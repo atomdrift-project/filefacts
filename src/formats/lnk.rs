@@ -274,15 +274,12 @@ pub(super) fn extract(
     Ok(())
 }
 
-/// Padding threshold (in chars) at which an argument string's
-/// whitespace becomes "excessive". Matches the CVE-2025-9491
-/// detection bar published by ZDI: 50+ consecutive spaces/tabs
-/// hiding the real command from the properties dialog.
-const EXCESSIVE_WHITESPACE_THRESHOLD: usize = 50;
-
-/// Compute whitespace-obfuscation metrics over an LNK argument
-/// string and emit them under `lnk.args_*` for the CVE-2025-9491
-/// detection traits to consume.
+/// Compute whitespace-obfuscation counts over an LNK argument
+/// string and emit them under `lnk.args_*`. Trait rules read these
+/// raw counts and pick their own thresholds (e.g. the CVE-2025-9491
+/// "interpreter padding" composite uses `args_max_whitespace_run
+/// >= 50` plus `args_whitespace_total >= 100`). No derived
+/// decisions live here.
 fn emit_argument_whitespace_metrics(metrics: &mut Metrics, args: &str) {
     let mut leading_spaces = 0usize;
     let mut leading_tabs = 0usize;
@@ -312,15 +309,10 @@ fn emit_argument_whitespace_metrics(metrics: &mut Metrics, args: &str) {
     if current_run > max_run {
         max_run = current_run;
     }
-    let excessive = max_run >= EXCESSIVE_WHITESPACE_THRESHOLD;
     metrics.insert("lnk.args_leading_spaces", leading_spaces as f64);
     metrics.insert("lnk.args_leading_tabs", leading_tabs as f64);
     metrics.insert("lnk.args_whitespace_total", total_whitespace as f64);
     metrics.insert("lnk.args_max_whitespace_run", max_run as f64);
-    metrics.insert(
-        "lnk.args_excessive_whitespace",
-        if excessive { 1.0 } else { 0.0 },
-    );
 }
 
 /// Map the SHLLINK `ShowCommand` value to its Windows `SW_*`
@@ -1135,7 +1127,6 @@ mod tests {
         let (_, m) = run(&lnk_with_arguments(&args));
         assert_eq!(m.get("lnk.args_leading_spaces"), Some(60.0));
         assert_eq!(m.get("lnk.args_max_whitespace_run"), Some(60.0));
-        assert_eq!(m.get("lnk.args_excessive_whitespace"), Some(1.0));
         assert!(m.get("lnk.args_whitespace_total").unwrap() >= 60.0);
     }
 
@@ -1143,7 +1134,6 @@ mod tests {
     fn argument_whitespace_metrics_quiet_on_normal_args() {
         let (_, m) = run(&lnk_with_arguments("/c notepad.exe"));
         assert!(m.get("lnk.args_max_whitespace_run").unwrap() < 50.0);
-        assert_eq!(m.get("lnk.args_excessive_whitespace"), Some(0.0));
         assert_eq!(m.get("lnk.args_leading_tabs"), Some(0.0));
     }
 
@@ -1153,6 +1143,5 @@ mod tests {
         let (_, m) = run(&lnk_with_arguments(&args));
         assert_eq!(m.get("lnk.args_leading_tabs"), Some(55.0));
         assert_eq!(m.get("lnk.args_max_whitespace_run"), Some(55.0));
-        assert_eq!(m.get("lnk.args_excessive_whitespace"), Some(1.0));
     }
 }

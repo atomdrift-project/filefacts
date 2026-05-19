@@ -128,7 +128,7 @@ fn debug_type_label(t: u32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::format_guid;
+    use super::{debug_type_label, format_guid};
 
     #[test]
     fn guid_byteswaps_first_three_groups() {
@@ -143,5 +143,57 @@ mod tests {
             format_guid(&bytes),
             "04030201-0605-0807-090a-0b0c0d0e0f10"
         );
+    }
+
+    #[test]
+    fn guid_zero_bytes() {
+        let bytes = [0u8; 16];
+        assert_eq!(
+            format_guid(&bytes),
+            "00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    #[test]
+    fn guid_canonical_microsoft_form() {
+        // Real-world example: a Visual Studio toolchain GUID.
+        // Source bytes in file order, output should match
+        // `dumpbin /headers`'s representation.
+        let bytes = [
+            0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf1, 0x23, 0x45, 0x67,
+            0x89, 0xab,
+        ];
+        assert_eq!(
+            format_guid(&bytes),
+            "12efcdab-5634-9a78-bcde-f1234567 89ab".replace(' ', "")
+        );
+    }
+
+    #[test]
+    fn debug_type_labels_cover_known_types() {
+        assert_eq!(debug_type_label(0), "unknown");
+        assert_eq!(debug_type_label(1), "coff");
+        assert_eq!(debug_type_label(2), "codeview");
+        assert_eq!(debug_type_label(13), "pogo");
+        assert_eq!(debug_type_label(14), "iltcg");
+        assert_eq!(debug_type_label(16), "repro");
+        assert_eq!(debug_type_label(20), "ex_dllcharacteristics");
+    }
+
+    #[test]
+    fn debug_type_label_unknown_value_falls_back_to_other() {
+        // Microsoft never assigned this value; reserve room for future
+        // expansion without crashing on real-world toolchain extensions.
+        assert_eq!(debug_type_label(99), "other");
+        assert_eq!(debug_type_label(u32::MAX), "other");
+    }
+
+    #[test]
+    fn debug_type_label_misc_distinguished_from_other() {
+        // `misc` is a real `IMAGE_DEBUG_TYPE_*` constant (4) — not a
+        // catch-all. The fallback "other" should kick in only outside
+        // the canonical 0..=16/20 range.
+        assert_eq!(debug_type_label(4), "misc");
+        assert_eq!(debug_type_label(17), "other");
     }
 }

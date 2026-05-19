@@ -27,7 +27,7 @@
 //!   `metrics.class.constant_pool_size`.
 
 use std::collections::HashMap;
-use serde_json::{json, Value as JsonValue};
+use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::{extract_ascii_strings, put_str, put_u64};

@@ -114,28 +114,26 @@ fn dt_flags(elf: &Elf<'_>, values: &mut Values) {
             _ => {}
         }
     }
-    if !flags.is_empty() || !flags1.is_empty() {
-        let mut obj = serde_json::Map::new();
-        if !flags.is_empty() {
-            obj.insert(
-                "flags".into(),
-                JsonValue::Array(flags.iter().map(|s| JsonValue::String((*s).to_string())).collect()),
-            );
-        }
-        if !flags1.is_empty() {
-            obj.insert(
-                "flags_1".into(),
-                JsonValue::Array(flags1.iter().map(|s| JsonValue::String((*s).to_string())).collect()),
-            );
-        }
-        values.insert("elf.dt_flags", JsonValue::Object(obj));
+    if !flags.is_empty() {
+        values.insert(
+            "elf.dt_flags",
+            JsonValue::Array(flags.iter().map(|s| JsonValue::String((*s).to_string())).collect()),
+        );
+    }
+    if !flags1.is_empty() {
+        values.insert(
+            "elf.dt_flags_1",
+            JsonValue::Array(
+                flags1.iter().map(|s| JsonValue::String((*s).to_string())).collect(),
+            ),
+        );
     }
 }
 
 fn decompose_df(v: u64, out: &mut Vec<&'static str>) {
     if v & 0x1 != 0 { out.push("origin"); }
     if v & 0x2 != 0 { out.push("symbolic"); }
-    if v & 0x4 != 0 { out.push("textrel"); }
+    if v & 0x4 != 0 { out.push("text_rel"); }
     if v & 0x8 != 0 { out.push("bind_now"); }
     if v & 0x10 != 0 { out.push("static_tls"); }
 }
@@ -143,16 +141,16 @@ fn decompose_df(v: u64, out: &mut Vec<&'static str>) {
 fn decompose_df1(v: u64, out: &mut Vec<&'static str>) {
     if v & 0x0000_0001 != 0 { out.push("now"); }
     if v & 0x0000_0002 != 0 { out.push("global"); }
-    if v & 0x0000_0008 != 0 { out.push("nodelete"); }
-    if v & 0x0000_0010 != 0 { out.push("loadfltr"); }
-    if v & 0x0000_0040 != 0 { out.push("initfirst"); }
-    if v & 0x0000_0080 != 0 { out.push("noopen"); }
+    if v & 0x0000_0008 != 0 { out.push("no_delete"); }
+    if v & 0x0000_0010 != 0 { out.push("load_filter"); }
+    if v & 0x0000_0040 != 0 { out.push("init_first"); }
+    if v & 0x0000_0080 != 0 { out.push("no_open"); }
     if v & 0x0000_0100 != 0 { out.push("origin"); }
-    if v & 0x0000_0800 != 0 { out.push("nodump"); }
-    if v & 0x0000_2000 != 0 { out.push("noopen2"); }
+    if v & 0x0000_0800 != 0 { out.push("no_dump"); }
+    if v & 0x0000_2000 != 0 { out.push("no_open_2"); }
     if v & 0x0800_0000 != 0 { out.push("pie"); }
-    if v & 0x1000_0000 != 0 { out.push("kmod"); }
-    if v & 0x4000_0000 != 0 { out.push("noreloc"); }
+    if v & 0x1000_0000 != 0 { out.push("kernel_module"); }
+    if v & 0x4000_0000 != 0 { out.push("no_reloc"); }
 }
 
 /// `.note.ABI-tag` (`NT_GNU_ABI_TAG = 1`) — declares the minimum
@@ -645,7 +643,7 @@ fn section_flags(flags: u64) -> Vec<&'static str> {
         out.push("alloc");
     }
     if flags & 0x4 != 0 {
-        out.push("execinstr");
+        out.push("executable");
     }
     if flags & 0x10 != 0 {
         out.push("merge");
@@ -665,11 +663,129 @@ fn section_flags(flags: u64) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::{Metrics, Strings, Values};
+
+    fn run(bytes: &[u8]) -> (Values, Strings, Metrics) {
+        let mut v = Values::new();
+        let mut s = Strings::default();
+        let mut m = Metrics::new();
+        let mut sections = Vec::new();
+        // Ignore the Result — most negative-path tests pass malformed
+        // bytes and we only care that extract returns without panic.
+        let _ = extract(bytes, &mut v, &mut s, &mut m, &mut sections);
+        (v, s, m)
+    }
 
     #[test]
     fn machine_string_handles_known() {
         assert_eq!(machine_string(header::EM_X86_64), "x86_64");
         assert_eq!(machine_string(header::EM_AARCH64), "aarch64");
+        assert_eq!(machine_string(header::EM_ARM), "arm");
+        assert_eq!(machine_string(header::EM_386), "i386");
+        assert_eq!(machine_string(header::EM_RISCV), "riscv");
+        assert_eq!(machine_string(header::EM_PPC64), "powerpc64");
+        assert_eq!(machine_string(header::EM_S390), "s390");
+        assert_eq!(machine_string(header::EM_LOONGARCH), "loongarch");
         assert_eq!(machine_string(0xeeee), "unknown");
+    }
+
+    #[test]
+    fn elf_type_string_covers_canonical_set() {
+        assert_eq!(elf_type_string(header::ET_NONE), "none");
+        assert_eq!(elf_type_string(header::ET_REL), "relocatable");
+        assert_eq!(elf_type_string(header::ET_EXEC), "executable");
+        assert_eq!(elf_type_string(header::ET_DYN), "dynamic");
+        assert_eq!(elf_type_string(header::ET_CORE), "core");
+        assert_eq!(elf_type_string(0x9999), "unknown");
+    }
+
+    #[test]
+    fn section_flags_decompose_each_bit() {
+        // SHF_WRITE | SHF_ALLOC | SHF_EXECINSTR
+        let f = section_flags(0x1 | 0x2 | 0x4);
+        assert_eq!(f, vec!["write", "alloc", "executable"]);
+    }
+
+    #[test]
+    fn section_flags_picks_up_strings_and_merge() {
+        // SHF_MERGE | SHF_STRINGS — `.rodata.str` section uses these.
+        let f = section_flags(0x10 | 0x20);
+        assert_eq!(f, vec!["merge", "strings"]);
+    }
+
+    #[test]
+    fn section_flags_tls_bit() {
+        let f = section_flags(0x100);
+        assert_eq!(f, vec!["tls"]);
+    }
+
+    #[test]
+    fn section_flags_empty_when_zero() {
+        assert!(section_flags(0).is_empty());
+    }
+
+    #[test]
+    fn gnu_property_name_handles_x86_features() {
+        // GNU_PROPERTY_X86_FEATURE_1_AND (0xc0000002) carries IBT/SHSTK
+        // markers on hardened x86 builds.
+        assert!(gnu_property_name(0xc0000002, false).is_some());
+    }
+
+    #[test]
+    fn gnu_property_name_handles_aarch64_pauth() {
+        // BTI / PAC properties are aarch64-only.
+        let bti = gnu_property_name(0xc0000000, true);
+        assert!(bti.is_some());
+    }
+
+    #[test]
+    fn pauth_platform_name_known_vendors() {
+        // Apple = 1, LLVM = 2; vendor IDs come from the AArch64 ABI
+        // supplement.
+        assert!(!pauth_platform_name(1).is_empty());
+        assert!(!pauth_platform_name(2).is_empty());
+    }
+
+    #[test]
+    fn rejects_non_elf_bytes() {
+        let (v, _, m) = run(b"not an elf");
+        assert!(v.is_empty());
+        // file.size is emitted by the dispatcher, not extract; nothing
+        // from elf.* should be present here.
+        assert!(m.get("binary.is_pie").is_none());
+    }
+
+    #[test]
+    fn empty_input_doesnt_crash() {
+        let (_, _, _) = run(&[]);
+    }
+
+    #[test]
+    fn truncated_elf_header_doesnt_crash() {
+        let mut bytes = vec![0u8; 32];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        let (_, _, _) = run(&bytes);
+    }
+
+    /// Read a real binary fixture from the cleave repo. Lets tests
+    /// exercise the full extractor against a non-trivial ELF without
+    /// shipping our own corpus.
+    fn read_fixture(name: &str) -> Vec<u8> {
+        let path = format!("../cleave/tests/fixtures/{name}");
+        std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"))
+    }
+
+    #[test]
+    fn end_to_end_parses_real_elf_fixture() {
+        let bytes = read_fixture("test.elf");
+        let (v, _, m) = run(&bytes);
+        // Pike-style flat schema: header fields live under `elf.<name>`
+        // directly, not nested in `elf.header.*`.
+        assert!(v.get("elf.class").is_some());
+        assert!(v.get("elf.endian").is_some());
+        assert!(v.get("elf.entry").is_some());
+        // PIE / stripped flags are present (0 or 1) for any ELF.
+        assert!(m.get("binary.is_pie").is_some());
+        assert!(m.get("binary.is_stripped").is_some());
     }
 }

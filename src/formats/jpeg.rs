@@ -139,7 +139,10 @@ pub(super) fn extract(
         put_str(values, "jpeg.comment", c);
     }
     if let Some(t) = state.adobe_color_transform {
-        values.insert("jpeg.adobe_color_transform", json!(t));
+        // Nest under `jpeg.adobe.*` so additional APP14 fields
+        // (DCTEncodeVersion, APP14Flags0/1) can land here in the
+        // future without renaming the existing key.
+        values.insert("jpeg.adobe.color_transform", json!(t));
     }
     if !state.features.is_empty() {
         values.insert(

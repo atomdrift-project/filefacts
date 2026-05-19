@@ -19,7 +19,7 @@
 //! - `vsix.properties.<id>` — `<Property Id="…" Value="…" />` pairs,
 //!   with the `Microsoft.VisualStudio.` prefix stripped.
 
-use serde_json::{json, Value as JsonValue};
+use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::{extract_ascii_strings, put_str};

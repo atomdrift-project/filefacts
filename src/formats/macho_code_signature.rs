@@ -255,7 +255,7 @@ fn code_signature_flags(flags: u32) -> Vec<String> {
         out.push("valid".to_string());
     }
     if flags & 0x0000_0002 != 0 {
-        out.push("adhoc".to_string());
+        out.push("ad_hoc".to_string());
     }
     if flags & 0x0000_0004 != 0 {
         out.push("get_task_allow".to_string());
@@ -330,7 +330,7 @@ mod tests {
     #[test]
     fn flags_decompose() {
         let f = code_signature_flags(0x2 | 0x2000 | 0x1_0000);
-        assert!(f.contains(&"adhoc".to_string()));
+        assert!(f.contains(&"ad_hoc".to_string()));
         assert!(f.contains(&"library_validation".to_string()));
         assert!(f.contains(&"runtime".to_string()));
     }
@@ -341,4 +341,74 @@ mod tests {
         assert_eq!(read_cstr(buf, 0).unwrap(), "hello");
         assert_eq!(read_cstr(buf, 6).unwrap(), "world");
     }
+
+    #[test]
+    fn flags_use_ad_hoc_separator() {
+        // The CS_ADHOC flag — ad-hoc signing — is two-words in
+        // English; the emitted name uses an underscore to match the
+        // rest of the Pike-style flag taxonomy.
+        let f = code_signature_flags(0x2);
+        assert!(f.contains(&"ad_hoc".to_string()));
+        assert!(!f.contains(&"adhoc".to_string()));
+    }
+
+    #[test]
+    fn flags_empty_when_zero() {
+        assert!(code_signature_flags(0).is_empty());
+    }
+
+    #[test]
+    fn flags_decompose_full_set() {
+        // Sum of every documented CS_* flag the parser handles.
+        let all = 0x0000_0001
+            | 0x0000_0002
+            | 0x0000_0004
+            | 0x0000_0008
+            | 0x0000_0100
+            | 0x0000_0200
+            | 0x0000_0400
+            | 0x0000_0800
+            | 0x0000_1000
+            | 0x0000_2000
+            | 0x0001_0000
+            | 0x0002_0000;
+        let f = code_signature_flags(all);
+        assert_eq!(f.len(), 12);
+        // Spot-check ordering matches the bit ordering in code_signature_flags.
+        assert_eq!(f[0], "valid");
+        assert_eq!(f[1], "ad_hoc");
+        assert_eq!(f.last().map(String::as_str), Some("linker_signed"));
+    }
+
+    #[test]
+    fn hash_label_covers_canonical_digest_set() {
+        assert_eq!(hash_label(3), "sha256_truncated");
+        assert_eq!(hash_label(4), "sha384");
+        assert_eq!(hash_label(5), "sha512");
+        assert_eq!(hash_label(99), "unknown");
+    }
+
+    #[test]
+    fn cstr_handles_offset_beyond_terminator() {
+        // After the second NUL the read should still terminate at the
+        // next NUL we encounter, returning whatever's between.
+        let buf = b"a\0b\0c";
+        assert_eq!(read_cstr(buf, 2).unwrap(), "b");
+        assert_eq!(read_cstr(buf, 4).unwrap(), "c");
+    }
+
+    #[test]
+    fn cstr_empty_when_first_byte_is_null() {
+        let buf = b"\0afterward";
+        let s = read_cstr(buf, 0).unwrap();
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn read_u32_be_reads_in_network_order() {
+        // Code-signature blobs are all big-endian.
+        let buf = [0x01, 0x02, 0x03, 0x04];
+        assert_eq!(read_u32_be(&buf, 0), 0x0102_0304);
+    }
+
 }

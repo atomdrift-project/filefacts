@@ -172,7 +172,7 @@ fn file_flags(flags: u32) -> Vec<String> {
         out.push("debug".to_string());
     }
     if flags & 0x02 != 0 {
-        out.push("prerelease".to_string());
+        out.push("pre_release".to_string());
     }
     if flags & 0x04 != 0 {
         out.push("patched".to_string());
@@ -214,4 +214,48 @@ mod tests {
         assert!(f.contains(&"special_build".to_string()));
         assert_eq!(f.len(), 3);
     }
+
+    #[test]
+    fn flags_empty_when_zero() {
+        assert!(file_flags(0).is_empty());
+    }
+
+    #[test]
+    fn flags_decompose_full_set() {
+        let f = file_flags(0x3F);
+        assert_eq!(
+            f,
+            vec!["debug", "pre_release", "patched", "private_build", "info_inferred", "special_build"]
+        );
+    }
+
+    #[test]
+    fn os_label_covers_canonical_values() {
+        // From wintrust.h. The composite encodings pair an OS family
+        // (high word) with a host environment (low word).
+        assert_eq!(file_os_label(0x0001_0000), "dos");
+        assert_eq!(file_os_label(0x0002_0000), "os216");
+        assert_eq!(file_os_label(0x0003_0000), "os232");
+        assert_eq!(file_os_label(0x0004_0000), "windows_nt");
+        assert_eq!(file_os_label(0x0001_0001), "dos_windows16");
+        assert_eq!(file_os_label(0x0001_0004), "dos_windows32");
+        assert_eq!(file_os_label(0x0004_0004), "windows_nt_windows32");
+        assert_eq!(file_os_label(0xdead_beef), "unknown");
+    }
+
+    #[test]
+    fn type_label_covers_drv_and_font() {
+        assert_eq!(file_type_label(3), "drv");
+        assert_eq!(file_type_label(4), "font");
+        assert_eq!(file_type_label(5), "vxd");
+        assert_eq!(file_type_label(7), "static_lib");
+    }
+
+    #[test]
+    fn type_label_unknown_falls_back() {
+        assert_eq!(file_type_label(0), "unknown");
+        assert_eq!(file_type_label(8), "unknown");
+        assert_eq!(file_type_label(u32::MAX), "unknown");
+    }
+
 }

@@ -164,7 +164,10 @@ pub(super) fn extract(
         values.insert("png.text", JsonValue::Object(text_kv));
     }
     if let Some(t) = time_value {
-        values.insert("png.time", JsonValue::String(t));
+        // tIME chunk per PNG spec is the "last image modification time"
+        // — match the archive/LNK `*_modified` / `mtime_*` convention
+        // instead of a vague "time".
+        values.insert("png.last_modified", JsonValue::String(t));
     }
     if let Some(n) = icc_name {
         values.insert("png.icc_profile_name", JsonValue::String(n));

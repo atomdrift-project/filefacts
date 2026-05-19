@@ -19,7 +19,7 @@
 //! - `pyc.source_files[]` — recovered source paths from
 //!   `co_filename` strings.
 
-use serde_json::{json, Value as JsonValue};
+use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::{extract_ascii_strings, put_str};

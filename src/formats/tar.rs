@@ -24,7 +24,10 @@ pub(super) fn extract(
     values: &mut Values,
     metrics: &mut Metrics,
 ) -> Result<(), Error> {
-    values.insert("archive.format", JsonValue::String(format_label(file_type).into()));
+    values.insert(
+        "archive.format.kind",
+        JsonValue::String(format_label(file_type).into()),
+    );
 
     let mut archive = open_archive(bytes, file_type)?;
     let mut members: Vec<JsonValue> = Vec::new();
@@ -216,5 +219,207 @@ fn tar_entry_type(t: tar::EntryType) -> &'static str {
         EntryType::XGlobalHeader => "pax-global",
         EntryType::XHeader => "pax-header",
         _ => "other",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output::{Metrics, Values};
+    use tar::{Builder, Header};
+
+    fn run(bytes: &[u8]) -> (Values, Metrics) {
+        let mut v = Values::new();
+        let mut m = Metrics::new();
+        // Plain tar; compressed variants test elsewhere.
+        let _ = extract(bytes, FileType::Tar, &mut v, &mut m);
+        (v, m)
+    }
+
+    /// Build a minimal in-memory tar archive. Each tuple is
+    /// `(path, mode, uid, gid, mtime, body)`. Set `uname`/`gname`
+    /// via the per-entry closure.
+    fn build_tar(entries: &[(&str, u32, u64, u64, u64, &[u8])]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut b = Builder::new(&mut out);
+            for (path, mode, uid, gid, mtime, body) in entries {
+                let mut h = Header::new_ustar();
+                h.set_path(path).unwrap();
+                h.set_mode(*mode);
+                h.set_uid(*uid);
+                h.set_gid(*gid);
+                h.set_mtime(*mtime);
+                h.set_size(body.len() as u64);
+                h.set_entry_type(tar::EntryType::Regular);
+                h.set_cksum();
+                b.append(&h, &body[..]).unwrap();
+            }
+            b.finish().unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn empty_input_returns_empty_member_list() {
+        let (v, m) = run(&[]);
+        // tar::Archive over empty bytes returns an empty entry iter; the
+        // walker still emits the empty list (so downstream consumers can
+        // distinguish "no members" from "archive not parsed").
+        let members = v.get("archive.members").and_then(|x| x.as_array()).unwrap();
+        assert!(members.is_empty());
+        assert_eq!(m.get("archive.member_count"), Some(0.0));
+    }
+
+    #[test]
+    fn surfaces_member_listing_and_metadata() {
+        let tar = build_tar(&[
+            ("usr/bin/script.sh", 0o755, 1000, 1000, 1_700_000_000, b"#!/bin/sh\n"),
+            ("etc/config", 0o644, 0, 0, 1_700_000_100, b"key=value\n"),
+        ]);
+        let (v, m) = run(&tar);
+
+        let members = v.get("archive.members").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(members.len(), 2);
+
+        // First member's structural fields.
+        let m0 = members[0].as_object().unwrap();
+        assert_eq!(m0["path"].as_str(), Some("usr/bin/script.sh"));
+        assert_eq!(m0["entry_type"].as_str(), Some("regular"));
+        assert_eq!(m0["mode_octal"].as_u64(), Some(0o755));
+        assert_eq!(m0["uid"].as_u64(), Some(1000));
+        assert_eq!(m0["gid"].as_u64(), Some(1000));
+        assert_eq!(m0["mtime_unix"].as_i64(), Some(1_700_000_000));
+        assert_eq!(m0["size_bytes"].as_u64(), Some(b"#!/bin/sh\n".len() as u64));
+
+        // Aggregates.
+        assert_eq!(m.get("archive.member_count"), Some(2.0));
+        assert_eq!(m.get("archive.format.regular_count"), Some(2.0));
+    }
+
+    #[test]
+    fn flags_setuid_in_security_metrics() {
+        // Setuid bit (04000) on root-owned binary.
+        let tar = build_tar(&[("bin/pwn", 0o4755, 0, 0, 0, b"")]);
+        let (_, m) = run(&tar);
+        assert_eq!(m.get("archive.security.setuid_count"), Some(1.0));
+        // World-writable is not set on 0o4755.
+        assert!(m.get("archive.security.world_writable_count").unwrap_or(0.0) < 1.0);
+    }
+
+    #[test]
+    fn flags_world_writable_and_setgid() {
+        let tar = build_tar(&[
+            ("data", 0o666, 1000, 1000, 0, b""),
+            ("bin/setgid", 0o2755, 0, 100, 0, b""),
+        ]);
+        let (_, m) = run(&tar);
+        assert_eq!(m.get("archive.security.world_writable_count"), Some(1.0));
+        assert_eq!(m.get("archive.security.setgid_count"), Some(1.0));
+    }
+
+    #[test]
+    fn timing_spread_zero_for_single_mtime() {
+        let tar = build_tar(&[
+            ("a", 0o644, 0, 0, 1_700_000_000, b""),
+            ("b", 0o644, 0, 0, 1_700_000_000, b""),
+        ]);
+        let (_, m) = run(&tar);
+        assert_eq!(m.get("archive.timing.mtime_spread_seconds"), Some(0.0));
+        assert_eq!(m.get("archive.timing.mtime_unique_count"), Some(1.0));
+    }
+
+    #[test]
+    fn timing_spread_captures_range() {
+        let tar = build_tar(&[
+            ("a", 0o644, 0, 0, 1_700_000_000, b""),
+            ("b", 0o644, 0, 0, 1_700_086_400, b""), // +24h
+        ]);
+        let (_, m) = run(&tar);
+        assert_eq!(m.get("archive.timing.mtime_spread_seconds"), Some(86400.0));
+        assert_eq!(m.get("archive.timing.mtime_unique_count"), Some(2.0));
+    }
+
+    #[test]
+    fn format_kind_set_to_tar() {
+        let tar = build_tar(&[("a", 0o644, 0, 0, 0, b"")]);
+        let (v, _) = run(&tar);
+        assert_eq!(
+            v.get("archive.format.kind").and_then(|x| x.as_str()),
+            Some("tar")
+        );
+    }
+
+    #[test]
+    fn compressed_variants_report_format_only() {
+        // Bytes don't matter — open_archive rejects compressed variants.
+        let mut values = Values::new();
+        let mut metrics = Metrics::new();
+        let _ = extract(b"any bytes", FileType::TarGz, &mut values, &mut metrics);
+        assert_eq!(
+            values.get("archive.format.kind").and_then(|x| x.as_str()),
+            Some("tar.gz")
+        );
+        // The walker bailed; no members.
+        assert!(values.get("archive.members").is_none());
+    }
+
+    #[test]
+    fn symlink_entry_recorded_with_linkname() {
+        // tar::Builder can append symlinks via append_link.
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut b = Builder::new(&mut out);
+            let mut h = Header::new_ustar();
+            h.set_path("link").unwrap();
+            h.set_size(0);
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_link_name("target.bin").unwrap();
+            h.set_cksum();
+            b.append(&h, std::io::empty()).unwrap();
+            b.finish().unwrap();
+        }
+        let (v, m) = run(&out);
+        let members = v.get("archive.members").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(members[0]["entry_type"].as_str(), Some("symlink"));
+        assert_eq!(members[0]["linkname"].as_str(), Some("target.bin"));
+        assert_eq!(m.get("archive.security.symlink_count"), Some(1.0));
+    }
+
+    #[test]
+    fn truncated_tar_doesnt_crash() {
+        // Just a partial header — should error inside, not panic.
+        let _ = run(&[0u8; 50]);
+    }
+
+    #[test]
+    fn builder_unames_collected_when_present() {
+        // We can't easily set uname via the default ustar header API,
+        // so build a header that has it. Cheating: use a longer header
+        // construction.
+        let mut h = Header::new_ustar();
+        h.set_path("a").unwrap();
+        h.set_size(0);
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_username("alice").unwrap();
+        h.set_groupname("dev").unwrap();
+        h.set_cksum();
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut b = Builder::new(&mut out);
+            b.append(&h, std::io::empty()).unwrap();
+            b.finish().unwrap();
+        }
+        let (v, _) = run(&out);
+        let unames = v
+            .get("archive.builder.unames")
+            .and_then(|x| x.as_array())
+            .unwrap();
+        assert!(unames.iter().any(|s| s.as_str() == Some("alice")));
+        let gnames = v
+            .get("archive.builder.gnames")
+            .and_then(|x| x.as_array())
+            .unwrap();
+        assert!(gnames.iter().any(|s| s.as_str() == Some("dev")));
     }
 }

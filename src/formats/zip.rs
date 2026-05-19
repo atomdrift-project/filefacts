@@ -25,7 +25,7 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
     let mut archive =
         ZipArchive::new(cursor).map_err(|e| Error::malformed("zip", e.to_string()))?;
 
-    values.insert("archive.format", JsonValue::String("zip".into()));
+    values.insert("archive.format.kind", JsonValue::String("zip".into()));
 
     if !archive.comment().is_empty() {
         let comment = String::from_utf8_lossy(archive.comment()).into_owned();
@@ -222,10 +222,164 @@ fn compression_method_name(method: CompressionMethod) -> &'static str {
 #[allow(unused_imports)]
 mod tests {
     use super::*;
+    use crate::output::{Metrics, Values};
+    use std::io::Cursor;
+    use std::io::Write;
+    use zip::write::{SimpleFileOptions, ZipWriter};
+
+    fn run(bytes: &[u8]) -> (Values, Metrics) {
+        let mut v = Values::new();
+        let mut m = Metrics::new();
+        let _ = extract(bytes, &mut v, &mut m);
+        (v, m)
+    }
+
+    /// Build an in-memory zip with the given members. Each tuple:
+    /// `(path, body, compression_method, last_modified_unix)`.
+    fn build_zip(entries: &[(&str, &[u8], CompressionMethod)]) -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::<u8>::new());
+        {
+            let mut w = ZipWriter::new(&mut buf);
+            for (path, body, method) in entries {
+                let opts = SimpleFileOptions::default()
+                    .compression_method(*method)
+                    .unix_permissions(0o644);
+                w.start_file(*path, opts).unwrap();
+                w.write_all(body).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        buf.into_inner()
+    }
 
     #[test]
     fn compression_names_are_stable() {
         assert_eq!(compression_method_name(CompressionMethod::Stored), "stored");
         assert_eq!(compression_method_name(CompressionMethod::Deflated), "deflate");
+    }
+
+    #[test]
+    fn surfaces_member_listing_and_per_member_fields() {
+        let z = build_zip(&[
+            ("file.txt", b"hello world", CompressionMethod::Stored),
+            ("nested/file.bin", b"\x00\x01\x02\x03", CompressionMethod::Deflated),
+        ]);
+        let (v, m) = run(&z);
+        let members = v.get("archive.members").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(members.len(), 2);
+        let m0 = members[0].as_object().unwrap();
+        assert_eq!(m0["path"].as_str(), Some("file.txt"));
+        assert_eq!(m0["compression_method"].as_str(), Some("stored"));
+        assert_eq!(m0["entry_type"].as_str(), Some("regular"));
+        assert_eq!(m.get("archive.member_count"), Some(2.0));
+    }
+
+    #[test]
+    fn format_kind_set_to_zip() {
+        let z = build_zip(&[("a", b"x", CompressionMethod::Stored)]);
+        let (v, _) = run(&z);
+        assert_eq!(
+            v.get("archive.format.kind").and_then(|x| x.as_str()),
+            Some("zip")
+        );
+    }
+
+    #[test]
+    fn compression_methods_array_unique() {
+        let z = build_zip(&[
+            ("a", b"x", CompressionMethod::Stored),
+            ("b", b"y", CompressionMethod::Stored),
+            ("c", b"z", CompressionMethod::Deflated),
+        ]);
+        let (v, _) = run(&z);
+        let methods = v
+            .get("archive.compression.methods")
+            .and_then(|x| x.as_array())
+            .unwrap();
+        let names: Vec<&str> = methods.iter().filter_map(|x| x.as_str()).collect();
+        // BTreeMap iteration order is alphabetical: deflate, stored.
+        assert_eq!(names, vec!["deflate", "stored"]);
+    }
+
+    #[test]
+    fn compression_ratio_present_when_uncompressed_nonzero() {
+        let z = build_zip(&[(
+            "big.txt",
+            &b"abcdefghijabcdefghijabcdefghijabcdefghijabcdefghij".repeat(20),
+            CompressionMethod::Deflated,
+        )]);
+        let (_, m) = run(&z);
+        let r = m.get("archive.compression.ratio").unwrap();
+        assert!(r > 0.0 && r < 1.0, "expected ratio in (0,1), got {r}");
+    }
+
+    #[test]
+    fn jar_signed_shape_detected() {
+        let z = build_zip(&[
+            ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n", CompressionMethod::Stored),
+            ("META-INF/CERT.SF", b"sigfile", CompressionMethod::Stored),
+            ("META-INF/CERT.RSA", b"\x00\x01", CompressionMethod::Stored),
+            ("Main.class", b"\xca\xfe\xba\xbe", CompressionMethod::Stored),
+        ]);
+        let (v, _) = run(&z);
+        assert_eq!(
+            v.get("archive.signing.jar_signed_shape").and_then(|x| x.as_bool()),
+            Some(true)
+        );
+        // mozilla-extension shape needs cose.manifest + cose.sig; not set here.
+        assert!(v.get("archive.signing.mozilla_extension_shape").is_none());
+    }
+
+    #[test]
+    fn mozilla_extension_shape_detected() {
+        let z = build_zip(&[
+            ("META-INF/cose.manifest", b"mozcose", CompressionMethod::Stored),
+            ("META-INF/cose.sig", b"\xde\xad", CompressionMethod::Stored),
+            ("manifest.json", b"{}", CompressionMethod::Stored),
+        ]);
+        let (v, _) = run(&z);
+        assert_eq!(
+            v.get("archive.signing.mozilla_extension_shape")
+                .and_then(|x| x.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn empty_zip_emits_empty_member_list() {
+        let z = build_zip(&[]);
+        let (v, m) = run(&z);
+        let members = v.get("archive.members").and_then(|x| x.as_array()).unwrap();
+        assert!(members.is_empty());
+        assert_eq!(m.get("archive.member_count"), Some(0.0));
+    }
+
+    #[test]
+    fn non_zip_input_rejected_silently() {
+        // Bytes that don't start with PK\x03\x04 — extract returns Err
+        // (which expose's dispatcher swallows). Values left empty.
+        let (v, _) = run(b"not a zip");
+        assert!(v.get("archive.members").is_none());
+    }
+
+    #[test]
+    fn aggregate_method_counts_per_compression() {
+        let z = build_zip(&[
+            ("a", b"x", CompressionMethod::Stored),
+            ("b", b"y", CompressionMethod::Deflated),
+            ("c", b"z", CompressionMethod::Deflated),
+        ]);
+        let (_, m) = run(&z);
+        assert_eq!(m.get("archive.compression.method_counts.stored"), Some(1.0));
+        assert_eq!(m.get("archive.compression.method_counts.deflate"), Some(2.0));
+    }
+
+    #[test]
+    fn truncated_zip_doesnt_crash() {
+        // Take a valid zip and chop most of it off.
+        let z = build_zip(&[("a", b"hello", CompressionMethod::Stored)]);
+        let truncated = &z[..z.len() / 2];
+        let (_, _) = run(truncated);
+        // No assertions — we only care that it didn't panic.
     }
 }

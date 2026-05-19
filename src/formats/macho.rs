@@ -152,7 +152,16 @@ fn extract_header_and_loads(macho: &MachO<'_>, bytes: &[u8], values: &mut Values
     put_str(values, "macho.cpu_type", cpu_type_string(macho.header.cputype()));
     put_u64(values, "macho.cpu_subtype", u64::from(macho.header.cpusubtype()));
     put_str(values, "macho.file_type", file_type_string(macho.header.filetype));
-    put_u64(values, "macho.flags_raw", u64::from(macho.header.flags));
+    // Pike-style decomposed flag array — matches `pe.dll_characteristics[]`
+    // / `lnk.header.flags[]` schema rather than emitting a raw bitfield
+    // that traits would have to mask themselves.
+    let mh_flags = mh_flag_names(macho.header.flags);
+    if !mh_flags.is_empty() {
+        values.insert(
+            "macho.flags",
+            JsonValue::Array(mh_flags.into_iter().map(|s| JsonValue::String(s.into())).collect()),
+        );
+    }
     put_str(values, "macho.endian", if macho.little_endian { "little" } else { "big" });
 
     let libs: Vec<JsonValue> = macho
@@ -597,6 +606,41 @@ fn format_macho_uuid(b: &[u8; 16]) -> String {
     )
 }
 
+/// Decompose Mach-O header flags into a Pike-style array of names.
+/// Values from `<mach-o/loader.h>` `MH_*`; word boundaries are
+/// preserved so the names read naturally instead of running the
+/// loader.h symbol's letters together.
+fn mh_flag_names(flags: u32) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if flags & 0x0000_0001 != 0 { out.push("no_undefs"); }
+    if flags & 0x0000_0002 != 0 { out.push("incremental_link"); }
+    if flags & 0x0000_0004 != 0 { out.push("dyld_link"); }
+    if flags & 0x0000_0008 != 0 { out.push("bind_at_load"); }
+    if flags & 0x0000_0010 != 0 { out.push("pre_bound"); }
+    if flags & 0x0000_0020 != 0 { out.push("split_segments"); }
+    if flags & 0x0000_0040 != 0 { out.push("lazy_init"); }
+    if flags & 0x0000_0080 != 0 { out.push("two_level"); }
+    if flags & 0x0000_0100 != 0 { out.push("force_flat"); }
+    if flags & 0x0000_0200 != 0 { out.push("no_multi_defs"); }
+    if flags & 0x0000_0400 != 0 { out.push("no_fix_pre_binding"); }
+    if flags & 0x0000_0800 != 0 { out.push("pre_bindable"); }
+    if flags & 0x0000_1000 != 0 { out.push("all_mods_bound"); }
+    if flags & 0x0000_2000 != 0 { out.push("subsections_via_symbols"); }
+    if flags & 0x0000_4000 != 0 { out.push("canonical"); }
+    if flags & 0x0000_8000 != 0 { out.push("weak_defines"); }
+    if flags & 0x0001_0000 != 0 { out.push("binds_to_weak"); }
+    if flags & 0x0002_0000 != 0 { out.push("allow_stack_execution"); }
+    if flags & 0x0004_0000 != 0 { out.push("root_safe"); }
+    if flags & 0x0008_0000 != 0 { out.push("setuid_safe"); }
+    if flags & 0x0010_0000 != 0 { out.push("no_reexported_dylibs"); }
+    if flags & 0x0020_0000 != 0 { out.push("pie"); }
+    if flags & 0x0040_0000 != 0 { out.push("dead_strippable_dylib"); }
+    if flags & 0x0080_0000 != 0 { out.push("has_tlv_descriptors"); }
+    if flags & 0x0100_0000 != 0 { out.push("no_heap_execution"); }
+    if flags & 0x0200_0000 != 0 { out.push("app_extension_safe"); }
+    out
+}
+
 fn cpu_type_string(cpu_type: u32) -> &'static str {
     // From `<mach/machine.h>` `CPU_TYPE_*`.
     match cpu_type {
@@ -701,4 +745,89 @@ mod tests {
         // LC_LOAD_DYLIB with `LC_REQ_DYLD` bit set
         assert_eq!(load_command_name(0x8000_000c), "LC_LOAD_DYLIB");
     }
+
+    fn run(bytes: &[u8]) -> (Values, Strings, Metrics) {
+        let mut v = Values::new();
+        let mut s = Strings::default();
+        let mut m = Metrics::new();
+        let mut sections = Vec::new();
+        let _ = extract(bytes, &mut v, &mut s, &mut m, &mut sections);
+        (v, s, m)
+    }
+
+    fn read_fixture(name: &str) -> Vec<u8> {
+        let path = format!("../cleave/tests/fixtures/{name}");
+        std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"))
+    }
+
+    #[test]
+    fn cpu_type_string_arm32_and_x86() {
+        assert_eq!(cpu_type_string(0x0000_0007), "x86");
+        assert_eq!(cpu_type_string(0x0000_000c), "arm");
+        assert_eq!(cpu_type_string(0x0200_000c), "arm64_32");
+    }
+
+    #[test]
+    fn file_type_string_object_and_core() {
+        assert_eq!(file_type_string(0x1), "object");
+        assert_eq!(file_type_string(0x4), "core");
+        assert_eq!(file_type_string(0x99), "unknown");
+    }
+
+    #[test]
+    fn load_command_name_known_set() {
+        // LC_SEGMENT_64 = 0x19, LC_UUID = 0x1b, LC_CODE_SIGNATURE = 0x1d
+        assert_eq!(load_command_name(0x19), "LC_SEGMENT_64");
+        assert_eq!(load_command_name(0x1b), "LC_UUID");
+        assert_eq!(load_command_name(0x1d), "LC_CODE_SIGNATURE");
+    }
+
+    #[test]
+    fn empty_input_doesnt_crash() {
+        let (_, _, _) = run(&[]);
+    }
+
+    #[test]
+    fn non_macho_input_is_silent() {
+        let (v, _, m) = run(b"\x00\x00\x00 not macho");
+        assert!(v.is_empty() || v.get("macho").is_none());
+        assert!(m.get("binary.is_pie").is_none());
+    }
+
+    #[test]
+    fn truncated_macho_doesnt_crash() {
+        // Mach-O magic but no real payload.
+        let bytes = vec![0xCF, 0xFA, 0xED, 0xFE, 0, 0, 0, 0];
+        let (_, _, _) = run(&bytes);
+    }
+
+    #[test]
+    fn end_to_end_parses_real_macho_fixture() {
+        let bytes = read_fixture("test.macho");
+        let (v, _, m) = run(&bytes);
+        // Flat schema: macho.{cpu_type, file_type, …} live directly
+        // under the namespace.
+        assert!(v.get("macho.cpu_type").is_some());
+        assert!(v.get("macho.file_type").is_some());
+        // PIE / stripped metrics emitted for every Mach-O.
+        assert!(m.get("binary.is_pie").is_some());
+        assert!(m.get("binary.is_stripped").is_some());
+    }
+
+    #[test]
+    fn mh_flag_names_decompose_canonical_set() {
+        // dyld_link | two_level | pie
+        let names = mh_flag_names(0x4 | 0x80 | 0x0020_0000);
+        assert!(names.contains(&"dyld_link"));
+        assert!(names.contains(&"two_level"));
+        assert!(names.contains(&"pie"));
+        // No spurious flags.
+        assert_eq!(names.len(), 3);
+    }
+
+    #[test]
+    fn mh_flag_names_empty_when_zero() {
+        assert!(mh_flag_names(0).is_empty());
+    }
+
 }

@@ -417,7 +417,7 @@ fn dll_characteristics(flags: u16) -> Vec<&'static str> {
         out.push("no_bind");
     }
     if flags & 0x1000 != 0 {
-        out.push("appcontainer");
+        out.push("app_container");
     }
     if flags & 0x2000 != 0 {
         out.push("wdm_driver");
@@ -771,5 +771,75 @@ mod tests {
         assert_eq!(subsystem_string(2), "windows_gui");
         assert_eq!(subsystem_string(3), "windows_cui");
         assert_eq!(subsystem_string(1), "native");
+    }
+
+    fn run(bytes: &[u8]) -> (Values, Strings, Metrics) {
+        let mut v = Values::new();
+        let mut s = Strings::default();
+        let mut m = Metrics::new();
+        let mut sections = Vec::new();
+        let _ = extract(bytes, &mut v, &mut s, &mut m, &mut sections);
+        (v, s, m)
+    }
+
+    fn read_fixture(name: &str) -> Vec<u8> {
+        let path = format!("../cleave/tests/fixtures/{name}");
+        std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"))
+    }
+
+    #[test]
+    fn dll_characteristics_empty_when_zero() {
+        let chars = dll_characteristics(0);
+        assert!(chars.is_empty());
+    }
+
+    #[test]
+    fn dll_characteristics_picks_up_force_integrity_and_aslr() {
+        // force_integrity (0x80) | dynamic_base (0x40) | guard_cf (0x4000)
+        let chars = dll_characteristics(0x80 | 0x40 | 0x4000);
+        assert!(chars.contains(&"force_integrity"));
+        assert!(chars.contains(&"dynamic_base"));
+        assert!(chars.contains(&"guard_cf"));
+    }
+
+    #[test]
+    fn subsystem_string_unknown_fallback() {
+        assert_eq!(subsystem_string(99), "unknown");
+    }
+
+    #[test]
+    fn rt_name_covers_canonical_resource_types() {
+        assert_eq!(rt_name(1), "RT_CURSOR");
+        assert_eq!(rt_name(2), "RT_BITMAP");
+        assert_eq!(rt_name(14), "RT_GROUP_ICON");
+    }
+
+    #[test]
+    fn empty_input_doesnt_crash() {
+        let (_, _, _) = run(&[]);
+    }
+
+    #[test]
+    fn non_pe_input_is_rejected_silently() {
+        let (v, _, m) = run(b"\x00\x00\x00 not even MZ");
+        assert!(v.is_empty() || v.get("pe.coff").is_none());
+        assert!(m.get("binary.is_pie").is_none());
+    }
+
+    #[test]
+    fn truncated_pe_header_doesnt_crash() {
+        let mut bytes = vec![0u8; 64];
+        bytes[..2].copy_from_slice(b"MZ");
+        let (_, _, _) = run(&bytes);
+    }
+
+    #[test]
+    fn end_to_end_parses_real_pe_fixture() {
+        let bytes = read_fixture("test.exe");
+        let (v, _, m) = run(&bytes);
+        // Pike-style flat schema for COFF + optional header.
+        assert!(v.get("pe.coff").is_some() || v.get("pe.machine").is_some());
+        // PIE flag derived from DLL_CHARACTERISTICS_DYNAMIC_BASE.
+        assert!(m.get("binary.is_pie").is_some());
     }
 }

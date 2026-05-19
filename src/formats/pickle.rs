@@ -15,7 +15,7 @@
 //!   `obj`, `newobj`, `newobj_ex`, `stack_global`, `global`,
 //!   `persid`, `binpersid`, `ext1`, `ext2`, `ext4`).
 
-use serde_json::{json, Value as JsonValue};
+use serde_json::Value as JsonValue;
 use std::collections::{BTreeSet, VecDeque};
 
 use crate::error::Error;
