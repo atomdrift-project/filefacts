@@ -55,12 +55,33 @@ const CP_PACKAGE: u8 = 20;
 struct ConstantPool {
     utf8: HashMap<u16, String>,
     class: HashMap<u16, u16>,
+    /// `CONSTANT_NameAndType_info` -> (name_idx, descriptor_idx).
+    /// Needed to resolve methodref / fieldref entries to readable
+    /// names.
+    name_and_type: HashMap<u16, (u16, u16)>,
+    /// `CONSTANT_Methodref_info` and friends -> (class_idx,
+    /// name_and_type_idx). One map covers Methodref,
+    /// InterfaceMethodref, and Fieldref — consumers can ignore the
+    /// kind for forensic purposes.
+    methodref: HashMap<u16, (u16, u16)>,
 }
 
 impl ConstantPool {
     fn class_name(&self, class_idx: u16) -> Option<&str> {
         let name_idx = *self.class.get(&class_idx)?;
         self.utf8.get(&name_idx).map(String::as_str)
+    }
+
+    /// Resolve a methodref-like CP entry to `(owning_class, name,
+    /// descriptor)` strings. Returns `None` when any link in the
+    /// chain is missing or malformed.
+    fn methodref_resolve(&self, idx: u16) -> Option<(&str, &str, &str)> {
+        let (class_idx, nat_idx) = *self.methodref.get(&idx)?;
+        let class = self.class_name(class_idx)?;
+        let (name_idx, desc_idx) = *self.name_and_type.get(&nat_idx)?;
+        let name = self.utf8.get(&name_idx).map(String::as_str)?;
+        let desc = self.utf8.get(&desc_idx).map(String::as_str)?;
+        Some((class, name, desc))
     }
 }
 
@@ -69,6 +90,8 @@ pub(super) fn extract(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
+    imports_out: &mut crate::Imports,
+    functions_out: &mut crate::Functions,
 ) -> Result<(), Error> {
     extract_ascii_strings(bytes, strings);
 
@@ -104,14 +127,18 @@ pub(super) fn extract(
         };
         interface_idx.push(idx);
     }
-    // Skip fields[] and methods[] to reach class-level attributes.
+    // Skip fields[]; parse methods[] for the typed Functions view.
     if skip_member_table(bytes, &mut pos).is_none() {
         return Ok(());
     }
-    if skip_member_table(bytes, &mut pos).is_none() {
-        return Ok(());
-    }
+    let method_count = parse_methods(bytes, &mut pos, &cp, functions_out).unwrap_or(0);
     let attrs = parse_attributes(bytes, &mut pos, &cp);
+
+    // Surface external class references and methodref-resolved
+    // imports. `this_class` is the class's own self-reference and
+    // must not show up as an import.
+    populate_imports(&cp, this_idx, imports_out, metrics);
+    metrics.insert("class.method_count", f64::from(method_count));
 
     put_u64(values, "class.major_version", u64::from(major_version));
     put_u64(values, "class.minor_version", u64::from(minor_version));
@@ -270,6 +297,123 @@ fn parse_attributes(bytes: &[u8], pos: &mut usize, cp: &ConstantPool) -> ClassAt
     out
 }
 
+/// Walk the `methods[]` array, push each declared method into the
+/// typed `Functions` view, and return the count. Field structure
+/// per JVM Spec §4.6: `access_flags u2; name_index u2;
+/// descriptor_index u2; attributes_count u2; attributes[]`.
+///
+/// We don't parse the per-method `Code` attribute — only the
+/// declaration matters for the symbol surface. Attributes are
+/// length-skipped.
+fn parse_methods(
+    bytes: &[u8],
+    pos: &mut usize,
+    cp: &ConstantPool,
+    out: &mut crate::Functions,
+) -> Option<u32> {
+    let count = read_u16(bytes, pos)?;
+    for _ in 0..count {
+        let access_flags = read_u16(bytes, pos)?;
+        let name_idx = read_u16(bytes, pos)?;
+        let _descriptor_idx = read_u16(bytes, pos)?;
+        let attrs = read_u16(bytes, pos)?;
+        for _ in 0..attrs {
+            *pos = pos.checked_add(2)?;
+            let len = read_u32(bytes, pos)? as usize;
+            *pos = pos.checked_add(len)?;
+            if *pos > bytes.len() {
+                return None;
+            }
+        }
+        let Some(name) = cp.utf8.get(&name_idx) else {
+            continue;
+        };
+        // Class-file method kinds: `<init>` is the JVM's name for a
+        // constructor, `<clinit>` for the static initialiser. Real
+        // method declarations get the generic `"method"` tag.
+        let kind: Option<&'static str> = match name.as_str() {
+            "<init>" => Some("constructor"),
+            "<clinit>" => Some("initializer"),
+            _ => Some("method"),
+        };
+        // Static methods are interesting for entry-point detection
+        // (`public static void main(String[])`). We don't yet emit
+        // the access-flag decomposition per function — that lives
+        // in the kv tree only.
+        let _ = access_flags;
+        out.push(crate::Function {
+            name: name.clone(),
+            source: "java-class",
+            offset: None,
+            kind,
+        });
+    }
+    Some(u32::from(count))
+}
+
+/// Push two flavours of typed `Import` entries discovered through
+/// the constant pool: external-class references (the JVM's import
+/// system at compile time) and methodref-resolved foreign-method
+/// references.
+fn populate_imports(
+    cp: &ConstantPool,
+    this_idx: u16,
+    out: &mut crate::Imports,
+    metrics: &mut Metrics,
+) {
+    // Distinct external class references — every CONSTANT_Class_info
+    // entry except the class's own `this_class`. The class's
+    // super-class is included because depending on it is a real
+    // import; tooling matching against superclass-of-X queries gets
+    // the data through the same view.
+    let mut class_count: u32 = 0;
+    let mut seen: std::collections::BTreeSet<&str> =
+        std::collections::BTreeSet::new();
+    for (&idx, _) in &cp.class {
+        if idx == this_idx {
+            continue;
+        }
+        let Some(name) = cp.class_name(idx) else {
+            continue;
+        };
+        if !seen.insert(name) {
+            continue;
+        }
+        out.push(crate::Import {
+            name: name.to_string(),
+            library: None,
+            source: "java-class",
+            offset: None,
+            ordinal: None,
+        });
+        class_count = class_count.saturating_add(1);
+    }
+    metrics.insert("class.external_class_count", f64::from(class_count));
+
+    // Methodref / InterfaceMethodref / Fieldref — surface only the
+    // ones we can fully resolve to (class, name, descriptor). The
+    // owning-class name carries the library identity; the symbol
+    // name is the method name. Descriptor is not stored on Import
+    // today — `<non-literal>` style overloading collisions are
+    // rare enough that consumers can re-walk the kv tree if they
+    // need the signature.
+    let mut method_ref_count: u32 = 0;
+    for (&idx, _) in &cp.methodref {
+        let Some((owner, name, _desc)) = cp.methodref_resolve(idx) else {
+            continue;
+        };
+        out.push(crate::Import {
+            name: name.to_string(),
+            library: Some(owner.to_string()),
+            source: "java-methodref",
+            offset: None,
+            ordinal: None,
+        });
+        method_ref_count = method_ref_count.saturating_add(1);
+    }
+    metrics.insert("class.method_ref_count", f64::from(method_ref_count));
+}
+
 fn skip_member_table(bytes: &[u8], pos: &mut usize) -> Option<()> {
     let count = read_u16(bytes, pos)?;
     for _ in 0..count {
@@ -318,14 +462,21 @@ fn parse_constant_pool(bytes: &[u8], pos: &mut usize, count: usize) -> Option<Co
                 *pos = pos.checked_add(8)?;
                 i += 1; // longs/doubles take two CP slots
             }
-            CP_INTEGER
-            | CP_FLOAT
-            | CP_FIELDREF
-            | CP_METHODREF
-            | CP_INTERFACE_METHODREF
-            | CP_NAME_AND_TYPE
-            | CP_DYNAMIC
-            | CP_INVOKE_DYNAMIC => {
+            CP_FIELDREF | CP_METHODREF | CP_INTERFACE_METHODREF => {
+                // (class_index, name_and_type_index) — both u16,
+                // big-endian. Captured so we can resolve method
+                // references to (owning_class, name, descriptor)
+                // triples later.
+                let class_idx = read_u16(bytes, pos)?;
+                let nat_idx = read_u16(bytes, pos)?;
+                cp.methodref.insert(i as u16, (class_idx, nat_idx));
+            }
+            CP_NAME_AND_TYPE => {
+                let name_idx = read_u16(bytes, pos)?;
+                let desc_idx = read_u16(bytes, pos)?;
+                cp.name_and_type.insert(i as u16, (name_idx, desc_idx));
+            }
+            CP_INTEGER | CP_FLOAT | CP_DYNAMIC | CP_INVOKE_DYNAMIC => {
                 *pos = pos.checked_add(4)?;
             }
             CP_METHOD_HANDLE => {
@@ -413,8 +564,22 @@ mod tests {
         let mut v = Values::new();
         let mut s = Strings::default();
         let mut m = Metrics::new();
-        extract(bytes, &mut v, &mut s, &mut m).unwrap();
+        let mut imports = crate::Imports::new();
+        let mut functions = crate::Functions::new();
+        extract(bytes, &mut v, &mut s, &mut m, &mut imports, &mut functions).unwrap();
         (v, m)
+    }
+
+    fn run_full(
+        bytes: &[u8],
+    ) -> (Values, Metrics, crate::Imports, crate::Functions) {
+        let mut v = Values::new();
+        let mut s = Strings::default();
+        let mut m = Metrics::new();
+        let mut imports = crate::Imports::new();
+        let mut functions = crate::Functions::new();
+        extract(bytes, &mut v, &mut s, &mut m, &mut imports, &mut functions).unwrap();
+        (v, m, imports, functions)
     }
 
     #[test]
@@ -472,6 +637,32 @@ mod tests {
         assert_eq!(m.get("class.major_version"), Some(99.0));
     }
 
+    /// `populate_imports` surfaces every external CONSTANT_Class_info
+    /// entry except the class's own `this_class`. A minimal class
+    /// with `super_class = java/lang/Object` always has at least one
+    /// external-class import.
+    #[test]
+    fn external_class_refs_emit_typed_imports() {
+        let bytes = build_class(52, false);
+        let (_, m, imports, functions) = run_full(&bytes);
+        // `java/lang/Object` shows up as a `java-class` import; the
+        // class's own `MyClass` self-reference does not.
+        let names: Vec<&str> = imports.iter().map(|i| i.name.as_str()).collect();
+        assert!(
+            names.contains(&"java/lang/Object"),
+            "expected super-class as java-class import, got {names:?}",
+        );
+        assert!(!names.contains(&"MyClass"), "this_class must not leak as import");
+        for imp in imports.iter() {
+            assert_eq!(imp.source, "java-class");
+            assert!(imp.library.is_none(), "java-class imports carry no library");
+        }
+        assert_eq!(m.get("class.external_class_count"), Some(1.0));
+        // No methods were declared by the builder.
+        assert_eq!(m.get("class.method_count"), Some(0.0));
+        assert!(functions.is_empty());
+    }
+
     #[test]
     fn truncated_constant_pool_doesnt_crash() {
         // Valid magic + version + cp_count = 7, but no entries.
@@ -512,6 +703,105 @@ mod tests {
         let bytes = vec![0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 65, 0, 1];
         let (v, _) = run(&bytes);
         assert!(v.get("class.major_version").is_none());
+    }
+
+    /// Build a class file with:
+    ///   - one declared method `compute()V`
+    ///   - one Methodref pointing at `java/lang/System.exit(I)V`
+    ///
+    /// Layout:
+    ///   1 Utf8 "Demo"
+    ///   2 Utf8 "java/lang/Object"
+    ///   3 Utf8 "java/lang/System"
+    ///   4 Utf8 "exit"
+    ///   5 Utf8 "(I)V"
+    ///   6 Utf8 "compute"
+    ///   7 Utf8 "()V"
+    ///   8 Class -> 1 (Demo)
+    ///   9 Class -> 2 (Object)
+    ///  10 Class -> 3 (System)
+    ///  11 NameAndType -> (4, 5)   exit:(I)V
+    ///  12 Methodref -> (10, 11)   System.exit(I)V
+    fn build_class_with_methodref_and_method() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0xCAFE_BABE_u32.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&52u16.to_be_bytes()); // major (Java 8)
+        out.extend_from_slice(&13u16.to_be_bytes()); // cp_count = 13 (indices 1..=12)
+
+        fn push_utf8(out: &mut Vec<u8>, s: &str) {
+            out.push(CP_UTF8);
+            out.extend_from_slice(&(s.len() as u16).to_be_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        push_utf8(&mut out, "Demo");
+        push_utf8(&mut out, "java/lang/Object");
+        push_utf8(&mut out, "java/lang/System");
+        push_utf8(&mut out, "exit");
+        push_utf8(&mut out, "(I)V");
+        push_utf8(&mut out, "compute");
+        push_utf8(&mut out, "()V");
+        // Class entries (idx 8, 9, 10)
+        out.push(CP_CLASS);
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.push(CP_CLASS);
+        out.extend_from_slice(&2u16.to_be_bytes());
+        out.push(CP_CLASS);
+        out.extend_from_slice(&3u16.to_be_bytes());
+        // NameAndType (idx 11)
+        out.push(CP_NAME_AND_TYPE);
+        out.extend_from_slice(&4u16.to_be_bytes());
+        out.extend_from_slice(&5u16.to_be_bytes());
+        // Methodref (idx 12)
+        out.push(CP_METHODREF);
+        out.extend_from_slice(&10u16.to_be_bytes());
+        out.extend_from_slice(&11u16.to_be_bytes());
+
+        out.extend_from_slice(&0x0021u16.to_be_bytes()); // access flags
+        out.extend_from_slice(&8u16.to_be_bytes()); // this_class -> Demo
+        out.extend_from_slice(&9u16.to_be_bytes()); // super_class -> Object
+        out.extend_from_slice(&0u16.to_be_bytes()); // interfaces_count
+        out.extend_from_slice(&0u16.to_be_bytes()); // fields_count
+
+        // methods[1]: compute()V — public, no attributes.
+        out.extend_from_slice(&1u16.to_be_bytes()); // methods_count
+        out.extend_from_slice(&0x0001u16.to_be_bytes()); // ACC_PUBLIC
+        out.extend_from_slice(&6u16.to_be_bytes()); // name -> "compute"
+        out.extend_from_slice(&7u16.to_be_bytes()); // descriptor -> "()V"
+        out.extend_from_slice(&0u16.to_be_bytes()); // attributes_count
+
+        // class-level attributes_count = 0
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn methodref_resolves_to_java_methodref_import() {
+        let bytes = build_class_with_methodref_and_method();
+        let (_, m, imports, _) = run_full(&bytes);
+        let methodref: Vec<&crate::Import> = imports
+            .iter()
+            .filter(|i| i.source == "java-methodref")
+            .collect();
+        assert_eq!(methodref.len(), 1);
+        assert_eq!(methodref[0].name, "exit");
+        assert_eq!(methodref[0].library.as_deref(), Some("java/lang/System"));
+        assert_eq!(m.get("class.method_ref_count"), Some(1.0));
+        // Three classes referenced: Object, System, Demo (self).
+        // populate_imports excludes Demo (this_class), so 2 stay.
+        assert_eq!(m.get("class.external_class_count"), Some(2.0));
+    }
+
+    #[test]
+    fn declared_methods_emit_typed_functions() {
+        let bytes = build_class_with_methodref_and_method();
+        let (_, m, _, functions) = run_full(&bytes);
+        let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["compute"]);
+        assert_eq!(m.get("class.method_count"), Some(1.0));
+        let f = functions.iter().next().unwrap();
+        assert_eq!(f.source, "java-class");
+        assert_eq!(f.kind, Some("method"));
     }
 
     fn build_class_with_flags(major: u16, flags: u16) -> Vec<u8> {

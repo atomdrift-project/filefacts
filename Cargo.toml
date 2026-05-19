@@ -59,6 +59,10 @@ cfb = "0.10"
 # need to construct them in test fixtures.
 uuid = "1"
 
+# Regex engine for the VBA symbol extractor. No PCRE features used —
+# the standard `regex` crate is enough.
+regex = "1"
+
 # Source-code extraction. Each language is its own crate; the base
 # `tree-sitter` engine is shared. Adding a language is one dependency
 # line plus one entry in `src/formats/source/langs.rs`.

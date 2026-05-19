@@ -33,6 +33,8 @@ pub(super) fn extract(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
+    imports_out: &mut crate::Imports,
+    functions_out: &mut crate::Functions,
 ) -> Result<(), Error> {
     let Some(cache) = tree_cache else {
         return Ok(());
@@ -48,23 +50,76 @@ pub(super) fn extract(
     let classes = collect_query(config.language, source, root, config.class_query);
 
     if !imports.is_empty() {
+        // Mirror into the typed Imports view with byte offsets from
+        // tree-sitter. `library` stays unset — source-language imports
+        // are module-scoped strings, not library-tagged. Source tag is
+        // the language name (`"javascript"`, `"python"`, `"go"`, …) so
+        // trait matchers can filter by language without consulting
+        // file_type. See expose/src/output/symbols.rs for the
+        // source-tag taxonomy.
+        for (name, offset) in &imports {
+            imports_out.push(crate::Import {
+                name: name.clone(),
+                library: None,
+                source: config.name,
+                offset: Some(*offset),
+                ordinal: None,
+            });
+        }
         values.insert(
             "imports",
-            JsonValue::Array(imports.into_iter().map(JsonValue::String).collect()),
+            JsonValue::Array(
+                imports
+                    .iter()
+                    .map(|(n, _)| JsonValue::String(n.clone()))
+                    .collect(),
+            ),
         );
     }
     if !functions.is_empty() {
         metrics.insert("source.function_count", functions.len() as f64);
+        for (name, offset) in &functions {
+            functions_out.push(crate::Function {
+                name: name.clone(),
+                source: config.name,
+                offset: Some(*offset),
+                kind: Some("function"),
+            });
+        }
         values.insert(
             "functions",
-            JsonValue::Array(functions.into_iter().map(JsonValue::String).collect()),
+            JsonValue::Array(
+                functions
+                    .iter()
+                    .map(|(n, _)| JsonValue::String(n.clone()))
+                    .collect(),
+            ),
         );
     }
     if !classes.is_empty() {
         metrics.insert("source.class_count", classes.len() as f64);
+        // Class declarations also surface as `Function` records
+        // tagged `kind: "class"` — the symbol axis is "things
+        // declared here", regardless of whether they're a function
+        // or a class. Consumers that need the distinction read the
+        // kind field; consumers that just want "is name X declared
+        // here?" iterate one collection.
+        for (name, offset) in &classes {
+            functions_out.push(crate::Function {
+                name: name.clone(),
+                source: config.name,
+                offset: Some(*offset),
+                kind: Some("class"),
+            });
+        }
         values.insert(
             "classes",
-            JsonValue::Array(classes.into_iter().map(JsonValue::String).collect()),
+            JsonValue::Array(
+                classes
+                    .iter()
+                    .map(|(n, _)| JsonValue::String(n.clone()))
+                    .collect(),
+            ),
         );
     }
 
@@ -156,7 +211,7 @@ fn collect_query(
     source: &str,
     root: Node<'_>,
     query_src: &'static str,
-) -> Vec<String> {
+) -> Vec<(String, u64)> {
     if query_src.is_empty() {
         return Vec::new();
     }
@@ -165,7 +220,12 @@ fn collect_query(
     };
     let capture_names = query.capture_names();
     let mut cursor = QueryCursor::new();
-    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // De-duplicate by name, keeping the first (smallest) offset for
+    // each. A repeated `import os` shows up once; the offset points
+    // at its first occurrence, which is the most useful answer for
+    // proximity-style matchers.
+    let mut seen: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
     let mut matches = cursor.matches(&query, root, source.as_bytes());
     while let Some(m) = matches.next() {
         for cap in m.captures {
@@ -178,13 +238,15 @@ fn collect_query(
             }
             if let Ok(text) = cap.node.utf8_text(source.as_bytes()) {
                 let cleaned = strip_quotes(text);
-                if !cleaned.is_empty() {
-                    out.insert(cleaned);
+                if cleaned.is_empty() {
+                    continue;
                 }
+                let offset = cap.node.start_byte() as u64;
+                seen.entry(cleaned).or_insert(offset);
             }
         }
     }
-    out.into_iter().collect()
+    seen.into_iter().collect()
 }
 
 fn strip_quotes(s: &str) -> String {
@@ -216,5 +278,56 @@ mod tests {
         assert_eq!(strip_quotes("'hello'"), "hello");
         assert_eq!(strip_quotes("`hello`"), "hello");
         assert_eq!(strip_quotes("hello"), "hello");
+    }
+
+    /// Python `import os` / `from sys import path` populate the
+    /// typed `Imports` view with the language name as `source` and
+    /// a non-zero byte offset.
+    #[test]
+    fn python_imports_populate_typed_view() {
+        let src = b"import os\nfrom sys import path\nimport hashlib\n";
+        // open_with_path so fileid classifies as Python via the
+        // `.py` extension hint — without it the bytes look like
+        // plain text and the source extractor never runs.
+        let parsed = crate::open_with_path(
+            std::path::Path::new("test.py"),
+            src,
+        )
+        .unwrap();
+        let _ = parsed.values();
+        let imports = parsed.imports();
+        assert!(!imports.is_empty(), "expected python imports to populate typed view");
+        let names: std::collections::HashSet<&str> =
+            imports.iter().map(|i| i.name.as_str()).collect();
+        assert!(names.contains("os"), "got names {names:?}");
+        assert!(names.contains("hashlib"));
+        for imp in imports.iter() {
+            assert_eq!(imp.source, "python");
+            assert!(imp.library.is_none());
+            assert!(imp.offset.is_some());
+        }
+    }
+
+    /// Python `def foo()` / `class Bar:` populate the typed
+    /// `Functions` view with `kind: "function"` / `"class"`.
+    #[test]
+    fn python_functions_and_classes_populate_typed_view() {
+        let src = b"def hello():\n    pass\n\nclass Greeter:\n    pass\n";
+        let parsed = crate::open_with_path(
+            std::path::Path::new("test.py"),
+            src,
+        )
+        .unwrap();
+        let _ = parsed.values();
+        let functions = parsed.functions();
+        let names: std::collections::HashMap<&str, Option<&str>> = functions
+            .iter()
+            .map(|f| (f.name.as_str(), f.kind))
+            .collect();
+        assert_eq!(names.get("hello").copied(), Some(Some("function")));
+        assert_eq!(names.get("Greeter").copied(), Some(Some("class")));
+        for f in functions.iter() {
+            assert_eq!(f.source, "python");
+        }
     }
 }

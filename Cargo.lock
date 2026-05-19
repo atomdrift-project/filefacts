@@ -332,6 +332,7 @@ dependencies = [
  "md-5",
  "memchr",
  "plist",
+ "regex",
  "roxmltree",
  "serde",
  "serde_json",

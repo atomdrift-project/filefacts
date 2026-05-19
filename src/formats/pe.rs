@@ -10,22 +10,27 @@
 //! `pe.coff.machine`; `IMAGE_OPTIONAL_HEADER.Subsystem` becomes
 //! `pe.optional.subsystem`; the IAT is exposed as `pe.imports[]`.
 
-use goblin::pe::{header::CoffHeader, options::ParseOptions, optional_header::OptionalHeader, PE};
+use goblin::pe::{header::CoffHeader, optional_header::OptionalHeader, PE};
 use serde_json::{json, Value as JsonValue};
 
 use crate::error::Error;
 use crate::formats::common::{
     extract_ascii_strings, extract_utf16_strings, hex_encode, put_i64, put_str, put_u64,
 };
-use crate::output::{Metrics, Section, Strings, Values};
+use crate::formats::goblin_safe;
+use crate::output::{Errors, Metrics, Section, Strings, Values};
 use crate::scan::entropy;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn extract(
     bytes: &[u8],
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
     sections_out: &mut Vec<Section>,
+    imports_out: &mut crate::Imports,
+    exports_out: &mut crate::Exports,
+    errors_out: &mut Errors,
 ) -> Result<(), Error> {
     // PE strings are scattered across `.rdata`, `.data`, and resources.
     // The full-file scan is cheap and captures content embedded outside
@@ -40,30 +45,57 @@ pub(super) fn extract(
     // optional-header + Authenticode facts. Partial output is far
     // more useful than none.
     //
-    // We default to `resolve_rva: true` here because goblin uses it to
-    // *validate* directory entries against the section table, and
-    // skipping that validation actually rejects legitimate binaries
-    // (some Microsoft DLLs have name RVAs that look out-of-bounds
-    // without section-aware resolution).
-    let opts = ParseOptions::default();
-    if let Ok(pe) = PE::parse_with_opts(bytes, &opts) {
+    // `goblin_safe::parse_pe` validates the header up-front (rejects
+    // PEs whose section count or directory-table sizes would blow up
+    // goblin's lazy walkers), catches any panic from the parse, and
+    // does the strict→permissive fallback internally. Callers must
+    // never reach for `PE::parse_with_opts` directly.
+    let parse_outcome = goblin_safe::parse_pe(bytes);
+    // Record the failure mode (if any) into the structured errors
+    // view *before* we attempt the header-only fallback, so consumers
+    // can see exactly which sub-stage tripped even when the fallback
+    // succeeds.
+    match &parse_outcome {
+        goblin_safe::GoblinOutcome::Failed(e) => {
+            errors_out.record_malformed("pe-parse", e.to_string());
+            metrics.insert("pe.parse_failed", 1.0);
+        }
+        goblin_safe::GoblinOutcome::Panicked(msg) => {
+            errors_out.record_panic("pe-parse", msg);
+            metrics.insert("pe.parse_panicked", 1.0);
+        }
+        goblin_safe::GoblinOutcome::Ok(_) => {}
+    }
+    if let Some(pe) = parse_outcome.ok() {
         coff_header(&pe.header.coff_header, values);
         if let Some(ref opt) = pe.header.optional_header {
             optional_header(opt, values);
             binary_flags(opt, metrics);
         }
         sections(&pe, bytes, metrics, sections_out);
-        imports(&pe, values, metrics);
-        exports(&pe, values, metrics);
+        imports(&pe, values, metrics, imports_out);
+        exports(&pe, values, metrics, exports_out);
         authenticode(&pe, bytes, values);
         if let Some(rd) = pe.resource_data.as_ref() {
-            resource_types(rd, values, metrics);
-            resource_timestamp(rd, values);
-            if let Some(ref vi) = rd.version_info {
-                super::pe_version_info::extract(vi, values);
-            }
-            if let Some(ref md) = rd.manifest_data {
-                super::pe_manifest::extract(md.data, values);
+            // The resource walker is lazy and slices with unchecked
+            // header offsets — packed Windows malware regularly
+            // panics inside `entries()` / `count()`. Wrap the walk
+            // in catch_infallible so a malformed resource directory
+            // leaves resource metrics at their defaults instead of
+            // aborting the whole extraction.
+            let walk = goblin_safe::catch_infallible(|| {
+                resource_types(rd, values, metrics);
+                resource_timestamp(rd, values);
+                if let Some(ref vi) = rd.version_info {
+                    super::pe_version_info::extract(vi, values);
+                }
+                if let Some(ref md) = rd.manifest_data {
+                    super::pe_manifest::extract(md.data, values);
+                }
+            });
+            if let goblin_safe::GoblinOutcome::Panicked(msg) = walk {
+                errors_out.record_panic("pe-resource-walk", msg);
+                metrics.insert("pe.resource_walk_panicked", 1.0);
             }
         }
         if let Some(ref dbg) = pe.debug_data {
@@ -90,7 +122,14 @@ pub(super) fn extract(
         binary_flags(opt, metrics);
     }
     authenticode_from_header(&header, bytes, values);
+    // Header-only fallback ran. Record that as a structured
+    // fallback entry alongside the legacy `pe.partial_parse` bool
+    // so trait authors can branch on either path. The bool is
+    // retained as the canonical "is this a partial parse?" key for
+    // existing rules.
     values.insert("pe.partial_parse", serde_json::Value::Bool(true));
+    errors_out.record_fallback("pe-parse", "header-only fallback");
+    metrics.insert("pe.partial_parse", 1.0);
     Ok(())
 }
 
@@ -232,7 +271,12 @@ fn strip_lib_ext(lib: &str) -> &str {
     lib
 }
 
-fn imports(pe: &PE<'_>, values: &mut Values, metrics: &mut Metrics) {
+fn imports(
+    pe: &PE<'_>,
+    values: &mut Values,
+    metrics: &mut Metrics,
+    imports_out: &mut crate::Imports,
+) {
     // goblin's `imports` is flat: one entry per imported symbol with the
     // DLL name attached. Group by DLL for the public schema — that's
     // what tooling expects and matches `dumpbin /imports` output.
@@ -243,6 +287,27 @@ fn imports(pe: &PE<'_>, values: &mut Values, metrics: &mut Metrics) {
             .entry(imp.dll.to_string())
             .or_default()
             .push(JsonValue::String(imp.name.to_string()));
+        // Mirror into the typed unified view. Library is normalised
+        // to the lowercase stem (no `.dll` / `.ocx` / `.sys`) so
+        // consumers can match against `library == "kernel32"` without
+        // case- or extension-juggling. goblin synthesises the name
+        // `ORDINAL N` for ordinal-only imports — surface the ordinal
+        // explicitly in that case so consumers don't have to parse
+        // the name back out.
+        let lib_lower = imp.dll.to_ascii_lowercase();
+        let library = strip_lib_ext(&lib_lower).to_string();
+        let name_is_ordinal_stub = imp.name.starts_with("ORDINAL ");
+        imports_out.push(crate::Import {
+            name: imp.name.to_string(),
+            library: Some(library),
+            source: "pe",
+            offset: Some(imp.offset as u64),
+            ordinal: if name_is_ordinal_stub {
+                Some(u32::from(imp.ordinal))
+            } else {
+                None
+            },
+        });
     }
     let arr: Vec<JsonValue> = by_dll
         .into_iter()
@@ -262,12 +327,26 @@ fn imports(pe: &PE<'_>, values: &mut Values, metrics: &mut Metrics) {
     }
 }
 
-fn exports(pe: &PE<'_>, values: &mut Values, metrics: &mut Metrics) {
+fn exports(
+    pe: &PE<'_>,
+    values: &mut Values,
+    metrics: &mut Metrics,
+    exports_out: &mut crate::Exports,
+) {
     let names: Vec<JsonValue> = pe
         .exports
         .iter()
         .filter_map(|e| e.name.map(|n| JsonValue::String(n.to_string())))
         .collect();
+    for exp in &pe.exports {
+        let Some(name) = exp.name else { continue };
+        exports_out.push(crate::Export {
+            name: name.to_string(),
+            source: "pe",
+            offset: exp.offset.map(|o| o as u64),
+            ordinal: None,
+        });
+    }
     metrics.insert("pe.export_count", names.len() as f64);
     values.insert("pe.exports", JsonValue::Array(names));
 }
@@ -778,7 +857,19 @@ mod tests {
         let mut s = Strings::default();
         let mut m = Metrics::new();
         let mut sections = Vec::new();
-        let _ = extract(bytes, &mut v, &mut s, &mut m, &mut sections);
+        let mut imports = crate::Imports::new();
+        let mut exports = crate::Exports::new();
+        let mut errors = Errors::new();
+        let _ = extract(
+            bytes,
+            &mut v,
+            &mut s,
+            &mut m,
+            &mut sections,
+            &mut imports,
+            &mut exports,
+            &mut errors,
+        );
         (v, s, m)
     }
 
@@ -841,5 +932,42 @@ mod tests {
         assert!(v.get("pe.coff").is_some() || v.get("pe.machine").is_some());
         // PIE flag derived from DLL_CHARACTERISTICS_DYNAMIC_BASE.
         assert!(m.get("binary.is_pie").is_some());
+    }
+
+    /// Verifies the typed Imports/Exports views are populated in
+    /// lockstep with the legacy `pe.imports[]` / `pe.exports[]` kv
+    /// shape, and that library names are normalised (lowercase, no
+    /// `.dll`).
+    #[test]
+    fn typed_imports_and_exports_populated() {
+        let bytes = read_fixture("test.exe");
+        let mut v = Values::new();
+        let mut s = Strings::default();
+        let mut m = Metrics::new();
+        let mut sections = Vec::new();
+        let mut imports = crate::Imports::new();
+        let mut exports = crate::Exports::new();
+        let mut errors = Errors::new();
+        extract(
+            &bytes,
+            &mut v,
+            &mut s,
+            &mut m,
+            &mut sections,
+            &mut imports,
+            &mut exports,
+            &mut errors,
+        )
+        .unwrap();
+        assert!(!imports.is_empty(), "expected at least one PE import");
+        for imp in imports.iter() {
+            assert_eq!(imp.source, "pe");
+            let lib = imp.library.as_deref().expect("PE imports carry library");
+            assert_eq!(lib, &lib.to_ascii_lowercase());
+            assert!(
+                !lib.ends_with(".dll") && !lib.ends_with(".ocx") && !lib.ends_with(".sys"),
+                "library stem should drop extension: {lib}",
+            );
+        }
     }
 }

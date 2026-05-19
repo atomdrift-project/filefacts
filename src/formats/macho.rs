@@ -14,24 +14,47 @@ use serde_json::{json, Value as JsonValue};
 
 use crate::error::Error;
 use crate::formats::common::{extract_ascii_strings, put_str, put_u64};
-use crate::output::{Metrics, Section, Strings, Values};
+use crate::formats::goblin_safe;
+use crate::output::{Errors, Metrics, Section, Strings, Values};
 use crate::scan::entropy;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn extract(
     bytes: &[u8],
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
     sections_out: &mut Vec<Section>,
+    imports_out: &mut crate::Imports,
+    exports_out: &mut crate::Exports,
+    errors_out: &mut Errors,
 ) -> Result<(), Error> {
     extract_ascii_strings(bytes, strings);
 
-    let parsed = Mach::parse(bytes).map_err(|e| Error::malformed("macho", e.to_string()))?;
+    // Wrap goblin parse in catch_unwind. Fat-header arithmetic
+    // overflow on malformed Mach-O has historically panicked
+    // goblin; record the failure and return Ok so byte-level
+    // metrics from the generic pass aren't lost.
+    let parsed = match goblin_safe::parse_mach(bytes) {
+        goblin_safe::GoblinOutcome::Ok(m) => m,
+        goblin_safe::GoblinOutcome::Failed(e) => {
+            errors_out.record_malformed("macho-parse", e.to_string());
+            metrics.insert("macho.parse_failed", 1.0);
+            return Ok(());
+        }
+        goblin_safe::GoblinOutcome::Panicked(msg) => {
+            errors_out.record_panic("macho-parse", msg);
+            metrics.insert("macho.parse_panicked", 1.0);
+            return Ok(());
+        }
+    };
     match parsed {
         Mach::Binary(macho) => {
-            single_arch(&macho, bytes, values, metrics, sections_out);
+            single_arch(&macho, bytes, values, metrics, sections_out, imports_out, exports_out);
         }
-        Mach::Fat(fat) => fat_binary(bytes, &fat, values, metrics, sections_out),
+        Mach::Fat(fat) => {
+            fat_binary(bytes, &fat, values, metrics, sections_out, imports_out, exports_out);
+        }
     }
     Ok(())
 }
@@ -42,6 +65,8 @@ fn fat_binary(
     values: &mut Values,
     metrics: &mut Metrics,
     sections_out: &mut Vec<Section>,
+    imports_out: &mut crate::Imports,
+    exports_out: &mut crate::Exports,
 ) {
     let mut archs: Vec<JsonValue> = Vec::new();
     for (idx, slice) in fat.iter_arches().enumerate() {
@@ -58,7 +83,9 @@ fn fat_binary(
             "libraries": macho.libs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
         }));
         if idx == 0 {
-            single_arch(&macho, slice_bytes, values, metrics, sections_out);
+            single_arch(
+                &macho, slice_bytes, values, metrics, sections_out, imports_out, exports_out,
+            );
         }
     }
     metrics.insert("macho.slice_count", archs.len() as f64);
@@ -71,10 +98,85 @@ fn single_arch(
     values: &mut Values,
     metrics: &mut Metrics,
     sections_out: &mut Vec<Section>,
+    imports_out: &mut crate::Imports,
+    exports_out: &mut crate::Exports,
 ) {
     extract_sections(macho, bytes, metrics, sections_out);
     extract_header_and_loads(macho, bytes, values, metrics);
+    extract_symbols(macho, values, metrics, imports_out, exports_out);
     super::build_toolchain::from_macho(values, sections_out);
+}
+
+/// Walk Mach-O's dyld bind-info (imports) and export trie (exports)
+/// and surface both as the format-native `macho.imports[]` /
+/// `macho.exports[]` arrays plus typed `Imports`/`Exports` entries.
+///
+/// Two source tags distinguish how the entry was discovered:
+/// `macho-bind` for two-level-namespace bind imports (carrying the
+/// resolving dylib stem), `macho-trie` for exports recovered from
+/// the dyld export trie.
+fn extract_symbols(
+    macho: &MachO<'_>,
+    values: &mut Values,
+    metrics: &mut Metrics,
+    imports_out: &mut crate::Imports,
+    exports_out: &mut crate::Exports,
+) {
+    // Imports — dylib stems are normalised to the bare library name
+    // (lowercased, basename only, `.dylib`/`.tbd` suffix stripped) so
+    // trait authors can match against `"libsystem.b"` rather than
+    // `"/usr/lib/libSystem.B.dylib"`.
+    if let Ok(imports) = macho.imports() {
+        let mut names: Vec<JsonValue> = Vec::new();
+        for imp in &imports {
+            let library = normalize_dylib_path(imp.dylib);
+            imports_out.push(crate::Import {
+                name: imp.name.to_string(),
+                library: Some(library),
+                source: "macho-bind",
+                offset: Some(imp.offset),
+                ordinal: None,
+            });
+            names.push(JsonValue::String(imp.name.to_string()));
+        }
+        metrics.insert("macho.import_count", names.len() as f64);
+        values.insert("macho.imports", JsonValue::Array(names));
+    }
+
+    // Exports — recovered from the dyld export trie. Re-exports
+    // (e.g. `libSystem` forwarding to `libdyld`) come through as
+    // regular `Export` entries; we surface only the name here, with
+    // forwarded-target handling left to a follow-up.
+    if let Ok(exports) = macho.exports() {
+        let mut names: Vec<JsonValue> = Vec::new();
+        for exp in &exports {
+            exports_out.push(crate::Export {
+                name: exp.name.clone(),
+                source: "macho-trie",
+                offset: Some(exp.offset),
+                ordinal: None,
+            });
+            names.push(JsonValue::String(exp.name.clone()));
+        }
+        metrics.insert("macho.export_count", names.len() as f64);
+        values.insert("macho.exports", JsonValue::Array(names));
+    }
+}
+
+/// Reduce a recorded dylib path to its bare library stem, lowercased.
+/// `/usr/lib/libSystem.B.dylib` -> `"libsystem.b"`. Compatible with
+/// PE's `library` normalisation convention so trait matchers can
+/// share library names across formats.
+fn normalize_dylib_path(path: &str) -> String {
+    let basename = path
+        .rsplit_once('/')
+        .map(|(_, name)| name)
+        .unwrap_or(path);
+    let stem = basename
+        .strip_suffix(".dylib")
+        .or_else(|| basename.strip_suffix(".tbd"))
+        .unwrap_or(basename);
+    stem.to_ascii_lowercase()
 }
 
 /// Walk `LC_SEGMENT` / `LC_SEGMENT_64` and surface each named
@@ -751,7 +853,19 @@ mod tests {
         let mut s = Strings::default();
         let mut m = Metrics::new();
         let mut sections = Vec::new();
-        let _ = extract(bytes, &mut v, &mut s, &mut m, &mut sections);
+        let mut imports = crate::Imports::new();
+        let mut exports = crate::Exports::new();
+        let mut errors = Errors::new();
+        let _ = extract(
+            bytes,
+            &mut v,
+            &mut s,
+            &mut m,
+            &mut sections,
+            &mut imports,
+            &mut exports,
+            &mut errors,
+        );
         (v, s, m)
     }
 
@@ -812,6 +926,53 @@ mod tests {
         // PIE / stripped metrics emitted for every Mach-O.
         assert!(m.get("binary.is_pie").is_some());
         assert!(m.get("binary.is_stripped").is_some());
+    }
+
+    #[test]
+    fn normalize_dylib_path_strips_dir_and_suffix() {
+        assert_eq!(normalize_dylib_path("/usr/lib/libSystem.B.dylib"), "libsystem.b");
+        assert_eq!(normalize_dylib_path("libobjc.A.tbd"), "libobjc.a");
+        // Bare names without prefix or suffix are lowercased.
+        assert_eq!(normalize_dylib_path("Foo"), "foo");
+    }
+
+    /// Verifies the typed Imports/Exports views are populated in
+    /// lockstep with the legacy `macho.imports[]` / `exports[]`
+    /// kv shape, and that library names come back normalised.
+    #[test]
+    fn typed_imports_and_exports_populated_for_macho() {
+        let bytes = read_fixture("test.macho");
+        let mut v = Values::new();
+        let mut s = Strings::default();
+        let mut m = Metrics::new();
+        let mut sections = Vec::new();
+        let mut imports = crate::Imports::new();
+        let mut exports = crate::Exports::new();
+        let mut errors = Errors::new();
+        extract(
+            &bytes,
+            &mut v,
+            &mut s,
+            &mut m,
+            &mut sections,
+            &mut imports,
+            &mut exports,
+            &mut errors,
+        )
+        .unwrap();
+        // The trivial test.macho fixture might have no exports but
+        // any real binary has bind imports for libSystem.
+        if !imports.is_empty() {
+            for imp in imports.iter() {
+                assert_eq!(imp.source, "macho-bind");
+                let lib = imp.library.as_deref().expect("Mach-O bind imports carry library");
+                assert_eq!(lib, &lib.to_ascii_lowercase());
+                assert!(!lib.ends_with(".dylib") && !lib.ends_with(".tbd"));
+            }
+        }
+        for exp in exports.iter() {
+            assert_eq!(exp.source, "macho-trie");
+        }
     }
 
     #[test]

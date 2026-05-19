@@ -22,13 +22,17 @@
 //!   tree-sitter parse for source files.
 
 mod ast;
+mod errors;
 mod metrics;
 mod sections;
 mod strings;
+mod symbols;
 mod values;
 
 pub use ast::{ArgShape, Ast, Call};
+pub use errors::{Errors, ParseError};
 pub use metrics::Metrics;
 pub use sections::{Section, Sections};
 pub use strings::{ExtractedString, StringCategory, Strings};
+pub use symbols::{Export, Exports, Function, Functions, Import, Imports};
 pub use values::Values;

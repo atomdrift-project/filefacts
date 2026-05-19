@@ -42,7 +42,19 @@ const MAX_MODULES: usize = 256;
 /// [`ole2::extract`]; this re-opens it because the cfb crate keeps
 /// the archive handle mutable internally and we'd otherwise have to
 /// thread it through the dispatch contract.
-pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
+///
+/// Module source bytes are also fed to [`super::vba_symbols::extract`],
+/// which populates the unified `imports_out` / `functions_out`
+/// collections with `vba-declare`, `vba-createobject`,
+/// `vba-getobject`, and `vba-decl` entries plus document-level
+/// aggregate metrics under `office.vba.*_count`.
+pub(super) fn extract(
+    bytes: &[u8],
+    values: &mut Values,
+    metrics: &mut Metrics,
+    imports_out: &mut crate::output::Imports,
+    functions_out: &mut crate::output::Functions,
+) {
     let cursor = Cursor::new(bytes);
     let Ok(mut comp) = cfb::CompoundFile::open(cursor) else {
         return;
@@ -63,6 +75,11 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
     // Parse module metadata from the decompressed dir stream.
     let module_infos = parse_dir_stream(&dir_decompressed);
     let mut modules: Vec<JsonValue> = Vec::new();
+    // Document-level aggregate counters folded across modules. The
+    // per-module stats from `vba_symbols::extract` accumulate here
+    // so a doc with three modules and one Declare each surfaces a
+    // single `office.vba.declare_count = 3`.
+    let mut agg = super::vba_symbols::VbaSymbolStats::default();
     for info in module_infos.iter().take(MAX_MODULES) {
         let stream_path = format!("{}/{}", prefix, info.stream_name);
         let Ok(stream_bytes) = read_stream(&mut comp, &stream_path) else {
@@ -80,6 +97,28 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
         // non-ASCII gracefully by substituting U+FFFD without
         // dropping the surrounding lines a trait might match against.
         let source = String::from_utf8_lossy(&source_bytes).into_owned();
+
+        // Run the symbol extractor before moving `source` into the
+        // module record.
+        let stats = super::vba_symbols::extract(&source, imports_out, functions_out);
+        agg.declare_count = agg.declare_count.saturating_add(stats.declare_count);
+        agg.declare_non_literal_count = agg
+            .declare_non_literal_count
+            .saturating_add(stats.declare_non_literal_count);
+        agg.createobject_count = agg
+            .createobject_count
+            .saturating_add(stats.createobject_count);
+        agg.createobject_non_literal_count = agg
+            .createobject_non_literal_count
+            .saturating_add(stats.createobject_non_literal_count);
+        agg.getobject_count = agg.getobject_count.saturating_add(stats.getobject_count);
+        agg.getobject_non_literal_count = agg
+            .getobject_non_literal_count
+            .saturating_add(stats.getobject_non_literal_count);
+        agg.trigger_handler_count = agg
+            .trigger_handler_count
+            .saturating_add(stats.trigger_handler_count);
+
         let mut obj = serde_json::Map::new();
         obj.insert("name".into(), JsonValue::String(info.name.clone()));
         obj.insert("stream_name".into(), JsonValue::String(info.stream_name.clone()));
@@ -102,6 +141,31 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
         let count = modules.len() as f64;
         values.insert("office.vba.modules", JsonValue::Array(modules));
         metrics.insert("office.vba.module_count", count);
+        // Aggregate symbol-extraction counters surface as metrics so
+        // composite rules can count obfuscation signals without
+        // walking the imports view.
+        metrics.insert("office.vba.declare_count", f64::from(agg.declare_count));
+        metrics.insert(
+            "office.vba.declare_non_literal_count",
+            f64::from(agg.declare_non_literal_count),
+        );
+        metrics.insert(
+            "office.vba.createobject_count",
+            f64::from(agg.createobject_count),
+        );
+        metrics.insert(
+            "office.vba.createobject_non_literal_count",
+            f64::from(agg.createobject_non_literal_count),
+        );
+        metrics.insert("office.vba.getobject_count", f64::from(agg.getobject_count));
+        metrics.insert(
+            "office.vba.getobject_non_literal_count",
+            f64::from(agg.getobject_non_literal_count),
+        );
+        metrics.insert(
+            "office.vba.trigger_handler_count",
+            f64::from(agg.trigger_handler_count),
+        );
     }
 }
 

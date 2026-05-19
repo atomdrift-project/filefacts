@@ -64,6 +64,18 @@ mod scan;
 
 pub mod fileid;
 
+/// VBA module-source symbol extractor.
+///
+/// Exposes the same regex-based pipeline `formats::vba::extract`
+/// uses internally to populate the typed `Imports` / `Functions`
+/// views for OLE2 documents. External crates that have a VBA
+/// module's decompressed source bytes in hand (without the
+/// surrounding CFB container) can call into [`vba_symbols::extract`]
+/// directly to get the same `Imports` / `Functions` / `VbaSymbolStats`.
+pub mod vba_symbols {
+    pub use crate::formats::vba_symbols::{extract, VbaSymbolStats, NON_LITERAL_SENTINEL};
+}
+
 use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -71,8 +83,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub use error::Error;
 pub use fileid::{FileId, FileType};
 pub use output::{
-    ArgShape, Ast, Call, ExtractedString, Metrics, Section, Sections, StringCategory, Strings,
-    Values,
+    ArgShape, Ast, Call, Errors, Export, Exports, ExtractedString, Function, Functions, Import,
+    Imports, Metrics, ParseError, Section, Sections, StringCategory, Strings, Values,
 };
 
 /// Schema version of the public output shape.
@@ -123,6 +135,10 @@ struct Extracted {
     metrics: Metrics,
     ast: Ast,
     sections: Sections,
+    imports: Imports,
+    exports: Exports,
+    functions: Functions,
+    errors: Errors,
 }
 
 impl<'a> ParsedFile<'a> {
@@ -175,6 +191,59 @@ impl<'a> ParsedFile<'a> {
         &self.extracted().sections
     }
 
+    /// Foreign-symbol references — entries this file uses that are
+    /// defined elsewhere (PE imports, ELF `.dynsym` undefined,
+    /// Mach-O undef symbols, VBA `Declare` / `CreateObject`,
+    /// Java constant-pool class refs, source-level `import` /
+    /// `require`). Each [`Import`] carries `name`, optional
+    /// `library`, a `source` tag identifying the extraction site,
+    /// and optional `offset` / `ordinal`. See [`crate::Import`].
+    pub fn imports(&self) -> &Imports {
+        &self.extracted().imports
+    }
+
+    /// Locally-defined symbols this file makes externally visible
+    /// (PE export table, ELF `.dynsym` defined, Mach-O dyld trie,
+    /// Java public methods, source-level `export` statements). Each
+    /// [`Export`] carries `name`, `source`, and optional `offset` /
+    /// `ordinal`.
+    pub fn exports(&self) -> &Exports {
+        &self.extracted().exports
+    }
+
+    /// Functions / methods / subroutines defined inside this file.
+    /// Distinct from [`Self::exports`] — a function may be local
+    /// without being exported, and an export entry may point at a
+    /// function whose body is also enumerated here with extra
+    /// detail. Each [`Function`] carries `name`, `source`, optional
+    /// `offset`, and optional `kind`.
+    pub fn functions(&self) -> &Functions {
+        &self.extracted().functions
+    }
+
+    /// Non-fatal extraction errors encountered during the parse.
+    ///
+    /// Expose always returns as much data as it can: when a goblin
+    /// lazy walker panics or a sub-table is truncated, the failure
+    /// is recorded here and the rest of the extraction continues.
+    /// Empty when nothing went wrong. See [`crate::ParseError`] for
+    /// the entry shape.
+    pub fn errors(&self) -> &Errors {
+        &self.extracted().errors
+    }
+
+    /// Iterate every symbol name across [`Self::imports`],
+    /// [`Self::exports`], and [`Self::functions`] in that order.
+    /// Convenience for cross-cutting trait matchers ("any symbol
+    /// of this name regardless of category"). Yields `(name,
+    /// source)` so the caller can disambiguate when needed.
+    pub fn symbol_iter(&self) -> impl Iterator<Item = (&str, &'static str)> {
+        let imports = self.imports().iter().map(|i| (i.name.as_str(), i.source));
+        let exports = self.exports().iter().map(|e| (e.name.as_str(), e.source));
+        let functions = self.functions().iter().map(|f| (f.name.as_str(), f.source));
+        imports.chain(exports).chain(functions)
+    }
+
     /// Borrow the shared tree-sitter parse, if this file is a source
     /// language and parsing succeeded.
     fn tree_cache(&self) -> Option<&formats::source::TreeCache<'a>> {
@@ -218,11 +287,18 @@ fn run_extraction(
     let mut strings = Strings::new();
     let mut metrics = Metrics::new();
     let mut sections: Vec<Section> = Vec::new();
-    // Format extractors return `Result` so they can report malformed
-    // input. We swallow the error here: a malformed format still
-    // yields whatever the generic pass extracted plus partial
-    // format-specific data.
-    let _ = formats::extract(
+    let mut imports = Imports::new();
+    let mut exports = Exports::new();
+    let mut functions = Functions::new();
+    let mut errors = Errors::new();
+    // Format extractors return `Result` so they can report a hard
+    // "this file is not in the format I expect" failure. Any
+    // recoverable mid-extraction issues (goblin lazy-walker panics,
+    // truncated sub-tables, permissive-mode fallbacks) are recorded
+    // through the typed `Errors` view instead — we want consumers to
+    // get everything we did manage to extract even when some sub-
+    // stage failed, since cleave depends on the partial data.
+    if let Err(e) = formats::extract(
         file_type,
         bytes,
         tree_cache,
@@ -230,7 +306,19 @@ fn run_extraction(
         &mut strings,
         &mut metrics,
         &mut sections,
-    );
+        &mut imports,
+        &mut exports,
+        &mut functions,
+        &mut errors,
+    ) {
+        // The format extractor bailed entirely. Surface that as a
+        // `malformed` entry so cleave can see *why* the
+        // format-specific view is sparse.
+        errors.record_malformed(
+            stage_for(file_type),
+            e.to_string(),
+        );
+    }
     // The AST view is computed alongside the rest when a tree-sitter
     // parse is available. The walk shares the cached tree with the
     // surface extraction and is small relative to the parse itself —
@@ -266,6 +354,38 @@ fn run_extraction(
             values.insert("ast", v);
         }
     }
+    // Project typed symbol collections into the values tree so kv-path
+    // consumers can read them as ordinary arrays. Each entry serializes
+    // through the structs' `#[serde]` derives (skips empty optionals).
+    if !imports.is_empty() {
+        if let Ok(v) = serde_json::to_value(&imports) {
+            values.insert("imports", v);
+        }
+    }
+    if !exports.is_empty() {
+        if let Ok(v) = serde_json::to_value(&exports) {
+            values.insert("exports", v);
+        }
+    }
+    if !functions.is_empty() {
+        if let Ok(v) = serde_json::to_value(&functions) {
+            values.insert("functions", v);
+        }
+    }
+    if !errors.is_empty() {
+        // Mirror parse errors into the values tree so kv-path
+        // consumers (cleave's trait engine) can match on them
+        // (`type: kv path: errors[*].kind exact: panic`). The typed
+        // `Errors` view stays the Rust-side API.
+        if let Ok(v) = serde_json::to_value(&errors) {
+            values.insert("errors", v);
+        }
+        // Pike-style numeric summary: a single `parse.error_count`
+        // metric so traits can fire on "did any sub-stage fail" /
+        // "more than N stages failed" without re-walking the typed
+        // view.
+        metrics.insert("parse.error_count", errors.len() as f64);
+    }
 
     Extracted {
         values,
@@ -273,6 +393,31 @@ fn run_extraction(
         metrics,
         ast,
         sections,
+        imports,
+        exports,
+        functions,
+        errors,
+    }
+}
+
+/// Map a [`FileType`] to the short `stage` tag we use when an
+/// extractor returns `Err` and we have to synthesise a fallback
+/// error record. Stage tags are stable across releases.
+fn stage_for(file_type: FileType) -> &'static str {
+    match file_type {
+        FileType::Pe => "pe-parse",
+        FileType::Elf => "elf-parse",
+        FileType::MachO => "macho-parse",
+        FileType::Ooxml => "ooxml-parse",
+        FileType::OleDoc => "ole2-parse",
+        FileType::Zip | FileType::Crx | FileType::Odf | FileType::Jar => "zip-parse",
+        FileType::Tar | FileType::TarGz | FileType::TarBz2 | FileType::TarXz | FileType::TarZst => {
+            "tar-parse"
+        }
+        FileType::JavaClass => "class-parse",
+        FileType::Pdf => "pdf-parse",
+        FileType::Rpm => "rpm-parse",
+        _ => "format-extract",
     }
 }
 
@@ -407,5 +552,75 @@ mod tests {
         let m = parsed.metrics();
         assert_eq!(m.get("file.size_bytes"), Some(256.0));
         assert!(m.get("file.entropy").unwrap() < 0.01);
+    }
+
+    /// `ParsedFile::symbol_iter` walks every Import / Export /
+    /// Function in one pass. Used by trait matchers that don't
+    /// care which collection a name appears in.
+    #[test]
+    fn symbol_iter_walks_all_three_collections() {
+        let bytes = std::fs::read("../cleave/tests/fixtures/test.exe")
+            .expect("test.exe fixture should exist");
+        let parsed = open(&bytes).unwrap();
+        // Realize the views before iterating — the lazy parse runs
+        // on first `.values()` access.
+        let _ = parsed.values();
+        let imports = parsed.imports();
+        assert!(!imports.is_empty(), "PE fixture should have imports");
+        let total = parsed.symbol_iter().count();
+        assert_eq!(
+            total,
+            parsed.imports().len() + parsed.exports().len() + parsed.functions().len(),
+            "symbol_iter must visit every entry in all three collections",
+        );
+        // All PE-sourced entries carry source == "pe".
+        let sources: std::collections::HashSet<&'static str> =
+            parsed.symbol_iter().map(|(_, src)| src).collect();
+        assert!(sources.contains("pe"));
+    }
+
+    /// A healthy PE fixture should produce zero parse errors and
+    /// no `parse.error_count` metric — the typed Errors view stays
+    /// empty.
+    #[test]
+    fn healthy_pe_emits_no_parse_errors() {
+        let bytes = std::fs::read("../cleave/tests/fixtures/test.exe")
+            .expect("test.exe fixture should exist");
+        let parsed = open(&bytes).unwrap();
+        // Realize.
+        let _ = parsed.values();
+        assert!(parsed.errors().is_empty());
+        assert!(parsed.metrics().get("parse.error_count").is_none());
+    }
+
+    /// Malformed ELF bytes (anything that starts \x7fELF but is
+    /// otherwise truncated) trip goblin's parse. The error must
+    /// land in the typed Errors view tagged `elf-parse` and the
+    /// generic byte-level metrics (file.size_bytes, file.entropy)
+    /// must still be present — partial data is the contract.
+    #[test]
+    fn malformed_elf_records_error_but_keeps_byte_metrics() {
+        // ELF magic + half a header — enough to be classified as
+        // ELF by fileid, not enough for goblin to parse.
+        let mut bytes = Vec::from(b"\x7fELF" as &[u8]);
+        bytes.extend_from_slice(&[2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let parsed = open(&bytes).unwrap();
+        let _ = parsed.values();
+
+        // Byte-level metrics survive even though the format parse
+        // failed — generic::extract ran before format dispatch.
+        assert!(parsed.metrics().get("file.size_bytes").is_some());
+
+        // Structured error recorded.
+        let errors = parsed.errors();
+        assert!(!errors.is_empty(), "expected a malformed-elf error entry");
+        let entry = errors.iter().next().unwrap();
+        assert_eq!(entry.kind, "malformed");
+        assert_eq!(entry.stage, "elf-parse");
+
+        // Aggregate count metric.
+        assert!(parsed.metrics().get("parse.error_count").is_some());
+        // Specific format metric.
+        assert!(parsed.metrics().get("elf.parse_failed").is_some());
     }
 }

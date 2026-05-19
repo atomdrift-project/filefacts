@@ -17,10 +17,11 @@
 
 use crate::error::Error;
 use crate::fileid::FileType;
-use crate::output::{Metrics, Section, Strings, Values};
+use crate::output::{Errors, Metrics, Section, Strings, Values};
 
 mod build_toolchain;
 mod chm;
+mod goblin_safe;
 mod class;
 mod common;
 mod elf;
@@ -43,6 +44,7 @@ mod ole2;
 mod ooxml;
 mod pyc;
 mod vba;
+pub(crate) mod vba_symbols;
 mod rpm;
 mod rtf;
 pub(crate) mod source;
@@ -54,6 +56,7 @@ mod zip;
 /// Drive the right extractor for `file_type` and merge its output into
 /// the three views. Unsupported types fall through to [`generic::extract`]
 /// (which still records `file.size_bytes` and Shannon entropy).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn extract(
     file_type: FileType,
     bytes: &[u8],
@@ -62,16 +65,31 @@ pub(crate) fn extract(
     strings: &mut Strings,
     metrics: &mut Metrics,
     sections: &mut Vec<Section>,
+    imports: &mut crate::Imports,
+    exports: &mut crate::Exports,
+    functions: &mut crate::Functions,
+    errors: &mut Errors,
 ) -> Result<(), Error> {
+    // Only PE / ELF / Mach-O record structured `Errors` today.
+    // Other extractors will start populating it as their goblin/zip
+    // / CFB calls grow panic-safe wrappers. Suppress the
+    // unused-mut warning on the binding until then.
+    let _ = &mut *errors;
     // Every file gets the generic byte-level metrics. Format-specific
     // extractors layer on top of (and may shadow with more accurate
     // values) what generic emits.
     generic::extract(bytes, values, strings, metrics);
 
     match file_type {
-        FileType::Pe => pe::extract(bytes, values, strings, metrics, sections),
-        FileType::Elf => elf::extract(bytes, values, strings, metrics, sections),
-        FileType::MachO => macho::extract(bytes, values, strings, metrics, sections),
+        FileType::Pe => pe::extract(
+            bytes, values, strings, metrics, sections, imports, exports, errors,
+        ),
+        FileType::Elf => elf::extract(
+            bytes, values, strings, metrics, sections, imports, exports, errors,
+        ),
+        FileType::MachO => macho::extract(
+            bytes, values, strings, metrics, sections, imports, exports, errors,
+        ),
         FileType::Zip | FileType::Crx | FileType::Odf => {
             zip::extract(bytes, values, metrics)
         }
@@ -88,7 +106,7 @@ pub(crate) fn extract(
             // VBA module source-text extraction (best-effort).
             // `vba::extract` is silent on failure — a doc without
             // macros just leaves `office.vba.*` unpopulated.
-            vba::extract(bytes, values, metrics);
+            vba::extract(bytes, values, metrics, imports, functions);
             Ok(())
         }
         FileType::Jar => {
@@ -115,7 +133,7 @@ pub(crate) fn extract(
         FileType::Plist => structured::extract_plist(bytes, values),
         FileType::PkgInfo => structured::extract_pkginfo(bytes, values),
         FileType::Chm => chm::extract(bytes, values, strings, metrics),
-        FileType::JavaClass => class::extract(bytes, values, strings, metrics),
+        FileType::JavaClass => class::extract(bytes, values, strings, metrics, imports, functions),
         FileType::Jpeg => jpeg::extract(bytes, values, strings, metrics),
         FileType::Lnk => lnk::extract(bytes, values, strings, metrics),
         FileType::Pdf => pdf::extract(bytes, values, strings, metrics),
@@ -136,7 +154,16 @@ pub(crate) fn extract(
         | FileType::Rust
         | FileType::Java
         | FileType::Shell
-        | FileType::Php => source::extract(bytes, file_type, tree_cache, values, strings, metrics),
+        | FileType::Php => source::extract(
+            bytes,
+            file_type,
+            tree_cache,
+            values,
+            strings,
+            metrics,
+            imports,
+            functions,
+        ),
 
         _ => Ok(()),
     }

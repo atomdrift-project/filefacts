@@ -10,24 +10,47 @@ use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::{extract_ascii_strings, hex_encode, put_str, put_u64};
-use crate::output::{Metrics, Section, Strings, Values};
+use crate::formats::goblin_safe;
+use crate::output::{Errors, Metrics, Section, Strings, Values};
 use crate::scan::entropy;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn extract(
     bytes: &[u8],
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
     sections_out: &mut Vec<Section>,
+    imports_out: &mut crate::Imports,
+    exports_out: &mut crate::Exports,
+    errors_out: &mut Errors,
 ) -> Result<(), Error> {
     extract_ascii_strings(bytes, strings);
 
-    let elf = Elf::parse(bytes).map_err(|e| Error::malformed("elf", e.to_string()))?;
+    // Wrap goblin parse in catch_unwind. ELF's dynamic-section
+    // walker has panicked on malformed `DT_*` tables; `parse_elf`
+    // turns a panic into a normal failure here. We record the
+    // failure into the typed errors view and return Ok so the
+    // byte-level metrics already in `metrics`/`strings` from the
+    // generic pass survive.
+    let elf = match goblin_safe::parse_elf(bytes) {
+        goblin_safe::GoblinOutcome::Ok(elf) => elf,
+        goblin_safe::GoblinOutcome::Failed(e) => {
+            errors_out.record_malformed("elf-parse", e.to_string());
+            metrics.insert("elf.parse_failed", 1.0);
+            return Ok(());
+        }
+        goblin_safe::GoblinOutcome::Panicked(msg) => {
+            errors_out.record_panic("elf-parse", msg);
+            metrics.insert("elf.parse_panicked", 1.0);
+            return Ok(());
+        }
+    };
 
     elf_header(&elf, values);
     dynamic(&elf, values);
     sections(&elf, bytes, metrics, sections_out);
-    symbols(&elf, values, metrics);
+    symbols(&elf, values, metrics, imports_out, exports_out);
     build_id(&elf, bytes, values);
     interpreter(&elf, values);
     relro(&elf, values);
@@ -546,7 +569,13 @@ fn section_entropy(bytes: &[u8], offset: u64, size: u64) -> f64 {
     entropy::shannon(&bytes[start..end])
 }
 
-fn symbols(elf: &Elf<'_>, values: &mut Values, metrics: &mut Metrics) {
+fn symbols(
+    elf: &Elf<'_>,
+    values: &mut Values,
+    metrics: &mut Metrics,
+    imports_out: &mut crate::Imports,
+    exports_out: &mut crate::Exports,
+) {
     // Dynamic-symbol table: imports are undefined (`SHN_UNDEF`, section
     // index 0); exports are defined globals/weaks. STT_GNU_IFUNC
     // entries are split into a dedicated `elf.ifuncs[]` — they're rare
@@ -569,9 +598,26 @@ fn symbols(elf: &Elf<'_>, values: &mut Values, metrics: &mut Metrics) {
         }
         if sym.st_shndx == 0 {
             imports.push(JsonValue::String(name.to_string()));
+            // ELF doesn't bind a dynsym entry to a specific
+            // DT_NEEDED library at link time — the dynamic linker
+            // resolves at load. Leave `library` unset; consumers
+            // that need it walk `elf.needed[]` separately.
+            imports_out.push(crate::Import {
+                name: name.to_string(),
+                library: None,
+                source: "elf-dynsym",
+                offset: None,
+                ordinal: None,
+            });
         } else if sym.is_function() || sym.st_info & 0xf == 1 {
             // STB_GLOBAL = 1 (binding in upper nibble of st_info)
             exports.push(JsonValue::String(name.to_string()));
+            exports_out.push(crate::Export {
+                name: name.to_string(),
+                source: "elf-dynsym",
+                offset: Some(sym.st_value),
+                ordinal: None,
+            });
         }
     }
     metrics.insert("elf.import_count", imports.len() as f64);
@@ -670,9 +716,21 @@ mod tests {
         let mut s = Strings::default();
         let mut m = Metrics::new();
         let mut sections = Vec::new();
+        let mut imports = crate::Imports::new();
+        let mut exports = crate::Exports::new();
+        let mut errors = Errors::new();
         // Ignore the Result — most negative-path tests pass malformed
         // bytes and we only care that extract returns without panic.
-        let _ = extract(bytes, &mut v, &mut s, &mut m, &mut sections);
+        let _ = extract(
+            bytes,
+            &mut v,
+            &mut s,
+            &mut m,
+            &mut sections,
+            &mut imports,
+            &mut exports,
+            &mut errors,
+        );
         (v, s, m)
     }
 
