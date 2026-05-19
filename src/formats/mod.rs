@@ -39,7 +39,10 @@ mod pe_rich;
 mod pe_version_info;
 mod pickle;
 mod png;
+mod ole2;
+mod ooxml;
 mod pyc;
+mod vba;
 mod rpm;
 mod rtf;
 pub(crate) mod source;
@@ -69,8 +72,24 @@ pub(crate) fn extract(
         FileType::Pe => pe::extract(bytes, values, strings, metrics, sections),
         FileType::Elf => elf::extract(bytes, values, strings, metrics, sections),
         FileType::MachO => macho::extract(bytes, values, strings, metrics, sections),
-        FileType::Zip | FileType::Crx | FileType::Ooxml | FileType::Odf => {
+        FileType::Zip | FileType::Crx | FileType::Odf => {
             zip::extract(bytes, values, metrics)
+        }
+        FileType::Ooxml => {
+            // The generic archive walk emits `archive.members[]` /
+            // `archive.compression.*` first; the OOXML extractor then
+            // layers the format-specific `office.*` schema on top
+            // (kind, core metadata, application, macro presence, …).
+            zip::extract(bytes, values, metrics)?;
+            ooxml::extract(bytes, values, metrics)
+        }
+        FileType::OleDoc => {
+            ole2::extract(bytes, values, metrics)?;
+            // VBA module source-text extraction (best-effort).
+            // `vba::extract` is silent on failure — a doc without
+            // macros just leaves `office.vba.*` unpopulated.
+            vba::extract(bytes, values, metrics);
+            Ok(())
         }
         FileType::Jar => {
             // JAR is a zip — run the generic archive walk for

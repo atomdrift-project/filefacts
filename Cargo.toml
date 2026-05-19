@@ -52,6 +52,13 @@ serde_yaml = "0.9"
 toml = "0.8"
 plist = "1"
 
+# Microsoft Compound File Binary Format (OLE2 / CFBF) — the storage
+# layout for legacy Office documents (.doc / .xls / .ppt) and MSI / MSG.
+cfb = "0.10"
+# UUID handling — `cfb`'s storage-CLSID API takes a `uuid::Uuid` and we
+# need to construct them in test fixtures.
+uuid = "1"
+
 # Source-code extraction. Each language is its own crate; the base
 # `tree-sitter` engine is shared. Adding a language is one dependency
 # line plus one entry in `src/formats/source/langs.rs`.
