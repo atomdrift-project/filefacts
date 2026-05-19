@@ -201,7 +201,7 @@ fn strip_quotes(s: &str) -> String {
     s.to_string()
 }
 
-/// True when this file type is a source language metaparse can parse.
+/// True when this file type is a source language expose can parse.
 pub(crate) fn supports(file_type: FileType) -> bool {
     langs::config_for(file_type).is_some()
 }

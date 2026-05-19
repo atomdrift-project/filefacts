@@ -21,7 +21,7 @@ use serde_json::{Map, Value as JsonValue};
 ///
 /// ```
 /// # use serde_json::json;
-/// # use metaparse::Values;
+/// # use expose::Values;
 /// let mut v = Values::new();
 /// v.insert("pe.coff.machine", json!("x86_64"));
 /// v.insert("pe.coff.timestamp_unix", json!(1_700_000_000_i64));
@@ -180,8 +180,8 @@ mod tests {
     #[test]
     fn insert_and_get_top_level() {
         let mut v = Values::new();
-        v.insert("name", json!("metaparse"));
-        assert_eq!(v.get("name").and_then(|x| x.as_str()), Some("metaparse"));
+        v.insert("name", json!("expose"));
+        assert_eq!(v.get("name").and_then(|x| x.as_str()), Some("expose"));
     }
 
     #[test]

@@ -1,9 +1,9 @@
-//! # metaparse
+//! # expose
 //!
 //! Fast, thorough metadata, metrics, and string extraction for binary
 //! and source file formats.
 //!
-//! `metaparse` is the single-pass extraction layer underneath higher-level
+//! `expose` is the single-pass extraction layer underneath higher-level
 //! analysis tools. Given a byte slice, it identifies the file format,
 //! parses the format's structural fields, scans for string literals, and
 //! computes byte-level metrics — once, lazily, sharing the parse across
@@ -23,7 +23,7 @@
 //!
 //! ```no_run
 //! let bytes = std::fs::read("sample.exe").unwrap();
-//! let parsed = metaparse::open(&bytes).unwrap();
+//! let parsed = expose::open(&bytes).unwrap();
 //!
 //! println!("file type: {:?}", parsed.fileid().file_type());
 //! for (key, value) in parsed.values().iter() {
@@ -54,7 +54,7 @@
 //! [`SCHEMA_VERSION`]; field additions are non-breaking, field
 //! semantics or renames bump the version.
 
-#![doc(html_root_url = "https://docs.rs/metaparse/0.1.0")]
+#![doc(html_root_url = "https://docs.rs/expose/0.1.0")]
 
 mod debug;
 mod error;
@@ -154,7 +154,7 @@ impl<'a> ParsedFile<'a> {
 
     /// AST projection view.
     ///
-    /// Empty when the file is not a source language metaparse can
+    /// Empty when the file is not a source language expose can
     /// parse. For source files, this is a curated set of projections
     /// of the tree-sitter parse: every call site, the sorted-unique
     /// call targets, dotted member-access chains, and per-target
@@ -368,8 +368,8 @@ pub fn open_with_path<'a>(path: &Path, bytes: &'a [u8]) -> Result<ParsedFile<'a>
 ///
 /// ```no_run
 /// let bytes = std::fs::read("sample.exe")?;
-/// let parsed = metaparse::open_with_path(std::path::Path::new("sample.exe"), &bytes)?;
-/// # Ok::<(), metaparse::Error>(())
+/// let parsed = expose::open_with_path(std::path::Path::new("sample.exe"), &bytes)?;
+/// # Ok::<(), expose::Error>(())
 /// ```
 pub fn from_path(path: &Path) -> Result<(Vec<u8>, FileId), Error> {
     let bytes = std::fs::read(path)?;

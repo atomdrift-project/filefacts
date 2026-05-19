@@ -12,7 +12,7 @@ use serde::Serialize;
 ///
 /// `Metrics` is intentionally a flat key→number map rather than a typed
 /// struct: format-specific metrics names follow each format's own
-/// conventions, and metaparse prefers a uniform interface over a typed
+/// conventions, and expose prefers a uniform interface over a typed
 /// surface that would have to grow a field for every metric every
 /// extractor invents.
 ///

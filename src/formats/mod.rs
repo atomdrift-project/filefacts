@@ -94,7 +94,7 @@ pub(crate) fn extract(
 
         // Source-code extraction is delegated to the source dispatcher,
         // which routes to the appropriate tree-sitter grammar. Languages
-        // metaparse doesn't yet support fall through to the generic
+        // expose doesn't yet support fall through to the generic
         // byte-level pass.
         FileType::JavaScript
         | FileType::TypeScript

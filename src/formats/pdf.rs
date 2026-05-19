@@ -7,7 +7,7 @@
 //! catalog flags) by recognizing the canonical PDF tokens directly
 //! in the raw bytes.
 //!
-//! Schema namespaces under `pdf.*` matching metaparse's per-format
+//! Schema namespaces under `pdf.*` matching expose's per-format
 //! convention:
 //!
 //! - `pdf.header.{version, header_count}` — first `%PDF-X.Y` plus the
@@ -1309,7 +1309,7 @@ mod tests {
     fn detects_javascript_action_count() {
         let pdf = b"%PDF-1.5\n5 0 obj << /S /JavaScript /JS (app.alert('hi')) >> endobj\n%%EOF";
         let (_, m) = extract_pdf(pdf);
-        // The metaparse extractor reports the count via metrics —
+        // The expose extractor reports the count via metrics —
         // the action-detail array stays with cleave's PDF parser.
         assert_eq!(m.get("pdf.action_count"), Some(1.0));
     }

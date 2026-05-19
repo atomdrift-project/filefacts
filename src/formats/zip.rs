@@ -5,7 +5,7 @@
 //! per-entry forensic fields drawn from the central-directory header.
 //!
 //! Decompression and recursion are the caller's responsibility:
-//! `metaparse` describes what's *in* the archive, not what each member
+//! `expose` describes what's *in* the archive, not what each member
 //! *contains*.
 
 // JAR signing manifests have format-defined uppercase names

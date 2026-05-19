@@ -1,4 +1,4 @@
-//! `metaparse` command-line interface.
+//! `expose` command-line interface.
 //!
 //! Single-shot file inspector. Reads one file, dumps the four views
 //! (`fileid`, `values`, `strings`, `metrics`) as JSON, exits.
@@ -6,14 +6,14 @@
 //! Usage:
 //!
 //! ```text
-//! metaparse <path>
-//! metaparse -p|--pretty <path>
-//! metaparse --values <path>     # only the values view
-//! metaparse --strings <path>    # only the strings view
-//! metaparse --metrics <path>    # only the metrics view
-//! metaparse --fileid <path>     # only the fileid view (no extraction)
-//! metaparse --help
-//! metaparse --version
+//! expose <path>
+//! expose -p|--pretty <path>
+//! expose --values <path>     # only the values view
+//! expose --strings <path>    # only the strings view
+//! expose --metrics <path>    # only the metrics view
+//! expose --fileid <path>     # only the fileid view (no extraction)
+//! expose --help
+//! expose --version
 //! ```
 
 use std::path::PathBuf;
@@ -42,7 +42,7 @@ fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(a) => a,
         Err(msg) => {
-            eprintln!("metaparse: {msg}");
+            eprintln!("expose: {msg}");
             print_usage(true);
             return ExitCode::from(2);
         }
@@ -56,15 +56,15 @@ fn main() -> ExitCode {
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("metaparse: cannot read {}: {e}", path.display());
+            eprintln!("expose: cannot read {}: {e}", path.display());
             return ExitCode::from(1);
         }
     };
 
-    let parsed = match metaparse::open_with_path(&path, &bytes) {
+    let parsed = match expose::open_with_path(&path, &bytes) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("metaparse: {e}");
+            eprintln!("expose: {e}");
             return ExitCode::from(1);
         }
     };
@@ -82,7 +82,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("metaparse: serialisation failed: {e}");
+            eprintln!("expose: serialisation failed: {e}");
             ExitCode::from(1)
         }
     }
@@ -93,16 +93,16 @@ fn main() -> ExitCode {
 struct Output<'a> {
     schema_version: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    fileid: Option<&'a metaparse::FileId>,
+    fileid: Option<&'a expose::FileId>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    values: Option<&'a metaparse::Values>,
+    values: Option<&'a expose::Values>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    metrics: Option<&'a metaparse::Metrics>,
+    metrics: Option<&'a expose::Metrics>,
 }
 
-fn build_output(parsed: &metaparse::ParsedFile<'_>, only: View) -> serde_json::Value {
+fn build_output(parsed: &expose::ParsedFile<'_>, only: View) -> serde_json::Value {
     let mut out = Output {
-        schema_version: metaparse::SCHEMA_VERSION,
+        schema_version: expose::SCHEMA_VERSION,
         fileid: None,
         values: None,
         metrics: None,
@@ -130,7 +130,7 @@ fn parse_args() -> Result<Args, String> {
                 std::process::exit(0);
             }
             "-V" | "--version" => {
-                println!("metaparse {}", env!("CARGO_PKG_VERSION"));
+                println!("expose {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "-p" | "--pretty" => args.pretty = true,
@@ -169,7 +169,7 @@ fn set_view(slot: &mut View, view: View) -> Result<(), String> {
 
 fn print_usage(to_stderr: bool) {
     let msg = "\
-usage: metaparse [options] <path>
+usage: expose [options] <path>
 
 options:
   -p, --pretty       Pretty-print the JSON output.

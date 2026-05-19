@@ -4,7 +4,7 @@
 //! (`parse_count() == 1` after exercising all views) so the contract
 //! holds for downstream embedders.
 
-use metaparse::{open, open_with_path, FileType};
+use expose::{open, open_with_path, FileType};
 
 #[test]
 fn json_manifest_parses_once_through_all_views() {

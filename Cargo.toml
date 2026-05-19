@@ -1,23 +1,23 @@
 [package]
-name = "metaparse"
+name = "expose"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 authors = ["The Atomdrift Project"]
-description = "Fast, thorough metadata, metrics, and string extraction for binary and source file formats"
+description = "Exposes structural facts (kv, metrics, strings) from binary and source files for forensic analysis."
 license = "Apache-2.0"
-repository = "https://codeberg.org/atomdrift/metaparse"
+repository = "https://codeberg.org/atomdrift/expose"
 keywords = ["forensics", "binary-analysis", "metadata", "pe", "elf"]
 categories = ["parsing", "command-line-utilities"]
 readme = "README.md"
 
 [lib]
-name = "metaparse"
+name = "expose"
 path = "src/lib.rs"
 
 [[bin]]
-name = "metaparse"
-path = "src/bin/metaparse.rs"
+name = "expose"
+path = "src/bin/expose.rs"
 
 [dependencies]
 # Serialization — required for output schema.

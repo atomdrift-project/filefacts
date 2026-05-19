@@ -1,7 +1,7 @@
 //! Output views every `ParsedFile` exposes.
 //!
 //! These are the public output schema. Their JSON serialisation is the
-//! contract: keys, nesting, types are governed by metaparse's
+//! contract: keys, nesting, types are governed by expose's
 //! `SCHEMA_VERSION`. Field additions are non-breaking; renames or
 //! semantic changes require a schema-version bump.
 //!

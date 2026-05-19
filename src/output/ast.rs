@@ -69,7 +69,7 @@ pub enum ArgShape {
 
 /// AST projection view.
 ///
-/// Empty when the file is not source code metaparse can parse. For
+/// Empty when the file is not source code expose can parse. For
 /// supported source files, the view is populated by a single walk of
 /// the tree-sitter tree; the same tree backs the `values`/`strings`
 /// extraction for source files, so no duplicate work is performed.

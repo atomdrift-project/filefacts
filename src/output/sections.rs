@@ -3,7 +3,7 @@
 //! Every binary format describes its address space with a sequence of
 //! named, sized regions: PE *sections*, ELF *sections*, Mach-O
 //! *sections* (and segments). They share the same forensic surface,
-//! so `metaparse` collapses them into a single uniform listing and
+//! so `expose` collapses them into a single uniform listing and
 //! lets the consumer branch on [`crate::FileId`] when the
 //! format-specific flag vocabulary matters.
 //!
@@ -52,7 +52,7 @@ pub struct Section {
 
 /// Unified section view across PE, ELF, and Mach-O.
 ///
-/// Empty when the file has no section table metaparse can read
+/// Empty when the file has no section table expose can read
 /// (structured documents, source code, opaque blobs).
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(transparent)]

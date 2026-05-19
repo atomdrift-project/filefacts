@@ -27,7 +27,7 @@ pub enum StringCategory {
 /// One extracted string with its category and offset.
 ///
 /// `offset` is the byte position of the first character within the source
-/// bytes given to `metaparse::open`. For UTF-16 strings, this is the byte
+/// bytes given to `expose::open`. For UTF-16 strings, this is the byte
 /// offset of the first code unit, not a character index.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExtractedString {

@@ -5,7 +5,7 @@
 //! presence flags, and stego-relevant counts (concatenated SOIs,
 //! comment density, MakerNote bytes). No pixel decode.
 //!
-//! Schema (no `has_*` bools per the metaparse convention — presence
+//! Schema (no `has_*` bools per the expose convention — presence
 //! is signaled via the `jpeg.features[]` array):
 //!
 //! - `jpeg.exif.{make, model, software, datetime, datetime_original,
