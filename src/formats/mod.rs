@@ -1,0 +1,110 @@
+//! Per-format extractors.
+//!
+//! Each module here owns the extraction logic for one format family. The
+//! contract is the same across all of them: take the source bytes, fill
+//! [`Values`], [`Strings`], and [`Metrics`] views with format-conventional
+//! keys and values. Extractors must never read from the filesystem and
+//! must never panic on malformed input — return [`crate::Error::Malformed`]
+//! instead.
+//!
+//! Dispatch to the right extractor happens in [`extract`], keyed off the
+//! [`FileType`] produced by [`crate::fileid`].
+//!
+//! [`Values`]: crate::Values
+//! [`Strings`]: crate::Strings
+//! [`Metrics`]: crate::Metrics
+//! [`FileType`]: crate::FileType
+
+use crate::error::Error;
+use crate::fileid::FileType;
+use crate::output::{Metrics, Section, Strings, Values};
+
+mod build_toolchain;
+mod common;
+mod elf;
+mod generic;
+mod jpeg;
+mod macho;
+mod macho_code_signature;
+mod pdf;
+mod pe;
+mod pe_authenticode;
+mod pe_debug;
+mod pe_manifest;
+mod pe_rich;
+mod pe_version_info;
+mod pickle;
+mod png;
+mod pyc;
+mod rpm;
+mod rtf;
+pub(crate) mod source;
+mod structured;
+mod tar;
+mod zip;
+
+/// Drive the right extractor for `file_type` and merge its output into
+/// the three views. Unsupported types fall through to [`generic::extract`]
+/// (which still records `file.size_bytes` and Shannon entropy).
+pub(crate) fn extract(
+    file_type: FileType,
+    bytes: &[u8],
+    tree_cache: Option<&source::TreeCache<'_>>,
+    values: &mut Values,
+    strings: &mut Strings,
+    metrics: &mut Metrics,
+    sections: &mut Vec<Section>,
+) -> Result<(), Error> {
+    // Every file gets the generic byte-level metrics. Format-specific
+    // extractors layer on top of (and may shadow with more accurate
+    // values) what generic emits.
+    generic::extract(bytes, values, strings, metrics);
+
+    match file_type {
+        FileType::Pe => pe::extract(bytes, values, strings, metrics, sections),
+        FileType::Elf => elf::extract(bytes, values, strings, metrics, sections),
+        FileType::MachO => macho::extract(bytes, values, strings, metrics, sections),
+        FileType::Zip
+        | FileType::Jar
+        | FileType::Crx
+        | FileType::Ooxml
+        | FileType::Odf => zip::extract(bytes, values, metrics),
+        FileType::Tar | FileType::TarGz | FileType::TarBz2 | FileType::TarXz | FileType::TarZst => {
+            tar::extract(bytes, file_type, values, metrics)
+        }
+        // Structured manifests parse their entire content into `values`
+        // with the format-native key shape (the parsed JSON/YAML/TOML
+        // tree, verbatim).
+        FileType::PackageJson
+        | FileType::PackageLockJson
+        | FileType::ComposerJson
+        | FileType::ChromeManifest
+        | FileType::VsixManifest => structured::extract_json(bytes, values),
+        FileType::CargoToml | FileType::PyProjectToml => structured::extract_toml(bytes, values),
+        FileType::GithubActions => structured::extract_yaml(bytes, values),
+        FileType::Plist => structured::extract_plist(bytes, values),
+        FileType::PkgInfo => structured::extract_pkginfo(bytes, values),
+        FileType::Jpeg => jpeg::extract(bytes, values, strings, metrics),
+        FileType::Pdf => pdf::extract(bytes, values, strings, metrics),
+        FileType::Pickle => pickle::extract(bytes, values, strings, metrics),
+        FileType::Png => png::extract(bytes, values, strings, metrics),
+        FileType::PythonBytecode => pyc::extract(bytes, values, strings, metrics),
+        FileType::Rpm => rpm::extract(bytes, values, strings, metrics),
+        FileType::Rtf => rtf::extract(bytes, values, strings, metrics),
+
+        // Source-code extraction is delegated to the source dispatcher,
+        // which routes to the appropriate tree-sitter grammar. Languages
+        // metaparse doesn't yet support fall through to the generic
+        // byte-level pass.
+        FileType::JavaScript
+        | FileType::TypeScript
+        | FileType::Python
+        | FileType::Go
+        | FileType::Rust
+        | FileType::Java
+        | FileType::Shell
+        | FileType::Php => source::extract(bytes, file_type, tree_cache, values, strings, metrics),
+
+        _ => Ok(()),
+    }
+}

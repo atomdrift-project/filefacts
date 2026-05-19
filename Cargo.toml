@@ -1,0 +1,111 @@
+[package]
+name = "metaparse"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+authors = ["The Atomdrift Project"]
+description = "Fast, thorough metadata, metrics, and string extraction for binary and source file formats"
+license = "Apache-2.0"
+repository = "https://codeberg.org/atomdrift/metaparse"
+keywords = ["forensics", "binary-analysis", "metadata", "pe", "elf"]
+categories = ["parsing", "command-line-utilities"]
+readme = "README.md"
+
+[lib]
+name = "metaparse"
+path = "src/lib.rs"
+
+[[bin]]
+name = "metaparse"
+path = "src/bin/metaparse.rs"
+
+[dependencies]
+# Serialization — required for output schema.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error reporting — single source of truth for the public error type.
+thiserror = "1"
+
+# Fast byte scanning, used by string extractors and the magic-byte matcher.
+memchr = "2"
+aho-corasick = "1"
+
+# Binary formats. `goblin` is a single crate that handles PE, ELF, and Mach-O
+# behind one parse entry point; we use it for all three.
+goblin = { version = "0.10", default-features = false, features = ["std", "pe32", "pe64", "elf32", "elf64", "endian_fd", "mach32", "mach64", "archive"] }
+
+# Archive index readers. We use these for header/central-directory enumeration
+# only — never for decompression or extraction.
+zip = "2"
+tar = "0.4"
+# Deflate decompressor for PDF FlateDecode streams. Already in the
+# transitive tree via `zip`; surfacing it as a direct dep avoids
+# reaching through `zip`'s public re-exports.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+# Structured-format parsers.
+serde_yaml = "0.9"
+toml = "0.8"
+plist = "1"
+
+# Source-code extraction. Each language is its own crate; the base
+# `tree-sitter` engine is shared. Adding a language is one dependency
+# line plus one entry in `src/formats/source/langs.rs`.
+tree-sitter = "0.26"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.25"
+tree-sitter-go = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-java = "0.23"
+tree-sitter-bash = "0.25"
+tree-sitter-php = "0.24"
+
+# Authenticode signature parsing. `cms` parses the PKCS#7 SignedData
+# envelope; `x509-cert` decodes the embedded signer certificate;
+# `der` handles the ASN.1 primitives the others build on.
+cms = "0.2"
+x509-cert = "0.2"
+der = { version = "0.7", features = ["std"] }
+sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+
+[dev-dependencies]
+# Snapshot-test framework used by per-format fixture tests.
+insta = { version = "1", features = ["json"] }
+
+[features]
+default = []
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_must_use = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Public-API friction without forensic benefit.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+# Metrics are intentionally f64. The precision boundary at 2^53 is an
+# accepted limit for forensic counts and sizes; values beyond that are
+# either pathological inputs or already-fatal earlier in the pipeline.
+cast_precision_loss = "allow"
+# Tar mtime is stored as unsigned seconds; promoting to signed for the
+# i64 metric range is intentional and harmless for all real timestamps.
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+# Format-conventional names (PE, ELF, DLL, etc.) get backticked when
+# they shouldn't have to be.
+doc_markdown = "allow"
+# Extraction routines are linear walks; their line count tracks the
+# format's complexity, not architectural depth.
+too_many_lines = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
