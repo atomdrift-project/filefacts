@@ -403,4 +403,61 @@ mod tests {
         let (v, _) = run(b"not a png");
         assert!(v.get("png.dimensions").is_none());
     }
+
+    #[test]
+    fn truncated_chunk_length_doesnt_crash() {
+        // Signature plus a length that overruns the buffer.
+        let mut png = Vec::new();
+        png.extend_from_slice(SIGNATURE);
+        png.extend_from_slice(&999_999u32.to_be_bytes());
+        png.extend_from_slice(b"IDAT");
+        let (v, _) = run(&png);
+        // Should not panic; no IHDR was emitted.
+        assert!(v.get("png.dimensions").is_none());
+    }
+
+    #[test]
+    fn empty_input_is_silent() {
+        let (v, _) = run(&[]);
+        assert!(v.get("png.dimensions").is_none());
+    }
+
+    #[test]
+    fn chunk_metrics_count_correctly() {
+        let ihdr: Vec<u8> = vec![0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0];
+        let png = build_png(&[
+            (b"IHDR", &ihdr),
+            (b"IDAT", &[0; 4]),
+            (b"IDAT", &[0; 4]),
+            (b"IDAT", &[0; 4]),
+            (b"IEND", &[]),
+        ]);
+        let (_, m) = run(&png);
+        assert_eq!(m.get("png.idat_chunk_count"), Some(3.0));
+        assert_eq!(m.get("png.chunk_count"), Some(5.0));
+        assert_eq!(m.get("png.chunks_after_iend"), Some(0.0));
+    }
+
+    #[test]
+    fn chunks_after_iend_counted() {
+        let png = build_png(&[
+            (b"IEND", &[]),
+            // tEXt chunk after IEND — should bump chunks_after_iend.
+            (b"tEXt", b"k\0v"),
+        ]);
+        let (_, m) = run(&png);
+        assert_eq!(m.get("png.chunks_after_iend"), Some(1.0));
+    }
+
+    #[test]
+    fn text_chunk_bytes_metric_accumulates() {
+        let png = build_png(&[
+            (b"tEXt", b"k1\0value-one"),
+            (b"tEXt", b"k2\0value-two"),
+            (b"IEND", &[]),
+        ]);
+        let (_, m) = run(&png);
+        let bytes = m.get("png.text_chunk_bytes").unwrap();
+        assert!(bytes > 0.0);
+    }
 }

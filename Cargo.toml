@@ -39,6 +39,9 @@ goblin = { version = "0.10", default-features = false, features = ["std", "pe32"
 # only — never for decompression or extraction.
 zip = "2"
 tar = "0.4"
+# XML parser for VSIX / WiX-style manifests. Pure Rust, no external
+# binary calls.
+roxmltree = "0.21"
 # Deflate decompressor for PDF FlateDecode streams. Already in the
 # transitive tree via `zip`; surfacing it as a direct dep avoids
 # reaching through `zip`'s public re-exports.

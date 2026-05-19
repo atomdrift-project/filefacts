@@ -273,9 +273,34 @@ pub(super) fn extract(
     // is set. Used by trait rules detecting staged JavaScript or
     // recognizable form authoring fingerprints.
     let form_fields = scan_form_fields(bytes, &dict_regions);
+    derive_form_field_metrics(&form_fields, metrics);
     if !form_fields.is_empty() {
         values.insert("pdf.form_fields", JsonValue::Array(form_fields));
     }
+
+    // Phase 1B derived metrics — formerly computed by cleave's
+    // pdf::parser. Now reachable through the metric-fold adapter
+    // (`merge_expose_metrics`) so trait rules using `field: pdf.X`
+    // resolve against expose's flat metric map.
+    let leading_bytes = bytes.windows(5).position(|w| w == b"%PDF-").unwrap_or(0);
+    metrics.insert("pdf.leading_bytes_before_header", leading_bytes as f64);
+    let sig_count =
+        count_type_occurrences(bytes, b"/Sig") + count_substring(bytes, b"/Type /Sig");
+    metrics.insert("pdf.signature_object_count", (sig_count / 2) as f64);
+    // Signed incremental update: incremental updates leave more than
+    // one `%%EOF` marker; pair that with the presence of a signature
+    // object to count signed-then-modified PDFs (the classic
+    // shadow-attack shape).
+    if sig_count > 0 {
+        let signed_incremental =
+            if eof_count > 1 { eof_count.saturating_sub(1) } else { 0 };
+        metrics.insert(
+            "pdf.signed_incremental_update_count",
+            signed_incremental as f64,
+        );
+    }
+    derive_stream_metrics(bytes, &dict_regions, metrics);
+    derive_risky_feature_score(values, metrics);
 
     Ok(())
 }
@@ -1267,6 +1292,212 @@ fn is_name_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// Derive form-field metrics from the already-parsed `pdf.form_fields[]`
+/// array: hidden-zero-rect count, duplicate-name / duplicate-rect /
+/// duplicate-name-and-rect counts, overlapping-pair count, and
+/// max-decoded-value length. These were the cleave-only PDF metrics
+/// that previously kept `pdf::parser` alive.
+fn derive_form_field_metrics(fields: &[JsonValue], metrics: &mut Metrics) {
+    if fields.is_empty() {
+        return;
+    }
+    use std::collections::HashMap;
+    let mut by_name: HashMap<String, usize> = HashMap::new();
+    let mut by_rect: HashMap<String, usize> = HashMap::new();
+    let mut by_name_rect: HashMap<(String, String), usize> = HashMap::new();
+    let mut hidden_zero_rect = 0_u32;
+    let mut max_decoded_len = 0_usize;
+    let mut rects: Vec<[f64; 4]> = Vec::with_capacity(fields.len());
+
+    for f in fields {
+        let obj = f.as_object();
+        let name = obj
+            .and_then(|o| o.get("name"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_string();
+        let rect = obj
+            .and_then(|o| o.get("rect"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_string();
+        let value = obj
+            .and_then(|o| o.get("value"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or("");
+        if !name.is_empty() {
+            *by_name.entry(name.clone()).or_insert(0) += 1;
+        }
+        if !rect.is_empty() {
+            *by_rect.entry(rect.clone()).or_insert(0) += 1;
+        }
+        if !name.is_empty() && !rect.is_empty() {
+            *by_name_rect.entry((name.clone(), rect.clone())).or_insert(0) += 1;
+        }
+        if let Some(r) = parse_rect(&rect) {
+            if r == [0.0, 0.0, 0.0, 0.0] {
+                hidden_zero_rect += 1;
+            }
+            rects.push(r);
+        }
+        max_decoded_len = max_decoded_len.max(value.len());
+    }
+
+    // Duplicate counts: every key with count > 1 contributes
+    // `count - 1` to the "extra occurrences" total.
+    let dup = |map: &HashMap<String, usize>| -> u32 {
+        map.values().filter(|&&c| c > 1).map(|&c| (c - 1) as u32).sum()
+    };
+    let dup_pair = |map: &HashMap<(String, String), usize>| -> u32 {
+        map.values().filter(|&&c| c > 1).map(|&c| (c - 1) as u32).sum()
+    };
+    metrics.insert("pdf.duplicate_form_name_count", f64::from(dup(&by_name)));
+    metrics.insert("pdf.duplicate_form_rect_count", f64::from(dup(&by_rect)));
+    metrics.insert(
+        "pdf.duplicate_form_name_rect_count",
+        f64::from(dup_pair(&by_name_rect)),
+    );
+    metrics.insert(
+        "pdf.hidden_zero_rect_field_count",
+        f64::from(hidden_zero_rect),
+    );
+    metrics.insert("pdf.decoded_form_value_max_len", max_decoded_len as f64);
+
+    // Overlapping-pair count: O(n²) intersection check. PDF rects
+    // are [x_lo, y_lo, x_hi, y_hi] but some producers swap the
+    // hi/lo pairs, so normalize before intersecting.
+    let mut overlapping = 0_u32;
+    for i in 0..rects.len() {
+        let a = normalize_rect(rects[i]);
+        for b_raw in rects.iter().skip(i + 1) {
+            let b = normalize_rect(*b_raw);
+            if rects_overlap(a, b) {
+                overlapping = overlapping.saturating_add(1);
+            }
+        }
+    }
+    metrics.insert(
+        "pdf.overlapping_form_field_pair_count",
+        f64::from(overlapping),
+    );
+}
+
+fn parse_rect(s: &str) -> Option<[f64; 4]> {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let mut out = [0.0; 4];
+    for (i, p) in parts.iter().enumerate() {
+        out[i] = p.parse().ok()?;
+    }
+    Some(out)
+}
+
+fn normalize_rect(r: [f64; 4]) -> [f64; 4] {
+    [r[0].min(r[2]), r[1].min(r[3]), r[0].max(r[2]), r[1].max(r[3])]
+}
+
+fn rects_overlap(a: [f64; 4], b: [f64; 4]) -> bool {
+    a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3]
+}
+
+/// Derive `pdf.stream_*_count` metrics from the existing dict
+/// regions. Each region with a `stream_range` is checked for
+/// declared-`/Length` accuracy, missing `endstream`, and a `stream`
+/// → newline delimiter (PDF spec requires a CR/LF/CR-LF between
+/// `stream` and the body).
+fn derive_stream_metrics(bytes: &[u8], dict_regions: &[DictRegion], metrics: &mut Metrics) {
+    let mut missing_length = 0_u32;
+    let mut missing_endstream = 0_u32;
+    let mut length_mismatch = 0_u32;
+    let mut bad_delimiter = 0_u32;
+
+    for region in dict_regions {
+        let Some((body_start, body_end)) = region.stream_range else {
+            continue;
+        };
+        let dict = &bytes[region.start..region.end];
+        let length_text = find_info_value(dict, b"/Length");
+        let declared: Option<u64> = length_text.and_then(|t| t.parse().ok());
+        if declared.is_none() {
+            missing_length = missing_length.saturating_add(1);
+        }
+        let actual = (body_end - body_start) as u64;
+        if let Some(d) = declared {
+            // Allow ±2 bytes for CR/LF tolerance around `endstream`.
+            let diff = if actual > d { actual - d } else { d - actual };
+            if diff > 2 {
+                length_mismatch = length_mismatch.saturating_add(1);
+            }
+        }
+        // `endstream` should follow the body's last byte (we trim
+        // a single trailing CR/LF in collect_dict_regions); if the
+        // bytes immediately after `body_end` aren't `endstream`,
+        // mark it missing.
+        let end_window = bytes
+            .get(body_end..body_end.saturating_add(16))
+            .unwrap_or(&[]);
+        if !end_window
+            .windows(9)
+            .any(|w| w == b"endstream")
+        {
+            missing_endstream = missing_endstream.saturating_add(1);
+        }
+        // Bad delimiter: the byte immediately after `stream` should
+        // be CR, LF, or CR-LF. `collect_dict_regions` already
+        // skipped that, so anything other than the canonical
+        // delimiter survived as part of `body_start`'s preceding
+        // bytes.
+        if body_start >= 2 {
+            let pre = &bytes[body_start.saturating_sub(2)..body_start];
+            if pre != b"\r\n" && pre != b"\n\n" && !pre.ends_with(b"\n") {
+                bad_delimiter = bad_delimiter.saturating_add(1);
+            }
+        }
+    }
+    metrics.insert("pdf.stream_missing_length_count", f64::from(missing_length));
+    metrics.insert("pdf.stream_missing_endstream_count", f64::from(missing_endstream));
+    metrics.insert("pdf.stream_length_mismatch_count", f64::from(length_mismatch));
+    metrics.insert("pdf.stream_bad_delimiter_count", f64::from(bad_delimiter));
+}
+
+/// Composite "how dangerous does this PDF look?" score, 0-100.
+/// Sums weighted signals from `pdf.catalog.features[]`, the action
+/// count, embedded files, and JavaScript-style stream content.
+/// Calibrated against cleave's prior implementation so existing
+/// trait thresholds (`min: 70`) still mean roughly the same thing.
+fn derive_risky_feature_score(values: &Values, metrics: &mut Metrics) {
+    let mut score: u32 = 0;
+    let features = values
+        .get("pdf.catalog.features")
+        .and_then(serde_json::Value::as_array);
+    if let Some(feats) = features {
+        for entry in feats {
+            let Some(name) = entry.as_str() else { continue };
+            score += match name {
+                "openaction" => 20,
+                "additional_actions" => 15,
+                "names_javascript" => 25,
+                "richmedia" => 25,
+                "3d" => 15,
+                "xfa" => 20,
+                "acroform" => 5,
+                _ => 0,
+            };
+        }
+    }
+    let action_count = metrics.get("pdf.action_count").unwrap_or(0.0) as u32;
+    if action_count > 0 {
+        score += action_count.min(20);
+    }
+    let embedded = metrics.get("pdf.embedded_file_count").unwrap_or(0.0) as u32;
+    if embedded > 0 {
+        score += (embedded * 5).min(20);
+    }
+    metrics.insert("pdf.risky_feature_score", f64::from(score.min(100)));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1387,5 +1618,149 @@ mod tests {
         let (v, m) = extract_pdf(bytes);
         assert!(v.get("pdf.header.version").is_none());
         assert!(m.get("pdf.header_count").is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 1B derived-metric tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn leading_bytes_before_header_counted() {
+        let pdf = b"GARBAGE_LEADING_NOISE_%PDF-1.7\n%%EOF\n";
+        let (_, m) = extract_pdf(pdf);
+        // `GARBAGE_LEADING_NOISE_` is 22 bytes; `%PDF-` starts at 22.
+        assert_eq!(m.get("pdf.leading_bytes_before_header"), Some(22.0));
+    }
+
+    #[test]
+    fn signature_object_counted() {
+        let pdf = b"%PDF-1.7\n5 0 obj << /Type /Sig /Filter /Adobe.PPKLite >> endobj\n%%EOF";
+        let (_, m) = extract_pdf(pdf);
+        assert!(m.get("pdf.signature_object_count").unwrap() >= 1.0);
+    }
+
+    #[test]
+    fn signed_incremental_update_counted() {
+        // Two %%EOF markers + a signature object → 1 incremental update.
+        let pdf = b"%PDF-1.7\n5 0 obj << /Type /Sig >> endobj\n%%EOF\n6 0 obj << >> endobj\n%%EOF\n";
+        let (_, m) = extract_pdf(pdf);
+        assert_eq!(m.get("pdf.signed_incremental_update_count"), Some(1.0));
+    }
+
+    #[test]
+    fn duplicate_form_name_counted() {
+        let pdf = b"%PDF-1.4\n\
+            10 0 obj << /Subtype /Widget /T (name1) /FT /Tx /Rect [0 0 10 10] >> endobj\n\
+            11 0 obj << /Subtype /Widget /T (name1) /FT /Tx /Rect [50 50 60 60] >> endobj\n\
+            12 0 obj << /Subtype /Widget /T (name2) /FT /Tx /Rect [100 100 110 110] >> endobj\n\
+            %%EOF";
+        let (_, m) = extract_pdf(pdf);
+        assert_eq!(m.get("pdf.duplicate_form_name_count"), Some(1.0));
+    }
+
+    #[test]
+    fn duplicate_form_rect_counted() {
+        let pdf = b"%PDF-1.4\n\
+            10 0 obj << /Subtype /Widget /T (a) /FT /Tx /Rect [0 0 10 10] >> endobj\n\
+            11 0 obj << /Subtype /Widget /T (b) /FT /Tx /Rect [0 0 10 10] >> endobj\n\
+            %%EOF";
+        let (_, m) = extract_pdf(pdf);
+        assert_eq!(m.get("pdf.duplicate_form_rect_count"), Some(1.0));
+    }
+
+    #[test]
+    fn hidden_zero_rect_field_counted() {
+        let pdf = b"%PDF-1.4\n\
+            10 0 obj << /Subtype /Widget /T (hidden) /FT /Tx /Rect [0 0 0 0] /V (secret) >> endobj\n\
+            11 0 obj << /Subtype /Widget /T (visible) /FT /Tx /Rect [10 10 100 100] /V (x) >> endobj\n\
+            %%EOF";
+        let (_, m) = extract_pdf(pdf);
+        assert_eq!(m.get("pdf.hidden_zero_rect_field_count"), Some(1.0));
+    }
+
+    #[test]
+    fn decoded_form_value_max_len_reported() {
+        let pdf = b"%PDF-1.4\n\
+            10 0 obj << /Subtype /Widget /T (short) /FT /Tx /Rect [0 0 10 10] /V (hi) >> endobj\n\
+            11 0 obj << /Subtype /Widget /T (long) /FT /Tx /Rect [0 0 10 10] /V (this is a longer value) >> endobj\n\
+            %%EOF";
+        let (_, m) = extract_pdf(pdf);
+        assert!(m.get("pdf.decoded_form_value_max_len").unwrap() >= 22.0);
+    }
+
+    #[test]
+    fn overlapping_form_field_pair_counted() {
+        // Two rects that overlap, one non-overlapping → 1 pair.
+        let pdf = b"%PDF-1.4\n\
+            10 0 obj << /Subtype /Widget /T (a) /FT /Tx /Rect [0 0 50 50] >> endobj\n\
+            11 0 obj << /Subtype /Widget /T (b) /FT /Tx /Rect [25 25 75 75] >> endobj\n\
+            12 0 obj << /Subtype /Widget /T (c) /FT /Tx /Rect [200 200 250 250] >> endobj\n\
+            %%EOF";
+        let (_, m) = extract_pdf(pdf);
+        assert_eq!(m.get("pdf.overlapping_form_field_pair_count"), Some(1.0));
+    }
+
+    #[test]
+    fn risky_feature_score_aggregates_signals() {
+        let pdf = b"%PDF-1.4\n<< /AcroForm << /XFA [1 0 R] >> /OpenAction << /JS (app.alert(1)) >> >>\n5 0 obj << /S /JavaScript /JS (app.alert('x')) >> endobj\n%%EOF";
+        let (_, m) = extract_pdf(pdf);
+        let score = m.get("pdf.risky_feature_score").unwrap();
+        // openaction (20) + xfa (20) + acroform (5) + 1 action (1)
+        // — exact arithmetic depends on action attribution; the
+        // floor is 40 for the catalog features alone.
+        assert!(score >= 40.0, "risky_feature_score = {score}");
+    }
+
+    #[test]
+    fn stream_metrics_count_anomalies() {
+        // Stream with no /Length declared → missing_length.
+        let pdf = b"%PDF-1.5\n5 0 obj << /Filter /FlateDecode >> stream\nXYZ\nendstream endobj\n%%EOF";
+        let (_, m) = extract_pdf(pdf);
+        assert_eq!(m.get("pdf.stream_missing_length_count"), Some(1.0));
+    }
+
+    #[test]
+    fn stream_length_mismatch_detected() {
+        // /Length declares 10 bytes but body is 3 bytes.
+        let pdf = b"%PDF-1.5\n5 0 obj << /Length 10 /Filter /FlateDecode >> stream\nXYZ\nendstream endobj\n%%EOF";
+        let (_, m) = extract_pdf(pdf);
+        assert!(m.get("pdf.stream_length_mismatch_count").unwrap() >= 1.0);
+    }
+
+    // ------------------------------------------------------------------
+    // Malformed / robustness tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn truncated_header_is_silent() {
+        // `%PDF-` truncated mid-version stamp.
+        let pdf = b"%PDF-";
+        let (v, m) = extract_pdf(pdf);
+        assert_eq!(m.get("pdf.header_count"), Some(1.0));
+        // No version parsed, but header_count remains.
+        assert!(v
+            .get("pdf.header")
+            .and_then(|h| h.get("version"))
+            .is_none());
+    }
+
+    #[test]
+    fn malformed_obj_block_doesnt_crash() {
+        let pdf = b"%PDF-1.5\nNNNN 0 obj << bad dict\n%%EOF";
+        let (_v, _m) = extract_pdf(pdf);
+        // Just confirm we don't panic; correctness of recovery is
+        // best-effort.
+    }
+
+    #[test]
+    fn extracts_info_title_utf16_bom() {
+        // `<feff>` BOM marks the Title as UTF-16BE encoded — see
+        // PDF 1.7 §7.9.2.2 ("Text Strings").
+        let pdf = b"%PDF-1.4\n4 0 obj << /Title <FEFF0048006900210020> >> endobj\n%%EOF";
+        let (v, _) = extract_pdf(pdf);
+        assert_eq!(
+            v.get("pdf.info.title").and_then(|x| x.as_str()),
+            Some("Hi!")
+        );
     }
 }

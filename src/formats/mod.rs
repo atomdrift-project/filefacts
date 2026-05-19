@@ -20,10 +20,14 @@ use crate::fileid::FileType;
 use crate::output::{Metrics, Section, Strings, Values};
 
 mod build_toolchain;
+mod chm;
+mod class;
 mod common;
 mod elf;
 mod generic;
+mod jar;
 mod jpeg;
+mod lnk;
 mod macho;
 mod macho_code_signature;
 mod pdf;
@@ -41,6 +45,7 @@ mod rtf;
 pub(crate) mod source;
 mod structured;
 mod tar;
+mod vsix;
 mod zip;
 
 /// Drive the right extractor for `file_type` and merge its output into
@@ -64,11 +69,17 @@ pub(crate) fn extract(
         FileType::Pe => pe::extract(bytes, values, strings, metrics, sections),
         FileType::Elf => elf::extract(bytes, values, strings, metrics, sections),
         FileType::MachO => macho::extract(bytes, values, strings, metrics, sections),
-        FileType::Zip
-        | FileType::Jar
-        | FileType::Crx
-        | FileType::Ooxml
-        | FileType::Odf => zip::extract(bytes, values, metrics),
+        FileType::Zip | FileType::Crx | FileType::Ooxml | FileType::Odf => {
+            zip::extract(bytes, values, metrics)
+        }
+        FileType::Jar => {
+            // JAR is a zip — run the generic archive walk for
+            // `archive.*` paths, then layer the JAR-specific
+            // `jar.manifest.*` / `jar.pom.*` / `jar.features[]`
+            // surface on top.
+            zip::extract(bytes, values, metrics)?;
+            jar::extract(bytes, values, metrics)
+        }
         FileType::Tar | FileType::TarGz | FileType::TarBz2 | FileType::TarXz | FileType::TarZst => {
             tar::extract(bytes, file_type, values, metrics)
         }
@@ -78,13 +89,16 @@ pub(crate) fn extract(
         FileType::PackageJson
         | FileType::PackageLockJson
         | FileType::ComposerJson
-        | FileType::ChromeManifest
-        | FileType::VsixManifest => structured::extract_json(bytes, values),
+        | FileType::ChromeManifest => structured::extract_json(bytes, values),
+        FileType::VsixManifest => vsix::extract(bytes, values, strings, metrics),
         FileType::CargoToml | FileType::PyProjectToml => structured::extract_toml(bytes, values),
         FileType::GithubActions => structured::extract_yaml(bytes, values),
         FileType::Plist => structured::extract_plist(bytes, values),
         FileType::PkgInfo => structured::extract_pkginfo(bytes, values),
+        FileType::Chm => chm::extract(bytes, values, strings, metrics),
+        FileType::JavaClass => class::extract(bytes, values, strings, metrics),
         FileType::Jpeg => jpeg::extract(bytes, values, strings, metrics),
+        FileType::Lnk => lnk::extract(bytes, values, strings, metrics),
         FileType::Pdf => pdf::extract(bytes, values, strings, metrics),
         FileType::Pickle => pickle::extract(bytes, values, strings, metrics),
         FileType::Png => png::extract(bytes, values, strings, metrics),

@@ -292,4 +292,40 @@ mod tests {
         // No signing tags in minimal sample → no signature subtree.
         assert!(v.get("rpm.signature").is_none());
     }
+
+    #[test]
+    fn truncated_lead_is_silent() {
+        let (v, _) = run(&[0u8; 10]);
+        assert!(v.get("rpm.name").is_none());
+    }
+
+    #[test]
+    fn wrong_lead_magic_is_silent() {
+        let mut bad = vec![0u8; LEAD_BYTES + 16];
+        bad[0..4].copy_from_slice(b"NOPE");
+        let (v, _) = run(&bad);
+        assert!(v.get("rpm.name").is_none());
+    }
+
+    #[test]
+    fn truncated_main_header_doesnt_crash() {
+        // Valid lead + valid (empty) sig header + main-header magic
+        // claiming 1 entry but truncated before entry bytes.
+        let mut out = Vec::new();
+        out.extend_from_slice(&RPM_LEAD_MAGIC);
+        out.extend_from_slice(&[0u8; 92]);
+        out.extend_from_slice(&RPM_HEADER_MAGIC);
+        out.push(1);
+        out.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        // Main header claims 1 entry of 100 bytes but supplies neither.
+        out.extend_from_slice(&RPM_HEADER_MAGIC);
+        out.push(1);
+        out.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&1u32.to_be_bytes());
+        out.extend_from_slice(&100u32.to_be_bytes());
+        let (v, _) = run(&out);
+        assert!(v.get("rpm.name").is_none());
+    }
 }

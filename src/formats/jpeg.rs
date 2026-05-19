@@ -438,4 +438,51 @@ mod tests {
         let names: Vec<&str> = feats.iter().filter_map(|x| x.as_str()).collect();
         assert!(names.contains(&"exif"));
     }
+
+    #[test]
+    fn detects_icc_profile() {
+        // APP2 ICC_PROFILE marker: 12 bytes ICC_PROFILE\0 +
+        // chunk seq/total bytes + the 84-byte profile header.
+        // Total body must be ≥ 14 + 84 = 98 bytes.
+        let mut body = b"ICC_PROFILE\0".to_vec();
+        body.extend_from_slice(&[1, 1]); // chunk_seq, chunk_total
+        body.extend_from_slice(&[0; 84]); // profile header
+        let jpeg = build_jpeg(&[(0xE2, body)]);
+        let (v, _) = run(&jpeg);
+        let feats = v.get("jpeg.features").and_then(|x| x.as_array()).unwrap();
+        let names: Vec<&str> = feats.iter().filter_map(|x| x.as_str()).collect();
+        assert!(names.contains(&"icc"));
+    }
+
+    #[test]
+    fn detects_xmp_packet() {
+        let mut body = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
+        body.extend_from_slice(b"<?xpacket begin=...?>");
+        let jpeg = build_jpeg(&[(0xE1, body)]);
+        let (v, _) = run(&jpeg);
+        let feats = v.get("jpeg.features").and_then(|x| x.as_array()).unwrap();
+        let names: Vec<&str> = feats.iter().filter_map(|x| x.as_str()).collect();
+        assert!(names.contains(&"xmp"));
+    }
+
+    #[test]
+    fn truncated_segment_doesnt_crash() {
+        // SOI + an APP1 marker claiming 10000-byte length we don't supply.
+        let buf = [0xFF, 0xD8, 0xFF, 0xE1, 0x27, 0x10];
+        let (_, _) = run(&buf);
+        // No panic, no assertion needed.
+    }
+
+    #[test]
+    fn detects_photoshop_irb_with_iptc() {
+        let mut body = b"Photoshop 3.0\0".to_vec();
+        body.extend_from_slice(b"8BIM");
+        body.extend_from_slice(&[0; 8]);
+        let jpeg = build_jpeg(&[(0xED, body)]);
+        let (v, _) = run(&jpeg);
+        let feats = v.get("jpeg.features").and_then(|x| x.as_array()).unwrap();
+        let names: Vec<&str> = feats.iter().filter_map(|x| x.as_str()).collect();
+        assert!(names.contains(&"photoshop_irb"));
+        assert!(names.contains(&"iptc"));
+    }
 }

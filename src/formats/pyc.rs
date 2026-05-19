@@ -241,4 +241,64 @@ mod tests {
         let files = v.get("pyc.source_files").and_then(|x| x.as_array()).unwrap();
         assert_eq!(files.len(), 1);
     }
+
+    #[test]
+    fn unknown_magic_omits_version() {
+        // Magic word not in the version table — header still parses,
+        // but `pyc.python_version` is omitted rather than mis-labelled.
+        let pyc = build_pyc(9999, 0, 0, 0, b"");
+        let (v, _) = run(&pyc);
+        assert!(v.get("pyc.magic").is_some());
+        assert!(v.get("pyc.python_version").is_none());
+    }
+
+    #[test]
+    fn recognizes_pyx_pyw_pyi_extensions() {
+        let mut body = Vec::new();
+        for path in [b"a/b.pyx" as &[u8], b"c/d.pyw", b"e/f.pyi", b"g.py"] {
+            body.push(0x10);
+            body.extend_from_slice(path);
+            body.push(0);
+        }
+        let pyc = build_pyc(3413, 0, 1, 1, &body);
+        let (v, m) = run(&pyc);
+        let files = v.get("pyc.source_files").and_then(|x| x.as_array()).unwrap();
+        let paths: Vec<&str> = files.iter().filter_map(|x| x.as_str()).collect();
+        assert!(paths.contains(&"a/b.pyx"));
+        assert!(paths.contains(&"c/d.pyw"));
+        assert!(paths.contains(&"e/f.pyi"));
+        assert!(paths.contains(&"g.py"));
+        assert_eq!(m.get("pyc.source_file_count"), Some(4.0));
+    }
+
+    #[test]
+    fn rejects_signature_with_wrong_second_pair() {
+        // First two bytes look like a magic word but the next two are
+        // not `\r\n` — must reject.
+        let mut bytes = vec![0x55, 0x0D, 0x00, 0x00];
+        bytes.extend_from_slice(&[0u8; 12]);
+        let (v, _) = run(&bytes);
+        assert!(v.get("pyc.magic").is_none());
+    }
+
+    #[test]
+    fn body_scan_caps_filename_count() {
+        // Build 40 distinct filenames; should cap at MAX_SOURCE_FILES (32).
+        let mut body = Vec::new();
+        for i in 0..40 {
+            body.push(0x10);
+            body.extend_from_slice(format!("/tmp/file{i}.py").as_bytes());
+            body.push(0);
+        }
+        let pyc = build_pyc(3413, 0, 1, 1, &body);
+        let (v, _) = run(&pyc);
+        let files = v.get("pyc.source_files").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(files.len(), MAX_SOURCE_FILES);
+    }
+
+    #[test]
+    fn empty_input_is_silent() {
+        let (v, _) = run(&[]);
+        assert!(v.get("pyc.magic").is_none());
+    }
 }

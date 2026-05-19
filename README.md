@@ -14,13 +14,24 @@ static-analysis tool.
 - **No external commands.** Every fact `expose` surfaces is recovered
   in-process from Rust code. We never shell out to `rizin`,
   `objdump`, `file`, `openssl`, `tar`, `7z`, or any other system
-  binary. Tools that genuinely require process spawning (currently
-  rizin/yara integration) live in cleave, not here.
-- **No external dependencies that shell out either.** Crates we
-  pull in (goblin, flate2/rust_backend, tree-sitter, zip, tar,
-  plist, cms, x509-cert) are pure-Rust by policy. Adding a crate
-  that internally calls a system binary is a regression of this
-  rule.
+  binary, and we never pull in crates that internally do. Tools that
+  genuinely require process spawning (currently rizin/yara
+  integration) live in cleave, not here.
+- **Pure-Rust dependencies are welcome.** This rule is about
+  *process spawning*, not about dependency count. If a Rust crate
+  parses a format we need (e.g. `lzx`, `flate2`, `cms`, `goblin`),
+  pulling it in is fine — it just runs as in-process Rust like the
+  rest of `expose`. The bar for adding one is "is this format
+  worth handling at all?", not "can we avoid the dependency?".
+- **Test coverage target: 85%+ per format.** Every format extractor
+  should cover at minimum: the happy path (canonical input, all
+  kv/metrics surfaced), every named metric the extractor emits, at
+  least two malformed / truncated-input cases (no panic, sensible
+  degradation), the rejection path (non-format input is silent),
+  and any non-obvious decoding quirks (escape sequences, BOMs,
+  endianness, length-prefix overflow). Lean test fixtures (built
+  in-memory in `#[cfg(test)]`) are preferred over real-file
+  corpora so the test suite stays self-contained and quick.
 - **Single-pass parsing.** Each format is parsed at most once per
   file; the typed views are computed lazily and cached. Trait
   evaluation in cleave reads from the same in-memory representation.

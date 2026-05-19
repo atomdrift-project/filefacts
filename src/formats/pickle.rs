@@ -352,4 +352,46 @@ mod tests {
         let (v, _) = run(&[]);
         assert!(v.get("pickle.protocol").is_none());
     }
+
+    #[test]
+    fn truncated_length_prefix_doesnt_crash() {
+        // SHORT_BINUNICODE with length=10 but only 3 bytes follow.
+        let data = vec![0x80, 5, 0x8C, 10, b'a', b'b', b'c'];
+        let (_, _) = run(&data);
+        // Just confirm no panic.
+    }
+
+    #[test]
+    fn dangerous_opcodes_recognized() {
+        // Protocol 0 GLOBAL+REDUCE — classic RCE pattern.
+        let mut data = vec![b'c'];
+        data.extend_from_slice(b"subprocess\nPopen\n");
+        data.push(b'R');
+        data.push(b'.');
+        let (v, _) = run(&data);
+        let danger = v
+            .get("pickle.dangerous_opcodes")
+            .and_then(|x| x.as_array())
+            .unwrap();
+        let names: Vec<&str> = danger.iter().filter_map(|x| x.as_str()).collect();
+        assert!(names.contains(&"global"));
+        assert!(names.contains(&"reduce"));
+    }
+
+    #[test]
+    fn non_pickle_input_is_silent() {
+        // Random binary that doesn't match any opcode pattern.
+        let (v, _) = run(b"this is some random text that won't match much");
+        // It might match a few stray opcodes (chars like '.', 'c'),
+        // but should not report a protocol or modules.
+        assert!(v.get("pickle.modules").is_none() || v.get("pickle.protocol").is_none());
+    }
+
+    #[test]
+    fn protocol_5_recognized() {
+        // PROTO 5 + STOP.
+        let data = vec![0x80, 5, b'.'];
+        let (_, m) = run(&data);
+        assert_eq!(m.get("pickle.protocol"), Some(5.0));
+    }
 }

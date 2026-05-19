@@ -605,4 +605,31 @@ mod tests {
         let (v, _) = extract_rtf(b"not an rtf");
         assert!(v.get("rtf.version").is_none());
     }
+
+    #[test]
+    fn unterminated_group_doesnt_crash() {
+        // Opening brace + magic but no matching close — match_group_end
+        // returns bytes.len() so we should still parse the prefix without
+        // panic.
+        let (v, _) = extract_rtf(b"{\\rtf1\\ansi {\\info{\\author Mallory");
+        assert_eq!(v.get("rtf.version").and_then(|x| x.as_str()), Some("1"));
+    }
+
+    #[test]
+    fn empty_input_is_silent() {
+        let (v, _) = extract_rtf(b"");
+        assert!(v.get("rtf.version").is_none());
+    }
+
+    #[test]
+    fn escaped_braces_dont_unbalance_depth() {
+        // `\{` and `\}` are escaped — they should not change brace depth.
+        let rtf = b"{\\rtf1\\ansi {\\info{\\author A\\{B\\}C}}}";
+        let (v, _) = extract_rtf(rtf);
+        // Backslash-escaped braces are decoded as literal `{` and `}`.
+        assert_eq!(
+            v.get("rtf.info.author").and_then(|x| x.as_str()),
+            Some("A{B}C")
+        );
+    }
 }
