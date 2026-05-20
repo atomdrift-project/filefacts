@@ -50,10 +50,26 @@ pub(super) fn extract(
     };
     match parsed {
         Mach::Binary(macho) => {
-            single_arch(&macho, bytes, values, metrics, sections_out, imports_out, exports_out);
+            single_arch(
+                &macho,
+                bytes,
+                values,
+                metrics,
+                sections_out,
+                imports_out,
+                exports_out,
+            );
         }
         Mach::Fat(fat) => {
-            fat_binary(bytes, &fat, values, metrics, sections_out, imports_out, exports_out);
+            fat_binary(
+                bytes,
+                &fat,
+                values,
+                metrics,
+                sections_out,
+                imports_out,
+                exports_out,
+            );
         }
     }
     Ok(())
@@ -72,7 +88,9 @@ fn fat_binary(
     for (idx, slice) in fat.iter_arches().enumerate() {
         let Ok(arch) = slice else { continue };
         let slice_bytes = &bytes[arch.offset as usize
-            ..(arch.offset as usize).saturating_add(arch.size as usize).min(bytes.len())];
+            ..(arch.offset as usize)
+                .saturating_add(arch.size as usize)
+                .min(bytes.len())];
         let Ok(macho) = MachO::parse(slice_bytes, 0) else {
             continue;
         };
@@ -84,7 +102,13 @@ fn fat_binary(
         }));
         if idx == 0 {
             single_arch(
-                &macho, slice_bytes, values, metrics, sections_out, imports_out, exports_out,
+                &macho,
+                slice_bytes,
+                values,
+                metrics,
+                sections_out,
+                imports_out,
+                exports_out,
             );
         }
     }
@@ -155,6 +179,11 @@ fn extract_symbols(
                 source: "macho-trie",
                 offset: Some(exp.offset),
                 ordinal: None,
+                // dyld re-exports are surfaced via ExportInfo::Reexport
+                // in goblin; this extractor surfaces them as plain
+                // entries today and leaves forwarded-target decoding
+                // for a follow-up.
+                forward_to: None,
             });
             names.push(JsonValue::String(exp.name.clone()));
         }
@@ -168,10 +197,7 @@ fn extract_symbols(
 /// PE's `library` normalisation convention so trait matchers can
 /// share library names across formats.
 fn normalize_dylib_path(path: &str) -> String {
-    let basename = path
-        .rsplit_once('/')
-        .map(|(_, name)| name)
-        .unwrap_or(path);
+    let basename = path.rsplit_once('/').map(|(_, name)| name).unwrap_or(path);
     let stem = basename
         .strip_suffix(".dylib")
         .or_else(|| basename.strip_suffix(".tbd"))
@@ -250,10 +276,27 @@ fn section_entropy(bytes: &[u8], offset: u64, size: u64) -> f64 {
     entropy::shannon(&bytes[start..end])
 }
 
-fn extract_header_and_loads(macho: &MachO<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
-    put_str(values, "macho.cpu_type", cpu_type_string(macho.header.cputype()));
-    put_u64(values, "macho.cpu_subtype", u64::from(macho.header.cpusubtype()));
-    put_str(values, "macho.file_type", file_type_string(macho.header.filetype));
+fn extract_header_and_loads(
+    macho: &MachO<'_>,
+    bytes: &[u8],
+    values: &mut Values,
+    metrics: &mut Metrics,
+) {
+    put_str(
+        values,
+        "macho.cpu_type",
+        cpu_type_string(macho.header.cputype()),
+    );
+    put_u64(
+        values,
+        "macho.cpu_subtype",
+        u64::from(macho.header.cpusubtype()),
+    );
+    put_str(
+        values,
+        "macho.file_type",
+        file_type_string(macho.header.filetype),
+    );
     // Pike-style decomposed flag array — matches `pe.dll_characteristics[]`
     // / `lnk.header.flags[]` schema rather than emitting a raw bitfield
     // that traits would have to mask themselves.
@@ -261,10 +304,19 @@ fn extract_header_and_loads(macho: &MachO<'_>, bytes: &[u8], values: &mut Values
     if !mh_flags.is_empty() {
         values.insert(
             "macho.flags",
-            JsonValue::Array(mh_flags.into_iter().map(|s| JsonValue::String(s.into())).collect()),
+            JsonValue::Array(
+                mh_flags
+                    .into_iter()
+                    .map(|s| JsonValue::String(s.into()))
+                    .collect(),
+            ),
         );
     }
-    put_str(values, "macho.endian", if macho.little_endian { "little" } else { "big" });
+    put_str(
+        values,
+        "macho.endian",
+        if macho.little_endian { "little" } else { "big" },
+    );
 
     let libs: Vec<JsonValue> = macho
         .libs
@@ -337,8 +389,148 @@ fn extract_header_and_loads(macho: &MachO<'_>, bytes: &[u8], values: &mut Values
     load_dylibs(macho, values);
     linker_options(macho, bytes, values);
     objc_image_info(macho, bytes, values);
+    segment_analysis(macho, values, metrics);
+    chained_fixups_marker(macho, metrics);
 
     binary_flags(macho, metrics);
+}
+
+/// Walk Mach-O segments + sections and emit segment-shape metrics:
+///
+/// - `macho.wx_segment_count`     — segments with both `WRITE` and
+///   `EXECUTE` in their initprot. Almost always 0 in legitimate
+///   binaries; non-zero indicates shellcode-friendly layout.
+/// - `macho.text_segment_writable` — `__TEXT` segment with write
+///   permission. Legit `__TEXT` is `r-x`; writable text is a
+///   self-modifying / unpacker signal.
+/// - `macho.pagezero_size`        — size of the `__PAGEZERO` segment.
+///   Standard is 4 GiB on 64-bit; unusually small / absent values
+///   defeat the standard NULL-pointer fault and are an anti-debug
+///   tell.
+/// - `macho.has_encrypted_section` — any segment with
+///   `S_ATTR_PURE_INSTRUCTIONS|S_ATTR_SELF_MODIFYING_CODE` flag
+///   bits set (Apple-encrypted FairPlay binaries).
+/// - `macho.entry_in_writable_segment` — entry-point address lands
+///   in a write-permitted segment.
+/// - `macho.entry_outside_segments`   — entry-point address falls
+///   outside every load segment (extremely rare; tampered binary).
+/// - `macho.segments[]` (values)  — typed program-header listing,
+///   mirroring `elf.segments[]`.
+fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metrics) {
+    // VM_PROT_* flags (bits in `initprot`/`maxprot`).
+    const VM_PROT_READ: u32 = 0x1;
+    const VM_PROT_WRITE: u32 = 0x2;
+    const VM_PROT_EXECUTE: u32 = 0x4;
+
+    let entry = entry_point(macho);
+    let mut wx_count: u64 = 0;
+    let mut text_writable = false;
+    let mut pagezero_size: u64 = 0;
+    let mut entry_in_writable = false;
+    let mut entry_in_segment = false;
+    let mut segments_out: Vec<JsonValue> = Vec::new();
+    for segment in &macho.segments {
+        let name = segment.name().unwrap_or("").to_string();
+        let writable = segment.initprot & VM_PROT_WRITE != 0;
+        let executable = segment.initprot & VM_PROT_EXECUTE != 0;
+        let readable = segment.initprot & VM_PROT_READ != 0;
+        if writable && executable {
+            wx_count += 1;
+        }
+        if name == "__TEXT" && writable {
+            text_writable = true;
+        }
+        if name == "__PAGEZERO" {
+            pagezero_size = segment.vmsize;
+        }
+        if entry != 0 {
+            let end = segment.vmaddr.saturating_add(segment.vmsize);
+            if entry >= segment.vmaddr && entry < end {
+                entry_in_segment = true;
+                if writable {
+                    entry_in_writable = true;
+                }
+            }
+        }
+
+        let mut entry_obj = serde_json::Map::new();
+        entry_obj.insert("name".into(), JsonValue::String(name));
+        entry_obj.insert("vaddr".into(), JsonValue::Number(segment.vmaddr.into()));
+        entry_obj.insert("vsize".into(), JsonValue::Number(segment.vmsize.into()));
+        entry_obj.insert(
+            "file_offset".into(),
+            JsonValue::Number(segment.fileoff.into()),
+        );
+        entry_obj.insert(
+            "file_size".into(),
+            JsonValue::Number(segment.filesize.into()),
+        );
+        let perms = format!(
+            "{}{}{}",
+            if readable { "r" } else { "-" },
+            if writable { "w" } else { "-" },
+            if executable { "x" } else { "-" },
+        );
+        entry_obj.insert("perms".into(), JsonValue::String(perms));
+        segments_out.push(JsonValue::Object(entry_obj));
+    }
+    metrics.insert("macho.wx_segment_count", wx_count as f64);
+    if text_writable {
+        metrics.insert("macho.text_segment_writable", 1.0);
+    }
+    if pagezero_size != 0 {
+        metrics.insert("macho.pagezero_size", pagezero_size as f64);
+    }
+    if entry_in_writable {
+        metrics.insert("macho.entry_in_writable_segment", 1.0);
+    }
+    if entry != 0 && !entry_in_segment {
+        metrics.insert("macho.entry_outside_segments", 1.0);
+    }
+    if !segments_out.is_empty() {
+        values.insert("macho.segments", JsonValue::Array(segments_out));
+    }
+}
+
+/// Entry-point address from `LC_MAIN`'s `entryoff` (modern dylinker)
+/// or the legacy `LC_UNIXTHREAD`'s thread-state PC. Returns `0` when
+/// neither is present (typical for shared libraries).
+fn entry_point(macho: &MachO<'_>) -> u64 {
+    for lc in &macho.load_commands {
+        if let mach::load_command::CommandVariant::Main(main) = lc.command {
+            return main.entryoff;
+        }
+    }
+    macho.entry
+}
+
+/// `LC_DYLD_CHAINED_FIXUPS` (`0x80000034`) replaces the legacy
+/// `LC_DYLD_INFO_ONLY` blob on modern Mach-O builds; presence
+/// signals the binary was linked with a recent dyld. Trait engines
+/// use the opposite (legacy fixups) as a "stale toolchain" signal.
+fn chained_fixups_marker(macho: &MachO<'_>, metrics: &mut Metrics) {
+    const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
+    let mut has_chained = false;
+    let mut has_legacy_dyld_info = false;
+    for lc in &macho.load_commands {
+        let cmd = lc.command.cmd();
+        if cmd == LC_DYLD_CHAINED_FIXUPS {
+            has_chained = true;
+        }
+        if matches!(
+            lc.command,
+            mach::load_command::CommandVariant::DyldInfo(_)
+                | mach::load_command::CommandVariant::DyldInfoOnly(_)
+        ) {
+            has_legacy_dyld_info = true;
+        }
+    }
+    if has_chained {
+        metrics.insert("macho.has_chained_fixups", 1.0);
+    }
+    if has_legacy_dyld_info {
+        metrics.insert("macho.has_dyld_info_legacy", 1.0);
+    }
 }
 
 /// `LC_LINKER_OPTION` (cmd `0x2d`) — embeds linker arguments
@@ -412,7 +604,10 @@ fn objc_image_info(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
             let flags = read_u32(&bytes[off + 4..off + 8], 0, little_endian);
             let swift_version = (flags >> 8) & 0xff;
             let mut obj = serde_json::Map::new();
-            obj.insert("flags_raw".into(), JsonValue::Number(u64::from(flags).into()));
+            obj.insert(
+                "flags_raw".into(),
+                JsonValue::Number(u64::from(flags).into()),
+            );
             if swift_version != 0 {
                 obj.insert(
                     "swift_version".into(),
@@ -462,7 +657,10 @@ fn load_dylibs(macho: &MachO<'_>, values: &mut Values) {
             JsonValue::String(decode_version_nibbles(dylib.compatibility_version)),
         );
         if dylib.timestamp != 0 {
-            entry.insert("timestamp".into(), JsonValue::Number(dylib.timestamp.into()));
+            entry.insert(
+                "timestamp".into(),
+                JsonValue::Number(dylib.timestamp.into()),
+            );
         }
         entries.push(JsonValue::Object(entry));
     }
@@ -493,10 +691,16 @@ fn build_version(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
         JsonValue::String(platform_name(bv.platform).to_string()),
     );
     if bv.minos != 0 {
-        obj.insert("min_os".into(), JsonValue::String(decode_version_nibbles(bv.minos)));
+        obj.insert(
+            "min_os".into(),
+            JsonValue::String(decode_version_nibbles(bv.minos)),
+        );
     }
     if bv.sdk != 0 {
-        obj.insert("sdk".into(), JsonValue::String(decode_version_nibbles(bv.sdk)));
+        obj.insert(
+            "sdk".into(),
+            JsonValue::String(decode_version_nibbles(bv.sdk)),
+        );
     }
     if bv.ntools > 0 {
         let header_size = 24_usize;
@@ -531,9 +735,7 @@ fn build_version(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
 }
 
 fn read_u32(bytes: &[u8], offset: usize, little_endian: bool) -> u32 {
-    let arr: [u8; 4] = bytes[offset..offset + 4]
-        .try_into()
-        .unwrap_or([0, 0, 0, 0]);
+    let arr: [u8; 4] = bytes[offset..offset + 4].try_into().unwrap_or([0, 0, 0, 0]);
     if little_endian {
         u32::from_le_bytes(arr)
     } else {
@@ -572,7 +774,11 @@ fn source_version(macho: &MachO<'_>, values: &mut Values) {
     let c = (sv >> 20) & 0x3FF;
     let d = (sv >> 10) & 0x3FF;
     let e = sv & 0x3FF;
-    put_str(values, "macho.source_version", format!("{a}.{b}.{c}.{d}.{e}"));
+    put_str(
+        values,
+        "macho.source_version",
+        format!("{a}.{b}.{c}.{d}.{e}"),
+    );
 }
 
 /// `LC_ID_DYLIB` — the dylib's own install name (only present on
@@ -680,9 +886,7 @@ fn plist_to_json(value: plist::Value) -> JsonValue {
             .map(|n| JsonValue::Number(n.into()))
             .or_else(|| i.as_unsigned().map(|u| JsonValue::Number(u.into())))
             .unwrap_or(JsonValue::Null),
-        P::Real(f) => {
-            serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
-        }
+        P::Real(f) => serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number),
         P::Boolean(b) => JsonValue::Bool(b),
         P::Date(d) => JsonValue::String(format!("{d:?}")),
         P::Array(arr) => JsonValue::Array(arr.into_iter().map(plist_to_json).collect()),
@@ -714,32 +918,84 @@ fn format_macho_uuid(b: &[u8; 16]) -> String {
 /// loader.h symbol's letters together.
 fn mh_flag_names(flags: u32) -> Vec<&'static str> {
     let mut out = Vec::new();
-    if flags & 0x0000_0001 != 0 { out.push("no_undefs"); }
-    if flags & 0x0000_0002 != 0 { out.push("incremental_link"); }
-    if flags & 0x0000_0004 != 0 { out.push("dyld_link"); }
-    if flags & 0x0000_0008 != 0 { out.push("bind_at_load"); }
-    if flags & 0x0000_0010 != 0 { out.push("pre_bound"); }
-    if flags & 0x0000_0020 != 0 { out.push("split_segments"); }
-    if flags & 0x0000_0040 != 0 { out.push("lazy_init"); }
-    if flags & 0x0000_0080 != 0 { out.push("two_level"); }
-    if flags & 0x0000_0100 != 0 { out.push("force_flat"); }
-    if flags & 0x0000_0200 != 0 { out.push("no_multi_defs"); }
-    if flags & 0x0000_0400 != 0 { out.push("no_fix_pre_binding"); }
-    if flags & 0x0000_0800 != 0 { out.push("pre_bindable"); }
-    if flags & 0x0000_1000 != 0 { out.push("all_mods_bound"); }
-    if flags & 0x0000_2000 != 0 { out.push("subsections_via_symbols"); }
-    if flags & 0x0000_4000 != 0 { out.push("canonical"); }
-    if flags & 0x0000_8000 != 0 { out.push("weak_defines"); }
-    if flags & 0x0001_0000 != 0 { out.push("binds_to_weak"); }
-    if flags & 0x0002_0000 != 0 { out.push("allow_stack_execution"); }
-    if flags & 0x0004_0000 != 0 { out.push("root_safe"); }
-    if flags & 0x0008_0000 != 0 { out.push("setuid_safe"); }
-    if flags & 0x0010_0000 != 0 { out.push("no_reexported_dylibs"); }
-    if flags & 0x0020_0000 != 0 { out.push("pie"); }
-    if flags & 0x0040_0000 != 0 { out.push("dead_strippable_dylib"); }
-    if flags & 0x0080_0000 != 0 { out.push("has_tlv_descriptors"); }
-    if flags & 0x0100_0000 != 0 { out.push("no_heap_execution"); }
-    if flags & 0x0200_0000 != 0 { out.push("app_extension_safe"); }
+    if flags & 0x0000_0001 != 0 {
+        out.push("no_undefs");
+    }
+    if flags & 0x0000_0002 != 0 {
+        out.push("incremental_link");
+    }
+    if flags & 0x0000_0004 != 0 {
+        out.push("dyld_link");
+    }
+    if flags & 0x0000_0008 != 0 {
+        out.push("bind_at_load");
+    }
+    if flags & 0x0000_0010 != 0 {
+        out.push("pre_bound");
+    }
+    if flags & 0x0000_0020 != 0 {
+        out.push("split_segments");
+    }
+    if flags & 0x0000_0040 != 0 {
+        out.push("lazy_init");
+    }
+    if flags & 0x0000_0080 != 0 {
+        out.push("two_level");
+    }
+    if flags & 0x0000_0100 != 0 {
+        out.push("force_flat");
+    }
+    if flags & 0x0000_0200 != 0 {
+        out.push("no_multi_defs");
+    }
+    if flags & 0x0000_0400 != 0 {
+        out.push("no_fix_pre_binding");
+    }
+    if flags & 0x0000_0800 != 0 {
+        out.push("pre_bindable");
+    }
+    if flags & 0x0000_1000 != 0 {
+        out.push("all_mods_bound");
+    }
+    if flags & 0x0000_2000 != 0 {
+        out.push("subsections_via_symbols");
+    }
+    if flags & 0x0000_4000 != 0 {
+        out.push("canonical");
+    }
+    if flags & 0x0000_8000 != 0 {
+        out.push("weak_defines");
+    }
+    if flags & 0x0001_0000 != 0 {
+        out.push("binds_to_weak");
+    }
+    if flags & 0x0002_0000 != 0 {
+        out.push("allow_stack_execution");
+    }
+    if flags & 0x0004_0000 != 0 {
+        out.push("root_safe");
+    }
+    if flags & 0x0008_0000 != 0 {
+        out.push("setuid_safe");
+    }
+    if flags & 0x0010_0000 != 0 {
+        out.push("no_reexported_dylibs");
+    }
+    if flags & 0x0020_0000 != 0 {
+        out.push("pie");
+    }
+    if flags & 0x0040_0000 != 0 {
+        out.push("dead_strippable_dylib");
+    }
+    if flags & 0x0080_0000 != 0 {
+        out.push("has_tlv_descriptors");
+    }
+    if flags & 0x0100_0000 != 0 {
+        out.push("no_heap_execution");
+    }
+    if flags & 0x0200_0000 != 0 {
+        out.push("app_extension_safe");
+    }
     out
 }
 
@@ -930,7 +1186,10 @@ mod tests {
 
     #[test]
     fn normalize_dylib_path_strips_dir_and_suffix() {
-        assert_eq!(normalize_dylib_path("/usr/lib/libSystem.B.dylib"), "libsystem.b");
+        assert_eq!(
+            normalize_dylib_path("/usr/lib/libSystem.B.dylib"),
+            "libsystem.b"
+        );
         assert_eq!(normalize_dylib_path("libobjc.A.tbd"), "libobjc.a");
         // Bare names without prefix or suffix are lowercased.
         assert_eq!(normalize_dylib_path("Foo"), "foo");
@@ -965,7 +1224,10 @@ mod tests {
         if !imports.is_empty() {
             for imp in imports.iter() {
                 assert_eq!(imp.source, "macho-bind");
-                let lib = imp.library.as_deref().expect("Mach-O bind imports carry library");
+                let lib = imp
+                    .library
+                    .as_deref()
+                    .expect("Mach-O bind imports carry library");
                 assert_eq!(lib, &lib.to_ascii_lowercase());
                 assert!(!lib.ends_with(".dylib") && !lib.ends_with(".tbd"));
             }
@@ -990,5 +1252,4 @@ mod tests {
     fn mh_flag_names_empty_when_zero() {
         assert!(mh_flag_names(0).is_empty());
     }
-
 }
