@@ -63,6 +63,7 @@ pub(super) fn extract(
     gnu_property(&elf, bytes, values, metrics);
     binary_flags(&elf, metrics);
     elf_numeric_metrics(&elf, bytes, metrics, values);
+    dynamic_metrics(&elf, metrics);
     linker_family(values);
     super::build_toolchain::from_elf(values, sections_out, bytes);
 
@@ -482,14 +483,30 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
     );
 
     // Program headers / segments. PT_LOAD = 1, PT_GNU_STACK = 0x6474_e551.
+    // PF_X = 1, PF_W = 2.
     let mut max_file_size: u64 = 0;
     let mut max_memory_size: u64 = 0;
     let mut has_gnu_stack = false;
     let mut nx_enabled = true; // default: no executable stack signal
+    let mut wx_segment_count: u64 = 0;
+    let mut entry_in_writable_segment = false;
+    let entry = elf.header.e_entry;
     for ph in &elf.program_headers {
         if ph.p_type == program_header::PT_LOAD {
             max_file_size = max_file_size.max(ph.p_filesz);
             max_memory_size = max_memory_size.max(ph.p_memsz);
+            let writable = ph.p_flags & 0x2 != 0;
+            let executable = ph.p_flags & 0x1 != 0;
+            if writable && executable {
+                wx_segment_count += 1;
+            }
+            if writable && entry != 0 {
+                let span = ph.p_memsz.max(ph.p_filesz);
+                let end = ph.p_vaddr.saturating_add(span);
+                if entry >= ph.p_vaddr && entry < end {
+                    entry_in_writable_segment = true;
+                }
+            }
         }
         if ph.p_type == program_header::PT_GNU_STACK {
             has_gnu_stack = true;
@@ -502,6 +519,11 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
     metrics.insert("elf.load_segment_max_file_size", max_file_size as f64);
     metrics.insert("elf.load_segment_max_memory_size", max_memory_size as f64);
     metrics.insert("elf.nx_enabled", f64::from(u8::from(nx_enabled)));
+    metrics.insert("elf.executable_stack", f64::from(u8::from(!nx_enabled)));
+    metrics.insert("elf.wx_segment_count", wx_segment_count as f64);
+    if entry_in_writable_segment {
+        metrics.insert("elf.entry_in_writable_segment", 1.0);
+    }
     // ET_REL (relocatable object) files legitimately omit PT_GNU_STACK
     // because they have no program headers; only flag absence for
     // ET_EXEC / ET_DYN.
@@ -565,6 +587,136 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
     if let Some(name) = entry_section {
         put_str(values, "elf.entry_section", &name);
     }
+}
+
+/// `elf.*` metrics derived from the dynamic-section tag stream. Each
+/// is a hardening / build-environment / sandbox-escape signal the
+/// trait engine wants as a numeric/bool flag rather than a substring
+/// match against `elf.gnu_property[]` / `elf.dt_flags[]`.
+///
+/// - `has_dt_textrel` — `DT_TEXTREL` (writable code requirement;
+///   normal binaries don't need it, malware loaders sometimes do).
+/// - `has_dt_audit` / `has_dt_depaudit` — auditor hooks the loader
+///   calls on every dlopen; sandbox-escape signal.
+/// - `has_dt_debug` — non-zero `DT_DEBUG` (used by runtime debuggers
+///   and some packers).
+/// - `has_dt_relr` — modern compressed relocations
+///   (glibc 2.36+ / lld 13+).
+/// - `has_gnu_hash` — newer hash table format; absence on a recent
+///   binary is anomalous.
+/// - `init_array_count` / `fini_array_count` / `preinit_array_count`
+///   — constructor / destructor counts. CRT-initializer abuse drops
+///   payloads into these arrays.
+/// - `dt_needed_abs_path_count` / `dt_needed_traversal_count` —
+///   anomaly counts over the DT_NEEDED library list.
+/// - `dt_runpath_uses_origin` — `$ORIGIN` token in DT_RUNPATH (the
+///   canonical relative-path runtime search base; common in modern
+///   builds but sometimes abused).
+/// - `has_direct_loader_dep` — a library directly DT_NEEDEDs the
+///   dynamic loader (`ld-linux-*.so.*`/`ld-musl-*.so.*`); legit libs
+///   pick up the loader transitively via libc, so direct dependency
+///   is a strong tampering tell.
+fn dynamic_metrics(elf: &Elf<'_>, metrics: &mut Metrics) {
+    use goblin::elf::dynamic::{
+        DT_AUDIT, DT_DEBUG, DT_DEPAUDIT, DT_FINI_ARRAYSZ, DT_GNU_HASH, DT_INIT_ARRAYSZ,
+        DT_PREINIT_ARRAYSZ, DT_TEXTREL,
+    };
+    // DT_RELR (36) isn't a named constant in goblin's enum yet; use
+    // the ELF-spec literal directly.
+    const DT_RELR: u64 = 36;
+
+    let Some(dynamic) = elf.dynamic.as_ref() else {
+        return;
+    };
+
+    let mut init_arraysz: u64 = 0;
+    let mut fini_arraysz: u64 = 0;
+    let mut preinit_arraysz: u64 = 0;
+    for d in &dynamic.dyns {
+        match d.d_tag {
+            DT_TEXTREL => {
+                metrics.insert("elf.has_dt_textrel", 1.0);
+            }
+            DT_AUDIT => {
+                metrics.insert("elf.has_dt_audit", 1.0);
+            }
+            DT_DEPAUDIT => {
+                metrics.insert("elf.has_dt_depaudit", 1.0);
+            }
+            DT_DEBUG if d.d_val != 0 => {
+                metrics.insert("elf.has_dt_debug", 1.0);
+            }
+            DT_RELR => {
+                metrics.insert("elf.has_dt_relr", 1.0);
+            }
+            DT_GNU_HASH => {
+                metrics.insert("elf.has_gnu_hash", 1.0);
+            }
+            DT_INIT_ARRAYSZ => init_arraysz = d.d_val,
+            DT_FINI_ARRAYSZ => fini_arraysz = d.d_val,
+            DT_PREINIT_ARRAYSZ => preinit_arraysz = d.d_val,
+            _ => {}
+        }
+    }
+    let ptr_size = if elf.is_64 { 8u64 } else { 4u64 };
+    if init_arraysz > 0 {
+        metrics.insert("elf.init_array_count", (init_arraysz / ptr_size) as f64);
+    }
+    if fini_arraysz > 0 {
+        metrics.insert("elf.fini_array_count", (fini_arraysz / ptr_size) as f64);
+    }
+    if preinit_arraysz > 0 {
+        metrics.insert(
+            "elf.preinit_array_count",
+            (preinit_arraysz / ptr_size) as f64,
+        );
+    }
+
+    // DT_NEEDED anomaly walk. Each `elf.libraries` entry is the
+    // string already resolved from DT_NEEDED via the dynstr table.
+    let mut abs_path_count: u64 = 0;
+    let mut traversal_count: u64 = 0;
+    let mut direct_loader_dep = false;
+    for needed in &elf.libraries {
+        if needed.starts_with('/') {
+            abs_path_count += 1;
+        }
+        if needed.split('/').any(|seg| seg == "..") {
+            traversal_count += 1;
+        }
+        if is_dynamic_loader_soname(needed) {
+            direct_loader_dep = true;
+        }
+    }
+    if abs_path_count > 0 {
+        metrics.insert("elf.dt_needed_abs_path_count", abs_path_count as f64);
+    }
+    if traversal_count > 0 {
+        metrics.insert("elf.dt_needed_traversal_count", traversal_count as f64);
+    }
+    if direct_loader_dep {
+        metrics.insert("elf.has_direct_loader_dep", 1.0);
+    }
+
+    // DT_RUNPATH $ORIGIN check — RUNPATH entries also serialise as
+    // colon-separated strings via the dynstr table; goblin parsed
+    // them into the `runpaths` slice already.
+    if elf
+        .runpaths
+        .iter()
+        .any(|p| p.split(':').any(|seg| seg.contains("$ORIGIN")))
+    {
+        metrics.insert("elf.dt_runpath_uses_origin", 1.0);
+    }
+}
+
+/// `true` when `name` matches one of the well-known dynamic-loader
+/// SONAMEs (`ld-linux-*.so.*` / `ld-musl-*.so.*` / `ld-*.so.*`). A
+/// *library* with the loader as a direct DT_NEEDED is anomalous —
+/// the loader is normally pulled in transitively via libc.
+fn is_dynamic_loader_soname(name: &str) -> bool {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    base.starts_with("ld-linux") || base.starts_with("ld-musl") || base == "ld.so"
 }
 
 /// Cross-format `binary.*` metrics derivable from ELF header state.
