@@ -38,6 +38,23 @@ pub struct ExtractedString {
     pub text: String,
     /// Byte offset of the first character in the source bytes.
     pub offset: usize,
+    /// Recovery method when something more specific than the byte-level
+    /// category applies — e.g. `"go-string"` for a fat-pointer Go
+    /// string, `"rust-string"` for `&str`/`String`, `"xor"` for an
+    /// XOR-deobfuscated run, `"base64"` for a base64-decoded payload.
+    /// `None` for plain ASCII / UTF-16 runs that need no annotation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// Classifier kind when the recovered string fits a recognised
+    /// shape (e.g. `"url"`, `"path"`, `"sql"`). Used by trait engines
+    /// that want to filter by intent rather than substring.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Section the string was recovered from when the format had
+    /// addressable sections (PE/ELF/Mach-O); `None` for bare byte
+    /// scans.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
 }
 
 /// Collection of strings extracted from a file.

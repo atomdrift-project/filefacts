@@ -13,7 +13,7 @@ use goblin::mach::{self, Mach, MachO};
 use serde_json::{json, Value as JsonValue};
 
 use crate::error::Error;
-use crate::formats::common::{extract_ascii_strings, put_str, put_u64};
+use crate::formats::common::{extract_binary_strings, put_str, put_u64};
 use crate::formats::goblin_safe;
 use crate::output::{Errors, Metrics, Section, Strings, Values};
 use crate::scan::entropy;
@@ -29,7 +29,7 @@ pub(super) fn extract(
     exports_out: &mut crate::Exports,
     errors_out: &mut Errors,
 ) -> Result<(), Error> {
-    extract_ascii_strings(bytes, strings);
+    extract_binary_strings(bytes, strings);
 
     // Wrap goblin parse in catch_unwind. Fat-header arithmetic
     // overflow on malformed Mach-O has historically panicked

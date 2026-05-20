@@ -51,14 +51,16 @@ impl Iterator for AsciiRuns<'_> {
             if self.pos - start >= self.min_len {
                 // `is_printable` only accepts ASCII bytes, so the slice is
                 // valid UTF-8 by construction.
-                let text =
-                    std::str::from_utf8(&self.bytes[start..self.pos])
-                        .expect("ascii slice is valid utf-8")
-                        .to_owned();
+                let text = std::str::from_utf8(&self.bytes[start..self.pos])
+                    .expect("ascii slice is valid utf-8")
+                    .to_owned();
                 return Some(ExtractedString {
                     category: StringCategory::Ascii,
                     text,
                     offset: start,
+                    method: None,
+                    kind: None,
+                    section: None,
                 });
             }
         }

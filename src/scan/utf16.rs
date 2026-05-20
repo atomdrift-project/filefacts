@@ -55,6 +55,9 @@ impl Iterator for Utf16Runs<'_> {
                         category: StringCategory::Utf16Le,
                         text,
                         offset: start,
+                        method: None,
+                        kind: None,
+                        section: None,
                     });
                 }
             } else {

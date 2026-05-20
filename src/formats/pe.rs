@@ -15,7 +15,7 @@ use serde_json::{json, Value as JsonValue};
 
 use crate::error::Error;
 use crate::formats::common::{
-    extract_ascii_strings, extract_utf16_strings, hex_encode, put_i64, put_str, put_u64,
+    extract_binary_strings, extract_utf16_strings, hex_encode, put_i64, put_str, put_u64,
 };
 use crate::formats::goblin_safe;
 use crate::output::{Errors, Metrics, Section, Strings, Values};
@@ -35,7 +35,7 @@ pub(super) fn extract(
     // PE strings are scattered across `.rdata`, `.data`, and resources.
     // The full-file scan is cheap and captures content embedded outside
     // of `goblin`'s parsed regions (overlays, hand-crafted sections).
-    extract_ascii_strings(bytes, strings);
+    extract_binary_strings(bytes, strings);
     extract_utf16_strings(bytes, strings);
 
     // Try the full goblin parse first — it gives us imports, exports,

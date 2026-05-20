@@ -39,8 +39,8 @@ pub(super) fn extract(
     let Some(cache) = tree_cache else {
         return Ok(());
     };
-    let config = langs::config_for(cache.file_type())
-        .expect("tree_cache implies config_for is Some");
+    let config =
+        langs::config_for(cache.file_type()).expect("tree_cache implies config_for is Some");
     let source = cache.source();
     let root = cache.tree().root_node();
 
@@ -133,12 +133,9 @@ pub(super) fn extract(
 
 /// Single-pass AST projection. Always returns a fully-built `Ast` —
 /// empty when the tree has no calls or member chains, never absent.
-pub(crate) fn build_ast(
-    cache: &TreeCache,
-    metrics: &mut Metrics,
-) -> crate::output::Ast {
-    let config = langs::config_for(cache.file_type())
-        .expect("tree_cache implies config_for is Some");
+pub(crate) fn build_ast(cache: &TreeCache, metrics: &mut Metrics) -> crate::output::Ast {
+    let config =
+        langs::config_for(cache.file_type()).expect("tree_cache implies config_for is Some");
     let source = cache.source();
     let root = cache.tree().root_node();
     ast_walk::walk(root, source, config, metrics)
@@ -161,6 +158,9 @@ fn extract_strings(
                     category: StringCategory::Literal,
                     text,
                     offset: node.start_byte(),
+                    method: None,
+                    kind: None,
+                    section: None,
                 });
                 count += 1;
             }
@@ -199,7 +199,9 @@ fn decode_string_literal(node: Node<'_>, source: &str) -> Option<String> {
     } else {
         return None;
     }
-    std::str::from_utf8(&bytes[start..end]).ok().map(str::to_string)
+    std::str::from_utf8(&bytes[start..end])
+        .ok()
+        .map(str::to_string)
 }
 
 fn is_string_prefix(b: u8) -> bool {
@@ -224,15 +226,11 @@ fn collect_query(
     // each. A repeated `import os` shows up once; the offset points
     // at its first occurrence, which is the most useful answer for
     // proximity-style matchers.
-    let mut seen: std::collections::BTreeMap<String, u64> =
-        std::collections::BTreeMap::new();
+    let mut seen: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     let mut matches = cursor.matches(&query, root, source.as_bytes());
     while let Some(m) = matches.next() {
         for cap in m.captures {
-            let name = capture_names
-                .get(cap.index as usize)
-                .copied()
-                .unwrap_or("");
+            let name = capture_names.get(cap.index as usize).copied().unwrap_or("");
             if name.starts_with('_') {
                 continue;
             }
@@ -289,14 +287,13 @@ mod tests {
         // open_with_path so fileid classifies as Python via the
         // `.py` extension hint — without it the bytes look like
         // plain text and the source extractor never runs.
-        let parsed = crate::open_with_path(
-            std::path::Path::new("test.py"),
-            src,
-        )
-        .unwrap();
+        let parsed = crate::open_with_path(std::path::Path::new("test.py"), src).unwrap();
         let _ = parsed.values();
         let imports = parsed.imports();
-        assert!(!imports.is_empty(), "expected python imports to populate typed view");
+        assert!(
+            !imports.is_empty(),
+            "expected python imports to populate typed view"
+        );
         let names: std::collections::HashSet<&str> =
             imports.iter().map(|i| i.name.as_str()).collect();
         assert!(names.contains("os"), "got names {names:?}");
@@ -313,11 +310,7 @@ mod tests {
     #[test]
     fn python_functions_and_classes_populate_typed_view() {
         let src = b"def hello():\n    pass\n\nclass Greeter:\n    pass\n";
-        let parsed = crate::open_with_path(
-            std::path::Path::new("test.py"),
-            src,
-        )
-        .unwrap();
+        let parsed = crate::open_with_path(std::path::Path::new("test.py"), src).unwrap();
         let _ = parsed.values();
         let functions = parsed.functions();
         let names: std::collections::HashMap<&str, Option<&str>> = functions

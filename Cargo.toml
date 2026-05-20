@@ -46,6 +46,12 @@ p384 = { version = "0.13", features = ["ecdsa"] }
 # behind one parse entry point; we use it for all three.
 goblin = { version = "0.10", default-features = false, features = ["std", "pe32", "pe64", "elf32", "elf64", "endian_fd", "mach32", "mach64", "archive"] }
 
+# Language-aware string extractor — Go/Rust fat-pointer aware, dedupes
+# packed runs, decodes XOR-obfuscated and base64-wrapped payloads.
+# Cleave used to call this directly; centralising in expose lets every
+# consumer get the same high-quality string set.
+stng = { git = "https://codeberg.org/atomdrift/stng.git" }
+
 # Archive index readers. We use these for header/central-directory enumeration
 # only — never for decompression or extraction.
 zip = "2"
