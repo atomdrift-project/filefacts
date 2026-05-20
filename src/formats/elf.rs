@@ -64,6 +64,7 @@ pub(super) fn extract(
     binary_flags(&elf, metrics);
     elf_numeric_metrics(&elf, bytes, metrics, values);
     dynamic_metrics(&elf, metrics);
+    table_counts(&elf, metrics);
     segments(&elf, values);
     linker_family(values);
     super::build_toolchain::from_elf(values, sections_out, bytes);
@@ -588,6 +589,22 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
     if let Some(name) = entry_section {
         put_str(values, "elf.entry_section", &name);
     }
+}
+
+/// Symbol-table + relocation-table counts. Cheap structural facts
+/// goblin already has in hand; emitting them as flat metrics lets
+/// trait engines threshold on "is the binary stripped" /
+/// "does it have an unusual number of relocations" without walking
+/// the dynsym table themselves.
+fn table_counts(elf: &Elf<'_>, metrics: &mut Metrics) {
+    metrics.insert("elf.dynsym_count", elf.dynsyms.len() as f64);
+    metrics.insert("elf.symtab_count", elf.syms.len() as f64);
+    metrics.insert("elf.dynrela_count", elf.dynrelas.len() as f64);
+    metrics.insert("elf.dynrel_count", elf.dynrels.len() as f64);
+    metrics.insert("elf.pltreloc_count", elf.pltrelocs.len() as f64);
+    // `elf.libraries` is the parsed DT_NEEDED list; goblin doesn't
+    // expose a separate `needed_count` outside the typed dynamic info.
+    metrics.insert("elf.needed_count", elf.libraries.len() as f64);
 }
 
 /// `elf.*` metrics derived from the dynamic-section tag stream. Each
