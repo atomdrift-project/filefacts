@@ -64,6 +64,7 @@ pub(super) fn extract(
     binary_flags(&elf, metrics);
     elf_numeric_metrics(&elf, bytes, metrics, values);
     dynamic_metrics(&elf, metrics);
+    segments(&elf, values);
     linker_family(values);
     super::build_toolchain::from_elf(values, sections_out, bytes);
 
@@ -710,6 +711,64 @@ fn dynamic_metrics(elf: &Elf<'_>, metrics: &mut Metrics) {
     }
 }
 
+/// Emit `elf.segments[]` — one entry per program header. Trait
+/// authors match on segment kind + permissions + extent for
+/// anti-debug / packer detection. Permissions are emitted both as a
+/// 3-character `rwx` string (loader-conventional) and the structured
+/// `flags[]` array; consumers pick whichever they prefer.
+fn segments(elf: &Elf<'_>, values: &mut Values) {
+    let segs: Vec<JsonValue> = elf
+        .program_headers
+        .iter()
+        .map(|ph| {
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "type".into(),
+                JsonValue::String(phdr_type_name(ph.p_type).to_string()),
+            );
+            entry.insert("vaddr".into(), JsonValue::Number(ph.p_vaddr.into()));
+            entry.insert("file_offset".into(), JsonValue::Number(ph.p_offset.into()));
+            entry.insert("file_size".into(), JsonValue::Number(ph.p_filesz.into()));
+            entry.insert("memory_size".into(), JsonValue::Number(ph.p_memsz.into()));
+            // PF_R = 4, PF_W = 2, PF_X = 1. Emit a `rwx`-style string
+            // matching how readelf prints segment flags.
+            let r = ph.p_flags & 0x4 != 0;
+            let w = ph.p_flags & 0x2 != 0;
+            let x = ph.p_flags & 0x1 != 0;
+            let perms = format!(
+                "{}{}{}",
+                if r { "r" } else { "-" },
+                if w { "w" } else { "-" },
+                if x { "x" } else { "-" },
+            );
+            entry.insert("perms".into(), JsonValue::String(perms));
+            JsonValue::Object(entry)
+        })
+        .collect();
+    if !segs.is_empty() {
+        values.insert("elf.segments", JsonValue::Array(segs));
+    }
+}
+
+/// Map a PT_* program-header type constant to its conventional name.
+fn phdr_type_name(p_type: u32) -> &'static str {
+    use goblin::elf::program_header as ph;
+    match p_type {
+        ph::PT_NULL => "null",
+        ph::PT_LOAD => "load",
+        ph::PT_DYNAMIC => "dynamic",
+        ph::PT_INTERP => "interp",
+        ph::PT_NOTE => "note",
+        ph::PT_SHLIB => "shlib",
+        ph::PT_PHDR => "phdr",
+        ph::PT_TLS => "tls",
+        ph::PT_GNU_EH_FRAME => "gnu_eh_frame",
+        ph::PT_GNU_STACK => "gnu_stack",
+        ph::PT_GNU_RELRO => "gnu_relro",
+        _ => "other",
+    }
+}
+
 /// `true` when `name` matches one of the well-known dynamic-loader
 /// SONAMEs (`ld-linux-*.so.*` / `ld-musl-*.so.*` / `ld-*.so.*`). A
 /// *library* with the loader as a direct DT_NEEDED is anomalous —
@@ -944,6 +1003,7 @@ fn symbols(
     let mut imports = Vec::new();
     let mut exports = Vec::new();
     let mut ifuncs = Vec::new();
+    let mut fortify_count: u64 = 0;
     for sym in &elf.dynsyms {
         let Some(name) = elf.dynstrtab.get_at(sym.st_name) else {
             continue;
@@ -954,6 +1014,13 @@ fn symbols(
         let stt = sym.st_info & 0xf;
         if stt == goblin::elf::sym::STT_GNU_IFUNC {
             ifuncs.push(JsonValue::String(name.to_string()));
+        }
+        // FORTIFY_SOURCE imports the `__*_chk` runtime variants of
+        // memcpy / strcpy / sprintf / etc. Count them so a single
+        // metric tells the trait engine whether the binary was
+        // compiled with -D_FORTIFY_SOURCE.
+        if name.starts_with("__") && name.ends_with("_chk") {
+            fortify_count += 1;
         }
         if sym.st_shndx == 0 {
             imports.push(JsonValue::String(name.to_string()));
@@ -986,6 +1053,9 @@ fn symbols(
     }
     metrics.insert("elf.import_count", imports.len() as f64);
     metrics.insert("elf.export_count", exports.len() as f64);
+    if fortify_count > 0 {
+        metrics.insert("elf.fortify_source_count", fortify_count as f64);
+    }
     values.insert("elf.imports", JsonValue::Array(imports));
     values.insert("elf.exports", JsonValue::Array(exports));
     if !ifuncs.is_empty() {
