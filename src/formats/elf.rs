@@ -60,7 +60,7 @@ pub(super) fn extract(
     comment(&elf, bytes, values, metrics);
     dt_flags(&elf, values);
     abi_tag(&elf, bytes, values);
-    gnu_property(&elf, bytes, values);
+    gnu_property(&elf, bytes, values, metrics);
     binary_flags(&elf, metrics);
     elf_numeric_metrics(&elf, bytes, metrics, values);
     linker_family(values);
@@ -271,7 +271,7 @@ fn abi_tag(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
 /// (`AARCH64_FEATURE_*`). When we see an AArch64 PAUTH property
 /// we also emit `elf.pauth_scheme` with the `platform:version`
 /// pair that identifies the key-generation scheme.
-fn gnu_property(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
+fn gnu_property(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     let Some(notes) = elf.iter_note_headers(bytes) else {
         return;
     };
@@ -309,9 +309,11 @@ fn gnu_property(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
                         let mut feats = Vec::new();
                         if v & 0x1 != 0 {
                             feats.push("bti");
+                            metrics.insert("elf.has_aarch64_bti", 1.0);
                         }
                         if v & 0x2 != 0 {
                             feats.push("pac");
+                            metrics.insert("elf.has_aarch64_pac", 1.0);
                         }
                         if v & 0x4 != 0 {
                             feats.push("gcs");
@@ -326,6 +328,31 @@ fn gnu_property(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
                                         .collect(),
                                 ),
                             );
+                        }
+                    } else if !is_aarch64 && pr_type == 0xC000_0002 {
+                        // GNU_PROPERTY_X86_FEATURE_1_AND — Intel CET
+                        // requirements stamped by the linker. bit 0 =
+                        // IBT (Indirect Branch Tracking, shadow CFI),
+                        // bit 1 = SHSTK (shadow stack).
+                        if v & 0x1 != 0 {
+                            metrics.insert("elf.has_cet_ibt", 1.0);
+                        }
+                        if v & 0x2 != 0 {
+                            metrics.insert("elf.has_cet_shstk", 1.0);
+                        }
+                    } else if !is_aarch64 && pr_type == 0xC000_0001 {
+                        // GNU_PROPERTY_X86_ISA_1_NEEDED — floor ISA
+                        // level (v1/v2/v3/v4). Surface as a string so
+                        // traits can match on the name.
+                        let level = match v {
+                            1 => Some("x86-64-v1"),
+                            2 => Some("x86-64-v2"),
+                            4 => Some("x86-64-v3"),
+                            8 => Some("x86-64-v4"),
+                            _ => None,
+                        };
+                        if let Some(s) = level {
+                            put_str(values, "elf.x86_isa_level", s);
                         }
                     }
                 } else if is_aarch64 && pr_type == 0xC000_0001 && pr_datasz == 16 {
