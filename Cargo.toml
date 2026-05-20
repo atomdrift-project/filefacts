@@ -30,6 +30,17 @@ thiserror = "1"
 # Fast byte scanning, used by string extractors and the magic-byte matcher.
 memchr = "2"
 aho-corasick = "1"
+# CRC-32 — used as a non-crypto fingerprint over PE bound-import tables.
+crc32fast = "1"
+# x86/x86-64 instruction decoder — first-instruction decode at each PE
+# export RVA powers stub/thunk alias detection.
+iced-x86 = { version = "1.21", default-features = false, features = ["decoder", "std"] }
+
+# Authenticode signature verification — RSA-PKCS1v15 + ECDSA over
+# the SignerInfo signed-attrs digest. Pure-Rust crypto.
+rsa = "0.9"
+p256 = { version = "0.13", features = ["ecdsa"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
 
 # Binary formats. `goblin` is a single crate that handles PE, ELF, and Mach-O
 # behind one parse entry point; we use it for all three.
@@ -82,8 +93,8 @@ tree-sitter-php = "0.24"
 cms = "0.2"
 x509-cert = "0.2"
 der = { version = "0.7", features = ["std"] }
-sha2 = "0.10"
-sha1 = "0.10"
+sha2 = { version = "0.10", features = ["oid"] }
+sha1 = { version = "0.10", features = ["oid"] }
 md-5 = "0.10"
 
 [dev-dependencies]

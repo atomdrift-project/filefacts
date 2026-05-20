@@ -51,17 +51,18 @@ pub(super) fn extract(
     dynamic(&elf, values);
     sections(&elf, bytes, metrics, sections_out);
     symbols(&elf, values, metrics, imports_out, exports_out);
-    build_id(&elf, bytes, values);
+    build_id(&elf, bytes, values, metrics);
     interpreter(&elf, values);
     relro(&elf, values);
     needed_versions(&elf, values);
     provided_versions(&elf, values);
     stripped_metadata(&elf, values, metrics);
-    comment(&elf, bytes, values);
+    comment(&elf, bytes, values, metrics);
     dt_flags(&elf, values);
     abi_tag(&elf, bytes, values);
     gnu_property(&elf, bytes, values);
     binary_flags(&elf, metrics);
+    elf_numeric_metrics(&elf, bytes, metrics, values);
     linker_family(values);
     super::build_toolchain::from_elf(values, sections_out, bytes);
 
@@ -105,20 +106,31 @@ fn linker_family(values: &mut Values) {
 /// same binary (e.g. `GCC: (Ubuntu …)` + `clang version …`) signal
 /// that one or more object files were built outside the main
 /// toolchain, the canonical xz-class supply-chain tampering tell.
-fn comment(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
+fn comment(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     let Some(data) = read_section(elf, bytes, ".comment") else {
         return;
     };
-    let entries: Vec<JsonValue> = data
+    let texts: Vec<String> = data
         .split(|&b| b == 0)
         .filter(|chunk| !chunk.is_empty())
         .filter_map(|chunk| std::str::from_utf8(chunk).ok())
         .filter(|s| !s.trim().is_empty())
-        .map(|s| JsonValue::String(s.to_string()))
+        .map(str::to_string)
         .collect();
-    if !entries.is_empty() {
-        values.insert("elf.comment", JsonValue::Array(entries));
+    if texts.is_empty() {
+        return;
     }
+    metrics.insert("elf.comment_entry_count", texts.len() as f64);
+    // `comment_distinct_count > 1` is the mixed-toolchain tell —
+    // an unstripped object file linked into the binary carries its
+    // own `GCC: (…)` / `clang version …` banner, so distinct count
+    // above 1 means objects from multiple toolchains were merged.
+    let distinct: std::collections::HashSet<&str> = texts.iter().map(String::as_str).collect();
+    metrics.insert("elf.comment_distinct_count", distinct.len() as f64);
+    values.insert(
+        "elf.comment",
+        JsonValue::Array(texts.into_iter().map(JsonValue::String).collect()),
+    );
 }
 
 /// Decompose `DT_FLAGS` and `DT_FLAGS_1` bitfields into a flat string
@@ -140,40 +152,82 @@ fn dt_flags(elf: &Elf<'_>, values: &mut Values) {
     if !flags.is_empty() {
         values.insert(
             "elf.dt_flags",
-            JsonValue::Array(flags.iter().map(|s| JsonValue::String((*s).to_string())).collect()),
+            JsonValue::Array(
+                flags
+                    .iter()
+                    .map(|s| JsonValue::String((*s).to_string()))
+                    .collect(),
+            ),
         );
     }
     if !flags1.is_empty() {
         values.insert(
             "elf.dt_flags_1",
             JsonValue::Array(
-                flags1.iter().map(|s| JsonValue::String((*s).to_string())).collect(),
+                flags1
+                    .iter()
+                    .map(|s| JsonValue::String((*s).to_string()))
+                    .collect(),
             ),
         );
     }
 }
 
 fn decompose_df(v: u64, out: &mut Vec<&'static str>) {
-    if v & 0x1 != 0 { out.push("origin"); }
-    if v & 0x2 != 0 { out.push("symbolic"); }
-    if v & 0x4 != 0 { out.push("text_rel"); }
-    if v & 0x8 != 0 { out.push("bind_now"); }
-    if v & 0x10 != 0 { out.push("static_tls"); }
+    if v & 0x1 != 0 {
+        out.push("origin");
+    }
+    if v & 0x2 != 0 {
+        out.push("symbolic");
+    }
+    if v & 0x4 != 0 {
+        out.push("text_rel");
+    }
+    if v & 0x8 != 0 {
+        out.push("bind_now");
+    }
+    if v & 0x10 != 0 {
+        out.push("static_tls");
+    }
 }
 
 fn decompose_df1(v: u64, out: &mut Vec<&'static str>) {
-    if v & 0x0000_0001 != 0 { out.push("now"); }
-    if v & 0x0000_0002 != 0 { out.push("global"); }
-    if v & 0x0000_0008 != 0 { out.push("no_delete"); }
-    if v & 0x0000_0010 != 0 { out.push("load_filter"); }
-    if v & 0x0000_0040 != 0 { out.push("init_first"); }
-    if v & 0x0000_0080 != 0 { out.push("no_open"); }
-    if v & 0x0000_0100 != 0 { out.push("origin"); }
-    if v & 0x0000_0800 != 0 { out.push("no_dump"); }
-    if v & 0x0000_2000 != 0 { out.push("no_open_2"); }
-    if v & 0x0800_0000 != 0 { out.push("pie"); }
-    if v & 0x1000_0000 != 0 { out.push("kernel_module"); }
-    if v & 0x4000_0000 != 0 { out.push("no_reloc"); }
+    if v & 0x0000_0001 != 0 {
+        out.push("now");
+    }
+    if v & 0x0000_0002 != 0 {
+        out.push("global");
+    }
+    if v & 0x0000_0008 != 0 {
+        out.push("no_delete");
+    }
+    if v & 0x0000_0010 != 0 {
+        out.push("load_filter");
+    }
+    if v & 0x0000_0040 != 0 {
+        out.push("init_first");
+    }
+    if v & 0x0000_0080 != 0 {
+        out.push("no_open");
+    }
+    if v & 0x0000_0100 != 0 {
+        out.push("origin");
+    }
+    if v & 0x0000_0800 != 0 {
+        out.push("no_dump");
+    }
+    if v & 0x0000_2000 != 0 {
+        out.push("no_open_2");
+    }
+    if v & 0x0800_0000 != 0 {
+        out.push("pie");
+    }
+    if v & 0x1000_0000 != 0 {
+        out.push("kernel_module");
+    }
+    if v & 0x4000_0000 != 0 {
+        out.push("no_reloc");
+    }
 }
 
 /// `.note.ABI-tag` (`NT_GNU_ABI_TAG = 1`) — declares the minimum
@@ -233,7 +287,8 @@ fn gnu_property(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
         while off + 8 <= note.desc.len() {
             let pr_type = u32::from_le_bytes(note.desc[off..off + 4].try_into().unwrap_or([0; 4]));
             let pr_datasz =
-                u32::from_le_bytes(note.desc[off + 4..off + 8].try_into().unwrap_or([0; 4])) as usize;
+                u32::from_le_bytes(note.desc[off + 4..off + 8].try_into().unwrap_or([0; 4]))
+                    as usize;
             let data_start = off + 8;
             let data_end = data_start.saturating_add(pr_datasz);
             if data_end > note.desc.len() {
@@ -243,22 +298,32 @@ fn gnu_property(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
                 let mut entry = serde_json::Map::new();
                 entry.insert("type".into(), JsonValue::String(name.to_string()));
                 if pr_datasz == 4 {
-                    let v =
-                        u32::from_le_bytes(note.desc[data_start..data_end].try_into().unwrap_or([0; 4]));
+                    let v = u32::from_le_bytes(
+                        note.desc[data_start..data_end].try_into().unwrap_or([0; 4]),
+                    );
                     entry.insert("value".into(), JsonValue::String(format!("0x{v:x}")));
                     if is_aarch64 && pr_type == 0xC000_0000 {
                         // AARCH64_FEATURE_1_AND — bit-decomposed
                         // features that link-time enforcement
                         // requires (BTI / PAC / GCS).
                         let mut feats = Vec::new();
-                        if v & 0x1 != 0 { feats.push("bti"); }
-                        if v & 0x2 != 0 { feats.push("pac"); }
-                        if v & 0x4 != 0 { feats.push("gcs"); }
+                        if v & 0x1 != 0 {
+                            feats.push("bti");
+                        }
+                        if v & 0x2 != 0 {
+                            feats.push("pac");
+                        }
+                        if v & 0x4 != 0 {
+                            feats.push("gcs");
+                        }
                         if !feats.is_empty() {
                             entry.insert(
                                 "features".into(),
                                 JsonValue::Array(
-                                    feats.into_iter().map(|s| JsonValue::String(s.into())).collect(),
+                                    feats
+                                        .into_iter()
+                                        .map(|s| JsonValue::String(s.into()))
+                                        .collect(),
                                 ),
                             );
                         }
@@ -267,7 +332,9 @@ fn gnu_property(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
                     // AARCH64_FEATURE_PAUTH — 16 bytes, two u64
                     // words identifying the key-generation scheme.
                     let platform = u64::from_le_bytes(
-                        note.desc[data_start..data_start + 8].try_into().unwrap_or([0; 8]),
+                        note.desc[data_start..data_start + 8]
+                            .try_into()
+                            .unwrap_or([0; 8]),
                     );
                     let version = u64::from_le_bytes(
                         note.desc[data_start + 8..data_start + 16]
@@ -275,7 +342,10 @@ fn gnu_property(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
                             .unwrap_or([0; 8]),
                     );
                     let scheme = format!("{}:{}", pauth_platform_name(platform), version);
-                    entry.insert("platform".into(), JsonValue::String(pauth_platform_name(platform).into()));
+                    entry.insert(
+                        "platform".into(),
+                        JsonValue::String(pauth_platform_name(platform).into()),
+                    );
                     entry.insert("version".into(), JsonValue::Number(version.into()));
                     put_str(values, "elf.pauth_scheme", scheme);
                 }
@@ -358,6 +428,118 @@ fn read_section<'a>(elf: &Elf<'_>, bytes: &'a [u8], name: &str) -> Option<&'a [u
     Some(&bytes[start..end])
 }
 
+/// Flat `elf.*` numeric metrics — the integer-valued counterparts to
+/// the string facts that already live on the `values` tree
+/// (`elf.machine`, `elf.type`, …). Trait rules read these via the
+/// metric map for thresholding. Field set mirrors what cleave's
+/// `ElfMetrics` historically populated, so traits that key on
+/// `elf.section_count`, `elf.has_plt`, `elf.nx_enabled`, etc. keep
+/// working after cleave's typed metrics retire.
+fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, values: &mut Values) {
+    // Header constants. `elf.machine` and `elf.type` already live on
+    // the values tree as strings — the numeric forms add nothing.
+    metrics.insert(
+        "elf.bits",
+        f64::from(if elf.is_64 { 64u32 } else { 32u32 }),
+    );
+    metrics.insert("elf.little_endian", f64::from(u8::from(elf.little_endian)));
+    metrics.insert("elf.entry", elf.header.e_entry as f64);
+    metrics.insert(
+        "elf.program_header_count",
+        elf.program_headers.len() as f64,
+    );
+    metrics.insert("elf.section_count", elf.section_headers.len() as f64);
+    metrics.insert(
+        "elf.section_relocation_group_count",
+        elf.shdr_relocs.len() as f64,
+    );
+
+    // Program headers / segments. PT_LOAD = 1, PT_GNU_STACK = 0x6474_e551.
+    let mut max_file_size: u64 = 0;
+    let mut max_memory_size: u64 = 0;
+    let mut has_gnu_stack = false;
+    let mut nx_enabled = true; // default: no executable stack signal
+    for ph in &elf.program_headers {
+        if ph.p_type == program_header::PT_LOAD {
+            max_file_size = max_file_size.max(ph.p_filesz);
+            max_memory_size = max_memory_size.max(ph.p_memsz);
+        }
+        if ph.p_type == program_header::PT_GNU_STACK {
+            has_gnu_stack = true;
+            // PF_X = 1; an executable GNU stack disables NX.
+            if ph.p_flags & 0x1 != 0 {
+                nx_enabled = false;
+            }
+        }
+    }
+    metrics.insert("elf.load_segment_max_file_size", max_file_size as f64);
+    metrics.insert("elf.load_segment_max_memory_size", max_memory_size as f64);
+    metrics.insert("elf.nx_enabled", f64::from(u8::from(nx_enabled)));
+    // ET_REL (relocatable object) files legitimately omit PT_GNU_STACK
+    // because they have no program headers; only flag absence for
+    // ET_EXEC / ET_DYN.
+    let stack_section_absent =
+        !has_gnu_stack && elf.header.e_type != header::ET_REL;
+    metrics.insert(
+        "elf.gnu_stack_section_absent",
+        f64::from(u8::from(stack_section_absent)),
+    );
+
+    // Section presence flags + note count + entry-section lookup.
+    let mut has_plt = false;
+    let mut has_got = false;
+    let mut has_eh_frame = false;
+    let mut has_note = false;
+    let mut note_count: u64 = 0;
+    let mut entry_section: Option<String> = None;
+    let entry = elf.header.e_entry;
+    for sh in elf.section_headers.iter() {
+        let name = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
+        match name {
+            ".plt" => has_plt = true,
+            ".got" | ".got.plt" => has_got = true,
+            ".eh_frame" => has_eh_frame = true,
+            _ => {}
+        }
+        if name.starts_with(".note") {
+            has_note = true;
+            // SHT_NOTE = 7. Each note section can hold multiple notes;
+            // the byte count is approximate (real walk requires
+            // `iter_note_headers`, which we tally separately below).
+            if sh.sh_type == 7 && sh.sh_size > 0 {
+                note_count = note_count.saturating_add(1);
+            }
+        }
+        if entry_section.is_none()
+            && entry != 0
+            && sh.sh_size > 0
+            && entry >= sh.sh_addr
+            && entry < sh.sh_addr.saturating_add(sh.sh_size)
+        {
+            entry_section = Some(name.to_string());
+        }
+    }
+    metrics.insert("elf.has_plt", f64::from(u8::from(has_plt)));
+    metrics.insert("elf.has_got", f64::from(u8::from(has_got)));
+    metrics.insert("elf.has_eh_frame", f64::from(u8::from(has_eh_frame)));
+    metrics.insert("elf.has_note", f64::from(u8::from(has_note)));
+
+    // Exact note count: walk note headers. Falls back to the
+    // section-level approximation above when `iter_note_headers`
+    // can't read the binary.
+    if let Some(notes) = elf.iter_note_headers(_bytes) {
+        let walked = notes.flatten().count() as u64;
+        if walked > 0 {
+            note_count = walked;
+        }
+    }
+    metrics.insert("elf.note_count", note_count as f64);
+
+    if let Some(name) = entry_section {
+        put_str(values, "elf.entry_section", &name);
+    }
+}
+
 /// Cross-format `binary.*` metrics derivable from ELF header state.
 fn binary_flags(elf: &Elf<'_>, metrics: &mut Metrics) {
     // PIE: dynamically-linked executable (`ET_DYN` + `PT_INTERP`).
@@ -416,8 +598,7 @@ fn stripped_metadata(elf: &Elf<'_>, values: &mut Values, metrics: &mut Metrics) 
     // `.debug_*` removed but `.symtab` retained. Distinctive shape:
     // a `strip --strip-debug` build that left symbol names intact.
     let symtab_present = present.contains(".symtab");
-    let debug_or_comment_gone =
-        !present.contains(".comment") || !present.contains(".debug_info");
+    let debug_or_comment_gone = !present.contains(".comment") || !present.contains(".debug_info");
     metrics.insert(
         "elf.stripped_but_symtab_present",
         f64::from(u8::from(symtab_present && debug_or_comment_gone)),
@@ -483,7 +664,11 @@ fn relro(elf: &Elf<'_>, values: &mut Values) {
 
 fn elf_header(elf: &Elf<'_>, values: &mut Values) {
     put_str(values, "elf.machine", machine_string(elf.header.e_machine));
-    put_str(values, "elf.class", if elf.is_64 { "elf64" } else { "elf32" });
+    put_str(
+        values,
+        "elf.class",
+        if elf.is_64 { "elf64" } else { "elf32" },
+    );
     put_str(
         values,
         "elf.endian",
@@ -523,12 +708,7 @@ fn dynamic(elf: &Elf<'_>, values: &mut Values) {
     }
 }
 
-fn sections(
-    elf: &Elf<'_>,
-    bytes: &[u8],
-    metrics: &mut Metrics,
-    sections_out: &mut Vec<Section>,
-) {
+fn sections(elf: &Elf<'_>, bytes: &[u8], metrics: &mut Metrics, sections_out: &mut Vec<Section>) {
     for (idx, sh) in elf.section_headers.iter().enumerate() {
         let name = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("").to_owned();
         // SHT_NOBITS (8) sections have no file bytes. Other types
@@ -617,6 +797,11 @@ fn symbols(
                 source: "elf-dynsym",
                 offset: Some(sym.st_value),
                 ordinal: None,
+                // ELF doesn't have a forwarded-export concept like
+                // PE's reexports — symbol versioning solves the same
+                // problem differently and is surfaced through the
+                // version-info extractor.
+                forward_to: None,
             });
         }
     }
@@ -629,7 +814,7 @@ fn symbols(
     }
 }
 
-fn build_id(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
+fn build_id(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     // GNU build-id lives in a SHT_NOTE section named `.note.gnu.build-id`
     // (or `.gnu.build.attributes` in newer binutils). Walk note sections
     // and find the one with `n_type == NT_GNU_BUILD_ID (3)` and owner
@@ -640,6 +825,8 @@ fn build_id(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
     for note in notes.flatten() {
         if note.name == "GNU" && note.n_type == 3 {
             put_str(values, "elf.build_id", hex_encode(note.desc));
+            metrics.insert("elf.has_build_id", 1.0);
+            metrics.insert("elf.build_id_length", note.desc.len() as f64);
             return;
         }
     }

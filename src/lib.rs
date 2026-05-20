@@ -64,21 +64,21 @@ mod scan;
 
 pub mod fileid;
 
-/// VBA module-source symbol extractor.
+/// VBA `<non-literal>` sentinel re-export.
 ///
-/// Exposes the same regex-based pipeline `formats::vba::extract`
-/// uses internally to populate the typed `Imports` / `Functions`
-/// views for OLE2 documents. External crates that have a VBA
-/// module's decompressed source bytes in hand (without the
-/// surrounding CFB container) can call into [`vba_symbols::extract`]
-/// directly to get the same `Imports` / `Functions` / `VbaSymbolStats`.
+/// Re-exported from the internal `formats::vba_symbols` module so
+/// downstream crates can compare against it without learning a
+/// private path. The full extractor stays internal: VBA symbols
+/// flow out through the unified [`Imports`] / [`Functions`] views
+/// like every other format, not through a format-specific public
+/// function.
 pub mod vba_symbols {
-    pub use crate::formats::vba_symbols::{extract, VbaSymbolStats, NON_LITERAL_SENTINEL};
+    pub use crate::formats::vba_symbols::NON_LITERAL_SENTINEL;
 }
 
 use std::path::Path;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 
 pub use error::Error;
 pub use fileid::{FileId, FileType};
@@ -314,10 +314,7 @@ fn run_extraction(
         // The format extractor bailed entirely. Surface that as a
         // `malformed` entry so cleave can see *why* the
         // format-specific view is sparse.
-        errors.record_malformed(
-            stage_for(file_type),
-            e.to_string(),
-        );
+        errors.record_malformed(stage_for(file_type), e.to_string());
     }
     // The AST view is computed alongside the rest when a tree-sitter
     // parse is available. The walk shares the cached tree with the
@@ -325,13 +322,15 @@ fn run_extraction(
     // bundling it keeps `parse_count` at 1 for every combination of
     // view accesses and removes a class of internal-mutability
     // complications.
-    let ast = tree_cache
-        .map_or_else(Ast::new, |cache| formats::source::build_ast(cache, &mut metrics));
+    let ast = tree_cache.map_or_else(Ast::new, |cache| {
+        formats::source::build_ast(cache, &mut metrics)
+    });
     let sections = Sections::from_iter_sections(sections);
     // Aggregate metrics derived from sections — mirrors the
     // `sections.*` path convention.
     if !sections.is_empty() {
         emit_section_metrics(&sections, &mut metrics);
+        emit_binary_aggregates(&sections, &strings, bytes, &mut metrics);
     }
 
     // Seal typed views into the unified `values` tree so the JSON
@@ -400,6 +399,35 @@ fn run_extraction(
     }
 }
 
+/// Heuristic: "looks like a natural-language sentence" — short enough
+/// to be ML-cheap, long enough to filter out short tokens. A binary
+/// embedding many of these usually contains documentation strings,
+/// error messages, or string-table assets — a different population
+/// than a binary whose strings are all `__cxx_…` symbols or paths.
+fn is_sentence_like(text: &str) -> bool {
+    if text.len() < 12 {
+        return false;
+    }
+    let mut spaces = 0_usize;
+    for b in text.bytes() {
+        if b == b' ' {
+            spaces += 1;
+        }
+    }
+    if spaces < 2 {
+        return false;
+    }
+    let mut alpha_tokens = 0_usize;
+    let mut tokens = 0_usize;
+    for tok in text.split_whitespace() {
+        tokens += 1;
+        if tok.chars().filter(|c| c.is_alphabetic()).count() >= 2 {
+            alpha_tokens += 1;
+        }
+    }
+    tokens >= 3 && alpha_tokens >= 2
+}
+
 /// Map a [`FileType`] to the short `stage` tag we use when an
 /// extractor returns `Err` and we have to synthesise a fallback
 /// error record. Stage tags are stable across releases.
@@ -447,7 +475,10 @@ fn emit_section_metrics(sections: &Sections, metrics: &mut Metrics) {
     let mut writable = 0_u64;
     let mut wx = 0_u64;
     for s in sections {
-        let is_exec = s.flags.iter().any(|f| f == "executable" || f == "execinstr");
+        let is_exec = s
+            .flags
+            .iter()
+            .any(|f| f == "executable" || f == "execinstr");
         let is_write = s.flags.iter().any(|f| f == "writable" || f == "write");
         if is_exec {
             executable += 1;
@@ -462,6 +493,169 @@ fn emit_section_metrics(sections: &Sections, metrics: &mut Metrics) {
     metrics.insert("sections.executable_count", executable as f64);
     metrics.insert("sections.writable_count", writable as f64);
     metrics.insert("sections.executable_writable_count", wx as f64);
+}
+
+/// Cross-format `binary.*` aggregates derived from sections + strings +
+/// raw bytes. Keeps the keys cleave's trait engine has used historically
+/// without each format extractor re-deriving the same logic.
+///
+/// Emits (only the useful subset — fields cleave computed but no trait
+/// queried were dropped):
+/// - `binary.string_count`, `binary.max_string_length`,
+///   `binary.avg_string_length`, `binary.high_entropy_string_count`.
+/// - `binary.entropy_variance` — population variance across the
+///   per-section entropies. Packers tend to flatten this; a normal
+///   binary spreads across `.text` (~6), `.rodata` (~5), `.data` (~3).
+/// - `binary.code_to_data_ratio`, `binary.largest_section_ratio` —
+///   simple structural ratios over `Sections.file_size`.
+/// - `binary.has_overlay`, `binary.overlay_size`,
+///   `binary.overlay_ratio`, `binary.overlay_entropy` — bytes beyond
+///   the last on-disk section extent (PE installer droppers, ELF
+///   self-extractors).
+fn emit_binary_aggregates(
+    sections: &Sections,
+    strings: &Strings,
+    bytes: &[u8],
+    metrics: &mut Metrics,
+) {
+    // -- Strings ------------------------------------------------------
+    let total = strings.len();
+    if total > 0 {
+        let mut max_len = 0_usize;
+        let mut sum_len = 0_usize;
+        let mut high_entropy = 0_u64;
+        let mut sentence = 0_u64;
+        // Collect lengths once; second pass below computes stddev.
+        let mut lengths: Vec<usize> = Vec::with_capacity(total);
+        for s in strings.iter() {
+            let len = s.text.len();
+            max_len = max_len.max(len);
+            sum_len = sum_len.saturating_add(len);
+            lengths.push(len);
+            // Shannon-entropy floor of 6.0 bits/byte separates random-
+            // looking strings (base64, keys, hex blobs) from English /
+            // identifier-shaped text (~3–4.5).
+            if scan::entropy::shannon(s.text.as_bytes()) >= 6.0 {
+                high_entropy += 1;
+            }
+            if is_sentence_like(&s.text) {
+                sentence += 1;
+            }
+        }
+        let avg = sum_len as f64 / total as f64;
+        let variance = lengths
+            .iter()
+            .map(|&l| {
+                let d = l as f64 - avg;
+                d * d
+            })
+            .sum::<f64>()
+            / total as f64;
+        metrics.insert("binary.string_count", total as f64);
+        metrics.insert("binary.max_string_length", max_len as f64);
+        metrics.insert("binary.avg_string_length", avg);
+        metrics.insert("binary.string_length_stddev", variance.sqrt());
+        metrics.insert("binary.high_entropy_string_count", high_entropy as f64);
+        metrics.insert("binary.sentence_string_count", sentence as f64);
+        metrics.insert(
+            "binary.sentence_string_ratio",
+            sentence as f64 / total as f64,
+        );
+    }
+
+    // -- Per-section entropy variance --------------------------------
+    let mut entropies: Vec<f64> = Vec::new();
+    for idx in 0..sections.len() {
+        if let Some(e) = metrics.get(&format!("sections[{idx}].entropy")) {
+            entropies.push(e);
+        }
+    }
+    if entropies.len() >= 2 {
+        let mean = entropies.iter().sum::<f64>() / entropies.len() as f64;
+        let var = entropies
+            .iter()
+            .map(|e| (e - mean).powi(2))
+            .sum::<f64>()
+            / entropies.len() as f64;
+        metrics.insert("binary.entropy_variance", var);
+    }
+
+    // -- Section ratios + size-weighted entropy ----------------------
+    // `binary.code_entropy` / `binary.data_entropy` are size-weighted
+    // averages of per-section entropies (already in `metrics` as
+    // `sections[idx].entropy`). Weighting by `file_size` is what
+    // packer detectors want — a tiny `.init` block at 7.9 entropy
+    // shouldn't dominate the `.text` average.
+    let mut code_size: u64 = 0;
+    let mut data_size: u64 = 0;
+    let mut largest: u64 = 0;
+    let mut code_entropy_sum = 0.0_f64;
+    let mut data_entropy_sum = 0.0_f64;
+    for (idx, s) in sections.as_slice().iter().enumerate() {
+        let is_exec = s
+            .flags
+            .iter()
+            .any(|f| f == "executable" || f == "execinstr");
+        let is_write = s.flags.iter().any(|f| f == "writable" || f == "write");
+        let on_disk = s.file_size;
+        largest = largest.max(on_disk);
+        let entropy = metrics
+            .get(&format!("sections[{idx}].entropy"))
+            .unwrap_or(0.0);
+        if is_exec {
+            code_size = code_size.saturating_add(on_disk);
+            code_entropy_sum += entropy * on_disk as f64;
+        } else if is_write {
+            data_size = data_size.saturating_add(on_disk);
+            data_entropy_sum += entropy * on_disk as f64;
+        }
+    }
+    if code_size > 0 {
+        metrics.insert("binary.code_entropy", code_entropy_sum / code_size as f64);
+    }
+    if data_size > 0 {
+        metrics.insert("binary.data_entropy", data_entropy_sum / data_size as f64);
+    }
+    if code_size + data_size > 0 {
+        metrics.insert(
+            "binary.code_to_data_ratio",
+            code_size as f64 / (code_size + data_size) as f64,
+        );
+    }
+    let file_size = bytes.len() as u64;
+    if file_size > 0 && largest > 0 {
+        metrics.insert(
+            "binary.largest_section_ratio",
+            largest as f64 / file_size as f64,
+        );
+    }
+
+    // -- Overlay ------------------------------------------------------
+    // Last on-disk extent across sections. Anything past it is
+    // appended payload (NSIS installer stubs, self-extractors).
+    let last_extent = sections
+        .as_slice()
+        .iter()
+        .map(|s| s.file_offset.saturating_add(s.file_size))
+        .max()
+        .unwrap_or(0);
+    if last_extent > 0 && file_size > last_extent {
+        let overlay_size = file_size - last_extent;
+        metrics.insert("binary.has_overlay", 1.0);
+        metrics.insert("binary.overlay_size", overlay_size as f64);
+        metrics.insert(
+            "binary.overlay_ratio",
+            overlay_size as f64 / file_size as f64,
+        );
+        let start = last_extent as usize;
+        let end = bytes.len();
+        if start < end {
+            metrics.insert(
+                "binary.overlay_entropy",
+                scan::entropy::shannon(&bytes[start..end]),
+            );
+        }
+    }
 }
 
 /// Open `bytes` for metadata extraction. The returned [`ParsedFile`]
