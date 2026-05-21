@@ -21,35 +21,36 @@ use crate::output::{Errors, Metrics, Section, Strings, Values};
 
 mod build_toolchain;
 mod chm;
-mod goblin_safe;
 mod class;
 mod common;
 mod elf;
 mod generic;
+mod goblin_safe;
 mod jar;
 mod jpeg;
 mod lnk;
 mod macho;
 mod macho_code_signature;
+mod ole2;
+mod ooxml;
 mod pdf;
 mod pe;
 mod pe_authenticode;
 mod pe_debug;
+mod pe_image_hash;
 mod pe_manifest;
 mod pe_rich;
 mod pe_version_info;
 mod pickle;
 mod png;
-mod ole2;
-mod ooxml;
 mod pyc;
-mod vba;
-pub(crate) mod vba_symbols;
 mod rpm;
 mod rtf;
 pub(crate) mod source;
 mod structured;
 mod tar;
+mod vba;
+pub(crate) mod vba_symbols;
 mod vsix;
 mod zip;
 
@@ -82,17 +83,15 @@ pub(crate) fn extract(
 
     match file_type {
         FileType::Pe => pe::extract(
-            bytes, values, strings, metrics, sections, imports, exports, errors,
+            bytes, values, strings, metrics, sections, imports, exports, functions, errors,
         ),
         FileType::Elf => elf::extract(
-            bytes, values, strings, metrics, sections, imports, exports, errors,
+            bytes, values, strings, metrics, sections, imports, exports, functions, errors,
         ),
         FileType::MachO => macho::extract(
-            bytes, values, strings, metrics, sections, imports, exports, errors,
+            bytes, values, strings, metrics, sections, imports, exports, functions, errors,
         ),
-        FileType::Zip | FileType::Crx | FileType::Odf => {
-            zip::extract(bytes, values, metrics)
-        }
+        FileType::Zip | FileType::Crx | FileType::Odf => zip::extract(bytes, values, metrics),
         FileType::Ooxml => {
             // The generic archive walk emits `archive.members[]` /
             // `archive.compression.*` first; the OOXML extractor then
@@ -155,14 +154,7 @@ pub(crate) fn extract(
         | FileType::Java
         | FileType::Shell
         | FileType::Php => source::extract(
-            bytes,
-            file_type,
-            tree_cache,
-            values,
-            strings,
-            metrics,
-            imports,
-            functions,
+            bytes, file_type, tree_cache, values, strings, metrics, imports, functions,
         ),
 
         _ => Ok(()),

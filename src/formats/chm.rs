@@ -164,18 +164,12 @@ pub(super) fn extract(
     metrics.insert("chm.total_user_entry_size", user_total as f64);
     let file_size = bytes.len() as u64;
     if file_size > 0 {
-        metrics.insert(
-            "chm.user_byte_ratio",
-            user_total as f64 / file_size as f64,
-        );
+        metrics.insert("chm.user_byte_ratio", user_total as f64 / file_size as f64);
     }
 
     // Content-section names from `::DataSpace/NameList` (Uncompressed
     // section 0 — no LZX needed).
-    if let Some(name_list_entry) = entries
-        .iter()
-        .find(|e| e.name == "::DataSpace/NameList")
-    {
+    if let Some(name_list_entry) = entries.iter().find(|e| e.name == "::DataSpace/NameList") {
         if let Some(body) = read_uncompressed(bytes, data_offset, name_list_entry) {
             let sections = parse_namelist(body);
             if !sections.is_empty() {
@@ -206,24 +200,13 @@ pub(super) fn extract(
     metrics.insert("chm.infotype_count", f64::from(summary.infotype_count));
     if let Some(topic) = summary.default_topic.as_deref() {
         let topic_lower = topic.to_ascii_lowercase();
-        let missing = !user_names_lower
-            .iter()
-            .any(|n| n == &topic_lower);
-        metrics.insert(
-            "chm.default_topic_missing",
-            f64::from(u8::from(missing)),
-        );
+        let missing = !user_names_lower.iter().any(|n| n == &topic_lower);
+        metrics.insert("chm.default_topic_missing", f64::from(u8::from(missing)));
     }
-    if let (Some(title), Some(topic)) =
-        (summary.title.as_deref(), summary.default_topic.as_deref())
+    if let (Some(title), Some(topic)) = (summary.title.as_deref(), summary.default_topic.as_deref())
     {
-        let mismatch = !title.is_empty()
-            && !topic.is_empty()
-            && !title.eq_ignore_ascii_case(topic);
-        metrics.insert(
-            "chm.title_topic_mismatch",
-            f64::from(u8::from(mismatch)),
-        );
+        let mismatch = !title.is_empty() && !topic.is_empty() && !title.eq_ignore_ascii_case(topic);
+        metrics.insert("chm.title_topic_mismatch", f64::from(u8::from(mismatch)));
     }
 
     // LZX framing parameters for `MSCompressed/Content` — directly
@@ -419,7 +402,15 @@ fn parse_entry(buf: &[u8]) -> Option<(DirEntry, usize)> {
     pos += n;
     let (length, n) = read_encint(&buf[pos..])?;
     pos += n;
-    Some((DirEntry { name, section, offset, length }, pos))
+    Some((
+        DirEntry {
+            name,
+            section,
+            offset,
+            length,
+        },
+        pos,
+    ))
 }
 
 /// CHM ENCINT — variable-length, big-endian, high bit set on
@@ -543,7 +534,10 @@ fn insert_cstr(
     key: &str,
     payload: &[u8],
 ) -> Option<String> {
-    let nul = payload.iter().position(|&c| c == 0).unwrap_or(payload.len());
+    let nul = payload
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(payload.len());
     let s = std::str::from_utf8(&payload[..nul]).ok()?;
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -624,7 +618,7 @@ mod tests {
         buf[0x04..0x08].copy_from_slice(&3u32.to_le_bytes());
         buf[0x10..0x14].copy_from_slice(&42u32.to_le_bytes()); // timestamp_counter
         buf[0x14..0x18].copy_from_slice(&0x0409u32.to_le_bytes()); // lcid = en-US
-        // section1 offset/length point past end → empty directory
+                                                                   // section1 offset/length point past end → empty directory
         buf[0x48..0x50].copy_from_slice(&0u64.to_le_bytes());
         buf[0x50..0x58].copy_from_slice(&0u64.to_le_bytes());
         buf[0x58..0x60].copy_from_slice(&0u64.to_le_bytes());

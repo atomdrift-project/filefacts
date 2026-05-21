@@ -18,12 +18,14 @@ fn json_manifest_parses_once_through_all_views() {
 
     assert_eq!(values.get("name").and_then(|v| v.as_str()), Some("sample"));
     assert_eq!(
-        values
-            .get("scripts.preinstall")
-            .and_then(|v| v.as_str()),
+        values.get("scripts.preinstall").and_then(|v| v.as_str()),
         Some("echo hi")
     );
-    assert_eq!(strings.len(), 0, "JSON manifests do not emit ASCII runs in v1");
+    assert_eq!(
+        strings.len(),
+        0,
+        "JSON manifests do not emit ASCII runs in v1"
+    );
     assert!(metrics.get("file.size_bytes").unwrap() > 0.0);
 
     assert_eq!(
@@ -80,7 +82,8 @@ fn javascript_ast_projection_is_complete() {
 
     let ast = parsed.ast();
     assert!(
-        ast.call_targets.contains(&"chrome.cookies.getAll".to_string()),
+        ast.call_targets
+            .contains(&"chrome.cookies.getAll".to_string()),
         "expected dotted target in call_targets, got {:?}",
         ast.call_targets
     );

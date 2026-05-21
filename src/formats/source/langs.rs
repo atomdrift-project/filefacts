@@ -112,7 +112,11 @@ static JAVASCRIPT: LangConfig = LangConfig {
     member_kinds: &["member_expression"],
     member_object_field: "object",
     member_property_field: "property",
-    identifier_kinds: &["identifier", "property_identifier", "shorthand_property_identifier"],
+    identifier_kinds: &[
+        "identifier",
+        "property_identifier",
+        "shorthand_property_identifier",
+    ],
     number_kinds: &["number"],
     bool_kinds: &["true", "false"],
     null_kinds: &["null", "undefined"],
@@ -216,7 +220,12 @@ static GO: LangConfig = LangConfig {
     member_kinds: &["selector_expression"],
     member_object_field: "operand",
     member_property_field: "field",
-    identifier_kinds: &["identifier", "field_identifier", "type_identifier", "package_identifier"],
+    identifier_kinds: &[
+        "identifier",
+        "field_identifier",
+        "type_identifier",
+        "package_identifier",
+    ],
     number_kinds: &["int_literal", "float_literal", "imaginary_literal"],
     bool_kinds: &["true", "false"],
     null_kinds: &["nil"],
@@ -285,7 +294,11 @@ static JAVA: LangConfig = LangConfig {
     member_object_field: "object",
     member_property_field: "field",
     identifier_kinds: &["identifier"],
-    number_kinds: &["decimal_integer_literal", "hex_integer_literal", "decimal_floating_point_literal"],
+    number_kinds: &[
+        "decimal_integer_literal",
+        "hex_integer_literal",
+        "decimal_floating_point_literal",
+    ],
     bool_kinds: &["true", "false"],
     null_kinds: &["null_literal"],
     object_kinds: &[],
@@ -351,7 +364,11 @@ static PHP: LangConfig = LangConfig {
         (interface_declaration name: (name) @class)
         (trait_declaration name: (name) @class)
     "#,
-    call_kinds: &["function_call_expression", "member_call_expression", "scoped_call_expression"],
+    call_kinds: &[
+        "function_call_expression",
+        "member_call_expression",
+        "scoped_call_expression",
+    ],
     callee_field: "function",
     arguments_field: "arguments",
     member_kinds: &["member_access_expression"],

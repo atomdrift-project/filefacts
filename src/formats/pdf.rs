@@ -111,7 +111,10 @@ pub(super) fn extract(
         catalog.insert(
             "features".into(),
             JsonValue::Array(
-                features.into_iter().map(|s| JsonValue::String(s.into())).collect(),
+                features
+                    .into_iter()
+                    .map(|s| JsonValue::String(s.into()))
+                    .collect(),
             ),
         );
         values.insert("pdf.catalog", JsonValue::Object(catalog));
@@ -141,7 +144,10 @@ pub(super) fn extract(
         shape.insert(
             "flags".into(),
             JsonValue::Array(
-                shape_flags.into_iter().map(|s| JsonValue::String(s.into())).collect(),
+                shape_flags
+                    .into_iter()
+                    .map(|s| JsonValue::String(s.into()))
+                    .collect(),
             ),
         );
     }
@@ -158,7 +164,11 @@ pub(super) fn extract(
         ("metadata_count", "/Metadata", None),
         ("objstm_count", "/ObjStm", None),
         ("xref_stream_count", "/XRef", None),
-        ("signature_object_count", "/Sig", Some("pdf.signature_object_count")),
+        (
+            "signature_object_count",
+            "/Sig",
+            Some("pdf.signature_object_count"),
+        ),
     ];
     for (kv_key, name, metric_key) in counts {
         let c = count_type_occurrences(bytes, name.as_bytes());
@@ -284,16 +294,18 @@ pub(super) fn extract(
     // resolve against expose's flat metric map.
     let leading_bytes = bytes.windows(5).position(|w| w == b"%PDF-").unwrap_or(0);
     metrics.insert("pdf.leading_bytes_before_header", leading_bytes as f64);
-    let sig_count =
-        count_type_occurrences(bytes, b"/Sig") + count_substring(bytes, b"/Type /Sig");
+    let sig_count = count_type_occurrences(bytes, b"/Sig") + count_substring(bytes, b"/Type /Sig");
     metrics.insert("pdf.signature_object_count", (sig_count / 2) as f64);
     // Signed incremental update: incremental updates leave more than
     // one `%%EOF` marker; pair that with the presence of a signature
     // object to count signed-then-modified PDFs (the classic
     // shadow-attack shape).
     if sig_count > 0 {
-        let signed_incremental =
-            if eof_count > 1 { eof_count.saturating_sub(1) } else { 0 };
+        let signed_incremental = if eof_count > 1 {
+            eof_count.saturating_sub(1)
+        } else {
+            0
+        };
         metrics.insert(
             "pdf.signed_incremental_update_count",
             signed_incremental as f64,
@@ -378,9 +390,7 @@ fn find_info_value(bytes: &[u8], key: &[u8]) -> Option<String> {
             continue;
         }
         let mut value_pos = after_key;
-        while value_pos < bytes.len()
-            && (bytes[value_pos] == b' ' || bytes[value_pos] == b'\t')
-        {
+        while value_pos < bytes.len() && (bytes[value_pos] == b' ' || bytes[value_pos] == b'\t') {
             value_pos += 1;
         }
         if value_pos >= bytes.len() {
@@ -525,7 +535,12 @@ fn hex_nibble(b: u8) -> Option<u8> {
 fn read_name(bytes: &[u8], start: usize) -> Option<String> {
     let end = bytes[start..]
         .iter()
-        .position(|&b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'/' | b'<' | b'>' | b'[' | b']' | b'('))
+        .position(|&b| {
+            matches!(
+                b,
+                b' ' | b'\t' | b'\n' | b'\r' | b'/' | b'<' | b'>' | b'[' | b']' | b'('
+            )
+        })
         .map_or(bytes.len(), |n| start + n);
     let name = &bytes[start..end];
     if name.is_empty() {
@@ -564,7 +579,11 @@ fn collect_dict_regions(bytes: &[u8]) -> Vec<DictRegion> {
         // Require whole-token: the byte before `obj` must be
         // whitespace and the byte after must not be a name char
         // (avoids matching `endobj`, `objstm`, etc.).
-        let before = if obj_pos == 0 { b' ' } else { bytes[obj_pos - 1] };
+        let before = if obj_pos == 0 {
+            b' '
+        } else {
+            bytes[obj_pos - 1]
+        };
         let after = bytes.get(obj_pos + 3).copied().unwrap_or(b' ');
         if !before.is_ascii_whitespace() || is_name_char(after) {
             pos = obj_pos + 3;
@@ -586,34 +605,32 @@ fn collect_dict_regions(bytes: &[u8]) -> Vec<DictRegion> {
         // If a stream is present (i.e. the `stream` token came
         // before `endobj`), find the matching `endstream` to record
         // the stream byte range.
-        let stream_range =
-            if let (Some(s), Some(e)) = (stream_end_marker, endobj_end) {
-                if s < e {
-                    // Skip past `stream` + optional CR/LF.
-                    let mut body_start = s + b"stream".len();
-                    if bytes.get(body_start) == Some(&b'\r') {
-                        body_start += 1;
-                    }
-                    if bytes.get(body_start) == Some(&b'\n') {
-                        body_start += 1;
-                    }
-                    let endstream =
-                        find_token_after(bytes, body_start, b"endstream").unwrap_or(e);
-                    // Trim a single trailing CR/LF before `endstream`.
-                    let mut body_end = endstream;
-                    if body_end > body_start && bytes[body_end - 1] == b'\n' {
-                        body_end -= 1;
-                    }
-                    if body_end > body_start && bytes[body_end - 1] == b'\r' {
-                        body_end -= 1;
-                    }
-                    Some((body_start, body_end))
-                } else {
-                    None
+        let stream_range = if let (Some(s), Some(e)) = (stream_end_marker, endobj_end) {
+            if s < e {
+                // Skip past `stream` + optional CR/LF.
+                let mut body_start = s + b"stream".len();
+                if bytes.get(body_start) == Some(&b'\r') {
+                    body_start += 1;
                 }
+                if bytes.get(body_start) == Some(&b'\n') {
+                    body_start += 1;
+                }
+                let endstream = find_token_after(bytes, body_start, b"endstream").unwrap_or(e);
+                // Trim a single trailing CR/LF before `endstream`.
+                let mut body_end = endstream;
+                if body_end > body_start && bytes[body_end - 1] == b'\n' {
+                    body_end -= 1;
+                }
+                if body_end > body_start && bytes[body_end - 1] == b'\r' {
+                    body_end -= 1;
+                }
+                Some((body_start, body_end))
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
         out.push(DictRegion {
             start: dict_start,
             end: dict_end,
@@ -667,7 +684,9 @@ fn parse_obj_id_before(bytes: &[u8], obj_pos: usize) -> Option<u32> {
 fn find_token_after(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
     let mut pos = from;
     while pos < bytes.len() {
-        let rel = bytes[pos..].windows(needle.len()).position(|w| w == needle)?;
+        let rel = bytes[pos..]
+            .windows(needle.len())
+            .position(|w| w == needle)?;
         let abs = pos + rel;
         let before = if abs == 0 { b' ' } else { bytes[abs - 1] };
         let after = bytes.get(abs + needle.len()).copied().unwrap_or(b' ');
@@ -678,7 +697,6 @@ fn find_token_after(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
     }
     None
 }
-
 
 /// Walk each dictionary region for action invocation patterns and
 /// emit one entry per occurrence. We don't deduplicate by source
@@ -704,7 +722,9 @@ fn scan_actions(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<JsonValue> {
     ];
     let mut out = Vec::new();
     for region_info in dict_regions {
-        let DictRegion { start, end, obj_id, .. } = *region_info;
+        let DictRegion {
+            start, end, obj_id, ..
+        } = *region_info;
         if end <= start {
             continue;
         }
@@ -721,7 +741,10 @@ fn scan_actions(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<JsonValue> {
         };
         for (needle, kind) in KINDS {
             let mut pos = 0;
-            while let Some(rel) = region[pos..].windows(needle.len()).position(|w| w == *needle) {
+            while let Some(rel) = region[pos..]
+                .windows(needle.len())
+                .position(|w| w == *needle)
+            {
                 let abs = pos + rel;
                 let next = abs + needle.len();
                 // Reject `/JS` matching `/JSON` or `/JavaScript`.
@@ -877,10 +900,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// `/Length` of the embedded-file stream referenced by `/EF /F
 /// <id> <gen> R` — recovered by walking the dict-region index back
 /// to the target object.
-fn scan_embedded_files(
-    bytes: &[u8],
-    dict_regions: &[DictRegion],
-) -> Vec<(String, Option<u64>)> {
+fn scan_embedded_files(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<(String, Option<u64>)> {
     let mut out = Vec::new();
     for region in dict_regions {
         let dict = &bytes[region.start..region.end];
@@ -1332,7 +1352,9 @@ fn derive_form_field_metrics(fields: &[JsonValue], metrics: &mut Metrics) {
             *by_rect.entry(rect.clone()).or_insert(0) += 1;
         }
         if !name.is_empty() && !rect.is_empty() {
-            *by_name_rect.entry((name.clone(), rect.clone())).or_insert(0) += 1;
+            *by_name_rect
+                .entry((name.clone(), rect.clone()))
+                .or_insert(0) += 1;
         }
         if let Some(r) = parse_rect(&rect) {
             if r == [0.0, 0.0, 0.0, 0.0] {
@@ -1346,10 +1368,16 @@ fn derive_form_field_metrics(fields: &[JsonValue], metrics: &mut Metrics) {
     // Duplicate counts: every key with count > 1 contributes
     // `count - 1` to the "extra occurrences" total.
     let dup = |map: &HashMap<String, usize>| -> u32 {
-        map.values().filter(|&&c| c > 1).map(|&c| (c - 1) as u32).sum()
+        map.values()
+            .filter(|&&c| c > 1)
+            .map(|&c| (c - 1) as u32)
+            .sum()
     };
     let dup_pair = |map: &HashMap<(String, String), usize>| -> u32 {
-        map.values().filter(|&&c| c > 1).map(|&c| (c - 1) as u32).sum()
+        map.values()
+            .filter(|&&c| c > 1)
+            .map(|&c| (c - 1) as u32)
+            .sum()
     };
     metrics.insert("pdf.duplicate_form_name_count", f64::from(dup(&by_name)));
     metrics.insert("pdf.duplicate_form_rect_count", f64::from(dup(&by_rect)));
@@ -1395,7 +1423,12 @@ fn parse_rect(s: &str) -> Option<[f64; 4]> {
 }
 
 fn normalize_rect(r: [f64; 4]) -> [f64; 4] {
-    [r[0].min(r[2]), r[1].min(r[3]), r[0].max(r[2]), r[1].max(r[3])]
+    [
+        r[0].min(r[2]),
+        r[1].min(r[3]),
+        r[0].max(r[2]),
+        r[1].max(r[3]),
+    ]
 }
 
 fn rects_overlap(a: [f64; 4], b: [f64; 4]) -> bool {
@@ -1438,10 +1471,7 @@ fn derive_stream_metrics(bytes: &[u8], dict_regions: &[DictRegion], metrics: &mu
         let end_window = bytes
             .get(body_end..body_end.saturating_add(16))
             .unwrap_or(&[]);
-        if !end_window
-            .windows(9)
-            .any(|w| w == b"endstream")
-        {
+        if !end_window.windows(9).any(|w| w == b"endstream") {
             missing_endstream = missing_endstream.saturating_add(1);
         }
         // Bad delimiter: the byte immediately after `stream` should
@@ -1457,8 +1487,14 @@ fn derive_stream_metrics(bytes: &[u8], dict_regions: &[DictRegion], metrics: &mu
         }
     }
     metrics.insert("pdf.stream_missing_length_count", f64::from(missing_length));
-    metrics.insert("pdf.stream_missing_endstream_count", f64::from(missing_endstream));
-    metrics.insert("pdf.stream_length_mismatch_count", f64::from(length_mismatch));
+    metrics.insert(
+        "pdf.stream_missing_endstream_count",
+        f64::from(missing_endstream),
+    );
+    metrics.insert(
+        "pdf.stream_length_mismatch_count",
+        f64::from(length_mismatch),
+    );
     metrics.insert("pdf.stream_bad_delimiter_count", f64::from(bad_delimiter));
 }
 
@@ -1549,10 +1585,7 @@ mod tests {
     fn flags_encrypt_and_linearized() {
         let pdf = b"%PDF-1.7\n<< /Linearized 1 /Encrypt 7 0 R >>\n%%EOF";
         let (v, _) = extract_pdf(pdf);
-        let flags = v
-            .get("pdf.shape.flags")
-            .and_then(|x| x.as_array())
-            .unwrap();
+        let flags = v.get("pdf.shape.flags").and_then(|x| x.as_array()).unwrap();
         let strings: Vec<&str> = flags.iter().filter_map(|x| x.as_str()).collect();
         assert!(strings.contains(&"encrypted"));
         assert!(strings.contains(&"linearized"));
@@ -1582,7 +1615,10 @@ mod tests {
     fn extracts_filter_chain() {
         let pdf = b"%PDF-1.4\n7 0 obj << /Filter /FlateDecode /Length 0 >> stream\nendstream endobj\n8 0 obj << /Filter [/ASCIIHexDecode /FlateDecode] /Length 0 >> stream\nendstream endobj\n%%EOF";
         let (v, _) = extract_pdf(pdf);
-        let chains = v.get("pdf.filter_chains").and_then(|x| x.as_array()).unwrap();
+        let chains = v
+            .get("pdf.filter_chains")
+            .and_then(|x| x.as_array())
+            .unwrap();
         let strings: Vec<&str> = chains.iter().filter_map(|x| x.as_str()).collect();
         assert!(strings.contains(&"FlateDecode"));
         assert!(strings.contains(&"ASCIIHexDecode,FlateDecode"));
@@ -1606,7 +1642,10 @@ mod tests {
         // declares `/Length 42`.
         let pdf = b"%PDF-1.4\n10 0 obj << /Type /Filespec /F (attachment.txt) /EF << /F 11 0 R >> >> endobj\n11 0 obj << /Length 42 /Type /EmbeddedFile >> stream\nXXX endstream endobj\n%%EOF";
         let (v, _) = extract_pdf(pdf);
-        let files = v.get("pdf.embedded_files").and_then(|x| x.as_array()).unwrap();
+        let files = v
+            .get("pdf.embedded_files")
+            .and_then(|x| x.as_array())
+            .unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0]["filename"].as_str(), Some("attachment.txt"));
         assert_eq!(files[0]["size"].as_u64(), Some(42));
@@ -1642,7 +1681,8 @@ mod tests {
     #[test]
     fn signed_incremental_update_counted() {
         // Two %%EOF markers + a signature object → 1 incremental update.
-        let pdf = b"%PDF-1.7\n5 0 obj << /Type /Sig >> endobj\n%%EOF\n6 0 obj << >> endobj\n%%EOF\n";
+        let pdf =
+            b"%PDF-1.7\n5 0 obj << /Type /Sig >> endobj\n%%EOF\n6 0 obj << >> endobj\n%%EOF\n";
         let (_, m) = extract_pdf(pdf);
         assert_eq!(m.get("pdf.signed_incremental_update_count"), Some(1.0));
     }
@@ -1714,7 +1754,8 @@ mod tests {
     #[test]
     fn stream_metrics_count_anomalies() {
         // Stream with no /Length declared → missing_length.
-        let pdf = b"%PDF-1.5\n5 0 obj << /Filter /FlateDecode >> stream\nXYZ\nendstream endobj\n%%EOF";
+        let pdf =
+            b"%PDF-1.5\n5 0 obj << /Filter /FlateDecode >> stream\nXYZ\nendstream endobj\n%%EOF";
         let (_, m) = extract_pdf(pdf);
         assert_eq!(m.get("pdf.stream_missing_length_count"), Some(1.0));
     }
@@ -1738,10 +1779,7 @@ mod tests {
         let (v, m) = extract_pdf(pdf);
         assert_eq!(m.get("pdf.header_count"), Some(1.0));
         // No version parsed, but header_count remains.
-        assert!(v
-            .get("pdf.header")
-            .and_then(|h| h.get("version"))
-            .is_none());
+        assert!(v.get("pdf.header").and_then(|h| h.get("version")).is_none());
     }
 
     #[test]

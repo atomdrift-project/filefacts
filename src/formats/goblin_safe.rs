@@ -337,9 +337,7 @@ mod tests {
 
     #[test]
     fn catch_converts_panic_to_outcome() {
-        let result: GoblinOutcome<i32> = catch(|| -> Result<i32, GoblinError> {
-            panic!("boom")
-        });
+        let result: GoblinOutcome<i32> = catch(|| -> Result<i32, GoblinError> { panic!("boom") });
         match result {
             GoblinOutcome::Panicked(msg) => assert!(msg.contains("boom")),
             other => panic!("expected Panicked, got {other:?}"),

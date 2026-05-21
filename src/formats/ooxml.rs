@@ -183,7 +183,10 @@ pub(super) fn extract(
         values.insert(
             "office.features",
             JsonValue::Array(
-                features.into_iter().map(|s| JsonValue::String(s.into())).collect(),
+                features
+                    .into_iter()
+                    .map(|s| JsonValue::String(s.into()))
+                    .collect(),
             ),
         );
     }
@@ -426,8 +429,7 @@ mod tests {
         let mut buf = Cursor::new(Vec::<u8>::new());
         {
             let mut w = ZipWriter::new(&mut buf);
-            let opts = SimpleFileOptions::default()
-                .compression_method(CompressionMethod::Stored);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
             for (path, body) in members {
                 w.start_file(*path, opts).unwrap();
                 w.write_all(body).unwrap();
@@ -488,7 +490,10 @@ mod tests {
         ]);
         let (v, _) = run(&z);
         let core = v.get("office.core").and_then(|x| x.as_object()).unwrap();
-        assert_eq!(core.get("title").and_then(|x| x.as_str()), Some("Quarterly Report"));
+        assert_eq!(
+            core.get("title").and_then(|x| x.as_str()),
+            Some("Quarterly Report")
+        );
         assert_eq!(core.get("creator").and_then(|x| x.as_str()), Some("Alice"));
         assert_eq!(
             core.get("last_modified_by").and_then(|x| x.as_str()),
@@ -612,7 +617,10 @@ mod tests {
     fn enumerates_embedded_pe_executable() {
         let z = build_ooxml(&[
             ("[Content_Types].xml", CONTENT_TYPES_DOCX.as_bytes()),
-            ("word/embeddings/oleObject1.bin", b"MZ\x90\x00\x03\x00\x00\x00fake-pe"),
+            (
+                "word/embeddings/oleObject1.bin",
+                b"MZ\x90\x00\x03\x00\x00\x00fake-pe",
+            ),
         ]);
         let (v, m) = run(&z);
         let embedded = v.get("office.embedded").and_then(|x| x.as_array()).unwrap();
@@ -633,7 +641,10 @@ mod tests {
     fn enumerates_embedded_elf_payload() {
         let z = build_ooxml(&[
             ("[Content_Types].xml", CONTENT_TYPES_XLSX.as_bytes()),
-            ("xl/embeddings/oleObject1.bin", b"\x7fELF\x02\x01\x01\x00rest-of-elf"),
+            (
+                "xl/embeddings/oleObject1.bin",
+                b"\x7fELF\x02\x01\x01\x00rest-of-elf",
+            ),
         ]);
         let (v, _) = run(&z);
         let embedded = v.get("office.embedded").and_then(|x| x.as_array()).unwrap();
@@ -645,7 +656,10 @@ mod tests {
         // Mach-O 64-bit little-endian magic: CF FA ED FE
         let z = build_ooxml(&[
             ("[Content_Types].xml", CONTENT_TYPES_DOCX.as_bytes()),
-            ("word/embeddings/oleObject1.bin", b"\xCF\xFA\xED\xFE\x07\x00\x00\x01"),
+            (
+                "word/embeddings/oleObject1.bin",
+                b"\xCF\xFA\xED\xFE\x07\x00\x00\x01",
+            ),
         ]);
         let (v, _) = run(&z);
         let embedded = v.get("office.embedded").and_then(|x| x.as_array()).unwrap();
@@ -676,7 +690,10 @@ mod tests {
     fn multiple_embeddings_with_mixed_kinds() {
         let z = build_ooxml(&[
             ("[Content_Types].xml", CONTENT_TYPES_DOCX.as_bytes()),
-            ("word/embeddings/oleObject1.bin", b"MZ\x90\x00\x03\x00fake-pe"),
+            (
+                "word/embeddings/oleObject1.bin",
+                b"MZ\x90\x00\x03\x00fake-pe",
+            ),
             ("word/embeddings/oleObject2.bin", b"\x7fELFfake-elf"),
             ("word/embeddings/image1.bin", b"not-an-exec"),
         ]);
@@ -692,7 +709,10 @@ mod tests {
         assert_eq!(embedded_kind(b"\xFE\xED\xFA\xCE"), Some("macho"));
         assert_eq!(embedded_kind(b"\xCF\xFA\xED\xFE"), Some("macho"));
         assert_eq!(embedded_kind(b"PK\x03\x04"), Some("zip"));
-        assert_eq!(embedded_kind(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"), Some("ole2"));
+        assert_eq!(
+            embedded_kind(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"),
+            Some("ole2")
+        );
         assert_eq!(embedded_kind(b"random"), None);
         // Too-short input must not panic.
         assert_eq!(embedded_kind(b""), None);

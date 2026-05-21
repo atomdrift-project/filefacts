@@ -82,7 +82,9 @@ fn parse_numeric_control(bytes: &[u8], cw: &[u8]) -> Option<String> {
     if end == start || (end == start + 1 && bytes[start] == b'-') {
         return None;
     }
-    std::str::from_utf8(&bytes[start..end]).ok().map(str::to_string)
+    std::str::from_utf8(&bytes[start..end])
+        .ok()
+        .map(str::to_string)
 }
 
 /// Pick the first of `\ansi` / `\mac` / `\pc` / `\pca` charset
@@ -295,7 +297,12 @@ fn fields(bytes: &[u8], values: &mut Values) {
         let body = decode_text(&bytes[cursor..end]);
         let mut parts = body.splitn(2, char::is_whitespace);
         let kind = parts.next().unwrap_or("").trim().to_string();
-        let target = parts.next().unwrap_or("").trim().trim_matches('"').to_string();
+        let target = parts
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches('"')
+            .to_string();
         if !kind.is_empty() {
             let mut entry = serde_json::Map::new();
             entry.insert("kind".into(), JsonValue::String(kind));
@@ -378,7 +385,12 @@ fn features(bytes: &[u8], values: &mut Values) {
     if !found.is_empty() {
         values.insert(
             "rtf.features",
-            JsonValue::Array(found.into_iter().map(|s| JsonValue::String(s.into())).collect()),
+            JsonValue::Array(
+                found
+                    .into_iter()
+                    .map(|s| JsonValue::String(s.into()))
+                    .collect(),
+            ),
         );
     }
 }
@@ -451,7 +463,9 @@ fn shape(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
 fn find_group(bytes: &[u8], control_word: &[u8]) -> Option<usize> {
     let mut pos = 0;
     while pos + control_word.len() + 1 <= bytes.len() {
-        let rel = bytes[pos..].windows(control_word.len()).position(|w| w == control_word)?;
+        let rel = bytes[pos..]
+            .windows(control_word.len())
+            .position(|w| w == control_word)?;
         let abs = pos + rel;
         if abs > 0 && bytes[abs - 1] == b'{' {
             let after = bytes.get(abs + control_word.len()).copied().unwrap_or(b' ');
@@ -514,14 +528,8 @@ mod tests {
         let (v, _) = extract_rtf(rtf);
         assert_eq!(v.get("rtf.version").and_then(|x| x.as_str()), Some("1"));
         assert_eq!(v.get("rtf.charset").and_then(|x| x.as_str()), Some("ansi"));
-        assert_eq!(
-            v.get("rtf.codepage").and_then(|x| x.as_str()),
-            Some("1252")
-        );
-        assert_eq!(
-            v.get("rtf.deflang").and_then(|x| x.as_str()),
-            Some("1033")
-        );
+        assert_eq!(v.get("rtf.codepage").and_then(|x| x.as_str()), Some("1252"));
+        assert_eq!(v.get("rtf.deflang").and_then(|x| x.as_str()), Some("1033"));
     }
 
     #[test]
@@ -558,10 +566,7 @@ mod tests {
         let fields = v.get("rtf.fields").and_then(|x| x.as_array()).unwrap();
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0]["kind"].as_str(), Some("HYPERLINK"));
-        assert_eq!(
-            fields[0]["target"].as_str(),
-            Some("https://evil.example/")
-        );
+        assert_eq!(fields[0]["target"].as_str(), Some("https://evil.example/"));
     }
 
     #[test]

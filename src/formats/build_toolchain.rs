@@ -105,7 +105,10 @@ fn scan_rust_rodata(sections: &[crate::output::Section], bytes: &[u8]) -> Option
         }
         let mut pos = start;
         while pos + NEEDLE.len() < end {
-            if let Some(rel) = bytes[pos..end].windows(NEEDLE.len()).position(|w| w == NEEDLE) {
+            if let Some(rel) = bytes[pos..end]
+                .windows(NEEDLE.len())
+                .position(|w| w == NEEDLE)
+            {
                 let after = pos + rel + NEEDLE.len();
                 // Require a digit immediately after `rustc ` to
                 // reject "rustcracker"-style false positives.
@@ -272,7 +275,9 @@ pub(super) fn from_macho(values: &mut Values, sections: &[crate::output::Section
         .and_then(|tools| {
             tools.iter().find_map(|t| {
                 if t.get("tool").and_then(serde_json::Value::as_str) == Some("clang") {
-                    t.get("version").and_then(serde_json::Value::as_str).map(str::to_string)
+                    t.get("version")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
                 } else {
                     None
                 }
@@ -314,7 +319,8 @@ mod tests {
 
     #[test]
     fn recognizes_apple_clang_banner() {
-        let (fam, ver) = recognize_comment("Apple clang version 15.0.0 (clang-1500.0.40.1)").unwrap();
+        let (fam, ver) =
+            recognize_comment("Apple clang version 15.0.0 (clang-1500.0.40.1)").unwrap();
         assert!(matches!(fam, Family::AppleClang));
         assert_eq!(ver, "15.0.0");
     }

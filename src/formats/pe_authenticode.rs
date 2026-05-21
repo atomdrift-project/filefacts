@@ -189,9 +189,21 @@ fn parse_pkcs7(der_bytes: &[u8]) -> Option<JsonValue> {
     }
 
     // Pull signing-time from the signed-attributes bag if present
-    // (OID 1.2.840.113549.1.9.5).
-    if let Some(signing_time) = extract_signing_time(signer) {
-        obj.insert("signing_time".into(), JsonValue::String(signing_time));
+    // (OID 1.2.840.113549.1.9.5). Emitted in two forms: the canonical
+    // ISO-8601 string for display, plus a Unix timestamp for downstream
+    // arithmetic (sign-time-before-build checks, age windows, etc.).
+    if let Some((s, unix)) = extract_signing_time(signer) {
+        obj.insert("signing_time".into(), JsonValue::String(s));
+        obj.insert("signing_time_unix".into(), JsonValue::Number(unix.into()));
+    }
+
+    // SpcIndirectDataContent — the structure inside the SignedData's
+    // encapContentInfo carrying the algorithm + digest the signature
+    // was made over. The digest is what consumers compare against the
+    // recomputed Authentihash to detect post-signing tampering.
+    if let Some((alg, digest_hex)) = extract_spc_indirect_data(&signed_data) {
+        obj.insert("signature_digest_algorithm".into(), JsonValue::String(alg.into()));
+        obj.insert("signature_digest".into(), JsonValue::String(digest_hex));
     }
 
     // Cryptographic verification of the SignerInfo signature against
@@ -536,7 +548,10 @@ fn find_signer_cert<'a>(
 /// PKCS#9 signing-time OID.
 const SIGNING_TIME_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.5");
 
-fn extract_signing_time(signer: &cms::signed_data::SignerInfo) -> Option<String> {
+/// Recover the signing time from the SignerInfo signed-attributes
+/// bag. Returns the ISO-8601 string alongside its Unix-epoch seconds
+/// so consumers don't have to reparse the string for arithmetic.
+fn extract_signing_time(signer: &cms::signed_data::SignerInfo) -> Option<(String, i64)> {
     let attrs = signer.signed_attrs.as_ref()?;
     for attr in attrs.iter() {
         if attr.oid != SIGNING_TIME_OID {
@@ -546,13 +561,85 @@ fn extract_signing_time(signer: &cms::signed_data::SignerInfo) -> Option<String>
         // CHOICE { UTCTime, GeneralizedTime }. Try both — `decode_as`
         // succeeds for whichever the ANY actually contains.
         if let Ok(t) = any.decode_as::<der::asn1::UtcTime>() {
-            return Some(t.to_date_time().to_string());
+            let dt = t.to_date_time();
+            return Some((dt.to_string(), dt.unix_duration().as_secs() as i64));
         }
         if let Ok(t) = any.decode_as::<der::asn1::GeneralizedTime>() {
-            return Some(t.to_date_time().to_string());
+            let dt = t.to_date_time();
+            return Some((dt.to_string(), dt.unix_duration().as_secs() as i64));
         }
     }
     None
+}
+
+/// Authenticode `SpcIndirectDataContent` OID — what the SignedData's
+/// `encapContentInfo.eContentType` is set to for a PE signature.
+const SPC_INDIRECT_DATA_OID: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.3.6.1.4.1.311.2.1.4");
+
+/// Extract the algorithm + digest the signature was made over from the
+/// SignedData's `encapContentInfo`. The eContent is a
+/// `SpcIndirectDataContent` whose nested `messageDigest.digestAlgorithm`
+/// + `messageDigest.digest` carry exactly the claim "this signature
+/// authenticates a PE image whose Authentihash equals these bytes
+/// under this hash".
+///
+/// Returns `(algorithm_label, hex_digest)` on success. The OID-to-label
+/// mapping uses the same `oid_to_label` helper as the SignerInfo digest
+/// so consumers see consistent shorthand ("sha256", "sha1", …).
+fn extract_spc_indirect_data(
+    signed_data: &cms::signed_data::SignedData,
+) -> Option<(&'static str, String)> {
+    let encap = &signed_data.encap_content_info;
+    if encap.econtent_type != SPC_INDIRECT_DATA_OID {
+        return None;
+    }
+    let econtent_any = encap.econtent.as_ref()?;
+    // Round-trip the Any through full DER encoding so we get the
+    // SpcIndirectDataContent SEQUENCE's tag + length back, then parse
+    // it as a regular SEQUENCE. `Any::value()` strips the outer wrapper
+    // which makes structural parsing fragile across the
+    // [0]-EXPLICIT-OCTET-STRING / [0]-EXPLICIT-SpcIndirect variants
+    // Microsoft uses in practice.
+    let full_der = econtent_any.to_der().ok()?;
+    parse_spc_indirect_inner(&full_der)
+}
+
+/// Walk the DER bytes of the SpcIndirectDataContent SEQUENCE and pull
+/// out the `messageDigest` (DigestInfo) component. Matches the spec
+/// layout: `SEQUENCE { data SpcAttributeTypeAndOptionalValue,
+///                     messageDigest DigestInfo }`.
+fn parse_spc_indirect_inner(der: &[u8]) -> Option<(&'static str, String)> {
+    use der::Reader as _;
+    let mut reader = der::SliceReader::new(der).ok()?;
+    // The bytes we're handed may be either the bare SpcIndirectDataContent
+    // SEQUENCE or that SEQUENCE wrapped in an OCTET STRING (the
+    // RFC-5652-strict form). Peek the tag and unwrap if needed.
+    let header = reader.peek_header().ok()?;
+    let body_bytes: Vec<u8> = if header.tag == der::Tag::OctetString {
+        // OCTET STRING containing the SEQUENCE — decode and use the
+        // inner bytes directly.
+        let os = der::asn1::OctetString::decode(&mut reader).ok()?;
+        os.as_bytes().to_vec()
+    } else {
+        der.to_vec()
+    };
+    let mut reader = der::SliceReader::new(&body_bytes).ok()?;
+    let body = reader.sequence(|r| {
+        // Skip `data SpcAttributeTypeAndOptionalValue`.
+        let _ = r.tlv_bytes()?;
+        // `messageDigest DigestInfo ::= SEQUENCE { digestAlgorithm
+        // AlgorithmIdentifier, digest OCTET STRING }`.
+        let msg_digest = r.sequence(|m| {
+            let alg = m.decode::<x509_cert::spki::AlgorithmIdentifierOwned>()?;
+            let digest = m.decode::<der::asn1::OctetString>()?;
+            Ok((alg, digest))
+        })?;
+        Ok(msg_digest)
+    });
+    let (alg, digest) = body.ok()?;
+    let label = oid_to_label(&alg.oid);
+    Some((label, hex_encode(digest.as_bytes())))
 }
 
 /// Return the prefix of `bytes` that is exactly one DER-encoded object,

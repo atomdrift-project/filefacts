@@ -67,10 +67,7 @@ pub(super) fn extract(
         // Per the convention, omit the `is_hash_based: true` bool
         // and use a presence-only key instead — `exists:
         // pyc.hash` flags the variant for traits without a bool.
-        let hash_hex: String = bytes[8..16]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let hash_hex: String = bytes[8..16].iter().map(|b| format!("{b:02x}")).collect();
         put_str(values, "pyc.hash", hash_hex);
     } else {
         let ts = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
@@ -203,7 +200,10 @@ mod tests {
         );
         assert_eq!(m.get("pyc.timestamp"), Some(1_700_000_000.0));
         assert_eq!(m.get("pyc.source_size"), Some(1234.0));
-        let files = v.get("pyc.source_files").and_then(|x| x.as_array()).unwrap();
+        let files = v
+            .get("pyc.source_files")
+            .and_then(|x| x.as_array())
+            .unwrap();
         assert_eq!(files[0].as_str(), Some("/build/foo/bar.py"));
     }
 
@@ -238,7 +238,10 @@ mod tests {
         }
         let pyc = build_pyc(3413, 0, 1, 1, &body);
         let (v, _) = run(&pyc);
-        let files = v.get("pyc.source_files").and_then(|x| x.as_array()).unwrap();
+        let files = v
+            .get("pyc.source_files")
+            .and_then(|x| x.as_array())
+            .unwrap();
         assert_eq!(files.len(), 1);
     }
 
@@ -262,7 +265,10 @@ mod tests {
         }
         let pyc = build_pyc(3413, 0, 1, 1, &body);
         let (v, m) = run(&pyc);
-        let files = v.get("pyc.source_files").and_then(|x| x.as_array()).unwrap();
+        let files = v
+            .get("pyc.source_files")
+            .and_then(|x| x.as_array())
+            .unwrap();
         let paths: Vec<&str> = files.iter().filter_map(|x| x.as_str()).collect();
         assert!(paths.contains(&"a/b.pyx"));
         assert!(paths.contains(&"c/d.pyw"));
@@ -292,7 +298,10 @@ mod tests {
         }
         let pyc = build_pyc(3413, 0, 1, 1, &body);
         let (v, _) = run(&pyc);
-        let files = v.get("pyc.source_files").and_then(|x| x.as_array()).unwrap();
+        let files = v
+            .get("pyc.source_files")
+            .and_then(|x| x.as_array())
+            .unwrap();
         assert_eq!(files.len(), MAX_SOURCE_FILES);
     }
 

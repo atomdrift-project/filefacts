@@ -23,8 +23,13 @@ pub(super) fn extract(debug: &DebugData<'_>, values: &mut Values) {
         .entries()
         .filter_map(Result::ok)
         .map(|e| {
+            // Emit both a stable string label (forensic consumers) and
+            // the raw IMAGE_DEBUG_TYPE_* numeric id so downstream
+            // aggregators can reconstruct deduplicated/sorted type
+            // vectors without a reverse lookup table.
             serde_json::json!({
                 "type": debug_type_label(e.data_type),
+                "type_id": e.data_type,
                 "timestamp_unix": e.time_date_stamp,
                 "size_bytes": e.size_of_data,
             })
@@ -50,11 +55,7 @@ pub(super) fn extract(debug: &DebugData<'_>, values: &mut Values) {
     }
 }
 
-fn codeview_pdb70(
-    cv: &CodeviewPDB70DebugInfo<'_>,
-    debug: &DebugData<'_>,
-    values: &mut Values,
-) {
+fn codeview_pdb70(cv: &CodeviewPDB70DebugInfo<'_>, debug: &DebugData<'_>, values: &mut Values) {
     if let Ok(path) = std::str::from_utf8(cv.filename) {
         // The PDB filename is null-terminated inside the codeview blob;
         // trim the trailing NULs before exposing.
@@ -70,7 +71,11 @@ fn codeview_pdb70(
     // consumers can build the same `<GUID><age>` PE-debug fingerprint
     // tools like symchk/symbol-server use to look the PDB up.
     if let Some(idd) = find_codeview_entry(debug) {
-        put_i64(values, "pe.debug.pdb.timestamp", i64::from(idd.time_date_stamp));
+        put_i64(
+            values,
+            "pe.debug.pdb.timestamp",
+            i64::from(idd.time_date_stamp),
+        );
     }
 }
 
@@ -139,19 +144,13 @@ mod tests {
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
             0x0f, 0x10,
         ];
-        assert_eq!(
-            format_guid(&bytes),
-            "04030201-0605-0807-090a-0b0c0d0e0f10"
-        );
+        assert_eq!(format_guid(&bytes), "04030201-0605-0807-090a-0b0c0d0e0f10");
     }
 
     #[test]
     fn guid_zero_bytes() {
         let bytes = [0u8; 16];
-        assert_eq!(
-            format_guid(&bytes),
-            "00000000-0000-0000-0000-000000000000"
-        );
+        assert_eq!(format_guid(&bytes), "00000000-0000-0000-0000-000000000000");
     }
 
     #[test]
@@ -195,5 +194,61 @@ mod tests {
         // the canonical 0..=16/20 range.
         assert_eq!(debug_type_label(4), "misc");
         assert_eq!(debug_type_label(17), "other");
+    }
+
+    /// Pin the PDB path, GUID, age, and the debug entry type vector
+    /// for `test.exe`. Drift in the CodeView decoder, GUID byteswap,
+    /// or entry walker will trip this test. Regenerate values via
+    /// `cargo run --bin expose -- ../cleave/tests/fixtures/test.exe`.
+    #[test]
+    fn debug_directory_decodes_test_exe_to_known_values() {
+        let bytes = std::fs::read("../cleave/tests/fixtures/test.exe")
+            .expect("test.exe fixture is required");
+        let mut v = crate::output::Values::new();
+        let mut s = crate::Strings::default();
+        let mut m = crate::output::Metrics::new();
+        let mut sections = Vec::new();
+        let mut imports = crate::Imports::new();
+        let mut exports = crate::Exports::new();
+        let mut functions = crate::Functions::new();
+        let mut errors = crate::output::Errors::new();
+        crate::formats::pe::extract(
+            &bytes,
+            &mut v,
+            &mut s,
+            &mut m,
+            &mut sections,
+            &mut imports,
+            &mut exports,
+            &mut functions,
+            &mut errors,
+        )
+        .unwrap();
+
+        // PDB metadata — the high-signal CodeView fields.
+        assert_eq!(
+            v.get("pe.debug.pdb.path").and_then(|x| x.as_str()),
+            Some("C:\\Users\\forveined\\Documents\\nil\\x64\\Release\\Nil.pdb"),
+        );
+        assert_eq!(
+            v.get("pe.debug.pdb.guid").and_then(|x| x.as_str()),
+            Some("73c36a97-cc89-44b8-ba8e-75d173799591"),
+        );
+        assert_eq!(v.get("pe.debug.pdb.age").and_then(|x| x.as_u64()), Some(1));
+        assert_eq!(
+            v.get("pe.debug.pdb.timestamp").and_then(|x| x.as_i64()),
+            Some(1_720_640_421),
+        );
+
+        // Entry array — type labels in directory order.
+        let entries = v
+            .get("pe.debug.entries")
+            .and_then(|x| x.as_array())
+            .expect("entries populated for a CodeView-bearing PE");
+        let types: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| e.get("type").and_then(|t| t.as_str()))
+            .collect();
+        assert_eq!(types, vec!["codeview", "vc_feature", "pogo", "iltcg"]);
     }
 }

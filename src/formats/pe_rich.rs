@@ -44,8 +44,8 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values) {
     if bytes.len() < 0x40 {
         return;
     }
-    let e_lfanew = u32::from_le_bytes([bytes[0x3c], bytes[0x3d], bytes[0x3e], bytes[0x3f]])
-        as usize;
+    let e_lfanew =
+        u32::from_le_bytes([bytes[0x3c], bytes[0x3d], bytes[0x3e], bytes[0x3f]]) as usize;
     let scan_end = e_lfanew.min(bytes.len());
     if scan_end < 8 {
         return;
@@ -71,12 +71,7 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values) {
     let mut pos = rich_pos;
     while pos >= 4 {
         pos -= 4;
-        let raw = u32::from_le_bytes([
-            bytes[pos],
-            bytes[pos + 1],
-            bytes[pos + 2],
-            bytes[pos + 3],
-        ]);
+        let raw = u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]);
         let decoded = raw ^ key;
         if decoded == DANS_MARKER {
             words.reverse();
@@ -136,9 +131,7 @@ fn find_rich_marker(bytes: &[u8]) -> Option<usize> {
     // The Rich marker sits in the DOS stub region; we scan only that
     // small window so a false positive deep in arbitrary data can't
     // misfire.
-    bytes
-        .windows(4)
-        .rposition(|w| w == RICH_MAGIC)
+    bytes.windows(4).rposition(|w| w == RICH_MAGIC)
 }
 
 #[cfg(test)]
@@ -173,5 +166,40 @@ mod tests {
         buf[20..24].copy_from_slice(b"Rich");
         buf[40..44].copy_from_slice(b"Rich");
         assert_eq!(find_rich_marker(&buf), Some(40));
+    }
+
+    /// End-to-end Rich header decode for the canonical `test.exe`
+    /// fixture. Pinning the key, the canonical MD5, and the first
+    /// entry's `(product_id, build_id, use_count)` guards against
+    /// silent drift in the XOR-key recovery, tuple walker, or hash
+    /// computation. Regenerate values by running
+    /// `cargo run --bin expose -- ../cleave/tests/fixtures/test.exe`.
+    #[test]
+    fn rich_header_decodes_test_exe_to_known_values() {
+        let bytes = std::fs::read("../cleave/tests/fixtures/test.exe")
+            .expect("test.exe fixture is required");
+        let mut v = Values::new();
+        extract(&bytes, &mut v);
+
+        assert_eq!(
+            v.get("pe.rich.key").and_then(|x| x.as_u64()),
+            Some(110_128_735),
+        );
+        assert_eq!(
+            v.get("pe.rich.hash").and_then(|x| x.as_str()),
+            Some("d7fdfa1db9e0bba7aef35f999a032c9a"),
+        );
+        let entries = v
+            .get("pe.rich.entries")
+            .and_then(|x| x.as_array())
+            .expect("entries populated for a Rich-header PE");
+        assert_eq!(entries.len(), 10);
+        let first = &entries[0];
+        assert_eq!(
+            first.get("product_id").and_then(|x| x.as_u64()),
+            Some(30729),
+        );
+        assert_eq!(first.get("build_id").and_then(|x| x.as_u64()), Some(147));
+        assert_eq!(first.get("use_count").and_then(|x| x.as_u64()), Some(10));
     }
 }

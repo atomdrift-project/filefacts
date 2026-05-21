@@ -33,26 +33,23 @@ use crate::output::{Function, Import};
 /// Sentinel library/argument value emitted when a Declare's `Lib`
 /// clause or a CreateObject/GetObject argument is not a string
 /// literal — i.e., the import target is built at runtime.
+///
+/// Re-exported through the crate-level `expose::vba_symbols` module
+/// for consumers that need to recognise it.
 pub const NON_LITERAL_SENTINEL: &str = "<non-literal>";
 
-/// Aggregate counters from one module's symbol extraction. The
-/// caller folds these into per-document metrics.
+/// Aggregate counters from one module's symbol extraction. Folded
+/// into the per-document `office.vba.*_count` metric keys by
+/// [`formats::vba::extract`]. Not exposed publicly — consumers read
+/// the metric map.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct VbaSymbolStats {
-    /// Total `Declare … Function|Sub … Lib` statements.
+pub(crate) struct VbaSymbolStats {
     pub declare_count: u32,
-    /// Of those, the count whose `Lib` clause was not a string literal.
     pub declare_non_literal_count: u32,
-    /// Total `CreateObject(…)` calls.
     pub createobject_count: u32,
-    /// Of those, the count whose ProgID argument was not a string literal.
     pub createobject_non_literal_count: u32,
-    /// Total `GetObject(…)` calls.
     pub getobject_count: u32,
-    /// Of those, the count whose moniker/ProgID argument was not literal.
     pub getobject_non_literal_count: u32,
-    /// Distinct trigger handlers observed (`Document_Open`,
-    /// `Workbook_Open`, `Auto_Open`, …).
     pub trigger_handler_count: u32,
 }
 
@@ -60,10 +57,11 @@ pub struct VbaSymbolStats {
 /// into `imports_out` / `functions_out` and returns the per-module
 /// aggregate counters.
 ///
-/// This is the single source of truth for VBA symbol extraction.
-/// Other crates that need the same semantics should call this rather
-/// than re-implementing the regex set.
-pub fn extract(
+/// Crate-internal: VBA symbols flow out to consumers through the
+/// unified [`crate::Imports`] / [`crate::Functions`] views populated
+/// by [`formats::vba::extract`], not through a public per-module
+/// function.
+pub(crate) fn extract(
     source: &str,
     imports_out: &mut crate::output::Imports,
     functions_out: &mut crate::output::Functions,

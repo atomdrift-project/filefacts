@@ -91,6 +91,13 @@ pub struct Export {
     /// PE ordinal slot, dyld trie ordinal, etc.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ordinal: Option<u32>,
+    /// Forwarded re-export target, when this entry is a forward
+    /// rather than a locally-defined symbol. PE format example:
+    /// `KERNEL32.LoadLibraryA` (DLL-name form) or `NTDLL.#123`
+    /// (DLL-ordinal form). `None` for normal exports whose RVA
+    /// points at the binary's own code/data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forward_to: Option<String>,
 }
 
 /// A function / method / subroutine defined inside this file. Local
@@ -272,12 +279,14 @@ mod tests {
             source: "pe",
             offset: Some(0x1000),
             ordinal: Some(1),
+            forward_to: None,
         });
         exports.push(Export {
             name: "_init".into(),
             source: "elf-dynsym",
             offset: None,
             ordinal: None,
+            forward_to: None,
         });
         let json = serde_json::to_value(&exports).unwrap();
         // First entry has every field; second elides optionals.

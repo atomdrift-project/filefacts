@@ -65,7 +65,10 @@ pub(super) fn extract(
         );
 
         if let Ok(mode) = header.mode() {
-            obj.insert("mode_octal".into(), JsonValue::Number(u64::from(mode).into()));
+            obj.insert(
+                "mode_octal".into(),
+                JsonValue::Number(u64::from(mode).into()),
+            );
             if mode & 0o4000 != 0 {
                 setuid += 1;
             }
@@ -113,7 +116,9 @@ pub(super) fn extract(
             symlinks += u64::from(header.entry_type().is_symlink());
         }
 
-        *entry_type_counts.entry(entry_type_label.into()).or_insert(0) += 1;
+        *entry_type_counts
+            .entry(entry_type_label.into())
+            .or_insert(0) += 1;
         members.push(JsonValue::Object(obj));
     }
 
@@ -127,22 +132,34 @@ pub(super) fn extract(
     values.insert("archive.format.entry_types", JsonValue::Array(entry_types));
 
     if !unames.is_empty() {
-        let u: Vec<JsonValue> = unames.iter().map(|s| JsonValue::String(s.clone())).collect();
+        let u: Vec<JsonValue> = unames
+            .iter()
+            .map(|s| JsonValue::String(s.clone()))
+            .collect();
         values.insert("archive.builder.unames", JsonValue::Array(u));
     }
     if !gnames.is_empty() {
-        let g: Vec<JsonValue> = gnames.iter().map(|s| JsonValue::String(s.clone())).collect();
+        let g: Vec<JsonValue> = gnames
+            .iter()
+            .map(|s| JsonValue::String(s.clone()))
+            .collect();
         values.insert("archive.builder.gnames", JsonValue::Array(g));
     }
 
     metrics.insert("archive.member_count", member_count as f64);
     for (t, c) in &entry_type_counts {
-        metrics.insert(format!("archive.format.{}_count", t.replace('-', "_")), *c as f64);
+        metrics.insert(
+            format!("archive.format.{}_count", t.replace('-', "_")),
+            *c as f64,
+        );
     }
     metrics.insert("archive.security.setuid_count", setuid as f64);
     metrics.insert("archive.security.setgid_count", setgid as f64);
     metrics.insert("archive.security.sticky_count", sticky as f64);
-    metrics.insert("archive.security.world_writable_count", world_writable as f64);
+    metrics.insert(
+        "archive.security.world_writable_count",
+        world_writable as f64,
+    );
     metrics.insert("archive.security.symlink_count", symlinks as f64);
 
     if !mtimes.is_empty() {
@@ -150,10 +167,7 @@ pub(super) fn extract(
         let max = *mtimes.iter().max().unwrap_or(&0);
         values.insert("archive.timing.mtime_min", JsonValue::Number(min.into()));
         values.insert("archive.timing.mtime_max", JsonValue::Number(max.into()));
-        metrics.insert(
-            "archive.timing.mtime_spread_seconds",
-            (max - min) as f64,
-        );
+        metrics.insert("archive.timing.mtime_spread_seconds", (max - min) as f64);
         let unique: std::collections::BTreeSet<i64> = mtimes.iter().copied().collect();
         metrics.insert("archive.timing.mtime_unique_count", unique.len() as f64);
     }
@@ -274,7 +288,14 @@ mod tests {
     #[test]
     fn surfaces_member_listing_and_metadata() {
         let tar = build_tar(&[
-            ("usr/bin/script.sh", 0o755, 1000, 1000, 1_700_000_000, b"#!/bin/sh\n"),
+            (
+                "usr/bin/script.sh",
+                0o755,
+                1000,
+                1000,
+                1_700_000_000,
+                b"#!/bin/sh\n",
+            ),
             ("etc/config", 0o644, 0, 0, 1_700_000_100, b"key=value\n"),
         ]);
         let (v, m) = run(&tar);
@@ -304,7 +325,11 @@ mod tests {
         let (_, m) = run(&tar);
         assert_eq!(m.get("archive.security.setuid_count"), Some(1.0));
         // World-writable is not set on 0o4755.
-        assert!(m.get("archive.security.world_writable_count").unwrap_or(0.0) < 1.0);
+        assert!(
+            m.get("archive.security.world_writable_count")
+                .unwrap_or(0.0)
+                < 1.0
+        );
     }
 
     #[test]

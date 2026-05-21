@@ -26,8 +26,8 @@
 //! - `class.constant_pool_size` — metric also surfaced as
 //!   `metrics.class.constant_pool_size`.
 
-use std::collections::HashMap;
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 
 use crate::error::Error;
 use crate::formats::common::{extract_ascii_strings, put_str, put_u64};
@@ -149,7 +149,12 @@ pub(super) fn extract(
     if !flags.is_empty() {
         values.insert(
             "class.access_flags",
-            JsonValue::Array(flags.into_iter().map(|s| JsonValue::String(s.into())).collect()),
+            JsonValue::Array(
+                flags
+                    .into_iter()
+                    .map(|s| JsonValue::String(s.into()))
+                    .collect(),
+            ),
         );
     }
     if let Some(name) = cp.class_name(this_idx) {
@@ -174,7 +179,13 @@ pub(super) fn extract(
     if !attrs.inner_classes.is_empty() {
         values.insert(
             "class.inner_classes",
-            JsonValue::Array(attrs.inner_classes.into_iter().map(JsonValue::String).collect()),
+            JsonValue::Array(
+                attrs
+                    .inner_classes
+                    .into_iter()
+                    .map(JsonValue::String)
+                    .collect(),
+            ),
         );
     }
     put_u64(values, "class.constant_pool_size", cp_count as u64);
@@ -223,15 +234,33 @@ fn java_version(major: u16) -> Option<&'static str> {
 /// Table 4.1-B.
 fn decode_access_flags(flags: u16) -> Vec<&'static str> {
     let mut out = Vec::new();
-    if flags & 0x0001 != 0 { out.push("public"); }
-    if flags & 0x0010 != 0 { out.push("final"); }
-    if flags & 0x0020 != 0 { out.push("super"); }
-    if flags & 0x0200 != 0 { out.push("interface"); }
-    if flags & 0x0400 != 0 { out.push("abstract"); }
-    if flags & 0x1000 != 0 { out.push("synthetic"); }
-    if flags & 0x2000 != 0 { out.push("annotation"); }
-    if flags & 0x4000 != 0 { out.push("enum"); }
-    if flags & 0x8000 != 0 { out.push("module"); }
+    if flags & 0x0001 != 0 {
+        out.push("public");
+    }
+    if flags & 0x0010 != 0 {
+        out.push("final");
+    }
+    if flags & 0x0020 != 0 {
+        out.push("super");
+    }
+    if flags & 0x0200 != 0 {
+        out.push("interface");
+    }
+    if flags & 0x0400 != 0 {
+        out.push("abstract");
+    }
+    if flags & 0x1000 != 0 {
+        out.push("synthetic");
+    }
+    if flags & 0x2000 != 0 {
+        out.push("annotation");
+    }
+    if flags & 0x4000 != 0 {
+        out.push("enum");
+    }
+    if flags & 0x8000 != 0 {
+        out.push("module");
+    }
     out
 }
 
@@ -367,8 +396,7 @@ fn populate_imports(
     // import; tooling matching against superclass-of-X queries gets
     // the data through the same view.
     let mut class_count: u32 = 0;
-    let mut seen: std::collections::BTreeSet<&str> =
-        std::collections::BTreeSet::new();
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for (&idx, _) in &cp.class {
         if idx == this_idx {
             continue;
@@ -518,7 +546,7 @@ mod tests {
         out.extend_from_slice(&0u16.to_be_bytes());
         out.extend_from_slice(&major.to_be_bytes());
         out.extend_from_slice(&7u16.to_be_bytes()); // cp_count
-        // 1 Utf8 "MyClass"
+                                                    // 1 Utf8 "MyClass"
         out.push(CP_UTF8);
         out.extend_from_slice(&7u16.to_be_bytes());
         out.extend_from_slice(b"MyClass");
@@ -570,9 +598,7 @@ mod tests {
         (v, m)
     }
 
-    fn run_full(
-        bytes: &[u8],
-    ) -> (Values, Metrics, crate::Imports, crate::Functions) {
+    fn run_full(bytes: &[u8]) -> (Values, Metrics, crate::Imports, crate::Functions) {
         let mut v = Values::new();
         let mut s = Strings::default();
         let mut m = Metrics::new();
@@ -592,12 +618,18 @@ mod tests {
     fn surfaces_version_and_hierarchy() {
         let bytes = build_class(65, true);
         let (v, m) = run(&bytes);
-        assert_eq!(v.get("class.major_version").and_then(|x| x.as_u64()), Some(65));
+        assert_eq!(
+            v.get("class.major_version").and_then(|x| x.as_u64()),
+            Some(65)
+        );
         assert_eq!(
             v.get("class.java_version").and_then(|x| x.as_str()),
             Some("21")
         );
-        let flags = v.get("class.access_flags").and_then(|x| x.as_array()).unwrap();
+        let flags = v
+            .get("class.access_flags")
+            .and_then(|x| x.as_array())
+            .unwrap();
         let names: Vec<&str> = flags.iter().filter_map(|x| x.as_str()).collect();
         assert!(names.contains(&"public"));
         assert!(names.contains(&"super"));
@@ -632,7 +664,10 @@ mod tests {
         // Java 99 — not in our mapping table.
         let bytes = build_class(99, false);
         let (v, m) = run(&bytes);
-        assert_eq!(v.get("class.major_version").and_then(|x| x.as_u64()), Some(99));
+        assert_eq!(
+            v.get("class.major_version").and_then(|x| x.as_u64()),
+            Some(99)
+        );
         assert!(v.get("class.java_version").is_none());
         assert_eq!(m.get("class.major_version"), Some(99.0));
     }
@@ -652,7 +687,10 @@ mod tests {
             names.contains(&"java/lang/Object"),
             "expected super-class as java-class import, got {names:?}",
         );
-        assert!(!names.contains(&"MyClass"), "this_class must not leak as import");
+        assert!(
+            !names.contains(&"MyClass"),
+            "this_class must not leak as import"
+        );
         for imp in imports.iter() {
             assert_eq!(imp.source, "java-class");
             assert!(imp.library.is_none(), "java-class imports carry no library");
@@ -683,7 +721,10 @@ mod tests {
         // ACC_PUBLIC | ACC_FINAL | ACC_INTERFACE | ACC_ABSTRACT.
         let bytes = build_class_with_flags(52, 0x0001 | 0x0010 | 0x0200 | 0x0400);
         let (v, _) = run(&bytes);
-        let flags = v.get("class.access_flags").and_then(|x| x.as_array()).unwrap();
+        let flags = v
+            .get("class.access_flags")
+            .and_then(|x| x.as_array())
+            .unwrap();
         let names: Vec<&str> = flags.iter().filter_map(|x| x.as_str()).collect();
         assert!(names.contains(&"public"));
         assert!(names.contains(&"final"));

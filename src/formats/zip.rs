@@ -20,7 +20,11 @@ use zip::{CompressionMethod, ZipArchive};
 use crate::error::Error;
 use crate::output::{Metrics, Values};
 
-pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) -> Result<(), Error> {
+pub(super) fn extract(
+    bytes: &[u8],
+    values: &mut Values,
+    metrics: &mut Metrics,
+) -> Result<(), Error> {
     let cursor = Cursor::new(bytes);
     let mut archive =
         ZipArchive::new(cursor).map_err(|e| Error::malformed("zip", e.to_string()))?;
@@ -54,10 +58,7 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
 
         let mut obj = JsonMap::new();
         obj.insert("path".into(), JsonValue::String(entry.name().to_string()));
-        obj.insert(
-            "size_bytes".into(),
-            JsonValue::Number(entry.size().into()),
-        );
+        obj.insert("size_bytes".into(), JsonValue::Number(entry.size().into()));
         obj.insert(
             "compressed_size".into(),
             JsonValue::Number(entry.compressed_size().into()),
@@ -72,13 +73,19 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
             encrypted_count += 1;
         }
 
-        if let Some(t) = entry.last_modified().and_then(crate::scan::zip_datetime_to_unix) {
+        if let Some(t) = entry
+            .last_modified()
+            .and_then(crate::scan::zip_datetime_to_unix)
+        {
             obj.insert("mtime_unix".into(), JsonValue::Number(t.into()));
             mtimes.push(t);
         }
 
         if let Some(mode) = entry.unix_mode() {
-            obj.insert("mode_octal".into(), JsonValue::Number(u64::from(mode).into()));
+            obj.insert(
+                "mode_octal".into(),
+                JsonValue::Number(u64::from(mode).into()),
+            );
             if mode & 0o4000 != 0 {
                 setuid += 1;
             }
@@ -141,12 +148,18 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
         metrics.insert(format!("archive.compression.method_counts.{m}"), *c as f64);
     }
     for (t, c) in &entry_type_counts {
-        metrics.insert(format!("archive.format.{}_count", t.replace('-', "_")), *c as f64);
+        metrics.insert(
+            format!("archive.format.{}_count", t.replace('-', "_")),
+            *c as f64,
+        );
     }
     metrics.insert("archive.security.setuid_count", setuid as f64);
     metrics.insert("archive.security.setgid_count", setgid as f64);
     metrics.insert("archive.security.sticky_count", sticky as f64);
-    metrics.insert("archive.security.world_writable_count", world_writable as f64);
+    metrics.insert(
+        "archive.security.world_writable_count",
+        world_writable as f64,
+    );
     metrics.insert("archive.security.symlink_count", symlinks as f64);
     metrics.insert("archive.security.encrypted_count", encrypted_count as f64);
 
@@ -155,10 +168,7 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
         let max = *mtimes.iter().max().unwrap_or(&0);
         values.insert("archive.timing.mtime_min", JsonValue::Number(min.into()));
         values.insert("archive.timing.mtime_max", JsonValue::Number(max.into()));
-        metrics.insert(
-            "archive.timing.mtime_spread_seconds",
-            (max - min) as f64,
-        );
+        metrics.insert("archive.timing.mtime_spread_seconds", (max - min) as f64);
         let unique: std::collections::BTreeSet<i64> = mtimes.iter().copied().collect();
         metrics.insert("archive.timing.mtime_unique_count", unique.len() as f64);
     }
@@ -183,10 +193,7 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
         && archive_names(&archive)
             .any(|n| n.starts_with("META-INF/") && (n.ends_with(".RSA") || n.ends_with(".DSA")));
     if jar_signed_shape {
-        values.insert(
-            "archive.signing.jar_signed_shape",
-            JsonValue::Bool(true),
-        );
+        values.insert("archive.signing.jar_signed_shape", JsonValue::Bool(true));
     }
 
     Ok(())
@@ -255,14 +262,21 @@ mod tests {
     #[test]
     fn compression_names_are_stable() {
         assert_eq!(compression_method_name(CompressionMethod::Stored), "stored");
-        assert_eq!(compression_method_name(CompressionMethod::Deflated), "deflate");
+        assert_eq!(
+            compression_method_name(CompressionMethod::Deflated),
+            "deflate"
+        );
     }
 
     #[test]
     fn surfaces_member_listing_and_per_member_fields() {
         let z = build_zip(&[
             ("file.txt", b"hello world", CompressionMethod::Stored),
-            ("nested/file.bin", b"\x00\x01\x02\x03", CompressionMethod::Deflated),
+            (
+                "nested/file.bin",
+                b"\x00\x01\x02\x03",
+                CompressionMethod::Deflated,
+            ),
         ]);
         let (v, m) = run(&z);
         let members = v.get("archive.members").and_then(|x| x.as_array()).unwrap();
@@ -316,14 +330,19 @@ mod tests {
     #[test]
     fn jar_signed_shape_detected() {
         let z = build_zip(&[
-            ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n", CompressionMethod::Stored),
+            (
+                "META-INF/MANIFEST.MF",
+                b"Manifest-Version: 1.0\n",
+                CompressionMethod::Stored,
+            ),
             ("META-INF/CERT.SF", b"sigfile", CompressionMethod::Stored),
             ("META-INF/CERT.RSA", b"\x00\x01", CompressionMethod::Stored),
             ("Main.class", b"\xca\xfe\xba\xbe", CompressionMethod::Stored),
         ]);
         let (v, _) = run(&z);
         assert_eq!(
-            v.get("archive.signing.jar_signed_shape").and_then(|x| x.as_bool()),
+            v.get("archive.signing.jar_signed_shape")
+                .and_then(|x| x.as_bool()),
             Some(true)
         );
         // mozilla-extension shape needs cose.manifest + cose.sig; not set here.
@@ -333,7 +352,11 @@ mod tests {
     #[test]
     fn mozilla_extension_shape_detected() {
         let z = build_zip(&[
-            ("META-INF/cose.manifest", b"mozcose", CompressionMethod::Stored),
+            (
+                "META-INF/cose.manifest",
+                b"mozcose",
+                CompressionMethod::Stored,
+            ),
             ("META-INF/cose.sig", b"\xde\xad", CompressionMethod::Stored),
             ("manifest.json", b"{}", CompressionMethod::Stored),
         ]);
@@ -371,7 +394,10 @@ mod tests {
         ]);
         let (_, m) = run(&z);
         assert_eq!(m.get("archive.compression.method_counts.stored"), Some(1.0));
-        assert_eq!(m.get("archive.compression.method_counts.deflate"), Some(2.0));
+        assert_eq!(
+            m.get("archive.compression.method_counts.deflate"),
+            Some(2.0)
+        );
     }
 
     #[test]

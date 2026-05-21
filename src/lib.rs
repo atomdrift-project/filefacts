@@ -60,6 +60,7 @@ mod debug;
 mod error;
 mod formats;
 mod output;
+mod rizin;
 mod scan;
 
 pub mod fileid;

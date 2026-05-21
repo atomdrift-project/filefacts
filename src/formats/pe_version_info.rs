@@ -225,7 +225,14 @@ mod tests {
         let f = file_flags(0x3F);
         assert_eq!(
             f,
-            vec!["debug", "pre_release", "patched", "private_build", "info_inferred", "special_build"]
+            vec![
+                "debug",
+                "pre_release",
+                "patched",
+                "private_build",
+                "info_inferred",
+                "special_build"
+            ]
         );
     }
 
@@ -257,5 +264,4 @@ mod tests {
         assert_eq!(file_type_label(8), "unknown");
         assert_eq!(file_type_label(u32::MAX), "unknown");
     }
-
 }

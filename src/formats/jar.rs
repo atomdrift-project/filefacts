@@ -77,7 +77,11 @@ const TRACKED_HEADERS: &[(&str, &str)] = &[
     ("Spring-Boot-Lib", "spring_boot_lib"),
 ];
 
-pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) -> Result<(), Error> {
+pub(super) fn extract(
+    bytes: &[u8],
+    values: &mut Values,
+    metrics: &mut Metrics,
+) -> Result<(), Error> {
     let cursor = Cursor::new(bytes);
     let Ok(mut zip) = ::zip::ZipArchive::new(cursor) else {
         return Ok(());
@@ -184,7 +188,10 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
         values.insert(
             "jar.features",
             JsonValue::Array(
-                features.into_iter().map(|s| JsonValue::String(s.into())).collect(),
+                features
+                    .into_iter()
+                    .map(|s| JsonValue::String(s.into()))
+                    .collect(),
             ),
         );
     }
@@ -270,8 +277,8 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let opts = SimpleFileOptions::default()
-                .compression_method(::zip::CompressionMethod::Stored);
+            let opts =
+                SimpleFileOptions::default().compression_method(::zip::CompressionMethod::Stored);
             for (name, body) in entries {
                 zip.start_file(*name, opts).unwrap();
                 zip.write_all(body).unwrap();

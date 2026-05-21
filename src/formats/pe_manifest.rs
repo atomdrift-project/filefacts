@@ -72,10 +72,7 @@ pub(super) fn extract(manifest_bytes: &[u8], values: &mut Values) {
         .map(JsonValue::String)
         .collect();
     if !supported.is_empty() {
-        values.insert(
-            "pe.manifest.supported_os",
-            JsonValue::Array(supported),
-        );
+        values.insert("pe.manifest.supported_os", JsonValue::Array(supported));
     }
 
     // `dpiAware` and `dpiAwareness` are element text nodes, not
@@ -304,11 +301,13 @@ mod tests {
         let mut v = crate::Values::new();
         extract(SAMPLE_WITH_DEPS.as_bytes(), &mut v);
         assert_eq!(
-            v.get("pe.manifest.assembly_identity.name").and_then(|x| x.as_str()),
+            v.get("pe.manifest.assembly_identity.name")
+                .and_then(|x| x.as_str()),
             Some("Microsoft.Windows.SampleApp")
         );
         assert_eq!(
-            v.get("pe.manifest.assembly_identity.version").and_then(|x| x.as_str()),
+            v.get("pe.manifest.assembly_identity.version")
+                .and_then(|x| x.as_str()),
             Some("1.0.0.0")
         );
     }
@@ -327,7 +326,10 @@ mod tests {
     fn parses_dependencies() {
         let mut v = crate::Values::new();
         extract(SAMPLE_WITH_DEPS.as_bytes(), &mut v);
-        let deps = v.get("pe.manifest.dependencies").and_then(|x| x.as_array()).unwrap();
+        let deps = v
+            .get("pe.manifest.dependencies")
+            .and_then(|x| x.as_array())
+            .unwrap();
         assert_eq!(deps.len(), 2);
         assert_eq!(
             deps[0].as_str(),
@@ -345,7 +347,8 @@ mod tests {
             Some("true")
         );
         assert_eq!(
-            v.get("pe.manifest.long_path_aware").and_then(|x| x.as_str()),
+            v.get("pe.manifest.long_path_aware")
+                .and_then(|x| x.as_str()),
             Some("true")
         );
     }

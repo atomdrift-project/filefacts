@@ -83,7 +83,12 @@ pub(super) fn extract(
         }
         values.insert(
             "pickle.opcodes",
-            JsonValue::Array(opcodes.into_iter().map(|s| JsonValue::String(s.into())).collect()),
+            JsonValue::Array(
+                opcodes
+                    .into_iter()
+                    .map(|s| JsonValue::String(s.into()))
+                    .collect(),
+            ),
         );
     }
 
@@ -181,7 +186,10 @@ fn apply_side_effects<'a>(
             }
         }
         b'c' => {
-            if let Some(nl) = scan.get(i + 1..).and_then(|s| s.iter().position(|&b| b == b'\n')) {
+            if let Some(nl) = scan
+                .get(i + 1..)
+                .and_then(|s| s.iter().position(|&b| b == b'\n'))
+            {
                 if let Ok(module) = std::str::from_utf8(&scan[i + 1..i + 1 + nl]) {
                     if !module.is_empty() {
                         modules.insert(module.to_string());

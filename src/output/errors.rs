@@ -155,7 +155,10 @@ mod tests {
         let obj = arr[0].as_object().unwrap();
         assert!(!obj.contains_key("message"));
         assert_eq!(obj.get("kind").and_then(|v| v.as_str()), Some("panic"));
-        assert_eq!(obj.get("stage").and_then(|v| v.as_str()), Some("macho-parse"));
+        assert_eq!(
+            obj.get("stage").and_then(|v| v.as_str()),
+            Some("macho-parse")
+        );
     }
 
     #[test]

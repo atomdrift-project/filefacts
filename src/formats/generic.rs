@@ -8,7 +8,12 @@ use crate::output::{Metrics, Strings, Values};
 use crate::scan::entropy;
 
 /// Run the generic byte-level pass. Always succeeds.
-pub(super) fn extract(bytes: &[u8], _values: &mut Values, _strings: &mut Strings, metrics: &mut Metrics) {
+pub(super) fn extract(
+    bytes: &[u8],
+    _values: &mut Values,
+    _strings: &mut Strings,
+    metrics: &mut Metrics,
+) {
     metrics.insert("file.size_bytes", bytes.len() as f64);
     metrics.insert("file.entropy", entropy::shannon(bytes));
 }

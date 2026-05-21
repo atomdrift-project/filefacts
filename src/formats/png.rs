@@ -63,7 +63,10 @@ pub(super) fn extract(
             u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
         let ctype_bytes = &bytes[i + 4..i + 8];
         let body_start = i + 8;
-        let Some(chunk_end) = body_start.checked_add(length).and_then(|n| n.checked_add(4)) else {
+        let Some(chunk_end) = body_start
+            .checked_add(length)
+            .and_then(|n| n.checked_add(4))
+        else {
             break;
         };
         if chunk_end > bytes.len() {
@@ -184,7 +187,12 @@ pub(super) fn extract(
     if !features.is_empty() {
         values.insert(
             "png.features",
-            JsonValue::Array(features.into_iter().map(|s| JsonValue::String(s.into())).collect()),
+            JsonValue::Array(
+                features
+                    .into_iter()
+                    .map(|s| JsonValue::String(s.into()))
+                    .collect(),
+            ),
         );
     }
 
@@ -333,8 +341,8 @@ mod tests {
         let ihdr: Vec<u8> = vec![
             0, 0, 0, 100, // width=100
             0, 0, 0, 50, // height=50
-            8, // bit_depth
-            2, // color_type=truecolor
+            8,  // bit_depth
+            2,  // color_type=truecolor
             0, 0, 1, // compression, filter, interlace=adam7
         ];
         let png = build_png(&[(b"IHDR", &ihdr), (b"IEND", &[])]);
@@ -346,10 +354,7 @@ mod tests {
             dim.get("color_type").and_then(|x| x.as_str()),
             Some("truecolor")
         );
-        assert_eq!(
-            dim.get("interlace").and_then(|x| x.as_str()),
-            Some("adam7")
-        );
+        assert_eq!(dim.get("interlace").and_then(|x| x.as_str()), Some("adam7"));
     }
 
     #[test]
@@ -385,7 +390,10 @@ mod tests {
     fn detects_unknown_chunks() {
         let png = build_png(&[(b"sTeG", b"hidden"), (b"IEND", &[])]);
         let (v, _) = run(&png);
-        let unk = v.get("png.unknown_chunks").and_then(|x| x.as_array()).unwrap();
+        let unk = v
+            .get("png.unknown_chunks")
+            .and_then(|x| x.as_array())
+            .unwrap();
         assert_eq!(unk.len(), 1);
         assert_eq!(unk[0].as_str(), Some("sTeG"));
     }

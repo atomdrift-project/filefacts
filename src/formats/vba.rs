@@ -121,7 +121,10 @@ pub(super) fn extract(
 
         let mut obj = serde_json::Map::new();
         obj.insert("name".into(), JsonValue::String(info.name.clone()));
-        obj.insert("stream_name".into(), JsonValue::String(info.stream_name.clone()));
+        obj.insert(
+            "stream_name".into(),
+            JsonValue::String(info.stream_name.clone()),
+        );
         obj.insert(
             "kind".into(),
             JsonValue::String(
@@ -244,7 +247,8 @@ fn decompress_vba(data: &[u8]) -> Result<Vec<u8>, &'static str> {
     if data[0] != 0x01 {
         return Err("invalid VBA compression signature");
     }
-    let mut output: Vec<u8> = Vec::with_capacity(data.len().saturating_mul(2).min(MAX_DECOMPRESSED_SIZE));
+    let mut output: Vec<u8> =
+        Vec::with_capacity(data.len().saturating_mul(2).min(MAX_DECOMPRESSED_SIZE));
     let mut pos = 1usize;
     while pos < data.len() {
         if pos + 1 >= data.len() {
@@ -264,7 +268,10 @@ fn decompress_vba(data: &[u8]) -> Result<Vec<u8>, &'static str> {
             pos = end;
             continue;
         }
-        let chunk_end = pos.saturating_add(chunk_size).saturating_sub(2).min(data.len());
+        let chunk_end = pos
+            .saturating_add(chunk_size)
+            .saturating_sub(2)
+            .min(data.len());
         let decompressed_start = output.len();
         while pos < chunk_end {
             if pos >= data.len() {
@@ -346,12 +353,9 @@ fn parse_dir_stream(data: &[u8]) -> Vec<ModuleInfo> {
     let mut pos = 0usize;
     while pos + 6 <= data.len() {
         let record_id = u16::from_le_bytes([data[pos], data[pos + 1]]);
-        let record_size = u32::from_le_bytes([
-            data[pos + 2],
-            data[pos + 3],
-            data[pos + 4],
-            data[pos + 5],
-        ]) as usize;
+        let record_size =
+            u32::from_le_bytes([data[pos + 2], data[pos + 3], data[pos + 4], data[pos + 5]])
+                as usize;
         match record_id {
             0x000F => break, // MODULETERMINATOR — end of project
             0x0019 => {

@@ -103,7 +103,12 @@ pub(super) fn extract(
         let mut sig = serde_json::Map::new();
         sig.insert(
             "algorithms".into(),
-            JsonValue::Array(algos.into_iter().map(|s| JsonValue::String(s.into())).collect()),
+            JsonValue::Array(
+                algos
+                    .into_iter()
+                    .map(|s| JsonValue::String(s.into()))
+                    .collect(),
+            ),
         );
         values.insert("rpm.signature", JsonValue::Object(sig));
     }
@@ -218,7 +223,12 @@ fn read_header(slice: &[u8]) -> Option<(Vec<IndexEntry>, &[u8], usize)> {
         let typ = u32::from_be_bytes(slice[off + 4..off + 8].try_into().ok()?);
         let offset = u32::from_be_bytes(slice[off + 8..off + 12].try_into().ok()?);
         let count = u32::from_be_bytes(slice[off + 12..off + 16].try_into().ok()?);
-        entries.push(IndexEntry { tag, typ, offset, count });
+        entries.push(IndexEntry {
+            tag,
+            typ,
+            offset,
+            count,
+        });
     }
     Some((entries, &slice[entries_end..data_end], data_end))
 }

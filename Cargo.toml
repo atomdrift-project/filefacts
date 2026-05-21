@@ -52,6 +52,7 @@ goblin = { version = "0.10", default-features = false, features = ["std", "pe32"
 # consumer get the same high-quality string set.
 stng = { git = "https://codeberg.org/atomdrift/stng.git" }
 
+
 # Archive index readers. We use these for header/central-directory enumeration
 # only — never for decompression or extraction.
 zip = "2"

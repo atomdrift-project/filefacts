@@ -222,7 +222,10 @@ mod tests {
   </Metadata>
 </PackageManifest>"#;
         let (v, m) = run(manifest);
-        let props = v.get("vsix.properties").and_then(|x| x.as_object()).unwrap();
+        let props = v
+            .get("vsix.properties")
+            .and_then(|x| x.as_object())
+            .unwrap();
         assert_eq!(
             props.get("code.executescode").and_then(|x| x.as_str()),
             Some("true")
@@ -263,7 +266,10 @@ mod tests {
   </Assets>
 </PackageManifest>"#;
         let (v, m) = run(manifest);
-        let deps = v.get("vsix.dependencies").and_then(|x| x.as_array()).unwrap();
+        let deps = v
+            .get("vsix.dependencies")
+            .and_then(|x| x.as_array())
+            .unwrap();
         assert_eq!(deps.len(), 2);
         let ids: Vec<&str> = deps
             .iter()

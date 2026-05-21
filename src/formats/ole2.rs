@@ -129,14 +129,20 @@ pub(super) fn extract(
     if !dangerous_clsids.is_empty() {
         features.push("dangerous_clsid");
         let count = dangerous_clsids.len() as f64;
-        values.insert("office.dangerous_clsids", JsonValue::Array(dangerous_clsids));
+        values.insert(
+            "office.dangerous_clsids",
+            JsonValue::Array(dangerous_clsids),
+        );
         metrics.insert("office.dangerous_clsid_count", count);
     }
     if !features.is_empty() {
         values.insert(
             "office.features",
             JsonValue::Array(
-                features.into_iter().map(|s| JsonValue::String(s.into())).collect(),
+                features
+                    .into_iter()
+                    .map(|s| JsonValue::String(s.into()))
+                    .collect(),
             ),
         );
     }
@@ -195,10 +201,7 @@ pub(super) fn extract(
                     // ProgID. We surface both — `prog_id` is the
                     // forward-looking name (matches the spec);
                     // `app_version` stays for trait-rule continuity.
-                    obj.insert(
-                        "prog_id".into(),
-                        JsonValue::String(co.app_version.clone()),
-                    );
+                    obj.insert("prog_id".into(), JsonValue::String(co.app_version.clone()));
                     obj.insert("app_version".into(), JsonValue::String(co.app_version));
                 }
                 if !obj.is_empty() {
@@ -229,8 +232,7 @@ fn parse_summary_information(data: &[u8]) -> serde_json::Map<String, JsonValue> 
     if section.len() < 8 {
         return out;
     }
-    let num_props =
-        u32::from_le_bytes([section[4], section[5], section[6], section[7]]) as usize;
+    let num_props = u32::from_le_bytes([section[4], section[5], section[6], section[7]]) as usize;
     // Cap the count so a malformed header can't request unbounded
     // property reads.
     let num_props = num_props.min(256);
@@ -247,16 +249,16 @@ fn parse_summary_information(data: &[u8]) -> serde_json::Map<String, JsonValue> 
         let key = match pid {
             0x02 => "title",
             0x03 => "subject",
-            0x04 => "creator",         // PIDSI_AUTHOR
+            0x04 => "creator", // PIDSI_AUTHOR
             0x05 => "keywords",
-            0x06 => "description",     // PIDSI_COMMENTS
+            0x06 => "description", // PIDSI_COMMENTS
             0x07 => "template",
-            0x08 => "last_modified_by",// PIDSI_LASTAUTHOR
-            0x09 => "revision",        // VT_LPSTR holding a decimal string
-            0x0B => "last_printed",    // VT_FILETIME
-            0x0C => "created",         // VT_FILETIME
-            0x0D => "modified",        // PIDSI_LASTSAVE_DTM, VT_FILETIME
-            0x12 => "application",     // PIDSI_APPNAME
+            0x08 => "last_modified_by", // PIDSI_LASTAUTHOR
+            0x09 => "revision",         // VT_LPSTR holding a decimal string
+            0x0B => "last_printed",     // VT_FILETIME
+            0x0C => "created",          // VT_FILETIME
+            0x0D => "modified",         // PIDSI_LASTSAVE_DTM, VT_FILETIME
+            0x12 => "application",      // PIDSI_APPNAME
             _ => continue,
         };
         if out.contains_key(key) {
@@ -282,8 +284,7 @@ fn parse_document_summary_information(data: &[u8]) -> serde_json::Map<String, Js
     if section.len() < 8 {
         return out;
     }
-    let num_props =
-        u32::from_le_bytes([section[4], section[5], section[6], section[7]]) as usize;
+    let num_props = u32::from_le_bytes([section[4], section[5], section[6], section[7]]) as usize;
     let num_props = num_props.min(256);
     for i in 0..num_props {
         let entry_off = 8 + i * 8;
@@ -297,17 +298,19 @@ fn parse_document_summary_information(data: &[u8]) -> serde_json::Map<String, Js
         let key = match pid {
             0x02 => "category",
             0x05 => "presentation_format",
-            0x09 => "slide_count",          // VT_I4
-            0x10 => "manager",              // VT_LPSTR
-            0x11 => "company",              // VT_LPSTR
-            0x13 => "security_flag",        // VT_I4 — bitfield
-            0x1A => "hyperlink_base",       // VT_LPSTR
+            0x09 => "slide_count",    // VT_I4
+            0x10 => "manager",        // VT_LPSTR
+            0x11 => "company",        // VT_LPSTR
+            0x13 => "security_flag",  // VT_I4 — bitfield
+            0x1A => "hyperlink_base", // VT_LPSTR
             _ => continue,
         };
         if out.contains_key(key) {
             continue;
         }
-        if let Some(value) = read_property(section, val_off).or_else(|| read_property_i32(section, val_off)) {
+        if let Some(value) =
+            read_property(section, val_off).or_else(|| read_property_i32(section, val_off))
+        {
             out.insert(key.into(), value);
         }
     }
@@ -526,8 +529,7 @@ fn parse_compobj(data: &[u8]) -> Option<CompObjData> {
     if data.len() < pos + 4 {
         return Some(out);
     }
-    let marker =
-        u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+    let marker = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
     if marker == 0 {
         pos += 4;
     } else {
@@ -586,29 +588,19 @@ fn lookup_dangerous_clsid(clsid: &str) -> Option<&'static str> {
     // hyphenated lowercase. Match against that form.
     match clsid {
         // Equation Editor — CVE-2017-11882 / CVE-2018-0802.
-        "0002ce02-0000-0000-c000-000000000046" => {
-            Some("Equation Editor 3.0 (CVE-2017-11882)")
-        }
+        "0002ce02-0000-0000-c000-000000000046" => Some("Equation Editor 3.0 (CVE-2017-11882)"),
         // Packager Shell Object — embeds arbitrary files as
         // double-click-to-execute payloads.
         "f20da720-c02f-11ce-927b-0800095ae340" => Some("OLE Package Shell Object"),
         // scriptlet.typelib — script execution via Windows Script Host.
-        "06290bd2-48aa-11d2-8432-006008c3fbfc" => {
-            Some("scriptlet.typelib (script execution)")
-        }
+        "06290bd2-48aa-11d2-8432-006008c3fbfc" => Some("scriptlet.typelib (script execution)"),
         // htmlfile — HTML Application surface (HTA-style execution).
         "25336920-03f9-11cf-8fd0-00aa00686f13" => Some("htmlfile (HTML document)"),
         // MSCOMCTL.ListViewCtrl — CVE-2012-0158 family.
-        "996bf5e0-8044-4650-adeb-0b013914e99c" => {
-            Some("MSCOMCTL.ListViewCtrl (CVE-2012-0158)")
-        }
-        "bdd1f04b-858b-11d1-b16a-00c0f0283628" => {
-            Some("MSCOMCTL.ListViewCtrl.2 (CVE-2012-0158)")
-        }
+        "996bf5e0-8044-4650-adeb-0b013914e99c" => Some("MSCOMCTL.ListViewCtrl (CVE-2012-0158)"),
+        "bdd1f04b-858b-11d1-b16a-00c0f0283628" => Some("MSCOMCTL.ListViewCtrl.2 (CVE-2012-0158)"),
         // Shell.Explorer — embedded browser, repeated RCE history.
-        "8856f961-340a-11d0-a96b-00c04fd705a2" => {
-            Some("Shell.Explorer (embedded browser)")
-        }
+        "8856f961-340a-11d0-a96b-00c04fd705a2" => Some("Shell.Explorer (embedded browser)"),
         // StdOleLink — external link object (template-injection
         // surrogate in OLE2 documents).
         "00000300-0000-0000-c000-000000000046" => Some("StdOleLink (external link)"),
@@ -688,9 +680,7 @@ mod tests {
         let (v, m) = run(&cfb);
         assert_eq!(v.get("office.kind").and_then(|x| x.as_str()), Some("doc"));
         let streams = v.get("office.streams").and_then(|x| x.as_array()).unwrap();
-        assert!(streams
-            .iter()
-            .any(|s| s.as_str() == Some("/WordDocument")));
+        assert!(streams.iter().any(|s| s.as_str() == Some("/WordDocument")));
         assert!(m.get("office.stream_count").unwrap() >= 1.0);
     }
 
@@ -796,7 +786,7 @@ mod tests {
         out.extend_from_slice(&[0u8; 4]); // OS
         out.extend_from_slice(&[0u8; 16]); // CLSID
         out.extend_from_slice(&1u32.to_le_bytes()); // section count
-        // Section header: 16-byte FMTID + 4-byte offset.
+                                                    // Section header: 16-byte FMTID + 4-byte offset.
         out.extend_from_slice(&[0u8; 16]); // FMTID
         out.extend_from_slice(&48u32.to_le_bytes()); // section starts at byte 48
 
@@ -853,7 +843,10 @@ mod tests {
         ]);
         let (v, _) = run(&cfb);
         let core = v.get("office.core").and_then(|x| x.as_object()).unwrap();
-        assert_eq!(core.get("title").and_then(|x| x.as_str()), Some("Quarterly Report"));
+        assert_eq!(
+            core.get("title").and_then(|x| x.as_str()),
+            Some("Quarterly Report")
+        );
         assert_eq!(core.get("creator").and_then(|x| x.as_str()), Some("Alice"));
         assert_eq!(
             core.get("last_modified_by").and_then(|x| x.as_str()),
@@ -922,10 +915,7 @@ mod tests {
 
     #[test]
     fn merges_document_summary_information_into_core() {
-        let summary = build_summary_info(&[
-            (0x02, "Quarterly Report"),
-            (0x04, "Alice"),
-        ]);
+        let summary = build_summary_info(&[(0x02, "Quarterly Report"), (0x04, "Alice")]);
         let dsi = build_property_set(&[
             (0x10, PropValue::Lpstr("Eve")),      // manager
             (0x11, PropValue::Lpstr("Acme Inc")), // company
@@ -940,7 +930,10 @@ mod tests {
         let (v, _) = run(&cfb);
         let core = v.get("office.core").and_then(|x| x.as_object()).unwrap();
         // From SummaryInformation:
-        assert_eq!(core.get("title").and_then(|x| x.as_str()), Some("Quarterly Report"));
+        assert_eq!(
+            core.get("title").and_then(|x| x.as_str()),
+            Some("Quarterly Report")
+        );
         assert_eq!(core.get("creator").and_then(|x| x.as_str()), Some("Alice"));
         // From DocumentSummaryInformation:
         assert_eq!(core.get("manager").and_then(|x| x.as_str()), Some("Eve"));
@@ -949,10 +942,7 @@ mod tests {
             Some("Acme Inc")
         );
         assert_eq!(core.get("slide_count").and_then(|x| x.as_i64()), Some(42));
-        assert_eq!(
-            core.get("security_flag").and_then(|x| x.as_i64()),
-            Some(1)
-        );
+        assert_eq!(core.get("security_flag").and_then(|x| x.as_i64()), Some(1));
     }
 
     #[test]
@@ -1071,10 +1061,7 @@ mod tests {
         // .doc file whose CompObj actually claims to be Excel — the
         // CVE-2017-0199 / T1036.005 shape.
         let body = build_compobj_body("Microsoft Excel Worksheet", Some("Excel.Sheet.8"));
-        let cfb = build_cfb(&[
-            ("/WordDocument", b"x"),
-            ("/\x01CompObj", &body),
-        ]);
+        let cfb = build_cfb(&[("/WordDocument", b"x"), ("/\x01CompObj", &body)]);
         let (v, _) = run(&cfb);
         let co = v.get("office.compobj").and_then(|x| x.as_object()).unwrap();
         assert_eq!(
@@ -1095,10 +1082,7 @@ mod tests {
     fn compobj_parser_handles_missing_prog_id() {
         // Documents without a ProgID still surface the user_type.
         let body = build_compobj_body("Microsoft Word Document", None);
-        let cfb = build_cfb(&[
-            ("/WordDocument", b"x"),
-            ("/\x01CompObj", &body),
-        ]);
+        let cfb = build_cfb(&[("/WordDocument", b"x"), ("/\x01CompObj", &body)]);
         let (v, _) = run(&cfb);
         let co = v.get("office.compobj").and_then(|x| x.as_object()).unwrap();
         assert_eq!(
@@ -1111,10 +1095,7 @@ mod tests {
     #[test]
     fn compobj_parser_rejects_truncated_stream() {
         // Just the 4-byte header — too short to carry any strings.
-        let cfb = build_cfb(&[
-            ("/WordDocument", b"x"),
-            ("/\x01CompObj", &[0u8; 4]),
-        ]);
+        let cfb = build_cfb(&[("/WordDocument", b"x"), ("/\x01CompObj", &[0u8; 4])]);
         let (v, _) = run(&cfb);
         // No office.compobj emitted when the stream can't be parsed.
         assert!(v.get("office.compobj").is_none());
@@ -1123,10 +1104,7 @@ mod tests {
     #[test]
     fn iso8601_format_matches_known_unix_timestamp() {
         // 2024-01-15T08:00:00Z = 1_705_305_600
-        assert_eq!(
-            format_iso8601_utc(1_705_305_600),
-            "2024-01-15T08:00:00Z"
-        );
+        assert_eq!(format_iso8601_utc(1_705_305_600), "2024-01-15T08:00:00Z");
         // 1970-01-01T00:00:00Z = 0
         assert_eq!(format_iso8601_utc(0), "1970-01-01T00:00:00Z");
     }

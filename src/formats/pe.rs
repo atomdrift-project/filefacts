@@ -16,6 +16,7 @@ use serde_json::{json, Value as JsonValue};
 use crate::error::Error;
 use crate::formats::common::{
     extract_binary_strings, extract_utf16_strings, hex_encode, put_i64, put_str, put_u64,
+    rizin_fallback,
 };
 use crate::formats::goblin_safe;
 use crate::output::{Errors, Metrics, Section, Strings, Values};
@@ -30,6 +31,7 @@ pub(super) fn extract(
     sections_out: &mut Vec<Section>,
     imports_out: &mut crate::Imports,
     exports_out: &mut crate::Exports,
+    functions_out: &mut crate::Functions,
     errors_out: &mut Errors,
 ) -> Result<(), Error> {
     // PE strings are scattered across `.rdata`, `.data`, and resources.
@@ -68,6 +70,7 @@ pub(super) fn extract(
     }
     if let Some(pe) = parse_outcome.ok() {
         coff_header(&pe.header.coff_header, values);
+        dos_header(&pe.header, values);
         if let Some(ref opt) = pe.header.optional_header {
             optional_header(opt, values);
             binary_flags(opt, metrics);
@@ -75,7 +78,7 @@ pub(super) fn extract(
         sections(&pe, bytes, metrics, sections_out);
         imports(&pe, values, metrics, imports_out);
         exports(&pe, values, metrics, exports_out);
-        authenticode(&pe, bytes, values);
+        authenticode(&pe, bytes, values, metrics);
         if let Some(rd) = pe.resource_data.as_ref() {
             // The resource walker is lazy and slices with unchecked
             // header offsets — packed Windows malware regularly
@@ -86,6 +89,28 @@ pub(super) fn extract(
             let walk = goblin_safe::catch_infallible(|| {
                 resource_types(rd, values, metrics);
                 resource_timestamp(rd, values);
+                // Presence flags emitted authoritatively from the
+                // resource directory walker — distinct from whether
+                // the version/manifest extraction populated any
+                // downstream keys (which can be empty on malformed
+                // structures).
+                if rd.version_info.is_some() {
+                    metrics.insert("pe.has_version_info", 1.0);
+                }
+                if rd.manifest_data.is_some() {
+                    metrics.insert("pe.has_manifest", 1.0);
+                }
+                // Count icon entries — IMAGE_RESOURCE RT_ICON (3) +
+                // RT_GROUP_ICON (14) — separately so consumers can
+                // distinguish "icon presence" from total resource count.
+                let icon_count = rd
+                    .entries()
+                    .flatten()
+                    .filter(|e| matches!(e.id(), Some(3 | 14)))
+                    .count() as f64;
+                if icon_count > 0.0 {
+                    metrics.insert("pe.icon_count", icon_count);
+                }
                 if let Some(ref vi) = rd.version_info {
                     super::pe_version_info::extract(vi, values);
                 }
@@ -110,8 +135,12 @@ pub(super) fn extract(
         dos_stub_anomalies(&pe, bytes, metrics);
         checksum(&pe, bytes, metrics);
         aliased_exports(&pe, bytes, metrics);
+        clr_metadata(&pe, values);
+        data_directories(&pe, values);
+        super::pe_image_hash::extract(&pe, bytes, values, metrics);
         super::pe_rich::extract(bytes, values);
         super::build_toolchain::from_pe_rich(values);
+        rizin_fallback(bytes, imports_out, exports_out, functions_out, metrics);
         return Ok(());
     }
 
@@ -122,6 +151,7 @@ pub(super) fn extract(
     let header = goblin::pe::header::Header::parse(bytes)
         .map_err(|e| Error::malformed("pe", e.to_string()))?;
     coff_header(&header.coff_header, values);
+    dos_header(&header, values);
     if let Some(ref opt) = header.optional_header {
         optional_header(opt, values);
         binary_flags(opt, metrics);
@@ -145,17 +175,52 @@ fn coff_header(coff: &CoffHeader, values: &mut Values) {
     // `pe.subsystem` / `pe.image_base` is what every Windows security
     // analyst reads.
     put_str(values, "pe.machine", machine_string(coff.machine));
+    // Raw COFF machine + characteristics u16 values. Stable across
+    // PE revisions and what downstream code that needs to round-trip
+    // back to goblin's typed bitmasks looks at — distinct from the
+    // string-flag projections above.
+    put_u64(values, "pe.machine_id", u64::from(coff.machine));
+    put_u64(
+        values,
+        "pe.characteristics_raw",
+        u64::from(coff.characteristics),
+    );
     // PE's `TimeDateStamp` is a 32-bit Unix timestamp. Treat it as `i64`
     // for room beyond 2038 in case implementations decide to ignore the
     // signed/unsigned ambiguity. `sections.count` already exposes the
     // section count from a separate path; the COFF NumberOfSections
     // field would just duplicate it.
     put_i64(values, "pe.timestamp", i64::from(coff.time_date_stamp));
+    // COFF symbol-table pointer + entry count. Modern toolchains zero
+    // both (debug info goes to PDBs), so a non-zero pair flags an
+    // older or unusual build. Consumers compute `has_coff_symbols`
+    // from `pst != 0 && nst != 0`.
+    put_u64(
+        values,
+        "pe.coff.symbol_table_offset",
+        u64::from(coff.pointer_to_symbol_table),
+    );
+    put_u64(
+        values,
+        "pe.coff.number_of_symbol_table",
+        u64::from(coff.number_of_symbol_table),
+    );
     let characteristics: Vec<JsonValue> = coff_characteristics(coff.characteristics)
         .into_iter()
         .map(|s| JsonValue::String(s.into()))
         .collect();
     values.insert("pe.characteristics", JsonValue::Array(characteristics));
+}
+
+/// DOS-header fields downstream consumers need. Currently just
+/// `e_lfanew` (the offset to the PE signature) so cleave can locate
+/// the Rich Header region without re-parsing.
+fn dos_header(header: &goblin::pe::header::Header, values: &mut Values) {
+    put_u64(
+        values,
+        "pe.coff.dos_header_pe_pointer",
+        u64::from(header.dos_header.pe_pointer),
+    );
 }
 
 fn optional_header(opt: &OptionalHeader, values: &mut Values) {
@@ -191,6 +256,39 @@ fn optional_header(opt: &OptionalHeader, values: &mut Values) {
             windows.major_operating_system_version, windows.minor_operating_system_version
         ),
     );
+    // Raw optional-header u16/u32 fields. Cleave consumes the numeric
+    // forms; the string projections above are for human-facing tools.
+    put_u64(values, "pe.subsystem_raw", u64::from(windows.subsystem));
+    put_u64(
+        values,
+        "pe.dll_characteristics_raw",
+        u64::from(windows.dll_characteristics),
+    );
+    put_u64(
+        values,
+        "pe.file_alignment",
+        u64::from(windows.file_alignment),
+    );
+    put_u64(
+        values,
+        "pe.section_alignment",
+        u64::from(windows.section_alignment),
+    );
+    put_u64(
+        values,
+        "pe.linker_major_version",
+        u64::from(standard.major_linker_version),
+    );
+    put_u64(
+        values,
+        "pe.linker_minor_version",
+        u64::from(standard.minor_linker_version),
+    );
+    put_u64(
+        values,
+        "pe.number_of_rva_and_sizes",
+        u64::from(windows.number_of_rva_and_sizes),
+    );
     let dll_chars: Vec<JsonValue> = dll_characteristics(windows.dll_characteristics)
         .into_iter()
         .map(|s| JsonValue::String(s.into()))
@@ -215,6 +313,13 @@ fn sections(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics, sections_out: &mut
             let e = section_entropy(bytes, file_offset, file_size);
             metrics.insert(format!("sections[{idx}].entropy"), e);
         }
+        // Raw IMAGE_SCN_* characteristics bitmask — emitted positionally
+        // so downstream consumers can reconstruct the typed u32 without
+        // a reverse-lookup over the string-flag projection.
+        metrics.insert(
+            format!("sections[{idx}].characteristics"),
+            f64::from(section.characteristics),
+        );
         sections_out.push(Section {
             name,
             vaddr: u64::from(section.virtual_address),
@@ -385,6 +490,17 @@ fn exports(
     if forwarded_count > 0 {
         metrics.insert("pe.forwarded_export_count", f64::from(forwarded_count));
     }
+    // Export-directory timestamp lives inside IMAGE_EXPORT_DIRECTORY
+    // and is distinct from the COFF header's `pe.timestamp`. Supply-
+    // chain tampering sometimes rewrites one without touching the
+    // other, so emit it independently. Zero is a sentinel meaning
+    // "unset" — linkers can elect to leave it untouched.
+    if let Some(export_data) = &pe.export_data {
+        let ts = export_data.export_directory_table.time_date_stamp;
+        if ts != 0 {
+            put_i64(values, "pe.export_timestamp", i64::from(ts));
+        }
+    }
     values.insert("pe.exports", JsonValue::Array(names));
 }
 
@@ -420,7 +536,7 @@ fn authenticode_from_header(
     super::pe_authenticode::parse(&bytes[offset..offset + size], values);
 }
 
-fn authenticode(pe: &PE<'_>, bytes: &[u8], values: &mut Values) {
+fn authenticode(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     // The Authenticode signature lives in the Certificate Table data
     // directory (entry index 4 in the optional header). The
     // directory's `virtual_address` is a *file offset* for this entry
@@ -443,7 +559,13 @@ fn authenticode(pe: &PE<'_>, bytes: &[u8], values: &mut Values) {
     put_u64(values, "pe.cert_table_size", u64::from(dir.size));
     let offset = dir.virtual_address as usize;
     let size = dir.size as usize;
-    if offset.saturating_add(size) > bytes.len() {
+    // The security-directory virtual_address is supposed to be an
+    // in-file offset (PE/COFF spec carves an exception for the
+    // Certificate Table). When the bytes it points at fall outside
+    // the file, the header has been tampered with — emit a flag so
+    // downstream callers don't have to redo the bounds check.
+    if offset > 0 && offset.saturating_add(size) > bytes.len() {
+        metrics.insert("pe.security_directory_out_of_bounds", 1.0);
         return;
     }
     super::pe_authenticode::parse(&bytes[offset..offset + size], values);
@@ -602,14 +724,26 @@ fn resource_types(
     values: &mut Values,
     metrics: &mut Metrics,
 ) {
-    let mut names: Vec<JsonValue> = Vec::new();
+    // Resource count is the raw entry total — duplicates allowed.
+    let total = rd.entries().flatten().count() as f64;
+    metrics.insert("pe.resource_count", total);
+
+    // `pe.resource_types[]` is a *deduplicated, sorted by numeric id*
+    // list of canonical `RT_*` names. Sorting on the numeric id (not
+    // the string) keeps the ordering stable across rt_name's
+    // unknown-id fallback, which collapses many ids to "RT_UNKNOWN".
+    let mut type_ids: std::collections::BTreeSet<u16> =
+        std::collections::BTreeSet::new();
     for entry in rd.entries().flatten() {
         if let Some(id) = entry.id() {
-            names.push(JsonValue::String(rt_name(id).to_string()));
+            type_ids.insert(id);
         }
     }
-    metrics.insert("pe.resource_count", names.len() as f64);
-    if !names.is_empty() {
+    if !type_ids.is_empty() {
+        let names: Vec<JsonValue> = type_ids
+            .iter()
+            .map(|&id| JsonValue::String(rt_name(id).to_string()))
+            .collect();
         values.insert("pe.resource_types", JsonValue::Array(names));
     }
 }
@@ -770,6 +904,82 @@ fn bound_imports_inner(
 /// anti-analysis hook point (malware uses them to defeat
 /// breakpoint-on-entry debuggers). When a callback VA matches an
 /// export, the export name is included alongside the address.
+/// PE optional-header data directories — the 16-slot table that
+/// indexes the special directories (export, import, resource, …) by
+/// RVA + size. Emits non-zero slots as `pe.data_directories[]` so
+/// downstream consumers can drive lookups off canonical names rather
+/// than fixed indices.
+fn data_directories(pe: &PE<'_>, values: &mut Values) {
+    let Some(opt) = pe.header.optional_header.as_ref() else {
+        return;
+    };
+    // Index → canonical name from the PE/COFF spec
+    // (winnt.h IMAGE_DIRECTORY_ENTRY_*).
+    const NAMES: [&str; 16] = [
+        "export",
+        "import",
+        "resource",
+        "exception",
+        "certificate",
+        "base_relocation",
+        "debug",
+        "architecture",
+        "global_ptr",
+        "tls",
+        "load_config",
+        "bound_import",
+        "iat",
+        "delay_import",
+        "clr_runtime_header",
+        "reserved",
+    ];
+    let mut entries: Vec<JsonValue> = Vec::new();
+    for (idx, slot) in opt.data_directories.data_directories.iter().enumerate() {
+        let Some((_, dir)) = slot.as_ref() else {
+            continue;
+        };
+        if dir.virtual_address == 0 && dir.size == 0 {
+            continue;
+        }
+        let name = NAMES.get(idx).copied().unwrap_or("unknown");
+        entries.push(serde_json::json!({
+            "name": name,
+            "rva": dir.virtual_address,
+            "size": dir.size,
+        }));
+    }
+    if !entries.is_empty() {
+        values.insert("pe.data_directories", JsonValue::Array(entries));
+    }
+}
+
+/// .NET / CLR metadata extracted from the COR20 header. The presence
+/// of `pe.clr` (or any sub-key) IS the "is this a managed binary?"
+/// signal — distinct from PE Authenticode signing, which a managed
+/// binary may or may not carry.
+///
+/// Emits:
+/// - `pe.clr.runtime_version`  — `"<major>.<minor>"` runtime version string
+/// - `pe.clr.is_il_only`       — 1 when the COMIMAGE_FLAGS_ILONLY bit is set
+/// - `pe.clr.is_native_entrypoint` — 1 when COMIMAGE_FLAGS_NATIVE_ENTRYPOINT is set
+fn clr_metadata(pe: &PE<'_>, values: &mut Values) {
+    let Some(clr) = pe.clr_data.as_ref() else {
+        return;
+    };
+    let hdr = &clr.cor20_header;
+    crate::formats::common::put_str(
+        values,
+        "pe.clr.runtime_version",
+        format!("{}.{}", hdr.major_runtime_version, hdr.minor_runtime_version),
+    );
+    if hdr.is_il_only() {
+        crate::formats::common::put_u64(values, "pe.clr.is_il_only", 1);
+    }
+    if hdr.is_native_entrypoint() {
+        crate::formats::common::put_u64(values, "pe.clr.is_native_entrypoint", 1);
+    }
+}
+
 fn tls_callbacks(pe: &PE<'_>, values: &mut Values, metrics: &mut Metrics) {
     let Some(tls) = pe.tls_data.as_ref() else {
         return;
@@ -1176,24 +1386,55 @@ fn load_config(pe: &PE<'_>, values: &mut Values) {
     let Some(lc) = pe.load_config_data.as_ref() else {
         return;
     };
-    let Some(guard_flags) = lc.directory.guard_flags else {
-        return;
-    };
-    let names = guard_flag_names(guard_flags);
-    if names.is_empty() {
-        return;
-    }
+    let dir = &lc.directory;
     let mut obj = serde_json::Map::new();
-    obj.insert(
-        "guard_flags".into(),
-        JsonValue::Array(
-            names
-                .into_iter()
-                .map(|s| JsonValue::String(s.to_string()))
-                .collect(),
-        ),
-    );
-    values.insert("pe.load_config", JsonValue::Object(obj));
+    // Raw numeric fields land under canonical names. Each is Option<u64>
+    // in goblin — skip when None rather than emitting a zero, so trait
+    // authors can use `exists:` to discriminate "PE has a Load Config
+    // directory but no security_cookie field" from "field present and
+    // zero" (the latter is its own tampering signal: cleared cookie).
+    if let Some(v) = dir.security_cookie {
+        obj.insert("security_cookie".into(), JsonValue::Number(v.into()));
+    }
+    if let Some(v) = dir.guard_cf_check_function_pointer {
+        obj.insert(
+            "guard_cf_check_function_pointer".into(),
+            JsonValue::Number(v.into()),
+        );
+    }
+    if let Some(v) = dir.guard_cf_function_table {
+        obj.insert(
+            "guard_cf_function_table".into(),
+            JsonValue::Number(v.into()),
+        );
+    }
+    if let Some(v) = dir.guard_cf_function_count {
+        obj.insert(
+            "guard_cf_function_count".into(),
+            JsonValue::Number(v.into()),
+        );
+    }
+    if let Some(flags) = dir.guard_flags {
+        // Both forms: raw u32 (for round-trip parity with goblin's
+        // typed bitmask) and a string-flag array (for human-readable
+        // trait matches against `cf_instrumented` / `cfw_instrumented`).
+        obj.insert("guard_flags_raw".into(), JsonValue::Number(flags.into()));
+        let names = guard_flag_names(flags);
+        if !names.is_empty() {
+            obj.insert(
+                "guard_flags".into(),
+                JsonValue::Array(
+                    names
+                        .into_iter()
+                        .map(|s| JsonValue::String(s.to_string()))
+                        .collect(),
+                ),
+            );
+        }
+    }
+    if !obj.is_empty() {
+        values.insert("pe.load_config", JsonValue::Object(obj));
+    }
 }
 
 /// `IMAGE_GUARD_*` constants from `winnt.h`. Names follow the
@@ -1292,6 +1533,7 @@ mod tests {
         let mut sections = Vec::new();
         let mut imports = crate::Imports::new();
         let mut exports = crate::Exports::new();
+        let mut functions = crate::Functions::new();
         let mut errors = Errors::new();
         let _ = extract(
             bytes,
@@ -1301,6 +1543,7 @@ mod tests {
             &mut sections,
             &mut imports,
             &mut exports,
+            &mut functions,
             &mut errors,
         );
         (v, s, m)
@@ -1379,6 +1622,7 @@ mod tests {
         let mut sections = Vec::new();
         let mut imports = crate::Imports::new();
         let mut exports = crate::Exports::new();
+        let mut functions = crate::Functions::new();
         let mut errors = Errors::new();
         extract(
             &bytes,
@@ -1388,6 +1632,7 @@ mod tests {
             &mut sections,
             &mut imports,
             &mut exports,
+            &mut functions,
             &mut errors,
         )
         .unwrap();
@@ -1414,6 +1659,7 @@ mod tests {
         let mut sections = Vec::new();
         let mut imports = crate::Imports::new();
         let mut exports = crate::Exports::new();
+        let mut functions = crate::Functions::new();
         let mut errors = Errors::new();
         extract(
             &bytes,
@@ -1423,6 +1669,7 @@ mod tests {
             &mut sections,
             &mut imports,
             &mut exports,
+            &mut functions,
             &mut errors,
         )
         .unwrap();
@@ -1436,5 +1683,89 @@ mod tests {
                 "library stem should drop extension: {lib}",
             );
         }
+    }
+
+    /// A clean MSVC-produced PE keeps the canonical "This program
+    /// cannot be run in DOS mode" banner and a non-zero stub. The
+    /// emitter must NOT raise either anomaly flag.
+    #[test]
+    fn dos_stub_anomalies_silent_on_clean_pe() {
+        let bytes = read_fixture("test.exe");
+        let (_, _, m) = run(&bytes);
+        assert!(
+            m.get("pe.dos_stub_modified").is_none(),
+            "clean PE should not flag dos_stub_modified",
+        );
+        assert!(
+            m.get("pe.dos_stub_zeroed").is_none(),
+            "clean PE should not flag dos_stub_zeroed",
+        );
+    }
+
+    /// Rewrite the DOS stub region of a real PE with zeros and verify
+    /// the emitter raises both anomaly bits. The PE remains parseable
+    /// because we only touch bytes 0x40..pe_offset.
+    #[test]
+    fn dos_stub_anomalies_fires_on_zeroed_stub() {
+        let mut bytes = read_fixture("test.exe");
+        // e_lfanew lives at 0x3C..0x40 as a little-endian u32 — locates
+        // the PE header start, which is the upper bound of the stub
+        // region the anomaly detector inspects.
+        let pe_offset = u32::from_le_bytes([bytes[0x3c], bytes[0x3d], bytes[0x3e], bytes[0x3f]])
+            as usize;
+        assert!(pe_offset > 0x40, "fixture should have a stub region");
+        for b in bytes[0x40..pe_offset].iter_mut() {
+            *b = 0;
+        }
+        let (_, _, m) = run(&bytes);
+        assert!(
+            m.get("pe.dos_stub_modified").is_some(),
+            "zeroed stub should flag dos_stub_modified",
+        );
+        assert!(
+            m.get("pe.dos_stub_zeroed").is_some(),
+            "zeroed stub should flag dos_stub_zeroed",
+        );
+    }
+
+    /// Overwrite the canonical banner with garbage but keep the stub
+    /// non-zero — `dos_stub_modified` should fire, `dos_stub_zeroed`
+    /// must not.
+    #[test]
+    fn dos_stub_modified_without_zeroed() {
+        let mut bytes = read_fixture("test.exe");
+        let pe_offset = u32::from_le_bytes([bytes[0x3c], bytes[0x3d], bytes[0x3e], bytes[0x3f]])
+            as usize;
+        for b in bytes[0x40..pe_offset].iter_mut() {
+            *b = 0xab;
+        }
+        let (_, _, m) = run(&bytes);
+        assert!(
+            m.get("pe.dos_stub_modified").is_some(),
+            "missing canonical banner should flag dos_stub_modified",
+        );
+        assert!(
+            m.get("pe.dos_stub_zeroed").is_none(),
+            "non-zero garbage stub must NOT be flagged as zeroed",
+        );
+    }
+
+    /// `pe.rich.entries` is the flat-path under which the Rich Header
+    /// emitter writes the decoded CompID tuples. The fixture is an
+    /// MSVC-linked PE so it carries a Rich header; the array must be
+    /// present and non-empty.
+    #[test]
+    fn rich_entries_populated_on_msvc_pe() {
+        let bytes = read_fixture("test.exe");
+        let (v, _, _) = run(&bytes);
+        let entries = v
+            .get("pe.rich.entries")
+            .and_then(|x| x.as_array())
+            .expect("MSVC-built fixture should carry pe.rich.entries");
+        assert!(!entries.is_empty(), "rich entries should be non-empty");
+        // `pe.rich.hash` and `pe.rich.key` must also be present whenever
+        // entries are emitted — they're written in the same code path.
+        assert!(v.get("pe.rich.hash").is_some());
+        assert!(v.get("pe.rich.key").is_some());
     }
 }

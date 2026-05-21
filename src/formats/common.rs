@@ -190,6 +190,26 @@ pub(super) fn put_i64(values: &mut Values, path: &str, n: i64) {
 // numeric/string value) instead — never a bare boolean that mirrors
 // presence/absence.
 
+/// Run rizin recovery when the static parse produced an empty
+/// symbol/function table — the canonical "stripped binary" signal
+/// goblin can't recover from. Shared by PE / ELF / Mach-O extractors.
+/// No-op when rizin isn't on PATH or when goblin already populated
+/// at least one of the three typed views.
+pub(super) fn rizin_fallback(
+    bytes: &[u8],
+    imports: &mut crate::Imports,
+    exports: &mut crate::Exports,
+    functions: &mut crate::Functions,
+    metrics: &mut crate::output::Metrics,
+) {
+    if !imports.is_empty() || !exports.is_empty() || !functions.is_empty() {
+        return;
+    }
+    if let Some(recovery) = crate::rizin::recover(bytes) {
+        recovery.apply(imports, exports, functions, metrics);
+    }
+}
+
 /// Lowercase hex encoding of arbitrary bytes. Used wherever a hash
 /// digest or serial number needs a stable, comparable representation.
 pub(super) fn hex_encode(bytes: &[u8]) -> String {

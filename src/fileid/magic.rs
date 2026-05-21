@@ -32,11 +32,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // in — otherwise `._foo.php` gets analyzed as PHP, the binary
             // body trips entropy/obfuscation traits, and a benign Composer
             // tarball lights up at suspicious.
-            if data.len() >= 4
-                && data[1] == 0x05
-                && data[2] == 0x16
-                && data[3] == 0x07
-            {
+            if data.len() >= 4 && data[1] == 0x05 && data[2] == 0x16 && data[3] == 0x07 {
                 Some((FileType::Unknown, DetectionSource::Magic))
             } else {
                 None

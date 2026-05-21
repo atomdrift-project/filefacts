@@ -288,7 +288,12 @@ fn decode_string_literal(node: Node<'_>, source: &str) -> Option<String> {
     }
     let bytes = raw.as_bytes();
     let mut start = 0_usize;
-    while start < bytes.len() && matches!(bytes[start], b'b' | b'B' | b'r' | b'R' | b'f' | b'F' | b'u' | b'U') {
+    while start < bytes.len()
+        && matches!(
+            bytes[start],
+            b'b' | b'B' | b'r' | b'R' | b'f' | b'F' | b'u' | b'U'
+        )
+    {
         start += 1;
     }
     let mut end = bytes.len();
@@ -305,7 +310,9 @@ fn decode_string_literal(node: Node<'_>, source: &str) -> Option<String> {
     } else {
         return None;
     }
-    std::str::from_utf8(&bytes[start..end]).ok().map(str::to_string)
+    std::str::from_utf8(&bytes[start..end])
+        .ok()
+        .map(str::to_string)
 }
 
 /// Helper trait for nodes that lets us pull the operator text without

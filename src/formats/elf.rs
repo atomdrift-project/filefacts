@@ -9,7 +9,9 @@ use goblin::elf::{dynamic, header, program_header, Elf};
 use serde_json::Value as JsonValue;
 
 use crate::error::Error;
-use crate::formats::common::{extract_binary_strings, hex_encode, put_str, put_u64};
+use crate::formats::common::{
+    extract_binary_strings, hex_encode, put_str, put_u64, rizin_fallback,
+};
 use crate::formats::goblin_safe;
 use crate::output::{Errors, Metrics, Section, Strings, Values};
 use crate::scan::entropy;
@@ -23,6 +25,7 @@ pub(super) fn extract(
     sections_out: &mut Vec<Section>,
     imports_out: &mut crate::Imports,
     exports_out: &mut crate::Exports,
+    functions_out: &mut crate::Functions,
     errors_out: &mut Errors,
 ) -> Result<(), Error> {
     extract_binary_strings(bytes, strings);
@@ -66,6 +69,7 @@ pub(super) fn extract(
     dynamic_metrics(&elf, metrics);
     table_counts(&elf, metrics);
     segments(&elf, values);
+    rizin_fallback(bytes, imports_out, exports_out, functions_out, metrics);
     linker_family(values);
     super::build_toolchain::from_elf(values, sections_out, bytes);
 
@@ -1171,6 +1175,7 @@ mod tests {
         let mut sections = Vec::new();
         let mut imports = crate::Imports::new();
         let mut exports = crate::Exports::new();
+        let mut functions = crate::Functions::new();
         let mut errors = Errors::new();
         // Ignore the Result — most negative-path tests pass malformed
         // bytes and we only care that extract returns without panic.
@@ -1182,6 +1187,7 @@ mod tests {
             &mut sections,
             &mut imports,
             &mut exports,
+            &mut functions,
             &mut errors,
         );
         (v, s, m)

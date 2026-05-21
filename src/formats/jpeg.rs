@@ -274,11 +274,19 @@ fn parse_exif_app1(tiff: &[u8], st: &mut JpegState) {
 fn walk_ifd(tiff: &[u8], off: usize, little: bool, st: &mut JpegState, is_root: bool) {
     let read_u16 = |o: usize| -> Option<u16> {
         let b = tiff.get(o..o + 2)?.try_into().ok()?;
-        Some(if little { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) })
+        Some(if little {
+            u16::from_le_bytes(b)
+        } else {
+            u16::from_be_bytes(b)
+        })
     };
     let read_u32 = |o: usize| -> Option<u32> {
         let b = tiff.get(o..o + 4)?.try_into().ok()?;
-        Some(if little { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) })
+        Some(if little {
+            u32::from_le_bytes(b)
+        } else {
+            u32::from_be_bytes(b)
+        })
     };
     let count = match read_u16(off) {
         Some(c) => c as usize,
@@ -386,7 +394,10 @@ mod tests {
     fn surfaces_comment() {
         let jpeg = build_jpeg(&[(0xFE, b"hello world".to_vec())]);
         let (v, m) = run(&jpeg);
-        assert_eq!(v.get("jpeg.comment").and_then(|x| x.as_str()), Some("hello world"));
+        assert_eq!(
+            v.get("jpeg.comment").and_then(|x| x.as_str()),
+            Some("hello world")
+        );
         assert_eq!(m.get("jpeg.com_count"), Some(1.0));
     }
 

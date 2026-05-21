@@ -14,8 +14,8 @@ use crate::output::Values;
 /// content's top-level keys (when the root is an object) or wrap the
 /// non-object root under `value` (when it isn't).
 pub(super) fn extract_json(bytes: &[u8], values: &mut Values) -> Result<(), Error> {
-    let parsed: JsonValue = serde_json::from_slice(bytes)
-        .map_err(|e| Error::malformed("json", e.to_string()))?;
+    let parsed: JsonValue =
+        serde_json::from_slice(bytes).map_err(|e| Error::malformed("json", e.to_string()))?;
     promote_root(parsed, values);
     Ok(())
 }
@@ -24,8 +24,8 @@ pub(super) fn extract_json(bytes: &[u8], values: &mut Values) -> Result<(), Erro
 /// document only — multi-document semantics aren't well-defined for the
 /// single-tree `Values` view.
 pub(super) fn extract_yaml(bytes: &[u8], values: &mut Values) -> Result<(), Error> {
-    let parsed: serde_yaml::Value = serde_yaml::from_slice(bytes)
-        .map_err(|e| Error::malformed("yaml", e.to_string()))?;
+    let parsed: serde_yaml::Value =
+        serde_yaml::from_slice(bytes).map_err(|e| Error::malformed("yaml", e.to_string()))?;
     let json = yaml_to_json(parsed);
     promote_root(json, values);
     Ok(())
@@ -35,8 +35,9 @@ pub(super) fn extract_yaml(bytes: &[u8], values: &mut Values) -> Result<(), Erro
 pub(super) fn extract_toml(bytes: &[u8], values: &mut Values) -> Result<(), Error> {
     let text = std::str::from_utf8(bytes)
         .map_err(|e| Error::malformed("toml", format!("input is not utf-8: {e}")))?;
-    let parsed: toml::Value =
-        text.parse().map_err(|e: toml::de::Error| Error::malformed("toml", e.to_string()))?;
+    let parsed: toml::Value = text
+        .parse()
+        .map_err(|e: toml::de::Error| Error::malformed("toml", e.to_string()))?;
     let json = toml_to_json(parsed);
     promote_root(json, values);
     Ok(())
@@ -45,8 +46,8 @@ pub(super) fn extract_toml(bytes: &[u8], values: &mut Values) -> Result<(), Erro
 /// Parse the bytes as an Apple Property List (XML or binary form).
 pub(super) fn extract_plist(bytes: &[u8], values: &mut Values) -> Result<(), Error> {
     let cursor = std::io::Cursor::new(bytes);
-    let parsed: plist::Value = plist::Value::from_reader(cursor)
-        .map_err(|e| Error::malformed("plist", e.to_string()))?;
+    let parsed: plist::Value =
+        plist::Value::from_reader(cursor).map_err(|e| Error::malformed("plist", e.to_string()))?;
     let json = plist_to_json(parsed);
     promote_root(json, values);
     Ok(())
@@ -165,7 +166,10 @@ fn yaml_key_to_string(v: serde_yaml::Value) -> String {
         Y::Bool(b) => b.to_string(),
         Y::Number(n) => n.to_string(),
         Y::Null => "null".to_string(),
-        other => serde_yaml::to_string(&other).unwrap_or_default().trim().to_string(),
+        other => serde_yaml::to_string(&other)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
     }
 }
 
@@ -174,9 +178,7 @@ fn toml_to_json(value: toml::Value) -> JsonValue {
     match value {
         T::String(s) => JsonValue::String(s),
         T::Integer(i) => JsonValue::Number(i.into()),
-        T::Float(f) => {
-            serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
-        }
+        T::Float(f) => serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number),
         T::Boolean(b) => JsonValue::Bool(b),
         T::Datetime(dt) => JsonValue::String(dt.to_string()),
         T::Array(arr) => JsonValue::Array(arr.into_iter().map(toml_to_json).collect()),
@@ -199,9 +201,7 @@ fn plist_to_json(value: plist::Value) -> JsonValue {
             .map(|n| JsonValue::Number(n.into()))
             .or_else(|| i.as_unsigned().map(|u| JsonValue::Number(u.into())))
             .unwrap_or(JsonValue::Null),
-        P::Real(f) => {
-            serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
-        }
+        P::Real(f) => serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number),
         P::Boolean(b) => JsonValue::Bool(b),
         P::Date(d) => JsonValue::String(format!("{d:?}")),
         P::Data(bytes) => JsonValue::String(base64_encode(&bytes)),
@@ -222,12 +222,12 @@ fn plist_to_json(value: plist::Value) -> JsonValue {
 /// Minimal base64 encoder for plist `Data` blobs. We don't depend on the
 /// `base64` crate for one tiny encoding path.
 fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= bytes.len() {
-        let n = (u32::from(bytes[i]) << 16) | (u32::from(bytes[i + 1]) << 8) | u32::from(bytes[i + 2]);
+        let n =
+            (u32::from(bytes[i]) << 16) | (u32::from(bytes[i + 1]) << 8) | u32::from(bytes[i + 2]);
         out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
         out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
         out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
@@ -284,10 +284,7 @@ mod tests {
     fn toml_basic() {
         let mut v = Values::new();
         extract_toml(b"[package]\nname = \"x\"\n", &mut v).unwrap();
-        assert_eq!(
-            v.get("package.name").and_then(|x| x.as_str()),
-            Some("x")
-        );
+        assert_eq!(v.get("package.name").and_then(|x| x.as_str()), Some("x"));
     }
 
     #[test]

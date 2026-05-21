@@ -107,14 +107,24 @@ pub(super) fn extract(
     if !flags.is_empty() {
         header.insert(
             "flags".into(),
-            JsonValue::Array(flags.into_iter().map(|s| JsonValue::String(s.into())).collect()),
+            JsonValue::Array(
+                flags
+                    .into_iter()
+                    .map(|s| JsonValue::String(s.into()))
+                    .collect(),
+            ),
         );
     }
     let attrs = decode_file_attributes(file_attributes);
     if !attrs.is_empty() {
         header.insert(
             "file_attributes".into(),
-            JsonValue::Array(attrs.into_iter().map(|s| JsonValue::String(s.into())).collect()),
+            JsonValue::Array(
+                attrs
+                    .into_iter()
+                    .map(|s| JsonValue::String(s.into()))
+                    .collect(),
+            ),
         );
     }
     values.insert("lnk.header", JsonValue::Object(header));
@@ -266,7 +276,12 @@ pub(super) fn extract(
     if !blocks.is_empty() {
         values.insert(
             "lnk.blocks",
-            JsonValue::Array(blocks.into_iter().map(|s| JsonValue::String(s.into())).collect()),
+            JsonValue::Array(
+                blocks
+                    .into_iter()
+                    .map(|s| JsonValue::String(s.into()))
+                    .collect(),
+            ),
         );
     }
     metrics.insert("lnk.file_size", f64::from(file_size));
@@ -341,9 +356,15 @@ fn format_hotkey(v: u16) -> String {
     let key = (v & 0xFF) as u8;
     let mods = (v >> 8) as u8;
     let mut parts: Vec<&str> = Vec::new();
-    if mods & 0x01 != 0 { parts.push("shift"); }
-    if mods & 0x02 != 0 { parts.push("ctrl"); }
-    if mods & 0x04 != 0 { parts.push("alt"); }
+    if mods & 0x01 != 0 {
+        parts.push("shift");
+    }
+    if mods & 0x02 != 0 {
+        parts.push("ctrl");
+    }
+    if mods & 0x04 != 0 {
+        parts.push("alt");
+    }
     let key_name = match key {
         0x30..=0x39 => format!("{}", (key - 0x30) as char),
         0x41..=0x5A => format!("{}", key as char),
@@ -361,49 +382,125 @@ fn format_hotkey(v: u16) -> String {
 
 fn decode_link_flags(v: u32) -> Vec<&'static str> {
     let mut out = Vec::new();
-    if v & FLAG_HAS_LINK_TARGET_ID_LIST != 0 { out.push("has_link_target_id_list"); }
-    if v & FLAG_HAS_LINK_INFO != 0 { out.push("has_link_info"); }
-    if v & FLAG_HAS_NAME != 0 { out.push("has_name"); }
-    if v & FLAG_HAS_RELATIVE_PATH != 0 { out.push("has_relative_path"); }
-    if v & FLAG_HAS_WORKING_DIR != 0 { out.push("has_working_dir"); }
-    if v & FLAG_HAS_ARGUMENTS != 0 { out.push("has_arguments"); }
-    if v & FLAG_HAS_ICON_LOCATION != 0 { out.push("has_icon_location"); }
-    if v & FLAG_IS_UNICODE != 0 { out.push("is_unicode"); }
-    if v & 0x0000_0100 != 0 { out.push("force_no_link_info"); }
-    if v & 0x0000_0200 != 0 { out.push("has_exp_string"); }
-    if v & 0x0000_0400 != 0 { out.push("run_in_separate_process"); }
-    if v & 0x0000_1000 != 0 { out.push("has_darwin_id"); }
-    if v & 0x0000_2000 != 0 { out.push("run_as_user"); }
-    if v & 0x0000_4000 != 0 { out.push("has_exp_icon"); }
-    if v & 0x0000_8000 != 0 { out.push("no_pidl_alias"); }
-    if v & 0x0002_0000 != 0 { out.push("run_with_shim_layer"); }
-    if v & 0x0004_0000 != 0 { out.push("force_no_link_track"); }
-    if v & 0x0008_0000 != 0 { out.push("enable_target_metadata"); }
-    if v & 0x0010_0000 != 0 { out.push("disable_link_path_tracking"); }
-    if v & 0x0020_0000 != 0 { out.push("disable_known_folder_tracking"); }
-    if v & 0x0040_0000 != 0 { out.push("disable_known_folder_alias"); }
-    if v & 0x0080_0000 != 0 { out.push("allow_link_to_link"); }
-    if v & 0x0100_0000 != 0 { out.push("unalias_on_save"); }
-    if v & 0x0200_0000 != 0 { out.push("prefer_environment_path"); }
-    if v & 0x0400_0000 != 0 { out.push("keep_local_id_list_for_unc_target"); }
+    if v & FLAG_HAS_LINK_TARGET_ID_LIST != 0 {
+        out.push("has_link_target_id_list");
+    }
+    if v & FLAG_HAS_LINK_INFO != 0 {
+        out.push("has_link_info");
+    }
+    if v & FLAG_HAS_NAME != 0 {
+        out.push("has_name");
+    }
+    if v & FLAG_HAS_RELATIVE_PATH != 0 {
+        out.push("has_relative_path");
+    }
+    if v & FLAG_HAS_WORKING_DIR != 0 {
+        out.push("has_working_dir");
+    }
+    if v & FLAG_HAS_ARGUMENTS != 0 {
+        out.push("has_arguments");
+    }
+    if v & FLAG_HAS_ICON_LOCATION != 0 {
+        out.push("has_icon_location");
+    }
+    if v & FLAG_IS_UNICODE != 0 {
+        out.push("is_unicode");
+    }
+    if v & 0x0000_0100 != 0 {
+        out.push("force_no_link_info");
+    }
+    if v & 0x0000_0200 != 0 {
+        out.push("has_exp_string");
+    }
+    if v & 0x0000_0400 != 0 {
+        out.push("run_in_separate_process");
+    }
+    if v & 0x0000_1000 != 0 {
+        out.push("has_darwin_id");
+    }
+    if v & 0x0000_2000 != 0 {
+        out.push("run_as_user");
+    }
+    if v & 0x0000_4000 != 0 {
+        out.push("has_exp_icon");
+    }
+    if v & 0x0000_8000 != 0 {
+        out.push("no_pidl_alias");
+    }
+    if v & 0x0002_0000 != 0 {
+        out.push("run_with_shim_layer");
+    }
+    if v & 0x0004_0000 != 0 {
+        out.push("force_no_link_track");
+    }
+    if v & 0x0008_0000 != 0 {
+        out.push("enable_target_metadata");
+    }
+    if v & 0x0010_0000 != 0 {
+        out.push("disable_link_path_tracking");
+    }
+    if v & 0x0020_0000 != 0 {
+        out.push("disable_known_folder_tracking");
+    }
+    if v & 0x0040_0000 != 0 {
+        out.push("disable_known_folder_alias");
+    }
+    if v & 0x0080_0000 != 0 {
+        out.push("allow_link_to_link");
+    }
+    if v & 0x0100_0000 != 0 {
+        out.push("unalias_on_save");
+    }
+    if v & 0x0200_0000 != 0 {
+        out.push("prefer_environment_path");
+    }
+    if v & 0x0400_0000 != 0 {
+        out.push("keep_local_id_list_for_unc_target");
+    }
     out
 }
 
 fn decode_file_attributes(v: u32) -> Vec<&'static str> {
     let mut out = Vec::new();
-    if v & 0x0001 != 0 { out.push("readonly"); }
-    if v & 0x0002 != 0 { out.push("hidden"); }
-    if v & 0x0004 != 0 { out.push("system"); }
-    if v & 0x0010 != 0 { out.push("directory"); }
-    if v & 0x0020 != 0 { out.push("archive"); }
-    if v & 0x0080 != 0 { out.push("normal"); }
-    if v & 0x0100 != 0 { out.push("temporary"); }
-    if v & 0x0200 != 0 { out.push("sparse"); }
-    if v & 0x0400 != 0 { out.push("reparse_point"); }
-    if v & 0x0800 != 0 { out.push("compressed"); }
-    if v & 0x1000 != 0 { out.push("offline"); }
-    if v & 0x2000 != 0 { out.push("not_content_indexed"); }
-    if v & 0x4000 != 0 { out.push("encrypted"); }
+    if v & 0x0001 != 0 {
+        out.push("readonly");
+    }
+    if v & 0x0002 != 0 {
+        out.push("hidden");
+    }
+    if v & 0x0004 != 0 {
+        out.push("system");
+    }
+    if v & 0x0010 != 0 {
+        out.push("directory");
+    }
+    if v & 0x0020 != 0 {
+        out.push("archive");
+    }
+    if v & 0x0080 != 0 {
+        out.push("normal");
+    }
+    if v & 0x0100 != 0 {
+        out.push("temporary");
+    }
+    if v & 0x0200 != 0 {
+        out.push("sparse");
+    }
+    if v & 0x0400 != 0 {
+        out.push("reparse_point");
+    }
+    if v & 0x0800 != 0 {
+        out.push("compressed");
+    }
+    if v & 0x1000 != 0 {
+        out.push("offline");
+    }
+    if v & 0x2000 != 0 {
+        out.push("not_content_indexed");
+    }
+    if v & 0x4000 != 0 {
+        out.push("encrypted");
+    }
     out
 }
 
@@ -468,7 +565,8 @@ fn read_ansi_or_unicode_pair(
     ansi_len: usize,
     uni_len: usize,
 ) -> Option<String> {
-    read_utf16le_string(block, uni_off, uni_len).or_else(|| read_fixed_ansi(block, ansi_off, ansi_len))
+    read_utf16le_string(block, uni_off, uni_len)
+        .or_else(|| read_fixed_ansi(block, ansi_off, ansi_len))
 }
 
 /// Decode a GUID stored as little-endian Data1/Data2/Data3 + raw
@@ -789,7 +887,9 @@ fn parse_filesystem_item(item: &[u8]) -> Option<String> {
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
-    bytes.get(offset..offset + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+    bytes
+        .get(offset..offset + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
 }
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     bytes
@@ -802,9 +902,9 @@ fn read_i32(bytes: &[u8], offset: usize) -> Option<i32> {
         .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
-    bytes.get(offset..offset + 8).map(|b| {
-        u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-    })
+    bytes
+        .get(offset..offset + 8)
+        .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
 }
 
 #[cfg(test)]
@@ -815,7 +915,10 @@ mod tests {
         let mut h = vec![0u8; 76];
         h[..4].copy_from_slice(&0x0000_004Cu32.to_le_bytes());
         // CLSID (16 bytes from offset 4) — exact value doesn't matter for our parse
-        h[4] = 0x01; h[5] = 0x14; h[6] = 0x02; h[7] = 0x00;
+        h[4] = 0x01;
+        h[5] = 0x14;
+        h[6] = 0x02;
+        h[7] = 0x00;
         h[20..24].copy_from_slice(&link_flags.to_le_bytes());
         h[24..28].copy_from_slice(&file_attrs.to_le_bytes());
         h[52..56].copy_from_slice(&0x1234u32.to_le_bytes());
@@ -842,12 +945,18 @@ mod tests {
         let lnk = header_bytes(FLAG_HAS_LINK_TARGET_ID_LIST | FLAG_IS_UNICODE, 0x0020, 3);
         let (v, _) = run(&lnk);
         let header = v.get("lnk.header").and_then(|x| x.as_object()).unwrap();
-        assert_eq!(header.get("show_command").and_then(|x| x.as_str()), Some("maximized"));
+        assert_eq!(
+            header.get("show_command").and_then(|x| x.as_str()),
+            Some("maximized")
+        );
         let flags = header.get("flags").and_then(|x| x.as_array()).unwrap();
         let names: Vec<&str> = flags.iter().filter_map(|x| x.as_str()).collect();
         assert!(names.contains(&"has_link_target_id_list"));
         assert!(names.contains(&"is_unicode"));
-        let attrs = header.get("file_attributes").and_then(|x| x.as_array()).unwrap();
+        let attrs = header
+            .get("file_attributes")
+            .and_then(|x| x.as_array())
+            .unwrap();
         let attr_names: Vec<&str> = attrs.iter().filter_map(|x| x.as_str()).collect();
         assert!(attr_names.contains(&"archive"));
     }
@@ -886,13 +995,13 @@ mod tests {
         block.extend_from_slice(&machine);
         // Volume Droid GUID
         block.extend_from_slice(&[
-            0x12, 0x34, 0x56, 0x78, 0xAA, 0xBB, 0xCC, 0xDD,
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            0x12, 0x34, 0x56, 0x78, 0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88,
         ]);
         // File Droid GUID (last 6 bytes encode the MAC)
         block.extend_from_slice(&[
-            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0x66, 0x77,
         ]);
         // Block was declared as 96 bytes total; pad if needed.
         while block.len() < 96 {
@@ -904,7 +1013,10 @@ mod tests {
 
         let (v, _) = run(&lnk);
         let tracker = v.get("lnk.tracker").and_then(|x| x.as_object()).unwrap();
-        assert_eq!(tracker.get("machine_id").and_then(|x| x.as_str()), Some("build-host-01"));
+        assert_eq!(
+            tracker.get("machine_id").and_then(|x| x.as_str()),
+            Some("build-host-01")
+        );
         let mac = tracker.get("mac_address").and_then(|x| x.as_str()).unwrap();
         assert_eq!(mac, "22:33:44:55:66:77");
         let blocks = v.get("lnk.blocks").and_then(|x| x.as_array()).unwrap();
@@ -1030,8 +1142,14 @@ mod tests {
         lnk.extend_from_slice(&info);
         let (v, _) = run(&lnk);
         let vol = v.get("lnk.volume").and_then(|x| x.as_object()).unwrap();
-        assert_eq!(vol.get("drive_type").and_then(|x| x.as_str()), Some("fixed"));
-        assert_eq!(vol.get("serial").and_then(|x| x.as_u64()), Some(0xDEAD_BEEF));
+        assert_eq!(
+            vol.get("drive_type").and_then(|x| x.as_str()),
+            Some("fixed")
+        );
+        assert_eq!(
+            vol.get("serial").and_then(|x| x.as_u64()),
+            Some(0xDEAD_BEEF)
+        );
         assert_eq!(vol.get("name").and_then(|x| x.as_str()), Some("System"));
         assert_eq!(
             v.get("lnk.target_path").and_then(|x| x.as_str()),
@@ -1042,13 +1160,8 @@ mod tests {
     #[test]
     fn link_info_with_path_suffix_concatenates() {
         let mut lnk = header_bytes(FLAG_HAS_LINK_INFO, 0x20, 1);
-        let info = build_link_info_with_local_path(
-            3,
-            0,
-            "",
-            "C:\\Users\\victim",
-            "\\Desktop\\target.exe",
-        );
+        let info =
+            build_link_info_with_local_path(3, 0, "", "C:\\Users\\victim", "\\Desktop\\target.exe");
         lnk.extend_from_slice(&info);
         let (v, _) = run(&lnk);
         assert_eq!(

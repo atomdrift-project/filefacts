@@ -299,9 +299,7 @@ fn plist_to_json(value: plist::Value) -> JsonValue {
             .map(|n| JsonValue::Number(n.into()))
             .or_else(|| i.as_unsigned().map(|u| JsonValue::Number(u.into())))
             .unwrap_or(JsonValue::Null),
-        P::Real(f) => {
-            serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
-        }
+        P::Real(f) => serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number),
         P::Boolean(b) => JsonValue::Bool(b),
         P::Date(d) => JsonValue::String(format!("{d:?}")),
         P::Array(arr) => JsonValue::Array(arr.into_iter().map(plist_to_json).collect()),
@@ -410,5 +408,4 @@ mod tests {
         let buf = [0x01, 0x02, 0x03, 0x04];
         assert_eq!(read_u32_be(&buf, 0), 0x0102_0304);
     }
-
 }
