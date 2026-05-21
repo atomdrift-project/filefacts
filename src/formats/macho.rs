@@ -99,6 +99,12 @@ fn fat_binary(
             "cpu_subtype": macho.header.cpusubtype(),
             "file_type": file_type_string(macho.header.filetype),
             "libraries": macho.libs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+            // File-offset extent for this arch slice within the fat
+            // wrapper. Consumers walking per-arch byte ranges (e.g.
+            // cleave's preferred_arch_range / all_arch_ranges) read
+            // these instead of re-parsing the fat header.
+            "file_offset": arch.offset,
+            "file_size": arch.size,
         }));
         if idx == 0 {
             single_arch(
