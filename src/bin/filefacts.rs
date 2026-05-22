@@ -719,9 +719,9 @@ fn format_metric_value(key: &str, value: &Value) -> String {
                 || key.ends_with("error_count")
             {
                 fg(FG_NUM, &(raw as u64).to_string())
-            } else if key.ends_with("_ratio") || key.ends_with("_pct") {
-                fg(FG_NUM, &format!("{raw:.3}"))
-            } else if key.ends_with("entropy")
+            } else if key.ends_with("_ratio")
+                || key.ends_with("_pct")
+                || key.ends_with("entropy")
                 || key.ends_with("_entropy")
                 || key.ends_with("entropy_mean")
                 || key.ends_with("entropy_max")
@@ -755,8 +755,8 @@ fn render_strings(value: &Value) -> String {
     let counts: Vec<String> = categories
         .iter()
         .map(|(k, v)| {
-            let n = v.as_array().map(Vec::len).unwrap_or(0);
-            format!("{} {}", fg(FG_LABEL, k), fg(FG_NUM, &n.to_string()),)
+            let n = v.as_array().map_or(0, Vec::len);
+            format!("{} {}", fg(FG_LABEL, k), fg(FG_NUM, &n.to_string()))
         })
         .collect();
     if !counts.is_empty() {
@@ -781,8 +781,7 @@ fn render_strings(value: &Value) -> String {
             let offset = obj
                 .get("offset")
                 .and_then(Value::as_u64)
-                .map(|o| format!("0x{o:08x}"))
-                .unwrap_or_else(|| "        ".into());
+                .map_or_else(|| "        ".into(), |o| format!("0x{o:08x}"));
             let text = obj.get("text").and_then(Value::as_str).unwrap_or("");
             let mut tags = Vec::<String>::new();
             if let Some(section) = obj.get("section").and_then(Value::as_str) {
@@ -1113,8 +1112,7 @@ fn render_exports(value: &Value) -> String {
         let offset = obj
             .get("offset")
             .and_then(Value::as_u64)
-            .map(|n| format!("0x{n:x}"))
-            .unwrap_or_else(|| "·".into());
+            .map_or_else(|| "·".into(), |n| format!("0x{n:x}"));
         let mut tail = Vec::<String>::new();
         if let Some(o) = obj.get("ordinal").and_then(Value::as_u64) {
             tail.push(dim(&format!("#{o}")));
@@ -1167,8 +1165,7 @@ fn render_functions(value: &Value) -> String {
         let offset = obj
             .get("offset")
             .and_then(Value::as_u64)
-            .map(|n| format!("0x{n:x}"))
-            .unwrap_or_else(|| "·".into());
+            .map_or_else(|| "·".into(), |n| format!("0x{n:x}"));
         let mut tail = Vec::<String>::new();
         if let Some(k) = obj.get("kind").and_then(Value::as_str) {
             tail.push(dim(k));
@@ -1299,8 +1296,7 @@ fn render_ast(value: &Value) -> String {
                 let target = obj
                     .get("target")
                     .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| "·".into());
+                    .map_or_else(|| "·".into(), str::to_string);
                 let args = obj
                     .get("args")
                     .and_then(Value::as_array)

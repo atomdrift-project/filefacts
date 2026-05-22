@@ -238,12 +238,12 @@ Start-Process powershell -ArgumentList "-nop", "-w hidden"
 
 #[test]
 fn typed_fact_views_are_not_mirrored_in_values() {
-    let source = br#"
+    let source = br"
         import fs from 'fs';
         class Runner {}
         function main() { return 'ok'; }
         fetch('https://example.com');
-    "#;
+    ";
     let parsed = open_with_path(std::path::Path::new("sample.js"), source).unwrap();
 
     assert!(

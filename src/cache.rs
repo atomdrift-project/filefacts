@@ -137,7 +137,11 @@ pub fn prune_old_versions() {
     let Some(root) = cache_root() else {
         return;
     };
-    let Ok(entries) = fs::read_dir(&root) else {
+    prune_old_versions_in(&root);
+}
+
+fn prune_old_versions_in(root: &std::path::Path) {
+    let Ok(entries) = fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
@@ -269,35 +273,15 @@ mod tests {
 
     #[test]
     fn prune_old_versions_removes_lower_versions() {
-        // Create a synthetic `v0` directory next to the live one and
-        // confirm prune removes it. Use a private temp root via
-        // XDG_CACHE_HOME so this test doesn't fight the real cache.
+        // Create a synthetic `v0` directory in a private temp root and
+        // confirm prune removes it without mutating process-global env.
         let tmp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: setting an env var is not thread-safe but the cache
-        // root is read on every call, so isolating via env on a
-        // per-test temp is fine for serial tests. If this becomes
-        // flaky under parallel runs, switch to a `version_dir` param.
-        let prev = std::env::var_os("XDG_CACHE_HOME");
-        // SAFETY: same caveat as above.
-        // SAFETY-justified env mutation kept tightly scoped.
-        unsafe {
-            std::env::set_var("XDG_CACHE_HOME", tmp.path());
-        }
-        let root = cache_root().expect("cache root with overridden XDG_CACHE_HOME");
-        let old = root.join("v0");
+        let old = tmp.path().join("v0");
         fs::create_dir_all(&old).expect("create v0");
         let canary = old.join("canary");
         fs::write(&canary, b"old").expect("write canary");
         assert!(canary.exists());
-        prune_old_versions();
+        prune_old_versions_in(tmp.path());
         assert!(!canary.exists(), "v0 canary should be removed");
-        // Restore env.
-        // SAFETY: same caveat.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
-                None => std::env::remove_var("XDG_CACHE_HOME"),
-            }
-        }
     }
 }

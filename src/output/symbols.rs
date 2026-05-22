@@ -377,7 +377,7 @@ mod tests {
         funcs.push(Function {
             name: "sub_401000".into(),
             source: "pe",
-            offset: Some(0x401000),
+            offset: Some(0x0040_1000),
             kind: None,
             ..Function::default()
         });

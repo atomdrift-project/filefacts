@@ -435,7 +435,7 @@ fn apply_unix_hardening(cmd: &mut Command) {
                 // `kill_all_rizin_groups`.
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
             }
-            libc::setrlimit(libc::RLIMIT_DATA, &limit);
+            libc::setrlimit(libc::RLIMIT_DATA, &raw const limit);
             Ok(())
         });
     }

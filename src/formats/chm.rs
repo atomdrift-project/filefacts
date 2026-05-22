@@ -623,7 +623,7 @@ mod tests {
         buf[0x48..0x50].copy_from_slice(&0u64.to_le_bytes());
         buf[0x50..0x58].copy_from_slice(&0u64.to_le_bytes());
         buf[0x58..0x60].copy_from_slice(&0u64.to_le_bytes());
-        let (v, m) = run(&buf);
+        let (v, _m) = run(&buf);
         let itsf = v.get("chm.itsf").and_then(|x| x.as_object()).unwrap();
         assert_eq!(itsf.get("version").and_then(|x| x.as_u64()), Some(3));
         assert_eq!(itsf.get("lcid").and_then(|x| x.as_u64()), Some(0x0409));
