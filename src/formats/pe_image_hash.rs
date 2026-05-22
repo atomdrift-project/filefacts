@@ -334,10 +334,14 @@ mod tests {
         let optional_header_offset = pe_offset + 4 + 20;
         let checksum_offset = match opt.standard_fields.magic {
             MAGIC_32 => {
-                optional_header_offset + SIZEOF_STANDARD_FIELDS_32 + OFFSET_WINDOWS_FIELDS_32_CHECKSUM
+                optional_header_offset
+                    + SIZEOF_STANDARD_FIELDS_32
+                    + OFFSET_WINDOWS_FIELDS_32_CHECKSUM
             }
             MAGIC_64 => {
-                optional_header_offset + SIZEOF_STANDARD_FIELDS_64 + OFFSET_WINDOWS_FIELDS_64_CHECKSUM
+                optional_header_offset
+                    + SIZEOF_STANDARD_FIELDS_64
+                    + OFFSET_WINDOWS_FIELDS_64_CHECKSUM
             }
             _ => panic!("unsupported magic"),
         };

@@ -65,6 +65,14 @@ roxmltree = "0.21"
 # reaching through `zip`'s public re-exports.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
+# Image decoders — used only to compute pixel-statistic metrics
+# (per-channel entropy, edge density, histogram flatness) that power
+# steganography detection. Decode is best-effort: structural marker /
+# chunk metadata is always emitted, pixel stats are skipped silently
+# on decode failure or oversize inputs.
+jpeg-decoder = "0.3"
+png = "0.17"
+
 # Structured-format parsers.
 serde_yaml = "0.9"
 toml = "0.8"
@@ -104,6 +112,28 @@ sha2 = { version = "0.10", features = ["oid"] }
 sha1 = { version = "0.10", features = ["oid"] }
 md-5 = "0.10"
 
+# Structured logging — used by rizin subprocess statistics emission.
+tracing = "0.1"
+
+# Disk cache — zstd-compressed bincode blobs keyed by sha256.
+zstd = "0.13"
+bincode = "1"
+
+# OS cache directory lookup — `~/.cache/expose` (Linux) / `Library/Caches`
+# (macOS) / `%LOCALAPPDATA%` (Windows).
+dirs = "5"
+
+# Temp file handling for rizin input materialisation. The existing rizin
+# integration was using std::env::temp_dir manually; `tempfile` cleans
+# up properly on Drop and avoids races.
+tempfile = "3"
+
+# Process group / RLIMIT / PR_SET_PDEATHSIG hooks for the hardened
+# rizin subprocess. Unix only — the gates in `rizin.rs` are
+# `#[cfg(unix)]`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Snapshot-test framework used by per-format fixture tests.
 insta = { version = "1", features = ["json"] }
@@ -112,7 +142,11 @@ insta = { version = "1", features = ["json"] }
 default = []
 
 [lints.rust]
-unsafe_code = "forbid"
+# rizin subprocess hardening (libc::setrlimit pre_exec, libc::kill on the
+# rizin process group, prctl PR_SET_PDEATHSIG on Linux) requires `unsafe`.
+# These are tightly scoped to the rizin module and gated #[cfg(unix)];
+# every other path stays unsafe-free.
+unsafe_code = "warn"
 missing_docs = "warn"
 unreachable_pub = "warn"
 unused_must_use = "warn"

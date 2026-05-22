@@ -155,28 +155,36 @@ pub(super) fn extract(
     // `/Type /Name` style counts — each is the number of object
     // dictionaries whose `/Type` key is the named role. Matches
     // both whitespace-separated and joined-token forms emitted by
-    // various PDF producers.
-    let counts: &[(&str, &str, Option<&str>)] = &[
-        ("page_count", "/Page", Some("pdf.page_count")),
-        ("annotation_count", "/Annot", Some("pdf.annotation_count")),
-        ("xobject_count", "/XObject", Some("pdf.xobject_count")),
-        ("font_count", "/Font", Some("pdf.font_count")),
-        ("metadata_count", "/Metadata", None),
-        ("objstm_count", "/ObjStm", None),
-        ("xref_stream_count", "/XRef", None),
+    // various PDF producers. Every count is mirrored into the flat
+    // metric map so trait rules resolve `field: pdf.<count>`
+    // without a kv round-trip.
+    let counts: &[(&str, &str, &str)] = &[
+        ("page_count", "/Page", "pdf.page_count"),
+        ("annotation_count", "/Annot", "pdf.annotation_count"),
+        ("xobject_count", "/XObject", "pdf.xobject_count"),
+        ("font_count", "/Font", "pdf.font_count"),
+        ("metadata_count", "/Metadata", "pdf.metadata_count"),
+        ("objstm_count", "/ObjStm", "pdf.objstm_count"),
+        ("xref_stream_count", "/XRef", "pdf.xref_stream_count"),
         (
             "signature_object_count",
             "/Sig",
-            Some("pdf.signature_object_count"),
+            "pdf.signature_object_count",
         ),
     ];
+    let mut page_count_value: u32 = 0;
+    let mut annotation_count_value: u32 = 0;
     for (kv_key, name, metric_key) in counts {
         let c = count_type_occurrences(bytes, name.as_bytes());
         if c > 0 {
             shape.insert((*kv_key).into(), json!(c));
-            if let Some(mk) = metric_key {
-                metrics.insert((*mk).to_string(), c as f64);
-            }
+            metrics.insert((*metric_key).to_string(), c as f64);
+        }
+        if *kv_key == "page_count" {
+            page_count_value = c as u32;
+        }
+        if *kv_key == "annotation_count" {
+            annotation_count_value = c as u32;
         }
     }
     let byte_range_count = count_substring(bytes, b"/ByteRange");
@@ -192,6 +200,25 @@ pub(super) fn extract(
     let three_d = count_substring(bytes, b"/Subtype /3D") + count_substring(bytes, b"/Subtype/3D");
     if three_d > 0 {
         shape.insert("three_d_object_count".into(), json!(three_d));
+        metrics.insert("pdf.three_d_object_count", three_d as f64);
+    }
+    // `visible_object_count` — objects recovered from the linear
+    // byte scan (not from object-stream expansion). Equal to
+    // `pdf.object_count` since this extractor does not yet decode
+    // ObjStm entries into the dict-region list. Surfacing both
+    // keys keeps the trait field schema stable and lets a future
+    // ObjStm expansion bump `object_count` without rewriting rules.
+    metrics.insert(
+        "pdf.visible_object_count",
+        obj_count.min(endobj_count) as f64,
+    );
+    // Trailing bytes after the *last* `%%EOF` marker — a common
+    // padding pattern in malicious PDFs that smuggle a payload past
+    // the parser. Counted relative to the last EOF only; multiple
+    // EOFs are normal in incrementally-updated documents.
+    let trailing_bytes = trailing_bytes_after_last_eof(bytes);
+    if trailing_bytes > 0 {
+        metrics.insert("pdf.trailing_bytes_after_eof", trailing_bytes as f64);
     }
     if !shape.is_empty() {
         values.insert("pdf.shape", JsonValue::Object(shape));
@@ -225,9 +252,20 @@ pub(super) fn extract(
     // parser. The `kind` and `snippet` fields stay accurate.
     let dict_regions = collect_dict_regions(bytes);
     let actions = scan_actions(bytes, &dict_regions);
+    let uri_action_count = action_count_by_kind(&actions, "uri");
+    let javascript_action_count = action_count_by_kind(&actions, "javascript");
     if !actions.is_empty() {
         metrics.insert("pdf.action_count", actions.len() as f64);
         values.insert("pdf.actions", JsonValue::Array(actions));
+    }
+    if javascript_action_count > 0 {
+        metrics.insert(
+            "pdf.javascript_action_count",
+            f64::from(javascript_action_count),
+        );
+    }
+    if uri_action_count > 0 {
+        metrics.insert("pdf.uri_action_count", f64::from(uri_action_count));
     }
 
     // Embedded files — `{filename, size}` per `/Type /Filespec`
@@ -283,9 +321,63 @@ pub(super) fn extract(
     // is set. Used by trait rules detecting staged JavaScript or
     // recognizable form authoring fingerprints.
     let form_fields = scan_form_fields(bytes, &dict_regions);
+    if !form_fields.is_empty() {
+        metrics.insert("pdf.form_field_count", form_fields.len() as f64);
+    }
     derive_form_field_metrics(&form_fields, metrics);
     if !form_fields.is_empty() {
         values.insert("pdf.form_fields", JsonValue::Array(form_fields));
+    }
+
+    // Per-page ratios — number of annotations / URI actions per
+    // page. Surfacing these as derived metrics keeps trait rules
+    // shape-agnostic: a one-page PDF with 30 URI annotations and a
+    // thirty-page PDF with one URI annotation per page produce the
+    // same `uri_actions_per_page = 1.0` rather than two unrelated
+    // raw counts. Zero pages → zero ratio (rather than NaN).
+    if page_count_value > 0 {
+        metrics.insert(
+            "pdf.annotations_per_page",
+            f64::from(annotation_count_value) / f64::from(page_count_value),
+        );
+        if uri_action_count > 0 {
+            metrics.insert(
+                "pdf.uri_actions_per_page",
+                f64::from(uri_action_count) / f64::from(page_count_value),
+            );
+        }
+    }
+
+    // Object stream inner-object count — the number of indirect
+    // objects packed into `/Type /ObjStm` streams. Each ObjStm
+    // carries an `/N` count plus a header table of `(id, offset)`
+    // pairs; we sum `/N` across every ObjStm we can locate (no
+    // decompression needed, the count is a dict field).
+    let obj_stream_inner = scan_object_stream_inner_count(bytes, &dict_regions);
+    if obj_stream_inner > 0 {
+        metrics.insert(
+            "pdf.object_stream_inner_object_count",
+            f64::from(obj_stream_inner),
+        );
+    }
+
+    // Unreferenced object count — objects whose id never appears
+    // as the target of an `<id> <gen> R` reference. Pure-orphan
+    // counts are a structural shape indicator (legitimate PDFs
+    // generally reference all their objects through the catalog
+    // graph).
+    let unreferenced = unreferenced_object_count(bytes, &dict_regions);
+    if unreferenced > 0 {
+        metrics.insert("pdf.unreferenced_object_count", f64::from(unreferenced));
+    }
+
+    // Unusual filters — JBIG2, LZW, and Crypt. Each pulls in a
+    // historically exploitable decoder path (CVE-2010-1297 et al).
+    // Counts the number of objects with at least one unusual
+    // filter in the chain, not the number of filter declarations.
+    let unusual = streams_with_unusual_filter_count(bytes, &dict_regions);
+    if unusual > 0 {
+        metrics.insert("pdf.streams_with_unusual_filter_count", f64::from(unusual));
     }
 
     // Phase 1B derived metrics — formerly computed by cleave's
@@ -894,6 +986,159 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Count action entries from `scan_actions` whose `kind` matches.
+/// Used to surface `pdf.javascript_action_count` and
+/// `pdf.uri_action_count` from the same action table the kv view
+/// emits — single source of truth, no separate substring scan.
+fn action_count_by_kind(actions: &[JsonValue], kind: &str) -> u32 {
+    actions
+        .iter()
+        .filter(|a| {
+            a.as_object()
+                .and_then(|o| o.get("kind"))
+                .and_then(JsonValue::as_str)
+                == Some(kind)
+        })
+        .count() as u32
+}
+
+/// Trailing bytes after the *last* `%%EOF` marker. Malicious PDFs
+/// commonly append a payload past the canonical end marker; this
+/// surfaces the length of that tail so trait rules can flag it.
+fn trailing_bytes_after_last_eof(bytes: &[u8]) -> usize {
+    let needle = b"%%EOF";
+    let mut last_end = None;
+    let mut cursor = 0;
+    while cursor + needle.len() <= bytes.len() {
+        let Some(rel) = bytes[cursor..]
+            .windows(needle.len())
+            .position(|w| w == needle)
+        else {
+            break;
+        };
+        let abs = cursor + rel;
+        last_end = Some(abs + needle.len());
+        cursor = abs + needle.len();
+    }
+    last_end
+        .map(|end| bytes.len().saturating_sub(end))
+        .unwrap_or(0)
+}
+
+/// Sum the declared `/N` count across every `/Type /ObjStm` object
+/// stream. An object stream packs multiple indirect objects into a
+/// single compressed body; `/N` is the spec-mandated header field
+/// stating how many objects live inside. We trust the declared
+/// count rather than decompressing because the count is a
+/// trait-shape indicator and decompression is expensive.
+fn scan_object_stream_inner_count(bytes: &[u8], dict_regions: &[DictRegion]) -> u32 {
+    let mut total: u32 = 0;
+    for region in dict_regions {
+        if region.end <= region.start {
+            continue;
+        }
+        let dict = &bytes[region.start..region.end];
+        let is_objstm =
+            contains_substring(dict, b"/Type /ObjStm") || contains_substring(dict, b"/Type/ObjStm");
+        if !is_objstm {
+            continue;
+        }
+        if let Some(n_text) = find_info_value(dict, b"/N") {
+            if let Ok(n) = n_text.trim().parse::<u32>() {
+                total = total.saturating_add(n);
+            }
+        }
+    }
+    total
+}
+
+/// Count object ids that are never referenced from any dict in the
+/// document. Walks every dict for `<id> <gen> R` triples and
+/// subtracts the reference set from the id set. Pure-orphan objects
+/// don't participate in the catalog graph — a structural anomaly.
+fn unreferenced_object_count(bytes: &[u8], dict_regions: &[DictRegion]) -> u32 {
+    use std::collections::BTreeSet;
+    let mut ids: BTreeSet<u32> = BTreeSet::new();
+    let mut refs: BTreeSet<u32> = BTreeSet::new();
+    for region in dict_regions {
+        if let Some(id) = region.obj_id {
+            ids.insert(id);
+        }
+        let dict = &bytes[region.start..region.end];
+        collect_indirect_refs(dict, &mut refs);
+    }
+    if ids.is_empty() {
+        return 0;
+    }
+    ids.difference(&refs).count() as u32
+}
+
+/// Scan an arbitrary byte slice for `<id> <gen> R` indirect-ref
+/// tokens and record the referenced ids. Array brackets and other
+/// delimiters are treated as token separators so `[2 0 R]` and
+/// `12 0 R` both contribute.
+fn collect_indirect_refs(slice: &[u8], refs: &mut std::collections::BTreeSet<u32>) {
+    let text = String::from_utf8_lossy(slice);
+    // Treat any non-ASCII-alphanumeric byte as a separator. PDF
+    // delimiter characters (`[`, `]`, `<`, `>`, `(`, `)`, `/`) all
+    // split tokens, as does whitespace. The `R` ref marker is a
+    // single ASCII char that survives this split intact.
+    let tokens: Vec<&str> = text
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+    for window in tokens.windows(3) {
+        if window[2] == "R" {
+            if let Ok(id) = window[0].parse::<u32>() {
+                refs.insert(id);
+            }
+        }
+    }
+}
+
+/// Count objects whose stream filter chain includes a historically
+/// exploitable decoder (JBIG2, LZW, Crypt). One match per object —
+/// chains with multiple unusual filters still count once, so the
+/// metric tracks "number of streams that pull in a risky decoder"
+/// rather than the raw filter-name occurrence count.
+fn streams_with_unusual_filter_count(bytes: &[u8], dict_regions: &[DictRegion]) -> u32 {
+    let mut count: u32 = 0;
+    for region in dict_regions {
+        if region.stream_range.is_none() {
+            continue;
+        }
+        let dict = &bytes[region.start..region.end];
+        let Some(chain) = find_filter_in_dict(dict) else {
+            continue;
+        };
+        if chain
+            .split(',')
+            .any(|f| matches!(f, "JBIG2Decode" | "JBIG2" | "LZWDecode" | "LZW" | "Crypt"))
+        {
+            count = count.saturating_add(1);
+        }
+    }
+    count
+}
+
+/// Locate the `/Filter` value inside a dict slice. Returns the
+/// comma-joined chain (single name or array form). Used by the
+/// unusual-filter sweep so we don't repeat `scan_filter_chains`'s
+/// dedup-aware walk for this dictionary-local check.
+fn find_filter_in_dict(dict: &[u8]) -> Option<String> {
+    let mut p = 0;
+    while p + 7 <= dict.len() {
+        let rel = dict[p..].windows(7).position(|w| w == b"/Filter")?;
+        let after = p + rel + 7;
+        if dict.get(after).is_some_and(|b| b.is_ascii_alphabetic()) {
+            p = after;
+            continue;
+        }
+        return read_filter_value(dict, after);
+    }
+    None
+}
+
 /// Scan for `/Type /Filespec` records and return each
 /// `(filename, size?)` pair. `filename` comes from `/UF` (Unicode)
 /// when present, falling back to `/F` (legacy). `size` is the
@@ -1442,6 +1687,7 @@ fn rects_overlap(a: [f64; 4], b: [f64; 4]) -> bool {
 /// `stream` and the body).
 fn derive_stream_metrics(bytes: &[u8], dict_regions: &[DictRegion], metrics: &mut Metrics) {
     let mut missing_length = 0_u32;
+    let mut invalid_length = 0_u32;
     let mut missing_endstream = 0_u32;
     let mut length_mismatch = 0_u32;
     let mut bad_delimiter = 0_u32;
@@ -1451,10 +1697,21 @@ fn derive_stream_metrics(bytes: &[u8], dict_regions: &[DictRegion], metrics: &mu
             continue;
         };
         let dict = &bytes[region.start..region.end];
-        let length_text = find_info_value(dict, b"/Length");
-        let declared: Option<u64> = length_text.and_then(|t| t.parse().ok());
-        if declared.is_none() {
-            missing_length = missing_length.saturating_add(1);
+        // Distinguish three `/Length` states for stream telemetry:
+        //   - key absent → missing_length
+        //   - present but non-numeric and not an indirect ref →
+        //     invalid_length (malformed value, common in
+        //     adversarial PDFs)
+        //   - direct numeric → drives length_mismatch detection
+        //   - indirect ref (`N N R`) → treated as declared but
+        //     unresolvable; skipped for mismatch
+        let length_classification = classify_stream_length(dict);
+        let mut declared: Option<u64> = None;
+        match length_classification {
+            LengthValue::Missing => missing_length = missing_length.saturating_add(1),
+            LengthValue::Invalid => invalid_length = invalid_length.saturating_add(1),
+            LengthValue::Indirect => {}
+            LengthValue::Direct(n) => declared = Some(n),
         }
         let actual = (body_end - body_start) as u64;
         if let Some(d) = declared {
@@ -1487,6 +1744,7 @@ fn derive_stream_metrics(bytes: &[u8], dict_regions: &[DictRegion], metrics: &mu
         }
     }
     metrics.insert("pdf.stream_missing_length_count", f64::from(missing_length));
+    metrics.insert("pdf.stream_invalid_length_count", f64::from(invalid_length));
     metrics.insert(
         "pdf.stream_missing_endstream_count",
         f64::from(missing_endstream),
@@ -1496,6 +1754,73 @@ fn derive_stream_metrics(bytes: &[u8], dict_regions: &[DictRegion], metrics: &mu
         f64::from(length_mismatch),
     );
     metrics.insert("pdf.stream_bad_delimiter_count", f64::from(bad_delimiter));
+}
+
+/// Classification of a stream dictionary's `/Length` value.
+///
+/// The PDF spec allows three concrete shapes — direct numeric,
+/// indirect reference, or absent — and adversarial inputs add a
+/// fourth (junk). `derive_stream_metrics` consumes all four to
+/// emit the `stream_*_length_count` family without re-walking the
+/// dict bytes.
+#[derive(Debug)]
+enum LengthValue {
+    Missing,
+    Invalid,
+    Indirect,
+    Direct(u64),
+}
+
+/// Inspect a stream dict for its `/Length` value and classify it.
+fn classify_stream_length(dict: &[u8]) -> LengthValue {
+    let key = b"/Length";
+    let mut cursor = 0;
+    while cursor + key.len() <= dict.len() {
+        let Some(rel) = dict[cursor..].windows(key.len()).position(|w| w == key) else {
+            return LengthValue::Missing;
+        };
+        let pos = cursor + rel;
+        let after = pos + key.len();
+        // Reject suffix collisions: `/LengthBytes`, `/Length1` (font
+        // subset metadata) — both are valid name characters after the
+        // key.
+        match dict.get(after).copied() {
+            Some(b) if is_name_char(b) => {
+                cursor = after;
+                continue;
+            }
+            None => return LengthValue::Missing,
+            _ => {}
+        }
+        // Capture the run of non-delimiter bytes up to the next
+        // `/` or `>>` boundary. Whitespace is permitted (indirect
+        // refs span three whitespace-separated tokens).
+        let mut end = after;
+        while end < dict.len() {
+            match dict[end] {
+                b'/' | b'<' | b'>' | b'[' | b']' => break,
+                _ => end += 1,
+            }
+        }
+        let value = std::str::from_utf8(&dict[after..end]).unwrap_or("").trim();
+        if value.is_empty() {
+            return LengthValue::Missing;
+        }
+        if let Ok(n) = value.parse::<u64>() {
+            return LengthValue::Direct(n);
+        }
+        // Indirect ref: `<id> <gen> R` — three whitespace tokens.
+        let parts: Vec<&str> = value.split_whitespace().collect();
+        if parts.len() == 3
+            && parts[0].parse::<u32>().is_ok()
+            && parts[1].parse::<u32>().is_ok()
+            && parts[2] == "R"
+        {
+            return LengthValue::Indirect;
+        }
+        return LengthValue::Invalid;
+    }
+    LengthValue::Missing
 }
 
 /// Composite "how dangerous does this PDF look?" score, 0-100.
@@ -1788,6 +2113,175 @@ mod tests {
         let (_v, _m) = extract_pdf(pdf);
         // Just confirm we don't panic; correctness of recovery is
         // best-effort.
+    }
+
+    // ------------------------------------------------------------------
+    // Metrics ported from cleave's pdf_kv module
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn javascript_and_uri_action_counts_split() {
+        let pdf = b"%PDF-1.7\n\
+1 0 obj << /S /JavaScript /JS (a) >> endobj\n\
+2 0 obj << /S /JavaScript /JS (b) >> endobj\n\
+3 0 obj << /S /URI /URI (https://example.invalid) >> endobj\n\
+%%EOF";
+        let (_, m) = extract_pdf(pdf);
+        assert_eq!(m.get("pdf.javascript_action_count"), Some(2.0));
+        assert_eq!(m.get("pdf.uri_action_count"), Some(1.0));
+    }
+
+    #[test]
+    fn metadata_and_objstm_counts_emitted() {
+        let pdf = b"%PDF-1.7\n\
+1 0 obj << /Type /Metadata /Length 0 >> endobj\n\
+2 0 obj << /Type /ObjStm /N 3 /First 0 /Length 0 >> stream\nendstream endobj\n\
+3 0 obj << /Type /XRef /Length 0 >> stream\nendstream endobj\n\
+%%EOF";
+        let (_, m) = extract_pdf(pdf);
+        assert_eq!(m.get("pdf.metadata_count"), Some(1.0));
+        assert_eq!(m.get("pdf.objstm_count"), Some(1.0));
+        assert_eq!(m.get("pdf.xref_stream_count"), Some(1.0));
+        assert_eq!(m.get("pdf.object_stream_inner_object_count"), Some(3.0));
+    }
+
+    #[test]
+    fn three_d_object_count_emitted() {
+        let pdf =
+            b"%PDF-1.7\n1 0 obj << /Subtype /3D /Type /Annot >> endobj\n2 0 obj << /Subtype/3D >> endobj\n%%EOF";
+        let (_, m) = extract_pdf(pdf);
+        assert!(m.get("pdf.three_d_object_count").unwrap() >= 2.0);
+    }
+
+    #[test]
+    fn trailing_bytes_after_eof_counted() {
+        // `\n` + `GARBAGE_TAIL_PAYLOAD` (20 bytes) = 21 trailing bytes.
+        let pdf = b"%PDF-1.7\n%%EOF\nGARBAGE_TAIL_PAYLOAD";
+        let (_, m) = extract_pdf(pdf);
+        assert_eq!(m.get("pdf.trailing_bytes_after_eof"), Some(21.0));
+    }
+
+    #[test]
+    fn annotations_per_page_ratio() {
+        // 2 pages, 4 annotations → 2.0 annotations/page.
+        let pdf = b"%PDF-1.7\n\
+1 0 obj << /Type /Page >> endobj\n\
+2 0 obj << /Type /Page >> endobj\n\
+3 0 obj << /Type /Annot >> endobj\n\
+4 0 obj << /Type /Annot >> endobj\n\
+5 0 obj << /Type /Annot >> endobj\n\
+6 0 obj << /Type /Annot >> endobj\n\
+%%EOF";
+        let (_, m) = extract_pdf(pdf);
+        assert_eq!(m.get("pdf.annotations_per_page"), Some(2.0));
+    }
+
+    #[test]
+    fn uri_actions_per_page_ratio() {
+        let pdf = b"%PDF-1.7\n\
+1 0 obj << /Type /Page >> endobj\n\
+2 0 obj << /S /URI /URI (https://a.invalid) >> endobj\n\
+3 0 obj << /S /URI /URI (https://b.invalid) >> endobj\n\
+%%EOF";
+        let (_, m) = extract_pdf(pdf);
+        assert_eq!(m.get("pdf.uri_actions_per_page"), Some(2.0));
+    }
+
+    #[test]
+    fn unreferenced_object_count_reported() {
+        // Three objects, none referenced from any other dict.
+        let pdf = b"%PDF-1.7\n\
+1 0 obj << /Type /Page >> endobj\n\
+2 0 obj << /Type /Annot >> endobj\n\
+3 0 obj << /Type /Font >> endobj\n\
+%%EOF";
+        let (_, m) = extract_pdf(pdf);
+        assert!(m.get("pdf.unreferenced_object_count").unwrap() >= 3.0);
+    }
+
+    #[test]
+    fn unreferenced_objects_drop_when_referenced() {
+        // Object 2 is referenced from object 1's /Kids array.
+        let pdf = b"%PDF-1.7\n\
+1 0 obj << /Type /Pages /Kids [2 0 R] >> endobj\n\
+2 0 obj << /Type /Page >> endobj\n\
+%%EOF";
+        let (_, m) = extract_pdf(pdf);
+        // Only object 1 is unreferenced (no /Root ref scan here).
+        assert_eq!(m.get("pdf.unreferenced_object_count"), Some(1.0));
+    }
+
+    #[test]
+    fn unusual_filter_count_jbig2() {
+        let pdf = b"%PDF-1.7\n\
+1 0 obj << /Filter /JBIG2Decode /Length 0 >> stream\nendstream endobj\n\
+2 0 obj << /Filter /FlateDecode /Length 0 >> stream\nendstream endobj\n\
+%%EOF";
+        let (_, m) = extract_pdf(pdf);
+        assert_eq!(m.get("pdf.streams_with_unusual_filter_count"), Some(1.0));
+    }
+
+    #[test]
+    fn stream_invalid_length_counted() {
+        // `/Length not_a_number` — neither decimal nor indirect ref.
+        let pdf = b"%PDF-1.7\n1 0 obj << /Length junk >> stream\nXYZ\nendstream endobj\n%%EOF";
+        let (_, m) = extract_pdf(pdf);
+        assert_eq!(m.get("pdf.stream_invalid_length_count"), Some(1.0));
+    }
+
+    #[test]
+    fn form_field_count_reported() {
+        let pdf = b"%PDF-1.7\n\
+1 0 obj << /Subtype /Widget /T (a) /FT /Tx /Rect [0 0 1 1] >> endobj\n\
+2 0 obj << /Subtype /Widget /T (b) /FT /Tx /Rect [0 0 1 1] >> endobj\n\
+%%EOF";
+        let (_, m) = extract_pdf(pdf);
+        assert_eq!(m.get("pdf.form_field_count"), Some(2.0));
+    }
+
+    #[test]
+    fn visible_object_count_mirrors_object_count() {
+        let pdf = b"%PDF-1.7\n\
+1 0 obj << >> endobj\n\
+2 0 obj << >> endobj\n\
+%%EOF";
+        let (_, m) = extract_pdf(pdf);
+        let oc = m.get("pdf.object_count").unwrap();
+        assert_eq!(m.get("pdf.visible_object_count"), Some(oc));
+    }
+
+    #[test]
+    fn known_fixture_emits_expected_metric_keys() {
+        // Lock the per-format metric surface against drift. If a
+        // metric is renamed or removed this assertion fires.
+        let pdf = b"%PDF-1.7\n\
+1 0 obj << /Type /Catalog /OpenAction 2 0 R /AcroForm << /XFA 3 0 R >> >> endobj\n\
+2 0 obj << /Type /Action /S /JavaScript /JS (app.alert\\(1\\)) >> endobj\n\
+3 0 obj << /Type /Font >> endobj\n\
+4 0 obj << /Type /Page >> endobj\n\
+5 0 obj << /Type /Annot /Subtype /Widget /T (n) /FT /Tx /Rect [0 0 1 1] /V (v) >> endobj\n\
+6 0 obj << /Type /ObjStm /N 2 /First 0 /Length 0 >> stream\nendstream endobj\n\
+%%EOF";
+        let (_, m) = extract_pdf(pdf);
+        let want: &[&str] = &[
+            "pdf.action_count",
+            "pdf.annotation_count",
+            "pdf.eof_count",
+            "pdf.font_count",
+            "pdf.form_field_count",
+            "pdf.header_count",
+            "pdf.javascript_action_count",
+            "pdf.object_count",
+            "pdf.object_stream_inner_object_count",
+            "pdf.objstm_count",
+            "pdf.page_count",
+            "pdf.risky_feature_score",
+            "pdf.stream_count",
+            "pdf.visible_object_count",
+        ];
+        for key in want {
+            assert!(m.get(key).is_some(), "missing metric: {key}");
+        }
     }
 
     #[test]

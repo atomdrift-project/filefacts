@@ -60,6 +60,7 @@ pub(super) fn extract_binary_strings(bytes: &[u8], strings: &mut Strings) {
             method: stng_method_label(s.method).map(str::to_string),
             kind: s.kind.map(stng_kind_label).map(str::to_string),
             section: s.section,
+            ..ExtractedString::default()
         };
         if is_utf16 {
             strings.utf16le.push(entry);
@@ -205,8 +206,64 @@ pub(super) fn rizin_fallback(
     if !imports.is_empty() || !exports.is_empty() || !functions.is_empty() {
         return;
     }
-    if let Some(recovery) = crate::rizin::recover(bytes) {
+    if let Some(recovery) = crate::rizin_impl::recover(bytes) {
         recovery.apply(imports, exports, functions, metrics);
+    }
+}
+
+/// Extended rizin fallback for PE: tries to recover sections as well
+/// as imports / exports / functions, and emits `*.rizin_recovered_*`
+/// metrics under the supplied prefix so callers can attribute the
+/// recovered counts in trait rules. Returns the number of entries
+/// rizin contributed to each view.
+///
+/// The caller passes the metric prefix (`"pe"`, `"elf"`, `"macho"`)
+/// so the emitted keys are `{prefix}.rizin_recovered_sections` etc.
+pub(super) fn rizin_fallback_with_sections(
+    bytes: &[u8],
+    imports: &mut crate::Imports,
+    exports: &mut crate::Exports,
+    functions: &mut crate::Functions,
+    sections: &mut Vec<crate::output::Section>,
+    metrics: &mut crate::output::Metrics,
+    metric_prefix: &str,
+) {
+    // Skip the spawn entirely when every view goblin owns is already
+    // populated. Sections are the new "fillable" view; if goblin gave
+    // us at least one of imports/exports/functions/sections we still
+    // run rizin only if sections are empty AND the symbol views are
+    // empty — matching cleave's historical "all four empty → run
+    // rizin" gate.
+    if !imports.is_empty() || !exports.is_empty() || !functions.is_empty() || !sections.is_empty() {
+        return;
+    }
+    let Some(recovery) = crate::rizin_impl::recover(bytes) else {
+        return;
+    };
+    let counts = recovery.apply_with_sections(imports, exports, functions, sections, metrics);
+    if counts.imports > 0 {
+        metrics.insert(
+            format!("{metric_prefix}.rizin_recovered_imports"),
+            f64::from(counts.imports),
+        );
+    }
+    if counts.exports > 0 {
+        metrics.insert(
+            format!("{metric_prefix}.rizin_recovered_exports"),
+            f64::from(counts.exports),
+        );
+    }
+    if counts.functions > 0 {
+        metrics.insert(
+            format!("{metric_prefix}.rizin_recovered_functions"),
+            f64::from(counts.functions),
+        );
+    }
+    if counts.sections > 0 {
+        metrics.insert(
+            format!("{metric_prefix}.rizin_recovered_sections"),
+            f64::from(counts.sections),
+        );
     }
 }
 

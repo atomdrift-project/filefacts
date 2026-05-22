@@ -55,6 +55,41 @@ pub struct ExtractedString {
     /// scans.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub section: Option<String>,
+    /// Virtual address — set when the extractor knew the loaded
+    /// image's layout (rizin's `izj` output). `None` for byte-level
+    /// scans that only know the file offset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vaddr: Option<u64>,
+    /// Physical / file offset reported by the extractor. Distinct
+    /// from `offset` (which is always the byte position in the input
+    /// slice) only when an extractor labels positions in a layout
+    /// the slice itself doesn't expose — e.g. rizin's `paddr` for a
+    /// string discovered inside a packed section the byte-level scan
+    /// didn't reach.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paddr: Option<u64>,
+    /// Encoding label as rizin / the extractor reports it
+    /// (`"ascii"`, `"utf8"`, `"utf16le"`, `"utf32le"`, …). Distinct
+    /// from `category`, which is expose's coarse technique
+    /// classification. `None` for category-only entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+}
+
+impl Default for ExtractedString {
+    fn default() -> Self {
+        Self {
+            category: StringCategory::Ascii,
+            text: String::new(),
+            offset: 0,
+            method: None,
+            kind: None,
+            section: None,
+            vaddr: None,
+            paddr: None,
+            encoding: None,
+        }
+    }
 }
 
 /// Collection of strings extracted from a file.

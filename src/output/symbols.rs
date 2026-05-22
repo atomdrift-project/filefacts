@@ -106,6 +106,16 @@ pub struct Export {
 /// (with ordinal / RVA from the export table) and a `Function`
 /// (with the entry address). VBA `Public Sub` similarly surfaces in
 /// both.
+///
+/// Per-function CFG fields (`complexity`, `basic_blocks`, `edges`,
+/// `instructions`, `stack_frame`, `recursive`, `noreturn`, `is_linear`,
+/// `calls`) are populated when rizin's `aflj` analysis ran over the
+/// function body. They are absent for entries sourced from symbol
+/// tables alone (PE imports, ELF `.dynsym`, VBA declarations, etc.).
+/// Cleave's diff-mode + xz-utils-style supply-chain detection keys
+/// on per-function fingerprint drift: a function gaining a new callee
+/// or a 3× basic-block count is exactly the signal those workflows
+/// surface.
 #[derive(Debug, Clone, Serialize)]
 pub struct Function {
     /// Function name. Empty when the format records the entry by
@@ -122,6 +132,64 @@ pub struct Function {
     /// from the export table).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<&'static str>,
+    /// Cyclomatic complexity (McCabe). Number of linearly-independent
+    /// paths through the function — roughly `edges - nodes + 2`. A
+    /// simple `if/else` is 2; a 10-branch state machine is 11.
+    /// `None` for functions sourced from symbol tables without
+    /// disassembly (PE imports, ELF dynsym, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complexity: Option<u32>,
+    /// Number of basic blocks (straight-line code segments).
+    /// Inflation signal: a function that suddenly has 3× the basic
+    /// blocks of upstream is doing something new.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub basic_blocks: Option<u32>,
+    /// Number of control-flow edges between basic blocks. With
+    /// `basic_blocks` defines the CFG shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edges: Option<u32>,
+    /// Total instruction count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<u32>,
+    /// Stack frame size in bytes (locals + saved registers).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stack_frame: Option<u64>,
+    /// `true` iff the function calls itself directly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recursive: Option<bool>,
+    /// `true` iff the function never returns (always exits / aborts).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub noreturn: Option<bool>,
+    /// `true` iff the function has no branches (straight-line code).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_linear: Option<bool>,
+    /// Names of callees rizin resolved (outgoing call edges). The
+    /// most useful per-function diff signal — xz's `_get_cpuid`
+    /// gained `_resolve` as a callee, that was the whole story.
+    /// Empty `Vec` when the function has no resolved outgoing calls
+    /// or wasn't disassembled.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub calls: Vec<String>,
+}
+
+impl Default for Function {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            source: "",
+            offset: None,
+            kind: None,
+            complexity: None,
+            basic_blocks: None,
+            edges: None,
+            instructions: None,
+            stack_frame: None,
+            recursive: None,
+            noreturn: None,
+            is_linear: None,
+            calls: Vec::new(),
+        }
+    }
 }
 
 /// All [`Import`] entries the parsers found, in the order each
@@ -304,16 +372,89 @@ mod tests {
             source: "vba-public-sub",
             offset: Some(100),
             kind: Some("sub"),
+            ..Function::default()
         });
         funcs.push(Function {
             name: "sub_401000".into(),
             source: "pe",
             offset: Some(0x401000),
             kind: None,
+            ..Function::default()
         });
         assert_eq!(funcs.len(), 2);
         assert_eq!(funcs.iter().next().unwrap().kind, Some("sub"));
         assert_eq!(funcs.iter().nth(1).unwrap().kind, None);
+    }
+
+    #[test]
+    fn function_cfg_fields_serialize_when_present() {
+        // Pin the full rizin-derived CFG fingerprint of one function.
+        // Any drift in field names, serialisation, or `skip_serializing_if`
+        // policy trips this test. The fields together describe what
+        // cleave's diff-mode + xz-utils-style supply-chain detector
+        // needs to spot a backdoored function (gained edges/callees,
+        // inflated basic-block count).
+        let mut funcs = Functions::new();
+        funcs.push(Function {
+            name: "_get_cpuid".into(),
+            source: "rizin",
+            offset: Some(0x4080),
+            kind: None,
+            complexity: Some(7),
+            basic_blocks: Some(12),
+            edges: Some(18),
+            instructions: Some(83),
+            stack_frame: Some(48),
+            recursive: Some(false),
+            noreturn: Some(false),
+            is_linear: Some(false),
+            calls: vec!["_resolve".into(), "_lzma_crc32".into()],
+        });
+        let json = serde_json::to_value(&funcs).unwrap();
+        let entry = &json[0];
+        assert_eq!(entry["name"], "_get_cpuid");
+        assert_eq!(entry["complexity"], 7);
+        assert_eq!(entry["basic_blocks"], 12);
+        assert_eq!(entry["edges"], 18);
+        assert_eq!(entry["instructions"], 83);
+        assert_eq!(entry["stack_frame"], 48);
+        assert_eq!(entry["recursive"], false);
+        assert_eq!(entry["noreturn"], false);
+        assert_eq!(entry["is_linear"], false);
+        assert_eq!(entry["calls"][0], "_resolve");
+    }
+
+    #[test]
+    fn function_cfg_fields_omit_when_absent() {
+        // Symbol-table-sourced functions (PE imports, ELF dynsym, VBA
+        // declarations) carry no disassembly. The CFG fields must be
+        // elided from JSON entirely rather than serialised as `null`.
+        let mut funcs = Functions::new();
+        funcs.push(Function {
+            name: "CreateFileW".into(),
+            source: "pe-import",
+            offset: Some(0x1000),
+            kind: None,
+            ..Function::default()
+        });
+        let json = serde_json::to_value(&funcs).unwrap();
+        let entry = json[0].as_object().unwrap();
+        for key in [
+            "complexity",
+            "basic_blocks",
+            "edges",
+            "instructions",
+            "stack_frame",
+            "recursive",
+            "noreturn",
+            "is_linear",
+            "calls",
+        ] {
+            assert!(
+                !entry.contains_key(key),
+                "expected {key} elided when absent"
+            );
+        }
     }
 
     #[test]

@@ -20,12 +20,16 @@
 
 use crate::fileid::FileType;
 
+use super::comment_metrics::CommentStyle;
+
 /// Configuration for one source language.
 pub(super) struct LangConfig {
     /// Stable label exposed under `values.source.language`.
     pub(super) name: &'static str,
     /// Grammar constructor. Called once per parse.
     pub(super) language: fn() -> tree_sitter::Language,
+    /// Comment-extraction style for `comments.*` metrics.
+    pub(super) comment_style: CommentStyle,
 
     // ------------------------------------------------------------------
     // Surface-extraction queries
@@ -90,6 +94,7 @@ pub(super) fn config_for(file_type: FileType) -> Option<&'static LangConfig> {
 static JAVASCRIPT: LangConfig = LangConfig {
     name: "javascript",
     language: || tree_sitter_javascript::LANGUAGE.into(),
+    comment_style: CommentStyle::CStyle,
     string_kinds: &["string", "template_string"],
     import_query: r#"
         (import_statement source: (string) @import)
@@ -134,6 +139,7 @@ static JAVASCRIPT: LangConfig = LangConfig {
 static TYPESCRIPT: LangConfig = LangConfig {
     name: "typescript",
     language: || tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+    comment_style: CommentStyle::CStyle,
     string_kinds: &["string", "template_string"],
     import_query: r#"
         (import_statement source: (string) @import)
@@ -170,6 +176,7 @@ static TYPESCRIPT: LangConfig = LangConfig {
 static PYTHON: LangConfig = LangConfig {
     name: "python",
     language: || tree_sitter_python::LANGUAGE.into(),
+    comment_style: CommentStyle::Hash,
     string_kinds: &["string"],
     import_query: r#"
         (import_statement name: (dotted_name) @import)
@@ -202,6 +209,7 @@ static PYTHON: LangConfig = LangConfig {
 static GO: LangConfig = LangConfig {
     name: "go",
     language: || tree_sitter_go::LANGUAGE.into(),
+    comment_style: CommentStyle::CStyle,
     string_kinds: &["interpreted_string_literal", "raw_string_literal"],
     import_query: r#"
         (import_spec path: (interpreted_string_literal) @import)
@@ -239,6 +247,7 @@ static GO: LangConfig = LangConfig {
 static RUST: LangConfig = LangConfig {
     name: "rust",
     language: || tree_sitter_rust::LANGUAGE.into(),
+    comment_style: CommentStyle::CStyle,
     string_kinds: &["string_literal", "raw_string_literal"],
     import_query: r#"
         (use_declaration argument: (scoped_identifier path: (identifier) @import))
@@ -272,6 +281,7 @@ static RUST: LangConfig = LangConfig {
 static JAVA: LangConfig = LangConfig {
     name: "java",
     language: || tree_sitter_java::LANGUAGE.into(),
+    comment_style: CommentStyle::CStyle,
     string_kinds: &["string_literal"],
     import_query: r#"
         (import_declaration (scoped_identifier) @import)
@@ -311,6 +321,7 @@ static JAVA: LangConfig = LangConfig {
 static BASH: LangConfig = LangConfig {
     name: "bash",
     language: || tree_sitter_bash::LANGUAGE.into(),
+    comment_style: CommentStyle::Hash,
     string_kinds: &["string", "raw_string"],
     import_query: r#"
         (command
@@ -346,6 +357,7 @@ static BASH: LangConfig = LangConfig {
 static PHP: LangConfig = LangConfig {
     name: "php",
     language: || tree_sitter_php::LANGUAGE_PHP.into(),
+    comment_style: CommentStyle::CStyle,
     string_kinds: &["string", "string_content", "heredoc_body"],
     import_query: r#"
         (namespace_use_clause (qualified_name) @import)

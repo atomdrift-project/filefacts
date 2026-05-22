@@ -131,7 +131,6 @@ pub(super) fn extract(
                 match info.module_type {
                     VbaModuleType::Standard => "standard",
                     VbaModuleType::Class => "class",
-                    VbaModuleType::Document => "document",
                 }
                 .into(),
             ),
@@ -176,7 +175,6 @@ pub(super) fn extract(
 enum VbaModuleType {
     Standard,
     Class,
-    Document,
 }
 
 struct ModuleInfo {

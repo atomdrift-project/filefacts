@@ -9,8 +9,14 @@
 //! [`ParsedFile`]: crate::ParsedFile
 
 mod ast_walk;
+mod comment_metrics;
+mod function_metrics;
+mod identifier_metrics;
+mod import_metrics;
 mod langs;
 pub(crate) mod parse;
+mod string_metrics;
+mod text_metrics;
 
 use tree_sitter::{Node, QueryCursor, StreamingIterator};
 
@@ -37,6 +43,12 @@ pub(super) fn extract(
     functions_out: &mut crate::Functions,
 ) -> Result<(), Error> {
     let Some(cache) = tree_cache else {
+        // Even without a parse, the byte stream still has language-agnostic
+        // text features worth surfacing — emit `text.*` metrics from the
+        // raw bytes when they decode as UTF-8.
+        if let Ok(content) = std::str::from_utf8(_bytes) {
+            text_metrics::emit(content, metrics);
+        }
         return Ok(());
     };
     let config =
@@ -44,10 +56,38 @@ pub(super) fn extract(
     let source = cache.source();
     let root = cache.tree().root_node();
 
+    // Byte-level / line-level / whitespace text metrics — language-agnostic.
+    text_metrics::emit(source, metrics);
+
+    // Comment metrics use the language's comment style; no AST.
+    comment_metrics::emit(source, config.comment_style, metrics);
+
     extract_strings(root, source, config, strings, metrics);
     let imports = collect_query(config.language, source, root, config.import_query);
     let functions = collect_query(config.language, source, root, config.function_query);
     let classes = collect_query(config.language, source, root, config.class_query);
+
+    // Identifier metrics — walk the tree once, emit `identifiers.*`.
+    let identifiers = identifier_metrics::collect_identifiers(root, source, config);
+    identifier_metrics::emit(&identifiers, metrics);
+
+    // String-literal metrics — operate on the literals we already
+    // extracted into the `strings` view.
+    let literal_refs: Vec<&str> = strings.literals.iter().map(|s| s.text.as_str()).collect();
+    string_metrics::emit(&literal_refs, metrics);
+
+    // Import metrics — feed the canonical language name so stdlib
+    // classification works.
+    let import_refs: Vec<&str> = imports.iter().map(|(n, _)| n.as_str()).collect();
+    import_metrics::emit(&import_refs, config.name, metrics);
+
+    // Function metrics — single AST walk over function-definition nodes.
+    let total_lines = source.lines().count() as u32;
+    function_metrics::emit(root, source, config, total_lines, metrics);
+
+    // Cross-component text ratios computed from the sub-metrics we just
+    // emitted. Pure division — no extra parsing.
+    emit_text_ratios(metrics, total_lines);
 
     if !imports.is_empty() {
         // Mirror into the typed Imports view with byte offsets from
@@ -84,6 +124,7 @@ pub(super) fn extract(
                 source: config.name,
                 offset: Some(*offset),
                 kind: Some("function"),
+                ..crate::Function::default()
             });
         }
         values.insert(
@@ -110,6 +151,7 @@ pub(super) fn extract(
                 source: config.name,
                 offset: Some(*offset),
                 kind: Some("class"),
+                ..crate::Function::default()
             });
         }
         values.insert(
@@ -161,6 +203,7 @@ fn extract_strings(
                     method: None,
                     kind: None,
                     section: None,
+                    ..ExtractedString::default()
                 });
                 count += 1;
             }
@@ -264,6 +307,142 @@ fn strip_quotes(s: &str) -> String {
 /// True when this file type is a source language expose can parse.
 pub(crate) fn supports(file_type: FileType) -> bool {
     langs::config_for(file_type).is_some()
+}
+
+/// Emit text-level metrics (`text.*`) without a tree-sitter parse.
+///
+/// Called from the format dispatcher for text-like languages that
+/// don't yet have a [`LangConfig`] entry (Ruby, Perl, Lua, PowerShell,
+/// Vbs, Batch, …). Only emits the byte-level / line-level / whitespace
+/// metrics that don't need an AST — language-agnostic by construction.
+pub(crate) fn extract_text_only(bytes: &[u8], metrics: &mut Metrics) {
+    if let Ok(content) = std::str::from_utf8(bytes) {
+        text_metrics::emit(content, metrics);
+    }
+}
+
+/// Compute cross-component ratios on `text.*` from already-emitted
+/// sub-metrics (`identifiers.*` / `strings.*` / `comments.*` /
+/// `functions.*` / `imports.*`). Pure division — no parsing.
+fn emit_text_ratios(metrics: &mut Metrics, total_lines: u32) {
+    let m = metrics.clone();
+    let get = |k: &str| m.get(k).unwrap_or(0.0);
+
+    let functions_total = get("functions.total");
+    let strings_total = get("strings.total");
+    let identifiers_total = get("identifiers.total");
+    let identifiers_unique = get("identifiers.unique_count");
+    let imports_total = get("imports.total");
+    let functions_anonymous = get("functions.anonymous");
+
+    if functions_total > 0.0 {
+        metrics.insert(
+            "text.strings_to_functions_ratio",
+            strings_total / functions_total,
+        );
+        metrics.insert(
+            "text.identifiers_to_functions_ratio",
+            identifiers_unique / functions_total,
+        );
+        if imports_total > 0.0 {
+            metrics.insert(
+                "text.imports_to_functions_ratio",
+                imports_total / functions_total,
+            );
+        }
+        if functions_anonymous > 0.0 {
+            metrics.insert(
+                "text.anonymous_function_ratio",
+                functions_anonymous / functions_total,
+            );
+        }
+    }
+
+    if total_lines > 0 {
+        let lines_f = f64::from(total_lines);
+        if identifiers_total > 0.0 {
+            metrics.insert("text.identifier_density", identifiers_total / lines_f);
+        }
+        if strings_total > 0.0 {
+            metrics.insert("text.string_density", strings_total / lines_f);
+        }
+        if imports_total > 0.0 {
+            metrics.insert("text.import_density", (imports_total * 100.0) / lines_f);
+        }
+        let lines_sqrt = lines_f.sqrt();
+        if lines_sqrt > 0.0 {
+            if functions_total > 0.0 {
+                metrics.insert(
+                    "text.normalized_function_count",
+                    functions_total / lines_sqrt,
+                );
+            }
+            if imports_total > 0.0 {
+                metrics.insert("text.normalized_import_count", imports_total / lines_sqrt);
+            }
+            if strings_total > 0.0 {
+                metrics.insert("text.normalized_string_count", strings_total / lines_sqrt);
+            }
+        }
+        let lines_log = lines_f.log2();
+        if lines_log > 0.0 && identifiers_unique > 0.0 {
+            metrics.insert(
+                "text.normalized_unique_identifiers",
+                identifiers_unique / lines_log,
+            );
+        }
+    }
+
+    // Obfuscation indicator ratios.
+    if identifiers_unique > 0.0 {
+        let suspicious = get("identifiers.hex_like_names")
+            + get("identifiers.base64_like_names")
+            + get("identifiers.sequential_names")
+            + get("identifiers.keyboard_pattern_names")
+            + get("identifiers.repeated_char_names");
+        if suspicious > 0.0 {
+            metrics.insert(
+                "text.suspicious_identifier_ratio",
+                suspicious / identifiers_unique,
+            );
+        }
+    }
+
+    if strings_total > 0.0 {
+        let encoded = get("strings.base64_candidates")
+            + get("strings.hex_strings")
+            + get("strings.url_encoded_strings");
+        if encoded > 0.0 {
+            metrics.insert("text.encoded_string_ratio", encoded / strings_total);
+        }
+        let suspicious = get("strings.embedded_code_candidates")
+            + get("strings.shell_command_strings")
+            + get("strings.sql_strings");
+        if suspicious > 0.0 {
+            metrics.insert("text.suspicious_string_ratio", suspicious / strings_total);
+        }
+        let dynamic = get("strings.concat_operations")
+            + get("strings.char_construction")
+            + get("strings.array_join_construction");
+        if dynamic > 0.0 {
+            metrics.insert("text.dynamic_string_ratio", dynamic / strings_total);
+        }
+    }
+
+    let comments_total = get("comments.total");
+    if comments_total > 0.0 {
+        let suspicious = get("comments.high_entropy_comments") + get("comments.base64_in_comments");
+        if suspicious > 0.0 {
+            metrics.insert("text.suspicious_comment_ratio", suspicious / comments_total);
+        }
+    }
+
+    if imports_total > 0.0 {
+        let dynamic = get("imports.dynamic_imports") + get("imports.conditional_imports");
+        if dynamic > 0.0 {
+            metrics.insert("text.dynamic_import_ratio", dynamic / imports_total);
+        }
+    }
 }
 
 #[cfg(test)]

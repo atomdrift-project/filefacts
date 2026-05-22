@@ -26,6 +26,7 @@ mod common;
 mod elf;
 mod generic;
 mod goblin_safe;
+mod image_stats;
 mod jar;
 mod jpeg;
 mod lnk;
@@ -144,8 +145,8 @@ pub(crate) fn extract(
 
         // Source-code extraction is delegated to the source dispatcher,
         // which routes to the appropriate tree-sitter grammar. Languages
-        // expose doesn't yet support fall through to the generic
-        // byte-level pass.
+        // expose doesn't yet support fall through to `extract_text_only`
+        // below so they still get language-agnostic `text.*` metrics.
         FileType::JavaScript
         | FileType::TypeScript
         | FileType::Python
@@ -156,6 +157,28 @@ pub(crate) fn extract(
         | FileType::Php => source::extract(
             bytes, file_type, tree_cache, values, strings, metrics, imports, functions,
         ),
+
+        // Text-like languages without a tree-sitter binding in expose.
+        // They still earn `text.*` metrics — pure byte/line analysis,
+        // no AST required.
+        FileType::Vbs
+        | FileType::Batch
+        | FileType::Ruby
+        | FileType::Perl
+        | FileType::Lua
+        | FileType::CSharp
+        | FileType::PowerShell
+        | FileType::Swift
+        | FileType::ObjectiveC
+        | FileType::Groovy
+        | FileType::Scala
+        | FileType::Kotlin
+        | FileType::Zig
+        | FileType::Elixir
+        | FileType::C => {
+            source::extract_text_only(bytes, metrics);
+            Ok(())
+        }
 
         _ => Ok(()),
     }

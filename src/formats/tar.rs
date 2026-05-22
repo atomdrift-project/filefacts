@@ -42,6 +42,24 @@ pub(super) fn extract(
     let mut world_writable = 0u64;
     let mut symlinks = 0u64;
 
+    // Aggregates ported from cleave's ArchiveMetrics. Tar has no per-entry
+    // compression, encryption, or comment field — those columns stay zero.
+    let mut file_count: u64 = 0;
+    let mut directory_count: u64 = 0;
+    let mut total_uncompressed: u64 = 0;
+    let mut max_filename_length: u64 = 0;
+    let mut hidden_file_count: u64 = 0;
+    let mut path_traversal_count: u64 = 0;
+    let mut symlink_escape_count: u64 = 0;
+    let mut executable_count: u64 = 0;
+    let mut script_count: u64 = 0;
+    let mut unicode_filename_count: u64 = 0;
+    let mut homoglyph_filename_count: u64 = 0;
+    let mut double_extension_count: u64 = 0;
+    let mut rtlo_filename_count: u64 = 0;
+    let mut nested_archive_count: u64 = 0;
+    let mut misplaced_executable_count: u64 = 0;
+
     for entry in archive
         .entries()
         .map_err(|e| Error::malformed("tar", e.to_string()))?
@@ -106,12 +124,12 @@ pub(super) fn extract(
             obj.insert("mtime_unix".into(), JsonValue::Number((m as i64).into()));
             mtimes.push(m as i64);
         }
+        let mut linkname_str: Option<String> = None;
         if header.entry_type().is_symlink() || header.entry_type().is_hard_link() {
             if let Ok(Some(linkname)) = header.link_name() {
-                obj.insert(
-                    "linkname".into(),
-                    JsonValue::String(linkname.to_string_lossy().into_owned()),
-                );
+                let s = linkname.to_string_lossy().into_owned();
+                obj.insert("linkname".into(), JsonValue::String(s.clone()));
+                linkname_str = Some(s);
             }
             symlinks += u64::from(header.entry_type().is_symlink());
         }
@@ -119,6 +137,71 @@ pub(super) fn extract(
         *entry_type_counts
             .entry(entry_type_label.into())
             .or_insert(0) += 1;
+
+        // Aggregate the same classification flags as the ZIP extractor.
+        let entry_path_str = obj
+            .get("path")
+            .and_then(|p| p.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if entry_path_str.len() as u64 > max_filename_length {
+            max_filename_length = entry_path_str.len() as u64;
+        }
+
+        if header.entry_type().is_dir() {
+            directory_count += 1;
+        } else if header.entry_type() == tar::EntryType::Regular {
+            file_count += 1;
+            total_uncompressed += size;
+        }
+
+        let cls = super::zip::classify_filename(&entry_path_str);
+        if cls.is_hidden {
+            hidden_file_count += 1;
+        }
+        if cls.has_path_traversal {
+            path_traversal_count += 1;
+        }
+        if cls.is_unicode {
+            unicode_filename_count += 1;
+        }
+        if cls.has_homoglyph {
+            homoglyph_filename_count += 1;
+        }
+        if cls.has_double_extension {
+            double_extension_count += 1;
+        }
+        if cls.has_rtlo {
+            rtlo_filename_count += 1;
+        }
+        let is_regular = header.entry_type() == tar::EntryType::Regular;
+        if is_regular {
+            if cls.is_nested_archive {
+                nested_archive_count += 1;
+            }
+            if cls.is_script {
+                script_count += 1;
+            }
+            let exec_by_mode = header.mode().ok().is_some_and(|m| m & 0o111 != 0);
+            if cls.is_executable || exec_by_mode {
+                executable_count += 1;
+                if cls.is_misplaced_executable {
+                    misplaced_executable_count += 1;
+                }
+            }
+        }
+
+        // Tar exposes the linkname directly in the header — detect symlink
+        // escapes (target contains `..` or is absolute).
+        if header.entry_type().is_symlink() {
+            if let Some(target) = linkname_str.as_deref() {
+                if target.starts_with('/') || target.split('/').any(|p| p == "..") {
+                    symlink_escape_count += 1;
+                }
+            }
+        }
+
         members.push(JsonValue::Object(obj));
     }
 
@@ -147,6 +230,9 @@ pub(super) fn extract(
     }
 
     metrics.insert("archive.member_count", member_count as f64);
+    metrics.insert("archive.file_count", file_count as f64);
+    metrics.insert("archive.directory_count", directory_count as f64);
+    metrics.insert("archive.total_uncompressed", total_uncompressed as f64);
     for (t, c) in &entry_type_counts {
         metrics.insert(
             format!("archive.format.{}_count", t.replace('-', "_")),
@@ -161,6 +247,32 @@ pub(super) fn extract(
         world_writable as f64,
     );
     metrics.insert("archive.security.symlink_count", symlinks as f64);
+    metrics.insert("archive.symlink_count", symlinks as f64);
+
+    metrics.insert("archive.max_filename_length", max_filename_length as f64);
+    metrics.insert("archive.hidden_file_count", hidden_file_count as f64);
+    metrics.insert("archive.path_traversal_count", path_traversal_count as f64);
+    metrics.insert("archive.symlink_escape_count", symlink_escape_count as f64);
+    metrics.insert("archive.executable_count", executable_count as f64);
+    metrics.insert("archive.script_count", script_count as f64);
+    metrics.insert(
+        "archive.unicode_filename_count",
+        unicode_filename_count as f64,
+    );
+    metrics.insert(
+        "archive.homoglyph_filename_count",
+        homoglyph_filename_count as f64,
+    );
+    metrics.insert(
+        "archive.double_extension_count",
+        double_extension_count as f64,
+    );
+    metrics.insert("archive.rtlo_filename_count", rtlo_filename_count as f64);
+    metrics.insert("archive.nested_archive_count", nested_archive_count as f64);
+    metrics.insert(
+        "archive.misplaced_executable_count",
+        misplaced_executable_count as f64,
+    );
 
     if !mtimes.is_empty() {
         let min = *mtimes.iter().min().unwrap_or(&0);
@@ -415,6 +527,46 @@ mod tests {
     fn truncated_tar_doesnt_crash() {
         // Just a partial header — should error inside, not panic.
         let _ = run(&[0u8; 50]);
+    }
+
+    #[test]
+    fn symlink_escape_flagged_when_target_uses_dotdot() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut b = Builder::new(&mut out);
+            let mut h = Header::new_ustar();
+            h.set_path("link").unwrap();
+            h.set_size(0);
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_link_name("../../etc/passwd").unwrap();
+            h.set_cksum();
+            b.append(&h, std::io::empty()).unwrap();
+            b.finish().unwrap();
+        }
+        let (_, m) = run(&out);
+        assert_eq!(m.get("archive.symlink_escape_count"), Some(1.0));
+    }
+
+    #[test]
+    fn tar_file_count_and_total_uncompressed() {
+        let tar = build_tar(&[
+            ("a.txt", 0o644, 0, 0, 0, b"hello"),
+            ("b.txt", 0o644, 0, 0, 0, b"world"),
+        ]);
+        let (_, m) = run(&tar);
+        assert_eq!(m.get("archive.file_count"), Some(2.0));
+        assert_eq!(m.get("archive.total_uncompressed"), Some(10.0));
+    }
+
+    #[test]
+    fn tar_executable_count_uses_mode_bit() {
+        let tar = build_tar(&[
+            ("bin/x", 0o755, 0, 0, 0, b""),
+            ("data", 0o644, 0, 0, 0, b""),
+        ]);
+        let (_, m) = run(&tar);
+        // Mode 0755 has exec bits → executable.
+        assert_eq!(m.get("archive.executable_count"), Some(1.0));
     }
 
     #[test]

@@ -61,6 +61,7 @@ impl Iterator for AsciiRuns<'_> {
                     method: None,
                     kind: None,
                     section: None,
+                    ..ExtractedString::default()
                 });
             }
         }

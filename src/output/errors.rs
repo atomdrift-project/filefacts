@@ -69,10 +69,6 @@ impl Errors {
         Self::default()
     }
 
-    pub(crate) fn push(&mut self, err: ParseError) {
-        self.0.push(err);
-    }
-
     /// Convenience for the common case — record a panic.
     pub(crate) fn record_panic(&mut self, stage: &'static str, message: impl Into<String>) {
         self.0.push(ParseError {
@@ -145,11 +141,7 @@ mod tests {
     #[test]
     fn errors_serialize_omits_empty_message() {
         let mut errs = Errors::new();
-        errs.push(ParseError {
-            kind: "panic",
-            stage: "macho-parse",
-            message: String::new(),
-        });
+        errs.record_panic("macho-parse", String::new());
         let json = serde_json::to_value(&errs).unwrap();
         let arr = json.as_array().unwrap();
         let obj = arr[0].as_object().unwrap();

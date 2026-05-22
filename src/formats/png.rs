@@ -25,7 +25,9 @@ use serde_json::{json, Value as JsonValue};
 
 use crate::error::Error;
 use crate::formats::common::extract_ascii_strings;
+use crate::formats::image_stats;
 use crate::output::{Metrics, Strings, Values};
+use crate::scan::entropy;
 
 const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 
@@ -203,7 +205,87 @@ pub(super) fn extract(
     metrics.insert("png.text_chunk_bytes", text_chunk_bytes as f64);
     metrics.insert("png.unknown_chunk_count", unknown_count as f64);
 
+    // Best-effort pixel-statistic pass. Decoder errors are swallowed —
+    // a PNG with a corrupted IDAT chunk or unsupported color depth
+    // still gets the structural metrics above.
+    extract_pixel_stats(bytes, metrics);
+
     Ok(())
+}
+
+/// Decode the PNG (cap-protected) and emit pixel-statistic metrics:
+/// dimensions, per-channel entropy, edge density, histogram flatness,
+/// compression ratio, and PNG-specific alpha entropy.
+/// `binary.overall_entropy` is the Shannon entropy of the raw file
+/// bytes — emitted unconditionally because it's cheap and useful even
+/// when the pixel decode bails.
+fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
+    use png::Decoder;
+
+    metrics.insert("binary.overall_entropy", entropy::shannon(bytes));
+
+    let decoder = Decoder::new(bytes);
+    let Ok(mut reader) = decoder.read_info() else {
+        return;
+    };
+    let info = reader.info();
+    let width = info.width;
+    let height = info.height;
+    let bit_depth = info.bit_depth as u32;
+    let channels: u32 = match info.color_type {
+        png::ColorType::Grayscale | png::ColorType::Indexed => 1,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+    };
+
+    metrics.insert("image.width", f64::from(width));
+    metrics.insert("image.height", f64::from(height));
+    metrics.insert("image.channels", f64::from(channels));
+
+    let buf_size = reader.output_buffer_size();
+    if buf_size > image_stats::MAX_DECODE_BYTES {
+        return;
+    }
+    let mut pixels = vec![0u8; buf_size];
+    let Ok(output_info) = reader.next_frame(&mut pixels) else {
+        return;
+    };
+    let pixels = &pixels[..output_info.buffer_size()];
+
+    let raw_size = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(channels as usize)
+        .saturating_mul((bit_depth as usize / 8).max(1));
+    let compression_ratio = if raw_size > 0 {
+        bytes.len() as f64 / raw_size as f64
+    } else {
+        1.0
+    };
+
+    let pixel_entropy = entropy::shannon(pixels);
+    metrics.insert("image.pixel_entropy", pixel_entropy);
+    metrics.insert("image.histogram_flatness", pixel_entropy / 8.0);
+    let density =
+        image_stats::edge_density(pixels, width as usize, height as usize, channels as usize);
+    metrics.insert("image.edge_density", f64::from(density));
+
+    if channels >= 3 {
+        let (r, g, b, a) = image_stats::channel_entropy(pixels, channels as usize);
+        metrics.insert("image.r_entropy", f64::from(r));
+        metrics.insert("image.g_entropy", f64::from(g));
+        metrics.insert("image.b_entropy", f64::from(b));
+        metrics.insert("png.a_entropy", f64::from(a));
+    } else {
+        // Mirror cleave's prior behavior: grayscale images put the
+        // overall pixel entropy into `r_entropy` so traits keyed on
+        // the red channel still fire for single-channel images.
+        metrics.insert("image.r_entropy", pixel_entropy);
+        metrics.insert("image.g_entropy", 0.0);
+        metrics.insert("image.b_entropy", 0.0);
+        metrics.insert("png.a_entropy", 0.0);
+    }
+    metrics.insert("png.compression_ratio", compression_ratio);
 }
 
 /// PNG-spec color-type byte → analyst-readable name. The canonical
@@ -470,5 +552,91 @@ mod tests {
         let (_, m) = run(&png);
         let bytes = m.get("png.text_chunk_bytes").unwrap();
         assert!(bytes > 0.0);
+    }
+
+    /// Encode a real RGB PNG via the `png` crate so the pixel-stat
+    /// decode path runs end-to-end. Constant-color image → zero pixel
+    /// entropy, zero edge density, low histogram flatness.
+    fn encode_rgb_png(width: u32, height: u32, fill: [u8; 3]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, width, height);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut writer = enc.write_header().unwrap();
+            let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+            for _ in 0..(width * height) {
+                pixels.extend_from_slice(&fill);
+            }
+            writer.write_image_data(&pixels).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn pixel_stats_constant_rgb_image() {
+        let png = encode_rgb_png(16, 16, [128, 128, 128]);
+        let (_, m) = run(&png);
+        assert_eq!(m.get("image.width"), Some(16.0));
+        assert_eq!(m.get("image.height"), Some(16.0));
+        assert_eq!(m.get("image.channels"), Some(3.0));
+        // Constant image — pixel entropy is exactly 0 bits/byte.
+        let pe = m.get("image.pixel_entropy").unwrap();
+        assert!(pe.abs() < 1e-6, "expected ~0 entropy, got {pe}");
+        let ed = m.get("image.edge_density").unwrap();
+        assert!(ed.abs() < 1e-6, "expected ~0 edge density, got {ed}");
+        // Histogram flatness is just pixel_entropy / 8.
+        let hf = m.get("image.histogram_flatness").unwrap();
+        assert!(hf.abs() < 1e-6);
+        // Channel-entropy fields are populated.
+        assert!(m.get("image.r_entropy").is_some());
+        assert!(m.get("image.g_entropy").is_some());
+        assert!(m.get("image.b_entropy").is_some());
+        // Compression ratio defined (real PNG > raw size for tiny imgs).
+        assert!(m.get("png.compression_ratio").unwrap() > 0.0);
+        // No alpha channel — a_entropy stays 0.
+        assert_eq!(m.get("png.a_entropy"), Some(0.0));
+        // binary.overall_entropy emitted as Shannon of raw file bytes.
+        assert!(m.get("binary.overall_entropy").unwrap() > 0.0);
+    }
+
+    #[test]
+    fn pixel_stats_natural_image_has_nonzero_entropy() {
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, 32, 32);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut writer = enc.write_header().unwrap();
+            let mut pixels = Vec::with_capacity(32 * 32 * 3);
+            // Deterministic pseudo-random pattern with structure
+            // (gradient + noise) — non-trivial entropy, some edges.
+            for y in 0..32u32 {
+                for x in 0..32u32 {
+                    pixels.push(((x * 8 + y * 3) % 256) as u8);
+                    pixels.push(((x * 5 + y * 11) % 256) as u8);
+                    pixels.push(((x * 13 + y * 7) % 256) as u8);
+                }
+            }
+            writer.write_image_data(&pixels).unwrap();
+        }
+        let (_, m) = run(&out);
+        let pe = m.get("image.pixel_entropy").unwrap();
+        assert!(pe > 1.0, "expected significant entropy, got {pe}");
+        let r = m.get("image.r_entropy").unwrap();
+        let g = m.get("image.g_entropy").unwrap();
+        let b = m.get("image.b_entropy").unwrap();
+        assert!(r > 0.0 && g > 0.0 && b > 0.0);
+    }
+
+    #[test]
+    fn malformed_png_decode_still_emits_binary_entropy() {
+        // Valid PNG signature + IHDR claiming a width that overruns
+        // the IDAT stream. Decode fails; binary.overall_entropy still
+        // emits because it doesn't depend on the decoder.
+        let ihdr = vec![0, 0, 0, 100, 0, 0, 0, 100, 8, 2, 0, 0, 0];
+        let png = build_png(&[(b"IHDR", &ihdr), (b"IDAT", &[0; 4]), (b"IEND", &[])]);
+        let (_, m) = run(&png);
+        assert!(m.get("binary.overall_entropy").is_some());
     }
 }

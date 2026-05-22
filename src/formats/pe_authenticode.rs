@@ -155,7 +155,7 @@ fn parse_pkcs7(der_bytes: &[u8]) -> Option<JsonValue> {
         // dotted-OID string for forward compatibility.
         obj.insert(
             "signature_algorithm".into(),
-            JsonValue::String(signature_algorithm_name(&cert.signature_algorithm.oid).into()),
+            JsonValue::String(signature_algorithm_name(&cert.signature_algorithm.oid)),
         );
 
         // Extended Key Usage — the leaf's claimed-purpose set. A
@@ -202,7 +202,10 @@ fn parse_pkcs7(der_bytes: &[u8]) -> Option<JsonValue> {
     // was made over. The digest is what consumers compare against the
     // recomputed Authentihash to detect post-signing tampering.
     if let Some((alg, digest_hex)) = extract_spc_indirect_data(&signed_data) {
-        obj.insert("signature_digest_algorithm".into(), JsonValue::String(alg.into()));
+        obj.insert(
+            "signature_digest_algorithm".into(),
+            JsonValue::String(alg.into()),
+        );
         obj.insert("signature_digest".into(), JsonValue::String(digest_hex));
     }
 
@@ -297,7 +300,7 @@ fn is_rsa_oid(oid: &str) -> bool {
             | "1.2.840.113549.1.1.5"   // sha1WithRSA
             | "1.2.840.113549.1.1.11"  // sha256WithRSA
             | "1.2.840.113549.1.1.12"  // sha384WithRSA
-            | "1.2.840.113549.1.1.13"  // sha512WithRSA
+            | "1.2.840.113549.1.1.13" // sha512WithRSA
     )
 }
 
@@ -356,18 +359,18 @@ fn verify_rsa(
         Err(_) => return VerifyOutcome::Failed,
     };
     let verified = match digest_oid {
-        "1.3.14.3.2.26" => {
-            VerifyingKey::<Sha1>::new(public_key).verify(signed_message, &sig).is_ok()
-        }
-        "2.16.840.1.101.3.4.2.1" => {
-            VerifyingKey::<Sha256>::new(public_key).verify(signed_message, &sig).is_ok()
-        }
-        "2.16.840.1.101.3.4.2.2" => {
-            VerifyingKey::<Sha384>::new(public_key).verify(signed_message, &sig).is_ok()
-        }
-        "2.16.840.1.101.3.4.2.3" => {
-            VerifyingKey::<Sha512>::new(public_key).verify(signed_message, &sig).is_ok()
-        }
+        "1.3.14.3.2.26" => VerifyingKey::<Sha1>::new(public_key)
+            .verify(signed_message, &sig)
+            .is_ok(),
+        "2.16.840.1.101.3.4.2.1" => VerifyingKey::<Sha256>::new(public_key)
+            .verify(signed_message, &sig)
+            .is_ok(),
+        "2.16.840.1.101.3.4.2.2" => VerifyingKey::<Sha384>::new(public_key)
+            .verify(signed_message, &sig)
+            .is_ok(),
+        "2.16.840.1.101.3.4.2.3" => VerifyingKey::<Sha512>::new(public_key)
+            .verify(signed_message, &sig)
+            .is_ok(),
         _ => return VerifyOutcome::Unsupported,
     };
     if verified {
@@ -476,8 +479,7 @@ struct ParsedEku {
 
 fn parse_extended_key_usage(cert: &x509_cert::Certificate) -> Option<ParsedEku> {
     const EKU_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.37");
-    const CODE_SIGNING_OID: ObjectIdentifier =
-        ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3");
+    const CODE_SIGNING_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.3");
     let exts = cert.tbs_certificate.extensions.as_ref()?;
     for ext in exts.iter() {
         if ext.extn_id != EKU_OID {
@@ -507,18 +509,22 @@ fn parse_extended_key_usage(cert: &x509_cert::Certificate) -> Option<ParsedEku> 
 /// set covers what real-world Authenticode + Mach-O CMS payloads use;
 /// unknown OIDs surface as the dotted-OID string so consumers can
 /// match on them as data.
-fn signature_algorithm_name(oid: &ObjectIdentifier) -> &'static str {
+/// Canonical RFC name for a signature-algorithm OID, or the dotted
+/// OID itself when the algorithm is outside our friendly-name table.
+/// Returning the raw OID (rather than a useless `"other"`) lets a
+/// forensic consumer look up exotic / new algorithms directly.
+fn signature_algorithm_name(oid: &ObjectIdentifier) -> String {
     match oid.to_string().as_str() {
-        "1.2.840.113549.1.1.5" => "sha1WithRSAEncryption",
-        "1.2.840.113549.1.1.11" => "sha256WithRSAEncryption",
-        "1.2.840.113549.1.1.12" => "sha384WithRSAEncryption",
-        "1.2.840.113549.1.1.13" => "sha512WithRSAEncryption",
-        "1.2.840.113549.1.1.4" => "md5WithRSAEncryption",
-        "1.2.840.10045.4.1" => "ecdsa-with-SHA1",
-        "1.2.840.10045.4.3.2" => "ecdsa-with-SHA256",
-        "1.2.840.10045.4.3.3" => "ecdsa-with-SHA384",
-        "1.2.840.10045.4.3.4" => "ecdsa-with-SHA512",
-        _ => "other",
+        "1.2.840.113549.1.1.5" => "sha1WithRSAEncryption".into(),
+        "1.2.840.113549.1.1.11" => "sha256WithRSAEncryption".into(),
+        "1.2.840.113549.1.1.12" => "sha384WithRSAEncryption".into(),
+        "1.2.840.113549.1.1.13" => "sha512WithRSAEncryption".into(),
+        "1.2.840.113549.1.1.4" => "md5WithRSAEncryption".into(),
+        "1.2.840.10045.4.1" => "ecdsa-with-SHA1".into(),
+        "1.2.840.10045.4.3.2" => "ecdsa-with-SHA256".into(),
+        "1.2.840.10045.4.3.3" => "ecdsa-with-SHA384".into(),
+        "1.2.840.10045.4.3.4" => "ecdsa-with-SHA512".into(),
+        other => other.to_string(),
     }
 }
 
@@ -708,7 +714,9 @@ use crate::formats::common::hex_encode;
 
 #[cfg(test)]
 mod tests {
-    use super::{oid_to_label, trim_to_der_object};
+    use super::{
+        is_ecdsa_oid, is_rsa_oid, oid_to_label, signature_algorithm_name, trim_to_der_object,
+    };
     use der::oid::ObjectIdentifier;
 
     #[test]
@@ -763,5 +771,75 @@ mod tests {
         // Claims 1000-byte content but only 4 bytes are present.
         let bytes = [0x30, 0x82, 0x03, 0xe8, 0x00, 0x00, 0x00, 0x00];
         assert!(trim_to_der_object(&bytes).is_none());
+    }
+
+    /// `is_rsa_oid` must accept every RSA OID Authenticode emitters
+    /// have been observed to put on PE signatures — the bare
+    /// `rsaEncryption` plus the hash-specific composites. Unknown
+    /// OIDs must NOT match, otherwise `verify_signer_signature`
+    /// would dispatch RSA verification on an ECDSA cert (or worse).
+    #[test]
+    fn is_rsa_oid_covers_known_authenticode_oids() {
+        // Bare rsaEncryption + every hash-specific composite shipped
+        // in Windows Authenticode signatures.
+        for oid in [
+            "1.2.840.113549.1.1.1",  // rsaEncryption
+            "1.2.840.113549.1.1.4",  // md5WithRSA
+            "1.2.840.113549.1.1.5",  // sha1WithRSA
+            "1.2.840.113549.1.1.11", // sha256WithRSA
+            "1.2.840.113549.1.1.12", // sha384WithRSA
+            "1.2.840.113549.1.1.13", // sha512WithRSA
+        ] {
+            assert!(is_rsa_oid(oid), "should classify {oid} as RSA");
+        }
+        // ECDSA OIDs must NOT match — they go through verify_ecdsa.
+        assert!(!is_rsa_oid("1.2.840.10045.4.3.2"));
+        // Garbage / Ed25519 / dsa-with-sha256 OIDs are unsupported.
+        assert!(!is_rsa_oid("1.3.101.112"));
+        assert!(!is_rsa_oid(""));
+    }
+
+    #[test]
+    fn is_ecdsa_oid_covers_known_authenticode_oids() {
+        for oid in [
+            "1.2.840.10045.4.1",   // ecdsa-with-SHA1
+            "1.2.840.10045.4.3.2", // ecdsa-with-SHA256
+            "1.2.840.10045.4.3.3", // ecdsa-with-SHA384
+            "1.2.840.10045.4.3.4", // ecdsa-with-SHA512
+        ] {
+            assert!(is_ecdsa_oid(oid), "should classify {oid} as ECDSA");
+        }
+        // RSA OIDs must NOT match.
+        assert!(!is_ecdsa_oid("1.2.840.113549.1.1.11"));
+        // Curve OIDs (subject_public_key_info parameters) must NOT
+        // be mistaken for signature algorithms.
+        assert!(!is_ecdsa_oid("1.2.840.10045.3.1.7")); // P-256
+        assert!(!is_ecdsa_oid(""));
+    }
+
+    /// `signature_algorithm_name` returns the canonical RFC label for
+    /// every signature-algorithm OID we recognise, and the dotted-OID
+    /// fallback for the long tail. Trait authors match against these
+    /// strings.
+    #[test]
+    fn signature_algorithm_name_maps_known_oids() {
+        let oid = ObjectIdentifier::new("1.2.840.113549.1.1.11").unwrap();
+        assert_eq!(signature_algorithm_name(&oid), "sha256WithRSAEncryption");
+        let oid = ObjectIdentifier::new("1.2.840.10045.4.3.2").unwrap();
+        assert_eq!(signature_algorithm_name(&oid), "ecdsa-with-SHA256");
+    }
+
+    /// Unknown / exotic OIDs fall through to the dotted-OID string
+    /// itself. The legacy `"other"` fallback threw away the only
+    /// piece of forensically useful information; the dotted form lets
+    /// an analyst look the algorithm up directly.
+    #[test]
+    fn signature_algorithm_name_falls_back_to_dotted_oid() {
+        let oid = ObjectIdentifier::new("1.3.6.1.4.1.99999").unwrap();
+        assert_eq!(signature_algorithm_name(&oid), "1.3.6.1.4.1.99999");
+        // RSASSA-PSS (1.2.840.113549.1.1.10) — not in our friendly
+        // table yet but still emitted as a usable identifier.
+        let oid = ObjectIdentifier::new("1.2.840.113549.1.1.10").unwrap();
+        assert_eq!(signature_algorithm_name(&oid), "1.2.840.113549.1.1.10");
     }
 }

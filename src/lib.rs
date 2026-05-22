@@ -60,10 +60,26 @@ mod debug;
 mod error;
 mod formats;
 mod output;
-mod rizin;
 mod scan;
 
+pub mod cache;
 pub mod fileid;
+
+/// Optional rizin/radare2 integration with hardened subprocess
+/// discipline (RLIMIT, PR_SET_PDEATHSIG, process-group SIGKILL on
+/// timeout / output-cap overflow). Exposed as a public module so host
+/// CLIs can mute it during scans (`scoped_disable`), reap in-flight
+/// workers (`kill_all_rizin_groups`) from a signal handler, and emit
+/// `tracing` telemetry (`log_stats`) at shutdown.
+pub mod rizin {
+    pub use crate::rizin_impl::{
+        available, disable, is_disabled, kill_all_rizin_groups, log_stats, scoped_disable, stats,
+        ScopedDisable,
+    };
+}
+
+#[path = "rizin.rs"]
+mod rizin_impl;
 
 /// VBA `<non-literal>` sentinel re-export.
 ///
@@ -91,7 +107,12 @@ pub use output::{
 /// Schema version of the public output shape.
 ///
 /// Bumps on any field rename or semantic change. Field additions are
-/// non-breaking and do not bump this version.
+/// non-breaking and do not bump this version. Wave A of the cleave
+/// rizin migration grows `Function` and `ExtractedString` with several
+/// new optional fields; pure additions, so no bump is required on
+/// JSON shape grounds. The on-disk cache (`expose::cache`) carries a
+/// distinct schema version that *is* bumped on every addition so
+/// cached bytes from old binaries are not silently reused.
 pub const SCHEMA_VERSION: &str = "1";
 
 /// A file with its bytes and lazily-computed metadata views.
@@ -573,11 +594,8 @@ fn emit_binary_aggregates(
     }
     if entropies.len() >= 2 {
         let mean = entropies.iter().sum::<f64>() / entropies.len() as f64;
-        let var = entropies
-            .iter()
-            .map(|e| (e - mean).powi(2))
-            .sum::<f64>()
-            / entropies.len() as f64;
+        let var =
+            entropies.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / entropies.len() as f64;
         metrics.insert("binary.entropy_variance", var);
     }
 

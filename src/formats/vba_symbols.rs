@@ -444,6 +444,7 @@ fn extract_subs_and_functions(
             source: "vba-decl",
             offset: Some(offset),
             kind: kind_tag,
+            ..Function::default()
         });
     }
 }

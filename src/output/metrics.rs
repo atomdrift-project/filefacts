@@ -55,6 +55,15 @@ impl Metrics {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Borrow the underlying `BTreeMap`.
+    ///
+    /// Useful for downstream consumers (e.g. cleave's `ExposeView`)
+    /// that want to attach the metric map to their own report shape
+    /// without re-walking `iter()` and copying key by key.
+    pub fn as_map(&self) -> &BTreeMap<String, f64> {
+        &self.0
+    }
 }
 
 #[cfg(test)]

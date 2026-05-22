@@ -58,6 +58,7 @@ impl Iterator for Utf16Runs<'_> {
                         method: None,
                         kind: None,
                         section: None,
+                        ..ExtractedString::default()
                     });
                 }
             } else {

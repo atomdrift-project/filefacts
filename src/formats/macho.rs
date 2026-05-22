@@ -295,6 +295,15 @@ fn extract_header_and_loads(
         "macho.cpu_type",
         cpu_type_string(macho.header.cputype()),
     );
+    // Raw CPU type / file type / flags. The string-decoded fields above
+    // are for trait authors; consumers that need to round-trip the
+    // u32 (cleave's typed metrics keep the raw header values) read
+    // these `_raw` siblings.
+    put_u64(
+        values,
+        "macho.cpu_type_raw",
+        u64::from(macho.header.cputype()),
+    );
     put_u64(
         values,
         "macho.cpu_subtype",
@@ -304,6 +313,11 @@ fn extract_header_and_loads(
         values,
         "macho.file_type",
         file_type_string(macho.header.filetype),
+    );
+    put_u64(
+        values,
+        "macho.file_type_raw",
+        u64::from(macho.header.filetype),
     );
     // Pike-style decomposed flag array — matches `pe.dll_characteristics[]`
     // / `lnk.header.flags[]` schema rather than emitting a raw bitfield
@@ -320,10 +334,34 @@ fn extract_header_and_loads(
             ),
         );
     }
+    // Raw flags bitfield (typed consumers need the unmasked u32).
+    put_u64(values, "macho.flags_raw", u64::from(macho.header.flags));
     put_str(
         values,
         "macho.endian",
         if macho.little_endian { "little" } else { "big" },
+    );
+    // 32-bit vs 64-bit. Trait authors read `macho.class_bits == 64`;
+    // typed consumers (`MachoMetrics::class_bits`) take the same u64.
+    put_u64(
+        values,
+        "macho.class_bits",
+        if macho.is_64 { 64 } else { 32 },
+    );
+    // Entry point address — Mach-O's `entry` (LC_MAIN.entryoff) or
+    // legacy LC_UNIXTHREAD thread-state PC. `old_style_entry` is set
+    // when the entry came from LC_UNIXTHREAD.
+    put_u64(values, "macho.entry", macho.entry);
+    if macho.old_style_entry {
+        metrics.insert("macho.old_style_entry", 1.0);
+    }
+    // Raw header counts: number of load commands and their cumulative
+    // byte size. `macho.load_command_count` already exists as a
+    // metric; `macho.load_commands_size` is new.
+    put_u64(
+        values,
+        "macho.load_commands_size",
+        u64::from(macho.header.sizeofcmds),
     );
 
     let libs: Vec<JsonValue> = macho
@@ -364,6 +402,12 @@ fn extract_header_and_loads(
         _ => None,
     });
     if let Some(cs) = code_sig {
+        // Surface the LC_CODE_SIGNATURE blob size up front — cleave's
+        // typed `MachoMetrics::code_signature_size` reads this even
+        // when the deeper signature parse fails. The blob *offset*
+        // isn't useful to downstream consumers (they don't seek into
+        // it) so we skip it.
+        put_u64(values, "macho.code_signature_size", u64::from(cs.datasize));
         super::macho_code_signature::parse(
             bytes,
             cs.dataoff as usize,
@@ -436,6 +480,7 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
     let mut pagezero_size: u64 = 0;
     let mut entry_in_writable = false;
     let mut entry_in_segment = false;
+    let mut has_data_const = false;
     let mut segments_out: Vec<JsonValue> = Vec::new();
     for segment in &macho.segments {
         let name = segment.name().unwrap_or("").to_string();
@@ -450,6 +495,9 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
         }
         if name == "__PAGEZERO" {
             pagezero_size = segment.vmsize;
+        }
+        if name == "__DATA_CONST" {
+            has_data_const = true;
         }
         if entry != 0 {
             let end = segment.vmaddr.saturating_add(segment.vmsize);
@@ -480,6 +528,17 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
             if executable { "x" } else { "-" },
         );
         entry_obj.insert("perms".into(), JsonValue::String(perms));
+        // Raw VM protection bitfields. Typed consumers display them as
+        // hex (e.g. cleave's `MachoSegmentEntry::initprot_hex`); we
+        // emit the u32 and let the consumer choose the formatting.
+        entry_obj.insert(
+            "initprot_raw".into(),
+            JsonValue::Number(u64::from(segment.initprot).into()),
+        );
+        entry_obj.insert(
+            "maxprot_raw".into(),
+            JsonValue::Number(u64::from(segment.maxprot).into()),
+        );
         segments_out.push(JsonValue::Object(entry_obj));
     }
     metrics.insert("macho.wx_segment_count", wx_count as f64);
@@ -494,6 +553,9 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
     }
     if entry != 0 && !entry_in_segment {
         metrics.insert("macho.entry_outside_segments", 1.0);
+    }
+    if has_data_const {
+        metrics.insert("macho.has_data_const_segment", 1.0);
     }
     if !segments_out.is_empty() {
         values.insert("macho.segments", JsonValue::Array(segments_out));
@@ -512,25 +574,53 @@ fn entry_point(macho: &MachO<'_>) -> u64 {
     macho.entry
 }
 
-/// `LC_DYLD_CHAINED_FIXUPS` (`0x80000034`) replaces the legacy
-/// `LC_DYLD_INFO_ONLY` blob on modern Mach-O builds; presence
-/// signals the binary was linked with a recent dyld. Trait engines
-/// use the opposite (legacy fixups) as a "stale toolchain" signal.
+/// Per-load-command shape metrics. Combines several presence checks
+/// in one walk so we don't iterate the load-command list more than
+/// once: chained fixups vs legacy dyld_info, encrypted regions,
+/// legacy `LC_VERSION_MIN_*`, `LC_DATA_IN_CODE` entry count, and the
+/// `LC_MAIN` / `LC_UNIXTHREAD` entry-style markers.
 fn chained_fixups_marker(macho: &MachO<'_>, metrics: &mut Metrics) {
     const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
     let mut has_chained = false;
     let mut has_legacy_dyld_info = false;
+    let mut has_encrypted = false;
+    let mut uses_legacy_version_min = false;
+    let mut data_in_code_count: u32 = 0;
+    let mut has_main_command = false;
+    let mut has_unixthread_command = false;
     for lc in &macho.load_commands {
         let cmd = lc.command.cmd();
         if cmd == LC_DYLD_CHAINED_FIXUPS {
             has_chained = true;
         }
-        if matches!(
-            lc.command,
+        match lc.command {
             mach::load_command::CommandVariant::DyldInfo(_)
-                | mach::load_command::CommandVariant::DyldInfoOnly(_)
-        ) {
-            has_legacy_dyld_info = true;
+            | mach::load_command::CommandVariant::DyldInfoOnly(_) => {
+                has_legacy_dyld_info = true;
+            }
+            mach::load_command::CommandVariant::EncryptionInfo32(e) if e.cryptid != 0 => {
+                has_encrypted = true;
+            }
+            mach::load_command::CommandVariant::EncryptionInfo64(e) if e.cryptid != 0 => {
+                has_encrypted = true;
+            }
+            mach::load_command::CommandVariant::VersionMinMacosx(_)
+            | mach::load_command::CommandVariant::VersionMinIphoneos(_)
+            | mach::load_command::CommandVariant::VersionMinTvos(_)
+            | mach::load_command::CommandVariant::VersionMinWatchos(_) => {
+                uses_legacy_version_min = true;
+            }
+            mach::load_command::CommandVariant::DataInCode(c) => {
+                // Each entry is 8 bytes (offset:u32, length:u16, kind:u16).
+                data_in_code_count = c.datasize / 8;
+            }
+            mach::load_command::CommandVariant::Main(_) => {
+                has_main_command = true;
+            }
+            mach::load_command::CommandVariant::Unixthread(_) => {
+                has_unixthread_command = true;
+            }
+            _ => {}
         }
     }
     if has_chained {
@@ -538,6 +628,21 @@ fn chained_fixups_marker(macho: &MachO<'_>, metrics: &mut Metrics) {
     }
     if has_legacy_dyld_info {
         metrics.insert("macho.has_dyld_info_legacy", 1.0);
+    }
+    if has_encrypted {
+        metrics.insert("macho.has_encrypted_section", 1.0);
+    }
+    if uses_legacy_version_min {
+        metrics.insert("macho.uses_legacy_version_min", 1.0);
+    }
+    if data_in_code_count > 0 {
+        metrics.insert("macho.data_in_code_count", f64::from(data_in_code_count));
+    }
+    if has_main_command {
+        metrics.insert("macho.has_main_command", 1.0);
+    }
+    if has_unixthread_command {
+        metrics.insert("macho.has_unixthread_command", 1.0);
     }
 }
 
@@ -644,6 +749,7 @@ fn load_dylibs(macho: &MachO<'_>, values: &mut Values) {
             mach::load_command::CommandVariant::LoadWeakDylib(c) => ("load_weak", c.dylib),
             mach::load_command::CommandVariant::ReexportDylib(c) => ("reexport", c.dylib),
             mach::load_command::CommandVariant::LazyLoadDylib(c) => ("lazy_load", c.dylib),
+            mach::load_command::CommandVariant::LoadUpwardDylib(c) => ("upward", c.dylib),
             _ => continue,
         };
         // The dylib name is an `LcStr` (offset into the command's
@@ -660,9 +766,19 @@ fn load_dylibs(macho: &MachO<'_>, values: &mut Values) {
             "current_version".into(),
             JsonValue::String(decode_version_nibbles(dylib.current_version)),
         );
+        // Raw packed u32 — typed consumers (cleave's `MachoDylibEntry`)
+        // keep the unencoded value alongside the human-readable form.
+        entry.insert(
+            "current_version_raw".into(),
+            JsonValue::Number(u64::from(dylib.current_version).into()),
+        );
         entry.insert(
             "compatibility_version".into(),
             JsonValue::String(decode_version_nibbles(dylib.compatibility_version)),
+        );
+        entry.insert(
+            "compatibility_version_raw".into(),
+            JsonValue::Number(u64::from(dylib.compatibility_version).into()),
         );
         if dylib.timestamp != 0 {
             entry.insert(
@@ -1192,6 +1308,77 @@ mod tests {
         // PIE / stripped metrics emitted for every Mach-O.
         assert!(m.get("binary.is_pie").is_some());
         assert!(m.get("binary.is_stripped").is_some());
+    }
+
+    /// Pin the `_raw` header fields and class_bits / entry / load
+    /// command size values that downstream typed consumers
+    /// (`cleave::MachoMetrics`) deserialise. test.macho is an x86_64
+    /// (cputype `0x01000007`) thin executable (`MH_EXECUTE = 0x2`).
+    #[test]
+    fn raw_header_fields_pinned() {
+        let bytes = read_fixture("test.macho");
+        let (v, _, _) = run(&bytes);
+        assert_eq!(
+            v.get("macho.cpu_type_raw").and_then(|x| x.as_u64()),
+            Some(0x0100_0007),
+        );
+        assert_eq!(
+            v.get("macho.file_type_raw").and_then(|x| x.as_u64()),
+            Some(0x2),
+        );
+        // Flags must be non-zero for any real Mach-O — at minimum
+        // MH_DYLDLINK | MH_TWOLEVEL.
+        assert!(v
+            .get("macho.flags_raw")
+            .and_then(|x| x.as_u64())
+            .is_some_and(|f| f != 0),);
+        // class_bits is 64 for an arm64 executable.
+        assert_eq!(v.get("macho.class_bits").and_then(|x| x.as_u64()), Some(64));
+        // Entry point must be set on an executable (LC_MAIN.entryoff).
+        assert!(v.get("macho.entry").and_then(|x| x.as_u64()).unwrap_or(0) > 0);
+        // sizeofcmds is always non-zero for a valid Mach-O.
+        assert!(v
+            .get("macho.load_commands_size")
+            .and_then(|x| x.as_u64())
+            .is_some_and(|n| n > 0));
+    }
+
+    /// Pin per-segment raw initprot/maxprot fields used by cleave's
+    /// `MachoSegmentEntry::{initprot_hex, maxprot_hex}`.
+    #[test]
+    fn segment_raw_protections_emitted() {
+        let bytes = read_fixture("test.macho");
+        let (v, _, _) = run(&bytes);
+        let segs = v
+            .get("macho.segments")
+            .and_then(|s| s.as_array())
+            .expect("segments emitted");
+        assert!(!segs.is_empty());
+        // __TEXT segment has initprot r-x (5) and maxprot rwx (7) on
+        // every Apple-shipped binary; the trivial test fixture matches.
+        let text = segs
+            .iter()
+            .find(|s| s.get("name").and_then(|n| n.as_str()) == Some("__TEXT"))
+            .expect("__TEXT segment present");
+        assert_eq!(text.get("initprot_raw").and_then(|x| x.as_u64()), Some(5));
+        assert_eq!(text.get("maxprot_raw").and_then(|x| x.as_u64()), Some(5));
+    }
+
+    /// Pin per-dylib raw current/compat versions used by cleave's
+    /// typed `MachoDylibEntry`.
+    #[test]
+    fn load_dylibs_raw_versions_emitted() {
+        let bytes = read_fixture("test.macho");
+        let (v, _, _) = run(&bytes);
+        let dylibs = v
+            .get("macho.load_dylibs")
+            .and_then(|d| d.as_array())
+            .expect("load_dylibs emitted");
+        assert!(!dylibs.is_empty());
+        for entry in dylibs {
+            assert!(entry.get("current_version_raw").is_some());
+            assert!(entry.get("compatibility_version_raw").is_some());
+        }
     }
 
     #[test]

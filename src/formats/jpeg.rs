@@ -22,7 +22,9 @@ use serde_json::{json, Value as JsonValue};
 
 use crate::error::Error;
 use crate::formats::common::{extract_ascii_strings, put_str};
+use crate::formats::image_stats;
 use crate::output::{Metrics, Strings, Values};
+use crate::scan::entropy;
 
 pub(super) fn extract(
     bytes: &[u8],
@@ -39,6 +41,7 @@ pub(super) fn extract(
     let mut state = JpegState::default();
     state.soi_count = 1;
     let mut pos = 2usize;
+    let mut eoi_pos: Option<usize> = None;
 
     loop {
         while pos < bytes.len() && bytes[pos] != 0xFF {
@@ -56,7 +59,10 @@ pub(super) fn extract(
 
         match marker {
             0xD8 => state.soi_count += 1,
-            0xD9 => break,
+            0xD9 => {
+                eoi_pos = Some(pos);
+                break;
+            }
             0xD0..=0xD7 | 0x01 => continue,
             0xDA => {
                 if pos + 1 >= bytes.len() {
@@ -86,8 +92,16 @@ pub(super) fn extract(
                 }
                 let body = &bytes[body_start..body_end];
 
+                let payload_len = seg_len - 2;
                 match marker {
-                    0xFE => state.com_count += 1,
+                    0xFE => {
+                        state.com_count += 1;
+                        state.comment_bytes =
+                            state.comment_bytes.saturating_add(payload_len as u64);
+                    }
+                    0xE1 => {
+                        state.exif_size = state.exif_size.saturating_add(payload_len as u64);
+                    }
                     0xDB => state.dqt_count += 1,
                     0xC4 => state.dht_count += 1,
                     _ => {}
@@ -164,8 +178,76 @@ pub(super) fn extract(
     metrics.insert("jpeg.dht_count", f64::from(state.dht_count));
     metrics.insert("jpeg.soi_count", f64::from(state.soi_count));
     metrics.insert("jpeg.maker_note_bytes", f64::from(state.maker_note_bytes));
+    metrics.insert("jpeg.comment_bytes", state.comment_bytes as f64);
+    metrics.insert("jpeg.exif_size", state.exif_size as f64);
+    let appended_bytes = eoi_pos.map_or(0u64, |p| bytes.len().saturating_sub(p) as u64);
+    metrics.insert("jpeg.appended_bytes", appended_bytes as f64);
+
+    // Best-effort pixel-statistic pass. Decoder errors are swallowed —
+    // a JPEG with a weird color space or a truncated bitstream still
+    // gets the structural metrics above.
+    extract_pixel_stats(bytes, metrics);
 
     Ok(())
+}
+
+/// Decode the JPEG (cap-protected) and emit pixel-statistic metrics:
+/// dimensions, per-channel entropy, edge density, histogram flatness.
+/// `binary.overall_entropy` is the Shannon entropy of the raw file
+/// bytes — emitted unconditionally because it's cheap and useful even
+/// when the pixel decode bails.
+fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
+    use jpeg_decoder::Decoder;
+    use std::io::Cursor;
+
+    // Always emit overall-file entropy — trait engines threshold on
+    // this for encrypted/compressed payload detection.
+    metrics.insert("binary.overall_entropy", entropy::shannon(bytes));
+
+    let mut decoder = Decoder::new(Cursor::new(bytes));
+    if decoder.read_info().is_err() {
+        return;
+    }
+    let Some(info) = decoder.info() else {
+        return;
+    };
+    let width = u32::from(info.width);
+    let height = u32::from(info.height);
+    let channels: u32 = match info.pixel_format {
+        jpeg_decoder::PixelFormat::L8 | jpeg_decoder::PixelFormat::L16 => 1,
+        jpeg_decoder::PixelFormat::RGB24 => 3,
+        jpeg_decoder::PixelFormat::CMYK32 => 4,
+    };
+
+    metrics.insert("image.width", f64::from(width));
+    metrics.insert("image.height", f64::from(height));
+    metrics.insert("image.channels", f64::from(channels));
+
+    let predicted = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(channels as usize);
+    if predicted > image_stats::MAX_DECODE_BYTES {
+        return;
+    }
+    let Ok(pixels) = decoder.decode() else {
+        return;
+    };
+
+    let pixel_entropy = entropy::shannon(&pixels);
+    metrics.insert("image.pixel_entropy", pixel_entropy);
+    metrics.insert("image.histogram_flatness", pixel_entropy / 8.0);
+    let density =
+        image_stats::edge_density(&pixels, width as usize, height as usize, channels as usize);
+    metrics.insert("image.edge_density", f64::from(density));
+
+    let (r, g, b, _a) = if channels >= 3 {
+        image_stats::channel_entropy(&pixels, channels as usize)
+    } else {
+        (0.0, 0.0, 0.0, 0.0)
+    };
+    metrics.insert("image.r_entropy", f64::from(r));
+    metrics.insert("image.g_entropy", f64::from(g));
+    metrics.insert("image.b_entropy", f64::from(b));
 }
 
 #[derive(Default)]
@@ -177,6 +259,8 @@ struct JpegState {
     dht_count: u32,
     soi_count: u32,
     maker_note_bytes: u32,
+    comment_bytes: u64,
+    exif_size: u64,
     exif_present: bool,
     exif_make: Option<String>,
     exif_model: Option<String>,
@@ -485,6 +569,47 @@ mod tests {
         let buf = [0xFF, 0xD8, 0xFF, 0xE1, 0x27, 0x10];
         let (_, _) = run(&buf);
         // No panic, no assertion needed.
+    }
+
+    #[test]
+    fn comment_bytes_metric_tracks_payload_size() {
+        let jpeg = build_jpeg(&[(0xFE, b"hello world".to_vec())]);
+        let (_, m) = run(&jpeg);
+        assert_eq!(m.get("jpeg.comment_bytes"), Some(11.0));
+    }
+
+    #[test]
+    fn appended_bytes_metric_tracks_post_eoi_data() {
+        let mut jpeg = build_jpeg(&[]);
+        jpeg.extend_from_slice(b"hidden payload");
+        let (_, m) = run(&jpeg);
+        assert_eq!(m.get("jpeg.appended_bytes"), Some(14.0));
+    }
+
+    #[test]
+    fn exif_size_metric_tracks_app1_payload() {
+        // APP1 segment with EXIF prefix — exif_size = payload length.
+        let mut body = b"Exif\0\0".to_vec();
+        body.extend_from_slice(&[0u8; 20]);
+        let jpeg = build_jpeg(&[(0xE1, body)]);
+        let (_, m) = run(&jpeg);
+        // payload = "Exif\0\0" (6) + 20 zeros = 26.
+        assert_eq!(m.get("jpeg.exif_size"), Some(26.0));
+    }
+
+    #[test]
+    fn emits_binary_overall_entropy() {
+        let jpeg = build_jpeg(&[(0xFE, b"hello".to_vec())]);
+        let (_, m) = run(&jpeg);
+        assert!(m.get("binary.overall_entropy").is_some());
+    }
+
+    #[test]
+    fn malformed_jpeg_still_emits_binary_entropy() {
+        // Bytes that pass the SOI check but aren't decodable.
+        let bytes = vec![0xFF, 0xD8, 0xFF, 0xD9];
+        let (_, m) = run(&bytes);
+        assert!(m.get("binary.overall_entropy").is_some());
     }
 
     #[test]

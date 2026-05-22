@@ -375,6 +375,7 @@ fn parse_methods(
             source: "java-class",
             offset: None,
             kind,
+            ..crate::Function::default()
         });
     }
     Some(u32::from(count))

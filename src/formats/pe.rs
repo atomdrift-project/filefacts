@@ -16,7 +16,7 @@ use serde_json::{json, Value as JsonValue};
 use crate::error::Error;
 use crate::formats::common::{
     extract_binary_strings, extract_utf16_strings, hex_encode, put_i64, put_str, put_u64,
-    rizin_fallback,
+    rizin_fallback_with_sections,
 };
 use crate::formats::goblin_safe;
 use crate::output::{Errors, Metrics, Section, Strings, Values};
@@ -140,7 +140,15 @@ pub(super) fn extract(
         super::pe_image_hash::extract(&pe, bytes, values, metrics);
         super::pe_rich::extract(bytes, values);
         super::build_toolchain::from_pe_rich(values);
-        rizin_fallback(bytes, imports_out, exports_out, functions_out, metrics);
+        rizin_fallback_with_sections(
+            bytes,
+            imports_out,
+            exports_out,
+            functions_out,
+            sections_out,
+            metrics,
+            "pe",
+        );
         return Ok(());
     }
 
@@ -732,8 +740,7 @@ fn resource_types(
     // list of canonical `RT_*` names. Sorting on the numeric id (not
     // the string) keeps the ordering stable across rt_name's
     // unknown-id fallback, which collapses many ids to "RT_UNKNOWN".
-    let mut type_ids: std::collections::BTreeSet<u16> =
-        std::collections::BTreeSet::new();
+    let mut type_ids: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
     for entry in rd.entries().flatten() {
         if let Some(id) = entry.id() {
             type_ids.insert(id);
@@ -970,7 +977,10 @@ fn clr_metadata(pe: &PE<'_>, values: &mut Values) {
     crate::formats::common::put_str(
         values,
         "pe.clr.runtime_version",
-        format!("{}.{}", hdr.major_runtime_version, hdr.minor_runtime_version),
+        format!(
+            "{}.{}",
+            hdr.major_runtime_version, hdr.minor_runtime_version
+        ),
     );
     if hdr.is_il_only() {
         crate::formats::common::put_u64(values, "pe.clr.is_il_only", 1);
@@ -1142,10 +1152,7 @@ fn section_anomalies(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &m
     }
 
     metrics.insert("pe.section_overflow_count", overflow_names.len() as f64);
-    metrics.insert(
-        "pe.misaligned_section_count",
-        misaligned_names.len() as f64,
-    );
+    metrics.insert("pe.misaligned_section_count", misaligned_names.len() as f64);
     metrics.insert("pe.bss_like_section_count", bss_like as f64);
     if !overflow_names.is_empty() {
         values.insert(
@@ -1156,7 +1163,12 @@ fn section_anomalies(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &m
     if !misaligned_names.is_empty() {
         values.insert(
             "pe.misaligned_sections",
-            JsonValue::Array(misaligned_names.into_iter().map(JsonValue::String).collect()),
+            JsonValue::Array(
+                misaligned_names
+                    .into_iter()
+                    .map(JsonValue::String)
+                    .collect(),
+            ),
         );
     }
 
@@ -1169,7 +1181,11 @@ fn section_anomalies(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &m
             .map(|s| {
                 let span = s.virtual_size.max(s.size_of_raw_data);
                 let name = s.name().unwrap_or("").to_string();
-                (s.virtual_address, s.virtual_address.saturating_add(span), name)
+                (
+                    s.virtual_address,
+                    s.virtual_address.saturating_add(span),
+                    name,
+                )
             })
             .collect();
         by_va.sort_by_key(|t| t.0);
@@ -1185,12 +1201,7 @@ fn section_anomalies(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &m
             metrics.insert("pe.section_overlap_count", overlap_names.len() as f64);
             values.insert(
                 "pe.overlapping_sections",
-                JsonValue::Array(
-                    overlap_names
-                        .into_iter()
-                        .map(JsonValue::String)
-                        .collect(),
-                ),
+                JsonValue::Array(overlap_names.into_iter().map(JsonValue::String).collect()),
             );
         }
     }
@@ -1297,8 +1308,12 @@ fn checksum(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
     let pe_offset = pe.header.dos_header.pe_pointer as usize;
     let opt_header_offset = pe_offset + 4 + 20; // signature + COFF header
     let checksum_offset = match opt.standard_fields.magic {
-        MAGIC_32 => opt_header_offset + SIZEOF_STANDARD_FIELDS_32 + OFFSET_WINDOWS_FIELDS_32_CHECKSUM,
-        MAGIC_64 => opt_header_offset + SIZEOF_STANDARD_FIELDS_64 + OFFSET_WINDOWS_FIELDS_64_CHECKSUM,
+        MAGIC_32 => {
+            opt_header_offset + SIZEOF_STANDARD_FIELDS_32 + OFFSET_WINDOWS_FIELDS_32_CHECKSUM
+        }
+        MAGIC_64 => {
+            opt_header_offset + SIZEOF_STANDARD_FIELDS_64 + OFFSET_WINDOWS_FIELDS_64_CHECKSUM
+        }
         _ => return,
     };
     if checksum_offset + 4 > bytes.len() {
@@ -1307,10 +1322,7 @@ fn checksum(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
     let computed = pe_checksum(bytes, checksum_offset);
     metrics.insert("pe.computed_checksum", f64::from(computed));
     if stored != 0 {
-        metrics.insert(
-            "pe.checksum_valid",
-            f64::from(u8::from(stored == computed)),
-        );
+        metrics.insert("pe.checksum_valid", f64::from(u8::from(stored == computed)));
     }
 }
 
@@ -1711,8 +1723,8 @@ mod tests {
         // e_lfanew lives at 0x3C..0x40 as a little-endian u32 — locates
         // the PE header start, which is the upper bound of the stub
         // region the anomaly detector inspects.
-        let pe_offset = u32::from_le_bytes([bytes[0x3c], bytes[0x3d], bytes[0x3e], bytes[0x3f]])
-            as usize;
+        let pe_offset =
+            u32::from_le_bytes([bytes[0x3c], bytes[0x3d], bytes[0x3e], bytes[0x3f]]) as usize;
         assert!(pe_offset > 0x40, "fixture should have a stub region");
         for b in bytes[0x40..pe_offset].iter_mut() {
             *b = 0;
@@ -1734,8 +1746,8 @@ mod tests {
     #[test]
     fn dos_stub_modified_without_zeroed() {
         let mut bytes = read_fixture("test.exe");
-        let pe_offset = u32::from_le_bytes([bytes[0x3c], bytes[0x3d], bytes[0x3e], bytes[0x3f]])
-            as usize;
+        let pe_offset =
+            u32::from_le_bytes([bytes[0x3c], bytes[0x3d], bytes[0x3e], bytes[0x3f]]) as usize;
         for b in bytes[0x40..pe_offset].iter_mut() {
             *b = 0xab;
         }

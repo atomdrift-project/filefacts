@@ -23,7 +23,8 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -35,6 +36,149 @@ use crate::output::{Export, Function, Import, Metrics};
 /// adversarial samples with packed code paths can take longer.
 /// Match cleave's default timeout so behaviour is consistent.
 const RIZIN_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Soft memory cap on a single rizin subprocess (4 GiB). Enforced via
+/// `setrlimit(RLIMIT_AS, ...)` (Linux) / `setrlimit(RLIMIT_DATA, ...)`
+/// (macOS) in a `pre_exec` hook. Legitimate rizin analysis never
+/// approaches this size — exceeding it indicates pathological input
+/// and the kernel will abort the subprocess instead of letting it
+/// drag the whole scan into OOM.
+const RIZIN_MEMORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Per-process byte cap on a rizin subprocess's stdout. Mirrors
+/// cleave's defence: pathological inputs can produce gigabytes of
+/// JSON; we kill the process group on overflow and record the reason.
+const MAX_SUBPROCESS_OUTPUT: usize = 100 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Process-wide hardening state.
+// ---------------------------------------------------------------------------
+
+/// Live rizin process-group IDs. Populated on spawn, drained in every
+/// cleanup path. `kill_all_rizin_groups` reads this list and SIGKILLs
+/// every entry so host CLI signal handlers can reap in-flight rizin
+/// subprocesses before a forced `process::exit`.
+static RIZIN_PGIDS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+/// Counter — positive value means rizin invocation is disabled. Built
+/// as a counter (not a `bool`) so `scoped_disable` can RAII-stack
+/// without clobbering an outer `disable()` call.
+static RIZIN_DISABLED: AtomicUsize = AtomicUsize::new(0);
+
+/// Statistics (total, successes, timeouts, failures, memory_exceeded).
+static RIZIN_TOTAL: AtomicU64 = AtomicU64::new(0);
+static RIZIN_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+static RIZIN_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+static RIZIN_FAILURES: AtomicU64 = AtomicU64::new(0);
+static RIZIN_MEMORY_EXCEEDED: AtomicU64 = AtomicU64::new(0);
+
+fn register_pgid(pgid: i32) {
+    if let Ok(mut g) = RIZIN_PGIDS.lock() {
+        g.push(pgid);
+    }
+}
+
+fn unregister_pgid(pgid: i32) {
+    if let Ok(mut g) = RIZIN_PGIDS.lock() {
+        if let Some(idx) = g.iter().position(|&p| p == pgid) {
+            g.swap_remove(idx);
+        }
+    }
+}
+
+struct PgidGuard(i32);
+impl Drop for PgidGuard {
+    fn drop(&mut self) {
+        unregister_pgid(self.0);
+    }
+}
+
+/// SIGKILL the process group of every currently-live rizin subprocess.
+///
+/// Intended for host CLI signal handlers (e.g. `ctrlc`) that need to
+/// reap rizin workers before `process::exit`. Idempotent: entries are
+/// removed from the registry by the normal cleanup paths, so calling
+/// this after a clean shutdown is a no-op. No-op on non-Unix.
+pub fn kill_all_rizin_groups() {
+    let pgids: Vec<i32> = RIZIN_PGIDS.lock().map(|g| g.clone()).unwrap_or_default();
+    #[cfg(unix)]
+    for pgid in &pgids {
+        // SAFETY: libc::kill with a negative pid sends the signal to
+        // the process group. Async-signal-safe; tolerates already-dead
+        // groups (ESRCH) silently.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::kill(-(*pgid as libc::pid_t), libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pgids;
+}
+
+/// Disable rizin globally for the rest of the process. Each call must
+/// be paired with the inverse via `enable()` or scoped via
+/// `scoped_disable()`. Used by tests and benches to ensure
+/// deterministic behaviour without actually invoking rizin.
+pub fn disable() {
+    RIZIN_DISABLED.fetch_add(1, Ordering::SeqCst);
+}
+
+/// RAII guard returned by [`scoped_disable`]. Re-enables rizin on
+/// drop. Multiple guards stack: rizin stays disabled until every
+/// guard is dropped.
+pub struct ScopedDisable {
+    _private: (),
+}
+
+impl Drop for ScopedDisable {
+    fn drop(&mut self) {
+        RIZIN_DISABLED.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Disable rizin for the lifetime of the returned guard.
+pub fn scoped_disable() -> ScopedDisable {
+    RIZIN_DISABLED.fetch_add(1, Ordering::SeqCst);
+    ScopedDisable { _private: () }
+}
+
+/// `true` when [`disable`] / [`scoped_disable`] has muted rizin.
+pub fn is_disabled() -> bool {
+    RIZIN_DISABLED.load(Ordering::SeqCst) > 0
+}
+
+/// Cumulative rizin subprocess counters as
+/// `(total, successes, timeouts, failures, memory_exceeded)`.
+pub fn stats() -> (u64, u64, u64, u64, u64) {
+    (
+        RIZIN_TOTAL.load(Ordering::Relaxed),
+        RIZIN_SUCCESSES.load(Ordering::Relaxed),
+        RIZIN_TIMEOUTS.load(Ordering::Relaxed),
+        RIZIN_FAILURES.load(Ordering::Relaxed),
+        RIZIN_MEMORY_EXCEEDED.load(Ordering::Relaxed),
+    )
+}
+
+/// Emit cumulative rizin statistics as a single `tracing::info!` line.
+/// Host CLIs call this at shutdown for telemetry. No-op when no rizin
+/// invocations have happened.
+pub fn log_stats() {
+    let (total, successes, timeouts, failures, memory_exceeded) = stats();
+    if total == 0 {
+        return;
+    }
+    let total_f = total as f64;
+    tracing::info!(
+        total_calls = total,
+        successes,
+        timeouts,
+        failures,
+        memory_exceeded,
+        timeout_rate_pct = (timeouts as f64 / total_f) * 100.0,
+        failure_rate_pct = (failures as f64 / total_f) * 100.0,
+        "expose rizin subprocess statistics"
+    );
+}
 
 /// One-shot PATH probe. Cached so we don't fork `which` per file.
 fn rizin_binary() -> Option<&'static Path> {
@@ -84,6 +228,9 @@ pub fn available() -> bool {
 /// Writes `bytes` to a temp file (rizin reads files from disk, not
 /// stdin) and deletes it when done.
 pub(crate) fn recover(bytes: &[u8]) -> Option<RizinRecovery> {
+    if is_disabled() {
+        return None;
+    }
     let bin = rizin_binary()?;
     recover_with_bin(bin, bytes)
 }
@@ -98,22 +245,25 @@ fn recover_with_bin_for_test(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> 
 }
 
 fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
+    // The disable check intentionally lives only in the public
+    // `recover()` entry, not here — tests inject a shim via
+    // `recover_with_bin_for_test` and need a deterministic spawn
+    // path that isn't affected by other tests' `scoped_disable`
+    // guards running in parallel.
+    RIZIN_TOTAL.fetch_add(1, Ordering::Relaxed);
+
     // Materialise the bytes as a temp file. Rizin requires a path —
     // there's no stdin mode for binary analysis. Concurrent callers
     // need distinct files: include a process-wide atomic counter
     // alongside the PID so two threads running `recover()` at once
     // don't trample each other's temp file (the second call's write
     // would race the first's read-and-spawn).
-    use std::sync::atomic::{AtomicU64, Ordering};
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut temp = std::env::temp_dir();
-    temp.push(format!(
-        "expose-rizin-{}-{}.bin",
-        std::process::id(),
-        seq
-    ));
+    temp.push(format!("expose-rizin-{}-{}.bin", std::process::id(), seq));
     if std::fs::write(&temp, bytes).is_err() {
+        RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     // Auto-cleanup guard — fires whether we return Some/None below.
@@ -138,29 +288,54 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
         "-e",
         "log.level=0",
         "-c",
-        "iij; echo ===SEP===; iEj; echo ===SEP===; aaa; echo ===SEP===; aflj",
+        "iij; echo ===SEP===; iEj; echo ===SEP===; aaa; echo ===SEP===; aflj; echo ===SEP===; iSj",
         &path_str,
     ]);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::null());
 
-    let mut child = cmd.spawn().ok()?;
+    apply_unix_hardening(&mut cmd);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => {
+            RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+    let child_id = child.id();
+    register_pgid(child_id as i32);
+    let _pgid_guard = PgidGuard(child_id as i32);
+    let output_cap_hit = Arc::new(AtomicBool::new(false));
+
     // Drain stdout in a background thread while we wait for exit.
     // Without this, `aflj` output on a binary with thousands of
     // discovered functions overflows the pipe buffer (~64 KB on
     // macOS), the child blocks on write, and `wait_with_output()`
     // deadlocks waiting for exit. Capped at 100 MiB to bound the
-    // worst-case adversarial blob; matches cleave's defence.
-    const MAX_OUTPUT: usize = 100 * 1024 * 1024;
-    let mut stdout_handle = child.stdout.take()?;
+    // worst-case adversarial blob; matches cleave's defence. On
+    // overflow the reader thread SIGKILLs the rizin process group so
+    // both pipes close promptly.
+    let mut stdout_handle = match child.stdout.take() {
+        Some(h) => h,
+        None => {
+            RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+    let cap_flag = output_cap_hit.clone();
     let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         use std::io::Read;
         let mut buf = Vec::new();
-        let _ = (&mut stdout_handle)
-            .take(MAX_OUTPUT as u64)
-            .read_to_end(&mut buf);
+        let n = (&mut stdout_handle)
+            .take(MAX_SUBPROCESS_OUTPUT as u64)
+            .read_to_end(&mut buf)
+            .unwrap_or(0);
+        if n >= MAX_SUBPROCESS_OUTPUT {
+            mark_output_cap_hit(&cap_flag, child_id);
+        }
         let _ = stdout_tx.send(buf);
     });
 
@@ -175,20 +350,30 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
                 break;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-            Err(_) => return None,
+            Err(_) => {
+                RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
         }
     }
     let status = match exit_status {
         Some(s) => s,
         None => {
+            RIZIN_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            kill_process_group(child_id);
             let _ = child.kill();
             let _ = child.wait();
             return None;
         }
     };
+    let cap_hit = output_cap_hit.load(Ordering::Acquire);
+    if cap_hit {
+        RIZIN_MEMORY_EXCEEDED.fetch_add(1, Ordering::Relaxed);
+    }
     // Rizin crashed / aborted — partial stdout is unreliable on a
     // failed run, so we drop it rather than emit phantom data.
     if !status.success() {
+        RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     // Bounded drain: if a rizin grandchild still holds the
@@ -199,10 +384,82 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
         .recv_timeout(Duration::from_secs(5))
         .unwrap_or_default();
     if stdout_bytes.is_empty() {
+        RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
         return None;
     }
+    RIZIN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
     let stdout = String::from_utf8_lossy(&stdout_bytes);
     Some(parse_recovery_output(&stdout))
+}
+
+/// Apply Unix subprocess hardening: own process group, RLIMIT_AS /
+/// RLIMIT_DATA memory cap, PR_SET_PDEATHSIG so the child dies if the
+/// parent does. No-op on non-Unix.
+#[cfg(unix)]
+fn apply_unix_hardening(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+    // SAFETY: pre_exec runs in the forked child between fork() and
+    // exec(). Only async-signal-safe calls are allowed; setrlimit and
+    // prctl are both on the POSIX list. No allocation, no locks.
+    #[allow(unsafe_code)]
+    unsafe {
+        cmd.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: RIZIN_MEMORY_LIMIT_BYTES as libc::rlim_t,
+                rlim_max: RIZIN_MEMORY_LIMIT_BYTES as libc::rlim_t,
+            };
+            // RLIMIT_AS caps total virtual address space on Linux —
+            // the one that actually bites mmap/malloc. RLIMIT_DATA is
+            // the best approximation on macOS. Failures are ignored:
+            // if the caller is already limited below our target,
+            // EINVAL is expected and the caller's tighter limit wins.
+            #[cfg(target_os = "linux")]
+            {
+                libc::setrlimit(libc::RLIMIT_AS, &limit);
+                // Ask the kernel to SIGKILL this subprocess if the
+                // parent dies without running our own cleanup —
+                // covers panic/abort/SIGKILL/OOM paths where the
+                // ctrlc handler never gets to run
+                // `kill_all_rizin_groups`.
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            }
+            libc::setrlimit(libc::RLIMIT_DATA, &limit);
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn apply_unix_hardening(_: &mut Command) {}
+
+/// SIGKILL a process group. Used by the reader thread on output-cap
+/// overflow and by the timeout cleanup path. No-op on non-Unix.
+fn kill_process_group(child_id: u32) {
+    #[cfg(unix)]
+    // SAFETY: libc::kill with negative pid targets the process group.
+    // Async-signal-safe; tolerates already-dead groups silently.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::kill(-(child_id as libc::pid_t), libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = child_id;
+}
+
+/// Mark the output-cap flag and SIGKILL the rizin process group so
+/// both pipes close promptly. First call sets the flag and kills;
+/// subsequent calls are no-ops.
+fn mark_output_cap_hit(flag: &Arc<AtomicBool>, child_id: u32) {
+    if flag.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    tracing::warn!(
+        pid = child_id,
+        cap_bytes = MAX_SUBPROCESS_OUTPUT,
+        "rizin output cap exceeded; killing process group"
+    );
+    kill_process_group(child_id);
 }
 
 /// Split rizin's combined stdout (four `===SEP===`-delimited blocks)
@@ -236,10 +493,17 @@ fn parse_recovery_output(stdout: &str) -> RizinRecovery {
         .next()
         .and_then(|p| parse_json_array::<RawFunction>(p).ok())
         .unwrap_or_default();
+    // Fifth (optional) block is `iSj` — sections. Older callers don't
+    // emit it; absence degrades to empty Vec.
+    let sections = parts
+        .next()
+        .and_then(|p| parse_json_array::<RawSection>(p).ok())
+        .unwrap_or_default();
     RizinRecovery {
         imports,
         exports,
         functions,
+        sections,
     }
 }
 
@@ -253,24 +517,73 @@ fn parse_json_array<T: serde::de::DeserializeOwned>(
 }
 
 /// Raw rizin output — converted into expose's typed `Import`/
-/// `Export`/`Function` views by `recover()`'s caller.
+/// `Export`/`Function`/`Section` views by `recover()`'s caller.
 pub(crate) struct RizinRecovery {
     imports: Vec<RawImport>,
     exports: Vec<RawExport>,
     functions: Vec<RawFunction>,
+    sections: Vec<RawSection>,
+}
+
+/// Counts of entries rizin contributed to each typed view through
+/// [`RizinRecovery::apply`]. Returned so format extractors can emit
+/// the `*.rizin_recovered_*` metrics that signal "this view was
+/// filled in by rizin, not goblin" — the same pattern cleave used
+/// historically.
+#[derive(Default, Debug, Clone, Copy)]
+pub(crate) struct RecoveryCounts {
+    pub imports: u32,
+    pub exports: u32,
+    pub functions: u32,
+    pub sections: u32,
 }
 
 impl RizinRecovery {
     /// Push recovered symbols into expose's typed views and emit the
     /// rizin-specific `binary.*` metrics. Only fills slots that
     /// goblin left empty — never overwrites existing data.
+    ///
+    /// The legacy three-view entry-point. Callers that also want
+    /// section recovery use [`apply_with_sections`] instead.
     pub(crate) fn apply(
         self,
         imports_out: &mut crate::Imports,
         exports_out: &mut crate::Exports,
         functions_out: &mut crate::Functions,
         metrics: &mut Metrics,
-    ) {
+    ) -> RecoveryCounts {
+        self.apply_inner(imports_out, exports_out, functions_out, None, metrics)
+    }
+
+    /// Variant of [`apply`] that also recovers sections. PE / ELF /
+    /// Mach-O extractors call this when goblin returned an empty
+    /// section table (packed binaries are the common case).
+    pub(crate) fn apply_with_sections(
+        self,
+        imports_out: &mut crate::Imports,
+        exports_out: &mut crate::Exports,
+        functions_out: &mut crate::Functions,
+        sections_out: &mut Vec<crate::output::Section>,
+        metrics: &mut Metrics,
+    ) -> RecoveryCounts {
+        self.apply_inner(
+            imports_out,
+            exports_out,
+            functions_out,
+            Some(sections_out),
+            metrics,
+        )
+    }
+
+    fn apply_inner(
+        self,
+        imports_out: &mut crate::Imports,
+        exports_out: &mut crate::Exports,
+        functions_out: &mut crate::Functions,
+        sections_out: Option<&mut Vec<crate::output::Section>>,
+        metrics: &mut Metrics,
+    ) -> RecoveryCounts {
+        let mut counts = RecoveryCounts::default();
         if imports_out.is_empty() {
             for imp in self.imports {
                 if imp.name.is_empty() {
@@ -283,6 +596,7 @@ impl RizinRecovery {
                     offset: None,
                     ordinal: imp.ordinal,
                 });
+                counts.imports = counts.imports.saturating_add(1);
             }
         }
         if exports_out.is_empty() {
@@ -297,6 +611,7 @@ impl RizinRecovery {
                     ordinal: None,
                     forward_to: None,
                 });
+                counts.exports = counts.exports.saturating_add(1);
             }
         }
         if functions_out.is_empty() && !self.functions.is_empty() {
@@ -304,12 +619,31 @@ impl RizinRecovery {
                 if func.name.is_empty() {
                     continue;
                 }
+                let calls: Vec<String> = func
+                    .callrefs
+                    .iter()
+                    .filter_map(|c| c.name.clone())
+                    .filter(|n| !n.is_empty())
+                    .collect();
+                let stack_frame = func
+                    .stackframe
+                    .map(|sf| u64::try_from(sf.max(0)).unwrap_or(0));
                 functions_out.push(Function {
                     name: func.name.clone(),
                     source: "rizin",
                     offset: Some(func.offset),
                     kind: None,
+                    complexity: func.cc,
+                    basic_blocks: func.nbbs,
+                    edges: func.edges,
+                    instructions: func.ninstrs,
+                    stack_frame,
+                    recursive: func.recursive,
+                    noreturn: func.noreturn,
+                    is_linear: func.is_lineal,
+                    calls,
                 });
+                counts.functions = counts.functions.saturating_add(1);
             }
             // Function-level aggregates. Complexity + basic blocks
             // are what `aflj` makes essentially free — they're the
@@ -317,11 +651,7 @@ impl RizinRecovery {
             let count = self.functions.len() as f64;
             metrics.insert("binary.rizin_function_count", count);
 
-            let cc_values: Vec<u32> = self
-                .functions
-                .iter()
-                .filter_map(|f| f.cc)
-                .collect();
+            let cc_values: Vec<u32> = self.functions.iter().filter_map(|f| f.cc).collect();
             if !cc_values.is_empty() {
                 let sum: u64 = cc_values.iter().map(|&v| u64::from(v)).sum();
                 metrics.insert("binary.avg_complexity", sum as f64 / cc_values.len() as f64);
@@ -329,11 +659,7 @@ impl RizinRecovery {
                 metrics.insert("binary.max_complexity", f64::from(max));
             }
 
-            let bb_values: Vec<u32> = self
-                .functions
-                .iter()
-                .filter_map(|f| f.nbbs)
-                .collect();
+            let bb_values: Vec<u32> = self.functions.iter().filter_map(|f| f.nbbs).collect();
             if !bb_values.is_empty() {
                 let sum: u64 = bb_values.iter().map(|&v| u64::from(v)).sum();
                 metrics.insert(
@@ -343,7 +669,53 @@ impl RizinRecovery {
                 metrics.insert("binary.total_basic_blocks", sum as f64);
             }
         }
+        // Section recovery for packed/obfuscated binaries where goblin
+        // returned an empty section table. We populate via the same
+        // `Section` view all other format extractors emit, with a
+        // best-effort flag projection from rizin's perm string
+        // (`-r-x` → executable/readable).
+        if let Some(sections_out) = sections_out {
+            if sections_out.is_empty() {
+                for sec in self.sections {
+                    if sec.name.is_empty() {
+                        continue;
+                    }
+                    let flags = perm_to_flags(sec.perm.as_deref());
+                    sections_out.push(crate::output::Section {
+                        name: sec.name,
+                        vaddr: sec.vaddr.unwrap_or(0),
+                        vsize: sec.vsize.unwrap_or(sec.size),
+                        file_offset: sec.paddr.unwrap_or(0),
+                        file_size: sec.size,
+                        flags,
+                    });
+                    counts.sections = counts.sections.saturating_add(1);
+                }
+            }
+        }
+        counts
     }
+}
+
+/// Map rizin's `perm` field (`-r-x`, `-rw-`, `-rwx`) to the canonical
+/// flag vocabulary used by every other expose section view. Order is
+/// `readable, writable, executable` so callers iterating the
+/// resulting Vec in order get a stable shape.
+fn perm_to_flags(perm: Option<&str>) -> Vec<String> {
+    let Some(p) = perm else {
+        return Vec::new();
+    };
+    let mut flags = Vec::new();
+    if p.contains('r') {
+        flags.push("readable".to_string());
+    }
+    if p.contains('w') {
+        flags.push("writable".to_string());
+    }
+    if p.contains('x') {
+        flags.push("executable".to_string());
+    }
+    flags
 }
 
 // =============================================================================
@@ -378,6 +750,58 @@ struct RawFunction {
     /// Number of basic blocks.
     #[serde(default)]
     nbbs: Option<u32>,
+    /// Control-flow edges between basic blocks.
+    #[serde(default)]
+    edges: Option<u32>,
+    /// Total instruction count.
+    #[serde(default)]
+    ninstrs: Option<u32>,
+    /// Stack frame size in bytes. Rizin emits a signed int (negative
+    /// values indicate "no frame"); we normalise to `u64` via `.max(0)`
+    /// in `apply`.
+    #[serde(default)]
+    stackframe: Option<i64>,
+    /// `true` iff the function calls itself directly.
+    #[serde(default)]
+    recursive: Option<bool>,
+    /// `true` iff the function never returns.
+    #[serde(default)]
+    noreturn: Option<bool>,
+    /// Straight-line code with no branches. Rizin's `aflj` emits this
+    /// under the kebab-case key `is-lineal` (sic, rizin's typo).
+    #[serde(default, rename = "is-lineal", alias = "is_lineal")]
+    is_lineal: Option<bool>,
+    /// Resolved outgoing call edges. Each entry has a `name` field
+    /// when rizin could resolve the callee; entries without a name
+    /// are dropped during `apply`.
+    #[serde(default)]
+    callrefs: Vec<RawCallref>,
+}
+
+#[derive(Deserialize)]
+struct RawCallref {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Rizin `iSj` section entry. Same fields cleave's `R2Section`
+/// historically deserialised. `paddr` / `vaddr` / `vsize` are
+/// optional because rizin sometimes emits a 0 for sections whose
+/// layout it couldn't fully resolve.
+#[derive(Deserialize)]
+struct RawSection {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    vsize: Option<u64>,
+    #[serde(default)]
+    paddr: Option<u64>,
+    #[serde(default)]
+    vaddr: Option<u64>,
+    #[serde(default)]
+    perm: Option<String>,
 }
 
 #[cfg(test)]
@@ -395,12 +819,15 @@ mod tests {
             exports: Vec<RawExport>,
             #[serde(default)]
             functions: Vec<RawFunction>,
+            #[serde(default)]
+            sections: Vec<RawSection>,
         }
         let w: Wire = serde_json::from_str(json).expect("valid test JSON");
         RizinRecovery {
             imports: w.imports,
             exports: w.exports,
             functions: w.functions,
+            sections: w.sections,
         }
     }
 
@@ -448,17 +875,61 @@ mod tests {
 
     #[test]
     fn raw_function_accepts_offset_or_addr() {
-        let v: Vec<RawFunction> =
-            parse_json_array(r#"[{"name":"a","offset":4096}]"#).unwrap();
+        let v: Vec<RawFunction> = parse_json_array(r#"[{"name":"a","offset":4096}]"#).unwrap();
         assert_eq!(v[0].offset, 4096);
-        let v: Vec<RawFunction> =
-            parse_json_array(r#"[{"name":"b","addr":8192}]"#).unwrap();
+        let v: Vec<RawFunction> = parse_json_array(r#"[{"name":"b","addr":8192}]"#).unwrap();
         assert_eq!(v[0].offset, 8192);
     }
 
     // ------------------------------------------------------------------
     // apply gate logic — "only fill what goblin left empty"
     // ------------------------------------------------------------------
+
+    #[test]
+    fn apply_populates_cfg_fields_from_aflj() {
+        // Full aflj payload — every CFG field exercised, including the
+        // is-lineal kebab key, the callrefs list (some named, some
+        // anonymous → only named ones land on `calls`), and the signed
+        // stackframe normalisation.
+        let recovery = make_recovery(
+            r#"{
+                "imports": [],
+                "exports": [],
+                "functions": [{
+                    "name": "main",
+                    "offset": 4096,
+                    "cc": 7,
+                    "nbbs": 12,
+                    "edges": 18,
+                    "ninstrs": 83,
+                    "stackframe": 48,
+                    "recursive": false,
+                    "noreturn": false,
+                    "is-lineal": false,
+                    "callrefs": [
+                        {"name": "puts"},
+                        {"name": "exit"},
+                        {}
+                    ]
+                }]
+            }"#,
+        );
+        let mut imports = crate::Imports::new();
+        let mut exports = crate::Exports::new();
+        let mut functions = crate::Functions::new();
+        let mut metrics = Metrics::new();
+        recovery.apply(&mut imports, &mut exports, &mut functions, &mut metrics);
+        let f = functions.iter().next().unwrap();
+        assert_eq!(f.complexity, Some(7));
+        assert_eq!(f.basic_blocks, Some(12));
+        assert_eq!(f.edges, Some(18));
+        assert_eq!(f.instructions, Some(83));
+        assert_eq!(f.stack_frame, Some(48));
+        assert_eq!(f.recursive, Some(false));
+        assert_eq!(f.noreturn, Some(false));
+        assert_eq!(f.is_linear, Some(false));
+        assert_eq!(f.calls, vec!["puts".to_string(), "exit".to_string()]);
+    }
 
     #[test]
     fn apply_populates_when_all_views_empty() {
@@ -486,9 +957,8 @@ mod tests {
 
     #[test]
     fn apply_skips_imports_when_goblin_already_populated() {
-        let recovery = make_recovery(
-            r#"{"imports":[{"name":"rizin_only"}],"exports":[],"functions":[]}"#,
-        );
+        let recovery =
+            make_recovery(r#"{"imports":[{"name":"rizin_only"}],"exports":[],"functions":[]}"#);
         let mut imports = crate::Imports::new();
         imports.push(Import {
             name: "from_goblin".into(),
@@ -519,6 +989,7 @@ mod tests {
             source: "goblin",
             offset: Some(0),
             kind: None,
+            ..Function::default()
         });
         let mut metrics = Metrics::new();
         recovery.apply(&mut imports, &mut exports, &mut functions, &mut metrics);
@@ -583,9 +1054,8 @@ mod tests {
     fn apply_omits_complexity_metrics_when_cc_absent() {
         // Functions without `cc` shouldn't emit complexity averages.
         // Without `nbbs` shouldn't emit basic-block aggregates either.
-        let recovery = make_recovery(
-            r#"{"imports":[],"exports":[],"functions":[{"name":"a","offset":1}]}"#,
-        );
+        let recovery =
+            make_recovery(r#"{"imports":[],"exports":[],"functions":[{"name":"a","offset":1}]}"#);
         let mut imports = crate::Imports::new();
         let mut exports = crate::Exports::new();
         let mut functions = crate::Functions::new();
@@ -609,6 +1079,78 @@ mod tests {
         let first = available();
         let second = available();
         assert_eq!(first, second, "PATH probe should be cached");
+    }
+
+    // ------------------------------------------------------------------
+    // Hardening: disable switch, scoped_disable RAII, stats counters
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn scoped_disable_increments_and_restores_disable_count() {
+        // Read the baseline because parallel tests may also be holding
+        // a guard — we assert the *delta*, not the absolute value.
+        let before = RIZIN_DISABLED.load(Ordering::SeqCst);
+        {
+            let _g = scoped_disable();
+            assert!(is_disabled());
+            assert_eq!(RIZIN_DISABLED.load(Ordering::SeqCst), before + 1);
+        }
+        assert_eq!(RIZIN_DISABLED.load(Ordering::SeqCst), before);
+    }
+
+    #[test]
+    fn scoped_disable_stacks() {
+        let before = RIZIN_DISABLED.load(Ordering::SeqCst);
+        let g1 = scoped_disable();
+        let g2 = scoped_disable();
+        assert_eq!(RIZIN_DISABLED.load(Ordering::SeqCst), before + 2);
+        drop(g1);
+        assert!(is_disabled(), "still disabled while outer guard alive");
+        drop(g2);
+        assert_eq!(RIZIN_DISABLED.load(Ordering::SeqCst), before);
+    }
+
+    #[test]
+    fn recover_short_circuits_when_disabled() {
+        // With a guard active, the public `recover()` entry returns
+        // None before touching PATH or spawning anything. We can't
+        // assert the absolute counters (parallel tests mutate them),
+        // only the observable contract: disabled → None.
+        let _g = scoped_disable();
+        assert!(is_disabled());
+        let r = recover(b"unused bytes for disabled probe");
+        assert!(r.is_none(), "disabled rizin must return None");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn kill_all_rizin_groups_drains_pgid_registry_idempotently() {
+        // No PGIDs registered: should be a clean no-op. Verifies the
+        // public reaper survives being called from a CLI signal
+        // handler after a clean shutdown.
+        let before = RIZIN_PGIDS.lock().map(|g| g.len()).unwrap_or(0);
+        kill_all_rizin_groups();
+        let after = RIZIN_PGIDS.lock().map(|g| g.len()).unwrap_or(0);
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn log_stats_is_no_op_when_total_zero() {
+        // Just confirm the call doesn't panic when nothing has been
+        // recorded yet. Real telemetry assertions would need a
+        // tracing subscriber; that's out of scope here.
+        // (We don't assert the counter — parallel tests may have
+        // bumped it.)
+        log_stats();
+    }
+
+    #[test]
+    fn stats_tuple_shape_is_stable() {
+        let (total, successes, timeouts, failures, mem) = stats();
+        // Tautological — purpose is to pin the (5,) tuple shape so a
+        // future API change trips a compile error here. The cleave
+        // host CLI destructures the tuple positionally.
+        let _ = (total, successes, timeouts, failures, mem);
     }
 
     // ------------------------------------------------------------------
@@ -678,6 +1220,20 @@ mod tests {
     // End-to-end spawn/drain via a fake-rizin shim script
     // ------------------------------------------------------------------
 
+    /// Process-unique counter for shim scratch dirs. The previous
+    /// `pid + subsec_nanos` scheme raced when three tests staged dirs
+    /// inside the same nanosecond window under parallel execution.
+    #[cfg(unix)]
+    fn unique_shim_dir(prefix: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ))
+    }
+
     /// Stage a shell script that masquerades as `rizin`, prints a
     /// fixed stdout payload (escaping the canonical separators), and
     /// returns its directory so we can stitch it onto PATH. Returns
@@ -687,15 +1243,7 @@ mod tests {
     fn stage_shim(stdout_payload: &str) -> Option<std::path::PathBuf> {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "expose-rizin-shim-{}-{}",
-            std::process::id(),
-            // Append nanos so concurrent test threads don't collide.
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ));
+        let dir = unique_shim_dir("expose-rizin-shim");
         std::fs::create_dir_all(&dir).ok()?;
         let shim = dir.join("rizin");
         let mut f = std::fs::File::create(&shim).ok()?;
@@ -800,14 +1348,7 @@ mod tests {
         // that silently fail (rizin crashing before its first echo).
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "expose-rizin-silentshim-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ));
+        let dir = unique_shim_dir("expose-rizin-silentshim");
         std::fs::create_dir_all(&dir).unwrap();
         let shim = dir.join("rizin");
         let mut f = std::fs::File::create(&shim).unwrap();
@@ -828,14 +1369,7 @@ mod tests {
         // return phantom data even if some partial stdout leaked.
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "expose-rizin-failshim-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ));
+        let dir = unique_shim_dir("expose-rizin-failshim");
         std::fs::create_dir_all(&dir).unwrap();
         let shim = dir.join("rizin");
         let mut f = std::fs::File::create(&shim).unwrap();
