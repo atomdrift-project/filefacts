@@ -247,7 +247,6 @@ pub(super) fn extract(
         world_writable as f64,
     );
     metrics.insert("archive.security.symlink_count", symlinks as f64);
-    metrics.insert("archive.symlink_count", symlinks as f64);
 
     metrics.insert("archive.max_filename_length", max_filename_length as f64);
     metrics.insert("archive.hidden_file_count", hidden_file_count as f64);

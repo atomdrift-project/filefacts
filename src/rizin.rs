@@ -325,8 +325,16 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
         }
     };
     let cap_flag = output_cap_hit.clone();
-    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    // The drain thread owns the read-end and reads to EOF. Once the
+    // child exits, its write-end closes and `read_to_end` returns
+    // promptly. Returning the buffer via `JoinHandle` (rather than a
+    // channel with a wall-clock timeout) is what keeps this robust
+    // under heavy parallel load — when the OS scheduler starves the
+    // drain thread for several seconds, a channel-recv_timeout would
+    // give up and treat the (still-pending) output as empty. The
+    // join can't deadlock because the child is already known to have
+    // exited by the time we join.
+    let drain = std::thread::spawn(move || {
         use std::io::Read;
         let mut buf = Vec::new();
         let n = (&mut stdout_handle)
@@ -336,7 +344,7 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
         if n >= MAX_SUBPROCESS_OUTPUT {
             mark_output_cap_hit(&cap_flag, child_id);
         }
-        let _ = stdout_tx.send(buf);
+        buf
     });
 
     // Poll for child exit with the timeout deadline. Once the child
@@ -376,17 +384,16 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
         RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    // Bounded drain: if a rizin grandchild still holds the
-    // write-end of the pipe, recv would block forever. 5 s is
-    // generous — `read_to_end` finishes immediately once the last
-    // write-end closes.
-    let stdout_bytes = stdout_rx
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap_or_default();
+    // Wait for the drain thread. The child has exited, so its
+    // write-end of the pipe is closed and `read_to_end` is guaranteed
+    // to return promptly — no deadlock risk. A poisoned thread
+    // (panic in the drain) is treated like empty stdout.
+    let stdout_bytes = drain.join().unwrap_or_default();
     if stdout_bytes.is_empty() {
         RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
         return None;
     }
+    let _ = cap_hit;
     RIZIN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
     let stdout = String::from_utf8_lossy(&stdout_bytes);
     Some(parse_recovery_output(&stdout))
@@ -527,9 +534,11 @@ pub(crate) struct RizinRecovery {
 
 /// Counts of entries rizin contributed to each typed view through
 /// [`RizinRecovery::apply`]. Returned so format extractors can emit
-/// the `*.rizin_recovered_*` metrics that signal "this view was
-/// filled in by rizin, not goblin" — the same pattern cleave used
-/// historically.
+/// the `*.recovered_*` metrics that signal "this view was filled in
+/// by the disassembly-side fallback, not the format-native parser"
+/// — same pattern cleave used historically. The metric path is tool-
+/// agnostic because swapping rizin for radare2/Ghidra shouldn't ripple
+/// into the schema.
 #[derive(Default, Debug, Clone, Copy)]
 pub(crate) struct RecoveryCounts {
     pub imports: u32,
@@ -648,8 +657,8 @@ impl RizinRecovery {
             // Function-level aggregates. Complexity + basic blocks
             // are what `aflj` makes essentially free — they're the
             // ML signals goblin can't produce on a stripped binary.
-            let count = self.functions.len() as f64;
-            metrics.insert("binary.rizin_function_count", count);
+            // `functions.count` is emitted cross-format by
+            // `lib.rs::extract_all` — no rizin-side dual-emit.
 
             let cc_values: Vec<u32> = self.functions.iter().filter_map(|f| f.cc).collect();
             if !cc_values.is_empty() {
@@ -668,6 +677,33 @@ impl RizinRecovery {
                 );
                 metrics.insert("binary.total_basic_blocks", sum as f64);
             }
+
+            // Function-shape bucket counts. Detection traits target the
+            // tails of these distributions: xz's backdoor introduced a
+            // single huge function in a sea of tiny ones; obfuscators
+            // produce sea-of-tiny shapes (one-block dispatch handlers
+            // per opcode); leaf-heavy ratios indicate flattened control
+            // flow. Thresholds chosen to match xz-utils inspection
+            // norms — `nbbs >= 50` is the standard "non-trivial CFG"
+            // floor, `nbbs == 1` is the rizin sentinel for stubs.
+            let huge = self
+                .functions
+                .iter()
+                .filter(|f| f.nbbs.is_some_and(|n| n >= 50))
+                .count();
+            let tiny = self
+                .functions
+                .iter()
+                .filter(|f| f.nbbs.is_some_and(|n| n == 1))
+                .count();
+            let leaf = self
+                .functions
+                .iter()
+                .filter(|f| f.callrefs.is_empty() && f.nbbs.is_some())
+                .count();
+            metrics.insert("binary.huge_func_count", huge as f64);
+            metrics.insert("binary.tiny_func_count", tiny as f64);
+            metrics.insert("binary.leaf_func_count", leaf as f64);
         }
         // Section recovery for packed/obfuscated binaries where goblin
         // returned an empty section table. We populate via the same
@@ -810,6 +846,20 @@ mod tests {
     use super::*;
     use crate::output::Metrics;
 
+    /// Tests that interact with the process-global `RIZIN_PGIDS`
+    /// registry — the live shim spawns and the `kill_all_rizin_groups`
+    /// reaper — must hold this mutex for the duration of their run.
+    /// Without it the reaper test SIGKILLs shims registered by other
+    /// in-flight tests, producing intermittent "shim recovery missing"
+    /// failures under cargo's default parallel test execution.
+    fn rizin_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // `unwrap_or_else` so a poisoned mutex (from a panicking test
+        // holding the guard) doesn't poison every subsequent test —
+        // the registry state survives across test panics regardless.
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     fn make_recovery(json: &str) -> RizinRecovery {
         #[derive(Deserialize)]
         struct Wire {
@@ -948,7 +998,9 @@ mod tests {
         assert_eq!(imports.iter().count(), 1);
         assert_eq!(exports.iter().count(), 1);
         assert_eq!(functions.iter().count(), 1);
-        assert_eq!(metrics.get("binary.rizin_function_count"), Some(1.0));
+        // `functions.count` is emitted cross-format by lib.rs::extract_all
+        // (not by recovery.apply directly); rizin-side aggregates stay
+        // under the `binary.*_complexity` / `binary.*_basic_blocks` namespace.
         assert_eq!(metrics.get("binary.avg_complexity"), Some(5.0));
         assert_eq!(metrics.get("binary.max_complexity"), Some(5.0));
         assert_eq!(metrics.get("binary.avg_basic_blocks"), Some(10.0));
@@ -994,7 +1046,6 @@ mod tests {
         let mut metrics = Metrics::new();
         recovery.apply(&mut imports, &mut exports, &mut functions, &mut metrics);
         // The function-block was skipped → no aggregate metrics emitted.
-        assert!(metrics.get("binary.rizin_function_count").is_none());
         assert!(metrics.get("binary.avg_complexity").is_none());
         // The preexisting goblin function survives.
         assert_eq!(functions.iter().count(), 1);
@@ -1043,7 +1094,7 @@ mod tests {
         let mut functions = crate::Functions::new();
         let mut metrics = Metrics::new();
         recovery.apply(&mut imports, &mut exports, &mut functions, &mut metrics);
-        assert_eq!(metrics.get("binary.rizin_function_count"), Some(3.0));
+        assert_eq!(functions.iter().count(), 3);
         assert_eq!(metrics.get("binary.avg_complexity"), Some(3.0));
         assert_eq!(metrics.get("binary.max_complexity"), Some(5.0));
         assert_eq!(metrics.get("binary.avg_basic_blocks"), Some(4.0));
@@ -1061,8 +1112,10 @@ mod tests {
         let mut functions = crate::Functions::new();
         let mut metrics = Metrics::new();
         recovery.apply(&mut imports, &mut exports, &mut functions, &mut metrics);
-        // rizin_function_count fires unconditionally on non-empty functions.
-        assert_eq!(metrics.get("binary.rizin_function_count"), Some(1.0));
+        // `functions.count` is emitted by the top-level pipeline; here
+        // we only verify rizin pushed the function into the Vec and the
+        // complexity/basic-block aggregates were skipped (no `cc`/`nbbs`).
+        assert_eq!(functions.iter().count(), 1);
         assert!(metrics.get("binary.avg_complexity").is_none());
         assert!(metrics.get("binary.avg_basic_blocks").is_none());
     }
@@ -1125,6 +1178,11 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn kill_all_rizin_groups_drains_pgid_registry_idempotently() {
+        // Hold the rizin test lock — `kill_all_rizin_groups` SIGKILLs
+        // every entry in the registry, which would otherwise reap
+        // live shim subprocesses from sibling tests running in
+        // parallel under the default cargo-test thread pool.
+        let _lock = rizin_test_lock();
         // No PGIDs registered: should be a clean no-op. Verifies the
         // public reaper survives being called from a CLI signal
         // handler after a clean shutdown.
@@ -1280,6 +1338,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn end_to_end_shim_returns_parsed_recovery() {
+        let _lock = rizin_test_lock();
         // A canonical four-block payload — exercises spawn, drain,
         // separator split, and per-block JSON parse together.
         let payload = synthesize_stdout(
@@ -1301,6 +1360,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn end_to_end_shim_handles_large_stdout_via_pipe_drain() {
+        let _lock = rizin_test_lock();
         // Build a function array large enough to exceed the typical
         // 64 KiB pipe buffer — without the background drain thread,
         // this would deadlock on shim's stdout write. With drain, it
@@ -1328,6 +1388,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn end_to_end_shim_returns_some_empty_recovery_on_separator_only_stdout() {
+        let _lock = rizin_test_lock();
         // Three SEPs with empty blocks → valid but contentless rizin
         // output. recover() returns Some(empty) here; `apply` is then
         // a no-op (functions empty → no metrics emitted) and the
@@ -1343,6 +1404,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn end_to_end_recover_returns_none_when_stdout_bytes_empty() {
+        let _lock = rizin_test_lock();
         // Pure-stdlib shim that exits 0 with zero stdout bytes. Exercises
         // the `stdout_bytes.is_empty() → None` guard against subprocesses
         // that silently fail (rizin crashing before its first echo).
@@ -1365,6 +1427,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn end_to_end_recover_returns_none_on_nonzero_exit() {
+        let _lock = rizin_test_lock();
         // Shim exits non-zero (rizin crashed) — recover should not
         // return phantom data even if some partial stdout leaked.
         use std::io::Write;

@@ -185,8 +185,11 @@ fn has_nested_function(node: Node<'_>, config: &LangConfig) -> bool {
 }
 
 fn emit_metrics(functions: &[FunctionInfo], total_lines: u32, metrics: &mut Metrics) {
+    // `functions.count` is emitted by `lib.rs::extract_all` once
+    // (cross-format: source-language counts and binary-disassembled
+    // counts share the same canonical path). We compute the local
+    // total here only for the ratio metrics below.
     let total = functions.len() as u32;
-    metrics.insert("functions.total", f64::from(total));
 
     let mut anonymous = 0u32;
     let mut nested_functions = 0u32;

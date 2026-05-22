@@ -382,16 +382,19 @@ fn run_extraction(
         if let Ok(v) = serde_json::to_value(&imports) {
             values.insert("imports", v);
         }
+        metrics.insert("imports.count", imports.len() as f64);
     }
     if !exports.is_empty() {
         if let Ok(v) = serde_json::to_value(&exports) {
             values.insert("exports", v);
         }
+        metrics.insert("exports.count", exports.len() as f64);
     }
     if !functions.is_empty() {
         if let Ok(v) = serde_json::to_value(&functions) {
             values.insert("functions", v);
         }
+        metrics.insert("functions.count", functions.len() as f64);
     }
     if !errors.is_empty() {
         // Mirror parse errors into the values tree so kv-path
@@ -496,6 +499,9 @@ fn emit_section_metrics(sections: &Sections, metrics: &mut Metrics) {
     let mut executable = 0_u64;
     let mut writable = 0_u64;
     let mut wx = 0_u64;
+    let mut code_size: u64 = 0;
+    let mut nonstandard = 0_u64;
+    let mut concatenated_names: Vec<u8> = Vec::new();
     for s in sections {
         let is_exec = s
             .flags
@@ -504,6 +510,7 @@ fn emit_section_metrics(sections: &Sections, metrics: &mut Metrics) {
         let is_write = s.flags.iter().any(|f| f == "writable" || f == "write");
         if is_exec {
             executable += 1;
+            code_size = code_size.saturating_add(s.file_size);
         }
         if is_write {
             writable += 1;
@@ -511,10 +518,70 @@ fn emit_section_metrics(sections: &Sections, metrics: &mut Metrics) {
         if is_exec && is_write {
             wx += 1;
         }
+        if !is_well_known_section_name(&s.name) {
+            nonstandard += 1;
+        }
+        concatenated_names.extend_from_slice(s.name.as_bytes());
     }
     metrics.insert("sections.executable_count", executable as f64);
     metrics.insert("sections.writable_count", writable as f64);
     metrics.insert("sections.executable_writable_count", wx as f64);
+    if code_size > 0 {
+        metrics.insert("sections.code_size", code_size as f64);
+    }
+    metrics.insert("sections.nonstandard_count", nonstandard as f64);
+    if !concatenated_names.is_empty() {
+        metrics.insert(
+            "sections.name_entropy",
+            scan::entropy::shannon(&concatenated_names),
+        );
+    }
+}
+
+/// `true` when `name` matches a section name routinely produced by
+/// upstream toolchains across PE/ELF/Mach-O. Packers and obfuscators
+/// rename or invent sections (`.UPX0`, `.aspack`, random hex tags)
+/// which trip `sections.nonstandard_count`. Membership is intentionally
+/// loose — any section the test corpus shows in benign binaries is in.
+fn is_well_known_section_name(name: &str) -> bool {
+    // Mach-O sections come in as `SEGMENT,section` (e.g. `__TEXT,__text`).
+    // Strip the segment prefix and check the section stem. For PE/ELF
+    // we additionally strip a leading dot so dotted (`.text`) and
+    // undotted (`text`) forms share the same lookup.
+    let stem = name
+        .rsplit_once(',')
+        .map_or(name, |(_, s)| s)
+        .trim_start_matches('.');
+    matches!(
+        stem,
+        // PE / ELF — the canonical set.
+        "text" | "rdata" | "data" | "bss" | "rodata" | "idata" | "edata"
+        | "pdata" | "xdata" | "tls" | "reloc" | "rsrc" | "debug" | "init"
+        | "fini" | "plt" | "got" | "got.plt" | "plt.got" | "plt.sec"
+        | "dynamic" | "dynsym" | "dynstr" | "symtab" | "strtab" | "shstrtab"
+        | "interp" | "note" | "hash" | "gnu.hash" | "gnu.version"
+        | "gnu.version_r" | "gnu.version_d" | "eh_frame" | "eh_frame_hdr"
+        | "comment" | "ARM.exidx" | "ARM.extab" | "ARM.attributes"
+        | "init_array" | "fini_array" | "preinit_array" | "ctors" | "dtors"
+        | "tbss" | "tdata" | "tm_clone_table" | "data.rel.ro"
+        | "got.plt.sec" | "stab" | "stabstr" | "drectve" | "didat"
+        // Mach-O segment,section combos (after dot-strip we still match the
+        // common ones — the names below come from the typical Mach-O
+        // layout where `Section.name` is `"__text"`, `"__data"`, etc.,
+        // *without* the segment prefix).
+        | "__text" | "__data" | "__bss" | "__cstring" | "__const"
+        | "__objc_classlist" | "__objc_classrefs" | "__objc_data"
+        | "__objc_classname" | "__objc_const" | "__objc_methname"
+        | "__objc_methtype" | "__objc_selrefs" | "__objc_imageinfo"
+        | "__la_symbol_ptr" | "__nl_symbol_ptr" | "__got" | "__stubs"
+        | "__stub_helper" | "__cfstring" | "__unwind_info" | "__eh_frame"
+        | "__info_plist" | "__swift5_proto" | "__swift5_types"
+        | "__swift5_fieldmd" | "__swift5_typeref" | "__swift5_reflstr"
+        | "__swift5_assocty" | "__swift5_capture" | "__swift5_builtin"
+        | "__swift5_acfuncs" | "__swift5_mpenum" | "__llvm_covmap"
+        | "__llvm_covfun" | "__llvm_prf_cnts" | "__llvm_prf_data"
+        | "__llvm_prf_names" | "__llvm_prf_vnds"
+    )
 }
 
 /// Cross-format `binary.*` aggregates derived from sections + strings +

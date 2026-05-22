@@ -87,6 +87,15 @@ pub(super) fn config_for(file_type: FileType) -> Option<&'static LangConfig> {
         FileType::Java => &JAVA,
         FileType::Shell => &BASH,
         FileType::Php => &PHP,
+        FileType::Ruby => &RUBY,
+        FileType::Lua => &LUA,
+        FileType::CSharp => &CSHARP,
+        FileType::C => &C,
+        FileType::Scala => &SCALA,
+        FileType::ObjectiveC => &OBJC,
+        FileType::Kotlin => &KOTLIN,
+        FileType::Swift => &SWIFT,
+        FileType::PowerShell => &POWERSHELL,
         _ => return None,
     })
 }
@@ -352,6 +361,363 @@ static BASH: LangConfig = LangConfig {
     function_kinds: &[],
     template_kinds: &[],
     binary_op_kinds: &[],
+};
+
+static RUBY: LangConfig = LangConfig {
+    name: "ruby",
+    language: || tree_sitter_ruby::LANGUAGE.into(),
+    comment_style: CommentStyle::Hash,
+    string_kinds: &["string", "string_array", "symbol_array", "heredoc_body"],
+    import_query: r#"
+        (call
+            method: (identifier) @_fn
+            arguments: (argument_list (string (string_content) @import))
+            (#match? @_fn "^(require|require_relative|load|autoload)$"))
+    "#,
+    function_query: r#"
+        (method name: (identifier) @fn)
+        (singleton_method name: (identifier) @fn)
+    "#,
+    class_query: r#"
+        (class name: (constant) @class)
+        (module name: (constant) @class)
+    "#,
+    call_kinds: &["call"],
+    callee_field: "method",
+    arguments_field: "arguments",
+    member_kinds: &["call"],
+    member_object_field: "receiver",
+    member_property_field: "method",
+    identifier_kinds: &[
+        "identifier",
+        "constant",
+        "instance_variable",
+        "class_variable",
+    ],
+    number_kinds: &["integer", "float"],
+    bool_kinds: &["true", "false"],
+    null_kinds: &["nil"],
+    object_kinds: &["hash"],
+    array_kinds: &["array"],
+    function_kinds: &["lambda", "block", "do_block"],
+    template_kinds: &["string"],
+    binary_op_kinds: &["binary"],
+};
+
+static LUA: LangConfig = LangConfig {
+    name: "lua",
+    language: || tree_sitter_lua::LANGUAGE.into(),
+    comment_style: CommentStyle::DoubleDash,
+    string_kinds: &["string"],
+    import_query: r#"
+        (function_call
+            name: (identifier) @_fn
+            arguments: (arguments (string (string_content) @import))
+            (#eq? @_fn "require"))
+    "#,
+    function_query: r#"
+        (function_declaration name: (identifier) @fn)
+        (function_declaration name: (dot_index_expression field: (identifier) @fn))
+    "#,
+    class_query: "",
+    call_kinds: &["function_call"],
+    callee_field: "name",
+    arguments_field: "arguments",
+    member_kinds: &["dot_index_expression"],
+    member_object_field: "table",
+    member_property_field: "field",
+    identifier_kinds: &["identifier"],
+    number_kinds: &["number"],
+    bool_kinds: &["true", "false"],
+    null_kinds: &["nil"],
+    object_kinds: &["table_constructor"],
+    array_kinds: &["table_constructor"],
+    function_kinds: &["function_definition"],
+    template_kinds: &[],
+    binary_op_kinds: &["binary_expression"],
+};
+
+static CSHARP: LangConfig = LangConfig {
+    name: "csharp",
+    language: || tree_sitter_c_sharp::LANGUAGE.into(),
+    comment_style: CommentStyle::CStyle,
+    string_kinds: &[
+        "string_literal",
+        "verbatim_string_literal",
+        "raw_string_literal",
+        "interpolated_string_expression",
+    ],
+    import_query: r#"
+        (using_directive (identifier) @import)
+        (using_directive (qualified_name) @import)
+    "#,
+    function_query: r#"
+        (method_declaration name: (identifier) @fn)
+        (constructor_declaration name: (identifier) @fn)
+        (local_function_statement name: (identifier) @fn)
+    "#,
+    class_query: r#"
+        (class_declaration name: (identifier) @class)
+        (interface_declaration name: (identifier) @class)
+        (struct_declaration name: (identifier) @class)
+        (record_declaration name: (identifier) @class)
+        (enum_declaration name: (identifier) @class)
+    "#,
+    call_kinds: &["invocation_expression", "object_creation_expression"],
+    callee_field: "function",
+    arguments_field: "arguments",
+    member_kinds: &["member_access_expression"],
+    member_object_field: "expression",
+    member_property_field: "name",
+    identifier_kinds: &["identifier"],
+    number_kinds: &["integer_literal", "real_literal"],
+    bool_kinds: &["boolean_literal"],
+    null_kinds: &["null_literal"],
+    object_kinds: &[
+        "anonymous_object_creation_expression",
+        "initializer_expression",
+    ],
+    array_kinds: &[
+        "array_creation_expression",
+        "implicit_array_creation_expression",
+    ],
+    function_kinds: &["lambda_expression", "anonymous_method_expression"],
+    template_kinds: &["interpolated_string_expression"],
+    binary_op_kinds: &["binary_expression"],
+};
+
+static C: LangConfig = LangConfig {
+    name: "c",
+    language: || tree_sitter_c::LANGUAGE.into(),
+    comment_style: CommentStyle::CStyle,
+    string_kinds: &["string_literal"],
+    import_query: r#"
+        (preproc_include path: (system_lib_string) @import)
+        (preproc_include path: (string_literal) @import)
+    "#,
+    function_query: r#"
+        (function_definition
+            declarator: (function_declarator declarator: (identifier) @fn))
+        (function_definition
+            declarator: (pointer_declarator
+                declarator: (function_declarator declarator: (identifier) @fn)))
+    "#,
+    class_query: r#"
+        (struct_specifier name: (type_identifier) @class)
+        (union_specifier name: (type_identifier) @class)
+        (enum_specifier name: (type_identifier) @class)
+    "#,
+    call_kinds: &["call_expression"],
+    callee_field: "function",
+    arguments_field: "arguments",
+    // C has no `a.b` member-access node-kind separate from struct-field
+    // dereferences (`field_expression`) but field-access is only one
+    // dotted-form so we wire it up:
+    member_kinds: &["field_expression"],
+    member_object_field: "argument",
+    member_property_field: "field",
+    identifier_kinds: &["identifier", "field_identifier", "type_identifier"],
+    number_kinds: &["number_literal"],
+    bool_kinds: &["true", "false"],
+    null_kinds: &["null"],
+    object_kinds: &["initializer_list"],
+    array_kinds: &["initializer_list"],
+    function_kinds: &[],
+    template_kinds: &[],
+    binary_op_kinds: &["binary_expression"],
+};
+
+static SCALA: LangConfig = LangConfig {
+    name: "scala",
+    language: || tree_sitter_scala::LANGUAGE.into(),
+    comment_style: CommentStyle::CStyle,
+    string_kinds: &["string", "interpolated_string_expression"],
+    import_query: r#"
+        (import_declaration (identifier) @import)
+    "#,
+    function_query: r#"
+        (function_definition name: (identifier) @fn)
+    "#,
+    class_query: r#"
+        (class_definition name: (identifier) @class)
+        (object_definition name: (identifier) @class)
+        (trait_definition name: (identifier) @class)
+    "#,
+    call_kinds: &["call_expression"],
+    callee_field: "function",
+    arguments_field: "arguments",
+    member_kinds: &["field_expression"],
+    member_object_field: "value",
+    member_property_field: "field",
+    identifier_kinds: &["identifier", "type_identifier"],
+    number_kinds: &["integer_literal", "floating_point_literal"],
+    bool_kinds: &["boolean_literal"],
+    null_kinds: &["null_literal"],
+    object_kinds: &[],
+    array_kinds: &[],
+    function_kinds: &["lambda_expression"],
+    template_kinds: &["interpolated_string_expression"],
+    binary_op_kinds: &["infix_expression"],
+};
+
+static OBJC: LangConfig = LangConfig {
+    name: "objc",
+    language: || tree_sitter_objc::LANGUAGE.into(),
+    comment_style: CommentStyle::CStyle,
+    string_kinds: &["string_literal"],
+    import_query: r#"
+        (preproc_include path: (system_lib_string) @import)
+        (preproc_include path: (string_literal) @import)
+    "#,
+    function_query: r#"
+        (function_definition
+            declarator: (function_declarator declarator: (identifier) @fn))
+        (method_definition (identifier) @fn)
+    "#,
+    class_query: r#"
+        (class_interface (identifier) @class)
+        (class_implementation (identifier) @class)
+    "#,
+    call_kinds: &["call_expression", "message_expression"],
+    callee_field: "function",
+    arguments_field: "arguments",
+    member_kinds: &["field_expression"],
+    member_object_field: "argument",
+    member_property_field: "field",
+    identifier_kinds: &["identifier", "field_identifier", "type_identifier"],
+    number_kinds: &["number_literal"],
+    bool_kinds: &["true", "false"],
+    null_kinds: &["null", "nil"],
+    object_kinds: &["dictionary_literal", "initializer_list"],
+    array_kinds: &["array_literal", "initializer_list"],
+    function_kinds: &["block_expression"],
+    template_kinds: &[],
+    binary_op_kinds: &["binary_expression"],
+};
+
+static KOTLIN: LangConfig = LangConfig {
+    name: "kotlin",
+    language: || tree_sitter_kotlin_ng::LANGUAGE.into(),
+    comment_style: CommentStyle::CStyle,
+    string_kinds: &["string_literal", "character_literal"],
+    import_query: r#"
+        (import (qualified_identifier) @import)
+    "#,
+    function_query: r#"
+        (function_declaration name: (identifier) @fn)
+    "#,
+    class_query: r#"
+        (class_declaration name: (identifier) @class)
+        (object_declaration name: (identifier) @class)
+    "#,
+    call_kinds: &["call_expression"],
+    callee_field: "",
+    arguments_field: "",
+    member_kinds: &["navigation_expression"],
+    member_object_field: "",
+    member_property_field: "",
+    identifier_kinds: &["identifier", "simple_identifier"],
+    number_kinds: &["number_literal", "real_literal"],
+    bool_kinds: &["boolean_literal"],
+    null_kinds: &["null_literal"],
+    object_kinds: &[],
+    array_kinds: &[],
+    function_kinds: &["lambda_literal", "anonymous_function"],
+    template_kinds: &["string_literal"],
+    binary_op_kinds: &["binary_expression", "infix_expression"],
+};
+
+static SWIFT: LangConfig = LangConfig {
+    name: "swift",
+    language: || tree_sitter_swift::LANGUAGE.into(),
+    comment_style: CommentStyle::CStyle,
+    string_kinds: &[
+        "line_string_literal",
+        "multi_line_string_literal",
+        "raw_string_literal",
+    ],
+    import_query: r#"
+        (import_declaration (identifier) @import)
+    "#,
+    function_query: r#"
+        (function_declaration name: (simple_identifier) @fn)
+        (init_declaration "init" @fn)
+    "#,
+    class_query: r#"
+        (class_declaration name: (type_identifier) @class)
+        (protocol_declaration name: (type_identifier) @class)
+    "#,
+    call_kinds: &["call_expression"],
+    callee_field: "",
+    arguments_field: "",
+    member_kinds: &["navigation_expression"],
+    member_object_field: "target",
+    member_property_field: "suffix",
+    identifier_kinds: &["simple_identifier", "type_identifier"],
+    number_kinds: &["integer_literal", "real_literal", "hex_literal"],
+    bool_kinds: &["boolean_literal"],
+    null_kinds: &["nil"],
+    object_kinds: &["dictionary_literal"],
+    array_kinds: &["array_literal"],
+    function_kinds: &["lambda_literal"],
+    template_kinds: &["line_string_literal"],
+    binary_op_kinds: &[
+        "additive_expression",
+        "multiplicative_expression",
+        "comparison_expression",
+    ],
+};
+
+static POWERSHELL: LangConfig = LangConfig {
+    name: "powershell",
+    language: || tree_sitter_powershell::LANGUAGE.into(),
+    comment_style: CommentStyle::Hash,
+    string_kinds: &[
+        "string_literal",
+        "expandable_string_literal",
+        "verbatim_string_characters",
+    ],
+    // PowerShell loads modules via the `Import-Module` cmdlet and
+    // dot-sources scripts via the `.` invocation operator. The grammar
+    // models a cmdlet invocation as a `command` node where
+    // `command_name` carries the cmdlet name and `command_elements`
+    // holds the arguments.
+    import_query: r#"
+        (command
+            command_name: (command_name) @_cmd
+            command_elements: (command_elements) @import
+            (#match? @_cmd "^(Import-Module|Add-PSSnapin|Using)$"))
+    "#,
+    function_query: r#"
+        (function_statement (function_name) @fn)
+    "#,
+    class_query: r#"
+        (class_statement (simple_name) @class)
+    "#,
+    // PowerShell's pipeline/command model doesn't fit the
+    // callee-field / argument-field AST-walk projection any better
+    // than bash does; we leave the call-related fields empty so the
+    // walker stays out of the way. Identifier/literal/comment/import
+    // metrics still flow.
+    call_kinds: &[],
+    callee_field: "",
+    arguments_field: "",
+    member_kinds: &[],
+    member_object_field: "",
+    member_property_field: "",
+    identifier_kinds: &["variable", "simple_name", "generic_token", "command_name"],
+    number_kinds: &["integer_literal", "real_literal", "decimal_integer_literal"],
+    bool_kinds: &[],
+    null_kinds: &[],
+    object_kinds: &["hash_literal_expression"],
+    array_kinds: &["array_expression", "array_literal_expression"],
+    function_kinds: &["script_block_expression"],
+    template_kinds: &["expandable_string_literal"],
+    binary_op_kinds: &[
+        "additive_expression",
+        "multiplicative_expression",
+        "comparison_expression",
+    ],
 };
 
 static PHP: LangConfig = LangConfig {

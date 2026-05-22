@@ -250,9 +250,6 @@ pub(super) fn extract(
     if total_uncompressed > 0 {
         let ratio = total_compressed as f64 / total_uncompressed as f64;
         metrics.insert("archive.compression.ratio", ratio);
-        // Same value under the flat name cleave's `ArchiveMetrics` used
-        // (and that traits still reference verbatim).
-        metrics.insert("archive.compression_ratio", ratio);
     }
     for (m, c) in &compression_counts {
         metrics.insert(format!("archive.compression.method_counts.{m}"), *c as f64);
@@ -271,9 +268,7 @@ pub(super) fn extract(
         world_writable as f64,
     );
     metrics.insert("archive.security.symlink_count", symlinks as f64);
-    metrics.insert("archive.symlink_count", symlinks as f64);
     metrics.insert("archive.security.encrypted_count", encrypted_count as f64);
-    metrics.insert("archive.encrypted_count", encrypted_count as f64);
 
     // Filename / content aggregates ported from cleave's ArchiveMetrics.
     metrics.insert("archive.max_filename_length", max_filename_length as f64);
@@ -803,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn totals_and_compression_ratio_alias() {
+    fn totals_and_compression_ratio() {
         let z = build_zip(&[
             ("a", b"abcdefghij", CompressionMethod::Stored),
             ("b", b"klmnop", CompressionMethod::Stored),
@@ -811,9 +806,9 @@ mod tests {
         let (_, m) = run(&z);
         assert_eq!(m.get("archive.total_uncompressed"), Some(16.0));
         assert!(m.get("archive.total_compressed").unwrap() >= 16.0);
-        // Both ratio names are present (legacy + flat).
+        // Canonical nested namespace only — flat `archive.compression_ratio`
+        // alias retired.
         assert!(m.get("archive.compression.ratio").is_some());
-        assert!(m.get("archive.compression_ratio").is_some());
     }
 
     #[test]
@@ -939,7 +934,6 @@ mod tests {
             "archive.total_uncompressed",
             "archive.total_compressed",
             "archive.compression.ratio",
-            "archive.compression_ratio",
             "archive.max_filename_length",
             "archive.hidden_file_count",
             "archive.path_traversal_count",
@@ -953,8 +947,6 @@ mod tests {
             "archive.nested_archive_count",
             "archive.misplaced_executable_count",
             "archive.extra_field_size",
-            "archive.symlink_count",
-            "archive.encrypted_count",
             "archive.security.setuid_count",
             "archive.security.setgid_count",
             "archive.security.sticky_count",

@@ -17,6 +17,8 @@ pub(super) enum CommentStyle {
     CStyle,
     /// `#` (Python, Shell, …).
     Hash,
+    /// `--` line comments (Lua, SQL, Haskell, …).
+    DoubleDash,
 }
 
 /// Emit `comments.*` metrics for `content` parsed with `style`.
@@ -131,7 +133,40 @@ fn extract_comments(content: &str, style: CommentStyle) -> Vec<String> {
     match style {
         CommentStyle::CStyle => extract_c_style_comments(content),
         CommentStyle::Hash => extract_hash_comments(content),
+        CommentStyle::DoubleDash => extract_double_dash_comments(content),
     }
+}
+
+fn extract_double_dash_comments(content: &str) -> Vec<String> {
+    let chars: Vec<char> = content.chars().collect();
+    let len = chars.len();
+    let mut comments = Vec::new();
+    let mut i = 0;
+    while i < len {
+        if chars[i] == '"' || chars[i] == '\'' {
+            let quote = chars[i];
+            i += 1;
+            while i < len && chars[i] != quote {
+                if chars[i] == '\\' && i + 1 < len {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if i + 1 < len && chars[i] == '-' && chars[i + 1] == '-' {
+            let start = i + 2;
+            i += 2;
+            while i < len && chars[i] != '\n' {
+                i += 1;
+            }
+            comments.push(chars[start..i].iter().collect());
+            continue;
+        }
+        i += 1;
+    }
+    comments
 }
 
 fn extract_c_style_comments(content: &str) -> Vec<String> {

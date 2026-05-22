@@ -154,7 +154,16 @@ pub(crate) fn extract(
         | FileType::Rust
         | FileType::Java
         | FileType::Shell
-        | FileType::Php => source::extract(
+        | FileType::Php
+        | FileType::Ruby
+        | FileType::Lua
+        | FileType::CSharp
+        | FileType::C
+        | FileType::Scala
+        | FileType::ObjectiveC
+        | FileType::Kotlin
+        | FileType::Swift
+        | FileType::PowerShell => source::extract(
             bytes, file_type, tree_cache, values, strings, metrics, imports, functions,
         ),
 
@@ -163,19 +172,10 @@ pub(crate) fn extract(
         // no AST required.
         FileType::Vbs
         | FileType::Batch
-        | FileType::Ruby
         | FileType::Perl
-        | FileType::Lua
-        | FileType::CSharp
-        | FileType::PowerShell
-        | FileType::Swift
-        | FileType::ObjectiveC
         | FileType::Groovy
-        | FileType::Scala
-        | FileType::Kotlin
         | FileType::Zig
-        | FileType::Elixir
-        | FileType::C => {
+        | FileType::Elixir => {
             source::extract_text_only(bytes, metrics);
             Ok(())
         }

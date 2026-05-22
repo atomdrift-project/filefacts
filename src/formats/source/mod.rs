@@ -484,6 +484,129 @@ mod tests {
         }
     }
 
+    /// Helper: parse `src` as a source file with the given extension and
+    /// return the typed `Imports` / `Functions` views plus the metrics
+    /// map. Asserts the file classified to a non-text-only source
+    /// extractor (i.e. `text.*` metrics fired) so callers can focus
+    /// on language-specific structural facts.
+    fn parse_source(name: &str, src: &[u8]) -> (Vec<String>, Vec<(String, Option<&'static str>)>) {
+        let parsed = crate::open_with_path(std::path::Path::new(name), src).unwrap();
+        let _ = parsed.values();
+        let imports = parsed
+            .imports()
+            .iter()
+            .map(|i| i.name.clone())
+            .collect::<Vec<_>>();
+        let functions = parsed
+            .functions()
+            .iter()
+            .map(|f| (f.name.clone(), f.kind))
+            .collect::<Vec<_>>();
+        // Every supported source language emits `text.line_count` from
+        // the byte stream — a cheap sanity check that the dispatcher
+        // routed to `source::extract`, not `extract_text_only`.
+        assert!(
+            parsed.metrics().get("text.total_lines").unwrap_or(0.0) > 0.0,
+            "expected text.total_lines metric to fire for {name}"
+        );
+        (imports, functions)
+    }
+
+    #[test]
+    fn ruby_imports_and_definitions() {
+        let src = b"require 'json'\nrequire_relative './lib'\nclass Greeter\n  def hello; end\nend\nmodule M; end\n";
+        let (imports, functions) = parse_source("app.rb", src);
+        assert!(imports.iter().any(|s| s == "json"), "got {imports:?}");
+        let names: std::collections::HashMap<&str, Option<&str>> =
+            functions.iter().map(|(n, k)| (n.as_str(), *k)).collect();
+        assert_eq!(names.get("hello").copied(), Some(Some("function")));
+        assert_eq!(names.get("Greeter").copied(), Some(Some("class")));
+        assert_eq!(names.get("M").copied(), Some(Some("class")));
+    }
+
+    #[test]
+    fn lua_imports_and_definitions() {
+        let src = b"local M = require(\"socket\")\nfunction greet(name)\n  return name\nend\nlocal function add(a, b) return a + b end\n";
+        let (imports, functions) = parse_source("script.lua", src);
+        assert!(imports.iter().any(|s| s == "socket"), "got {imports:?}");
+        let names: Vec<&str> = functions.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"greet"), "got {names:?}");
+    }
+
+    #[test]
+    fn csharp_imports_and_definitions() {
+        let src = b"using System;\nusing System.IO;\nnamespace Foo {\n  public class Bar {\n    public void Hello() {}\n  }\n}\n";
+        let (imports, functions) = parse_source("App.cs", src);
+        assert!(
+            imports.iter().any(|s| s == "System" || s == "System.IO"),
+            "got {imports:?}"
+        );
+        let names: std::collections::HashMap<&str, Option<&str>> =
+            functions.iter().map(|(n, k)| (n.as_str(), *k)).collect();
+        assert_eq!(names.get("Hello").copied(), Some(Some("function")));
+        assert_eq!(names.get("Bar").copied(), Some(Some("class")));
+    }
+
+    #[test]
+    fn c_imports_and_definitions() {
+        let src = b"#include <stdio.h>\n#include \"local.h\"\nint add(int a, int b) { return a + b; }\nstruct P { int x; };\n";
+        let (imports, functions) = parse_source("main.c", src);
+        assert!(!imports.is_empty(), "expected C #include imports");
+        let names: std::collections::HashMap<&str, Option<&str>> =
+            functions.iter().map(|(n, k)| (n.as_str(), *k)).collect();
+        assert_eq!(names.get("add").copied(), Some(Some("function")));
+        assert_eq!(names.get("P").copied(), Some(Some("class")));
+    }
+
+    #[test]
+    fn scala_imports_and_definitions() {
+        let src = b"import scala.collection.mutable\nclass Greeter { def hello() = 1 }\nobject O { def add(a: Int, b: Int) = a + b }\n";
+        let (imports, functions) = parse_source("App.scala", src);
+        assert!(!imports.is_empty(), "expected scala imports");
+        let names: std::collections::HashMap<&str, Option<&str>> =
+            functions.iter().map(|(n, k)| (n.as_str(), *k)).collect();
+        assert_eq!(names.get("hello").copied(), Some(Some("function")));
+        assert_eq!(names.get("Greeter").copied(), Some(Some("class")));
+    }
+
+    #[test]
+    fn objc_imports_and_definitions() {
+        let src = b"#import <Foundation/Foundation.h>\n@interface Greeter : NSObject\n- (void)hello;\n@end\n@implementation Greeter\n- (void)hello {}\n@end\n";
+        let (imports, _functions) = parse_source("view.m", src);
+        assert!(!imports.is_empty(), "expected objc imports");
+    }
+
+    #[test]
+    fn kotlin_imports_and_definitions() {
+        let src = b"package foo\nimport java.io.File\nclass Greeter { fun hello() = 1 }\nfun add(a: Int, b: Int) = a + b\n";
+        let (imports, functions) = parse_source("App.kt", src);
+        assert!(
+            imports.iter().any(|s| s.contains("File")),
+            "got {imports:?}"
+        );
+        let names: Vec<&str> = functions.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"hello"), "got {names:?}");
+        assert!(names.contains(&"add"), "got {names:?}");
+    }
+
+    #[test]
+    fn swift_imports_and_definitions() {
+        let src = b"import Foundation\nclass Greeter {\n  func hello() -> Int { return 1 }\n}\nfunc add(a: Int, b: Int) -> Int { return a + b }\n";
+        let (imports, functions) = parse_source("app.swift", src);
+        assert!(imports.iter().any(|s| s == "Foundation"), "got {imports:?}");
+        let names: Vec<&str> = functions.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"add"), "got {names:?}");
+    }
+
+    #[test]
+    fn powershell_functions_extracted() {
+        let src =
+            b"function Get-Greeting {\n  param([string]$Name)\n  Write-Output \"Hi $Name\"\n}\n";
+        let (_imports, functions) = parse_source("script.ps1", src);
+        let names: Vec<&str> = functions.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"Get-Greeting"), "got {names:?}");
+    }
+
     /// Python `def foo()` / `class Bar:` populate the typed
     /// `Functions` view with `kind: "function"` / `"class"`.
     #[test]

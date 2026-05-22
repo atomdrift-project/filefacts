@@ -476,7 +476,8 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
     metrics.insert("elf.little_endian", f64::from(u8::from(elf.little_endian)));
     metrics.insert("elf.entry", elf.header.e_entry as f64);
     metrics.insert("elf.program_header_count", elf.program_headers.len() as f64);
-    metrics.insert("elf.section_count", elf.section_headers.len() as f64);
+    // Section count flows through `sections.count` (cross-format aggregate
+    // emitted by `emit_section_metrics`). Don't dual-emit `elf.section_count`.
     metrics.insert(
         "elf.section_relocation_group_count",
         elf.shdr_relocs.len() as f64,
@@ -746,9 +747,9 @@ fn table_counts(elf: &Elf<'_>, metrics: &mut Metrics) {
     metrics.insert("elf.dynrela_count", elf.dynrelas.len() as f64);
     metrics.insert("elf.dynrel_count", elf.dynrels.len() as f64);
     metrics.insert("elf.pltreloc_count", elf.pltrelocs.len() as f64);
-    // `elf.libraries` is the parsed DT_NEEDED list; goblin doesn't
-    // expose a separate `needed_count` outside the typed dynamic info.
-    metrics.insert("elf.needed_count", elf.libraries.len() as f64);
+    // DT_NEEDED entries are this ELF's shared-library dependencies.
+    // Flows through the cross-format `dependencies.count` metric.
+    metrics.insert("dependencies.count", elf.libraries.len() as f64);
 }
 
 /// `elf.*` metrics derived from the dynamic-section tag stream. Each
@@ -787,10 +788,9 @@ fn dynamic_metrics(elf: &Elf<'_>, metrics: &mut Metrics) {
     // the ELF-spec literal directly.
     const DT_RELR: u64 = 36;
 
-    // `needed_count` mirrors the `DT_NEEDED` count expose's `dynamic`
-    // emitter already publishes as `elf.needed[]`. Trait authors keying
-    // off a count use this; cleave's binary metrics layer reads from it.
-    metrics.insert("elf.needed_count", elf.libraries.len() as f64);
+    // DT_NEEDED count surfaces under the cross-format
+    // `dependencies.count` metric. No per-format alias.
+    metrics.insert("dependencies.count", elf.libraries.len() as f64);
 
     let Some(dynamic) = elf.dynamic.as_ref() else {
         return;
@@ -1268,8 +1268,9 @@ fn symbols(
             });
         }
     }
-    metrics.insert("elf.import_count", imports.len() as f64);
-    metrics.insert("elf.export_count", exports.len() as f64);
+    // Import/export totals flow through cross-format `imports.count`
+    // / `exports.count` emitted by `lib.rs::extract_all` after every
+    // format extractor runs. No per-format aliases.
     if fortify_count > 0 {
         metrics.insert("elf.fortify_source_count", fortify_count as f64);
     }
@@ -1519,8 +1520,12 @@ mod tests {
         // Header / section / segment counts.
         assert!(m.get("elf.bits").unwrap() == 64.0 || m.get("elf.bits").unwrap() == 32.0);
         assert!(m.get("elf.program_header_count").unwrap() > 0.0);
-        assert!(m.get("elf.section_count").unwrap() > 0.0);
-        assert!(m.get("elf.needed_count").is_some());
+        // Section count flows through cross-format `sections.count`
+        // emitted from `lib.rs::extract_all`. The per-format `extract`
+        // call this test exercises populates the `sections` Vec
+        // directly — the aggregate metric is asserted in the
+        // top-level pipeline tests.
+        assert!(m.get("dependencies.count").is_some());
         // Anomaly metrics are emitted as zero only when set; their
         // absence on a healthy binary is expected. We verify the
         // dependency-loaded metrics are present.

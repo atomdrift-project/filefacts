@@ -135,7 +135,7 @@ fn single_arch(
 ) {
     extract_sections(macho, bytes, metrics, sections_out);
     extract_header_and_loads(macho, bytes, values, metrics);
-    extract_symbols(macho, values, metrics, imports_out, exports_out);
+    extract_symbols(macho, values, imports_out, exports_out);
     super::build_toolchain::from_macho(values, sections_out);
 }
 
@@ -150,7 +150,6 @@ fn single_arch(
 fn extract_symbols(
     macho: &MachO<'_>,
     values: &mut Values,
-    metrics: &mut Metrics,
     imports_out: &mut crate::Imports,
     exports_out: &mut crate::Exports,
 ) {
@@ -171,7 +170,7 @@ fn extract_symbols(
             });
             names.push(JsonValue::String(imp.name.to_string()));
         }
-        metrics.insert("macho.import_count", names.len() as f64);
+        // Import count flows through cross-format `imports.count`.
         values.insert("macho.imports", JsonValue::Array(names));
     }
 
@@ -195,7 +194,7 @@ fn extract_symbols(
             });
             names.push(JsonValue::String(exp.name.clone()));
         }
-        metrics.insert("macho.export_count", names.len() as f64);
+        // Export count flows through cross-format `exports.count`.
         values.insert("macho.exports", JsonValue::Array(names));
     }
 }
@@ -370,7 +369,9 @@ fn extract_header_and_loads(
         .filter(|s| !s.is_empty() && **s != "self")
         .map(|s| JsonValue::String((*s).to_string()))
         .collect();
-    metrics.insert("macho.library_count", libs.len() as f64);
+    // LC_LOAD_DYLIB count surfaces under the cross-format
+    // `dependencies.count` metric. No per-format alias.
+    metrics.insert("dependencies.count", libs.len() as f64);
     values.insert("macho.libraries", JsonValue::Array(libs));
 
     let rpaths: Vec<JsonValue> = macho

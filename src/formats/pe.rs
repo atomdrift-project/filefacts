@@ -439,8 +439,10 @@ fn imports(
             })
         })
         .collect();
-    metrics.insert("pe.import_count", pe.imports.len() as f64);
-    metrics.insert("pe.imported_library_count", arr.len() as f64);
+    // Total import-symbol count flows through cross-format `imports.count`.
+    // DLL dependencies (the libraries imports are bound to) flow through
+    // cross-format `dependencies.count`.
+    metrics.insert("dependencies.count", arr.len() as f64);
     values.insert("pe.imports", JsonValue::Array(arr));
 
     if let Some(hash) = imphash(pe) {
@@ -494,7 +496,7 @@ fn exports(
             forward_to,
         });
     }
-    metrics.insert("pe.export_count", names.len() as f64);
+    // Export count flows through cross-format `exports.count`.
     if forwarded_count > 0 {
         metrics.insert("pe.forwarded_export_count", f64::from(forwarded_count));
     }

@@ -212,13 +212,15 @@ pub(super) fn rizin_fallback(
 }
 
 /// Extended rizin fallback for PE: tries to recover sections as well
-/// as imports / exports / functions, and emits `*.rizin_recovered_*`
+/// as imports / exports / functions, and emits `*.recovered_*`
 /// metrics under the supplied prefix so callers can attribute the
-/// recovered counts in trait rules. Returns the number of entries
-/// rizin contributed to each view.
+/// recovered counts in trait rules. Returns the number of entries the
+/// disassembler contributed to each view.
 ///
 /// The caller passes the metric prefix (`"pe"`, `"elf"`, `"macho"`)
-/// so the emitted keys are `{prefix}.rizin_recovered_sections` etc.
+/// so the emitted keys are `{prefix}.recovered_sections` etc. The
+/// path stays tool-agnostic — if the disassembler ever swaps from
+/// rizin to radare2 / Ghidra the schema doesn't ripple.
 pub(super) fn rizin_fallback_with_sections(
     bytes: &[u8],
     imports: &mut crate::Imports,
@@ -243,25 +245,25 @@ pub(super) fn rizin_fallback_with_sections(
     let counts = recovery.apply_with_sections(imports, exports, functions, sections, metrics);
     if counts.imports > 0 {
         metrics.insert(
-            format!("{metric_prefix}.rizin_recovered_imports"),
+            format!("{metric_prefix}.recovered_imports"),
             f64::from(counts.imports),
         );
     }
     if counts.exports > 0 {
         metrics.insert(
-            format!("{metric_prefix}.rizin_recovered_exports"),
+            format!("{metric_prefix}.recovered_exports"),
             f64::from(counts.exports),
         );
     }
     if counts.functions > 0 {
         metrics.insert(
-            format!("{metric_prefix}.rizin_recovered_functions"),
+            format!("{metric_prefix}.recovered_functions"),
             f64::from(counts.functions),
         );
     }
     if counts.sections > 0 {
         metrics.insert(
-            format!("{metric_prefix}.rizin_recovered_sections"),
+            format!("{metric_prefix}.recovered_sections"),
             f64::from(counts.sections),
         );
     }

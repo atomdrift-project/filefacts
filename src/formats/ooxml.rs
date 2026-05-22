@@ -143,7 +143,7 @@ pub(super) fn extract(
     // ratio that would drown the forensic signal.
     let mut external_relationships: Vec<JsonValue> = Vec::new();
     for i in 0..zip.len() {
-        let Ok(mut entry) = zip.by_index(i) else {
+        let Ok(entry) = zip.by_index(i) else {
             continue;
         };
         let name = entry.name().to_string();
@@ -399,7 +399,7 @@ fn read_entry_text<R: Read + std::io::Seek>(
     zip: &mut ::zip::ZipArchive<R>,
     name: &str,
 ) -> Option<String> {
-    let mut entry = zip.by_name(name).ok()?;
+    let entry = zip.by_name(name).ok()?;
     // OOXML metadata files are tiny — 16 KiB is generous; the cap
     // keeps a hostile archive with a giant fake metadata stream from
     // ballooning memory.

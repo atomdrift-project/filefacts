@@ -63,7 +63,8 @@ pub(super) fn extract(
     itsf.insert("timestamp_counter".into(), json!(timestamp_counter));
     itsf.insert("lcid".into(), json!(lcid));
     values.insert("chm.itsf", JsonValue::Object(itsf));
-    metrics.insert("chm.itsf_lcid", f64::from(lcid));
+    // The LCID is reachable via `chm.itsf.lcid` (nested value).
+    // Don't dual-emit as a flat `chm.itsf_lcid` metric.
 
     let Some(dir) = bytes.get(section1_offset..section1_offset.saturating_add(section1_length))
     else {
@@ -630,7 +631,8 @@ mod tests {
             itsf.get("timestamp_counter").and_then(|x| x.as_u64()),
             Some(42)
         );
-        assert_eq!(m.get("chm.itsf_lcid"), Some(0x0409 as f64));
+        // LCID is reachable via the nested `chm.itsf.lcid` value
+        // surfaced above; no flat `chm.itsf_lcid` metric is emitted.
     }
 
     #[test]
