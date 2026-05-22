@@ -68,12 +68,39 @@ pub(super) fn extract(
     elf_numeric_metrics(&elf, bytes, metrics, values);
     dynamic_metrics(&elf, metrics);
     table_counts(&elf, metrics);
+    relocation_kinds(&elf, values);
     segments(&elf, values);
     rizin_fallback(bytes, imports_out, exports_out, functions_out, metrics);
     linker_family(values);
     super::elf_hashes::emit(&elf, values, imports_out, exports_out);
     super::upx::detect(bytes, values);
-    super::go_buildinfo::detect(bytes, values, "elf");
+    {
+        // VA→file-offset resolver: walk `PT_LOAD` program headers and
+        // map any address in `[p_vaddr, p_vaddr + p_memsz)` to the
+        // corresponding `[p_offset, p_offset + p_filesz)` byte. Used
+        // by the old-format (Go <1.18) Go buildinfo decoder to chase
+        // the version + modinfo pointers it stores instead of inline
+        // strings.
+        let loads: Vec<(u64, u64, u64, u64)> = elf
+            .program_headers
+            .iter()
+            .filter(|p| p.p_type == goblin::elf::program_header::PT_LOAD)
+            .map(|p| (p.p_vaddr, p.p_memsz, p.p_offset, p.p_filesz))
+            .collect();
+        let resolve = |va: u64| -> Option<usize> {
+            for (vaddr, memsz, offset, filesz) in &loads {
+                if va >= *vaddr && va < vaddr.saturating_add(*memsz) {
+                    let delta = va - vaddr;
+                    if delta >= *filesz {
+                        return None;
+                    }
+                    return usize::try_from(offset.saturating_add(delta)).ok();
+                }
+            }
+            None
+        };
+        super::go_buildinfo::detect(bytes, values, "elf", Some(&resolve));
+    }
     super::build_toolchain::from_elf(values, sections_out, bytes);
 
     Ok(())
@@ -755,6 +782,109 @@ fn table_counts(elf: &Elf<'_>, metrics: &mut Metrics) {
     metrics.insert("dependencies.count", elf.libraries.len() as f64);
 }
 
+/// Aggregate per-relocation-type counts across `.rela.dyn` /
+/// `.rel.dyn` / `.rela.plt`. The distribution is a useful
+/// fingerprint:
+///
+/// - `R_*_RELATIVE` dominance signals a PIE / shared object
+///   resolving load-time fixups.
+/// - `R_*_JUMP_SLOT` count tracks the PLT entry count (one per
+///   resolved import).
+/// - `R_*_COPY` entries indicate the binary needs writable copies
+///   of imported `.data` symbols (rare; almost always C++/glibc).
+/// - `R_*_IRELATIVE` entries point at `STT_GNU_IFUNC` resolvers —
+///   the runtime dispatcher mechanism used by both glibc internal
+///   string-function dispatch and a small fraction of malware
+///   loaders.
+///
+/// Names use the canonical binutils mnemonic per architecture.
+/// Unrecognised codes fall through to `R_<MACHINE>_<NUM>`.
+fn relocation_kinds(elf: &Elf<'_>, values: &mut Values) {
+    let machine = elf.header.e_machine;
+    let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut tally = |r_type: u32| {
+        let name = relocation_kind_name(machine, r_type);
+        *counts.entry(name).or_insert(0) += 1;
+    };
+    for r in &elf.dynrelas {
+        tally(r.r_type);
+    }
+    for r in &elf.dynrels {
+        tally(r.r_type);
+    }
+    for r in &elf.pltrelocs {
+        tally(r.r_type);
+    }
+    if counts.is_empty() {
+        return;
+    }
+    let mut obj = serde_json::Map::new();
+    for (name, count) in counts {
+        obj.insert(name, JsonValue::Number(count.into()));
+    }
+    values.insert("elf.relocation_kinds", JsonValue::Object(obj));
+}
+
+/// Per-machine relocation-type mnemonic. Returns the binutils name
+/// (`R_X86_64_RELATIVE`, `R_AARCH64_JUMP_SLOT`, …) for the codes
+/// most commonly seen in dynamic relocation tables; falls back to a
+/// `R_<MACHINE>_<NUM>` string for codes the histogram doesn't cover
+/// so unusual values still show up in the output.
+fn relocation_kind_name(machine: u16, r_type: u32) -> String {
+    let known = match machine {
+        header::EM_X86_64 => match r_type {
+            0 => Some("R_X86_64_NONE"),
+            1 => Some("R_X86_64_64"),
+            2 => Some("R_X86_64_PC32"),
+            5 => Some("R_X86_64_COPY"),
+            6 => Some("R_X86_64_GLOB_DAT"),
+            7 => Some("R_X86_64_JUMP_SLOT"),
+            8 => Some("R_X86_64_RELATIVE"),
+            9 => Some("R_X86_64_GOTPCREL"),
+            37 => Some("R_X86_64_IRELATIVE"),
+            _ => None,
+        },
+        header::EM_AARCH64 => match r_type {
+            0 => Some("R_AARCH64_NONE"),
+            257 => Some("R_AARCH64_ABS64"),
+            1024 => Some("R_AARCH64_COPY"),
+            1025 => Some("R_AARCH64_GLOB_DAT"),
+            1026 => Some("R_AARCH64_JUMP_SLOT"),
+            1027 => Some("R_AARCH64_RELATIVE"),
+            1042 => Some("R_AARCH64_IRELATIVE"),
+            _ => None,
+        },
+        header::EM_ARM => match r_type {
+            0 => Some("R_ARM_NONE"),
+            2 => Some("R_ARM_ABS32"),
+            18 => Some("R_ARM_COPY"),
+            20 => Some("R_ARM_GLOB_DAT"),
+            21 => Some("R_ARM_JUMP_SLOT"),
+            23 => Some("R_ARM_RELATIVE"),
+            160 => Some("R_ARM_IRELATIVE"),
+            _ => None,
+        },
+        header::EM_386 => match r_type {
+            0 => Some("R_386_NONE"),
+            1 => Some("R_386_32"),
+            5 => Some("R_386_COPY"),
+            6 => Some("R_386_GLOB_DAT"),
+            7 => Some("R_386_JUMP_SLOT"),
+            8 => Some("R_386_RELATIVE"),
+            42 => Some("R_386_IRELATIVE"),
+            _ => None,
+        },
+        _ => None,
+    };
+    match known {
+        Some(name) => name.to_string(),
+        None => format!(
+            "R_{}_{r_type}",
+            machine_string(machine).to_ascii_uppercase()
+        ),
+    }
+}
+
 /// `elf.*` metrics derived from the dynamic-section tag stream. Each
 /// is a hardening / build-environment / sandbox-escape signal the
 /// trait engine wants as a numeric/bool flag rather than a substring
@@ -1114,6 +1244,126 @@ fn elf_header(elf: &Elf<'_>, values: &mut Values) {
     put_str(values, "elf.type", elf_type_string(elf.header.e_type));
     put_u64(values, "elf.entry", elf.header.e_entry);
     put_u64(values, "elf.version", u64::from(elf.header.e_version));
+    e_flags(elf, values);
+}
+
+/// Per-architecture decode of `e_flags`. x86 / x86_64 / aarch64
+/// don't use the field (always zero), so we don't bother emitting
+/// `elf.e_flags` for them — the absence of the field IS the "no
+/// arch flags" signal. ARM / MIPS / RISC-V carry meaningful ABI
+/// bits here: ABI version (ARM EABI), float convention (ARM
+/// soft/hard, MIPS FP64, RISC-V single/double/quad), endianness
+/// hints, and ISA-extension markers.
+fn e_flags(elf: &Elf<'_>, values: &mut Values) {
+    let raw = elf.header.e_flags;
+    if raw == 0 {
+        return;
+    }
+    let machine = elf.header.e_machine;
+    let mut flags: Vec<&'static str> = Vec::new();
+    match machine {
+        header::EM_ARM => decompose_arm_eflags(raw, &mut flags),
+        header::EM_MIPS => decompose_mips_eflags(raw, &mut flags),
+        header::EM_RISCV => decompose_riscv_eflags(raw, &mut flags),
+        _ => {}
+    }
+    put_u64(values, "elf.e_flags_raw", u64::from(raw));
+    if !flags.is_empty() {
+        values.insert(
+            "elf.e_flags",
+            JsonValue::Array(
+                flags
+                    .into_iter()
+                    .map(|s| JsonValue::String(s.to_string()))
+                    .collect(),
+            ),
+        );
+    }
+}
+
+fn decompose_arm_eflags(v: u32, out: &mut Vec<&'static str>) {
+    // EABI version sits in the top byte. binutils prints it as
+    // "Version5 EABI" — we use the canonical short name.
+    let eabi = (v >> 24) & 0xff;
+    if eabi != 0 {
+        out.push(match eabi {
+            1 => "eabi_v1",
+            2 => "eabi_v2",
+            3 => "eabi_v3",
+            4 => "eabi_v4",
+            5 => "eabi_v5",
+            _ => "eabi_unknown",
+        });
+    }
+    if v & 0x0000_0001 != 0 {
+        out.push("relexec");
+    }
+    if v & 0x0000_0004 != 0 {
+        out.push("interwork");
+    }
+    if v & 0x0000_0200 != 0 {
+        out.push("soft_float");
+    }
+    if v & 0x0000_0400 != 0 {
+        out.push("hard_float");
+    }
+    if v & 0x0040_0000 != 0 {
+        out.push("le8");
+    }
+    if v & 0x0080_0000 != 0 {
+        out.push("be8");
+    }
+}
+
+fn decompose_mips_eflags(v: u32, out: &mut Vec<&'static str>) {
+    if v & 0x0000_0001 != 0 {
+        out.push("noreorder");
+    }
+    if v & 0x0000_0002 != 0 {
+        out.push("pic");
+    }
+    if v & 0x0000_0004 != 0 {
+        out.push("cpic");
+    }
+    if v & 0x0000_0020 != 0 {
+        out.push("abi2_n32");
+    }
+    if v & 0x0000_0100 != 0 {
+        out.push("32bit_mode");
+    }
+    if v & 0x0000_0200 != 0 {
+        out.push("fp64");
+    }
+    if v & 0x0000_0400 != 0 {
+        out.push("nan2008");
+    }
+    // ABI field (bits 0x0000_F000) — only the first few values are used.
+    match (v >> 12) & 0xf {
+        1 => out.push("abi_o32"),
+        2 => out.push("abi_o64"),
+        3 => out.push("abi_eabi32"),
+        4 => out.push("abi_eabi64"),
+        _ => {}
+    }
+}
+
+fn decompose_riscv_eflags(v: u32, out: &mut Vec<&'static str>) {
+    if v & 0x0000_0001 != 0 {
+        out.push("rvc");
+    }
+    if v & 0x0000_0008 != 0 {
+        out.push("rve");
+    }
+    if v & 0x0000_0010 != 0 {
+        out.push("tso");
+    }
+    // Float ABI in bits 0x6.
+    match (v >> 1) & 0x3 {
+        1 => out.push("fp_single"),
+        2 => out.push("fp_double"),
+        3 => out.push("fp_quad"),
+        _ => {}
+    }
 }
 
 fn dynamic(elf: &Elf<'_>, values: &mut Values) {
@@ -1200,12 +1450,27 @@ fn symbols(
     let mut fortify_count: u64 = 0;
     let mut hidden_count: u64 = 0;
     let mut stack_canary = false;
+    // Aggregate symbol-type / binding / visibility histograms across
+    // `.symtab` and `.dynsym`. The forensic value is in the *ratio*
+    // (Go binaries skew heavily toward STT_FUNC; C++ STL templates
+    // generate huge STT_OBJECT counts; rootkits often have many
+    // STT_TLS to hide state) so we surface the counts under
+    // `elf.symbol_kinds` rather than as individual metrics.
+    let mut sym_type_counts: [u64; 16] = [0; 16];
+    let mut sym_bind_counts: [u64; 4] = [0; 4];
+    let mut sym_vis_counts: [u64; 4] = [0; 4];
     // Static `.symtab` — hidden visibility + stack-canary symbols.
     // `STB_LOCAL = 0`, `STV_HIDDEN = 2`.
     for sym in elf.syms.iter() {
         if sym.st_bind() == 0 && sym.st_visibility() == 2 {
             hidden_count += 1;
         }
+        tally_symbol_kinds(
+            sym.clone(),
+            &mut sym_type_counts,
+            &mut sym_bind_counts,
+            &mut sym_vis_counts,
+        );
         if let Some(name) = elf.strtab.get_at(sym.st_name) {
             if name == "__stack_chk_fail" || name == "__stack_chk_guard" {
                 stack_canary = true;
@@ -1217,6 +1482,12 @@ fn symbols(
         if sym.st_bind() == 0 && sym.st_visibility() == 2 {
             hidden_count += 1;
         }
+        tally_symbol_kinds(
+            sym.clone(),
+            &mut sym_type_counts,
+            &mut sym_bind_counts,
+            &mut sym_vis_counts,
+        );
         let Some(name) = elf.dynstrtab.get_at(sym.st_name) else {
             continue;
         };
@@ -1278,6 +1549,92 @@ fn symbols(
     }
     if !ifuncs.is_empty() {
         values.insert("elf.ifuncs", JsonValue::Array(ifuncs));
+    }
+    emit_symbol_kind_histograms(&sym_type_counts, &sym_bind_counts, &sym_vis_counts, values);
+}
+
+/// Bump the type / binding / visibility tallies for one ELF symbol.
+/// `STT_*` types past 15 do not exist (the field is 4 bits); same for
+/// the 2-bit visibility. `STB_LOCAL` / `GLOBAL` / `WEAK` (0/1/2) are
+/// the entire population in practice — anything else is processor-
+/// specific and rare enough to round into the array's last slot.
+fn tally_symbol_kinds(
+    sym: goblin::elf::sym::Sym,
+    types: &mut [u64; 16],
+    bindings: &mut [u64; 4],
+    visibility: &mut [u64; 4],
+) {
+    let stt = (sym.st_info & 0xf) as usize;
+    types[stt] += 1;
+    let stb = ((sym.st_info >> 4) & 0xf) as usize;
+    bindings[stb.min(3)] += 1;
+    let vis = (sym.st_other & 0x3) as usize;
+    visibility[vis] += 1;
+}
+
+/// Project the three tally arrays into `elf.symbol_kinds.*` under
+/// the canonical lowercase names. Empty buckets are suppressed
+/// rather than emitted as zeros to keep the JSON output focused on
+/// what's actually present.
+fn emit_symbol_kind_histograms(
+    types: &[u64; 16],
+    bindings: &[u64; 4],
+    visibility: &[u64; 4],
+    values: &mut Values,
+) {
+    const TYPE_NAMES: [&str; 16] = [
+        "notype",
+        "object",
+        "func",
+        "section",
+        "file",
+        "common",
+        "tls",
+        "stt_7",
+        "stt_8",
+        "stt_9",
+        "gnu_ifunc",
+        "stt_11",
+        "stt_12",
+        "stt_13",
+        "stt_14",
+        "stt_15",
+    ];
+    const BIND_NAMES: [&str; 4] = ["local", "global", "weak", "other"];
+    const VIS_NAMES: [&str; 4] = ["default", "internal", "hidden", "protected"];
+
+    let mut by_type = serde_json::Map::new();
+    for (i, count) in types.iter().enumerate() {
+        if *count > 0 {
+            by_type.insert(
+                TYPE_NAMES[i].to_string(),
+                JsonValue::Number((*count).into()),
+            );
+        }
+    }
+    if !by_type.is_empty() {
+        values.insert("elf.symbol_kinds.types", JsonValue::Object(by_type));
+    }
+    let mut by_bind = serde_json::Map::new();
+    for (i, count) in bindings.iter().enumerate() {
+        if *count > 0 {
+            by_bind.insert(
+                BIND_NAMES[i].to_string(),
+                JsonValue::Number((*count).into()),
+            );
+        }
+    }
+    if !by_bind.is_empty() {
+        values.insert("elf.symbol_kinds.bindings", JsonValue::Object(by_bind));
+    }
+    let mut by_vis = serde_json::Map::new();
+    for (i, count) in visibility.iter().enumerate() {
+        if *count > 0 {
+            by_vis.insert(VIS_NAMES[i].to_string(), JsonValue::Number((*count).into()));
+        }
+    }
+    if !by_vis.is_empty() {
+        values.insert("elf.symbol_kinds.visibility", JsonValue::Object(by_vis));
     }
 }
 

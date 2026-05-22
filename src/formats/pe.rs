@@ -143,7 +143,7 @@ pub(super) fn extract(
         super::pe_image_hash::extract(&pe, bytes, values, metrics);
         super::pe_rich::extract(bytes, values);
         super::upx::detect(bytes, values);
-        super::go_buildinfo::detect(bytes, values, "pe");
+        super::go_buildinfo::detect(bytes, values, "pe", None);
         super::build_toolchain::from_pe_rich(values);
         rizin_fallback_with_sections(
             bytes,

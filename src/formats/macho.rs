@@ -75,7 +75,7 @@ pub(super) fn extract(
     }
     rizin_fallback(bytes, imports_out, exports_out, functions_out, metrics);
     super::upx::detect(bytes, values);
-    super::go_buildinfo::detect(bytes, values, "macho");
+    super::go_buildinfo::detect(bytes, values, "macho", None);
     Ok(())
 }
 

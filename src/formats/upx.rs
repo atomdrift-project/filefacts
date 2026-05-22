@@ -84,9 +84,7 @@ fn extract_version(bytes: &[u8]) -> Option<String> {
 /// Naive substring search. The needles here are short and rare
 /// enough that a memchr-driven scan would not measurably help.
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]

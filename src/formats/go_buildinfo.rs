@@ -49,37 +49,135 @@ const MAGIC: &[u8] = b"\xff Go buildinf:";
 /// populate `<key_prefix>.go.*` with the decoded metadata. The
 /// key prefix is the format's namespace (`"elf"`, `"macho"`,
 /// `"pe"`) — keeps Go data attached to the format that hosted it.
-pub(super) fn detect(bytes: &[u8], values: &mut Values, key_prefix: &str) {
+///
+/// `resolve_va` is an optional virtual-address resolver. The old
+/// (Go <1.18) format encodes the version + modinfo strings as
+/// pointers into the binary's load segments; resolving them needs
+/// the format's program-header table. Callers that can map a VA to
+/// a file offset (the ELF extractor walks `PT_LOAD`) pass a
+/// closure; those that can't pass `None` and we silently skip the
+/// old-format decode.
+pub(super) fn detect(
+    bytes: &[u8],
+    values: &mut Values,
+    key_prefix: &str,
+    resolve_va: Option<&dyn Fn(u64) -> Option<usize>>,
+) {
     let Some(start) = find_bytes(bytes, MAGIC) else {
         return;
     };
     if start + 32 > bytes.len() {
         return;
     }
+    let ptr_size = bytes[start + 14] as usize;
     let flags = bytes[start + 15];
     let inline = flags & 0x2 != 0;
-    if !inline {
-        // Old (Go <1.18) format uses VA pointers into the data
-        // segment; resolving them needs the program header table
-        // and is not worth the complexity here. The plain-text
-        // `modinfo` still leaks via the strings view.
-        return;
-    }
-    // Payload starts at a 32-byte alignment from the magic.
-    let payload = &bytes[start + 32..];
-    let (version, rest) = match read_uvarint_string(payload) {
-        Some(v) => v,
-        None => return,
-    };
-    let modinfo_bytes = read_uvarint_string(rest).map_or(&[][..], |(s, _)| s);
 
     let key = format!("{key_prefix}.go");
     let mut obj = Map::new();
-    if let Ok(s) = std::str::from_utf8(version) {
-        obj.insert("version".into(), JsonValue::String(s.to_string()));
+    if inline {
+        // Payload starts at a 32-byte alignment from the magic.
+        let payload = &bytes[start + 32..];
+        let Some((version, rest)) = read_uvarint_string(payload) else {
+            return;
+        };
+        let modinfo_bytes = read_uvarint_string(rest).map_or(&[][..], |(s, _)| s);
+        if let Ok(s) = std::str::from_utf8(version) {
+            obj.insert("version".into(), JsonValue::String(s.to_string()));
+        }
+        parse_modinfo(modinfo_bytes, &mut obj);
+    } else if let Some(resolve) = resolve_va {
+        // Old (Go <1.18) format: two VA pointers follow the header
+        // at +16. Each one points to a Go string-header struct
+        // (`{ data ptr; int len }`) sitting in the data segment.
+        if !decode_old_format(bytes, start, ptr_size, resolve, &mut obj) {
+            return;
+        }
+    } else {
+        return;
     }
-    parse_modinfo(modinfo_bytes, &mut obj);
+    if obj.is_empty() {
+        return;
+    }
     values.insert(&key, JsonValue::Object(obj));
+}
+
+/// Decode the legacy pointer-based build-info layout. Returns
+/// `true` when at least the Go version string was recovered. The
+/// resolver maps a VA to a file offset; the rest is just two
+/// indirections (pointer → string header → string body).
+fn decode_old_format(
+    bytes: &[u8],
+    start: usize,
+    ptr_size: usize,
+    resolve_va: &dyn Fn(u64) -> Option<usize>,
+    out: &mut Map<String, JsonValue>,
+) -> bool {
+    if ptr_size != 4 && ptr_size != 8 {
+        return false;
+    }
+    if start + 16 + 2 * ptr_size > bytes.len() {
+        return false;
+    }
+    let v_ptr = read_uint_le(bytes, start + 16, ptr_size);
+    let m_ptr = read_uint_le(bytes, start + 16 + ptr_size, ptr_size);
+
+    let mut got_version = false;
+    if let Some(version) = read_go_string(bytes, v_ptr, ptr_size, resolve_va) {
+        if let Ok(s) = std::str::from_utf8(&version) {
+            out.insert("version".into(), JsonValue::String(s.to_string()));
+            got_version = true;
+        }
+    }
+    if let Some(modinfo) = read_go_string(bytes, m_ptr, ptr_size, resolve_va) {
+        parse_modinfo(&modinfo, out);
+    }
+    got_version
+}
+
+/// Follow a Go `string` header at VA `header_va`. Layout:
+/// `{ data: pointer; len: int }`. Returns the string body bytes.
+fn read_go_string(
+    bytes: &[u8],
+    header_va: u64,
+    ptr_size: usize,
+    resolve_va: &dyn Fn(u64) -> Option<usize>,
+) -> Option<Vec<u8>> {
+    let hdr_off = resolve_va(header_va)?;
+    if hdr_off + 2 * ptr_size > bytes.len() {
+        return None;
+    }
+    let data_va = read_uint_le(bytes, hdr_off, ptr_size);
+    let len = read_uint_le(bytes, hdr_off + ptr_size, ptr_size);
+    // Sanity-cap on length so a malformed pointer can't have us
+    // allocate gigabytes. 4 MiB is far above any real Go modinfo
+    // (kube-diag's was 1.3 KiB).
+    let len = usize::try_from(len).ok()?.min(4 * 1024 * 1024);
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let data_off = resolve_va(data_va)?;
+    let end = data_off.checked_add(len)?;
+    if end > bytes.len() {
+        return None;
+    }
+    Some(bytes[data_off..end].to_vec())
+}
+
+/// Little-endian unsigned read of `width` bytes (4 or 8). Go
+/// binaries are little-endian on every mainstream architecture
+/// (the loader hasn't shipped a big-endian build target in
+/// years), so we don't carry an endian parameter — the few
+/// `mips`/`s390x` BE binaries are rare enough to defer.
+fn read_uint_le(bytes: &[u8], off: usize, width: usize) -> u64 {
+    let mut v: u64 = 0;
+    for i in 0..width {
+        if off + i >= bytes.len() {
+            return v;
+        }
+        v |= u64::from(bytes[off + i]) << (8 * i);
+    }
+    v
 }
 
 /// Parse the modinfo text and fold its records into `out`. Records

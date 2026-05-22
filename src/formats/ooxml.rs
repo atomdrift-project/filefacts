@@ -25,6 +25,7 @@
 //! - `office.macros[]` — paths of `vbaProject.bin` streams when
 //!   present (one per OOXML application; usually a single entry).
 
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Cursor, Read};
 
 use serde_json::Value as JsonValue;
@@ -42,16 +43,17 @@ pub(super) fn extract(
     let Ok(mut zip) = ::zip::ZipArchive::new(cursor) else {
         return Ok(());
     };
+    let names = zip_entry_names(&mut zip);
+    let Some(index) = build_ooxml_index(&mut zip, &names) else {
+        return Ok(());
+    };
 
-    // Detect the OOXML application from `[Content_Types].xml`.
-    if let Some(kind) = detect_kind(&mut zip) {
+    if let Some(kind) = detect_kind(&index) {
         put_str(values, "office.kind", kind);
     } else {
-        // Not actually an OOXML — bail without emitting `office.*`.
         return Ok(());
     }
 
-    // Core metadata (Dublin Core).
     if let Some(core) = parse_core_props(&mut zip) {
         for (key, value) in core {
             let path = format!("office.{key}");
@@ -59,10 +61,6 @@ pub(super) fn extract(
         }
     }
 
-    // Application metadata. `application` / `company` live in
-    // `docProps/app.xml` rather than `core.xml`; surface them at the
-    // top level so trait rules can match `office.application` without
-    // a nested object hop.
     if let Some((app, company)) = parse_app_props(&mut zip) {
         if let Some(app) = app {
             put_str(values, "office.application", app);
@@ -72,53 +70,95 @@ pub(super) fn extract(
         }
     }
 
-    // Structural features. Macros are the highest-signal forensic
-    // marker — every macro-enabled supply-chain attack rides on the
-    // presence of `vbaProject.bin`.
     let mut features: Vec<&'static str> = Vec::new();
+    let mut macros_seen = BTreeSet::new();
     let mut macros: Vec<JsonValue> = Vec::new();
-    // Enumerate embedded objects with magic-byte type detection.
-    // Forensically the high-signal cases are PE/ELF/Mach-O blobs
-    // wedged into `*/embeddings/` — supply-chain attacks ship the
-    // payload as an "OLE object" so opening the doc unpacks it.
+    let mut embedded_seen = HashSet::new();
     let mut embedded: Vec<JsonValue> = Vec::new();
-    for i in 0..zip.len() {
-        let Ok(mut entry) = zip.by_index(i) else {
-            continue;
-        };
-        let name = entry.name().to_string();
-        if name.ends_with("/vbaProject.bin") || name == "vbaProject.bin" {
-            macros.push(JsonValue::String(name.clone()));
+    let mut controls_seen = HashSet::new();
+    let mut controls: Vec<JsonValue> = Vec::new();
+
+    for name in &names {
+        let content_type = index.content_type_for(name).unwrap_or_default();
+        if is_macro_content_type(content_type)
+            || name.ends_with("/vbaProject.bin")
+            || name == "vbaProject.bin"
+        {
+            push_unique_string(&mut macros_seen, &mut macros, name);
+        }
+        if is_control_content_type(content_type) {
+            push_control(&mut controls_seen, &mut controls, name, "active_x", None);
         }
         if name.contains("/embeddings/") {
-            if !features.contains(&"ole_objects") {
-                features.push("ole_objects");
-            }
-            // Peek at the first few bytes to classify embedded content.
-            // Cap the read so a hostile entry can't drag us into a
-            // multi-MB decompression pass per file.
-            let mut header = [0u8; 8];
-            let n = entry.read(&mut header).unwrap_or(0);
-            let kind = embedded_kind(&header[..n]);
-            let mut obj = serde_json::Map::new();
-            obj.insert("filename".into(), JsonValue::String(name.clone()));
-            obj.insert("size_bytes".into(), JsonValue::Number(entry.size().into()));
-            if let Some(k) = kind {
-                obj.insert("kind".into(), JsonValue::String(k.into()));
-            }
-            embedded.push(JsonValue::Object(obj));
+            push_feature(&mut features, "ole_objects");
+            push_embedded(
+                &mut zip,
+                &mut embedded_seen,
+                &mut embedded,
+                name,
+                None,
+                None,
+            );
         }
         if name.starts_with("xl/externalLinks/") {
-            if !features.contains(&"external_links") {
-                features.push("external_links");
-            }
+            push_feature(&mut features, "external_links");
         }
     }
+
+    for rel in &index.relationships {
+        match rel.short_type.as_str() {
+            "vbaProject" | "xlIntlMacrosheet" => {
+                if let Some(target) = rel.target_part.as_deref() {
+                    push_unique_string(&mut macros_seen, &mut macros, target);
+                } else {
+                    push_unique_string(&mut macros_seen, &mut macros, &rel.target);
+                }
+            }
+            "oleObject" => {
+                push_feature(&mut features, "ole_objects");
+                if let Some(target) = rel.target_part.as_deref() {
+                    push_embedded(
+                        &mut zip,
+                        &mut embedded_seen,
+                        &mut embedded,
+                        target,
+                        Some("oleObject"),
+                        Some(&rel.source),
+                    );
+                }
+            }
+            "package" => {
+                push_feature(&mut features, "embedded_packages");
+                if let Some(target) = rel.target_part.as_deref() {
+                    push_embedded(
+                        &mut zip,
+                        &mut embedded_seen,
+                        &mut embedded,
+                        target,
+                        Some("package"),
+                        Some(&rel.source),
+                    );
+                }
+            }
+            "control" => {
+                push_feature(&mut features, "active_x");
+                if let Some(target) = rel.target_part.as_deref() {
+                    push_control(
+                        &mut controls_seen,
+                        &mut controls,
+                        target,
+                        "active_x",
+                        Some(&rel.source),
+                    );
+                }
+            }
+            "externalLink" => push_feature(&mut features, "external_links"),
+            _ => {}
+        }
+    }
+
     if !embedded.is_empty() {
         let count = embedded.len() as f64;
-        // Surface a count of executable-like payloads — distinct from
-        // total embedded count since a doc with only a benign image
-        // shouldn't trip executable-aware traits.
         let exec_count = embedded
             .iter()
             .filter(|e| {
@@ -131,36 +171,23 @@ pub(super) fn extract(
         metrics.insert("office.embedded_count", count);
         if exec_count > 0.0 {
             metrics.insert("office.embedded_executable_count", exec_count);
-            if !features.contains(&"embedded_executable") {
-                features.push("embedded_executable");
-            }
+            push_feature(&mut features, "embedded_executable");
         }
     }
 
-    // External relationships — the T1221 template-injection signal.
-    // Walk every `*.rels` file and pick out `<Relationship>` entries
-    // whose Target points at a remote / UNC / file:// location. Local
-    // relationships (relative paths) are dropped — they're the noise
-    // ratio that would drown the forensic signal.
-    let mut external_relationships: Vec<JsonValue> = Vec::new();
-    for i in 0..zip.len() {
-        let Ok(entry) = zip.by_index(i) else {
-            continue;
-        };
-        let name = entry.name().to_string();
-        if !name.ends_with(".rels") {
-            continue;
-        }
-        // Cap at 64 KiB — `_rels/*.rels` files are tiny in real docs.
-        let mut buf = Vec::new();
-        let _ = entry.take(64 * 1024).read_to_end(&mut buf);
-        let Ok(text) = std::str::from_utf8(&buf) else {
-            continue;
-        };
-        for rel in extract_external_relationships(text, &name) {
-            external_relationships.push(rel);
-        }
+    if !controls.is_empty() {
+        let count = controls.len() as f64;
+        values.insert("office.controls", JsonValue::Array(controls));
+        metrics.insert("office.control_count", count);
+        push_feature(&mut features, "active_x");
     }
+
+    let external_relationships: Vec<JsonValue> = index
+        .relationships
+        .iter()
+        .filter(|rel| rel.mode.as_deref() == Some("External") || is_external_target(&rel.target))
+        .map(external_relationship_value)
+        .collect();
     if !external_relationships.is_empty() {
         let count = external_relationships.len() as f64;
         values.insert(
@@ -168,18 +195,44 @@ pub(super) fn extract(
             JsonValue::Array(external_relationships),
         );
         metrics.insert("office.external_relationship_count", count);
-        if !features.contains(&"external_relationships") {
-            features.push("external_relationships");
-        }
+        push_feature(&mut features, "external_relationships");
     }
+
     if !macros.is_empty() {
-        if !features.contains(&"macros") {
-            features.push("macros");
-        }
+        push_feature(&mut features, "macros");
         let count = macros.len() as f64;
         values.insert("office.macros", JsonValue::Array(macros));
         metrics.insert("office.macro_count", count);
     }
+
+    let mut dde_links: Vec<JsonValue> = Vec::new();
+    let mut custom_ui_onload: Vec<JsonValue> = Vec::new();
+    for name in &names {
+        if !name.ends_with(".xml") || name.ends_with(".rels") {
+            continue;
+        }
+        let Some(text) = read_entry_text_limited(&mut zip, name, 1024 * 1024) else {
+            continue;
+        };
+        dde_links.extend(extract_dde_links(&text, name));
+        custom_ui_onload.extend(extract_custom_ui_onload(&text, name));
+    }
+    if !dde_links.is_empty() {
+        let count = dde_links.len() as f64;
+        values.insert("office.dde_links", JsonValue::Array(dde_links));
+        metrics.insert("office.dde_link_count", count);
+        push_feature(&mut features, "dde_links");
+    }
+    if !custom_ui_onload.is_empty() {
+        let count = custom_ui_onload.len() as f64;
+        values.insert(
+            "office.custom_ui_onload",
+            JsonValue::Array(custom_ui_onload),
+        );
+        metrics.insert("office.custom_ui_onload_count", count);
+        push_feature(&mut features, "custom_ui_onload");
+    }
+
     if !features.is_empty() {
         values.insert(
             "office.features",
@@ -195,68 +248,293 @@ pub(super) fn extract(
     Ok(())
 }
 
-/// Walk a `.rels` XML body and return one JSON entry per
-/// `<Relationship>` whose `Target` looks external (URL / UNC / file
-/// scheme). Each entry is `{type, target, source, mode?}` — `source`
-/// is the rels-file path inside the archive so traits can distinguish
-/// a settings.xml.rels template injection from an oleObject.xml.rels
-/// remote-content fetch. `mode` is "External" verbatim when the
-/// relationship element declared `TargetMode="External"`.
-fn extract_external_relationships(xml: &str, source: &str) -> Vec<JsonValue> {
+#[derive(Debug, Default)]
+struct OoxmlIndex {
+    defaults: HashMap<String, String>,
+    overrides: HashMap<String, String>,
+    relationships: Vec<RelationshipInfo>,
+}
+
+#[derive(Debug)]
+struct RelationshipInfo {
+    source: String,
+    rels_source: String,
+    target: String,
+    target_part: Option<String>,
+    rel_type: String,
+    short_type: String,
+    mode: Option<String>,
+}
+
+impl OoxmlIndex {
+    fn content_type_for(&self, name: &str) -> Option<&str> {
+        let normalized = name.trim_start_matches('/');
+        if let Some(content_type) = self.overrides.get(normalized) {
+            return Some(content_type);
+        }
+        let ext = normalized.rsplit_once('.')?.1.to_ascii_lowercase();
+        self.defaults.get(&ext).map(String::as_str)
+    }
+}
+
+fn zip_entry_names<R: Read + std::io::Seek>(zip: &mut ::zip::ZipArchive<R>) -> Vec<String> {
+    let mut names = Vec::with_capacity(zip.len());
+    for i in 0..zip.len() {
+        if let Ok(entry) = zip.by_index(i) {
+            names.push(entry.name().to_string());
+        }
+    }
+    names
+}
+
+fn build_ooxml_index<R: Read + std::io::Seek>(
+    zip: &mut ::zip::ZipArchive<R>,
+    names: &[String],
+) -> Option<OoxmlIndex> {
+    let content_types = read_entry_text(zip, "[Content_Types].xml")?;
+    let mut index = parse_content_types(&content_types)?;
+    for name in names {
+        if !name.ends_with(".rels") {
+            continue;
+        }
+        let Some(text) = read_entry_text_limited(zip, name, 64 * 1024) else {
+            continue;
+        };
+        index.relationships.extend(parse_relationships(&text, name));
+    }
+    Some(index)
+}
+
+fn parse_content_types(xml: &str) -> Option<OoxmlIndex> {
+    let doc = roxmltree::Document::parse(xml).ok()?;
+    let mut index = OoxmlIndex::default();
+    for node in doc.descendants() {
+        match node.tag_name().name() {
+            "Default" => {
+                let Some(ext) = node.attribute("Extension") else {
+                    continue;
+                };
+                let Some(content_type) = node.attribute("ContentType") else {
+                    continue;
+                };
+                index
+                    .defaults
+                    .insert(ext.to_ascii_lowercase(), content_type.to_string());
+            }
+            "Override" => {
+                let Some(part) = node.attribute("PartName") else {
+                    continue;
+                };
+                let Some(content_type) = node.attribute("ContentType") else {
+                    continue;
+                };
+                index.overrides.insert(
+                    part.trim_start_matches('/').to_string(),
+                    content_type.to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+    Some(index)
+}
+
+fn parse_relationships(xml: &str, rels_source: &str) -> Vec<RelationshipInfo> {
     let Ok(doc) = roxmltree::Document::parse(xml) else {
         return Vec::new();
     };
+    let source = relationship_source_part(rels_source);
     let mut out = Vec::new();
     for node in doc.descendants() {
         if node.tag_name().name() != "Relationship" {
             continue;
         }
-        let target = match node.attribute("Target") {
-            Some(t) if is_external_target(t) => t.to_string(),
-            _ => continue,
+        let Some(target) = node.attribute("Target") else {
+            continue;
         };
-        let rel_type = node.attribute("Type").unwrap_or("").to_string();
-        // Strip the schema URI prefix from the rel type so traits can
-        // match on the suffix (`attachedTemplate`, `oleObject`,
-        // `image`, …) without spelling the full namespace.
+        let rel_type = node.attribute("Type").unwrap_or_default().to_string();
         let short_type = rel_type
             .rsplit('/')
             .next()
             .unwrap_or(rel_type.as_str())
             .to_string();
         let mode = node.attribute("TargetMode").map(str::to_string);
-        let mut obj = serde_json::Map::new();
-        obj.insert("type".into(), JsonValue::String(short_type));
-        obj.insert("target".into(), JsonValue::String(target));
-        obj.insert("source".into(), JsonValue::String(source.to_string()));
-        if let Some(m) = mode {
-            obj.insert("mode".into(), JsonValue::String(m));
-        }
-        out.push(JsonValue::Object(obj));
+        let target_part = if mode.as_deref() == Some("External") || is_external_target(target) {
+            None
+        } else {
+            resolve_relationship_target(&source, target)
+        };
+        out.push(RelationshipInfo {
+            source: source.clone(),
+            rels_source: rels_source.to_string(),
+            target: target.to_string(),
+            target_part,
+            rel_type,
+            short_type,
+            mode,
+        });
     }
     out
 }
 
-/// True when a relationship target points at something outside the
-/// archive — a remote URL, a UNC path, or a `file://` scheme. Local
-/// (relative) targets are excluded since they're the bulk of every
-/// rels file and don't carry forensic signal.
-fn is_external_target(target: &str) -> bool {
-    let t = target.trim();
-    if t.is_empty() {
-        return false;
+fn relationship_source_part(rels_source: &str) -> String {
+    if rels_source == "_rels/.rels" {
+        return String::new();
     }
-    // Remote: any URL scheme. Schema is `scheme://...` per RFC 3986;
-    // checking for `://` covers http/https/ftp/file uniformly.
-    if t.contains("://") {
-        return true;
+    let Some((prefix, file)) = rels_source.rsplit_once("/_rels/") else {
+        return String::new();
+    };
+    let source_name = file.strip_suffix(".rels").unwrap_or(file);
+    if prefix.is_empty() {
+        source_name.to_string()
+    } else {
+        format!("{prefix}/{source_name}")
     }
-    // UNC: Windows accepts both `\\server\share` and the
-    // forward-slash form `//server/share`.
-    if t.starts_with("\\\\") || t.starts_with("//") {
-        return true;
+}
+
+fn resolve_relationship_target(source: &str, target: &str) -> Option<String> {
+    let target = target.trim();
+    if target.is_empty() || target.eq_ignore_ascii_case("NULL") {
+        return None;
     }
-    false
+    let joined = if target.starts_with('/') {
+        target.trim_start_matches('/').to_string()
+    } else if let Some((dir, _)) = source.rsplit_once('/') {
+        format!("{dir}/{target}")
+    } else {
+        target.to_string()
+    };
+    normalize_part_name(&joined)
+}
+
+fn normalize_part_name(path: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            _ => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+fn push_feature(features: &mut Vec<&'static str>, feature: &'static str) {
+    if !features.contains(&feature) {
+        features.push(feature);
+    }
+}
+
+fn push_unique_string(seen: &mut BTreeSet<String>, out: &mut Vec<JsonValue>, value: &str) {
+    if seen.insert(value.to_string()) {
+        out.push(JsonValue::String(value.to_string()));
+    }
+}
+
+fn push_control(
+    seen: &mut HashSet<String>,
+    out: &mut Vec<JsonValue>,
+    filename: &str,
+    kind: &str,
+    source: Option<&str>,
+) {
+    if !seen.insert(filename.to_string()) {
+        return;
+    }
+    let mut obj = serde_json::Map::new();
+    obj.insert("filename".into(), JsonValue::String(filename.to_string()));
+    obj.insert("kind".into(), JsonValue::String(kind.to_string()));
+    if let Some(source) = source {
+        obj.insert("source".into(), JsonValue::String(source.to_string()));
+    }
+    out.push(JsonValue::Object(obj));
+}
+
+fn push_embedded<R: Read + std::io::Seek>(
+    zip: &mut ::zip::ZipArchive<R>,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<JsonValue>,
+    filename: &str,
+    relationship_type: Option<&str>,
+    source: Option<&str>,
+) {
+    if !seen.insert(filename.to_string()) {
+        if relationship_type.is_some() || source.is_some() {
+            for item in out.iter_mut() {
+                let Some(obj) = item.as_object_mut() else {
+                    continue;
+                };
+                if obj.get("filename").and_then(|v| v.as_str()) != Some(filename) {
+                    continue;
+                }
+                if let Some(relationship_type) = relationship_type {
+                    obj.insert(
+                        "relationship_type".into(),
+                        JsonValue::String(relationship_type.to_string()),
+                    );
+                }
+                if let Some(source) = source {
+                    obj.insert("source".into(), JsonValue::String(source.to_string()));
+                }
+                break;
+            }
+        }
+        return;
+    }
+    let mut obj = serde_json::Map::new();
+    obj.insert("filename".into(), JsonValue::String(filename.to_string()));
+    if let Some(relationship_type) = relationship_type {
+        obj.insert(
+            "relationship_type".into(),
+            JsonValue::String(relationship_type.to_string()),
+        );
+    }
+    if let Some(source) = source {
+        obj.insert("source".into(), JsonValue::String(source.to_string()));
+    }
+    if let Ok(mut entry) = zip.by_name(filename) {
+        obj.insert("size_bytes".into(), JsonValue::Number(entry.size().into()));
+        let mut header = [0u8; 8];
+        let n = entry.read(&mut header).unwrap_or(0);
+        if let Some(kind) = embedded_kind(&header[..n]) {
+            obj.insert("kind".into(), JsonValue::String(kind.into()));
+        }
+    }
+    out.push(JsonValue::Object(obj));
+}
+
+fn is_macro_content_type(content_type: &str) -> bool {
+    content_type.contains("vbaProject") || content_type.contains("intlmacrosheet")
+}
+
+fn is_control_content_type(content_type: &str) -> bool {
+    content_type.contains("vnd.ms-office.activeX")
+}
+
+fn external_relationship_value(rel: &RelationshipInfo) -> JsonValue {
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".into(), JsonValue::String(rel.short_type.clone()));
+    obj.insert("target".into(), JsonValue::String(rel.target.clone()));
+    obj.insert("source".into(), JsonValue::String(rel.rels_source.clone()));
+    if !rel.source.is_empty() {
+        obj.insert("part".into(), JsonValue::String(rel.source.clone()));
+    }
+    if !rel.rel_type.is_empty() {
+        obj.insert(
+            "relationship".into(),
+            JsonValue::String(rel.rel_type.clone()),
+        );
+    }
+    if let Some(mode) = &rel.mode {
+        obj.insert("mode".into(), JsonValue::String(mode.clone()));
+    }
+    JsonValue::Object(obj)
 }
 
 /// Classify the first few bytes of an embedded payload by magic.
@@ -297,37 +575,41 @@ fn embedded_kind(bytes: &[u8]) -> Option<&'static str> {
 /// Read `[Content_Types].xml` and map its primary content type onto a
 /// short OOXML variant label. Falls back to `"ooxml"` for OOXML files
 /// we don't have a more specific label for (Visio, custom packages, …).
-fn detect_kind<R: Read + std::io::Seek>(zip: &mut ::zip::ZipArchive<R>) -> Option<&'static str> {
-    let text = read_entry_text(zip, "[Content_Types].xml")?;
-    // The body lists every part's ContentType — we only need to match
-    // the document-root content type, which uniquely identifies the
-    // application.
-    if text.contains("wordprocessingml.document") {
-        return Some("docx");
+fn detect_kind(index: &OoxmlIndex) -> Option<&'static str> {
+    let all_types = index
+        .overrides
+        .values()
+        .chain(index.defaults.values())
+        .map(String::as_str);
+    let mut saw_ooxml_type = false;
+    for content_type in all_types {
+        saw_ooxml_type = true;
+        if content_type.contains("wordprocessingml.document")
+            || content_type.contains("wordprocessingml.template")
+            || content_type.contains("ms-word.document")
+            || content_type.contains("ms-word.template")
+        {
+            return Some("docx");
+        }
+        if content_type.contains("spreadsheetml.sheet")
+            || content_type.contains("spreadsheetml.template")
+            || content_type.contains("ms-excel.sheet")
+            || content_type.contains("ms-excel.template")
+            || content_type.contains("ms-excel.addin")
+        {
+            return Some("xlsx");
+        }
+        if content_type.contains("presentationml.presentation")
+            || content_type.contains("presentationml.template")
+            || content_type.contains("presentationml.slideshow")
+            || content_type.contains("ms-powerpoint.presentation")
+            || content_type.contains("ms-powerpoint.template")
+            || content_type.contains("ms-powerpoint.slideshow")
+        {
+            return Some("pptx");
+        }
     }
-    if text.contains("spreadsheetml.sheet") {
-        return Some("xlsx");
-    }
-    if text.contains("presentationml.presentation") {
-        return Some("pptx");
-    }
-    // Office can also stamp these for templates (`.dotx`, `.xltx`,
-    // `.potx`); we collapse them under the same variant since traits
-    // care about the application, not the template-vs-document
-    // distinction.
-    if text.contains("wordprocessingml.template") {
-        return Some("docx");
-    }
-    if text.contains("spreadsheetml.template") {
-        return Some("xlsx");
-    }
-    if text.contains("presentationml.template") {
-        return Some("pptx");
-    }
-    // It's a Content_Types-bearing OOXML package but not one of the
-    // big three — still emit `office.*` so traits can match the
-    // shape (e.g. Visio `.vsdx`).
-    Some("ooxml")
+    saw_ooxml_type.then_some("ooxml")
 }
 
 /// Parse `docProps/core.xml` into a Map of canonical Dublin Core
@@ -393,21 +675,168 @@ fn parse_app_props<R: Read + std::io::Seek>(
     ))
 }
 
-/// Read a named entry's content as text. Returns `None` on missing
-/// entry or non-UTF-8 content. Bounded by the zip crate's own
-/// per-entry size limits.
+/// True when a relationship target points at something outside the archive.
+fn is_external_target(target: &str) -> bool {
+    let t = target.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.starts_with("\\\\") || t.starts_with("//") {
+        return true;
+    }
+    let Some(colon) = t.find(':') else {
+        return false;
+    };
+    if colon == 1 && t.as_bytes()[0].is_ascii_alphabetic() {
+        return false;
+    }
+    t[..colon].bytes().enumerate().all(|(i, b)| {
+        b.is_ascii_alphabetic()
+            || (i > 0 && (b.is_ascii_digit() || b == b'+' || b == b'.' || b == b'-'))
+    })
+}
+
+fn extract_dde_links(xml: &str, source: &str) -> Vec<JsonValue> {
+    let Ok(doc) = roxmltree::Document::parse(xml) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for node in doc.descendants() {
+        match node.tag_name().name() {
+            "fldSimple" => {
+                for attr in node.attributes() {
+                    if attr.name() == "instr" {
+                        push_dde_field(&mut out, source, "field", attr.value());
+                    }
+                }
+            }
+            "instrText" => {
+                if let Some(text) = node.text() {
+                    push_dde_field(&mut out, source, "field", text);
+                }
+            }
+            "ddeLink" => {
+                let mut obj = serde_json::Map::new();
+                obj.insert("source".into(), JsonValue::String(source.to_string()));
+                obj.insert("kind".into(), JsonValue::String("excel".into()));
+                for attr in node.attributes() {
+                    match attr.name() {
+                        "ddeService" => {
+                            obj.insert(
+                                "service".into(),
+                                JsonValue::String(attr.value().to_string()),
+                            );
+                        }
+                        "ddeTopic" => {
+                            obj.insert("topic".into(), JsonValue::String(attr.value().to_string()));
+                        }
+                        _ => {}
+                    }
+                }
+                out.push(JsonValue::Object(obj));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn push_dde_field(out: &mut Vec<JsonValue>, source: &str, kind: &str, text: &str) {
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower.starts_with("dde ")
+        || lower.starts_with("ddeauto ")
+        || lower == "dde"
+        || lower == "ddeauto")
+    {
+        return;
+    }
+    let mut obj = serde_json::Map::new();
+    obj.insert("source".into(), JsonValue::String(source.to_string()));
+    obj.insert("kind".into(), JsonValue::String(kind.to_string()));
+    obj.insert("text".into(), JsonValue::String(trimmed.to_string()));
+    out.push(JsonValue::Object(obj));
+}
+
+fn extract_custom_ui_onload(xml: &str, source: &str) -> Vec<JsonValue> {
+    let Ok(doc) = roxmltree::Document::parse(xml) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for node in doc.descendants() {
+        if node.tag_name().name() != "customUI" {
+            continue;
+        }
+        let Some(on_load) = node.attribute("onLoad") else {
+            continue;
+        };
+        let trimmed = on_load.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut obj = serde_json::Map::new();
+        obj.insert("source".into(), JsonValue::String(source.to_string()));
+        obj.insert("on_load".into(), JsonValue::String(trimmed.to_string()));
+        out.push(JsonValue::Object(obj));
+    }
+    out
+}
+
+/// Read a named entry's content as text. Bounded by the zip crate's own
+/// per-entry size limits and a caller-provided cap.
 fn read_entry_text<R: Read + std::io::Seek>(
     zip: &mut ::zip::ZipArchive<R>,
     name: &str,
 ) -> Option<String> {
+    read_entry_text_limited(zip, name, 16 * 1024)
+}
+
+fn read_entry_text_limited<R: Read + std::io::Seek>(
+    zip: &mut ::zip::ZipArchive<R>,
+    name: &str,
+    max_bytes: u64,
+) -> Option<String> {
     let entry = zip.by_name(name).ok()?;
-    // OOXML metadata files are tiny — 16 KiB is generous; the cap
-    // keeps a hostile archive with a giant fake metadata stream from
-    // ballooning memory.
-    const MAX_BYTES: u64 = 16 * 1024;
-    let mut buf = Vec::with_capacity(entry.size().min(MAX_BYTES) as usize);
-    let _ = entry.take(MAX_BYTES).read_to_end(&mut buf).ok()?;
-    String::from_utf8(buf).ok()
+    let mut buf = Vec::with_capacity(entry.size().min(max_bytes) as usize);
+    let _ = entry.take(max_bytes).read_to_end(&mut buf).ok()?;
+    decode_xml_bytes(&buf)
+}
+
+fn decode_xml_bytes(buf: &[u8]) -> Option<String> {
+    if buf.starts_with(&[0xFF, 0xFE]) {
+        return decode_utf16(&buf[2..], true);
+    }
+    if buf.starts_with(&[0xFE, 0xFF]) {
+        return decode_utf16(&buf[2..], false);
+    }
+    if looks_utf16le(buf) {
+        return decode_utf16(buf, true);
+    }
+    if looks_utf16be(buf) {
+        return decode_utf16(buf, false);
+    }
+    String::from_utf8(buf.to_vec()).ok()
+}
+
+fn looks_utf16le(buf: &[u8]) -> bool {
+    buf.len() >= 8 && buf[0] == b'<' && buf[1] == 0 && buf[2] == b'?' && buf[3] == 0
+}
+
+fn looks_utf16be(buf: &[u8]) -> bool {
+    buf.len() >= 8 && buf[0] == 0 && buf[1] == b'<' && buf[2] == 0 && buf[3] == b'?'
+}
+
+fn decode_utf16(buf: &[u8], little_endian: bool) -> Option<String> {
+    let mut units = Vec::with_capacity(buf.len() / 2);
+    for pair in buf.chunks_exact(2) {
+        let unit = if little_endian {
+            u16::from_le_bytes([pair[0], pair[1]])
+        } else {
+            u16::from_be_bytes([pair[0], pair[1]])
+        };
+        units.push(unit);
+    }
+    String::from_utf16(&units).ok()
 }
 
 #[cfg(test)]
@@ -834,5 +1263,114 @@ mod tests {
         let names: Vec<&str> = features.iter().filter_map(|x| x.as_str()).collect();
         assert!(names.contains(&"macros"));
         assert!(names.contains(&"ole_objects"));
+    }
+    #[test]
+    fn detects_macro_project_from_content_type_nonstandard_path() {
+        let ct = r#"<?xml version="1.0"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.ms-excel.sheet.macroEnabled.main+xml"/>
+  <Override PartName="/xl/new_name.bin" ContentType="application/vnd.ms-office.vbaProject"/>
+</Types>"#;
+        let z = build_ooxml(&[
+            ("[Content_Types].xml", ct.as_bytes()),
+            ("xl/new_name.bin", b"macro"),
+        ]);
+        let (v, m) = run(&z);
+        assert_eq!(v.get("office.kind").and_then(|x| x.as_str()), Some("xlsx"));
+        let macros = v.get("office.macros").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(macros[0].as_str(), Some("xl/new_name.bin"));
+        assert_eq!(m.get("office.macro_count"), Some(1.0));
+    }
+
+    #[test]
+    fn detects_controls_and_packages_from_relationships() {
+        let rels = r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="r1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/control" Target="activeX/activeX1.xml"/>
+  <Relationship Id="r2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/package" Target="embeddings/package1.bin"/>
+</Relationships>"#;
+        let z = build_ooxml(&[
+            ("[Content_Types].xml", CONTENT_TYPES_XLSX.as_bytes()),
+            ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+            ("xl/activeX/activeX1.xml", b"<ax />"),
+            ("xl/embeddings/package1.bin", b"PK\x03\x04zip"),
+        ]);
+        let (v, m) = run(&z);
+        let features = v.get("office.features").and_then(|x| x.as_array()).unwrap();
+        let names: Vec<&str> = features.iter().filter_map(|x| x.as_str()).collect();
+        assert!(names.contains(&"active_x"));
+        assert!(names.contains(&"embedded_packages"));
+        let controls = v.get("office.controls").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(
+            controls[0]["filename"].as_str(),
+            Some("xl/activeX/activeX1.xml")
+        );
+        let embedded = v.get("office.embedded").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(embedded[0]["relationship_type"].as_str(), Some("package"));
+        assert_eq!(embedded[0]["kind"].as_str(), Some("zip"));
+        assert_eq!(m.get("office.control_count"), Some(1.0));
+    }
+
+    #[test]
+    fn target_mode_external_counts_without_url_shape() {
+        let rels = r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="r1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/attachedTemplate" Target="template.dotm" TargetMode="External"/>
+</Relationships>"#;
+        let z = build_ooxml(&[
+            ("[Content_Types].xml", CONTENT_TYPES_DOCX.as_bytes()),
+            ("word/_rels/settings.xml.rels", rels.as_bytes()),
+        ]);
+        let (v, _) = run(&z);
+        let rels = v
+            .get("office.external_relationships")
+            .and_then(|x| x.as_array())
+            .unwrap();
+        assert_eq!(rels[0]["target"].as_str(), Some("template.dotm"));
+        assert_eq!(rels[0]["mode"].as_str(), Some("External"));
+    }
+
+    #[test]
+    fn extracts_word_and_excel_dde_links() {
+        let doc = r#"<w:document xmlns:w="w"><w:fldSimple w:instr="DDEAUTO c:\windows\system32\cmd.exe /c calc"/></w:document>"#;
+        let sheet = r#"<worksheet><ddeLink ddeService="cmd" ddeTopic="/c calc"/></worksheet>"#;
+        let z = build_ooxml(&[
+            ("[Content_Types].xml", CONTENT_TYPES_DOCX.as_bytes()),
+            ("word/document.xml", doc.as_bytes()),
+            ("xl/externalLinks/externalLink1.xml", sheet.as_bytes()),
+        ]);
+        let (v, m) = run(&z);
+        let links = v
+            .get("office.dde_links")
+            .and_then(|x| x.as_array())
+            .unwrap();
+        assert_eq!(links.len(), 2);
+        assert_eq!(m.get("office.dde_link_count"), Some(2.0));
+    }
+
+    #[test]
+    fn extracts_custom_ui_onload_callbacks() {
+        let custom = r#"<customUI xmlns="http://schemas.microsoft.com/office/2006/01/customui" onLoad="AutoOpen"/>"#;
+        let z = build_ooxml(&[
+            ("[Content_Types].xml", CONTENT_TYPES_DOCX.as_bytes()),
+            ("customUI/customUI.xml", custom.as_bytes()),
+        ]);
+        let (v, _) = run(&z);
+        let callbacks = v
+            .get("office.custom_ui_onload")
+            .and_then(|x| x.as_array())
+            .unwrap();
+        assert_eq!(callbacks[0]["on_load"].as_str(), Some("AutoOpen"));
+    }
+
+    #[test]
+    fn decodes_utf16_xml_entries() {
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in CONTENT_TYPES_DOCX.encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        let z = build_ooxml(&[("[Content_Types].xml", &utf16)]);
+        let (v, _) = run(&z);
+        assert_eq!(v.get("office.kind").and_then(|x| x.as_str()), Some("docx"));
     }
 }

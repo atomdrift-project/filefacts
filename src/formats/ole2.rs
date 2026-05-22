@@ -57,6 +57,8 @@ pub(super) fn extract(
     let mut had_ole10native = false;
     let mut had_encryption_info = false;
     let mut had_encrypted_package = false;
+    let mut had_encrypted_summary = false;
+    let mut had_object_pool = false;
     let mut dangerous_clsids: Vec<JsonValue> = Vec::new();
 
     for entry in comp.walk() {
@@ -92,11 +94,17 @@ pub(super) fn extract(
         if path.contains("Ole10Native") {
             had_ole10native = true;
         }
+        if lower == "/objectpool" || lower.contains("/objectpool/") {
+            had_object_pool = true;
+        }
         if path == "/EncryptionInfo" || lower.contains("encryptioninfo") {
             had_encryption_info = true;
         }
         if path == "/EncryptedPackage" || lower.contains("encryptedpackage") {
             had_encrypted_package = true;
+        }
+        if lower.contains("encryptedsummary") {
+            had_encrypted_summary = true;
         }
 
         streams.push(path);
@@ -113,17 +121,31 @@ pub(super) fn extract(
     metrics.insert("office.stream_count", streams.len() as f64);
     values.insert(
         "office.streams",
-        JsonValue::Array(streams.into_iter().map(JsonValue::String).collect()),
+        JsonValue::Array(streams.iter().cloned().map(JsonValue::String).collect()),
     );
+
+    let summary_data = read_stream_data(&mut comp, "\x05SummaryInformation");
+    let summary_security_encrypted = summary_data
+        .as_deref()
+        .is_some_and(summary_document_security_encrypted);
+    let word_document_encrypted = word_document_encrypted(&mut comp);
 
     if macro_count > 0 {
         features.push("macros");
         metrics.insert("office.macro_count", macro_count as f64);
     }
-    if had_ole10native {
+    if had_ole10native || had_object_pool {
         features.push("ole_objects");
     }
-    if had_encryption_info || had_encrypted_package {
+    if had_object_pool {
+        features.push("object_pool");
+    }
+    if had_encryption_info
+        || had_encrypted_package
+        || had_encrypted_summary
+        || summary_security_encrypted
+        || word_document_encrypted
+    {
         features.push("encryption");
     }
     if !dangerous_clsids.is_empty() {
@@ -152,13 +174,10 @@ pub(super) fn extract(
     // for a control-character storage). Emit the same `office.*`
     // paths as OOXML so rules do not care which container supplied
     // the property.
-    let mut props: serde_json::Map<String, JsonValue> = serde_json::Map::new();
-    if let Ok(mut stream) = comp.open_stream("\x05SummaryInformation") {
-        let mut data = Vec::new();
-        if stream.read_to_end(&mut data).is_ok() {
-            props = parse_summary_information(&data);
-        }
-    }
+    let mut props: serde_json::Map<String, JsonValue> = summary_data
+        .as_deref()
+        .map(parse_summary_information)
+        .unwrap_or_default();
     // DocumentSummaryInformation extends the summary set with
     // manager / company / security_flag / hyperlink_base — fields
     // OOXML carries in `docProps/app.xml`.
@@ -252,18 +271,21 @@ fn parse_summary_information(data: &[u8]) -> serde_json::Map<String, JsonValue> 
             0x05 => "keywords",
             0x06 => "description", // PIDSI_COMMENTS
             0x07 => "template",
-            0x08 => "last_modified_by", // PIDSI_LASTAUTHOR
-            0x09 => "revision",         // VT_LPSTR holding a decimal string
-            0x0B => "last_printed",     // VT_FILETIME
-            0x0C => "created",          // VT_FILETIME
-            0x0D => "modified",         // PIDSI_LASTSAVE_DTM, VT_FILETIME
-            0x12 => "application",      // PIDSI_APPNAME
+            0x08 => "last_modified_by",  // PIDSI_LASTAUTHOR
+            0x09 => "revision",          // VT_LPSTR holding a decimal string
+            0x0B => "last_printed",      // VT_FILETIME
+            0x0C => "created",           // VT_FILETIME
+            0x0D => "modified",          // PIDSI_LASTSAVE_DTM, VT_FILETIME
+            0x12 => "application",       // PIDSI_APPNAME
+            0x13 => "document_security", // PIDSI_DOC_SECURITY, VT_I4 bitfield
             _ => continue,
         };
         if out.contains_key(key) {
             continue;
         }
-        if let Some(value) = read_property(section, val_off) {
+        if let Some(value) =
+            read_property(section, val_off).or_else(|| read_property_i32(section, val_off))
+        {
             out.insert(key.into(), value);
         }
     }
@@ -314,6 +336,61 @@ fn parse_document_summary_information(data: &[u8]) -> serde_json::Map<String, Js
         }
     }
     out
+}
+
+fn read_stream_data<T: Read + std::io::Seek>(
+    comp: &mut cfb::CompoundFile<T>,
+    path: &str,
+) -> Option<Vec<u8>> {
+    let mut stream = comp.open_stream(path).ok()?;
+    let mut data = Vec::new();
+    stream.read_to_end(&mut data).ok()?;
+    Some(data)
+}
+
+fn summary_document_security_encrypted(data: &[u8]) -> bool {
+    let Some(section) = locate_first_section(data) else {
+        return false;
+    };
+    let Some(value) = property_i32_by_pid(section, 0x13) else {
+        return false;
+    };
+    value & 1 == 1
+}
+
+fn property_i32_by_pid(section: &[u8], wanted_pid: u32) -> Option<i32> {
+    if section.len() < 8 {
+        return None;
+    }
+    let num_props = u32::from_le_bytes([section[4], section[5], section[6], section[7]]) as usize;
+    let num_props = num_props.min(256);
+    for i in 0..num_props {
+        let entry_off = 8 + i * 8;
+        if entry_off + 8 > section.len() {
+            break;
+        }
+        let pid = read_u32_le(section, entry_off);
+        if pid != wanted_pid {
+            continue;
+        }
+        let val_off = read_u32_le(section, entry_off + 4) as usize;
+        let Some(JsonValue::Number(value)) = read_property_i32(section, val_off) else {
+            return None;
+        };
+        return value.as_i64().and_then(|v| i32::try_from(v).ok());
+    }
+    None
+}
+
+fn word_document_encrypted<T: Read + std::io::Seek>(comp: &mut cfb::CompoundFile<T>) -> bool {
+    let Some(data) = read_stream_data(comp, "WordDocument") else {
+        return false;
+    };
+    if data.len() < 12 {
+        return false;
+    }
+    let flags = u16::from_le_bytes([data[10], data[11]]);
+    flags & 0x0100 != 0
 }
 
 /// Read a VT_I4 (signed 32-bit integer) at `(section + offset)`.
@@ -583,26 +660,31 @@ fn sanitize_ansi(bytes: &[u8]) -> String {
 /// on `office.dangerous_clsids[*].name` get the same string regardless
 /// of which side did the detection.
 fn lookup_dangerous_clsid(clsid: &str) -> Option<&'static str> {
-    // `cfb::Entry::clsid().to_string()` produces canonical RFC-4122
-    // hyphenated lowercase. Match against that form.
     match clsid {
-        // Equation Editor — CVE-2017-11882 / CVE-2018-0802.
-        "0002ce02-0000-0000-c000-000000000046" => Some("Equation Editor 3.0 (CVE-2017-11882)"),
-        // Packager Shell Object — embeds arbitrary files as
-        // double-click-to-execute payloads.
-        "f20da720-c02f-11ce-927b-0800095ae340" => Some("OLE Package Shell Object"),
-        // scriptlet.typelib — script execution via Windows Script Host.
-        "06290bd2-48aa-11d2-8432-006008c3fbfc" => Some("scriptlet.typelib (script execution)"),
-        // htmlfile — HTML Application surface (HTA-style execution).
-        "25336920-03f9-11cf-8fd0-00aa00686f13" => Some("htmlfile (HTML document)"),
-        // MSCOMCTL.ListViewCtrl — CVE-2012-0158 family.
-        "996bf5e0-8044-4650-adeb-0b013914e99c" => Some("MSCOMCTL.ListViewCtrl (CVE-2012-0158)"),
-        "bdd1f04b-858b-11d1-b16a-00c0f0283628" => Some("MSCOMCTL.ListViewCtrl.2 (CVE-2012-0158)"),
-        // Shell.Explorer — embedded browser, repeated RCE history.
-        "8856f961-340a-11d0-a96b-00c04fd705a2" => Some("Shell.Explorer (embedded browser)"),
-        // StdOleLink — external link object (template-injection
-        // surrogate in OLE2 documents).
-        "00000300-0000-0000-c000-000000000046" => Some("StdOleLink (external link)"),
+        "00021700-0000-0000-c000-000000000046"
+        | "0002ce02-0000-0000-c000-000000000046"
+        | "0003000b-0000-0000-c000-000000000046"
+        | "0004a6b0-0000-0000-c000-000000000046" => Some("Equation Editor"),
+        "00020c01-0000-0000-c000-000000000046"
+        | "00022601-0000-0000-c000-000000000046"
+        | "00022602-0000-0000-c000-000000000046"
+        | "00022603-0000-0000-c000-000000000046"
+        | "0003000c-0000-0000-c000-000000000046"
+        | "0003000d-0000-0000-c000-000000000046"
+        | "0003000e-0000-0000-c000-000000000046"
+        | "f20da720-c02f-11ce-927b-0800095ae340" => Some("OLE Package"),
+        "d27cdb6e-ae6d-11cf-96b8-444553540000" | "d27cdb70-ae6d-11cf-96b8-444553540000" => {
+            Some("Shockwave Flash")
+        }
+        "06290bd2-48aa-11d2-8432-006008c3fbfc" => Some("scriptlet.typelib"),
+        "25336920-03f9-11cf-8fd0-00aa00686f13" => Some("htmlfile"),
+        "996bf5e0-8044-4650-adeb-0b013914e99c" => Some("MSCOMCTL.ListViewCtrl"),
+        "bdd1f04b-858b-11d1-b16a-00c0f0283628" => Some("MSCOMCTL.ListViewCtrl.2"),
+        "8856f961-340a-11d0-a96b-00c04fd705a2" => Some("Shell.Explorer"),
+        "00000300-0000-0000-c000-000000000046" => Some("StdOleLink"),
+        "79eac9d0-baf9-11ce-8c82-00aa004ba90b" | "79eac9d1-baf9-11ce-8c82-00aa004ba90b" => {
+            Some("StdHlink")
+        }
         _ => None,
     }
 }
@@ -1009,10 +1091,6 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Equation Editor"));
-        assert!(dangerous[0]["name"]
-            .as_str()
-            .unwrap()
-            .contains("CVE-2017-11882"));
         assert_eq!(dangerous[0]["storage"].as_str(), Some("/EQUATION"));
         assert_eq!(m.get("office.dangerous_clsid_count"), Some(1.0));
 
@@ -1133,5 +1211,73 @@ mod tests {
         // how `cfb::CompoundFile::walk` materializes parent storages,
         // so we just assert a non-trivial count.
         assert!(m.get("office.macro_count").unwrap() >= 1.0);
+    }
+    #[test]
+    fn detects_object_pool_as_ole_objects() {
+        let cfb = build_cfb(&[
+            ("/WordDocument", b"x"),
+            ("/ObjectPool/_123/Contents", b"obj"),
+        ]);
+        let (v, _) = run(&cfb);
+        let features = v.get("office.features").and_then(|x| x.as_array()).unwrap();
+        let names: Vec<&str> = features.iter().filter_map(|x| x.as_str()).collect();
+        assert!(names.contains(&"ole_objects"));
+        assert!(names.contains(&"object_pool"));
+    }
+
+    #[test]
+    fn detects_summary_information_security_encryption() {
+        let summary = build_property_set(&[(0x13, PropValue::I4(1))]);
+        let cfb = build_cfb(&[
+            ("/WordDocument", b"x"),
+            ("/\x05SummaryInformation", &summary),
+        ]);
+        let (v, _) = run(&cfb);
+        let features = v.get("office.features").and_then(|x| x.as_array()).unwrap();
+        let names: Vec<&str> = features.iter().filter_map(|x| x.as_str()).collect();
+        assert!(names.contains(&"encryption"));
+        assert_eq!(
+            v.get("office.document_security").and_then(|x| x.as_i64()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn detects_word_document_encryption_flag() {
+        let mut word = vec![0u8; 12];
+        word[10..12].copy_from_slice(&0x0100_u16.to_le_bytes());
+        let cfb = build_cfb(&[("/WordDocument", &word)]);
+        let (v, _) = run(&cfb);
+        let features = v.get("office.features").and_then(|x| x.as_array()).unwrap();
+        let names: Vec<&str> = features.iter().filter_map(|x| x.as_str()).collect();
+        assert!(names.contains(&"encryption"));
+    }
+
+    #[test]
+    fn detects_encrypted_summary_stream() {
+        let cfb = build_cfb(&[
+            ("/WordDocument", b"x"),
+            ("/EncryptedSummary", b"ciphertext"),
+        ]);
+        let (v, _) = run(&cfb);
+        let features = v.get("office.features").and_then(|x| x.as_array()).unwrap();
+        let names: Vec<&str> = features.iter().filter_map(|x| x.as_str()).collect();
+        assert!(names.contains(&"encryption"));
+    }
+
+    #[test]
+    fn lookup_dangerous_clsid_expanded_entries() {
+        assert_eq!(
+            lookup_dangerous_clsid("d27cdb6e-ae6d-11cf-96b8-444553540000"),
+            Some("Shockwave Flash")
+        );
+        assert_eq!(
+            lookup_dangerous_clsid("00021700-0000-0000-c000-000000000046"),
+            Some("Equation Editor")
+        );
+        assert_eq!(
+            lookup_dangerous_clsid("79eac9d0-baf9-11ce-8c82-00aa004ba90b"),
+            Some("StdHlink")
+        );
     }
 }
