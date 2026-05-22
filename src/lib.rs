@@ -1,20 +1,24 @@
-//! # expose
+//! # filefacts
 //!
 //! Fast, thorough metadata, metrics, and string extraction for binary
 //! and source file formats.
 //!
-//! `expose` is the single-pass extraction layer underneath higher-level
+//! `filefacts` is the single-pass extraction layer underneath higher-level
 //! analysis tools. Given a byte slice, it identifies the file format,
 //! parses the format's structural fields, scans for string literals, and
 //! computes byte-level metrics — once, lazily, sharing the parse across
 //! every view.
 //!
-//! Three output views form the public schema:
+//! Output views form the public schema:
 //!
-//! - [`Values`] — the format's structural data, navigable as a JSON tree.
+//! - [`Values`] — residual format structural data, navigable as a JSON tree.
 //! - [`Strings`] — extracted string literals, grouped by extraction
 //!   technique.
 //! - [`Metrics`] — derived numeric features (entropy, sizes, counts).
+//! - [`Sections`] — binary section / segment listings.
+//! - [`Imports`], [`Exports`], and [`Functions`] — typed symbol views.
+//! - [`Ast`] — source-code call and member-access projections.
+//! - [`Errors`] — recoverable extractor diagnostics.
 //!
 //! Plus a fourth concern that's always available without computing the
 //! views: [`FileId`], the result of file-format identification.
@@ -23,7 +27,7 @@
 //!
 //! ```no_run
 //! let bytes = std::fs::read("sample.exe").unwrap();
-//! let parsed = expose::open(&bytes).unwrap();
+//! let parsed = filefacts::open(&bytes).unwrap();
 //!
 //! println!("file type: {:?}", parsed.fileid().file_type());
 //! for (key, value) in parsed.values().iter() {
@@ -40,12 +44,12 @@
 //! ## Design
 //!
 //! `ParsedFile` borrows the source bytes for its entire lifetime. The
-//! three views are computed lazily on first access and cached via
+//! extraction views are computed lazily on first access and cached via
 //! [`std::sync::OnceLock`], so subsequent accesses are free and views
 //! can be safely read from multiple threads.
 //!
 //! Format extraction is single-pass: a format extractor receives the
-//! bytes and writes into all three views in one walk. There is no
+//! bytes and writes into every view in one walk. There is no
 //! parsing during view materialisation that wasn't requested.
 //!
 //! ## Stability
@@ -54,7 +58,7 @@
 //! [`SCHEMA_VERSION`]; field additions are non-breaking, field
 //! semantics or renames bump the version.
 
-#![doc(html_root_url = "https://docs.rs/expose/0.1.0")]
+#![doc(html_root_url = "https://docs.rs/filefacts/0.1.0")]
 
 mod debug;
 mod error;
@@ -100,8 +104,8 @@ use std::sync::OnceLock;
 pub use error::Error;
 pub use fileid::{FileId, FileType};
 pub use output::{
-    ArgShape, Ast, Call, Errors, Export, Exports, ExtractedString, Function, Functions, Import,
-    Imports, Metrics, ParseError, Section, Sections, StringCategory, Strings, Values,
+    ArgShape, Assignment, Ast, Call, Errors, Export, Exports, ExtractedString, Function, Functions,
+    Import, Imports, Metrics, ParseError, Section, Sections, StringCategory, Strings, Values,
 };
 
 /// Schema version of the public output shape.
@@ -110,19 +114,21 @@ pub use output::{
 /// non-breaking and do not bump this version. Wave A of the cleave
 /// rizin migration grows `Function` and `ExtractedString` with several
 /// new optional fields; pure additions, so no bump is required on
-/// JSON shape grounds. The on-disk cache (`expose::cache`) carries a
+/// JSON shape grounds. The on-disk cache (`filefacts::cache`) carries a
 /// distinct schema version that *is* bumped on every addition so
 /// cached bytes from old binaries are not silently reused.
-pub const SCHEMA_VERSION: &str = "1";
+pub const SCHEMA_VERSION: &str = "4";
 
 /// A file with its bytes and lazily-computed metadata views.
 ///
 /// `ParsedFile` is the central type. Construct one with [`open`] (no
 /// filesystem access) or [`from_path`] (reads the file from disk).
 ///
-/// The three views are accessed via [`values`], [`strings`], and
-/// [`metrics`]. Each is computed on first access and cached for the
-/// lifetime of the `ParsedFile`.
+/// Views are computed on first access and cached for the lifetime of
+/// the `ParsedFile`. Typed fact families such as strings, sections,
+/// symbols, AST projections, and recoverable errors live in their own
+/// views; [`values`] is only for residual format structure that does
+/// not already have a typed home.
 ///
 /// [`values`]: ParsedFile::values
 /// [`strings`]: ParsedFile::strings
@@ -192,12 +198,12 @@ impl<'a> ParsedFile<'a> {
 
     /// AST projection view.
     ///
-    /// Empty when the file is not a source language expose can
+    /// Empty when the file is not a source language filefacts can
     /// parse. For source files, this is a curated set of projections
     /// of the tree-sitter parse: every call site, the sorted-unique
-    /// call targets, dotted member-access chains, and per-target
-    /// string-literal arguments. The same tree-sitter parse backs
-    /// `values()` / `strings()` for source files — no re-parsing is
+    /// targets, dotted members, bindings, and per-target string-literal
+    /// arguments. The same tree-sitter parse backs all
+    /// source-driven views for source files, so no re-parsing is
     /// performed.
     pub fn ast(&self) -> &Ast {
         &self.extracted().ast
@@ -245,7 +251,7 @@ impl<'a> ParsedFile<'a> {
 
     /// Non-fatal extraction errors encountered during the parse.
     ///
-    /// Expose always returns as much data as it can: when a goblin
+    /// Filefacts always returns as much data as it can: when a goblin
     /// lazy walker panics or a sub-table is truncated, the failure
     /// is recorded here and the rest of the extraction continues.
     /// Empty when nothing went wrong. See [`crate::ParseError`] for
@@ -355,59 +361,20 @@ fn run_extraction(
         emit_binary_aggregates(&sections, &strings, bytes, &mut metrics);
     }
 
-    // Seal typed views into the unified `values` tree so the JSON
-    // shape exposes exactly two carrier blocks (`values`, `metrics`)
-    // plus the always-cheap `fileid`. The typed views still live on
-    // `Extracted` for the Rust API; this is a serialisation-side
-    // unification only.
-    if !strings.is_empty() {
-        if let Ok(v) = serde_json::to_value(&strings) {
-            values.insert("strings", v);
-        }
-    }
-    if !sections.is_empty() {
-        if let Ok(v) = serde_json::to_value(&sections) {
-            values.insert("sections", v);
-        }
-    }
-    if !ast.is_empty() {
-        if let Ok(v) = serde_json::to_value(&ast) {
-            values.insert("ast", v);
-        }
-    }
-    // Project typed symbol collections into the values tree so kv-path
-    // consumers can read them as ordinary arrays. Each entry serializes
-    // through the structs' `#[serde]` derives (skips empty optionals).
+    // Keep typed fact families in their own views. `values` is the
+    // residual format-structure tree, so it must not mirror strings,
+    // sections, symbols, AST projections, or parse errors. Count
+    // metrics are aggregates and remain useful for rules.
     if !imports.is_empty() {
-        if let Ok(v) = serde_json::to_value(&imports) {
-            values.insert("imports", v);
-        }
         metrics.insert("imports.count", imports.len() as f64);
     }
     if !exports.is_empty() {
-        if let Ok(v) = serde_json::to_value(&exports) {
-            values.insert("exports", v);
-        }
         metrics.insert("exports.count", exports.len() as f64);
     }
     if !functions.is_empty() {
-        if let Ok(v) = serde_json::to_value(&functions) {
-            values.insert("functions", v);
-        }
         metrics.insert("functions.count", functions.len() as f64);
     }
     if !errors.is_empty() {
-        // Mirror parse errors into the values tree so kv-path
-        // consumers (cleave's trait engine) can match on them
-        // (`type: kv path: errors[*].kind exact: panic`). The typed
-        // `Errors` view stays the Rust-side API.
-        if let Ok(v) = serde_json::to_value(&errors) {
-            values.insert("errors", v);
-        }
-        // Pike-style numeric summary: a single `parse.error_count`
-        // metric so traits can fire on "did any sub-stage fail" /
-        // "more than N stages failed" without re-walking the typed
-        // view.
         metrics.insert("parse.error_count", errors.len() as f64);
     }
 
@@ -477,15 +444,15 @@ fn stage_for(file_type: FileType) -> &'static str {
 fn emit_section_metrics(sections: &Sections, metrics: &mut Metrics) {
     metrics.insert("sections.count", sections.len() as f64);
 
-    // Per-section entropies were emitted into `metrics` as
-    // `sections[N].entropy` during format extraction. Walk the section
-    // table by index so the aggregate computation can't drift out of
-    // sync with the per-section values.
+    // Per-section entropies live on `Section.entropy`. Aggregate
+    // max / mean across the sections that have file-backed bytes (the
+    // `None` entries are SHT_NOBITS / BSS-style purely-virtual regions
+    // and shouldn't pull the mean toward zero).
     let mut entropy_max = 0.0_f64;
     let mut entropy_sum = 0.0_f64;
     let mut entropy_n = 0_u64;
-    for idx in 0..sections.len() {
-        if let Some(e) = metrics.get(&format!("sections[{idx}].entropy")) {
+    for s in sections {
+        if let Some(e) = s.entropy {
             entropy_max = entropy_max.max(e);
             entropy_sum += e;
             entropy_n += 1;
@@ -653,12 +620,7 @@ fn emit_binary_aggregates(
     }
 
     // -- Per-section entropy variance --------------------------------
-    let mut entropies: Vec<f64> = Vec::new();
-    for idx in 0..sections.len() {
-        if let Some(e) = metrics.get(&format!("sections[{idx}].entropy")) {
-            entropies.push(e);
-        }
-    }
+    let entropies: Vec<f64> = sections.iter().filter_map(|s| s.entropy).collect();
     if entropies.len() >= 2 {
         let mean = entropies.iter().sum::<f64>() / entropies.len() as f64;
         let var =
@@ -668,16 +630,15 @@ fn emit_binary_aggregates(
 
     // -- Section ratios + size-weighted entropy ----------------------
     // `binary.code_entropy` / `binary.data_entropy` are size-weighted
-    // averages of per-section entropies (already in `metrics` as
-    // `sections[idx].entropy`). Weighting by `file_size` is what
-    // packer detectors want — a tiny `.init` block at 7.9 entropy
+    // averages of per-section entropies. Weighting by `file_size` is
+    // what packer detectors want — a tiny `.init` block at 7.9 entropy
     // shouldn't dominate the `.text` average.
     let mut code_size: u64 = 0;
     let mut data_size: u64 = 0;
     let mut largest: u64 = 0;
     let mut code_entropy_sum = 0.0_f64;
     let mut data_entropy_sum = 0.0_f64;
-    for (idx, s) in sections.as_slice().iter().enumerate() {
+    for s in sections {
         let is_exec = s
             .flags
             .iter()
@@ -685,9 +646,7 @@ fn emit_binary_aggregates(
         let is_write = s.flags.iter().any(|f| f == "writable" || f == "write");
         let on_disk = s.file_size;
         largest = largest.max(on_disk);
-        let entropy = metrics
-            .get(&format!("sections[{idx}].entropy"))
-            .unwrap_or(0.0);
+        let entropy = s.entropy.unwrap_or(0.0);
         if is_exec {
             code_size = code_size.saturating_add(on_disk);
             code_entropy_sum += entropy * on_disk as f64;
@@ -793,8 +752,8 @@ pub fn open_with_path<'a>(path: &Path, bytes: &'a [u8]) -> Result<ParsedFile<'a>
 ///
 /// ```no_run
 /// let bytes = std::fs::read("sample.exe")?;
-/// let parsed = expose::open_with_path(std::path::Path::new("sample.exe"), &bytes)?;
-/// # Ok::<(), expose::Error>(())
+/// let parsed = filefacts::open_with_path(std::path::Path::new("sample.exe"), &bytes)?;
+/// # Ok::<(), filefacts::Error>(())
 /// ```
 pub fn from_path(path: &Path) -> Result<(Vec<u8>, FileId), Error> {
     let bytes = std::fs::read(path)?;

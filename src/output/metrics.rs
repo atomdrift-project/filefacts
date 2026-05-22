@@ -12,7 +12,7 @@ use serde::Serialize;
 ///
 /// `Metrics` is intentionally a flat key→number map rather than a typed
 /// struct: format-specific metrics names follow each format's own
-/// conventions, and expose prefers a uniform interface over a typed
+/// conventions, and filefacts prefers a uniform interface over a typed
 /// surface that would have to grow a field for every metric every
 /// extractor invents.
 ///
@@ -58,7 +58,7 @@ impl Metrics {
 
     /// Borrow the underlying `BTreeMap`.
     ///
-    /// Useful for downstream consumers (e.g. cleave's `ExposeView`)
+    /// Useful for downstream consumers (e.g. cleave's `FilefactsView`)
     /// that want to attach the metric map to their own report shape
     /// without re-walking `iter()` and copying key by key.
     pub fn as_map(&self) -> &BTreeMap<String, f64> {

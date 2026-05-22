@@ -285,7 +285,7 @@ mod tests {
     /// known values. Any unintended change in the region walker — the
     /// number of bytes hashed, the order, the holes punched in the
     /// header — will produce a different digest and trip this test.
-    /// Regenerate by running `cargo run --bin expose -- ../cleave/tests/fixtures/test.exe`
+    /// Regenerate by running `cargo run --bin filefacts -- ../cleave/tests/fixtures/test.exe`
     /// if the fixture itself is ever replaced.
     #[test]
     fn image_hashes_test_exe_pinned_values() {

@@ -199,7 +199,7 @@ mod tests {
     /// Pin the PDB path, GUID, age, and the debug entry type vector
     /// for `test.exe`. Drift in the CodeView decoder, GUID byteswap,
     /// or entry walker will trip this test. Regenerate values via
-    /// `cargo run --bin expose -- ../cleave/tests/fixtures/test.exe`.
+    /// `cargo run --bin filefacts -- ../cleave/tests/fixtures/test.exe`.
     #[test]
     fn debug_directory_decodes_test_exe_to_known_values() {
         let bytes = std::fs::read("../cleave/tests/fixtures/test.exe")

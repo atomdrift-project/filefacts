@@ -16,9 +16,9 @@
 //!
 //! - `office.kind` — `"docx" | "xlsx" | "pptx" | "ooxml"` from the
 //!   `[Content_Types].xml` document-type declaration.
-//! - `office.core.{title, creator, last_modified_by, created,
-//!   modified, subject, description, keywords, category}` — Dublin
-//!   Core fields from `docProps/core.xml`.
+//! - `office.{title, creator, last_modified_by, created, modified,
+//!   subject, description, keywords, category}` — Dublin Core fields
+//!   from `docProps/core.xml`.
 //! - `office.application`, `office.company` — from `docProps/app.xml`.
 //! - `office.features[]` — Pike-style array of structural features
 //!   (`"macros"`, `"external_template"`, `"ole_objects"`, …).
@@ -53,8 +53,9 @@ pub(super) fn extract(
 
     // Core metadata (Dublin Core).
     if let Some(core) = parse_core_props(&mut zip) {
-        if !core.is_empty() {
-            values.insert("office.core", JsonValue::Object(core));
+        for (key, value) in core {
+            let path = format!("office.{key}");
+            values.insert(&path, value);
         }
     }
 
@@ -489,22 +490,24 @@ mod tests {
             ("docProps/core.xml", CORE_XML.as_bytes()),
         ]);
         let (v, _) = run(&z);
-        let core = v.get("office.core").and_then(|x| x.as_object()).unwrap();
         assert_eq!(
-            core.get("title").and_then(|x| x.as_str()),
+            v.get("office.title").and_then(|x| x.as_str()),
             Some("Quarterly Report")
         );
-        assert_eq!(core.get("creator").and_then(|x| x.as_str()), Some("Alice"));
         assert_eq!(
-            core.get("last_modified_by").and_then(|x| x.as_str()),
+            v.get("office.creator").and_then(|x| x.as_str()),
+            Some("Alice")
+        );
+        assert_eq!(
+            v.get("office.last_modified_by").and_then(|x| x.as_str()),
             Some("Bob")
         );
         assert_eq!(
-            core.get("created").and_then(|x| x.as_str()),
+            v.get("office.created").and_then(|x| x.as_str()),
             Some("2024-01-15T08:00:00Z")
         );
         assert_eq!(
-            core.get("modified").and_then(|x| x.as_str()),
+            v.get("office.modified").and_then(|x| x.as_str()),
             Some("2024-01-16T09:30:00Z")
         );
     }
@@ -572,7 +575,7 @@ mod tests {
         let z = build_ooxml(&[("hello.txt", b"world")]);
         let (v, _) = run(&z);
         assert!(v.get("office.kind").is_none());
-        assert!(v.get("office.core").is_none());
+        assert!(v.get("office.title").is_none());
     }
 
     #[test]
@@ -582,9 +585,9 @@ mod tests {
             ("docProps/core.xml", b"<not-actually-xml"),
         ]);
         let (v, _) = run(&z);
-        // Kind still set; core simply missing.
+        // Kind still set; core properties simply missing.
         assert_eq!(v.get("office.kind").and_then(|x| x.as_str()), Some("docx"));
-        assert!(v.get("office.core").is_none());
+        assert!(v.get("office.title").is_none());
     }
 
     #[test]
@@ -603,14 +606,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_core_xml_omits_object() {
-        // Empty docProps/core.xml shouldn't emit office.core.
+    fn empty_core_xml_omits_values() {
+        // Empty docProps/core.xml shouldn't emit office.
         let z = build_ooxml(&[
             ("[Content_Types].xml", CONTENT_TYPES_DOCX.as_bytes()),
             ("docProps/core.xml", b"<cp:coreProperties xmlns:cp=\"x\"/>"),
         ]);
         let (v, _) = run(&z);
-        assert!(v.get("office.core").is_none());
+        assert!(v.get("office.title").is_none());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Non-fatal extraction errors surfaced alongside the rest of the output.
 //!
-//! Expose's contract is *return as much data as we possibly can*: a
+//! Filefacts' contract is *return as much data as we possibly can*: a
 //! truncated PE that goblin chokes on still gets its byte-level
 //! metrics emitted; a malformed Mach-O fat header still gets a
 //! Magic-byte–derived [`crate::FileId`]. When a sub-extractor fails
@@ -22,7 +22,7 @@
 //! extraction (`section.entropy > 7.9`, `pe.section_count > 50`,
 //! `tls_callback_count > 4`) belong in [`crate::Metrics`] instead —
 //! they are quantitative facts the file genuinely has, not
-//! diagnostics about expose's parse.
+//! diagnostics about filefacts' parse.
 //!
 //! Schema:
 //!

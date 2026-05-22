@@ -34,7 +34,7 @@ use crate::output::{Function, Import};
 /// clause or a CreateObject/GetObject argument is not a string
 /// literal — i.e., the import target is built at runtime.
 ///
-/// Re-exported through the crate-level `expose::vba_symbols` module
+/// Re-exported through the crate-level `filefacts::vba_symbols` module
 /// for consumers that need to recognise it.
 pub const NON_LITERAL_SENTINEL: &str = "<non-literal>";
 

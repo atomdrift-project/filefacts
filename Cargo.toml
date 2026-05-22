@@ -1,23 +1,23 @@
 [package]
-name = "expose"
+name = "filefacts"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 authors = ["The Atomdrift Project"]
-description = "Exposes structural facts (kv, metrics, strings) from binary and source files for forensic analysis."
+description = "Extracts file facts: identification, structural values, strings, metrics, symbols, sections, AST, and recoverable parse errors."
 license = "Apache-2.0"
-repository = "https://codeberg.org/atomdrift/expose"
+repository = "https://codeberg.org/atomdrift/filefacts"
 keywords = ["forensics", "binary-analysis", "metadata", "pe", "elf"]
 categories = ["parsing", "command-line-utilities"]
 readme = "README.md"
 
 [lib]
-name = "expose"
+name = "filefacts"
 path = "src/lib.rs"
 
 [[bin]]
-name = "expose"
-path = "src/bin/expose.rs"
+name = "filefacts"
+path = "src/bin/filefacts.rs"
 
 [dependencies]
 # Serialization — required for output schema.
@@ -48,7 +48,7 @@ goblin = { version = "0.10", default-features = false, features = ["std", "pe32"
 
 # Language-aware string extractor — Go/Rust fat-pointer aware, dedupes
 # packed runs, decodes XOR-obfuscated and base64-wrapped payloads.
-# Cleave used to call this directly; centralising in expose lets every
+# Cleave used to call this directly; centralising in filefacts lets every
 # consumer get the same high-quality string set.
 stng = { git = "https://codeberg.org/atomdrift/stng.git" }
 
@@ -128,7 +128,7 @@ tracing = "0.1"
 zstd = "0.13"
 bincode = "1"
 
-# OS cache directory lookup — `~/.cache/expose` (Linux) / `Library/Caches`
+# OS cache directory lookup — `~/.cache/filefacts` (Linux) / `Library/Caches`
 # (macOS) / `%LOCALAPPDATA%` (Windows).
 dirs = "5"
 

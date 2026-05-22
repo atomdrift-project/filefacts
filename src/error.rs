@@ -4,7 +4,7 @@ use std::io;
 
 use thiserror::Error;
 
-/// Error returned by expose's public API.
+/// Error returned by filefacts' public API.
 ///
 /// Variants are stable; new variants are additive and gated by
 /// `#[non_exhaustive]`. Existing variants will not be renamed or removed
@@ -22,7 +22,7 @@ pub enum Error {
     ///
     /// Returned by `open()` when neither magic-byte detection nor content
     /// heuristics produce a result. The bytes themselves may be valid for
-    /// some format expose does not yet support.
+    /// some format filefacts does not yet support.
     #[error("unrecognised file format")]
     UnknownFormat,
 

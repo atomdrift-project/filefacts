@@ -307,9 +307,9 @@ fn open_archive(
     file_type: FileType,
 ) -> Result<tar::Archive<Box<dyn Read + '_>>, Error> {
     let cursor = io::Cursor::new(bytes);
-    // Compressed wrappers. expose doesn't take a dep on the compressor
+    // Compressed wrappers. filefacts doesn't take a dep on the compressor
     // crates yet; for now we report the format label and decline to walk
-    // entries when the bytes are compressed. (Cleave can hand expose
+    // entries when the bytes are compressed. (Cleave can hand filefacts
     // the *decompressed* tar bytes and get the full member listing.)
     if matches!(
         file_type,
@@ -319,7 +319,7 @@ fn open_archive(
             "tar",
             format!(
                 "compressed tar variants are reported by format only; \
-                 decompress the wrapper before passing to expose (variant={file_type:?})"
+                 decompress the wrapper before passing to filefacts (variant={file_type:?})"
             ),
         ));
     }

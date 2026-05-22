@@ -11,10 +11,10 @@
 //! 1. **Grammar binding** — the `tree_sitter::Language` constructor.
 //! 2. **Surface extraction** — tree-sitter queries for imports,
 //!    function-definition names, and class-definition names. These
-//!    feed `values.imports` / `values.functions` / `values.classes`.
+//!    feed the typed imports/functions views.
 //! 3. **AST walk** — node-kind names and field names the
 //!    language-agnostic AST walker uses to project the tree into
-//!    `ast.calls`, `ast.member_chains`, and `ast.call_string_args`.
+//!    `ast.calls`, `ast.members`, and `ast.call_strings`.
 //!
 //! Adding a language is a single entry here plus a Cargo dependency.
 
@@ -188,9 +188,12 @@ static PYTHON: LangConfig = LangConfig {
     comment_style: CommentStyle::Hash,
     string_kinds: &["string"],
     import_query: r#"
+        (import_statement name: (aliased_import) @import)
         (import_statement name: (dotted_name) @import)
         (import_from_statement module_name: (dotted_name) @import)
         (import_from_statement module_name: (relative_import) @import)
+        (import_from_statement name: (aliased_import) @import)
+        (import_from_statement name: (dotted_name) @import)
     "#,
     function_query: r#"
         (function_definition name: (identifier) @fn)
@@ -342,17 +345,13 @@ static BASH: LangConfig = LangConfig {
         (function_definition name: (word) @fn)
     "#,
     class_query: "",
-    // Bash's command-execution AST shape doesn't fit the
-    // callee/arguments-field model the walker expects; we leave the
-    // AST-walk fields empty and `ast` stays empty for bash files. The
-    // surface extraction (imports/functions) still works via queries.
-    call_kinds: &[],
-    callee_field: "",
-    arguments_field: "",
+    call_kinds: &["command"],
+    callee_field: "name",
+    arguments_field: "argument",
     member_kinds: &[],
     member_object_field: "",
     member_property_field: "",
-    identifier_kinds: &["word", "variable_name"],
+    identifier_kinds: &["command_name", "word", "variable_name"],
     number_kinds: &["number"],
     bool_kinds: &[],
     null_kinds: &[],
@@ -694,14 +693,9 @@ static POWERSHELL: LangConfig = LangConfig {
     class_query: r#"
         (class_statement (simple_name) @class)
     "#,
-    // PowerShell's pipeline/command model doesn't fit the
-    // callee-field / argument-field AST-walk projection any better
-    // than bash does; we leave the call-related fields empty so the
-    // walker stays out of the way. Identifier/literal/comment/import
-    // metrics still flow.
-    call_kinds: &[],
-    callee_field: "",
-    arguments_field: "",
+    call_kinds: &["command"],
+    callee_field: "command_name",
+    arguments_field: "command_elements",
     member_kinds: &[],
     member_object_field: "",
     member_property_field: "",

@@ -5,7 +5,7 @@
 //! per-entry forensic fields drawn from the central-directory header.
 //!
 //! Decompression and recursion are the caller's responsibility:
-//! `expose` describes what's *in* the archive, not what each member
+//! `filefacts` describes what's *in* the archive, not what each member
 //! *contains*.
 
 // JAR signing manifests have format-defined uppercase names
@@ -357,7 +357,7 @@ fn members_includes<R: std::io::Read + std::io::Seek>(
 
 /// Classification flags for a single archive entry path, derived from
 /// the name alone. Cleave's `ArchiveMetrics` aggregates roll these up
-/// across the archive; expose computes them once per member.
+/// across the archive; filefacts computes them once per member.
 #[derive(Default)]
 pub(super) struct FilenameClass {
     pub(super) is_hidden: bool,
@@ -745,7 +745,7 @@ mod tests {
     #[test]
     fn non_zip_input_rejected_silently() {
         // Bytes that don't start with PK\x03\x04 — extract returns Err
-        // (which expose's dispatcher swallows). Values left empty.
+        // (which filefacts' dispatcher swallows). Values left empty.
         let (v, _) = run(b"not a zip");
         assert!(v.get("archive.members").is_none());
     }
@@ -900,7 +900,7 @@ mod tests {
     }
 
     /// Canonical key list emitted by the ZIP extractor. The test fails
-    /// loudly when expose stops emitting any of these keys for a
+    /// loudly when filefacts stops emitting any of these keys for a
     /// realistic archive — protects traits referencing them from
     /// silent disappearance.
     #[test]

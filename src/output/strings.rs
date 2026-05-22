@@ -27,7 +27,7 @@ pub enum StringCategory {
 /// One extracted string with its category and offset.
 ///
 /// `offset` is the byte position of the first character within the source
-/// bytes given to `expose::open`. For UTF-16 strings, this is the byte
+/// bytes given to `filefacts::open`. For UTF-16 strings, this is the byte
 /// offset of the first code unit, not a character index.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExtractedString {
@@ -70,7 +70,7 @@ pub struct ExtractedString {
     pub paddr: Option<u64>,
     /// Encoding label as rizin / the extractor reports it
     /// (`"ascii"`, `"utf8"`, `"utf16le"`, `"utf32le"`, …). Distinct
-    /// from `category`, which is expose's coarse technique
+    /// from `category`, which is filefacts' coarse technique
     /// classification. `None` for category-only entries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encoding: Option<String>,

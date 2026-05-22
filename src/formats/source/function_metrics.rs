@@ -44,7 +44,7 @@ pub(super) fn emit(
 
 /// Function-defining node kinds per language. Mirrors the
 /// `function_node_types` used by cleave's UnifiedSourceAnalyzer for the
-/// subset of languages that expose currently parses.
+/// subset of languages that filefacts currently parses.
 fn function_kinds_for(lang: &str) -> &'static [&'static str] {
     match lang {
         "python" => &["function_definition", "async_function_definition"],

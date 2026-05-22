@@ -176,7 +176,7 @@ pub fn log_stats() {
         memory_exceeded,
         timeout_rate_pct = (timeouts as f64 / total_f) * 100.0,
         failure_rate_pct = (failures as f64 / total_f) * 100.0,
-        "expose rizin subprocess statistics"
+        "filefacts rizin subprocess statistics"
     );
 }
 
@@ -261,7 +261,11 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut temp = std::env::temp_dir();
-    temp.push(format!("expose-rizin-{}-{}.bin", std::process::id(), seq));
+    temp.push(format!(
+        "filefacts-rizin-{}-{}.bin",
+        std::process::id(),
+        seq
+    ));
     if std::fs::write(&temp, bytes).is_err() {
         RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
         return None;
@@ -523,7 +527,7 @@ fn parse_json_array<T: serde::de::DeserializeOwned>(
     serde_json::from_str(&text[start..])
 }
 
-/// Raw rizin output — converted into expose's typed `Import`/
+/// Raw rizin output — converted into filefacts' typed `Import`/
 /// `Export`/`Function`/`Section` views by `recover()`'s caller.
 pub(crate) struct RizinRecovery {
     imports: Vec<RawImport>,
@@ -548,7 +552,7 @@ pub(crate) struct RecoveryCounts {
 }
 
 impl RizinRecovery {
-    /// Push recovered symbols into expose's typed views and emit the
+    /// Push recovered symbols into filefacts' typed views and emit the
     /// rizin-specific `binary.*` metrics. Only fills slots that
     /// goblin left empty — never overwrites existing data.
     ///
@@ -724,6 +728,8 @@ impl RizinRecovery {
                         file_offset: sec.paddr.unwrap_or(0),
                         file_size: sec.size,
                         flags,
+                        flags_raw: None,
+                        entropy: None,
                     });
                     counts.sections = counts.sections.saturating_add(1);
                 }
@@ -734,7 +740,7 @@ impl RizinRecovery {
 }
 
 /// Map rizin's `perm` field (`-r-x`, `-rw-`, `-rwx`) to the canonical
-/// flag vocabulary used by every other expose section view. Order is
+/// flag vocabulary used by every other filefacts section view. Order is
 /// `readable, writable, executable` so callers iterating the
 /// resulting Vec in order get a stable shape.
 fn perm_to_flags(perm: Option<&str>) -> Vec<String> {
@@ -756,7 +762,7 @@ fn perm_to_flags(perm: Option<&str>) -> Vec<String> {
 
 // =============================================================================
 // Wire-format deserialisers. Map rizin's JSON shape to internal structs;
-// expose's public typed views (Import / Export / Function) stay independent.
+// filefacts' public typed views (Import / Export / Function) stay independent.
 // =============================================================================
 
 #[derive(Deserialize)]
@@ -1301,7 +1307,7 @@ mod tests {
     fn stage_shim(stdout_payload: &str) -> Option<std::path::PathBuf> {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
-        let dir = unique_shim_dir("expose-rizin-shim");
+        let dir = unique_shim_dir("filefacts-rizin-shim");
         std::fs::create_dir_all(&dir).ok()?;
         let shim = dir.join("rizin");
         let mut f = std::fs::File::create(&shim).ok()?;
@@ -1410,7 +1416,7 @@ mod tests {
         // that silently fail (rizin crashing before its first echo).
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
-        let dir = unique_shim_dir("expose-rizin-silentshim");
+        let dir = unique_shim_dir("filefacts-rizin-silentshim");
         std::fs::create_dir_all(&dir).unwrap();
         let shim = dir.join("rizin");
         let mut f = std::fs::File::create(&shim).unwrap();
@@ -1432,7 +1438,7 @@ mod tests {
         // return phantom data even if some partial stdout leaked.
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
-        let dir = unique_shim_dir("expose-rizin-failshim");
+        let dir = unique_shim_dir("filefacts-rizin-failshim");
         std::fs::create_dir_all(&dir).unwrap();
         let shim = dir.join("rizin");
         let mut f = std::fs::File::create(&shim).unwrap();
@@ -1453,6 +1459,6 @@ mod tests {
     // PID prefix); serialising every shim test to make the snapshot
     // deterministic defeats parallelism. The Drop pattern is idiomatic
     // Rust and was verified end-to-end on the malware sample run
-    // (8,325 functions recovered, no `expose-rizin-*` files left in
+    // (8,325 functions recovered, no `filefacts-rizin-*` files left in
     // `/tmp` across sessions).
 }

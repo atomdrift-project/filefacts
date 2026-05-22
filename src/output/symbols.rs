@@ -18,7 +18,7 @@
 //! - **Source code** (tree-sitter languages) carries the same idea
 //!   via `import` / `require` statements and top-level definitions.
 //!
-//! Rather than collapsing these into a single union type, expose
+//! Rather than collapsing these into a single union type, filefacts
 //! keeps three typed collections — [`Imports`], [`Exports`],
 //! [`Functions`] — each with the fields its concept actually carries.
 //! When a single fact appears in two categories (e.g. a VBA `Declare`

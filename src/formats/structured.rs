@@ -82,7 +82,7 @@ pub(super) fn extract_pkginfo(bytes: &[u8], values: &mut Values) -> Result<(), E
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
-        let key = key.trim().to_string();
+        let key = key.trim().to_lowercase();
         let value = JsonValue::String(value.trim().to_string());
         match root.get_mut(&key) {
             None => {
@@ -300,10 +300,25 @@ mod tests {
         let input = b"Metadata-Version: 2.1\nName: foo\nVersion: 1.2.3\n";
         extract_pkginfo(input, &mut v).unwrap();
         assert_eq!(
-            v.get("Metadata-Version").and_then(|x| x.as_str()),
+            v.get("metadata-version").and_then(|x| x.as_str()),
             Some("2.1")
         );
-        assert_eq!(v.get("Name").and_then(|x| x.as_str()), Some("foo"));
+        assert_eq!(v.get("name").and_then(|x| x.as_str()), Some("foo"));
+    }
+
+    #[test]
+    fn pkginfo_keys_are_lowercase() {
+        let mut v = Values::new();
+        let input = b"Summary: Dependency confusion PoC\nAuthor-email: a@example.com\n";
+        extract_pkginfo(input, &mut v).unwrap();
+        assert_eq!(
+            v.get("summary").and_then(|x| x.as_str()),
+            Some("Dependency confusion PoC")
+        );
+        assert_eq!(
+            v.get("author-email").and_then(|x| x.as_str()),
+            Some("a@example.com")
+        );
     }
 
     #[test]
@@ -311,7 +326,7 @@ mod tests {
         let mut v = Values::new();
         let input = b"Classifier: A\nClassifier: B\nClassifier: C\n";
         extract_pkginfo(input, &mut v).unwrap();
-        let arr = v.get("Classifier").and_then(|x| x.as_array()).unwrap();
+        let arr = v.get("classifier").and_then(|x| x.as_array()).unwrap();
         assert_eq!(arr.len(), 3);
     }
 

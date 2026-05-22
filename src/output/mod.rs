@@ -1,7 +1,7 @@
 //! Output views every `ParsedFile` exposes.
 //!
 //! These are the public output schema. Their JSON serialisation is the
-//! contract: keys, nesting, types are governed by expose's
+//! contract: keys, nesting, and types are governed by filefacts
 //! `SCHEMA_VERSION`. Field additions are non-breaking; renames or
 //! semantic changes require a schema-version bump.
 //!
@@ -18,8 +18,10 @@
 //!   spread" rather than "what does it contain".
 //! - [`Sections`] — unified section / segment listing for binary
 //!   formats, with per-section entropy and flag vocabulary.
+//! - [`Imports`], [`Exports`], and [`Functions`] — typed symbol views.
 //! - [`Ast`] — call-graph and member-access projection of the
 //!   tree-sitter parse for source files.
+//! - [`Errors`] — recoverable extractor diagnostics.
 
 mod ast;
 mod errors;
@@ -29,7 +31,7 @@ mod strings;
 mod symbols;
 mod values;
 
-pub use ast::{ArgShape, Ast, Call};
+pub use ast::{ArgShape, Assignment, Ast, Call};
 pub use errors::{Errors, ParseError};
 pub use metrics::Metrics;
 pub use sections::{Section, Sections};

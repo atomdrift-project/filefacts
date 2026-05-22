@@ -6,7 +6,7 @@
 //! tree-sitter parse, so the helper runs on any source-text input.
 //!
 //! Ported from cleave's `analyzers/text_metrics.rs` as part of the
-//! cleave→expose architecture migration. The original built a typed
+//! cleave→filefacts architecture migration. The original built a typed
 //! `TextMetrics` struct and flattened it into a metric map; here we
 //! emit straight into [`Metrics`] under the canonical `text.*` keys.
 

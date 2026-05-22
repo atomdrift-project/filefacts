@@ -7,7 +7,7 @@
 //! catalog flags) by recognizing the canonical PDF tokens directly
 //! in the raw bytes.
 //!
-//! Schema namespaces under `pdf.*` matching expose's per-format
+//! Schema namespaces under `pdf.*` matching filefacts' per-format
 //! convention:
 //!
 //! - `pdf.header.{version, header_count}` — first `%PDF-X.Y` plus the
@@ -268,6 +268,26 @@ pub(super) fn extract(
         metrics.insert("pdf.uri_action_count", f64::from(uri_action_count));
     }
 
+    // Full-content JavaScript payloads — one entry per `/JS` site
+    // resolved end-to-end (inline literals, hex strings, and indirect
+    // references followed into Flate-compressed streams). Distinct
+    // from `pdf.actions[]`, which keeps a short truncated snippet for
+    // at-a-glance triage. Downstream consumers (cleave's PDF
+    // sub-file analyzer) re-extract each entry as a virtual JS
+    // sub-file at depth 1 so JavaScript-specific traits match
+    // against the actual code rather than just the metadata count.
+    let js_payloads = scan_javascript_payloads(bytes, &dict_regions);
+    if !js_payloads.is_empty() {
+        let total_bytes: u64 = js_payloads
+            .iter()
+            .filter_map(|v| v.as_object())
+            .filter_map(|o| o.get("content_bytes").and_then(JsonValue::as_u64))
+            .sum();
+        metrics.insert("pdf.javascript_count", js_payloads.len() as f64);
+        metrics.insert("pdf.javascript_total_bytes", total_bytes as f64);
+        values.insert("pdf.javascript", JsonValue::Array(js_payloads));
+    }
+
     // Embedded files — `{filename, size}` per `/Type /Filespec`
     // record. `size` is recovered by following the `/EF /F <ref>`
     // reference to the embedded-stream object and reading the
@@ -382,8 +402,8 @@ pub(super) fn extract(
 
     // Phase 1B derived metrics — formerly computed by cleave's
     // pdf::parser. Now reachable through the metric-fold adapter
-    // (`merge_expose_metrics`) so trait rules using `field: pdf.X`
-    // resolve against expose's flat metric map.
+    // (`merge_filefacts_metrics`) so trait rules using `field: pdf.X`
+    // resolve against filefacts' flat metric map.
     let leading_bytes = bytes.windows(5).position(|w| w == b"%PDF-").unwrap_or(0);
     metrics.insert("pdf.leading_bytes_before_header", leading_bytes as f64);
     let sig_count = count_type_occurrences(bytes, b"/Sig") + count_substring(bytes, b"/Type /Sig");
@@ -859,6 +879,225 @@ fn scan_actions(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<JsonValue> {
         }
     }
     out
+}
+
+/// Walk every `/JS` site and resolve it to its full byte content —
+/// inline literals (`/JS (var x=1;)`), hex strings (`/JS <76617220...>`),
+/// and indirect references (`/JS 42 0 R`) that point at a string or
+/// stream object. FlateDecode-encoded streams are inflated. Distinct
+/// from [`scan_actions`], which records each site with a 200-byte
+/// snippet for at-a-glance triage; here we want the *whole* payload so
+/// downstream tools can treat each JS blob as a virtual sub-file.
+///
+/// Returns one entry per site with `{source, target_object_id?,
+/// filters?, content, content_bytes}`. `target_object_id` is set when
+/// the site referenced another object (so consumers can map the JS
+/// payload back to a specific object id); `filters` records the
+/// stream's filter chain when the payload was decoded from a stream.
+fn scan_javascript_payloads(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<JsonValue> {
+    // Lookup table for indirect-ref resolution. PDFs with multiple
+    // generations of the same object id are rare in malicious samples
+    // and we accept the last-wins behavior here (matches how the rest
+    // of the extractor handles incremental updates).
+    let mut by_id: std::collections::HashMap<u32, &DictRegion> =
+        std::collections::HashMap::with_capacity(dict_regions.len());
+    for r in dict_regions {
+        if let Some(id) = r.obj_id {
+            by_id.insert(id, r);
+        }
+    }
+
+    let mut out = Vec::new();
+    for region in dict_regions {
+        let DictRegion {
+            start, end, obj_id, ..
+        } = *region;
+        if end <= start {
+            continue;
+        }
+        let dict = &bytes[start..end];
+        let mut pos = 0;
+        while let Some(rel) = dict[pos..].windows(3).position(|w| w == b"/JS") {
+            let abs = pos + rel;
+            let next = abs + 3;
+            // Reject /JSON, /JavaScript (the *name*, not the key form).
+            if next < dict.len() && dict[next].is_ascii_alphabetic() {
+                pos = next;
+                continue;
+            }
+            if let Some(payload) = resolve_js_value(bytes, dict, next, &by_id) {
+                let mut entry = serde_json::Map::new();
+                entry.insert(
+                    "source".into(),
+                    JsonValue::String(match obj_id {
+                        Some(id) => format!("object:{id}"),
+                        None => "object:unknown".to_string(),
+                    }),
+                );
+                if let Some(target) = payload.target_object_id {
+                    entry.insert(
+                        "target_object_id".into(),
+                        JsonValue::Number(u64::from(target).into()),
+                    );
+                }
+                if !payload.filters.is_empty() {
+                    entry.insert(
+                        "filters".into(),
+                        JsonValue::Array(
+                            payload.filters.into_iter().map(JsonValue::String).collect(),
+                        ),
+                    );
+                }
+                entry.insert(
+                    "content_bytes".into(),
+                    JsonValue::Number((payload.content.len() as u64).into()),
+                );
+                entry.insert("content".into(), JsonValue::String(payload.content));
+                out.push(JsonValue::Object(entry));
+            }
+            pos = next;
+        }
+    }
+    out
+}
+
+struct JsPayload {
+    target_object_id: Option<u32>,
+    filters: Vec<String>,
+    content: String,
+}
+
+/// Resolve the value sitting after a `/JS` key in `dict` (slice
+/// relative to the object's dict region). Walks across object
+/// boundaries for indirect references — string objects come back
+/// inline; stream objects come back inflated (FlateDecode) or raw
+/// (no filter).
+fn resolve_js_value(
+    bytes: &[u8],
+    dict: &[u8],
+    after_js_key: usize,
+    by_id: &std::collections::HashMap<u32, &DictRegion>,
+) -> Option<JsPayload> {
+    let mut cursor = after_js_key;
+    while cursor < dict.len() && dict[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    let first = *dict.get(cursor)?;
+    match first {
+        b'(' => {
+            let content = read_literal_string(dict, cursor + 1)?;
+            Some(JsPayload {
+                target_object_id: None,
+                filters: Vec::new(),
+                content,
+            })
+        }
+        b'<' if dict.get(cursor + 1) != Some(&b'<') => {
+            let content = read_hex_string(dict, cursor + 1)?;
+            Some(JsPayload {
+                target_object_id: None,
+                filters: Vec::new(),
+                content,
+            })
+        }
+        b'0'..=b'9' => resolve_indirect_js(bytes, dict, cursor, by_id),
+        _ => None,
+    }
+}
+
+/// Parse an `N G R` indirect reference at `dict[cursor..]` and dereference
+/// it through `by_id` to recover the underlying string- or stream-object's
+/// content.
+fn resolve_indirect_js(
+    bytes: &[u8],
+    dict: &[u8],
+    cursor: usize,
+    by_id: &std::collections::HashMap<u32, &DictRegion>,
+) -> Option<JsPayload> {
+    let end = (cursor + 32).min(dict.len());
+    let token: String = dict[cursor..end]
+        .iter()
+        .take_while(|&&b| !matches!(b, b'\n' | b'\r' | b'>' | b'/' | b'('))
+        .map(|&b| b as char)
+        .collect();
+    let trimmed = token.trim();
+    if !trimmed.ends_with('R') {
+        return None;
+    }
+    let mut parts = trimmed[..trimmed.len() - 1].split_whitespace();
+    let target_id: u32 = parts.next()?.parse().ok()?;
+    let _gen: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let target = by_id.get(&target_id).copied()?;
+
+    // Two shapes — a stream object (most common for /JS, since JS
+    // blobs are bigger than a string-literal-friendly size) or a
+    // bare string object. Try stream first.
+    if let Some((s, e)) = target.stream_range {
+        if e > s && e <= bytes.len() {
+            let target_dict = &bytes[target.start..target.end];
+            let filters = read_object_filters(target_dict);
+            let raw = &bytes[s..e];
+            let decoded: Option<Vec<u8>> = match filters.as_slice() {
+                [] => Some(raw.to_vec()),
+                [single] if single == "FlateDecode" => inflate(raw),
+                _ => None, // skip unusual filter chains; out of scope for now
+            };
+            if let Some(decoded) = decoded {
+                // Surface as a string. `String::from_utf8_lossy` so
+                // any embedded shellcode bytes survive as `U+FFFD`
+                // rather than throwing the whole payload away — the
+                // downstream JS parser sees the same UTF-8 it would
+                // see opening the PDF in a viewer that ignores the
+                // odd byte.
+                return Some(JsPayload {
+                    target_object_id: Some(target_id),
+                    filters,
+                    content: String::from_utf8_lossy(&decoded).into_owned(),
+                });
+            }
+        }
+    }
+    // String-object fallback — the target dict region may just be a
+    // bare `(literal)` or `<hex>` string instead of an actual dict.
+    let target_dict = &bytes[target.start..target.end];
+    let mut p = 0;
+    while p < target_dict.len() && target_dict[p].is_ascii_whitespace() {
+        p += 1;
+    }
+    match target_dict.get(p) {
+        Some(&b'(') => Some(JsPayload {
+            target_object_id: Some(target_id),
+            filters: Vec::new(),
+            content: read_literal_string(target_dict, p + 1)?,
+        }),
+        Some(&b'<') if target_dict.get(p + 1) != Some(&b'<') => Some(JsPayload {
+            target_object_id: Some(target_id),
+            filters: Vec::new(),
+            content: read_hex_string(target_dict, p + 1)?,
+        }),
+        _ => None,
+    }
+}
+
+/// Pull the `/Filter` chain out of an object's dict, returning a
+/// `Vec` of name strings (no leading slash). `/FilterDecodeParms` and
+/// other name-suffix collisions are rejected via whole-token match.
+fn read_object_filters(dict: &[u8]) -> Vec<String> {
+    let mut p = 0;
+    while p + 7 <= dict.len() {
+        let Some(rel) = dict[p..].windows(7).position(|w| w == b"/Filter") else {
+            return Vec::new();
+        };
+        let after = p + rel + 7;
+        if dict.get(after).is_some_and(|b| b.is_ascii_alphabetic()) {
+            p = after;
+            continue;
+        }
+        return read_filter_value(dict, after)
+            .map(|s| s.split(',').map(str::to_string).collect())
+            .unwrap_or_default();
+    }
+    Vec::new()
 }
 
 /// Deduplicated comma-joined filter chain strings across every
@@ -1901,9 +2140,63 @@ mod tests {
     fn detects_javascript_action_count() {
         let pdf = b"%PDF-1.5\n5 0 obj << /S /JavaScript /JS (app.alert('hi')) >> endobj\n%%EOF";
         let (_, m) = extract_pdf(pdf);
-        // The expose extractor reports the count via metrics —
+        // The filefacts extractor reports the count via metrics —
         // the action-detail array stays with cleave's PDF parser.
         assert_eq!(m.get("pdf.action_count"), Some(1.0));
+    }
+
+    /// Inline-string `/JS (literal)` surfaces in `pdf.javascript[]`
+    /// with the literal as its full content — downstream consumers
+    /// extract this as a virtual JS sub-file.
+    #[test]
+    fn javascript_payload_inline_literal() {
+        let pdf = b"%PDF-1.5\n5 0 obj << /S /JavaScript /JS (app.alert('hi')) >> endobj\n%%EOF";
+        let (v, m) = extract_pdf(pdf);
+        let js = v.get("pdf.javascript").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(js.len(), 1);
+        assert_eq!(js[0]["source"].as_str(), Some("object:5"));
+        assert_eq!(js[0]["content"].as_str(), Some("app.alert('hi')"));
+        assert_eq!(js[0]["content_bytes"].as_u64(), Some(15));
+        assert!(js[0].get("target_object_id").is_none());
+        assert_eq!(m.get("pdf.javascript_count"), Some(1.0));
+        assert_eq!(m.get("pdf.javascript_total_bytes"), Some(15.0));
+    }
+
+    /// `/JS <hex>` surfaces with the decoded hex string as its
+    /// content. Hex strings are how some authoring tools encode
+    /// non-ASCII JS or obfuscate the payload past simple grep scans.
+    #[test]
+    fn javascript_payload_hex_string() {
+        // <6170703D31> = "app=1" — trailing-whitespace trimming in
+        // read_hex_string drops the canonical "app " sample, so we
+        // pick a no-trailing-space string for the assertion.
+        let pdf = b"%PDF-1.5\n5 0 obj << /S /JavaScript /JS <6170703D31> >> endobj\n%%EOF";
+        let (v, _) = extract_pdf(pdf);
+        let js = v.get("pdf.javascript").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(js[0]["content"].as_str(), Some("app=1"));
+    }
+
+    /// `/JS N N R` follows the indirect reference into a string-
+    /// object body and surfaces its content — the target object id
+    /// is recorded so analysts can map JS back to a specific obj.
+    #[test]
+    fn javascript_payload_indirect_string_object() {
+        let pdf = b"%PDF-1.5\n5 0 obj << /S /JavaScript /JS 7 0 R >> endobj\n7 0 obj (var x = 1;) endobj\n%%EOF";
+        let (v, _) = extract_pdf(pdf);
+        let js = v.get("pdf.javascript").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(js.len(), 1);
+        assert_eq!(js[0]["target_object_id"].as_u64(), Some(7));
+        assert_eq!(js[0]["content"].as_str(), Some("var x = 1;"));
+    }
+
+    /// Bare `/JSON` / `/JavaScript` name tokens (the action-type
+    /// declaration, not the key form) must not produce a payload.
+    #[test]
+    fn javascript_payload_ignores_name_only_tokens() {
+        // `/JavaScript` is a name value here, not a `/JS` key.
+        let pdf = b"%PDF-1.5\n5 0 obj << /S /JavaScript >> endobj\n%%EOF";
+        let (v, _) = extract_pdf(pdf);
+        assert!(v.get("pdf.javascript").is_none());
     }
 
     #[test]

@@ -1,17 +1,18 @@
-# expose
+# filefacts
 
-Exposes characteristics and metadata for a wide variety of file types.
+Extracts facts from a wide variety of file types.
 
 A Rust library that parses binary, archive, document, and source-code
 formats once and surfaces the structural facts as a typed
-`ParsedFile<'a>` with four lazy views: `fileid`, `values`, `strings`,
-`metrics`. Built as the parsing layer for the
+`ParsedFile<'a>` with lazy views: `fileid`, `values`, `strings`,
+`metrics`, `ast`, `sections`, `imports`, `exports`, `functions`, and
+`errors`. Built as the parsing layer for the
 [cleave](https://codeberg.org/atomdrift/cleave) forensic
 static-analysis tool.
 
 ## Design rules
 
-- **No external commands.** Every fact `expose` surfaces is recovered
+- **No external commands.** Every fact `filefacts` surfaces is recovered
   in-process from Rust code. We never shell out to `rizin`,
   `objdump`, `file`, `openssl`, `tar`, `7z`, or any other system
   binary, and we never pull in crates that internally do. Tools that
@@ -21,11 +22,11 @@ static-analysis tool.
   *process spawning*, not about dependency count. If a Rust crate
   parses a format we need (e.g. `lzx`, `flate2`, `cms`, `goblin`),
   pulling it in is fine — it just runs as in-process Rust like the
-  rest of `expose`. The bar for adding one is "is this format
+  rest of `filefacts`. The bar for adding one is "is this format
   worth handling at all?", not "can we avoid the dependency?".
 - **Test coverage target: 85%+ per format.** Every format extractor
   should cover at minimum: the happy path (canonical input, all
-  kv/metrics surfaced), every named metric the extractor emits, at
+  values/metrics surfaced), every named metric the extractor emits, at
   least two malformed / truncated-input cases (no panic, sensible
   degradation), the rejection path (non-format input is silent),
   and any non-obvious decoding quirks (escape sequences, BOMs,
@@ -43,6 +44,6 @@ static-analysis tool.
 
 ## Naming
 
-The project was originally `metaparse` while the schema settled;
-it was renamed `expose` once the kv-tree-as-truth design was
-finalized.
+`filefacts` emits a facts bundle. A bundle contains top-level views.
+`values` is the structural tree view; downstream tools can query that
+tree with value paths.

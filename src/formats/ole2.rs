@@ -147,33 +147,32 @@ pub(super) fn extract(
         );
     }
 
-    // SummaryInformation property set — `office.core.*`. The stream
-    // name is `\x05SummaryInformation` (the SOH-prefix is the CFB
-    // shorthand for a control-character storage). Mirrors the OOXML
-    // `office.core.*` schema so cross-format trait rules work
-    // uniformly.
-    let mut core: serde_json::Map<String, JsonValue> = serde_json::Map::new();
+    // SummaryInformation property set. The stream name is
+    // `\x05SummaryInformation` (the SOH-prefix is the CFB shorthand
+    // for a control-character storage). Emit the same `office.*`
+    // paths as OOXML so rules do not care which container supplied
+    // the property.
+    let mut props: serde_json::Map<String, JsonValue> = serde_json::Map::new();
     if let Ok(mut stream) = comp.open_stream("\x05SummaryInformation") {
         let mut data = Vec::new();
         if stream.read_to_end(&mut data).is_ok() {
-            core = parse_summary_information(&data);
+            props = parse_summary_information(&data);
         }
     }
-    // DocumentSummaryInformation extends the core set with
+    // DocumentSummaryInformation extends the summary set with
     // manager / company / security_flag / hyperlink_base — fields
-    // OOXML carries in `docProps/app.xml`. Mixing them into the same
-    // `office.core.*` object keeps the cross-format trait surface
-    // uniform.
+    // OOXML carries in `docProps/app.xml`.
     if let Ok(mut stream) = comp.open_stream("\x05DocumentSummaryInformation") {
         let mut data = Vec::new();
         if stream.read_to_end(&mut data).is_ok() {
             for (k, v) in parse_document_summary_information(&data) {
-                core.entry(k).or_insert(v);
+                props.entry(k).or_insert(v);
             }
         }
     }
-    if !core.is_empty() {
-        values.insert("office.core", JsonValue::Object(core));
+    for (key, value) in props {
+        let path = format!("office.{key}");
+        values.insert(&path, value);
     }
 
     // CompObj stream — `\x01CompObj` carries the OLE-class identity
@@ -216,7 +215,7 @@ pub(super) fn extract(
 
 /// Parse the `\x05SummaryInformation` property set (MS-OLEPS) and
 /// return a map keyed by the same canonical names the OOXML
-/// extractor uses for `office.core.*`, so trait rules can match
+/// extractor uses for `office.*`, so trait rules can match
 /// either legacy or modern Office uniformly.
 ///
 /// Property layout:
@@ -272,8 +271,8 @@ fn parse_summary_information(data: &[u8]) -> serde_json::Map<String, JsonValue> 
 }
 
 /// Parse the `\x05DocumentSummaryInformation` property set into the
-/// subset of fields that overlap with the OOXML `office.core.*` /
-/// `office.{company, manager}` shape. The full DSI also carries
+/// subset of fields that overlap with the OOXML `office.*` shape.
+/// The full DSI also carries
 /// custom user-defined properties in a second section; we skip those
 /// for now — trait rules that care will get their own slice.
 fn parse_document_summary_information(data: &[u8]) -> serde_json::Map<String, JsonValue> {
@@ -319,7 +318,7 @@ fn parse_document_summary_information(data: &[u8]) -> serde_json::Map<String, Js
 
 /// Read a VT_I4 (signed 32-bit integer) at `(section + offset)`.
 /// Separate from `read_property` because the canonical helper only
-/// surfaces types that flow through OOXML's `office.core.*` schema
+/// surfaces types that flow through OOXML's `office.*` schema
 /// (strings + filetime); DSI counts like `slide_count` need integer
 /// decoding.
 fn read_property_i32(section: &[u8], offset: usize) -> Option<JsonValue> {
@@ -368,7 +367,7 @@ fn locate_first_section(data: &[u8]) -> Option<&[u8]> {
 /// Read a property value at `(section + offset)` and decode it into
 /// JSON. Returns `None` for types we don't surface as core metadata
 /// (thumbnails, BLOBs, integer counts that aren't part of the
-/// `office.core.*` schema).
+/// `office.*` schema).
 fn read_property(section: &[u8], offset: usize) -> Option<JsonValue> {
     if offset + 4 > section.len() {
         return None;
@@ -830,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn surfaces_office_core_from_summary_information() {
+    fn surfaces_office_properties_from_summary_information() {
         let summary = build_summary_info(&[
             (0x02, "Quarterly Report"),
             (0x04, "Alice"),
@@ -842,18 +841,20 @@ mod tests {
             ("/\x05SummaryInformation", &summary),
         ]);
         let (v, _) = run(&cfb);
-        let core = v.get("office.core").and_then(|x| x.as_object()).unwrap();
         assert_eq!(
-            core.get("title").and_then(|x| x.as_str()),
+            v.get("office.title").and_then(|x| x.as_str()),
             Some("Quarterly Report")
         );
-        assert_eq!(core.get("creator").and_then(|x| x.as_str()), Some("Alice"));
         assert_eq!(
-            core.get("last_modified_by").and_then(|x| x.as_str()),
+            v.get("office.creator").and_then(|x| x.as_str()),
+            Some("Alice")
+        );
+        assert_eq!(
+            v.get("office.last_modified_by").and_then(|x| x.as_str()),
             Some("Bob")
         );
         assert_eq!(
-            core.get("application").and_then(|x| x.as_str()),
+            v.get("office.application").and_then(|x| x.as_str()),
             Some("Microsoft Word")
         );
     }
@@ -914,7 +915,7 @@ mod tests {
     }
 
     #[test]
-    fn merges_document_summary_information_into_core() {
+    fn merges_document_summary_information_into_office_properties() {
         let summary = build_summary_info(&[(0x02, "Quarterly Report"), (0x04, "Alice")]);
         let dsi = build_property_set(&[
             (0x10, PropValue::Lpstr("Eve")),      // manager
@@ -928,27 +929,37 @@ mod tests {
             ("/\x05DocumentSummaryInformation", &dsi),
         ]);
         let (v, _) = run(&cfb);
-        let core = v.get("office.core").and_then(|x| x.as_object()).unwrap();
         // From SummaryInformation:
         assert_eq!(
-            core.get("title").and_then(|x| x.as_str()),
+            v.get("office.title").and_then(|x| x.as_str()),
             Some("Quarterly Report")
         );
-        assert_eq!(core.get("creator").and_then(|x| x.as_str()), Some("Alice"));
-        // From DocumentSummaryInformation:
-        assert_eq!(core.get("manager").and_then(|x| x.as_str()), Some("Eve"));
         assert_eq!(
-            core.get("company").and_then(|x| x.as_str()),
+            v.get("office.creator").and_then(|x| x.as_str()),
+            Some("Alice")
+        );
+        // From DocumentSummaryInformation:
+        assert_eq!(
+            v.get("office.manager").and_then(|x| x.as_str()),
+            Some("Eve")
+        );
+        assert_eq!(
+            v.get("office.company").and_then(|x| x.as_str()),
             Some("Acme Inc")
         );
-        assert_eq!(core.get("slide_count").and_then(|x| x.as_i64()), Some(42));
-        assert_eq!(core.get("security_flag").and_then(|x| x.as_i64()), Some(1));
+        assert_eq!(
+            v.get("office.slide_count").and_then(|x| x.as_i64()),
+            Some(42)
+        );
+        assert_eq!(
+            v.get("office.security_flag").and_then(|x| x.as_i64()),
+            Some(1)
+        );
     }
 
     #[test]
-    fn document_summary_alone_still_populates_core() {
-        // No SummaryInformation present — DSI fields should still
-        // land in office.core.
+    fn document_summary_alone_still_populates_office_properties() {
+        // No SummaryInformation present — DSI fields should still land in office.*.
         let dsi = build_property_set(&[
             (0x11, PropValue::Lpstr("Acme Inc")),
             (0x1A, PropValue::Lpstr("https://intranet.acme/docs")),
@@ -958,13 +969,12 @@ mod tests {
             ("/\x05DocumentSummaryInformation", &dsi),
         ]);
         let (v, _) = run(&cfb);
-        let core = v.get("office.core").and_then(|x| x.as_object()).unwrap();
         assert_eq!(
-            core.get("company").and_then(|x| x.as_str()),
+            v.get("office.company").and_then(|x| x.as_str()),
             Some("Acme Inc")
         );
         assert_eq!(
-            core.get("hyperlink_base").and_then(|x| x.as_str()),
+            v.get("office.hyperlink_base").and_then(|x| x.as_str()),
             Some("https://intranet.acme/docs")
         );
     }

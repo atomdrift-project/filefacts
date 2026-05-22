@@ -30,6 +30,6 @@ fn enabled() -> bool {
 /// ```
 pub(crate) fn log(args: fmt::Arguments<'_>) {
     if enabled() {
-        eprintln!("expose: {args}");
+        eprintln!("filefacts: {args}");
     }
 }

@@ -11,6 +11,11 @@ use serde_json::{Map, Value as JsonValue};
 /// root) so the same data prints, serialises, and navigates uniformly
 /// across every supported format.
 ///
+/// Typed fact families are deliberately not mirrored here: strings, sections,
+/// imports, exports, functions, AST projections, and recoverable parse
+/// errors have their own views. Values is for residual format structure and
+/// derived format-specific facts that do not yet have a typed home.
+///
 /// Keys are format-conventional. A PE file's machine type lives at
 /// `pe.coff.machine`. An ELF's needed-library list lives at
 /// `elf.dynamic.needed[]`. A JSON manifest's parsed content is exposed
@@ -21,7 +26,7 @@ use serde_json::{Map, Value as JsonValue};
 ///
 /// ```
 /// # use serde_json::json;
-/// # use expose::Values;
+/// # use filefacts::Values;
 /// let mut v = Values::new();
 /// v.insert("pe.coff.machine", json!("x86_64"));
 /// v.insert("pe.coff.timestamp_unix", json!(1_700_000_000_i64));
@@ -180,8 +185,8 @@ mod tests {
     #[test]
     fn insert_and_get_top_level() {
         let mut v = Values::new();
-        v.insert("name", json!("expose"));
-        assert_eq!(v.get("name").and_then(|x| x.as_str()), Some("expose"));
+        v.insert("name", json!("filefacts"));
+        assert_eq!(v.get("name").and_then(|x| x.as_str()), Some("filefacts"));
     }
 
     #[test]

@@ -76,7 +76,7 @@ mod tests {
         );
     }
 
-    /// `extract` is the very first pass in expose's pipeline — any
+    /// `extract` is the very first pass in filefacts' pipeline — any
     /// panic here would abort the whole extraction. Adversarial
     /// inputs (extreme sizes, weird byte patterns) must be handled
     /// without crashing.

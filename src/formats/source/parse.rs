@@ -1,7 +1,7 @@
 //! Shared tree-sitter parse cache.
 //!
-//! Built lazily on first need (by any of `values`, `strings`, `ast`),
-//! shared across all source-driven views of the same `ParsedFile`.
+//! Built lazily on first source-driven extraction and shared across
+//! every source-derived view of the same `ParsedFile`.
 //!
 //! The cache owns the [`tree_sitter::Tree`] and a borrowed reference to
 //! the source bytes (as a `&str`); the tree-sitter API references the

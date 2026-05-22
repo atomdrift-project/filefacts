@@ -1,11 +1,10 @@
 //! Per-format extractors.
 //!
 //! Each module here owns the extraction logic for one format family. The
-//! contract is the same across all of them: take the source bytes, fill
-//! [`Values`], [`Strings`], and [`Metrics`] views with format-conventional
-//! keys and values. Extractors must never read from the filesystem and
-//! must never panic on malformed input — return [`crate::Error::Malformed`]
-//! instead.
+//! contract is the same across all of them: take the source bytes and fill
+//! the public output views with format-conventional facts. Extractors must
+//! never read from the filesystem and must never panic on malformed input —
+//! return [`crate::Error::Malformed`] instead.
 //!
 //! Dispatch to the right extractor happens in [`extract`], keyed off the
 //! [`FileType`] produced by [`crate::fileid`].
@@ -24,7 +23,9 @@ mod chm;
 mod class;
 mod common;
 mod elf;
+mod elf_hashes;
 mod generic;
+mod go_buildinfo;
 mod goblin_safe;
 mod image_stats;
 mod jar;
@@ -32,6 +33,7 @@ mod jpeg;
 mod lnk;
 mod macho;
 mod macho_code_signature;
+mod macho_hashes;
 mod ole2;
 mod ooxml;
 mod pdf;
@@ -50,13 +52,14 @@ mod rtf;
 pub(crate) mod source;
 mod structured;
 mod tar;
+mod upx;
 mod vba;
 pub(crate) mod vba_symbols;
 mod vsix;
 mod zip;
 
 /// Drive the right extractor for `file_type` and merge its output into
-/// the three views. Unsupported types fall through to [`generic::extract`]
+/// the public views. Unsupported types fall through to [`generic::extract`]
 /// (which still records `file.size_bytes` and Shannon entropy).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn extract(
@@ -145,7 +148,7 @@ pub(crate) fn extract(
 
         // Source-code extraction is delegated to the source dispatcher,
         // which routes to the appropriate tree-sitter grammar. Languages
-        // expose doesn't yet support fall through to `extract_text_only`
+        // filefacts doesn't yet support fall through to `extract_text_only`
         // below so they still get language-agnostic `text.*` metrics.
         FileType::JavaScript
         | FileType::TypeScript
@@ -167,7 +170,7 @@ pub(crate) fn extract(
             bytes, file_type, tree_cache, values, strings, metrics, imports, functions,
         ),
 
-        // Text-like languages without a tree-sitter binding in expose.
+        // Text-like languages without a tree-sitter binding in filefacts.
         // They still earn `text.*` metrics — pure byte/line analysis,
         // no AST required.
         FileType::Vbs

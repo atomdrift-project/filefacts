@@ -3,11 +3,11 @@
 //! Walks the entire tree once and emits, in source order:
 //!
 //! - every call site (`ast.calls[]`),
-//! - the sorted-unique set of static call targets (`ast.call_targets[]`),
+//! - the sorted-unique set of static call targets (`ast.targets[]`),
 //! - the sorted-unique set of dotted member-access chains
-//!   (`ast.member_chains[]`),
+//!   (`ast.members[]`),
 //! - the per-target list of string-literal arguments
-//!   (`ast.call_string_args`).
+//!   (`ast.call_strings`).
 //!
 //! While walking we also tally numeric features into the caller's
 //! [`Metrics`] map. Counts and depths live there, not on the `Ast`
@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use tree_sitter::Node;
 
-use crate::output::{ArgShape, Ast, Call, Metrics};
+use crate::output::{ArgShape, Assignment, Ast, Call, Metrics};
 
 use super::langs::LangConfig;
 
@@ -47,25 +47,23 @@ pub(super) fn walk(
 
     let ast = Ast {
         calls: state.calls,
-        call_targets: unique_targets.into_iter().collect(),
-        member_chains: state.member_chains.into_iter().collect(),
-        call_string_args: state
+        targets: unique_targets.into_iter().collect(),
+        members: state.members.into_iter().collect(),
+        call_strings: state
             .literal_args
             .into_iter()
             .map(|(k, v)| (k, v.into_iter().collect::<Vec<_>>()))
             .collect(),
+        binds: state.binds,
     };
 
     metrics.insert("ast.node_count", state.node_count as f64);
     metrics.insert("ast.max_depth", f64::from(state.max_depth));
     metrics.insert("ast.call_count", ast.calls.len() as f64);
-    metrics.insert(
-        "ast.unique_call_target_count",
-        ast.call_targets.len() as f64,
-    );
+    metrics.insert("ast.target_count", ast.targets.len() as f64);
     if state.max_member_chain_depth > 0 {
         metrics.insert(
-            "ast.member_chain_max_depth",
+            "ast.member_depth_max",
             f64::from(state.max_member_chain_depth),
         );
     }
@@ -81,6 +79,13 @@ pub(super) fn walk(
             f64::from(state.max_array_literal_length),
         );
     }
+    if !ast.binds.is_empty() {
+        metrics.insert("ast.bind_count", ast.binds.len() as f64);
+        let string_binds = ast.binds.iter().filter(|a| a.string.is_some()).count();
+        if string_binds > 0 {
+            metrics.insert("ast.string_bind_count", string_binds as f64);
+        }
+    }
 
     ast
 }
@@ -88,8 +93,10 @@ pub(super) fn walk(
 #[derive(Default)]
 struct State {
     calls: Vec<Call>,
-    member_chains: BTreeSet<String>,
+    binds: Vec<Assignment>,
+    members: BTreeSet<String>,
     literal_args: BTreeMap<String, BTreeSet<String>>,
+    scopes: Vec<&'static str>,
     node_count: u64,
     max_depth: u32,
     max_member_chain_depth: u32,
@@ -104,6 +111,16 @@ impl State {
             self.max_depth = depth;
         }
 
+        let pushed_scope = if is_class_scope(node.kind(), config.name) {
+            self.scopes.push("class");
+            true
+        } else if is_function_scope(node.kind()) {
+            self.scopes.push("function");
+            true
+        } else {
+            false
+        };
+
         // Member chains we treat as a property of the *outermost* member
         // expression in a chain — descending into nested member nodes
         // would duplicate the chain prefix. The walker is therefore
@@ -115,7 +132,7 @@ impl State {
                 if depth_n > self.max_member_chain_depth {
                     self.max_member_chain_depth = depth_n;
                 }
-                self.member_chains.insert(chain);
+                self.members.insert(chain);
             }
             // Continue walking children so we still find string
             // literals, call expressions, etc. inside member chains —
@@ -125,6 +142,10 @@ impl State {
 
         if config.call_kinds.contains(&node.kind()) {
             self.record_call(node, source, config);
+        }
+
+        if is_assignment_kind(node.kind()) {
+            self.record_assignment(node, source, config);
         }
 
         if config.array_kinds.contains(&node.kind()) {
@@ -150,6 +171,10 @@ impl State {
         for child in node.children(&mut cursor) {
             self.walk_node(child, source, config, depth + 1);
         }
+
+        if pushed_scope {
+            self.scopes.pop();
+        }
     }
 
     fn record_call(&mut self, node: Node<'_>, source: &str, config: &LangConfig) {
@@ -159,18 +184,26 @@ impl State {
         let args_node = node.child_by_field_name(config.arguments_field);
 
         let target = callee.and_then(|c| static_dotted_chain(c, source, config));
+        if config.name == "bash" && target.as_deref().is_some_and(|t| t.starts_with('-')) {
+            return;
+        }
 
         let mut shapes: Vec<ArgShape> = Vec::new();
         let mut literal_strings: Vec<String> = Vec::new();
-        if let Some(args) = args_node {
+        if config.arguments_field == "argument" {
+            let mut cursor = node.walk();
+            for arg in node.children_by_field_name(config.arguments_field, &mut cursor) {
+                shapes.push(arg_shape(arg, config));
+                collect_string_literals(arg, source, config, &mut literal_strings);
+            }
+        } else if let Some(args) = args_node {
             let mut cursor = args.walk();
             for arg in args.named_children(&mut cursor) {
-                shapes.push(arg_shape(arg, config));
-                if config.string_kinds.contains(&arg.kind()) {
-                    if let Some(text) = decode_string_literal(arg, source) {
-                        literal_strings.push(text);
-                    }
+                if arg.kind() == "command_argument_sep" {
+                    continue;
                 }
+                shapes.push(arg_shape(arg, config));
+                collect_string_literals(arg, source, config, &mut literal_strings);
             }
         }
 
@@ -186,6 +219,30 @@ impl State {
         self.calls.push(Call {
             target,
             args: shapes,
+        });
+    }
+
+    fn record_assignment(&mut self, node: Node<'_>, source: &str, config: &LangConfig) {
+        let Some(target_node) = assignment_target(node) else {
+            return;
+        };
+        let Some(value_node) = assignment_value(node) else {
+            return;
+        };
+        let Some(target) = static_dotted_chain(target_node, source, config) else {
+            return;
+        };
+        let string = if config.string_kinds.contains(&value_node.kind()) {
+            decode_string_literal(value_node, source)
+        } else {
+            None
+        };
+        self.binds.push(Assignment {
+            target,
+            scope: self.scopes.last().copied().unwrap_or("module"),
+            shape: arg_shape(value_node, config),
+            string,
+            offset: target_node.start_byte() as u64,
         });
     }
 }
@@ -235,7 +292,98 @@ fn static_dotted_chain(node: Node<'_>, source: &str, config: &LangConfig) -> Opt
         }
         return Some(format!("{object_path}.{prop_text}"));
     }
+    if config.call_kinds.contains(&node.kind()) {
+        let callee = node
+            .child_by_field_name(config.callee_field)
+            .or_else(|| first_named_child(node))?;
+        let target = static_dotted_chain(callee, source, config)?;
+        return Some(format!("{target}()"));
+    }
     None
+}
+
+fn collect_string_literals(
+    node: Node<'_>,
+    source: &str,
+    config: &LangConfig,
+    out: &mut Vec<String>,
+) {
+    if config.string_kinds.contains(&node.kind()) {
+        if let Some(text) = decode_string_literal(node, source) {
+            out.push(text);
+        }
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if config.function_kinds.contains(&child.kind())
+            || config.call_kinds.contains(&child.kind())
+        {
+            continue;
+        }
+        collect_string_literals(child, source, config, out);
+    }
+}
+
+fn is_assignment_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "assignment"
+            | "assignment_expression"
+            | "augmented_assignment"
+            | "assignment_statement"
+            | "variable_declarator"
+            | "variable_assignment"
+            | "operator_assignment"
+            | "global_variable"
+    )
+}
+
+fn assignment_target(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("left")
+        .or_else(|| node.child_by_field_name("name"))
+        .or_else(|| node.child_by_field_name("pattern"))
+        .or_else(|| node.child_by_field_name("variable"))
+}
+
+fn assignment_value(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("right")
+        .or_else(|| node.child_by_field_name("value"))
+}
+
+fn is_function_scope(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_definition"
+            | "function_declaration"
+            | "generator_function_declaration"
+            | "method_definition"
+            | "method_declaration"
+            | "constructor_declaration"
+            | "function_expression"
+            | "arrow_function"
+            | "lambda"
+            | "method"
+            | "singleton_method"
+            | "function_statement"
+    )
+}
+
+fn is_class_scope(kind: &str, language: &str) -> bool {
+    if kind == "module" {
+        return language == "ruby";
+    }
+    matches!(
+        kind,
+        "class_definition"
+            | "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "class"
+            | "class_statement"
+    )
 }
 
 fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {

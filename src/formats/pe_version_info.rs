@@ -65,7 +65,7 @@ fn string_table(strings: &StringFileInfo<'_>, values: &mut Values) {
     // `Legal` prefix on copyright/trademarks). The Win32 SDK key
     // names are documented as canonical PascalCase (CompanyName etc.);
     // we honour the *concepts* but keep the path style consistent with
-    // the rest of expose.
+    // the rest of filefacts.
     if let Some(v) = strings.company_name() {
         put_str(values, "pe.version.company", v);
     }

@@ -8,10 +8,11 @@
 //! The schema follows the names PE-the-format gives its own fields,
 //! lightly snake-cased. `IMAGE_FILE_HEADER.Machine` becomes
 //! `pe.coff.machine`; `IMAGE_OPTIONAL_HEADER.Subsystem` becomes
-//! `pe.optional.subsystem`; the IAT is exposed as `pe.imports[]`.
+//! `pe.optional.subsystem`. Symbol tables live in the typed imports /
+//! exports views rather than being mirrored into `values`.
 
 use goblin::pe::{header::CoffHeader, optional_header::OptionalHeader, PE};
-use serde_json::{json, Value as JsonValue};
+use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::{
@@ -127,9 +128,11 @@ pub(super) fn extract(
             super::pe_debug::extract(dbg, values);
         }
         bound_imports_with_metrics(&pe, bytes, values, metrics);
+        delay_imports(&pe, bytes, values, metrics, imports_out);
+        base_relocations(&pe, bytes, values, metrics);
         tls_callbacks(&pe, values, metrics);
         inflated_sections(&pe, values);
-        load_config(&pe, values);
+        load_config(&pe, bytes, values, metrics);
         entry_and_overlay(&pe, bytes, values, metrics);
         section_anomalies(&pe, bytes, values, metrics);
         dos_stub_anomalies(&pe, bytes, metrics);
@@ -139,6 +142,8 @@ pub(super) fn extract(
         data_directories(&pe, values);
         super::pe_image_hash::extract(&pe, bytes, values, metrics);
         super::pe_rich::extract(bytes, values);
+        super::upx::detect(bytes, values);
+        super::go_buildinfo::detect(bytes, values, "pe");
         super::build_toolchain::from_pe_rich(values);
         rizin_fallback_with_sections(
             bytes,
@@ -312,22 +317,12 @@ fn binary_flags(opt: &OptionalHeader, metrics: &mut Metrics) {
     metrics.insert("binary.is_pie", f64::from(u8::from(is_pie)));
 }
 
-fn sections(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics, sections_out: &mut Vec<Section>) {
-    for (idx, section) in pe.sections.iter().enumerate() {
+fn sections(pe: &PE<'_>, bytes: &[u8], _metrics: &mut Metrics, sections_out: &mut Vec<Section>) {
+    for section in &pe.sections {
         let name = section.name().unwrap_or("").to_owned();
         let file_offset = u64::from(section.pointer_to_raw_data);
         let file_size = u64::from(section.size_of_raw_data);
-        if file_size > 0 {
-            let e = section_entropy(bytes, file_offset, file_size);
-            metrics.insert(format!("sections[{idx}].entropy"), e);
-        }
-        // Raw IMAGE_SCN_* characteristics bitmask — emitted positionally
-        // so downstream consumers can reconstruct the typed u32 without
-        // a reverse-lookup over the string-flag projection.
-        metrics.insert(
-            format!("sections[{idx}].characteristics"),
-            f64::from(section.characteristics),
-        );
+        let entropy = (file_size > 0).then(|| section_entropy(bytes, file_offset, file_size));
         sections_out.push(Section {
             name,
             vaddr: u64::from(section.virtual_address),
@@ -338,6 +333,8 @@ fn sections(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics, sections_out: &mut
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            flags_raw: Some(u64::from(section.characteristics)),
+            entropy,
         });
     }
 }
@@ -430,20 +427,10 @@ fn imports(
             },
         });
     }
-    let arr: Vec<JsonValue> = by_dll
-        .into_iter()
-        .map(|(dll, functions)| {
-            json!({
-                "library": dll,
-                "functions": functions,
-            })
-        })
-        .collect();
     // Total import-symbol count flows through cross-format `imports.count`.
     // DLL dependencies (the libraries imports are bound to) flow through
     // cross-format `dependencies.count`.
-    metrics.insert("dependencies.count", arr.len() as f64);
-    values.insert("pe.imports", JsonValue::Array(arr));
+    metrics.insert("dependencies.count", by_dll.len() as f64);
 
     if let Some(hash) = imphash(pe) {
         put_str(values, "pe.imphash", hash);
@@ -456,11 +443,6 @@ fn exports(
     metrics: &mut Metrics,
     exports_out: &mut crate::Exports,
 ) {
-    let names: Vec<JsonValue> = pe
-        .exports
-        .iter()
-        .filter_map(|e| e.name.map(|n| JsonValue::String(n.to_string())))
-        .collect();
     let mut forwarded_count: u32 = 0;
     for exp in &pe.exports {
         let Some(name) = exp.name else { continue };
@@ -511,7 +493,6 @@ fn exports(
             put_i64(values, "pe.export_timestamp", i64::from(ts));
         }
     }
-    values.insert("pe.exports", JsonValue::Array(names));
 }
 
 /// Authenticode lookup using only the parsed header — used when the
@@ -1323,8 +1304,14 @@ fn checksum(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
     }
     let computed = pe_checksum(bytes, checksum_offset);
     metrics.insert("pe.computed_checksum", f64::from(computed));
-    if stored != 0 {
-        metrics.insert("pe.checksum_valid", f64::from(u8::from(stored == computed)));
+    // Emit `pe.checksum_valid` unconditionally — a `stored == 0`
+    // value is itself a forensic signal (linker option `/RELEASE`
+    // omitted, or post-build stripper / packer cleared the field).
+    // `computed != 0` for any non-trivial binary, so `stored == 0`
+    // reliably trips this comparison to `0.0`.
+    metrics.insert("pe.checksum_valid", f64::from(u8::from(stored == computed)));
+    if stored == 0 {
+        metrics.insert("pe.checksum_stripped", 1.0);
     }
 }
 
@@ -1391,47 +1378,141 @@ fn inflated_sections(pe: &PE<'_>, values: &mut Values) {
     }
 }
 
-/// Decompose the Load Configuration Directory's `guard_flags` field
-/// into the named `IMAGE_GUARD_*` bits. These flags describe how
-/// Control Flow Guard / Return Flow Guard hardening was wired up at
-/// link time; analysts use them to distinguish compiler-enforced
-/// indirect-call protection from binaries that opted out.
-fn load_config(pe: &PE<'_>, values: &mut Values) {
-    let Some(lc) = pe.load_config_data.as_ref() else {
+/// Parse the IMAGE_LOAD_CONFIG_DIRECTORY structure using the `Size`
+/// field embedded at offset 0 — Microsoft's spec says this is the
+/// authoritative size, not the data-directory entry's `Size` field.
+/// goblin's parser slices to `dd.size` and silently drops every field
+/// past it, which on modern binaries truncates the parse before
+/// `GuardFlags` (the CFG / mitigation status indicator).
+///
+/// Surfaces the security-cookie, the SafeSEH table, the full CFG /
+/// Return Flow Guard / XFG pointer set, and a decoded
+/// `IMAGE_GUARD_*` flag-name array. Field absence (`None`) is
+/// preserved by omitting the key, so trait authors can distinguish
+/// "field present and zero" (a cleared-cookie tampering tell) from
+/// "field not in this binary's load_config".
+fn load_config(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
+    use goblin::pe::optional_header::MAGIC_64;
+    let Some(opt) = pe.header.optional_header.as_ref() else {
         return;
     };
-    let dir = &lc.directory;
+    let Some(dd) = opt.data_directories.get_load_config_table() else {
+        return;
+    };
+    if dd.virtual_address == 0 {
+        return;
+    }
+    let Some(start) = rva_to_file_offset(pe, dd.virtual_address) else {
+        return;
+    };
+    if start + 4 > bytes.len() {
+        return;
+    }
+    let embedded_size = u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()) as usize;
+    if embedded_size < 4 {
+        return;
+    }
+    let end = start.saturating_add(embedded_size).min(bytes.len());
+    let slice = &bytes[start..end];
+    let is_64 = matches!(opt.standard_fields.magic, MAGIC_64);
     let mut obj = serde_json::Map::new();
-    // Raw numeric fields land under canonical names. Each is Option<u64>
-    // in goblin — skip when None rather than emitting a zero, so trait
-    // authors can use `exists:` to discriminate "PE has a Load Config
-    // directory but no security_cookie field" from "field present and
-    // zero" (the latter is its own tampering signal: cleared cookie).
-    if let Some(v) = dir.security_cookie {
-        obj.insert("security_cookie".into(), JsonValue::Number(v.into()));
-    }
-    if let Some(v) = dir.guard_cf_check_function_pointer {
-        obj.insert(
-            "guard_cf_check_function_pointer".into(),
-            JsonValue::Number(v.into()),
-        );
-    }
-    if let Some(v) = dir.guard_cf_function_table {
-        obj.insert(
-            "guard_cf_function_table".into(),
-            JsonValue::Number(v.into()),
-        );
-    }
-    if let Some(v) = dir.guard_cf_function_count {
-        obj.insert(
-            "guard_cf_function_count".into(),
-            JsonValue::Number(v.into()),
-        );
-    }
-    if let Some(flags) = dir.guard_flags {
-        // Both forms: raw u32 (for round-trip parity with goblin's
-        // typed bitmask) and a string-flag array (for human-readable
-        // trait matches against `cf_instrumented` / `cfw_instrumented`).
+    obj.insert("size".into(), JsonValue::Number(embedded_size.into()));
+
+    let read_u32 = |off: usize| -> Option<u32> {
+        slice
+            .get(off..off + 4)
+            .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+    };
+    let read_u64 = |off: usize| -> Option<u64> {
+        slice
+            .get(off..off + 8)
+            .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+    };
+    let read_ptr = |off: usize| -> Option<u64> {
+        if is_64 {
+            read_u64(off)
+        } else {
+            read_u32(off).map(u64::from)
+        }
+    };
+
+    // Field offsets per IMAGE_LOAD_CONFIG_DIRECTORY{32,64} from winnt.h.
+    // Pre-cookie fields (TimeDateStamp, GlobalFlags, *Threshold, etc.)
+    // are rarely forensically interesting and bloat the surface — we
+    // skip straight to the security/mitigation-relevant block.
+    let (
+        sec_cookie,
+        seh_table,
+        seh_count,
+        cf_check,
+        cf_dispatch,
+        cf_table,
+        cf_count,
+        guard_flags_off,
+        taken_iat_table,
+        taken_iat_count,
+        longjmp_table,
+        longjmp_count,
+    ) = if is_64 {
+        (
+            0x58, 0x60, 0x68, 0x70, 0x78, 0x80, 0x88, 0x90, 0xA0, 0xA8, 0xB0, 0xB8,
+        )
+    } else {
+        (
+            0x3C, 0x40, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x68, 0x6C, 0x70, 0x74,
+        )
+    };
+
+    let put_ptr =
+        |obj: &mut serde_json::Map<String, JsonValue>, key: &str, off: usize, allow_zero: bool| {
+            if let Some(v) = read_ptr(off) {
+                if v != 0 || allow_zero {
+                    obj.insert(key.into(), JsonValue::Number(v.into()));
+                }
+            }
+        };
+    put_ptr(&mut obj, "security_cookie", sec_cookie, true);
+    put_ptr(&mut obj, "se_handler_table", seh_table, false);
+    put_ptr(&mut obj, "se_handler_count", seh_count, false);
+    put_ptr(&mut obj, "guard_cf_check_function_pointer", cf_check, false);
+    put_ptr(
+        &mut obj,
+        "guard_cf_dispatch_function_pointer",
+        cf_dispatch,
+        false,
+    );
+    put_ptr(&mut obj, "guard_cf_function_table", cf_table, false);
+    put_ptr(&mut obj, "guard_cf_function_count", cf_count, false);
+    put_ptr(
+        &mut obj,
+        "guard_address_taken_iat_entry_table",
+        taken_iat_table,
+        false,
+    );
+    put_ptr(
+        &mut obj,
+        "guard_address_taken_iat_entry_count",
+        taken_iat_count,
+        false,
+    );
+    put_ptr(
+        &mut obj,
+        "guard_long_jump_target_table",
+        longjmp_table,
+        false,
+    );
+    put_ptr(
+        &mut obj,
+        "guard_long_jump_target_count",
+        longjmp_count,
+        false,
+    );
+
+    if let Some(flags) = read_u32(guard_flags_off) {
+        // Both forms — raw u32 for round-trip and a string-flag array
+        // for human-readable trait matches against `cf_instrumented`
+        // / `cfw_instrumented`. Zero is still emitted; "no flags set"
+        // is itself a meaningful signal ("CFG was not wired up").
         obj.insert("guard_flags_raw".into(), JsonValue::Number(flags.into()));
         let names = guard_flag_names(flags);
         if !names.is_empty() {
@@ -1445,9 +1526,258 @@ fn load_config(pe: &PE<'_>, values: &mut Values) {
                 ),
             );
         }
+        // Cross-format mitigation summary metrics — boolean-valued for
+        // easy trait composition.
+        let cf_on = flags & 0x0000_0100 != 0;
+        metrics.insert("pe.has_cfg", f64::from(u8::from(cf_on)));
     }
-    if !obj.is_empty() {
-        values.insert("pe.load_config", JsonValue::Object(obj));
+    if read_ptr(seh_table).unwrap_or(0) != 0 && read_ptr(seh_count).unwrap_or(0) != 0 {
+        metrics.insert("pe.has_safe_seh", 1.0);
+    }
+
+    values.insert("pe.load_config", JsonValue::Object(obj));
+}
+
+/// IMAGE_DELAYLOAD_DESCRIPTOR table walker. Delay-load imports are
+/// resolved on first call rather than at process startup, so they
+/// don't appear in the regular IAT / Import Directory — pefile sees
+/// them via `DIRECTORY_ENTRY_DELAY_IMPORT`. They are forensically
+/// important: evasive malware moves anti-analysis APIs
+/// (`IsDebuggerPresent`, `CheckRemoteDebuggerPresent`,
+/// `VirtualProtect` for code-patching, network primitives) into the
+/// delay-load table so a static IAT scan misses them.
+///
+/// Emits `pe.delay_imports[]` (one descriptor per DLL with timestamp,
+/// rva_based flag, and import count) and pushes each resolved symbol
+/// into the typed [`Imports`] view with `source: "pe-delay"` so the
+/// flattened import set matches what `dumpbin /dependents` would show.
+fn delay_imports(
+    pe: &PE<'_>,
+    bytes: &[u8],
+    values: &mut Values,
+    metrics: &mut Metrics,
+    imports_out: &mut crate::Imports,
+) {
+    use goblin::pe::optional_header::MAGIC_64;
+    let Some(opt) = pe.header.optional_header.as_ref() else {
+        return;
+    };
+    let Some(dd) = opt.data_directories.get_delay_import_descriptor() else {
+        return;
+    };
+    if dd.virtual_address == 0 || dd.size == 0 {
+        return;
+    }
+    let Some(table_off) = rva_to_file_offset(pe, dd.virtual_address) else {
+        return;
+    };
+    let is_64 = matches!(opt.standard_fields.magic, MAGIC_64);
+    let ptr_size = if is_64 { 8 } else { 4 };
+    let image_base = opt.windows_fields.image_base;
+    const DESC_SIZE: usize = 32; // IMAGE_DELAYLOAD_DESCRIPTOR is 8 DWORDs
+    const MAX_DESCRIPTORS: usize = 128;
+    const MAX_FUNCTIONS_PER_DLL: usize = 4096;
+
+    let mut entries_out: Vec<JsonValue> = Vec::new();
+    let mut total_imports = 0_u64;
+    let mut cursor = table_off;
+    let mut desc_idx = 0;
+    while desc_idx < MAX_DESCRIPTORS && cursor + DESC_SIZE <= bytes.len() {
+        let attrs = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+        let name_va = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap());
+        // Skip ModuleHandle (offset 8) — runtime cache, no forensic value.
+        let _iat_va = u32::from_le_bytes(bytes[cursor + 12..cursor + 16].try_into().unwrap());
+        let int_va = u32::from_le_bytes(bytes[cursor + 16..cursor + 20].try_into().unwrap());
+        // BoundIAT, UnloadIAT — also runtime caches.
+        let timestamp = u32::from_le_bytes(bytes[cursor + 28..cursor + 32].try_into().unwrap());
+        cursor += DESC_SIZE;
+        desc_idx += 1;
+
+        if attrs == 0 && name_va == 0 && int_va == 0 {
+            break; // all-zero descriptor terminates the list
+        }
+        // Attributes bit 0 (`RvaBased`) tells us whether `name`/`iat`/`int`
+        // are RVAs (modern linkers) or absolute VAs (legacy / VC6 era).
+        let rva_based = attrs & 1 != 0;
+        let to_rva = |v: u32| -> u32 {
+            if rva_based {
+                v
+            } else {
+                v.saturating_sub(image_base as u32)
+            }
+        };
+
+        let dll = read_cstring_at_rva(pe, bytes, to_rva(name_va));
+        if dll.is_empty() {
+            continue;
+        }
+        let lib_lower = dll.to_ascii_lowercase();
+        let library = strip_lib_ext(&lib_lower).to_string();
+
+        // Walk the Import Name Table — array of pointer-sized entries.
+        // High bit = ordinal-only (low 16 bits is the ordinal); else
+        // RVA pointing at an IMAGE_IMPORT_BY_NAME { hint:WORD, name:cstr }.
+        let mut function_count = 0_u64;
+        if let Some(mut int_off) = rva_to_file_offset(pe, to_rva(int_va)) {
+            let ordinal_mask: u64 = if is_64 {
+                0x8000_0000_0000_0000
+            } else {
+                0x8000_0000
+            };
+            for _ in 0..MAX_FUNCTIONS_PER_DLL {
+                if int_off + ptr_size > bytes.len() {
+                    break;
+                }
+                let entry = if is_64 {
+                    u64::from_le_bytes(bytes[int_off..int_off + 8].try_into().unwrap())
+                } else {
+                    u64::from(u32::from_le_bytes(
+                        bytes[int_off..int_off + 4].try_into().unwrap(),
+                    ))
+                };
+                int_off += ptr_size;
+                if entry == 0 {
+                    break;
+                }
+                if entry & ordinal_mask != 0 {
+                    let ordinal = (entry & 0xFFFF) as u32;
+                    imports_out.push(crate::Import {
+                        name: format!("ORDINAL {ordinal}"),
+                        library: Some(library.clone()),
+                        source: "pe-delay",
+                        offset: None,
+                        ordinal: Some(ordinal),
+                    });
+                } else {
+                    let name = read_hint_name(pe, bytes, entry as u32);
+                    if !name.is_empty() {
+                        imports_out.push(crate::Import {
+                            name,
+                            library: Some(library.clone()),
+                            source: "pe-delay",
+                            offset: None,
+                            ordinal: None,
+                        });
+                    }
+                }
+                function_count += 1;
+            }
+        }
+        total_imports = total_imports.saturating_add(function_count);
+
+        entries_out.push(serde_json::json!({
+            "dll": dll,
+            "rva_based": rva_based,
+            "time_date_stamp": timestamp,
+            "import_count": function_count,
+        }));
+    }
+
+    if !entries_out.is_empty() {
+        values.insert("pe.delay_imports", JsonValue::Array(entries_out));
+        metrics.insert("pe.delay_import_count", total_imports as f64);
+    }
+}
+
+/// Read a NUL-terminated C string at the given RVA. Returns an empty
+/// string if the RVA doesn't map into any section or the bytes aren't
+/// UTF-8 (DLL names and function names are ASCII by spec).
+fn read_cstring_at_rva(pe: &PE<'_>, bytes: &[u8], rva: u32) -> String {
+    let Some(off) = rva_to_file_offset(pe, rva) else {
+        return String::new();
+    };
+    let cap = bytes.len().min(off.saturating_add(512));
+    if off >= cap {
+        return String::new();
+    }
+    let tail = &bytes[off..cap];
+    let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+    std::str::from_utf8(&tail[..end]).unwrap_or("").to_string()
+}
+
+/// Read an IMAGE_IMPORT_BY_NAME { hint: WORD, name: CSTR } at the
+/// given RVA, returning just the name (the hint is a linker artefact
+/// not forensically interesting).
+fn read_hint_name(pe: &PE<'_>, bytes: &[u8], rva: u32) -> String {
+    let Some(off) = rva_to_file_offset(pe, rva) else {
+        return String::new();
+    };
+    if off + 2 >= bytes.len() {
+        return String::new();
+    }
+    read_cstring_at_rva_inner(bytes, off + 2)
+}
+
+fn read_cstring_at_rva_inner(bytes: &[u8], off: usize) -> String {
+    let cap = bytes.len().min(off.saturating_add(512));
+    if off >= cap {
+        return String::new();
+    }
+    let tail = &bytes[off..cap];
+    let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+    std::str::from_utf8(&tail[..end]).unwrap_or("").to_string()
+}
+
+/// Walk the base-relocation directory (data dir index 5) and count
+/// the relocation entries. ASLR-aware binaries carry a populated
+/// relocation table; packed / hand-rolled binaries often strip or
+/// truncate it. The block structure is a sequence of
+/// `IMAGE_BASE_RELOCATION { page_rva: DWORD, block_size: DWORD }`
+/// each followed by `(block_size-8)/2` WORD entries (4-bit type +
+/// 12-bit offset).
+fn base_relocations(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
+    let Some(opt) = pe.header.optional_header.as_ref() else {
+        return;
+    };
+    let Some(dd) = opt.data_directories.get_base_relocation_table() else {
+        return;
+    };
+    if dd.virtual_address == 0 || dd.size == 0 {
+        return;
+    }
+    let Some(start) = rva_to_file_offset(pe, dd.virtual_address) else {
+        return;
+    };
+    let end = start.saturating_add(dd.size as usize).min(bytes.len());
+    let mut cursor = start;
+    let mut block_count = 0_u64;
+    let mut entry_count = 0_u64;
+    let mut absolute_count = 0_u64; // type 0 — pure padding, no real reloc
+    while cursor + 8 <= end {
+        let _page_rva = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+        let block_size =
+            u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+        if block_size < 8 || cursor + block_size > end {
+            break;
+        }
+        block_count += 1;
+        let entries = (block_size - 8) / 2;
+        for i in 0..entries {
+            let off = cursor + 8 + i * 2;
+            if off + 2 > end {
+                break;
+            }
+            let word = u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap());
+            let kind = word >> 12;
+            if kind == 0 {
+                absolute_count += 1;
+            } else {
+                entry_count += 1;
+            }
+        }
+        cursor += block_size;
+    }
+    if block_count > 0 {
+        values.insert(
+            "pe.base_relocations",
+            serde_json::json!({
+                "block_count": block_count,
+                "entry_count": entry_count,
+                "padding_count": absolute_count,
+            }),
+        );
+        metrics.insert("pe.base_relocation_block_count", block_count as f64);
+        metrics.insert("pe.base_relocation_entry_count", entry_count as f64);
     }
 }
 
@@ -1480,14 +1810,32 @@ fn guard_flag_names(flags: u32) -> Vec<&'static str> {
     if flags & 0x0008_0000 != 0 {
         out.push("enable_export_suppression");
     }
-    if flags & 0x0010_0000 != 0 {
+    if flags & 0x0001_0000 != 0 {
         out.push("longjump_table_present");
     }
-    if flags & 0x4000_0000 != 0 {
+    if flags & 0x0002_0000 != 0 {
         out.push("rf_instrumented");
     }
-    if flags & 0x8000_0000 != 0 {
+    if flags & 0x0004_0000 != 0 {
         out.push("rf_enable");
+    }
+    if flags & 0x0008_0000 != 0 {
+        out.push("rf_strict");
+    }
+    if flags & 0x0010_0000 != 0 {
+        out.push("retpoline_present");
+    }
+    if flags & 0x0040_0000 != 0 {
+        out.push("eh_continuation_table_present");
+    }
+    if flags & 0x0080_0000 != 0 {
+        out.push("xfg_enabled");
+    }
+    if flags & 0x0100_0000 != 0 {
+        out.push("castguard_present");
+    }
+    if flags & 0x0200_0000 != 0 {
+        out.push("memcpy_present");
     }
     out
 }
@@ -1660,10 +2008,8 @@ mod tests {
         assert!(m.get("pe.forwarded_export_count").is_none());
     }
 
-    /// Verifies the typed Imports/Exports views are populated in
-    /// lockstep with the legacy `pe.imports[]` / `pe.exports[]` kv
-    /// shape, and that library names are normalised (lowercase, no
-    /// `.dll`).
+    /// Verifies the typed Imports/Exports views are populated and
+    /// that library names are normalised (lowercase, no `.dll`).
     #[test]
     fn typed_imports_and_exports_populated() {
         let bytes = read_fixture("test.exe");

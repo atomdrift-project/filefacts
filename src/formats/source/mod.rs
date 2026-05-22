@@ -2,9 +2,9 @@
 //!
 //! Source files are parsed once with tree-sitter. The resulting tree
 //! is cached on the [`ParsedFile`] and shared by every view that needs
-//! it: `values` reads imports / functions / classes, `strings` reads
-//! literal nodes, `metrics` reads the node count, `ast` reads the
-//! call-graph projection. No view ever causes a re-parse.
+//! it: typed symbol views read imports / functions / classes,
+//! `strings` reads literal nodes, `metrics` reads the node count, and
+//! `ast` reads the call-graph projection. No view ever causes a re-parse.
 //!
 //! [`ParsedFile`]: crate::ParsedFile
 
@@ -95,7 +95,7 @@ pub(super) fn extract(
         // are module-scoped strings, not library-tagged. Source tag is
         // the language name (`"javascript"`, `"python"`, `"go"`, …) so
         // trait matchers can filter by language without consulting
-        // file_type. See expose/src/output/symbols.rs for the
+        // file_type. See filefacts/src/output/symbols.rs for the
         // source-tag taxonomy.
         for (name, offset) in &imports {
             imports_out.push(crate::Import {
@@ -106,15 +106,6 @@ pub(super) fn extract(
                 ordinal: None,
             });
         }
-        values.insert(
-            "imports",
-            JsonValue::Array(
-                imports
-                    .iter()
-                    .map(|(n, _)| JsonValue::String(n.clone()))
-                    .collect(),
-            ),
-        );
     }
     if !functions.is_empty() {
         metrics.insert("source.function_count", functions.len() as f64);
@@ -127,15 +118,6 @@ pub(super) fn extract(
                 ..crate::Function::default()
             });
         }
-        values.insert(
-            "functions",
-            JsonValue::Array(
-                functions
-                    .iter()
-                    .map(|(n, _)| JsonValue::String(n.clone()))
-                    .collect(),
-            ),
-        );
     }
     if !classes.is_empty() {
         metrics.insert("source.class_count", classes.len() as f64);
@@ -154,15 +136,6 @@ pub(super) fn extract(
                 ..crate::Function::default()
             });
         }
-        values.insert(
-            "classes",
-            JsonValue::Array(
-                classes
-                    .iter()
-                    .map(|(n, _)| JsonValue::String(n.clone()))
-                    .collect(),
-            ),
-        );
     }
 
     values.insert(
@@ -174,7 +147,7 @@ pub(super) fn extract(
 }
 
 /// Single-pass AST projection. Always returns a fully-built `Ast` —
-/// empty when the tree has no calls or member chains, never absent.
+/// empty when the tree has no calls or members, never absent.
 pub(crate) fn build_ast(cache: &TreeCache, metrics: &mut Metrics) -> crate::output::Ast {
     let config =
         langs::config_for(cache.file_type()).expect("tree_cache implies config_for is Some");
@@ -304,7 +277,7 @@ fn strip_quotes(s: &str) -> String {
     s.to_string()
 }
 
-/// True when this file type is a source language expose can parse.
+/// True when this file type is a source language filefacts can parse.
 pub(crate) fn supports(file_type: FileType) -> bool {
     langs::config_for(file_type).is_some()
 }

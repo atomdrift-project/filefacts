@@ -22,7 +22,7 @@ use serde::Serialize;
 ///
 /// `args` describes the *shape* of each argument, not its value.
 /// Literal-string arguments have their value carried separately in
-/// [`Ast::call_string_args`] so consumers can match on it without
+/// [`Ast::call_strings`] so consumers can match on it without
 /// re-walking the AST.
 #[derive(Debug, Clone, Serialize)]
 pub struct Call {
@@ -33,12 +33,36 @@ pub struct Call {
     pub args: Vec<ArgShape>,
 }
 
+/// One static assignment/binding observed in source code.
+///
+/// The projection is intentionally shallow: it records the assigned
+/// target, coarse value shape, lexical scope, and direct string literal
+/// value when there is one. It does not attempt constant propagation or
+/// language-specific type inference.
+#[derive(Debug, Clone, Serialize)]
+pub struct Assignment {
+    /// Static identifier/member path being assigned, such as
+    /// `API_URL`, `self.path`, or `exports.token`.
+    pub target: String,
+    /// Coarse lexical scope for the assignment: `module`, `class`, or
+    /// `function`.
+    pub scope: &'static str,
+    /// Shape of the assigned expression.
+    pub shape: ArgShape,
+    /// Direct string literal value when the right-hand side is a
+    /// literal string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub string: Option<String>,
+    /// Byte offset where the assignment target starts.
+    pub offset: u64,
+}
+
 /// Shape category for a call argument.
 ///
 /// The set is closed and intentionally small — distinguishing "what
 /// kind of thing is this argument" is enough to support every trait
 /// query that doesn't need the literal value, and the literal-value
-/// case is served by [`Ast::call_string_args`].
+/// case is served by [`Ast::call_strings`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
@@ -69,10 +93,10 @@ pub enum ArgShape {
 
 /// AST projection view.
 ///
-/// Empty when the file is not source code expose can parse. For
+/// Empty when the file is not source code filefacts can parse. For
 /// supported source files, the view is populated by a single walk of
-/// the tree-sitter tree; the same tree backs the `values`/`strings`
-/// extraction for source files, so no duplicate work is performed.
+/// the tree-sitter tree; the same parse backs all source-driven views,
+/// so no duplicate work is performed.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Ast {
     /// Every call site in source order. Preserves multiplicity (a
@@ -82,19 +106,22 @@ pub struct Ast {
 
     /// Sorted, deduplicated list of every static call target. The
     /// natural index for "did this file ever call X?" queries.
-    pub call_targets: Vec<String>,
+    pub targets: Vec<String>,
 
     /// Sorted, deduplicated list of every dotted member-access chain
     /// observed *in any position*, called or not. `window.localStorage`
     /// appears here whether the code reads it, writes it, or just
     /// passes it as a value.
-    pub member_chains: Vec<String>,
+    pub members: Vec<String>,
 
     /// Map of call target → string-literal arguments observed at any
     /// argument position across all call sites with that target.
     /// Targets with no string-literal arguments do not appear in the
     /// map.
-    pub call_string_args: std::collections::BTreeMap<String, Vec<String>>,
+    pub call_strings: std::collections::BTreeMap<String, Vec<String>>,
+
+    /// Static bindings observed in source order.
+    pub binds: Vec<Assignment>,
 }
 
 impl Ast {
@@ -103,12 +130,13 @@ impl Ast {
         Self::default()
     }
 
-    /// `true` when the view contains no calls, member chains, or
+    /// `true` when the view contains no calls, members, or
     /// literal-argument observations.
     pub fn is_empty(&self) -> bool {
         self.calls.is_empty()
-            && self.call_targets.is_empty()
-            && self.member_chains.is_empty()
-            && self.call_string_args.is_empty()
+            && self.targets.is_empty()
+            && self.members.is_empty()
+            && self.call_strings.is_empty()
+            && self.binds.is_empty()
     }
 }

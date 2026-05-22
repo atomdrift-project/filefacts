@@ -104,6 +104,7 @@ fn is_stdlib_module(module: &str, language: &str) -> bool {
 }
 
 fn is_python_stdlib(module: &str) -> bool {
+    let module = module.split(" as ").next().unwrap_or(module);
     let top_level = module.split('.').next().unwrap_or(module);
     matches!(
         top_level,

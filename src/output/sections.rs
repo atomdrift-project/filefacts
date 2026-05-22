@@ -3,7 +3,7 @@
 //! Every binary format describes its address space with a sequence of
 //! named, sized regions: PE *sections*, ELF *sections*, Mach-O
 //! *sections* (and segments). They share the same forensic surface,
-//! so `expose` collapses them into a single uniform listing and
+//! so `filefacts` collapses them into a single uniform listing and
 //! lets the consumer branch on [`crate::FileId`] when the
 //! format-specific flag vocabulary matters.
 //!
@@ -11,7 +11,9 @@
 //! packed and encrypted regions read out at ~8.0 bits/byte while
 //! normal code sits around 5–6.5. Together with the executable /
 //! writable flags this is enough to spot UPX, custom packers, and
-//! encrypted payload blobs without parsing them further.
+//! encrypted payload blobs without parsing them further. Entropy
+//! lives on the [`Section`] itself, alongside the structural fields
+//! it derives from.
 //!
 //! Naming convention follows what radare2, `llvm-readobj`, and Ghidra
 //! use:
@@ -23,10 +25,10 @@ use serde::Serialize;
 
 /// One section / segment entry.
 ///
-/// Carries only structural facts the format itself records. Numeric
-/// features computed from the section's bytes (Shannon entropy,
-/// for one) live in [`crate::Metrics`] under keys that mirror the
-/// section's position (`sections[N].entropy`).
+/// Carries the structural facts the format itself records plus
+/// byte-level features computed from the section's bytes (Shannon
+/// entropy). Optional fields are absent when the value is undefined
+/// for this format or when the section has no on-disk bytes.
 #[derive(Debug, Clone, Serialize)]
 pub struct Section {
     /// Section name as the format records it (`.text`, `__TEXT,__text`,
@@ -48,11 +50,22 @@ pub struct Section {
     /// `strings`, `info_link`, `tls`. Mach-O: `executable`,
     /// `readable`, `writable` distilled from the segment `initprot`.
     pub flags: Vec<String>,
+    /// Raw format-specific flag bitmask backing [`Self::flags`]. PE:
+    /// the `IMAGE_SCN_*` `characteristics` u32. ELF: the `sh_flags`
+    /// u64. Mach-O: the section / segment `initprot`. `None` when the
+    /// format has no single integer for flag state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flags_raw: Option<u64>,
+    /// Shannon entropy of the section's on-disk bytes, in
+    /// bits per byte (range 0.0..=8.0). `None` for purely virtual
+    /// sections with no file bytes (BSS, ELF `nobits`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entropy: Option<f64>,
 }
 
 /// Unified section view across PE, ELF, and Mach-O.
 ///
-/// Empty when the file has no section table expose can read
+/// Empty when the file has no section table filefacts can read
 /// (structured documents, source code, opaque blobs).
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(transparent)]
@@ -112,6 +125,8 @@ mod tests {
             file_offset: 0x400,
             file_size: 0x1000,
             flags: vec!["code".into(), "executable".into(), "readable".into()],
+            flags_raw: Some(0x6000_0020),
+            entropy: Some(6.10),
         }
     }
 
@@ -125,8 +140,9 @@ mod tests {
     }
 
     /// `from_iter_sections` preserves the iterator order — the format
-    /// extractors rely on this so positional `sections[N].entropy`
-    /// metric keys line up with the typed view.
+    /// extractors emit sections in load-table order, and aggregate
+    /// metrics (size-weighted code/data entropy) depend on that order
+    /// matching the layout.
     #[test]
     fn from_iter_preserves_insertion_order() {
         let mut a = pe_text(0x1000);
@@ -177,6 +193,8 @@ mod tests {
             .filter_map(|v| v.as_str())
             .collect();
         assert_eq!(flags, vec!["code", "executable", "readable"]);
+        assert_eq!(s["flags_raw"], 0x6000_0020_u64);
+        assert!((s["entropy"].as_f64().unwrap() - 6.10).abs() < 1e-9);
     }
 
     /// `#[serde(transparent)]` means the wrapper struct doesn't add

@@ -173,7 +173,7 @@ mod tests {
     /// entry's `(product_id, build_id, use_count)` guards against
     /// silent drift in the XOR-key recovery, tuple walker, or hash
     /// computation. Regenerate values by running
-    /// `cargo run --bin expose -- ../cleave/tests/fixtures/test.exe`.
+    /// `cargo run --bin filefacts -- ../cleave/tests/fixtures/test.exe`.
     #[test]
     fn rich_header_decodes_test_exe_to_known_values() {
         let bytes = std::fs::read("../cleave/tests/fixtures/test.exe")

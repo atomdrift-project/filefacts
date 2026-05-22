@@ -10,7 +10,7 @@
 //! consumers don't have to enumerate the array.
 
 use goblin::mach::{self, Mach, MachO};
-use serde_json::{json, Value as JsonValue};
+use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::{extract_binary_strings, put_str, put_u64, rizin_fallback};
@@ -74,6 +74,8 @@ pub(super) fn extract(
         }
     }
     rizin_fallback(bytes, imports_out, exports_out, functions_out, metrics);
+    super::upx::detect(bytes, values);
+    super::go_buildinfo::detect(bytes, values, "macho");
     Ok(())
 }
 
@@ -96,18 +98,19 @@ fn fat_binary(
         let Ok(macho) = MachO::parse(slice_bytes, 0) else {
             continue;
         };
-        archs.push(json!({
-            "cpu_type": cpu_type_string(macho.header.cputype()),
-            "cpu_subtype": macho.header.cpusubtype(),
-            "file_type": file_type_string(macho.header.filetype),
-            "libraries": macho.libs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
-            // File-offset extent for this arch slice within the fat
-            // wrapper. Consumers walking per-arch byte ranges (e.g.
-            // cleave's preferred_arch_range / all_arch_ranges) read
-            // these instead of re-parsing the fat header.
-            "file_offset": arch.offset,
-            "file_size": arch.size,
-        }));
+        // Every slice gets the same forensic analysis as a single-arch
+        // binary: full header/load-command extraction, code signature,
+        // similarity hashes, segments. The result lands in this
+        // slice's entry of `macho.slices[]`. File-offset extent within
+        // the fat wrapper (`file_offset` + `file_size`) is added by
+        // the caller — consumers walking per-arch byte ranges read
+        // those rather than re-parsing the fat header.
+        let mut slice_entry = analyze_slice(&macho, slice_bytes);
+        if let JsonValue::Object(ref mut obj) = slice_entry {
+            obj.insert("file_offset".into(), JsonValue::Number(arch.offset.into()));
+            obj.insert("file_size".into(), JsonValue::Number(arch.size.into()));
+        }
+        archs.push(slice_entry);
         if idx == 0 {
             single_arch(
                 &macho,
@@ -124,6 +127,72 @@ fn fat_binary(
     values.insert("macho.slices", JsonValue::Array(archs));
 }
 
+/// Run the full single-arch extractor on a slice and return the
+/// resulting `macho.*` subtree as a JSON object. Used for FAT
+/// binaries so each architecture's view (cdhash, segments, imports,
+/// hashes, code-signature, build_version, entitlements, …) is
+/// recoverable independently of which slice happens to sit at index
+/// zero. Throws away the cross-format `Metrics`, `Imports`,
+/// `Exports`, and `Section` outputs — those keep tracking the
+/// preferred slice via `single_arch`.
+fn analyze_slice(macho: &MachO<'_>, slice_bytes: &[u8]) -> JsonValue {
+    let mut slice_values = Values::new();
+    let mut throwaway_metrics = Metrics::new();
+    let mut throwaway_sections: Vec<Section> = Vec::new();
+    let mut throwaway_imports = crate::Imports::new();
+    let mut throwaway_exports = crate::Exports::new();
+
+    extract_sections(
+        macho,
+        slice_bytes,
+        &mut throwaway_metrics,
+        &mut throwaway_sections,
+    );
+    extract_header_and_loads(
+        macho,
+        slice_bytes,
+        &mut slice_values,
+        &mut throwaway_metrics,
+    );
+    extract_symbols(macho, &mut throwaway_imports, &mut throwaway_exports);
+    super::macho_hashes::emit(
+        macho,
+        &mut slice_values,
+        &throwaway_imports,
+        &throwaway_exports,
+    );
+
+    // Pluck the `macho.*` subtree the extractors built and return it
+    // as the slice entry. Anything else (a flat key the future code
+    // path might add) is dropped — slices carry only Mach-O-shaped
+    // data.
+    let mut root = slice_values.into_json();
+    if let Some(obj) = root.as_object_mut() {
+        if let Some(macho_sub) = obj.remove("macho") {
+            // Counts the slice has at the unified-view level — exported
+            // as integers on the slice for symmetry with `imports.count`
+            // / `exports.count` on the top-level binary.
+            if let JsonValue::Object(mut m) = macho_sub {
+                m.insert(
+                    "import_count".into(),
+                    JsonValue::Number((throwaway_imports.len() as u64).into()),
+                );
+                m.insert(
+                    "export_count".into(),
+                    JsonValue::Number((throwaway_exports.len() as u64).into()),
+                );
+                m.insert(
+                    "section_count".into(),
+                    JsonValue::Number((throwaway_sections.len() as u64).into()),
+                );
+                return JsonValue::Object(m);
+            }
+            return macho_sub;
+        }
+    }
+    JsonValue::Object(serde_json::Map::new())
+}
+
 fn single_arch(
     macho: &MachO<'_>,
     bytes: &[u8],
@@ -135,13 +204,13 @@ fn single_arch(
 ) {
     extract_sections(macho, bytes, metrics, sections_out);
     extract_header_and_loads(macho, bytes, values, metrics);
-    extract_symbols(macho, values, imports_out, exports_out);
+    extract_symbols(macho, imports_out, exports_out);
+    super::macho_hashes::emit(macho, values, imports_out, exports_out);
     super::build_toolchain::from_macho(values, sections_out);
 }
 
 /// Walk Mach-O's dyld bind-info (imports) and export trie (exports)
-/// and surface both as the format-native `macho.imports[]` /
-/// `macho.exports[]` arrays plus typed `Imports`/`Exports` entries.
+/// and surface them as typed `Imports`/`Exports` entries.
 ///
 /// Two source tags distinguish how the entry was discovered:
 /// `macho-bind` for two-level-namespace bind imports (carrying the
@@ -149,7 +218,6 @@ fn single_arch(
 /// the dyld export trie.
 fn extract_symbols(
     macho: &MachO<'_>,
-    values: &mut Values,
     imports_out: &mut crate::Imports,
     exports_out: &mut crate::Exports,
 ) {
@@ -158,7 +226,6 @@ fn extract_symbols(
     // trait authors can match against `"libsystem.b"` rather than
     // `"/usr/lib/libSystem.B.dylib"`.
     if let Ok(imports) = macho.imports() {
-        let mut names: Vec<JsonValue> = Vec::new();
         for imp in &imports {
             let library = normalize_dylib_path(imp.dylib);
             imports_out.push(crate::Import {
@@ -168,10 +235,8 @@ fn extract_symbols(
                 offset: Some(imp.offset),
                 ordinal: None,
             });
-            names.push(JsonValue::String(imp.name.to_string()));
         }
         // Import count flows through cross-format `imports.count`.
-        values.insert("macho.imports", JsonValue::Array(names));
     }
 
     // Exports — recovered from the dyld export trie. Re-exports
@@ -179,7 +244,6 @@ fn extract_symbols(
     // regular `Export` entries; we surface only the name here, with
     // forwarded-target handling left to a follow-up.
     if let Ok(exports) = macho.exports() {
-        let mut names: Vec<JsonValue> = Vec::new();
         for exp in &exports {
             exports_out.push(crate::Export {
                 name: exp.name.clone(),
@@ -192,10 +256,8 @@ fn extract_symbols(
                 // for a follow-up.
                 forward_to: None,
             });
-            names.push(JsonValue::String(exp.name.clone()));
         }
         // Export count flows through cross-format `exports.count`.
-        values.insert("macho.exports", JsonValue::Array(names));
     }
 }
 
@@ -219,13 +281,13 @@ fn normalize_dylib_path(path: &str) -> String {
 fn extract_sections(
     macho: &MachO<'_>,
     bytes: &[u8],
-    metrics: &mut Metrics,
+    _metrics: &mut Metrics,
     sections_out: &mut Vec<Section>,
 ) {
-    let mut section_idx = 0_usize;
     for segment in &macho.segments {
         let segment_name = segment.name().unwrap_or("").to_owned();
         let flags = macho_segment_flags(segment.initprot);
+        let initprot = u64::from(segment.initprot);
         let Ok(secs) = segment.sections() else {
             continue;
         };
@@ -238,10 +300,7 @@ fn extract_sections(
             };
             let file_offset = u64::from(section.offset);
             let file_size = section.size;
-            if file_size > 0 {
-                let e = section_entropy(bytes, file_offset, file_size);
-                metrics.insert(format!("sections[{section_idx}].entropy"), e);
-            }
+            let entropy = (file_size > 0).then(|| section_entropy(bytes, file_offset, file_size));
             sections_out.push(Section {
                 name: display,
                 vaddr: section.addr,
@@ -249,8 +308,9 @@ fn extract_sections(
                 file_offset,
                 file_size,
                 flags: flags.iter().map(|s| (*s).to_string()).collect(),
+                flags_raw: Some(initprot),
+                entropy,
             });
-            section_idx += 1;
         }
     }
 }
@@ -292,7 +352,7 @@ fn extract_header_and_loads(
     put_str(
         values,
         "macho.cpu_type",
-        cpu_type_string(macho.header.cputype()),
+        cpu_kind_string(macho.header.cputype(), macho.header.cpusubtype()),
     );
     // Raw CPU type / file type / flags. The string-decoded fields above
     // are for trait authors; consumers that need to round-trip the
@@ -439,11 +499,14 @@ fn extract_header_and_loads(
     build_version(macho, bytes, values);
     source_version(macho, values);
     install_name(macho, values);
+    load_dylinker(macho, bytes, values);
     load_dylibs(macho, values);
     linker_options(macho, bytes, values);
     objc_image_info(macho, bytes, values);
     segment_analysis(macho, values, metrics);
     chained_fixups_marker(macho, metrics);
+    function_starts(macho, bytes, values, metrics);
+    data_in_code_kinds(macho, bytes, values);
 
     binary_flags(macho, metrics);
 }
@@ -644,6 +707,117 @@ fn chained_fixups_marker(macho: &MachO<'_>, metrics: &mut Metrics) {
     }
     if has_unixthread_command {
         metrics.insert("macho.has_unixthread_command", 1.0);
+    }
+}
+
+/// `LC_FUNCTION_STARTS` — ULEB128-encoded deltas from `__TEXT` base
+/// to each function entry. Counting non-zero deltas (a zero byte
+/// terminates the stream) gives the function count the linker
+/// recorded. Forensically useful: stripped binaries still carry
+/// this, so it's the best lower bound on function count when no
+/// symbol table is present. Emits `macho.function_starts_count` as
+/// a metric.
+fn function_starts(macho: &MachO<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
+    let Some(fs) = macho.load_commands.iter().find_map(|lc| match lc.command {
+        mach::load_command::CommandVariant::FunctionStarts(c) => Some(c),
+        _ => None,
+    }) else {
+        return;
+    };
+    let start = fs.dataoff as usize;
+    let size = fs.datasize as usize;
+    let end = start.saturating_add(size).min(bytes.len());
+    if start >= bytes.len() || start >= end {
+        return;
+    }
+    let data = &bytes[start..end];
+    let mut count: u64 = 0;
+    let mut i = 0usize;
+    while i < data.len() {
+        // Read one ULEB128. Zero is the stream terminator and
+        // signals end-of-table (any padding bytes after it are
+        // ignored).
+        let mut value: u64 = 0;
+        let mut shift = 0u32;
+        let mut consumed = 0usize;
+        loop {
+            if i + consumed >= data.len() {
+                break;
+            }
+            let b = data[i + consumed];
+            consumed += 1;
+            value |= u64::from(b & 0x7f) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift > 63 {
+                break;
+            }
+        }
+        i += consumed;
+        if value == 0 {
+            break;
+        }
+        count += 1;
+    }
+    metrics.insert("macho.function_starts_count", count as f64);
+    put_u64(values, "macho.function_starts_count", count);
+}
+
+/// `LC_DATA_IN_CODE` — table of (offset, length, kind) triples
+/// marking byte ranges inside `__TEXT,__text` that are *data*
+/// rather than executable code. Reverse engineers hit these as
+/// jump tables and inline constants the disassembler must skip
+/// over.
+///
+/// Kind values are stable Apple constants (`<mach-o/loader.h>`
+/// `DICE_KIND_*`); a histogram is more useful than the raw count
+/// because the kind distribution is itself a fingerprint of the
+/// compiler's switch-statement codegen.
+fn data_in_code_kinds(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
+    let Some(dic) = macho.load_commands.iter().find_map(|lc| match lc.command {
+        mach::load_command::CommandVariant::DataInCode(c) => Some(c),
+        _ => None,
+    }) else {
+        return;
+    };
+    let start = dic.dataoff as usize;
+    let size = dic.datasize as usize;
+    let end = start.saturating_add(size).min(bytes.len());
+    if start >= end {
+        return;
+    }
+    let little_endian = macho.little_endian;
+    let mut kinds = serde_json::Map::new();
+    for chunk in bytes[start..end].chunks_exact(8) {
+        let kind = if little_endian {
+            u16::from_le_bytes([chunk[6], chunk[7]])
+        } else {
+            u16::from_be_bytes([chunk[6], chunk[7]])
+        };
+        let name = data_in_code_kind_name(kind);
+        let entry = kinds
+            .entry(name.to_string())
+            .or_insert(JsonValue::Number(0.into()));
+        if let Some(n) = entry.as_u64() {
+            *entry = JsonValue::Number((n + 1).into());
+        }
+    }
+    if !kinds.is_empty() {
+        values.insert("macho.data_in_code_kinds", JsonValue::Object(kinds));
+    }
+}
+
+fn data_in_code_kind_name(kind: u16) -> &'static str {
+    // `<mach-o/loader.h>` `DICE_KIND_*`.
+    match kind {
+        1 => "data",
+        2 => "jump_table8",
+        3 => "jump_table16",
+        4 => "jump_table32",
+        5 => "abs_jump_table32",
+        _ => "unknown",
     }
 }
 
@@ -929,6 +1103,35 @@ fn install_name(macho: &MachO<'_>, values: &mut Values) {
     }
 }
 
+/// `LC_LOAD_DYLINKER` — path to the dynamic linker the binary was
+/// linked against. On macOS this is almost always `/usr/lib/dyld`;
+/// any other path is a strong injection / tampering signal (custom
+/// dyld replacements have been used by both Apple-internal tools and
+/// targeted attacks). Emitted as `macho.dyld_path`.
+fn load_dylinker(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
+    let Some((lc_offset, name_offset)) =
+        macho.load_commands.iter().find_map(|lc| match lc.command {
+            mach::load_command::CommandVariant::LoadDylinker(c) => {
+                Some((lc.offset, c.name as usize))
+            }
+            _ => None,
+        })
+    else {
+        return;
+    };
+    let start = lc_offset.saturating_add(name_offset);
+    if start >= bytes.len() {
+        return;
+    }
+    let tail = &bytes[start..];
+    let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+    if let Ok(s) = std::str::from_utf8(&tail[..end]) {
+        if !s.is_empty() {
+            put_str(values, "macho.dyld_path", s);
+        }
+    }
+}
+
 /// Decode a Mach-O version field (`X.Y.Z` packed as `xxxx.yy.zz`
 /// nibbles in a `u32`).
 fn decode_version_nibbles(v: u32) -> String {
@@ -1135,6 +1338,27 @@ fn cpu_type_string(cpu_type: u32) -> &'static str {
         0x0000_0012 => "powerpc",
         0x0100_0012 => "powerpc64",
         _ => "unknown",
+    }
+}
+
+/// Render the canonical Apple shorthand for a (cputype, cpusubtype)
+/// pair. `arm64e` and `x86_64h` are the forensically interesting ones
+/// — both are subtype-driven variants the bare cputype loses:
+/// `arm64e` carries pointer-authentication (PAC) bindings,
+/// `x86_64h` is the Haswell-only slice. The low byte of cpusubtype
+/// carries the family value; the high byte holds capability flags
+/// (`CPU_SUBTYPE_MASK`) we strip before matching.
+fn cpu_kind_string(cpu_type: u32, cpu_subtype: u32) -> &'static str {
+    let sub = (cpu_subtype & 0x00ff_ffff) as u8;
+    match (cpu_type, sub) {
+        (0x0100_000c, 0) => "arm64",
+        (0x0100_000c, 1) => "arm64v8",
+        (0x0100_000c, 2) => "arm64e",
+        (0x0200_000c, 0) => "arm64_32",
+        (0x0200_000c, 1) => "arm64_32v8",
+        (0x0100_0007, 3) => "x86_64",
+        (0x0100_0007, 8) => "x86_64h",
+        _ => cpu_type_string(cpu_type),
     }
 }
 
@@ -1393,9 +1617,8 @@ mod tests {
         assert_eq!(normalize_dylib_path("Foo"), "foo");
     }
 
-    /// Verifies the typed Imports/Exports views are populated in
-    /// lockstep with the legacy `macho.imports[]` / `exports[]`
-    /// kv shape, and that library names come back normalised.
+    /// Verifies the typed Imports/Exports views are populated and
+    /// that library names come back normalised.
     #[test]
     fn typed_imports_and_exports_populated_for_macho() {
         let bytes = read_fixture("test.macho");

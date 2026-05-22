@@ -71,6 +71,9 @@ pub(super) fn extract(
     segments(&elf, values);
     rizin_fallback(bytes, imports_out, exports_out, functions_out, metrics);
     linker_family(values);
+    super::elf_hashes::emit(&elf, values, imports_out, exports_out);
+    super::upx::detect(bytes, values);
+    super::go_buildinfo::detect(bytes, values, "elf");
     super::build_toolchain::from_elf(values, sections_out, bytes);
 
     Ok(())
@@ -1142,8 +1145,8 @@ fn dynamic(elf: &Elf<'_>, values: &mut Values) {
     }
 }
 
-fn sections(elf: &Elf<'_>, bytes: &[u8], metrics: &mut Metrics, sections_out: &mut Vec<Section>) {
-    for (idx, sh) in elf.section_headers.iter().enumerate() {
+fn sections(elf: &Elf<'_>, bytes: &[u8], _metrics: &mut Metrics, sections_out: &mut Vec<Section>) {
+    for sh in &elf.section_headers {
         let name = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("").to_owned();
         // SHT_NOBITS (8) sections have no file bytes. Other types
         // occupy `sh_offset..sh_offset + sh_size` in the file.
@@ -1152,10 +1155,7 @@ fn sections(elf: &Elf<'_>, bytes: &[u8], metrics: &mut Metrics, sections_out: &m
         } else {
             (sh.sh_offset, sh.sh_size)
         };
-        if file_size > 0 {
-            let e = section_entropy(bytes, file_offset, file_size);
-            metrics.insert(format!("sections[{idx}].entropy"), e);
-        }
+        let entropy = (file_size > 0).then(|| section_entropy(bytes, file_offset, file_size));
         sections_out.push(Section {
             name,
             vaddr: sh.sh_addr,
@@ -1166,6 +1166,8 @@ fn sections(elf: &Elf<'_>, bytes: &[u8], metrics: &mut Metrics, sections_out: &m
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            flags_raw: Some(sh.sh_flags),
+            entropy,
         });
     }
 }
@@ -1191,13 +1193,9 @@ fn symbols(
     exports_out: &mut crate::Exports,
 ) {
     // Dynamic-symbol table: imports are undefined (`SHN_UNDEF`, section
-    // index 0); exports are defined globals/weaks. STT_GNU_IFUNC
-    // entries are split into a dedicated `elf.ifuncs[]` — they're rare
-    // (libc memcpy/strcmp resolvers, glibc startup) and trait authors
-    // want to detect their presence directly without scanning all
-    // imports.
-    let mut imports = Vec::new();
-    let mut exports = Vec::new();
+    // index 0); exports are defined globals/weaks. STT_GNU_IFUNC entries
+    // stay in `values` as a derived ELF-specific list; ordinary imports and
+    // exports live only in the typed symbol views.
     let mut ifuncs = Vec::new();
     let mut fortify_count: u64 = 0;
     let mut hidden_count: u64 = 0;
@@ -1240,7 +1238,6 @@ fn symbols(
             fortify_count += 1;
         }
         if sym.st_shndx == 0 {
-            imports.push(JsonValue::String(name.to_string()));
             // ELF doesn't bind a dynsym entry to a specific
             // DT_NEEDED library at link time — the dynamic linker
             // resolves at load. Leave `library` unset; consumers
@@ -1254,7 +1251,6 @@ fn symbols(
             });
         } else if sym.is_function() || sym.st_info & 0xf == 1 {
             // STB_GLOBAL = 1 (binding in upper nibble of st_info)
-            exports.push(JsonValue::String(name.to_string()));
             exports_out.push(crate::Export {
                 name: name.to_string(),
                 source: "elf-dynsym",
@@ -1280,8 +1276,6 @@ fn symbols(
     if stack_canary {
         metrics.insert("elf.stack_canary", 1.0);
     }
-    values.insert("elf.imports", JsonValue::Array(imports));
-    values.insert("elf.exports", JsonValue::Array(exports));
     if !ifuncs.is_empty() {
         values.insert("elf.ifuncs", JsonValue::Array(ifuncs));
     }
@@ -1510,7 +1504,7 @@ mod tests {
     }
 
     /// Pin every cleave-consumed emission added to support the
-    /// ctx-only ELF analyzer migration. If expose stops emitting any
+    /// ctx-only ELF analyzer migration. If filefacts stops emitting any
     /// of these, the analyzer's typed-metric path silently regresses
     /// to defaults — catch the loss here.
     #[test]

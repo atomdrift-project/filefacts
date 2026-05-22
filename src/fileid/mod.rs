@@ -12,7 +12,7 @@
 //! # Example
 //!
 //! ```
-//! use expose::{FileId, FileType};
+//! use filefacts::{FileId, FileType};
 //!
 //! let data = b"\x7fELF\x02\x01\x01\x00";
 //! let id = FileId::from_bytes(data);
