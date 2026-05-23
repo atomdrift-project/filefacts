@@ -11,6 +11,15 @@
 use crate::error::Error;
 use crate::fileid::FileType;
 use crate::formats::source::langs;
+use std::cell::RefCell;
+
+thread_local! {
+    /// One tree-sitter parser per worker thread, reused across files.
+    /// Constructing a fresh `Parser` on every call allocates internal
+    /// state tables; reusing the same instance lets tree-sitter keep
+    /// its scratch arenas warm across files in the same archive.
+    static THREAD_PARSER: RefCell<tree_sitter::Parser> = RefCell::new(tree_sitter::Parser::new());
+}
 
 /// A cached parse for a source file.
 pub(crate) struct TreeCache<'a> {
@@ -33,21 +42,21 @@ impl<'a> TreeCache<'a> {
         let Ok(source) = std::str::from_utf8(bytes) else {
             return Ok(None);
         };
-        let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&(config.language)()).map_err(|e| {
-            Error::malformed("source", format!("tree-sitter language setup failed: {e}"))
-        })?;
-        let Some(tree) = parser.parse(source, None) else {
-            return Err(Error::malformed(
-                "source",
-                "tree-sitter parse returned None",
-            ));
-        };
-        Ok(Some(Self {
-            source,
-            tree,
-            file_type,
-        }))
+        let language = (config.language)();
+        THREAD_PARSER.with(|cell| {
+            let mut parser = cell.borrow_mut();
+            parser.set_language(&language).map_err(|e| {
+                Error::malformed("source", format!("tree-sitter language setup failed: {e}"))
+            })?;
+            let tree = parser.parse(source, None).ok_or_else(|| {
+                Error::malformed("source", "tree-sitter parse returned None")
+            })?;
+            Ok(Some(Self {
+                source,
+                tree,
+                file_type,
+            }))
+        })
     }
 
     pub(crate) fn source(&self) -> &str {
