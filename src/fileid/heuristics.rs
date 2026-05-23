@@ -44,11 +44,12 @@ enum Lang {
     JavaScript,
     C,
     Kotlin,
+    Dockerfile,
 }
 
 /// All languages in index order. Used to map score indices back to Lang values
 /// without unsafe transmute.
-const LANGS: [Lang; 10] = [
+const LANGS: [Lang; 11] = [
     Lang::Shell,
     Lang::Python,
     Lang::PowerShell,
@@ -59,6 +60,7 @@ const LANGS: [Lang; 10] = [
     Lang::JavaScript,
     Lang::C,
     Lang::Kotlin,
+    Lang::Dockerfile,
 ];
 
 const LANG_COUNT: usize = LANGS.len();
@@ -77,6 +79,7 @@ impl Lang {
             Self::JavaScript => 7,
             Self::C => 8,
             Self::Kotlin => 9,
+            Self::Dockerfile => 10,
         }
     }
 
@@ -92,6 +95,7 @@ impl Lang {
             Self::JavaScript => FileType::JavaScript,
             Self::C => FileType::C,
             Self::Kotlin => FileType::Kotlin,
+            Self::Dockerfile => FileType::Dockerfile,
         }
     }
 }
@@ -176,6 +180,17 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"val ", Lang::Kotlin, 5),
     (b"var ", Lang::Kotlin, 5),
     (b"suspend fun ", Lang::Kotlin, 5),
+    // ── Dockerfile ──
+    (b"\nFROM ", Lang::Dockerfile, 10),
+    (b"FROM scratch", Lang::Dockerfile, 10),
+    (b"\nRUN ", Lang::Dockerfile, 5),
+    (b"\nCMD [", Lang::Dockerfile, 10),
+    (b"\nENTRYPOINT", Lang::Dockerfile, 10),
+    (b"\nWORKDIR ", Lang::Dockerfile, 5),
+    (b"\nCOPY ", Lang::Dockerfile, 5),
+    (b"\nEXPOSE ", Lang::Dockerfile, 5),
+    (b"\nVOLUME ", Lang::Dockerfile, 5),
+    (b"\nHEALTHCHECK", Lang::Dockerfile, 10),
 ];
 
 struct AcScanner {

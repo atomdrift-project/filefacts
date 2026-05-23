@@ -156,6 +156,12 @@ fn detect_from_filename(path: &Path) -> Option<FileType> {
     if name.eq_ignore_ascii_case("action.yml") || name.eq_ignore_ascii_case("action.yaml") {
         return Some(FileType::GithubActions);
     }
+    if name == "Dockerfile" || name.starts_with("Dockerfile.") || name.starts_with("dockerfile.") {
+        return Some(FileType::Dockerfile);
+    }
+    if name == "Containerfile" || name.starts_with("Containerfile.") {
+        return Some(FileType::Dockerfile);
+    }
     if name.starts_with("Makefile") || name.starts_with("GNUmakefile") {
         return Some(FileType::Makefile);
     }
@@ -243,6 +249,7 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "html" | "htm" => Some(FileType::Html),
         "md" | "markdown" => Some(FileType::Markdown),
         "mk" | "mak" => Some(FileType::Makefile),
+        "dockerfile" | "containerfile" => Some(FileType::Dockerfile),
         "txt" | "text" | "b64" | "base64" => Some(FileType::Text),
         // Opaque binary "data" extensions that commonly carry encrypted/XOR'd payloads
         // (PlugX's Canon.dat, Cobalt Strike profiles, shellcode drops).

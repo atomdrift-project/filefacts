@@ -243,6 +243,8 @@ pub enum FileType {
     Markdown,
     /// Makefile / GNU Make build file
     Makefile,
+    /// Dockerfile — container image build definition
+    Dockerfile,
     /// OpenDocument Format (.odt, .ods, .odp, .odg) — ZIP-based office documents
     Odf,
     /// Plain text data (.txt, .text, or printable text with no stronger type)

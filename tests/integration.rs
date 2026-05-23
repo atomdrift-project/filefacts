@@ -51,6 +51,26 @@ fn zip_archive_emits_member_listing_and_aggregates() {
         .and_then(|v| v.as_array())
         .expect("archive.members should be present");
     assert_eq!(members.len(), 3);
+    for member in members {
+        let header_offset = member
+            .get("header_offset")
+            .and_then(serde_json::Value::as_u64)
+            .expect("zip member header_offset");
+        let data_offset = member
+            .get("data_offset")
+            .and_then(serde_json::Value::as_u64)
+            .expect("zip member data_offset");
+        let central_header_offset = member
+            .get("central_header_offset")
+            .and_then(serde_json::Value::as_u64)
+            .expect("zip member central_header_offset");
+        assert!(data_offset > header_offset);
+        assert!(central_header_offset > data_offset);
+        assert!(member
+            .get("crc32")
+            .and_then(serde_json::Value::as_u64)
+            .is_some());
+    }
 
     assert_eq!(metrics.get("archive.member_count"), Some(3.0));
     assert!(metrics.get("file.entropy").is_some());
@@ -66,6 +86,24 @@ fn empty_input_classifies_and_exposes_metrics() {
     // observe the degenerate case uniformly.
     assert_eq!(parsed.metrics().get("file.size_bytes"), Some(0.0));
     assert_eq!(parsed.metrics().get("file.entropy"), Some(0.0));
+    assert_eq!(parsed.parse_count(), 1);
+}
+
+#[test]
+fn source_ast_borrows_cached_tree_without_extraction_pass() {
+    let source = b"function main() { return fetch('https://example.com'); }";
+    let parsed = open_with_path(std::path::Path::new("sample.js"), source).unwrap();
+
+    let ast = parsed.source_ast().expect("source AST should be available");
+    assert_eq!(ast.source, std::str::from_utf8(source).unwrap());
+    assert_eq!(ast.tree.root_node().kind(), "program");
+    assert_eq!(
+        parsed.parse_count(),
+        0,
+        "borrowing the AST is not extraction"
+    );
+
+    assert!(parsed.ast().targets.contains(&"fetch".to_string()));
     assert_eq!(parsed.parse_count(), 1);
 }
 

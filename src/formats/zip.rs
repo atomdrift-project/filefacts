@@ -94,6 +94,22 @@ pub(super) fn extract(
             "compression_method".into(),
             JsonValue::String(method.into()),
         );
+        obj.insert(
+            "header_offset".into(),
+            JsonValue::Number(entry.header_start().into()),
+        );
+        obj.insert(
+            "data_offset".into(),
+            JsonValue::Number(entry.data_start().into()),
+        );
+        obj.insert(
+            "central_header_offset".into(),
+            JsonValue::Number(entry.central_header_start().into()),
+        );
+        obj.insert(
+            "crc32".into(),
+            JsonValue::Number(u64::from(entry.crc32()).into()),
+        );
         if entry.encrypted() {
             obj.insert("encrypted".into(), JsonValue::Bool(true));
             encrypted_count += 1;

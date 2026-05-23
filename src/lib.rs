@@ -147,6 +147,22 @@ pub struct ParsedFile<'a> {
     parse_count: AtomicU32,
 }
 
+/// Borrowed source parse owned by a [`ParsedFile`].
+///
+/// This exposes the shared tree-sitter tree to host tools that need
+/// their own AST queries. The tree is still owned and cached by
+/// `ParsedFile`; callers borrow it and must keep the `ParsedFile`
+/// alive for as long as they use this view.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceAst<'tree> {
+    /// UTF-8 source text used to build the tree.
+    pub source: &'tree str,
+    /// Shared tree-sitter parse tree.
+    pub tree: &'tree tree_sitter::Tree,
+    /// File type used to select the parser.
+    pub file_type: FileType,
+}
+
 impl std::fmt::Debug for ParsedFile<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ParsedFile")
@@ -207,6 +223,20 @@ impl<'a> ParsedFile<'a> {
     /// performed.
     pub fn ast(&self) -> &Ast {
         &self.extracted().ast
+    }
+
+    /// Borrow the shared tree-sitter parse, if this is a supported
+    /// UTF-8 source file and parsing succeeded.
+    ///
+    /// This is the zero-copy handoff for downstream rule engines: it
+    /// returns the same tree used by filefacts's own source extraction
+    /// rather than forcing callers to parse the source again.
+    pub fn source_ast(&self) -> Option<SourceAst<'_>> {
+        self.tree_cache().map(|cache| SourceAst {
+            source: cache.source(),
+            tree: cache.tree(),
+            file_type: cache.file_type(),
+        })
     }
 
     /// Section / segment listing for binary formats.
