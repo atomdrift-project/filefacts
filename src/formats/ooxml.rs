@@ -8,10 +8,9 @@
 //! string distinguishes the document variant (Word / Excel /
 //! PowerPoint, with-macros vs without).
 //!
-//! Layered on top of the generic [`crate::formats::zip::extract`]
-//! walk (which has already emitted `archive.members[]` and
-//! `archive.compression.*`). This module reads a small number of
-//! named streams from the same archive and surfaces an `office.*`
+//! Layered on the same ZIP handle used by the generic archive walk,
+//! after it has emitted `archive.members[]` and `archive.compression.*`.
+//! This module reads a small number of named streams and surfaces an `office.*`
 //! schema for trait rules:
 //!
 //! - `office.kind` — `"docx" | "xlsx" | "pptx" | "ooxml"` from the
@@ -26,7 +25,7 @@
 //!   present (one per OOXML application; usually a single entry).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io::{Cursor, Read};
+use std::io::{Read, Seek};
 
 use serde_json::Value as JsonValue;
 
@@ -34,17 +33,13 @@ use crate::error::Error;
 use crate::formats::common::put_str;
 use crate::output::{Metrics, Values};
 
-pub(super) fn extract(
-    bytes: &[u8],
+pub(super) fn extract_from_archive<R: Read + Seek>(
+    zip: &mut ::zip::ZipArchive<R>,
     values: &mut Values,
     metrics: &mut Metrics,
 ) -> Result<(), Error> {
-    let cursor = Cursor::new(bytes);
-    let Ok(mut zip) = ::zip::ZipArchive::new(cursor) else {
-        return Ok(());
-    };
-    let names = zip_entry_names(&mut zip);
-    let Some(index) = build_ooxml_index(&mut zip, &names) else {
+    let names = zip_entry_names(zip);
+    let Some(index) = build_ooxml_index(zip, &names) else {
         return Ok(());
     };
 
@@ -54,14 +49,14 @@ pub(super) fn extract(
         return Ok(());
     }
 
-    if let Some(core) = parse_core_props(&mut zip) {
+    if let Some(core) = parse_core_props(zip) {
         for (key, value) in core {
             let path = format!("office.{key}");
             values.insert(&path, value);
         }
     }
 
-    if let Some((app, company)) = parse_app_props(&mut zip) {
+    if let Some((app, company)) = parse_app_props(zip) {
         if let Some(app) = app {
             put_str(values, "office.application", app);
         }
@@ -91,14 +86,7 @@ pub(super) fn extract(
         }
         if name.contains("/embeddings/") {
             push_feature(&mut features, "ole_objects");
-            push_embedded(
-                &mut zip,
-                &mut embedded_seen,
-                &mut embedded,
-                name,
-                None,
-                None,
-            );
+            push_embedded(zip, &mut embedded_seen, &mut embedded, name, None, None);
         }
         if name.starts_with("xl/externalLinks/") {
             push_feature(&mut features, "external_links");
@@ -118,7 +106,7 @@ pub(super) fn extract(
                 push_feature(&mut features, "ole_objects");
                 if let Some(target) = rel.target_part.as_deref() {
                     push_embedded(
-                        &mut zip,
+                        zip,
                         &mut embedded_seen,
                         &mut embedded,
                         target,
@@ -131,7 +119,7 @@ pub(super) fn extract(
                 push_feature(&mut features, "embedded_packages");
                 if let Some(target) = rel.target_part.as_deref() {
                     push_embedded(
-                        &mut zip,
+                        zip,
                         &mut embedded_seen,
                         &mut embedded,
                         target,
@@ -211,7 +199,7 @@ pub(super) fn extract(
         if !name.ends_with(".xml") || name.ends_with(".rels") {
             continue;
         }
-        let Some(text) = read_entry_text_limited(&mut zip, name, 1024 * 1024) else {
+        let Some(text) = read_entry_text_limited(zip, name, 1024 * 1024) else {
             continue;
         };
         dde_links.extend(extract_dde_links(&text, name));
@@ -851,7 +839,9 @@ mod tests {
     fn run(bytes: &[u8]) -> (Values, Metrics) {
         let mut v = Values::new();
         let mut m = Metrics::new();
-        let _ = extract(bytes, &mut v, &mut m);
+        if let Ok(mut zip) = crate::formats::zip::open_archive(bytes) {
+            let _ = extract_from_archive(&mut zip, &mut v, &mut m);
+        }
         (v, m)
     }
 

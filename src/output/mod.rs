@@ -23,6 +23,7 @@
 //!   tree-sitter parse for source files.
 //! - [`Errors`] — recoverable extractor diagnostics.
 
+mod archive;
 mod ast;
 mod errors;
 mod metrics;
@@ -31,6 +32,7 @@ mod strings;
 mod symbols;
 mod values;
 
+pub use archive::ArchiveMember;
 pub use ast::{ArgShape, Assignment, Ast, Call};
 pub use errors::{Errors, ParseError};
 pub use metrics::Metrics;

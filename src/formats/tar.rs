@@ -16,13 +16,14 @@ use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::fileid::FileType;
-use crate::output::{Metrics, Values};
+use crate::output::{ArchiveMember, Metrics, Values};
 
 pub(super) fn extract(
     bytes: &[u8],
     file_type: FileType,
     values: &mut Values,
     metrics: &mut Metrics,
+    archive_members: &mut Vec<ArchiveMember>,
 ) -> Result<(), Error> {
     values.insert(
         "archive.format.kind",
@@ -75,14 +76,15 @@ pub(super) fn extract(
         let size = header.size().unwrap_or(0);
 
         let mut obj = serde_json::Map::new();
-        obj.insert("path".into(), JsonValue::String(path));
+        obj.insert("path".into(), JsonValue::String(path.clone()));
         obj.insert("size_bytes".into(), JsonValue::Number(size.into()));
         obj.insert(
             "entry_type".into(),
             JsonValue::String(entry_type_label.into()),
         );
 
-        if let Ok(mode) = header.mode() {
+        let mode_octal = header.mode().ok();
+        if let Some(mode) = mode_octal {
             obj.insert(
                 "mode_octal".into(),
                 JsonValue::Number(u64::from(mode).into()),
@@ -100,29 +102,36 @@ pub(super) fn extract(
                 world_writable += 1;
             }
         }
-        if let Ok(uid) = header.uid() {
+        let uid = header.uid().ok();
+        if let Some(uid) = uid {
             obj.insert("uid".into(), JsonValue::Number(uid.into()));
         }
-        if let Ok(gid) = header.gid() {
+        let gid = header.gid().ok();
+        if let Some(gid) = gid {
             obj.insert("gid".into(), JsonValue::Number(gid.into()));
         }
-        if let Ok(Some(name)) = header.username() {
-            if !name.is_empty() {
-                obj.insert("uname".into(), JsonValue::String(name.to_string()));
-                unames.insert(name.to_string());
-            }
+        let uname = header
+            .username()
+            .ok()
+            .flatten()
+            .and_then(|name| (!name.is_empty()).then(|| name.to_string()));
+        if let Some(name) = &uname {
+            obj.insert("uname".into(), JsonValue::String(name.clone()));
+            unames.insert(name.clone());
         }
-        if let Ok(Some(name)) = header.groupname() {
-            if !name.is_empty() {
-                obj.insert("gname".into(), JsonValue::String(name.to_string()));
-                gnames.insert(name.to_string());
-            }
+        let gname = header
+            .groupname()
+            .ok()
+            .flatten()
+            .and_then(|name| (!name.is_empty()).then(|| name.to_string()));
+        if let Some(name) = &gname {
+            obj.insert("gname".into(), JsonValue::String(name.clone()));
+            gnames.insert(name.clone());
         }
-        if let Ok(m) = header.mtime() {
-            // tar stores mtime as unsigned seconds since the epoch.
-            // `as i64` is safe for the realistic range.
-            obj.insert("mtime_unix".into(), JsonValue::Number((m as i64).into()));
-            mtimes.push(m as i64);
+        let mtime_unix = header.mtime().ok().map(|m| m as i64);
+        if let Some(m) = mtime_unix {
+            obj.insert("mtime_unix".into(), JsonValue::Number(m.into()));
+            mtimes.push(m);
         }
         let mut linkname_str: Option<String> = None;
         if header.entry_type().is_symlink() || header.entry_type().is_hard_link() {
@@ -201,6 +210,35 @@ pub(super) fn extract(
                 }
             }
         }
+
+        let (header_offset, data_offset) = if file_type == FileType::Tar {
+            (
+                Some(entry.raw_header_position()),
+                Some(entry.raw_file_position()),
+            )
+        } else {
+            (None, None)
+        };
+        archive_members.push(ArchiveMember {
+            path,
+            size_bytes: size,
+            compressed_size: None,
+            compression_method: None,
+            mtime_unix,
+            mode_octal,
+            uid,
+            gid,
+            uname,
+            gname,
+            entry_type: Some(entry_type_label.to_string()),
+            linkname: linkname_str,
+            host_os: None,
+            header_offset,
+            data_offset,
+            central_header_offset: None,
+            crc32: None,
+            encrypted: false,
+        });
 
         members.push(JsonValue::Object(obj));
     }
@@ -357,7 +395,8 @@ mod tests {
         let mut v = Values::new();
         let mut m = Metrics::new();
         // Plain tar; compressed variants test elsewhere.
-        let _ = extract(bytes, FileType::Tar, &mut v, &mut m);
+        let mut archive_members = Vec::new();
+        let _ = extract(bytes, FileType::Tar, &mut v, &mut m, &mut archive_members);
         (v, m)
     }
 
@@ -430,6 +469,41 @@ mod tests {
     }
 
     #[test]
+    fn typed_members_track_tar_headers() {
+        let tar = build_tar(&[(
+            "usr/bin/script.sh",
+            0o755,
+            1000,
+            1000,
+            1_700_000_000,
+            b"#!/bin/sh\n",
+        )]);
+        let mut values = Values::new();
+        let mut metrics = Metrics::new();
+        let mut archive_members = Vec::new();
+        extract(
+            &tar,
+            FileType::Tar,
+            &mut values,
+            &mut metrics,
+            &mut archive_members,
+        )
+        .unwrap();
+
+        assert_eq!(archive_members.len(), 1);
+        let member = &archive_members[0];
+        assert_eq!(member.path, "usr/bin/script.sh");
+        assert_eq!(member.size_bytes, b"#!/bin/sh\n".len() as u64);
+        assert_eq!(member.mode_octal, Some(0o755));
+        assert_eq!(member.uid, Some(1000));
+        assert_eq!(member.gid, Some(1000));
+        assert_eq!(member.mtime_unix, Some(1_700_000_000));
+        assert_eq!(member.entry_type.as_deref(), Some("regular"));
+        assert_eq!(member.header_offset, Some(0));
+        assert_eq!(member.data_offset, Some(512));
+    }
+
+    #[test]
     fn flags_setuid_in_security_metrics() {
         // Setuid bit (04000) on root-owned binary.
         let tar = build_tar(&[("bin/pwn", 0o4755, 0, 0, 0, b"")]);
@@ -491,7 +565,14 @@ mod tests {
         // Bytes don't matter — open_archive rejects compressed variants.
         let mut values = Values::new();
         let mut metrics = Metrics::new();
-        let _ = extract(b"any bytes", FileType::TarGz, &mut values, &mut metrics);
+        let mut archive_members = Vec::new();
+        let _ = extract(
+            b"any bytes",
+            FileType::TarGz,
+            &mut values,
+            &mut metrics,
+            &mut archive_members,
+        );
         assert_eq!(
             values.get("archive.format.kind").and_then(|x| x.as_str()),
             Some("tar.gz")

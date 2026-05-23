@@ -12,23 +12,34 @@
 // (`META-INF/*.SF`, `*.RSA`). The case-sensitive comparison is required.
 #![allow(clippy::case_sensitive_file_extension_comparisons)]
 
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek};
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use zip::{CompressionMethod, ZipArchive};
 
 use crate::error::Error;
-use crate::output::{Metrics, Values};
+use crate::output::{ArchiveMember, Metrics, Values};
+
+pub(super) fn open_archive(bytes: &[u8]) -> Result<ZipArchive<Cursor<&[u8]>>, Error> {
+    ZipArchive::new(Cursor::new(bytes)).map_err(|e| Error::malformed("zip", e.to_string()))
+}
 
 pub(super) fn extract(
     bytes: &[u8],
     values: &mut Values,
     metrics: &mut Metrics,
+    archive_members: &mut Vec<ArchiveMember>,
 ) -> Result<(), Error> {
-    let cursor = Cursor::new(bytes);
-    let mut archive =
-        ZipArchive::new(cursor).map_err(|e| Error::malformed("zip", e.to_string()))?;
+    let mut archive = open_archive(bytes)?;
+    extract_from_archive(&mut archive, values, metrics, archive_members)
+}
 
+pub(super) fn extract_from_archive<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    values: &mut Values,
+    metrics: &mut Metrics,
+    archive_members: &mut Vec<ArchiveMember>,
+) -> Result<(), Error> {
     values.insert("archive.format.kind", JsonValue::String("zip".into()));
 
     let has_comment = !archive.comment().is_empty();
@@ -110,20 +121,22 @@ pub(super) fn extract(
             "crc32".into(),
             JsonValue::Number(u64::from(entry.crc32()).into()),
         );
-        if entry.encrypted() {
+        let encrypted = entry.encrypted();
+        if encrypted {
             obj.insert("encrypted".into(), JsonValue::Bool(true));
             encrypted_count += 1;
         }
 
-        if let Some(t) = entry
+        let mtime_unix = entry
             .last_modified()
-            .and_then(crate::scan::zip_datetime_to_unix)
-        {
+            .and_then(crate::scan::zip_datetime_to_unix);
+        if let Some(t) = mtime_unix {
             obj.insert("mtime_unix".into(), JsonValue::Number(t.into()));
             mtimes.push(t);
         }
 
-        if let Some(mode) = entry.unix_mode() {
+        let mode_octal = entry.unix_mode();
+        if let Some(mode) = mode_octal {
             obj.insert(
                 "mode_octal".into(),
                 JsonValue::Number(u64::from(mode).into()),
@@ -237,6 +250,26 @@ pub(super) fn extract(
             uses_zip64 = true;
         }
 
+        archive_members.push(ArchiveMember {
+            path: name,
+            size_bytes: uncompressed,
+            compressed_size: Some(compressed),
+            compression_method: Some(method.to_string()),
+            mtime_unix,
+            mode_octal,
+            uid: None,
+            gid: None,
+            uname: None,
+            gname: None,
+            entry_type: Some(entry_type.to_string()),
+            linkname: None,
+            host_os: None,
+            header_offset: Some(entry.header_start()),
+            data_offset: Some(entry.data_start()),
+            central_header_offset: Some(entry.central_header_start()),
+            crc32: Some(entry.crc32()),
+            encrypted,
+        });
         members.push(JsonValue::Object(obj));
     }
 
@@ -336,8 +369,8 @@ pub(super) fn extract(
     // signature-chain files in `META-INF/` is a benign-build attestation
     // (not a cryptographic verification). Emit the structural marker; the
     // consumer decides what to do with it.
-    let signed_marker = members_includes(&archive, "META-INF/cose.manifest")
-        && members_includes(&archive, "META-INF/cose.sig");
+    let signed_marker = members_includes(archive, "META-INF/cose.manifest")
+        && members_includes(archive, "META-INF/cose.sig");
     if signed_marker {
         values.insert(
             "archive.signing.mozilla_extension_shape",
@@ -347,9 +380,9 @@ pub(super) fn extract(
 
     // Also report `archive.signing.jar_signed_shape` when META-INF/*.SF
     // and META-INF/*.RSA both exist.
-    let jar_signed_shape = archive_names(&archive)
+    let jar_signed_shape = archive_names(archive)
         .any(|n| n.starts_with("META-INF/") && n.ends_with(".SF"))
-        && archive_names(&archive)
+        && archive_names(archive)
             .any(|n| n.starts_with("META-INF/") && (n.ends_with(".RSA") || n.ends_with(".DSA")));
     if jar_signed_shape {
         values.insert("archive.signing.jar_signed_shape", JsonValue::Bool(true));
@@ -618,7 +651,8 @@ mod tests {
     fn run(bytes: &[u8]) -> (Values, Metrics) {
         let mut v = Values::new();
         let mut m = Metrics::new();
-        let _ = extract(bytes, &mut v, &mut m);
+        let mut archive_members = Vec::new();
+        let _ = extract(bytes, &mut v, &mut m, &mut archive_members);
         (v, m)
     }
 

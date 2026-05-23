@@ -104,8 +104,9 @@ use std::sync::OnceLock;
 pub use error::Error;
 pub use fileid::{FileId, FileType};
 pub use output::{
-    ArgShape, Assignment, Ast, Call, Errors, Export, Exports, ExtractedString, Function, Functions,
-    Import, Imports, Metrics, ParseError, Section, Sections, StringCategory, Strings, Values,
+    ArchiveMember, ArgShape, Assignment, Ast, Call, Errors, Export, Exports, ExtractedString,
+    Function, Functions, Import, Imports, Metrics, ParseError, Section, Sections, StringCategory,
+    Strings, Values,
 };
 
 /// Schema version of the public output shape.
@@ -177,6 +178,7 @@ struct Extracted {
     values: Values,
     strings: Strings,
     metrics: Metrics,
+    archive_members: Vec<ArchiveMember>,
     ast: Ast,
     sections: Sections,
     imports: Imports,
@@ -210,6 +212,16 @@ impl<'a> ParsedFile<'a> {
     /// Numeric metrics view. Computed on first access and cached.
     pub fn metrics(&self) -> &Metrics {
         &self.extracted().metrics
+    }
+
+    /// Typed archive member index.
+    ///
+    /// Empty for non-archive formats. For ZIP-family files, this is
+    /// built from the same central-directory walk that emits
+    /// `archive.members[]`, so callers can consume offsets and
+    /// metadata without re-reading JSON.
+    pub fn archive_members(&self) -> &[ArchiveMember] {
+        &self.extracted().archive_members
     }
 
     /// AST projection view.
@@ -344,6 +356,7 @@ fn run_extraction(
     let mut values = Values::new();
     let mut strings = Strings::new();
     let mut metrics = Metrics::new();
+    let mut archive_members = Vec::new();
     let mut sections: Vec<Section> = Vec::new();
     let mut imports = Imports::new();
     let mut exports = Exports::new();
@@ -363,6 +376,7 @@ fn run_extraction(
         &mut values,
         &mut strings,
         &mut metrics,
+        &mut archive_members,
         &mut sections,
         &mut imports,
         &mut exports,
@@ -412,6 +426,7 @@ fn run_extraction(
         values,
         strings,
         metrics,
+        archive_members,
         ast,
         sections,
         imports,

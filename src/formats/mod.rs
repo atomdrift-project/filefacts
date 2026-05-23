@@ -16,7 +16,7 @@
 
 use crate::error::Error;
 use crate::fileid::FileType;
-use crate::output::{Errors, Metrics, Section, Strings, Values};
+use crate::output::{ArchiveMember, Errors, Metrics, Section, Strings, Values};
 
 mod build_toolchain;
 mod chm;
@@ -69,6 +69,7 @@ pub(crate) fn extract(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
+    archive_members: &mut Vec<ArchiveMember>,
     sections: &mut Vec<Section>,
     imports: &mut crate::Imports,
     exports: &mut crate::Exports,
@@ -95,14 +96,15 @@ pub(crate) fn extract(
         FileType::MachO => macho::extract(
             bytes, values, strings, metrics, sections, imports, exports, functions, errors,
         ),
-        FileType::Zip | FileType::Crx | FileType::Odf => zip::extract(bytes, values, metrics),
+        FileType::Zip | FileType::Crx | FileType::Odf => {
+            zip::extract(bytes, values, metrics, archive_members)
+        }
         FileType::Ooxml => {
-            // The generic archive walk emits `archive.members[]` /
-            // `archive.compression.*` first; the OOXML extractor then
-            // layers the format-specific `office.*` schema on top
-            // (kind, core metadata, application, macro presence, …).
-            zip::extract(bytes, values, metrics)?;
-            ooxml::extract(bytes, values, metrics)
+            // Open the ZIP container once: generic archive facts first,
+            // then the OOXML-specific `office.*` layer from the same handle.
+            let mut archive = zip::open_archive(bytes)?;
+            zip::extract_from_archive(&mut archive, values, metrics, archive_members)?;
+            ooxml::extract_from_archive(&mut archive, values, metrics)
         }
         FileType::OleDoc => {
             ole2::extract(bytes, values, metrics)?;
@@ -113,15 +115,14 @@ pub(crate) fn extract(
             Ok(())
         }
         FileType::Jar => {
-            // JAR is a zip — run the generic archive walk for
-            // `archive.*` paths, then layer the JAR-specific
-            // `jar.manifest.*` / `jar.pom.*` / `jar.features[]`
-            // surface on top.
-            zip::extract(bytes, values, metrics)?;
-            jar::extract(bytes, values, metrics)
+            // Open the ZIP container once: generic archive facts first,
+            // then the JAR-specific surface from the same handle.
+            let mut archive = zip::open_archive(bytes)?;
+            zip::extract_from_archive(&mut archive, values, metrics, archive_members)?;
+            jar::extract_from_archive(&mut archive, values, metrics)
         }
         FileType::Tar | FileType::TarGz | FileType::TarBz2 | FileType::TarXz | FileType::TarZst => {
-            tar::extract(bytes, file_type, values, metrics)
+            tar::extract(bytes, file_type, values, metrics, archive_members)
         }
         // Structured manifests parse their entire content into `values`
         // with the format-native key shape (the parsed JSON/YAML/TOML

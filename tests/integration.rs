@@ -72,6 +72,37 @@ fn zip_archive_emits_member_listing_and_aggregates() {
             .is_some());
     }
 
+    let typed_members = parsed.archive_members();
+    assert_eq!(typed_members.len(), members.len());
+    for (typed, member) in typed_members.iter().zip(members) {
+        assert_eq!(
+            member.get("path").and_then(serde_json::Value::as_str),
+            Some(typed.path.as_str())
+        );
+        assert_eq!(
+            member
+                .get("header_offset")
+                .and_then(serde_json::Value::as_u64),
+            typed.header_offset
+        );
+        assert_eq!(
+            member
+                .get("data_offset")
+                .and_then(serde_json::Value::as_u64),
+            typed.data_offset
+        );
+        assert_eq!(
+            member
+                .get("central_header_offset")
+                .and_then(serde_json::Value::as_u64),
+            typed.central_header_offset
+        );
+        assert_eq!(
+            member.get("crc32").and_then(serde_json::Value::as_u64),
+            typed.crc32.map(u64::from)
+        );
+    }
+
     assert_eq!(metrics.get("archive.member_count"), Some(3.0));
     assert!(metrics.get("file.entropy").is_some());
 

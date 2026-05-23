@@ -18,12 +18,12 @@
 //!   `metrics.jar.*`.
 //!
 //! The generic archive walk (`archive.members[]`,
-//! `archive.compression.*`) still runs via `zip::extract` — JAR is
-//! a zip after all — so trait authors get both views.
+//! `archive.compression.*`) runs on the same ZIP handle before this
+//! extractor layers JAR-specific facts on top.
 
 use serde_json::{json, Value as JsonValue};
 use std::collections::BTreeMap;
-use std::io::{Cursor, Read};
+use std::io::{Read, Seek};
 
 use crate::error::Error;
 use crate::output::{Metrics, Values};
@@ -77,16 +77,11 @@ const TRACKED_HEADERS: &[(&str, &str)] = &[
     ("Spring-Boot-Lib", "spring_boot_lib"),
 ];
 
-pub(super) fn extract(
-    bytes: &[u8],
+pub(super) fn extract_from_archive<R: Read + Seek>(
+    zip: &mut ::zip::ZipArchive<R>,
     values: &mut Values,
     metrics: &mut Metrics,
 ) -> Result<(), Error> {
-    let cursor = Cursor::new(bytes);
-    let Ok(mut zip) = ::zip::ZipArchive::new(cursor) else {
-        return Ok(());
-    };
-
     let mut entry_count: u32 = 0;
     let mut class_count: u32 = 0;
     let mut signature_count: u32 = 0;
@@ -127,11 +122,11 @@ pub(super) fn extract(
             multi_release = true;
         }
         if name == "META-INF/MANIFEST.MF" {
-            if let Some(text) = read_text(&mut zip, name) {
+            if let Some(text) = read_text(zip, name) {
                 manifest = parse_manifest(&text);
             }
         } else if pom_group.is_none() && name.ends_with("/pom.properties") {
-            if let Some(text) = read_text(&mut zip, name) {
+            if let Some(text) = read_text(zip, name) {
                 for line in text.lines() {
                     let line = line.trim();
                     if let Some(v) = line.strip_prefix("groupId=") {
@@ -270,7 +265,7 @@ fn parse_manifest(text: &str) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Cursor, Write};
     use zip::write::SimpleFileOptions;
 
     fn build_jar(entries: &[(&str, &[u8])]) -> Vec<u8> {
@@ -291,7 +286,9 @@ mod tests {
     fn run(bytes: &[u8]) -> (Values, Metrics) {
         let mut v = Values::new();
         let mut m = Metrics::new();
-        extract(bytes, &mut v, &mut m).unwrap();
+        if let Ok(mut zip) = crate::formats::zip::open_archive(bytes) {
+            extract_from_archive(&mut zip, &mut v, &mut m).unwrap();
+        }
         (v, m)
     }
 
