@@ -503,6 +503,7 @@ fn extract_header_and_loads(
     load_dylibs(macho, values);
     linker_options(macho, bytes, values);
     objc_image_info(macho, bytes, values);
+    swift_sections(macho, values);
     segment_analysis(macho, values, metrics);
     chained_fixups_marker(macho, metrics);
     function_starts(macho, bytes, values, metrics);
@@ -540,6 +541,7 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
 
     let entry = entry_point(macho);
     let mut wx_count: u64 = 0;
+    let mut wx_segments: Vec<JsonValue> = Vec::new();
     let mut text_writable = false;
     let mut pagezero_size: u64 = 0;
     let mut entry_in_writable = false;
@@ -553,6 +555,7 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
         let readable = segment.initprot & VM_PROT_READ != 0;
         if writable && executable {
             wx_count += 1;
+            wx_segments.push(JsonValue::String(name.clone()));
         }
         if name == "__TEXT" && writable {
             text_writable = true;
@@ -606,6 +609,9 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
         segments_out.push(JsonValue::Object(entry_obj));
     }
     metrics.insert("macho.wx_segment_count", wx_count as f64);
+    if !wx_segments.is_empty() {
+        values.insert("macho.wx_segments", JsonValue::Array(wx_segments));
+    }
     if text_writable {
         metrics.insert("macho.text_segment_writable", 1.0);
     }
@@ -901,10 +907,76 @@ fn objc_image_info(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
                     "swift_version".into(),
                     JsonValue::Number(u64::from(swift_version).into()),
                 );
+                if let Some(label) = swift_version_label(swift_version as u8) {
+                    obj.insert(
+                        "swift_version_label".into(),
+                        JsonValue::String(label.to_string()),
+                    );
+                }
+            }
+            // Bit 3: OBJC_IMAGE_OPTIMIZED_BY_DYLD.
+            // Bit 5: OBJC_IMAGE_IS_SIMULATED.
+            // Bit 6: OBJC_IMAGE_HAS_CATEGORY_CLASS_PROPERTIES.
+            if flags & (1 << 3) != 0 {
+                obj.insert("optimized_by_dyld".into(), JsonValue::Bool(true));
+            }
+            if flags & (1 << 5) != 0 {
+                obj.insert("simulator".into(), JsonValue::Bool(true));
+            }
+            if flags & (1 << 6) != 0 {
+                obj.insert(
+                    "has_category_class_properties".into(),
+                    JsonValue::Bool(true),
+                );
             }
             values.insert("macho.objc", JsonValue::Object(obj));
             return;
         }
+    }
+}
+
+/// Apple's Swift runtime version table — values >= 8 indicate Swift
+/// 5.x where the exact version is encoded in additional metadata.
+fn swift_version_label(byte: u8) -> Option<&'static str> {
+    Some(match byte {
+        0 => return None,
+        1 => "1.0",
+        2 => "1.1",
+        3 => "2.0",
+        4 => "3.0",
+        5 => "4.0",
+        6 => "4.1",
+        7 => "4.2",
+        _ => "5.0+",
+    })
+}
+
+/// `__TEXT,__swift5_*` section family — protocol/type/reflection
+/// metadata emitted by every swiftc-built binary. The specific subset
+/// present pins the Swift compiler version (acfuncs ≥ 5.5, mpenum
+/// newer, …). Emitted as `macho.swift_sections[]` (sorted, deduped
+/// section names with their `__` prefix).
+fn swift_sections(macho: &MachO<'_>, values: &mut Values) {
+    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for segment in &macho.segments {
+        if segment.name().unwrap_or("") != "__TEXT" {
+            continue;
+        }
+        let Ok(sections) = segment.sections() else {
+            continue;
+        };
+        for (section, _data) in sections {
+            let name = section.name().unwrap_or("");
+            if name.starts_with("__swift5_") {
+                out.insert(name.to_string());
+            }
+        }
+    }
+    if !out.is_empty() {
+        values.insert(
+            "macho.swift_sections",
+            JsonValue::Array(out.into_iter().map(JsonValue::String).collect()),
+        );
     }
 }
 
@@ -937,6 +1009,10 @@ fn load_dylibs(macho: &MachO<'_>, values: &mut Values) {
         let mut entry = serde_json::Map::new();
         entry.insert("path".into(), JsonValue::String(path.to_string()));
         entry.insert("kind".into(), JsonValue::String(kind.to_string()));
+        entry.insert(
+            "path_kind".into(),
+            JsonValue::String(install_name_kind(path).to_string()),
+        );
         entry.insert(
             "current_version".into(),
             JsonValue::String(decode_version_nibbles(dylib.current_version)),
@@ -1099,7 +1175,30 @@ fn install_name(macho: &MachO<'_>, values: &mut Values) {
     if let Some(name) = macho.libs.first().copied() {
         if !name.is_empty() && name != "self" {
             put_str(values, "macho.install_name", name);
+            put_str(values, "macho.install_name_kind", install_name_kind(name));
         }
+    }
+}
+
+/// Classify an install_name / dylib path by its leading dyld token.
+/// The 3CX backdoor toggled libffmpeg's `install_name` from `@rpath`
+/// to `@loader_path`; surfacing the kind lets trait authors compare
+/// the categorical form rather than regex-matching the raw string.
+fn install_name_kind(path: &str) -> &'static str {
+    if let Some(rest) = path.strip_prefix('@') {
+        if rest == "rpath" || rest.starts_with("rpath/") {
+            "rpath"
+        } else if rest == "loader_path" || rest.starts_with("loader_path/") {
+            "loader_path"
+        } else if rest == "executable_path" || rest.starts_with("executable_path/") {
+            "executable_path"
+        } else {
+            "other_token"
+        }
+    } else if path.starts_with('/') {
+        "absolute"
+    } else {
+        "relative"
     }
 }
 
@@ -1182,12 +1281,33 @@ fn binary_flags(macho: &MachO<'_>, metrics: &mut Metrics) {
 }
 
 fn info_plist_section(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
+    // Both sections live under `__TEXT` and store a serialized plist
+    // dictionary (XML or binary). `__info_plist` carries the CFBundle
+    // metadata; `__launchd_plist` carries the launchd job spec for
+    // self-installing daemons (`ProgramArguments`, `KeepAlive`,
+    // `RunAtLoad`, …). Surfaced under sibling subtrees so trait
+    // authors can read both with the same shape.
+    for (section_name, value_key) in [
+        ("__info_plist", "macho.info_plist"),
+        ("__launchd_plist", "macho.launchd_plist"),
+    ] {
+        emit_embedded_plist(macho, bytes, values, section_name, value_key);
+    }
+}
+
+fn emit_embedded_plist(
+    macho: &MachO<'_>,
+    bytes: &[u8],
+    values: &mut Values,
+    section_name: &str,
+    value_key: &str,
+) {
     for segment in &macho.segments {
         let Ok(sections) = segment.sections() else {
             continue;
         };
         for (section, _data) in sections {
-            if section.name().unwrap_or("") != "__info_plist" {
+            if section.name().unwrap_or("") != section_name {
                 continue;
             }
             let off = section.offset as usize;
@@ -1198,7 +1318,7 @@ fn info_plist_section(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
             }
             let plist_bytes = &bytes[off..end];
             if let Ok(parsed) = plist::Value::from_reader(std::io::Cursor::new(plist_bytes)) {
-                values.insert("macho.info_plist", plist_to_json(parsed));
+                values.insert(value_key, plist_to_json(parsed));
             }
             return;
         }

@@ -409,6 +409,14 @@ fn classify_pk(path: &Path, data: &[u8]) -> (FileType, DetectionSource) {
         return (FileType::Jar, DetectionSource::Magic);
     }
 
+    if ext == "xpi" {
+        return (FileType::Xpi, DetectionSource::Magic);
+    }
+
+    if ext == "whl" {
+        return (FileType::Whl, DetectionSource::Magic);
+    }
+
     if matches!(
         ext,
         "docx" | "xlsx" | "pptx" | "docm" | "xlsm" | "pptm" | "dotx" | "dotm" | "xltx" | "xltm"
@@ -427,7 +435,7 @@ fn classify_pk(path: &Path, data: &[u8]) -> (FileType, DetectionSource) {
     // OOXML by content (scan for [Content_Types].xml) — but not for archive containers
     let is_archive_opc = matches!(
         ext,
-        "zip" | "jar" | "vsix" | "nupkg" | "xpi" | "epub" | "apk" | "ipa"
+        "zip" | "jar" | "vsix" | "nupkg" | "xpi" | "whl" | "epub" | "apk" | "ipa"
     );
     if !is_archive_opc && memchr::memmem::find(data, b"[Content_Types].xml").is_some() {
         return (FileType::Ooxml, DetectionSource::Magic);

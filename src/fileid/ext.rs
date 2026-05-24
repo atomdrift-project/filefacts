@@ -232,8 +232,11 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "jpg" | "jpeg" => Some(FileType::Jpeg),
         "png" => Some(FileType::Png),
         "pkl" | "pickle" | "joblib" => Some(FileType::Pickle),
-        "zip" | "apk" | "ipa" | "xpi" | "epub" | "nupkg" | "vsix" | "aar" | "egg" | "whl"
-        | "phar" => Some(FileType::Zip),
+        "zip" | "apk" | "ipa" | "epub" | "nupkg" | "vsix" | "aar" | "egg" | "phar" => {
+            Some(FileType::Zip)
+        }
+        "xpi" => Some(FileType::Xpi),
+        "whl" => Some(FileType::Whl),
         "7z" => Some(FileType::SevenZ),
         "rar" => Some(FileType::Rar),
         "deb" => Some(FileType::Deb),

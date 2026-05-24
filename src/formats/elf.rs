@@ -58,11 +58,16 @@ pub(super) fn extract(
     interpreter(&elf, values);
     relro(&elf, values);
     needed_versions(&elf, values);
-    provided_versions(&elf, values);
+    super::elf_dynamic::verdef(&elf, values);
+    super::elf_dynamic::init_arrays(&elf, bytes, values);
+    super::elf_dynamic::dynsym_funcs(&elf, values);
     stripped_metadata(&elf, values, metrics);
     comment(&elf, bytes, values, metrics);
+    gcc_command_line(&elf, bytes, values);
+    super::elf_dwarf::emit(&elf, bytes, values, metrics);
     dt_flags(&elf, values);
     abi_tag(&elf, bytes, values);
+    package_note(&elf, bytes, values);
     gnu_property(&elf, bytes, values, metrics);
     binary_flags(&elf, metrics);
     elf_numeric_metrics(&elf, bytes, metrics, values);
@@ -71,7 +76,8 @@ pub(super) fn extract(
     relocation_kinds(&elf, values);
     segments(&elf, values);
     rizin_fallback(bytes, imports_out, exports_out, functions_out, metrics);
-    linker_family(values);
+    linker_family(&elf, bytes, values);
+    comment_fingerprint(values);
     super::elf_hashes::emit(&elf, values, imports_out, exports_out);
     super::upx::detect(bytes, values);
     {
@@ -106,27 +112,49 @@ pub(super) fn extract(
     Ok(())
 }
 
-/// Identify the linker family that produced this binary from
-/// `elf.comment[]` banners. `GNU ld` / `GNU gold` are recognizable
-/// by their `.comment` strings; LLD and `mold` stamp themselves
-/// distinctly. Emits a single `elf.linker_family` string.
-fn linker_family(values: &mut Values) {
+/// Identify the linker family that produced this binary. Prefers the
+/// dedicated `.note.*` sections (canonical, written by the linker
+/// itself); falls back to scanning `.comment[]` banners for the
+/// linker's name. Emits a single `elf.linker_family` string.
+fn linker_family(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
+    let by_section = |name: &str| {
+        elf.section_headers
+            .iter()
+            .any(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(name))
+    };
+    let family = if by_section(".note.gnu.gold-version") {
+        Some("gold")
+    } else if by_section(".note.mold") {
+        Some("mold")
+    } else if by_section(".note.lld") {
+        Some("lld")
+    } else {
+        None
+    };
+    if let Some(f) = family {
+        put_str(values, "elf.linker_family", f);
+        return;
+    }
+    // `.comment` fallback — covers GNU ld (no dedicated note) and
+    // toolchains that append `ld.lld` / `mold` strings inline.
     let Some(entries) = values
         .get("elf.comment")
         .and_then(serde_json::Value::as_array)
         .cloned()
     else {
+        let _ = bytes;
         return;
     };
     for entry in entries {
         let Some(text) = entry.as_str() else {
             continue;
         };
+        let lower = text.to_lowercase();
         let family = if text.contains("GNU gold") {
             "gold"
-        } else if text.contains("LLD") || text.contains("Linker:") && text.contains("LLD") {
+        } else if text.contains("LLD") || lower.contains("ld.lld") || lower.contains("lld ") {
             "lld"
-        } else if text.contains("mold") {
+        } else if lower.contains("mold ") || text.contains("mold") {
             "mold"
         } else if text.contains("GNU ld") {
             "ld"
@@ -135,6 +163,116 @@ fn linker_family(values: &mut Values) {
         };
         put_str(values, "elf.linker_family", family);
         return;
+    }
+}
+
+/// Best-effort distro/toolchain attribution from the `.comment`
+/// banner strings already emitted under `elf.comment[]`. Surfaces
+/// `elf.distro` (e.g. `wolfi`, `ubuntu`, `debian`, `alpine`, …),
+/// `elf.toolchain_family` (`gcc` / `clang` / `apple_clang`), and
+/// `elf.toolchain` (the family + version, e.g. `"gcc 13.2.0"`).
+///
+/// Trait authors who need finer-grained matching can regex against
+/// the raw `elf.comment[]` entries; these are the common cases.
+fn comment_fingerprint(values: &mut Values) {
+    let Some(entries) = values
+        .get("elf.comment")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+    else {
+        return;
+    };
+    let joined: String = entries
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>()
+        .join("; ");
+    if joined.is_empty() {
+        return;
+    }
+    let lower = joined.to_lowercase();
+    // Wolfi / Chainguard / Kali come before their parent distros —
+    // Wolfi inherits Alpine's banner format, Kali inherits Debian's.
+    let distro: Option<&str> = if lower.contains("wolfi") {
+        Some("wolfi")
+    } else if lower.contains("chainguard") {
+        Some("chainguard")
+    } else if lower.contains("kali") {
+        Some("kali")
+    } else if lower.contains("ubuntu") {
+        Some("ubuntu")
+    } else if lower.contains("debian") {
+        Some("debian")
+    } else if lower.contains("alpine") {
+        Some("alpine")
+    } else if lower.contains("red hat") || lower.contains("redhat") {
+        Some("redhat")
+    } else if lower.contains("rocky") {
+        Some("rocky")
+    } else if lower.contains("almalinux") {
+        Some("almalinux")
+    } else if lower.contains("amazon linux") {
+        Some("amazon")
+    } else if lower.contains("fedora") {
+        Some("fedora")
+    } else if lower.contains("suse") {
+        Some("suse")
+    } else if lower.contains("arch linux") || lower.contains("archlinux") {
+        Some("archlinux")
+    } else if lower.contains("gentoo") {
+        Some("gentoo")
+    } else if lower.contains("nixos") {
+        Some("nixos")
+    } else if lower.contains("openwrt") {
+        Some("openwrt")
+    } else {
+        None
+    };
+    if let Some(d) = distro {
+        put_str(values, "elf.distro", d);
+    }
+
+    let (family, version) = if joined.starts_with("GCC:") || joined.contains("; GCC:") {
+        let version = joined.find("GCC:").and_then(|start| {
+            let rest = &joined[start + "GCC:".len()..];
+            // Skip the parenthesized distro tag.
+            let after_paren = match rest.find(')') {
+                Some(p) => &rest[p + 1..],
+                None => rest,
+            };
+            after_paren
+                .split([';', ',', ' '])
+                .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
+                .map(|t| t.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+        (Some("gcc"), version)
+    } else if joined.contains("Apple LLVM") || joined.contains("Apple clang") {
+        let version = joined.find("version ").and_then(|pos| {
+            let rest = &joined[pos + "version ".len()..];
+            rest.split([' ', '(', ')'])
+                .next()
+                .map(|t| t.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+        (Some("apple_clang"), version)
+    } else if joined.contains("clang version") {
+        let version = joined.find("clang version ").and_then(|pos| {
+            let rest = &joined[pos + "clang version ".len()..];
+            rest.split([' ', '(', ')'])
+                .next()
+                .map(|t| t.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+        (Some("clang"), version)
+    } else {
+        (None, None)
+    };
+    if let Some(f) = family {
+        put_str(values, "elf.toolchain_family", f);
+        if let Some(v) = version {
+            put_str(values, "elf.toolchain", format!("{f} {v}"));
+        }
     }
 }
 
@@ -168,6 +306,28 @@ fn comment(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metri
         "elf.comment",
         JsonValue::Array(texts.into_iter().map(JsonValue::String).collect()),
     );
+}
+
+/// Verbatim `-frecord-gcc-switches` argv. Present when the source was
+/// built with that flag (Fedora/RHEL default on most packages, opt-in
+/// elsewhere). NULs separate argv entries — we render them as single
+/// spaces and collapse internal runs of whitespace, so the value is a
+/// single readable command line per CU. Strong attribution surface
+/// when present, silent otherwise.
+fn gcc_command_line(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
+    let Some(data) = read_section(elf, bytes, ".GCC.command.line") else {
+        return;
+    };
+    let rendered: String = data
+        .iter()
+        .map(|&b| if b == 0 { ' ' } else { b as char })
+        .collect();
+    let trimmed = rendered.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let collapsed: String = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    values.insert("elf.gcc_command_line", JsonValue::String(collapsed));
 }
 
 /// Decompose `DT_FLAGS` and `DT_FLAGS_1` bitfields into a flat string
@@ -264,6 +424,40 @@ fn decompose_df1(v: u64, out: &mut Vec<&'static str>) {
     }
     if v & 0x4000_0000 != 0 {
         out.push("no_reloc");
+    }
+}
+
+/// `.note.package` (`n_type = 0xCAFE1A7E`, vendor `"FDO"`) — FDO
+/// Package Metadata. The descriptor is a JSON document with a fixed
+/// schema (<https://systemd.io/COREDUMP_PACKAGE_METADATA/>): `name`,
+/// `version`, `type` (`rpm`/`deb`/`apk`/…), `cpe`, `url`, `vcs`.
+/// Strongest distro/package attestation any binary format offers —
+/// Wolfi, Chainguard, Fedora 36+, recent systemd builds emit it.
+/// Surfaced as the `elf.package` subtree with the JSON keys verbatim
+/// (so trait authors write `elf.package.type == "apk"`).
+fn package_note(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
+    let Some(notes) = elf.iter_note_headers(bytes) else {
+        return;
+    };
+    for note in notes.flatten() {
+        if note.n_type != 0xCAFE_1A7E {
+            continue;
+        }
+        // Trim trailing NULs — the section may pad up to 4 bytes.
+        let Some(desc) = note.desc.split(|&b| b == 0).next() else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(desc) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<JsonValue>(text) else {
+            continue;
+        };
+        if json.is_null() {
+            continue;
+        }
+        values.insert("elf.package", json);
+        return;
     }
 }
 
@@ -453,27 +647,6 @@ fn pauth_platform_name(platform: u64) -> &'static str {
         1 => "linux",
         0x1000_0002 => "llvm",
         _ => "unknown",
-    }
-}
-
-/// `Verdef` table — symbol versions this shared object *exports*
-/// (parallels `verneed` which is symbols it *requires*). Emits flat
-/// strings of the form `"VERSION_NAME"`.
-fn provided_versions(elf: &Elf<'_>, values: &mut Values) {
-    let Some(verdef) = elf.verdef.as_ref() else {
-        return;
-    };
-    let mut out: Vec<JsonValue> = Vec::new();
-    for def in verdef.iter() {
-        for aux in def.iter() {
-            let name = elf.dynstrtab.get_at(aux.vda_name).unwrap_or("");
-            if !name.is_empty() {
-                out.push(JsonValue::String(name.to_string()));
-            }
-        }
-    }
-    if !out.is_empty() {
-        values.insert("elf.provided_versions", JsonValue::Array(out));
     }
 }
 

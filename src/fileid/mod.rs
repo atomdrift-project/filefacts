@@ -217,6 +217,15 @@ pub enum FileType {
     Chm,
     /// Chrome extension (.crx)
     Crx,
+    /// Mozilla Firefox extension (.xpi) — ZIP container with WebExtension or
+    /// legacy XUL layout. Disambiguated from generic ZIP so the XPI-specific
+    /// signing-scheme shape (`META-INF/mozilla.*`, `META-INF/cose.*`) can be
+    /// surfaced.
+    Xpi,
+    /// Python wheel (.whl) — ZIP container with PEP 427 layout. Distinct
+    /// from generic ZIP so the wheel-specific surface (dist-info, RECORD,
+    /// native-extension count, top-level packages) can be extracted.
+    Whl,
     /// AppleScript source file (.applescript, .scpt)
     AppleScript,
     /// Apple Property List (.plist)
@@ -291,6 +300,8 @@ impl FileType {
                 | Self::Cab
                 | Self::Chm
                 | Self::Crx
+                | Self::Xpi
+                | Self::Whl
                 | Self::Jar
         )
     }
@@ -452,6 +463,8 @@ fn allows_heuristic_extension_override(file_type: FileType) -> bool {
         file_type,
         FileType::Zip
             | FileType::Jar
+            | FileType::Xpi
+            | FileType::Whl
             | FileType::Ooxml
             | FileType::Odf
             | FileType::Cab
@@ -729,6 +742,31 @@ mod tests {
     #[test]
     fn jar_by_ext() {
         assert_detect("lib.war", b"PK\x03\x04war content", FileType::Jar);
+    }
+
+    #[test]
+    fn xpi_by_ext_routes_to_xpi_not_zip() {
+        // ZIP magic + .xpi extension → FileType::Xpi (distinct from generic Zip).
+        assert_detect("addon.xpi", b"PK\x03\x04xpi content", FileType::Xpi);
+    }
+
+    #[test]
+    fn xpi_classified_as_archive() {
+        assert!(FileType::Xpi.is_archive());
+    }
+
+    #[test]
+    fn whl_by_ext_routes_to_whl_not_zip() {
+        assert_detect(
+            "pkg-1.0-py3-none-any.whl",
+            b"PK\x03\x04wheel content",
+            FileType::Whl,
+        );
+    }
+
+    #[test]
+    fn whl_classified_as_archive() {
+        assert!(FileType::Whl.is_archive());
     }
 
     // ── Python ───────────────────────────────────────────────────────

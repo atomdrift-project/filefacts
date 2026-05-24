@@ -1,12 +1,30 @@
 //! `filefacts` command-line interface.
 //!
 //! Reads one file and emits its facts bundle, or one selected top-level
-//! view from that bundle. The terminal renderer mirrors the JSON detail
-//! in a colored, aligned layout (heading pills, grouped metrics,
-//! columnar section / symbol tables) inspired by sibling tools cleave
-//! and litmus.
+//! view from that bundle. When the positional argument is a directory it
+//! is walked recursively, emitting one bundle per regular file.
+//!
+//! The terminal renderer mirrors the JSON detail in a colored, aligned
+//! layout (heading pills, grouped metrics, columnar section / symbol
+//! tables) inspired by sibling tools cleave and litmus.
 
-use std::path::PathBuf;
+// Use jemalloc on unix systems where it isn't the OS default (see Cargo.toml).
+// Built-in `--features jemalloc-prof` activates jemalloc's heap-profiling support
+// (`_RJEM_MALLOC_CONF=prof:true,...`) which cleave-tuna's memory-mode benches consume.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "solaris"
+    ))
+))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use serde::Serialize;
@@ -52,24 +70,67 @@ fn main() -> ExitCode {
         }
     };
 
-    let Some(path) = args.path else {
+    let Some(root) = args.path.clone() else {
         print_usage(true);
         return ExitCode::from(2);
     };
 
-    let bytes = match std::fs::read(&path) {
+    if root.is_dir() {
+        let mut had_error = false;
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("filefacts: cannot read dir {}: {e}", dir.display());
+                    had_error = true;
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                match entry.file_type() {
+                    Ok(ft) if ft.is_dir() => stack.push(p),
+                    Ok(ft) if ft.is_file() => {
+                        if !analyze_one(&p, &args) {
+                            had_error = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        return if had_error {
+            ExitCode::from(1)
+        } else {
+            ExitCode::SUCCESS
+        };
+    }
+
+    if analyze_one(&root, &args) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+// analyze_one parses one file and prints its rendered bundle. Returns
+// false on read/parse/serialise failure so the caller can track whether
+// any file in a directory walk failed.
+fn analyze_one(path: &Path, args: &Args) -> bool {
+    let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("filefacts: cannot read {}: {e}", path.display());
-            return ExitCode::from(1);
+            return false;
         }
     };
 
-    let parsed = match filefacts::open_with_path(&path, &bytes) {
+    let parsed = match filefacts::open_with_path(path, &bytes) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("filefacts: {e}");
-            return ExitCode::from(1);
+            eprintln!("filefacts: {}: {e}", path.display());
+            return false;
         }
     };
 
@@ -78,15 +139,18 @@ fn main() -> ExitCode {
         Format::Json => match serde_json::to_string_pretty(&output) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("filefacts: serialisation failed: {e}");
-                return ExitCode::from(1);
+                eprintln!(
+                    "filefacts: serialisation failed for {}: {e}",
+                    path.display()
+                );
+                return false;
             }
         },
-        Format::Terminal => format_terminal(&path, &parsed, args.view, &output),
+        Format::Terminal => format_terminal(path, &parsed, args.view, &output),
     };
 
     println!("{rendered}");
-    ExitCode::SUCCESS
+    true
 }
 
 #[derive(Serialize)]

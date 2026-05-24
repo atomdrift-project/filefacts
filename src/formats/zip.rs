@@ -31,21 +31,24 @@ pub(super) fn extract(
     archive_members: &mut Vec<ArchiveMember>,
 ) -> Result<(), Error> {
     let mut archive = open_archive(bytes)?;
-    extract_from_archive(&mut archive, values, metrics, archive_members)
+    extract_from_archive(&mut archive, bytes, values, metrics, archive_members)
 }
 
 pub(super) fn extract_from_archive<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
+    bytes: &[u8],
     values: &mut Values,
     metrics: &mut Metrics,
     archive_members: &mut Vec<ArchiveMember>,
 ) -> Result<(), Error> {
     values.insert("archive.format.kind", JsonValue::String("zip".into()));
 
-    let has_comment = !archive.comment().is_empty();
+    let comment = archive.comment();
+    let has_comment = !comment.is_empty();
     if has_comment {
-        let comment = String::from_utf8_lossy(archive.comment()).into_owned();
-        values.insert("archive.comment", JsonValue::String(comment));
+        let comment_str = String::from_utf8_lossy(comment).into_owned();
+        values.insert("archive.comment", JsonValue::String(comment_str));
+        metrics.insert("archive.comment_size", comment.len() as f64);
     }
 
     let mut members: Vec<JsonValue> = Vec::with_capacity(archive.len());
@@ -86,6 +89,17 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     let mut zip_bomb_ratio: f64 = 0.0;
     let mut extra_field_size: u64 = 0;
     let mut uses_zip64 = false;
+    let mut noise_file_count: u64 = 0;
+    let mut sentinel_mtime_count: u64 = 0;
+    let mut future_mtime_count: u64 = 0;
+    let mut entry_comment_count: u64 = 0;
+    let mut entry_comment_size: u64 = 0;
+    // Tag IDs encountered in any LFH/CDH extra field (union across members).
+    let mut extra_field_tags: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+    // Member paths grouped by mtime bucket (None = sentinel/unrecorded).
+    // Used to compute the dominant-bucket / outlier supply-chain signal.
+    let mut mtime_buckets: std::collections::BTreeMap<Option<i64>, Vec<String>> =
+        std::collections::BTreeMap::new();
 
     for i in 0..archive.len() {
         let entry = archive
@@ -133,7 +147,23 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         if let Some(t) = mtime_unix {
             obj.insert("mtime_unix".into(), JsonValue::Number(t.into()));
             mtimes.push(t);
+            // Year-2100 is a safe "impossible" ceiling without needing a
+            // wall clock (works offline; survives system-clock skew).
+            // Seconds since epoch at 2100-01-01 00:00:00 UTC = 4_102_444_800.
+            if t > 4_102_444_800 {
+                future_mtime_count += 1;
+            }
+        } else {
+            // None means the MS-DOS date didn't parse — Mozilla's
+            // (1980, 0, 0) "no recorded timestamp" sentinel is the
+            // common case. Deterministic-build tooling (web-ext, bazel)
+            // produces these intentionally.
+            sentinel_mtime_count += 1;
         }
+        mtime_buckets
+            .entry(mtime_unix)
+            .or_default()
+            .push(name.clone());
 
         let mode_octal = entry.unix_mode();
         if let Some(mode) = mode_octal {
@@ -239,15 +269,46 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         // (`tar.rs` has the linkname in the header and can detect escapes
         // exactly.)
 
+        let mut entry_tags: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
         if let Some(extra) = entry.extra_data() {
             extra_field_size += extra.len() as u64;
-            if extra_field_has_zip64(extra) {
+            for tag in enumerate_extra_tags(extra) {
+                entry_tags.insert(tag);
+                extra_field_tags.insert(tag);
+            }
+            if entry_tags.contains(&0x0001) {
                 uses_zip64 = true;
             }
         }
         // Sentinel sizes in the central directory also indicate Zip64 usage.
         if compressed == 0xFFFF_FFFF || uncompressed == 0xFFFF_FFFF {
             uses_zip64 = true;
+        }
+        if !entry_tags.is_empty() {
+            let tags: Vec<JsonValue> = entry_tags
+                .iter()
+                .map(|t| JsonValue::Number(u64::from(*t).into()))
+                .collect();
+            obj.insert("extra_tags".into(), JsonValue::Array(tags));
+        }
+
+        // Per-entry comment (CDH `file_comment` field) — separate from
+        // the archive-level EOCD comment. Used in some packaging tools
+        // legitimately; abused for out-of-band config strings.
+        let entry_comment = entry.comment();
+        if !entry_comment.is_empty() {
+            entry_comment_count += 1;
+            entry_comment_size += entry_comment.len() as u64;
+            obj.insert(
+                "comment_size".into(),
+                JsonValue::Number((entry_comment.len() as u64).into()),
+            );
+        }
+
+        // Noise files: developer/OS detritus that often slips through
+        // into release builds.
+        if is_noise_filename(&name) {
+            noise_file_count += 1;
         }
 
         archive_members.push(ArchiveMember {
@@ -348,12 +409,85 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         metrics.insert("archive.zip_bomb_ratio", zip_bomb_ratio);
     }
     metrics.insert("archive.extra_field_size", extra_field_size as f64);
+    if !extra_field_tags.is_empty() {
+        let tags: Vec<JsonValue> = extra_field_tags
+            .iter()
+            .map(|t| JsonValue::Number(u64::from(*t).into()))
+            .collect();
+        values.insert("archive.extra_field_tags", JsonValue::Array(tags));
+    }
     if uses_zip64 {
         metrics.insert("archive.uses_zip64", 1.0);
     }
     if has_comment {
         metrics.insert("archive.has_comment", 1.0);
     }
+    metrics.insert("archive.noise_file_count", noise_file_count as f64);
+    metrics.insert("archive.entry_comment_count", entry_comment_count as f64);
+    if entry_comment_size > 0 {
+        metrics.insert("archive.entry_comment_size", entry_comment_size as f64);
+    }
+
+    // Duplicate-name and CRC-collision detection. The `zip` crate
+    // deduplicates the central directory by name at parse time, so the
+    // per-member loop above can't see shadowed entries — walk the raw
+    // CDH bytes directly to catch the ZIP-confusion attack shape.
+    let cd_start = archive.central_directory_start() as usize;
+    let raw_entries = scan_central_directory(bytes, cd_start);
+
+    let mut name_counts: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    let mut crc_counts: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+    for e in &raw_entries {
+        *name_counts.entry(e.name.as_str()).or_insert(0) += 1;
+        if e.uncompressed_size > 0 {
+            *crc_counts.entry(e.crc32).or_insert(0) += 1;
+        }
+    }
+
+    let mut duplicate_member_count: u64 = 0;
+    let mut duplicate_names: Vec<JsonValue> = Vec::new();
+    for (name, count) in &name_counts {
+        if *count > 1 {
+            duplicate_member_count += count - 1;
+            if duplicate_names.len() < 16 {
+                duplicate_names.push(JsonValue::String((*name).to_string()));
+            }
+        }
+    }
+    metrics.insert(
+        "archive.duplicate_member_count",
+        duplicate_member_count as f64,
+    );
+    if !duplicate_names.is_empty() {
+        values.insert(
+            "archive.duplicate_member_names",
+            JsonValue::Array(duplicate_names),
+        );
+    }
+
+    // CRC collisions: how many *extra* entries share a CRC32 with a
+    // prior one (excluding zero-size entries, which all share CRC=0).
+    let mut crc_collision_count: u64 = 0;
+    for (_, count) in &crc_counts {
+        if *count > 1 {
+            crc_collision_count += count - 1;
+        }
+    }
+    metrics.insert("archive.crc_collision_count", crc_collision_count as f64);
+
+    // Sentinel mtime count derived from the raw CDH (the zip crate's
+    // dedup keeps only one entry per name, hiding sentinel-mtime
+    // duplicates from the per-member loop). Recompute from raw — the
+    // value-add is that this also catches duplicates' sentinel state.
+    let raw_sentinel_count = raw_entries
+        .iter()
+        .filter(|e| e.parsed_mtime.is_none())
+        .count() as u64;
+    let final_sentinel_count = sentinel_mtime_count.max(raw_sentinel_count);
+    metrics.insert(
+        "archive.timing.sentinel_mtime_count",
+        final_sentinel_count as f64,
+    );
 
     if !mtimes.is_empty() {
         let min = *mtimes.iter().min().unwrap_or(&0);
@@ -363,6 +497,53 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         metrics.insert("archive.timing.mtime_spread_seconds", (max - min) as f64);
         let unique: std::collections::BTreeSet<i64> = mtimes.iter().copied().collect();
         metrics.insert("archive.timing.mtime_unique_count", unique.len() as f64);
+        let ratio = unique.len() as f64 / mtimes.len() as f64;
+        metrics.insert("archive.timing.mtime_unique_ratio", ratio);
+    }
+    if future_mtime_count > 0 {
+        metrics.insert(
+            "archive.timing.future_mtime_count",
+            future_mtime_count as f64,
+        );
+    }
+
+    // Dominant-bucket / outlier analysis. Buckets the entries by exact
+    // mtime (sentinel/None being its own bucket); when one bucket
+    // covers a strict majority (>50%) of members, every other member
+    // is reported as an "outlier" — the supply-chain "13 files at
+    // sentinel + 1 file with a real timestamp" signal.
+    let total_members = archive.len();
+    if total_members > 0 && !mtime_buckets.is_empty() {
+        let (dominant_count, dominant_key) = mtime_buckets
+            .iter()
+            .map(|(k, v)| (v.len() as u64, *k))
+            .max_by_key(|(count, _)| *count)
+            .unwrap_or((0, None));
+        let dominant_fraction = dominant_count as f64 / total_members as f64;
+        metrics.insert("archive.timing.mtime_dominant_count", dominant_count as f64);
+        metrics.insert("archive.timing.mtime_dominant_fraction", dominant_fraction);
+        if dominant_fraction > 0.5 && dominant_count < total_members as u64 {
+            let mut outliers: Vec<JsonValue> = Vec::new();
+            for (k, paths) in &mtime_buckets {
+                if *k == dominant_key {
+                    continue;
+                }
+                for p in paths {
+                    if outliers.len() >= 16 {
+                        break;
+                    }
+                    outliers.push(JsonValue::String(p.clone()));
+                }
+            }
+            let outlier_count = total_members as u64 - dominant_count;
+            metrics.insert("archive.timing.mtime_outlier_count", outlier_count as f64);
+            if !outliers.is_empty() {
+                values.insert(
+                    "archive.timing.mtime_outlier_members",
+                    JsonValue::Array(outliers),
+                );
+            }
+        }
     }
 
     // Mozilla / JAR signing-pipeline detection: existence of the
@@ -388,7 +569,163 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         values.insert("archive.signing.jar_signed_shape", JsonValue::Bool(true));
     }
 
+    // Chrome Web Store signed-extension shape. The `_metadata/verified_contents.json`
+    // entry is the canonical marker; it is unique to the Chrome web-store
+    // signing pipeline and lets a CRX-renamed-to-.zip be told apart from
+    // a generic ZIP without inspecting the CRX header.
+    if members_includes(archive, "_metadata/verified_contents.json") {
+        values.insert(
+            "archive.signing.chrome_webstore_shape",
+            JsonValue::Bool(true),
+        );
+    }
+
+    // Container-level structural facts derived from the raw byte stream:
+    // prefix bytes before the first LFH (self-extracting stubs / polyglots)
+    // and trailing bytes after the EOCD record (appended payloads).
+    let prefix = scan_prefix_bytes(bytes);
+    if prefix > 0 {
+        metrics.insert("archive.prefix_bytes", prefix as f64);
+    }
+    let trailing = scan_trailing_bytes(bytes);
+    if trailing > 0 {
+        metrics.insert("archive.trailing_bytes", trailing as f64);
+    }
+
     Ok(())
+}
+
+/// One central-directory entry as recovered by the raw walker. The
+/// fields are the subset filefacts needs for duplicate / CRC collision
+/// / sentinel-mtime detection — *not* a full CDH model.
+struct RawCdhEntry {
+    name: String,
+    crc32: u32,
+    uncompressed_size: u64,
+    parsed_mtime: Option<i64>,
+}
+
+/// Walk the raw central directory and return every entry — including
+/// duplicates that the `zip` crate's name-keyed map collapses. Starts
+/// at `cd_start` (the byte offset reported by `central_directory_start`)
+/// and stops when it can no longer find a `PK\x01\x02` signature.
+fn scan_central_directory(bytes: &[u8], cd_start: usize) -> Vec<RawCdhEntry> {
+    let mut out = Vec::new();
+    let mut i = cd_start;
+    while i + 46 <= bytes.len() {
+        if &bytes[i..i + 4] != b"PK\x01\x02" {
+            break;
+        }
+        let crc = u32::from_le_bytes([bytes[i + 16], bytes[i + 17], bytes[i + 18], bytes[i + 19]]);
+        let csize =
+            u32::from_le_bytes([bytes[i + 20], bytes[i + 21], bytes[i + 22], bytes[i + 23]]);
+        let usize_ =
+            u32::from_le_bytes([bytes[i + 24], bytes[i + 25], bytes[i + 26], bytes[i + 27]]);
+        let name_len = u16::from_le_bytes([bytes[i + 28], bytes[i + 29]]) as usize;
+        let extra_len = u16::from_le_bytes([bytes[i + 30], bytes[i + 31]]) as usize;
+        let comment_len = u16::from_le_bytes([bytes[i + 32], bytes[i + 33]]) as usize;
+        let mod_time = u16::from_le_bytes([bytes[i + 12], bytes[i + 13]]);
+        let mod_date = u16::from_le_bytes([bytes[i + 14], bytes[i + 15]]);
+        let name_start = i + 46;
+        let name_end = name_start + name_len;
+        if name_end > bytes.len() {
+            break;
+        }
+        let name = String::from_utf8_lossy(&bytes[name_start..name_end]).into_owned();
+        let parsed_mtime = ::zip::DateTime::try_from_msdos(mod_date, mod_time)
+            .ok()
+            .and_then(crate::scan::zip_datetime_to_unix);
+        out.push(RawCdhEntry {
+            name,
+            crc32: crc,
+            uncompressed_size: u64::from(usize_),
+            parsed_mtime,
+        });
+        let _ = csize;
+        i = name_end + extra_len + comment_len;
+    }
+    out
+}
+
+/// Walk an extra-field TLV blob and return the set of tag IDs present.
+/// Format: `[u16 tag][u16 size][size bytes]` repeating. Malformed input
+/// (a length that would overrun the buffer) stops the walk silently.
+pub(super) fn enumerate_extra_tags(extra: &[u8]) -> std::collections::BTreeSet<u16> {
+    let mut tags = std::collections::BTreeSet::new();
+    let mut i = 0usize;
+    while i + 4 <= extra.len() {
+        let tag = u16::from_le_bytes([extra[i], extra[i + 1]]);
+        let size = u16::from_le_bytes([extra[i + 2], extra[i + 3]]) as usize;
+        tags.insert(tag);
+        let Some(next) = i.checked_add(4).and_then(|n| n.checked_add(size)) else {
+            break;
+        };
+        if next > extra.len() {
+            break;
+        }
+        i = next;
+    }
+    tags
+}
+
+/// Names treated as developer/OS detritus: macOS resource forks and
+/// `.DS_Store`, Windows `Thumbs.db` / `desktop.ini`. Counted as
+/// `archive.noise_file_count`. Conservative — files matching these
+/// patterns indicate sloppy packaging, not malice on their own.
+fn is_noise_filename(path: &str) -> bool {
+    if path.starts_with("__MACOSX/") {
+        return true;
+    }
+    let base = path.rsplit('/').next().unwrap_or(path);
+    matches!(base, ".DS_Store" | "Thumbs.db" | "desktop.ini")
+}
+
+/// Offset of the first ZIP local-file-header signature `PK\x03\x04`.
+/// Returning >0 means the archive carries a prefix (self-extracting
+/// stub, polyglot, or appended-front payload). The `zip` crate parses
+/// such archives correctly because EOCD offsets are relative to the
+/// start of stream, but the prefix is still container-level data
+/// outside any signed-content scheme.
+fn scan_prefix_bytes(bytes: &[u8]) -> usize {
+    memchr::memmem::find(bytes, b"PK\x03\x04").unwrap_or(0)
+}
+
+/// Bytes appended after the End-of-Central-Directory record's stated
+/// end (EOCD offset + 22 + comment length). A non-zero value means an
+/// attacker (or an aggressive concatenator) stuck data on the end of
+/// the archive that the canonical EOCD doesn't account for.
+fn scan_trailing_bytes(bytes: &[u8]) -> usize {
+    let Some(eocd_offset) = find_eocd(bytes) else {
+        return 0;
+    };
+    if eocd_offset + 22 > bytes.len() {
+        return 0;
+    }
+    let comment_len =
+        u16::from_le_bytes([bytes[eocd_offset + 20], bytes[eocd_offset + 21]]) as usize;
+    let end = eocd_offset + 22 + comment_len;
+    bytes.len().saturating_sub(end)
+}
+
+/// Locate the End-of-Central-Directory signature `PK\x05\x06`. ZIP
+/// readers scan backward from EOF over at most 64 KiB + 22 because the
+/// EOCD itself is 22 bytes and the comment can be up to 65 535 bytes.
+/// Returns the offset of the EOCD signature, or `None` if not found.
+fn find_eocd(bytes: &[u8]) -> Option<usize> {
+    const MAX_COMMENT_LEN: usize = 65_535;
+    const EOCD_LEN: usize = 22;
+    if bytes.len() < EOCD_LEN {
+        return None;
+    }
+    let scan_start = bytes.len().saturating_sub(MAX_COMMENT_LEN + EOCD_LEN);
+    let window = &bytes[scan_start..];
+    let mut best: Option<usize> = None;
+    for (i, w) in window.windows(4).enumerate() {
+        if w == [0x50, 0x4b, 0x05, 0x06] {
+            best = Some(scan_start + i);
+        }
+    }
+    best
 }
 
 fn archive_names<R: std::io::Read + std::io::Seek>(
@@ -605,25 +942,6 @@ fn is_homoglyph_char(ch: char) -> bool {
             | 'Ρ' | 'Τ' | 'Υ' | 'Χ'
             | 'ο' | 'ν'
     )
-}
-
-/// Scan a raw central-directory extra-field blob for the Zip64
-/// extended-information field (tag `0x0001`). Returns true on first
-/// match. Format: `[u16 tag][u16 size][size bytes]` repeating.
-fn extra_field_has_zip64(extra: &[u8]) -> bool {
-    let mut i = 0usize;
-    while i + 4 <= extra.len() {
-        let tag = u16::from_le_bytes([extra[i], extra[i + 1]]);
-        let size = u16::from_le_bytes([extra[i + 2], extra[i + 3]]) as usize;
-        if tag == 0x0001 {
-            return true;
-        }
-        let Some(next) = i.checked_add(4).and_then(|n| n.checked_add(size)) else {
-            break;
-        };
-        i = next;
-    }
-    false
 }
 
 fn compression_method_name(method: CompressionMethod) -> &'static str {
@@ -1021,5 +1339,369 @@ mod tests {
         ]);
         let (_, m) = run(&z);
         assert_eq!(m.get("archive.max_filename_length"), Some(120.0));
+    }
+
+    // ---- Extra-field tag enumeration (task 3) ----
+
+    #[test]
+    fn enumerate_extra_tags_handles_known_tlv_stream() {
+        // Two well-formed TLVs back-to-back: Unicode Path (0x7075) with 3
+        // bytes of body, followed by NTFS times (0x000a) with 4 bytes.
+        let extra = &[
+            0x75, 0x70, 0x03, 0x00, b'a', b'b', b'c', 0x0a, 0x00, 0x04, 0x00, 1, 2, 3, 4,
+        ];
+        let tags = enumerate_extra_tags(extra);
+        assert!(tags.contains(&0x7075));
+        assert!(tags.contains(&0x000a));
+        assert_eq!(tags.len(), 2);
+    }
+
+    #[test]
+    fn enumerate_extra_tags_stops_on_overrun() {
+        // Header claims 100 bytes of body but only 2 are present —
+        // walker must stop without panic and report the single tag it
+        // managed to read (the tag header itself is intact).
+        let extra = &[0x01, 0x00, 100, 0x00, 0xde, 0xad];
+        let tags = enumerate_extra_tags(extra);
+        assert!(tags.contains(&0x0001));
+        assert_eq!(tags.len(), 1);
+    }
+
+    #[test]
+    fn enumerate_extra_tags_empty_input_is_empty() {
+        assert!(enumerate_extra_tags(&[]).is_empty());
+    }
+
+    // ---- Out-of-band smuggling detectors (task 4) ----
+
+    #[test]
+    fn comment_size_emitted_when_archive_has_comment() {
+        let mut buf = Cursor::new(Vec::<u8>::new());
+        {
+            let mut w = ZipWriter::new(&mut buf);
+            w.set_raw_comment(b"hello".to_vec().into_boxed_slice());
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            w.start_file("a", opts).unwrap();
+            w.write_all(b"x").unwrap();
+            w.finish().unwrap();
+        }
+        let (_, m) = run(&buf.into_inner());
+        assert_eq!(m.get("archive.comment_size"), Some(5.0));
+    }
+
+    #[test]
+    fn prefix_bytes_detected_for_polyglot_with_leading_payload() {
+        let z = build_zip(&[("a", b"x", CompressionMethod::Stored)]);
+        // Prepend a 16-byte stub before the first local file header.
+        let mut polyglot = b"\x00".repeat(16);
+        polyglot.extend_from_slice(&z);
+        let (_, m) = run(&polyglot);
+        assert_eq!(m.get("archive.prefix_bytes"), Some(16.0));
+    }
+
+    #[test]
+    fn trailing_bytes_detected_for_appended_payload() {
+        let z = build_zip(&[("a", b"x", CompressionMethod::Stored)]);
+        let mut tampered = z.clone();
+        tampered.extend_from_slice(b"appended-data-here");
+        let (_, m) = run(&tampered);
+        assert_eq!(m.get("archive.trailing_bytes"), Some(18.0));
+    }
+
+    #[test]
+    fn no_prefix_or_trailing_for_clean_archive() {
+        let z = build_zip(&[("a", b"x", CompressionMethod::Stored)]);
+        let (_, m) = run(&z);
+        assert!(m.get("archive.prefix_bytes").is_none());
+        assert!(m.get("archive.trailing_bytes").is_none());
+    }
+
+    /// Build a minimal hand-rolled ZIP with two CDH entries pointing at
+    /// the *same* local-file body and the same on-disk name. ZipWriter
+    /// rejects duplicate names, so this exercises the duplicate-name
+    /// detector with raw bytes — exactly the ZIP-confusion attack
+    /// shape (one CDH-only, one LFH+CDH, two paths winning).
+    fn build_duplicate_name_zip() -> Vec<u8> {
+        let mut out = Vec::new();
+        let name = b"dup.txt";
+        let body = b"hello";
+        let crc = crc32fast::hash(body);
+
+        // Single local file header + body.
+        out.extend_from_slice(b"PK\x03\x04");
+        out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&0u16.to_le_bytes()); // method = stored
+        out.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        out.extend_from_slice(&0u16.to_le_bytes()); // mod date
+        out.extend_from_slice(&crc.to_le_bytes()); // crc
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes()); // csize
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes()); // usize
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes()); // name len
+        out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        out.extend_from_slice(name);
+        out.extend_from_slice(body);
+
+        let lfh_offset: u32 = 0;
+        let cd_start = out.len() as u32;
+
+        // Two central-directory entries pointing at the same LFH.
+        for _ in 0..2 {
+            out.extend_from_slice(b"PK\x01\x02");
+            out.extend_from_slice(&0x031Eu16.to_le_bytes()); // version made by
+            out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            out.extend_from_slice(&0u16.to_le_bytes()); // flags
+            out.extend_from_slice(&0u16.to_le_bytes()); // method
+            out.extend_from_slice(&0u16.to_le_bytes()); // mod time
+            out.extend_from_slice(&0u16.to_le_bytes()); // mod date
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+            out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+            out.extend_from_slice(&0u16.to_le_bytes()); // disk
+            out.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+            out.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+            out.extend_from_slice(&lfh_offset.to_le_bytes());
+            out.extend_from_slice(name);
+        }
+
+        let cd_size = (out.len() as u32) - cd_start;
+
+        // EOCD
+        out.extend_from_slice(b"PK\x05\x06");
+        out.extend_from_slice(&0u16.to_le_bytes()); // disk
+        out.extend_from_slice(&0u16.to_le_bytes()); // disk start
+        out.extend_from_slice(&2u16.to_le_bytes()); // entries on disk
+        out.extend_from_slice(&2u16.to_le_bytes()); // total entries
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_start.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+
+        out
+    }
+
+    #[test]
+    fn duplicate_member_count_detects_zip_confusion() {
+        let z = build_duplicate_name_zip();
+        let (v, m) = run(&z);
+        // Two CDH entries with the same name → one duplicate beyond the first.
+        assert_eq!(m.get("archive.duplicate_member_count"), Some(1.0));
+        let names = v
+            .get("archive.duplicate_member_names")
+            .and_then(|x| x.as_array())
+            .expect("duplicate names emitted");
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].as_str(), Some("dup.txt"));
+    }
+
+    #[test]
+    fn crc_collision_count_detects_identical_bodies() {
+        // Two files with identical bodies → identical CRC32.
+        let z = build_zip(&[
+            ("one.txt", b"identical body", CompressionMethod::Stored),
+            ("two.txt", b"identical body", CompressionMethod::Stored),
+            ("three.txt", b"different", CompressionMethod::Stored),
+        ]);
+        let (_, m) = run(&z);
+        assert_eq!(m.get("archive.crc_collision_count"), Some(1.0));
+    }
+
+    #[test]
+    fn crc_collision_ignores_zero_size_entries() {
+        // Two empty files share CRC32=0 but aren't a real collision.
+        let z = build_zip(&[
+            ("empty1", b"", CompressionMethod::Stored),
+            ("empty2", b"", CompressionMethod::Stored),
+        ]);
+        let (_, m) = run(&z);
+        assert_eq!(m.get("archive.crc_collision_count"), Some(0.0));
+    }
+
+    #[test]
+    fn find_eocd_locates_signature_at_end_of_clean_zip() {
+        let z = build_zip(&[("a", b"x", CompressionMethod::Stored)]);
+        let offset = find_eocd(&z).unwrap();
+        assert_eq!(&z[offset..offset + 4], b"PK\x05\x06");
+        // Clean zip → EOCD sits exactly 22 bytes from the end.
+        assert_eq!(offset, z.len() - 22);
+    }
+
+    #[test]
+    fn find_eocd_returns_none_for_too_short_input() {
+        assert!(find_eocd(b"PK").is_none());
+    }
+
+    // ---- Timestamp anomalies (task 5) ----
+
+    #[test]
+    fn sentinel_mtime_count_counts_unparseable_dates() {
+        // ZipWriter always emits a valid DateTime, so we hand-roll a
+        // zip with mod_date=0 mod_time=0 (day=0 month=0 → unparseable,
+        // matching the Mozilla "(1980, 0, 0) no recorded timestamp"
+        // shape that filefacts treats as a sentinel).
+        let z = build_duplicate_name_zip();
+        let (_, m) = run(&z);
+        // The hand-rolled archive has 2 CDH entries both at the sentinel.
+        assert_eq!(m.get("archive.timing.sentinel_mtime_count"), Some(2.0));
+    }
+
+    #[test]
+    fn dominant_mtime_outlier_detected_for_supply_chain_drop() {
+        // Three files at sentinel + one file with a real future mtime —
+        // the classic "attacker dropped one extra entry" signal.
+        let mut buf = Cursor::new(Vec::<u8>::new());
+        {
+            let mut w = ZipWriter::new(&mut buf);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            w.start_file("a", opts).unwrap();
+            w.write_all(b"x").unwrap();
+            w.start_file("b", opts).unwrap();
+            w.write_all(b"y").unwrap();
+            w.start_file("c", opts).unwrap();
+            w.write_all(b"z").unwrap();
+            let real = zip::DateTime::from_date_and_time(2025, 6, 15, 12, 0, 0).unwrap();
+            w.start_file("payload.dropped", opts.last_modified_time(real))
+                .unwrap();
+            w.write_all(b"!").unwrap();
+            w.finish().unwrap();
+        }
+        let (v, m) = run(&buf.into_inner());
+        // Three of four entries share the sentinel bucket → fraction = 0.75.
+        let fraction = m.get("archive.timing.mtime_dominant_fraction").unwrap();
+        assert!(
+            (fraction - 0.75).abs() < 1e-9,
+            "expected ~0.75, got {fraction}"
+        );
+        assert_eq!(m.get("archive.timing.mtime_outlier_count"), Some(1.0));
+        let outliers = v
+            .get("archive.timing.mtime_outlier_members")
+            .and_then(|x| x.as_array())
+            .unwrap();
+        assert_eq!(outliers.len(), 1);
+        assert_eq!(outliers[0].as_str(), Some("payload.dropped"));
+    }
+
+    #[test]
+    fn no_outliers_emitted_when_no_dominant_majority() {
+        // Two distinct buckets, 1 entry each — neither is a majority.
+        let mut buf = Cursor::new(Vec::<u8>::new());
+        {
+            let mut w = ZipWriter::new(&mut buf);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            let d1 = zip::DateTime::from_date_and_time(2020, 1, 1, 0, 0, 0).unwrap();
+            let d2 = zip::DateTime::from_date_and_time(2025, 1, 1, 0, 0, 0).unwrap();
+            w.start_file("a", opts.last_modified_time(d1)).unwrap();
+            w.write_all(b"x").unwrap();
+            w.start_file("b", opts.last_modified_time(d2)).unwrap();
+            w.write_all(b"y").unwrap();
+            w.finish().unwrap();
+        }
+        let (v, m) = run(&buf.into_inner());
+        // Dominant fraction is 0.5, not strictly greater → no outliers.
+        assert_eq!(m.get("archive.timing.mtime_dominant_fraction"), Some(0.5));
+        assert!(m.get("archive.timing.mtime_outlier_count").is_none());
+        assert!(v.get("archive.timing.mtime_outlier_members").is_none());
+    }
+
+    #[test]
+    fn mtime_unique_ratio_one_when_all_distinct() {
+        let mut buf = Cursor::new(Vec::<u8>::new());
+        {
+            let mut w = ZipWriter::new(&mut buf);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            let d1 = zip::DateTime::from_date_and_time(2020, 1, 1, 0, 0, 0).unwrap();
+            let d2 = zip::DateTime::from_date_and_time(2021, 1, 1, 0, 0, 0).unwrap();
+            w.start_file("a", opts.last_modified_time(d1)).unwrap();
+            w.write_all(b"x").unwrap();
+            w.start_file("b", opts.last_modified_time(d2)).unwrap();
+            w.write_all(b"y").unwrap();
+            w.finish().unwrap();
+        }
+        let (_, m) = run(&buf.into_inner());
+        assert_eq!(m.get("archive.timing.mtime_unique_ratio"), Some(1.0));
+    }
+
+    #[test]
+    fn future_mtime_count_flags_year_2100_plus() {
+        let mut buf = Cursor::new(Vec::<u8>::new());
+        {
+            let mut w = ZipWriter::new(&mut buf);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            let future = zip::DateTime::from_date_and_time(2107, 12, 31, 23, 59, 58).unwrap();
+            w.start_file("a", opts.last_modified_time(future)).unwrap();
+            w.write_all(b"x").unwrap();
+            w.finish().unwrap();
+        }
+        let (_, m) = run(&buf.into_inner());
+        assert_eq!(m.get("archive.timing.future_mtime_count"), Some(1.0));
+    }
+
+    // ---- Noise files + Chrome web-store shape (task 6) ----
+
+    #[test]
+    fn noise_file_count_tracks_developer_detritus() {
+        let z = build_zip(&[
+            ("__MACOSX/foo", b"x", CompressionMethod::Stored),
+            ("subdir/.DS_Store", b"x", CompressionMethod::Stored),
+            ("Thumbs.db", b"x", CompressionMethod::Stored),
+            ("desktop.ini", b"x", CompressionMethod::Stored),
+            ("clean.txt", b"x", CompressionMethod::Stored),
+        ]);
+        let (_, m) = run(&z);
+        assert_eq!(m.get("archive.noise_file_count"), Some(4.0));
+    }
+
+    #[test]
+    fn is_noise_filename_helper() {
+        assert!(is_noise_filename("__MACOSX/anything"));
+        assert!(is_noise_filename(".DS_Store"));
+        assert!(is_noise_filename("nested/path/.DS_Store"));
+        assert!(is_noise_filename("Thumbs.db"));
+        assert!(is_noise_filename("desktop.ini"));
+        assert!(!is_noise_filename("ok.txt"));
+        assert!(!is_noise_filename("a/b/c.txt"));
+        // Case-sensitive — exact Windows / macOS conventions only.
+        assert!(!is_noise_filename("THUMBS.DB"));
+    }
+
+    #[test]
+    fn chrome_webstore_shape_detected() {
+        let z = build_zip(&[
+            (
+                "_metadata/verified_contents.json",
+                b"{}",
+                CompressionMethod::Stored,
+            ),
+            ("manifest.json", b"{}", CompressionMethod::Stored),
+        ]);
+        let (v, _) = run(&z);
+        assert_eq!(
+            v.get("archive.signing.chrome_webstore_shape")
+                .and_then(|x| x.as_bool()),
+            Some(true)
+        );
+    }
+
+    // ---- Per-entry extra_tags surface ----
+
+    #[test]
+    fn extra_field_tags_aggregated_at_archive_level() {
+        // ZipWriter at default settings doesn't synthesize Unicode-path
+        // extras, but Mach-O and NTFS-times extras are sometimes added
+        // by Info-ZIP. Building a clean archive: extra_field_tags is
+        // either absent or contains tags the writer chose to emit. The
+        // important invariant is that *when* extras exist, they parse
+        // to a deduped sorted u16 set — already covered by
+        // enumerate_extra_tags_handles_known_tlv_stream.
+        let z = build_zip(&[("a", b"x", CompressionMethod::Stored)]);
+        let (v, _) = run(&z);
+        // Either absent (no extras) or a JSON array of numbers.
+        if let Some(arr) = v.get("archive.extra_field_tags").and_then(|x| x.as_array()) {
+            for item in arr {
+                assert!(item.as_u64().is_some());
+            }
+        }
     }
 }

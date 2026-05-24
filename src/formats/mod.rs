@@ -18,11 +18,14 @@ use crate::error::Error;
 use crate::fileid::FileType;
 use crate::output::{ArchiveMember, Errors, Metrics, Section, Strings, Values};
 
+mod binary_attribution;
 mod build_toolchain;
 mod chm;
 mod class;
 mod common;
 mod elf;
+mod elf_dwarf;
+mod elf_dynamic;
 mod elf_hashes;
 mod generic;
 mod go_buildinfo;
@@ -56,6 +59,8 @@ mod upx;
 mod vba;
 pub(crate) mod vba_symbols;
 mod vsix;
+mod whl;
+mod xpi;
 mod zip;
 
 /// Drive the right extractor for `file_type` and merge its output into
@@ -86,7 +91,7 @@ pub(crate) fn extract(
     // values) what generic emits.
     generic::extract(bytes, values, strings, metrics);
 
-    match file_type {
+    let result = match file_type {
         FileType::Pe => pe::extract(
             bytes, values, strings, metrics, sections, imports, exports, functions, errors,
         ),
@@ -103,7 +108,7 @@ pub(crate) fn extract(
             // Open the ZIP container once: generic archive facts first,
             // then the OOXML-specific `office.*` layer from the same handle.
             let mut archive = zip::open_archive(bytes)?;
-            zip::extract_from_archive(&mut archive, values, metrics, archive_members)?;
+            zip::extract_from_archive(&mut archive, bytes, values, metrics, archive_members)?;
             ooxml::extract_from_archive(&mut archive, values, metrics)
         }
         FileType::OleDoc => {
@@ -118,8 +123,22 @@ pub(crate) fn extract(
             // Open the ZIP container once: generic archive facts first,
             // then the JAR-specific surface from the same handle.
             let mut archive = zip::open_archive(bytes)?;
-            zip::extract_from_archive(&mut archive, values, metrics, archive_members)?;
+            zip::extract_from_archive(&mut archive, bytes, values, metrics, archive_members)?;
             jar::extract_from_archive(&mut archive, values, metrics)
+        }
+        FileType::Xpi => {
+            // Open the ZIP container once: generic archive facts first,
+            // then the XPI-specific signing-shape layer.
+            let mut archive = zip::open_archive(bytes)?;
+            zip::extract_from_archive(&mut archive, bytes, values, metrics, archive_members)?;
+            xpi::extract_from_archive(&mut archive, values, metrics)
+        }
+        FileType::Whl => {
+            // Open the ZIP container once: generic archive facts first,
+            // then the wheel-specific dist-info / RECORD layer.
+            let mut archive = zip::open_archive(bytes)?;
+            zip::extract_from_archive(&mut archive, bytes, values, metrics, archive_members)?;
+            whl::extract_from_archive(&mut archive, values, metrics)
         }
         FileType::Tar | FileType::TarGz | FileType::TarBz2 | FileType::TarXz | FileType::TarZst => {
             tar::extract(bytes, file_type, values, metrics, archive_members)
@@ -185,5 +204,14 @@ pub(crate) fn extract(
         }
 
         _ => Ok(()),
+    };
+
+    // Cross-format binary attribution derived from the merged import
+    // view (sanitizer instrumentation, FORTIFY_SOURCE wrappers).
+    // Skipped silently when no imports were collected.
+    if !imports.is_empty() {
+        binary_attribution::emit(imports, values);
     }
+
+    result
 }

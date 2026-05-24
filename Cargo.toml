@@ -1,6 +1,6 @@
 [package]
 name = "filefacts"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.82"
 authors = ["The Atomdrift Project"]
@@ -45,6 +45,11 @@ p384 = { version = "0.13", features = ["ecdsa"] }
 # Binary formats. `goblin` is a single crate that handles PE, ELF, and Mach-O
 # behind one parse entry point; we use it for all three.
 goblin = { version = "0.10", default-features = false, features = ["std", "pe32", "pe64", "elf32", "elf64", "endian_fd", "mach32", "mach64", "archive"] }
+
+# DWARF debug-info reader — surfaces DW_AT_producer (full compile
+# command line per CU) and DW_AT_comp_dir from unstripped ELF
+# binaries.
+gimli = { version = "0.32", default-features = false, features = ["read", "std"] }
 
 # Language-aware string extractor — Go/Rust fat-pointer aware, dedupes
 # packed runs, decodes XOR-obfuscated and base64-wrapped payloads.
@@ -143,12 +148,26 @@ tempfile = "3"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Use jemalloc on unix systems where it isn't the OS default.
+# FreeBSD/DragonFlyBSD ship jemalloc as the default; bundling a second copy
+# causes TSD assertion failures in jails. OpenBSD's jemalloc version string
+# format is incompatible with tikv-jemalloc-sys's configure script. illumos
+# and Solaris ship libumem.
+[target.'cfg(all(unix, not(any(target_os = "freebsd", target_os = "dragonfly", target_os = "openbsd", target_os = "illumos", target_os = "solaris"))))'.dependencies]
+tikv-jemallocator = "0.6"
+
 [dev-dependencies]
 # Snapshot-test framework used by per-format fixture tests.
 insta = { version = "1", features = ["json"] }
 
 [features]
 default = []
+# Enables jemalloc heap profiling. Build with:
+#   cargo build --profile profiling --features jemalloc-prof --bin filefacts
+# Run with (note the `_RJEM_` prefix — tikv-jemalloc renames MALLOC_CONF):
+#   _RJEM_MALLOC_CONF="prof:true,prof_active:true,prof_final:true,lg_prof_interval:28,prof_prefix:out/heap/jeprof" \
+#     out/filefacts.heap <path>
+jemalloc-prof = ["tikv-jemallocator/profiling"]
 
 [lints.rust]
 # rizin subprocess hardening (libc::setrlimit pre_exec, libc::kill on the
@@ -238,3 +257,8 @@ too_many_lines = "allow"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[profile.profiling]
+inherits = "release"
+strip = "none"
+debug = 2
