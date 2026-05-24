@@ -115,6 +115,11 @@ tree-sitter-objc = "3"
 tree-sitter-kotlin-ng = "1"
 tree-sitter-swift = "0.7"
 tree-sitter-powershell = "0.25"
+ts-parser-perl = "1.0.2"
+tree-sitter-groovy = "0.1"
+tree-sitter-zig = "1.1"
+tree-sitter-elixir = "0.3"
+tree-sitter-make = "1.1.1"
 
 # Authenticode signature parsing. `cms` parses the PKCS#7 SignedData
 # envelope; `x509-cert` decodes the embedded signer certificate;

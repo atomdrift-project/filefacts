@@ -186,19 +186,19 @@ pub(crate) fn extract(
         | FileType::ObjectiveC
         | FileType::Kotlin
         | FileType::Swift
-        | FileType::PowerShell => source::extract(
+        | FileType::PowerShell
+        | FileType::Perl
+        | FileType::Groovy
+        | FileType::Zig
+        | FileType::Elixir
+        | FileType::Makefile => source::extract(
             bytes, file_type, tree_cache, values, strings, metrics, imports, functions,
         ),
 
         // Text-like languages without a tree-sitter binding in filefacts.
         // They still earn `text.*` metrics — pure byte/line analysis,
         // no AST required.
-        FileType::Vbs
-        | FileType::Batch
-        | FileType::Perl
-        | FileType::Groovy
-        | FileType::Zig
-        | FileType::Elixir => {
+        FileType::Vbs | FileType::Batch => {
             source::extract_text_only(bytes, metrics);
             Ok(())
         }

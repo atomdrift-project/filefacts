@@ -96,6 +96,11 @@ pub(super) fn config_for(file_type: FileType) -> Option<&'static LangConfig> {
         FileType::Kotlin => &KOTLIN,
         FileType::Swift => &SWIFT,
         FileType::PowerShell => &POWERSHELL,
+        FileType::Perl => &PERL,
+        FileType::Groovy => &GROOVY,
+        FileType::Zig => &ZIG,
+        FileType::Elixir => &ELIXIR,
+        FileType::Makefile => &MAKEFILE,
         _ => return None,
     })
 }
@@ -755,4 +760,177 @@ static PHP: LangConfig = LangConfig {
     function_kinds: &["anonymous_function_creation_expression", "arrow_function"],
     template_kinds: &[],
     binary_op_kinds: &["binary_expression"],
+};
+
+static PERL: LangConfig = LangConfig {
+    name: "perl",
+    language: || ts_parser_perl::LANGUAGE.into(),
+    comment_style: CommentStyle::Hash,
+    string_kinds: &["string_literal", "interpolated_string_literal", "heredoc_content"],
+    import_query: r#"
+        (use_statement (package) @import)
+        (require_expression (bareword) @import)
+    "#,
+    function_query: r#"
+        (subroutine_declaration_statement name: (bareword) @fn)
+    "#,
+    class_query: r#"
+        (package_statement (package) @class)
+        (class_statement (package) @class)
+    "#,
+    call_kinds: &["function_call_expression", "method_call_expression"],
+    callee_field: "function",
+    arguments_field: "arguments",
+    member_kinds: &["method_call_expression"],
+    member_object_field: "invocant",
+    member_property_field: "method",
+    identifier_kinds: &["scalar_variable", "array_variable", "hash_variable", "bareword"],
+    number_kinds: &["number"],
+    bool_kinds: &["boolean"],
+    null_kinds: &["undef_expression"],
+    object_kinds: &["anonymous_hash_expression", "hash"],
+    array_kinds: &["anonymous_array_expression", "array"],
+    function_kinds: &["anonymous_subroutine_expression"],
+    template_kinds: &["interpolated_string_literal"],
+    binary_op_kinds: &["binary_expression"],
+};
+
+static GROOVY: LangConfig = LangConfig {
+    name: "groovy",
+    language: || tree_sitter_groovy::LANGUAGE.into(),
+    comment_style: CommentStyle::CStyle,
+    string_kinds: &["string_literal"],
+    import_query: r#"
+        (import_declaration (scoped_identifier) @import)
+        (import_declaration (identifier) @import)
+    "#,
+    function_query: r#"
+        (method_declaration name: (identifier) @fn)
+        (function_definition name: (identifier) @fn)
+    "#,
+    class_query: r#"
+        (class_declaration name: (identifier) @class)
+    "#,
+    call_kinds: &["method_invocation", "juxt_function_call"],
+    callee_field: "name",
+    arguments_field: "arguments",
+    member_kinds: &["method_invocation"],
+    member_object_field: "object",
+    member_property_field: "name",
+    identifier_kinds: &["identifier"],
+    number_kinds: &[
+        "decimal_integer_literal",
+        "hex_integer_literal",
+        "decimal_floating_point_literal",
+    ],
+    bool_kinds: &["true", "false"],
+    null_kinds: &["null_literal"],
+    object_kinds: &["map"],
+    array_kinds: &["list", "array_literal"],
+    function_kinds: &["closure"],
+    template_kinds: &["string_interpolation"],
+    binary_op_kinds: &["binary_expression"],
+};
+
+static ZIG: LangConfig = LangConfig {
+    name: "zig",
+    language: || tree_sitter_zig::LANGUAGE.into(),
+    comment_style: CommentStyle::CStyle,
+    string_kinds: &["string", "multiline_string"],
+    import_query: r#"
+        (builtin_function
+            (builtin_identifier) @_fn
+            (arguments (string (string_content) @import))
+            (#any-of? @_fn "@import" "@cImport"))
+    "#,
+    function_query: r#"
+        (function_declaration name: (identifier) @fn)
+    "#,
+    class_query: "",
+    call_kinds: &["call_expression"],
+    callee_field: "function",
+    arguments_field: "arguments",
+    member_kinds: &["field_expression"],
+    member_object_field: "object",
+    member_property_field: "field",
+    identifier_kinds: &["identifier", "builtin_identifier"],
+    number_kinds: &["integer", "float"],
+    bool_kinds: &["true", "false"],
+    null_kinds: &["null"],
+    object_kinds: &["struct_initializer", "anonymous_struct_initializer"],
+    array_kinds: &[],
+    function_kinds: &[],
+    template_kinds: &[],
+    binary_op_kinds: &["binary_expression"],
+};
+
+static ELIXIR: LangConfig = LangConfig {
+    name: "elixir",
+    language: || tree_sitter_elixir::LANGUAGE.into(),
+    comment_style: CommentStyle::Hash,
+    string_kinds: &["string", "charlist"],
+    import_query: r#"
+        (call
+            target: (identifier) @_fn
+            (arguments (alias) @import)
+            (#any-of? @_fn "alias" "import" "require" "use"))
+    "#,
+    function_query: r#"
+        (call
+            target: (identifier) @_fn
+            (arguments (call target: (identifier) @fn))
+            (#any-of? @_fn "def" "defp" "defmacro" "defmacrop"))
+    "#,
+    class_query: r#"
+        (call
+            target: (identifier) @_fn
+            (arguments (alias) @class)
+            (#eq? @_fn "defmodule"))
+    "#,
+    call_kinds: &["call"],
+    callee_field: "target",
+    arguments_field: "arguments",
+    member_kinds: &["dot"],
+    member_object_field: "left",
+    member_property_field: "right",
+    identifier_kinds: &["identifier", "alias", "atom"],
+    number_kinds: &["integer", "float"],
+    bool_kinds: &["boolean"],
+    null_kinds: &["nil"],
+    object_kinds: &["map", "struct"],
+    array_kinds: &["list", "tuple"],
+    function_kinds: &["anonymous_function"],
+    template_kinds: &["interpolation"],
+    binary_op_kinds: &["binary_operator"],
+};
+
+static MAKEFILE: LangConfig = LangConfig {
+    name: "makefile",
+    language: || tree_sitter_make::LANGUAGE.into(),
+    comment_style: CommentStyle::Hash,
+    string_kinds: &["string"],
+    import_query: r#"
+        (include_directive (list (word) @import))
+    "#,
+    // Rules in Make are the closest analogue to "functions" — the
+    // target name(s) of each rule.
+    function_query: r#"
+        (rule (targets (word) @fn))
+    "#,
+    class_query: "",
+    call_kinds: &["function_call", "shell_function"],
+    callee_field: "function",
+    arguments_field: "arguments",
+    member_kinds: &[],
+    member_object_field: "",
+    member_property_field: "",
+    identifier_kinds: &["word", "variable_reference"],
+    number_kinds: &[],
+    bool_kinds: &[],
+    null_kinds: &[],
+    object_kinds: &[],
+    array_kinds: &["list"],
+    function_kinds: &[],
+    template_kinds: &[],
+    binary_op_kinds: &[],
 };

@@ -806,6 +806,61 @@ pub fn from_path(path: &Path) -> Result<(Vec<u8>, FileId), Error> {
     Ok((bytes, fileid))
 }
 
+/// Compile a tree-sitter S-expression query against the grammar named
+/// `language`. Used by rule engines that want to validate a query
+/// string at load time without holding a parsed file. Recognised
+/// language names match the values exposed under `values.source.language`
+/// (e.g. `"python"`, `"javascript"`, `"perl"`, `"makefile"`).
+///
+/// Returns `Ok(())` on success; on failure, returns an `Error` whose
+/// message identifies whether the language is unknown or the query
+/// string is malformed.
+pub fn validate_source_query(language: &str, query: &str) -> Result<(), Error> {
+    let Some(file_type) = file_type_for_language(language) else {
+        return Err(Error::malformed(
+            "source",
+            format!("unsupported language for ast query: {language}"),
+        ));
+    };
+    let Some(ts_lang) = formats::source::tree_sitter_language(file_type) else {
+        return Err(Error::malformed(
+            "source",
+            format!("no tree-sitter grammar registered for {language}"),
+        ));
+    };
+    tree_sitter::Query::new(&ts_lang, query)
+        .map(|_| ())
+        .map_err(|e| Error::malformed("source", format!("invalid tree-sitter query: {e}")))
+}
+
+fn file_type_for_language(name: &str) -> Option<FileType> {
+    Some(match name {
+        "c" => FileType::C,
+        "python" => FileType::Python,
+        "javascript" | "js" => FileType::JavaScript,
+        "typescript" | "ts" => FileType::TypeScript,
+        "rust" => FileType::Rust,
+        "go" => FileType::Go,
+        "java" => FileType::Java,
+        "ruby" => FileType::Ruby,
+        "shell" | "bash" => FileType::Shell,
+        "php" => FileType::Php,
+        "csharp" | "c#" => FileType::CSharp,
+        "lua" => FileType::Lua,
+        "perl" => FileType::Perl,
+        "powershell" | "ps1" => FileType::PowerShell,
+        "swift" => FileType::Swift,
+        "objc" | "objective-c" => FileType::ObjectiveC,
+        "groovy" => FileType::Groovy,
+        "scala" => FileType::Scala,
+        "kotlin" => FileType::Kotlin,
+        "zig" => FileType::Zig,
+        "elixir" => FileType::Elixir,
+        "makefile" | "make" => FileType::Makefile,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

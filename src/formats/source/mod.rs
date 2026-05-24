@@ -282,12 +282,19 @@ pub(crate) fn supports(file_type: FileType) -> bool {
     langs::config_for(file_type).is_some()
 }
 
+/// Resolve `file_type` to its tree-sitter [`Language`]. Used by callers
+/// that want to compile a tree-sitter query against the same grammar
+/// filefacts uses internally — e.g. rule-engine load-time validation.
+pub(crate) fn tree_sitter_language(file_type: FileType) -> Option<tree_sitter::Language> {
+    langs::config_for(file_type).map(|config| (config.language)())
+}
+
 /// Emit text-level metrics (`text.*`) without a tree-sitter parse.
 ///
 /// Called from the format dispatcher for text-like languages that
-/// don't yet have a [`LangConfig`] entry (Ruby, Perl, Lua, PowerShell,
-/// Vbs, Batch, …). Only emits the byte-level / line-level / whitespace
-/// metrics that don't need an AST — language-agnostic by construction.
+/// don't yet have a [`LangConfig`] entry (Vbs, Batch, …). Only emits
+/// the byte-level / line-level / whitespace metrics that don't need
+/// an AST — language-agnostic by construction.
 pub(crate) fn extract_text_only(bytes: &[u8], metrics: &mut Metrics) {
     if let Ok(content) = std::str::from_utf8(bytes) {
         text_metrics::emit(content, metrics);
@@ -569,6 +576,72 @@ mod tests {
         assert!(imports.iter().any(|s| s == "Foundation"), "got {imports:?}");
         let names: Vec<&str> = functions.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"add"), "got {names:?}");
+    }
+
+    #[test]
+    fn perl_imports_and_definitions() {
+        let src = b"use strict;\nuse warnings;\nuse Foo::Bar;\npackage My::Class;\nsub greet { return 1 }\nsub add { my ($a, $b) = @_; return $a + $b }\n";
+        let (imports, functions) = parse_source("app.pl", src);
+        assert!(
+            imports.iter().any(|s| s == "Foo::Bar"),
+            "got {imports:?}"
+        );
+        let names: std::collections::HashMap<&str, Option<&str>> =
+            functions.iter().map(|(n, k)| (n.as_str(), *k)).collect();
+        assert_eq!(names.get("greet").copied(), Some(Some("function")));
+        assert_eq!(names.get("add").copied(), Some(Some("function")));
+        assert_eq!(names.get("My::Class").copied(), Some(Some("class")));
+    }
+
+    #[test]
+    fn groovy_imports_and_definitions() {
+        let src = b"package com.example\nimport java.util.List\nimport groovy.json.*\nclass Greeter {\n  def hello(name) { return \"hi\" }\n}\n";
+        let (imports, functions) = parse_source("App.groovy", src);
+        assert!(
+            imports.iter().any(|s| s == "java.util.List"),
+            "got {imports:?}"
+        );
+        let names: Vec<&str> = functions.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"Greeter"), "got {names:?}");
+    }
+
+    #[test]
+    fn zig_imports_and_definitions() {
+        let src = b"const std = @import(\"std\");\nfn main() void {\n  std.debug.print(\"hi\\n\", .{});\n}\ntest \"smoke\" { try std.testing.expect(true); }\n";
+        let (imports, functions) = parse_source("main.zig", src);
+        assert!(imports.iter().any(|s| s == "std"), "got {imports:?}");
+        let names: Vec<&str> = functions.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"main"), "got {names:?}");
+    }
+
+    #[test]
+    fn elixir_imports_and_definitions() {
+        let src = b"defmodule Greeter do\n  alias My.Helper\n  import Logger\n  def hello(name), do: name\nend\n";
+        let (imports, functions) = parse_source("app.ex", src);
+        assert!(
+            imports.iter().any(|s| s == "My.Helper" || s == "Logger"),
+            "got {imports:?}"
+        );
+        let names: Vec<&str> = functions.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"hello") || names.contains(&"Greeter"),
+            "got {names:?}"
+        );
+    }
+
+    #[test]
+    fn makefile_targets_and_includes() {
+        let src = b"include common.mk\n\nall: build\n\nbuild:\n\t@echo building\n";
+        let (imports, functions) = parse_source("Makefile", src);
+        assert!(
+            imports.iter().any(|s| s == "common.mk"),
+            "got {imports:?}"
+        );
+        let names: Vec<&str> = functions.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.iter().any(|n| *n == "all" || *n == "build"),
+            "got {names:?}"
+        );
     }
 
     #[test]
