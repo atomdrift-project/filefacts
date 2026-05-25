@@ -6,7 +6,7 @@
 //! input, so callers can collect into any container or apply a cap
 //! mid-scan.
 
-use crate::output::{ExtractedString, StringCategory};
+use crate::output::ExtractedString;
 
 /// Default minimum string length. Matches `strings(1)` and is the
 /// long-standing convention for forensic ASCII extraction.
@@ -55,12 +55,8 @@ impl Iterator for AsciiRuns<'_> {
                     .expect("ascii slice is valid utf-8")
                     .to_owned();
                 return Some(ExtractedString {
-                    category: StringCategory::Ascii,
                     text,
                     offset: start,
-                    method: None,
-                    kind: None,
-                    section: None,
                     ..ExtractedString::default()
                 });
             }

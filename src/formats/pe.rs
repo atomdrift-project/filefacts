@@ -30,9 +30,7 @@ pub(super) fn extract(
     strings: &mut Strings,
     metrics: &mut Metrics,
     sections_out: &mut Vec<Section>,
-    imports_out: &mut crate::Imports,
-    exports_out: &mut crate::Exports,
-    functions_out: &mut crate::Functions,
+    symbols_out: &mut crate::Symbols,
     errors_out: &mut Errors,
 ) -> Result<(), Error> {
     // PE strings are scattered across `.rdata`, `.data`, and resources.
@@ -77,8 +75,8 @@ pub(super) fn extract(
             binary_flags(opt, metrics);
         }
         sections(&pe, bytes, metrics, sections_out);
-        imports(&pe, values, metrics, imports_out);
-        exports(&pe, values, metrics, exports_out);
+        imports(&pe, values, metrics, symbols_out);
+        exports(&pe, values, metrics, symbols_out);
         authenticode(&pe, bytes, values, metrics);
         if let Some(rd) = pe.resource_data.as_ref() {
             // The resource walker is lazy and slices with unchecked
@@ -128,7 +126,7 @@ pub(super) fn extract(
             super::pe_debug::extract(dbg, values);
         }
         bound_imports_with_metrics(&pe, bytes, values, metrics);
-        delay_imports(&pe, bytes, values, metrics, imports_out);
+        delay_imports(&pe, bytes, values, metrics, symbols_out);
         base_relocations(&pe, bytes, values, metrics);
         tls_callbacks(&pe, values, metrics);
         inflated_sections(&pe, values);
@@ -145,15 +143,7 @@ pub(super) fn extract(
         super::upx::detect(bytes, values);
         super::go_buildinfo::detect(bytes, values, "pe", None);
         super::build_toolchain::from_pe_rich(values);
-        rizin_fallback_with_sections(
-            bytes,
-            imports_out,
-            exports_out,
-            functions_out,
-            sections_out,
-            metrics,
-            "pe",
-        );
+        rizin_fallback_with_sections(bytes, symbols_out, sections_out, metrics, "pe");
         return Ok(());
     }
 
@@ -393,7 +383,7 @@ fn imports(
     pe: &PE<'_>,
     values: &mut Values,
     metrics: &mut Metrics,
-    imports_out: &mut crate::Imports,
+    symbols_out: &mut crate::Symbols,
 ) {
     // goblin's `imports` is flat: one entry per imported symbol with the
     // DLL name attached. Group by DLL for the public schema — that's
@@ -415,10 +405,10 @@ fn imports(
         let lib_lower = imp.dll.to_ascii_lowercase();
         let library = strip_lib_ext(&lib_lower).to_string();
         let name_is_ordinal_stub = imp.name.starts_with("ORDINAL ");
-        imports_out.push(crate::Import {
+        symbols_out.push(crate::Symbol::Import {
             name: imp.name.to_string(),
             library: Some(library),
-            source: "pe",
+            source: "pe".into(),
             offset: Some(imp.offset as u64),
             ordinal: if name_is_ordinal_stub {
                 Some(u32::from(imp.ordinal))
@@ -441,7 +431,7 @@ fn exports(
     pe: &PE<'_>,
     values: &mut Values,
     metrics: &mut Metrics,
-    exports_out: &mut crate::Exports,
+    symbols_out: &mut crate::Symbols,
 ) {
     let mut forwarded_count: u32 = 0;
     for exp in &pe.exports {
@@ -470,9 +460,9 @@ fn exports(
         // Ghidra, and the PE specification all key exports off
         // RVA. The file offset is internal plumbing and not
         // forensically interesting for an export-table consumer.
-        exports_out.push(crate::Export {
+        symbols_out.push(crate::Symbol::Export {
             name: name.to_string(),
-            source: "pe",
+            source: "pe".into(),
             offset: Some(exp.rva as u64),
             ordinal: None,
             forward_to,
@@ -1556,7 +1546,7 @@ fn delay_imports(
     bytes: &[u8],
     values: &mut Values,
     metrics: &mut Metrics,
-    imports_out: &mut crate::Imports,
+    symbols_out: &mut crate::Symbols,
 ) {
     use goblin::pe::optional_header::MAGIC_64;
     let Some(opt) = pe.header.optional_header.as_ref() else {
@@ -1641,20 +1631,20 @@ fn delay_imports(
                 }
                 if entry & ordinal_mask != 0 {
                     let ordinal = (entry & 0xFFFF) as u32;
-                    imports_out.push(crate::Import {
+                    symbols_out.push(crate::Symbol::Import {
                         name: format!("ORDINAL {ordinal}"),
                         library: Some(library.clone()),
-                        source: "pe-delay",
+                        source: "pe-delay".into(),
                         offset: None,
                         ordinal: Some(ordinal),
                     });
                 } else {
                     let name = read_hint_name(pe, bytes, entry as u32);
                     if !name.is_empty() {
-                        imports_out.push(crate::Import {
+                        symbols_out.push(crate::Symbol::Import {
                             name,
                             library: Some(library.clone()),
-                            source: "pe-delay",
+                            source: "pe-delay".into(),
                             offset: None,
                             ordinal: None,
                         });
@@ -1893,9 +1883,7 @@ mod tests {
         let mut s = Strings::default();
         let mut m = Metrics::new();
         let mut sections = Vec::new();
-        let mut imports = crate::Imports::new();
-        let mut exports = crate::Exports::new();
-        let mut functions = crate::Functions::new();
+        let mut symbols = crate::Symbols::new();
         let mut errors = Errors::new();
         let _ = extract(
             bytes,
@@ -1903,9 +1891,7 @@ mod tests {
             &mut s,
             &mut m,
             &mut sections,
-            &mut imports,
-            &mut exports,
-            &mut functions,
+            &mut symbols,
             &mut errors,
         );
         (v, s, m)
@@ -1982,9 +1968,7 @@ mod tests {
         let mut s = Strings::default();
         let mut m = Metrics::new();
         let mut sections = Vec::new();
-        let mut imports = crate::Imports::new();
-        let mut exports = crate::Exports::new();
-        let mut functions = crate::Functions::new();
+        let mut symbols = crate::Symbols::new();
         let mut errors = Errors::new();
         extract(
             &bytes,
@@ -1992,23 +1976,22 @@ mod tests {
             &mut s,
             &mut m,
             &mut sections,
-            &mut imports,
-            &mut exports,
-            &mut functions,
+            &mut symbols,
             &mut errors,
         )
         .unwrap();
-        for exp in exports.iter() {
-            assert!(
-                exp.forward_to.is_none(),
-                "test.exe shouldn't have forwarded exports; got {:?}",
-                exp.forward_to,
-            );
+        for sym in symbols.iter_kind(crate::SymbolKind::Export) {
+            if let crate::Symbol::Export { forward_to, .. } = sym {
+                assert!(
+                    forward_to.is_none(),
+                    "test.exe shouldn't have forwarded exports; got {forward_to:?}",
+                );
+            }
         }
         assert!(m.get("pe.forwarded_export_count").is_none());
     }
 
-    /// Verifies the typed Imports/Exports views are populated and
+    /// Verifies the unified Symbols view is populated for PE imports and
     /// that library names are normalised (lowercase, no `.dll`).
     #[test]
     fn typed_imports_and_exports_populated() {
@@ -2017,9 +2000,7 @@ mod tests {
         let mut s = Strings::default();
         let mut m = Metrics::new();
         let mut sections = Vec::new();
-        let mut imports = crate::Imports::new();
-        let mut exports = crate::Exports::new();
-        let mut functions = crate::Functions::new();
+        let mut symbols = crate::Symbols::new();
         let mut errors = Errors::new();
         extract(
             &bytes,
@@ -2027,16 +2008,22 @@ mod tests {
             &mut s,
             &mut m,
             &mut sections,
-            &mut imports,
-            &mut exports,
-            &mut functions,
+            &mut symbols,
             &mut errors,
         )
         .unwrap();
+        let imports: Vec<&crate::Symbol> =
+            symbols.iter_kind(crate::SymbolKind::Import).collect();
         assert!(!imports.is_empty(), "expected at least one PE import");
-        for imp in imports.iter() {
-            assert_eq!(imp.source, "pe");
-            let lib = imp.library.as_deref().expect("PE imports carry library");
+        for sym in imports {
+            let crate::Symbol::Import {
+                source, library, ..
+            } = sym
+            else {
+                unreachable!("iter_kind(Import) yields only Import variants");
+            };
+            assert_eq!(source, "pe");
+            let lib = library.as_deref().expect("PE imports carry library");
             assert_eq!(lib, &lib.to_ascii_lowercase());
             assert!(
                 !lib.ends_with(".dll") && !lib.ends_with(".ocx") && !lib.ends_with(".sys"),

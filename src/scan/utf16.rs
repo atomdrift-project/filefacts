@@ -11,7 +11,7 @@
 //! extractors that need full decoding can fall back to the `widestring`
 //! crate.
 
-use crate::output::{ExtractedString, StringCategory};
+use crate::output::ExtractedString;
 
 /// Default minimum length (in *characters*, not bytes).
 pub(crate) const DEFAULT_MIN_LEN: usize = 4;
@@ -52,12 +52,8 @@ impl Iterator for Utf16Runs<'_> {
                 }
                 if text.len() >= self.min_len {
                     return Some(ExtractedString {
-                        category: StringCategory::Utf16Le,
                         text,
                         offset: start,
-                        method: None,
-                        kind: None,
-                        section: None,
                         ..ExtractedString::default()
                     });
                 }

@@ -44,16 +44,14 @@ const MAX_MODULES: usize = 256;
 /// thread it through the dispatch contract.
 ///
 /// Module source bytes are also fed to [`super::vba_symbols::extract`],
-/// which populates the unified `imports_out` / `functions_out`
-/// collections with `vba-declare`, `vba-createobject`,
-/// `vba-getobject`, and `vba-decl` entries plus document-level
-/// aggregate metrics under `office.vba.*_count`.
+/// which pushes `vba-declare`, `vba-createobject`, `vba-getobject`,
+/// and `vba-decl` entries into the unified `symbols_out` view plus
+/// document-level aggregate metrics under `office.vba.*_count`.
 pub(super) fn extract(
     bytes: &[u8],
     values: &mut Values,
     metrics: &mut Metrics,
-    imports_out: &mut crate::output::Imports,
-    functions_out: &mut crate::output::Functions,
+    symbols_out: &mut crate::output::Symbols,
 ) {
     let cursor = Cursor::new(bytes);
     let Ok(mut comp) = cfb::CompoundFile::open(cursor) else {
@@ -100,7 +98,7 @@ pub(super) fn extract(
 
         // Run the symbol extractor before moving `source` into the
         // module record.
-        let stats = super::vba_symbols::extract(&source, imports_out, functions_out);
+        let stats = super::vba_symbols::extract(&source, symbols_out);
         agg.declare_count = agg.declare_count.saturating_add(stats.declare_count);
         agg.declare_non_literal_count = agg
             .declare_non_literal_count

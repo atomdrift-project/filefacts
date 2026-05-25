@@ -23,9 +23,7 @@ pub(super) fn extract(
     strings: &mut Strings,
     metrics: &mut Metrics,
     sections_out: &mut Vec<Section>,
-    imports_out: &mut crate::Imports,
-    exports_out: &mut crate::Exports,
-    functions_out: &mut crate::Functions,
+    symbols_out: &mut crate::Symbols,
     errors_out: &mut Errors,
 ) -> Result<(), Error> {
     extract_binary_strings(bytes, strings);
@@ -53,7 +51,7 @@ pub(super) fn extract(
     elf_header(&elf, values);
     dynamic(&elf, values);
     sections(&elf, bytes, metrics, sections_out);
-    symbols(&elf, values, metrics, imports_out, exports_out);
+    symbols(&elf, values, metrics, symbols_out);
     build_id(&elf, bytes, values, metrics);
     interpreter(&elf, values);
     relro(&elf, values);
@@ -75,10 +73,10 @@ pub(super) fn extract(
     table_counts(&elf, metrics);
     relocation_kinds(&elf, values);
     segments(&elf, values);
-    rizin_fallback(bytes, imports_out, exports_out, functions_out, metrics);
+    rizin_fallback(bytes, symbols_out, metrics);
     linker_family(&elf, bytes, values);
     comment_fingerprint(values);
-    super::elf_hashes::emit(&elf, values, imports_out, exports_out);
+    super::elf_hashes::emit(&elf, values, symbols_out);
     super::upx::detect(bytes, values);
     {
         // VA→file-offset resolver: walk `PT_LOAD` program headers and
@@ -1612,8 +1610,7 @@ fn symbols(
     elf: &Elf<'_>,
     values: &mut Values,
     metrics: &mut Metrics,
-    imports_out: &mut crate::Imports,
-    exports_out: &mut crate::Exports,
+    symbols_out: &mut crate::Symbols,
 ) {
     // Dynamic-symbol table: imports are undefined (`SHN_UNDEF`, section
     // index 0); exports are defined globals/weaks. STT_GNU_IFUNC entries
@@ -1686,18 +1683,18 @@ fn symbols(
             // DT_NEEDED library at link time — the dynamic linker
             // resolves at load. Leave `library` unset; consumers
             // that need it walk `elf.needed[]` separately.
-            imports_out.push(crate::Import {
+            symbols_out.push(crate::Symbol::Import {
                 name: name.to_string(),
                 library: None,
-                source: "elf-dynsym",
+                source: "elf-dynsym".into(),
                 offset: None,
                 ordinal: None,
             });
         } else if sym.is_function() || sym.st_info & 0xf == 1 {
             // STB_GLOBAL = 1 (binding in upper nibble of st_info)
-            exports_out.push(crate::Export {
+            symbols_out.push(crate::Symbol::Export {
                 name: name.to_string(),
-                source: "elf-dynsym",
+                source: "elf-dynsym".into(),
                 offset: Some(sym.st_value),
                 ordinal: None,
                 // ELF doesn't have a forwarded-export concept like
@@ -1900,9 +1897,7 @@ mod tests {
         let mut s = Strings::default();
         let mut m = Metrics::new();
         let mut sections = Vec::new();
-        let mut imports = crate::Imports::new();
-        let mut exports = crate::Exports::new();
-        let mut functions = crate::Functions::new();
+        let mut symbols = crate::Symbols::new();
         let mut errors = Errors::new();
         // Ignore the Result — most negative-path tests pass malformed
         // bytes and we only care that extract returns without panic.
@@ -1912,9 +1907,7 @@ mod tests {
             &mut s,
             &mut m,
             &mut sections,
-            &mut imports,
-            &mut exports,
-            &mut functions,
+            &mut symbols,
             &mut errors,
         );
         (v, s, m)

@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::output::{Export, Function, Import, Metrics};
+use crate::output::Metrics;
 
 /// Hard cap on a single rizin run. `aaa` analysis on a heavily
 /// stripped ~14 MB Linux binary needed ~85 s in real measurement;
@@ -527,8 +527,8 @@ fn parse_json_array<T: serde::de::DeserializeOwned>(
     serde_json::from_str(&text[start..])
 }
 
-/// Raw rizin output — converted into filefacts' typed `Import`/
-/// `Export`/`Function`/`Section` views by `recover()`'s caller.
+/// Raw rizin output — converted into filefacts' unified [`crate::Symbol`]
+/// view by `recover()`'s caller.
 pub(crate) struct RizinRecovery {
     imports: Vec<RawImport>,
     exports: Vec<RawExport>,
@@ -552,20 +552,17 @@ pub(crate) struct RecoveryCounts {
 }
 
 impl RizinRecovery {
-    /// Push recovered symbols into filefacts' typed views and emit the
-    /// rizin-specific `binary.*` metrics. Only fills slots that
+    /// Push recovered symbols into the unified `Symbols` view and emit
+    /// the rizin-specific `binary.*` metrics. Only fills slots that
     /// goblin left empty — never overwrites existing data.
     ///
-    /// The legacy three-view entry-point. Callers that also want
-    /// section recovery use [`apply_with_sections`] instead.
+    /// The legacy entry-point that doesn't recover sections.
     pub(crate) fn apply(
         self,
-        imports_out: &mut crate::Imports,
-        exports_out: &mut crate::Exports,
-        functions_out: &mut crate::Functions,
+        symbols_out: &mut crate::Symbols,
         metrics: &mut Metrics,
     ) -> RecoveryCounts {
-        self.apply_inner(imports_out, exports_out, functions_out, None, metrics)
+        self.apply_inner(symbols_out, None, metrics)
     }
 
     /// Variant of [`apply`] that also recovers sections. PE / ELF /
@@ -573,53 +570,53 @@ impl RizinRecovery {
     /// section table (packed binaries are the common case).
     pub(crate) fn apply_with_sections(
         self,
-        imports_out: &mut crate::Imports,
-        exports_out: &mut crate::Exports,
-        functions_out: &mut crate::Functions,
+        symbols_out: &mut crate::Symbols,
         sections_out: &mut Vec<crate::output::Section>,
         metrics: &mut Metrics,
     ) -> RecoveryCounts {
-        self.apply_inner(
-            imports_out,
-            exports_out,
-            functions_out,
-            Some(sections_out),
-            metrics,
-        )
+        self.apply_inner(symbols_out, Some(sections_out), metrics)
     }
 
     fn apply_inner(
         self,
-        imports_out: &mut crate::Imports,
-        exports_out: &mut crate::Exports,
-        functions_out: &mut crate::Functions,
+        symbols_out: &mut crate::Symbols,
         sections_out: Option<&mut Vec<crate::output::Section>>,
         metrics: &mut Metrics,
     ) -> RecoveryCounts {
+        use crate::output::{Symbol, SymbolKind};
         let mut counts = RecoveryCounts::default();
-        if imports_out.is_empty() {
+        let had_imports = symbols_out
+            .iter()
+            .any(|s| s.kind() == SymbolKind::Import);
+        let had_exports = symbols_out
+            .iter()
+            .any(|s| s.kind() == SymbolKind::Export);
+        let had_functions = symbols_out
+            .iter()
+            .any(|s| s.kind() == SymbolKind::Function);
+        if !had_imports {
             for imp in self.imports {
                 if imp.name.is_empty() {
                     continue;
                 }
-                imports_out.push(Import {
+                symbols_out.push(Symbol::Import {
                     name: imp.name,
                     library: imp.libname,
-                    source: "rizin",
+                    source: "rizin".into(),
                     offset: None,
                     ordinal: imp.ordinal,
                 });
                 counts.imports = counts.imports.saturating_add(1);
             }
         }
-        if exports_out.is_empty() {
+        if !had_exports {
             for exp in self.exports {
                 if exp.name.is_empty() {
                     continue;
                 }
-                exports_out.push(Export {
+                symbols_out.push(Symbol::Export {
                     name: exp.name,
-                    source: "rizin",
+                    source: "rizin".into(),
                     offset: Some(exp.vaddr),
                     ordinal: None,
                     forward_to: None,
@@ -627,12 +624,12 @@ impl RizinRecovery {
                 counts.exports = counts.exports.saturating_add(1);
             }
         }
-        if functions_out.is_empty() && !self.functions.is_empty() {
+        if !had_functions && !self.functions.is_empty() {
             for func in &self.functions {
                 if func.name.is_empty() {
                     continue;
                 }
-                let calls: Vec<String> = func
+                let callees: Vec<String> = func
                     .callrefs
                     .iter()
                     .filter_map(|c| c.name.clone())
@@ -641,11 +638,11 @@ impl RizinRecovery {
                 let stack_frame = func
                     .stackframe
                     .map(|sf| u64::try_from(sf.max(0)).unwrap_or(0));
-                functions_out.push(Function {
+                symbols_out.push(Symbol::Function {
                     name: func.name.clone(),
-                    source: "rizin",
+                    source: "rizin".into(),
                     offset: Some(func.offset),
-                    kind: None,
+                    decl: None,
                     complexity: func.cc,
                     basic_blocks: func.nbbs,
                     edges: func.edges,
@@ -654,7 +651,7 @@ impl RizinRecovery {
                     recursive: func.recursive,
                     noreturn: func.noreturn,
                     is_linear: func.is_lineal,
-                    calls,
+                    callees,
                 });
                 counts.functions = counts.functions.saturating_add(1);
             }
@@ -941,12 +938,22 @@ mod tests {
     // apply gate logic — "only fill what goblin left empty"
     // ------------------------------------------------------------------
 
+    use crate::output::{Symbol, SymbolKind, Symbols};
+
+    fn first_function(symbols: &Symbols) -> Option<&Symbol> {
+        symbols.iter_kind(SymbolKind::Function).next()
+    }
+
+    fn count_kind(symbols: &Symbols, kind: SymbolKind) -> usize {
+        symbols.iter_kind(kind).count()
+    }
+
     #[test]
     fn apply_populates_cfg_fields_from_aflj() {
         // Full aflj payload — every CFG field exercised, including the
         // is-lineal kebab key, the callrefs list (some named, some
-        // anonymous → only named ones land on `calls`), and the signed
-        // stackframe normalisation.
+        // anonymous → only named ones land on `callees`), and the
+        // signed stackframe normalisation.
         let recovery = make_recovery(
             r#"{
                 "imports": [],
@@ -970,21 +977,33 @@ mod tests {
                 }]
             }"#,
         );
-        let mut imports = crate::Imports::new();
-        let mut exports = crate::Exports::new();
-        let mut functions = crate::Functions::new();
+        let mut symbols = Symbols::new();
         let mut metrics = Metrics::new();
-        recovery.apply(&mut imports, &mut exports, &mut functions, &mut metrics);
-        let f = functions.iter().next().unwrap();
-        assert_eq!(f.complexity, Some(7));
-        assert_eq!(f.basic_blocks, Some(12));
-        assert_eq!(f.edges, Some(18));
-        assert_eq!(f.instructions, Some(83));
-        assert_eq!(f.stack_frame, Some(48));
-        assert_eq!(f.recursive, Some(false));
-        assert_eq!(f.noreturn, Some(false));
-        assert_eq!(f.is_linear, Some(false));
-        assert_eq!(f.calls, vec!["puts".to_string(), "exit".to_string()]);
+        recovery.apply(&mut symbols, &mut metrics);
+        let Some(Symbol::Function {
+            complexity,
+            basic_blocks,
+            edges,
+            instructions,
+            stack_frame,
+            recursive,
+            noreturn,
+            is_linear,
+            callees,
+            ..
+        }) = first_function(&symbols)
+        else {
+            panic!("expected one rizin function");
+        };
+        assert_eq!(*complexity, Some(7));
+        assert_eq!(*basic_blocks, Some(12));
+        assert_eq!(*edges, Some(18));
+        assert_eq!(*instructions, Some(83));
+        assert_eq!(*stack_frame, Some(48));
+        assert_eq!(*recursive, Some(false));
+        assert_eq!(*noreturn, Some(false));
+        assert_eq!(*is_linear, Some(false));
+        assert_eq!(*callees, vec!["puts".to_string(), "exit".to_string()]);
     }
 
     #[test]
@@ -996,17 +1015,14 @@ mod tests {
                 "functions": [{"name":"main","offset":4096,"cc":5,"nbbs":10}]
             }"#,
         );
-        let mut imports = crate::Imports::new();
-        let mut exports = crate::Exports::new();
-        let mut functions = crate::Functions::new();
+        let mut symbols = Symbols::new();
         let mut metrics = Metrics::new();
-        recovery.apply(&mut imports, &mut exports, &mut functions, &mut metrics);
-        assert_eq!(imports.iter().count(), 1);
-        assert_eq!(exports.iter().count(), 1);
-        assert_eq!(functions.iter().count(), 1);
-        // `functions.count` is emitted cross-format by lib.rs::extract_all
-        // (not by recovery.apply directly); rizin-side aggregates stay
-        // under the `binary.*_complexity` / `binary.*_basic_blocks` namespace.
+        recovery.apply(&mut symbols, &mut metrics);
+        assert_eq!(count_kind(&symbols, SymbolKind::Import), 1);
+        assert_eq!(count_kind(&symbols, SymbolKind::Export), 1);
+        assert_eq!(count_kind(&symbols, SymbolKind::Function), 1);
+        // Rizin-side aggregates stay under `binary.*_complexity` /
+        // `binary.*_basic_blocks`.
         assert_eq!(metrics.get("binary.avg_complexity"), Some(5.0));
         assert_eq!(metrics.get("binary.max_complexity"), Some(5.0));
         assert_eq!(metrics.get("binary.avg_basic_blocks"), Some(10.0));
@@ -1017,20 +1033,24 @@ mod tests {
     fn apply_skips_imports_when_goblin_already_populated() {
         let recovery =
             make_recovery(r#"{"imports":[{"name":"rizin_only"}],"exports":[],"functions":[]}"#);
-        let mut imports = crate::Imports::new();
-        imports.push(Import {
+        let mut symbols = Symbols::new();
+        symbols.push(Symbol::Import {
             name: "from_goblin".into(),
             library: None,
-            source: "elf-dynsym",
+            source: "elf-dynsym".into(),
             offset: None,
             ordinal: None,
         });
-        let mut exports = crate::Exports::new();
-        let mut functions = crate::Functions::new();
         let mut metrics = Metrics::new();
-        recovery.apply(&mut imports, &mut exports, &mut functions, &mut metrics);
+        recovery.apply(&mut symbols, &mut metrics);
         // Rizin import dropped — goblin's entry survives untouched.
-        let names: Vec<String> = imports.iter().map(|i| i.name.clone()).collect();
+        let names: Vec<String> = symbols
+            .iter_kind(SymbolKind::Import)
+            .filter_map(|s| match s {
+                Symbol::Import { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(names, vec!["from_goblin"]);
     }
 
@@ -1039,22 +1059,28 @@ mod tests {
         let recovery = make_recovery(
             r#"{"imports":[],"exports":[],"functions":[{"name":"a","offset":1,"cc":99,"nbbs":99}]}"#,
         );
-        let mut imports = crate::Imports::new();
-        let mut exports = crate::Exports::new();
-        let mut functions = crate::Functions::new();
-        functions.push(Function {
+        let mut symbols = Symbols::new();
+        symbols.push(Symbol::Function {
             name: "preexisting".into(),
-            source: "goblin",
+            source: "goblin".into(),
             offset: Some(0),
-            kind: None,
-            ..Function::default()
+            decl: None,
+            complexity: None,
+            basic_blocks: None,
+            edges: None,
+            instructions: None,
+            stack_frame: None,
+            recursive: None,
+            noreturn: None,
+            is_linear: None,
+            callees: Vec::new(),
         });
         let mut metrics = Metrics::new();
-        recovery.apply(&mut imports, &mut exports, &mut functions, &mut metrics);
+        recovery.apply(&mut symbols, &mut metrics);
         // The function-block was skipped → no aggregate metrics emitted.
         assert!(metrics.get("binary.avg_complexity").is_none());
         // The preexisting goblin function survives.
-        assert_eq!(functions.iter().count(), 1);
+        assert_eq!(count_kind(&symbols, SymbolKind::Function), 1);
     }
 
     #[test]
@@ -1066,18 +1092,12 @@ mod tests {
                 "functions": [{"name":"","offset":0},{"name":"keep","offset":1}]
             }"#,
         );
-        let mut imports = crate::Imports::new();
-        let mut exports = crate::Exports::new();
-        let mut functions = crate::Functions::new();
+        let mut symbols = Symbols::new();
         let mut metrics = Metrics::new();
-        recovery.apply(&mut imports, &mut exports, &mut functions, &mut metrics);
-        for view in [
-            imports.iter().count(),
-            exports.iter().count(),
-            functions.iter().count(),
-        ] {
-            assert_eq!(view, 1, "empty-name entries should be filtered out");
-        }
+        recovery.apply(&mut symbols, &mut metrics);
+        assert_eq!(count_kind(&symbols, SymbolKind::Import), 1);
+        assert_eq!(count_kind(&symbols, SymbolKind::Export), 1);
+        assert_eq!(count_kind(&symbols, SymbolKind::Function), 1);
     }
 
     #[test]
@@ -1095,12 +1115,10 @@ mod tests {
                 ]
             }"#,
         );
-        let mut imports = crate::Imports::new();
-        let mut exports = crate::Exports::new();
-        let mut functions = crate::Functions::new();
+        let mut symbols = Symbols::new();
         let mut metrics = Metrics::new();
-        recovery.apply(&mut imports, &mut exports, &mut functions, &mut metrics);
-        assert_eq!(functions.iter().count(), 3);
+        recovery.apply(&mut symbols, &mut metrics);
+        assert_eq!(count_kind(&symbols, SymbolKind::Function), 3);
         assert_eq!(metrics.get("binary.avg_complexity"), Some(3.0));
         assert_eq!(metrics.get("binary.max_complexity"), Some(5.0));
         assert_eq!(metrics.get("binary.avg_basic_blocks"), Some(4.0));
@@ -1113,15 +1131,10 @@ mod tests {
         // Without `nbbs` shouldn't emit basic-block aggregates either.
         let recovery =
             make_recovery(r#"{"imports":[],"exports":[],"functions":[{"name":"a","offset":1}]}"#);
-        let mut imports = crate::Imports::new();
-        let mut exports = crate::Exports::new();
-        let mut functions = crate::Functions::new();
+        let mut symbols = Symbols::new();
         let mut metrics = Metrics::new();
-        recovery.apply(&mut imports, &mut exports, &mut functions, &mut metrics);
-        // `functions.count` is emitted by the top-level pipeline; here
-        // we only verify rizin pushed the function into the Vec and the
-        // complexity/basic-block aggregates were skipped (no `cc`/`nbbs`).
-        assert_eq!(functions.iter().count(), 1);
+        recovery.apply(&mut symbols, &mut metrics);
+        assert_eq!(count_kind(&symbols, SymbolKind::Function), 1);
         assert!(metrics.get("binary.avg_complexity").is_none());
         assert!(metrics.get("binary.avg_basic_blocks").is_none());
     }

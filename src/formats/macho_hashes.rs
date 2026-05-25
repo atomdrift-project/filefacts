@@ -26,24 +26,19 @@ use md5::{Digest, Md5};
 use serde_json::Value as JsonValue;
 
 use crate::formats::common::{hex_encode, put_str};
-use crate::output::Values;
+use crate::output::{Symbol, SymbolKind, Symbols, Values};
 
-/// Populate `macho.hashes.*` from the parsed Mach-O plus the
-/// collected import/export views (which the imports/exports
-/// extractor has already filled in).
-pub(super) fn emit(
-    macho: &MachO<'_>,
-    values: &mut Values,
-    imports: &crate::Imports,
-    exports: &crate::Exports,
-) {
-    if let Some(h) = imphash(imports) {
+/// Populate `macho.hashes.*` from the parsed Mach-O plus the unified
+/// symbols view (which the imports/exports extractor has already
+/// filled in).
+pub(super) fn emit(macho: &MachO<'_>, values: &mut Values, symbols: &Symbols) {
+    if let Some(h) = imphash(symbols) {
         put_str(values, "macho.hashes.imphash", h);
     }
     if let Some(h) = dylib_hash(macho) {
         put_str(values, "macho.hashes.dylib_hash", h);
     }
-    if let Some(h) = export_hash(exports) {
+    if let Some(h) = export_hash(symbols) {
         put_str(values, "macho.hashes.export_hash", h);
     }
     if let Some(h) = symhash(macho) {
@@ -56,10 +51,13 @@ pub(super) fn emit(
 
 /// MD5 of the sorted, lowercased, dedup'd imported-function names,
 /// comma-joined. `None` when no imports were recovered.
-fn imphash(imports: &crate::Imports) -> Option<String> {
-    let mut names: Vec<String> = imports
-        .iter()
-        .map(|i| i.name.to_ascii_lowercase())
+fn imphash(symbols: &Symbols) -> Option<String> {
+    let mut names: Vec<String> = symbols
+        .iter_kind(SymbolKind::Import)
+        .filter_map(|s| match s {
+            Symbol::Import { name, .. } => Some(name.to_ascii_lowercase()),
+            _ => None,
+        })
         .collect();
     if names.is_empty() {
         return None;
@@ -88,10 +86,13 @@ fn dylib_hash(macho: &MachO<'_>) -> Option<String> {
 }
 
 /// MD5 of the sorted, lowercased, dedup'd export-trie names.
-fn export_hash(exports: &crate::Exports) -> Option<String> {
-    let mut names: Vec<String> = exports
-        .iter()
-        .map(|e| e.name.to_ascii_lowercase())
+fn export_hash(symbols: &Symbols) -> Option<String> {
+    let mut names: Vec<String> = symbols
+        .iter_kind(SymbolKind::Export)
+        .filter_map(|s| match s {
+            Symbol::Export { name, .. } => Some(name.to_ascii_lowercase()),
+            _ => None,
+        })
         .collect();
     if names.is_empty() {
         return None;

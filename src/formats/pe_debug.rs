@@ -205,12 +205,10 @@ mod tests {
         let bytes = std::fs::read("../cleave/tests/fixtures/test.exe")
             .expect("test.exe fixture is required");
         let mut v = crate::output::Values::new();
-        let mut s = crate::Strings::default();
+        let mut s = crate::output::Strings::default();
         let mut m = crate::output::Metrics::new();
         let mut sections = Vec::new();
-        let mut imports = crate::Imports::new();
-        let mut exports = crate::Exports::new();
-        let mut functions = crate::Functions::new();
+        let mut symbols = crate::Symbols::new();
         let mut errors = crate::output::Errors::new();
         crate::formats::pe::extract(
             &bytes,
@@ -218,9 +216,7 @@ mod tests {
             &mut s,
             &mut m,
             &mut sections,
-            &mut imports,
-            &mut exports,
-            &mut functions,
+            &mut symbols,
             &mut errors,
         )
         .unwrap();

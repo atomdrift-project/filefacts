@@ -10,21 +10,21 @@
 //! - [`Values`] — structural facts the format itself carries (headers,
 //!   manifest fields, archive index entries). Navigable as a JSON object
 //!   with dot-path lookup.
-//! - [`Strings`] — extracted string literals grouped by extraction
-//!   technique (printable ASCII run, UTF-16LE run, language-level
-//!   string literal).
+//! - [`Text`] — byte-scan extracted strings (printable ASCII /
+//!   UTF-16LE runs); the Unix `strings(1)` tier.
+//! - [`Literals`] — parser-extracted language string literals from
+//!   tree-sitter / structured-format parses; the precise tier.
 //! - [`Metrics`] — derived numeric features (entropy, sizes, counts,
 //!   ratios). Anything that answers "how much / how many / how
 //!   spread" rather than "what does it contain".
 //! - [`Sections`] — unified section / segment listing for binary
 //!   formats, with per-section entropy and flag vocabulary.
-//! - [`Imports`], [`Exports`], and [`Functions`] — typed symbol views.
-//! - [`Ast`] — call-graph and member-access projection of the
-//!   tree-sitter parse for source files.
+//! - [`Symbols`] — unified named-entity facts (imports, exports,
+//!   functions, calls, members, binds, identifiers) tagged by
+//!   [`SymbolKind`].
 //! - [`Errors`] — recoverable extractor diagnostics.
 
 mod archive;
-mod ast;
 mod errors;
 mod metrics;
 mod sections;
@@ -33,10 +33,13 @@ mod symbols;
 mod values;
 
 pub use archive::ArchiveMember;
-pub use ast::{ArgShape, Assignment, Ast, Call};
 pub use errors::{Errors, ParseError};
 pub use metrics::Metrics;
 pub use sections::{Section, Sections};
-pub use strings::{ExtractedString, StringCategory, Strings};
-pub use symbols::{Export, Exports, Function, Functions, Import, Imports};
+pub use strings::{ExtractedString, Literals, Text};
+// Crate-internal bundle of Text + Literals — used by format extractors
+// so they can push to either tier without juggling two parameters.
+// Not part of the public schema.
+pub(crate) use strings::Strings;
+pub use symbols::{Arg, ArgShape, Symbol, SymbolKind, Symbols};
 pub use values::Values;

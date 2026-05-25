@@ -76,9 +76,7 @@ pub(crate) fn extract(
     metrics: &mut Metrics,
     archive_members: &mut Vec<ArchiveMember>,
     sections: &mut Vec<Section>,
-    imports: &mut crate::Imports,
-    exports: &mut crate::Exports,
-    functions: &mut crate::Functions,
+    symbols: &mut crate::Symbols,
     errors: &mut Errors,
 ) -> Result<(), Error> {
     // Only PE / ELF / Mach-O record structured `Errors` today.
@@ -92,15 +90,15 @@ pub(crate) fn extract(
     generic::extract(bytes, values, strings, metrics);
 
     let result = match file_type {
-        FileType::Pe => pe::extract(
-            bytes, values, strings, metrics, sections, imports, exports, functions, errors,
-        ),
-        FileType::Elf => elf::extract(
-            bytes, values, strings, metrics, sections, imports, exports, functions, errors,
-        ),
-        FileType::MachO => macho::extract(
-            bytes, values, strings, metrics, sections, imports, exports, functions, errors,
-        ),
+        FileType::Pe => {
+            pe::extract(bytes, values, strings, metrics, sections, symbols, errors)
+        }
+        FileType::Elf => {
+            elf::extract(bytes, values, strings, metrics, sections, symbols, errors)
+        }
+        FileType::MachO => {
+            macho::extract(bytes, values, strings, metrics, sections, symbols, errors)
+        }
         FileType::Zip | FileType::Crx | FileType::Odf => {
             zip::extract(bytes, values, metrics, archive_members)
         }
@@ -116,7 +114,7 @@ pub(crate) fn extract(
             // VBA module source-text extraction (best-effort).
             // `vba::extract` is silent on failure — a doc without
             // macros just leaves `office.vba.*` unpopulated.
-            vba::extract(bytes, values, metrics, imports, functions);
+            vba::extract(bytes, values, metrics, symbols);
             Ok(())
         }
         FileType::Jar => {
@@ -156,7 +154,7 @@ pub(crate) fn extract(
         FileType::Plist => structured::extract_plist(bytes, values),
         FileType::PkgInfo => structured::extract_pkginfo(bytes, values),
         FileType::Chm => chm::extract(bytes, values, strings, metrics),
-        FileType::JavaClass => class::extract(bytes, values, strings, metrics, imports, functions),
+        FileType::JavaClass => class::extract(bytes, values, strings, metrics, symbols),
         FileType::Jpeg => jpeg::extract(bytes, values, strings, metrics),
         FileType::Lnk => lnk::extract(bytes, values, strings, metrics),
         FileType::Pdf => pdf::extract(bytes, values, strings, metrics),
@@ -192,7 +190,7 @@ pub(crate) fn extract(
         | FileType::Zig
         | FileType::Elixir
         | FileType::Makefile => source::extract(
-            bytes, file_type, tree_cache, values, strings, metrics, imports, functions,
+            bytes, file_type, tree_cache, values, strings, metrics, symbols,
         ),
 
         // Text-like languages without a tree-sitter binding in filefacts.
@@ -206,11 +204,11 @@ pub(crate) fn extract(
         _ => Ok(()),
     };
 
-    // Cross-format binary attribution derived from the merged import
+    // Cross-format binary attribution derived from the merged symbol
     // view (sanitizer instrumentation, FORTIFY_SOURCE wrappers).
-    // Skipped silently when no imports were collected.
-    if !imports.is_empty() {
-        binary_attribution::emit(imports, values);
+    // Skipped silently when no symbols were collected.
+    if !symbols.is_empty() {
+        binary_attribution::emit(symbols, values);
     }
 
     result

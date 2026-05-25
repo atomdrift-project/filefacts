@@ -24,18 +24,13 @@ use goblin::elf::Elf;
 use md5::{Digest, Md5};
 
 use crate::formats::common::{hex_encode, put_str};
-use crate::output::Values;
+use crate::output::{Symbol, SymbolKind, Symbols, Values};
 
-pub(super) fn emit(
-    elf: &Elf<'_>,
-    values: &mut Values,
-    imports: &crate::Imports,
-    exports: &crate::Exports,
-) {
-    if let Some(h) = imphash(imports) {
+pub(super) fn emit(elf: &Elf<'_>, values: &mut Values, symbols: &Symbols) {
+    if let Some(h) = imphash(symbols) {
         put_str(values, "elf.hashes.imphash", h);
     }
-    if let Some(h) = export_hash(exports) {
+    if let Some(h) = export_hash(symbols) {
         put_str(values, "elf.hashes.export_hash", h);
     }
     if let Some(h) = dyn_hash(elf) {
@@ -48,10 +43,13 @@ pub(super) fn emit(
 
 /// MD5 of the sorted, lowercased, dedup'd imported-symbol names
 /// (`STB_GLOBAL`/`STB_WEAK` symbols with `SHN_UNDEF`).
-fn imphash(imports: &crate::Imports) -> Option<String> {
-    let mut names: Vec<String> = imports
-        .iter()
-        .map(|i| i.name.to_ascii_lowercase())
+fn imphash(symbols: &Symbols) -> Option<String> {
+    let mut names: Vec<String> = symbols
+        .iter_kind(SymbolKind::Import)
+        .filter_map(|s| match s {
+            Symbol::Import { name, .. } => Some(name.to_ascii_lowercase()),
+            _ => None,
+        })
         .collect();
     if names.is_empty() {
         return None;
@@ -61,10 +59,13 @@ fn imphash(imports: &crate::Imports) -> Option<String> {
     Some(md5_of_csv(&names))
 }
 
-fn export_hash(exports: &crate::Exports) -> Option<String> {
-    let mut names: Vec<String> = exports
-        .iter()
-        .map(|e| e.name.to_ascii_lowercase())
+fn export_hash(symbols: &Symbols) -> Option<String> {
+    let mut names: Vec<String> = symbols
+        .iter_kind(SymbolKind::Export)
+        .filter_map(|s| match s {
+            Symbol::Export { name, .. } => Some(name.to_ascii_lowercase()),
+            _ => None,
+        })
         .collect();
     if names.is_empty() {
         return None;

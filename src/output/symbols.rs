@@ -1,310 +1,405 @@
-//! Imports, exports, and locally-defined functions — three peer
-//! collections that every format extractor contributes to.
+//! Unified symbol facts — every named entity in the artifact, tagged
+//! by kind, in one flat collection.
 //!
-//! Each binary / source format has its own native vocabulary for these
-//! concepts:
+//! Each [`Symbol`] is one fact about a name in the parsed file:
 //!
-//! - **PE** has an import table (DLL + symbol), an export table
-//!   (symbol + ordinal + RVA), bound imports, and delay-load imports.
-//! - **ELF** has `.dynsym` entries (undefined → import, defined →
-//!   export) and `DT_NEEDED` library references.
-//! - **Mach-O** has undefined/defined symbols and dyld trie exports.
-//! - **Java class** files reference other classes via the constant
-//!   pool and declare methods locally.
-//! - **VBA** uses `Declare … Function … Lib "kernel32"` for foreign-
-//!   library imports and `CreateObject("Excel.Application")` for
-//!   COM-style imports; `Public Function`/`Sub` declarations are
-//!   locally-defined functions.
-//! - **Source code** (tree-sitter languages) carries the same idea
-//!   via `import` / `require` statements and top-level definitions.
+//! - `Import` — foreign symbol this file uses (PE import table, ELF
+//!   dynsym undef, Mach-O undef, VBA `Declare`/`CreateObject`, Java
+//!   class refs, source-level `import` / `require`).
+//! - `Export` — locally-defined symbol this file publishes.
+//! - `Function` — function / method / sub defined inside this file;
+//!   carries CFG metrics (`complexity`, `basic_blocks`, `callees`, …)
+//!   when rizin disassembled it.
+//! - `Call` — one source-code call site with target + arg shapes.
+//! - `Member` — one dotted member-access chain observed in source.
+//! - `Bind` — one static name = value binding observed in source.
+//! - `Identifier` — one bare-identifier appearance.
 //!
-//! Rather than collapsing these into a single union type, filefacts
-//! keeps three typed collections — [`Imports`], [`Exports`],
-//! [`Functions`] — each with the fields its concept actually carries.
-//! When a single fact appears in two categories (e.g. a VBA `Declare`
-//! is both a local function and a foreign-library import), the
-//! extractor emits one entry per category so consumers don't have to
-//! handle multi-category records.
-//!
-//! Cross-cutting "match this name regardless of kind" queries walk
-//! all three via [`ParsedFile::find_symbol`](crate::ParsedFile)
-//! rather than forcing every consumer to switch on a discriminator.
+//! Same family for source and binary; which kinds populate depends on
+//! the file. JSON shape is flat: `{"kind": "import", ...payload}`.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-/// A foreign-symbol reference — something this file *uses* that is
-/// defined elsewhere.
+/// Shape category for a call/bind argument.
 ///
-/// Examples by `source`:
-/// - `"pe"` — entry from the PE import table.
-/// - `"pe-bound"` / `"pe-delay"` — same table family, different
-///   binding strategies.
-/// - `"elf-dynsym"` — undefined symbol in `.dynsym`.
-/// - `"macho"` — undefined symbol in `LC_DYSYMTAB`.
-/// - `"vba-declare"` — VBA `Declare … Function NAME Lib "LIB"`.
-/// - `"vba-createobject"` / `"vba-getobject"` — COM-style ProgID
-///   imports; `library` is `"com"` / `"com-getobject"`.
-/// - `"java-class"` — constant-pool CONSTANT_Class_info reference.
-/// - `"js-require"`, `"py-import"`, … — source-language imports.
-#[derive(Debug, Clone, Serialize)]
-pub struct Import {
-    /// Symbol name in the form the format records it (no
-    /// demangling, no path normalization). For VBA Declares with an
-    /// `Alias` clause, this is the alias (i.e. the exported name in
-    /// the DLL), not the local VBA-side name.
-    pub name: String,
-    /// Library / module / pseudo-namespace the symbol is bound to,
-    /// when the format records one. PE: the DLL stem ("kernel32",
-    /// case-normalised to lowercase, without `.dll`). ELF:
-    /// `DT_NEEDED` library when resolvable, otherwise `None`. VBA:
-    /// the Lib-clause stem, or `"com"` / `"com-getobject"` for COM
-    /// imports, or the sentinel `"<non-literal>"` when the Lib
-    /// argument is a runtime expression rather than a string literal.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub library: Option<String>,
-    /// Short tag identifying the format and extraction subkind. See
-    /// module-level docs for the canonical taxonomy.
-    pub source: &'static str,
-    /// Byte offset within the source file where this import was
-    /// declared. Optional because some formats (notably ELF dynsym)
-    /// don't expose a useful offset for the import-table entry.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub offset: Option<u64>,
-    /// PE ordinal-only imports / dyld trie ordinals when relevant.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ordinal: Option<u32>,
+/// The set is closed and intentionally small — distinguishing "what
+/// kind of thing is this argument" supports every rule query that
+/// doesn't need the literal value; the literal-value case is served by
+/// [`Symbol::Call`]`::args`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum ArgShape {
+    /// String literal (after un-quoting).
+    String,
+    /// Numeric literal.
+    Number,
+    /// Boolean literal.
+    Bool,
+    /// Null / nil / None literal.
+    Null,
+    /// Bare identifier reference.
+    Identifier,
+    /// Object / map / dict / struct literal.
+    Object,
+    /// Array / list / slice literal.
+    Array,
+    /// Function / lambda / closure literal (anonymous callable).
+    Function,
+    /// Template / formatted / interpolated string.
+    Template,
+    /// Result of another call expression.
+    Call,
+    /// Any expression that doesn't fit one of the above.
+    Expression,
 }
 
-/// A locally-defined symbol that this file makes visible to other
-/// code. Distinct from a locally-defined function (which may not be
-/// exported); see [`Function`].
-#[derive(Debug, Clone, Serialize)]
-pub struct Export {
-    /// Symbol name as recorded by the format.
-    pub name: String,
-    /// Format / extraction-subkind tag. See module-level docs.
-    pub source: &'static str,
-    /// Offset within the source file (for binary formats, the RVA
-    /// of the exported entry).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub offset: Option<u64>,
-    /// PE ordinal slot, dyld trie ordinal, etc.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ordinal: Option<u32>,
-    /// Forwarded re-export target, when this entry is a forward
-    /// rather than a locally-defined symbol. PE format example:
-    /// `KERNEL32.LoadLibraryA` (DLL-name form) or `NTDLL.#123`
-    /// (DLL-ordinal form). `None` for normal exports whose RVA
-    /// points at the binary's own code/data.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub forward_to: Option<String>,
-}
-
-/// A function / method / subroutine defined inside this file. Local
-/// declarations regardless of export status — a PE export entry
-/// pointing at function `foo` will surface as both an [`Export`]
-/// (with ordinal / RVA from the export table) and a `Function`
-/// (with the entry address). VBA `Public Sub` similarly surfaces in
-/// both.
+/// One positional argument at a call site. Tagged enum: each variant
+/// carries exactly the data meaningful for its shape, so authors of
+/// `type: symbol, kind: call, arg: …` rules can match on the
+/// literal value directly without going through offset correlation
+/// against the top-level `literals` collection.
 ///
-/// Per-function CFG fields (`complexity`, `basic_blocks`, `edges`,
-/// `instructions`, `stack_frame`, `recursive`, `noreturn`, `is_linear`,
-/// `calls`) are populated when rizin's `aflj` analysis ran over the
-/// function body. They are absent for entries sourced from symbol
-/// tables alone (PE imports, ELF `.dynsym`, VBA declarations, etc.).
-/// Cleave's diff-mode + xz-utils-style supply-chain detection keys
-/// on per-function fingerprint drift: a function gaining a new callee
-/// or a 3× basic-block count is exactly the signal those workflows
-/// surface.
-#[derive(Debug, Clone, Serialize)]
-pub struct Function {
-    /// Function name. Empty when the format records the entry by
-    /// address only (rare).
-    pub name: String,
-    /// Format / extraction-subkind tag.
-    pub source: &'static str,
-    /// Entry-point offset within the source file.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub offset: Option<u64>,
-    /// Optional language-level kind tag — `"method"`, `"sub"`,
-    /// `"function"`, `"constructor"`, `"initializer"`. `None` when
-    /// the format doesn't distinguish (e.g. PE function entries
-    /// from the export table).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind: Option<&'static str>,
-    /// Cyclomatic complexity (McCabe). Number of linearly-independent
-    /// paths through the function — roughly `edges - nodes + 2`. A
-    /// simple `if/else` is 2; a 10-branch state machine is 11.
-    /// `None` for functions sourced from symbol tables without
-    /// disassembly (PE imports, ELF dynsym, etc.).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub complexity: Option<u32>,
-    /// Number of basic blocks (straight-line code segments).
-    /// Inflation signal: a function that suddenly has 3× the basic
-    /// blocks of upstream is doing something new.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub basic_blocks: Option<u32>,
-    /// Number of control-flow edges between basic blocks. With
-    /// `basic_blocks` defines the CFG shape.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub edges: Option<u32>,
-    /// Total instruction count.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<u32>,
-    /// Stack frame size in bytes (locals + saved registers).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stack_frame: Option<u64>,
-    /// `true` iff the function calls itself directly.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recursive: Option<bool>,
-    /// `true` iff the function never returns (always exits / aborts).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub noreturn: Option<bool>,
-    /// `true` iff the function has no branches (straight-line code).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_linear: Option<bool>,
-    /// Names of callees rizin resolved (outgoing call edges). The
-    /// most useful per-function diff signal — xz's `_get_cpuid`
-    /// gained `_resolve` as a callee, that was the whole story.
-    /// Empty `Vec` when the function has no resolved outgoing calls
-    /// or wasn't disassembled.
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub calls: Vec<String>,
+/// JSON shape: `{"shape": "<lower>", ...payload}` — the value-carrying
+/// variants (String, Number, Identifier, Bool, Template) have their
+/// own fields; the rest (Object, Array, Function, Null, Call,
+/// Expression) carry only the shape tag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "shape", rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum Arg {
+    /// String literal — value is the un-quoted text.
+    String { value: String },
+    /// Numeric literal — `text` is the source-written form
+    /// (`"0o777"`, `"0xDEADBEEF"`, `"4444"`); `value` is the parsed
+    /// integer; `radix` is how it was written (2/8/10/16). Authors
+    /// distinguish `0o777` from decimal `511` via `radix`.
+    Number {
+        /// Source-written form (carries the prefix/separators).
+        text: String,
+        /// Parsed integer value.
+        value: i64,
+        /// Source-written radix: 2 / 8 / 10 / 16.
+        radix: u32,
+    },
+    /// Bare identifier — value is the identifier name.
+    Identifier { name: String },
+    /// Boolean literal — value is the parsed bool.
+    Bool { value: bool },
+    /// Template / formatted / interpolated string — value is the
+    /// source text including the formatting markers (best-effort).
+    Template { value: String },
+    /// Null / nil / None literal.
+    Null,
+    /// Object / map / dict / struct literal.
+    Object,
+    /// Array / list / slice literal.
+    Array,
+    /// Function / lambda / closure literal (anonymous callable).
+    Function,
+    /// Result of another call expression.
+    Call,
+    /// Any expression that doesn't fit one of the above (computed
+    /// value, parenthesised sub-expression with non-trivial shape,
+    /// member access result, …).
+    Expression,
 }
 
-impl Default for Function {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            source: "",
-            offset: None,
-            kind: None,
-            complexity: None,
-            basic_blocks: None,
-            edges: None,
-            instructions: None,
-            stack_frame: None,
-            recursive: None,
-            noreturn: None,
-            is_linear: None,
-            calls: Vec::new(),
+/// One named-entity fact about a parsed artifact.
+///
+/// Serializes as `{"kind": "<lower_snake>", ...payload}` via
+/// `#[serde(tag = "kind")]`. Each variant carries the fields that apply
+/// to its kind; unused fields are elided from JSON via
+/// `skip_serializing_if`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Symbol {
+    /// Foreign-symbol reference — something this file *uses* that is
+    /// defined elsewhere.
+    Import {
+        /// Symbol name in the form the format records it (no demangling,
+        /// no path normalization). For VBA `Declare` with an `Alias`
+        /// clause, this is the alias.
+        name: String,
+        /// Library / module / pseudo-namespace the symbol is bound to,
+        /// when the format records one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        library: Option<String>,
+        /// Short tag identifying the format and extraction subkind.
+        /// Examples: `"pe"`, `"pe-bound"`, `"pe-delay"`, `"elf-dynsym"`,
+        /// `"macho"`, `"vba-declare"`, `"vba-createobject"`,
+        /// `"java-class"`, `"js-require"`, `"py-import"`.
+        source: String,
+        /// Byte offset within the source file where this import was
+        /// declared. Optional because some formats (notably ELF dynsym)
+        /// don't expose a useful offset for the import-table entry.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<u64>,
+        /// PE ordinal-only imports / dyld trie ordinals when relevant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ordinal: Option<u32>,
+    },
+
+    /// Locally-defined symbol that this file makes visible to other code.
+    Export {
+        /// Symbol name as recorded by the format.
+        name: String,
+        /// Format / extraction-subkind tag.
+        source: String,
+        /// Offset within the source file (for binary formats, the RVA
+        /// of the exported entry).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<u64>,
+        /// PE ordinal slot, dyld trie ordinal, etc.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ordinal: Option<u32>,
+        /// Forwarded re-export target, when this entry is a forward
+        /// rather than a locally-defined symbol. PE example:
+        /// `"KERNEL32.LoadLibraryA"` or `"NTDLL.#123"`. `None` for
+        /// normal exports whose RVA points at the binary's own code.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        forward_to: Option<String>,
+    },
+
+    /// Function / method / subroutine defined inside this file.
+    ///
+    /// CFG fields (`complexity`, `basic_blocks`, `edges`, `instructions`,
+    /// `stack_frame`, `recursive`, `noreturn`, `is_linear`, `callees`)
+    /// are populated when rizin's `aflj` analysis ran. They are absent
+    /// for entries sourced from symbol tables alone (PE imports, ELF
+    /// `.dynsym`, VBA declarations, etc.).
+    Function {
+        /// Function name. Empty when the format records by address only.
+        name: String,
+        /// Format / extraction-subkind tag.
+        source: String,
+        /// Entry-point offset within the source file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<u64>,
+        /// Language-level declaration shape — `"method"`, `"sub"`,
+        /// `"function"`, `"constructor"`, `"initializer"`, `"class"`.
+        /// Renamed from the prior `kind` field to avoid collision with
+        /// the [`Symbol`] discriminator.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decl: Option<String>,
+        /// Cyclomatic complexity (McCabe).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        complexity: Option<u32>,
+        /// Number of basic blocks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        basic_blocks: Option<u32>,
+        /// Number of control-flow edges between basic blocks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edges: Option<u32>,
+        /// Total instruction count.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<u32>,
+        /// Stack frame size in bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stack_frame: Option<u64>,
+        /// `true` iff the function calls itself directly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recursive: Option<bool>,
+        /// `true` iff the function never returns.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        noreturn: Option<bool>,
+        /// `true` iff the function has no branches (straight-line code).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_linear: Option<bool>,
+        /// Names of resolved outgoing call edges (rizin). Renamed from
+        /// the prior `calls` field to disambiguate from the top-level
+        /// [`Symbol::Call`] kind.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        callees: Vec<String>,
+    },
+
+    /// One observed call site in source order.
+    ///
+    /// `target` is the dotted-static path resolved from the callee chain
+    /// — `"fetch"`, `"chrome.cookies.getAll"`. `None` when the callee is
+    /// computed (`obj[varName]()`, an anonymous function call, a method
+    /// on a call result, …).
+    ///
+    /// `args` carries only the *shape* of each argument in call order.
+    /// Literal values live canonically in the top-level `literals`
+    /// collection; rules that need to match arg content compose by
+    /// offset window (a literal whose offset falls inside the call's
+    /// extent).
+    Call {
+        /// Static dotted path to the function being called, or `None`
+        /// for dynamic targets.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+        /// Per-position arguments in call order. Each [`Arg`] carries
+        /// its shape plus the literal value when the shape is a
+        /// literal kind (String, Number, Identifier, Bool, Template).
+        /// Authors match on arg content via `arg: { kind: ..., value:
+        /// ... }` in rules without needing offset correlation against
+        /// the top-level `literals` collection.
+        #[serde(default)]
+        args: Vec<Arg>,
+        /// Source / extraction-subkind tag (typically the language name
+        /// for source files).
+        source: String,
+        /// Byte offset of the call expression's start, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<u64>,
+    },
+
+    /// One dotted member-access chain observed in source code, *in any
+    /// position* — called or not, read or written.
+    Member {
+        /// Dotted chain like `chrome.cookies.getAll` or
+        /// `window.localStorage`.
+        path: String,
+        /// Source / extraction-subkind tag.
+        source: String,
+    },
+
+    /// One static assignment/binding observed in source code.
+    ///
+    /// Carries the assignment target, its shape, and its lexical scope.
+    /// Literal values live canonically in the top-level `literals`
+    /// collection and correlate to this bind by offset window — same
+    /// pattern as [`Self::Call`] args.
+    Bind {
+        /// Static identifier/member path being assigned: `API_URL`,
+        /// `self.path`, `exports.token`.
+        target: String,
+        /// Lexical scope for the assignment: `"module"`, `"class"`, or
+        /// `"function"`.
+        scope: String,
+        /// Shape of the assigned expression.
+        shape: ArgShape,
+        /// Source / extraction-subkind tag.
+        source: String,
+        /// Byte offset where the assignment target starts.
+        offset: u64,
+    },
+
+    /// One bare-identifier appearance — variable name, function name,
+    /// type name, macro name. Captures naming-pattern signals
+    /// (`c2_server`, `BackdoorListener`) that don't appear in any other
+    /// kind.
+    Identifier {
+        /// The identifier text.
+        name: String,
+        /// Source / extraction-subkind tag.
+        source: String,
+        /// Byte offset of the identifier, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<u64>,
+    },
+}
+
+/// Discriminator tag for filtering [`Symbols`] without matching on the
+/// full enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SymbolKind {
+    /// [`Symbol::Import`].
+    Import,
+    /// [`Symbol::Export`].
+    Export,
+    /// [`Symbol::Function`].
+    Function,
+    /// [`Symbol::Call`].
+    Call,
+    /// [`Symbol::Member`].
+    Member,
+    /// [`Symbol::Bind`].
+    Bind,
+    /// [`Symbol::Identifier`].
+    Identifier,
+}
+
+impl Symbol {
+    /// The discriminator tag for this symbol.
+    pub fn kind(&self) -> SymbolKind {
+        match self {
+            Self::Import { .. } => SymbolKind::Import,
+            Self::Export { .. } => SymbolKind::Export,
+            Self::Function { .. } => SymbolKind::Function,
+            Self::Call { .. } => SymbolKind::Call,
+            Self::Member { .. } => SymbolKind::Member,
+            Self::Bind { .. } => SymbolKind::Bind,
+            Self::Identifier { .. } => SymbolKind::Identifier,
+        }
+    }
+
+    /// Primary identifying name for this symbol, when one applies.
+    /// Returns the dotted target for [`Self::Call`], the chain for
+    /// [`Self::Member`], the assignment target for [`Self::Bind`], or
+    /// the `name` field for the rest. `None` for dynamic call targets.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Self::Import { name, .. }
+            | Self::Export { name, .. }
+            | Self::Function { name, .. }
+            | Self::Identifier { name, .. } => Some(name.as_str()),
+            Self::Call { target, .. } => target.as_deref(),
+            Self::Member { path, .. } => Some(path.as_str()),
+            Self::Bind { target, .. } => Some(target.as_str()),
+        }
+    }
+
+    /// The extraction-subkind tag.
+    pub fn source(&self) -> &str {
+        match self {
+            Self::Import { source, .. }
+            | Self::Export { source, .. }
+            | Self::Function { source, .. }
+            | Self::Call { source, .. }
+            | Self::Member { source, .. }
+            | Self::Bind { source, .. }
+            | Self::Identifier { source, .. } => source.as_str(),
         }
     }
 }
 
-/// All [`Import`] entries the parsers found, in the order each
-/// format emits them.
-#[derive(Debug, Clone, Default, Serialize)]
+/// All [`Symbol`] facts collected from a file, in extraction order.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Imports(Vec<Import>);
+pub struct Symbols(Vec<Symbol>);
 
-/// All [`Export`] entries the parsers found.
-#[derive(Debug, Clone, Default, Serialize)]
-#[serde(transparent)]
-pub struct Exports(Vec<Export>);
-
-/// All [`Function`] entries the parsers found.
-#[derive(Debug, Clone, Default, Serialize)]
-#[serde(transparent)]
-pub struct Functions(Vec<Function>);
-
-impl Imports {
+impl Symbols {
     /// Construct an empty collection.
     pub fn new() -> Self {
         Self::default()
     }
-    pub(crate) fn push(&mut self, import: Import) {
-        self.0.push(import);
+
+    pub(crate) fn push(&mut self, symbol: Symbol) {
+        self.0.push(symbol);
     }
+
     /// Borrow the underlying slice.
-    pub fn as_slice(&self) -> &[Import] {
+    pub fn as_slice(&self) -> &[Symbol] {
         &self.0
     }
-    /// Iterate every recorded import.
-    pub fn iter(&self) -> std::slice::Iter<'_, Import> {
+
+    /// Iterate every recorded symbol.
+    pub fn iter(&self) -> std::slice::Iter<'_, Symbol> {
         self.0.iter()
     }
-    /// Number of imports recorded.
+
+    /// Iterate symbols of a specific kind (filtered view).
+    pub fn iter_kind(&self, want: SymbolKind) -> impl Iterator<Item = &Symbol> {
+        self.0.iter().filter(move |s| s.kind() == want)
+    }
+
+    /// Number of symbols recorded.
     pub fn len(&self) -> usize {
         self.0.len()
     }
-    /// True when no imports were recorded.
+
+    /// True when no symbols were recorded.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }
 
-impl Exports {
-    /// Construct an empty collection.
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub(crate) fn push(&mut self, export: Export) {
-        self.0.push(export);
-    }
-    /// Borrow the underlying slice.
-    pub fn as_slice(&self) -> &[Export] {
-        &self.0
-    }
-    /// Iterate every recorded export.
-    pub fn iter(&self) -> std::slice::Iter<'_, Export> {
-        self.0.iter()
-    }
-    /// Number of exports recorded.
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-    /// True when no exports were recorded.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-impl Functions {
-    /// Construct an empty collection.
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub(crate) fn push(&mut self, function: Function) {
-        self.0.push(function);
-    }
-    /// Borrow the underlying slice.
-    pub fn as_slice(&self) -> &[Function] {
-        &self.0
-    }
-    /// Iterate every recorded function.
-    pub fn iter(&self) -> std::slice::Iter<'_, Function> {
-        self.0.iter()
-    }
-    /// Number of functions recorded.
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-    /// True when no functions were recorded.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-impl<'a> IntoIterator for &'a Imports {
-    type Item = &'a Import;
-    type IntoIter = std::slice::Iter<'a, Import>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a Exports {
-    type Item = &'a Export;
-    type IntoIter = std::slice::Iter<'a, Export>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a Functions {
-    type Item = &'a Function;
-    type IntoIter = std::slice::Iter<'a, Function>;
+impl<'a> IntoIterator for &'a Symbols {
+    type Item = &'a Symbol;
+    type IntoIter = std::slice::Iter<'a, Symbol>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
@@ -312,94 +407,33 @@ impl<'a> IntoIterator for &'a Functions {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
 
     #[test]
-    fn imports_push_and_iterate() {
-        let mut imports = Imports::new();
-        imports.push(Import {
+    fn symbol_kind_discriminator_round_trips_through_serde() {
+        let s = Symbol::Import {
             name: "CreateFileW".into(),
             library: Some("kernel32".into()),
-            source: "pe",
+            source: "pe".into(),
             offset: Some(0x1234),
             ordinal: None,
-        });
-        imports.push(Import {
-            name: "URLDownloadToFileA".into(),
-            library: Some("urlmon".into()),
-            source: "vba-declare",
-            offset: Some(42),
-            ordinal: None,
-        });
-        assert_eq!(imports.len(), 2);
-        let names: Vec<&str> = imports.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(names, vec!["CreateFileW", "URLDownloadToFileA"]);
-        // Source taxonomy distinguishes the binary and the VBA entry.
-        let sources: Vec<&str> = imports.iter().map(|i| i.source).collect();
-        assert_eq!(sources, vec!["pe", "vba-declare"]);
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"kind\":\"import\""));
+        let back: Symbol = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind(), SymbolKind::Import);
+        assert_eq!(back.name(), Some("CreateFileW"));
+        assert_eq!(back.source(), "pe");
     }
 
     #[test]
-    fn exports_serialize_omits_optional_fields() {
-        let mut exports = Exports::new();
-        exports.push(Export {
-            name: "DllMain".into(),
-            source: "pe",
-            offset: Some(0x1000),
-            ordinal: Some(1),
-            forward_to: None,
-        });
-        exports.push(Export {
-            name: "_init".into(),
-            source: "elf-dynsym",
-            offset: None,
-            ordinal: None,
-            forward_to: None,
-        });
-        let json = serde_json::to_value(&exports).unwrap();
-        // First entry has every field; second elides optionals.
-        let arr = json.as_array().unwrap();
-        assert!(arr[0].as_object().unwrap().contains_key("ordinal"));
-        assert!(!arr[1].as_object().unwrap().contains_key("ordinal"));
-        assert!(!arr[1].as_object().unwrap().contains_key("offset"));
-    }
-
-    #[test]
-    fn functions_kind_optional() {
-        let mut funcs = Functions::new();
-        funcs.push(Function {
-            name: "Auto_Open".into(),
-            source: "vba-public-sub",
-            offset: Some(100),
-            kind: Some("sub"),
-            ..Function::default()
-        });
-        funcs.push(Function {
-            name: "sub_401000".into(),
-            source: "pe",
-            offset: Some(0x0040_1000),
-            kind: None,
-            ..Function::default()
-        });
-        assert_eq!(funcs.len(), 2);
-        assert_eq!(funcs.iter().next().unwrap().kind, Some("sub"));
-        assert_eq!(funcs.iter().nth(1).unwrap().kind, None);
-    }
-
-    #[test]
-    fn function_cfg_fields_serialize_when_present() {
-        // Pin the full rizin-derived CFG fingerprint of one function.
-        // Any drift in field names, serialisation, or `skip_serializing_if`
-        // policy trips this test. The fields together describe what
-        // cleave's diff-mode + xz-utils-style supply-chain detector
-        // needs to spot a backdoored function (gained edges/callees,
-        // inflated basic-block count).
-        let mut funcs = Functions::new();
-        funcs.push(Function {
+    fn function_cfg_fields_round_trip() {
+        let s = Symbol::Function {
             name: "_get_cpuid".into(),
-            source: "rizin",
+            source: "rizin".into(),
             offset: Some(0x4080),
-            kind: None,
+            decl: None,
             complexity: Some(7),
             basic_blocks: Some(12),
             edges: Some(18),
@@ -408,38 +442,41 @@ mod tests {
             recursive: Some(false),
             noreturn: Some(false),
             is_linear: Some(false),
-            calls: vec!["_resolve".into(), "_lzma_crc32".into()],
-        });
-        let json = serde_json::to_value(&funcs).unwrap();
-        let entry = &json[0];
-        assert_eq!(entry["name"], "_get_cpuid");
-        assert_eq!(entry["complexity"], 7);
-        assert_eq!(entry["basic_blocks"], 12);
-        assert_eq!(entry["edges"], 18);
-        assert_eq!(entry["instructions"], 83);
-        assert_eq!(entry["stack_frame"], 48);
-        assert_eq!(entry["recursive"], false);
-        assert_eq!(entry["noreturn"], false);
-        assert_eq!(entry["is_linear"], false);
-        assert_eq!(entry["calls"][0], "_resolve");
+            callees: vec!["_resolve".into(), "_lzma_crc32".into()],
+        };
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["kind"], "function");
+        assert_eq!(json["complexity"], 7);
+        assert_eq!(json["callees"][0], "_resolve");
+        let back: Symbol = serde_json::from_value(json).unwrap();
+        if let Symbol::Function { callees, .. } = back {
+            assert_eq!(callees, vec!["_resolve", "_lzma_crc32"]);
+        } else {
+            panic!("expected Function variant");
+        }
     }
 
     #[test]
-    fn function_cfg_fields_omit_when_absent() {
-        // Symbol-table-sourced functions (PE imports, ELF dynsym, VBA
-        // declarations) carry no disassembly. The CFG fields must be
-        // elided from JSON entirely rather than serialised as `null`.
-        let mut funcs = Functions::new();
-        funcs.push(Function {
+    fn function_optional_fields_elide_from_json() {
+        let s = Symbol::Function {
             name: "CreateFileW".into(),
-            source: "pe-import",
+            source: "pe-import".into(),
             offset: Some(0x1000),
-            kind: None,
-            ..Function::default()
-        });
-        let json = serde_json::to_value(&funcs).unwrap();
-        let entry = json[0].as_object().unwrap();
+            decl: None,
+            complexity: None,
+            basic_blocks: None,
+            edges: None,
+            instructions: None,
+            stack_frame: None,
+            recursive: None,
+            noreturn: None,
+            is_linear: None,
+            callees: Vec::new(),
+        };
+        let json = serde_json::to_value(&s).unwrap();
+        let obj = json.as_object().unwrap();
         for key in [
+            "decl",
             "complexity",
             "basic_blocks",
             "edges",
@@ -448,29 +485,123 @@ mod tests {
             "recursive",
             "noreturn",
             "is_linear",
-            "calls",
+            "callees",
         ] {
-            assert!(
-                !entry.contains_key(key),
-                "expected {key} elided when absent"
-            );
+            assert!(!obj.contains_key(key), "expected {key} elided when absent");
         }
     }
 
     #[test]
-    fn collections_round_trip_through_serde() {
-        let mut imports = Imports::new();
-        imports.push(Import {
+    fn call_record_round_trips() {
+        let s = Symbol::Call {
+            target: Some("fetch".into()),
+            args: vec![Arg::String {
+                value: "https://example.com".into(),
+            }],
+            source: "javascript".into(),
+            offset: Some(42),
+        };
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["kind"], "call");
+        assert_eq!(json["target"], "fetch");
+        assert_eq!(json["args"][0]["shape"], "string");
+        assert_eq!(json["args"][0]["value"], "https://example.com");
+        let back: Symbol = serde_json::from_value(json).unwrap();
+        assert_eq!(back.name(), Some("fetch"));
+    }
+
+    #[test]
+    fn dynamic_call_serializes_without_target() {
+        let s = Symbol::Call {
+            target: None,
+            args: vec![Arg::Identifier {
+                name: "callback".into(),
+            }],
+            source: "javascript".into(),
+            offset: None,
+        };
+        let json = serde_json::to_value(&s).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(!obj.contains_key("target"));
+    }
+
+    #[test]
+    fn numeric_arg_carries_text_value_and_radix() {
+        // chmod(file, 0o777) — the canonical example. Verifies the
+        // Number variant serializes with all three fields so authors
+        // can match on parsed value + source-written radix.
+        let s = Symbol::Call {
+            target: Some("chmod".into()),
+            args: vec![
+                Arg::String {
+                    value: "/tmp/x".into(),
+                },
+                Arg::Number {
+                    text: "0o777".into(),
+                    value: 511,
+                    radix: 8,
+                },
+            ],
+            source: "python".into(),
+            offset: Some(0),
+        };
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["args"][1]["shape"], "number");
+        assert_eq!(json["args"][1]["text"], "0o777");
+        assert_eq!(json["args"][1]["value"], 511);
+        assert_eq!(json["args"][1]["radix"], 8);
+        let back: Symbol = serde_json::from_value(json).unwrap();
+        let Symbol::Call { args, .. } = back else {
+            panic!("expected Call");
+        };
+        assert_eq!(args.len(), 2);
+        assert!(matches!(args[0], Arg::String { ref value } if value == "/tmp/x"));
+        assert!(matches!(args[1], Arg::Number { value: 511, radix: 8, .. }));
+    }
+
+    #[test]
+    fn collection_is_transparent_array() {
+        let mut syms = Symbols::new();
+        syms.push(Symbol::Import {
             name: "Foo".into(),
             library: Some("bar".into()),
-            source: "pe",
+            source: "pe".into(),
             offset: None,
             ordinal: None,
         });
-        let json = serde_json::to_string(&imports).unwrap();
-        // `#[serde(transparent)]` means the collection serializes as
-        // a bare JSON array, not `{ "0": [...] }`.
+        let json = serde_json::to_string(&syms).unwrap();
         assert!(json.starts_with('['));
-        assert!(json.contains("\"name\":\"Foo\""));
+        assert!(json.contains("\"kind\":\"import\""));
+    }
+
+    #[test]
+    fn iter_kind_filters() {
+        let mut syms = Symbols::new();
+        syms.push(Symbol::Import {
+            name: "Foo".into(),
+            library: None,
+            source: "pe".into(),
+            offset: None,
+            ordinal: None,
+        });
+        syms.push(Symbol::Export {
+            name: "Bar".into(),
+            source: "pe".into(),
+            offset: None,
+            ordinal: None,
+            forward_to: None,
+        });
+        syms.push(Symbol::Import {
+            name: "Baz".into(),
+            library: None,
+            source: "pe".into(),
+            offset: None,
+            ordinal: None,
+        });
+        let imports: Vec<&str> = syms
+            .iter_kind(SymbolKind::Import)
+            .map(|s| s.name().unwrap())
+            .collect();
+        assert_eq!(imports, vec!["Foo", "Baz"]);
     }
 }

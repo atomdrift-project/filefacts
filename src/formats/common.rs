@@ -6,17 +6,19 @@ use crate::output::{Strings, Values};
 use crate::scan::ascii;
 use crate::scan::utf16;
 
-/// Push every ASCII run in `bytes` into `strings.ascii`, applying the
-/// scanner's default minimum length.
+/// Push every ASCII run in `bytes` into the byte-scan Text view,
+/// applying the scanner's default minimum length.
 pub(super) fn extract_ascii_strings(bytes: &[u8], strings: &mut Strings) {
     strings
+        .text
         .ascii
         .extend(ascii::extract_runs(bytes, ascii::DEFAULT_MIN_LEN));
 }
 
-/// Push every UTF-16LE run in `bytes` into `strings.utf16le`.
+/// Push every UTF-16LE run in `bytes` into the byte-scan Text view.
 pub(super) fn extract_utf16_strings(bytes: &[u8], strings: &mut Strings) {
     strings
+        .text
         .utf16le
         .extend(utf16::extract_runs(bytes, utf16::DEFAULT_MIN_LEN));
 }
@@ -26,16 +28,14 @@ pub(super) fn extract_utf16_strings(bytes: &[u8], strings: &mut Strings) {
 /// `extract_ascii_strings` byte-scan: stng's pointer+length-aware
 /// extraction dedupes Go/Rust packed strings, recovers XOR-deobfuscated
 /// runs, and decodes base64/hex/url payloads. UTF-16-recovered runs
-/// land in `strings.utf16le`; everything else in `strings.ascii`.
+/// land in the Text.utf16le partition; everything else in Text.ascii.
 ///
 /// `method` is set only for *transformation* methods (the string went
 /// through a decoder: `base64`, `xor`, `unicode-escape`, …) — the
 /// pure recovery methods (raw scan, instruction-pattern, structure)
-/// add noise and aren't worth tagging. Convention: kebab-case for
-/// multi-word encoding names (`base64-obf`, `unicode-escape`), `+` to
-/// separate chained encodings (`base64+zlib`).
+/// add noise and aren't worth tagging.
 pub(super) fn extract_binary_strings(bytes: &[u8], strings: &mut Strings) {
-    use crate::output::{ExtractedString, StringCategory};
+    use crate::output::ExtractedString;
     let opts = stng::ExtractOptions {
         min_length: ascii::DEFAULT_MIN_LEN,
         ..Default::default()
@@ -48,13 +48,7 @@ pub(super) fn extract_binary_strings(bytes: &[u8], strings: &mut Strings) {
                 | stng::StringMethod::Utf16LeDecode
                 | stng::StringMethod::Utf16BeDecode
         );
-        let category = if is_utf16 {
-            StringCategory::Utf16Le
-        } else {
-            StringCategory::Ascii
-        };
         let entry = ExtractedString {
-            category,
             text: s.value,
             offset: s.data_offset as usize,
             method: stng_method_label(s.method).map(str::to_string),
@@ -63,9 +57,9 @@ pub(super) fn extract_binary_strings(bytes: &[u8], strings: &mut Strings) {
             ..ExtractedString::default()
         };
         if is_utf16 {
-            strings.utf16le.push(entry);
+            strings.text.utf16le.push(entry);
         } else {
-            strings.ascii.push(entry);
+            strings.text.ascii.push(entry);
         }
     }
 }
@@ -191,31 +185,27 @@ pub(super) fn put_i64(values: &mut Values, path: &str, n: i64) {
 // numeric/string value) instead — never a bare boolean that mirrors
 // presence/absence.
 
-/// Run rizin recovery when the static parse produced an empty
-/// symbol/function table — the canonical "stripped binary" signal
-/// goblin can't recover from. Shared by PE / ELF / Mach-O extractors.
-/// No-op when rizin isn't on PATH or when goblin already populated
-/// at least one of the three typed views.
+/// Run rizin recovery when the static parse produced an empty symbol
+/// table — the canonical "stripped binary" signal goblin can't recover
+/// from. Shared by PE / ELF / Mach-O extractors. No-op when rizin
+/// isn't on PATH or when goblin already populated any symbol kind.
 pub(super) fn rizin_fallback(
     bytes: &[u8],
-    imports: &mut crate::Imports,
-    exports: &mut crate::Exports,
-    functions: &mut crate::Functions,
+    symbols: &mut crate::Symbols,
     metrics: &mut crate::output::Metrics,
 ) {
-    if !imports.is_empty() || !exports.is_empty() || !functions.is_empty() {
+    if !symbols.is_empty() {
         return;
     }
     if let Some(recovery) = crate::rizin_impl::recover(bytes) {
-        recovery.apply(imports, exports, functions, metrics);
+        recovery.apply(symbols, metrics);
     }
 }
 
 /// Extended rizin fallback for PE: tries to recover sections as well
-/// as imports / exports / functions, and emits `*.recovered_*`
-/// metrics under the supplied prefix so callers can attribute the
-/// recovered counts in trait rules. Returns the number of entries the
-/// disassembler contributed to each view.
+/// as symbols, and emits `*.recovered_*` metrics under the supplied
+/// prefix so callers can attribute the recovered counts in trait
+/// rules.
 ///
 /// The caller passes the metric prefix (`"pe"`, `"elf"`, `"macho"`)
 /// so the emitted keys are `{prefix}.recovered_sections` etc. The
@@ -223,26 +213,21 @@ pub(super) fn rizin_fallback(
 /// rizin to radare2 / Ghidra the schema doesn't ripple.
 pub(super) fn rizin_fallback_with_sections(
     bytes: &[u8],
-    imports: &mut crate::Imports,
-    exports: &mut crate::Exports,
-    functions: &mut crate::Functions,
+    symbols: &mut crate::Symbols,
     sections: &mut Vec<crate::output::Section>,
     metrics: &mut crate::output::Metrics,
     metric_prefix: &str,
 ) {
-    // Skip the spawn entirely when every view goblin owns is already
-    // populated. Sections are the new "fillable" view; if goblin gave
-    // us at least one of imports/exports/functions/sections we still
-    // run rizin only if sections are empty AND the symbol views are
-    // empty — matching cleave's historical "all four empty → run
-    // rizin" gate.
-    if !imports.is_empty() || !exports.is_empty() || !functions.is_empty() || !sections.is_empty() {
+    // Skip the spawn entirely when goblin already gave us *anything* —
+    // any symbol or any section. Matches cleave's historical "all
+    // empty → run rizin" gate.
+    if !symbols.is_empty() || !sections.is_empty() {
         return;
     }
     let Some(recovery) = crate::rizin_impl::recover(bytes) else {
         return;
     };
-    let counts = recovery.apply_with_sections(imports, exports, functions, sections, metrics);
+    let counts = recovery.apply_with_sections(symbols, sections, metrics);
     if counts.imports > 0 {
         metrics.insert(
             format!("{metric_prefix}.recovered_imports"),

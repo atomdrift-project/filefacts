@@ -25,9 +25,7 @@ pub(super) fn extract(
     strings: &mut Strings,
     metrics: &mut Metrics,
     sections_out: &mut Vec<Section>,
-    imports_out: &mut crate::Imports,
-    exports_out: &mut crate::Exports,
-    functions_out: &mut crate::Functions,
+    symbols_out: &mut crate::Symbols,
     errors_out: &mut Errors,
 ) -> Result<(), Error> {
     extract_binary_strings(bytes, strings);
@@ -51,29 +49,13 @@ pub(super) fn extract(
     };
     match parsed {
         Mach::Binary(macho) => {
-            single_arch(
-                &macho,
-                bytes,
-                values,
-                metrics,
-                sections_out,
-                imports_out,
-                exports_out,
-            );
+            single_arch(&macho, bytes, values, metrics, sections_out, symbols_out);
         }
         Mach::Fat(fat) => {
-            fat_binary(
-                bytes,
-                &fat,
-                values,
-                metrics,
-                sections_out,
-                imports_out,
-                exports_out,
-            );
+            fat_binary(bytes, &fat, values, metrics, sections_out, symbols_out);
         }
     }
-    rizin_fallback(bytes, imports_out, exports_out, functions_out, metrics);
+    rizin_fallback(bytes, symbols_out, metrics);
     super::upx::detect(bytes, values);
     super::go_buildinfo::detect(bytes, values, "macho", None);
     Ok(())
@@ -85,8 +67,7 @@ fn fat_binary(
     values: &mut Values,
     metrics: &mut Metrics,
     sections_out: &mut Vec<Section>,
-    imports_out: &mut crate::Imports,
-    exports_out: &mut crate::Exports,
+    symbols_out: &mut crate::Symbols,
 ) {
     let mut archs: Vec<JsonValue> = Vec::new();
     for (idx, slice) in fat.iter_arches().enumerate() {
@@ -112,15 +93,7 @@ fn fat_binary(
         }
         archs.push(slice_entry);
         if idx == 0 {
-            single_arch(
-                &macho,
-                slice_bytes,
-                values,
-                metrics,
-                sections_out,
-                imports_out,
-                exports_out,
-            );
+            single_arch(&macho, slice_bytes, values, metrics, sections_out, symbols_out);
         }
     }
     metrics.insert("macho.slice_count", archs.len() as f64);
@@ -129,18 +102,16 @@ fn fat_binary(
 
 /// Run the full single-arch extractor on a slice and return the
 /// resulting `macho.*` subtree as a JSON object. Used for FAT
-/// binaries so each architecture's view (cdhash, segments, imports,
-/// hashes, code-signature, build_version, entitlements, …) is
-/// recoverable independently of which slice happens to sit at index
-/// zero. Throws away the cross-format `Metrics`, `Imports`,
-/// `Exports`, and `Section` outputs — those keep tracking the
-/// preferred slice via `single_arch`.
+/// binaries so each architecture's view is recoverable independently
+/// of which slice happens to sit at index zero. Throws away the
+/// cross-format `Metrics`, `Symbols`, and `Section` outputs — those
+/// keep tracking the preferred slice via `single_arch`.
 fn analyze_slice(macho: &MachO<'_>, slice_bytes: &[u8]) -> JsonValue {
+    use crate::output::SymbolKind;
     let mut slice_values = Values::new();
     let mut throwaway_metrics = Metrics::new();
     let mut throwaway_sections: Vec<Section> = Vec::new();
-    let mut throwaway_imports = crate::Imports::new();
-    let mut throwaway_exports = crate::Exports::new();
+    let mut throwaway_symbols = crate::Symbols::new();
 
     extract_sections(
         macho,
@@ -154,13 +125,11 @@ fn analyze_slice(macho: &MachO<'_>, slice_bytes: &[u8]) -> JsonValue {
         &mut slice_values,
         &mut throwaway_metrics,
     );
-    extract_symbols(macho, &mut throwaway_imports, &mut throwaway_exports);
-    super::macho_hashes::emit(
-        macho,
-        &mut slice_values,
-        &throwaway_imports,
-        &throwaway_exports,
-    );
+    extract_symbols(macho, &mut throwaway_symbols);
+    super::macho_hashes::emit(macho, &mut slice_values, &throwaway_symbols);
+
+    let import_count = throwaway_symbols.iter_kind(SymbolKind::Import).count() as u64;
+    let export_count = throwaway_symbols.iter_kind(SymbolKind::Export).count() as u64;
 
     // Pluck the `macho.*` subtree the extractors built and return it
     // as the slice entry. Anything else (a flat key the future code
@@ -175,11 +144,11 @@ fn analyze_slice(macho: &MachO<'_>, slice_bytes: &[u8]) -> JsonValue {
             if let JsonValue::Object(mut m) = macho_sub {
                 m.insert(
                     "import_count".into(),
-                    JsonValue::Number((throwaway_imports.len() as u64).into()),
+                    JsonValue::Number(import_count.into()),
                 );
                 m.insert(
                     "export_count".into(),
-                    JsonValue::Number((throwaway_exports.len() as u64).into()),
+                    JsonValue::Number(export_count.into()),
                 );
                 m.insert(
                     "section_count".into(),
@@ -199,13 +168,12 @@ fn single_arch(
     values: &mut Values,
     metrics: &mut Metrics,
     sections_out: &mut Vec<Section>,
-    imports_out: &mut crate::Imports,
-    exports_out: &mut crate::Exports,
+    symbols_out: &mut crate::Symbols,
 ) {
     extract_sections(macho, bytes, metrics, sections_out);
     extract_header_and_loads(macho, bytes, values, metrics);
-    extract_symbols(macho, imports_out, exports_out);
-    super::macho_hashes::emit(macho, values, imports_out, exports_out);
+    extract_symbols(macho, symbols_out);
+    super::macho_hashes::emit(macho, values, symbols_out);
     super::build_toolchain::from_macho(values, sections_out);
 }
 
@@ -216,11 +184,7 @@ fn single_arch(
 /// `macho-bind` for two-level-namespace bind imports (carrying the
 /// resolving dylib stem), `macho-trie` for exports recovered from
 /// the dyld export trie.
-fn extract_symbols(
-    macho: &MachO<'_>,
-    imports_out: &mut crate::Imports,
-    exports_out: &mut crate::Exports,
-) {
+fn extract_symbols(macho: &MachO<'_>, symbols_out: &mut crate::Symbols) {
     // Imports — dylib stems are normalised to the bare library name
     // (lowercased, basename only, `.dylib`/`.tbd` suffix stripped) so
     // trait authors can match against `"libsystem.b"` rather than
@@ -228,10 +192,10 @@ fn extract_symbols(
     if let Ok(imports) = macho.imports() {
         for imp in &imports {
             let library = normalize_dylib_path(imp.dylib);
-            imports_out.push(crate::Import {
+            symbols_out.push(crate::Symbol::Import {
                 name: imp.name.to_string(),
                 library: Some(library),
-                source: "macho-bind",
+                source: "macho-bind".into(),
                 offset: Some(imp.offset),
                 ordinal: None,
             });
@@ -245,9 +209,9 @@ fn extract_symbols(
     // forwarded-target handling left to a follow-up.
     if let Ok(exports) = macho.exports() {
         for exp in &exports {
-            exports_out.push(crate::Export {
+            symbols_out.push(crate::Symbol::Export {
                 name: exp.name.clone(),
-                source: "macho-trie",
+                source: "macho-trie".into(),
                 offset: Some(exp.offset),
                 ordinal: None,
                 // dyld re-exports are surfaced via ExportInfo::Reexport
@@ -1578,9 +1542,7 @@ mod tests {
         let mut s = Strings::default();
         let mut m = Metrics::new();
         let mut sections = Vec::new();
-        let mut imports = crate::Imports::new();
-        let mut exports = crate::Exports::new();
-        let mut functions = crate::Functions::new();
+        let mut symbols = crate::Symbols::new();
         let mut errors = Errors::new();
         let _ = extract(
             bytes,
@@ -1588,9 +1550,7 @@ mod tests {
             &mut s,
             &mut m,
             &mut sections,
-            &mut imports,
-            &mut exports,
-            &mut functions,
+            &mut symbols,
             &mut errors,
         );
         (v, s, m)
@@ -1737,8 +1697,8 @@ mod tests {
         assert_eq!(normalize_dylib_path("Foo"), "foo");
     }
 
-    /// Verifies the typed Imports/Exports views are populated and
-    /// that library names come back normalised.
+    /// Verifies the unified Symbols view is populated for Mach-O
+    /// imports/exports and that library names come back normalised.
     #[test]
     fn typed_imports_and_exports_populated_for_macho() {
         let bytes = read_fixture("test.macho");
@@ -1746,9 +1706,7 @@ mod tests {
         let mut s = Strings::default();
         let mut m = Metrics::new();
         let mut sections = Vec::new();
-        let mut imports = crate::Imports::new();
-        let mut exports = crate::Exports::new();
-        let mut functions = crate::Functions::new();
+        let mut symbols = crate::Symbols::new();
         let mut errors = Errors::new();
         extract(
             &bytes,
@@ -1756,27 +1714,31 @@ mod tests {
             &mut s,
             &mut m,
             &mut sections,
-            &mut imports,
-            &mut exports,
-            &mut functions,
+            &mut symbols,
             &mut errors,
         )
         .unwrap();
         // The trivial test.macho fixture might have no exports but
         // any real binary has bind imports for libSystem.
-        if !imports.is_empty() {
-            for imp in imports.iter() {
-                assert_eq!(imp.source, "macho-bind");
-                let lib = imp
-                    .library
-                    .as_deref()
-                    .expect("Mach-O bind imports carry library");
-                assert_eq!(lib, &lib.to_ascii_lowercase());
-                assert!(!lib.ends_with(".dylib") && !lib.ends_with(".tbd"));
-            }
+        for sym in symbols.iter_kind(crate::SymbolKind::Import) {
+            let crate::Symbol::Import {
+                source, library, ..
+            } = sym
+            else {
+                unreachable!();
+            };
+            assert_eq!(source, "macho-bind");
+            let lib = library
+                .as_deref()
+                .expect("Mach-O bind imports carry library");
+            assert_eq!(lib, &lib.to_ascii_lowercase());
+            assert!(!lib.ends_with(".dylib") && !lib.ends_with(".tbd"));
         }
-        for exp in exports.iter() {
-            assert_eq!(exp.source, "macho-trie");
+        for sym in symbols.iter_kind(crate::SymbolKind::Export) {
+            let crate::Symbol::Export { source, .. } = sym else {
+                unreachable!();
+            };
+            assert_eq!(source, "macho-trie");
         }
     }
 

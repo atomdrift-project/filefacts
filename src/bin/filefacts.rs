@@ -50,13 +50,18 @@ enum View {
     All,
     Fileid,
     Values,
-    Strings,
+    Text,
+    Literals,
     Metrics,
-    Ast,
     Sections,
+    Symbols,
     Imports,
     Exports,
     Functions,
+    Calls,
+    Members,
+    Binds,
+    Identifiers,
     Errors,
 }
 
@@ -158,40 +163,49 @@ struct Facts<'a> {
     schema_version: &'static str,
     fileid: &'a filefacts::FileId,
     values: &'a filefacts::Values,
-    strings: &'a filefacts::Strings,
+    text: &'a filefacts::Text,
+    literals: &'a filefacts::Literals,
     metrics: &'a filefacts::Metrics,
-    ast: &'a filefacts::Ast,
     sections: &'a filefacts::Sections,
-    imports: &'a filefacts::Imports,
-    exports: &'a filefacts::Exports,
-    functions: &'a filefacts::Functions,
+    symbols: &'a filefacts::Symbols,
     errors: &'a filefacts::Errors,
 }
 
+fn symbols_of_kind<'a>(
+    parsed: &'a filefacts::ParsedFile<'_>,
+    kind: filefacts::SymbolKind,
+) -> Vec<&'a filefacts::Symbol> {
+    parsed.symbols().iter_kind(kind).collect()
+}
+
 fn build_output(parsed: &filefacts::ParsedFile<'_>, view: View) -> Value {
+    use filefacts::SymbolKind;
     match view {
         View::All => serde_json::to_value(Facts {
             schema_version: filefacts::SCHEMA_VERSION,
             fileid: parsed.fileid(),
             values: parsed.values(),
-            strings: parsed.strings(),
+            text: parsed.text(),
+            literals: parsed.literals(),
             metrics: parsed.metrics(),
-            ast: parsed.ast(),
             sections: parsed.sections(),
-            imports: parsed.imports(),
-            exports: parsed.exports(),
-            functions: parsed.functions(),
+            symbols: parsed.symbols(),
             errors: parsed.errors(),
         }),
         View::Fileid => serde_json::to_value(parsed.fileid()),
         View::Values => serde_json::to_value(parsed.values()),
-        View::Strings => serde_json::to_value(parsed.strings()),
+        View::Text => serde_json::to_value(parsed.text()),
+        View::Literals => serde_json::to_value(parsed.literals()),
         View::Metrics => serde_json::to_value(parsed.metrics()),
-        View::Ast => serde_json::to_value(parsed.ast()),
         View::Sections => serde_json::to_value(parsed.sections()),
-        View::Imports => serde_json::to_value(parsed.imports()),
-        View::Exports => serde_json::to_value(parsed.exports()),
-        View::Functions => serde_json::to_value(parsed.functions()),
+        View::Symbols => serde_json::to_value(parsed.symbols()),
+        View::Imports => serde_json::to_value(symbols_of_kind(parsed, SymbolKind::Import)),
+        View::Exports => serde_json::to_value(symbols_of_kind(parsed, SymbolKind::Export)),
+        View::Functions => serde_json::to_value(symbols_of_kind(parsed, SymbolKind::Function)),
+        View::Calls => serde_json::to_value(symbols_of_kind(parsed, SymbolKind::Call)),
+        View::Members => serde_json::to_value(symbols_of_kind(parsed, SymbolKind::Member)),
+        View::Binds => serde_json::to_value(symbols_of_kind(parsed, SymbolKind::Bind)),
+        View::Identifiers => serde_json::to_value(symbols_of_kind(parsed, SymbolKind::Identifier)),
         View::Errors => serde_json::to_value(parsed.errors()),
     }
     .unwrap_or_else(|_| json!({}))
@@ -222,13 +236,18 @@ fn parse_args() -> Result<Args, String> {
             "-p" | "--pretty" => args.format = Format::Json,
             "--fileid" => set_view(&mut args.view, View::Fileid)?,
             "--values" => set_view(&mut args.view, View::Values)?,
-            "--strings" => set_view(&mut args.view, View::Strings)?,
+            "--text" => set_view(&mut args.view, View::Text)?,
+            "--literals" => set_view(&mut args.view, View::Literals)?,
             "--metrics" => set_view(&mut args.view, View::Metrics)?,
-            "--ast" => set_view(&mut args.view, View::Ast)?,
             "--sections" => set_view(&mut args.view, View::Sections)?,
+            "--symbols" => set_view(&mut args.view, View::Symbols)?,
             "--imports" => set_view(&mut args.view, View::Imports)?,
             "--exports" => set_view(&mut args.view, View::Exports)?,
             "--functions" => set_view(&mut args.view, View::Functions)?,
+            "--calls" => set_view(&mut args.view, View::Calls)?,
+            "--members" => set_view(&mut args.view, View::Members)?,
+            "--binds" => set_view(&mut args.view, View::Binds)?,
+            "--identifiers" => set_view(&mut args.view, View::Identifiers)?,
             "--errors" => set_view(&mut args.view, View::Errors)?,
             "--" => {
                 let Some(rest) = iter.next() else {
@@ -266,13 +285,18 @@ fn parse_view(value: &str) -> Option<View> {
     Some(match value {
         "fileid" => View::Fileid,
         "values" => View::Values,
-        "strings" => View::Strings,
+        "text" => View::Text,
+        "literals" => View::Literals,
         "metrics" => View::Metrics,
-        "ast" => View::Ast,
         "sections" => View::Sections,
+        "symbols" => View::Symbols,
         "imports" => View::Imports,
         "exports" => View::Exports,
         "functions" => View::Functions,
+        "calls" => View::Calls,
+        "members" => View::Members,
+        "binds" => View::Binds,
+        "identifiers" => View::Identifiers,
         "errors" => View::Errors,
         _ => return None,
     })
@@ -408,7 +432,8 @@ fn format_terminal(
         View::All => {
             render_section(&mut out, "fileid", output.get("fileid"), render_fileid);
             render_section(&mut out, "values", output.get("values"), render_values_tree);
-            render_section(&mut out, "strings", output.get("strings"), render_strings);
+            render_section(&mut out, "text", output.get("text"), render_strings);
+            render_section(&mut out, "literals", output.get("literals"), render_strings);
             let metrics = output.get("metrics");
             render_section(&mut out, "metrics", metrics, render_metrics);
             render_section(&mut out, "sections", output.get("sections"), |v| {
@@ -422,20 +447,23 @@ fn format_terminal(
                 output.get("functions"),
                 render_functions,
             );
-            render_section(&mut out, "ast", output.get("ast"), render_ast);
+            render_section(&mut out, "symbols", output.get("symbols"), render_symbols);
             render_section(&mut out, "errors", output.get("errors"), render_errors);
         }
         view => {
             let renderer: Box<dyn Fn(&Value) -> String> = match view {
                 View::Fileid => Box::new(render_fileid),
                 View::Values => Box::new(render_values_tree),
-                View::Strings => Box::new(render_strings),
+                View::Text | View::Literals => Box::new(render_strings),
                 View::Metrics => Box::new(render_metrics),
                 View::Sections => Box::new(|v| render_sections(v, None)),
+                View::Symbols => Box::new(render_symbols),
                 View::Imports => Box::new(render_imports),
                 View::Exports => Box::new(render_exports),
                 View::Functions => Box::new(render_functions),
-                View::Ast => Box::new(render_ast),
+                View::Calls | View::Members | View::Binds | View::Identifiers => {
+                    Box::new(render_symbols)
+                }
                 View::Errors => Box::new(render_errors),
                 View::All => unreachable!(),
             };
@@ -1297,132 +1325,74 @@ fn render_functions(value: &Value) -> String {
     out
 }
 
-// ─── AST view ───────────────────────────────────────────────────────
+// ─── symbols view ───────────────────────────────────────────────────
 
-const AST_PREVIEW_LIMIT: usize = 30;
+const SYMBOL_PREVIEW_LIMIT: usize = 30;
 
-fn render_ast(value: &Value) -> String {
-    let Value::Object(map) = value else {
+/// Terminal rendering of the unified `Symbols` view (or any per-kind
+/// filtered subset). Each row is one tagged `Symbol` JSON object;
+/// we surface kind, primary name/target/path, and a compact label
+/// for the optional fields most rule authors care about.
+fn render_symbols(value: &Value) -> String {
+    let Value::Array(items) = value else {
         return render_values_tree(value);
     };
+    if items.is_empty() {
+        return String::new();
+    }
     let mut out = String::new();
-    if let Some(Value::Array(targets)) = map.get("targets") {
-        if !targets.is_empty() {
-            out.push_str(&format!(
-                "  {} {}\n",
-                fg_bold(FG_VALUE, "targets"),
-                dim(&format!("({})", targets.len())),
-            ));
-            for v in targets.iter().take(AST_PREVIEW_LIMIT) {
-                if let Some(s) = v.as_str() {
-                    out.push_str(&format!("    {}\n", fg(FG_VALUE, s)));
-                }
-            }
-            if targets.len() > AST_PREVIEW_LIMIT {
-                out.push_str(&format!(
-                    "    {}\n",
-                    dim(&format!("... {} more", targets.len() - AST_PREVIEW_LIMIT)),
-                ));
-            }
-        }
+    for v in items.iter().take(SYMBOL_PREVIEW_LIMIT) {
+        let Some(obj) = v.as_object() else { continue };
+        let kind = obj.get("kind").and_then(Value::as_str).unwrap_or("?");
+        let name = obj
+            .get("name")
+            .or_else(|| obj.get("target"))
+            .or_else(|| obj.get("path"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| "·".into());
+        let source = obj.get("source").and_then(Value::as_str).unwrap_or("");
+        let extras = match kind {
+            "import" => obj
+                .get("library")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_default(),
+            "call" => obj
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .map(|v| v.as_str().unwrap_or("?").to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default(),
+            "function" => obj
+                .get("decl")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        out.push_str(&format!(
+            "  {k:>10} {name}{spacer}{extras}{spacer2}{src}\n",
+            k = dim(kind),
+            name = fg(FG_VALUE, &name),
+            spacer = if extras.is_empty() { "" } else { "  " },
+            extras = dim(&extras),
+            spacer2 = if source.is_empty() { "" } else { "  " },
+            src = dim(source),
+        ));
     }
-    if let Some(Value::Array(chains)) = map.get("members") {
-        if !chains.is_empty() {
-            out.push('\n');
-            out.push_str(&format!(
-                "  {} {}\n",
-                fg_bold(FG_VALUE, "members"),
-                dim(&format!("({})", chains.len())),
-            ));
-            for v in chains.iter().take(AST_PREVIEW_LIMIT) {
-                if let Some(s) = v.as_str() {
-                    out.push_str(&format!("    {}\n", fg(FG_VALUE, s)));
-                }
-            }
-            if chains.len() > AST_PREVIEW_LIMIT {
-                out.push_str(&format!(
-                    "    {}\n",
-                    dim(&format!("... {} more", chains.len() - AST_PREVIEW_LIMIT)),
-                ));
-            }
-        }
-    }
-    if let Some(Value::Array(calls)) = map.get("calls") {
-        if !calls.is_empty() {
-            out.push('\n');
-            out.push_str(&format!(
-                "  {} {}\n",
-                fg_bold(FG_VALUE, "calls"),
-                dim(&format!("({})", calls.len())),
-            ));
-            for v in calls.iter().take(AST_PREVIEW_LIMIT) {
-                let Some(obj) = v.as_object() else { continue };
-                let target = obj
-                    .get("target")
-                    .and_then(Value::as_str)
-                    .map_or_else(|| "·".into(), str::to_string);
-                let args = obj
-                    .get("args")
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .map(|v| v.as_str().unwrap_or("?").to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
-                    .unwrap_or_default();
-                out.push_str(&format!(
-                    "    {target}{open}{args}{close}\n",
-                    target = fg(FG_VALUE, &target),
-                    open = dim("("),
-                    args = dim(&args),
-                    close = dim(")"),
-                ));
-            }
-            if calls.len() > AST_PREVIEW_LIMIT {
-                out.push_str(&format!(
-                    "    {}\n",
-                    dim(&format!("... {} more", calls.len() - AST_PREVIEW_LIMIT)),
-                ));
-            }
-        }
-    }
-    if let Some(Value::Object(args_map)) = map.get("call_strings") {
-        if !args_map.is_empty() {
-            out.push('\n');
-            out.push_str(&format!(
-                "  {} {}\n",
-                fg_bold(FG_VALUE, "call_strings"),
-                dim(&format!("({})", args_map.len())),
-            ));
-            for (target, vals) in args_map.iter().take(AST_PREVIEW_LIMIT) {
-                let Value::Array(arr) = vals else { continue };
-                let inline = arr
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .take(4)
-                    .map(|s| format!("{:?}", string_excerpt(s, 40)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let suffix = if arr.len() > 4 {
-                    format!(", … +{}", arr.len() - 4)
-                } else {
-                    String::new()
-                };
-                out.push_str(&format!(
-                    "    {t}  {body}{suf}\n",
-                    t = fg(FG_VALUE, target),
-                    body = fg(FG_STR, &inline),
-                    suf = dim(&suffix),
-                ));
-            }
-            if args_map.len() > AST_PREVIEW_LIMIT {
-                out.push_str(&format!(
-                    "    {}\n",
-                    dim(&format!("... {} more", args_map.len() - AST_PREVIEW_LIMIT)),
-                ));
-            }
-        }
+    if items.len() > SYMBOL_PREVIEW_LIMIT {
+        out.push_str(&format!(
+            "    {}\n",
+            dim(&format!(
+                "... {} more",
+                items.len() - SYMBOL_PREVIEW_LIMIT
+            )),
+        ));
     }
     out
 }
@@ -1506,13 +1476,18 @@ impl View {
             Self::All => "facts",
             Self::Fileid => "fileid",
             Self::Values => "values",
-            Self::Strings => "strings",
+            Self::Text => "text",
+            Self::Literals => "literals",
             Self::Metrics => "metrics",
-            Self::Ast => "ast",
             Self::Sections => "sections",
+            Self::Symbols => "symbols",
             Self::Imports => "imports",
             Self::Exports => "exports",
             Self::Functions => "functions",
+            Self::Calls => "calls",
+            Self::Members => "members",
+            Self::Binds => "binds",
+            Self::Identifiers => "identifiers",
             Self::Errors => "errors",
         }
     }
@@ -1523,20 +1498,26 @@ fn print_usage(to_stderr: bool) {
 usage: filefacts [options] [view] <path>
 
 views:
-  fileid values strings metrics ast sections imports exports functions errors
+  fileid values text literals metrics sections symbols imports exports
+  functions calls members binds identifiers errors
 
 options:
   -f, --format <terminal|json>
                      Output format. Default: terminal.
   --fileid           Emit only the fileid view.
   --values           Emit only the structural values tree.
-  --strings          Emit only extracted strings.
+  --text             Emit only byte-scan text runs (ascii / utf16le).
+  --literals         Emit only parser-extracted string literals.
   --metrics          Emit only derived metrics.
-  --ast              Emit only AST projections.
   --sections         Emit only binary sections.
-  --imports          Emit only imported symbols.
-  --exports          Emit only exported symbols.
-  --functions        Emit only functions.
+  --symbols          Emit the full Symbols view (all kinds).
+  --imports          Emit only import symbols.
+  --exports          Emit only export symbols.
+  --functions        Emit only function symbols.
+  --calls            Emit only call symbols.
+  --members          Emit only member symbols.
+  --binds            Emit only bind symbols.
+  --identifiers      Emit only identifier symbols.
   --errors           Emit only recoverable parse errors.
   -p, --pretty       Compatibility shorthand for --format json.
   -h, --help         Show this help and exit.

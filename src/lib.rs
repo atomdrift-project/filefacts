@@ -16,8 +16,8 @@
 //!   technique.
 //! - [`Metrics`] — derived numeric features (entropy, sizes, counts).
 //! - [`Sections`] — binary section / segment listings.
-//! - [`Imports`], [`Exports`], and [`Functions`] — typed symbol views.
-//! - [`Ast`] — source-code call and member-access projections.
+//! - [`Symbols`] — unified named-entity facts (imports, exports,
+//!   functions, calls, members, binds, identifiers) tagged by kind.
 //! - [`Errors`] — recoverable extractor diagnostics.
 //!
 //! Plus a fourth concern that's always available without computing the
@@ -89,10 +89,9 @@ mod rizin_impl;
 ///
 /// Re-exported from the internal `formats::vba_symbols` module so
 /// downstream crates can compare against it without learning a
-/// private path. The full extractor stays internal: VBA symbols
-/// flow out through the unified [`Imports`] / [`Functions`] views
-/// like every other format, not through a format-specific public
-/// function.
+/// private path. The full extractor stays internal: VBA symbols flow
+/// out through the unified [`Symbols`] view like every other format,
+/// not through a format-specific public function.
 pub mod vba_symbols {
     pub use crate::formats::vba_symbols::NON_LITERAL_SENTINEL;
 }
@@ -104,21 +103,30 @@ use std::sync::OnceLock;
 pub use error::Error;
 pub use fileid::{FileId, FileType};
 pub use output::{
-    ArchiveMember, ArgShape, Assignment, Ast, Call, Errors, Export, Exports, ExtractedString,
-    Function, Functions, Import, Imports, Metrics, ParseError, Section, Sections, StringCategory,
-    Strings, Values,
+    Arg, ArchiveMember, ArgShape, Errors, ExtractedString, Literals, Metrics, ParseError, Section,
+    Sections, Symbol, SymbolKind, Symbols, Text, Values,
 };
 
 /// Schema version of the public output shape.
 ///
 /// Bumps on any field rename or semantic change. Field additions are
-/// non-breaking and do not bump this version. Wave A of the cleave
-/// rizin migration grows `Function` and `ExtractedString` with several
-/// new optional fields; pure additions, so no bump is required on
-/// JSON shape grounds. The on-disk cache (`filefacts::cache`) carries a
-/// distinct schema version that *is* bumped on every addition so
-/// cached bytes from old binaries are not silently reused.
-pub const SCHEMA_VERSION: &str = "4";
+/// non-breaking and do not bump this version. The on-disk cache
+/// (`filefacts::cache`) carries a distinct schema version that *is*
+/// bumped on every addition so cached bytes from old binaries are not
+/// silently reused.
+///
+/// **v5** — the `Imports`, `Exports`, `Functions`, and `Ast` peer
+/// types are collapsed into a single tagged [`Symbol`] enum. The
+/// `Function.kind` field is renamed to `decl` (to free the word `kind`
+/// for the discriminator) and `Function.calls` is renamed to `callees`
+/// (to disambiguate from the new [`Symbol::Call`] kind).
+///
+/// **v6** — the `Strings` collection is split into peer top-level
+/// [`Text`] (byte-scan: ascii + utf16le) and [`Literals`] (parser-
+/// extracted language string literals). The `StringCategory` enum and
+/// `ExtractedString.category` field are removed; the container
+/// identifies the tier.
+pub const SCHEMA_VERSION: &str = "6";
 
 /// A file with its bytes and lazily-computed metadata views.
 ///
@@ -176,14 +184,11 @@ impl std::fmt::Debug for ParsedFile<'_> {
 
 struct Extracted {
     values: Values,
-    strings: Strings,
+    strings: output::Strings,
     metrics: Metrics,
     archive_members: Vec<ArchiveMember>,
-    ast: Ast,
     sections: Sections,
-    imports: Imports,
-    exports: Exports,
-    functions: Functions,
+    symbols: Symbols,
     errors: Errors,
 }
 
@@ -204,9 +209,17 @@ impl<'a> ParsedFile<'a> {
         &self.extracted().values
     }
 
-    /// Extracted strings view. Computed on first access and cached.
-    pub fn strings(&self) -> &Strings {
-        &self.extracted().strings
+    /// Byte-scan extracted strings (printable ASCII / UTF-16LE runs).
+    /// The Unix `strings(1)` tier. Computed on first access and cached.
+    pub fn text(&self) -> &Text {
+        &self.extracted().strings.text
+    }
+
+    /// Parser-extracted language string literals (tree-sitter / JSON /
+    /// YAML / TOML). The precise tier — no comment or code false
+    /// positives. Computed on first access and cached.
+    pub fn literals(&self) -> &Literals {
+        &self.extracted().strings.literals
     }
 
     /// Numeric metrics view. Computed on first access and cached.
@@ -222,19 +235,6 @@ impl<'a> ParsedFile<'a> {
     /// metadata without re-reading JSON.
     pub fn archive_members(&self) -> &[ArchiveMember] {
         &self.extracted().archive_members
-    }
-
-    /// AST projection view.
-    ///
-    /// Empty when the file is not a source language filefacts can
-    /// parse. For source files, this is a curated set of projections
-    /// of the tree-sitter parse: every call site, the sorted-unique
-    /// targets, dotted members, bindings, and per-target string-literal
-    /// arguments. The same tree-sitter parse backs all
-    /// source-driven views for source files, so no re-parsing is
-    /// performed.
-    pub fn ast(&self) -> &Ast {
-        &self.extracted().ast
     }
 
     /// Borrow the shared tree-sitter parse, if this is a supported
@@ -261,34 +261,15 @@ impl<'a> ParsedFile<'a> {
         &self.extracted().sections
     }
 
-    /// Foreign-symbol references — entries this file uses that are
-    /// defined elsewhere (PE imports, ELF `.dynsym` undefined,
-    /// Mach-O undef symbols, VBA `Declare` / `CreateObject`,
-    /// Java constant-pool class refs, source-level `import` /
-    /// `require`). Each [`Import`] carries `name`, optional
-    /// `library`, a `source` tag identifying the extraction site,
-    /// and optional `offset` / `ordinal`. See [`crate::Import`].
-    pub fn imports(&self) -> &Imports {
-        &self.extracted().imports
-    }
-
-    /// Locally-defined symbols this file makes externally visible
-    /// (PE export table, ELF `.dynsym` defined, Mach-O dyld trie,
-    /// Java public methods, source-level `export` statements). Each
-    /// [`Export`] carries `name`, `source`, and optional `offset` /
-    /// `ordinal`.
-    pub fn exports(&self) -> &Exports {
-        &self.extracted().exports
-    }
-
-    /// Functions / methods / subroutines defined inside this file.
-    /// Distinct from [`Self::exports`] — a function may be local
-    /// without being exported, and an export entry may point at a
-    /// function whose body is also enumerated here with extra
-    /// detail. Each [`Function`] carries `name`, `source`, optional
-    /// `offset`, and optional `kind`.
-    pub fn functions(&self) -> &Functions {
-        &self.extracted().functions
+    /// Unified named-entity facts about this file.
+    ///
+    /// Every row is a [`Symbol`] tagged by [`SymbolKind`]: imports,
+    /// exports, locally-defined functions (with CFG metrics when rizin
+    /// disassembled), source call sites, dotted member-access chains,
+    /// static bindings, and bare identifiers. Which kinds populate
+    /// depends on the file type. Filter with [`Symbols::iter_kind`].
+    pub fn symbols(&self) -> &Symbols {
+        &self.extracted().symbols
     }
 
     /// Non-fatal extraction errors encountered during the parse.
@@ -302,16 +283,18 @@ impl<'a> ParsedFile<'a> {
         &self.extracted().errors
     }
 
-    /// Iterate every symbol name across [`Self::imports`],
-    /// [`Self::exports`], and [`Self::functions`] in that order.
-    /// Convenience for cross-cutting trait matchers ("any symbol
-    /// of this name regardless of category"). Yields `(name,
-    /// source)` so the caller can disambiguate when needed.
-    pub fn symbol_iter(&self) -> impl Iterator<Item = (&str, &'static str)> {
-        let imports = self.imports().iter().map(|i| (i.name.as_str(), i.source));
-        let exports = self.exports().iter().map(|e| (e.name.as_str(), e.source));
-        let functions = self.functions().iter().map(|f| (f.name.as_str(), f.source));
-        imports.chain(exports).chain(functions)
+    /// Iterate every symbol name across the declaration kinds
+    /// (`Import`, `Export`, `Function`) for cross-cutting matchers
+    /// that ask "any declared name of this value regardless of role."
+    /// Yields `(name, source)` so callers can disambiguate when
+    /// needed.
+    pub fn symbol_iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.symbols().iter().filter_map(|s| match s {
+            Symbol::Import { name, source, .. }
+            | Symbol::Export { name, source, .. }
+            | Symbol::Function { name, source, .. } => Some((name.as_str(), source.as_str())),
+            _ => None,
+        })
     }
 
     /// Borrow the shared tree-sitter parse, if this file is a source
@@ -354,13 +337,11 @@ fn run_extraction(
     tree_cache: Option<&formats::source::TreeCache<'_>>,
 ) -> Extracted {
     let mut values = Values::new();
-    let mut strings = Strings::new();
+    let mut strings = output::Strings::new();
     let mut metrics = Metrics::new();
     let mut archive_members = Vec::new();
     let mut sections: Vec<Section> = Vec::new();
-    let mut imports = Imports::new();
-    let mut exports = Exports::new();
-    let mut functions = Functions::new();
+    let mut symbols = Symbols::new();
     let mut errors = Errors::new();
     // Format extractors return `Result` so they can report a hard
     // "this file is not in the format I expect" failure. Any
@@ -378,9 +359,7 @@ fn run_extraction(
         &mut metrics,
         &mut archive_members,
         &mut sections,
-        &mut imports,
-        &mut exports,
-        &mut functions,
+        &mut symbols,
         &mut errors,
     ) {
         // The format extractor bailed entirely. Surface that as a
@@ -388,15 +367,13 @@ fn run_extraction(
         // format-specific view is sparse.
         errors.record_malformed(stage_for(file_type), e.to_string());
     }
-    // The AST view is computed alongside the rest when a tree-sitter
-    // parse is available. The walk shares the cached tree with the
-    // surface extraction and is small relative to the parse itself —
-    // bundling it keeps `parse_count` at 1 for every combination of
-    // view accesses and removes a class of internal-mutability
-    // complications.
-    let ast = tree_cache.map_or_else(Ast::new, |cache| {
-        formats::source::build_ast(cache, &mut metrics)
-    });
+    // Tree-sitter source extraction also pushes Call/Member/Bind/
+    // Identifier symbols when a parse is available. Bundling here
+    // keeps `parse_count` at 1 regardless of which views the caller
+    // reads.
+    if let Some(cache) = tree_cache {
+        formats::source::build_symbols(cache, &mut symbols, &mut metrics);
+    }
     let sections = Sections::from_iter_sections(sections);
     // Aggregate metrics derived from sections — mirrors the
     // `sections.*` path convention.
@@ -405,19 +382,9 @@ fn run_extraction(
         emit_binary_aggregates(&sections, &strings, bytes, &mut metrics);
     }
 
-    // Keep typed fact families in their own views. `values` is the
-    // residual format-structure tree, so it must not mirror strings,
-    // sections, symbols, AST projections, or parse errors. Count
-    // metrics are aggregates and remain useful for rules.
-    if !imports.is_empty() {
-        metrics.insert("imports.count", imports.len() as f64);
-    }
-    if !exports.is_empty() {
-        metrics.insert("exports.count", exports.len() as f64);
-    }
-    if !functions.is_empty() {
-        metrics.insert("functions.count", functions.len() as f64);
-    }
+    // Per-kind counts for ergonomic rule filtering. Derived from the
+    // unified `symbols` view.
+    emit_symbol_kind_counts(&symbols, &mut metrics);
     if !errors.is_empty() {
         metrics.insert("parse.error_count", errors.len() as f64);
     }
@@ -427,12 +394,54 @@ fn run_extraction(
         strings,
         metrics,
         archive_members,
-        ast,
         sections,
-        imports,
-        exports,
-        functions,
+        symbols,
         errors,
+    }
+}
+
+/// Emit `imports.count`, `exports.count`, `functions.count`,
+/// `calls.count`, `members.count`, `binds.count`, `identifiers.count`
+/// for whichever kinds have at least one entry.
+fn emit_symbol_kind_counts(symbols: &Symbols, metrics: &mut Metrics) {
+    let mut imports = 0u64;
+    let mut exports = 0u64;
+    let mut functions = 0u64;
+    let mut calls = 0u64;
+    let mut members = 0u64;
+    let mut binds = 0u64;
+    let mut identifiers = 0u64;
+    for s in symbols {
+        match s.kind() {
+            SymbolKind::Import => imports += 1,
+            SymbolKind::Export => exports += 1,
+            SymbolKind::Function => functions += 1,
+            SymbolKind::Call => calls += 1,
+            SymbolKind::Member => members += 1,
+            SymbolKind::Bind => binds += 1,
+            SymbolKind::Identifier => identifiers += 1,
+        }
+    }
+    if imports > 0 {
+        metrics.insert("imports.count", imports as f64);
+    }
+    if exports > 0 {
+        metrics.insert("exports.count", exports as f64);
+    }
+    if functions > 0 {
+        metrics.insert("functions.count", functions as f64);
+    }
+    if calls > 0 {
+        metrics.insert("calls.count", calls as f64);
+    }
+    if members > 0 {
+        metrics.insert("members.count", members as f64);
+    }
+    if binds > 0 {
+        metrics.insert("binds.count", binds as f64);
+    }
+    if identifiers > 0 {
+        metrics.insert("identifiers.count", identifiers as f64);
     }
 }
 
@@ -615,7 +624,7 @@ fn is_well_known_section_name(name: &str) -> bool {
 ///   self-extractors).
 fn emit_binary_aggregates(
     sections: &Sections,
-    strings: &Strings,
+    strings: &output::Strings,
     bytes: &[u8],
     metrics: &mut Metrics,
 ) {
@@ -879,7 +888,8 @@ mod tests {
         assert_eq!(parsed.parse_count(), 0);
         let _ = parsed.values();
         assert_eq!(parsed.parse_count(), 1);
-        let _ = parsed.strings();
+        let _ = parsed.text();
+        let _ = parsed.literals();
         let _ = parsed.metrics();
         assert_eq!(parsed.parse_count(), 1, "subsequent views must not reparse");
     }
@@ -894,8 +904,8 @@ mod tests {
     }
 
     /// `ParsedFile::symbol_iter` walks every Import / Export /
-    /// Function in one pass. Used by trait matchers that don't
-    /// care which collection a name appears in.
+    /// Function row in one pass. Used by trait matchers that don't
+    /// care which sub-kind a name appears in.
     #[test]
     fn symbol_iter_walks_all_three_collections() {
         let bytes = std::fs::read("../cleave/tests/fixtures/test.exe")
@@ -904,16 +914,19 @@ mod tests {
         // Realize the views before iterating — the lazy parse runs
         // on first `.values()` access.
         let _ = parsed.values();
-        let imports = parsed.imports();
-        assert!(!imports.is_empty(), "PE fixture should have imports");
+        let symbols = parsed.symbols();
+        let import_count = symbols.iter_kind(SymbolKind::Import).count();
+        assert!(import_count > 0, "PE fixture should have imports");
         let total = parsed.symbol_iter().count();
+        let expected = symbols.iter_kind(SymbolKind::Import).count()
+            + symbols.iter_kind(SymbolKind::Export).count()
+            + symbols.iter_kind(SymbolKind::Function).count();
         assert_eq!(
-            total,
-            parsed.imports().len() + parsed.exports().len() + parsed.functions().len(),
-            "symbol_iter must visit every entry in all three collections",
+            total, expected,
+            "symbol_iter must visit every Import/Export/Function row"
         );
         // All PE-sourced entries carry source == "pe".
-        let sources: std::collections::HashSet<&'static str> =
+        let sources: std::collections::HashSet<&str> =
             parsed.symbol_iter().map(|(_, src)| src).collect();
         assert!(sources.contains("pe"));
     }

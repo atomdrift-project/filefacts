@@ -22,7 +22,7 @@ use tree_sitter::{Node, QueryCursor, StreamingIterator};
 
 use crate::error::Error;
 use crate::fileid::FileType;
-use crate::output::{ExtractedString, Metrics, StringCategory, Strings, Values};
+use crate::output::{ExtractedString, Metrics, Strings, Values};
 
 use serde_json::Value as JsonValue;
 
@@ -39,8 +39,7 @@ pub(super) fn extract(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
-    imports_out: &mut crate::Imports,
-    functions_out: &mut crate::Functions,
+    symbols_out: &mut crate::Symbols,
 ) -> Result<(), Error> {
     let Some(cache) = tree_cache else {
         // Even without a parse, the byte stream still has language-agnostic
@@ -89,53 +88,64 @@ pub(super) fn extract(
     // emitted. Pure division — no extra parsing.
     emit_text_ratios(metrics, total_lines);
 
-    if !imports.is_empty() {
-        // Mirror into the typed Imports view with byte offsets from
-        // tree-sitter. `library` stays unset — source-language imports
-        // are module-scoped strings, not library-tagged. Source tag is
-        // the language name (`"javascript"`, `"python"`, `"go"`, …) so
-        // trait matchers can filter by language without consulting
-        // file_type. See filefacts/src/output/symbols.rs for the
-        // source-tag taxonomy.
-        for (name, offset) in &imports {
-            imports_out.push(crate::Import {
-                name: name.clone(),
-                library: None,
-                source: config.name,
-                offset: Some(*offset),
-                ordinal: None,
-            });
-        }
+    // Push source-language imports / functions / classes into the
+    // unified Symbols view. `library` stays unset — source-language
+    // imports are module-scoped strings, not library-tagged. Source
+    // tag is the language name (`"javascript"`, `"python"`, `"go"`,
+    // …) so trait matchers can filter by language without consulting
+    // file_type.
+    for (name, offset) in &imports {
+        symbols_out.push(crate::Symbol::Import {
+            name: name.clone(),
+            library: None,
+            source: config.name.into(),
+            offset: Some(*offset),
+            ordinal: None,
+        });
     }
     if !functions.is_empty() {
         metrics.insert("source.function_count", functions.len() as f64);
-        for (name, offset) in &functions {
-            functions_out.push(crate::Function {
-                name: name.clone(),
-                source: config.name,
-                offset: Some(*offset),
-                kind: Some("function"),
-                ..crate::Function::default()
-            });
-        }
+    }
+    for (name, offset) in &functions {
+        symbols_out.push(crate::Symbol::Function {
+            name: name.clone(),
+            source: config.name.into(),
+            offset: Some(*offset),
+            decl: Some("function".into()),
+            complexity: None,
+            basic_blocks: None,
+            edges: None,
+            instructions: None,
+            stack_frame: None,
+            recursive: None,
+            noreturn: None,
+            is_linear: None,
+            callees: Vec::new(),
+        });
     }
     if !classes.is_empty() {
         metrics.insert("source.class_count", classes.len() as f64);
-        // Class declarations also surface as `Function` records
-        // tagged `kind: "class"` — the symbol axis is "things
-        // declared here", regardless of whether they're a function
-        // or a class. Consumers that need the distinction read the
-        // kind field; consumers that just want "is name X declared
-        // here?" iterate one collection.
-        for (name, offset) in &classes {
-            functions_out.push(crate::Function {
-                name: name.clone(),
-                source: config.name,
-                offset: Some(*offset),
-                kind: Some("class"),
-                ..crate::Function::default()
-            });
-        }
+    }
+    // Class declarations surface as `Symbol::Function` with
+    // `decl: "class"` — the symbol axis is "things declared here",
+    // regardless of whether the declaration is a function or a class.
+    // Consumers that need the distinction read the decl field.
+    for (name, offset) in &classes {
+        symbols_out.push(crate::Symbol::Function {
+            name: name.clone(),
+            source: config.name.into(),
+            offset: Some(*offset),
+            decl: Some("class".into()),
+            complexity: None,
+            basic_blocks: None,
+            edges: None,
+            instructions: None,
+            stack_frame: None,
+            recursive: None,
+            noreturn: None,
+            is_linear: None,
+            callees: Vec::new(),
+        });
     }
 
     values.insert(
@@ -146,14 +156,19 @@ pub(super) fn extract(
     Ok(())
 }
 
-/// Single-pass AST projection. Always returns a fully-built `Ast` —
-/// empty when the tree has no calls or members, never absent.
-pub(crate) fn build_ast(cache: &TreeCache, metrics: &mut Metrics) -> crate::output::Ast {
+/// Walk the tree-sitter parse and push every `Symbol::Call`,
+/// `Symbol::Member`, and `Symbol::Bind` into `symbols_out`. Replaces
+/// the prior `build_ast` which materialised a separate `Ast` struct.
+pub(crate) fn build_symbols(
+    cache: &TreeCache,
+    symbols_out: &mut crate::Symbols,
+    metrics: &mut Metrics,
+) {
     let config =
         langs::config_for(cache.file_type()).expect("tree_cache implies config_for is Some");
     let source = cache.source();
     let root = cache.tree().root_node();
-    ast_walk::walk(root, source, config, metrics)
+    ast_walk::walk(root, source, config, symbols_out, metrics);
 }
 
 fn extract_strings(
@@ -170,12 +185,8 @@ fn extract_strings(
         if config.string_kinds.contains(&node.kind()) {
             if let Some(text) = decode_string_literal(node, source) {
                 strings.literals.push(ExtractedString {
-                    category: StringCategory::Literal,
                     text,
                     offset: node.start_byte(),
-                    method: None,
-                    kind: None,
-                    section: None,
                     ..ExtractedString::default()
                 });
                 count += 1;
@@ -438,8 +449,8 @@ mod tests {
     }
 
     /// Python `import os` / `from sys import path` populate the
-    /// typed `Imports` view with the language name as `source` and
-    /// a non-zero byte offset.
+    /// unified [`crate::Symbols`] view with the language name as
+    /// `source` and a non-zero byte offset.
     #[test]
     fn python_imports_populate_typed_view() {
         let src = b"import os\nfrom sys import path\nimport hashlib\n";
@@ -448,43 +459,59 @@ mod tests {
         // plain text and the source extractor never runs.
         let parsed = crate::open_with_path(std::path::Path::new("test.py"), src).unwrap();
         let _ = parsed.values();
-        let imports = parsed.imports();
+        let imports: Vec<(&str, Option<&str>, bool)> = parsed
+            .symbols()
+            .iter_kind(crate::SymbolKind::Import)
+            .filter_map(|s| match s {
+                crate::Symbol::Import {
+                    name,
+                    library,
+                    source,
+                    offset,
+                    ..
+                } if source == "python" => {
+                    Some((name.as_str(), library.as_deref(), offset.is_some()))
+                }
+                _ => None,
+            })
+            .collect();
         assert!(
             !imports.is_empty(),
             "expected python imports to populate typed view"
         );
-        let names: std::collections::HashSet<&str> =
-            imports.iter().map(|i| i.name.as_str()).collect();
+        let names: std::collections::HashSet<&str> = imports.iter().map(|(n, _, _)| *n).collect();
         assert!(names.contains("os"), "got names {names:?}");
         assert!(names.contains("hashlib"));
-        for imp in imports.iter() {
-            assert_eq!(imp.source, "python");
-            assert!(imp.library.is_none());
-            assert!(imp.offset.is_some());
+        for (_, lib, has_offset) in &imports {
+            assert!(lib.is_none());
+            assert!(*has_offset);
         }
     }
 
-    /// Helper: parse `src` as a source file with the given extension and
-    /// return the typed `Imports` / `Functions` views plus the metrics
-    /// map. Asserts the file classified to a non-text-only source
-    /// extractor (i.e. `text.*` metrics fired) so callers can focus
-    /// on language-specific structural facts.
-    fn parse_source(name: &str, src: &[u8]) -> (Vec<String>, Vec<(String, Option<&'static str>)>) {
+    /// Helper: parse `src` as a source file with the given extension
+    /// and return the import names + (function name, decl) pairs from
+    /// the unified [`crate::Symbols`] view. Asserts the file classified
+    /// to a non-text-only source extractor (i.e. `text.*` metrics
+    /// fired) so callers can focus on language-specific structural facts.
+    fn parse_source(name: &str, src: &[u8]) -> (Vec<String>, Vec<(String, Option<String>)>) {
         let parsed = crate::open_with_path(std::path::Path::new(name), src).unwrap();
         let _ = parsed.values();
-        let imports = parsed
-            .imports()
-            .iter()
-            .map(|i| i.name.clone())
-            .collect::<Vec<_>>();
-        let functions = parsed
-            .functions()
-            .iter()
-            .map(|f| (f.name.clone(), f.kind))
-            .collect::<Vec<_>>();
-        // Every supported source language emits `text.line_count` from
-        // the byte stream — a cheap sanity check that the dispatcher
-        // routed to `source::extract`, not `extract_text_only`.
+        let imports: Vec<String> = parsed
+            .symbols()
+            .iter_kind(crate::SymbolKind::Import)
+            .filter_map(|s| match s {
+                crate::Symbol::Import { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        let functions: Vec<(String, Option<String>)> = parsed
+            .symbols()
+            .iter_kind(crate::SymbolKind::Function)
+            .filter_map(|s| match s {
+                crate::Symbol::Function { name, decl, .. } => Some((name.clone(), decl.clone())),
+                _ => None,
+            })
+            .collect();
         assert!(
             parsed.metrics().get("text.total_lines").unwrap_or(0.0) > 0.0,
             "expected text.total_lines metric to fire for {name}"
@@ -497,11 +524,13 @@ mod tests {
         let src = b"require 'json'\nrequire_relative './lib'\nclass Greeter\n  def hello; end\nend\nmodule M; end\n";
         let (imports, functions) = parse_source("app.rb", src);
         assert!(imports.iter().any(|s| s == "json"), "got {imports:?}");
-        let names: std::collections::HashMap<&str, Option<&str>> =
-            functions.iter().map(|(n, k)| (n.as_str(), *k)).collect();
-        assert_eq!(names.get("hello").copied(), Some(Some("function")));
-        assert_eq!(names.get("Greeter").copied(), Some(Some("class")));
-        assert_eq!(names.get("M").copied(), Some(Some("class")));
+        let names: std::collections::HashMap<&str, Option<String>> = functions
+            .iter()
+            .map(|(n, k)| (n.as_str(), k.clone()))
+            .collect();
+        assert_eq!(names.get("hello").cloned(), Some(Some("function".to_string())));
+        assert_eq!(names.get("Greeter").cloned(), Some(Some("class".to_string())));
+        assert_eq!(names.get("M").cloned(), Some(Some("class".to_string())));
     }
 
     #[test]
@@ -521,10 +550,12 @@ mod tests {
             imports.iter().any(|s| s == "System" || s == "System.IO"),
             "got {imports:?}"
         );
-        let names: std::collections::HashMap<&str, Option<&str>> =
-            functions.iter().map(|(n, k)| (n.as_str(), *k)).collect();
-        assert_eq!(names.get("Hello").copied(), Some(Some("function")));
-        assert_eq!(names.get("Bar").copied(), Some(Some("class")));
+        let names: std::collections::HashMap<&str, Option<String>> = functions
+            .iter()
+            .map(|(n, k)| (n.as_str(), k.clone()))
+            .collect();
+        assert_eq!(names.get("Hello").cloned(), Some(Some("function".to_string())));
+        assert_eq!(names.get("Bar").cloned(), Some(Some("class".to_string())));
     }
 
     #[test]
@@ -532,10 +563,12 @@ mod tests {
         let src = b"#include <stdio.h>\n#include \"local.h\"\nint add(int a, int b) { return a + b; }\nstruct P { int x; };\n";
         let (imports, functions) = parse_source("main.c", src);
         assert!(!imports.is_empty(), "expected C #include imports");
-        let names: std::collections::HashMap<&str, Option<&str>> =
-            functions.iter().map(|(n, k)| (n.as_str(), *k)).collect();
-        assert_eq!(names.get("add").copied(), Some(Some("function")));
-        assert_eq!(names.get("P").copied(), Some(Some("class")));
+        let names: std::collections::HashMap<&str, Option<String>> = functions
+            .iter()
+            .map(|(n, k)| (n.as_str(), k.clone()))
+            .collect();
+        assert_eq!(names.get("add").cloned(), Some(Some("function".to_string())));
+        assert_eq!(names.get("P").cloned(), Some(Some("class".to_string())));
     }
 
     #[test]
@@ -543,10 +576,12 @@ mod tests {
         let src = b"import scala.collection.mutable\nclass Greeter { def hello() = 1 }\nobject O { def add(a: Int, b: Int) = a + b }\n";
         let (imports, functions) = parse_source("App.scala", src);
         assert!(!imports.is_empty(), "expected scala imports");
-        let names: std::collections::HashMap<&str, Option<&str>> =
-            functions.iter().map(|(n, k)| (n.as_str(), *k)).collect();
-        assert_eq!(names.get("hello").copied(), Some(Some("function")));
-        assert_eq!(names.get("Greeter").copied(), Some(Some("class")));
+        let names: std::collections::HashMap<&str, Option<String>> = functions
+            .iter()
+            .map(|(n, k)| (n.as_str(), k.clone()))
+            .collect();
+        assert_eq!(names.get("hello").cloned(), Some(Some("function".to_string())));
+        assert_eq!(names.get("Greeter").cloned(), Some(Some("class".to_string())));
     }
 
     #[test]
@@ -586,11 +621,13 @@ mod tests {
             imports.iter().any(|s| s == "Foo::Bar"),
             "got {imports:?}"
         );
-        let names: std::collections::HashMap<&str, Option<&str>> =
-            functions.iter().map(|(n, k)| (n.as_str(), *k)).collect();
-        assert_eq!(names.get("greet").copied(), Some(Some("function")));
-        assert_eq!(names.get("add").copied(), Some(Some("function")));
-        assert_eq!(names.get("My::Class").copied(), Some(Some("class")));
+        let names: std::collections::HashMap<&str, Option<String>> = functions
+            .iter()
+            .map(|(n, k)| (n.as_str(), k.clone()))
+            .collect();
+        assert_eq!(names.get("greet").cloned(), Some(Some("function".to_string())));
+        assert_eq!(names.get("add").cloned(), Some(Some("function".to_string())));
+        assert_eq!(names.get("My::Class").cloned(), Some(Some("class".to_string())));
     }
 
     #[test]
@@ -653,22 +690,32 @@ mod tests {
         assert!(names.contains(&"Get-Greeting"), "got {names:?}");
     }
 
-    /// Python `def foo()` / `class Bar:` populate the typed
-    /// `Functions` view with `kind: "function"` / `"class"`.
+    /// Python `def foo()` / `class Bar:` populate the unified
+    /// [`crate::Symbols`] view with `decl: "function"` / `"class"`.
     #[test]
     fn python_functions_and_classes_populate_typed_view() {
         let src = b"def hello():\n    pass\n\nclass Greeter:\n    pass\n";
         let parsed = crate::open_with_path(std::path::Path::new("test.py"), src).unwrap();
         let _ = parsed.values();
-        let functions = parsed.functions();
-        let names: std::collections::HashMap<&str, Option<&str>> = functions
-            .iter()
-            .map(|f| (f.name.as_str(), f.kind))
+        let functions: Vec<(&str, Option<&str>, &str)> = parsed
+            .symbols()
+            .iter_kind(crate::SymbolKind::Function)
+            .filter_map(|s| match s {
+                crate::Symbol::Function {
+                    name,
+                    decl,
+                    source,
+                    ..
+                } => Some((name.as_str(), decl.as_deref(), source.as_str())),
+                _ => None,
+            })
             .collect();
-        assert_eq!(names.get("hello").copied(), Some(Some("function")));
-        assert_eq!(names.get("Greeter").copied(), Some(Some("class")));
-        for f in functions.iter() {
-            assert_eq!(f.source, "python");
+        let names: std::collections::HashMap<&str, Option<&str>> =
+            functions.iter().map(|(n, d, _)| (*n, *d)).collect();
+        assert_eq!(names.get("hello").cloned(), Some(Some("function")));
+        assert_eq!(names.get("Greeter").cloned(), Some(Some("class")));
+        for (_, _, src) in &functions {
+            assert_eq!(*src, "python");
         }
     }
 }

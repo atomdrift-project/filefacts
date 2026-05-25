@@ -1,10 +1,10 @@
-//! Cross-format binary attribution derived from the import table:
+//! Cross-format binary attribution derived from the import-symbol view:
 //! sanitizer instrumentation and `_FORTIFY_SOURCE` wrappers.
 //!
 //! Both are format-agnostic — the compiler links the runtime as
 //! ordinary imports on whatever platform you target — so they live
 //! outside the per-format extractors and run once over the merged
-//! `imports` view.
+//! [`crate::Symbols`] view.
 //!
 //! Emits:
 //! - `binary.sanitizers[]` — sorted unique names: `asan`, `tsan`,
@@ -18,19 +18,27 @@ use std::collections::BTreeSet;
 
 use serde_json::Value as JsonValue;
 
-use crate::output::Values;
-use crate::Imports;
+use crate::output::{Symbol, SymbolKind, Symbols, Values};
 
-pub(super) fn emit(imports: &Imports, values: &mut Values) {
-    sanitizers(imports, values);
-    fortify(imports, values);
+pub(super) fn emit(symbols: &Symbols, values: &mut Values) {
+    sanitizers(symbols, values);
+    fortify(symbols, values);
 }
 
-fn sanitizers(imports: &Imports, values: &mut Values) {
+fn each_import_name<'a>(symbols: &'a Symbols) -> impl Iterator<Item = &'a str> {
+    symbols
+        .iter_kind(SymbolKind::Import)
+        .filter_map(|s| match s {
+            Symbol::Import { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+}
+
+fn sanitizers(symbols: &Symbols, values: &mut Values) {
     let mut out: BTreeSet<&'static str> = BTreeSet::new();
-    for imp in imports.iter() {
-        let s = imp.name.trim_start_matches('_');
-        let name = if s.starts_with("asan_") {
+    for name in each_import_name(symbols) {
+        let s = name.trim_start_matches('_');
+        let tag = if s.starts_with("asan_") {
             "asan"
         } else if s.starts_with("tsan_") {
             "tsan"
@@ -53,7 +61,7 @@ fn sanitizers(imports: &Imports, values: &mut Values) {
         } else {
             continue;
         };
-        out.insert(name);
+        out.insert(tag);
     }
     if out.is_empty() {
         return;
@@ -68,10 +76,10 @@ fn sanitizers(imports: &Imports, values: &mut Values) {
     );
 }
 
-fn fortify(imports: &Imports, values: &mut Values) {
+fn fortify(symbols: &Symbols, values: &mut Values) {
     let mut out: BTreeSet<String> = BTreeSet::new();
-    for imp in imports.iter() {
-        let s = imp.name.trim_start_matches('_');
+    for name in each_import_name(symbols) {
+        let s = name.trim_start_matches('_');
         let Some(base) = s.strip_suffix("_chk") else {
             continue;
         };

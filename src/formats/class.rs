@@ -90,8 +90,7 @@ pub(super) fn extract(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
-    imports_out: &mut crate::Imports,
-    functions_out: &mut crate::Functions,
+    symbols_out: &mut crate::Symbols,
 ) -> Result<(), Error> {
     extract_ascii_strings(bytes, strings);
 
@@ -131,13 +130,13 @@ pub(super) fn extract(
     if skip_member_table(bytes, &mut pos).is_none() {
         return Ok(());
     }
-    let method_count = parse_methods(bytes, &mut pos, &cp, functions_out).unwrap_or(0);
+    let method_count = parse_methods(bytes, &mut pos, &cp, symbols_out).unwrap_or(0);
     let attrs = parse_attributes(bytes, &mut pos, &cp);
 
     // Surface external class references and methodref-resolved
     // imports. `this_class` is the class's own self-reference and
     // must not show up as an import.
-    populate_imports(&cp, this_idx, imports_out, metrics);
+    populate_imports(&cp, this_idx, symbols_out, metrics);
     metrics.insert("class.method_count", f64::from(method_count));
 
     put_u64(values, "class.major_version", u64::from(major_version));
@@ -338,7 +337,7 @@ fn parse_methods(
     bytes: &[u8],
     pos: &mut usize,
     cp: &ConstantPool,
-    out: &mut crate::Functions,
+    symbols_out: &mut crate::Symbols,
 ) -> Option<u32> {
     let count = read_u16(bytes, pos)?;
     for _ in 0..count {
@@ -357,25 +356,33 @@ fn parse_methods(
         let Some(name) = cp.utf8.get(&name_idx) else {
             continue;
         };
-        // Class-file method kinds: `<init>` is the JVM's name for a
-        // constructor, `<clinit>` for the static initialiser. Real
+        // Class-file method decl tags: `<init>` is the JVM's name for
+        // a constructor, `<clinit>` for the static initialiser. Real
         // method declarations get the generic `"method"` tag.
-        let kind: Option<&'static str> = match name.as_str() {
-            "<init>" => Some("constructor"),
-            "<clinit>" => Some("initializer"),
-            _ => Some("method"),
-        };
+        let decl = Some(match name.as_str() {
+            "<init>" => "constructor".to_string(),
+            "<clinit>" => "initializer".to_string(),
+            _ => "method".to_string(),
+        });
         // Static methods are interesting for entry-point detection
         // (`public static void main(String[])`). We don't yet emit
         // the access-flag decomposition per function — that lives
         // in the kv tree only.
         let _ = access_flags;
-        out.push(crate::Function {
+        symbols_out.push(crate::Symbol::Function {
             name: name.clone(),
-            source: "java-class",
+            source: "java-class".into(),
             offset: None,
-            kind,
-            ..crate::Function::default()
+            decl,
+            complexity: None,
+            basic_blocks: None,
+            edges: None,
+            instructions: None,
+            stack_frame: None,
+            recursive: None,
+            noreturn: None,
+            is_linear: None,
+            callees: Vec::new(),
         });
     }
     Some(u32::from(count))
@@ -388,7 +395,7 @@ fn parse_methods(
 fn populate_imports(
     cp: &ConstantPool,
     this_idx: u16,
-    out: &mut crate::Imports,
+    symbols_out: &mut crate::Symbols,
     metrics: &mut Metrics,
 ) {
     // Distinct external class references — every CONSTANT_Class_info
@@ -408,10 +415,10 @@ fn populate_imports(
         if !seen.insert(name) {
             continue;
         }
-        out.push(crate::Import {
+        symbols_out.push(crate::Symbol::Import {
             name: name.to_string(),
             library: None,
-            source: "java-class",
+            source: "java-class".into(),
             offset: None,
             ordinal: None,
         });
@@ -431,10 +438,10 @@ fn populate_imports(
         let Some((owner, name, _desc)) = cp.methodref_resolve(idx) else {
             continue;
         };
-        out.push(crate::Import {
+        symbols_out.push(crate::Symbol::Import {
             name: name.to_string(),
             library: Some(owner.to_string()),
-            source: "java-methodref",
+            source: "java-methodref".into(),
             offset: None,
             ordinal: None,
         });
@@ -593,20 +600,18 @@ mod tests {
         let mut v = Values::new();
         let mut s = Strings::default();
         let mut m = Metrics::new();
-        let mut imports = crate::Imports::new();
-        let mut functions = crate::Functions::new();
-        extract(bytes, &mut v, &mut s, &mut m, &mut imports, &mut functions).unwrap();
+        let mut symbols = crate::Symbols::new();
+        extract(bytes, &mut v, &mut s, &mut m, &mut symbols).unwrap();
         (v, m)
     }
 
-    fn run_full(bytes: &[u8]) -> (Values, Metrics, crate::Imports, crate::Functions) {
+    fn run_full(bytes: &[u8]) -> (Values, Metrics, crate::Symbols) {
         let mut v = Values::new();
         let mut s = Strings::default();
         let mut m = Metrics::new();
-        let mut imports = crate::Imports::new();
-        let mut functions = crate::Functions::new();
-        extract(bytes, &mut v, &mut s, &mut m, &mut imports, &mut functions).unwrap();
-        (v, m, imports, functions)
+        let mut symbols = crate::Symbols::new();
+        extract(bytes, &mut v, &mut s, &mut m, &mut symbols).unwrap();
+        (v, m, symbols)
     }
 
     #[test]
@@ -680,10 +685,16 @@ mod tests {
     #[test]
     fn external_class_refs_emit_typed_imports() {
         let bytes = build_class(52, false);
-        let (_, m, imports, functions) = run_full(&bytes);
+        let (_, m, symbols) = run_full(&bytes);
         // `java/lang/Object` shows up as a `java-class` import; the
         // class's own `MyClass` self-reference does not.
-        let names: Vec<&str> = imports.iter().map(|i| i.name.as_str()).collect();
+        let names: Vec<&str> = symbols
+            .iter_kind(crate::SymbolKind::Import)
+            .filter_map(|s| match s {
+                crate::Symbol::Import { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
         assert!(
             names.contains(&"java/lang/Object"),
             "expected super-class as java-class import, got {names:?}",
@@ -692,14 +703,20 @@ mod tests {
             !names.contains(&"MyClass"),
             "this_class must not leak as import"
         );
-        for imp in imports.iter() {
-            assert_eq!(imp.source, "java-class");
-            assert!(imp.library.is_none(), "java-class imports carry no library");
+        for sym in symbols.iter_kind(crate::SymbolKind::Import) {
+            let crate::Symbol::Import {
+                source, library, ..
+            } = sym
+            else {
+                unreachable!();
+            };
+            assert_eq!(source, "java-class");
+            assert!(library.is_none(), "java-class imports carry no library");
         }
         assert_eq!(m.get("class.external_class_count"), Some(1.0));
         // No methods were declared by the builder.
         assert_eq!(m.get("class.method_count"), Some(0.0));
-        assert!(functions.is_empty());
+        assert_eq!(symbols.iter_kind(crate::SymbolKind::Function).count(), 0);
     }
 
     #[test]
@@ -820,14 +837,22 @@ mod tests {
     #[test]
     fn methodref_resolves_to_java_methodref_import() {
         let bytes = build_class_with_methodref_and_method();
-        let (_, m, imports, _) = run_full(&bytes);
-        let methodref: Vec<&crate::Import> = imports
-            .iter()
-            .filter(|i| i.source == "java-methodref")
+        let (_, m, symbols) = run_full(&bytes);
+        let methodref: Vec<(&str, Option<&str>)> = symbols
+            .iter_kind(crate::SymbolKind::Import)
+            .filter_map(|s| match s {
+                crate::Symbol::Import {
+                    name,
+                    library,
+                    source,
+                    ..
+                } if source == "java-methodref" => Some((name.as_str(), library.as_deref())),
+                _ => None,
+            })
             .collect();
         assert_eq!(methodref.len(), 1);
-        assert_eq!(methodref[0].name, "exit");
-        assert_eq!(methodref[0].library.as_deref(), Some("java/lang/System"));
+        assert_eq!(methodref[0].0, "exit");
+        assert_eq!(methodref[0].1, Some("java/lang/System"));
         assert_eq!(m.get("class.method_ref_count"), Some(1.0));
         // Three classes referenced: Object, System, Demo (self).
         // populate_imports excludes Demo (this_class), so 2 stay.
@@ -837,13 +862,24 @@ mod tests {
     #[test]
     fn declared_methods_emit_typed_functions() {
         let bytes = build_class_with_methodref_and_method();
-        let (_, m, _, functions) = run_full(&bytes);
-        let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, vec!["compute"]);
+        let (_, m, symbols) = run_full(&bytes);
+        let funcs: Vec<(&str, &str, Option<&str>)> = symbols
+            .iter_kind(crate::SymbolKind::Function)
+            .filter_map(|s| match s {
+                crate::Symbol::Function {
+                    name,
+                    source,
+                    decl,
+                    ..
+                } => Some((name.as_str(), source.as_str(), decl.as_deref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(funcs.len(), 1);
+        assert_eq!(funcs[0].0, "compute");
+        assert_eq!(funcs[0].1, "java-class");
+        assert_eq!(funcs[0].2, Some("method"));
         assert_eq!(m.get("class.method_count"), Some(1.0));
-        let f = functions.iter().next().unwrap();
-        assert_eq!(f.source, "java-class");
-        assert_eq!(f.kind, Some("method"));
     }
 
     fn build_class_with_flags(major: u16, flags: u16) -> Vec<u8> {
