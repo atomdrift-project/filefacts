@@ -528,8 +528,14 @@ mod tests {
             .iter()
             .map(|(n, k)| (n.as_str(), k.clone()))
             .collect();
-        assert_eq!(names.get("hello").cloned(), Some(Some("function".to_string())));
-        assert_eq!(names.get("Greeter").cloned(), Some(Some("class".to_string())));
+        assert_eq!(
+            names.get("hello").cloned(),
+            Some(Some("function".to_string()))
+        );
+        assert_eq!(
+            names.get("Greeter").cloned(),
+            Some(Some("class".to_string()))
+        );
         assert_eq!(names.get("M").cloned(), Some(Some("class".to_string())));
     }
 
@@ -554,7 +560,10 @@ mod tests {
             .iter()
             .map(|(n, k)| (n.as_str(), k.clone()))
             .collect();
-        assert_eq!(names.get("Hello").cloned(), Some(Some("function".to_string())));
+        assert_eq!(
+            names.get("Hello").cloned(),
+            Some(Some("function".to_string()))
+        );
         assert_eq!(names.get("Bar").cloned(), Some(Some("class".to_string())));
     }
 
@@ -567,7 +576,10 @@ mod tests {
             .iter()
             .map(|(n, k)| (n.as_str(), k.clone()))
             .collect();
-        assert_eq!(names.get("add").cloned(), Some(Some("function".to_string())));
+        assert_eq!(
+            names.get("add").cloned(),
+            Some(Some("function".to_string()))
+        );
         assert_eq!(names.get("P").cloned(), Some(Some("class".to_string())));
     }
 
@@ -580,8 +592,14 @@ mod tests {
             .iter()
             .map(|(n, k)| (n.as_str(), k.clone()))
             .collect();
-        assert_eq!(names.get("hello").cloned(), Some(Some("function".to_string())));
-        assert_eq!(names.get("Greeter").cloned(), Some(Some("class".to_string())));
+        assert_eq!(
+            names.get("hello").cloned(),
+            Some(Some("function".to_string()))
+        );
+        assert_eq!(
+            names.get("Greeter").cloned(),
+            Some(Some("class".to_string()))
+        );
     }
 
     #[test]
@@ -617,17 +635,23 @@ mod tests {
     fn perl_imports_and_definitions() {
         let src = b"use strict;\nuse warnings;\nuse Foo::Bar;\npackage My::Class;\nsub greet { return 1 }\nsub add { my ($a, $b) = @_; return $a + $b }\n";
         let (imports, functions) = parse_source("app.pl", src);
-        assert!(
-            imports.iter().any(|s| s == "Foo::Bar"),
-            "got {imports:?}"
-        );
+        assert!(imports.iter().any(|s| s == "Foo::Bar"), "got {imports:?}");
         let names: std::collections::HashMap<&str, Option<String>> = functions
             .iter()
             .map(|(n, k)| (n.as_str(), k.clone()))
             .collect();
-        assert_eq!(names.get("greet").cloned(), Some(Some("function".to_string())));
-        assert_eq!(names.get("add").cloned(), Some(Some("function".to_string())));
-        assert_eq!(names.get("My::Class").cloned(), Some(Some("class".to_string())));
+        assert_eq!(
+            names.get("greet").cloned(),
+            Some(Some("function".to_string()))
+        );
+        assert_eq!(
+            names.get("add").cloned(),
+            Some(Some("function".to_string()))
+        );
+        assert_eq!(
+            names.get("My::Class").cloned(),
+            Some(Some("class".to_string()))
+        );
     }
 
     #[test]
@@ -670,10 +694,7 @@ mod tests {
     fn makefile_targets_and_includes() {
         let src = b"include common.mk\n\nall: build\n\nbuild:\n\t@echo building\n";
         let (imports, functions) = parse_source("Makefile", src);
-        assert!(
-            imports.iter().any(|s| s == "common.mk"),
-            "got {imports:?}"
-        );
+        assert!(imports.iter().any(|s| s == "common.mk"), "got {imports:?}");
         let names: Vec<&str> = functions.iter().map(|(n, _)| n.as_str()).collect();
         assert!(
             names.iter().any(|n| *n == "all" || *n == "build"),
@@ -702,18 +723,15 @@ mod tests {
             .iter_kind(crate::SymbolKind::Function)
             .filter_map(|s| match s {
                 crate::Symbol::Function {
-                    name,
-                    decl,
-                    source,
-                    ..
+                    name, decl, source, ..
                 } => Some((name.as_str(), decl.as_deref(), source.as_str())),
                 _ => None,
             })
             .collect();
         let names: std::collections::HashMap<&str, Option<&str>> =
             functions.iter().map(|(n, d, _)| (*n, *d)).collect();
-        assert_eq!(names.get("hello").cloned(), Some(Some("function")));
-        assert_eq!(names.get("Greeter").cloned(), Some(Some("class")));
+        assert_eq!(names.get("hello").copied(), Some(Some("function")));
+        assert_eq!(names.get("Greeter").copied(), Some(Some("class")));
         for (_, _, src) in &functions {
             assert_eq!(*src, "python");
         }

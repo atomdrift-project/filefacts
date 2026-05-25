@@ -69,7 +69,10 @@ pub enum ArgShape {
 #[non_exhaustive]
 pub enum Arg {
     /// String literal — value is the un-quoted text.
-    String { value: String },
+    String {
+        /// Un-quoted text content.
+        value: String,
+    },
     /// Numeric literal — `text` is the source-written form
     /// (`"0o777"`, `"0xDEADBEEF"`, `"4444"`); `value` is the parsed
     /// integer; `radix` is how it was written (2/8/10/16). Authors
@@ -83,12 +86,21 @@ pub enum Arg {
         radix: u32,
     },
     /// Bare identifier — value is the identifier name.
-    Identifier { name: String },
+    Identifier {
+        /// Identifier name.
+        name: String,
+    },
     /// Boolean literal — value is the parsed bool.
-    Bool { value: bool },
+    Bool {
+        /// Parsed boolean value.
+        value: bool,
+    },
     /// Template / formatted / interpolated string — value is the
     /// source text including the formatting markers (best-effort).
-    Template { value: String },
+    Template {
+        /// Source text including formatting markers (best-effort).
+        value: String,
+    },
     /// Null / nil / None literal.
     Null,
     /// Object / map / dict / struct literal.
@@ -556,7 +568,14 @@ mod tests {
         };
         assert_eq!(args.len(), 2);
         assert!(matches!(args[0], Arg::String { ref value } if value == "/tmp/x"));
-        assert!(matches!(args[1], Arg::Number { value: 511, radix: 8, .. }));
+        assert!(matches!(
+            args[1],
+            Arg::Number {
+                value: 511,
+                radix: 8,
+                ..
+            }
+        ));
     }
 
     #[test]

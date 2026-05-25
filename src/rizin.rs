@@ -585,15 +585,9 @@ impl RizinRecovery {
     ) -> RecoveryCounts {
         use crate::output::{Symbol, SymbolKind};
         let mut counts = RecoveryCounts::default();
-        let had_imports = symbols_out
-            .iter()
-            .any(|s| s.kind() == SymbolKind::Import);
-        let had_exports = symbols_out
-            .iter()
-            .any(|s| s.kind() == SymbolKind::Export);
-        let had_functions = symbols_out
-            .iter()
-            .any(|s| s.kind() == SymbolKind::Function);
+        let had_imports = symbols_out.iter().any(|s| s.kind() == SymbolKind::Import);
+        let had_exports = symbols_out.iter().any(|s| s.kind() == SymbolKind::Export);
+        let had_functions = symbols_out.iter().any(|s| s.kind() == SymbolKind::Function);
         if !had_imports {
             for imp in self.imports {
                 if imp.name.is_empty() {

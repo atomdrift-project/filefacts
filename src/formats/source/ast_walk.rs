@@ -331,16 +331,16 @@ fn parse_numeric_literal_node(node: Node<'_>, source: &str) -> Option<(String, i
     if text.contains('.') {
         return None;
     }
-    let (rest, radix) =
-        if let Some(s) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-            (s, 16u32)
-        } else if let Some(s) = text.strip_prefix("0o").or_else(|| text.strip_prefix("0O")) {
-            (s, 8u32)
-        } else if let Some(s) = text.strip_prefix("0b").or_else(|| text.strip_prefix("0B")) {
-            (s, 2u32)
-        } else {
-            (text.as_str(), 10u32)
-        };
+    let (rest, radix) = if let Some(s) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X"))
+    {
+        (s, 16u32)
+    } else if let Some(s) = text.strip_prefix("0o").or_else(|| text.strip_prefix("0O")) {
+        (s, 8u32)
+    } else if let Some(s) = text.strip_prefix("0b").or_else(|| text.strip_prefix("0B")) {
+        (s, 2u32)
+    } else {
+        (text.as_str(), 10u32)
+    };
     let cleaned: String = rest
         .chars()
         .take_while(|c| c.is_digit(radix) || *c == '_')
@@ -352,7 +352,6 @@ fn parse_numeric_literal_node(node: Node<'_>, source: &str) -> Option<(String, i
     let value = i64::from_str_radix(&cleaned, radix).ok()?;
     Some((text, value, radix))
 }
-
 
 /// Resolve a callee or member-access node into its static dotted path,
 /// `a.b.c`. Returns `None` for any chain that contains a non-static
@@ -414,11 +413,7 @@ fn is_subscript_kind(kind: &str) -> bool {
 ///
 /// Returns `None` for non-literal indices (variable, expression,
 /// numeric) — those genuinely are dynamic accesses.
-fn try_fold_string_subscript(
-    node: Node<'_>,
-    source: &str,
-    config: &LangConfig,
-) -> Option<String> {
+fn try_fold_string_subscript(node: Node<'_>, source: &str, config: &LangConfig) -> Option<String> {
     // First named child is the object; second is the index expression.
     let mut cursor = node.walk();
     let mut children = node.named_children(&mut cursor);

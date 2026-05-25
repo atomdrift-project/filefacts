@@ -68,9 +68,9 @@ impl<'a> TreeCache<'a> {
             parser.set_language(&language).map_err(|e| {
                 Error::malformed("source", format!("tree-sitter language setup failed: {e}"))
             })?;
-            let tree = parser.parse(source, None).ok_or_else(|| {
-                Error::malformed("source", "tree-sitter parse returned None")
-            })?;
+            let tree = parser
+                .parse(source, None)
+                .ok_or_else(|| Error::malformed("source", "tree-sitter parse returned None"))?;
             Ok(Some(Self {
                 source,
                 tree,

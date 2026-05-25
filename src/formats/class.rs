@@ -867,10 +867,7 @@ mod tests {
             .iter_kind(crate::SymbolKind::Function)
             .filter_map(|s| match s {
                 crate::Symbol::Function {
-                    name,
-                    source,
-                    decl,
-                    ..
+                    name, source, decl, ..
                 } => Some((name.as_str(), source.as_str(), decl.as_deref())),
                 _ => None,
             })

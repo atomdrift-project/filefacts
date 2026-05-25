@@ -2012,8 +2012,7 @@ mod tests {
             &mut errors,
         )
         .unwrap();
-        let imports: Vec<&crate::Symbol> =
-            symbols.iter_kind(crate::SymbolKind::Import).collect();
+        let imports: Vec<&crate::Symbol> = symbols.iter_kind(crate::SymbolKind::Import).collect();
         assert!(!imports.is_empty(), "expected at least one PE import");
         for sym in imports {
             let crate::Symbol::Import {

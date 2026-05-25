@@ -93,7 +93,14 @@ fn fat_binary(
         }
         archs.push(slice_entry);
         if idx == 0 {
-            single_arch(&macho, slice_bytes, values, metrics, sections_out, symbols_out);
+            single_arch(
+                &macho,
+                slice_bytes,
+                values,
+                metrics,
+                sections_out,
+                symbols_out,
+            );
         }
     }
     metrics.insert("macho.slice_count", archs.len() as f64);

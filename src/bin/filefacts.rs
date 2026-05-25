@@ -1388,10 +1388,7 @@ fn render_symbols(value: &Value) -> String {
     if items.len() > SYMBOL_PREVIEW_LIMIT {
         out.push_str(&format!(
             "    {}\n",
-            dim(&format!(
-                "... {} more",
-                items.len() - SYMBOL_PREVIEW_LIMIT
-            )),
+            dim(&format!("... {} more", items.len() - SYMBOL_PREVIEW_LIMIT)),
         ));
     }
     out

@@ -454,7 +454,7 @@ fn extract_subs_and_functions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output::{Symbols, SymbolKind};
+    use crate::output::{SymbolKind, Symbols};
 
     fn run(src: &str) -> (Symbols, VbaSymbolStats) {
         let mut symbols = Symbols::new();
@@ -575,7 +575,10 @@ mod tests {
         let (syms, stats) = run(src);
         let imps = imports(&syms);
         assert_eq!(imps.len(), 1);
-        assert_eq!(imps[0], ("Excel.Application", Some("com-getobject"), "vba-getobject"));
+        assert_eq!(
+            imps[0],
+            ("Excel.Application", Some("com-getobject"), "vba-getobject")
+        );
         assert_eq!(stats.getobject_count, 1);
     }
 

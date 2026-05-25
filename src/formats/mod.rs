@@ -90,12 +90,8 @@ pub(crate) fn extract(
     generic::extract(bytes, values, strings, metrics);
 
     let result = match file_type {
-        FileType::Pe => {
-            pe::extract(bytes, values, strings, metrics, sections, symbols, errors)
-        }
-        FileType::Elf => {
-            elf::extract(bytes, values, strings, metrics, sections, symbols, errors)
-        }
+        FileType::Pe => pe::extract(bytes, values, strings, metrics, sections, symbols, errors),
+        FileType::Elf => elf::extract(bytes, values, strings, metrics, sections, symbols, errors),
         FileType::MachO => {
             macho::extract(bytes, values, strings, metrics, sections, symbols, errors)
         }

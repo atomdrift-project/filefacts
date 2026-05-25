@@ -25,7 +25,7 @@ pub(super) fn emit(symbols: &Symbols, values: &mut Values) {
     fortify(symbols, values);
 }
 
-fn each_import_name<'a>(symbols: &'a Symbols) -> impl Iterator<Item = &'a str> {
+fn each_import_name(symbols: &Symbols) -> impl Iterator<Item = &str> {
     symbols
         .iter_kind(SymbolKind::Import)
         .filter_map(|s| match s {

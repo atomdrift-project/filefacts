@@ -33,7 +33,7 @@
 //! for (key, value) in parsed.values().iter() {
 //!     println!("{}: {}", key, value);
 //! }
-//! for s in &parsed.strings().ascii {
+//! for s in &parsed.text().ascii {
 //!     println!("@{}: {}", s.offset, s.text);
 //! }
 //! for (key, value) in parsed.metrics().iter() {
@@ -103,7 +103,7 @@ use std::sync::OnceLock;
 pub use error::Error;
 pub use fileid::{FileId, FileType};
 pub use output::{
-    Arg, ArchiveMember, ArgShape, Errors, ExtractedString, Literals, Metrics, ParseError, Section,
+    ArchiveMember, Arg, ArgShape, Errors, ExtractedString, Literals, Metrics, ParseError, Section,
     Sections, Symbol, SymbolKind, Symbols, Text, Values,
 };
 

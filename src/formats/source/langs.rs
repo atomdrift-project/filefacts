@@ -766,7 +766,11 @@ static PERL: LangConfig = LangConfig {
     name: "perl",
     language: || ts_parser_perl::LANGUAGE.into(),
     comment_style: CommentStyle::Hash,
-    string_kinds: &["string_literal", "interpolated_string_literal", "heredoc_content"],
+    string_kinds: &[
+        "string_literal",
+        "interpolated_string_literal",
+        "heredoc_content",
+    ],
     import_query: r#"
         (use_statement (package) @import)
         (require_expression (bareword) @import)
@@ -784,7 +788,12 @@ static PERL: LangConfig = LangConfig {
     member_kinds: &["method_call_expression"],
     member_object_field: "invocant",
     member_property_field: "method",
-    identifier_kinds: &["scalar_variable", "array_variable", "hash_variable", "bareword"],
+    identifier_kinds: &[
+        "scalar_variable",
+        "array_variable",
+        "hash_variable",
+        "bareword",
+    ],
     number_kinds: &["number"],
     bool_kinds: &["boolean"],
     null_kinds: &["undef_expression"],

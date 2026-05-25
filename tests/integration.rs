@@ -347,7 +347,14 @@ fn typed_fact_views_are_not_mirrored_in_values() {
         values.get("source.language").and_then(|v| v.as_str()),
         Some("javascript")
     );
-    for path in ["imports", "functions", "classes", "strings", "ast", "symbols"] {
+    for path in [
+        "imports",
+        "functions",
+        "classes",
+        "strings",
+        "ast",
+        "symbols",
+    ] {
         assert!(
             values.get(path).is_none(),
             "{path} must live only in its typed filefacts view"
