@@ -37,12 +37,12 @@ pub(super) fn extract(
     let parsed = match goblin_safe::parse_mach(bytes) {
         goblin_safe::GoblinOutcome::Ok(m) => m,
         goblin_safe::GoblinOutcome::Failed(e) => {
-            errors_out.record_malformed("macho-parse", e.to_string());
+            errors_out.record_malformed(crate::Stage::MachoParse, e.to_string());
             metrics.insert("macho.parse_failed", 1.0);
             return Ok(());
         }
         goblin_safe::GoblinOutcome::Panicked(msg) => {
-            errors_out.record_panic("macho-parse", msg);
+            errors_out.record_panic(crate::Stage::MachoParse, msg);
             metrics.insert("macho.parse_panicked", 1.0);
             return Ok(());
         }
@@ -72,10 +72,18 @@ fn fat_binary(
     let mut archs: Vec<JsonValue> = Vec::new();
     for (idx, slice) in fat.iter_arches().enumerate() {
         let Ok(arch) = slice else { continue };
-        let slice_bytes = &bytes[arch.offset as usize
-            ..(arch.offset as usize)
-                .saturating_add(arch.size as usize)
-                .min(bytes.len())];
+        // `arch.offset` and `arch.size` come from the fat header — on
+        // a misclassified CAFEBABE input (Java `.class` mistaken for
+        // Mach-O fat) they are random bytes and routinely overflow
+        // the file. Validate the start before slicing; `.min(end)`
+        // alone only clamps the upper bound and still panics on a
+        // huge start.
+        let start = arch.offset as usize;
+        if start >= bytes.len() {
+            continue;
+        }
+        let end = start.saturating_add(arch.size as usize).min(bytes.len());
+        let slice_bytes = &bytes[start..end];
         let Ok(macho) = MachO::parse(slice_bytes, 0) else {
             continue;
         };
@@ -1081,11 +1089,11 @@ fn build_version(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
 }
 
 fn read_u32(bytes: &[u8], offset: usize, little_endian: bool) -> u32 {
-    let arr: [u8; 4] = bytes[offset..offset + 4].try_into().unwrap_or([0, 0, 0, 0]);
+    use crate::formats::common::bytes_at;
     if little_endian {
-        u32::from_le_bytes(arr)
+        bytes_at::u32_le(bytes, offset).unwrap_or(0)
     } else {
-        u32::from_be_bytes(arr)
+        bytes_at::u32_be(bytes, offset).unwrap_or(0)
     }
 }
 
@@ -1266,6 +1274,17 @@ fn info_plist_section(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
     }
 }
 
+/// Maximum recursion depth honoured when projecting a parsed plist
+/// into JSON. Bounds stack usage on plists whose value graph nests
+/// arrays and dictionaries beyond what real Apple artifacts emit.
+const MAX_EMBEDDED_PLIST_DEPTH: u8 = 64;
+
+/// Upper bound on the bytes we hand to `plist::Value::from_reader` for
+/// `__info_plist` / `__launchd_plist` sections. Real binaries carry at
+/// most a few hundred KiB; capping prevents an oversized embedded
+/// plist from forcing megabytes of attacker XML through the parser.
+const MAX_EMBEDDED_PLIST_BYTES: usize = 8 << 20;
+
 fn emit_embedded_plist(
     macho: &MachO<'_>,
     bytes: &[u8],
@@ -1287,17 +1306,23 @@ fn emit_embedded_plist(
             if off >= bytes.len() || end > bytes.len() || len == 0 {
                 return;
             }
+            if len > MAX_EMBEDDED_PLIST_BYTES {
+                return;
+            }
             let plist_bytes = &bytes[off..end];
             if let Ok(parsed) = plist::Value::from_reader(std::io::Cursor::new(plist_bytes)) {
-                values.insert(value_key, plist_to_json(parsed));
+                values.insert(value_key, plist_to_json(parsed, 0));
             }
             return;
         }
     }
 }
 
-fn plist_to_json(value: plist::Value) -> JsonValue {
+fn plist_to_json(value: plist::Value, depth: u8) -> JsonValue {
     use plist::Value as P;
+    if depth > MAX_EMBEDDED_PLIST_DEPTH {
+        return JsonValue::Null;
+    }
     match value {
         P::String(s) => JsonValue::String(s),
         P::Integer(i) => i
@@ -1308,11 +1333,15 @@ fn plist_to_json(value: plist::Value) -> JsonValue {
         P::Real(f) => serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number),
         P::Boolean(b) => JsonValue::Bool(b),
         P::Date(d) => JsonValue::String(format!("{d:?}")),
-        P::Array(arr) => JsonValue::Array(arr.into_iter().map(plist_to_json).collect()),
+        P::Array(arr) => JsonValue::Array(
+            arr.into_iter()
+                .map(|v| plist_to_json(v, depth + 1))
+                .collect(),
+        ),
         P::Dictionary(dict) => {
             let mut obj = serde_json::Map::new();
             for (k, v) in dict {
-                obj.insert(k, plist_to_json(v));
+                obj.insert(k, plist_to_json(v, depth + 1));
             }
             JsonValue::Object(obj)
         }
@@ -1325,9 +1354,22 @@ fn format_macho_uuid(b: &[u8; 16]) -> String {
     // tool's output (codesign, dwarfdump, otool -l).
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        b[0], b[1], b[2], b[3],
-        b[4], b[5], b[6], b[7], b[8], b[9],
-        b[10], b[11], b[12], b[13], b[14], b[15]
+        b[0],
+        b[1],
+        b[2],
+        b[3],
+        b[4],
+        b[5],
+        b[6],
+        b[7],
+        b[8],
+        b[9],
+        b[10],
+        b[11],
+        b[12],
+        b[13],
+        b[14],
+        b[15]
     )
 }
 
@@ -1544,6 +1586,50 @@ mod tests {
         assert_eq!(load_command_name(0x8000_000c), "LC_LOAD_DYLIB");
     }
 
+    /// Regression test for a panic seen in the field: a small file
+    /// whose CAFEBABE prefix made goblin parse a fat header with
+    /// implausible arch offsets. The old slicing path computed
+    /// `&bytes[start..end]` where `start > bytes.len()` and panicked
+    /// with `range start index N out of range`. We now bail before
+    /// the slice and `extract` returns cleanly.
+    #[test]
+    fn fat_header_with_out_of_range_arch_offset_does_not_panic() {
+        // CAFEBABE + nfat_arch=2 + two arch entries each claiming a
+        // multi-gigabyte offset/size. Mirrors junk Java `.class` files
+        // misclassified as Mach-O fat via the magic check.
+        let mut bytes = vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x02];
+        // arch 0: cputype=7, subtype=3, offset=0xFFFFFFF0, size=0x1000, align=12
+        bytes.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x03, 0xFF, 0xFF, 0xFF, 0xF0, 0x00, 0x00,
+            0x10, 0x00, 0x00, 0x00, 0x00, 0x0C,
+        ]);
+        // arch 1: cputype=0x0100_000C, subtype=0, offset=0x4D11ABD4, size=0x800, align=12
+        bytes.extend_from_slice(&[
+            0x01, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x4D, 0x11, 0xAB, 0xD4, 0x00, 0x00,
+            0x08, 0x00, 0x00, 0x00, 0x00, 0x0C,
+        ]);
+        // Pad to a plausible class-file size so the body slicing path
+        // still operates against bounded input.
+        bytes.resize(1024, 0);
+
+        let mut values = Values::new();
+        let mut strings = crate::output::Strings::default();
+        let mut metrics = Metrics::new();
+        let mut sections: Vec<Section> = Vec::new();
+        let mut symbols = crate::Symbols::new();
+        let mut errors = crate::output::Errors::new();
+        // The point of the test is non-panicking completion.
+        let _ = extract(
+            &bytes,
+            &mut values,
+            &mut strings,
+            &mut metrics,
+            &mut sections,
+            &mut symbols,
+            &mut errors,
+        );
+    }
+
     fn run(bytes: &[u8]) -> (Values, Strings, Metrics) {
         let mut v = Values::new();
         let mut s = Strings::default();
@@ -1640,19 +1726,21 @@ mod tests {
         );
         // Flags must be non-zero for any real Mach-O — at minimum
         // MH_DYLDLINK | MH_TWOLEVEL.
-        assert!(v
-            .get("macho.flags_raw")
-            .and_then(|x| x.as_u64())
-            .is_some_and(|f| f != 0),);
+        assert!(
+            v.get("macho.flags_raw")
+                .and_then(|x| x.as_u64())
+                .is_some_and(|f| f != 0),
+        );
         // class_bits is 64 for an arm64 executable.
         assert_eq!(v.get("macho.class_bits").and_then(|x| x.as_u64()), Some(64));
         // Entry point must be set on an executable (LC_MAIN.entryoff).
         assert!(v.get("macho.entry").and_then(|x| x.as_u64()).unwrap_or(0) > 0);
         // sizeofcmds is always non-zero for a valid Mach-O.
-        assert!(v
-            .get("macho.load_commands_size")
-            .and_then(|x| x.as_u64())
-            .is_some_and(|n| n > 0));
+        assert!(
+            v.get("macho.load_commands_size")
+                .and_then(|x| x.as_u64())
+                .is_some_and(|n| n > 0)
+        );
     }
 
     /// Pin per-segment raw initprot/maxprot fields used by cleave's

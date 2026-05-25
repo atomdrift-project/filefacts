@@ -72,7 +72,7 @@ fn is_printable(b: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_runs, DEFAULT_MIN_LEN};
+    use super::{DEFAULT_MIN_LEN, extract_runs};
 
     #[test]
     fn finds_simple_runs() {

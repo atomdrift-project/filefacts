@@ -106,17 +106,31 @@ fn attribute_value(text: &str, elem: &str, attr: &str) -> Option<String> {
 
 fn attr_value_in_tag(tag: &str, attr: &str) -> Option<String> {
     let pattern = format!("{attr}=");
-    let idx = tag.find(&pattern)?;
-    let after = &tag[idx + pattern.len()..];
-    let after = after.trim_start();
-    let quote = after.chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
+    let mut search_from = 0;
+    while let Some(rel) = tag[search_from..].find(&pattern) {
+        let idx = search_from + rel;
+        // The attribute name must begin a token — preceded by tag
+        // whitespace, the opening `<`, or a `/` (for empty elements).
+        // Otherwise we'd accept `Id=` matching the tail of `someId=`.
+        let preceded_by_boundary = idx == 0
+            || matches!(
+                tag.as_bytes()[idx - 1],
+                b' ' | b'\t' | b'\r' | b'\n' | b'<' | b'/'
+            );
+        if !preceded_by_boundary {
+            search_from = idx + pattern.len();
+            continue;
+        }
+        let after = tag[idx + pattern.len()..].trim_start();
+        let quote = after.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let rest = &after[1..];
+        let end = rest.find(quote)?;
+        return Some(rest[..end].to_string());
     }
-    let value_start = after.len() - after[1..].len();
-    let rest = &after[value_start..];
-    let end = rest.find(quote)?;
-    Some(rest[..end].to_string())
+    None
 }
 
 /// Find the first `<elem` occurrence. Tolerates whitespace and
@@ -275,9 +289,10 @@ mod tests {
             .and_then(|x| x.as_array())
             .unwrap();
         assert_eq!(arr.len(), 2);
-        assert!(arr
-            .iter()
-            .any(|x| x.as_str() == Some("{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}")));
+        assert!(
+            arr.iter()
+                .any(|x| x.as_str() == Some("{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"))
+        );
     }
 
     const SAMPLE_WITH_DEPS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>

@@ -18,7 +18,7 @@
 //!   entry is one of `rsa`, `dsa`, `pgp`, `gpg`; presence of the
 //!   array signals a signed package (no bool needed).
 
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
 use crate::formats::common::{extract_ascii_strings, put_str};
@@ -112,8 +112,21 @@ pub(super) fn extract(
         );
         values.insert("rpm.signature", JsonValue::Object(sig));
     }
-    pos += sig_total;
-    pos += (8 - (pos % 8)) % 8;
+    // Advance past the signature header and round up to the 8-byte
+    // alignment boundary the main header is expected to sit at.
+    // `sig_total` is attacker-controlled — guard against arithmetic
+    // overflow and against landing past the end of the buffer.
+    let Some(after_sig) = pos.checked_add(sig_total) else {
+        return Ok(());
+    };
+    let padding = (8 - (after_sig % 8)) % 8;
+    let Some(aligned) = after_sig.checked_add(padding) else {
+        return Ok(());
+    };
+    if aligned >= bytes.len() {
+        return Ok(());
+    }
+    pos = aligned;
 
     // Main header.
     let Some((main_entries, main_data, _)) = read_header(&bytes[pos..]) else {

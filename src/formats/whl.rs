@@ -174,8 +174,8 @@ fn ends_with_so_versioned(basename: &str) -> bool {
 mod tests {
     use super::*;
     use std::io::{Cursor, Write};
-    use zip::write::SimpleFileOptions;
     use zip::CompressionMethod;
+    use zip::write::SimpleFileOptions;
 
     fn build_whl(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut buf = Vec::new();

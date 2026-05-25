@@ -194,7 +194,7 @@ pub(super) fn emit(strings: &[&str], metrics: &mut Metrics) {
 }
 
 fn is_likely_base64(s: &str) -> bool {
-    if s.len() < 16 || !s.len() % 4 == 0 {
+    if s.len() < 16 || s.len() % 4 != 0 {
         return false;
     }
     let base64_chars = s
@@ -211,7 +211,7 @@ fn is_likely_base64(s: &str) -> bool {
 }
 
 fn is_hex_string(s: &str) -> bool {
-    if s.len() < 8 || !s.len() % 2 == 0 {
+    if s.len() < 8 || s.len() % 2 != 0 {
         return false;
     }
     let check = if s.starts_with("0x") || s.starts_with("0X") {
@@ -415,6 +415,23 @@ mod tests {
         let mut m = Metrics::new();
         emit(&["SGVsbG8gV29ybGQh", "normalString"], &mut m);
         assert_eq!(m.get("strings.base64_candidates"), Some(1.0));
+    }
+
+    #[test]
+    fn base64_requires_length_multiple_of_four() {
+        // 17 chars (len % 4 == 1) and 18 chars (len % 4 == 2): not valid
+        // base64 framing, must be rejected by `is_likely_base64`.
+        assert!(!is_likely_base64("SGVsbG8gV29ybGQhX")); // 17 chars
+        assert!(!is_likely_base64("SGVsbG8gV29ybGQhXY")); // 18 chars
+        assert!(!is_likely_base64("SGVsbG8gV29ybGQhXYZ")); // 19 chars
+        assert!(is_likely_base64("SGVsbG8gV29ybGQh")); // 16 chars
+    }
+
+    #[test]
+    fn hex_requires_length_multiple_of_two() {
+        assert!(!is_hex_string("deadbeefa")); // 9 chars
+        assert!(is_hex_string("deadbeef")); // 8 chars
+        assert!(is_hex_string("0xdeadbeef")); // prefixed, 8 hex chars
     }
 
     #[test]

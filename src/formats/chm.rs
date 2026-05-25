@@ -28,7 +28,7 @@
 //!   (capped at 256 entries — `metrics.chm.user_entry_count` carries
 //!   the raw count).
 
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
 use crate::formats::common::extract_ascii_strings;
@@ -359,14 +359,19 @@ fn parse_directory(section: &[u8]) -> Vec<DirEntry> {
         return out;
     }
     for i in 0..chunk_count {
-        let off = match header_len.checked_add(i.checked_mul(chunk_size).unwrap_or(0)) {
-            Some(v) => v,
-            None => break,
+        let Some(off) = i
+            .checked_mul(chunk_size)
+            .and_then(|n| header_len.checked_add(n))
+        else {
+            break;
         };
-        if off + chunk_size > section.len() {
+        let Some(end) = off.checked_add(chunk_size) else {
+            break;
+        };
+        if end > section.len() {
             break;
         }
-        let chunk = &section[off..off + chunk_size];
+        let chunk = &section[off..end];
         if &chunk[..4] != b"PMGL" {
             continue;
         }
@@ -438,18 +443,23 @@ fn parse_namelist(bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::with_capacity(count);
     let mut pos = 4_usize;
     for _ in 0..count {
-        if pos + 2 > bytes.len() {
+        let Some(after_len) = pos.checked_add(2) else {
+            break;
+        };
+        if after_len > bytes.len() {
             break;
         }
         let name_words = u16_le(bytes, pos) as usize;
-        pos += 2;
-        let nbytes = name_words * 2;
-        if pos + nbytes + 2 > bytes.len() {
+        let nbytes = name_words.saturating_mul(2);
+        let Some(end) = after_len.checked_add(nbytes).and_then(|n| n.checked_add(2)) else {
+            break;
+        };
+        if end > bytes.len() {
             break;
         }
-        let name = utf16le_to_string(&bytes[pos..pos + nbytes]);
+        let name = utf16le_to_string(&bytes[after_len..after_len + nbytes]);
         out.push(name);
-        pos += nbytes + 2;
+        pos = end;
     }
     out
 }
@@ -482,11 +492,14 @@ fn emit_system(bytes: &[u8], values: &mut Values) -> SystemSummary {
         let code = u16_le(bytes, pos);
         let len = u16_le(bytes, pos + 2) as usize;
         pos += 4;
-        if pos + len > bytes.len() {
+        let Some(payload_end) = pos.checked_add(len) else {
+            break;
+        };
+        if payload_end > bytes.len() {
             break;
         }
-        let payload = &bytes[pos..pos + len];
-        pos += len;
+        let payload = &bytes[pos..payload_end];
+        pos = payload_end;
         match code {
             0 => {
                 if let Some(v) = insert_cstr(&mut sys, "default_topic", payload) {
@@ -571,24 +584,14 @@ fn utf16le_to_string(b: &[u8]) -> String {
     String::from_utf16_lossy(&units)
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn u16_le(buf: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([buf[off], buf[off + 1]])
+    crate::formats::common::bytes_at::u16_le(buf, off).unwrap_or(0)
 }
 fn u32_le(buf: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+    crate::formats::common::bytes_at::u32_le(buf, off).unwrap_or(0)
 }
 fn u64_le(buf: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes([
-        buf[off],
-        buf[off + 1],
-        buf[off + 2],
-        buf[off + 3],
-        buf[off + 4],
-        buf[off + 5],
-        buf[off + 6],
-        buf[off + 7],
-    ])
+    crate::formats::common::bytes_at::u64_le(buf, off).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -619,7 +622,7 @@ mod tests {
         buf[0x04..0x08].copy_from_slice(&3u32.to_le_bytes());
         buf[0x10..0x14].copy_from_slice(&42u32.to_le_bytes()); // timestamp_counter
         buf[0x14..0x18].copy_from_slice(&0x0409u32.to_le_bytes()); // lcid = en-US
-                                                                   // section1 offset/length point past end → empty directory
+        // section1 offset/length point past end → empty directory
         buf[0x48..0x50].copy_from_slice(&0u64.to_le_bytes());
         buf[0x50..0x58].copy_from_slice(&0u64.to_le_bytes());
         buf[0x58..0x60].copy_from_slice(&0u64.to_le_bytes());

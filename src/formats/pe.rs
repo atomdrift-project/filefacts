@@ -11,7 +11,7 @@
 //! `pe.optional.subsystem`. Symbol tables live in the typed imports /
 //! exports views rather than being mirrored into `values`.
 
-use goblin::pe::{header::CoffHeader, optional_header::OptionalHeader, PE};
+use goblin::pe::{PE, header::CoffHeader, optional_header::OptionalHeader};
 use serde_json::Value as JsonValue;
 
 use crate::error::Error;
@@ -58,11 +58,11 @@ pub(super) fn extract(
     // succeeds.
     match &parse_outcome {
         goblin_safe::GoblinOutcome::Failed(e) => {
-            errors_out.record_malformed("pe-parse", e.to_string());
+            errors_out.record_malformed(crate::Stage::PeParse, e.to_string());
             metrics.insert("pe.parse_failed", 1.0);
         }
         goblin_safe::GoblinOutcome::Panicked(msg) => {
-            errors_out.record_panic("pe-parse", msg);
+            errors_out.record_panic(crate::Stage::PeParse, msg);
             metrics.insert("pe.parse_panicked", 1.0);
         }
         goblin_safe::GoblinOutcome::Ok(_) => {}
@@ -118,7 +118,7 @@ pub(super) fn extract(
                 }
             });
             if let goblin_safe::GoblinOutcome::Panicked(msg) = walk {
-                errors_out.record_panic("pe-resource-walk", msg);
+                errors_out.record_panic(crate::Stage::PeResourceWalk, msg);
                 metrics.insert("pe.resource_walk_panicked", 1.0);
             }
         }
@@ -166,7 +166,7 @@ pub(super) fn extract(
     // retained as the canonical "is this a partial parse?" key for
     // existing rules.
     values.insert("pe.partial_parse", serde_json::Value::Bool(true));
-    errors_out.record_fallback("pe-parse", "header-only fallback");
+    errors_out.record_fallback(crate::Stage::PeParse, "header-only fallback");
     metrics.insert("pe.partial_parse", 1.0);
     Ok(())
 }
@@ -1223,11 +1223,7 @@ fn aliased_exports(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
             let target = match instr.mnemonic() {
                 Mnemonic::Jmp | Mnemonic::Call => {
                     let t = instr.near_branch_target();
-                    if t != 0 {
-                        t
-                    } else {
-                        rva as u64
-                    }
+                    if t != 0 { t } else { rva as u64 }
                 }
                 _ => rva as u64,
             };
@@ -1248,7 +1244,10 @@ fn rva_to_file_offset(pe: &PE<'_>, rva: u32) -> Option<usize> {
         let span = section.virtual_size.max(section.size_of_raw_data);
         if rva >= start && rva < start.saturating_add(span) {
             let delta = rva - start;
-            return Some((section.pointer_to_raw_data + delta) as usize);
+            return section
+                .pointer_to_raw_data
+                .checked_add(delta)
+                .map(|v| v as usize);
         }
     }
     None

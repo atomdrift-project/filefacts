@@ -32,8 +32,8 @@ mod strings;
 mod symbols;
 mod values;
 
-pub use archive::ArchiveMember;
-pub use errors::{Errors, ParseError};
+pub use archive::{ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership};
+pub use errors::{ErrorKind, Errors, ParseError, Stage};
 pub use metrics::Metrics;
 pub use sections::{Section, Sections};
 pub use strings::{ExtractedString, Literals, Text};

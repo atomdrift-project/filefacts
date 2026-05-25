@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use serde::Serialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 enum Format {
@@ -67,7 +67,15 @@ enum View {
 
 fn main() -> ExitCode {
     let args = match parse_args() {
-        Ok(a) => a,
+        Ok(ParseOutcome::Run(a)) => a,
+        Ok(ParseOutcome::Help) => {
+            print_usage(false);
+            return ExitCode::SUCCESS;
+        }
+        Ok(ParseOutcome::Version) => {
+            println!("filefacts {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
         Err(msg) => {
             eprintln!("filefacts: {msg}");
             print_usage(true);
@@ -76,6 +84,7 @@ fn main() -> ExitCode {
     };
 
     let Some(root) = args.path.clone() else {
+        eprintln!("filefacts: no path supplied");
         print_usage(true);
         return ExitCode::from(2);
     };
@@ -92,7 +101,15 @@ fn main() -> ExitCode {
                     continue;
                 }
             };
-            for entry in entries.flatten() {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => {
+                        eprintln!("filefacts: cannot read entry in {}: {e}", dir.display());
+                        had_error = true;
+                        continue;
+                    }
+                };
                 let p = entry.path();
                 match entry.file_type() {
                     Ok(ft) if ft.is_dir() => stack.push(p),
@@ -211,19 +228,19 @@ fn build_output(parsed: &filefacts::ParsedFile<'_>, view: View) -> Value {
     .unwrap_or_else(|_| json!({}))
 }
 
-fn parse_args() -> Result<Args, String> {
+enum ParseOutcome {
+    Run(Args),
+    Help,
+    Version,
+}
+
+fn parse_args() -> Result<ParseOutcome, String> {
     let mut args = Args::default();
     let mut iter = std::env::args().skip(1).peekable();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "-h" | "--help" => {
-                print_usage(false);
-                std::process::exit(0);
-            }
-            "-V" | "--version" => {
-                println!("filefacts {}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
-            }
+            "-h" | "--help" => return Ok(ParseOutcome::Help),
+            "-V" | "--version" => return Ok(ParseOutcome::Version),
             "-f" | "--format" => {
                 let Some(value) = iter.next() else {
                     return Err("--format requires terminal or json".into());
@@ -270,7 +287,7 @@ fn parse_args() -> Result<Args, String> {
             }
         }
     }
-    Ok(args)
+    Ok(ParseOutcome::Run(args))
 }
 
 fn parse_format(value: &str) -> Result<Format, String> {
@@ -518,11 +535,7 @@ fn top_level_count(value: &Value) -> Option<usize> {
             // Heading count makes sense for top-level lists of items, not
             // for the fileid bag or the metrics map (whose count is the
             // number of distinct keys, displayed separately).
-            if o.len() <= 6 {
-                None
-            } else {
-                Some(o.len())
-            }
+            if o.len() <= 6 { None } else { Some(o.len()) }
         }
         _ => None,
     }
@@ -562,7 +575,7 @@ fn render_file_header(
     if let Some(e) = entropy {
         subtitle.push(fg(FG_LABEL, &format!("entropy {e:.2}")));
     }
-    if parsed.fileid().extension_mismatch {
+    if parsed.fileid().extension_mismatch() {
         subtitle.push(fg(FG_ERROR, "extension mismatch"));
     }
     if !subtitle.is_empty() {

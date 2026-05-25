@@ -38,6 +38,23 @@ const CSMAGIC_EMBEDDED_ENTITLEMENTS: u32 = 0xfade_7171;
 const CSMAGIC_DER_ENTITLEMENTS: u32 = 0xfade_7172;
 const CSMAGIC_BLOBWRAPPER: u32 = 0xfade_0b01;
 
+/// Maximum recursion depth honoured when decoding Apple Requirement
+/// expressions. Real-world expressions are shallow (a handful of
+/// AND/OR/NOT operators); the cap bounds stack usage on adversarial
+/// blobs that chain operators arbitrarily deep.
+const MAX_REQUIREMENT_DEPTH: u8 = 32;
+
+/// Maximum recursion depth honoured when projecting a parsed plist
+/// into JSON. Bounds stack usage on plists whose value graph nests
+/// arrays and dictionaries beyond what real macOS artifacts emit.
+const MAX_PLIST_DEPTH: u8 = 64;
+
+/// Upper bound on the XML plist payload we hand to `plist::from_bytes`
+/// in `parse_entitlements`. Real entitlements blobs are at most a few
+/// KiB; capping prevents an oversized payload from forcing the plist
+/// parser through megabytes of attacker XML.
+const MAX_ENTITLEMENT_XML_BYTES: usize = 1 << 20;
+
 /// Parse the code-signature blob at offset `sig_off..sig_off+sig_size`
 /// in `bytes` and populate the `macho.code_signature.*` subtree.
 pub(super) fn parse(bytes: &[u8], sig_off: usize, sig_size: usize, values: &mut Values) {
@@ -59,7 +76,9 @@ pub(super) fn parse(bytes: &[u8], sig_off: usize, sig_size: usize, values: &mut 
     let count = read_u32_be(sig, 8) as usize;
     // Each BlobIndex: u32 type, u32 offset (12 bytes header + 8 * count
     // for the index table).
-    let index_end = 12 + count.checked_mul(8).unwrap_or(0);
+    let Some(index_end) = count.checked_mul(8).and_then(|n| n.checked_add(12)) else {
+        return;
+    };
     if index_end > total_len {
         return;
     }
@@ -279,7 +298,7 @@ fn parse_requirements_set(blob: &[u8], values: &mut Values) {
         let expr_start = req_off + 12;
         let expr_end = req_off + req_len;
         let mut cursor = expr_start;
-        let text = decode_expression(blob, &mut cursor, expr_end).unwrap_or_else(|| "?".into());
+        let text = decode_expression(blob, &mut cursor, expr_end, 0).unwrap_or_else(|| "?".into());
         let key = requirement_slot_name(slot_type);
         requirements.insert(key.to_string(), JsonValue::String(text));
     }
@@ -310,7 +329,14 @@ fn requirement_slot_name(slot: u32) -> &'static str {
 /// follow inline with 4-byte alignment between fields. The textual
 /// output matches what Apple's `csreq` / `codesign -d -r-` emit so
 /// values can be diffed directly against those tools' output.
-fn decode_expression(blob: &[u8], cursor: &mut usize, end: usize) -> Option<String> {
+///
+/// `depth` is the recursion level (start at 0). Adversarial blobs can
+/// chain AND/OR/NOT operators to arbitrary depth — cap at
+/// [`MAX_REQUIREMENT_DEPTH`] to keep stack usage bounded.
+fn decode_expression(blob: &[u8], cursor: &mut usize, end: usize, depth: u8) -> Option<String> {
+    if depth > MAX_REQUIREMENT_DEPTH {
+        return None;
+    }
     if *cursor + 4 > end {
         return None;
     }
@@ -337,13 +363,13 @@ fn decode_expression(blob: &[u8], cursor: &mut usize, end: usize) -> Option<Stri
             format!("info[{key}] = \"{val}\"")
         }
         6 => {
-            let left = decode_expression(blob, cursor, end)?;
-            let right = decode_expression(blob, cursor, end)?;
+            let left = decode_expression(blob, cursor, end, depth + 1)?;
+            let right = decode_expression(blob, cursor, end, depth + 1)?;
             format!("({left} and {right})")
         }
         7 => {
-            let left = decode_expression(blob, cursor, end)?;
-            let right = decode_expression(blob, cursor, end)?;
+            let left = decode_expression(blob, cursor, end, depth + 1)?;
+            let right = decode_expression(blob, cursor, end, depth + 1)?;
             format!("({left} or {right})")
         }
         8 => format!(
@@ -351,7 +377,7 @@ fn decode_expression(blob: &[u8], cursor: &mut usize, end: usize) -> Option<Stri
             hex_encode(&read_expr_data(blob, cursor, end)?)
         ),
         9 => {
-            let inner = decode_expression(blob, cursor, end)?;
+            let inner = decode_expression(blob, cursor, end, depth + 1)?;
             format!("!({inner})")
         }
         10 => {
@@ -467,6 +493,9 @@ fn parse_entitlements(blob: &[u8], values: &mut Values) {
         return;
     }
     let xml_bytes = &blob[8..];
+    if xml_bytes.len() > MAX_ENTITLEMENT_XML_BYTES {
+        return;
+    }
     let Ok(parsed) = plist::from_bytes::<plist::Value>(xml_bytes) else {
         // Surface raw text as a fallback so the consumer at least sees
         // what was claimed.
@@ -475,7 +504,7 @@ fn parse_entitlements(blob: &[u8], values: &mut Values) {
         }
         return;
     };
-    let json = plist_to_json(parsed);
+    let json = plist_to_json(parsed, 0);
     values.insert("macho.code_signature.entitlements", json);
 }
 
@@ -507,7 +536,7 @@ fn parse_cms(blob: &[u8], values: &mut Values) {
 }
 
 fn read_u32_be(b: &[u8], off: usize) -> u32 {
-    u32::from_be_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+    crate::formats::common::bytes_at::u32_be(b, off).unwrap_or(0)
 }
 
 fn read_cstr(b: &[u8], off: usize) -> Option<String> {
@@ -573,8 +602,11 @@ fn code_signature_flags(flags: u32) -> Vec<String> {
     out
 }
 
-fn plist_to_json(value: plist::Value) -> JsonValue {
+fn plist_to_json(value: plist::Value, depth: u8) -> JsonValue {
     use plist::Value as P;
+    if depth > MAX_PLIST_DEPTH {
+        return JsonValue::Null;
+    }
     match value {
         P::String(s) => JsonValue::String(s),
         P::Integer(i) => i
@@ -585,11 +617,15 @@ fn plist_to_json(value: plist::Value) -> JsonValue {
         P::Real(f) => serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number),
         P::Boolean(b) => JsonValue::Bool(b),
         P::Date(d) => JsonValue::String(format!("{d:?}")),
-        P::Array(arr) => JsonValue::Array(arr.into_iter().map(plist_to_json).collect()),
+        P::Array(arr) => JsonValue::Array(
+            arr.into_iter()
+                .map(|v| plist_to_json(v, depth + 1))
+                .collect(),
+        ),
         P::Dictionary(dict) => {
             let mut obj = Map::new();
             for (k, v) in dict {
-                obj.insert(k, plist_to_json(v));
+                obj.insert(k, plist_to_json(v, depth + 1));
             }
             JsonValue::Object(obj)
         }

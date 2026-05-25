@@ -30,6 +30,7 @@ use serde::Serialize;
 /// entropy). Optional fields are absent when the value is undefined
 /// for this format or when the section has no on-disk bytes.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct Section {
     /// Section name as the format records it (`.text`, `__TEXT,__text`,
     /// etc.). Empty when the format has no name for this region.
@@ -77,11 +78,6 @@ impl Sections {
         Self::default()
     }
 
-    /// Build from an iterator of [`Section`]s.
-    pub(crate) fn from_iter_sections(iter: impl IntoIterator<Item = Section>) -> Self {
-        Self(iter.into_iter().collect())
-    }
-
     /// Borrow the underlying section vector.
     pub fn as_slice(&self) -> &[Section] {
         &self.0
@@ -113,6 +109,12 @@ impl<'a> IntoIterator for &'a Sections {
     }
 }
 
+impl FromIterator<Section> for Sections {
+    fn from_iter<I: IntoIterator<Item = Section>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,7 +141,7 @@ mod tests {
         assert_eq!(s.iter().count(), 0);
     }
 
-    /// `from_iter_sections` preserves the iterator order — the format
+    /// `FromIterator` preserves the iterator order — the format
     /// extractors emit sections in load-table order, and aggregate
     /// metrics (size-weighted code/data entropy) depend on that order
     /// matching the layout.
@@ -151,7 +153,7 @@ mod tests {
         b.name = ".data".into();
         let mut c = pe_text(0x3000);
         c.name = ".rsrc".into();
-        let sections = Sections::from_iter_sections([a, b, c]);
+        let sections = Sections::from_iter([a, b, c]);
         let names: Vec<&str> = sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec![".text", ".data", ".rsrc"]);
     }
@@ -162,7 +164,7 @@ mod tests {
     /// (which expands to the `IntoIterator` impl).
     #[test]
     fn iter_and_into_iter_agree() {
-        let sections = Sections::from_iter_sections([pe_text(0x1000), pe_text(0x2000)]);
+        let sections = Sections::from_iter([pe_text(0x1000), pe_text(0x2000)]);
         let via_iter: Vec<u64> = sections.iter().map(|s| s.vaddr).collect();
         let via_into: Vec<u64> = (&sections).into_iter().map(|s| s.vaddr).collect();
         assert_eq!(via_iter, via_into);
@@ -174,7 +176,7 @@ mod tests {
     /// so traits authoring against `flags[0]` get a stable position.
     #[test]
     fn json_round_trip_preserves_section_fields() {
-        let sections = Sections::from_iter_sections([pe_text(0x1000)]);
+        let sections = Sections::from_iter([pe_text(0x1000)]);
         let json = serde_json::to_value(&sections).unwrap();
         let arr = json
             .as_array()
@@ -203,7 +205,7 @@ mod tests {
     /// navigate `sections[0].name`.
     #[test]
     fn sections_serializes_as_bare_array_not_wrapped_object() {
-        let sections = Sections::from_iter_sections([pe_text(0x1000)]);
+        let sections = Sections::from_iter([pe_text(0x1000)]);
         let json = serde_json::to_value(&sections).unwrap();
         assert!(
             json.is_array(),

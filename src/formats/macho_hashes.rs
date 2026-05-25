@@ -106,6 +106,12 @@ fn export_hash(symbols: &Symbols) -> Option<String> {
 /// keeps only **external + undefined** entries (`N_EXT` set, type
 /// bits == `N_UNDF`). Names are sorted, comma-joined, MD5'd. The
 /// `nlist` `n_strx == 0` entries are skipped — they have no name.
+///
+/// Unlike the sibling hashers in this module, symhash does **not**
+/// lowercase symbol names. Mach-O linker symbols are case-sensitive
+/// (`_Foo` and `_foo` are distinct symbols), and the canonical
+/// Anomali / YARA-X implementations preserve case — lowercasing here
+/// would diverge from those reference outputs.
 fn symhash(macho: &MachO<'_>) -> Option<String> {
     const N_EXT: u8 = 0x01;
     const N_TYPE_MASK: u8 = 0x0e;

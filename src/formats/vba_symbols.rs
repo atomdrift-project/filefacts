@@ -161,9 +161,25 @@ fn preprocess(source: &str) -> Prepared {
             }
         }
 
-        text.push(bytes[i] as char);
-        map.push(i);
-        i += 1;
+        let byte = bytes[i];
+        if byte.is_ascii() {
+            text.push(byte as char);
+            map.push(i);
+            i += 1;
+        } else {
+            // Preserve the original UTF-8 sequence: a Latin-1 cast
+            // (`byte as char`) would produce mojibake for non-ASCII
+            // identifiers and would also misalign the per-byte offset
+            // map, since one source byte would expand into two UTF-8
+            // bytes in `text` while `map` only recorded one entry.
+            let ch = source[i..].chars().next().unwrap_or('\u{FFFD}');
+            let ch_len = ch.len_utf8();
+            text.push(ch);
+            for _ in 0..ch_len {
+                map.push(i);
+            }
+            i += ch_len;
+        }
     }
 
     Prepared { text, map }

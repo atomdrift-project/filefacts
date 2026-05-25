@@ -235,22 +235,11 @@ pub(super) fn emit(identifiers: &[&str], metrics: &mut Metrics) {
 }
 
 /// Shannon entropy in bits over the byte distribution of `s`.
+/// Thin wrapper around [`crate::scan::entropy::shannon`] so the
+/// math stays in one place and any future tweak (e.g. lazy
+/// histogram construction) lands once.
 pub(super) fn string_entropy(s: &str) -> f64 {
-    if s.is_empty() {
-        return 0.0;
-    }
-    let mut freq = [0u32; 256];
-    let total = s.len();
-    for &b in s.as_bytes() {
-        freq[b as usize] += 1;
-    }
-    freq.iter()
-        .filter(|&&count| count > 0)
-        .map(|&count| {
-            let p = f64::from(count) / total as f64;
-            -p * p.log2()
-        })
-        .sum()
+    crate::scan::entropy::shannon(s.as_bytes())
 }
 
 fn is_hex_like(s: &str) -> bool {

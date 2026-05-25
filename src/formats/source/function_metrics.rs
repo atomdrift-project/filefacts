@@ -64,14 +64,6 @@ fn function_kinds_for(lang: &str) -> &'static [&'static str] {
     }
 }
 
-/// Field name on the function-definition node holding the function's name.
-fn function_name_field(lang: &str) -> &'static str {
-    match lang {
-        "rust" | "go" | "javascript" | "typescript" | "python" | "java" | "php" | "bash" => "name",
-        _ => "name",
-    }
-}
-
 /// Field name on the function-definition node holding the parameter list.
 fn function_params_field(lang: &str) -> &'static str {
     match lang {
@@ -108,7 +100,7 @@ fn collect(
 fn build_info(node: Node<'_>, source: &str, config: &LangConfig, depth: u32) -> FunctionInfo {
     let bytes = source.as_bytes();
     let name = node
-        .child_by_field_name(function_name_field(config.name))
+        .child_by_field_name("name")
         .and_then(|n| n.utf8_text(bytes).ok())
         .map(str::to_string)
         .unwrap_or_default();

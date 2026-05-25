@@ -25,7 +25,7 @@
 //! - `lnk.blocks[]` — Pike-style array of ExtraData block names
 //!   present in the file.
 
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
 use crate::formats::common::{extract_ascii_strings, put_str, put_u64};
@@ -879,11 +879,7 @@ fn parse_filesystem_item(item: &[u8]) -> Option<String> {
         }
         probe += ext_size;
     }
-    if short.is_empty() {
-        None
-    } else {
-        Some(short)
-    }
+    if short.is_empty() { None } else { Some(short) }
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {

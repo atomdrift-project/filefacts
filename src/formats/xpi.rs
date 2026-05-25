@@ -94,8 +94,8 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
 mod tests {
     use super::*;
     use std::io::{Cursor, Write};
-    use zip::write::SimpleFileOptions;
     use zip::CompressionMethod;
+    use zip::write::SimpleFileOptions;
 
     fn build_xpi(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut buf = Vec::new();

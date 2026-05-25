@@ -162,7 +162,9 @@ pub(super) fn extract(
             directory_count += 1;
         } else if header.entry_type() == tar::EntryType::Regular {
             file_count += 1;
-            total_uncompressed += size;
+            // Saturate so a tar built from many huge sparse headers can't
+            // wrap the u64 sum and report a misleadingly small total.
+            total_uncompressed = total_uncompressed.saturating_add(size);
         }
 
         let cls = super::zip::classify_filename(&entry_path_str);
@@ -219,25 +221,38 @@ pub(super) fn extract(
         } else {
             (None, None)
         };
+        let ownership = if mode_octal.is_some()
+            || uid.is_some()
+            || gid.is_some()
+            || uname.is_some()
+            || gname.is_some()
+        {
+            Some(crate::output::ArchiveOwnership {
+                mode_octal,
+                uid,
+                gid,
+                uname,
+                gname,
+            })
+        } else {
+            None
+        };
         archive_members.push(ArchiveMember {
             path,
             size_bytes: size,
-            compressed_size: None,
-            compression_method: None,
-            mtime_unix,
-            mode_octal,
-            uid,
-            gid,
-            uname,
-            gname,
             entry_type: Some(entry_type_label.to_string()),
+            mtime_unix,
             linkname: linkname_str,
             host_os: None,
-            header_offset,
-            data_offset,
-            central_header_offset: None,
             crc32: None,
             encrypted: false,
+            compression: None,
+            ownership,
+            offsets: crate::output::ArchiveOffsets {
+                header: header_offset,
+                data: data_offset,
+                central_header: None,
+            },
         });
 
         members.push(JsonValue::Object(obj));
@@ -494,13 +509,14 @@ mod tests {
         let member = &archive_members[0];
         assert_eq!(member.path, "usr/bin/script.sh");
         assert_eq!(member.size_bytes, b"#!/bin/sh\n".len() as u64);
-        assert_eq!(member.mode_octal, Some(0o755));
-        assert_eq!(member.uid, Some(1000));
-        assert_eq!(member.gid, Some(1000));
+        let ownership = member.ownership.as_ref().expect("tar entry has ownership");
+        assert_eq!(ownership.mode_octal, Some(0o755));
+        assert_eq!(ownership.uid, Some(1000));
+        assert_eq!(ownership.gid, Some(1000));
         assert_eq!(member.mtime_unix, Some(1_700_000_000));
         assert_eq!(member.entry_type.as_deref(), Some("regular"));
-        assert_eq!(member.header_offset, Some(0));
-        assert_eq!(member.data_offset, Some(512));
+        assert_eq!(member.offsets.header, Some(0));
+        assert_eq!(member.offsets.data, Some(512));
     }
 
     #[test]

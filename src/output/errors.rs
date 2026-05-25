@@ -37,18 +37,67 @@
 
 use serde::Serialize;
 
+/// Closed set of failure categories. The JSON wire form serialises
+/// as the lowercase variant name (`"panic"`, `"malformed"`,
+/// `"truncated"`, `"fallback"`) so downstream rules and dashboards
+/// keep working unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum ErrorKind {
+    /// A sub-extractor panicked; surrounding code caught the unwind.
+    Panic,
+    /// The bytes claimed a format but failed strict validation.
+    Malformed,
+    /// The input was cut short of what the format requires.
+    Truncated,
+    /// The strict parse failed but a less-strict path succeeded; the
+    /// data is present but came from a fallback interpretation.
+    Fallback,
+}
+
+/// Extractor / sub-extractor that recorded the failure. Serialises
+/// as kebab-case (`"pe-parse"`, `"pe-resource-walk"`, `"elf-parse"`,
+/// …) — same vocabulary the previous `&'static str` field used,
+/// preserved verbatim so existing rules keep matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum Stage {
+    /// Top-level PE/COFF header parse.
+    PeParse,
+    /// PE resource directory walk.
+    PeResourceWalk,
+    /// Top-level ELF header parse.
+    ElfParse,
+    /// Top-level Mach-O header parse.
+    MachoParse,
+    /// OOXML package open / parts walk.
+    OoxmlParse,
+    /// OLE2 / Compound File Binary open.
+    Ole2Parse,
+    /// ZIP central-directory walk.
+    ZipParse,
+    /// TAR header walk.
+    TarParse,
+    /// Java `.class` parse.
+    ClassParse,
+    /// PDF object scan.
+    PdfParse,
+    /// RPM header parse.
+    RpmParse,
+    /// Generic / catch-all extraction stage.
+    FormatExtract,
+}
+
 /// One non-fatal extraction error.
-///
-/// `kind` and `stage` are `&'static str` rather than enums because
-/// the closed-set vocabulary is small and the JSON wire-format is the
-/// contract; widening either set is a non-breaking schema change.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ParseError {
-    /// Short tag categorising the failure. One of `"panic"`,
-    /// `"malformed"`, `"truncated"`, `"fallback"`.
-    pub kind: &'static str,
-    /// Extractor / sub-extractor name where the failure was caught.
-    pub stage: &'static str,
+    /// Category of the failure.
+    pub kind: ErrorKind,
+    /// Extractor / sub-extractor where the failure was caught.
+    pub stage: Stage,
     /// Verbatim diagnostic message, when available. Empty string
     /// when the failing stage produced no message (raw panic with a
     /// non-string payload, header-only fallback signal, …).
@@ -69,33 +118,32 @@ impl Errors {
         Self::default()
     }
 
-    /// Convenience for the common case — record a panic.
-    pub(crate) fn record_panic(&mut self, stage: &'static str, message: impl Into<String>) {
+    /// Record an extractor failure at the given stage. Replaces the
+    /// older `record_panic` / `record_malformed` / `record_fallback`
+    /// trio with a single entry point.
+    pub(crate) fn record(&mut self, kind: ErrorKind, stage: Stage, message: impl Into<String>) {
         self.0.push(ParseError {
-            kind: "panic",
+            kind,
             stage,
             message: message.into(),
         });
+    }
+
+    /// Convenience for the common case — record a panic.
+    pub(crate) fn record_panic(&mut self, stage: Stage, message: impl Into<String>) {
+        self.record(ErrorKind::Panic, stage, message);
     }
 
     /// Convenience for the common case — record a clean malformed-
     /// header failure.
-    pub(crate) fn record_malformed(&mut self, stage: &'static str, message: impl Into<String>) {
-        self.0.push(ParseError {
-            kind: "malformed",
-            stage,
-            message: message.into(),
-        });
+    pub(crate) fn record_malformed(&mut self, stage: Stage, message: impl Into<String>) {
+        self.record(ErrorKind::Malformed, stage, message);
     }
 
     /// Convenience — record a soft fallback (parse succeeded but
     /// took a less-strict path).
-    pub(crate) fn record_fallback(&mut self, stage: &'static str, message: impl Into<String>) {
-        self.0.push(ParseError {
-            kind: "fallback",
-            stage,
-            message: message.into(),
-        });
+    pub(crate) fn record_fallback(&mut self, stage: Stage, message: impl Into<String>) {
+        self.record(ErrorKind::Fallback, stage, message);
     }
 
     /// Borrow the underlying slice.
@@ -131,17 +179,17 @@ mod tests {
     #[test]
     fn errors_push_and_iterate() {
         let mut errs = Errors::new();
-        errs.record_panic("pe-resource-walk", "out of range");
-        errs.record_fallback("pe-parse", "permissive mode succeeded");
+        errs.record_panic(Stage::PeResourceWalk, "out of range");
+        errs.record_fallback(Stage::PeParse, "permissive mode succeeded");
         assert_eq!(errs.len(), 2);
-        let kinds: Vec<&str> = errs.iter().map(|e| e.kind).collect();
-        assert_eq!(kinds, vec!["panic", "fallback"]);
+        let kinds: Vec<ErrorKind> = errs.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, vec![ErrorKind::Panic, ErrorKind::Fallback]);
     }
 
     #[test]
     fn errors_serialize_omits_empty_message() {
         let mut errs = Errors::new();
-        errs.record_panic("macho-parse", String::new());
+        errs.record_panic(Stage::MachoParse, String::new());
         let json = serde_json::to_value(&errs).unwrap();
         let arr = json.as_array().unwrap();
         let obj = arr[0].as_object().unwrap();
@@ -156,7 +204,7 @@ mod tests {
     #[test]
     fn errors_serialize_as_bare_array() {
         let mut errs = Errors::new();
-        errs.record_malformed("elf-parse", "bad magic");
+        errs.record_malformed(Stage::ElfParse, "bad magic");
         let json = serde_json::to_string(&errs).unwrap();
         // `#[serde(transparent)]` means the collection serializes as
         // a bare JSON array, not `{ "0": [...] }`.

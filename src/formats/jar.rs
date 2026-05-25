@@ -21,7 +21,7 @@
 //! `archive.compression.*`) runs on the same ZIP handle before this
 //! extractor layers JAR-specific facts on top.
 
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek};
 
@@ -207,20 +207,23 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     Ok(())
 }
 
-/// Decompress an entry into a `String`, capped at `MAX_TEXT_BYTES`.
-/// Used for `MANIFEST.MF` and `pom.properties` — both small text
-/// files in any legitimate JAR.
+/// Decompress an entry into a `String`, capped at `MAX_TEXT_BYTES`
+/// of actual decompressed output. Trusting `entry.size()` alone is
+/// unsafe — that value comes from the central-directory header and
+/// can be spoofed by a zip bomb that claims a small uncompressed
+/// length while inflating to gigabytes. Used for `MANIFEST.MF` and
+/// `pom.properties`, both small text files in any legitimate JAR.
 fn read_text<R: std::io::Read + std::io::Seek>(
     zip: &mut ::zip::ZipArchive<R>,
     name: &str,
 ) -> Option<String> {
-    let mut entry = zip.by_name(name).ok()?;
-    if entry.size() > MAX_TEXT_BYTES {
+    let entry = zip.by_name(name).ok()?;
+    let mut buf = Vec::new();
+    entry.take(MAX_TEXT_BYTES + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > MAX_TEXT_BYTES {
         return None;
     }
-    let mut s = String::new();
-    entry.read_to_string(&mut s).ok()?;
-    Some(s)
+    String::from_utf8(buf).ok()
 }
 
 /// Parse a `MANIFEST.MF` text body and return the tracked headers

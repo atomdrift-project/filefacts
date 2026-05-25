@@ -29,7 +29,7 @@
 //!
 //! Metric counts live flat under `pdf.*` and parallel the kv view.
 
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
 use crate::formats::common::extract_ascii_strings;
@@ -40,6 +40,18 @@ use crate::output::{Metrics, Strings, Values};
 /// bytes contain the recognizable invocation patterns analysts
 /// want; the rest is obfuscated runtime. Matches cleave's cap.
 const SNIPPET_BYTES: usize = 200;
+
+/// Upper bound on how many `<id> <gen> obj` dict regions we collect
+/// from a single PDF. Adversarial inputs can stuff millions of
+/// skeleton objects to amplify every downstream pass. Real-world
+/// PDFs hold a few thousand objects; cap with comfortable headroom
+/// and surface a metric so trait rules can spot truncation.
+const MAX_DICT_REGIONS: usize = 50_000;
+
+/// Upper bound on how many form-field rects we run the O(n²)
+/// overlap check across. Real PDFs hold a handful per page; with
+/// thousands of widgets the pairwise pass dominates parse time.
+const MAX_OVERLAP_RECTS: usize = 2_000;
 
 pub(super) fn extract(
     bytes: &[u8],
@@ -251,6 +263,12 @@ pub(super) fn extract(
     // PDFs may show fewer source labels than cleave's xref-aware
     // parser. The `kind` and `snippet` fields stay accurate.
     let dict_regions = collect_dict_regions(bytes);
+    if dict_regions.len() >= MAX_DICT_REGIONS {
+        // Signal to trait rules that the object-graph scan stopped
+        // early. The cap is a DoS guard, not a sizing heuristic, so
+        // anything that hits it is well outside the real-world range.
+        metrics.insert("pdf.dict_region_truncated", 1.0);
+    }
     let actions = scan_actions(bytes, &dict_regions);
     let uri_action_count = action_count_by_kind(&actions, "uri");
     let javascript_action_count = action_count_by_kind(&actions, "javascript");
@@ -679,11 +697,17 @@ struct DictRegion {
 
 /// Walk every `<id> <gen> obj` … (`stream`|`endobj`) block. Each
 /// returned region carries the dict byte range and, when a stream
-/// body was present, the stream byte range too.
+/// body was present, the stream byte range too. Output is capped
+/// at [`MAX_DICT_REGIONS`] entries — adversarial inputs that stuff
+/// millions of skeleton objects would otherwise turn every
+/// downstream pass into a quadratic walk.
 fn collect_dict_regions(bytes: &[u8]) -> Vec<DictRegion> {
     let mut out = Vec::new();
     let mut pos = 0;
     while pos < bytes.len() {
+        if out.len() >= MAX_DICT_REGIONS {
+            break;
+        }
         let Some(rel) = bytes[pos..].windows(3).position(|w| w == b"obj") else {
             break;
         };
@@ -1683,24 +1707,17 @@ fn inflate(input: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Substring count using a simple sliding window. Fast enough on
-/// the file sizes we care about; replace with `memmem` if profiles
-/// flag it.
+/// Non-overlapping substring count via the `memchr` SIMD-accelerated
+/// `memmem` searcher. Roughly an order of magnitude faster than the
+/// hand-rolled sliding window we used previously, and the worst-case
+/// cost on adversarial inputs (long near-matches that repeatedly
+/// reset a naive scan) stays linear.
+#[must_use]
 fn count_substring(bytes: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() || bytes.len() < needle.len() {
         return 0;
     }
-    let mut count = 0;
-    let mut i = 0;
-    while i + needle.len() <= bytes.len() {
-        if &bytes[i..i + needle.len()] == needle {
-            count += 1;
-            i += needle.len();
-        } else {
-            i += 1;
-        }
-    }
-    count
+    memchr::memmem::find_iter(bytes, needle).count()
 }
 
 fn contains_substring(bytes: &[u8], needle: &[u8]) -> bool {
@@ -1749,6 +1766,7 @@ fn count_type_occurrences(bytes: &[u8], name: &[u8]) -> usize {
 /// Whole-token count — requires the match to be followed by a
 /// non-name character (whitespace, delimiter, paren, etc.) so
 /// `obj` doesn't match `objstm` and `endobj` doesn't double-count.
+#[must_use]
 fn count_token(bytes: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() || bytes.len() < needle.len() {
         return 0;
@@ -1877,11 +1895,15 @@ fn derive_form_field_metrics(fields: &[JsonValue], metrics: &mut Metrics) {
 
     // Overlapping-pair count: O(n²) intersection check. PDF rects
     // are [x_lo, y_lo, x_hi, y_hi] but some producers swap the
-    // hi/lo pairs, so normalize before intersecting.
+    // hi/lo pairs, so normalize before intersecting. Capped at
+    // `MAX_OVERLAP_RECTS` widgets so an adversarial AcroForm with
+    // hundreds of thousands of fields can't dominate parse time —
+    // anything beyond the cap is itself the forensic signal.
+    let overlap_window = rects.len().min(MAX_OVERLAP_RECTS);
     let mut overlapping = 0_u32;
-    for i in 0..rects.len() {
+    for i in 0..overlap_window {
         let a = normalize_rect(rects[i]);
-        for b_raw in rects.iter().skip(i + 1) {
+        for b_raw in rects[i + 1..overlap_window].iter() {
             let b = normalize_rect(*b_raw);
             if rects_overlap(a, b) {
                 overlapping = overlapping.saturating_add(1);
@@ -1892,6 +1914,9 @@ fn derive_form_field_metrics(fields: &[JsonValue], metrics: &mut Metrics) {
         "pdf.overlapping_form_field_pair_count",
         f64::from(overlapping),
     );
+    if rects.len() > MAX_OVERLAP_RECTS {
+        metrics.insert("pdf.overlap_check_truncated", 1.0);
+    }
 }
 
 fn parse_rect(s: &str) -> Option<[f64; 4]> {

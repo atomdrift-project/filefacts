@@ -75,36 +75,27 @@ pub mod fileid;
 /// CLIs can mute it during scans (`scoped_disable`), reap in-flight
 /// workers (`kill_all_rizin_groups`) from a signal handler, and emit
 /// `tracing` telemetry (`log_stats`) at shutdown.
-pub mod rizin {
-    pub use crate::rizin_impl::{
-        available, disable, is_disabled, kill_all_rizin_groups, log_stats, scoped_disable, stats,
-        ScopedDisable,
-    };
-}
+pub mod rizin;
 
-#[path = "rizin.rs"]
-mod rizin_impl;
-
-/// VBA `<non-literal>` sentinel re-export.
-///
-/// Re-exported from the internal `formats::vba_symbols` module so
-/// downstream crates can compare against it without learning a
-/// private path. The full extractor stays internal: VBA symbols flow
-/// out through the unified [`Symbols`] view like every other format,
-/// not through a format-specific public function.
-pub mod vba_symbols {
-    pub use crate::formats::vba_symbols::NON_LITERAL_SENTINEL;
-}
+/// VBA `<non-literal>` sentinel — the placeholder a VBA symbol's
+/// `target` field takes when the call was made through a variable
+/// or expression rather than a quoted literal. Re-exported flat from
+/// the internal extractor so downstream crates can compare against
+/// it without learning a private path. The extractor itself stays
+/// internal; VBA symbols flow out through the unified [`Symbols`]
+/// view like every other format.
+pub use formats::vba_symbols::NON_LITERAL_SENTINEL as VBA_NON_LITERAL_SENTINEL;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 pub use error::Error;
 pub use fileid::{FileId, FileType};
 pub use output::{
-    ArchiveMember, Arg, ArgShape, Errors, ExtractedString, Literals, Metrics, ParseError, Section,
-    Sections, Symbol, SymbolKind, Symbols, Text, Values,
+    ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Arg, ArgShape, ErrorKind,
+    Errors, ExtractedString, Literals, Metrics, ParseError, Section, Sections, Stage, Symbol,
+    SymbolKind, Symbols, Text, Values,
 };
 
 /// Schema version of the public output shape.
@@ -142,6 +133,7 @@ pub const SCHEMA_VERSION: &str = "6";
 /// [`values`]: ParsedFile::values
 /// [`strings`]: ParsedFile::strings
 /// [`metrics`]: ParsedFile::metrics
+#[must_use = "ParsedFile owns the extraction pipeline; dropping it discards every view"]
 pub struct ParsedFile<'a> {
     bytes: &'a [u8],
     fileid: FileId,
@@ -354,13 +346,15 @@ fn run_extraction(
         file_type,
         bytes,
         tree_cache,
-        &mut values,
-        &mut strings,
-        &mut metrics,
-        &mut archive_members,
-        &mut sections,
-        &mut symbols,
-        &mut errors,
+        formats::ExtractCtx {
+            values: &mut values,
+            strings: &mut strings,
+            metrics: &mut metrics,
+            archive_members: &mut archive_members,
+            sections: &mut sections,
+            symbols: &mut symbols,
+            errors: &mut errors,
+        },
     ) {
         // The format extractor bailed entirely. Surface that as a
         // `malformed` entry so cleave can see *why* the
@@ -374,7 +368,7 @@ fn run_extraction(
     if let Some(cache) = tree_cache {
         formats::source::build_symbols(cache, &mut symbols, &mut metrics);
     }
-    let sections = Sections::from_iter_sections(sections);
+    let sections = Sections::from_iter(sections);
     // Aggregate metrics derived from sections — mirrors the
     // `sections.*` path convention.
     if !sections.is_empty() {
@@ -474,24 +468,24 @@ fn is_sentence_like(text: &str) -> bool {
     tokens >= 3 && alpha_tokens >= 2
 }
 
-/// Map a [`FileType`] to the short `stage` tag we use when an
+/// Map a [`FileType`] to the [`Stage`] we tag against when an
 /// extractor returns `Err` and we have to synthesise a fallback
-/// error record. Stage tags are stable across releases.
-fn stage_for(file_type: FileType) -> &'static str {
+/// error record. Stage values are stable across releases.
+fn stage_for(file_type: FileType) -> Stage {
     match file_type {
-        FileType::Pe => "pe-parse",
-        FileType::Elf => "elf-parse",
-        FileType::MachO => "macho-parse",
-        FileType::Ooxml => "ooxml-parse",
-        FileType::OleDoc => "ole2-parse",
-        FileType::Zip | FileType::Crx | FileType::Odf | FileType::Jar => "zip-parse",
+        FileType::Pe => Stage::PeParse,
+        FileType::Elf => Stage::ElfParse,
+        FileType::MachO => Stage::MachoParse,
+        FileType::Ooxml => Stage::OoxmlParse,
+        FileType::OleDoc => Stage::Ole2Parse,
+        FileType::Zip | FileType::Crx | FileType::Odf | FileType::Jar => Stage::ZipParse,
         FileType::Tar | FileType::TarGz | FileType::TarBz2 | FileType::TarXz | FileType::TarZst => {
-            "tar-parse"
+            Stage::TarParse
         }
-        FileType::JavaClass => "class-parse",
-        FileType::Pdf => "pdf-parse",
-        FileType::Rpm => "rpm-parse",
-        _ => "format-extract",
+        FileType::JavaClass => Stage::ClassParse,
+        FileType::Pdf => Stage::PdfParse,
+        FileType::Rpm => Stage::RpmParse,
+        _ => Stage::FormatExtract,
     }
 }
 
@@ -797,15 +791,14 @@ pub fn open_with_path<'a>(path: &Path, bytes: &'a [u8]) -> Result<ParsedFile<'a>
     })
 }
 
-/// Read a file from disk, identify it, and return a `ParsedFile` plus
-/// the owned bytes buffer.
+/// Read a file from disk, identify it, and return its bytes paired
+/// with a [`FileId`].
 ///
-/// The bytes are returned separately because `ParsedFile` borrows them
-/// — the caller must keep the `Vec<u8>` alive for as long as the
-/// `ParsedFile` is in scope. For one-shot use, write:
+/// The bytes are returned so the caller can pass them on to
+/// [`open_with_path`] without re-reading the file:
 ///
 /// ```no_run
-/// let bytes = std::fs::read("sample.exe")?;
+/// let (bytes, _id) = filefacts::from_path(std::path::Path::new("sample.exe"))?;
 /// let parsed = filefacts::open_with_path(std::path::Path::new("sample.exe"), &bytes)?;
 /// # Ok::<(), filefacts::Error>(())
 /// ```
@@ -967,8 +960,8 @@ mod tests {
         let errors = parsed.errors();
         assert!(!errors.is_empty(), "expected a malformed-elf error entry");
         let entry = errors.iter().next().unwrap();
-        assert_eq!(entry.kind, "malformed");
-        assert_eq!(entry.stage, "elf-parse");
+        assert_eq!(entry.kind, ErrorKind::Malformed);
+        assert_eq!(entry.stage, Stage::ElfParse);
 
         // Aggregate count metric.
         assert!(parsed.metrics().get("parse.error_count").is_some());

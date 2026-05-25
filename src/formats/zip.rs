@@ -20,6 +20,15 @@ use zip::{CompressionMethod, ZipArchive};
 use crate::error::Error;
 use crate::output::{ArchiveMember, Metrics, Values};
 
+/// Upper bound on how many entries we'll preallocate for when reading
+/// a zip's central directory. Zip64 lets the entry count run to 2^64,
+/// and the count lands in the EOCD before any byte of any entry has
+/// been verified — so it's attacker-controlled. 65_536 fits a generous
+/// real-world archive (the JDK ships a few thousand classes per jar);
+/// anything beyond that should grow on demand rather than be reserved
+/// up front.
+pub(super) const MAX_ZIP_MEMBERS: usize = 65_536;
+
 pub(super) fn open_archive(bytes: &[u8]) -> Result<ZipArchive<Cursor<&[u8]>>, Error> {
     ZipArchive::new(Cursor::new(bytes)).map_err(|e| Error::malformed("zip", e.to_string()))
 }
@@ -51,7 +60,11 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         metrics.insert("archive.comment_size", comment.len() as f64);
     }
 
-    let mut members: Vec<JsonValue> = Vec::with_capacity(archive.len());
+    // Cap the preallocation: `archive.len()` is the central-directory
+    // entry count, which on Zip64 is attacker-controlled up to 2^64.
+    // A malicious archive claiming millions of entries would OOM the
+    // process before we walked the first one.
+    let mut members: Vec<JsonValue> = Vec::with_capacity(archive.len().min(MAX_ZIP_MEMBERS));
     let mut compression_counts: std::collections::BTreeMap<String, u64> =
         std::collections::BTreeMap::new();
     let mut entry_type_counts: std::collections::BTreeMap<String, u64> =
@@ -314,22 +327,25 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         archive_members.push(ArchiveMember {
             path: name,
             size_bytes: uncompressed,
-            compressed_size: Some(compressed),
-            compression_method: Some(method.to_string()),
-            mtime_unix,
-            mode_octal,
-            uid: None,
-            gid: None,
-            uname: None,
-            gname: None,
             entry_type: Some(entry_type.to_string()),
+            mtime_unix,
             linkname: None,
             host_os: None,
-            header_offset: Some(entry.header_start()),
-            data_offset: Some(entry.data_start()),
-            central_header_offset: Some(entry.central_header_start()),
             crc32: Some(entry.crc32()),
             encrypted,
+            compression: Some(crate::output::ArchiveCompression {
+                compressed_size: Some(compressed),
+                method: Some(method.to_string()),
+            }),
+            ownership: mode_octal.map(|mode| crate::output::ArchiveOwnership {
+                mode_octal: Some(mode),
+                ..Default::default()
+            }),
+            offsets: crate::output::ArchiveOffsets {
+                header: Some(entry.header_start()),
+                data: Some(entry.data_start()),
+                central_header: Some(entry.central_header_start()),
+            },
         });
         members.push(JsonValue::Object(obj));
     }

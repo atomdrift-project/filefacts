@@ -558,7 +558,7 @@ fn format_iso8601_utc(unix: u64) -> String {
 }
 
 fn read_u32_le(buf: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+    crate::formats::common::bytes_at::u32_le(buf, off).unwrap_or(0)
 }
 
 /// Parsed CompObj stream contents.
@@ -867,7 +867,7 @@ mod tests {
         out.extend_from_slice(&[0u8; 4]); // OS
         out.extend_from_slice(&[0u8; 16]); // CLSID
         out.extend_from_slice(&1u32.to_le_bytes()); // section count
-                                                    // Section header: 16-byte FMTID + 4-byte offset.
+        // Section header: 16-byte FMTID + 4-byte offset.
         out.extend_from_slice(&[0u8; 16]); // FMTID
         out.extend_from_slice(&48u32.to_le_bytes()); // section starts at byte 48
 
@@ -1087,10 +1087,12 @@ mod tests {
             dangerous[0]["clsid"].as_str(),
             Some("0002ce02-0000-0000-c000-000000000046")
         );
-        assert!(dangerous[0]["name"]
-            .as_str()
-            .unwrap()
-            .contains("Equation Editor"));
+        assert!(
+            dangerous[0]["name"]
+                .as_str()
+                .unwrap()
+                .contains("Equation Editor")
+        );
         assert_eq!(dangerous[0]["storage"].as_str(), Some("/EQUATION"));
         assert_eq!(m.get("office.dangerous_clsid_count"), Some(1.0));
 

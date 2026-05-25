@@ -25,7 +25,7 @@
 //! "rich pv" or "rich hash" malware-clustering signal.
 
 use md5::{Digest, Md5};
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 
 use crate::formats::common::{hex_encode, put_str, put_u64};
 use crate::output::Values;

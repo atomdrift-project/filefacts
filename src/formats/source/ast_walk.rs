@@ -516,8 +516,7 @@ fn is_class_scope(kind: &str, language: &str) -> bool {
 
 fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
-    let first = node.named_children(&mut cursor).next();
-    first
+    node.named_children(&mut cursor).next()
 }
 
 fn is_string_concat_root(node: Node<'_>, config: &LangConfig) -> bool {

@@ -16,7 +16,20 @@
 
 use crate::error::Error;
 use crate::fileid::FileType;
-use crate::output::{ArchiveMember, Errors, Metrics, Section, Strings, Values};
+use crate::output::{ArchiveMember, Errors, Metrics, Section, Strings, Symbols, Values};
+
+/// Mutable output collectors that every format extractor writes into.
+/// Bundled to keep the [`extract`] dispatch signature manageable and
+/// to give future extractors a single place to grow new views.
+pub(crate) struct ExtractCtx<'a> {
+    pub(crate) values: &'a mut Values,
+    pub(crate) strings: &'a mut Strings,
+    pub(crate) metrics: &'a mut Metrics,
+    pub(crate) archive_members: &'a mut Vec<ArchiveMember>,
+    pub(crate) sections: &'a mut Vec<Section>,
+    pub(crate) symbols: &'a mut Symbols,
+    pub(crate) errors: &'a mut Errors,
+}
 
 mod binary_attribution;
 mod build_toolchain;
@@ -66,24 +79,21 @@ mod zip;
 /// Drive the right extractor for `file_type` and merge its output into
 /// the public views. Unsupported types fall through to [`generic::extract`]
 /// (which still records `file.size_bytes` and Shannon entropy).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn extract(
     file_type: FileType,
     bytes: &[u8],
     tree_cache: Option<&source::TreeCache<'_>>,
-    values: &mut Values,
-    strings: &mut Strings,
-    metrics: &mut Metrics,
-    archive_members: &mut Vec<ArchiveMember>,
-    sections: &mut Vec<Section>,
-    symbols: &mut crate::Symbols,
-    errors: &mut Errors,
+    ctx: ExtractCtx<'_>,
 ) -> Result<(), Error> {
-    // Only PE / ELF / Mach-O record structured `Errors` today.
-    // Other extractors will start populating it as their goblin/zip
-    // / CFB calls grow panic-safe wrappers. Suppress the
-    // unused-mut warning on the binding until then.
-    let _ = &mut *errors;
+    let ExtractCtx {
+        values,
+        strings,
+        metrics,
+        archive_members,
+        sections,
+        symbols,
+        errors,
+    } = ctx;
     // Every file gets the generic byte-level metrics. Format-specific
     // extractors layer on top of (and may shadow with more accurate
     // values) what generic emits.

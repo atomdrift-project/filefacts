@@ -21,7 +21,7 @@
 //!   presence signals: `apng`, `exif`, `icc`, `trailing_data`,
 //!   `post_iend_chunks`.
 
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
 use crate::formats::common::extract_ascii_strings;

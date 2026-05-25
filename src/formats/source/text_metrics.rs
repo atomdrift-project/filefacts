@@ -35,7 +35,7 @@ fn emit_byte_metrics(bytes: &[u8], metrics: &mut Metrics) {
         return;
     }
 
-    let mut freq = [0u32; 256];
+    let mut freq = [0u64; 256];
     let mut non_ascii = 0usize;
     let mut non_printable = 0usize;
     let mut null_count = 0u32;
@@ -56,15 +56,7 @@ fn emit_byte_metrics(bytes: &[u8], metrics: &mut Metrics) {
     }
 
     let unique_chars = freq.iter().filter(|&&c| c > 0).count() as u32;
-
-    let entropy: f64 = freq
-        .iter()
-        .filter(|&&count| count > 0)
-        .map(|&count| {
-            let p = f64::from(count) / total as f64;
-            -p * p.log2()
-        })
-        .sum();
+    let entropy = crate::scan::entropy::shannon_from_histogram(&freq, total);
 
     // Most common non-whitespace byte
     let most_common = freq
@@ -75,7 +67,7 @@ fn emit_byte_metrics(bytes: &[u8], metrics: &mut Metrics) {
         .map(|(b, _)| b as u8);
 
     let most_common_ratio = most_common
-        .map(|c| f64::from(freq[c as usize]) / total as f64)
+        .map(|c| freq[c as usize] as f64 / total as f64)
         .unwrap_or(0.0);
 
     if entropy > 0.0 {

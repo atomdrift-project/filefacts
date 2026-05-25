@@ -266,7 +266,9 @@ impl OoxmlIndex {
 }
 
 fn zip_entry_names<R: Read + std::io::Seek>(zip: &mut ::zip::ZipArchive<R>) -> Vec<String> {
-    let mut names = Vec::with_capacity(zip.len());
+    // Cap the prealloc: `zip.len()` is the central-directory entry
+    // count, attacker-controlled on Zip64. See `zip::MAX_ZIP_MEMBERS`.
+    let mut names = Vec::with_capacity(zip.len().min(super::zip::MAX_ZIP_MEMBERS));
     for i in 0..zip.len() {
         if let Ok(entry) = zip.by_index(i) {
             names.push(entry.name().to_string());
@@ -833,8 +835,8 @@ mod tests {
     use crate::output::{Metrics, Values};
     use std::io::Cursor;
     use std::io::Write;
-    use zip::write::{SimpleFileOptions, ZipWriter};
     use zip::CompressionMethod;
+    use zip::write::{SimpleFileOptions, ZipWriter};
 
     fn run(bytes: &[u8]) -> (Values, Metrics) {
         let mut v = Values::new();
@@ -1219,10 +1221,12 @@ mod tests {
             .and_then(|x| x.as_array())
             .unwrap();
         assert_eq!(rels[0]["type"].as_str(), Some("oleObject"));
-        assert!(rels[0]["target"]
-            .as_str()
-            .unwrap()
-            .starts_with("\\\\10.0.0.5"));
+        assert!(
+            rels[0]["target"]
+                .as_str()
+                .unwrap()
+                .starts_with("\\\\10.0.0.5")
+        );
     }
 
     #[test]

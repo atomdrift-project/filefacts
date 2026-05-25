@@ -4,7 +4,7 @@
 //! (`parse_count() == 1` after exercising all views) so the contract
 //! holds for downstream embedders.
 
-use filefacts::{open, open_with_path, FileType, Symbol, SymbolKind};
+use filefacts::{FileType, Symbol, SymbolKind, open, open_with_path};
 
 /// Convenience: collect every call target (`Symbol::Call.target`) from a
 /// parsed file, dropping dynamic-callee entries.
@@ -101,10 +101,12 @@ fn zip_archive_emits_member_listing_and_aggregates() {
             .expect("zip member central_header_offset");
         assert!(data_offset > header_offset);
         assert!(central_header_offset > data_offset);
-        assert!(member
-            .get("crc32")
-            .and_then(serde_json::Value::as_u64)
-            .is_some());
+        assert!(
+            member
+                .get("crc32")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+        );
     }
 
     let typed_members = parsed.archive_members();
@@ -118,19 +120,19 @@ fn zip_archive_emits_member_listing_and_aggregates() {
             member
                 .get("header_offset")
                 .and_then(serde_json::Value::as_u64),
-            typed.header_offset
+            typed.offsets.header
         );
         assert_eq!(
             member
                 .get("data_offset")
                 .and_then(serde_json::Value::as_u64),
-            typed.data_offset
+            typed.offsets.data
         );
         assert_eq!(
             member
                 .get("central_header_offset")
                 .and_then(serde_json::Value::as_u64),
-            typed.central_header_offset
+            typed.offsets.central_header
         );
         assert_eq!(
             member.get("crc32").and_then(serde_json::Value::as_u64),

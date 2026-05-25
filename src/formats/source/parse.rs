@@ -26,9 +26,31 @@ use std::cell::RefCell;
 /// bundles) and gain little from AST analysis anyway.
 const MAX_AST_FILE_BYTES: usize = 2 * 1024 * 1024;
 
-/// Python's external scanner stores the indent stack roughly two bytes
-/// per level. 450 levels leaves headroom below the 1024-byte buffer.
-const MAX_SAFE_PYTHON_INDENT_STACK_DEPTH: usize = 450;
+/// Budget for the **combined** Python scanner state. Layout per
+/// `tree_sitter_python_external_scanner_serialize` (`scanner.c`):
+///
+/// ```text
+/// 1 byte   inside_interpolated_string
+/// 1 byte   delimiter_count (clamped to UINT8_MAX = 255)
+/// N bytes  delimiters (N = clamped count)
+/// 2*M B    indent stack (M = indents.size - 1, since indents[0] is
+///          always 0 and the serializer's loop starts at iter = 1)
+/// ```
+///
+/// The upstream serializer has an off-by-one: its loop guard is
+/// `size < 1024`, but each iteration writes 2 bytes, so the final
+/// returned size can reach 1025 (the assert is `length <= 1024`).
+/// Pick 1020 as the budget to stay clear of the boundary with one
+/// indent of slack.
+const PYTHON_SCANNER_BUDGET_BYTES: usize = 1020;
+
+/// Per-string-literal byte cost in the delimiter portion of the
+/// scanner state.
+const PYTHON_DELIMITER_BYTES: usize = 1;
+
+/// Per-indent-level byte cost in the indent portion of the scanner
+/// state.
+const PYTHON_INDENT_BYTES_PER_LEVEL: usize = 2;
 
 thread_local! {
     /// One tree-sitter parser per worker thread, reused across files.
@@ -100,16 +122,37 @@ fn would_overflow_scanner_state(file_type: FileType, source: &str) -> bool {
         return true;
     }
     if matches!(file_type, FileType::Python)
-        && estimated_python_indent_stack_depth(source) > MAX_SAFE_PYTHON_INDENT_STACK_DEPTH
+        && estimated_python_scanner_bytes(source) > PYTHON_SCANNER_BUDGET_BYTES
     {
         return true;
     }
     false
 }
 
-/// Worst-case depth of Python's indent stack — what the tree-sitter
-/// external scanner serializes. Computed without parsing so it stays
-/// cheap on hostile input.
+/// Worst-case Python scanner serialization size. Models both the
+/// **indent stack** and the **delimiter stack** the scanner persists,
+/// since either one alone — or the two together — can exceed the
+/// 1024-byte buffer and trip `ts_parser__external_scanner_serialize`.
+/// Computed without invoking the parser so it stays cheap on hostile
+/// input.
+///
+/// Returned value is in bytes and includes the 2-byte header that
+/// the serializer emits before either stack.
+fn estimated_python_scanner_bytes(source: &str) -> usize {
+    // 1 byte `inside_interpolated_string` + 1 byte `delimiter_count`.
+    const HEADER_BYTES: usize = 2;
+    let indent_levels = estimated_python_indent_stack_depth(source);
+    let delim_levels = estimated_python_delimiter_depth(source);
+    // The serializer's `iter = 1` start skips `indents[0]` (always 0),
+    // so the persisted indent count is `indent_levels.saturating_sub(1)`.
+    let indent_bytes = indent_levels.saturating_sub(1) * PYTHON_INDENT_BYTES_PER_LEVEL;
+    // Delimiter count is clamped to UINT8_MAX inside the serializer.
+    let delim_bytes = delim_levels.min(u8::MAX as usize) * PYTHON_DELIMITER_BYTES;
+    HEADER_BYTES + delim_bytes + indent_bytes
+}
+
+/// Worst-case depth of Python's indent stack — one of the two stacks
+/// the tree-sitter external scanner persists.
 fn estimated_python_indent_stack_depth(source: &str) -> usize {
     let mut stack: Vec<usize> = vec![0];
     let mut max_depth: usize = 1;
@@ -134,6 +177,60 @@ fn estimated_python_indent_stack_depth(source: &str) -> usize {
     max_depth
 }
 
+/// Worst-case depth of Python's delimiter stack — the other stack the
+/// scanner persists. The scanner pushes one entry per open string
+/// literal that hasn't closed yet; the only path that grows it beyond
+/// a single entry is f-string interpolation, where `f"{ ... }"` may
+/// itself contain another `f"..."`.
+///
+/// We can't parse Python here without running tree-sitter, so we use
+/// the simplest correct upper bound: every `f"`, `f'`, `F"`, or `F'`
+/// found in the source is a potential push. Brackets that an f-string
+/// might close (`}`) are accounted for by walking the bytes and
+/// tracking the maximum unmatched `f`-prefix count between the
+/// surrounding `{` and `}` boundaries. Triple-quoted f-strings count
+/// once each (they consume a single delimiter slot).
+fn estimated_python_delimiter_depth(source: &str) -> usize {
+    let bytes = source.as_bytes();
+    let mut max_depth: usize = 0;
+    let mut depth: usize = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            // Skip past a hash-line comment — `f"` inside a comment is
+            // not a delimiter push.
+            b'#' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            // An `f`/`F` immediately followed by a quote opens an
+            // f-string. Plain (non-f) strings never *nest*, so we
+            // only need to count f-string openers.
+            b'f' | b'F' => {
+                let next = bytes.get(i + 1).copied().unwrap_or(0);
+                if next == b'"' || next == b'\'' {
+                    depth = depth.saturating_add(1);
+                    max_depth = max_depth.max(depth);
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            // A closing brace inside interpolation drops one level of
+            // f-string nesting. Worst-case heuristic: every `}` could
+            // close an f-string interpolation, so decrement.
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    max_depth
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,9 +243,32 @@ mod tests {
 
     #[test]
     fn skips_deep_python_indentation() {
+        // Indent levels alone large enough to exceed the budget when
+        // even a tiny delimiter stack is added on top.
         let mut source = String::new();
-        for depth in 0..=MAX_SAFE_PYTHON_INDENT_STACK_DEPTH + 8 {
+        for depth in 0..600 {
             source.push_str(&" ".repeat(depth * 2));
+            source.push_str("if True:\n");
+        }
+        assert!(would_overflow_scanner_state(FileType::Python, &source));
+    }
+
+    /// Adversarial Python that pushes BOTH the indent stack and the
+    /// delimiter stack hard enough that the combined serialized state
+    /// exceeds the 1024-byte buffer — even though each stack on its
+    /// own would stay under the upstream serializer's clamps. The
+    /// pre-existing indent-only guard at 450 levels missed this
+    /// scenario; the budget-based check catches it.
+    #[test]
+    fn skips_combined_indent_and_fstring_pressure() {
+        let mut source = String::new();
+        // Bury an open f-string deep enough that the delimiter stack
+        // carries 255 entries when the indent stack is also large.
+        for _ in 0..255 {
+            source.push_str("f\"{");
+        }
+        for depth in 0..400 {
+            source.push_str(&" ".repeat(depth + 1));
             source.push_str("if True:\n");
         }
         assert!(would_overflow_scanner_state(FileType::Python, &source));
@@ -161,12 +281,34 @@ mod tests {
     }
 
     #[test]
+    fn allows_realistic_fstring_usage() {
+        let source = r#"
+def greet(name, count):
+    return f"hello {name}, you have {count} messages, {f'~{count*2}~'} doubled"
+"#;
+        assert!(!would_overflow_scanner_state(FileType::Python, source));
+    }
+
+    #[test]
     fn deep_indentation_ignored_for_non_python() {
         let mut source = String::new();
-        for depth in 0..=MAX_SAFE_PYTHON_INDENT_STACK_DEPTH + 8 {
+        for depth in 0..600 {
             source.push_str(&" ".repeat(depth * 2));
             source.push_str("echo hi\n");
         }
         assert!(!would_overflow_scanner_state(FileType::Shell, &source));
+    }
+
+    #[test]
+    fn scanner_bytes_estimator_tracks_both_stacks() {
+        let plain = "x = 1\n";
+        let n_plain = estimated_python_scanner_bytes(plain);
+        // 2-byte header + 0 delimiter + 0 indent (single line, no block).
+        assert_eq!(n_plain, 2);
+
+        let nested = "x = f\"{f\"{1}\"}\"\n";
+        let n_nested = estimated_python_scanner_bytes(nested);
+        // 2 header + 2 delimiters + 0 indent.
+        assert_eq!(n_nested, 4);
     }
 }

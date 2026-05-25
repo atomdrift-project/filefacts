@@ -336,10 +336,10 @@ fn verify_rsa(
     signed_message: &[u8],
     signature: &[u8],
 ) -> VerifyOutcome {
+    use rsa::RsaPublicKey;
     use rsa::pkcs1::DecodeRsaPublicKey;
     use rsa::pkcs1v15::{Signature, VerifyingKey};
     use rsa::signature::Verifier;
-    use rsa::RsaPublicKey;
     use sha1::Sha1;
     use sha2::{Sha256, Sha384, Sha512};
 
@@ -413,7 +413,7 @@ fn verify_ecdsa(
 
     match (&curve, digest_oid) {
         (NamedCurve::P256, "2.16.840.1.101.3.4.2.1") => {
-            use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+            use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
             let Ok(vk) = VerifyingKey::from_sec1_bytes(pubkey_sec1) else {
                 return VerifyOutcome::Unsupported;
             };
@@ -427,7 +427,7 @@ fn verify_ecdsa(
             }
         }
         (NamedCurve::P384, "2.16.840.1.101.3.4.2.2") => {
-            use p384::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+            use p384::ecdsa::{Signature, VerifyingKey, signature::Verifier};
             let Ok(vk) = VerifyingKey::from_sec1_bytes(pubkey_sec1) else {
                 return VerifyOutcome::Unsupported;
             };
@@ -534,10 +534,10 @@ fn find_signer_cert<'a>(
 ) -> Option<&'a x509_cert::Certificate> {
     let bag = signed_data.certificates.as_ref()?;
     for entry in bag.0.iter() {
-        let cms::cert::CertificateChoices::Certificate(ref cert) = entry else {
+        let cms::cert::CertificateChoices::Certificate(cert) = entry else {
             continue;
         };
-        let cms::signed_data::SignerIdentifier::IssuerAndSerialNumber(ref isn) = signer.sid else {
+        let cms::signed_data::SignerIdentifier::IssuerAndSerialNumber(isn) = &signer.sid else {
             // SubjectKeyIdentifier matching for `subject_key_identifier`
             // variant is uncommon in Authenticode; skip.
             continue;

@@ -36,13 +36,19 @@ use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 
+/// Shared bincode configuration. The 2.x API requires an explicit
+/// config object; pick the legacy variant (little-endian, varint
+/// length encoding) for output that's competitive in size with the
+/// 1.x default we used previously.
+const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
+
 /// On-disk cache schema version. Bump on any meaningful change to
 /// the cached payload or public extraction semantics. Version 2
 /// separates typed fact families from the residual values tree.
 /// Version 3 expands source AST facts with assignment projection and
 /// richer literal argument extraction. Version 4 renames the public AST
 /// projection fields and related metric keys.
-pub const CACHE_SCHEMA_VERSION: u32 = 4;
+pub const CACHE_SCHEMA_VERSION: u32 = 5;
 
 /// SHA-256 a byte slice, returning the lowercase hex digest.
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -105,7 +111,9 @@ pub fn load<T: serde::de::DeserializeOwned>(sha_hex: &str) -> Option<T> {
     }
     let compressed = fs::read(&path).ok()?;
     let decompressed = zstd::decode_all(compressed.as_slice()).ok()?;
-    bincode::deserialize(&decompressed).ok()
+    bincode::serde::decode_from_slice::<T, _>(&decompressed, BINCODE_CONFIG)
+        .ok()
+        .map(|(value, _)| value)
 }
 
 /// Encode + compress + write a payload atomically. Best-effort —
@@ -115,7 +123,7 @@ pub fn store<T: serde::Serialize>(sha_hex: &str, value: &T) {
     let Some(path) = entry_path(sha_hex) else {
         return;
     };
-    let Ok(serialized) = bincode::serialize(value) else {
+    let Ok(serialized) = bincode::serde::encode_to_vec(value, BINCODE_CONFIG) else {
         return;
     };
     let Ok(compressed) = zstd::encode_all(&serialized[..], 3) else {

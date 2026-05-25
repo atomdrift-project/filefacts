@@ -9,7 +9,7 @@
 //! one of the highest-signal attribution fields a PE carries.
 
 use goblin::pe::debug::{
-    CodeviewPDB70DebugInfo, DebugData, ImageDebugDirectory, IMAGE_DEBUG_TYPE_CODEVIEW,
+    CodeviewPDB70DebugInfo, DebugData, IMAGE_DEBUG_TYPE_CODEVIEW, ImageDebugDirectory,
 };
 use serde_json::Value as JsonValue;
 

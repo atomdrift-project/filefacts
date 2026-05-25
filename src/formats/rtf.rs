@@ -22,7 +22,7 @@
 //! - `rtf.shape.{control_word_count, group_depth_max, brace_count}`
 //!    — structural counts that fingerprint generator authenticity.
 
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
 use crate::formats::common::{extract_ascii_strings, put_str};
@@ -265,6 +265,14 @@ fn fields(bytes: &[u8], values: &mut Values) {
             break;
         };
         let abs = pos + rel;
+        // Require a word boundary after the control word so
+        // `\fldinstFoo` (a different control word) doesn't false-match
+        // `\fldinst`.
+        let next = bytes.get(abs + 8).copied().unwrap_or(b' ');
+        if next.is_ascii_alphabetic() {
+            pos = abs + 8;
+            continue;
+        }
         // Skip past the control word and its delimiter.
         let mut cursor = abs + 8;
         if bytes.get(cursor) == Some(&b' ') {
@@ -478,8 +486,15 @@ fn find_group(bytes: &[u8], control_word: &[u8]) -> Option<usize> {
     None
 }
 
+/// Maximum group nesting honoured by [`match_group_end`]. Real RTF
+/// rarely nests beyond a dozen levels; the cap bounds the worst-case
+/// scan cost on adversarial documents that open thousands of nested
+/// groups without closing them.
+const MAX_GROUP_DEPTH: i32 = 256;
+
 /// Return the position of the matching `}` for the `{` at `start`.
-/// Returns `bytes.len()` on unterminated groups.
+/// Returns `bytes.len()` on unterminated groups or when nesting
+/// exceeds [`MAX_GROUP_DEPTH`].
 fn match_group_end(bytes: &[u8], start: usize) -> usize {
     let mut depth = 0_i32;
     let mut i = start;
@@ -495,6 +510,9 @@ fn match_group_end(bytes: &[u8], start: usize) -> usize {
             }
             b'{' => {
                 depth += 1;
+                if depth > MAX_GROUP_DEPTH {
+                    return bytes.len();
+                }
                 i += 1;
             }
             b'}' => {

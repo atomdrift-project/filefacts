@@ -294,13 +294,13 @@ fn decompress_vba(data: &[u8]) -> Result<Vec<u8>, &'static str> {
                     }
                     let token = u16::from_le_bytes([data[pos], data[pos + 1]]);
                     pos += 2;
-                    let decompressed_pos = output.len() - decompressed_start;
+                    let decompressed_pos = output.len().saturating_sub(decompressed_start);
                     let bits = max_bit_count(decompressed_pos);
                     let len_mask = 0xFFFFu16 >> bits;
                     let off_mask = !len_mask;
                     let length = ((token & len_mask) + 3) as usize;
                     let offset = ((token & off_mask) >> (16 - bits)) as usize + 1;
-                    if output.len() + length > MAX_DECOMPRESSED_SIZE {
+                    if output.len().saturating_add(length) > MAX_DECOMPRESSED_SIZE {
                         return Err("decompressed size exceeds cap");
                     }
                     for _ in 0..length {

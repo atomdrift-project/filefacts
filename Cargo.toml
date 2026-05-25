@@ -1,8 +1,8 @@
 [package]
 name = "filefacts"
 version = "0.6.0"
-edition = "2021"
-rust-version = "1.82"
+edition = "2024"
+rust-version = "1.85"
 authors = ["The Atomdrift Project"]
 description = "Extracts file facts: identification, structural values, strings, metrics, symbols, sections, AST, and recoverable parse errors."
 license = "Apache-2.0"
@@ -25,7 +25,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Error reporting — single source of truth for the public error type.
-thiserror = "1"
+thiserror = "2"
 
 # Fast byte scanning, used by string extractors and the magic-byte matcher.
 memchr = "2"
@@ -55,7 +55,9 @@ gimli = { version = "0.32", default-features = false, features = ["read", "std"]
 # packed runs, decodes XOR-obfuscated and base64-wrapped payloads.
 # Cleave used to call this directly; centralising in filefacts lets every
 # consumer get the same high-quality string set.
-stng = { git = "https://codeberg.org/atomdrift/stng.git" }
+# `rev` pinned for reproducible builds. Bump alongside any stng
+# integration change; see codeberg.org/atomdrift/stng for tags.
+stng = { git = "https://codeberg.org/atomdrift/stng.git", rev = "d1e272d9" }
 
 
 # Archive index readers. We use these for header/central-directory enumeration
@@ -136,11 +138,11 @@ tracing = "0.1"
 
 # Disk cache — zstd-compressed bincode blobs keyed by sha256.
 zstd = "0.13"
-bincode = "1"
+bincode = { version = "2", features = ["serde"] }
 
 # OS cache directory lookup — `~/.cache/filefacts` (Linux) / `Library/Caches`
 # (macOS) / `%LOCALAPPDATA%` (Windows).
-dirs = "5"
+dirs = "6"
 
 # Temp file handling for rizin input materialisation. The existing rizin
 # integration was using std::env::temp_dir manually; `tempfile` cleans
@@ -177,9 +179,11 @@ jemalloc-prof = ["tikv-jemallocator/profiling"]
 [lints.rust]
 # rizin subprocess hardening (libc::setrlimit pre_exec, libc::kill on the
 # rizin process group, prctl PR_SET_PDEATHSIG on Linux) requires `unsafe`.
-# These are tightly scoped to the rizin module and gated #[cfg(unix)];
-# every other path stays unsafe-free.
-unsafe_code = "warn"
+# These are tightly scoped to the rizin module, gated #[cfg(unix)], and
+# wrapped in per-block `#[allow(unsafe_code)]`. Setting "deny" here means
+# any new unsafe outside that scope becomes a hard error rather than a
+# warning that can drift past review.
+unsafe_code = "deny"
 missing_docs = "warn"
 unreachable_pub = "warn"
 unused_must_use = "warn"

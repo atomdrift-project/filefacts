@@ -34,15 +34,17 @@ use serde::Serialize;
 /// and a flag for cases where the file's extension disagrees with its
 /// content. The detection pipeline never returns "unknown plus an
 /// error" — failures collapse to [`FileType::Unknown`].
+///
+/// Access state through the accessor methods ([`Self::file_type`],
+/// [`Self::source`], [`Self::extension_mismatch`]); the fields stay
+/// crate-private so new state can be added without breaking
+/// downstream consumers.
 #[derive(Debug, Clone, Copy, Serialize)]
+#[non_exhaustive]
 pub struct FileId {
-    /// Identified file type.
-    pub file_type: FileType,
-    /// How the type was determined.
-    pub source: DetectionSource,
-    /// `true` when content-based detection disagrees with the file's
-    /// extension. Useful as a low-friction evasion signal.
-    pub extension_mismatch: bool,
+    pub(crate) file_type: FileType,
+    pub(crate) source: DetectionSource,
+    pub(crate) extension_mismatch: bool,
 }
 
 impl FileId {
@@ -85,6 +87,13 @@ impl FileId {
     #[must_use]
     pub fn source(&self) -> DetectionSource {
         self.source
+    }
+
+    /// `true` when content-based detection disagrees with the file's
+    /// extension. Useful as a low-friction evasion signal.
+    #[must_use]
+    pub fn extension_mismatch(&self) -> bool {
+        self.extension_mismatch
     }
 }
 

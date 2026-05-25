@@ -65,10 +65,22 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             }
         }
         0xCA => {
-            // Java class or Mach-O fat: CAFEBABE
+            // Java class and Mach-O fat both start with CAFEBABE.
+            // Java's bytes 6..8 are the class-file `major_version`
+            // (45 = Java 1.1, 52 = Java 8, 65 = Java 21 — well over
+            // a decade of headroom in 45..=70). Mach-O fat's bytes
+            // 4..8 are `nfat_arch` (BE u32), realistically ≤ 12.
+            //
+            // Either signal alone misfires on random or hostile bytes
+            // shaped like CAFEBABE: a junk file whose `major_version`
+            // lands at 0x01F4 (500) fails the Java check, then the
+            // Mach-O parser tries to slice with a several-billion
+            // offset. Combine both checks so we only call it Mach-O
+            // when nfat_arch is plausible AND the Java major isn't.
             if data.len() >= 8 && data[1] == 0xFE && data[2] == 0xBA && data[3] == 0xBE {
                 let major = u16::from_be_bytes([data[6], data[7]]);
-                if (45..=70).contains(&major) {
+                let nfat_arch = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+                if (45..=70).contains(&major) || nfat_arch > 16 {
                     Some((FileType::JavaClass, DetectionSource::Magic))
                 } else {
                     Some((FileType::MachO, DetectionSource::Magic))
@@ -675,6 +687,22 @@ mod tests {
         let macho = [0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x02];
         let (ft, _) = detect_from_content(Path::new("universal"), &macho).unwrap();
         assert_eq!(ft, FileType::MachO);
+    }
+
+    /// Junk file shaped like CAFEBABE whose `major_version` falls
+    /// outside the Java range AND whose `nfat_arch` is implausibly
+    /// large. Pre-fix, this classified as Mach-O and the fat parser
+    /// then sliced with a multi-gigabyte start offset → panic. We now
+    /// treat it as a Java class so the lenient class parser handles
+    /// it (and bails cleanly when the body doesn't match).
+    #[test]
+    fn cafebabe_with_implausible_nfat_arch_falls_back_to_java() {
+        // bytes[4..8] = 0x4D 0x11 0xAB 0xD4 — nfat_arch ≈ 1.29 billion
+        // and major_version = 0xABD4 (44_000), both outside their
+        // respective sane ranges.
+        let junk = [0xCA, 0xFE, 0xBA, 0xBE, 0x4D, 0x11, 0xAB, 0xD4];
+        let (ft, _) = detect_from_content(Path::new("anon.class"), &junk).unwrap();
+        assert_eq!(ft, FileType::JavaClass);
     }
 
     #[test]

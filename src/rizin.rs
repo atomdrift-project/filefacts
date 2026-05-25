@@ -126,6 +126,8 @@ pub fn disable() {
 /// RAII guard returned by [`scoped_disable`]. Re-enables rizin on
 /// drop. Multiple guards stack: rizin stays disabled until every
 /// guard is dropped.
+#[must_use = "dropping the guard immediately re-enables rizin; bind it to a \
+              variable that lives at least as long as the scope you intended to mute"]
 pub struct ScopedDisable {
     _private: (),
 }

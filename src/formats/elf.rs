@@ -5,7 +5,7 @@
 //! section table, dynamic symbol table imports/exports, and the
 //! GNU build-id when present.
 
-use goblin::elf::{dynamic, header, program_header, Elf};
+use goblin::elf::{Elf, dynamic, header, program_header};
 use serde_json::Value as JsonValue;
 
 use crate::error::Error;
@@ -37,12 +37,12 @@ pub(super) fn extract(
     let elf = match goblin_safe::parse_elf(bytes) {
         goblin_safe::GoblinOutcome::Ok(elf) => elf,
         goblin_safe::GoblinOutcome::Failed(e) => {
-            errors_out.record_malformed("elf-parse", e.to_string());
+            errors_out.record_malformed(crate::Stage::ElfParse, e.to_string());
             metrics.insert("elf.parse_failed", 1.0);
             return Ok(());
         }
         goblin_safe::GoblinOutcome::Panicked(msg) => {
-            errors_out.record_panic("elf-parse", msg);
+            errors_out.record_panic(crate::Stage::ElfParse, msg);
             metrics.insert("elf.parse_panicked", 1.0);
             return Ok(());
         }

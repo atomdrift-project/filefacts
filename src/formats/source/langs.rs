@@ -69,7 +69,16 @@ pub(super) struct LangConfig {
     pub(super) object_kinds: &'static [&'static str],
     /// Node-kind names for array / list / slice literals.
     pub(super) array_kinds: &'static [&'static str],
-    /// Node-kind names for function / lambda / closure literals.
+    /// Node-kind names for *anonymous* function / lambda / closure
+    /// **value** expressions — used by [`crate::formats::source::ast_walk`]
+    /// to classify a call argument's shape as
+    /// [`crate::ArgShape::Function`].
+    ///
+    /// Distinct from the named, top-level function-definition kinds
+    /// (`function_declaration`, `method_definition`, …) that
+    /// [`crate::formats::source::function_metrics`] looks for when
+    /// surfacing declared functions — those live in a separate table
+    /// inside that module.
     pub(super) function_kinds: &'static [&'static str],
     /// Node-kind names for template / formatted / interpolated strings.
     pub(super) template_kinds: &'static [&'static str],

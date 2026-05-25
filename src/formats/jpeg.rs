@@ -18,7 +18,7 @@
 //! - `jpeg.{segment_count, app_segment_count, com_count, dqt_count,
 //!   dht_count, soi_count, maker_note_bytes}` — flat metrics.
 
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
 use crate::formats::common::{extract_ascii_strings, put_str};

@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 /// source bytes given to `filefacts::open`. For UTF-16 strings, this
 /// is the byte offset of the first code unit, not a character index.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ExtractedString {
     /// Decoded text. UTF-16LE runs are decoded to UTF-8 here; invalid
     /// surrogates are replaced with `U+FFFD`.

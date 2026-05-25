@@ -27,12 +27,12 @@ use sha1::Sha1;
 use sha2::digest::DynDigest;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
+use goblin::pe::PE;
 use goblin::pe::optional_header::{
     MAGIC_32, MAGIC_64, OFFSET_WINDOWS_FIELDS_32_CHECKSUM, OFFSET_WINDOWS_FIELDS_64_CHECKSUM,
     SIZEOF_STANDARD_FIELDS_32, SIZEOF_STANDARD_FIELDS_64, SIZEOF_WINDOWS_FIELDS_32,
     SIZEOF_WINDOWS_FIELDS_64,
 };
-use goblin::pe::PE;
 
 use crate::formats::common::{hex_encode, put_str};
 use crate::output::{Metrics, Values};

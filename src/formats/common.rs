@@ -197,7 +197,7 @@ pub(super) fn rizin_fallback(
     if !symbols.is_empty() {
         return;
     }
-    if let Some(recovery) = crate::rizin_impl::recover(bytes) {
+    if let Some(recovery) = crate::rizin::recover(bytes) {
         recovery.apply(symbols, metrics);
     }
 }
@@ -224,7 +224,7 @@ pub(super) fn rizin_fallback_with_sections(
     if !symbols.is_empty() || !sections.is_empty() {
         return;
     }
-    let Some(recovery) = crate::rizin_impl::recover(bytes) else {
+    let Some(recovery) = crate::rizin::recover(bytes) else {
         return;
     };
     let counts = recovery.apply_with_sections(symbols, sections, metrics);
@@ -251,6 +251,48 @@ pub(super) fn rizin_fallback_with_sections(
             format!("{metric_prefix}.recovered_sections"),
             f64::from(counts.sections),
         );
+    }
+}
+
+/// Panic-safe fixed-width integer reads. Each helper bounds-checks
+/// via `slice::get`, so an out-of-range offset returns `None` instead
+/// of panicking — the right idiom for parsing untrusted input where
+/// callers may have a bug in their length-check.
+///
+/// Per-format extractors that need a non-`Option` return type can
+/// wrap the call in `.unwrap_or(0)` to keep their existing signature;
+/// the panic surface is gone either way.
+pub(super) mod bytes_at {
+    /// Read a little-endian `u16` at `off`.
+    #[inline]
+    pub(crate) fn u16_le(b: &[u8], off: usize) -> Option<u16> {
+        b.get(off..off.checked_add(2)?)
+            .and_then(|s| s.try_into().ok())
+            .map(u16::from_le_bytes)
+    }
+
+    /// Read a little-endian `u32` at `off`.
+    #[inline]
+    pub(crate) fn u32_le(b: &[u8], off: usize) -> Option<u32> {
+        b.get(off..off.checked_add(4)?)
+            .and_then(|s| s.try_into().ok())
+            .map(u32::from_le_bytes)
+    }
+
+    /// Read a big-endian `u32` at `off`.
+    #[inline]
+    pub(crate) fn u32_be(b: &[u8], off: usize) -> Option<u32> {
+        b.get(off..off.checked_add(4)?)
+            .and_then(|s| s.try_into().ok())
+            .map(u32::from_be_bytes)
+    }
+
+    /// Read a little-endian `u64` at `off`.
+    #[inline]
+    pub(crate) fn u64_le(b: &[u8], off: usize) -> Option<u64> {
+        b.get(off..off.checked_add(8)?)
+            .and_then(|s| s.try_into().ok())
+            .map(u64::from_le_bytes)
     }
 }
 

@@ -554,7 +554,7 @@ mod tests {
         out.extend_from_slice(&0u16.to_be_bytes());
         out.extend_from_slice(&major.to_be_bytes());
         out.extend_from_slice(&7u16.to_be_bytes()); // cp_count
-                                                    // 1 Utf8 "MyClass"
+        // 1 Utf8 "MyClass"
         out.push(CP_UTF8);
         out.extend_from_slice(&7u16.to_be_bytes());
         out.extend_from_slice(b"MyClass");

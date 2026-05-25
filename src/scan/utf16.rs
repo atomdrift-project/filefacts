@@ -72,7 +72,7 @@ fn is_printable_utf16le_unit(lo: u8, hi: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_runs, DEFAULT_MIN_LEN};
+    use super::{DEFAULT_MIN_LEN, extract_runs};
 
     fn utf16le(s: &str) -> Vec<u8> {
         let mut out = Vec::with_capacity(s.len() * 2);
