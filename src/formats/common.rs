@@ -173,7 +173,7 @@ pub(super) fn put_str(values: &mut Values, path: &str, s: impl Into<String>) {
 /// `"bar.exe"`. Returns the input unchanged if no separator is found.
 #[must_use]
 pub(crate) fn basename(path: &str) -> &str {
-    match path.rfind(|c| c == '/' || c == '\\') {
+    match path.rfind(['/', '\\']) {
         Some(idx) => &path[idx + 1..],
         None => path,
     }
@@ -338,7 +338,7 @@ pub(super) fn hex_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{basename, stem, hex_encode};
+    use super::{basename, hex_encode, stem};
 
     #[test]
     fn hex_encode_known_vectors() {

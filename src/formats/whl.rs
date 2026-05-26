@@ -188,9 +188,7 @@ fn parse_wheel_filename(basename: &str, values: &mut Values) {
     // 5 fields: name, version, python, abi, platform.
     // 6 fields: name, version, build, python, abi, platform.
     let (name, version, build, python, abi, platform) = match parts.len() {
-        5 => (
-            parts[0], parts[1], None, parts[2], parts[3], parts[4],
-        ),
+        5 => (parts[0], parts[1], None, parts[2], parts[3], parts[4]),
         6 => (
             parts[0],
             parts[1],
@@ -475,7 +473,10 @@ mod tests {
         assert_eq!(fstr(&v, "whl.filename.version").as_deref(), Some("0.5.0"));
         assert_eq!(fstr(&v, "whl.filename.python_tag").as_deref(), Some("py3"));
         assert_eq!(fstr(&v, "whl.filename.abi_tag").as_deref(), Some("none"));
-        assert_eq!(fstr(&v, "whl.filename.platform_tag").as_deref(), Some("any"));
+        assert_eq!(
+            fstr(&v, "whl.filename.platform_tag").as_deref(),
+            Some("any")
+        );
         // No build tag in this filename — fact should be absent.
         assert!(v.get("whl.filename.build").is_none());
     }
@@ -494,7 +495,10 @@ mod tests {
         // mixinv2-0.4.0.post45.dev0-py3-none-any.whl — version contains
         // dots but is still a single hyphen-separated field.
         let v = parse_only("mixinv2-0.4.0.post45.dev0-py3-none-any.whl");
-        assert_eq!(fstr(&v, "whl.filename.name_prefix").as_deref(), Some("mixinv2"));
+        assert_eq!(
+            fstr(&v, "whl.filename.name_prefix").as_deref(),
+            Some("mixinv2")
+        );
         assert_eq!(
             fstr(&v, "whl.filename.version").as_deref(),
             Some("0.4.0.post45.dev0")

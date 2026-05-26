@@ -348,10 +348,7 @@ fn run_extraction(
     let mut symbols = Symbols::new();
     let mut errors = Errors::new();
     if let Some(name) = basename {
-        values.insert(
-            "file.basename",
-            serde_json::Value::String(name.to_string()),
-        );
+        values.insert("file.basename", serde_json::Value::String(name.to_string()));
         values.insert(
             "file.stem",
             serde_json::Value::String(formats::common::stem(name)),

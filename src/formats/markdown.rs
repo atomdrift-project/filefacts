@@ -47,10 +47,7 @@ pub(super) fn extract(
 
     let repos = github_repos(&text);
     if !repos.is_empty() {
-        let arr = repos
-            .into_iter()
-            .map(JsonValue::String)
-            .collect::<Vec<_>>();
+        let arr = repos.into_iter().map(JsonValue::String).collect::<Vec<_>>();
         values.insert("markdown.github_repos", JsonValue::Array(arr));
     }
 
@@ -217,7 +214,10 @@ mod tests {
     }
 
     fn get_str(values: &Values, path: &str) -> Option<String> {
-        values.get(path).and_then(|v| v.as_str()).map(str::to_string)
+        values
+            .get(path)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
     }
 
     fn get_arr(values: &Values, path: &str) -> Vec<String> {
@@ -358,7 +358,9 @@ mod tests {
 
     #[test]
     fn github_repos_strips_subpaths() {
-        let v = run("See https://github.com/lovell/sharp/issues/123 and https://github.com/lovell/sharp/blob/main/README.md\n");
+        let v = run(
+            "See https://github.com/lovell/sharp/issues/123 and https://github.com/lovell/sharp/blob/main/README.md\n",
+        );
         // Two refs, but both collapse to the same owner/repo and dedup.
         assert_eq!(
             get_arr(&v, "markdown.github_repos"),
@@ -368,13 +370,19 @@ mod tests {
 
     #[test]
     fn github_repos_strips_dotgit_suffix() {
-        let v = run("git clone https://github.com/foo/bar.git\nWebsite https://github.com/foo/bar\n");
-        assert_eq!(get_arr(&v, "markdown.github_repos"), vec!["github.com/foo/bar"]);
+        let v =
+            run("git clone https://github.com/foo/bar.git\nWebsite https://github.com/foo/bar\n");
+        assert_eq!(
+            get_arr(&v, "markdown.github_repos"),
+            vec!["github.com/foo/bar"]
+        );
     }
 
     #[test]
     fn github_repos_deduped_preserves_first_seen_order() {
-        let v = run("https://github.com/aaa/one https://github.com/bbb/two https://github.com/aaa/one\n");
+        let v = run(
+            "https://github.com/aaa/one https://github.com/bbb/two https://github.com/aaa/one\n",
+        );
         assert_eq!(
             get_arr(&v, "markdown.github_repos"),
             vec!["github.com/aaa/one", "github.com/bbb/two"]
