@@ -131,11 +131,11 @@ fn parse_atx_heading(line: &str) -> Option<String> {
 /// We don't reconstruct nested emphasis — we just remove the marker
 /// bytes so `**Foo**` and `` `bar` `` read as `Foo` and `bar`.
 fn strip_inline_emphasis(s: &str) -> String {
-    s.chars()
+    let stripped: String = s
+        .chars()
         .filter(|c| !matches!(c, '*' | '_' | '`'))
-        .collect::<String>()
-        .trim()
-        .to_string()
+        .collect();
+    stripped.trim().to_owned()
 }
 
 /// Find every `github.com/<owner>/<repo>` reference and return them
@@ -169,7 +169,8 @@ fn github_repos(text: &str) -> Vec<String> {
         // `github.com/foo/bar` collapse to the same value.
         let repo_clean = repo.strip_suffix(".git").unwrap_or(repo.as_str());
         let joined = format!("github.com/{}/{}", owner, repo_clean);
-        if seen.insert(joined.clone()) {
+        if !seen.contains(joined.as_str()) {
+            seen.insert(joined.clone());
             out.push(joined);
         }
     }

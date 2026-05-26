@@ -284,7 +284,7 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
     // `-NN` disables plugin auto-loading (faster startup, fewer
     // surprises). `-q` quits after the `-c` script. `-e scr.color=0`
     // strips ANSI escapes from any stray log lines.
-    let path_str = temp.to_string_lossy().to_string();
+    let path_str = temp.to_string_lossy();
     let mut cmd = Command::new(bin);
     cmd.args([
         "-NN",

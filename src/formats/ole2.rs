@@ -38,6 +38,12 @@ use crate::output::{Metrics, Values};
 /// file from looping us forever.
 const MAX_STREAMS: usize = 4096;
 
+/// Hard cap on the property-entry count read from a single OLEPS
+/// section header. The header's `cProperties` field is attacker-
+/// controlled; a malformed file could otherwise request unbounded
+/// reads.
+const MAX_PROPERTIES_PER_SECTION: usize = 256;
+
 pub(super) fn extract(
     bytes: &[u8],
     values: &mut Values,
@@ -251,9 +257,7 @@ fn parse_summary_information(data: &[u8]) -> serde_json::Map<String, JsonValue> 
         return out;
     }
     let num_props = u32::from_le_bytes([section[4], section[5], section[6], section[7]]) as usize;
-    // Cap the count so a malformed header can't request unbounded
-    // property reads.
-    let num_props = num_props.min(256);
+    let num_props = num_props.min(MAX_PROPERTIES_PER_SECTION);
     for i in 0..num_props {
         let entry_off = 8 + i * 8;
         if entry_off + 8 > section.len() {
@@ -306,7 +310,7 @@ fn parse_document_summary_information(data: &[u8]) -> serde_json::Map<String, Js
         return out;
     }
     let num_props = u32::from_le_bytes([section[4], section[5], section[6], section[7]]) as usize;
-    let num_props = num_props.min(256);
+    let num_props = num_props.min(MAX_PROPERTIES_PER_SECTION);
     for i in 0..num_props {
         let entry_off = 8 + i * 8;
         if entry_off + 8 > section.len() {
@@ -363,7 +367,7 @@ fn property_i32_by_pid(section: &[u8], wanted_pid: u32) -> Option<i32> {
         return None;
     }
     let num_props = u32::from_le_bytes([section[4], section[5], section[6], section[7]]) as usize;
-    let num_props = num_props.min(256);
+    let num_props = num_props.min(MAX_PROPERTIES_PER_SECTION);
     for i in 0..num_props {
         let entry_off = 8 + i * 8;
         if entry_off + 8 > section.len() {
