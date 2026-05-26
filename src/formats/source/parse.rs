@@ -12,6 +12,7 @@ use crate::error::Error;
 use crate::fileid::FileType;
 use crate::formats::source::langs;
 use std::cell::RefCell;
+use std::io::Write;
 
 /// Tree-sitter's external scanners serialize their state into a fixed
 /// 1024-byte buffer (`TREE_SITTER_SERIALIZATION_BUFFER_SIZE` in
@@ -25,6 +26,20 @@ use std::cell::RefCell;
 /// almost always machine-generated (protobuf descriptors, minified
 /// bundles) and gain little from AST analysis anyway.
 const MAX_AST_FILE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Conservative cap for grammars whose scanner has not been audited
+/// for the 1024-byte overflow. New or freshly-bumped grammar crates
+/// land here automatically — when an entry is missing from
+/// [`scanner_audit`], we'd rather drop AST analysis on the rare
+/// 64+ KB source than risk a C-level abort on the whole worker.
+const UNAUDITED_GRAMMAR_CAP_BYTES: usize = 64 * 1024;
+
+/// Size at which a parse is worth a per-call diagnostic line. Below
+/// this most scanners can't have accumulated enough state to reach
+/// the 1024-byte serialization boundary, so the breadcrumb would
+/// only add log noise. Above it, an abort is plausible and the
+/// breadcrumb names the grammar + size for the next post-mortem.
+const PARSE_BREADCRUMB_THRESHOLD_BYTES: usize = 64 * 1024;
 
 /// Budget for the **combined** Python scanner state. Layout per
 /// `tree_sitter_python_external_scanner_serialize` (`scanner.c`):
@@ -82,6 +97,12 @@ impl<'a> TreeCache<'a> {
             return Ok(None);
         };
         if would_overflow_scanner_state(file_type, source) {
+            tracing::warn!(
+                language = config.name,
+                bytes = source.len(),
+                audit = ?scanner_audit(file_type),
+                "skipping tree-sitter parse to avoid 1024-byte scanner-state overflow"
+            );
             return Ok(None);
         }
         let language = (config.language)();
@@ -90,6 +111,18 @@ impl<'a> TreeCache<'a> {
             parser.set_language(&language).map_err(|e| {
                 Error::malformed("source", format!("tree-sitter language setup failed: {e}"))
             })?;
+            // Breadcrumb for sources large enough to plausibly overflow
+            // the scanner. Flushed before `parse` so the line survives
+            // a C-level abort and names the offending grammar.
+            if source.len() >= PARSE_BREADCRUMB_THRESHOLD_BYTES {
+                tracing::info!(
+                    language = config.name,
+                    bytes = source.len(),
+                    "tree-sitter parse begin"
+                );
+                let _ = std::io::stderr().flush();
+                let _ = std::io::stdout().flush();
+            }
             let tree = parser
                 .parse(source, None)
                 .ok_or_else(|| Error::malformed("source", "tree-sitter parse returned None"))?;
@@ -118,15 +151,104 @@ impl<'a> TreeCache<'a> {
 /// 1024-byte serialization buffer. Returning `true` causes `parse` to
 /// skip the parse rather than risk the C-level abort.
 fn would_overflow_scanner_state(file_type: FileType, source: &str) -> bool {
-    if source.len() > MAX_AST_FILE_BYTES {
+    let audit = scanner_audit(file_type);
+    if source.len() > parse_cap_bytes(audit) {
         return true;
     }
-    if matches!(file_type, FileType::Python)
-        && estimated_python_scanner_bytes(source) > PYTHON_SCANNER_BUDGET_BYTES
-    {
-        return true;
+    if matches!(audit, ScannerAudit::Modeled) && matches!(file_type, FileType::Python) {
+        if estimated_python_scanner_bytes(source) > PYTHON_SCANNER_BUDGET_BYTES {
+            return true;
+        }
     }
     false
+}
+
+/// What we've verified about a grammar's external scanner overflow
+/// behavior, against the locked crate version in this workspace.
+///
+/// The serialization buffer is a fixed 1024 bytes (`parser.c`
+/// `TREE_SITTER_SERIALIZATION_BUFFER_SIZE`). When the C scanner's
+/// `serialize()` returns more than that, the tree-sitter runtime
+/// aborts. The audit categorizes how each grammar handles overflow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScannerAudit {
+    /// Scanner serializes a fixed, small amount of state regardless of
+    /// input (e.g. no external scanner, or a single counter, or a
+    /// `return 0`). Cannot reach the 1024-byte limit.
+    Bounded,
+    /// Scanner has a self-guard in `serialize()` that returns 0 when
+    /// the next write would exceed the buffer. Safe at any input size.
+    SelfGuarded,
+    /// Scanner can overflow, but filefacts pre-models its worst-case
+    /// serialized size and rejects inputs likely to trip it. Currently
+    /// only Python.
+    Modeled,
+    /// Grammar has not been audited at the currently-locked version —
+    /// or `file_type` is one this module doesn't recognize. Apply the
+    /// tight [`UNAUDITED_GRAMMAR_CAP_BYTES`] cap until audited.
+    Unaudited,
+}
+
+/// Audit table for the grammars wired up in [`langs::config_for`].
+///
+/// When bumping a `tree-sitter-*` crate, re-inspect that crate's
+/// `scanner.c` (or `.cc`) and confirm the audit category still holds
+/// — in particular, check whether `external_scanner_serialize` still
+/// either returns a small constant size, or guards each write against
+/// `TREE_SITTER_SERIALIZATION_BUFFER_SIZE`. If neither, downgrade to
+/// `Unaudited` or add a model like Python's.
+fn scanner_audit(file_type: FileType) -> ScannerAudit {
+    use ScannerAudit::{Bounded, Modeled, SelfGuarded, Unaudited};
+    match file_type {
+        // No external scanner in the locked grammar crate.
+        FileType::C
+        | FileType::Go
+        | FileType::Groovy
+        | FileType::Java
+        | FileType::Makefile
+        | FileType::ObjectiveC
+        | FileType::TypeScript
+        | FileType::Zig => Bounded,
+
+        // External scanner present, but `serialize()` returns a fixed
+        // small size independent of input.
+        FileType::Elixir
+        | FileType::JavaScript
+        | FileType::Kotlin
+        | FileType::Lua
+        | FileType::PowerShell
+        | FileType::Rust
+        | FileType::Swift => Bounded,
+
+        // `serialize()` early-returns 0 when the next write would
+        // overflow the 1024-byte buffer.
+        FileType::CSharp | FileType::Php | FileType::Ruby | FileType::Scala | FileType::Shell => {
+            SelfGuarded
+        }
+
+        // Can overflow; modeled in [`estimated_python_scanner_bytes`].
+        FileType::Python => Modeled,
+
+        // Perl's `serialize()` in `ts-parser-perl` writes up to
+        // 255 × `sizeof(TSPQuote)` (~3 KB) without a buffer-size guard,
+        // so deeply quoted input can overflow. Treat as `Unaudited`
+        // for now — the 64 KB cap blocks the bulk of the risk; a
+        // proper model (like Python's) would be the long-term fix.
+        FileType::Perl => Unaudited,
+
+        _ => Unaudited,
+    }
+}
+
+/// Maximum source size we'll hand to the tree-sitter parser for a
+/// grammar with the given audit category.
+fn parse_cap_bytes(audit: ScannerAudit) -> usize {
+    match audit {
+        ScannerAudit::Bounded | ScannerAudit::SelfGuarded | ScannerAudit::Modeled => {
+            MAX_AST_FILE_BYTES
+        }
+        ScannerAudit::Unaudited => UNAUDITED_GRAMMAR_CAP_BYTES,
+    }
 }
 
 /// Worst-case Python scanner serialization size. Models both the
@@ -297,6 +419,72 @@ def greet(name, count):
             source.push_str("echo hi\n");
         }
         assert!(!would_overflow_scanner_state(FileType::Shell, &source));
+    }
+
+    #[test]
+    fn unaudited_grammars_use_tight_cap() {
+        // Perl is known-unguarded and routed to `Unaudited`. The cap
+        // for unaudited grammars must be the tighter
+        // `UNAUDITED_GRAMMAR_CAP_BYTES`, not the 2 MB default — a
+        // 200 KB Perl source should be rejected even though the same
+        // size is fine for audited grammars.
+        let source = "1;\n".repeat(80_000); // ~240 KB.
+        assert!(source.len() > UNAUDITED_GRAMMAR_CAP_BYTES);
+        assert!(source.len() < MAX_AST_FILE_BYTES);
+        assert!(would_overflow_scanner_state(FileType::Perl, &source));
+        // The same source under an audited grammar with a 2 MB cap
+        // passes through (Shell is `SelfGuarded`).
+        assert!(!would_overflow_scanner_state(FileType::Shell, &source));
+    }
+
+    #[test]
+    fn audit_lookup_covers_every_wired_grammar() {
+        // Every file type that has a `LangConfig` in `langs::config_for`
+        // must have an explicit audit entry — falling into the
+        // `_ => Unaudited` catch-all should be deliberate, not
+        // accidental. This test pins the audit table to the current
+        // grammar set so a new `FileType` doesn't silently get the
+        // tight cap.
+        let audited: &[FileType] = &[
+            FileType::C,
+            FileType::CSharp,
+            FileType::Elixir,
+            FileType::Go,
+            FileType::Groovy,
+            FileType::Java,
+            FileType::JavaScript,
+            FileType::Kotlin,
+            FileType::Lua,
+            FileType::Makefile,
+            FileType::ObjectiveC,
+            FileType::Perl,
+            FileType::Php,
+            FileType::PowerShell,
+            FileType::Python,
+            FileType::Ruby,
+            FileType::Rust,
+            FileType::Scala,
+            FileType::Shell,
+            FileType::Swift,
+            FileType::TypeScript,
+            FileType::Zig,
+        ];
+        for ft in audited {
+            // Bounded/SelfGuarded/Modeled — anything but Unaudited
+            // counts as "explicit entry". Perl is the only audited
+            // type that maps to Unaudited (with a comment explaining
+            // why), so allow it.
+            let audit = scanner_audit(*ft);
+            if *ft == FileType::Perl {
+                assert_eq!(audit, ScannerAudit::Unaudited);
+            } else {
+                assert_ne!(
+                    audit,
+                    ScannerAudit::Unaudited,
+                    "{ft:?} fell through to Unaudited — add explicit audit entry"
+                );
+            }
+        }
     }
 
     #[test]
