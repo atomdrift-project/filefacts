@@ -179,6 +179,8 @@ pub enum FileType {
     PyProjectToml,
     /// PHP composer.json manifest
     ComposerJson,
+    /// Generic JSON document (.json)
+    Json,
     /// GitHub Actions workflow YAML
     GithubActions,
     /// systemd service unit file (.service, .service.d/*.conf)
@@ -1408,8 +1410,10 @@ mod tests {
     }
 
     #[test]
-    fn json_data_not_misclassified() {
-        assert!(detect(Path::new("data.json"), b"{\"key\": \"value\"}").is_none());
+    fn json_data_detects_as_generic_json() {
+        let det = detect(Path::new("data.json"), b"{\"key\": \"value\"}").unwrap();
+        assert_eq!(det.file_type, FileType::Json);
+        assert!(det.file_type.is_program());
     }
 
     #[test]

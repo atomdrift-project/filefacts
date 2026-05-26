@@ -220,6 +220,7 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "desktop" => Some(FileType::DesktopEntry),
         "xml" | "csproj" | "vbproj" | "fsproj" | "proj" | "props" | "targets" | "vcxproj"
         | "xaml" | "config" | "settings" | "svg" => Some(FileType::Xml),
+        "json" => Some(FileType::Json),
         "plist" | "resx" => Some(FileType::Plist),
         "rtf" => Some(FileType::Rtf),
         "doc" | "msi" | "msp" | "msg" | "dot" | "ppt" | "xls" | "xlt" => Some(FileType::OleDoc),

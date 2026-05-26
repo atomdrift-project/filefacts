@@ -8,7 +8,13 @@
 use serde_json::{Map, Value as JsonValue};
 
 use crate::error::Error;
+use crate::output::Metrics;
 use crate::output::Values;
+
+/// Generic JSON payloads are common, sometimes huge, and not always worth
+/// deserializing. Named JSON formats use `extract_json` directly and are not
+/// subject to this limit.
+pub(crate) const GENERIC_JSON_PARSE_LIMIT_BYTES: usize = 75 * 1024;
 
 /// Parse the bytes as JSON and populate `values` with the parsed
 /// content's top-level keys (when the root is an object) or wrap the
@@ -18,6 +24,39 @@ pub(super) fn extract_json(bytes: &[u8], values: &mut Values) -> Result<(), Erro
         serde_json::from_slice(bytes).map_err(|e| Error::malformed("json", e.to_string()))?;
     promote_root(parsed, values);
     Ok(())
+}
+
+/// Parse a generic `.json` document if it is below the default parse cap.
+/// Oversized files stay analyzable as text/raw content, but we avoid building
+/// a potentially huge `serde_json::Value` tree.
+pub(super) fn extract_generic_json(
+    bytes: &[u8],
+    values: &mut Values,
+    metrics: &mut Metrics,
+) -> Result<(), Error> {
+    metrics.insert(
+        "json.parse_limit_bytes",
+        GENERIC_JSON_PARSE_LIMIT_BYTES as f64,
+    );
+    if bytes.len() > GENERIC_JSON_PARSE_LIMIT_BYTES {
+        values.insert("json.parse.skipped", JsonValue::Bool(true));
+        values.insert(
+            "json.parse.reason",
+            JsonValue::String("size_limit".to_string()),
+        );
+        values.insert(
+            "json.parse.limit_bytes",
+            JsonValue::Number((GENERIC_JSON_PARSE_LIMIT_BYTES as u64).into()),
+        );
+        values.insert(
+            "json.parse.size_bytes",
+            JsonValue::Number((bytes.len() as u64).into()),
+        );
+        return Ok(());
+    }
+
+    metrics.insert("json.parsed_bytes", bytes.len() as f64);
+    extract_json(bytes, values)
 }
 
 /// Parse the bytes as YAML (1.2). Multi-document streams use the first

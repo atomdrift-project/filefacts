@@ -155,6 +155,7 @@ pub(crate) fn extract(
         | FileType::PackageLockJson
         | FileType::ComposerJson
         | FileType::ChromeManifest => structured::extract_json(bytes, values),
+        FileType::Json => structured::extract_generic_json(bytes, values, metrics),
         FileType::VsixManifest => vsix::extract(bytes, values, strings, metrics),
         FileType::CargoToml | FileType::PyProjectToml => structured::extract_toml(bytes, values),
         FileType::GithubActions => structured::extract_yaml(bytes, values),

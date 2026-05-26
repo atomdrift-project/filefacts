@@ -71,6 +71,36 @@ fn json_manifest_parses_once_through_all_views() {
 }
 
 #[test]
+fn generic_json_parses_below_limit() {
+    let parsed =
+        open_with_path(std::path::Path::new("payload.json"), br#"{"cookie":"alert(1)"}"#)
+            .unwrap();
+    assert_eq!(parsed.fileid().file_type(), FileType::Json);
+    assert_eq!(
+        parsed.values().get("cookie").and_then(serde_json::Value::as_str),
+        Some("alert(1)")
+    );
+}
+
+#[test]
+fn generic_json_parse_limit_skips_values() {
+    let mut bytes = Vec::from(br#"{"blob":""#.as_slice());
+    bytes.extend(std::iter::repeat(b'a').take(76 * 1024));
+    bytes.extend_from_slice(br#""}"#);
+
+    let parsed = open_with_path(std::path::Path::new("payload.json"), &bytes).unwrap();
+    assert_eq!(parsed.fileid().file_type(), FileType::Json);
+    assert_eq!(
+        parsed
+            .values()
+            .get("json.parse.skipped")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert!(parsed.values().get("blob").is_none());
+}
+
+#[test]
 fn zip_archive_emits_member_listing_and_aggregates() {
     // Hand-build a minimal ZIP with three regular-file entries so we
     // don't depend on an external fixture for an integration test.
