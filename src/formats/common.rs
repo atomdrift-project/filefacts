@@ -168,6 +168,34 @@ pub(super) fn put_str(values: &mut Values, path: &str, s: impl Into<String>) {
     values.insert(path, JsonValue::String(s.into()));
 }
 
+/// Return the last path segment of `path`, treating both `/` and `\`
+/// as separators. `"C:\\foo\\bar.exe"` and `"/tmp/bar.exe"` both yield
+/// `"bar.exe"`. Returns the input unchanged if no separator is found.
+#[must_use]
+pub(crate) fn basename(path: &str) -> &str {
+    match path.rfind(|c| c == '/' || c == '\\') {
+        Some(idx) => &path[idx + 1..],
+        None => path,
+    }
+}
+
+/// Return `name` with its trailing `.<ext>` removed, where `<ext>`
+/// contains no further `.`. Matches Python's `pathlib.Path.stem`:
+/// a leading dot is *not* an extension separator (so `.gitignore`
+/// has stem `.gitignore`), and only the last extension is stripped
+/// (so `foo.tar.gz` has stem `foo.tar`).
+///
+/// Pure function on basenames; callers should pass the output of
+/// [`basename`] when starting from a path.
+#[must_use]
+pub(crate) fn stem(name: &str) -> String {
+    // Leading-dot files have no extension to strip.
+    let body_start = name.bytes().take_while(|b| *b == b'.').count();
+    let body = &name[body_start..];
+    let stem_end = body.rfind('.').unwrap_or(body.len());
+    format!("{}{}", &name[..body_start], &body[..stem_end])
+}
+
 /// Convenience wrapper for emitting an integer-typed value.
 pub(super) fn put_u64(values: &mut Values, path: &str, n: u64) {
     values.insert(path, JsonValue::Number(n.into()));
@@ -310,12 +338,75 @@ pub(super) fn hex_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::hex_encode;
+    use super::{basename, stem, hex_encode};
 
     #[test]
     fn hex_encode_known_vectors() {
         assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
         assert_eq!(hex_encode(&[0x00, 0xff]), "00ff");
         assert_eq!(hex_encode(&[]), "");
+    }
+
+    #[test]
+    fn basename_unix_path() {
+        assert_eq!(basename("/tmp/foo/bar.exe"), "bar.exe");
+    }
+
+    #[test]
+    fn basename_windows_path() {
+        assert_eq!(basename("C:\\Users\\bob\\stealer.exe"), "stealer.exe");
+    }
+
+    #[test]
+    fn basename_mixed_separators() {
+        // Windows forward-slash convention.
+        assert_eq!(basename("C:/Users\\bob/run.exe"), "run.exe");
+    }
+
+    #[test]
+    fn basename_no_separator() {
+        assert_eq!(basename("foo.exe"), "foo.exe");
+    }
+
+    #[test]
+    fn basename_trailing_separator_returns_empty() {
+        // Pure mechanical behavior: the segment after the last separator is "".
+        // Callers should normalize trailing separators before calling.
+        assert_eq!(basename("foo/"), "");
+    }
+
+    #[test]
+    fn stem_simple() {
+        assert_eq!(stem("update.exe"), "update");
+    }
+
+    #[test]
+    fn stem_strips_only_last_extension() {
+        // Python pathlib semantics: stem of "foo.tar.gz" is "foo.tar".
+        assert_eq!(stem("foo.tar.gz"), "foo.tar");
+    }
+
+    #[test]
+    fn stem_no_extension() {
+        assert_eq!(stem("Makefile"), "Makefile");
+    }
+
+    #[test]
+    fn stem_leading_dot_is_not_extension() {
+        // .gitignore is a hidden file, not "extension only".
+        assert_eq!(stem(".gitignore"), ".gitignore");
+        // ..foo has stem ..foo for the same reason.
+        assert_eq!(stem("..foo"), "..foo");
+    }
+
+    #[test]
+    fn stem_dotfile_with_extension() {
+        // .config.json: leading-dot prefix preserved, .json stripped.
+        assert_eq!(stem(".config.json"), ".config");
+    }
+
+    #[test]
+    fn stem_empty_string() {
+        assert_eq!(stem(""), "");
     }
 }

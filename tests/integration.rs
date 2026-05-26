@@ -438,6 +438,52 @@ fn unrecognised_bytes_still_extract_generic_metrics() {
     assert_eq!(parsed.parse_count(), 1);
 }
 
+/// open_with_path should populate file.basename and file.stem in the
+/// values tree so traits can match on them via
+/// `type: value, path: file.basename`.
+#[test]
+fn open_with_path_populates_file_basename_and_stem() {
+    let bytes = b"# Hello\n";
+    let parsed = open_with_path(std::path::Path::new("/tmp/README.md"), bytes).unwrap();
+    let values = parsed.values();
+    assert_eq!(
+        values.get("file.basename").and_then(|v| v.as_str()),
+        Some("README.md")
+    );
+    assert_eq!(
+        values.get("file.stem").and_then(|v| v.as_str()),
+        Some("README")
+    );
+}
+
+/// open() without a path supplies no basename, so neither value path
+/// shows up. Trait-level matchers correctly report "value not present"
+/// rather than firing on a nonsense empty string.
+#[test]
+fn open_without_path_omits_file_basename() {
+    let bytes = b"\x7fELF\x02\x01\x01\x00";
+    let parsed = open(bytes).unwrap();
+    let values = parsed.values();
+    assert!(values.get("file.basename").is_none());
+    assert!(values.get("file.stem").is_none());
+}
+
+/// Stem-vs-extension semantics: a dotfile keeps its leading dot in
+/// the stem (matches Python pathlib).
+#[test]
+fn file_stem_handles_dotfiles() {
+    let parsed = open_with_path(std::path::Path::new("/p/.gitignore"), b"").unwrap();
+    let v = parsed.values();
+    assert_eq!(
+        v.get("file.basename").and_then(|x| x.as_str()),
+        Some(".gitignore")
+    );
+    assert_eq!(
+        v.get("file.stem").and_then(|x| x.as_str()),
+        Some(".gitignore")
+    );
+}
+
 /// Build a minimal ZIP containing three regular-file entries with
 /// distinct paths. Pure-Rust, no external test fixture required.
 fn build_minimal_zip() -> Vec<u8> {

@@ -137,6 +137,12 @@ pub const SCHEMA_VERSION: &str = "6";
 pub struct ParsedFile<'a> {
     bytes: &'a [u8],
     fileid: FileId,
+    // Basename of the file as supplied via `open_with_path` /
+    // `from_path`. None when the file was opened from a byte slice
+    // with no associated path. When present, surfaced as the
+    // `file.basename` value during extraction so traits can match
+    // against it via `type: value, path: file.basename`.
+    basename: Option<String>,
     // Shared tree-sitter parse for source files. Built once by
     // `tree_cache()` and consumed by the single extraction pipeline
     // that fills `extracted`.
@@ -318,7 +324,12 @@ impl<'a> ParsedFile<'a> {
     fn extracted(&self) -> &Extracted {
         self.extracted.get_or_init(|| {
             self.parse_count.fetch_add(1, Ordering::AcqRel);
-            run_extraction(self.bytes, self.fileid.file_type(), self.tree_cache())
+            run_extraction(
+                self.bytes,
+                self.fileid.file_type(),
+                self.basename.as_deref(),
+                self.tree_cache(),
+            )
         })
     }
 }
@@ -326,6 +337,7 @@ impl<'a> ParsedFile<'a> {
 fn run_extraction(
     bytes: &[u8],
     file_type: FileType,
+    basename: Option<&str>,
     tree_cache: Option<&formats::source::TreeCache<'_>>,
 ) -> Extracted {
     let mut values = Values::new();
@@ -335,6 +347,16 @@ fn run_extraction(
     let mut sections: Vec<Section> = Vec::new();
     let mut symbols = Symbols::new();
     let mut errors = Errors::new();
+    if let Some(name) = basename {
+        values.insert(
+            "file.basename",
+            serde_json::Value::String(name.to_string()),
+        );
+        values.insert(
+            "file.stem",
+            serde_json::Value::String(formats::common::stem(name)),
+        );
+    }
     // Format extractors return `Result` so they can report a hard
     // "this file is not in the format I expect" failure. Any
     // recoverable mid-extraction issues (goblin lazy-walker panics,
@@ -768,6 +790,7 @@ pub fn open(bytes: &[u8]) -> Result<ParsedFile<'_>, Error> {
     Ok(ParsedFile {
         bytes,
         fileid,
+        basename: None,
         tree_cache: OnceLock::new(),
         extracted: OnceLock::new(),
         parse_count: AtomicU32::new(0),
@@ -782,9 +805,14 @@ pub fn open(bytes: &[u8]) -> Result<ParsedFile<'_>, Error> {
 /// path when you have it.
 pub fn open_with_path<'a>(path: &Path, bytes: &'a [u8]) -> Result<ParsedFile<'a>, Error> {
     let fileid = FileId::from_path_and_bytes(path, bytes);
+    let basename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string);
     Ok(ParsedFile {
         bytes,
         fileid,
+        basename,
         tree_cache: OnceLock::new(),
         extracted: OnceLock::new(),
         parse_count: AtomicU32::new(0),

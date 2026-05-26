@@ -36,6 +36,19 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     values: &mut Values,
     metrics: &mut Metrics,
 ) -> Result<(), Error> {
+    // Parse the outer wheel filename (set by lib.rs from open_with_path)
+    // for PEP 427 components. The name_prefix here is the *outer*
+    // claim of identity, distinct from `whl.distribution` parsed from
+    // the dist-info directory inside the archive. When they disagree,
+    // it's an impersonation/repack signal.
+    if let Some(basename) = values
+        .get("file.basename")
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
+    {
+        parse_wheel_filename(&basename, values);
+    }
+
     let mut dist_info_dir: Option<String> = None;
     let mut data_dir: Option<String> = None;
     let mut has_metadata = false;
@@ -152,6 +165,65 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     }
 
     Ok(())
+}
+
+/// Parse a PEP 427 wheel filename and emit `whl.filename.*` facts.
+///
+/// Format: `{distribution}-{version}(-{build})?-{python}-{abi}-{platform}.whl`
+///
+/// At minimum the filename must end in `.whl` and contain 5 or 6
+/// hyphen-separated fields. Build tag is optional and is recognised
+/// by digit-leading prefix per the spec.
+///
+/// The distribution name leaked here is the *outer claim* of identity.
+/// Compare against `whl.distribution` (from the dist-info dir) and
+/// `dist-info/METADATA::Name` (from the metadata blob) to flag
+/// repackaging.
+fn parse_wheel_filename(basename: &str, values: &mut Values) {
+    let stem = match basename.strip_suffix(".whl") {
+        Some(s) => s,
+        None => return,
+    };
+    let parts: Vec<&str> = stem.split('-').collect();
+    // 5 fields: name, version, python, abi, platform.
+    // 6 fields: name, version, build, python, abi, platform.
+    let (name, version, build, python, abi, platform) = match parts.len() {
+        5 => (
+            parts[0], parts[1], None, parts[2], parts[3], parts[4],
+        ),
+        6 => (
+            parts[0],
+            parts[1],
+            Some(parts[2]),
+            parts[3],
+            parts[4],
+            parts[5],
+        ),
+        _ => return,
+    };
+    if name.is_empty() || version.is_empty() {
+        return;
+    }
+    values.insert(
+        "whl.filename.name_prefix",
+        JsonValue::String(name.to_string()),
+    );
+    values.insert(
+        "whl.filename.version",
+        JsonValue::String(version.to_string()),
+    );
+    if let Some(b) = build {
+        values.insert("whl.filename.build", JsonValue::String(b.to_string()));
+    }
+    values.insert(
+        "whl.filename.python_tag",
+        JsonValue::String(python.to_string()),
+    );
+    values.insert("whl.filename.abi_tag", JsonValue::String(abi.to_string()));
+    values.insert(
+        "whl.filename.platform_tag",
+        JsonValue::String(platform.to_string()),
+    );
 }
 
 /// Linux shared libraries also appear as `libfoo.so.1`, `libfoo.so.1.2.3`.
@@ -379,5 +451,109 @@ mod tests {
     fn non_zip_input_is_silent() {
         let (v, _) = run(b"not a zip");
         assert!(v.get("whl.dist_info_dir").is_none());
+    }
+
+    /// Drive `parse_wheel_filename` directly; isolated from ZIP/dist-info
+    /// concerns. Returns the populated `whl.filename.*` facts as a map.
+    fn parse_only(basename: &str) -> Values {
+        let mut v = Values::new();
+        super::parse_wheel_filename(basename, &mut v);
+        v
+    }
+
+    fn fstr(v: &Values, key: &str) -> Option<String> {
+        v.get(key).and_then(|x| x.as_str()).map(str::to_string)
+    }
+
+    #[test]
+    fn wheel_filename_basic_five_fields() {
+        let v = parse_only("mempalace_dashboard-0.5.0-py3-none-any.whl");
+        assert_eq!(
+            fstr(&v, "whl.filename.name_prefix").as_deref(),
+            Some("mempalace_dashboard")
+        );
+        assert_eq!(fstr(&v, "whl.filename.version").as_deref(), Some("0.5.0"));
+        assert_eq!(fstr(&v, "whl.filename.python_tag").as_deref(), Some("py3"));
+        assert_eq!(fstr(&v, "whl.filename.abi_tag").as_deref(), Some("none"));
+        assert_eq!(fstr(&v, "whl.filename.platform_tag").as_deref(), Some("any"));
+        // No build tag in this filename — fact should be absent.
+        assert!(v.get("whl.filename.build").is_none());
+    }
+
+    #[test]
+    fn wheel_filename_with_build_tag() {
+        let v = parse_only("foo-1.0-1-py3-none-any.whl");
+        assert_eq!(fstr(&v, "whl.filename.name_prefix").as_deref(), Some("foo"));
+        assert_eq!(fstr(&v, "whl.filename.version").as_deref(), Some("1.0"));
+        assert_eq!(fstr(&v, "whl.filename.build").as_deref(), Some("1"));
+        assert_eq!(fstr(&v, "whl.filename.python_tag").as_deref(), Some("py3"));
+    }
+
+    #[test]
+    fn wheel_filename_pep440_post_dev_version() {
+        // mixinv2-0.4.0.post45.dev0-py3-none-any.whl — version contains
+        // dots but is still a single hyphen-separated field.
+        let v = parse_only("mixinv2-0.4.0.post45.dev0-py3-none-any.whl");
+        assert_eq!(fstr(&v, "whl.filename.name_prefix").as_deref(), Some("mixinv2"));
+        assert_eq!(
+            fstr(&v, "whl.filename.version").as_deref(),
+            Some("0.4.0.post45.dev0")
+        );
+    }
+
+    #[test]
+    fn wheel_filename_rejects_non_whl_extension() {
+        let v = parse_only("mempalace_dashboard-0.5.0-py3-none-any.zip");
+        assert!(v.get("whl.filename.name_prefix").is_none());
+    }
+
+    #[test]
+    fn wheel_filename_rejects_too_few_fields() {
+        // Looks like a wheel suffix but missing platform tag.
+        let v = parse_only("foo-1.0-py3-none.whl");
+        assert!(v.get("whl.filename.name_prefix").is_none());
+    }
+
+    #[test]
+    fn wheel_filename_rejects_too_many_fields() {
+        let v = parse_only("a-b-c-d-e-f-g.whl");
+        assert!(v.get("whl.filename.name_prefix").is_none());
+    }
+
+    #[test]
+    fn wheel_filename_rejects_empty_name_or_version() {
+        let v = parse_only("-1.0-py3-none-any.whl");
+        assert!(v.get("whl.filename.name_prefix").is_none());
+        let v = parse_only("foo--py3-none-any.whl");
+        assert!(v.get("whl.filename.name_prefix").is_none());
+    }
+
+    /// End-to-end: when a wheel is opened with a path the outer-filename
+    /// facts get parsed *before* the inner dist-info extraction runs,
+    /// so the disagreement between outer claim (`whl.filename.name_prefix`)
+    /// and inner claim (`whl.distribution`) is visible to traits.
+    #[test]
+    fn outer_filename_facts_disagree_with_inner_dist_info() {
+        let whl = build_whl(&[
+            ("realpkg/__init__.py", b""),
+            ("realpkg-1.0.0.dist-info/METADATA", b"Name: realpkg\n"),
+            ("realpkg-1.0.0.dist-info/WHEEL", b""),
+            ("realpkg-1.0.0.dist-info/RECORD", b""),
+        ]);
+        // Pretend an attacker renamed the wheel to claim a different identity.
+        let parsed = crate::open_with_path(
+            std::path::Path::new("/tmp/fake_name-1.0.0-py3-none-any.whl"),
+            &whl,
+        )
+        .unwrap();
+        let v = parsed.values();
+        assert_eq!(
+            v.get("whl.filename.name_prefix").and_then(|x| x.as_str()),
+            Some("fake_name")
+        );
+        assert_eq!(
+            v.get("whl.distribution").and_then(|x| x.as_str()),
+            Some("realpkg")
+        );
     }
 }

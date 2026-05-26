@@ -13,8 +13,22 @@ use goblin::pe::debug::{
 };
 use serde_json::Value as JsonValue;
 
-use crate::formats::common::{hex_encode, put_i64, put_str, put_u64};
+use crate::formats::common::{basename, hex_encode, put_i64, put_str, put_u64, stem};
 use crate::output::Values;
+
+/// Emit the PDB path and its derived basename + stem. The path itself
+/// is the forensic anchor; basename and stem are the comparison
+/// surfaces traits use to flag mismatches against the binary's own
+/// filename (build-pipeline anomaly / commodity-malware repacks reuse
+/// PDB stems across renamed binaries).
+fn put_pdb_path(values: &mut Values, path: &str) {
+    put_str(values, "pe.debug.pdb.path", path);
+    let name = basename(path);
+    if !name.is_empty() {
+        put_str(values, "pe.debug.pdb.basename", name);
+        put_str(values, "pe.debug.pdb.stem", stem(name));
+    }
+}
 
 pub(super) fn extract(debug: &DebugData<'_>, values: &mut Values) {
     // Enumerate every directory entry so a consumer can see the full
@@ -48,7 +62,7 @@ pub(super) fn extract(debug: &DebugData<'_>, values: &mut Values) {
         if let Ok(path) = std::str::from_utf8(cv.filename) {
             let path = path.trim_end_matches('\0');
             if !path.is_empty() {
-                put_str(values, "pe.debug.pdb.path", path);
+                put_pdb_path(values, path);
             }
         }
         put_u64(values, "pe.debug.pdb.age", u64::from(cv.age));
@@ -61,7 +75,7 @@ fn codeview_pdb70(cv: &CodeviewPDB70DebugInfo<'_>, debug: &DebugData<'_>, values
         // trim the trailing NULs before exposing.
         let path = path.trim_end_matches('\0');
         if !path.is_empty() {
-            put_str(values, "pe.debug.pdb.path", path);
+            put_pdb_path(values, path);
         }
     }
     put_str(values, "pe.debug.pdb.guid", format_guid(&cv.signature));
@@ -134,6 +148,7 @@ fn debug_type_label(t: u32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{debug_type_label, format_guid};
+    use crate::output::Values;
 
     #[test]
     fn guid_byteswaps_first_three_groups() {
@@ -226,6 +241,16 @@ mod tests {
             v.get("pe.debug.pdb.path").and_then(|x| x.as_str()),
             Some("C:\\Users\\forveined\\Documents\\nil\\x64\\Release\\Nil.pdb"),
         );
+        // Derived basename / stem — comparison surfaces for traits that
+        // flag PDB / binary filename mismatches.
+        assert_eq!(
+            v.get("pe.debug.pdb.basename").and_then(|x| x.as_str()),
+            Some("Nil.pdb"),
+        );
+        assert_eq!(
+            v.get("pe.debug.pdb.stem").and_then(|x| x.as_str()),
+            Some("Nil"),
+        );
         assert_eq!(
             v.get("pe.debug.pdb.guid").and_then(|x| x.as_str()),
             Some("73c36a97-cc89-44b8-ba8e-75d173799591"),
@@ -246,5 +271,65 @@ mod tests {
             .filter_map(|e| e.get("type").and_then(|t| t.as_str()))
             .collect();
         assert_eq!(types, vec!["codeview", "vc_feature", "pogo", "iltcg"]);
+    }
+
+    /// Helper to drive `put_pdb_path` without standing up a full debug
+    /// blob; returns the populated path / basename / stem triple as
+    /// `(path, basename, stem)`.
+    fn pdb_facts(path: &str) -> (Option<String>, Option<String>, Option<String>) {
+        let mut v = Values::new();
+        super::put_pdb_path(&mut v, path);
+        (
+            v.get("pe.debug.pdb.path")
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
+            v.get("pe.debug.pdb.basename")
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
+            v.get("pe.debug.pdb.stem")
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
+        )
+    }
+
+    #[test]
+    fn pdb_facts_windows_absolute_path() {
+        let (p, b, s) = pdb_facts("C:\\Users\\bob\\stealer.pdb");
+        assert_eq!(p.as_deref(), Some("C:\\Users\\bob\\stealer.pdb"));
+        assert_eq!(b.as_deref(), Some("stealer.pdb"));
+        assert_eq!(s.as_deref(), Some("stealer"));
+    }
+
+    #[test]
+    fn pdb_facts_unix_path() {
+        let (_p, b, s) = pdb_facts("/build/agent/out/foo.pdb");
+        assert_eq!(b.as_deref(), Some("foo.pdb"));
+        assert_eq!(s.as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn pdb_facts_no_directory() {
+        let (_p, b, s) = pdb_facts("loader.pdb");
+        assert_eq!(b.as_deref(), Some("loader.pdb"));
+        assert_eq!(s.as_deref(), Some("loader"));
+    }
+
+    #[test]
+    fn pdb_facts_mixed_slashes() {
+        // PE PDBs are usually pure backslash, but CI builds can leak
+        // forward-slash paths on cross-compiles. Either separator must
+        // peel cleanly.
+        let (_p, b, s) = pdb_facts("C:/work\\release/mixed.pdb");
+        assert_eq!(b.as_deref(), Some("mixed.pdb"));
+        assert_eq!(s.as_deref(), Some("mixed"));
+    }
+
+    #[test]
+    fn pdb_facts_path_with_no_extension() {
+        // Unusual but valid: PDB name with no `.pdb` suffix. Stem
+        // collapses to basename.
+        let (_p, b, s) = pdb_facts("C:\\proj\\OUTPUT");
+        assert_eq!(b.as_deref(), Some("OUTPUT"));
+        assert_eq!(s.as_deref(), Some("OUTPUT"));
     }
 }

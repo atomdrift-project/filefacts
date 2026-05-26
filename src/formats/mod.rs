@@ -35,7 +35,7 @@ mod binary_attribution;
 mod build_toolchain;
 mod chm;
 mod class;
-mod common;
+pub(crate) mod common;
 mod elf;
 mod elf_dwarf;
 mod elf_dynamic;
@@ -50,6 +50,7 @@ mod lnk;
 mod macho;
 mod macho_code_signature;
 mod macho_hashes;
+mod markdown;
 mod ole2;
 mod ooxml;
 mod pdf;
@@ -205,6 +206,14 @@ pub(crate) fn extract(
         FileType::Vbs | FileType::Batch => {
             source::extract_text_only(bytes, metrics);
             Ok(())
+        }
+
+        // Markdown: extract identity-signal facts (first heading, GitHub
+        // refs) for supply-chain impersonation detection. Plain text
+        // metrics get layered on top.
+        FileType::Markdown => {
+            source::extract_text_only(bytes, metrics);
+            markdown::extract(bytes, values, metrics)
         }
 
         _ => Ok(()),
