@@ -751,15 +751,12 @@ fn collect_dict_regions(bytes: &[u8]) -> Vec<DictRegion> {
                 if bytes.get(body_start) == Some(&b'\n') {
                     body_start += 1;
                 }
-                let endstream = find_token_after(bytes, body_start, b"endstream").unwrap_or(e);
-                // Trim a single trailing CR/LF before `endstream`.
-                let mut body_end = endstream;
-                if body_end > body_start && bytes[body_end - 1] == b'\n' {
-                    body_end -= 1;
-                }
-                if body_end > body_start && bytes[body_end - 1] == b'\r' {
-                    body_end -= 1;
-                }
+                let dict = &bytes[dict_start..dict_end];
+                let body_end = match classify_stream_length(dict) {
+                    LengthValue::Direct(n) => declared_stream_end(bytes, body_start, n)
+                        .unwrap_or_else(|| fallback_stream_end(bytes, body_start, e)),
+                    _ => fallback_stream_end(bytes, body_start, e),
+                };
                 Some((body_start, body_end))
             } else {
                 None
@@ -832,6 +829,45 @@ fn find_token_after(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
         pos = abs + needle.len();
     }
     None
+}
+
+/// Return the stream body end implied by a direct `/Length`, but only
+/// when `endstream` sits exactly at that boundary. PDF writers
+/// normally put an EOL before `endstream`, but real generated PDFs may
+/// omit it; in that case compressed body bytes can end with a name
+/// character and form raw byte strings such as `sendstream`. A whole
+/// token scan misses those valid boundaries, so prefer the declared
+/// length when it is self-consistent.
+fn declared_stream_end(bytes: &[u8], body_start: usize, declared: u64) -> Option<usize> {
+    let declared = usize::try_from(declared).ok()?;
+    let body_end = body_start.checked_add(declared)?;
+    if body_end > bytes.len() {
+        return None;
+    }
+    let mut marker = body_end;
+    if bytes.get(marker) == Some(&b'\r') {
+        marker += 1;
+    }
+    if bytes.get(marker) == Some(&b'\n') {
+        marker += 1;
+    }
+    bytes
+        .get(marker..marker.saturating_add(b"endstream".len()))
+        .filter(|w| *w == b"endstream")
+        .map(|_| body_end)
+}
+
+fn fallback_stream_end(bytes: &[u8], body_start: usize, object_end: usize) -> usize {
+    let endstream = find_token_after(bytes, body_start, b"endstream").unwrap_or(object_end);
+    // Trim a single trailing CR/LF before `endstream`.
+    let mut body_end = endstream;
+    if body_end > body_start && bytes[body_end - 1] == b'\n' {
+        body_end -= 1;
+    }
+    if body_end > body_start && bytes[body_end - 1] == b'\r' {
+        body_end -= 1;
+    }
+    body_end
 }
 
 /// Walk each dictionary region for action invocation patterns and
@@ -2409,6 +2445,15 @@ mod tests {
         let pdf = b"%PDF-1.5\n5 0 obj << /Length 10 /Filter /FlateDecode >> stream\nXYZ\nendstream endobj\n%%EOF";
         let (_, m) = extract_pdf(pdf);
         assert!(m.get("pdf.stream_length_mismatch_count").unwrap() >= 1.0);
+    }
+
+    #[test]
+    fn direct_length_allows_adjacent_endstream_marker() {
+        // The body ends with `s`, yielding raw bytes `sendstream`.
+        // Direct /Length still identifies the stream boundary exactly.
+        let pdf = b"%PDF-1.5\n5 0 obj << /Length 4 /Filter /FlateDecode >> stream\nABCsendstream endobj\n%%EOF";
+        let (_, m) = extract_pdf(pdf);
+        assert_eq!(m.get("pdf.stream_length_mismatch_count"), Some(0.0));
     }
 
     // ------------------------------------------------------------------
