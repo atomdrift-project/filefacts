@@ -490,6 +490,13 @@ fn allows_heuristic_extension_override(file_type: FileType) -> bool {
     )
 }
 
+fn has_yaml_extension(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
+}
+
 /// Detect file type from content + path. Content is trusted first, extension as fallback.
 ///
 /// Returns `None` if the file format cannot be identified.
@@ -523,6 +530,9 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
 
         let ext_match = match ext_ft {
             Some(e) if e != file_type => ExtensionMatch::Different(e),
+            None if file_type == FileType::GithubActions && has_yaml_extension(path) => {
+                ExtensionMatch::Consistent
+            }
             None if path.extension().is_some() => ExtensionMatch::Unknown,
             Some(_) | None => ExtensionMatch::Consistent,
         };
@@ -1132,6 +1142,15 @@ mod tests {
         let det = detect(Path::new(".github/workflows/ci.yml"), b"name: CI\n").unwrap();
         assert_eq!(det.file_type, FileType::GithubActions);
         assert_eq!(det.source, DetectionSource::Filename);
+    }
+
+    #[test]
+    fn github_actions_workflow_by_content() {
+        let data = b"name: CI\n\non: [push]\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n";
+        let det = detect(Path::new("ci.yml"), data).unwrap();
+        assert_eq!(det.file_type, FileType::GithubActions);
+        assert_eq!(det.source, DetectionSource::Heuristic);
+        assert!(!det.extension_mismatch());
     }
 
     #[test]

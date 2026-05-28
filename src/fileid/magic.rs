@@ -388,6 +388,10 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         }
     }
 
+    if looks_like_github_actions_workflow(path, data) {
+        return Some((FileType::GithubActions, DetectionSource::Heuristic));
+    }
+
     // Manifest files — only check if there's a filename component
     if path.file_name().is_some() {
         if let Some(ft) = detect_manifest(path, data) {
@@ -406,6 +410,43 @@ fn path_ends_with_ci(path: &Path, suffix: &[u8]) -> bool {
         return false;
     }
     bytes[bytes.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+}
+
+fn looks_like_github_actions_workflow(path: &Path, data: &[u8]) -> bool {
+    if !(path_ends_with_ci(path, b".yml") || path_ends_with_ci(path, b".yaml")) {
+        return false;
+    }
+
+    let Ok(text) = std::str::from_utf8(&data[..data.len().min(16 * 1024)]) else {
+        return false;
+    };
+
+    let mut has_on = false;
+    let mut has_jobs = false;
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with("---") || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue;
+        }
+
+        let Some((key, _)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim_matches(|c| c == '\'' || c == '"' || c == ' ');
+        match key {
+            "on" => has_on = true,
+            "jobs" => has_jobs = true,
+            _ => {}
+        }
+        if has_on && has_jobs {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Classify PK (ZIP) archives into JAR, OOXML, or generic Archive.
