@@ -883,6 +883,7 @@ fn file_type_for_language(name: &str) -> Option<FileType> {
         "kotlin" => FileType::Kotlin,
         "zig" => FileType::Zig,
         "elixir" => FileType::Elixir,
+        "clojure" | "clj" | "cljs" | "cljc" => FileType::Clojure,
         "makefile" | "make" => FileType::Makefile,
         _ => return None,
     })

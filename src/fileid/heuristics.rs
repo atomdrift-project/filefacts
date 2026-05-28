@@ -45,11 +45,12 @@ enum Lang {
     C,
     Kotlin,
     Dockerfile,
+    Clojure,
 }
 
 /// All languages in index order. Used to map score indices back to Lang values
 /// without unsafe transmute.
-const LANGS: [Lang; 11] = [
+const LANGS: [Lang; 12] = [
     Lang::Shell,
     Lang::Python,
     Lang::PowerShell,
@@ -61,6 +62,7 @@ const LANGS: [Lang; 11] = [
     Lang::C,
     Lang::Kotlin,
     Lang::Dockerfile,
+    Lang::Clojure,
 ];
 
 const LANG_COUNT: usize = LANGS.len();
@@ -80,6 +82,7 @@ impl Lang {
             Self::C => 8,
             Self::Kotlin => 9,
             Self::Dockerfile => 10,
+            Self::Clojure => 11,
         }
     }
 
@@ -96,6 +99,7 @@ impl Lang {
             Self::C => FileType::C,
             Self::Kotlin => FileType::Kotlin,
             Self::Dockerfile => FileType::Dockerfile,
+            Self::Clojure => FileType::Clojure,
         }
     }
 }
@@ -191,6 +195,28 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"\nEXPOSE ", Lang::Dockerfile, 5),
     (b"\nVOLUME ", Lang::Dockerfile, 5),
     (b"\nHEALTHCHECK", Lang::Dockerfile, 10),
+    // ── Clojure / ClojureScript / EDN ──
+    // Clojure source heavily shares tokens with the Python pattern list
+    // (`def `, `exec(`, `self.`) so its conclusive patterns are weighted high
+    // enough to win even when Python scores on incidental hits.
+    (b"(defn ", Lang::Clojure, 10),
+    (b"(defn- ", Lang::Clojure, 10),
+    (b"(defmacro ", Lang::Clojure, 10),
+    (b"(defprotocol ", Lang::Clojure, 10),
+    (b"(defmethod ", Lang::Clojure, 10),
+    (b"(defmulti ", Lang::Clojure, 10),
+    (b"(defrecord ", Lang::Clojure, 10),
+    (b"(deftype ", Lang::Clojure, 10),
+    (b"(ns ", Lang::Clojure, 10),
+    (b":require ", Lang::Clojure, 10),
+    (b":require\n", Lang::Clojure, 10),
+    (b"#?(:clj", Lang::Clojure, 10),
+    (b"#?(:cljs", Lang::Clojure, 10),
+    (b"(let [", Lang::Clojure, 5),
+    (b"(if-let [", Lang::Clojure, 5),
+    (b"(when-let [", Lang::Clojure, 5),
+    (b"(fn [", Lang::Clojure, 5),
+    (b"#'", Lang::Clojure, 5),
 ];
 
 struct AcScanner {

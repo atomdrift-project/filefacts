@@ -163,6 +163,8 @@ pub enum FileType {
     Zig,
     /// Elixir source file (.ex, .exs)
     Elixir,
+    /// Clojure / ClojureScript / EDN source (.clj, .cljs, .cljc, .cljr, .edn, .bb)
+    Clojure,
     /// C source file (.c, .h)
     C,
     /// npm package.json manifest
@@ -237,6 +239,8 @@ pub enum FileType {
     /// from generic ZIP so the wheel-specific surface (dist-info, RECORD,
     /// native-extension count, top-level packages) can be extracted.
     Whl,
+    /// Electron ASAR application archive (.asar)
+    Asar,
     /// AppleScript source file (.applescript, .scpt)
     AppleScript,
     /// Apple Property List (.plist)
@@ -313,6 +317,7 @@ impl FileType {
                 | Self::Crx
                 | Self::Xpi
                 | Self::Whl
+                | Self::Asar
                 | Self::Jar
         )
     }
@@ -1419,6 +1424,16 @@ mod tests {
     #[test]
     fn txt_detects_as_text() {
         assert_detect("notes.txt", b"some text here", FileType::Text);
+    }
+
+    #[test]
+    fn asar_detects_as_archive() {
+        assert_detect(
+            "app.asar",
+            b"\x04\x00\x00\x00\x20\x00\x00\x00\x1c\x00\x00\x00\x18\x00\x00\x00{\"files\":{}}",
+            FileType::Asar,
+        );
+        assert!(FileType::Asar.is_archive());
     }
 
     // ── API: detect_content / detect_path ────────────────────────────

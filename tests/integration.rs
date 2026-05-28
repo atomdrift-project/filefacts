@@ -72,12 +72,17 @@ fn json_manifest_parses_once_through_all_views() {
 
 #[test]
 fn generic_json_parses_below_limit() {
-    let parsed =
-        open_with_path(std::path::Path::new("payload.json"), br#"{"cookie":"alert(1)"}"#)
-            .unwrap();
+    let parsed = open_with_path(
+        std::path::Path::new("payload.json"),
+        br#"{"cookie":"alert(1)"}"#,
+    )
+    .unwrap();
     assert_eq!(parsed.fileid().file_type(), FileType::Json);
     assert_eq!(
-        parsed.values().get("cookie").and_then(serde_json::Value::as_str),
+        parsed
+            .values()
+            .get("cookie")
+            .and_then(serde_json::Value::as_str),
         Some("alert(1)")
     );
 }

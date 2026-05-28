@@ -31,6 +31,7 @@ pub(crate) struct ExtractCtx<'a> {
     pub(crate) errors: &'a mut Errors,
 }
 
+mod asar;
 mod binary_attribution;
 mod build_toolchain;
 mod chm;
@@ -109,6 +110,7 @@ pub(crate) fn extract(
         FileType::Zip | FileType::Crx | FileType::Odf => {
             zip::extract(bytes, values, metrics, archive_members)
         }
+        FileType::Asar => asar::extract(bytes, values, metrics, archive_members),
         FileType::Ooxml => {
             // Open the ZIP container once: generic archive facts first,
             // then the OOXML-specific `office.*` layer from the same handle.
@@ -204,7 +206,7 @@ pub(crate) fn extract(
         // Text-like languages without a tree-sitter binding in filefacts.
         // They still earn `text.*` metrics — pure byte/line analysis,
         // no AST required.
-        FileType::Vbs | FileType::Batch => {
+        FileType::Vbs | FileType::Batch | FileType::Clojure => {
             source::extract_text_only(bytes, metrics);
             Ok(())
         }
