@@ -678,6 +678,13 @@ mod tests {
     }
 
     #[test]
+    fn pe_extension_is_consistent() {
+        let det = detect(Path::new("app.exe"), b"MZ\x90\x00\x03\x00\x00\x00").unwrap();
+        assert_eq!(det.file_type, FileType::Pe);
+        assert!(!det.extension_mismatch());
+    }
+
+    #[test]
     fn pe_mismatch() {
         let det = detect(Path::new("font.woff2"), b"MZ\x90\x00\x03\x00\x00\x00").unwrap();
         assert_eq!(det.file_type, FileType::Pe);

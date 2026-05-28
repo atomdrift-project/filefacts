@@ -229,6 +229,7 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
             Some(FileType::Ooxml)
         }
         "odt" | "ods" | "odp" | "odg" | "odf" | "ott" | "ots" | "otp" => Some(FileType::Odf),
+        "exe" | "dll" | "sys" | "scr" | "cpl" | "ocx" | "drv" | "efi" => Some(FileType::Pe),
         "lnk" => Some(FileType::Lnk),
         "pdf" => Some(FileType::Pdf),
         "jpg" | "jpeg" => Some(FileType::Jpeg),
