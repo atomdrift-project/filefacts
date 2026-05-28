@@ -21,6 +21,18 @@ use crate::output::{Arg, ArgShape, Metrics, Symbol, Symbols};
 
 use super::langs::LangConfig;
 
+/// Hard cap on AST recursion depth.
+///
+/// tree-sitter trees can be arbitrarily deep on generated or adversarial
+/// source (thousands of nested brackets, binary expressions, etc.).
+/// `walk_node` recurses one stack frame per level, so an unbounded walk
+/// overflows the worker thread's stack and aborts the whole process. We
+/// stop descending here instead. Real source is rarely more than a few
+/// dozen levels deep; anything past this is machine-generated and yields no
+/// useful symbols. `ast.max_depth` saturates at this value, which is itself
+/// a usable "pathologically nested" signal.
+pub(super) const MAX_AST_DEPTH: u32 = 1000;
+
 pub(super) fn walk(
     root: Node<'_>,
     source: &str,
@@ -112,6 +124,10 @@ impl State {
         self.node_count += 1;
         if depth > self.max_depth {
             self.max_depth = depth;
+        }
+        // Stop before a pathologically deep tree overflows the stack.
+        if depth >= MAX_AST_DEPTH {
+            return;
         }
 
         let pushed_scope = if is_class_scope(node.kind(), config.name) {

@@ -736,4 +736,40 @@ mod tests {
             assert_eq!(*src, "python");
         }
     }
+
+    /// Regression: `walk_node` used to recurse one stack frame per tree
+    /// level with no bound, so a pathologically deep source file (e.g.
+    /// thousands of nested parens) overflowed the worker stack and aborted
+    /// the whole process. The walk must now stop at [`ast_walk::MAX_AST_DEPTH`]
+    /// and complete, with `ast.max_depth` saturating at the cap.
+    #[test]
+    fn deeply_nested_source_does_not_overflow_stack() {
+        let nesting = (super::ast_walk::MAX_AST_DEPTH as usize) * 3;
+        let mut src = String::with_capacity(nesting * 2 + 8);
+        src.push_str("x = ");
+        src.push_str(&"(".repeat(nesting));
+        src.push('1');
+        src.push_str(&")".repeat(nesting));
+        src.push('\n');
+
+        // Run on a worker-sized stack so the test reflects production limits
+        // rather than the test harness's smaller default stack.
+        let max_depth = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let parsed =
+                    crate::open_with_path(std::path::Path::new("deep.js"), src.as_bytes())
+                        .expect("parse deep js");
+                parsed.metrics().get("ast.max_depth").unwrap_or(0.0)
+            })
+            .expect("spawn walker thread")
+            .join()
+            .expect("deep AST walk must not overflow the stack");
+
+        assert_eq!(
+            max_depth,
+            f64::from(super::ast_walk::MAX_AST_DEPTH),
+            "ast.max_depth should saturate at the recursion cap"
+        );
+    }
 }
