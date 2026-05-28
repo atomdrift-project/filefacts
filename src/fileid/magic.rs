@@ -439,7 +439,20 @@ fn classify_pk(path: &Path, data: &[u8]) -> (FileType, DetectionSource) {
     // OpenDocument Format by extension
     if matches!(
         ext,
-        "odt" | "ods" | "odp" | "odg" | "odf" | "ott" | "ots" | "otp"
+        "odt"
+            | "ods"
+            | "odp"
+            | "odg"
+            | "odf"
+            | "ott"
+            | "ots"
+            | "otp"
+            | "odm"
+            | "oth"
+            | "otg"
+            | "odb"
+            | "odc"
+            | "odi"
     ) {
         return (FileType::Odf, DetectionSource::Magic);
     }
@@ -447,7 +460,30 @@ fn classify_pk(path: &Path, data: &[u8]) -> (FileType, DetectionSource) {
     // OOXML by content (scan for [Content_Types].xml) — but not for archive containers
     let is_archive_opc = matches!(
         ext,
-        "zip" | "jar" | "vsix" | "nupkg" | "xpi" | "whl" | "epub" | "apk" | "ipa"
+        "zip"
+            | "jar"
+            | "war"
+            | "ear"
+            | "vsix"
+            | "nupkg"
+            | "xpi"
+            | "whl"
+            | "epub"
+            | "apk"
+            | "ipa"
+            | "aar"
+            | "egg"
+            | "phar"
+            | "pyz"
+            | "conda"
+            | "msix"
+            | "appx"
+            | "msixbundle"
+            | "appxbundle"
+            | "aab"
+            | "apks"
+            | "xapk"
+            | "cbz"
     );
     if !is_archive_opc && memchr::memmem::find(data, b"[Content_Types].xml").is_some() {
         return (FileType::Ooxml, DetectionSource::Magic);

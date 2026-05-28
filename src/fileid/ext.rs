@@ -54,6 +54,11 @@ pub(crate) fn detect_from_path(path: &Path) -> Option<FileType> {
         return Some(FileType::Tar);
     }
 
+    // Versioned ELF shared libraries, e.g. libssl.so.3 or libc.so.6.
+    if has_versioned_so_suffix(&path_str) {
+        return Some(FileType::Elf);
+    }
+
     // JAR/WAR/EAR by extension
     if ends_with_ci(p, b".jar") || ends_with_ci(p, b".war") || ends_with_ci(p, b".ear") {
         return Some(FileType::Jar);
@@ -189,22 +194,24 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
     };
 
     match ext_lower {
-        "sh" | "bash" | "ksh" | "zsh" | "csh" | "tcsh" | "dash" => Some(FileType::Shell),
-        "py" | "pth" => Some(FileType::Python),
-        "js" | "mjs" | "cjs" | "jsx" => Some(FileType::JavaScript),
+        "sh" | "bash" | "ksh" | "zsh" | "csh" | "tcsh" | "dash" | "fish" | "command" => {
+            Some(FileType::Shell)
+        }
+        "py" | "pyw" | "pyi" | "pth" => Some(FileType::Python),
+        "js" | "mjs" | "cjs" | "jsx" | "jse" => Some(FileType::JavaScript),
         "ts" | "tsx" | "mts" | "cts" => Some(FileType::TypeScript),
         "go" => Some(FileType::Go),
         "rs" => Some(FileType::Rust),
         "java" => Some(FileType::Java),
         "class" => Some(FileType::JavaClass),
-        "pyc" => Some(FileType::PythonBytecode),
-        "rb" | "rbs" => Some(FileType::Ruby),
-        "php" => Some(FileType::Php),
+        "pyc" | "pyo" => Some(FileType::PythonBytecode),
+        "rb" | "rbs" | "gemspec" => Some(FileType::Ruby),
+        "php" | "php3" | "php4" | "php5" | "php7" | "phtml" => Some(FileType::Php),
         "pl" | "pm" | "t" => Some(FileType::Perl),
         "ps1" | "psm1" | "psd1" => Some(FileType::PowerShell),
         "kt" | "kts" => Some(FileType::Kotlin),
         "bat" | "cmd" => Some(FileType::Batch),
-        "vbs" | "vbe" | "wsf" | "wsc" => Some(FileType::Vbs),
+        "vbs" | "vbe" | "wsf" | "wsc" | "wsh" => Some(FileType::Vbs),
         "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" | "hxx" | "hh" | "pas" | "dpr" | "asm" | "s"
         | "nasm" => Some(FileType::C),
         "lua" => Some(FileType::Lua),
@@ -220,33 +227,40 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "service" => Some(FileType::SystemdService),
         "desktop" => Some(FileType::DesktopEntry),
         "xml" | "csproj" | "vbproj" | "fsproj" | "proj" | "props" | "targets" | "vcxproj"
-        | "xaml" | "config" | "settings" | "svg" => Some(FileType::Xml),
+        | "xaml" | "config" | "settings" | "svg" | "nuspec" | "wsdl" | "xsd" | "xsl" | "xslt" => {
+            Some(FileType::Xml)
+        }
         "json" => Some(FileType::Json),
         "plist" | "resx" => Some(FileType::Plist),
         "rtf" => Some(FileType::Rtf),
-        "doc" | "msi" | "msp" | "msg" | "dot" | "ppt" | "xls" | "xlt" => Some(FileType::OleDoc),
-        "docx" | "xlsx" | "pptx" | "docm" | "xlsm" | "pptm" | "dotx" | "dotm" | "xltx" | "xltm" => {
+        "doc" | "msi" | "msp" | "msg" | "dot" | "ppt" | "pps" | "pot" | "ppa" | "xls" | "xlt"
+        | "xla" => Some(FileType::OleDoc),
+        "docx" | "xlsx" | "pptx" | "docm" | "xlsm" | "pptm" | "dotx" | "dotm" | "xltx" | "xltm"
+        | "xlam" | "ppam" | "potx" | "potm" | "ppsx" | "ppsm" | "sldx" | "sldm" => {
             Some(FileType::Ooxml)
         }
-        "odt" | "ods" | "odp" | "odg" | "odf" | "ott" | "ots" | "otp" => Some(FileType::Odf),
-        "exe" | "dll" | "sys" | "scr" | "cpl" | "ocx" | "drv" | "efi" => Some(FileType::Pe),
+        "odt" | "ods" | "odp" | "odg" | "odf" | "ott" | "ots" | "otp" | "odm" | "oth" | "otg"
+        | "odb" | "odc" | "odi" => Some(FileType::Odf),
+        "exe" | "dll" | "sys" | "scr" | "cpl" | "ocx" | "drv" | "efi" | "pyd" => Some(FileType::Pe),
+        "so" | "elf" | "ko" => Some(FileType::Elf),
+        "dylib" | "bundle" => Some(FileType::MachO),
         "lnk" => Some(FileType::Lnk),
         "pdf" => Some(FileType::Pdf),
-        "jpg" | "jpeg" => Some(FileType::Jpeg),
+        "jpg" | "jpeg" | "jpe" | "jfif" => Some(FileType::Jpeg),
         "png" => Some(FileType::Png),
         "pkl" | "pickle" | "joblib" => Some(FileType::Pickle),
-        "zip" | "apk" | "ipa" | "epub" | "nupkg" | "vsix" | "aar" | "egg" | "phar" => {
-            Some(FileType::Zip)
-        }
+        "zip" | "apk" | "ipa" | "epub" | "nupkg" | "vsix" | "aar" | "egg" | "phar" | "pyz"
+        | "conda" | "msix" | "appx" | "msixbundle" | "appxbundle" | "aab" | "apks" | "xapk"
+        | "cbz" => Some(FileType::Zip),
         "xpi" => Some(FileType::Xpi),
         "whl" => Some(FileType::Whl),
-        "7z" => Some(FileType::SevenZ),
-        "rar" => Some(FileType::Rar),
-        "deb" => Some(FileType::Deb),
-        "rpm" => Some(FileType::Rpm),
+        "7z" | "cb7" => Some(FileType::SevenZ),
+        "rar" | "cbr" => Some(FileType::Rar),
+        "deb" | "udeb" => Some(FileType::Deb),
+        "rpm" | "srpm" => Some(FileType::Rpm),
         "crx" => Some(FileType::Crx),
         "pkg" => Some(FileType::Pkg),
-        "cab" => Some(FileType::Cab),
+        "cab" | "msu" => Some(FileType::Cab),
         "chm" => Some(FileType::Chm),
         "asar" => Some(FileType::Asar),
         "gz" => Some(FileType::Gz),
@@ -263,6 +277,21 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "dat" | "bin" | "payload" | "raw" => Some(FileType::Data),
         _ => None,
     }
+}
+
+fn has_versioned_so_suffix(path: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let bytes = name.as_bytes();
+    let Some(pos) = bytes
+        .windows(4)
+        .rposition(|window| window.eq_ignore_ascii_case(b".so."))
+    else {
+        return false;
+    };
+    let suffix = &bytes[pos + 4..];
+    !suffix.is_empty()
+        && suffix.iter().any(u8::is_ascii_digit)
+        && suffix.iter().all(|b| b.is_ascii_digit() || *b == b'.')
 }
 
 /// Case-insensitive suffix check on raw bytes (no allocation).
@@ -285,14 +314,35 @@ mod tests {
             Some(FileType::Python)
         );
         assert_eq!(
+            detect_from_path(Path::new("windowed.pyw")),
+            Some(FileType::Python)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("types.pyi")),
+            Some(FileType::Python)
+        );
+        assert_eq!(
             detect_from_path(Path::new("site-package.pth")),
             Some(FileType::Python)
         );
     }
 
     #[test]
+    fn compiled_python_extensions() {
+        assert_eq!(
+            detect_from_path(Path::new("module.pyc")),
+            Some(FileType::PythonBytecode)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("module.pyo")),
+            Some(FileType::PythonBytecode)
+        );
+        assert_eq!(detect_from_path(Path::new("app.pyz")), Some(FileType::Zip));
+    }
+
+    #[test]
     fn shell_extensions() {
-        for ext in &["sh", "bash", "zsh", "ksh"] {
+        for ext in &["sh", "bash", "zsh", "ksh", "fish", "command"] {
             let path = format!("script.{ext}");
             assert_eq!(
                 detect_from_path(Path::new(&path)),
@@ -386,6 +436,142 @@ mod tests {
     }
 
     #[test]
+    fn native_binary_extensions() {
+        assert_eq!(detect_from_path(Path::new("app.exe")), Some(FileType::Pe));
+        assert_eq!(
+            detect_from_path(Path::new("native.pyd")),
+            Some(FileType::Pe)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("libfoo.so")),
+            Some(FileType::Elf)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("module.ko")),
+            Some(FileType::Elf)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("/usr/lib/libssl.so.3")),
+            Some(FileType::Elf)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("/usr/lib/libc.so.6.1")),
+            Some(FileType::Elf)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("libfoo.dylib")),
+            Some(FileType::MachO)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("Plugin.bundle")),
+            Some(FileType::MachO)
+        );
+        assert_eq!(detect_from_path(Path::new("note.so.old")), None);
+    }
+
+    #[test]
+    fn package_archive_aliases() {
+        for name in [
+            "pkg.conda",
+            "app.msix",
+            "app.appx",
+            "bundle.msixbundle",
+            "bundle.appxbundle",
+            "android.aab",
+            "split.apks",
+            "bundle.xapk",
+            "comic.cbz",
+        ] {
+            assert_eq!(
+                detect_from_path(Path::new(name)),
+                Some(FileType::Zip),
+                "failed for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_family_aliases() {
+        assert_eq!(
+            detect_from_path(Path::new("installer.msu")),
+            Some(FileType::Cab)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("package.udeb")),
+            Some(FileType::Deb)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("source.srpm")),
+            Some(FileType::Rpm)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("comic.cbr")),
+            Some(FileType::Rar)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("comic.cb7")),
+            Some(FileType::SevenZ)
+        );
+    }
+
+    #[test]
+    fn odf_alias_extensions() {
+        for name in [
+            "text.odm",
+            "web.oth",
+            "drawing.otg",
+            "database.odb",
+            "chart.odc",
+            "image.odi",
+        ] {
+            assert_eq!(
+                detect_from_path(Path::new(name)),
+                Some(FileType::Odf),
+                "failed for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn office_alias_extensions() {
+        for name in ["show.pps", "template.pot", "addin.ppa", "addin.xla"] {
+            assert_eq!(
+                detect_from_path(Path::new(name)),
+                Some(FileType::OleDoc),
+                "failed for {name}"
+            );
+        }
+        for name in [
+            "addin.xlam",
+            "addin.ppam",
+            "template.potx",
+            "template.potm",
+            "show.ppsx",
+            "show.ppsm",
+            "slide.sldx",
+            "slide.sldm",
+        ] {
+            assert_eq!(
+                detect_from_path(Path::new(name)),
+                Some(FileType::Ooxml),
+                "failed for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_alias_extensions() {
+        assert_eq!(
+            detect_from_path(Path::new("photo.jpe")),
+            Some(FileType::Jpeg)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("photo.jfif")),
+            Some(FileType::Jpeg)
+        );
+    }
+
+    #[test]
     fn unknown_extension() {
         assert_eq!(detect_from_path(Path::new("file.xyz")), None);
     }
@@ -405,6 +591,38 @@ mod tests {
         assert_eq!(
             detect_from_path(Path::new("script.PY")),
             Some(FileType::Python)
+        );
+    }
+
+    #[test]
+    fn source_alias_extensions() {
+        assert_eq!(
+            detect_from_path(Path::new("payload.jse")),
+            Some(FileType::JavaScript)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("plugin.gemspec")),
+            Some(FileType::Ruby)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("shell.phtml")),
+            Some(FileType::Php)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("shell.php5")),
+            Some(FileType::Php)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("settings.wsh")),
+            Some(FileType::Vbs)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("package.nuspec")),
+            Some(FileType::Xml)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("schema.xsd")),
+            Some(FileType::Xml)
         );
     }
 

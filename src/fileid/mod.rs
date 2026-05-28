@@ -792,6 +792,20 @@ mod tests {
         assert!(FileType::Whl.is_archive());
     }
 
+    #[test]
+    fn opc_package_archives_do_not_route_to_ooxml() {
+        let data = b"PK\x03\x04[Content_Types].xml";
+        for name in [
+            "app.msix",
+            "app.appx",
+            "bundle.msixbundle",
+            "bundle.appxbundle",
+            "comic.cbz",
+        ] {
+            assert_detect(name, data, FileType::Zip);
+        }
+    }
+
     // ── Python ───────────────────────────────────────────────────────
 
     #[test]
@@ -1599,6 +1613,7 @@ mod tests {
     fn mangled_temp_name_does_not_detect_package_json() {
         // Old behavior: TempBuilder::new().suffix("_package.json") produces
         // a filename like ".tmpXXXXXX_package.json" which doesn't match.
-        assert!(detect(Path::new("/tmp/.tmpABC_package.json"), b"{}").is_none());
+        let det = detect(Path::new("/tmp/.tmpABC_package.json"), b"{}").unwrap();
+        assert_eq!(det.file_type, FileType::Json);
     }
 }
