@@ -145,6 +145,12 @@ fn detect_from_filename(path: &Path) -> Option<FileType> {
     if name.eq_ignore_ascii_case("pyproject.toml") {
         return Some(FileType::PyProjectToml);
     }
+    if name.eq_ignore_ascii_case(".pkginfo")
+        || name.eq_ignore_ascii_case(".buildinfo")
+        || name.eq_ignore_ascii_case(".mtree")
+    {
+        return Some(FileType::Text);
+    }
     if name.eq_ignore_ascii_case("pkg-info") || name.eq_ignore_ascii_case("metadata") {
         return Some(FileType::PkgInfo);
     }

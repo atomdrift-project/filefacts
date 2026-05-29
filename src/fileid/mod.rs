@@ -23,7 +23,7 @@ mod ext;
 mod heuristics;
 mod magic;
 
-use std::path::Path;
+use std::{io::Read, path::Path};
 
 use serde::Serialize;
 
@@ -497,6 +497,27 @@ fn has_yaml_extension(path: &Path) -> bool {
     ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
 }
 
+fn is_freebsd_pkg_zstd(path: &Path, data: &[u8], file_type: FileType) -> bool {
+    if !matches!(file_type, FileType::TarZst | FileType::Zst) {
+        return false;
+    }
+    if !path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.len() >= 4 && name[name.len() - 4..].eq_ignore_ascii_case(".pkg"))
+    {
+        return false;
+    }
+    let Ok(mut decoder) = zstd::stream::read::Decoder::new(data) else {
+        return false;
+    };
+    let mut prefix = [0u8; 32];
+    let Ok(n) = decoder.read(&mut prefix) else {
+        return false;
+    };
+    prefix[..n].starts_with(b"+COMPACT_MANIFEST") || prefix[..n].starts_with(b"+MANIFEST")
+}
+
 /// Detect file type from content + path. Content is trusted first, extension as fallback.
 ///
 /// Returns `None` if the file format cannot be identified.
@@ -529,6 +550,9 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
         }
 
         let ext_match = match ext_ft {
+            Some(FileType::Pkg) if is_freebsd_pkg_zstd(path, data, file_type) => {
+                ExtensionMatch::Consistent
+            }
             Some(e) if e != file_type => ExtensionMatch::Different(e),
             None if file_type == FileType::GithubActions && has_yaml_extension(path) => {
                 ExtensionMatch::Consistent
@@ -1181,6 +1205,13 @@ mod tests {
         assert_detect("METADATA", b"Metadata-Version: 2.1\n", FileType::PkgInfo);
     }
 
+    #[test]
+    fn arch_package_metadata_files_are_text() {
+        assert_detect(".PKGINFO", b"pkgname = wasm-pkg-tools\n", FileType::Text);
+        assert_detect(".BUILDINFO", b"format = 2\n", FileType::Text);
+        assert_detect(".MTREE", b"#mtree\n", FileType::Text);
+    }
+
     // ── Archives ─────────────────────────────────────────────────────
 
     #[test]
@@ -1216,6 +1247,15 @@ mod tests {
     #[test]
     fn zstd_archive() {
         assert_detect("data.zst", &[0x28, 0xB5, 0x2F, 0xFD, 0, 0], FileType::Zst);
+    }
+
+    #[test]
+    fn freebsd_pkg_zstd_is_not_extension_mismatch() {
+        let data = zstd::encode_all(&b"+COMPACT_MANIFEST\0payload"[..], 3).unwrap();
+        let det = detect(Path::new("BerkeleyGW-4.0_2.pkg"), &data).unwrap();
+        assert_eq!(det.file_type, FileType::TarZst);
+        assert_eq!(det.source, DetectionSource::Magic);
+        assert!(!det.extension_mismatch());
     }
 
     #[test]

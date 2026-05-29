@@ -757,9 +757,8 @@ mod tests {
         let max_depth = std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .spawn(move || {
-                let parsed =
-                    crate::open_with_path(std::path::Path::new("deep.js"), src.as_bytes())
-                        .expect("parse deep js");
+                let parsed = crate::open_with_path(std::path::Path::new("deep.js"), src.as_bytes())
+                    .expect("parse deep js");
                 parsed.metrics().get("ast.max_depth").unwrap_or(0.0)
             })
             .expect("spawn walker thread")

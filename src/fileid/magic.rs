@@ -3,7 +3,7 @@
 //! Uses a first-byte jump table to avoid sequential if-chains. Most files are
 //! identified by examining only the first 4-20 bytes.
 
-use std::path::Path;
+use std::{io::Read, path::Path};
 
 use super::{DetectionSource, FileType};
 
@@ -329,6 +329,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
                     || path_ends_with_ci(path, b".tzst")
                     || path_ends_with_ci(path, b".xbps")
                     || path_ends_with_ci(path, b".pkg.tar.zst")
+                    || is_freebsd_pkg_zstd(path, data)
                 {
                     FileType::TarZst
                 } else {
@@ -410,6 +411,20 @@ fn path_ends_with_ci(path: &Path, suffix: &[u8]) -> bool {
         return false;
     }
     bytes[bytes.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+}
+
+fn is_freebsd_pkg_zstd(path: &Path, data: &[u8]) -> bool {
+    if !path_ends_with_ci(path, b".pkg") {
+        return false;
+    }
+    let Ok(mut decoder) = zstd::stream::read::Decoder::new(data) else {
+        return false;
+    };
+    let mut prefix = [0u8; 32];
+    let Ok(n) = decoder.read(&mut prefix) else {
+        return false;
+    };
+    prefix[..n].starts_with(b"+COMPACT_MANIFEST") || prefix[..n].starts_with(b"+MANIFEST")
 }
 
 fn looks_like_github_actions_workflow(path: &Path, data: &[u8]) -> bool {
@@ -716,6 +731,7 @@ fn detect_manifest(path: &Path, data: &[u8]) -> Option<FileType> {
             }
         }
         "extension.vsixmanifest" => Some(FileType::VsixManifest),
+        ".pkginfo" | ".buildinfo" | ".mtree" => Some(FileType::Text),
         "pkg-info" | "metadata" => Some(FileType::PkgInfo),
         "action.yml" | "action.yaml" => Some(FileType::GithubActions),
         _ => {
@@ -960,6 +976,13 @@ mod tests {
         let data = [0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00];
         let (ft, _) = detect_from_content(Path::new("data.zst"), &data).unwrap();
         assert_eq!(ft, FileType::Zst);
+    }
+
+    #[test]
+    fn freebsd_pkg_zstd_archive() {
+        let data = zstd::encode_all(&b"+COMPACT_MANIFEST\0payload"[..], 3).unwrap();
+        let (ft, _) = detect_from_content(Path::new("BerkeleyGW-4.0_2.pkg"), &data).unwrap();
+        assert_eq!(ft, FileType::TarZst);
     }
 
     #[test]
