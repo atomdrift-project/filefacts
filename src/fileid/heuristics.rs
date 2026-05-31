@@ -178,12 +178,16 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"section .text", Lang::C, 10),
     (b"[BITS 32]", Lang::C, 10),
     // ── Kotlin ──
-    (b"package ", Lang::Kotlin, 10),
-    (b"import kotlin", Lang::Kotlin, 5),
+    // `package ` is NOT conclusive: it appears in English prose ("a package
+    // for…"), Java, and package-manifest text, so it stays a supporting weight
+    // and must be corroborated by a second Kotlin hit. The Kotlin-exclusive
+    // tokens (`import kotlin`, `suspend fun `) carry the conclusive weight.
+    (b"package ", Lang::Kotlin, 5),
+    (b"import kotlin", Lang::Kotlin, 10),
     (b"fun main(", Lang::Kotlin, 5),
     (b"val ", Lang::Kotlin, 5),
     (b"var ", Lang::Kotlin, 5),
-    (b"suspend fun ", Lang::Kotlin, 5),
+    (b"suspend fun ", Lang::Kotlin, 10),
     // ── Dockerfile ──
     (b"\nFROM ", Lang::Dockerfile, 10),
     (b"FROM scratch", Lang::Dockerfile, 10),
@@ -491,5 +495,17 @@ class BaselineProfileGenerator {
 }
 ";
         assert_eq!(detect_from_content(data), Some(FileType::Kotlin));
+    }
+
+    #[test]
+    fn prose_with_package_word_is_not_kotlin() {
+        // Texinfo/prose that line-wraps to "package for creating scripts"
+        // (GNU Autoconf manual) must not be mistaken for Kotlin via a bare
+        // `package ` substring. With no second Kotlin token it stays below
+        // threshold.
+        let data = b"This is ./autoconf.info, produced by makeinfo version 4.8 from\n\
+./autoconf.texi.  This manual is for GNU Autoconf, a\n\
+package for creating scripts to configure source code packages.\n";
+        assert_eq!(detect_from_content(data), None);
     }
 }

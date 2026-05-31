@@ -211,6 +211,7 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "java" => Some(FileType::Java),
         "class" => Some(FileType::JavaClass),
         "pyc" | "pyo" => Some(FileType::PythonBytecode),
+        "beam" => Some(FileType::Beam),
         "rb" | "rbs" | "gemspec" => Some(FileType::Ruby),
         "php" | "php3" | "php4" | "php5" | "php7" | "phtml" => Some(FileType::Php),
         "pl" | "pm" | "t" => Some(FileType::Perl),

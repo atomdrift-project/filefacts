@@ -135,6 +135,8 @@ pub enum FileType {
     JavaClass,
     /// Python compiled bytecode (.pyc)
     PythonBytecode,
+    /// Erlang/Elixir compiled BEAM bytecode (.beam; `FOR1`…`BEAM` IFF container)
+    Beam,
     /// Java archive (.jar, .war, .ear)
     Jar,
     /// Ruby source file (.rb)
@@ -327,7 +329,12 @@ impl FileType {
     pub fn is_binary(&self) -> bool {
         matches!(
             self,
-            Self::Elf | Self::Pe | Self::MachO | Self::JavaClass | Self::PythonBytecode
+            Self::Elf
+                | Self::Pe
+                | Self::MachO
+                | Self::JavaClass
+                | Self::PythonBytecode
+                | Self::Beam
         )
     }
 

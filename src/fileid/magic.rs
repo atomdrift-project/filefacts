@@ -177,6 +177,9 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // Compiled AppleScript: Fasd
             if data.starts_with(b"Fasd") {
                 Some((FileType::AppleScript, DetectionSource::Magic))
+            } else if data.len() >= 12 && data.starts_with(b"FOR1") && &data[8..12] == b"BEAM" {
+                // Erlang/Elixir BEAM bytecode: IFF container `FOR1` <u32 size> `BEAM`.
+                Some((FileType::Beam, DetectionSource::Magic))
             } else {
                 None
             }
@@ -969,6 +972,22 @@ mod tests {
         let data = [0x42, 0x0D, 0x0D, 0x0A, 0x00, 0x00, 0x00, 0x00];
         let (ft, _) = detect_from_content(Path::new("module.pyc"), &data).unwrap();
         assert_eq!(ft, FileType::PythonBytecode);
+    }
+
+    #[test]
+    fn beam_bytecode() {
+        // IFF container: `FOR1` <u32 size> `BEAM`
+        let data = *b"FOR1\x00\x00\x40\x08BEAMAtU8";
+        let (ft, src) = detect_from_content(Path::new("gb_trees.beam"), &data).unwrap();
+        assert_eq!(ft, FileType::Beam);
+        assert_eq!(src, DetectionSource::Magic);
+    }
+
+    #[test]
+    fn for1_without_beam_is_not_beam() {
+        // `FOR1` IFF header for a non-BEAM form (e.g. AIFF would be `FORM`) must not match.
+        let data = *b"FOR1\x00\x00\x00\x08AIFFxxxx";
+        assert!(detect_from_content(Path::new("x"), &data).is_none());
     }
 
     #[test]
