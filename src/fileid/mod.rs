@@ -45,6 +45,7 @@ pub struct FileId {
     pub(crate) file_type: FileType,
     pub(crate) source: DetectionSource,
     pub(crate) extension_mismatch: bool,
+    pub(crate) extension_mismatch_low_severity: bool,
 }
 
 impl FileId {
@@ -64,15 +65,26 @@ impl FileId {
     #[must_use]
     pub fn from_path_and_bytes(path: &Path, bytes: &[u8]) -> Self {
         match detect(path, bytes) {
-            Some(d) => Self {
-                file_type: d.file_type,
-                source: d.source,
-                extension_mismatch: d.extension_mismatch(),
-            },
+            Some(d) => {
+                // Apply benign carve-outs (AppleDouble sidecars, Android APK,
+                // XHTML) so the reported mismatch is an evasion signal rather
+                // than a known format convention. FreeBSD `.pkg` zstd is already
+                // resolved as Consistent during detection.
+                let mismatch =
+                    d.extension_mismatch() && !is_benign_extension_mismatch(path, bytes, &d);
+                Self {
+                    file_type: d.file_type,
+                    source: d.source,
+                    extension_mismatch: mismatch,
+                    extension_mismatch_low_severity: mismatch
+                        && is_low_severity_extension_mismatch(&d),
+                }
+            }
             None => Self {
                 file_type: FileType::Unknown,
                 source: DetectionSource::Heuristic,
                 extension_mismatch: false,
+                extension_mismatch_low_severity: false,
             },
         }
     }
@@ -90,10 +102,20 @@ impl FileId {
     }
 
     /// `true` when content-based detection disagrees with the file's
-    /// extension. Useful as a low-friction evasion signal.
+    /// extension. Useful as a low-friction evasion signal. Benign format
+    /// conventions (AppleDouble sidecars, Android APK, XHTML, FreeBSD pkg)
+    /// are excluded.
     #[must_use]
     pub fn extension_mismatch(&self) -> bool {
         self.extension_mismatch
+    }
+
+    /// `true` when [`Self::extension_mismatch`] holds but the disagreeing
+    /// pair is low-severity (extension implies opaque `Data`, or the content
+    /// is a generic archive), rather than an executable masquerade.
+    #[must_use]
+    pub fn extension_mismatch_low_severity(&self) -> bool {
+        self.extension_mismatch_low_severity
     }
 }
 
@@ -523,6 +545,66 @@ fn is_freebsd_pkg_zstd(path: &Path, data: &[u8], file_type: FileType) -> bool {
         return false;
     };
     prefix[..n].starts_with(b"+COMPACT_MANIFEST") || prefix[..n].starts_with(b"+MANIFEST")
+}
+
+/// True when an extension/content disagreement is a known benign format
+/// convention rather than an evasion signal. Mirrors the carve-outs cleave
+/// previously applied before emitting `metadata/file-extension-mismatch`.
+fn is_benign_extension_mismatch(path: &Path, data: &[u8], det: &Detection) -> bool {
+    // macOS AppleDouble sidecars (`._name`) carry resource-fork bytes whose
+    // type intentionally differs from the extension — convention, not evasion.
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("._"))
+    {
+        return true;
+    }
+    let Some(ext_type) = det.extension_type() else {
+        return false;
+    };
+    let content = det.file_type;
+    let name_ends_ci = |suffix: &str| {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| {
+                n.len() >= suffix.len() && n[n.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+            })
+    };
+    // Android/Alpine APK: `.apk` (extension maps to Zip) whose body is a tar(.gz/…).
+    if name_ends_ci(".apk")
+        && ext_type == FileType::Zip
+        && matches!(
+            content,
+            FileType::Tar
+                | FileType::TarGz
+                | FileType::TarBz2
+                | FileType::TarXz
+                | FileType::TarZst
+        )
+    {
+        return true;
+    }
+    // XHTML served with a `.html` extension but parsed as XML.
+    if ext_type == FileType::Html && content == FileType::Xml {
+        let n = data.len().min(4096);
+        let prefix = String::from_utf8_lossy(&data[..n]).to_ascii_lowercase();
+        if prefix.contains("<!doctype html") || prefix.contains("<html") {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when a genuine extension/content mismatch is low-severity: the
+/// extension implies opaque `Data`, or the content is a generic archive
+/// (`.tar.gz` / `.zip`). Everything else (notably executable masquerades) is
+/// higher-severity. Mirrors cleave's former `extension_content_mismatch_criticality`.
+fn is_low_severity_extension_mismatch(det: &Detection) -> bool {
+    let Some(ext_type) = det.extension_type() else {
+        return false;
+    };
+    ext_type == FileType::Data || matches!(det.file_type, FileType::TarGz | FileType::Zip)
 }
 
 /// Detect file type from content + path. Content is trusted first, extension as fallback.

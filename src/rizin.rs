@@ -303,6 +303,13 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
 
     apply_unix_hardening(&mut cmd);
 
+    // Per-run timing so binary-heavy archives can be diagnosed at the
+    // file granularity (the cumulative `log_stats` line hides which input
+    // ate the time). `bytes.len()` identifies the run alongside the
+    // caller's own per-member `rizin_mode=enabled` log.
+    let started = std::time::Instant::now();
+    tracing::debug!(bytes = bytes.len(), "rizin recover: begin");
+
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(_) => {
@@ -374,6 +381,11 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
         Some(s) => s,
         None => {
             RIZIN_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                bytes = bytes.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "rizin recover: end (timed out)"
+            );
             kill_process_group(child_id);
             let _ = child.kill();
             let _ = child.wait();
@@ -401,6 +413,12 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
     }
     let _ = cap_hit;
     RIZIN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(
+        bytes = bytes.len(),
+        elapsed_ms = started.elapsed().as_millis(),
+        stdout_bytes = stdout_bytes.len(),
+        "rizin recover: end (ok)"
+    );
     let stdout = String::from_utf8_lossy(&stdout_bytes);
     Some(parse_recovery_output(&stdout))
 }

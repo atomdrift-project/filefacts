@@ -14,8 +14,14 @@ pub(super) fn extract(
     _strings: &mut Strings,
     metrics: &mut Metrics,
 ) {
+    let file_entropy = entropy::shannon(bytes);
     metrics.insert("file.size_bytes", bytes.len() as f64);
-    metrics.insert("file.entropy", entropy::shannon(bytes));
+    metrics.insert("file.entropy", file_entropy);
+    // Whole-file Shannon entropy under the binary.* namespace too, so traits
+    // thresholding on `binary.overall_entropy` work for every file type. The
+    // png/jpeg extractors emit it from their own passes; this generalises it to
+    // PE/ELF/data/unknown blobs (cleave previously recomputed it for Data files).
+    metrics.insert("binary.overall_entropy", file_entropy);
 }
 
 #[cfg(test)]
@@ -58,6 +64,14 @@ mod tests {
         assert_eq!(m.get("file.size_bytes"), Some(2.0));
         let h = m.get("file.entropy").unwrap();
         assert!((h - 1.0).abs() < 1e-9, "expected ~1 bit, got {h}",);
+    }
+
+    /// `binary.overall_entropy` is emitted universally (not just by png/jpeg)
+    /// and mirrors `file.entropy`, so entropy rules apply to every file type.
+    #[test]
+    fn binary_overall_entropy_mirrors_file_entropy() {
+        let m = run(&[0x00, 0xff]);
+        assert_eq!(m.get("binary.overall_entropy"), m.get("file.entropy"));
     }
 
     /// Uniform random over the full byte alphabet → entropy ≈ 8.0

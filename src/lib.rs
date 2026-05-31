@@ -327,6 +327,8 @@ impl<'a> ParsedFile<'a> {
             run_extraction(
                 self.bytes,
                 self.fileid.file_type(),
+                self.fileid.extension_mismatch(),
+                self.fileid.extension_mismatch_low_severity(),
                 self.basename.as_deref(),
                 self.tree_cache(),
             )
@@ -337,6 +339,8 @@ impl<'a> ParsedFile<'a> {
 fn run_extraction(
     bytes: &[u8],
     file_type: FileType,
+    extension_mismatch: bool,
+    extension_mismatch_low_severity: bool,
     basename: Option<&str>,
     tree_cache: Option<&formats::source::TreeCache<'_>>,
 ) -> Extracted {
@@ -353,6 +357,15 @@ fn run_extraction(
             "file.stem",
             serde_json::Value::String(formats::common::stem(name)),
         );
+    }
+    // Content-based detection disagreed with the file's extension — a
+    // low-friction masquerade signal. Emitted only when true (and only when a
+    // path/extension was supplied), mirroring the pe.dos_stub_* convention.
+    if extension_mismatch {
+        metrics.insert("consistency.extension_content_mismatch", 1.0);
+        if extension_mismatch_low_severity {
+            metrics.insert("consistency.extension_content_mismatch_low_severity", 1.0);
+        }
     }
     // Format extractors return `Result` so they can report a hard
     // "this file is not in the format I expect" failure. Any
