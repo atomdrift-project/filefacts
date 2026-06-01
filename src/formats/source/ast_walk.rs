@@ -94,19 +94,17 @@ pub(super) fn walk(
     if identifier_count > 0 {
         metrics.insert("ast.identifier_count", identifier_count as f64);
     }
-    // Per-operator density metrics: `ast.op.<op>` (e.g. `ast.op.^`) plus a
-    // total. Matched O(1) via `type: metrics, field: 'ast.op.^', min: N`.
-    let mut op_total = 0u64;
+    // Per-operator density: `ast.op.<op>` (e.g. `ast.op.^`). The `op.`
+    // sub-namespace keys by the operator token; matched O(1) via
+    // `type: metrics, field: 'ast.op.^', min: N`.
     for (op, count) in &state.op_counts {
-        op_total += u64::from(*count);
         metrics.insert(format!("ast.op.{op}"), f64::from(*count));
     }
-    if op_total > 0 {
-        metrics.insert("ast.op_count".to_string(), op_total as f64);
-    }
+    // `ast.sequence_count` follows the node-kind-count convention (cf.
+    // `ast.member_count` from `member_expression`).
     if state.sequence_expr_count > 0 {
         metrics.insert(
-            "ast.sequence_expression_count".to_string(),
+            "ast.sequence_count".to_string(),
             f64::from(state.sequence_expr_count),
         );
     }
