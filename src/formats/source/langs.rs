@@ -117,7 +117,7 @@ pub(super) fn config_for(file_type: FileType) -> Option<&'static LangConfig> {
 static JAVASCRIPT: LangConfig = LangConfig {
     name: "javascript",
     language: || tree_sitter_javascript::LANGUAGE.into(),
-    comment_style: CommentStyle::CStyle,
+    comment_style: CommentStyle::CStyleTemplate,
     string_kinds: &["string", "template_string"],
     import_query: r#"
         (import_statement source: (string) @import)
@@ -162,7 +162,7 @@ static JAVASCRIPT: LangConfig = LangConfig {
 static TYPESCRIPT: LangConfig = LangConfig {
     name: "typescript",
     language: || tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-    comment_style: CommentStyle::CStyle,
+    comment_style: CommentStyle::CStyleTemplate,
     string_kinds: &["string", "template_string"],
     import_query: r#"
         (import_statement source: (string) @import)
@@ -235,7 +235,7 @@ static PYTHON: LangConfig = LangConfig {
 static GO: LangConfig = LangConfig {
     name: "go",
     language: || tree_sitter_go::LANGUAGE.into(),
-    comment_style: CommentStyle::CStyle,
+    comment_style: CommentStyle::CStyleTemplate,
     string_kinds: &["interpreted_string_literal", "raw_string_literal"],
     import_query: r#"
         (import_spec path: (interpreted_string_literal) @import)

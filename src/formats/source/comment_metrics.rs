@@ -13,8 +13,14 @@ use super::identifier_metrics::string_entropy;
 /// Per-language comment delimiter style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CommentStyle {
-    /// `//` and `/* */` (C, JavaScript, Java, Go, Rust, PHP, …).
+    /// `//` and `/* */` (C, Java, Rust, PHP, C#, …).
     CStyle,
+    /// `//` and `/* */` plus backtick-delimited string literals — template
+    /// literals (JavaScript, TypeScript) and raw strings (Go). Backtick
+    /// contents are skipped so a `//` or `/*` inside a template/raw string
+    /// (e.g. a URL like `https://…` in an error-message template) is not
+    /// misread as a comment.
+    CStyleTemplate,
     /// `#` (Python, Shell, …).
     Hash,
     /// `--` line comments (Lua, SQL, Haskell, …).
@@ -149,7 +155,8 @@ pub(super) fn emit(
 
 fn extract_comments(content: &str, style: CommentStyle) -> Vec<String> {
     match style {
-        CommentStyle::CStyle => extract_c_style_comments(content),
+        CommentStyle::CStyle => extract_c_style_comments(content, false),
+        CommentStyle::CStyleTemplate => extract_c_style_comments(content, true),
         CommentStyle::Hash => extract_hash_comments(content),
         CommentStyle::DoubleDash => extract_double_dash_comments(content),
     }
@@ -187,7 +194,7 @@ fn extract_double_dash_comments(content: &str) -> Vec<String> {
     comments
 }
 
-fn extract_c_style_comments(content: &str) -> Vec<String> {
+fn extract_c_style_comments(content: &str, template_strings: bool) -> Vec<String> {
     let chars: Vec<char> = content.chars().collect();
     let len = chars.len();
     let mut comments = Vec::new();
@@ -197,6 +204,22 @@ fn extract_c_style_comments(content: &str) -> Vec<String> {
             let quote = chars[i];
             i += 1;
             while i < len && chars[i] != quote {
+                if chars[i] == '\\' && i + 1 < len {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        // Backtick template literals (JS/TS) and raw strings (Go) routinely
+        // embed `//` and `/*` inside their text (URLs, escapes). Skip the
+        // whole backtick span so those bytes aren't misread as comments.
+        // `${…}` interpolation is treated as opaque string content, matching
+        // how the `"`/`'` branches above ignore their contents.
+        if template_strings && chars[i] == '`' {
+            i += 1;
+            while i < len && chars[i] != '`' {
                 if chars[i] == '\\' && i + 1 < len {
                     i += 1;
                 }
@@ -324,8 +347,39 @@ mod tests {
 
     #[test]
     fn c_style_comments_are_extracted() {
-        let comments = extract_c_style_comments("// foo\n/* bar */\nx = 1; // inline\n");
+        let comments = extract_c_style_comments("// foo\n/* bar */\nx = 1; // inline\n", false);
         assert_eq!(comments.len(), 3);
+    }
+
+    #[test]
+    fn template_literal_contents_are_not_comments() {
+        // A `//` inside a JS template literal (here a URL) must not be read as
+        // a line comment that swallows the rest of the line.
+        let src = "const e=`see https://react.dev/errors/ for details`;\n// real\n";
+        // Without template awareness the old scanner treated `//react.dev/...`
+        // as a comment running to the newline.
+        let with_templates = extract_c_style_comments(src, true);
+        assert_eq!(
+            with_templates.len(),
+            1,
+            "only the genuine `// real` comment, got {with_templates:?}"
+        );
+        assert_eq!(with_templates[0].trim(), "real");
+
+        // The plain C-style mode (no backtick strings) still sees both.
+        let without = extract_c_style_comments(src, false);
+        assert_eq!(without.len(), 2);
+    }
+
+    #[test]
+    fn template_literal_block_comment_marker_ignored() {
+        // `/*` inside a template literal must not open a block comment.
+        let src = "const g=`glob /* not a comment */ pattern`;\nx=1;\n";
+        let comments = extract_c_style_comments(src, true);
+        assert!(
+            comments.is_empty(),
+            "no comments expected, got {comments:?}"
+        );
     }
 
     #[test]
