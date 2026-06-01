@@ -93,9 +93,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub use error::Error;
 pub use fileid::{FileId, FileType};
 pub use output::{
-    ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Arg, ArgShape, ErrorKind,
-    Errors, ExtractedString, Literals, Metrics, ParseError, Section, Sections, Stage, Symbol,
-    SymbolKind, Symbols, Text, Values,
+    ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Arg, ArgShape, Comments,
+    ErrorKind, Errors, ExtractedString, Literals, Metrics, ParseError, Section, Sections, Stage,
+    Symbol, SymbolKind, Symbols, Text, Values,
 };
 
 /// Schema version of the public output shape.
@@ -218,6 +218,14 @@ impl<'a> ParsedFile<'a> {
     /// positives. Computed on first access and cached.
     pub fn literals(&self) -> &Literals {
         &self.extracted().strings.literals
+    }
+
+    /// Source-code comment bodies — the comment-scoped tier. Populated
+    /// for source files from the language's comment style. Matching here
+    /// never fires on a keyword in code or a string, only in a genuine
+    /// comment. Computed on first access and cached.
+    pub fn comments(&self) -> &Comments {
+        &self.extracted().strings.comments
     }
 
     /// Numeric metrics view. Computed on first access and cached.

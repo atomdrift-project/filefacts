@@ -58,8 +58,9 @@ pub(super) fn extract(
     // Byte-level / line-level / whitespace text metrics — language-agnostic.
     text_metrics::emit(source, metrics);
 
-    // Comment metrics use the language's comment style; no AST.
-    comment_metrics::emit(source, config.comment_style, metrics);
+    // Comment metrics use the language's comment style; no AST. Also
+    // collects comment bodies into the comment-scoped string tier.
+    comment_metrics::emit(source, config.comment_style, metrics, &mut strings.comments);
 
     extract_strings(root, source, config, strings, metrics);
     let imports = collect_query(config.language, source, root, config.import_query);

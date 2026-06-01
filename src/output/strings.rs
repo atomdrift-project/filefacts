@@ -141,19 +141,69 @@ impl<'a> IntoIterator for &'a Literals {
     }
 }
 
-/// Internal extractor-facing bundle of [`Text`] + [`Literals`].
+/// Source-code comment bodies — the comment-scoped tier.
 ///
-/// Format extractors take `&mut Strings` so they can push to either
-/// tier without juggling two parameters. The bundle is *not* part of
-/// the public schema — consumers read [`ParsedFile::text`] and
-/// [`ParsedFile::literals`] separately.
+/// Populated for source files from the language's comment style (the
+/// same extraction that drives `comments.*` metrics). Distinct from
+/// [`Text`] (which is a byte-level scan that mixes comments, code, and
+/// strings) and [`Literals`] (string literals only): matching here can
+/// never fire on a keyword that appears in code or a string, only in a
+/// genuine comment — the lowest-false-positive home for "this keyword
+/// is mentioned in a comment" rules.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Comments(Vec<ExtractedString>);
+
+impl Comments {
+    /// Empty collection.
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub(crate) fn push(&mut self, c: ExtractedString) {
+        self.0.push(c);
+    }
+    /// Borrow the underlying slice.
+    pub fn as_slice(&self) -> &[ExtractedString] {
+        &self.0
+    }
+    /// Iterate every recorded comment.
+    pub fn iter(&self) -> std::slice::Iter<'_, ExtractedString> {
+        self.0.iter()
+    }
+    /// Number of comments recorded.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    /// True when no comments were recorded.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl<'a> IntoIterator for &'a Comments {
+    type Item = &'a ExtractedString;
+    type IntoIter = std::slice::Iter<'a, ExtractedString>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Internal extractor-facing bundle of [`Text`] + [`Literals`] +
+/// [`Comments`].
+///
+/// Format extractors take `&mut Strings` so they can push to any
+/// tier without juggling parameters. The bundle is *not* part of
+/// the public schema — consumers read [`ParsedFile::text`],
+/// [`ParsedFile::literals`], and [`ParsedFile::comments`] separately.
 ///
 /// [`ParsedFile::text`]: crate::ParsedFile::text
 /// [`ParsedFile::literals`]: crate::ParsedFile::literals
+/// [`ParsedFile::comments`]: crate::ParsedFile::comments
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Strings {
     pub(crate) text: Text,
     pub(crate) literals: Literals,
+    pub(crate) comments: Comments,
 }
 
 impl Strings {

@@ -22,10 +22,28 @@ pub(super) enum CommentStyle {
 }
 
 /// Emit `comments.*` metrics for `content` parsed with `style`.
-pub(super) fn emit(content: &str, style: CommentStyle, metrics: &mut Metrics) {
+pub(super) fn emit(
+    content: &str,
+    style: CommentStyle,
+    metrics: &mut Metrics,
+    comments_out: &mut crate::output::Comments,
+) {
     let comments = extract_comments(content, style);
     if comments.is_empty() {
         return;
+    }
+
+    // Expose each non-empty comment body as a matchable fact so rules
+    // can match keywords scoped to comments (lowest false positives —
+    // a keyword in code or a string never reaches this tier).
+    for comment in &comments {
+        let trimmed = comment.trim();
+        if !trimmed.is_empty() {
+            comments_out.push(crate::output::ExtractedString {
+                text: trimmed.to_string(),
+                ..Default::default()
+            });
+        }
     }
 
     let total = comments.len() as u32;
@@ -319,12 +337,15 @@ mod tests {
     #[test]
     fn todo_fixme_detection() {
         let mut m = Metrics::new();
+        let mut comments = crate::output::Comments::new();
         emit(
             "// TODO fix\n// FIXME broken\n",
             CommentStyle::CStyle,
             &mut m,
+            &mut comments,
         );
         assert_eq!(m.get("comments.todo_count"), Some(1.0));
         assert_eq!(m.get("comments.fixme_count"), Some(1.0));
+        assert_eq!(comments.len(), 2, "both comment bodies exposed as facts");
     }
 }

@@ -36,7 +36,7 @@ pub use archive::{ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwne
 pub use errors::{ErrorKind, Errors, ParseError, Stage};
 pub use metrics::Metrics;
 pub use sections::{Section, Sections};
-pub use strings::{ExtractedString, Literals, Text};
+pub use strings::{Comments, ExtractedString, Literals, Text};
 // Crate-internal bundle of Text + Literals — used by format extractors
 // so they can push to either tier without juggling two parameters.
 // Not part of the public schema.

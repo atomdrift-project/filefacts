@@ -586,3 +586,23 @@ fn js_identity_function_density_metric() {
         "a, b, and the arrow are identity proxies; d is not"
     );
 }
+
+/// Comment bodies are exposed as the comment-scoped string tier so rules
+/// can match keywords that appear only in comments (lowest false
+/// positives — a keyword in code or a string never reaches this tier).
+#[test]
+fn comment_bodies_are_exposed_as_comment_facts() {
+    let source = br#"// this hides a rootkit in the kernel
+int legit_function(void) { return 0; }
+/* multi-line
+   stealth note */
+"#;
+    let parsed = open_with_path(std::path::Path::new("m.c"), source).unwrap();
+    let comments = parsed.comments();
+    let joined: String = comments.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join("\n");
+    assert!(joined.contains("rootkit"), "comment body should expose 'rootkit': {joined:?}");
+    assert!(joined.contains("stealth"), "multi-line comment body should expose 'stealth': {joined:?}");
+    // The function name is NOT a comment — must not leak into this tier.
+    assert!(!joined.contains("legit_function"), "code must not appear in comment tier");
+    assert_eq!(parsed.parse_count(), 1);
+}
