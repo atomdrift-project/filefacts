@@ -781,4 +781,34 @@ mod tests {
             "ast.max_depth should saturate at the recursion cap"
         );
     }
+
+    /// `ast.op_density.<op>` must equal count / node_count and rise sharply
+    /// when an operator dominates the tree — the signal that distinguishes an
+    /// obfuscated `number - number` array from a large benign bundle (which
+    /// has a high subtraction *count* but a low *density*).
+    #[test]
+    fn subtraction_density_reflects_concentration() {
+        let body: String = (0..60)
+            .map(|i| format!("{}-{}", i + 100, i))
+            .collect::<Vec<_>>()
+            .join(",");
+        let src = format!("var a=[{body}];\n");
+        let parsed = crate::open_with_path(std::path::Path::new("o.js"), src.as_bytes())
+            .expect("parse obfuscated js");
+        let m = parsed.metrics();
+        let sub = m.get("ast.op.sub").unwrap_or(0.0);
+        let nodes = m.get("ast.node_count").unwrap_or(0.0);
+        let density = m.get("ast.op_density.sub").unwrap_or(0.0);
+
+        assert_eq!(sub, 60.0, "60 subtraction expressions");
+        assert!(nodes > 0.0);
+        assert!(
+            (density - sub / nodes).abs() < 1e-9,
+            "density must equal count / node_count"
+        );
+        assert!(
+            density > 0.05,
+            "a packed subtraction array is dense, got {density}"
+        );
+    }
 }

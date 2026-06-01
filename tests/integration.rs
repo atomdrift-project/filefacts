@@ -599,11 +599,24 @@ int legit_function(void) { return 0; }
 "#;
     let parsed = open_with_path(std::path::Path::new("m.c"), source).unwrap();
     let comments = parsed.comments();
-    let joined: String = comments.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join("\n");
-    assert!(joined.contains("rootkit"), "comment body should expose 'rootkit': {joined:?}");
-    assert!(joined.contains("stealth"), "multi-line comment body should expose 'stealth': {joined:?}");
+    let joined: String = comments
+        .iter()
+        .map(|c| c.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("rootkit"),
+        "comment body should expose 'rootkit': {joined:?}"
+    );
+    assert!(
+        joined.contains("stealth"),
+        "multi-line comment body should expose 'stealth': {joined:?}"
+    );
     // The function name is NOT a comment — must not leak into this tier.
-    assert!(!joined.contains("legit_function"), "code must not appear in comment tier");
+    assert!(
+        !joined.contains("legit_function"),
+        "code must not appear in comment tier"
+    );
     assert_eq!(parsed.parse_count(), 1);
 }
 
@@ -615,6 +628,30 @@ fn java_constructor_calls_resolve_to_call_targets() {
     let src = br#"class C { void m() { Runtime r = new ProcessBuilder("sh"); var o = new java.io.ObjectInputStream(x); } }"#;
     let parsed = open_with_path(std::path::Path::new("C.java"), src).unwrap();
     let targets = call_targets(&parsed);
-    assert!(targets.contains(&"ProcessBuilder".to_string()), "new ProcessBuilder() -> call target: {targets:?}");
-    assert!(targets.iter().any(|t| t.contains("ObjectInputStream")), "new java.io.ObjectInputStream() -> call target: {targets:?}");
+    assert!(
+        targets.contains(&"ProcessBuilder".to_string()),
+        "new ProcessBuilder() -> call target: {targets:?}"
+    );
+    assert!(
+        targets.iter().any(|t| t.contains("ObjectInputStream")),
+        "new java.io.ObjectInputStream() -> call target: {targets:?}"
+    );
+}
+
+#[test]
+fn csharp_qualified_constructor_resolves() {
+    let src =
+        br#"class C { void m() { var r = new System.Random(); var f = new BinaryFormatter(); } }"#;
+    let parsed = open_with_path(std::path::Path::new("C.cs"), src).unwrap();
+    let targets = call_targets(&parsed);
+    assert!(
+        targets
+            .iter()
+            .any(|t| t.contains("System.Random") || t == "Random"),
+        "System.Random: {targets:?}"
+    );
+    assert!(
+        targets.iter().any(|t| t.contains("BinaryFormatter")),
+        "BinaryFormatter: {targets:?}"
+    );
 }

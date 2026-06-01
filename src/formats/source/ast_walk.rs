@@ -599,7 +599,10 @@ fn static_dotted_chain(node: Node<'_>, source: &str, config: &LangConfig) -> Opt
     // would otherwise drop to `None`. The node text is already the
     // (possibly dotted) type name, so emit it directly — this is what makes
     // `new ProcessBuilder(...)` a `kind: call` fact with target `ProcessBuilder`.
-    if node.kind().ends_with("type_identifier") {
+    if node.kind().ends_with("type_identifier") || node.kind() == "qualified_name" {
+        // `qualified_name` covers C# `new System.Random()` — its text is the
+        // already-dotted type name. Together with the `type_identifier` arm
+        // this resolves constructor callees that aren't bare identifiers.
         return node
             .utf8_text(source.as_bytes())
             .ok()
