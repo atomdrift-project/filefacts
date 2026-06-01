@@ -1685,6 +1685,7 @@ fn symbols(
             // that need it walk `elf.needed[]` separately.
             symbols_out.push(crate::Symbol::Import {
                 name: name.to_string(),
+                alias: None,
                 library: None,
                 source: "elf-dynsym".into(),
                 offset: None,

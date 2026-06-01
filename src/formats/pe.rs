@@ -407,6 +407,7 @@ fn imports(
         let name_is_ordinal_stub = imp.name.starts_with("ORDINAL ");
         symbols_out.push(crate::Symbol::Import {
             name: imp.name.to_string(),
+            alias: None,
             library: Some(library),
             source: "pe".into(),
             offset: Some(imp.offset as u64),
@@ -1632,6 +1633,7 @@ fn delay_imports(
                     let ordinal = (entry & 0xFFFF) as u32;
                     symbols_out.push(crate::Symbol::Import {
                         name: format!("ORDINAL {ordinal}"),
+                        alias: None,
                         library: Some(library.clone()),
                         source: "pe-delay".into(),
                         offset: None,
@@ -1642,6 +1644,7 @@ fn delay_imports(
                     if !name.is_empty() {
                         symbols_out.push(crate::Symbol::Import {
                             name,
+                            alias: None,
                             library: Some(library.clone()),
                             source: "pe-delay".into(),
                             offset: None,

@@ -95,8 +95,17 @@ pub(super) fn extract(
     // …) so trait matchers can filter by language without consulting
     // file_type.
     for (name, offset) in &imports {
+        // Source-language aliased imports arrive as `module as local` (the raw
+        // `aliased_import` node text). Split so the symbol name is the bare
+        // module and the alias is a structured field — no whitespace in the
+        // symbol, and trait authors can match the alias directly.
+        let (bare, alias) = match name.split_once(" as ") {
+            Some((module, local)) => (module.trim().to_string(), Some(local.trim().to_string())),
+            None => (name.clone(), None),
+        };
         symbols_out.push(crate::Symbol::Import {
-            name: name.clone(),
+            name: bare,
+            alias,
             library: None,
             source: config.name.into(),
             offset: Some(*offset),

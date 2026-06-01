@@ -615,6 +615,7 @@ impl RizinRecovery {
                 }
                 symbols_out.push(Symbol::Import {
                     name: imp.name,
+                    alias: None,
                     library: imp.libname,
                     source: "rizin".into(),
                     offset: None,
@@ -1050,6 +1051,7 @@ mod tests {
         let mut symbols = Symbols::new();
         symbols.push(Symbol::Import {
             name: "from_goblin".into(),
+            alias: None,
             library: None,
             source: "elf-dynsym".into(),
             offset: None,

@@ -417,6 +417,7 @@ fn populate_imports(
         }
         symbols_out.push(crate::Symbol::Import {
             name: name.to_string(),
+            alias: None,
             library: None,
             source: "java-class".into(),
             offset: None,
@@ -440,6 +441,7 @@ fn populate_imports(
         };
         symbols_out.push(crate::Symbol::Import {
             name: name.to_string(),
+            alias: None,
             library: Some(owner.to_string()),
             source: "java-methodref".into(),
             offset: None,

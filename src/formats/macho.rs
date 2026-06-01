@@ -209,6 +209,7 @@ fn extract_symbols(macho: &MachO<'_>, symbols_out: &mut crate::Symbols) {
             let library = normalize_dylib_path(imp.dylib);
             symbols_out.push(crate::Symbol::Import {
                 name: imp.name.to_string(),
+                alias: None,
                 library: Some(library),
                 source: "macho-bind".into(),
                 offset: Some(imp.offset),

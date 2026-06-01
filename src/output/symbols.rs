@@ -131,8 +131,17 @@ pub enum Symbol {
     Import {
         /// Symbol name in the form the format records it (no demangling,
         /// no path normalization). For VBA `Declare` with an `Alias`
-        /// clause, this is the alias.
+        /// clause, this is the alias. For source-language aliased imports
+        /// (`import subprocess as sp`) this is the bare module (`subprocess`)
+        /// and the alias is carried separately in [`alias`](Self::Import::alias).
         name: String,
+        /// Local binding name for a source-language aliased import — the
+        /// `sp` in `import subprocess as sp`. `None` for plain imports and
+        /// binary-format imports. Lets trait authors match on the alias
+        /// itself (e.g. a 1–2 char alias as an obfuscation signal) without a
+        /// whitespace-bearing symbol name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alias: Option<String>,
         /// Library / module / pseudo-namespace the symbol is bound to,
         /// when the format records one.
         #[serde(default, skip_serializing_if = "Option::is_none")]

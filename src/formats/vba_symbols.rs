@@ -236,6 +236,7 @@ fn extract_declares(
 
         symbols_out.push(Symbol::Import {
             name: import_name,
+            alias: None,
             library: Some(lib_label),
             source: "vba-declare".into(),
             offset: Some(offset),
@@ -334,6 +335,7 @@ fn extract_createobject(
             .unwrap_or(0) as u64;
         symbols_out.push(Symbol::Import {
             name: label,
+            alias: None,
             library: Some(lib_label.to_string()),
             source: source_label.into(),
             offset: Some(offset),
