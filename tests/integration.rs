@@ -671,3 +671,20 @@ fn string_return_functions_are_counted() {
         "a, b, and the arrow return string literals; c returns an expression"
     );
 }
+
+#[test]
+fn xor_mod_loop_is_detected() {
+    // Python rolling-XOR decode: data[i] ^ key[i % len(key)]
+    let py = br#"def dec(b,k):
+    return bytes(c ^ k[i % len(k)] for i,c in enumerate(b))
+"#;
+    let p = open_with_path(std::path::Path::new("d.py"), py).unwrap();
+    assert!(
+        p.metrics().get("ast.xor_mod_loop_count").unwrap_or(0.0) >= 1.0,
+        "python rolling-xor: {:?}",
+        p.metrics().get("ast.xor_mod_loop_count")
+    );
+    // Plain xor without modulo must NOT count.
+    let plain = open_with_path(std::path::Path::new("p.py"), b"x = a ^ b\n").unwrap();
+    assert_eq!(plain.metrics().get("ast.xor_mod_loop_count"), None);
+}

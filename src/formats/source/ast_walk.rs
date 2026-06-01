@@ -131,6 +131,12 @@ pub(super) fn walk(
             f64::from(state.string_return_fn_count),
         );
     }
+    if state.xor_mod_loop_count > 0 {
+        metrics.insert(
+            "ast.xor_mod_loop_count".to_string(),
+            f64::from(state.xor_mod_loop_count),
+        );
+    }
 }
 
 /// Canonical, language-agnostic name for an operator token, or `None` for
@@ -177,6 +183,30 @@ fn canonical_op(tok: &str) -> Option<&'static str> {
         "??" | "??=" => "coalesce",
         _ => return None,
     })
+}
+
+/// True when `node`'s subtree (within `depth` levels) contains a `%` (modulo)
+/// operator — used to recognize the rolling-XOR decode shape `a[i] ^ b[i % n]`
+/// when called on the enclosing `^` binary node. Bounded depth keeps it O(1)
+/// amortized over the walk.
+fn subtree_has_mod(node: Node<'_>, source: &str, depth: u32) -> bool {
+    if depth == 0 {
+        return false;
+    }
+    if let Some(op) = node.child_by_field_name("operator") {
+        if let Ok(t) = op.utf8_text(source.as_bytes()) {
+            if canonical_op(t) == Some("mod") {
+                return true;
+            }
+        }
+    }
+    let mut cur = node.walk();
+    for child in node.named_children(&mut cur) {
+        if subtree_has_mod(child, source, depth - 1) {
+            return true;
+        }
+    }
+    false
 }
 
 /// True when `node` is a function whose entire body is `return <ident>` and
@@ -339,6 +369,9 @@ struct State {
     /// Count of functions whose entire body is `return <string-literal>` —
     /// the substitution-table obfuscation shape (`ast.string_return_function_count`).
     string_return_fn_count: u32,
+    /// Count of `^` expressions whose operand subtree contains a `%` — the
+    /// rolling-XOR decode shape `data[i] ^ key[i % n]` (`ast.xor_mod_loop_count`).
+    xor_mod_loop_count: u32,
 }
 
 impl State {
@@ -423,6 +456,13 @@ impl State {
             if let Ok(op) = op_node.utf8_text(source.as_bytes()) {
                 if let Some(name) = canonical_op(op) {
                     *self.op_counts.entry(name.to_string()).or_insert(0) += 1;
+                    // Rolling-XOR decode shape: an `^` whose operand subtree
+                    // contains a `%` (cyclic key index, `data[i] ^ key[i % n]`).
+                    // Recognized across JS / Python / Go without a per-language
+                    // query; emitted as `ast.xor_mod_loop_count`.
+                    if name == "xor" && subtree_has_mod(node, source, 6) {
+                        self.xor_mod_loop_count += 1;
+                    }
                 }
             }
         }
