@@ -655,3 +655,19 @@ fn csharp_qualified_constructor_resolves() {
         "BinaryFormatter: {targets:?}"
     );
 }
+
+#[test]
+fn string_return_functions_are_counted() {
+    let src = br#"
+        function a() { return "alpha"; }
+        function b() { return "beta"; }
+        function c(x) { return x + 1; }
+        const d = () => "delta";
+    "#;
+    let parsed = open_with_path(std::path::Path::new("s.js"), src).unwrap();
+    assert_eq!(
+        parsed.metrics().get("ast.string_return_function_count"),
+        Some(3.0),
+        "a, b, and the arrow return string literals; c returns an expression"
+    );
+}

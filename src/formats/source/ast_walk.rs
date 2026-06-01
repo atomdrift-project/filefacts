@@ -125,6 +125,12 @@ pub(super) fn walk(
             f64::from(state.identity_fn_count),
         );
     }
+    if state.string_return_fn_count > 0 {
+        metrics.insert(
+            "ast.string_return_function_count".to_string(),
+            f64::from(state.string_return_fn_count),
+        );
+    }
 }
 
 /// Canonical, language-agnostic name for an operator token, or `None` for
@@ -247,6 +253,57 @@ fn returned_identifier<'a>(body: Node<'_>, bytes: &'a [u8]) -> Option<&'a str> {
     if stmt_count == 1 { ret_id } else { None }
 }
 
+/// True when `node` is a function whose entire body is a single
+/// `return <string-literal>` (or an arrow whose expression body is a string).
+/// The substitution-table obfuscation shape — decoder functions that just
+/// return a fixed string — replaces tree-sitter `(function_declaration body:
+/// (statement_block (return_statement (string))))` queries.
+fn is_string_return_function(node: Node<'_>, source: &str) -> bool {
+    if !matches!(
+        node.kind(),
+        "function_declaration"
+            | "function_expression"
+            | "arrow_function"
+            | "function_definition"
+            | "method_definition"
+    ) {
+        return false;
+    }
+    let Some(body) = node.child_by_field_name("body") else {
+        return false;
+    };
+    let is_string_kind = |k: &str| {
+        matches!(
+            k,
+            "string" | "template_string" | "template_literal" | "raw_string"
+        )
+    };
+    // Arrow expression body: the body *is* the string.
+    if is_string_kind(body.kind()) {
+        return true;
+    }
+    // Block body: a lone return_statement whose argument is a string literal.
+    let _ = source;
+    let mut cur = body.walk();
+    let mut stmt_count = 0u32;
+    let mut returns_string = false;
+    for child in body.named_children(&mut cur) {
+        if child.kind() == "comment" {
+            continue;
+        }
+        stmt_count += 1;
+        if child.kind() == "return_statement" {
+            let mut rcur = child.walk();
+            if let Some(arg) = child.named_children(&mut rcur).next() {
+                if is_string_kind(arg.kind()) {
+                    returns_string = true;
+                }
+            }
+        }
+    }
+    stmt_count == 1 && returns_string
+}
+
 #[derive(Default)]
 struct State {
     calls: Vec<Symbol>,
@@ -279,6 +336,9 @@ struct State {
     /// walker checks it here and exposes only the count
     /// (`ast.identity_function_count`).
     identity_fn_count: u32,
+    /// Count of functions whose entire body is `return <string-literal>` —
+    /// the substitution-table obfuscation shape (`ast.string_return_function_count`).
+    string_return_fn_count: u32,
 }
 
 impl State {
@@ -378,6 +438,14 @@ impl State {
         // backreference no regex can express, so check it here.
         if is_identity_function(node, source) {
             self.identity_fn_count += 1;
+        }
+
+        // String-return functions (`function(){ return "..." }`): a function
+        // whose entire body is a single `return <string-literal>`. Many of
+        // these in one file is the substitution-table obfuscation shape
+        // (decoder functions that just hand back a fixed string).
+        if is_string_return_function(node, source) {
+            self.string_return_fn_count += 1;
         }
 
         // String concatenation chains: `a + b + c + ...` builds
