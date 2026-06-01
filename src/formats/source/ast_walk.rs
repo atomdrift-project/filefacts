@@ -94,11 +94,22 @@ pub(super) fn walk(
     if identifier_count > 0 {
         metrics.insert("ast.identifier_count", identifier_count as f64);
     }
-    // Per-operator density: `ast.op.<name>` (e.g. `ast.op.xor`). The `op.`
-    // sub-namespace keys by the canonical operator name; matched O(1) via
+    // Per-operator counts: `ast.op.<name>` (e.g. `ast.op.xor`). Raw integer
+    // counts keyed by the canonical operator name; matched O(1) via
     // `type: metrics, field: 'ast.op.xor', min: N`.
     for (op, count) in &state.op_counts {
         metrics.insert(format!("ast.op.{op}"), f64::from(*count));
+    }
+    // Per-operator density: `ast.op_density.<name>` = count / node_count. A
+    // scale-invariant signal that an operator dominates the parse tree
+    // (e.g. an obfuscated array packed with `number - number` subtractions),
+    // independent of file size — unlike the raw count, which simply grows
+    // with the file. Emitted only when there is a node to divide by.
+    if state.node_count > 0 {
+        let nodes = state.node_count as f64;
+        for (op, count) in &state.op_counts {
+            metrics.insert(format!("ast.op_density.{op}"), f64::from(*count) / nodes);
+        }
     }
     // `ast.sequence_count` follows the node-kind-count convention (cf.
     // `ast.member_count` from `member_expression`).
