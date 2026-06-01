@@ -187,8 +187,14 @@ fn is_identity_function(node: Node<'_>, source: &str) -> bool {
     let param_names: Vec<&str> = params
         .named_children(&mut pcur)
         .filter_map(|p| {
-            let id = if p.kind() == "identifier" { p } else { first_named_child(p)? };
-            id.utf8_text(bytes).ok().filter(|_| id.kind() == "identifier")
+            let id = if p.kind() == "identifier" {
+                p
+            } else {
+                first_named_child(p)?
+            };
+            id.utf8_text(bytes)
+                .ok()
+                .filter(|_| id.kind() == "identifier")
         })
         .collect();
     if param_names.is_empty() {
@@ -575,6 +581,19 @@ fn static_dotted_chain(node: Node<'_>, source: &str, config: &LangConfig) -> Opt
             .or_else(|| first_named_child(node))?;
         let target = static_dotted_chain(callee, source, config)?;
         return Some(format!("{target}()"));
+    }
+    // Constructor type names: Java `type_identifier` / `scoped_type_identifier`
+    // (`new ProcessBuilder()`, `new java.io.File()`) and similar type-name
+    // nodes aren't in `identifier_kinds`, so a `new X()` callee resolved here
+    // would otherwise drop to `None`. The node text is already the
+    // (possibly dotted) type name, so emit it directly — this is what makes
+    // `new ProcessBuilder(...)` a `kind: call` fact with target `ProcessBuilder`.
+    if node.kind().ends_with("type_identifier") {
+        return node
+            .utf8_text(source.as_bytes())
+            .ok()
+            .map(str::to_string)
+            .filter(|s| !s.is_empty());
     }
     None
 }

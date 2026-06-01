@@ -606,3 +606,15 @@ int legit_function(void) { return 0; }
     assert!(!joined.contains("legit_function"), "code must not appear in comment tier");
     assert_eq!(parsed.parse_count(), 1);
 }
+
+/// Constructor calls (`new ProcessBuilder()`, `new java.io.File()`) resolve to
+/// `Symbol::Call` targets so `kind: call` rules can match them — the type-name
+/// node (Java `type_identifier`/`scoped_type_identifier`) must not drop to None.
+#[test]
+fn java_constructor_calls_resolve_to_call_targets() {
+    let src = br#"class C { void m() { Runtime r = new ProcessBuilder("sh"); var o = new java.io.ObjectInputStream(x); } }"#;
+    let parsed = open_with_path(std::path::Path::new("C.java"), src).unwrap();
+    let targets = call_targets(&parsed);
+    assert!(targets.contains(&"ProcessBuilder".to_string()), "new ProcessBuilder() -> call target: {targets:?}");
+    assert!(targets.iter().any(|t| t.contains("ObjectInputStream")), "new java.io.ObjectInputStream() -> call target: {targets:?}");
+}
