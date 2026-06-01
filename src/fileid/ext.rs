@@ -206,6 +206,13 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "py" | "pyw" | "pyi" | "pth" => Some(FileType::Python),
         "js" | "mjs" | "cjs" | "jsx" | "jse" => Some(FileType::JavaScript),
         "ts" | "tsx" | "mts" | "cts" => Some(FileType::TypeScript),
+        // CSS and preprocessor stylesheets. There is no dedicated stylesheet
+        // analyzer, and their C-like braces/`;`/`//` syntax otherwise scores as
+        // JavaScript under content heuristics — which fires JS AST rules
+        // (arithmetic-density obfuscation, string-concat) on benign layout math
+        // like `margin: $a - $b`. Treat them as plain text: still scanned for
+        // strings/URLs/secrets, but never parsed as a JS AST.
+        "css" | "scss" | "sass" | "less" | "styl" | "pcss" | "postcss" => Some(FileType::Text),
         "go" => Some(FileType::Go),
         "rs" => Some(FileType::Rust),
         "java" => Some(FileType::Java),
@@ -655,5 +662,25 @@ mod tests {
     #[test]
     fn erlang_returns_none() {
         assert_eq!(detect_from_path(Path::new("app.erl")), None);
+    }
+
+    #[test]
+    fn stylesheets_are_text_not_javascript() {
+        // Stylesheets must not be parsed as JS — their `$a - $b` layout math
+        // otherwise trips JS arithmetic/obfuscation AST rules.
+        for name in [
+            "theme.scss",
+            "layout/_sidebar.scss",
+            "vars.sass",
+            "mixins.less",
+            "site.css",
+            "app.styl",
+        ] {
+            assert_eq!(
+                detect_from_path(Path::new(name)),
+                Some(FileType::Text),
+                "{name} should be Text, not JavaScript"
+            );
+        }
     }
 }
