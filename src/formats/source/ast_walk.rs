@@ -94,9 +94,9 @@ pub(super) fn walk(
     if identifier_count > 0 {
         metrics.insert("ast.identifier_count", identifier_count as f64);
     }
-    // Per-operator density: `ast.op.<op>` (e.g. `ast.op.^`). The `op.`
-    // sub-namespace keys by the operator token; matched O(1) via
-    // `type: metrics, field: 'ast.op.^', min: N`.
+    // Per-operator density: `ast.op.<name>` (e.g. `ast.op.xor`). The `op.`
+    // sub-namespace keys by the canonical operator name; matched O(1) via
+    // `type: metrics, field: 'ast.op.xor', min: N`.
     for (op, count) in &state.op_counts {
         metrics.insert(format!("ast.op.{op}"), f64::from(*count));
     }
@@ -114,6 +114,52 @@ pub(super) fn walk(
             f64::from(state.identity_fn_count),
         );
     }
+}
+
+/// Canonical, language-agnostic name for an operator token, or `None` for
+/// tokens that aren't meaningful operators (assignment `=`, separators, …).
+/// Normalizes per-grammar spellings to one semantic name so density metrics
+/// (`ast.op.xor`, `ast.op.sub`, …) are key-safe and consistent across
+/// languages — JS `^`, Python `^`, and PowerShell `-bxor` all become `xor`.
+/// Compound assignments fold to their base op (`^=` → `xor`).
+fn canonical_op(tok: &str) -> Option<&'static str> {
+    Some(match tok {
+        // bitwise
+        "^" | "^=" | "-bxor" => "xor",
+        "&" | "&=" | "-band" => "band",
+        "|" | "|=" | "-bor" => "bor",
+        "~" | "-bnot" => "bnot",
+        "<<" | "<<=" | "-shl" => "shl",
+        ">>" | ">>=" | "-shr" => "shr",
+        ">>>" | ">>>=" => "ushr",
+        // arithmetic
+        "+" | "+=" => "add",
+        "-" | "-=" => "sub",
+        "*" | "*=" => "mul",
+        "/" | "/=" => "div",
+        "%" | "%=" | "-mod" => "mod",
+        "**" | "**=" => "pow",
+        "//" | "//=" => "floordiv",
+        // comparison
+        "==" | "===" | "-eq" => "eq",
+        "!=" | "!==" | "<>" | "-ne" => "ne",
+        "<" | "-lt" => "lt",
+        ">" | "-gt" => "gt",
+        "<=" | "-le" => "le",
+        ">=" | "-ge" => "ge",
+        // logical
+        "&&" | "and" | "-and" => "land",
+        "||" | "or" | "-or" => "lor",
+        "!" | "not" | "-not" => "lnot",
+        // string / collection
+        "." | ".=" => "concat", // PHP string concatenation
+        "-join" => "join",
+        "-split" => "split",
+        "-match" => "match",
+        "-replace" => "replace",
+        "??" | "??=" => "coalesce",
+        _ => return None,
+    })
 }
 
 /// True when `node` is a function whose entire body is `return <ident>` and
@@ -197,11 +243,10 @@ struct State {
     identifiers: BTreeMap<String, u64>,
     /// Every operator occurrence (`^`, `%`, `<<=`, …) with its byte offset,
     /// in source order. Emitted as [`Symbol::Op`] so density rules can count
-    /// them (`kind: op, exact: "^"` + `count_min`/`per_kb_min`).
-    /// Per-operator occurrence counts (`^` → 12, `%` → 3, …), tallied during
-    /// the single existing walk. Emitted as `ast.op.<op>` metrics so density
-    /// rules match O(1) via `type: metrics` with no per-occurrence facts —
-    /// the lowest-overhead form of operator-density detection.
+    /// Per-operator occurrence counts keyed by canonical name (`xor` → 12,
+    /// `mod` → 3, …), tallied during the single existing walk. Emitted as
+    /// `ast.op.<name>` metrics so density rules match O(1) via `type: metrics`
+    /// with no per-occurrence facts — the lowest-overhead operator-density form.
     op_counts: BTreeMap<String, u32>,
     scopes: Vec<&'static str>,
     node_count: u64,
@@ -293,13 +338,14 @@ impl State {
 
         // Operator density: tally the `operator` token of any node that has
         // one (binary expressions, augmented assignments, unary ops across all
-        // grammars). Counted inline in this single walk and emitted as
-        // `ast.op.<op>` metrics — O(1) to match, one f64 per distinct operator,
-        // no per-occurrence facts.
+        // grammars), normalized to a canonical semantic name (`^` → `xor`,
+        // PowerShell `-bxor` → `xor`, …). Counted inline in this single walk
+        // and emitted as `ast.op.<name>` metrics — language-agnostic, key-safe,
+        // O(1) to match, no per-occurrence facts.
         if let Some(op_node) = node.child_by_field_name("operator") {
             if let Ok(op) = op_node.utf8_text(source.as_bytes()) {
-                if !op.is_empty() {
-                    *self.op_counts.entry(op.to_string()).or_insert(0) += 1;
+                if let Some(name) = canonical_op(op) {
+                    *self.op_counts.entry(name.to_string()).or_insert(0) += 1;
                 }
             }
         }

@@ -553,9 +553,9 @@ fn build_minimal_zip() -> Vec<u8> {
     buf
 }
 
-/// Operator density is exposed as `ast.op.<op>` metrics (counted inline in
-/// the single AST walk, O(1) to match, no per-occurrence facts) so rules can
-/// match `type: metrics, field: 'ast.op.^', min: N`.
+/// Operator density is exposed as `ast.op.<name>` metrics, keyed by canonical
+/// operator name (counted inline in the single AST walk, O(1) to match, no
+/// per-occurrence facts) so rules can match `type: metrics, field: 'ast.op.xor', min: N`.
 #[test]
 fn python_xor_operator_density_metric() {
     let source = br#"def dec(b, k):
@@ -564,8 +564,8 @@ x = a ^ b ^ c
 "#;
     let parsed = open_with_path(std::path::Path::new("x.py"), source).unwrap();
     let m = parsed.metrics();
-    assert_eq!(m.get("ast.op.^"), Some(3.0), "three `^` operators");
-    assert_eq!(m.get("ast.op.%"), Some(1.0), "one `%` operator");
+    assert_eq!(m.get("ast.op.xor"), Some(3.0), "three `^` operators -> xor");
+    assert_eq!(m.get("ast.op.mod"), Some(1.0), "one `%` operator -> mod");
 }
 
 /// Identity-proxy functions (`function(x){ return x }`) need a param↔return
