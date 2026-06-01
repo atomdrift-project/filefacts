@@ -172,6 +172,13 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"document.", Lang::JavaScript, 5),
     (b"window.", Lang::JavaScript, 5),
     (b"addEventListener", Lang::JavaScript, 5),
+    // `var `/`let `/`const ` are JS variable declarations. `var ` especially is
+    // dense in obfuscated/minified JS (every renamed local), so it must score
+    // for JS — not only Kotlin (which prefers `val`). Supporting weight: a
+    // single decl word isn't conclusive on its own.
+    (b"var ", Lang::JavaScript, 5),
+    (b"let ", Lang::JavaScript, 5),
+    (b"const ", Lang::JavaScript, 5),
     // ── C/C++/ASM ──
     (b"#include <", Lang::C, 10),
     (b"#include \"", Lang::C, 10),
@@ -185,8 +192,11 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"package ", Lang::Kotlin, 5),
     (b"import kotlin", Lang::Kotlin, 10),
     (b"fun main(", Lang::Kotlin, 5),
+    // `val ` is Kotlin-characteristic (Kotlin prefers immutable `val`); `var `
+    // was removed here because it is a core JavaScript keyword and dominates
+    // obfuscated JS, mis-scoring var-heavy scripts as Kotlin. Kotlin still has
+    // conclusive markers (`import kotlin`, `suspend fun `) plus `val `.
     (b"val ", Lang::Kotlin, 5),
-    (b"var ", Lang::Kotlin, 5),
     (b"suspend fun ", Lang::Kotlin, 10),
     // ── Dockerfile ──
     (b"\nFROM ", Lang::Dockerfile, 10),
@@ -507,5 +517,19 @@ class BaselineProfileGenerator {
 ./autoconf.texi.  This manual is for GNU Autoconf, a\n\
 package for creating scripts to configure source code packages.\n";
         assert_eq!(detect_from_content(data), None);
+    }
+
+    #[test]
+    fn var_heavy_obfuscated_js_is_not_kotlin() {
+        // Trojanized WordPress JS (VirusShare sample): a jQuery script with an
+        // appended obfuscated injector whose renamed locals use `var` ~14×.
+        // `var ` is a JS keyword, not a Kotlin signal — the JS markers
+        // (`(function(`, `===`, `window.`) must win, not lose to Kotlin's `var`.
+        let data = b"jQuery(function( $ ){ $('.x').click(function(){}); });\n\
+if(ndsw===undefined){function g(R,G){var y=V();return g=function(O,n){\
+var P=y[O];return P;};}var ndsw=true,HttpClient=function(){var S=g;};\
+var rand=function(){var C=g;};(function(){var Y=g,R=navigator;\
+var D=new HttpClient();window['eval'](R);}());}\n";
+        assert_eq!(detect_from_content(data), Some(FileType::JavaScript));
     }
 }
