@@ -54,16 +54,12 @@ pub(super) fn walk(
         symbols_out.push(b);
     }
     for chain in state.members {
-        symbols_out.push(Symbol::Member {
-            path: chain,
-            source: config.name.into(),
-        });
+        symbols_out.push(Symbol::Member { path: chain });
     }
     let identifier_count = state.identifiers.len() as u64;
     for (name, offset) in state.identifiers {
         symbols_out.push(Symbol::Identifier {
             name,
-            source: config.name.into(),
             offset: Some(offset),
         });
     }
@@ -98,6 +94,96 @@ pub(super) fn walk(
     if identifier_count > 0 {
         metrics.insert("ast.identifier_count", identifier_count as f64);
     }
+    // Per-operator density metrics: `ast.op.<op>` (e.g. `ast.op.^`) plus a
+    // total. Matched O(1) via `type: metrics, field: 'ast.op.^', min: N`.
+    let mut op_total = 0u64;
+    for (op, count) in &state.op_counts {
+        op_total += u64::from(*count);
+        metrics.insert(format!("ast.op.{op}"), f64::from(*count));
+    }
+    if op_total > 0 {
+        metrics.insert("ast.op_count".to_string(), op_total as f64);
+    }
+    if state.sequence_expr_count > 0 {
+        metrics.insert(
+            "ast.sequence_expression_count".to_string(),
+            f64::from(state.sequence_expr_count),
+        );
+    }
+    if state.identity_fn_count > 0 {
+        metrics.insert(
+            "ast.identity_function_count".to_string(),
+            f64::from(state.identity_fn_count),
+        );
+    }
+}
+
+/// True when `node` is a function whose entire body is `return <ident>` and
+/// `<ident>` names one of the function's own parameters — the identity-proxy
+/// obfuscation shape (`function(x){ return x }`, `lambda x: x`). The
+/// param↔return backreference is why a regex can't express this.
+fn is_identity_function(node: Node<'_>, source: &str) -> bool {
+    if !matches!(
+        node.kind(),
+        "function_declaration"
+            | "function_expression"
+            | "arrow_function"
+            | "function_definition"
+            | "lambda"
+            | "method_definition"
+    ) {
+        return false;
+    }
+    let bytes = source.as_bytes();
+    // Collect parameter identifier names.
+    let Some(params) = node.child_by_field_name("parameters") else {
+        return false;
+    };
+    let mut pcur = params.walk();
+    let param_names: Vec<&str> = params
+        .named_children(&mut pcur)
+        .filter_map(|p| {
+            let id = if p.kind() == "identifier" { p } else { first_named_child(p)? };
+            id.utf8_text(bytes).ok().filter(|_| id.kind() == "identifier")
+        })
+        .collect();
+    if param_names.is_empty() {
+        return false;
+    }
+    // The body must be (or wrap) a single `return <identifier>`.
+    let Some(body) = node.child_by_field_name("body") else {
+        return false;
+    };
+    let returned = returned_identifier(body, bytes);
+    returned.is_some_and(|r| param_names.contains(&r))
+}
+
+/// The single identifier returned by a function body, if the body is exactly
+/// one `return <identifier>` (JS `{ return x }` / arrow `x` / Python `return x`).
+fn returned_identifier<'a>(body: Node<'_>, bytes: &'a [u8]) -> Option<&'a str> {
+    // Arrow-function expression body: the body *is* the identifier.
+    if body.kind() == "identifier" {
+        return body.utf8_text(bytes).ok();
+    }
+    // Block body: find a lone return_statement with an identifier argument.
+    let mut cur = body.walk();
+    let mut ret_id = None;
+    let mut stmt_count = 0u32;
+    for child in body.named_children(&mut cur) {
+        if child.kind() == "comment" {
+            continue;
+        }
+        stmt_count += 1;
+        if child.kind() == "return_statement" {
+            let mut rcur = child.walk();
+            if let Some(arg) = child.named_children(&mut rcur).next() {
+                if arg.kind() == "identifier" {
+                    ret_id = arg.utf8_text(bytes).ok();
+                }
+            }
+        }
+    }
+    if stmt_count == 1 { ret_id } else { None }
 }
 
 #[derive(Default)]
@@ -111,12 +197,28 @@ struct State {
     /// etc. — so naming-pattern rules (`c2_server`, `BackdoorListener`,
     /// `xmrig`) can fire via `type: name, kind: identifier`.
     identifiers: BTreeMap<String, u64>,
+    /// Every operator occurrence (`^`, `%`, `<<=`, …) with its byte offset,
+    /// in source order. Emitted as [`Symbol::Op`] so density rules can count
+    /// them (`kind: op, exact: "^"` + `count_min`/`per_kb_min`).
+    /// Per-operator occurrence counts (`^` → 12, `%` → 3, …), tallied during
+    /// the single existing walk. Emitted as `ast.op.<op>` metrics so density
+    /// rules match O(1) via `type: metrics` with no per-occurrence facts —
+    /// the lowest-overhead form of operator-density detection.
+    op_counts: BTreeMap<String, u32>,
     scopes: Vec<&'static str>,
     node_count: u64,
     max_depth: u32,
     max_member_chain_depth: u32,
     max_string_concat_chain: u32,
     max_array_literal_length: u32,
+    /// Count of statement-level comma sequences (`a, b, c;`) — a density
+    /// signal for comma-sequence obfuscation (`ast.sequence_expression_count`).
+    sequence_expr_count: u32,
+    /// Count of identity-proxy functions (`function(x){ return x }`) — the
+    /// backreference (return == param) can't be expressed in a regex, so the
+    /// walker checks it here and exposes only the count
+    /// (`ast.identity_function_count`).
+    identity_fn_count: u32,
 }
 
 impl State {
@@ -191,6 +293,32 @@ impl State {
             }
         }
 
+        // Operator density: tally the `operator` token of any node that has
+        // one (binary expressions, augmented assignments, unary ops across all
+        // grammars). Counted inline in this single walk and emitted as
+        // `ast.op.<op>` metrics — O(1) to match, one f64 per distinct operator,
+        // no per-occurrence facts.
+        if let Some(op_node) = node.child_by_field_name("operator") {
+            if let Ok(op) = op_node.utf8_text(source.as_bytes()) {
+                if !op.is_empty() {
+                    *self.op_counts.entry(op.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Statement-level comma sequences (`a, b, c;`) — density signal for
+        // comma-sequence obfuscation.
+        if node.kind() == "sequence_expression" {
+            self.sequence_expr_count += 1;
+        }
+
+        // Identity-proxy functions (`function(x){ return x }`): the return
+        // must reference the *same* identifier as a parameter — a
+        // backreference no regex can express, so check it here.
+        if is_identity_function(node, source) {
+            self.identity_fn_count += 1;
+        }
+
         // String concatenation chains: `a + b + c + ...` builds
         // left-leaning nested binary expressions in every grammar we
         // support. Measure the chain length when we hit the *outermost*
@@ -243,7 +371,6 @@ impl State {
         self.calls.push(Symbol::Call {
             target,
             args,
-            source: config.name.into(),
             offset: Some(node.start_byte() as u64),
         });
     }
@@ -262,7 +389,6 @@ impl State {
             target,
             scope: self.scopes.last().copied().unwrap_or("module").into(),
             shape: arg_shape(value_node, config),
-            source: config.name.into(),
             offset: target_node.start_byte() as u64,
         });
     }

@@ -280,8 +280,22 @@ def run_command():
 
     let imports = import_names(&parsed);
     assert!(
-        imports.contains(&"subprocess as sp".to_string()),
-        "aliased imports should keep the alias fact, got {imports:?}"
+        imports.contains(&"subprocess".to_string()),
+        "aliased import keeps the bare module name, got {imports:?}"
+    );
+    // The alias (`sp`) is now a structured field, not concatenated into name.
+    let sp_alias = parsed.symbols().iter().find_map(|s| match s {
+        filefacts::Symbol::Import {
+            name,
+            alias: Some(a),
+            ..
+        } if name == "subprocess" => Some(a.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        sp_alias.as_deref(),
+        Some("sp"),
+        "aliased import should carry the alias in the structured `alias` field"
     );
     assert!(
         imports.contains(&"request".to_string()),
@@ -537,4 +551,38 @@ fn build_minimal_zip() -> Vec<u8> {
     writer.write_all(b"gamma\n").unwrap();
     writer.finish().unwrap();
     buf
+}
+
+/// Operator density is exposed as `ast.op.<op>` metrics (counted inline in
+/// the single AST walk, O(1) to match, no per-occurrence facts) so rules can
+/// match `type: metrics, field: 'ast.op.^', min: N`.
+#[test]
+fn python_xor_operator_density_metric() {
+    let source = br#"def dec(b, k):
+    return bytes(c ^ k[i % len(k)] for i, c in enumerate(b))
+x = a ^ b ^ c
+"#;
+    let parsed = open_with_path(std::path::Path::new("x.py"), source).unwrap();
+    let m = parsed.metrics();
+    assert_eq!(m.get("ast.op.^"), Some(3.0), "three `^` operators");
+    assert_eq!(m.get("ast.op.%"), Some(1.0), "one `%` operator");
+}
+
+/// Identity-proxy functions (`function(x){ return x }`) need a param↔return
+/// backreference no regex can express; the walker checks it and exposes the
+/// count as `ast.identity_function_count`.
+#[test]
+fn js_identity_function_density_metric() {
+    let source = br#"
+        function a(x) { return x; }
+        function b(y) { return y; }
+        const c = (z) => z;
+        function d(p, q) { return p + q; }
+    "#;
+    let parsed = open_with_path(std::path::Path::new("x.js"), source).unwrap();
+    assert_eq!(
+        parsed.metrics().get("ast.identity_function_count"),
+        Some(3.0),
+        "a, b, and the arrow are identity proxies; d is not"
+    );
 }

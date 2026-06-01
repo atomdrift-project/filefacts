@@ -259,9 +259,6 @@ pub enum Symbol {
         /// the top-level `literals` collection.
         #[serde(default)]
         args: Vec<Arg>,
-        /// Source / extraction-subkind tag (typically the language name
-        /// for source files).
-        source: String,
         /// Byte offset of the call expression's start, when known.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         offset: Option<u64>,
@@ -273,8 +270,6 @@ pub enum Symbol {
         /// Dotted chain like `chrome.cookies.getAll` or
         /// `window.localStorage`.
         path: String,
-        /// Source / extraction-subkind tag.
-        source: String,
     },
 
     /// One static assignment/binding observed in source code.
@@ -292,8 +287,6 @@ pub enum Symbol {
         scope: String,
         /// Shape of the assigned expression.
         shape: ArgShape,
-        /// Source / extraction-subkind tag.
-        source: String,
         /// Byte offset where the assignment target starts.
         offset: u64,
     },
@@ -305,8 +298,6 @@ pub enum Symbol {
     Identifier {
         /// The identifier text.
         name: String,
-        /// Source / extraction-subkind tag.
-        source: String,
         /// Byte offset of the identifier, when known.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         offset: Option<u64>,
@@ -349,8 +340,8 @@ impl Symbol {
 
     /// Primary identifying name for this symbol, when one applies.
     /// Returns the dotted target for [`Self::Call`], the chain for
-    /// [`Self::Member`], the assignment target for [`Self::Bind`], or
-    /// the `name` field for the rest. `None` for dynamic call targets.
+    /// [`Self::Member`], the assignment target for [`Self::Bind`], or the
+    /// `name` field for the rest. `None` for dynamic call targets.
     pub fn name(&self) -> Option<&str> {
         match self {
             Self::Import { name, .. }
@@ -363,16 +354,17 @@ impl Symbol {
         }
     }
 
-    /// The extraction-subkind tag.
+    /// The extraction-subkind tag for binary symbols (`"pe-import"`,
+    /// `"elf-dynsym"`, `"rizin"`, …). Source-AST symbols (call / member /
+    /// bind / identifier / op) carry no per-symbol source — their language
+    /// is the file's, known from the file type — so this returns `""` for
+    /// them.
     pub fn source(&self) -> &str {
         match self {
             Self::Import { source, .. }
             | Self::Export { source, .. }
-            | Self::Function { source, .. }
-            | Self::Call { source, .. }
-            | Self::Member { source, .. }
-            | Self::Bind { source, .. }
-            | Self::Identifier { source, .. } => source.as_str(),
+            | Self::Function { source, .. } => source.as_str(),
+            _ => "",
         }
     }
 }
@@ -436,6 +428,7 @@ mod tests {
         let s = Symbol::Import {
             name: "CreateFileW".into(),
             library: Some("kernel32".into()),
+            alias: None,
             source: "pe".into(),
             offset: Some(0x1234),
             ordinal: None,
@@ -519,7 +512,6 @@ mod tests {
             args: vec![Arg::String {
                 value: "https://example.com".into(),
             }],
-            source: "javascript".into(),
             offset: Some(42),
         };
         let json = serde_json::to_value(&s).unwrap();
@@ -538,7 +530,6 @@ mod tests {
             args: vec![Arg::Identifier {
                 name: "callback".into(),
             }],
-            source: "javascript".into(),
             offset: None,
         };
         let json = serde_json::to_value(&s).unwrap();
@@ -563,7 +554,6 @@ mod tests {
                     radix: 8,
                 },
             ],
-            source: "python".into(),
             offset: Some(0),
         };
         let json = serde_json::to_value(&s).unwrap();
@@ -593,6 +583,7 @@ mod tests {
         syms.push(Symbol::Import {
             name: "Foo".into(),
             library: Some("bar".into()),
+            alias: None,
             source: "pe".into(),
             offset: None,
             ordinal: None,
@@ -608,6 +599,7 @@ mod tests {
         syms.push(Symbol::Import {
             name: "Foo".into(),
             library: None,
+            alias: None,
             source: "pe".into(),
             offset: None,
             ordinal: None,
@@ -622,6 +614,7 @@ mod tests {
         syms.push(Symbol::Import {
             name: "Baz".into(),
             library: None,
+            alias: None,
             source: "pe".into(),
             offset: None,
             ordinal: None,
