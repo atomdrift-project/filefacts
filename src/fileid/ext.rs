@@ -176,6 +176,14 @@ fn detect_from_filename(path: &Path) -> Option<FileType> {
     if name.starts_with("Makefile") || name.starts_with("GNUmakefile") {
         return Some(FileType::Makefile);
     }
+    // Meson build files. Their own DSL (not source code); classify as a build
+    // file so source/AST traits (e.g. JavaScript obfuscation) do not run on them.
+    if name.eq_ignore_ascii_case("meson.build")
+        || name.eq_ignore_ascii_case("meson.options")
+        || name.eq_ignore_ascii_case("meson_options.txt")
+    {
+        return Some(FileType::Makefile);
+    }
     if name.eq_ignore_ascii_case("LICENSE") || name.eq_ignore_ascii_case("COPYING") {
         return Some(FileType::Text);
     }

@@ -168,7 +168,10 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"module.exports", Lang::JavaScript, 10),
     (b"(function(", Lang::JavaScript, 5),
     (b"===", Lang::JavaScript, 5),
-    (b"console.", Lang::JavaScript, 5),
+    // `console.log(` (the JS call), not bare `console.` — the latter matches
+    // source filenames like `console.cpp` / `reporter_console.cpp` listed in
+    // build files, mis-typing them as JavaScript.
+    (b"console.log(", Lang::JavaScript, 5),
     (b"document.", Lang::JavaScript, 5),
     (b"window.", Lang::JavaScript, 5),
     (b"addEventListener", Lang::JavaScript, 5),
@@ -270,6 +273,17 @@ fn scan_scores(data: &[u8]) -> [u16; LANG_COUNT] {
 
     if let Some(ac) = &s.ac {
         for mat in ac.find_overlapping_iter(data) {
+            // `===` (JS strict-equality) must not score when it is part of a
+            // longer run of '=' — e.g. "=========" separator lines or reST/
+            // Markdown header rules. Overlapping matches across such a run would
+            // otherwise inflate the JavaScript score and mis-type plain text.
+            if &data[mat.start()..mat.end()] == b"===" {
+                let prev_eq = mat.start() > 0 && data[mat.start() - 1] == b'=';
+                let next_eq = mat.end() < data.len() && data[mat.end()] == b'=';
+                if prev_eq || next_eq {
+                    continue;
+                }
+            }
             let entry = &s.entries[mat.pattern().as_usize()];
             let idx = entry.lang.idx();
             scores[idx] = scores[idx].saturating_add(u16::from(entry.weight));
