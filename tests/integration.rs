@@ -758,3 +758,50 @@ fn numeric_array_max_length_metric() {
         "the 7-int array counts; the string array does not"
     );
 }
+
+#[test]
+fn numeric_sequence_max_length_metric() {
+    // JS comma sequence of numeric literals (comma-constant obfuscation).
+    let js = b"var x = (1, 2, 3, 4, 5);\n";
+    let p = open_with_path(std::path::Path::new("s.js"), js).unwrap();
+    assert_eq!(
+        p.metrics().get("ast.numeric_sequence_max_length"),
+        Some(5.0)
+    );
+}
+
+#[test]
+fn const_return_function_count_metric() {
+    let js =
+        b"function a(){ return 0; }\nfunction b(){ return 'x'; }\nfunction id(y){ return y; }\n";
+    let p = open_with_path(std::path::Path::new("c.js"), js).unwrap();
+    // a() and b() are parameterless const-returns; id(y) is an identity proxy, not counted.
+    assert_eq!(
+        p.metrics().get("ast.const_return_function_count"),
+        Some(2.0)
+    );
+}
+
+#[test]
+fn self_compare_count_metric() {
+    // `5 - 5` (useless arithmetic) and `x === x` (opaque) count; `n !== n`
+    // (the NaN idiom) does not.
+    let js = b"var a = 5 - 5;\nif (x === x) {}\nif (n !== n) {}\n";
+    let p = open_with_path(std::path::Path::new("sc.js"), js).unwrap();
+    assert_eq!(p.metrics().get("ast.self_compare_count"), Some(2.0));
+}
+
+#[test]
+fn infinite_loop_count_metric() {
+    let rb = b"while true\n  break\nend\n";
+    let p = open_with_path(std::path::Path::new("l.rb"), rb).unwrap();
+    assert_eq!(p.metrics().get("ast.infinite_loop_count"), Some(1.0));
+}
+
+#[test]
+fn infinite_loop_js_while_true() {
+    let js = b"while (true) { f(); }\nwhile (x < 10) { g(); }\n";
+    let p = open_with_path(std::path::Path::new("w.js"), js).unwrap();
+    // Only `while (true)` is infinite; the bounded loop is not.
+    assert_eq!(p.metrics().get("ast.infinite_loop_count"), Some(1.0));
+}

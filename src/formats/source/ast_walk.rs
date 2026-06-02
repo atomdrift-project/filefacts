@@ -143,6 +143,30 @@ pub(super) fn walk(
             f64::from(state.xor_mod_loop_count),
         );
     }
+    if state.max_numeric_sequence_length > 0 {
+        metrics.insert(
+            "ast.numeric_sequence_max_length".to_string(),
+            f64::from(state.max_numeric_sequence_length),
+        );
+    }
+    if state.const_return_fn_count > 0 {
+        metrics.insert(
+            "ast.const_return_function_count".to_string(),
+            f64::from(state.const_return_fn_count),
+        );
+    }
+    if state.self_compare_count > 0 {
+        metrics.insert(
+            "ast.self_compare_count".to_string(),
+            f64::from(state.self_compare_count),
+        );
+    }
+    if state.infinite_loop_count > 0 {
+        metrics.insert(
+            "ast.infinite_loop_count".to_string(),
+            f64::from(state.infinite_loop_count),
+        );
+    }
 }
 
 /// Canonical, language-agnostic name for an operator token, or `None` for
@@ -351,6 +375,122 @@ fn is_static_string_literal(node: Node<'_>) -> bool {
     }
 }
 
+/// A single literal value or bare identifier — the only things a
+/// constant-return padding helper hands back.
+fn is_literal_or_identifier(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "number"
+            | "integer"
+            | "float"
+            | "string"
+            | "raw_string"
+            | "true"
+            | "false"
+            | "null"
+            | "True"
+            | "False"
+            | "None"
+            | "none"
+            | "nil"
+            | "identifier"
+    )
+}
+
+/// True when `node` is a **parameterless** function whose entire body is a
+/// single `return <literal-or-identifier>` (or an arrow whose expression body
+/// is such). The dead-code / opaque padding shape — many of these in one file
+/// dilute static and ML analysis. Parameterless distinguishes it from an
+/// identity proxy (`function(x){ return x }`).
+fn is_const_return_function(node: Node<'_>, source: &str) -> bool {
+    if !matches!(
+        node.kind(),
+        "function_declaration"
+            | "function_expression"
+            | "arrow_function"
+            | "function_definition"
+            | "method_definition"
+    ) {
+        return false;
+    }
+    let _ = source;
+    // Parameterless: a `parameters`/`formal_parameters` node with no named children.
+    let Some(params) = node.child_by_field_name("parameters") else {
+        return false;
+    };
+    if params.named_child_count() != 0 {
+        return false;
+    }
+    let Some(body) = node.child_by_field_name("body") else {
+        return false;
+    };
+    // Arrow expression body: the body *is* the literal/identifier.
+    if is_literal_or_identifier(body) {
+        return true;
+    }
+    // Block body: a lone return_statement whose argument is a literal/identifier.
+    let mut cur = body.walk();
+    let mut stmt_count = 0u32;
+    let mut const_return = false;
+    for child in body.named_children(&mut cur) {
+        if child.kind() == "comment" {
+            continue;
+        }
+        stmt_count += 1;
+        if child.kind() == "return_statement" {
+            let mut rcur = child.walk();
+            if let Some(arg) = child.named_children(&mut rcur).next() {
+                if is_literal_or_identifier(arg) {
+                    const_return = true;
+                }
+            }
+        }
+    }
+    stmt_count == 1 && const_return
+}
+
+/// True when `node` is a loop with a literally-true condition: `while true`,
+/// `while (1)`, `while (!![])`, or a C-style `for (;;)`. Recognized across
+/// grammars by inspecting the condition text (parens/whitespace stripped) — a
+/// node-scoped check, so a bare `while true` in prose or a comment never fires.
+fn is_infinite_loop(node: Node<'_>, source: &str) -> bool {
+    let kind = node.kind();
+    let bytes = source.as_bytes();
+    // C-style `for (;;)`: a for_statement with neither condition nor update.
+    if kind == "for_statement"
+        && node.child_by_field_name("condition").is_none()
+        && node.child_by_field_name("initializer").is_none()
+        && node.child_by_field_name("update").is_none()
+    {
+        // Only C-style fors have these fields; for-in/for-of lack them too, so
+        // require the literal `for (;;)`/`for(;;)` spelling to avoid those.
+        if let Ok(t) = node.utf8_text(bytes) {
+            let head: String = t.chars().take(12).filter(|c| !c.is_whitespace()).collect();
+            return head.starts_with("for(;;)");
+        }
+        return false;
+    }
+    if !matches!(
+        kind,
+        "while_statement" | "while" | "while_modifier" | "do_statement"
+    ) {
+        return false;
+    }
+    let cond = node
+        .child_by_field_name("condition")
+        .or_else(|| first_named_child(node));
+    let Some(cond) = cond else { return false };
+    let Ok(text) = cond.utf8_text(bytes) else {
+        return false;
+    };
+    // Strip whitespace and one layer of wrapping parens.
+    let mut t = text.trim();
+    while let Some(inner) = t.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+        t = inner.trim();
+    }
+    matches!(t, "true" | "True" | "1" | "!![]" | "!0" | "1==1" | "1===1")
+}
+
 #[derive(Default)]
 struct State {
     calls: Vec<Symbol>,
@@ -391,6 +531,23 @@ struct State {
     /// Count of `^` expressions whose operand subtree contains a `%` — the
     /// rolling-XOR decode shape `data[i] ^ key[i % n]` (`ast.xor_mod_loop_count`).
     xor_mod_loop_count: u32,
+    /// Max count of numeric literals in a comma `sequence_expression`
+    /// (`(1, 2, 3)`) — comma-constant obfuscation (`ast.numeric_sequence_max_length`).
+    max_numeric_sequence_length: u32,
+    /// Count of parameterless functions whose body is a single
+    /// `return <literal>` — dead-code / opaque padding helpers
+    /// (`ast.const_return_function_count`).
+    const_return_fn_count: u32,
+    /// Count of binary expressions whose left and right operands are textually
+    /// identical (`5 - 5`, `x === x`) — the useless-arithmetic / opaque-predicate
+    /// shape (`#eq? @left @right`, a backreference no regex expresses). Excludes
+    /// `!=`/`!==`/`<>` since `x !== x` is the legitimate NaN test
+    /// (`ast.self_compare_count`).
+    self_compare_count: u32,
+    /// Count of loops with a literally-true condition (`while true`,
+    /// `while (1)`, `for (;;)`) — infinite-loop obfuscation/rotators, matched
+    /// on the loop node so it never fires on prose (`ast.infinite_loop_count`).
+    infinite_loop_count: u32,
 }
 
 impl State {
@@ -497,6 +654,24 @@ impl State {
                         self.xor_mod_loop_count += 1;
                     }
                 }
+                // Self-compare: identical left/right operands (`5 - 5`,
+                // `x === x`) — useless arithmetic / opaque predicate. Skip the
+                // NaN idiom `x !== x` (`ne` maps inequality ops to one name).
+                if !matches!(op, "!=" | "!==" | "<>") {
+                    if let (Some(l), Some(r)) = (
+                        node.child_by_field_name("left"),
+                        node.child_by_field_name("right"),
+                    ) {
+                        if let (Ok(lt), Ok(rt)) = (
+                            l.utf8_text(source.as_bytes()),
+                            r.utf8_text(source.as_bytes()),
+                        ) {
+                            if lt == rt && !lt.is_empty() {
+                                self.self_compare_count += 1;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -504,6 +679,21 @@ impl State {
         // comma-sequence obfuscation.
         if node.kind() == "sequence_expression" {
             self.sequence_expr_count += 1;
+            // All-numeric comma sequence (`(1, 2, 3, …)`) — comma-constant
+            // obfuscation. Mirror the numeric-array shape: count the numeric
+            // members when every member is a numeric literal.
+            let mut cur = node.walk();
+            let members: Vec<Node<'_>> = node.named_children(&mut cur).collect();
+            if members.len() >= 2
+                && members
+                    .iter()
+                    .all(|c| config.number_kinds.contains(&c.kind()))
+            {
+                let len = u32::try_from(members.len()).unwrap_or(u32::MAX);
+                if len > self.max_numeric_sequence_length {
+                    self.max_numeric_sequence_length = len;
+                }
+            }
         }
 
         // Identity-proxy functions (`function(x){ return x }`): the return
@@ -519,6 +709,20 @@ impl State {
         // (decoder functions that just hand back a fixed string).
         if is_string_return_function(node, source) {
             self.string_return_fn_count += 1;
+        }
+
+        // Constant-return padding functions (`function(){ return 0 }` /
+        // `function(){ return "x" }` with no parameters): dead-code/opaque
+        // padding. Parameterless distinguishes it from an identity proxy.
+        if is_const_return_function(node, source) {
+            self.const_return_fn_count += 1;
+        }
+
+        // Infinite loops with a literally-true condition (`while true`,
+        // `while (1)`, `for (;;)`). Node-scoped so a bare `while true` in prose
+        // or a comment never matches.
+        if is_infinite_loop(node, source) {
+            self.infinite_loop_count += 1;
         }
 
         // String concatenation chains: `a + b + c + ...` builds

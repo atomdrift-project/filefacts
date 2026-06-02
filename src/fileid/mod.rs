@@ -565,22 +565,16 @@ fn is_benign_extension_mismatch(path: &Path, data: &[u8], det: &Detection) -> bo
     };
     let content = det.file_type;
     let name_ends_ci = |suffix: &str| {
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| {
-                n.len() >= suffix.len() && n[n.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
-            })
+        path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            n.len() >= suffix.len() && n[n.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+        })
     };
     // Android/Alpine APK: `.apk` (extension maps to Zip) whose body is a tar(.gz/…).
     if name_ends_ci(".apk")
         && ext_type == FileType::Zip
         && matches!(
             content,
-            FileType::Tar
-                | FileType::TarGz
-                | FileType::TarBz2
-                | FileType::TarXz
-                | FileType::TarZst
+            FileType::Tar | FileType::TarGz | FileType::TarBz2 | FileType::TarXz | FileType::TarZst
         )
     {
         return true;
