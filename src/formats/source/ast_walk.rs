@@ -308,14 +308,8 @@ fn is_string_return_function(node: Node<'_>, source: &str) -> bool {
     let Some(body) = node.child_by_field_name("body") else {
         return false;
     };
-    let is_string_kind = |k: &str| {
-        matches!(
-            k,
-            "string" | "template_string" | "template_literal" | "raw_string"
-        )
-    };
     // Arrow expression body: the body *is* the string.
-    if is_string_kind(body.kind()) {
+    if is_static_string_literal(body) {
         return true;
     }
     // Block body: a lone return_statement whose argument is a string literal.
@@ -331,13 +325,30 @@ fn is_string_return_function(node: Node<'_>, source: &str) -> bool {
         if child.kind() == "return_statement" {
             let mut rcur = child.walk();
             if let Some(arg) = child.named_children(&mut rcur).next() {
-                if is_string_kind(arg.kind()) {
+                if is_static_string_literal(arg) {
                     returns_string = true;
                 }
             }
         }
     }
     stmt_count == 1 && returns_string
+}
+
+/// A function that returns a **static** string literal is the substitution-table
+/// obfuscation shape. An interpolated template (`` `https://…${id}` ``) is a
+/// *computed* value — a URL builder, not a decoder table entry — so a template
+/// carrying any `${…}` substitution does not count.
+fn is_static_string_literal(node: Node<'_>) -> bool {
+    match node.kind() {
+        "string" | "raw_string" => true,
+        "template_string" | "template_literal" => {
+            let mut cur = node.walk();
+            !node
+                .named_children(&mut cur)
+                .any(|c| c.kind() == "template_substitution")
+        }
+        _ => false,
+    }
 }
 
 #[derive(Default)]
