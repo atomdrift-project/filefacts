@@ -598,6 +598,26 @@ fn arg_shape(node: Node<'_>, config: &LangConfig) -> ArgShape {
 /// / `Call` / `Expression` variants when the argument has no
 /// statically-recoverable value.
 fn build_arg(node: Node<'_>, source: &str, config: &LangConfig) -> Arg {
+    // PHP (and a few other grammars) wrap each call argument in an `argument`
+    // node whose child is the real expression, and PHP double-quoted strings
+    // are `encapsed_string` wrapping a `string_content`. Without unwrapping,
+    // every PHP arg would classify as `Expression` and its string/number value
+    // would be lost — so `arg: { kind: string, ... }` rules could never match.
+    // Descend through these wrappers to the inner value before shaping.
+    let mut node = node;
+    while node.kind() == "argument" {
+        match first_named_child(node) {
+            Some(inner) => node = inner,
+            None => break,
+        }
+    }
+    if node.kind() == "encapsed_string" {
+        if let Some(content) = first_named_child(node) {
+            if content.kind() == "string_content" {
+                node = content;
+            }
+        }
+    }
     match arg_shape(node, config) {
         ArgShape::String => match decode_string_literal(node, source) {
             Some(value) => Arg::String { value },

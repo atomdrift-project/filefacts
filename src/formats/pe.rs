@@ -168,6 +168,14 @@ pub(super) fn extract(
     values.insert("pe.partial_parse", serde_json::Value::Bool(true));
     errors_out.record_fallback(crate::Stage::PeParse, "header-only fallback");
     metrics.insert("pe.partial_parse", 1.0);
+    // goblin couldn't parse the section table / import directory at all
+    // (the header-only path leaves `sections_out` and `symbols_out` empty).
+    // This is exactly the case rizin recovery exists for — without it,
+    // malformed/packed PEs that rizin parses fine surface zero sections and
+    // zero imports, breaking every section-scoped trait. The success branch
+    // already calls this; the header-only branch must too. The helper no-ops
+    // when goblin did supply something, so it's safe to call unconditionally.
+    rizin_fallback_with_sections(bytes, symbols_out, sections_out, metrics, "pe");
     Ok(())
 }
 

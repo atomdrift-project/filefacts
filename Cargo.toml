@@ -148,6 +148,7 @@ dirs = "6"
 # integration was using std::env::temp_dir manually; `tempfile` cleans
 # up properly on Drop and avoids races.
 tempfile = "3"
+tree-sitter-clojure = "0.1.0"
 
 # Process group / RLIMIT / PR_SET_PDEATHSIG hooks for the hardened
 # rizin subprocess. Unix only — the gates in `rizin.rs` are
@@ -271,3 +272,9 @@ codegen-units = 1
 inherits = "release"
 strip = "none"
 debug = 2
+
+# Clojure grammar vendored with its tree-sitter dependency bumped 0.25.6 -> 0.26
+# to match this crate's engine (the grammar binds via the version-decoupled
+# tree-sitter-language LanguageFn ABI, so the parser.c is forward-compatible).
+[patch.crates-io]
+tree-sitter-clojure = { path = "vendor/tree-sitter-clojure" }

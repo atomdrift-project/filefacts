@@ -110,6 +110,7 @@ pub(super) fn config_for(file_type: FileType) -> Option<&'static LangConfig> {
         FileType::Zig => &ZIG,
         FileType::Elixir => &ELIXIR,
         FileType::Makefile => &MAKEFILE,
+        FileType::Clojure => &CLOJURE,
         _ => return None,
     })
 }
@@ -949,6 +950,36 @@ static MAKEFILE: LangConfig = LangConfig {
     object_kinds: &[],
     array_kinds: &["list"],
     function_kinds: &[],
+    template_kinds: &[],
+    binary_op_kinds: &[],
+};
+
+// Clojure / ClojureScript / EDN (Lisp). The grammar is S-expression based:
+// every call/special-form is a `list_lit` with positional children (no named
+// callee/arguments fields), so call-name extraction doesn't apply, but strings
+// (`str_lit`), symbols (`sym_lit`), literals, and the AST shape are all
+// recovered — which is what trait matching needs. `;` line comments.
+static CLOJURE: LangConfig = LangConfig {
+    name: "clojure",
+    language: || tree_sitter_clojure::LANGUAGE.into(),
+    comment_style: CommentStyle::Semicolon,
+    string_kinds: &["str_lit", "regex_lit"],
+    import_query: "",
+    function_query: "",
+    class_query: "",
+    call_kinds: &["list_lit"],
+    callee_field: "",
+    arguments_field: "",
+    member_kinds: &[],
+    member_object_field: "",
+    member_property_field: "",
+    identifier_kinds: &["sym_lit"],
+    number_kinds: &["num_lit"],
+    bool_kinds: &["bool_lit"],
+    null_kinds: &["nil_lit"],
+    object_kinds: &["map_lit", "ns_map_lit"],
+    array_kinds: &["vec_lit"],
+    function_kinds: &["anon_fn_lit"],
     template_kinds: &[],
     binary_op_kinds: &[],
 };
