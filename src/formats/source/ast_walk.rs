@@ -85,6 +85,12 @@ pub(super) fn walk(
             f64::from(state.max_array_literal_length),
         );
     }
+    if state.max_numeric_array_length > 0 {
+        metrics.insert(
+            "ast.numeric_array_max_length",
+            f64::from(state.max_numeric_array_length),
+        );
+    }
     if bind_count > 0 {
         metrics.insert("ast.bind_count", bind_count as f64);
     }
@@ -358,6 +364,8 @@ struct State {
     max_member_chain_depth: u32,
     max_string_concat_chain: u32,
     max_array_literal_length: u32,
+    /// Max length of an all-numeric-literal array (`ast.numeric_array_max_length`).
+    max_numeric_array_length: u32,
     /// Count of statement-level comma sequences (`a, b, c;`) — a density
     /// signal for comma-sequence obfuscation (`ast.sequence_expression_count`).
     sequence_expr_count: u32,
@@ -426,6 +434,20 @@ impl State {
             let len = u32::try_from(node.named_child_count()).unwrap_or(u32::MAX);
             if len > self.max_array_literal_length {
                 self.max_array_literal_length = len;
+            }
+            // Numeric-array length: arrays whose elements are *all* numeric
+            // literals — the byte-packing obfuscation shape (`[112,97,121,...]`),
+            // distinct from a generic long array of mixed/string data. Lets
+            // `ast.numeric_array_max_length` keep that specificity that a plain
+            // array-length metric would lose.
+            if len >= 2 {
+                let mut cur = node.walk();
+                let all_numeric = node
+                    .named_children(&mut cur)
+                    .all(|c| config.number_kinds.contains(&c.kind()));
+                if all_numeric && len > self.max_numeric_array_length {
+                    self.max_numeric_array_length = len;
+                }
             }
         }
 
@@ -611,12 +633,13 @@ fn build_arg(node: Node<'_>, source: &str, config: &LangConfig) -> Arg {
             None => break,
         }
     }
+    // PHP double-quoted strings are `encapsed_string` (quoted, so `decode`
+    // works) but aren't in `string_kinds`, so shape them as String directly.
     if node.kind() == "encapsed_string" {
-        if let Some(content) = first_named_child(node) {
-            if content.kind() == "string_content" {
-                node = content;
-            }
-        }
+        return match decode_string_literal(node, source) {
+            Some(value) => Arg::String { value },
+            None => Arg::Expression,
+        };
     }
     match arg_shape(node, config) {
         ArgShape::String => match decode_string_literal(node, source) {

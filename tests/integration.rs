@@ -701,3 +701,11 @@ fn php_call_string_arg_value_is_captured() {
         "PHP string arg value should be captured: {arg:?}");
 }
 
+
+#[test]
+fn numeric_array_max_length_metric() {
+    let py = b"a = [112, 97, 121, 108, 111, 97, 100]\nb = ['x','y','z']\n";
+    let p = open_with_path(std::path::Path::new("n.py"), py).unwrap();
+    assert_eq!(p.metrics().get("ast.numeric_array_max_length"), Some(7.0),
+        "the 7-int array counts; the string array does not");
+}

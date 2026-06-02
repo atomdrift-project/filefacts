@@ -148,7 +148,13 @@ dirs = "6"
 # integration was using std::env::temp_dir manually; `tempfile` cleans
 # up properly on Drop and avoids races.
 tempfile = "3"
-tree-sitter-clojure = "0.1.0"
+# Vendored: the published 0.1.0 pins tree-sitter ^0.25.6, conflicting with this
+# crate's 0.26 (links = "tree-sitter" permits only one). The vendored copy bumps
+# that to 0.26 (the grammar binds via tree-sitter-language's decoupled
+# LanguageFn ABI, so the parser.c is forward-compatible). A path dependency
+# (not crates.io + [patch]) so it resolves transitively when filefacts is itself
+# consumed as a git dependency — [patch] only applies in the root crate.
+tree-sitter-clojure = { path = "vendor/tree-sitter-clojure" }
 
 # Process group / RLIMIT / PR_SET_PDEATHSIG hooks for the hardened
 # rizin subprocess. Unix only — the gates in `rizin.rs` are
@@ -272,9 +278,3 @@ codegen-units = 1
 inherits = "release"
 strip = "none"
 debug = 2
-
-# Clojure grammar vendored with its tree-sitter dependency bumped 0.25.6 -> 0.26
-# to match this crate's engine (the grammar binds via the version-decoupled
-# tree-sitter-language LanguageFn ABI, so the parser.c is forward-compatible).
-[patch.crates-io]
-tree-sitter-clojure = { path = "vendor/tree-sitter-clojure" }
