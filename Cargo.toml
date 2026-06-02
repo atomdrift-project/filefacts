@@ -154,6 +154,7 @@ tempfile = "3"
 # LanguageFn ABI, so the parser.c is forward-compatible). A path dependency
 # (not crates.io + [patch]) so it resolves transitively when filefacts is itself
 # consumed as a git dependency — [patch] only applies in the root crate.
+tree-sitter-batch = "0.11.1"
 tree-sitter-clojure = { path = "vendor/tree-sitter-clojure" }
 
 # Process group / RLIMIT / PR_SET_PDEATHSIG hooks for the hardened

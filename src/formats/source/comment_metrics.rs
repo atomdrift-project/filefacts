@@ -28,6 +28,8 @@ pub(super) enum CommentStyle {
     /// `;` line comments (Clojure / Lisp family). `#` is a reader macro in
     /// Clojure, not a comment, so Hash would mis-scan it.
     Semicolon,
+    /// `REM` and `::` line comments (Windows Batch / CMD).
+    Batch,
 }
 
 /// Emit `comments.*` metrics for `content` parsed with `style`.
@@ -163,7 +165,27 @@ fn extract_comments(content: &str, style: CommentStyle) -> Vec<String> {
         CommentStyle::Hash => extract_hash_comments(content),
         CommentStyle::DoubleDash => extract_double_dash_comments(content),
         CommentStyle::Semicolon => extract_semicolon_comments(content),
+        CommentStyle::Batch => extract_batch_comments(content),
     }
+}
+
+/// Extract Windows Batch line comments: a line whose first non-space token is
+/// `::` or `rem` (case-insensitive). Whole-line constructs, so no string-state
+/// tracking is needed.
+fn extract_batch_comments(content: &str) -> Vec<String> {
+    let mut comments = Vec::new();
+    for line in content.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("::") {
+            comments.push(rest.to_string());
+        } else if t.len() >= 3 && t[..3].eq_ignore_ascii_case("rem") {
+            let after = &t[3..];
+            if after.is_empty() || after.starts_with([' ', '\t']) {
+                comments.push(after.trim_start().to_string());
+            }
+        }
+    }
+    comments
 }
 
 /// Extract `;`-to-end-of-line comments (Clojure / Lisp). Skips `"..."` string

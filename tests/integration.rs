@@ -673,6 +673,43 @@ fn string_return_functions_are_counted() {
 }
 
 #[test]
+fn interpolated_template_url_builders_are_not_counted() {
+    // Arrow functions returning an *interpolated* template literal are URL builders /
+    // computed values, not substitution-table decoder entries. They must NOT count
+    // toward the obfuscation signal. Regression: a benign UniProt browser extension
+    // had 14 such URL builders and tripped anti-static/obfuscation/string/reconstruct.
+    let src = br#"
+        const ALPHAFOLD = (id) => `https://alphafold.ebi.ac.uk/api/prediction/${id}`;
+        const FEATURES = (id) => `https://www.ebi.ac.uk/proteins/api/features/${id}`;
+        const UNIPROT = (id) => `https://rest.uniprot.org/uniprotkb/${id}.json`;
+        function key(p) { return `${p.position}-${p.category}`; }
+    "#;
+    let parsed = open_with_path(std::path::Path::new("u.js"), src).unwrap();
+    assert_eq!(
+        parsed.metrics().get("ast.string_return_function_count"),
+        None,
+        "interpolated template returns are computed values, not static string literals"
+    );
+}
+
+#[test]
+fn non_interpolated_template_returns_are_counted() {
+    // A template literal with no `${...}` is effectively a static string literal.
+    let src = br#"
+        const a = () => `alpha`;
+        const b = () => `beta`;
+        function c() { return `gamma`; }
+        function d() { return `delta`; }
+    "#;
+    let parsed = open_with_path(std::path::Path::new("t.js"), src).unwrap();
+    assert_eq!(
+        parsed.metrics().get("ast.string_return_function_count"),
+        Some(4.0),
+        "static (non-interpolated) templates are string literals"
+    );
+}
+
+#[test]
 fn xor_mod_loop_is_detected() {
     // Python rolling-XOR decode: data[i] ^ key[i % len(key)]
     let py = br#"def dec(b,k):

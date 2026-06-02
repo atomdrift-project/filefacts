@@ -111,6 +111,7 @@ pub(super) fn config_for(file_type: FileType) -> Option<&'static LangConfig> {
         FileType::Elixir => &ELIXIR,
         FileType::Makefile => &MAKEFILE,
         FileType::Clojure => &CLOJURE,
+        FileType::Batch => &BATCH,
         _ => return None,
     })
 }
@@ -980,6 +981,34 @@ static CLOJURE: LangConfig = LangConfig {
     object_kinds: &["map_lit", "ns_map_lit"],
     array_kinds: &["vec_lit"],
     function_kinds: &["anon_fn_lit"],
+    template_kinds: &[],
+    binary_op_kinds: &[],
+};
+
+// Windows Batch / CMD. Commands are `cmd` statements (no C-like callee/argument
+// fields), but command names, variables, strings, and integers are recovered.
+// `REM` / `::` line comments.
+static BATCH: LangConfig = LangConfig {
+    name: "batch",
+    language: || tree_sitter_batch::LANGUAGE.into(),
+    comment_style: CommentStyle::Batch,
+    string_kinds: &["string"],
+    import_query: "",
+    function_query: "",
+    class_query: "",
+    call_kinds: &["cmd", "call_stmt", "macro_invocation"],
+    callee_field: "",
+    arguments_field: "",
+    member_kinds: &[],
+    member_object_field: "",
+    member_property_field: "",
+    identifier_kinds: &["command_name", "variable_name", "variable_reference"],
+    number_kinds: &["integer"],
+    bool_kinds: &[],
+    null_kinds: &[],
+    object_kinds: &[],
+    array_kinds: &[],
+    function_kinds: &[],
     template_kinds: &[],
     binary_op_kinds: &[],
 };

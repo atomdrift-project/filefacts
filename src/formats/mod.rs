@@ -200,6 +200,7 @@ pub(crate) fn extract(
         | FileType::Zig
         | FileType::Elixir
         | FileType::Clojure
+        | FileType::Batch
         | FileType::Makefile => source::extract(
             bytes, file_type, tree_cache, values, strings, metrics, symbols,
         ),
@@ -207,7 +208,7 @@ pub(crate) fn extract(
         // Text-like languages without a tree-sitter binding in filefacts.
         // They still earn `text.*` metrics — pure byte/line analysis,
         // no AST required.
-        FileType::Vbs | FileType::Batch => {
+        FileType::Vbs => {
             source::extract_text_only(bytes, metrics);
             Ok(())
         }
