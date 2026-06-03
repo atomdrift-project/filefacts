@@ -290,7 +290,11 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "xz" => Some(FileType::Xz),
         "zst" => Some(FileType::Zst),
         "html" | "htm" => Some(FileType::Html),
-        "md" | "markdown" => Some(FileType::Markdown),
+        // R Markdown / Quarto / Sweave are markdown documents with embedded
+        // code chunks — classify as Markdown so they aren't analysed as source
+        // code (their YAML frontmatter and code chunks otherwise trip
+        // polyglot/obfuscation matchers).
+        "md" | "markdown" | "rmd" | "qmd" | "rnw" => Some(FileType::Markdown),
         "mk" | "mak" => Some(FileType::Makefile),
         "dockerfile" | "containerfile" => Some(FileType::Dockerfile),
         "txt" | "text" | "b64" | "base64" => Some(FileType::Text),
