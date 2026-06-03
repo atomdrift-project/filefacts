@@ -71,13 +71,13 @@ impl FileId {
                 // than a known format convention. FreeBSD `.pkg` zstd is already
                 // resolved as Consistent during detection.
                 let mismatch =
-                    d.extension_mismatch() && !is_benign_extension_mismatch(path, bytes, &d);
+                    d.extension_mismatch() && !is_benign_extension_mismatch(path, bytes, d);
                 Self {
                     file_type: d.file_type,
                     source: d.source,
                     extension_mismatch: mismatch,
                     extension_mismatch_low_severity: mismatch
-                        && is_low_severity_extension_mismatch(&d),
+                        && is_low_severity_extension_mismatch(d),
                 }
             }
             None => Self {
@@ -550,7 +550,7 @@ fn is_freebsd_pkg_zstd(path: &Path, data: &[u8], file_type: FileType) -> bool {
 /// True when an extension/content disagreement is a known benign format
 /// convention rather than an evasion signal. Mirrors the carve-outs cleave
 /// previously applied before emitting `metadata/file-extension-mismatch`.
-fn is_benign_extension_mismatch(path: &Path, data: &[u8], det: &Detection) -> bool {
+fn is_benign_extension_mismatch(path: &Path, data: &[u8], det: Detection) -> bool {
     // macOS AppleDouble sidecars (`._name`) carry resource-fork bytes whose
     // type intentionally differs from the extension — convention, not evasion.
     if path
@@ -594,7 +594,7 @@ fn is_benign_extension_mismatch(path: &Path, data: &[u8], det: &Detection) -> bo
 /// extension implies opaque `Data`, or the content is a generic archive
 /// (`.tar.gz` / `.zip`). Everything else (notably executable masquerades) is
 /// higher-severity. Mirrors cleave's former `extension_content_mismatch_criticality`.
-fn is_low_severity_extension_mismatch(det: &Detection) -> bool {
+fn is_low_severity_extension_mismatch(det: Detection) -> bool {
     let Some(ext_type) = det.extension_type() else {
         return false;
     };

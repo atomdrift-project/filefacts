@@ -90,7 +90,7 @@ fn generic_json_parses_below_limit() {
 #[test]
 fn generic_json_parse_limit_skips_values() {
     let mut bytes = Vec::from(br#"{"blob":""#.as_slice());
-    bytes.extend(std::iter::repeat(b'a').take(76 * 1024));
+    bytes.extend(std::iter::repeat_n(b'a', 76 * 1024));
     bytes.extend_from_slice(br#""}"#);
 
     let parsed = open_with_path(std::path::Path::new("payload.json"), &bytes).unwrap();

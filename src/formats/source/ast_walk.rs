@@ -137,6 +137,17 @@ pub(super) fn walk(
             f64::from(state.string_return_fn_count),
         );
     }
+    // Scale-invariant companion to `ast.string_return_function_count`: the
+    // fraction of all functions whose body is a single `return "<literal>"`.
+    // A substitution-table decoder is almost entirely such functions; a large
+    // hand-written module has a handful, so the ratio separates them where the
+    // raw count cannot.
+    if state.function_count > 0 && state.string_return_fn_count > 0 {
+        metrics.insert(
+            "ast.string_return_function_ratio".to_string(),
+            f64::from(state.string_return_fn_count) / f64::from(state.function_count),
+        );
+    }
     if state.xor_mod_loop_count > 0 {
         metrics.insert(
             "ast.xor_mod_loop_count".to_string(),
@@ -153,6 +164,17 @@ pub(super) fn walk(
         metrics.insert(
             "ast.const_return_function_count".to_string(),
             f64::from(state.const_return_fn_count),
+        );
+    }
+    // Scale-invariant companion to `ast.const_return_function_count`: the
+    // fraction of all functions that are parameterless constant-return padding.
+    // Opaque-padding obfuscation makes most functions this shape; a normal
+    // large module has many real functions diluting them, so gate on the ratio
+    // (with a count floor) rather than the size-scaling raw count.
+    if state.function_count > 0 && state.const_return_fn_count > 0 {
+        metrics.insert(
+            "ast.const_return_function_ratio".to_string(),
+            f64::from(state.const_return_fn_count) / f64::from(state.function_count),
         );
     }
     if state.self_compare_count > 0 {
@@ -538,6 +560,12 @@ struct State {
     /// `return <literal>` — dead-code / opaque padding helpers
     /// (`ast.const_return_function_count`).
     const_return_fn_count: u32,
+    /// Count of all function-definition nodes (declarations, expressions,
+    /// arrows, methods, lambdas) — the denominator for the const-return /
+    /// string-return *ratio* metrics. A raw count of decoder/padding helpers
+    /// grows with file size; the obfuscation signal is the *fraction* of a
+    /// file's functions that take that shape, so density beats count.
+    function_count: u32,
     /// Count of binary expressions whose left and right operands are textually
     /// identical (`5 - 5`, `x === x`) — the useless-arithmetic / opaque-predicate
     /// shape (`#eq? @left @right`, a backreference no regex expresses). Excludes
@@ -694,6 +722,21 @@ impl State {
                     self.max_numeric_sequence_length = len;
                 }
             }
+        }
+
+        // Tally every function-definition node so the const/string-return
+        // shapes can be reported as a fraction of all functions, not a raw
+        // count that simply grows with the file.
+        if matches!(
+            node.kind(),
+            "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "function_definition"
+                | "lambda"
+                | "method_definition"
+        ) {
+            self.function_count += 1;
         }
 
         // Identity-proxy functions (`function(x){ return x }`): the return
