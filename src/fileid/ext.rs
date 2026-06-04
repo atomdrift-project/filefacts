@@ -139,6 +139,9 @@ fn detect_from_filename(path: &Path) -> Option<FileType> {
     if name.eq_ignore_ascii_case("composer.json") {
         return Some(FileType::ComposerJson);
     }
+    if name.eq_ignore_ascii_case("binding.gyp") {
+        return Some(FileType::Gyp);
+    }
     if name.eq_ignore_ascii_case("cargo.toml") {
         return Some(FileType::CargoToml);
     }
@@ -253,6 +256,7 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
             Some(FileType::Xml)
         }
         "json" => Some(FileType::Json),
+        "gyp" | "gypi" => Some(FileType::Gyp),
         "plist" | "resx" => Some(FileType::Plist),
         "rtf" => Some(FileType::Rtf),
         "doc" | "msi" | "msp" | "msg" | "dot" | "ppt" | "pps" | "pot" | "ppa" | "xls" | "xlt"

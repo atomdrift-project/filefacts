@@ -63,7 +63,7 @@ pub(super) fn extract(
     comment_metrics::emit(source, config.comment_style, metrics, &mut strings.comments);
 
     extract_strings(root, source, config, strings, metrics);
-    let imports = collect_query(config.language, source, root, config.import_query);
+    let imports = collect_imports(config.language, source, root, config.import_query);
     let functions = collect_query(config.language, source, root, config.function_query);
     let classes = collect_query(config.language, source, root, config.class_query);
 
@@ -245,6 +245,35 @@ fn is_string_prefix(b: u8) -> bool {
     matches!(b, b'b' | b'B' | b'r' | b'R' | b'f' | b'F' | b'u' | b'U')
 }
 
+/// Compile-once cache for tree-sitter queries. `Query::new` is non-trivial
+/// (parses the S-expression and builds matcher state) and was re-run for all
+/// three queries on *every* source file; the compiled `Query` is immutable and
+/// reusable, so we build each (language, query) once and share it. Keyed by the
+/// language function pointer and the `&'static` query-source pointer — both are
+/// stable per query, so identical queries hit the cache without re-parsing.
+fn cached_query(
+    language_fn: fn() -> tree_sitter::Language,
+    query_src: &'static str,
+) -> Option<std::sync::Arc<tree_sitter::Query>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, RwLock};
+    static CACHE: LazyLock<RwLock<HashMap<(usize, usize), Option<Arc<tree_sitter::Query>>>>> =
+        LazyLock::new(|| RwLock::new(HashMap::new()));
+    let key = (language_fn as usize, query_src.as_ptr() as usize);
+    if let Ok(cache) = CACHE.read()
+        && let Some(entry) = cache.get(&key)
+    {
+        return entry.clone();
+    }
+    let compiled = tree_sitter::Query::new(&language_fn(), query_src)
+        .ok()
+        .map(Arc::new);
+    if let Ok(mut cache) = CACHE.write() {
+        return cache.entry(key).or_insert(compiled).clone();
+    }
+    compiled
+}
+
 fn collect_query(
     language_fn: fn() -> tree_sitter::Language,
     source: &str,
@@ -254,7 +283,7 @@ fn collect_query(
     if query_src.is_empty() {
         return Vec::new();
     }
-    let Ok(query) = tree_sitter::Query::new(&language_fn(), query_src) else {
+    let Some(query) = cached_query(language_fn, query_src) else {
         return Vec::new();
     };
     let capture_names = query.capture_names();
@@ -282,6 +311,88 @@ fn collect_query(
         }
     }
     seen.into_iter().collect()
+}
+
+/// Collect import symbols, qualifying Python relative-import members with
+/// their relative module prefix.
+///
+/// Tree-sitter records `from .pkg import name` as two separate captures: the
+/// relative module (`.pkg`) and the imported member (`name`). The bare member
+/// is indistinguishable from a top-level `import name`, so `from . import
+/// requests` would otherwise masquerade as an import of the PyPI `requests`
+/// library. Rejoining the member to its relative module (`.requests`,
+/// `.pkg.requests`) keeps the symbol relative-prefixed: it counts as a
+/// relative import and no library matcher anchored on `^name` matches a local
+/// submodule. Non-relative imports and other languages pass through unchanged.
+fn collect_imports(
+    language_fn: fn() -> tree_sitter::Language,
+    source: &str,
+    root: Node<'_>,
+    query_src: &'static str,
+) -> Vec<(String, u64)> {
+    if query_src.is_empty() {
+        return Vec::new();
+    }
+    let Some(query) = cached_query(language_fn, query_src) else {
+        return Vec::new();
+    };
+    let capture_names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+    let mut seen: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut matches = cursor.matches(&query, root, source.as_bytes());
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            let name = capture_names.get(cap.index as usize).copied().unwrap_or("");
+            if name.starts_with('_') {
+                continue;
+            }
+            if let Ok(text) = cap.node.utf8_text(source.as_bytes()) {
+                let cleaned = strip_quotes(text);
+                if cleaned.is_empty() {
+                    continue;
+                }
+                let qualified = qualify_relative_member(cap.node, cleaned, source);
+                let offset = cap.node.start_byte() as u64;
+                seen.entry(qualified).or_insert(offset);
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// When `node` is the imported-member field of a Python relative
+/// `import_from_statement` (`from .pkg import member`), return the member
+/// joined to its relative module prefix (`.pkg.member`); otherwise return
+/// `cleaned` unchanged. The relative module node itself already starts with
+/// `.`, so it is left as-is, and absolute imports (`from os import path`) are
+/// untouched because their `module_name` is a `dotted_name`, not a
+/// `relative_import`.
+fn qualify_relative_member(node: Node<'_>, cleaned: String, source: &str) -> String {
+    if cleaned.starts_with('.') {
+        return cleaned;
+    }
+    let Some(parent) = node.parent() else {
+        return cleaned;
+    };
+    if parent.kind() != "import_from_statement" {
+        return cleaned;
+    }
+    let Some(module) = parent.child_by_field_name("module_name") else {
+        return cleaned;
+    };
+    if module.kind() != "relative_import" {
+        return cleaned;
+    }
+    let Ok(prefix) = module.utf8_text(source.as_bytes()) else {
+        return cleaned;
+    };
+    let prefix = prefix.trim();
+    // `.`/`..` end in a dot already; `.pkg` needs a joining dot.
+    if prefix.ends_with('.') {
+        format!("{prefix}{cleaned}")
+    } else {
+        format!("{prefix}.{cleaned}")
+    }
 }
 
 fn strip_quotes(s: &str) -> String {
@@ -496,6 +607,38 @@ mod tests {
             assert!(lib.is_none());
             assert!(*has_offset);
         }
+    }
+
+    /// Python relative imports (`from . import requests`) must carry their
+    /// relative prefix so a local submodule named `requests` is not recorded
+    /// as an import of the PyPI `requests` library. Absolute imports of the
+    /// same name stay bare.
+    #[test]
+    fn python_relative_import_member_keeps_prefix() {
+        let src = b"from . import requests\nfrom .graph import responses\nimport os\n";
+        let parsed = crate::open_with_path(std::path::Path::new("rel.py"), src).unwrap();
+        let _ = parsed.values();
+        let names: std::collections::HashSet<String> = parsed
+            .symbols()
+            .iter_kind(crate::SymbolKind::Import)
+            .filter_map(|s| match s {
+                crate::Symbol::Import { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            names.contains(".requests"),
+            "relative member should be prefixed, got {names:?}"
+        );
+        assert!(
+            !names.contains("requests"),
+            "bare `requests` must not appear for a relative import, got {names:?}"
+        );
+        assert!(
+            names.contains(".graph.responses"),
+            "member of `.graph` should be `.graph.responses`, got {names:?}"
+        );
+        assert!(names.contains("os"), "absolute import unaffected, got {names:?}");
     }
 
     /// Helper: parse `src` as a source file with the given extension

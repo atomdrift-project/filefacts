@@ -207,6 +207,11 @@ pub enum FileType {
     ComposerJson,
     /// Generic JSON document (.json)
     Json,
+    /// node-gyp build manifest (binding.gyp, .gyp, .gypi). JSON-shaped build
+    /// config; its `<!(...)`/`<!@(...)` command-expansion runs arbitrary shell
+    /// during `node-gyp configure` (npm runs this automatically on install of a
+    /// package containing binding.gyp), a known supply-chain execution vector.
+    Gyp,
     /// GitHub Actions workflow YAML
     GithubActions,
     /// systemd service unit file (.service, .service.d/*.conf)
