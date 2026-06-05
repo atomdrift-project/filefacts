@@ -336,7 +336,7 @@ impl<'a> ParsedFile<'a> {
                 self.bytes,
                 self.fileid.file_type(),
                 self.fileid.extension_mismatch(),
-                self.fileid.extension_mismatch_low_severity(),
+                self.fileid.extension_mismatch_transition(),
                 self.basename.as_deref(),
                 self.tree_cache(),
             )
@@ -348,7 +348,7 @@ fn run_extraction(
     bytes: &[u8],
     file_type: FileType,
     extension_mismatch: bool,
-    extension_mismatch_low_severity: bool,
+    mismatch_transition: Option<(&'static str, &'static str)>,
     basename: Option<&str>,
     tree_cache: Option<&formats::source::TreeCache<'_>>,
 ) -> Extracted {
@@ -369,10 +369,17 @@ fn run_extraction(
     // Content-based detection disagreed with the file's extension — a
     // low-friction masquerade signal. Emitted only when true (and only when a
     // path/extension was supplied), mirroring the pe.dos_stub_* convention.
+    // The typed sub-metric names the content→extension group transition
+    // (e.g. `…_mismatch.binary_as_image` for a PE named `.png`) so a trait can
+    // decide which transitions are dangerous instead of relying on a severity
+    // verdict baked in here.
     if extension_mismatch {
         metrics.insert("consistency.extension_content_mismatch", 1.0);
-        if extension_mismatch_low_severity {
-            metrics.insert("consistency.extension_content_mismatch_low_severity", 1.0);
+        if let Some((content, ext)) = mismatch_transition {
+            metrics.insert(
+                format!("consistency.extension_content_mismatch.{content}_as_{ext}"),
+                1.0,
+            );
         }
     }
     // Format extractors return `Result` so they can report a hard

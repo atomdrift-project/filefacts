@@ -45,7 +45,11 @@ pub struct FileId {
     pub(crate) file_type: FileType,
     pub(crate) source: DetectionSource,
     pub(crate) extension_mismatch: bool,
-    pub(crate) extension_mismatch_low_severity: bool,
+    /// When `extension_mismatch` holds, the type the *extension* implied
+    /// (`None` when the extension is absent or unrecognized). Lets callers
+    /// describe the mismatch as a content-group→extension-group transition
+    /// without deciding, here, whether that transition is dangerous.
+    pub(crate) mismatch_ext_type: Option<FileType>,
 }
 
 impl FileId {
@@ -76,15 +80,14 @@ impl FileId {
                     file_type: d.file_type,
                     source: d.source,
                     extension_mismatch: mismatch,
-                    extension_mismatch_low_severity: mismatch
-                        && is_low_severity_extension_mismatch(d),
+                    mismatch_ext_type: if mismatch { d.extension_type() } else { None },
                 }
             }
             None => Self {
                 file_type: FileType::Unknown,
                 source: DetectionSource::Heuristic,
                 extension_mismatch: false,
-                extension_mismatch_low_severity: false,
+                mismatch_ext_type: None,
             },
         }
     }
@@ -110,12 +113,113 @@ impl FileId {
         self.extension_mismatch
     }
 
-    /// `true` when [`Self::extension_mismatch`] holds but the disagreeing
-    /// pair is low-severity (extension implies opaque `Data`, or the content
-    /// is a generic archive), rather than an executable masquerade.
+    /// When [`Self::extension_mismatch`] holds, the coarse
+    /// `(content_group, extension_group)` transition — e.g. `("binary",
+    /// "image")` for a PE named `.png`. The extension group is `"unknown"`
+    /// when the extension is unrecognized (e.g. `.woff2` carrying a PE).
+    ///
+    /// This deliberately reports *what kind* of mismatch occurred and leaves
+    /// the severity call to the consumer: a `.docx` named `.doc`
+    /// (`document`→`document`) is mundane, while a PE named `.jpeg`
+    /// (`binary`→`image`) is a masquerade. Returns `None` when there is no
+    /// genuine mismatch.
     #[must_use]
-    pub fn extension_mismatch_low_severity(&self) -> bool {
-        self.extension_mismatch_low_severity
+    pub fn extension_mismatch_transition(&self) -> Option<(&'static str, &'static str)> {
+        if !self.extension_mismatch {
+            return None;
+        }
+        let content = file_group(self.file_type);
+        let ext = self.mismatch_ext_type.map_or("unknown", file_group);
+        Some((content, ext))
+    }
+}
+
+/// Coarse content category for a [`FileType`], used to describe an
+/// extension/content mismatch as a `content_group → extension_group`
+/// transition. Kept exhaustive so a new [`FileType`] forces a category choice.
+fn file_group(ft: FileType) -> &'static str {
+    match ft {
+        FileType::MachO
+        | FileType::Elf
+        | FileType::Pe
+        | FileType::JavaClass
+        | FileType::PythonBytecode
+        | FileType::Beam
+        | FileType::Lnk => "binary",
+        // Interpreted scripting languages (cleave's `scripts` for-group).
+        FileType::Shell
+        | FileType::Batch
+        | FileType::Vbs
+        | FileType::Python
+        | FileType::JavaScript
+        | FileType::Ruby
+        | FileType::Php
+        | FileType::Perl
+        | FileType::Lua
+        | FileType::PowerShell
+        | FileType::AppleScript => "script",
+        // Compiled / typed source languages (cleave's `source` for-group).
+        FileType::TypeScript
+        | FileType::Go
+        | FileType::Rust
+        | FileType::Java
+        | FileType::C
+        | FileType::CSharp
+        | FileType::Swift
+        | FileType::ObjectiveC
+        | FileType::Groovy
+        | FileType::Scala
+        | FileType::Kotlin
+        | FileType::Zig
+        | FileType::Elixir
+        | FileType::Clojure => "source",
+        FileType::PackageJson
+        | FileType::PackageLockJson
+        | FileType::VsixManifest
+        | FileType::ChromeManifest
+        | FileType::CargoToml
+        | FileType::PyProjectToml
+        | FileType::ComposerJson
+        | FileType::Json
+        | FileType::Gyp
+        | FileType::GithubActions
+        | FileType::SystemdService
+        | FileType::DesktopEntry
+        | FileType::Xml
+        | FileType::PkgInfo
+        | FileType::Plist
+        | FileType::Makefile
+        | FileType::Dockerfile => "config",
+        FileType::Jar
+        | FileType::Zip
+        | FileType::Tar
+        | FileType::TarGz
+        | FileType::TarBz2
+        | FileType::TarXz
+        | FileType::TarZst
+        | FileType::Gz
+        | FileType::Bz2
+        | FileType::Xz
+        | FileType::Zst
+        | FileType::SevenZ
+        | FileType::Rar
+        | FileType::Deb
+        | FileType::Rpm
+        | FileType::Pkg
+        | FileType::Cab
+        | FileType::Chm
+        | FileType::Crx
+        | FileType::Xpi
+        | FileType::Whl
+        | FileType::Asar => "archive",
+        FileType::Rtf
+        | FileType::OleDoc
+        | FileType::Ooxml
+        | FileType::Pdf
+        | FileType::Odf => "document",
+        FileType::Jpeg | FileType::Png => "image",
+        FileType::Html | FileType::Markdown | FileType::Text => "text",
+        FileType::Pickle | FileType::Data | FileType::Unknown => "data",
     }
 }
 
@@ -593,17 +697,6 @@ fn is_benign_extension_mismatch(path: &Path, data: &[u8], det: Detection) -> boo
         }
     }
     false
-}
-
-/// True when a genuine extension/content mismatch is low-severity: the
-/// extension implies opaque `Data`, or the content is a generic archive
-/// (`.tar.gz` / `.zip`). Everything else (notably executable masquerades) is
-/// higher-severity. Mirrors cleave's former `extension_content_mismatch_criticality`.
-fn is_low_severity_extension_mismatch(det: Detection) -> bool {
-    let Some(ext_type) = det.extension_type() else {
-        return false;
-    };
-    ext_type == FileType::Data || matches!(det.file_type, FileType::TarGz | FileType::Zip)
 }
 
 /// Detect file type from content + path. Content is trusted first, extension as fallback.
