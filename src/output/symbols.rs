@@ -117,6 +117,83 @@ pub enum Arg {
     Expression,
 }
 
+/// Language-level declaration shape for a [`Symbol::Function`]. A closed,
+/// small set — encoded as a tag rather than a `String` so consumers match
+/// on a type, not a spelling. Serializes to the same lowercase strings the
+/// field carried before (`"function"`, `"method"`, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum Decl {
+    /// Free function / lambda / closure declaration.
+    Function,
+    /// Class / type declaration treated as a symbol.
+    Class,
+    /// Constructor (`<init>` in JVM terms).
+    Constructor,
+    /// Static initializer (`<clinit>`).
+    Initializer,
+    /// Method on a class/type.
+    Method,
+    /// VBA `Sub` (no return value).
+    Sub,
+}
+
+impl Decl {
+    /// The canonical lowercase spelling — the same string the field
+    /// serialized to before it became a tag.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Class => "class",
+            Self::Constructor => "constructor",
+            Self::Initializer => "initializer",
+            Self::Method => "method",
+            Self::Sub => "sub",
+        }
+    }
+}
+
+/// Control-flow-graph metrics for a [`Symbol::Function`], populated only
+/// when rizin's `aflj` analysis ran. Absent for entries sourced from
+/// symbol tables alone (PE imports, ELF `.dynsym`, source ASTs, VBA
+/// declarations, …) — which is the common case, so this lives behind a
+/// `Box` on the variant and is never allocated when no CFG exists.
+///
+/// `#[serde(flatten)]` on the variant keeps these fields at the
+/// `Function` object's top level, so the emitted JSON is unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FunctionMetrics {
+    /// Cyclomatic complexity (McCabe).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complexity: Option<u32>,
+    /// Number of basic blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basic_blocks: Option<u32>,
+    /// Number of control-flow edges between basic blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edges: Option<u32>,
+    /// Total instruction count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<u32>,
+    /// Stack frame size in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack_frame: Option<u64>,
+    /// `true` iff the function calls itself directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recursive: Option<bool>,
+    /// `true` iff the function never returns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noreturn: Option<bool>,
+    /// `true` iff the function has no branches (straight-line code).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_linear: Option<bool>,
+    /// Names of resolved outgoing call edges (rizin).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub callees: Vec<String>,
+}
+
 /// One named-entity fact about a parsed artifact.
 ///
 /// Serializes as `{"kind": "<lower_snake>", ...payload}` via
@@ -184,11 +261,10 @@ pub enum Symbol {
 
     /// Function / method / subroutine defined inside this file.
     ///
-    /// CFG fields (`complexity`, `basic_blocks`, `edges`, `instructions`,
-    /// `stack_frame`, `recursive`, `noreturn`, `is_linear`, `callees`)
-    /// are populated when rizin's `aflj` analysis ran. They are absent
-    /// for entries sourced from symbol tables alone (PE imports, ELF
-    /// `.dynsym`, VBA declarations, etc.).
+    /// CFG metrics live in [`FunctionMetrics`] behind a `Box`, populated
+    /// only when rizin's `aflj` analysis ran. They are absent (the `Box`
+    /// unallocated) for entries sourced from symbol tables alone (PE
+    /// imports, ELF `.dynsym`, source ASTs, VBA declarations, etc.).
     Function {
         /// Function name. Empty when the format records by address only.
         name: String,
@@ -197,41 +273,15 @@ pub enum Symbol {
         /// Entry-point offset within the source file.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         offset: Option<u64>,
-        /// Language-level declaration shape — `"method"`, `"sub"`,
-        /// `"function"`, `"constructor"`, `"initializer"`, `"class"`.
-        /// Renamed from the prior `kind` field to avoid collision with
-        /// the [`Symbol`] discriminator.
+        /// Language-level declaration shape ([`Decl`]). Named to avoid
+        /// collision with the [`Symbol`] discriminator.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        decl: Option<String>,
-        /// Cyclomatic complexity (McCabe).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        complexity: Option<u32>,
-        /// Number of basic blocks.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        basic_blocks: Option<u32>,
-        /// Number of control-flow edges between basic blocks.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        edges: Option<u32>,
-        /// Total instruction count.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        instructions: Option<u32>,
-        /// Stack frame size in bytes.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        stack_frame: Option<u64>,
-        /// `true` iff the function calls itself directly.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        recursive: Option<bool>,
-        /// `true` iff the function never returns.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        noreturn: Option<bool>,
-        /// `true` iff the function has no branches (straight-line code).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        is_linear: Option<bool>,
-        /// Names of resolved outgoing call edges (rizin). Renamed from
-        /// the prior `calls` field to disambiguate from the top-level
-        /// [`Symbol::Call`] kind.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        callees: Vec<String>,
+        decl: Option<Decl>,
+        /// Control-flow-graph metrics ([`FunctionMetrics`]), flattened so
+        /// the fields stay at this object's top level in JSON. `None` —
+        /// and unallocated — when no CFG analysis ran (the common case).
+        #[serde(flatten)]
+        metrics: Option<Box<FunctionMetrics>>,
     },
 
     /// One observed call site in source order.
@@ -448,25 +498,28 @@ mod tests {
             source: "rizin".into(),
             offset: Some(0x4080),
             decl: None,
-            complexity: Some(7),
-            basic_blocks: Some(12),
-            edges: Some(18),
-            instructions: Some(83),
-            stack_frame: Some(48),
-            recursive: Some(false),
-            noreturn: Some(false),
-            is_linear: Some(false),
-            callees: vec!["_resolve".into(), "_lzma_crc32".into()],
+            metrics: Some(Box::new(FunctionMetrics {
+                complexity: Some(7),
+                basic_blocks: Some(12),
+                edges: Some(18),
+                instructions: Some(83),
+                stack_frame: Some(48),
+                recursive: Some(false),
+                noreturn: Some(false),
+                is_linear: Some(false),
+                callees: vec!["_resolve".into(), "_lzma_crc32".into()],
+            })),
         };
         let json = serde_json::to_value(&s).unwrap();
         assert_eq!(json["kind"], "function");
+        // `#[serde(flatten)]` keeps the CFG fields at the top level.
         assert_eq!(json["complexity"], 7);
         assert_eq!(json["callees"][0], "_resolve");
         let back: Symbol = serde_json::from_value(json).unwrap();
-        if let Symbol::Function { callees, .. } = back {
-            assert_eq!(callees, vec!["_resolve", "_lzma_crc32"]);
+        if let Symbol::Function { metrics: Some(m), .. } = back {
+            assert_eq!(m.callees, vec!["_resolve", "_lzma_crc32"]);
         } else {
-            panic!("expected Function variant");
+            panic!("expected Function variant with metrics");
         }
     }
 
@@ -477,15 +530,7 @@ mod tests {
             source: "pe-import".into(),
             offset: Some(0x1000),
             decl: None,
-            complexity: None,
-            basic_blocks: None,
-            edges: None,
-            instructions: None,
-            stack_frame: None,
-            recursive: None,
-            noreturn: None,
-            is_linear: None,
-            callees: Vec::new(),
+            metrics: None,
         };
         let json = serde_json::to_value(&s).unwrap();
         let obj = json.as_object().unwrap();

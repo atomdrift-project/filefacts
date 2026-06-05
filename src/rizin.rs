@@ -658,15 +658,17 @@ impl RizinRecovery {
                     source: "rizin".into(),
                     offset: Some(func.offset),
                     decl: None,
-                    complexity: func.cc,
-                    basic_blocks: func.nbbs,
-                    edges: func.edges,
-                    instructions: func.ninstrs,
-                    stack_frame,
-                    recursive: func.recursive,
-                    noreturn: func.noreturn,
-                    is_linear: func.is_lineal,
-                    callees,
+                    metrics: Some(Box::new(crate::FunctionMetrics {
+                        complexity: func.cc,
+                        basic_blocks: func.nbbs,
+                        edges: func.edges,
+                        instructions: func.ninstrs,
+                        stack_frame,
+                        recursive: func.recursive,
+                        noreturn: func.noreturn,
+                        is_linear: func.is_lineal,
+                        callees,
+                    })),
                 });
                 counts.functions = counts.functions.saturating_add(1);
             }
@@ -995,30 +997,19 @@ mod tests {
         let mut symbols = Symbols::new();
         let mut metrics = Metrics::new();
         recovery.apply(&mut symbols, &mut metrics);
-        let Some(Symbol::Function {
-            complexity,
-            basic_blocks,
-            edges,
-            instructions,
-            stack_frame,
-            recursive,
-            noreturn,
-            is_linear,
-            callees,
-            ..
-        }) = first_function(&symbols)
-        else {
+        let Some(Symbol::Function { metrics, .. }) = first_function(&symbols) else {
             panic!("expected one rizin function");
         };
-        assert_eq!(*complexity, Some(7));
-        assert_eq!(*basic_blocks, Some(12));
-        assert_eq!(*edges, Some(18));
-        assert_eq!(*instructions, Some(83));
-        assert_eq!(*stack_frame, Some(48));
-        assert_eq!(*recursive, Some(false));
-        assert_eq!(*noreturn, Some(false));
-        assert_eq!(*is_linear, Some(false));
-        assert_eq!(*callees, vec!["puts".to_string(), "exit".to_string()]);
+        let m = metrics.as_deref().expect("rizin function carries CFG metrics");
+        assert_eq!(m.complexity, Some(7));
+        assert_eq!(m.basic_blocks, Some(12));
+        assert_eq!(m.edges, Some(18));
+        assert_eq!(m.instructions, Some(83));
+        assert_eq!(m.stack_frame, Some(48));
+        assert_eq!(m.recursive, Some(false));
+        assert_eq!(m.noreturn, Some(false));
+        assert_eq!(m.is_linear, Some(false));
+        assert_eq!(m.callees, vec!["puts".to_string(), "exit".to_string()]);
     }
 
     #[test]
@@ -1081,15 +1072,7 @@ mod tests {
             source: "goblin".into(),
             offset: Some(0),
             decl: None,
-            complexity: None,
-            basic_blocks: None,
-            edges: None,
-            instructions: None,
-            stack_frame: None,
-            recursive: None,
-            noreturn: None,
-            is_linear: None,
-            callees: Vec::new(),
+                    metrics: None,
         });
         let mut metrics = Metrics::new();
         recovery.apply(&mut symbols, &mut metrics);

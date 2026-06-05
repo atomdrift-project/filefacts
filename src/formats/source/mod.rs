@@ -121,16 +121,8 @@ pub(super) fn extract(
             name: name.clone(),
             source: config.name.into(),
             offset: Some(*offset),
-            decl: Some("function".into()),
-            complexity: None,
-            basic_blocks: None,
-            edges: None,
-            instructions: None,
-            stack_frame: None,
-            recursive: None,
-            noreturn: None,
-            is_linear: None,
-            callees: Vec::new(),
+            decl: Some(crate::Decl::Function),
+                    metrics: None,
         });
     }
     if !classes.is_empty() {
@@ -145,16 +137,8 @@ pub(super) fn extract(
             name: name.clone(),
             source: config.name.into(),
             offset: Some(*offset),
-            decl: Some("class".into()),
-            complexity: None,
-            basic_blocks: None,
-            edges: None,
-            instructions: None,
-            stack_frame: None,
-            recursive: None,
-            noreturn: None,
-            is_linear: None,
-            callees: Vec::new(),
+            decl: Some(crate::Decl::Class),
+                    metrics: None,
         });
     }
 
@@ -661,7 +645,9 @@ mod tests {
             .symbols()
             .iter_kind(crate::SymbolKind::Function)
             .filter_map(|s| match s {
-                crate::Symbol::Function { name, decl, .. } => Some((name.clone(), decl.clone())),
+                crate::Symbol::Function { name, decl, .. } => {
+                    Some((name.clone(), decl.as_ref().map(|d| d.as_str().to_string())))
+                }
                 _ => None,
             })
             .collect();
@@ -877,7 +863,7 @@ mod tests {
             .filter_map(|s| match s {
                 crate::Symbol::Function {
                     name, decl, source, ..
-                } => Some((name.as_str(), decl.as_deref(), source.as_str())),
+                } => Some((name.as_str(), decl.as_ref().map(|d| d.as_str()), source.as_str())),
                 _ => None,
             })
             .collect();

@@ -41,5 +41,5 @@ pub use strings::{Comments, ExtractedString, Literals, Text};
 // so they can push to either tier without juggling two parameters.
 // Not part of the public schema.
 pub(crate) use strings::Strings;
-pub use symbols::{Arg, ArgShape, Symbol, SymbolKind, Symbols};
+pub use symbols::{Arg, ArgShape, Decl, FunctionMetrics, Symbol, SymbolKind, Symbols};
 pub use values::Values;

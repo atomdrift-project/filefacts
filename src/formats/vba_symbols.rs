@@ -444,9 +444,9 @@ fn extract_subs_and_functions(
         // from `Function` so consumers don't have to lowercase /
         // string-compare.
         let decl = if kind.eq_ignore_ascii_case("sub") {
-            Some("sub".to_string())
+            Some(crate::Decl::Sub)
         } else if kind.eq_ignore_ascii_case("function") {
-            Some("function".to_string())
+            Some(crate::Decl::Function)
         } else {
             None
         };
@@ -456,15 +456,7 @@ fn extract_subs_and_functions(
             source: "vba-decl".into(),
             offset: Some(offset),
             decl,
-            complexity: None,
-            basic_blocks: None,
-            edges: None,
-            instructions: None,
-            stack_frame: None,
-            recursive: None,
-            noreturn: None,
-            is_linear: None,
-            callees: Vec::new(),
+                    metrics: None,
         });
     }
 }

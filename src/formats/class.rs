@@ -360,9 +360,9 @@ fn parse_methods(
         // a constructor, `<clinit>` for the static initialiser. Real
         // method declarations get the generic `"method"` tag.
         let decl = Some(match name.as_str() {
-            "<init>" => "constructor".to_string(),
-            "<clinit>" => "initializer".to_string(),
-            _ => "method".to_string(),
+            "<init>" => crate::Decl::Constructor,
+            "<clinit>" => crate::Decl::Initializer,
+            _ => crate::Decl::Method,
         });
         // Static methods are interesting for entry-point detection
         // (`public static void main(String[])`). We don't yet emit
@@ -374,15 +374,7 @@ fn parse_methods(
             source: "java-class".into(),
             offset: None,
             decl,
-            complexity: None,
-            basic_blocks: None,
-            edges: None,
-            instructions: None,
-            stack_frame: None,
-            recursive: None,
-            noreturn: None,
-            is_linear: None,
-            callees: Vec::new(),
+                    metrics: None,
         });
     }
     Some(u32::from(count))
@@ -870,7 +862,7 @@ mod tests {
             .filter_map(|s| match s {
                 crate::Symbol::Function {
                     name, source, decl, ..
-                } => Some((name.as_str(), source.as_str(), decl.as_deref())),
+                } => Some((name.as_str(), source.as_str(), decl.as_ref().map(|d| d.as_str()))),
                 _ => None,
             })
             .collect();
