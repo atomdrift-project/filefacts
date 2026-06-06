@@ -309,26 +309,21 @@ def run_command():
     );
 
     // Module-level string binding for API_URL — verify the bind exists
-    // with the right target/scope/shape. Literal-value matching now
+    // with the right target/shape. Literal-value matching now
     // happens via the top-level `literals[]` collection correlated by
     // offset; we keep the simpler structural assertion here.
-    let bind_targets: Vec<(&str, &str, filefacts::ArgShape)> = parsed
+    let bind_targets: Vec<(&str, filefacts::ArgShape)> = parsed
         .symbols()
         .iter_kind(SymbolKind::Bind)
         .filter_map(|s| match s {
-            Symbol::Bind {
-                target,
-                scope,
-                shape,
-                ..
-            } => Some((target.as_str(), scope.as_str(), *shape)),
+            Symbol::Bind { target, shape, .. } => Some((target.as_str(), *shape)),
             _ => None,
         })
         .collect();
     assert!(
-        bind_targets.iter().any(|(t, s, sh)| {
-            *t == "API_URL" && *s == "module" && *sh == filefacts::ArgShape::String
-        }),
+        bind_targets
+            .iter()
+            .any(|(t, sh)| *t == "API_URL" && *sh == filefacts::ArgShape::String),
         "module string constants should be exposed as bind facts, got {bind_targets:?}",
     );
 

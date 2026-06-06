@@ -94,8 +94,8 @@ pub use error::Error;
 pub use fileid::{FileId, FileType};
 pub use output::{
     ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Arg, ArgShape, Comments,
-    ErrorKind, Errors, ExtractedString, Literals, Metrics, ParseError,
-    Section, Sections, Stage, Symbol, SymbolKind, Symbols, Text, Values,
+    ErrorKind, Errors, ExtractedString, Literals, Metrics, ParseError, Section, Sections, Stage,
+    Symbol, SymbolKind, Symbols, Text, Values,
 };
 
 /// Schema version of the public output shape.

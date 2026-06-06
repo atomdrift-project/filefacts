@@ -614,7 +614,10 @@ mod tests {
             names.contains(".graph.responses"),
             "member of `.graph` should be `.graph.responses`, got {names:?}"
         );
-        assert!(names.contains("os"), "absolute import unaffected, got {names:?}");
+        assert!(
+            names.contains("os"),
+            "absolute import unaffected, got {names:?}"
+        );
     }
 
     /// Helper: parse `src` as a source file with the given extension

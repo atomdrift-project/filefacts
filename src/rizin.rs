@@ -961,7 +961,9 @@ mod tests {
         let mut metrics = Metrics::new();
         recovery.apply(&mut symbols, &mut metrics);
         let Some(Symbol::Function {
-            complexity, callees, ..
+            complexity,
+            callees,
+            ..
         }) = first_function(&symbols)
         else {
             panic!("expected one rizin function");

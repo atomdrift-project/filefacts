@@ -24,6 +24,32 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// Default jemalloc options: return freed pages to the OS immediately
+/// (`dirty_decay_ms:0`) instead of holding them for the default 10s decay
+/// window. filefacts is a one-shot batch tool; each file's alloc/free burst
+/// otherwise leaves dirty pages resident across the rest of the walk,
+/// inflating peak RSS ~60% on a 200MB mixed corpus (345MB → 216MB) for ~1%
+/// wall-clock. Overrides jemalloc's weak `_rjem_malloc_conf` definition;
+/// the `_RJEM_MALLOC_CONF` environment variable still takes precedence, so
+/// heap-profiling builds keep working unchanged.
+///
+/// `unsafe(export_name)` carries no runtime unsafety — it only places the
+/// symbol where jemalloc's option parser looks for it. Scoped allow per the
+/// Cargo.toml `unsafe_code = "deny"` rationale.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "solaris"
+    ))
+))]
+#[allow(unsafe_code, non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static malloc_conf: Option<&'static u8> = Some(&b"dirty_decay_ms:0\0"[0]);
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -156,23 +182,83 @@ fn analyze_one(path: &Path, args: &Args) -> bool {
         }
     };
 
-    let output = build_output(&parsed, args.view);
-    let rendered = match args.format {
-        Format::Json => match serde_json::to_string_pretty(&output) {
-            Ok(s) => s,
-            Err(e) => {
+    match args.format {
+        // Stream JSON straight to stdout. Building an intermediate
+        // `serde_json::Value` tree (and then one giant pretty string)
+        // doubles peak memory on string-heavy files; serialising the
+        // borrowed views directly keeps only one copy live.
+        Format::Json => {
+            if let Err(e) = write_json(&parsed, args.view) {
                 eprintln!(
                     "filefacts: serialisation failed for {}: {e}",
                     path.display()
                 );
                 return false;
             }
-        },
-        Format::Terminal => format_terminal(path, &parsed, args.view, &output),
-    };
-
-    println!("{rendered}");
+        }
+        Format::Terminal => {
+            let output = build_output(&parsed, args.view);
+            println!("{}", format_terminal(path, &parsed, args.view, &output));
+        }
+    }
     true
+}
+
+// write_json pretty-prints the selected view directly to stdout without
+// materialising a `serde_json::Value` tree or an intermediate String.
+fn write_json(parsed: &filefacts::ParsedFile<'_>, view: View) -> std::io::Result<()> {
+    use filefacts::SymbolKind;
+    use std::io::Write;
+    let stdout = std::io::stdout().lock();
+    let mut out = std::io::BufWriter::new(stdout);
+    match view {
+        View::All => serde_json::to_writer_pretty(
+            &mut out,
+            &Facts {
+                schema_version: filefacts::SCHEMA_VERSION,
+                fileid: parsed.fileid(),
+                values: parsed.values(),
+                text: parsed.text(),
+                literals: parsed.literals(),
+                metrics: parsed.metrics(),
+                sections: parsed.sections(),
+                symbols: parsed.symbols(),
+                errors: parsed.errors(),
+            },
+        )?,
+        View::Fileid => serde_json::to_writer_pretty(&mut out, parsed.fileid())?,
+        View::Values => serde_json::to_writer_pretty(&mut out, parsed.values())?,
+        View::Text => serde_json::to_writer_pretty(&mut out, parsed.text())?,
+        View::Literals => serde_json::to_writer_pretty(&mut out, parsed.literals())?,
+        View::Metrics => serde_json::to_writer_pretty(&mut out, parsed.metrics())?,
+        View::Sections => serde_json::to_writer_pretty(&mut out, parsed.sections())?,
+        View::Symbols => serde_json::to_writer_pretty(&mut out, parsed.symbols())?,
+        View::Imports => {
+            serde_json::to_writer_pretty(&mut out, &symbols_of_kind(parsed, SymbolKind::Import))?
+        }
+        View::Exports => {
+            serde_json::to_writer_pretty(&mut out, &symbols_of_kind(parsed, SymbolKind::Export))?
+        }
+        View::Functions => {
+            serde_json::to_writer_pretty(&mut out, &symbols_of_kind(parsed, SymbolKind::Function))?
+        }
+        View::Calls => {
+            serde_json::to_writer_pretty(&mut out, &symbols_of_kind(parsed, SymbolKind::Call))?
+        }
+        View::Members => {
+            serde_json::to_writer_pretty(&mut out, &symbols_of_kind(parsed, SymbolKind::Member))?
+        }
+        View::Binds => {
+            serde_json::to_writer_pretty(&mut out, &symbols_of_kind(parsed, SymbolKind::Bind))?
+        }
+        View::Identifiers => serde_json::to_writer_pretty(
+            &mut out,
+            &symbols_of_kind(parsed, SymbolKind::Identifier),
+        )?,
+        View::Errors => serde_json::to_writer_pretty(&mut out, parsed.errors())?,
+    }
+    out.write_all(b"\n")?;
+    out.flush()
 }
 
 #[derive(Serialize)]

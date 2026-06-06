@@ -212,11 +212,9 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::Xpi
         | FileType::Whl
         | FileType::Asar => "archive",
-        FileType::Rtf
-        | FileType::OleDoc
-        | FileType::Ooxml
-        | FileType::Pdf
-        | FileType::Odf => "document",
+        FileType::Rtf | FileType::OleDoc | FileType::Ooxml | FileType::Pdf | FileType::Odf => {
+            "document"
+        }
         FileType::Jpeg | FileType::Png => "image",
         FileType::Html | FileType::Markdown | FileType::Text => "text",
         FileType::Pickle | FileType::Data | FileType::Unknown => "data",

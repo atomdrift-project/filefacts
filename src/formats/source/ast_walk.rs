@@ -588,7 +588,6 @@ impl State {
             return;
         }
 
-
         // Member chains we treat as a property of the *outermost* member
         // expression in a chain — descending into nested member nodes
         // would duplicate the chain prefix. Subscript-with-string-index
@@ -774,7 +773,6 @@ impl State {
         for child in node.children(&mut cursor) {
             self.walk_node(child, source, config, depth + 1);
         }
-
     }
 
     fn record_call(&mut self, node: Node<'_>, source: &str, config: &LangConfig) {
