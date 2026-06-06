@@ -1687,7 +1687,6 @@ fn symbols(
                 name: name.to_string(),
                 alias: None,
                 library: None,
-                source: "elf-dynsym".into(),
                 offset: None,
                 ordinal: None,
             });
@@ -1695,7 +1694,6 @@ fn symbols(
             // STB_GLOBAL = 1 (binding in upper nibble of st_info)
             symbols_out.push(crate::Symbol::Export {
                 name: name.to_string(),
-                source: "elf-dynsym".into(),
                 offset: Some(sym.st_value),
                 ordinal: None,
                 // ELF doesn't have a forwarded-export concept like

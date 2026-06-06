@@ -531,7 +531,6 @@ struct State {
     /// `ast.op.<name>` metrics so density rules match O(1) via `type: metrics`
     /// with no per-occurrence facts — the lowest-overhead operator-density form.
     op_counts: BTreeMap<String, u32>,
-    scopes: Vec<&'static str>,
     node_count: u64,
     max_depth: u32,
     max_member_chain_depth: u32,
@@ -589,15 +588,6 @@ impl State {
             return;
         }
 
-        let pushed_scope = if is_class_scope(node.kind(), config.name) {
-            self.scopes.push("class");
-            true
-        } else if is_function_scope(node.kind()) {
-            self.scopes.push("function");
-            true
-        } else {
-            false
-        };
 
         // Member chains we treat as a property of the *outermost* member
         // expression in a chain — descending into nested member nodes
@@ -785,9 +775,6 @@ impl State {
             self.walk_node(child, source, config, depth + 1);
         }
 
-        if pushed_scope {
-            self.scopes.pop();
-        }
     }
 
     fn record_call(&mut self, node: Node<'_>, source: &str, config: &LangConfig) {
@@ -836,7 +823,6 @@ impl State {
         };
         self.binds.push(Symbol::Bind {
             target,
-            scope: self.scopes.last().copied().unwrap_or("module").into(),
             shape: arg_shape(value_node, config),
             offset: target_node.start_byte() as u64,
         });
@@ -1106,40 +1092,6 @@ fn assignment_target(node: Node<'_>) -> Option<Node<'_>> {
 fn assignment_value(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("right")
         .or_else(|| node.child_by_field_name("value"))
-}
-
-fn is_function_scope(kind: &str) -> bool {
-    matches!(
-        kind,
-        "function_definition"
-            | "function_declaration"
-            | "generator_function_declaration"
-            | "method_definition"
-            | "method_declaration"
-            | "constructor_declaration"
-            | "function_expression"
-            | "arrow_function"
-            | "lambda"
-            | "method"
-            | "singleton_method"
-            | "function_statement"
-    )
-}
-
-fn is_class_scope(kind: &str, language: &str) -> bool {
-    if kind == "module" {
-        return language == "ruby";
-    }
-    matches!(
-        kind,
-        "class_definition"
-            | "class_declaration"
-            | "interface_declaration"
-            | "enum_declaration"
-            | "record_declaration"
-            | "class"
-            | "class_statement"
-    )
 }
 
 fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {

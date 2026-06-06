@@ -108,7 +108,6 @@ pub(super) fn extract(
             name: bare,
             alias,
             library: None,
-            source: config.name.into(),
             offset: Some(*offset),
             ordinal: None,
         });
@@ -119,26 +118,22 @@ pub(super) fn extract(
     for (name, offset) in &functions {
         symbols_out.push(crate::Symbol::Function {
             name: name.clone(),
-            source: config.name.into(),
             offset: Some(*offset),
-            decl: Some(crate::Decl::Function),
-                    metrics: None,
+            complexity: None,
+            callees: Vec::new(),
         });
     }
     if !classes.is_empty() {
         metrics.insert("source.class_count", classes.len() as f64);
     }
-    // Class declarations surface as `Symbol::Function` with
-    // `decl: "class"` — the symbol axis is "things declared here",
-    // regardless of whether the declaration is a function or a class.
-    // Consumers that need the distinction read the decl field.
+    // Class declarations surface as `Symbol::Function` too — the symbol
+    // axis is "things declared here", regardless of function vs class.
     for (name, offset) in &classes {
         symbols_out.push(crate::Symbol::Function {
             name: name.clone(),
-            source: config.name.into(),
             offset: Some(*offset),
-            decl: Some(crate::Decl::Class),
-                    metrics: None,
+            complexity: None,
+            callees: Vec::new(),
         });
     }
 
@@ -571,12 +566,9 @@ mod tests {
                 crate::Symbol::Import {
                     name,
                     library,
-                    source,
                     offset,
                     ..
-                } if source == "python" => {
-                    Some((name.as_str(), library.as_deref(), offset.is_some()))
-                }
+                } => Some((name.as_str(), library.as_deref(), offset.is_some())),
                 _ => None,
             })
             .collect();
@@ -630,7 +622,7 @@ mod tests {
     /// the unified [`crate::Symbols`] view. Asserts the file classified
     /// to a non-text-only source extractor (i.e. `text.*` metrics
     /// fired) so callers can focus on language-specific structural facts.
-    fn parse_source(name: &str, src: &[u8]) -> (Vec<String>, Vec<(String, Option<String>)>) {
+    fn parse_source(name: &str, src: &[u8]) -> (Vec<String>, Vec<String>) {
         let parsed = crate::open_with_path(std::path::Path::new(name), src).unwrap();
         let _ = parsed.values();
         let imports: Vec<String> = parsed
@@ -641,13 +633,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let functions: Vec<(String, Option<String>)> = parsed
+        let functions: Vec<String> = parsed
             .symbols()
             .iter_kind(crate::SymbolKind::Function)
             .filter_map(|s| match s {
-                crate::Symbol::Function { name, decl, .. } => {
-                    Some((name.clone(), decl.as_ref().map(|d| d.as_str().to_string())))
-                }
+                crate::Symbol::Function { name, .. } => Some(name.clone()),
                 _ => None,
             })
             .collect();
@@ -663,19 +653,10 @@ mod tests {
         let src = b"require 'json'\nrequire_relative './lib'\nclass Greeter\n  def hello; end\nend\nmodule M; end\n";
         let (imports, functions) = parse_source("app.rb", src);
         assert!(imports.iter().any(|s| s == "json"), "got {imports:?}");
-        let names: std::collections::HashMap<&str, Option<String>> = functions
-            .iter()
-            .map(|(n, k)| (n.as_str(), k.clone()))
-            .collect();
-        assert_eq!(
-            names.get("hello").cloned(),
-            Some(Some("function".to_string()))
-        );
-        assert_eq!(
-            names.get("Greeter").cloned(),
-            Some(Some("class".to_string()))
-        );
-        assert_eq!(names.get("M").cloned(), Some(Some("class".to_string())));
+        let names: Vec<&str> = functions.iter().map(String::as_str).collect();
+        assert!(names.contains(&"hello"), "expected hello");
+        assert!(names.contains(&"Greeter"), "expected Greeter");
+        assert!(names.contains(&"M"), "expected M");
     }
 
     #[test]
@@ -683,7 +664,7 @@ mod tests {
         let src = b"local M = require(\"socket\")\nfunction greet(name)\n  return name\nend\nlocal function add(a, b) return a + b end\n";
         let (imports, functions) = parse_source("script.lua", src);
         assert!(imports.iter().any(|s| s == "socket"), "got {imports:?}");
-        let names: Vec<&str> = functions.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = functions.iter().map(String::as_str).collect();
         assert!(names.contains(&"greet"), "got {names:?}");
     }
 
@@ -695,15 +676,9 @@ mod tests {
             imports.iter().any(|s| s == "System" || s == "System.IO"),
             "got {imports:?}"
         );
-        let names: std::collections::HashMap<&str, Option<String>> = functions
-            .iter()
-            .map(|(n, k)| (n.as_str(), k.clone()))
-            .collect();
-        assert_eq!(
-            names.get("Hello").cloned(),
-            Some(Some("function".to_string()))
-        );
-        assert_eq!(names.get("Bar").cloned(), Some(Some("class".to_string())));
+        let names: Vec<&str> = functions.iter().map(String::as_str).collect();
+        assert!(names.contains(&"Hello"), "expected Hello");
+        assert!(names.contains(&"Bar"), "expected Bar");
     }
 
     #[test]
@@ -711,15 +686,9 @@ mod tests {
         let src = b"#include <stdio.h>\n#include \"local.h\"\nint add(int a, int b) { return a + b; }\nstruct P { int x; };\n";
         let (imports, functions) = parse_source("main.c", src);
         assert!(!imports.is_empty(), "expected C #include imports");
-        let names: std::collections::HashMap<&str, Option<String>> = functions
-            .iter()
-            .map(|(n, k)| (n.as_str(), k.clone()))
-            .collect();
-        assert_eq!(
-            names.get("add").cloned(),
-            Some(Some("function".to_string()))
-        );
-        assert_eq!(names.get("P").cloned(), Some(Some("class".to_string())));
+        let names: Vec<&str> = functions.iter().map(String::as_str).collect();
+        assert!(names.contains(&"add"), "expected add");
+        assert!(names.contains(&"P"), "expected P");
     }
 
     #[test]
@@ -727,18 +696,9 @@ mod tests {
         let src = b"import scala.collection.mutable\nclass Greeter { def hello() = 1 }\nobject O { def add(a: Int, b: Int) = a + b }\n";
         let (imports, functions) = parse_source("App.scala", src);
         assert!(!imports.is_empty(), "expected scala imports");
-        let names: std::collections::HashMap<&str, Option<String>> = functions
-            .iter()
-            .map(|(n, k)| (n.as_str(), k.clone()))
-            .collect();
-        assert_eq!(
-            names.get("hello").cloned(),
-            Some(Some("function".to_string()))
-        );
-        assert_eq!(
-            names.get("Greeter").cloned(),
-            Some(Some("class".to_string()))
-        );
+        let names: Vec<&str> = functions.iter().map(String::as_str).collect();
+        assert!(names.contains(&"hello"), "expected hello");
+        assert!(names.contains(&"Greeter"), "expected Greeter");
     }
 
     #[test]
@@ -756,7 +716,7 @@ mod tests {
             imports.iter().any(|s| s.contains("File")),
             "got {imports:?}"
         );
-        let names: Vec<&str> = functions.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = functions.iter().map(String::as_str).collect();
         assert!(names.contains(&"hello"), "got {names:?}");
         assert!(names.contains(&"add"), "got {names:?}");
     }
@@ -766,7 +726,7 @@ mod tests {
         let src = b"import Foundation\nclass Greeter {\n  func hello() -> Int { return 1 }\n}\nfunc add(a: Int, b: Int) -> Int { return a + b }\n";
         let (imports, functions) = parse_source("app.swift", src);
         assert!(imports.iter().any(|s| s == "Foundation"), "got {imports:?}");
-        let names: Vec<&str> = functions.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = functions.iter().map(String::as_str).collect();
         assert!(names.contains(&"add"), "got {names:?}");
     }
 
@@ -775,22 +735,10 @@ mod tests {
         let src = b"use strict;\nuse warnings;\nuse Foo::Bar;\npackage My::Class;\nsub greet { return 1 }\nsub add { my ($a, $b) = @_; return $a + $b }\n";
         let (imports, functions) = parse_source("app.pl", src);
         assert!(imports.iter().any(|s| s == "Foo::Bar"), "got {imports:?}");
-        let names: std::collections::HashMap<&str, Option<String>> = functions
-            .iter()
-            .map(|(n, k)| (n.as_str(), k.clone()))
-            .collect();
-        assert_eq!(
-            names.get("greet").cloned(),
-            Some(Some("function".to_string()))
-        );
-        assert_eq!(
-            names.get("add").cloned(),
-            Some(Some("function".to_string()))
-        );
-        assert_eq!(
-            names.get("My::Class").cloned(),
-            Some(Some("class".to_string()))
-        );
+        let names: Vec<&str> = functions.iter().map(String::as_str).collect();
+        assert!(names.contains(&"greet"), "expected greet");
+        assert!(names.contains(&"add"), "expected add");
+        assert!(names.contains(&"My::Class"), "expected My::Class");
     }
 
     #[test]
@@ -801,7 +749,7 @@ mod tests {
             imports.iter().any(|s| s == "java.util.List"),
             "got {imports:?}"
         );
-        let names: Vec<&str> = functions.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = functions.iter().map(String::as_str).collect();
         assert!(names.contains(&"Greeter"), "got {names:?}");
     }
 
@@ -810,7 +758,7 @@ mod tests {
         let src = b"const std = @import(\"std\");\nfn main() void {\n  std.debug.print(\"hi\\n\", .{});\n}\ntest \"smoke\" { try std.testing.expect(true); }\n";
         let (imports, functions) = parse_source("main.zig", src);
         assert!(imports.iter().any(|s| s == "std"), "got {imports:?}");
-        let names: Vec<&str> = functions.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = functions.iter().map(String::as_str).collect();
         assert!(names.contains(&"main"), "got {names:?}");
     }
 
@@ -822,7 +770,7 @@ mod tests {
             imports.iter().any(|s| s == "My.Helper" || s == "Logger"),
             "got {imports:?}"
         );
-        let names: Vec<&str> = functions.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = functions.iter().map(String::as_str).collect();
         assert!(
             names.contains(&"hello") || names.contains(&"Greeter"),
             "got {names:?}"
@@ -834,7 +782,7 @@ mod tests {
         let src = b"include common.mk\n\nall: build\n\nbuild:\n\t@echo building\n";
         let (imports, functions) = parse_source("Makefile", src);
         assert!(imports.iter().any(|s| s == "common.mk"), "got {imports:?}");
-        let names: Vec<&str> = functions.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = functions.iter().map(String::as_str).collect();
         assert!(
             names.iter().any(|n| *n == "all" || *n == "build"),
             "got {names:?}"
@@ -846,7 +794,7 @@ mod tests {
         let src =
             b"function Get-Greeting {\n  param([string]$Name)\n  Write-Output \"Hi $Name\"\n}\n";
         let (_imports, functions) = parse_source("script.ps1", src);
-        let names: Vec<&str> = functions.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = functions.iter().map(String::as_str).collect();
         assert!(names.contains(&"Get-Greeting"), "got {names:?}");
     }
 
@@ -857,23 +805,16 @@ mod tests {
         let src = b"def hello():\n    pass\n\nclass Greeter:\n    pass\n";
         let parsed = crate::open_with_path(std::path::Path::new("test.py"), src).unwrap();
         let _ = parsed.values();
-        let functions: Vec<(&str, Option<&str>, &str)> = parsed
+        let names: Vec<&str> = parsed
             .symbols()
             .iter_kind(crate::SymbolKind::Function)
             .filter_map(|s| match s {
-                crate::Symbol::Function {
-                    name, decl, source, ..
-                } => Some((name.as_str(), decl.as_ref().map(|d| d.as_str()), source.as_str())),
+                crate::Symbol::Function { name, .. } => Some(name.as_str()),
                 _ => None,
             })
             .collect();
-        let names: std::collections::HashMap<&str, Option<&str>> =
-            functions.iter().map(|(n, d, _)| (*n, *d)).collect();
-        assert_eq!(names.get("hello").copied(), Some(Some("function")));
-        assert_eq!(names.get("Greeter").copied(), Some(Some("class")));
-        for (_, _, src) in &functions {
-            assert_eq!(*src, "python");
-        }
+        assert!(names.contains(&"hello"), "expected hello");
+        assert!(names.contains(&"Greeter"), "expected Greeter");
     }
 
     /// Regression: `walk_node` used to recurse one stack frame per tree

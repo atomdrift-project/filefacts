@@ -211,7 +211,6 @@ fn extract_symbols(macho: &MachO<'_>, symbols_out: &mut crate::Symbols) {
                 name: imp.name.to_string(),
                 alias: None,
                 library: Some(library),
-                source: "macho-bind".into(),
                 offset: Some(imp.offset),
                 ordinal: None,
             });
@@ -227,7 +226,6 @@ fn extract_symbols(macho: &MachO<'_>, symbols_out: &mut crate::Symbols) {
         for exp in &exports {
             symbols_out.push(crate::Symbol::Export {
                 name: exp.name.clone(),
-                source: "macho-trie".into(),
                 offset: Some(exp.offset),
                 ordinal: None,
                 // dyld re-exports are surfaced via ExportInfo::Reexport
@@ -1817,13 +1815,9 @@ mod tests {
         // The trivial test.macho fixture might have no exports but
         // any real binary has bind imports for libSystem.
         for sym in symbols.iter_kind(crate::SymbolKind::Import) {
-            let crate::Symbol::Import {
-                source, library, ..
-            } = sym
-            else {
+            let crate::Symbol::Import { library, .. } = sym else {
                 unreachable!();
             };
-            assert_eq!(source, "macho-bind");
             let lib = library
                 .as_deref()
                 .expect("Mach-O bind imports carry library");
@@ -1831,10 +1825,7 @@ mod tests {
             assert!(!lib.ends_with(".dylib") && !lib.ends_with(".tbd"));
         }
         for sym in symbols.iter_kind(crate::SymbolKind::Export) {
-            let crate::Symbol::Export { source, .. } = sym else {
-                unreachable!();
-            };
-            assert_eq!(source, "macho-trie");
+            assert!(matches!(sym, crate::Symbol::Export { .. }));
         }
     }
 

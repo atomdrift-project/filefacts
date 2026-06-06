@@ -94,7 +94,7 @@ pub use error::Error;
 pub use fileid::{FileId, FileType};
 pub use output::{
     ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Arg, ArgShape, Comments,
-    Decl, ErrorKind, Errors, ExtractedString, FunctionMetrics, Literals, Metrics, ParseError,
+    ErrorKind, Errors, ExtractedString, Literals, Metrics, ParseError,
     Section, Sections, Stage, Symbol, SymbolKind, Symbols, Text, Values,
 };
 
@@ -292,13 +292,11 @@ impl<'a> ParsedFile<'a> {
     /// Iterate every symbol name across the declaration kinds
     /// (`Import`, `Export`, `Function`) for cross-cutting matchers
     /// that ask "any declared name of this value regardless of role."
-    /// Yields `(name, source)` so callers can disambiguate when
-    /// needed.
-    pub fn symbol_iter(&self) -> impl Iterator<Item = (&str, &str)> {
+    pub fn symbol_iter(&self) -> impl Iterator<Item = &str> {
         self.symbols().iter().filter_map(|s| match s {
-            Symbol::Import { name, source, .. }
-            | Symbol::Export { name, source, .. }
-            | Symbol::Function { name, source, .. } => Some((name.as_str(), source.as_str())),
+            Symbol::Import { name, .. }
+            | Symbol::Export { name, .. }
+            | Symbol::Function { name, .. } => Some(name.as_str()),
             _ => None,
         })
     }
@@ -972,10 +970,6 @@ mod tests {
             total, expected,
             "symbol_iter must visit every Import/Export/Function row"
         );
-        // All PE-sourced entries carry source == "pe".
-        let sources: std::collections::HashSet<&str> =
-            parsed.symbol_iter().map(|(_, src)| src).collect();
-        assert!(sources.contains("pe"));
     }
 
     /// A healthy PE fixture should produce zero parse errors and

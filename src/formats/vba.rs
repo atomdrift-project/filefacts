@@ -78,6 +78,9 @@ pub(super) fn extract(
     // so a doc with three modules and one Declare each surfaces a
     // single `office.vba.declare_count = 3`.
     let mut agg = super::vba_symbols::VbaSymbolStats::default();
+    // Mark where this document's VBA symbols start so the identifier-shape
+    // metrics below are computed over exactly the symbols emitted here.
+    let sym_start = symbols_out.len();
     for info in module_infos.iter().take(MAX_MODULES) {
         let stream_path = format!("{}/{}", prefix, info.stream_name);
         let Ok(stream_bytes) = read_stream(&mut comp, &stream_path) else {
@@ -165,6 +168,54 @@ pub(super) fn extract(
         metrics.insert(
             "office.vba.trigger_handler_count",
             f64::from(agg.trigger_handler_count),
+        );
+
+        // Identifier-shape signals over this document's VBA symbol names
+        // (imports + functions): mean length, Shannon entropy of the
+        // byte-frequency distribution, and the count of *distinct* trigger
+        // handlers. Random/obfuscated macros skew length+entropy; the
+        // distinct-trigger count separates one auto-exec stub from a doc
+        // that hooks many lifecycle events.
+        let mut byte_counts = [0u32; 256];
+        let mut total_chars = 0u64;
+        let mut total_idents = 0u32;
+        let mut distinct_triggers = std::collections::BTreeSet::new();
+        for sym in symbols_out.iter().skip(sym_start) {
+            let Some(name) = sym.name().filter(|n| !n.is_empty()) else {
+                continue;
+            };
+            total_idents += 1;
+            for b in name.bytes() {
+                byte_counts[b as usize] = byte_counts[b as usize].saturating_add(1);
+                total_chars += 1;
+            }
+            if matches!(sym, crate::Symbol::Function { .. })
+                && super::vba_symbols::is_trigger_name(name)
+            {
+                distinct_triggers.insert(name.to_string());
+            }
+        }
+        if total_idents > 0 {
+            metrics.insert(
+                "office.vba.mean_identifier_length",
+                total_chars as f64 / f64::from(total_idents),
+            );
+        }
+        if total_chars > 0 {
+            let total = total_chars as f64;
+            let entropy: f64 = byte_counts
+                .iter()
+                .filter(|&&c| c > 0)
+                .map(|&c| {
+                    let p = f64::from(c) / total;
+                    -p * p.log2()
+                })
+                .sum();
+            metrics.insert("office.vba.identifier_entropy", entropy);
+        }
+        metrics.insert(
+            "office.vba.distinct_trigger_count",
+            distinct_triggers.len() as f64,
         );
     }
 }

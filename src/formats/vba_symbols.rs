@@ -238,7 +238,6 @@ fn extract_declares(
             name: import_name,
             alias: None,
             library: Some(lib_label),
-            source: "vba-declare".into(),
             offset: Some(offset),
             ordinal: None,
         });
@@ -286,10 +285,10 @@ fn extract_createobject(
     stats: &mut VbaSymbolStats,
     is_get: bool,
 ) {
-    let (re, source_label, lib_label) = if is_get {
-        (getobject_re(), "vba-getobject", "com-getobject")
+    let (re, lib_label) = if is_get {
+        (getobject_re(), "com-getobject")
     } else {
-        (createobject_re(), "vba-createobject", "com")
+        (createobject_re(), "com")
     };
 
     for cap in re.captures_iter(&prep.text) {
@@ -337,7 +336,6 @@ fn extract_createobject(
             name: label,
             alias: None,
             library: Some(lib_label.to_string()),
-            source: source_label.into(),
             offset: Some(offset),
             ordinal: None,
         });
@@ -404,7 +402,7 @@ const TRIGGER_NAMES: &[&str] = &[
     "App_NewMail",
 ];
 
-fn is_trigger_name(name: &str) -> bool {
+pub(super) fn is_trigger_name(name: &str) -> bool {
     TRIGGER_NAMES.iter().any(|t| t.eq_ignore_ascii_case(name))
 }
 
@@ -441,22 +439,12 @@ fn extract_subs_and_functions(
         }
 
         // Pike-style decl tag — distinguish `Sub` (no return value)
-        // from `Function` so consumers don't have to lowercase /
-        // string-compare.
-        let decl = if kind.eq_ignore_ascii_case("sub") {
-            Some(crate::Decl::Sub)
-        } else if kind.eq_ignore_ascii_case("function") {
-            Some(crate::Decl::Function)
-        } else {
-            None
-        };
-
+        let _ = kind;
         symbols_out.push(Symbol::Function {
             name,
-            source: "vba-decl".into(),
             offset: Some(offset),
-            decl,
-                    metrics: None,
+            complexity: None,
+            callees: Vec::new(),
         });
     }
 }
@@ -472,15 +460,10 @@ mod tests {
         (symbols, stats)
     }
 
-    fn imports(s: &Symbols) -> Vec<(&str, Option<&str>, &str)> {
+    fn imports(s: &Symbols) -> Vec<(&str, Option<&str>)> {
         s.iter_kind(SymbolKind::Import)
             .filter_map(|sym| match sym {
-                Symbol::Import {
-                    name,
-                    library,
-                    source,
-                    ..
-                } => Some((name.as_str(), library.as_deref(), source.as_str())),
+                Symbol::Import { name, library, .. } => Some((name.as_str(), library.as_deref())),
                 _ => None,
             })
             .collect()
@@ -504,7 +487,7 @@ mod tests {
         let (syms, stats) = run(src);
         let imps = imports(&syms);
         assert_eq!(imps.len(), 1);
-        assert_eq!(imps[0], ("VirtualAlloc", Some("kernel32"), "vba-declare"));
+        assert_eq!(imps[0], ("VirtualAlloc", Some("kernel32")));
         assert_eq!(stats.declare_count, 1);
         assert_eq!(stats.declare_non_literal_count, 0);
     }
@@ -564,7 +547,7 @@ mod tests {
         let (syms, stats) = run(src);
         let imps = imports(&syms);
         assert_eq!(imps.len(), 1);
-        assert_eq!(imps[0], ("WScript.Shell", Some("com"), "vba-createobject"));
+        assert_eq!(imps[0], ("WScript.Shell", Some("com")));
         assert_eq!(stats.createobject_count, 1);
         assert_eq!(stats.createobject_non_literal_count, 0);
     }
@@ -585,10 +568,7 @@ mod tests {
         let (syms, stats) = run(src);
         let imps = imports(&syms);
         assert_eq!(imps.len(), 1);
-        assert_eq!(
-            imps[0],
-            ("Excel.Application", Some("com-getobject"), "vba-getobject")
-        );
+        assert_eq!(imps[0], ("Excel.Application", Some("com-getobject")));
         assert_eq!(stats.getobject_count, 1);
     }
 

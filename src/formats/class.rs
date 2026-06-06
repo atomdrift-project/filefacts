@@ -356,14 +356,6 @@ fn parse_methods(
         let Some(name) = cp.utf8.get(&name_idx) else {
             continue;
         };
-        // Class-file method decl tags: `<init>` is the JVM's name for
-        // a constructor, `<clinit>` for the static initialiser. Real
-        // method declarations get the generic `"method"` tag.
-        let decl = Some(match name.as_str() {
-            "<init>" => crate::Decl::Constructor,
-            "<clinit>" => crate::Decl::Initializer,
-            _ => crate::Decl::Method,
-        });
         // Static methods are interesting for entry-point detection
         // (`public static void main(String[])`). We don't yet emit
         // the access-flag decomposition per function — that lives
@@ -371,10 +363,9 @@ fn parse_methods(
         let _ = access_flags;
         symbols_out.push(crate::Symbol::Function {
             name: name.clone(),
-            source: "java-class".into(),
             offset: None,
-            decl,
-                    metrics: None,
+            complexity: None,
+            callees: Vec::new(),
         });
     }
     Some(u32::from(count))
@@ -411,7 +402,6 @@ fn populate_imports(
             name: name.to_string(),
             alias: None,
             library: None,
-            source: "java-class".into(),
             offset: None,
             ordinal: None,
         });
@@ -435,7 +425,6 @@ fn populate_imports(
             name: name.to_string(),
             alias: None,
             library: Some(owner.to_string()),
-            source: "java-methodref".into(),
             offset: None,
             ordinal: None,
         });
@@ -698,13 +687,9 @@ mod tests {
             "this_class must not leak as import"
         );
         for sym in symbols.iter_kind(crate::SymbolKind::Import) {
-            let crate::Symbol::Import {
-                source, library, ..
-            } = sym
-            else {
+            let crate::Symbol::Import { library, .. } = sym else {
                 unreachable!();
             };
-            assert_eq!(source, "java-class");
             assert!(library.is_none(), "java-class imports carry no library");
         }
         assert_eq!(m.get("class.external_class_count"), Some(1.0));
@@ -832,15 +817,16 @@ mod tests {
     fn methodref_resolves_to_java_methodref_import() {
         let bytes = build_class_with_methodref_and_method();
         let (_, m, symbols) = run_full(&bytes);
+        // Methodref imports are the ones carrying a resolved library
+        // (owning class); plain external-class refs carry none.
         let methodref: Vec<(&str, Option<&str>)> = symbols
             .iter_kind(crate::SymbolKind::Import)
             .filter_map(|s| match s {
                 crate::Symbol::Import {
                     name,
-                    library,
-                    source,
+                    library: Some(lib),
                     ..
-                } if source == "java-methodref" => Some((name.as_str(), library.as_deref())),
+                } => Some((name.as_str(), Some(lib.as_str()))),
                 _ => None,
             })
             .collect();
@@ -857,19 +843,15 @@ mod tests {
     fn declared_methods_emit_typed_functions() {
         let bytes = build_class_with_methodref_and_method();
         let (_, m, symbols) = run_full(&bytes);
-        let funcs: Vec<(&str, &str, Option<&str>)> = symbols
+        let funcs: Vec<&str> = symbols
             .iter_kind(crate::SymbolKind::Function)
             .filter_map(|s| match s {
-                crate::Symbol::Function {
-                    name, source, decl, ..
-                } => Some((name.as_str(), source.as_str(), decl.as_ref().map(|d| d.as_str()))),
+                crate::Symbol::Function { name, .. } => Some(name.as_str()),
                 _ => None,
             })
             .collect();
         assert_eq!(funcs.len(), 1);
-        assert_eq!(funcs[0].0, "compute");
-        assert_eq!(funcs[0].1, "java-class");
-        assert_eq!(funcs[0].2, Some("method"));
+        assert_eq!(funcs[0], "compute");
         assert_eq!(m.get("class.method_count"), Some(1.0));
     }
 

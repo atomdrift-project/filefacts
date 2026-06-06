@@ -417,7 +417,6 @@ fn imports(
             name: imp.name.to_string(),
             alias: None,
             library: Some(library),
-            source: "pe".into(),
             offset: Some(imp.offset as u64),
             ordinal: if name_is_ordinal_stub {
                 Some(u32::from(imp.ordinal))
@@ -471,7 +470,6 @@ fn exports(
         // forensically interesting for an export-table consumer.
         symbols_out.push(crate::Symbol::Export {
             name: name.to_string(),
-            source: "pe".into(),
             offset: Some(exp.rva as u64),
             ordinal: None,
             forward_to,
@@ -1643,7 +1641,6 @@ fn delay_imports(
                         name: format!("ORDINAL {ordinal}"),
                         alias: None,
                         library: Some(library.clone()),
-                        source: "pe-delay".into(),
                         offset: None,
                         ordinal: Some(ordinal),
                     });
@@ -1654,7 +1651,6 @@ fn delay_imports(
                             name,
                             alias: None,
                             library: Some(library.clone()),
-                            source: "pe-delay".into(),
                             offset: None,
                             ordinal: None,
                         });
@@ -2025,13 +2021,9 @@ mod tests {
         let imports: Vec<&crate::Symbol> = symbols.iter_kind(crate::SymbolKind::Import).collect();
         assert!(!imports.is_empty(), "expected at least one PE import");
         for sym in imports {
-            let crate::Symbol::Import {
-                source, library, ..
-            } = sym
-            else {
+            let crate::Symbol::Import { library, .. } = sym else {
                 unreachable!("iter_kind(Import) yields only Import variants");
             };
-            assert_eq!(source, "pe");
             let lib = library.as_deref().expect("PE imports carry library");
             assert_eq!(lib, &lib.to_ascii_lowercase());
             assert!(

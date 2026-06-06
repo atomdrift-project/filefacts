@@ -617,7 +617,6 @@ impl RizinRecovery {
                     name: imp.name,
                     alias: None,
                     library: imp.libname,
-                    source: "rizin".into(),
                     offset: None,
                     ordinal: imp.ordinal,
                 });
@@ -631,7 +630,6 @@ impl RizinRecovery {
                 }
                 symbols_out.push(Symbol::Export {
                     name: exp.name,
-                    source: "rizin".into(),
                     offset: Some(exp.vaddr),
                     ordinal: None,
                     forward_to: None,
@@ -650,25 +648,11 @@ impl RizinRecovery {
                     .filter_map(|c| c.name.clone())
                     .filter(|n| !n.is_empty())
                     .collect();
-                let stack_frame = func
-                    .stackframe
-                    .map(|sf| u64::try_from(sf.max(0)).unwrap_or(0));
                 symbols_out.push(Symbol::Function {
                     name: func.name.clone(),
-                    source: "rizin".into(),
                     offset: Some(func.offset),
-                    decl: None,
-                    metrics: Some(Box::new(crate::FunctionMetrics {
-                        complexity: func.cc,
-                        basic_blocks: func.nbbs,
-                        edges: func.edges,
-                        instructions: func.ninstrs,
-                        stack_frame,
-                        recursive: func.recursive,
-                        noreturn: func.noreturn,
-                        is_linear: func.is_lineal,
-                        callees,
-                    })),
+                    complexity: func.cc,
+                    callees,
                 });
                 counts.functions = counts.functions.saturating_add(1);
             }
@@ -803,30 +787,9 @@ struct RawFunction {
     /// Cyclomatic complexity.
     #[serde(default)]
     cc: Option<u32>,
-    /// Number of basic blocks.
+    /// Number of basic blocks (feeds the `binary.*_basic_blocks` aggregates).
     #[serde(default)]
     nbbs: Option<u32>,
-    /// Control-flow edges between basic blocks.
-    #[serde(default)]
-    edges: Option<u32>,
-    /// Total instruction count.
-    #[serde(default)]
-    ninstrs: Option<u32>,
-    /// Stack frame size in bytes. Rizin emits a signed int (negative
-    /// values indicate "no frame"); we normalise to `u64` via `.max(0)`
-    /// in `apply`.
-    #[serde(default)]
-    stackframe: Option<i64>,
-    /// `true` iff the function calls itself directly.
-    #[serde(default)]
-    recursive: Option<bool>,
-    /// `true` iff the function never returns.
-    #[serde(default)]
-    noreturn: Option<bool>,
-    /// Straight-line code with no branches. Rizin's `aflj` emits this
-    /// under the kebab-case key `is-lineal` (sic, rizin's typo).
-    #[serde(default, rename = "is-lineal", alias = "is_lineal")]
-    is_lineal: Option<bool>,
     /// Resolved outgoing call edges. Each entry has a `name` field
     /// when rizin could resolve the callee; entries without a name
     /// are dropped during `apply`.
@@ -997,19 +960,14 @@ mod tests {
         let mut symbols = Symbols::new();
         let mut metrics = Metrics::new();
         recovery.apply(&mut symbols, &mut metrics);
-        let Some(Symbol::Function { metrics, .. }) = first_function(&symbols) else {
+        let Some(Symbol::Function {
+            complexity, callees, ..
+        }) = first_function(&symbols)
+        else {
             panic!("expected one rizin function");
         };
-        let m = metrics.as_deref().expect("rizin function carries CFG metrics");
-        assert_eq!(m.complexity, Some(7));
-        assert_eq!(m.basic_blocks, Some(12));
-        assert_eq!(m.edges, Some(18));
-        assert_eq!(m.instructions, Some(83));
-        assert_eq!(m.stack_frame, Some(48));
-        assert_eq!(m.recursive, Some(false));
-        assert_eq!(m.noreturn, Some(false));
-        assert_eq!(m.is_linear, Some(false));
-        assert_eq!(m.callees, vec!["puts".to_string(), "exit".to_string()]);
+        assert_eq!(*complexity, Some(7));
+        assert_eq!(*callees, vec!["puts".to_string(), "exit".to_string()]);
     }
 
     #[test]
@@ -1044,7 +1002,6 @@ mod tests {
             name: "from_goblin".into(),
             alias: None,
             library: None,
-            source: "elf-dynsym".into(),
             offset: None,
             ordinal: None,
         });
@@ -1069,10 +1026,9 @@ mod tests {
         let mut symbols = Symbols::new();
         symbols.push(Symbol::Function {
             name: "preexisting".into(),
-            source: "goblin".into(),
             offset: Some(0),
-            decl: None,
-                    metrics: None,
+            complexity: None,
+            callees: Vec::new(),
         });
         let mut metrics = Metrics::new();
         recovery.apply(&mut symbols, &mut metrics);
