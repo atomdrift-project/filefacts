@@ -46,11 +46,12 @@ enum Lang {
     Kotlin,
     Dockerfile,
     Clojure,
+    AppleScript,
 }
 
 /// All languages in index order. Used to map score indices back to Lang values
 /// without unsafe transmute.
-const LANGS: [Lang; 12] = [
+const LANGS: [Lang; 13] = [
     Lang::Shell,
     Lang::Python,
     Lang::PowerShell,
@@ -63,6 +64,7 @@ const LANGS: [Lang; 12] = [
     Lang::Kotlin,
     Lang::Dockerfile,
     Lang::Clojure,
+    Lang::AppleScript,
 ];
 
 const LANG_COUNT: usize = LANGS.len();
@@ -83,6 +85,7 @@ impl Lang {
             Self::Kotlin => 9,
             Self::Dockerfile => 10,
             Self::Clojure => 11,
+            Self::AppleScript => 12,
         }
     }
 
@@ -100,6 +103,7 @@ impl Lang {
             Self::Kotlin => FileType::Kotlin,
             Self::Dockerfile => FileType::Dockerfile,
             Self::Clojure => FileType::Clojure,
+            Self::AppleScript => FileType::AppleScript,
         }
     }
 }
@@ -234,6 +238,16 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"(when-let [", Lang::Clojure, 5),
     (b"(fn [", Lang::Clojure, 5),
     (b"#'", Lang::Clojure, 5),
+    // ── AppleScript ──
+    // Conclusive tokens almost never appear outside AppleScript/OSA source.
+    (b"do shell script", Lang::AppleScript, 10),
+    (b"tell application", Lang::AppleScript, 10),
+    (b"end tell", Lang::AppleScript, 10),
+    (b"POSIX path", Lang::AppleScript, 10),
+    (b"quoted form of", Lang::AppleScript, 10),
+    (b"on error ", Lang::AppleScript, 5),
+    (b"with timeout", Lang::AppleScript, 5),
+    (b"end repeat", Lang::AppleScript, 5),
 ];
 
 struct AcScanner {
@@ -380,6 +394,12 @@ mod tests {
     fn shell_heuristic() {
         let data = b"export PATH=/usr/bin\nif [ -f /etc/foo ]; then\n  echo ok\nfi\n";
         assert_eq!(detect_from_content(data), Some(FileType::Shell));
+    }
+
+    #[test]
+    fn applescript_heuristic() {
+        let data = b"on mkdir(someItem)\n\ttry\n\t\tset p to quoted form of (POSIX path of someItem)\n\t\tdo shell script \"mkdir -p \" & p\n\tend try\nend mkdir\n";
+        assert_eq!(detect_from_content(data), Some(FileType::AppleScript));
     }
 
     #[test]
