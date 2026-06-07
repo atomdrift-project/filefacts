@@ -224,6 +224,11 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         // like `margin: $a - $b`. Treat them as plain text: still scanned for
         // strings/URLs/secrets, but never parsed as a JS AST.
         "css" | "scss" | "sass" | "less" | "styl" | "pcss" | "postcss" => Some(FileType::Text),
+        // Vim script. No dedicated analyzer, and its ubiquitous `let ` bindings
+        // otherwise score as JavaScript under content heuristics — which fires
+        // JS rules on syntax databases like filetype.vim (a catalog of sensitive
+        // path patterns: .aws/credentials, /etc/hosts, ...). Treat as plain text.
+        "vim" => Some(FileType::Text),
         "go" => Some(FileType::Go),
         "rs" => Some(FileType::Rust),
         "java" => Some(FileType::Java),
