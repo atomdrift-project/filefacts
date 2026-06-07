@@ -229,6 +229,13 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         // JS rules on syntax databases like filetype.vim (a catalog of sensitive
         // path patterns: .aws/credentials, /etc/hosts, ...). Treat as plain text.
         "vim" => Some(FileType::Text),
+        // Lisp family. No dedicated analyzer; parenthesized arithmetic like
+        // `(- a b)` otherwise scores as JavaScript and fires JS obfuscation
+        // rules on e.g. the GCL ANSI test suite. Treat as plain text.
+        "lsp" | "lisp" | "el" | "cl" | "scm" => Some(FileType::Text),
+        // TypeScript compiler test baselines (annotated code fixtures, not
+        // executable JS): x.types / x.symbols / x.baseline.
+        "types" | "symbols" | "baseline" => Some(FileType::Text),
         "go" => Some(FileType::Go),
         "rs" => Some(FileType::Rust),
         "java" => Some(FileType::Java),

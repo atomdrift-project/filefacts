@@ -662,9 +662,11 @@ fn detect_shebang(data: &[u8]) -> Option<(FileType, DetectionSource)> {
 
     // Match interpreter name
     match name {
-        b"sh" | b"bash" | b"zsh" | b"dash" | b"ash" | b"ksh" | b"fish" | b"tcsh" | b"csh" => {
-            Some((FileType::Shell, DetectionSource::Shebang))
-        }
+        b"sh" | b"bash" | b"zsh" | b"dash" | b"ash" | b"ksh" | b"fish" | b"tcsh" | b"csh"
+        | b"atf-sh" => Some((FileType::Shell, DetectionSource::Shebang)),
+        // debian/rules and friends: `#!/usr/bin/make -f`. Without this the
+        // content heuristics mis-type make scripts as source code.
+        b"make" | b"gmake" => Some((FileType::Makefile, DetectionSource::Shebang)),
         b"python" | b"python2" | b"python3" => Some((FileType::Python, DetectionSource::Shebang)),
         b"node" | b"nodejs" | b"deno" | b"bun" => {
             Some((FileType::JavaScript, DetectionSource::Shebang))
