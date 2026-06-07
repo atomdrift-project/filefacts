@@ -1,6 +1,6 @@
 [package]
 name = "filefacts"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["The Atomdrift Project"]
@@ -117,7 +117,7 @@ tree-sitter-objc = "3"
 tree-sitter-kotlin-ng = "1"
 tree-sitter-swift = "0.7"
 tree-sitter-powershell = "0.25"
-ts-parser-perl = "1.1.0"
+ts-parser-perl = "1.1.1"
 tree-sitter-groovy = "0.1"
 tree-sitter-zig = "1.1"
 tree-sitter-elixir = "0.3"
