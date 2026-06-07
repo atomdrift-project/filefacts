@@ -239,15 +239,19 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"(fn [", Lang::Clojure, 5),
     (b"#'", Lang::Clojure, 5),
     // ── AppleScript ──
-    // Conclusive tokens almost never appear outside AppleScript/OSA source.
+    // AMOS/Shub-family stealers are routinely delivered as plaintext AppleScript
+    // with a random or `.unknown` extension, so content sniffing matters. These
+    // idioms are AppleScript-exclusive (no other scripting language uses them):
+    // `do shell script`, `tell application "`, `quoted form of`, `POSIX path of`,
+    // and the `on <handler>(` / `end <handler>` block form.
     (b"do shell script", Lang::AppleScript, 10),
-    (b"tell application", Lang::AppleScript, 10),
-    (b"end tell", Lang::AppleScript, 10),
-    (b"POSIX path", Lang::AppleScript, 10),
+    (b"tell application \"", Lang::AppleScript, 10),
     (b"quoted form of", Lang::AppleScript, 10),
-    (b"on error ", Lang::AppleScript, 5),
-    (b"with timeout", Lang::AppleScript, 5),
+    (b"POSIX path of", Lang::AppleScript, 10),
+    (b"end tell", Lang::AppleScript, 5),
     (b"end repeat", Lang::AppleScript, 5),
+    (b"on run", Lang::AppleScript, 5),
+    (b"with hidden answer", Lang::AppleScript, 10),
 ];
 
 struct AcScanner {
@@ -397,12 +401,6 @@ mod tests {
     }
 
     #[test]
-    fn applescript_heuristic() {
-        let data = b"on mkdir(someItem)\n\ttry\n\t\tset p to quoted form of (POSIX path of someItem)\n\t\tdo shell script \"mkdir -p \" & p\n\tend try\nend mkdir\n";
-        assert_eq!(detect_from_content(data), Some(FileType::AppleScript));
-    }
-
-    #[test]
     fn python_heuristic() {
         let data = b"import os\nimport sys\ndef main():\n    print('hello')\n";
         assert_eq!(detect_from_content(data), Some(FileType::Python));
@@ -456,6 +454,30 @@ mod tests {
     fn javascript_iife_console() {
         let data = b"(function() { var x = 1; console.log(x); })();\n";
         assert_eq!(detect_from_content(data), Some(FileType::JavaScript));
+    }
+
+    #[test]
+    fn applescript_stealer_handlers() {
+        // AMOS/Shub-family plaintext AppleScript stealer delivered with a
+        // `.unknown` extension: handler blocks plus `do shell script` and
+        // `quoted form of POSIX path` must classify as AppleScript, not unknown.
+        let data = b"on filesizer(paths)\n\
+\tset fsz to 0\n\
+\ttry\n\
+\t\tset theItem to quoted form of POSIX path of paths\n\
+\t\tset fsz to (do shell script \"/usr/bin/mdls -name kMDItemFSSize -raw \" & theItem)\n\
+\tend try\n\
+\treturn fsz\n\
+end filesizer\n";
+        assert_eq!(detect_from_content(data), Some(FileType::AppleScript));
+    }
+
+    #[test]
+    fn applescript_tell_block() {
+        let data = b"tell application \"Finder\"\n\
+\tset x to name of every file\n\
+end tell\n";
+        assert_eq!(detect_from_content(data), Some(FileType::AppleScript));
     }
 
     #[test]
