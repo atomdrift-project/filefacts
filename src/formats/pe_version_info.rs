@@ -22,15 +22,85 @@ use goblin::pe::resource::{StringFileInfo, VersionInfo, VsFixedFileInfo};
 use serde_json::Value as JsonValue;
 
 use crate::formats::common::put_str;
-use crate::output::Values;
+use crate::output::{Metrics, Values};
 
-pub(super) fn extract(info: &VersionInfo<'_>, values: &mut Values) {
+pub(super) fn extract(info: &VersionInfo<'_>, values: &mut Values, metrics: &mut Metrics) {
     if let Some(ref fixed) = info.fixed_info {
         if fixed.is_valid() {
             fixed_file_info(fixed, values);
         }
     }
     string_table(&info.string_info, values);
+    identity_metrics(&info.string_info, metrics);
+}
+
+/// Emit randomness/non-linguisticness metrics over the human-readable identity
+/// fields (CompanyName + ProductName + FileDescription). Crypter stubs routinely
+/// XOR/shift the VERSIONINFO string table, leaving garbage that no legitimate
+/// vendor field carries. A charset trait only catches scrambles that land on
+/// symbol bytes; these metrics also catch alphanumeric-range scrambles and are
+/// harder to evade than a fixed character class.
+///
+/// - `pe.version.identity_entropy` — Shannon bits/char over the concatenated
+///   identity fields. Length-guarded: emitted only when the concatenation is at
+///   least 16 chars, below which the estimate is too noisy to threshold.
+/// - `pe.version.identity_symbol_ratio` — fraction of chars that are neither
+///   letters (incl. non-ASCII letters, so CJK/transliterated names score low)
+///   nor whitespace. Real names are letters + spaces; scrambles interleave
+///   digits and punctuation.
+///
+/// The two are meant to be ANDed in a composite: high entropy alone FPs on long
+/// non-English names, high symbol ratio alone FPs on version-laden product
+/// names; together they isolate scrambled identity.
+fn identity_metrics(strings: &StringFileInfo<'_>, metrics: &mut Metrics) {
+    let mut identity = String::new();
+    for field in [
+        strings.company_name(),
+        strings.product_name(),
+        strings.file_description(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        identity.push_str(field.trim());
+    }
+
+    if let Some((symbol_ratio, entropy)) = identity_scores(&identity) {
+        metrics.insert("pe.version.identity_symbol_ratio", symbol_ratio);
+        metrics.insert("pe.version.identity_entropy", entropy);
+    }
+}
+
+/// Symbol/digit ratio and Shannon byte-entropy of the concatenated identity
+/// text. `None` below the 16-char length guard, where the estimate is too noisy
+/// to threshold.
+fn identity_scores(identity: &str) -> Option<(f64, f64)> {
+    let total = identity.chars().count();
+    if total < 16 {
+        return None;
+    }
+
+    let nonlinguistic = identity
+        .chars()
+        .filter(|c| !c.is_alphabetic() && !c.is_whitespace())
+        .count();
+    let symbol_ratio = nonlinguistic as f64 / total as f64;
+
+    let mut freq = [0u32; 256];
+    let byte_total = identity.len() as f64;
+    for b in identity.bytes() {
+        freq[b as usize] += 1;
+    }
+    let entropy = freq
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = c as f64 / byte_total;
+            -p * p.log2()
+        })
+        .sum();
+
+    Some((symbol_ratio, entropy))
 }
 
 fn fixed_file_info(fixed: &VsFixedFileInfo, values: &mut Values) {
@@ -263,5 +333,38 @@ mod tests {
         assert_eq!(file_type_label(0), "unknown");
         assert_eq!(file_type_label(8), "unknown");
         assert_eq!(file_type_label(u32::MAX), "unknown");
+    }
+
+    #[test]
+    fn identity_scores_below_length_guard() {
+        assert!(identity_scores("short").is_none());
+        assert!(identity_scores("Acme Corp Tools").is_none()); // 15 chars
+    }
+
+    #[test]
+    fn identity_scores_clean_name_low_symbol_ratio() {
+        // Legitimate identity: letters + spaces, symbol ratio ~0.
+        let (ratio, entropy) =
+            identity_scores("Microsoft CorporationWindows Operating System").unwrap();
+        assert!(ratio < 0.05, "clean name symbol ratio {ratio}");
+        assert!(entropy > 3.0);
+    }
+
+    #[test]
+    fn identity_scores_scrambled_high_symbol_ratio() {
+        // Crypter-scrambled VERSIONINFO: symbol/digit dense, fires the metric.
+        let (ratio, entropy) =
+            identity_scores("5:EB6>G8HB<57C5II=J47I>5FF@F6664<<CCI;I8:").unwrap();
+        assert!(ratio >= 0.4, "scrambled symbol ratio {ratio}");
+        assert!(entropy >= 3.5, "scrambled entropy {entropy}");
+    }
+
+    #[test]
+    fn identity_scores_repeated_padding_excluded_by_entropy() {
+        // Degenerate numeric padding: high symbol ratio but near-zero entropy,
+        // so the ANDed composite (which also needs the entropy floor) rejects it.
+        let (ratio, entropy) = identity_scores("00000000000000000000").unwrap();
+        assert!(ratio >= 0.4);
+        assert!(entropy < 1.0, "padding entropy {entropy}");
     }
 }

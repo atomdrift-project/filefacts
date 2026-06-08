@@ -111,7 +111,7 @@ pub(super) fn extract(
                     metrics.insert("pe.icon_count", icon_count);
                 }
                 if let Some(ref vi) = rd.version_info {
-                    super::pe_version_info::extract(vi, values);
+                    super::pe_version_info::extract(vi, values, metrics);
                 }
                 if let Some(ref md) = rd.manifest_data {
                     super::pe_manifest::extract(md.data, values);
@@ -137,6 +137,7 @@ pub(super) fn extract(
         checksum(&pe, bytes, metrics);
         aliased_exports(&pe, bytes, metrics);
         clr_metadata(&pe, values);
+        clr_resources(&pe, bytes, metrics);
         data_directories(&pe, values);
         super::pe_image_hash::extract(&pe, bytes, values, metrics);
         super::pe_rich::extract(bytes, values);
@@ -159,7 +160,7 @@ pub(super) fn extract(
         optional_header(opt, values);
         binary_flags(opt, metrics);
     }
-    authenticode_from_header(&header, bytes, values);
+    authenticode_from_header(&header, bytes, values, metrics);
     // Header-only fallback ran. Record that as a structured
     // fallback entry alongside the legacy `pe.partial_parse` bool
     // so trait authors can branch on either path. The bool is
@@ -505,6 +506,7 @@ fn authenticode_from_header(
     header: &goblin::pe::header::Header,
     bytes: &[u8],
     values: &mut Values,
+    metrics: &mut Metrics,
 ) {
     let Some(opt) = header.optional_header.as_ref() else {
         return;
@@ -515,7 +517,7 @@ fn authenticode_from_header(
     if dir.size == 0 {
         return;
     }
-    put_u64(values, "pe.cert_table_size", u64::from(dir.size));
+    metrics.insert("pe.cert_table_size", f64::from(dir.size));
     let offset = dir.virtual_address as usize;
     let size = dir.size as usize;
     if offset.saturating_add(size) > bytes.len() {
@@ -525,6 +527,11 @@ fn authenticode_from_header(
 }
 
 fn authenticode(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
+    // `pe.cert_table_size` is a byte count, so it is emitted as a metric (not a
+    // value) — `type: metrics` trait conditions threshold on it. Presence of
+    // `pe.signatures` remains the "is it signed" signal; a non-zero
+    // cert_table_size with no parsed signatures means a claimed-but-unparseable
+    // (tampered) signature.
     // The Authenticode signature lives in the Certificate Table data
     // directory (entry index 4 in the optional header). The
     // directory's `virtual_address` is a *file offset* for this entry
@@ -544,7 +551,7 @@ fn authenticode(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Me
     if dir.size == 0 {
         return;
     }
-    put_u64(values, "pe.cert_table_size", u64::from(dir.size));
+    metrics.insert("pe.cert_table_size", f64::from(dir.size));
     let offset = dir.virtual_address as usize;
     let size = dir.size as usize;
     // The security-directory virtual_address is supposed to be an
@@ -968,6 +975,63 @@ fn clr_metadata(pe: &PE<'_>, values: &mut Values) {
     if hdr.is_native_entrypoint() {
         crate::formats::common::put_u64(values, "pe.clr.is_native_entrypoint", 1);
     }
+}
+
+/// Measure the embedded managed (CLR) resources that the Win32 resource walk
+/// never sees. The cor20 header's `Resources` directory points at a blob of
+/// `[u32 little-endian length][bytes]` chunks (ECMA-335 II.25.3.3); each
+/// embedded resource is one chunk. We don't need the `ManifestResource`
+/// metadata table — names aside, the bytes are all here — so we skip the whole
+/// table/heap machinery and just walk the blob. The forensic point is entropy:
+/// .NET crypters stash an encrypted second stage as a managed resource, which
+/// shows up as a high-entropy chunk among the low-entropy `.resources` streams.
+///
+/// Emits `pe.clr.managed_resource_{count, max_entropy, max_size}`.
+fn clr_resources(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
+    let Some(clr) = pe.clr_data.as_ref() else {
+        return;
+    };
+    let dir = clr.cor20_header.resources;
+    if dir.size == 0 {
+        return;
+    }
+    let Some(base) = rva_to_file_offset(pe, dir.virtual_address) else {
+        return;
+    };
+    let end = base
+        .saturating_add(dir.size as usize)
+        .min(bytes.len());
+    if base >= end {
+        return;
+    }
+
+    let (count, max_entropy, max_size) = scan_resource_blob(&bytes[base..end]);
+    if count == 0 {
+        return;
+    }
+    metrics.insert("pe.clr.managed_resource_count", count as f64);
+    metrics.insert("pe.clr.managed_resource_max_entropy", max_entropy);
+    metrics.insert("pe.clr.managed_resource_max_size", max_size as f64);
+}
+
+/// Walk a CLR resources blob (`[u32 len][bytes]` chunks) and return
+/// `(count, max_entropy, max_size)`. A length that runs past the blob stops the
+/// walk — a corrupt or non-consecutive layout yields a short count, never a
+/// panic or over-read.
+fn scan_resource_blob(blob: &[u8]) -> (u64, f64, u64) {
+    let (mut count, mut max_entropy, mut max_size, mut p) = (0u64, 0.0f64, 0u64, 0usize);
+    while p + 4 <= blob.len() {
+        let len = u32::from_le_bytes([blob[p], blob[p + 1], blob[p + 2], blob[p + 3]]) as usize;
+        p += 4;
+        if len == 0 || p + len > blob.len() {
+            break;
+        }
+        max_entropy = max_entropy.max(entropy::shannon(&blob[p..p + len]));
+        max_size = max_size.max(len as u64);
+        count += 1;
+        p += len;
+    }
+    (count, max_entropy, max_size)
 }
 
 fn tls_callbacks(pe: &PE<'_>, values: &mut Values, metrics: &mut Metrics) {
@@ -2142,5 +2206,44 @@ mod tests {
         // entries are emitted — they're written in the same code path.
         assert!(v.get("pe.rich.hash").is_some());
         assert!(v.get("pe.rich.key").is_some());
+    }
+
+    /// Build a CLR resources blob from `[u32 len][bytes]` chunks.
+    fn resource_blob(chunks: &[&[u8]]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for c in chunks {
+            b.extend_from_slice(&(c.len() as u32).to_le_bytes());
+            b.extend_from_slice(c);
+        }
+        b
+    }
+
+    #[test]
+    fn scan_resource_blob_counts_and_measures() {
+        let low = vec![b'A'; 256]; // entropy 0
+        let high: Vec<u8> = (0..=255u8).cycle().take(4096).collect(); // entropy ~8
+        let blob = resource_blob(&[&low, &high]);
+        let (count, max_entropy, max_size) = scan_resource_blob(&blob);
+        assert_eq!(count, 2);
+        assert_eq!(max_size, 4096);
+        assert!(max_entropy > 7.0, "max_entropy {max_entropy}");
+    }
+
+    #[test]
+    fn scan_resource_blob_stops_on_bad_length() {
+        // One good chunk, then a length that overruns the blob — the walk
+        // counts the good chunk and stops rather than over-reading.
+        let mut blob = resource_blob(&[b"hello there friend"]);
+        blob.extend_from_slice(&u32::MAX.to_le_bytes());
+        blob.extend_from_slice(b"trailing");
+        let (count, _, max_size) = scan_resource_blob(&blob);
+        assert_eq!(count, 1);
+        assert_eq!(max_size, 18);
+    }
+
+    #[test]
+    fn scan_resource_blob_empty_and_truncated() {
+        assert_eq!(scan_resource_blob(&[]), (0, 0.0, 0));
+        assert_eq!(scan_resource_blob(&[0x10, 0x00]), (0, 0.0, 0)); // < 4 bytes
     }
 }
