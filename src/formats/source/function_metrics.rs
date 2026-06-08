@@ -11,6 +11,7 @@ use tree_sitter::Node;
 
 use crate::output::Metrics;
 
+use super::ast_walk::MAX_AST_DEPTH;
 use super::identifier_metrics::string_entropy;
 use super::langs::LangConfig;
 
@@ -35,7 +36,15 @@ pub(super) fn emit(
     metrics: &mut Metrics,
 ) {
     let mut functions: Vec<FunctionInfo> = Vec::new();
-    collect(root, source, config, 0, &mut functions);
+    let mut capped = false;
+    collect(root, source, config, 0, 0, &mut functions, &mut capped);
+    // Surface the truncation as the shared anti-analysis signal *before* the
+    // empty-functions early return: a function-free but pathologically deep
+    // tree (a giant `a+b+c+…` chain) caps here while producing no functions, so
+    // emitting after the return would drop exactly the case worth flagging.
+    if capped {
+        metrics.insert("ast.depth_capped", 1.0);
+    }
     if functions.is_empty() {
         return;
     }
@@ -83,8 +92,20 @@ fn collect(
     source: &str,
     config: &LangConfig,
     depth: u32,
+    tree_depth: u32,
     out: &mut Vec<FunctionInfo>,
+    capped: &mut bool,
 ) {
+    // This recurses one frame per *tree* level (every child), while `depth`
+    // only tracks function nesting — so a function-free but deeply nested tree
+    // (e.g. a `a+b+c+…` chain thousands long) would recurse unbounded and
+    // overflow the worker stack with `depth` stuck at 0. Stop at the same cap
+    // the AST walk uses; nothing useful lives past it, and a tree this deep is
+    // itself an anti-analysis signal — record that we truncated.
+    if tree_depth >= MAX_AST_DEPTH {
+        *capped = true;
+        return;
+    }
     let is_fn = function_kinds_for(config.name).contains(&node.kind());
     if is_fn {
         let info = build_info(node, source, config, depth);
@@ -93,7 +114,15 @@ fn collect(
     let new_depth = if is_fn { depth + 1 } else { depth };
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect(child, source, config, new_depth, out);
+        collect(
+            child,
+            source,
+            config,
+            new_depth,
+            tree_depth + 1,
+            out,
+            capped,
+        );
     }
 }
 

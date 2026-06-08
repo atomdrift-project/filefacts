@@ -66,6 +66,23 @@ pub(super) fn walk(
 
     metrics.insert("ast.node_count", state.node_count as f64);
     metrics.insert("ast.max_depth", f64::from(state.max_depth));
+    // Reaching the recursion cap means the tree (and any member/concat/subscript
+    // chain inside it) was truncated — deeper nodes were not analysed. A
+    // pathologically deep tree is itself a generated/obfuscated-source signal,
+    // so surface it as a metric *and* warn once: the same depth that trips this
+    // is what used to overflow the worker stack and abort the process, so an
+    // operator seeing a flood of these knows the inputs are hostile-shaped.
+    if state.max_depth >= MAX_AST_DEPTH {
+        metrics.insert("ast.depth_capped", 1.0);
+        tracing::warn!(
+            lang = config.name,
+            node_count = state.node_count,
+            max_depth = state.max_depth,
+            cap = MAX_AST_DEPTH,
+            "AST walk hit the recursion depth cap; deeper nodes and chains were \
+             truncated (generated or adversarial source)",
+        );
+    }
     metrics.insert("ast.call_count", call_count as f64);
     if state.max_member_chain_depth > 0 {
         metrics.insert(
@@ -596,7 +613,7 @@ impl State {
         // pattern like `obj["constructor"]["constructor"]("...")` lands
         // as a member chain instead of dropping out as a dynamic access.
         if config.member_kinds.contains(&node.kind()) || is_subscript_kind(node.kind()) {
-            if let Some(chain) = static_dotted_chain(node, source, config) {
+            if let Some(chain) = static_dotted_chain(node, source, config, 0) {
                 let depth_n = u32::try_from(chain.matches('.').count()).unwrap_or(u32::MAX) + 1;
                 if depth_n > self.max_member_chain_depth {
                     self.max_member_chain_depth = depth_n;
@@ -781,7 +798,7 @@ impl State {
             .or_else(|| first_named_child(node));
         let args_node = node.child_by_field_name(config.arguments_field);
 
-        let target = callee.and_then(|c| static_dotted_chain(c, source, config));
+        let target = callee.and_then(|c| static_dotted_chain(c, source, config, 0));
         if config.name == "bash" && target.as_deref().is_some_and(|t| t.starts_with('-')) {
             return;
         }
@@ -816,7 +833,7 @@ impl State {
         let Some(value_node) = assignment_value(node) else {
             return;
         };
-        let Some(target) = static_dotted_chain(target_node, source, config) else {
+        let Some(target) = static_dotted_chain(target_node, source, config, 0) else {
             return;
         };
         self.binds.push(Symbol::Bind {
@@ -960,14 +977,28 @@ fn parse_numeric_literal_node(node: Node<'_>, source: &str) -> Option<(String, i
 /// JS sandbox-escape pattern. Numeric or identifier indices stay
 /// computed (returns `None` for that path) since their values aren't
 /// statically resolvable to a property name.
-fn static_dotted_chain(node: Node<'_>, source: &str, config: &LangConfig) -> Option<String> {
+fn static_dotted_chain(
+    node: Node<'_>,
+    source: &str,
+    config: &LangConfig,
+    depth: u32,
+) -> Option<String> {
+    // A member/subscript/call chain (`a.b.c…`, `obj["x"]["y"]…`, `f()()…`) is
+    // a left-leaning tree as deep as it is long, and this function recurses
+    // one frame per link while allocating a `String` at each. An adversarial
+    // chain thousands deep would overflow the stack before `walk_node`'s own
+    // guard ever returns. Bail at the shared cap and treat the chain as
+    // non-static (dynamic access) — the conservative, no-symbol outcome.
+    if depth >= MAX_AST_DEPTH {
+        return None;
+    }
     if config.identifier_kinds.contains(&node.kind()) {
         return node.utf8_text(source.as_bytes()).ok().map(str::to_string);
     }
     if config.member_kinds.contains(&node.kind()) {
         let object = node.child_by_field_name(config.member_object_field)?;
         let prop = node.child_by_field_name(config.member_property_field)?;
-        let object_path = static_dotted_chain(object, source, config)?;
+        let object_path = static_dotted_chain(object, source, config, depth + 1)?;
         let prop_text = prop.utf8_text(source.as_bytes()).ok()?;
         if prop_text.is_empty() {
             return None;
@@ -975,7 +1006,7 @@ fn static_dotted_chain(node: Node<'_>, source: &str, config: &LangConfig) -> Opt
         return Some(format!("{object_path}.{prop_text}"));
     }
     if is_subscript_kind(node.kind()) {
-        if let Some(folded) = try_fold_string_subscript(node, source, config) {
+        if let Some(folded) = try_fold_string_subscript(node, source, config, depth + 1) {
             return Some(folded);
         }
     }
@@ -983,7 +1014,7 @@ fn static_dotted_chain(node: Node<'_>, source: &str, config: &LangConfig) -> Opt
         let callee = node
             .child_by_field_name(config.callee_field)
             .or_else(|| first_named_child(node))?;
-        let target = static_dotted_chain(callee, source, config)?;
+        let target = static_dotted_chain(callee, source, config, depth + 1)?;
         return Some(format!("{target}()"));
     }
     // Constructor type names: Java `type_identifier` / `scoped_type_identifier`
@@ -1025,7 +1056,18 @@ fn is_subscript_kind(kind: &str) -> bool {
 ///
 /// Returns `None` for non-literal indices (variable, expression,
 /// numeric) — those genuinely are dynamic accesses.
-fn try_fold_string_subscript(node: Node<'_>, source: &str, config: &LangConfig) -> Option<String> {
+fn try_fold_string_subscript(
+    node: Node<'_>,
+    source: &str,
+    config: &LangConfig,
+    depth: u32,
+) -> Option<String> {
+    // Mutually recursive with `static_dotted_chain` for nested subscripts
+    // (`obj["x"]["y"]…`); share its depth budget so the pair can't outrun the
+    // cap between them.
+    if depth >= MAX_AST_DEPTH {
+        return None;
+    }
     // First named child is the object; second is the index expression.
     let mut cursor = node.walk();
     let mut children = node.named_children(&mut cursor);
@@ -1034,7 +1076,7 @@ fn try_fold_string_subscript(node: Node<'_>, source: &str, config: &LangConfig) 
     if !config.string_kinds.contains(&index.kind()) {
         return None;
     }
-    let object_path = static_dotted_chain(object, source, config)?;
+    let object_path = static_dotted_chain(object, source, config, depth + 1)?;
     let prop = decode_string_literal(index, source)?;
     // Conservative: only fold string indices whose content looks like
     // an identifier (alphanumeric + underscore, no leading digit).
@@ -1119,18 +1161,25 @@ fn is_string_concat_root(node: Node<'_>, config: &LangConfig) -> bool {
 fn string_concat_chain_length(node: Node<'_>, config: &LangConfig) -> u32 {
     // Count leaves under a nested `+` chain. The chain looks like
     // `(a + b) + c + d` → BinaryExpr(BinaryExpr(BinaryExpr(a, b), c), d).
-    fn descend(node: Node<'_>, config: &LangConfig, acc: &mut u32) {
+    fn descend(node: Node<'_>, config: &LangConfig, acc: &mut u32, depth: u32) {
+        // A `+` chain of N terms nests N deep; stop at the shared cap so a
+        // pathological `a+b+c+…` (thousands of terms) can't overflow the stack
+        // before `walk_node`'s guard returns. The length saturates, which is
+        // all `ast.string_concat_chain_max_length` needs.
+        if depth >= MAX_AST_DEPTH {
+            return;
+        }
         if config.binary_op_kinds.contains(&node.kind()) {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                descend(child, config, acc);
+                descend(child, config, acc, depth + 1);
             }
         } else {
             *acc += 1;
         }
     }
     let mut acc = 0;
-    descend(node, config, &mut acc);
+    descend(node, config, &mut acc, 0);
     acc
 }
 

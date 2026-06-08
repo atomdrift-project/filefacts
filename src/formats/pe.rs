@@ -1775,6 +1775,33 @@ fn base_relocations(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mu
         metrics.insert("pe.base_relocation_block_count", block_count as f64);
         metrics.insert("pe.base_relocation_entry_count", entry_count as f64);
     }
+
+    // Reloc-section overhang: how much of the section that hosts the base-
+    // relocation directory is NOT actual relocation data. Real relocation
+    // tables fill their `.reloc` section (modulo a sub-alignment tail). Packers
+    // and trojanized loaders append an encrypted second stage to `.reloc` so the
+    // section dwarfs the few real relocation blocks — the parser stops at the
+    // first malformed block (or the directory end) far short of the section's
+    // raw size. `overhang_ratio` is that gap as a fraction of the section, a
+    // precise, format-level "payload concealed in .reloc" signal that does not
+    // depend on the payload's entropy. ~0 for benign images.
+    let parsed_bytes = (cursor - start) as u64;
+    if let Some(section) = pe.sections.iter().find(|s| {
+        let va = u64::from(s.virtual_address);
+        let span = u64::from(s.virtual_size).max(u64::from(s.size_of_raw_data));
+        let dir_va = u64::from(dd.virtual_address);
+        dir_va >= va && dir_va < va.saturating_add(span)
+    }) {
+        let section_raw = u64::from(section.size_of_raw_data);
+        if section_raw > 0 {
+            let overhang = section_raw.saturating_sub(parsed_bytes);
+            metrics.insert("pe.reloc_overhang_bytes", overhang as f64);
+            metrics.insert(
+                "pe.reloc_overhang_ratio",
+                overhang as f64 / section_raw as f64,
+            );
+        }
+    }
 }
 
 /// `IMAGE_GUARD_*` constants from `winnt.h`. Names follow the

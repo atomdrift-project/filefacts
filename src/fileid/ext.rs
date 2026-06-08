@@ -233,6 +233,19 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         // `(- a b)` otherwise scores as JavaScript and fires JS obfuscation
         // rules on e.g. the GCL ANSI test suite. Treat as plain text.
         "lsp" | "lisp" | "el" | "cl" | "scm" => Some(FileType::Text),
+        // SQL dumps/scripts. No dedicated analyzer; large dumps of long INSERT
+        // statements otherwise content-score as Batch and fire batch
+        // line/token-bloat obfuscation rules. Treat as plain text.
+        "sql" | "ddl" | "dml" => Some(FileType::Text),
+        // Smali (Android/Dalvik bytecode disassembly). No dedicated analyzer;
+        // its dense arithmetic/array literals otherwise score as JavaScript and
+        // fire JS arithmetic-obfuscation rules (e.g. jadx test .smali fixtures).
+        "smali" => Some(FileType::Text),
+        // Unified-diff patches. No dedicated analyzer; their `-`/`+` line
+        // prefixes otherwise content-score as JavaScript, and the removed-line
+        // `-` markers parse as subtraction operators — tripping
+        // js-arithmetic-array-init on benign kernel/source patch sets. Text.
+        "patch" | "diff" => Some(FileType::Text),
         // TypeScript compiler test baselines (annotated code fixtures, not
         // executable JS): x.types / x.symbols / x.baseline.
         "types" | "symbols" | "baseline" => Some(FileType::Text),

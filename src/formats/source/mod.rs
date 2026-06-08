@@ -855,6 +855,87 @@ mod tests {
         );
     }
 
+    /// Parse `src` (as `path`) on a worker-sized stack and return its metrics.
+    /// The unbounded AST-helper recursions (member / concat / subscript chains)
+    /// used to recurse one frame — and, for member/subscript, one `String`
+    /// allocation — per link, overflowing the stack and `abort()`ing the whole
+    /// process on a chain thousands deep. With the cap in place a chain far
+    /// past [`ast_walk::MAX_AST_DEPTH`] must complete with `ast.max_depth` and
+    /// every chain-length metric pinned at the cap, never growing with the
+    /// input. `join()` returning `Ok` asserts nothing overflowed.
+    ///
+    /// 8 MiB matches the existing `deeply_nested_source_does_not_overflow_stack`
+    /// test. We don't probe smaller: well past the cap, tree-sitter's own
+    /// C-level parse/free recurses with the tree and overflows a 2 MiB stack
+    /// independently of this crate's walk — a separate layer that the 2 MiB
+    /// `MAX_AST_FILE_BYTES` cap keeps clear of the 256 MiB production stack.
+    fn metrics_on_worker_stack(path: &str, src: String) -> crate::output::Metrics {
+        let path = path.to_string();
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let parsed = crate::open_with_path(std::path::Path::new(&path), src.as_bytes())
+                    .expect("parse deep source");
+                parsed.metrics().clone()
+            })
+            .expect("spawn walker thread")
+            .join()
+            .expect("deep chain must not overflow the stack")
+    }
+
+    /// Regression: `static_dotted_chain` recursed one stack frame (plus a
+    /// `String` allocation) per link of a member chain with no bound, so a
+    /// pathological `a.a.a.…` thousands deep overflowed the worker stack and
+    /// aborted the process. It must now cap at `MAX_AST_DEPTH` and complete.
+    #[test]
+    fn deep_member_chain_does_not_overflow_stack() {
+        let chain = "a".to_string() + &".a".repeat(50_000);
+        let m = metrics_on_worker_stack("deep.js", format!("x = {chain};\n"));
+        assert_eq!(
+            m.get("ast.max_depth").unwrap_or(0.0),
+            f64::from(super::ast_walk::MAX_AST_DEPTH),
+            "max_depth should saturate at the cap"
+        );
+        assert_eq!(
+            m.get("ast.depth_capped").unwrap_or(0.0),
+            1.0,
+            "a chain past the cap must set ast.depth_capped"
+        );
+    }
+
+    /// Regression: `string_concat_chain_length::descend` recursed per `+` link
+    /// with no bound — a `"a"+"a"+…` chain thousands long overflowed the stack.
+    #[test]
+    fn deep_concat_chain_does_not_overflow_stack() {
+        let chain = "\"a\"".to_string() + &"+\"a\"".repeat(50_000);
+        let m = metrics_on_worker_stack("deep.js", format!("x = {chain};\n"));
+        assert_eq!(
+            m.get("ast.depth_capped").unwrap_or(0.0),
+            1.0,
+            "a concat chain past the cap must set ast.depth_capped"
+        );
+        // The chain-length metric is bounded too — it can't exceed the cap.
+        let concat = m.get("ast.string_concat_chain_max_length").unwrap_or(0.0);
+        assert!(
+            concat <= f64::from(super::ast_walk::MAX_AST_DEPTH),
+            "concat chain length must saturate at the cap, got {concat}"
+        );
+    }
+
+    /// Regression: nested string-subscript folding (`obj["a"]["b"]…`) is
+    /// mutually recursive between `static_dotted_chain` and
+    /// `try_fold_string_subscript`; both were unbounded.
+    #[test]
+    fn deep_subscript_chain_does_not_overflow_stack() {
+        let chain = "a".to_string() + &"[\"b\"]".repeat(50_000);
+        let m = metrics_on_worker_stack("deep.js", format!("x = {chain};\n"));
+        assert_eq!(
+            m.get("ast.depth_capped").unwrap_or(0.0),
+            1.0,
+            "a subscript chain past the cap must set ast.depth_capped"
+        );
+    }
+
     /// `ast.op_density.<op>` must equal count / node_count and rise sharply
     /// when an operator dominates the tree — the signal that distinguishes an
     /// obfuscated `number - number` array from a large benign bundle (which
