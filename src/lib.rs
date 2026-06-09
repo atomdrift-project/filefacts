@@ -146,7 +146,7 @@ pub struct ParsedFile<'a> {
     // Shared tree-sitter parse for source files. Built once by
     // `tree_cache()` and consumed by the single extraction pipeline
     // that fills `extracted`.
-    tree_cache: OnceLock<Option<formats::source::TreeCache<'a>>>,
+    tree_parse: OnceLock<Option<formats::source::TreeParse<'a>>>,
     extracted: OnceLock<Extracted>,
     // How many times this `ParsedFile` ran its extraction pipeline.
     // A correctly-implemented `ParsedFile` never reports more than 1
@@ -304,14 +304,24 @@ impl<'a> ParsedFile<'a> {
     /// Borrow the shared tree-sitter parse, if this file is a source
     /// language and parsing succeeded.
     fn tree_cache(&self) -> Option<&formats::source::TreeCache<'a>> {
-        self.tree_cache
+        self.tree_parse()
+            .and_then(formats::source::TreeParse::cache)
+    }
+
+    fn tree_parse(&self) -> Option<&formats::source::TreeParse<'a>> {
+        self.tree_parse
             .get_or_init(|| {
                 if !formats::source::supports(self.fileid.file_type()) {
                     return None;
                 }
-                formats::source::TreeCache::parse(self.bytes, self.fileid.file_type())
-                    .ok()
-                    .flatten()
+                Some(
+                    formats::source::TreeCache::parse(self.bytes, self.fileid.file_type())
+                        .unwrap_or_else(|e| {
+                            formats::source::TreeParse::Unavailable(
+                                formats::source::TreeSitterDiagnostic::parse_failed(e.to_string()),
+                            )
+                        }),
+                )
             })
             .as_ref()
     }
@@ -337,6 +347,8 @@ impl<'a> ParsedFile<'a> {
                 self.fileid.extension_mismatch_transition(),
                 self.basename.as_deref(),
                 self.tree_cache(),
+                self.tree_parse()
+                    .and_then(formats::source::TreeParse::diagnostic),
             )
         })
     }
@@ -349,6 +361,7 @@ fn run_extraction(
     mismatch_transition: Option<(&'static str, &'static str)>,
     basename: Option<&str>,
     tree_cache: Option<&formats::source::TreeCache<'_>>,
+    tree_diagnostic: Option<&formats::source::TreeSitterDiagnostic>,
 ) -> Extracted {
     let mut values = Values::new();
     let mut strings = output::Strings::new();
@@ -380,6 +393,11 @@ fn run_extraction(
             );
         }
     }
+    if let Some(diagnostic) = tree_diagnostic {
+        metrics.insert("source.ast_unavailable", 1.0);
+        metrics.insert(diagnostic.metric, 1.0);
+        errors.record_fallback(crate::Stage::SourceParse, diagnostic.message.clone());
+    }
     // Format extractors return `Result` so they can report a hard
     // "this file is not in the format I expect" failure. Any
     // recoverable mid-extraction issues (goblin lazy-walker panics,
@@ -387,31 +405,52 @@ fn run_extraction(
     // through the typed `Errors` view instead — we want consumers to
     // get everything we did manage to extract even when some sub-
     // stage failed, since cleave depends on the partial data.
-    if let Err(e) = formats::extract(
-        file_type,
-        bytes,
-        tree_cache,
-        formats::ExtractCtx {
-            values: &mut values,
-            strings: &mut strings,
-            metrics: &mut metrics,
-            archive_members: &mut archive_members,
-            sections: &mut sections,
-            symbols: &mut symbols,
-            errors: &mut errors,
-        },
-    ) {
-        // The format extractor bailed entirely. Surface that as a
-        // `malformed` entry so cleave can see *why* the
-        // format-specific view is sparse.
-        errors.record_malformed(stage_for(file_type), e.to_string());
+    let extract_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        formats::extract(
+            file_type,
+            bytes,
+            tree_cache,
+            formats::ExtractCtx {
+                values: &mut values,
+                strings: &mut strings,
+                metrics: &mut metrics,
+                archive_members: &mut archive_members,
+                sections: &mut sections,
+                symbols: &mut symbols,
+                errors: &mut errors,
+            },
+        )
+    }));
+    match extract_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            // The format extractor bailed entirely. Surface that as a
+            // `malformed` entry so cleave can see *why* the
+            // format-specific view is sparse.
+            errors.record_malformed(stage_for(file_type), e.to_string());
+        }
+        Err(payload) => {
+            let stage = stage_for(file_type);
+            if stage == Stage::SourceExtract {
+                metrics.insert("source.extract_panic", 1.0);
+                metrics.insert("source.ast_unavailable", 1.0);
+            }
+            errors.record_panic(stage, panic_payload_message(payload));
+        }
     }
     // Tree-sitter source extraction also pushes Call/Member/Bind/
     // Identifier symbols when a parse is available. Bundling here
     // keeps `parse_count` at 1 regardless of which views the caller
     // reads.
     if let Some(cache) = tree_cache {
-        formats::source::build_symbols(cache, &mut symbols, &mut metrics);
+        let walk_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            formats::source::build_symbols(cache, &mut symbols, &mut metrics);
+        }));
+        if let Err(payload) = walk_result {
+            metrics.insert("source.ast_walk_panic", 1.0);
+            metrics.insert("source.ast_unavailable", 1.0);
+            errors.record_panic(Stage::SourceAstWalk, panic_payload_message(payload));
+        }
     }
     let sections = Sections::from_iter(sections);
     // Aggregate metrics derived from sections — mirrors the
@@ -518,6 +557,30 @@ fn is_sentence_like(text: &str) -> bool {
 /// error record. Stage values are stable across releases.
 fn stage_for(file_type: FileType) -> Stage {
     match file_type {
+        FileType::JavaScript
+        | FileType::TypeScript
+        | FileType::Python
+        | FileType::Go
+        | FileType::Rust
+        | FileType::Java
+        | FileType::Shell
+        | FileType::Php
+        | FileType::Ruby
+        | FileType::Lua
+        | FileType::CSharp
+        | FileType::C
+        | FileType::Scala
+        | FileType::ObjectiveC
+        | FileType::Kotlin
+        | FileType::Swift
+        | FileType::PowerShell
+        | FileType::Perl
+        | FileType::Groovy
+        | FileType::Zig
+        | FileType::Elixir
+        | FileType::Clojure
+        | FileType::Batch
+        | FileType::Makefile => Stage::SourceExtract,
         FileType::Pe => Stage::PeParse,
         FileType::Elf => Stage::ElfParse,
         FileType::MachO => Stage::MachoParse,
@@ -531,6 +594,16 @@ fn stage_for(file_type: FileType) -> Stage {
         FileType::Pdf => Stage::PdfParse,
         FileType::Rpm => Stage::RpmParse,
         _ => Stage::FormatExtract,
+    }
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => (*message).to_string(),
+            Err(_) => String::new(),
+        },
     }
 }
 
@@ -814,7 +887,7 @@ pub fn open(bytes: &[u8]) -> Result<ParsedFile<'_>, Error> {
         bytes,
         fileid,
         basename: None,
-        tree_cache: OnceLock::new(),
+        tree_parse: OnceLock::new(),
         extracted: OnceLock::new(),
         parse_count: AtomicU32::new(0),
     })
@@ -836,7 +909,7 @@ pub fn open_with_path<'a>(path: &Path, bytes: &'a [u8]) -> Result<ParsedFile<'a>
         bytes,
         fileid,
         basename,
-        tree_cache: OnceLock::new(),
+        tree_parse: OnceLock::new(),
         extracted: OnceLock::new(),
         parse_count: AtomicU32::new(0),
     })
@@ -1015,5 +1088,32 @@ mod tests {
         assert!(parsed.metrics().get("parse.error_count").is_some());
         // Specific format metric.
         assert!(parsed.metrics().get("elf.parse_failed").is_some());
+    }
+
+    #[test]
+    fn guarded_tree_sitter_skip_records_source_error_and_metric() {
+        // Perl is intentionally treated as an unaudited external-scanner grammar
+        // and capped before invoking tree-sitter. The skip should be visible to
+        // callers instead of silently looking like a source file with no AST.
+        let source = "use strict;\nmy $x = 1;\n".repeat(4_000);
+        let parsed = open_with_path(std::path::Path::new("large.pl"), source.as_bytes()).unwrap();
+        let metrics = parsed.metrics();
+
+        assert_eq!(parsed.fileid().file_type(), FileType::Perl);
+        assert!(metrics.get("file.size_bytes").is_some());
+        assert_eq!(metrics.get("source.ast_unavailable"), Some(1.0));
+        assert_eq!(
+            metrics.get("source.ast_unavailable.tree_sitter_guard"),
+            Some(1.0)
+        );
+        assert!(metrics.get("ast.node_count").is_none());
+
+        let errors = parsed.errors();
+        assert_eq!(errors.len(), 1);
+        let entry = errors.iter().next().unwrap();
+        assert_eq!(entry.kind, ErrorKind::Fallback);
+        assert_eq!(entry.stage, Stage::SourceParse);
+        assert!(entry.message.contains("tree-sitter parse skipped"));
+        assert_eq!(metrics.get("parse.error_count"), Some(1.0));
     }
 }

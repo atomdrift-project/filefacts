@@ -18,6 +18,10 @@ pub(crate) mod parse;
 mod string_metrics;
 mod text_metrics;
 
+use std::cell::Cell;
+use std::ops::ControlFlow;
+use std::time::{Duration, Instant};
+
 use tree_sitter::{Node, QueryCursor, StreamingIterator};
 
 use crate::error::Error;
@@ -26,7 +30,20 @@ use crate::output::{ExtractedString, Metrics, Strings, Values};
 
 use serde_json::Value as JsonValue;
 
-pub(crate) use parse::TreeCache;
+pub(crate) use parse::{TreeCache, TreeParse, TreeSitterDiagnostic};
+
+const SOURCE_QUERY_MATCH_LIMIT: u32 = 50_000;
+const SOURCE_QUERY_BYTE_LIMIT: usize = 2 * 1024 * 1024;
+const SOURCE_QUERY_WALL_BUDGET: Duration = Duration::from_millis(250);
+const SOURCE_QUERY_OUTPUT_LIMIT: usize = 10_000;
+
+fn source_query_wall_budget() -> Duration {
+    if cfg!(test) {
+        Duration::from_secs(5)
+    } else {
+        SOURCE_QUERY_WALL_BUDGET
+    }
+}
 
 // The dispatcher in `formats::extract` requires every format
 // extractor to return `Result<(), Error>` even when the impl can't
@@ -66,6 +83,9 @@ pub(super) fn extract(
     let imports = collect_imports(config.language, source, root, config.import_query);
     let functions = collect_query(config.language, source, root, config.function_query);
     let classes = collect_query(config.language, source, root, config.class_query);
+    emit_query_limit_metrics(metrics, "imports", &imports);
+    emit_query_limit_metrics(metrics, "functions", &functions);
+    emit_query_limit_metrics(metrics, "classes", &classes);
 
     // Identifier metrics — walk the tree once, emit `identifiers.*`.
     let identifiers = identifier_metrics::collect_identifiers(root, source, config);
@@ -78,7 +98,7 @@ pub(super) fn extract(
 
     // Import metrics — feed the canonical language name so stdlib
     // classification works.
-    let import_refs: Vec<&str> = imports.iter().map(|(n, _)| n.as_str()).collect();
+    let import_refs: Vec<&str> = imports.items.iter().map(|(n, _)| n.as_str()).collect();
     import_metrics::emit(&import_refs, config.name, metrics);
 
     // Function metrics — single AST walk over function-definition nodes.
@@ -95,7 +115,7 @@ pub(super) fn extract(
     // tag is the language name (`"javascript"`, `"python"`, `"go"`,
     // …) so trait matchers can filter by language without consulting
     // file_type.
-    for (name, offset) in &imports {
+    for (name, offset) in &imports.items {
         // Source-language aliased imports arrive as `module as local` (the raw
         // `aliased_import` node text). Split so the symbol name is the bare
         // module and the alias is a structured field — no whitespace in the
@@ -112,10 +132,10 @@ pub(super) fn extract(
             ordinal: None,
         });
     }
-    if !functions.is_empty() {
-        metrics.insert("source.function_count", functions.len() as f64);
+    if !functions.items.is_empty() {
+        metrics.insert("source.function_count", functions.items.len() as f64);
     }
-    for (name, offset) in &functions {
+    for (name, offset) in &functions.items {
         symbols_out.push(crate::Symbol::Function {
             name: name.clone(),
             offset: Some(*offset),
@@ -123,12 +143,12 @@ pub(super) fn extract(
             callees: Vec::new(),
         });
     }
-    if !classes.is_empty() {
-        metrics.insert("source.class_count", classes.len() as f64);
+    if !classes.items.is_empty() {
+        metrics.insert("source.class_count", classes.items.len() as f64);
     }
     // Class declarations surface as `Symbol::Function` too — the symbol
     // axis is "things declared here", regardless of function vs class.
-    for (name, offset) in &classes {
+    for (name, offset) in &classes.items {
         symbols_out.push(crate::Symbol::Function {
             name: name.clone(),
             offset: Some(*offset),
@@ -253,43 +273,102 @@ fn cached_query(
     compiled
 }
 
+#[derive(Default)]
+struct QueryCollection {
+    items: Vec<(String, u64)>,
+    timed_out: bool,
+    match_limited: bool,
+    output_limited: bool,
+}
+
+impl QueryCollection {
+    fn limited(&self) -> bool {
+        self.timed_out || self.match_limited || self.output_limited
+    }
+}
+
+fn emit_query_limit_metrics(metrics: &mut Metrics, label: &str, result: &QueryCollection) {
+    if !result.limited() {
+        return;
+    }
+    metrics.insert("source.query_limited", 1.0);
+    metrics.insert(format!("source.query_limited.{label}"), 1.0);
+    if result.timed_out {
+        metrics.insert(format!("source.query_limited.{label}.timeout"), 1.0);
+    }
+    if result.match_limited {
+        metrics.insert(format!("source.query_limited.{label}.match_limit"), 1.0);
+    }
+    if result.output_limited {
+        metrics.insert(format!("source.query_limited.{label}.output_limit"), 1.0);
+    }
+}
+
 fn collect_query(
     language_fn: fn() -> tree_sitter::Language,
     source: &str,
     root: Node<'_>,
     query_src: &'static str,
-) -> Vec<(String, u64)> {
+) -> QueryCollection {
     if query_src.is_empty() {
-        return Vec::new();
+        return QueryCollection::default();
     }
     let Some(query) = cached_query(language_fn, query_src) else {
-        return Vec::new();
+        return QueryCollection::default();
     };
     let capture_names = query.capture_names();
     let mut cursor = QueryCursor::new();
+    cursor.set_match_limit(SOURCE_QUERY_MATCH_LIMIT);
+    cursor.set_byte_range(0..source.len().min(SOURCE_QUERY_BYTE_LIMIT));
     // De-duplicate by name, keeping the first (smallest) offset for
     // each. A repeated `import os` shows up once; the offset points
     // at its first occurrence, which is the most useful answer for
     // proximity-style matchers.
     let mut seen: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    let mut matches = cursor.matches(&query, root, source.as_bytes());
-    while let Some(m) = matches.next() {
-        for cap in m.captures {
-            let name = capture_names.get(cap.index as usize).copied().unwrap_or("");
-            if name.starts_with('_') {
-                continue;
-            }
-            if let Ok(text) = cap.node.utf8_text(source.as_bytes()) {
-                let cleaned = strip_quotes(text);
-                if cleaned.is_empty() {
+    let query_start = Instant::now();
+    let timed_out = Cell::new(false);
+    let output_limited = Cell::new(false);
+    let mut progress_cb = |_state: &tree_sitter::QueryCursorState| -> ControlFlow<()> {
+        if query_start.elapsed() > source_query_wall_budget() {
+            timed_out.set(true);
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    };
+    let options = tree_sitter::QueryCursorOptions::default().progress_callback(&mut progress_cb);
+    {
+        let mut matches = cursor.matches_with_options(&query, root, source.as_bytes(), options);
+        while let Some(m) = matches.next() {
+            for cap in m.captures {
+                let name = capture_names.get(cap.index as usize).copied().unwrap_or("");
+                if name.starts_with('_') {
                     continue;
                 }
-                let offset = cap.node.start_byte() as u64;
-                seen.entry(cleaned).or_insert(offset);
+                if let Ok(text) = cap.node.utf8_text(source.as_bytes()) {
+                    let cleaned = strip_quotes(text);
+                    if cleaned.is_empty() {
+                        continue;
+                    }
+                    let offset = cap.node.start_byte() as u64;
+                    seen.entry(cleaned).or_insert(offset);
+                    if seen.len() >= SOURCE_QUERY_OUTPUT_LIMIT {
+                        output_limited.set(true);
+                        break;
+                    }
+                }
+            }
+            if output_limited.get() {
+                break;
             }
         }
     }
-    seen.into_iter().collect()
+    QueryCollection {
+        items: seen.into_iter().collect(),
+        timed_out: timed_out.get(),
+        match_limited: cursor.did_exceed_match_limit(),
+        output_limited: output_limited.get(),
+    }
 }
 
 /// Collect import symbols, qualifying Python relative-import members with
@@ -308,35 +387,63 @@ fn collect_imports(
     source: &str,
     root: Node<'_>,
     query_src: &'static str,
-) -> Vec<(String, u64)> {
+) -> QueryCollection {
     if query_src.is_empty() {
-        return Vec::new();
+        return QueryCollection::default();
     }
     let Some(query) = cached_query(language_fn, query_src) else {
-        return Vec::new();
+        return QueryCollection::default();
     };
     let capture_names = query.capture_names();
     let mut cursor = QueryCursor::new();
+    cursor.set_match_limit(SOURCE_QUERY_MATCH_LIMIT);
+    cursor.set_byte_range(0..source.len().min(SOURCE_QUERY_BYTE_LIMIT));
     let mut seen: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    let mut matches = cursor.matches(&query, root, source.as_bytes());
-    while let Some(m) = matches.next() {
-        for cap in m.captures {
-            let name = capture_names.get(cap.index as usize).copied().unwrap_or("");
-            if name.starts_with('_') {
-                continue;
-            }
-            if let Ok(text) = cap.node.utf8_text(source.as_bytes()) {
-                let cleaned = strip_quotes(text);
-                if cleaned.is_empty() {
+    let query_start = Instant::now();
+    let timed_out = Cell::new(false);
+    let output_limited = Cell::new(false);
+    let mut progress_cb = |_state: &tree_sitter::QueryCursorState| -> ControlFlow<()> {
+        if query_start.elapsed() > source_query_wall_budget() {
+            timed_out.set(true);
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    };
+    let options = tree_sitter::QueryCursorOptions::default().progress_callback(&mut progress_cb);
+    {
+        let mut matches = cursor.matches_with_options(&query, root, source.as_bytes(), options);
+        while let Some(m) = matches.next() {
+            for cap in m.captures {
+                let name = capture_names.get(cap.index as usize).copied().unwrap_or("");
+                if name.starts_with('_') {
                     continue;
                 }
-                let qualified = qualify_relative_member(cap.node, cleaned, source);
-                let offset = cap.node.start_byte() as u64;
-                seen.entry(qualified).or_insert(offset);
+                if let Ok(text) = cap.node.utf8_text(source.as_bytes()) {
+                    let cleaned = strip_quotes(text);
+                    if cleaned.is_empty() {
+                        continue;
+                    }
+                    let qualified = qualify_relative_member(cap.node, cleaned, source);
+                    let offset = cap.node.start_byte() as u64;
+                    seen.entry(qualified).or_insert(offset);
+                    if seen.len() >= SOURCE_QUERY_OUTPUT_LIMIT {
+                        output_limited.set(true);
+                        break;
+                    }
+                }
+            }
+            if output_limited.get() {
+                break;
             }
         }
     }
-    seen.into_iter().collect()
+    QueryCollection {
+        items: seen.into_iter().collect(),
+        timed_out: timed_out.get(),
+        match_limited: cursor.did_exceed_match_limit(),
+        output_limited: output_limited.get(),
+    }
 }
 
 /// When `node` is the imported-member field of a Python relative
@@ -546,6 +653,45 @@ mod tests {
         assert_eq!(strip_quotes("'hello'"), "hello");
         assert_eq!(strip_quotes("`hello`"), "hello");
         assert_eq!(strip_quotes("hello"), "hello");
+    }
+
+    #[test]
+    fn source_query_output_limit_records_metric() {
+        fn javascript_language() -> tree_sitter::Language {
+            tree_sitter_javascript::LANGUAGE.into()
+        }
+
+        let mut src = String::new();
+        for i in 0..(SOURCE_QUERY_OUTPUT_LIMIT + 128) {
+            if i > 0 {
+                src.push(',');
+            }
+            src.push_str(&format!("u{i}"));
+        }
+        src.push_str(";\n");
+
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&javascript_language())
+            .expect("javascript grammar");
+        let tree = parser.parse(&src, None).expect("parse generated js");
+        let result = collect_query(
+            javascript_language,
+            &src,
+            tree.root_node(),
+            "(identifier) @name",
+        );
+
+        assert_eq!(result.items.len(), SOURCE_QUERY_OUTPUT_LIMIT);
+        assert!(result.output_limited);
+        let mut metrics = Metrics::new();
+        emit_query_limit_metrics(&mut metrics, "identifiers", &result);
+        assert_eq!(metrics.get("source.query_limited"), Some(1.0));
+        assert_eq!(metrics.get("source.query_limited.identifiers"), Some(1.0));
+        assert_eq!(
+            metrics.get("source.query_limited.identifiers.output_limit"),
+            Some(1.0)
+        );
     }
 
     /// Python `import os` / `from sys import path` populate the

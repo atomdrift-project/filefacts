@@ -82,28 +82,82 @@ pub(crate) struct TreeCache<'a> {
     file_type: FileType,
 }
 
+/// Source parsing outcome cached by [`crate::ParsedFile`].
+pub(crate) enum TreeParse<'a> {
+    Parsed(TreeCache<'a>),
+    Unavailable(TreeSitterDiagnostic),
+}
+
+impl<'a> TreeParse<'a> {
+    pub(crate) fn cache(&self) -> Option<&TreeCache<'a>> {
+        match self {
+            Self::Parsed(cache) => Some(cache),
+            Self::Unavailable(_) => None,
+        }
+    }
+
+    pub(crate) fn diagnostic(&self) -> Option<&TreeSitterDiagnostic> {
+        match self {
+            Self::Parsed(_) => None,
+            Self::Unavailable(diagnostic) => Some(diagnostic),
+        }
+    }
+}
+
+/// Recoverable source-AST diagnostic emitted when filefacts refuses or fails
+/// a Tree-sitter parse but can still return generic/text facts.
+pub(crate) struct TreeSitterDiagnostic {
+    pub(crate) metric: &'static str,
+    pub(crate) message: String,
+}
+
+impl TreeSitterDiagnostic {
+    fn tree_sitter_guard(language: &'static str, bytes: usize, audit: ScannerAudit) -> Self {
+        Self {
+            metric: "source.ast_unavailable.tree_sitter_guard",
+            message: format!(
+                "tree-sitter parse skipped for {language}: {bytes} bytes exceeds scanner-risk guard ({audit:?})"
+            ),
+        }
+    }
+
+    pub(crate) fn parse_failed(message: impl Into<String>) -> Self {
+        Self {
+            metric: "source.ast_unavailable.parse_failed",
+            message: message.into(),
+        }
+    }
+}
+
 impl<'a> TreeCache<'a> {
-    /// Parse `bytes` as `file_type` source. Returns `Ok(None)` when the
-    /// type isn't a supported source language; returns `Ok(None)` when
-    /// the bytes aren't valid UTF-8 (source code must be); returns
-    /// `Err` only when the language is supported but the parser
-    /// signals an unrecoverable error (rare — tree-sitter recovers
-    /// gracefully from most malformed input).
-    pub(crate) fn parse(bytes: &'a [u8], file_type: FileType) -> Result<Option<Self>, Error> {
+    /// Parse `bytes` as `file_type` source. Returns [`TreeParse::Unavailable`]
+    /// when filefacts deliberately refuses the parse or cannot build a
+    /// Tree-sitter tree, so callers can still emit generic/text facts plus a
+    /// recoverable diagnostic.
+    pub(crate) fn parse(bytes: &'a [u8], file_type: FileType) -> Result<TreeParse<'a>, Error> {
         let Some(config) = langs::config_for(file_type) else {
-            return Ok(None);
+            return Ok(TreeParse::Unavailable(TreeSitterDiagnostic::parse_failed(
+                "no tree-sitter grammar registered for source file type",
+            )));
         };
         let Ok(source) = std::str::from_utf8(bytes) else {
-            return Ok(None);
+            return Ok(TreeParse::Unavailable(TreeSitterDiagnostic::parse_failed(
+                "source bytes are not valid utf-8",
+            )));
         };
         if would_overflow_scanner_state(file_type, source) {
+            let diagnostic = TreeSitterDiagnostic::tree_sitter_guard(
+                config.name,
+                source.len(),
+                scanner_audit(file_type),
+            );
             tracing::warn!(
                 language = config.name,
                 bytes = source.len(),
                 audit = ?scanner_audit(file_type),
                 "skipping tree-sitter parse to avoid 1024-byte scanner-state overflow"
             );
-            return Ok(None);
+            return Ok(TreeParse::Unavailable(diagnostic));
         }
         let language = (config.language)();
         THREAD_PARSER.with(|cell| {
@@ -126,7 +180,7 @@ impl<'a> TreeCache<'a> {
             let tree = parser
                 .parse(source, None)
                 .ok_or_else(|| Error::malformed("source", "tree-sitter parse returned None"))?;
-            Ok(Some(Self {
+            Ok(TreeParse::Parsed(Self {
                 source,
                 tree,
                 file_type,

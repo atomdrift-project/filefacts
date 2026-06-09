@@ -86,6 +86,12 @@ pub enum Stage {
     PdfParse,
     /// RPM header parse.
     RpmParse,
+    /// Tree-sitter parser setup or guarded source parse.
+    SourceParse,
+    /// Source-language extraction from an existing Tree-sitter parse.
+    SourceExtract,
+    /// Source AST symbol walk from an existing Tree-sitter parse.
+    SourceAstWalk,
     /// Generic / catch-all extraction stage.
     FormatExtract,
 }
