@@ -13,7 +13,9 @@ use goblin::mach::{self, Mach, MachO};
 use serde_json::Value as JsonValue;
 
 use crate::error::Error;
-use crate::formats::common::{extract_binary_strings, put_str, put_u64, rizin_fallback};
+use crate::formats::common::{
+    extract_binary_strings, extract_binary_strings_from_object, put_str, put_u64, rizin_fallback,
+};
 use crate::formats::goblin_safe;
 use crate::output::{Errors, Metrics, Section, Strings, Values};
 use crate::scan::entropy;
@@ -28,8 +30,6 @@ pub(super) fn extract(
     symbols_out: &mut crate::Symbols,
     errors_out: &mut Errors,
 ) -> Result<(), Error> {
-    extract_binary_strings(bytes, strings);
-
     // Wrap goblin parse in catch_unwind. Fat-header arithmetic
     // overflow on malformed Mach-O has historically panicked
     // goblin; record the failure and return Ok so byte-level
@@ -37,15 +37,26 @@ pub(super) fn extract(
     let parsed = match goblin_safe::parse_mach(bytes) {
         goblin_safe::GoblinOutcome::Ok(m) => m,
         goblin_safe::GoblinOutcome::Failed(e) => {
+            // Parse failed: let stng parse the bytes itself so strings are
+            // still recovered from the malformed input.
+            extract_binary_strings(bytes, strings);
             errors_out.record_malformed(crate::Stage::MachoParse, e.to_string());
             metrics.insert("macho.parse_failed", 1.0);
             return Ok(());
         }
         goblin_safe::GoblinOutcome::Panicked(msg) => {
+            extract_binary_strings(bytes, strings);
             errors_out.record_panic(crate::Stage::MachoParse, msg);
             metrics.insert("macho.parse_panicked", 1.0);
             return Ok(());
         }
+    };
+    // Reuse this parse for string extraction instead of having stng parse the
+    // binary a second time.
+    let object = goblin::Object::Mach(parsed);
+    extract_binary_strings_from_object(&object, bytes, strings);
+    let goblin::Object::Mach(parsed) = object else {
+        unreachable!("constructed as Object::Mach")
     };
     match parsed {
         Mach::Binary(macho) => {

@@ -16,8 +16,8 @@ use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::{
-    extract_binary_strings, extract_utf16_strings, hex_encode, put_i64, put_str, put_u64,
-    rizin_fallback_with_sections,
+    extract_binary_strings, extract_binary_strings_from_object, extract_utf16_strings, hex_encode,
+    put_i64, put_str, put_u64, rizin_fallback_with_sections,
 };
 use crate::formats::goblin_safe;
 use crate::output::{Errors, Metrics, Section, Strings, Values};
@@ -33,10 +33,9 @@ pub(super) fn extract(
     symbols_out: &mut crate::Symbols,
     errors_out: &mut Errors,
 ) -> Result<(), Error> {
-    // PE strings are scattered across `.rdata`, `.data`, and resources.
-    // The full-file scan is cheap and captures content embedded outside
-    // of `goblin`'s parsed regions (overlays, hand-crafted sections).
-    extract_binary_strings(bytes, strings);
+    // UTF-16 strings (resource names, version info) are a separate raw pass.
+    // ASCII / section strings come from the parsed object below — or a
+    // byte-level fallback if the parse fails — so the binary is parsed once.
     extract_utf16_strings(bytes, strings);
 
     // Try the full goblin parse first — it gives us imports, exports,
@@ -68,6 +67,13 @@ pub(super) fn extract(
         goblin_safe::GoblinOutcome::Ok(_) => {}
     }
     if let Some(pe) = parse_outcome.ok() {
+        // Reuse this parse for string extraction (move into an Object for stng,
+        // then move back out) so the binary isn't parsed a second time.
+        let object = goblin::Object::PE(pe);
+        extract_binary_strings_from_object(&object, bytes, strings);
+        let goblin::Object::PE(pe) = object else {
+            unreachable!("constructed as Object::PE")
+        };
         coff_header(&pe.header.coff_header, values);
         dos_header(&pe.header, values);
         if let Some(ref opt) = pe.header.optional_header {
@@ -147,6 +153,10 @@ pub(super) fn extract(
         rizin_fallback_with_sections(bytes, symbols_out, sections_out, metrics, "pe");
         return Ok(());
     }
+
+    // Full parse failed: recover strings via stng's own byte-level scan
+    // (it parses the bytes itself, tolerating the malformed structure).
+    extract_binary_strings(bytes, strings);
 
     // Header-only fallback. The header parse is far more tolerant —
     // we can still surface machine / subsystem / characteristics +
@@ -998,9 +1008,7 @@ fn clr_resources(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
     let Some(base) = rva_to_file_offset(pe, dir.virtual_address) else {
         return;
     };
-    let end = base
-        .saturating_add(dir.size as usize)
-        .min(bytes.len());
+    let end = base.saturating_add(dir.size as usize).min(bytes.len());
     if base >= end {
         return;
     }

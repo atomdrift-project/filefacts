@@ -247,7 +247,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         b'x' => {
             // XAR (macOS PKG): xar!
             if data.starts_with(b"xar!") {
-                Some((FileType::Pkg, DetectionSource::Magic))
+                Some((FileType::PkgMacos, DetectionSource::Magic))
             } else {
                 None
             }
@@ -272,13 +272,24 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // Gzip: 1F 8B — could wrap a tar or be a single compressed file.
             // Use extension to tell them apart; unknown extension → plain gz.
             if data[1] == 0x8B {
-                // .apk with gzip magic is Alpine Linux APK (tar.gz), not Android APK (zip)
-                let ft = if path_ends_with_ci(path, b".tar.gz")
-                    || path_ends_with_ci(path, b".tgz")
-                    || path_ends_with_ci(path, b".crate")
-                    || path_ends_with_ci(path, b".apk")
-                {
-                    FileType::TarGz
+                // `.apk` + gzip magic is an Alpine Linux package (a
+                // gzip-concatenated tar), distinct from the Android `.apk`
+                // (a zip — handled by `classify_pk`). The two never share
+                // magic, so container magic alone disambiguates them.
+                let ft = if path_ends_with_ci(path, b".apk") {
+                    FileType::ApkAlpine
+                } else if path_ends_with_ci(path, b".crate") {
+                    // Cargo-specific extension; always a `<name>-<ver>/` gzip tar.
+                    FileType::Crate
+                } else if path_ends_with_ci(path, b".tar.gz") || path_ends_with_ci(path, b".tgz") {
+                    // npm publishes gzip tarballs with everything under a
+                    // `package/` prefix; that marker — not the generic
+                    // extension — is what identifies an npm package.
+                    if gzip_tar_is_npm(data) {
+                        FileType::Npm
+                    } else {
+                        FileType::TarGz
+                    }
                 } else {
                     FileType::Gz
                 };
@@ -328,11 +339,20 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         0x28 => {
             // Zstandard: 28 B5 2F FD
             if data.len() >= 4 && data[1] == 0xB5 && data[2] == 0x2F && data[3] == 0xFD {
-                let ft = if path_ends_with_ci(path, b".tar.zst")
+                // FreeBSD (`.pkg`, `+MANIFEST` marker) and Arch
+                // (`.pkg.tar.zst`, `.PKGINFO` marker) are both zstd tars,
+                // disambiguated by their leading manifest member.
+                let ft = if is_freebsd_pkg_zstd(path, data) {
+                    FileType::PkgFreebsd
+                } else if path_ends_with_ci(path, b".pkg.tar.zst") {
+                    if zstd_tar_has_pkginfo(data) {
+                        FileType::PkgArch
+                    } else {
+                        FileType::TarZst
+                    }
+                } else if path_ends_with_ci(path, b".tar.zst")
                     || path_ends_with_ci(path, b".tzst")
                     || path_ends_with_ci(path, b".xbps")
-                    || path_ends_with_ci(path, b".pkg.tar.zst")
-                    || is_freebsd_pkg_zstd(path, data)
                 {
                     FileType::TarZst
                 } else {
@@ -430,6 +450,68 @@ fn is_freebsd_pkg_zstd(path: &Path, data: &[u8]) -> bool {
     prefix[..n].starts_with(b"+COMPACT_MANIFEST") || prefix[..n].starts_with(b"+MANIFEST")
 }
 
+/// Peek a gzip tar's leading members (header names only) to decide whether the
+/// layout is an npm package: every entry under a `package/` prefix, with a
+/// `package/package.json` present. Bails on the first non-`package/` entry, so
+/// a non-npm gzip tar costs one header. Bounded to the first 16 members.
+fn gzip_tar_is_npm(data: &[u8]) -> bool {
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(data));
+    let Ok(entries) = archive.entries() else {
+        return false;
+    };
+    for entry in entries.take(24) {
+        let Ok(entry) = entry else { return false };
+        // Tar metadata headers (pax/GNU long-name) aren't real members.
+        if matches!(
+            entry.header().entry_type(),
+            tar::EntryType::XGlobalHeader
+                | tar::EntryType::XHeader
+                | tar::EntryType::GNULongName
+                | tar::EntryType::GNULongLink
+        ) {
+            continue;
+        }
+        let Ok(path) = entry.path() else { continue };
+        let path = path.to_string_lossy();
+        let trimmed = path.trim_end_matches('/');
+        // Skip macOS AppleDouble sidecars (`._name`) that `tar` smuggles in
+        // alongside real files — they're not part of the npm layout.
+        let basename = trimmed.rsplit('/').next().unwrap_or(trimmed);
+        if basename.starts_with("._") {
+            continue;
+        }
+        // The directory entry arrives as `package` (trailing slash stripped);
+        // files under it as `package/<...>`. The first real entry outside that
+        // tree means this isn't an npm package.
+        if trimmed != "package" && !trimmed.starts_with("package/") {
+            return false;
+        }
+        if trimmed == "package/package.json" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Peek a zstd tar's leading members for the Arch package marker `.PKGINFO`
+/// (its first member). Bounded to the first 8 members.
+fn zstd_tar_has_pkginfo(data: &[u8]) -> bool {
+    let Ok(decoder) = zstd::stream::read::Decoder::new(data) else {
+        return false;
+    };
+    let mut archive = tar::Archive::new(decoder);
+    let Ok(entries) = archive.entries() else {
+        return false;
+    };
+    for entry in entries.take(8) {
+        let Ok(entry) = entry else { return false };
+        if entry.path().is_ok_and(|p| p.as_os_str() == ".PKGINFO") {
+            return true;
+        }
+    }
+    false
+}
+
 fn looks_like_github_actions_workflow(path: &Path, data: &[u8]) -> bool {
     if !(path_ends_with_ci(path, b".yml") || path_ends_with_ci(path, b".yaml")) {
         return false;
@@ -486,6 +568,30 @@ fn classify_pk(path: &Path, data: &[u8]) -> (FileType, DetectionSource) {
 
     if ext == "whl" {
         return (FileType::Whl, DetectionSource::Magic);
+    }
+
+    // `.apk` + zip magic is an Android application package. Alpine's `.apk` is
+    // a gzip tar, resolved in the gzip branch — the two never share magic.
+    if ext == "apk" {
+        return (FileType::ApkAndroid, DetectionSource::Magic);
+    }
+
+    // Zip-based package ecosystems, disambiguated from a generic zip by their
+    // unambiguous extension (each ships its identity manifest inside).
+    if ext == "conda" {
+        return (FileType::Conda, DetectionSource::Magic);
+    }
+    if ext == "egg" {
+        return (FileType::Egg, DetectionSource::Magic);
+    }
+    if ext == "nupkg" {
+        return (FileType::Nupkg, DetectionSource::Magic);
+    }
+    if ext == "ipa" {
+        return (FileType::Ipa, DetectionSource::Magic);
+    }
+    if ext == "vsix" {
+        return (FileType::Vsix, DetectionSource::Magic);
     }
 
     if matches!(
@@ -912,6 +1018,30 @@ mod tests {
     }
 
     #[test]
+    fn apk_android_is_zip() {
+        // `.apk` + ZIP magic → Android package (never the Alpine gzip form).
+        let data = b"PK\x03\x04android apk content";
+        let (ft, _) = detect_from_content(Path::new("app.apk"), data).unwrap();
+        assert_eq!(ft, FileType::ApkAndroid);
+    }
+
+    #[test]
+    fn apk_alpine_is_gzip_tar() {
+        // `.apk` + gzip magic → Alpine package, disambiguated from Android by
+        // container magic alone (no member peek).
+        let data = [0x1f, 0x8b, 0x08, 0x00];
+        let (ft, _) = detect_from_content(Path::new("musl-1.2.4.apk"), &data).unwrap();
+        assert_eq!(ft, FileType::ApkAlpine);
+    }
+
+    #[test]
+    fn macos_pkg_is_xar() {
+        let data = b"xar!\x00\x1c\x00\x01";
+        let (ft, _) = detect_from_content(Path::new("installer.pkg"), data).unwrap();
+        assert_eq!(ft, FileType::PkgMacos);
+    }
+
+    #[test]
     fn ooxml_by_extension() {
         let data = b"PK\x03\x04some office content";
         let (ft, _) = detect_from_content(Path::new("report.docx"), data).unwrap();
@@ -1003,7 +1133,99 @@ mod tests {
     fn freebsd_pkg_zstd_archive() {
         let data = zstd::encode_all(&b"+COMPACT_MANIFEST\0payload"[..], 3).unwrap();
         let (ft, _) = detect_from_content(Path::new("BerkeleyGW-4.0_2.pkg"), &data).unwrap();
-        assert_eq!(ft, FileType::TarZst);
+        assert_eq!(ft, FileType::PkgFreebsd);
+    }
+
+    #[test]
+    fn crate_is_gzip_tar() {
+        // `.crate` is cargo-specific; gzip magic + extension suffices.
+        let data = [0x1f, 0x8b, 0x08, 0x00];
+        let (ft, _) = detect_from_content(Path::new("serde-1.0.0.crate"), &data).unwrap();
+        assert_eq!(ft, FileType::Crate);
+    }
+
+    #[test]
+    fn npm_tgz_detected_by_package_prefix() {
+        // npm tarballs put everything under `package/`; build a real gzip tar
+        // so the marker peek runs.
+        let mut tar = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar);
+            // macOS `tar` smuggles an AppleDouble `._package` sidecar in as the
+            // first entry; the peek must skip it rather than bail.
+            let mut sidecar = tar::Header::new_ustar();
+            sidecar.set_path("._package").unwrap();
+            sidecar.set_size(0);
+            sidecar.set_cksum();
+            b.append(&sidecar, std::io::empty()).unwrap();
+            // Real `tar` emits the `package/` directory entry first; the peek
+            // must tolerate it (its path arrives without the trailing slash).
+            let mut dir = tar::Header::new_ustar();
+            dir.set_path("package/").unwrap();
+            dir.set_size(0);
+            dir.set_entry_type(tar::EntryType::Directory);
+            dir.set_cksum();
+            b.append(&dir, std::io::empty()).unwrap();
+            let body = br#"{"name":"demo","version":"1.0.0"}"#;
+            let mut h = tar::Header::new_ustar();
+            h.set_path("package/package.json").unwrap();
+            h.set_size(body.len() as u64);
+            h.set_cksum();
+            b.append(&h, &body[..]).unwrap();
+            b.finish().unwrap();
+        }
+        let gz = {
+            use std::io::Write;
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(&tar).unwrap();
+            e.finish().unwrap()
+        };
+        let (ft, _) = detect_from_content(Path::new("demo-1.0.0.tgz"), &gz).unwrap();
+        assert_eq!(ft, FileType::Npm);
+
+        // A `.tgz` without the `package/` layout stays a generic gzip tar.
+        let plain = {
+            use std::io::Write;
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(b"not a tar").unwrap();
+            e.finish().unwrap()
+        };
+        let (ft, _) = detect_from_content(Path::new("blob.tgz"), &plain).unwrap();
+        assert_eq!(ft, FileType::TarGz);
+    }
+
+    #[test]
+    fn arch_pkg_detected_by_pkginfo() {
+        let mut tar = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar);
+            let body = b"pkgname = demo\n";
+            let mut h = tar::Header::new_ustar();
+            h.set_path(".PKGINFO").unwrap();
+            h.set_size(body.len() as u64);
+            h.set_cksum();
+            b.append(&h, &body[..]).unwrap();
+            b.finish().unwrap();
+        }
+        let zst = zstd::encode_all(&tar[..], 3).unwrap();
+        let (ft, _) =
+            detect_from_content(Path::new("demo-1.0-1-x86_64.pkg.tar.zst"), &zst).unwrap();
+        assert_eq!(ft, FileType::PkgArch);
+    }
+
+    #[test]
+    fn zip_package_ecosystems_by_extension() {
+        for (name, expected) in [
+            ("pkg.conda", FileType::Conda),
+            ("lib.egg", FileType::Egg),
+            ("Newtonsoft.Json.nupkg", FileType::Nupkg),
+            ("App.ipa", FileType::Ipa),
+            ("ext.vsix", FileType::Vsix),
+        ] {
+            let data = b"PK\x03\x04zip body";
+            let (ft, _) = detect_from_content(Path::new(name), data).unwrap();
+            assert_eq!(ft, expected, "{name}");
+        }
     }
 
     #[test]

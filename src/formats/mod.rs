@@ -37,10 +37,12 @@ mod build_toolchain;
 mod chm;
 mod class;
 pub(crate) mod common;
+mod deb;
 mod elf;
 mod elf_dwarf;
 mod elf_dynamic;
 mod elf_hashes;
+mod gem;
 mod generic;
 mod go_buildinfo;
 mod goblin_safe;
@@ -107,7 +109,18 @@ pub(crate) fn extract(
         FileType::MachO => {
             macho::extract(bytes, values, strings, metrics, sections, symbols, errors)
         }
-        FileType::Zip | FileType::Crx | FileType::Odf => {
+        FileType::Zip
+        | FileType::Crx
+        | FileType::Odf
+        | FileType::ApkAndroid
+        | FileType::Conda
+        | FileType::Egg
+        | FileType::Nupkg
+        | FileType::Ipa
+        | FileType::Vsix => {
+            // Zip-based packages (Android apk, conda, egg, nupkg, ipa, vsix):
+            // the generic archive walk surfaces their member listing and the
+            // identity manifests inside (PKG-INFO, *.nuspec, Info.plist, …).
             zip::extract(bytes, values, metrics, archive_members)
         }
         FileType::Asar => asar::extract(bytes, values, metrics, archive_members),
@@ -150,6 +163,21 @@ pub(crate) fn extract(
         FileType::Tar | FileType::TarGz | FileType::TarBz2 | FileType::TarXz | FileType::TarZst => {
             tar::extract(bytes, file_type, values, metrics, archive_members)
         }
+        // Compressed-tar packages (Alpine apk, npm, crate, FreeBSD/Arch pkg):
+        // same handling as the other compressed-tar variants — format label
+        // only; cleave decompresses and re-submits the members.
+        FileType::ApkAlpine
+        | FileType::Npm
+        | FileType::Crate
+        | FileType::PkgFreebsd
+        | FileType::PkgArch => tar::extract(bytes, file_type, values, metrics, archive_members),
+        // A gem is an uncompressed `ustar` tar. Walk it for the generic
+        // archive.* surface, then read the gzipped metadata member for the
+        // gem.* identity facts (name/version/deps live only in `metadata.gz`).
+        FileType::Gem => {
+            tar::extract(bytes, file_type, values, metrics, archive_members)?;
+            gem::extract(bytes, values, metrics)
+        }
         // Structured manifests parse their entire content into `values`
         // with the format-native key shape (the parsed JSON/YAML/TOML
         // tree, verbatim).
@@ -176,6 +204,7 @@ pub(crate) fn extract(
         FileType::Png => png::extract(bytes, values, strings, metrics),
         FileType::PythonBytecode => pyc::extract(bytes, values, strings, metrics),
         FileType::Rpm => rpm::extract(bytes, values, strings, metrics),
+        FileType::Deb => deb::extract(bytes, values, metrics),
         FileType::Rtf => rtf::extract(bytes, values, strings, metrics),
 
         // Source-code extraction is delegated to the source dispatcher,

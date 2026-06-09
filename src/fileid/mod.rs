@@ -23,7 +23,7 @@ mod ext;
 mod heuristics;
 mod magic;
 
-use std::{io::Read, path::Path};
+use std::path::Path;
 
 use serde::Serialize;
 
@@ -205,12 +205,24 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::Rar
         | FileType::Deb
         | FileType::Rpm
-        | FileType::Pkg
+        | FileType::PkgMacos
         | FileType::Cab
         | FileType::Chm
         | FileType::Crx
         | FileType::Xpi
         | FileType::Whl
+        | FileType::Gem
+        | FileType::ApkAndroid
+        | FileType::ApkAlpine
+        | FileType::Npm
+        | FileType::Crate
+        | FileType::Conda
+        | FileType::Egg
+        | FileType::Nupkg
+        | FileType::Ipa
+        | FileType::Vsix
+        | FileType::PkgFreebsd
+        | FileType::PkgArch
         | FileType::Asar => "archive",
         FileType::Rtf | FileType::OleDoc | FileType::Ooxml | FileType::Pdf | FileType::Odf => {
             "document"
@@ -352,8 +364,10 @@ pub enum FileType {
     Deb,
     /// RPM package (.rpm)
     Rpm,
-    /// macOS installer package (.pkg, XAR format)
-    Pkg,
+    /// macOS installer package (.pkg, XAR format). Named `PkgMacos` (not bare
+    /// `Pkg`) because the `.pkg` extension is ambiguous: FreeBSD and Arch also
+    /// use it for compressed-tar packages, disambiguated by container magic.
+    PkgMacos,
     /// Cabinet archive (.cab)
     Cab,
     /// Compiled HTML Help (.chm) — Microsoft ITSF/ITOL container with
@@ -370,6 +384,49 @@ pub enum FileType {
     /// from generic ZIP so the wheel-specific surface (dist-info, RECORD,
     /// native-extension count, top-level packages) can be extracted.
     Whl,
+    /// RubyGems package (.gem) — uncompressed `ustar` tar holding
+    /// `metadata.gz` (gzipped `Gem::Specification` YAML), `data.tar.gz`, and
+    /// `checksums.yaml.gz`. Distinct from generic tar so the gem's external
+    /// identity metadata can be surfaced as `gem.*`.
+    Gem,
+    /// Android application package (.apk) — ZIP container (`AndroidManifest.xml`,
+    /// `classes.dex`). Disambiguated from the Alpine `.apk` by container magic
+    /// (`PK` zip vs gzip tar) so each ecosystem gets its own model.
+    ApkAndroid,
+    /// Alpine Linux package (.apk) — gzip-concatenated tar (signature ‖ control
+    /// ‖ data) carrying `.PKGINFO`. Disambiguated from the Android `.apk` by
+    /// container magic (gzip vs `PK` zip).
+    ApkAlpine,
+    /// npm package (.tgz) — gzip tar with everything under a `package/` prefix
+    /// (`package/package.json`). Disambiguated from a generic gzip tar by that
+    /// marker, so npm supply-chain signal (install scripts, bin shims) routes
+    /// to its own model.
+    Npm,
+    /// Rust crate (.crate) — gzip tar laid out as `<name>-<version>/` with a
+    /// `Cargo.toml` at its root. The `.crate` extension is cargo-specific.
+    Crate,
+    /// conda package (.conda) — ZIP holding `metadata.json` plus zstd-compressed
+    /// `info-*`/`pkg-*` tars. Distinct from generic ZIP so conda identity
+    /// (`info/index.json`) routes to its own model.
+    Conda,
+    /// Python egg (.egg) — ZIP with an `EGG-INFO/` directory (`PKG-INFO`).
+    Egg,
+    /// NuGet package (.nupkg) — ZIP carrying a `*.nuspec` manifest.
+    Nupkg,
+    /// iOS application archive (.ipa) — ZIP with `Payload/*.app/Info.plist`.
+    Ipa,
+    /// VS Code / Open VSX extension (.vsix) — ZIP carrying
+    /// `extension.vsixmanifest`. Distinct from the manifest file type
+    /// [`FileType::VsixManifest`], which is that inner XML alone.
+    Vsix,
+    /// FreeBSD package (.pkg) — zstd-compressed tar whose first member is the
+    /// `+COMPACT_MANIFEST` / `+MANIFEST` metadata. Disambiguated from the macOS
+    /// `.pkg` by container magic (zstd-tar vs `xar!`) and from Arch by the
+    /// `+MANIFEST` marker.
+    PkgFreebsd,
+    /// Arch Linux package (.pkg.tar.zst) — zstd-compressed tar whose first
+    /// member is `.PKGINFO`. Disambiguated from FreeBSD by that marker.
+    PkgArch,
     /// Electron ASAR application archive (.asar)
     Asar,
     /// AppleScript source file (.applescript, .scpt)
@@ -442,12 +499,24 @@ impl FileType {
                 | Self::Rar
                 | Self::Deb
                 | Self::Rpm
-                | Self::Pkg
+                | Self::PkgMacos
                 | Self::Cab
                 | Self::Chm
                 | Self::Crx
                 | Self::Xpi
                 | Self::Whl
+                | Self::Gem
+                | Self::ApkAndroid
+                | Self::ApkAlpine
+                | Self::Npm
+                | Self::Crate
+                | Self::Conda
+                | Self::Egg
+                | Self::Nupkg
+                | Self::Ipa
+                | Self::Vsix
+                | Self::PkgFreebsd
+                | Self::PkgArch
                 | Self::Asar
                 | Self::Jar
         )
@@ -633,27 +702,6 @@ fn has_yaml_extension(path: &Path) -> bool {
     ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
 }
 
-fn is_freebsd_pkg_zstd(path: &Path, data: &[u8], file_type: FileType) -> bool {
-    if !matches!(file_type, FileType::TarZst | FileType::Zst) {
-        return false;
-    }
-    if !path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.len() >= 4 && name[name.len() - 4..].eq_ignore_ascii_case(".pkg"))
-    {
-        return false;
-    }
-    let Ok(mut decoder) = zstd::stream::read::Decoder::new(data) else {
-        return false;
-    };
-    let mut prefix = [0u8; 32];
-    let Ok(n) = decoder.read(&mut prefix) else {
-        return false;
-    };
-    prefix[..n].starts_with(b"+COMPACT_MANIFEST") || prefix[..n].starts_with(b"+MANIFEST")
-}
-
 /// True when an extension/content disagreement is a known benign format
 /// convention rather than an evasion signal. Mirrors the carve-outs cleave
 /// previously applied before emitting `metadata/file-extension-mismatch`.
@@ -676,13 +724,23 @@ fn is_benign_extension_mismatch(path: &Path, data: &[u8], det: Detection) -> boo
             n.len() >= suffix.len() && n[n.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
         })
     };
-    // Android/Alpine APK: `.apk` (extension maps to Zip) whose body is a tar(.gz/…).
+    // Android/Alpine APK: `.apk` (extension maps to Zip) resolved by container
+    // magic to the ecosystem-specific type. Both are legitimate `.apk`s — the
+    // disambiguation is the point, not an evasion signal.
     if name_ends_ci(".apk")
         && ext_type == FileType::Zip
-        && matches!(
-            content,
-            FileType::Tar | FileType::TarGz | FileType::TarBz2 | FileType::TarXz | FileType::TarZst
-        )
+        && matches!(content, FileType::ApkAndroid | FileType::ApkAlpine)
+    {
+        return true;
+    }
+    // Content detection refined a generic-archive extension to a specific
+    // package ecosystem (npm `.tgz`, Arch/FreeBSD `.pkg*`). The extension's
+    // generic archive type and the content's specific archive type agree on
+    // being an archive — a benign refinement, not a masquerade.
+    if matches!(
+        content,
+        FileType::Npm | FileType::PkgFreebsd | FileType::PkgArch
+    ) && ext_type.is_archive()
     {
         return true;
     }
@@ -729,9 +787,6 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
         }
 
         let ext_match = match ext_ft {
-            Some(FileType::Pkg) if is_freebsd_pkg_zstd(path, data, file_type) => {
-                ExtensionMatch::Consistent
-            }
             Some(e) if e != file_type => ExtensionMatch::Different(e),
             None if file_type == FileType::GithubActions && has_yaml_extension(path) => {
                 ExtensionMatch::Consistent
@@ -1431,10 +1486,12 @@ mod tests {
     #[test]
     fn freebsd_pkg_zstd_is_not_extension_mismatch() {
         let data = zstd::encode_all(&b"+COMPACT_MANIFEST\0payload"[..], 3).unwrap();
-        let det = detect(Path::new("BerkeleyGW-4.0_2.pkg"), &data).unwrap();
-        assert_eq!(det.file_type, FileType::TarZst);
-        assert_eq!(det.source, DetectionSource::Magic);
-        assert!(!det.extension_mismatch());
+        // FreeBSD `.pkg` (zstd tar) now carries its own ecosystem type; the
+        // `.pkg`→macOS extension default is a benign refinement, suppressed at
+        // the FileId level where consumers read it.
+        let id = FileId::from_path_and_bytes(Path::new("BerkeleyGW-4.0_2.pkg"), &data);
+        assert_eq!(id.file_type(), FileType::PkgFreebsd);
+        assert!(!id.extension_mismatch());
     }
 
     #[test]
@@ -1446,6 +1503,50 @@ mod tests {
     #[test]
     fn deb_by_ext() {
         assert_ext("package.deb", FileType::Deb);
+    }
+
+    #[test]
+    fn gem_by_ext() {
+        // A gem is an uncompressed tar with no offset-0 magic, so it resolves
+        // through the extension fallback to its own type (not generic Tar).
+        assert_ext("rails-7.0.4.gem", FileType::Gem);
+    }
+
+    #[test]
+    fn apk_split_is_not_an_extension_mismatch() {
+        // Both `.apk` ecosystems are content-detected away from the extension's
+        // zip default, but that disambiguation is benign — not an evasion flag.
+        let android = FileId::from_path_and_bytes(Path::new("app.apk"), b"PK\x03\x04zip body");
+        assert_eq!(android.file_type(), FileType::ApkAndroid);
+        assert!(!android.extension_mismatch());
+
+        let alpine = FileId::from_path_and_bytes(Path::new("musl.apk"), &[0x1f, 0x8b, 0x08, 0x00]);
+        assert_eq!(alpine.file_type(), FileType::ApkAlpine);
+        assert!(!alpine.extension_mismatch());
+    }
+
+    #[test]
+    fn package_types_stay_in_archive_group() {
+        // Fine-grained package identity must not leak out of the coarse
+        // `archive` group that downstream consumers key on.
+        for ft in [
+            FileType::Gem,
+            FileType::ApkAndroid,
+            FileType::ApkAlpine,
+            FileType::Npm,
+            FileType::Crate,
+            FileType::Conda,
+            FileType::Egg,
+            FileType::Nupkg,
+            FileType::Ipa,
+            FileType::Vsix,
+            FileType::PkgMacos,
+            FileType::PkgFreebsd,
+            FileType::PkgArch,
+        ] {
+            assert!(ft.is_archive(), "{ft:?} should be an archive");
+            assert_eq!(file_group(ft), "archive", "{ft:?} group");
+        }
     }
 
     #[test]

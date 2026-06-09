@@ -38,7 +38,10 @@ pub(crate) fn detect_from_path(path: &Path) -> Option<FileType> {
     if ends_with_ci(p, b".pkg.tar.gz") {
         return Some(FileType::TarGz);
     }
-    if ends_with_ci(p, b".tar.gz") || ends_with_ci(p, b".tgz") || ends_with_ci(p, b".crate") {
+    if ends_with_ci(p, b".crate") {
+        return Some(FileType::Crate);
+    }
+    if ends_with_ci(p, b".tar.gz") || ends_with_ci(p, b".tgz") {
         return Some(FileType::TarGz);
     }
     if ends_with_ci(p, b".tar.bz2") || ends_with_ci(p, b".tbz2") || ends_with_ci(p, b".tbz") {
@@ -50,7 +53,10 @@ pub(crate) fn detect_from_path(path: &Path) -> Option<FileType> {
     if ends_with_ci(p, b".tar.zst") || ends_with_ci(p, b".tzst") || ends_with_ci(p, b".xbps") {
         return Some(FileType::TarZst);
     }
-    if ends_with_ci(p, b".tar") || ends_with_ci(p, b".gem") {
+    if ends_with_ci(p, b".gem") {
+        return Some(FileType::Gem);
+    }
+    if ends_with_ci(p, b".tar") {
         return Some(FileType::Tar);
     }
 
@@ -300,9 +306,16 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "jpg" | "jpeg" | "jpe" | "jfif" => Some(FileType::Jpeg),
         "png" => Some(FileType::Png),
         "pkl" | "pickle" | "joblib" => Some(FileType::Pickle),
-        "zip" | "apk" | "ipa" | "epub" | "nupkg" | "vsix" | "aar" | "egg" | "phar" | "pyz"
-        | "conda" | "msix" | "appx" | "msixbundle" | "appxbundle" | "aab" | "apks" | "xapk"
-        | "cbz" => Some(FileType::Zip),
+        // Zip-based package ecosystems with unambiguous extensions get their
+        // own type (the magic branch agrees when `PK` is present; this keeps
+        // the extension fallback consistent so it isn't flagged a mismatch).
+        "ipa" => Some(FileType::Ipa),
+        "nupkg" => Some(FileType::Nupkg),
+        "vsix" => Some(FileType::Vsix),
+        "egg" => Some(FileType::Egg),
+        "conda" => Some(FileType::Conda),
+        "zip" | "apk" | "epub" | "aar" | "phar" | "pyz" | "msix" | "appx" | "msixbundle"
+        | "appxbundle" | "aab" | "apks" | "xapk" | "cbz" => Some(FileType::Zip),
         "xpi" => Some(FileType::Xpi),
         "whl" => Some(FileType::Whl),
         "7z" | "cb7" => Some(FileType::SevenZ),
@@ -310,7 +323,7 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "deb" | "udeb" => Some(FileType::Deb),
         "rpm" | "srpm" => Some(FileType::Rpm),
         "crx" => Some(FileType::Crx),
-        "pkg" => Some(FileType::Pkg),
+        "pkg" => Some(FileType::PkgMacos),
         "cab" | "msu" => Some(FileType::Cab),
         "chm" => Some(FileType::Chm),
         "asar" => Some(FileType::Asar),
@@ -527,7 +540,6 @@ mod tests {
     #[test]
     fn package_archive_aliases() {
         for name in [
-            "pkg.conda",
             "app.msix",
             "app.appx",
             "bundle.msixbundle",

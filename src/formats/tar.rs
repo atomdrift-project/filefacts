@@ -345,6 +345,11 @@ fn format_label(file_type: FileType) -> &'static str {
         FileType::TarBz2 => "tar.bz2",
         FileType::TarXz => "tar.xz",
         FileType::TarZst => "tar.zst",
+        FileType::ApkAlpine => "apk",
+        FileType::Gem => "gem",
+        FileType::Npm => "npm",
+        FileType::Crate => "crate",
+        FileType::PkgFreebsd | FileType::PkgArch => "pkg",
         // Plain `Tar` and any catch-all the dispatcher routes here.
         _ => "tar",
     }
@@ -364,9 +369,20 @@ fn open_archive(
     // crates yet; for now we report the format label and decline to walk
     // entries when the bytes are compressed. (Cleave can hand filefacts
     // the *decompressed* tar bytes and get the full member listing.)
+    // `Gem` is an *uncompressed* `ustar` tar — it falls through to the plain
+    // walker below. The compressed variants (including Alpine's gzip `.apk`)
+    // are reported by format label only.
     if matches!(
         file_type,
-        FileType::TarGz | FileType::TarBz2 | FileType::TarXz | FileType::TarZst
+        FileType::TarGz
+            | FileType::TarBz2
+            | FileType::TarXz
+            | FileType::TarZst
+            | FileType::ApkAlpine
+            | FileType::Npm
+            | FileType::Crate
+            | FileType::PkgFreebsd
+            | FileType::PkgArch
     ) {
         return Err(Error::malformed(
             "tar",

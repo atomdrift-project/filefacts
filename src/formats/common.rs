@@ -34,13 +34,21 @@ pub(super) fn extract_utf16_strings(bytes: &[u8], strings: &mut Strings) {
 /// through a decoder: `base64`, `xor`, `unicode-escape`, …) — the
 /// pure recovery methods (raw scan, instruction-pattern, structure)
 /// add noise and aren't worth tagging.
-pub(super) fn extract_binary_strings(bytes: &[u8], strings: &mut Strings) {
-    use crate::output::ExtractedString;
-    let opts = stng::ExtractOptions {
+/// Options shared by both extraction entry points. `caller_provides_symbols`
+/// tells stng to skip its native import/export/symbol pass: filefacts already
+/// walks the symbol tables itself (`extract_symbols`), so doing it in stng too
+/// would parse them twice.
+fn string_opts() -> stng::ExtractOptions {
+    stng::ExtractOptions {
         min_length: ascii::DEFAULT_MIN_LEN,
+        caller_provides_symbols: true,
         ..Default::default()
-    };
-    let extracted = stng::extract_strings_with_options(bytes, &opts);
+    }
+}
+
+/// Partition stng's extracted strings into the UTF-16 / ASCII buckets.
+fn push_stng_strings(extracted: Vec<stng::ExtractedString>, strings: &mut Strings) {
+    use crate::output::ExtractedString;
     for s in extracted {
         let is_utf16 = matches!(
             s.method,
@@ -62,6 +70,32 @@ pub(super) fn extract_binary_strings(bytes: &[u8], strings: &mut Strings) {
             strings.text.ascii.push(entry);
         }
     }
+}
+
+/// Extract strings from a binary stng parses itself. Used as the fallback when
+/// the format handler's own goblin parse failed (malformed input) — see
+/// [`extract_binary_strings_from_object`] for the fast path that reuses an
+/// already-parsed object.
+pub(super) fn extract_binary_strings(bytes: &[u8], strings: &mut Strings) {
+    push_stng_strings(
+        stng::extract_strings_with_options(bytes, &string_opts()),
+        strings,
+    );
+}
+
+/// Extract strings from a goblin object the caller already parsed, so the
+/// binary isn't parsed a second time inside stng. stng re-parses only for
+/// `Object::Unknown`; filefacts only ever passes a recognised Mach-O / ELF / PE
+/// object here, so the parse is genuinely skipped.
+pub(super) fn extract_binary_strings_from_object(
+    object: &goblin::Object<'_>,
+    bytes: &[u8],
+    strings: &mut Strings,
+) {
+    push_stng_strings(
+        stng::extract_strings_from_object(object, bytes, &string_opts()),
+        strings,
+    );
 }
 
 /// Map stng's `StringMethod` to a canonical kebab-case encoding name.

@@ -55,9 +55,8 @@ gimli = { version = "0.32", default-features = false, features = ["read", "std"]
 # packed runs, decodes XOR-obfuscated and base64-wrapped payloads.
 # Cleave used to call this directly; centralising in filefacts lets every
 # consumer get the same high-quality string set.
-# `rev` pinned for reproducible builds. Bump alongside any stng
-# integration change; see codeberg.org/atomdrift/stng for tags.
-stng = { git = "https://codeberg.org/atomdrift/stng.git", rev = "d1e272d9" }
+# Track upstream HEAD until the next stng release is cut.
+stng = { git = "https://codeberg.org/atomdrift/stng.git" }
 
 
 # Archive index readers. We use these for header/central-directory enumeration
