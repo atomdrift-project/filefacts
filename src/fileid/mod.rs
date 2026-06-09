@@ -1891,6 +1891,21 @@ mod tests {
         assert!(!det.extension_mismatch());
     }
 
+    #[test]
+    fn unsupported_ocaml_extensions_skip_weak_language_heuristics() {
+        let ml = b"open Stdune\nmodule Scheduler = Fiber.Scheduler\nlet main () = Fiber.run Scheduler.go\n";
+        let det = detect(Path::new("scheduler_bench.ml"), ml).unwrap();
+        assert_eq!(det.file_type, FileType::Text);
+        assert_eq!(det.source, DetectionSource::Extension);
+        assert!(!det.extension_mismatch());
+
+        let mli = b"type t\nval create : unit -> t\nval run : t -> unit\n";
+        let det = detect(Path::new("duneboot.mli"), mli).unwrap();
+        assert_eq!(det.file_type, FileType::Text);
+        assert_eq!(det.source, DetectionSource::Extension);
+        assert!(!det.extension_mismatch());
+    }
+
     /// Negative: a `.cargo.toml` file with text content stays in its
     /// declared role via the extension/filename path. Data formats are
     /// listed in `ext::is_data_format` precisely so heuristics doesn't

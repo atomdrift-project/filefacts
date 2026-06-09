@@ -239,6 +239,10 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         // `(- a b)` otherwise scores as JavaScript and fires JS obfuscation
         // rules on e.g. the GCL ANSI test suite. Treat as plain text.
         "lsp" | "lisp" | "el" | "cl" | "scm" => Some(FileType::Text),
+        // OCaml family. No dedicated analyzer; `let`-heavy implementations
+        // otherwise score as JavaScript and `.mli` `val` declarations score
+        // as Kotlin under weak content heuristics. Treat as plain text.
+        "ml" | "mli" | "mll" | "mly" | "mld" | "eliom" | "eliomi" => Some(FileType::Text),
         // SQL dumps/scripts. No dedicated analyzer; large dumps of long INSERT
         // statements otherwise content-score as Batch and fire batch
         // line/token-bloat obfuscation rules. Treat as plain text.
@@ -733,6 +737,25 @@ mod tests {
                 detect_from_path(Path::new(name)),
                 Some(FileType::Text),
                 "{name} should be Text, not JavaScript"
+            );
+        }
+    }
+
+    #[test]
+    fn ocaml_extensions_are_text_not_javascript_or_kotlin() {
+        for name in [
+            "scheduler_bench.ml",
+            "duneboot.mli",
+            "lexer.mll",
+            "parser.mly",
+            "manual.mld",
+            "page.eliom",
+            "page.eliomi",
+        ] {
+            assert_eq!(
+                detect_from_path(Path::new(name)),
+                Some(FileType::Text),
+                "{name} should be Text, not JavaScript or Kotlin"
             );
         }
     }
