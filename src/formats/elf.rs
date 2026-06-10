@@ -1656,6 +1656,15 @@ fn symbols(
             }
         }
     }
+    // File offset of the `.dynstr` table, so each dynamic symbol's name can be
+    // located in the file (`dynstr_offset + st_name`). ELF binds no useful
+    // offset to an import-table *entry*, but the name string itself is a real,
+    // anchorable location — what consumers want to point at.
+    let dynstr_offset = elf
+        .section_headers
+        .iter()
+        .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".dynstr"))
+        .map(|sh| sh.sh_offset);
     for sym in &elf.dynsyms {
         // Hidden + canary on dynsym too.
         if sym.st_bind() == 0 && sym.st_visibility() == 2 {
@@ -1696,7 +1705,9 @@ fn symbols(
                 name: name.to_string(),
                 alias: None,
                 library: None,
-                offset: None,
+                // The symbol name's byte offset in the file (via `.dynstr`).
+                offset: dynstr_offset
+                    .and_then(|base| u64::try_from(sym.st_name).ok().map(|n| base.saturating_add(n))),
                 ordinal: None,
             });
         } else if sym.is_function() || sym.st_info & 0xf == 1 {

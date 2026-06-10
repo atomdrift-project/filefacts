@@ -147,8 +147,9 @@ pub enum Symbol {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         library: Option<String>,
         /// Byte offset within the source file where this import was
-        /// declared. Optional because some formats (notably ELF dynsym)
-        /// don't expose a useful offset for the import-table entry.
+        /// declared. For ELF dynsym this is the symbol *name*'s offset in
+        /// `.dynstr` (the import-table entry itself has no useful offset).
+        /// Optional because some formats expose no anchorable location.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         offset: Option<u64>,
         /// PE ordinal-only imports / dyld trie ordinals when relevant.
