@@ -231,6 +231,9 @@ pub enum Symbol {
         /// Dotted chain like `chrome.cookies.getAll` or
         /// `window.localStorage`.
         path: String,
+        /// Byte offset where this member chain starts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<u64>,
     },
 
     /// One static assignment/binding observed in source code.

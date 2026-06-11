@@ -458,6 +458,9 @@ fn extract_header_and_loads(
         // isn't useful to downstream consumers (they don't seek into
         // it) so we skip it.
         put_u64(values, "macho.code_signature_size", u64::from(cs.datasize));
+        // The blob's file offset — consumers anchor the code-signature
+        // finding's evidence here rather than at the header.
+        put_u64(values, "macho.code_signature_offset", u64::from(cs.dataoff));
         super::macho_code_signature::parse(
             bytes,
             cs.dataoff as usize,
@@ -997,6 +1000,12 @@ fn load_dylibs(macho: &MachO<'_>, values: &mut Values) {
         let path = macho.libs.get(idx).copied().unwrap_or("");
         let mut entry = serde_json::Map::new();
         entry.insert("path".into(), JsonValue::String(path.to_string()));
+        // File offset of this LC_LOAD*_DYLIB load command — where the dylib
+        // reference physically sits, so consumers can anchor evidence there.
+        entry.insert(
+            "offset".into(),
+            JsonValue::Number((lc.offset as u64).into()),
+        );
         entry.insert("kind".into(), JsonValue::String(kind.to_string()));
         entry.insert(
             "path_kind".into(),

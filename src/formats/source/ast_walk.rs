@@ -13,7 +13,7 @@
 //! The walker is language-driven by the [`LangConfig`] passed in; it
 //! contains no language-specific code itself.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use tree_sitter::Node;
 
@@ -53,8 +53,11 @@ pub(super) fn walk(
     for b in state.binds {
         symbols_out.push(b);
     }
-    for chain in state.members {
-        symbols_out.push(Symbol::Member { path: chain });
+    for (path, offset) in state.members {
+        symbols_out.push(Symbol::Member {
+            path,
+            offset: Some(offset),
+        });
     }
     let identifier_count = state.identifiers.len() as u64;
     for (name, offset) in state.identifiers {
@@ -534,7 +537,7 @@ fn is_infinite_loop(node: Node<'_>, source: &str) -> bool {
 struct State {
     calls: Vec<Symbol>,
     binds: Vec<Symbol>,
-    members: BTreeSet<String>,
+    members: BTreeMap<String, u64>,
     /// Dedup'd bare-identifier names with first-seen byte offset.
     /// Captures every identifier-kind token across the file — variable
     /// references, parameter names, type names, function-call targets,
@@ -618,7 +621,9 @@ impl State {
                 if depth_n > self.max_member_chain_depth {
                     self.max_member_chain_depth = depth_n;
                 }
-                self.members.insert(chain);
+                self.members
+                    .entry(chain)
+                    .or_insert(node.start_byte() as u64);
             }
             // Continue walking children so we still find string
             // literals, call expressions, etc. inside member chains.

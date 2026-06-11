@@ -1706,8 +1706,11 @@ fn symbols(
                 alias: None,
                 library: None,
                 // The symbol name's byte offset in the file (via `.dynstr`).
-                offset: dynstr_offset
-                    .and_then(|base| u64::try_from(sym.st_name).ok().map(|n| base.saturating_add(n))),
+                offset: dynstr_offset.and_then(|base| {
+                    u64::try_from(sym.st_name)
+                        .ok()
+                        .map(|n| base.saturating_add(n))
+                }),
                 ordinal: None,
             });
         } else if sym.is_function() || sym.st_info & 0xf == 1 {

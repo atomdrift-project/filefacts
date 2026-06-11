@@ -235,6 +235,23 @@ fn javascript_ast_projection_is_complete() {
         "atob should be a call target, got {targets:?}",
     );
 
+    let chrome_member = parsed
+        .symbols()
+        .iter_kind(SymbolKind::Member)
+        .find_map(|s| match s {
+            Symbol::Member { path, offset } if path == "chrome.cookies.getAll" => *offset,
+            _ => None,
+        });
+    let expected_offset = source
+        .windows(b"chrome.cookies.getAll".len())
+        .position(|window| window == b"chrome.cookies.getAll")
+        .expect("fixture contains chrome member") as u64;
+    assert_eq!(
+        chrome_member,
+        Some(expected_offset),
+        "member chain should carry its first source offset"
+    );
+
     // Parse count must stay at 1 after exercising all five views.
     let _ = parsed.values();
     let _ = parsed.text();
