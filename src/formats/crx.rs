@@ -18,6 +18,8 @@
 //!   `CrxFileHeader` whose first `sha256_with_rsa` proof carries the
 //!   public key.
 
+use std::io::Read;
+
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
@@ -33,7 +35,43 @@ pub(super) fn extract(
     // Header decode is best-effort identity enrichment; a malformed
     // header must not stop the ZIP walk.
     header(bytes, values);
-    super::zip::extract(bytes, values, metrics, archive_members)
+    let mut archive = super::zip::open_archive(bytes)?;
+    super::zip::extract_from_archive(&mut archive, bytes, values, metrics, archive_members)?;
+    // The extension's `manifest.json` carries the developer-declared
+    // author and homepage — the human identity behind the signing key.
+    if let Some(manifest) = read_manifest(&mut archive) {
+        emit_manifest_identity(&manifest, values);
+    }
+    Ok(())
+}
+
+/// Read and parse the root `manifest.json` of an opened CRX archive.
+fn read_manifest<R: Read + std::io::Seek>(zip: &mut ::zip::ZipArchive<R>) -> Option<JsonValue> {
+    const MAX: u64 = 512 * 1024;
+    let member = zip.by_name("manifest.json").ok()?;
+    let mut buf = Vec::new();
+    member.take(MAX).read_to_end(&mut buf).ok()?;
+    serde_json::from_slice(&buf).ok()
+}
+
+/// Emit `crx.author` / `crx.author_email` / `crx.homepage_url` from a
+/// parsed Chrome `manifest.json`. `author` may be a bare string or an
+/// `{ "email": … }` object (MV3).
+fn emit_manifest_identity(manifest: &JsonValue, values: &mut Values) {
+    match manifest.get("author") {
+        Some(JsonValue::String(s)) if !s.is_empty() => {
+            values.insert("crx.author", JsonValue::String(s.clone()));
+        }
+        Some(JsonValue::Object(o)) => {
+            if let Some(email) = o.get("email").and_then(JsonValue::as_str) {
+                values.insert("crx.author_email", JsonValue::String(email.to_string()));
+            }
+        }
+        _ => {}
+    }
+    if let Some(url) = manifest.get("homepage_url").and_then(JsonValue::as_str) {
+        values.insert("crx.homepage_url", JsonValue::String(url.to_string()));
+    }
 }
 
 fn header(bytes: &[u8], values: &mut Values) {

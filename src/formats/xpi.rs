@@ -87,7 +87,46 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         values.insert("xpi.unsigned_shape", JsonValue::Bool(true));
     }
 
+    // The WebExtension manifest declares the add-on's author and name —
+    // the human identity behind a (possibly self-signed) XPI.
+    if has_manifest_json {
+        if let Some(manifest) = read_manifest(zip) {
+            emit_manifest_identity(&manifest, values);
+        }
+    }
+
     Ok(())
+}
+
+/// Read and parse the root `manifest.json` of an opened XPI.
+fn read_manifest<R: Read + Seek>(zip: &mut ::zip::ZipArchive<R>) -> Option<JsonValue> {
+    const MAX: u64 = 512 * 1024;
+    let member = zip.by_name("manifest.json").ok()?;
+    let mut buf = Vec::new();
+    member.take(MAX).read_to_end(&mut buf).ok()?;
+    serde_json::from_slice(&buf).ok()
+}
+
+/// Emit `xpi.author` / `xpi.homepage_url` and a non-localized name from a
+/// parsed WebExtension `manifest.json`. `name` is skipped when it is an
+/// `__MSG_*__` localization placeholder.
+fn emit_manifest_identity(manifest: &JsonValue, values: &mut Values) {
+    if let Some(author) = manifest.get("author").and_then(JsonValue::as_str) {
+        if !author.is_empty() {
+            values.insert("xpi.author", JsonValue::String(author.to_string()));
+        }
+    }
+    if let Some(url) = manifest.get("homepage_url").and_then(JsonValue::as_str) {
+        values.insert("xpi.homepage_url", JsonValue::String(url.to_string()));
+    }
+    if let Some(name) = manifest.get("name").and_then(JsonValue::as_str) {
+        if !name.is_empty() && !name.starts_with("__MSG_") {
+            values.insert("xpi.name", JsonValue::String(name.to_string()));
+        }
+    }
+    if let Some(version) = manifest.get("version").and_then(JsonValue::as_str) {
+        values.insert("xpi.version", JsonValue::String(version.to_string()));
+    }
 }
 
 #[cfg(test)]

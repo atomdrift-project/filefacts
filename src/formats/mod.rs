@@ -57,6 +57,7 @@ mod macho_code_signature;
 mod macho_hashes;
 mod markdown;
 mod npm;
+mod nupkg;
 mod ole2;
 mod ooxml;
 mod pdf;
@@ -72,6 +73,7 @@ mod png;
 mod pyc;
 mod rpm;
 mod rtf;
+mod rust_crate;
 pub(crate) mod source;
 mod structured;
 mod tar;
@@ -117,12 +119,18 @@ pub(crate) fn extract(
         | FileType::ApkAndroid
         | FileType::Conda
         | FileType::Egg
-        | FileType::Nupkg
         | FileType::Ipa => {
-            // Zip-based packages (Android apk, conda, egg, nupkg, ipa):
-            // the generic archive walk surfaces their member listing and the
-            // identity manifests inside (PKG-INFO, *.nuspec, Info.plist, …).
+            // Zip-based packages (Android apk, conda, egg, ipa): the generic
+            // archive walk surfaces their member listing and the identity
+            // manifests inside (PKG-INFO, Info.plist, …).
             zip::extract(bytes, values, metrics, archive_members)
+        }
+        FileType::Nupkg => {
+            // Open the ZIP once: generic archive facts, then the inner
+            // `.nuspec` for the nupkg.* NuGet publisher identity.
+            let mut archive = zip::open_archive(bytes)?;
+            zip::extract_from_archive(&mut archive, bytes, values, metrics, archive_members)?;
+            nupkg::extract_from_archive(&mut archive, values, metrics)
         }
         FileType::Vsix => {
             // Open the ZIP container once: generic archive facts first,
@@ -175,12 +183,15 @@ pub(crate) fn extract(
         FileType::Tar | FileType::TarGz | FileType::TarBz2 | FileType::TarXz | FileType::TarZst => {
             tar::extract(bytes, file_type, values, metrics, archive_members)
         }
-        // Compressed-tar packages (Alpine apk, crate, FreeBSD/Arch pkg):
-        // same handling as the other compressed-tar variants — format label
-        // only; cleave decompresses and re-submits the members.
-        FileType::ApkAlpine | FileType::Crate | FileType::PkgFreebsd | FileType::PkgArch => {
+        // Compressed-tar packages (Alpine apk, FreeBSD/Arch pkg): same
+        // handling as the other compressed-tar variants — format label only;
+        // cleave decompresses and re-submits the members.
+        FileType::ApkAlpine | FileType::PkgFreebsd | FileType::PkgArch => {
             tar::extract(bytes, file_type, values, metrics, archive_members)
         }
+        // A Rust `.crate` is a gzipped tar: walk it, then read the embedded
+        // `Cargo.toml` for the crate.* publisher identity.
+        FileType::Crate => rust_crate::extract(bytes, file_type, values, metrics, archive_members),
         // An npm package is a gzipped tar: walk it for the member listing,
         // then read `package/package.json` for the npm.* publisher identity.
         FileType::Npm => npm::extract(bytes, file_type, values, metrics, archive_members),

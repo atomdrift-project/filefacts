@@ -56,9 +56,13 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Iden
         FileType::MachO => macho(values, bytes, &mut id),
         FileType::Pe => pe(values, &mut id),
         FileType::Vsix | FileType::VsixManifest => vsix(values, &mut id),
+        FileType::Xpi => xpi(values, &mut id),
+        FileType::Nupkg => nupkg(values, &mut id),
         FileType::Whl => wheel(values, &mut id),
+        FileType::Jar => jar(values, &mut id),
         FileType::Gem => gem(values, &mut id),
         FileType::Npm | FileType::PackageJson => npm(values, &mut id),
+        FileType::Crate => rust_crate(values, &mut id),
         FileType::Crx => crx(values, &mut id),
         FileType::Ooxml | FileType::OleDoc => office(values, &mut id),
         FileType::Pdf => pdf(values, &mut id),
@@ -250,11 +254,67 @@ fn crx(values: &Values, id: &mut Identity) {
         id.unique_ids
             .insert("public_key_sha256".into(), pk.to_string());
     }
+    // Developer-declared author from the extension manifest.
+    push_author(
+        id,
+        get_str(values, "crx.author").map(str::to_string),
+        get_str(values, "crx.author_email").map(str::to_string),
+        None,
+        "author",
+        "crx.author",
+    );
+    if let Some(home) = get_str(values, "crx.homepage_url") {
+        push_url(id, UrlKind::Homepage, home, "crx.homepage_url");
+    }
 }
 
 // ---------------------------------------------------------------------
 // Package manifests — claimed identity.
 // ---------------------------------------------------------------------
+
+fn xpi(values: &Values, id: &mut Identity) {
+    if let Some(name) = get_str(values, "xpi.name") {
+        id.name = Some(Claim::claimed(name, "xpi.name"));
+    }
+    if let Some(version) = get_str(values, "xpi.version") {
+        id.version = Some(Claim::claimed(version, "xpi.version"));
+    }
+    push_author(
+        id,
+        get_str(values, "xpi.author").map(str::to_string),
+        None,
+        None,
+        "author",
+        "xpi.author",
+    );
+    if let Some(home) = get_str(values, "xpi.homepage_url") {
+        push_url(id, UrlKind::Homepage, home, "xpi.homepage_url");
+    }
+}
+
+fn nupkg(values: &Values, id: &mut Identity) {
+    if let Some(pkg_id) = get_str(values, "nupkg.id") {
+        id.identifier = Some(Claim::claimed(pkg_id, "nupkg.id"));
+    }
+    if let Some(name) = get_str(values, "nupkg.title").or_else(|| get_str(values, "nupkg.id")) {
+        id.name = Some(Claim::claimed(name, "nupkg.title"));
+    }
+    if let Some(version) = get_str(values, "nupkg.version") {
+        id.version = Some(Claim::claimed(version, "nupkg.version"));
+    }
+    for author in split_list(get_str(values, "nupkg.authors")) {
+        push_author(id, Some(author), None, None, "author", "nupkg.authors");
+    }
+    for owner in split_list(get_str(values, "nupkg.owners")) {
+        push_author(id, Some(owner), None, None, "owner", "nupkg.owners");
+    }
+    if let Some(url) = get_str(values, "nupkg.project_url") {
+        push_url(id, UrlKind::Homepage, url, "nupkg.project_url");
+    }
+    if let Some(url) = get_str(values, "nupkg.repository_url") {
+        push_url(id, UrlKind::Repository, url, "nupkg.repository_url");
+    }
+}
 
 fn vsix(values: &Values, id: &mut Identity) {
     if let Some(ext_id) = get_str(values, "vsix.identity.id") {
@@ -282,6 +342,59 @@ fn wheel(values: &Values, id: &mut Identity) {
     }
     if let Some(version) = get_str(values, "whl.version") {
         id.version = Some(Claim::claimed(version, "whl.version"));
+    }
+    // Authorship from the dist-info METADATA. `*-email` fields may carry a
+    // bare address or a `Name <email>` pair.
+    let (a_name, a_email) = split_contact(
+        get_str(values, "whl.author"),
+        get_str(values, "whl.author_email"),
+    );
+    push_author(id, a_name, a_email, None, "author", "whl.author");
+    let (m_name, m_email) = split_contact(
+        get_str(values, "whl.maintainer"),
+        get_str(values, "whl.maintainer_email"),
+    );
+    push_author(id, m_name, m_email, None, "maintainer", "whl.maintainer");
+    if let Some(home) = get_str(values, "whl.home_page") {
+        push_url(id, UrlKind::Homepage, home, "whl.home_page");
+    }
+}
+
+fn jar(values: &Values, id: &mut Identity) {
+    if let Some(name) = get_str(values, "jar.manifest.implementation_title")
+        .or_else(|| get_str(values, "jar.pom.artifact_id"))
+    {
+        id.name = Some(Claim::claimed(name, "jar.manifest.implementation_title"));
+    }
+    if let Some(version) = get_str(values, "jar.manifest.implementation_version")
+        .or_else(|| get_str(values, "jar.pom.version"))
+    {
+        id.version = Some(Claim::claimed(
+            version,
+            "jar.manifest.implementation_version",
+        ));
+    }
+    // Maven coordinates form a stable `group:artifact` identifier.
+    if let (Some(group), Some(artifact)) = (
+        get_str(values, "jar.pom.group_id"),
+        get_str(values, "jar.pom.artifact_id"),
+    ) {
+        id.identifier = Some(Claim::claimed(format!("{group}:{artifact}"), "jar.pom"));
+    }
+    if let Some(vendor) = get_str(values, "jar.manifest.implementation_vendor")
+        .or_else(|| get_str(values, "jar.manifest.bundle_vendor"))
+        .or_else(|| get_str(values, "jar.manifest.specification_vendor"))
+    {
+        id.organization = Some(Claim::claimed(vendor, "jar.manifest.implementation_vendor"));
+    }
+    if let Some(producer) = get_str(values, "jar.manifest.created_by") {
+        id.producer = Some(Claim::claimed(producer, "jar.manifest.created_by"));
+    }
+    // `Built-By` is the build account — an origin-host artifact, the JAR
+    // analogue of a binary's embedded build path.
+    if let Some(built_by) = get_str(values, "jar.manifest.built_by") {
+        id.unique_ids
+            .insert("build_user".into(), built_by.to_string());
     }
 }
 
@@ -344,6 +457,26 @@ fn npm(values: &Values, id: &mut Identity) {
     }
     if let Some(home) = get_str(values, "npm.homepage") {
         push_url(id, UrlKind::Homepage, home, "npm.homepage");
+    }
+}
+
+fn rust_crate(values: &Values, id: &mut Identity) {
+    if let Some(name) = get_str(values, "crate.name") {
+        id.name = Some(Claim::claimed(name, "crate.name"));
+        id.identifier = Some(Claim::claimed(name, "crate.name"));
+    }
+    if let Some(version) = get_str(values, "crate.version") {
+        id.version = Some(Claim::claimed(version, "crate.version"));
+    }
+    for author in str_array(values, "crate.authors") {
+        let (name, email, _) = parse_person(author);
+        push_author(id, name, email, None, "author", "crate.authors");
+    }
+    if let Some(repo) = get_str(values, "crate.repository") {
+        push_url(id, UrlKind::Repository, repo, "crate.repository");
+    }
+    if let Some(home) = get_str(values, "crate.homepage") {
+        push_url(id, UrlKind::Homepage, home, "crate.homepage");
     }
 }
 
@@ -718,6 +851,29 @@ fn between(s: &str, open: char, close: char) -> Option<String> {
     (!inner.is_empty()).then(|| inner.to_string())
 }
 
+/// Resolve a separate name field and an email field (which may itself be
+/// a bare address or a `Name <email>` pair) into `(name, email)`. The
+/// dedicated name field wins; otherwise a name embedded in the email
+/// field is used.
+fn split_contact(name: Option<&str>, email: Option<&str>) -> (Option<String>, Option<String>) {
+    let mut display = name.map(str::to_string);
+    let mut addr = None;
+    if let Some(raw) = email {
+        if let Some(inner) = between(raw, '<', '>') {
+            addr = Some(inner);
+            if display.is_none() {
+                let embedded = raw[..raw.find('<').unwrap_or(raw.len())].trim();
+                if !embedded.is_empty() {
+                    display = Some(embedded.to_string());
+                }
+            }
+        } else if !raw.is_empty() {
+            addr = Some(raw.to_string());
+        }
+    }
+    (display, addr)
+}
+
 /// Scan for a `KEY:value` token (Apple `what(1)` stamps), returning the
 /// value up to the next whitespace / control byte.
 fn scan_token(bytes: &[u8], needle: &[u8]) -> Option<String> {
@@ -749,6 +905,18 @@ fn str_array<'a>(values: &'a Values, key: &str) -> impl Iterator<Item = &'a str>
         .filter_map(JsonValue::as_str)
 }
 
+/// Split a comma-separated field (NuGet `authors`/`owners`) into trimmed,
+/// non-empty entries.
+fn split_list(value: Option<&str>) -> Vec<String> {
+    value
+        .into_iter()
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn flag_set(values: &Values, key: &str, flag: &str) -> bool {
     values
         .get(key)
@@ -765,6 +933,16 @@ fn push_author(
     source: &str,
 ) {
     if name.is_none() && email.is_none() {
+        return;
+    }
+    // Drop a duplicate party — the same person often appears under more
+    // than one role (NuGet author == owner, npm author == maintainer).
+    // The first role seen wins.
+    if id
+        .authors
+        .iter()
+        .any(|a| a.name == name && a.email == email)
+    {
         return;
     }
     id.authors.push(Party {

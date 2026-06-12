@@ -136,6 +136,12 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
 
     if has_metadata {
         values.insert("whl.has_metadata", JsonValue::Bool(true));
+        // The dist-info `METADATA` is an RFC 822 header block (PEP 566).
+        // Pull the authorship fields — the publisher identity a wheel
+        // carries that the filename and dir name don't.
+        if let Some(meta) = read_text_member(zip, &format!("{dist_info}/METADATA")) {
+            emit_metadata_authors(&meta, values);
+        }
     }
     if has_wheel {
         values.insert("whl.has_wheel", JsonValue::Bool(true));
@@ -240,6 +246,45 @@ fn ends_with_so_versioned(basename: &str) -> bool {
         && chars.next().is_some()
 }
 
+/// Read a zip member as UTF-8 text, capped so a hostile member can't
+/// balloon memory. Returns `None` on any failure.
+fn read_text_member<R: Read + Seek>(zip: &mut ::zip::ZipArchive<R>, name: &str) -> Option<String> {
+    const MAX: u64 = 256 * 1024;
+    let member = zip.by_name(name).ok()?;
+    let mut buf = Vec::new();
+    member.take(MAX).read_to_end(&mut buf).ok()?;
+    String::from_utf8(buf).ok()
+}
+
+/// Emit `whl.author` / `whl.maintainer` (+ `_email`) and `whl.home_page`
+/// from an RFC 822 `METADATA` header block. Headers end at the first
+/// blank line (the long `Description` body follows); only the first
+/// occurrence of each field is taken, and `UNKNOWN` placeholders skipped.
+fn emit_metadata_authors(meta: &str, values: &mut Values) {
+    let put_first = |values: &mut Values, key: &str, val: &str| {
+        if !val.is_empty() && val != "UNKNOWN" && values.get(key).is_none() {
+            values.insert(key, JsonValue::String(val.to_string()));
+        }
+    };
+    for line in meta.lines() {
+        if line.is_empty() {
+            break;
+        }
+        let Some((field, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match field.trim().to_ascii_lowercase().as_str() {
+            "author" => put_first(values, "whl.author", value),
+            "author-email" => put_first(values, "whl.author_email", value),
+            "maintainer" => put_first(values, "whl.maintainer", value),
+            "maintainer-email" => put_first(values, "whl.maintainer_email", value),
+            "home-page" => put_first(values, "whl.home_page", value),
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +313,31 @@ mod tests {
             extract_from_archive(&mut zip, &mut v, &mut m).unwrap();
         }
         (v, m)
+    }
+
+    #[test]
+    fn metadata_author_fields_are_extracted() {
+        let whl = build_whl(&[
+            ("mypkg/__init__.py", b""),
+            (
+                "mypkg-1.0.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: mypkg\nVersion: 1.0.0\nAuthor: trtkajko\nAuthor-email: <mail@mail.com>\nHome-page: https://example.test\n\nLong description body\n",
+            ),
+            ("mypkg-1.0.0.dist-info/RECORD", b"mypkg/__init__.py,,0\n"),
+        ]);
+        let (v, _) = run(&whl);
+        assert_eq!(
+            v.get("whl.author").and_then(|x| x.as_str()),
+            Some("trtkajko")
+        );
+        assert_eq!(
+            v.get("whl.author_email").and_then(|x| x.as_str()),
+            Some("<mail@mail.com>")
+        );
+        assert_eq!(
+            v.get("whl.home_page").and_then(|x| x.as_str()),
+            Some("https://example.test")
+        );
     }
 
     #[test]
