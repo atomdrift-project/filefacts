@@ -211,6 +211,15 @@ fn single_arch(
 /// resolving dylib stem), `macho-trie` for exports recovered from
 /// the dyld export trie.
 fn extract_symbols(macho: &MachO<'_>, symbols_out: &mut crate::Symbols) {
+    // Map each undefined external symbol to the file offset of its name in
+    // the `LC_SYMTAB` string table. goblin's `Import::offset` is the dyld
+    // *bind* slot (a pointer in `__got`/`__DATA`, binary data), but every
+    // other consumer anchors a symbol at its human-readable name — ELF
+    // imports point into `.dynstr`, and the hex/context view expects to
+    // render the name's ASCII. Anchoring imports at the name string keeps
+    // Mach-O consistent with ELF and makes the annotated bytes readable.
+    let name_offsets = import_name_offsets(macho);
+
     // Imports — dylib stems are normalised to the bare library name
     // (lowercased, basename only, `.dylib`/`.tbd` suffix stripped) so
     // trait authors can match against `"libsystem.b"` rather than
@@ -218,11 +227,15 @@ fn extract_symbols(macho: &MachO<'_>, symbols_out: &mut crate::Symbols) {
     if let Ok(imports) = macho.imports() {
         for imp in &imports {
             let library = normalize_dylib_path(imp.dylib);
+            // Prefer the name-string offset; fall back to the bind slot
+            // when the symbol has no `LC_SYMTAB` entry (rare, e.g.
+            // dyld-info-only binaries).
+            let offset = name_offsets.get(imp.name).copied().unwrap_or(imp.offset);
             symbols_out.push(crate::Symbol::Import {
                 name: imp.name.to_string(),
                 alias: None,
                 library: Some(library),
-                offset: Some(imp.offset),
+                offset: Some(offset),
                 ordinal: None,
             });
         }
@@ -248,6 +261,45 @@ fn extract_symbols(macho: &MachO<'_>, symbols_out: &mut crate::Symbols) {
         }
         // Export count flows through cross-format `exports.count`.
     }
+}
+
+/// Build a map from undefined-external symbol name to the file offset of
+/// that name in the `LC_SYMTAB` string table (`stroff + n_strx`).
+///
+/// These are the binary's imports as recorded in the static symbol table.
+/// goblin's `SymbolIterator` already resolves each `nlist` to its name, so
+/// we only need the absolute `stroff` from the symtab load command to turn
+/// the relative `n_strx` into a file offset. Returns an empty map when the
+/// binary is stripped (no `LC_SYMTAB`) — callers fall back to the bind slot.
+fn import_name_offsets<'a>(macho: &MachO<'a>) -> std::collections::HashMap<&'a str, u64> {
+    const N_EXT: u8 = 0x01;
+    const N_TYPE_MASK: u8 = 0x0e;
+    const N_UNDF: u8 = 0x00;
+
+    let mut offsets = std::collections::HashMap::new();
+    let Some(stroff) = macho.load_commands.iter().find_map(|lc| match lc.command {
+        mach::load_command::CommandVariant::Symtab(st) => Some(u64::from(st.stroff)),
+        _ => None,
+    }) else {
+        return offsets;
+    };
+
+    for sym in macho.symbols() {
+        let Ok((name, nlist)) = sym else { continue };
+        // External + undefined == imported symbol; `n_strx == 0` has no name.
+        if nlist.n_type & N_EXT == 0
+            || nlist.n_type & N_TYPE_MASK != N_UNDF
+            || nlist.n_strx == 0
+            || name.is_empty()
+        {
+            continue;
+        }
+        // First occurrence wins; duplicate undefined entries are degenerate.
+        offsets
+            .entry(name)
+            .or_insert_with(|| stroff + nlist.n_strx as u64);
+    }
+    offsets
 }
 
 /// Reduce a recorded dylib path to its bare library stem, lowercased.
