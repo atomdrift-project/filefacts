@@ -148,7 +148,10 @@ pub enum Symbol {
         library: Option<String>,
         /// Byte offset within the source file where this import was
         /// declared. For ELF dynsym this is the symbol *name*'s offset in
-        /// `.dynstr` (the import-table entry itself has no useful offset).
+        /// `.dynstr`, and for Mach-O it is the name's offset in the
+        /// `LC_SYMTAB` string table (the import-table entry itself — an
+        /// `__got` bind slot — holds only a pointer). Anchoring at the name
+        /// keeps the location human-readable and consistent across formats.
         /// Optional because some formats expose no anchorable location.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         offset: Option<u64>,

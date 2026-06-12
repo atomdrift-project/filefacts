@@ -26,6 +26,7 @@
 
 mod archive;
 mod errors;
+mod identity;
 mod metrics;
 mod sections;
 mod strings;
@@ -34,6 +35,7 @@ mod values;
 
 pub use archive::{ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership};
 pub use errors::{ErrorKind, Errors, ParseError, Stage};
+pub use identity::{Claim, Identity, Party, Signer, Trust, Url, UrlKind};
 pub use metrics::Metrics;
 pub use sections::{Section, Sections};
 pub use strings::{Comments, ExtractedString, Literals, Text};

@@ -93,9 +93,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub use error::Error;
 pub use fileid::{FileId, FileType};
 pub use output::{
-    ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Arg, ArgShape, Comments,
-    ErrorKind, Errors, ExtractedString, Literals, Metrics, ParseError, Section, Sections, Stage,
-    Symbol, SymbolKind, Symbols, Text, Values,
+    ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Arg, ArgShape, Claim,
+    Comments, ErrorKind, Errors, ExtractedString, Identity, Literals, Metrics, ParseError, Party,
+    Section, Sections, Signer, Stage, Symbol, SymbolKind, Symbols, Text, Trust, Url, UrlKind,
+    Values,
 };
 
 /// Schema version of the public output shape.
@@ -117,7 +118,12 @@ pub use output::{
 /// extracted language string literals). The `StringCategory` enum and
 /// `ExtractedString.category` field are removed; the container
 /// identifies the tier.
-pub const SCHEMA_VERSION: &str = "6";
+///
+/// **v7** — adds the [`Identity`] view: normalized, cross-format
+/// identity claims (name, identifier, project, signer, trust tier,
+/// authors, document title/producer, unique ids) folded out of the
+/// per-format structural values, each tagged claimed-vs-verified.
+pub const SCHEMA_VERSION: &str = "7";
 
 /// A file with its bytes and lazily-computed metadata views.
 ///
@@ -187,6 +193,7 @@ struct Extracted {
     archive_members: Vec<ArchiveMember>,
     sections: Sections,
     symbols: Symbols,
+    identity: Identity,
     errors: Errors,
 }
 
@@ -276,6 +283,16 @@ impl<'a> ParsedFile<'a> {
     /// depends on the file type. Filter with [`Symbols::iter_kind`].
     pub fn symbols(&self) -> &Symbols {
         &self.extracted().symbols
+    }
+
+    /// Normalized identity claims: who and what the artifact says it
+    /// is, folded across formats into one shape and tagged
+    /// claimed-vs-verified. Computed on first access and cached.
+    ///
+    /// Empty (see [`Identity::is_empty`]) for files that assert no
+    /// identity and carry no signature.
+    pub fn identity(&self) -> &Identity {
+        &self.extracted().identity
     }
 
     /// Non-fatal extraction errors encountered during the parse.
@@ -467,6 +484,13 @@ fn run_extraction(
         metrics.insert("parse.error_count", errors.len() as f64);
     }
 
+    // Fold the per-format structural values into the normalized,
+    // cross-format identity view. Runs last so it can read everything
+    // every extractor wrote (signature fields, manifest claims,
+    // document properties). Never fails — absent inputs yield an empty
+    // identity.
+    let identity = formats::identity::derive(file_type, bytes, &values);
+
     Extracted {
         values,
         strings,
@@ -474,6 +498,7 @@ fn run_extraction(
         archive_members,
         sections,
         symbols,
+        identity,
         errors,
     }
 }

@@ -81,6 +81,7 @@ enum View {
     Metrics,
     Sections,
     Symbols,
+    Identity,
     Imports,
     Exports,
     Functions,
@@ -223,6 +224,7 @@ fn write_json(parsed: &filefacts::ParsedFile<'_>, view: View) -> std::io::Result
                 metrics: parsed.metrics(),
                 sections: parsed.sections(),
                 symbols: parsed.symbols(),
+                identity: parsed.identity(),
                 errors: parsed.errors(),
             },
         )?,
@@ -233,6 +235,7 @@ fn write_json(parsed: &filefacts::ParsedFile<'_>, view: View) -> std::io::Result
         View::Metrics => serde_json::to_writer_pretty(&mut out, parsed.metrics())?,
         View::Sections => serde_json::to_writer_pretty(&mut out, parsed.sections())?,
         View::Symbols => serde_json::to_writer_pretty(&mut out, parsed.symbols())?,
+        View::Identity => serde_json::to_writer_pretty(&mut out, parsed.identity())?,
         View::Imports => {
             serde_json::to_writer_pretty(&mut out, &symbols_of_kind(parsed, SymbolKind::Import))?
         }
@@ -271,6 +274,7 @@ struct Facts<'a> {
     metrics: &'a filefacts::Metrics,
     sections: &'a filefacts::Sections,
     symbols: &'a filefacts::Symbols,
+    identity: &'a filefacts::Identity,
     errors: &'a filefacts::Errors,
 }
 
@@ -293,6 +297,7 @@ fn build_output(parsed: &filefacts::ParsedFile<'_>, view: View) -> Value {
             metrics: parsed.metrics(),
             sections: parsed.sections(),
             symbols: parsed.symbols(),
+            identity: parsed.identity(),
             errors: parsed.errors(),
         }),
         View::Fileid => serde_json::to_value(parsed.fileid()),
@@ -302,6 +307,7 @@ fn build_output(parsed: &filefacts::ParsedFile<'_>, view: View) -> Value {
         View::Metrics => serde_json::to_value(parsed.metrics()),
         View::Sections => serde_json::to_value(parsed.sections()),
         View::Symbols => serde_json::to_value(parsed.symbols()),
+        View::Identity => serde_json::to_value(parsed.identity()),
         View::Imports => serde_json::to_value(symbols_of_kind(parsed, SymbolKind::Import)),
         View::Exports => serde_json::to_value(symbols_of_kind(parsed, SymbolKind::Export)),
         View::Functions => serde_json::to_value(symbols_of_kind(parsed, SymbolKind::Function)),
@@ -344,6 +350,7 @@ fn parse_args() -> Result<ParseOutcome, String> {
             "--metrics" => set_view(&mut args.view, View::Metrics)?,
             "--sections" => set_view(&mut args.view, View::Sections)?,
             "--symbols" => set_view(&mut args.view, View::Symbols)?,
+            "--identity" => set_view(&mut args.view, View::Identity)?,
             "--imports" => set_view(&mut args.view, View::Imports)?,
             "--exports" => set_view(&mut args.view, View::Exports)?,
             "--functions" => set_view(&mut args.view, View::Functions)?,
@@ -393,6 +400,7 @@ fn parse_view(value: &str) -> Option<View> {
         "metrics" => View::Metrics,
         "sections" => View::Sections,
         "symbols" => View::Symbols,
+        "identity" => View::Identity,
         "imports" => View::Imports,
         "exports" => View::Exports,
         "functions" => View::Functions,
@@ -534,6 +542,12 @@ fn format_terminal(
     match view {
         View::All => {
             render_section(&mut out, "fileid", output.get("fileid"), render_fileid);
+            render_section(
+                &mut out,
+                "identity",
+                output.get("identity"),
+                render_values_tree,
+            );
             render_section(&mut out, "values", output.get("values"), render_values_tree);
             render_section(&mut out, "text", output.get("text"), render_strings);
             render_section(&mut out, "literals", output.get("literals"), render_strings);
@@ -561,6 +575,7 @@ fn format_terminal(
                 View::Metrics => Box::new(render_metrics),
                 View::Sections => Box::new(|v| render_sections(v, None)),
                 View::Symbols => Box::new(render_symbols),
+                View::Identity => Box::new(render_values_tree),
                 View::Imports => Box::new(render_imports),
                 View::Exports => Box::new(render_exports),
                 View::Functions => Box::new(render_functions),
@@ -1577,6 +1592,7 @@ impl View {
             Self::Metrics => "metrics",
             Self::Sections => "sections",
             Self::Symbols => "symbols",
+            Self::Identity => "identity",
             Self::Imports => "imports",
             Self::Exports => "exports",
             Self::Functions => "functions",
@@ -1594,8 +1610,8 @@ fn print_usage(to_stderr: bool) {
 usage: filefacts [options] [view] <path>
 
 views:
-  fileid values text literals metrics sections symbols imports exports
-  functions calls members binds identifiers errors
+  fileid identity values text literals metrics sections symbols imports
+  exports functions calls members binds identifiers errors
 
 options:
   -f, --format <terminal|json>
@@ -1607,6 +1623,7 @@ options:
   --metrics          Emit only derived metrics.
   --sections         Emit only binary sections.
   --symbols          Emit the full Symbols view (all kinds).
+  --identity         Emit only the normalized identity claims.
   --imports          Emit only import symbols.
   --exports          Emit only export symbols.
   --functions        Emit only function symbols.

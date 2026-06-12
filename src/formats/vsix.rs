@@ -19,11 +19,36 @@
 //! - `vsix.properties.<id>` — `<Property Id="…" Value="…" />` pairs,
 //!   with the `Microsoft.VisualStudio.` prefix stripped.
 
+use std::io::{Read, Seek};
+
 use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::{extract_ascii_strings, put_str};
 use crate::output::{Metrics, Strings, Values};
+
+/// Manifests above this are not legitimate — stop reading rather than
+/// buffer a zip-bomb member.
+const MAX_MANIFEST: u64 = 4 << 20;
+
+/// Parse the `extension.vsixmanifest` member of an opened `.vsix`
+/// container so the ZIP-wrapped package surfaces the same
+/// `vsix.identity.*` facts as the bare manifest. Silent when absent.
+pub(super) fn extract_from_archive<R: Read + Seek>(
+    zip: &mut ::zip::ZipArchive<R>,
+    values: &mut Values,
+    strings: &mut Strings,
+    metrics: &mut Metrics,
+) -> Result<(), Error> {
+    let Ok(member) = zip.by_name("extension.vsixmanifest") else {
+        return Ok(());
+    };
+    let mut buf = Vec::new();
+    if member.take(MAX_MANIFEST).read_to_end(&mut buf).is_err() {
+        return Ok(());
+    }
+    extract(&buf, values, strings, metrics)
+}
 
 pub(super) fn extract(
     bytes: &[u8],

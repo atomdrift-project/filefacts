@@ -1702,6 +1702,11 @@ mod tests {
     }
 
     fn run(bytes: &[u8]) -> (Values, Strings, Metrics) {
+        let (v, s, m, _) = run_with_symbols(bytes);
+        (v, s, m)
+    }
+
+    fn run_with_symbols(bytes: &[u8]) -> (Values, Strings, Metrics, crate::Symbols) {
         let mut v = Values::new();
         let mut s = Strings::default();
         let mut m = Metrics::new();
@@ -1717,7 +1722,48 @@ mod tests {
             &mut symbols,
             &mut errors,
         );
-        (v, s, m)
+        (v, s, m, symbols)
+    }
+
+    /// Every Mach-O import offset must anchor at the symbol *name* in the
+    /// `LC_SYMTAB` string table — the bytes at that offset spell the name
+    /// (NUL-terminated), human-readable and consistent with ELF `.dynstr`.
+    /// Regression guard for the universal-binary hex view, which rendered
+    /// `__got` bind-slot pointer bytes (pure binary) before this anchor was
+    /// introduced.
+    #[test]
+    fn import_offsets_anchor_at_name_string() {
+        use crate::output::Symbol;
+        let bytes = read_fixture("test.macho");
+        let (_, _, _, symbols) = run_with_symbols(&bytes);
+
+        let mut checked = 0;
+        for sym in symbols.iter() {
+            let Symbol::Import {
+                name,
+                offset: Some(off),
+                ..
+            } = sym
+            else {
+                continue;
+            };
+            let off = *off as usize;
+            // The string-table entry is the name followed by a NUL.
+            let end = off + name.len();
+            assert!(
+                bytes.get(off..end) == Some(name.as_bytes()) && bytes.get(end) == Some(&0u8),
+                "import {name:?} offset {off:#x} should point at its NUL-terminated \
+                 name in LC_SYMTAB, found {:?}",
+                bytes
+                    .get(off..end.min(bytes.len()))
+                    .map(String::from_utf8_lossy)
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "fixture should expose at least one import with an offset"
+        );
     }
 
     fn read_fixture(name: &str) -> Vec<u8> {

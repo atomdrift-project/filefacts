@@ -1,14 +1,14 @@
 //! Disk cache for filefacts analysis output.
 //!
-//! Mirrors cleave's `~/.cache/cleave/re/` cache shape but lives under
-//! a separate filefacts-owned directory so the two caches can evolve
+//! Mirrors cleave's `~/.cache/atomdrift/cleave/re/` cache shape but lives
+//! under a separate filefacts-owned directory so the two caches can evolve
 //! independently during the cleave->filefacts rizin migration. After Wave
 //! D the cleave cache goes away and this is the canonical store.
 //!
 //! # Layout
 //!
 //! ```text
-//! {cache_dir}/filefacts/v{SCHEMA_VERSION}/{sha[0..2]}/{sha}.bin
+//! {cache_dir}/atomdrift/filefacts/v{SCHEMA_VERSION}/{sha[0..2]}/{sha}.bin
 //! ```
 //!
 //! The two-character shard keeps any single directory bounded; the
@@ -62,11 +62,12 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Root cache directory for filefacts. Returns the first writable
-/// candidate from (OS cache dir + `filefacts`) → temp dir + `filefacts-cache`.
+/// candidate from (OS cache dir + `atomdrift/filefacts`) → temp dir +
+/// `filefacts-cache`.
 pub fn cache_root() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(base) = dirs::cache_dir() {
-        candidates.push(base.join("filefacts"));
+        candidates.push(base.join("atomdrift").join("filefacts"));
     }
     candidates.push(std::env::temp_dir().join("filefacts-cache"));
     for c in candidates {

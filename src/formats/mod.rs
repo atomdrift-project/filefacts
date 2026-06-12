@@ -37,6 +37,7 @@ mod build_toolchain;
 mod chm;
 mod class;
 pub(crate) mod common;
+mod crx;
 mod deb;
 mod elf;
 mod elf_dwarf;
@@ -46,6 +47,7 @@ mod gem;
 mod generic;
 mod go_buildinfo;
 mod goblin_safe;
+pub(crate) mod identity;
 mod image_stats;
 mod jar;
 mod jpeg;
@@ -54,6 +56,7 @@ mod macho;
 mod macho_code_signature;
 mod macho_hashes;
 mod markdown;
+mod npm;
 mod ole2;
 mod ooxml;
 mod pdf;
@@ -110,19 +113,28 @@ pub(crate) fn extract(
             macho::extract(bytes, values, strings, metrics, sections, symbols, errors)
         }
         FileType::Zip
-        | FileType::Crx
         | FileType::Odf
         | FileType::ApkAndroid
         | FileType::Conda
         | FileType::Egg
         | FileType::Nupkg
-        | FileType::Ipa
-        | FileType::Vsix => {
-            // Zip-based packages (Android apk, conda, egg, nupkg, ipa, vsix):
+        | FileType::Ipa => {
+            // Zip-based packages (Android apk, conda, egg, nupkg, ipa):
             // the generic archive walk surfaces their member listing and the
             // identity manifests inside (PKG-INFO, *.nuspec, Info.plist, …).
             zip::extract(bytes, values, metrics, archive_members)
         }
+        FileType::Vsix => {
+            // Open the ZIP container once: generic archive facts first,
+            // then parse the inner extension.vsixmanifest for the
+            // vsix.identity.* publisher/id/version triple.
+            let mut archive = zip::open_archive(bytes)?;
+            zip::extract_from_archive(&mut archive, bytes, values, metrics, archive_members)?;
+            vsix::extract_from_archive(&mut archive, values, strings, metrics)
+        }
+        // CRX is a ZIP with a signed header prepended: walk the ZIP, then
+        // decode the header for the public key and derived extension id.
+        FileType::Crx => crx::extract(bytes, values, metrics, archive_members),
         FileType::Asar => asar::extract(bytes, values, metrics, archive_members),
         FileType::Ooxml => {
             // Open the ZIP container once: generic archive facts first,
@@ -163,14 +175,15 @@ pub(crate) fn extract(
         FileType::Tar | FileType::TarGz | FileType::TarBz2 | FileType::TarXz | FileType::TarZst => {
             tar::extract(bytes, file_type, values, metrics, archive_members)
         }
-        // Compressed-tar packages (Alpine apk, npm, crate, FreeBSD/Arch pkg):
+        // Compressed-tar packages (Alpine apk, crate, FreeBSD/Arch pkg):
         // same handling as the other compressed-tar variants — format label
         // only; cleave decompresses and re-submits the members.
-        FileType::ApkAlpine
-        | FileType::Npm
-        | FileType::Crate
-        | FileType::PkgFreebsd
-        | FileType::PkgArch => tar::extract(bytes, file_type, values, metrics, archive_members),
+        FileType::ApkAlpine | FileType::Crate | FileType::PkgFreebsd | FileType::PkgArch => {
+            tar::extract(bytes, file_type, values, metrics, archive_members)
+        }
+        // An npm package is a gzipped tar: walk it for the member listing,
+        // then read `package/package.json` for the npm.* publisher identity.
+        FileType::Npm => npm::extract(bytes, file_type, values, metrics, archive_members),
         // A gem is an uncompressed `ustar` tar. Walk it for the generic
         // archive.* surface, then read the gzipped metadata member for the
         // gem.* identity facts (name/version/deps live only in `metadata.gz`).
@@ -181,10 +194,18 @@ pub(crate) fn extract(
         // Structured manifests parse their entire content into `values`
         // with the format-native key shape (the parsed JSON/YAML/TOML
         // tree, verbatim).
-        FileType::PackageJson
-        | FileType::PackageLockJson
-        | FileType::ComposerJson
-        | FileType::ChromeManifest => structured::extract_json(bytes, values),
+        FileType::PackageLockJson | FileType::ComposerJson | FileType::ChromeManifest => {
+            structured::extract_json(bytes, values)
+        }
+        // A bare package.json: the verbatim JSON tree, plus the same
+        // npm.* identity layer the tarball path emits.
+        FileType::PackageJson => {
+            structured::extract_json(bytes, values)?;
+            if let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                npm::emit(&manifest, values);
+            }
+            Ok(())
+        }
         FileType::Json => structured::extract_generic_json(bytes, values, metrics),
         // gyp is JSON-shaped (binding.gyp is plain JSON in the common case); parse
         // it as generic JSON so value paths like targets[*].sources[*] resolve.

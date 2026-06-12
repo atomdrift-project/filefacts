@@ -139,8 +139,9 @@ tracing = "0.1"
 zstd = "0.13"
 bincode = { version = "2", features = ["serde"] }
 
-# OS cache directory lookup — `~/.cache/filefacts` (Linux) / `Library/Caches`
-# (macOS) / `%LOCALAPPDATA%` (Windows).
+# OS cache directory lookup — `~/.cache/atomdrift/filefacts` (Linux) /
+# `Library/Caches/atomdrift/filefacts` (macOS) / `%LOCALAPPDATA%\atomdrift\filefacts`
+# (Windows).
 dirs = "6"
 
 # Temp file handling for rizin input materialisation. The existing rizin
