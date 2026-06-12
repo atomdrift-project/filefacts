@@ -124,6 +124,21 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"cd $", Lang::Shell, 5),
     (b"curl -O http", Lang::Shell, 5),
     (b"xattr -c ", Lang::Shell, 5),
+    // pacman/AUR `.install` scriptlet hook functions. These are shell function
+    // definitions (`name() {`) with names reserved by pacman's install-scriptlet
+    // convention, so the `() {` definition form keyed to a pacman hook name is
+    // conclusive shell — it never appears in other languages. Detecting these by
+    // content (not by the `.install` extension) avoids mis-typing Debian
+    // `debian/*.install` files, which share the extension but are plain
+    // newline-separated path lists with no scriptlet functions. Content-based
+    // detection also recovers scriptlets shipped with a renamed or absent
+    // extension.
+    (b"post_install() {", Lang::Shell, 10),
+    (b"pre_install() {", Lang::Shell, 10),
+    (b"post_upgrade() {", Lang::Shell, 10),
+    (b"pre_upgrade() {", Lang::Shell, 10),
+    (b"post_remove() {", Lang::Shell, 10),
+    (b"pre_remove() {", Lang::Shell, 10),
     // ── Python ──
     (b"if __name__", Lang::Python, 10),
     (b"import os", Lang::Python, 10),
@@ -478,6 +493,23 @@ end filesizer\n";
 \tset x to name of every file\n\
 end tell\n";
         assert_eq!(detect_from_content(data), Some(FileType::AppleScript));
+    }
+
+    #[test]
+    fn pacman_install_scriptlet() {
+        // AUR `.install` scriptlet (the AUR/ALVR supply-chain delivery vector):
+        // the pacman hook-function definitions must classify as Shell even with
+        // an unmapped `.install` extension so install-hook composites can fire.
+        let data = b"post_install() {\n  cd /tmp\n  npm install atomic-lockfile yargs\n}\n";
+        assert_eq!(detect_from_content(data), Some(FileType::Shell));
+    }
+
+    #[test]
+    fn debian_dh_install_is_not_shell() {
+        // Debian `debian/*.install` files share the extension but are plain
+        // path lists with no scriptlet functions — they must NOT become Shell.
+        let data = b"usr/bin/foo\nusr/share/foo/bar.png\netc/foo/foo.conf\n";
+        assert_eq!(detect_from_content(data), None);
     }
 
     #[test]
