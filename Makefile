@@ -14,7 +14,7 @@ CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 # cache across worktrees). Falls back to the cargo default `target` otherwise.
 CARGO_TARGET ?= $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 
-.PHONY: all build release test lint fmt clean help bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once
+.PHONY: all build release install test lint fmt clean help bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once
 
 all: build
 
@@ -25,6 +25,7 @@ help: ## Show this help
 	@echo "Targets:"
 	@echo "  build              - Build in debug mode (default)"
 	@echo "  release            - Build in release mode"
+	@echo "  install            - Install release binary to first writeable PATH dir"
 	@echo "  test               - Run all tests"
 	@echo "  lint               - Run rustfmt + clippy"
 	@echo "  fmt                - Format code with rustfmt"
@@ -44,6 +45,23 @@ release: $(OUT_DIR)
 	cp $(CARGO_TARGET)/release/$(BINARY) $(OUT_DIR)/$(BINARY)
 	@if [ "$$(uname)" = "Darwin" ]; then codesign -s - -f $(OUT_DIR)/$(BINARY); fi
 	@echo "✓ Release binary: $(OUT_DIR)/$(BINARY)"
+
+install: release ## Install binary to first writeable location
+	@set -e; \
+	if echo "$$PATH" | tr ':' '\n' | grep -qx "$$HOME/.cargo/bin" && [ -d "$$HOME/.cargo/bin" ]; then \
+		dest="$$HOME/.cargo/bin/$(BINARY)"; \
+	elif [ -d "$$HOME/bin" ] && [ -w "$$HOME/bin" ]; then \
+		dest="$$HOME/bin/$(BINARY)"; \
+	elif [ -d "$$HOME/.local/bin" ] && [ -w "$$HOME/.local/bin" ]; then \
+		dest="$$HOME/.local/bin/$(BINARY)"; \
+	elif [ -w /usr/local/bin ]; then \
+		dest="/usr/local/bin/$(BINARY)"; \
+	else \
+		mkdir -p "$$HOME/.cargo/bin"; \
+		dest="$$HOME/.cargo/bin/$(BINARY)"; \
+	fi; \
+	install -m 755 $(OUT_DIR)/$(BINARY) "$$dest.new" && mv -f "$$dest.new" "$$dest"; \
+	echo "✓ Installed to $$dest"
 
 test:
 	$(CARGO) test
