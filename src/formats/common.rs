@@ -25,16 +25,18 @@ pub(super) fn extract_ascii_strings(bytes: &[u8], strings: &mut Strings) {
 /// through a decoder: `base64`, `xor`, `unicode-escape`, …) — the
 /// pure recovery methods (raw scan, instruction-pattern, structure)
 /// add noise and aren't worth tagging.
-/// Options shared by both extraction entry points. `caller_provides_symbols`
-/// tells stng to skip its native import/export/symbol pass: filefacts already
-/// walks the symbol tables itself (`extract_symbols`), so doing it in stng too
-/// would parse them twice.
+/// Options shared by both binary extraction entry points. filefacts is the
+/// single string-extraction authority for cleave, so these mirror the rich opts
+/// cleave used to pass to stng directly:
+/// - `garbage_filter` drops high-noise runs,
+/// - `xor` recovers XOR-deobfuscated strings (key auto-detected),
+/// - `caller_provides_symbols` skips stng's symbol pass — filefacts walks the
+///   symbol tables itself (`extract_symbols`), the single symbol codepath.
 fn string_opts() -> stng::ExtractOptions {
-    stng::ExtractOptions {
-        min_length: ascii::DEFAULT_MIN_LEN,
-        caller_provides_symbols: true,
-        ..Default::default()
-    }
+    stng::ExtractOptions::new(ascii::DEFAULT_MIN_LEN)
+        .with_garbage_filter(true)
+        .with_xor(None)
+        .with_caller_provides_symbols(true)
 }
 
 /// Partition stng's extracted strings into the UTF-16 / ASCII buckets.
