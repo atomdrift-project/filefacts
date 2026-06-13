@@ -25,7 +25,7 @@
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
-use crate::formats::common::{extract_ascii_strings, put_str};
+use crate::formats::common::{extract_ascii_strings, hex_nibble, put_str};
 use crate::output::{Metrics, Strings, Values};
 
 pub(super) fn extract(
@@ -241,15 +241,6 @@ fn decode_text(bytes: &[u8]) -> String {
         }
     }
     String::from_utf8_lossy(&out).trim().to_string()
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// Find each `\fldinst <body>` site and surface the leading

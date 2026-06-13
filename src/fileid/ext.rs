@@ -13,11 +13,8 @@ pub(crate) fn detect_from_path(path: &Path) -> Option<FileType> {
 
     // GitHub Actions workflow files
     let path_str = path.to_string_lossy();
-    if path_str.contains(".github/workflows/") || path_str.contains(".github\\workflows\\") {
-        let p = path_str.as_bytes();
-        if ends_with_ci(p, b".yml") || ends_with_ci(p, b".yaml") {
-            return Some(FileType::GithubActions);
-        }
+    if is_github_workflow(&path_str) {
+        return Some(FileType::GithubActions);
     }
 
     // systemd service drop-ins: *.service.d/*.conf
@@ -76,11 +73,15 @@ pub(crate) fn detect_from_path(path: &Path) -> Option<FileType> {
 
 /// Returns true if the path matched via filename (not extension).
 pub(crate) fn is_filename_match(path: &Path) -> bool {
-    detect_from_filename(path).is_some() || {
-        let s = path.to_string_lossy();
-        (s.contains(".github/workflows/") || s.contains(".github\\workflows\\"))
-            && (ends_with_ci(s.as_bytes(), b".yml") || ends_with_ci(s.as_bytes(), b".yaml"))
-    }
+    detect_from_filename(path).is_some() || is_github_workflow(&path.to_string_lossy())
+}
+
+/// `true` for a GitHub Actions workflow file: a `.yml`/`.yaml` under a
+/// `.github/workflows/` directory (either path separator).
+fn is_github_workflow(path_str: &str) -> bool {
+    (path_str.contains(".github/workflows/") || path_str.contains(".github\\workflows\\"))
+        && (ends_with_ci(path_str.as_bytes(), b".yml")
+            || ends_with_ci(path_str.as_bytes(), b".yaml"))
 }
 
 /// Returns true if the path has a data/config extension that should not be

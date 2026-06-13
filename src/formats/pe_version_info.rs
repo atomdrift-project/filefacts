@@ -120,14 +120,17 @@ fn walk_version_block(bytes: &[u8], off: usize, depth: u8, values: &mut Values) 
     if let Some(leaf) = version_key_leaf(&key)
         && value_off < block_end
     {
-        put_u64(values, &format!("pe.version.{leaf}_offset"), value_off as u64);
+        put_u64(
+            values,
+            &format!("pe.version.{leaf}_offset"),
+            value_off as u64,
+        );
     }
 
     // Children follow the value, DWORD-aligned, up to this block's end.
     let mut child = align4(value_off.saturating_add(value_bytes));
     while child + 6 <= block_end {
-        let child_len =
-            u16::from_le_bytes([bytes[child], bytes[child + 1]]) as usize;
+        let child_len = u16::from_le_bytes([bytes[child], bytes[child + 1]]) as usize;
         if child_len < 6 {
             break;
         }
@@ -421,14 +424,19 @@ mod tests {
         emit_value_offsets(&root, &mut values);
 
         // The companion offset must point exactly at the UTF-16LE value bytes.
-        let want: Vec<u8> = "ACME Corp".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let want: Vec<u8> = "ACME Corp"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
         let expect = root
             .windows(want.len())
             .position(|w| w == want.as_slice())
             .map(|p| p as u64);
         assert!(expect.is_some(), "fixture must contain the value");
         assert_eq!(
-            values.get("pe.version.company_offset").and_then(JsonValue::as_u64),
+            values
+                .get("pe.version.company_offset")
+                .and_then(JsonValue::as_u64),
             expect,
         );
         // Unknown keys (StringFileInfo/StringTable/langID) emit no companion.
@@ -441,7 +449,10 @@ mod tests {
         let mut v = Values::new();
         emit_value_offsets(&[], &mut v);
         emit_value_offsets(&[0u8; 8], &mut v);
-        let mut sig: Vec<u8> = "VS_VERSION_INFO".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut sig: Vec<u8> = "VS_VERSION_INFO"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
         sig.truncate(10); // cut mid-key
         emit_value_offsets(&sig, &mut v);
     }

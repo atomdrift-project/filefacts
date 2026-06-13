@@ -32,7 +32,7 @@
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
-use crate::formats::common::extract_ascii_strings;
+use crate::formats::common::{extract_ascii_strings, hex_nibble};
 use crate::output::{Metrics, Strings, Values};
 
 /// Cap on the snippet text we surface per action. Long JavaScript
@@ -649,15 +649,6 @@ fn read_hex_string(bytes: &[u8], start: usize) -> Option<String> {
         return Some(String::from_utf16_lossy(&units).trim().to_string());
     }
     Some(String::from_utf8_lossy(&out).trim().to_string())
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// PDF names start with `/` and continue with regular characters

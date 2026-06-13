@@ -662,11 +662,8 @@ fn emit_section_metrics(sections: &Sections, metrics: &mut Metrics) {
     let mut nonstandard = 0_u64;
     let mut concatenated_names: Vec<u8> = Vec::new();
     for s in sections {
-        let is_exec = s
-            .flags
-            .iter()
-            .any(|f| f == "executable" || f == "execinstr");
-        let is_write = s.flags.iter().any(|f| f == "writable" || f == "write");
+        let is_exec = s.is_executable();
+        let is_write = s.is_writable();
         if is_exec {
             executable += 1;
             code_size = code_size.saturating_add(s.file_size);
@@ -831,11 +828,8 @@ fn emit_binary_aggregates(
     let mut code_entropy_sum = 0.0_f64;
     let mut data_entropy_sum = 0.0_f64;
     for s in sections {
-        let is_exec = s
-            .flags
-            .iter()
-            .any(|f| f == "executable" || f == "execinstr");
-        let is_write = s.flags.iter().any(|f| f == "writable" || f == "write");
+        let is_exec = s.is_executable();
+        let is_write = s.is_writable();
         let on_disk = s.file_size;
         largest = largest.max(on_disk);
         let entropy = s.entropy.unwrap_or(0.0);

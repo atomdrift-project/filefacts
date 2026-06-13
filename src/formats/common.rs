@@ -370,6 +370,17 @@ pub(super) fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Decode a single ASCII hex digit to its 0–15 value, or `None` if the
+/// byte is not `[0-9a-fA-F]`.
+pub(super) fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{basename, hex_encode, stem};

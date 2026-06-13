@@ -64,6 +64,22 @@ pub struct Section {
     pub entropy: Option<f64>,
 }
 
+impl Section {
+    /// `true` when the section carries an execute flag, under either the
+    /// PE (`executable`) or ELF (`execinstr`) spelling.
+    pub fn is_executable(&self) -> bool {
+        self.flags
+            .iter()
+            .any(|f| f == "executable" || f == "execinstr")
+    }
+
+    /// `true` when the section carries a write flag, under either the
+    /// PE (`writable`) or ELF (`write`) spelling.
+    pub fn is_writable(&self) -> bool {
+        self.flags.iter().any(|f| f == "writable" || f == "write")
+    }
+}
+
 /// Unified section view across PE, ELF, and Mach-O.
 ///
 /// Empty when the file has no section table filefacts can read

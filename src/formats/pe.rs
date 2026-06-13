@@ -141,7 +141,7 @@ pub(super) fn extract(
         if let Some(ref dbg) = pe.debug_data {
             super::pe_debug::extract(dbg, values);
         }
-        bound_imports_with_metrics(&pe, bytes, values, metrics);
+        bound_imports(&pe, bytes, values, metrics);
         delay_imports(&pe, bytes, values, metrics, symbols_out);
         base_relocations(&pe, bytes, values, metrics);
         tls_callbacks(&pe, values, metrics);
@@ -803,35 +803,20 @@ fn rt_name(id: u16) -> &'static str {
 ///
 /// Bound-import tables are largely a 1990s artefact (the loader
 /// rebinds on mismatch), so finding one is itself a build-pipeline
-/// fingerprint.
-/// `bound_imports_with_metrics` emits the directory. The lazy goblin walker
-/// can panic on truncated tables, so we keep the parse self-contained
-/// (we already validated the directory bounds before calling).
+/// fingerprint. The lazy goblin walker can panic on truncated tables,
+/// so we keep the parse self-contained (we already validated the
+/// directory bounds before calling).
 ///
 /// Emits to values:
 /// - `pe.bound_imports[]` — array of `{name, time_date_stamp,
 ///   forwarder_ref_count}` objects, capped at 64 entries.
 ///
-/// Emits to metrics when present:
+/// Emits to metrics:
 /// - `pe.bound_import_count` — number of descriptors recovered.
 /// - `pe.bound_imports_fingerprint` — CRC-32 of the canonical-sorted
 ///   set. Useful for "binaries linked on the same host within seconds
 ///   get the same fingerprint" clustering.
-fn bound_imports_with_metrics(
-    pe: &PE<'_>,
-    bytes: &[u8],
-    values: &mut Values,
-    metrics: &mut Metrics,
-) {
-    bound_imports_inner(pe, bytes, values, Some(metrics));
-}
-
-fn bound_imports_inner(
-    pe: &PE<'_>,
-    bytes: &[u8],
-    values: &mut Values,
-    metrics: Option<&mut Metrics>,
-) {
+fn bound_imports(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     let Some(opt) = pe.header.optional_header.as_ref() else {
         return;
     };
@@ -895,21 +880,19 @@ fn bound_imports_inner(
         .collect();
     values.insert("pe.bound_imports", JsonValue::Array(modules));
 
-    if let Some(metrics) = metrics {
-        metrics.insert("pe.bound_import_count", out.len() as f64);
-        // CRC-32 fingerprint over the canonical-sorted set so the
-        // linker's emission order doesn't change clustering.
-        let mut sorted: Vec<&Desc> = out.iter().collect();
-        sorted.sort_by(|a, b| a.name.cmp(&b.name));
-        let mut hasher = crc32fast::Hasher::new();
-        for d in sorted {
-            hasher.update(d.name.as_bytes());
-            hasher.update(&[0]);
-            hasher.update(&d.time_date_stamp.to_le_bytes());
-            hasher.update(&d.forwarder_ref_count.to_le_bytes());
-        }
-        metrics.insert("pe.bound_imports_fingerprint", f64::from(hasher.finalize()));
+    metrics.insert("pe.bound_import_count", out.len() as f64);
+    // CRC-32 fingerprint over the canonical-sorted set so the
+    // linker's emission order doesn't change clustering.
+    let mut sorted: Vec<&Desc> = out.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut hasher = crc32fast::Hasher::new();
+    for d in sorted {
+        hasher.update(d.name.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(&d.time_date_stamp.to_le_bytes());
+        hasher.update(&d.forwarder_ref_count.to_le_bytes());
     }
+    metrics.insert("pe.bound_imports_fingerprint", f64::from(hasher.finalize()));
 }
 
 /// Walk the TLS Directory's `AddressOfCallBacks` table and surface the

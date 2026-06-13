@@ -734,7 +734,10 @@ mod tests {
             .position(|w| w == b"java/lang/Object")
             .map(|p| p as u64);
         assert!(want.is_some(), "fixture should contain the class name");
-        assert_eq!(offset, want, "class import must anchor at its CP Utf8 offset");
+        assert_eq!(
+            offset, want,
+            "class import must anchor at its CP Utf8 offset"
+        );
     }
 
     #[test]
