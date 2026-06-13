@@ -98,7 +98,10 @@ pub(super) fn parse(bytes: &[u8], sig_off: usize, sig_size: usize, values: &mut 
         let blob = &sig[blob_off..blob_off + blob_len];
 
         match blob_magic {
-            CSMAGIC_CODEDIRECTORY => parse_code_directory(blob, values),
+            // `sig_off + blob_off` is the CodeDirectory's absolute offset in
+            // `bytes`; pass it so interior fields (the identifier string) can
+            // be reported in the same coordinate space as the signature blob.
+            CSMAGIC_CODEDIRECTORY => parse_code_directory(blob, sig_off + blob_off, values),
             CSMAGIC_REQUIREMENTS => {
                 put_u64(
                     values,
@@ -124,7 +127,10 @@ pub(super) fn parse(bytes: &[u8], sig_off: usize, sig_size: usize, values: &mut 
 }
 
 /// CodeDirectory layout (excerpt — fields through v20400 are stable).
-fn parse_code_directory(blob: &[u8], values: &mut Values) {
+/// `cd_base` is the blob's absolute offset in the file, used to anchor
+/// interior strings (the identifier) at their true byte position rather
+/// than at the enclosing signature blob.
+fn parse_code_directory(blob: &[u8], cd_base: usize, values: &mut Values) {
     // Header layout (big-endian):
     //   u32 magic            (already validated)
     //   u32 length
@@ -167,6 +173,14 @@ fn parse_code_directory(blob: &[u8], values: &mut Values) {
 
     if let Some(ident) = read_cstr(blob, ident_offset) {
         put_str(values, "macho.code_signature.identifier", ident);
+        // Absolute file offset of the identifier C-string, so consumers can
+        // anchor it at the string itself rather than at the CodeDirectory or
+        // signature blob. Same coordinate space as the signature offset.
+        put_u64(
+            values,
+            "macho.code_signature.identifier_offset",
+            (cd_base + ident_offset) as u64,
+        );
     }
 
     // The team_offset field landed in version 0x20200.

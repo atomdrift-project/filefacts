@@ -38,6 +38,16 @@ pub(super) fn extract(
     // byte-level fallback if the parse fails — so the binary is parsed once.
     extract_utf16_strings(bytes, strings);
 
+    // goblin treats a Rich header carrying the `Rich` marker but no
+    // decodable `DanS` table as a fatal parse error — strict, permissive,
+    // and the header-only fallback all abort, leaving zero sections and
+    // imports. Packers and mangled samples emit that shape routinely.
+    // Neutralize it on a copy so structural recovery proceeds; raw byte
+    // readers (section data, overlay, authenticode, our own pe_rich
+    // extractor) keep reading the untouched `bytes`.
+    let rich_sanitized = goblin_safe::neutralize_malformed_rich_header(bytes);
+    let pe_bytes: &[u8] = rich_sanitized.as_deref().unwrap_or(bytes);
+
     // Try the full goblin parse first — it gives us imports, exports,
     // resources, and the section table in one go. If it fails
     // (packed/obfuscated PE, malformed import directory, …) we fall
@@ -50,7 +60,7 @@ pub(super) fn extract(
     // goblin's lazy walkers), catches any panic from the parse, and
     // does the strict→permissive fallback internally. Callers must
     // never reach for `PE::parse_with_opts` directly.
-    let parse_outcome = goblin_safe::parse_pe(bytes);
+    let parse_outcome = goblin_safe::parse_pe(pe_bytes);
     // Record the failure mode (if any) into the structured errors
     // view *before* we attempt the header-only fallback, so consumers
     // can see exactly which sub-stage tripped even when the fallback
@@ -162,7 +172,7 @@ pub(super) fn extract(
     // we can still surface machine / subsystem / characteristics +
     // Authenticode for binaries whose import directory is malformed
     // or stripped (packed installers, Go binaries, obfuscated builds).
-    let header = goblin::pe::header::Header::parse(bytes)
+    let header = goblin::pe::header::Header::parse(pe_bytes)
         .map_err(|e| Error::malformed("pe", e.to_string()))?;
     coff_header(&header.coff_header, values);
     dos_header(&header, values);

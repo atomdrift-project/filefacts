@@ -171,6 +171,61 @@ pub(crate) fn parse_pe(data: &[u8]) -> GoblinOutcome<PE<'_>> {
     }
 }
 
+/// Detect a Rich header that goblin's parser would treat as a fatal
+/// `Malformed` error — the `Rich` marker is present in the DOS stub but
+/// no XOR-decodable `DanS` table precedes it — and return an owned copy
+/// of `data` with the marker neutralized so the rest of the PE still
+/// parses. Returns `None` when no Rich marker is present or the header is
+/// well-formed, so the common path never copies.
+///
+/// goblin 0.10 parses the Rich header inside both `PE::parse` and the
+/// header-only `Header::parse`, and a corrupt stub aborts the *entire*
+/// parse (strict and permissive alike) — leaving every section- and
+/// import-scoped fact blind. Packed and intentionally-mangled samples
+/// emit forged Rich stubs routinely. Zeroing the 4-byte `Rich` magic
+/// makes goblin's marker scan find nothing and treat the header as
+/// absent (`Ok(None)`); filefacts' own `pe_rich` extractor still reads
+/// the untouched bytes, so a genuine Rich hash is unaffected.
+pub(crate) fn neutralize_malformed_rich_header(data: &[u8]) -> Option<Vec<u8>> {
+    const RICH_MAGIC: &[u8; 4] = b"Rich";
+    // "DanS" little-endian as u32.
+    const DANS_MARKER: u32 = 0x536e_6144;
+
+    if data.len() < 0x40 {
+        return None;
+    }
+    let e_lfanew = u32::from_le_bytes([data[0x3c], data[0x3d], data[0x3e], data[0x3f]]) as usize;
+    let scan_end = e_lfanew.min(data.len());
+    if scan_end < 8 {
+        return None;
+    }
+    let rich_pos = data[..scan_end].windows(4).rposition(|w| w == RICH_MAGIC)?;
+    if rich_pos + 8 > data.len() {
+        return None;
+    }
+    let key = u32::from_le_bytes([
+        data[rich_pos + 4],
+        data[rich_pos + 5],
+        data[rich_pos + 6],
+        data[rich_pos + 7],
+    ]);
+    // Walk backwards in 4-byte words: a decodable DanS marker means the
+    // header is well-formed and goblin will parse it without complaint.
+    let mut pos = rich_pos;
+    while pos >= 4 {
+        pos -= 4;
+        let word = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        if word ^ key == DANS_MARKER {
+            return None;
+        }
+    }
+    // No DanS table reachable — goblin would abort. Hand back a copy with
+    // the `Rich` magic cleared so its marker scan finds nothing.
+    let mut patched = data.to_vec();
+    patched[rich_pos..rich_pos + 4].fill(0);
+    Some(patched)
+}
+
 /// Basic structural validation of PE headers, run *before* goblin
 /// sees the bytes. Defends against known panic / OOM triggers:
 ///
