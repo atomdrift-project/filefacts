@@ -149,6 +149,7 @@ fn file_group(ft: FileType) -> &'static str {
         // Interpreted scripting languages (cleave's `scripts` for-group).
         FileType::Shell
         | FileType::Batch
+        | FileType::Jcl
         | FileType::Vbs
         | FileType::Python
         | FileType::JavaScript
@@ -253,6 +254,8 @@ pub enum FileType {
     Shell,
     /// Windows batch file (.bat, .cmd)
     Batch,
+    /// IBM z/OS Job Control Language batch script (.jcl)
+    Jcl,
     /// VBScript source file (.vbs, .vbe, .wsf, .wsc)
     Vbs,
     /// Python source file (.py)
@@ -560,6 +563,7 @@ impl FileType {
                 | Self::Rust
                 | Self::Shell
                 | Self::PowerShell
+                | Self::Jcl
                 | Self::Kotlin
                 | Self::Java
                 | Self::Go
