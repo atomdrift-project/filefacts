@@ -186,6 +186,13 @@ fn detect_from_filename(path: &Path) -> Option<FileType> {
     if name.starts_with("Makefile") || name.starts_with("GNUmakefile") {
         return Some(FileType::Makefile);
     }
+    // Arch Linux PKGBUILD recipes are bash, but carry no shebang and — for short
+    // recipes — too little shell syntax for content sniffing to catch, so they
+    // fall through to Unknown and packaging traits never run. Recognize the
+    // canonical name (it is always bash) so the pacman trait family applies.
+    if name == "PKGBUILD" {
+        return Some(FileType::Shell);
+    }
     // Meson build files. Their own DSL (not source code); classify as a build
     // file so source/AST traits (e.g. JavaScript obfuscation) do not run on them.
     if name.eq_ignore_ascii_case("meson.build")
