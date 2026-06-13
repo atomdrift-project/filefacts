@@ -16,8 +16,8 @@ use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::{
-    extract_binary_strings, extract_binary_strings_from_object, extract_utf16_strings, hex_encode,
-    put_i64, put_str, put_u64, rizin_fallback_with_sections,
+    extract_binary_strings, extract_binary_strings_from_object, hex_encode, put_i64, put_str,
+    put_u64, rizin_fallback_with_sections,
 };
 use crate::formats::goblin_safe;
 use crate::output::{Errors, Metrics, Section, Strings, Values};
@@ -33,10 +33,11 @@ pub(super) fn extract(
     symbols_out: &mut crate::Symbols,
     errors_out: &mut Errors,
 ) -> Result<(), Error> {
-    // UTF-16 strings (resource names, version info) are a separate raw pass.
-    // ASCII / section strings come from the parsed object below — or a
-    // byte-level fallback if the parse fails — so the binary is parsed once.
-    extract_utf16_strings(bytes, strings);
+    // All strings — ASCII, section names, and UTF-16 (resource / version-info)
+    // runs — come from the single stng pass below: it scans the whole buffer
+    // for wide strings at absolute file offsets, including the unparseable
+    // case (it recognises the `MZ` header itself). ELF and Mach-O rely on the
+    // same pass, so there's no separate raw UTF-16 scan here.
 
     // goblin treats a Rich header carrying the `Rich` marker but no
     // decodable `DanS` table as a fatal parse error — strict, permissive,

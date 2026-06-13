@@ -7,7 +7,6 @@
 
 pub(crate) mod ascii;
 pub(crate) mod entropy;
-pub(crate) mod utf16;
 
 /// Convert a ZIP `DateTime` (interpreted as UTC) to Unix seconds.
 ///

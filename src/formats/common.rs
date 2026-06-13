@@ -4,7 +4,6 @@ use serde_json::Value as JsonValue;
 
 use crate::output::{Strings, Values};
 use crate::scan::ascii;
-use crate::scan::utf16;
 
 /// Push every ASCII run in `bytes` into the byte-scan Text view,
 /// applying the scanner's default minimum length.
@@ -13,14 +12,6 @@ pub(super) fn extract_ascii_strings(bytes: &[u8], strings: &mut Strings) {
         .text
         .ascii
         .extend(ascii::extract_runs(bytes, ascii::DEFAULT_MIN_LEN));
-}
-
-/// Push every UTF-16LE run in `bytes` into the byte-scan Text view.
-pub(super) fn extract_utf16_strings(bytes: &[u8], strings: &mut Strings) {
-    strings
-        .text
-        .utf16le
-        .extend(utf16::extract_runs(bytes, utf16::DEFAULT_MIN_LEN));
 }
 
 /// Language-aware binary string extraction via the `stng` crate.
