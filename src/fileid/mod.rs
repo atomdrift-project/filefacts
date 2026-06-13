@@ -1217,6 +1217,13 @@ mod tests {
         assert_ext("run.cmd", FileType::Batch);
     }
 
+    // ── JCL ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn jcl_by_ext() {
+        assert_ext("run.jcl", FileType::Jcl);
+    }
+
     // ── VBScript ─────────────────────────────────────────────────────
 
     #[test]

@@ -605,6 +605,7 @@ fn stage_for(file_type: FileType) -> Stage {
         | FileType::Elixir
         | FileType::Clojure
         | FileType::Batch
+        | FileType::Jcl
         | FileType::Makefile => Stage::SourceExtract,
         FileType::Pe => Stage::PeParse,
         FileType::Elf => Stage::ElfParse,

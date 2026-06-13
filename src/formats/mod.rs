@@ -273,7 +273,7 @@ pub(crate) fn extract(
         // Text-like languages without a tree-sitter binding in filefacts.
         // They still earn `text.*` metrics — pure byte/line analysis,
         // no AST required.
-        FileType::Vbs => {
+        FileType::Vbs | FileType::Jcl => {
             source::extract_text_only(bytes, metrics);
             Ok(())
         }
