@@ -127,7 +127,7 @@ pub(super) fn extract(
                     metrics.insert("pe.icon_count", icon_count);
                 }
                 if let Some(ref vi) = rd.version_info {
-                    super::pe_version_info::extract(vi, values, metrics);
+                    super::pe_version_info::extract(vi, bytes, values, metrics);
                 }
                 if let Some(ref md) = rd.manifest_data {
                     super::pe_manifest::extract(md.data, values);

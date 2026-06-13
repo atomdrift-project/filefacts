@@ -21,17 +21,133 @@
 use goblin::pe::resource::{StringFileInfo, VersionInfo, VsFixedFileInfo};
 use serde_json::Value as JsonValue;
 
-use crate::formats::common::put_str;
+use crate::formats::common::{put_str, put_u64};
 use crate::output::{Metrics, Values};
 
-pub(super) fn extract(info: &VersionInfo<'_>, values: &mut Values, metrics: &mut Metrics) {
+pub(super) fn extract(
+    info: &VersionInfo<'_>,
+    bytes: &[u8],
+    values: &mut Values,
+    metrics: &mut Metrics,
+) {
     if let Some(ref fixed) = info.fixed_info {
         if fixed.is_valid() {
             fixed_file_info(fixed, values);
         }
     }
     string_table(&info.string_info, values);
+    // goblin decodes the string-table values but hides their file offsets, so
+    // walk the raw VS_VERSIONINFO blob ourselves to anchor `pe.version.*`
+    // `value` matches in the hex view.
+    emit_value_offsets(bytes, values);
     identity_metrics(&info.string_info, metrics);
+}
+
+/// Maximum VS_VERSIONINFO tree depth honoured while indexing value offsets.
+/// Real resources are 4 levels (root → StringFileInfo → StringTable → String);
+/// the cap bounds stack use on a hostile/looping blob.
+const MAX_VERSION_DEPTH: u8 = 8;
+
+/// Map a VS_VERSIONINFO `String` key to the `pe.version.*` leaf the value-tree
+/// uses (must match [`string_table`]), so the emitted `<leaf>_offset` companion
+/// lines up with the value path a trait queries.
+fn version_key_leaf(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "Comments" => "comments",
+        "CompanyName" => "company",
+        "FileDescription" => "description",
+        "FileVersion" => "file_version",
+        "InternalName" => "internal_name",
+        "LegalCopyright" => "copyright",
+        "LegalTrademarks" => "trademarks",
+        "OriginalFilename" => "original_filename",
+        "PrivateBuild" => "private_build",
+        "ProductName" => "product_name",
+        "ProductVersion" => "product_version",
+        "SpecialBuild" => "special_build",
+        _ => return None,
+    })
+}
+
+/// Read a UTF-16LE NUL-terminated key at `pos`, returning `(key, offset just
+/// past the terminator)`. Bounded by `end`.
+fn read_utf16_key(bytes: &[u8], pos: usize, end: usize) -> (String, usize) {
+    let mut units = Vec::new();
+    let mut i = pos;
+    while i + 2 <= end {
+        let u = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+        i += 2;
+        if u == 0 {
+            break;
+        }
+        units.push(u);
+    }
+    (String::from_utf16_lossy(&units), i)
+}
+
+/// Round `n` up to the next 4-byte boundary (VS_VERSIONINFO blocks are
+/// DWORD-aligned).
+fn align4(n: usize) -> usize {
+    (n + 3) & !3
+}
+
+/// Walk one length-prefixed VS_VERSIONINFO block at `off` (a file offset into
+/// `bytes`): `{u16 wLength, u16 wValueLength, u16 wType, WCHAR szKey[], pad,
+/// Value, pad, Children}`. Records `pe.version.<leaf>_offset` for `String`
+/// blocks whose key is recognised, then recurses into children. Fully bounds-
+/// and depth-checked: this parses untrusted resource bytes.
+fn walk_version_block(bytes: &[u8], off: usize, depth: u8, values: &mut Values) {
+    if depth >= MAX_VERSION_DEPTH || off + 6 > bytes.len() {
+        return;
+    }
+    let w_length = u16::from_le_bytes([bytes[off], bytes[off + 1]]) as usize;
+    let w_value_length = u16::from_le_bytes([bytes[off + 2], bytes[off + 3]]) as usize;
+    let w_type = u16::from_le_bytes([bytes[off + 4], bytes[off + 5]]);
+    let block_end = off.saturating_add(w_length).min(bytes.len());
+    if w_length < 6 || block_end <= off {
+        return; // zero/short length — stop rather than loop
+    }
+
+    let (key, key_end) = read_utf16_key(bytes, off + 6, block_end);
+    let value_off = align4(key_end);
+    // Text values count WCHARs; binary values count bytes.
+    let value_bytes = if w_type == 1 {
+        w_value_length * 2
+    } else {
+        w_value_length
+    };
+
+    if let Some(leaf) = version_key_leaf(&key)
+        && value_off < block_end
+    {
+        put_u64(values, &format!("pe.version.{leaf}_offset"), value_off as u64);
+    }
+
+    // Children follow the value, DWORD-aligned, up to this block's end.
+    let mut child = align4(value_off.saturating_add(value_bytes));
+    while child + 6 <= block_end {
+        let child_len =
+            u16::from_le_bytes([bytes[child], bytes[child + 1]]) as usize;
+        if child_len < 6 {
+            break;
+        }
+        walk_version_block(bytes, child, depth + 1, values);
+        child = align4(child.saturating_add(child_len));
+    }
+}
+
+/// Locate the VS_VERSIONINFO blob by its `"VS_VERSION_INFO"` key (6 bytes into
+/// the root block) and walk it, recording each string value's byte offset.
+fn emit_value_offsets(bytes: &[u8], values: &mut Values) {
+    let sig: Vec<u8> = "VS_VERSION_INFO"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let Some(key_pos) = memchr::memmem::find(bytes, &sig) else {
+        return;
+    };
+    let root = key_pos.saturating_sub(6);
+    walk_version_block(bytes, root, 0, values);
 }
 
 /// Emit randomness/non-linguisticness metrics over the human-readable identity
@@ -262,6 +378,73 @@ fn file_flags(flags: u32) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build one DWORD-aligned VS_VERSIONINFO block (`wType=1`, text) with a key,
+    /// an optional value, and pre-built child bytes — mirroring the real layout
+    /// so the walker is exercised against genuine alignment/length rules.
+    fn version_block(key: &str, value: Option<&str>, children: &[u8]) -> Vec<u8> {
+        let utf16z = |s: &str| -> Vec<u8> {
+            s.encode_utf16()
+                .chain(std::iter::once(0))
+                .flat_map(u16::to_le_bytes)
+                .collect()
+        };
+        let value_units = value.map_or(0, |v| v.encode_utf16().count() + 1);
+        let mut b = Vec::new();
+        b.extend_from_slice(&0u16.to_le_bytes()); // wLength (patched below)
+        b.extend_from_slice(&(value_units as u16).to_le_bytes()); // wValueLength (WCHARs)
+        b.extend_from_slice(&1u16.to_le_bytes()); // wType = text
+        b.extend_from_slice(&utf16z(key));
+        while b.len() % 4 != 0 {
+            b.push(0);
+        }
+        if let Some(v) = value {
+            b.extend_from_slice(&utf16z(v));
+        }
+        while b.len() % 4 != 0 {
+            b.push(0);
+        }
+        b.extend_from_slice(children);
+        let len = b.len() as u16;
+        b[0..2].copy_from_slice(&len.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn version_value_offsets_anchor_at_the_string() {
+        let string = version_block("CompanyName", Some("ACME Corp"), &[]);
+        let table = version_block("040904b0", None, &string);
+        let sfi = version_block("StringFileInfo", None, &table);
+        let root = version_block("VS_VERSION_INFO", None, &sfi);
+
+        let mut values = Values::new();
+        emit_value_offsets(&root, &mut values);
+
+        // The companion offset must point exactly at the UTF-16LE value bytes.
+        let want: Vec<u8> = "ACME Corp".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let expect = root
+            .windows(want.len())
+            .position(|w| w == want.as_slice())
+            .map(|p| p as u64);
+        assert!(expect.is_some(), "fixture must contain the value");
+        assert_eq!(
+            values.get("pe.version.company_offset").and_then(JsonValue::as_u64),
+            expect,
+        );
+        // Unknown keys (StringFileInfo/StringTable/langID) emit no companion.
+        assert!(values.get("pe.version.040904b0_offset").is_none());
+    }
+
+    #[test]
+    fn version_walker_tolerates_garbage() {
+        // No signature, truncated, and zero-length blocks must not panic or loop.
+        let mut v = Values::new();
+        emit_value_offsets(&[], &mut v);
+        emit_value_offsets(&[0u8; 8], &mut v);
+        let mut sig: Vec<u8> = "VS_VERSION_INFO".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        sig.truncate(10); // cut mid-key
+        emit_value_offsets(&sig, &mut v);
+    }
 
     #[test]
     fn os_label_known() {
