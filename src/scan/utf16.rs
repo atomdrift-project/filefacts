@@ -41,24 +41,29 @@ impl Iterator for Utf16Runs<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.pos + 1 < self.bytes.len() {
-            if is_printable_utf16le_unit(self.bytes[self.pos], self.bytes[self.pos + 1]) {
-                let start = self.pos;
-                let mut text = String::new();
-                while self.pos + 1 < self.bytes.len()
-                    && is_printable_utf16le_unit(self.bytes[self.pos], self.bytes[self.pos + 1])
-                {
-                    text.push(self.bytes[self.pos] as char);
-                    self.pos += 2;
-                }
-                if text.len() >= self.min_len {
-                    return Some(ExtractedString {
-                        text,
-                        offset: start,
-                        ..ExtractedString::default()
-                    });
-                }
-            } else {
+            if !is_printable_utf16le_unit(self.bytes[self.pos], self.bytes[self.pos + 1]) {
                 self.pos += 1;
+                continue;
+            }
+            // Measure the maximal run first: runs below `min_len` are skipped
+            // without allocating, and the kept ones size their String exactly
+            // once (every unit is one ASCII byte → one UTF-8 byte).
+            let start = self.pos;
+            while self.pos + 1 < self.bytes.len()
+                && is_printable_utf16le_unit(self.bytes[self.pos], self.bytes[self.pos + 1])
+            {
+                self.pos += 2;
+            }
+            if (self.pos - start) / 2 >= self.min_len {
+                let text: String = self.bytes[start..self.pos]
+                    .chunks_exact(2)
+                    .map(|pair| pair[0] as char)
+                    .collect();
+                return Some(ExtractedString {
+                    text,
+                    offset: start,
+                    ..ExtractedString::default()
+                });
             }
         }
         None

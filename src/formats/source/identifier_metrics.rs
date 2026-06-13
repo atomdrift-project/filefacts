@@ -268,18 +268,19 @@ fn is_base64_like(s: &str) -> bool {
 
 fn is_sequential(s: &str) -> bool {
     if s.len() <= 2 {
-        let chars: Vec<char> = s.chars().collect();
-        if chars.len() == 1 && chars[0].is_ascii_alphabetic() {
-            return true;
-        }
-        if chars.len() == 2 && chars[0].is_ascii_alphabetic() && chars[1].is_ascii_digit() {
-            return true;
+        let mut chars = s.chars();
+        match (chars.next(), chars.next()) {
+            (Some(a), None) if a.is_ascii_alphabetic() => return true,
+            (Some(a), Some(b)) if a.is_ascii_alphabetic() && b.is_ascii_digit() => return true,
+            _ => {}
         }
     }
     if s.len() >= 2 {
         if let Some(last) = s.chars().last() {
             if last.is_ascii_digit() {
-                let prefix: String = s.chars().take(s.len() - 1).collect();
+                // The final ASCII digit is one byte, so the byte before it is a
+                // char boundary — slice the prefix instead of reallocating it.
+                let prefix = &s[..s.len() - 1];
                 let common = [
                     "var", "tmp", "temp", "arg", "param", "item", "val", "x", "y", "z", "i", "j",
                     "k",

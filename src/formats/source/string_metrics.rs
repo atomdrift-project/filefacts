@@ -197,17 +197,19 @@ fn is_likely_base64(s: &str) -> bool {
     if s.len() < 16 || s.len() % 4 != 0 {
         return false;
     }
-    let base64_chars = s
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '+' || *c == '/' || *c == '=')
-        .count();
-    if base64_chars != s.len() {
-        return false;
+    // One pass: every char must be in the base64 alphabet, and a real payload
+    // mixes upper and lower case. (All-base64 implies all-ASCII, so a clean
+    // char count equals the byte length the early guard already vetted.)
+    let mut all_base64 = true;
+    let mut has_upper = false;
+    let mut has_lower = false;
+    for c in s.chars() {
+        all_base64 &= c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=';
+        has_upper |= c.is_ascii_uppercase();
+        has_lower |= c.is_ascii_lowercase();
     }
-    let has_upper = s.chars().any(|c| c.is_ascii_uppercase());
-    let has_lower = s.chars().any(|c| c.is_ascii_lowercase());
     let valid_padding = !s.contains('=') || s.ends_with('=') || s.ends_with("==");
-    has_upper && has_lower && valid_padding
+    all_base64 && has_upper && has_lower && valid_padding
 }
 
 fn is_hex_string(s: &str) -> bool {
@@ -243,10 +245,28 @@ fn has_url_encoding(s: &str) -> bool {
 }
 
 fn has_unicode_heavy(s: &str) -> bool {
-    let count = s.matches("\\u").count()
-        + s.matches("\\x").count()
-        + s.matches("&#x").count()
-        + s.matches("&#").count();
+    // Tally the escape markers `\u`, `\x`, `&#x`, and `&#` in a single pass.
+    // `&#x` also counts as `&#`, matching the original sum of per-pattern
+    // `matches()` counts.
+    let b = s.as_bytes();
+    let mut count = 0usize;
+    let mut i = 0;
+    while i + 1 < b.len() {
+        match (b[i], b[i + 1]) {
+            (b'\\', b'u' | b'x') => {
+                count += 1;
+                i += 2;
+            }
+            (b'&', b'#') => {
+                count += 1; // &#
+                if b.get(i + 2) == Some(&b'x') {
+                    count += 1; // &#x
+                }
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
     count >= 5
 }
 
@@ -345,12 +365,14 @@ fn has_embedded_code(s: &str) -> bool {
         "<?php",
         "def ",
         "class ",
-        "System.",
-        "Runtime.",
-        "Process.",
+        "system.",
+        "runtime.",
+        "process.",
     ];
+    // Patterns are lowercase literals, so match against the lowercased
+    // input directly without re-lowercasing each one.
     let lower = s.to_lowercase();
-    patterns.iter().any(|p| lower.contains(&p.to_lowercase()))
+    patterns.iter().any(|p| lower.contains(*p))
 }
 
 fn has_shell_command(s: &str) -> bool {

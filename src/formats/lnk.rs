@@ -371,13 +371,8 @@ fn format_hotkey(v: u16) -> String {
         0x70..=0x87 => format!("F{}", key - 0x6F),
         _ => format!("0x{key:02x}"),
     };
-    parts.push(""); // separator placeholder
-    let mut out = parts[..parts.len() - 1].join("+");
-    if !out.is_empty() {
-        out.push('+');
-    }
-    out.push_str(&key_name);
-    out
+    parts.push(&key_name);
+    parts.join("+")
 }
 
 fn decode_link_flags(v: u32) -> Vec<&'static str> {

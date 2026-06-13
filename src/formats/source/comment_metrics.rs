@@ -371,11 +371,10 @@ fn has_code_patterns(s: &str) -> bool {
         "= function",
         "=> {",
     ];
+    // Patterns are already lowercase literals, so match against the
+    // lowercased input directly without re-lowercasing each one.
     let lower = s.to_lowercase();
-    let count = patterns
-        .iter()
-        .filter(|p| lower.contains(&p.to_lowercase()))
-        .count();
+    let count = patterns.iter().filter(|p| lower.contains(*p)).count();
     count >= 2
 }
 

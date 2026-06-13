@@ -140,20 +140,17 @@ pub(super) fn walk(
     // `ast.sequence_count` follows the node-kind-count convention (cf.
     // `ast.member_count` from `member_expression`).
     if state.sequence_expr_count > 0 {
-        metrics.insert(
-            "ast.sequence_count".to_string(),
-            f64::from(state.sequence_expr_count),
-        );
+        metrics.insert("ast.sequence_count", f64::from(state.sequence_expr_count));
     }
     if state.identity_fn_count > 0 {
         metrics.insert(
-            "ast.identity_function_count".to_string(),
+            "ast.identity_function_count",
             f64::from(state.identity_fn_count),
         );
     }
     if state.string_return_fn_count > 0 {
         metrics.insert(
-            "ast.string_return_function_count".to_string(),
+            "ast.string_return_function_count",
             f64::from(state.string_return_fn_count),
         );
     }
@@ -164,25 +161,25 @@ pub(super) fn walk(
     // raw count cannot.
     if state.function_count > 0 && state.string_return_fn_count > 0 {
         metrics.insert(
-            "ast.string_return_function_ratio".to_string(),
+            "ast.string_return_function_ratio",
             f64::from(state.string_return_fn_count) / f64::from(state.function_count),
         );
     }
     if state.xor_mod_loop_count > 0 {
         metrics.insert(
-            "ast.xor_mod_loop_count".to_string(),
+            "ast.xor_mod_loop_count",
             f64::from(state.xor_mod_loop_count),
         );
     }
     if state.max_numeric_sequence_length > 0 {
         metrics.insert(
-            "ast.numeric_sequence_max_length".to_string(),
+            "ast.numeric_sequence_max_length",
             f64::from(state.max_numeric_sequence_length),
         );
     }
     if state.const_return_fn_count > 0 {
         metrics.insert(
-            "ast.const_return_function_count".to_string(),
+            "ast.const_return_function_count",
             f64::from(state.const_return_fn_count),
         );
     }
@@ -193,19 +190,19 @@ pub(super) fn walk(
     // (with a count floor) rather than the size-scaling raw count.
     if state.function_count > 0 && state.const_return_fn_count > 0 {
         metrics.insert(
-            "ast.const_return_function_ratio".to_string(),
+            "ast.const_return_function_ratio",
             f64::from(state.const_return_fn_count) / f64::from(state.function_count),
         );
     }
     if state.self_compare_count > 0 {
         metrics.insert(
-            "ast.self_compare_count".to_string(),
+            "ast.self_compare_count",
             f64::from(state.self_compare_count),
         );
     }
     if state.infinite_loop_count > 0 {
         metrics.insert(
-            "ast.infinite_loop_count".to_string(),
+            "ast.infinite_loop_count",
             f64::from(state.infinite_loop_count),
         );
     }
@@ -327,6 +324,27 @@ fn is_identity_function(node: Node<'_>, source: &str) -> bool {
     returned.is_some_and(|r| param_names.contains(&r))
 }
 
+/// The argument node of a block body's lone `return <expr>`, if the block
+/// holds exactly one non-comment statement and it is a `return` carrying an
+/// argument. `None` otherwise. Comments don't count toward the statement total,
+/// so a documented one-liner still qualifies. This single-return shape is what
+/// the obfuscation-decoder detectors below all key on.
+fn sole_return_argument(body: Node<'_>) -> Option<Node<'_>> {
+    // Exactly one non-comment statement, and it must be a `return` carrying an
+    // argument — a second statement, zero statements, or a non-return all
+    // disqualify (the second `next()` short-circuits multi-statement bodies).
+    let mut cur = body.walk();
+    let mut stmts = body
+        .named_children(&mut cur)
+        .filter(|c| c.kind() != "comment");
+    let stmt = stmts.next()?;
+    if stmts.next().is_some() || stmt.kind() != "return_statement" {
+        return None;
+    }
+    let mut rcur = stmt.walk();
+    stmt.named_children(&mut rcur).next()
+}
+
 /// The single identifier returned by a function body, if the body is exactly
 /// one `return <identifier>` (JS `{ return x }` / arrow `x` / Python `return x`).
 fn returned_identifier<'a>(body: Node<'_>, bytes: &'a [u8]) -> Option<&'a str> {
@@ -334,25 +352,13 @@ fn returned_identifier<'a>(body: Node<'_>, bytes: &'a [u8]) -> Option<&'a str> {
     if body.kind() == "identifier" {
         return body.utf8_text(bytes).ok();
     }
-    // Block body: find a lone return_statement with an identifier argument.
-    let mut cur = body.walk();
-    let mut ret_id = None;
-    let mut stmt_count = 0u32;
-    for child in body.named_children(&mut cur) {
-        if child.kind() == "comment" {
-            continue;
-        }
-        stmt_count += 1;
-        if child.kind() == "return_statement" {
-            let mut rcur = child.walk();
-            if let Some(arg) = child.named_children(&mut rcur).next() {
-                if arg.kind() == "identifier" {
-                    ret_id = arg.utf8_text(bytes).ok();
-                }
-            }
-        }
+    // Block body: a lone `return <identifier>`.
+    let arg = sole_return_argument(body)?;
+    if arg.kind() == "identifier" {
+        arg.utf8_text(bytes).ok()
+    } else {
+        None
     }
-    if stmt_count == 1 { ret_id } else { None }
 }
 
 /// True when `node` is a function whose entire body is a single
@@ -360,7 +366,7 @@ fn returned_identifier<'a>(body: Node<'_>, bytes: &'a [u8]) -> Option<&'a str> {
 /// The substitution-table obfuscation shape — decoder functions that just
 /// return a fixed string — replaces tree-sitter `(function_declaration body:
 /// (statement_block (return_statement (string))))` queries.
-fn is_string_return_function(node: Node<'_>, source: &str) -> bool {
+fn is_string_return_function(node: Node<'_>) -> bool {
     if !matches!(
         node.kind(),
         "function_declaration"
@@ -378,26 +384,8 @@ fn is_string_return_function(node: Node<'_>, source: &str) -> bool {
     if is_static_string_literal(body) {
         return true;
     }
-    // Block body: a lone return_statement whose argument is a string literal.
-    let _ = source;
-    let mut cur = body.walk();
-    let mut stmt_count = 0u32;
-    let mut returns_string = false;
-    for child in body.named_children(&mut cur) {
-        if child.kind() == "comment" {
-            continue;
-        }
-        stmt_count += 1;
-        if child.kind() == "return_statement" {
-            let mut rcur = child.walk();
-            if let Some(arg) = child.named_children(&mut rcur).next() {
-                if is_static_string_literal(arg) {
-                    returns_string = true;
-                }
-            }
-        }
-    }
-    stmt_count == 1 && returns_string
+    // Block body: a lone `return <string-literal>`.
+    sole_return_argument(body).is_some_and(is_static_string_literal)
 }
 
 /// A function that returns a **static** string literal is the substitution-table
@@ -444,7 +432,7 @@ fn is_literal_or_identifier(node: Node<'_>) -> bool {
 /// is such). The dead-code / opaque padding shape — many of these in one file
 /// dilute static and ML analysis. Parameterless distinguishes it from an
 /// identity proxy (`function(x){ return x }`).
-fn is_const_return_function(node: Node<'_>, source: &str) -> bool {
+fn is_const_return_function(node: Node<'_>) -> bool {
     if !matches!(
         node.kind(),
         "function_declaration"
@@ -455,7 +443,6 @@ fn is_const_return_function(node: Node<'_>, source: &str) -> bool {
     ) {
         return false;
     }
-    let _ = source;
     // Parameterless: a `parameters`/`formal_parameters` node with no named children.
     let Some(params) = node.child_by_field_name("parameters") else {
         return false;
@@ -470,25 +457,8 @@ fn is_const_return_function(node: Node<'_>, source: &str) -> bool {
     if is_literal_or_identifier(body) {
         return true;
     }
-    // Block body: a lone return_statement whose argument is a literal/identifier.
-    let mut cur = body.walk();
-    let mut stmt_count = 0u32;
-    let mut const_return = false;
-    for child in body.named_children(&mut cur) {
-        if child.kind() == "comment" {
-            continue;
-        }
-        stmt_count += 1;
-        if child.kind() == "return_statement" {
-            let mut rcur = child.walk();
-            if let Some(arg) = child.named_children(&mut rcur).next() {
-                if is_literal_or_identifier(arg) {
-                    const_return = true;
-                }
-            }
-        }
-    }
-    stmt_count == 1 && const_return
+    // Block body: a lone `return <literal/identifier>`.
+    sole_return_argument(body).is_some_and(is_literal_or_identifier)
 }
 
 /// True when `node` is a loop with a literally-true condition: `while true`,
@@ -550,7 +520,7 @@ struct State {
     /// `mod` → 3, …), tallied during the single existing walk. Emitted as
     /// `ast.op.<name>` metrics so density rules match O(1) via `type: metrics`
     /// with no per-occurrence facts — the lowest-overhead operator-density form.
-    op_counts: BTreeMap<String, u32>,
+    op_counts: BTreeMap<&'static str, u32>,
     node_count: u64,
     max_depth: u32,
     max_member_chain_depth: u32,
@@ -684,7 +654,7 @@ impl State {
         if let Some(op_node) = node.child_by_field_name("operator") {
             if let Ok(op) = op_node.utf8_text(source.as_bytes()) {
                 if let Some(name) = canonical_op(op) {
-                    *self.op_counts.entry(name.to_string()).or_insert(0) += 1;
+                    *self.op_counts.entry(name).or_insert(0) += 1;
                     // Rolling-XOR decode shape: an `^` whose operand subtree
                     // contains a `%` (cyclic key index, `data[i] ^ key[i % n]`).
                     // Recognized across JS / Python / Go without a per-language
@@ -761,14 +731,14 @@ impl State {
         // whose entire body is a single `return <string-literal>`. Many of
         // these in one file is the substitution-table obfuscation shape
         // (decoder functions that just hand back a fixed string).
-        if is_string_return_function(node, source) {
+        if is_string_return_function(node) {
             self.string_return_fn_count += 1;
         }
 
         // Constant-return padding functions (`function(){ return 0 }` /
         // `function(){ return "x" }` with no parameters): dead-code/opaque
         // padding. Parameterless distinguishes it from an identity proxy.
-        if is_const_return_function(node, source) {
+        if is_const_return_function(node) {
             self.const_return_fn_count += 1;
         }
 

@@ -774,7 +774,7 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
     // Overlapping PT_LOAD pairs — sort by start address, then any
     // segment whose end exceeds the next segment's start overlaps.
     if load_ranges.len() > 1 {
-        let mut sorted = load_ranges.clone();
+        let mut sorted = load_ranges;
         sorted.sort_by_key(|t| t.0);
         let mut overlap_idxs: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for w in sorted.windows(2) {

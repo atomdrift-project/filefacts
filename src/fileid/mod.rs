@@ -751,9 +751,7 @@ fn is_benign_extension_mismatch(path: &Path, data: &[u8], det: Detection) -> boo
     if ext_type == FileType::Html && content == FileType::Xml {
         let n = data.len().min(4096);
         let prefix = String::from_utf8_lossy(&data[..n]).to_ascii_lowercase();
-        if prefix.contains("<!doctype html") || prefix.contains("<html") {
-            return true;
-        }
+        return prefix.contains("<!doctype html") || prefix.contains("<html");
     }
     false
 }

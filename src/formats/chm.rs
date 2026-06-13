@@ -527,7 +527,7 @@ fn emit_system(bytes: &[u8], values: &mut Values) -> SystemSummary {
                 insert_cstr(&mut sys, "chm_filename", payload);
             }
             9 => {
-                if let Some(_) = insert_cstr(&mut sys, "compiler_version", payload) {
+                if insert_cstr(&mut sys, "compiler_version", payload).is_some() {
                     summary.has_compiler_version = true;
                 }
             }

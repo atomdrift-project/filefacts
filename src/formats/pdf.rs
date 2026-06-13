@@ -359,11 +359,9 @@ pub(super) fn extract(
     // is set. Used by trait rules detecting staged JavaScript or
     // recognizable form authoring fingerprints.
     let form_fields = scan_form_fields(bytes, &dict_regions);
-    if !form_fields.is_empty() {
-        metrics.insert("pdf.form_field_count", form_fields.len() as f64);
-    }
     derive_form_field_metrics(&form_fields, metrics);
     if !form_fields.is_empty() {
+        metrics.insert("pdf.form_field_count", form_fields.len() as f64);
         values.insert("pdf.form_fields", JsonValue::Array(form_fields));
     }
 

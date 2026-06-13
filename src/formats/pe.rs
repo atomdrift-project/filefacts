@@ -103,7 +103,14 @@ pub(super) fn extract(
             // aborting the whole extraction.
             let walk = goblin_safe::catch_infallible(|| {
                 resource_types(rd, values, metrics);
-                resource_timestamp(rd, values);
+                // Resource-directory TimeDateStamp, set by the resource
+                // compiler at link time. Often stable across rebuilds, so a
+                // change between releases of an otherwise-stable binary is a
+                // tampering signal.
+                let ts = rd.image_resource_directory.time_date_stamp;
+                if ts != 0 {
+                    put_u64(values, "pe.resource_timestamp", u64::from(ts));
+                }
                 // Presence flags emitted authoritatively from the
                 // resource directory walker — distinct from whether
                 // the version/manifest extraction populated any
@@ -513,6 +520,21 @@ fn exports(
     }
 }
 
+/// Locate the Certificate Table (Authenticode) directory, record its byte
+/// count as `pe.cert_table_size`, and return the signature blob's
+/// `(file_offset, size)`. `None` when the optional header has no cert-table
+/// directory or it is empty — the shared front half of both Authenticode
+/// readers below. For this directory alone the `virtual_address` is a true
+/// file offset (a PE/COFF spec carve-out), so callers read the bytes directly.
+fn cert_table_extent(opt: &OptionalHeader, metrics: &mut Metrics) -> Option<(usize, usize)> {
+    let dir = opt.data_directories.get_certificate_table()?;
+    if dir.size == 0 {
+        return None;
+    }
+    metrics.insert("pe.cert_table_size", f64::from(dir.size));
+    Some((dir.virtual_address as usize, dir.size as usize))
+}
+
 /// Authenticode lookup using only the parsed header — used when the
 /// full goblin parse fails and we fall back to a header-only walk.
 ///
@@ -521,7 +543,7 @@ fn exports(
 /// When the cert-table directory is set but the bytes are truncated
 /// or refuse to parse, no `pe.signatures` entry is emitted; consumers
 /// distinguish "no signature claim" from "claimed but unparseable" via
-/// the secondary `pe.cert_table_size` marker below.
+/// the secondary `pe.cert_table_size` marker.
 fn authenticode_from_header(
     header: &goblin::pe::header::Header,
     bytes: &[u8],
@@ -531,15 +553,9 @@ fn authenticode_from_header(
     let Some(opt) = header.optional_header.as_ref() else {
         return;
     };
-    let Some(dir) = opt.data_directories.get_certificate_table() else {
+    let Some((offset, size)) = cert_table_extent(opt, metrics) else {
         return;
     };
-    if dir.size == 0 {
-        return;
-    }
-    metrics.insert("pe.cert_table_size", f64::from(dir.size));
-    let offset = dir.virtual_address as usize;
-    let size = dir.size as usize;
     if offset.saturating_add(size) > bytes.len() {
         return;
     }
@@ -565,20 +581,12 @@ fn authenticode(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Me
     let Some(opt) = pe.header.optional_header.as_ref() else {
         return;
     };
-    let Some(dir) = opt.data_directories.get_certificate_table() else {
+    let Some((offset, size)) = cert_table_extent(opt, metrics) else {
         return;
     };
-    if dir.size == 0 {
-        return;
-    }
-    metrics.insert("pe.cert_table_size", f64::from(dir.size));
-    let offset = dir.virtual_address as usize;
-    let size = dir.size as usize;
-    // The security-directory virtual_address is supposed to be an
-    // in-file offset (PE/COFF spec carves an exception for the
-    // Certificate Table). When the bytes it points at fall outside
-    // the file, the header has been tampered with — emit a flag so
-    // downstream callers don't have to redo the bounds check.
+    // When the bytes the cert-table points at fall outside the file, the
+    // header has been tampered with — emit a flag so downstream callers
+    // don't have to redo the bounds check.
     if offset > 0 && offset.saturating_add(size) > bytes.len() {
         metrics.insert("pe.security_directory_out_of_bounds", 1.0);
         return;
@@ -1173,17 +1181,17 @@ fn section_anomalies(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &m
     let mut misaligned_names: Vec<String> = Vec::new();
     let mut bss_like: u64 = 0;
     for section in &pe.sections {
-        let name = section.name().unwrap_or("").to_string();
+        let name = section.name().unwrap_or("");
         let raw_end = u64::from(section.pointer_to_raw_data)
             .saturating_add(u64::from(section.size_of_raw_data));
         if section.size_of_raw_data > 0 && raw_end > file_size {
-            overflow_names.push(name.clone());
+            overflow_names.push(name.to_string());
         }
         if file_alignment > 0
             && section.pointer_to_raw_data != 0
             && section.pointer_to_raw_data % file_alignment != 0
         {
-            misaligned_names.push(name.clone());
+            misaligned_names.push(name.to_string());
         }
         // BSS-like: raw size zero, virtual size non-zero, name not in
         // the standard set (`.bss`/`.tls`). Standard names on legitimate
@@ -1220,33 +1228,36 @@ fn section_anomalies(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &m
     // Section overlap (virtual extent intersection). O(n log n) over
     // a section count capped at ~96 by the COFF format.
     if pe.sections.len() > 1 {
-        let mut by_va: Vec<(u32, u32, String)> = pe
+        let mut by_va: Vec<(u32, u32, &str)> = pe
             .sections
             .iter()
             .map(|s| {
                 let span = s.virtual_size.max(s.size_of_raw_data);
-                let name = s.name().unwrap_or("").to_string();
                 (
                     s.virtual_address,
                     s.virtual_address.saturating_add(span),
-                    name,
+                    s.name().unwrap_or(""),
                 )
             })
             .collect();
         by_va.sort_by_key(|t| t.0);
-        let mut overlap_names: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
+        let mut overlap_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for w in by_va.windows(2) {
             if w[0].1 > w[1].0 && w[1].0 >= w[0].0 {
-                overlap_names.insert(w[0].2.clone());
-                overlap_names.insert(w[1].2.clone());
+                overlap_names.insert(w[0].2);
+                overlap_names.insert(w[1].2);
             }
         }
         if !overlap_names.is_empty() {
             metrics.insert("pe.section_overlap_count", overlap_names.len() as f64);
             values.insert(
                 "pe.overlapping_sections",
-                JsonValue::Array(overlap_names.into_iter().map(JsonValue::String).collect()),
+                JsonValue::Array(
+                    overlap_names
+                        .into_iter()
+                        .map(|s| JsonValue::String(s.to_string()))
+                        .collect(),
+                ),
             );
         }
     }
@@ -1747,13 +1758,7 @@ fn read_cstring_at_rva(pe: &PE<'_>, bytes: &[u8], rva: u32) -> String {
     let Some(off) = rva_to_file_offset(pe, rva) else {
         return String::new();
     };
-    let cap = bytes.len().min(off.saturating_add(512));
-    if off >= cap {
-        return String::new();
-    }
-    let tail = &bytes[off..cap];
-    let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
-    std::str::from_utf8(&tail[..end]).unwrap_or("").to_string()
+    read_cstring_at_rva_inner(bytes, off)
 }
 
 /// Read an IMAGE_IMPORT_BY_NAME { hint: WORD, name: CSTR } at the
@@ -1769,6 +1774,8 @@ fn read_hint_name(pe: &PE<'_>, bytes: &[u8], rva: u32) -> String {
     read_cstring_at_rva_inner(bytes, off + 2)
 }
 
+/// Read a NUL-terminated, UTF-8 (ASCII by spec) string at a file offset,
+/// capped at 512 bytes. The shared core of both RVA-string readers.
 fn read_cstring_at_rva_inner(bytes: &[u8], off: usize) -> String {
     let cap = bytes.len().min(off.saturating_add(512));
     if off >= cap {
@@ -1929,16 +1936,6 @@ fn guard_flag_names(flags: u32) -> Vec<&'static str> {
 }
 
 /// `IMAGE_RESOURCE_DIRECTORY.TimeDateStamp` — independent of the COFF
-/// `TimeDateStamp`, set by the resource compiler at link time. Often
-/// left untouched across rebuilds, so a change between releases of an
-/// otherwise-stable binary is a tampering signal.
-fn resource_timestamp(rd: &goblin::pe::resource::ResourceData<'_>, values: &mut Values) {
-    let ts = rd.image_resource_directory.time_date_stamp;
-    if ts != 0 {
-        put_u64(values, "pe.resource_timestamp", u64::from(ts));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
