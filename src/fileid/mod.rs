@@ -563,7 +563,6 @@ impl FileType {
                 | Self::Rust
                 | Self::Shell
                 | Self::PowerShell
-                | Self::Jcl
                 | Self::Kotlin
                 | Self::Java
                 | Self::Go

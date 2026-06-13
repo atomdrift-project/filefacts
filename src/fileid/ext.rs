@@ -271,6 +271,7 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "ps1" | "psm1" | "psd1" => Some(FileType::PowerShell),
         "kt" | "kts" => Some(FileType::Kotlin),
         "bat" | "cmd" => Some(FileType::Batch),
+        "jcl" => Some(FileType::Jcl),
         "vbs" | "vbe" | "wsf" | "wsc" | "wsh" => Some(FileType::Vbs),
         "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" | "hxx" | "hh" | "pas" | "dpr" | "asm" | "s"
         | "nasm" => Some(FileType::C),
