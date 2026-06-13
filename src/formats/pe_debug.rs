@@ -21,8 +21,13 @@ use crate::output::Values;
 /// surfaces traits use to flag mismatches against the binary's own
 /// filename (build-pipeline anomaly / commodity-malware repacks reuse
 /// PDB stems across renamed binaries).
-fn put_pdb_path(values: &mut Values, path: &str) {
+fn put_pdb_path(values: &mut Values, path: &str, path_offset: Option<u64>) {
     put_str(values, "pe.debug.pdb.path", path);
+    // Anchor the value at the filename string in the CodeView blob so a
+    // `type: value` match on `pe.debug.pdb.path` renders in the hex view.
+    if let Some(off) = path_offset {
+        put_u64(values, "pe.debug.pdb.path_offset", off);
+    }
     let name = basename(path);
     if !name.is_empty() {
         put_str(values, "pe.debug.pdb.basename", name);
@@ -62,7 +67,11 @@ pub(super) fn extract(debug: &DebugData<'_>, values: &mut Values) {
         if let Ok(path) = std::str::from_utf8(cv.filename) {
             let path = path.trim_end_matches('\0');
             if !path.is_empty() {
-                put_pdb_path(values, path);
+                // NB10 header: CvSignature + Offset + Signature + Age = 16 bytes
+                // before the filename.
+                let path_offset =
+                    find_codeview_entry(debug).map(|idd| u64::from(idd.pointer_to_raw_data) + 16);
+                put_pdb_path(values, path, path_offset);
             }
         }
         put_u64(values, "pe.debug.pdb.age", u64::from(cv.age));
@@ -75,7 +84,11 @@ fn codeview_pdb70(cv: &CodeviewPDB70DebugInfo<'_>, debug: &DebugData<'_>, values
         // trim the trailing NULs before exposing.
         let path = path.trim_end_matches('\0');
         if !path.is_empty() {
-            put_pdb_path(values, path);
+            // RSDS header: CvSignature(4) + Signature/GUID(16) + Age(4) = 24
+            // bytes before the filename string.
+            let path_offset =
+                find_codeview_entry(debug).map(|idd| u64::from(idd.pointer_to_raw_data) + 24);
+            put_pdb_path(values, path, path_offset);
         }
     }
     put_str(values, "pe.debug.pdb.guid", format_guid(&cv.signature));
@@ -278,7 +291,7 @@ mod tests {
     /// `(path, basename, stem)`.
     fn pdb_facts(path: &str) -> (Option<String>, Option<String>, Option<String>) {
         let mut v = Values::new();
-        super::put_pdb_path(&mut v, path);
+        super::put_pdb_path(&mut v, path, Some(0x1234));
         (
             v.get("pe.debug.pdb.path")
                 .and_then(|x| x.as_str())
