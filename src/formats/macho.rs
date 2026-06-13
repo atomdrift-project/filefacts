@@ -525,11 +525,14 @@ fn extract_header_and_loads(
     // dSYM correlation and crash-report symbolication. The canonical
     // text form is the lowercase 8-4-4-4-12 hyphenated layout that
     // `dwarfdump --uuid` emits.
-    if let Some(uuid) = macho.load_commands.iter().find_map(|lc| match lc.command {
-        mach::load_command::CommandVariant::Uuid(c) => Some(c.uuid),
+    if let Some((uuid, lc_offset)) = macho.load_commands.iter().find_map(|lc| match lc.command {
+        mach::load_command::CommandVariant::Uuid(c) => Some((c.uuid, lc.offset)),
         _ => None,
     }) {
         put_str(values, "macho.uuid", format_macho_uuid(&uuid));
+        // Anchor the value at the 16 UUID bytes (past the 8-byte cmd/cmdsize
+        // header), so a `value` match on `macho.uuid` renders in the hex view.
+        put_u64(values, "macho.uuid_offset", (lc_offset + 8) as u64);
     }
 
     // __TEXT,__info_plist — many Apple tools embed a CFBundle-style

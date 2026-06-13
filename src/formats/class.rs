@@ -54,6 +54,9 @@ const CP_PACKAGE: u8 = 20;
 #[derive(Default)]
 struct ConstantPool {
     utf8: HashMap<u16, String>,
+    /// Byte offset of each `CONSTANT_Utf8_info` entry's string data, so
+    /// constant-pool-derived imports can anchor where the name physically sits.
+    utf8_offset: HashMap<u16, u64>,
     class: HashMap<u16, u16>,
     /// `CONSTANT_NameAndType_info` -> (name_idx, descriptor_idx).
     /// Needed to resolve methodref / fieldref entries to readable
@@ -70,6 +73,19 @@ impl ConstantPool {
     fn class_name(&self, class_idx: u16) -> Option<&str> {
         let name_idx = *self.class.get(&class_idx)?;
         self.utf8.get(&name_idx).map(String::as_str)
+    }
+
+    /// File offset of a class entry's name string, for anchoring class imports.
+    fn class_name_offset(&self, class_idx: u16) -> Option<u64> {
+        self.utf8_offset.get(self.class.get(&class_idx)?).copied()
+    }
+
+    /// File offset of a methodref's method-name string, for anchoring
+    /// methodref-resolved imports.
+    fn methodref_name_offset(&self, idx: u16) -> Option<u64> {
+        let (_class_idx, nat_idx) = *self.methodref.get(&idx)?;
+        let (name_idx, _desc_idx) = *self.name_and_type.get(&nat_idx)?;
+        self.utf8_offset.get(&name_idx).copied()
     }
 
     /// Resolve a methodref-like CP entry to `(owning_class, name,
@@ -402,7 +418,7 @@ fn populate_imports(
             name: name.to_string(),
             alias: None,
             library: None,
-            offset: None,
+            offset: cp.class_name_offset(idx),
             ordinal: None,
         });
         class_count = class_count.saturating_add(1);
@@ -425,7 +441,7 @@ fn populate_imports(
             name: name.to_string(),
             alias: None,
             library: Some(owner.to_string()),
-            offset: None,
+            offset: cp.methodref_name_offset(idx),
             ordinal: None,
         });
         method_ref_count = method_ref_count.saturating_add(1);
@@ -468,6 +484,7 @@ fn parse_constant_pool(bytes: &[u8], pos: &mut usize, count: usize) -> Option<Co
                 }
                 let s = String::from_utf8_lossy(&bytes[*pos..end]).into_owned();
                 cp.utf8.insert(i as u16, s);
+                cp.utf8_offset.insert(i as u16, *pos as u64);
                 *pos = end;
             }
             CP_CLASS => {
@@ -696,6 +713,28 @@ mod tests {
         // No methods were declared by the builder.
         assert_eq!(m.get("class.method_count"), Some(0.0));
         assert_eq!(symbols.iter_kind(crate::SymbolKind::Function).count(), 0);
+    }
+
+    #[test]
+    fn class_imports_carry_constant_pool_offset() {
+        let bytes = build_class(52, false);
+        let (_, _, symbols) = run_full(&bytes);
+        let offset = symbols
+            .iter_kind(crate::SymbolKind::Import)
+            .find_map(|s| match s {
+                crate::Symbol::Import { name, offset, .. } if name == "java/lang/Object" => {
+                    Some(*offset)
+                }
+                _ => None,
+            })
+            .expect("java/lang/Object import present");
+        // Anchors at the Utf8 string data for the class name in the constant pool.
+        let want = bytes
+            .windows("java/lang/Object".len())
+            .position(|w| w == b"java/lang/Object")
+            .map(|p| p as u64);
+        assert!(want.is_some(), "fixture should contain the class name");
+        assert_eq!(offset, want, "class import must anchor at its CP Utf8 offset");
     }
 
     #[test]
