@@ -188,6 +188,7 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::DesktopEntry
         | FileType::Xml
         | FileType::PkgInfo
+        | FileType::SrcInfo
         | FileType::Plist
         | FileType::Makefile
         | FileType::Dockerfile => "config",
@@ -339,6 +340,8 @@ pub enum FileType {
     Xml,
     /// Python package metadata (PKG-INFO, METADATA)
     PkgInfo,
+    /// Arch/AUR generated package metadata (.SRCINFO) — normalized mirror of PKGBUILD
+    SrcInfo,
     /// ZIP archive (zip, apk, ipa, nupkg, etc.)
     Zip,
     /// TAR archive (plain, no compression)

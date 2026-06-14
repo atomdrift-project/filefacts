@@ -193,6 +193,12 @@ fn detect_from_filename(path: &Path) -> Option<FileType> {
     if name == "PKGBUILD" {
         return Some(FileType::Shell);
     }
+    // Arch/AUR .SRCINFO: the machine-generated, normalized mirror of PKGBUILD
+    // metadata (key = value lines). Parsed into a pkg.* value tree so it can be
+    // compared field-by-field against the PKGBUILD that should have produced it.
+    if name.eq_ignore_ascii_case(".SRCINFO") {
+        return Some(FileType::SrcInfo);
+    }
     // Meson build files. Their own DSL (not source code); classify as a build
     // file so source/AST traits (e.g. JavaScript obfuscation) do not run on them.
     if name.eq_ignore_ascii_case("meson.build")

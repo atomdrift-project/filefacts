@@ -435,6 +435,7 @@ fn run_extraction(
                 sections: &mut sections,
                 symbols: &mut symbols,
                 errors: &mut errors,
+                basename,
             },
         )
     }));

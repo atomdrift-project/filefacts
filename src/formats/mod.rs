@@ -29,6 +29,9 @@ pub(crate) struct ExtractCtx<'a> {
     pub(crate) sections: &'a mut Vec<Section>,
     pub(crate) symbols: &'a mut Symbols,
     pub(crate) errors: &'a mut Errors,
+    /// File basename, when known — lets format-agnostic types (e.g. Shell)
+    /// dispatch on a recognized filename such as `PKGBUILD`.
+    pub(crate) basename: Option<&'a str>,
 }
 
 mod asar;
@@ -67,6 +70,7 @@ mod pe_debug;
 mod pe_image_hash;
 mod pe_manifest;
 mod pe_rich;
+mod pkgmeta;
 mod pe_version_info;
 mod pickle;
 mod png;
@@ -102,6 +106,7 @@ pub(crate) fn extract(
         sections,
         symbols,
         errors,
+        basename,
     } = ctx;
     // Every file gets the generic byte-level metrics. Format-specific
     // extractors layer on top of (and may shadow with more accurate
@@ -232,6 +237,7 @@ pub(crate) fn extract(
         FileType::GithubActions => structured::extract_yaml(bytes, values),
         FileType::Plist => structured::extract_plist(bytes, values),
         FileType::PkgInfo => structured::extract_pkginfo(bytes, values),
+        FileType::SrcInfo => pkgmeta::extract_srcinfo(bytes, values),
         FileType::Chm => chm::extract(bytes, values, strings, metrics),
         FileType::JavaClass => class::extract(bytes, values, strings, metrics, symbols),
         FileType::Jpeg => jpeg::extract(bytes, values, strings, metrics),
@@ -254,7 +260,6 @@ pub(crate) fn extract(
         | FileType::Go
         | FileType::Rust
         | FileType::Java
-        | FileType::Shell
         | FileType::Php
         | FileType::Ruby
         | FileType::Lua
@@ -274,6 +279,19 @@ pub(crate) fn extract(
         | FileType::Makefile => source::extract(
             bytes, file_type, tree_cache, values, strings, metrics, symbols,
         ),
+
+        // Shell gets the normal source/AST extraction; a PKGBUILD additionally
+        // gets its package-metadata fields lifted into a pkg.* value tree so it
+        // can be compared field-for-field against a sibling .SRCINFO.
+        FileType::Shell => {
+            let r = source::extract(
+                bytes, file_type, tree_cache, values, strings, metrics, symbols,
+            );
+            if basename == Some("PKGBUILD") {
+                let _ = pkgmeta::extract_pkgbuild(bytes, values);
+            }
+            r
+        }
 
         // Text-like languages without a tree-sitter binding in filefacts.
         // They still earn `text.*` metrics — pure byte/line analysis,
