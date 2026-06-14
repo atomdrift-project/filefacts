@@ -201,7 +201,17 @@ fn detect_from_filename(path: &Path) -> Option<FileType> {
     {
         return Some(FileType::Makefile);
     }
-    if name.eq_ignore_ascii_case("LICENSE") || name.eq_ignore_ascii_case("COPYING") {
+    // License / copying files are plain text. Match the canonical names and
+    // their license-name suffixes (LICENSE.GPLv3, LICENSE.LGPLv3, COPYING.LESSER,
+    // LICENSE.txt, LICENSE-MIT) so content sniffing never scores license prose
+    // as a programming language. Defer to the extension when it names a real
+    // code type, so a source file like `license-checker.js` stays JavaScript.
+    if let Some(stem) = name.split(['.', '-']).next()
+        && (stem.eq_ignore_ascii_case("LICENSE")
+            || stem.eq_ignore_ascii_case("LICENCE")
+            || stem.eq_ignore_ascii_case("COPYING"))
+        && detect_from_extension(path).is_none_or(|ft| ft == FileType::Text)
+    {
         return Some(FileType::Text);
     }
 
@@ -767,5 +777,33 @@ mod tests {
                 "{name} should be Text, not JavaScript or Kotlin"
             );
         }
+    }
+
+    #[test]
+    fn license_files_are_text_not_source() {
+        // License/copying files (incl. license-name suffixes) are plain text —
+        // otherwise their prose content-sniffs to a programming language.
+        for name in [
+            "LICENSE",
+            "licence",
+            "LICENSE.txt",
+            "LICENSE.GPLv3",
+            "LICENSE.LGPLv3",
+            "COPYING",
+            "COPYING.LESSER",
+            "LICENSE-MIT",
+        ] {
+            assert_eq!(
+                detect_from_path(Path::new(name)),
+                Some(FileType::Text),
+                "{name} should be Text"
+            );
+        }
+        // A source file merely starting with "license" keeps its code type.
+        assert_eq!(
+            detect_from_path(Path::new("license-checker.js")),
+            Some(FileType::JavaScript),
+            "license-checker.js must stay JavaScript"
+        );
     }
 }

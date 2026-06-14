@@ -317,6 +317,18 @@ fn scan_scores(data: &[u8]) -> [u16; LANG_COUNT] {
                     continue;
                 }
             }
+            // `document.`/`window.` are JS DOM-global accesses only when a member
+            // name follows (document.getElementById, window.location). English
+            // prose ends sentences with "…this document." / "…the window.", where
+            // the dot is followed by whitespace/EOL/an uppercase next sentence —
+            // never a lowercase member. Require a lowercase member char so a
+            // license, README, or changelog does not score as JavaScript.
+            let m = &data[mat.start()..mat.end()];
+            if (m == b"document." || m == b"window.")
+                && !data.get(mat.end()).is_some_and(u8::is_ascii_lowercase)
+            {
+                continue;
+            }
             let entry = &s.entries[mat.pattern().as_usize()];
             let idx = entry.lang.idx();
             scores[idx] = scores[idx].saturating_add(u16::from(entry.weight));
@@ -375,6 +387,25 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
     // Ambiguity: if the second-best is close (within 60%), bail
     if second_score > 0 && second_score * 100 / best_score > 60 {
         return None;
+    }
+
+    // JavaScript's supporting tokens (`var `/`let `/`const `/`document.`…) are
+    // short and accumulate in English prose — a license that mentions "tablet"
+    // and "outlet" hits `let ` twice (= THRESHOLD), and a README ending
+    // sentences with "this document." scores too. Real JavaScript also carries
+    // structural syntax: statement terminators and block braces. Require that
+    // structure so keyword hits alone never type prose as JavaScript. (Only the
+    // heuristic stage is gated — files with a real `.js` extension are resolved
+    // earlier by extension and never reach here.)
+    if lang == Lang::JavaScript {
+        let has_structure = |b: &[u8]| b.iter().any(|&c| matches!(c, b';' | b'{' | b'}'));
+        let structured = has_structure(&data[..data.len().min(SCAN_LIMIT)])
+            || (is_mostly_whitespace(data, SCAN_LIMIT)
+                && data.len() > SCAN_LIMIT
+                && has_structure(&data[data.len().saturating_sub(TAIL_SIZE)..]));
+        if !structured {
+            return None;
+        }
     }
 
     Some(lang.to_file_type())
@@ -468,6 +499,25 @@ mod tests {
     #[test]
     fn javascript_iife_console() {
         let data = b"(function() { var x = 1; console.log(x); })();\n";
+        assert_eq!(detect_from_content(data), Some(FileType::JavaScript));
+    }
+
+    #[test]
+    fn license_prose_not_javascript() {
+        // GPL/LGPL prose hits JS keyword tokens — "this document." (document.),
+        // and "tablet"/"outlet"/"let you" (let ) — but has no JS structure
+        // (`;`/`{`/`}`). It must not classify as JavaScript on keywords alone.
+        let data = b"You may copy and distribute verbatim copies of this document. \
+A tablet or outlet may let you study the freedom this license grants. \
+Everyone is permitted to copy this document. then let recipients know their rights.";
+        assert_ne!(detect_from_content(data), Some(FileType::JavaScript));
+    }
+
+    #[test]
+    fn javascript_dom_with_structure_still_detected() {
+        // Real DOM JS: document.<member>/window.<member> plus a statement
+        // terminator — structure present, so it detects.
+        let data = b"const el = document.getElementById('x');\nwindow.location = el;\n";
         assert_eq!(detect_from_content(data), Some(FileType::JavaScript));
     }
 
