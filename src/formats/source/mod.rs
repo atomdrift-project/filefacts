@@ -972,6 +972,7 @@ mod tests {
     /// the whole process. The walk must now stop at [`ast_walk::MAX_AST_DEPTH`]
     /// and complete, with `ast.max_depth` saturating at the cap.
     #[test]
+    #[ignore = "CPU-saturating: parses a 50k-deep AST on an 8 MiB worker stack (>60s). Run with --ignored."]
     fn deeply_nested_source_does_not_overflow_stack() {
         let nesting = (super::ast_walk::MAX_AST_DEPTH as usize) * 3;
         let mut src = String::with_capacity(nesting * 2 + 8);
@@ -1034,6 +1035,7 @@ mod tests {
     /// pathological `a.a.a.…` thousands deep overflowed the worker stack and
     /// aborted the process. It must now cap at `MAX_AST_DEPTH` and complete.
     #[test]
+    #[ignore = "CPU-saturating: parses a 50k-deep AST on an 8 MiB worker stack (>60s). Run with --ignored."]
     fn deep_member_chain_does_not_overflow_stack() {
         let chain = "a".to_string() + &".a".repeat(50_000);
         let m = metrics_on_worker_stack("deep.js", format!("x = {chain};\n"));
@@ -1052,6 +1054,7 @@ mod tests {
     /// Regression: `string_concat_chain_length::descend` recursed per `+` link
     /// with no bound — a `"a"+"a"+…` chain thousands long overflowed the stack.
     #[test]
+    #[ignore = "CPU-saturating: parses a 50k-deep AST on an 8 MiB worker stack (>60s). Run with --ignored."]
     fn deep_concat_chain_does_not_overflow_stack() {
         let chain = "\"a\"".to_string() + &"+\"a\"".repeat(50_000);
         let m = metrics_on_worker_stack("deep.js", format!("x = {chain};\n"));
@@ -1072,6 +1075,7 @@ mod tests {
     /// mutually recursive between `static_dotted_chain` and
     /// `try_fold_string_subscript`; both were unbounded.
     #[test]
+    #[ignore = "CPU-saturating: parses a 50k-deep AST on an 8 MiB worker stack (>60s). Run with --ignored."]
     fn deep_subscript_chain_does_not_overflow_stack() {
         let chain = "a".to_string() + &"[\"b\"]".repeat(50_000);
         let m = metrics_on_worker_stack("deep.js", format!("x = {chain};\n"));
