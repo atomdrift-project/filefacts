@@ -70,9 +70,9 @@ mod pe_debug;
 mod pe_image_hash;
 mod pe_manifest;
 mod pe_rich;
-mod pkgmeta;
 mod pe_version_info;
 mod pickle;
+mod pkgmeta;
 mod png;
 mod pyc;
 mod rpm;
@@ -313,12 +313,19 @@ pub(crate) fn extract(
     };
 
     // filefacts is the single string-extraction authority. Binary formats
-    // (PE/ELF/Mach-O and friends) already ran the stng scan; every other type
-    // — source, structured, and unsupported — still needs `text.*` populated so
-    // downstream consumers see one consistent string view. Run the same rich
-    // stng extraction here when the format handler produced no byte-scan strings
+    // (PE/ELF/Mach-O and friends) already ran the stng scan; source and
+    // unsupported text-like files still need a `strings(1)`-tier view, so run
+    // the rich stng extraction here when the format handler produced none
     // (source files keep their tree-sitter `literals`/`comments` alongside).
-    if strings.text.ascii.is_empty() && strings.text.utf16le.is_empty() {
+    //
+    // Structured manifests are excluded: their whole content is already in the
+    // `values` tree, so byte-scanning the same bytes would only duplicate it as
+    // noise. (Generic `Json`/`Gyp` are *not* structured-data here — when their
+    // size-limited parse is skipped they legitimately fall through to a scan.)
+    if !file_type.is_structured_data()
+        && strings.text.ascii.is_empty()
+        && strings.text.utf16le.is_empty()
+    {
         common::extract_binary_strings(bytes, strings);
     }
 

@@ -57,8 +57,8 @@ fn is_known_field(key: &str) -> bool {
 fn is_array_field(key: &str) -> bool {
     let base = key.split_once('_').map_or(key, |(b, _)| b);
     ARRAY_FIELDS.contains(&base)
-        // `pkgname` is scalar in a PKGBUILD but may repeat in a split-package
-        // .SRCINFO; the caller decides via `force_array`.
+    // `pkgname` is scalar in a PKGBUILD but may repeat in a split-package
+    // .SRCINFO; the caller decides via `force_array`.
 }
 
 /// Insert a value under `pkg.<key>`, accumulating array fields.
@@ -67,7 +67,10 @@ fn push(root: &mut Map<String, JsonValue>, key: &str, value: String) {
         match root.get_mut(key) {
             Some(JsonValue::Array(arr)) => arr.push(JsonValue::String(value)),
             _ => {
-                root.insert(key.to_string(), JsonValue::Array(vec![JsonValue::String(value)]));
+                root.insert(
+                    key.to_string(),
+                    JsonValue::Array(vec![JsonValue::String(value)]),
+                );
             }
         }
     } else {
@@ -164,55 +167,6 @@ fn split_array(body: &str) -> Vec<String> {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn pkg(values: &Values, path: &str) -> String {
-        values
-            .get(&format!("pkg.{path}"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    }
-
-    #[test]
-    fn pkgbuild_fields_and_checksum_digest() {
-        let src = b"pkgname=foo\npkgver=1.2.3\npkgrel=1\nsource=('a.tar.gz::https://x/v$pkgver.tar.gz')\nsha256sums=('SKIP' 'deadbeef')\n";
-        let mut v = Values::new();
-        extract_pkgbuild(src, &mut v).unwrap();
-        assert_eq!(pkg(&v, "pkgver"), "1.2.3");
-        assert_eq!(pkg(&v, "pkgname"), "foo");
-        // SKIP excluded; only the real hash drives the digest.
-        assert_eq!(pkg(&v, "checksums"), "deadbeef");
-        assert!(matches!(v.get("pkg.source"), Some(JsonValue::Array(_))));
-    }
-
-    #[test]
-    fn srcinfo_matches_pkgbuild_checksum() {
-        let pb = b"pkgver=1.0\nsha256sums=('aa' 'bb')\n";
-        let si = b"pkgbase = x\n\tpkgver = 1.0\n\tsha256sums = bb\n\tsha256sums = aa\n";
-        let mut vp = Values::new();
-        let mut vs = Values::new();
-        extract_pkgbuild(pb, &mut vp).unwrap();
-        extract_srcinfo(si, &mut vs).unwrap();
-        // Sorted+deduped digest is order-independent → equal across both forms.
-        assert_eq!(pkg(&vp, "checksums"), pkg(&vs, "checksums"));
-        assert_eq!(pkg(&vp, "checksums"), "aa,bb");
-    }
-
-    #[test]
-    fn srcinfo_multiline_arrays() {
-        let si = b"pkgbase = foo\n\tsource = one\n\tsource = two\n";
-        let mut v = Values::new();
-        extract_srcinfo(si, &mut v).unwrap();
-        match v.get("pkg.source") {
-            Some(JsonValue::Array(a)) => assert_eq!(a.len(), 2),
-            other => panic!("expected array, got {other:?}"),
-        }
-    }
-}
-
 /// Parse a `.SRCINFO`: `key = value` lines, leading tabs, repeated keys.
 pub(super) fn extract_srcinfo(bytes: &[u8], values: &mut Values) -> Result<(), crate::Error> {
     let text = std::str::from_utf8(bytes)
@@ -291,4 +245,53 @@ pub(super) fn extract_pkgbuild(bytes: &[u8], values: &mut Values) -> Result<(), 
     }
     finalize(root, values);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pkg(values: &Values, path: &str) -> String {
+        values
+            .get(&format!("pkg.{path}"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[test]
+    fn pkgbuild_fields_and_checksum_digest() {
+        let src = b"pkgname=foo\npkgver=1.2.3\npkgrel=1\nsource=('a.tar.gz::https://x/v$pkgver.tar.gz')\nsha256sums=('SKIP' 'deadbeef')\n";
+        let mut v = Values::new();
+        extract_pkgbuild(src, &mut v).unwrap();
+        assert_eq!(pkg(&v, "pkgver"), "1.2.3");
+        assert_eq!(pkg(&v, "pkgname"), "foo");
+        // SKIP excluded; only the real hash drives the digest.
+        assert_eq!(pkg(&v, "checksums"), "deadbeef");
+        assert!(matches!(v.get("pkg.source"), Some(JsonValue::Array(_))));
+    }
+
+    #[test]
+    fn srcinfo_matches_pkgbuild_checksum() {
+        let pb = b"pkgver=1.0\nsha256sums=('aa' 'bb')\n";
+        let si = b"pkgbase = x\n\tpkgver = 1.0\n\tsha256sums = bb\n\tsha256sums = aa\n";
+        let mut vp = Values::new();
+        let mut vs = Values::new();
+        extract_pkgbuild(pb, &mut vp).unwrap();
+        extract_srcinfo(si, &mut vs).unwrap();
+        // Sorted+deduped digest is order-independent → equal across both forms.
+        assert_eq!(pkg(&vp, "checksums"), pkg(&vs, "checksums"));
+        assert_eq!(pkg(&vp, "checksums"), "aa,bb");
+    }
+
+    #[test]
+    fn srcinfo_multiline_arrays() {
+        let si = b"pkgbase = foo\n\tsource = one\n\tsource = two\n";
+        let mut v = Values::new();
+        extract_srcinfo(si, &mut v).unwrap();
+        match v.get("pkg.source") {
+            Some(JsonValue::Array(a)) => assert_eq!(a.len(), 2),
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
 }

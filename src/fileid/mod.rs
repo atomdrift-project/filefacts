@@ -577,6 +577,31 @@ impl FileType {
                 | Self::Elixir
         )
     }
+
+    /// Returns true for structured-manifest formats whose entire content is
+    /// parsed into the `values` tree (JSON/TOML/YAML manifests, plist, etc.).
+    ///
+    /// For these, the structured view *is* the content surface, so the
+    /// `strings(1)`-tier byte scan is suppressed — re-scanning the same bytes
+    /// would only duplicate the parsed tree as noise. This covers only the
+    /// named formats that are always fully parsed; generic `Json`/`Gyp` are
+    /// size-limited and intentionally fall back to a text scan when skipped.
+    #[must_use]
+    pub fn is_structured_data(&self) -> bool {
+        matches!(
+            self,
+            Self::PackageJson
+                | Self::PackageLockJson
+                | Self::ComposerJson
+                | Self::ChromeManifest
+                | Self::CargoToml
+                | Self::PyProjectToml
+                | Self::GithubActions
+                | Self::Plist
+                | Self::PkgInfo
+                | Self::SrcInfo
+        )
+    }
 }
 
 /// How the file type was identified.
@@ -1585,6 +1610,20 @@ mod tests {
         assert!(FileType::JavaClass.is_binary());
         assert!(!FileType::Zip.is_binary());
         assert!(!FileType::Python.is_binary());
+    }
+
+    #[test]
+    fn is_structured_data_true_for_fully_parsed_manifests() {
+        assert!(FileType::PackageJson.is_structured_data());
+        assert!(FileType::CargoToml.is_structured_data());
+        assert!(FileType::GithubActions.is_structured_data());
+        assert!(FileType::Plist.is_structured_data());
+        assert!(FileType::SrcInfo.is_structured_data());
+        // Generic JSON is size-limited and may fall back to a text scan, so it
+        // is deliberately *not* treated as fully-parsed structured data.
+        assert!(!FileType::Json.is_structured_data());
+        assert!(!FileType::Python.is_structured_data());
+        assert!(!FileType::Elf.is_structured_data());
     }
 
     // ── Documents ────────────────────────────────────────────────────

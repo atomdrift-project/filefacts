@@ -230,6 +230,9 @@ manual_let_else = "allow"
 redundant_pattern_matching = "allow"
 manual_contains = "allow"
 explicit_iter_loop = "allow"
+# Single-byte counts run over short, bounded format tokens; the SIMD bytecount
+# crate is an unwarranted dependency for these tiny scans.
+naive_bytecount = "allow"
 type_complexity = "allow"
 map_unwrap_or = "allow"
 format_push_string = "allow"

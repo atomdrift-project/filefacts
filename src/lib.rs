@@ -34,7 +34,7 @@
 //!     println!("{}: {}", key, value);
 //! }
 //! for s in &parsed.text().ascii {
-//!     println!("@{}: {}", s.offset, s.text);
+//!     println!("@{}: {}", s.data_offset, s.value);
 //! }
 //! for (key, value) in parsed.metrics().iter() {
 //!     println!("{} = {}", key, value);
