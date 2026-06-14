@@ -800,8 +800,11 @@ mod tests {
 
         // Wrap it in an OOXML-style zip under word/vbaProject.bin.
         let mut zw = zip::ZipWriter::new(Cursor::new(Vec::<u8>::new()));
-        zw.start_file("word/vbaProject.bin", zip::write::SimpleFileOptions::default())
-            .unwrap();
+        zw.start_file(
+            "word/vbaProject.bin",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
         zw.write_all(&vba_bin).unwrap();
         let zip_bytes = zw.finish().unwrap().into_inner();
 

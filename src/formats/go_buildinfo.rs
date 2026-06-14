@@ -57,11 +57,26 @@ const MAGIC: &[u8] = b"\xff Go buildinf:";
 /// a file offset (the ELF extractor walks `PT_LOAD`) pass a
 /// closure; those that can't pass `None` and we silently skip the
 /// old-format decode.
+/// Attribution sections the caller resolves (via its format parser) and
+/// hands to [`detect`] so the Go build-id / GoRoot / developer source
+/// root can be recovered. None of these live in the build-info blob.
+#[derive(Default)]
+pub(super) struct GoSections<'a> {
+    /// ELF `.note.go.buildid` note bytes (None for Mach-O / PE).
+    pub buildid_note: Option<&'a [u8]>,
+    /// `.gopclntab` / `__gopclntab` section bytes.
+    pub pclntab: Option<&'a [u8]>,
+    /// Read-only data section bytes (`.rodata` / `__const` / `.rdata`),
+    /// scanned for the `Go build ID: "…"` linker marker as a fallback.
+    pub rodata: Option<&'a [u8]>,
+}
+
 pub(super) fn detect(
     bytes: &[u8],
     values: &mut Values,
     key_prefix: &str,
     resolve_va: Option<&dyn Fn(u64) -> Option<usize>>,
+    sections: &GoSections<'_>,
 ) {
     let Some(start) = find_bytes(bytes, MAGIC) else {
         return;
@@ -96,10 +111,151 @@ pub(super) fn detect(
     } else {
         return;
     }
+
+    // Attribution facts that live outside the build-info blob.
+    if let Some(id) = build_id(sections.buildid_note, sections.rodata, bytes) {
+        obj.insert("build_id".into(), JsonValue::String(id));
+    }
+    if let Some(pclntab) = sections.pclntab {
+        let go_root = scan_go_root(pclntab);
+        if let Some(main_root) = scan_go_main_root(pclntab, go_root.as_deref()) {
+            obj.insert("main_root".into(), JsonValue::String(main_root));
+        }
+        if let Some(root) = go_root {
+            obj.insert("go_root".into(), JsonValue::String(root));
+        }
+    }
+
     if obj.is_empty() {
         return;
     }
     values.insert(&key, JsonValue::Object(obj));
+}
+
+/// Recover the Go build id. Prefers the ELF `.note.go.buildid` note;
+/// otherwise scans the read-only data section (and a bounded prefix of
+/// the file) for the linker's `Go build ID: "…"` marker.
+fn build_id(buildid_note: Option<&[u8]>, rodata: Option<&[u8]>, bytes: &[u8]) -> Option<String> {
+    if let Some(note) = buildid_note
+        && let Some(id) = parse_elf_buildid_note(note)
+    {
+        return Some(id);
+    }
+    let needle = b"Go build ID: \"";
+    let scan_in = |hay: &[u8]| -> Option<String> {
+        let pos = find_bytes(hay, needle)?;
+        let after = &hay[pos + needle.len()..];
+        let end = after.iter().take(256).position(|&b| b == b'"')?;
+        let id = std::str::from_utf8(&after[..end]).ok()?;
+        (!id.is_empty()).then(|| id.to_string())
+    };
+    if let Some(ro) = rodata
+        && let Some(id) = scan_in(ro)
+    {
+        return Some(id);
+    }
+    scan_in(&bytes[..bytes.len().min(4 * 1024 * 1024)])
+}
+
+/// Parse an ELF `.note.go.buildid` note (namesz/descsz/type header,
+/// 4-byte-padded name then desc); the desc is the ASCII build id.
+fn parse_elf_buildid_note(note: &[u8]) -> Option<String> {
+    if note.len() < 16 {
+        return None;
+    }
+    let namesz = u32::from_le_bytes(note[..4].try_into().ok()?) as usize;
+    let descsz = u32::from_le_bytes(note[4..8].try_into().ok()?) as usize;
+    let desc_off = 12 + ((namesz + 3) & !3);
+    let desc_end = desc_off.checked_add(descsz)?;
+    let desc = note.get(desc_off..desc_end)?.split(|&b| b == 0).next()?;
+    let s = std::str::from_utf8(desc).ok()?;
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// Scan the pclntab for the canonical `/src/runtime/` source path and
+/// walk back to the GoRoot install prefix.
+fn scan_go_root(pclntab: &[u8]) -> Option<String> {
+    let pos = find_bytes(pclntab, b"/src/runtime/")?;
+    let mut start = pos;
+    let lo = pos.saturating_sub(256);
+    while start > lo && is_path_byte(pclntab[start - 1]) {
+        start -= 1;
+    }
+    if start == pos {
+        return None;
+    }
+    let s = std::str::from_utf8(&pclntab[start..pos]).ok()?;
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// Recover the developer source-tree root: the longest common directory
+/// prefix of absolute `*.go` paths in the pclntab that are neither under
+/// GoRoot nor in the module cache. Empty under `-trimpath`.
+fn scan_go_main_root(pclntab: &[u8], go_root: Option<&str>) -> Option<String> {
+    const MAX_CANDIDATES: usize = 4096;
+    let mut candidates: Vec<&str> = Vec::new();
+    let mut from = 0;
+    while candidates.len() < MAX_CANDIDATES {
+        let Some(rel0) = find_bytes(&pclntab[from..], b".go\0") else {
+            break;
+        };
+        let rel = from + rel0;
+        from = rel + 4;
+        let mut start = rel;
+        let lo = rel.saturating_sub(512);
+        while start > lo {
+            let b = pclntab[start - 1];
+            if !is_path_byte(b) && b != b'/' {
+                break;
+            }
+            start -= 1;
+        }
+        if start == rel || pclntab[start] != b'/' {
+            continue;
+        }
+        let Ok(s) = std::str::from_utf8(&pclntab[start..rel + 3]) else {
+            continue;
+        };
+        if go_root.is_some_and(|r| s.starts_with(r))
+            || s.contains("/pkg/mod/")
+            || s.contains("/src/runtime/")
+        {
+            continue;
+        }
+        candidates.push(s);
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    let prefix = longest_common_dir_prefix(&candidates)?;
+    (!prefix.is_empty() && prefix != "/").then_some(prefix)
+}
+
+fn longest_common_dir_prefix(paths: &[&str]) -> Option<String> {
+    let first = paths.first()?;
+    let mut max = first.len();
+    for &p in &paths[1..] {
+        let common = first
+            .as_bytes()
+            .iter()
+            .zip(p.as_bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        max = max.min(common);
+        if max == 0 {
+            return None;
+        }
+    }
+    let cut = first[..max].rfind('/')?;
+    Some(if cut == 0 {
+        "/".to_string()
+    } else {
+        first[..cut].to_string()
+    })
+}
+
+fn is_path_byte(b: u8) -> bool {
+    matches!(b, b'/' | b'.' | b'-' | b'_' | b'+' | b':') || b.is_ascii_alphanumeric()
 }
 
 /// Decode the legacy pointer-based build-info layout. Returns
@@ -267,6 +423,11 @@ fn parse_modinfo(blob: &[u8], out: &mut Map<String, JsonValue>) {
         }
     }
     if !deps.is_empty() {
+        let (std, thirdparty, replaced, vendored) = classify_deps(&deps);
+        out.insert("deps_std".into(), JsonValue::from(std));
+        out.insert("deps_thirdparty".into(), JsonValue::from(thirdparty));
+        out.insert("deps_replaced".into(), JsonValue::from(replaced));
+        out.insert("deps_vendored".into(), JsonValue::from(vendored));
         out.insert("deps".into(), JsonValue::Array(deps));
     }
     if !build.is_empty() {
@@ -275,6 +436,38 @@ fn parse_modinfo(blob: &[u8], out: &mut Map<String, JsonValue>) {
     if !vcs.is_empty() {
         out.insert("vcs".into(), JsonValue::Object(vcs));
     }
+}
+
+/// Tally dependency provenance. A `=>` (replace-directive target) entry
+/// immediately follows the dep it replaces, so a dep with a trailing
+/// replace entry is counted as `replaced`; the replace entry itself is
+/// not counted as its own dependency. Mirrors the buildinfo dep model.
+fn classify_deps(deps: &[JsonValue]) -> (u32, u32, u32, u32) {
+    let (mut std, mut thirdparty, mut replaced, mut vendored) = (0u32, 0u32, 0u32, 0u32);
+    let is_replace = |d: &JsonValue| d.get("kind").and_then(|k| k.as_str()) == Some("replace");
+    for (i, dep) in deps.iter().enumerate() {
+        if is_replace(dep) {
+            continue; // replacement target — accounted for by its base dep
+        }
+        let path = dep.get("path").and_then(|p| p.as_str()).unwrap_or("");
+        if deps.get(i + 1).is_some_and(is_replace) {
+            replaced += 1;
+        } else if path.contains("/vendor/") {
+            vendored += 1;
+        } else if is_stdlib_path(path) {
+            std += 1;
+        } else {
+            thirdparty += 1;
+        }
+    }
+    (std, thirdparty, replaced, vendored)
+}
+
+/// A Go stdlib package path has no dot in its first segment (third-party
+/// module paths are domain-rooted: `github.com/…`, `golang.org/x/…`).
+fn is_stdlib_path(path: &str) -> bool {
+    let first = path.split('/').next().unwrap_or("");
+    !first.is_empty() && !first.contains('.')
 }
 
 /// Decode an unsigned varint (Go's `encoding/binary.Uvarint`) and
@@ -337,5 +530,57 @@ mod tests {
         assert_eq!(out["build_settings"]["-tags"], "foo");
         assert_eq!(out["vcs"]["system"], "git");
         assert_eq!(out["vcs"]["modified"], "true");
+    }
+
+    #[test]
+    fn classifies_dependency_provenance() {
+        let mut out = Map::new();
+        parse_modinfo(
+            b"path\texample.com/main\n\
+              dep\tfmt\t(devel)\t\n\
+              dep\tgithub.com/foo/bar\tv1.2.3\th1:aaa=\n\
+              dep\texample.com/old\tv1.0.0\th1:bbb=\n\
+              =>\texample.com/new\tv2.0.0\th1:ccc=\n",
+            &mut out,
+        );
+        // fmt = std, github.com/foo/bar = thirdparty, example.com/old is
+        // replaced (followed by a `=>` target), the `=>` itself not counted.
+        assert_eq!(out["deps_std"], JsonValue::from(1u32));
+        assert_eq!(out["deps_thirdparty"], JsonValue::from(1u32));
+        assert_eq!(out["deps_replaced"], JsonValue::from(1u32));
+        assert_eq!(out["deps_vendored"], JsonValue::from(0u32));
+    }
+
+    #[test]
+    fn build_id_from_rodata_marker() {
+        let rodata = b"....Go build ID: \"abc123/def456\"....";
+        let id = build_id(None, Some(rodata), b"");
+        assert_eq!(id.as_deref(), Some("abc123/def456"));
+    }
+
+    #[test]
+    fn build_id_from_elf_note() {
+        // namesz=4 ("Go\0\0"), descsz=7 ("id12345"), type=4.
+        let mut note = Vec::new();
+        note.extend_from_slice(&4u32.to_le_bytes());
+        note.extend_from_slice(&7u32.to_le_bytes());
+        note.extend_from_slice(&4u32.to_le_bytes());
+        note.extend_from_slice(b"Go\0\0");
+        note.extend_from_slice(b"id12345");
+        assert_eq!(parse_elf_buildid_note(&note).as_deref(), Some("id12345"));
+    }
+
+    #[test]
+    fn go_root_from_pclntab_runtime_path() {
+        let pclntab = b"\x00\x00/usr/local/go/src/runtime/proc.go\x00";
+        assert_eq!(scan_go_root(pclntab).as_deref(), Some("/usr/local/go"));
+    }
+
+    #[test]
+    fn main_root_is_common_dir_of_developer_paths() {
+        let pclntab =
+            b"/home/dev/project/main.go\x00\x00/home/dev/project/pkg/util.go\x00\x00/usr/local/go/src/runtime/proc.go\x00";
+        let root = scan_go_main_root(pclntab, Some("/usr/local/go"));
+        assert_eq!(root.as_deref(), Some("/home/dev/project"));
     }
 }

@@ -58,18 +58,52 @@ pub(super) fn extract(
     let goblin::Object::Mach(parsed) = object else {
         unreachable!("constructed as Object::Mach")
     };
-    match parsed {
+    // Resolve the Go attribution sections (pclntab + read-only data) from
+    // the thin-binary case while the parsed Mach-O is in scope; the bytes
+    // they reference outlive it. Fat binaries skip pclntab-based GoRoot
+    // recovery (rare for Go) but still get build-id via the marker scan.
+    let (go_pclntab, go_rodata) = match parsed {
         Mach::Binary(macho) => {
             single_arch(&macho, bytes, values, metrics, sections_out, symbols_out);
+            macho_go_sections(&macho)
         }
         Mach::Fat(fat) => {
             fat_binary(bytes, &fat, values, metrics, sections_out, symbols_out);
+            (None, None)
         }
-    }
+    };
     rizin_fallback(bytes, symbols_out, metrics);
     super::upx::detect(bytes, values);
-    super::go_buildinfo::detect(bytes, values, "macho", None);
+    let go_sections = super::go_buildinfo::GoSections {
+        buildid_note: None,
+        pclntab: go_pclntab,
+        rodata: go_rodata,
+    };
+    super::go_buildinfo::detect(bytes, values, "macho", None, &go_sections);
     Ok(())
+}
+
+/// Resolve the `__TEXT,__gopclntab` and read-only data (`__const`,
+/// falling back to `__rodata`) section bytes used for Go attribution.
+fn macho_go_sections<'a>(macho: &MachO<'a>) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
+    let (mut pclntab, mut const_data, mut rodata) = (None, None, None);
+    for segment in &macho.segments {
+        if segment.name().unwrap_or("") != "__TEXT" {
+            continue;
+        }
+        let Ok(secs) = segment.sections() else {
+            continue;
+        };
+        for (section, data) in secs {
+            match section.name().unwrap_or("") {
+                "__gopclntab" => pclntab = Some(data),
+                "__const" => const_data = Some(data),
+                "__rodata" => rodata = Some(data),
+                _ => {}
+            }
+        }
+    }
+    (pclntab, const_data.or(rodata))
 }
 
 fn fat_binary(

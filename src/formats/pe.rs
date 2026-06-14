@@ -166,7 +166,12 @@ pub(super) fn extract(
         super::pe_image_hash::extract(&pe, bytes, values, metrics);
         super::pe_rich::extract(bytes, values);
         super::upx::detect(bytes, values);
-        super::go_buildinfo::detect(bytes, values, "pe", None);
+        let go_sections = super::go_buildinfo::GoSections {
+            buildid_note: None,
+            pclntab: pe_section_bytes(&pe, bytes, ".gopclntab"),
+            rodata: pe_section_bytes(&pe, bytes, ".rdata"),
+        };
+        super::go_buildinfo::detect(bytes, values, "pe", None, &go_sections);
         super::build_toolchain::from_pe_rich(values);
         rizin_fallback_with_sections(bytes, symbols_out, sections_out, metrics, "pe");
         return Ok(());
@@ -342,6 +347,15 @@ fn optional_header(opt: &OptionalHeader, values: &mut Values) {
 fn binary_flags(opt: &OptionalHeader, metrics: &mut Metrics) {
     let is_pie = opt.windows_fields.dll_characteristics & 0x0040 != 0;
     metrics.insert("binary.is_pie", f64::from(u8::from(is_pie)));
+}
+
+/// Raw bytes of a named PE section (e.g. `.gopclntab`, `.rdata`), for
+/// Go attribution recovery.
+fn pe_section_bytes<'a>(pe: &PE<'_>, bytes: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    let section = pe.sections.iter().find(|s| s.name().ok() == Some(name))?;
+    let start = section.pointer_to_raw_data as usize;
+    let size = section.size_of_raw_data as usize;
+    bytes.get(start..start.checked_add(size)?)
 }
 
 fn sections(pe: &PE<'_>, bytes: &[u8], _metrics: &mut Metrics, sections_out: &mut Vec<Section>) {

@@ -83,10 +83,22 @@ fn classify(target: &str, lang: &str) -> TargetKind {
 fn classify_shell(target: &str) -> TargetKind {
     // Path-form commands (`/usr/bin/x`, `$HOME/bin/y`, `./script`, a quoted
     // path with spaces) are normal program locations, never name-hiding —
-    // settle them first so the quote/glue rules below only see bare tokens.
+    // settle them first so the rules below only see bare tokens.
     if target.contains('/') {
         return TargetKind::Clean;
     }
+    // Strip quotes and judge the inner form. A single quoted token (`"$VAR"`,
+    // `"ls"`) is the normal, recommended way to run a command; quote-SHATTERED
+    // literals (`"b"'u'"n"`) are left to the text char-split traits, which
+    // distinguish adjacent single-char fragments from ordinary quoted strings
+    // (error messages carry many quotes too — `"Failed to run 'foo'"`).
+    let unquoted;
+    let target = if target.contains('"') || target.contains('\'') {
+        unquoted = target.replace(['"', '\''], "");
+        unquoted.as_str()
+    } else {
+        target
+    };
     // Command substitution as the command name. Hiding shows up as a decoder
     // or escape sequence inside the substitution (`$(printf '\x62')`,
     // `$(echo bun)`); a resolver (`$(command -v python)`) is benign-dynamic.
@@ -96,34 +108,35 @@ fn classify_shell(target: &str) -> TargetKind {
         }
         return TargetKind::Dynamic;
     }
-    // Quote characters in a command name shatter a literal into fragments
-    // (`"b"'u'"n"`) — there is no benign reason to quote a command name
-    // character-by-character.
-    if target.contains('"') || target.contains('\'') {
-        return TargetKind::Obfuscated;
+    // A command NAME is a single token. A target carrying internal whitespace
+    // or a newline is a tree-sitter mis-parse of a string argument / here-doc
+    // (an eval'd command string, a multi-line Tcl literal), not a welded
+    // command name — the byte-level rules below would misfire on it.
+    if target
+        .bytes()
+        .any(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+    {
+        return TargetKind::Clean;
     }
     // Backslash escapes on a command name (`\b\u\n`) decode to the same bytes
-    // and exist only to break up the token for scanners.
-    if target.contains('\\') {
+    // and exist only to break the token up for scanners. A single leading
+    // backslash (`\rm`, `\ls`) is the benign alias-bypass idiom, so require
+    // two or more escapes.
+    if target.bytes().filter(|&b| b == b'\\').count() >= 2 {
         return TargetKind::Obfuscated;
     }
-    // Default/alternate parameter expansion used to *produce* the command name
-    // (`${b:-bun}`). Real scripts use these for argument fallbacks, not to name
-    // the program being run.
-    if target.contains(":-")
-        || target.contains(":=")
-        || target.contains(":+")
-        || target.contains(":?")
-    {
-        return TargetKind::Obfuscated;
-    }
+    // NOTE: default/alternate parameter expansion (`${x:-cat}`) is deliberately
+    // NOT treated as obfuscation — `${PAGER:-less}` / `${filt:-cat}` command
+    // fallbacks are a standard idiom (zdiff, pager/editor wrappers) and are
+    // structurally indistinguishable from a malicious `${b:-bun}`.
+    //
     // Expansions welded into a word (`b$@u`, `$A$B`, `b${UNSET}u${NOPE}n`).
     if has_welded_expansion(target) {
         return TargetKind::Obfuscated;
     }
-    // A bare single expansion as the command (`$CC`, `$1`, `${VAR}`, and the
-    // benign `python${VER}` welded form ruled out above): dynamic but
-    // legitimate. Gate downstream on file size / lack of structure.
+    // A bare single expansion as the command (`$CC`, `$1`, `${VAR}`,
+    // `${x:-default}`): dynamic but legitimate. Gate downstream on file size /
+    // lack of structure.
     if target.starts_with('$') {
         return TargetKind::Dynamic;
     }
@@ -132,10 +145,32 @@ fn classify_shell(target: &str) -> TargetKind {
 
 /// A command substitution whose body decodes/echoes its output rather than
 /// resolving a program path — the hiding shape, as opposed to a benign
-/// `$(command -v python)` resolver.
+/// `$(command -v python)` resolver or a `$(printf '%sX\n' "$1")` formatter.
 fn is_decoding_substitution(target: &str) -> bool {
-    const DECODERS: [&str; 4] = ["printf", "echo", "base64", "xxd"];
-    target.contains('\\') || DECODERS.iter().any(|d| target.contains(d))
+    // base64/xxd: always a byte decoder.
+    if target.contains("base64") || target.contains("xxd") {
+        return true;
+    }
+    // printf only counts when it reconstructs bytes from hex (`\x62`) or octal
+    // (`\142`) escapes — a normal format string (`printf '%sX\n'`) is not a
+    // decoder. `has_byte_escape` excludes `\n`/`\t`-style letter escapes.
+    if target.contains("printf") && has_byte_escape(target) {
+        return true;
+    }
+    // `$(echo word)` runs the echoed literal as the command — pointless unless
+    // hiding the name. `$(echo "$x" | sed …)` is benign indent/format
+    // plumbing, so exclude pipelines.
+    target.contains("echo") && !target.contains('|')
+}
+
+/// True when the string contains a `\xHH` hex escape or a `\NNN`-style octal
+/// escape (backslash followed by an octal digit), the byte-reconstruction
+/// shapes — not letter escapes like `\n`/`\t`.
+fn has_byte_escape(target: &str) -> bool {
+    let bytes = target.as_bytes();
+    bytes.windows(2).any(|w| {
+        w[0] == b'\\' && (w[1] == b'x' || w[1] == b'X' || w[1].is_ascii_digit() && w[1] <= b'7')
+    })
 }
 
 /// True when an expansion is welded into a word rather than standing alone.
@@ -187,23 +222,67 @@ mod tests {
         // Resolver command substitutions are dynamic, not obfuscated.
         assert_eq!(shell("$(command -v python)"), TargetKind::Dynamic);
         assert_eq!(shell("$(which gcc)"), TargetKind::Dynamic);
+        // A quoted variable command (best practice) is dynamic, not shattered.
+        assert_eq!(shell("\"$SANE_SH\""), TargetKind::Dynamic);
+        assert_eq!(shell("\"$python_version\""), TargetKind::Dynamic);
+        // A quoted literal command unwraps to a plain name.
+        assert_eq!(shell("\"ls\""), TargetKind::Clean);
+        // Default/alternate parameter command fallbacks are a standard idiom.
+        assert_eq!(shell("${filt:-cat}"), TargetKind::Dynamic);
+        assert_eq!(shell("${PAGER:-less}"), TargetKind::Dynamic);
+        // A single leading backslash is the benign alias-bypass idiom.
+        assert_eq!(shell("\\rm"), TargetKind::Clean);
     }
 
     #[test]
     fn obfuscated_command_names() {
         for t in [
-            "\"b\"'u'\"n\"",         // 01 quote-shatter
-            "\\b\\u\\n",             // 02 backslash escapes
-            "$A$B",                  // 04 glued expansions
-            "b$@u$n",                // 08 $@ glue
-            "b$*u$n",                // 09 $* glue
-            "b${UNSET}u${NOPE}n",    // 10 empty-var glue
-            "$(echo bun)",           // 12 command-sub decoder
-            "$(printf \"\\x62\")",   // 14 command-sub decoder
-            "${b:-bun}",             // 19 default-param
+            "\\b\\u\\n",                // 02 backslash escapes
+            "$A$B",                     // 04 glued expansions
+            "b$@u$n",                   // 08 $@ glue
+            "b$*u$n",                   // 09 $* glue
+            "b${UNSET}u${NOPE}n",       // 10 empty-var glue
+            "$(echo bun)",              // 12 command-sub decoder
+            "$(printf \"\\142\\165\")", // 13 octal-escape decoder
+            "$(printf \"\\x62\")",      // 14 hex-escape decoder
         ] {
             assert_eq!(shell(t), TargetKind::Obfuscated, "{t}");
         }
+    }
+
+    #[test]
+    fn quote_shatter_and_format_printf_are_not_metric_obfuscated() {
+        // Quote-shattered literals unwrap to a plain name here (the text
+        // char-split traits own that signal); a printf format string and an
+        // error message with embedded quotes must not be flagged.
+        assert_eq!(shell("\"b\"'u'\"n\""), TargetKind::Clean);
+        assert_eq!(
+            shell("`printf '%sX\\n' \"$1\" | sed \"$e\"`"),
+            TargetKind::Dynamic
+        );
+        assert_eq!(
+            shell("\"Failed to start 'pamcat' process\""),
+            TargetKind::Clean
+        );
+        // A spaced/multi-line "target" is a mis-parsed string argument, not a
+        // welded command name — backslash continuations must not trip it.
+        assert_eq!(
+            shell("pgmtoppm \\\"$colorlist[0]\\\" >$outfile"),
+            TargetKind::Clean
+        );
+        // `echo "$x" | sed` indent plumbing is not a decoder.
+        assert_eq!(
+            shell("`echo \"$indent\" | sed 's|.| |g'`"),
+            TargetKind::Dynamic
+        );
+    }
+
+    #[test]
+    fn default_param_command_is_dynamic_not_obfuscated() {
+        // `${b:-bun}` (sample 19) is structurally identical to the benign
+        // `${PAGER:-less}` idiom, so it must classify as dynamic, never
+        // obfuscated — there is no FP-safe way to flag it.
+        assert_eq!(shell("${b:-bun}"), TargetKind::Dynamic);
     }
 
     #[test]

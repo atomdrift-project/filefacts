@@ -42,6 +42,10 @@ pub(super) fn extract(
 
     let mut protocol: i32 = -1;
     let mut modules: BTreeSet<String> = BTreeSet::new();
+    // Fully-qualified `module.attr` callable references resolved from GLOBAL
+    // and STACK_GLOBAL — the actual RCE targets, gated to Python-identifier
+    // shape so trait rules can match on e.g. `os.system` / `builtins.exec`.
+    let mut globals: BTreeSet<String> = BTreeSet::new();
     let mut opcodes: BTreeSet<&'static str> = BTreeSet::new();
     let mut recent: VecDeque<&str> = VecDeque::with_capacity(RECENT_STRING_CAP);
 
@@ -51,7 +55,15 @@ pub(super) fn extract(
         if let Some(name) = OPCODE_NAMES[op as usize] {
             opcodes.insert(name);
         }
-        apply_side_effects(op, i, scan, &mut protocol, &mut modules, &mut recent);
+        apply_side_effects(
+            op,
+            i,
+            scan,
+            &mut protocol,
+            &mut modules,
+            &mut globals,
+            &mut recent,
+        );
         let Some(frame) = payload_size(op, i, scan) else {
             break;
         };
@@ -70,6 +82,12 @@ pub(super) fn extract(
         values.insert(
             "pickle.modules",
             JsonValue::Array(modules.into_iter().map(JsonValue::String).collect()),
+        );
+    }
+    if !globals.is_empty() {
+        values.insert(
+            "pickle.globals",
+            JsonValue::Array(globals.into_iter().map(JsonValue::String).collect()),
         );
     }
     if !opcodes.is_empty() {
@@ -165,12 +183,23 @@ fn payload_size(op: u8, i: usize, scan: &[u8]) -> Option<usize> {
     }
 }
 
+/// Python-identifier shape (allowing dotted submodules), matching the gate
+/// used when forming `module.attr` callable references.
+fn is_pickle_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.is_ascii()
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+        && s.starts_with(|c: char| c.is_alphabetic() || c == '_')
+}
+
 fn apply_side_effects<'a>(
     op: u8,
     i: usize,
     scan: &'a [u8],
     protocol: &mut i32,
     modules: &mut BTreeSet<String>,
+    globals: &mut BTreeSet<String>,
     recent: &mut VecDeque<&'a str>,
 ) {
     let push_recent = |rs: &mut VecDeque<&'a str>, s: &'a str| {
@@ -186,13 +215,29 @@ fn apply_side_effects<'a>(
             }
         }
         b'c' => {
-            if let Some(nl) = scan
+            // GLOBAL: "module\nattr\n". Record the module and, when both the
+            // module and the following attr are identifier-shaped, the
+            // fully-qualified `module.attr` callable reference.
+            if let Some(m_nl) = scan
                 .get(i + 1..)
                 .and_then(|s| s.iter().position(|&b| b == b'\n'))
             {
-                if let Ok(module) = std::str::from_utf8(&scan[i + 1..i + 1 + nl]) {
+                let module_end = i + 1 + m_nl;
+                if let Ok(module) = std::str::from_utf8(&scan[i + 1..module_end]) {
                     if !module.is_empty() {
                         modules.insert(module.to_string());
+                    }
+                    if let Some(a_nl) = scan
+                        .get(module_end + 1..)
+                        .and_then(|s| s.iter().position(|&b| b == b'\n'))
+                    {
+                        let attr_end = module_end + 1 + a_nl;
+                        if let Ok(attr) = std::str::from_utf8(&scan[module_end + 1..attr_end])
+                            && is_pickle_ident(module)
+                            && is_pickle_ident(attr)
+                        {
+                            globals.insert(format!("{module}.{attr}"));
+                        }
                     }
                 }
             }
@@ -229,6 +274,12 @@ fn apply_side_effects<'a>(
             if let Some(&module) = n.checked_sub(2).and_then(|j| recent.get(j)) {
                 if !module.is_empty() {
                     modules.insert(module.to_string());
+                }
+                if let Some(&attr) = n.checked_sub(1).and_then(|j| recent.get(j))
+                    && is_pickle_ident(module)
+                    && is_pickle_ident(attr)
+                {
+                    globals.insert(format!("{module}.{attr}"));
                 }
             }
         }
@@ -328,6 +379,11 @@ mod tests {
         assert_eq!(m.get("pickle.protocol"), Some(4.0));
         let mods = v.get("pickle.modules").and_then(|x| x.as_array()).unwrap();
         assert_eq!(mods[0].as_str(), Some("os"));
+        let globals = v.get("pickle.globals").and_then(|x| x.as_array()).unwrap();
+        assert!(
+            globals.iter().any(|g| g.as_str() == Some("os.system")),
+            "GLOBAL should resolve the module.attr callable: {globals:?}"
+        );
         let danger = v
             .get("pickle.dangerous_opcodes")
             .and_then(|x| x.as_array())
@@ -353,6 +409,13 @@ mod tests {
         let (v, _) = run(&data);
         let mods = v.get("pickle.modules").and_then(|x| x.as_array()).unwrap();
         assert!(mods.iter().any(|v| v.as_str() == Some("subprocess")));
+        let globals = v.get("pickle.globals").and_then(|x| x.as_array()).unwrap();
+        assert!(
+            globals
+                .iter()
+                .any(|g| g.as_str() == Some("subprocess.Popen")),
+            "STACK_GLOBAL should resolve module.attr: {globals:?}"
+        );
     }
 
     #[test]

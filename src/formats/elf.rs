@@ -112,7 +112,12 @@ pub(super) fn extract(
             }
             None
         };
-        super::go_buildinfo::detect(bytes, values, "elf", Some(&resolve));
+        let go_sections = super::go_buildinfo::GoSections {
+            buildid_note: read_section(&elf, bytes, ".note.go.buildid"),
+            pclntab: read_section(&elf, bytes, ".gopclntab"),
+            rodata: read_section(&elf, bytes, ".rodata"),
+        };
+        super::go_buildinfo::detect(bytes, values, "elf", Some(&resolve), &go_sections);
     }
     super::build_toolchain::from_elf(values, sections_out, bytes);
 
