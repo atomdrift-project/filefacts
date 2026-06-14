@@ -78,7 +78,7 @@ pub(super) fn detect(
     resolve_va: Option<&dyn Fn(u64) -> Option<usize>>,
     sections: &GoSections<'_>,
 ) {
-    let Some(start) = find_bytes(bytes, MAGIC) else {
+    let Some(start) = memchr::memmem::find(bytes, MAGIC) else {
         return;
     };
     if start + 32 > bytes.len() {
@@ -143,7 +143,7 @@ fn build_id(buildid_note: Option<&[u8]>, rodata: Option<&[u8]>, bytes: &[u8]) ->
     }
     let needle = b"Go build ID: \"";
     let scan_in = |hay: &[u8]| -> Option<String> {
-        let pos = find_bytes(hay, needle)?;
+        let pos = memchr::memmem::find(hay, needle)?;
         let after = &hay[pos + needle.len()..];
         let end = after.iter().take(256).position(|&b| b == b'"')?;
         let id = std::str::from_utf8(&after[..end]).ok()?;
@@ -175,7 +175,7 @@ fn parse_elf_buildid_note(note: &[u8]) -> Option<String> {
 /// Scan the pclntab for the canonical `/src/runtime/` source path and
 /// walk back to the GoRoot install prefix.
 fn scan_go_root(pclntab: &[u8]) -> Option<String> {
-    let pos = find_bytes(pclntab, b"/src/runtime/")?;
+    let pos = memchr::memmem::find(pclntab, b"/src/runtime/")?;
     let mut start = pos;
     let lo = pos.saturating_sub(256);
     while start > lo && is_path_byte(pclntab[start - 1]) {
@@ -194,13 +194,11 @@ fn scan_go_root(pclntab: &[u8]) -> Option<String> {
 fn scan_go_main_root(pclntab: &[u8], go_root: Option<&str>) -> Option<String> {
     const MAX_CANDIDATES: usize = 4096;
     let mut candidates: Vec<&str> = Vec::new();
-    let mut from = 0;
-    while candidates.len() < MAX_CANDIDATES {
-        let Some(rel0) = find_bytes(&pclntab[from..], b".go\0") else {
+    for rel in memchr::memmem::Finder::new(b".go\0").find_iter(pclntab) {
+        if candidates.len() >= MAX_CANDIDATES {
             break;
-        };
-        let rel = from + rel0;
-        from = rel + 4;
+        }
+        // Walk back from the `.go` match to the start of the path.
         let mut start = rel;
         let lo = rel.saturating_sub(512);
         while start > lo {
@@ -210,6 +208,8 @@ fn scan_go_main_root(pclntab: &[u8], go_root: Option<&str>) -> Option<String> {
             }
             start -= 1;
         }
+        // Only absolute paths identify a developer tree; relative module
+        // paths (emitted under -trimpath) don't.
         if start == rel || pclntab[start] != b'/' {
             continue;
         }
@@ -343,7 +343,7 @@ fn parse_modinfo(blob: &[u8], out: &mut Map<String, JsonValue>) {
     // Trim the 16-byte sentinels the runtime brackets the modinfo
     // with. Locating the first ASCII `path\t` line is more
     // forgiving than reproducing the exact sentinel bytes.
-    let start = find_bytes(blob, b"path\t").unwrap_or(0);
+    let start = memchr::memmem::find(blob, b"path\t").unwrap_or(0);
     let end = blob
         .iter()
         .rposition(|&b| b == b'\n')
@@ -498,10 +498,6 @@ fn decode_uvarint(buf: &[u8]) -> Option<(u64, &[u8])> {
         shift += 7;
     }
     None
-}
-
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]
