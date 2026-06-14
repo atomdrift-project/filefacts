@@ -21,7 +21,7 @@
 //! a single module is silent — partial output is more useful than
 //! none.
 
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek};
 
 use serde_json::Value as JsonValue;
 
@@ -218,6 +218,41 @@ pub(super) fn extract(
             distinct_triggers.len() as f64,
         );
     }
+}
+
+/// Decompress VBA macros carried in an OOXML `vbaProject.bin` member.
+///
+/// `vbaProject.bin` is itself a standalone CFBF compound file, so once
+/// its bytes are read out of the zip they flow through the same CFB walk
+/// as the legacy [`extract`] path and populate `office.vba.*`
+/// identically. This mirrors the `FileType::OleDoc` dispatch so macros in
+/// `.docm`/`.xlsm`/`.pptm` are decompressed, not merely flagged by stream
+/// path. A document carries a single `vbaProject.bin`; the first match
+/// wins, matching the legacy extractor's selection.
+pub(super) fn extract_from_zip<R: Read + Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    values: &mut Values,
+    metrics: &mut Metrics,
+    symbols_out: &mut crate::output::Symbols,
+) {
+    let Some(name) = zip
+        .file_names()
+        .find(|n| n.to_ascii_lowercase().ends_with("vbaproject.bin"))
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let Ok(mut entry) = zip.by_name(&name) else {
+        return;
+    };
+    if entry.size() > MAX_STREAM_SIZE {
+        return;
+    }
+    let mut bytes = Vec::with_capacity(entry.size() as usize);
+    if entry.read_to_end(&mut bytes).is_err() {
+        return;
+    }
+    extract(&bytes, values, metrics, symbols_out);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -715,5 +750,78 @@ mod tests {
         assert_eq!(infos[0].name, "Foo");
         assert_eq!(infos[0].stream_name, "Bar");
         assert_eq!(infos[0].offset, 42);
+    }
+
+    /// Wrap raw bytes as a single uncompressed MS-OVBA chunk so the
+    /// decompressor round-trips them verbatim (`raw` must be ≤ 4096).
+    fn ovba_store(raw: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x01u8];
+        out.extend_from_slice(&0u16.to_le_bytes()); // header, high bit clear → uncompressed
+        out.extend_from_slice(raw);
+        out
+    }
+
+    #[test]
+    fn ooxml_vbaproject_member_is_decompressed() {
+        use std::io::{Cursor, Write};
+
+        // dir stream describing one standard module "Module1" whose
+        // source lives in the "Module1" stream at offset 0.
+        let mut dir = Vec::new();
+        let push = |d: &mut Vec<u8>, id: u16, body: &[u8]| {
+            d.extend_from_slice(&id.to_le_bytes());
+            d.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            d.extend_from_slice(body);
+        };
+        push(&mut dir, 0x0019, b"Module1"); // MODULENAME
+        push(&mut dir, 0x001A, b"Module1"); // MODULESTREAMNAME
+        push(&mut dir, 0x0031, &0u32.to_le_bytes()); // MODULEOFFSET = 0
+        push(&mut dir, 0x0021, &[]); // procedural
+        push(&mut dir, 0x002B, &[]); // terminator
+
+        let source =
+            b"Attribute VB_Name = \"Module1\"\r\nSub AutoOpen()\r\n  Shell \"calc.exe\"\r\nEnd Sub\r\n";
+
+        // vbaProject.bin is a standalone CFBF with a /VBA storage.
+        let mut buf = Cursor::new(Vec::<u8>::new());
+        {
+            let mut comp = cfb::CompoundFile::create(&mut buf).unwrap();
+            comp.create_storage("/VBA").unwrap();
+            {
+                let mut s = comp.create_stream("/VBA/dir").unwrap();
+                s.write_all(&ovba_store(&dir)).unwrap();
+            }
+            {
+                let mut s = comp.create_stream("/VBA/Module1").unwrap();
+                s.write_all(&ovba_store(source)).unwrap();
+            }
+        }
+        let vba_bin = buf.into_inner();
+
+        // Wrap it in an OOXML-style zip under word/vbaProject.bin.
+        let mut zw = zip::ZipWriter::new(Cursor::new(Vec::<u8>::new()));
+        zw.start_file("word/vbaProject.bin", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zw.write_all(&vba_bin).unwrap();
+        let zip_bytes = zw.finish().unwrap().into_inner();
+
+        let mut zip = zip::ZipArchive::new(Cursor::new(zip_bytes)).unwrap();
+        let mut values = Values::new();
+        let mut metrics = Metrics::new();
+        let mut symbols = crate::output::Symbols::new();
+        extract_from_zip(&mut zip, &mut values, &mut metrics, &mut symbols);
+
+        let modules = values
+            .get("office.vba.modules")
+            .and_then(|v| v.as_array())
+            .expect("office.vba.modules populated from OOXML vbaProject.bin");
+        assert_eq!(modules.len(), 1);
+        let src = modules[0]
+            .get("source")
+            .and_then(|v| v.as_str())
+            .expect("module source present");
+        assert!(src.contains("AutoOpen"), "decompressed source: {src}");
+        assert!(src.contains("Shell"));
+        assert_eq!(metrics.get("office.vba.module_count"), Some(1.0));
     }
 }

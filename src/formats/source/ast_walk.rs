@@ -47,6 +47,9 @@ pub(super) fn walk(
     let call_count = state.calls.len() as u64;
     let bind_count = state.binds.len() as u64;
     let member_count = state.members.len() as u64;
+    // Classify each call's command-name target (obfuscated vs dynamic) before
+    // the buffer is drained into `symbols_out`.
+    super::call_target_metrics::emit(&state.calls, config.name, metrics);
     for c in state.calls {
         symbols_out.push(c);
     }

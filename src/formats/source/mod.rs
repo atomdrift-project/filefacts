@@ -9,6 +9,7 @@
 //! [`ParsedFile`]: crate::ParsedFile
 
 mod ast_walk;
+mod call_target_metrics;
 mod comment_metrics;
 mod function_metrics;
 mod identifier_metrics;

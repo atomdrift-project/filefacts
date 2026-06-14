@@ -51,6 +51,11 @@ const CP_INVOKE_DYNAMIC: u8 = 18;
 const CP_MODULE: u8 = 19;
 const CP_PACKAGE: u8 = 20;
 
+/// Upper bound on the number of `class.class_refs` / `class.strings`
+/// entries emitted, so a hostile constant pool can't bloat the output.
+/// Real classes carry far fewer distinct entries than this.
+const MAX_CP_FACTS: usize = 8192;
+
 #[derive(Default)]
 struct ConstantPool {
     utf8: HashMap<u16, String>,
@@ -154,6 +159,44 @@ pub(super) fn extract(
     // must not show up as an import.
     populate_imports(&cp, this_idx, symbols_out, metrics);
     metrics.insert("class.method_count", f64::from(method_count));
+
+    // Complete CONSTANT_Class name set and CONSTANT_Utf8 string table.
+    // Consumers run constant-pool class/string heuristics directly off
+    // these facts rather than re-parsing the class. Both are bounded so a
+    // hostile constant pool can't bloat the output unboundedly.
+    let mut class_refs: Vec<&str> = cp
+        .class
+        .keys()
+        .filter_map(|idx| cp.class_name(*idx))
+        .collect();
+    class_refs.sort_unstable();
+    class_refs.dedup();
+    if !class_refs.is_empty() {
+        values.insert(
+            "class.class_refs",
+            JsonValue::Array(
+                class_refs
+                    .into_iter()
+                    .take(MAX_CP_FACTS)
+                    .map(|s| JsonValue::String(s.to_string()))
+                    .collect(),
+            ),
+        );
+    }
+    let mut utf8: Vec<&str> = cp.utf8.values().map(String::as_str).collect();
+    utf8.sort_unstable();
+    utf8.dedup();
+    if !utf8.is_empty() {
+        values.insert(
+            "class.strings",
+            JsonValue::Array(
+                utf8.into_iter()
+                    .take(MAX_CP_FACTS)
+                    .map(|s| JsonValue::String(s.to_string()))
+                    .collect(),
+            ),
+        );
+    }
 
     put_u64(values, "class.major_version", u64::from(major_version));
     put_u64(values, "class.minor_version", u64::from(minor_version));
@@ -618,6 +661,32 @@ mod tests {
     fn rejects_non_class() {
         let (v, _) = run(b"not a class");
         assert!(v.get("class.major_version").is_none());
+    }
+
+    #[test]
+    fn emits_constant_pool_class_refs_and_strings() {
+        let bytes = build_class(52, true);
+        let (v, _) = run(&bytes);
+        let refs: Vec<&str> = v
+            .get("class.class_refs")
+            .and_then(|x| x.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        assert_eq!(refs, vec!["MyClass", "java/lang/Object"]);
+        let strings: Vec<&str> = v
+            .get("class.strings")
+            .and_then(|x| x.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        // Every CONSTANT_Utf8 entry, sorted + deduped.
+        assert_eq!(
+            strings,
+            vec!["MyClass", "MyClass.java", "SourceFile", "java/lang/Object"]
+        );
     }
 
     #[test]

@@ -149,7 +149,12 @@ pub(crate) fn extract(
             // then the OOXML-specific `office.*` layer from the same handle.
             let mut archive = zip::open_archive(bytes)?;
             zip::extract_from_archive(&mut archive, bytes, values, metrics, archive_members)?;
-            ooxml::extract_from_archive(&mut archive, values, metrics)
+            ooxml::extract_from_archive(&mut archive, values, metrics)?;
+            // Decompress macros from any `vbaProject.bin` member so
+            // `office.vba.modules[]` is populated for OOXML, mirroring the
+            // OleDoc arm. Best-effort: a macro-free doc leaves it unset.
+            vba::extract_from_zip(&mut archive, values, metrics, symbols);
+            Ok(())
         }
         FileType::OleDoc => {
             ole2::extract(bytes, values, metrics)?;
