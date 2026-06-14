@@ -25,7 +25,7 @@
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
-use crate::formats::common::{extract_ascii_strings, hex_nibble, put_str};
+use crate::formats::common::{extract_binary_strings, hex_nibble, put_str};
 use crate::output::{Metrics, Strings, Values};
 
 pub(super) fn extract(
@@ -34,7 +34,7 @@ pub(super) fn extract(
     strings: &mut Strings,
     metrics: &mut Metrics,
 ) -> Result<(), Error> {
-    extract_ascii_strings(bytes, strings);
+    extract_binary_strings(bytes, strings);
 
     // Every RTF starts with `{\rtf<version>`. Bail (parsable as
     // generic) if the magic is missing.

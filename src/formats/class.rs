@@ -30,7 +30,7 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
 use crate::error::Error;
-use crate::formats::common::{extract_ascii_strings, put_str, put_u64};
+use crate::formats::common::{extract_binary_strings, put_str, put_u64};
 use crate::output::{Metrics, Strings, Values};
 
 const CP_UTF8: u8 = 1;
@@ -108,7 +108,7 @@ pub(super) fn extract(
     metrics: &mut Metrics,
     symbols_out: &mut crate::Symbols,
 ) -> Result<(), Error> {
-    extract_ascii_strings(bytes, strings);
+    extract_binary_strings(bytes, strings);
 
     if bytes.len() < 10
         || u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) != 0xCAFE_BABE

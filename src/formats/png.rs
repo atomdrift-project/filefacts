@@ -24,7 +24,7 @@
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
-use crate::formats::common::extract_ascii_strings;
+use crate::formats::common::extract_binary_strings;
 use crate::formats::image_stats;
 use crate::output::{Metrics, Strings, Values};
 use crate::scan::entropy;
@@ -37,7 +37,7 @@ pub(super) fn extract(
     strings: &mut Strings,
     metrics: &mut Metrics,
 ) -> Result<(), Error> {
-    extract_ascii_strings(bytes, strings);
+    extract_binary_strings(bytes, strings);
 
     if bytes.len() < 8 || &bytes[..8] != SIGNATURE {
         return Ok(());

@@ -5,27 +5,7 @@ use serde_json::Value as JsonValue;
 use crate::output::{Strings, Values};
 use crate::scan::ascii;
 
-/// Push every ASCII run in `bytes` into the byte-scan Text view,
-/// applying the scanner's default minimum length.
-pub(super) fn extract_ascii_strings(bytes: &[u8], strings: &mut Strings) {
-    strings
-        .text
-        .ascii
-        .extend(ascii::extract_runs(bytes, ascii::DEFAULT_MIN_LEN));
-}
-
-/// Language-aware binary string extraction via the `stng` crate.
-/// Used by PE/ELF/Mach-O extractors in place of the raw
-/// `extract_ascii_strings` byte-scan: stng's pointer+length-aware
-/// extraction dedupes Go/Rust packed strings, recovers XOR-deobfuscated
-/// runs, and decodes base64/hex/url payloads. UTF-16-recovered runs
-/// land in the Text.utf16le partition; everything else in Text.ascii.
-///
-/// `method` is set only for *transformation* methods (the string went
-/// through a decoder: `base64`, `xor`, `unicode-escape`, …) — the
-/// pure recovery methods (raw scan, instruction-pattern, structure)
-/// add noise and aren't worth tagging.
-/// Options shared by both binary extraction entry points. filefacts is the
+/// stng extraction options. filefacts is the
 /// single string-extraction authority for cleave, so these mirror the rich opts
 /// cleave used to pass to stng directly:
 /// - `garbage_filter` drops high-noise runs,
@@ -39,9 +19,10 @@ fn string_opts() -> stng::ExtractOptions {
         .with_caller_provides_symbols(true)
 }
 
-/// Partition stng's extracted strings into the UTF-16 / ASCII buckets.
+/// Partition stng's extracted strings into the UTF-16 / ASCII buckets,
+/// retaining the raw typed `stng::ExtractedString` rows (the consumer reads
+/// stng's `StringKind`/`StringMethod` directly).
 fn push_stng_strings(extracted: Vec<stng::ExtractedString>, strings: &mut Strings) {
-    use crate::output::ExtractedString;
     for s in extracted {
         let is_utf16 = matches!(
             s.method,
@@ -49,18 +30,10 @@ fn push_stng_strings(extracted: Vec<stng::ExtractedString>, strings: &mut String
                 | stng::StringMethod::Utf16LeDecode
                 | stng::StringMethod::Utf16BeDecode
         );
-        let entry = ExtractedString {
-            text: s.value,
-            offset: s.data_offset as usize,
-            method: stng_method_label(s.method).map(str::to_string),
-            kind: s.kind.map(stng_kind_label).map(str::to_string),
-            section: s.section,
-            ..ExtractedString::default()
-        };
         if is_utf16 {
-            strings.text.utf16le.push(entry);
+            strings.text.utf16le.push(s);
         } else {
-            strings.text.ascii.push(entry);
+            strings.text.ascii.push(s);
         }
     }
 }
@@ -89,105 +62,6 @@ pub(super) fn extract_binary_strings_from_object(
         stng::extract_strings_from_object(object, bytes, &string_opts()),
         strings,
     );
-}
-
-/// Map stng's `StringMethod` to a canonical kebab-case encoding name.
-/// Only decoder/transformation methods are surfaced; pure recovery
-/// methods (raw scan, structure, instruction-pattern) return `None`
-/// because trait engines don't gain anything from "this string was
-/// found by looking at bytes". Convention matches cleave's existing
-/// `encoding_chain` values so `type: kv path: strings.ascii[*].method`
-/// rules port across without renaming.
-fn stng_method_label(m: stng::StringMethod) -> Option<&'static str> {
-    use stng::StringMethod as M;
-    Some(match m {
-        // Transformation methods — the string went through a decoder.
-        M::Base64Decode => "base64",
-        M::Base64ObfuscatedDecode => "base64-obf",
-        M::HexDecode => "hex",
-        M::UrlDecode => "url",
-        M::Base32Decode => "base32",
-        M::Base85Decode => "base85",
-        M::UnicodeEscapeDecode => "unicode-escape",
-        M::XorDecode => "xor",
-        M::XorStackPair => "xor-stack-pair",
-        M::StackString => "stack",
-        M::WideString => "wide",
-        M::Utf16LeDecode => "utf16-le",
-        M::Utf16BeDecode => "utf16-be",
-        M::SpacedAscii => "spaced-ascii",
-        M::ScriptDecode => "script",
-        M::CodeSignature => "code-signature",
-        M::PclntabSymbol => "pclntab",
-        // Pure recovery — not interesting to annotate.
-        M::Structure
-        | M::InstructionPattern
-        | M::RawScan
-        | M::Heuristic
-        | M::R2String
-        | M::R2Symbol => return None,
-        _ => return None,
-    })
-}
-
-/// Map stng's classifier `StringKind` to a kebab-case label. Mirrors
-/// the method-label convention. Coverage focuses on malware-detection
-/// useful kinds; unrecognised variants pass through as `other` so
-/// trait engines can fire on the negative (`kind: other` =
-/// classifier ran but didn't match anything specific).
-fn stng_kind_label(k: stng::StringKind) -> &'static str {
-    use stng::StringKind as K;
-    match k {
-        K::FuncName => "func-name",
-        K::FilePath => "file-path",
-        K::MapKey => "map-key",
-        K::Error => "error",
-        K::EnvVar => "env-var",
-        K::Url => "url",
-        K::Path => "path",
-        K::Arg => "arg",
-        K::Ident => "ident",
-        K::Garbage => "garbage",
-        K::Section => "section",
-        K::Import => "import",
-        K::Export => "export",
-        K::IP => "ip",
-        K::IPPort => "ip-port",
-        K::Hostname => "hostname",
-        K::ShellCmd => "shell-cmd",
-        K::AppleScript => "applescript",
-        K::PythonCode => "python-code",
-        K::JavaScriptCode => "javascript-code",
-        K::PhpCode => "php-code",
-        K::PowerShellCode => "powershell-code",
-        K::SuspiciousPath => "suspicious-path",
-        K::Registry => "registry",
-        K::Base58 => "base58",
-        K::Base85 => "base85",
-        K::Overlay => "overlay",
-        K::CryptoWallet => "crypto-wallet",
-        K::MiningPool => "mining-pool",
-        K::Email => "email",
-        K::TorAddress => "tor-address",
-        K::CTFFlag => "ctf-flag",
-        K::SQLInjection => "sql-injection",
-        K::XSSPayload => "xss-payload",
-        K::CommandInjection => "command-injection",
-        K::JWT => "jwt",
-        K::APIKey => "api-key",
-        K::Mutex => "mutex",
-        K::GUID => "guid",
-        K::Hash => "hash",
-        K::RansomNote => "ransom-note",
-        K::LDAPPath => "ldap-path",
-        K::OverlayWide => "overlay-wide",
-        K::StackString => "stack-string",
-        K::Entitlement => "entitlement",
-        K::AppId => "app-id",
-        K::EntitlementsXml => "entitlements-xml",
-        K::XorKey => "xor-key",
-        _ => "other",
-    }
 }
 
 /// Convenience wrapper for emitting a string-typed value into `values`.

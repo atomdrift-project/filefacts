@@ -772,18 +772,18 @@ fn emit_binary_aggregates(
         let mut sentence = 0_u64;
         // Collect lengths once; second pass below computes stddev.
         let mut lengths: Vec<usize> = Vec::with_capacity(total);
-        for s in strings.iter() {
-            let len = s.text.len();
+        for s in strings.text_values() {
+            let len = s.len();
             max_len = max_len.max(len);
             sum_len = sum_len.saturating_add(len);
             lengths.push(len);
             // Shannon-entropy floor of 6.0 bits/byte separates random-
             // looking strings (base64, keys, hex blobs) from English /
             // identifier-shaped text (~3–4.5).
-            if scan::entropy::shannon(s.text.as_bytes()) >= 6.0 {
+            if scan::entropy::shannon(s.as_bytes()) >= 6.0 {
                 high_entropy += 1;
             }
-            if is_sentence_like(&s.text) {
+            if is_sentence_like(s) {
                 sentence += 1;
             }
         }

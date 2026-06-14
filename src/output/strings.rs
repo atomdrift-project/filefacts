@@ -69,12 +69,18 @@ pub struct ExtractedString {
 /// Partitioned by encoding so consumers can pull a single slice
 /// cheaply. Within a partition, order matches the byte order of the
 /// source — earlier bytes first.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// Rows are the raw `stng::ExtractedString` (the single string-extraction
+/// engine), retained typed so the sole consumer (cleave) reads stng's
+/// `StringKind`/`StringMethod` enums directly rather than re-parsing labels.
+/// `Deserialize` is intentionally absent — `stng::ExtractedString` is
+/// serialize-only, and this tier is produced, never loaded.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Text {
     /// Printable ASCII runs.
-    pub ascii: Vec<ExtractedString>,
+    pub ascii: Vec<stng::ExtractedString>,
     /// Printable UTF-16LE runs.
-    pub utf16le: Vec<ExtractedString>,
+    pub utf16le: Vec<stng::ExtractedString>,
 }
 
 impl Text {
@@ -92,7 +98,7 @@ impl Text {
     }
     /// Iterate every run regardless of encoding, in (ascii, utf16le)
     /// order. Within each encoding, order is by source byte offset.
-    pub fn iter(&self) -> impl Iterator<Item = &ExtractedString> {
+    pub fn iter(&self) -> impl Iterator<Item = &stng::ExtractedString> {
         self.ascii.iter().chain(self.utf16le.iter())
     }
 }
@@ -213,10 +219,15 @@ impl Strings {
     pub(crate) fn len(&self) -> usize {
         self.text.len() + self.literals.len()
     }
-    /// Iterate every extracted string across both tiers, in
-    /// (text.ascii, text.utf16le, literals) order.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &ExtractedString> {
-        self.text.iter().chain(self.literals.iter())
+    /// Each string's text across both tiers, in (text.ascii, text.utf16le,
+    /// literals) order. The `text` tier is stng-typed (`.value`); the
+    /// `literals` tier is filefacts-typed (`.text`) — so they're yielded as a
+    /// common `&str` rather than a shared row type.
+    pub(crate) fn text_values(&self) -> impl Iterator<Item = &str> {
+        self.text
+            .iter()
+            .map(|s| s.value.as_str())
+            .chain(self.literals.iter().map(|s| s.text.as_str()))
     }
 }
 
@@ -227,17 +238,17 @@ mod tests {
     #[test]
     fn text_iter_walks_both_encodings() {
         let mut t = Text::new();
-        t.ascii.push(ExtractedString {
-            text: "Mozilla/5.0".into(),
-            offset: 100,
+        t.ascii.push(stng::ExtractedString {
+            value: "Mozilla/5.0".into(),
+            data_offset: 100,
             ..Default::default()
         });
-        t.utf16le.push(ExtractedString {
-            text: "RegOpenKeyExW".into(),
-            offset: 200,
+        t.utf16le.push(stng::ExtractedString {
+            value: "RegOpenKeyExW".into(),
+            data_offset: 200,
             ..Default::default()
         });
-        let texts: Vec<&str> = t.iter().map(|s| s.text.as_str()).collect();
+        let texts: Vec<&str> = t.iter().map(|s| s.value.as_str()).collect();
         assert_eq!(texts, vec!["Mozilla/5.0", "RegOpenKeyExW"]);
         assert_eq!(t.len(), 2);
     }

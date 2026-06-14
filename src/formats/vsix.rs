@@ -24,7 +24,7 @@ use std::io::{Read, Seek};
 use serde_json::Value as JsonValue;
 
 use crate::error::Error;
-use crate::formats::common::{extract_ascii_strings, put_str};
+use crate::formats::common::{extract_binary_strings, put_str};
 use crate::output::{Metrics, Strings, Values};
 
 /// Manifests above this are not legitimate — stop reading rather than
@@ -56,7 +56,7 @@ pub(super) fn extract(
     strings: &mut Strings,
     metrics: &mut Metrics,
 ) -> Result<(), Error> {
-    extract_ascii_strings(bytes, strings);
+    extract_binary_strings(bytes, strings);
 
     let Ok(text) = std::str::from_utf8(bytes) else {
         return Ok(());
