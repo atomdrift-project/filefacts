@@ -617,7 +617,11 @@ impl RizinRecovery {
                     name: imp.name,
                     alias: None,
                     library: imp.libname,
-                    offset: None,
+                    // The PLT/stub address — where the binary references the
+                    // import — anchors the finding, matching how recovered
+                    // exports/functions store their vaddr. 0 means rizin gave
+                    // no location, so leave it unanchored rather than at 0.
+                    offset: (imp.plt != 0).then_some(imp.plt),
                     ordinal: imp.ordinal,
                 });
                 counts.imports = counts.imports.saturating_add(1);
@@ -768,6 +772,11 @@ struct RawImport {
     name: String,
     libname: Option<String>,
     ordinal: Option<u32>,
+    /// PLT/stub address rizin resolves for the import — the site where the
+    /// binary actually calls through to the imported symbol. 0 (the serde
+    /// default) means rizin couldn't place it; treated as "no location".
+    #[serde(default)]
+    plt: u64,
 }
 
 #[derive(Deserialize)]
@@ -1018,6 +1027,33 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec!["from_goblin"]);
+    }
+
+    #[test]
+    fn recovered_import_anchors_at_plt_address() {
+        // rizin's iij carries the PLT/stub address; recovery records it as the
+        // import's offset (it only runs when goblin found zero imports). An
+        // import without a plt stays unanchored rather than anchoring at 0.
+        let recovery = make_recovery(
+            r#"{"imports":[{"name":"dlopen","plt":4096},{"name":"getpid"}],"exports":[],"functions":[]}"#,
+        );
+        let mut symbols = Symbols::new();
+        let mut metrics = Metrics::new();
+        recovery.apply(&mut symbols, &mut metrics);
+        let offsets: Vec<(String, Option<u64>)> = symbols
+            .iter_kind(SymbolKind::Import)
+            .filter_map(|s| match s {
+                Symbol::Import { name, offset, .. } => Some((name.clone(), *offset)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            offsets,
+            vec![
+                ("dlopen".to_string(), Some(4096)),
+                ("getpid".to_string(), None),
+            ]
+        );
     }
 
     #[test]

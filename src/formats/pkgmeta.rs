@@ -118,11 +118,61 @@ fn finalize(root: Map<String, JsonValue>, values: &mut Values) {
     if !sums.is_empty() {
         values.insert("pkg.checksums", JsonValue::String(sums.join(",")));
     }
+    // Normalized GitHub-owner projections for provenance comparison in traits.
+    // The upstream `url`'s owner and every github.com source's owner are emitted
+    // as neutral facts; a trait compares the url owner against the source owners
+    // (`ne … match: any`) to flag `-bin` fork impersonation — a source repo under
+    // a different owner than the declared upstream. Owners are path[0] after
+    // `github.com/`, an unambiguous high-confidence key; a bare cross-DOMAIN
+    // difference (project site vs CDN vs GitHub releases) is normal and is
+    // deliberately NOT projected, so only same-host owner divergence is
+    // comparable. Parsing lives here; the comparison is pure YAML.
+    if let Some(JsonValue::String(url)) = root.get("url") {
+        if let Some(owner) = github_owner(url) {
+            values.insert("pkg.url_github_owner", JsonValue::String(owner));
+        }
+    }
+    let mut source_owners: Vec<JsonValue> = Vec::new();
+    for (key, value) in &root {
+        if key.split_once('_').map_or(key.as_str(), |(b, _)| b) != "source" {
+            continue;
+        }
+        let JsonValue::Array(arr) = value else {
+            continue;
+        };
+        for e in arr {
+            let JsonValue::String(s) = e else { continue };
+            // Honor `filename::url` rename syntax — read the URL half.
+            let u = s.rsplit_once("::").map_or(s.as_str(), |(_, u)| u);
+            if let Some(owner) = github_owner(u) {
+                let owner = JsonValue::String(owner);
+                if !source_owners.contains(&owner) {
+                    source_owners.push(owner);
+                }
+            }
+        }
+    }
+    if !source_owners.is_empty() {
+        values.insert("pkg.source_github_owners", JsonValue::Array(source_owners));
+    }
     // Insert each field under `pkg.<field>` so the subtree merges alongside the
     // generic file.* values rather than replacing the whole values object.
     for (key, value) in root {
         values.insert(&format!("pkg.{key}"), value);
     }
+}
+
+/// The GitHub owner (first path segment after `github.com/`), lowercased.
+/// Covers `https://github.com/OWNER/repo`, `git+https://…`, codeload, and
+/// release-download URLs. `None` for non-github URLs or an unresolved `$var`
+/// owner (which can't be compared).
+fn github_owner(s: &str) -> Option<String> {
+    let rest = s.split_once("github.com/")?.1;
+    let owner = rest.split(['/', '#', '?']).next()?;
+    if owner.is_empty() || owner.contains('$') {
+        return None;
+    }
+    Some(owner.to_ascii_lowercase())
 }
 
 /// Strip surrounding single/double quotes from a bash word.
@@ -269,6 +319,41 @@ mod tests {
         // SKIP excluded; only the real hash drives the digest.
         assert_eq!(pkg(&v, "checksums"), "deadbeef");
         assert!(matches!(v.get("pkg.source"), Some(JsonValue::Array(_))));
+    }
+
+    #[test]
+    fn github_owner_extraction() {
+        assert_eq!(
+            github_owner("https://github.com/foo/bar"),
+            Some("foo".into())
+        );
+        assert_eq!(
+            github_owner("git+https://github.com/Foo/bar.git#tag=v1"),
+            Some("foo".into())
+        );
+        assert_eq!(
+            github_owner("https://github.com/o/r/releases/download/v1/x.tar.gz"),
+            Some("o".into())
+        );
+        // Non-github and unresolved-variable owners aren't comparable.
+        assert_eq!(github_owner("https://librewolf.net/x.tar.gz"), None);
+        assert_eq!(github_owner("https://github.com/$_owner/r"), None);
+    }
+
+    #[test]
+    fn github_owner_projections() {
+        // url owner and source owners are emitted as neutral facts; the trait
+        // does the compare. Here url=foo but the source repo is attacker/payload.
+        let src = b"pkgname=tool-bin\nurl=https://github.com/foo/tool\nsource=('https://github.com/attacker/payload/releases/download/v1/t.tar.gz')\nsha256sums=('SKIP')\n";
+        let mut v = Values::new();
+        extract_pkgbuild(src, &mut v).unwrap();
+        assert_eq!(pkg(&v, "url_github_owner"), "foo");
+        assert_eq!(
+            v.get("pkg.source_github_owners"),
+            Some(&JsonValue::Array(vec![JsonValue::String(
+                "attacker".into()
+            )]))
+        );
     }
 
     #[test]

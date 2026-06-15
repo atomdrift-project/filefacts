@@ -828,6 +828,15 @@ fn detect_manifest(path: &Path, data: &[u8]) -> Option<FileType> {
     match name {
         "package.json" => Some(FileType::PackageJson),
         "package-lock.json" => Some(FileType::PackageLockJson),
+        "go.mod" => Some(FileType::GoMod),
+        "go.sum" => Some(FileType::GoSum),
+        "requirements.txt" => Some(FileType::RequirementsTxt),
+        "poetry.lock" => Some(FileType::PoetryLock),
+        "pipfile.lock" => Some(FileType::PipfileLock),
+        "gemfile.lock" => Some(FileType::GemfileLock),
+        "composer.lock" => Some(FileType::ComposerLock),
+        "yarn.lock" => Some(FileType::YarnLock),
+        "pnpm-lock.yaml" => Some(FileType::PnpmLock),
         "manifest.json" => {
             // Chrome extension: manifest_version + at least one Chrome-specific key
             if memchr::memmem::find(data, b"\"manifest_version\"").is_some()

@@ -85,6 +85,19 @@ pub(super) fn emit(manifest: &JsonValue, values: &mut Values) {
     if !maintainers.is_empty() {
         values.insert("npm.maintainers", JsonValue::Array(maintainers));
     }
+    // Install-time lifecycle hooks: the command string is the reference
+    // source — a `postinstall` that fetches a remote stage is the classic
+    // npm supply-chain vector.
+    if let Some(scripts) = obj.get("scripts").and_then(JsonValue::as_object) {
+        for hook in ["preinstall", "install", "postinstall"] {
+            if let Some(cmd) = scripts.get(hook).and_then(JsonValue::as_str) {
+                values.insert(
+                    &format!("npm.scripts.{hook}"),
+                    JsonValue::String(cmd.to_string()),
+                );
+            }
+        }
+    }
 }
 
 /// A `repository` is either a string (`"github:user/repo"` or a URL) or

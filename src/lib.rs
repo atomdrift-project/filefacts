@@ -94,9 +94,9 @@ pub use error::Error;
 pub use fileid::{FileId, FileType};
 pub use output::{
     ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Arg, ArgShape, Claim,
-    Comments, ErrorKind, Errors, ExtractedString, Identity, Literals, Metrics, ParseError, Party,
-    Section, Sections, Signer, Stage, Symbol, SymbolKind, Symbols, Text, Trust, Url, UrlKind,
-    Values,
+    Comments, ErrorKind, Errors, ExternalRef, ExtractedString, HashAlgo, Identity, Literals,
+    Metrics, ParseError, Party, PinnedHash, RefKind, RefLocator, Section, Sections, Signer, Stage,
+    Symbol, SymbolKind, Symbols, Text, Trust, Url, UrlKind, Values,
 };
 
 /// Schema version of the public output shape.
@@ -194,6 +194,7 @@ struct Extracted {
     sections: Sections,
     symbols: Symbols,
     identity: Identity,
+    references: Vec<ExternalRef>,
     errors: Errors,
 }
 
@@ -293,6 +294,15 @@ impl<'a> ParsedFile<'a> {
     /// identity and carry no signature.
     pub fn identity(&self) -> &Identity {
         &self.extracted().identity
+    }
+
+    /// External references this artifact points at — declared packages,
+    /// install-hook URLs, staged downloads — normalized to PURL where the
+    /// ecosystem is identifiable, else a raw URL. Recorded, never fetched;
+    /// a downstream fetcher resolves and verifies them. Empty for files
+    /// that reference nothing. Computed on first access and cached.
+    pub fn references(&self) -> &[ExternalRef] {
+        &self.extracted().references
     }
 
     /// Non-fatal extraction errors encountered during the parse.
@@ -492,6 +502,11 @@ fn run_extraction(
     // identity.
     let identity = formats::identity::derive(file_type, bytes, &values);
 
+    // External references this file points at (declared packages, install
+    // hooks, staged URLs), normalized to PURL/URL. Reads the same `values`
+    // the format extractors wrote; never fetches.
+    let references = formats::references::derive(file_type, bytes, &values);
+
     Extracted {
         values,
         strings,
@@ -500,6 +515,7 @@ fn run_extraction(
         sections,
         symbols,
         identity,
+        references,
         errors,
     }
 }

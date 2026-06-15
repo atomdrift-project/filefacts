@@ -152,6 +152,9 @@ fn detect_from_filename(path: &Path) -> Option<FileType> {
     if name.eq_ignore_ascii_case("cargo.toml") {
         return Some(FileType::CargoToml);
     }
+    if name.eq_ignore_ascii_case("cargo.lock") {
+        return Some(FileType::CargoLock);
+    }
     if name.eq_ignore_ascii_case("pyproject.toml") {
         return Some(FileType::PyProjectToml);
     }

@@ -75,6 +75,7 @@ mod pickle;
 mod pkgmeta;
 mod png;
 mod pyc;
+pub(crate) mod references;
 mod rpm;
 mod rtf;
 mod rust_crate;
@@ -215,9 +216,11 @@ pub(crate) fn extract(
         // Structured manifests parse their entire content into `values`
         // with the format-native key shape (the parsed JSON/YAML/TOML
         // tree, verbatim).
-        FileType::PackageLockJson | FileType::ComposerJson | FileType::ChromeManifest => {
-            structured::extract_json(bytes, values)
-        }
+        FileType::PackageLockJson
+        | FileType::ComposerJson
+        | FileType::ChromeManifest
+        | FileType::PipfileLock
+        | FileType::ComposerLock => structured::extract_json(bytes, values),
         // A bare package.json: the verbatim JSON tree, plus the same
         // npm.* identity layer the tarball path emits.
         FileType::PackageJson => {
@@ -233,8 +236,11 @@ pub(crate) fn extract(
         // text/raw matchers still fall back when a .gyp uses comments/quotes.
         FileType::Gyp => structured::extract_generic_json(bytes, values, metrics),
         FileType::VsixManifest => vsix::extract(bytes, values, strings, metrics),
-        FileType::CargoToml | FileType::PyProjectToml => structured::extract_toml(bytes, values),
-        FileType::GithubActions => structured::extract_yaml(bytes, values),
+        FileType::CargoToml
+        | FileType::CargoLock
+        | FileType::PoetryLock
+        | FileType::PyProjectToml => structured::extract_toml(bytes, values),
+        FileType::GithubActions | FileType::PnpmLock => structured::extract_yaml(bytes, values),
         FileType::Plist => structured::extract_plist(bytes, values),
         FileType::PkgInfo => structured::extract_pkginfo(bytes, values),
         FileType::SrcInfo => pkgmeta::extract_srcinfo(bytes, values),

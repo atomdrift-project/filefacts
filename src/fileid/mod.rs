@@ -189,6 +189,16 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::Xml
         | FileType::PkgInfo
         | FileType::SrcInfo
+        | FileType::GoMod
+        | FileType::GoSum
+        | FileType::CargoLock
+        | FileType::RequirementsTxt
+        | FileType::PoetryLock
+        | FileType::PipfileLock
+        | FileType::GemfileLock
+        | FileType::ComposerLock
+        | FileType::YarnLock
+        | FileType::PnpmLock
         | FileType::Plist
         | FileType::Makefile
         | FileType::Dockerfile => "config",
@@ -319,6 +329,22 @@ pub enum FileType {
     ChromeManifest,
     /// Rust Cargo.toml manifest
     CargoToml,
+    /// Rust Cargo.lock lockfile — pins every crate to an exact version + sha256.
+    CargoLock,
+    /// Python pip requirements file (requirements.txt) — `name==version` pins.
+    RequirementsTxt,
+    /// Python Poetry lockfile (poetry.lock) — resolved package set.
+    PoetryLock,
+    /// Python Pipenv lockfile (Pipfile.lock) — resolved package set with hashes.
+    PipfileLock,
+    /// Ruby Bundler lockfile (Gemfile.lock) — resolved gem set with versions.
+    GemfileLock,
+    /// PHP Composer lockfile (composer.lock) — resolved package set with dists.
+    ComposerLock,
+    /// Yarn lockfile (yarn.lock) — resolved npm package set with integrity.
+    YarnLock,
+    /// pnpm lockfile (pnpm-lock.yaml) — resolved npm package set with integrity.
+    PnpmLock,
     /// Python pyproject.toml manifest
     PyProjectToml,
     /// PHP composer.json manifest
@@ -342,6 +368,10 @@ pub enum FileType {
     PkgInfo,
     /// Arch/AUR generated package metadata (.SRCINFO) — normalized mirror of PKGBUILD
     SrcInfo,
+    /// Go module manifest (go.mod) — `require` directives are declared dependencies.
+    GoMod,
+    /// Go module checksum database (go.sum) — pins every module to an `h1:` hash.
+    GoSum,
     /// ZIP archive (zip, apk, ipa, nupkg, etc.)
     Zip,
     /// TAR archive (plain, no compression)
@@ -595,6 +625,11 @@ impl FileType {
                 | Self::ComposerJson
                 | Self::ChromeManifest
                 | Self::CargoToml
+                | Self::CargoLock
+                | Self::PoetryLock
+                | Self::PipfileLock
+                | Self::ComposerLock
+                | Self::PnpmLock
                 | Self::PyProjectToml
                 | Self::GithubActions
                 | Self::Plist
