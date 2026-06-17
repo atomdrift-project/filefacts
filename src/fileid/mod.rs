@@ -1844,6 +1844,29 @@ mod tests {
     }
 
     #[test]
+    fn extensionless_php_html_fragment_detects_as_php() {
+        let data = br#"/**
+** Filters for Special Mail Tags
+**/
+
+add_filter( 'wpcf7_special_mail_tags', 'wpcf7_special_mail_tag', 10, 3 );
+
+function wpcf7_special_mail_tag( $output, $name, $html ) {
+    if ( '_remote_ip' == $name )
+        $output = preg_replace( '/[^0-9a-f.:, ]/', '', $_SERVER['REMOTE_ADDR'] );
+    elseif ( '_user_agent' == $name )
+        $output = substr( $_SERVER['HTTP_USER_AGENT'], 0, 254 );
+}
+?>
+<!DOCTYPE html><html><head><script>var x = 1;</script></head></html>
+"#;
+        let det = detect(Path::new("wordpress-cache-fragment"), data)
+            .expect("expected PHP heuristic detection");
+        assert_eq!(det.file_type, FileType::Php);
+        assert_eq!(det.source, DetectionSource::Heuristic);
+    }
+
+    #[test]
     fn markdown_by_ext() {
         assert_ext("readme.md", FileType::Markdown);
         assert_ext("notes.markdown", FileType::Markdown);

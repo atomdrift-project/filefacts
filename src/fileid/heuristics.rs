@@ -38,6 +38,7 @@ enum Lang {
     Python,
     PowerShell,
     Perl,
+    Php,
     Batch,
     Vbs,
     Lua,
@@ -51,11 +52,12 @@ enum Lang {
 
 /// All languages in index order. Used to map score indices back to Lang values
 /// without unsafe transmute.
-const LANGS: [Lang; 13] = [
+const LANGS: [Lang; 14] = [
     Lang::Shell,
     Lang::Python,
     Lang::PowerShell,
     Lang::Perl,
+    Lang::Php,
     Lang::Batch,
     Lang::Vbs,
     Lang::Lua,
@@ -77,15 +79,16 @@ impl Lang {
             Self::Python => 1,
             Self::PowerShell => 2,
             Self::Perl => 3,
-            Self::Batch => 4,
-            Self::Vbs => 5,
-            Self::Lua => 6,
-            Self::JavaScript => 7,
-            Self::C => 8,
-            Self::Kotlin => 9,
-            Self::Dockerfile => 10,
-            Self::Clojure => 11,
-            Self::AppleScript => 12,
+            Self::Php => 4,
+            Self::Batch => 5,
+            Self::Vbs => 6,
+            Self::Lua => 7,
+            Self::JavaScript => 8,
+            Self::C => 9,
+            Self::Kotlin => 10,
+            Self::Dockerfile => 11,
+            Self::Clojure => 12,
+            Self::AppleScript => 13,
         }
     }
 
@@ -95,6 +98,7 @@ impl Lang {
             Self::Python => FileType::Python,
             Self::PowerShell => FileType::PowerShell,
             Self::Perl => FileType::Perl,
+            Self::Php => FileType::Php,
             Self::Batch => FileType::Batch,
             Self::Vbs => FileType::Vbs,
             Self::Lua => FileType::Lua,
@@ -162,6 +166,18 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"use warnings\n", Lang::Perl, 10),
     (b"my $", Lang::Perl, 5),
     (b"chomp", Lang::Perl, 5),
+    // ── PHP ──
+    // Some malware corpora contain PHP fragments or PHP+HTML hybrids without a
+    // leading `<?php` tag. Score PHP-specific globals and WordPress hook idioms
+    // so `elseif ` in those files does not incorrectly win as Lua.
+    (b"<?php", Lang::Php, 10),
+    (b"$_SERVER", Lang::Php, 10),
+    (b"$_POST", Lang::Php, 10),
+    (b"$_GET", Lang::Php, 10),
+    (b"add_filter(", Lang::Php, 10),
+    (b"add_action(", Lang::Php, 10),
+    (b"esc_html(", Lang::Php, 5),
+    (b"preg_replace(", Lang::Php, 5),
     // ── Batch ──
     (b"@echo", Lang::Batch, 10),
     (b"@ECHO", Lang::Batch, 10),
@@ -488,6 +504,26 @@ mod tests {
     fn lua_setmetatable() {
         let data = b"local t = {}\nsetmetatable(t, {__index = function() end})\n";
         assert_eq!(detect_from_content(data), Some(FileType::Lua));
+    }
+
+    #[test]
+    fn php_html_fragment_not_lua() {
+        let data = br#"/**
+** Filters for Special Mail Tags
+**/
+
+add_filter( 'wpcf7_special_mail_tags', 'wpcf7_special_mail_tag', 10, 3 );
+
+function wpcf7_special_mail_tag( $output, $name, $html ) {
+    if ( '_remote_ip' == $name )
+        $output = preg_replace( '/[^0-9a-f.:, ]/', '', $_SERVER['REMOTE_ADDR'] );
+    elseif ( '_user_agent' == $name )
+        $output = substr( $_SERVER['HTTP_USER_AGENT'], 0, 254 );
+}
+?>
+<!DOCTYPE html><html><head><script>var x = 1;</script></head></html>
+"#;
+        assert_eq!(detect_from_content(data), Some(FileType::Php));
     }
 
     #[test]
