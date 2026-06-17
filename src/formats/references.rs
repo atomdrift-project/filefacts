@@ -537,6 +537,63 @@ fn npm(values: &Values, out: &mut Refs<'_>) {
             None,
         );
     }
+    npm_manifest_deps(out);
+}
+
+/// Declared runtime dependencies of a `package.json`, read from the manifest
+/// text — the dependency map is not mirrored into `values`. Each becomes a
+/// fetchable npm reference: an exact pin (`1.2.3`) resolves straight to its
+/// tarball like a lockfile entry, while a range, dist-tag, or wildcard is
+/// emitted versionless for the fetcher to resolve against the registry. Only
+/// `dependencies`/`optionalDependencies` are followed — `devDependencies` and
+/// `peerDependencies` are not installed for a consumed package, so they are not
+/// part of the delivered supply chain. A no-op for a binary `.tgz` (no text).
+fn npm_manifest_deps(out: &mut Refs<'_>) {
+    let Some(text) = out.text else { return };
+    let Ok(manifest) = serde_json::from_str::<JsonValue>(text) else {
+        return;
+    };
+    for field in ["dependencies", "optionalDependencies"] {
+        let Some(deps) = manifest.get(field).and_then(JsonValue::as_object) else {
+            continue;
+        };
+        for (name, spec) in deps {
+            let Some(spec) = spec.as_str() else { continue };
+            let locator = if is_exact_npm_version(spec) {
+                npm_purl(name, spec)
+            } else {
+                npm_purl_unversioned(name)
+            };
+            out.push(
+                RefLocator::Purl(locator),
+                RefKind::Dependency,
+                "package.json",
+                format!("{name}@{spec}"),
+                None,
+            );
+        }
+    }
+}
+
+/// An npm PURL with no version — a manifest dependency whose declared spec is a
+/// range/tag/wildcard rather than a single version. The fetcher resolves it to
+/// the registry's current release.
+fn npm_purl_unversioned(name: &str) -> String {
+    match name.strip_prefix('@').and_then(|s| s.split_once('/')) {
+        Some((scope, pkg)) => format!("pkg:npm/%40{scope}/{pkg}"),
+        None => format!("pkg:npm/{name}"),
+    }
+}
+
+/// Whether an npm dependency spec is a single concrete version
+/// (`MAJOR.MINOR.PATCH[-prerelease]`) rather than a range, comparator, union,
+/// dist-tag, or partial/wildcard. Errs toward "not exact": a misjudged exact
+/// would build a bogus tarball URL, whereas a non-exact simply resolves to the
+/// registry's current version.
+fn is_exact_npm_version(spec: &str) -> bool {
+    spec.starts_with(|c: char| c.is_ascii_digit())
+        && spec.split('.').count() >= 3
+        && !spec.contains(['^', '~', '>', '<', '=', '|', '*', 'x', 'X', ' '])
 }
 
 /// npm `package-lock.json`: every locked dependency, with the `integrity`
@@ -809,6 +866,60 @@ mod tests {
             refs[0].locator,
             RefLocator::Url("https://example.com/x/y.git".into())
         );
+    }
+
+    #[test]
+    fn package_json_deps_pin_exact_and_unversion_ranges() {
+        // A manifest declares an exact pin, a caret range, a scoped range, and
+        // an optional dep; dev deps are ignored. Exact → versioned PURL;
+        // anything else → versionless PURL for the fetcher to resolve.
+        let manifest = br#"{
+            "name": "app",
+            "dependencies": {
+                "left-pad": "1.3.0",
+                "easy-day-js": "^1.11.21",
+                "@scope/util": "~2.0.0"
+            },
+            "optionalDependencies": { "fsevents": "*" },
+            "devDependencies": { "typescript": "^6.0.3" }
+        }"#;
+        let refs = derive(FileType::PackageJson, manifest, &Values::new());
+        let purls: Vec<&str> = refs
+            .iter()
+            .filter_map(|r| match &r.locator {
+                RefLocator::Purl(p) => Some(p.as_str()),
+                RefLocator::Url(_) => None,
+            })
+            .collect();
+        assert!(purls.contains(&"pkg:npm/left-pad@1.3.0"), "{purls:?}");
+        assert!(purls.contains(&"pkg:npm/easy-day-js"), "{purls:?}");
+        assert!(purls.contains(&"pkg:npm/%40scope/util"), "{purls:?}");
+        assert!(purls.contains(&"pkg:npm/fsevents"), "{purls:?}");
+        assert!(
+            !purls.iter().any(|p| p.contains("typescript")),
+            "devDependencies must not be fetched: {purls:?}"
+        );
+        // The declared range is preserved as evidence for the report.
+        let easy = refs
+            .iter()
+            .find(|r| matches!(&r.locator, RefLocator::Purl(p) if p == "pkg:npm/easy-day-js"))
+            .expect("easy-day-js ref");
+        assert_eq!(easy.evidence, "easy-day-js@^1.11.21");
+        assert_eq!(easy.kind, RefKind::Dependency);
+    }
+
+    #[test]
+    fn is_exact_npm_version_classifies_specs() {
+        assert!(is_exact_npm_version("1.3.0"));
+        assert!(is_exact_npm_version("2.0.0-beta.1"));
+        assert!(!is_exact_npm_version("^1.11.21"));
+        assert!(!is_exact_npm_version("~2.0.0"));
+        assert!(!is_exact_npm_version(">=1.0.0"));
+        assert!(!is_exact_npm_version("1.x"));
+        assert!(!is_exact_npm_version("*"));
+        assert!(!is_exact_npm_version("latest"));
+        assert!(!is_exact_npm_version("1.2")); // partial → resolve to current
+        assert!(!is_exact_npm_version("1.0.0 || 2.0.0"));
     }
 
     #[test]
