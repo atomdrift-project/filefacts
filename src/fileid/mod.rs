@@ -218,6 +218,7 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::Deb
         | FileType::Rpm
         | FileType::PkgMacos
+        | FileType::Dmg
         | FileType::Cab
         | FileType::Chm
         | FileType::Crx
@@ -404,6 +405,8 @@ pub enum FileType {
     /// `Pkg`) because the `.pkg` extension is ambiguous: FreeBSD and Arch also
     /// use it for compressed-tar packages, disambiguated by container magic.
     PkgMacos,
+    /// Apple Disk Image (.dmg, UDIF container).
+    Dmg,
     /// Cabinet archive (.cab)
     Cab,
     /// Compiled HTML Help (.chm) — Microsoft ITSF/ITOL container with
@@ -536,6 +539,7 @@ impl FileType {
                 | Self::Deb
                 | Self::Rpm
                 | Self::PkgMacos
+                | Self::Dmg
                 | Self::Cab
                 | Self::Chm
                 | Self::Crx
@@ -1545,6 +1549,18 @@ mod tests {
     }
 
     #[test]
+    fn dmg_udif_archive() {
+        let mut data = vec![0u8; 2048];
+        data[63..66].copy_from_slice(b"BZh");
+        let trailer = data.len() - 512;
+        data[trailer..trailer + 4].copy_from_slice(b"koly");
+        data[trailer + 4..trailer + 8].copy_from_slice(&4u32.to_be_bytes());
+        data[trailer + 8..trailer + 12].copy_from_slice(&512u32.to_be_bytes());
+
+        assert_detect("data.dmg", &data, FileType::Dmg);
+    }
+
+    #[test]
     fn sevenz_archive() {
         assert_detect("data.7z", b"7z\xBC\xAF\x27\x1C\x00", FileType::SevenZ);
     }
@@ -1612,6 +1628,7 @@ mod tests {
             FileType::Ipa,
             FileType::Vsix,
             FileType::PkgMacos,
+            FileType::Dmg,
             FileType::PkgFreebsd,
             FileType::PkgArch,
         ] {

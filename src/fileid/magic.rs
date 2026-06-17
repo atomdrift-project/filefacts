@@ -19,6 +19,10 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         return None;
     }
 
+    if looks_like_udif_dmg(data) {
+        return Some((FileType::Dmg, DetectionSource::Magic));
+    }
+
     // ── First-byte jump table ────────────────────────────────────────
     // Dispatch on data[0] to avoid evaluating 30+ conditions sequentially.
     // Each arm only checks formats that start with that byte.
@@ -424,6 +428,20 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
     }
 
     None
+}
+
+fn looks_like_udif_dmg(data: &[u8]) -> bool {
+    if data.len() < 512 {
+        return false;
+    }
+    let trailer = &data[data.len() - 512..];
+    if !trailer.starts_with(b"koly") {
+        return false;
+    }
+
+    let version = u32::from_be_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]);
+    let header_size = u32::from_be_bytes([trailer[8], trailer[9], trailer[10], trailer[11]]);
+    version >= 4 && header_size == 512
 }
 
 /// Case-insensitive suffix match on path bytes (no allocation).
