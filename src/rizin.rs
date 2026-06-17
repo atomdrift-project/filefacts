@@ -65,6 +65,52 @@ static RIZIN_PGIDS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 /// without clobbering an outer `disable()` call.
 static RIZIN_DISABLED: AtomicUsize = AtomicUsize::new(0);
 
+/// Per-run rizin wall-clock budget, in seconds. `0` selects the [`RIZIN_TIMEOUT`]
+/// default. Lowered by latency-sensitive callers (e.g. `ascan ps`, which scans
+/// live process binaries where a multi-minute disassembly is never worth it).
+static RIZIN_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(0);
+
+/// Skip rizin entirely for inputs larger than this many bytes. `0` disables the
+/// gate. Full `aaa` on a 100 MB+ stripped binary costs minutes; a size cap keeps
+/// a directory of giant signed apps from dominating a scan.
+static RIZIN_MAX_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// When set, fat Mach-O inputs are sliced to the host-native architecture before
+/// rizin runs, instead of handing rizin the whole universal binary. Cuts the
+/// work on multi-arch binaries roughly in half and avoids analysing a slice that
+/// will never execute on this host. Off by default (full-fidelity filesystem
+/// scans still cover every slice).
+static RIZIN_NATIVE_ARCH_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Set the per-run rizin timeout (seconds). `0` restores the default.
+pub fn set_timeout_secs(secs: u64) {
+    RIZIN_TIMEOUT_SECS.store(secs, Ordering::Relaxed);
+}
+
+/// Resolved rizin timeout: the override when set, else [`RIZIN_TIMEOUT`].
+fn rizin_timeout() -> Duration {
+    match RIZIN_TIMEOUT_SECS.load(Ordering::Relaxed) {
+        0 => RIZIN_TIMEOUT,
+        secs => Duration::from_secs(secs),
+    }
+}
+
+/// Skip rizin for inputs larger than `max_bytes`. `0` disables the gate.
+pub fn set_max_bytes(max_bytes: usize) {
+    RIZIN_MAX_BYTES.store(max_bytes, Ordering::Relaxed);
+}
+
+/// Slice fat Mach-O inputs to the host-native arch before running rizin.
+pub fn set_native_arch_only(enabled: bool) {
+    RIZIN_NATIVE_ARCH_ONLY.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether fat Mach-O inputs should be sliced to the native arch before rizin.
+#[must_use]
+pub fn native_arch_only() -> bool {
+    RIZIN_NATIVE_ARCH_ONLY.load(Ordering::Relaxed)
+}
+
 /// Statistics (total, successes, timeouts, failures, memory_exceeded).
 static RIZIN_TOTAL: AtomicU64 = AtomicU64::new(0);
 static RIZIN_SUCCESSES: AtomicU64 = AtomicU64::new(0);
@@ -233,6 +279,19 @@ pub(crate) fn recover(bytes: &[u8]) -> Option<RizinRecovery> {
     if is_disabled() {
         return None;
     }
+    // Size gate: skip rizin for inputs above the configured cap. A 100 MB+
+    // stripped binary costs minutes of `aaa`; latency-sensitive callers set a
+    // cap so one giant doesn't dominate the scan. Counts as a skip, not a
+    // failure — goblin's typed views still stand in.
+    let max = RIZIN_MAX_BYTES.load(Ordering::Relaxed);
+    if max > 0 && bytes.len() > max {
+        tracing::debug!(
+            bytes = bytes.len(),
+            max,
+            "rizin recover: skipped (over size cap)"
+        );
+        return None;
+    }
     let bin = rizin_binary()?;
     recover_with_bin(bin, bytes)
 }
@@ -362,7 +421,7 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
 
     // Poll for child exit with the timeout deadline. Once the child
     // exits, the reader thread's `read_to_end` returns naturally.
-    let deadline = std::time::Instant::now() + RIZIN_TIMEOUT;
+    let deadline = std::time::Instant::now() + rizin_timeout();
     let mut exit_status = None;
     while std::time::Instant::now() < deadline {
         match child.try_wait() {

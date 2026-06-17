@@ -62,6 +62,12 @@ pub(super) fn extract(
     // the thin-binary case while the parsed Mach-O is in scope; the bytes
     // they reference outlive it. Fat binaries skip pclntab-based GoRoot
     // recovery (rare for Go) but still get build-id via the marker scan.
+    // When native-arch-only mode is on (e.g. `ascan ps`), hand rizin just the
+    // host-native slice of a fat binary instead of the whole universal file —
+    // the other slices will never run here and full `aaa` on each is the bulk
+    // of the per-binary cost. Falls back to the whole input for thin binaries
+    // or when no native slice is found.
+    let mut native_rizin_range: Option<(usize, usize)> = None;
     let (go_pclntab, go_rodata) = match parsed {
         Mach::Binary(macho) => {
             single_arch(&macho, bytes, values, metrics, sections_out, symbols_out);
@@ -69,10 +75,17 @@ pub(super) fn extract(
         }
         Mach::Fat(fat) => {
             fat_binary(bytes, &fat, values, metrics, sections_out, symbols_out);
+            if crate::rizin::native_arch_only() {
+                native_rizin_range = native_slice_range(bytes, &fat);
+            }
             (None, None)
         }
     };
-    rizin_fallback(bytes, symbols_out, metrics);
+    let rizin_bytes = match native_rizin_range {
+        Some((start, end)) => &bytes[start..end],
+        None => bytes,
+    };
+    rizin_fallback(rizin_bytes, symbols_out, metrics);
     super::upx::detect(bytes, values);
     let go_sections = super::go_buildinfo::GoSections {
         buildid_note: None,
