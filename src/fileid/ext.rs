@@ -286,6 +286,11 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         // TypeScript compiler test baselines (annotated code fixtures, not
         // executable JS): x.types / x.symbols / x.baseline.
         "types" | "symbols" | "baseline" => Some(FileType::Text),
+        // Protocol Buffer schemas. No dedicated analyzer; `.proto` syntax uses
+        // `package` declarations and service/message identifiers that otherwise
+        // content-score as Kotlin. Treat as text so C2/protocol traits can still
+        // match without source-language misclassification.
+        "proto" => Some(FileType::Text),
         "go" => Some(FileType::Go),
         "rs" => Some(FileType::Rust),
         "java" => Some(FileType::Java),
@@ -787,6 +792,15 @@ mod tests {
                 "{name} should be Text, not JavaScript or Kotlin"
             );
         }
+    }
+
+    #[test]
+    fn protobuf_schema_extension_is_text_not_kotlin() {
+        assert_eq!(
+            detect_from_path(Path::new("c2.proto")),
+            Some(FileType::Text),
+            "protobuf schemas use package/message syntax but are not Kotlin"
+        );
     }
 
     #[test]

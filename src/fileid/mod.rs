@@ -1251,6 +1251,28 @@ mod tests {
     }
 
     #[test]
+    fn protobuf_schema_extension_prevents_kotlin_heuristic() {
+        let data = br#"syntax = "proto3";
+
+package c2;
+
+service C2Service {
+  rpc BeaconStream(stream BeaconMessage) returns (stream CommandMessage);
+  rpc SendCommand(SendCommandRequest) returns (SendCommandResponse);
+}
+
+message CommandMessage {
+  string command_id = 1;
+  string command = 2;
+  repeated string args = 3;
+}
+"#;
+        let det = detect(Path::new("c2.proto"), data).unwrap();
+        assert_eq!(det.file_type, FileType::Text);
+        assert!(!det.extension_mismatch());
+    }
+
+    #[test]
     fn shell_extension_with_shell_shebang_no_juke() {
         // .sh with bash shebang: not a juke, no override.
         let det = detect(Path::new("script.sh"), b"#!/bin/bash\necho hello\n").unwrap();
