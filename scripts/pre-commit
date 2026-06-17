@@ -1,0 +1,36 @@
+#!/bin/sh
+# filefacts pre-commit hook.
+#
+# Blocks the commit unless:
+#   1. Cargo.toml has no local-only overrides ([patch]/[replace] sections or
+#      path dependencies that escape the repo, e.g. ../sibling). The vendored
+#      `path = "vendor/..."` dep is in-tree and allowed.
+#   2. `make lint` passes (rustfmt --check + clippy -D warnings).
+#   3. `make test` passes.
+#
+# Install with: make install-hooks
+
+set -e
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+echo "pre-commit: checking Cargo.toml for local overrides..."
+if grep -nE '^\s*\[patch|^\s*\[replace\]' Cargo.toml; then
+	echo "✗ Cargo.toml contains a [patch] or [replace] section. Remove it before committing." >&2
+	exit 1
+fi
+# Path dependencies are only allowed when they point inside the repo (vendor/).
+# Anything reaching out with ../ or an absolute path is a local-only override.
+if grep -nE 'path\s*=\s*"(\.\./|/)' Cargo.toml; then
+	echo "✗ Cargo.toml has a path dependency outside the repo. Remove it before committing." >&2
+	exit 1
+fi
+
+echo "pre-commit: running make lint..."
+make lint
+
+echo "pre-commit: running make test..."
+make test
+
+echo "✓ pre-commit checks passed."

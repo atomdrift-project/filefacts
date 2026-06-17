@@ -14,7 +14,7 @@ CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 # cache across worktrees). Falls back to the cargo default `target` otherwise.
 CARGO_TARGET ?= $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 
-.PHONY: all build release install test lint fmt clean help bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once
+.PHONY: all build release install install-hooks test lint fmt clean help bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once
 
 all: build
 
@@ -26,6 +26,7 @@ help: ## Show this help
 	@echo "  build              - Build in debug mode (default)"
 	@echo "  release            - Build in release mode"
 	@echo "  install            - Install release binary to first writeable PATH dir"
+	@echo "  install-hooks      - Install the git pre-commit hook (lint+test+Cargo.toml check)"
 	@echo "  test               - Run all tests"
 	@echo "  lint               - Run rustfmt + clippy"
 	@echo "  fmt                - Format code with rustfmt"
@@ -62,6 +63,13 @@ install: release ## Install binary to first writeable location
 	fi; \
 	install -m 755 $(OUT_DIR)/$(BINARY) "$$dest.new" && mv -f "$$dest.new" "$$dest"; \
 	echo "✓ Installed to $$dest"
+
+install-hooks: ## Install the git pre-commit hook
+	@hooks_dir="$$(git rev-parse --git-path hooks)"; \
+	mkdir -p "$$hooks_dir"; \
+	cp scripts/pre-commit "$$hooks_dir/pre-commit"; \
+	chmod +x "$$hooks_dir/pre-commit"; \
+	echo "✓ Pre-commit hook installed to $$hooks_dir/pre-commit"
 
 test:
 	$(CARGO) test
