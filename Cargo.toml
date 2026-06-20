@@ -173,7 +173,7 @@ libc = "0.2"
 # format is incompatible with tikv-jemalloc-sys's configure script. illumos
 # and Solaris ship libumem.
 [target.'cfg(all(unix, not(any(target_os = "freebsd", target_os = "dragonfly", target_os = "openbsd", target_os = "illumos", target_os = "solaris"))))'.dependencies]
-tikv-jemallocator = "0.6"
+tikv-jemallocator = "0.7"
 
 [dev-dependencies]
 # Snapshot-test framework used by per-format fixture tests.
