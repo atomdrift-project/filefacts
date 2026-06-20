@@ -4,7 +4,28 @@
 //! (`parse_count() == 1` after exercising all views) so the contract
 //! holds for downstream embedders.
 
-use filefacts::{FileType, Symbol, SymbolKind, open, open_with_path};
+use filefacts::{FileType, Symbol, SymbolKind};
+
+/// Hermetic `open`: these tests assert `parse_count() == 1`, which only
+/// holds when this process actually runs the extraction pipeline. The
+/// cross-process disk cache is on by default outside filefacts' own unit
+/// tests (`!cfg!(test)`), but that guard does not reach integration tests —
+/// here the crate is linked as an ordinary dependency, so the cache would
+/// serve a warm entry from a prior run and leave the count at 0. Routing
+/// every test through these wrappers forces the cache off process-wide.
+/// Idempotent and safe under parallel test execution.
+fn open(bytes: &[u8]) -> Result<filefacts::ParsedFile<'_>, filefacts::Error> {
+    filefacts::cache::set_caching_enabled(false);
+    filefacts::open(bytes)
+}
+
+fn open_with_path<'a>(
+    path: &std::path::Path,
+    bytes: &'a [u8],
+) -> Result<filefacts::ParsedFile<'a>, filefacts::Error> {
+    filefacts::cache::set_caching_enabled(false);
+    filefacts::open_with_path(path, bytes)
+}
 
 /// Convenience: collect every call target (`Symbol::Call.target`) from a
 /// parsed file, dropping dynamic-callee entries.
