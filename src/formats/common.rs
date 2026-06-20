@@ -2,7 +2,7 @@
 
 use serde_json::Value as JsonValue;
 
-use crate::output::{Strings, Values};
+use crate::output::{Strings, Text, Values};
 use crate::scan::ascii;
 
 /// stng extraction options. filefacts is the
@@ -19,23 +19,18 @@ fn string_opts() -> stng::ExtractOptions {
         .with_caller_provides_symbols(true)
 }
 
-/// Partition stng's extracted strings into the UTF-16 / ASCII buckets,
-/// retaining the raw typed `stng::ExtractedString` rows (the consumer reads
-/// stng's `StringKind`/`StringMethod` directly).
-fn push_stng_strings(extracted: Vec<stng::ExtractedString>, strings: &mut Strings) {
-    for s in extracted {
-        let is_utf16 = matches!(
-            s.method,
-            stng::StringMethod::WideString
-                | stng::StringMethod::Utf16LeDecode
-                | stng::StringMethod::Utf16BeDecode
-        );
-        if is_utf16 {
-            strings.text.utf16le.push(s);
-        } else {
-            strings.text.ascii.push(s);
-        }
-    }
+/// Adopt stng's shared string rows as the `text` tier. stng owns the
+/// allocation (via its string cache); filefacts holds the `Arc` so the rows are
+/// never copied here, and downstream consumers borrow the same allocation. The
+/// ASCII / UTF-16 split is a view over these rows, derived from each row's
+/// `StringMethod`, rather than two separate buffers.
+fn push_stng_strings(
+    extracted: std::sync::Arc<[stng::ExtractedString]>,
+    text_key: Option<String>,
+    strings: &mut Strings,
+) {
+    strings.text = Text::from_rows(extracted);
+    strings.text_key = text_key;
 }
 
 /// Extract strings from a binary stng parses itself. Used as the fallback when
@@ -43,8 +38,10 @@ fn push_stng_strings(extracted: Vec<stng::ExtractedString>, strings: &mut String
 /// [`extract_binary_strings_from_object`] for the fast path that reuses an
 /// already-parsed object.
 pub(super) fn extract_binary_strings(bytes: &[u8], strings: &mut Strings) {
+    let opts = string_opts();
     push_stng_strings(
-        stng::extract_strings_with_options(bytes, &string_opts()),
+        stng::cached_strings_with_options(bytes, &opts),
+        stng::cache_key_for(bytes, &opts),
         strings,
     );
 }
@@ -58,8 +55,10 @@ pub(super) fn extract_binary_strings_from_object(
     bytes: &[u8],
     strings: &mut Strings,
 ) {
+    let opts = string_opts();
     push_stng_strings(
-        stng::extract_strings_from_object(object, bytes, &string_opts()),
+        stng::cached_strings_from_object(object, bytes, &opts),
+        stng::cache_key_for(bytes, &opts),
         strings,
     );
 }
@@ -111,7 +110,11 @@ pub(super) fn extract_text_strings(bytes: &[u8], strings: &mut Strings, run_xor:
     } else {
         string_opts_no_xor()
     };
-    push_stng_strings(stng::extract_strings_with_options(bytes, &opts), strings);
+    push_stng_strings(
+        stng::cached_strings_with_options(bytes, &opts),
+        stng::cache_key_for(bytes, &opts),
+        strings,
+    );
 }
 
 /// Convenience wrapper for emitting a string-typed value into `values`.

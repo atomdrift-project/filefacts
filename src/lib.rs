@@ -33,7 +33,7 @@
 //! for (key, value) in parsed.values().iter() {
 //!     println!("{}: {}", key, value);
 //! }
-//! for s in &parsed.text().ascii {
+//! for s in parsed.text().ascii() {
 //!     println!("@{}: {}", s.data_offset, s.value);
 //! }
 //! for (key, value) in parsed.metrics().iter() {
@@ -202,6 +202,76 @@ struct Extracted {
     identity: Identity,
     references: Vec<ExternalRef>,
     errors: Errors,
+}
+
+/// On-disk cache form of [`Extracted`]: identical except the byte-scan `text`
+/// rows are dropped and replaced by stng's cache key. stng owns those rows in
+/// its own cache, so persisting them again here would store a second copy;
+/// instead [`ExtractedSnapshot::into_extracted`] rehydrates them from stng.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ExtractedSnapshot {
+    values: Values,
+    /// stng cache key for the dropped `text` rows (`None` when no text tier ran).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text_key: Option<String>,
+    literals: output::Literals,
+    comments: output::Comments,
+    metrics: Metrics,
+    archive_members: Vec<ArchiveMember>,
+    sections: Sections,
+    symbols: Symbols,
+    identity: Identity,
+    references: Vec<ExternalRef>,
+    errors: Errors,
+}
+
+impl From<Extracted> for ExtractedSnapshot {
+    fn from(e: Extracted) -> Self {
+        // The `text` rows are intentionally dropped here — stng's cache holds
+        // them, keyed by `text_key`.
+        Self {
+            values: e.values,
+            text_key: e.strings.text_key,
+            literals: e.strings.literals,
+            comments: e.strings.comments,
+            metrics: e.metrics,
+            archive_members: e.archive_members,
+            sections: e.sections,
+            symbols: e.symbols,
+            identity: e.identity,
+            references: e.references,
+            errors: e.errors,
+        }
+    }
+}
+
+impl ExtractedSnapshot {
+    /// Rebuild a full [`Extracted`], rehydrating the `text` rows from stng's
+    /// cache. Returns `None` when a key was recorded but stng no longer has the
+    /// entry (evicted) — the caller then recomputes the pipeline so the strings
+    /// are never silently lost.
+    fn into_extracted(self) -> Option<Extracted> {
+        let text = match &self.text_key {
+            Some(key) => output::Text::from_rows(stng::cached_strings_by_key(key)?),
+            None => output::Text::new(),
+        };
+        Some(Extracted {
+            values: self.values,
+            strings: output::Strings {
+                text,
+                literals: self.literals,
+                comments: self.comments,
+                text_key: self.text_key,
+            },
+            metrics: self.metrics,
+            archive_members: self.archive_members,
+            sections: self.sections,
+            symbols: self.symbols,
+            identity: self.identity,
+            references: self.references,
+            errors: self.errors,
+        })
+    }
 }
 
 impl<'a> ParsedFile<'a> {
@@ -399,18 +469,27 @@ impl<'a> ParsedFile<'a> {
             // degraded rizin run is returned but not persisted, so a later
             // healthy run still gets to fill the entry.
             let variant = crate::rizin::cache_fingerprint();
-            cache::open_with_cache(self.bytes, &variant, |_| {
-                let extracted = self.run_pipeline();
-                if extracted.metrics.get("binary.rizin_incomplete").is_some() {
-                    Some(cache::Computed::Transient(extracted))
-                } else {
-                    Some(cache::Computed::Cacheable(extracted))
-                }
-            })
-            // `open_with_cache` only returns `None` when the closure does,
-            // and ours never does; recompute defensively rather than panic
-            // if that contract ever changes.
-            .unwrap_or_else(|| self.run_pipeline())
+            // The cached form drops the byte-scan `text` rows (stng owns them);
+            // they are rehydrated below. `open_with_cache` stores/loads the
+            // lean snapshot, not the full `Extracted`.
+            let snapshot: Option<ExtractedSnapshot> =
+                cache::open_with_cache(self.bytes, &variant, |_| {
+                    let extracted = self.run_pipeline();
+                    let transient = extracted.metrics.get("binary.rizin_incomplete").is_some();
+                    let snapshot = ExtractedSnapshot::from(extracted);
+                    if transient {
+                        Some(cache::Computed::Transient(snapshot))
+                    } else {
+                        Some(cache::Computed::Cacheable(snapshot))
+                    }
+                });
+            // Rehydrate `text` from stng. A `None` here means either the
+            // closure declined (it never does) or stng evicted the entry the
+            // snapshot referenced; recompute the pipeline so strings are never
+            // silently dropped.
+            snapshot
+                .and_then(ExtractedSnapshot::into_extracted)
+                .unwrap_or_else(|| self.run_pipeline())
         })
     }
 
@@ -1158,6 +1237,57 @@ mod tests {
         assert!(
             !original.strings.text.is_empty(),
             "fixture should yield byte-scan strings"
+        );
+    }
+
+    #[test]
+    fn snapshot_drops_text_rows_and_rehydrates_from_stng() {
+        // The disk cache stores an `ExtractedSnapshot`, which carries no
+        // byte-scan row data — only stng's cache key. Rehydration must
+        // reconstruct the exact `text` rows from stng's cache (the single
+        // owner), so strings are stored once across the layers.
+        let bytes = std::fs::read("../cleave/tests/fixtures/test.exe")
+            .expect("test.exe fixture should exist");
+        let parsed = open(&bytes).unwrap();
+        // Owned extraction; this also populates stng's in-process memo.
+        let extracted = parsed.run_pipeline();
+        let want: Vec<String> = extracted
+            .strings
+            .text
+            .iter()
+            .map(|s| s.value.clone())
+            .collect();
+        assert!(!want.is_empty(), "fixture should yield byte-scan strings");
+        assert!(
+            extracted.strings.text_key.is_some(),
+            "cacheable opts must record a rehydration key"
+        );
+
+        let snapshot = ExtractedSnapshot::from(extracted);
+        let json = serde_json::to_vec(&snapshot).expect("serialize snapshot");
+        let as_value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert!(
+            as_value.get("text_key").is_some(),
+            "snapshot must carry the rehydration key"
+        );
+        assert!(
+            as_value.get("text").is_none() && as_value.get("ascii").is_none(),
+            "snapshot must not carry the byte-scan row data"
+        );
+
+        let restored: ExtractedSnapshot = serde_json::from_slice(&json).expect("deserialize");
+        let rehydrated = restored
+            .into_extracted()
+            .expect("stng cache still holds the rows from the extraction above");
+        let got: Vec<String> = rehydrated
+            .strings
+            .text
+            .iter()
+            .map(|s| s.value.clone())
+            .collect();
+        assert_eq!(
+            want, got,
+            "text rehydrated from stng must match the original rows exactly"
         );
     }
 

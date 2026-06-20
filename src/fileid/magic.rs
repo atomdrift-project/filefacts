@@ -703,6 +703,13 @@ fn lowercase_ext(path: &Path) -> Option<String> {
 /// Plist is checked first (separate function), and HTML is distinguished from
 /// generic XML by the `looks_like_html` content heuristic that runs later.
 fn detect_xml(data: &[u8]) -> Option<(FileType, DetectionSource)> {
+    // SVG root, with or without an `<?xml` prolog / DOCTYPE preamble. SVG is
+    // XML but gets its own type: it is a media format that can embed scripts,
+    // so it warrants distinct reporting and masquerade grouping.
+    if has_svg_root(data) {
+        return Some((FileType::Svg, DetectionSource::Magic));
+    }
+
     // Standard XML prolog
     if data.starts_with(b"<?xml") {
         return Some((FileType::Xml, DetectionSource::Magic));
@@ -721,8 +728,6 @@ fn detect_xml(data: &[u8]) -> Option<(FileType, DetectionSource)> {
     // colliding with HTML — HTML would match `looks_like_html` heuristic after
     // this returns None.
     for prefix in [
-        &b"<svg "[..],
-        &b"<svg>"[..],
         &b"<rss "[..],
         &b"<feed "[..],
         &b"<RDF "[..],
@@ -737,6 +742,21 @@ fn detect_xml(data: &[u8]) -> Option<(FileType, DetectionSource)> {
     }
 
     None
+}
+
+/// True if `data` has an `<svg>` root element, allowing a leading `<?xml`
+/// prolog, `<!DOCTYPE …>`, and comments/whitespace before it. Bounded to the
+/// document head so a stray `<svg` deep inside an unrelated XML body does not
+/// reclassify the whole file.
+fn has_svg_root(data: &[u8]) -> bool {
+    if data.starts_with(b"<svg ") || data.starts_with(b"<svg>") {
+        return true;
+    }
+    if !data.starts_with(b"<?xml") && !data.starts_with(b"<!DOCTYPE") {
+        return false;
+    }
+    let head = &data[..data.len().min(1024)];
+    memchr::memmem::find(head, b"<svg ").is_some() || memchr::memmem::find(head, b"<svg>").is_some()
 }
 
 /// Detect XML Plist markers in the first 256 bytes.

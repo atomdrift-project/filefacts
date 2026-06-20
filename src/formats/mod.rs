@@ -330,10 +330,7 @@ pub(crate) fn extract(
     // `values` tree, so byte-scanning the same bytes would only duplicate it as
     // noise. (Generic `Json`/`Gyp` are *not* structured-data here — when their
     // size-limited parse is skipped they legitimately fall through to a scan.)
-    if !file_type.is_structured_data()
-        && strings.text.ascii.is_empty()
-        && strings.text.utf16le.is_empty()
-    {
+    if !file_type.is_structured_data() && strings.text.is_empty() {
         // Decide whether to run stng's (expensive, FP-prone) XOR auto-detect
         // scan alongside the always-on printable-run extraction:
         //   * Archive containers — never. Their bytes are compressed/high-entropy;

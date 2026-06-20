@@ -319,8 +319,9 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "scpt" | "applescript" => Some(FileType::AppleScript),
         "service" => Some(FileType::SystemdService),
         "desktop" => Some(FileType::DesktopEntry),
+        "svg" => Some(FileType::Svg),
         "xml" | "csproj" | "vbproj" | "fsproj" | "proj" | "props" | "targets" | "vcxproj"
-        | "xaml" | "config" | "settings" | "svg" | "nuspec" | "wsdl" | "xsd" | "xsl" | "xslt" => {
+        | "xaml" | "config" | "settings" | "nuspec" | "wsdl" | "xsd" | "xsl" | "xslt" => {
             Some(FileType::Xml)
         }
         "json" => Some(FileType::Json),

@@ -75,12 +75,14 @@ pub struct ExtractedString {
 /// `StringKind`/`StringMethod` enums directly rather than re-parsing labels.
 /// Round-trips through the disk cache, so `stng::ExtractedString` carries
 /// `Deserialize` alongside `Serialize`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct Text {
-    /// Printable ASCII runs.
-    pub ascii: Vec<stng::ExtractedString>,
-    /// Printable UTF-16LE runs.
-    pub utf16le: Vec<stng::ExtractedString>,
+    /// All byte-scan rows, held as the shared `Arc` stng handed back so
+    /// downstream consumers (cleave) borrow this allocation instead of
+    /// cloning. ASCII and UTF-16LE are not separate buffers — the encoding
+    /// split is a view ([`Text::ascii`] / [`Text::utf16le`]) over `rows`,
+    /// which preserves the serialized `{ascii, utf16le}` shape.
+    rows: std::sync::Arc<[stng::ExtractedString]>,
 }
 
 impl Text {
@@ -88,18 +90,78 @@ impl Text {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Wrap the shared rows stng produced (no copy).
+    pub(crate) fn from_rows(rows: std::sync::Arc<[stng::ExtractedString]>) -> Self {
+        Self { rows }
+    }
+    /// The shared row slice — lets consumers hold an `Arc` clone (a refcount
+    /// bump) rather than cloning the string data.
+    pub fn rows(&self) -> &std::sync::Arc<[stng::ExtractedString]> {
+        &self.rows
+    }
     /// Total run count across both encodings.
     pub fn len(&self) -> usize {
-        self.ascii.len() + self.utf16le.len()
+        self.rows.len()
     }
     /// True when no runs were extracted.
     pub fn is_empty(&self) -> bool {
-        self.ascii.is_empty() && self.utf16le.is_empty()
+        self.rows.is_empty()
     }
-    /// Iterate every run regardless of encoding, in (ascii, utf16le)
-    /// order. Within each encoding, order is by source byte offset.
+    /// Iterate every run in (ascii, utf16le) order. Derived from the encoding
+    /// views rather than the raw `rows` so the order is identical whether the
+    /// rows came fresh from stng (offset-sorted, interleaved) or from the disk
+    /// cache (deserialized ascii-then-utf16) — i.e. the cache stays transparent.
     pub fn iter(&self) -> impl Iterator<Item = &stng::ExtractedString> {
-        self.ascii.iter().chain(self.utf16le.iter())
+        self.ascii().chain(self.utf16le())
+    }
+    /// True for the UTF-16 extraction methods.
+    fn is_utf16(method: stng::StringMethod) -> bool {
+        matches!(
+            method,
+            stng::StringMethod::WideString
+                | stng::StringMethod::Utf16LeDecode
+                | stng::StringMethod::Utf16BeDecode
+        )
+    }
+    /// Printable ASCII runs (view over `rows`).
+    pub fn ascii(&self) -> impl Iterator<Item = &stng::ExtractedString> {
+        self.rows.iter().filter(|s| !Self::is_utf16(s.method))
+    }
+    /// Printable UTF-16LE runs (view over `rows`).
+    pub fn utf16le(&self) -> impl Iterator<Item = &stng::ExtractedString> {
+        self.rows.iter().filter(|s| Self::is_utf16(s.method))
+    }
+}
+
+// Serialize keeping the historical `{ascii, utf16le}` schema (a view over the
+// shared rows); deserialize concatenates the two arrays back into one `Arc`,
+// ascii first, matching `from_rows` order.
+impl Serialize for Text {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let ascii: Vec<&stng::ExtractedString> = self.ascii().collect();
+        let utf16le: Vec<&stng::ExtractedString> = self.utf16le().collect();
+        let mut st = serializer.serialize_struct("Text", 2)?;
+        st.serialize_field("ascii", &ascii)?;
+        st.serialize_field("utf16le", &utf16le)?;
+        st.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Text {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            ascii: Vec<stng::ExtractedString>,
+            #[serde(default)]
+            utf16le: Vec<stng::ExtractedString>,
+        }
+        let mut raw = Raw::deserialize(deserializer)?;
+        raw.ascii.extend(raw.utf16le);
+        Ok(Self {
+            rows: raw.ascii.into(),
+        })
     }
 }
 
@@ -210,6 +272,11 @@ pub(crate) struct Strings {
     pub(crate) text: Text,
     pub(crate) literals: Literals,
     pub(crate) comments: Comments,
+    /// stng's cache key for the `text` rows, recorded so the disk cache can drop
+    /// the row bytes and rehydrate them from stng's cache (the single owner)
+    /// instead of persisting a second copy. `None` when no text tier ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) text_key: Option<String>,
 }
 
 impl Strings {
@@ -237,20 +304,27 @@ mod tests {
 
     #[test]
     fn text_iter_walks_both_encodings() {
-        let mut t = Text::new();
-        t.ascii.push(stng::ExtractedString {
-            value: "Mozilla/5.0".into(),
-            data_offset: 100,
-            ..Default::default()
-        });
-        t.utf16le.push(stng::ExtractedString {
-            value: "RegOpenKeyExW".into(),
-            data_offset: 200,
-            ..Default::default()
-        });
+        let rows: std::sync::Arc<[stng::ExtractedString]> = vec![
+            stng::ExtractedString {
+                value: "Mozilla/5.0".into(),
+                data_offset: 100,
+                method: stng::StringMethod::RawScan,
+                ..Default::default()
+            },
+            stng::ExtractedString {
+                value: "RegOpenKeyExW".into(),
+                data_offset: 200,
+                method: stng::StringMethod::WideString,
+                ..Default::default()
+            },
+        ]
+        .into();
+        let t = Text::from_rows(rows);
         let texts: Vec<&str> = t.iter().map(|s| s.value.as_str()).collect();
         assert_eq!(texts, vec!["Mozilla/5.0", "RegOpenKeyExW"]);
         assert_eq!(t.len(), 2);
+        assert_eq!(t.ascii().count(), 1);
+        assert_eq!(t.utf16le().count(), 1);
     }
 
     #[test]

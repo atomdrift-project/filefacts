@@ -262,7 +262,7 @@ fn file_group(ft: FileType) -> &'static str {
         FileType::Rtf | FileType::OleDoc | FileType::Ooxml | FileType::Pdf | FileType::Odf => {
             "document"
         }
-        FileType::Jpeg | FileType::Png => "image",
+        FileType::Jpeg | FileType::Png | FileType::Svg => "image",
         FileType::Html | FileType::Markdown | FileType::Text => "text",
         FileType::Pickle | FileType::Data | FileType::Unknown => "data",
     }
@@ -506,6 +506,10 @@ pub enum FileType {
     Jpeg,
     /// PNG image
     Png,
+    /// SVG image (.svg) — XML-based vector graphic. Unlike raster images it
+    /// is text and can embed `<script>` / event handlers, making it a common
+    /// phishing/HTML-smuggling carrier; classified as media but scanned as XML.
+    Svg,
     /// Python pickle serialized data (.pkl, .pickle, .joblib)
     Pickle,
     /// PDF document
@@ -1834,6 +1838,45 @@ message CommandMessage {
     #[test]
     fn png_by_ext() {
         assert_ext("image.png", FileType::Png);
+    }
+
+    #[test]
+    fn svg_magic_bare_root() {
+        assert_detect(
+            "noext",
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\">",
+            FileType::Svg,
+        );
+        assert_detect("noext", b"<svg>", FileType::Svg);
+    }
+
+    #[test]
+    fn svg_magic_with_xml_prolog() {
+        // Real-world SVGs frequently lead with an XML prolog (and sometimes a
+        // DOCTYPE) before the <svg> root; these must still resolve to Svg, not
+        // generic Xml.
+        assert_detect(
+            "noext",
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<svg xmlns=\"x\"></svg>",
+            FileType::Svg,
+        );
+    }
+
+    #[test]
+    fn svg_by_ext() {
+        assert_ext("logo.svg", FileType::Svg);
+    }
+
+    #[test]
+    fn svg_is_image_group() {
+        // SVG belongs to the media (image) group so a binary renamed .svg is a
+        // binary→image masquerade, even though its content is scanned as XML.
+        assert_eq!(file_group(FileType::Svg), "image");
+    }
+
+    #[test]
+    fn xml_prolog_without_svg_stays_xml() {
+        assert_detect("noext", b"<?xml version=\"1.0\"?>\n<root/>", FileType::Xml);
     }
 
     // ── Other formats ────────────────────────────────────────────────
