@@ -1,6 +1,6 @@
 [package]
 name = "filefacts"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["The Atomdrift Project"]
@@ -22,7 +22,10 @@ path = "src/bin/filefacts.rs"
 [dependencies]
 # Serialization — required for output schema.
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip` makes the JSON parser bit-exact for f64, so a metric
+# loaded from the disk cache equals the freshly computed value rather than
+# drifting by a ULP. Required for the cache snapshot to be truly transparent.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 # Error reporting — single source of truth for the public error type.
 thiserror = "2"
@@ -135,9 +138,10 @@ md-5 = "0.10"
 # Structured logging — used by rizin subprocess statistics emission.
 tracing = "0.1"
 
-# Disk cache — zstd-compressed bincode blobs keyed by sha256.
+# Disk cache — zstd-compressed JSON blobs keyed by sha256. JSON (not a
+# positional format) round-trips the `skip_serializing_if` fields the
+# cached payload carries; zstd keeps the on-disk size competitive.
 zstd = "0.13"
-bincode = { version = "2", features = ["serde"] }
 
 # OS cache directory lookup — `~/.cache/atomdrift/filefacts` (Linux) /
 # `Library/Caches/atomdrift/filefacts` (macOS) / `%LOCALAPPDATA%\atomdrift\filefacts`
@@ -282,3 +286,5 @@ codegen-units = 1
 inherits = "release"
 strip = "none"
 debug = 2
+
+

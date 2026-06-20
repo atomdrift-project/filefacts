@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Derived numeric features of a file.
 ///
@@ -19,7 +19,7 @@ use serde::Serialize;
 /// Numbers are stored as `f64` so a single representation handles
 /// integer counts, ratios in `[0.0, 1.0]`, and entropies in `[0.0, 8.0]`.
 /// Callers that need integer precision can round at the boundary.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Metrics(BTreeMap<String, f64>);
 

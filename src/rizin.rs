@@ -264,18 +264,103 @@ pub fn available() -> bool {
     rizin_binary().is_some()
 }
 
+/// rizin's self-reported version string, probed once and cached.
+///
+/// Used only to invalidate the disk cache across rizin upgrades, so the
+/// exact text is opaque — any change that alters analysis output also
+/// changes this line. `None` when rizin isn't on PATH or the probe
+/// fails. Spawns `rizin -v` a single time per process.
+fn rizin_version() -> Option<&'static str> {
+    static VERSION: OnceLock<Option<String>> = OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            let bin = rizin_binary()?;
+            let output = Command::new(bin)
+                .arg("-v")
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let text = String::from_utf8_lossy(&output.stdout);
+            let first = text.lines().next().unwrap_or("").trim();
+            (!first.is_empty()).then(|| first.to_string())
+        })
+        .as_deref()
+}
+
+/// Cache discriminator capturing the rizin configuration that changes
+/// the *correct* recovery for a given input and is stable across runs.
+///
+/// Folded into the disk-cache key by [`crate::cache::cache_key`] so a
+/// payload recovered under one rizin setup is never served to a run with
+/// a different one. It captures:
+///
+/// * whether rizin is on PATH and its version — an upgraded rizin that
+///   discovers more functions must not reuse an older run's recovery;
+/// * native-arch slicing — a fat Mach-O analysed as a single host slice
+///   yields different symbols than the whole universal binary, so the
+///   host arch is mixed in while that mode is active.
+///
+/// Transient conditions (disabled, timeout, output cap, size gate) are
+/// deliberately *excluded*: those make a run's payload
+/// [`crate::cache::Computed::Transient`] instead of minting a distinct,
+/// persisted key.
+#[must_use]
+pub fn cache_fingerprint() -> String {
+    if !available() {
+        return "rizin=none".to_string();
+    }
+    let version = rizin_version().unwrap_or("unknown");
+    if native_arch_only() {
+        format!("rizin={version}|native={}", std::env::consts::ARCH)
+    } else {
+        format!("rizin={version}")
+    }
+}
+
+/// Depth of rizin auto-analysis to request before listing functions.
+///
+/// The analysis pass is the dominant cost of a recovery (the cheap `iij`/
+/// `iEj`/`aflj`/`iSj` commands just read tables), so callers that can prove
+/// the binary already carries a complete function table pick `Basic` to halve
+/// the wall-clock — without losing any function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Analysis {
+    /// `aa` — functions reachable from symbols, entrypoints, and format
+    /// metadata (rizin parses Go's `.gopclntab` here). Sufficient, and ~2x
+    /// faster, when the binary carries its own complete function table.
+    Basic,
+    /// `aaa` — adds emulation, reference, and prelude passes that discover
+    /// functions absent from every symbol table. Required for stripped
+    /// binaries; the safe default.
+    Deep,
+}
+
+impl Analysis {
+    /// The rizin command that performs this analysis depth.
+    fn command(self) -> &'static str {
+        match self {
+            Analysis::Basic => "aa",
+            Analysis::Deep => "aaa",
+        }
+    }
+}
+
 /// Recover symbol tables + function discovery via rizin. Returns
 /// `None` when rizin isn't on PATH or invocation failed; callers
 /// fall back to whatever goblin already populated.
 ///
-/// The single rizin command runs `iij` (imports), `iEj` (exports),
-/// `aaa` (deep analysis to discover functions), and `aflj`
-/// (function list). Output blocks are separated by sentinel strings
-/// we can `split` on cheaply.
+/// The single rizin command runs `iij` (imports), `iEj` (exports), the
+/// requested `analysis` pass (`aa`/`aaa`) to discover functions, and `aflj`
+/// (function list). Output blocks are separated by sentinel strings we can
+/// `split` on cheaply.
 ///
 /// Writes `bytes` to a temp file (rizin reads files from disk, not
 /// stdin) and deletes it when done.
-pub(crate) fn recover(bytes: &[u8]) -> Option<RizinRecovery> {
+pub(crate) fn recover(bytes: &[u8], analysis: Analysis) -> Option<RizinRecovery> {
     if is_disabled() {
         return None;
     }
@@ -293,7 +378,7 @@ pub(crate) fn recover(bytes: &[u8]) -> Option<RizinRecovery> {
         return None;
     }
     let bin = rizin_binary()?;
-    recover_with_bin(bin, bytes)
+    recover_with_bin(bin, bytes, analysis)
 }
 
 /// `recover()` with the rizin binary path passed in. Production path
@@ -302,10 +387,10 @@ pub(crate) fn recover(bytes: &[u8]) -> Option<RizinRecovery> {
 /// deterministically without a real rizin install.
 #[cfg(test)]
 fn recover_with_bin_for_test(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
-    recover_with_bin(bin, bytes)
+    recover_with_bin(bin, bytes, Analysis::Deep)
 }
 
-fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
+fn recover_with_bin(bin: &Path, bytes: &[u8], analysis: Analysis) -> Option<RizinRecovery> {
     // The disable check intentionally lives only in the public
     // `recover()` entry, not here — tests inject a shim via
     // `recover_with_bin_for_test` and need a deterministic spawn
@@ -344,6 +429,13 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
     // surprises). `-q` quits after the `-c` script. `-e scr.color=0`
     // strips ANSI escapes from any stray log lines.
     let path_str = temp.to_string_lossy();
+    // The analysis pass (`aa`/`aaa`) is the one variable command; the
+    // surrounding `iij`/`iEj`/`aflj`/`iSj` are cheap table reads. The `===SEP===`
+    // sentinels must stay 1:1 with the parser's `split` below.
+    let script = format!(
+        "iij; echo ===SEP===; iEj; echo ===SEP===; {}; echo ===SEP===; aflj; echo ===SEP===; iSj",
+        analysis.command()
+    );
     let mut cmd = Command::new(bin);
     cmd.args([
         "-NN",
@@ -353,7 +445,7 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
         "-e",
         "log.level=0",
         "-c",
-        "iij; echo ===SEP===; iEj; echo ===SEP===; aaa; echo ===SEP===; aflj; echo ===SEP===; iSj",
+        script.as_str(),
         &path_str,
     ]);
     cmd.stdin(std::process::Stdio::null());
@@ -1205,6 +1297,24 @@ mod tests {
         assert_eq!(first, second, "PATH probe should be cached");
     }
 
+    #[test]
+    fn cache_fingerprint_is_stable_and_tracks_availability() {
+        // Host-independent contract: the fingerprint is deterministic
+        // within a process and reflects whether rizin is on PATH. When
+        // absent it is the sentinel `rizin=none`; when present it names a
+        // version (or `unknown`), so a no-rizin run and a rizin run never
+        // collide on a cache key.
+        let first = cache_fingerprint();
+        let second = cache_fingerprint();
+        assert_eq!(first, second, "fingerprint must be stable per process");
+        assert!(first.starts_with("rizin="), "fingerprint names the tool");
+        if available() {
+            assert_ne!(first, "rizin=none");
+        } else {
+            assert_eq!(first, "rizin=none");
+        }
+    }
+
     // ------------------------------------------------------------------
     // Hardening: disable switch, scoped_disable RAII, stats counters
     // ------------------------------------------------------------------
@@ -1235,6 +1345,15 @@ mod tests {
     }
 
     #[test]
+    fn analysis_depth_maps_to_rizin_command() {
+        // Guards the Go fast-path: `Basic` MUST stay `aa` (cheap) and `Deep`
+        // MUST stay `aaa` (full discovery). A revert of either string would
+        // silently re-slow Go binaries or weaken stripped-binary recovery.
+        assert_eq!(Analysis::Basic.command(), "aa");
+        assert_eq!(Analysis::Deep.command(), "aaa");
+    }
+
+    #[test]
     fn recover_short_circuits_when_disabled() {
         // With a guard active, the public `recover()` entry returns
         // None before touching PATH or spawning anything. We can't
@@ -1242,7 +1361,7 @@ mod tests {
         // only the observable contract: disabled → None.
         let _g = scoped_disable();
         assert!(is_disabled());
-        let r = recover(b"unused bytes for disabled probe");
+        let r = recover(b"unused bytes for disabled probe", Analysis::Deep);
         assert!(r.is_none(), "disabled rizin must return None");
     }
 

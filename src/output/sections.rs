@@ -21,7 +21,7 @@
 //! - `file_offset` / `file_size` for the on-disk extent,
 //! - `flags` as a free-form, format-conventional string array.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// One section / segment entry.
 ///
@@ -29,7 +29,7 @@ use serde::Serialize;
 /// byte-level features computed from the section's bytes (Shannon
 /// entropy). Optional fields are absent when the value is undefined
 /// for this format or when the section has no on-disk bytes.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Section {
     /// Section name as the format records it (`.text`, `__TEXT,__text`,
@@ -84,7 +84,7 @@ impl Section {
 ///
 /// Empty when the file has no section table filefacts can read
 /// (structured documents, source code, opaque blobs).
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Sections(Vec<Section>);
 

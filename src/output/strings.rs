@@ -73,9 +73,9 @@ pub struct ExtractedString {
 /// Rows are the raw `stng::ExtractedString` (the single string-extraction
 /// engine), retained typed so the sole consumer (cleave) reads stng's
 /// `StringKind`/`StringMethod` enums directly rather than re-parsing labels.
-/// `Deserialize` is intentionally absent — `stng::ExtractedString` is
-/// serialize-only, and this tier is produced, never loaded.
-#[derive(Debug, Clone, Default, Serialize)]
+/// Round-trips through the disk cache, so `stng::ExtractedString` carries
+/// `Deserialize` alongside `Serialize`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Text {
     /// Printable ASCII runs.
     pub ascii: Vec<stng::ExtractedString>,
@@ -205,7 +205,7 @@ impl<'a> IntoIterator for &'a Comments {
 /// [`ParsedFile::text`]: crate::ParsedFile::text
 /// [`ParsedFile::literals`]: crate::ParsedFile::literals
 /// [`ParsedFile::comments`]: crate::ParsedFile::comments
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Strings {
     pub(crate) text: Text,
     pub(crate) literals: Literals,

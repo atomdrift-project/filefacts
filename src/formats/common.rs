@@ -122,12 +122,33 @@ pub(super) fn rizin_fallback(
     bytes: &[u8],
     symbols: &mut crate::Symbols,
     metrics: &mut crate::output::Metrics,
+    analysis: crate::rizin::Analysis,
 ) {
     if !symbols.is_empty() {
         return;
     }
-    if let Some(recovery) = crate::rizin::recover(bytes) {
-        recovery.apply(symbols, metrics);
+    match crate::rizin::recover(bytes, analysis) {
+        Some(recovery) => {
+            recovery.apply(symbols, metrics);
+        }
+        None => note_incomplete_recovery(metrics),
+    }
+}
+
+/// Record that rizin *should* have recovered symbols here but its run
+/// didn't complete. Fires only when rizin is on PATH — i.e. the cache
+/// key (via [`crate::rizin::cache_fingerprint`]) claims rizin-grade
+/// recovery, yet this run produced nothing because rizin timed out, was
+/// killed on the output cap, was muted, or was skipped by the size gate.
+/// The empty table is an artefact of this run, not of the bytes, so the
+/// `binary.rizin_incomplete` marker lets a cache consumer treat the
+/// payload as [`crate::cache::Computed::Transient`] and refuse to persist
+/// a poisoned entry (see [`crate::ParsedFile::rizin_recovery_incomplete`]).
+/// When rizin is absent the no-rizin result is correct for the
+/// environment — and keyed as such — so nothing is recorded.
+fn note_incomplete_recovery(metrics: &mut crate::output::Metrics) {
+    if crate::rizin::available() {
+        metrics.insert("binary.rizin_incomplete", 1.0);
     }
 }
 
@@ -153,8 +174,14 @@ pub(super) fn rizin_fallback_with_sections(
     if !symbols.is_empty() || !sections.is_empty() {
         return;
     }
-    let Some(recovery) = crate::rizin::recover(bytes) else {
-        return;
+    // PE recovery has no cheap complete-function-table signal (no Go pclntab),
+    // so it always needs the deep discovery pass.
+    let recovery = match crate::rizin::recover(bytes, crate::rizin::Analysis::Deep) {
+        Some(recovery) => recovery,
+        None => {
+            note_incomplete_recovery(metrics);
+            return;
+        }
     };
     let counts = recovery.apply_with_sections(symbols, sections, metrics);
     if counts.imports > 0 {

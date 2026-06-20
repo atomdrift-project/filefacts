@@ -71,6 +71,33 @@ pub(super) struct GoSections<'a> {
     pub rodata: Option<&'a [u8]>,
 }
 
+/// Go `pclntab` header magics across releases, little- and big-endian.
+/// Go 1.2/1.16/1.18/1.20 use `0xfffffffb/fa/f0/f1`; the table is laid out in
+/// target byte order, so both orientations are accepted (LE covers
+/// amd64/arm64/386/arm; BE covers s390x/mips/ppc64).
+const PCLNTAB_MAGICS: [[u8; 4]; 8] = [
+    [0xfb, 0xff, 0xff, 0xff],
+    [0xfa, 0xff, 0xff, 0xff],
+    [0xf0, 0xff, 0xff, 0xff],
+    [0xf1, 0xff, 0xff, 0xff],
+    [0xff, 0xff, 0xff, 0xfb],
+    [0xff, 0xff, 0xff, 0xfa],
+    [0xff, 0xff, 0xff, 0xf0],
+    [0xff, 0xff, 0xff, 0xf1],
+];
+
+/// True when `data` begins with a recognized Go pclntab magic — proof the
+/// section is a genuine Go function table, not a same-named decoy. Used to gate
+/// the cheaper rizin analysis path (Go's pclntab is a complete function table,
+/// so basic `aa` recovers every function): validating the magic, not just the
+/// section name, stops a hand-added empty `.gopclntab`/`__gopclntab` from
+/// tricking that path into skipping a stripped payload's hidden functions.
+pub(super) fn has_pclntab_magic(data: &[u8]) -> bool {
+    data.get(..4)
+        .and_then(|m| <[u8; 4]>::try_from(m).ok())
+        .is_some_and(|magic| PCLNTAB_MAGICS.contains(&magic))
+}
+
 pub(super) fn detect(
     bytes: &[u8],
     values: &mut Values,
@@ -503,6 +530,26 @@ fn decode_uvarint(buf: &[u8]) -> Option<(u64, &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pclntab_magic_recognizes_known_versions() {
+        // Go 1.18 (LE) and Go 1.20 (BE) headers, with a plausible tail.
+        assert!(has_pclntab_magic(&[0xf0, 0xff, 0xff, 0xff, 0, 0, 1, 8]));
+        assert!(has_pclntab_magic(&[0xff, 0xff, 0xff, 0xf1, 0, 0, 1, 8]));
+        // Go 1.2 / 1.16 little-endian.
+        assert!(has_pclntab_magic(&[0xfb, 0xff, 0xff, 0xff]));
+        assert!(has_pclntab_magic(&[0xfa, 0xff, 0xff, 0xff]));
+    }
+
+    #[test]
+    fn pclntab_magic_rejects_decoys_and_short_input() {
+        // A section named like pclntab but without a real magic must NOT pass —
+        // otherwise a decoy could downgrade analysis and hide functions.
+        assert!(!has_pclntab_magic(b"not a pclntab"));
+        assert!(!has_pclntab_magic(&[0x00, 0x00, 0x00, 0x00]));
+        assert!(!has_pclntab_magic(&[0xf0, 0xff, 0xff])); // too short
+        assert!(!has_pclntab_magic(&[])); // empty
+    }
 
     #[test]
     fn uvarint_decodes_small_values() {

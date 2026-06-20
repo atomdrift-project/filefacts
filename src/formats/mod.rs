@@ -42,6 +42,7 @@ mod class;
 pub(crate) mod common;
 mod crx;
 mod deb;
+mod dmg;
 mod elf;
 mod elf_dwarf;
 mod elf_dynamic;
@@ -254,6 +255,7 @@ pub(crate) fn extract(
         FileType::PythonBytecode => pyc::extract(bytes, values, strings, metrics),
         FileType::Rpm => rpm::extract(bytes, values, strings, metrics),
         FileType::Deb => deb::extract(bytes, values, metrics),
+        FileType::Dmg => dmg::extract(bytes, values, metrics, archive_members),
         FileType::Rtf => rtf::extract(bytes, values, strings, metrics),
 
         // Source-code extraction is delegated to the source dispatcher,

@@ -186,6 +186,12 @@ impl std::fmt::Debug for ParsedFile<'_> {
     }
 }
 
+/// The owned, serializable extraction snapshot. Round-trips through the
+/// disk cache ([`crate::cache`]) so the expensive recovery — chiefly the
+/// rizin disassembly pass folded into `symbols`/`sections`/`metrics` —
+/// is computed once per `(content, filefacts build, rizin config)` and
+/// reused across processes rather than re-run on every `open`.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Extracted {
     values: Values,
     strings: output::Strings,
@@ -316,6 +322,24 @@ impl<'a> ParsedFile<'a> {
         &self.extracted().errors
     }
 
+    /// Whether rizin symbol recovery was attempted but did not complete
+    /// on this run.
+    ///
+    /// `true` means rizin is installed (so the symbol/section views would
+    /// normally be rizin-grade) yet this particular run produced nothing
+    /// — it timed out, was killed on the output cap, was muted, or
+    /// skipped the input by size. The bytes are unchanged, so a later run
+    /// may succeed; a caller caching analysis output keyed by content
+    /// **must not persist a payload while this is `true`**, or the
+    /// degraded result would be served to every future run. Pair with
+    /// [`crate::cache::Computed::Transient`] and
+    /// [`crate::rizin::cache_fingerprint`]. Always `false` when rizin is
+    /// not installed (the no-rizin result is correct for that
+    /// environment, and keyed as such).
+    pub fn rizin_recovery_incomplete(&self) -> bool {
+        self.metrics().get("binary.rizin_incomplete").is_some()
+    }
+
     /// Iterate every symbol name across the declaration kinds
     /// (`Import`, `Export`, `Function`) for cross-cutting matchers
     /// that ask "any declared name of this value regardless of role."
@@ -366,18 +390,45 @@ impl<'a> ParsedFile<'a> {
 
     fn extracted(&self) -> &Extracted {
         self.extracted.get_or_init(|| {
-            self.parse_count.fetch_add(1, Ordering::AcqRel);
-            run_extraction(
-                self.bytes,
-                self.fileid.file_type(),
-                self.fileid.extension_mismatch(),
-                self.fileid.extension_mismatch_transition(),
-                self.basename.as_deref(),
-                self.tree_cache(),
-                self.tree_parse()
-                    .and_then(formats::source::TreeParse::diagnostic),
-            )
+            if !cache::caching_enabled() {
+                return self.run_pipeline();
+            }
+            // The disk cache is keyed by (content, filefacts build, rizin
+            // config), so the expensive rizin recovery folded into the
+            // snapshot is computed once and reused across processes. A
+            // degraded rizin run is returned but not persisted, so a later
+            // healthy run still gets to fill the entry.
+            let variant = crate::rizin::cache_fingerprint();
+            cache::open_with_cache(self.bytes, &variant, |_| {
+                let extracted = self.run_pipeline();
+                if extracted.metrics.get("binary.rizin_incomplete").is_some() {
+                    Some(cache::Computed::Transient(extracted))
+                } else {
+                    Some(cache::Computed::Cacheable(extracted))
+                }
+            })
+            // `open_with_cache` only returns `None` when the closure does,
+            // and ours never does; recompute defensively rather than panic
+            // if that contract ever changes.
+            .unwrap_or_else(|| self.run_pipeline())
         })
+    }
+
+    /// Run the extraction pipeline once and count it. The single place
+    /// `run_extraction` is invoked, whether the result is destined for the
+    /// cache or returned directly.
+    fn run_pipeline(&self) -> Extracted {
+        self.parse_count.fetch_add(1, Ordering::AcqRel);
+        run_extraction(
+            self.bytes,
+            self.fileid.file_type(),
+            self.fileid.extension_mismatch(),
+            self.fileid.extension_mismatch_transition(),
+            self.basename.as_deref(),
+            self.tree_cache(),
+            self.tree_parse()
+                .and_then(formats::source::TreeParse::diagnostic),
+        )
     }
 }
 
@@ -952,6 +1003,40 @@ pub fn open_with_path<'a>(path: &Path, bytes: &'a [u8]) -> Result<ParsedFile<'a>
     })
 }
 
+/// Open `bytes` forcing a caller-known [`FileType`], bypassing content
+/// and extension detection.
+///
+/// Identification normally trusts magic bytes, then the path/extension,
+/// then content heuristics. Some callers already know the language from
+/// context the bytes don't carry, and detection would otherwise give the
+/// wrong answer or fall back to [`FileType::Unknown`]. The motivating case
+/// is an interpreter inline-code payload: the body extracted from
+/// `python3 -c "<code>"` is genuine Python, but stripped of its shebang
+/// and carried under a virtual path with no usable extension, so the
+/// detector can't see it. Forcing the type lets `source_ast()` select the
+/// correct tree-sitter grammar and recover the payload's real AST.
+///
+/// `path` is retained only for its basename (so `file.basename` rules and
+/// well-known-name lookups still work); it does not influence the type.
+pub fn open_as<'a>(
+    path: &Path,
+    bytes: &'a [u8],
+    file_type: FileType,
+) -> Result<ParsedFile<'a>, Error> {
+    let basename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string);
+    Ok(ParsedFile {
+        bytes,
+        fileid: FileId::forced(file_type),
+        basename,
+        tree_parse: OnceLock::new(),
+        extracted: OnceLock::new(),
+        parse_count: AtomicU32::new(0),
+    })
+}
+
 /// Read a file from disk, identify it, and return its bytes paired
 /// with a [`FileId`].
 ///
@@ -1047,6 +1132,33 @@ mod tests {
         let _ = parsed.literals();
         let _ = parsed.metrics();
         assert_eq!(parsed.parse_count(), 1, "subsequent views must not reparse");
+    }
+
+    #[test]
+    fn extracted_round_trips_through_cache_json() {
+        // The cache stores the extraction snapshot as zstd-compressed
+        // JSON, so a real, rich extraction (sections, symbols, the
+        // stng-typed byte-scan `text` tier, metrics, identity) must
+        // survive serialize -> deserialize -> serialize unchanged.
+        // Caching is off under cfg(test), so `extracted()` returns a
+        // freshly computed snapshot to round-trip.
+        let bytes = std::fs::read("../cleave/tests/fixtures/test.exe")
+            .expect("test.exe fixture should exist");
+        let parsed = open(&bytes).unwrap();
+        let original = parsed.extracted();
+        let json = serde_json::to_vec(original).expect("serialize Extracted");
+        let restored: Extracted = serde_json::from_slice(&json).expect("deserialize Extracted");
+        assert_eq!(
+            serde_json::to_value(original).unwrap(),
+            serde_json::to_value(&restored).unwrap(),
+            "Extracted must round-trip losslessly through the cache JSON form"
+        );
+        // Confirm the fixture actually exercised the stng-typed text tier
+        // (the field that newly gained Deserialize), not just empty views.
+        assert!(
+            !original.strings.text.is_empty(),
+            "fixture should yield byte-scan strings"
+        );
     }
 
     #[test]

@@ -92,6 +92,28 @@ impl FileId {
         }
     }
 
+    /// Construct a `FileId` for a caller-known type, bypassing the
+    /// detection pipeline entirely.
+    ///
+    /// Use when the language is established by surrounding context that the
+    /// bytes themselves don't carry: the inner body of an interpreter
+    /// inline-code invocation (`python3 -c "<code>"`, `node -e '<code>'`)
+    /// has no shebang, extension, or magic, so [`from_path_and_bytes`]
+    /// would fall back to [`FileType::Unknown`] and skip source parsing.
+    /// The reported [`source`](Self::source) is [`DetectionSource::Forced`];
+    /// no extension comparison is made, so `extension_mismatch` is `false`.
+    ///
+    /// [`from_path_and_bytes`]: Self::from_path_and_bytes
+    #[must_use]
+    pub fn forced(file_type: FileType) -> Self {
+        Self {
+            file_type,
+            source: DetectionSource::Forced,
+            extension_mismatch: false,
+            mismatch_ext_type: None,
+        }
+    }
+
     /// The identified file type.
     #[must_use]
     pub fn file_type(&self) -> FileType {
@@ -662,6 +684,12 @@ pub enum DetectionSource {
     /// Extension overrode a shebang juke (e.g. `.js` file with `#!/bin/bash`).
     /// `extension_type()` returns the type the shebang claimed.
     ExtensionOverridesShebang,
+    /// Type asserted by the caller via [`FileId::forced`] /
+    /// [`crate::open_as`], bypassing detection. Used when the language is
+    /// already known from context the bytes alone don't carry — e.g. the
+    /// inner source of a `python3 -c "<code>"` payload, whose extracted
+    /// body has no shebang, extension, or magic to detect.
+    Forced,
 }
 
 /// What the file extension implies about the content.

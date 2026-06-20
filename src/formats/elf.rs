@@ -82,7 +82,7 @@ pub(super) fn extract(
     table_counts(&elf, metrics);
     relocation_kinds(&elf, values);
     segments(&elf, values);
-    rizin_fallback(bytes, symbols_out, metrics);
+    rizin_fallback(bytes, symbols_out, metrics, elf_rizin_analysis(&elf, bytes));
     linker_family(&elf, bytes, values);
     comment_fingerprint(values);
     super::elf_hashes::emit(&elf, values, symbols_out);
@@ -663,6 +663,26 @@ fn pauth_platform_name(platform: u64) -> &'static str {
 }
 
 /// Return the file bytes of a named section, or `None` when absent.
+/// Pick rizin's analysis depth for this ELF. Go binaries carry a complete
+/// function table in `.gopclntab`, which rizin's basic `aa` parses in full —
+/// so the deep `aaa` emulation/reference passes find nothing more, at ~2x the
+/// cost. Everything else (stripped C/C++, etc.) needs deep discovery.
+fn elf_rizin_analysis(elf: &Elf<'_>, bytes: &[u8]) -> crate::rizin::Analysis {
+    if has_go_pclntab(elf, bytes) {
+        crate::rizin::Analysis::Basic
+    } else {
+        crate::rizin::Analysis::Deep
+    }
+}
+
+/// Cheap Go probe: read the already-parsed `.gopclntab` section (no extra
+/// parse) and validate its magic. False negatives are safe (fall back to deep
+/// analysis); a false positive is impossible — no non-Go format writes a
+/// pclntab magic — so this only ever picks the faster path for genuine Go.
+fn has_go_pclntab(elf: &Elf<'_>, bytes: &[u8]) -> bool {
+    read_section(elf, bytes, ".gopclntab").is_some_and(super::go_buildinfo::has_pclntab_magic)
+}
+
 fn read_section<'a>(elf: &Elf<'_>, bytes: &'a [u8], name: &str) -> Option<&'a [u8]> {
     let sh = elf
         .section_headers
@@ -1620,6 +1640,23 @@ fn section_entropy(bytes: &[u8], offset: u64, size: u64) -> f64 {
     entropy::shannon(&bytes[start..end])
 }
 
+/// Map a virtual address to a file offset through the `PT_LOAD` segments.
+///
+/// This is the only VA→offset path that survives section-header stripping:
+/// release and packed binaries (and many shipped inside wheels) routinely drop
+/// the section table while keeping the loadable segments the dynamic linker
+/// needs. Returns `None` when no `PT_LOAD` segment covers `va` in the file image
+/// (e.g. a `.bss`-only address with no file backing).
+fn load_segment_va_to_offset(elf: &Elf<'_>, va: u64) -> Option<u64> {
+    elf.program_headers
+        .iter()
+        .filter(|p| p.p_type == goblin::elf::program_header::PT_LOAD)
+        .find_map(|p| {
+            let delta = va.checked_sub(p.p_vaddr)?;
+            (delta < p.p_filesz).then(|| p.p_offset.saturating_add(delta))
+        })
+}
+
 fn symbols(
     elf: &Elf<'_>,
     values: &mut Values,
@@ -1665,11 +1702,19 @@ fn symbols(
     // located in the file (`dynstr_offset + st_name`). ELF binds no useful
     // offset to an import-table *entry*, but the name string itself is a real,
     // anchorable location — what consumers want to point at.
+    //
+    // Prefer the `.dynstr` section header, but fall back to the dynamic
+    // segment's `DT_STRTAB` (a virtual address resolved back to a file offset
+    // through `PT_LOAD`) when the section table is absent. Release and packed
+    // binaries strip section headers entirely while keeping the dynamic symbols
+    // fully resolvable, so the section-only lookup would otherwise leave every
+    // import name unanchored.
     let dynstr_offset = elf
         .section_headers
         .iter()
         .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".dynstr"))
-        .map(|sh| sh.sh_offset);
+        .map(|sh| sh.sh_offset)
+        .or_else(|| load_segment_va_to_offset(elf, elf.dynamic.as_ref()?.info.strtab as u64));
     for sym in &elf.dynsyms {
         // Hidden + canary on dynsym too.
         if sym.st_bind() == 0 && sym.st_visibility() == 2 {
@@ -1701,6 +1746,17 @@ fn symbols(
         if name.starts_with("__") && name.ends_with("_chk") {
             fortify_count += 1;
         }
+        // The symbol name's byte offset in the file (via `.dynstr`): a real,
+        // file-backed location every consumer can render. Imports and exports
+        // both anchor here. `st_value` is a virtual address, not a file offset,
+        // and may point into `.bss` with no file backing — so anchoring exports
+        // on the name string keeps them consistent with imports and always
+        // pointing at bytes that exist in the file.
+        let name_off = dynstr_offset.and_then(|base| {
+            u64::try_from(sym.st_name)
+                .ok()
+                .map(|n| base.saturating_add(n))
+        });
         if sym.st_shndx == 0 {
             // ELF doesn't bind a dynsym entry to a specific
             // DT_NEEDED library at link time — the dynamic linker
@@ -1710,19 +1766,14 @@ fn symbols(
                 name: name.to_string(),
                 alias: None,
                 library: None,
-                // The symbol name's byte offset in the file (via `.dynstr`).
-                offset: dynstr_offset.and_then(|base| {
-                    u64::try_from(sym.st_name)
-                        .ok()
-                        .map(|n| base.saturating_add(n))
-                }),
+                offset: name_off,
                 ordinal: None,
             });
         } else if sym.is_function() || sym.st_info & 0xf == 1 {
             // STB_GLOBAL = 1 (binding in upper nibble of st_info)
             symbols_out.push(crate::Symbol::Export {
                 name: name.to_string(),
-                offset: Some(sym.st_value),
+                offset: name_off,
                 ordinal: None,
                 // ELF doesn't have a forwarded-export concept like
                 // PE's reexports — symbol versioning solves the same
@@ -1940,6 +1991,139 @@ mod tests {
         (v, s, m)
     }
 
+    /// Build a minimal, goblin-parseable ELF64 (little-endian) carrying a
+    /// single named section with the given contents, plus the `.shstrtab`
+    /// goblin needs to resolve section names. Pure-Rust — no committed binary
+    /// fixture, no toolchain — so the Go fast-path stays covered everywhere.
+    fn elf_with_section(name: &str, data: &[u8]) -> Vec<u8> {
+        const EH: usize = 64; // ELF64 header size
+        const SH: usize = 64; // ELF64 section header size
+
+        // Section-name string table; index 0 is the empty name.
+        let mut shstr = vec![0u8];
+        let name_off = shstr.len() as u32;
+        shstr.extend_from_slice(name.as_bytes());
+        shstr.push(0);
+        let shstrtab_name_off = shstr.len() as u32;
+        shstr.extend_from_slice(b".shstrtab");
+        shstr.push(0);
+
+        let data_off = EH;
+        let shstr_off = data_off + data.len();
+        let shtab_off = shstr_off + shstr.len();
+        let mut buf = vec![0u8; shtab_off + 3 * SH];
+
+        // ELF header.
+        buf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        buf[4] = 2; // ELFCLASS64
+        buf[5] = 1; // ELFDATA2LSB
+        buf[6] = 1; // EV_CURRENT
+        buf[16..18].copy_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
+        buf[18..20].copy_from_slice(&62u16.to_le_bytes()); // e_machine = EM_X86_64
+        buf[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        buf[40..48].copy_from_slice(&(shtab_off as u64).to_le_bytes()); // e_shoff
+        buf[52..54].copy_from_slice(&(EH as u16).to_le_bytes()); // e_ehsize
+        buf[58..60].copy_from_slice(&(SH as u16).to_le_bytes()); // e_shentsize
+        buf[60..62].copy_from_slice(&3u16.to_le_bytes()); // e_shnum
+        buf[62..64].copy_from_slice(&2u16.to_le_bytes()); // e_shstrndx
+
+        // Section contents.
+        buf[data_off..data_off + data.len()].copy_from_slice(data);
+        buf[shstr_off..shstr_off + shstr.len()].copy_from_slice(&shstr);
+
+        // Section headers: [0] null (already zeroed), [1] named, [2] shstrtab.
+        fn put_sh(buf: &mut [u8], base: usize, name: u32, ty: u32, off: u64, size: u64) {
+            buf[base..base + 4].copy_from_slice(&name.to_le_bytes()); // sh_name
+            buf[base + 4..base + 8].copy_from_slice(&ty.to_le_bytes()); // sh_type
+            buf[base + 24..base + 32].copy_from_slice(&off.to_le_bytes()); // sh_offset
+            buf[base + 32..base + 40].copy_from_slice(&size.to_le_bytes()); // sh_size
+        }
+        put_sh(
+            &mut buf,
+            shtab_off + SH,
+            name_off,
+            1, // SHT_PROGBITS
+            data_off as u64,
+            data.len() as u64,
+        );
+        put_sh(
+            &mut buf,
+            shtab_off + 2 * SH,
+            shstrtab_name_off,
+            3, // SHT_STRTAB
+            shstr_off as u64,
+            shstr.len() as u64,
+        );
+        buf
+    }
+
+    #[test]
+    fn synthetic_elf_builder_parses_and_names_sections() {
+        // Guards the test harness itself: if goblin can't parse what
+        // `elf_with_section` emits, the Go-path tests below are meaningless.
+        let bytes = elf_with_section(".gopclntab", &[0xf0, 0xff, 0xff, 0xff]);
+        let elf = Elf::parse(&bytes).expect("synthetic ELF must parse");
+        assert!(
+            elf.section_headers
+                .iter()
+                .any(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".gopclntab")),
+            "named section must be resolvable"
+        );
+    }
+
+    #[test]
+    fn go_pclntab_magic_selects_basic_analysis() {
+        // Go 1.18 pclntab magic (0xfffffff0, little-endian) + a plausible tail.
+        let pclntab = [0xf0, 0xff, 0xff, 0xff, 0x00, 0x00, 0x01, 0x08];
+        let bytes = elf_with_section(".gopclntab", &pclntab);
+        let elf = Elf::parse(&bytes).expect("synthetic ELF must parse");
+        assert!(
+            has_go_pclntab(&elf, &bytes),
+            "a valid Go pclntab must be detected"
+        );
+        assert_eq!(
+            elf_rizin_analysis(&elf, &bytes),
+            crate::rizin::Analysis::Basic,
+            "Go binaries take the cheap `aa` analysis path"
+        );
+    }
+
+    #[test]
+    fn go_pclntab_big_endian_magic_is_detected() {
+        // s390x/ppc64 Go binaries lay the magic out big-endian (0xfffffff1).
+        let pclntab = [0xff, 0xff, 0xff, 0xf1, 0x00, 0x00, 0x01, 0x08];
+        let bytes = elf_with_section(".gopclntab", &pclntab);
+        let elf = Elf::parse(&bytes).expect("synthetic ELF must parse");
+        assert!(has_go_pclntab(&elf, &bytes));
+    }
+
+    #[test]
+    fn spoofed_gopclntab_without_magic_keeps_deep_analysis() {
+        // A section *named* `.gopclntab` but carrying no valid magic is an
+        // evasion attempt to dodge deep function discovery. It MUST stay on
+        // `aaa` so hidden functions are still recovered.
+        let bytes = elf_with_section(".gopclntab", b"not a real pclntab header");
+        let elf = Elf::parse(&bytes).expect("synthetic ELF must parse");
+        assert!(!has_go_pclntab(&elf, &bytes));
+        assert_eq!(
+            elf_rizin_analysis(&elf, &bytes),
+            crate::rizin::Analysis::Deep
+        );
+    }
+
+    #[test]
+    fn non_go_binary_keeps_deep_analysis() {
+        // No `.gopclntab` at all → deep discovery, the safe default for
+        // stripped C/C++ where `aa` would miss reference-only functions.
+        let bytes = elf_with_section(".text", &[0x55, 0x48, 0x89, 0xe5]);
+        let elf = Elf::parse(&bytes).expect("synthetic ELF must parse");
+        assert!(!has_go_pclntab(&elf, &bytes));
+        assert_eq!(
+            elf_rizin_analysis(&elf, &bytes),
+            crate::rizin::Analysis::Deep
+        );
+    }
+
     #[test]
     fn machine_string_handles_known() {
         assert_eq!(machine_string(header::EM_X86_64), "x86_64");
@@ -2037,6 +2221,83 @@ mod tests {
     fn read_fixture(name: &str) -> Vec<u8> {
         let path = format!("../cleave/tests/fixtures/{name}");
         std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"))
+    }
+
+    /// Extract and return the typed symbols (the `run` helper drops them).
+    fn run_symbols(bytes: &[u8]) -> crate::Symbols {
+        let mut v = Values::new();
+        let mut s = Strings::default();
+        let mut m = Metrics::new();
+        let mut sections = Vec::new();
+        let mut symbols = crate::Symbols::new();
+        let mut errors = Errors::new();
+        let _ = extract(
+            bytes,
+            &mut v,
+            &mut s,
+            &mut m,
+            &mut sections,
+            &mut symbols,
+            &mut errors,
+        );
+        symbols
+    }
+
+    /// Zero the section-header table in an ELF64 image, simulating a
+    /// release/packed binary that ships only program headers. goblin still
+    /// resolves dynamic symbols through `PT_DYNAMIC`, so the names survive — the
+    /// only thing lost is the `.dynstr` *section*.
+    fn strip_section_headers(bytes: &mut [u8]) {
+        bytes[0x28..0x30].copy_from_slice(&0u64.to_le_bytes()); // e_shoff
+        bytes[0x3c..0x3e].copy_from_slice(&0u16.to_le_bytes()); // e_shnum
+        bytes[0x3e..0x40].copy_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+    }
+
+    /// Section-header-stripped binaries must still anchor every import at its
+    /// name's file offset. The `.dynstr` section is gone, but `DT_STRTAB` in the
+    /// dynamic segment locates the same string table — without the fallback,
+    /// downstream consumers see offset-less import matches and (in cleave) log
+    /// them as "content match has no file offset".
+    #[test]
+    fn stripped_section_headers_still_anchor_import_names() {
+        use crate::output::{Symbol, SymbolKind};
+        let bytes = read_fixture("test.elf");
+        let with_shdrs = run_symbols(&bytes);
+        let baseline: std::collections::HashMap<String, Option<u64>> = with_shdrs
+            .iter_kind(SymbolKind::Import)
+            .filter_map(|s| match s {
+                Symbol::Import { name, offset, .. } => Some((name.clone(), *offset)),
+                _ => None,
+            })
+            .collect();
+        assert!(!baseline.is_empty(), "fixture should carry dynamic imports");
+        assert!(
+            baseline.values().all(Option::is_some),
+            "baseline imports already anchored via .dynstr section"
+        );
+
+        let mut stripped = bytes.clone();
+        strip_section_headers(&mut stripped);
+        let recovered = run_symbols(&stripped);
+        let mut import_count = 0;
+        for sym in recovered.iter_kind(SymbolKind::Import) {
+            let Symbol::Import { name, offset, .. } = sym else {
+                continue;
+            };
+            import_count += 1;
+            // Every import keeps an offset, and it matches the section-based one:
+            // both point at the name string in `.dynstr`.
+            assert_eq!(
+                *offset,
+                baseline.get(name).copied().flatten(),
+                "import {name} lost or changed its offset when section headers were stripped"
+            );
+        }
+        assert_eq!(
+            import_count,
+            baseline.len(),
+            "same imports recovered without section headers"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Structural key-value data extracted from a file.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as JsonValue};
 
 /// Structural key-value data extracted from a file.
@@ -33,7 +33,7 @@ use serde_json::{Map, Value as JsonValue};
 ///
 /// assert_eq!(v.get("pe.coff.machine").and_then(|x| x.as_str()), Some("x86_64"));
 /// ```
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Values(JsonValue);
 

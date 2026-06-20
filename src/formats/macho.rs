@@ -85,7 +85,16 @@ pub(super) fn extract(
         Some((start, end)) => &bytes[start..end],
         None => bytes,
     };
-    rizin_fallback(rizin_bytes, symbols_out, metrics);
+    // Mach-O Go binaries carry their complete function table in `__gopclntab`
+    // (resolved above for thin binaries), so rizin's basic `aa` recovers every
+    // function — the deep `aaa` finds nothing more at ~2x the cost. Fat
+    // binaries skip pclntab resolution, so they stay on deep discovery.
+    rizin_fallback(
+        rizin_bytes,
+        symbols_out,
+        metrics,
+        macho_rizin_analysis(go_pclntab),
+    );
     super::upx::detect(bytes, values);
     let go_sections = super::go_buildinfo::GoSections {
         buildid_note: None,
@@ -94,6 +103,18 @@ pub(super) fn extract(
     };
     super::go_buildinfo::detect(bytes, values, "macho", None, &go_sections);
     Ok(())
+}
+
+/// Pick rizin's analysis depth from the resolved `__gopclntab` bytes. A
+/// genuine Go pclntab (validated by magic, not just section name) is a complete
+/// function table that basic `aa` parses in full; everything else needs deep
+/// `aaa` discovery. Mirrors the ELF path's `elf_rizin_analysis`.
+fn macho_rizin_analysis(go_pclntab: Option<&[u8]>) -> crate::rizin::Analysis {
+    if go_pclntab.is_some_and(super::go_buildinfo::has_pclntab_magic) {
+        crate::rizin::Analysis::Basic
+    } else {
+        crate::rizin::Analysis::Deep
+    }
 }
 
 /// Resolve the `__TEXT,__gopclntab` and read-only data (`__const`,
@@ -1727,6 +1748,27 @@ mod tests {
         assert_eq!(cpu_type_string(0x0100_0007), "x86_64");
         assert_eq!(cpu_type_string(0x0100_000c), "arm64");
         assert_eq!(cpu_type_string(0xffff_ffff), "unknown");
+    }
+
+    #[test]
+    fn macho_go_pclntab_selects_basic_analysis() {
+        // Real Go pclntab magic (1.18, LE) → cheap `aa`, like the ELF path.
+        let pclntab = [0xf0, 0xff, 0xff, 0xff, 0x00, 0x00, 0x01, 0x08];
+        assert_eq!(
+            macho_rizin_analysis(Some(&pclntab)),
+            crate::rizin::Analysis::Basic
+        );
+    }
+
+    #[test]
+    fn macho_spoofed_or_absent_pclntab_keeps_deep_analysis() {
+        // A `__gopclntab` decoy without a valid magic, and the no-pclntab case
+        // (fat binaries, non-Go) must both stay on deep `aaa` discovery.
+        assert_eq!(
+            macho_rizin_analysis(Some(b"not a real pclntab")),
+            crate::rizin::Analysis::Deep
+        );
+        assert_eq!(macho_rizin_analysis(None), crate::rizin::Analysis::Deep);
     }
 
     #[test]

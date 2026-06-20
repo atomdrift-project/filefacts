@@ -35,13 +35,13 @@
 //! - `message` — verbatim diagnostic from the failing stage, when
 //!   one is available.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Closed set of failure categories. The JSON wire form serialises
 /// as the lowercase variant name (`"panic"`, `"malformed"`,
 /// `"truncated"`, `"fallback"`) so downstream rules and dashboards
 /// keep working unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum ErrorKind {
@@ -60,7 +60,7 @@ pub enum ErrorKind {
 /// as kebab-case (`"pe-parse"`, `"pe-resource-walk"`, `"elf-parse"`,
 /// …) — same vocabulary the previous `&'static str` field used,
 /// preserved verbatim so existing rules keep matching.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum Stage {
@@ -97,7 +97,7 @@ pub enum Stage {
 }
 
 /// One non-fatal extraction error.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ParseError {
     /// Category of the failure.
@@ -114,7 +114,7 @@ pub struct ParseError {
 /// Non-fatal extraction errors collected across the parse, in the
 /// order they were encountered. Empty when the parse hit no
 /// failures or fallbacks.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Errors(Vec<ParseError>);
 

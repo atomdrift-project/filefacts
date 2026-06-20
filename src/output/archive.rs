@@ -9,8 +9,10 @@
 //! so the common case (a regular file from a zip) constructs cleanly
 //! without spelling `None` ten times.
 
+use serde::{Deserialize, Serialize};
+
 /// One member entry from an archive central directory or header table.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ArchiveMember {
     /// Member path as stored in the archive index.
@@ -42,7 +44,7 @@ pub struct ArchiveMember {
 
 /// Compressed-size and compression-method metadata. Both fields are
 /// `Option` because some archive formats record only one.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ArchiveCompression {
     /// Compressed member size in bytes.
@@ -55,7 +57,7 @@ pub struct ArchiveCompression {
 /// POSIX-style ownership and mode bits. Every field is `Option`
 /// because tar headers may carry numeric ids without names, or names
 /// without ids, depending on the variant.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ArchiveOwnership {
     /// Unix mode bits, including file-type bits when the archive records them.
@@ -72,7 +74,7 @@ pub struct ArchiveOwnership {
 
 /// Byte-offset locations of a member's headers and payload within the
 /// archive bytes.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ArchiveOffsets {
     /// Offset of the member local header, when addressable.

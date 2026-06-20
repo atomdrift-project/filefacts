@@ -116,6 +116,12 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
 
+    // The extraction cache is on by default; drop entries from superseded
+    // schema versions (one cheap directory scan). The per-build stale-walk
+    // (`cache::prune_stale`) is left to long-lived consumers like cleave —
+    // running it on every short CLI invocation would not pay for itself.
+    filefacts::cache::prune_old_versions();
+
     if root.is_dir() {
         let mut had_error = false;
         let mut stack = vec![root];
