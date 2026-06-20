@@ -334,7 +334,23 @@ pub(crate) fn extract(
         && strings.text.ascii.is_empty()
         && strings.text.utf16le.is_empty()
     {
-        common::extract_binary_strings(bytes, strings);
+        // Decide whether to run stng's (expensive, FP-prone) XOR auto-detect
+        // scan alongside the always-on printable-run extraction:
+        //   * Archive containers — never. Their bytes are compressed/high-entropy;
+        //     any real XOR payload lives in a *member*, which is scanned on its
+        //     own. Scanning the container only burns cycles and manufactures
+        //     speculative-decode false positives.
+        //   * Source/script — only when the bytes show XOR intent (`^` operator
+        //     or the `xor` keyword). A self-contained script wielding an
+        //     XOR-encoded payload must carry its decoder in the same file, so
+        //     `has_xor_intent` preserves real detection while skipping the scan
+        //     (and its speculative FPs) on the overwhelming majority of benign
+        //     source.
+        //   * Everything else (binaries, unknown text-like) — full scan; their
+        //     decode logic is machine code, not greppable.
+        let run_xor = !file_type.is_archive()
+            && (!file_type.is_source_code() || common::has_xor_intent(bytes));
+        common::extract_text_strings(bytes, strings, run_xor);
     }
 
     // Cross-format binary attribution derived from the merged symbol

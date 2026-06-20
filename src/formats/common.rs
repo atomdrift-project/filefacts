@@ -64,6 +64,56 @@ pub(super) fn extract_binary_strings_from_object(
     );
 }
 
+/// [`string_opts`] without the XOR auto-detect scan. Used for source/script
+/// members that show no sign of XOR logic (see [`has_xor_intent`]): the
+/// printable-run, base64, and classification passes still run identically —
+/// only stng's expensive XOR seed search is skipped.
+fn string_opts_no_xor() -> stng::ExtractOptions {
+    stng::ExtractOptions::new(ascii::DEFAULT_MIN_LEN)
+        .with_garbage_filter(true)
+        .with_caller_provides_symbols(true)
+}
+
+/// Cheap pre-scan for XOR intent in source/script bytes. A self-contained
+/// script that ships an XOR-encoded payload must also carry the code that
+/// *decodes* it in the same file, so the absence of any XOR operator or keyword
+/// means stng's XOR auto-detect scan would only burn cycles finding nothing.
+/// Indicators (either is enough):
+/// - the `^` byte — the bitwise-XOR operator in C/JS/Python/Java/Go/Rust/…,
+/// - the substring `xor` (case-insensitive) — `xor`, VBScript `Xor`,
+///   PowerShell `-bxor`, `.xor(`, etc.
+///
+/// Binaries are never gated this way — their decode logic is machine code, not
+/// greppable text — so this is only consulted for [`FileType::is_source_code`].
+pub(super) fn has_xor_intent(bytes: &[u8]) -> bool {
+    if memchr::memchr(b'^', bytes).is_some() {
+        return true;
+    }
+    static XOR_WORD: std::sync::OnceLock<Option<aho_corasick::AhoCorasick>> =
+        std::sync::OnceLock::new();
+    XOR_WORD
+        .get_or_init(|| {
+            aho_corasick::AhoCorasick::builder()
+                .ascii_case_insensitive(true)
+                .build(["xor"])
+                .ok()
+        })
+        .as_ref()
+        .is_some_and(|ac| ac.find(bytes).is_some())
+}
+
+/// `strings(1)`-tier byte view for a text/source member. Mirrors
+/// [`extract_binary_strings`] but runs stng's XOR auto-detect scan only when
+/// `run_xor` is set — callers gate source files on [`has_xor_intent`].
+pub(super) fn extract_text_strings(bytes: &[u8], strings: &mut Strings, run_xor: bool) {
+    let opts = if run_xor {
+        string_opts()
+    } else {
+        string_opts_no_xor()
+    };
+    push_stng_strings(stng::extract_strings_with_options(bytes, &opts), strings);
+}
+
 /// Convenience wrapper for emitting a string-typed value into `values`.
 pub(super) fn put_str(values: &mut Values, path: &str, s: impl Into<String>) {
     values.insert(path, JsonValue::String(s.into()));
@@ -277,7 +327,27 @@ pub(super) fn hex_nibble(b: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{basename, hex_encode, stem};
+    use super::{basename, has_xor_intent, hex_encode, stem};
+
+    #[test]
+    fn xor_intent_detects_operator_and_keyword() {
+        // bitwise-XOR operator (C/JS/Python/…)
+        assert!(has_xor_intent(b"for (i=0;i<n;i++) out[i] = buf[i] ^ key;"));
+        // `xor` keyword, any case (xor / VBScript Xor / PowerShell -bxor)
+        assert!(has_xor_intent(b"result = a xor b"));
+        assert!(has_xor_intent(b"$d = $b -bxor 0x42"));
+        assert!(has_xor_intent(b"value = data.XOR(key)"));
+    }
+
+    #[test]
+    fn xor_intent_absent_in_benign_source() {
+        // A plain comment / coordinate string of the kind that previously
+        // mis-decoded into speculative "XOR payload" false positives.
+        assert!(!has_xor_intent(b"// Build data=\"Name:v1,v2;...\" from series"));
+        assert!(!has_xor_intent(b"10504 1900 10802 2169 L 11697 1363 C 11971"));
+        assert!(!has_xor_intent(b"const greeting = `hello ${name}`;"));
+        assert!(!has_xor_intent(b""));
+    }
 
     #[test]
     fn hex_encode_known_vectors() {
