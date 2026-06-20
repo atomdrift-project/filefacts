@@ -343,8 +343,12 @@ mod tests {
     fn xor_intent_absent_in_benign_source() {
         // A plain comment / coordinate string of the kind that previously
         // mis-decoded into speculative "XOR payload" false positives.
-        assert!(!has_xor_intent(b"// Build data=\"Name:v1,v2;...\" from series"));
-        assert!(!has_xor_intent(b"10504 1900 10802 2169 L 11697 1363 C 11971"));
+        assert!(!has_xor_intent(
+            b"// Build data=\"Name:v1,v2;...\" from series"
+        ));
+        assert!(!has_xor_intent(
+            b"10504 1900 10802 2169 L 11697 1363 C 11971"
+        ));
         assert!(!has_xor_intent(b"const greeting = `hello ${name}`;"));
         assert!(!has_xor_intent(b""));
     }
