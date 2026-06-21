@@ -291,3 +291,6 @@ debug = 2
 
 # Local-only override for cross-repo development against unpublished stng changes
 # (the stng-owned string cache API). Remove before committing — restore the git pin.
+
+[profile.dev]
+debug = "line-tables-only"
