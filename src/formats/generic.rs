@@ -14,14 +14,30 @@ pub(super) fn extract(
     _strings: &mut Strings,
     metrics: &mut Metrics,
 ) {
-    let file_entropy = entropy::shannon(bytes);
+    // One windowed pass yields both the whole-file entropy and the
+    // concealed-region signals below, so the file is read only once.
+    let scan = entropy::windowed(bytes);
     metrics.insert("file.size_bytes", bytes.len() as f64);
-    metrics.insert("file.entropy", file_entropy);
+    metrics.insert("file.entropy", scan.overall);
     // Whole-file Shannon entropy under the binary.* namespace too, so traits
     // thresholding on `binary.overall_entropy` work for every file type. The
     // png/jpeg extractors emit it from their own passes; this generalises it to
     // PE/ELF/data/unknown blobs (cleave previously recomputed it for Data files).
-    metrics.insert("binary.overall_entropy", file_entropy);
+    metrics.insert("binary.overall_entropy", scan.overall);
+
+    // Peak concentrated region. Whole-file and section entropy both average a
+    // small encrypted stage into its surroundings; this surfaces and locates
+    // the single most concentrated region for any file type. Pure measurement
+    // — the detection policy ("how high, how big, against what baseline") lives
+    // in the rules. The canonical tell is `peak_region_entropy` high while
+    // `overall_entropy` stays low (a blob concealed in low-entropy padding, or
+    // a base64 region inside readable source); `peak_region_offset` points an
+    // analyst straight at it.
+    if scan.peak_bytes > 0 {
+        metrics.insert("binary.peak_region_entropy", scan.peak_entropy);
+        metrics.insert("binary.peak_region_bytes", scan.peak_bytes as f64);
+        metrics.insert("binary.peak_region_offset", scan.peak_offset as f64);
+    }
 }
 
 #[cfg(test)]
@@ -102,5 +118,43 @@ mod tests {
         // All 0xff: also zero entropy (single-symbol alphabet).
         let m = run(&vec![0xffu8; 4096]);
         assert_eq!(m.get("file.entropy"), Some(0.0));
+    }
+
+    /// A low-entropy file still reports a peak region (the metric is pure
+    /// measurement), but `peak_region_entropy` is ~0 so no detection rule
+    /// keying on a high peak can fire.
+    #[test]
+    fn low_entropy_file_reports_low_peak() {
+        let m = run(&vec![0u8; 8192]);
+        assert!(m.get("binary.peak_region_entropy").unwrap() < 1.0);
+    }
+
+    /// The headline case: a cipher blob buried in zero padding stays
+    /// low-entropy whole-file, yet the peak-region metrics surface and
+    /// locate it — `peak_region_entropy` high while `overall_entropy` is low.
+    #[test]
+    fn concealed_blob_surfaces_peak_region_but_not_overall() {
+        let mut bytes = vec![0u8; 4096];
+        bytes.extend((0..4096).map(|i| (i % 256) as u8)); // uniform → 8.0
+        bytes.extend(vec![0u8; 4096]);
+        let m = run(&bytes);
+        assert!(m.get("binary.overall_entropy").unwrap() < 5.0);
+        assert!(m.get("binary.peak_region_entropy").unwrap() >= 7.5);
+        assert_eq!(m.get("binary.peak_region_bytes"), Some(4096.0));
+        assert_eq!(m.get("binary.peak_region_offset"), Some(4096.0));
+    }
+
+    /// Same mechanism on script-shaped input: a base64 region (~6.0) inside
+    /// readable text (~4.32) is located even though it never reaches 7.5.
+    #[test]
+    fn concealed_base64_region_in_script_text_is_located() {
+        let mut bytes: Vec<u8> = (0..4096).map(|i| (i % 20) as u8).collect(); // text
+        bytes.extend((0..2048).map(|i| (i % 64) as u8)); // base64 blob
+        bytes.extend((0..4096).map(|i| (i % 20) as u8)); // more text
+        let m = run(&bytes);
+        let peak = m.get("binary.peak_region_entropy").unwrap();
+        assert!((peak - 6.0).abs() < 0.1, "peak = {peak}");
+        assert_eq!(m.get("binary.peak_region_offset"), Some(4096.0));
+        assert_eq!(m.get("binary.peak_region_bytes"), Some(2048.0));
     }
 }
