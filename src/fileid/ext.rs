@@ -137,6 +137,11 @@ pub(crate) fn is_data_format(path: &Path) -> bool {
 fn detect_from_filename(path: &Path) -> Option<FileType> {
     let name = path.file_name()?.to_str()?;
 
+    // `<pkg>@<ver>.registry.json` — normalized registry metadata. Checked before
+    // the generic `.json` extension so the suffix wins over `FileType::Json`.
+    if ends_with_ci(name.as_bytes(), b".registry.json") {
+        return Some(FileType::Registry);
+    }
     if name.eq_ignore_ascii_case("package.json") {
         return Some(FileType::PackageJson);
     }
@@ -470,6 +475,19 @@ mod tests {
         assert_eq!(
             detect_from_path(Path::new("/foo/bar/package.json")),
             Some(FileType::PackageJson)
+        );
+    }
+
+    #[test]
+    fn registry_json_suffix_beats_generic_json() {
+        assert_eq!(
+            detect_from_path(Path::new("/tmp/left-pad@1.3.0.registry.json")),
+            Some(FileType::Registry)
+        );
+        // A plain .json is still generic, not a registry document.
+        assert_eq!(
+            detect_from_path(Path::new("/tmp/data.json")),
+            Some(FileType::Json)
         );
     }
 

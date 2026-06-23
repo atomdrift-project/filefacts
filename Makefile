@@ -14,7 +14,7 @@ CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 # cache across worktrees). Falls back to the cargo default `target` otherwise.
 CARGO_TARGET ?= $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 
-.PHONY: all build release install install-hooks test lint fmt clean help bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once
+.PHONY: all build release install install-hooks test lint fix fmt clean help bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once
 
 all: build
 
@@ -29,6 +29,7 @@ help: ## Show this help
 	@echo "  install-hooks      - Install the git pre-commit hook (lint+test+Cargo.toml check)"
 	@echo "  test               - Run all tests"
 	@echo "  lint               - Run rustfmt + clippy"
+	@echo "  fix                - Auto-fix clippy lints, then format with rustfmt"
 	@echo "  fmt                - Format code with rustfmt"
 	@echo "  bench-build        - Build the profiling-profile bench binary"
 	@echo "  sampled-benchmark  - Run the bench binary under samply"
@@ -75,6 +76,12 @@ test:
 	$(CARGO) test
 
 fmt:
+	$(CARGO) fmt --all
+
+# Auto-fix what clippy and rustfmt can fix on their own. Run fmt last so it
+# tidies any code clippy rewrote. Mirrors what `lint` checks.
+fix:
+	$(CARGO) clippy --fix --all-targets --all-features --allow-dirty --allow-staged
 	$(CARGO) fmt --all
 
 lint:

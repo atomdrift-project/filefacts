@@ -64,6 +64,7 @@ mod debug;
 mod error;
 mod formats;
 mod output;
+mod registry;
 mod scan;
 
 pub mod cache;
@@ -98,6 +99,7 @@ pub use output::{
     Metrics, ParseError, Party, PinnedHash, RefKind, RefLocator, Section, Sections, Signer, Span,
     SpanBuilder, Stage, Symbol, SymbolKind, Symbols, Text, Trust, Url, UrlKind, Values,
 };
+pub use registry::Registry;
 
 /// Schema version of the public output shape.
 ///

@@ -211,6 +211,7 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::Xml
         | FileType::PkgInfo
         | FileType::SrcInfo
+        | FileType::Registry
         | FileType::GoMod
         | FileType::GoSum
         | FileType::CargoLock
@@ -391,6 +392,10 @@ pub enum FileType {
     PkgInfo,
     /// Arch/AUR generated package metadata (.SRCINFO) — normalized mirror of PKGBUILD
     SrcInfo,
+    /// Normalized package-registry metadata (`*.registry.json`) — an upstream
+    /// provider's account of a release (publish date, author, downloads,
+    /// rating, deprecation), the serialized form of [`crate::Registry`].
+    Registry,
     /// Go module manifest (go.mod) — `require` directives are declared dependencies.
     GoMod,
     /// Go module checksum database (go.sum) — pins every module to an `h1:` hash.
@@ -665,6 +670,7 @@ impl FileType {
                 | Self::Plist
                 | Self::PkgInfo
                 | Self::SrcInfo
+                | Self::Registry
         )
     }
 }

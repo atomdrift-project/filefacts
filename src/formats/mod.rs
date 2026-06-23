@@ -77,6 +77,7 @@ mod pkgmeta;
 mod png;
 mod pyc;
 pub(crate) mod references;
+mod registry;
 mod rpm;
 mod rtf;
 mod rust_crate;
@@ -245,6 +246,7 @@ pub(crate) fn extract(
         FileType::Plist => structured::extract_plist(bytes, values),
         FileType::PkgInfo => structured::extract_pkginfo(bytes, values),
         FileType::SrcInfo => pkgmeta::extract_srcinfo(bytes, values),
+        FileType::Registry => registry::extract(bytes, values, metrics),
         FileType::Chm => chm::extract(bytes, values, strings, metrics),
         FileType::JavaClass => class::extract(bytes, values, strings, metrics, symbols),
         FileType::Jpeg => jpeg::extract(bytes, values, strings, metrics),
