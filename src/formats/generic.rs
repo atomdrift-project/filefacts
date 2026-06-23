@@ -4,7 +4,7 @@
 //! Shannon entropy. Runs before every format-specific extractor so the
 //! metric exists even for unrecognised inputs.
 
-use crate::output::{Metrics, Strings, Values};
+use crate::output::{Metrics, Span, Strings, Values};
 use crate::scan::entropy;
 
 /// Run the generic byte-level pass. Always succeeds.
@@ -31,12 +31,13 @@ pub(super) fn extract(
     // — the detection policy ("how high, how big, against what baseline") lives
     // in the rules. The canonical tell is `peak_region_entropy` high while
     // `overall_entropy` stays low (a blob concealed in low-entropy padding, or
-    // a base64 region inside readable source); `peak_region_offset` points an
-    // analyst straight at it.
+    // a base64 region inside readable source). The high-entropy runs travel
+    // with `peak_region_entropy` as its spans, so a finding can point an
+    // analyst straight at the bytes — no offset scalar to join against.
     if scan.peak_bytes > 0 {
-        metrics.insert("binary.peak_region_entropy", scan.peak_entropy);
+        let spans = scan.spans.iter().map(|&(offset, len)| Span { offset, len });
+        metrics.insert_located("binary.peak_region_entropy", scan.peak_entropy, spans);
         metrics.insert("binary.peak_region_bytes", scan.peak_bytes as f64);
-        metrics.insert("binary.peak_region_offset", scan.peak_offset as f64);
     }
 }
 
@@ -141,7 +142,11 @@ mod tests {
         assert!(m.get("binary.overall_entropy").unwrap() < 5.0);
         assert!(m.get("binary.peak_region_entropy").unwrap() >= 7.5);
         assert_eq!(m.get("binary.peak_region_bytes"), Some(4096.0));
-        assert_eq!(m.get("binary.peak_region_offset"), Some(4096.0));
+        // The blob's location travels with the fact, not as a separate metric.
+        assert_eq!(
+            m.fact("binary.peak_region_entropy").unwrap().spans,
+            vec![Span::new(4096, 4096)]
+        );
     }
 
     /// Same mechanism on script-shaped input: a base64 region (~6.0) inside
@@ -154,7 +159,10 @@ mod tests {
         let m = run(&bytes);
         let peak = m.get("binary.peak_region_entropy").unwrap();
         assert!((peak - 6.0).abs() < 0.1, "peak = {peak}");
-        assert_eq!(m.get("binary.peak_region_offset"), Some(4096.0));
         assert_eq!(m.get("binary.peak_region_bytes"), Some(2048.0));
+        assert_eq!(
+            m.fact("binary.peak_region_entropy").unwrap().spans,
+            vec![Span::new(4096, 2048)]
+        );
     }
 }

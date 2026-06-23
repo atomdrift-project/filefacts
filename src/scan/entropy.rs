@@ -64,6 +64,11 @@ pub(crate) const WINDOW_BYTES: usize = 1024;
 /// code (~6.2) never absorbs an adjacent cipher block (~8.0).
 const PEAK_TOLERANCE: f64 = 0.5;
 
+/// Cap on the number of run spans reported. The aggregate `peak_bytes` is
+/// always the full mass; `spans` is a bounded sample of the largest runs for
+/// localisation, so a pathologically fragmented file can't bloat the result.
+const MAX_SPANS: usize = 64;
+
 /// Per-file result of a single-pass windowed entropy scan.
 ///
 /// Whole-file and section-level entropy both average a small encrypted
@@ -72,7 +77,7 @@ const PEAK_TOLERANCE: f64 = 0.5;
 /// most concentrated region — measurement only, no verdict — while a shared
 /// accumulated histogram still yields the whole-file entropy. One pass over
 /// the bytes, no re-reads.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct WindowedEntropy {
     /// Shannon entropy of the whole file, folded from the same pass.
     pub overall: f64,
@@ -86,6 +91,10 @@ pub(crate) struct WindowedEntropy {
     /// File offset where the largest *contiguous* block of peak-level windows
     /// begins — the best single pointer at the concealed payload for triage.
     pub peak_offset: u64,
+    /// The contiguous peak-level runs as `(offset, len)` byte spans, largest
+    /// first, capped at [`MAX_SPANS`]. The provenance of the measurement —
+    /// where the high-entropy data physically is.
+    pub spans: Vec<(u64, u64)>,
 }
 
 /// Scan `bytes` in fixed [`WINDOW_BYTES`] windows, returning the whole-file
@@ -121,22 +130,43 @@ pub(crate) fn windowed(bytes: &[u8]) -> WindowedEntropy {
     let peak_entropy = windows.iter().copied().fold(0.0f64, f64::max);
     out.peak_entropy = peak_entropy;
     let floor = peak_entropy - PEAK_TOLERANCE;
-    let mut run_len = 0usize; // current contiguous run, in windows
-    let mut best_run = 0usize;
+
+    // Collect the contiguous runs of peak-level windows as byte spans. Each
+    // run's byte length is bounded by the file end so a short trailing window
+    // contributes its actual size, not a padded window.
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let mut start: Option<usize> = None;
+    let close = |s: usize, end_idx: usize, runs: &mut Vec<(u64, u64)>| {
+        let off = (s * WINDOW_BYTES) as u64;
+        let end = (end_idx * WINDOW_BYTES).min(bytes.len()) as u64;
+        runs.push((off, end - off));
+    };
     for (i, &e) in windows.iter().enumerate() {
         if e >= floor {
-            let start = i * WINDOW_BYTES;
-            let end = (start + WINDOW_BYTES).min(bytes.len());
-            out.peak_bytes += (end - start) as u64;
-            run_len += 1;
-            if run_len > best_run {
-                best_run = run_len;
-                out.peak_offset = ((i + 1 - run_len) * WINDOW_BYTES) as u64;
+            if start.is_none() {
+                start = Some(i);
             }
-        } else {
-            run_len = 0;
+        } else if let Some(s) = start.take() {
+            close(s, i, &mut runs);
         }
     }
+    if let Some(s) = start.take() {
+        close(s, windows.len(), &mut runs);
+    }
+
+    out.peak_bytes = runs.iter().map(|&(_, len)| len).sum();
+    // Largest run, ties broken toward the earliest offset.
+    let mut best_len = 0u64;
+    for &(off, len) in &runs {
+        if len > best_len {
+            best_len = len;
+            out.peak_offset = off;
+        }
+    }
+    // Report the largest runs first, bounded — the aggregate above is exact.
+    runs.sort_by_key(|&(_, len)| std::cmp::Reverse(len));
+    runs.truncate(MAX_SPANS);
+    out.spans = runs;
     out
 }
 
@@ -292,6 +322,34 @@ mod tests {
         assert!(w.peak_entropy > 7.9, "peak = {}", w.peak_entropy);
         assert_eq!(w.peak_bytes, (3 * WINDOW_BYTES) as u64);
         assert_eq!(w.peak_offset, 0);
+        // Each cipher window is its own run; spans localise all three.
+        assert_eq!(
+            w.spans,
+            vec![
+                (0, WINDOW_BYTES as u64),
+                (2 * WINDOW_BYTES as u64, WINDOW_BYTES as u64),
+                (4 * WINDOW_BYTES as u64, WINDOW_BYTES as u64),
+            ]
+        );
+    }
+
+    #[test]
+    fn windowed_spans_are_largest_first_and_capped() {
+        // One big run then a one-window run: spans are ordered by size, and a
+        // single contiguous block is reported as a single span.
+        let mut bytes = block(3 * WINDOW_BYTES, 256); // 3-window run
+        bytes.extend(vec![0u8; WINDOW_BYTES]); // gap
+        bytes.extend(block(WINDOW_BYTES, 256)); // 1-window run
+        let w = windowed(&bytes);
+        assert_eq!(
+            w.spans,
+            vec![
+                (0, 3 * WINDOW_BYTES as u64),
+                (4 * WINDOW_BYTES as u64, WINDOW_BYTES as u64),
+            ]
+        );
+        assert_eq!(w.peak_offset, 0);
+        assert_eq!(w.peak_bytes, (4 * WINDOW_BYTES) as u64);
     }
 
     #[test]

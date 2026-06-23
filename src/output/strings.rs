@@ -15,6 +15,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::Span;
+
 /// One extracted string with its offset and optional metadata.
 ///
 /// `offset` is the byte position of the first character within the
@@ -286,21 +288,112 @@ impl Strings {
     pub(crate) fn len(&self) -> usize {
         self.text.len() + self.literals.len()
     }
-    /// Each string's text across both tiers, in (text.ascii, text.utf16le,
-    /// literals) order. The `text` tier is stng-typed (`.value`); the
-    /// `literals` tier is filefacts-typed (`.text`) — so they're yielded as a
-    /// common `&str` rather than a shared row type.
-    pub(crate) fn text_values(&self) -> impl Iterator<Item = &str> {
-        self.text
-            .iter()
-            .map(|s| s.value.as_str())
-            .chain(self.literals.iter().map(|s| s.text.as_str()))
+    /// Each string paired with the source [`Span`] it was recovered from, in
+    /// (text.ascii, text.utf16le, literals) order.
+    ///
+    /// The span's *offset* is correct for locating the string in the file:
+    /// - a `StackString` is synthesised from scattered instructions, so its
+    ///   bytes are not contiguous at `data_offset` — anchor at the first source
+    ///   fragment instead of claiming a bogus run;
+    /// - a literal recovered by rizin inside a packed section reports its file
+    ///   offset in `paddr`, not the (slice-relative) `offset` — prefer `paddr`.
+    ///
+    /// The span's *length* is the decoded value's byte length: exact for byte
+    /// strings, an under-count for UTF-16LE / base64 (their encoded source is
+    /// longer). That matches how the string-length metrics are defined and the
+    /// rendered preview is capped regardless, so the approximation is bounded.
+    pub(crate) fn text_spans(&self) -> impl Iterator<Item = (Span, &str)> {
+        // stng records each string's exact source extent (encoded length,
+        // fragments for stack strings); `source_spans` returns it correctly for
+        // every encoding. Anchor at the first span — the largest interest for a
+        // single-anchor metric — falling back to the raw offset only for the
+        // degenerate empty-fragments case.
+        let text = self.text.iter().map(|s| {
+            let (off, len) = s
+                .source_spans()
+                .next()
+                .unwrap_or((s.data_offset, s.value.len() as u64));
+            (Span::new(off, len), s.value.as_str())
+        });
+        // The literals tier is filefacts-native (rizin-recovered, already
+        // decoded); its source length isn't tracked, so use the value length and
+        // the physical file offset (`paddr`) when the slice-relative `offset`
+        // doesn't address the file.
+        let literals = self.literals.iter().map(|s| {
+            let offset = s.paddr.unwrap_or(s.offset as u64);
+            (Span::new(offset, s.text.len() as u64), s.text.as_str())
+        });
+        text.chain(literals)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_spans_locate_each_string_kind_correctly() {
+        let text_rows: std::sync::Arc<[stng::ExtractedString]> = vec![
+            // StackString: source is scattered across instructions, so the span
+            // anchors at the first fragment — NOT the (non-contiguous) data_offset.
+            stng::ExtractedString {
+                value: "STACKSTR".into(),
+                data_offset: 9999,
+                method: stng::StringMethod::StackString,
+                fragments: Some(Box::new(vec![
+                    stng::StringFragment {
+                        offset: 0x100,
+                        length: 4,
+                    },
+                    stng::StringFragment {
+                        offset: 0x200,
+                        length: 4,
+                    },
+                ])),
+                ..Default::default()
+            },
+            // Plain byte-scan literal: span at its file offset.
+            stng::ExtractedString {
+                value: "plain".into(),
+                data_offset: 0x10,
+                method: stng::StringMethod::RawScan,
+                ..Default::default()
+            },
+        ]
+        .into();
+        let literals = Literals(vec![
+            // rizin-recovered inside a packed section: prefer the physical
+            // file offset (paddr) over the slice-relative offset.
+            ExtractedString {
+                text: "packed".into(),
+                offset: 7,
+                paddr: Some(0x500),
+                ..Default::default()
+            },
+            // ordinary literal with no paddr: use offset.
+            ExtractedString {
+                text: "lit".into(),
+                offset: 0x40,
+                ..Default::default()
+            },
+        ]);
+        let strings = Strings {
+            text: Text::from_rows(text_rows),
+            literals,
+            comments: Comments::new(),
+            text_key: None,
+        };
+        let spans: Vec<(Span, &str)> = strings.text_spans().collect();
+        assert_eq!(
+            spans,
+            vec![
+                (Span::new(0x100, 4), "STACKSTR"), // first fragment, not (9999, 8)
+                (Span::new(0x10, 5), "plain"),
+                (Span::new(0x500, 6), "packed"), // paddr, not offset 7
+                (Span::new(0x40, 3), "lit"),
+            ]
+        );
+    }
 
     #[test]
     fn text_iter_walks_both_encodings() {

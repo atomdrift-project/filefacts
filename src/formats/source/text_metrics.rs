@@ -10,7 +10,11 @@
 //! `TextMetrics` struct and flattened it into a metric map; here we
 //! emit straight into [`Metrics`] under the canonical `text.*` keys.
 
-use crate::output::Metrics;
+use crate::output::{Metrics, Span, SpanBuilder};
+
+/// Cap on the number of invisible-character runs reported. The count metric
+/// is exact; the spans are a bounded sample for localisation (prism).
+const MAX_INVISIBLE_SPANS: usize = 64;
 
 /// Emit `text.*` metrics computed from `content`.
 ///
@@ -174,7 +178,16 @@ fn emit_line_metrics(content: &str, metrics: &mut Metrics) {
 
     metrics.insert("text.total_lines", f64::from(total_lines));
     metrics.insert("text.avg_line_length", mean);
-    metrics.insert("text.max_line_length", f64::from(max_line_length));
+    // Locate the longest line (minified/obfuscated payload tell). Isolated pass
+    // so the metric loop above is untouched; `split_inclusive('\n')` plus the
+    // same `\r\n` strip `.lines()` performs makes the length match exactly, and
+    // accumulating `raw.len()` (terminator included) gives the true byte offset.
+    match longest_line_span(content, max_line_length) {
+        Some(span) => {
+            metrics.insert_located("text.max_line_length", f64::from(max_line_length), [span])
+        }
+        None => metrics.insert("text.max_line_length", f64::from(max_line_length)),
+    }
     if total_lines > 0 {
         let stddev = (m2 / f64::from(total_lines)).sqrt();
         if stddev > 0.0 {
@@ -225,6 +238,7 @@ fn emit_char_metrics(content: &str, metrics: &mut Metrics) {
     let mut spaces = 0u32;
     let mut unusual_whitespace = 0u32;
     let mut invisible_chars = 0u32;
+    let mut invisible_spans = SpanBuilder::with_cap(MAX_INVISIBLE_SPANS);
     let mut current_token_bytes = 0usize;
     let mut long_token_count = 0u32;
     let mut prev_char = None;
@@ -234,7 +248,7 @@ fn emit_char_metrics(content: &str, metrics: &mut Metrics) {
     let mut alphanumeric = 0usize;
     let mut is_first_char = true;
 
-    for c in content.chars() {
+    for (byte_pos, c) in content.char_indices() {
         if c.is_whitespace() {
             whitespace_count += 1;
             match c {
@@ -255,6 +269,9 @@ fn emit_char_metrics(content: &str, metrics: &mut Metrics) {
 
         if is_invisible_char(c, is_first_char) {
             invisible_chars = invisible_chars.saturating_add(1);
+            // Coalesce a contiguous run of invisible chars into one span (a
+            // zero-width run is a single stego payload); the cap bounds runs.
+            invisible_spans.push(byte_pos as u64, c.len_utf8() as u64);
         }
 
         if c.is_ascii_digit() {
@@ -304,7 +321,13 @@ fn emit_char_metrics(content: &str, metrics: &mut Metrics) {
         metrics.insert("text.unusual_whitespace", f64::from(unusual_whitespace));
     }
     if invisible_chars > 0 {
-        metrics.insert("text.invisible_chars", f64::from(invisible_chars));
+        // Located: the byte positions of the hidden characters travel with the
+        // count so a finding (Trojan Source / zero-width stego) points at them.
+        metrics.insert_located(
+            "text.invisible_chars",
+            f64::from(invisible_chars),
+            invisible_spans.into_spans(),
+        );
     }
     if long_token_count > 0 {
         metrics.insert("text.long_token_count", f64::from(long_token_count));
@@ -379,6 +402,27 @@ fn emit_escape_metrics(content: &str, metrics: &mut Metrics) {
             (f64::from(total_escapes) / len as f64) * 100.0,
         );
     }
+}
+
+/// Byte span of the first line whose length equals `max_len`. `None` when
+/// `max_len` is 0 (no non-empty line to point at). Mirrors `str::lines` line
+/// boundaries — split on `\n`, strip a trailing `\r` — so the length compared
+/// here matches the value the metric loop computed, while accumulating the
+/// terminator-inclusive `raw.len()` yields the true line-start byte offset.
+fn longest_line_span(content: &str, max_len: u32) -> Option<Span> {
+    if max_len == 0 {
+        return None;
+    }
+    let mut off = 0usize;
+    for raw in content.split_inclusive('\n') {
+        let line = raw.strip_suffix('\n').unwrap_or(raw);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.len() as u32 == max_len {
+            return Some(Span::new(off as u64, line.len() as u64));
+        }
+        off += raw.len();
+    }
+    None
 }
 
 fn scan_line_whitespace(line: &str) -> (bool, bool, u32) {
@@ -461,6 +505,53 @@ mod tests {
     fn empty_content_emits_nothing() {
         let m = run("");
         assert!(m.is_empty());
+    }
+
+    #[test]
+    fn invisible_chars_carry_their_byte_positions() {
+        // "ab<ZWSP>cd<ZWJ>ef": ZWSP (U+200B, 3 bytes) at byte 2, ZWJ (U+200D)
+        // at byte 7. The count is exact and the spans pinpoint each char.
+        let m = run("ab\u{200B}cd\u{200D}ef");
+        assert_eq!(m.get("text.invisible_chars"), Some(2.0));
+        assert_eq!(
+            m.fact("text.invisible_chars").unwrap().spans,
+            vec![Span::new(2, 3), Span::new(7, 3)]
+        );
+    }
+
+    #[test]
+    fn max_line_length_locates_the_longest_line() {
+        // "ab\nABCDE\nx": longest line "ABCDE" (5) starts at byte 3.
+        let m = run("ab\nABCDE\nx");
+        assert_eq!(m.get("text.max_line_length"), Some(5.0));
+        assert_eq!(
+            m.fact("text.max_line_length").unwrap().spans,
+            vec![Span::new(3, 5)]
+        );
+    }
+
+    #[test]
+    fn max_line_length_offset_survives_crlf() {
+        // CRLF terminators: "a\r\nLONGER\r\n" → "LONGER" (6) starts at byte 3
+        // ("a"=1 + "\r\n"=2). Locks the terminator-byte accounting.
+        let m = run("a\r\nLONGER\r\n");
+        assert_eq!(m.get("text.max_line_length"), Some(6.0));
+        assert_eq!(
+            m.fact("text.max_line_length").unwrap().spans,
+            vec![Span::new(3, 6)]
+        );
+    }
+
+    #[test]
+    fn adjacent_invisible_chars_coalesce_into_one_span() {
+        // "a<ZWSP><ZWSP>b": two ZWSP (U+200B, 3 bytes each) at bytes 1 and 4 —
+        // contiguous, so one span [1, 6); the count still reflects both chars.
+        let m = run("a\u{200B}\u{200B}b");
+        assert_eq!(m.get("text.invisible_chars"), Some(2.0));
+        assert_eq!(
+            m.fact("text.invisible_chars").unwrap().spans,
+            vec![Span::new(1, 6)]
+        );
     }
 
     #[test]

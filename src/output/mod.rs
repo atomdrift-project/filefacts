@@ -30,6 +30,7 @@ mod identity;
 mod metrics;
 mod references;
 mod sections;
+mod spans;
 mod strings;
 mod symbols;
 mod values;
@@ -37,9 +38,10 @@ mod values;
 pub use archive::{ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership};
 pub use errors::{ErrorKind, Errors, ParseError, Stage};
 pub use identity::{Claim, Identity, Party, Signer, Trust, Url, UrlKind};
-pub use metrics::Metrics;
+pub use metrics::{Fact, Metrics};
 pub use references::{ExternalRef, HashAlgo, PinnedHash, RefKind, RefLocator};
 pub use sections::{Section, Sections};
+pub use spans::{Span, SpanBuilder};
 pub use strings::{Comments, ExtractedString, Literals, Text};
 // Crate-internal bundle of Text + Literals — used by format extractors
 // so they can push to either tier without juggling two parameters.

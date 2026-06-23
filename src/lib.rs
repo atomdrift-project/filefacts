@@ -94,9 +94,9 @@ pub use error::Error;
 pub use fileid::{FileId, FileType};
 pub use output::{
     ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Arg, ArgShape, Claim,
-    Comments, ErrorKind, Errors, ExternalRef, ExtractedString, HashAlgo, Identity, Literals,
-    Metrics, ParseError, Party, PinnedHash, RefKind, RefLocator, Section, Sections, Signer, Stage,
-    Symbol, SymbolKind, Symbols, Text, Trust, Url, UrlKind, Values,
+    Comments, ErrorKind, Errors, ExternalRef, ExtractedString, Fact, HashAlgo, Identity, Literals,
+    Metrics, ParseError, Party, PinnedHash, RefKind, RefLocator, Section, Sections, Signer, Span,
+    SpanBuilder, Stage, Symbol, SymbolKind, Symbols, Text, Trust, Url, UrlKind, Values,
 };
 
 /// Schema version of the public output shape.
@@ -123,7 +123,15 @@ pub use output::{
 /// identity claims (name, identifier, project, signer, trust tier,
 /// authors, document title/producer, unique ids) folded out of the
 /// per-format structural values, each tagged claimed-vs-verified.
-pub const SCHEMA_VERSION: &str = "7";
+///
+/// **v8** — metrics gain byte-span provenance. A *located* metric (one
+/// measured from a specific region — `binary.peak_region_entropy`,
+/// `text.invisible_chars`, `sections.entropy_max`, …) now serializes as
+/// `{"value": n, "spans": [{"offset", "len"}, …]}` instead of a bare
+/// number; unlocated metrics are unchanged. This is a value-shape change,
+/// so a consumer parsing every metric as a number must handle the object
+/// form. `stng::ExtractedString` also gains a `data_len` source extent.
+pub const SCHEMA_VERSION: &str = "8";
 
 /// A file with its bytes and lazily-computed metadata views.
 ///
@@ -788,17 +796,26 @@ fn emit_section_metrics(sections: &Sections, metrics: &mut Metrics) {
     // `None` entries are SHT_NOBITS / BSS-style purely-virtual regions
     // and shouldn't pull the mean toward zero).
     let mut entropy_max = 0.0_f64;
+    let mut max_span: Option<Span> = None;
     let mut entropy_sum = 0.0_f64;
     let mut entropy_n = 0_u64;
     for s in sections {
         if let Some(e) = s.entropy {
-            entropy_max = entropy_max.max(e);
+            if max_span.is_none() || e > entropy_max {
+                entropy_max = e;
+                max_span = Some(Span::new(s.file_offset, s.file_size));
+            }
             entropy_sum += e;
             entropy_n += 1;
         }
     }
     if entropy_n > 0 {
-        metrics.insert("sections.entropy_max", entropy_max);
+        // Locate the peak-entropy section so a packer/encrypted-section finding
+        // can point at it; the mean has no single location.
+        match max_span {
+            Some(span) => metrics.insert_located("sections.entropy_max", entropy_max, [span]),
+            None => metrics.insert("sections.entropy_max", entropy_max),
+        }
         metrics.insert("sections.entropy_mean", entropy_sum / entropy_n as f64);
     }
 
@@ -904,6 +921,10 @@ fn is_well_known_section_name(name: &str) -> bool {
 ///   `binary.overlay_ratio`, `binary.overlay_entropy` — bytes beyond
 ///   the last on-disk section extent (PE installer droppers, ELF
 ///   self-extractors).
+/// Cap on located high-entropy string spans. The count metric is exact; the
+/// spans are a bounded sample for localisation.
+const MAX_STRING_SPANS: usize = 64;
+
 fn emit_binary_aggregates(
     sections: &Sections,
     strings: &output::Strings,
@@ -914,14 +935,19 @@ fn emit_binary_aggregates(
     let total = strings.len();
     if total > 0 {
         let mut max_len = 0_usize;
+        let mut max_string_span: Option<Span> = None;
         let mut sum_len = 0_usize;
         let mut high_entropy = 0_u64;
+        let mut high_entropy_spans = SpanBuilder::with_cap(MAX_STRING_SPANS);
         let mut sentence = 0_u64;
         // Collect lengths once; second pass below computes stddev.
         let mut lengths: Vec<usize> = Vec::with_capacity(total);
-        for s in strings.text_values() {
+        for (span, s) in strings.text_spans() {
             let len = s.len();
-            max_len = max_len.max(len);
+            if len > max_len {
+                max_len = len;
+                max_string_span = Some(span);
+            }
             sum_len = sum_len.saturating_add(len);
             lengths.push(len);
             // Shannon-entropy floor of 6.0 bits/byte separates random-
@@ -929,6 +955,7 @@ fn emit_binary_aggregates(
             // identifier-shaped text (~3–4.5).
             if scan::entropy::shannon(s.as_bytes()) >= 6.0 {
                 high_entropy += 1;
+                high_entropy_spans.push(span.offset, span.len);
             }
             if is_sentence_like(s) {
                 sentence += 1;
@@ -944,10 +971,19 @@ fn emit_binary_aggregates(
             .sum::<f64>()
             / total as f64;
         metrics.insert("binary.string_count", total as f64);
-        metrics.insert("binary.max_string_length", max_len as f64);
+        match max_string_span {
+            Some(span) => {
+                metrics.insert_located("binary.max_string_length", max_len as f64, [span])
+            }
+            None => metrics.insert("binary.max_string_length", max_len as f64),
+        }
         metrics.insert("binary.avg_string_length", avg);
         metrics.insert("binary.string_length_stddev", variance.sqrt());
-        metrics.insert("binary.high_entropy_string_count", high_entropy as f64);
+        metrics.insert_located(
+            "binary.high_entropy_string_count",
+            high_entropy as f64,
+            high_entropy_spans.into_spans(),
+        );
         metrics.insert("binary.sentence_string_count", sentence as f64);
         metrics.insert(
             "binary.sentence_string_ratio",
@@ -1028,9 +1064,12 @@ fn emit_binary_aggregates(
         let start = last_extent as usize;
         let end = bytes.len();
         if start < end {
-            metrics.insert(
+            // The overlay is appended payload (installer stub, SFX); carry its
+            // extent so a finding points past the last section.
+            metrics.insert_located(
                 "binary.overlay_entropy",
                 scan::entropy::shannon(&bytes[start..end]),
+                [Span::new(last_extent, overlay_size)],
             );
         }
     }
