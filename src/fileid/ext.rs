@@ -26,14 +26,19 @@ pub(crate) fn detect_from_path(path: &Path) -> Option<FileType> {
 
     // Archive multi-part extensions (check before single extension)
     let p = path_str.as_bytes();
-    if ends_with_ci(p, b".pkg.tar.zst") {
-        return Some(FileType::TarZst);
+    // Gentoo GLEP 78 binary package — must precede the `.tar` fallback.
+    if ends_with_ci(p, b".gpkg.tar") {
+        return Some(FileType::GentooBinpkg);
     }
-    if ends_with_ci(p, b".pkg.tar.xz") {
-        return Some(FileType::TarXz);
-    }
-    if ends_with_ci(p, b".pkg.tar.gz") {
-        return Some(FileType::TarGz);
+    // Arch packages: the `.pkg.tar.*` family is Arch-specific. The zstd/gzip
+    // bodies are confirmed by the `.PKGINFO` content scan; the xz body and the
+    // uncompressed `.pkg.tar` can't be read, so the extension is authoritative.
+    if ends_with_ci(p, b".pkg.tar.zst")
+        || ends_with_ci(p, b".pkg.tar.xz")
+        || ends_with_ci(p, b".pkg.tar.gz")
+        || ends_with_ci(p, b".pkg.tar")
+    {
+        return Some(FileType::PkgArch);
     }
     if ends_with_ci(p, b".crate") {
         return Some(FileType::Crate);
@@ -47,7 +52,10 @@ pub(crate) fn detect_from_path(path: &Path) -> Option<FileType> {
     if ends_with_ci(p, b".tar.xz") || ends_with_ci(p, b".txz") {
         return Some(FileType::TarXz);
     }
-    if ends_with_ci(p, b".tar.zst") || ends_with_ci(p, b".tzst") || ends_with_ci(p, b".xbps") {
+    if ends_with_ci(p, b".xbps") {
+        return Some(FileType::Xbps);
+    }
+    if ends_with_ci(p, b".tar.zst") || ends_with_ci(p, b".tzst") {
         return Some(FileType::TarZst);
     }
     if ends_with_ci(p, b".gem") {

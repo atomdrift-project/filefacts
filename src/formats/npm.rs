@@ -7,8 +7,8 @@
 //! identifier npm carries, so they are surfaced as structured fields the
 //! identity normalizer rolls up.
 //!
-//! Decompression stops at `package/package.json` — npm always packs it
-//! near the front — so a multi-megabyte tarball is never fully
+//! Decompression stops as soon as `package/package.json` is reached —
+//! usually near the front, so a multi-megabyte tarball is rarely fully
 //! inflated just to read one manifest.
 
 use std::io::Read;

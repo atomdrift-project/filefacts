@@ -62,6 +62,7 @@ mod macho_hashes;
 mod markdown;
 mod npm;
 mod nupkg;
+mod oci;
 mod ole2;
 mod ooxml;
 mod pdf;
@@ -76,6 +77,7 @@ mod pickle;
 mod pkgmeta;
 mod png;
 mod pyc;
+mod python_sdist;
 pub(crate) mod references;
 mod registry;
 mod rpm;
@@ -88,6 +90,7 @@ mod upx;
 mod vba;
 pub(crate) mod vba_symbols;
 mod vsix;
+mod wasm;
 mod whl;
 mod xpi;
 mod zip;
@@ -119,6 +122,7 @@ pub(crate) fn extract(
     let result = match file_type {
         FileType::Pe => pe::extract(bytes, values, strings, metrics, sections, symbols, errors),
         FileType::Elf => elf::extract(bytes, values, strings, metrics, sections, symbols, errors),
+        FileType::Wasm => wasm::extract(bytes, values, strings, metrics, sections, symbols, errors),
         FileType::MachO => {
             macho::extract(bytes, values, strings, metrics, sections, symbols, errors)
         }
@@ -193,14 +197,34 @@ pub(crate) fn extract(
             zip::extract_from_archive(&mut archive, bytes, values, metrics, archive_members)?;
             whl::extract_from_archive(&mut archive, values, metrics)
         }
-        FileType::Tar | FileType::TarGz | FileType::TarBz2 | FileType::TarXz | FileType::TarZst => {
+        // Plain and Gentoo binpkg tars are uncompressed — walked in full.
+        // Gentoo's nested `metadata.tar.*`/`image.tar.*` identity isn't cheap
+        // to reach, so it stops at the member listing for now.
+        FileType::Tar
+        | FileType::TarGz
+        | FileType::TarBz2
+        | FileType::TarXz
+        | FileType::TarZst
+        | FileType::GentooBinpkg => {
             tar::extract(bytes, file_type, values, metrics, archive_members)
         }
-        // Compressed-tar packages (Alpine apk, FreeBSD/Arch pkg): same
-        // handling as the other compressed-tar variants — format label only;
-        // cleave decompresses and re-submits the members.
-        FileType::ApkAlpine | FileType::PkgFreebsd | FileType::PkgArch => {
+        // Compressed-tar packages (Alpine apk, FreeBSD/Arch pkg, Void xbps):
+        // same handling as the other compressed-tar variants — format label
+        // only; cleave decompresses and re-submits the members. Void's
+        // `props.plist` identity needs a plist parse, deferred for now.
+        FileType::ApkAlpine | FileType::PkgFreebsd | FileType::PkgArch | FileType::Xbps => {
             tar::extract(bytes, file_type, values, metrics, archive_members)
+        }
+        // A Python sdist is a gzip tar: read `<root>/PKG-INFO` for the
+        // python.* publisher identity, then list members (format label only).
+        FileType::PythonSdist => {
+            python_sdist::extract(bytes, file_type, values, metrics, archive_members)
+        }
+        // An OCI/Docker image is an uncompressed tar: walk it for the member
+        // listing, then read the image manifest for the oci.* identity facts.
+        FileType::OciImage => {
+            tar::extract(bytes, file_type, values, metrics, archive_members)?;
+            oci::extract(bytes, values, metrics)
         }
         // A Rust `.crate` is a gzipped tar: walk it, then read the embedded
         // `Cargo.toml` for the crate.* publisher identity.

@@ -350,6 +350,10 @@ fn format_label(file_type: FileType) -> &'static str {
         FileType::Npm => "npm",
         FileType::Crate => "crate",
         FileType::PkgFreebsd | FileType::PkgArch => "pkg",
+        FileType::PythonSdist => "sdist",
+        FileType::OciImage => "oci",
+        FileType::Xbps => "xbps",
+        FileType::GentooBinpkg => "gpkg",
         // Plain `Tar` and any catch-all the dispatcher routes here.
         _ => "tar",
     }
@@ -383,6 +387,8 @@ fn open_archive(
             | FileType::Crate
             | FileType::PkgFreebsd
             | FileType::PkgArch
+            | FileType::PythonSdist
+            | FileType::Xbps
     ) {
         return Err(Error::malformed(
             "tar",

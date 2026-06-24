@@ -290,12 +290,19 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
                 } else if path_ends_with_ci(path, b".crate") {
                     // Cargo-specific extension; always a `<name>-<ver>/` gzip tar.
                     FileType::Crate
+                } else if path_ends_with_ci(path, b".pkg.tar.gz") {
+                    // Arch package with a gzip body; the `.pkg.tar.*` extension
+                    // is Arch-specific. Checked before the generic `.tar.gz`.
+                    FileType::PkgArch
                 } else if path_ends_with_ci(path, b".tar.gz") || path_ends_with_ci(path, b".tgz") {
-                    // npm publishes gzip tarballs with everything under a
-                    // `package/` prefix; that marker — not the generic
-                    // extension — is what identifies an npm package.
+                    // npm and Python sdists both publish gzip tarballs identified
+                    // by an interior marker, not the generic extension: npm puts
+                    // everything under `package/`, an sdist under a single
+                    // `<name>-<version>/` holding `PKG-INFO`.
                     if gzip_tar_is_npm(data) {
                         FileType::Npm
+                    } else if gzip_tar_is_sdist(data) {
+                        FileType::PythonSdist
                     } else {
                         FileType::TarGz
                     }
@@ -310,8 +317,11 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         0xFD => {
             // XZ: FD 37 7A 58
             if data.starts_with(b"\xfd7zX") {
-                let ft = if path_ends_with_ci(path, b".tar.xz") || path_ends_with_ci(path, b".txz")
-                {
+                let ft = if path_ends_with_ci(path, b".pkg.tar.xz") {
+                    // Arch package with an xz body. No xz decompressor is linked,
+                    // so the Arch-specific extension is authoritative here.
+                    FileType::PkgArch
+                } else if path_ends_with_ci(path, b".tar.xz") || path_ends_with_ci(path, b".txz") {
                     FileType::TarXz
                 } else {
                     FileType::Xz
@@ -359,9 +369,10 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
                     } else {
                         FileType::TarZst
                     }
-                } else if path_ends_with_ci(path, b".tar.zst")
-                    || path_ends_with_ci(path, b".tzst")
-                    || path_ends_with_ci(path, b".xbps")
+                } else if path_ends_with_ci(path, b".xbps") {
+                    // Void Linux package — a zstd tar; its extension is unique.
+                    FileType::Xbps
+                } else if path_ends_with_ci(path, b".tar.zst") || path_ends_with_ci(path, b".tzst")
                 {
                     FileType::TarZst
                 } else {
@@ -400,6 +411,15 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
 
     // ── Fallback checks (rare paths) ─────────────────────────────────
     // These are guarded by cheap pre-checks to avoid unnecessary work.
+
+    // Uncompressed tar carries no leading magic — the `ustar` signature sits at
+    // offset 257. Only OCI/Docker image tarballs are promoted from the generic
+    // `Tar` type here; any other tar falls through to the extension fallback.
+    if data.len() > 262 && &data[257..262] == b"ustar" {
+        if tar_is_oci_image(data) {
+            return Some((FileType::OciImage, DetectionSource::Magic));
+        }
+    }
 
     // Python bytecode (3.5+): XX 0D 0D 0A — first byte varies by version
     if data.len() >= 4 && data[1] == 0x0D && data[2] == 0x0D && data[3] == 0x0A {
@@ -466,23 +486,42 @@ fn is_freebsd_pkg_zstd(path: &Path, data: &[u8]) -> bool {
     let Ok(mut decoder) = zstd::stream::read::Decoder::new(data) else {
         return false;
     };
+    // `Read::read` may return fewer bytes than requested even when more are
+    // available, so fill the buffer in a loop rather than trusting one read —
+    // a short first read must not split the marker and downgrade a real package
+    // to a generic zstd tar. Stops early at EOF for streams shorter than 32 B.
     let mut prefix = [0u8; 32];
-    let Ok(n) = decoder.read(&mut prefix) else {
-        return false;
-    };
-    prefix[..n].starts_with(b"+COMPACT_MANIFEST") || prefix[..n].starts_with(b"+MANIFEST")
+    let mut filled = 0;
+    while filled < prefix.len() {
+        match decoder.read(&mut prefix[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(_) => return false,
+        }
+    }
+    let prefix = &prefix[..filled];
+    prefix.starts_with(b"+COMPACT_MANIFEST") || prefix.starts_with(b"+MANIFEST")
 }
 
-/// Peek a gzip tar's leading members (header names only) to decide whether the
-/// layout is an npm package: every entry under a `package/` prefix, with a
-/// `package/package.json` present. Bails on the first non-`package/` entry, so
-/// a non-npm gzip tar costs one header. Bounded to the first 16 members.
+/// How far detection will inflate a `.tgz` while looking for the npm manifest.
+/// Generous enough to scan past a reordered package's source tree, small enough
+/// that a `package/`-only gzip bomb can't make detection do unbounded work.
+const NPM_PEEK_LIMIT: u64 = 8 << 20;
+
+/// Peek a gzip tar's members to decide whether the layout is an npm package:
+/// every entry under a `package/` prefix, with a `package/package.json`
+/// present. Bails on the first non-`package/` entry, so a non-npm gzip tar
+/// costs one header. The manifest usually sits near the front, but some packers
+/// order it after the source tree, so we scan the whole `package/` layout —
+/// bounded by [`NPM_PEEK_LIMIT`] decompressed bytes so a crafted `package/`-only
+/// stream can't make detection inflate without limit.
 fn gzip_tar_is_npm(data: &[u8]) -> bool {
-    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(data));
+    let reader = flate2::read::GzDecoder::new(data).take(NPM_PEEK_LIMIT);
+    let mut archive = tar::Archive::new(reader);
     let Ok(entries) = archive.entries() else {
         return false;
     };
-    for entry in entries.take(24) {
+    for entry in entries {
         let Ok(entry) = entry else { return false };
         // Tar metadata headers (pax/GNU long-name) aren't real members.
         if matches!(
@@ -510,6 +549,88 @@ fn gzip_tar_is_npm(data: &[u8]) -> bool {
             return false;
         }
         if trimmed == "package/package.json" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Peek a gzip tar's members to decide whether the layout is a Python source
+/// distribution: every entry under a single `<name>-<version>/` root, with a
+/// `<root>/PKG-INFO` present. Bails on the first entry outside that root, so a
+/// non-sdist gzip tar costs one header. Bounded by [`NPM_PEEK_LIMIT`] bytes.
+fn gzip_tar_is_sdist(data: &[u8]) -> bool {
+    let reader = flate2::read::GzDecoder::new(data).take(NPM_PEEK_LIMIT);
+    let mut archive = tar::Archive::new(reader);
+    let Ok(entries) = archive.entries() else {
+        return false;
+    };
+    let mut root: Option<String> = None;
+    for entry in entries {
+        let Ok(entry) = entry else { return false };
+        if matches!(
+            entry.header().entry_type(),
+            tar::EntryType::XGlobalHeader
+                | tar::EntryType::XHeader
+                | tar::EntryType::GNULongName
+                | tar::EntryType::GNULongLink
+        ) {
+            continue;
+        }
+        let Ok(path) = entry.path() else { continue };
+        let path = path.to_string_lossy();
+        let trimmed = path.trim_end_matches('/');
+        let basename = trimmed.rsplit('/').next().unwrap_or(trimmed);
+        // Skip macOS AppleDouble sidecars that `tar` smuggles in.
+        if basename.starts_with("._") {
+            continue;
+        }
+        // An sdist is a single top-level directory; a second top-level entry
+        // means this is some other gzip tar.
+        let top = trimmed.split('/').next().unwrap_or(trimmed);
+        match &root {
+            None => root = Some(top.to_string()),
+            Some(r) if r != top => return false,
+            Some(_) => {}
+        }
+        // `PKG-INFO` sitting directly under the root is the sdist marker.
+        if basename == "PKG-INFO" && trimmed.split('/').count() == 2 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Peek an uncompressed tar's members for the markers that distinguish an
+/// OCI image layout (`oci-layout` + `index.json`) or a `docker save` bundle
+/// (`manifest.json` + `repositories`, layer tars, or a `blobs/` tree) from a
+/// generic tar. Bounded to the first 512 members; the in-memory tar is
+/// seekable, so each member costs only its header. Requires the structural
+/// pair, not a lone `manifest.json`, to avoid matching an ordinary tar.
+fn tar_is_oci_image(data: &[u8]) -> bool {
+    let mut archive = tar::Archive::new(std::io::Cursor::new(data));
+    let Ok(entries) = archive.entries() else {
+        return false;
+    };
+    let (mut oci_layout, mut index_json) = (false, false);
+    let (mut manifest_json, mut docker_layers) = (false, false);
+    for entry in entries.take(512) {
+        let Ok(entry) = entry else { return false };
+        let Ok(path) = entry.path() else { continue };
+        let path = path.to_string_lossy();
+        let name = path.trim_start_matches("./");
+        match name {
+            "oci-layout" => oci_layout = true,
+            "index.json" => index_json = true,
+            "manifest.json" => manifest_json = true,
+            "repositories" => docker_layers = true,
+            _ => {
+                if name.ends_with("/layer.tar") || name.starts_with("blobs/") {
+                    docker_layers = true;
+                }
+            }
+        }
+        if (oci_layout && index_json) || (manifest_json && docker_layers) {
             return true;
         }
     }
@@ -1188,6 +1309,109 @@ mod tests {
         assert_eq!(ft, FileType::PkgFreebsd);
     }
 
+    /// Build a gzip-compressed tar from `(path, body)` members.
+    fn build_gzip_tar(members: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut tar = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar);
+            for (path, body) in members {
+                let mut h = tar::Header::new_ustar();
+                h.set_path(path).unwrap();
+                h.set_size(body.len() as u64);
+                h.set_cksum();
+                b.append(&h, &body[..]).unwrap();
+            }
+            b.finish().unwrap();
+        }
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(&tar).unwrap();
+        e.finish().unwrap()
+    }
+
+    /// Build an uncompressed tar from `(path, body)` members.
+    fn build_plain_tar(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tar = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar);
+            for (path, body) in members {
+                let mut h = tar::Header::new_ustar();
+                h.set_path(path).unwrap();
+                h.set_size(body.len() as u64);
+                h.set_cksum();
+                b.append(&h, &body[..]).unwrap();
+            }
+            b.finish().unwrap();
+        }
+        tar
+    }
+
+    #[test]
+    fn python_sdist_detected_by_pkg_info() {
+        let gz = build_gzip_tar(&[
+            ("requests-2.31.0/setup.py", b"setup()"),
+            ("requests-2.31.0/requests/__init__.py", b"# pkg"),
+            ("requests-2.31.0/PKG-INFO", b"Name: requests\n"),
+        ]);
+        let (ft, _) = detect_from_content(Path::new("requests-2.31.0.tar.gz"), &gz).unwrap();
+        assert_eq!(ft, FileType::PythonSdist);
+
+        // A single-rooted gzip tar without PKG-INFO stays a generic tar.gz.
+        let plain = build_gzip_tar(&[("proj-1.0/README", b"hi"), ("proj-1.0/main.c", b"int")]);
+        let (ft, _) = detect_from_content(Path::new("proj-1.0.tar.gz"), &plain).unwrap();
+        assert_eq!(ft, FileType::TarGz);
+    }
+
+    #[test]
+    fn arch_pkg_non_zstd_by_extension() {
+        // The `.pkg.tar.{xz,gz}` extension is Arch-specific; content can't always
+        // be read (no xz decompressor), so the extension is authoritative.
+        let gz = build_gzip_tar(&[
+            (".PKGINFO", b"pkgname = foo\n"),
+            ("usr/bin/foo", b"\x7fELF"),
+        ]);
+        let (ft, _) = detect_from_content(Path::new("foo-1.0-1-x86_64.pkg.tar.gz"), &gz).unwrap();
+        assert_eq!(ft, FileType::PkgArch);
+
+        let xz = b"\xfd7zXZ\x00\x00\x00rest-of-stream";
+        let (ft, _) = detect_from_content(Path::new("foo-1.0-1-x86_64.pkg.tar.xz"), xz).unwrap();
+        assert_eq!(ft, FileType::PkgArch);
+    }
+
+    #[test]
+    fn oci_layout_and_docker_save_detected() {
+        // OCI image layout: oci-layout + index.json.
+        let oci = build_plain_tar(&[
+            ("oci-layout", br#"{"imageLayoutVersion":"1.0.0"}"#),
+            ("index.json", br#"{"manifests":[]}"#),
+            ("blobs/sha256/abc", b"blob"),
+        ]);
+        let (ft, _) = detect_from_content(Path::new("image.tar"), &oci).unwrap();
+        assert_eq!(ft, FileType::OciImage);
+
+        // docker save bundle: manifest.json + a layer tar.
+        let docker = build_plain_tar(&[
+            ("deadbeef/layer.tar", b"layer"),
+            ("config.json", b"{}"),
+            ("manifest.json", br#"[{"RepoTags":["x:1"]}]"#),
+        ]);
+        let (ft, _) = detect_from_content(Path::new("saved.tar"), &docker).unwrap();
+        assert_eq!(ft, FileType::OciImage);
+
+        // A plain tar with neither marker pair stays a generic tar.
+        let plain = build_plain_tar(&[("README", b"hi"), ("src/main.rs", b"fn main(){}")]);
+        assert!(detect_from_content(Path::new("plain.tar"), &plain).is_none());
+    }
+
+    #[test]
+    fn pkg_zstd_without_manifest_is_not_freebsd() {
+        // A `.pkg`-named zstd stream whose leading bytes aren't the FreeBSD
+        // manifest marker must not be claimed as a FreeBSD package.
+        let data = zstd::encode_all(&b"usr/local/bin/whatever\0payload"[..], 3).unwrap();
+        let (ft, _) = detect_from_content(Path::new("notpkg.pkg"), &data).unwrap();
+        assert_eq!(ft, FileType::Zst);
+    }
+
     #[test]
     fn crate_is_gzip_tar() {
         // `.crate` is cargo-specific; gzip magic + extension suffices.
@@ -1243,6 +1467,66 @@ mod tests {
             e.finish().unwrap()
         };
         let (ft, _) = detect_from_content(Path::new("blob.tgz"), &plain).unwrap();
+        assert_eq!(ft, FileType::TarGz);
+    }
+
+    #[test]
+    fn npm_tgz_with_manifest_after_source_tree() {
+        // Some packers order `package/package.json` after the whole source
+        // tree instead of near the front. Detection must still scan past those
+        // entries rather than give up on a fixed member budget.
+        let mut tar = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar);
+            for i in 0..40 {
+                let body = b"// source\n";
+                let mut h = tar::Header::new_ustar();
+                h.set_path(format!("package/lib/file{i}.js")).unwrap();
+                h.set_size(body.len() as u64);
+                h.set_cksum();
+                b.append(&h, &body[..]).unwrap();
+            }
+            let body = br#"{"name":"demo","version":"1.0.0"}"#;
+            let mut h = tar::Header::new_ustar();
+            h.set_path("package/package.json").unwrap();
+            h.set_size(body.len() as u64);
+            h.set_cksum();
+            b.append(&h, &body[..]).unwrap();
+            b.finish().unwrap();
+        }
+        let gz = {
+            use std::io::Write;
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(&tar).unwrap();
+            e.finish().unwrap()
+        };
+        let (ft, _) = detect_from_content(Path::new("demo-1.0.0.tgz"), &gz).unwrap();
+        assert_eq!(ft, FileType::Npm);
+    }
+
+    #[test]
+    fn package_layout_without_manifest_stays_targz() {
+        // Everything under `package/` but no `package/package.json` is not a
+        // valid npm package — it must fall back to a generic gzip tar rather
+        // than being mislabeled npm.
+        let mut tar = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar);
+            let body = b"data";
+            let mut h = tar::Header::new_ustar();
+            h.set_path("package/readme.txt").unwrap();
+            h.set_size(body.len() as u64);
+            h.set_cksum();
+            b.append(&h, &body[..]).unwrap();
+            b.finish().unwrap();
+        }
+        let gz = {
+            use std::io::Write;
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(&tar).unwrap();
+            e.finish().unwrap()
+        };
+        let (ft, _) = detect_from_content(Path::new("blob.tgz"), &gz).unwrap();
         assert_eq!(ft, FileType::TarGz);
     }
 

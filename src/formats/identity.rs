@@ -63,6 +63,8 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Iden
         FileType::Gem => gem(values, &mut id),
         FileType::Npm | FileType::PackageJson => npm(values, &mut id),
         FileType::Crate => rust_crate(values, &mut id),
+        FileType::PythonSdist => python_sdist(values, &mut id),
+        FileType::OciImage => oci(values, &mut id),
         FileType::Crx => crx(values, &mut id),
         FileType::Ooxml | FileType::OleDoc => office(values, &mut id),
         FileType::Pdf => pdf(values, &mut id),
@@ -477,6 +479,51 @@ fn rust_crate(values: &Values, id: &mut Identity) {
     }
     if let Some(home) = get_str(values, "crate.homepage") {
         push_url(id, UrlKind::Homepage, home, "crate.homepage");
+    }
+}
+
+fn python_sdist(values: &Values, id: &mut Identity) {
+    if let Some(name) = get_str(values, "python.name") {
+        id.name = Some(Claim::claimed(name, "python.name"));
+        id.identifier = Some(Claim::claimed(name, "python.name"));
+    }
+    if let Some(version) = get_str(values, "python.version") {
+        id.version = Some(Claim::claimed(version, "python.version"));
+    }
+    push_author(
+        id,
+        get_str(values, "python.author.name").map(str::to_string),
+        get_str(values, "python.author.email").map(str::to_string),
+        None,
+        "author",
+        "python.author",
+    );
+    push_author(
+        id,
+        get_str(values, "python.maintainer.name").map(str::to_string),
+        get_str(values, "python.maintainer.email").map(str::to_string),
+        None,
+        "maintainer",
+        "python.maintainer",
+    );
+    if let Some(home) = get_str(values, "python.homepage") {
+        push_url(id, UrlKind::Homepage, home, "python.homepage");
+    }
+}
+
+fn oci(values: &Values, id: &mut Identity) {
+    // The first image ref is the closest thing an image bundle has to a name;
+    // the config/manifest digest is its strongest unique identifier.
+    if let Some(first_ref) = str_array(values, "oci.ref").next() {
+        id.name = Some(Claim::claimed(first_ref, "oci.ref"));
+    }
+    if let Some(digest) = str_array(values, "oci.config.digest")
+        .next()
+        .or_else(|| str_array(values, "oci.manifest.digest").next())
+    {
+        id.identifier = Some(Claim::claimed(digest, "oci.config.digest"));
+        id.unique_ids
+            .insert("oci_digest".into(), digest.to_string());
     }
 }
 

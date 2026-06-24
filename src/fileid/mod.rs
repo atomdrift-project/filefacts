@@ -260,6 +260,10 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::Vsix
         | FileType::PkgFreebsd
         | FileType::PkgArch
+        | FileType::PythonSdist
+        | FileType::OciImage
+        | FileType::Xbps
+        | FileType::GentooBinpkg
         | FileType::Asar => "archive",
         FileType::Rtf | FileType::OleDoc | FileType::Ooxml | FileType::Pdf | FileType::Odf => {
             "document"
@@ -497,9 +501,27 @@ pub enum FileType {
     /// `.pkg` by container magic (zstd-tar vs `xar!`) and from Arch by the
     /// `+MANIFEST` marker.
     PkgFreebsd,
-    /// Arch Linux package (.pkg.tar.zst) — zstd-compressed tar whose first
-    /// member is `.PKGINFO`. Disambiguated from FreeBSD by that marker.
+    /// Arch Linux package (.pkg.tar.{zst,xz,gz}) — compressed tar whose first
+    /// member is `.PKGINFO`. Disambiguated from FreeBSD by that marker; the
+    /// `.pkg.tar.*` extension is Arch-specific where the body can't be read.
     PkgArch,
+    /// Python source distribution (sdist) — gzip tar laid out as
+    /// `<name>-<version>/` with a `PKG-INFO` metadata file at its root.
+    /// Disambiguated from a generic gzip tar by that marker, so the PyPI
+    /// publisher identity (`python.*`) routes to its own model.
+    PythonSdist,
+    /// OCI / Docker container image archive — an (uncompressed) tar carrying
+    /// either an OCI `oci-layout` + `index.json` or a `docker save`
+    /// `manifest.json`. Distinct from a generic tar so image refs and content
+    /// digests can be surfaced as `oci.*`.
+    OciImage,
+    /// Void Linux package (.xbps) — zstd-compressed tar carrying `props.plist`
+    /// metadata. Distinguished from a generic `.tar.zst` by its extension.
+    Xbps,
+    /// Gentoo binary package (GLEP 78 `.gpkg.tar`) — an uncompressed tar
+    /// bundling `metadata.tar.*`, `image.tar.*`, and a `Manifest`. Distinct
+    /// from a generic tar by its `.gpkg.tar` extension.
+    GentooBinpkg,
     /// Electron ASAR application archive (.asar)
     Asar,
     /// AppleScript source file (.applescript, .scpt)
@@ -595,6 +617,10 @@ impl FileType {
                 | Self::Vsix
                 | Self::PkgFreebsd
                 | Self::PkgArch
+                | Self::PythonSdist
+                | Self::OciImage
+                | Self::Xbps
+                | Self::GentooBinpkg
                 | Self::Asar
                 | Self::Jar
         )
@@ -855,7 +881,13 @@ fn is_benign_extension_mismatch(path: &Path, data: &[u8], det: Detection) -> boo
     // being an archive — a benign refinement, not a masquerade.
     if matches!(
         content,
-        FileType::Npm | FileType::PkgFreebsd | FileType::PkgArch
+        FileType::Npm
+            | FileType::PkgFreebsd
+            | FileType::PkgArch
+            | FileType::PythonSdist
+            | FileType::OciImage
+            | FileType::Xbps
+            | FileType::GentooBinpkg
     ) && ext_type.is_archive()
     {
         return true;
@@ -1668,6 +1700,18 @@ message CommandMessage {
     }
 
     #[test]
+    fn specialized_package_extensions() {
+        // Void and Gentoo packages resolve through the extension fallback to
+        // their own ecosystem types, not generic tar/tar.zst.
+        assert_ext("zlib-1.3_1.x86_64.xbps", FileType::Xbps);
+        assert_ext("app-1.0-1.gpkg.tar", FileType::GentooBinpkg);
+        // The Arch `.pkg.tar.*` family maps to PkgArch by extension.
+        assert_ext("foo-1.0-1-x86_64.pkg.tar.zst", FileType::PkgArch);
+        assert_ext("foo-1.0-1-x86_64.pkg.tar.xz", FileType::PkgArch);
+        assert_ext("foo-1.0-1-x86_64.pkg.tar", FileType::PkgArch);
+    }
+
+    #[test]
     fn apk_split_is_not_an_extension_mismatch() {
         // Both `.apk` ecosystems are content-detected away from the extension's
         // zip default, but that disambiguation is benign — not an evasion flag.
@@ -1699,6 +1743,10 @@ message CommandMessage {
             FileType::Dmg,
             FileType::PkgFreebsd,
             FileType::PkgArch,
+            FileType::PythonSdist,
+            FileType::OciImage,
+            FileType::Xbps,
+            FileType::GentooBinpkg,
         ] {
             assert!(ft.is_archive(), "{ft:?} should be an archive");
             assert_eq!(file_group(ft), "archive", "{ft:?} group");
