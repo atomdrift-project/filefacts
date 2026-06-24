@@ -92,7 +92,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 pub use error::Error;
-pub use fileid::{FileId, FileType};
+pub use fileid::{ArchiveFormat, Compression, Container, FileId, FileType, container_of};
 pub use output::{
     ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Arg, ArgShape, Claim,
     Comments, ErrorKind, Errors, ExternalRef, ExtractedString, Fact, HashAlgo, Identity, Literals,

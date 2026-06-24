@@ -19,9 +19,12 @@
 //! assert_eq!(id.file_type(), FileType::Elf);
 //! ```
 
+pub mod container;
 mod ext;
 mod heuristics;
 mod magic;
+
+pub use container::{ArchiveFormat, Compression, Container, container_of};
 
 use std::path::Path;
 
@@ -279,10 +282,13 @@ fn file_group(ft: FileType) -> &'static str {
 /// Variants cover binary formats, source languages, package manifests, archives,
 /// and document types. Manifest types (e.g. `PackageJson`, `CargoToml`) are included
 /// because they require format-specific analysis despite being syntactically JSON/TOML.
+// Serialization goes through the canonical [`FileType::label`] /
+// [`FileType::from_label`] pair (see the `impl serde::*` below), not a derived
+// `rename_all`. That label is the single nomenclature filefacts, cleave, and
+// scan all share — keeping the serialized form and the report/routing label
+// the same string instead of two near-identical vocabularies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum FileType {
     /// Mach-O binary (macOS/iOS executable or library)
     MachO,
@@ -706,6 +712,290 @@ impl FileType {
                 | Self::SrcInfo
                 | Self::Registry
         )
+    }
+
+    /// The canonical, stable label for this type — the single nomenclature
+    /// shared by filefacts, cleave (its report `type` field), and scan (its
+    /// routing keys). It is also the serialized form (see the `serde` impls).
+    ///
+    /// The scheme: lowercase throughout; multi-word descriptive types use
+    /// `snake_case`; archive container+compression pairs use the real dotted
+    /// suffix (`tar.gz`); types that *are* a fixed filename use that filename
+    /// (`go.mod`, `package-lock.json`); and universally known short names stay
+    /// short (`elf`, `pe`, `macho`). [`FileType::from_label`] is the inverse.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            // Native binaries / bytecode.
+            Self::MachO => "macho",
+            Self::Elf => "elf",
+            Self::Pe => "pe",
+            Self::JavaClass => "java_class",
+            Self::PythonBytecode => "python_bytecode",
+            Self::Beam => "beam",
+            Self::Wasm => "wasm",
+            // Source / scripts.
+            Self::Shell => "shell",
+            Self::Batch => "batch",
+            Self::Jcl => "jcl",
+            Self::Vbs => "vbs",
+            Self::Python => "python",
+            Self::JavaScript => "javascript",
+            Self::TypeScript => "typescript",
+            Self::Go => "go",
+            Self::Rust => "rust",
+            Self::Java => "java",
+            Self::Ruby => "ruby",
+            Self::Php => "php",
+            Self::Perl => "perl",
+            Self::Lua => "lua",
+            Self::CSharp => "csharp",
+            Self::PowerShell => "powershell",
+            Self::Swift => "swift",
+            Self::ObjectiveC => "objective_c",
+            Self::Groovy => "groovy",
+            Self::Scala => "scala",
+            Self::Kotlin => "kotlin",
+            Self::Zig => "zig",
+            Self::Elixir => "elixir",
+            Self::Clojure => "clojure",
+            Self::C => "c",
+            Self::AppleScript => "applescript",
+            Self::Makefile => "makefile",
+            Self::Dockerfile => "dockerfile",
+            // Manifests / lockfiles — fixed filenames keep their filename;
+            // descriptive ones are snake_case.
+            Self::PackageJson => "package.json",
+            Self::PackageLockJson => "package-lock.json",
+            Self::ComposerJson => "composer.json",
+            Self::ComposerLock => "composer.lock",
+            Self::CargoToml => "cargo.toml",
+            Self::CargoLock => "cargo.lock",
+            Self::PyProjectToml => "pyproject.toml",
+            Self::RequirementsTxt => "requirements.txt",
+            Self::PoetryLock => "poetry.lock",
+            Self::PipfileLock => "pipfile.lock",
+            Self::GemfileLock => "gemfile.lock",
+            Self::YarnLock => "yarn.lock",
+            Self::PnpmLock => "pnpm-lock.yaml",
+            Self::GoMod => "go.mod",
+            Self::GoSum => "go.sum",
+            Self::Gyp => "gyp",
+            Self::GithubActions => "github_actions",
+            Self::SystemdService => "systemd_service",
+            Self::DesktopEntry => "desktop_entry",
+            Self::PkgInfo => "pkg_info",
+            Self::SrcInfo => "src_info",
+            Self::VsixManifest => "vsix_manifest",
+            Self::ChromeManifest => "chrome_manifest",
+            Self::Registry => "registry",
+            Self::Json => "json",
+            Self::Xml => "xml",
+            Self::Plist => "plist",
+            Self::Svg => "svg",
+            Self::Html => "html",
+            Self::Markdown => "markdown",
+            Self::Text => "text",
+            Self::Data => "data",
+            Self::Unknown => "unknown",
+            // Archive containers and compression.
+            Self::Zip => "zip",
+            Self::Tar => "tar",
+            Self::TarGz => "tar.gz",
+            Self::TarBz2 => "tar.bz2",
+            Self::TarXz => "tar.xz",
+            Self::TarZst => "tar.zst",
+            Self::Gz => "gz",
+            Self::Bz2 => "bz2",
+            Self::Xz => "xz",
+            Self::Zst => "zst",
+            Self::SevenZ => "7z",
+            Self::Rar => "rar",
+            Self::Cab => "cab",
+            Self::Asar => "asar",
+            Self::Jar => "jar",
+            // Packages.
+            Self::Deb => "deb",
+            Self::Rpm => "rpm",
+            Self::Dmg => "dmg",
+            Self::Chm => "chm",
+            Self::Crx => "crx",
+            Self::Xpi => "xpi",
+            Self::Whl => "whl",
+            Self::Gem => "gem",
+            Self::Npm => "npm",
+            Self::Crate => "crate",
+            Self::Conda => "conda",
+            Self::Egg => "egg",
+            Self::Nupkg => "nupkg",
+            Self::Ipa => "ipa",
+            Self::Vsix => "vsix",
+            Self::Xbps => "xbps",
+            Self::ApkAndroid => "apk_android",
+            Self::ApkAlpine => "apk_alpine",
+            Self::PkgMacos => "pkg_macos",
+            Self::PkgFreebsd => "pkg_freebsd",
+            Self::PkgArch => "pkg_arch",
+            Self::PythonSdist => "python_sdist",
+            Self::OciImage => "oci_image",
+            Self::GentooBinpkg => "gentoo_binpkg",
+            // Documents / media.
+            Self::Rtf => "rtf",
+            Self::OleDoc => "ole_doc",
+            Self::Ooxml => "ooxml",
+            Self::Lnk => "lnk",
+            Self::Jpeg => "jpeg",
+            Self::Png => "png",
+            Self::Pdf => "pdf",
+            Self::Pickle => "pickle",
+            Self::Odf => "odf",
+        }
+    }
+
+    /// Parse a [`FileType`] from its canonical [`label`](FileType::label).
+    /// Returns `None` for any string that is not a label — the exact inverse
+    /// of `label`, verified exhaustively by the `label_round_trips` test.
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        Some(match label {
+            "macho" => Self::MachO,
+            "elf" => Self::Elf,
+            "pe" => Self::Pe,
+            "java_class" => Self::JavaClass,
+            "python_bytecode" => Self::PythonBytecode,
+            "beam" => Self::Beam,
+            "wasm" => Self::Wasm,
+            "shell" => Self::Shell,
+            "batch" => Self::Batch,
+            "jcl" => Self::Jcl,
+            "vbs" => Self::Vbs,
+            "python" => Self::Python,
+            "javascript" => Self::JavaScript,
+            "typescript" => Self::TypeScript,
+            "go" => Self::Go,
+            "rust" => Self::Rust,
+            "java" => Self::Java,
+            "ruby" => Self::Ruby,
+            "php" => Self::Php,
+            "perl" => Self::Perl,
+            "lua" => Self::Lua,
+            "csharp" => Self::CSharp,
+            "powershell" => Self::PowerShell,
+            "swift" => Self::Swift,
+            "objective_c" => Self::ObjectiveC,
+            "groovy" => Self::Groovy,
+            "scala" => Self::Scala,
+            "kotlin" => Self::Kotlin,
+            "zig" => Self::Zig,
+            "elixir" => Self::Elixir,
+            "clojure" => Self::Clojure,
+            "c" => Self::C,
+            "applescript" => Self::AppleScript,
+            "makefile" => Self::Makefile,
+            "dockerfile" => Self::Dockerfile,
+            "package.json" => Self::PackageJson,
+            "package-lock.json" => Self::PackageLockJson,
+            "composer.json" => Self::ComposerJson,
+            "composer.lock" => Self::ComposerLock,
+            "cargo.toml" => Self::CargoToml,
+            "cargo.lock" => Self::CargoLock,
+            "pyproject.toml" => Self::PyProjectToml,
+            "requirements.txt" => Self::RequirementsTxt,
+            "poetry.lock" => Self::PoetryLock,
+            "pipfile.lock" => Self::PipfileLock,
+            "gemfile.lock" => Self::GemfileLock,
+            "yarn.lock" => Self::YarnLock,
+            "pnpm-lock.yaml" => Self::PnpmLock,
+            "go.mod" => Self::GoMod,
+            "go.sum" => Self::GoSum,
+            "gyp" => Self::Gyp,
+            "github_actions" => Self::GithubActions,
+            "systemd_service" => Self::SystemdService,
+            "desktop_entry" => Self::DesktopEntry,
+            "pkg_info" => Self::PkgInfo,
+            "src_info" => Self::SrcInfo,
+            "vsix_manifest" => Self::VsixManifest,
+            "chrome_manifest" => Self::ChromeManifest,
+            "registry" => Self::Registry,
+            "json" => Self::Json,
+            "xml" => Self::Xml,
+            "plist" => Self::Plist,
+            "svg" => Self::Svg,
+            "html" => Self::Html,
+            "markdown" => Self::Markdown,
+            "text" => Self::Text,
+            "data" => Self::Data,
+            "unknown" => Self::Unknown,
+            "zip" => Self::Zip,
+            "tar" => Self::Tar,
+            "tar.gz" => Self::TarGz,
+            "tar.bz2" => Self::TarBz2,
+            "tar.xz" => Self::TarXz,
+            "tar.zst" => Self::TarZst,
+            "gz" => Self::Gz,
+            "bz2" => Self::Bz2,
+            "xz" => Self::Xz,
+            "zst" => Self::Zst,
+            "7z" => Self::SevenZ,
+            "rar" => Self::Rar,
+            "cab" => Self::Cab,
+            "asar" => Self::Asar,
+            "jar" => Self::Jar,
+            "deb" => Self::Deb,
+            "rpm" => Self::Rpm,
+            "dmg" => Self::Dmg,
+            "chm" => Self::Chm,
+            "crx" => Self::Crx,
+            "xpi" => Self::Xpi,
+            "whl" => Self::Whl,
+            "gem" => Self::Gem,
+            "npm" => Self::Npm,
+            "crate" => Self::Crate,
+            "conda" => Self::Conda,
+            "egg" => Self::Egg,
+            "nupkg" => Self::Nupkg,
+            "ipa" => Self::Ipa,
+            "vsix" => Self::Vsix,
+            "xbps" => Self::Xbps,
+            "apk_android" => Self::ApkAndroid,
+            "apk_alpine" => Self::ApkAlpine,
+            "pkg_macos" => Self::PkgMacos,
+            "pkg_freebsd" => Self::PkgFreebsd,
+            "pkg_arch" => Self::PkgArch,
+            "python_sdist" => Self::PythonSdist,
+            "oci_image" => Self::OciImage,
+            "gentoo_binpkg" => Self::GentooBinpkg,
+            "rtf" => Self::Rtf,
+            "ole_doc" => Self::OleDoc,
+            "ooxml" => Self::Ooxml,
+            "lnk" => Self::Lnk,
+            "jpeg" => Self::Jpeg,
+            "png" => Self::Png,
+            "pdf" => Self::Pdf,
+            "pickle" => Self::Pickle,
+            "odf" => Self::Odf,
+            _ => return None,
+        })
+    }
+}
+
+impl std::fmt::Display for FileType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl serde::Serialize for FileType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.label())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for FileType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let label = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        Self::from_label(&label)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown FileType label: {label:?}")))
     }
 }
 
@@ -2249,5 +2539,160 @@ function wpcf7_special_mail_tag( $output, $name, $html ) {
         // a filename like ".tmpXXXXXX_package.json" which doesn't match.
         let det = detect(Path::new("/tmp/.tmpABC_package.json"), b"{}").unwrap();
         assert_eq!(det.file_type, FileType::Json);
+    }
+
+    /// Every variant's label is unique and round-trips through `from_label`,
+    /// so the two hand-written matches can never silently drift apart. The
+    /// array is the full variant set; `label` itself is a wildcard-free match,
+    /// so the compiler already guarantees every variant *has* a label.
+    #[test]
+    fn label_round_trips() {
+        use std::collections::HashSet;
+        let all = [
+            FileType::MachO,
+            FileType::Elf,
+            FileType::Pe,
+            FileType::JavaClass,
+            FileType::PythonBytecode,
+            FileType::Beam,
+            FileType::Wasm,
+            FileType::Shell,
+            FileType::Batch,
+            FileType::Jcl,
+            FileType::Vbs,
+            FileType::Python,
+            FileType::JavaScript,
+            FileType::TypeScript,
+            FileType::Go,
+            FileType::Rust,
+            FileType::Java,
+            FileType::Ruby,
+            FileType::Php,
+            FileType::Perl,
+            FileType::Lua,
+            FileType::CSharp,
+            FileType::PowerShell,
+            FileType::Swift,
+            FileType::ObjectiveC,
+            FileType::Groovy,
+            FileType::Scala,
+            FileType::Kotlin,
+            FileType::Zig,
+            FileType::Elixir,
+            FileType::Clojure,
+            FileType::C,
+            FileType::AppleScript,
+            FileType::Makefile,
+            FileType::Dockerfile,
+            FileType::PackageJson,
+            FileType::PackageLockJson,
+            FileType::ComposerJson,
+            FileType::ComposerLock,
+            FileType::CargoToml,
+            FileType::CargoLock,
+            FileType::PyProjectToml,
+            FileType::RequirementsTxt,
+            FileType::PoetryLock,
+            FileType::PipfileLock,
+            FileType::GemfileLock,
+            FileType::YarnLock,
+            FileType::PnpmLock,
+            FileType::GoMod,
+            FileType::GoSum,
+            FileType::Gyp,
+            FileType::GithubActions,
+            FileType::SystemdService,
+            FileType::DesktopEntry,
+            FileType::PkgInfo,
+            FileType::SrcInfo,
+            FileType::VsixManifest,
+            FileType::ChromeManifest,
+            FileType::Registry,
+            FileType::Json,
+            FileType::Xml,
+            FileType::Plist,
+            FileType::Svg,
+            FileType::Html,
+            FileType::Markdown,
+            FileType::Text,
+            FileType::Data,
+            FileType::Unknown,
+            FileType::Zip,
+            FileType::Tar,
+            FileType::TarGz,
+            FileType::TarBz2,
+            FileType::TarXz,
+            FileType::TarZst,
+            FileType::Gz,
+            FileType::Bz2,
+            FileType::Xz,
+            FileType::Zst,
+            FileType::SevenZ,
+            FileType::Rar,
+            FileType::Cab,
+            FileType::Asar,
+            FileType::Jar,
+            FileType::Deb,
+            FileType::Rpm,
+            FileType::Dmg,
+            FileType::Chm,
+            FileType::Crx,
+            FileType::Xpi,
+            FileType::Whl,
+            FileType::Gem,
+            FileType::Npm,
+            FileType::Crate,
+            FileType::Conda,
+            FileType::Egg,
+            FileType::Nupkg,
+            FileType::Ipa,
+            FileType::Vsix,
+            FileType::Xbps,
+            FileType::ApkAndroid,
+            FileType::ApkAlpine,
+            FileType::PkgMacos,
+            FileType::PkgFreebsd,
+            FileType::PkgArch,
+            FileType::PythonSdist,
+            FileType::OciImage,
+            FileType::GentooBinpkg,
+            FileType::Rtf,
+            FileType::OleDoc,
+            FileType::Ooxml,
+            FileType::Lnk,
+            FileType::Jpeg,
+            FileType::Png,
+            FileType::Pdf,
+            FileType::Pickle,
+            FileType::Odf,
+        ];
+        let mut seen = HashSet::new();
+        for ft in all {
+            let label = ft.label();
+            assert!(seen.insert(label), "duplicate label {label:?}");
+            assert_eq!(
+                FileType::from_label(label),
+                Some(ft),
+                "round-trip failed for {label:?}"
+            );
+        }
+        assert_eq!(FileType::from_label("not_a_label"), None);
+    }
+
+    #[test]
+    fn serde_uses_canonical_label() {
+        // The serialized form is the canonical label, not the old snake_case
+        // derive — `tar.gz`, not `tar_gz`; `macho`, not `mach_o`.
+        assert_eq!(
+            serde_json::to_string(&FileType::TarGz).unwrap(),
+            "\"tar.gz\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FileType::MachO).unwrap(),
+            "\"macho\""
+        );
+        let ft: FileType = serde_json::from_str("\"python_sdist\"").unwrap();
+        assert_eq!(ft, FileType::PythonSdist);
+        assert!(serde_json::from_str::<FileType>("\"tar_gz\"").is_err());
     }
 }

@@ -119,6 +119,23 @@ pub(crate) fn extract(
     // values) what generic emits.
     generic::extract(bytes, values, strings, metrics);
 
+    // Archive-backed types carry their container decomposition (archive +
+    // compression) as facts, so a consumer can route on the underlying
+    // container — e.g. a `.gem`/`.whl`/`.crate` reports `tar`/`zip`/`tar`
+    // here. Emitted centrally so every archive arm gets it; the codec for an
+    // Arch `.pkg.tar.*` is resolved from the bytes. Non-archive types emit
+    // nothing.
+    if let Some(container) = crate::fileid::container_of(file_type, bytes) {
+        values.insert(
+            "archive.container.archive",
+            serde_json::Value::String(container.archive.label().into()),
+        );
+        values.insert(
+            "archive.container.compression",
+            serde_json::Value::String(container.compression.label().into()),
+        );
+    }
+
     let result = match file_type {
         FileType::Pe => pe::extract(bytes, values, strings, metrics, sections, symbols, errors),
         FileType::Elf => elf::extract(bytes, values, strings, metrics, sections, symbols, errors),
