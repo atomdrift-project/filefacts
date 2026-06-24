@@ -308,6 +308,7 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "class" => Some(FileType::JavaClass),
         "pyc" | "pyo" => Some(FileType::PythonBytecode),
         "beam" => Some(FileType::Beam),
+        "wasm" => Some(FileType::Wasm),
         "rb" | "rbs" | "gemspec" => Some(FileType::Ruby),
         "php" | "php3" | "php4" | "php5" | "php7" | "phtml" => Some(FileType::Php),
         "pl" | "pm" | "t" => Some(FileType::Perl),

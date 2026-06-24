@@ -167,6 +167,7 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::JavaClass
         | FileType::PythonBytecode
         | FileType::Beam
+        | FileType::Wasm
         | FileType::Lnk => "binary",
         // Interpreted scripting languages (cleave's `scripts` for-group).
         FileType::Shell
@@ -311,6 +312,12 @@ pub enum FileType {
     PythonBytecode,
     /// Erlang/Elixir compiled BEAM bytecode (.beam; `FOR1`…`BEAM` IFF container)
     Beam,
+    /// WebAssembly binary module (.wasm; `\0asm` magic + version). A portable
+    /// bytecode payload — frequently a Go/TinyGo/Rust/Emscripten compile target
+    /// loaded by a JS host. Routed through the generic analyzer so string
+    /// extraction, entropy, and symbol-name traits fire on the embedded
+    /// `syscall/js` imports, struct tags, and rodata.
+    Wasm,
     /// Java archive (.jar, .war, .ear)
     Jar,
     /// Ruby source file (.rb)
@@ -604,6 +611,7 @@ impl FileType {
                 | Self::JavaClass
                 | Self::PythonBytecode
                 | Self::Beam
+                | Self::Wasm
         )
     }
 

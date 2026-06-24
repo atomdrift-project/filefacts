@@ -38,6 +38,11 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // tarball lights up at suspicious.
             if data.len() >= 4 && data[1] == 0x05 && data[2] == 0x16 && data[3] == 0x07 {
                 Some((FileType::Unknown, DetectionSource::Magic))
+            } else if data.len() >= 8 && &data[1..4] == b"asm" && data[4..8] == [0x01, 0, 0, 0] {
+                // WebAssembly binary module: `\0asm` magic followed by the
+                // little-endian u32 version (`01 00 00 00`). The version guard
+                // keeps `\0asm`-prefixed binary noise from misclassifying.
+                Some((FileType::Wasm, DetectionSource::Magic))
             } else {
                 None
             }
