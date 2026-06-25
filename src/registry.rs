@@ -118,6 +118,12 @@ pub struct Registry {
     /// is as authoritative a bad signal as a registry gives; `None` when the
     /// registry has no such tombstone concept.
     pub security_hold: Option<bool>,
+    /// Whether *this version* has been removed from the registry — unpublished
+    /// (npm `time.unpublished`) or yanked — while its metadata still resolves.
+    /// A days-old package whose version was already pulled is, in practice,
+    /// almost always a malware takedown. `None` when removal can't be
+    /// determined.
+    pub version_removed: Option<bool>,
 
     // ── Artifact shape (from the registry's own file records). ──────────────
     /// Unpacked size of the release in bytes, where the registry reports it
@@ -281,6 +287,10 @@ impl Registry {
             "registry.security_hold",
             self.security_hold.map(|b| f64::from(u8::from(b))),
         );
+        num(
+            "registry.version_removed",
+            self.version_removed.map(|b| f64::from(u8::from(b))),
+        );
     }
 }
 
@@ -324,6 +334,9 @@ mod tests {
             publisher: Some("attacker".into()),
             publisher_email_domain: Some("gmail.com".into()),
             publisher_in_maintainers: Some(false),
+            publisher_verified: Some(false),
+            security_hold: Some(false),
+            version_removed: Some(true),
             unpacked_size: Some(4096),
             file_count: Some(3),
             has_install_script: Some(true),
@@ -358,6 +371,9 @@ mod tests {
         assert_eq!(metrics.get("registry.file_count"), Some(3.0));
         assert_eq!(metrics.get("registry.has_install_script"), Some(1.0));
         assert_eq!(metrics.get("registry.publisher_in_maintainers"), Some(0.0));
+        assert_eq!(metrics.get("registry.publisher_verified"), Some(0.0));
+        assert_eq!(metrics.get("registry.security_hold"), Some(0.0));
+        assert_eq!(metrics.get("registry.version_removed"), Some(1.0));
         // A present-but-zero count is still emitted (0 vulns is a real fact).
         assert_eq!(metrics.get("registry.vulnerability_count"), Some(0.0));
         // Publisher identity never leaks into metrics; counts never into values.
