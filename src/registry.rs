@@ -112,6 +112,12 @@ pub struct Registry {
     /// namespace (Open VSX). `Some(false)` means anyone could have published
     /// under this name; `None` when the registry has no such concept.
     pub publisher_verified: Option<bool>,
+    /// Whether the registry has replaced this package with a takedown
+    /// placeholder — npm's `security holding package` stub, published by the
+    /// registry's own security team after malicious code was removed. `Some(true)`
+    /// is as authoritative a bad signal as a registry gives; `None` when the
+    /// registry has no such tombstone concept.
+    pub security_hold: Option<bool>,
 
     // ── Artifact shape (from the registry's own file records). ──────────────
     /// Unpacked size of the release in bytes, where the registry reports it
@@ -270,6 +276,10 @@ impl Registry {
         num(
             "registry.publisher_verified",
             self.publisher_verified.map(|b| f64::from(u8::from(b))),
+        );
+        num(
+            "registry.security_hold",
+            self.security_hold.map(|b| f64::from(u8::from(b))),
         );
     }
 }
