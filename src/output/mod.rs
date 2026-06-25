@@ -39,7 +39,7 @@ pub use archive::{ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwne
 pub use errors::{ErrorKind, Errors, ParseError, Stage};
 pub use identity::{Claim, Identity, Party, Signer, Trust, Url, UrlKind};
 pub use metrics::{Fact, Metrics};
-pub use references::{ExternalRef, HashAlgo, PinnedHash, RefKind, RefLocator};
+pub use references::{HashAlgo, PinnedHash, RefKind, RefLocator, Reference};
 pub use sections::{Section, Sections};
 pub use spans::{Span, SpanBuilder};
 pub use strings::{Comments, ExtractedString, Literals, Text};

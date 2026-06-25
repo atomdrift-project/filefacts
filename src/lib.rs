@@ -95,8 +95,8 @@ pub use error::Error;
 pub use fileid::{ArchiveFormat, Compression, Container, FileId, FileType, container_of};
 pub use output::{
     ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Arg, ArgShape, Claim,
-    Comments, ErrorKind, Errors, ExternalRef, ExtractedString, Fact, HashAlgo, Identity, Literals,
-    Metrics, ParseError, Party, PinnedHash, RefKind, RefLocator, Section, Sections, Signer, Span,
+    Comments, ErrorKind, Errors, ExtractedString, Fact, HashAlgo, Identity, Literals, Metrics,
+    ParseError, Party, PinnedHash, RefKind, RefLocator, Reference, Section, Sections, Signer, Span,
     SpanBuilder, Stage, Symbol, SymbolKind, Symbols, Text, Trust, Url, UrlKind, Values,
 };
 pub use registry::Registry;
@@ -210,7 +210,7 @@ struct Extracted {
     sections: Sections,
     symbols: Symbols,
     identity: Identity,
-    references: Vec<ExternalRef>,
+    references: Vec<Reference>,
     errors: Errors,
 }
 
@@ -231,7 +231,7 @@ struct ExtractedSnapshot {
     sections: Sections,
     symbols: Symbols,
     identity: Identity,
-    references: Vec<ExternalRef>,
+    references: Vec<Reference>,
     errors: Errors,
 }
 
@@ -387,7 +387,7 @@ impl<'a> ParsedFile<'a> {
     /// ecosystem is identifiable, else a raw URL. Recorded, never fetched;
     /// a downstream fetcher resolves and verifies them. Empty for files
     /// that reference nothing. Computed on first access and cached.
-    pub fn references(&self) -> &[ExternalRef] {
+    pub fn references(&self) -> &[Reference] {
         &self.extracted().references
     }
 

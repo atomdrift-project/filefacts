@@ -1,18 +1,23 @@
-//! External-reference extraction — the packages and URLs an artifact
-//! points at, folded across formats into [`ExternalRef`] rows.
+//! Reference extraction — the external packages and URLs an artifact points
+//! at, plus the intra-artifact files it names (a manifest entry point), folded
+//! across formats into [`Reference`] rows.
 //!
 //! Mirrors [`super::identity`]: format parsers write `values`, and
 //! [`derive`] reads them back into one typed view. PURL is preferred over
-//! a raw URL wherever the ecosystem is identifiable, for disambiguation.
+//! a raw URL wherever the ecosystem is identifiable, for disambiguation; an
+//! intra-artifact target is a [`RefLocator::Path`].
 
+use std::sync::OnceLock;
+
+use regex::Regex;
 use serde_json::Value as JsonValue;
 
 use crate::fileid::FileType;
-use crate::output::{ExternalRef, HashAlgo, PinnedHash, RefKind, RefLocator, Values};
+use crate::output::{HashAlgo, PinnedHash, RefKind, RefLocator, Reference, Values};
 
 /// Derive external references from a parsed file's `values`. `bytes` is the
 /// raw file, used to locate each reference's `evidence` for its byte offset.
-pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Vec<ExternalRef> {
+pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Vec<Reference> {
     let mut out = Refs {
         refs: Vec::new(),
         // UTF-8 text manifests can be searched for offsets; binary or
@@ -38,9 +43,45 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Vec<
         FileType::ComposerLock => composer_lock(values, &mut out),
         FileType::YarnLock => yarn_lock(&mut out),
         FileType::PnpmLock => pnpm_lock(values, &mut out),
+        FileType::JavaScript | FileType::TypeScript => js_local_refs(&mut out),
         _ => {}
     }
     out.refs
+}
+
+/// Relative `require`/`import`/`export … from`/dynamic `import()` targets in a
+/// JS/TS source — the intra-package module graph the entry points alone don't
+/// reveal (an npm trojan reaches its payload through `require('./util')`, not a
+/// manifest field). Only relative specifiers (`./`, `../`) are intra-artifact
+/// references; a bare package name is an external dependency, recorded
+/// elsewhere. A consumer resolves each against the bundle's other files, so an
+/// over-broad match that names no real file simply draws no edge.
+fn js_local_refs(out: &mut Refs<'_>) {
+    let Some(text) = out.text else { return };
+    let mut seen: Vec<&str> = Vec::new();
+    for caps in js_relative_import_re().captures_iter(text) {
+        let Some(spec) = caps.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        if spec.is_empty() || seen.contains(&spec) {
+            continue;
+        }
+        seen.push(spec);
+        push_local_ref(out, spec, "import");
+    }
+}
+
+/// Matches a relative module specifier in `require("./x")`, `import … from
+/// "./x"`, `export … from "./x"`, side-effect `import "./x"`, and dynamic
+/// `import("./x")`. The keyword gate plus a specifier that must start with `.`
+/// keeps bare-package and non-import strings out; the closing quote keeps
+/// `import.meta` / `fromCharCode` out.
+fn js_relative_import_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r#"\b(?:require|import|from)\b\s*\(?\s*["'](\.[^"'\n]*)["']"#)
+            .expect("js_relative_import_re compiles")
+    })
 }
 
 /// `yarn.lock` (Yarn classic): one block per resolved package, headed by its
@@ -465,7 +506,7 @@ fn strip_line_comment(line: &str) -> &str {
 
 /// Reference accumulator that also carries the raw file text for offsets.
 struct Refs<'a> {
-    refs: Vec<ExternalRef>,
+    refs: Vec<Reference>,
     text: Option<&'a str>,
 }
 
@@ -498,7 +539,7 @@ impl Refs<'_> {
             .as_ref()
             .filter(|p| p.algo == HashAlgo::Sha256)
             .map(|p| p.value.clone());
-        self.refs.push(ExternalRef {
+        self.refs.push(Reference {
             locator,
             kind,
             source: source.into(),
@@ -516,6 +557,7 @@ impl Refs<'_> {
 fn anchor_from_locator(loc: &RefLocator) -> String {
     match loc {
         RefLocator::Url(u) => u.clone(),
+        RefLocator::Path(p) => p.clone(),
         RefLocator::Purl(p) => {
             let body = p.strip_prefix("pkg:").unwrap_or(p);
             let body = body.split_once('/').map_or(body, |(_, rest)| rest); // drop type
@@ -538,6 +580,98 @@ fn npm(values: &Values, out: &mut Refs<'_>) {
         );
     }
     npm_manifest_deps(out);
+    npm_local_refs(out);
+}
+
+/// Intra-artifact file references a `package.json` names: the entry module
+/// (`main`/`module`), the `exports` map's targets, and the executables (`bin`).
+/// Each points at a sibling file in the same package, so a consumer resolves it
+/// against the bundle's other members rather than fetching it. A no-op for a
+/// binary `.tgz` (no text). The initial, deliberately small set of inter-file
+/// producers — relative `import`/`require` targets and HTML `src` can follow.
+fn npm_local_refs(out: &mut Refs<'_>) {
+    let Some(text) = out.text else { return };
+    let Ok(manifest) = serde_json::from_str::<JsonValue>(text) else {
+        return;
+    };
+    // Dedup identical targets — `exports` routinely repeats `main` and lists one
+    // file under several conditions (`require`/`import`/`default`).
+    let mut seen: Vec<String> = Vec::new();
+    let mut emit = |out: &mut Refs<'_>, path: &str, source: &str| {
+        if path.is_empty() || path.contains('*') {
+            return; // empty, or a subpath pattern (`./*`) that names no one file
+        }
+        if seen.iter().any(|p| p == path) {
+            return;
+        }
+        seen.push(path.to_string());
+        push_local_ref(out, path, source);
+    };
+
+    // Single-string entry-point fields.
+    for (field, source) in [
+        ("main", "package.json:main"),
+        ("module", "package.json:module"),
+    ] {
+        if let Some(path) = manifest.get(field).and_then(JsonValue::as_str) {
+            emit(out, path, source);
+        }
+    }
+    // `exports`: the modern entry map. Its leaf string values are file targets
+    // (`{".": {"require": "./index.js", "import": "./index.mjs"}}`); subpath
+    // patterns (`"./*"`) are skipped above.
+    if let Some(exports) = manifest.get("exports") {
+        let mut paths = Vec::new();
+        collect_export_paths(exports, &mut paths);
+        for path in paths {
+            emit(out, &path, "package.json:exports");
+        }
+    }
+    // `bin`: either a single path (the package's lone binary) or a name→path map.
+    match manifest.get("bin") {
+        Some(JsonValue::String(path)) => emit(out, path, "package.json:bin"),
+        Some(JsonValue::Object(map)) => {
+            for path in map.values().filter_map(JsonValue::as_str) {
+                emit(out, path, "package.json:bin");
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect every relative-path string leaf (`./…`) from an `exports` value,
+/// which nests arbitrarily: a string, a conditions object, a subpath map, or an
+/// array of fallbacks. Non-relative entries (bare package names in a fallback
+/// array) are not intra-artifact references and are left out.
+fn collect_export_paths(value: &JsonValue, out: &mut Vec<String>) {
+    match value {
+        JsonValue::String(s) if s.starts_with("./") => out.push(s.clone()),
+        JsonValue::Object(map) => {
+            for v in map.values() {
+                collect_export_paths(v, out);
+            }
+        }
+        JsonValue::Array(arr) => {
+            for v in arr {
+                collect_export_paths(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Emit one intra-artifact file reference, skipping an empty target.
+fn push_local_ref(out: &mut Refs<'_>, path: &str, source: &str) {
+    if path.is_empty() {
+        return;
+    }
+    out.push(
+        RefLocator::Path(path.to_string()),
+        RefKind::Local,
+        source,
+        path,
+        None,
+    );
 }
 
 /// Declared runtime dependencies of a `package.json`, read from the manifest
@@ -888,7 +1022,7 @@ mod tests {
             .iter()
             .filter_map(|r| match &r.locator {
                 RefLocator::Purl(p) => Some(p.as_str()),
-                RefLocator::Url(_) => None,
+                RefLocator::Url(_) | RefLocator::Path(_) => None,
             })
             .collect();
         assert!(purls.contains(&"pkg:npm/left-pad@1.3.0"), "{purls:?}");
@@ -906,6 +1040,162 @@ mod tests {
             .expect("easy-day-js ref");
         assert_eq!(easy.evidence, "easy-day-js@^1.11.21");
         assert_eq!(easy.kind, RefKind::Dependency);
+    }
+
+    #[test]
+    fn package_json_entry_points_are_local_file_refs() {
+        // `main`/`module`/`bin` point at sibling files in the same package, so
+        // each is a Local reference with a Path locator — resolved against the
+        // bundle, never fetched. A string `bin` and a `bin` map both work.
+        let manifest = br#"{
+            "name": "app",
+            "main": "./lib/index.js",
+            "module": "lib/index.mjs",
+            "bin": { "app": "bin/cli.js", "app-dev": "bin/dev.js" },
+            "dependencies": { "left-pad": "1.3.0" }
+        }"#;
+        let refs = derive(FileType::PackageJson, manifest, &Values::new());
+        let paths: Vec<(&str, &str)> = refs
+            .iter()
+            .filter_map(|r| match &r.locator {
+                RefLocator::Path(p) => Some((p.as_str(), r.source.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            paths.contains(&("./lib/index.js", "package.json:main")),
+            "{paths:?}"
+        );
+        assert!(
+            paths.contains(&("lib/index.mjs", "package.json:module")),
+            "{paths:?}"
+        );
+        assert!(
+            paths.contains(&("bin/cli.js", "package.json:bin")),
+            "{paths:?}"
+        );
+        assert!(
+            paths.contains(&("bin/dev.js", "package.json:bin")),
+            "{paths:?}"
+        );
+        // Every Path locator is a Local kind, and Local is never a fetch target.
+        for r in refs
+            .iter()
+            .filter(|r| matches!(r.locator, RefLocator::Path(_)))
+        {
+            assert_eq!(r.kind, RefKind::Local);
+            assert!(!r.is_fetch_target());
+        }
+        // The byte offset points at the path's first occurrence in the manifest.
+        let main = refs
+            .iter()
+            .find(|r| matches!(&r.locator, RefLocator::Path(p) if p == "./lib/index.js"))
+            .expect("main ref");
+        let text = std::str::from_utf8(manifest).unwrap();
+        assert_eq!(main.offset as usize, text.find("./lib/index.js").unwrap());
+    }
+
+    #[test]
+    fn package_json_exports_map_yields_local_refs_deduped() {
+        // The modern `exports` map carries explicit file targets under
+        // conditions; subpath patterns (`./*`) are skipped and a target shared
+        // with `main` is emitted once.
+        let manifest = br#"{
+            "name": "chai-plugin-helper",
+            "main": "./index.js",
+            "exports": {
+                ".": { "require": "./index.js", "import": "./index.mjs" },
+                "./util": { "default": "./lib/util.js" },
+                "./*": "./*"
+            }
+        }"#;
+        let refs = derive(FileType::PackageJson, manifest, &Values::new());
+        let paths: Vec<&str> = refs
+            .iter()
+            .filter_map(|r| match &r.locator {
+                RefLocator::Path(p) => Some(p.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(paths.contains(&"./index.js"), "{paths:?}");
+        assert!(paths.contains(&"./index.mjs"), "{paths:?}");
+        assert!(paths.contains(&"./lib/util.js"), "{paths:?}");
+        // `./index.js` is in both `main` and `exports` — emitted once.
+        assert_eq!(
+            paths.iter().filter(|p| **p == "./index.js").count(),
+            1,
+            "{paths:?}"
+        );
+        // The `./*` subpath pattern names no single file.
+        assert!(!paths.iter().any(|p| p.contains('*')), "{paths:?}");
+    }
+
+    #[test]
+    fn js_relative_imports_become_local_refs() {
+        // require / import-from / export-from / side-effect / dynamic import,
+        // in their common spacings. Bare packages and `import.meta` are not
+        // intra-artifact references; an identical specifier is emitted once.
+        let src = br#"
+            const a = require('./util');
+            import b from "../lib/helper.js";
+            export { c } from './sub/mod';
+            import "./side-effect";
+            const d = await import("./dynamic.js");
+            const ext = require('lodash');
+            const meta = import.meta.url;
+            const dup = require('./util');
+        "#;
+        let refs = derive(FileType::JavaScript, src, &Values::new());
+        let paths: Vec<&str> = refs
+            .iter()
+            .filter_map(|r| match &r.locator {
+                RefLocator::Path(p) => Some(p.as_str()),
+                _ => None,
+            })
+            .collect();
+        for want in [
+            "./util",
+            "../lib/helper.js",
+            "./sub/mod",
+            "./side-effect",
+            "./dynamic.js",
+        ] {
+            assert!(paths.contains(&want), "missing {want}: {paths:?}");
+        }
+        assert!(
+            !paths.iter().any(|p| p.contains("lodash")),
+            "a bare package is an external dependency, not a local ref: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("meta")),
+            "import.meta is not an import string: {paths:?}"
+        );
+        assert_eq!(
+            paths.iter().filter(|p| **p == "./util").count(),
+            1,
+            "identical specifier emitted once: {paths:?}"
+        );
+        // Every JS path reference is a Local kind.
+        for r in refs
+            .iter()
+            .filter(|r| matches!(r.locator, RefLocator::Path(_)))
+        {
+            assert_eq!(r.kind, RefKind::Local);
+        }
+    }
+
+    #[test]
+    fn package_json_string_bin_is_a_local_ref() {
+        // `bin` as a bare string (the package's single executable) resolves too.
+        let manifest = br#"{ "name": "app", "bin": "cli.js" }"#;
+        let refs = derive(FileType::PackageJson, manifest, &Values::new());
+        assert!(
+            refs.iter().any(
+                |r| matches!(&r.locator, RefLocator::Path(p) if p == "cli.js")
+                    && r.kind == RefKind::Local
+            ),
+            "{refs:?}"
+        );
     }
 
     #[test]
@@ -1035,7 +1325,7 @@ mod tests {
             .iter()
             .filter_map(|r| match &r.locator {
                 RefLocator::Purl(p) => Some(p.as_str()),
-                RefLocator::Url(_) => None,
+                RefLocator::Url(_) | RefLocator::Path(_) => None,
             })
             .collect();
         assert!(purls.contains(&"pkg:golang/github.com/foo/Bar@v1.2.3"));
@@ -1123,11 +1413,11 @@ mod tests {
         assert_eq!(repo.locator, RefLocator::Purl("pkg:github/foo/bar".into()));
     }
 
-    fn purls(refs: &[ExternalRef]) -> Vec<&str> {
+    fn purls(refs: &[Reference]) -> Vec<&str> {
         refs.iter()
             .filter_map(|r| match &r.locator {
                 RefLocator::Purl(p) => Some(p.as_str()),
-                RefLocator::Url(_) => None,
+                RefLocator::Url(_) | RefLocator::Path(_) => None,
             })
             .collect()
     }

@@ -1,20 +1,24 @@
-//! External references an artifact points at — the packages it declares
-//! or installs and the URLs it stages — normalized for fetching and for
-//! cross-repo lookup.
+//! References an artifact points at — the external packages it declares or
+//! installs and the URLs it stages, plus the *intra-artifact* files it names
+//! (a manifest entry point, a relative import) — normalized for fetching,
+//! cross-repo lookup, and intra-bundle resolution.
 //!
-//! Each row is an [`ExternalRef`]. Extraction records *what* a file points
-//! at; it does not fetch. A downstream fetcher resolves the locator,
-//! retrieves the bytes, and fills in [`ExternalRef::content_sha256`].
+//! Each row is a [`Reference`]. Extraction records *what* a file points at; it
+//! does not fetch or resolve. A downstream fetcher resolves a fetchable
+//! locator and fills in [`Reference::content_sha256`]; a bundle consumer
+//! resolves a [`RefLocator::Path`] against the artifact's other files.
 
 use serde::{Deserialize, Serialize};
 
-/// A normalized, fetchable identity for a referenced artifact.
+/// A normalized identity for a referenced target.
 ///
 /// A [`RefLocator::Purl`] is preferred wherever the ecosystem is
 /// identifiable, because a package URL is canonical: two registry-mirror
 /// URLs for the same package collapse to one PURL, which keeps cache keys
 /// and cross-repo lookups stable. [`RefLocator::Url`] is reserved for a
-/// genuine non-package fetch — a bare script on an arbitrary host.
+/// genuine non-package fetch — a bare script on an arbitrary host. A
+/// [`RefLocator::Path`] is an intra-artifact file reference, resolved against
+/// the bundle's other files rather than fetched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RefLocator {
@@ -23,6 +27,11 @@ pub enum RefLocator {
     Purl(String),
     /// A raw URL with no package identity.
     Url(String),
+    /// A path to another file in the same artifact, as written
+    /// (`./lib/index.js`, `index.js`, `bin/cli.js`). Relative to the
+    /// referencing file's location; a consumer resolves it against the
+    /// bundle's other files. Never a fetch target.
+    Path(String),
 }
 
 /// The coarse nature of a reference — the *expression form* it was found
@@ -48,6 +57,11 @@ pub enum RefKind {
     UrlFetch,
     /// The artifact's own source repository — identity, not a fetch target.
     Repository,
+    /// A reference to another file *within the same artifact* — a manifest
+    /// entry point (`package.json` `main`/`bin`), a relative `import`. Carries
+    /// a [`RefLocator::Path`] and is resolved against sibling files, not
+    /// fetched.
+    Local,
     /// Recorded, but the kind could not be determined.
     Undefined,
 }
@@ -81,9 +95,11 @@ pub struct PinnedHash {
     pub value: String,
 }
 
-/// One external reference, normalized for fetching and cross-repo lookup.
+/// One reference an artifact points at — an external package/URL (normalized
+/// for fetching and cross-repo lookup) or an intra-artifact file path
+/// (resolved against the bundle's other files).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExternalRef {
+pub struct Reference {
     /// Normalized, fetchable identity. PURL where possible, else URL.
     pub locator: RefLocator,
     /// The coarse kind / expression form this reference was found in.
@@ -116,7 +132,7 @@ pub struct ExternalRef {
     pub content_sha256: Option<String>,
 }
 
-impl ExternalRef {
+impl Reference {
     /// Whether this reference is a fetch target. A source repository is
     /// identity and an unclassified reference is not actioned, so neither
     /// is fetched; dependencies, commands, and URL fetches are.
