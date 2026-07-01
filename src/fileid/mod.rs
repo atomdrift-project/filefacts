@@ -171,6 +171,7 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::PythonBytecode
         | FileType::Beam
         | FileType::Wasm
+        | FileType::AndroidDex
         | FileType::Lnk => "binary",
         // Interpreted scripting languages (cleave's `scripts` for-group).
         FileType::Shell
@@ -328,6 +329,10 @@ pub enum FileType {
     /// extraction, entropy, and symbol-name traits fire on the embedded
     /// `syscall/js` imports, struct tags, and rodata.
     Wasm,
+    /// Android Dalvik executable bytecode (`dex\n035\0` and related versions).
+    /// APKs carry this as `classes.dex`; route it as a program so member scans
+    /// can match Android behavior strings and APIs.
+    AndroidDex,
     /// Java archive (.jar, .war, .ear)
     Jar,
     /// Ruby source file (.rb)
@@ -644,6 +649,7 @@ impl FileType {
                 | Self::PythonBytecode
                 | Self::Beam
                 | Self::Wasm
+                | Self::AndroidDex
         )
     }
 
@@ -734,6 +740,7 @@ impl FileType {
             Self::PythonBytecode => "python_bytecode",
             Self::Beam => "beam",
             Self::Wasm => "wasm",
+            Self::AndroidDex => "dex",
             // Source / scripts.
             Self::Shell => "shell",
             Self::Batch => "batch",
@@ -865,6 +872,7 @@ impl FileType {
             "python_bytecode" => Self::PythonBytecode,
             "beam" => Self::Beam,
             "wasm" => Self::Wasm,
+            "dex" => Self::AndroidDex,
             "shell" => Self::Shell,
             "batch" => Self::Batch,
             "jcl" => Self::Jcl,
@@ -1549,6 +1557,11 @@ mod tests {
         assert_ext("mod.pyc", FileType::PythonBytecode);
     }
 
+    #[test]
+    fn dex_by_ext() {
+        assert_ext("classes.dex", FileType::AndroidDex);
+    }
+
     // ── JavaScript / TypeScript ──────────────────────────────────────
 
     #[test]
@@ -2066,6 +2079,7 @@ message CommandMessage {
         assert!(FileType::Pe.is_binary());
         assert!(FileType::MachO.is_binary());
         assert!(FileType::JavaClass.is_binary());
+        assert!(FileType::AndroidDex.is_binary());
         assert!(!FileType::Zip.is_binary());
         assert!(!FileType::Python.is_binary());
     }
@@ -2556,6 +2570,7 @@ function wpcf7_special_mail_tag( $output, $name, $html ) {
             FileType::PythonBytecode,
             FileType::Beam,
             FileType::Wasm,
+            FileType::AndroidDex,
             FileType::Shell,
             FileType::Batch,
             FileType::Jcl,

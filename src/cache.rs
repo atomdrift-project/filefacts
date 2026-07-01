@@ -167,22 +167,15 @@ pub fn cache_key(bytes: &[u8], variant: &str) -> String {
     hex(&hasher.finalize())
 }
 
-/// Root cache directory for filefacts. Returns the first writable
-/// candidate from (OS cache dir + `atomdrift/filefacts`) → temp dir +
-/// `filefacts-cache`.
+/// Root cache directory for filefacts. Returns the writable OS/user cache dir,
+/// or `None` when no user cache directory is available.
 pub fn cache_root() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(base) = dirs::cache_dir() {
-        candidates.push(base.join("atomdrift").join("filefacts"));
-    }
-    candidates.push(std::env::temp_dir().join("filefacts-cache"));
-    for c in candidates {
-        if fs::create_dir_all(&c).is_ok() {
-            let probe = c.join(".write-test");
-            if fs::write(&probe, b"ok").is_ok() {
-                let _ = fs::remove_file(&probe);
-                return Some(c);
-            }
+    let c = dirs::cache_dir()?.join("atomdrift").join("filefacts");
+    if fs::create_dir_all(&c).is_ok() {
+        let probe = c.join(".write-test");
+        if fs::write(&probe, b"ok").is_ok() {
+            let _ = fs::remove_file(&probe);
+            return Some(c);
         }
     }
     None

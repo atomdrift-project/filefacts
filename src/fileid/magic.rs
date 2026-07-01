@@ -193,6 +193,22 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
                 None
             }
         }
+        b'd' => {
+            // Dalvik executable bytecode: dex\n035\0, dex\n038\0, etc.
+            if data.len() >= 8
+                && data[1] == b'e'
+                && data[2] == b'x'
+                && data[3] == b'\n'
+                && data[4].is_ascii_digit()
+                && data[5].is_ascii_digit()
+                && data[6].is_ascii_digit()
+                && data[7] == 0
+            {
+                Some((FileType::AndroidDex, DetectionSource::Magic))
+            } else {
+                None
+            }
+        }
         b'I' => {
             // Compiled HTML Help: ITSF
             if data.starts_with(b"ITSF") {
@@ -1181,6 +1197,20 @@ mod tests {
         let data = b"PK\x03\x04some content here";
         let (ft, _) = detect_from_content(Path::new("data.zip"), data).unwrap();
         assert_eq!(ft, FileType::Zip);
+    }
+
+    #[test]
+    fn cab_archive() {
+        let data = b"MSCF\x00\x00\x00\x00cabinet content";
+        let (ft, _) = detect_from_content(Path::new("archive.cab"), data).unwrap();
+        assert_eq!(ft, FileType::Cab);
+    }
+
+    #[test]
+    fn dex_bytecode() {
+        let data = b"dex\n035\0payload";
+        let (ft, _) = detect_from_content(Path::new("classes.dex"), data).unwrap();
+        assert_eq!(ft, FileType::AndroidDex);
     }
 
     #[test]
