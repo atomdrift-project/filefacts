@@ -116,11 +116,14 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
 
-    // The extraction cache is on by default; drop entries from superseded
-    // schema versions (one cheap directory scan). The per-build stale-walk
-    // (`cache::prune_stale`) is left to long-lived consumers like cleave —
-    // running it on every short CLI invocation would not pay for itself.
+    // The extraction cache is on by default. Drop entries from superseded
+    // schema versions (one cheap directory scan), then kick off a
+    // background sweep that ages out stale entries and bounds the total
+    // item count. `cleanup` is non-blocking and self-throttling: a short
+    // one-file run may exit before it finishes and the next run resumes,
+    // while a long directory scan lets it complete.
     filefacts::cache::prune_old_versions();
+    filefacts::cache::cleanup();
 
     if root.is_dir() {
         let mut had_error = false;
