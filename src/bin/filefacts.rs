@@ -116,13 +116,12 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
 
-    // The extraction cache is on by default. Drop entries from superseded
-    // schema versions (one cheap directory scan), then kick off a
-    // background sweep that ages out stale entries and bounds the total
-    // item count. `cleanup` is non-blocking and self-throttling: a short
-    // one-file run may exit before it finishes and the next run resumes,
-    // while a long directory scan lets it complete.
-    filefacts::cache::prune_old_versions();
+    // The extraction cache is on by default. Kick off cleanup on a
+    // background thread: it drops superseded schema versions and bounds the
+    // cache to its item cap (evicting least-recently-used entries).
+    // Non-blocking and self-throttling — a short one-file run may exit
+    // before it finishes and the next run resumes, while a long directory
+    // scan lets it complete.
     filefacts::cache::cleanup();
 
     if root.is_dir() {

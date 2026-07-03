@@ -48,22 +48,23 @@
 //!
 //! # Retention
 //!
-//! Within the current version dir the cache is bounded on two axes by
-//! [`Limits`] ([`DEFAULT_MAX_ITEMS`] entries, [`DEFAULT_MAX_AGE`] since
-//! last use). [`enforce_limits`] ages out entries past `max_age`, then
-//! evicts the oldest down to `max_items`; a cache *hit* bumps an entry's
-//! mtime ([`load`]), so eviction is least-recently-*used*, not merely
-//! oldest-written. [`cleanup`] runs a sweep on a background thread — the
-//! entry point a consumer calls at startup — and an on-write trigger
-//! kicks off the same sweep when a store pushes the cache over the
-//! ceiling mid-run. Everything here is best-effort: the cache is a
-//! performance optimisation, never a source of truth.
+//! Within the current version dir the cache is bounded by entry count:
+//! [`enforce_limits`] evicts the oldest entries once the total passes
+//! [`DEFAULT_MAX_ITEMS`], down to 90% of the cap. A cache *hit* bumps an
+//! entry's mtime ([`load`]), so eviction is least-recently-*used*, not
+//! merely oldest-written — the same count+LRU model cleave's analysis
+//! cache uses, so the two projects bound their caches consistently.
+//! [`cleanup`] runs the sweep on a background thread — the entry point a
+//! consumer calls at startup — and an on-write trigger kicks off the same
+//! sweep when a store pushes the cache over the ceiling mid-run.
+//! Everything here is best-effort: the cache is a performance
+//! optimisation, never a source of truth.
 
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
@@ -238,9 +239,8 @@ pub fn load<T: serde::de::DeserializeOwned>(sha_hex: &str) -> Option<T> {
 /// Coarse granularity for the LRU mtime bump in [`load`]. A hit only
 /// rewrites the entry's mtime when it is already older than this, so an
 /// entry read repeatedly costs at most one metadata write per window
-/// rather than one per read. A day keeps LRU ordering meaningful against
-/// the multi-week age cap while leaving the common hot-entry hit a pure
-/// read.
+/// rather than one per read. A day is fine enough to order eviction
+/// candidates while leaving the common hot-entry hit a pure read.
 const LRU_TOUCH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Best-effort relatime-style LRU touch: set `path`'s mtime to now, but
@@ -325,76 +325,53 @@ fn prune_old_versions_in(root: &std::path::Path) {
 /// these; the count lets a single-shard sample estimate the whole.
 const SHARD_COUNT: usize = 256;
 
-/// Default ceiling on retained cache entries. Reached, the oldest
-/// (least-recently-used) entries are evicted down to this count.
+/// Default ceiling on retained cache entries. On reaching it, the oldest
+/// (least-recently-used) entries are evicted; see [`enforce_limits`].
 pub const DEFAULT_MAX_ITEMS: usize = 16_000;
 
-/// Default maximum age for a cache entry: 30 days since last use.
-pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// Post-eviction target as a fraction of the cap (9/10). Evicting to 90%
+/// rather than exactly to the cap stops a cache sitting at the ceiling from
+/// re-triggering a sweep on the very next store. Mirrors cleave's analysis
+/// cache so the two projects bound their caches identically.
+const EVICTION_TARGET_NUM: usize = 9;
+const EVICTION_TARGET_DEN: usize = 10;
 
-/// Retention limits enforced by [`enforce_limits`] and the on-write
-/// auto-cleanup. `max_age` bounds staleness; `max_items` bounds count.
-/// Either can be effectively disabled with [`Duration::MAX`] /
-/// [`usize::MAX`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Limits {
-    /// Hard ceiling on retained entries; the oldest are evicted past it.
-    pub max_items: usize,
-    /// Entries not used within this window are dropped regardless of count.
-    pub max_age: Duration,
-}
-
-impl Default for Limits {
-    fn default() -> Self {
-        Self {
-            max_items: DEFAULT_MAX_ITEMS,
-            max_age: DEFAULT_MAX_AGE,
-        }
-    }
-}
-
-// Process-wide limits, read by both the startup sweep and the on-write
-// trigger so a single `set_limits` reconfigures every cleanup path.
+// Process-wide item cap, read by both the startup sweep and the on-write
+// trigger so a single `set_max_items` reconfigures every cleanup path.
 static MAX_ITEMS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_ITEMS);
-static MAX_AGE_SECS: AtomicU64 = AtomicU64::new(DEFAULT_MAX_AGE.as_secs());
 
-/// Set the process-wide cache retention limits. A consumer that wants a
-/// larger or smaller cache calls this once at startup, before the first
-/// [`cleanup`]; the defaults ([`DEFAULT_MAX_ITEMS`] / [`DEFAULT_MAX_AGE`])
-/// apply otherwise.
-pub fn set_limits(limits: Limits) {
-    MAX_ITEMS.store(limits.max_items, Ordering::Relaxed);
-    MAX_AGE_SECS.store(limits.max_age.as_secs(), Ordering::Relaxed);
+/// Set the process-wide cache item cap. A consumer that wants a larger or
+/// smaller cache calls this once at startup, before the first [`cleanup`];
+/// [`DEFAULT_MAX_ITEMS`] applies otherwise.
+pub fn set_max_items(max_items: usize) {
+    MAX_ITEMS.store(max_items, Ordering::Relaxed);
 }
 
-/// The currently configured limits.
+/// The currently configured item cap.
 #[must_use]
-pub fn limits() -> Limits {
-    Limits {
-        max_items: MAX_ITEMS.load(Ordering::Relaxed),
-        max_age: Duration::from_secs(MAX_AGE_SECS.load(Ordering::Relaxed)),
-    }
+pub fn max_items() -> usize {
+    MAX_ITEMS.load(Ordering::Relaxed)
 }
 
 /// Guards against overlapping sweeps: at most one enforcement pass runs at
 /// a time, whether kicked off at startup or by an on-write trigger.
 static SWEEP_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// Enforce the configured [`limits`] on a background thread and return
-/// immediately. This is the entry point a consumer calls at startup.
+/// Prune superseded schema versions and enforce the item cap on a
+/// background thread, returning immediately. This is the entry point a
+/// consumer calls at startup — one non-blocking call covers all cleanup.
 ///
-/// Non-blocking and best-effort: a short-lived process may exit before the
-/// sweep finishes (a detached thread dies with the process), and the next
-/// run resumes the work; a long-lived consumer always sees it through. At
-/// most one sweep runs at a time, so repeated calls are cheap no-ops while
-/// one is in flight.
+/// Best-effort: a short-lived process may exit before the sweep finishes (a
+/// detached thread dies with the process), and the next run resumes the
+/// work; a long-lived consumer always sees it through. At most one sweep
+/// runs at a time, so repeated calls are cheap no-ops while one is in flight.
 pub fn cleanup() {
-    spawn_sweep(limits());
+    spawn_sweep(max_items());
 }
 
-/// Claim the sweep guard and run [`enforce_limits`] on a detached thread.
+/// Claim the sweep guard and run the cleanup passes on a detached thread.
 /// Silent no-op if a sweep is already running or the thread fails to spawn.
-fn spawn_sweep(limits: Limits) {
+fn spawn_sweep(max_items: usize) {
     if SWEEP_RUNNING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -404,7 +381,8 @@ fn spawn_sweep(limits: Limits) {
     let spawned = std::thread::Builder::new()
         .name("filefacts-cache-sweep".into())
         .spawn(move || {
-            enforce_limits(limits);
+            prune_old_versions();
+            enforce_limits(max_items);
             SWEEP_RUNNING.store(false, Ordering::Release);
         });
     if spawned.is_err() {
@@ -416,7 +394,7 @@ fn spawn_sweep(limits: Limits) {
 /// own shard directory. A store follows a cache *miss* — i.e. an expensive
 /// compute — so one `read_dir` here is negligible, and once a sweep is
 /// running the sample is skipped entirely. If this shard alone holds well
-/// more than its uniform share of `max_items`, the whole cache is over the
+/// more than its uniform share of the cap, the whole cache is over the
 /// ceiling; hand off to a background sweep, which counts for real before
 /// evicting.
 fn maybe_trigger_sweep(sha_hex: &str) {
@@ -425,86 +403,71 @@ fn maybe_trigger_sweep(sha_hex: &str) {
     if cfg!(test) || SWEEP_RUNNING.load(Ordering::Relaxed) {
         return;
     }
-    let limits = limits();
+    let max_items = max_items();
     // 1.5× the per-shard mean: enough slack that a shard crossing it
     // reliably implies the whole cache is over, not just Poisson noise.
-    let per_shard_trigger = limits.max_items / SHARD_COUNT * 3 / 2 + 1;
+    let per_shard_trigger = max_items / SHARD_COUNT * 3 / 2 + 1;
     let (Some(dir), Some(shard)) = (version_dir(), sha_hex.get(..2)) else {
         return;
     };
     let count = fs::read_dir(dir.join(shard)).map_or(0, |it| it.flatten().count());
     if count > per_shard_trigger {
-        spawn_sweep(limits);
+        spawn_sweep(max_items);
     }
 }
 
-/// Enforce `limits` synchronously: age out entries past `max_age`, then,
-/// if the survivors still exceed `max_items`, evict the oldest
-/// (least-recently-used, since [`load`] bumps mtime on a hit) down to the
-/// ceiling. Best-effort; failures are ignored.
+/// Enforce the item cap synchronously: if the cache holds more than
+/// `max_items` entries, evict the oldest — least-recently-*used*, since
+/// [`load`] bumps an entry's mtime on a hit — down to 90% of the cap.
+/// Best-effort; failures are ignored.
 ///
+/// Content-only, matching cleave's analysis cache: there is no age cutoff.
 /// The cache key folds in the [`build_fingerprint`], so every filefacts
-/// rebuild (and every release) mints a fresh key space and orphans the
-/// previous build's entries. Those orphans are correct to drop but are not
-/// pruned by [`prune_old_versions`] (same schema dir); the age pass ages
-/// them out and the count pass bounds the total so the cache cannot grow
-/// without bound across many rebuilds. Prefer [`cleanup`], which runs this
+/// rebuild orphans the previous build's entries; because those orphans are
+/// never read again their mtime never advances, so LRU eviction discards
+/// them first once the cap is reached. Prefer [`cleanup`], which runs this
 /// off the hot path.
-pub fn enforce_limits(limits: Limits) {
+pub fn enforce_limits(max_items: usize) {
     let Some(dir) = version_dir() else {
         return;
     };
-    enforce_limits_in(&dir, limits);
+    enforce_limits_in(&dir, max_items);
 }
 
-fn enforce_limits_in(version_dir: &Path, limits: Limits) {
-    let cutoff = SystemTime::now().checked_sub(limits.max_age);
+fn enforce_limits_in(version_dir: &Path, max_items: usize) {
     let Ok(shards) = fs::read_dir(version_dir) else {
         return;
     };
-    // Survivors of the age pass, retained so the count pass can order and
-    // evict them. One transient (path, mtime) per live entry — a few MB at
-    // the default ceiling, freed as soon as the sweep returns.
-    let mut survivors: Vec<(PathBuf, SystemTime)> = Vec::new();
+    // One transient (path, mtime) per live entry — a few MB at the default
+    // ceiling, freed as soon as the sweep returns.
+    let mut entries: Vec<(PathBuf, SystemTime)> = Vec::new();
     for shard in shards.flatten() {
-        let Ok(entries) = fs::read_dir(shard.path()) else {
+        let Ok(files) = fs::read_dir(shard.path()) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        for file in files.flatten() {
+            let path = file.path();
             // Manage only finished entries; skip in-flight `.tmp` writes
             // and any stray non-entry files.
             if path.extension().is_none_or(|ext| ext != "bin") {
                 continue;
             }
-            let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+            let Ok(mtime) = file.metadata().and_then(|m| m.modified()) else {
                 continue;
             };
-            if cutoff.is_some_and(|cutoff| mtime < cutoff) {
-                let _ = fs::remove_file(&path);
-                continue;
-            }
-            survivors.push((path, mtime));
+            entries.push((path, mtime));
         }
     }
-    if survivors.len() > limits.max_items {
-        // Oldest first, then drop the excess head.
-        survivors.sort_unstable_by_key(|&(_, mtime)| mtime);
-        let excess = survivors.len() - limits.max_items;
-        for (path, _) in survivors.into_iter().take(excess) {
-            let _ = fs::remove_file(path);
-        }
+    if entries.len() <= max_items {
+        return;
     }
-}
-
-/// Delete current-schema entries not used within `max_age`. A thin,
-/// count-unbounded wrapper over [`enforce_limits`] for callers that want
-/// the age pass alone; most should prefer [`cleanup`].
-pub fn prune_stale(max_age: Duration) {
-    enforce_limits(Limits {
-        max_items: usize::MAX,
-        max_age,
-    });
+    let target = max_items * EVICTION_TARGET_NUM / EVICTION_TARGET_DEN;
+    let excess = entries.len() - target;
+    // Oldest (least-recently-used) first, then drop the excess head.
+    entries.sort_unstable_by_key(|&(_, mtime)| mtime);
+    for (path, _) in entries.into_iter().take(excess) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 /// Whether a freshly computed payload may be persisted to disk.
@@ -751,55 +714,44 @@ mod tests {
     }
 
     #[test]
-    fn enforce_limits_evicts_oldest_beyond_max_items() {
+    fn enforce_limits_evicts_oldest_to_ninety_percent() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let shard = tmp.path().join("ab");
         fs::create_dir_all(&shard).expect("shard");
         let now = SystemTime::now();
-        // Five entries aged 0..5 hours; ages stand in for last-use order.
-        let paths: Vec<PathBuf> = (0..5u64)
+        // Thirteen entries, mtime ascending with index: 00 is the oldest
+        // (least-recently-used), 12 the newest.
+        let paths: Vec<PathBuf> = (0..13u64)
             .map(|i| {
                 entry_with_mtime(
                     &shard,
                     &format!("{i:02}.bin"),
-                    now - Duration::from_secs(i * 3600),
+                    now - Duration::from_secs((13 - i) * 3600),
                 )
             })
             .collect();
-        // Age cap effectively off; keep only the three newest.
-        enforce_limits_in(
-            tmp.path(),
-            Limits {
-                max_items: 3,
-                max_age: Duration::from_secs(365 * 24 * 3600),
-            },
-        );
-        assert!(paths[0].exists() && paths[1].exists() && paths[2].exists());
-        assert!(!paths[3].exists(), "oldest evicted past the count cap");
-        assert!(!paths[4].exists(), "oldest evicted past the count cap");
+        // Cap 10 → evict down to 90% (9), so the 4 oldest go.
+        enforce_limits_in(tmp.path(), 10);
+        for (i, p) in paths.iter().enumerate() {
+            if i < 4 {
+                assert!(!p.exists(), "entry {i:02} (oldest) should be evicted");
+            } else {
+                assert!(p.exists(), "entry {i:02} (newer) should be kept");
+            }
+        }
     }
 
     #[test]
-    fn enforce_limits_ages_out_stale_entries() {
+    fn enforce_limits_noop_under_cap() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let shard = tmp.path().join("cd");
         fs::create_dir_all(&shard).expect("shard");
         let now = SystemTime::now();
-        let fresh = entry_with_mtime(&shard, "fresh.bin", now);
-        let stale = entry_with_mtime(
-            &shard,
-            "stale.bin",
-            now - Duration::from_secs(10 * 24 * 3600),
-        );
-        enforce_limits_in(
-            tmp.path(),
-            Limits {
-                max_items: usize::MAX,
-                max_age: Duration::from_secs(24 * 3600),
-            },
-        );
-        assert!(fresh.exists(), "in-window entry kept");
-        assert!(!stale.exists(), "out-of-window entry aged out");
+        let kept: Vec<PathBuf> = (0..5u64)
+            .map(|i| entry_with_mtime(&shard, &format!("{i}.bin"), now))
+            .collect();
+        enforce_limits_in(tmp.path(), 100);
+        assert!(kept.iter().all(|p| p.exists()), "nothing evicted under cap");
     }
 
     #[test]
@@ -807,19 +759,10 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let shard = tmp.path().join("ef");
         fs::create_dir_all(&shard).expect("shard");
-        // An old in-flight write, under the most aggressive limits.
-        let inflight = entry_with_mtime(
-            &shard,
-            "partial.tmp",
-            SystemTime::now() - Duration::from_secs(100 * 24 * 3600),
-        );
-        enforce_limits_in(
-            tmp.path(),
-            Limits {
-                max_items: 0,
-                max_age: Duration::from_secs(1),
-            },
-        );
+        // An in-flight write under the most aggressive cap: it is not a
+        // finished `.bin`, so it must survive.
+        let inflight = entry_with_mtime(&shard, "partial.tmp", SystemTime::now());
+        enforce_limits_in(tmp.path(), 0);
         assert!(
             inflight.exists(),
             "a non-.bin in-flight write is never swept"
