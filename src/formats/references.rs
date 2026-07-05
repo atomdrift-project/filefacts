@@ -931,6 +931,13 @@ fn locator_from_repo(repo: &str) -> RefLocator {
 
 /// `pkg:github/owner/repo` (or gitlab/bitbucket) from a forge URL, if it
 /// is one. Namespace and name are lowercased for canonical form.
+///
+/// Only a *bare* `owner/repo` path (optionally `.git`) is a whole-repo
+/// reference. A deeper path — `owner/repo/releases/download/v1/asset.zip`,
+/// `owner/repo/archive/v1.tar.gz` — points at one specific artifact, not the
+/// repo, so it is declined; the caller keeps the URL and fetches it verbatim
+/// (matching its `sha256sums` pin). Collapsing such a URL to `pkg:github/
+/// owner/repo` would resolve to the source tree at HEAD — the wrong bytes.
 fn purl_from_forge(repo: &str) -> Option<String> {
     let s = repo.trim_start_matches("git+");
     let rest = s
@@ -951,6 +958,9 @@ fn purl_from_forge(repo: &str) -> Option<String> {
     let mut parts = path.split('/');
     let owner = parts.next().filter(|s| !s.is_empty())?;
     let name = parts.next().filter(|s| !s.is_empty())?;
+    if parts.next().is_some() {
+        return None; // deeper than owner/repo: a specific artifact, not the repo
+    }
     Some(format!(
         "pkg:{ty}/{}/{}",
         owner.to_ascii_lowercase(),
@@ -1310,6 +1320,35 @@ mod tests {
             .expect("git source");
         assert!(git.pinned_hash.is_none());
         assert!(git.content_sha256.is_none());
+    }
+
+    #[test]
+    fn srcinfo_release_asset_url_stays_url_with_pin() {
+        // A GitHub *release asset* download URL (not the repo) must be fetched
+        // verbatim so its sha256sums pin applies. Collapsing it to
+        // `pkg:github/owner/repo` would resolve to the source tree at HEAD —
+        // different bytes, a hash mismatch. Modeled on ttf-iosevka-curly-slab.
+        let sum = "97d10cd3052cf30a3bc5bac4434d2937220e3343c4304eca9bd5c2259b10f5bc";
+        let asset =
+            "https://github.com/be5invis/Iosevka/releases/download/v34.7.0/PkgTTF-Iosevka.zip";
+        let pkg = serde_json::json!({
+            "pkg": {
+                "source": [asset],
+                "sha256sums": [sum]
+            }
+        });
+        let refs = derive(FileType::SrcInfo, &[], &Values::from_json(pkg));
+        let r = refs
+            .iter()
+            .find(|r| r.locator == RefLocator::Url(asset.into()))
+            .expect("release asset stays a verbatim URL");
+        assert_eq!(r.content_sha256.as_deref(), Some(sum));
+        // No forge PURL was minted from the release-download path.
+        assert!(
+            !refs
+                .iter()
+                .any(|r| matches!(&r.locator, RefLocator::Purl(p) if p.starts_with("pkg:github/")))
+        );
     }
 
     #[test]
