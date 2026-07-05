@@ -279,6 +279,13 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         // `(- a b)` otherwise scores as JavaScript and fires JS obfuscation
         // rules on e.g. the GCL ANSI test suite. Treat as plain text.
         "lsp" | "lisp" | "el" | "cl" | "scm" => Some(FileType::Text),
+        // PatEL (`.ptl`) — Iosevka's Lisp-like glyph / OpenType-layout DSL,
+        // compiled by the `patel` npm package. No dedicated analyzer; its
+        // `$$include`, `$`-prefixed macros, and bare command-like statement
+        // heads otherwise content-score as Shell and fire shell
+        // command-execution / obfuscated-command traits on font-outline source.
+        // Treat as plain text: still scanned for strings/URLs, never as shell.
+        "ptl" => Some(FileType::Text),
         // OCaml family. No dedicated analyzer; `let`-heavy implementations
         // otherwise score as JavaScript and `.mli` `val` declarations score
         // as Kotlin under weak content heuristics. Treat as plain text.
@@ -825,6 +832,20 @@ mod tests {
                 detect_from_path(Path::new(name)),
                 Some(FileType::Text),
                 "{name} should be Text, not JavaScript or Kotlin"
+            );
+        }
+    }
+
+    #[test]
+    fn patel_extension_is_text_not_shell() {
+        // Iosevka's PatEL glyph source (`.ptl`) must not parse as Shell — its
+        // `$$include`/`$`-macro heads otherwise trip shell command-execution
+        // and obfuscated-command traits on font-outline source.
+        for name in ["gsub-ligation.ptl", "packages/font-otl/src/gsub-cv-ss.ptl"] {
+            assert_eq!(
+                detect_from_path(Path::new(name)),
+                Some(FileType::Text),
+                "{name} should be Text, not Shell"
             );
         }
     }
