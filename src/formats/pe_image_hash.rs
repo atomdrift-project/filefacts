@@ -226,7 +226,7 @@ mod tests {
     use crate::output::{Errors, Strings};
 
     fn fixture(name: &str) -> Vec<u8> {
-        let path = format!("../cleave/tests/fixtures/{name}");
+        let path = format!("tests/fixtures/{name}");
         std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"))
     }
 
@@ -280,7 +280,7 @@ mod tests {
     /// known values. Any unintended change in the region walker — the
     /// number of bytes hashed, the order, the holes punched in the
     /// header — will produce a different digest and trip this test.
-    /// Regenerate by running `cargo run --bin filefacts -- ../cleave/tests/fixtures/test.exe`
+    /// Regenerate by running `cargo run --bin filefacts -- tests/fixtures/test.exe`
     /// if the fixture itself is ever replaced.
     #[test]
     fn image_hashes_test_exe_pinned_values() {

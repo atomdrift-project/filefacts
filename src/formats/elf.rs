@@ -2219,7 +2219,7 @@ mod tests {
     /// exercise the full extractor against a non-trivial ELF without
     /// shipping our own corpus.
     fn read_fixture(name: &str) -> Vec<u8> {
-        let path = format!("../cleave/tests/fixtures/{name}");
+        let path = format!("tests/fixtures/{name}");
         std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"))
     }
 

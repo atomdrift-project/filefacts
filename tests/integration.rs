@@ -448,7 +448,7 @@ fn typed_fact_views_are_not_mirrored_in_values() {
 
 #[test]
 fn binary_typed_fact_views_are_not_mirrored_in_values() {
-    let bytes = std::fs::read("../cleave/tests/fixtures/test.exe").expect("PE fixture present");
+    let bytes = std::fs::read("tests/fixtures/test.exe").expect("PE fixture present");
     let parsed = open(&bytes).unwrap();
 
     assert!(

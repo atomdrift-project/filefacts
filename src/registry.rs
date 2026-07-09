@@ -53,6 +53,10 @@ pub struct Registry {
     pub homepage: Option<String>,
     /// Source repository URL.
     pub repository: Option<String>,
+    /// Source-repository commit the release was built from, where the registry
+    /// or its manifest records it (NuGet `.nuspec` `<repository commit=…>`). The
+    /// artifact→source pin a bare [`repository`](Self::repository) URL can't give.
+    pub repository_commit: Option<String>,
     /// SPDX (or registry-reported) license string.
     pub license: Option<String>,
     /// Lifetime download count, where the registry reports one.
@@ -201,6 +205,10 @@ impl Registry {
         put("registry.description", self.description.as_deref());
         put("registry.homepage", self.homepage.as_deref());
         put("registry.repository", self.repository.as_deref());
+        put(
+            "registry.repository_commit",
+            self.repository_commit.as_deref(),
+        );
         put("registry.license", self.license.as_deref());
         put("registry.deprecated", self.deprecated.as_deref());
         put("registry.publisher", self.publisher.as_deref());

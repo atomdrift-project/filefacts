@@ -1262,8 +1262,8 @@ mod tests {
         // survive serialize -> deserialize -> serialize unchanged.
         // Caching is off under cfg(test), so `extracted()` returns a
         // freshly computed snapshot to round-trip.
-        let bytes = std::fs::read("../cleave/tests/fixtures/test.exe")
-            .expect("test.exe fixture should exist");
+        let bytes =
+            std::fs::read("tests/fixtures/test.exe").expect("test.exe fixture should exist");
         let parsed = open(&bytes).unwrap();
         let original = parsed.extracted();
         let json = serde_json::to_vec(original).expect("serialize Extracted");
@@ -1287,8 +1287,8 @@ mod tests {
         // byte-scan row data — only stng's cache key. Rehydration must
         // reconstruct the exact `text` rows from stng's cache (the single
         // owner), so strings are stored once across the layers.
-        let bytes = std::fs::read("../cleave/tests/fixtures/test.exe")
-            .expect("test.exe fixture should exist");
+        let bytes =
+            std::fs::read("tests/fixtures/test.exe").expect("test.exe fixture should exist");
         let parsed = open(&bytes).unwrap();
         // Owned extraction; this also populates stng's in-process memo.
         let extracted = parsed.run_pipeline();
@@ -1346,8 +1346,8 @@ mod tests {
     /// care which sub-kind a name appears in.
     #[test]
     fn symbol_iter_walks_all_three_collections() {
-        let bytes = std::fs::read("../cleave/tests/fixtures/test.exe")
-            .expect("test.exe fixture should exist");
+        let bytes =
+            std::fs::read("tests/fixtures/test.exe").expect("test.exe fixture should exist");
         let parsed = open(&bytes).unwrap();
         // Realize the views before iterating — the lazy parse runs
         // on first `.values()` access.
@@ -1370,8 +1370,8 @@ mod tests {
     /// empty.
     #[test]
     fn healthy_pe_emits_no_parse_errors() {
-        let bytes = std::fs::read("../cleave/tests/fixtures/test.exe")
-            .expect("test.exe fixture should exist");
+        let bytes =
+            std::fs::read("tests/fixtures/test.exe").expect("test.exe fixture should exist");
         let parsed = open(&bytes).unwrap();
         // Realize.
         let _ = parsed.values();

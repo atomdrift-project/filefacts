@@ -227,11 +227,10 @@ mod tests {
     /// Pin the PDB path, GUID, age, and the debug entry type vector
     /// for `test.exe`. Drift in the CodeView decoder, GUID byteswap,
     /// or entry walker will trip this test. Regenerate values via
-    /// `cargo run --bin filefacts -- ../cleave/tests/fixtures/test.exe`.
+    /// `cargo run --bin filefacts -- tests/fixtures/test.exe`.
     #[test]
     fn debug_directory_decodes_test_exe_to_known_values() {
-        let bytes = std::fs::read("../cleave/tests/fixtures/test.exe")
-            .expect("test.exe fixture is required");
+        let bytes = std::fs::read("tests/fixtures/test.exe").expect("test.exe fixture is required");
         let mut v = crate::output::Values::new();
         let mut s = crate::output::Strings::default();
         let mut m = crate::output::Metrics::new();
