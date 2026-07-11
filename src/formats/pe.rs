@@ -160,7 +160,7 @@ pub(super) fn extract(
         dos_stub_anomalies(&pe, bytes, metrics);
         checksum(&pe, bytes, metrics);
         aliased_exports(&pe, bytes, metrics);
-        clr_metadata(&pe, values);
+        clr_metadata(&pe, bytes, values, metrics);
         clr_resources(&pe, bytes, metrics);
         data_directories(&pe, values);
         super::pe_image_hash::extract(&pe, bytes, values, metrics);
@@ -973,21 +973,45 @@ fn data_directories(pe: &PE<'_>, values: &mut Values) {
     }
 }
 
-/// .NET / CLR metadata extracted from the COR20 header. The presence
-/// of `pe.clr` (or any sub-key) IS the "is this a managed binary?"
-/// signal — distinct from PE Authenticode signing, which a managed
+/// .NET / CLR metadata extracted from the COR20 header and metadata root.
+/// The presence of `pe.clr` (or any sub-key) IS the "is this a managed
+/// binary?" signal — distinct from PE Authenticode signing, which a managed
 /// binary may or may not carry.
 ///
-/// Emits:
-/// - `pe.clr.runtime_version`  — `"<major>.<minor>"` runtime version string
-/// - `pe.clr.is_il_only`       — 1 when the COMIMAGE_FLAGS_ILONLY bit is set
-/// - `pe.clr.is_native_entrypoint` — 1 when COMIMAGE_FLAGS_NATIVE_ENTRYPOINT is set
-fn clr_metadata(pe: &PE<'_>, values: &mut Values) {
+/// The fields answer the *who / what* of a managed build and are chosen to be
+/// stable diff anchors: version-to-version differential analysis surfaces a
+/// changed strong-name state, MVID, metadata version, or stream set, which is
+/// how a trojanized release is told apart from a genuine rebuild.
+///
+/// Values (raw structural reads — strings, raw words, identities):
+/// - `pe.clr.runtime_version`      — COR20 `"<major>.<minor>"` runtime version
+/// - `pe.clr.metadata_version`     — metadata-root version string (e.g. `v4.0.30319`)
+/// - `pe.clr.flags`                — raw COR20 flags word
+/// - `pe.clr.entry_point_token`    — managed entry-point token (absent for a DLL)
+/// - `pe.clr.mvid`                 — Module Version ID GUID; a build-unique
+///   identity anchor for correlating and diffing releases (WHO / WHAT)
+/// - `pe.clr.streams`              — metadata stream-name inventory. A shipped
+///   release carrying `#-` (uncompressed / edit-and-continue tables) or
+///   `#Schema` instead of the normal `#~` is a post-compile IL-patch tell.
+///
+/// Metrics (decoded flag bits / sizes — typed for comparison matching):
+/// - `pe.clr.is_il_only`, `pe.clr.is_native_entrypoint`,
+///   `pe.clr.is_32bit_required`, `pe.clr.is_32bit_preferred` — 0/1 COR20 bits
+/// - `pe.clr.strong_name_signed`   — 0/1 COMIMAGE_FLAGS_STRONGNAMESIGNED (WHO /
+///   integrity). A genuine vendor SDK is strong-name signed; a source-rebuilt
+///   clone that never had the private key is not, so `0` under a vendor brand
+///   is a forgery / publisher-hijack tell — and a `1 -> 0` transition across
+///   versions is a strong differential signal.
+/// - `pe.clr.strong_name_sig_size` — strong-name signature blob size (>0 with
+///   `strong_name_signed=0` = delay-signed or signature stripped)
+fn clr_metadata(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
+    use crate::formats::common::{put_str, put_u64};
     let Some(clr) = pe.clr_data.as_ref() else {
         return;
     };
     let hdr = &clr.cor20_header;
-    crate::formats::common::put_str(
+    // Raw structural reads (strings, raw words, identities) -> values.
+    put_str(
         values,
         "pe.clr.runtime_version",
         format!(
@@ -995,12 +1019,121 @@ fn clr_metadata(pe: &PE<'_>, values: &mut Values) {
             hdr.major_runtime_version, hdr.minor_runtime_version
         ),
     );
-    if hdr.is_il_only() {
-        crate::formats::common::put_u64(values, "pe.clr.is_il_only", 1);
+    let mdver = clr.metadata_header.version.trim_matches('\0').trim();
+    if !mdver.is_empty() {
+        put_str(values, "pe.clr.metadata_version", mdver);
     }
-    if hdr.is_native_entrypoint() {
-        crate::formats::common::put_u64(values, "pe.clr.is_native_entrypoint", 1);
+    put_u64(values, "pe.clr.flags", u64::from(hdr.flags));
+    if hdr.entry_point_token_or_rva != 0 {
+        put_u64(
+            values,
+            "pe.clr.entry_point_token",
+            u64::from(hdr.entry_point_token_or_rva),
+        );
     }
+    // Decoded flag bits and sizes are typed numbers -> metrics, so traits can
+    // match them by comparison (e.g. `strong_name_signed max: 0`).
+    let mut bit = |name: &str, v: bool| metrics.insert(name, f64::from(u8::from(v)));
+    bit("pe.clr.is_il_only", hdr.is_il_only());
+    bit("pe.clr.is_native_entrypoint", hdr.is_native_entrypoint());
+    bit("pe.clr.is_32bit_required", hdr.is_32bit_required());
+    bit("pe.clr.is_32bit_preferred", hdr.is_32bit_preferred());
+    bit("pe.clr.strong_name_signed", hdr.is_strong_name_signed());
+    if hdr.strong_name_signature.size > 0 {
+        metrics.insert(
+            "pe.clr.strong_name_sig_size",
+            f64::from(hdr.strong_name_signature.size),
+        );
+    }
+    // Parse the ECMA-335 metadata root directly. goblin 0.10's CLR stream
+    // helpers (`sections()`/`mvid()`/`storage_header`) mis-seed the walk, and
+    // its `metadata_data` is sliced from file offset 0 (the MZ header) rather
+    // than the metadata RVA — both unusable — so resolve the metadata directory
+    // ourselves and parse from the `BSJB` root.
+    let mdir = hdr.metadata;
+    let md = rva_to_file_offset(pe, mdir.virtual_address).and_then(|base| {
+        let end = base.saturating_add(mdir.size as usize).min(bytes.len());
+        bytes.get(base..end)
+    });
+    if let Some((names, guid_stream)) = md.and_then(parse_clr_streams) {
+        if !names.is_empty() {
+            let arr = names.into_iter().map(JsonValue::String).collect();
+            values.insert("pe.clr.streams", JsonValue::Array(arr));
+        }
+        // The module MVID is the first GUID in the `#GUID` heap (Module.Mvid == 1).
+        if let (Some((goff, gsize)), Some(md)) = (guid_stream, md) {
+            if gsize >= 16 {
+                if let Some(s) = md.get(goff..goff + 16).and_then(format_guid) {
+                    put_str(values, "pe.clr.mvid", s);
+                }
+            }
+        }
+    }
+}
+
+/// Parse the .NET metadata-root stream directory (ECMA-335 II.24.2.1) from the
+/// blob beginning at the `BSJB` signature. Returns the stream names in order
+/// and the `(offset, size)` of the `#GUID` heap (offsets relative to the blob
+/// start). Returns `None` when the signature or layout is malformed.
+fn parse_clr_streams(md: &[u8]) -> Option<(Vec<String>, Option<(usize, usize)>)> {
+    let rd_u32 = |b: &[u8], p: usize| -> Option<usize> {
+        b.get(p..p + 4)
+            .map(|s| u32::from_le_bytes(s.try_into().unwrap()) as usize)
+    };
+    if md.get(0..4)? != b"BSJB" {
+        return None;
+    }
+    let version_len = rd_u32(md, 12)?;
+    // Flags (u16) + Streams (u16) follow the 4-byte-padded version string.
+    let mut p = 16usize.checked_add((version_len + 3) & !3)?;
+    let n_streams = u16::from_le_bytes(md.get(p + 2..p + 4)?.try_into().unwrap());
+    p += 4;
+    let mut names = Vec::new();
+    let mut guid_stream = None;
+    for _ in 0..n_streams {
+        let s_off = rd_u32(md, p)?;
+        let s_size = rd_u32(md, p + 4)?;
+        p += 8;
+        // Name: null-terminated ASCII, whole field padded to a 4-byte boundary.
+        let start = p;
+        while *md.get(p)? != 0 {
+            p += 1;
+        }
+        let name = std::str::from_utf8(&md[start..p]).ok()?.to_string();
+        if name == "#GUID" {
+            guid_stream = Some((s_off, s_size));
+        }
+        names.push(name);
+        p = start.checked_add(((p - start) + 1 + 3) & !3)?;
+    }
+    Some((names, guid_stream))
+}
+
+/// Format a 16-byte .NET GUID (MVID) as the canonical
+/// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` string. The first three fields are
+/// stored little-endian and the last two byte-for-byte, matching how the CLR
+/// (and `ikdasm`) render the module MVID.
+fn format_guid(g: &[u8]) -> Option<String> {
+    let g: &[u8; 16] = g.get(..16)?.try_into().ok()?;
+    Some(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        g[3],
+        g[2],
+        g[1],
+        g[0],
+        g[5],
+        g[4],
+        g[7],
+        g[6],
+        g[8],
+        g[9],
+        g[10],
+        g[11],
+        g[12],
+        g[13],
+        g[14],
+        g[15],
+    ))
 }
 
 /// Measure the embedded managed (CLR) resources that the Win32 resource walk
@@ -1964,6 +2097,46 @@ mod tests {
     }
 
     #[test]
+    fn format_guid_renders_mvid_like_ikdasm() {
+        // #GUID heap bytes (first three fields little-endian) for the MVID
+        // ikdasm prints as {3C2F06E5-115F-41C1-9886-1F7748FBEF06}.
+        let bytes = [
+            0xe5, 0x06, 0x2f, 0x3c, 0x5f, 0x11, 0xc1, 0x41, 0x98, 0x86, 0x1f, 0x77, 0x48, 0xfb,
+            0xef, 0x06,
+        ];
+        assert_eq!(
+            format_guid(&bytes).as_deref(),
+            Some("3c2f06e5-115f-41c1-9886-1f7748fbef06")
+        );
+        assert_eq!(format_guid(&[0u8; 8]), None);
+    }
+
+    #[test]
+    fn parse_clr_streams_reads_standard_heaps() {
+        // Minimal metadata root: BSJB, version "v4.0" (len 4), flags=0,
+        // streams=2, then #GUID (offset 0x20, size 16) and #Blob headers.
+        let mut md = Vec::new();
+        md.extend_from_slice(b"BSJB");
+        md.extend_from_slice(&1u16.to_le_bytes()); // major
+        md.extend_from_slice(&1u16.to_le_bytes()); // minor
+        md.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        md.extend_from_slice(&4u32.to_le_bytes()); // version_len
+        md.extend_from_slice(b"v4.0"); // version (already 4-aligned)
+        md.extend_from_slice(&0u16.to_le_bytes()); // flags
+        md.extend_from_slice(&2u16.to_le_bytes()); // streams
+        md.extend_from_slice(&0x20u32.to_le_bytes()); // #GUID offset
+        md.extend_from_slice(&16u32.to_le_bytes()); // #GUID size
+        md.extend_from_slice(b"#GUID\0\0\0"); // name, padded to 8
+        md.extend_from_slice(&0x40u32.to_le_bytes()); // #Blob offset
+        md.extend_from_slice(&8u32.to_le_bytes()); // #Blob size
+        md.extend_from_slice(b"#Blob\0\0\0"); // name, padded to 8
+        let (names, guid) = parse_clr_streams(&md).unwrap();
+        assert_eq!(names, vec!["#GUID".to_string(), "#Blob".to_string()]);
+        assert_eq!(guid, Some((0x20, 16)));
+        assert!(parse_clr_streams(&b"NOPE"[..]).is_none());
+    }
+
+    #[test]
     fn machine_string_known_values() {
         assert_eq!(machine_string(0x8664), "x86_64");
         assert_eq!(machine_string(0x014c), "i386");
@@ -2066,6 +2239,44 @@ mod tests {
         assert!(v.get("pe.coff").is_some() || v.get("pe.machine").is_some());
         // PIE flag derived from DLL_CHARACTERISTICS_DYNAMIC_BASE.
         assert!(m.get("binary.is_pie").is_some());
+    }
+
+    // Managed CLR extraction, end to end, against tiny C# libraries built from
+    // the same source with and without `csc /keyfile` (see tests/fixtures).
+    #[test]
+    fn clr_unsigned_fixture_reports_no_strong_name() {
+        let (v, _, m) = run(&read_fixture("managed-unsigned.dll"));
+        // STRONGNAMESIGNED bit clear -> metric 0 (the forgery-relevant state).
+        assert_eq!(m.get("pe.clr.strong_name_signed"), Some(0.0));
+        assert_eq!(m.get("pe.clr.is_il_only"), Some(1.0));
+        assert_eq!(
+            v.get("pe.clr.metadata_version").and_then(JsonValue::as_str),
+            Some("v4.0.30319")
+        );
+        // MVID is a well-formed lowercase 8-4-4-4-12 GUID.
+        let mvid = v
+            .get("pe.clr.mvid")
+            .and_then(JsonValue::as_str)
+            .expect("mvid present");
+        assert_eq!(mvid.len(), 36);
+        assert_eq!(mvid.matches('-').count(), 4);
+        assert!(mvid.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+        // Standard heaps, in order; a `#-`/`#Schema` stream would signal IL patching.
+        let streams: Vec<&str> = v
+            .get("pe.clr.streams")
+            .and_then(JsonValue::as_array)
+            .expect("streams present")
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .collect();
+        assert_eq!(streams, ["#~", "#Strings", "#US", "#GUID", "#Blob"]);
+    }
+
+    #[test]
+    fn clr_signed_fixture_reports_strong_name() {
+        // Same source, strong-name signed: the STRONGNAMESIGNED bit flips the metric.
+        let (_, _, m) = run(&read_fixture("managed-signed.dll"));
+        assert_eq!(m.get("pe.clr.strong_name_signed"), Some(1.0));
     }
 
     /// A normal local-export fixture has no forwarded exports —
