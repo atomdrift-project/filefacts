@@ -336,6 +336,16 @@ pub const DEFAULT_MAX_ITEMS: usize = 16_000;
 const EVICTION_TARGET_NUM: usize = 9;
 const EVICTION_TARGET_DEN: usize = 10;
 
+/// Entries older than this are evicted regardless of the count/byte caps, so
+/// nothing lingers forever. Uses mtime, which [`load`] bumps on a hit, so a
+/// still-used entry is never dropped for age alone. 30 days.
+const MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Disk ceiling for the cache; over it, the oldest entries are evicted to 90%.
+/// The item cap usually binds first — this bounds the pathological case of a
+/// few very large entries. 2 GiB.
+const MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 // Process-wide item cap, read by both the startup sweep and the on-write
 // trigger so a single `set_max_items` reconfigures every cleanup path.
 static MAX_ITEMS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_ITEMS);
@@ -367,6 +377,11 @@ static SWEEP_RUNNING: AtomicBool = AtomicBool::new(false);
 /// runs at a time, so repeated calls are cheap no-ops while one is in flight.
 pub fn cleanup() {
     spawn_sweep(max_items());
+    // Also reclaim stng's on-disk caches. filefacts fills stng's string cache
+    // during extraction, and — unlike filefacts' own cache — nothing else prunes
+    // it in a filefacts- or cleave-only process (cleave routes its startup
+    // cleanup through here). Best-effort, self-gated to once a day, non-blocking.
+    stng::cache_sweep::spawn(vec![stng::cache_sweep::stng_budget()]);
 }
 
 /// Claim the sweep guard and run the cleanup passes on a detached thread.
@@ -416,31 +431,32 @@ fn maybe_trigger_sweep(sha_hex: &str) {
     }
 }
 
-/// Enforce the item cap synchronously: if the cache holds more than
-/// `max_items` entries, evict the oldest — least-recently-*used*, since
-/// [`load`] bumps an entry's mtime on a hit — down to 90% of the cap.
-/// Best-effort; failures are ignored.
+/// Enforce the cache's bounds synchronously, best-effort (failures ignored):
 ///
-/// Content-only, matching cleave's analysis cache: there is no age cutoff.
-/// The cache key folds in the [`build_fingerprint`], so every filefacts
-/// rebuild orphans the previous build's entries; because those orphans are
-/// never read again their mtime never advances, so LRU eviction discards
-/// them first once the cap is reached. Prefer [`cleanup`], which runs this
-/// off the hot path.
+/// 1. Drop entries older than [`MAX_AGE`] (the 30-day TTL). mtime is
+///    least-recently-*used* — [`load`] bumps it on a hit — so a still-used
+///    entry is never dropped for age alone.
+/// 2. If the cache still exceeds `max_items` entries or [`MAX_BYTES`] on disk,
+///    evict the oldest until both are within 90% of their caps.
+///
+/// The cache key folds in the [`build_fingerprint`], so every filefacts rebuild
+/// orphans the previous build's entries; because those orphans are never read
+/// again their mtime never advances, so they age out and are evicted first.
+/// Prefer [`cleanup`], which runs this off the hot path.
 pub fn enforce_limits(max_items: usize) {
     let Some(dir) = version_dir() else {
         return;
     };
-    enforce_limits_in(&dir, max_items);
+    enforce_limits_in(&dir, max_items, MAX_BYTES);
 }
 
-fn enforce_limits_in(version_dir: &Path, max_items: usize) {
+fn enforce_limits_in(version_dir: &Path, max_items: usize, max_bytes: u64) {
     let Ok(shards) = fs::read_dir(version_dir) else {
         return;
     };
-    // One transient (path, mtime) per live entry — a few MB at the default
-    // ceiling, freed as soon as the sweep returns.
-    let mut entries: Vec<(PathBuf, SystemTime)> = Vec::new();
+    // One transient (path, mtime, bytes) per live entry — a few MB at the
+    // default ceiling, freed as soon as the sweep returns.
+    let mut entries: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
     for shard in shards.flatten() {
         let Ok(files) = fs::read_dir(shard.path()) else {
             continue;
@@ -452,21 +468,44 @@ fn enforce_limits_in(version_dir: &Path, max_items: usize) {
             if path.extension().is_none_or(|ext| ext != "bin") {
                 continue;
             }
-            let Ok(mtime) = file.metadata().and_then(|m| m.modified()) else {
+            let Ok(meta) = file.metadata() else {
                 continue;
             };
-            entries.push((path, mtime));
+            let Ok(mtime) = meta.modified() else {
+                continue;
+            };
+            entries.push((path, mtime, meta.len()));
         }
     }
-    if entries.len() <= max_items {
-        return;
-    }
-    let target = max_items * EVICTION_TARGET_NUM / EVICTION_TARGET_DEN;
-    let excess = entries.len() - target;
-    // Oldest (least-recently-used) first, then drop the excess head.
-    entries.sort_unstable_by_key(|&(_, mtime)| mtime);
-    for (path, _) in entries.into_iter().take(excess) {
-        let _ = fs::remove_file(path);
+
+    // Age pass: drop anything past the TTL outright, whatever the counts.
+    let now = SystemTime::now();
+    entries.retain(|(path, mtime, _)| {
+        if now.duration_since(*mtime).unwrap_or_default() > MAX_AGE {
+            let _ = fs::remove_file(path);
+            false
+        } else {
+            true
+        }
+    });
+
+    // Count/byte pass: over either ceiling → evict oldest to 90% of both.
+    let mut total_bytes: u64 = entries.iter().map(|&(_, _, bytes)| bytes).sum();
+    if entries.len() > max_items || total_bytes > max_bytes {
+        // Oldest (least-recently-used) first.
+        entries.sort_unstable_by_key(|&(_, mtime, _)| mtime);
+        let count_target = max_items * EVICTION_TARGET_NUM / EVICTION_TARGET_DEN;
+        let byte_target = max_bytes / 10 * 9;
+        let mut count = entries.len();
+        for (path, _, bytes) in &entries {
+            if count <= count_target && total_bytes <= byte_target {
+                break;
+            }
+            if fs::remove_file(path).is_ok() {
+                count -= 1;
+                total_bytes = total_bytes.saturating_sub(*bytes);
+            }
+        }
     }
 }
 
@@ -731,7 +770,7 @@ mod tests {
             })
             .collect();
         // Cap 10 → evict down to 90% (9), so the 4 oldest go.
-        enforce_limits_in(tmp.path(), 10);
+        enforce_limits_in(tmp.path(), 10, MAX_BYTES);
         for (i, p) in paths.iter().enumerate() {
             if i < 4 {
                 assert!(!p.exists(), "entry {i:02} (oldest) should be evicted");
@@ -739,6 +778,49 @@ mod tests {
                 assert!(p.exists(), "entry {i:02} (newer) should be kept");
             }
         }
+    }
+
+    #[test]
+    fn enforce_limits_drops_entries_past_ttl() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shard = tmp.path().join("ab");
+        fs::create_dir_all(&shard).expect("shard");
+        let now = SystemTime::now();
+        // Both well under the item cap, so only the age pass can act.
+        let stale = entry_with_mtime(&shard, "stale.bin", now - MAX_AGE - Duration::from_secs(1));
+        let fresh = entry_with_mtime(&shard, "fresh.bin", now - Duration::from_secs(3600));
+        enforce_limits_in(tmp.path(), 10_000, MAX_BYTES);
+        assert!(!stale.exists(), "entry past the 30d TTL is evicted");
+        assert!(fresh.exists(), "a recently-used entry is kept");
+    }
+
+    #[test]
+    fn enforce_limits_evicts_oldest_over_byte_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shard = tmp.path().join("ab");
+        fs::create_dir_all(&shard).expect("shard");
+        let now = SystemTime::now();
+        // Five 400-byte entries (2000 total), all under the item cap and the
+        // 30d TTL. Byte cap 1000 → target 900, so the 3 oldest are evicted.
+        let paths: Vec<PathBuf> = (0..5u64)
+            .map(|i| {
+                let path = shard.join(format!("{i}.bin"));
+                fs::write(&path, vec![b'x'; 400]).expect("write");
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .expect("open")
+                    .set_modified(now - Duration::from_secs((5 - i) * 3600))
+                    .expect("mtime");
+                path
+            })
+            .collect();
+        enforce_limits_in(tmp.path(), 10_000, 1000);
+        assert!(!paths[0].exists(), "oldest evicted for byte cap");
+        assert!(!paths[1].exists());
+        assert!(!paths[2].exists());
+        assert!(paths[3].exists(), "newest kept");
+        assert!(paths[4].exists());
     }
 
     #[test]
@@ -750,7 +832,7 @@ mod tests {
         let kept: Vec<PathBuf> = (0..5u64)
             .map(|i| entry_with_mtime(&shard, &format!("{i}.bin"), now))
             .collect();
-        enforce_limits_in(tmp.path(), 100);
+        enforce_limits_in(tmp.path(), 100, MAX_BYTES);
         assert!(kept.iter().all(|p| p.exists()), "nothing evicted under cap");
     }
 
@@ -762,7 +844,7 @@ mod tests {
         // An in-flight write under the most aggressive cap: it is not a
         // finished `.bin`, so it must survive.
         let inflight = entry_with_mtime(&shard, "partial.tmp", SystemTime::now());
-        enforce_limits_in(tmp.path(), 0);
+        enforce_limits_in(tmp.path(), 0, MAX_BYTES);
         assert!(
             inflight.exists(),
             "a non-.bin in-flight write is never swept"

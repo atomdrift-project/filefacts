@@ -290,7 +290,9 @@ debug = 2
 
 
 # Local-only override for cross-repo development against unpublished stng changes
-# (the stng-owned string cache API). Remove before committing — restore the git pin.
+# (the stng-owned string cache API, now also `stng::cache_sweep`). Only applies
+# when filefacts is built as the root crate, so consumers (cleave/scan) are
+# unaffected. Remove before committing — restore the git pin.
 
 [profile.dev]
 debug = "line-tables-only"
