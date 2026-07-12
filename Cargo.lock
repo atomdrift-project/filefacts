@@ -1598,7 +1598,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "1.7.1"
-source = "git+https://codeberg.org/atomdrift/stng.git#323676a1b000dd46882dabc3124d60ca17599d15"
+source = "git+https://codeberg.org/atomdrift/stng.git#8f0a83eedb7f6f3aaee71ea9de319819461a5d4d"
 dependencies = [
  "aho-corasick",
  "anyhow",
