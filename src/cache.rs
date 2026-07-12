@@ -494,7 +494,9 @@ fn enforce_limits_in(version_dir: &Path, max_items: usize, max_bytes: u64) {
     if entries.len() > max_items || total_bytes > max_bytes {
         // Oldest (least-recently-used) first.
         entries.sort_unstable_by_key(|&(_, mtime, _)| mtime);
-        let count_target = max_items * EVICTION_TARGET_NUM / EVICTION_TARGET_DEN;
+        // Divide before multiplying so a huge `max_items` (e.g. `set_max_items`
+        // with `usize::MAX`) can't overflow; mirrors `byte_target` below.
+        let count_target = max_items / EVICTION_TARGET_DEN * EVICTION_TARGET_NUM;
         let byte_target = max_bytes / 10 * 9;
         let mut count = entries.len();
         for (path, _, bytes) in &entries {
