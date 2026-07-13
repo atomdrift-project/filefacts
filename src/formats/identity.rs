@@ -238,23 +238,21 @@ fn pe(values: &Values, id: &mut Identity) {
 
 fn crx(values: &Values, id: &mut Identity) {
     if let Some(ext_id) = get_str(values, "crx.extension_id") {
-        // The extension id is the SHA-256 of the packager's public key:
-        // a CRX3 signature proves the holder of that key built this.
-        let verified = values.get("crx.public_key_sha256").is_some();
+        // CRX3 carries the canonical extension id in SignedData. The parser
+        // identifies a matching developer proof key when present, but does not
+        // cryptographically verify that proof, so this remains an unverified
+        // structural claim.
         id.identifier = Some(Claim {
             value: ext_id.to_string(),
             source: "crx.extension_id".into(),
-            verified,
+            verified: false,
         });
         id.unique_ids.insert("crx_id".into(), ext_id.to_string());
-        if verified {
-            // Key-based identity with no CA chain to vouch for it.
-            id.trust = Trust::SelfSigned;
-        }
     }
     if let Some(pk) = get_str(values, "crx.public_key_sha256") {
         id.unique_ids
             .insert("public_key_sha256".into(), pk.to_string());
+        id.trust = Trust::Unverified;
     }
     // Developer-declared author from the extension manifest.
     push_author(

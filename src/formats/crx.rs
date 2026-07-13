@@ -3,20 +3,21 @@
 //! A CRX file is a ZIP with a signed header prepended. The ZIP body is
 //! walked by the generic [`super::zip`] extractor (the `zip` crate
 //! tolerates the prefix); this module decodes the header to recover the
-//! identity that ZIP can't carry: the packager's public key and the
-//! **extension id** derived from it.
+//! identity that ZIP can't carry: the developer proof key and canonical
+//! **extension id**.
 //!
-//! The extension id is the canonical Chrome identifier — the first 16
-//! bytes of `SHA-256(DER public key)`, each nibble mapped `0..15` →
-//! `a..p`. Because it is a hash of the signing key, it is forgery-proof
-//! in a way a manifest name is not.
+//! The extension id is the first 16 bytes of a SHA-256 digest, each nibble
+//! mapped `0..15` → `a..p`. CRX2 derives it directly from its public key.
+//! CRX3 declares it in the signed-header `SignedData`; Web Store packages can
+//! carry a publisher proof before the developer proof, so hashing the first
+//! proof key produces the wrong extension id.
 //!
 //! Two on-disk layouts:
 //! - **CRX2**: `Cr24`, version, key length, signature length, then the
 //!   DER `SubjectPublicKeyInfo` directly.
 //! - **CRX3**: `Cr24`, version, header length, then a protobuf
-//!   `CrxFileHeader` whose first `sha256_with_rsa` proof carries the
-//!   public key.
+//!   `CrxFileHeader`. Field 10000 contains the canonical signed id; RSA/ECDSA
+//!   proofs are searched for a developer key whose hash agrees with that id.
 
 use std::io::Read;
 
@@ -81,32 +82,47 @@ fn header(bytes: &[u8], values: &mut Values) {
     let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
     values.insert("crx.version", JsonValue::from(version));
 
-    let Some(public_key) = public_key(bytes, version) else {
-        return;
-    };
-    let digest = Sha256::digest(public_key);
-    values.insert(
-        "crx.public_key_sha256",
-        JsonValue::String(hex_lower(&digest)),
-    );
-    values.insert("crx.extension_id", JsonValue::String(extension_id(&digest)));
-}
-
-/// Locate the DER public key for either CRX version.
-fn public_key(bytes: &[u8], version: u32) -> Option<&[u8]> {
     match version {
         2 => {
-            let key_len = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?) as usize;
-            let start = 16usize;
-            bytes.get(start..start.checked_add(key_len)?)
+            let Some(public_key) = crx2_public_key(bytes) else {
+                return;
+            };
+            let digest = Sha256::digest(public_key);
+            values.insert(
+                "crx.public_key_sha256",
+                JsonValue::String(hex_lower(&digest)),
+            );
+            values.insert("crx.extension_id", JsonValue::String(extension_id(&digest)));
         }
         3 => {
-            let header_len = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?) as usize;
-            let header = bytes.get(12..12usize.checked_add(header_len)?)?;
-            first_rsa_public_key(header)
+            let Some(header) = crx3_header(bytes) else {
+                return;
+            };
+            let Some(crx_id) = signed_crx_id(header) else {
+                return;
+            };
+            values.insert("crx.extension_id", JsonValue::String(extension_id(crx_id)));
+            if let Some(public_key) = matching_developer_public_key(header, crx_id) {
+                let digest = Sha256::digest(public_key);
+                values.insert(
+                    "crx.public_key_sha256",
+                    JsonValue::String(hex_lower(&digest)),
+                );
+            }
         }
-        _ => None,
+        _ => {}
     }
+}
+
+fn crx2_public_key(bytes: &[u8]) -> Option<&[u8]> {
+    let key_len = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?) as usize;
+    let start = 16usize;
+    bytes.get(start..start.checked_add(key_len)?)
+}
+
+fn crx3_header(bytes: &[u8]) -> Option<&[u8]> {
+    let header_len = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?) as usize;
+    bytes.get(12..12usize.checked_add(header_len)?)
 }
 
 /// Map a SHA-256 digest to the 32-character `a..p` Chrome extension id.
@@ -179,18 +195,47 @@ fn next_field<'a>(buf: &'a [u8], pos: &mut usize) -> Option<(u64, &'a [u8])> {
     None
 }
 
-fn first_rsa_public_key(header: &[u8]) -> Option<&[u8]> {
+/// Decode `CrxFileHeader.signed_header_data` (field 10000), then return
+/// `SignedData.crx_id` (field 1). A valid Chrome extension id is 16 bytes.
+fn signed_crx_id(header: &[u8]) -> Option<&[u8]> {
     let mut pos = 0;
     while let Some((field, data)) = next_field(header, &mut pos) {
-        // Field 2 = repeated AsymmetricKeyProof sha256_with_rsa.
-        if field == 2 {
+        if field == 10_000 {
             let mut inner = 0;
-            while let Some((proof_field, proof_data)) = next_field(data, &mut inner) {
-                // Field 1 = public_key.
-                if proof_field == 1 {
-                    return Some(proof_data);
+            while let Some((signed_field, signed_data)) = next_field(data, &mut inner) {
+                if signed_field == 1 && signed_data.len() == 16 {
+                    return Some(signed_data);
                 }
             }
+        }
+    }
+    None
+}
+
+/// Return the RSA or ECDSA proof key whose SHA-256 prefix equals the signed
+/// CRX id. Publisher proofs (notably the shared Chrome Web Store key) do not
+/// satisfy this relation and are intentionally ignored.
+fn matching_developer_public_key<'a>(header: &'a [u8], crx_id: &[u8]) -> Option<&'a [u8]> {
+    let mut pos = 0;
+    while let Some((field, proof)) = next_field(header, &mut pos) {
+        if field != 2 && field != 3 {
+            continue;
+        }
+        let mut inner = 0;
+        let mut public_key = None;
+        let mut has_signature = false;
+        while let Some((proof_field, data)) = next_field(proof, &mut inner) {
+            match proof_field {
+                1 => public_key = Some(data),
+                2 => has_signature = !data.is_empty(),
+                _ => {}
+            }
+        }
+        if has_signature
+            && let Some(public_key) = public_key
+            && Sha256::digest(public_key).get(..16) == Some(crx_id)
+        {
+            return Some(public_key);
         }
     }
     None
@@ -208,13 +253,43 @@ mod tests {
     }
 
     #[test]
-    fn crx3_public_key_round_trips_through_protobuf() {
-        // CrxFileHeader { sha256_with_rsa: [ { public_key: "KEY" } ] }
-        // field 2 (LEN) -> { field 1 (LEN) -> "KEY" }
-        let proof = [0x0a, 0x03, b'K', b'E', b'Y']; // field 1, len 3
-        let mut header = vec![0x12, proof.len() as u8]; // field 2, len
-        header.extend_from_slice(&proof);
-        assert_eq!(first_rsa_public_key(&header), Some(&b"KEY"[..]));
+    fn crx3_uses_signed_id_and_matching_developer_proof() {
+        let publisher_key = b"shared publisher key";
+        let developer_key = b"extension developer key";
+        let digest = Sha256::digest(developer_key);
+        let crx_id = &digest[..16];
+
+        let mut header = Vec::new();
+        for key in [publisher_key.as_slice(), developer_key.as_slice()] {
+            let mut proof = vec![0x0a, key.len() as u8];
+            proof.extend_from_slice(key);
+            proof.extend_from_slice(&[0x12, 0x01, 0x01]);
+            header.extend_from_slice(&[0x12, proof.len() as u8]);
+            header.extend_from_slice(&proof);
+        }
+        let mut signed_data = vec![0x0a, 16];
+        signed_data.extend_from_slice(crx_id);
+        // field 10000, wire type 2
+        header.extend_from_slice(&[0x82, 0xf1, 0x04, signed_data.len() as u8]);
+        header.extend_from_slice(&signed_data);
+
+        let mut bytes = b"Cr24".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&header);
+
+        let mut values = Values::new();
+        super::header(&bytes, &mut values);
+        assert_eq!(
+            values.get("crx.extension_id").and_then(JsonValue::as_str),
+            Some(extension_id(crx_id).as_str())
+        );
+        assert_eq!(
+            values
+                .get("crx.public_key_sha256")
+                .and_then(JsonValue::as_str),
+            Some(hex_lower(&digest).as_str())
+        );
     }
 
     #[test]

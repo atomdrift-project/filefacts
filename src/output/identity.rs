@@ -152,6 +152,9 @@ pub enum Trust {
     /// No signature present.
     #[default]
     Unsigned,
+    /// A signature structure is present, but its cryptographic proof has not
+    /// been verified. This records signed packaging without overstating trust.
+    Unverified,
     /// Ad-hoc signed: a code signature with no identifying certificate
     /// chain (Mach-O `CS_ADHOC`). Integrity without identity.
     AdHoc,
