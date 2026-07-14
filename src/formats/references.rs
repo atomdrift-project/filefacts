@@ -40,6 +40,8 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Vec<
         FileType::PoetryLock => poetry_lock(values, &mut out),
         FileType::PipfileLock => pipfile_lock(values, &mut out),
         FileType::GemfileLock => gemfile_lock(&mut out),
+        FileType::Gem => gem_runtime_deps(values, &mut out),
+        FileType::Vsix => vsix_deps(values, &mut out),
         FileType::ComposerLock => composer_lock(values, &mut out),
         FileType::YarnLock => yarn_lock(&mut out),
         FileType::PnpmLock => pnpm_lock(values, &mut out),
@@ -312,6 +314,72 @@ fn gemfile_lock(out: &mut Refs<'_>) {
             RefKind::Dependency,
             "Gemfile.lock",
             line.trim(),
+            None,
+        );
+    }
+}
+
+/// A `.gem` archive's declared runtime dependencies, read from the
+/// `gem.runtime_dependencies` names the gem extractor lifts out of `metadata.gz`.
+/// A gemspec declares version *ranges* (`>= 0`, `~> 1.0`), not pins, so these are
+/// unversioned `pkg:gem/<name>` PURLs that resolve to the current release through
+/// rubygems.org at fetch time. Development dependencies are intentionally excluded
+/// (the extractor already split them out). This is the gem counterpart to npm's
+/// manifest-declared deps: without it a scanned gem would resolve no dependencies
+/// at all, and a Ruby `require` is *not* a substitute — it is not npm, and its
+/// specifier is a load path, not a gem name (`require "faraday/multipart"` loads
+/// the `faraday-multipart` gem).
+fn gem_runtime_deps(values: &Values, out: &mut Refs<'_>) {
+    let Some(deps) = values
+        .get("gem.runtime_dependencies")
+        .and_then(JsonValue::as_array)
+    else {
+        return;
+    };
+    for dep in deps {
+        let Some(name) = dep.as_str() else { continue };
+        if name.is_empty() {
+            continue;
+        }
+        out.push(
+            RefLocator::Purl(format!("pkg:gem/{name}")),
+            RefKind::Dependency,
+            "gem.runtime_dependencies",
+            name,
+            None,
+        );
+    }
+}
+
+/// A VSIX extension's declared `<Dependency Id="publisher.name">` elements — the
+/// other marketplace extensions it activates. Each resolves as a VS Code
+/// Marketplace PURL (`pkg:vscode/<publisher>/<name>`), the same ecosystem the
+/// extension itself belongs to — *not* npm, even though a VSIX is a zip of Node
+/// code. The declared version is a range the marketplace resolver ignores, so
+/// these are unversioned. An `Id` without the `publisher.name` shape isn't a
+/// resolvable extension identity and is skipped rather than turned into a bad ref.
+fn vsix_deps(values: &Values, out: &mut Refs<'_>) {
+    let Some(deps) = values
+        .get("vsix.dependencies")
+        .and_then(JsonValue::as_array)
+    else {
+        return;
+    };
+    for dep in deps {
+        let Some(id) = dep.get("id").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some((publisher, name)) = id.split_once('.') else {
+            continue;
+        };
+        if publisher.is_empty() || name.is_empty() {
+            continue;
+        }
+        out.push(
+            RefLocator::Purl(format!("pkg:vscode/{publisher}/{name}")),
+            RefKind::Dependency,
+            "vsix.dependencies",
+            id,
             None,
         );
     }
@@ -1560,6 +1628,67 @@ mod tests {
         assert!(!purls.iter().any(|p| p.contains("rspec-core")), "{purls:?}");
         // The GIT gem isn't on rubygems.org, so it's skipped.
         assert!(!purls.iter().any(|p| p.contains("/bar@")), "{purls:?}");
+    }
+
+    #[test]
+    fn gem_archive_resolves_runtime_deps_to_rubygems() {
+        // A .gem's declared runtime deps (lifted from metadata.gz by the gem
+        // extractor) resolve as unversioned gem PURLs — the gemspec declares
+        // ranges, not pins. This is the manifest path; it must NOT depend on
+        // `require` statements (which are load paths, not gem names, and are not
+        // npm — the bug that motivated this arm).
+        let mut values = Values::new();
+        values.insert(
+            "gem.runtime_dependencies",
+            serde_json::json!(["faraday", "faraday-multipart", "mime-types"]),
+        );
+        let refs = derive(FileType::Gem, &[], &values);
+        let p = purls(&refs);
+        assert!(p.contains(&"pkg:gem/faraday"), "{p:?}");
+        assert!(p.contains(&"pkg:gem/faraday-multipart"), "{p:?}");
+        assert!(p.contains(&"pkg:gem/mime-types"), "{p:?}");
+        // Every dep is a rubygems PURL — nothing leaked to npm.
+        assert!(
+            refs.iter().all(|r| matches!(
+                &r.locator,
+                RefLocator::Purl(pu) if pu.starts_with("pkg:gem/")
+            )),
+            "{refs:?}"
+        );
+        assert!(refs.iter().all(|r| r.kind == RefKind::Dependency));
+    }
+
+    #[test]
+    fn gem_archive_without_deps_yields_nothing() {
+        // A dependency-free gem (or one whose metadata.gz had no runtime deps)
+        // must not fabricate references.
+        let refs = derive(FileType::Gem, &[], &Values::new());
+        assert!(refs.is_empty(), "{refs:?}");
+    }
+
+    #[test]
+    fn vsix_dependencies_resolve_to_the_marketplace() {
+        // A VSIX's `<Dependency>` extension ids resolve as VS Code Marketplace
+        // PURLs (publisher/name), not npm — even though the VSIX is Node code.
+        let mut values = Values::new();
+        values.insert(
+            "vsix.dependencies",
+            serde_json::json!([
+                { "id": "ms-python.python", "version": "2024.0.0" },
+                { "id": "dbaeumer.vscode-eslint" },
+                { "id": "no-dot-here" },     // not a publisher.name → skipped
+                { "version": "1.0.0" }       // no id → skipped
+            ]),
+        );
+        let refs = derive(FileType::Vsix, &[], &values);
+        let p = purls(&refs);
+        assert!(p.contains(&"pkg:vscode/ms-python/python"), "{p:?}");
+        assert!(p.contains(&"pkg:vscode/dbaeumer/vscode-eslint"), "{p:?}");
+        assert_eq!(p.len(), 2, "malformed ids must be skipped: {p:?}");
+        assert!(
+            refs.iter().all(|r| r.kind == RefKind::Dependency),
+            "{refs:?}"
+        );
     }
 
     #[test]
