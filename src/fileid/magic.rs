@@ -262,9 +262,19 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             }
         }
         b'!' => {
-            // Debian package: !<arch>
-            if data.starts_with(b"!<arch>") {
-                Some((FileType::Deb, DetectionSource::Magic))
+            // Unix `ar` archive (`!<arch>\n`). This magic is shared by Debian
+            // packages and static libraries (.a). Distinguish by the first `ar`
+            // member: a `.deb` always leads with `debian-binary`; a static
+            // library leads with a symbol/string table (`/`, `//`, `__.SYMDEF`)
+            // or an object file. Without this split every `.a` was mis-typed as
+            // `Deb`, so its object bytes were scanned as an opaque package.
+            if data.starts_with(b"!<arch>\n") {
+                let ty = if ar_first_member_is(data, b"debian-binary") {
+                    FileType::Deb
+                } else {
+                    FileType::StaticLib
+                };
+                Some((ty, DetectionSource::Magic))
             } else {
                 None
             }
@@ -469,6 +479,23 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
     }
 
     None
+}
+
+/// Peek the first `ar` member's name and compare it to `want`.
+///
+/// An `ar` archive is `!<arch>\n` (8 bytes) followed by fixed 60-byte member
+/// headers; the name is the leading 16-byte field, space-padded and sometimes
+/// terminated with `/` (GNU). Used to tell a Debian package (first member
+/// `debian-binary`) from a static library (a symbol/string table or object).
+fn ar_first_member_is(data: &[u8], want: &[u8]) -> bool {
+    const AR_MAGIC_LEN: usize = 8; // "!<arch>\n"
+    let Some(field) = data.get(AR_MAGIC_LEN..AR_MAGIC_LEN + 16) else {
+        return false;
+    };
+    let end = field.iter().rposition(|&b| b != b' ').map_or(0, |p| p + 1);
+    let name = &field[..end];
+    let name = name.strip_suffix(b"/").unwrap_or(name);
+    name == want
 }
 
 fn looks_like_udif_dmg(data: &[u8]) -> bool {
@@ -1176,6 +1203,54 @@ mod tests {
         let data = b"Rar!\x1a\x07\x01\x00";
         let (ft, _) = detect_from_content(Path::new("archive.rar"), data).unwrap();
         assert_eq!(ft, FileType::Rar);
+    }
+
+    /// Build a Unix `ar` archive from `(member_name, data)` pairs.
+    fn ar_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = b"!<arch>\n".to_vec();
+        for (name, data) in members {
+            let header = format!(
+                "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}",
+                name,
+                "0",
+                "0",
+                "0",
+                "100644",
+                data.len()
+            );
+            out.extend_from_slice(header.as_bytes());
+            out.extend_from_slice(b"`\n");
+            out.extend_from_slice(data);
+            if data.len() % 2 == 1 {
+                out.push(b'\n'); // members are 2-byte aligned
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn ar_debian_binary_is_deb() {
+        // A `.deb` always leads with the `debian-binary` member. Detect by
+        // magic alone (extensionless path) to exercise the member peek.
+        let deb = ar_archive(&[("debian-binary", b"2.0\n"), ("control.tar.gz", b"xx")]);
+        let (ft, _) = detect_from_content(Path::new("mystery"), &deb).unwrap();
+        assert_eq!(ft, FileType::Deb);
+
+        // GNU `ar` slash-terminates member names; still a Deb.
+        let deb_slash = ar_archive(&[("debian-binary/", b"2.0\n")]);
+        let (ft, _) = detect_from_content(Path::new("mystery"), &deb_slash).unwrap();
+        assert_eq!(ft, FileType::Deb);
+    }
+
+    #[test]
+    fn ar_static_library_is_not_deb() {
+        // A static library (.a) leads with a symbol table (`/`) or an object
+        // member — never `debian-binary`. It must NOT be mis-typed as `Deb`
+        // (which sent libcurl.a et al. down the Debian-package extractor and
+        // exposed their object bytes to archive-family content rules).
+        let lib = ar_archive(&[("/", b"symtab.."), ("curl_ftp.o/", b"\x7fELF....")]);
+        let (ft, _) = detect_from_content(Path::new("mystery"), &lib).unwrap();
+        assert_eq!(ft, FileType::StaticLib);
     }
 
     #[test]

@@ -172,6 +172,7 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::Beam
         | FileType::Wasm
         | FileType::AndroidDex
+        | FileType::StaticLib
         | FileType::Lnk => "binary",
         // Interpreted scripting languages (cleave's `scripts` for-group).
         FileType::Shell
@@ -448,6 +449,10 @@ pub enum FileType {
     Rar,
     /// Debian package (.deb)
     Deb,
+    /// Unix static library (.a) — an `ar` archive of relocatable object files.
+    /// Shares the `!<arch>` magic with `.deb`; distinguished by the first `ar`
+    /// member (`.deb` leads with `debian-binary`, a static library does not).
+    StaticLib,
     /// RPM package (.rpm)
     Rpm,
     /// macOS installer package (.pkg, XAR format). Named `PkgMacos` (not bare
@@ -823,6 +828,7 @@ impl FileType {
             Self::Jar => "jar",
             // Packages.
             Self::Deb => "deb",
+            Self::StaticLib => "static-lib",
             Self::Rpm => "rpm",
             Self::Dmg => "dmg",
             Self::Chm => "chm",
@@ -950,6 +956,7 @@ impl FileType {
             "asar" => Self::Asar,
             "jar" => Self::Jar,
             "deb" => Self::Deb,
+            "static-lib" => Self::StaticLib,
             "rpm" => Self::Rpm,
             "dmg" => Self::Dmg,
             "chm" => Self::Chm,

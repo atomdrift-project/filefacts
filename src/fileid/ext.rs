@@ -387,6 +387,10 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "7z" | "cb7" => Some(FileType::SevenZ),
         "rar" | "cbr" => Some(FileType::Rar),
         "deb" | "udeb" => Some(FileType::Deb),
+        // Unix static library: an `ar` archive of object files. Magic-based
+        // detection also handles extensionless `.a`; this keeps the extension
+        // fallback consistent (and off the `Deb` path).
+        "a" => Some(FileType::StaticLib),
         "rpm" | "srpm" => Some(FileType::Rpm),
         "crx" => Some(FileType::Crx),
         "pkg" => Some(FileType::PkgMacos),
