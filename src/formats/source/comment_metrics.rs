@@ -178,7 +178,15 @@ fn extract_batch_comments(content: &str) -> Vec<String> {
         let t = line.trim_start();
         if let Some(rest) = t.strip_prefix("::") {
             comments.push(rest.to_string());
-        } else if t.len() >= 3 && t[..3].eq_ignore_ascii_case("rem") {
+        } else if t
+            .as_bytes()
+            .get(..3)
+            .is_some_and(|p| p.eq_ignore_ascii_case(b"rem"))
+        {
+            // Byte-compare, not `t[..3]`: a trimmed line can begin with a
+            // multi-byte char (e.g. CJK source comments), and slicing a str at
+            // byte 3 would panic mid-char. On a match bytes 0..2 are ASCII
+            // r/e/m, so byte 3 is a valid boundary and `&t[3..]` is safe.
             let after = &t[3..];
             if after.is_empty() || after.starts_with([' ', '\t']) {
                 comments.push(after.trim_start().to_string());
@@ -458,5 +466,25 @@ mod tests {
         assert_eq!(m.get("comments.todo_count"), Some(1.0));
         assert_eq!(m.get("comments.fixme_count"), Some(1.0));
         assert_eq!(comments.len(), 2, "both comment bodies exposed as facts");
+    }
+
+    #[test]
+    fn batch_comments_are_extracted() {
+        // `::` keeps text verbatim (leading space preserved); `rem` trims.
+        let comments =
+            extract_batch_comments(":: colon comment\nREM upper\n  rem indented\ncode\n");
+        assert_eq!(comments, vec![" colon comment", "upper", "indented"]);
+        // `rem` must be a whole token: `remove` is code, not a comment.
+        assert!(extract_batch_comments("remove x\n").is_empty());
+    }
+
+    #[test]
+    fn batch_comment_multibyte_line_does_not_panic() {
+        // A trimmed line can begin with a multi-byte char (CJK source comments
+        // are common in real packages). The `rem` check must not byte-slice at
+        // index 3 — `语言` splits mid-char there and used to panic. Regression
+        // for the matrixone scan crash (filefacts comment_metrics:181).
+        let got = extract_batch_comments("语言 test\nREM ok\n");
+        assert_eq!(got, vec!["ok"], "multibyte line ignored, real REM kept");
     }
 }
