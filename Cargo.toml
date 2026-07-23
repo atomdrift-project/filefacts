@@ -6,7 +6,7 @@ rust-version = "1.85"
 authors = ["The Atomdrift Project"]
 description = "Extracts file facts: identification, structural values, strings, metrics, symbols, sections, AST, and recoverable parse errors."
 license = "Apache-2.0"
-repository = "https://codeberg.org/atomdrift/filefacts"
+repository = "https://github.com/atomdrift-project/filefacts"
 keywords = ["forensics", "binary-analysis", "metadata", "pe", "elf"]
 categories = ["parsing", "command-line-utilities"]
 readme = "README.md"
@@ -59,7 +59,7 @@ gimli = { version = "0.32", default-features = false, features = ["read", "std"]
 # Cleave used to call this directly; centralising in filefacts lets every
 # consumer get the same high-quality string set.
 # Track upstream HEAD until the next stng release is cut.
-stng = { git = "https://codeberg.org/atomdrift/stng.git" }
+stng = { git = "https://github.com/atomdrift-project/stng.git" }
 
 
 # Archive index readers. We use these for header/central-directory enumeration

@@ -4,7 +4,7 @@ A Rust library that reads a file and tells you what is in it — built for the
 people who turn files into feature vectors. Malware classifiers, triage
 systems, dataset builders: anything that needs a dense, honest description of a
 file as model input. Extracted from
-[cleave](https://codeberg.org/atomdrift/cleave), it is the extraction layer that
+[cleave](https://github.com/atomdrift-project/cleave), it is the extraction layer that
 sits underneath Atomdrift's own models — and it is designed to sit underneath
 yours. (If you only want to understand a single file, it does that too.)
 
@@ -114,4 +114,4 @@ files with no sign of XOR logic, the XOR seed search is skipped entirely.
 ---
 
 Source and issues live on
-[Codeberg](https://codeberg.org/atomdrift/filefacts). Apache 2.0.
+[GitHub](https://github.com/atomdrift-project/filefacts). Apache 2.0.
