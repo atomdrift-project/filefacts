@@ -1202,13 +1202,10 @@ fn read_filter_value(bytes: &[u8], start: usize) -> Option<String> {
                 match bytes.get(cursor) {
                     Some(b']') => break,
                     Some(b'/') => {
-                        if let Some(name) = read_name(bytes, cursor + 1) {
-                            let trimmed = name.trim_start_matches('/').to_string();
-                            cursor += 1 + trimmed.len();
-                            names.push(trimmed);
-                        } else {
-                            return None;
-                        }
+                        let name = read_name(bytes, cursor + 1)?;
+                        let trimmed = name.trim_start_matches('/').to_string();
+                        cursor += 1 + trimmed.len();
+                        names.push(trimmed);
                     }
                     _ => return None,
                 }
