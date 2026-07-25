@@ -23,6 +23,10 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         return Some((FileType::Dmg, DetectionSource::Magic));
     }
 
+    if looks_like_iso_or_udf(data) {
+        return Some((FileType::Iso, DetectionSource::Magic));
+    }
+
     // ── First-byte jump table ────────────────────────────────────────
     // Dispatch on data[0] to avoid evaluating 30+ conditions sequentially.
     // Each arm only checks formats that start with that byte.
@@ -510,6 +514,24 @@ fn looks_like_udif_dmg(data: &[u8]) -> bool {
     let version = u32::from_be_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]);
     let header_size = u32::from_be_bytes([trailer[8], trailer[9], trailer[10], trailer[11]]);
     version >= 4 && header_size == 512
+}
+
+/// Optical-disc image (`.iso`): ISO 9660 and/or UDF.
+///
+/// The Volume Descriptor set begins at sector 16 (offset `0x8000`); each
+/// 2048-byte descriptor is `[type:1][standard_identifier:5]`. ISO 9660 volume
+/// descriptors carry `"CD001"`; a UDF bridge Volume Recognition Sequence carries
+/// `"BEA01"`/`"NSR02"`/`"NSR03"`/`"TEA01"` (Windows install media are UDF). Either
+/// identifier in the first several sectors means 7-Zip can unpack the image.
+fn looks_like_iso_or_udf(data: &[u8]) -> bool {
+    (16..=22usize).any(|sector| {
+        let off = sector * 2048 + 1;
+        data.len() >= off + 5
+            && matches!(
+                &data[off..off + 5],
+                b"CD001" | b"BEA01" | b"NSR02" | b"NSR03" | b"TEA01"
+            )
+    })
 }
 
 /// Case-insensitive suffix match on path bytes (no allocation).

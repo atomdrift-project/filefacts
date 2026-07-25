@@ -248,6 +248,7 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::Rpm
         | FileType::PkgMacos
         | FileType::Dmg
+        | FileType::Iso
         | FileType::Cab
         | FileType::Chm
         | FileType::Crx
@@ -461,6 +462,10 @@ pub enum FileType {
     PkgMacos,
     /// Apple Disk Image (.dmg, UDIF container).
     Dmg,
+    /// Optical-disc image (.iso): ISO 9660 and/or UDF filesystem — full OS
+    /// install media. Identified by the volume-descriptor magic at sector 16;
+    /// unpacked downstream by 7-Zip (ISO 9660, Joliet, Rock Ridge, and UDF).
+    Iso,
     /// Cabinet archive (.cab)
     Cab,
     /// Compiled HTML Help (.chm) — Microsoft ITSF/ITOL container with
@@ -831,6 +836,7 @@ impl FileType {
             Self::StaticLib => "static-lib",
             Self::Rpm => "rpm",
             Self::Dmg => "dmg",
+            Self::Iso => "iso",
             Self::Chm => "chm",
             Self::Crx => "crx",
             Self::Xpi => "xpi",

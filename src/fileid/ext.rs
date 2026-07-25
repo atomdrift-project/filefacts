@@ -395,6 +395,7 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "crx" => Some(FileType::Crx),
         "pkg" => Some(FileType::PkgMacos),
         "dmg" => Some(FileType::Dmg),
+        "iso" => Some(FileType::Iso),
         "cab" | "msu" => Some(FileType::Cab),
         "chm" => Some(FileType::Chm),
         "asar" => Some(FileType::Asar),
