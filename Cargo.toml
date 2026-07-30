@@ -101,7 +101,14 @@ regex = "1"
 # Source-code extraction. Each language is its own crate; the base
 # `tree-sitter` engine is shared. Adding a language is one dependency
 # line plus one entry in `src/formats/source/langs.rs`.
-tree-sitter = "0.26"
+# Forked to carry an illumos fix: lib/src/portable/endian.h has no branch for
+# compilers that don't predefine __illumos__ (stock toolchains generally
+# don't), so an illumos build hits "#error platform not supported". The fork
+# adds a __sun branch over <sys/byteorder.h>. Upstream PR pending; drop this
+# back to a crates.io version once it lands. The vendored tree-sitter-clojure
+# grammar points at the same source — `links = "tree-sitter"` permits exactly
+# one copy in the graph, so the two must not diverge.
+tree-sitter = "0.27"
 tree-sitter-javascript = "0.25"
 tree-sitter-typescript = "0.23"
 tree-sitter-python = "0.25"
@@ -293,6 +300,20 @@ debug = 2
 # (the stng-owned string cache API, now also `stng::cache_sweep`). Only applies
 # when filefacts is built as the root crate, so consumers (cleave/scan) are
 # unaffected. Remove before committing — restore the git pin.
+
+# Forked tree-sitter, for the illumos fix described above. Both crates have to
+# come from the fork together: the fork's tree-sitter depends on its in-tree
+# tree-sitter-language, and `links = "tree-sitter-language"` permits only one
+# copy in the graph — leaving the grammars on the crates.io copy is a hard
+# resolver conflict, not a preference.
+#
+# Unlike the tree-sitter-clojure path dep above, [patch] does NOT resolve
+# transitively: it applies only in the root crate. Consumers that build scan
+# or cleave as the root need this same block in their own manifest. Delete it
+# everywhere once the upstream PR lands and a release carries the fix.
+[patch.crates-io]
+tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
+tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
 
 [profile.dev]
 debug = "line-tables-only"

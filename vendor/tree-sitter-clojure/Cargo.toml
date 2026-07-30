@@ -38,8 +38,10 @@ repository = "https://github.com/jerielverissimo/tree-sitter-clojure"
 name = "tree_sitter_clojure"
 path = "src/lib.rs"
 
+# Kept in lockstep with the parent crate's requirement: `links` allows only
+# one copy of the native library in the graph.
 [dependencies.tree-sitter]
-version = "0.26"
+version = "0.27"
 
 [dependencies.tree-sitter-language]
 version = "0.1.5"

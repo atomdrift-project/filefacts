@@ -2111,13 +2111,11 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter"
-version = "0.26.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af1c71c1c4cc0920b20d6b0f6572e7682cd07a6a2faec71067a31fa394c586df"
+version = "0.27.0"
+source = "git+https://github.com/tstromberg/tree-sitter?branch=master#5b21a777ada8ac7d3b448b3e4aebfe827d020a70"
 dependencies = [
  "cc",
  "regex",
- "regex-syntax",
  "serde_json",
  "streaming-iterator",
  "tree-sitter-language",
@@ -2234,9 +2232,8 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-language"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
+version = "0.1.8"
+source = "git+https://github.com/tstromberg/tree-sitter?branch=master#5b21a777ada8ac7d3b448b3e4aebfe827d020a70"
 
 [[package]]
 name = "tree-sitter-lua"
