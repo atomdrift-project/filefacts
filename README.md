@@ -70,11 +70,11 @@ things they imitate — not a metadata dump:
 
 ## What it parses
 
-- **Executables** — PE, ELF (with DWARF), Mach-O, Java class, Python bytecode,
-  WebAssembly, Android DEX.
+- **Executables** — PE (with .NET/CLR managed metadata), ELF (with DWARF),
+  Mach-O, Java class, Python bytecode, WebAssembly, Android DEX.
 - **Archives & packages** — zip, tar (+ gz/bz2/xz/zst), 7z, rar, deb, rpm, pkg,
   cab, CHM, DMG, CRX, XPI, WHL, JAR, VSIX, npm, gem, nupkg, Rust crate, Python
-  sdist, OCI container images.
+  sdist, static libraries (`.a`), OCI container images.
 - **Documents** — PDF, RTF, OOXML, OLE2 (legacy Office, MSI, MSG), LNK, plist,
   AppleScript. Authenticode is verified in-process.
 - **Images** — JPEG, PNG, with the stego metrics above.
@@ -95,7 +95,7 @@ brew install filefacts
 ```
 
 `make install` builds the release binary and copies it to the first writeable
-location on your `PATH`. As a library, add `filefacts = "1.2"` to `Cargo.toml`.
+location on your `PATH`. As a library, add `filefacts = "1.3"` to `Cargo.toml`.
 
 ```bash
 filefacts suspect.bin       # JSON facts for one file
@@ -107,9 +107,10 @@ filefacts /tmp/samples      # recurse a directory
 In-process and single-pass by design: one walk per file, no forking. Views are
 cached on disk as zstd-compressed bincode keyed by SHA-256, so a second pass
 over the same corpus is nearly free — handy when you re-extract features after
-tweaking a downstream model. The cache self-cleans, pruning to 90% of capacity
-under pressure rather than aging entries out on a timer. On source and script
-files with no sign of XOR logic, the XOR seed search is skipped entirely.
+tweaking a downstream model. The cache self-cleans in the background: it prunes
+to 90% of capacity when it exceeds its size ceiling (2 GiB) and drops entries
+past a 30-day TTL, so it never grows unbounded. On source and script files with
+no sign of XOR logic, the XOR seed search is skipped entirely.
 
 ---
 

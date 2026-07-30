@@ -187,7 +187,8 @@ pub enum Symbol {
     Function {
         /// Function name. Empty when the format records by address only.
         name: String,
-        /// Entry-point offset within the source file.
+        /// Entry-point byte offset for source formats, or virtual address for
+        /// disassembly-recovered native functions.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         offset: Option<u64>,
         /// Cyclomatic complexity (McCabe), when rizin disassembled it.
@@ -223,7 +224,8 @@ pub enum Symbol {
         /// the top-level `literals` collection.
         #[serde(default)]
         args: Vec<Arg>,
-        /// Byte offset of the call expression's start, when known.
+        /// Byte offset of the call expression for source formats, or virtual
+        /// address of the call instruction for disassembly-recovered binaries.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         offset: Option<u64>,
     },

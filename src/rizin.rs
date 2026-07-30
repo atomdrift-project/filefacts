@@ -723,6 +723,32 @@ pub(crate) struct RecoveryCounts {
 }
 
 impl RizinRecovery {
+    /// Function ranges recovered by `aflj`, expressed as
+    /// `(entry_va, size)`. PE-specific post-processing uses these ranges to
+    /// associate native byte-pattern facts with their containing functions.
+    pub(crate) fn function_ranges(&self) -> Vec<(u64, u64)> {
+        self.functions
+            .iter()
+            .map(|function| (function.offset, function.size))
+            .collect()
+    }
+
+    /// Direct inter-function call edges as
+    /// `(caller_entry_va, callsite_va, target_va)`.
+    pub(crate) fn direct_call_edges(&self) -> Vec<(u64, u64, u64)> {
+        self.functions
+            .iter()
+            .flat_map(|function| {
+                function.callrefs.iter().filter_map(move |callref| {
+                    if !callref.is_call() {
+                        return None;
+                    }
+                    Some((function.offset, callref.from?, callref.to?))
+                })
+            })
+            .collect()
+    }
+
     /// Push recovered symbols into the unified `Symbols` view and emit
     /// the rizin-specific `binary.*` metrics. Only fills slots that
     /// goblin left empty — never overwrites existing data.
@@ -759,6 +785,13 @@ impl RizinRecovery {
         let had_imports = symbols_out.iter().any(|s| s.kind() == SymbolKind::Import);
         let had_exports = symbols_out.iter().any(|s| s.kind() == SymbolKind::Export);
         let had_functions = symbols_out.iter().any(|s| s.kind() == SymbolKind::Function);
+        let had_calls = symbols_out.iter().any(|s| s.kind() == SymbolKind::Call);
+        let function_names: std::collections::HashMap<u64, String> = self
+            .functions
+            .iter()
+            .filter(|function| !function.name.is_empty())
+            .map(|function| (function.offset, function.name.clone()))
+            .collect();
         if !had_imports {
             for imp in self.imports {
                 if imp.name.is_empty() {
@@ -800,7 +833,13 @@ impl RizinRecovery {
                 let callees: Vec<String> = func
                     .callrefs
                     .iter()
-                    .filter_map(|c| c.name.clone())
+                    .filter(|callref| callref.is_call())
+                    .filter_map(|callref| {
+                        callref
+                            .name
+                            .clone()
+                            .or_else(|| function_names.get(&callref.to?).cloned())
+                    })
                     .filter(|n| !n.is_empty())
                     .collect();
                 symbols_out.push(Symbol::Function {
@@ -861,6 +900,29 @@ impl RizinRecovery {
             metrics.insert("binary.huge_func_count", huge as f64);
             metrics.insert("binary.tiny_func_count", tiny as f64);
             metrics.insert("binary.leaf_func_count", leaf as f64);
+        }
+        // `aflj.callrefs` carries concrete binary call sites even when the
+        // target has no source-level symbol. Preserve direct CALL edges in
+        // the same typed Call view used by source formats. Branch-only CODE
+        // refs are deliberately excluded: they describe CFG edges within a
+        // function, not function invocation.
+        if !had_calls {
+            for function in &self.functions {
+                for callref in &function.callrefs {
+                    if !callref.is_call() {
+                        continue;
+                    }
+                    let target = callref
+                        .name
+                        .clone()
+                        .or_else(|| function_names.get(&callref.to?).cloned());
+                    symbols_out.push(Symbol::Call {
+                        target,
+                        args: Vec::new(),
+                        offset: callref.from,
+                    });
+                }
+            }
         }
         // Section recovery for packed/obfuscated binaries where goblin
         // returned an empty section table. We populate via the same
@@ -944,6 +1006,10 @@ struct RawFunction {
     #[serde(alias = "addr")]
     #[serde(default)]
     offset: u64,
+    /// Function byte size. Used only for correlating separately recovered
+    /// native-code facts with their containing function.
+    #[serde(default)]
+    size: u64,
     /// Cyclomatic complexity.
     #[serde(default)]
     cc: Option<u32>,
@@ -961,6 +1027,24 @@ struct RawFunction {
 struct RawCallref {
     #[serde(default)]
     name: Option<String>,
+    /// Virtual address of the call instruction.
+    #[serde(default)]
+    from: Option<u64>,
+    /// Virtual address of the call target.
+    #[serde(default)]
+    to: Option<u64>,
+    /// Rizin emits `CALL` for inter-function invocation and `CODE` for
+    /// intra-function control-flow edges.
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+}
+
+impl RawCallref {
+    fn is_call(&self) -> bool {
+        self.kind
+            .as_deref()
+            .is_none_or(|kind| kind.eq_ignore_ascii_case("call"))
+    }
 }
 
 /// Rizin `iSj` section entry. Same fields cleave's `R2Section`
@@ -1068,10 +1152,35 @@ mod tests {
 
     #[test]
     fn raw_function_accepts_offset_or_addr() {
-        let v: Vec<RawFunction> = parse_json_array(r#"[{"name":"a","offset":4096}]"#).unwrap();
+        let v: Vec<RawFunction> =
+            parse_json_array(r#"[{"name":"a","offset":4096,"size":32}]"#).unwrap();
         assert_eq!(v[0].offset, 4096);
+        assert_eq!(v[0].size, 32);
         let v: Vec<RawFunction> = parse_json_array(r#"[{"name":"b","addr":8192}]"#).unwrap();
         assert_eq!(v[0].offset, 8192);
+        assert_eq!(v[0].size, 0);
+    }
+
+    #[test]
+    fn exposes_function_ranges_and_direct_call_edges() {
+        let recovery = make_recovery(
+            r#"{
+                "functions": [
+                    {
+                        "name": "caller",
+                        "offset": 4096,
+                        "size": 64,
+                        "callrefs": [
+                            {"from": 4100, "to": 8192, "type": "CALL"},
+                            {"from": 4105, "to": 4098, "type": "CODE"}
+                        ]
+                    },
+                    {"name": "callee", "offset": 8192, "size": 24}
+                ]
+            }"#,
+        );
+        assert_eq!(recovery.function_ranges(), vec![(4096, 64), (8192, 24)]);
+        assert_eq!(recovery.direct_call_edges(), vec![(4096, 4100, 8192)]);
     }
 
     // ------------------------------------------------------------------
@@ -1110,9 +1219,9 @@ mod tests {
                     "noreturn": false,
                     "is-lineal": false,
                     "callrefs": [
-                        {"name": "puts"},
-                        {"name": "exit"},
-                        {}
+                        {"name": "puts", "from": 4100, "to": 8192, "type": "CALL"},
+                        {"name": "exit", "from": 4105, "to": 12288, "type": "CALL"},
+                        {"from": 4110, "to": 4098, "type": "CODE"}
                     ]
                 }]
             }"#,
@@ -1130,6 +1239,68 @@ mod tests {
         };
         assert_eq!(*complexity, Some(7));
         assert_eq!(*callees, vec!["puts".to_string(), "exit".to_string()]);
+        assert_eq!(count_kind(&symbols, SymbolKind::Call), 2);
+        let calls: Vec<_> = symbols.iter_kind(SymbolKind::Call).collect();
+        assert!(matches!(
+            calls[0],
+            Symbol::Call {
+                target: Some(target),
+                offset: Some(4100),
+                ..
+            } if target == "puts"
+        ));
+        assert!(matches!(
+            calls[1],
+            Symbol::Call {
+                target: Some(target),
+                offset: Some(4105),
+                ..
+            } if target == "exit"
+        ));
+    }
+
+    #[test]
+    fn apply_resolves_anonymous_binary_callrefs_by_target_address() {
+        let recovery = make_recovery(
+            r#"{
+                "functions": [
+                    {
+                        "name": "entry0",
+                        "offset": 4096,
+                        "callrefs": [
+                            {"from": 4100, "to": 8192, "type": "CALL"},
+                            {"from": 4105, "to": 4098, "type": "CODE"}
+                        ]
+                    },
+                    {
+                        "name": "fcn.00002000",
+                        "offset": 8192
+                    }
+                ]
+            }"#,
+        );
+        let mut symbols = Symbols::new();
+        let mut metrics = Metrics::new();
+        recovery.apply(&mut symbols, &mut metrics);
+
+        let calls: Vec<_> = symbols.iter_kind(SymbolKind::Call).collect();
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(
+            calls[0],
+            Symbol::Call {
+                target: Some(target),
+                offset: Some(4100),
+                ..
+            } if target == "fcn.00002000"
+        ));
+        let entry = symbols
+            .iter_kind(SymbolKind::Function)
+            .find(|symbol| symbol.name() == Some("entry0"))
+            .expect("entry function");
+        assert!(matches!(
+            entry,
+            Symbol::Function { callees, .. } if callees == &["fcn.00002000".to_string()]
+        ));
     }
 
     #[test]

@@ -93,6 +93,12 @@ pub(super) fn extract(
         }
         sections(&pe, bytes, metrics, sections_out);
         imports(&pe, values, metrics, symbols_out);
+        native_resolver_signals(&pe, bytes, values, metrics);
+        // Importless PEs are the narrow class where function recovery remains
+        // worthwhile even when goblin already recovered a normal section table.
+        // This exposes Rizin's function/call graph to downstream analysis
+        // without paying that cost for ordinary applications.
+        rizin_importless_analysis(&pe, bytes, values, symbols_out, metrics);
         exports(&pe, values, metrics, symbols_out);
         authenticode(&pe, bytes, values, metrics);
         if let Some(rd) = pe.resource_data.as_ref() {
@@ -163,6 +169,7 @@ pub(super) fn extract(
         clr_metadata(&pe, bytes, values, metrics);
         clr_resources(&pe, bytes, metrics);
         data_directories(&pe, values);
+        data_directory_anomalies(&pe, bytes, values, metrics);
         super::pe_image_hash::extract(&pe, bytes, values, metrics);
         super::pe_rich::extract(bytes, values);
         super::upx::detect(bytes, values);
@@ -211,6 +218,881 @@ pub(super) fn extract(
     // when goblin did supply something, so it's safe to call unconditionally.
     rizin_fallback_with_sections(bytes, symbols_out, sections_out, metrics, "pe");
     Ok(())
+}
+
+/// Cheap native-code indicators for manual Windows API resolution.
+///
+/// These are deliberately mechanics, not a claim that a binary communicates
+/// over the network. Combined, they distinguish an importless PE's custom
+/// module/export resolver from an ordinary PEB read or arithmetic loop.
+fn native_resolver_signals(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
+    // Limit native signatures to executable sections. Scanning resources and
+    // encrypted data would make an instruction-shaped byte sequence a noisy
+    // fact rather than evidence of executable resolver code.
+    let mut peb_x86 = 0;
+    let mut peb_x64 = 0;
+    let mut export_walks = 0;
+    let mut hash_loops = 0;
+    let mut peb_sites = Vec::new();
+    let mut export_walk_sites = Vec::new();
+    let mut hash_profiles = Vec::new();
+    for section in pe
+        .sections
+        .iter()
+        .filter(|section| section.characteristics & 0x2000_0000 != 0)
+    {
+        let start = section.pointer_to_raw_data as usize;
+        let end = start.saturating_add(section.size_of_raw_data as usize);
+        let Some(code) = bytes.get(start..end) else {
+            continue;
+        };
+        for local_offset in find_bytes(code, b"\x64\xa1\x30\x00\x00\x00") {
+            peb_x86 += 1;
+            peb_sites.push(native_site(
+                pe,
+                section,
+                start.saturating_add(local_offset),
+                serde_json::json!({
+                    "architecture": "x86",
+                    "mechanism": "fs:[0x30]",
+                }),
+            ));
+        }
+        for local_offset in find_bytes(code, b"\x65\x48\x8b\x04\x25\x60\x00\x00\x00") {
+            peb_x64 += 1;
+            peb_sites.push(native_site(
+                pe,
+                section,
+                start.saturating_add(local_offset),
+                serde_json::json!({
+                    "architecture": "x86_64",
+                    "mechanism": "gs:[0x60]",
+                }),
+            ));
+        }
+        for walk in find_checked_export_walks_x86(code) {
+            export_walks += 1;
+            let mut fact = native_site(
+                pe,
+                section,
+                start.saturating_add(walk.mz_check),
+                serde_json::json!({
+                    "architecture": "x86",
+                    "kind": "checked_pe32_export_directory_walk",
+                    "checks": ["mz_signature", "pe_signature", "export_rva", "export_size"],
+                }),
+            );
+            if let Some(object) = fact.as_object_mut() {
+                object.insert(
+                    "anchors".to_string(),
+                    serde_json::json!({
+                        "mz_check_file_offset": start.saturating_add(walk.mz_check),
+                        "e_lfanew_file_offset": start.saturating_add(walk.e_lfanew),
+                        "pe_check_file_offset": start.saturating_add(walk.pe_check),
+                        "export_rva_file_offset": start.saturating_add(walk.export_rva),
+                        "export_size_file_offset": start.saturating_add(walk.export_size),
+                    }),
+                );
+            }
+            export_walk_sites.push(fact);
+        }
+        for profile in find_custom_byte_hash_profiles_x86(code) {
+            hash_loops += 1;
+            let mut fact = native_site(
+                pe,
+                section,
+                start.saturating_add(profile.loop_offset),
+                serde_json::json!({
+                    "architecture": "x86",
+                    "kind": profile.kind,
+                    "multiplier": profile.multiplier,
+                    "xor_constant": profile.xor_constant,
+                    "rotate": {
+                        "direction": "left",
+                        "bits": profile.rotate_bits,
+                    },
+                }),
+            );
+            if let Some(object) = fact.as_object_mut() {
+                if let Some(seed) = profile.seed {
+                    object.insert("seed".to_string(), serde_json::json!(seed));
+                }
+                if profile.ascii_lowercase {
+                    object.insert(
+                        "normalization".to_string(),
+                        JsonValue::String("ascii_lowercase".to_string()),
+                    );
+                }
+            }
+            hash_profiles.push(fact);
+        }
+    }
+    if peb_x86 > 0 {
+        metrics.insert("pe.peb_access_x86_count", peb_x86 as f64);
+    }
+    if peb_x64 > 0 {
+        metrics.insert("pe.peb_access_x64_count", peb_x64 as f64);
+    }
+    if export_walks > 0 {
+        metrics.insert("pe.checked_export_walk_x86_count", export_walks as f64);
+    }
+    if hash_loops > 0 {
+        metrics.insert("pe.custom_byte_hash_loop_x86_count", hash_loops as f64);
+    }
+    if !peb_sites.is_empty() {
+        values.insert("pe.peb_access_sites", JsonValue::Array(peb_sites));
+    }
+    if !export_walk_sites.is_empty() {
+        values.insert(
+            "pe.checked_export_walk_sites",
+            JsonValue::Array(export_walk_sites),
+        );
+    }
+    if !hash_profiles.is_empty() {
+        values.insert("pe.api_hash_profiles", JsonValue::Array(hash_profiles));
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+    haystack
+        .windows(needle.len())
+        .enumerate()
+        .filter_map(|(offset, window)| (window == needle).then_some(offset))
+        .collect()
+}
+
+fn native_site(
+    pe: &PE<'_>,
+    section: &goblin::pe::section_table::SectionTable,
+    file_offset: usize,
+    mut fact: JsonValue,
+) -> JsonValue {
+    let section_file_offset = section.pointer_to_raw_data as usize;
+    let delta = file_offset.saturating_sub(section_file_offset);
+    let rva = u64::from(section.virtual_address).saturating_add(delta as u64);
+    let va = pe.image_base.saturating_add(rva);
+    if let Some(object) = fact.as_object_mut() {
+        object.insert("file_offset".to_string(), serde_json::json!(file_offset));
+        object.insert("rva".to_string(), serde_json::json!(rva));
+        object.insert("va".to_string(), serde_json::json!(va));
+        object.insert(
+            "section".to_string(),
+            JsonValue::String(section.name().unwrap_or("").to_string()),
+        );
+    }
+    fact
+}
+
+/// Recover function facts and correlate manual export walkers with their
+/// concrete callsites for small importless PEs. This turns "there is an API
+/// hash loop somewhere" into the more useful fact "this call requested this
+/// hash, which exactly matches this known API under the recovered profile".
+fn rizin_importless_analysis(
+    pe: &PE<'_>,
+    bytes: &[u8],
+    values: &mut Values,
+    symbols: &mut crate::Symbols,
+    metrics: &mut Metrics,
+) {
+    const MAX_IMPORTLESS_ANALYSIS_BYTES: usize = 5 * 1024 * 1024;
+    if bytes.len() > MAX_IMPORTLESS_ANALYSIS_BYTES
+        || symbols
+            .iter()
+            .any(|symbol| symbol.kind() == crate::SymbolKind::Import)
+    {
+        return;
+    }
+    let Some(recovery) = crate::rizin::recover(bytes, crate::rizin::Analysis::Deep) else {
+        return;
+    };
+    recover_api_hash_requests(pe, bytes, values, metrics, &recovery);
+    let counts = recovery.apply(symbols, metrics);
+    metrics.insert("pe.rizin_importless_analysis", 1.0);
+    if counts.functions > 0 {
+        metrics.insert(
+            "pe.rizin_importless_function_count",
+            f64::from(counts.functions),
+        );
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LocatedHashProfile {
+    va: u64,
+    kind: String,
+    seed: u32,
+    multiplier: u32,
+    xor_constant: u32,
+    rotate_bits: u32,
+    ascii_lowercase: bool,
+}
+
+fn recover_api_hash_requests(
+    pe: &PE<'_>,
+    bytes: &[u8],
+    values: &mut Values,
+    metrics: &mut Metrics,
+    recovery: &crate::rizin::RizinRecovery,
+) {
+    let walk_sites: Vec<u64> = values
+        .get("pe.checked_export_walk_sites")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|site| site.get("va").and_then(JsonValue::as_u64))
+        .collect();
+    if walk_sites.is_empty() {
+        return;
+    }
+    let ranges = recovery.function_ranges();
+    let resolver_targets: Vec<u64> = ranges
+        .iter()
+        .filter(|(start, size)| {
+            walk_sites
+                .iter()
+                .any(|site| va_in_function(*site, *start, *size))
+        })
+        .map(|(start, _)| *start)
+        .collect();
+    if resolver_targets.is_empty() {
+        return;
+    }
+
+    let profiles = located_hash_profiles(values);
+    let call_edges = recovery.direct_call_edges();
+    let mut requests = Vec::new();
+    let mut name_matches = 0_u32;
+    let mut folded = 0_u32;
+    for (caller_va, callsite_va, resolver_va) in &call_edges {
+        if !resolver_targets.contains(resolver_va) {
+            continue;
+        }
+        let resolver_range = ranges.iter().find(|(start, _)| start == resolver_va);
+        let profile = resolver_range
+            .and_then(|(start, size)| {
+                profiles
+                    .iter()
+                    .find(|profile| va_in_function(profile.va, *start, *size))
+            })
+            .or_else(|| {
+                call_edges
+                    .iter()
+                    .filter(|(caller, _, _)| caller == resolver_va)
+                    .find_map(|(_, _, target)| {
+                        let (start, size) = ranges.iter().find(|(start, _)| start == target)?;
+                        profiles
+                            .iter()
+                            .find(|profile| va_in_function(profile.va, *start, *size))
+                    })
+            });
+        let Some(profile) = profile else {
+            continue;
+        };
+        let request = recover_x86_hash_argument(pe, bytes, *callsite_va);
+        let mut fact = serde_json::json!({
+            "kind": "hashed_pe_export_resolution",
+            "architecture": "x86",
+            "caller_va": caller_va,
+            "callsite_va": callsite_va,
+            "resolver_va": resolver_va,
+            "hash_profile_kind": profile.kind,
+            "hash_profile_va": profile.va,
+        });
+        if let Some(callsite_file_offset) = va_to_file_offset(pe, *callsite_va) {
+            fact["callsite_file_offset"] = serde_json::json!(callsite_file_offset);
+        }
+        match request {
+            Some((hash, source)) => {
+                fact["hash"] = serde_json::json!(hash);
+                fact["hash_hex"] = JsonValue::String(format!("0x{hash:08x}"));
+                fact["hash_source"] = JsonValue::String(source.to_string());
+                if source == "constant_folded_memory_xor_add" {
+                    folded = folded.saturating_add(1);
+                }
+                let matches: Vec<_> = WINDOWS_API_HASH_CANDIDATES
+                    .iter()
+                    .filter(|candidate| hash_windows_name(profile, candidate.name) == hash)
+                    .collect();
+                if matches.len() == 1 {
+                    let candidate = matches[0];
+                    fact["resolved_name"] = JsonValue::String(candidate.name.to_string());
+                    fact["resolved_library"] = JsonValue::String(candidate.library.to_string());
+                    fact["resolution"] = JsonValue::String("exact_hash_match".to_string());
+                    name_matches = name_matches.saturating_add(1);
+                }
+            }
+            None => {
+                fact["hash_source"] = JsonValue::String("runtime_expression".to_string());
+            }
+        }
+        requests.push(fact);
+    }
+    if requests.is_empty() {
+        return;
+    }
+    metrics.insert("pe.api_hash_resolver_request_count", requests.len() as f64);
+    if folded > 0 {
+        metrics.insert(
+            "pe.api_hash_constant_folded_request_count",
+            f64::from(folded),
+        );
+    }
+    if name_matches > 0 {
+        metrics.insert("pe.api_hash_name_match_count", f64::from(name_matches));
+    }
+    values.insert("pe.api_hash_resolver_requests", JsonValue::Array(requests));
+}
+
+fn va_in_function(va: u64, start: u64, size: u64) -> bool {
+    va >= start && (size == 0 && va == start || size > 0 && va < start.saturating_add(size))
+}
+
+fn located_hash_profiles(values: &Values) -> Vec<LocatedHashProfile> {
+    values
+        .get("pe.api_hash_profiles")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|profile| {
+            Some(LocatedHashProfile {
+                va: profile.get("va")?.as_u64()?,
+                kind: profile.get("kind")?.as_str()?.to_string(),
+                seed: u32::try_from(profile.get("seed")?.as_u64()?).ok()?,
+                multiplier: u32::try_from(profile.get("multiplier")?.as_u64()?).ok()?,
+                xor_constant: u32::try_from(profile.get("xor_constant")?.as_u64()?).ok()?,
+                rotate_bits: u32::try_from(profile.get("rotate")?.get("bits")?.as_u64()?).ok()?,
+                ascii_lowercase: profile.get("normalization").and_then(JsonValue::as_str)
+                    == Some("ascii_lowercase"),
+            })
+        })
+        .collect()
+}
+
+fn hash_windows_name(profile: &LocatedHashProfile, name: &str) -> u32 {
+    let mut hash = profile.seed;
+    for mut byte in name.bytes() {
+        if profile.ascii_lowercase && byte.is_ascii_uppercase() {
+            byte = byte.to_ascii_lowercase();
+        }
+        hash = match profile.kind.as_str() {
+            "multiply_xor_rotate" => {
+                (hash.wrapping_mul(profile.multiplier) ^ u32::from(byte) ^ profile.xor_constant)
+                    .rotate_left(profile.rotate_bits)
+            }
+            "xor_rotate_multiply_xor" => {
+                (hash ^ profile.xor_constant)
+                    .rotate_left(profile.rotate_bits)
+                    .wrapping_mul(profile.multiplier)
+                    ^ u32::from(byte)
+            }
+            _ => return 0,
+        };
+    }
+    hash
+}
+
+fn recover_x86_hash_argument(
+    pe: &PE<'_>,
+    bytes: &[u8],
+    callsite_va: u64,
+) -> Option<(u32, &'static str)> {
+    let callsite = va_to_file_offset(pe, callsite_va)?;
+    let start = callsite.saturating_sub(48);
+    let prefix = bytes.get(start..callsite)?;
+
+    // cdecl/stdcall two-argument call: `push hash_imm32; push module; call`.
+    if prefix.len() >= 6
+        && prefix[prefix.len() - 6] == 0x68
+        && (0x50..=0x57).contains(&prefix[prefix.len() - 1])
+    {
+        let push = &prefix[prefix.len() - 6..prefix.len() - 1];
+        return Some((u32::from_le_bytes(push[1..5].try_into().ok()?), "immediate"));
+    }
+
+    // Common opaque-constant form:
+    // mov eax,[absolute]; mov ecx,imm32; xor eax,ecx; add eax,imm32;
+    // push eax; push module; call resolver.
+    for expression in prefix.windows(19) {
+        if expression[0] != 0xa1
+            || expression[5] != 0xb9
+            || !matches!(expression[10..12], [0x31, 0xc8] | [0x33, 0xc1])
+            || expression[12] != 0x05
+            || expression[17] != 0x50
+        {
+            continue;
+        }
+        let address = u64::from(u32::from_le_bytes(expression[1..5].try_into().ok()?));
+        let memory_offset = va_to_file_offset(pe, address)?;
+        let initial = u32::from_le_bytes(
+            bytes
+                .get(memory_offset..memory_offset.checked_add(4)?)?
+                .try_into()
+                .ok()?,
+        );
+        let xor = u32::from_le_bytes(expression[6..10].try_into().ok()?);
+        let add = u32::from_le_bytes(expression[13..17].try_into().ok()?);
+        return Some((
+            (initial ^ xor).wrapping_add(add),
+            "constant_folded_memory_xor_add",
+        ));
+    }
+    None
+}
+
+fn va_to_file_offset(pe: &PE<'_>, va: u64) -> Option<usize> {
+    let rva = va.checked_sub(pe.image_base)?;
+    pe.sections.iter().find_map(|section| {
+        let start = u64::from(section.virtual_address);
+        let size = u64::from(section.size_of_raw_data);
+        if rva < start || rva >= start.saturating_add(size) {
+            return None;
+        }
+        usize::try_from(
+            u64::from(section.pointer_to_raw_data).saturating_add(rva.saturating_sub(start)),
+        )
+        .ok()
+    })
+}
+
+struct WindowsApiHashCandidate {
+    library: &'static str,
+    name: &'static str,
+}
+
+const WINDOWS_API_HASH_CANDIDATES: &[WindowsApiHashCandidate] = &[
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "NtAllocateVirtualMemory",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "NtClose",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "NtCreateFile",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "NtCreateProcess",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "NtCreateSection",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "NtCreateThreadEx",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "NtDelayExecution",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "NtFreeVirtualMemory",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "NtMapViewOfSection",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "NtOpenProcess",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "NtProtectVirtualMemory",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "NtQueryInformationProcess",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "NtQuerySystemInformation",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "NtReadVirtualMemory",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "NtResumeThread",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "NtSetInformationThread",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "NtTerminateProcess",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "NtUnmapViewOfSection",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "NtWaitForSingleObject",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "NtWriteVirtualMemory",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "RtlAllocateHeap",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "RtlCreateProcessParametersEx",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "RtlGetVersion",
+    },
+    WindowsApiHashCandidate {
+        library: "ntdll.dll",
+        name: "RtlInitUnicodeString",
+    },
+    WindowsApiHashCandidate {
+        library: "kernel32.dll",
+        name: "CreateProcessW",
+    },
+    WindowsApiHashCandidate {
+        library: "kernel32.dll",
+        name: "GetProcAddress",
+    },
+    WindowsApiHashCandidate {
+        library: "kernel32.dll",
+        name: "LoadLibraryA",
+    },
+    WindowsApiHashCandidate {
+        library: "kernel32.dll",
+        name: "VirtualAlloc",
+    },
+    WindowsApiHashCandidate {
+        library: "kernel32.dll",
+        name: "VirtualProtect",
+    },
+    WindowsApiHashCandidate {
+        library: "winhttp.dll",
+        name: "WinHttpConnect",
+    },
+    WindowsApiHashCandidate {
+        library: "winhttp.dll",
+        name: "WinHttpOpen",
+    },
+    WindowsApiHashCandidate {
+        library: "winhttp.dll",
+        name: "WinHttpOpenRequest",
+    },
+    WindowsApiHashCandidate {
+        library: "winhttp.dll",
+        name: "WinHttpReadData",
+    },
+    WindowsApiHashCandidate {
+        library: "winhttp.dll",
+        name: "WinHttpReceiveResponse",
+    },
+    WindowsApiHashCandidate {
+        library: "winhttp.dll",
+        name: "WinHttpSendRequest",
+    },
+    WindowsApiHashCandidate {
+        library: "wininet.dll",
+        name: "HttpOpenRequestA",
+    },
+    WindowsApiHashCandidate {
+        library: "wininet.dll",
+        name: "HttpSendRequestA",
+    },
+    WindowsApiHashCandidate {
+        library: "wininet.dll",
+        name: "InternetConnectA",
+    },
+    WindowsApiHashCandidate {
+        library: "wininet.dll",
+        name: "InternetOpenA",
+    },
+    WindowsApiHashCandidate {
+        library: "wininet.dll",
+        name: "InternetReadFile",
+    },
+    WindowsApiHashCandidate {
+        library: "ws2_32.dll",
+        name: "WSAStartup",
+    },
+    WindowsApiHashCandidate {
+        library: "ws2_32.dll",
+        name: "connect",
+    },
+    WindowsApiHashCandidate {
+        library: "ws2_32.dll",
+        name: "recv",
+    },
+    WindowsApiHashCandidate {
+        library: "ws2_32.dll",
+        name: "send",
+    },
+    WindowsApiHashCandidate {
+        library: "ws2_32.dll",
+        name: "socket",
+    },
+];
+
+fn contains_after(
+    bytes: &[u8],
+    start: usize,
+    max: usize,
+    predicate: impl Fn(&[u8]) -> bool,
+) -> Option<usize> {
+    let end = start.saturating_add(max).min(bytes.len());
+    (start..end).find(|&i| predicate(&bytes[i..]))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CheckedExportWalk {
+    mz_check: usize,
+    e_lfanew: usize,
+    pe_check: usize,
+    export_rva: usize,
+    export_size: usize,
+}
+
+fn find_checked_export_walks_x86(bytes: &[u8]) -> Vec<CheckedExportWalk> {
+    bytes
+        .windows(5)
+        .enumerate()
+        .filter(|(_, w)| {
+            // `cmp word ptr [reg], 0x5a4d`: opcode 81 /7 with a memory
+            // operand, not an arbitrary 81 instruction containing `MZ`.
+            w[0] == 0x66
+                && w[1] == 0x81
+                && w[2] & 0x38 == 0x38
+                && w[2] & 0xc0 != 0xc0
+                && w[3..] == [0x4d, 0x5a]
+        })
+        .filter_map(|(start, _)| {
+            let pe_offset = contains_after(bytes, start + 5, 64, |b| {
+                // `mov reg, [reg+0x3c]` (the PE e_lfanew field).
+                b.len() >= 3 && b[0] == 0x8b && b[1] & 0xc0 == 0x40 && b[2] == 0x3c
+            })?;
+            let signature = contains_after(bytes, pe_offset + 3, 64, |b| {
+                // `cmp dword ptr [base+e_lfanew], 0x4550`.
+                b.len() >= 7
+                    && b[0] == 0x81
+                    && b[1] & 0x38 == 0x38
+                    && b[1] & 0xc0 != 0xc0
+                    && b[3..7] == [0x50, 0x45, 0, 0]
+            })?;
+            let export_directory = contains_after(bytes, signature + 7, 64, |b| {
+                // `mov reg, [base+e_lfanew+0x78]`: PE32 export directory.
+                b.len() >= 4 && b[0] == 0x8b && b[1] & 0xc0 == 0x40 && b[3] == 0x78
+            })?;
+            let export_size = contains_after(bytes, export_directory + 4, 32, |b| {
+                // A checked resolver also reads the paired export-directory
+                // size field at +0x7c before dereferencing the directory.
+                b.len() >= 4 && b[0] == 0x8b && b[1] & 0xc0 == 0x40 && b[3] == 0x7c
+            })?;
+            Some(CheckedExportWalk {
+                mz_check: start,
+                e_lfanew: pe_offset,
+                pe_check: signature,
+                export_rva: export_directory,
+                export_size,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn count_checked_export_walks_x86(bytes: &[u8]) -> usize {
+    find_checked_export_walks_x86(bytes).len()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ApiHashProfile {
+    loop_offset: usize,
+    kind: &'static str,
+    seed: Option<u32>,
+    multiplier: u32,
+    xor_constant: u32,
+    rotate_bits: u8,
+    ascii_lowercase: bool,
+}
+
+fn find_custom_byte_hash_profiles_x86(bytes: &[u8]) -> Vec<ApiHashProfile> {
+    let mut profiles: Vec<ApiHashProfile> = bytes
+        .windows(6)
+        .enumerate()
+        // Register-register IMUL with a trailing imm32. Requiring mod=3
+        // makes bytes 2..6 unambiguously the multiplier.
+        .filter(|(_, w)| w[0] == 0x69 && w[1] & 0xc0 == 0xc0)
+        .filter_map(|(start, multiply)| {
+            let byte_load = contains_after(bytes, start + 6, 16, |b| {
+                b.len() >= 2 && b[..2] == [0x0f, 0xb6]
+            })?;
+            let xor_register = contains_after(bytes, byte_load + 2, 16, |b| {
+                b.first().is_some_and(|op| matches!(*op, 0x31 | 0x33))
+            })?;
+            let xor_constant = contains_after(bytes, xor_register + 2, 16, |b| {
+                b.len() >= 5 && b[0] == 0x35
+            })?;
+            let rotate = contains_after(bytes, xor_constant + 5, 16, |b| {
+                // C1 /0 ib is ROL r32, imm8. Other C1 groups are shifts
+                // or ROR and must not satisfy the existing ROL trait.
+                b.len() >= 3 && b[0] == 0xc1 && b[1] & 0xc0 == 0xc0 && b[1] & 0x38 == 0 && b[2] < 32
+            })?;
+            let multiplier = u32::from_le_bytes(multiply[2..6].try_into().ok()?);
+            let xor_value = u32::from_le_bytes(
+                bytes
+                    .get(xor_constant + 1..xor_constant + 5)?
+                    .try_into()
+                    .ok()?,
+            );
+            let seed_start = start.saturating_sub(64);
+            let seed = bytes.get(seed_start..start).and_then(|prefix| {
+                prefix
+                    .windows(5)
+                    .enumerate()
+                    .rfind(|(_, window)| window[0] == 0xb8)
+                    .and_then(|(_, window)| {
+                        u32::from_le_bytes(window[1..5].try_into().ok()?).into()
+                    })
+            });
+            let normalization_start = start.saturating_sub(32);
+            let normalization = bytes.get(normalization_start..start).is_some_and(|prefix| {
+                find_bytes(prefix, b"\x80\xcd\x20").len() == 1
+                    && find_bytes(prefix, b"\x80\xf9\x1a").len() == 1
+                    && prefix.windows(2).any(|window| window == [0x0f, 0x43])
+            });
+            Some(ApiHashProfile {
+                loop_offset: start,
+                kind: "multiply_xor_rotate",
+                seed,
+                multiplier,
+                xor_constant: xor_value,
+                rotate_bits: bytes[rotate + 2],
+                ascii_lowercase: normalization,
+            })
+        })
+        .collect();
+    profiles.extend(find_xor_rotate_multiply_hash_profiles_x86(bytes));
+    profiles.sort_by_key(|profile| profile.loop_offset);
+    profiles.dedup_by_key(|profile| profile.loop_offset);
+    profiles
+}
+
+/// Recover the alternate state update used by flattened resolvers:
+///
+/// `hash = (rol(hash ^ constant, bits) * multiplier) ^ lowercase(byte)`.
+///
+/// The seed may be initialized in a different dispatcher block. We only
+/// report it when a concrete stack-slot copy connects the initialization to
+/// the accumulator slot loaded by the loop.
+fn find_xor_rotate_multiply_hash_profiles_x86(bytes: &[u8]) -> Vec<ApiHashProfile> {
+    let mut profiles = Vec::new();
+    for (multiply_offset, multiply) in bytes.windows(6).enumerate() {
+        if multiply[0] != 0x69 || multiply[1] & 0xc0 != 0xc0 {
+            continue;
+        }
+        let rotate_start = multiply_offset.saturating_sub(16);
+        let Some((rotate_rel, rotate)) =
+            bytes.get(rotate_start..multiply_offset).and_then(|prefix| {
+                prefix.windows(3).enumerate().rfind(|(_, op)| {
+                    op[0] == 0xc1 && op[1] & 0xc0 == 0xc0 && op[1] & 0x38 == 0 && op[2] < 32
+                })
+            })
+        else {
+            continue;
+        };
+        let rotate_offset = rotate_start + rotate_rel;
+        let xor_start = rotate_offset.saturating_sub(12);
+        let Some((xor_rel, _)) = bytes.get(xor_start..rotate_offset).and_then(|prefix| {
+            prefix
+                .windows(2)
+                .enumerate()
+                .rfind(|(_, op)| matches!(op[0], 0x31 | 0x33) && op[1] & 0xc0 == 0xc0)
+        }) else {
+            continue;
+        };
+        let xor_offset = xor_start + xor_rel;
+        let constant_start = xor_offset.saturating_sub(10);
+        let Some((_, constant_load)) = bytes.get(constant_start..xor_offset).and_then(|prefix| {
+            prefix
+                .windows(5)
+                .enumerate()
+                .rfind(|(_, op)| (0xb8..=0xbf).contains(&op[0]))
+        }) else {
+            continue;
+        };
+        let Some(byte_load) = contains_after(bytes, multiply_offset + 6, 16, |op| {
+            op.len() >= 3 && op[..2] == [0x0f, 0xb6]
+        }) else {
+            continue;
+        };
+        let Some(_) = contains_after(bytes, byte_load + 3, 12, |op| {
+            op.first().is_some_and(|byte| matches!(*byte, 0x31 | 0x33))
+        }) else {
+            continue;
+        };
+
+        let seed = recover_flattened_stack_hash_seed(bytes, xor_offset);
+        let normalization_start = byte_load.saturating_sub(32);
+        let normalization = bytes
+            .get(normalization_start..byte_load)
+            .is_some_and(|prefix| {
+                find_bytes(prefix, b"\x80\xca\x20").len()
+                    + find_bytes(prefix, b"\x80\xce\x20").len()
+                    > 0
+                    && prefix
+                        .windows(3)
+                        .any(|op| op[..2] == [0x80, 0xfa] && op[2] == 0x1a)
+            });
+        profiles.push(ApiHashProfile {
+            loop_offset: byte_load,
+            kind: "xor_rotate_multiply_xor",
+            seed,
+            multiplier: u32::from_le_bytes(multiply[2..6].try_into().unwrap_or([0; 4])),
+            xor_constant: u32::from_le_bytes(constant_load[1..5].try_into().unwrap_or([0; 4])),
+            rotate_bits: rotate[2],
+            ascii_lowercase: normalization,
+        });
+    }
+    profiles
+}
+
+fn recover_flattened_stack_hash_seed(bytes: &[u8], loop_offset: usize) -> Option<u32> {
+    let search_start = loop_offset.saturating_sub(512);
+    let prefix = bytes.get(search_start..loop_offset)?;
+
+    // `mov accumulator, [esp+hash_slot]`
+    let hash_slot = prefix
+        .windows(4)
+        .rfind(|op| op[0] == 0x8b && op[2] == 0x24)
+        .map(|op| op[3])?;
+
+    // Dispatcher transfer:
+    // `mov eax,[esp+source_slot]; mov [esp+hash_slot],eax`.
+    let source_slot = prefix
+        .windows(8)
+        .rfind(|op| {
+            op[0..3] == [0x8b, 0x44, 0x24] && op[4..7] == [0x89, 0x44, 0x24] && op[7] == hash_slot
+        })
+        .map(|op| op[3])?;
+
+    // Concrete initialization of that source slot.
+    prefix
+        .windows(8)
+        .rfind(|op| op[0..3] == [0xc7, 0x44, 0x24] && op[3] == source_slot)
+        .and_then(|op| u32::from_le_bytes(op[4..8].try_into().ok()?).into())
+}
+
+#[cfg(test)]
+fn count_custom_byte_hash_loops_x86(bytes: &[u8]) -> usize {
+    find_custom_byte_hash_profiles_x86(bytes).len()
 }
 
 fn coff_header(coff: &CoffHeader, values: &mut Values) {
@@ -971,6 +1853,147 @@ fn data_directories(pe: &PE<'_>, values: &mut Values) {
     if !entries.is_empty() {
         values.insert("pe.data_directories", JsonValue::Array(entries));
     }
+}
+
+/// Raw PE data-directory declarations and structural inconsistencies.
+///
+/// Goblin deliberately treats a `(0, 0)` directory as absent, which is right
+/// for normal extraction.  A directory with exactly one zero field is a
+/// different case: it is declared in the optional header but cannot describe
+/// a valid image range.  Packers and import-hiding loaders use this shape to
+/// leave a misleading IAT/import declaration while presenting no parseable
+/// imports.  Preserve it as a header fact instead of silently dropping it.
+///
+/// `pe.declared_data_directories[]` preserves every non-zero header slot with
+/// its mapped section, even when the format parser declines to treat it as a
+/// usable directory. `pe.data_directory_anomalies[]` holds the subset with a
+/// zero RVA or size. The accompanying metrics are intentionally generic so
+/// trait authors can detect malformed declarations without naming one
+/// particular directory.
+fn data_directory_anomalies(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
+    let Some(opt) = pe.header.optional_header.as_ref() else {
+        return;
+    };
+    // The data-directory array begins 96 bytes into PE32 optional headers and
+    // 112 bytes into PE32+ headers.  Read the original bytes rather than
+    // goblin's sparse representation so malformed declared slots survive.
+    let directory_relative_offset = match opt.standard_fields.magic {
+        0x10b => 96_usize,
+        0x20b => 112_usize,
+        _ => return,
+    };
+    let Some(optional_offset) = (pe.header.dos_header.pe_pointer as usize).checked_add(4 + 20)
+    else {
+        return;
+    };
+    let Some(directory_offset) = optional_offset.checked_add(directory_relative_offset) else {
+        return;
+    };
+    let directory_count = usize::try_from(opt.windows_fields.number_of_rva_and_sizes)
+        .unwrap_or(16)
+        .min(16);
+    // Index → canonical name from the PE/COFF spec (winnt.h
+    // IMAGE_DIRECTORY_ENTRY_*).  Kept local to avoid making this raw-header
+    // recovery depend on goblin's sparse directory model.
+    const NAMES: [&str; 16] = [
+        "export",
+        "import",
+        "resource",
+        "exception",
+        "certificate",
+        "base_relocation",
+        "debug",
+        "architecture",
+        "global_ptr",
+        "tls",
+        "load_config",
+        "bound_import",
+        "iat",
+        "delay_import",
+        "clr_runtime_header",
+        "reserved",
+    ];
+
+    let mut declared = Vec::new();
+    let mut anomalies = Vec::new();
+    let mut zero_rva_nonzero_size = 0_u64;
+    let mut nonzero_rva_zero_size = 0_u64;
+    for (index, name) in NAMES.iter().enumerate().take(directory_count) {
+        let Some(entry_offset) = directory_offset.checked_add(index.saturating_mul(8)) else {
+            break;
+        };
+        let Some(entry) = bytes.get(entry_offset..entry_offset.saturating_add(8)) else {
+            break;
+        };
+        let rva = u32::from_le_bytes(entry[..4].try_into().expect("fixed-width slice"));
+        let size = u32::from_le_bytes(entry[4..].try_into().expect("fixed-width slice"));
+        if rva == 0 && size == 0 {
+            continue;
+        }
+        // Certificate-table addresses are file offsets by PE/COFF definition;
+        // all other directory addresses are RVAs that can be mapped to a
+        // section. Retain the mapping as a fact rather than assuming the
+        // standard `.idata` / `.rsrc` / `.reloc` layout.
+        let section = if index == 4 {
+            None
+        } else {
+            pe.sections.iter().find_map(|s| {
+                let start = s.virtual_address;
+                let extent = s.virtual_size.max(s.size_of_raw_data);
+                let end = start.saturating_add(extent);
+                (rva >= start && rva < end)
+                    .then(|| s.name().ok().map(str::to_owned))
+                    .flatten()
+            })
+        };
+        declared.push(serde_json::json!({
+            "index": index,
+            "name": name,
+            "rva": rva,
+            "size": size,
+            "section": section,
+        }));
+        if rva != 0 && size != 0 {
+            continue;
+        }
+        let kind = if rva == 0 {
+            zero_rva_nonzero_size = zero_rva_nonzero_size.saturating_add(1);
+            "zero_rva_nonzero_size"
+        } else {
+            nonzero_rva_zero_size = nonzero_rva_zero_size.saturating_add(1);
+            "nonzero_rva_zero_size"
+        };
+        anomalies.push(serde_json::json!({
+            "index": index,
+            "name": name,
+            "rva": rva,
+            "size": size,
+            "kind": kind,
+        }));
+    }
+    if anomalies.is_empty() {
+        if !declared.is_empty() {
+            metrics.insert("pe.declared_data_directory_count", declared.len() as f64);
+            values.insert("pe.declared_data_directories", JsonValue::Array(declared));
+        }
+        return;
+    }
+    metrics.insert("pe.declared_data_directory_count", declared.len() as f64);
+    metrics.insert("pe.data_directory_anomaly_count", anomalies.len() as f64);
+    if zero_rva_nonzero_size > 0 {
+        metrics.insert(
+            "pe.data_directory_zero_rva_nonzero_size_count",
+            zero_rva_nonzero_size as f64,
+        );
+    }
+    if nonzero_rva_zero_size > 0 {
+        metrics.insert(
+            "pe.data_directory_nonzero_rva_zero_size_count",
+            nonzero_rva_zero_size as f64,
+        );
+    }
+    values.insert("pe.declared_data_directories", JsonValue::Array(declared));
+    values.insert("pe.data_directory_anomalies", JsonValue::Array(anomalies));
 }
 
 /// .NET / CLR metadata extracted from the COR20 header and metadata root.
@@ -2183,6 +3206,183 @@ mod tests {
     fn read_fixture(name: &str) -> Vec<u8> {
         let path = format!("tests/fixtures/{name}");
         std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"))
+    }
+
+    #[test]
+    fn malformed_declared_directory_is_preserved_as_a_fact() {
+        let mut bytes = read_fixture("test.exe");
+        let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+        let optional_offset = pe_offset + 24;
+        let directory_offset = match u16::from_le_bytes(
+            bytes[optional_offset..optional_offset + 2]
+                .try_into()
+                .unwrap(),
+        ) {
+            0x10b => optional_offset + 96,
+            0x20b => optional_offset + 112,
+            magic => panic!("unexpected fixture optional-header magic {magic:#x}"),
+        };
+        // Import directory: zero RVA with non-zero declared size. This must
+        // not disappear just because the normal import walker cannot use it.
+        let import_offset = directory_offset + 8;
+        bytes[import_offset..import_offset + 4].fill(0);
+        bytes[import_offset + 4..import_offset + 8].copy_from_slice(&0x40_u32.to_le_bytes());
+
+        let (values, _, metrics) = run(&bytes);
+        let anomalies = values
+            .get("pe.data_directory_anomalies")
+            .and_then(serde_json::Value::as_array)
+            .expect("malformed directory must be preserved");
+        assert!(anomalies.iter().any(|entry| {
+            entry.get("name").and_then(serde_json::Value::as_str) == Some("import")
+                && entry.get("kind").and_then(serde_json::Value::as_str)
+                    == Some("zero_rva_nonzero_size")
+        }));
+        assert_eq!(
+            metrics.get("pe.data_directory_zero_rva_nonzero_size_count"),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn manual_resolver_code_signals_require_the_complete_mechanics() {
+        // A bounds-checking export walker: MZ → e_lfanew → PE signature →
+        // PE32 export-directory offset and size. Keep this independent from a fixture
+        // so a future parser change cannot accidentally widen the detector.
+        let checked_walk = [
+            0x66, 0x81, 0x3f, 0x4d, 0x5a, 0x8b, 0x47, 0x3c, 0x81, 0x3c, 0x07, 0x50, 0x45, 0x00,
+            0x00, 0x8b, 0x4c, 0x07, 0x78, 0x8b, 0x54, 0x07, 0x7c,
+        ];
+        assert_eq!(count_checked_export_walks_x86(&checked_walk), 1);
+        assert_eq!(
+            find_checked_export_walks_x86(&checked_walk),
+            vec![CheckedExportWalk {
+                mz_check: 0,
+                e_lfanew: 5,
+                pe_check: 8,
+                export_rva: 15,
+                export_size: 19,
+            }]
+        );
+        assert_eq!(count_checked_export_walks_x86(&checked_walk[..8]), 0);
+
+        // A byte-wise custom hash: multiply, byte load, XOR with the
+        // accumulator and a constant, then rotate.
+        let hash_loop = [
+            0xb8, 0xdb, 0xf7, 0x26, 0xab, 0x80, 0xcd, 0x20, 0x80, 0xf9, 0x1a, 0x0f, 0x43, 0xcb,
+            0x69, 0xd8, 0x7f, 0x85, 0x3b, 0x80, 0x0f, 0xb6, 0xc1, 0x31, 0xd8, 0x35, 0x38, 0x9f,
+            0x93, 0x87, 0xc1, 0xc0, 0x09,
+        ];
+        assert_eq!(count_custom_byte_hash_loops_x86(&hash_loop), 1);
+        assert_eq!(
+            find_custom_byte_hash_profiles_x86(&hash_loop),
+            vec![ApiHashProfile {
+                loop_offset: 14,
+                kind: "multiply_xor_rotate",
+                seed: Some(0xab26f7db),
+                multiplier: 0x803b857f,
+                xor_constant: 0x87939f38,
+                rotate_bits: 9,
+                ascii_lowercase: true,
+            }]
+        );
+        assert_eq!(count_custom_byte_hash_loops_x86(&hash_loop[..29]), 0);
+    }
+
+    #[test]
+    fn flattened_xor_rotate_multiply_hash_profile_recovers_seed_flow() {
+        let hash_loop = [
+            // seed -> stack slot 0x10
+            0xc7, 0x44, 0x24, 0x10, 0xb5, 0xcf, 0x88, 0x11,
+            // dispatcher copies slot 0x10 -> accumulator slot 0x1c
+            0x8b, 0x44, 0x24, 0x10, 0x89, 0x44, 0x24, 0x1c,
+            // lowercase normalization and accumulator update
+            0x8b, 0x44, 0x24, 0x18, 0x0f, 0xb6, 0x0c, 0x07, 0x89, 0xca, 0x80, 0xc2, 0xbf, 0x88,
+            0xce, 0x80, 0xce, 0x20, 0x80, 0xfa, 0x1a, 0x0f, 0xb6, 0xd6, 0x0f, 0x43, 0xd1, 0x8b,
+            0x4c, 0x24, 0x1c, 0xbd, 0xa7, 0x79, 0x02, 0x34, 0x31, 0xe9, 0xc1, 0xc1, 0x15, 0x69,
+            0xc9, 0x59, 0x94, 0x27, 0x85, 0x0f, 0xb6, 0xd2, 0x31, 0xca,
+        ];
+        let profiles = find_custom_byte_hash_profiles_x86(&hash_loop);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].kind, "xor_rotate_multiply_xor");
+        assert_eq!(profiles[0].seed, Some(0x1188cfb5));
+        assert_eq!(profiles[0].xor_constant, 0x340279a7);
+        assert_eq!(profiles[0].multiplier, 0x85279459);
+        assert_eq!(profiles[0].rotate_bits, 21);
+        assert!(profiles[0].ascii_lowercase);
+    }
+
+    #[test]
+    fn recovered_profile_exactly_matches_native_api_name() {
+        let profile = LocatedHashProfile {
+            va: 0x40ed6d,
+            kind: "xor_rotate_multiply_xor".to_string(),
+            seed: 0x1188cfb5,
+            multiplier: 0x85279459,
+            xor_constant: 0x340279a7,
+            rotate_bits: 21,
+            ascii_lowercase: true,
+        };
+        assert_eq!(
+            hash_windows_name(&profile, "NtQueryInformationProcess"),
+            0x3b1471e8
+        );
+        assert_ne!(
+            hash_windows_name(&profile, "NtQuerySystemInformation"),
+            0x3b1471e8
+        );
+    }
+
+    #[test]
+    fn recovers_immediate_and_constant_folded_hash_arguments() {
+        let mut bytes = read_fixture("test.exe");
+        let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+        let optional_offset = pe_offset + 24;
+        assert_eq!(
+            u16::from_le_bytes(
+                bytes[optional_offset..optional_offset + 2]
+                    .try_into()
+                    .unwrap()
+            ),
+            0x20b
+        );
+        bytes[optional_offset + 24..optional_offset + 32]
+            .copy_from_slice(&0x0040_0000_u64.to_le_bytes());
+        let pe = PE::parse(&bytes).expect("fixture PE");
+        let section = pe
+            .sections
+            .iter()
+            .find(|section| section.size_of_raw_data >= 0x100)
+            .expect("fixture code section");
+        let section_file = section.pointer_to_raw_data as usize;
+        let section_va = pe.image_base + u64::from(section.virtual_address);
+        drop(pe);
+
+        let direct_offset = section_file + 0x20;
+        bytes[direct_offset..direct_offset + 11]
+            .copy_from_slice(&[0x68, 0xe8, 0x71, 0x14, 0x3b, 0x50, 0xe8, 0, 0, 0, 0]);
+
+        let memory_offset = section_file + 0x80;
+        bytes[memory_offset..memory_offset + 4].copy_from_slice(&0x0000bd87_u32.to_le_bytes());
+        let memory_va = u32::try_from(section_va + 0x80).expect("PE32 fixture VA");
+        let folded_offset = section_file + 0x40;
+        let mut folded = vec![0xa1];
+        folded.extend_from_slice(&memory_va.to_le_bytes());
+        folded.push(0xb9);
+        folded.extend_from_slice(&0x9bf7790b_u32.to_le_bytes());
+        folded.extend_from_slice(&[0x31, 0xc8, 0x05]);
+        folded.extend_from_slice(&0x9f1cad5c_u32.to_le_bytes());
+        folded.extend_from_slice(&[0x50, 0xff, 0x74, 0x24, 0x0c, 0xe8, 0, 0, 0, 0]);
+        bytes[folded_offset..folded_offset + folded.len()].copy_from_slice(&folded);
+        let pe = PE::parse(&bytes).expect("mutated fixture PE");
+        assert_eq!(
+            recover_x86_hash_argument(&pe, &bytes, section_va + 0x26),
+            Some((0x3b1471e8, "immediate"))
+        );
+        assert_eq!(
+            recover_x86_hash_argument(&pe, &bytes, section_va + 0x40 + 22),
+            Some((0x3b1471e8, "constant_folded_memory_xor_add"))
+        );
     }
 
     #[test]
