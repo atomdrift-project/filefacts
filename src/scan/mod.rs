@@ -29,7 +29,7 @@ pub(crate) fn zip_datetime_to_unix(dt: ::zip::DateTime) -> Option<i64> {
 /// Days from 1970-01-01 for the given Gregorian `(y, m, d)`, after
 /// Howard Hinnant's *date.h* algorithm. Returns `None` for invalid
 /// month/day combinations.
-fn days_from_civil(y: i32, m: u32, d: u32) -> Option<i64> {
+pub(crate) fn days_from_civil(y: i32, m: u32, d: u32) -> Option<i64> {
     if !(1..=12).contains(&m) || d == 0 || d > 31 {
         return None;
     }

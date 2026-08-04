@@ -51,6 +51,10 @@ pub enum ArchiveFormat {
     Cab,
     /// Electron ASAR application archive.
     Asar,
+    /// ISO 9660 optical-disc filesystem — the container under a `.iso`.
+    /// A filesystem rather than an archive: members are stored verbatim in
+    /// addressable sector runs, so there is no per-member codec.
+    Iso9660,
 }
 
 impl ArchiveFormat {
@@ -67,6 +71,7 @@ impl ArchiveFormat {
             Self::Rar => "rar",
             Self::Cab => "cab",
             Self::Asar => "asar",
+            Self::Iso9660 => "iso9660",
         }
     }
 }
@@ -171,7 +176,7 @@ impl FileType {
     /// container format (ignoring compression) when none exists.
     #[must_use]
     pub const fn archive_format(self) -> Option<ArchiveFormat> {
-        use ArchiveFormat::{Ar, Asar, Cab, Rar, SevenZip, Tar, Xar, Zip};
+        use ArchiveFormat::{Ar, Asar, Cab, Iso9660, Rar, SevenZip, Tar, Xar, Zip};
         Some(match self {
             // Tar containers: plain, the compressed `.tar.*` variants, and the
             // ecosystem packages that are a tar at heart (uncompressed gem /
@@ -211,6 +216,7 @@ impl FileType {
             Self::Rar => Rar,
             Self::Cab => Cab,
             Self::Asar => Asar,
+            Self::Iso => Iso9660,
             _ => return None,
         })
     }

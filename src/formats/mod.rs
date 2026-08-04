@@ -53,6 +53,7 @@ mod go_buildinfo;
 mod goblin_safe;
 pub(crate) mod identity;
 mod image_stats;
+pub(crate) mod iso;
 mod jar;
 mod jpeg;
 mod lnk;
@@ -86,6 +87,7 @@ mod rust_crate;
 pub(crate) mod source;
 mod structured;
 mod tar;
+mod udf;
 mod upx;
 mod vba;
 pub(crate) mod vba_symbols;
@@ -299,6 +301,7 @@ pub(crate) fn extract(
         FileType::Rpm => rpm::extract(bytes, values, strings, metrics),
         FileType::Deb => deb::extract(bytes, values, metrics),
         FileType::Dmg => dmg::extract(bytes, values, metrics, archive_members),
+        FileType::Iso => iso::extract(bytes, values, metrics, archive_members),
         FileType::Rtf => rtf::extract(bytes, values, strings, metrics),
 
         // Source-code extraction is delegated to the source dispatcher,

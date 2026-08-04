@@ -621,6 +621,7 @@ impl FileType {
                 | Self::Rpm
                 | Self::PkgMacos
                 | Self::Dmg
+                | Self::Iso
                 | Self::Cab
                 | Self::Chm
                 | Self::Crx
@@ -965,6 +966,7 @@ impl FileType {
             "static-lib" => Self::StaticLib,
             "rpm" => Self::Rpm,
             "dmg" => Self::Dmg,
+            "iso" => Self::Iso,
             "chm" => Self::Chm,
             "crx" => Self::Crx,
             "xpi" => Self::Xpi,
@@ -2663,6 +2665,7 @@ function wpcf7_special_mail_tag( $output, $name, $html ) {
             FileType::Deb,
             FileType::Rpm,
             FileType::Dmg,
+            FileType::Iso,
             FileType::Chm,
             FileType::Crx,
             FileType::Xpi,
