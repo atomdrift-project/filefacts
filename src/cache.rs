@@ -219,9 +219,14 @@ pub fn entry_path(sha_hex: &str) -> Option<PathBuf> {
 /// cache file gets overwritten on the next write).
 pub fn load<T: serde::de::DeserializeOwned>(sha_hex: &str) -> Option<T> {
     let path = entry_path(sha_hex)?;
+    load_from_path(&path)
+}
+
+/// Read one cache entry from an already-resolved path.
+fn load_from_path<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     // One open serves both the read and the mtime probe that drives LRU
     // eviction; a missing/unreadable entry is a plain cache miss.
-    let mut file = fs::File::open(&path).ok()?;
+    let mut file = fs::File::open(path).ok()?;
     let mtime = file.metadata().and_then(|m| m.modified()).ok();
     let mut compressed = Vec::new();
     file.read_to_end(&mut compressed).ok()?;
@@ -230,7 +235,7 @@ pub fn load<T: serde::de::DeserializeOwned>(sha_hex: &str) -> Option<T> {
     // least-recently-*used*, not merely the oldest-written. Best-effort
     // and relatime-style — see [`touch_lru`].
     if let Some(mtime) = mtime {
-        touch_lru(&path, mtime);
+        touch_lru(path, mtime);
     }
     let decompressed = zstd::decode_all(compressed.as_slice()).ok()?;
     serde_json::from_slice::<T>(&decompressed).ok()
@@ -268,6 +273,11 @@ pub fn store<T: serde::Serialize>(sha_hex: &str, value: &T) {
     let Some(path) = entry_path(sha_hex) else {
         return;
     };
+    store_at_path(&path, value);
+}
+
+/// Write one cache entry to an already-resolved path.
+fn store_at_path<T: serde::Serialize>(path: &Path, value: &T) {
     let Ok(serialized) = serde_json::to_vec(value) else {
         return;
     };
@@ -277,7 +287,7 @@ pub fn store<T: serde::Serialize>(sha_hex: &str, value: &T) {
     let tmp = path.with_extension("tmp");
     if let Ok(mut f) = fs::File::create(&tmp) {
         if f.write_all(&compressed).is_ok() {
-            let _ = fs::rename(&tmp, &path);
+            let _ = fs::rename(&tmp, path);
         } else {
             let _ = fs::remove_file(&tmp);
         }
@@ -565,18 +575,37 @@ where
     T: serde::Serialize + serde::de::DeserializeOwned,
     F: FnOnce(&[u8]) -> Option<Computed<T>>,
 {
+    open_with_cache_in(bytes, variant, entry_path, maybe_trigger_sweep, compute)
+}
+
+fn open_with_cache_in<T, F, P, S>(
+    bytes: &[u8],
+    variant: &str,
+    path_for: P,
+    after_store: S,
+    compute: F,
+) -> Option<T>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+    F: FnOnce(&[u8]) -> Option<Computed<T>>,
+    P: FnOnce(&str) -> Option<PathBuf>,
+    S: FnOnce(&str),
+{
     let key = cache_key(bytes, variant);
-    if let Some(cached) = load::<T>(&key) {
+    let path = path_for(&key);
+    if let Some(cached) = path.as_deref().and_then(load_from_path::<T>) {
         return Some(cached);
     }
     match compute(bytes)? {
         Computed::Cacheable(value) => {
-            store(&key, &value);
+            if let Some(path) = path {
+                store_at_path(&path, &value);
+            }
             // A store means the cache just grew; cheaply check whether it
             // has crossed the item ceiling and, if so, sweep in the
             // background. Kept out of `store` so a direct `store` call
             // (e.g. in tests) has no cleanup side effect.
-            maybe_trigger_sweep(&key);
+            after_store(&key);
             Some(value)
         }
         Computed::Transient(value) => Some(value),
@@ -604,6 +633,12 @@ mod tests {
         format!("filefacts-cache-test:{tag}:{}:{ns}", std::process::id()).into_bytes()
     }
 
+    fn test_entry_path(root: &Path, sha_hex: &str) -> Option<PathBuf> {
+        let shard = root.join(sha_hex.get(..2)?);
+        fs::create_dir_all(&shard).ok()?;
+        Some(shard.join(format!("{sha_hex}.bin")))
+    }
+
     #[test]
     fn sha256_hex_known_vector() {
         assert_eq!(
@@ -628,9 +663,12 @@ mod tests {
             n: 42,
             name: "rizin-out".into(),
         };
+        let tmp = tempfile::tempdir().expect("tempdir");
         let sha = sha256_hex(&bytes);
-        store(&sha, &original);
-        let loaded: Payload = load(&sha).expect("cache should hit immediately after store");
+        let path = test_entry_path(tmp.path(), &sha).expect("cache path");
+        store_at_path(&path, &original);
+        let loaded: Payload =
+            load_from_path(&path).expect("cache should hit immediately after store");
         assert_eq!(loaded, original);
     }
 
@@ -640,19 +678,32 @@ mod tests {
         #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
         struct Payload(u32);
         let bytes = unique_bytes("open_with_cache");
+        let tmp = tempfile::tempdir().expect("tempdir");
         let calls = AtomicU32::new(0);
-        let first = open_with_cache::<Payload, _>(&bytes, "", |_| {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Some(Computed::Cacheable(Payload(7)))
-        });
+        let first = open_with_cache_in::<Payload, _, _, _>(
+            &bytes,
+            "",
+            |key| test_entry_path(tmp.path(), key),
+            |_| {},
+            |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Some(Computed::Cacheable(Payload(7)))
+            },
+        );
         assert_eq!(first, Some(Payload(7)));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         // Second call must hit the cache and not invoke compute.
-        let second = open_with_cache::<Payload, _>(&bytes, "", |_| {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Some(Computed::Cacheable(Payload(999))) // never observed
-        });
+        let second = open_with_cache_in::<Payload, _, _, _>(
+            &bytes,
+            "",
+            |key| test_entry_path(tmp.path(), key),
+            |_| {},
+            |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Some(Computed::Cacheable(Payload(999))) // never observed
+            },
+        );
         assert_eq!(second, Some(Payload(7)));
         assert_eq!(calls.load(Ordering::SeqCst), 1, "compute must not re-run");
     }
@@ -663,20 +714,34 @@ mod tests {
         #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
         struct Payload(u32);
         let bytes = unique_bytes("transient");
+        let tmp = tempfile::tempdir().expect("tempdir");
         let calls = AtomicU32::new(0);
         // A degraded run: the value is handed back to the caller...
-        let first = open_with_cache::<Payload, _>(&bytes, "", |_| {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Some(Computed::Transient(Payload(1)))
-        });
+        let first = open_with_cache_in::<Payload, _, _, _>(
+            &bytes,
+            "",
+            |key| test_entry_path(tmp.path(), key),
+            |_| {},
+            |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Some(Computed::Transient(Payload(1)))
+            },
+        );
         assert_eq!(first, Some(Payload(1)));
         // ...but nothing was written, so a second call recomputes rather
         // than serving the poisoned (degraded) entry.
-        assert!(!is_cached(&bytes, ""), "transient result must not persist");
-        let second = open_with_cache::<Payload, _>(&bytes, "", |_| {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Some(Computed::Cacheable(Payload(2)))
-        });
+        let path = test_entry_path(tmp.path(), &cache_key(&bytes, "")).expect("cache path");
+        assert!(!path.exists(), "transient result must not persist");
+        let second = open_with_cache_in::<Payload, _, _, _>(
+            &bytes,
+            "",
+            |key| test_entry_path(tmp.path(), key),
+            |_| {},
+            |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Some(Computed::Cacheable(Payload(2)))
+            },
+        );
         assert_eq!(second, Some(Payload(2)));
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -707,15 +772,24 @@ mod tests {
         #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
         struct Payload(u32);
         let bytes = unique_bytes("variant_isolation");
-        let a = open_with_cache::<Payload, _>(&bytes, "rizin=none", |_| {
-            Some(Computed::Cacheable(Payload(10)))
-        });
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let a = open_with_cache_in::<Payload, _, _, _>(
+            &bytes,
+            "rizin=none",
+            |key| test_entry_path(tmp.path(), key),
+            |_| {},
+            |_| Some(Computed::Cacheable(Payload(10))),
+        );
         assert_eq!(a, Some(Payload(10)));
         // A run under a different fingerprint must miss and recompute,
         // not reuse the no-rizin payload.
-        let b = open_with_cache::<Payload, _>(&bytes, "rizin=0.7.2", |_| {
-            Some(Computed::Cacheable(Payload(20)))
-        });
+        let b = open_with_cache_in::<Payload, _, _, _>(
+            &bytes,
+            "rizin=0.7.2",
+            |key| test_entry_path(tmp.path(), key),
+            |_| {},
+            |_| Some(Computed::Cacheable(Payload(20))),
+        );
         assert_eq!(b, Some(Payload(20)));
     }
 

@@ -21,6 +21,7 @@
 //! tracking on truant children) lives in cleave's existing
 //! `radare2/mod.rs` and ports across as #75c.
 
+use std::cell::Cell;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -185,14 +186,59 @@ impl Drop for ScopedDisable {
 }
 
 /// Disable rizin for the lifetime of the returned guard.
+///
+/// Process-global: every thread sees the mute. That is what a
+/// whole-scan policy (`--no-radare2`) wants, since the scan fans out
+/// across a thread pool. It is the WRONG tool for a per-file decision —
+/// see [`scoped_disable_current_thread`].
 pub fn scoped_disable() -> ScopedDisable {
     RIZIN_DISABLED.fetch_add(1, Ordering::SeqCst);
     ScopedDisable { _private: () }
 }
 
-/// `true` when [`disable`] / [`scoped_disable`] has muted rizin.
+thread_local! {
+    /// Per-thread mute depth; see [`scoped_disable_current_thread`].
+    static RIZIN_DISABLED_THREAD: Cell<usize> = const { Cell::new(0) };
+}
+
+/// RAII guard returned by [`scoped_disable_current_thread`]. Restores the
+/// calling thread's previous state on drop; guards stack.
+#[must_use = "dropping the guard immediately re-enables rizin; bind it to a               variable that lives at least as long as the scope you intended to mute"]
+pub struct ScopedDisableThread {
+    _private: (),
+}
+
+impl Drop for ScopedDisableThread {
+    fn drop(&mut self) {
+        RIZIN_DISABLED_THREAD.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
+/// Disable rizin **on the calling thread only**, for the guard's lifetime.
+///
+/// Use this to express a per-file policy ("this member is not a native
+/// binary, don't disassemble it"). [`scoped_disable`] cannot express that:
+/// it mutes the whole process, so while one thread skips disassembly for
+/// its own file, every binary being analyzed concurrently on other threads
+/// silently loses its symbols and metrics too — the traits derived from
+/// them vanish and the verdict shifts, non-deterministically with thread
+/// timing. Analyzers fan members out across rayon, so that is not
+/// hypothetical.
+///
+/// Sound because [`recover`] consults [`is_disabled`] synchronously on the
+/// thread that requested the parse: filefacts spawns no worker threads
+/// between the two (the only spawns are rizin's own stdout drain, after the
+/// check, and the unrelated cache sweep).
+pub fn scoped_disable_current_thread() -> ScopedDisableThread {
+    RIZIN_DISABLED_THREAD.with(|c| c.set(c.get() + 1));
+    ScopedDisableThread { _private: () }
+}
+
+/// `true` when rizin is muted for the calling thread — by the global
+/// [`disable`] / [`scoped_disable`], or by this thread's own
+/// [`scoped_disable_current_thread`].
 pub fn is_disabled() -> bool {
-    RIZIN_DISABLED.load(Ordering::SeqCst) > 0
+    RIZIN_DISABLED.load(Ordering::SeqCst) > 0 || RIZIN_DISABLED_THREAD.with(Cell::get) > 0
 }
 
 /// Cumulative rizin subprocess counters as
@@ -1522,6 +1568,30 @@ mod tests {
         // silently re-slow Go binaries or weaken stripped-binary recovery.
         assert_eq!(Analysis::Basic.command(), "aa");
         assert_eq!(Analysis::Deep.command(), "aaa");
+    }
+
+    /// A per-thread mute must not leak to other threads: that is the bug
+    /// where one archive member skipping disassembly silently stripped
+    /// symbols from a binary being analyzed concurrently.
+    #[test]
+    fn thread_local_disable_does_not_leak_across_threads() {
+        let guard = scoped_disable_current_thread();
+        assert!(is_disabled(), "muted on the thread that asked");
+        let other = std::thread::spawn(is_disabled).join().unwrap();
+        assert!(!other, "must NOT be muted on an unrelated thread");
+        drop(guard);
+        assert!(!is_disabled(), "restored on drop");
+    }
+
+    /// The global switch still covers every thread — `--no-radare2` applies
+    /// to a whole scan, which fans out across a pool.
+    #[test]
+    fn global_disable_still_applies_to_other_threads() {
+        let _lock = rizin_test_lock();
+        let guard = scoped_disable();
+        let other = std::thread::spawn(is_disabled).join().unwrap();
+        assert!(other, "global mute must reach other threads");
+        drop(guard);
     }
 
     #[test]
