@@ -1,118 +1,119 @@
 # filefacts
 
-A Rust library that reads a file and tells you what is in it — built for the
-people who turn files into feature vectors. Malware classifiers, triage
-systems, dataset builders: anything that needs a dense, honest description of a
-file as model input. Extracted from
-[cleave](https://github.com/atomdrift-project/cleave), it is the extraction layer that
-sits underneath Atomdrift's own models — and it is designed to sit underneath
-yours. (If you only want to understand a single file, it does that too.)
+[![Latest release](https://img.shields.io/github/v/release/atomdrift-project/filefacts)](https://github.com/atomdrift-project/filefacts/releases/latest)
+[![Crates.io](https://img.shields.io/crates/v/filefacts)](https://crates.io/crates/filefacts)
+[![License](https://img.shields.io/github/license/atomdrift-project/filefacts)](LICENSE)
 
-The pitch to an ML security researcher is one word: **reproducible.** Same bytes
-in, same facts out, every time — no subprocesses, no `file`/`objdump`/`openssl`/
-`tar` shelling out, no locale or tool-version drift leaking into your features.
-A vector you extract during a training run is the same vector you extract when
-you re-triage that sample in an incident six months later. That property is hard
-to get from a pile of CLIs glued together, and it is the whole point here.
+filefacts is an open-source Rust library and CLI that turns files into
+structured, security-relevant facts. It identifies formats, parses their
+structure, and exposes lazy views over text, symbols, sections, metrics,
+metadata, ASTs, and archive members.
 
-Give it bytes. filefacts identifies the format, parses it **once**, and returns
-a `ParsedFile` of lazy, cached views — read what you want, the rest costs
-nothing:
+Use it when building a malware classifier, triage pipeline, dataset, or any
+tool that needs more than a MIME type. It is the extraction layer used by
+[cleave](https://github.com/atomdrift-project/cleave), packaged so you can use
+the same parsers independently.
 
-```rust
-let facts = filefacts::open(&bytes)?;
-let entropy = facts.metrics();   // computed on demand
-let strings = facts.text();      // the other views never ran
-```
+## Why filefacts?
 
-`filefacts <path>` writes the same structure as JSON, one object per file, ready
-to fold straight into a feature pipeline.
-
-## The output
-
-| View | What it carries |
-|------|-----------------|
-| `fileid` | Format identification — type, container, compression. Free; no view computed. |
-| `values` | Residual structural fields, navigable as a JSON tree. |
-| `text` | Byte-scan strings (ASCII + UTF-16LE) with offsets. |
-| `literals` | Parser-extracted language string literals. |
-| `comments` | Comments recovered from source and documents. |
-| `metrics` | Derived numeric features — entropy, sizes, counts. |
-| `sections` | Binary section / segment listings. |
-| `symbols` | Unified named entities — imports, exports, functions, calls, members, identifiers — tagged by kind. |
-| `archive_members` | Entries inside archives, recursively. |
-| `source_ast` | tree-sitter AST facts for source files. |
-| `errors` | Recoverable extractor diagnostics — never a panic. |
-
-Every fact carries a **byte-range span** pointing at the evidence it was derived
-from, so a downstream model (or a human) can trace any feature back to the exact
-region of the file that produced it. The output schema is versioned
-(`SCHEMA_VERSION`): field additions are non-breaking; renames or semantic changes
-bump it, so a pipeline can pin a schema and trust it across releases.
-
-## The signals that discriminate
-
-filefacts surfaces the features that actually separate benign files from the
-things they imitate — not a metadata dump:
-
-- **Entropy, windowed.** Byte and per-section entropy, plus a windowed scan that
-  surfaces a concealed high-entropy region (peak value + offset) even when the
-  file's overall entropy looks unremarkable — the classic "small encrypted blob
-  hidden in a large benign file" tell.
-- **Structure over trust.** Section layout, import and symbol tables, signature
-  validity (Authenticode verified in-process with pure-Rust crypto), and
-  extension/content mismatches.
-- **Supply-chain identity.** Registry and package metadata parsed into
-  structured fields, including a `security_hold` flag and a `version_removed`
-  metric for packages pulled from their registry.
-- **Stego surface.** Per-channel entropy, edge density, and histogram flatness
-  for images.
-
-## What it parses
-
-- **Executables** — PE (with .NET/CLR managed metadata), ELF (with DWARF),
-  Mach-O, Java class, Python bytecode, WebAssembly, Android DEX.
-- **Archives & packages** — zip, tar (+ gz/bz2/xz/zst), 7z, rar, deb, rpm, pkg,
-  cab, CHM, DMG, CRX, XPI, WHL, JAR, VSIX, npm, gem, nupkg, Rust crate, Python
-  sdist, static libraries (`.a`), OCI container images.
-- **Documents** — PDF, RTF, OOXML, OLE2 (legacy Office, MSI, MSG), LNK, plist,
-  AppleScript. Authenticode is verified in-process.
-- **Images** — JPEG, PNG, with the stego metrics above.
-- **Structured** — JSON, YAML, TOML, XML, SVG, pickle, Dockerfile, Makefile,
-  systemd units, .desktop, GitHub Actions, lockfiles, and package manifests.
-- **Source** — tree-sitter ASTs for 20+ languages: JavaScript, TypeScript,
-  Python, Go, Rust, Java, C, C#, Bash, Batch, PowerShell, PHP, Ruby, Lua, Scala,
-  Swift, Objective-C, Kotlin, Clojure, Elixir, Groovy, Zig, plus Cypher/CQL and
-  Python template files.
+- **Parse once, inspect what you need.** Views are computed lazily and cached.
+- **Broad format coverage.** Handles source, executables, packages, archives,
+  documents, images, manifests, lockfiles, and deployment configuration.
+- **Evidence-oriented output.** Facts retain offsets, kinds, and provenance
+  useful to models and human reviewers.
+- **Recoverable failures.** Unsupported or damaged structures produce
+  diagnostics instead of forcing the entire pipeline to fail.
+- **Library and CLI.** Embed it in Rust or emit terminal/JSON output for another
+  process.
 
 ## Install
 
-```bash
-make install                              # build + install via cargo
+### Rust library
 
-brew tap atomdrift/tap                     # one-time, macOS / Linux
-brew install filefacts
+```toml
+[dependencies]
+filefacts = "1.3"
 ```
 
-`make install` builds the release binary and copies it to the first writeable
-location on your `PATH`. As a library, add `filefacts = "1.3"` to `Cargo.toml`.
-
-```bash
-filefacts suspect.bin       # JSON facts for one file
-filefacts /tmp/samples      # recurse a directory
+```rust
+let parsed = filefacts::open(&bytes)?;
+let identity = parsed.fileid();
+let metrics = parsed.metrics();
+let symbols = parsed.symbols();
 ```
 
-## Performance
+### Homebrew CLI on macOS or Linux
 
-In-process and single-pass by design: one walk per file, no forking. Views are
-cached on disk as zstd-compressed bincode keyed by SHA-256, so a second pass
-over the same corpus is nearly free — handy when you re-extract features after
-tweaking a downstream model. The cache self-cleans in the background: it prunes
-to 90% of capacity when it exceeds its size ceiling (2 GiB) and drops entries
-past a 30-day TTL, so it never grows unbounded. On source and script files with
-no sign of XOR logic, the XOR seed search is skipped entirely.
+```bash
+brew tap atomdrift/tap https://github.com/atomdrift-project/homebrew-tap.git
+brew install atomdrift/tap/filefacts
+```
 
----
+### Build the CLI from source
 
-Source and issues live on
-[GitHub](https://github.com/atomdrift-project/filefacts). Apache 2.0.
+Source builds require Git, Make, a C/C++ toolchain, and Rust 1.85 or newer.
+
+```bash
+git clone https://github.com/atomdrift-project/filefacts.git
+cd filefacts
+make install
+```
+
+## Quick start
+
+```bash
+# Inspect all available views in the terminal.
+filefacts suspect.bin
+
+# Emit the complete report as JSON.
+filefacts --format json suspect.bin
+
+# Request one focused view.
+filefacts metrics suspect.bin
+filefacts imports suspect.bin
+filefacts errors suspect.bin
+
+# Recursively inspect recognized files in a directory.
+filefacts --format json ./samples
+```
+
+Run `filefacts --help` for the complete view and output list.
+
+## Available views
+
+| View | Contents |
+| --- | --- |
+| `fileid` | File type, container, compression, and format confidence |
+| `identity` | Normalized package, signing, and producer identity claims |
+| `values` | Format-specific structural fields |
+| `text` / `literals` | Byte-scan text and parser-extracted string literals |
+| `metrics` | Entropy, sizes, counts, and other numeric features |
+| `sections` | Executable sections and segments |
+| `symbols` | Imports, exports, functions, calls, members, and identifiers |
+| `archive_members` | Recursively discovered container entries |
+| `source_ast` | tree-sitter facts for recognized source languages |
+| `errors` | Recoverable parser and extractor diagnostics |
+
+The schema is versioned with `SCHEMA_VERSION`. Views are cached as
+content-addressed, zstd-compressed records to make repeated corpus passes
+inexpensive.
+
+Most parsing is in-process. For PE, ELF, and Mach-O files, filefacts can invoke
+an installed Rizin or radare2 subprocess to recover deeper control-flow and
+symbol information. Its presence and version are part of the cache key, so pin
+the analysis environment when producing reproducible training data.
+
+## Coverage
+
+Representative formats include PE, ELF, Mach-O, WebAssembly, Android DEX, Java
+class files, Python bytecode, ZIP/TAR/7-Zip/RAR, deb/rpm/APK packages, OCI
+images, npm/wheel/gem/crate/NuGet packages, PDF, Office/OLE2, OOXML, RTF, LNK,
+plist, JPEG/PNG, JSON/YAML/TOML/XML, package manifests, lockfiles, and more than
+20 source languages.
+
+Issues and pull requests are welcome in the
+[GitHub repository](https://github.com/atomdrift-project/filefacts).
+
+## License
+
+filefacts is available under the [Apache License 2.0](LICENSE).
