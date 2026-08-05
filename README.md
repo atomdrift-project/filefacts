@@ -45,8 +45,7 @@ let symbols = parsed.symbols();
 ### Homebrew CLI on macOS or Linux
 
 ```bash
-brew tap atomdrift/tap https://github.com/atomdrift-project/homebrew-tap.git
-brew install atomdrift/tap/filefacts
+brew install atomdrift-project/tap/filefacts
 ```
 
 ### Build the CLI from source
