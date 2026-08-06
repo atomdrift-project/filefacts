@@ -5,6 +5,37 @@ use serde_json::Value as JsonValue;
 use crate::output::{Strings, Text, Values};
 use crate::scan::ascii;
 
+/// Whether stng's XOR seed search runs for a member.
+///
+/// XOR string obfuscation is a *payload* technique. It appears in executable
+/// code — ELF, PE, Mach-O — and in shell/JS/Python source that necessarily
+/// ships its own decoder, and effectively never in container, document, image
+/// or bytecode formats. On those the scan is pure cost, and on high-entropy
+/// content (a compressed disk image, a media blob) its short anchors match by
+/// chance, so each hit also triggers 4 KB of speculative decoding and the
+/// false positives that come with it.
+///
+/// Every extraction site states its answer explicitly so a newly added format
+/// has to make the choice rather than inherit one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum XorScan {
+    /// Executable code or a script carrying XOR intent.
+    Yes,
+    /// Everything else.
+    No,
+}
+
+/// Ceiling on XOR scanning. Beyond this the scan's cost outgrows any plausible
+/// yield — hand-rolled XOR string obfuscation is a small-payload technique, and
+/// a single member this large is a bundled runtime or media blob.
+const XOR_MAX_BYTES: usize = 300 << 20;
+
+impl XorScan {
+    fn runs_on(self, bytes: &[u8]) -> bool {
+        self == Self::Yes && bytes.len() < XOR_MAX_BYTES
+    }
+}
+
 /// stng extraction options. filefacts is the
 /// single string-extraction authority for cleave, so these mirror the rich opts
 /// cleave used to pass to stng directly:
@@ -12,11 +43,15 @@ use crate::scan::ascii;
 /// - `xor` recovers XOR-deobfuscated strings (key auto-detected),
 /// - `caller_provides_symbols` skips stng's symbol pass — filefacts walks the
 ///   symbol tables itself (`extract_symbols`), the single symbol codepath.
-fn string_opts() -> stng::ExtractOptions {
-    stng::ExtractOptions::new(ascii::DEFAULT_MIN_LEN)
+fn string_opts_for(xor: XorScan, bytes: &[u8]) -> stng::ExtractOptions {
+    let opts = stng::ExtractOptions::new(ascii::DEFAULT_MIN_LEN)
         .with_garbage_filter(true)
-        .with_xor(None)
-        .with_caller_provides_symbols(true)
+        .with_caller_provides_symbols(true);
+    if xor.runs_on(bytes) {
+        opts.with_xor(None)
+    } else {
+        opts
+    }
 }
 
 /// Adopt stng's shared string rows as the `text` tier. stng owns the
@@ -37,8 +72,8 @@ fn push_stng_strings(
 /// the format handler's own goblin parse failed (malformed input) — see
 /// [`extract_binary_strings_from_object`] for the fast path that reuses an
 /// already-parsed object.
-pub(super) fn extract_binary_strings(bytes: &[u8], strings: &mut Strings) {
-    let opts = string_opts();
+pub(super) fn extract_binary_strings(bytes: &[u8], strings: &mut Strings, xor: XorScan) {
+    let opts = string_opts_for(xor, bytes);
     push_stng_strings(
         stng::cached_strings_with_options(bytes, &opts),
         stng::cache_key_for(bytes, &opts),
@@ -54,23 +89,14 @@ pub(super) fn extract_binary_strings_from_object(
     object: &goblin::Object<'_>,
     bytes: &[u8],
     strings: &mut Strings,
+    xor: XorScan,
 ) {
-    let opts = string_opts();
+    let opts = string_opts_for(xor, bytes);
     push_stng_strings(
         stng::cached_strings_from_object(object, bytes, &opts),
         stng::cache_key_for(bytes, &opts),
         strings,
     );
-}
-
-/// [`string_opts`] without the XOR auto-detect scan. Used for source/script
-/// members that show no sign of XOR logic (see [`has_xor_intent`]): the
-/// printable-run, base64, and classification passes still run identically —
-/// only stng's expensive XOR seed search is skipped.
-fn string_opts_no_xor() -> stng::ExtractOptions {
-    stng::ExtractOptions::new(ascii::DEFAULT_MIN_LEN)
-        .with_garbage_filter(true)
-        .with_caller_provides_symbols(true)
 }
 
 /// Cheap pre-scan for XOR intent in source/script bytes. A self-contained
@@ -102,14 +128,10 @@ pub(super) fn has_xor_intent(bytes: &[u8]) -> bool {
 }
 
 /// `strings(1)`-tier byte view for a text/source member. Mirrors
-/// [`extract_binary_strings`] but runs stng's XOR auto-detect scan only when
-/// `run_xor` is set — callers gate source files on [`has_xor_intent`].
-pub(super) fn extract_text_strings(bytes: &[u8], strings: &mut Strings, run_xor: bool) {
-    let opts = if run_xor {
-        string_opts()
-    } else {
-        string_opts_no_xor()
-    };
+/// [`extract_binary_strings`] but for text/source bytes; callers gate source
+/// files on [`has_xor_intent`].
+pub(super) fn extract_text_strings(bytes: &[u8], strings: &mut Strings, xor: XorScan) {
+    let opts = string_opts_for(xor, bytes);
     push_stng_strings(
         stng::cached_strings_with_options(bytes, &opts),
         stng::cache_key_for(bytes, &opts),

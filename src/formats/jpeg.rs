@@ -21,7 +21,7 @@
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
-use crate::formats::common::{extract_binary_strings, put_str};
+use crate::formats::common::{XorScan, extract_binary_strings, put_str};
 use crate::formats::image_stats;
 use crate::output::{Metrics, Strings, Values};
 use crate::scan::entropy;
@@ -32,7 +32,7 @@ pub(super) fn extract(
     strings: &mut Strings,
     metrics: &mut Metrics,
 ) -> Result<(), Error> {
-    extract_binary_strings(bytes, strings);
+    extract_binary_strings(bytes, strings, XorScan::No);
 
     if bytes.len() < 2 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
         return Ok(());

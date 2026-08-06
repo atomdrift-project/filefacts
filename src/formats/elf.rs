@@ -10,8 +10,8 @@ use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::{
-    extract_binary_strings, extract_binary_strings_from_object, hex_encode, put_str, put_u64,
-    rizin_fallback,
+    XorScan, extract_binary_strings, extract_binary_strings_from_object, hex_encode, put_str,
+    put_u64, rizin_fallback,
 };
 use crate::formats::goblin_safe;
 use crate::output::{Errors, Metrics, Section, Strings, Values};
@@ -36,13 +36,13 @@ pub(super) fn extract(
     let elf = match goblin_safe::parse_elf(bytes) {
         goblin_safe::GoblinOutcome::Ok(elf) => elf,
         goblin_safe::GoblinOutcome::Failed(e) => {
-            extract_binary_strings(bytes, strings);
+            extract_binary_strings(bytes, strings, XorScan::Yes);
             errors_out.record_malformed(crate::Stage::ElfParse, e.to_string());
             metrics.insert("elf.parse_failed", 1.0);
             return Ok(());
         }
         goblin_safe::GoblinOutcome::Panicked(msg) => {
-            extract_binary_strings(bytes, strings);
+            extract_binary_strings(bytes, strings, XorScan::Yes);
             errors_out.record_panic(crate::Stage::ElfParse, msg);
             metrics.insert("elf.parse_panicked", 1.0);
             return Ok(());
@@ -52,7 +52,7 @@ pub(super) fn extract(
     // Reuse this parse for string extraction (move into an Object for stng,
     // then move back out) so the binary isn't parsed a second time.
     let object = goblin::Object::Elf(elf);
-    extract_binary_strings_from_object(&object, bytes, strings);
+    extract_binary_strings_from_object(&object, bytes, strings, XorScan::Yes);
     let goblin::Object::Elf(elf) = object else {
         unreachable!("constructed as Object::Elf")
     };

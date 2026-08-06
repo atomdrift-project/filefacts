@@ -14,7 +14,8 @@ use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::{
-    extract_binary_strings, extract_binary_strings_from_object, put_str, put_u64, rizin_fallback,
+    XorScan, extract_binary_strings, extract_binary_strings_from_object, put_str, put_u64,
+    rizin_fallback,
 };
 use crate::formats::goblin_safe;
 use crate::output::{Errors, Metrics, Section, Strings, Values};
@@ -39,13 +40,13 @@ pub(super) fn extract(
         goblin_safe::GoblinOutcome::Failed(e) => {
             // Parse failed: let stng parse the bytes itself so strings are
             // still recovered from the malformed input.
-            extract_binary_strings(bytes, strings);
+            extract_binary_strings(bytes, strings, XorScan::Yes);
             errors_out.record_malformed(crate::Stage::MachoParse, e.to_string());
             metrics.insert("macho.parse_failed", 1.0);
             return Ok(());
         }
         goblin_safe::GoblinOutcome::Panicked(msg) => {
-            extract_binary_strings(bytes, strings);
+            extract_binary_strings(bytes, strings, XorScan::Yes);
             errors_out.record_panic(crate::Stage::MachoParse, msg);
             metrics.insert("macho.parse_panicked", 1.0);
             return Ok(());
@@ -54,7 +55,7 @@ pub(super) fn extract(
     // Reuse this parse for string extraction instead of having stng parse the
     // binary a second time.
     let object = goblin::Object::Mach(parsed);
-    extract_binary_strings_from_object(&object, bytes, strings);
+    extract_binary_strings_from_object(&object, bytes, strings, XorScan::Yes);
     let goblin::Object::Mach(parsed) = object else {
         unreachable!("constructed as Object::Mach")
     };

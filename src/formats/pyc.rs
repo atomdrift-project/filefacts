@@ -22,7 +22,7 @@
 use serde_json::Value as JsonValue;
 
 use crate::error::Error;
-use crate::formats::common::{extract_binary_strings, put_str};
+use crate::formats::common::{XorScan, extract_binary_strings, put_str};
 use crate::output::{Metrics, Strings, Values};
 
 /// Cap on body bytes scanned for source-filename strings. Real
@@ -38,7 +38,7 @@ pub(super) fn extract(
     strings: &mut Strings,
     metrics: &mut Metrics,
 ) -> Result<(), Error> {
-    extract_binary_strings(bytes, strings);
+    extract_binary_strings(bytes, strings, XorScan::No);
 
     if bytes.len() < 16 {
         return Ok(());

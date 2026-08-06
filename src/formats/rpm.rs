@@ -21,7 +21,7 @@
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
-use crate::formats::common::{extract_binary_strings, put_str};
+use crate::formats::common::{XorScan, extract_binary_strings, put_str};
 use crate::output::{Metrics, Strings, Values};
 
 const RPM_LEAD_MAGIC: [u8; 4] = [0xed, 0xab, 0xee, 0xdb];
@@ -70,7 +70,7 @@ pub(super) fn extract(
     strings: &mut Strings,
     metrics: &mut Metrics,
 ) -> Result<(), Error> {
-    extract_binary_strings(bytes, strings);
+    extract_binary_strings(bytes, strings, XorScan::No);
 
     if bytes.len() < LEAD_BYTES + 16 || bytes[..4] != RPM_LEAD_MAGIC {
         return Ok(());

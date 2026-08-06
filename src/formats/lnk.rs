@@ -28,7 +28,7 @@
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
-use crate::formats::common::{extract_binary_strings, put_str, put_u64};
+use crate::formats::common::{XorScan, extract_binary_strings, put_str, put_u64};
 use crate::output::{Metrics, Strings, Values};
 
 /// `{0001-4C00-0000-0000-AA00-3826B3713F}` — the canonical CLSID
@@ -65,7 +65,7 @@ pub(super) fn extract(
     strings: &mut Strings,
     metrics: &mut Metrics,
 ) -> Result<(), Error> {
-    extract_binary_strings(bytes, strings);
+    extract_binary_strings(bytes, strings, XorScan::No);
 
     // Header is exactly 76 bytes; first 4 bytes are its self-described
     // length.

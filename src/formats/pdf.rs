@@ -32,7 +32,7 @@
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
-use crate::formats::common::{extract_binary_strings, hex_nibble};
+use crate::formats::common::{XorScan, extract_binary_strings, hex_nibble};
 use crate::output::{Metrics, Strings, Values};
 
 /// Cap on the snippet text we surface per action. Long JavaScript
@@ -59,7 +59,7 @@ pub(super) fn extract(
     strings: &mut Strings,
     metrics: &mut Metrics,
 ) -> Result<(), Error> {
-    extract_binary_strings(bytes, strings);
+    extract_binary_strings(bytes, strings, XorScan::No);
 
     // Every PDF starts with `%PDF-<major>.<minor>`. Bail (parsable
     // as generic) if the header is missing or unreadable.

@@ -377,23 +377,26 @@ pub(crate) fn extract(
     // noise. (Generic `Json`/`Gyp` are *not* structured-data here — when their
     // size-limited parse is skipped they legitimately fall through to a scan.)
     if !file_type.is_structured_data() && strings.text.is_empty() {
-        // Decide whether to run stng's (expensive, FP-prone) XOR auto-detect
-        // scan alongside the always-on printable-run extraction:
-        //   * Archive containers — never. Their bytes are compressed/high-entropy;
-        //     any real XOR payload lives in a *member*, which is scanned on its
-        //     own. Scanning the container only burns cycles and manufactures
-        //     speculative-decode false positives.
-        //   * Source/script — only when the bytes show XOR intent (`^` operator
-        //     or the `xor` keyword). A self-contained script wielding an
-        //     XOR-encoded payload must carry its decoder in the same file, so
-        //     `has_xor_intent` preserves real detection while skipping the scan
-        //     (and its speculative FPs) on the overwhelming majority of benign
-        //     source.
-        //   * Everything else (binaries, unknown text-like) — full scan; their
-        //     decode logic is machine code, not greppable.
-        let run_xor = !file_type.is_archive()
-            && (!file_type.is_source_code() || common::has_xor_intent(bytes));
-        common::extract_text_strings(bytes, strings, run_xor);
+        // This is the fallback path — everything without its own format
+        // handler. stng's XOR auto-detect scan is expensive and FP-prone, so it
+        // runs only for source/script that shows XOR intent (`^` operator or
+        // the `xor` keyword). A self-contained script wielding an XOR-encoded
+        // payload must carry its decoder in the same file, so `has_xor_intent`
+        // preserves real detection while skipping the scan on the overwhelming
+        // majority of benign source.
+        //
+        // Nothing else here gets it. Archive containers are compressed and
+        // high-entropy — any real XOR payload lives in a *member*, scanned on
+        // its own — and the remaining unknown/text-like bytes have no decoder to
+        // pair a payload with. The formats where XOR *is* a live technique
+        // (ELF/PE/Mach-O) have their own handlers, which pass
+        // [`common::XorScan::Yes`] explicitly.
+        let xor = if file_type.is_source_code() && common::has_xor_intent(bytes) {
+            common::XorScan::Yes
+        } else {
+            common::XorScan::No
+        };
+        common::extract_text_strings(bytes, strings, xor);
     }
 
     // Cross-format binary attribution derived from the merged symbol

@@ -16,8 +16,8 @@ use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::{
-    extract_binary_strings, extract_binary_strings_from_object, hex_encode, put_i64, put_str,
-    put_u64, rizin_fallback_with_sections,
+    XorScan, extract_binary_strings, extract_binary_strings_from_object, hex_encode, put_i64,
+    put_str, put_u64, rizin_fallback_with_sections,
 };
 use crate::formats::goblin_safe;
 use crate::output::{Errors, Metrics, Section, Strings, Values};
@@ -81,7 +81,7 @@ pub(super) fn extract(
         // Reuse this parse for string extraction (move into an Object for stng,
         // then move back out) so the binary isn't parsed a second time.
         let object = goblin::Object::PE(pe);
-        extract_binary_strings_from_object(&object, bytes, strings);
+        extract_binary_strings_from_object(&object, bytes, strings, XorScan::Yes);
         let goblin::Object::PE(pe) = object else {
             unreachable!("constructed as Object::PE")
         };
@@ -186,7 +186,7 @@ pub(super) fn extract(
 
     // Full parse failed: recover strings via stng's own byte-level scan
     // (it parses the bytes itself, tolerating the malformed structure).
-    extract_binary_strings(bytes, strings);
+    extract_binary_strings(bytes, strings, XorScan::Yes);
 
     // Header-only fallback. The header parse is far more tolerant —
     // we can still surface machine / subsystem / characteristics +
