@@ -26,6 +26,10 @@ const TAIL_SIZE: usize = 2048;
 /// Minimum score to consider a language match.
 const THRESHOLD: u16 = 10;
 
+/// Significant lines a document needs before its shape is judged as YAML. Short
+/// fragments carry too little structure to separate a mapping from prose.
+const MIN_YAML_LINES: usize = 5;
+
 #[derive(Clone, Copy)]
 struct PatternEntry {
     lang: Lang,
@@ -361,6 +365,17 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
         return None;
     }
 
+    // Detection rules, CI configuration, and package manifests quote the very
+    // tokens this table scores: a rule pack hunting Python stagers contains
+    // `import os`, one hunting macOS stealers contains `do shell script`. The
+    // document is data about a language, not the language. Extensions normally
+    // settle this (`ext::is_data_format`), but a renamed, disabled, or
+    // extensionless copy reaches content sniffing, so the document shape has to
+    // decide. Structured data is never one of the scored languages.
+    if looks_like_structured_data(data) {
+        return None;
+    }
+
     let head = &data[..data.len().min(SCAN_LIMIT)];
 
     // If the head is mostly whitespace, also scan the tail
@@ -424,7 +439,131 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
         }
     }
 
+    // A Dockerfile must begin with FROM (ARG may precede it). `\nFROM ` alone is
+    // not enough: uppercase SQL puts `FROM` at the start of a line too, and a
+    // `SELECT … FROM users` query would otherwise type as a Dockerfile.
+    if lang == Lang::Dockerfile && !starts_with_dockerfile_instruction(data) {
+        return None;
+    }
+
+    // PHP is tag-delimited: code only runs between `<?`/`<?php`/`<?=` and `?>`.
+    // Without a tag there is no PHP, however many superglobals or WordPress hook
+    // names the bytes contain — and those names are ordinary text elsewhere.
+    // Detection rules, WAF patterns, changelogs, and log lines quote `$_POST`
+    // without being PHP, and a YAML rule file whose regexes match PHP stagers
+    // quotes little else. Requiring a delimiter keeps such references from
+    // typing data as PHP, while still admitting the tagless fragments this table
+    // targets: a fragment cut from a larger file loses its opening tag but keeps
+    // the closing one.
+    if lang == Lang::Php {
+        let tagged = has_php_tag(&data[..data.len().min(SCAN_LIMIT)])
+            || (is_mostly_whitespace(data, SCAN_LIMIT)
+                && data.len() > SCAN_LIMIT
+                && has_php_tag(&data[data.len().saturating_sub(TAIL_SIZE)..]));
+        if !tagged {
+            return None;
+        }
+    }
+
     Some(lang.to_file_type())
+}
+
+/// First offset of `needle` in `haystack`.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// `true` when the bytes read as a structured-data document — a JSON object or
+/// array, or a YAML block mapping — rather than as code in any scored language.
+/// Kept deliberately shape-based: it asks how the lines are built, never which
+/// words they contain, so a rule file is data no matter which language's tokens
+/// it quotes.
+fn looks_like_structured_data(data: &[u8]) -> bool {
+    let head = &data[..data.len().min(SCAN_LIMIT)];
+    // A shebang names an interpreter: that is a script, whatever follows.
+    if head.starts_with(b"#!") {
+        return false;
+    }
+    let body = head.trim_ascii_start();
+    // JSON: opens a container and carries at least one quoted key.
+    if (body.starts_with(b"{") || body.starts_with(b"[")) && find(body, b"\":").is_some() {
+        return true;
+    }
+    // YAML: block mappings and sequence entries dominate the significant lines.
+    // A trailing partial line from the scan cut is dropped rather than judged.
+    let mut lines = head.split(|&b| b == b'\n').peekable();
+    let mut significant = 0usize;
+    let mut structured = 0usize;
+    while let Some(line) = lines.next() {
+        if lines.peek().is_none() && head.len() == SCAN_LIMIT {
+            break;
+        }
+        let line = line.trim_ascii();
+        if line.is_empty() || line.starts_with(b"#") {
+            continue;
+        }
+        significant += 1;
+        if is_yaml_node_line(line) {
+            structured += 1;
+        }
+    }
+    significant >= MIN_YAML_LINES && structured * 10 >= significant * 7
+}
+
+/// `true` for a line that opens a YAML sequence entry, a block mapping key, or
+/// a document marker. Keys are matched by shape (`name:` followed by end of line
+/// or a space), which is what separates `regex: \$_POST` from PHP's `$_POST`.
+fn is_yaml_node_line(line: &[u8]) -> bool {
+    if line == b"---" || line == b"..." || line.starts_with(b"--- ") {
+        return true;
+    }
+    if line == b"-" || line.starts_with(b"- ") {
+        return true;
+    }
+    // A sequence entry may carry its first mapping key: `- id: value`.
+    let key = line.strip_prefix(b"- ").unwrap_or(line).trim_ascii_start();
+    let end = key
+        .iter()
+        .position(|b| !matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'/' | b'"' | b'\''))
+        .unwrap_or(key.len());
+    end > 0 && key.get(end) == Some(&b':') && matches!(key.get(end + 1), None | Some(b' '))
+}
+
+/// `true` when the first instruction of the document is `FROM` or `ARG`, the
+/// only two a Dockerfile may open with. Comments, blank lines, and a leading
+/// parser directive are skipped, matching what the builder accepts.
+fn starts_with_dockerfile_instruction(data: &[u8]) -> bool {
+    for line in data[..data.len().min(SCAN_LIMIT)].split(|&b| b == b'\n') {
+        let line = line.trim_ascii();
+        if line.is_empty() || line.starts_with(b"#") {
+            continue;
+        }
+        let word_end = line
+            .iter()
+            .position(u8::is_ascii_whitespace)
+            .unwrap_or(line.len());
+        return line[..word_end].eq_ignore_ascii_case(b"FROM")
+            || line[..word_end].eq_ignore_ascii_case(b"ARG");
+    }
+    false
+}
+
+/// `true` when the bytes carry a PHP tag delimiter — an opening `<?`, `<?php`,
+/// or `<?=`, or the `?>` that closes a fragment whose opening tag was cut off.
+/// `<?xml …?>` is an XML processing instruction and never counts on its own.
+fn has_php_tag(data: &[u8]) -> bool {
+    let mut saw_xml_pi = false;
+    let mut offset = 0;
+    while let Some(pos) = find(&data[offset..], b"<?") {
+        let after = offset + pos + 2;
+        if data[after..].len() >= 3 && data[after..after + 3].eq_ignore_ascii_case(b"xml") {
+            saw_xml_pi = true;
+        } else {
+            return true;
+        }
+        offset = after;
+    }
+    !saw_xml_pi && find(data, b"?>").is_some()
 }
 
 /// Check if content looks like HTML (has actual markup tags).
@@ -524,6 +663,162 @@ function wpcf7_special_mail_tag( $output, $name, $html ) {
 <!DOCTYPE html><html><head><script>var x = 1;</script></head></html>
 "#;
         assert_eq!(detect_from_content(data), Some(FileType::Php));
+    }
+
+    #[test]
+    fn detection_rules_quoting_php_superglobals_are_not_php() {
+        // A YAML rule file whose regexes match PHP stagers: it names `$_POST`
+        // and `$_COOKIE` but contains no PHP tag, so it is not PHP.
+        let data = br#"defaults:
+  platforms: [linux, unix]
+  for: [data]
+
+traits:
+  - id: webshell-post-loop
+    desc: foreach over POST parameters
+    if:
+      type: raw
+      regex: foreach\s*\(\s*\$_POST\s+as.{0,80}==\s*16
+
+  - id: webshell-cookie-post-pair
+    if:
+      type: raw
+      regex: \$_COOKIE\s*,\s*\$_POST
+"#;
+        assert_eq!(detect_from_content(data), None);
+    }
+
+    #[test]
+    fn php_requires_a_tag() {
+        // Same superglobals, no tag — prose about PHP is not PHP.
+        let untagged = b"The handler reads $_POST and $_GET, then calls preg_replace( ) on it.\n";
+        assert_eq!(detect_from_content(untagged), None);
+
+        // The opening tag settles it.
+        let tagged = b"<?php\n$x = $_POST['a'];\necho $x;\n";
+        assert_eq!(detect_from_content(tagged), Some(FileType::Php));
+    }
+
+    #[test]
+    fn xml_processing_instruction_is_not_a_php_tag() {
+        let data = br#"<?xml version="1.0"?>
+<rules>
+  <rule match="$_POST"/>
+  <rule match="$_GET"/>
+  <rule match="$_SERVER"/>
+</rules>
+"#;
+        assert_eq!(detect_from_content(data), None);
+    }
+
+    #[test]
+    fn yaml_detection_rules_are_not_typed_as_what_they_match() {
+        // Detection content names the tokens it hunts for. Each of these rule
+        // files quotes a different language's conclusive markers; none of them
+        // is that language. The `.yaml` extension normally suppresses content
+        // heuristics, but a renamed, disabled, or extensionless copy reaches
+        // them, so the document shape has to carry the decision.
+        let python = br#"traits:
+  - id: py-stager-entrypoint
+    desc: Python stager entrypoint
+    if:
+      type: raw
+      substr: if __name__
+  - id: py-stager-imports
+    if:
+      type: raw
+      substr: import os
+  - id: py-stager-decode
+    if:
+      type: raw
+      substr: base64.b64decode
+"#;
+        assert_eq!(detect_from_content(python), None);
+
+        let applescript = br#"traits:
+  - id: amos-shell-handoff
+    desc: AMOS stealer shell handoff
+    if:
+      type: raw
+      substr: do shell script
+  - id: amos-tell-finder
+    if:
+      type: raw
+      substr: tell application "Finder"
+  - id: amos-quoted-form
+    if:
+      type: raw
+      substr: quoted form of
+"#;
+        assert_eq!(detect_from_content(applescript), None);
+
+        let powershell = br#"traits:
+  - id: ps-loader-preference
+    if:
+      type: raw
+      substr: $ErrorActionPreference
+  - id: ps-loader-convert
+    if:
+      type: raw
+      substr: "[System.Convert]"
+  - id: ps-loader-xor
+    if:
+      type: raw
+      substr: " -bxor "
+"#;
+        assert_eq!(detect_from_content(powershell), None);
+
+        let vbs = br#"traits:
+  - id: vbs-dropper-host
+    if:
+      type: raw
+      substr: WScript.Shell
+  - id: vbs-dropper-explicit
+    if:
+      type: raw
+      substr: Option Explicit
+  - id: vbs-dropper-createobject
+    if:
+      type: raw
+      substr: CreateObject(
+"#;
+        assert_eq!(detect_from_content(vbs), None);
+    }
+
+    #[test]
+    fn json_manifest_quoting_language_tokens_is_not_that_language() {
+        let data = br##"{
+  "name": "rule-pack",
+  "rules": [
+    {"id": "py", "match": "import os"},
+    {"id": "ps", "match": "$ErrorActionPreference"},
+    {"id": "lua", "match": "setmetatable"},
+    {"id": "c", "match": "#include <stdio.h>"}
+  ]
+}
+"##;
+        assert_eq!(detect_from_content(data), None);
+    }
+
+    #[test]
+    fn sql_query_is_not_a_dockerfile() {
+        // `\nFROM ` is the Dockerfile marker, but uppercase SQL puts FROM at the
+        // start of a line too. A Dockerfile must begin with FROM (or ARG); this
+        // begins with SELECT.
+        let data = br#"SELECT id, name, created_at
+FROM users
+WHERE created_at > now() - interval '7 days'
+ORDER BY created_at DESC;
+"#;
+        assert_ne!(detect_from_content(data), Some(FileType::Dockerfile));
+
+        // A real Dockerfile still resolves.
+        let dockerfile = br#"# syntax=docker/dockerfile:1
+FROM alpine:3.20
+RUN apk add --no-cache curl
+COPY entrypoint.sh /entrypoint.sh
+"#;
+        assert_eq!(detect_from_content(dockerfile), Some(FileType::Dockerfile));
     }
 
     #[test]
