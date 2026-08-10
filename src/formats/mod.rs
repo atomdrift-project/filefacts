@@ -47,6 +47,7 @@ mod elf;
 mod elf_dwarf;
 mod elf_dynamic;
 mod elf_hashes;
+mod elf_syscalls;
 mod gem;
 mod generic;
 mod go_buildinfo;
@@ -85,6 +86,7 @@ mod rpm;
 mod rtf;
 mod rust_crate;
 pub(crate) mod source;
+mod source_meta;
 mod structured;
 mod tar;
 mod udf;
@@ -405,6 +407,13 @@ pub(crate) fn extract(
     if !symbols.is_empty() {
         binary_attribution::emit(symbols, values);
     }
+
+    // Interior source identity: a source archive (.tar.gz/.zip release) or a
+    // bare plugin PHP that carries no ecosystem manifest, probed for a
+    // WordPress plugin header or an autoconf AC_INIT. Self-gates by type,
+    // reads only a bounded set of members; the normalizer folds `source.*`
+    // in below.
+    source_meta::extract(bytes, file_type, values);
 
     result
 }

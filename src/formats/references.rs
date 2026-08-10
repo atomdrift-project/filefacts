@@ -23,6 +23,8 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Vec<
         // UTF-8 text manifests can be searched for offsets; binary or
         // compressed sources (an npm `.tgz`) cannot.
         text: std::str::from_utf8(bytes).ok(),
+        cursor: 0,
+        budget: MAX_LOCATE_SCAN,
     };
     // Only declared, structured dependencies live here. Imperative/undeclared
     // recognition (install-hook commands, shell/Dockerfile `npm install`,
@@ -46,9 +48,147 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Vec<
         FileType::YarnLock => yarn_lock(&mut out),
         FileType::PnpmLock => pnpm_lock(values, &mut out),
         FileType::JavaScript | FileType::TypeScript => js_local_refs(&mut out),
+        FileType::GithubActions => github_actions(values, &mut out),
         _ => {}
     }
     out.refs
+}
+
+/// GitHub Actions `uses:` steps — third-party code a workflow (or composite
+/// `action.yml`) runs. Each `owner/repo@ref` is a GitHub repository action
+/// (`pkg:github`), each `docker://…` a container action (`pkg:oci`); local
+/// `./…` actions ship in the repo and are not external. Every match is a
+/// declared [`RefKind::Dependency`] — its CI-only *context* is the workflow
+/// file's, not the reference's, so a consumer gates fetching on the file type
+/// rather than a per-reference mark.
+fn github_actions(values: &Values, out: &mut Refs<'_>) {
+    let root = values.as_json();
+    // Workflow steps: `jobs.<job>.steps[].uses`, plus a job-level `uses:` that
+    // calls a reusable workflow. Composite actions: `runs.steps[].uses`.
+    if let Some(jobs) = root.get("jobs").and_then(JsonValue::as_object) {
+        for job in jobs.values() {
+            emit_uses(out, job.get("uses"), "github-actions.jobs.uses");
+            emit_step_uses(out, job.get("steps"));
+        }
+    }
+    emit_step_uses(out, root.get("runs").and_then(|runs| runs.get("steps")));
+}
+
+/// Emit `uses:` for every step in a `steps:` array.
+fn emit_step_uses(out: &mut Refs<'_>, steps: Option<&JsonValue>) {
+    let Some(steps) = steps.and_then(JsonValue::as_array) else {
+        return;
+    };
+    for step in steps {
+        emit_uses(out, step.get("uses"), "github-actions.steps.uses");
+    }
+}
+
+/// Emit one `uses:` value as a reference, if it names remote third-party code.
+fn emit_uses(out: &mut Refs<'_>, uses: Option<&JsonValue>, source: &str) {
+    let Some(raw) = uses.and_then(JsonValue::as_str) else {
+        return;
+    };
+    if let Some(locator) = github_action_locator(raw) {
+        out.push(locator, RefKind::Dependency, source, raw, None);
+    }
+}
+
+/// A fetchable locator for a GitHub Actions `uses:` value.
+/// `owner/repo[/subpath]@ref` → `pkg:github/owner/repo@ref`;
+/// `docker://[registry/]image[:tag]` → `pkg:oci/image?repository_url=…&tag=…`,
+/// the name lowercased as the `oci` purl type requires. Local (`./…`) uses ship
+/// in the repo and return `None`.
+fn github_action_locator(uses: &str) -> Option<RefLocator> {
+    let uses = uses.trim();
+    if let Some(image) = uses.strip_prefix("docker://") {
+        // A `:` opens the tag only after the last `/` — otherwise it is a
+        // registry port (`localhost:5000/tool`), not a tag.
+        let (path, tag) = match image.rsplit_once(':') {
+            Some((path, tag)) if !tag.contains('/') => (path, Some(tag)),
+            _ => (image, None),
+        };
+        let (registry, name) = match path.rsplit_once('/') {
+            Some((registry, leaf)) => (Some(registry), leaf),
+            None => (None, path),
+        };
+        // The registry keeps `/` for a namespace and `:` for a port; the image
+        // leaf and the tag are bare names. Anything else must never reach a
+        // fetchable locator.
+        if !purl_safe(name, b"")
+            || !registry.is_none_or(registry_safe)
+            || !tag.is_none_or(|t| purl_safe(t, b""))
+        {
+            return None;
+        }
+        // The `oci` type reserves the version for the sha256 digest, which a
+        // workflow reference never carries — registry and tag are qualifiers.
+        // A registry's slashes are percent-encoded: purl exempts a separator
+        // character from encoding only in separator position, and inside a
+        // qualifier value `/` is ordinary text (only `&` ends a value). An
+        // absent tag stays absent, so an unpinned action reads as unpinned.
+        // Canonical form sorts qualifiers by key — keep any addition here in
+        // alphabetical order.
+        let quals: Vec<String> = [
+            registry.map(|r| format!("repository_url={}", r.replace('/', "%2F"))),
+            tag.map(|t| format!("tag={t}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let purl = format!("pkg:oci/{}", name.to_ascii_lowercase());
+        return Some(RefLocator::Purl(if quals.is_empty() {
+            purl
+        } else {
+            format!("{purl}?{}", quals.join("&"))
+        }));
+    }
+    if uses.starts_with('.') {
+        return None; // local action, ships in the repo
+    }
+    let (repo, git_ref) = uses.split_once('@')?;
+    let mut segs = repo.split('/');
+    let (owner, name) = (segs.next()?, segs.next()?);
+    // Validate every component before it reaches the purl: a `uses:` value is
+    // attacker-controlled (it comes from a scanned repo's workflow), and an
+    // unescaped `?`/`&`/`@` in the ref would inject a purl qualifier — e.g.
+    // `owner/repo@v1?repository_url=http://evil` redirects the fetch to an
+    // attacker host. The ref keeps `/` (`refs/tags/x`); owner and name are bare
+    // slugs. `purl_safe` also rejects `..`, so no ref walks the archive URL.
+    if !purl_safe(owner, b"") || !purl_safe(name, b"") || !purl_safe(git_ref, b"/") {
+        return None;
+    }
+    Some(RefLocator::Purl(format!(
+        "pkg:github/{owner}/{name}@{git_ref}"
+    )))
+}
+
+/// Whether a `uses:` component is safe to interpolate into a PURL: non-empty,
+/// free of path traversal (`..`), and limited to identifier characters plus the
+/// `extra` punctuation legal for its position (`/` in a ref path, `:` for a
+/// registry port). Every PURL-syntax character (`?`, `#`, `&`, `@`, `%`),
+/// whitespace, and control byte is rejected, so a component can neither open a
+/// qualifier nor redirect the fetch.
+/// Whether a container registry is well-formed enough to hand to a fetcher:
+/// `host[:port]` plus optional namespace segments, each a real label.
+///
+/// Beyond [`purl_safe`] this requires every `/`-separated segment to be
+/// non-empty and alphanumeric-led. `purl_safe` alone admits `//evil.example`,
+/// which survives into `repository_url` and which a consumer resolving it as a
+/// URL reads as protocol-relative — pointing the fetch at an attacker's host.
+fn registry_safe(registry: &str) -> bool {
+    purl_safe(registry, b"/:")
+        && registry
+            .split('/')
+            .all(|seg| seg.starts_with(|c: char| c.is_ascii_alphanumeric()))
+}
+
+fn purl_safe(s: &str, extra: &[u8]) -> bool {
+    !s.is_empty()
+        && !s.contains("..")
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_') || extra.contains(&b)
+        })
 }
 
 /// Relative `require`/`import`/`export … from`/dynamic `import()` targets in a
@@ -572,13 +712,58 @@ fn strip_line_comment(line: &str) -> &str {
     line.split_once("//").map_or(line, |(code, _)| code)
 }
 
+/// Budget for whole-file evidence searches, in bytes scanned.
+///
+/// [`Refs::locate`] resumes from the previous match, which is linear while a
+/// producer emits in document order. A producer that doesn't falls back to
+/// searching the whole file per reference — O(N × file), quadratic in a
+/// manifest that declares thousands. Measured before this budget existed: 40k
+/// `uses:` steps in 1.5 MB cost 10.5 s, rising 4× per doubling, so a crafted
+/// input scales to hours of CPU on one file. Once the budget is spent the
+/// remaining offsets report 0, already the value for evidence we can't locate.
+const MAX_LOCATE_SCAN: usize = 64 << 20;
+
 /// Reference accumulator that also carries the raw file text for offsets.
 struct Refs<'a> {
     refs: Vec<Reference>,
     text: Option<&'a str>,
+    /// Where the last evidence was found; the next search resumes here.
+    cursor: usize,
+    /// Remaining whole-file search budget; see [`MAX_LOCATE_SCAN`].
+    budget: usize,
 }
 
 impl Refs<'_> {
+    /// Byte offset of `evidence`: its first occurrence at or after the previous
+    /// match, else its first occurrence anywhere, else the package name / URL
+    /// anchor, else 0.
+    ///
+    /// Resuming at the previous match is what keeps this linear, and it also
+    /// sharpens repeated evidence: two steps that name the same action cite
+    /// their own lines instead of both citing the first. The cursor never
+    /// advances *past* a match, so a producer emitting two references for one
+    /// span still gets that span twice.
+    fn locate(&mut self, evidence: &str, locator: &RefLocator) -> u64 {
+        let Some(text) = self.text else { return 0 };
+        if let Some(at) = text.get(self.cursor..).and_then(|tail| tail.find(evidence)) {
+            self.cursor += at;
+            return self.cursor as u64;
+        }
+        if self.budget == 0 {
+            return 0;
+        }
+        // A miss already cost a scan to end-of-file, and the fallback costs up
+        // to two more; charge the pair.
+        self.budget = self.budget.saturating_sub(text.len().saturating_mul(2));
+        let found = text
+            .find(evidence)
+            .or_else(|| text.find(&anchor_from_locator(locator)));
+        if let Some(at) = found {
+            self.cursor = at;
+        }
+        found.unwrap_or(0) as u64
+    }
+
     /// Push one reference, deriving its `offset`, and `content_sha256` from a
     /// SHA-256 pin (a sha256 pin *is* the content hash, so it doubles as the
     /// hopper key). Every producer goes through here so these rules live in
@@ -596,13 +781,7 @@ impl Refs<'_> {
         pinned_hash: Option<PinnedHash>,
     ) {
         let evidence = evidence.into();
-        let offset = self
-            .text
-            .and_then(|t| {
-                t.find(&evidence)
-                    .or_else(|| t.find(&anchor_from_locator(&locator)))
-            })
-            .unwrap_or(0) as u64;
+        let offset = self.locate(&evidence, &locator);
         let content_sha256 = pinned_hash
             .as_ref()
             .filter(|p| p.algo == HashAlgo::Sha256)
@@ -1725,5 +1904,124 @@ mod tests {
         let purls = purls(&refs);
         assert!(purls.contains(&"pkg:pypi/requests@2.28.1"));
         assert!(purls.contains(&"pkg:pypi/pytest@7.0.0"));
+    }
+
+    #[test]
+    fn github_actions_maps_uses_to_repo_and_container_purls() {
+        let values = Values::from_json(serde_json::json!({
+            "jobs": { "build": { "steps": [
+                { "uses": "actions/checkout@v4" },
+                { "uses": "docker://ghcr.io/owner/tool:1.2" },
+                { "uses": "docker://alpine:3.19" },
+                { "uses": "docker://localhost:5000/tool" },
+                { "uses": "docker://alpine" },
+                { "uses": "./.github/actions/local" },
+                { "run": "echo hi" }
+            ] } }
+        }));
+        let refs = derive(FileType::GithubActions, &[], &values);
+        let purls = purls(&refs);
+        // Repo action → pkg:github; container action → pkg:oci. The `oci` type
+        // reserves the version for a digest, so registry and tag are
+        // qualifiers. A local action ships in the repo, so it is not a ref.
+        assert!(purls.contains(&"pkg:github/actions/checkout@v4"));
+        assert!(purls.contains(&"pkg:oci/tool?repository_url=ghcr.io%2Fowner&tag=1.2"));
+        assert!(purls.contains(&"pkg:oci/alpine?tag=3.19"));
+        // A registry port is not a tag, and the `:` it keeps needs no encoding.
+        assert!(purls.contains(&"pkg:oci/tool?repository_url=localhost:5000"));
+        // An untagged reference stays untagged — an unpinned action reads as
+        // unpinned rather than being silently resolved to `latest`.
+        assert!(purls.contains(&"pkg:oci/alpine"), "{purls:?}");
+        assert_eq!(
+            refs.len(),
+            5,
+            "local action and run step are not references"
+        );
+        // Every action reference is a declared dependency (kind); its CI-only
+        // context comes from the workflow file, not the reference.
+        assert!(refs.iter().all(|r| r.kind == RefKind::Dependency));
+    }
+
+    #[test]
+    fn locate_cites_a_real_occurrence_of_every_evidence() {
+        // The resume-from-cursor search keeps locating N references linear.
+        // The invariant it must hold is that every offset still *cites* its
+        // evidence — the byte there really begins that string.
+        let mut yaml = String::from("name: w\non: push\njobs:\n  build:\n    steps:\n");
+        let mut steps = Vec::new();
+        for i in 0..64 {
+            yaml.push_str(&format!("      - uses: actions/step{i}@v{i}\n"));
+            steps.push(serde_json::json!({ "uses": format!("actions/step{i}@v{i}") }));
+        }
+        // A repeat of an earlier step: it is a distinct step at a distinct
+        // byte, so it must cite its own line, not the first one's.
+        yaml.push_str("      - uses: actions/step0@v0\n");
+        steps.push(serde_json::json!({ "uses": "actions/step0@v0" }));
+
+        let values = Values::from_json(serde_json::json!({
+            "jobs": { "build": { "steps": steps } }
+        }));
+        let refs = derive(FileType::GithubActions, yaml.as_bytes(), &values);
+        assert_eq!(refs.len(), 65);
+
+        for r in &refs {
+            assert!(
+                yaml[r.offset as usize..].starts_with(&r.evidence),
+                "offset {} must cite {:?}",
+                r.offset,
+                r.evidence
+            );
+        }
+        // Distinct evidence in document order lands exactly where a whole-file
+        // search would.
+        for r in &refs[..64] {
+            assert_eq!(r.offset as usize, yaml.find(&r.evidence).unwrap());
+        }
+        // The duplicate cites its own later line, which a whole-file search
+        // could not distinguish from the first.
+        assert_eq!(refs[64].evidence, refs[0].evidence);
+        assert!(refs[64].offset > refs[63].offset);
+    }
+
+    #[test]
+    fn github_action_rejects_purl_injection() {
+        // A crafted `uses:` whose ref carries a purl qualifier would, if
+        // interpolated, redirect the fetch to an attacker host. Each of these
+        // must produce no locator rather than a poisoned one.
+        for hostile in [
+            "actions/checkout@v4?repository_url=http://evil.example/x",
+            "actions/checkout@v4&repository_url=evil",
+            "actions/checkout@v4#frag",
+            "actions/checkout@v4%2e%2e",
+            "actions/checkout@../../../../etc/passwd",
+            "docker://ghcr.io/owner/tool:1.2?repository_url=http://evil",
+            "docker://evil\u{0000}/tool:1",
+            // A protocol-relative registry: percent-encoded into
+            // `repository_url`, a consumer resolving it as a URL would fetch
+            // from evil.example over its own scheme.
+            "docker:////evil.example/tool",
+            "docker://evil.example//tool:1",
+            "docker://-evil.example/tool:1",
+            "actions/checkout@v4 --extra",
+        ] {
+            assert_eq!(
+                github_action_locator(hostile),
+                None,
+                "must reject injection-shaped uses: {hostile:?}"
+            );
+        }
+        // A pinned SHA and a slashed ref are legitimate and still resolve.
+        assert_eq!(
+            github_action_locator("actions/checkout@a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"),
+            Some(RefLocator::Purl(
+                "pkg:github/actions/checkout@a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".into()
+            ))
+        );
+        assert_eq!(
+            github_action_locator("owner/repo@refs/tags/v1"),
+            Some(RefLocator::Purl(
+                "pkg:github/owner/repo@refs/tags/v1".into()
+            ))
+        );
     }
 }

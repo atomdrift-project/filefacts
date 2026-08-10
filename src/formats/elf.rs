@@ -17,6 +17,9 @@ use crate::formats::goblin_safe;
 use crate::output::{Errors, Metrics, Section, Strings, Values};
 use crate::scan::entropy;
 
+/// Longest section name copied into the sections view, in chars.
+const MAX_SECTION_NAME: usize = 256;
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn extract(
     bytes: &[u8],
@@ -68,6 +71,7 @@ pub(super) fn extract(
     super::elf_dynamic::verdef(&elf, values);
     super::elf_dynamic::init_arrays(&elf, bytes, values);
     super::elf_dynamic::dynsym_funcs(&elf, values);
+    super::elf_syscalls::emit(&elf, bytes, values, metrics);
     stripped_metadata(&elf, values, metrics);
     comment(&elf, bytes, values, metrics);
     gcc_command_line(&elf, bytes, values);
@@ -1601,8 +1605,27 @@ fn dynamic(elf: &Elf<'_>, values: &mut Values) {
 }
 
 fn sections(elf: &Elf<'_>, bytes: &[u8], _metrics: &mut Metrics, sections_out: &mut Vec<Section>) {
+    // Entropy is O(section length) and section ranges are attacker-supplied:
+    // nothing requires them to be disjoint, so `e_shnum` headers can all cover
+    // the same megabytes and cost `e_shnum × filesize` — measured at 11.8 s for
+    // 2000 headers over one 8 MB range. An honest ELF's file-backed sections are
+    // disjoint slices of the file, so its own length is the exact budget they
+    // need and this never bites a real binary.
+    let mut entropy_budget = bytes.len() as u64;
     for sh in &elf.section_headers {
-        let name = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("").to_owned();
+        // Truncate by chars so the cut always lands on a boundary. The string
+        // table is attacker-supplied: `sh_name` may point into a run holding no
+        // NUL, making a section's "name" the rest of the file. Measured without
+        // this cap, an 8.5 MB ELF whose four section names each ran to EOF
+        // emitted 201 MB of JSON (control bytes escape to ``, 6x), and
+        // the 2000-section version did not finish. Real names are a handful of
+        // bytes, so nothing legitimate reaches this.
+        let full = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
+        let name = match full.char_indices().nth(MAX_SECTION_NAME) {
+            Some((end, _)) => &full[..end],
+            None => full,
+        };
+        let name = name.to_owned();
         // SHT_NOBITS (8) sections have no file bytes. Other types
         // occupy `sh_offset..sh_offset + sh_size` in the file.
         let (file_offset, file_size) = if sh.sh_type == 8 {
@@ -1610,7 +1633,12 @@ fn sections(elf: &Elf<'_>, bytes: &[u8], _metrics: &mut Metrics, sections_out: &
         } else {
             (sh.sh_offset, sh.sh_size)
         };
-        let entropy = (file_size > 0).then(|| section_entropy(bytes, file_offset, file_size));
+        // Charging `min` rather than skipping outright means at most one
+        // section overdraws, so an honest trailing section is never dropped.
+        let entropy = (file_size > 0 && entropy_budget > 0).then(|| {
+            entropy_budget -= file_size.min(entropy_budget);
+            section_entropy(bytes, file_offset, file_size)
+        });
         sections_out.push(Section {
             name,
             vaddr: sh.sh_addr,

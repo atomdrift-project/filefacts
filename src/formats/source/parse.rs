@@ -11,8 +11,10 @@
 use crate::error::Error;
 use crate::fileid::FileType;
 use crate::formats::source::langs;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::Write;
+use std::ops::ControlFlow;
+use std::time::{Duration, Instant};
 
 /// Tree-sitter's external scanners serialize their state into a fixed
 /// 1024-byte buffer (`TREE_SITTER_SERIALIZATION_BUFFER_SIZE` in
@@ -26,6 +28,39 @@ use std::io::Write;
 /// almost always machine-generated (protobuf descriptors, minified
 /// bundles) and gain little from AST analysis anyway.
 const MAX_AST_FILE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Wall-clock backstop for a single parse. Input is already byte-capped by
+/// [`parse_cap_bytes`], so this exists only for the case size cannot bound:
+/// tree-sitter's GLR error recovery on source crafted to maximize ambiguity,
+/// where cost climbs far faster than length.
+///
+/// Deliberately generous. A parse killed here yields no AST facts, so a budget
+/// tight enough to trip under ordinary load would quietly cost detection on
+/// benign files — the failure mode is invisible, which makes it worse than the
+/// one it prevents. 15 s is orders of magnitude above a normal 2 MB parse and
+/// is meant to fire only for genuinely pathological input, never as a
+/// throughput limiter. Raise it if `source.ast_unavailable.parse_timeout` ever
+/// shows up on samples that are merely large.
+const SOURCE_PARSE_WALL_BUDGET: Duration = Duration::from_secs(15);
+
+thread_local! {
+    /// Test-only override in milliseconds; `0` means
+    /// [`SOURCE_PARSE_WALL_BUDGET`]. The timeout path is otherwise
+    /// unreachable in a unit test — provoking real GLR blowup would need a
+    /// fragile adversarial fixture.
+    ///
+    /// Thread-local, not a global: parses run on the caller's thread, and a
+    /// process-wide knob would let one test's shortened budget cancel a
+    /// parse in another test running in parallel.
+    static PARSE_BUDGET_OVERRIDE_MS: Cell<u64> = const { Cell::new(0) };
+}
+
+fn parse_wall_budget() -> Duration {
+    match PARSE_BUDGET_OVERRIDE_MS.get() {
+        0 => SOURCE_PARSE_WALL_BUDGET,
+        ms => Duration::from_millis(ms),
+    }
+}
 
 /// Conservative cap for grammars whose scanner has not been audited
 /// for the 1024-byte overflow. New or freshly-bumped grammar crates
@@ -127,6 +162,26 @@ impl TreeSitterDiagnostic {
             message: message.into(),
         }
     }
+
+    fn parse_timeout(language: &'static str, bytes: usize, budget: Duration) -> Self {
+        Self {
+            metric: "source.ast_unavailable.parse_timeout",
+            message: format!(
+                "tree-sitter parse for {language} exceeded {budget:?} on {bytes} bytes"
+            ),
+        }
+    }
+
+    /// Kept distinct from [`Self::parse_timeout`]: a cancelled parse is the
+    /// caller shutting down and is expected, while a timed-out one means the
+    /// input beat the budget and is worth investigating. Folding them into one
+    /// metric would bury the second under the first on every Ctrl-C.
+    fn parse_cancelled(language: &'static str, bytes: usize) -> Self {
+        Self {
+            metric: "source.ast_unavailable.parse_cancelled",
+            message: format!("tree-sitter parse for {language} cancelled at {bytes} bytes"),
+        }
+    }
 }
 
 impl<'a> TreeCache<'a> {
@@ -134,7 +189,11 @@ impl<'a> TreeCache<'a> {
     /// when filefacts deliberately refuses the parse or cannot build a
     /// Tree-sitter tree, so callers can still emit generic/text facts plus a
     /// recoverable diagnostic.
-    pub(crate) fn parse(bytes: &'a [u8], file_type: FileType) -> Result<TreeParse<'a>, Error> {
+    pub(crate) fn parse(
+        bytes: &'a [u8],
+        file_type: FileType,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<TreeParse<'a>, Error> {
         let Some(config) = langs::config_for(file_type) else {
             return Ok(TreeParse::Unavailable(TreeSitterDiagnostic::parse_failed(
                 "no tree-sitter grammar registered for source file type",
@@ -177,9 +236,65 @@ impl<'a> TreeCache<'a> {
                 let _ = std::io::stderr().flush();
                 let _ = std::io::stdout().flush();
             }
-            let tree = parser
-                .parse(source, None)
-                .ok_or_else(|| Error::malformed("source", "tree-sitter parse returned None"))?;
+            // The C core polls this between parse steps; `Break` unwinds it
+            // cleanly and yields `None`, which is why the backstop can be a
+            // plain deadline check rather than a thread kill.
+            let budget = parse_wall_budget();
+            let deadline = Instant::now() + budget;
+            let timed_out = Cell::new(false);
+            let cancelled = Cell::new(false);
+            let mut progress = |_: &tree_sitter::ParseState| -> ControlFlow<()> {
+                // Cancellation first: it is a plain atomic load, and when the
+                // caller is shutting down there is no point consulting a clock.
+                // `Relaxed` is right for a poll — the flag is a hint, and the
+                // worst a stale read costs is one more progress interval.
+                if cancel.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
+                    cancelled.set(true);
+                    return ControlFlow::Break(());
+                }
+                if Instant::now() >= deadline {
+                    timed_out.set(true);
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            };
+            let mut read = |offset: usize, _: tree_sitter::Point| -> &[u8] {
+                source.as_bytes().get(offset..).unwrap_or_default()
+            };
+            let parsed = parser.parse_with_options(
+                &mut read,
+                None,
+                Some(tree_sitter::ParseOptions::default().progress_callback(&mut progress)),
+            );
+            let Some(tree) = parsed else {
+                // An abandoned parse degrades like the scanner-risk guard
+                // above: generic/text facts still flow, with a diagnostic
+                // naming why the AST is missing. Only a genuine parser failure
+                // is an Err — cancelling must not turn into a caller-visible
+                // error, or a Ctrl-C would look like a corrupt sample.
+                if cancelled.get() {
+                    return Ok(TreeParse::Unavailable(
+                        TreeSitterDiagnostic::parse_cancelled(config.name, source.len()),
+                    ));
+                }
+                if timed_out.get() {
+                    tracing::warn!(
+                        language = config.name,
+                        bytes = source.len(),
+                        budget_ms = budget.as_millis(),
+                        "tree-sitter parse exceeded its wall budget; AST facts dropped"
+                    );
+                    return Ok(TreeParse::Unavailable(TreeSitterDiagnostic::parse_timeout(
+                        config.name,
+                        source.len(),
+                        budget,
+                    )));
+                }
+                return Err(Error::malformed(
+                    "source",
+                    "tree-sitter parse returned None",
+                ));
+            };
             Ok(TreeParse::Parsed(Self {
                 source,
                 tree,
@@ -415,6 +530,70 @@ mod tests {
     fn skips_oversized_source() {
         let huge = "x = 1\n".repeat(MAX_AST_FILE_BYTES);
         assert!(would_overflow_scanner_state(FileType::Python, &huge));
+    }
+
+    /// An exhausted budget must degrade to a diagnostic, not an `Err` and not a
+    /// panic: the caller still emits generic/text facts for the file.
+    #[test]
+    fn exhausted_wall_budget_degrades_to_a_diagnostic() {
+        // A budget of 1ms is already spent by the first progress poll, so this
+        // exercises the cancel path without needing adversarial input.
+        PARSE_BUDGET_OVERRIDE_MS.set(1);
+        let source = "def f():\n    return 1\n".repeat(20_000);
+        let parsed = TreeCache::parse(source.as_bytes(), FileType::Python, None);
+        PARSE_BUDGET_OVERRIDE_MS.set(0);
+
+        let parsed = parsed.expect("a timeout is a diagnostic, never an Err");
+        let diagnostic = parsed
+            .diagnostic()
+            .expect("a cancelled parse yields no tree");
+        assert_eq!(diagnostic.metric, "source.ast_unavailable.parse_timeout");
+    }
+
+    /// A raised cancellation flag abandons the parse without becoming an
+    /// `Err`, and reports separately from a timeout.
+    #[test]
+    fn a_raised_cancellation_flag_abandons_the_parse() {
+        use std::sync::atomic::AtomicBool;
+
+        let flag = AtomicBool::new(true);
+        let source = "def f():\n    return 1\n".repeat(20_000);
+        let parsed = TreeCache::parse(source.as_bytes(), FileType::Python, Some(&flag))
+            .expect("cancelling is not an error");
+        let diagnostic = parsed
+            .diagnostic()
+            .expect("a cancelled parse yields no tree");
+        assert_eq!(diagnostic.metric, "source.ast_unavailable.parse_cancelled");
+    }
+
+    /// A flag that stays false must be invisible — the guard against a poll
+    /// that accidentally cancels healthy work.
+    #[test]
+    fn an_unraised_cancellation_flag_changes_nothing() {
+        use std::sync::atomic::AtomicBool;
+
+        let flag = AtomicBool::new(false);
+        let source = "def f():\n    return 1\n".repeat(20_000);
+        let parsed = TreeCache::parse(source.as_bytes(), FileType::Python, Some(&flag))
+            .expect("ordinary source parses");
+        assert!(
+            parsed.cache().is_some(),
+            "an un-raised flag must not disturb the parse"
+        );
+    }
+
+    /// The default budget is a backstop, not a throughput limiter: ordinary
+    /// source must parse untouched. Guards against a future edit that makes the
+    /// deadline fire on normal files and silently sheds detection.
+    #[test]
+    fn default_budget_does_not_disturb_an_ordinary_parse() {
+        let source = "def f():\n    return 1\n".repeat(20_000);
+        let parsed = TreeCache::parse(source.as_bytes(), FileType::Python, None)
+            .expect("ordinary source parses");
+        assert!(
+            parsed.cache().is_some(),
+            "a normal parse must not hit the wall budget"
+        );
     }
 
     #[test]

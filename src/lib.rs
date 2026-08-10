@@ -163,6 +163,10 @@ pub struct ParsedFile<'a> {
     // `tree_cache()` and consumed by the single extraction pipeline
     // that fills `extracted`.
     tree_parse: OnceLock<Option<formats::source::TreeParse<'a>>>,
+    // Caller's cancellation flag, polled by long-running leaf work (currently
+    // the tree-sitter parse). Borrowed rather than `Arc`-shared, and never
+    // written here: filefacts only ever reads it.
+    cancellation: Option<&'a std::sync::atomic::AtomicBool>,
     extracted: OnceLock<Extracted>,
     // How many times this `ParsedFile` ran its extraction pipeline.
     // A correctly-implemented `ParsedFile` never reports more than 1
@@ -432,6 +436,28 @@ impl<'a> ParsedFile<'a> {
         })
     }
 
+    /// Poll `flag` during long-running leaf work, abandoning it when the flag
+    /// goes true. Currently observed by the tree-sitter parse, the one leaf
+    /// that can run long on adversarial input without spawning a process.
+    ///
+    /// Cancelling is *not* an error: the affected view degrades to a
+    /// diagnostic (`source.ast_unavailable.parse_cancelled`) and every other
+    /// fact family still extracts, so a caller that cancels mid-file still
+    /// gets a usable — if shallower — result.
+    ///
+    /// The flag is borrowed, so it is the caller's job to keep it alive for
+    /// this `ParsedFile`. filefacts only ever reads it, never sets it, which
+    /// is what makes it safe to share across threads without an `Arc` here.
+    ///
+    /// Note that rizin is deliberately *not* wired to this: it enforces its
+    /// own hard wall-clock timeout and kills its process group, so it is
+    /// already bounded, and threading a flag to it would widen several
+    /// format-extractor signatures for no new guarantee.
+    pub fn with_cancellation(mut self, flag: &'a std::sync::atomic::AtomicBool) -> Self {
+        self.cancellation = Some(flag);
+        self
+    }
+
     /// Borrow the shared tree-sitter parse, if this file is a source
     /// language and parsing succeeded.
     fn tree_cache(&self) -> Option<&formats::source::TreeCache<'a>> {
@@ -446,12 +472,16 @@ impl<'a> ParsedFile<'a> {
                     return None;
                 }
                 Some(
-                    formats::source::TreeCache::parse(self.bytes, self.fileid.file_type())
-                        .unwrap_or_else(|e| {
-                            formats::source::TreeParse::Unavailable(
-                                formats::source::TreeSitterDiagnostic::parse_failed(e.to_string()),
-                            )
-                        }),
+                    formats::source::TreeCache::parse(
+                        self.bytes,
+                        self.fileid.file_type(),
+                        self.cancellation,
+                    )
+                    .unwrap_or_else(|e| {
+                        formats::source::TreeParse::Unavailable(
+                            formats::source::TreeSitterDiagnostic::parse_failed(e.to_string()),
+                        )
+                    }),
                 )
             })
             .as_ref()
@@ -1096,6 +1126,7 @@ pub fn open(bytes: &[u8]) -> Result<ParsedFile<'_>, Error> {
         fileid,
         basename: None,
         tree_parse: OnceLock::new(),
+        cancellation: None,
         extracted: OnceLock::new(),
         parse_count: AtomicU32::new(0),
     })
@@ -1118,6 +1149,7 @@ pub fn open_with_path<'a>(path: &Path, bytes: &'a [u8]) -> Result<ParsedFile<'a>
         fileid,
         basename,
         tree_parse: OnceLock::new(),
+        cancellation: None,
         extracted: OnceLock::new(),
         parse_count: AtomicU32::new(0),
     })
@@ -1152,6 +1184,7 @@ pub fn open_as<'a>(
         fileid: FileId::forced(file_type),
         basename,
         tree_parse: OnceLock::new(),
+        cancellation: None,
         extracted: OnceLock::new(),
         parse_count: AtomicU32::new(0),
     })

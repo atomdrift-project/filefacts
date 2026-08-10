@@ -82,6 +82,17 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Iden
         build_path(bytes, values, &mut id);
     }
 
+    // Interior source identity — a WordPress plugin header or an autoconf
+    // AC_INIT read from inside a source archive or a bare PHP file. Weaker
+    // than a signed or manifest claim, stronger than the filename below.
+    source(values, &mut id);
+
+    // Filename fallback: a source tarball whose interior yields no identity
+    // still announces `<name><sep><version>` in the name it travels under —
+    // the FTP era's only version resource. The weakest claim there is,
+    // filled only when nothing embedded said otherwise.
+    filename_fallback(values, &mut id);
+
     finalize(&mut id);
     id
 }
@@ -937,6 +948,148 @@ fn scan_token(bytes: &[u8], needle: &[u8]) -> Option<String> {
     std::str::from_utf8(token).ok().map(str::to_string)
 }
 
+// ---------------------------------------------------------------------
+// Interior source identity — WordPress headers, autoconf AC_INIT.
+// ---------------------------------------------------------------------
+
+/// Fold `source.*` values (see [`super::source_meta`]) into identity. A
+/// WordPress plugin's canonical slug is its text domain (`wp-1-slider`),
+/// with the display name ("WP 1 Slider") kept as the title; autoconf gives
+/// name and version directly. Never overrides an ecosystem-manifest or
+/// signed claim already set.
+fn source(values: &Values, id: &mut Identity) {
+    // The prose display name, tagged with the field it came from (a theme's
+    // is a distinct key), so both the title and the name ladder attribute it
+    // correctly.
+    let display = first_claim(
+        values,
+        &[
+            "source.wordpress.plugin_name",
+            "source.wordpress.theme_name",
+        ],
+    );
+    if let Some((name, src)) = display {
+        id.title.get_or_insert_with(|| Claim::claimed(name, src));
+    }
+    // Name, strongest first: the distribution slug (the archive's top
+    // directory, i.e. the WordPress.org package identity) beats the interior
+    // text domain, which beats autoconf's package name; the prose display
+    // name is the last resort. A standalone plugin PHP has no slug, so it
+    // falls through to text domain / display name.
+    let name = first_claim(
+        values,
+        &[
+            "source.wordpress.slug",
+            "source.wordpress.text_domain",
+            "source.autoconf.name",
+        ],
+    )
+    .or(display);
+    if let Some((name, src)) = name {
+        id.name.get_or_insert_with(|| Claim::claimed(name, src));
+    }
+    let version = first_claim(
+        values,
+        &["source.wordpress.version", "source.autoconf.version"],
+    );
+    if let Some((v, src)) = version {
+        id.version.get_or_insert_with(|| Claim::claimed(v, src));
+    }
+}
+
+/// The first present key's `(value, key)` — the value plus the field to
+/// credit it to, so a claim records where it actually came from.
+fn first_claim<'a>(values: &'a Values, keys: &[&'static str]) -> Option<(&'a str, &'static str)> {
+    keys.iter()
+        .find_map(|&k| get_str(values, k).map(|v| (v, k)))
+}
+
+// ---------------------------------------------------------------------
+// Filename fallback — the FTP era's version resource.
+// ---------------------------------------------------------------------
+
+/// Archive extensions whose stems conventionally encode `<name><sep><version>`.
+/// Deliberately scoped to source/archive containers: package formats (rpm,
+/// whl, nupkg, gem, …) carry real metadata their extractors already surface,
+/// and a filename guess must never shadow it. Longest form first so
+/// `.tar.gz` wins over `.tar`; matched case-insensitively for the era's
+/// `.tar.Z` (compress) spelling.
+const ARCHIVE_EXTS: &[&str] = &[
+    ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tar.z", ".tgz", ".tbz2", ".txz", ".taz",
+    ".tar", ".zip",
+];
+
+/// Fill `name`/`version` from the artifact's own filename when no embedded
+/// source claimed them. `file.basename` is recorded by extraction whenever
+/// the caller supplied a path.
+fn filename_fallback(values: &Values, id: &mut Identity) {
+    if id.name.is_some() {
+        return;
+    }
+    let Some(base) = get_str(values, "file.basename") else {
+        return;
+    };
+    let Some((name, version)) = split_name_version(base) else {
+        return;
+    };
+    id.name = Some(Claim::claimed(name, "file.basename"));
+    if id.version.is_none() {
+        id.version = Some(Claim::claimed(version, "file.basename"));
+    }
+}
+
+/// Split an archive filename into its conventional `(name, version)`:
+/// `wuftpd-10.9.2.tgz` → ("wuftpd", "10.9.2"), covering the hyphen,
+/// underscore (`apache_1.3.9`), and dotted (`sendmail.8.9.1`) separators of
+/// thirty years of source releases. Conservative by construction: the stem
+/// must end in a known archive extension and the boundary is the first
+/// separator whose remainder is version-shaped (digit-led after an optional
+/// `v`); anything else returns `None` rather than guessing. A leading
+/// `YYYY-MM-DD-` disclosure stamp (threat-feed dataset naming) is stripped
+/// first, mirroring hopper's pkgparse.
+fn split_name_version(base: &str) -> Option<(&str, &str)> {
+    // Case-insensitive suffix match without lowercasing the whole name — the
+    // era's `.tar.Z` folds onto `.tar.z` here.
+    let ext_len = ARCHIVE_EXTS.iter().find_map(|ext| {
+        let start = base.len().checked_sub(ext.len())?;
+        base.get(start..)?
+            .eq_ignore_ascii_case(ext)
+            .then_some(ext.len())
+    })?;
+    let stem = strip_date_prefix(&base[..base.len() - ext_len]);
+    // The boundary is the first separator whose remainder is version-shaped:
+    // digit-led (after an optional `v`), then the usual version alphabet. A
+    // separator at position 0 would leave no name, and one at the end leaves
+    // an empty remainder, which is not digit-led.
+    for (i, _) in stem.match_indices(['-', '_', '.']).filter(|&(i, _)| i > 0) {
+        let rest = &stem[i + 1..];
+        let mut tail = rest.strip_prefix('v').unwrap_or(rest).chars();
+        if tail.next().is_some_and(|c| c.is_ascii_digit())
+            && tail.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '~' | '-'))
+        {
+            return Some((&stem[..i], rest));
+        }
+    }
+    None
+}
+
+/// Strip a leading `YYYY-MM-DD-` date stamp, digit-bounded so version-like
+/// names ("2020-vision") survive intact.
+fn strip_date_prefix(stem: &str) -> &str {
+    let b = stem.as_bytes();
+    // Shape first — digits where digits belong, dashes at 4, 7 and 10 — then
+    // the cheap plausibility bounds: a 1000s/2000s year, month < 20, day < 40.
+    let stamped = b.len() > 11
+        && b[..11].iter().enumerate().all(|(i, &c)| match i {
+            4 | 7 | 10 => c == b'-',
+            _ => c.is_ascii_digit(),
+        })
+        && matches!(b[0], b'1' | b'2')
+        && b[5] <= b'1'
+        && b[8] <= b'3';
+    if stamped { &stem[11..] } else { stem }
+}
+
 fn get_str<'a>(values: &'a Values, key: &str) -> Option<&'a str> {
     values.get(key).and_then(JsonValue::as_str)
 }
@@ -1019,4 +1172,56 @@ fn finalize(id: &mut Identity) {
         }
     }
     id.emails = emails;
+}
+
+#[cfg(test)]
+mod filename_tests {
+    use super::split_name_version;
+
+    #[test]
+    fn era_conventions_split() {
+        // (filename, name, version) — real release names spanning the eras.
+        for (base, name, version) in [
+            ("wuftpd-10.9.2.tgz", "wuftpd", "10.9.2"),
+            ("sendmail-8.9.1.tgz", "sendmail", "8.9.1"),
+            ("sendmail.8.9.1.tar.gz", "sendmail", "8.9.1"),
+            ("apache_1.3.9.tar.gz", "apache", "1.3.9"),
+            ("bind-4.9.5-P1.tar.gz", "bind", "4.9.5-P1"),
+            ("ncompress-4.2.4.tar.Z", "ncompress", "4.2.4"),
+            ("elm-2.5.8.tar.gz", "elm", "2.5.8"),
+            ("R-4.0.0.tar.gz", "R", "4.0.0"),
+            ("Template-Toolkit-3.102.tar.gz", "Template-Toolkit", "3.102"),
+            ("lodash-4.17.21.tgz", "lodash", "4.17.21"),
+            (
+                "github.com-gorilla-mux-v1.8.1.zip",
+                "github.com-gorilla-mux",
+                "v1.8.1",
+            ),
+            ("2020-vision-1.0.0.tgz", "2020-vision", "1.0.0"),
+        ] {
+            let got = split_name_version(base);
+            assert_eq!(got, Some((name, version)), "split_name_version({base:?})");
+        }
+    }
+
+    #[test]
+    fn date_stamped_dataset_names_shed_the_stamp() {
+        assert_eq!(
+            split_name_version("2026-03-18-big-nunber-v5.0.5.zip"),
+            Some(("big-nunber", "v5.0.5")),
+        );
+    }
+
+    #[test]
+    fn non_conforming_names_yield_nothing() {
+        for base in [
+            "evil.exe",        // not an archive extension
+            "MetaStealer.zip", // no version tail
+            "notes.tar",       // no separator+digit boundary
+            "60d11b7004c80ae17a900094bbddd0a92273167af2b15f7597b9749d1b5edaa2",
+            "backup.tar.gz", // versionless
+        ] {
+            assert_eq!(split_name_version(base), None, "{base:?} must not split");
+        }
+    }
 }
