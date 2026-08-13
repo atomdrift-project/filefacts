@@ -241,6 +241,7 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::Gz
         | FileType::Bz2
         | FileType::Xz
+        | FileType::Lzma
         | FileType::Zst
         | FileType::SevenZ
         | FileType::Rar
@@ -442,6 +443,8 @@ pub enum FileType {
     Bz2,
     /// XZ-compressed single file (.xz, not a tar)
     Xz,
+    /// LZMA-alone compressed single file (.lzma)
+    Lzma,
     /// Zstandard-compressed single file (.zst, not a tar)
     Zst,
     /// 7-Zip archive (.7z)
@@ -614,6 +617,7 @@ impl FileType {
                 | Self::Gz
                 | Self::Bz2
                 | Self::Xz
+                | Self::Lzma
                 | Self::Zst
                 | Self::SevenZ
                 | Self::Rar
@@ -826,6 +830,7 @@ impl FileType {
             Self::Gz => "gz",
             Self::Bz2 => "bz2",
             Self::Xz => "xz",
+            Self::Lzma => "lzma",
             Self::Zst => "zst",
             Self::SevenZ => "7z",
             Self::Rar => "rar",
@@ -956,6 +961,7 @@ impl FileType {
             "gz" => Self::Gz,
             "bz2" => Self::Bz2,
             "xz" => Self::Xz,
+            "lzma" => Self::Lzma,
             "zst" => Self::Zst,
             "7z" => Self::SevenZ,
             "rar" => Self::Rar,
@@ -2386,6 +2392,24 @@ function wpcf7_special_mail_tag( $output, $name, $html ) {
     }
 
     #[test]
+    fn m4_macro_detects_as_text() {
+        assert_detect(
+            "build-to-host.m4",
+            b"AC_DEFUN([gl_BUILD_TO_HOST], [AC_SUBST([$1])])\n",
+            FileType::Text,
+        );
+    }
+
+    #[test]
+    fn raw_lzma_extension_detects_as_lzma() {
+        assert_detect(
+            "fixture.lzma",
+            b"\x5d\x00\x00\x80\x00\xff\xff\xff\xff\xff\xff\xff\xff",
+            FileType::Lzma,
+        );
+    }
+
+    #[test]
     fn asar_detects_as_archive() {
         assert_detect(
             "app.asar",
@@ -2656,6 +2680,7 @@ function wpcf7_special_mail_tag( $output, $name, $html ) {
             FileType::Gz,
             FileType::Bz2,
             FileType::Xz,
+            FileType::Lzma,
             FileType::Zst,
             FileType::SevenZ,
             FileType::Rar,

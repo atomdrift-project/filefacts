@@ -309,6 +309,10 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         // `-` markers parse as subtraction operators — tripping
         // js-arithmetic-array-init on benign kernel/source patch sets. Text.
         "patch" | "diff" => Some(FileType::Text),
+        // GNU M4 / Autoconf macro source. There is no dedicated parser yet,
+        // but treating it as text keeps build-system behavior visible to
+        // cleave instead of dropping every *.m4 file as Unknown.
+        "m4" => Some(FileType::Text),
         // TypeScript compiler test baselines (annotated code fixtures, not
         // executable JS): x.types / x.symbols / x.baseline.
         "types" | "symbols" | "baseline" => Some(FileType::Text),
@@ -402,6 +406,7 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "gz" => Some(FileType::Gz),
         "bz2" => Some(FileType::Bz2),
         "xz" => Some(FileType::Xz),
+        "lzma" => Some(FileType::Lzma),
         "zst" => Some(FileType::Zst),
         "html" | "htm" => Some(FileType::Html),
         // R Markdown / Quarto / Sweave are markdown documents with embedded
