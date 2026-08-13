@@ -336,7 +336,11 @@ fn extract_symbols(macho: &MachO<'_>, symbols_out: &mut crate::Symbols) {
             // dyld-info-only binaries).
             let offset = name_offsets.get(imp.name).copied().unwrap_or(imp.offset);
             symbols_out.push(crate::Symbol::Import {
-                name: imp.name.to_string(),
+                // Record the base symbol, not the Darwin `$VARIANT` spelling,
+                // so anchored trait matchers and imphash see `popen` rather
+                // than `popen$DARWIN_EXTSN`. The offset lookup above still uses
+                // the raw name — that is how it is keyed in `LC_SYMTAB`.
+                name: strip_darwin_symbol_variant(imp.name).to_string(),
                 alias: None,
                 library: Some(library),
                 offset: Some(offset),
@@ -353,7 +357,11 @@ fn extract_symbols(macho: &MachO<'_>, symbols_out: &mut crate::Symbols) {
     if let Ok(exports) = macho.exports() {
         for exp in &exports {
             symbols_out.push(crate::Symbol::Export {
-                name: exp.name.clone(),
+                // Normalize the same Darwin `$VARIANT` suffix as imports: these
+                // markers are *defined* in libSystem, so a library re-exporting
+                // libc carries them here. The allow-list leaves a binary's own
+                // `_OBJC_CLASS_$_…` exports intact.
+                name: strip_darwin_symbol_variant(&exp.name).to_string(),
                 offset: Some(exp.offset),
                 ordinal: None,
                 // dyld re-exports are surfaced via ExportInfo::Reexport
@@ -404,6 +412,43 @@ fn import_name_offsets<'a>(macho: &MachO<'a>) -> std::collections::HashMap<&'a s
             .or_insert_with(|| stroff + nlist.n_strx as u64);
     }
     offsets
+}
+
+/// Symbol-variant markers Darwin appends to a libc name after a `$`. Each
+/// selects a binary-compatible implementation of the *same* function, so it
+/// is an ABI/SDK detail rather than a distinct capability. This is the
+/// complete set libSystem uses; extend it here if Apple introduces another.
+const DARWIN_SYMBOL_VARIANTS: &[&str] =
+    &["UNIX2003", "DARWIN_EXTSN", "INODE64", "NOCANCEL", "1050"];
+
+/// Strip a macOS symbol-variant suffix, returning the base symbol.
+///
+/// Darwin records several libc calls under a `$`-variant spelling:
+/// `popen$DARWIN_EXTSN`, `open$NOCANCEL`, `stat$INODE64`, `write$UNIX2003`
+/// (variants can chain, e.g. `close$NOCANCEL$UNIX2003`). The analytically
+/// meaningful name is the base before the first `$` — the function the symbol
+/// actually refers to, whether the binary imports it or (as libSystem and its
+/// re-exporters do) defines it. Recording the raw spelling let anchored trait
+/// matchers (`^popen$`) and imphash/export-hash clustering miss it.
+///
+/// Only a suffix built entirely from known [`DARWIN_SYMBOL_VARIANTS`] tokens
+/// is stripped. `$` also carries unrelated conventions — Objective-C class
+/// references (`_OBJC_CLASS_$_NSURL`) and linker directives (`$ld$hide$…`) —
+/// and those must survive untouched, so a shape heuristic is not enough: an
+/// all-caps class name like `NSURL` would be mistaken for a variant. The
+/// allow-list keys on the actual ABI markers instead.
+fn strip_darwin_symbol_variant(name: &str) -> &str {
+    match name.split_once('$') {
+        Some((base, tail))
+            if !base.is_empty()
+                && tail
+                    .split('$')
+                    .all(|token| DARWIN_SYMBOL_VARIANTS.contains(&token)) =>
+        {
+            base
+        }
+        _ => name,
+    }
 }
 
 /// Reduce a recorded dylib path to its bare library stem, lowercased.
@@ -1780,9 +1825,107 @@ mod tests {
     }
 
     #[test]
+    fn strip_darwin_symbol_variant_recovers_base() {
+        // Darwin libc variant suffixes are stripped to the base symbol.
+        assert_eq!(strip_darwin_symbol_variant("popen$DARWIN_EXTSN"), "popen");
+        assert_eq!(strip_darwin_symbol_variant("write$UNIX2003"), "write");
+        assert_eq!(strip_darwin_symbol_variant("stat$INODE64"), "stat");
+        assert_eq!(strip_darwin_symbol_variant("open$NOCANCEL"), "open");
+        assert_eq!(strip_darwin_symbol_variant("time$1050"), "time");
+        // Chained variants collapse to the single base symbol.
+        assert_eq!(
+            strip_darwin_symbol_variant("close$NOCANCEL$UNIX2003"),
+            "close"
+        );
+        // Plain symbols are untouched.
+        assert_eq!(strip_darwin_symbol_variant("popen"), "popen");
+        assert_eq!(
+            strip_darwin_symbol_variant("_objc_msgSend"),
+            "_objc_msgSend"
+        );
+        // Objective-C class/metaclass references (imported and exported) also
+        // use `$`; they must survive, even when the class name is entirely
+        // upper-case and so looks variant-shaped — the case a naive shape
+        // heuristic truncates to `_OBJC_CLASS_`.
+        assert_eq!(
+            strip_darwin_symbol_variant("_OBJC_CLASS_$_NSURL"),
+            "_OBJC_CLASS_$_NSURL"
+        );
+        assert_eq!(
+            strip_darwin_symbol_variant("_OBJC_CLASS_$_ABC"),
+            "_OBJC_CLASS_$_ABC"
+        );
+        assert_eq!(
+            strip_darwin_symbol_variant("_OBJC_METACLASS_$_ABC"),
+            "_OBJC_METACLASS_$_ABC"
+        );
+        // Linker directives (leading `$`) and unknown `$` tails are preserved.
+        assert_eq!(
+            strip_darwin_symbol_variant("$ld$hide$os10.4$_foo"),
+            "$ld$hide$os10.4$_foo"
+        );
+        assert_eq!(strip_darwin_symbol_variant("foo$bar"), "foo$bar");
+    }
+
+    #[test]
     fn load_command_name_strips_required_bit() {
         // LC_LOAD_DYLIB with `LC_REQ_DYLD` bit set
         assert_eq!(load_command_name(0x8000_000c), "LC_LOAD_DYLIB");
+    }
+
+    /// End-to-end coverage of the variant-suffix normalization through the
+    /// full `open()` pipeline, on a real Mach-O whose `LC_SYMTAB` records
+    /// libc calls under Darwin's `$`-variant spelling. The fixture is a live
+    /// (already-public) malware sample, so it is stored zstd-compressed — both
+    /// to keep it small and to keep an executable backdoor from sitting
+    /// unpacked in the tree where on-access scanners would quarantine it.
+    #[test]
+    fn open_normalizes_darwin_variant_import_names() {
+        let compressed = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/macho-darwin-variant-symbols.dylib.zst"
+        ))
+        .expect("fixture present");
+        let bytes = zstd::decode_all(compressed.as_slice()).expect("fixture decompresses");
+
+        let parsed = crate::open(&bytes).expect("fixture parses");
+        let imports: Vec<&str> = parsed
+            .symbols()
+            .iter_kind(crate::SymbolKind::Import)
+            .filter_map(|s| match s {
+                crate::Symbol::Import { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(!imports.is_empty(), "dylib imports should populate");
+
+        // Variant suffixes are stripped to the base symbol.
+        assert!(
+            imports.contains(&"_popen"),
+            "popen$DARWIN_EXTSN should normalize to _popen; got {imports:?}"
+        );
+        assert!(
+            imports.contains(&"_fopen") && imports.contains(&"_fdopen"),
+            "fopen/fdopen variants should normalize to their base names"
+        );
+        // No import retains a Darwin variant suffix.
+        assert!(
+            !imports.iter().any(|n| n.contains("$DARWIN_EXTSN")
+                || n.contains("$UNIX2003")
+                || n.contains("$INODE64")
+                || n.contains("$NOCANCEL")),
+            "no import should retain a Darwin variant suffix; got {imports:?}"
+        );
+        // Objective-C class references also contain `$` and must survive intact,
+        // never truncated at the `$` to a bare `_OBJC_CLASS_`.
+        assert!(
+            imports.contains(&"_OBJC_CLASS_$_NSURL"),
+            "ObjC class import must survive normalization intact"
+        );
+        assert!(
+            !imports.contains(&"_OBJC_CLASS_") && !imports.contains(&"_OBJC_METACLASS_"),
+            "ObjC class reference must not be truncated at its `$`"
+        );
     }
 
     /// Regression test for a panic seen in the field: a small file
