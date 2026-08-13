@@ -257,9 +257,8 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
     };
 
     match ext_lower {
-        "sh" | "bash" | "ksh" | "zsh" | "csh" | "tcsh" | "dash" | "fish" | "command" => {
-            Some(FileType::Shell)
-        }
+        "sh" | "bash" | "ksh" | "zsh" | "csh" | "tcsh" | "dash" | "fish" | "command" | "ebuild"
+        | "eclass" => Some(FileType::Shell),
         "py" | "pyw" | "pyi" | "pth" => Some(FileType::Python),
         "js" | "mjs" | "cjs" | "jsx" | "jse" => Some(FileType::JavaScript),
         "ts" | "tsx" | "mts" | "cts" => Some(FileType::TypeScript),
@@ -487,7 +486,9 @@ mod tests {
 
     #[test]
     fn shell_extensions() {
-        for ext in &["sh", "bash", "zsh", "ksh", "fish", "command"] {
+        for ext in &[
+            "sh", "bash", "zsh", "ksh", "fish", "command", "ebuild", "eclass",
+        ] {
             let path = format!("script.{ext}");
             assert_eq!(
                 detect_from_path(Path::new(&path)),
