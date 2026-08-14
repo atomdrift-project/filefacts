@@ -161,9 +161,10 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// * the filefacts [`build_fingerprint`] — extraction logic changes
 ///   between builds, so a stale entry from an older filefacts must not be
 ///   reused;
-/// * the caller's `variant` — the [`crate::rizin::cache_fingerprint`]
-///   (rizin presence / version / native-arch slicing), since the *same*
-///   bytes yield different recovery under different rizin configurations.
+/// * the caller's `variant` — the detected file type plus
+///   [`crate::rizin::cache_fingerprint`] (rizin presence / version /
+///   native-arch slicing), since the *same* bytes yield different extraction
+///   under different path-assisted types or rizin configurations.
 ///
 /// `variant` may be empty for a computation that never involves rizin;
 /// the build fingerprint is always mixed in regardless.

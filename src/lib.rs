@@ -503,12 +503,14 @@ impl<'a> ParsedFile<'a> {
             if !cache::caching_enabled() {
                 return self.run_pipeline();
             }
-            // The disk cache is keyed by (content, filefacts build, rizin
-            // config), so the expensive rizin recovery folded into the
-            // snapshot is computed once and reused across processes. A
-            // degraded rizin run is returned but not persisted, so a later
+            // The disk cache is keyed by (content, filefacts build, detected
+            // type, rizin config). Type belongs in the key because detection
+            // may use the logical filename: identical gzip bytes named
+            // `package.tgz` and `hash.sample` are npm and generic gzip inputs,
+            // respectively, and expose different identity/structure views.
+            // A degraded rizin run is returned but not persisted, so a later
             // healthy run still gets to fill the entry.
-            let variant = crate::rizin::cache_fingerprint();
+            let variant = extraction_cache_variant(self.fileid.file_type());
             // The cached form drops the byte-scan `text` rows (stng owns them);
             // they are rehydrated below. `open_with_cache` stores/loads the
             // lean snapshot, not the full `Extracted`.
@@ -549,6 +551,14 @@ impl<'a> ParsedFile<'a> {
                 .and_then(formats::source::TreeParse::diagnostic),
         )
     }
+}
+
+fn extraction_cache_variant(file_type: FileType) -> String {
+    format!(
+        "{};file_type={}",
+        crate::rizin::cache_fingerprint(),
+        file_type.label()
+    )
 }
 
 fn run_extraction(
@@ -1285,6 +1295,18 @@ mod tests {
         let _ = parsed.literals();
         let _ = parsed.metrics();
         assert_eq!(parsed.parse_count(), 1, "subsequent views must not reparse");
+    }
+
+    #[test]
+    fn extraction_cache_separates_path_dependent_file_types() {
+        assert_ne!(
+            extraction_cache_variant(FileType::Gz),
+            extraction_cache_variant(FileType::Npm),
+        );
+        assert_eq!(
+            extraction_cache_variant(FileType::Npm),
+            extraction_cache_variant(FileType::Npm),
+        );
     }
 
     #[test]
