@@ -10,8 +10,8 @@ use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::{
-    XorScan, extract_binary_strings, extract_binary_strings_from_object, hex_encode, put_str,
-    put_u64, rizin_fallback,
+    NativeFormat, XorScan, extract_binary_strings, extract_binary_strings_from_object, hex_encode,
+    put_str, put_u64, rizin_fallback,
 };
 use crate::formats::goblin_safe;
 use crate::output::{Errors, Metrics, Section, Strings, Values};
@@ -86,7 +86,15 @@ pub(super) fn extract(
     table_counts(&elf, metrics);
     relocation_kinds(&elf, values);
     segments(&elf, values);
-    rizin_fallback(bytes, symbols_out, metrics, elf_rizin_analysis(&elf, bytes));
+    rizin_fallback(
+        NativeFormat::Elf,
+        bytes,
+        strings,
+        sections_out,
+        symbols_out,
+        metrics,
+        has_go_pclntab(&elf, bytes),
+    );
     linker_family(&elf, bytes, values);
     comment_fingerprint(values);
     super::elf_hashes::emit(&elf, values, symbols_out);
@@ -663,19 +671,6 @@ fn pauth_platform_name(platform: u64) -> &'static str {
         1 => "linux",
         0x1000_0002 => "llvm",
         _ => "unknown",
-    }
-}
-
-/// Return the file bytes of a named section, or `None` when absent.
-/// Pick rizin's analysis depth for this ELF. Go binaries carry a complete
-/// function table in `.gopclntab`, which rizin's basic `aa` parses in full —
-/// so the deep `aaa` emulation/reference passes find nothing more, at ~2x the
-/// cost. Everything else (stripped C/C++, etc.) needs deep discovery.
-fn elf_rizin_analysis(elf: &Elf<'_>, bytes: &[u8]) -> crate::rizin::Analysis {
-    if has_go_pclntab(elf, bytes) {
-        crate::rizin::Analysis::Basic
-    } else {
-        crate::rizin::Analysis::Deep
     }
 }
 
@@ -2100,7 +2095,7 @@ mod tests {
     }
 
     #[test]
-    fn go_pclntab_magic_selects_basic_analysis() {
+    fn go_pclntab_magic_is_detected() {
         // Go 1.18 pclntab magic (0xfffffff0, little-endian) + a plausible tail.
         let pclntab = [0xf0, 0xff, 0xff, 0xff, 0x00, 0x00, 0x01, 0x08];
         let bytes = elf_with_section(".gopclntab", &pclntab);
@@ -2108,11 +2103,6 @@ mod tests {
         assert!(
             has_go_pclntab(&elf, &bytes),
             "a valid Go pclntab must be detected"
-        );
-        assert_eq!(
-            elf_rizin_analysis(&elf, &bytes),
-            crate::rizin::Analysis::Basic,
-            "Go binaries take the cheap `aa` analysis path"
         );
     }
 
@@ -2126,30 +2116,20 @@ mod tests {
     }
 
     #[test]
-    fn spoofed_gopclntab_without_magic_keeps_deep_analysis() {
+    fn spoofed_gopclntab_without_magic_is_not_go() {
         // A section *named* `.gopclntab` but carrying no valid magic is an
         // evasion attempt to dodge deep function discovery. It MUST stay on
         // `aaa` so hidden functions are still recovered.
         let bytes = elf_with_section(".gopclntab", b"not a real pclntab header");
         let elf = Elf::parse(&bytes).expect("synthetic ELF must parse");
         assert!(!has_go_pclntab(&elf, &bytes));
-        assert_eq!(
-            elf_rizin_analysis(&elf, &bytes),
-            crate::rizin::Analysis::Deep
-        );
     }
 
     #[test]
-    fn non_go_binary_keeps_deep_analysis() {
-        // No `.gopclntab` at all → deep discovery, the safe default for
-        // stripped C/C++ where `aa` would miss reference-only functions.
+    fn non_go_binary_has_no_pclntab() {
         let bytes = elf_with_section(".text", &[0x55, 0x48, 0x89, 0xe5]);
         let elf = Elf::parse(&bytes).expect("synthetic ELF must parse");
         assert!(!has_go_pclntab(&elf, &bytes));
-        assert_eq!(
-            elf_rizin_analysis(&elf, &bytes),
-            crate::rizin::Analysis::Deep
-        );
     }
 
     #[test]

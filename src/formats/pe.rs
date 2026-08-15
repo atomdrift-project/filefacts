@@ -17,7 +17,7 @@ use serde_json::Value as JsonValue;
 use crate::error::Error;
 use crate::formats::common::{
     XorScan, extract_binary_strings, extract_binary_strings_from_object, hex_encode, put_i64,
-    put_str, put_u64, rizin_fallback_with_sections,
+    put_str, put_u64, rizin_decision, rizin_fallback_with_sections,
 };
 use crate::formats::goblin_safe;
 use crate::output::{Errors, Metrics, Section, Strings, Values};
@@ -94,11 +94,6 @@ pub(super) fn extract(
         sections(&pe, bytes, metrics, sections_out);
         imports(&pe, values, metrics, symbols_out);
         native_resolver_signals(&pe, bytes, values, metrics);
-        // Importless PEs are the narrow class where function recovery remains
-        // worthwhile even when goblin already recovered a normal section table.
-        // This exposes Rizin's function/call graph to downstream analysis
-        // without paying that cost for ordinary applications.
-        rizin_importless_analysis(&pe, bytes, values, symbols_out, metrics);
         exports(&pe, values, metrics, symbols_out);
         authenticode(&pe, bytes, values, metrics);
         if let Some(rd) = pe.resource_data.as_ref() {
@@ -178,9 +173,33 @@ pub(super) fn extract(
             pclntab: pe_section_bytes(&pe, bytes, ".gopclntab"),
             rodata: pe_section_bytes(&pe, bytes, ".rdata"),
         };
+        let has_go_pclntab = go_sections
+            .pclntab
+            .is_some_and(super::go_buildinfo::has_pclntab_magic);
         super::go_buildinfo::detect(bytes, values, "pe", None, &go_sections);
         super::build_toolchain::from_pe_rich(values);
-        rizin_fallback_with_sections(bytes, symbols_out, sections_out, metrics, "pe");
+        // Importless PEs are the narrow parsed-PE class where function
+        // recovery can correlate API-hash callsites. It shares the same
+        // cross-platform admission facts, including the Go exclusion.
+        rizin_importless_analysis(
+            &pe,
+            bytes,
+            values,
+            strings,
+            sections_out,
+            symbols_out,
+            metrics,
+            has_go_pclntab,
+        );
+        rizin_fallback_with_sections(
+            bytes,
+            strings,
+            symbols_out,
+            sections_out,
+            metrics,
+            "pe",
+            has_go_pclntab,
+        );
         return Ok(());
     }
 
@@ -216,7 +235,15 @@ pub(super) fn extract(
     // zero imports, breaking every section-scoped trait. The success branch
     // already calls this; the header-only branch must too. The helper no-ops
     // when goblin did supply something, so it's safe to call unconditionally.
-    rizin_fallback_with_sections(bytes, symbols_out, sections_out, metrics, "pe");
+    rizin_fallback_with_sections(
+        bytes,
+        strings,
+        symbols_out,
+        sections_out,
+        metrics,
+        "pe",
+        false,
+    );
     Ok(())
 }
 
@@ -391,8 +418,11 @@ fn rizin_importless_analysis(
     pe: &PE<'_>,
     bytes: &[u8],
     values: &mut Values,
+    strings: &Strings,
+    sections: &[Section],
     symbols: &mut crate::Symbols,
     metrics: &mut Metrics,
+    go_pclntab: bool,
 ) {
     const MAX_IMPORTLESS_ANALYSIS_BYTES: usize = 5 * 1024 * 1024;
     if bytes.len() > MAX_IMPORTLESS_ANALYSIS_BYTES
@@ -402,7 +432,20 @@ fn rizin_importless_analysis(
     {
         return;
     }
-    let Some(recovery) = crate::rizin::recover(bytes, crate::rizin::Analysis::Deep) else {
+    if !rizin_decision(
+        crate::formats::common::NativeFormat::Pe,
+        bytes,
+        strings,
+        sections,
+        symbols,
+        metrics,
+        go_pclntab,
+    )
+    .runs()
+    {
+        return;
+    }
+    let Some(recovery) = crate::rizin::recover(bytes) else {
         return;
     };
     recover_api_hash_requests(pe, bytes, values, metrics, &recovery);

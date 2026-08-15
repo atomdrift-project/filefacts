@@ -2,7 +2,7 @@
 
 use serde_json::Value as JsonValue;
 
-use crate::output::{Strings, Text, Values};
+use crate::output::{Section, Strings, Text, Values};
 use crate::scan::ascii;
 
 /// Whether stng's XOR seed search runs for a member.
@@ -189,20 +189,183 @@ pub(super) fn put_i64(values: &mut Values, path: &str, n: i64) {
 // numeric/string value) instead — never a bare boolean that mirrors
 // presence/absence.
 
-/// Run rizin recovery when the static parse produced an empty symbol
-/// table — the canonical "stripped binary" signal goblin can't recover
-/// from. Shared by PE / ELF / Mach-O extractors. No-op when rizin
-/// isn't on PATH or when goblin already populated any symbol kind.
-pub(super) fn rizin_fallback(
+/// Native executable formats sharing the Rizin admission policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NativeFormat {
+    Elf,
+    MachO,
+    Pe,
+}
+
+/// Inputs to the deliberately small Rizin admission policy. Keeping this a
+/// plain fact bundle makes the decision table testable without spawning a
+/// disassembler or manufacturing three kinds of executable fixture.
+#[derive(Clone, Copy, Debug)]
+struct RizinProfile {
+    format: NativeFormat,
+    size: usize,
+    function_count: usize,
+    section_count: usize,
+    stripped: Option<bool>,
+    go_pclntab: bool,
+    string_count: usize,
+    string_bytes: usize,
+    code_entropy: Option<f64>,
+    overall_entropy: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RizinDecision {
+    Skip(&'static str),
+    Analyze(&'static str),
+}
+
+impl RizinDecision {
+    pub(super) fn runs(self) -> bool {
+        matches!(self, Self::Analyze(_))
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Skip(reason) | Self::Analyze(reason) => reason,
+        }
+    }
+}
+
+/// Above this size, stripping alone is not enough reason to spend minutes in
+/// `aaa`: large release binaries are commonly stripped but otherwise fully
+/// transparent. String poverty or high code entropy still admits a binary of
+/// any size, so this is not a blanket size cap.
+const LARGE_RIZIN_INPUT: usize = 32 << 20;
+const FEW_STRINGS: usize = 64;
+const HIGH_CODE_ENTROPY: f64 = 7.2;
+
+/// One explicit, cross-platform decision table. There is intentionally no
+/// weighted score to tune: each branch states the fact that justifies paying
+/// for deep recovery.
+fn decide_rizin(profile: RizinProfile) -> RizinDecision {
+    if profile.go_pclntab {
+        return RizinDecision::Skip("Go pclntab provides the function inventory");
+    }
+
+    // A PE whose native parser could not recover even its section table needs
+    // Rizin for structural recovery, not merely function metrics. ELF/Mach-O
+    // parse failures return before this policy and retain their typed errors.
+    if profile.format == NativeFormat::Pe && profile.section_count == 0 {
+        return RizinDecision::Analyze("PE section table needs recovery");
+    }
+
+    // Imports and exports do not constitute a function inventory. A stripped
+    // ELF with libc imports still benefits from CFG recovery. Conversely, once
+    // native parsing supplied functions, `RizinRecovery::apply` deliberately
+    // preserves them instead of replacing them, so a deep run cannot add the
+    // function-level metrics this policy exists to obtain.
+    if profile.function_count > 0 {
+        return RizinDecision::Skip("static function inventory available");
+    }
+
+    // Importless PEs are a useful platform-specific exception: a compact PE
+    // with no symbol projection is often a resolver/hash stub, and the PE
+    // analyzer correlates Rizin's call graph with its native API-hash facts.
+    if profile.format == NativeFormat::Pe && profile.size <= 5 * 1024 * 1024 {
+        return RizinDecision::Analyze("small importless PE");
+    }
+
+    // "No obvious strings" means either genuinely few runs, or printable
+    // content occupying less than roughly 0.1% of the file. The density test
+    // catches a huge packed payload with a small loader banner.
+    let strings_are_sparse = profile.string_count < FEW_STRINGS
+        || profile.string_bytes.saturating_mul(1024) < profile.size;
+    if strings_are_sparse {
+        return RizinDecision::Analyze("printable strings are sparse");
+    }
+
+    // Prefer the size-weighted executable-section entropy. Whole-file entropy
+    // is only a fallback for formats/fixtures without executable sections, so
+    // a compressed resource or installer overlay does not admit an otherwise
+    // transparent program.
+    let entropy = profile.code_entropy.unwrap_or(profile.overall_entropy);
+    if entropy >= HIGH_CODE_ENTROPY {
+        return RizinDecision::Analyze("executable code has high entropy");
+    }
+
+    if profile.stripped == Some(true) && profile.size <= LARGE_RIZIN_INPUT {
+        return RizinDecision::Analyze("stripped binary within deep-analysis budget");
+    }
+
+    RizinDecision::Skip("static facts show a transparent binary")
+}
+
+fn weighted_code_entropy(sections: &[Section]) -> Option<f64> {
+    let (weighted, bytes) = sections
+        .iter()
+        .filter(|section| section.is_executable())
+        .filter_map(|section| {
+            section
+                .entropy
+                .map(|entropy| (entropy * section.file_size as f64, section.file_size))
+        })
+        .fold((0.0, 0_u64), |(sum, size), (part, part_size)| {
+            (sum + part, size.saturating_add(part_size))
+        });
+    (bytes > 0).then_some(weighted / bytes as f64)
+}
+
+pub(super) fn rizin_decision(
+    format: NativeFormat,
     bytes: &[u8],
+    strings: &Strings,
+    sections: &[Section],
+    symbols: &crate::Symbols,
+    metrics: &crate::output::Metrics,
+    go_pclntab: bool,
+) -> RizinDecision {
+    let string_bytes = strings.text.iter().fold(0_usize, |total, string| {
+        total.saturating_add(string.value.len())
+    });
+    decide_rizin(RizinProfile {
+        format,
+        size: bytes.len(),
+        function_count: symbols
+            .iter()
+            .filter(|symbol| symbol.kind() == crate::SymbolKind::Function)
+            .count(),
+        section_count: sections.len(),
+        stripped: metrics.get("binary.is_stripped").map(|value| value != 0.0),
+        go_pclntab,
+        string_count: strings.text.len(),
+        string_bytes,
+        code_entropy: weighted_code_entropy(sections),
+        overall_entropy: metrics.get("file.entropy").unwrap_or(0.0),
+    })
+}
+
+/// Run full Rizin recovery only when the static facts say it is likely to add
+/// useful function metrics. Shared by ELF and Mach-O; PE uses the extended
+/// helper below so malformed images can recover sections too.
+pub(super) fn rizin_fallback(
+    format: NativeFormat,
+    bytes: &[u8],
+    strings: &Strings,
+    sections: &[Section],
     symbols: &mut crate::Symbols,
     metrics: &mut crate::output::Metrics,
-    analysis: crate::rizin::Analysis,
+    go_pclntab: bool,
 ) {
-    if !symbols.is_empty() {
+    let decision = rizin_decision(
+        format, bytes, strings, sections, symbols, metrics, go_pclntab,
+    );
+    tracing::debug!(
+        ?format,
+        bytes = bytes.len(),
+        run = decision.runs(),
+        reason = decision.reason(),
+        "rizin admission decision"
+    );
+    if !decision.runs() {
         return;
     }
-    match crate::rizin::recover(bytes, analysis) {
+    match crate::rizin::recover(bytes) {
         Some(recovery) => {
             recovery.apply(symbols, metrics);
         }
@@ -238,10 +401,12 @@ fn note_incomplete_recovery(metrics: &mut crate::output::Metrics) {
 /// rizin to radare2 / Ghidra the schema doesn't ripple.
 pub(super) fn rizin_fallback_with_sections(
     bytes: &[u8],
+    strings: &Strings,
     symbols: &mut crate::Symbols,
     sections: &mut Vec<crate::output::Section>,
     metrics: &mut crate::output::Metrics,
     metric_prefix: &str,
+    go_pclntab: bool,
 ) {
     // Skip the spawn entirely when goblin already gave us *anything* —
     // any symbol or any section. Matches cleave's historical "all
@@ -249,9 +414,26 @@ pub(super) fn rizin_fallback_with_sections(
     if !symbols.is_empty() || !sections.is_empty() {
         return;
     }
-    // PE recovery has no cheap complete-function-table signal (no Go pclntab),
-    // so it always needs the deep discovery pass.
-    let recovery = match crate::rizin::recover(bytes, crate::rizin::Analysis::Deep) {
+    let decision = rizin_decision(
+        NativeFormat::Pe,
+        bytes,
+        strings,
+        sections,
+        symbols,
+        metrics,
+        go_pclntab,
+    );
+    tracing::debug!(
+        format = ?NativeFormat::Pe,
+        bytes = bytes.len(),
+        run = decision.runs(),
+        reason = decision.reason(),
+        "rizin admission decision"
+    );
+    if !decision.runs() {
+        return;
+    }
+    let recovery = match crate::rizin::recover(bytes) {
         Some(recovery) => recovery,
         None => {
             note_incomplete_recovery(metrics);
@@ -352,7 +534,162 @@ pub(super) fn hex_nibble(b: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{basename, has_xor_intent, hex_encode, stem};
+    use super::{
+        LARGE_RIZIN_INPUT, NativeFormat, RizinDecision, RizinProfile, basename, decide_rizin,
+        has_xor_intent, hex_encode, stem,
+    };
+
+    fn transparent_profile(format: NativeFormat) -> RizinProfile {
+        RizinProfile {
+            format,
+            size: 64 << 20,
+            function_count: 0,
+            section_count: 8,
+            stripped: Some(false),
+            go_pclntab: false,
+            string_count: 10_000,
+            string_bytes: 4 << 20,
+            code_entropy: Some(6.2),
+            overall_entropy: 6.5,
+        }
+    }
+
+    #[test]
+    fn rizin_policy_is_consistent_across_native_formats() {
+        for format in [NativeFormat::Elf, NativeFormat::MachO, NativeFormat::Pe] {
+            assert!(matches!(
+                decide_rizin(transparent_profile(format)),
+                RizinDecision::Skip("static facts show a transparent binary")
+            ));
+
+            let mut no_strings = transparent_profile(format);
+            no_strings.string_count = 0;
+            no_strings.string_bytes = 0;
+            assert!(matches!(
+                decide_rizin(no_strings),
+                RizinDecision::Analyze("printable strings are sparse")
+            ));
+
+            let mut packed_code = transparent_profile(format);
+            packed_code.code_entropy = Some(7.3);
+            assert!(matches!(
+                decide_rizin(packed_code),
+                RizinDecision::Analyze("executable code has high entropy")
+            ));
+        }
+    }
+
+    #[test]
+    fn static_function_inventory_wins_over_expensive_signals() {
+        for format in [NativeFormat::Elf, NativeFormat::MachO, NativeFormat::Pe] {
+            let mut profile = transparent_profile(format);
+            profile.function_count = 1;
+            profile.stripped = Some(true);
+            profile.string_count = 0;
+            profile.string_bytes = 0;
+            profile.code_entropy = Some(8.0);
+            assert!(matches!(
+                decide_rizin(profile),
+                RizinDecision::Skip("static function inventory available")
+            ));
+        }
+    }
+
+    #[test]
+    fn go_pclntab_skips_rizin_on_every_platform() {
+        for format in [NativeFormat::Elf, NativeFormat::MachO, NativeFormat::Pe] {
+            let mut profile = transparent_profile(format);
+            profile.go_pclntab = true;
+            profile.stripped = Some(true);
+            profile.string_count = 0;
+            profile.string_bytes = 0;
+            profile.code_entropy = Some(8.0);
+            assert!(matches!(
+                decide_rizin(profile),
+                RizinDecision::Skip("Go pclntab provides the function inventory")
+            ));
+        }
+    }
+
+    #[test]
+    fn stripped_size_budget_has_an_explicit_boundary() {
+        for format in [NativeFormat::Elf, NativeFormat::MachO] {
+            let mut profile = transparent_profile(format);
+            profile.stripped = Some(true);
+            profile.size = LARGE_RIZIN_INPUT;
+            assert!(matches!(
+                decide_rizin(profile),
+                RizinDecision::Analyze("stripped binary within deep-analysis budget")
+            ));
+
+            profile.size += 1;
+            assert!(matches!(
+                decide_rizin(profile),
+                RizinDecision::Skip("static facts show a transparent binary")
+            ));
+        }
+    }
+
+    #[test]
+    fn string_density_and_count_are_both_admission_signals() {
+        let mut profile = transparent_profile(NativeFormat::Elf);
+        profile.string_count = 64;
+        profile.string_bytes = profile.size / 1024;
+        assert!(!decide_rizin(profile).runs());
+
+        profile.string_bytes -= 1;
+        assert!(matches!(
+            decide_rizin(profile),
+            RizinDecision::Analyze("printable strings are sparse")
+        ));
+
+        profile.string_bytes = profile.size;
+        profile.string_count = 63;
+        assert!(matches!(
+            decide_rizin(profile),
+            RizinDecision::Analyze("printable strings are sparse")
+        ));
+    }
+
+    #[test]
+    fn pe_exceptions_are_narrow_and_explicit() {
+        let mut malformed = transparent_profile(NativeFormat::Pe);
+        malformed.section_count = 0;
+        assert!(matches!(
+            decide_rizin(malformed),
+            RizinDecision::Analyze("PE section table needs recovery")
+        ));
+
+        let mut importless = transparent_profile(NativeFormat::Pe);
+        importless.size = 5 * 1024 * 1024;
+        assert!(matches!(
+            decide_rizin(importless),
+            RizinDecision::Analyze("small importless PE")
+        ));
+
+        importless.size += 1;
+        assert!(!decide_rizin(importless).runs());
+    }
+
+    #[test]
+    fn failing_workerd_macho_is_recognized_as_transparent() {
+        let profile = RizinProfile {
+            format: NativeFormat::MachO,
+            size: 119_799_896,
+            function_count: 0,
+            section_count: 20,
+            stripped: Some(false),
+            go_pclntab: false,
+            string_count: 330_028,
+            string_bytes: 40 << 20,
+            code_entropy: Some(6.39),
+            overall_entropy: 6.70,
+        };
+        assert!(matches!(
+            decide_rizin(profile),
+            RizinDecision::Skip("static facts show a transparent binary")
+        ));
+    }
 
     #[test]
     fn xor_intent_detects_operator_and_keyword() {

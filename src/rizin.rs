@@ -51,6 +51,27 @@ const RIZIN_MEMORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// JSON; we kill the process group on overflow and record the reason.
 const MAX_SUBPROCESS_OUTPUT: usize = 100 * 1024 * 1024;
 
+/// Full analysis plus the four JSON tables imported by [`RizinRecovery`].
+const RIZIN_METRICS_SCRIPT: &str =
+    "iij; echo ===SEP===; iEj; echo ===SEP===; aaa; echo ===SEP===; aflj; echo ===SEP===; iSj";
+
+/// Rizin switches that remove work whose output filefacts never consumes.
+/// Keep this separate from the input path so the contract is directly tested.
+const RIZIN_METRICS_ARGS: &[&str] = &[
+    "-NN",
+    "-q",
+    "-T",
+    "-z",
+    "-e",
+    "scr.color=0",
+    "-e",
+    "log.level=0",
+    "-e",
+    "analysis.vars=false",
+    "-c",
+    RIZIN_METRICS_SCRIPT,
+];
+
 // ---------------------------------------------------------------------------
 // Process-wide hardening state.
 // ---------------------------------------------------------------------------
@@ -361,37 +382,12 @@ pub fn cache_fingerprint() -> String {
     }
     let version = rizin_version().unwrap_or("unknown");
     if native_arch_only() {
-        format!("rizin={version}|native={}", std::env::consts::ARCH)
+        format!(
+            "rizin={version}|policy=opaque-v1|native={}",
+            std::env::consts::ARCH
+        )
     } else {
-        format!("rizin={version}")
-    }
-}
-
-/// Depth of rizin auto-analysis to request before listing functions.
-///
-/// The analysis pass is the dominant cost of a recovery (the cheap `iij`/
-/// `iEj`/`aflj`/`iSj` commands just read tables), so callers that can prove
-/// the binary already carries a complete function table pick `Basic` to halve
-/// the wall-clock — without losing any function.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Analysis {
-    /// `aa` — functions reachable from symbols, entrypoints, and format
-    /// metadata (rizin parses Go's `.gopclntab` here). Sufficient, and ~2x
-    /// faster, when the binary carries its own complete function table.
-    Basic,
-    /// `aaa` — adds emulation, reference, and prelude passes that discover
-    /// functions absent from every symbol table. Required for stripped
-    /// binaries; the safe default.
-    Deep,
-}
-
-impl Analysis {
-    /// The rizin command that performs this analysis depth.
-    fn command(self) -> &'static str {
-        match self {
-            Analysis::Basic => "aa",
-            Analysis::Deep => "aaa",
-        }
+        format!("rizin={version}|policy=opaque-v1")
     }
 }
 
@@ -399,14 +395,14 @@ impl Analysis {
 /// `None` when rizin isn't on PATH or invocation failed; callers
 /// fall back to whatever goblin already populated.
 ///
-/// The single rizin command runs `iij` (imports), `iEj` (exports), the
-/// requested `analysis` pass (`aa`/`aaa`) to discover functions, and `aflj`
-/// (function list). Output blocks are separated by sentinel strings we can
-/// `split` on cheaply.
+/// Admission is decided before this function. Every admitted binary gets the
+/// same full `aaa` pass, preserving function-count and CFG-complexity quality;
+/// callers save time by not spawning Rizin for transparent binaries, rather
+/// than silently downgrading the metrics of an admitted one.
 ///
 /// Writes `bytes` to a temp file (rizin reads files from disk, not
 /// stdin) and deletes it when done.
-pub(crate) fn recover(bytes: &[u8], analysis: Analysis) -> Option<RizinRecovery> {
+pub(crate) fn recover(bytes: &[u8]) -> Option<RizinRecovery> {
     if is_disabled() {
         return None;
     }
@@ -424,7 +420,7 @@ pub(crate) fn recover(bytes: &[u8], analysis: Analysis) -> Option<RizinRecovery>
         return None;
     }
     let bin = rizin_binary()?;
-    recover_with_bin(bin, bytes, analysis)
+    recover_with_bin(bin, bytes)
 }
 
 /// `recover()` with the rizin binary path passed in. Production path
@@ -433,10 +429,10 @@ pub(crate) fn recover(bytes: &[u8], analysis: Analysis) -> Option<RizinRecovery>
 /// deterministically without a real rizin install.
 #[cfg(test)]
 fn recover_with_bin_for_test(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
-    recover_with_bin(bin, bytes, Analysis::Deep)
+    recover_with_bin(bin, bytes)
 }
 
-fn recover_with_bin(bin: &Path, bytes: &[u8], analysis: Analysis) -> Option<RizinRecovery> {
+fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
     // The disable check intentionally lives only in the public
     // `recover()` entry, not here — tests inject a shim via
     // `recover_with_bin_for_test` and need a deterministic spawn
@@ -471,29 +467,20 @@ fn recover_with_bin(bin: &Path, bytes: &[u8], analysis: Analysis) -> Option<Rizi
     }
     let _cleanup = Cleanup(&temp);
 
-    // `-NN` disables plugin auto-loading (faster startup, fewer
-    // surprises). `-q` quits after the `-c` script. `-e scr.color=0`
-    // strips ANSI escapes from any stray log lines.
+    // `-NN` disables plugin auto-loading (faster startup, fewer surprises).
+    // `-T` skips Rizin's file hashes and `-z` skips its duplicate string-table
+    // scan: filefacts computes both independently before this fallback. Local
+    // variable/argument recovery is also excluded because none of the imported
+    // `aflj` fields use it; function discovery, names/ranges, CFG complexity,
+    // basic blocks, and call edges remain part of the full `aaa` pass. Three-run
+    // ELF/Mach-O/PE benchmarks found equality in every field consumed below.
+    // `-q` quits after the `-c` script and `scr.color=0` strips ANSI escapes.
     let path_str = temp.to_string_lossy();
-    // The analysis pass (`aa`/`aaa`) is the one variable command; the
-    // surrounding `iij`/`iEj`/`aflj`/`iSj` are cheap table reads. The `===SEP===`
+    // The `aaa` pass is deliberately fixed for admitted binaries; the
+    // surrounding `iij`/`iEj`/`aflj`/`iSj` are table reads. The `===SEP===`
     // sentinels must stay 1:1 with the parser's `split` below.
-    let script = format!(
-        "iij; echo ===SEP===; iEj; echo ===SEP===; {}; echo ===SEP===; aflj; echo ===SEP===; iSj",
-        analysis.command()
-    );
     let mut cmd = Command::new(bin);
-    cmd.args([
-        "-NN",
-        "-q",
-        "-e",
-        "scr.color=0",
-        "-e",
-        "log.level=0",
-        "-c",
-        script.as_str(),
-        &path_str,
-    ]);
+    cmd.args(RIZIN_METRICS_ARGS).arg(&*path_str);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::null());
@@ -1154,6 +1141,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn metrics_command_skips_unused_work_but_keeps_full_cfg_analysis() {
+        assert!(RIZIN_METRICS_ARGS.contains(&"-T"));
+        assert!(RIZIN_METRICS_ARGS.contains(&"-z"));
+        assert!(
+            RIZIN_METRICS_ARGS
+                .windows(2)
+                .any(|pair| pair == ["-e", "analysis.vars=false"])
+        );
+        assert!(
+            RIZIN_METRICS_SCRIPT.contains("aaa"),
+            "admitted binaries need the full CFG pass"
+        );
+        for table in ["iij", "iEj", "aflj", "iSj"] {
+            assert!(
+                RIZIN_METRICS_SCRIPT.contains(table),
+                "missing consumed table {table}"
+            );
+        }
+    }
+
     // ------------------------------------------------------------------
     // parse_json_array
     // ------------------------------------------------------------------
@@ -1561,15 +1569,6 @@ mod tests {
         assert_eq!(RIZIN_DISABLED.load(Ordering::SeqCst), before);
     }
 
-    #[test]
-    fn analysis_depth_maps_to_rizin_command() {
-        // Guards the Go fast-path: `Basic` MUST stay `aa` (cheap) and `Deep`
-        // MUST stay `aaa` (full discovery). A revert of either string would
-        // silently re-slow Go binaries or weaken stripped-binary recovery.
-        assert_eq!(Analysis::Basic.command(), "aa");
-        assert_eq!(Analysis::Deep.command(), "aaa");
-    }
-
     /// A per-thread mute must not leak to other threads: that is the bug
     /// where one archive member skipping disassembly silently stripped
     /// symbols from a binary being analyzed concurrently.
@@ -1602,7 +1601,7 @@ mod tests {
         // only the observable contract: disabled → None.
         let _g = scoped_disable();
         assert!(is_disabled());
-        let r = recover(b"unused bytes for disabled probe", Analysis::Deep);
+        let r = recover(b"unused bytes for disabled probe");
         assert!(r.is_none(), "disabled rizin must return None");
     }
 

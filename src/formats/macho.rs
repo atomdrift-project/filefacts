@@ -14,8 +14,8 @@ use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::{
-    XorScan, extract_binary_strings, extract_binary_strings_from_object, put_str, put_u64,
-    rizin_fallback,
+    NativeFormat, XorScan, extract_binary_strings, extract_binary_strings_from_object, put_str,
+    put_u64, rizin_fallback,
 };
 use crate::formats::goblin_safe;
 use crate::output::{Errors, Metrics, Section, Strings, Values};
@@ -86,15 +86,15 @@ pub(super) fn extract(
         Some((start, end)) => &bytes[start..end],
         None => bytes,
     };
-    // Mach-O Go binaries carry their complete function table in `__gopclntab`
-    // (resolved above for thin binaries), so rizin's basic `aa` recovers every
-    // function — the deep `aaa` finds nothing more at ~2x the cost. Fat
-    // binaries skip pclntab resolution, so they stay on deep discovery.
+    let has_go_pclntab = go_pclntab.is_some_and(super::go_buildinfo::has_pclntab_magic);
     rizin_fallback(
+        NativeFormat::MachO,
         rizin_bytes,
+        strings,
+        sections_out,
         symbols_out,
         metrics,
-        macho_rizin_analysis(go_pclntab),
+        has_go_pclntab,
     );
     super::upx::detect(bytes, values);
     let go_sections = super::go_buildinfo::GoSections {
@@ -104,18 +104,6 @@ pub(super) fn extract(
     };
     super::go_buildinfo::detect(bytes, values, "macho", None, &go_sections);
     Ok(())
-}
-
-/// Pick rizin's analysis depth from the resolved `__gopclntab` bytes. A
-/// genuine Go pclntab (validated by magic, not just section name) is a complete
-/// function table that basic `aa` parses in full; everything else needs deep
-/// `aaa` discovery. Mirrors the ELF path's `elf_rizin_analysis`.
-fn macho_rizin_analysis(go_pclntab: Option<&[u8]>) -> crate::rizin::Analysis {
-    if go_pclntab.is_some_and(super::go_buildinfo::has_pclntab_magic) {
-        crate::rizin::Analysis::Basic
-    } else {
-        crate::rizin::Analysis::Deep
-    }
 }
 
 /// Resolve the `__TEXT,__gopclntab` and read-only data (`__const`,
@@ -1797,24 +1785,16 @@ mod tests {
     }
 
     #[test]
-    fn macho_go_pclntab_selects_basic_analysis() {
-        // Real Go pclntab magic (1.18, LE) → cheap `aa`, like the ELF path.
+    fn macho_go_pclntab_magic_is_validated() {
         let pclntab = [0xf0, 0xff, 0xff, 0xff, 0x00, 0x00, 0x01, 0x08];
-        assert_eq!(
-            macho_rizin_analysis(Some(&pclntab)),
-            crate::rizin::Analysis::Basic
-        );
+        assert!(crate::formats::go_buildinfo::has_pclntab_magic(&pclntab));
     }
 
     #[test]
-    fn macho_spoofed_or_absent_pclntab_keeps_deep_analysis() {
-        // A `__gopclntab` decoy without a valid magic, and the no-pclntab case
-        // (fat binaries, non-Go) must both stay on deep `aaa` discovery.
-        assert_eq!(
-            macho_rizin_analysis(Some(b"not a real pclntab")),
-            crate::rizin::Analysis::Deep
-        );
-        assert_eq!(macho_rizin_analysis(None), crate::rizin::Analysis::Deep);
+    fn macho_spoofed_pclntab_is_not_treated_as_go() {
+        assert!(!crate::formats::go_buildinfo::has_pclntab_magic(
+            b"not a real pclntab"
+        ));
     }
 
     #[test]
