@@ -32,11 +32,13 @@ use serde::Deserialize;
 
 use crate::output::Metrics;
 
-/// Hard cap on a single rizin run. `aaa` analysis on a heavily
-/// stripped ~14 MB Linux binary needed ~85 s in real measurement;
-/// adversarial samples with packed code paths can take longer.
-/// Match cleave's default timeout so behaviour is consistent.
-const RIZIN_TIMEOUT: Duration = Duration::from_secs(300);
+/// Default hard cap on a single Rizin run. `aaa` analysis on a heavily
+/// stripped ~14 MB Linux binary needed ~85 s in real measurement, while large
+/// but legitimate native images can take several minutes. Ten minutes gives
+/// those a useful completion window without letting a pathological subprocess
+/// occupy an analysis worker indefinitely.
+pub const DEFAULT_RIZIN_TIMEOUT_SECS: u64 = 600;
+const RIZIN_TIMEOUT: Duration = Duration::from_secs(DEFAULT_RIZIN_TIMEOUT_SECS);
 
 /// Soft memory cap on a single rizin subprocess (4 GiB). Enforced via
 /// `setrlimit(RLIMIT_AS, ...)` (Linux) / `setrlimit(RLIMIT_DATA, ...)`
@@ -518,6 +520,7 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
         Some(h) => h,
         None => {
             RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
+            terminate_child(&mut child, child_id);
             return None;
         }
     };
@@ -544,11 +547,13 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
         buf
     });
 
-    // Poll for child exit with the timeout deadline. Once the child
-    // exits, the reader thread's `read_to_end` returns naturally.
-    let deadline = std::time::Instant::now() + rizin_timeout();
+    // Poll until the configured duration has elapsed. Comparing elapsed time
+    // avoids overflowing `Instant` if a caller supplies an intentionally
+    // enormous timeout override. Once the child exits, the reader thread's
+    // `read_to_end` returns naturally.
+    let timeout = rizin_timeout();
     let mut exit_status = None;
-    while std::time::Instant::now() < deadline {
+    while started.elapsed() < timeout {
         match child.try_wait() {
             Ok(Some(status)) => {
                 exit_status = Some(status);
@@ -557,6 +562,8 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
             Err(_) => {
                 RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
+                terminate_child(&mut child, child_id);
+                let _ = drain.join();
                 return None;
             }
         }
@@ -570,12 +577,23 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
                 elapsed_ms = started.elapsed().as_millis(),
                 "rizin recover: end (timed out)"
             );
-            kill_process_group(child_id);
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_child(&mut child, child_id);
+            // Killing the whole group closes every inherited copy of stdout.
+            // Join before returning so a timed-out analysis cannot leave a
+            // detached drain thread behind after its Rayon caller is released.
+            let _ = drain.join();
             return None;
         }
     };
+    // The leader has exited, but a helper process could still hold an inherited
+    // stdout descriptor open. Terminate any remaining members of Rizin's private
+    // process group before joining, so neither a descendant nor the reader can
+    // retain this Rayon caller indefinitely. This is harmless when the group is
+    // already empty.
+    kill_process_group(child_id);
+    // Join on every exit-status path—not only success—so a crashing Rizin cannot
+    // leak a detached reader thread.
+    let stdout_bytes = drain.join().unwrap_or_default();
     let cap_hit = output_cap_hit.load(Ordering::Acquire);
     if cap_hit {
         RIZIN_MEMORY_EXCEEDED.fetch_add(1, Ordering::Relaxed);
@@ -586,11 +604,6 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
         RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    // Wait for the drain thread. The child has exited, so its
-    // write-end of the pipe is closed and `read_to_end` is guaranteed
-    // to return promptly — no deadlock risk. A poisoned thread
-    // (panic in the drain) is treated like empty stdout.
-    let stdout_bytes = drain.join().unwrap_or_default();
     if stdout_bytes.is_empty() {
         RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
         return None;
@@ -660,6 +673,16 @@ fn kill_process_group(child_id: u32) {
     }
     #[cfg(not(unix))]
     let _ = child_id;
+}
+
+/// Terminate the complete Rizin process group and synchronously reap its
+/// leader. The direct `Child::kill` is an idempotent fallback for platforms
+/// without Unix process groups and for the narrow race where group creation
+/// failed before `exec`.
+fn terminate_child(child: &mut std::process::Child, child_id: u32) {
+    kill_process_group(child_id);
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Mark the output-cap flag and SIGKILL the rizin process group so
@@ -1874,6 +1897,160 @@ mod tests {
         let rec = recover_with_bin_for_test(&shim, b"unused");
         let _ = std::fs::remove_dir_all(&dir);
         assert!(rec.is_none(), "non-zero exit should yield None");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exited_rizin_cannot_leave_descendant_holding_worker() {
+        let _lock = rizin_test_lock();
+
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_shim_dir("filefacts-rizin-descendantshim");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("rizin");
+        let descendant_pid = dir.join("descendant.pid");
+        let mut f = std::fs::File::create(&shim).unwrap();
+        writeln!(f, "#!/bin/sh").unwrap();
+        // The descendant inherits stdout, then the shim exits immediately. If
+        // the recovery path only reaps the group leader, `drain.join()` blocks
+        // until this sleep ends and retains its Rayon caller in the meantime.
+        writeln!(f, "sleep 5 &").unwrap();
+        writeln!(f, "descendant=$!").unwrap();
+        writeln!(
+            f,
+            "printf '%s\\n' \"$descendant\" > '{}'",
+            descendant_pid.display()
+        )
+        .unwrap();
+        writeln!(f, "exit 1").unwrap();
+        let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&shim, perms).unwrap();
+        drop(f);
+
+        let started = std::time::Instant::now();
+        let rec = recover_with_bin_for_test(&shim, b"descendant cleanup fixture");
+        let elapsed = started.elapsed();
+        assert!(rec.is_none(), "failed Rizin must not emit partial facts");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "lingering descendant retained the worker for {elapsed:?}"
+        );
+
+        let descendant: i32 = std::fs::read_to_string(&descendant_pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        for _ in 0..100 {
+            // SAFETY: signal 0 performs existence/permission probing only.
+            #[allow(unsafe_code)]
+            let exists = unsafe { libc::kill(descendant, 0) } == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            if !exists {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // SAFETY: signal 0 performs existence/permission probing only.
+        #[allow(unsafe_code)]
+        let exists = unsafe { libc::kill(descendant, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        assert!(!exists, "Rizin descendant survived its leader's exit");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn timeout_kills_process_group_joins_reader_and_returns_worker() {
+        let _lock = rizin_test_lock();
+
+        // Preserve a caller-installed override even if an assertion panics.
+        struct TimeoutReset(u64);
+        impl Drop for TimeoutReset {
+            fn drop(&mut self) {
+                RIZIN_TIMEOUT_SECS.store(self.0, Ordering::SeqCst);
+            }
+        }
+        let previous = RIZIN_TIMEOUT_SECS.swap(1, Ordering::SeqCst);
+        let _timeout_reset = TimeoutReset(previous);
+
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_shim_dir("filefacts-rizin-timeoutshim");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("rizin");
+        let leader_pid = dir.join("leader.pid");
+        let descendant_pid = dir.join("descendant.pid");
+        let mut f = std::fs::File::create(&shim).unwrap();
+        writeln!(f, "#!/bin/sh").unwrap();
+        writeln!(f, "printf '%s\\n' \"$$\" > '{}'", leader_pid.display()).unwrap();
+        writeln!(f, "sleep 300 &").unwrap();
+        writeln!(f, "descendant=$!").unwrap();
+        writeln!(
+            f,
+            "printf '%s\\n' \"$descendant\" > '{}'",
+            descendant_pid.display()
+        )
+        .unwrap();
+        writeln!(f, "wait \"$descendant\"").unwrap();
+        let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&shim, perms).unwrap();
+        drop(f);
+
+        let started = std::time::Instant::now();
+        let rec = recover_with_bin_for_test(&shim, b"timeout cleanup fixture");
+        let elapsed = started.elapsed();
+        assert!(rec.is_none(), "timed-out Rizin must not emit partial facts");
+        assert!(
+            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(5),
+            "one-second timeout returned after {elapsed:?}"
+        );
+
+        let leader: i32 = std::fs::read_to_string(&leader_pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let descendant: i32 = std::fs::read_to_string(&descendant_pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        fn process_exists(pid: i32) -> bool {
+            // SAFETY: signal 0 performs existence/permission probing only.
+            #[allow(unsafe_code)]
+            let rc = unsafe { libc::kill(pid, 0) };
+            rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        }
+
+        // The direct child is synchronously waited. Its background child is
+        // killed by the same process-group signal and may remain a zombie for a
+        // scheduler tick while init adopts it, so give reaping a short grace.
+        for _ in 0..100 {
+            if !process_exists(leader) && !process_exists(descendant) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!process_exists(leader), "Rizin group leader was not reaped");
+        assert!(
+            !process_exists(descendant),
+            "Rizin descendant survived the process-group timeout"
+        );
+        assert!(
+            !RIZIN_PGIDS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(&leader),
+            "timed-out Rizin remained in the live-process registry"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Temp-file cleanup is enforced by a `Drop` guard on `Cleanup<'_>`
