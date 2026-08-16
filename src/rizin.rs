@@ -7,11 +7,10 @@
 //!
 //! # Discovery model
 //!
-//! At runtime we look for `rizin` (or `r2`) on `PATH`. If neither is
-//! installed, every call here returns `None` and extraction proceeds
-//! without rizin's contributions. No feature flag — the module is
-//! always compiled; consumers running without rizin pay nothing
-//! beyond a single `which`-style PATH scan per process.
+//! At runtime we look for `rizin` (or `r2`) through the cached external-tool
+//! resolver. It checks `PATH` first and then platform fallback locations. If
+//! neither is installed, every call here returns `None` and extraction
+//! proceeds without rizin's contributions.
 //!
 //! # Subprocess discipline
 //!
@@ -297,14 +296,15 @@ pub fn log_stats() {
     );
 }
 
-/// One-shot PATH probe. Cached so we don't fork `which` per file.
+/// One-shot binary probe. The shared resolver caches the discovered path so we
+/// don't search PATH or fallback locations per file.
 fn rizin_binary() -> Option<&'static Path> {
     static CACHED: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
     CACHED
         .get_or_init(|| {
             // Prefer `rizin` (modern); fall back to `radare2` / `r2`.
             for name in ["rizin", "radare2", "r2"] {
-                if let Some(path) = which(name) {
+                if let Some(path) = crate::tools::resolve(name) {
                     return Some(path);
                 }
             }
@@ -313,21 +313,7 @@ fn rizin_binary() -> Option<&'static Path> {
         .as_deref()
 }
 
-/// Tiny PATH search — avoids pulling the `which` crate as a dep for
-/// a single binary lookup. Returns the first existing executable
-/// matching `name` in any `PATH` directory.
-fn which(name: &str) -> Option<std::path::PathBuf> {
-    let path_env = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_env) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-/// `true` when rizin (or a compatible drop-in) is available on PATH.
+/// `true` when rizin (or a compatible drop-in) is available.
 /// Cheap — does not spawn anything; only checks the cached probe.
 pub fn available() -> bool {
     rizin_binary().is_some()
@@ -337,7 +323,7 @@ pub fn available() -> bool {
 ///
 /// Used only to invalidate the disk cache across rizin upgrades, so the
 /// exact text is opaque — any change that alters analysis output also
-/// changes this line. `None` when rizin isn't on PATH or the probe
+/// changes this line. `None` when rizin isn't installed or the probe
 /// fails. Spawns `rizin -v` a single time per process.
 fn rizin_version() -> Option<&'static str> {
     static VERSION: OnceLock<Option<String>> = OnceLock::new();

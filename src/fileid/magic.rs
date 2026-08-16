@@ -324,18 +324,16 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
                     // Arch package with a gzip body; the `.pkg.tar.*` extension
                     // is Arch-specific. Checked before the generic `.tar.gz`.
                     FileType::PkgArch
+                // npm and Python sdists are identified by interior structure,
+                // not their filename. Content-addressed stores commonly name
+                // either one `<hash>.sample`, so inspect before consulting the
+                // generic gzip-tar extension.
+                } else if gzip_tar_is_npm(data) {
+                    FileType::Npm
+                } else if gzip_tar_is_sdist(data) {
+                    FileType::PythonSdist
                 } else if path_ends_with_ci(path, b".tar.gz") || path_ends_with_ci(path, b".tgz") {
-                    // npm and Python sdists both publish gzip tarballs identified
-                    // by an interior marker, not the generic extension: npm puts
-                    // everything under `package/`, an sdist under a single
-                    // `<name>-<version>/` holding `PKG-INFO`.
-                    if gzip_tar_is_npm(data) {
-                        FileType::Npm
-                    } else if gzip_tar_is_sdist(data) {
-                        FileType::PythonSdist
-                    } else {
-                        FileType::TarGz
-                    }
+                    FileType::TarGz
                 } else {
                     FileType::Gz
                 };
@@ -573,6 +571,11 @@ fn is_freebsd_pkg_zstd(path: &Path, data: &[u8]) -> bool {
 /// that a `package/`-only gzip bomb can't make detection do unbounded work.
 const NPM_PEEK_LIMIT: u64 = 8 << 20;
 
+/// Source distributions often put `PKG-INFO` last, after generated clients,
+/// tests, and documentation. Keep a decompression-bomb bound, but do not share
+/// npm's smaller manifest budget: valid sdists commonly exceed 8 MiB expanded.
+const SDIST_PEEK_LIMIT: u64 = 64 << 20;
+
 /// Peek a gzip tar's members to decide whether the layout is an npm package:
 /// every entry under a `package/` prefix, with a `package/package.json`
 /// present. Bails on the first non-`package/` entry, so a non-npm gzip tar
@@ -623,9 +626,9 @@ fn gzip_tar_is_npm(data: &[u8]) -> bool {
 /// Peek a gzip tar's members to decide whether the layout is a Python source
 /// distribution: every entry under a single `<name>-<version>/` root, with a
 /// `<root>/PKG-INFO` present. Bails on the first entry outside that root, so a
-/// non-sdist gzip tar costs one header. Bounded by [`NPM_PEEK_LIMIT`] bytes.
+/// non-sdist gzip tar costs one header. Bounded by [`SDIST_PEEK_LIMIT`] bytes.
 fn gzip_tar_is_sdist(data: &[u8]) -> bool {
-    let reader = flate2::read::GzDecoder::new(data).take(NPM_PEEK_LIMIT);
+    let reader = flate2::read::GzDecoder::new(data).take(SDIST_PEEK_LIMIT);
     let mut archive = tar::Archive::new(reader);
     let Ok(entries) = archive.entries() else {
         return false;
@@ -800,6 +803,14 @@ fn classify_pk(path: &Path, data: &[u8]) -> (FileType, DetectionSource) {
         return (FileType::Ipa, DetectionSource::Magic);
     }
     if ext == "vsix" {
+        return (FileType::Vsix, DetectionSource::Magic);
+    }
+
+    // VSIX is an Open Packaging Conventions ZIP, so it also carries
+    // `[Content_Types].xml`. Its root manifest is the format-specific marker
+    // and must win before the generic OOXML check — especially for extensionless
+    // samples and registry blobs whose filenames do not preserve `.vsix`.
+    if memchr::memmem::find(data, b"extension.vsixmanifest").is_some() {
         return (FileType::Vsix, DetectionSource::Magic);
     }
 
@@ -1357,6 +1368,14 @@ mod tests {
     }
 
     #[test]
+    fn vsix_by_manifest_without_extension() {
+        let mut data = b"PK\x03\x04".to_vec();
+        data.extend_from_slice(b"extension.vsixmanifest\0[Content_Types].xml");
+        let (ft, _) = detect_from_content(Path::new("artifact.sample"), &data).unwrap();
+        assert_eq!(ft, FileType::Vsix);
+    }
+
+    #[test]
     fn php_opening_tag() {
         let data = b"<?php\necho 'hello';\n";
         let (ft, _) = detect_from_content(Path::new("page"), data).unwrap();
@@ -1487,6 +1506,17 @@ mod tests {
         let plain = build_gzip_tar(&[("proj-1.0/README", b"hi"), ("proj-1.0/main.c", b"int")]);
         let (ft, _) = detect_from_content(Path::new("proj-1.0.tar.gz"), &plain).unwrap();
         assert_eq!(ft, FileType::TarGz);
+    }
+
+    #[test]
+    fn python_sdist_pkg_info_may_follow_large_source_tree() {
+        let padding = vec![0u8; (NPM_PEEK_LIMIT as usize) + 1];
+        let gz = build_gzip_tar(&[
+            ("generated-1.0/src/generated/client.py", &padding),
+            ("generated-1.0/PKG-INFO", b"Name: generated\n"),
+        ]);
+        let (ft, _) = detect_from_content(Path::new("content-addressed.sample"), &gz).unwrap();
+        assert_eq!(ft, FileType::PythonSdist);
     }
 
     #[test]

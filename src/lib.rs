@@ -69,6 +69,7 @@ mod scan;
 
 pub mod cache;
 pub mod fileid;
+pub mod tools;
 
 /// Optional rizin/radare2 integration with hardened subprocess
 /// discipline (RLIMIT, PR_SET_PDEATHSIG, process-group SIGKILL on
