@@ -66,7 +66,7 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Iden
         FileType::PythonSdist => python_sdist(values, &mut id),
         FileType::OciImage => oci(values, &mut id),
         FileType::Crx => crx(values, &mut id),
-        FileType::Ooxml | FileType::OleDoc => office(values, &mut id),
+        FileType::Ooxml | FileType::OleDoc | FileType::Msi => office(values, &mut id),
         FileType::Pdf => pdf(values, &mut id),
         FileType::Rtf => rtf(values, &mut id),
         FileType::Png => png(values, &mut id),

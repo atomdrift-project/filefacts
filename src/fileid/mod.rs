@@ -171,7 +171,7 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::PythonBytecode
         | FileType::Beam
         | FileType::Wasm
-        | FileType::AndroidDex
+        | FileType::Dex
         | FileType::StaticLib
         | FileType::Lnk => "binary",
         // Interpreted scripting languages (cleave's `scripts` for-group).
@@ -275,6 +275,10 @@ fn file_group(ft: FileType) -> &'static str {
         FileType::Rtf | FileType::OleDoc | FileType::Ooxml | FileType::Pdf | FileType::Odf => {
             "document"
         }
+        // Installer packages share the OLE2/CFBF wire format with OleDoc but
+        // are not documents — treat them as archive-class for mismatch
+        // transitions (e.g. an MSI renamed `.doc` is archive→document).
+        FileType::Msi => "archive",
         FileType::Jpeg | FileType::Png | FileType::Svg => "image",
         FileType::Html | FileType::Markdown | FileType::Text => "text",
         FileType::Pickle | FileType::Data | FileType::Unknown => "data",
@@ -332,10 +336,11 @@ pub enum FileType {
     /// extraction, entropy, and symbol-name traits fire on the embedded
     /// `syscall/js` imports, struct tags, and rodata.
     Wasm,
-    /// Android Dalvik executable bytecode (`dex\n035\0` and related versions).
-    /// APKs carry this as `classes.dex`; route it as a program so member scans
-    /// can match Android behavior strings and APIs.
-    AndroidDex,
+    /// Dalvik/ART executable bytecode (`dex\n035\0` and later versions).
+    /// APKs carry this as `classes.dex`; a standalone `.dex` is the same
+    /// format, not an APK. There is no competing popular "DEX" file type —
+    /// the name is the format, not a platform qualifier.
+    Dex,
     /// Java archive (.jar, .war, .ear)
     Jar,
     /// Ruby source file (.rb)
@@ -556,6 +561,10 @@ pub enum FileType {
     Rtf,
     /// Legacy Microsoft Office document (OLE2/CFBF: .doc, .xls, .ppt, .msg)
     OleDoc,
+    /// Windows Installer package / patch (OLE2/CFBF: .msi, .msp). Same compound
+    /// container as [`OleDoc`], but a distinct product surface (installer tables,
+    /// custom-action binaries, SummaryInformation) — not a document.
+    Msi,
     /// Modern Microsoft Office document (OOXML: .docx, .xlsx, .pptx)
     Ooxml,
     /// Windows Shell Link file (.lnk)
@@ -664,7 +673,7 @@ impl FileType {
                 | Self::PythonBytecode
                 | Self::Beam
                 | Self::Wasm
-                | Self::AndroidDex
+                | Self::Dex
         )
     }
 
@@ -755,7 +764,7 @@ impl FileType {
             Self::PythonBytecode => "python_bytecode",
             Self::Beam => "beam",
             Self::Wasm => "wasm",
-            Self::AndroidDex => "dex",
+            Self::Dex => "dex",
             // Source / scripts.
             Self::Shell => "shell",
             Self::Batch => "batch",
@@ -867,6 +876,7 @@ impl FileType {
             // Documents / media.
             Self::Rtf => "rtf",
             Self::OleDoc => "ole_doc",
+            Self::Msi => "msi",
             Self::Ooxml => "ooxml",
             Self::Lnk => "lnk",
             Self::Jpeg => "jpeg",
@@ -890,7 +900,7 @@ impl FileType {
             "python_bytecode" => Self::PythonBytecode,
             "beam" => Self::Beam,
             "wasm" => Self::Wasm,
-            "dex" => Self::AndroidDex,
+            "dex" => Self::Dex,
             "shell" => Self::Shell,
             "batch" => Self::Batch,
             "jcl" => Self::Jcl,
@@ -996,6 +1006,7 @@ impl FileType {
             "gentoo_binpkg" => Self::GentooBinpkg,
             "rtf" => Self::Rtf,
             "ole_doc" => Self::OleDoc,
+            "msi" => Self::Msi,
             "ooxml" => Self::Ooxml,
             "lnk" => Self::Lnk,
             "jpeg" => Self::Jpeg,
@@ -1580,7 +1591,7 @@ mod tests {
 
     #[test]
     fn dex_by_ext() {
-        assert_ext("classes.dex", FileType::AndroidDex);
+        assert_ext("classes.dex", FileType::Dex);
     }
 
     // ── JavaScript / TypeScript ──────────────────────────────────────
@@ -2100,7 +2111,7 @@ message CommandMessage {
         assert!(FileType::Pe.is_binary());
         assert!(FileType::MachO.is_binary());
         assert!(FileType::JavaClass.is_binary());
-        assert!(FileType::AndroidDex.is_binary());
+        assert!(FileType::Dex.is_binary());
         assert!(!FileType::Zip.is_binary());
         assert!(!FileType::Python.is_binary());
     }
@@ -2149,6 +2160,23 @@ message CommandMessage {
         assert_ext("file.xls", FileType::OleDoc);
         assert_ext("file.ppt", FileType::OleDoc);
         assert_ext("file.msg", FileType::OleDoc);
+    }
+
+    #[test]
+    fn msi_by_ext_and_magic() {
+        assert_ext("setup.msi", FileType::Msi);
+        assert_ext("patch.msp", FileType::Msi);
+        assert_ext("custom.mst", FileType::Msi);
+        assert_ext("merge.msm", FileType::Msi);
+        let mut data = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+        data.extend_from_slice(&[0; 100]);
+        // Extension gates CFBF: installer family → Msi, .doc → OleDoc, bare → OleDoc.
+        assert_detect("setup.msi", &data, FileType::Msi);
+        assert_detect("patch.msp", &data, FileType::Msi);
+        assert_detect("custom.mst", &data, FileType::Msi);
+        assert_detect("merge.msm", &data, FileType::Msi);
+        assert_detect("doc.doc", &data, FileType::OleDoc);
+        assert_detect("untitled.bin", &data, FileType::OleDoc);
     }
 
     #[test]
@@ -2609,7 +2637,7 @@ function wpcf7_special_mail_tag( $output, $name, $html ) {
             FileType::PythonBytecode,
             FileType::Beam,
             FileType::Wasm,
-            FileType::AndroidDex,
+            FileType::Dex,
             FileType::Shell,
             FileType::Batch,
             FileType::Jcl,
@@ -2714,6 +2742,7 @@ function wpcf7_special_mail_tag( $output, $name, $html ) {
             FileType::GentooBinpkg,
             FileType::Rtf,
             FileType::OleDoc,
+            FileType::Msi,
             FileType::Ooxml,
             FileType::Lnk,
             FileType::Jpeg,

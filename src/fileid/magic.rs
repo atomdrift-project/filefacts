@@ -155,7 +155,11 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             }
         }
         0xD0 => {
-            // OLE2/CFBF: D0 CF 11 E0 A1 B1 1A E1
+            // OLE2/CFBF: D0 CF 11 E0 A1 B1 1A E1. Shared by Office documents
+            // (.doc/.xls/.ppt/.msg) and Windows Installer packages (.msi/.msp);
+            // magic alone cannot tell them apart, so the extension gates the
+            // choice (Pickle-style). Bare CFBF without an installer extension
+            // stays OleDoc — stream subtype may still promote MSI later.
             if data.len() >= 8
                 && data[1] == 0xCF
                 && data[2] == 0x11
@@ -165,7 +169,16 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
                 && data[6] == 0x1A
                 && data[7] == 0xE1
             {
-                Some((FileType::OleDoc, DetectionSource::Magic))
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(str::to_ascii_lowercase);
+                let ty = if matches!(ext.as_deref(), Some("msi" | "msp" | "mst" | "msm")) {
+                    FileType::Msi
+                } else {
+                    FileType::OleDoc
+                };
+                Some((ty, DetectionSource::Magic))
             } else {
                 None
             }
@@ -208,7 +221,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
                 && data[6].is_ascii_digit()
                 && data[7] == 0
             {
-                Some((FileType::AndroidDex, DetectionSource::Magic))
+                Some((FileType::Dex, DetectionSource::Magic))
             } else {
                 None
             }
@@ -1215,6 +1228,12 @@ mod tests {
         data.extend_from_slice(&[0; 100]);
         let (ft, _) = detect_from_content(Path::new("doc.doc"), &data).unwrap();
         assert_eq!(ft, FileType::OleDoc);
+        let (ft, _) = detect_from_content(Path::new("setup.msi"), &data).unwrap();
+        assert_eq!(ft, FileType::Msi);
+        let (ft, _) = detect_from_content(Path::new("patch.msp"), &data).unwrap();
+        assert_eq!(ft, FileType::Msi);
+        let (ft, _) = detect_from_content(Path::new("custom.mst"), &data).unwrap();
+        assert_eq!(ft, FileType::Msi);
     }
 
     #[test]
@@ -1318,7 +1337,7 @@ mod tests {
     fn dex_bytecode() {
         let data = b"dex\n035\0payload";
         let (ft, _) = detect_from_content(Path::new("classes.dex"), data).unwrap();
-        assert_eq!(ft, FileType::AndroidDex);
+        assert_eq!(ft, FileType::Dex);
     }
 
     #[test]

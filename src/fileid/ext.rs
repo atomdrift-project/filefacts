@@ -327,7 +327,7 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "pyc" | "pyo" => Some(FileType::PythonBytecode),
         "beam" => Some(FileType::Beam),
         "wasm" => Some(FileType::Wasm),
-        "dex" => Some(FileType::AndroidDex),
+        "dex" => Some(FileType::Dex),
         "rb" | "rbs" | "gemspec" => Some(FileType::Ruby),
         "php" | "php3" | "php4" | "php5" | "php7" | "phtml" => Some(FileType::Php),
         "pl" | "pm" | "t" => Some(FileType::Perl),
@@ -359,8 +359,10 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "gyp" | "gypi" => Some(FileType::Gyp),
         "plist" | "resx" => Some(FileType::Plist),
         "rtf" => Some(FileType::Rtf),
-        "doc" | "msi" | "msp" | "msg" | "dot" | "ppt" | "pps" | "pot" | "ppa" | "xls" | "xlt"
-        | "xla" => Some(FileType::OleDoc),
+        "doc" | "msg" | "dot" | "ppt" | "pps" | "pot" | "ppa" | "xls" | "xlt" | "xla" => {
+            Some(FileType::OleDoc)
+        }
+        "msi" | "msp" | "mst" | "msm" => Some(FileType::Msi),
         "docx" | "xlsx" | "pptx" | "docm" | "xlsm" | "pptm" | "dotx" | "dotm" | "xltx" | "xltm"
         | "xlam" | "ppam" | "potx" | "potm" | "ppsx" | "ppsm" | "sldx" | "sldm" => {
             Some(FileType::Ooxml)

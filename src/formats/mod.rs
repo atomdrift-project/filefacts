@@ -189,11 +189,13 @@ pub(crate) fn extract(
             vba::extract_from_zip(&mut archive, values, metrics, symbols);
             Ok(())
         }
-        FileType::OleDoc => {
+        FileType::OleDoc | FileType::Msi => {
             ole2::extract(bytes, values, metrics)?;
             // VBA module source-text extraction (best-effort).
             // `vba::extract` is silent on failure — a doc without
-            // macros just leaves `office.vba.*` unpopulated.
+            // macros just leaves `office.vba.*` unpopulated. MSI rarely
+            // carries VBA; the call is still cheap and keeps the OLE2
+            // extract path uniform.
             vba::extract(bytes, values, metrics, symbols);
             Ok(())
         }

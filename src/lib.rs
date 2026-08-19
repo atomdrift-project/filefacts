@@ -809,7 +809,7 @@ fn stage_for(file_type: FileType) -> Stage {
         FileType::Elf => Stage::ElfParse,
         FileType::MachO => Stage::MachoParse,
         FileType::Ooxml => Stage::OoxmlParse,
-        FileType::OleDoc => Stage::Ole2Parse,
+        FileType::OleDoc | FileType::Msi => Stage::Ole2Parse,
         FileType::Zip | FileType::Crx | FileType::Odf | FileType::Jar => Stage::ZipParse,
         FileType::Tar | FileType::TarGz | FileType::TarBz2 | FileType::TarXz | FileType::TarZst => {
             Stage::TarParse
