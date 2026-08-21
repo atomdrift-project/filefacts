@@ -408,7 +408,42 @@ pub(crate) fn recover(bytes: &[u8]) -> Option<RizinRecovery> {
         return None;
     }
     let bin = rizin_binary()?;
-    recover_with_bin(bin, bytes)
+
+    // In-run memo keyed by content hash. Archives routinely carry the same
+    // binary several times (a vsix shipping per-language duplicates of every
+    // Roslyn DLL, vendored copies of one .so) and each copy previously paid a
+    // full `aaa` run — two identical 6.9 MB ELFs were 65 s each on one C#
+    // vsix. The recovery is a pure function of the bytes (same rizin build,
+    // same flags for the whole process), so replaying the parsed tables is
+    // exactly the work the second spawn would redo. This is not the
+    // persistent analysis cache (which CLEAVE_SKIP_CACHE governs): it lives
+    // and dies with the process. Failures are memoized too — a timeout on
+    // these bytes would time out again. Bounded by entry count; on overflow
+    // the map resets (duplicates cluster in time, so recency is all we need).
+    const RIZIN_MEMO_MAX: usize = 512;
+    static MEMO: std::sync::Mutex<
+        Option<std::collections::HashMap<[u8; 32], Option<RizinRecovery>>>,
+    > = std::sync::Mutex::new(None);
+    let key: [u8; 32] = {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(bytes).into()
+    };
+    if let Ok(guard) = MEMO.lock()
+        && let Some(map) = guard.as_ref()
+        && let Some(hit) = map.get(&key)
+    {
+        tracing::debug!(bytes = bytes.len(), "rizin recover: in-run memo hit");
+        return hit.clone();
+    }
+    let result = recover_with_bin(bin, bytes);
+    if let Ok(mut guard) = MEMO.lock() {
+        let map = guard.get_or_insert_with(std::collections::HashMap::default);
+        if map.len() >= RIZIN_MEMO_MAX {
+            map.clear();
+        }
+        map.insert(key, result.clone());
+    }
+    result
 }
 
 /// `recover()` with the rizin binary path passed in. Production path
@@ -742,6 +777,7 @@ fn parse_json_array<T: serde::de::DeserializeOwned>(
 
 /// Raw rizin output — converted into filefacts' unified [`crate::Symbol`]
 /// view by `recover()`'s caller.
+#[derive(Clone)]
 pub(crate) struct RizinRecovery {
     imports: Vec<RawImport>,
     exports: Vec<RawExport>,
@@ -1022,7 +1058,7 @@ fn perm_to_flags(perm: Option<&str>) -> Vec<String> {
 // filefacts' public typed views (Import / Export / Function) stay independent.
 // =============================================================================
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct RawImport {
     name: String,
     libname: Option<String>,
@@ -1034,14 +1070,14 @@ struct RawImport {
     plt: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct RawExport {
     name: String,
     #[serde(default)]
     vaddr: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct RawFunction {
     name: String,
     /// Function entry address. Rizin uses `offset`; older r2 used `addr`.
@@ -1065,7 +1101,7 @@ struct RawFunction {
     callrefs: Vec<RawCallref>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct RawCallref {
     #[serde(default)]
     name: Option<String>,
@@ -1093,7 +1129,7 @@ impl RawCallref {
 /// historically deserialised. `paddr` / `vaddr` / `vsize` are
 /// optional because rizin sometimes emits a 0 for sections whose
 /// layout it couldn't fully resolve.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct RawSection {
     #[serde(default)]
     name: String,
