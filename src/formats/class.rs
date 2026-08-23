@@ -151,14 +151,15 @@ pub(super) fn extract(
     if skip_member_table(bytes, &mut pos).is_none() {
         return Ok(());
     }
-    let method_count = parse_methods(bytes, &mut pos, &cp, symbols_out).unwrap_or(0);
+    let _ = parse_methods(bytes, &mut pos, &cp, symbols_out).unwrap_or(0);
     let attrs = parse_attributes(bytes, &mut pos, &cp);
 
     // Surface external class references and methodref-resolved
     // imports. `this_class` is the class's own self-reference and
     // must not show up as an import.
     populate_imports(&cp, this_idx, symbols_out, metrics);
-    metrics.insert("class.method_count", f64::from(method_count));
+    // (`class.method_count` was a byte-identical alias of `functions.count`,
+    // which carries 60 rule references. Dropped 2026-08-22.)
 
     // Complete CONSTANT_Class name set and CONSTANT_Utf8 string table.
     // Consumers run constant-pool class/string heuristics directly off
@@ -780,7 +781,7 @@ mod tests {
         }
         assert_eq!(m.get("class.external_class_count"), Some(1.0));
         // No methods were declared by the builder.
-        assert_eq!(m.get("class.method_count"), Some(0.0));
+        assert_eq!(m.get("class.method_count"), None);
         assert_eq!(symbols.iter_kind(crate::SymbolKind::Function).count(), 0);
     }
 
@@ -963,7 +964,7 @@ mod tests {
             .collect();
         assert_eq!(funcs.len(), 1);
         assert_eq!(funcs[0], "compute");
-        assert_eq!(m.get("class.method_count"), Some(1.0));
+        assert_eq!(m.get("class.method_count"), None);
     }
 
     fn build_class_with_flags(major: u16, flags: u16) -> Vec<u8> {

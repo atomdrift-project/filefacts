@@ -371,8 +371,8 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     // historical struct field names that traits still reference.
     metrics.insert("archive.file_count", file_count as f64);
     metrics.insert("archive.directory_count", directory_count as f64);
-    metrics.insert("archive.total_uncompressed", total_uncompressed as f64);
-    metrics.insert("archive.total_compressed", total_compressed as f64);
+    metrics.insert("archive.uncompressed_size", total_uncompressed as f64);
+    metrics.insert("archive.compressed_size", total_compressed as f64);
     if total_uncompressed > 0 {
         let ratio = total_compressed as f64 / total_uncompressed as f64;
         metrics.insert("archive.compression.ratio", ratio);
@@ -1188,8 +1188,8 @@ mod tests {
             ("b", b"klmnop", CompressionMethod::Stored),
         ]);
         let (_, m) = run(&z);
-        assert_eq!(m.get("archive.total_uncompressed"), Some(16.0));
-        assert!(m.get("archive.total_compressed").unwrap() >= 16.0);
+        assert_eq!(m.get("archive.uncompressed_size"), Some(16.0));
+        assert!(m.get("archive.compressed_size").unwrap() >= 16.0);
         // Canonical nested namespace only — flat `archive.compression_ratio`
         // alias retired.
         assert!(m.get("archive.compression.ratio").is_some());
@@ -1315,8 +1315,8 @@ mod tests {
             "archive.member_count",
             "archive.file_count",
             "archive.directory_count",
-            "archive.total_uncompressed",
-            "archive.total_compressed",
+            "archive.uncompressed_size",
+            "archive.compressed_size",
             "archive.compression.ratio",
             "archive.max_filename_length",
             "archive.hidden_file_count",

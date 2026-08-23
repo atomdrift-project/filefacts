@@ -80,7 +80,7 @@ pub(super) fn extract(
     // collects comment bodies into the comment-scoped string tier.
     comment_metrics::emit(source, config.comment_style, metrics, &mut strings.comments);
 
-    extract_strings(root, source, config, strings, metrics);
+    extract_strings(root, source, config, strings);
     let imports = collect_imports(config.language, source, root, config.import_query);
     let functions = collect_query(config.language, source, root, config.function_query);
     let classes = collect_query(config.language, source, root, config.class_query);
@@ -186,9 +186,7 @@ fn extract_strings(
     source: &str,
     config: &langs::LangConfig,
     strings: &mut Strings,
-    metrics: &mut Metrics,
 ) {
-    let mut count: u64 = 0;
     let mut cursor = root.walk();
     let mut stack: Vec<Node<'_>> = vec![root];
     while let Some(node) = stack.pop() {
@@ -199,16 +197,12 @@ fn extract_strings(
                     offset: node.start_byte(),
                     ..ExtractedString::default()
                 });
-                count += 1;
             }
             continue;
         }
         for child in node.children(&mut cursor) {
             stack.push(child);
         }
-    }
-    if count > 0 {
-        metrics.insert("ast.string_literal_count", count as f64);
     }
 }
 
@@ -528,9 +522,9 @@ fn emit_text_ratios(metrics: &mut Metrics, total_lines: u32) {
     let get = |k: &str| m.get(k).unwrap_or(0.0);
 
     let functions_total = get("functions.total");
-    let strings_total = get("strings.total");
-    let identifiers_total = get("identifiers.total");
-    let identifiers_unique = get("identifiers.unique_count");
+    let strings_total = get("strings.count");
+    let identifiers_total = get("identifiers.count");
+    let identifiers_unique = get("identifiers.unique");
     let imports_total = get("imports.total");
     let functions_anonymous = get("functions.anonymous");
 
@@ -609,14 +603,14 @@ fn emit_text_ratios(metrics: &mut Metrics, total_lines: u32) {
 
     if strings_total > 0.0 {
         let encoded = get("strings.base64_candidates")
-            + get("strings.hex_strings")
-            + get("strings.url_encoded_strings");
+            + get("strings.hex")
+            + get("strings.url_encoded");
         if encoded > 0.0 {
             metrics.insert("text.encoded_string_ratio", encoded / strings_total);
         }
         let suspicious = get("strings.embedded_code_candidates")
-            + get("strings.shell_command_strings")
-            + get("strings.sql_strings");
+            + get("strings.shell")
+            + get("strings.sql");
         if suspicious > 0.0 {
             metrics.insert("text.suspicious_string_ratio", suspicious / strings_total);
         }
@@ -628,16 +622,16 @@ fn emit_text_ratios(metrics: &mut Metrics, total_lines: u32) {
         }
     }
 
-    let comments_total = get("comments.total");
+    let comments_total = get("comments.count");
     if comments_total > 0.0 {
-        let suspicious = get("comments.high_entropy_comments") + get("comments.base64_in_comments");
+        let suspicious = get("comments.high_entropy") + get("comments.base64");
         if suspicious > 0.0 {
             metrics.insert("text.suspicious_comment_ratio", suspicious / comments_total);
         }
     }
 
     if imports_total > 0.0 {
-        let dynamic = get("imports.dynamic_imports") + get("imports.conditional_imports");
+        let dynamic = get("imports.dynamic") + get("imports.conditional_imports");
         if dynamic > 0.0 {
             metrics.insert("text.dynamic_import_ratio", dynamic / imports_total);
         }
@@ -792,8 +786,8 @@ mod tests {
             })
             .collect();
         assert!(
-            parsed.metrics().get("text.total_lines").unwrap_or(0.0) > 0.0,
-            "expected text.total_lines metric to fire for {name}"
+            parsed.metrics().get("text.lines").unwrap_or(0.0) > 0.0,
+            "expected text.lines metric to fire for {name}"
         );
         (imports, functions)
     }
@@ -1065,7 +1059,7 @@ mod tests {
             "a concat chain past the cap must set ast.depth_capped"
         );
         // The chain-length metric is bounded too — it can't exceed the cap.
-        let concat = m.get("ast.string_concat_chain_max_length").unwrap_or(0.0);
+        let concat = m.get("ast.max_concat_chain").unwrap_or(0.0);
         assert!(
             concat <= f64::from(super::ast_walk::MAX_AST_DEPTH),
             "concat chain length must saturate at the cap, got {concat}"

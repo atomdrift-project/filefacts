@@ -702,25 +702,22 @@ fn run_extraction(
 }
 
 /// Emit `imports.count`, `exports.count`, `functions.count`,
-/// `calls.count`, `members.count`, `binds.count`, `identifiers.count`
+/// and `binds.count` (calls/members are covered by the byte-identical
+/// `ast.call_count`/`ast.member_count`; identifier occurrence counts come
+/// from `identifier_metrics` — `identifiers.count`/`identifiers.unique`)
 /// for whichever kinds have at least one entry.
 fn emit_symbol_kind_counts(symbols: &Symbols, metrics: &mut Metrics) {
     let mut imports = 0u64;
     let mut exports = 0u64;
     let mut functions = 0u64;
-    let mut calls = 0u64;
-    let mut members = 0u64;
     let mut binds = 0u64;
-    let mut identifiers = 0u64;
     for s in symbols {
         match s.kind() {
             SymbolKind::Import => imports += 1,
             SymbolKind::Export => exports += 1,
             SymbolKind::Function => functions += 1,
-            SymbolKind::Call => calls += 1,
-            SymbolKind::Member => members += 1,
             SymbolKind::Bind => binds += 1,
-            SymbolKind::Identifier => identifiers += 1,
+            SymbolKind::Call | SymbolKind::Member | SymbolKind::Identifier => {}
         }
     }
     if imports > 0 {
@@ -732,17 +729,8 @@ fn emit_symbol_kind_counts(symbols: &Symbols, metrics: &mut Metrics) {
     if functions > 0 {
         metrics.insert("functions.count", functions as f64);
     }
-    if calls > 0 {
-        metrics.insert("calls.count", calls as f64);
-    }
-    if members > 0 {
-        metrics.insert("members.count", members as f64);
-    }
     if binds > 0 {
         metrics.insert("binds.count", binds as f64);
-    }
-    if identifiers > 0 {
-        metrics.insert("identifiers.count", identifiers as f64);
     }
 }
 
@@ -1393,7 +1381,7 @@ mod tests {
         let bytes = b"x".repeat(256);
         let parsed = open(&bytes).unwrap();
         let m = parsed.metrics();
-        assert_eq!(m.get("file.size_bytes"), Some(256.0));
+        assert_eq!(m.get("file.size"), Some(256.0));
         assert!(m.get("file.entropy").unwrap() < 0.01);
     }
 
@@ -1438,7 +1426,7 @@ mod tests {
     /// Malformed ELF bytes (anything that starts \x7fELF but is
     /// otherwise truncated) trip goblin's parse. The error must
     /// land in the typed Errors view tagged `elf-parse` and the
-    /// generic byte-level metrics (file.size_bytes, file.entropy)
+    /// generic byte-level metrics (file.size, file.entropy)
     /// must still be present — partial data is the contract.
     #[test]
     fn malformed_elf_records_error_but_keeps_byte_metrics() {
@@ -1451,7 +1439,7 @@ mod tests {
 
         // Byte-level metrics survive even though the format parse
         // failed — generic::extract ran before format dispatch.
-        assert!(parsed.metrics().get("file.size_bytes").is_some());
+        assert!(parsed.metrics().get("file.size").is_some());
 
         // Structured error recorded.
         let errors = parsed.errors();
@@ -1476,7 +1464,7 @@ mod tests {
         let metrics = parsed.metrics();
 
         assert_eq!(parsed.fileid().file_type(), FileType::Perl);
-        assert!(metrics.get("file.size_bytes").is_some());
+        assert!(metrics.get("file.size").is_some());
         assert_eq!(metrics.get("source.ast_unavailable"), Some(1.0));
         assert_eq!(
             metrics.get("source.ast_unavailable.tree_sitter_guard"),

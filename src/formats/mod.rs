@@ -101,7 +101,7 @@ mod zip;
 
 /// Drive the right extractor for `file_type` and merge its output into
 /// the public views. Unsupported types fall through to [`generic::extract`]
-/// (which still records `file.size_bytes` and Shannon entropy).
+/// (which still records `file.size` and Shannon entropy).
 pub(crate) fn extract(
     file_type: FileType,
     bytes: &[u8],

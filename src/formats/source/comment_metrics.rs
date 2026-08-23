@@ -58,7 +58,7 @@ pub(super) fn emit(
     }
 
     let total = comments.len() as u32;
-    metrics.insert("comments.total", f64::from(total));
+    metrics.insert("comments.count", f64::from(total));
 
     let mut total_chars: u64 = 0;
     let mut comment_lines: u32 = 0;
@@ -139,22 +139,22 @@ pub(super) fn emit(
         metrics.insert("comments.xxx_count", f64::from(xxx_count));
     }
     if empty_comments > 0 {
-        metrics.insert("comments.empty_comments", f64::from(empty_comments));
+        metrics.insert("comments.empty", f64::from(empty_comments));
     }
     if high_entropy_comments > 0 {
         metrics.insert(
-            "comments.high_entropy_comments",
+            "comments.high_entropy",
             f64::from(high_entropy_comments),
         );
     }
     if code_in_comments > 0 {
-        metrics.insert("comments.code_in_comments", f64::from(code_in_comments));
+        metrics.insert("comments.code", f64::from(code_in_comments));
     }
     if url_in_comments > 0 {
         metrics.insert("comments.url_in_comments", f64::from(url_in_comments));
     }
     if base64_in_comments > 0 {
-        metrics.insert("comments.base64_in_comments", f64::from(base64_in_comments));
+        metrics.insert("comments.base64", f64::from(base64_in_comments));
     }
 }
 

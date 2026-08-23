@@ -216,13 +216,13 @@ pub(super) fn extract(
 /// Decode the PNG (cap-protected) and emit pixel-statistic metrics:
 /// dimensions, per-channel entropy, edge density, histogram flatness,
 /// compression ratio, and PNG-specific alpha entropy.
-/// `binary.overall_entropy` is the Shannon entropy of the raw file
+/// `file.entropy` is the Shannon entropy of the raw file
 /// bytes — emitted unconditionally because it's cheap and useful even
 /// when the pixel decode bails.
 fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
     use png::Decoder;
 
-    metrics.insert("binary.overall_entropy", entropy::shannon(bytes));
+    metrics.insert("file.entropy", entropy::shannon(bytes));
 
     let decoder = Decoder::new(bytes);
     let Ok(mut reader) = decoder.read_info() else {
@@ -596,8 +596,8 @@ mod tests {
         assert!(m.get("png.compression_ratio").unwrap() > 0.0);
         // No alpha channel — a_entropy stays 0.
         assert_eq!(m.get("png.a_entropy"), Some(0.0));
-        // binary.overall_entropy emitted as Shannon of raw file bytes.
-        assert!(m.get("binary.overall_entropy").unwrap() > 0.0);
+        // file.entropy emitted as Shannon of raw file bytes.
+        assert!(m.get("file.entropy").unwrap() > 0.0);
     }
 
     #[test]
@@ -632,11 +632,11 @@ mod tests {
     #[test]
     fn malformed_png_decode_still_emits_binary_entropy() {
         // Valid PNG signature + IHDR claiming a width that overruns
-        // the IDAT stream. Decode fails; binary.overall_entropy still
+        // the IDAT stream. Decode fails; file.entropy still
         // emits because it doesn't depend on the decoder.
         let ihdr = vec![0, 0, 0, 100, 0, 0, 0, 100, 8, 2, 0, 0, 0];
         let png = build_png(&[(b"IHDR", &ihdr), (b"IDAT", &[0; 4]), (b"IEND", &[])]);
         let (_, m) = run(&png);
-        assert!(m.get("binary.overall_entropy").is_some());
+        assert!(m.get("file.entropy").is_some());
     }
 }

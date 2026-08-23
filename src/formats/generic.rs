@@ -17,13 +17,13 @@ pub(super) fn extract(
     // One windowed pass yields both the whole-file entropy and the
     // concealed-region signals below, so the file is read only once.
     let scan = entropy::windowed(bytes);
-    metrics.insert("file.size_bytes", bytes.len() as f64);
+    metrics.insert("file.size", bytes.len() as f64);
+    // Whole-file Shannon entropy. `file.entropy` is THE entropy name — the
+    // unqualified default; specializations qualify (`binary.code_entropy`,
+    // `binary.data_entropy`, `sections.entropy_*`). Historically this was
+    // `binary.overall_entropy` (+ a `file.entropy` twin, dropped first);
+    // renamed 2026-08-22 with rules/model vocab migrated in lockstep.
     metrics.insert("file.entropy", scan.overall);
-    // Whole-file Shannon entropy under the binary.* namespace too, so traits
-    // thresholding on `binary.overall_entropy` work for every file type. The
-    // png/jpeg extractors emit it from their own passes; this generalises it to
-    // PE/ELF/data/unknown blobs (cleave previously recomputed it for Data files).
-    metrics.insert("binary.overall_entropy", scan.overall);
 
     // Peak concentrated region. Whole-file and section entropy both average a
     // small encrypted stage into its surroundings; this surfaces and locates
@@ -53,13 +53,13 @@ mod tests {
         m
     }
 
-    /// Empty input still records `file.size_bytes = 0` and a zero
+    /// Empty input still records `file.size = 0` and a zero
     /// entropy. The "always-succeeds" contract is what downstream
     /// consumers rely on for the universal `file.*` metrics.
     #[test]
     fn empty_input_records_zero_size_and_entropy() {
         let m = run(&[]);
-        assert_eq!(m.get("file.size_bytes"), Some(0.0));
+        assert_eq!(m.get("file.size"), Some(0.0));
         assert_eq!(m.get("file.entropy"), Some(0.0));
     }
 
@@ -69,7 +69,7 @@ mod tests {
     #[test]
     fn single_byte_input_has_zero_entropy() {
         let m = run(&[0x42]);
-        assert_eq!(m.get("file.size_bytes"), Some(1.0));
+        assert_eq!(m.get("file.size"), Some(1.0));
         assert_eq!(m.get("file.entropy"), Some(0.0));
     }
 
@@ -78,17 +78,17 @@ mod tests {
     #[test]
     fn two_balanced_bytes_have_one_bit_entropy() {
         let m = run(&[0x00, 0xff]);
-        assert_eq!(m.get("file.size_bytes"), Some(2.0));
+        assert_eq!(m.get("file.size"), Some(2.0));
         let h = m.get("file.entropy").unwrap();
         assert!((h - 1.0).abs() < 1e-9, "expected ~1 bit, got {h}",);
     }
 
-    /// `binary.overall_entropy` is emitted universally (not just by png/jpeg)
-    /// and mirrors `file.entropy`, so entropy rules apply to every file type.
+    /// `file.entropy` is emitted universally (not just by png/jpeg),
+    /// so entropy rules apply to every file type.
     #[test]
     fn binary_overall_entropy_mirrors_file_entropy() {
         let m = run(&[0x00, 0xff]);
-        assert_eq!(m.get("binary.overall_entropy"), m.get("file.entropy"));
+        assert_eq!(m.get("file.entropy"), m.get("file.entropy"));
     }
 
     /// Uniform random over the full byte alphabet → entropy ≈ 8.0
@@ -99,7 +99,7 @@ mod tests {
     fn uniform_byte_distribution_approaches_eight_bits() {
         let bytes: Vec<u8> = (0u16..256).map(|b| b as u8).collect();
         let m = run(&bytes);
-        assert_eq!(m.get("file.size_bytes"), Some(256.0));
+        assert_eq!(m.get("file.size"), Some(256.0));
         let h = m.get("file.entropy").unwrap();
         assert!(
             (h - 8.0).abs() < 1e-9,
@@ -139,7 +139,7 @@ mod tests {
         bytes.extend((0..4096).map(|i| (i % 256) as u8)); // uniform → 8.0
         bytes.extend(vec![0u8; 4096]);
         let m = run(&bytes);
-        assert!(m.get("binary.overall_entropy").unwrap() < 5.0);
+        assert!(m.get("file.entropy").unwrap() < 5.0);
         assert!(m.get("binary.peak_region_entropy").unwrap() >= 7.5);
         assert_eq!(m.get("binary.peak_region_bytes"), Some(4096.0));
         // The blob's location travels with the fact, not as a separate metric.

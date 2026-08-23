@@ -54,8 +54,8 @@ pub(super) fn emit(identifiers: &[&str], metrics: &mut Metrics) {
     let unique: HashSet<&str> = identifiers.iter().copied().collect();
     let unique_count = unique.len() as u32;
 
-    metrics.insert("identifiers.total", f64::from(total));
-    metrics.insert("identifiers.unique_count", f64::from(unique_count));
+    metrics.insert("identifiers.count", f64::from(total));
+    metrics.insert("identifiers.unique", f64::from(unique_count));
     if total > 0 {
         metrics.insert(
             "identifiers.reuse_ratio",
@@ -309,8 +309,8 @@ mod tests {
     fn basic_counts() {
         let mut m = Metrics::new();
         emit(&["foo", "bar", "baz", "foo"], &mut m);
-        assert_eq!(m.get("identifiers.total"), Some(4.0));
-        assert_eq!(m.get("identifiers.unique_count"), Some(3.0));
+        assert_eq!(m.get("identifiers.count"), Some(4.0));
+        assert_eq!(m.get("identifiers.unique"), Some(3.0));
     }
 
     #[test]

@@ -243,8 +243,8 @@ pub(super) fn extract(
     metrics.insert("archive.member_count", file_count as f64);
     metrics.insert("archive.file_count", file_count as f64);
     metrics.insert("archive.directory_count", directory_count as f64);
-    metrics.insert("archive.total_uncompressed", total_uncompressed as f64);
-    metrics.insert("archive.total_compressed", total_uncompressed as f64);
+    metrics.insert("archive.uncompressed_size", total_uncompressed as f64);
+    metrics.insert("archive.compressed_size", total_uncompressed as f64);
     metrics.insert("archive.format.regular_count", file_count as f64);
     metrics.insert("archive.max_filename_length", max_filename_length as f64);
     metrics.insert("archive.script_count", script_count as f64);

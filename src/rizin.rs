@@ -51,6 +51,15 @@ const RIZIN_MEMORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// cleave's defence: pathological inputs can produce gigabytes of
 /// JSON; we kill the process group on overflow and record the reason.
 const MAX_SUBPROCESS_OUTPUT: usize = 100 * 1024 * 1024;
+/// How long to wait for the stdout drain thread after the child is known dead
+/// before abandoning it. The drain normally returns the instant the last write
+/// handle closes; this bound exists only so a handle we cannot reach (one an
+/// unrelated process inherited through the Windows `CreateProcess` inheritance
+/// race, say) degrades to a single lost recovery instead of parking the Rayon
+/// caller — and with it every archive queued behind its memory-gate permit —
+/// forever. Generous on purpose: a drain starved by the scheduler under heavy
+/// parallel load must never be mistaken for a stuck one.
+const DRAIN_GRACE: Duration = Duration::from_secs(60);
 
 /// Full analysis plus the four JSON tables imported by [`RizinRecovery`].
 const RIZIN_METRICS_SCRIPT: &str =
@@ -92,6 +101,9 @@ static RIZIN_DISABLED: AtomicUsize = AtomicUsize::new(0);
 /// default. Lowered by latency-sensitive callers (e.g. `ascan ps`, which scans
 /// live process binaries where a multi-minute disassembly is never worth it).
 static RIZIN_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(0);
+/// Drain threads abandoned after [`DRAIN_GRACE`] (see `join_drain`). Non-zero
+/// means some process outside our reach held a copy of a rizin stdout pipe.
+static RIZIN_DRAINS_ABANDONED: AtomicU64 = AtomicU64::new(0);
 
 /// Skip rizin entirely for inputs larger than this many bytes. `0` disables the
 /// gate. Full `aaa` on a 100 MB+ stripped binary costs minutes; a size cap keeps
@@ -525,6 +537,15 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
         }
     };
     let child_id = child.id();
+    // Contain descendants on Windows the way `process_group(0)` does on Unix.
+    // Created immediately after spawn; a helper started in the window before
+    // the assignment lands would escape the job, which is what the bounded
+    // drain join below exists to survive.
+    #[cfg(windows)]
+    let job = {
+        use std::os::windows::io::AsRawHandle;
+        win_job::Job::containing(child.as_raw_handle().cast())
+    };
     register_pgid(child_id as i32);
     let _pgid_guard = PgidGuard(child_id as i32);
     let output_cap_hit = Arc::new(AtomicBool::new(false));
@@ -555,7 +576,11 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
     // give up and treat the (still-pending) output as empty. The
     // join can't deadlock because the child is already known to have
     // exited by the time we join.
-    let drain = std::thread::spawn(move || {
+    // The buffer comes back over a channel rather than a `JoinHandle` so the
+    // wait can be bounded (see `join_drain`); the handle itself is dropped,
+    // detaching the thread.
+    let (drain_tx, drain_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+    std::thread::spawn(move || {
         use std::io::Read;
         let mut buf = Vec::new();
         let n = (&mut stdout_handle)
@@ -565,7 +590,7 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
         if n >= MAX_SUBPROCESS_OUTPUT {
             mark_output_cap_hit(&cap_flag, child_id);
         }
-        buf
+        let _ = drain_tx.send(buf);
     });
 
     // Poll until the configured duration has elapsed. Comparing elapsed time
@@ -584,7 +609,11 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
             Err(_) => {
                 RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
                 terminate_child(&mut child, child_id);
-                let _ = drain.join();
+                #[cfg(windows)]
+                if let Some(job) = &job {
+                    job.terminate();
+                }
+                let _ = join_drain(&drain_rx, child_id);
                 return None;
             }
         }
@@ -599,10 +628,15 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
                 "rizin recover: end (timed out)"
             );
             terminate_child(&mut child, child_id);
-            // Killing the whole group closes every inherited copy of stdout.
-            // Join before returning so a timed-out analysis cannot leave a
-            // detached drain thread behind after its Rayon caller is released.
-            let _ = drain.join();
+            // Killing the whole group (Unix) / job (Windows) closes every
+            // inherited copy of stdout. Wait — bounded — before returning so a
+            // timed-out analysis does not leave a reader behind holding output
+            // its Rayon caller has already been released from.
+            #[cfg(windows)]
+            if let Some(job) = &job {
+                job.terminate();
+            }
+            let _ = join_drain(&drain_rx, child_id);
             return None;
         }
     };
@@ -612,9 +646,17 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
     // retain this Rayon caller indefinitely. This is harmless when the group is
     // already empty.
     kill_process_group(child_id);
-    // Join on every exit-status path—not only success—so a crashing Rizin cannot
-    // leak a detached reader thread.
-    let stdout_bytes = drain.join().unwrap_or_default();
+    // Same on Windows, where `kill_process_group` is a no-op: the job outlives
+    // the reaped leader and is addressed by handle, so terminating it here is
+    // both safe (no pid to recycle) and necessary (this is the path a shim that
+    // backgrounds a helper and exits takes).
+    #[cfg(windows)]
+    if let Some(job) = &job {
+        job.terminate();
+    }
+    // Wait on every exit-status path—not only success—so a crashing Rizin
+    // cannot leave a reader holding a pipe after its caller moves on.
+    let stdout_bytes = join_drain(&drain_rx, child_id);
     let cap_hit = output_cap_hit.load(Ordering::Acquire);
     if cap_hit {
         RIZIN_MEMORY_EXCEEDED.fetch_add(1, Ordering::Relaxed);
@@ -684,6 +726,143 @@ fn apply_unix_hardening(_: &mut Command) {}
 
 /// SIGKILL a process group. Used by the reader thread on output-cap
 /// overflow and by the timeout cleanup path. No-op on non-Unix.
+/// Windows analogue of the Unix private process group: a Job Object holding
+/// the rizin leader and everything it spawns.
+///
+/// Unix hardening puts rizin in its own process group so a single `kill(-pgid)`
+/// reaps descendants; without an equivalent, a helper that inherited rizin's
+/// stdout keeps the pipe's write end open after the leader exits, `read_to_end`
+/// never returns, and the Rayon worker blocked on the drain join is retained
+/// indefinitely — holding its scan memory-gate permit and stalling every
+/// archive queued behind it. `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` also makes
+/// the cleanup unconditional: whatever is still in the job dies when the handle
+/// closes, including on a panic unwind.
+///
+/// Addressing the job (not a pid) is what makes this safe to use *after* the
+/// leader has been reaped — a pid can be recycled the moment it is waited on,
+/// a job handle cannot.
+#[cfg(windows)]
+#[allow(unsafe_code)] // FFI to kernel32 job-object APIs; each call site documents its invariants.
+mod win_job {
+    use std::ffi::c_void;
+
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+    /// `JobObjectExtendedLimitInformation`
+    const EXTENDED_LIMIT_INFORMATION: i32 = 9;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct IoCounters {
+        read_ops: u64,
+        write_ops: u64,
+        other_ops: u64,
+        read_bytes: u64,
+        write_bytes: u64,
+        other_bytes: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct BasicLimitInformation {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ExtendedLimitInformation {
+        basic: BasicLimitInformation,
+        io: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateJobObjectW(attrs: *mut c_void, name: *const u16) -> *mut c_void;
+        fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+        fn SetInformationJobObject(
+            job: *mut c_void,
+            class: i32,
+            info: *mut c_void,
+            len: u32,
+        ) -> i32;
+        fn TerminateJobObject(job: *mut c_void, exit_code: u32) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    /// An owned job handle. Dropping it kills any process still inside.
+    pub(super) struct Job(*mut c_void);
+
+    // SAFETY: a job handle is a kernel object usable from any thread; the
+    // wrapper only ever passes it back to the Win32 calls above.
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    impl Job {
+        /// Create a kill-on-close job and put `process` in it. `None` when any
+        /// step fails — the caller then behaves exactly as before this existed
+        /// (bounded drain join is the backstop), never worse.
+        pub(super) fn containing(process: *mut c_void) -> Option<Self> {
+            // SAFETY: null attributes/name request an unnamed default job;
+            // the returned handle is checked before use and owned by `Job`.
+            let job = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+            if job.is_null() {
+                return None;
+            }
+            let job = Self(job);
+            let mut info = ExtendedLimitInformation::default();
+            info.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let len = u32::try_from(size_of::<ExtendedLimitInformation>()).unwrap_or(0);
+            // SAFETY: `info` is a correctly-shaped, fully-initialised
+            // JOBOBJECT_EXTENDED_LIMIT_INFORMATION and `len` is its size.
+            let set = unsafe {
+                SetInformationJobObject(
+                    job.0,
+                    EXTENDED_LIMIT_INFORMATION,
+                    std::ptr::from_mut(&mut info).cast(),
+                    len,
+                )
+            };
+            // SAFETY: both handles are live; failure is reported, not ignored.
+            let assigned = unsafe { AssignProcessToJobObject(job.0, process) };
+            if set == 0 || assigned == 0 {
+                return None;
+            }
+            Some(job)
+        }
+
+        /// Kill every process still in the job. Idempotent and safe to call
+        /// after the leader has exited — the job, not a recyclable pid, is
+        /// what is addressed.
+        pub(super) fn terminate(&self) {
+            // SAFETY: `self.0` is a live job handle owned by this value.
+            unsafe {
+                TerminateJobObject(self.0, 1);
+            }
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: closes the handle exactly once; kill-on-close then
+            // reaps anything still inside.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
 fn kill_process_group(child_id: u32) {
     #[cfg(unix)]
     // SAFETY: libc::kill with negative pid targets the process group.
@@ -719,6 +898,33 @@ fn mark_output_cap_hit(flag: &Arc<AtomicBool>, child_id: u32) {
         "rizin output cap exceeded; killing process group"
     );
     kill_process_group(child_id);
+}
+
+/// Wait for the stdout drain thread, bounded by [`DRAIN_GRACE`].
+///
+/// The reader returns as soon as the last copy of the pipe's write end closes.
+/// Containment (Unix process group / Windows job) closes the copies we know
+/// about; this bound covers the ones we cannot reach — most plausibly a handle
+/// another process inherited through the Windows `CreateProcess` handle race —
+/// so the worst case is one binary analysed without rizin facts plus a leaked
+/// reader thread, never a wedged scan. The thread is deliberately detached
+/// rather than joined on expiry: it owns the blocked read, and there is no
+/// portable way to cancel it.
+fn join_drain(rx: &std::sync::mpsc::Receiver<Vec<u8>>, child_id: u32) -> Vec<u8> {
+    match rx.recv_timeout(DRAIN_GRACE) {
+        Ok(buf) => buf,
+        Err(_) => {
+            RIZIN_DRAINS_ABANDONED.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                pid = child_id,
+                grace_s = DRAIN_GRACE.as_secs(),
+                "rizin stdout still held open after its process tree exited; \
+                 abandoning the reader (a process outside our containment \
+                 inherited the pipe). Recovery facts for this binary are lost."
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Split rizin's combined stdout (four `===SEP===`-delimited blocks)
@@ -949,7 +1155,7 @@ impl RizinRecovery {
                     "binary.avg_basic_blocks",
                     sum as f64 / bb_values.len() as f64,
                 );
-                metrics.insert("binary.total_basic_blocks", sum as f64);
+                metrics.insert("binary.basic_blocks", sum as f64);
             }
 
             // Function-shape bucket counts. Detection traits target the
@@ -1422,7 +1628,7 @@ mod tests {
         assert_eq!(metrics.get("binary.avg_complexity"), Some(5.0));
         assert_eq!(metrics.get("binary.max_complexity"), Some(5.0));
         assert_eq!(metrics.get("binary.avg_basic_blocks"), Some(10.0));
-        assert_eq!(metrics.get("binary.total_basic_blocks"), Some(10.0));
+        assert_eq!(metrics.get("binary.basic_blocks"), Some(10.0));
     }
 
     #[test]
@@ -1536,7 +1742,7 @@ mod tests {
         assert_eq!(metrics.get("binary.avg_complexity"), Some(3.0));
         assert_eq!(metrics.get("binary.max_complexity"), Some(5.0));
         assert_eq!(metrics.get("binary.avg_basic_blocks"), Some(4.0));
-        assert_eq!(metrics.get("binary.total_basic_blocks"), Some(12.0));
+        assert_eq!(metrics.get("binary.basic_blocks"), Some(12.0));
     }
 
     #[test]
@@ -1756,7 +1962,7 @@ mod tests {
     /// Process-unique counter for shim scratch dirs. The previous
     /// `pid + subsec_nanos` scheme raced when three tests staged dirs
     /// inside the same nanosecond window under parallel execution.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn unique_shim_dir(prefix: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1980,6 +2186,57 @@ mod tests {
         let exists = unsafe { libc::kill(descendant, 0) } == 0
             || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
         assert!(!exists, "Rizin descendant survived its leader's exit");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows counterpart of the `descendant_*` tests: a shim that
+    /// backgrounds a helper which inherits stdout and then exits must not
+    /// retain its Rayon caller.
+    ///
+    /// This is the shape behind a whole-scan stall observed 2026-08-22 — every
+    /// archive queued on the scan memory gate while the permit holder sat at
+    /// 0% CPU. The leader is reaped, but `read_to_end` cannot return while a
+    /// descendant holds the pipe's write end, and the drain join was unbounded.
+    /// Unix contains this with a private process group; until the job object in
+    /// `win_job`, Windows had neither the containment nor this coverage.
+    #[test]
+    #[cfg(windows)]
+    fn windows_descendant_holding_stdout_does_not_retain_worker() {
+        let _lock = rizin_test_lock();
+
+        const HELPER_SECS: u64 = 20;
+        let dir = unique_shim_dir("filefacts-rizin-winshim");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("rizin.cmd");
+        let marker = dir.join("shim-ran.txt");
+
+        // `start /b` hands the helper an inherited copy of stdout and does not
+        // wait for it, so the leader exits while the pipe stays open.
+        let script = [
+            "@echo off".to_string(),
+            format!("echo ran > \"{}\"", marker.display()),
+            format!(
+                "start /b \"\" powershell -NoProfile -Command \"Start-Sleep -Seconds {HELPER_SECS}\""
+            ),
+            "exit 1".to_string(),
+        ]
+        .join("\r\n");
+        std::fs::write(&shim, script).unwrap();
+
+        let started = std::time::Instant::now();
+        let rec = recover_with_bin_for_test(&shim, b"windows descendant fixture");
+        let elapsed = started.elapsed();
+
+        assert!(
+            marker.exists(),
+            "shim never executed — the assertions below would be vacuous"
+        );
+        assert!(rec.is_none(), "failed Rizin must not emit partial facts");
+        assert!(
+            elapsed < Duration::from_secs(HELPER_SECS / 2),
+            "descendant holding stdout retained the worker for {elapsed:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

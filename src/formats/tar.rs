@@ -285,7 +285,7 @@ pub(super) fn extract(
     metrics.insert("archive.member_count", member_count as f64);
     metrics.insert("archive.file_count", file_count as f64);
     metrics.insert("archive.directory_count", directory_count as f64);
-    metrics.insert("archive.total_uncompressed", total_uncompressed as f64);
+    metrics.insert("archive.uncompressed_size", total_uncompressed as f64);
     for (t, c) in &entry_type_counts {
         metrics.insert(
             format!("archive.format.{}_count", t.replace('-', "_")),
@@ -673,7 +673,7 @@ mod tests {
         ]);
         let (_, m) = run(&tar);
         assert_eq!(m.get("archive.file_count"), Some(2.0));
-        assert_eq!(m.get("archive.total_uncompressed"), Some(10.0));
+        assert_eq!(m.get("archive.uncompressed_size"), Some(10.0));
     }
 
     #[test]

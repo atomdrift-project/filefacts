@@ -55,7 +55,6 @@ pub(super) fn emit(imports: &[&str], language: &str, metrics: &mut Metrics) {
         }
     }
 
-    metrics.insert("imports.unique_modules", unique_modules.len() as f64);
     if stdlib_count > 0 {
         metrics.insert("imports.stdlib_count", f64::from(stdlib_count));
     }
@@ -63,16 +62,16 @@ pub(super) fn emit(imports: &[&str], language: &str, metrics: &mut Metrics) {
         metrics.insert("imports.third_party_count", f64::from(third_party_count));
     }
     if relative_count > 0 {
-        metrics.insert("imports.relative_imports", f64::from(relative_count));
+        metrics.insert("imports.relative", f64::from(relative_count));
     }
     if dynamic_count > 0 {
-        metrics.insert("imports.dynamic_imports", f64::from(dynamic_count));
+        metrics.insert("imports.dynamic", f64::from(dynamic_count));
     }
     if wildcard_count > 0 {
-        metrics.insert("imports.wildcard_imports", f64::from(wildcard_count));
+        metrics.insert("imports.wildcard", f64::from(wildcard_count));
     }
     if aliased_count > 0 {
-        metrics.insert("imports.aliased_imports", f64::from(aliased_count));
+        metrics.insert("imports.aliased", f64::from(aliased_count));
     }
     let total_f = f64::from(total);
     if total_f > 0.0 {

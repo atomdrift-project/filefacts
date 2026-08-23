@@ -43,7 +43,6 @@ fn emit_byte_metrics(bytes: &[u8], metrics: &mut Metrics) {
     let mut non_ascii = 0usize;
     let mut non_printable = 0usize;
     let mut null_count = 0u32;
-    let mut high_byte = 0usize;
 
     for &b in bytes {
         freq[b as usize] += 1;
@@ -52,7 +51,6 @@ fn emit_byte_metrics(bytes: &[u8], metrics: &mut Metrics) {
         }
         if b > 127 {
             non_ascii += 1;
-            high_byte += 1;
         }
         if (b < 32 && b != 9 && b != 10 && b != 13) || b == 127 {
             non_printable += 1;
@@ -81,14 +79,14 @@ fn emit_byte_metrics(bytes: &[u8], metrics: &mut Metrics) {
         metrics.insert("text.unique_chars", f64::from(unique_chars));
     }
     if let Some(c) = most_common {
-        metrics.insert("text.most_common_char_codepoint", f64::from(c));
+        metrics.insert("text.top_char", f64::from(c));
         metrics.insert(
-            "text.most_common_char_is_null",
+            "text.top_char_null",
             if c == 0 { 1.0 } else { 0.0 },
         );
     }
     if most_common_ratio > 0.0 {
-        metrics.insert("text.most_common_ratio", most_common_ratio);
+        metrics.insert("text.top_char_ratio", most_common_ratio);
     }
     if non_ascii > 0 {
         metrics.insert("text.non_ascii_ratio", non_ascii as f64 / total as f64);
@@ -101,9 +99,6 @@ fn emit_byte_metrics(bytes: &[u8], metrics: &mut Metrics) {
     }
     if null_count > 0 {
         metrics.insert("text.null_byte_count", f64::from(null_count));
-    }
-    if high_byte > 0 {
-        metrics.insert("text.high_byte_ratio", high_byte as f64 / total as f64);
     }
 }
 
@@ -176,7 +171,7 @@ fn emit_line_metrics(content: &str, metrics: &mut Metrics) {
         return;
     }
 
-    metrics.insert("text.total_lines", f64::from(total_lines));
+    metrics.insert("text.lines", f64::from(total_lines));
     metrics.insert("text.avg_line_length", mean);
     // Locate the longest line (minified/obfuscated payload tell). Isolated pass
     // so the metric loop above is untouched; `split_inclusive('\n')` plus the
@@ -223,7 +218,7 @@ fn emit_line_metrics(content: &str, metrics: &mut Metrics) {
     }
     if max_inline_whitespace_run > 0 {
         metrics.insert(
-            "text.max_inline_whitespace_run",
+            "text.max_ws_run",
             f64::from(max_inline_whitespace_run),
         );
     }
@@ -557,7 +552,7 @@ mod tests {
     #[test]
     fn simple_content_emits_line_count_and_entropy() {
         let m = run("hello world\n");
-        assert_eq!(m.get("text.total_lines"), Some(1.0));
+        assert_eq!(m.get("text.lines"), Some(1.0));
         assert!(m.get("text.char_entropy").unwrap_or(0.0) > 0.0);
     }
 
@@ -594,11 +589,11 @@ mod tests {
     fn max_inline_whitespace_run_detects_payload_padding() {
         let padded = format!("export default config;{}global['!']=1;", " ".repeat(500));
         let m = run(&padded);
-        assert_eq!(m.get("text.max_inline_whitespace_run"), Some(500.0));
+        assert_eq!(m.get("text.max_ws_run"), Some(500.0));
 
         // Leading indent should not count.
         let indented = format!("{}function foo() {{}}", " ".repeat(200));
         let m = run(&indented);
-        assert_eq!(m.get("text.max_inline_whitespace_run"), Some(1.0));
+        assert_eq!(m.get("text.max_ws_run"), Some(1.0));
     }
 }

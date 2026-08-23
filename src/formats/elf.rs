@@ -842,7 +842,7 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
     // ET_EXEC / ET_DYN.
     let stack_section_absent = !has_gnu_stack && elf.header.e_type != header::ET_REL;
     metrics.insert(
-        "elf.gnu_stack_section_absent",
+        "elf.no_gnu_stack",
         f64::from(u8::from(stack_section_absent)),
     );
 
@@ -1371,7 +1371,7 @@ fn stripped_metadata(elf: &Elf<'_>, values: &mut Values, metrics: &mut Metrics) 
     let symtab_present = present.contains(".symtab");
     let debug_or_comment_gone = !present.contains(".comment") || !present.contains(".debug_info");
     metrics.insert(
-        "elf.stripped_but_symtab_present",
+        "elf.stripped_with_symtab",
         f64::from(u8::from(symtab_present && debug_or_comment_gone)),
     );
 }

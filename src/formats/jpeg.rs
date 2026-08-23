@@ -193,7 +193,7 @@ pub(super) fn extract(
 
 /// Decode the JPEG (cap-protected) and emit pixel-statistic metrics:
 /// dimensions, per-channel entropy, edge density, histogram flatness.
-/// `binary.overall_entropy` is the Shannon entropy of the raw file
+/// `file.entropy` is the Shannon entropy of the raw file
 /// bytes — emitted unconditionally because it's cheap and useful even
 /// when the pixel decode bails.
 fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
@@ -202,7 +202,7 @@ fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
 
     // Always emit overall-file entropy — trait engines threshold on
     // this for encrypted/compressed payload detection.
-    metrics.insert("binary.overall_entropy", entropy::shannon(bytes));
+    metrics.insert("file.entropy", entropy::shannon(bytes));
 
     let mut decoder = Decoder::new(Cursor::new(bytes));
     if decoder.read_info().is_err() {
@@ -601,7 +601,7 @@ mod tests {
     fn emits_binary_overall_entropy() {
         let jpeg = build_jpeg(&[(0xFE, b"hello".to_vec())]);
         let (_, m) = run(&jpeg);
-        assert!(m.get("binary.overall_entropy").is_some());
+        assert!(m.get("file.entropy").is_some());
     }
 
     #[test]
@@ -609,7 +609,7 @@ mod tests {
         // Bytes that pass the SOI check but aren't decodable.
         let bytes = vec![0xFF, 0xD8, 0xFF, 0xD9];
         let (_, m) = run(&bytes);
-        assert!(m.get("binary.overall_entropy").is_some());
+        assert!(m.get("file.entropy").is_some());
     }
 
     #[test]

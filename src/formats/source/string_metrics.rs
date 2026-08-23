@@ -17,7 +17,7 @@ pub(super) fn emit(strings: &[&str], metrics: &mut Metrics) {
     }
 
     let total = strings.len() as u32;
-    metrics.insert("strings.total", f64::from(total));
+    metrics.insert("strings.count", f64::from(total));
 
     let mut total_bytes: u64 = 0;
     let mut max_length: u32 = 0;
@@ -106,7 +106,7 @@ pub(super) fn emit(strings: &[&str], metrics: &mut Metrics) {
     }
 
     if total_bytes > 0 {
-        metrics.insert("strings.total_bytes", total_bytes as f64);
+        metrics.insert("strings.bytes", total_bytes as f64);
         metrics.insert("strings.avg_length", total_bytes as f64 / f64::from(total));
     }
     if max_length > 0 {
@@ -147,14 +147,14 @@ pub(super) fn emit(strings: &[&str], metrics: &mut Metrics) {
         metrics.insert("strings.base64_candidates", f64::from(base64_count));
     }
     if hex_count > 0 {
-        metrics.insert("strings.hex_strings", f64::from(hex_count));
+        metrics.insert("strings.hex", f64::from(hex_count));
     }
     if url_encoded_count > 0 {
-        metrics.insert("strings.url_encoded_strings", f64::from(url_encoded_count));
+        metrics.insert("strings.url_encoded", f64::from(url_encoded_count));
     }
     if unicode_heavy_count > 0 {
         metrics.insert(
-            "strings.unicode_heavy_strings",
+            "strings.unicode_heavy",
             f64::from(unicode_heavy_count),
         );
     }
@@ -174,7 +174,7 @@ pub(super) fn emit(strings: &[&str], metrics: &mut Metrics) {
         metrics.insert("strings.domain_count", f64::from(domain_count));
     }
     if very_long_count > 0 {
-        metrics.insert("strings.very_long_strings", f64::from(very_long_count));
+        metrics.insert("strings.very_long", f64::from(very_long_count));
     }
     if embedded_code_count > 0 {
         metrics.insert(
@@ -184,12 +184,12 @@ pub(super) fn emit(strings: &[&str], metrics: &mut Metrics) {
     }
     if shell_command_count > 0 {
         metrics.insert(
-            "strings.shell_command_strings",
+            "strings.shell",
             f64::from(shell_command_count),
         );
     }
     if sql_count > 0 {
-        metrics.insert("strings.sql_strings", f64::from(sql_count));
+        metrics.insert("strings.sql", f64::from(sql_count));
     }
 }
 
@@ -428,7 +428,7 @@ mod tests {
     fn basic_counts_and_lengths() {
         let mut m = Metrics::new();
         emit(&["hello", "world", "test"], &mut m);
-        assert_eq!(m.get("strings.total"), Some(3.0));
+        assert_eq!(m.get("strings.count"), Some(3.0));
         assert!(m.get("strings.avg_length").unwrap_or(0.0) > 0.0);
     }
 
@@ -467,6 +467,6 @@ mod tests {
             ],
             &mut m,
         );
-        assert_eq!(m.get("strings.shell_command_strings"), Some(2.0));
+        assert_eq!(m.get("strings.shell"), Some(2.0));
     }
 }

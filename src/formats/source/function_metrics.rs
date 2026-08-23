@@ -278,7 +278,7 @@ fn emit_metrics(functions: &[FunctionInfo], total_lines: u32, metrics: &mut Metr
         metrics.insert("functions.anonymous", f64::from(anonymous));
     }
     if nested_functions > 0 {
-        metrics.insert("functions.nested_functions", f64::from(nested_functions));
+        metrics.insert("functions.nested", f64::from(nested_functions));
     }
     if over_100 > 0 {
         metrics.insert("functions.over_100_lines", f64::from(over_100));
@@ -381,11 +381,11 @@ fn emit_metrics(functions: &[FunctionInfo], total_lines: u32, metrics: &mut Metr
 
     if total_lines > 0 {
         metrics.insert(
-            "functions.density_per_100_lines",
+            "functions.density",
             (f64::from(total) / f64::from(total_lines)) * 100.0,
         );
         metrics.insert(
-            "functions.code_in_functions_ratio",
+            "functions.code_ratio",
             f64::from(total_lines_in_functions) / f64::from(total_lines),
         );
     }

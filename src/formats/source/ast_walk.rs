@@ -98,30 +98,28 @@ pub(super) fn walk(
     }
     if state.max_string_concat_chain > 1 {
         metrics.insert(
-            "ast.string_concat_chain_max_length",
+            "ast.max_concat_chain",
             f64::from(state.max_string_concat_chain),
         );
     }
     if state.max_array_literal_length > 0 {
         metrics.insert(
-            "ast.array_literal_max_length",
+            "ast.max_array_len",
             f64::from(state.max_array_literal_length),
         );
     }
     if state.max_numeric_array_length > 0 {
         metrics.insert(
-            "ast.numeric_array_max_length",
+            "ast.max_numeric_array",
             f64::from(state.max_numeric_array_length),
         );
     }
     if bind_count > 0 {
-        metrics.insert("ast.bind_count", bind_count as f64);
     }
     if member_count > 0 {
         metrics.insert("ast.member_count", member_count as f64);
     }
     if identifier_count > 0 {
-        metrics.insert("ast.identifier_count", identifier_count as f64);
     }
     // Per-operator counts: `ast.op.<name>` (e.g. `ast.op.xor`). Raw integer
     // counts keyed by the canonical operator name; matched O(1) via
@@ -176,7 +174,7 @@ pub(super) fn walk(
     }
     if state.max_numeric_sequence_length > 0 {
         metrics.insert(
-            "ast.numeric_sequence_max_length",
+            "ast.max_numeric_seq",
             f64::from(state.max_numeric_sequence_length),
         );
     }
@@ -529,7 +527,7 @@ struct State {
     max_member_chain_depth: u32,
     max_string_concat_chain: u32,
     max_array_literal_length: u32,
-    /// Max length of an all-numeric-literal array (`ast.numeric_array_max_length`).
+    /// Max length of an all-numeric-literal array (`ast.max_numeric_array`).
     max_numeric_array_length: u32,
     /// Count of statement-level comma sequences (`a, b, c;`) — a density
     /// signal for comma-sequence obfuscation (`ast.sequence_expression_count`).
@@ -546,7 +544,7 @@ struct State {
     /// rolling-XOR decode shape `data[i] ^ key[i % n]` (`ast.xor_mod_loop_count`).
     xor_mod_loop_count: u32,
     /// Max count of numeric literals in a comma `sequence_expression`
-    /// (`(1, 2, 3)`) — comma-constant obfuscation (`ast.numeric_sequence_max_length`).
+    /// (`(1, 2, 3)`) — comma-constant obfuscation (`ast.max_numeric_seq`).
     max_numeric_sequence_length: u32,
     /// Count of parameterless functions whose body is a single
     /// `return <literal>` — dead-code / opaque padding helpers
@@ -618,7 +616,7 @@ impl State {
             // Numeric-array length: arrays whose elements are *all* numeric
             // literals — the byte-packing obfuscation shape (`[112,97,121,...]`),
             // distinct from a generic long array of mixed/string data. Lets
-            // `ast.numeric_array_max_length` keep that specificity that a plain
+            // `ast.max_numeric_array` keep that specificity that a plain
             // array-length metric would lose.
             if len >= 2 {
                 let mut cur = node.walk();
@@ -1143,7 +1141,7 @@ fn string_concat_chain_length(node: Node<'_>, config: &LangConfig) -> u32 {
         // A `+` chain of N terms nests N deep; stop at the shared cap so a
         // pathological `a+b+c+…` (thousands of terms) can't overflow the stack
         // before `walk_node`'s guard returns. The length saturates, which is
-        // all `ast.string_concat_chain_max_length` needs.
+        // all `ast.max_concat_chain` needs.
         if depth >= MAX_AST_DEPTH {
             return;
         }
