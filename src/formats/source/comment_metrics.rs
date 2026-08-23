@@ -142,10 +142,7 @@ pub(super) fn emit(
         metrics.insert("comments.empty", f64::from(empty_comments));
     }
     if high_entropy_comments > 0 {
-        metrics.insert(
-            "comments.high_entropy",
-            f64::from(high_entropy_comments),
-        );
+        metrics.insert("comments.high_entropy", f64::from(high_entropy_comments));
     }
     if code_in_comments > 0 {
         metrics.insert("comments.code", f64::from(code_in_comments));

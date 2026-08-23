@@ -82,7 +82,7 @@ fn json_manifest_parses_once_through_all_views() {
         0,
         "JSON manifests do not emit ASCII runs in v1"
     );
-    assert!(metrics.get("file.size_bytes").unwrap() > 0.0);
+    assert!(metrics.get("file.size").unwrap() > 0.0);
 
     assert_eq!(
         parsed.parse_count(),
@@ -206,9 +206,9 @@ fn zip_archive_emits_member_listing_and_aggregates() {
 fn empty_input_classifies_and_exposes_metrics() {
     let parsed = open(&[]).unwrap();
     // An empty byte slice has no meaningful format; we still expose
-    // file.size_bytes and file.entropy so downstream consumers can
+    // file.size and file.entropy so downstream consumers can
     // observe the degenerate case uniformly.
-    assert_eq!(parsed.metrics().get("file.size_bytes"), Some(0.0));
+    assert_eq!(parsed.metrics().get("file.size"), Some(0.0));
     assert_eq!(parsed.metrics().get("file.entropy"), Some(0.0));
     assert_eq!(parsed.parse_count(), 1);
 }
@@ -485,8 +485,8 @@ fn ast_metrics_mirror_ast_paths() {
     let parsed = open_with_path(std::path::Path::new("x.js"), source).unwrap();
     let m = parsed.metrics();
     assert!(m.get("ast.node_count").unwrap_or(0.0) > 0.0);
-    assert_eq!(m.get("ast.array_literal_max_length"), Some(12.0));
-    assert_eq!(m.get("ast.string_concat_chain_max_length"), Some(4.0));
+    assert_eq!(m.get("ast.max_array_len"), Some(12.0));
+    assert_eq!(m.get("ast.max_concat_chain"), Some(4.0));
 }
 
 #[test]
@@ -514,7 +514,7 @@ fn unrecognised_bytes_still_extract_generic_metrics() {
     let bytes = vec![0xaa_u8; 4096];
     let parsed = open(&bytes).unwrap();
     let m = parsed.metrics();
-    assert_eq!(m.get("file.size_bytes"), Some(4096.0));
+    assert_eq!(m.get("file.size"), Some(4096.0));
     // A single repeated byte has zero entropy.
     assert!(m.get("file.entropy").unwrap().abs() < 1e-9);
     assert_eq!(parsed.parse_count(), 1);
@@ -786,7 +786,7 @@ fn numeric_array_max_length_metric() {
     let py = b"a = [112, 97, 121, 108, 111, 97, 100]\nb = ['x','y','z']\n";
     let p = open_with_path(std::path::Path::new("n.py"), py).unwrap();
     assert_eq!(
-        p.metrics().get("ast.numeric_array_max_length"),
+        p.metrics().get("ast.max_numeric_array"),
         Some(7.0),
         "the 7-int array counts; the string array does not"
     );
@@ -797,10 +797,7 @@ fn numeric_sequence_max_length_metric() {
     // JS comma sequence of numeric literals (comma-constant obfuscation).
     let js = b"var x = (1, 2, 3, 4, 5);\n";
     let p = open_with_path(std::path::Path::new("s.js"), js).unwrap();
-    assert_eq!(
-        p.metrics().get("ast.numeric_sequence_max_length"),
-        Some(5.0)
-    );
+    assert_eq!(p.metrics().get("ast.max_numeric_seq"), Some(5.0));
 }
 
 #[test]

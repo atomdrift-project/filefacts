@@ -80,10 +80,7 @@ fn emit_byte_metrics(bytes: &[u8], metrics: &mut Metrics) {
     }
     if let Some(c) = most_common {
         metrics.insert("text.top_char", f64::from(c));
-        metrics.insert(
-            "text.top_char_null",
-            if c == 0 { 1.0 } else { 0.0 },
-        );
+        metrics.insert("text.top_char_null", if c == 0 { 1.0 } else { 0.0 });
     }
     if most_common_ratio > 0.0 {
         metrics.insert("text.top_char_ratio", most_common_ratio);
@@ -217,10 +214,7 @@ fn emit_line_metrics(content: &str, metrics: &mut Metrics) {
         );
     }
     if max_inline_whitespace_run > 0 {
-        metrics.insert(
-            "text.max_ws_run",
-            f64::from(max_inline_whitespace_run),
-        );
+        metrics.insert("text.max_ws_run", f64::from(max_inline_whitespace_run));
     }
     if ascii_art_lines > 0 {
         metrics.insert("text.ascii_art_lines", f64::from(ascii_art_lines));

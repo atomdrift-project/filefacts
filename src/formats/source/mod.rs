@@ -602,15 +602,13 @@ fn emit_text_ratios(metrics: &mut Metrics, total_lines: u32) {
     }
 
     if strings_total > 0.0 {
-        let encoded = get("strings.base64_candidates")
-            + get("strings.hex")
-            + get("strings.url_encoded");
+        let encoded =
+            get("strings.base64_candidates") + get("strings.hex") + get("strings.url_encoded");
         if encoded > 0.0 {
             metrics.insert("text.encoded_string_ratio", encoded / strings_total);
         }
-        let suspicious = get("strings.embedded_code_candidates")
-            + get("strings.shell")
-            + get("strings.sql");
+        let suspicious =
+            get("strings.embedded_code_candidates") + get("strings.shell") + get("strings.sql");
         if suspicious > 0.0 {
             metrics.insert("text.suspicious_string_ratio", suspicious / strings_total);
         }

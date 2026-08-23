@@ -45,7 +45,6 @@ pub(super) fn walk(
 
     // Drain the per-symbol-kind buffers into the unified Symbols view.
     let call_count = state.calls.len() as u64;
-    let bind_count = state.binds.len() as u64;
     let member_count = state.members.len() as u64;
     // Classify each call's command-name target (obfuscated vs dynamic) before
     // the buffer is drained into `symbols_out`.
@@ -62,7 +61,6 @@ pub(super) fn walk(
             offset: Some(offset),
         });
     }
-    let identifier_count = state.identifiers.len() as u64;
     for (name, offset) in state.identifiers {
         symbols_out.push(Symbol::Identifier {
             name,
@@ -114,13 +112,11 @@ pub(super) fn walk(
             f64::from(state.max_numeric_array_length),
         );
     }
-    if bind_count > 0 {
-    }
+
     if member_count > 0 {
         metrics.insert("ast.member_count", member_count as f64);
     }
-    if identifier_count > 0 {
-    }
+
     // Per-operator counts: `ast.op.<name>` (e.g. `ast.op.xor`). Raw integer
     // counts keyed by the canonical operator name; matched O(1) via
     // `type: metrics, field: 'ast.op.xor', min: N`.

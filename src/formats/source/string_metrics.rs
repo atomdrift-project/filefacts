@@ -153,10 +153,7 @@ pub(super) fn emit(strings: &[&str], metrics: &mut Metrics) {
         metrics.insert("strings.url_encoded", f64::from(url_encoded_count));
     }
     if unicode_heavy_count > 0 {
-        metrics.insert(
-            "strings.unicode_heavy",
-            f64::from(unicode_heavy_count),
-        );
+        metrics.insert("strings.unicode_heavy", f64::from(unicode_heavy_count));
     }
     if url_count > 0 {
         metrics.insert("strings.url_count", f64::from(url_count));
@@ -183,10 +180,7 @@ pub(super) fn emit(strings: &[&str], metrics: &mut Metrics) {
         );
     }
     if shell_command_count > 0 {
-        metrics.insert(
-            "strings.shell",
-            f64::from(shell_command_count),
-        );
+        metrics.insert("strings.shell", f64::from(shell_command_count));
     }
     if sql_count > 0 {
         metrics.insert("strings.sql", f64::from(sql_count));
