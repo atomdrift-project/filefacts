@@ -194,7 +194,7 @@ pub(super) fn extract(
             if cls.is_script {
                 script_count += 1;
             }
-            let exec_by_mode = header.mode().ok().is_some_and(|m| m & 0o111 != 0);
+            let exec_by_mode = header.mode().is_ok_and(|m| m & 0o111 != 0);
             if cls.is_executable || exec_by_mode {
                 executable_count += 1;
                 if cls.is_misplaced_executable {

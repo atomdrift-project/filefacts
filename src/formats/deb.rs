@@ -104,8 +104,7 @@ fn read_control_file(name: &str, member: &[u8]) -> Option<Vec<u8>> {
         // `read_to_end` consumes it.
         let is_control = entry
             .path()
-            .ok()
-            .is_some_and(|p| matches!(p.to_string_lossy().as_ref(), "./control" | "control"));
+            .is_ok_and(|p| matches!(p.to_string_lossy().as_ref(), "./control" | "control"));
         if is_control {
             let mut buf = Vec::new();
             entry.take(MAX_CONTROL_FILE).read_to_end(&mut buf).ok()?;
