@@ -295,15 +295,8 @@ inherits = "release"
 strip = "none"
 debug = 2
 
-
-
-# Local-only override for cross-repo development against unpublished stng changes
-# (the stng-owned string cache API, now also `stng::cache_sweep`). Only applies
-# when filefacts is built as the root crate, so consumers (cleave/scan) are
-# unaffected. Remove before committing — restore the git pin.
-
-# Unreleased upstream tree-sitter, for the illumos fix described above. Both
-# crates have to come from the same source: tree-sitter depends on its in-tree
+# Forked tree-sitter, for the illumos fix described above. Both crates have to
+# come from the fork together: the fork's tree-sitter depends on its in-tree
 # tree-sitter-language, and `links = "tree-sitter-language"` permits only one
 # copy in the graph — leaving the grammars on the crates.io copy is a hard
 # resolver conflict, not a preference.
@@ -311,10 +304,10 @@ debug = 2
 # Unlike the tree-sitter-clojure path dep above, [patch] does NOT resolve
 # transitively: it applies only in the root crate. Consumers that build scan
 # or cleave as the root need this same block in their own manifest. Delete it
-# everywhere once a release carries the fix.
+# everywhere once the upstream PR lands and a release carries the fix.
 [patch.crates-io]
-tree-sitter = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
-tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
+tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
+tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
 
 [profile.dev]
 debug = "line-tables-only"

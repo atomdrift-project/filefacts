@@ -2206,7 +2206,7 @@ mod tests {
     fn rejects_non_elf_bytes() {
         let (v, _, m) = run(b"not an elf");
         assert!(v.is_empty());
-        // file.size_bytes is emitted by the dispatcher, not extract; nothing
+        // file.size is emitted by the dispatcher, not extract; nothing
         // from elf.* should be present here.
         assert!(m.get("binary.is_pie").is_none());
     }

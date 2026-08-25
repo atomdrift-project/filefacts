@@ -96,19 +96,19 @@ pub(super) fn walk(
     }
     if state.max_string_concat_chain > 1 {
         metrics.insert(
-            "ast.string_concat_chain_max_length",
+            "ast.max_concat_chain",
             f64::from(state.max_string_concat_chain),
         );
     }
     if state.max_array_literal_length > 0 {
         metrics.insert(
-            "ast.array_literal_max_length",
+            "ast.max_array_len",
             f64::from(state.max_array_literal_length),
         );
     }
     if state.max_numeric_array_length > 0 {
         metrics.insert(
-            "ast.numeric_array_max_length",
+            "ast.max_numeric_array",
             f64::from(state.max_numeric_array_length),
         );
     }
@@ -170,7 +170,7 @@ pub(super) fn walk(
     }
     if state.max_numeric_sequence_length > 0 {
         metrics.insert(
-            "ast.numeric_sequence_max_length",
+            "ast.max_numeric_seq",
             f64::from(state.max_numeric_sequence_length),
         );
     }
@@ -524,7 +524,7 @@ struct State {
     max_string_concat_chain: u32,
     max_array_literal_length: u32,
     /// Max length of an all-numeric-literal array
-    /// (`ast.numeric_array_max_length`).
+    /// (`ast.max_numeric_array`).
     max_numeric_array_length: u32,
     /// Count of statement-level comma sequences (`a, b, c;`) — a density
     /// signal for comma-sequence obfuscation (`ast.sequence_expression_count`).
@@ -542,7 +542,7 @@ struct State {
     xor_mod_loop_count: u32,
     /// Max count of numeric literals in a comma `sequence_expression`
     /// (`(1, 2, 3)`) — comma-constant obfuscation
-    /// (`ast.numeric_sequence_max_length`).
+    /// (`ast.max_numeric_seq`).
     max_numeric_sequence_length: u32,
     /// Count of parameterless functions whose body is a single
     /// `return <literal>` — dead-code / opaque padding helpers
@@ -614,7 +614,7 @@ impl State {
             // Numeric-array length: arrays whose elements are *all* numeric
             // literals — the byte-packing obfuscation shape (`[112,97,121,...]`),
             // distinct from a generic long array of mixed/string data. Lets
-            // `ast.numeric_array_max_length` keeps that specificity that a plain
+            // `ast.max_numeric_array` keeps that specificity that a plain
             // array-length metric would lose.
             if len >= 2 {
                 let mut cur = node.walk();
@@ -1119,7 +1119,7 @@ fn is_string_concat_root(node: Node<'_>, config: &LangConfig) -> bool {
     }
     let op_text = node
         .child_by_field_name("operator")
-        .and_then(NodeOpExt::utf8_text_lossy_static)
+        .and_then(NodeOpExt::utf8_text_lossy)
         .unwrap_or("");
     if op_text != "+" {
         return false;
@@ -1139,7 +1139,7 @@ fn string_concat_chain_length(node: Node<'_>, config: &LangConfig) -> u32 {
         // A `+` chain of N terms nests N deep; stop at the shared cap so a
         // pathological `a+b+c+…` (thousands of terms) can't overflow the stack
         // before `walk_node`'s guard returns. The length saturates, which is
-        // all `ast.string_concat_chain_max_length` needs.
+        // all `ast.max_concat_chain` needs.
         if depth >= MAX_AST_DEPTH {
             return;
         }
@@ -1159,15 +1159,16 @@ fn string_concat_chain_length(node: Node<'_>, config: &LangConfig) -> u32 {
 
 /// Helper trait for nodes that lets us pull the operator text without
 /// importing tree-sitter throughout this module.
-trait NodeOpExt {
-    fn utf8_text_lossy_static(self) -> Option<&'static str>;
+trait NodeOpExt<'tree> {
+    fn utf8_text_lossy(self) -> Option<&'tree str>;
 }
 
-impl NodeOpExt for Node<'_> {
-    fn utf8_text_lossy_static(self) -> Option<&'static str> {
+impl<'tree> NodeOpExt<'tree> for Node<'tree> {
+    fn utf8_text_lossy(self) -> Option<&'tree str> {
         // The `operator` field on binary-expression nodes is an
         // anonymous node whose kind name *is* the operator string in
-        // every grammar we use. `kind()` returns a `&'static str`.
+        // every grammar we use. `kind()` returns text borrowed from the
+        // node, so preserve that lifetime instead of claiming it is static.
         Some(self.kind())
     }
 }

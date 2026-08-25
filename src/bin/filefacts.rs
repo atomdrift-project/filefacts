@@ -679,7 +679,7 @@ fn render_file_header(
     out.push_str(&pill_bg(&ft, ft_color));
 
     // Subtitle: size · entropy · mismatch
-    let size = parsed.metrics().get("file.size_bytes").unwrap_or(0.0) as u64;
+    let size = parsed.metrics().get("file.size").unwrap_or(0.0) as u64;
     let entropy = parsed.metrics().get("file.entropy");
     let mut subtitle = Vec::<String>::new();
     subtitle.push(fg(FG_LABEL, &humanize_bytes(size)));

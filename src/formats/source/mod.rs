@@ -1057,7 +1057,7 @@ mod tests {
             "a concat chain past the cap must set ast.depth_capped"
         );
         // The chain-length metric is bounded too — it can't exceed the cap.
-        let concat = m.get("ast.string_concat_chain_max_length").unwrap_or(0.0);
+        let concat = m.get("ast.max_concat_chain").unwrap_or(0.0);
         assert!(
             concat <= f64::from(super::ast_walk::MAX_AST_DEPTH),
             "concat chain length must saturate at the cap, got {concat}"
