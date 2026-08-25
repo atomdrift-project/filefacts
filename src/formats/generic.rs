@@ -17,8 +17,8 @@ pub(super) fn extract(
     // One windowed pass yields both the whole-file entropy and the
     // concealed-region signals below, so the file is read only once.
     let scan = entropy::windowed(bytes);
-    metrics.insert("file.size", bytes.len() as f64);
-    // Whole-file Shannon entropy. `file.entropy` is THE entropy name — the
+    metrics.insert("file.size_bytes", bytes.len() as f64);
+    // Whole-file Shannon entropy.
     // unqualified default; specializations qualify (`binary.code_entropy`,
     // `binary.data_entropy`, `sections.entropy_*`). Historically this was
     // `binary.overall_entropy` (+ a `file.entropy` twin, dropped first);
@@ -53,13 +53,13 @@ mod tests {
         m
     }
 
-    /// Empty input still records `file.size = 0` and a zero
+    /// Empty input still records `file.size_bytes = 0` and a zero
     /// entropy. The "always-succeeds" contract is what downstream
     /// consumers rely on for the universal `file.*` metrics.
     #[test]
     fn empty_input_records_zero_size_and_entropy() {
         let m = run(&[]);
-        assert_eq!(m.get("file.size"), Some(0.0));
+        assert_eq!(m.get("file.size_bytes"), Some(0.0));
         assert_eq!(m.get("file.entropy"), Some(0.0));
     }
 
@@ -69,7 +69,7 @@ mod tests {
     #[test]
     fn single_byte_input_has_zero_entropy() {
         let m = run(&[0x42]);
-        assert_eq!(m.get("file.size"), Some(1.0));
+        assert_eq!(m.get("file.size_bytes"), Some(1.0));
         assert_eq!(m.get("file.entropy"), Some(0.0));
     }
 
@@ -78,7 +78,7 @@ mod tests {
     #[test]
     fn two_balanced_bytes_have_one_bit_entropy() {
         let m = run(&[0x00, 0xff]);
-        assert_eq!(m.get("file.size"), Some(2.0));
+        assert_eq!(m.get("file.size_bytes"), Some(2.0));
         let h = m.get("file.entropy").unwrap();
         assert!((h - 1.0).abs() < 1e-9, "expected ~1 bit, got {h}",);
     }
@@ -99,7 +99,7 @@ mod tests {
     fn uniform_byte_distribution_approaches_eight_bits() {
         let bytes: Vec<u8> = (0u16..256).map(|b| b as u8).collect();
         let m = run(&bytes);
-        assert_eq!(m.get("file.size"), Some(256.0));
+        assert_eq!(m.get("file.size_bytes"), Some(256.0));
         let h = m.get("file.entropy").unwrap();
         assert!(
             (h - 8.0).abs() < 1e-9,

@@ -80,7 +80,7 @@ fn candidate_names(name: &str) -> Vec<String> {
 }
 
 fn fallback_roots() -> Vec<PathBuf> {
-    let mut roots = vec![
+    let roots = vec![
         PathBuf::from("/usr/local/bin"),
         PathBuf::from("/usr/bin"),
         PathBuf::from("/bin"),

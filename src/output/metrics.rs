@@ -191,9 +191,9 @@ mod tests {
     #[test]
     fn insert_and_get() {
         let mut m = Metrics::new();
-        m.insert("file.size", 1024.0);
+        m.insert("file.size_bytes", 1024.0);
         m.insert("file.entropy", 7.21);
-        assert_eq!(m.get("file.size"), Some(1024.0));
+        assert_eq!(m.get("file.size_bytes"), Some(1024.0));
         assert_eq!(m.get("file.entropy"), Some(7.21));
         assert_eq!(m.get("missing"), None);
         assert_eq!(m.len(), 2);

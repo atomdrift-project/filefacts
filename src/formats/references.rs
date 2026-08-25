@@ -940,13 +940,11 @@ fn npm_manifest_deps(out: &mut Refs<'_>) {
         };
         for (name, spec) in deps {
             let Some(spec) = spec.as_str() else { continue };
-            let locator = if is_exact_npm_version(spec) {
-                npm_purl(name, spec)
-            } else {
-                npm_purl_unversioned(name)
+            let Some(locator) = npm_dep_locator(name, spec) else {
+                continue;
             };
             out.push(
-                RefLocator::Purl(locator),
+                locator,
                 RefKind::Dependency,
                 "package.json",
                 format!("{name}@{spec}"),
@@ -954,6 +952,115 @@ fn npm_manifest_deps(out: &mut Refs<'_>) {
             );
         }
     }
+}
+
+/// Where an npm dependency spec actually points. A spec is not always a
+/// registry range: npm and its alternatives accept several protocols, and only
+/// the registry ones name a package *on the registry* under the map's key.
+/// Deriving the PURL from the key regardless is wrong in both directions — it
+/// invents a coordinate that either does not exist (`"@scope/shared":
+/// "workspace:*"`) or, worse, names an unrelated published package that happens
+/// to share the key (`"link-dep": "link:../other"` resolving to the real
+/// `link-dep` on npm) — while the dependency that is actually delivered goes
+/// unrecorded.
+///
+/// - `workspace:` / `catalog:` / `file:` / `link:` / `portal:`, and a bare
+///   relative path: the code is inside the artifact or its workspace, so
+///   nothing external is delivered and there is no reference to record.
+/// - `npm:name[@range]`: an alias. The delivered package is the *aliased* one;
+///   the key is only the name it is imported under locally.
+/// - `git+…`, `git://`, `http(s)://`, and the `github:`/`gitlab:`/`bitbucket:`
+///   and bare `owner/repo` shorthands: fetched from a forge or URL, never from
+///   the registry.
+/// - anything else: a range, dist-tag, or exact version of the key's own
+///   package — the one case where the key *is* the coordinate.
+fn npm_dep_locator(name: &str, spec: &str) -> Option<RefLocator> {
+    if is_local_npm_spec(spec) {
+        return None;
+    }
+    if let Some(alias) = spec.strip_prefix("npm:") {
+        let (aliased, range) = split_npm_alias(alias);
+        return npm_registry_locator(aliased, range);
+    }
+    if let Some(locator) = npm_remote_locator(spec) {
+        return Some(locator);
+    }
+    npm_registry_locator(name, spec)
+}
+
+/// A registry coordinate: versioned when the spec pins one exact version,
+/// versionless otherwise for the fetcher to resolve.
+fn npm_registry_locator(name: &str, spec: &str) -> Option<RefLocator> {
+    (!name.is_empty()).then(|| {
+        RefLocator::Purl(if is_exact_npm_version(spec) {
+            npm_purl(name, spec)
+        } else {
+            npm_purl_unversioned(name)
+        })
+    })
+}
+
+/// Whether a spec resolves to code already on disk — a workspace sibling, a
+/// pnpm catalog entry (itself declared in the workspace manifest), or a plain
+/// path. None of these is fetchable, and all of them are inside the artifact
+/// already, where they are scanned in place.
+fn is_local_npm_spec(spec: &str) -> bool {
+    const LOCAL_PROTOCOLS: [&str; 5] = ["workspace:", "catalog:", "file:", "link:", "portal:"];
+    const LOCAL_PATHS: [&str; 4] = ["./", "../", "/", "~/"];
+    LOCAL_PROTOCOLS.iter().any(|p| spec.starts_with(p))
+        || LOCAL_PATHS.iter().any(|p| spec.starts_with(p))
+}
+
+/// Split an `npm:` alias body into the aliased package and its range. The name
+/// may be scoped, so the separating `@` is the one after position 0; with no
+/// range the alias tracks whatever the registry serves (`*`).
+fn split_npm_alias(alias: &str) -> (&str, &str) {
+    let at = match alias.strip_prefix('@') {
+        Some(scoped) => scoped.find('@').map(|i| i + 1),
+        None => alias.find('@'),
+    };
+    at.map_or((alias, "*"), |i| (&alias[..i], &alias[i + 1..]))
+}
+
+/// A spec fetched from a forge or a URL rather than the registry, as its
+/// locator — a forge PURL where the host is one, else the URL verbatim.
+/// `None` when the spec is not remote.
+///
+/// npm's commit-ish fragment is bare (`#v1.2.3`, `#main`) rather than the
+/// `#tag=`/`#commit=` form [`source_locator`] parses, so it is applied here;
+/// a `#semver:` fragment is a range, not a pin, and contributes no version.
+fn npm_remote_locator(spec: &str) -> Option<RefLocator> {
+    let (base, fragment) = spec
+        .split_once('#')
+        .map_or((spec, None), |(b, f)| (b, Some(f)));
+    let url = npm_forge_shorthand(base).unwrap_or_else(|| base.to_string());
+    let locator = source_locator(&url)?;
+    let version = fragment.filter(|f| !f.is_empty() && !f.starts_with("semver:"));
+    match (locator, version) {
+        (RefLocator::Purl(purl), Some(version)) => {
+            Some(RefLocator::Purl(format!("{purl}@{version}")))
+        }
+        (locator, _) => Some(locator),
+    }
+}
+
+/// The forge URL an npm shorthand abbreviates: `github:owner/repo` and its
+/// `gitlab:`/`bitbucket:` siblings, plus the bare `owner/repo` form npm reads
+/// as GitHub. `None` for anything else, including a spec carrying some other
+/// protocol — a local one is already gone by here, and a real URL needs no
+/// expansion.
+fn npm_forge_shorthand(spec: &str) -> Option<String> {
+    let (host, path) = match spec.split_once(':') {
+        Some(("github", path)) => ("github.com", path),
+        Some(("gitlab", path)) => ("gitlab.com", path),
+        Some(("bitbucket", path)) => ("bitbucket.org", path),
+        Some(_) => return None,
+        // A range never contains `/`, so an unprefixed `owner/repo` is GitHub.
+        None => ("github.com", spec),
+    };
+    let (owner, repo) = path.split_once('/')?;
+    (!owner.is_empty() && !repo.is_empty() && !repo.contains('/'))
+        .then(|| format!("https://{host}/{owner}/{repo}"))
 }
 
 /// An npm PURL with no version — a manifest dependency whose declared spec is a
@@ -1297,6 +1404,89 @@ mod tests {
             .expect("easy-day-js ref");
         assert_eq!(easy.evidence, "easy-day-js@^1.11.21");
         assert_eq!(easy.kind, RefKind::Dependency);
+    }
+
+    #[test]
+    fn package_json_deps_follow_the_spec_protocol_not_the_key() {
+        // Only a registry range is a coordinate under the map's own key. A
+        // local protocol delivers nothing external; an alias delivers the
+        // aliased package; a forge or URL spec is fetched from there. Reading
+        // the key regardless would both invent coordinates and miss the ones
+        // actually delivered.
+        let manifest = br#"{
+            "name": "app",
+            "dependencies": {
+                "@scope/shared": "workspace:*",
+                "cat-dep": "catalog:",
+                "file-dep": "file:../local-thing",
+                "link-dep": "link:../other",
+                "portal-dep": "portal:../p",
+                "bare-path-dep": "../sibling",
+                "helper": "npm:left-pad@1.3.0",
+                "loose-alias": "npm:@scope/util",
+                "git-dep": "git+https://github.com/foo/bar.git#v1.2.3",
+                "gh-dep": "github:foo/baz",
+                "bare-forge-dep": "foo/qux",
+                "ranged-forge-dep": "foo/quux#semver:^1.0.0",
+                "url-dep": "https://example.com/foo.tgz",
+                "range-dep": "^1.6.0"
+            }
+        }"#;
+        let refs = derive(FileType::PackageJson, manifest, &Values::new());
+        let locators: Vec<&RefLocator> = refs.iter().map(|r| &r.locator).collect();
+        let has = |want: &str| {
+            locators.iter().any(|l| match l {
+                RefLocator::Purl(v) | RefLocator::Url(v) => v == want,
+                RefLocator::Path(_) => false,
+            })
+        };
+
+        // Local protocols and paths are inside the artifact: no reference.
+        for key in [
+            "shared",
+            "cat-dep",
+            "file-dep",
+            "link-dep",
+            "portal-dep",
+            "bare-path-dep",
+        ] {
+            assert!(
+                !locators
+                    .iter()
+                    .any(|l| matches!(l, RefLocator::Purl(p) if p.contains(key))),
+                "local spec must emit no reference: {key} in {locators:?}"
+            );
+        }
+        // An alias names the aliased package, never the local import name.
+        assert!(has("pkg:npm/left-pad@1.3.0"), "{locators:?}");
+        assert!(has("pkg:npm/%40scope/util"), "{locators:?}");
+        assert!(
+            !locators
+                .iter()
+                .any(|l| matches!(l, RefLocator::Purl(p) if p.contains("helper"))),
+            "alias key is not a package: {locators:?}"
+        );
+        // Forge specs normalize to a forge PURL, bare commit-ish as version.
+        assert!(has("pkg:github/foo/bar@v1.2.3"), "{locators:?}");
+        assert!(has("pkg:github/foo/baz"), "{locators:?}");
+        assert!(has("pkg:github/foo/qux"), "{locators:?}");
+        assert!(
+            has("pkg:github/foo/quux"),
+            "a `semver:` fragment is a range, not a pin: {locators:?}"
+        );
+        // A plain URL is fetched verbatim.
+        assert!(has("https://example.com/foo.tgz"), "{locators:?}");
+        // The ordinary registry range is untouched.
+        assert!(has("pkg:npm/range-dep"), "{locators:?}");
+        assert_eq!(refs.len(), 8, "one ref per non-local spec: {locators:?}");
+    }
+
+    #[test]
+    fn npm_alias_splits_scoped_and_unversioned_forms() {
+        assert_eq!(split_npm_alias("left-pad@1.3.0"), ("left-pad", "1.3.0"));
+        assert_eq!(split_npm_alias("@scope/util@^2"), ("@scope/util", "^2"));
+        assert_eq!(split_npm_alias("@scope/util"), ("@scope/util", "*"));
+        assert_eq!(split_npm_alias("left-pad"), ("left-pad", "*"));
     }
 
     #[test]
