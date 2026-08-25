@@ -86,6 +86,9 @@ fn fallback_roots() -> Vec<PathBuf> {
         PathBuf::from("/bin"),
     ];
 
+    #[cfg(any(target_os = "macos", windows))]
+    let mut roots = roots;
+
     #[cfg(target_os = "macos")]
     roots.extend([
         PathBuf::from("/opt/homebrew/bin"),
