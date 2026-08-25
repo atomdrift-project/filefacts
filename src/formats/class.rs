@@ -423,7 +423,9 @@ fn parse_methods(
         let _ = access_flags;
         symbols_out.push(crate::Symbol::Function {
             name: name.clone(),
-            offset: None,
+            // The method name is a constant-pool UTF-8 entry, so anchor the
+            // function symbol at the name bytes just like methodref imports.
+            offset: cp.utf8_offset.get(&name_idx).copied(),
             complexity: None,
             callees: Vec::new(),
         });
@@ -964,6 +966,20 @@ mod tests {
             .collect();
         assert_eq!(funcs.len(), 1);
         assert_eq!(funcs[0], "compute");
+        let compute_offset = symbols
+            .iter_kind(crate::SymbolKind::Function)
+            .find_map(|s| match s {
+                crate::Symbol::Function { name, offset, .. } if name == "compute" => *offset,
+                _ => None,
+            });
+        let want = bytes
+            .windows("compute".len())
+            .position(|w| w == b"compute")
+            .map(|p| p as u64);
+        assert_eq!(
+            compute_offset, want,
+            "method must anchor at its CP Utf8 offset"
+        );
         assert_eq!(m.get("class.method_count"), None);
     }
 

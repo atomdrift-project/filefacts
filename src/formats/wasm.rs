@@ -70,11 +70,19 @@ impl<'a> Reader<'a> {
     /// A length-prefixed UTF-8 name (WASM `name` = `vec(byte)`). Lossily
     /// decoded so non-UTF-8 bytes can't abort extraction.
     fn name(&mut self) -> Option<String> {
+        self.name_with_offset().map(|(name, _)| name)
+    }
+
+    /// Read a name and return the offset of its first UTF-8 byte relative to
+    /// this reader's input. The length prefix is intentionally excluded so
+    /// symbol evidence points at the name itself.
+    fn name_with_offset(&mut self) -> Option<(String, usize)> {
         let len = self.uleb()? as usize;
+        let offset = self.pos;
         let end = self.pos.checked_add(len)?;
         let slice = self.data.get(self.pos..end)?;
         self.pos = end;
-        Some(String::from_utf8_lossy(slice).into_owned())
+        Some((String::from_utf8_lossy(slice).into_owned(), offset))
     }
 
     fn skip(&mut self, n: usize) -> Option<()> {
@@ -91,6 +99,7 @@ impl<'a> Reader<'a> {
 /// 0 func, 1 table, 2 memory, 3 global.
 fn extract_imports(
     body: &[u8],
+    body_offset: u64,
     symbols_out: &mut Symbols,
     modules: &mut Vec<String>,
     import_names: &mut Vec<String>,
@@ -99,8 +108,12 @@ fn extract_imports(
     let Some(count) = r.uleb() else { return };
     let count = (count as usize).min(MAX_ENTRIES);
     for _ in 0..count {
-        let Some(module) = r.name() else { return };
-        let Some(field) = r.name() else { return };
+        let Some((module, _module_offset)) = r.name_with_offset() else {
+            return;
+        };
+        let Some((field, field_offset)) = r.name_with_offset() else {
+            return;
+        };
         let Some(kind) = r.byte() else { return };
         // Skip the kind-specific descriptor so the next import aligns.
         let ok = match kind {
@@ -122,7 +135,7 @@ fn extract_imports(
                 name: field,
                 alias: None,
                 library: Some(module),
-                offset: None,
+                offset: Some(body_offset + field_offset as u64),
                 ordinal: None,
             });
         }
@@ -146,12 +159,19 @@ fn skip_table_type(r: &mut Reader<'_>) -> Option<()> {
     skip_limits(r)
 }
 
-fn extract_exports(body: &[u8], symbols_out: &mut Symbols, export_names: &mut Vec<String>) {
+fn extract_exports(
+    body: &[u8],
+    body_offset: u64,
+    symbols_out: &mut Symbols,
+    export_names: &mut Vec<String>,
+) {
     let mut r = Reader::new(body);
     let Some(count) = r.uleb() else { return };
     let count = (count as usize).min(MAX_ENTRIES);
     for _ in 0..count {
-        let Some(name) = r.name() else { return };
+        let Some((name, name_offset)) = r.name_with_offset() else {
+            return;
+        };
         if r.byte().is_none() {
             return;
         } // export kind
@@ -161,7 +181,7 @@ fn extract_exports(body: &[u8], symbols_out: &mut Symbols, export_names: &mut Ve
         export_names.push(name.clone());
         symbols_out.push(crate::Symbol::Export {
             name,
-            offset: None,
+            offset: Some(body_offset + name_offset as u64),
             ordinal: None,
             forward_to: None,
         });
@@ -250,8 +270,14 @@ pub(super) fn extract(
         section_count += 1;
 
         match id {
-            2 => extract_imports(body, symbols_out, &mut modules, &mut import_names),
-            7 => extract_exports(body, symbols_out, &mut export_names),
+            2 => extract_imports(
+                body,
+                start as u64,
+                symbols_out,
+                &mut modules,
+                &mut import_names,
+            ),
+            7 => extract_exports(body, start as u64, symbols_out, &mut export_names),
             8 => has_start = true,
             5 => extract_memory(body, values),
             0 => {

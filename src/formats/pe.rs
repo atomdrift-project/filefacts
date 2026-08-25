@@ -2914,6 +2914,11 @@ fn delay_imports(
                 if int_off + ptr_size > bytes.len() {
                     break;
                 }
+                // Keep the file offset of the INT entry before advancing.
+                // Delay imports are real symbol evidence too; dropping this
+                // offset leaves symbol matches with only the semantic
+                // `"import"` location, so cleave cannot anchor their context.
+                let entry_off = int_off;
                 let entry = if is_64 {
                     u64::from_le_bytes(bytes[int_off..int_off + 8].try_into().unwrap())
                 } else {
@@ -2931,7 +2936,7 @@ fn delay_imports(
                         name: format!("ORDINAL {ordinal}"),
                         alias: None,
                         library: Some(library.clone()),
-                        offset: None,
+                        offset: Some(entry_off as u64),
                         ordinal: Some(ordinal),
                     });
                 } else {
@@ -2941,7 +2946,7 @@ fn delay_imports(
                             name,
                             alias: None,
                             library: Some(library.clone()),
-                            offset: None,
+                            offset: Some(entry_off as u64),
                             ordinal: None,
                         });
                     }
