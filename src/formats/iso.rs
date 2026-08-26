@@ -1225,7 +1225,13 @@ impl Walk {
             };
             pos += len;
             let sig = [head[0], head[1]];
-            let data = rec.get(5..).unwrap_or_default();
+            // SUSP entries have a four-byte header: two-byte signature,
+            // length, and version. Record-specific payload begins at byte 4.
+            // NM and SL then carry their own flags byte at payload[0]; their
+            // decoders skip that byte themselves. Starting every payload at
+            // byte 5 dropped the first Rock Ridge filename character and also
+            // shifted PX ownership, CE continuation, and SL component fields.
+            let data = rec.get(4..).unwrap_or_default();
             match &sig {
                 b"SP" | b"RR" => self.rock_ridge = true,
                 b"ER" => {
@@ -1915,6 +1921,82 @@ mod tests {
         let mut root = String::new();
         decode_symlink(b"\x00\x08\x00\x00\x03etc", &mut root);
         assert_eq!(root, "/etc");
+    }
+
+    fn susp_record(signature: [u8; 2], payload: &[u8]) -> Vec<u8> {
+        let mut record = Vec::with_capacity(4 + payload.len());
+        record.extend_from_slice(&signature);
+        record.push((4 + payload.len()) as u8);
+        record.push(1); // SUSP entry version
+        record.extend_from_slice(payload);
+        record
+    }
+
+    fn both32(value: u32) -> Vec<u8> {
+        let mut encoded = value.to_le_bytes().to_vec();
+        encoded.extend_from_slice(&value.to_be_bytes());
+        encoded
+    }
+
+    fn test_entry() -> Entry {
+        Entry {
+            namespace: Namespace::Iso9660,
+            path: "/LIBSYS.SO;1".into(),
+            alt_name: None,
+            lba: 0,
+            size: 0,
+            flags: 0,
+            recorded: None,
+            depth: 0,
+            contiguous: true,
+            ext_attr_sectors: 0,
+            mode: None,
+            uid: None,
+            gid: None,
+            symlink: None,
+        }
+    }
+
+    #[test]
+    fn susp_payload_starts_after_four_byte_header() {
+        let mut system_use = susp_record(*b"NM", b"\0libsys.so.7");
+
+        let mut px = both32(0o100755);
+        px.extend(both32(1)); // link count
+        px.extend(both32(1000)); // uid
+        px.extend(both32(100)); // gid
+        system_use.extend(susp_record(*b"PX", &px));
+
+        // SL entry flags, followed by the `usr` and `lib` components.
+        system_use.extend(susp_record(*b"SL", b"\0\0\x03usr\0\x03lib"));
+
+        let mut walk = Walk::new();
+        let mut entry = test_entry();
+        walk.parse_susp(&[], &system_use, &mut entry, "/lib", 0);
+
+        assert_eq!(entry.path, "/lib/libsys.so.7");
+        assert_eq!(entry.alt_name.as_deref(), Some("libsys.so.7"));
+        assert_eq!(entry.mode, Some(0o100755));
+        assert_eq!(entry.uid, Some(1000));
+        assert_eq!(entry.gid, Some(100));
+        assert_eq!(entry.symlink.as_deref(), Some("usr/lib"));
+    }
+
+    #[test]
+    fn susp_ce_continuation_uses_unshifted_payload() {
+        let continuation = susp_record(*b"NM", b"\0continued-name");
+        let mut image = vec![0_u8; SECTOR + continuation.len()];
+        image[SECTOR..].copy_from_slice(&continuation);
+
+        let mut ce = both32(1); // continuation block
+        ce.extend(both32(0)); // offset within block
+        ce.extend(both32(continuation.len() as u32));
+
+        let mut walk = Walk::new();
+        let mut entry = test_entry();
+        walk.parse_susp(&image, &susp_record(*b"CE", &ce), &mut entry, "", 0);
+
+        assert_eq!(entry.path, "/continued-name");
     }
 
     fn empty_pvd() -> Pvd {
