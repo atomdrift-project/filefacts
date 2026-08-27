@@ -45,6 +45,7 @@ const RIZIN_TIMEOUT: Duration = Duration::from_secs(DEFAULT_RIZIN_TIMEOUT_SECS);
 /// approaches this size — exceeding it indicates pathological input
 /// and the kernel will abort the subprocess instead of letting it
 /// drag the whole scan into OOM.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const RIZIN_MEMORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Per-process byte cap on a rizin subprocess's stdout. Mirrors
@@ -683,9 +684,15 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
     Some(parse_recovery_output(&stdout))
 }
 
-/// Apply Unix subprocess hardening: own process group, RLIMIT_AS /
-/// RLIMIT_DATA memory cap, PR_SET_PDEATHSIG so the child dies if the
-/// parent does. No-op on non-Unix.
+/// Apply Unix subprocess hardening: own process group everywhere, plus the
+/// platform-specific memory/death limits Linux and macOS support here.
+///
+/// Any `pre_exec` hook forces Rust's `Command` off its `posix_spawn` path and
+/// through `fork()`. In a large multithreaded jemalloc process that means
+/// taking every allocator prefork lock. Do not install the hook on FreeBSD,
+/// where the previous unconditional RLIMIT_DATA hook produced exactly that
+/// contention in live DTrace stacks; `process_group(0)` remains available via
+/// `posix_spawn` there.
 #[cfg(unix)]
 fn apply_unix_hardening(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
@@ -693,6 +700,7 @@ fn apply_unix_hardening(cmd: &mut Command) {
     // SAFETY: pre_exec runs in the forked child between fork() and
     // exec(). Only async-signal-safe calls are allowed; setrlimit and
     // prctl are both on the POSIX list. No allocation, no locks.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[allow(unsafe_code)]
     unsafe {
         cmd.pre_exec(|| {
