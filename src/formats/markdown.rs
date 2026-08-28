@@ -51,6 +51,12 @@ pub(super) fn extract(
         values.insert("markdown.github_repos", JsonValue::Array(arr));
     }
 
+    let pkgs = npm_packages(&text);
+    if !pkgs.is_empty() {
+        let arr = pkgs.into_iter().map(JsonValue::String).collect::<Vec<_>>();
+        values.insert("markdown.npm_packages", JsonValue::Array(arr));
+    }
+
     Ok(())
 }
 
@@ -200,6 +206,74 @@ fn take_path_segment(s: &str) -> Option<String> {
 /// chars) terminates the segment.
 fn is_path_segment_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')
+}
+
+/// Deduped, ordered list of npm package names a README points at, lifted from
+/// the two forms a package's own README uses to name itself: the registry link
+/// `npmjs.com/package/<name>` and the shields.io version badge `/npm/v/<name>`.
+/// Scoped names (`@scope/name`) are kept whole. A legit package always names
+/// itself here (its badge, its install link); a byte-clean starjack that keeps
+/// the upstream README names the *upstream* package instead, so a supply-chain
+/// trait can compare this against the manifest's declared `name`.
+fn npm_packages(text: &str) -> Vec<String> {
+    const NEEDLES: [&str; 2] = ["npmjs.com/package/", "/npm/v/"];
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for needle in NEEDLES {
+        let mut cursor = 0;
+        while let Some(rel) = text[cursor..].find(needle) {
+            let start = cursor + rel + needle.len();
+            cursor = start;
+            if let Some(name) = take_npm_name(&text[start..]) {
+                if !seen.contains(name.as_str()) {
+                    seen.insert(name.clone());
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Take one npm package name from the start of `s`. Handles a `@scope/name`
+/// pair as a single value; otherwise a bare unscoped segment. Returns `None`
+/// for an empty or malformed name.
+fn take_npm_name(s: &str) -> Option<String> {
+    if let Some(rest) = s.strip_prefix('@') {
+        let scope = take_path_segment(rest)?;
+        if scope.is_empty() {
+            return None;
+        }
+        let after_scope = 1 + scope.len();
+        if s.as_bytes().get(after_scope) != Some(&b'/') {
+            return None;
+        }
+        let name = take_path_segment(&s[after_scope + 1..])?;
+        if name.is_empty() {
+            return None;
+        }
+        Some(format!("@{}/{}", scope, name))
+    } else {
+        let name = take_npm_segment(s)?;
+        if name.is_empty() { None } else { Some(name) }
+    }
+}
+
+/// Like `take_path_segment`, but stops at a URL fragment/query as well so a
+/// shields badge such as `/npm/v/foo?style=flat` yields `foo`.
+fn take_npm_segment(s: &str) -> Option<String> {
+    let mut out = String::new();
+    for ch in s.chars() {
+        if ch == '/' || ch == '?' || ch == '#' || ch.is_whitespace() {
+            break;
+        }
+        if is_path_segment_char(ch) {
+            out.push(ch);
+        } else {
+            break;
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -400,6 +474,36 @@ mod tests {
     fn github_repos_none_no_value() {
         let v = run("# No links here\n");
         assert!(v.get("markdown.github_repos").is_none());
+    }
+
+    #[test]
+    fn npm_packages_registry_link() {
+        let v = run("Install from https://www.npmjs.com/package/tailwindcss-3d today.\n");
+        assert_eq!(get_arr(&v, "markdown.npm_packages"), vec!["tailwindcss-3d"]);
+    }
+
+    #[test]
+    fn npm_packages_shields_badge_and_dedup() {
+        let v = run(
+            "![v](https://img.shields.io/npm/v/tailwindcss-3d?style=flat) \
+             see https://www.npmjs.com/package/tailwindcss-3d\n",
+        );
+        assert_eq!(get_arr(&v, "markdown.npm_packages"), vec!["tailwindcss-3d"]);
+    }
+
+    #[test]
+    fn npm_packages_scoped_name() {
+        let v = run("https://www.npmjs.com/package/@scope/pkg-name\n");
+        assert_eq!(
+            get_arr(&v, "markdown.npm_packages"),
+            vec!["@scope/pkg-name"]
+        );
+    }
+
+    #[test]
+    fn npm_packages_none_no_value() {
+        let v = run("# A README with no npm references\n");
+        assert!(v.get("markdown.npm_packages").is_none());
     }
 
     #[test]

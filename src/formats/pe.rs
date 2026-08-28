@@ -2014,14 +2014,19 @@ fn data_directory_anomalies(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metr
             "kind": kind,
         }));
     }
+    // The count is unconditional; the list is not. An absent key is the right
+    // shape for an empty value list, but as a metric it left a rule unable to
+    // separate "declares no directory at all" from "never parsed". Zero is a
+    // real and rare observation: every linker emits at least an import
+    // directory, so a loadable image declaring none built its own header and
+    // resolves imports at runtime.
+    metrics.insert("pe.declared_data_directory_count", declared.len() as f64);
     if anomalies.is_empty() {
         if !declared.is_empty() {
-            metrics.insert("pe.declared_data_directory_count", declared.len() as f64);
             values.insert("pe.declared_data_directories", JsonValue::Array(declared));
         }
         return;
     }
-    metrics.insert("pe.declared_data_directory_count", declared.len() as f64);
     metrics.insert("pe.data_directory_anomaly_count", anomalies.len() as f64);
     if zero_rva_nonzero_size > 0 {
         metrics.insert(
