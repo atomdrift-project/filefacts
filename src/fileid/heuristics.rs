@@ -377,6 +377,15 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
     }
 
     let head = &data[..data.len().min(SCAN_LIMIT)];
+    // Natural-language prose is never one of the scored languages either, but
+    // it does quote their keywords: a novel has `const`, `let `, `var ` and
+    // `new ` in every chapter, and 1 MB of it typed as JavaScript sends
+    // tree-sitter's GLR error recovery on a 20 s walk (observed: an
+    // extensionless Tom Sawyer in a fuzz corpus). Code carries punctuation
+    // prose does not, and the head alone tells them apart.
+    if data.len() >= PROSE_GUARD_MIN_BYTES && looks_like_prose(head) {
+        return None;
+    }
 
     // If the head is mostly whitespace, also scan the tail
     let scores = if is_mostly_whitespace(data, SCAN_LIMIT) && data.len() > SCAN_LIMIT {
@@ -469,6 +478,45 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
 }
 
 /// First offset of `needle` in `haystack`.
+/// Only inputs at least this large are screened by [`looks_like_prose`]: a
+/// tiny script (`echo hi`) can legitimately have no code punctuation at all,
+/// and a mis-typed tiny file costs nothing to parse.
+const PROSE_GUARD_MIN_BYTES: usize = 1024;
+
+/// Bytes that appear in essentially every programming language and essentially
+/// never in running prose: brackets, statement/assignment/comparison operators,
+/// and the shell/comment sigils.
+const CODE_PUNCT: &[u8] = b"{}[]();=<>$#@\\|&*";
+
+/// True when `head` reads like natural-language text rather than source.
+///
+/// Measured on the first 4 KiB: prose (novels, licenses) has 0.15-0.3% code
+/// punctuation with ~4% of lines carrying any; minified JS 6.5% / 93%, Rust
+/// 3.5% / 58%, a Makefile 4.1% / 91%, and even a Markdown README with embedded
+/// snippets 2.8% / 30%. Both thresholds sit well inside that gap, and both must
+/// hold — a file has to look like prose on the byte *and* the line axis.
+fn looks_like_prose(head: &[u8]) -> bool {
+    if head.is_empty() {
+        return false;
+    }
+    let punct = head.iter().filter(|b| CODE_PUNCT.contains(b)).count();
+    let mut lines = 0usize;
+    let mut code_lines = 0usize;
+    for line in head.split(|&b| b == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        lines += 1;
+        if line.iter().any(|b| CODE_PUNCT.contains(b)) {
+            code_lines += 1;
+        }
+    }
+    if lines == 0 {
+        return false;
+    }
+    punct * 100 < head.len() && code_lines * 100 < lines * 15
+}
+
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
@@ -594,6 +642,38 @@ pub(crate) fn looks_like_html(data: &[u8]) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prose_with_keywords_is_not_source() {
+        // Sentences that happen to contain JavaScript's scored tokens.
+        let para = "Let us go, said Tom, for the new day was const and true. \
+                    We shall let it be. And var the river ran, this. is what \
+                    the window. of the cabin showed us, and const it stayed.\n";
+        let data = para.repeat(40);
+        assert!(data.len() >= PROSE_GUARD_MIN_BYTES);
+        assert!(looks_like_prose(data.as_bytes()));
+        assert_eq!(detect_from_content(data.as_bytes()), None);
+    }
+
+    #[test]
+    fn source_with_prose_comments_still_detects() {
+        let js = "// A long explanatory comment that reads like prose and goes on.\n\
+                  const x = require('fs');\nmodule.exports = function (a, b) {\n\
+                  \treturn a === b;\n};\nconsole.log(x);\n";
+        let data = js.repeat(20);
+        assert!(!looks_like_prose(data.as_bytes()));
+        assert_eq!(
+            detect_from_content(data.as_bytes()),
+            Some(FileType::JavaScript)
+        );
+    }
+
+    #[test]
+    fn prose_guard_skips_tiny_inputs() {
+        let tiny = b"var x = require('foo');\nmodule.exports = x;\n";
+        assert!(tiny.len() < PROSE_GUARD_MIN_BYTES);
+        assert_eq!(detect_from_content(tiny), Some(FileType::JavaScript));
+    }
 
     #[test]
     fn shell_heuristic() {

@@ -106,6 +106,14 @@ static RIZIN_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(0);
 /// means some process outside our reach held a copy of a rizin stdout pipe.
 static RIZIN_DRAINS_ABANDONED: AtomicU64 = AtomicU64::new(0);
 
+/// Abandoned drains after which rizin disables itself for the rest of the
+/// process. Each abandoned reader is an OS thread parked in `read_to_end`
+/// forever, holding a pipe fd and up to [`MAX_SUBPROCESS_OUTPUT`] of buffer —
+/// there is no portable way to cancel it. One is an anomaly; a steady trickle
+/// on a days-old worker is a leak with no bound but uptime, and a host whose
+/// rizin children keep escaping containment is not going to start behaving.
+const RIZIN_MAX_ABANDONED_DRAINS: u64 = 8;
+
 /// Skip rizin entirely for inputs larger than this many bytes. `0` disables the
 /// gate. Full `aaa` on a 100 MB+ stripped binary costs minutes; a size cap keeps
 /// a directory of giant signed apps from dominating a scan.
@@ -288,6 +296,14 @@ pub fn stats() -> (u64, u64, u64, u64, u64) {
     )
 }
 
+/// Stdout reader threads abandoned so far (see `join_drain`). Each one is a
+/// permanently parked thread; a long-lived host should surface this on its
+/// heartbeat, and rizin turns itself off at `RIZIN_MAX_ABANDONED_DRAINS`.
+#[must_use]
+pub fn abandoned_drains() -> u64 {
+    RIZIN_DRAINS_ABANDONED.load(Ordering::Relaxed)
+}
+
 /// Emit cumulative rizin statistics as a single `tracing::info!` line.
 /// Host CLIs call this at shutdown for telemetry. No-op when no rizin
 /// invocations have happened.
@@ -303,6 +319,7 @@ pub fn log_stats() {
         timeouts,
         failures,
         memory_exceeded,
+        abandoned_drains = abandoned_drains(),
         timeout_rate_pct = (timeouts as f64 / total_f) * 100.0,
         failure_rate_pct = (failures as f64 / total_f) * 100.0,
         "filefacts rizin subprocess statistics"
@@ -922,14 +939,24 @@ fn join_drain(rx: &std::sync::mpsc::Receiver<Vec<u8>>, child_id: u32) -> Vec<u8>
     match rx.recv_timeout(DRAIN_GRACE) {
         Ok(buf) => buf,
         Err(_) => {
-            RIZIN_DRAINS_ABANDONED.fetch_add(1, Ordering::Relaxed);
+            let abandoned = RIZIN_DRAINS_ABANDONED.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::error!(
                 pid = child_id,
                 grace_s = DRAIN_GRACE.as_secs(),
+                abandoned,
                 "rizin stdout still held open after its process tree exited; \
                  abandoning the reader (a process outside our containment \
                  inherited the pipe). Recovery facts for this binary are lost."
             );
+            if abandoned == RIZIN_MAX_ABANDONED_DRAINS {
+                disable();
+                tracing::error!(
+                    abandoned,
+                    limit = RIZIN_MAX_ABANDONED_DRAINS,
+                    "rizin disabled for the rest of this process: too many \
+                     abandoned stdout readers, each a leaked thread and buffer"
+                );
+            }
             Vec::new()
         }
     }
