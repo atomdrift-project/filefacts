@@ -189,6 +189,18 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     if !macros.is_empty() {
         push_feature(&mut features, "macros");
         let count = macros.len() as f64;
+        // Uncompressed bytes of the VBA project. A project someone wrote is
+        // tens of kilobytes; the padding that hides a payload, or defeats a
+        // scanner's size limit, shows up here and nowhere else -- the
+        // document itself stays small because the padding compresses away.
+        let vba_bytes: u64 = macros
+            .iter()
+            .filter_map(|m| m.as_str())
+            .filter_map(|name| zip.by_name(name).ok().map(|e| e.size()))
+            .sum();
+        if vba_bytes > 0 {
+            metrics.insert("office.vba_project_size", vba_bytes as f64);
+        }
         values.insert("office.macros", JsonValue::Array(macros));
         metrics.insert("office.macro_count", count);
     }
@@ -948,6 +960,29 @@ mod tests {
             v.get("office.company").and_then(|x| x.as_str()),
             Some("Acme Corp")
         );
+    }
+
+    #[test]
+    fn reports_the_uncompressed_size_of_the_vba_project() {
+        // The document stays small because padding compresses away, so the
+        // project's own size is the only place the padding is visible. One
+        // maldoc family ships a 2.3 MB VBA project inside a 68 KB .docx.
+        let blob = vec![b'A'; 40_000];
+        let z = build_ooxml(&[
+            ("[Content_Types].xml", CONTENT_TYPES_DOCX.as_bytes()),
+            ("word/vbaProject.bin", &blob),
+        ]);
+        let (_, m) = run(&z);
+        // The uncompressed size, not the stored size -- the whole point is
+        // that it survives whatever the container did to it.
+        assert_eq!(m.get("office.vba_project_size"), Some(40_000.0));
+    }
+
+    #[test]
+    fn no_vba_project_size_without_macros() {
+        let z = build_ooxml(&[("[Content_Types].xml", CONTENT_TYPES_DOCX.as_bytes())]);
+        let (_, m) = run(&z);
+        assert_eq!(m.get("office.vba_project_size"), None);
     }
 
     #[test]

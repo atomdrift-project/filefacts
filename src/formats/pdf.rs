@@ -170,6 +170,13 @@ pub(super) fn extract(
     // various PDF producers. Every count is mirrored into the flat
     // metric map so trait rules resolve `field: pdf.<count>`
     // without a kv round-trip.
+    // Objects packed into `/Type /ObjStm` streams never appear in the bytes
+    // as written, so a scan of the file alone reports a document with no
+    // annotations, no pages and no actions in it. Decode them once here and
+    // count against both views.
+    let dict_regions = collect_dict_regions(bytes);
+    let objstm_text = decode_object_streams(bytes, &dict_regions);
+
     let counts: &[(&str, &str, &str)] = &[
         ("page_count", "/Page", "pdf.page_count"),
         ("annotation_count", "/Annot", "pdf.annotation_count"),
@@ -187,7 +194,11 @@ pub(super) fn extract(
     let mut page_count_value: u32 = 0;
     let mut annotation_count_value: u32 = 0;
     for (kv_key, name, metric_key) in counts {
-        let c = count_type_occurrences(bytes, name.as_bytes());
+        let c = count_type_occurrences(bytes, name.as_bytes())
+            + objstm_text
+                .iter()
+                .map(|(_, text)| count_type_occurrences(text, name.as_bytes()))
+                .sum::<usize>();
         if c > 0 {
             shape.insert((*kv_key).into(), json!(c));
             metrics.insert((*metric_key).to_string(), c as f64);
@@ -262,14 +273,14 @@ pub(super) fn extract(
     // / annotation / acroform sites, so heavily-staged malicious
     // PDFs may show fewer source labels than cleave's xref-aware
     // parser. The `kind` and `snippet` fields stay accurate.
-    let dict_regions = collect_dict_regions(bytes);
     if dict_regions.len() >= MAX_DICT_REGIONS {
         // Signal to trait rules that the object-graph scan stopped
         // early. The cap is a DoS guard, not a sizing heuristic, so
         // anything that hits it is well outside the real-world range.
         metrics.insert("pdf.dict_region_truncated", 1.0);
     }
-    let actions = scan_actions(bytes, &dict_regions);
+    let mut actions = scan_actions(bytes, &dict_regions);
+    actions.extend(objstm_actions(&objstm_text));
     let uri_action_count = action_count_by_kind(&actions, "uri");
     let javascript_action_count = action_count_by_kind(&actions, "javascript");
     if !actions.is_empty() {
@@ -925,6 +936,58 @@ fn scan_actions(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<JsonValue> {
                 }
                 pos = next;
             }
+        }
+    }
+    out
+}
+
+/// Scan actions packed inside `/Type /ObjStm` object streams.
+///
+/// A cross-reference stream file keeps most of its objects inside compressed
+/// object streams, so the annotation that carries the document's only link
+/// never appears in the raw bytes at all -- and a scan of the file as written
+/// reports a PDF with no actions in it. Malicious documents are routinely
+/// built this way, which makes the compressed side the more important one.
+///
+/// Objects inside an ObjStm have no `obj` framing -- the stream is a table of
+/// offsets followed by the dictionaries end to end -- so the decoded buffer is
+/// handed to [`scan_actions`] as a single region.
+fn objstm_actions(decoded: &[(Option<u32>, Vec<u8>)]) -> Vec<JsonValue> {
+    let mut out = Vec::new();
+    for (obj_id, text) in decoded {
+        let whole = DictRegion {
+            start: 0,
+            end: text.len(),
+            obj_id: *obj_id,
+            stream_range: None,
+        };
+        for mut action in scan_actions(text, std::slice::from_ref(&whole)) {
+            // Say where it really came from: inside object stream <id>, not
+            // object <id> itself.
+            if let (Some(map), Some(id)) = (action.as_object_mut(), *obj_id) {
+                map.insert("source".into(), JsonValue::String(format!("objstm:{id}")));
+            }
+            out.push(action);
+        }
+    }
+    out
+}
+
+/// Inflate every `/Type /ObjStm` stream, returning each carrier's object id
+/// alongside the objects it holds.
+fn decode_object_streams(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<(Option<u32>, Vec<u8>)> {
+    let mut out = Vec::new();
+    for region in dict_regions {
+        let Some((s, e)) = region.stream_range else {
+            continue;
+        };
+        let dict = &bytes[region.start..region.end];
+        if !contains_substring(dict, b"/Type /ObjStm") && !contains_substring(dict, b"/Type/ObjStm")
+        {
+            continue;
+        }
+        if let Some(decoded) = inflate(&bytes[s..e]) {
+            out.push((region.obj_id, decoded));
         }
     }
     out
@@ -1819,11 +1882,19 @@ fn contains_token(bytes: &[u8], needle: &[u8]) -> bool {
 /// random binary. Require both a leading non-name byte and a
 /// trailing non-alpha to confirm it's a real `/AA` action key.
 fn contains_keyword(bytes: &[u8], needle: &[u8]) -> bool {
+    // A name key sits inside a dictionary, so it has a delimiter or
+    // whitespace on both sides. Checking only the trailing byte let the two
+    // letters through when they fell inside compressed image data, which
+    // reported additional actions on every other scanned document.
+    fn is_delim(b: u8) -> bool {
+        b.is_ascii_whitespace() || matches!(b, b'<' | b'>' | b'[' | b']' | b'(' | b')' | b'/')
+    }
     let mut i = 0;
     while i + needle.len() <= bytes.len() {
         if &bytes[i..i + needle.len()] == needle {
+            let before = if i == 0 { b' ' } else { bytes[i - 1] };
             let after = bytes.get(i + needle.len()).copied().unwrap_or(b' ');
-            if !after.is_ascii_alphabetic() && after != b'_' {
+            if is_delim(before) && (is_delim(after) || after.is_ascii_digit()) {
                 return true;
             }
         }
@@ -2426,6 +2497,34 @@ mod tests {
     }
 
     #[test]
+    fn additional_actions_needs_a_real_dictionary_key() {
+        // `/AA` inside compressed image data is two letters, not an action.
+        let mut pdf = b"%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\n".to_vec();
+        pdf.extend_from_slice(
+            b"2 0 obj << /Length 8 >> stream\n\xb5\x89/AA\x95\x1cv\nendstream endobj\n",
+        );
+        let (v, _) = extract_pdf(&pdf);
+        let features = v
+            .get("pdf.catalog")
+            .and_then(|c| c.get("features"))
+            .and_then(|f| f.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert!(!features.contains(&"additional_actions"), "{features:?}");
+
+        // The real key still registers.
+        let real = b"%PDF-1.4\n1 0 obj << /Type /Catalog /AA << /O 3 0 R >> >> endobj\n";
+        let (v2, _) = extract_pdf(real);
+        let f2 = v2
+            .get("pdf.catalog")
+            .and_then(|c| c.get("features"))
+            .and_then(|f| f.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert!(f2.contains(&"additional_actions"), "{f2:?}");
+    }
+
+    #[test]
     fn stream_length_mismatch_detected() {
         // /Length declares 10 bytes but body is 3 bytes.
         let pdf = b"%PDF-1.5\n5 0 obj << /Length 10 /Filter /FlateDecode >> stream\nXYZ\nendstream endobj\n%%EOF";
@@ -2477,6 +2576,71 @@ mod tests {
 %%EOF";
         let (_, m) = extract_pdf(pdf);
         assert_eq!(m.get("pdf.javascript_action_count"), Some(2.0));
+        assert_eq!(m.get("pdf.uri_action_count"), Some(1.0));
+    }
+
+    /// A PDF whose objects live in one Flate-compressed `/Type /ObjStm`.
+    fn pdf_with_object_stream(inner: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(inner).unwrap();
+        let body = enc.finish().unwrap();
+        let mut pdf =
+            b"%PDF-1.5\n7 0 obj << /Type /ObjStm /N 1 /First 0 /Filter /FlateDecode >> stream\n"
+                .to_vec();
+        pdf.extend_from_slice(&body);
+        pdf.extend_from_slice(b"\nendstream endobj\n");
+        pdf
+    }
+
+    #[test]
+    fn type_counts_include_objects_inside_object_streams() {
+        // A cross-reference-stream PDF keeps its annotations and pages in a
+        // compressed ObjStm. Counting only the bytes as written reported a
+        // document with no annotations in it, which is what a full-page link
+        // to an executable hides behind.
+        let pdf = pdf_with_object_stream(
+            b"31 0 44 60 <</Subtype/Link/Type/Annot>><</Type/Page>><</Type/Annot>>",
+        );
+        let (_, m) = extract_pdf(&pdf);
+        assert_eq!(m.get("pdf.annotation_count"), Some(2.0));
+        assert_eq!(m.get("pdf.page_count"), Some(1.0));
+    }
+
+    #[test]
+    fn uncompressed_object_streams_are_not_double_counted() {
+        // The same key written plainly must still count exactly once.
+        let pdf = b"%PDF-1.4\n1 0 obj << /Type /Annot >> endobj\n";
+        let (_, m) = extract_pdf(pdf);
+        assert_eq!(m.get("pdf.annotation_count"), Some(1.0));
+    }
+
+    #[test]
+    fn actions_inside_object_streams_are_found() {
+        // A cross-reference-stream PDF keeps its annotations inside a
+        // compressed ObjStm. Scanning only the bytes as written reports a
+        // document with no links in it.
+        let inner = b"31 0 44 60 <</S/URI/URI(https://example.invalid/setup.exe)>>";
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        use std::io::Write;
+        enc.write_all(inner).unwrap();
+        let body = enc.finish().unwrap();
+        let mut pdf =
+            b"%PDF-1.5\n7 0 obj << /Type /ObjStm /N 1 /First 0 /Filter /FlateDecode >> stream\n"
+                .to_vec();
+        pdf.extend_from_slice(&body);
+        pdf.extend_from_slice(b"\nendstream endobj\n");
+        let (v, m) = extract_pdf(&pdf);
+        let actions = v.get("pdf.actions").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0]["kind"], "uri");
+        assert_eq!(actions[0]["source"], "objstm:7");
+        assert!(
+            actions[0]["snippet"]
+                .as_str()
+                .unwrap()
+                .contains("setup.exe")
+        );
         assert_eq!(m.get("pdf.uri_action_count"), Some(1.0));
     }
 

@@ -166,6 +166,12 @@ pub(super) fn extract(
         data_directories(&pe, values);
         data_directory_anomalies(&pe, bytes, values, metrics);
         super::pe_image_hash::extract(&pe, bytes, values, metrics);
+        // The one wall-clock read in the PE path; see pe_signature_trust for
+        // why expiry is kept out of the content-derived facts.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        super::pe_signature_trust::derive(values, metrics, now);
         super::pe_rich::extract(bytes, values);
         super::upx::detect(bytes, values);
         let go_sections = super::go_buildinfo::GoSections {

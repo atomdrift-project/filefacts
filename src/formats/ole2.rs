@@ -18,6 +18,8 @@
 //!   `EncryptedPackage` streams), `"ole_objects"`
 //!   (`\1Ole10Native` streams).
 //! - `office.macro_count`, `office.stream_count` — metrics.
+//! - `office.sheet_count`, `office.xlm_sheet_count`,
+//!   `office.hidden_sheet_count` — BIFF worksheet inventory.
 //!
 //! Metadata / property-set parsing is deferred to a follow-up slice;
 //! the SummaryInformation stream uses a documented but non-trivial
@@ -43,6 +45,7 @@ const MAX_STREAMS: usize = 4096;
 /// controlled; a malformed file could otherwise request unbounded
 /// reads.
 const MAX_PROPERTIES_PER_SECTION: usize = 256;
+const MAX_NAMES: usize = 256;
 
 pub(super) fn extract(
     bytes: &[u8],
@@ -76,9 +79,15 @@ pub(super) fn extract(
 
         // Macros live under `/VBA/` storage. Some macro-enabled
         // templates also use `Macros/` or `_VBA_PROJECT_CUR/`; cover
-        // all the documented forms.
+        // all the documented forms. Excel writes the project directly as
+        // `/_VBA_PROJECT`, which the `/vba` form misses -- the underscore
+        // sits between the separator and the name.
         if entry.is_storage() {
-            if lower.contains("/vba") || lower == "/macros" || lower.contains("/macros/") {
+            if lower.contains("/vba")
+                || lower.contains("/_vba_project")
+                || lower == "/macros"
+                || lower.contains("/macros/")
+            {
                 macro_count += 1;
             }
             // Storage entries carry a CLSID identifying the OLE class
@@ -139,6 +148,74 @@ pub(super) fn extract(
     if macro_count > 0 {
         features.push("macros");
         metrics.insert("office.macro_count", macro_count as f64);
+    }
+
+    // Excel 4.0 macro sheets. Deprecated since the 1990s and disabled by
+    // default from 2021 precisely because of the maldoc wave that used them,
+    // so a workbook still declaring one is worth reporting on its own.
+    let workbook = ["Workbook", "Book"]
+        .iter()
+        .find_map(|name| read_stream_data(&mut comp, name))
+        .unwrap_or_default();
+    let workbook = if biff_encrypted(&workbook) {
+        Vec::new()
+    } else {
+        workbook
+    };
+    let sheets = boundsheets(&workbook);
+    let names = defined_names(&workbook);
+    for auto in ["auto_open", "auto_close"] {
+        if names.iter().any(|n| n == auto) {
+            features.push(if auto == "auto_open" {
+                "auto_open"
+            } else {
+                "auto_close"
+            });
+        }
+    }
+    if !names.is_empty() {
+        metrics.insert("office.name_count", names.len() as f64);
+        // XLM payloads live in defined names -- each one labels a cell the
+        // macro sheet calls -- so the names themselves are worth reading.
+        values.insert(
+            "office.names",
+            JsonValue::Array(
+                names
+                    .iter()
+                    .take(MAX_NAMES)
+                    .cloned()
+                    .map(JsonValue::String)
+                    .collect(),
+            ),
+        );
+    }
+    if !sheets.is_empty() {
+        let xlm = sheets.iter().filter(|s| s.kind == SHEET_XLM).count();
+        let hidden = sheets.iter().filter(|s| s.visibility != 0).count();
+        metrics.insert("office.sheet_count", sheets.len() as f64);
+        values.insert(
+            "office.sheet_names",
+            JsonValue::Array(
+                sheets
+                    .iter()
+                    .filter(|s| !s.name.is_empty())
+                    .map(|s| JsonValue::String(s.name.clone()))
+                    .collect(),
+            ),
+        );
+        if xlm > 0 {
+            features.push("xlm_macros");
+            metrics.insert("office.xlm_sheet_count", xlm as f64);
+        }
+        if hidden > 0 {
+            metrics.insert("office.hidden_sheet_count", hidden as f64);
+        }
+        // Visibility 2 is "very hidden": the sheet cannot be unhidden from
+        // Excel's own UI, only from VBA. Nothing a person maintaining a
+        // workbook has a reason to set.
+        if sheets.iter().any(|s| s.visibility == SHEET_VERY_HIDDEN) {
+            features.push("veryhidden_sheets");
+        }
     }
     if had_ole10native || had_object_pool {
         features.push("ole_objects");
@@ -337,6 +414,173 @@ fn parse_document_summary_information(data: &[u8]) -> serde_json::Map<String, Js
             read_property(section, val_off).or_else(|| read_property_i32(section, val_off))
         {
             out.insert(key.into(), value);
+        }
+    }
+    out
+}
+
+/// A worksheet declared by a BIFF `BOUNDSHEET` record.
+#[derive(Debug, PartialEq, Eq)]
+struct BoundSheet {
+    /// 0 = worksheet, 1 = Excel 4.0 macro sheet, 2 = chart, 6 = VB module.
+    kind: u8,
+    /// 0 = visible, 1 = hidden, 2 = very hidden.
+    visibility: u8,
+    name: String,
+}
+
+/// Excel 4.0 macro sheet.
+const SHEET_XLM: u8 = 1;
+const SHEET_VERY_HIDDEN: u8 = 2;
+
+/// Built-in defined names, stored as an index rather than as text.
+/// `auto_open` and `auto_close` are the two that make a workbook run
+/// something without the reader touching anything.
+const BUILTIN_NAMES: [&str; 14] = [
+    "consolidate_area",
+    "auto_open",
+    "auto_close",
+    "extract",
+    "database",
+    "criteria",
+    "print_area",
+    "print_titles",
+    "recorder",
+    "data_form",
+    "auto_activate",
+    "auto_deactivate",
+    "sheet_title",
+    "filter_database",
+];
+
+/// Read the `BOUNDSHEET` records from a BIFF workbook stream.
+///
+/// Excel 4.0 macro sheets are the payload surface of the XLM maldoc wave:
+/// they hold formulas, not VBA, so a workbook carrying one has no
+/// `_VBA_PROJECT` stream and looks macro-free to anything that only counts
+/// those. The sheet type lives here and nowhere else.
+///
+/// Walks the record stream properly rather than scanning for the record id —
+/// a `0x0085` byte pair occurs constantly inside cell data, and scanning
+/// finds sheets in files that have none.
+fn defined_names(data: &[u8]) -> Vec<String> {
+    const DEFINEDNAME: u16 = 0x0018;
+    const BUILTIN: u16 = 0x0020;
+    // grbit(2) chKey(1) cch(1) cce(2) reserved(2) itab(2) then four length
+    // bytes. BIFF8 then spends one byte on the string encoding before the
+    // name itself; BIFF5 stores the bytes directly.
+    const FIXED: usize = 14;
+    let biff8 = biff_version(data) >= 0x0600;
+    let start = if biff8 { FIXED + 1 } else { FIXED };
+    let mut out = Vec::new();
+    for (id, body) in biff_records(data) {
+        let cch = match body.get(3) {
+            Some(&c) if body.len() > start && id == DEFINEDNAME => c as usize,
+            _ => continue,
+        };
+        let grbit = u16::from_le_bytes([body[0], body[1]]);
+        // A built-in name is stored as its index rather than its text, and is
+        // always one character long.
+        if grbit & BUILTIN != 0 && cch == 1 {
+            let idx = body[start];
+            out.push(match BUILTIN_NAMES.get(idx as usize) {
+                Some(name) => (*name).to_string(),
+                None => format!("builtin_{idx}"),
+            });
+            continue;
+        }
+        // Otherwise it is text: BIFF8 marks a wide string in the byte before
+        // it, and the names that matter here are all ASCII either way.
+        let wide = biff8 && body[FIXED] & 1 != 0;
+        let step = if wide { 2 } else { 1 };
+        let name: String = (0..cch)
+            .filter_map(|i| body.get(start + i * step).map(|&b| b as char))
+            .collect();
+        if name.chars().count() == cch {
+            out.push(name.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
+/// A sheet name: a length, then in BIFF8 an encoding byte and possibly
+/// two-byte characters. Builders name sheets with random tokens, so the name
+/// is worth reading even though nothing else here needs it.
+fn sheet_name(rest: &[u8], biff8: bool) -> String {
+    let cch = rest[0] as usize;
+    let (start, step) = match biff8 {
+        true if rest.get(1).is_some_and(|f| f & 1 != 0) => (2, 2),
+        true => (2, 1),
+        false => (1, 1),
+    };
+    (0..cch)
+        .filter_map(|i| rest.get(start + i * step).map(|&b| b as char))
+        .collect()
+}
+
+/// Whether the workbook's record payloads are encrypted.
+///
+/// BIFF encryption leaves the record headers in the clear and enciphers the
+/// bodies, so the walk still succeeds but every field it reads is ciphertext
+/// -- sheet names come out as mojibake, and a random byte in the right place
+/// would announce a macro sheet that is not there. `FILEPASS` appears in the
+/// globals substream ahead of anything worth reading.
+fn biff_encrypted(data: &[u8]) -> bool {
+    const FILEPASS: u16 = 0x002F;
+    const BOUNDSHEET: u16 = 0x0085;
+    biff_records(data)
+        .take_while(|(id, _)| *id != BOUNDSHEET)
+        .any(|(id, _)| id == FILEPASS)
+}
+
+/// The BIFF version from the leading `BOF` record: `0x0500` for BIFF5,
+/// `0x0600` for BIFF8. Record layouts differ between them.
+fn biff_version(data: &[u8]) -> u16 {
+    match data.get(4..6) {
+        Some(v) => u16::from_le_bytes([v[0], v[1]]),
+        None => 0,
+    }
+}
+
+/// Walk a BIFF stream, yielding each record's id and payload.
+///
+/// A workbook stream opens with `BOF`; anything else is not BIFF, and walking
+/// it would produce records out of arbitrary bytes.
+fn biff_records(data: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
+    const BOF: u16 = 0x0809;
+    let biff = data.len() >= 4 && u16::from_le_bytes([data[0], data[1]]) == BOF;
+    let mut pos = 0usize;
+    std::iter::from_fn(move || {
+        if !biff {
+            return None;
+        }
+        if pos + 4 > data.len() {
+            return None;
+        }
+        let id = u16::from_le_bytes([data[pos], data[pos + 1]]);
+        let len = u16::from_le_bytes([data[pos + 2], data[pos + 3]]) as usize;
+        let body = pos + 4;
+        if body + len > data.len() {
+            return None;
+        }
+        pos = body + len;
+        Some((id, &data[body..body + len]))
+    })
+}
+
+fn boundsheets(data: &[u8]) -> Vec<BoundSheet> {
+    const BOUNDSHEET: u16 = 0x0085;
+    let biff8 = biff_version(data) >= 0x0600;
+    let mut out = Vec::new();
+    for (id, body) in biff_records(data) {
+        // lbPlyPos(4) + grbit(2) + cch(1) is the shortest useful BOUNDSHEET.
+        if id == BOUNDSHEET && body.len() >= 7 {
+            let grbit = u16::from_le_bytes([body[4], body[5]]);
+            out.push(BoundSheet {
+                kind: (grbit >> 8) as u8,
+                visibility: (grbit & 0xFF) as u8,
+                name: sheet_name(&body[6..], biff8),
+            });
         }
     }
     out
@@ -1285,5 +1529,246 @@ mod tests {
             lookup_dangerous_clsid("79eac9d0-baf9-11ce-8c82-00aa004ba90b"),
             Some("StdHlink")
         );
+    }
+
+    /// The `office.features[]` array as owned strings.
+    fn feature_list(v: &Values) -> Vec<String> {
+        v.get("office.features")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A BIFF workbook stream: BOF, then one BOUNDSHEET per sheet, then one
+    /// DEFINEDNAME per entry. Mirrors what Excel writes closely enough for
+    /// the extractor, which never decodes cell data.
+    fn workbook(sheets: &[(u8, u8, &str)], builtin_names: &[u8]) -> Vec<u8> {
+        let mut d = vec![0x09, 0x08, 0x04, 0x00, 0x00, 0x06, 0, 0];
+        for (kind, vis, name) in sheets {
+            let body_len = 8 + name.len();
+            d.extend_from_slice(&[0x85, 0x00]);
+            d.extend_from_slice(&(body_len as u16).to_le_bytes());
+            d.extend_from_slice(&[0, 0, 0, 0, *vis, *kind]);
+            d.push(name.len() as u8);
+            d.push(0); // compressed string
+            d.extend_from_slice(name.as_bytes());
+        }
+        for idx in builtin_names {
+            d.extend_from_slice(&[0x18, 0x00, 0x10, 0x00]);
+            d.extend_from_slice(&[0x20, 0x00, 0, 1]);
+            d.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            d.extend_from_slice(&[0, *idx]);
+        }
+        d
+    }
+
+    #[test]
+    fn xlm_macro_workbook_reports_its_sheets_and_auto_open() {
+        // The whole emission path, not just the record walk: an Excel 4.0
+        // macro sheet beside an ordinary one, named Auto_Open.
+        let wb = workbook(&[(0, 0, "Sheet1"), (SHEET_XLM, 0, "rRQxz")], &[1]);
+        let cfb = build_cfb(&[("/Workbook", &wb)]);
+        let (v, m) = run(&cfb);
+
+        assert_eq!(m.get("office.sheet_count"), Some(2.0));
+        assert_eq!(m.get("office.xlm_sheet_count"), Some(1.0));
+        assert_eq!(m.get("office.name_count"), Some(1.0));
+        assert_eq!(m.get("office.hidden_sheet_count"), None);
+
+        let features = feature_list(&v);
+        let features: Vec<&str> = features.iter().map(String::as_str).collect();
+        assert!(features.contains(&"xlm_macros"), "{features:?}");
+        assert!(features.contains(&"auto_open"), "{features:?}");
+        assert!(!features.contains(&"veryhidden_sheets"), "{features:?}");
+
+        let sheets = v
+            .get("office.sheet_names")
+            .and_then(|x| x.as_array())
+            .unwrap();
+        let sheets: Vec<&str> = sheets.iter().filter_map(|x| x.as_str()).collect();
+        assert_eq!(sheets, vec!["Sheet1", "rRQxz"]);
+        assert_eq!(v.get("office.names").unwrap()[0], "auto_open");
+    }
+
+    #[test]
+    fn ordinary_workbook_reports_no_macro_surface() {
+        // The negative case that keeps the XLM traits off every spreadsheet.
+        let wb = workbook(&[(0, 0, "Sheet1"), (0, 0, "Sheet2")], &[6]);
+        let cfb = build_cfb(&[("/Workbook", &wb)]);
+        let (v, m) = run(&cfb);
+
+        assert_eq!(m.get("office.sheet_count"), Some(2.0));
+        assert_eq!(m.get("office.xlm_sheet_count"), None);
+        let features = feature_list(&v);
+        let features: Vec<&str> = features.iter().map(String::as_str).collect();
+        assert!(!features.contains(&"xlm_macros"), "{features:?}");
+        assert!(!features.contains(&"auto_open"), "{features:?}");
+        // Built-in 6 is Print_Area, and it is named, not numbered.
+        assert_eq!(v.get("office.names").unwrap()[0], "print_area");
+    }
+
+    #[test]
+    fn very_hidden_sheet_is_reported_separately_from_hidden() {
+        let wb = workbook(&[(0, 0, "Sheet1"), (SHEET_XLM, 2, "x")], &[]);
+        let cfb = build_cfb(&[("/Workbook", &wb)]);
+        let (v, m) = run(&cfb);
+        assert_eq!(m.get("office.hidden_sheet_count"), Some(1.0));
+        let features = feature_list(&v);
+        let features: Vec<&str> = features.iter().map(String::as_str).collect();
+        assert!(features.contains(&"veryhidden_sheets"), "{features:?}");
+    }
+
+    #[test]
+    fn encrypted_workbook_emits_no_sheet_inventory() {
+        // Every field after FILEPASS is ciphertext. Reading one would invent
+        // sheets, and a stray byte would announce a macro sheet.
+        let mut wb = vec![0x09, 0x08, 0x04, 0x00, 0x00, 0x06, 0, 0];
+        wb.extend_from_slice(&[0x2F, 0x00, 0x02, 0x00, 0x01, 0x00]);
+        wb.extend_from_slice(&workbook(&[(SHEET_XLM, 0, "x")], &[1])[8..]);
+        let cfb = build_cfb(&[("/Workbook", &wb)]);
+        let (v, m) = run(&cfb);
+        assert_eq!(m.get("office.sheet_count"), None);
+        assert_eq!(m.get("office.xlm_sheet_count"), None);
+        assert!(v.get("office.sheet_names").is_none());
+    }
+
+    #[test]
+    fn vba_project_storage_counts_as_macros() {
+        // Excel writes the project as `/_VBA_PROJECT`. Matching only `/vba`
+        // missed it, because the underscore sits between the separator and
+        // the name -- so a macro-bearing workbook reported none.
+        let cfb = build_cfb(&[("/Book", b"x"), ("/_VBA_PROJECT/dir", b"y")]);
+        let (v, m) = run(&cfb);
+        assert!(m.get("office.macro_count").unwrap_or(0.0) >= 1.0);
+        let features = feature_list(&v);
+        let features: Vec<&str> = features.iter().map(String::as_str).collect();
+        assert!(features.contains(&"macros"), "{features:?}");
+    }
+
+    #[test]
+    fn boundsheets_reads_sheet_kind_and_visibility() {
+        // BOF, then two BOUNDSHEET records: a visible worksheet and a very
+        // hidden Excel 4.0 macro sheet -- the XLM maldoc shape.
+        let mut d = vec![0x09, 0x08, 0x04, 0x00, 0, 0, 0, 0];
+        for (kind, vis) in [(0u8, 0u8), (1u8, 2u8)] {
+            d.extend_from_slice(&[0x85, 0x00, 0x08, 0x00]);
+            d.extend_from_slice(&[0, 0, 0, 0]); // lbPlyPos
+            d.extend_from_slice(&[vis, kind]); // grbit: lo visibility, hi kind
+            d.extend_from_slice(&[0, 0]); // cch + grbitChr
+        }
+        let sheets = boundsheets(&d);
+        assert_eq!(sheets.len(), 2);
+        assert_eq!((sheets[0].kind, sheets[0].visibility), (0, 0));
+        assert_eq!((sheets[1].kind, sheets[1].visibility), (SHEET_XLM, 2));
+    }
+
+    #[test]
+    fn boundsheets_reports_ordinary_hidden_apart_from_very_hidden() {
+        let mut d = vec![0x09, 0x08, 0x04, 0x00, 0, 0, 0, 0];
+        for vis in [0u8, 1, 2] {
+            d.extend_from_slice(&[0x85, 0x00, 0x08, 0x00]);
+            d.extend_from_slice(&[0, 0, 0, 0, vis, 0, 0, 0]);
+        }
+        let sheets = boundsheets(&d);
+        assert_eq!(sheets.iter().filter(|s| s.visibility != 0).count(), 2);
+        assert_eq!(
+            sheets
+                .iter()
+                .filter(|s| s.visibility == SHEET_VERY_HIDDEN)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn defined_names_read_builtin_indices() {
+        // BOF (BIFF8), then Auto_Open and Auto_Close as built-in names.
+        let mut d = vec![0x09, 0x08, 0x04, 0x00, 0x00, 0x06, 0, 0];
+        for idx in [1u8, 2] {
+            // Auto_Open, Auto_Close
+            d.extend_from_slice(&[0x18, 0x00, 0x10, 0x00]);
+            d.extend_from_slice(&[0x20, 0x00]); // grbit: fBuiltin
+            d.extend_from_slice(&[0, 1]); // chKey, cch = 1
+            d.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // cce..lengths
+            d.extend_from_slice(&[0, idx]); // name flags, builtin index
+        }
+        assert_eq!(defined_names(&d), vec!["auto_open", "auto_close"]);
+    }
+
+    #[test]
+    fn defined_names_read_the_text_form_too() {
+        // A named range is text, not a builtin index; reading its first byte
+        // as an index would turn an ordinary name into a phantom Auto_Open.
+        let mut d = vec![0x09, 0x08, 0x04, 0x00, 0x00, 0x06, 0, 0];
+        d.extend_from_slice(&[0x18, 0x00, 0x14, 0x00]);
+        d.extend_from_slice(&[0x00, 0x00]); // grbit: not builtin
+        d.extend_from_slice(&[0, 5]); // chKey, cch = 5
+        d.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        d.extend_from_slice(&[0]); // compressed string
+        d.extend_from_slice(b"Total");
+        assert_eq!(defined_names(&d), vec!["total"]);
+        assert!(defined_names(b"not biff").is_empty());
+    }
+
+    #[test]
+    fn defined_names_read_biff5_without_the_encoding_byte() {
+        // BIFF5 has no string-flags byte, so the name starts one earlier.
+        // Reading it at the BIFF8 offset loses the first character.
+        let mut d = vec![0x09, 0x08, 0x04, 0x00, 0x00, 0x05, 0, 0];
+        d.extend_from_slice(&[0x18, 0x00, 0x17, 0x00]);
+        d.extend_from_slice(&[0x00, 0x00, 0, 9]);
+        d.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        d.extend_from_slice(b"Auto_Open");
+        assert_eq!(defined_names(&d), vec!["auto_open"]);
+    }
+
+    #[test]
+    fn boundsheets_read_the_sheet_name() {
+        let mut d = vec![0x09, 0x08, 0x04, 0x00, 0x00, 0x06, 0, 0];
+        d.extend_from_slice(&[0x85, 0x00, 0x0D, 0x00]);
+        d.extend_from_slice(&[0, 0, 0, 0]); // lbPlyPos
+        d.extend_from_slice(&[0, 1]); // grbit: visible XLM macro sheet
+        d.extend_from_slice(&[5, 0]); // cch, compressed
+        d.extend_from_slice(b"rRQxz");
+        assert_eq!(boundsheets(&d)[0].name, "rRQxz");
+    }
+
+    #[test]
+    fn encrypted_workbooks_are_not_read() {
+        // FILEPASS ahead of the sheet table: every payload after it is
+        // ciphertext, and reading one would invent a sheet.
+        let mut d = vec![0x09, 0x08, 0x04, 0x00, 0x00, 0x06, 0, 0];
+        d.extend_from_slice(&[0x2F, 0x00, 0x02, 0x00, 0x01, 0x00]);
+        assert!(biff_encrypted(&d));
+        assert!(!biff_encrypted(&[0x09, 0x08, 0x04, 0x00, 0x00, 0x06, 0, 0]));
+    }
+
+    #[test]
+    fn boundsheets_requires_a_biff_stream() {
+        // Without the leading BOF this is not a workbook, and walking it would
+        // invent sheets out of arbitrary bytes.
+        assert!(boundsheets(b"not a biff stream at all").is_empty());
+        assert!(boundsheets(&[]).is_empty());
+    }
+
+    #[test]
+    fn boundsheets_ignores_the_record_id_inside_cell_data() {
+        // 0x0085 occurs constantly as ordinary data. A record walk steps over
+        // it; a byte scan would report a sheet here.
+        let mut d = vec![0x09, 0x08, 0x04, 0x00, 0, 0, 0, 0];
+        d.extend_from_slice(&[0xFD, 0x00, 0x0A, 0x00]); // some record, 10 bytes
+        d.extend_from_slice(&[0x85, 0x00, 0x08, 0x00, 0, 0, 0, 0, 2, 1]); // payload
+        assert!(boundsheets(&d).is_empty());
+    }
+
+    #[test]
+    fn boundsheets_stops_at_a_truncated_record() {
+        let mut d = vec![0x09, 0x08, 0x04, 0x00, 0, 0, 0, 0];
+        d.extend_from_slice(&[0x85, 0x00, 0xFF, 0x00]); // claims 255 bytes, has none
+        assert!(boundsheets(&d).is_empty());
     }
 }

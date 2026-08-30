@@ -967,11 +967,37 @@ fn has_svg_root(data: &[u8]) -> bool {
     if data.starts_with(b"<svg ") || data.starts_with(b"<svg>") {
         return true;
     }
-    if !data.starts_with(b"<?xml") && !data.starts_with(b"<!DOCTYPE") {
+    if data.starts_with(b"<!DOCTYPE") {
+        // The preamble allowance is for `<!DOCTYPE svg PUBLIC …>`. A page that
+        // declares itself HTML is HTML however many `<svg>` icons it draws in
+        // its navigation bar, and modern markup puts them in the first
+        // kilobyte.
+        if !doctype_names_svg(data) {
+            return false;
+        }
+    } else if !data.starts_with(b"<?xml") {
         return false;
     }
     let head = &data[..data.len().min(1024)];
-    memchr::memmem::find(head, b"<svg ").is_some() || memchr::memmem::find(head, b"<svg>").is_some()
+    // An `<html>` element ahead of the `<svg>` settles it the same way: the
+    // svg is a child of the page, not the root of the document.
+    if let Some(svg) = memchr::memmem::find(head, b"<svg ").or(memchr::memmem::find(head, b"<svg>"))
+    {
+        return !head[..svg]
+            .windows(5)
+            .any(|w| w.eq_ignore_ascii_case(b"<html"));
+    }
+    false
+}
+
+/// True if a `<!DOCTYPE …>` preamble names `svg` as the root element.
+fn doctype_names_svg(data: &[u8]) -> bool {
+    data.get(9..data.len().min(64))
+        .and_then(|rest| {
+            rest.split(|b| b.is_ascii_whitespace())
+                .find(|w| !w.is_empty())
+        })
+        .is_some_and(|name| name.eq_ignore_ascii_case(b"svg"))
 }
 
 /// Detect XML Plist markers in the first 256 bytes.
@@ -1120,6 +1146,38 @@ fn detect_manifest(path: &Path, data: &[u8]) -> Option<FileType> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+
+    #[test]
+    fn svg_root_needs_a_doctype_that_names_svg() {
+        // The `<!DOCTYPE …>` allowance exists for `<!DOCTYPE svg PUBLIC …>`.
+        // Accepting any doctype and then hunting for `<svg` in the first
+        // kilobyte typed every HTML page with an inline icon as an image,
+        // which skipped every HTML rule for it.
+        assert!(has_svg_root(
+            b"<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"x\">\n<svg xmlns=\"x\"/>"
+        ));
+        assert!(!has_svg_root(b"<!DOCTYPE html>\n<svg xmlns=\"x\"></svg>"));
+        // A `<?xml` prolog is still a legitimate preamble for a real SVG.
+        assert!(has_svg_root(b"<?xml version=\"1.0\"?>\n<svg xmlns=\"x\"/>"));
+    }
+
+    #[test]
+    fn svg_root_yields_to_an_enclosing_html_element() {
+        // XHTML reaches the prolog branch, so the doctype check alone does
+        // not settle it. An `<html>` ahead of the `<svg>` does.
+        assert!(!has_svg_root(
+            b"<?xml version=\"1.0\"?>\n<html xmlns=\"x\"><body><svg width=\"9\"></svg>"
+        ));
+        assert!(!has_svg_root(b"<!DOCTYPE svg><html><svg ></svg>"));
+    }
+
+    #[test]
+    fn svg_root_ignores_a_document_with_no_svg_at_all() {
+        assert!(!has_svg_root(
+            b"<?xml version=\"1.0\"?>\n<rss version=\"2.0\">"
+        ));
+        assert!(!has_svg_root(b"plain text"));
+    }
     use super::*;
 
     #[test]

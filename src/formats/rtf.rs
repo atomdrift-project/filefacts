@@ -21,6 +21,8 @@
 //!    `datafield`.
 //! - `rtf.shape.{control_word_count, group_depth_max, brace_count}`
 //!    — structural counts that fingerprint generator authenticity.
+//! - `rtf.control_word_density` — control words per kilobyte, which
+//!    separates a document from a file that merely starts like one.
 
 use serde_json::{Value as JsonValue, json};
 
@@ -454,6 +456,18 @@ fn shape(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     values.insert("rtf.shape", JsonValue::Object(obj));
     metrics.insert("rtf.control_word_count", control_words as f64);
     metrics.insert("rtf.group_depth_max", f64::from(max_depth));
+    // Control words per kilobyte. A document is mostly formatting: real RTF
+    // runs tens of control words per KB whatever its size. A file that opens
+    // with `{\rtf` and then spends its bytes on something else -- a hex blob,
+    // an encrypted body, a shape value -- reads far below that, and the ratio
+    // says so without any assumption about how large the file is.
+    if !bytes.is_empty() {
+        let density = control_words as f64 * 1024.0 / bytes.len() as f64;
+        metrics.insert(
+            "rtf.control_word_density",
+            (density * 100.0).round() / 100.0,
+        );
+    }
 }
 
 /// Locate `{\<word>` group opening in `bytes`. Returns the position
@@ -529,6 +543,39 @@ mod tests {
         let mut m = Metrics::new();
         extract(bytes, &mut v, &mut s, &mut m).unwrap();
         (v, m)
+    }
+
+    #[test]
+    fn control_word_density_separates_a_document_from_a_wrapper() {
+        // A document is mostly formatting, so it carries tens of control
+        // words per kilobyte whatever its size. A file that opens with
+        // `{\rtf` and then spends its bytes on a payload sits far below
+        // that, and the ratio says so without knowing what the payload is.
+        let mut doc = b"{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0\\fnil Arial;}}".to_vec();
+        for _ in 0..60 {
+            doc.extend_from_slice(b"\\pard\\f0\\fs20 Some ordinary text.\\par\n");
+        }
+        doc.push(b'}');
+        let (_, m) = extract_rtf(&doc);
+        let dense = m.get("rtf.control_word_density").unwrap();
+        assert!(dense > 20.0, "document density {dense}");
+
+        // Same header, then a megabyte of hex with nothing to format.
+        let mut wrapper = b"{\\rtf1{\\object\\objdata ".to_vec();
+        wrapper.extend(std::iter::repeat_n(b'a', 200_000));
+        wrapper.extend_from_slice(b"}}");
+        let (_, m2) = extract_rtf(&wrapper);
+        let sparse = m2.get("rtf.control_word_density").unwrap();
+        assert!(sparse < 1.0, "wrapper density {sparse}");
+        assert!(dense > sparse * 20.0, "{dense} vs {sparse}");
+    }
+
+    #[test]
+    fn control_word_density_is_absent_for_non_rtf() {
+        // The extractor bails before the shape pass when the magic is
+        // missing, so nothing downstream sees a density of zero.
+        let (_, m) = extract_rtf(b"not an rtf document at all");
+        assert_eq!(m.get("rtf.control_word_density"), None);
     }
 
     #[test]

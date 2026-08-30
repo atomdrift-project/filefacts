@@ -74,6 +74,7 @@ mod pe_debug;
 mod pe_image_hash;
 mod pe_manifest;
 mod pe_rich;
+mod pe_signature_trust;
 mod pe_version_info;
 mod pickle;
 mod pkgmeta;

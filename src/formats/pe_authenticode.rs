@@ -149,6 +149,21 @@ fn parse_pkcs7(der_bytes: &[u8]) -> Option<JsonValue> {
             "not_after".into(),
             JsonValue::String(time_to_string(tbs.validity.not_after)),
         );
+        // Unix forms of the same two instants. The string forms are for
+        // display; these are what a consumer needs to answer "was this
+        // signature made while the certificate was valid?" and "has the
+        // certificate since expired?" without parsing dates. Those are
+        // different questions with different answers: an old but honestly
+        // signed binary fails the second and passes the first, whereas a
+        // backdated or forged one fails the first.
+        obj.insert(
+            "not_before_unix".into(),
+            JsonValue::Number(time_to_unix(tbs.validity.not_before).into()),
+        );
+        obj.insert(
+            "not_after_unix".into(),
+            JsonValue::Number(time_to_unix(tbs.validity.not_after).into()),
+        );
         // Friendly name for the cert's signature algorithm
         // (`sha256WithRSAEncryption` / `ecdsa-with-SHA256` / …). Maps
         // a stable set of OIDs; unknown algorithms surface as their
@@ -192,9 +207,23 @@ fn parse_pkcs7(der_bytes: &[u8]) -> Option<JsonValue> {
     // (OID 1.2.840.113549.1.9.5). Emitted in two forms: the canonical
     // ISO-8601 string for display, plus a Unix timestamp for downstream
     // arithmetic (sign-time-before-build checks, age windows, etc.).
-    if let Some((s, unix)) = extract_signing_time(signer) {
+    // The signer's own attribute first, then the countersignature — the
+    // timestamping authority is where Authenticode actually records signing
+    // time, so most binaries only answer on the second lookup. `signing_time`
+    // means the same thing either way; `signing_time_source` says which
+    // attested it, because a self-asserted time is the signer's word and a
+    // countersigned one is a third party's.
+    let timed = extract_signing_time(signer)
+        .map(|t| (t, "signer"))
+        .or_else(|| extract_countersignature_time(signer).map(|t| (t, "countersignature")))
+        .or_else(|| extract_rfc3161_gen_time(signer).map(|t| (t, "rfc3161")));
+    if let Some(((s, unix), source)) = timed {
         obj.insert("signing_time".into(), JsonValue::String(s));
         obj.insert("signing_time_unix".into(), JsonValue::Number(unix.into()));
+        obj.insert(
+            "signing_time_source".into(),
+            JsonValue::String(source.into()),
+        );
     }
 
     // SpcIndirectDataContent — the structure inside the SignedData's
@@ -446,6 +475,187 @@ fn verify_ecdsa(
     }
 }
 
+/// Signing time from a countersignature, for the common case where the signer
+/// left no `signingTime` of its own.
+///
+/// Authenticode records *when* a signature was made in a countersignature made
+/// by a timestamping authority, not in the signer's own attributes — which is
+/// why reading only the signer leaves the signing time unknown for most real
+/// binaries, Microsoft's included. Two forms exist and both appear in the wild:
+/// the legacy PKCS#9 `counterSignature`, whose value is a SignerInfo carrying
+/// an ordinary `signingTime`, and the RFC 3161 token used by modern signing.
+/// This handles the legacy form; the token form is read by
+/// `extract_rfc3161_gen_time`.
+fn extract_countersignature_time(signer: &cms::signed_data::SignerInfo) -> Option<(String, i64)> {
+    const COUNTERSIGNATURE_OID: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.6");
+    let attrs = signer.unsigned_attrs.as_ref()?;
+    for attr in attrs.iter() {
+        if attr.oid != COUNTERSIGNATURE_OID {
+            continue;
+        }
+        let any = attr.values.as_slice().first()?;
+        let der = any.to_der().ok()?;
+        // The countersignature value is a SignerInfo in its own right, so the
+        // existing signed-attribute walk applies unchanged.
+        if let Ok(counter) = der::Decode::from_der(&der) {
+            let counter: cms::signed_data::SignerInfo = counter;
+            if let Some(found) = extract_signing_time(&counter) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Signing time from an RFC 3161 timestamp token.
+///
+/// Modern Authenticode timestamps with a token rather than a PKCS#9
+/// countersignature: the unsigned attribute (OID 1.3.6.1.4.1.311.3.3.1) holds a
+/// ContentInfo wrapping SignedData whose encapsulated content is a TSTInfo, and
+/// the authority's attested instant is TSTInfo's `genTime`. Every
+/// Microsoft-signed binary checked here uses this form, so without it the
+/// signing time — and any judgement about whether a signature was made while
+/// its certificate was valid — is unavailable for most signed software.
+///
+/// The token is navigated by hand rather than through `cms::SignedData`:
+/// these tokens carry the optional `crls [1]` field, which that model rejects
+/// ("unexpected ASN.1 DER tag: got CONTEXT-SPECIFIC [1]"). Only one value is
+/// wanted, and it sits at a fixed place relative to the `id-ct-TSTInfo`
+/// content-type OID, so the search anchors there and reads forward.
+fn extract_rfc3161_gen_time(signer: &cms::signed_data::SignerInfo) -> Option<(String, i64)> {
+    const MS_TIMESTAMP_TOKEN_OID: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.3.6.1.4.1.311.3.3.1");
+    let attrs = signer.unsigned_attrs.as_ref()?;
+    for attr in attrs.iter() {
+        if attr.oid != MS_TIMESTAMP_TOKEN_OID {
+            continue;
+        }
+        let Some(any) = attr.values.as_slice().first() else {
+            continue;
+        };
+        let Ok(der_bytes) = any.to_der() else {
+            continue;
+        };
+        if let Some(found) = gen_time_from_token(&der_bytes) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// DER encoding of the `id-ct-TSTInfo` OID (1.2.840.113549.1.9.16.1.4), which
+/// appears exactly once in a token — as `encapContentInfo.eContentType`.
+const TST_INFO_OID_DER: &[u8] = &[
+    0x06, 0x0B, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x01, 0x04,
+];
+
+/// Locate the TSTInfo inside a timestamp token and read its `genTime`.
+///
+/// After the content-type OID comes `eContent [0] EXPLICIT OCTET STRING`, whose
+/// bytes are the TSTInfo. Some producers wrap the TSTInfo in a further OCTET
+/// STRING, so one extra layer is unwrapped when present.
+fn gen_time_from_token(token_der: &[u8]) -> Option<(String, i64)> {
+    let at = token_der
+        .windows(TST_INFO_OID_DER.len())
+        .position(|w| w == TST_INFO_OID_DER)?;
+    let after_oid = &token_der[at + TST_INFO_OID_DER.len()..];
+
+    let (tag, explicit, _) = read_tlv(after_oid)?;
+    // [0] EXPLICIT, constructed.
+    if tag != 0xA0 {
+        return None;
+    }
+    let (tag, mut body, _) = read_tlv(explicit)?;
+    if tag != 0x04 {
+        return None;
+    }
+    // Unwrap a redundant OCTET STRING layer if one is present.
+    if let Some((0x04, inner, _)) = read_tlv(body) {
+        if inner.len() + 2 <= body.len() {
+            body = inner;
+        }
+    }
+    gen_time_from_tst_info(body)
+}
+
+/// Read one DER TLV, returning `(tag, contents, remainder)`.
+///
+/// Deliberately minimal: definite-length only, which is all DER permits.
+fn read_tlv(bytes: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let tag = *bytes.first()?;
+    let first_len = *bytes.get(1)? as usize;
+    let (len, header) = if first_len < 0x80 {
+        (first_len, 2)
+    } else {
+        // Long form: the low seven bits give the number of length bytes.
+        let n = first_len & 0x7F;
+        if n == 0 || n > 4 {
+            return None;
+        }
+        let mut len = 0usize;
+        for i in 0..n {
+            len = (len << 8) | *bytes.get(2 + i)? as usize;
+        }
+        (len, 2 + n)
+    };
+    let end = header.checked_add(len)?;
+    if end > bytes.len() {
+        return None;
+    }
+    Some((tag, &bytes[header..end], &bytes[end..]))
+}
+
+/// Pull `genTime` out of a TSTInfo body.
+///
+/// TSTInfo ::= SEQUENCE {
+///     version, policy, messageImprint, serialNumber, genTime, ... }
+///
+/// Only `genTime` is wanted, so the SEQUENCE is walked positionally to its
+/// fifth element rather than modelling the whole structure.
+fn gen_time_from_tst_info(tst_der: &[u8]) -> Option<(String, i64)> {
+    let (tag, mut rest, _) = read_tlv(tst_der)?;
+    if tag != 0x30 {
+        return None;
+    }
+    // version, policy, messageImprint, serialNumber.
+    for _ in 0..4 {
+        let (_, _, next) = read_tlv(rest)?;
+        rest = next;
+    }
+    let (tag, gen_time, _) = read_tlv(rest)?;
+    // GeneralizedTime.
+    if tag != 0x18 {
+        return None;
+    }
+    let text = std::str::from_utf8(gen_time).ok()?;
+    parse_generalized_time(text)
+}
+
+/// Parse `YYYYMMDDHHMMSS[.fff]Z` into a display string and Unix seconds.
+fn parse_generalized_time(text: &str) -> Option<(String, i64)> {
+    let digits = &text[..text.find(['.', 'Z'])?];
+    if digits.len() < 14 {
+        return None;
+    }
+    let num = |a: usize, b: usize| digits[a..b].parse::<i64>().ok();
+    let (y, mo, d) = (num(0, 4)?, num(4, 6)?, num(6, 8)?);
+    let (h, mi, sec) = (num(8, 10)?, num(10, 12)?, num(12, 14)?);
+    // Days since epoch via the civil-from-days algorithm (Howard Hinnant).
+    let yy = if mo <= 2 { y - 1 } else { y };
+    let era = if yy >= 0 { yy } else { yy - 399 } / 400;
+    let yoe = yy - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let unix = days * 86_400 + h * 3_600 + mi * 60 + sec;
+    Some((
+        format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{sec:02} UTC"),
+        unix,
+    ))
+}
+
 /// Walk the SignerInfo's `unsigned_attrs` for the Microsoft nested-
 /// signature attribute (OID 1.3.6.1.4.1.311.2.4.1). When present, the
 /// attribute value is itself a PKCS#7 SignedData blob; we recursively
@@ -687,6 +897,15 @@ fn trim_to_der_object(bytes: &[u8]) -> Option<&[u8]> {
     Some(&bytes[..total])
 }
 
+/// Seconds since the Unix epoch for an X.509 validity instant.
+fn time_to_unix(t: x509_cert::time::Time) -> i64 {
+    use x509_cert::time::Time;
+    match t {
+        Time::UtcTime(v) => v.to_date_time().unix_duration().as_secs() as i64,
+        Time::GeneralTime(v) => v.to_date_time().unix_duration().as_secs() as i64,
+    }
+}
+
 fn time_to_string(t: x509_cert::time::Time) -> String {
     use x509_cert::time::Time;
     match t {
@@ -715,7 +934,8 @@ use crate::formats::common::hex_encode;
 #[cfg(test)]
 mod tests {
     use super::{
-        is_ecdsa_oid, is_rsa_oid, oid_to_label, signature_algorithm_name, trim_to_der_object,
+        gen_time_from_tst_info, is_ecdsa_oid, is_rsa_oid, oid_to_label, parse_generalized_time,
+        read_tlv, signature_algorithm_name, trim_to_der_object,
     };
     use der::oid::ObjectIdentifier;
 
@@ -841,5 +1061,90 @@ mod tests {
         // table yet but still emitted as a usable identifier.
         let oid = ObjectIdentifier::new("1.2.840.113549.1.1.10").unwrap();
         assert_eq!(signature_algorithm_name(&oid), "1.2.840.113549.1.1.10");
+    }
+
+    /// A short-form TLV: tag, one length byte, contents.
+    #[test]
+    fn tlv_short_form_splits_tag_body_and_remainder() {
+        let (tag, body, rest) = read_tlv(&[0x04, 0x03, 1, 2, 3, 0xFF]).unwrap();
+        assert_eq!(tag, 0x04);
+        assert_eq!(body, &[1, 2, 3]);
+        assert_eq!(rest, &[0xFF]);
+    }
+
+    /// Long-form lengths are what real certificates use; a token is far larger
+    /// than 127 bytes, so getting this wrong would fail on every real input.
+    #[test]
+    fn tlv_long_form_length_is_decoded() {
+        let mut input = vec![0x30, 0x82, 0x01, 0x02];
+        input.extend(std::iter::repeat_n(0xAA, 258));
+        let (tag, body, rest) = read_tlv(&input).unwrap();
+        assert_eq!(tag, 0x30);
+        assert_eq!(body.len(), 258);
+        assert!(rest.is_empty());
+    }
+
+    /// A length running past the buffer must be refused, not panic — these
+    /// bytes come from untrusted files.
+    #[test]
+    fn tlv_rejects_length_beyond_input() {
+        assert!(read_tlv(&[0x04, 0x7F, 1, 2, 3]).is_none());
+        assert!(read_tlv(&[0x04]).is_none());
+        assert!(read_tlv(&[]).is_none());
+    }
+
+    #[test]
+    fn generalized_time_converts_to_unix_seconds() {
+        let (display, unix) = parse_generalized_time("20230406164252Z").unwrap();
+        assert_eq!(display, "2023-04-06 16:42:52 UTC");
+        assert_eq!(unix, 1_680_799_372);
+        // Fractional seconds are permitted and ignored.
+        let (_, frac) = parse_generalized_time("20230406164252.500Z").unwrap();
+        assert_eq!(frac, unix);
+    }
+
+    #[test]
+    fn generalized_time_epoch_and_leap_day() {
+        assert_eq!(parse_generalized_time("19700101000000Z").unwrap().1, 0);
+        // 2024-02-29 exists; a naive month table would slip a day here.
+        assert_eq!(
+            parse_generalized_time("20240229000000Z").unwrap().1,
+            1_709_164_800
+        );
+    }
+
+    #[test]
+    fn generalized_time_rejects_truncated_input() {
+        assert!(parse_generalized_time("2023Z").is_none());
+        assert!(parse_generalized_time("20230406164252").is_none());
+    }
+
+    /// genTime is the fifth TSTInfo element; the walk must skip exactly the
+    /// four before it.
+    #[test]
+    fn tst_info_walk_reaches_gen_time() {
+        let mut body = Vec::new();
+        body.extend([0x02, 0x01, 0x01]); // version
+        body.extend([0x06, 0x01, 0x2A]); // policy
+        body.extend([0x30, 0x02, 0x05, 0x00]); // messageImprint
+        body.extend([0x02, 0x01, 0x07]); // serialNumber
+        body.extend([0x18, 0x0F]); // genTime
+        body.extend(b"20230406164252Z");
+        let mut seq = vec![0x30, body.len() as u8];
+        seq.extend(&body);
+
+        let (display, unix) = gen_time_from_tst_info(&seq).unwrap();
+        assert_eq!(display, "2023-04-06 16:42:52 UTC");
+        assert_eq!(unix, 1_680_799_372);
+    }
+
+    /// A TSTInfo that ends before genTime yields nothing rather than reading
+    /// past the structure.
+    #[test]
+    fn tst_info_walk_stops_when_truncated() {
+        let body = [0x02, 0x01, 0x01, 0x06, 0x01, 0x2A];
+        let mut seq = vec![0x30, body.len() as u8];
+        seq.extend(body);
+        assert!(gen_time_from_tst_info(&seq).is_none());
     }
 }

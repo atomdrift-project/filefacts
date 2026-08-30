@@ -2290,6 +2290,36 @@ message CommandMessage {
     }
 
     #[test]
+    fn html_page_with_inline_svg_is_html() {
+        // An icon in the navigation bar does not make the page an image, and
+        // typing it as SVG skips every HTML rule.
+        assert_detect(
+            "panel.html",
+            b"<!DOCTYPE html>\n<html lang=\"en\"><body><nav><svg width=\"20\"></svg></nav>",
+            FileType::Html,
+        );
+    }
+
+    #[test]
+    fn xhtml_with_inline_svg_is_not_an_image() {
+        // An `<?xml` prolog is allowed before an SVG root, so the doctype
+        // check alone does not settle XHTML. An `<html>` element ahead of
+        // the `<svg>` does: the svg is a child of the page.
+        let data = b"<?xml version=\"1.0\"?>\n<html xmlns=\"x\"><body><svg width=\"9\"></svg>";
+        let det = detect(Path::new("page.xhtml"), data).expect("a type");
+        assert_ne!(det.file_type, FileType::Svg);
+    }
+
+    #[test]
+    fn svg_doctype_still_detects_svg() {
+        assert_detect(
+            "noext",
+            b"<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"x\">\n<svg xmlns=\"x\"></svg>",
+            FileType::Svg,
+        );
+    }
+
+    #[test]
     fn xml_prolog_without_svg_stays_xml() {
         assert_detect("noext", b"<?xml version=\"1.0\"?>\n<root/>", FileType::Xml);
     }
