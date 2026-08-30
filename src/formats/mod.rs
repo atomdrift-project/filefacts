@@ -380,7 +380,20 @@ pub(crate) fn extract(
     // `values` tree, so byte-scanning the same bytes would only duplicate it as
     // noise. (Generic `Json`/`Gyp` are *not* structured-data here — when their
     // size-limited parse is skipped they legitimately fall through to a scan.)
-    if !file_type.is_structured_data() && strings.text.is_empty() {
+    // Containers whose whole payload is one compressed stream (a plain
+    // `.gz`/`.xz`/…, a gzip/xz/zstd tar and the packages built on one) are
+    // skipped too: a byte scan of codec output is high-entropy noise at
+    // 20-40 ms/MiB on the analyzer's calling thread, and every member is
+    // scanned on its own once extracted. Zip-style containers are NOT
+    // skipped: stored (uncompressed) entries and the central directory are
+    // readable in place, and container-level string findings from them feed
+    // the report-wide strip/rescue passes.
+    let compressed_stream = matches!(
+        file_type,
+        FileType::Gz | FileType::Bz2 | FileType::Xz | FileType::Lzma | FileType::Zst
+    ) || crate::fileid::container_of(file_type, bytes)
+        .is_some_and(|c| c.compression != crate::fileid::Compression::None);
+    if !file_type.is_structured_data() && !compressed_stream && strings.text.is_empty() {
         // This is the fallback path — everything without its own format
         // handler. stng's XOR auto-detect scan is expensive and FP-prone, so it
         // runs only for source/script that shows XOR intent (`^` operator or

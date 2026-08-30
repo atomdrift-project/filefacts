@@ -1154,6 +1154,31 @@ pub fn open_with_path<'a>(path: &Path, bytes: &'a [u8]) -> Result<ParsedFile<'a>
     })
 }
 
+/// Open `bytes` with a [`FileId`] the caller already computed via
+/// [`FileId::from_path_and_bytes`]. Identical to [`open_with_path`] minus the
+/// second detection pass: detection on a compressed tar inflates up to 64 MiB
+/// of it to decide npm/sdist, so a caller that has already paid for that
+/// (cleave's archive analyzer) must not pay it again.
+pub fn open_with_fileid<'a>(
+    path: &Path,
+    bytes: &'a [u8],
+    fileid: FileId,
+) -> Result<ParsedFile<'a>, Error> {
+    let basename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string);
+    Ok(ParsedFile {
+        bytes,
+        fileid,
+        basename,
+        tree_parse: OnceLock::new(),
+        cancellation: None,
+        extracted: OnceLock::new(),
+        parse_count: AtomicU32::new(0),
+    })
+}
+
 /// Open `bytes` forcing a caller-known [`FileType`], bypassing content
 /// and extension detection.
 ///
