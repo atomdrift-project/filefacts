@@ -13,6 +13,15 @@
 //!    `github.com/owner/repo` references extracted from the document.
 //!    Sub-paths (`.../blob/main/foo`, `.../issues/1`) collapse to the
 //!    `owner/repo` form.
+//! - `markdown.install_packages[]` — deduped, ordered list of the package
+//!    names a README tells the reader to install (`npm install foo`,
+//!    `yarn add foo`, `pip install foo`, ...). This is the most load-bearing
+//!    identity claim a README makes: "type this to get me". A clone-and-rename
+//!    republication routinely forgets to update it, leaving the upstream name
+//!    in the instructions while the manifest carries the new one, so cleave
+//!    compares the two (`consistency.manifest_readme_name_mismatch`).
+//!    Unlike `markdown.npm_packages`, which reads registry *links* (badges
+//!    frequently point at an unrelated project), this reads *imperatives*.
 //!
 //! ATX-style fenced code blocks (``` ``` ``` and `~~~`) are skipped so
 //! headings inside code samples don't show up as identity claims.
@@ -55,6 +64,15 @@ pub(super) fn extract(
     if !pkgs.is_empty() {
         let arr = pkgs.into_iter().map(JsonValue::String).collect::<Vec<_>>();
         values.insert("markdown.npm_packages", JsonValue::Array(arr));
+    }
+
+    let installs = install_packages(&text);
+    if !installs.is_empty() {
+        let arr = installs
+            .into_iter()
+            .map(JsonValue::String)
+            .collect::<Vec<_>>();
+        values.insert("markdown.install_packages", JsonValue::Array(arr));
     }
 
     Ok(())
@@ -216,6 +234,19 @@ fn is_path_segment_char(ch: char) -> bool {
 /// the upstream README names the *upstream* package instead, so a supply-chain
 /// trait can compare this against the manifest's declared `name`.
 fn npm_packages(text: &str) -> Vec<String> {
+    // `/npm/v/<pkg>` is a shields.io version badge, and its URL commonly carries
+    // the image format as an extension: `/npm/v/etag.svg`. Keeping the suffix
+    // made every badge name a package that does not exist, so a rule comparing
+    // the manifest name against this list saw a mismatch for `etag`, `js-yaml`,
+    // `commander` and every other project that badges itself this way.
+    fn strip_badge_extension(name: &str) -> &str {
+        for ext in [".svg", ".png", ".json"] {
+            if let Some(base) = name.strip_suffix(ext) {
+                return base;
+            }
+        }
+        name
+    }
     const NEEDLES: [&str; 2] = ["npmjs.com/package/", "/npm/v/"];
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
@@ -225,6 +256,10 @@ fn npm_packages(text: &str) -> Vec<String> {
             let start = cursor + rel + needle.len();
             cursor = start;
             if let Some(name) = take_npm_name(&text[start..]) {
+                let name = strip_badge_extension(&name).to_string();
+                if name.is_empty() {
+                    continue;
+                }
                 if !seen.contains(name.as_str()) {
                     seen.insert(name.clone());
                     out.push(name);
@@ -238,6 +273,106 @@ fn npm_packages(text: &str) -> Vec<String> {
 /// Take one npm package name from the start of `s`. Handles a `@scope/name`
 /// pair as a single value; otherwise a bare unscoped segment. Returns `None`
 /// for an empty or malformed name.
+/// Package names a README instructs the reader to install.
+///
+/// Scans every line (inside fenced blocks too — install commands almost always
+/// live in one) for a package-manager install imperative and takes the first
+/// argument that is not a flag. Flags are skipped rather than terminating the
+/// scan so `npm install --save-dev foo` still yields `foo`.
+///
+/// Deliberately conservative about what counts as a name: anything holding a
+/// path separator, a URL scheme, a version pin, or a shell metacharacter is a
+/// local path, a tarball or a piped command rather than a registry name, and is
+/// dropped. A line that yields nothing simply contributes nothing.
+fn install_packages(text: &str) -> Vec<String> {
+    // (command, install verbs). Two-token prefixes: the manager then the verb.
+    const COMMANDS: [(&str, &[&str]); 6] = [
+        ("npm", &["install", "i", "add"]),
+        ("yarn", &["add"]),
+        ("pnpm", &["add", "install", "i"]),
+        ("bun", &["add", "install"]),
+        ("pip", &["install"]),
+        ("pip3", &["install"]),
+    ];
+
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for line in text.lines() {
+        // Strip a leading shell prompt or markdown list/quote marker so
+        // `$ npm install foo` and `- npm install foo` both parse.
+        let line = line
+            .trim_start()
+            .trim_start_matches(['$', '>', '-', '*', ' ']);
+        let mut tokens = line.split_whitespace();
+        let Some(cmd) = tokens.next() else { continue };
+        let Some((_, verbs)) = COMMANDS.iter().find(|(name, _)| *name == cmd) else {
+            continue;
+        };
+        let Some(verb) = tokens.next() else { continue };
+        if !verbs.contains(&verb) {
+            continue;
+        }
+        // A line carrying shell punctuation is a pipeline, not a plain install
+        // instruction (`npm install foo | sh`, `npm i foo && ./run`). The
+        // metacharacter is its own whitespace-separated token, so it has to be
+        // caught here rather than in the per-argument check. Abstain on the
+        // whole line: the point of this fact is an unambiguous identity claim.
+        let args: Vec<&str> = tokens.collect();
+        if args.iter().any(|a| {
+            a.chars()
+                .any(|c| matches!(c, '|' | ';' | '&' | '`' | '$' | '(' | ')' | '<' | '>'))
+        }) {
+            continue;
+        }
+        // First non-flag argument is the package. Global/dev flags and their
+        // detached values (`--registry <url>`) are not names.
+        for arg in args {
+            if arg.starts_with('-') {
+                continue;
+            }
+            if let Some(name) = install_argument_name(arg) {
+                if seen.insert(name.clone()) {
+                    out.push(name);
+                }
+            }
+            break;
+        }
+    }
+    out
+}
+
+/// Reduce one install argument to a bare registry name, or reject it.
+///
+/// Rejects paths (`./pkg`, `/tmp/x`), URLs and git specs, tarballs, and
+/// anything carrying shell punctuation. A version suffix is trimmed
+/// (`foo@1.2.3` -> `foo`) while a scope is preserved (`@scope/pkg`).
+fn install_argument_name(arg: &str) -> Option<String> {
+    if arg.is_empty() || arg.contains("://") || arg.contains('\\') {
+        return None;
+    }
+    if arg
+        .chars()
+        .any(|c| matches!(c, '|' | ';' | '&' | '`' | '$' | '(' | ')' | '"' | '\''))
+    {
+        return None;
+    }
+    // Trim a version pin, keeping a leading scope marker intact.
+    let body = arg.strip_prefix('@').map_or(arg, |rest| rest);
+    let trimmed = match body.find('@') {
+        Some(at) => &arg[..arg.len() - (body.len() - at)],
+        None => arg,
+    };
+    if trimmed.starts_with('.') || trimmed.starts_with('/') {
+        return None;
+    }
+    // A non-scoped name has no slash; a scoped one has exactly one.
+    let name = take_npm_name(trimmed)?;
+    if name.len() != trimmed.len() {
+        return None;
+    }
+    Some(name)
+}
+
 fn take_npm_name(s: &str) -> Option<String> {
     if let Some(rest) = s.strip_prefix('@') {
         let scope = take_path_segment(rest)?;
@@ -492,6 +627,22 @@ mod tests {
     }
 
     #[test]
+    fn npm_packages_strips_shields_badge_extension() {
+        // `img.shields.io/npm/v/etag.svg` names `etag`, not `etag.svg`.
+        let v = run("![v](https://img.shields.io/npm/v/etag.svg)\n");
+        assert_eq!(get_arr(&v, "markdown.npm_packages"), vec!["etag"]);
+        let v = run("![v](https://img.shields.io/npm/v/js-yaml.png)\n");
+        assert_eq!(get_arr(&v, "markdown.npm_packages"), vec!["js-yaml"]);
+    }
+
+    #[test]
+    fn npm_packages_keeps_a_real_dotted_name() {
+        // `punycode.js` is a real package name; only image suffixes are stripped.
+        let v = run("https://www.npmjs.com/package/punycode.js\n");
+        assert_eq!(get_arr(&v, "markdown.npm_packages"), vec!["punycode.js"]);
+    }
+
+    #[test]
     fn npm_packages_scoped_name() {
         let v = run("https://www.npmjs.com/package/@scope/pkg-name\n");
         assert_eq!(
@@ -504,6 +655,64 @@ mod tests {
     fn npm_packages_none_no_value() {
         let v = run("# A README with no npm references\n");
         assert!(v.get("markdown.npm_packages").is_none());
+    }
+
+    #[test]
+    fn install_packages_npm_install() {
+        let v = run("Install it:\n\n```\nnpm install theta-registry\n```\n");
+        assert_eq!(
+            get_arr(&v, "markdown.install_packages"),
+            vec!["theta-registry"]
+        );
+    }
+
+    #[test]
+    fn install_packages_skips_flags_and_handles_managers() {
+        let v = run(
+            "npm i --save-dev eslint\nyarn add react\npnpm add -D vitest\npip install requests\n",
+        );
+        assert_eq!(
+            get_arr(&v, "markdown.install_packages"),
+            vec!["eslint", "react", "vitest", "requests"]
+        );
+    }
+
+    #[test]
+    fn install_packages_scoped_name_and_version_pin() {
+        let v = run("npm install @scope/pkg-name@1.2.3\n");
+        assert_eq!(
+            get_arr(&v, "markdown.install_packages"),
+            vec!["@scope/pkg-name"]
+        );
+    }
+
+    #[test]
+    fn install_packages_strips_prompt_and_list_marker() {
+        let v = run("$ npm install alpha\n- yarn add beta\n");
+        assert_eq!(
+            get_arr(&v, "markdown.install_packages"),
+            vec!["alpha", "beta"]
+        );
+    }
+
+    #[test]
+    fn install_packages_rejects_paths_urls_and_shell() {
+        // Local paths, tarball URLs and piped commands are not registry names.
+        let v =
+            run("npm install ./local\nnpm install https://x.test/a.tgz\nnpm install foo | sh\n");
+        assert!(v.get("markdown.install_packages").is_none());
+    }
+
+    #[test]
+    fn install_packages_dedupes_preserving_order() {
+        let v = run("npm install foo\nyarn add foo\nnpm install bar\n");
+        assert_eq!(get_arr(&v, "markdown.install_packages"), vec!["foo", "bar"]);
+    }
+
+    #[test]
+    fn install_packages_none_no_value() {
+        let v = run("# A README that never says how to install\n");
+        assert!(v.get("markdown.install_packages").is_none());
     }
 
     #[test]
