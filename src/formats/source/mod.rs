@@ -11,6 +11,20 @@
 mod ast_walk;
 mod call_target_metrics;
 mod comment_metrics;
+mod escapes;
+
+/// Decode the escape sequences a parsed source string literal carries, so a
+/// consumer sees the text the program will actually use rather than the way the
+/// source spelled it.
+///
+/// Re-exported from the crate root because cleave maintains its own AST
+/// string-literal corpus — the one `type: literal` rules match against — and has
+/// to land on the same value this crate reports from `cleave facts literals`.
+/// When those two disagree, a rule author who checks the facts (as the rule
+/// guide instructs) sees a string that no rule they write can match.
+pub fn decode_source_escapes(literal: &str) -> String {
+    escapes::decode(literal)
+}
 mod function_metrics;
 mod identifier_metrics;
 mod import_metrics;
@@ -234,9 +248,17 @@ fn decode_string_literal(node: Node<'_>, source: &str) -> Option<String> {
     } else {
         return None;
     }
-    std::str::from_utf8(&bytes[start..end])
-        .ok()
-        .map(str::to_string)
+    let body = std::str::from_utf8(&bytes[start..end]).ok()?;
+    // A raw literal (Python `r"..."`, Rust `r#"..."#`, Go backticks) carries
+    // the backslash as data, so decoding it would corrupt the value.
+    let prefixes = &bytes[..start.saturating_sub(1)];
+    let raw_literal = prefixes.iter().any(|b| matches!(b, b'r' | b'R'))
+        || node.kind().contains("raw")
+        || node.kind().contains("verbatim");
+    if raw_literal {
+        return Some(body.to_string());
+    }
+    Some(escapes::decode(body))
 }
 
 fn is_string_prefix(b: u8) -> bool {

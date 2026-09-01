@@ -1081,9 +1081,14 @@ fn decode_string_literal(node: Node<'_>, source: &str) -> Option<String> {
     if !matches!(open, b'"' | b'\'' | b'`') || bytes[bytes.len() - 1] != open {
         return None;
     }
-    std::str::from_utf8(&bytes[1..bytes.len() - 1])
-        .ok()
-        .map(str::to_string)
+    let body = std::str::from_utf8(&bytes[1..bytes.len() - 1]).ok()?;
+    // In a raw literal the backslash *is* the character — Go's backtick
+    // strings and Rust/C# raw and verbatim forms all carry it literally.
+    let kind = node.kind();
+    if kind.contains("raw") || kind.contains("verbatim") {
+        return Some(body.to_string());
+    }
+    Some(super::escapes::decode(body))
 }
 
 fn is_assignment_kind(kind: &str) -> bool {

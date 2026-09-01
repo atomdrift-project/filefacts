@@ -79,6 +79,7 @@ pub mod tools;
 /// `tracing` telemetry (`log_stats`) at shutdown.
 pub mod rizin;
 
+pub use formats::source::decode_source_escapes;
 /// VBA `<non-literal>` sentinel — the placeholder a VBA symbol's
 /// `target` field takes when the call was made through a variable
 /// or expression rather than a quoted literal. Re-exported flat from

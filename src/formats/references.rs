@@ -828,6 +828,64 @@ fn npm(values: &Values, out: &mut Refs<'_>) {
     }
     npm_manifest_deps(out);
     npm_local_refs(out);
+    vscode_extension_deps(out);
+}
+
+/// `extensionDependencies` and `extensionPack` from a VS Code extension
+/// manifest, as `pkg:vscode/<publisher>/<name>` dependencies.
+///
+/// These are declared install-time dependencies in the strongest sense the
+/// editor has: it refuses to install the extension without what
+/// `extensionDependencies` names, and installs everything in `extensionPack`
+/// alongside it. They belong here with the other manifest-declared coordinates
+/// rather than in a consumer's value-driven hunt, because only references
+/// emitted at parse time survive into an archive member's retained facts — and
+/// a VSIX is an archive, so a hunt that reads the values tree never sees them.
+///
+/// Following them is what makes the interesting artifact reachable: an
+/// extension pack contributes no code of its own and exists to bring its
+/// entries along. It also makes the *failure* observable — an entry the
+/// marketplace no longer serves was pulled, and extensions get pulled for
+/// reasons.
+///
+/// Unversioned: a manifest names the extension, never a version.
+fn vscode_extension_deps(out: &mut Refs<'_>) {
+    let Some(text) = out.text else { return };
+    let Ok(manifest) = serde_json::from_str::<JsonValue>(text) else {
+        return;
+    };
+    for field in ["extensionDependencies", "extensionPack"] {
+        let Some(entries) = manifest.get(field).and_then(JsonValue::as_array) else {
+            continue;
+        };
+        for id in entries.iter().filter_map(JsonValue::as_str) {
+            // A marketplace id is `publisher.name`; neither half may itself
+            // contain a dot, so anything else is not an extension coordinate.
+            let Some((publisher, name)) = id.split_once('.') else {
+                continue;
+            };
+            if !is_marketplace_segment(publisher) || !is_marketplace_segment(name) {
+                continue;
+            }
+            out.push(
+                RefLocator::Purl(format!("pkg:vscode/{publisher}/{name}")),
+                RefKind::Dependency,
+                field,
+                id,
+                None,
+            );
+        }
+    }
+}
+
+/// Marketplace publisher and extension names are ASCII alphanumerics with
+/// hyphens or underscores. Rejecting anything else keeps paths, versions and
+/// free text out of the dependency list.
+fn is_marketplace_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Intra-artifact file references a `package.json` names: the entry module
@@ -1404,6 +1462,39 @@ mod tests {
             .expect("easy-day-js ref");
         assert_eq!(easy.evidence, "easy-day-js@^1.11.21");
         assert_eq!(easy.kind, RefKind::Dependency);
+    }
+
+    #[test]
+    fn vscode_extension_manifest_deps_become_dependencies() {
+        let manifest = br#"{
+            "name": "krabt-extension-pack",
+            "publisher": "krabt",
+            "extensionDependencies": ["Dart-Code.dart-code"],
+            "extensionPack": ["krabt.krabt-proto", "eamodio.gitlens", "not-an-id", "a.b.c"]
+        }"#;
+        let refs = derive(FileType::PackageJson, manifest, &Values::new());
+        let purls: Vec<&str> = refs
+            .iter()
+            .filter_map(|r| match &r.locator {
+                RefLocator::Purl(p) => Some(p.as_str()),
+                RefLocator::Url(_) | RefLocator::Path(_) => None,
+            })
+            .collect();
+        assert!(
+            purls.contains(&"pkg:vscode/Dart-Code/dart-code"),
+            "{purls:?}"
+        );
+        assert!(purls.contains(&"pkg:vscode/krabt/krabt-proto"), "{purls:?}");
+        assert!(purls.contains(&"pkg:vscode/eamodio/gitlens"), "{purls:?}");
+        // Not marketplace coordinates: no publisher half, and a three-part id.
+        assert!(!purls.iter().any(|p| p.contains("not-an-id")), "{purls:?}");
+        assert!(!purls.iter().any(|p| p.contains("a.b.c")), "{purls:?}");
+        let pack = refs
+            .iter()
+            .find(|r| matches!(&r.locator, RefLocator::Purl(p) if p == "pkg:vscode/krabt/krabt-proto"))
+            .expect("pack ref");
+        assert_eq!(pack.kind, RefKind::Dependency);
+        assert_eq!(pack.source, "extensionPack");
     }
 
     #[test]
