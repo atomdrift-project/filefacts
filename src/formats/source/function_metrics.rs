@@ -7,6 +7,7 @@
 //! analyzer left those for language-specific extractors that never
 //! materialised, so behaviour is preserved.
 
+use crate::metric;
 use tree_sitter::Node;
 
 use crate::output::Metrics;
@@ -43,7 +44,7 @@ pub(super) fn emit(
     // tree (a giant `a+b+c+…` chain) caps here while producing no functions, so
     // emitting after the return would drop exactly the case worth flagging.
     if capped {
-        metrics.insert("ast.depth_capped", 1.0);
+        metrics.insert(metric!("ast.depth_capped"), 1.0);
     }
     if functions.is_empty() {
         return;
@@ -275,38 +276,44 @@ fn emit_metrics(functions: &[FunctionInfo], total_lines: u32, metrics: &mut Metr
     }
 
     if anonymous > 0 {
-        metrics.insert("functions.anonymous", f64::from(anonymous));
+        metrics.insert(metric!("functions.anonymous"), f64::from(anonymous));
     }
     if nested_functions > 0 {
-        metrics.insert("functions.nested", f64::from(nested_functions));
+        metrics.insert(metric!("functions.nested"), f64::from(nested_functions));
     }
     if over_100 > 0 {
-        metrics.insert("functions.over_100_lines", f64::from(over_100));
+        metrics.insert(metric!("functions.over_100_lines"), f64::from(over_100));
     }
     if over_500 > 0 {
-        metrics.insert("functions.over_500_lines", f64::from(over_500));
+        metrics.insert(metric!("functions.over_500_lines"), f64::from(over_500));
     }
     if one_liners > 0 {
-        metrics.insert("functions.one_liners", f64::from(one_liners));
+        metrics.insert(metric!("functions.one_liners"), f64::from(one_liners));
     }
     if no_params > 0 {
-        metrics.insert("functions.no_params_count", f64::from(no_params));
+        metrics.insert(metric!("functions.no_params_count"), f64::from(no_params));
     }
     if many_params > 0 {
-        metrics.insert("functions.many_params_count", f64::from(many_params));
+        metrics.insert(
+            metric!("functions.many_params_count"),
+            f64::from(many_params),
+        );
     }
     if single_char_names > 0 {
-        metrics.insert("functions.single_char_names", f64::from(single_char_names));
+        metrics.insert(
+            metric!("functions.single_char_names"),
+            f64::from(single_char_names),
+        );
     }
     if high_entropy_names > 0 {
         metrics.insert(
-            "functions.high_entropy_names",
+            metric!("functions.high_entropy_names"),
             f64::from(high_entropy_names),
         );
     }
     if numeric_suffix_names > 0 {
         metrics.insert(
-            "functions.numeric_suffix_names",
+            metric!("functions.numeric_suffix_names"),
             f64::from(numeric_suffix_names),
         );
     }
@@ -314,13 +321,13 @@ fn emit_metrics(functions: &[FunctionInfo], total_lines: u32, metrics: &mut Metr
     if !lengths.is_empty() {
         let sum: u32 = lengths.iter().sum();
         let avg = f64::from(sum) / lengths.len() as f64;
-        metrics.insert("functions.avg_length_lines", avg);
+        metrics.insert(metric!("functions.avg_length_lines"), avg);
         metrics.insert(
-            "functions.max_length_lines",
+            metric!("functions.max_length_lines"),
             f64::from(*lengths.iter().max().unwrap_or(&0)),
         );
         metrics.insert(
-            "functions.min_length_lines",
+            metric!("functions.min_length_lines"),
             f64::from(*lengths.iter().min().unwrap_or(&0)),
         );
         let variance: f64 = lengths
@@ -333,7 +340,7 @@ fn emit_metrics(functions: &[FunctionInfo], total_lines: u32, metrics: &mut Metr
             / lengths.len() as f64;
         let stddev = variance.sqrt();
         if stddev > 0.0 {
-            metrics.insert("functions.length_stddev", stddev);
+            metrics.insert(metric!("functions.length_stddev"), stddev);
         }
     }
 
@@ -341,11 +348,11 @@ fn emit_metrics(functions: &[FunctionInfo], total_lines: u32, metrics: &mut Metr
         let sum: u32 = param_counts.iter().sum();
         let avg = f64::from(sum) / param_counts.len() as f64;
         if avg > 0.0 {
-            metrics.insert("functions.avg_params", avg);
+            metrics.insert(metric!("functions.avg_params"), avg);
         }
         let max = *param_counts.iter().max().unwrap_or(&0);
         if max > 0 {
-            metrics.insert("functions.max_params", f64::from(max));
+            metrics.insert(metric!("functions.max_params"), f64::from(max));
         }
     }
 
@@ -353,39 +360,39 @@ fn emit_metrics(functions: &[FunctionInfo], total_lines: u32, metrics: &mut Metr
         let total_len: usize = all_param_names.iter().map(String::len).sum();
         let avg = total_len as f64 / all_param_names.len() as f64;
         if avg > 0.0 {
-            metrics.insert("functions.avg_param_name_length", avg);
+            metrics.insert(metric!("functions.avg_param_name_length"), avg);
         }
         let single = all_param_names.iter().filter(|s| s.len() == 1).count();
         if single > 0 {
-            metrics.insert("functions.single_char_params", single as f64);
+            metrics.insert(metric!("functions.single_char_params"), single as f64);
         }
     }
 
     if !name_lengths.is_empty() {
         let sum: usize = name_lengths.iter().sum();
         let avg = sum as f64 / name_lengths.len() as f64;
-        metrics.insert("functions.avg_name_length", avg);
+        metrics.insert(metric!("functions.avg_name_length"), avg);
     }
 
     if !nesting_depths.is_empty() {
         let max = *nesting_depths.iter().max().unwrap_or(&0);
         if max > 0 {
-            metrics.insert("functions.max_nesting_depth", f64::from(max));
+            metrics.insert(metric!("functions.max_nesting_depth"), f64::from(max));
         }
         let sum: u32 = nesting_depths.iter().sum();
         let avg = f64::from(sum) / nesting_depths.len() as f64;
         if avg > 0.0 {
-            metrics.insert("functions.avg_nesting_depth", avg);
+            metrics.insert(metric!("functions.avg_nesting_depth"), avg);
         }
     }
 
     if total_lines > 0 {
         metrics.insert(
-            "functions.density",
+            metric!("functions.density"),
             (f64::from(total) / f64::from(total_lines)) * 100.0,
         );
         metrics.insert(
-            "functions.code_ratio",
+            metric!("functions.code_ratio"),
             f64::from(total_lines_in_functions) / f64::from(total_lines),
         );
     }

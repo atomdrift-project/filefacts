@@ -10,6 +10,7 @@
 //! `TextMetrics` struct and flattened it into a metric map; here we
 //! emit straight into [`Metrics`] under the canonical `text.*` keys.
 
+use crate::metric;
 use crate::output::{Metrics, Span, SpanBuilder};
 
 /// Cap on the number of invisible-character runs reported. The count metric
@@ -73,29 +74,35 @@ fn emit_byte_metrics(bytes: &[u8], metrics: &mut Metrics) {
         .unwrap_or(0.0);
 
     if entropy > 0.0 {
-        metrics.insert("text.char_entropy", entropy);
+        metrics.insert(metric!("text.char_entropy"), entropy);
     }
     if unique_chars > 0 {
-        metrics.insert("text.unique_chars", f64::from(unique_chars));
+        metrics.insert(metric!("text.unique_chars"), f64::from(unique_chars));
     }
     if let Some(c) = most_common {
-        metrics.insert("text.top_char", f64::from(c));
-        metrics.insert("text.top_char_null", if c == 0 { 1.0 } else { 0.0 });
+        metrics.insert(metric!("text.top_char"), f64::from(c));
+        metrics.insert(
+            metric!("text.top_char_null"),
+            if c == 0 { 1.0 } else { 0.0 },
+        );
     }
     if most_common_ratio > 0.0 {
-        metrics.insert("text.top_char_ratio", most_common_ratio);
+        metrics.insert(metric!("text.top_char_ratio"), most_common_ratio);
     }
     if non_ascii > 0 {
-        metrics.insert("text.non_ascii_ratio", non_ascii as f64 / total as f64);
+        metrics.insert(
+            metric!("text.non_ascii_ratio"),
+            non_ascii as f64 / total as f64,
+        );
     }
     if non_printable > 0 {
         metrics.insert(
-            "text.non_printable_ratio",
+            metric!("text.non_printable_ratio"),
             non_printable as f64 / total as f64,
         );
     }
     if null_count > 0 {
-        metrics.insert("text.null_byte_count", f64::from(null_count));
+        metrics.insert(metric!("text.null_byte_count"), f64::from(null_count));
     }
 }
 
@@ -168,56 +175,64 @@ fn emit_line_metrics(content: &str, metrics: &mut Metrics) {
         return;
     }
 
-    metrics.insert("text.lines", f64::from(total_lines));
-    metrics.insert("text.avg_line_length", mean);
+    metrics.insert(metric!("text.lines"), f64::from(total_lines));
+    metrics.insert(metric!("text.avg_line_length"), mean);
     // Locate the longest line (minified/obfuscated payload tell). Isolated pass
     // so the metric loop above is untouched; `split_inclusive('\n')` plus the
     // same `\r\n` strip `.lines()` performs makes the length match exactly, and
     // accumulating `raw.len()` (terminator included) gives the true byte offset.
     match longest_line_span(content, max_line_length) {
-        Some(span) => {
-            metrics.insert_located("text.max_line_length", f64::from(max_line_length), [span])
-        }
-        None => metrics.insert("text.max_line_length", f64::from(max_line_length)),
+        Some(span) => metrics.insert_located(
+            metric!("text.max_line_length"),
+            f64::from(max_line_length),
+            [span],
+        ),
+        None => metrics.insert(metric!("text.max_line_length"), f64::from(max_line_length)),
     }
     if total_lines > 0 {
         let stddev = (m2 / f64::from(total_lines)).sqrt();
         if stddev > 0.0 {
-            metrics.insert("text.line_length_stddev", stddev);
+            metrics.insert(metric!("text.line_length_stddev"), stddev);
         }
     }
     if lines_over_200 > 0 {
-        metrics.insert("text.lines_over_200", f64::from(lines_over_200));
+        metrics.insert(metric!("text.lines_over_200"), f64::from(lines_over_200));
     }
     if lines_over_500 > 0 {
-        metrics.insert("text.lines_over_500", f64::from(lines_over_500));
+        metrics.insert(metric!("text.lines_over_500"), f64::from(lines_over_500));
     }
     if lines_over_1000 > 0 {
-        metrics.insert("text.lines_over_1000", f64::from(lines_over_1000));
+        metrics.insert(metric!("text.lines_over_1000"), f64::from(lines_over_1000));
     }
     if last_line_length > 0 {
-        metrics.insert("text.last_line_length", f64::from(last_line_length));
+        metrics.insert(
+            metric!("text.last_line_length"),
+            f64::from(last_line_length),
+        );
     }
     if empty_lines > 0 {
         metrics.insert(
-            "text.empty_line_ratio",
+            metric!("text.empty_line_ratio"),
             f64::from(empty_lines) / f64::from(total_lines),
         );
     }
     if lines_with_tab_indent > 0 && lines_with_space_indent > 0 {
-        metrics.insert("text.mixed_indent", 1.0);
+        metrics.insert(metric!("text.mixed_indent"), 1.0);
     }
     if trailing_whitespace_lines > 0 {
         metrics.insert(
-            "text.trailing_whitespace_lines",
+            metric!("text.trailing_whitespace_lines"),
             f64::from(trailing_whitespace_lines),
         );
     }
     if max_inline_whitespace_run > 0 {
-        metrics.insert("text.max_ws_run", f64::from(max_inline_whitespace_run));
+        metrics.insert(
+            metric!("text.max_ws_run"),
+            f64::from(max_inline_whitespace_run),
+        );
     }
     if ascii_art_lines > 0 {
-        metrics.insert("text.ascii_art_lines", f64::from(ascii_art_lines));
+        metrics.insert(metric!("text.ascii_art_lines"), f64::from(ascii_art_lines));
     }
 }
 
@@ -296,39 +311,48 @@ fn emit_char_metrics(content: &str, metrics: &mut Metrics) {
     }
     if whitespace_count > 0 {
         metrics.insert(
-            "text.whitespace_ratio",
+            metric!("text.whitespace_ratio"),
             whitespace_count as f64 / total as f64,
         );
     }
     if tabs > 0 {
-        metrics.insert("text.tab_count", f64::from(tabs));
+        metrics.insert(metric!("text.tab_count"), f64::from(tabs));
     }
     if spaces > 0 {
-        metrics.insert("text.space_count", f64::from(spaces));
+        metrics.insert(metric!("text.space_count"), f64::from(spaces));
     }
     if unusual_whitespace > 0 {
-        metrics.insert("text.unusual_whitespace", f64::from(unusual_whitespace));
+        metrics.insert(
+            metric!("text.unusual_whitespace"),
+            f64::from(unusual_whitespace),
+        );
     }
     if invisible_chars > 0 {
         // Located: the byte positions of the hidden characters travel with the
         // count so a finding (Trojan Source / zero-width stego) points at them.
         metrics.insert_located(
-            "text.invisible_chars",
+            metric!("text.invisible_chars"),
             f64::from(invisible_chars),
             invisible_spans.into_spans(),
         );
     }
     if long_token_count > 0 {
-        metrics.insert("text.long_token_count", f64::from(long_token_count));
+        metrics.insert(
+            metric!("text.long_token_count"),
+            f64::from(long_token_count),
+        );
     }
     if repeated_char_sequences > 0 {
         metrics.insert(
-            "text.repeated_char_sequences",
+            metric!("text.repeated_char_sequences"),
             f64::from(repeated_char_sequences),
         );
     }
     if alphanumeric > 0 && digits > 0 {
-        metrics.insert("text.digit_ratio", digits as f64 / alphanumeric as f64);
+        metrics.insert(
+            metric!("text.digit_ratio"),
+            digits as f64 / alphanumeric as f64,
+        );
     }
 }
 
@@ -376,18 +400,21 @@ fn emit_escape_metrics(content: &str, metrics: &mut Metrics) {
     }
 
     if hex_count > 0 {
-        metrics.insert("text.hex_escape_count", f64::from(hex_count));
+        metrics.insert(metric!("text.hex_escape_count"), f64::from(hex_count));
     }
     if unicode_count > 0 {
-        metrics.insert("text.unicode_escape_count", f64::from(unicode_count));
+        metrics.insert(
+            metric!("text.unicode_escape_count"),
+            f64::from(unicode_count),
+        );
     }
     if octal_count > 0 {
-        metrics.insert("text.octal_escape_count", f64::from(octal_count));
+        metrics.insert(metric!("text.octal_escape_count"), f64::from(octal_count));
     }
     let total_escapes = hex_count + unicode_count + octal_count;
     if total_escapes > 0 {
         metrics.insert(
-            "text.escape_density",
+            metric!("text.escape_density"),
             (f64::from(total_escapes) / len as f64) * 100.0,
         );
     }

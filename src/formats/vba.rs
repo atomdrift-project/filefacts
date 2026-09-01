@@ -21,6 +21,7 @@
 //! a single module is silent — partial output is more useful than
 //! none.
 
+use crate::metric;
 use std::io::{Cursor, Read, Seek};
 
 use serde_json::Value as JsonValue;
@@ -143,30 +144,36 @@ pub(super) fn extract(
     if !modules.is_empty() {
         let count = modules.len() as f64;
         values.insert("office.vba.modules", JsonValue::Array(modules));
-        metrics.insert("office.vba.module_count", count);
+        metrics.insert(metric!("office.vba.module_count"), count);
         // Aggregate symbol-extraction counters surface as metrics so
         // composite rules can count obfuscation signals without
         // walking the imports view.
-        metrics.insert("office.vba.declare_count", f64::from(agg.declare_count));
         metrics.insert(
-            "office.vba.declare_non_literal_count",
+            metric!("office.vba.declare_count"),
+            f64::from(agg.declare_count),
+        );
+        metrics.insert(
+            metric!("office.vba.declare_non_literal_count"),
             f64::from(agg.declare_non_literal_count),
         );
         metrics.insert(
-            "office.vba.createobject_count",
+            metric!("office.vba.createobject_count"),
             f64::from(agg.createobject_count),
         );
         metrics.insert(
-            "office.vba.createobject_non_literal_count",
+            metric!("office.vba.createobject_non_literal_count"),
             f64::from(agg.createobject_non_literal_count),
         );
-        metrics.insert("office.vba.getobject_count", f64::from(agg.getobject_count));
         metrics.insert(
-            "office.vba.getobject_non_literal_count",
+            metric!("office.vba.getobject_count"),
+            f64::from(agg.getobject_count),
+        );
+        metrics.insert(
+            metric!("office.vba.getobject_non_literal_count"),
             f64::from(agg.getobject_non_literal_count),
         );
         metrics.insert(
-            "office.vba.trigger_handler_count",
+            metric!("office.vba.trigger_handler_count"),
             f64::from(agg.trigger_handler_count),
         );
 
@@ -197,7 +204,7 @@ pub(super) fn extract(
         }
         if total_idents > 0 {
             metrics.insert(
-                "office.vba.mean_identifier_length",
+                metric!("office.vba.mean_identifier_length"),
                 total_chars as f64 / f64::from(total_idents),
             );
         }
@@ -211,10 +218,10 @@ pub(super) fn extract(
                     -p * p.log2()
                 })
                 .sum();
-            metrics.insert("office.vba.identifier_entropy", entropy);
+            metrics.insert(metric!("office.vba.identifier_entropy"), entropy);
         }
         metrics.insert(
-            "office.vba.distinct_trigger_count",
+            metric!("office.vba.distinct_trigger_count"),
             distinct_triggers.len() as f64,
         );
     }
@@ -274,7 +281,7 @@ struct ModuleInfo {
 fn find_vba_prefix<R: Read + std::io::Seek>(comp: &mut cfb::CompoundFile<R>) -> Option<String> {
     let entries: Vec<String> = comp
         .walk()
-        .map(|e| e.path().to_string_lossy().into_owned())
+        .map(|e| super::common::cfb_entry_path(&e))
         .collect();
     const CANDIDATES: &[&str] = &[
         "VBA",

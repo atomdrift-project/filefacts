@@ -16,6 +16,7 @@
 //! normalizer. The tarball is uncompressed, so reading one small JSON member
 //! is cheap.
 
+use crate::metric;
 use std::collections::BTreeSet;
 use std::io::{Cursor, Read};
 
@@ -74,7 +75,7 @@ fn emit_oci_index(index: &JsonValue, values: &mut Values, metrics: &mut Metrics)
     values.insert("oci.kind", JsonValue::String("oci".into()));
     let manifests = index.get("manifests").and_then(JsonValue::as_array);
     let Some(manifests) = manifests else { return };
-    metrics.insert("oci.manifest_count", manifests.len() as f64);
+    metrics.insert(metric!("oci.manifest_count"), manifests.len() as f64);
 
     let mut digests = BTreeSet::new();
     let mut refs = BTreeSet::new();
@@ -99,7 +100,7 @@ fn emit_docker_manifest(manifest: &JsonValue, values: &mut Values, metrics: &mut
     values.insert("oci.kind", JsonValue::String("docker".into()));
     let images = manifest.as_array();
     let Some(images) = images else { return };
-    metrics.insert("oci.image_count", images.len() as f64);
+    metrics.insert(metric!("oci.image_count"), images.len() as f64);
 
     let mut refs = BTreeSet::new();
     let mut configs = BTreeSet::new();
@@ -124,7 +125,7 @@ fn emit_docker_manifest(manifest: &JsonValue, values: &mut Values, metrics: &mut
     }
     insert_set(values, "oci.ref", refs);
     insert_set(values, "oci.config.digest", configs);
-    metrics.insert("oci.layer_count", layers as f64);
+    metrics.insert(metric!("oci.layer_count"), layers as f64);
 }
 
 /// Normalize a `docker save` config reference to a `sha256:<hex>` digest.

@@ -44,6 +44,7 @@
 //! It is the only clock-dependent fact this module emits, so a consumer caching
 //! by content hash knows exactly which one field to recompute or drop.
 
+use crate::metric;
 use serde_json::{Map, Value as JsonValue};
 
 use crate::Values;
@@ -102,7 +103,7 @@ pub(super) fn derive(values: &mut Values, metrics: &mut Metrics, now: i64) {
         JsonValue::String(worst.to_string()),
     );
     if let Some(days) = expired_days(&annotated, now) {
-        metrics.insert("pe.signature_expired_days", days);
+        metrics.insert(metric!("pe.signature_expired_days"), days);
     }
 }
 

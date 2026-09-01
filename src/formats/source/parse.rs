@@ -11,6 +11,7 @@
 use crate::error::Error;
 use crate::fileid::FileType;
 use crate::formats::source::langs;
+use crate::metric;
 use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::ops::ControlFlow;
@@ -142,14 +143,14 @@ impl<'a> TreeParse<'a> {
 /// Recoverable source-AST diagnostic emitted when filefacts refuses or fails
 /// a Tree-sitter parse but can still return generic/text facts.
 pub(crate) struct TreeSitterDiagnostic {
-    pub(crate) metric: &'static str,
+    pub(crate) metric: crate::MetricKey,
     pub(crate) message: String,
 }
 
 impl TreeSitterDiagnostic {
     fn tree_sitter_guard(language: &'static str, bytes: usize, audit: ScannerAudit) -> Self {
         Self {
-            metric: "source.ast_unavailable.tree_sitter_guard",
+            metric: metric!("source.ast_unavailable.tree_sitter_guard"),
             message: format!(
                 "tree-sitter parse skipped for {language}: {bytes} bytes exceeds scanner-risk guard ({audit:?})"
             ),
@@ -158,14 +159,14 @@ impl TreeSitterDiagnostic {
 
     pub(crate) fn parse_failed(message: impl Into<String>) -> Self {
         Self {
-            metric: "source.ast_unavailable.parse_failed",
+            metric: metric!("source.ast_unavailable.parse_failed"),
             message: message.into(),
         }
     }
 
     fn parse_timeout(language: &'static str, bytes: usize, budget: Duration) -> Self {
         Self {
-            metric: "source.ast_unavailable.parse_timeout",
+            metric: metric!("source.ast_unavailable.parse_timeout"),
             message: format!(
                 "tree-sitter parse for {language} exceeded {budget:?} on {bytes} bytes"
             ),
@@ -178,7 +179,7 @@ impl TreeSitterDiagnostic {
     /// metric would bury the second under the first on every Ctrl-C.
     fn parse_cancelled(language: &'static str, bytes: usize) -> Self {
         Self {
-            metric: "source.ast_unavailable.parse_cancelled",
+            metric: metric!("source.ast_unavailable.parse_cancelled"),
             message: format!("tree-sitter parse for {language} cancelled at {bytes} bytes"),
         }
     }
@@ -547,7 +548,10 @@ mod tests {
         let diagnostic = parsed
             .diagnostic()
             .expect("a cancelled parse yields no tree");
-        assert_eq!(diagnostic.metric, "source.ast_unavailable.parse_timeout");
+        assert_eq!(
+            diagnostic.metric.as_str(),
+            "source.ast_unavailable.parse_timeout"
+        );
     }
 
     /// A raised cancellation flag abandons the parse without becoming an
@@ -563,7 +567,10 @@ mod tests {
         let diagnostic = parsed
             .diagnostic()
             .expect("a cancelled parse yields no tree");
-        assert_eq!(diagnostic.metric, "source.ast_unavailable.parse_cancelled");
+        assert_eq!(
+            diagnostic.metric.as_str(),
+            "source.ast_unavailable.parse_cancelled"
+        );
     }
 
     /// A flag that stays false must be invisible — the guard against a poll

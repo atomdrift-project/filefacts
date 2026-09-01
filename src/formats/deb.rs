@@ -16,6 +16,7 @@
 //! - `deb.depends[]` — runtime dependency package names (bounded).
 //! - `deb.installed_size` — declared installed size in KiB.
 
+use crate::metric;
 use std::io::{Cursor, Read};
 
 use serde_json::Value as JsonValue;
@@ -142,13 +143,13 @@ fn parse_control(control: &[u8], values: &mut Values, metrics: &mut Metrics) {
             "Description" => insert_str(values, "deb.summary", value),
             "Installed-Size" => {
                 if let Ok(kib) = value.parse::<f64>() {
-                    metrics.insert("deb.installed_size", kib);
+                    metrics.insert(metric!("deb.installed_size"), kib);
                 }
             }
             "Depends" => {
                 let names = dependency_names(value);
                 if !names.is_empty() {
-                    metrics.insert("deb.depends_count", names.len() as f64);
+                    metrics.insert(metric!("deb.depends_count"), names.len() as f64);
                     values.insert(
                         "deb.depends",
                         JsonValue::Array(names.into_iter().map(JsonValue::String).collect()),

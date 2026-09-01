@@ -10,6 +10,7 @@
 //! decompressor is wrapped around the cursor before walking. *Only* the
 //! header bytes are decompressed; entry data is skipped.
 
+use crate::metric;
 use std::io::{self, Read};
 
 use serde_json::Value as JsonValue;
@@ -282,47 +283,68 @@ pub(super) fn extract(
         values.insert("archive.builder.gnames", JsonValue::Array(g));
     }
 
-    metrics.insert("archive.member_count", member_count as f64);
-    metrics.insert("archive.file_count", file_count as f64);
-    metrics.insert("archive.directory_count", directory_count as f64);
-    metrics.insert("archive.uncompressed_size", total_uncompressed as f64);
+    metrics.insert(metric!("archive.member_count"), member_count as f64);
+    metrics.insert(metric!("archive.file_count"), file_count as f64);
+    metrics.insert(metric!("archive.directory_count"), directory_count as f64);
+    metrics.insert(
+        metric!("archive.uncompressed_size"),
+        total_uncompressed as f64,
+    );
     for (t, c) in &entry_type_counts {
         metrics.insert(
-            format!("archive.format.{}_count", t.replace('-', "_")),
+            crate::archive_entry_type_count(&t.replace('-', "_")),
             *c as f64,
         );
     }
-    metrics.insert("archive.security.setuid_count", setuid as f64);
-    metrics.insert("archive.security.setgid_count", setgid as f64);
-    metrics.insert("archive.security.sticky_count", sticky as f64);
+    metrics.insert(metric!("archive.security.setuid_count"), setuid as f64);
+    metrics.insert(metric!("archive.security.setgid_count"), setgid as f64);
+    metrics.insert(metric!("archive.security.sticky_count"), sticky as f64);
     metrics.insert(
-        "archive.security.world_writable_count",
+        metric!("archive.security.world_writable_count"),
         world_writable as f64,
     );
-    metrics.insert("archive.security.symlink_count", symlinks as f64);
+    metrics.insert(metric!("archive.security.symlink_count"), symlinks as f64);
 
-    metrics.insert("archive.max_filename_length", max_filename_length as f64);
-    metrics.insert("archive.hidden_file_count", hidden_file_count as f64);
-    metrics.insert("archive.path_traversal_count", path_traversal_count as f64);
-    metrics.insert("archive.symlink_escape_count", symlink_escape_count as f64);
-    metrics.insert("archive.executable_count", executable_count as f64);
-    metrics.insert("archive.script_count", script_count as f64);
     metrics.insert(
-        "archive.unicode_filename_count",
+        metric!("archive.max_filename_length"),
+        max_filename_length as f64,
+    );
+    metrics.insert(
+        metric!("archive.hidden_file_count"),
+        hidden_file_count as f64,
+    );
+    metrics.insert(
+        metric!("archive.path_traversal_count"),
+        path_traversal_count as f64,
+    );
+    metrics.insert(
+        metric!("archive.symlink_escape_count"),
+        symlink_escape_count as f64,
+    );
+    metrics.insert(metric!("archive.executable_count"), executable_count as f64);
+    metrics.insert(metric!("archive.script_count"), script_count as f64);
+    metrics.insert(
+        metric!("archive.unicode_filename_count"),
         unicode_filename_count as f64,
     );
     metrics.insert(
-        "archive.homoglyph_filename_count",
+        metric!("archive.homoglyph_filename_count"),
         homoglyph_filename_count as f64,
     );
     metrics.insert(
-        "archive.double_extension_count",
+        metric!("archive.double_extension_count"),
         double_extension_count as f64,
     );
-    metrics.insert("archive.rtlo_filename_count", rtlo_filename_count as f64);
-    metrics.insert("archive.nested_archive_count", nested_archive_count as f64);
     metrics.insert(
-        "archive.misplaced_executable_count",
+        metric!("archive.rtlo_filename_count"),
+        rtlo_filename_count as f64,
+    );
+    metrics.insert(
+        metric!("archive.nested_archive_count"),
+        nested_archive_count as f64,
+    );
+    metrics.insert(
+        metric!("archive.misplaced_executable_count"),
         misplaced_executable_count as f64,
     );
 
@@ -331,9 +353,15 @@ pub(super) fn extract(
         let max = *mtimes.iter().max().unwrap_or(&0);
         values.insert("archive.timing.mtime_min", JsonValue::Number(min.into()));
         values.insert("archive.timing.mtime_max", JsonValue::Number(max.into()));
-        metrics.insert("archive.timing.mtime_spread_seconds", (max - min) as f64);
+        metrics.insert(
+            metric!("archive.timing.mtime_spread_seconds"),
+            (max - min) as f64,
+        );
         let unique: std::collections::BTreeSet<i64> = mtimes.iter().copied().collect();
-        metrics.insert("archive.timing.mtime_unique_count", unique.len() as f64);
+        metrics.insert(
+            metric!("archive.timing.mtime_unique_count"),
+            unique.len() as f64,
+        );
     }
 
     Ok(())

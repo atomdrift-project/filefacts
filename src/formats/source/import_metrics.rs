@@ -5,6 +5,7 @@
 //! keys: total, unique, stdlib/third-party split, relative imports,
 //! wildcard/dynamic/aliased imports, and their ratios.
 
+use crate::metric;
 use std::collections::HashSet;
 
 use crate::output::Metrics;
@@ -56,37 +57,43 @@ pub(super) fn emit(imports: &[&str], language: &str, metrics: &mut Metrics) {
     }
 
     if stdlib_count > 0 {
-        metrics.insert("imports.stdlib_count", f64::from(stdlib_count));
+        metrics.insert(metric!("imports.stdlib_count"), f64::from(stdlib_count));
     }
     if third_party_count > 0 {
-        metrics.insert("imports.third_party_count", f64::from(third_party_count));
+        metrics.insert(
+            metric!("imports.third_party_count"),
+            f64::from(third_party_count),
+        );
     }
     if relative_count > 0 {
-        metrics.insert("imports.relative", f64::from(relative_count));
+        metrics.insert(metric!("imports.relative"), f64::from(relative_count));
     }
     if dynamic_count > 0 {
-        metrics.insert("imports.dynamic", f64::from(dynamic_count));
+        metrics.insert(metric!("imports.dynamic"), f64::from(dynamic_count));
     }
     if wildcard_count > 0 {
-        metrics.insert("imports.wildcard", f64::from(wildcard_count));
+        metrics.insert(metric!("imports.wildcard"), f64::from(wildcard_count));
     }
     if aliased_count > 0 {
-        metrics.insert("imports.aliased", f64::from(aliased_count));
+        metrics.insert(metric!("imports.aliased"), f64::from(aliased_count));
     }
     let total_f = f64::from(total);
     if total_f > 0.0 {
         if stdlib_count > 0 {
-            metrics.insert("imports.stdlib_ratio", f64::from(stdlib_count) / total_f);
+            metrics.insert(
+                metric!("imports.stdlib_ratio"),
+                f64::from(stdlib_count) / total_f,
+            );
         }
         if third_party_count > 0 {
             metrics.insert(
-                "imports.third_party_ratio",
+                metric!("imports.third_party_ratio"),
                 f64::from(third_party_count) / total_f,
             );
         }
         if relative_count > 0 {
             metrics.insert(
-                "imports.relative_ratio",
+                metric!("imports.relative_ratio"),
                 f64::from(relative_count) / total_f,
             );
         }

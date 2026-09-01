@@ -26,6 +26,7 @@
 //! layer already consumes the generic metric, so adding a language is purely
 //! additive here.
 
+use crate::metric;
 use crate::output::{Metrics, Symbol};
 
 /// How a call's command-name target was expressed.
@@ -63,10 +64,10 @@ pub(super) fn emit(calls: &[Symbol], lang: &str, metrics: &mut Metrics) {
         }
     }
     if obfuscated > 0 {
-        metrics.insert("calls.obfuscated_target_count", obfuscated as f64);
+        metrics.insert(metric!("calls.obfuscated_target_count"), obfuscated as f64);
     }
     if dynamic > 0 {
-        metrics.insert("calls.dynamic_target_count", dynamic as f64);
+        metrics.insert(metric!("calls.dynamic_target_count"), dynamic as f64);
     }
 }
 

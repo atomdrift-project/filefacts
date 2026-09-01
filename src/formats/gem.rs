@@ -18,6 +18,7 @@
 //! - `gem.dependency_count`, `gem.runtime_dependency_count`,
 //!   `gem.development_dependency_count` — dependency-shape metrics.
 
+use crate::metric;
 use std::io::{Cursor, Read};
 
 use serde_json::Value as JsonValue;
@@ -147,9 +148,15 @@ fn extract_dependencies(spec: &Yaml, values: &mut Values, metrics: &mut Metrics)
             }
         }
     }
-    metrics.insert("gem.dependency_count", deps.len() as f64);
-    metrics.insert("gem.runtime_dependency_count", runtime_count as f64);
-    metrics.insert("gem.development_dependency_count", development_count as f64);
+    metrics.insert(metric!("gem.dependency_count"), deps.len() as f64);
+    metrics.insert(
+        metric!("gem.runtime_dependency_count"),
+        runtime_count as f64,
+    );
+    metrics.insert(
+        metric!("gem.development_dependency_count"),
+        development_count as f64,
+    );
     if !runtime.is_empty() {
         values.insert("gem.runtime_dependencies", string_array(&runtime));
     }

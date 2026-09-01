@@ -6,6 +6,7 @@
 //! suspicious payloads (high-entropy text, embedded code, URLs,
 //! base64 blobs).
 
+use crate::metric;
 use crate::output::Metrics;
 
 use super::identifier_metrics::string_entropy;
@@ -58,7 +59,7 @@ pub(super) fn emit(
     }
 
     let total = comments.len() as u32;
-    metrics.insert("comments.count", f64::from(total));
+    metrics.insert(metric!("comments.count"), f64::from(total));
 
     let mut total_chars: u64 = 0;
     let mut comment_lines: u32 = 0;
@@ -113,45 +114,51 @@ pub(super) fn emit(
     }
 
     if comment_lines > 0 {
-        metrics.insert("comments.lines", f64::from(comment_lines));
+        metrics.insert(metric!("comments.lines"), f64::from(comment_lines));
     }
     if total_chars > 0 {
-        metrics.insert("comments.chars", total_chars as f64);
+        metrics.insert(metric!("comments.chars"), total_chars as f64);
     }
     let total_lines = content.lines().count() as f64;
     let code_lines = total_lines - f64::from(comment_lines);
     if code_lines > 0.0 {
         metrics.insert(
-            "comments.to_code_ratio",
+            metric!("comments.to_code_ratio"),
             f64::from(comment_lines) / code_lines,
         );
     }
     if todo_count > 0 {
-        metrics.insert("comments.todo_count", f64::from(todo_count));
+        metrics.insert(metric!("comments.todo_count"), f64::from(todo_count));
     }
     if fixme_count > 0 {
-        metrics.insert("comments.fixme_count", f64::from(fixme_count));
+        metrics.insert(metric!("comments.fixme_count"), f64::from(fixme_count));
     }
     if hack_count > 0 {
-        metrics.insert("comments.hack_count", f64::from(hack_count));
+        metrics.insert(metric!("comments.hack_count"), f64::from(hack_count));
     }
     if xxx_count > 0 {
-        metrics.insert("comments.xxx_count", f64::from(xxx_count));
+        metrics.insert(metric!("comments.xxx_count"), f64::from(xxx_count));
     }
     if empty_comments > 0 {
-        metrics.insert("comments.empty", f64::from(empty_comments));
+        metrics.insert(metric!("comments.empty"), f64::from(empty_comments));
     }
     if high_entropy_comments > 0 {
-        metrics.insert("comments.high_entropy", f64::from(high_entropy_comments));
+        metrics.insert(
+            metric!("comments.high_entropy"),
+            f64::from(high_entropy_comments),
+        );
     }
     if code_in_comments > 0 {
-        metrics.insert("comments.code", f64::from(code_in_comments));
+        metrics.insert(metric!("comments.code"), f64::from(code_in_comments));
     }
     if url_in_comments > 0 {
-        metrics.insert("comments.url_in_comments", f64::from(url_in_comments));
+        metrics.insert(
+            metric!("comments.url_in_comments"),
+            f64::from(url_in_comments),
+        );
     }
     if base64_in_comments > 0 {
-        metrics.insert("comments.base64", f64::from(base64_in_comments));
+        metrics.insert(metric!("comments.base64"), f64::from(base64_in_comments));
     }
 }
 

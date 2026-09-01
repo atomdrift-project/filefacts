@@ -31,6 +31,7 @@
 //! - `dmg.volume.name`, `dmg.volume.created_unix`, `dmg.volume.modified_unix`,
 //!   `dmg.volume.formatted_by`, and `dmg.volume.{file,folder,symlink}_count`.
 
+use crate::metric;
 use std::io::Read;
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -69,15 +70,15 @@ pub(super) fn extract(
         "dmg.image_variant",
         JsonValue::Number(koly.image_variant.into()),
     );
-    metrics.insert("dmg.sector_count", koly.sector_count as f64);
+    metrics.insert(metric!("dmg.sector_count"), koly.sector_count as f64);
     let uncompressed = koly.sector_count.saturating_mul(SECTOR);
-    metrics.insert("dmg.total_uncompressed_bytes", uncompressed as f64);
-    metrics.insert("dmg.data_fork_bytes", koly.data_fork_length as f64);
+    metrics.insert(metric!("dmg.total_uncompressed_bytes"), uncompressed as f64);
+    metrics.insert(metric!("dmg.data_fork_bytes"), koly.data_fork_length as f64);
     if koly.data_fork_length > 0 {
         // >1 means the image expands on mount; the small hash-named samples in
         // the wild run 8–80×, a sparse-volume / hidden-payload signal.
         metrics.insert(
-            "dmg.compression.ratio",
+            metric!("dmg.compression.ratio"),
             uncompressed as f64 / koly.data_fork_length as f64,
         );
     }
@@ -231,7 +232,7 @@ fn emit_partitions(
     metrics: &mut Metrics,
     archive_members: &mut Vec<ArchiveMember>,
 ) {
-    metrics.insert("dmg.partition_count", partitions.len() as f64);
+    metrics.insert(metric!("dmg.partition_count"), partitions.len() as f64);
 
     // Codec chunk counts across all partitions. BTreeMap → stable order.
     let mut codec_counts: std::collections::BTreeMap<&'static str, u64> =
@@ -303,10 +304,7 @@ fn emit_partitions(
         .collect();
     values.insert("dmg.compression.codecs", JsonValue::Array(codecs));
     for (codec, count) in &codec_counts {
-        metrics.insert(
-            format!("dmg.compression.codec_counts.{codec}"),
-            *count as f64,
-        );
+        metrics.insert(crate::dmg_codec_count(codec), *count as f64);
     }
 
     // The compressor set fingerprints the creating tool / `hdiutil -format`.
@@ -428,12 +426,12 @@ fn hfs_volume_facts(prefix: &[u8], values: &mut Values, metrics: &mut Metrics) -
         values.insert("dmg.volume.modified_unix", JsonValue::Number(t.into()));
     }
     if let (Some(c), Some(m)) = (hfs_to_unix(create), hfs_to_unix(modify)) {
-        metrics.insert("dmg.volume.timezone_skew_seconds", (c - m) as f64);
+        metrics.insert(metric!("dmg.volume.timezone_skew_seconds"), (c - m) as f64);
     }
 
-    metrics.insert("dmg.volume.file_count", be_u32(vh, 32)? as f64);
-    metrics.insert("dmg.volume.folder_count", be_u32(vh, 36)? as f64);
-    metrics.insert("dmg.volume.block_size", be_u32(vh, 40)? as f64);
+    metrics.insert(metric!("dmg.volume.file_count"), be_u32(vh, 32)? as f64);
+    metrics.insert(metric!("dmg.volume.folder_count"), be_u32(vh, 36)? as f64);
+    metrics.insert(metric!("dmg.volume.block_size"), be_u32(vh, 40)? as f64);
     Some(())
 }
 
@@ -454,9 +452,9 @@ fn apfs_volume_facts(prefix: &[u8], values: &mut Values, metrics: &mut Metrics) 
     // distribution volumes leave the superblock copies zeroed. Emit only
     // when populated — the authoritative count is cleave's full-walk job.
     for (key, off) in [
-        ("dmg.volume.file_count", 184),
-        ("dmg.volume.folder_count", 192),
-        ("dmg.volume.symlink_count", 200),
+        (metric!("dmg.volume.file_count"), 184),
+        (metric!("dmg.volume.folder_count"), 192),
+        (metric!("dmg.volume.symlink_count"), 200),
     ] {
         let n = le_u64(sb, off)?;
         if n > 0 {

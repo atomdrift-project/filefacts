@@ -21,6 +21,7 @@
 //!   presence signals: `apng`, `exif`, `icc`, `trailing_data`,
 //!   `post_iend_chunks`.
 
+use crate::metric;
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
@@ -198,12 +199,12 @@ pub(super) fn extract(
         );
     }
 
-    metrics.insert("png.chunk_count", chunks_total as f64);
-    metrics.insert("png.idat_chunk_count", chunks_idat as f64);
-    metrics.insert("png.chunks_after_iend", chunks_after_iend as f64);
-    metrics.insert("png.trailing_bytes", trailing_bytes as f64);
-    metrics.insert("png.text_chunk_bytes", text_chunk_bytes as f64);
-    metrics.insert("png.unknown_chunk_count", unknown_count as f64);
+    metrics.insert(metric!("png.chunk_count"), chunks_total as f64);
+    metrics.insert(metric!("png.idat_chunk_count"), chunks_idat as f64);
+    metrics.insert(metric!("png.chunks_after_iend"), chunks_after_iend as f64);
+    metrics.insert(metric!("png.trailing_bytes"), trailing_bytes as f64);
+    metrics.insert(metric!("png.text_chunk_bytes"), text_chunk_bytes as f64);
+    metrics.insert(metric!("png.unknown_chunk_count"), unknown_count as f64);
 
     // Best-effort pixel-statistic pass. Decoder errors are swallowed —
     // a PNG with a corrupted IDAT chunk or unsupported color depth
@@ -222,7 +223,7 @@ pub(super) fn extract(
 fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
     use png::Decoder;
 
-    metrics.insert("file.entropy", entropy::shannon(bytes));
+    metrics.insert(metric!("file.entropy"), entropy::shannon(bytes));
 
     let decoder = Decoder::new(bytes);
     let Ok(mut reader) = decoder.read_info() else {
@@ -239,9 +240,9 @@ fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
         png::ColorType::Rgba => 4,
     };
 
-    metrics.insert("image.width", f64::from(width));
-    metrics.insert("image.height", f64::from(height));
-    metrics.insert("image.channels", f64::from(channels));
+    metrics.insert(metric!("image.width"), f64::from(width));
+    metrics.insert(metric!("image.height"), f64::from(height));
+    metrics.insert(metric!("image.channels"), f64::from(channels));
 
     let buf_size = reader.output_buffer_size();
     if buf_size > image_stats::MAX_DECODE_BYTES {
@@ -264,28 +265,28 @@ fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
     };
 
     let pixel_entropy = entropy::shannon(pixels);
-    metrics.insert("image.pixel_entropy", pixel_entropy);
-    metrics.insert("image.histogram_flatness", pixel_entropy / 8.0);
+    metrics.insert(metric!("image.pixel_entropy"), pixel_entropy);
+    metrics.insert(metric!("image.histogram_flatness"), pixel_entropy / 8.0);
     let density =
         image_stats::edge_density(pixels, width as usize, height as usize, channels as usize);
-    metrics.insert("image.edge_density", f64::from(density));
+    metrics.insert(metric!("image.edge_density"), f64::from(density));
 
     if channels >= 3 {
         let (r, g, b, a) = image_stats::channel_entropy(pixels, channels as usize);
-        metrics.insert("image.r_entropy", f64::from(r));
-        metrics.insert("image.g_entropy", f64::from(g));
-        metrics.insert("image.b_entropy", f64::from(b));
-        metrics.insert("png.a_entropy", f64::from(a));
+        metrics.insert(metric!("image.r_entropy"), f64::from(r));
+        metrics.insert(metric!("image.g_entropy"), f64::from(g));
+        metrics.insert(metric!("image.b_entropy"), f64::from(b));
+        metrics.insert(metric!("png.a_entropy"), f64::from(a));
     } else {
         // Mirror cleave's prior behavior: grayscale images put the
         // overall pixel entropy into `r_entropy` so traits keyed on
         // the red channel still fire for single-channel images.
-        metrics.insert("image.r_entropy", pixel_entropy);
-        metrics.insert("image.g_entropy", 0.0);
-        metrics.insert("image.b_entropy", 0.0);
-        metrics.insert("png.a_entropy", 0.0);
+        metrics.insert(metric!("image.r_entropy"), pixel_entropy);
+        metrics.insert(metric!("image.g_entropy"), 0.0);
+        metrics.insert(metric!("image.b_entropy"), 0.0);
+        metrics.insert(metric!("png.a_entropy"), 0.0);
     }
-    metrics.insert("png.compression_ratio", compression_ratio);
+    metrics.insert(metric!("png.compression_ratio"), compression_ratio);
 }
 
 /// PNG-spec color-type byte → analyst-readable name. The canonical

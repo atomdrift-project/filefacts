@@ -14,6 +14,7 @@
 //! signals (downloads, rating, age) land in [`Metrics`], where trait authors can
 //! threshold them with `min`/`max`.
 
+use crate::metric;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
@@ -217,86 +218,113 @@ impl Registry {
             self.publisher_email_domain.as_deref(),
         );
 
-        let mut num = |key: &str, v: Option<f64>| {
+        let mut num = |key: crate::MetricKey, v: Option<f64>| {
             if let Some(v) = v {
                 metrics.insert(key, v);
             }
         };
-        num("registry.published_at", self.published_at.map(|v| v as f64));
-        num("registry.age_days", self.age_days.map(|v| v as f64));
         num(
-            "registry.downloads_total",
+            metric!("registry.published_at"),
+            self.published_at.map(|v| v as f64),
+        );
+        num(
+            metric!("registry.age_days"),
+            self.age_days.map(|v| v as f64),
+        );
+        num(
+            metric!("registry.downloads_total"),
             self.downloads_total.map(|v| v as f64),
         );
         num(
-            "registry.downloads_recent",
+            metric!("registry.downloads_recent"),
             self.downloads_recent.map(|v| v as f64),
         );
-        num("registry.rating", self.rating.map(f64::from));
-        num("registry.rating_count", self.rating_count.map(|v| v as f64));
-        num("registry.maintainers", self.maintainers.map(f64::from));
+        num(metric!("registry.rating"), self.rating.map(f64::from));
+        num(
+            metric!("registry.rating_count"),
+            self.rating_count.map(|v| v as f64),
+        );
+        num(
+            metric!("registry.maintainers"),
+            self.maintainers.map(f64::from),
+        );
         // A boolean deprecation flag as a 0/1 metric, so a trait can gate on
         // `registry.is_deprecated >= 1` without parsing the reason text.
         num(
-            "registry.is_deprecated",
+            metric!("registry.is_deprecated"),
             Some(f64::from(u8::from(self.deprecated.is_some()))),
         );
 
         // Release history — every count/measure is a metric so traits can
         // threshold it (e.g. `registry.releases_24h >= 3`, `package_age_days <= 7`).
         num(
-            "registry.first_published_at",
+            metric!("registry.first_published_at"),
             self.first_published_at.map(|v| v as f64),
         );
         num(
-            "registry.previous_published_at",
+            metric!("registry.previous_published_at"),
             self.previous_published_at.map(|v| v as f64),
         );
         num(
-            "registry.package_age_days",
+            metric!("registry.package_age_days"),
             self.package_age_days.map(|v| v as f64),
         );
-        num("registry.release_count", self.release_count.map(f64::from));
-        num("registry.releases_24h", self.releases_24h.map(f64::from));
-        num("registry.releases_48h", self.releases_48h.map(f64::from));
+        num(
+            metric!("registry.release_count"),
+            self.release_count.map(f64::from),
+        );
+        num(
+            metric!("registry.releases_24h"),
+            self.releases_24h.map(f64::from),
+        );
+        num(
+            metric!("registry.releases_48h"),
+            self.releases_48h.map(f64::from),
+        );
         // Days the package lay dormant before this release — a derived delta, so
         // it is a metric. Only when both endpoints of the gap are known.
         let days_since_previous = self
             .published_at
             .zip(self.previous_published_at)
             .map(|(now, prev)| (now.saturating_sub(prev) / 86_400) as f64);
-        num("registry.days_since_previous_release", days_since_previous);
+        num(
+            metric!("registry.days_since_previous_release"),
+            days_since_previous,
+        );
 
         // Custody and artifact shape.
         num(
-            "registry.unpacked_size",
+            metric!("registry.unpacked_size"),
             self.unpacked_size.map(|v| v as f64),
         );
-        num("registry.file_count", self.file_count.map(f64::from));
         num(
-            "registry.vulnerability_count",
+            metric!("registry.file_count"),
+            self.file_count.map(f64::from),
+        );
+        num(
+            metric!("registry.vulnerability_count"),
             self.vulnerability_count.map(f64::from),
         );
         // 0/1 flags, mirroring `registry.is_deprecated`.
         num(
-            "registry.has_install_script",
+            metric!("registry.has_install_script"),
             self.has_install_script.map(|b| f64::from(u8::from(b))),
         );
         num(
-            "registry.publisher_in_maintainers",
+            metric!("registry.publisher_in_maintainers"),
             self.publisher_in_maintainers
                 .map(|b| f64::from(u8::from(b))),
         );
         num(
-            "registry.publisher_verified",
+            metric!("registry.publisher_verified"),
             self.publisher_verified.map(|b| f64::from(u8::from(b))),
         );
         num(
-            "registry.security_hold",
+            metric!("registry.security_hold"),
             self.security_hold.map(|b| f64::from(u8::from(b))),
         );
         num(
-            "registry.version_removed",
+            metric!("registry.version_removed"),
             self.version_removed.map(|b| f64::from(u8::from(b))),
         );
     }

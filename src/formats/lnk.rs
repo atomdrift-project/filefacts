@@ -25,6 +25,7 @@
 //! - `lnk.blocks[]` — Pike-style array of ExtraData block names
 //!   present in the file.
 
+use crate::metric;
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
@@ -284,7 +285,7 @@ pub(super) fn extract(
             ),
         );
     }
-    metrics.insert("lnk.file_size", f64::from(file_size));
+    metrics.insert(metric!("lnk.file_size"), f64::from(file_size));
 
     Ok(())
 }
@@ -324,10 +325,13 @@ fn emit_argument_whitespace_metrics(metrics: &mut Metrics, args: &str) {
     if current_run > max_run {
         max_run = current_run;
     }
-    metrics.insert("lnk.args_leading_spaces", leading_spaces as f64);
-    metrics.insert("lnk.args_leading_tabs", leading_tabs as f64);
-    metrics.insert("lnk.args_whitespace_total", total_whitespace as f64);
-    metrics.insert("lnk.args_max_whitespace_run", max_run as f64);
+    metrics.insert(metric!("lnk.args_leading_spaces"), leading_spaces as f64);
+    metrics.insert(metric!("lnk.args_leading_tabs"), leading_tabs as f64);
+    metrics.insert(
+        metric!("lnk.args_whitespace_total"),
+        total_whitespace as f64,
+    );
+    metrics.insert(metric!("lnk.args_max_whitespace_run"), max_run as f64);
 }
 
 /// Map the SHLLINK `ShowCommand` value to its Windows `SW_*`

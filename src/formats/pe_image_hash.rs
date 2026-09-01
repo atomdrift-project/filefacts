@@ -23,6 +23,7 @@
 //!   data was appended to the binary post-signing-time but inside the
 //!   region the signature authenticates.
 
+use crate::metric;
 use sha1::Sha1;
 use sha2::digest::DynDigest;
 use sha2::{Digest, Sha256, Sha384, Sha512};
@@ -111,7 +112,10 @@ pub(super) fn extract(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &
         );
     }
     if regions.overlay_padding > 0 {
-        metrics.insert("pe.overlay_padding", regions.overlay_padding as f64);
+        metrics.insert(
+            metric!("pe.overlay_padding"),
+            regions.overlay_padding as f64,
+        );
     }
 }
 

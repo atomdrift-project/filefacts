@@ -19,6 +19,7 @@
 //! - `pyc.source_files[]` — recovered source paths from
 //!   `co_filename` strings.
 
+use crate::metric;
 use serde_json::Value as JsonValue;
 
 use crate::error::Error;
@@ -73,11 +74,11 @@ pub(super) fn extract(
         let ts = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
         let sz = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
         if ts != 0 {
-            metrics.insert("pyc.timestamp", f64::from(ts));
+            metrics.insert(metric!("pyc.timestamp"), f64::from(ts));
             put_str(values, "pyc.timestamp", ts.to_string());
         }
         if sz != 0 {
-            metrics.insert("pyc.source_size", f64::from(sz));
+            metrics.insert(metric!("pyc.source_size"), f64::from(sz));
             put_str(values, "pyc.source_size", sz.to_string());
         }
     }
@@ -86,7 +87,7 @@ pub(super) fn extract(
     let body = &bytes[16..body_end];
     let source_files = scan_source_files(body);
     if !source_files.is_empty() {
-        metrics.insert("pyc.source_file_count", source_files.len() as f64);
+        metrics.insert(metric!("pyc.source_file_count"), source_files.len() as f64);
         values.insert(
             "pyc.source_files",
             JsonValue::Array(source_files.into_iter().map(JsonValue::String).collect()),

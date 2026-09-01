@@ -21,6 +21,7 @@
 //! `archive.compression.*`) runs on the same ZIP handle before this
 //! extractor layers JAR-specific facts on top.
 
+use crate::metric;
 use serde_json::{Value as JsonValue, json};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek};
@@ -199,10 +200,13 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     if signature_count > 0 {
         values.insert("jar.signature_count", json!(signature_count));
     }
-    metrics.insert("jar.entry_count", f64::from(entry_count));
-    metrics.insert("jar.class_count", f64::from(class_count));
-    metrics.insert("jar.embedded_jar_count", f64::from(embedded_jar_count));
-    metrics.insert("jar.signature_count", f64::from(signature_count));
+    metrics.insert(metric!("jar.entry_count"), f64::from(entry_count));
+    metrics.insert(metric!("jar.class_count"), f64::from(class_count));
+    metrics.insert(
+        metric!("jar.embedded_jar_count"),
+        f64::from(embedded_jar_count),
+    );
+    metrics.insert(metric!("jar.signature_count"), f64::from(signature_count));
 
     Ok(())
 }

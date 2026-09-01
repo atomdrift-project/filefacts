@@ -5,6 +5,7 @@
 //! section table, dynamic symbol table imports/exports, and the
 //! GNU build-id when present.
 
+use crate::metric;
 use goblin::elf::{Elf, dynamic, header, program_header};
 use serde_json::Value as JsonValue;
 
@@ -41,13 +42,13 @@ pub(super) fn extract(
         goblin_safe::GoblinOutcome::Failed(e) => {
             extract_binary_strings(bytes, strings, XorScan::Yes);
             errors_out.record_malformed(crate::Stage::ElfParse, e.to_string());
-            metrics.insert("elf.parse_failed", 1.0);
+            metrics.insert(metric!("elf.parse_failed"), 1.0);
             return Ok(());
         }
         goblin_safe::GoblinOutcome::Panicked(msg) => {
             extract_binary_strings(bytes, strings, XorScan::Yes);
             errors_out.record_panic(crate::Stage::ElfParse, msg);
-            metrics.insert("elf.parse_panicked", 1.0);
+            metrics.insert(metric!("elf.parse_panicked"), 1.0);
             return Ok(());
         }
     };
@@ -319,13 +320,13 @@ fn comment(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metri
     if texts.is_empty() {
         return;
     }
-    metrics.insert("elf.comment_entry_count", texts.len() as f64);
+    metrics.insert(metric!("elf.comment_entry_count"), texts.len() as f64);
     // `comment_distinct_count > 1` is the mixed-toolchain tell —
     // an unstripped object file linked into the binary carries its
     // own `GCC: (…)` / `clang version …` banner, so distinct count
     // above 1 means objects from multiple toolchains were merged.
     let distinct: std::collections::HashSet<&str> = texts.iter().map(String::as_str).collect();
-    metrics.insert("elf.comment_distinct_count", distinct.len() as f64);
+    metrics.insert(metric!("elf.comment_distinct_count"), distinct.len() as f64);
     values.insert(
         "elf.comment",
         JsonValue::Array(texts.into_iter().map(JsonValue::String).collect()),
@@ -564,11 +565,11 @@ fn gnu_property(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &mut 
                         let mut feats = Vec::new();
                         if v & 0x1 != 0 {
                             feats.push("bti");
-                            metrics.insert("elf.has_aarch64_bti", 1.0);
+                            metrics.insert(metric!("elf.has_aarch64_bti"), 1.0);
                         }
                         if v & 0x2 != 0 {
                             feats.push("pac");
-                            metrics.insert("elf.has_aarch64_pac", 1.0);
+                            metrics.insert(metric!("elf.has_aarch64_pac"), 1.0);
                         }
                         if v & 0x4 != 0 {
                             feats.push("gcs");
@@ -590,10 +591,10 @@ fn gnu_property(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &mut 
                         // IBT (Indirect Branch Tracking, shadow CFI),
                         // bit 1 = SHSTK (shadow stack).
                         if v & 0x1 != 0 {
-                            metrics.insert("elf.has_cet_ibt", 1.0);
+                            metrics.insert(metric!("elf.has_cet_ibt"), 1.0);
                         }
                         if v & 0x2 != 0 {
-                            metrics.insert("elf.has_cet_shstk", 1.0);
+                            metrics.insert(metric!("elf.has_cet_shstk"), 1.0);
                         }
                     } else if !is_aarch64 && pr_type == 0xC000_0001 {
                         // GNU_PROPERTY_X86_ISA_1_NEEDED — floor ISA
@@ -706,14 +707,23 @@ fn read_section<'a>(elf: &Elf<'_>, bytes: &'a [u8], name: &str) -> Option<&'a [u
 fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, values: &mut Values) {
     // Header constants. `elf.machine` and `elf.type` already live on
     // the values tree as strings — the numeric forms add nothing.
-    metrics.insert("elf.bits", f64::from(if elf.is_64 { 64u32 } else { 32u32 }));
-    metrics.insert("elf.little_endian", f64::from(u8::from(elf.little_endian)));
-    metrics.insert("elf.entry", elf.header.e_entry as f64);
-    metrics.insert("elf.program_header_count", elf.program_headers.len() as f64);
+    metrics.insert(
+        metric!("elf.bits"),
+        f64::from(if elf.is_64 { 64u32 } else { 32u32 }),
+    );
+    metrics.insert(
+        metric!("elf.little_endian"),
+        f64::from(u8::from(elf.little_endian)),
+    );
+    metrics.insert(metric!("elf.entry"), elf.header.e_entry as f64);
+    metrics.insert(
+        metric!("elf.program_header_count"),
+        elf.program_headers.len() as f64,
+    );
     // Section count flows through `sections.count` (cross-format aggregate
     // emitted by `emit_section_metrics`). Don't dual-emit `elf.section_count`.
     metrics.insert(
-        "elf.section_relocation_group_count",
+        metric!("elf.section_relocation_group_count"),
         elf.shdr_relocs.len() as f64,
     );
 
@@ -773,26 +783,35 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
             interp_count = interp_count.saturating_add(1);
         }
     }
-    metrics.insert("elf.load_segment_max_file_size", max_file_size as f64);
-    metrics.insert("elf.load_segment_max_memory_size", max_memory_size as f64);
-    metrics.insert("elf.nx_enabled", f64::from(u8::from(nx_enabled)));
-    metrics.insert("elf.executable_stack", f64::from(u8::from(!nx_enabled)));
-    metrics.insert("elf.wx_segment_count", wx_segment_count as f64);
+    metrics.insert(
+        metric!("elf.load_segment_max_file_size"),
+        max_file_size as f64,
+    );
+    metrics.insert(
+        metric!("elf.load_segment_max_memory_size"),
+        max_memory_size as f64,
+    );
+    metrics.insert(metric!("elf.nx_enabled"), f64::from(u8::from(nx_enabled)));
+    metrics.insert(
+        metric!("elf.executable_stack"),
+        f64::from(u8::from(!nx_enabled)),
+    );
+    metrics.insert(metric!("elf.wx_segment_count"), wx_segment_count as f64);
     if entry_in_writable_segment {
-        metrics.insert("elf.entry_in_writable_segment", 1.0);
+        metrics.insert(metric!("elf.entry_in_writable_segment"), 1.0);
     }
     if entry != 0 && !entry_in_any_segment {
-        metrics.insert("elf.entry_outside_segments", 1.0);
+        metrics.insert(metric!("elf.entry_outside_segments"), 1.0);
     }
     if interp_count > 1 {
-        metrics.insert("elf.multiple_pt_interp", 1.0);
+        metrics.insert(metric!("elf.multiple_pt_interp"), 1.0);
     }
     // Entry-in-last-segment: the EP's containing PT_LOAD is the one with
     // the highest p_vaddr. UPX-style packers stash the unpacker stub
     // there; vendor binaries land EPs in earlier segments.
     if let (Some(ep_idx), Some(last_idx)) = (entry_load_idx, last_load_idx) {
         if ep_idx == last_idx {
-            metrics.insert("elf.entry_in_last_segment", 1.0);
+            metrics.insert(metric!("elf.entry_in_last_segment"), 1.0);
         }
     }
     // Overlapping PT_LOAD pairs — sort by start address, then any
@@ -810,7 +829,10 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
             }
         }
         if !overlap_idxs.is_empty() {
-            metrics.insert("elf.segment_overlap_count", overlap_idxs.len() as f64);
+            metrics.insert(
+                metric!("elf.segment_overlap_count"),
+                overlap_idxs.len() as f64,
+            );
             let mut names: Vec<String> = overlap_idxs
                 .into_iter()
                 .map(|i| format!("PT_LOAD#{i}"))
@@ -830,19 +852,22 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
         .saturating_add(u64::from(elf.header.e_phnum) * u64::from(elf.header.e_phentsize));
     if let Some(first_off) = min_load_offset {
         if first_off > header_end {
-            metrics.insert("elf.first_segment_gap", (first_off - header_end) as f64);
+            metrics.insert(
+                metric!("elf.first_segment_gap"),
+                (first_off - header_end) as f64,
+            );
         }
     }
     // Section header count mismatch — `e_shnum` vs walked sections.
     if usize::from(elf.header.e_shnum) != elf.section_headers.len() {
-        metrics.insert("elf.section_header_count_mismatch", 1.0);
+        metrics.insert(metric!("elf.section_header_count_mismatch"), 1.0);
     }
     // ET_REL (relocatable object) files legitimately omit PT_GNU_STACK
     // because they have no program headers; only flag absence for
     // ET_EXEC / ET_DYN.
     let stack_section_absent = !has_gnu_stack && elf.header.e_type != header::ET_REL;
     metrics.insert(
-        "elf.no_gnu_stack",
+        metric!("elf.no_gnu_stack"),
         f64::from(u8::from(stack_section_absent)),
     );
 
@@ -913,33 +938,42 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
             entry_section = Some(name.to_string());
         }
     }
-    metrics.insert("elf.has_plt", f64::from(u8::from(has_plt)));
-    metrics.insert("elf.has_got", f64::from(u8::from(has_got)));
-    metrics.insert("elf.has_eh_frame", f64::from(u8::from(has_eh_frame)));
-    metrics.insert("elf.has_note", f64::from(u8::from(has_note)));
+    metrics.insert(metric!("elf.has_plt"), f64::from(u8::from(has_plt)));
+    metrics.insert(metric!("elf.has_got"), f64::from(u8::from(has_got)));
+    metrics.insert(
+        metric!("elf.has_eh_frame"),
+        f64::from(u8::from(has_eh_frame)),
+    );
+    metrics.insert(metric!("elf.has_note"), f64::from(u8::from(has_note)));
     if has_debuglink {
-        metrics.insert("elf.has_debuglink", 1.0);
+        metrics.insert(metric!("elf.has_debuglink"), 1.0);
     }
     if has_symtab {
-        metrics.insert("elf.has_symtab", 1.0);
+        metrics.insert(metric!("elf.has_symtab"), 1.0);
     }
     if has_rustc_section {
-        metrics.insert("elf.has_rustc_section", 1.0);
+        metrics.insert(metric!("elf.has_rustc_section"), 1.0);
     }
     if has_dot_hash && has_gnu_hash_sect {
-        metrics.insert("elf.has_both_hash_tables", 1.0);
+        metrics.insert(metric!("elf.has_both_hash_tables"), 1.0);
     }
     if text_writable {
-        metrics.insert("elf.text_section_writable", 1.0);
+        metrics.insert(metric!("elf.text_section_writable"), 1.0);
     }
     if rodata_writable {
-        metrics.insert("elf.rodata_writable", 1.0);
+        metrics.insert(metric!("elf.rodata_writable"), 1.0);
     }
     if debug_section_count > 0 {
-        metrics.insert("elf.debug_section_count", debug_section_count as f64);
+        metrics.insert(
+            metric!("elf.debug_section_count"),
+            debug_section_count as f64,
+        );
     }
     if compressed_count > 0 {
-        metrics.insert("elf.compressed_sections_count", compressed_count as f64);
+        metrics.insert(
+            metric!("elf.compressed_sections_count"),
+            compressed_count as f64,
+        );
     }
     // Override goblin's "stack section absent" decision with the actual
     // `.note.GNU-stack` section presence; the program-header walk above
@@ -947,11 +981,14 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
     let _ = has_gnu_stack_section;
     // Each `.gnu.version` entry is a 16-bit half per dynamic symbol.
     if versym_size > 0 {
-        metrics.insert("elf.dt_versym_count", (versym_size / 2) as f64);
+        metrics.insert(metric!("elf.dt_versym_count"), (versym_size / 2) as f64);
     }
     let dup_count = name_seen.values().filter(|&&c| c > 1).count() as u64;
     if dup_count > 0 {
-        metrics.insert("elf.duplicate_section_name_count", dup_count as f64);
+        metrics.insert(
+            metric!("elf.duplicate_section_name_count"),
+            dup_count as f64,
+        );
     }
 
     // Exact note count: walk note headers. Falls back to the
@@ -963,7 +1000,7 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
             note_count = walked;
         }
     }
-    metrics.insert("elf.note_count", note_count as f64);
+    metrics.insert(metric!("elf.note_count"), note_count as f64);
 
     if let Some(name) = entry_section {
         put_str(values, "elf.entry_section", &name);
@@ -976,14 +1013,14 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
 /// "does it have an unusual number of relocations" without walking
 /// the dynsym table themselves.
 fn table_counts(elf: &Elf<'_>, metrics: &mut Metrics) {
-    metrics.insert("elf.dynsym_count", elf.dynsyms.len() as f64);
-    metrics.insert("elf.symtab_count", elf.syms.len() as f64);
-    metrics.insert("elf.dynrela_count", elf.dynrelas.len() as f64);
-    metrics.insert("elf.dynrel_count", elf.dynrels.len() as f64);
-    metrics.insert("elf.pltreloc_count", elf.pltrelocs.len() as f64);
+    metrics.insert(metric!("elf.dynsym_count"), elf.dynsyms.len() as f64);
+    metrics.insert(metric!("elf.symtab_count"), elf.syms.len() as f64);
+    metrics.insert(metric!("elf.dynrela_count"), elf.dynrelas.len() as f64);
+    metrics.insert(metric!("elf.dynrel_count"), elf.dynrels.len() as f64);
+    metrics.insert(metric!("elf.pltreloc_count"), elf.pltrelocs.len() as f64);
     // DT_NEEDED entries are this ELF's shared-library dependencies.
     // Flows through the cross-format `dependencies.count` metric.
-    metrics.insert("dependencies.count", elf.libraries.len() as f64);
+    metrics.insert(metric!("dependencies.count"), elf.libraries.len() as f64);
 }
 
 /// Aggregate per-relocation-type counts across `.rela.dyn` /
@@ -1127,7 +1164,7 @@ fn dynamic_metrics(elf: &Elf<'_>, metrics: &mut Metrics) {
 
     // DT_NEEDED count surfaces under the cross-format
     // `dependencies.count` metric. No per-format alias.
-    metrics.insert("dependencies.count", elf.libraries.len() as f64);
+    metrics.insert(metric!("dependencies.count"), elf.libraries.len() as f64);
 
     let Some(dynamic) = elf.dynamic.as_ref() else {
         return;
@@ -1142,31 +1179,31 @@ fn dynamic_metrics(elf: &Elf<'_>, metrics: &mut Metrics) {
     for d in &dynamic.dyns {
         match d.d_tag {
             DT_TEXTREL => {
-                metrics.insert("elf.has_dt_textrel", 1.0);
+                metrics.insert(metric!("elf.has_dt_textrel"), 1.0);
             }
             DT_AUDIT => {
-                metrics.insert("elf.has_dt_audit", 1.0);
+                metrics.insert(metric!("elf.has_dt_audit"), 1.0);
             }
             DT_DEPAUDIT => {
-                metrics.insert("elf.has_dt_depaudit", 1.0);
+                metrics.insert(metric!("elf.has_dt_depaudit"), 1.0);
             }
             DT_DEBUG if d.d_val != 0 => {
-                metrics.insert("elf.has_dt_debug", 1.0);
+                metrics.insert(metric!("elf.has_dt_debug"), 1.0);
             }
             DT_RELR => {
-                metrics.insert("elf.has_dt_relr", 1.0);
+                metrics.insert(metric!("elf.has_dt_relr"), 1.0);
             }
             DT_GNU_HASH => {
-                metrics.insert("elf.has_gnu_hash", 1.0);
+                metrics.insert(metric!("elf.has_gnu_hash"), 1.0);
             }
             DT_INIT_ARRAYSZ => init_arraysz = d.d_val,
             DT_FINI_ARRAYSZ => fini_arraysz = d.d_val,
             DT_PREINIT_ARRAYSZ => preinit_arraysz = d.d_val,
             DT_FLAGS_1 => {
-                metrics.insert("elf.dt_flags_1_raw", d.d_val as f64);
+                metrics.insert(metric!("elf.dt_flags_1_raw"), d.d_val as f64);
             }
             DT_RELACOUNT => {
-                metrics.insert("elf.relacount", d.d_val as f64);
+                metrics.insert(metric!("elf.relacount"), d.d_val as f64);
             }
             DT_RPATH => has_rpath_tag = true,
             DT_RUNPATH => has_runpath_tag = true,
@@ -1175,10 +1212,10 @@ fn dynamic_metrics(elf: &Elf<'_>, metrics: &mut Metrics) {
         }
     }
     if has_rpath_tag {
-        metrics.insert("elf.has_rpath", 1.0);
+        metrics.insert(metric!("elf.has_rpath"), 1.0);
     }
     if has_runpath_tag {
-        metrics.insert("elf.has_runpath", 1.0);
+        metrics.insert(metric!("elf.has_runpath"), 1.0);
     }
     // DT_VERSYM presence acts as a marker when the section walk in
     // `elf_numeric_metrics` already established the accurate
@@ -1186,18 +1223,24 @@ fn dynamic_metrics(elf: &Elf<'_>, metrics: &mut Metrics) {
     // trait engines can still distinguish "has versioned symbols at
     // all" from "no versioning".
     if dt_versym_present && metrics.get("elf.dt_versym_count").is_none() {
-        metrics.insert("elf.dt_versym_count", 1.0);
+        metrics.insert(metric!("elf.dt_versym_count"), 1.0);
     }
     let ptr_size = if elf.is_64 { 8u64 } else { 4u64 };
     if init_arraysz > 0 {
-        metrics.insert("elf.init_array_count", (init_arraysz / ptr_size) as f64);
+        metrics.insert(
+            metric!("elf.init_array_count"),
+            (init_arraysz / ptr_size) as f64,
+        );
     }
     if fini_arraysz > 0 {
-        metrics.insert("elf.fini_array_count", (fini_arraysz / ptr_size) as f64);
+        metrics.insert(
+            metric!("elf.fini_array_count"),
+            (fini_arraysz / ptr_size) as f64,
+        );
     }
     if preinit_arraysz > 0 {
         metrics.insert(
-            "elf.preinit_array_count",
+            metric!("elf.preinit_array_count"),
             (preinit_arraysz / ptr_size) as f64,
         );
     }
@@ -1219,13 +1262,19 @@ fn dynamic_metrics(elf: &Elf<'_>, metrics: &mut Metrics) {
         }
     }
     if abs_path_count > 0 {
-        metrics.insert("elf.dt_needed_abs_path_count", abs_path_count as f64);
+        metrics.insert(
+            metric!("elf.dt_needed_abs_path_count"),
+            abs_path_count as f64,
+        );
     }
     if traversal_count > 0 {
-        metrics.insert("elf.dt_needed_traversal_count", traversal_count as f64);
+        metrics.insert(
+            metric!("elf.dt_needed_traversal_count"),
+            traversal_count as f64,
+        );
     }
     if direct_loader_dep {
-        metrics.insert("elf.has_direct_loader_dep", 1.0);
+        metrics.insert(metric!("elf.has_direct_loader_dep"), 1.0);
     }
 
     // DT_RUNPATH $ORIGIN check — RUNPATH entries also serialise as
@@ -1236,7 +1285,7 @@ fn dynamic_metrics(elf: &Elf<'_>, metrics: &mut Metrics) {
         .iter()
         .any(|p| p.split(':').any(|seg| seg.contains("$ORIGIN")))
     {
-        metrics.insert("elf.dt_runpath_uses_origin", 1.0);
+        metrics.insert(metric!("elf.dt_runpath_uses_origin"), 1.0);
     }
 }
 
@@ -1316,7 +1365,7 @@ fn binary_flags(elf: &Elf<'_>, metrics: &mut Metrics) {
     // PIE: dynamically-linked executable (`ET_DYN` + `PT_INTERP`).
     // A shared library is also `ET_DYN` but has no interpreter.
     let is_pie = elf.header.e_type == header::ET_DYN && elf.interpreter.is_some();
-    metrics.insert("binary.is_pie", f64::from(u8::from(is_pie)));
+    metrics.insert(metric!("binary.is_pie"), f64::from(u8::from(is_pie)));
 
     // Stripped: `.symtab` section absent. Imports stay in `.dynsym`
     // and survive `strip`, so they're not a reliable signal.
@@ -1324,7 +1373,10 @@ fn binary_flags(elf: &Elf<'_>, metrics: &mut Metrics) {
         .section_headers
         .iter()
         .any(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".symtab"));
-    metrics.insert("binary.is_stripped", f64::from(u8::from(!has_symtab)));
+    metrics.insert(
+        metric!("binary.is_stripped"),
+        f64::from(u8::from(!has_symtab)),
+    );
 }
 
 /// Emit the names of canonical metadata sections that a normal
@@ -1361,7 +1413,10 @@ fn stripped_metadata(elf: &Elf<'_>, values: &mut Values, metrics: &mut Metrics) 
         .map(|name| JsonValue::String((*name).to_string()))
         .collect();
 
-    metrics.insert("elf.stripped_metadata_section_count", stripped.len() as f64);
+    metrics.insert(
+        metric!("elf.stripped_metadata_section_count"),
+        stripped.len() as f64,
+    );
     if !stripped.is_empty() {
         values.insert("elf.stripped_metadata_sections", JsonValue::Array(stripped));
     }
@@ -1371,7 +1426,7 @@ fn stripped_metadata(elf: &Elf<'_>, values: &mut Values, metrics: &mut Metrics) 
     let symtab_present = present.contains(".symtab");
     let debug_or_comment_gone = !present.contains(".comment") || !present.contains(".debug_info");
     metrics.insert(
-        "elf.stripped_with_symtab",
+        metric!("elf.stripped_with_symtab"),
         f64::from(u8::from(symtab_present && debug_or_comment_gone)),
     );
 }
@@ -1810,13 +1865,13 @@ fn symbols(
     // / `exports.count` emitted by `lib.rs::extract_all` after every
     // format extractor runs. No per-format aliases.
     if fortify_count > 0 {
-        metrics.insert("elf.fortify_source_count", fortify_count as f64);
+        metrics.insert(metric!("elf.fortify_source_count"), fortify_count as f64);
     }
     if hidden_count > 0 {
-        metrics.insert("elf.hidden_symbol_count", hidden_count as f64);
+        metrics.insert(metric!("elf.hidden_symbol_count"), hidden_count as f64);
     }
     if stack_canary {
-        metrics.insert("elf.stack_canary", 1.0);
+        metrics.insert(metric!("elf.stack_canary"), 1.0);
     }
     if !ifuncs.is_empty() {
         values.insert("elf.ifuncs", JsonValue::Array(ifuncs));
@@ -1920,8 +1975,8 @@ fn build_id(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metr
     for note in notes.flatten() {
         if note.name == "GNU" && note.n_type == 3 {
             put_str(values, "elf.build_id", hex_encode(note.desc));
-            metrics.insert("elf.has_build_id", 1.0);
-            metrics.insert("elf.build_id_length", note.desc.len() as f64);
+            metrics.insert(metric!("elf.has_build_id"), 1.0);
+            metrics.insert(metric!("elf.build_id_length"), note.desc.len() as f64);
             return;
         }
     }

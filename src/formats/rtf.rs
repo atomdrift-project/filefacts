@@ -24,6 +24,7 @@
 //! - `rtf.control_word_density` — control words per kilobyte, which
 //!    separates a document from a file that merely starts like one.
 
+use crate::metric;
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
@@ -454,8 +455,8 @@ fn shape(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     obj.insert("group_depth_max".into(), json!(max_depth));
     obj.insert("brace_count".into(), json!(braces_open + braces_close));
     values.insert("rtf.shape", JsonValue::Object(obj));
-    metrics.insert("rtf.control_word_count", control_words as f64);
-    metrics.insert("rtf.group_depth_max", f64::from(max_depth));
+    metrics.insert(metric!("rtf.control_word_count"), control_words as f64);
+    metrics.insert(metric!("rtf.group_depth_max"), f64::from(max_depth));
     // Control words per kilobyte. A document is mostly formatting: real RTF
     // runs tens of control words per KB whatever its size. A file that opens
     // with `{\rtf` and then spends its bytes on something else -- a hex blob,
@@ -464,7 +465,7 @@ fn shape(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     if !bytes.is_empty() {
         let density = control_words as f64 * 1024.0 / bytes.len() as f64;
         metrics.insert(
-            "rtf.control_word_density",
+            metric!("rtf.control_word_density"),
             (density * 100.0).round() / 100.0,
         );
     }

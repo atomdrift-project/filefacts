@@ -29,6 +29,7 @@
 //! `.text`. Argument resolution tracks a handful more registers in the same
 //! per-candidate decode, so it costs nothing measurable over a number-only pass.
 
+use crate::metric;
 use goblin::elf::Elf;
 use goblin::elf::header::{EM_AARCH64, EM_X86_64};
 use goblin::elf::section_header::{SHF_EXECINSTR, SHT_NOBITS};
@@ -104,11 +105,11 @@ pub(super) fn emit(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &m
             values.insert("elf.syscalls_arch", arch.into());
         }
         if direct > 0 {
-            metrics.insert("elf.direct_syscall_count", direct as f64);
+            metrics.insert(metric!("elf.direct_syscall_count"), direct as f64);
         }
     }
     if indirect {
-        metrics.insert("elf.has_indirect_syscall", 1.0);
+        metrics.insert(metric!("elf.has_indirect_syscall"), 1.0);
     }
 }
 

@@ -13,6 +13,7 @@
 //! The walker is language-driven by the [`LangConfig`] passed in; it
 //! contains no language-specific code itself.
 
+use crate::metric;
 use std::collections::BTreeMap;
 
 use tree_sitter::Node;
@@ -68,8 +69,8 @@ pub(super) fn walk(
         });
     }
 
-    metrics.insert("ast.node_count", state.node_count as f64);
-    metrics.insert("ast.max_depth", f64::from(state.max_depth));
+    metrics.insert(metric!("ast.node_count"), state.node_count as f64);
+    metrics.insert(metric!("ast.max_depth"), f64::from(state.max_depth));
     // Reaching the recursion cap means the tree (and any member/concat/subscript
     // chain inside it) was truncated — deeper nodes were not analysed. A
     // pathologically deep tree is itself a generated/obfuscated-source signal,
@@ -77,7 +78,7 @@ pub(super) fn walk(
     // is what used to overflow the worker stack and abort the process, so an
     // operator seeing a flood of these knows the inputs are hostile-shaped.
     if state.max_depth >= MAX_AST_DEPTH {
-        metrics.insert("ast.depth_capped", 1.0);
+        metrics.insert(metric!("ast.depth_capped"), 1.0);
         tracing::warn!(
             lang = config.name,
             node_count = state.node_count,
@@ -87,41 +88,41 @@ pub(super) fn walk(
              truncated (generated or adversarial source)",
         );
     }
-    metrics.insert("ast.call_count", call_count as f64);
+    metrics.insert(metric!("ast.call_count"), call_count as f64);
     if state.max_member_chain_depth > 0 {
         metrics.insert(
-            "ast.member_depth_max",
+            metric!("ast.member_depth_max"),
             f64::from(state.max_member_chain_depth),
         );
     }
     if state.max_string_concat_chain > 1 {
         metrics.insert(
-            "ast.max_concat_chain",
+            metric!("ast.max_concat_chain"),
             f64::from(state.max_string_concat_chain),
         );
     }
     if state.max_array_literal_length > 0 {
         metrics.insert(
-            "ast.max_array_len",
+            metric!("ast.max_array_len"),
             f64::from(state.max_array_literal_length),
         );
     }
     if state.max_numeric_array_length > 0 {
         metrics.insert(
-            "ast.max_numeric_array",
+            metric!("ast.max_numeric_array"),
             f64::from(state.max_numeric_array_length),
         );
     }
 
     if member_count > 0 {
-        metrics.insert("ast.member_count", member_count as f64);
+        metrics.insert(metric!("ast.member_count"), member_count as f64);
     }
 
     // Per-operator counts: `ast.op.<name>` (e.g. `ast.op.xor`). Raw integer
     // counts keyed by the canonical operator name; matched O(1) via
     // `type: metrics, field: 'ast.op.xor', min: N`.
     for (op, count) in &state.op_counts {
-        metrics.insert(format!("ast.op.{op}"), f64::from(*count));
+        metrics.insert(crate::ast_op(op), f64::from(*count));
     }
     // Per-operator density: `ast.op_density.<name>` = count / node_count. A
     // scale-invariant signal that an operator dominates the parse tree
@@ -131,23 +132,26 @@ pub(super) fn walk(
     if state.node_count > 0 {
         let nodes = state.node_count as f64;
         for (op, count) in &state.op_counts {
-            metrics.insert(format!("ast.op_density.{op}"), f64::from(*count) / nodes);
+            metrics.insert(crate::ast_op_density(op), f64::from(*count) / nodes);
         }
     }
     // `ast.sequence_count` follows the node-kind-count convention (cf.
     // `ast.member_count` from `member_expression`).
     if state.sequence_expr_count > 0 {
-        metrics.insert("ast.sequence_count", f64::from(state.sequence_expr_count));
+        metrics.insert(
+            metric!("ast.sequence_count"),
+            f64::from(state.sequence_expr_count),
+        );
     }
     if state.identity_fn_count > 0 {
         metrics.insert(
-            "ast.identity_function_count",
+            metric!("ast.identity_function_count"),
             f64::from(state.identity_fn_count),
         );
     }
     if state.string_return_fn_count > 0 {
         metrics.insert(
-            "ast.string_return_function_count",
+            metric!("ast.string_return_function_count"),
             f64::from(state.string_return_fn_count),
         );
     }
@@ -158,25 +162,25 @@ pub(super) fn walk(
     // raw count cannot.
     if state.function_count > 0 && state.string_return_fn_count > 0 {
         metrics.insert(
-            "ast.string_return_function_ratio",
+            metric!("ast.string_return_function_ratio"),
             f64::from(state.string_return_fn_count) / f64::from(state.function_count),
         );
     }
     if state.xor_mod_loop_count > 0 {
         metrics.insert(
-            "ast.xor_mod_loop_count",
+            metric!("ast.xor_mod_loop_count"),
             f64::from(state.xor_mod_loop_count),
         );
     }
     if state.max_numeric_sequence_length > 0 {
         metrics.insert(
-            "ast.max_numeric_seq",
+            metric!("ast.max_numeric_seq"),
             f64::from(state.max_numeric_sequence_length),
         );
     }
     if state.const_return_fn_count > 0 {
         metrics.insert(
-            "ast.const_return_function_count",
+            metric!("ast.const_return_function_count"),
             f64::from(state.const_return_fn_count),
         );
     }
@@ -187,19 +191,19 @@ pub(super) fn walk(
     // (with a count floor) rather than the size-scaling raw count.
     if state.function_count > 0 && state.const_return_fn_count > 0 {
         metrics.insert(
-            "ast.const_return_function_ratio",
+            metric!("ast.const_return_function_ratio"),
             f64::from(state.const_return_fn_count) / f64::from(state.function_count),
         );
     }
     if state.self_compare_count > 0 {
         metrics.insert(
-            "ast.self_compare_count",
+            metric!("ast.self_compare_count"),
             f64::from(state.self_compare_count),
         );
     }
     if state.infinite_loop_count > 0 {
         metrics.insert(
-            "ast.infinite_loop_count",
+            metric!("ast.infinite_loop_count"),
             f64::from(state.infinite_loop_count),
         );
     }

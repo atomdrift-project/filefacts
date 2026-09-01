@@ -19,6 +19,7 @@ pub(crate) mod parse;
 mod string_metrics;
 mod text_metrics;
 
+use crate::metric;
 use std::cell::Cell;
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
@@ -134,7 +135,10 @@ pub(super) fn extract(
         });
     }
     if !functions.items.is_empty() {
-        metrics.insert("source.function_count", functions.items.len() as f64);
+        metrics.insert(
+            metric!("source.function_count"),
+            functions.items.len() as f64,
+        );
     }
     for (name, offset) in &functions.items {
         symbols_out.push(crate::Symbol::Function {
@@ -145,7 +149,7 @@ pub(super) fn extract(
         });
     }
     if !classes.items.is_empty() {
-        metrics.insert("source.class_count", classes.items.len() as f64);
+        metrics.insert(metric!("source.class_count"), classes.items.len() as f64);
     }
     // Class declarations surface as `Symbol::Function` too — the symbol
     // axis is "things declared here", regardless of function vs class.
@@ -286,16 +290,28 @@ fn emit_query_limit_metrics(metrics: &mut Metrics, label: &str, result: &QueryCo
     if !result.limited() {
         return;
     }
-    metrics.insert("source.query_limited", 1.0);
-    metrics.insert(format!("source.query_limited.{label}"), 1.0);
+    metrics.insert(metric!("source.query_limited"), 1.0);
+    metrics.insert(
+        crate::source_query_limited(label, crate::QueryLimit::Any),
+        1.0,
+    );
     if result.timed_out {
-        metrics.insert(format!("source.query_limited.{label}.timeout"), 1.0);
+        metrics.insert(
+            crate::source_query_limited(label, crate::QueryLimit::Timeout),
+            1.0,
+        );
     }
     if result.match_limited {
-        metrics.insert(format!("source.query_limited.{label}.match_limit"), 1.0);
+        metrics.insert(
+            crate::source_query_limited(label, crate::QueryLimit::Match),
+            1.0,
+        );
     }
     if result.output_limited {
-        metrics.insert(format!("source.query_limited.{label}.output_limit"), 1.0);
+        metrics.insert(
+            crate::source_query_limited(label, crate::QueryLimit::Output),
+            1.0,
+        );
     }
 }
 
@@ -530,22 +546,22 @@ fn emit_text_ratios(metrics: &mut Metrics, total_lines: u32) {
 
     if functions_total > 0.0 {
         metrics.insert(
-            "text.strings_to_functions_ratio",
+            metric!("text.strings_to_functions_ratio"),
             strings_total / functions_total,
         );
         metrics.insert(
-            "text.identifiers_to_functions_ratio",
+            metric!("text.identifiers_to_functions_ratio"),
             identifiers_unique / functions_total,
         );
         if imports_total > 0.0 {
             metrics.insert(
-                "text.imports_to_functions_ratio",
+                metric!("text.imports_to_functions_ratio"),
                 imports_total / functions_total,
             );
         }
         if functions_anonymous > 0.0 {
             metrics.insert(
-                "text.anonymous_function_ratio",
+                metric!("text.anonymous_function_ratio"),
                 functions_anonymous / functions_total,
             );
         }
@@ -554,33 +570,45 @@ fn emit_text_ratios(metrics: &mut Metrics, total_lines: u32) {
     if total_lines > 0 {
         let lines_f = f64::from(total_lines);
         if identifiers_total > 0.0 {
-            metrics.insert("text.identifier_density", identifiers_total / lines_f);
+            metrics.insert(
+                metric!("text.identifier_density"),
+                identifiers_total / lines_f,
+            );
         }
         if strings_total > 0.0 {
-            metrics.insert("text.string_density", strings_total / lines_f);
+            metrics.insert(metric!("text.string_density"), strings_total / lines_f);
         }
         if imports_total > 0.0 {
-            metrics.insert("text.import_density", (imports_total * 100.0) / lines_f);
+            metrics.insert(
+                metric!("text.import_density"),
+                (imports_total * 100.0) / lines_f,
+            );
         }
         let lines_sqrt = lines_f.sqrt();
         if lines_sqrt > 0.0 {
             if functions_total > 0.0 {
                 metrics.insert(
-                    "text.normalized_function_count",
+                    metric!("text.normalized_function_count"),
                     functions_total / lines_sqrt,
                 );
             }
             if imports_total > 0.0 {
-                metrics.insert("text.normalized_import_count", imports_total / lines_sqrt);
+                metrics.insert(
+                    metric!("text.normalized_import_count"),
+                    imports_total / lines_sqrt,
+                );
             }
             if strings_total > 0.0 {
-                metrics.insert("text.normalized_string_count", strings_total / lines_sqrt);
+                metrics.insert(
+                    metric!("text.normalized_string_count"),
+                    strings_total / lines_sqrt,
+                );
             }
         }
         let lines_log = lines_f.log2();
         if lines_log > 0.0 && identifiers_unique > 0.0 {
             metrics.insert(
-                "text.normalized_unique_identifiers",
+                metric!("text.normalized_unique_identifiers"),
                 identifiers_unique / lines_log,
             );
         }
@@ -595,7 +623,7 @@ fn emit_text_ratios(metrics: &mut Metrics, total_lines: u32) {
             + get("identifiers.repeated_char_names");
         if suspicious > 0.0 {
             metrics.insert(
-                "text.suspicious_identifier_ratio",
+                metric!("text.suspicious_identifier_ratio"),
                 suspicious / identifiers_unique,
             );
         }
@@ -605,18 +633,27 @@ fn emit_text_ratios(metrics: &mut Metrics, total_lines: u32) {
         let encoded =
             get("strings.base64_candidates") + get("strings.hex") + get("strings.url_encoded");
         if encoded > 0.0 {
-            metrics.insert("text.encoded_string_ratio", encoded / strings_total);
+            metrics.insert(
+                metric!("text.encoded_string_ratio"),
+                encoded / strings_total,
+            );
         }
         let suspicious =
             get("strings.embedded_code_candidates") + get("strings.shell") + get("strings.sql");
         if suspicious > 0.0 {
-            metrics.insert("text.suspicious_string_ratio", suspicious / strings_total);
+            metrics.insert(
+                metric!("text.suspicious_string_ratio"),
+                suspicious / strings_total,
+            );
         }
         let dynamic = get("strings.concat_operations")
             + get("strings.char_construction")
             + get("strings.array_join_construction");
         if dynamic > 0.0 {
-            metrics.insert("text.dynamic_string_ratio", dynamic / strings_total);
+            metrics.insert(
+                metric!("text.dynamic_string_ratio"),
+                dynamic / strings_total,
+            );
         }
     }
 
@@ -624,14 +661,20 @@ fn emit_text_ratios(metrics: &mut Metrics, total_lines: u32) {
     if comments_total > 0.0 {
         let suspicious = get("comments.high_entropy") + get("comments.base64");
         if suspicious > 0.0 {
-            metrics.insert("text.suspicious_comment_ratio", suspicious / comments_total);
+            metrics.insert(
+                metric!("text.suspicious_comment_ratio"),
+                suspicious / comments_total,
+            );
         }
     }
 
     if imports_total > 0.0 {
         let dynamic = get("imports.dynamic") + get("imports.conditional_imports");
         if dynamic > 0.0 {
-            metrics.insert("text.dynamic_import_ratio", dynamic / imports_total);
+            metrics.insert(
+                metric!("text.dynamic_import_ratio"),
+                dynamic / imports_total,
+            );
         }
     }
 }

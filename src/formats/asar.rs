@@ -5,6 +5,7 @@
 //! that need recursive analysis should slice members and dispatch them by their
 //! own detected file types.
 
+use crate::metric;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::error::Error;
@@ -206,7 +207,7 @@ pub(super) fn extract(
 ) -> Result<(), Error> {
     let index = parse_index(bytes)?;
     values.insert("archive.format.kind", JsonValue::String("asar".into()));
-    metrics.insert("archive.header_size", index.header_size as f64);
+    metrics.insert(metric!("archive.header_size"), index.header_size as f64);
 
     let mut members = Vec::new();
     let mut file_count = 0u64;
@@ -240,15 +241,27 @@ pub(super) fn extract(
         JsonValue::Array(vec![JsonValue::String("stored".into())]),
     );
 
-    metrics.insert("archive.member_count", file_count as f64);
-    metrics.insert("archive.file_count", file_count as f64);
-    metrics.insert("archive.directory_count", directory_count as f64);
-    metrics.insert("archive.uncompressed_size", total_uncompressed as f64);
-    metrics.insert("archive.compressed_size", total_uncompressed as f64);
-    metrics.insert("archive.format.regular_count", file_count as f64);
-    metrics.insert("archive.max_filename_length", max_filename_length as f64);
-    metrics.insert("archive.script_count", script_count as f64);
-    metrics.insert("archive.nested_archive_count", nested_archive_count as f64);
+    metrics.insert(metric!("archive.member_count"), file_count as f64);
+    metrics.insert(metric!("archive.file_count"), file_count as f64);
+    metrics.insert(metric!("archive.directory_count"), directory_count as f64);
+    metrics.insert(
+        metric!("archive.uncompressed_size"),
+        total_uncompressed as f64,
+    );
+    metrics.insert(
+        metric!("archive.compressed_size"),
+        total_uncompressed as f64,
+    );
+    metrics.insert(metric!("archive.format.regular_count"), file_count as f64);
+    metrics.insert(
+        metric!("archive.max_filename_length"),
+        max_filename_length as f64,
+    );
+    metrics.insert(metric!("archive.script_count"), script_count as f64);
+    metrics.insert(
+        metric!("archive.nested_archive_count"),
+        nested_archive_count as f64,
+    );
 
     Ok(())
 }

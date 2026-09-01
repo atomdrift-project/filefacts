@@ -19,6 +19,7 @@
 //! - `vsix.properties.<id>` — `<Property Id="…" Value="…" />` pairs,
 //!   with the `Microsoft.VisualStudio.` prefix stripped.
 
+use crate::metric;
 use std::io::{Read, Seek};
 
 use serde_json::Value as JsonValue;
@@ -138,7 +139,7 @@ pub(super) fn extract(
     if !properties.is_empty() {
         values.insert("vsix.properties", JsonValue::Object(properties));
     }
-    metrics.insert("vsix.property_count", f64::from(property_count));
+    metrics.insert(metric!("vsix.property_count"), f64::from(property_count));
 
     // <Dependency> elements signal extension activation chaining. Each
     // dependency surfaces as a `{id, version}` pair.
@@ -183,7 +184,7 @@ pub(super) fn extract(
         })
         .collect();
     if !assets.is_empty() {
-        metrics.insert("vsix.asset_count", assets.len() as f64);
+        metrics.insert(metric!("vsix.asset_count"), assets.len() as f64);
         values.insert("vsix.assets", JsonValue::Array(assets));
     }
 

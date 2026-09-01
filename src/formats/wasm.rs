@@ -23,6 +23,7 @@
 //! records neutral structure.
 
 use crate::error::Error;
+use crate::metric;
 use crate::output::{Errors, Metrics, Section, Strings, Symbols, Values};
 use serde_json::Value as JsonValue;
 
@@ -312,9 +313,9 @@ pub(super) fn extract(
         values.insert("wasm.exports", JsonValue::from(export_names.clone()));
     }
 
-    metrics.insert("wasm.import_count", import_names.len() as f64);
-    metrics.insert("wasm.export_count", export_names.len() as f64);
-    metrics.insert("wasm.section_count", section_count as f64);
+    metrics.insert(metric!("wasm.import_count"), import_names.len() as f64);
+    metrics.insert(metric!("wasm.export_count"), export_names.len() as f64);
+    metrics.insert(metric!("wasm.section_count"), section_count as f64);
 
     Ok(())
 }

@@ -18,6 +18,7 @@
 //!   entry is one of `rsa`, `dsa`, `pgp`, `gpg`; presence of the
 //!   array signals a signed package (no bool needed).
 
+use crate::metric;
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
@@ -144,9 +145,9 @@ fn apply_main_tag(entry: &IndexEntry, data: &[u8], values: &mut Values, metrics:
         main_tag::NAME => set_string(values, "rpm.name", entry, data),
         main_tag::VERSION => set_string(values, "rpm.version", entry, data),
         main_tag::RELEASE => set_string(values, "rpm.release", entry, data),
-        main_tag::EPOCH => set_u32(values, metrics, "rpm.epoch", entry, data),
+        main_tag::EPOCH => set_u32(values, metrics, metric!("rpm.epoch"), entry, data),
         main_tag::SUMMARY => set_string(values, "rpm.summary", entry, data),
-        main_tag::BUILDTIME => set_u32(values, metrics, "rpm.buildtime", entry, data),
+        main_tag::BUILDTIME => set_u32(values, metrics, metric!("rpm.buildtime"), entry, data),
         main_tag::BUILDHOST => set_string(values, "rpm.buildhost", entry, data),
         main_tag::DISTRIBUTION => set_string(values, "rpm.distribution", entry, data),
         main_tag::VENDOR => set_string(values, "rpm.vendor", entry, data),
@@ -173,10 +174,16 @@ fn set_string(values: &mut Values, key: &str, entry: &IndexEntry, data: &[u8]) {
     }
 }
 
-fn set_u32(values: &mut Values, metrics: &mut Metrics, key: &str, entry: &IndexEntry, data: &[u8]) {
+fn set_u32(
+    values: &mut Values,
+    metrics: &mut Metrics,
+    key: crate::MetricKey,
+    entry: &IndexEntry,
+    data: &[u8],
+) {
     if let Some(v) = decode_u32(entry, data) {
-        metrics.insert(key.to_string(), f64::from(v));
-        values.insert(key, json!(v));
+        values.insert(key.as_str(), json!(v));
+        metrics.insert(key, f64::from(v));
     }
 }
 

@@ -20,6 +20,7 @@
 //! attribution surface for legitimate vendor binaries — exactly what
 //! supply-chain swap detection needs.
 
+use crate::metric;
 use gimli::{
     DebugAbbrev, DebugInfo, DebugLineStr, DebugStr, DwLang, EndianSlice, LittleEndian, Reader,
 };
@@ -140,7 +141,7 @@ pub(super) fn emit(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &m
         );
     }
     if cu_count > 0 {
-        metrics.insert("elf.dwarf.cu_count", f64::from(cu_count));
+        metrics.insert(metric!("elf.dwarf.cu_count"), f64::from(cu_count));
     }
 }
 

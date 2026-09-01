@@ -5,6 +5,7 @@
 //! key-namespace prefix — `fileid` already tells consumers which
 //! structured format they're looking at.
 
+use crate::metric;
 use serde_json::{Map, Value as JsonValue};
 
 use crate::error::Error;
@@ -35,7 +36,7 @@ pub(super) fn extract_generic_json(
     metrics: &mut Metrics,
 ) -> Result<(), Error> {
     metrics.insert(
-        "json.parse_limit_bytes",
+        metric!("json.parse_limit_bytes"),
         GENERIC_JSON_PARSE_LIMIT_BYTES as f64,
     );
     if bytes.len() > GENERIC_JSON_PARSE_LIMIT_BYTES {
@@ -55,7 +56,7 @@ pub(super) fn extract_generic_json(
         return Ok(());
     }
 
-    metrics.insert("json.parsed_bytes", bytes.len() as f64);
+    metrics.insert(metric!("json.parsed_bytes"), bytes.len() as f64);
     extract_json(bytes, values)
 }
 
@@ -77,7 +78,7 @@ pub(super) fn extract_gyp(
     metrics: &mut Metrics,
 ) -> Result<(), Error> {
     metrics.insert(
-        "json.parse_limit_bytes",
+        metric!("json.parse_limit_bytes"),
         GENERIC_JSON_PARSE_LIMIT_BYTES as f64,
     );
     if bytes.len() > GENERIC_JSON_PARSE_LIMIT_BYTES {
@@ -96,14 +97,14 @@ pub(super) fn extract_gyp(
         );
         return Ok(());
     }
-    metrics.insert("json.parsed_bytes", bytes.len() as f64);
+    metrics.insert(metric!("json.parsed_bytes"), bytes.len() as f64);
     if let Ok(parsed) = serde_json::from_slice::<JsonValue>(bytes) {
         promote_root(parsed, values);
         return Ok(());
     }
     match parse_gyp(bytes) {
         Some(parsed) => {
-            metrics.insert("gyp.parse_lenient", 1.0);
+            metrics.insert(metric!("gyp.parse_lenient"), 1.0);
             promote_root(parsed, values);
             Ok(())
         }

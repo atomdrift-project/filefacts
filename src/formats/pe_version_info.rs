@@ -18,6 +18,7 @@
 //! with format-conventional names — file_version as `"a.b.c.d"`,
 //! flag bits as a sorted string array, OS class as a stable label.
 
+use crate::metric;
 use goblin::pe::resource::{StringFileInfo, VersionInfo, VsFixedFileInfo};
 use serde_json::Value as JsonValue;
 
@@ -185,8 +186,8 @@ fn identity_metrics(strings: &StringFileInfo<'_>, metrics: &mut Metrics) {
     }
 
     if let Some((symbol_ratio, entropy)) = identity_scores(&identity) {
-        metrics.insert("pe.version.identity_symbol_ratio", symbol_ratio);
-        metrics.insert("pe.version.identity_entropy", entropy);
+        metrics.insert(metric!("pe.version.identity_symbol_ratio"), symbol_ratio);
+        metrics.insert(metric!("pe.version.identity_entropy"), entropy);
     }
 }
 

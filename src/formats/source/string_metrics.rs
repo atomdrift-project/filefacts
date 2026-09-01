@@ -6,6 +6,7 @@
 //! categories (URL/path/IP/email/domain), and suspicious payloads
 //! (embedded code, shell commands, SQL).
 
+use crate::metric;
 use crate::output::Metrics;
 
 use super::identifier_metrics::string_entropy;
@@ -17,7 +18,7 @@ pub(super) fn emit(strings: &[&str], metrics: &mut Metrics) {
     }
 
     let total = strings.len() as u32;
-    metrics.insert("strings.count", f64::from(total));
+    metrics.insert(metric!("strings.count"), f64::from(total));
 
     let mut total_bytes: u64 = 0;
     let mut max_length: u32 = 0;
@@ -106,20 +107,23 @@ pub(super) fn emit(strings: &[&str], metrics: &mut Metrics) {
     }
 
     if total_bytes > 0 {
-        metrics.insert("strings.bytes", total_bytes as f64);
-        metrics.insert("strings.avg_length", total_bytes as f64 / f64::from(total));
+        metrics.insert(metric!("strings.bytes"), total_bytes as f64);
+        metrics.insert(
+            metric!("strings.avg_length"),
+            total_bytes as f64 / f64::from(total),
+        );
     }
     if max_length > 0 {
-        metrics.insert("strings.max_length", f64::from(max_length));
+        metrics.insert(metric!("strings.max_length"), f64::from(max_length));
     }
     if empty_count > 0 {
-        metrics.insert("strings.empty_count", f64::from(empty_count));
+        metrics.insert(metric!("strings.empty_count"), f64::from(empty_count));
     }
 
     if !entropy_values.is_empty() {
         let sum: f64 = entropy_values.iter().sum();
         let mean = sum / entropy_values.len() as f64;
-        metrics.insert("strings.avg_entropy", mean);
+        metrics.insert(metric!("strings.avg_entropy"), mean);
         let variance: f64 = entropy_values
             .iter()
             .map(|&e| {
@@ -130,60 +134,69 @@ pub(super) fn emit(strings: &[&str], metrics: &mut Metrics) {
             / entropy_values.len() as f64;
         let stddev = variance.sqrt();
         if stddev > 0.0 {
-            metrics.insert("strings.entropy_stddev", stddev);
+            metrics.insert(metric!("strings.entropy_stddev"), stddev);
         }
     }
 
     if high_entropy_count > 0 {
-        metrics.insert("strings.high_entropy_count", f64::from(high_entropy_count));
+        metrics.insert(
+            metric!("strings.high_entropy_count"),
+            f64::from(high_entropy_count),
+        );
     }
     if very_high_entropy_count > 0 {
         metrics.insert(
-            "strings.very_high_entropy_count",
+            metric!("strings.very_high_entropy_count"),
             f64::from(very_high_entropy_count),
         );
     }
     if base64_count > 0 {
-        metrics.insert("strings.base64_candidates", f64::from(base64_count));
+        metrics.insert(
+            metric!("strings.base64_candidates"),
+            f64::from(base64_count),
+        );
     }
     if hex_count > 0 {
-        metrics.insert("strings.hex", f64::from(hex_count));
+        metrics.insert(metric!("strings.hex"), f64::from(hex_count));
     }
     if url_encoded_count > 0 {
-        metrics.insert("strings.url_encoded", f64::from(url_encoded_count));
+        metrics.insert(metric!("strings.url_encoded"), f64::from(url_encoded_count));
     }
     if unicode_heavy_count > 0 {
-        metrics.insert("strings.unicode_heavy", f64::from(unicode_heavy_count));
+        metrics.insert(
+            metric!("strings.unicode_heavy"),
+            f64::from(unicode_heavy_count),
+        );
     }
     if url_count > 0 {
-        metrics.insert("strings.url_count", f64::from(url_count));
+        metrics.insert(metric!("strings.url_count"), f64::from(url_count));
     }
     if path_count > 0 {
-        metrics.insert("strings.path_count", f64::from(path_count));
+        metrics.insert(metric!("strings.path_count"), f64::from(path_count));
     }
     if ip_count > 0 {
-        metrics.insert("strings.ip_count", f64::from(ip_count));
+        metrics.insert(metric!("strings.ip_count"), f64::from(ip_count));
     }
     if email_count > 0 {
-        metrics.insert("strings.email_count", f64::from(email_count));
+        metrics.insert(metric!("strings.email_count"), f64::from(email_count));
     }
     if domain_count > 0 {
-        metrics.insert("strings.domain_count", f64::from(domain_count));
+        metrics.insert(metric!("strings.domain_count"), f64::from(domain_count));
     }
     if very_long_count > 0 {
-        metrics.insert("strings.very_long", f64::from(very_long_count));
+        metrics.insert(metric!("strings.very_long"), f64::from(very_long_count));
     }
     if embedded_code_count > 0 {
         metrics.insert(
-            "strings.embedded_code_candidates",
+            metric!("strings.embedded_code_candidates"),
             f64::from(embedded_code_count),
         );
     }
     if shell_command_count > 0 {
-        metrics.insert("strings.shell", f64::from(shell_command_count));
+        metrics.insert(metric!("strings.shell"), f64::from(shell_command_count));
     }
     if sql_count > 0 {
-        metrics.insert("strings.sql", f64::from(sql_count));
+        metrics.insert(metric!("strings.sql"), f64::from(sql_count));
     }
 }
 

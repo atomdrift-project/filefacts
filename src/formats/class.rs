@@ -26,6 +26,7 @@
 //! - `class.constant_pool_size` — metric also surfaced as
 //!   `metrics.class.constant_pool_size`.
 
+use crate::metric;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
@@ -248,9 +249,12 @@ pub(super) fn extract(
         );
     }
     put_u64(values, "class.constant_pool_size", cp_count as u64);
-    metrics.insert("class.constant_pool_size", cp_count as f64);
-    metrics.insert("class.interface_count", f64::from(interfaces_count));
-    metrics.insert("class.major_version", f64::from(major_version));
+    metrics.insert(metric!("class.constant_pool_size"), cp_count as f64);
+    metrics.insert(
+        metric!("class.interface_count"),
+        f64::from(interfaces_count),
+    );
+    metrics.insert(metric!("class.major_version"), f64::from(major_version));
 
     Ok(())
 }
@@ -469,7 +473,10 @@ fn populate_imports(
         });
         class_count = class_count.saturating_add(1);
     }
-    metrics.insert("class.external_class_count", f64::from(class_count));
+    metrics.insert(
+        metric!("class.external_class_count"),
+        f64::from(class_count),
+    );
 
     // Methodref / InterfaceMethodref / Fieldref — surface only the
     // ones we can fully resolve to (class, name, descriptor). The
@@ -492,7 +499,10 @@ fn populate_imports(
         });
         method_ref_count = method_ref_count.saturating_add(1);
     }
-    metrics.insert("class.method_ref_count", f64::from(method_ref_count));
+    metrics.insert(
+        metric!("class.method_ref_count"),
+        f64::from(method_ref_count),
+    );
 }
 
 fn skip_member_table(bytes: &[u8], pos: &mut usize) -> Option<()> {

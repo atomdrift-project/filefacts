@@ -9,6 +9,7 @@
 //! and surfaces the first slice's metadata at the top level so simple
 //! consumers don't have to enumerate the array.
 
+use crate::metric;
 use goblin::mach::{self, Mach, MachO};
 use serde_json::Value as JsonValue;
 
@@ -42,13 +43,13 @@ pub(super) fn extract(
             // still recovered from the malformed input.
             extract_binary_strings(bytes, strings, XorScan::Yes);
             errors_out.record_malformed(crate::Stage::MachoParse, e.to_string());
-            metrics.insert("macho.parse_failed", 1.0);
+            metrics.insert(metric!("macho.parse_failed"), 1.0);
             return Ok(());
         }
         goblin_safe::GoblinOutcome::Panicked(msg) => {
             extract_binary_strings(bytes, strings, XorScan::Yes);
             errors_out.record_panic(crate::Stage::MachoParse, msg);
-            metrics.insert("macho.parse_panicked", 1.0);
+            metrics.insert(metric!("macho.parse_panicked"), 1.0);
             return Ok(());
         }
     };
@@ -214,7 +215,7 @@ fn fat_binary(
             );
         }
     }
-    metrics.insert("macho.slice_count", archs.len() as f64);
+    metrics.insert(metric!("macho.slice_count"), archs.len() as f64);
     values.insert("macho.slices", JsonValue::Array(archs));
 }
 
@@ -590,7 +591,7 @@ fn extract_header_and_loads(
     // when the entry came from LC_UNIXTHREAD.
     put_u64(values, "macho.entry", macho.entry);
     if macho.old_style_entry {
-        metrics.insert("macho.old_style_entry", 1.0);
+        metrics.insert(metric!("macho.old_style_entry"), 1.0);
     }
     // Raw header counts: number of load commands and their cumulative
     // byte size. `macho.load_command_count` already exists as a
@@ -609,7 +610,7 @@ fn extract_header_and_loads(
         .collect();
     // LC_LOAD_DYLIB count surfaces under the cross-format
     // `dependencies.count` metric. No per-format alias.
-    metrics.insert("dependencies.count", libs.len() as f64);
+    metrics.insert(metric!("dependencies.count"), libs.len() as f64);
     values.insert("macho.libraries", JsonValue::Array(libs));
 
     let rpaths: Vec<JsonValue> = macho
@@ -628,7 +629,7 @@ fn extract_header_and_loads(
         .iter()
         .map(|lc| JsonValue::String(load_command_name(lc.command.cmd()).to_string()))
         .collect();
-    metrics.insert("macho.load_command_count", lcs.len() as f64);
+    metrics.insert(metric!("macho.load_command_count"), lcs.len() as f64);
     values.insert("macho.load_commands", JsonValue::Array(lcs));
 
     // Find the LC_CODE_SIGNATURE entry — its `dataoff`/`datasize`
@@ -647,6 +648,7 @@ fn extract_header_and_loads(
         // isn't useful to downstream consumers (they don't seek into
         // it) so we skip it.
         put_u64(values, "macho.code_signature_size", u64::from(cs.datasize));
+        metrics.insert(metric!("macho.code_signature_size"), f64::from(cs.datasize));
         // The blob's file offset — consumers anchor the code-signature
         // finding's evidence here rather than at the header.
         put_u64(values, "macho.code_signature_offset", u64::from(cs.dataoff));
@@ -792,24 +794,24 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
         );
         segments_out.push(JsonValue::Object(entry_obj));
     }
-    metrics.insert("macho.wx_segment_count", wx_count as f64);
+    metrics.insert(metric!("macho.wx_segment_count"), wx_count as f64);
     if !wx_segments.is_empty() {
         values.insert("macho.wx_segments", JsonValue::Array(wx_segments));
     }
     if text_writable {
-        metrics.insert("macho.text_segment_writable", 1.0);
+        metrics.insert(metric!("macho.text_segment_writable"), 1.0);
     }
     if pagezero_size != 0 {
-        metrics.insert("macho.pagezero_size", pagezero_size as f64);
+        metrics.insert(metric!("macho.pagezero_size"), pagezero_size as f64);
     }
     if entry_in_writable {
-        metrics.insert("macho.entry_in_writable_segment", 1.0);
+        metrics.insert(metric!("macho.entry_in_writable_segment"), 1.0);
     }
     if entry != 0 && !entry_in_segment {
-        metrics.insert("macho.entry_outside_segments", 1.0);
+        metrics.insert(metric!("macho.entry_outside_segments"), 1.0);
     }
     if has_data_const {
-        metrics.insert("macho.has_data_const_segment", 1.0);
+        metrics.insert(metric!("macho.has_data_const_segment"), 1.0);
     }
     if !segments_out.is_empty() {
         values.insert("macho.segments", JsonValue::Array(segments_out));
@@ -878,25 +880,28 @@ fn chained_fixups_marker(macho: &MachO<'_>, metrics: &mut Metrics) {
         }
     }
     if has_chained {
-        metrics.insert("macho.has_chained_fixups", 1.0);
+        metrics.insert(metric!("macho.has_chained_fixups"), 1.0);
     }
     if has_legacy_dyld_info {
-        metrics.insert("macho.has_dyld_info_legacy", 1.0);
+        metrics.insert(metric!("macho.has_dyld_info_legacy"), 1.0);
     }
     if has_encrypted {
-        metrics.insert("macho.has_encrypted_section", 1.0);
+        metrics.insert(metric!("macho.has_encrypted_section"), 1.0);
     }
     if uses_legacy_version_min {
-        metrics.insert("macho.uses_legacy_version_min", 1.0);
+        metrics.insert(metric!("macho.uses_legacy_version_min"), 1.0);
     }
     if data_in_code_count > 0 {
-        metrics.insert("macho.data_in_code_count", f64::from(data_in_code_count));
+        metrics.insert(
+            metric!("macho.data_in_code_count"),
+            f64::from(data_in_code_count),
+        );
     }
     if has_main_command {
-        metrics.insert("macho.has_main_command", 1.0);
+        metrics.insert(metric!("macho.has_main_command"), 1.0);
     }
     if has_unixthread_command {
-        metrics.insert("macho.has_unixthread_command", 1.0);
+        metrics.insert(metric!("macho.has_unixthread_command"), 1.0);
     }
 }
 
@@ -951,7 +956,7 @@ fn function_starts(macho: &MachO<'_>, bytes: &[u8], values: &mut Values, metrics
         }
         count += 1;
     }
-    metrics.insert("macho.function_starts_count", count as f64);
+    metrics.insert(metric!("macho.function_starts_count"), count as f64);
     put_u64(values, "macho.function_starts_count", count);
 }
 
@@ -1458,7 +1463,7 @@ fn binary_flags(macho: &MachO<'_>, metrics: &mut Metrics) {
     // App Store / hardened runtime.
     const MH_PIE: u32 = 0x0020_0000;
     let is_pie = macho.header.flags & MH_PIE != 0;
-    metrics.insert("binary.is_pie", f64::from(u8::from(is_pie)));
+    metrics.insert(metric!("binary.is_pie"), f64::from(u8::from(is_pie)));
 
     // Stripped: `LC_SYMTAB.nsyms == 0`. The `nlist` table is the
     // Mach-O equivalent of ELF's `.symtab`; `strip` zeroes it out.
@@ -1467,7 +1472,10 @@ fn binary_flags(macho: &MachO<'_>, metrics: &mut Metrics) {
         _ => None,
     });
     let is_stripped = nsyms.is_some_and(|n| n == 0);
-    metrics.insert("binary.is_stripped", f64::from(u8::from(is_stripped)));
+    metrics.insert(
+        metric!("binary.is_stripped"),
+        f64::from(u8::from(is_stripped)),
+    );
 }
 
 fn info_plist_section(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {

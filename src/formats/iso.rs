@@ -54,6 +54,7 @@
 //! are *not* one range — a caller that slices on the offset must not be
 //! handed a start it cannot trust.
 
+use crate::metric;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 use crate::error::Error;
@@ -146,7 +147,7 @@ pub(super) fn extract(
     let joliet = supplementaries.iter().find(|(_, lvl)| lvl.is_some());
     if let Some((_, Some(level))) = joliet {
         extensions.push("joliet");
-        metrics.insert("iso.joliet_level", f64::from(*level));
+        metrics.insert(metric!("iso.joliet_level"), f64::from(*level));
     }
     values.insert("iso.joliet", JsonValue::Bool(joliet.is_some()));
 
@@ -296,13 +297,13 @@ fn finish(
         // value is data the filesystem does not account for.
         let declared = u64::from(pvd.volume_space_sectors) * SECTOR as u64;
         let actual = bytes.len() as u64;
-        metrics.insert("iso.declared_bytes", declared as f64);
+        metrics.insert(metric!("iso.declared_bytes"), declared as f64);
         if actual > declared {
             let trailing = actual - declared;
-            metrics.insert("iso.trailing_bytes", trailing as f64);
+            metrics.insert(metric!("iso.trailing_bytes"), trailing as f64);
             anomalies.push("trailing-data");
         } else if actual < declared {
-            metrics.insert("iso.missing_bytes", (declared - actual) as f64);
+            metrics.insert(metric!("iso.missing_bytes"), (declared - actual) as f64);
             anomalies.push("truncated-image");
         }
     }
@@ -317,7 +318,7 @@ fn finish(
 
     anomalies.sort_unstable();
     anomalies.dedup();
-    metrics.insert("iso.anomaly_count", anomalies.len() as f64);
+    metrics.insert(metric!("iso.anomaly_count"), anomalies.len() as f64);
     values.insert(
         "iso.anomalies",
         JsonValue::Array(anomalies.iter().map(|a| json!(a)).collect()),
@@ -399,7 +400,10 @@ fn emit_descriptor_set(descriptors: &[Descriptor<'_>], values: &mut Values, metr
         obj.insert("kind".into(), json!(descriptor_kind(d.ident, d.kind)));
         list.push(JsonValue::Object(obj));
     }
-    metrics.insert("iso.volume_descriptor_count", descriptors.len() as f64);
+    metrics.insert(
+        metric!("iso.volume_descriptor_count"),
+        descriptors.len() as f64,
+    );
     values.insert("iso.volume_descriptors", JsonValue::Array(list));
 }
 
@@ -576,37 +580,59 @@ fn emit_pvd(
     }
 
     metrics.insert(
-        "iso.volume_space_sectors",
+        metric!("iso.volume_space_sectors"),
         f64::from(pvd.volume_space_sectors),
     );
-    metrics.insert("iso.volume_set_size", f64::from(pvd.volume_set_size));
     metrics.insert(
-        "iso.volume_sequence_number",
+        metric!("iso.volume_set_size"),
+        f64::from(pvd.volume_set_size),
+    );
+    metrics.insert(
+        metric!("iso.volume_sequence_number"),
         f64::from(pvd.volume_sequence_number),
     );
-    metrics.insert("iso.logical_block_size", f64::from(pvd.logical_block_size));
-    metrics.insert("iso.path_table_bytes", f64::from(pvd.path_table_size));
     metrics.insert(
-        "iso.file_structure_version",
+        metric!("iso.logical_block_size"),
+        f64::from(pvd.logical_block_size),
+    );
+    metrics.insert(
+        metric!("iso.path_table_bytes"),
+        f64::from(pvd.path_table_size),
+    );
+    metrics.insert(
+        metric!("iso.file_structure_version"),
         f64::from(pvd.file_structure_version),
     );
     metrics.insert(
-        "iso.application_use_nonzero_bytes",
+        metric!("iso.application_use_nonzero_bytes"),
         pvd.application_use_nonzero as f64,
     );
 
-    for (key, time) in [
-        ("iso.created", &pvd.created),
-        ("iso.modified", &pvd.modified),
-        ("iso.expires", &pvd.expires),
-        ("iso.effective", &pvd.effective),
+    for (unix, gmt_offset, time) in [
+        (
+            metric!("iso.created_unix"),
+            metric!("iso.created_gmt_offset_minutes"),
+            &pvd.created,
+        ),
+        (
+            metric!("iso.modified_unix"),
+            metric!("iso.modified_gmt_offset_minutes"),
+            &pvd.modified,
+        ),
+        (
+            metric!("iso.expires_unix"),
+            metric!("iso.expires_gmt_offset_minutes"),
+            &pvd.expires,
+        ),
+        (
+            metric!("iso.effective_unix"),
+            metric!("iso.effective_gmt_offset_minutes"),
+            &pvd.effective,
+        ),
     ] {
         if let Some(t) = time {
-            metrics.insert(format!("{key}_unix"), t.unix as f64);
-            metrics.insert(
-                format!("{key}_gmt_offset_minutes"),
-                f64::from(t.gmt_offset_minutes),
-            );
+            metrics.insert(unix, t.unix as f64);
+            metrics.insert(gmt_offset, f64::from(t.gmt_offset_minutes));
         }
     }
 
@@ -628,7 +654,7 @@ fn emit_pvd(
     .iter()
     .filter(|f| f.is_empty())
     .count();
-    metrics.insert("iso.blank_identifier_fields", blank as f64);
+    metrics.insert(metric!("iso.blank_identifier_fields"), blank as f64);
 
     if pvd.logical_block_size != SECTOR as u16 {
         anomalies.push("nonstandard-block-size");
@@ -796,7 +822,7 @@ fn emit_system_area(
         .get(..SYSTEM_AREA_SECTORS * SECTOR)
         .unwrap_or_default();
     let nonzero = area.iter().filter(|b| **b != 0).count();
-    metrics.insert("iso.system_area.nonzero_bytes", nonzero as f64);
+    metrics.insert(metric!("iso.system_area.nonzero_bytes"), nonzero as f64);
 
     // A conforming image leaves this reserved. Real content means the
     // image is also bootable as a raw disk (isohybrid), or that someone
@@ -872,7 +898,7 @@ fn emit_boot(
     }
 
     let catalog_lba = u32_le(body, 71).unwrap_or(0);
-    metrics.insert("iso.boot.catalog_lba", f64::from(catalog_lba));
+    metrics.insert(metric!("iso.boot.catalog_lba"), f64::from(catalog_lba));
     if catalog_lba >= pvd.volume_space_sectors {
         anomalies.push("boot-catalog-out-of-range");
     }
@@ -978,8 +1004,11 @@ fn emit_boot(
         });
     }
 
-    metrics.insert("iso.boot.entry_count", entries.len() as f64);
-    metrics.insert("iso.boot.bootable_entry_count", f64::from(bootable_count));
+    metrics.insert(metric!("iso.boot.entry_count"), entries.len() as f64);
+    metrics.insert(
+        metric!("iso.boot.bootable_entry_count"),
+        f64::from(bootable_count),
+    );
     values.insert("iso.boot.bootable", JsonValue::Bool(bootable_count > 0));
     values.insert(
         "iso.boot.platforms",
@@ -1560,25 +1589,34 @@ fn emit_tree(
         }
     }
 
-    metrics.insert("iso.file_count", file_count as f64);
-    metrics.insert("iso.dir_count", dir_count as f64);
-    metrics.insert("iso.symlink_count", symlink_count as f64);
-    metrics.insert("iso.hidden_file_count", hidden_count as f64);
-    metrics.insert("iso.associated_file_count", associated_count as f64);
-    metrics.insert("iso.setuid_file_count", setuid_count as f64);
-    metrics.insert("iso.executable_file_count", executable_count as f64);
-    metrics.insert("iso.lnk_file_count", lnk_count as f64);
-    metrics.insert("iso.divergent_name_count", divergent as f64);
-    metrics.insert("iso.max_depth", f64::from(max_depth));
-    metrics.insert("iso.total_file_bytes", total_bytes as f64);
-    metrics.insert("iso.largest_file_bytes", largest as f64);
-    metrics.insert("iso.surfaced_file_count", surfaced.len() as f64);
+    metrics.insert(metric!("iso.file_count"), file_count as f64);
+    metrics.insert(metric!("iso.dir_count"), dir_count as f64);
+    metrics.insert(metric!("iso.symlink_count"), symlink_count as f64);
+    metrics.insert(metric!("iso.hidden_file_count"), hidden_count as f64);
+    metrics.insert(
+        metric!("iso.associated_file_count"),
+        associated_count as f64,
+    );
+    metrics.insert(metric!("iso.setuid_file_count"), setuid_count as f64);
+    metrics.insert(
+        metric!("iso.executable_file_count"),
+        executable_count as f64,
+    );
+    metrics.insert(metric!("iso.lnk_file_count"), lnk_count as f64);
+    metrics.insert(metric!("iso.divergent_name_count"), divergent as f64);
+    metrics.insert(metric!("iso.max_depth"), f64::from(max_depth));
+    metrics.insert(metric!("iso.total_file_bytes"), total_bytes as f64);
+    metrics.insert(metric!("iso.largest_file_bytes"), largest as f64);
+    metrics.insert(metric!("iso.surfaced_file_count"), surfaced.len() as f64);
 
     // One file holding nearly the whole image is the shape of a delivery
     // wrapper rather than of distribution media.
     let declared = volume_sectors.saturating_mul(SECTOR as u64);
     if declared > 0 {
-        metrics.insert("iso.largest_file_ratio", largest as f64 / declared as f64);
+        metrics.insert(
+            metric!("iso.largest_file_ratio"),
+            largest as f64 / declared as f64,
+        );
     }
     if divergent > 0 {
         anomalies.push("namespace-name-divergence");
@@ -1684,10 +1722,13 @@ fn emit_unclaimed(
         .filter(|(kind, _, _)| *kind == "slack")
         .map(|(_, _, len)| *len)
         .sum();
-    metrics.insert("iso.unallocated_bytes", total as f64);
-    metrics.insert("iso.unclaimed_region_count", regions.len() as f64);
+    metrics.insert(metric!("iso.unallocated_bytes"), total as f64);
+    metrics.insert(metric!("iso.unclaimed_region_count"), regions.len() as f64);
     if declared > 0 {
-        metrics.insert("iso.unallocated_ratio", total as f64 / declared as f64);
+        metrics.insert(
+            metric!("iso.unallocated_ratio"),
+            total as f64 / declared as f64,
+        );
     }
     if total > 0 {
         anomalies.push("populated-unallocated-space");

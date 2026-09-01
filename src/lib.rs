@@ -95,12 +95,27 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub use error::Error;
 pub use fileid::{ArchiveFormat, Compression, Container, FileId, FileType, container_of};
 pub use output::{
-    ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Arg, ArgShape, Claim,
-    Comments, ErrorKind, Errors, ExtractedString, Fact, HashAlgo, Identity, Literals, Metrics,
-    ParseError, Party, PinnedHash, RefKind, RefLocator, Reference, Section, Sections, Signer, Span,
-    SpanBuilder, Stage, Symbol, SymbolKind, Symbols, Text, Trust, Url, UrlKind, Values,
+    ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Arg, ArgShape, CATALOG,
+    Claim, Comments, ErrorKind, Errors, ExtractedString, FAMILIES, Fact, HashAlgo, Identity,
+    Literals, MetricKey, Metrics, ParseError, Party, PinnedHash, QueryLimit, RefKind, RefLocator,
+    Reference, Section, Sections, Signer, Span, SpanBuilder, Stage, Symbol, SymbolKind, Symbols,
+    Text, Trust, Url, UrlKind, Values, archive_entry_type_count, archive_method_count, ast_op,
+    ast_op_density, declared, dmg_codec_count, extension_content_mismatch, source_query_limited,
 };
 pub use registry::Registry;
+
+/// Every metric key this build can emit, as fixed names plus the templates
+/// for the few keys with a data-derived segment.
+///
+/// This is the enumeration downstream validators consume — cleave checks
+/// every `type: metrics` field in the trait corpus against it, so a rule
+/// naming a metric that no extractor emits is a build-time error there
+/// rather than a rule that silently never fires. Deriving the same list by
+/// scanning filefacts' source is the thing this exists to replace.
+#[must_use]
+pub fn known_metrics() -> (&'static [&'static str], &'static [&'static str]) {
+    (CATALOG, FAMILIES)
+}
 
 /// Schema version of the public output shape.
 ///
@@ -593,17 +608,14 @@ fn run_extraction(
     // decide which transitions are dangerous instead of relying on a severity
     // verdict baked in here.
     if extension_mismatch {
-        metrics.insert("consistency.extension_content_mismatch", 1.0);
+        metrics.insert(metric!("consistency.extension_content_mismatch"), 1.0);
         if let Some((content, ext)) = mismatch_transition {
-            metrics.insert(
-                format!("consistency.extension_content_mismatch.{content}_as_{ext}"),
-                1.0,
-            );
+            metrics.insert(crate::extension_content_mismatch(content, ext), 1.0);
         }
     }
     if let Some(diagnostic) = tree_diagnostic {
-        metrics.insert("source.ast_unavailable", 1.0);
-        metrics.insert(diagnostic.metric, 1.0);
+        metrics.insert(metric!("source.ast_unavailable"), 1.0);
+        metrics.insert(diagnostic.metric.clone(), 1.0);
         errors.record_fallback(crate::Stage::SourceParse, diagnostic.message.clone());
     }
     // Format extractors return `Result` so they can report a hard
@@ -641,8 +653,8 @@ fn run_extraction(
         Err(payload) => {
             let stage = stage_for(file_type);
             if stage == Stage::SourceExtract {
-                metrics.insert("source.extract_panic", 1.0);
-                metrics.insert("source.ast_unavailable", 1.0);
+                metrics.insert(metric!("source.extract_panic"), 1.0);
+                metrics.insert(metric!("source.ast_unavailable"), 1.0);
             }
             errors.record_panic(stage, panic_payload_message(payload));
         }
@@ -656,8 +668,8 @@ fn run_extraction(
             formats::source::build_symbols(cache, &mut symbols, &mut metrics);
         }));
         if let Err(payload) = walk_result {
-            metrics.insert("source.ast_walk_panic", 1.0);
-            metrics.insert("source.ast_unavailable", 1.0);
+            metrics.insert(metric!("source.ast_walk_panic"), 1.0);
+            metrics.insert(metric!("source.ast_unavailable"), 1.0);
             errors.record_panic(Stage::SourceAstWalk, panic_payload_message(payload));
         }
     }
@@ -673,7 +685,7 @@ fn run_extraction(
     // unified `symbols` view.
     emit_symbol_kind_counts(&symbols, &mut metrics);
     if !errors.is_empty() {
-        metrics.insert("parse.error_count", errors.len() as f64);
+        metrics.insert(metric!("parse.error_count"), errors.len() as f64);
     }
 
     // Fold the per-format structural values into the normalized,
@@ -721,16 +733,16 @@ fn emit_symbol_kind_counts(symbols: &Symbols, metrics: &mut Metrics) {
         }
     }
     if imports > 0 {
-        metrics.insert("imports.count", imports as f64);
+        metrics.insert(metric!("imports.count"), imports as f64);
     }
     if exports > 0 {
-        metrics.insert("exports.count", exports as f64);
+        metrics.insert(metric!("exports.count"), exports as f64);
     }
     if functions > 0 {
-        metrics.insert("functions.count", functions as f64);
+        metrics.insert(metric!("functions.count"), functions as f64);
     }
     if binds > 0 {
-        metrics.insert("binds.count", binds as f64);
+        metrics.insert(metric!("binds.count"), binds as f64);
     }
 }
 
@@ -820,7 +832,7 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
 }
 
 fn emit_section_metrics(sections: &Sections, metrics: &mut Metrics) {
-    metrics.insert("sections.count", sections.len() as f64);
+    metrics.insert(metric!("sections.count"), sections.len() as f64);
 
     // Per-section entropies live on `Section.entropy`. Aggregate
     // max / mean across the sections that have file-backed bytes (the
@@ -844,10 +856,15 @@ fn emit_section_metrics(sections: &Sections, metrics: &mut Metrics) {
         // Locate the peak-entropy section so a packer/encrypted-section finding
         // can point at it; the mean has no single location.
         match max_span {
-            Some(span) => metrics.insert_located("sections.entropy_max", entropy_max, [span]),
-            None => metrics.insert("sections.entropy_max", entropy_max),
+            Some(span) => {
+                metrics.insert_located(metric!("sections.entropy_max"), entropy_max, [span])
+            }
+            None => metrics.insert(metric!("sections.entropy_max"), entropy_max),
         }
-        metrics.insert("sections.entropy_mean", entropy_sum / entropy_n as f64);
+        metrics.insert(
+            metric!("sections.entropy_mean"),
+            entropy_sum / entropy_n as f64,
+        );
     }
 
     let mut executable = 0_u64;
@@ -874,16 +891,16 @@ fn emit_section_metrics(sections: &Sections, metrics: &mut Metrics) {
         }
         concatenated_names.extend_from_slice(s.name.as_bytes());
     }
-    metrics.insert("sections.executable_count", executable as f64);
-    metrics.insert("sections.writable_count", writable as f64);
-    metrics.insert("sections.executable_writable_count", wx as f64);
+    metrics.insert(metric!("sections.executable_count"), executable as f64);
+    metrics.insert(metric!("sections.writable_count"), writable as f64);
+    metrics.insert(metric!("sections.executable_writable_count"), wx as f64);
     if code_size > 0 {
-        metrics.insert("sections.code_size", code_size as f64);
+        metrics.insert(metric!("sections.code_size"), code_size as f64);
     }
-    metrics.insert("sections.nonstandard_count", nonstandard as f64);
+    metrics.insert(metric!("sections.nonstandard_count"), nonstandard as f64);
     if !concatenated_names.is_empty() {
         metrics.insert(
-            "sections.name_entropy",
+            metric!("sections.name_entropy"),
             scan::entropy::shannon(&concatenated_names),
         );
     }
@@ -1001,23 +1018,23 @@ fn emit_binary_aggregates(
             })
             .sum::<f64>()
             / total as f64;
-        metrics.insert("binary.string_count", total as f64);
+        metrics.insert(metric!("binary.string_count"), total as f64);
         match max_string_span {
             Some(span) => {
-                metrics.insert_located("binary.max_string_length", max_len as f64, [span])
+                metrics.insert_located(metric!("binary.max_string_length"), max_len as f64, [span])
             }
-            None => metrics.insert("binary.max_string_length", max_len as f64),
+            None => metrics.insert(metric!("binary.max_string_length"), max_len as f64),
         }
-        metrics.insert("binary.avg_string_length", avg);
-        metrics.insert("binary.string_length_stddev", variance.sqrt());
+        metrics.insert(metric!("binary.avg_string_length"), avg);
+        metrics.insert(metric!("binary.string_length_stddev"), variance.sqrt());
         metrics.insert_located(
-            "binary.high_entropy_string_count",
+            metric!("binary.high_entropy_string_count"),
             high_entropy as f64,
             high_entropy_spans.into_spans(),
         );
-        metrics.insert("binary.sentence_string_count", sentence as f64);
+        metrics.insert(metric!("binary.sentence_string_count"), sentence as f64);
         metrics.insert(
-            "binary.sentence_string_ratio",
+            metric!("binary.sentence_string_ratio"),
             sentence as f64 / total as f64,
         );
     }
@@ -1028,7 +1045,7 @@ fn emit_binary_aggregates(
         let mean = entropies.iter().sum::<f64>() / entropies.len() as f64;
         let var =
             entropies.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / entropies.len() as f64;
-        metrics.insert("binary.entropy_variance", var);
+        metrics.insert(metric!("binary.entropy_variance"), var);
     }
 
     // -- Section ratios + size-weighted entropy ----------------------
@@ -1056,21 +1073,27 @@ fn emit_binary_aggregates(
         }
     }
     if code_size > 0 {
-        metrics.insert("binary.code_entropy", code_entropy_sum / code_size as f64);
+        metrics.insert(
+            metric!("binary.code_entropy"),
+            code_entropy_sum / code_size as f64,
+        );
     }
     if data_size > 0 {
-        metrics.insert("binary.data_entropy", data_entropy_sum / data_size as f64);
+        metrics.insert(
+            metric!("binary.data_entropy"),
+            data_entropy_sum / data_size as f64,
+        );
     }
     if code_size + data_size > 0 {
         metrics.insert(
-            "binary.code_to_data_ratio",
+            metric!("binary.code_to_data_ratio"),
             code_size as f64 / (code_size + data_size) as f64,
         );
     }
     let file_size = bytes.len() as u64;
     if file_size > 0 && largest > 0 {
         metrics.insert(
-            "binary.largest_section_ratio",
+            metric!("binary.largest_section_ratio"),
             largest as f64 / file_size as f64,
         );
     }
@@ -1086,10 +1109,10 @@ fn emit_binary_aggregates(
         .unwrap_or(0);
     if last_extent > 0 && file_size > last_extent {
         let overlay_size = file_size - last_extent;
-        metrics.insert("binary.has_overlay", 1.0);
-        metrics.insert("binary.overlay_size", overlay_size as f64);
+        metrics.insert(metric!("binary.has_overlay"), 1.0);
+        metrics.insert(metric!("binary.overlay_size"), overlay_size as f64);
         metrics.insert(
-            "binary.overlay_ratio",
+            metric!("binary.overlay_ratio"),
             overlay_size as f64 / file_size as f64,
         );
         let start = last_extent as usize;
@@ -1098,7 +1121,7 @@ fn emit_binary_aggregates(
             // The overlay is appended payload (installer stub, SFX); carry its
             // extent so a finding points past the last section.
             metrics.insert_located(
-                "binary.overlay_entropy",
+                metric!("binary.overlay_entropy"),
                 scan::entropy::shannon(&bytes[start..end]),
                 [Span::new(last_extent, overlay_size)],
             );

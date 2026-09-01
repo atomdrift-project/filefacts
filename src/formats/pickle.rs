@@ -15,6 +15,7 @@
 //!   `obj`, `newobj`, `newobj_ex`, `stack_global`, `global`,
 //!   `persid`, `binpersid`, `ext1`, `ext2`, `ext4`).
 
+use crate::metric;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeSet, VecDeque};
 
@@ -75,7 +76,7 @@ pub(super) fn extract(
     }
 
     if protocol >= 0 {
-        metrics.insert("pickle.protocol", f64::from(protocol));
+        metrics.insert(metric!("pickle.protocol"), f64::from(protocol));
         put_str(values, "pickle.protocol", protocol.to_string());
     }
     if !modules.is_empty() {

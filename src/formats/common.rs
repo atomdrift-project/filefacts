@@ -1,5 +1,6 @@
 //! Helpers shared across format extractors.
 
+use crate::metric;
 use serde_json::Value as JsonValue;
 
 use crate::output::{Section, Strings, Text, Values};
@@ -142,6 +143,19 @@ pub(super) fn extract_text_strings(bytes: &[u8], strings: &mut Strings, xor: Xor
 /// Convenience wrapper for emitting a string-typed value into `values`.
 pub(super) fn put_str(values: &mut Values, path: &str, s: impl Into<String>) {
     values.insert(path, JsonValue::String(s.into()));
+}
+
+/// The path of a compound-file entry, always `/`-separated.
+///
+/// `cfb` hands back a `PathBuf`, so rendering it joins the components with
+/// the *host* separator: a stream inside a storage reads `/VBA/dir` on Unix
+/// but `/VBA\dir` on Windows. Every caller here matches these paths against
+/// literals from the OLE specs — `VBA/dir`, `/ObjectPool/` — and several
+/// publish them as facts, so the host's separator has no business reaching
+/// either. Normalising once at the boundary keeps matching and output
+/// identical on every platform.
+pub(super) fn cfb_entry_path(entry: &cfb::Entry) -> String {
+    entry.path().to_string_lossy().replace('\\', "/")
 }
 
 /// Return the last path segment of `path`, treating both `/` and `\`
@@ -386,7 +400,7 @@ pub(super) fn rizin_fallback(
 /// environment — and keyed as such — so nothing is recorded.
 fn note_incomplete_recovery(metrics: &mut crate::output::Metrics) {
     if crate::rizin::available() {
-        metrics.insert("binary.rizin_incomplete", 1.0);
+        metrics.insert(metric!("binary.rizin_incomplete"), 1.0);
     }
 }
 
@@ -405,7 +419,6 @@ pub(super) fn rizin_fallback_with_sections(
     symbols: &mut crate::Symbols,
     sections: &mut Vec<crate::output::Section>,
     metrics: &mut crate::output::Metrics,
-    metric_prefix: &str,
     go_pclntab: bool,
 ) {
     // Skip the spawn entirely when goblin already gave us *anything* —
@@ -442,28 +455,19 @@ pub(super) fn rizin_fallback_with_sections(
     };
     let counts = recovery.apply_with_sections(symbols, sections, metrics);
     if counts.imports > 0 {
-        metrics.insert(
-            format!("{metric_prefix}.recovered_imports"),
-            f64::from(counts.imports),
-        );
+        metrics.insert(metric!("pe.recovered_imports"), f64::from(counts.imports));
     }
     if counts.exports > 0 {
-        metrics.insert(
-            format!("{metric_prefix}.recovered_exports"),
-            f64::from(counts.exports),
-        );
+        metrics.insert(metric!("pe.recovered_exports"), f64::from(counts.exports));
     }
     if counts.functions > 0 {
         metrics.insert(
-            format!("{metric_prefix}.recovered_functions"),
+            metric!("pe.recovered_functions"),
             f64::from(counts.functions),
         );
     }
     if counts.sections > 0 {
-        metrics.insert(
-            format!("{metric_prefix}.recovered_sections"),
-            f64::from(counts.sections),
-        );
+        metrics.insert(metric!("pe.recovered_sections"), f64::from(counts.sections));
     }
 }
 
@@ -535,8 +539,8 @@ pub(super) fn hex_nibble(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LARGE_RIZIN_INPUT, NativeFormat, RizinDecision, RizinProfile, basename, decide_rizin,
-        has_xor_intent, hex_encode, stem,
+        LARGE_RIZIN_INPUT, NativeFormat, RizinDecision, RizinProfile, basename, cfb_entry_path,
+        decide_rizin, has_xor_intent, hex_encode, stem,
     };
 
     fn transparent_profile(format: NativeFormat) -> RizinProfile {
@@ -783,5 +787,33 @@ mod tests {
     #[test]
     fn stem_empty_string() {
         assert_eq!(stem(""), "");
+    }
+
+    /// A stream nested inside a storage must render `/`-separated on every
+    /// host. `cfb` joins path components with the platform separator, so on
+    /// Windows this walk yields `/VBA\dir` — which silently defeated every
+    /// `/vba/`-style match in the OLE and VBA extractors, and put a
+    /// backslash into the published `office.streams` paths.
+    #[test]
+    fn cfb_entry_paths_are_slash_separated_on_every_host() {
+        use std::io::Cursor;
+
+        let mut buf = Cursor::new(Vec::<u8>::new());
+        {
+            let mut comp = cfb::CompoundFile::create(&mut buf).unwrap();
+            comp.create_storage("/VBA").unwrap();
+            comp.create_stream("/VBA/dir").unwrap();
+        }
+        let comp = cfb::CompoundFile::open(buf).unwrap();
+        let paths: Vec<String> = comp.walk().map(|e| cfb_entry_path(&e)).collect();
+
+        assert!(
+            paths.iter().any(|p| p == "/VBA/dir"),
+            "nested entry should normalise to /VBA/dir, got {paths:?}"
+        );
+        assert!(
+            paths.iter().all(|p| !p.contains('\\')),
+            "no host separator should survive: {paths:?}"
+        );
     }
 }

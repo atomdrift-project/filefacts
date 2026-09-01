@@ -4,6 +4,7 @@
 //! Shannon entropy. Runs before every format-specific extractor so the
 //! metric exists even for unrecognised inputs.
 
+use crate::metric;
 use crate::output::{Metrics, Span, Strings, Values};
 use crate::scan::entropy;
 
@@ -17,13 +18,13 @@ pub(super) fn extract(
     // One windowed pass yields both the whole-file entropy and the
     // concealed-region signals below, so the file is read only once.
     let scan = entropy::windowed(bytes);
-    metrics.insert("file.size", bytes.len() as f64);
+    metrics.insert(metric!("file.size"), bytes.len() as f64);
     // Whole-file Shannon entropy.
     // unqualified default; specializations qualify (`binary.code_entropy`,
     // `binary.data_entropy`, `sections.entropy_*`). Historically this was
     // `binary.overall_entropy` (+ a `file.entropy` twin, dropped first);
     // renamed 2026-08-22 with rules/model vocab migrated in lockstep.
-    metrics.insert("file.entropy", scan.overall);
+    metrics.insert(metric!("file.entropy"), scan.overall);
 
     // Peak concentrated region. Whole-file and section entropy both average a
     // small encrypted stage into its surroundings; this surfaces and locates
@@ -36,8 +37,12 @@ pub(super) fn extract(
     // analyst straight at the bytes — no offset scalar to join against.
     if scan.peak_bytes > 0 {
         let spans = scan.spans.iter().map(|&(offset, len)| Span { offset, len });
-        metrics.insert_located("binary.peak_region_entropy", scan.peak_entropy, spans);
-        metrics.insert("binary.peak_region_bytes", scan.peak_bytes as f64);
+        metrics.insert_located(
+            metric!("binary.peak_region_entropy"),
+            scan.peak_entropy,
+            spans,
+        );
+        metrics.insert(metric!("binary.peak_region_bytes"), scan.peak_bytes as f64);
     }
 }
 

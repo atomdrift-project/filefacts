@@ -23,6 +23,7 @@
 //!   vs `+CD001` (an ISO 9660 shadow partition).
 //! - `iso.udf.file_count` / `iso.udf.dir_count` — from the tree walk.
 
+use crate::metric;
 use serde_json::Value as JsonValue;
 
 use crate::formats::common::bytes_at::{u16_le, u32_le, u64_le};
@@ -143,7 +144,10 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
         if let Some(rev) = &lv.revision {
             values.insert("iso.udf.revision", JsonValue::String(rev.clone()));
         }
-        metrics.insert("iso.udf.logical_block_size", f64::from(lv.block_size));
+        metrics.insert(
+            metric!("iso.udf.logical_block_size"),
+            f64::from(lv.block_size),
+        );
     }
     if let Some(id) = impl_id {
         values.insert("iso.udf.implementation_id", JsonValue::String(id));
@@ -156,8 +160,8 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
             "iso.udf.partition_contents",
             JsonValue::String(p.contents.clone()),
         );
-        metrics.insert("iso.udf.partition_start_lba", f64::from(p.start));
-        metrics.insert("iso.udf.partition_sectors", f64::from(p.length));
+        metrics.insert(metric!("iso.udf.partition_start_lba"), f64::from(p.start));
+        metrics.insert(metric!("iso.udf.partition_sectors"), f64::from(p.length));
     }
 
     let (Some(lv), Some(part)) = (lvd, partition) else {
@@ -196,8 +200,8 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
     facts.file_count = walk.file_count;
     facts.members = walk.members;
 
-    metrics.insert("iso.udf.file_count", walk.file_count as f64);
-    metrics.insert("iso.udf.dir_count", walk.dir_count as f64);
+    metrics.insert(metric!("iso.udf.file_count"), walk.file_count as f64);
+    metrics.insert(metric!("iso.udf.dir_count"), walk.dir_count as f64);
     if walk.truncated {
         values.insert("iso.udf.tree_truncated", JsonValue::Bool(true));
     }

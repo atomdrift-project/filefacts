@@ -27,6 +27,7 @@
 //! For Phase 2's first slice, we surface the structural inventory
 //! that supply-chain detection traits care about most.
 
+use crate::metric;
 use std::io::{Cursor, Read};
 
 use serde_json::Value as JsonValue;
@@ -74,7 +75,7 @@ pub(super) fn extract(
         if streams.len() >= MAX_STREAMS {
             break;
         }
-        let path = entry.path().to_string_lossy().into_owned();
+        let path = super::common::cfb_entry_path(&entry);
         let lower = path.to_ascii_lowercase();
 
         // Macros live under `/VBA/` storage. Some macro-enabled
@@ -133,7 +134,7 @@ pub(super) fn extract(
     let kind = detect_kind(&streams);
     put_str(values, "office.kind", kind);
 
-    metrics.insert("office.stream_count", streams.len() as f64);
+    metrics.insert(metric!("office.stream_count"), streams.len() as f64);
     values.insert(
         "office.streams",
         JsonValue::Array(streams.iter().cloned().map(JsonValue::String).collect()),
@@ -147,7 +148,7 @@ pub(super) fn extract(
 
     if macro_count > 0 {
         features.push("macros");
-        metrics.insert("office.macro_count", macro_count as f64);
+        metrics.insert(metric!("office.macro_count"), macro_count as f64);
     }
 
     // Excel 4.0 macro sheets. Deprecated since the 1990s and disabled by
@@ -174,7 +175,7 @@ pub(super) fn extract(
         }
     }
     if !names.is_empty() {
-        metrics.insert("office.name_count", names.len() as f64);
+        metrics.insert(metric!("office.name_count"), names.len() as f64);
         // XLM payloads live in defined names -- each one labels a cell the
         // macro sheet calls -- so the names themselves are worth reading.
         values.insert(
@@ -192,7 +193,7 @@ pub(super) fn extract(
     if !sheets.is_empty() {
         let xlm = sheets.iter().filter(|s| s.kind == SHEET_XLM).count();
         let hidden = sheets.iter().filter(|s| s.visibility != 0).count();
-        metrics.insert("office.sheet_count", sheets.len() as f64);
+        metrics.insert(metric!("office.sheet_count"), sheets.len() as f64);
         values.insert(
             "office.sheet_names",
             JsonValue::Array(
@@ -205,10 +206,10 @@ pub(super) fn extract(
         );
         if xlm > 0 {
             features.push("xlm_macros");
-            metrics.insert("office.xlm_sheet_count", xlm as f64);
+            metrics.insert(metric!("office.xlm_sheet_count"), xlm as f64);
         }
         if hidden > 0 {
-            metrics.insert("office.hidden_sheet_count", hidden as f64);
+            metrics.insert(metric!("office.hidden_sheet_count"), hidden as f64);
         }
         // Visibility 2 is "very hidden": the sheet cannot be unhidden from
         // Excel's own UI, only from VBA. Nothing a person maintaining a
@@ -238,7 +239,7 @@ pub(super) fn extract(
             "office.dangerous_clsids",
             JsonValue::Array(dangerous_clsids),
         );
-        metrics.insert("office.dangerous_clsid_count", count);
+        metrics.insert(metric!("office.dangerous_clsid_count"), count);
     }
     if !features.is_empty() {
         values.insert(

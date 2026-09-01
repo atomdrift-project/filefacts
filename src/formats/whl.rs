@@ -25,6 +25,7 @@
 //! - `whl.top_level_packages[]` — root-level directories excluding
 //!   `.dist-info` and `.data`. These are the import-able package names.
 
+use crate::metric;
 use serde_json::Value as JsonValue;
 use std::io::{Read, Seek};
 
@@ -160,7 +161,10 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         values.insert("whl.data_dir", JsonValue::String(d));
     }
 
-    metrics.insert("whl.native_extension_count", native_extension_count as f64);
+    metrics.insert(
+        metric!("whl.native_extension_count"),
+        native_extension_count as f64,
+    );
     if native_extension_count == 0 {
         values.insert("whl.purelib_shape", JsonValue::Bool(true));
     }

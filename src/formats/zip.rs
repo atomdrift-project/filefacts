@@ -12,6 +12,7 @@
 // (`META-INF/*.SF`, `*.RSA`). The case-sensitive comparison is required.
 #![allow(clippy::case_sensitive_file_extension_comparisons)]
 
+use crate::metric;
 use std::io::{Cursor, Read, Seek};
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -57,7 +58,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     if has_comment {
         let comment_str = String::from_utf8_lossy(comment).into_owned();
         values.insert("archive.comment", JsonValue::String(comment_str));
-        metrics.insert("archive.comment_size", comment.len() as f64);
+        metrics.insert(metric!("archive.comment_size"), comment.len() as f64);
     }
 
     // Cap the preallocation: `archive.len()` is the central-directory
@@ -366,65 +367,89 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
 
     // Aggregate metrics. Counts/ratios/spreads go here; verbatim values
     // (the lists above) live in `values`.
-    metrics.insert("archive.member_count", archive.len() as f64);
+    metrics.insert(metric!("archive.member_count"), archive.len() as f64);
     // `archive.file_count` and `archive.directory_count` mirror cleave's
     // historical struct field names that traits still reference.
-    metrics.insert("archive.file_count", file_count as f64);
-    metrics.insert("archive.directory_count", directory_count as f64);
-    metrics.insert("archive.uncompressed_size", total_uncompressed as f64);
-    metrics.insert("archive.compressed_size", total_compressed as f64);
+    metrics.insert(metric!("archive.file_count"), file_count as f64);
+    metrics.insert(metric!("archive.directory_count"), directory_count as f64);
+    metrics.insert(
+        metric!("archive.uncompressed_size"),
+        total_uncompressed as f64,
+    );
+    metrics.insert(metric!("archive.compressed_size"), total_compressed as f64);
     if total_uncompressed > 0 {
         let ratio = total_compressed as f64 / total_uncompressed as f64;
-        metrics.insert("archive.compression.ratio", ratio);
+        metrics.insert(metric!("archive.compression.ratio"), ratio);
     }
     for (m, c) in &compression_counts {
-        metrics.insert(format!("archive.compression.method_counts.{m}"), *c as f64);
+        metrics.insert(crate::archive_method_count(m), *c as f64);
     }
     for (t, c) in &entry_type_counts {
         metrics.insert(
-            format!("archive.format.{}_count", t.replace('-', "_")),
+            crate::archive_entry_type_count(&t.replace('-', "_")),
             *c as f64,
         );
     }
-    metrics.insert("archive.security.setuid_count", setuid as f64);
-    metrics.insert("archive.security.setgid_count", setgid as f64);
-    metrics.insert("archive.security.sticky_count", sticky as f64);
+    metrics.insert(metric!("archive.security.setuid_count"), setuid as f64);
+    metrics.insert(metric!("archive.security.setgid_count"), setgid as f64);
+    metrics.insert(metric!("archive.security.sticky_count"), sticky as f64);
     metrics.insert(
-        "archive.security.world_writable_count",
+        metric!("archive.security.world_writable_count"),
         world_writable as f64,
     );
-    metrics.insert("archive.security.symlink_count", symlinks as f64);
-    metrics.insert("archive.security.encrypted_count", encrypted_count as f64);
+    metrics.insert(metric!("archive.security.symlink_count"), symlinks as f64);
+    metrics.insert(
+        metric!("archive.security.encrypted_count"),
+        encrypted_count as f64,
+    );
 
     // Filename / content aggregates ported from cleave's ArchiveMetrics.
-    metrics.insert("archive.max_filename_length", max_filename_length as f64);
-    metrics.insert("archive.hidden_file_count", hidden_file_count as f64);
-    metrics.insert("archive.path_traversal_count", path_traversal_count as f64);
-    metrics.insert("archive.symlink_escape_count", symlink_escape_count as f64);
-    metrics.insert("archive.executable_count", executable_count as f64);
-    metrics.insert("archive.script_count", script_count as f64);
     metrics.insert(
-        "archive.unicode_filename_count",
+        metric!("archive.max_filename_length"),
+        max_filename_length as f64,
+    );
+    metrics.insert(
+        metric!("archive.hidden_file_count"),
+        hidden_file_count as f64,
+    );
+    metrics.insert(
+        metric!("archive.path_traversal_count"),
+        path_traversal_count as f64,
+    );
+    metrics.insert(
+        metric!("archive.symlink_escape_count"),
+        symlink_escape_count as f64,
+    );
+    metrics.insert(metric!("archive.executable_count"), executable_count as f64);
+    metrics.insert(metric!("archive.script_count"), script_count as f64);
+    metrics.insert(
+        metric!("archive.unicode_filename_count"),
         unicode_filename_count as f64,
     );
     metrics.insert(
-        "archive.homoglyph_filename_count",
+        metric!("archive.homoglyph_filename_count"),
         homoglyph_filename_count as f64,
     );
     metrics.insert(
-        "archive.double_extension_count",
+        metric!("archive.double_extension_count"),
         double_extension_count as f64,
     );
-    metrics.insert("archive.rtlo_filename_count", rtlo_filename_count as f64);
-    metrics.insert("archive.nested_archive_count", nested_archive_count as f64);
     metrics.insert(
-        "archive.misplaced_executable_count",
+        metric!("archive.rtlo_filename_count"),
+        rtlo_filename_count as f64,
+    );
+    metrics.insert(
+        metric!("archive.nested_archive_count"),
+        nested_archive_count as f64,
+    );
+    metrics.insert(
+        metric!("archive.misplaced_executable_count"),
         misplaced_executable_count as f64,
     );
     if zip_bomb_ratio > 0.0 {
-        metrics.insert("archive.zip_bomb_ratio", zip_bomb_ratio);
+        metrics.insert(metric!("archive.zip_bomb_ratio"), zip_bomb_ratio);
     }
-    metrics.insert("archive.extra_field_size", extra_field_size as f64);
+    metrics.insert(metric!("archive.extra_field_size"), extra_field_size as f64);
     if !extra_field_tags.is_empty() {
         let tags: Vec<JsonValue> = extra_field_tags
             .iter()
@@ -433,15 +458,21 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         values.insert("archive.extra_field_tags", JsonValue::Array(tags));
     }
     if uses_zip64 {
-        metrics.insert("archive.uses_zip64", 1.0);
+        metrics.insert(metric!("archive.uses_zip64"), 1.0);
     }
     if has_comment {
-        metrics.insert("archive.has_comment", 1.0);
+        metrics.insert(metric!("archive.has_comment"), 1.0);
     }
-    metrics.insert("archive.noise_file_count", noise_file_count as f64);
-    metrics.insert("archive.entry_comment_count", entry_comment_count as f64);
+    metrics.insert(metric!("archive.noise_file_count"), noise_file_count as f64);
+    metrics.insert(
+        metric!("archive.entry_comment_count"),
+        entry_comment_count as f64,
+    );
     if entry_comment_size > 0 {
-        metrics.insert("archive.entry_comment_size", entry_comment_size as f64);
+        metrics.insert(
+            metric!("archive.entry_comment_size"),
+            entry_comment_size as f64,
+        );
     }
 
     // Duplicate-name and CRC-collision detection. The `zip` crate
@@ -471,7 +502,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         }
     }
     metrics.insert(
-        "archive.duplicate_member_count",
+        metric!("archive.duplicate_member_count"),
         duplicate_member_count as f64,
     );
     if !duplicate_names.is_empty() {
@@ -489,7 +520,10 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             crc_collision_count += count - 1;
         }
     }
-    metrics.insert("archive.crc_collision_count", crc_collision_count as f64);
+    metrics.insert(
+        metric!("archive.crc_collision_count"),
+        crc_collision_count as f64,
+    );
 
     // Sentinel mtime count derived from the raw CDH (the zip crate's
     // dedup keeps only one entry per name, hiding sentinel-mtime
@@ -501,7 +535,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         .count() as u64;
     let final_sentinel_count = sentinel_mtime_count.max(raw_sentinel_count);
     metrics.insert(
-        "archive.timing.sentinel_mtime_count",
+        metric!("archive.timing.sentinel_mtime_count"),
         final_sentinel_count as f64,
     );
 
@@ -510,15 +544,21 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         let max = *mtimes.iter().max().unwrap_or(&0);
         values.insert("archive.timing.mtime_min", JsonValue::Number(min.into()));
         values.insert("archive.timing.mtime_max", JsonValue::Number(max.into()));
-        metrics.insert("archive.timing.mtime_spread_seconds", (max - min) as f64);
+        metrics.insert(
+            metric!("archive.timing.mtime_spread_seconds"),
+            (max - min) as f64,
+        );
         let unique: std::collections::BTreeSet<i64> = mtimes.iter().copied().collect();
-        metrics.insert("archive.timing.mtime_unique_count", unique.len() as f64);
+        metrics.insert(
+            metric!("archive.timing.mtime_unique_count"),
+            unique.len() as f64,
+        );
         let ratio = unique.len() as f64 / mtimes.len() as f64;
-        metrics.insert("archive.timing.mtime_unique_ratio", ratio);
+        metrics.insert(metric!("archive.timing.mtime_unique_ratio"), ratio);
     }
     if future_mtime_count > 0 {
         metrics.insert(
-            "archive.timing.future_mtime_count",
+            metric!("archive.timing.future_mtime_count"),
             future_mtime_count as f64,
         );
     }
@@ -536,8 +576,14 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             .max_by_key(|(count, _)| *count)
             .unwrap_or((0, None));
         let dominant_fraction = dominant_count as f64 / total_members as f64;
-        metrics.insert("archive.timing.mtime_dominant_count", dominant_count as f64);
-        metrics.insert("archive.timing.mtime_dominant_fraction", dominant_fraction);
+        metrics.insert(
+            metric!("archive.timing.mtime_dominant_count"),
+            dominant_count as f64,
+        );
+        metrics.insert(
+            metric!("archive.timing.mtime_dominant_fraction"),
+            dominant_fraction,
+        );
         if dominant_fraction > 0.5 && dominant_count < total_members as u64 {
             let mut outliers: Vec<JsonValue> = Vec::new();
             for (k, paths) in &mtime_buckets {
@@ -552,7 +598,10 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
                 }
             }
             let outlier_count = total_members as u64 - dominant_count;
-            metrics.insert("archive.timing.mtime_outlier_count", outlier_count as f64);
+            metrics.insert(
+                metric!("archive.timing.mtime_outlier_count"),
+                outlier_count as f64,
+            );
             if !outliers.is_empty() {
                 values.insert(
                     "archive.timing.mtime_outlier_members",
@@ -601,11 +650,11 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     // and trailing bytes after the EOCD record (appended payloads).
     let prefix = scan_prefix_bytes(bytes);
     if prefix > 0 {
-        metrics.insert("archive.prefix_bytes", prefix as f64);
+        metrics.insert(metric!("archive.prefix_bytes"), prefix as f64);
     }
     let trailing = scan_trailing_bytes(bytes);
     if trailing > 0 {
-        metrics.insert("archive.trailing_bytes", trailing as f64);
+        metrics.insert(metric!("archive.trailing_bytes"), trailing as f64);
     }
 
     Ok(())

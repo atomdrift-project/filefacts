@@ -8,6 +8,7 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::Span;
+use super::metric_keys::MetricKey;
 
 /// A named observation about the file: a value plus, optionally, the byte
 /// spans where the evidence for it lives.
@@ -125,7 +126,12 @@ impl Metrics {
     }
 
     /// Record a file-global metric. Overwrites any existing entry.
-    pub fn insert(&mut self, key: impl Into<String>, value: f64) {
+    ///
+    /// The key is a [`MetricKey`], which can only be built by
+    /// [`metric!`](crate::metric) — checked against the catalog at compile
+    /// time — or by one of the family constructors. An emitter cannot
+    /// invent a name that downstream rules have no way to know about.
+    pub fn insert(&mut self, key: MetricKey, value: f64) {
         self.0.insert(key.into(), Fact::unlocated(value));
     }
 
@@ -134,7 +140,7 @@ impl Metrics {
     /// consumer (facts JSON, disk cache, the trait engine, prism).
     pub fn insert_located(
         &mut self,
-        key: impl Into<String>,
+        key: MetricKey,
         value: f64,
         spans: impl IntoIterator<Item = Span>,
     ) {
@@ -186,13 +192,13 @@ impl Metrics {
 
 #[cfg(test)]
 mod tests {
-    use super::{Fact, Metrics, Span};
+    use super::{Fact, MetricKey, Metrics, Span};
 
     #[test]
     fn insert_and_get() {
         let mut m = Metrics::new();
-        m.insert("file.size", 1024.0);
-        m.insert("file.entropy", 7.21);
+        m.insert(MetricKey::unchecked("file.size"), 1024.0);
+        m.insert(MetricKey::unchecked("file.entropy"), 7.21);
         assert_eq!(m.get("file.size"), Some(1024.0));
         assert_eq!(m.get("file.entropy"), Some(7.21));
         assert_eq!(m.get("missing"), None);
@@ -202,7 +208,11 @@ mod tests {
     #[test]
     fn located_metric_carries_spans() {
         let mut m = Metrics::new();
-        m.insert_located("binary.peak_region_entropy", 8.0, [Span::new(4096, 2048)]);
+        m.insert_located(
+            MetricKey::unchecked("binary.peak_region_entropy"),
+            8.0,
+            [Span::new(4096, 2048)],
+        );
         assert_eq!(m.get("binary.peak_region_entropy"), Some(8.0));
         let f = m.fact("binary.peak_region_entropy").unwrap();
         assert_eq!(f.spans, vec![Span::new(4096, 2048)]);
@@ -211,9 +221,9 @@ mod tests {
     #[test]
     fn iter_is_sorted() {
         let mut m = Metrics::new();
-        m.insert("z", 1.0);
-        m.insert("a", 2.0);
-        m.insert("m", 3.0);
+        m.insert(MetricKey::unchecked("z"), 1.0);
+        m.insert(MetricKey::unchecked("a"), 2.0);
+        m.insert(MetricKey::unchecked("m"), 3.0);
         let keys: Vec<&str> = m.iter().map(|(k, _)| k).collect();
         assert_eq!(keys, vec!["a", "m", "z"]);
     }
@@ -221,8 +231,8 @@ mod tests {
     #[test]
     fn unlocated_fact_serializes_as_bare_number() {
         let mut m = Metrics::new();
-        m.insert("a", 1.0);
-        m.insert("b", 2.0);
+        m.insert(MetricKey::unchecked("a"), 1.0);
+        m.insert(MetricKey::unchecked("b"), 2.0);
         let s = serde_json::to_string(&m).unwrap();
         assert_eq!(s, r#"{"a":1.0,"b":2.0}"#);
     }
@@ -230,7 +240,7 @@ mod tests {
     #[test]
     fn located_fact_serializes_as_object() {
         let mut m = Metrics::new();
-        m.insert_located("p", 8.0, [Span::new(16, 32)]);
+        m.insert_located(MetricKey::unchecked("p"), 8.0, [Span::new(16, 32)]);
         let s = serde_json::to_string(&m).unwrap();
         assert_eq!(s, r#"{"p":{"value":8.0,"spans":[{"offset":16,"len":32}]}}"#);
     }
@@ -238,8 +248,12 @@ mod tests {
     #[test]
     fn round_trips_both_forms() {
         let mut m = Metrics::new();
-        m.insert("plain", 3.5);
-        m.insert_located("located", 8.0, [Span::new(1, 2), Span::new(9, 4)]);
+        m.insert(MetricKey::unchecked("plain"), 3.5);
+        m.insert_located(
+            MetricKey::unchecked("located"),
+            8.0,
+            [Span::new(1, 2), Span::new(9, 4)],
+        );
         let s = serde_json::to_string(&m).unwrap();
         let back: Metrics = serde_json::from_str(&s).unwrap();
         assert_eq!(back.get("plain"), Some(3.5));

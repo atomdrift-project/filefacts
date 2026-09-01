@@ -20,6 +20,7 @@
 //! tracking on truant children) lives in cleave's existing
 //! `radare2/mod.rs` and ports across as #75c.
 
+use crate::metric;
 use std::cell::Cell;
 use std::path::Path;
 use std::process::Command;
@@ -1178,19 +1179,22 @@ impl RizinRecovery {
             let cc_values: Vec<u32> = self.functions.iter().filter_map(|f| f.cc).collect();
             if !cc_values.is_empty() {
                 let sum: u64 = cc_values.iter().map(|&v| u64::from(v)).sum();
-                metrics.insert("binary.avg_complexity", sum as f64 / cc_values.len() as f64);
+                metrics.insert(
+                    metric!("binary.avg_complexity"),
+                    sum as f64 / cc_values.len() as f64,
+                );
                 let max = cc_values.iter().copied().max().unwrap_or(0);
-                metrics.insert("binary.max_complexity", f64::from(max));
+                metrics.insert(metric!("binary.max_complexity"), f64::from(max));
             }
 
             let bb_values: Vec<u32> = self.functions.iter().filter_map(|f| f.nbbs).collect();
             if !bb_values.is_empty() {
                 let sum: u64 = bb_values.iter().map(|&v| u64::from(v)).sum();
                 metrics.insert(
-                    "binary.avg_basic_blocks",
+                    metric!("binary.avg_basic_blocks"),
                     sum as f64 / bb_values.len() as f64,
                 );
-                metrics.insert("binary.basic_blocks", sum as f64);
+                metrics.insert(metric!("binary.basic_blocks"), sum as f64);
             }
 
             // Function-shape bucket counts. Detection traits target the
@@ -1216,9 +1220,9 @@ impl RizinRecovery {
                 .iter()
                 .filter(|f| f.callrefs.is_empty() && f.nbbs.is_some())
                 .count();
-            metrics.insert("binary.huge_func_count", huge as f64);
-            metrics.insert("binary.tiny_func_count", tiny as f64);
-            metrics.insert("binary.leaf_func_count", leaf as f64);
+            metrics.insert(metric!("binary.huge_func_count"), huge as f64);
+            metrics.insert(metric!("binary.tiny_func_count"), tiny as f64);
+            metrics.insert(metric!("binary.leaf_func_count"), leaf as f64);
         }
         // `aflj.callrefs` carries concrete binary call sites even when the
         // target has no source-level symbol. Preserve direct CALL edges in

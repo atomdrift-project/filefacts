@@ -29,6 +29,7 @@
 //!
 //! Metric counts live flat under `pdf.*` and parallel the kv view.
 
+use crate::metric;
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
@@ -67,7 +68,7 @@ pub(super) fn extract(
     if header_count == 0 {
         return Ok(());
     }
-    metrics.insert("pdf.header_count", header_count as f64);
+    metrics.insert(metric!("pdf.header_count"), header_count as f64);
     let mut header = serde_json::Map::new();
     if let Some(version) = parse_first_header(bytes) {
         header.insert("version".into(), JsonValue::String(version));
@@ -82,11 +83,14 @@ pub(super) fn extract(
     let obj_count = count_token(bytes, b"obj");
     let endobj_count = count_token(bytes, b"endobj");
     let stream_count = count_token(bytes, b"stream");
-    metrics.insert("pdf.eof_count", eof_count as f64);
-    metrics.insert("pdf.trailer_count", trailer_count as f64);
-    metrics.insert("pdf.startxref_count", startxref_count as f64);
-    metrics.insert("pdf.object_count", obj_count.min(endobj_count) as f64);
-    metrics.insert("pdf.stream_count", stream_count as f64);
+    metrics.insert(metric!("pdf.eof_count"), eof_count as f64);
+    metrics.insert(metric!("pdf.trailer_count"), trailer_count as f64);
+    metrics.insert(metric!("pdf.startxref_count"), startxref_count as f64);
+    metrics.insert(
+        metric!("pdf.object_count"),
+        obj_count.min(endobj_count) as f64,
+    );
+    metrics.insert(metric!("pdf.stream_count"), stream_count as f64);
 
     // `pdf.catalog.features[]` — Pike-style flag array (mirrors
     // `pe.dll_characteristics`). Trait authors match `exact: xfa` /
@@ -177,18 +181,26 @@ pub(super) fn extract(
     let dict_regions = collect_dict_regions(bytes);
     let objstm_text = decode_object_streams(bytes, &dict_regions);
 
-    let counts: &[(&str, &str, &str)] = &[
-        ("page_count", "/Page", "pdf.page_count"),
-        ("annotation_count", "/Annot", "pdf.annotation_count"),
-        ("xobject_count", "/XObject", "pdf.xobject_count"),
-        ("font_count", "/Font", "pdf.font_count"),
-        ("metadata_count", "/Metadata", "pdf.metadata_count"),
-        ("objstm_count", "/ObjStm", "pdf.objstm_count"),
-        ("xref_stream_count", "/XRef", "pdf.xref_stream_count"),
+    let counts: &[(&str, &str, crate::MetricKey)] = &[
+        ("page_count", "/Page", metric!("pdf.page_count")),
+        (
+            "annotation_count",
+            "/Annot",
+            metric!("pdf.annotation_count"),
+        ),
+        ("xobject_count", "/XObject", metric!("pdf.xobject_count")),
+        ("font_count", "/Font", metric!("pdf.font_count")),
+        ("metadata_count", "/Metadata", metric!("pdf.metadata_count")),
+        ("objstm_count", "/ObjStm", metric!("pdf.objstm_count")),
+        (
+            "xref_stream_count",
+            "/XRef",
+            metric!("pdf.xref_stream_count"),
+        ),
         (
             "signature_object_count",
             "/Sig",
-            "pdf.signature_object_count",
+            metric!("pdf.signature_object_count"),
         ),
     ];
     let mut page_count_value: u32 = 0;
@@ -201,7 +213,7 @@ pub(super) fn extract(
                 .sum::<usize>();
         if c > 0 {
             shape.insert((*kv_key).into(), json!(c));
-            metrics.insert((*metric_key).to_string(), c as f64);
+            metrics.insert(metric_key.clone(), c as f64);
         }
         if *kv_key == "page_count" {
             page_count_value = c as u32;
@@ -213,17 +225,17 @@ pub(super) fn extract(
     let byte_range_count = count_substring(bytes, b"/ByteRange");
     if byte_range_count > 0 {
         shape.insert("byte_range_count".into(), json!(byte_range_count));
-        metrics.insert("pdf.byte_range_count", byte_range_count as f64);
+        metrics.insert(metric!("pdf.byte_range_count"), byte_range_count as f64);
     }
     let jbig2 = count_substring(bytes, b"/JBIG2Decode");
     if jbig2 > 0 {
         shape.insert("jbig2_filter_count".into(), json!(jbig2));
-        metrics.insert("pdf.jbig2_filter_count", jbig2 as f64);
+        metrics.insert(metric!("pdf.jbig2_filter_count"), jbig2 as f64);
     }
     let three_d = count_substring(bytes, b"/Subtype /3D") + count_substring(bytes, b"/Subtype/3D");
     if three_d > 0 {
         shape.insert("three_d_object_count".into(), json!(three_d));
-        metrics.insert("pdf.three_d_object_count", three_d as f64);
+        metrics.insert(metric!("pdf.three_d_object_count"), three_d as f64);
     }
     // `visible_object_count` — objects recovered from the linear
     // byte scan (not from object-stream expansion). Equal to
@@ -232,7 +244,7 @@ pub(super) fn extract(
     // keys keeps the trait field schema stable and lets a future
     // ObjStm expansion bump `object_count` without rewriting rules.
     metrics.insert(
-        "pdf.visible_object_count",
+        metric!("pdf.visible_object_count"),
         obj_count.min(endobj_count) as f64,
     );
     // Trailing bytes after the *last* `%%EOF` marker — a common
@@ -241,7 +253,10 @@ pub(super) fn extract(
     // EOFs are normal in incrementally-updated documents.
     let trailing_bytes = trailing_bytes_after_last_eof(bytes);
     if trailing_bytes > 0 {
-        metrics.insert("pdf.trailing_bytes_after_eof", trailing_bytes as f64);
+        metrics.insert(
+            metric!("pdf.trailing_bytes_after_eof"),
+            trailing_bytes as f64,
+        );
     }
     if !shape.is_empty() {
         values.insert("pdf.shape", JsonValue::Object(shape));
@@ -251,7 +266,7 @@ pub(super) fn extract(
     // streams. (`/JBIG2Decode` is emitted alongside `shape.*` below
     // as both a metric and a kv field.)
     metrics.insert(
-        "pdf.flate_filter_count",
+        metric!("pdf.flate_filter_count"),
         count_substring(bytes, b"/FlateDecode") as f64,
     );
 
@@ -277,24 +292,24 @@ pub(super) fn extract(
         // Signal to trait rules that the object-graph scan stopped
         // early. The cap is a DoS guard, not a sizing heuristic, so
         // anything that hits it is well outside the real-world range.
-        metrics.insert("pdf.dict_region_truncated", 1.0);
+        metrics.insert(metric!("pdf.dict_region_truncated"), 1.0);
     }
     let mut actions = scan_actions(bytes, &dict_regions);
     actions.extend(objstm_actions(&objstm_text));
     let uri_action_count = action_count_by_kind(&actions, "uri");
     let javascript_action_count = action_count_by_kind(&actions, "javascript");
     if !actions.is_empty() {
-        metrics.insert("pdf.action_count", actions.len() as f64);
+        metrics.insert(metric!("pdf.action_count"), actions.len() as f64);
         values.insert("pdf.actions", JsonValue::Array(actions));
     }
     if javascript_action_count > 0 {
         metrics.insert(
-            "pdf.javascript_action_count",
+            metric!("pdf.javascript_action_count"),
             f64::from(javascript_action_count),
         );
     }
     if uri_action_count > 0 {
-        metrics.insert("pdf.uri_action_count", f64::from(uri_action_count));
+        metrics.insert(metric!("pdf.uri_action_count"), f64::from(uri_action_count));
     }
 
     // Full-content JavaScript payloads — one entry per `/JS` site
@@ -312,8 +327,8 @@ pub(super) fn extract(
             .filter_map(|v| v.as_object())
             .filter_map(|o| o.get("content_bytes").and_then(JsonValue::as_u64))
             .sum();
-        metrics.insert("pdf.javascript_count", js_payloads.len() as f64);
-        metrics.insert("pdf.javascript_total_bytes", total_bytes as f64);
+        metrics.insert(metric!("pdf.javascript_count"), js_payloads.len() as f64);
+        metrics.insert(metric!("pdf.javascript_total_bytes"), total_bytes as f64);
         values.insert("pdf.javascript", JsonValue::Array(js_payloads));
     }
 
@@ -323,7 +338,7 @@ pub(super) fn extract(
     // (possibly indirect) `/Length` value from its dict.
     let embedded = scan_embedded_files(bytes, &dict_regions);
     if !embedded.is_empty() {
-        metrics.insert("pdf.embedded_file_count", embedded.len() as f64);
+        metrics.insert(metric!("pdf.embedded_file_count"), embedded.len() as f64);
         values.insert(
             "pdf.embedded_files",
             JsonValue::Array(
@@ -372,7 +387,7 @@ pub(super) fn extract(
     let form_fields = scan_form_fields(bytes, &dict_regions);
     derive_form_field_metrics(&form_fields, metrics);
     if !form_fields.is_empty() {
-        metrics.insert("pdf.form_field_count", form_fields.len() as f64);
+        metrics.insert(metric!("pdf.form_field_count"), form_fields.len() as f64);
         values.insert("pdf.form_fields", JsonValue::Array(form_fields));
     }
 
@@ -384,12 +399,12 @@ pub(super) fn extract(
     // raw counts. Zero pages → zero ratio (rather than NaN).
     if page_count_value > 0 {
         metrics.insert(
-            "pdf.annotations_per_page",
+            metric!("pdf.annotations_per_page"),
             f64::from(annotation_count_value) / f64::from(page_count_value),
         );
         if uri_action_count > 0 {
             metrics.insert(
-                "pdf.uri_actions_per_page",
+                metric!("pdf.uri_actions_per_page"),
                 f64::from(uri_action_count) / f64::from(page_count_value),
             );
         }
@@ -403,7 +418,7 @@ pub(super) fn extract(
     let obj_stream_inner = scan_object_stream_inner_count(bytes, &dict_regions);
     if obj_stream_inner > 0 {
         metrics.insert(
-            "pdf.object_stream_inner_object_count",
+            metric!("pdf.object_stream_inner_object_count"),
             f64::from(obj_stream_inner),
         );
     }
@@ -415,7 +430,10 @@ pub(super) fn extract(
     // graph).
     let unreferenced = unreferenced_object_count(bytes, &dict_regions);
     if unreferenced > 0 {
-        metrics.insert("pdf.unreferenced_object_count", f64::from(unreferenced));
+        metrics.insert(
+            metric!("pdf.unreferenced_object_count"),
+            f64::from(unreferenced),
+        );
     }
 
     // Unusual filters — JBIG2, LZW, and Crypt. Each pulls in a
@@ -424,7 +442,10 @@ pub(super) fn extract(
     // filter in the chain, not the number of filter declarations.
     let unusual = streams_with_unusual_filter_count(bytes, &dict_regions);
     if unusual > 0 {
-        metrics.insert("pdf.streams_with_unusual_filter_count", f64::from(unusual));
+        metrics.insert(
+            metric!("pdf.streams_with_unusual_filter_count"),
+            f64::from(unusual),
+        );
     }
 
     // Phase 1B derived metrics — formerly computed by cleave's
@@ -432,9 +453,15 @@ pub(super) fn extract(
     // (`merge_filefacts_metrics`) so trait rules using `field: pdf.X`
     // resolve against filefacts' flat metric map.
     let leading_bytes = bytes.windows(5).position(|w| w == b"%PDF-").unwrap_or(0);
-    metrics.insert("pdf.leading_bytes_before_header", leading_bytes as f64);
+    metrics.insert(
+        metric!("pdf.leading_bytes_before_header"),
+        leading_bytes as f64,
+    );
     let sig_count = count_type_occurrences(bytes, b"/Sig") + count_substring(bytes, b"/Type /Sig");
-    metrics.insert("pdf.signature_object_count", (sig_count / 2) as f64);
+    metrics.insert(
+        metric!("pdf.signature_object_count"),
+        (sig_count / 2) as f64,
+    );
     // Signed incremental update: incremental updates leave more than
     // one `%%EOF` marker; pair that with the presence of a signature
     // object to count signed-then-modified PDFs (the classic
@@ -446,7 +473,7 @@ pub(super) fn extract(
             0
         };
         metrics.insert(
-            "pdf.signed_incremental_update_count",
+            metric!("pdf.signed_incremental_update_count"),
             signed_incremental as f64,
         );
     }
@@ -1974,17 +2001,26 @@ fn derive_form_field_metrics(fields: &[JsonValue], metrics: &mut Metrics) {
             .map(|&c| (c - 1) as u32)
             .sum()
     };
-    metrics.insert("pdf.duplicate_form_name_count", f64::from(dup(&by_name)));
-    metrics.insert("pdf.duplicate_form_rect_count", f64::from(dup(&by_rect)));
     metrics.insert(
-        "pdf.duplicate_form_name_rect_count",
+        metric!("pdf.duplicate_form_name_count"),
+        f64::from(dup(&by_name)),
+    );
+    metrics.insert(
+        metric!("pdf.duplicate_form_rect_count"),
+        f64::from(dup(&by_rect)),
+    );
+    metrics.insert(
+        metric!("pdf.duplicate_form_name_rect_count"),
         f64::from(dup_pair(&by_name_rect)),
     );
     metrics.insert(
-        "pdf.hidden_zero_rect_field_count",
+        metric!("pdf.hidden_zero_rect_field_count"),
         f64::from(hidden_zero_rect),
     );
-    metrics.insert("pdf.decoded_form_value_max_len", max_decoded_len as f64);
+    metrics.insert(
+        metric!("pdf.decoded_form_value_max_len"),
+        max_decoded_len as f64,
+    );
 
     // Overlapping-pair count: O(n²) intersection check. PDF rects
     // are [x_lo, y_lo, x_hi, y_hi] but some producers swap the
@@ -2004,11 +2040,11 @@ fn derive_form_field_metrics(fields: &[JsonValue], metrics: &mut Metrics) {
         }
     }
     metrics.insert(
-        "pdf.overlapping_form_field_pair_count",
+        metric!("pdf.overlapping_form_field_pair_count"),
         f64::from(overlapping),
     );
     if rects.len() > MAX_OVERLAP_RECTS {
-        metrics.insert("pdf.overlap_check_truncated", 1.0);
+        metrics.insert(metric!("pdf.overlap_check_truncated"), 1.0);
     }
 }
 
@@ -2100,17 +2136,26 @@ fn derive_stream_metrics(bytes: &[u8], dict_regions: &[DictRegion], metrics: &mu
             }
         }
     }
-    metrics.insert("pdf.stream_missing_length_count", f64::from(missing_length));
-    metrics.insert("pdf.stream_invalid_length_count", f64::from(invalid_length));
     metrics.insert(
-        "pdf.stream_missing_endstream_count",
+        metric!("pdf.stream_missing_length_count"),
+        f64::from(missing_length),
+    );
+    metrics.insert(
+        metric!("pdf.stream_invalid_length_count"),
+        f64::from(invalid_length),
+    );
+    metrics.insert(
+        metric!("pdf.stream_missing_endstream_count"),
         f64::from(missing_endstream),
     );
     metrics.insert(
-        "pdf.stream_length_mismatch_count",
+        metric!("pdf.stream_length_mismatch_count"),
         f64::from(length_mismatch),
     );
-    metrics.insert("pdf.stream_bad_delimiter_count", f64::from(bad_delimiter));
+    metrics.insert(
+        metric!("pdf.stream_bad_delimiter_count"),
+        f64::from(bad_delimiter),
+    );
 }
 
 /// Classification of a stream dictionary's `/Length` value.
@@ -2213,7 +2258,10 @@ fn derive_risky_feature_score(values: &Values, metrics: &mut Metrics) {
     if embedded > 0 {
         score += (embedded * 5).min(20);
     }
-    metrics.insert("pdf.risky_feature_score", f64::from(score.min(100)));
+    metrics.insert(
+        metric!("pdf.risky_feature_score"),
+        f64::from(score.min(100)),
+    );
 }
 
 #[cfg(test)]

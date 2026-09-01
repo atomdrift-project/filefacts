@@ -5,6 +5,7 @@
 //! naming patterns, and obfuscation indicators (single-char, hex-like,
 //! base64-like, sequential, keyboard, repeated-character).
 
+use crate::metric;
 use std::collections::HashSet;
 
 use tree_sitter::Node;
@@ -54,11 +55,11 @@ pub(super) fn emit(identifiers: &[&str], metrics: &mut Metrics) {
     let unique: HashSet<&str> = identifiers.iter().copied().collect();
     let unique_count = unique.len() as u32;
 
-    metrics.insert("identifiers.count", f64::from(total));
-    metrics.insert("identifiers.unique", f64::from(unique_count));
+    metrics.insert(metric!("identifiers.count"), f64::from(total));
+    metrics.insert(metric!("identifiers.unique"), f64::from(unique_count));
     if total > 0 {
         metrics.insert(
-            "identifiers.reuse_ratio",
+            metric!("identifiers.reuse_ratio"),
             f64::from(unique_count) / f64::from(total),
         );
     }
@@ -68,13 +69,13 @@ pub(super) fn emit(identifiers: &[&str], metrics: &mut Metrics) {
     if !lengths.is_empty() {
         let total_len: usize = lengths.iter().sum();
         let avg_length = total_len as f64 / lengths.len() as f64;
-        metrics.insert("identifiers.avg_length", avg_length);
+        metrics.insert(metric!("identifiers.avg_length"), avg_length);
         metrics.insert(
-            "identifiers.min_length",
+            metric!("identifiers.min_length"),
             *lengths.iter().min().unwrap_or(&0) as f64,
         );
         metrics.insert(
-            "identifiers.max_length",
+            metric!("identifiers.max_length"),
             *lengths.iter().max().unwrap_or(&0) as f64,
         );
 
@@ -88,7 +89,7 @@ pub(super) fn emit(identifiers: &[&str], metrics: &mut Metrics) {
             / lengths.len() as f64;
         let stddev = variance.sqrt();
         if stddev > 0.0 {
-            metrics.insert("identifiers.length_stddev", stddev);
+            metrics.insert(metric!("identifiers.length_stddev"), stddev);
         }
     }
 
@@ -165,70 +166,88 @@ pub(super) fn emit(identifiers: &[&str], metrics: &mut Metrics) {
 
     let denom = f64::from(unique_count);
     if single_char > 0 {
-        metrics.insert("identifiers.single_char_count", f64::from(single_char));
         metrics.insert(
-            "identifiers.single_char_ratio",
+            metric!("identifiers.single_char_count"),
+            f64::from(single_char),
+        );
+        metrics.insert(
+            metric!("identifiers.single_char_ratio"),
             f64::from(single_char) / denom,
         );
     }
     if all_lowercase > 0 {
         metrics.insert(
-            "identifiers.all_lowercase_ratio",
+            metric!("identifiers.all_lowercase_ratio"),
             f64::from(all_lowercase) / denom,
         );
     }
     if all_uppercase > 0 {
         metrics.insert(
-            "identifiers.all_uppercase_ratio",
+            metric!("identifiers.all_uppercase_ratio"),
             f64::from(all_uppercase) / denom,
         );
     }
     if has_digit > 0 {
-        metrics.insert("identifiers.has_digit_ratio", f64::from(has_digit) / denom);
+        metrics.insert(
+            metric!("identifiers.has_digit_ratio"),
+            f64::from(has_digit) / denom,
+        );
     }
     if underscore_prefix > 0 {
         metrics.insert(
-            "identifiers.underscore_prefix_count",
+            metric!("identifiers.underscore_prefix_count"),
             f64::from(underscore_prefix),
         );
     }
     if double_underscore > 0 {
         metrics.insert(
-            "identifiers.double_underscore_count",
+            metric!("identifiers.double_underscore_count"),
             f64::from(double_underscore),
         );
     }
     if numeric_suffix > 0 {
         metrics.insert(
-            "identifiers.numeric_suffix_count",
+            metric!("identifiers.numeric_suffix_count"),
             f64::from(numeric_suffix),
         );
     }
     if hex_like > 0 {
-        metrics.insert("identifiers.hex_like_names", f64::from(hex_like));
+        metrics.insert(metric!("identifiers.hex_like_names"), f64::from(hex_like));
     }
     if base64_like > 0 {
-        metrics.insert("identifiers.base64_like_names", f64::from(base64_like));
+        metrics.insert(
+            metric!("identifiers.base64_like_names"),
+            f64::from(base64_like),
+        );
     }
     if sequential > 0 {
-        metrics.insert("identifiers.sequential_names", f64::from(sequential));
+        metrics.insert(
+            metric!("identifiers.sequential_names"),
+            f64::from(sequential),
+        );
     }
     if keyboard_pattern > 0 {
         metrics.insert(
-            "identifiers.keyboard_pattern_names",
+            metric!("identifiers.keyboard_pattern_names"),
             f64::from(keyboard_pattern),
         );
     }
     if repeated_char > 0 {
-        metrics.insert("identifiers.repeated_char_names", f64::from(repeated_char));
+        metrics.insert(
+            metric!("identifiers.repeated_char_names"),
+            f64::from(repeated_char),
+        );
     }
     if denom > 0.0 {
-        metrics.insert("identifiers.avg_entropy", entropy_sum / denom);
+        metrics.insert(metric!("identifiers.avg_entropy"), entropy_sum / denom);
     }
     if high_entropy > 0 {
-        metrics.insert("identifiers.high_entropy_count", f64::from(high_entropy));
         metrics.insert(
-            "identifiers.high_entropy_ratio",
+            metric!("identifiers.high_entropy_count"),
+            f64::from(high_entropy),
+        );
+        metrics.insert(
+            metric!("identifiers.high_entropy_ratio"),
             f64::from(high_entropy) / denom,
         );
     }

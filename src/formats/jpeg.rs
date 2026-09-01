@@ -18,6 +18,7 @@
 //! - `jpeg.{segment_count, app_segment_count, com_count, dqt_count,
 //!   dht_count, soi_count, maker_note_bytes}` — flat metrics.
 
+use crate::metric;
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
@@ -171,17 +172,26 @@ pub(super) fn extract(
         );
     }
 
-    metrics.insert("jpeg.segment_count", f64::from(state.segment_count));
-    metrics.insert("jpeg.app_segment_count", f64::from(state.app_segment_count));
-    metrics.insert("jpeg.com_count", f64::from(state.com_count));
-    metrics.insert("jpeg.dqt_count", f64::from(state.dqt_count));
-    metrics.insert("jpeg.dht_count", f64::from(state.dht_count));
-    metrics.insert("jpeg.soi_count", f64::from(state.soi_count));
-    metrics.insert("jpeg.maker_note_bytes", f64::from(state.maker_note_bytes));
-    metrics.insert("jpeg.comment_bytes", state.comment_bytes as f64);
-    metrics.insert("jpeg.exif_size", state.exif_size as f64);
+    metrics.insert(
+        metric!("jpeg.segment_count"),
+        f64::from(state.segment_count),
+    );
+    metrics.insert(
+        metric!("jpeg.app_segment_count"),
+        f64::from(state.app_segment_count),
+    );
+    metrics.insert(metric!("jpeg.com_count"), f64::from(state.com_count));
+    metrics.insert(metric!("jpeg.dqt_count"), f64::from(state.dqt_count));
+    metrics.insert(metric!("jpeg.dht_count"), f64::from(state.dht_count));
+    metrics.insert(metric!("jpeg.soi_count"), f64::from(state.soi_count));
+    metrics.insert(
+        metric!("jpeg.maker_note_bytes"),
+        f64::from(state.maker_note_bytes),
+    );
+    metrics.insert(metric!("jpeg.comment_bytes"), state.comment_bytes as f64);
+    metrics.insert(metric!("jpeg.exif_size"), state.exif_size as f64);
     let appended_bytes = eoi_pos.map_or(0u64, |p| bytes.len().saturating_sub(p) as u64);
-    metrics.insert("jpeg.appended_bytes", appended_bytes as f64);
+    metrics.insert(metric!("jpeg.appended_bytes"), appended_bytes as f64);
 
     // Best-effort pixel-statistic pass. Decoder errors are swallowed —
     // a JPEG with a weird color space or a truncated bitstream still
@@ -202,7 +212,7 @@ fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
 
     // Always emit overall-file entropy — trait engines threshold on
     // this for encrypted/compressed payload detection.
-    metrics.insert("file.entropy", entropy::shannon(bytes));
+    metrics.insert(metric!("file.entropy"), entropy::shannon(bytes));
 
     let mut decoder = Decoder::new(Cursor::new(bytes));
     if decoder.read_info().is_err() {
@@ -219,9 +229,9 @@ fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
         jpeg_decoder::PixelFormat::CMYK32 => 4,
     };
 
-    metrics.insert("image.width", f64::from(width));
-    metrics.insert("image.height", f64::from(height));
-    metrics.insert("image.channels", f64::from(channels));
+    metrics.insert(metric!("image.width"), f64::from(width));
+    metrics.insert(metric!("image.height"), f64::from(height));
+    metrics.insert(metric!("image.channels"), f64::from(channels));
 
     let predicted = (width as usize)
         .saturating_mul(height as usize)
@@ -234,20 +244,20 @@ fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
     };
 
     let pixel_entropy = entropy::shannon(&pixels);
-    metrics.insert("image.pixel_entropy", pixel_entropy);
-    metrics.insert("image.histogram_flatness", pixel_entropy / 8.0);
+    metrics.insert(metric!("image.pixel_entropy"), pixel_entropy);
+    metrics.insert(metric!("image.histogram_flatness"), pixel_entropy / 8.0);
     let density =
         image_stats::edge_density(&pixels, width as usize, height as usize, channels as usize);
-    metrics.insert("image.edge_density", f64::from(density));
+    metrics.insert(metric!("image.edge_density"), f64::from(density));
 
     let (r, g, b, _a) = if channels >= 3 {
         image_stats::channel_entropy(&pixels, channels as usize)
     } else {
         (0.0, 0.0, 0.0, 0.0)
     };
-    metrics.insert("image.r_entropy", f64::from(r));
-    metrics.insert("image.g_entropy", f64::from(g));
-    metrics.insert("image.b_entropy", f64::from(b));
+    metrics.insert(metric!("image.r_entropy"), f64::from(r));
+    metrics.insert(metric!("image.g_entropy"), f64::from(g));
+    metrics.insert(metric!("image.b_entropy"), f64::from(b));
 }
 
 #[derive(Default)]

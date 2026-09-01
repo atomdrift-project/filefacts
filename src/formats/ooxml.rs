@@ -24,6 +24,7 @@
 //! - `office.macros[]` — paths of `vbaProject.bin` streams when
 //!   present (one per OOXML application; usually a single entry).
 
+use crate::metric;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek};
 
@@ -156,9 +157,9 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             })
             .count() as f64;
         values.insert("office.embedded", JsonValue::Array(embedded));
-        metrics.insert("office.embedded_count", count);
+        metrics.insert(metric!("office.embedded_count"), count);
         if exec_count > 0.0 {
-            metrics.insert("office.embedded_executable_count", exec_count);
+            metrics.insert(metric!("office.embedded_executable_count"), exec_count);
             push_feature(&mut features, "embedded_executable");
         }
     }
@@ -166,7 +167,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     if !controls.is_empty() {
         let count = controls.len() as f64;
         values.insert("office.controls", JsonValue::Array(controls));
-        metrics.insert("office.control_count", count);
+        metrics.insert(metric!("office.control_count"), count);
         push_feature(&mut features, "active_x");
     }
 
@@ -182,7 +183,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             "office.external_relationships",
             JsonValue::Array(external_relationships),
         );
-        metrics.insert("office.external_relationship_count", count);
+        metrics.insert(metric!("office.external_relationship_count"), count);
         push_feature(&mut features, "external_relationships");
     }
 
@@ -199,10 +200,10 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             .filter_map(|name| zip.by_name(name).ok().map(|e| e.size()))
             .sum();
         if vba_bytes > 0 {
-            metrics.insert("office.vba_project_size", vba_bytes as f64);
+            metrics.insert(metric!("office.vba_project_size"), vba_bytes as f64);
         }
         values.insert("office.macros", JsonValue::Array(macros));
-        metrics.insert("office.macro_count", count);
+        metrics.insert(metric!("office.macro_count"), count);
     }
 
     let mut dde_links: Vec<JsonValue> = Vec::new();
@@ -220,7 +221,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     if !dde_links.is_empty() {
         let count = dde_links.len() as f64;
         values.insert("office.dde_links", JsonValue::Array(dde_links));
-        metrics.insert("office.dde_link_count", count);
+        metrics.insert(metric!("office.dde_link_count"), count);
         push_feature(&mut features, "dde_links");
     }
     if !custom_ui_onload.is_empty() {
@@ -229,7 +230,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             "office.custom_ui_onload",
             JsonValue::Array(custom_ui_onload),
         );
-        metrics.insert("office.custom_ui_onload_count", count);
+        metrics.insert(metric!("office.custom_ui_onload_count"), count);
         push_feature(&mut features, "custom_ui_onload");
     }
 

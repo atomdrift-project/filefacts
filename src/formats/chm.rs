@@ -28,6 +28,7 @@
 //!   (capped at 256 entries — `metrics.chm.user_entry_count` carries
 //!   the raw count).
 
+use crate::metric;
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
@@ -156,16 +157,19 @@ pub(super) fn extract(
     }
 
     // Per-entry metrics roll-up (formerly cleave's `ChmMetrics`).
-    metrics.insert("chm.user_entry_count", f64::from(user_count));
-    metrics.insert("chm.control_entry_count", f64::from(control_count));
-    metrics.insert("chm.html_entry_count", f64::from(html_count));
-    metrics.insert("chm.script_entry_count", f64::from(script_count));
-    metrics.insert("chm.image_entry_count", f64::from(image_count));
-    metrics.insert("chm.max_user_entry_size", user_max as f64);
-    metrics.insert("chm.total_user_entry_size", user_total as f64);
+    metrics.insert(metric!("chm.user_entry_count"), f64::from(user_count));
+    metrics.insert(metric!("chm.control_entry_count"), f64::from(control_count));
+    metrics.insert(metric!("chm.html_entry_count"), f64::from(html_count));
+    metrics.insert(metric!("chm.script_entry_count"), f64::from(script_count));
+    metrics.insert(metric!("chm.image_entry_count"), f64::from(image_count));
+    metrics.insert(metric!("chm.max_user_entry_size"), user_max as f64);
+    metrics.insert(metric!("chm.total_user_entry_size"), user_total as f64);
     let file_size = bytes.len() as u64;
     if file_size > 0 {
-        metrics.insert("chm.user_byte_ratio", user_total as f64 / file_size as f64);
+        metrics.insert(
+            metric!("chm.user_byte_ratio"),
+            user_total as f64 / file_size as f64,
+        );
     }
 
     // Content-section names from `::DataSpace/NameList` (Uncompressed
@@ -195,19 +199,28 @@ pub(super) fn extract(
         .map(|body| emit_system(body, values));
     let summary = sys_summary.unwrap_or_default();
     metrics.insert(
-        "chm.no_compiler_version",
+        metric!("chm.no_compiler_version"),
         f64::from(u8::from(!summary.has_compiler_version)),
     );
-    metrics.insert("chm.infotype_count", f64::from(summary.infotype_count));
+    metrics.insert(
+        metric!("chm.infotype_count"),
+        f64::from(summary.infotype_count),
+    );
     if let Some(topic) = summary.default_topic.as_deref() {
         let topic_lower = topic.to_ascii_lowercase();
         let missing = !user_names_lower.iter().any(|n| n == &topic_lower);
-        metrics.insert("chm.default_topic_missing", f64::from(u8::from(missing)));
+        metrics.insert(
+            metric!("chm.default_topic_missing"),
+            f64::from(u8::from(missing)),
+        );
     }
     if let (Some(title), Some(topic)) = (summary.title.as_deref(), summary.default_topic.as_deref())
     {
         let mismatch = !title.is_empty() && !topic.is_empty() && !title.eq_ignore_ascii_case(topic);
-        metrics.insert("chm.title_topic_mismatch", f64::from(u8::from(mismatch)));
+        metrics.insert(
+            metric!("chm.title_topic_mismatch"),
+            f64::from(u8::from(mismatch)),
+        );
     }
 
     // LZX framing parameters for `MSCompressed/Content` — directly
@@ -275,13 +288,13 @@ fn emit_lzx_framing(
     lzx.insert("compressed_size".into(), json!(content.length));
     values.insert("chm.lzx", JsonValue::Object(lzx));
 
-    metrics.insert("chm.lzx_reset_count", rt.reset_count as f64);
+    metrics.insert(metric!("chm.lzx_reset_count"), rt.reset_count as f64);
     // Compression ratio is a classic forensic signal — values
     // significantly off from typical (~3-5×) suggest a hand-rolled
     // or tampered build.
     if content.length > 0 && rt.uncompressed_size > 0 {
         let ratio = rt.uncompressed_size as f64 / content.length as f64;
-        metrics.insert("chm.lzx_compression_ratio", ratio);
+        metrics.insert(metric!("chm.lzx_compression_ratio"), ratio);
     }
 }
 

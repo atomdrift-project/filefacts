@@ -27,6 +27,7 @@
 mod archive;
 mod errors;
 mod identity;
+mod metric_keys;
 mod metrics;
 mod references;
 mod sections;
@@ -38,6 +39,11 @@ mod values;
 pub use archive::{ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership};
 pub use errors::{ErrorKind, Errors, ParseError, Stage};
 pub use identity::{Claim, Identity, Party, Signer, Trust, Url, UrlKind};
+pub use metric_keys::{
+    CATALOG, FAMILIES, MetricKey, QueryLimit, archive_entry_type_count, archive_method_count,
+    ast_op, ast_op_density, declared, dmg_codec_count, extension_content_mismatch,
+    source_query_limited,
+};
 pub use metrics::{Fact, Metrics};
 pub use references::{HashAlgo, PinnedHash, RefKind, RefLocator, Reference};
 pub use sections::{Section, Sections};
