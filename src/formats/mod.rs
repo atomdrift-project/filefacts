@@ -281,10 +281,13 @@ pub(crate) fn extract(
             Ok(())
         }
         FileType::Json => structured::extract_generic_json(bytes, values, metrics),
-        // gyp is JSON-shaped (binding.gyp is plain JSON in the common case); parse
-        // it as generic JSON so value paths like targets[*].sources[*] resolve.
-        // text/raw matchers still fall back when a .gyp uses comments/quotes.
-        FileType::Gyp => structured::extract_generic_json(bytes, values, metrics),
+        // gyp is Python-literal syntax: JSON in the common case, but real (and
+        // hostile) manifests use trailing commas, `#` comments, single quotes,
+        // and byte escapes that strict JSON rejects. extract_gyp parses JSON
+        // first, then falls back to a tolerant Python-literal parse so value
+        // paths like targets[*].sources[*] and a byte-escaped target `type`
+        // still resolve instead of vanishing into a text/raw scan.
+        FileType::Gyp => structured::extract_gyp(bytes, values, metrics),
         FileType::VsixManifest => vsix::extract(bytes, values, strings, metrics),
         FileType::CargoToml
         | FileType::CargoLock
