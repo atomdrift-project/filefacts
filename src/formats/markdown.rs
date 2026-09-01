@@ -22,6 +22,15 @@
 //!    compares the two (`consistency.manifest_readme_name_mismatch`).
 //!    Unlike `markdown.npm_packages`, which reads registry *links* (badges
 //!    frequently point at an unrelated project), this reads *imperatives*.
+//! - `markdown.install_extensions[]` — the same imperative for editor
+//!    extensions (`code --install-extension publisher.ext`, `...
+//!    my-ext-1.2.3.vsix`), reduced to the bare extension name. Kept in its own
+//!    list rather than folded into `install_packages`, because the two claims
+//!    are not interchangeable: an extension's README routinely tells you to
+//!    `pip install` the language server it drives, which names a companion
+//!    program and says nothing about the extension's own identity. Only the
+//!    editor-CLI form claims "this is the extension you are installing", so
+//!    only it can contradict the manifest.
 //!
 //! ATX-style fenced code blocks (``` ``` ``` and `~~~`) are skipped so
 //! headings inside code samples don't show up as identity claims.
@@ -66,13 +75,20 @@ pub(super) fn extract(
         values.insert("markdown.npm_packages", JsonValue::Array(arr));
     }
 
-    let installs = install_packages(&text);
+    let (installs, extensions) = install_packages(&text);
     if !installs.is_empty() {
         let arr = installs
             .into_iter()
             .map(JsonValue::String)
             .collect::<Vec<_>>();
         values.insert("markdown.install_packages", JsonValue::Array(arr));
+    }
+    if !extensions.is_empty() {
+        let arr = extensions
+            .into_iter()
+            .map(JsonValue::String)
+            .collect::<Vec<_>>();
+        values.insert("markdown.install_extensions", JsonValue::Array(arr));
     }
 
     Ok(())
@@ -284,7 +300,9 @@ fn npm_packages(text: &str) -> Vec<String> {
 /// path separator, a URL scheme, a version pin, or a shell metacharacter is a
 /// local path, a tarball or a piped command rather than a registry name, and is
 /// dropped. A line that yields nothing simply contributes nothing.
-fn install_packages(text: &str) -> Vec<String> {
+/// Returns `(registry packages, editor extensions)` — see the module docs for
+/// why the editor-CLI form is kept apart rather than merged into the first.
+fn install_packages(text: &str) -> (Vec<String>, Vec<String>) {
     // (command, install verbs). Two-token prefixes: the manager then the verb.
     const COMMANDS: [(&str, &[&str]); 6] = [
         ("npm", &["install", "i", "add"]),
@@ -295,8 +313,26 @@ fn install_packages(text: &str) -> Vec<String> {
         ("pip3", &["install"]),
     ];
 
+    // Editor CLIs that install a VS Code extension. These need their own table
+    // because the verb is a flag rather than a subcommand, and because the
+    // argument names an extension rather than a registry package. `code` is the
+    // Microsoft build; the rest are the forks that kept the same CLI surface, so
+    // a README cloned between marketplaces still parses.
+    const EXTENSION_COMMANDS: [&str; 7] = [
+        "code",
+        "code-insiders",
+        "code-oss",
+        "codium",
+        "cursor",
+        "windsurf",
+        "trae",
+    ];
+    const EXTENSION_VERB: &str = "--install-extension";
+
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
+    let mut seen_ext = BTreeSet::new();
+    let mut out_ext = Vec::new();
     for line in text.lines() {
         // Strip a leading shell prompt or markdown list/quote marker so
         // `$ npm install foo` and `- npm install foo` both parse.
@@ -305,8 +341,14 @@ fn install_packages(text: &str) -> Vec<String> {
             .trim_start_matches(['$', '>', '-', '*', ' ']);
         let mut tokens = line.split_whitespace();
         let Some(cmd) = tokens.next() else { continue };
-        let Some((_, verbs)) = COMMANDS.iter().find(|(name, _)| *name == cmd) else {
-            continue;
+        let editor = EXTENSION_COMMANDS.contains(&cmd);
+        let verbs: &[&str] = if editor {
+            &[EXTENSION_VERB]
+        } else {
+            match COMMANDS.iter().find(|(name, _)| *name == cmd) {
+                Some((_, verbs)) => verbs,
+                None => continue,
+            }
         };
         let Some(verb) = tokens.next() else { continue };
         if !verbs.contains(&verb) {
@@ -330,7 +372,13 @@ fn install_packages(text: &str) -> Vec<String> {
             if arg.starts_with('-') {
                 continue;
             }
-            if let Some(name) = install_argument_name(arg) {
+            if editor {
+                if let Some(name) = extension_argument_name(arg) {
+                    if seen_ext.insert(name.clone()) {
+                        out_ext.push(name);
+                    }
+                }
+            } else if let Some(name) = install_argument_name(arg) {
                 if seen.insert(name.clone()) {
                     out.push(name);
                 }
@@ -338,7 +386,77 @@ fn install_packages(text: &str) -> Vec<String> {
             break;
         }
     }
-    out
+    (out, out_ext)
+}
+
+/// Reduce a `--install-extension` argument to the extension's own name.
+///
+/// Two forms appear in the wild, and both name the same thing:
+///
+/// - a marketplace id, `publisher.extension` — only the second half is the
+///   package's name, which is what `package.json::name` carries;
+/// - a packaged file, `my-ext-1.2.3.vsix`, or the `my-ext-x.x.x.vsix`
+///   placeholder that `vsce`'s own docs use. The basename carries the identity;
+///   the version and extension are noise.
+///
+/// Reducing both to the bare name is what lets the value be compared directly
+/// against the manifest. A republished extension keeps the upstream install
+/// line — "install sugar-extension-pack" in a package shipped as
+/// `krabt-extension-pack` — because the instructions were never part of the
+/// branding the repackager set out to change.
+fn extension_argument_name(arg: &str) -> Option<String> {
+    if arg.is_empty() || arg.contains("://") {
+        return None;
+    }
+    if arg
+        .chars()
+        .any(|c| matches!(c, '|' | ';' | '&' | '`' | '$' | '(' | ')' | '"' | '\''))
+    {
+        return None;
+    }
+    // A packaged file may be given by path; only the basename carries identity.
+    let base = arg.rsplit(['/', '\\']).next()?;
+    let vsix = base.len() > 5 && base[base.len() - 5..].eq_ignore_ascii_case(".vsix");
+    let name = if vsix {
+        strip_version_suffix(&base[..base.len() - 5])
+    } else {
+        // Marketplace id: publisher.extension. A bare token with no publisher
+        // half is taken as-is.
+        match base.split_once('.') {
+            Some((publisher, ext)) if !publisher.is_empty() && !ext.is_empty() => ext,
+            _ => base,
+        }
+    };
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Trim a trailing `-1.2.3` / `-x.x.x` version from a packaged filename stem.
+///
+/// Requires a dot in the trailing segment so that a name whose last component
+/// merely happens to be numeric (`vscode-icons-2`) keeps it: a version this
+/// function should remove always has at least one separator.
+fn strip_version_suffix(stem: &str) -> &str {
+    let Some(dash) = stem.rfind('-') else {
+        return stem;
+    };
+    let tail = &stem[dash + 1..];
+    if !tail.contains('.') {
+        return stem;
+    }
+    let versionish = tail.split('.').all(|seg| {
+        !seg.is_empty()
+            && seg
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == 'x' || c == 'X')
+    });
+    if versionish { &stem[..dash] } else { stem }
 }
 
 /// Reduce one install argument to a bare registry name, or reject it.
@@ -674,6 +792,62 @@ mod tests {
         assert_eq!(
             get_arr(&v, "markdown.install_packages"),
             vec!["eslint", "react", "vitest", "requests"]
+        );
+    }
+
+    #[test]
+    fn install_packages_vscode_marketplace_id() {
+        let v = run("```\ncode --install-extension publisher.my-extension\n```\n");
+        assert_eq!(
+            get_arr(&v, "markdown.install_extensions"),
+            vec!["my-extension"],
+            "only the extension half of a marketplace id names the package"
+        );
+        assert!(get_arr(&v, "markdown.install_packages").is_empty());
+    }
+
+    #[test]
+    fn install_packages_vsix_file_strips_version() {
+        // The `x.x.x` placeholder is what vsce's own docs print, and what a
+        // cloned README carries over verbatim.
+        let v = run("code --install-extension sugar-extension-pack-x.x.x.vsix\n\
+             cursor --install-extension ./dist/my-ext-1.2.3.vsix\n");
+        assert_eq!(
+            get_arr(&v, "markdown.install_extensions"),
+            vec!["sugar-extension-pack", "my-ext"]
+        );
+    }
+
+    #[test]
+    fn install_packages_vscode_forks_and_non_version_tail() {
+        let v = run(
+            "codium --install-extension vscode-icons-team.vscode-icons\n\
+             windsurf --install-extension vscode-icons-2.vsix\n",
+        );
+        assert_eq!(
+            get_arr(&v, "markdown.install_extensions"),
+            vec!["vscode-icons", "vscode-icons-2"],
+            "a numeric trailing segment with no dot is part of the name"
+        );
+    }
+
+    #[test]
+    fn install_packages_ignores_other_code_invocations() {
+        let v = run("code .\ncode --list-extensions\ncode --help\n");
+        assert!(get_arr(&v, "markdown.install_extensions").is_empty());
+    }
+
+    #[test]
+    fn install_extensions_kept_apart_from_companion_packages() {
+        // An extension's README routinely documents installing the backend it
+        // drives. That names a companion program, not the extension, so it must
+        // not land in the list the manifest is checked against.
+        let v = run("```bash\npip install --upgrade zenzic\n```\n\n\
+             ```bash\ncode --install-extension pythonwoods.zenzic-vscode\n```\n");
+        assert_eq!(get_arr(&v, "markdown.install_packages"), vec!["zenzic"]);
+        assert_eq!(
+            get_arr(&v, "markdown.install_extensions"),
+            vec!["zenzic-vscode"]
         );
     }
 
