@@ -127,6 +127,29 @@ static RIZIN_MAX_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// scans still cover every slice).
 static RIZIN_NATIVE_ARCH_ONLY: AtomicBool = AtomicBool::new(false);
 
+/// Hook consulted while a caller waits for a rizin child to exit. Returns
+/// `true` when it did useful work (the loop then polls again at once) and
+/// `false` when it had nothing to do (the loop sleeps as before).
+///
+/// A caller that runs rizin from a thread-pool worker — cleave analyzing an
+/// ELF member on rayon — otherwise parks that worker for the 10–30 s a full
+/// `aaa` takes, a pool slot idle while its own siblings queue for it.
+/// Installing `rayon::yield_now` here lets the waiting worker execute other
+/// pending jobs instead. The hook is process-wide and set once.
+static WAIT_IDLE_HOOK: std::sync::OnceLock<fn() -> bool> = std::sync::OnceLock::new();
+
+/// Install the wait-idle hook (see [`WAIT_IDLE_HOOK`]). Later calls are no-ops.
+pub fn set_wait_idle_hook(hook: fn() -> bool) {
+    let _ = WAIT_IDLE_HOOK.set(hook);
+}
+
+fn wait_idle() {
+    if WAIT_IDLE_HOOK.get().is_some_and(|hook| hook()) {
+        return;
+    }
+    std::thread::sleep(Duration::from_millis(100));
+}
+
 /// Set the per-run rizin timeout (seconds). `0` restores the default.
 pub fn set_timeout_secs(secs: u64) {
     RIZIN_TIMEOUT_SECS.store(secs, Ordering::Relaxed);
@@ -624,7 +647,7 @@ fn recover_with_bin(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
                 exit_status = Some(status);
                 break;
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Ok(None) => wait_idle(),
             Err(_) => {
                 RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
                 terminate_child(&mut child, child_id);
