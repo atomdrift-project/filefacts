@@ -379,7 +379,7 @@ pub(super) fn rizin_fallback(
     if !decision.runs() {
         return;
     }
-    match crate::rizin::recover(bytes) {
+    match crate::rizin::recover_with_symbols(bytes, symbols.len()) {
         Some(recovery) => {
             recovery.apply(symbols, metrics);
         }
@@ -446,7 +446,7 @@ pub(super) fn rizin_fallback_with_sections(
     if !decision.runs() {
         return;
     }
-    let recovery = match crate::rizin::recover(bytes) {
+    let recovery = match crate::rizin::recover_with_symbols(bytes, symbols.len()) {
         Some(recovery) => recovery,
         None => {
             note_incomplete_recovery(metrics);

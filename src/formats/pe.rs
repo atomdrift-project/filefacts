@@ -449,7 +449,7 @@ fn rizin_importless_analysis(
     {
         return;
     }
-    let Some(recovery) = crate::rizin::recover(bytes) else {
+    let Some(recovery) = crate::rizin::recover_with_symbols(bytes, symbols.len()) else {
         return;
     };
     recover_api_hash_requests(pe, bytes, values, metrics, &recovery);
