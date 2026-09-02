@@ -76,7 +76,60 @@ pub(crate) fn detect_from_path(path: &Path) -> Option<FileType> {
     }
 
     // Single extension
-    detect_from_extension(path)
+    if let Some(ft) = detect_from_extension(path) {
+        return Some(ft);
+    }
+
+    // Wrapper suffix: `configure-backdoor.c.fragment`, `payload.php.sample`,
+    // `index.js.bak`. Incident corpora, quarantine folders and editor backups
+    // all append a suffix that says something about the file's provenance and
+    // nothing about its format. Without this the real extension is invisible,
+    // the file types as unknown, and no rule -- not even a `for: [text]` one --
+    // ever sees its bytes.
+    //
+    // Only a fixed set of wrappers is stripped, and only one layer, so a
+    // genuine two-part name (`libc.so.6`, `archive.tar.gz`) still resolves
+    // through the multi-part rules above.
+    // Only source-shaped inner types are accepted. A renamed binary or archive
+    // (`note.so.old`) still resolves by content, where its magic decides; a
+    // text file has no magic, so the extension under the wrapper is the only
+    // evidence there is.
+    strip_wrapper_suffix(path)
+        .and_then(|inner| detect_from_extension(Path::new(&inner)))
+        .filter(FileType::is_source_code)
+}
+
+/// Suffixes that wrap a file without changing what it is. Kept deliberately
+/// small: each one is a provenance or lifecycle marker, never a format.
+const WRAPPER_SUFFIXES: &[&str] = &[
+    "fragment",
+    "sample",
+    "bak",
+    "orig",
+    "old",
+    "save",
+    "copy",
+    "disabled",
+    "quarantine",
+    "download",
+    "part",
+    "tmp",
+    "orig_bak",
+];
+
+/// `foo.c.fragment` -> `foo.c`, when the trailing extension is a wrapper.
+fn strip_wrapper_suffix(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let (stem, ext) = name.rsplit_once('.')?;
+    if !WRAPPER_SUFFIXES.iter().any(|w| ext.eq_ignore_ascii_case(w)) {
+        return None;
+    }
+    // The remaining name must still carry an extension of its own, otherwise
+    // there is nothing to resolve and content heuristics should decide.
+    if !stem.contains('.') {
+        return None;
+    }
+    Some(stem.to_string())
 }
 
 /// Returns true if the path matched via filename (not extension).
@@ -628,6 +681,32 @@ mod tests {
             Some(FileType::MachO)
         );
         assert_eq!(detect_from_path(Path::new("note.so.old")), None);
+    }
+
+    /// A provenance or lifecycle suffix hides the real extension. Source-shaped
+    /// inner types resolve through it; binaries and archives do not, because
+    /// their magic bytes are better evidence than a renamed path.
+    #[test]
+    fn wrapper_suffix_reveals_inner_source_extension() {
+        assert_eq!(
+            detect_from_path(Path::new("configure-backdoor.c.fragment")),
+            Some(FileType::C)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("wp-includes-vars.php.sample")),
+            Some(FileType::Php)
+        );
+        assert_eq!(
+            detect_from_path(Path::new("loader.js.bak")),
+            Some(FileType::JavaScript)
+        );
+        // Not source-shaped: content detection decides these.
+        assert_eq!(detect_from_path(Path::new("payload.zip.sample")), None);
+        assert_eq!(detect_from_path(Path::new("libc.so.disabled")), None);
+        // No inner extension to reveal.
+        assert_eq!(detect_from_path(Path::new("evidence.fragment")), None);
+        // A wrapper suffix is stripped only once.
+        assert_eq!(detect_from_path(Path::new("x.py.bak.old")), None);
     }
 
     #[test]

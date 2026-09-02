@@ -214,6 +214,15 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"document.", Lang::JavaScript, 5),
     (b"window.", Lang::JavaScript, 5),
     (b"addEventListener", Lang::JavaScript, 5),
+    // Forms that appear in modern JS with none of the tokens above: an arrow
+    // function with a block body, JSON serialization, and CommonJS require.
+    // An untyped fragment of a payload (`const b = ...; fetch(url, {...})
+    // .catch(() => {})`) previously scored 5 and typed as unknown, which
+    // means no rule of any kind ever ran on it.
+    (b"=> {", Lang::JavaScript, 5),
+    (b"JSON.stringify", Lang::JavaScript, 10),
+    (b"require(\"", Lang::JavaScript, 10),
+    (b"require('", Lang::JavaScript, 10),
     // `var `/`let `/`const ` are JS variable declarations. `var ` especially is
     // dense in obfuscated/minified JS (every renamed local), so it must score
     // for JS — not only Kotlin (which prefers `val`). Supporting weight: a
