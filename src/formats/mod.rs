@@ -276,7 +276,7 @@ pub(crate) fn extract(
         FileType::PackageJson => {
             structured::extract_json(bytes, values)?;
             if let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(bytes) {
-                npm::emit(&manifest, values);
+                npm::emit(&manifest, values, metrics);
             }
             Ok(())
         }
