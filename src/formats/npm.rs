@@ -10,6 +10,12 @@
 //! Decompression stops as soon as `package/package.json` is reached —
 //! usually near the front, so a multi-megabyte tarball is rarely fully
 //! inflated just to read one manifest.
+//!
+//! Two of the emitted facts are cross-field judgements over the manifest
+//! rather than fields lifted out of it: `consistency.name_repo_mismatch`
+//! and `consistency.publisher_repo_owner_mismatch`. Both compare two
+//! claims the same manifest makes, so they are measurements of one file's
+//! bytes and belong here beside the parse that reads them.
 
 use std::io::Read;
 
@@ -19,6 +25,7 @@ use tar::Archive;
 
 use crate::error::Error;
 use crate::fileid::FileType;
+use crate::metric;
 use crate::output::{ArchiveMember, Metrics, Values};
 
 /// Manifests larger than this are almost certainly hostile padding; we
@@ -33,7 +40,7 @@ pub(super) fn extract(
     archive_members: &mut Vec<ArchiveMember>,
 ) -> Result<(), Error> {
     if let Some(manifest) = package_json(bytes) {
-        emit(&manifest, values);
+        emit(&manifest, values, metrics);
     }
     super::tar::extract(bytes, file_type, values, metrics, archive_members)
 }
@@ -58,9 +65,10 @@ fn package_json(bytes: &[u8]) -> Option<JsonValue> {
     None
 }
 
-/// Emit `npm.*` identity values from a parsed `package.json`. Shared by
-/// the tarball path and the bare-`package.json` file type.
-pub(super) fn emit(manifest: &JsonValue, values: &mut Values) {
+/// Emit `npm.*` identity values from a parsed `package.json`, plus the
+/// `consistency.*` judgements over them. Shared by the tarball path and the
+/// bare-`package.json` file type.
+pub(super) fn emit(manifest: &JsonValue, values: &mut Values, metrics: &mut Metrics) {
     let Some(obj) = manifest.as_object() else {
         return;
     };
@@ -98,6 +106,114 @@ pub(super) fn emit(manifest: &JsonValue, values: &mut Values) {
             }
         }
     }
+    if let Some(mismatch) = name_repo_mismatch(obj) {
+        metrics.insert(
+            metric!("consistency.name_repo_mismatch"),
+            f64::from(u8::from(mismatch)),
+        );
+    }
+    if let Some(mismatch) = publisher_repo_owner_mismatch(obj) {
+        metrics.insert(
+            metric!("consistency.publisher_repo_owner_mismatch"),
+            f64::from(u8::from(mismatch)),
+        );
+    }
+}
+
+/// Fold a string to its comparable core: no separators, no case.
+fn slug(s: &str) -> String {
+    s.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// The same fold applied to the last path segment of a repository URL, with
+/// a trailing `.git` dropped first.
+fn repo_slug(url: &str) -> String {
+    let trimmed = url.trim_end_matches('/');
+    slug(
+        trimmed
+            .rsplit('/')
+            .next()
+            .unwrap_or(trimmed)
+            .trim_end_matches(".git"),
+    )
+}
+
+/// A `repository` object may declare the subdirectory a monorepo package
+/// ships from. Only the object form can carry it.
+fn repository_directory(value: Option<&JsonValue>) -> Option<&str> {
+    value?.as_object()?.get("directory")?.as_str()
+}
+
+/// Whether the manifest names one package and claims another project's
+/// repository — the clone-and-rename shape, where there is no hostile code
+/// to find because the payload is a later version.
+///
+/// Compared on a folded slug, because the noise is predictable: a `@scope/`
+/// prefix, a `.git` suffix, and `-`/`_`/case spelling all differ without
+/// disagreeing, so `@tailwindcss/forms` and `tailwindcss-forms` agree.
+///
+/// Deliberately literal beyond that. A package legitimately named `foo` in a
+/// repo called `foo-js` will read as a mismatch — which is why this is one
+/// weak signal and never a verdict on its own.
+///
+/// `None` when either field is missing: a package that claims no repository
+/// has made no claim to contradict. Also `None` for a monorepo package, which
+/// declares the subdirectory it ships from and thereby makes no claim that the
+/// repository shares its name (`@react-pdf/png-js` ships from
+/// `diegomura/react-pdf` with `directory: packages/png-js`).
+fn name_repo_mismatch(obj: &serde_json::Map<String, JsonValue>) -> Option<bool> {
+    if repository_directory(obj.get("repository")).is_some() {
+        return None;
+    }
+    // A scoped name is `@scope/pkg`, whose slug is the two joined — the scope
+    // is part of the identity, not a path.
+    let name = slug(obj.get("name")?.as_str()?);
+    let repo = repo_slug(&repository_url(obj.get("repository"))?);
+    if name.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(name != repo)
+}
+
+/// Whether a marketplace extension's publisher disagrees with the owner of
+/// the repository it claims.
+///
+/// This is the discriminator a bare name-vs-repository mismatch lacks. An
+/// honest fork renames the package and keeps its own repository, so publisher
+/// and owner still agree (`Bobronium/vscode-pycharm-darcula-theme` published
+/// by `Bobronium`). A republication keeps the *upstream's* repository URL — it
+/// was never part of the branding the repackager set out to change — so the
+/// listing is published by one identity while pointing at another's code
+/// (`krabt-proto`, publisher `krabt`, repository `zxh0/vscode-proto3`).
+///
+/// `None` whenever either side is missing — a `package.json` with no
+/// `publisher` is not a marketplace extension and has made no claim to
+/// contradict.
+fn publisher_repo_owner_mismatch(obj: &serde_json::Map<String, JsonValue>) -> Option<bool> {
+    let publisher = slug(obj.get("publisher")?.as_str()?);
+    let repo = repository_url(obj.get("repository"))?;
+
+    // The owner is the path segment before the repository name, on any forge
+    // that uses the `host/owner/repo` shape. Anything shorter names no owner.
+    let path = repo
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .rsplit("://")
+        .next()
+        .unwrap_or(&repo);
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .skip(1) // host
+        .collect();
+    let owner = slug(segments.first()?);
+    if publisher.is_empty() || owner.is_empty() || segments.len() < 2 {
+        return None;
+    }
+    Some(publisher != owner)
 }
 
 /// A `repository` is either a string (`"github:user/repo"` or a URL) or
@@ -202,7 +318,8 @@ mod tests {
             "repository": { "url": "git+https://github.com/azer/left-pad.git" }
         });
         let mut values = Values::new();
-        emit(&manifest, &mut values);
+        let mut metrics = Metrics::new();
+        emit(&manifest, &mut values, &mut metrics);
         assert_eq!(
             values.get("npm.name").and_then(JsonValue::as_str),
             Some("left-pad")
@@ -224,7 +341,8 @@ mod tests {
             "maintainers": [{ "name": "a", "email": "a@x.io" }, "b <b@x.io>"]
         });
         let mut values = Values::new();
-        emit(&manifest, &mut values);
+        let mut metrics = Metrics::new();
+        emit(&manifest, &mut values, &mut metrics);
         let m = values
             .get("npm.maintainers")
             .and_then(JsonValue::as_array)
@@ -234,5 +352,129 @@ mod tests {
             m[1].get("email").and_then(JsonValue::as_str),
             Some("b@x.io")
         );
+    }
+
+    /// Run `emit` and return only the metrics, for the consistency judgements.
+    fn consistency(manifest: &JsonValue) -> Metrics {
+        let mut values = Values::new();
+        let mut metrics = Metrics::new();
+        emit(manifest, &mut values, &mut metrics);
+        metrics
+    }
+
+    fn name_repo(name: &str, repository: &JsonValue) -> Option<f64> {
+        consistency(&serde_json::json!({ "name": name, "repository": repository }))
+            .get("consistency.name_repo_mismatch")
+    }
+
+    fn publisher_repo(publisher: &str, repository: &str) -> Option<f64> {
+        consistency(&serde_json::json!({
+            "publisher": publisher,
+            "repository": { "url": repository },
+        }))
+        .get("consistency.publisher_repo_owner_mismatch")
+    }
+
+    #[test]
+    fn name_repo_mismatch_spots_a_clone_and_rename() {
+        // Both gauntlet samples: the manifest names one package and claims
+        // another project's repository.
+        assert_eq!(
+            name_repo(
+                "tailwindcss-form-styles",
+                &serde_json::json!("https://github.com/tailwindlabs/tailwindcss-forms"),
+            ),
+            Some(1.0),
+        );
+        assert_eq!(
+            name_repo(
+                "tailwindcss-3d-animate",
+                &serde_json::json!({ "url": "git://github.com/sambauers/tailwindcss-3d.git" }),
+            ),
+            Some(1.0),
+        );
+    }
+
+    #[test]
+    fn name_repo_mismatch_folds_the_noise() {
+        // A scope, a `.git` suffix and `-`/`_`/case spelling differ without
+        // disagreeing.
+        for (name, repo) in [
+            (
+                "@tailwindcss/forms",
+                "https://github.com/tailwindlabs/tailwindcss-forms",
+            ),
+            ("Lodash", "https://github.com/lodash/lodash.git"),
+            (
+                "mini_svg_data_uri",
+                "https://github.com/tigt/mini-svg-data-uri/",
+            ),
+        ] {
+            assert_eq!(
+                name_repo(name, &serde_json::json!(repo)),
+                Some(0.0),
+                "{name} vs {repo}",
+            );
+        }
+    }
+
+    #[test]
+    fn name_repo_mismatch_abstains_for_a_monorepo() {
+        // `@react-pdf/png-js` ships from `diegomura/react-pdf` and says so.
+        assert_eq!(
+            name_repo(
+                "@react-pdf/png-js",
+                &serde_json::json!({
+                    "url": "https://github.com/diegomura/react-pdf.git",
+                    "directory": "packages/png-js",
+                }),
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn name_repo_mismatch_abstains_without_a_claim() {
+        // No repository is no claim to contradict, and neither is no manifest.
+        assert_eq!(
+            consistency(&serde_json::json!({ "name": "solo" }))
+                .get("consistency.name_repo_mismatch"),
+            None,
+        );
+        assert_eq!(
+            consistency(&serde_json::json!({})).get("consistency.name_repo_mismatch"),
+            None,
+        );
+    }
+
+    #[test]
+    fn publisher_repo_owner_mismatch_separates_a_fork_from_a_republication() {
+        // Republication: the upstream repository kept, the listing renamed.
+        assert_eq!(
+            publisher_repo("krabt", "https://github.com/zxh0/vscode-proto3"),
+            Some(1.0),
+        );
+        // Honest fork: the author publishes their own repository, even though
+        // the package name and the repository name differ.
+        assert_eq!(
+            publisher_repo(
+                "Bobronium",
+                "https://github.com/Bobronium/vscode-pycharm-darcula-theme",
+            ),
+            Some(0.0),
+        );
+        // Case and separators are noise, not disagreement.
+        assert_eq!(
+            publisher_repo("Dart-Code", "https://github.com/dartcode/Flutter.git"),
+            Some(0.0),
+        );
+    }
+
+    #[test]
+    fn publisher_repo_owner_mismatch_abstains_without_both_sides() {
+        // No publisher: an ordinary npm manifest, not a marketplace listing.
+        assert_eq!(publisher_repo("", "https://github.com/a/b"), None);
+        // A URL that names no owner.
+        assert_eq!(publisher_repo("krabt", "https://example.com/thing"), None);
     }
 }

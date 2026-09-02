@@ -247,6 +247,8 @@ pub const CATALOG: &[&str] = &[
     "comments.url_in_comments",
     "comments.xxx_count",
     "consistency.extension_content_mismatch",
+    "consistency.name_repo_mismatch",
+    "consistency.publisher_repo_owner_mismatch",
     "deb.depends_count",
     "deb.installed_size",
     "dependencies.count",
@@ -658,8 +660,6 @@ pub const CATALOG: &[&str] = &[
     "pyc.source_file_count",
     "pyc.source_size",
     "pyc.timestamp",
-    "references.declared_count",
-    "references.unresolved_count",
     "registry.age_days",
     "registry.days_since_previous_release",
     "registry.downloads_recent",
@@ -799,11 +799,6 @@ pub const FAMILIES: &[&str] = &[
     "archive.format.<entry_type>_count",
     "ast.op.<operator>",
     "ast.op_density.<operator>",
-    // Emitted by the follow phase, not by an extractor: what became of the
-    // references a file declared, attributed back to the declaring file. The
-    // per-ecosystem count is a family because the ecosystem comes from the
-    // reference's own PURL type (`pkg:vscode/...` -> `vscode`).
-    "references.unresolved_<ecosystem>_count",
     "consistency.extension_content_mismatch.<content>_as_<extension>",
     "dmg.compression.codec_counts.<codec>",
     "source.query_limited.<query>",
