@@ -189,6 +189,82 @@ fn identity_metrics(strings: &StringFileInfo<'_>, metrics: &mut Metrics) {
         metrics.insert(metric!("pe.version.identity_symbol_ratio"), symbol_ratio);
         metrics.insert(metric!("pe.version.identity_entropy"), entropy);
     }
+
+    module_name_consistency(strings, metrics);
+}
+
+/// `InternalName` and `OriginalFilename` name the same module, so a linker sets
+/// them from the same source: they come out identical (`d3dcompiler_47.dll` /
+/// `d3dcompiler_47.dll`) or one is the other's stem (`WebBrowserPassView` /
+/// `WebBrowserPassView.exe`). Builder kits that synthesise a vendor identity
+/// fill the two fields independently and leave them unrelated — the 2021
+/// `coa`/`rc` npm loader declared `InternalName "Didride Cutuse"` against
+/// `OriginalFilename "Thin.dll"`.
+///
+/// The comparison is deliberately loose. Traits can already express a strict
+/// `ne:` between two value paths, and a strict test is useless here: it fires
+/// on every stem pair, which is most of the benign population. Folding the
+/// extension, case and separators away and then accepting *containment* leaves
+/// only the genuinely unrelated case.
+///
+/// Emitted as 0 or 1 whenever both fields are present, so a consumer can
+/// distinguish "checked and consistent" from "not checked".
+///
+/// PORTING NOTE: this tree predates the metric catalog. On current filefacts
+/// the insert becomes
+/// `metrics.insert(metric!("consistency.internal_name_original_filename_mismatch"), ..)`
+/// and the key needs a matching entry in `src/output/metric_keys.rs::CATALOG`,
+/// which is what `filefacts::known_metrics()` exposes and what cleave's
+/// `qual/validation` check validates trait `type: metrics` fields against. A
+/// trait cannot reference the field until both land.
+fn module_name_consistency(strings: &StringFileInfo<'_>, metrics: &mut Metrics) {
+    let (Some(internal), Some(original)) = (strings.internal_name(), strings.original_filename())
+    else {
+        return;
+    };
+    let (Some(internal), Some(original)) =
+        (fold_module_name(&internal), fold_module_name(&original))
+    else {
+        return;
+    };
+
+    let related = internal.contains(&original) || original.contains(&internal);
+    metrics.insert(
+        "consistency.internal_name_original_filename_mismatch",
+        if related { 0.0 } else { 1.0 },
+    );
+}
+
+/// Fold a module name to its comparable core: drop one trailing extension,
+/// lowercase, and keep only alphanumerics so spaces, `_`, `-` and `.` cannot
+/// make two spellings of one name look different.
+///
+/// `None` below three characters, where containment stops being evidence of
+/// anything — a two-letter stem is a substring of far too much.
+fn fold_module_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let stem = match trimmed.rsplit_once('.') {
+        // The extension must contain a letter. Without that, a trailing
+        // version component is eaten as one -- `libssl.1.1` folds to
+        // `libssl1`, quietly making two different modules look related.
+        Some((base, ext))
+            if !base.is_empty()
+                && (1..=5).contains(&ext.len())
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                && ext.chars().any(|c| c.is_ascii_alphabetic()) =>
+        {
+            base
+        }
+        _ => trimmed,
+    };
+
+    let folded: String = stem
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+
+    (folded.chars().count() >= 3).then_some(folded)
 }
 
 /// Symbol/digit ratio and Shannon byte-entropy of the concatenated identity
@@ -561,5 +637,45 @@ mod tests {
         let (ratio, entropy) = identity_scores("00000000000000000000").unwrap();
         assert!(ratio >= 0.4);
         assert!(entropy < 1.0, "padding entropy {entropy}");
+    }
+
+    /// Every InternalName/OriginalFilename pair observed across the PE corpus
+    /// in `supplychain-attack-data`. The first four are the benign shapes a
+    /// strict inequality would have flagged; the last is the generated one.
+    #[test]
+    fn module_names_fold_to_related_forms() {
+        for (internal, original) in [
+            ("d3dcompiler_47.dll", "d3dcompiler_47.dll"),
+            ("DTWpfInstaller.exe", "DTWpfInstaller.exe"),
+            ("WebBrowserPassView", "WebBrowserPassView.exe"),
+            ("ClassicShellSetup", "ClassicShellSetup.exe"),
+        ] {
+            let a = fold_module_name(internal).unwrap();
+            let b = fold_module_name(original).unwrap();
+            assert!(
+                a.contains(&b) || b.contains(&a),
+                "{internal} / {original} folded to {a} / {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_module_names_stay_unrelated() {
+        let a = fold_module_name("Didride Cutuse").unwrap();
+        let b = fold_module_name("Thin.dll").unwrap();
+        assert!(!a.contains(&b) && !b.contains(&a), "{a} / {b}");
+    }
+
+    #[test]
+    fn fold_module_name_normalises_separators_and_case() {
+        assert_eq!(fold_module_name("Foo-Bar_Baz.DLL").unwrap(), "foobarbaz");
+        // A dotted version is not an extension: keep the digits.
+        assert_eq!(fold_module_name("libssl.1.1").unwrap(), "libssl11");
+    }
+
+    #[test]
+    fn fold_module_name_rejects_too_short_to_compare() {
+        assert!(fold_module_name("a.dll").is_none());
+        assert!(fold_module_name("  ").is_none());
     }
 }
