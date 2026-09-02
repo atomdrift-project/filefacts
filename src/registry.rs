@@ -79,11 +79,11 @@ pub struct Registry {
     // fetch, PyPI in the package-level `releases` map). Counts and measures are
     // projected as metrics so traits can threshold them. ────────────────────
     /// Publish time of the package's *first-ever* release, Unix seconds — the
-    /// package's birth, distinct from this version's [`published_at`]. `None`
+    /// package's birth, distinct from this version's [`published_at`](Self::published_at). `None`
     /// when the registry exposes no timeline.
     pub first_published_at: Option<u64>,
     /// Publish time of the release immediately preceding this version, Unix
-    /// seconds. The gap to [`published_at`] surfaces a dormant package that
+    /// seconds. The gap to [`published_at`](Self::published_at) surfaces a dormant package that
     /// suddenly ships again (a hijack tell).
     pub previous_published_at: Option<u64>,
     /// Days from the first release to when this record was produced — the

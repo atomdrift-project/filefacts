@@ -74,7 +74,7 @@ use sha2::{Digest, Sha256};
 /// switch a host sets once; see [`set_caching_enabled`].
 static CACHING_OVERRIDE: AtomicI8 = AtomicI8::new(0);
 
-/// Force the [`crate::ParsedFile::open`]-time disk cache on or off for
+/// Force the [`crate::open`]-time disk cache on or off for
 /// the rest of the process. Overrides the default (on, except inside
 /// filefacts' own test runs). A consumer that needs hermetic extraction
 /// — its own test suite, a reproducibility check — disables it here.
@@ -158,7 +158,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// function of the key. Two things break that for a bare content hash,
 /// and both are folded in here:
 ///
-/// * the filefacts [`build_fingerprint`] — extraction logic changes
+/// * the filefacts build fingerprint — extraction logic changes
 ///   between builds, so a stale entry from an older filefacts must not be
 ///   reused;
 /// * the caller's `variant` — the detected file type plus
@@ -444,13 +444,13 @@ fn maybe_trigger_sweep(sha_hex: &str) {
 
 /// Enforce the cache's bounds synchronously, best-effort (failures ignored):
 ///
-/// 1. Drop entries older than [`MAX_AGE`] (the 30-day TTL). mtime is
+/// 1. Drop entries older than the 30-day TTL. mtime is
 ///    least-recently-*used* — [`load`] bumps it on a hit — so a still-used
 ///    entry is never dropped for age alone.
-/// 2. If the cache still exceeds `max_items` entries or [`MAX_BYTES`] on disk,
+/// 2. If the cache still exceeds `max_items` entries or the on-disk byte cap,
 ///    evict the oldest until both are within 90% of their caps.
 ///
-/// The cache key folds in the [`build_fingerprint`], so every filefacts rebuild
+/// The cache key folds in the build fingerprint, so every filefacts rebuild
 /// orphans the previous build's entries; because those orphans are never read
 /// again their mtime never advances, so they age out and are evicted first.
 /// Prefer [`cleanup`], which runs this off the hot path.

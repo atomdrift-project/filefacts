@@ -247,6 +247,7 @@ pub const CATALOG: &[&str] = &[
     "comments.url_in_comments",
     "comments.xxx_count",
     "consistency.extension_content_mismatch",
+    "consistency.internal_name_original_filename_mismatch",
     "consistency.name_repo_mismatch",
     "consistency.publisher_repo_owner_mismatch",
     "deb.depends_count",

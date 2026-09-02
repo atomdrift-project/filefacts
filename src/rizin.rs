@@ -195,7 +195,7 @@ static RIZIN_NATIVE_ARCH_ONLY: AtomicBool = AtomicBool::new(false);
 /// pending jobs instead. The hook is process-wide and set once.
 static WAIT_IDLE_HOOK: std::sync::OnceLock<fn() -> bool> = std::sync::OnceLock::new();
 
-/// Install the wait-idle hook (see [`WAIT_IDLE_HOOK`]). Later calls are no-ops.
+/// Install the wait-idle hook (see `WAIT_IDLE_HOOK`). Later calls are no-ops.
 pub fn set_wait_idle_hook(hook: fn() -> bool) {
     let _ = WAIT_IDLE_HOOK.set(hook);
 }
@@ -349,7 +349,7 @@ impl Drop for ScopedDisableThread {
 /// timing. Analyzers fan members out across rayon, so that is not
 /// hypothetical.
 ///
-/// Sound because [`recover`] consults [`is_disabled`] synchronously on the
+/// Sound because `recover_with_symbols` consults [`is_disabled`] synchronously on the
 /// thread that requested the parse: filefacts spawns no worker threads
 /// between the two (the only spawns are rizin's own stdout drain, after the
 /// check, and the unrelated cache sweep).
@@ -2034,7 +2034,7 @@ mod tests {
         // only the observable contract: disabled → None.
         let _g = scoped_disable();
         assert!(is_disabled());
-        let r = recover(b"unused bytes for disabled probe");
+        let r = recover_with_symbols(b"unused bytes for disabled probe", 0);
         assert!(r.is_none(), "disabled rizin must return None");
     }
 

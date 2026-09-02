@@ -209,14 +209,6 @@ fn identity_metrics(strings: &StringFileInfo<'_>, metrics: &mut Metrics) {
 ///
 /// Emitted as 0 or 1 whenever both fields are present, so a consumer can
 /// distinguish "checked and consistent" from "not checked".
-///
-/// PORTING NOTE: this tree predates the metric catalog. On current filefacts
-/// the insert becomes
-/// `metrics.insert(metric!("consistency.internal_name_original_filename_mismatch"), ..)`
-/// and the key needs a matching entry in `src/output/metric_keys.rs::CATALOG`,
-/// which is what `filefacts::known_metrics()` exposes and what cleave's
-/// `qual/validation` check validates trait `type: metrics` fields against. A
-/// trait cannot reference the field until both land.
 fn module_name_consistency(strings: &StringFileInfo<'_>, metrics: &mut Metrics) {
     let (Some(internal), Some(original)) = (strings.internal_name(), strings.original_filename())
     else {
@@ -230,7 +222,7 @@ fn module_name_consistency(strings: &StringFileInfo<'_>, metrics: &mut Metrics) 
 
     let related = internal.contains(&original) || original.contains(&internal);
     metrics.insert(
-        "consistency.internal_name_original_filename_mismatch",
+        metric!("consistency.internal_name_original_filename_mismatch"),
         if related { 0.0 } else { 1.0 },
     );
 }

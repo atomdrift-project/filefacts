@@ -562,7 +562,7 @@ pub enum FileType {
     /// Legacy Microsoft Office document (OLE2/CFBF: .doc, .xls, .ppt, .msg)
     OleDoc,
     /// Windows Installer package / patch (OLE2/CFBF: .msi, .msp). Same compound
-    /// container as [`OleDoc`], but a distinct product surface (installer tables,
+    /// container as [`OleDoc`](Self::OleDoc), but a distinct product surface (installer tables,
     /// custom-action binaries, SummaryInformation) — not a document.
     Msi,
     /// Modern Microsoft Office document (OOXML: .docx, .xlsx, .pptx)

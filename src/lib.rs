@@ -12,8 +12,10 @@
 //! Output views form the public schema:
 //!
 //! - [`Values`] — residual format structural data, navigable as a JSON tree.
-//! - [`Strings`] — extracted string literals, grouped by extraction
+//! - [`Text`] — byte-level printable runs, grouped by extraction
 //!   technique.
+//! - [`Literals`] — language-defined string literals from source and
+//!   structured formats.
 //! - [`Metrics`] — derived numeric features (entropy, sizes, counts).
 //! - [`Sections`] — binary section / segment listings.
 //! - [`Symbols`] — unified named-entity facts (imports, exports,
@@ -164,8 +166,6 @@ pub const SCHEMA_VERSION: &str = "8";
 /// not already have a typed home.
 ///
 /// [`values`]: ParsedFile::values
-/// [`strings`]: ParsedFile::strings
-/// [`metrics`]: ParsedFile::metrics
 #[must_use = "ParsedFile owns the extraction pipeline; dropping it discards every view"]
 pub struct ParsedFile<'a> {
     bytes: &'a [u8],
