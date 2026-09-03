@@ -57,6 +57,9 @@ const EXTRA_DARWIN_DATA: u32 = 0xA000_0006;
 const EXTRA_ICON_ENVIRONMENT_DATA: u32 = 0xA000_0007;
 const EXTRA_SHIM_DATA: u32 = 0xA000_0008;
 const EXTRA_PROPERTY_STORE_DATA: u32 = 0xA000_0009;
+/// Byte offset of the ShowCommand u32 inside the fixed 76-byte header.
+const SHOW_COMMAND_OFFSET: usize = 60;
+
 const EXTRA_KNOWN_FOLDER_DATA: u32 = 0xA000_000B;
 const EXTRA_VISTA_AND_ABOVE_IDLIST_DATA: u32 = 0xA000_000C;
 
@@ -81,7 +84,7 @@ pub(super) fn extract(
     let write_time = read_u64(bytes, 44).unwrap_or(0);
     let file_size = read_u32(bytes, 52).unwrap_or(0);
     let icon_index = read_i32(bytes, 56).unwrap_or(0);
-    let show_command = read_u32(bytes, 60).unwrap_or(0);
+    let show_command = read_u32(bytes, SHOW_COMMAND_OFFSET).unwrap_or(0);
     let hotkey = read_u16(bytes, 64).unwrap_or(0);
 
     // Header object.
@@ -92,6 +95,8 @@ pub(super) fn extract(
         "show_command".into(),
         JsonValue::String(show_command_name(show_command).to_string()),
     );
+    // The name is decoded, but it came from the u32 at header offset 60.
+    header.insert("show_command_offset".into(), json!(SHOW_COMMAND_OFFSET));
     if hotkey != 0 {
         header.insert("hotkey".into(), JsonValue::String(format_hotkey(hotkey)));
     }
@@ -133,23 +138,27 @@ pub(super) fn extract(
     // StringData sections.
     let is_unicode = link_flags & FLAG_IS_UNICODE != 0;
     let mut offset = 76usize;
-    let mut id_list_path: Option<String> = None;
+    // Both sources carry the file offset of the bytes the path was read
+    // from, so `lnk.target_path` anchors like every other fact.
+    let mut id_list_path: Option<(String, usize)> = None;
     if link_flags & FLAG_HAS_LINK_TARGET_ID_LIST != 0 {
         if let Some(id_list_size) = read_u16(bytes, offset) {
             let id_list_end = offset.saturating_add(2 + id_list_size as usize);
             if id_list_end <= bytes.len() {
-                id_list_path = walk_id_list(&bytes[offset + 2..id_list_end]);
+                let body = offset + 2;
+                id_list_path =
+                    walk_id_list(&bytes[body..id_list_end]).map(|(p, at)| (p, body + at));
             }
             offset = id_list_end;
         }
     }
-    let mut link_info_path: Option<String> = None;
+    let mut link_info_path: Option<(String, usize)> = None;
     if link_flags & FLAG_HAS_LINK_INFO != 0 {
         if let Some(link_info_size) = read_u32(bytes, offset) {
             let link_info_size = link_info_size as usize;
             let link_info_end = offset.saturating_add(link_info_size);
             if link_info_size >= 0x1C && link_info_end <= bytes.len() {
-                link_info_path = parse_link_info(&bytes[offset..link_info_end], values);
+                link_info_path = parse_link_info(&bytes[offset..link_info_end], offset, values);
             }
             offset = link_info_end;
         }
@@ -157,9 +166,10 @@ pub(super) fn extract(
     // Resolved target_path: the IDList walk is the canonical source;
     // LinkInfo's LocalBasePath + CommonPathSuffix is the documented
     // fallback when there's no IDList (per MS-SHLLINK §2.5).
-    if let Some(p) = id_list_path.or(link_info_path) {
+    if let Some((p, at)) = id_list_path.or(link_info_path) {
         if !p.is_empty() {
             put_str(values, "lnk.target_path", p);
+            put_u64(values, "lnk.target_path_offset", at as u64);
         }
     }
     let string_keys: &[(u32, &str)] = &[
@@ -185,6 +195,11 @@ pub(super) fn extract(
                         emit_argument_whitespace_metrics(metrics, &value);
                     }
                     put_str(values, key, value);
+                    // Anchor the fact to its StringData body (2 bytes of
+                    // length prefix precede it). Consumers read the
+                    // `<path>_offset` companion to turn a `value:` match
+                    // into a byte-addressed span.
+                    put_u64(values, &format!("{key}_offset"), (offset + 2) as u64);
                 }
                 offset = next;
             }
@@ -208,8 +223,13 @@ pub(super) fn extract(
         match signature {
             EXTRA_ENVIRONMENT_VARIABLE_DATA => {
                 blocks.push("environment_variable");
-                if let Some(s) = read_ansi_or_unicode_pair(block, 8, 268, 260, 520) {
+                if let Some((s, at)) = read_ansi_or_unicode_pair(block, 8, 268, 260, 520) {
                     put_str(values, "lnk.environment_target", s);
+                    put_u64(
+                        values,
+                        "lnk.environment_target_offset",
+                        (offset + at) as u64,
+                    );
                 }
             }
             EXTRA_CONSOLE_DATA => blocks.push("console"),
@@ -246,20 +266,27 @@ pub(super) fn extract(
             }
             EXTRA_DARWIN_DATA => {
                 blocks.push("darwin");
-                if let Some(s) = read_ansi_or_unicode_pair(block, 8, 268, 260, 520) {
+                if let Some((s, at)) = read_ansi_or_unicode_pair(block, 8, 268, 260, 520) {
                     put_str(values, "lnk.darwin_data", s);
+                    put_u64(values, "lnk.darwin_data_offset", (offset + at) as u64);
                 }
             }
             EXTRA_ICON_ENVIRONMENT_DATA => {
                 blocks.push("icon_environment");
-                if let Some(s) = read_ansi_or_unicode_pair(block, 8, 268, 260, 520) {
+                if let Some((s, at)) = read_ansi_or_unicode_pair(block, 8, 268, 260, 520) {
                     put_str(values, "lnk.icon_environment_target", s);
+                    put_u64(
+                        values,
+                        "lnk.icon_environment_target_offset",
+                        (offset + at) as u64,
+                    );
                 }
             }
             EXTRA_SHIM_DATA => {
                 blocks.push("shim");
                 if let Some(s) = read_utf16le_string(block, 8, block_size.saturating_sub(8)) {
                     put_str(values, "lnk.shim_layer_name", s);
+                    put_u64(values, "lnk.shim_layer_name_offset", (offset + 8) as u64);
                 }
             }
             EXTRA_PROPERTY_STORE_DATA => blocks.push("property_store"),
@@ -563,9 +590,10 @@ fn read_ansi_or_unicode_pair(
     uni_off: usize,
     ansi_len: usize,
     uni_len: usize,
-) -> Option<String> {
+) -> Option<(String, usize)> {
     read_utf16le_string(block, uni_off, uni_len)
-        .or_else(|| read_fixed_ansi(block, ansi_off, ansi_len))
+        .map(|s| (s, uni_off))
+        .or_else(|| read_fixed_ansi(block, ansi_off, ansi_len).map(|s| (s, ansi_off)))
 }
 
 /// Decode a GUID stored as little-endian Data1/Data2/Data3 + raw
@@ -608,8 +636,15 @@ fn derive_mac(guid: &str) -> Option<String> {
 /// `lnk.volume.{drive_type, serial, name}` and
 /// `lnk.network.{share, device, provider}` and returns the
 /// composed local target path (`LocalBasePath` + `CommonPathSuffix`)
-/// when present.
-fn parse_link_info(block: &[u8], values: &mut Values) -> Option<String> {
+/// with the file offset of the base path, when present.
+///
+/// `block_base` is the offset of `block` within the file, so every
+/// emitted fact carries a file-relative `_offset` companion.
+fn parse_link_info(
+    block: &[u8],
+    block_base: usize,
+    values: &mut Values,
+) -> Option<(String, usize)> {
     if block.len() < 0x1C {
         return None;
     }
@@ -645,12 +680,13 @@ fn parse_link_info(block: &[u8], values: &mut Values) -> Option<String> {
             // at +0x10 and the ASCII label is empty.
             let name = if label_off == 0x14 && vol.len() >= 20 {
                 let unicode_off = read_u32(vol, 16).unwrap_or(0) as usize;
-                read_utf16le_cstring(vol, unicode_off)
+                read_utf16le_cstring(vol, unicode_off).map(|s| (s, unicode_off))
             } else {
-                read_ansi_cstring(vol, label_off)
+                read_ansi_cstring(vol, label_off).map(|s| (s, label_off))
             };
-            if let Some(name) = name.filter(|s| !s.is_empty()) {
+            if let Some((name, at)) = name.filter(|(s, _)| !s.is_empty()) {
                 volume.insert("name".into(), JsonValue::String(name));
+                volume.insert("name_offset".into(), json!(block_base + volume_id_off + at));
             }
             values.insert("lnk.volume", JsonValue::Object(volume));
         }
@@ -668,6 +704,10 @@ fn parse_link_info(block: &[u8], values: &mut Values) -> Option<String> {
             if let Some(name) = read_ansi_cstring(net, net_name_off) {
                 if !name.is_empty() {
                     network.insert("share".into(), JsonValue::String(name));
+                    network.insert(
+                        "share_offset".into(),
+                        json!(block_base + net_link_off + net_name_off),
+                    );
                 }
             }
             // ValidDevice bit (0x1) → DeviceNameOffset is meaningful.
@@ -675,6 +715,10 @@ fn parse_link_info(block: &[u8], values: &mut Values) -> Option<String> {
                 if let Some(name) = read_ansi_cstring(net, device_name_off) {
                     if !name.is_empty() {
                         network.insert("device".into(), JsonValue::String(name));
+                        network.insert(
+                            "device_offset".into(),
+                            json!(block_base + net_link_off + device_name_off),
+                        );
                     }
                 }
             }
@@ -689,9 +733,9 @@ fn parse_link_info(block: &[u8], values: &mut Values) -> Option<String> {
 
     // Compose local target path. Prefer Unicode offsets when present.
     let base = if local_base_off_u != 0 {
-        read_utf16le_cstring(block, local_base_off_u)
+        read_utf16le_cstring(block, local_base_off_u).map(|s| (s, local_base_off_u))
     } else if local_base_off != 0 {
-        read_ansi_cstring(block, local_base_off)
+        read_ansi_cstring(block, local_base_off).map(|s| (s, local_base_off))
     } else {
         None
     };
@@ -703,8 +747,8 @@ fn parse_link_info(block: &[u8], values: &mut Values) -> Option<String> {
         None
     };
     match (base, suffix) {
-        (Some(b), Some(s)) if !s.is_empty() => Some(format!("{b}{s}")),
-        (Some(b), _) => Some(b),
+        (Some((b, at)), Some(s)) if !s.is_empty() => Some((format!("{b}{s}"), block_base + at)),
+        (Some((b, at)), _) => Some((b, block_base + at)),
         _ => None,
     }
 }
@@ -756,10 +800,17 @@ fn read_utf16le_cstring(buf: &[u8], offset: usize) -> Option<String> {
 /// is `\\?\<root>\<components…>` style — close enough to the
 /// canonical `link_target()` for trait matching without bringing in
 /// the full shell-folder parser.
-fn walk_id_list(buf: &[u8]) -> Option<String> {
+///
+/// Returns the path together with an anchor offset into `buf`. The
+/// path is composed from several ItemIDs, so it exists nowhere in the
+/// file as one contiguous run; the anchor points at the leaf
+/// component's name — the part path traits actually match — falling
+/// back to the drive root when that is all there is.
+fn walk_id_list(buf: &[u8]) -> Option<(String, usize)> {
     let mut i = 0usize;
     let mut components: Vec<String> = Vec::new();
-    let mut drive: Option<String> = None;
+    let mut drive: Option<(String, usize)> = None;
+    let mut anchor: Option<usize> = None;
     while i + 2 <= buf.len() {
         let size = u16::from_le_bytes([buf[i], buf[i + 1]]) as usize;
         if size == 0 {
@@ -769,27 +820,32 @@ fn walk_id_list(buf: &[u8]) -> Option<String> {
             return None;
         }
         let item = &buf[i + 2..i + size];
-        if let Some(c) = parse_id_item(item, &mut drive) {
+        if let Some((c, at)) = parse_id_item(item, i + 2, &mut drive) {
             if !c.is_empty() {
                 components.push(c);
+                anchor = Some(at);
             }
         }
         i += size;
     }
-    if drive.is_none() && components.is_empty() {
-        return None;
-    }
-    let mut out = drive.unwrap_or_default();
+    let anchor = anchor.or_else(|| drive.as_ref().map(|(_, at)| *at))?;
+    let mut out = drive.map(|(d, _)| d).unwrap_or_default();
     for c in components {
         if !out.is_empty() && !out.ends_with('\\') {
             out.push('\\');
         }
         out.push_str(&c);
     }
-    Some(out)
+    Some((out, anchor))
 }
 
-fn parse_id_item(item: &[u8], drive: &mut Option<String>) -> Option<String> {
+/// Parse one ItemID body. `item_base` is the body's offset within the
+/// IDList, so returned (and recorded) anchors are IDList-relative.
+fn parse_id_item(
+    item: &[u8],
+    item_base: usize,
+    drive: &mut Option<(String, usize)>,
+) -> Option<(String, usize)> {
     if item.is_empty() {
         return None;
     }
@@ -810,7 +866,7 @@ fn parse_id_item(item: &[u8], drive: &mut Option<String>) -> Option<String> {
                 let s = String::from_utf8_lossy(&item[1..end]).into_owned();
                 if !s.is_empty() {
                     let s = s.trim_end_matches('\\').to_string();
-                    *drive = Some(s);
+                    *drive = Some((s, item_base + 1));
                 }
             }
             None
@@ -823,12 +879,13 @@ fn parse_id_item(item: &[u8], drive: &mut Option<String>) -> Option<String> {
         //   u16 file_attrs
         //   ANSI ShortName (null-terminated, word-aligned)
         //   …extension block with Unicode LongName
-        0x30..=0x3F => parse_filesystem_item(item),
+        0x30..=0x3F => parse_filesystem_item(item).map(|(n, at)| (n, item_base + at)),
         _ => None,
     }
 }
 
-fn parse_filesystem_item(item: &[u8]) -> Option<String> {
+/// Returns the best available name with its offset within `item`.
+fn parse_filesystem_item(item: &[u8]) -> Option<(String, usize)> {
     if item.len() < 14 {
         return None;
     }
@@ -871,14 +928,18 @@ fn parse_filesystem_item(item: &[u8]) -> Option<String> {
                 }
                 if let Some(name) = read_utf16le_cstring(&item[probe..probe + ext_size], sub) {
                     if !name.is_empty() {
-                        return Some(name);
+                        return Some((name, probe + sub));
                     }
                 }
             }
         }
         probe += ext_size;
     }
-    if short.is_empty() { None } else { Some(short) }
+    if short.is_empty() {
+        None
+    } else {
+        Some((short, name_start))
+    }
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
@@ -971,6 +1032,59 @@ mod tests {
         assert_eq!(
             v.get("lnk.relative_path").and_then(|x| x.as_str()),
             Some(path)
+        );
+    }
+
+    #[test]
+    fn stringdata_carries_body_offset() {
+        // Header is 76 bytes; with no IDList/LinkInfo the StringData starts
+        // there, so the body sits 2 bytes later past the length prefix.
+        let path = "..\\target.exe";
+        let mut lnk = header_bytes(FLAG_HAS_RELATIVE_PATH | FLAG_IS_UNICODE, 0, 1);
+        let chars: Vec<u16> = path.encode_utf16().collect();
+        lnk.extend_from_slice(&(chars.len() as u16).to_le_bytes());
+        for w in &chars {
+            lnk.extend_from_slice(&w.to_le_bytes());
+        }
+        let (v, _) = run(&lnk);
+        assert_eq!(
+            v.get("lnk.relative_path_offset").and_then(|x| x.as_u64()),
+            Some(78)
+        );
+        assert_eq!(
+            &lnk[78..78 + chars.len() * 2],
+            &lnk[78..],
+            "offset must index the body bytes"
+        );
+    }
+
+    #[test]
+    fn icon_environment_block_carries_its_offset() {
+        // IconEnvironmentDataBlock: u32 size, u32 signature, ANSI target
+        // at +8 (260 bytes), Unicode target at +268 (520 bytes). The
+        // Unicode copy wins, so the anchor must point at +268.
+        let mut lnk = header_bytes(0, 0, 1);
+        let block_start = lnk.len();
+        let mut block = vec![0u8; 788];
+        block[0..4].copy_from_slice(&788u32.to_le_bytes());
+        block[4..8].copy_from_slice(&EXTRA_ICON_ENVIRONMENT_DATA.to_le_bytes());
+        let target = "%ProgramFiles%\\app\\app.exe";
+        for (i, unit) in target.encode_utf16().enumerate() {
+            block[268 + i * 2..268 + i * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        lnk.extend_from_slice(&block);
+        lnk.extend_from_slice(&[0u8; 4]); // terminal block
+
+        let (v, _) = run(&lnk);
+        assert_eq!(
+            v.get("lnk.icon_environment_target")
+                .and_then(|x| x.as_str()),
+            Some(target)
+        );
+        assert_eq!(
+            v.get("lnk.icon_environment_target_offset")
+                .and_then(|x| x.as_u64()),
+            Some((block_start + 268) as u64)
         );
     }
 
@@ -1150,6 +1264,15 @@ mod tests {
             v.get("lnk.target_path").and_then(|x| x.as_str()),
             Some("C:\\Windows\\System32\\notepad.exe")
         );
+        // The anchor must index the LocalBasePath bytes in the file.
+        let at = v
+            .get("lnk.target_path_offset")
+            .and_then(|x| x.as_u64())
+            .unwrap() as usize;
+        assert!(
+            lnk[at..].starts_with(b"C:\\Windows\\System32\\notepad.exe\0"),
+            "offset {at} does not index the base path"
+        );
     }
 
     #[test]
@@ -1193,6 +1316,15 @@ mod tests {
         let (v, _) = run(&lnk);
         let target = v.get("lnk.target_path").and_then(|x| x.as_str()).unwrap();
         assert!(target.starts_with("C:"), "got: {target}");
+        // With no named component the anchor falls back to the drive root.
+        let at = v
+            .get("lnk.target_path_offset")
+            .and_then(|x| x.as_u64())
+            .unwrap() as usize;
+        assert!(
+            lnk[at..].starts_with(b"C:\\\0"),
+            "offset {at} does not index the drive root"
+        );
     }
 
     #[test]
