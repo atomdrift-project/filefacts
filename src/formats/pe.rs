@@ -62,7 +62,18 @@ pub(super) fn extract(
     // goblin's lazy walkers), catches any panic from the parse, and
     // does the strict→permissive fallback internally. Callers must
     // never reach for `PE::parse_with_opts` directly.
-    let parse_outcome = goblin_safe::parse_pe(pe_bytes);
+    let parse = goblin_safe::parse_pe(pe_bytes);
+    // An import directory too large to walk safely: goblin was run with
+    // imports off, so everything else below is intact but `pe.imports` is
+    // empty by construction rather than by the sample's own doing. Say so,
+    // both as a metric and in the structured errors view — a forged import
+    // table is a fact worth carrying, and its absence would otherwise read
+    // as "this binary imports nothing".
+    if let Some(reason) = &parse.imports_skipped {
+        errors_out.record_malformed(crate::Stage::PeParse, reason.clone());
+        metrics.insert(metric!("pe.import_table_unwalkable"), 1.0);
+    }
+    let parse_outcome = parse.outcome;
     // Record the failure mode (if any) into the structured errors
     // view *before* we attempt the header-only fallback, so consumers
     // can see exactly which sub-stage tripped even when the fallback

@@ -118,6 +118,12 @@ pub(super) fn emit(manifest: &JsonValue, values: &mut Values, metrics: &mut Metr
             f64::from(u8::from(mismatch)),
         );
     }
+    if let Some(self_ref) = self_referential_git_dependency(obj) {
+        metrics.insert(
+            metric!("consistency.self_referential_git_dependency"),
+            f64::from(u8::from(self_ref)),
+        );
+    }
 }
 
 /// Fold a string to its comparable core: no separators, no case.
@@ -214,6 +220,86 @@ fn publisher_repo_owner_mismatch(obj: &serde_json::Map<String, JsonValue>) -> Op
         return None;
     }
     Some(publisher != owner)
+}
+
+/// The `owner`/`repo` pair a forge reference points at, folded for
+/// comparison. Accepts every shape npm and the forges use — `github:o/r`, a
+/// `git+https://`, `git://` or plain `https://` URL, `git@host:o/r`, and the
+/// bare `o/r` shorthand — because the caller has already decided the string
+/// is meant to name a repository.
+fn forge_parts(spec: &str) -> Option<(String, String)> {
+    let path = spec.trim().split('#').next()?;
+    let path = path
+        .trim_start_matches("git+")
+        .trim_start_matches("github:")
+        .trim_start_matches("gitlab:")
+        .trim_start_matches("bitbucket:");
+    // Drop scheme and host when the reference is a URL; `git@host:owner/repo`
+    // and the bare shorthand are already rooted at the owner.
+    let path = match path.split_once("://") {
+        Some((_, rest)) => rest.split_once('/').map_or(rest, |(_, tail)| tail),
+        None => path.rsplit(':').next().unwrap_or(path),
+    };
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let repo = slug(segments.last()?.trim_end_matches(".git"));
+    let owner = slug(segments.get(segments.len().checked_sub(2)?)?);
+    (!owner.is_empty() && !repo.is_empty()).then_some((owner, repo))
+}
+
+/// Whether a dependency specifier resolves through git rather than through
+/// the registry.
+///
+/// A registry alias such as `npm:@ai-sdk/provider@3.0.10` also carries a
+/// slash, so requiring a git marker rather than merely a slash is what keeps
+/// ordinary aliases from reading as repository references.
+fn is_git_specifier(spec: &str) -> bool {
+    let spec = spec.trim();
+    spec.starts_with("github:")
+        || spec.starts_with("gitlab:")
+        || spec.starts_with("bitbucket:")
+        || spec.starts_with("git+")
+        || spec.starts_with("git://")
+        || spec.starts_with("git@")
+        || (spec.contains('#') && !spec.contains(':'))
+}
+
+/// Whether the manifest declares a git-resolved dependency on the very
+/// repository it says it ships from.
+///
+/// A package has no reason to depend on itself. What the shape buys an
+/// attacker is that the published tarball stays clean: the code that runs at
+/// install time lives at a commit in the repository, which npm fetches
+/// separately and which no registry audit of the tarball ever sees. Pinning
+/// it to a commit rather than a tag keeps it off every branch listing too.
+///
+/// `None` when the manifest claims no repository, or declares no git
+/// dependency — there is nothing to agree or disagree about.
+fn self_referential_git_dependency(obj: &serde_json::Map<String, JsonValue>) -> Option<bool> {
+    let own = forge_parts(&repository_url(obj.get("repository"))?)?;
+    let mut saw_git_dependency = false;
+    for field in [
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ] {
+        let Some(deps) = obj.get(field).and_then(JsonValue::as_object) else {
+            continue;
+        };
+        for spec in deps.values().filter_map(JsonValue::as_str) {
+            if !is_git_specifier(spec) {
+                continue;
+            }
+            saw_git_dependency = true;
+            let Some(target) = forge_parts(spec) else {
+                continue;
+            };
+            if target == own {
+                return Some(true);
+            }
+        }
+    }
+    saw_git_dependency.then_some(false)
 }
 
 /// A `repository` is either a string (`"github:user/repo"` or a URL) or
@@ -444,6 +530,57 @@ mod tests {
         assert_eq!(
             consistency(&serde_json::json!({})).get("consistency.name_repo_mismatch"),
             None,
+        );
+    }
+
+    #[test]
+    fn self_reference_needs_the_dependency_to_name_this_repository() {
+        // opensearch-js 3.8.0: a lone optional dependency, renamed into a
+        // scope the project does not own, pinned to a commit in the project's
+        // own repository. The tarball it ships is otherwise unchanged.
+        let manifest = serde_json::json!({
+            "name": "@opensearch-project/opensearch",
+            "repository": { "url": "https://github.com/opensearch-project/opensearch-js.git" },
+            "optionalDependencies": {
+                "@opensearch/setup":
+                    "github:opensearch-project/opensearch-js#d446803f4c3bc116263faa3499a1d3f95b2825de"
+            },
+        });
+        assert_eq!(
+            consistency(&manifest).get("consistency.self_referential_git_dependency"),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn a_git_dependency_on_another_project_is_not_a_self_reference() {
+        let manifest = serde_json::json!({
+            "name": "left-pad",
+            "repository": { "url": "git+https://github.com/azer/left-pad.git" },
+            "dependencies": { "patched-dep": "github:someone/other-project#main" },
+        });
+        assert_eq!(
+            consistency(&manifest).get("consistency.self_referential_git_dependency"),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn registry_aliases_and_ranges_are_not_repository_references() {
+        // `npm:@ai-sdk/provider@3.0.10` carries a slash but names no forge, so
+        // a manifest full of aliases declares no git dependency and the metric
+        // abstains rather than reading them as a disagreement.
+        let manifest = serde_json::json!({
+            "name": "@mastra/core",
+            "repository": { "url": "https://github.com/mastra-ai/mastra.git" },
+            "dependencies": {
+                "@ai-sdk/provider-v6": "npm:@ai-sdk/provider@3.0.10",
+                "easy-day-js": "^1.11.21",
+            },
+        });
+        assert_eq!(
+            consistency(&manifest).get("consistency.self_referential_git_dependency"),
+            None
         );
     }
 
