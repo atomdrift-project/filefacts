@@ -735,7 +735,7 @@ fn collect_dict_regions(bytes: &[u8]) -> Vec<DictRegion> {
         if out.len() >= MAX_DICT_REGIONS {
             break;
         }
-        let Some(rel) = bytes[pos..].windows(3).position(|w| w == b"obj") else {
+        let Some(rel) = memchr::memmem::find(&bytes[pos..], b"obj") else {
             break;
         };
         let obj_pos = pos + rel;
@@ -756,9 +756,19 @@ fn collect_dict_regions(bytes: &[u8]) -> Vec<DictRegion> {
         let dict_start = obj_pos + 3;
         // Dict ends at the nearest `stream` or `endobj` token.
         // Both are whole tokens, so accept any non-name char as the
-        // delimiter (space, newline, etc.).
-        let stream_end_marker = find_token_after(bytes, dict_start, b"stream");
+        // delimiter (space, newline, etc.). `endobj` first, and
+        // `stream` only inside this object: an object without a
+        // stream used to look for one all the way to the next stream
+        // in the file, and a tagged PDF ends with thousands of
+        // stream-less structure objects, so each of them scanned to
+        // end-of-file — minutes for a 5 MB manual (fleet, 2026-09-06).
         let endobj_end = find_token_after(bytes, dict_start, b"endobj");
+        let stream_end_marker = find_token_between(
+            bytes,
+            dict_start,
+            endobj_end.unwrap_or(bytes.len()),
+            b"stream",
+        );
         let dict_end = match (stream_end_marker, endobj_end) {
             (Some(a), Some(b)) => a.min(b),
             (Some(a), None) => a,
@@ -797,10 +807,11 @@ fn collect_dict_regions(bytes: &[u8]) -> Vec<DictRegion> {
             obj_id,
             stream_range,
         });
-        // Skip past the stream body if one was present (the next
-        // `endobj` is after `endstream`).
+        // Skip past the stream body if one was present: `endobj_end`
+        // is the first `endobj` after the dict, so it is the one after
+        // `endstream` too.
         pos = match (stream_end_marker, endobj_end) {
-            (Some(s), Some(e)) if s < e => find_token_after(bytes, s, b"endobj").unwrap_or(e),
+            (Some(s), Some(e)) if s < e => e,
             _ => dict_end,
         };
     }
@@ -842,20 +853,25 @@ fn parse_obj_id_before(bytes: &[u8], obj_pos: usize) -> Option<u32> {
 /// Like `find_after` but requires the match to be a whole token:
 /// neither the preceding nor following byte may be a name char.
 fn find_token_after(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
-    let mut pos = from;
-    while pos < bytes.len() {
-        let rel = bytes[pos..]
-            .windows(needle.len())
-            .position(|w| w == needle)?;
-        let abs = pos + rel;
-        let before = if abs == 0 { b' ' } else { bytes[abs - 1] };
-        let after = bytes.get(abs + needle.len()).copied().unwrap_or(b' ');
-        if !is_name_char(before) && !is_name_char(after) {
-            return Some(abs);
-        }
-        pos = abs + needle.len();
+    find_token_between(bytes, from, bytes.len(), needle)
+}
+
+/// [`find_token_after`] with the match confined to `from..to`. The
+/// bytes on either side of a match are still judged from `bytes`, so
+/// a token at the bound is accepted or rejected exactly as an
+/// unbounded search would.
+fn find_token_between(bytes: &[u8], from: usize, to: usize, needle: &[u8]) -> Option<usize> {
+    let to = to.min(bytes.len());
+    if from >= to {
+        return None;
     }
-    None
+    memchr::memmem::find_iter(&bytes[from..to], needle)
+        .map(|rel| from + rel)
+        .find(|&abs| {
+            let before = if abs == 0 { b' ' } else { bytes[abs - 1] };
+            let after = bytes.get(abs + needle.len()).copied().unwrap_or(b' ');
+            !is_name_char(before) && !is_name_char(after)
+        })
 }
 
 /// Return the stream body end implied by a direct `/Length`, but only
@@ -2587,6 +2603,55 @@ mod tests {
         let pdf = b"%PDF-1.5\n5 0 obj << /Length 4 /Filter /FlateDecode >> stream\nABCsendstream endobj\n%%EOF";
         let (_, m) = extract_pdf(pdf);
         assert_eq!(m.get("pdf.stream_length_mismatch_count"), Some(0.0));
+    }
+
+    /// A tagged PDF ends with thousands of stream-less structure objects.
+    /// Each one used to search for a `stream` token to end-of-file, which
+    /// made region collection quadratic: 5 MB manuals took 80–400 s on the
+    /// fleet (2026-09-06). The search is bounded by the object's own
+    /// `endobj` now, and the walk is linear.
+    #[test]
+    fn dict_regions_are_linear_in_stream_less_objects() {
+        let mut pdf =
+            b"%PDF-1.7\n1 0 obj\n<< /Length 5 >>\nstream\nhello\nendstream\nendobj\n".to_vec();
+        let objects = 20_000;
+        for id in 2..2 + objects {
+            let parent = id - 1;
+            pdf.extend_from_slice(
+                format!("{id} 0 obj\n<< /Type /StructElem /P {parent} 0 R >>\nendobj\n").as_bytes(),
+            );
+        }
+        pdf.extend_from_slice(b"trailer\n<< /Root 1 0 R >>\n%%EOF\n");
+        let started = std::time::Instant::now();
+        let regions = collect_dict_regions(&pdf);
+        let elapsed = started.elapsed();
+        assert_eq!(regions.len(), 1 + objects);
+        assert_eq!(regions[0].obj_id, Some(1));
+        assert_eq!(regions[0].stream_range, Some((40, 45)));
+        assert_eq!(regions[1].obj_id, Some(2));
+        assert!(regions[1..].iter().all(|r| r.stream_range.is_none()));
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "region walk is quadratic again: {elapsed:?}"
+        );
+    }
+
+    /// The bound confines the match, not the token test: a `stream` that
+    /// runs into the bound is judged by the byte after it as before.
+    #[test]
+    fn token_between_respects_the_bound() {
+        let bytes = b"<< >> stream\nendobj stream endobj";
+        assert_eq!(
+            find_token_between(bytes, 0, bytes.len(), b"stream"),
+            Some(6)
+        );
+        assert_eq!(
+            find_token_between(bytes, 7, bytes.len(), b"stream"),
+            Some(20)
+        );
+        assert_eq!(find_token_between(bytes, 7, 20, b"stream"), None);
+        assert_eq!(find_token_between(bytes, 7, 7, b"stream"), None);
+        assert_eq!(find_token_after(b"streams stream", 0, b"stream"), Some(8));
     }
 
     // ------------------------------------------------------------------
