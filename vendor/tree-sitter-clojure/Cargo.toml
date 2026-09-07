@@ -48,3 +48,8 @@ version = "0.1.5"
 
 [build-dependencies.cc]
 version = "1.0"
+
+# `cc` is used by build.rs to compile grammar-src/src/parser.c; cargo-machete
+# does not see build-script usage, so tell it to skip the dependency.
+[package.metadata.cargo-machete]
+ignored = ["cc"]
