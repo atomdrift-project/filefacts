@@ -55,6 +55,19 @@ pub(crate) fn detect_from_path(path: &Path) -> Option<FileType> {
     if ends_with_ci(p, b".xbps") {
         return Some(FileType::Xbps);
     }
+    // Checksum files are commonly named "<artifact>.tar.gz.sha256sum" and
+    // signatures "<artifact>.tar.gz.sig": the archive suffix is in the middle of
+    // the name, so these must be settled before the `.tar.*` fallbacks below.
+    if ends_with_ci(p, b".sha256sum")
+        || ends_with_ci(p, b".sha512sum")
+        || ends_with_ci(p, b".sha1sum")
+        || ends_with_ci(p, b".md5sum")
+    {
+        return Some(FileType::Text);
+    }
+    if ends_with_ci(p, b".sig") || ends_with_ci(p, b".asc") {
+        return Some(FileType::PgpSignature);
+    }
     if ends_with_ci(p, b".tar.zst") || ends_with_ci(p, b".tzst") {
         return Some(FileType::TarZst);
     }
@@ -90,13 +103,34 @@ pub(crate) fn detect_from_path(path: &Path) -> Option<FileType> {
     // Only a fixed set of wrappers is stripped, and only one layer, so a
     // genuine two-part name (`libc.so.6`, `archive.tar.gz`) still resolves
     // through the multi-part rules above.
-    // Only source-shaped inner types are accepted. A renamed binary or archive
+    // Only magic-less inner types are accepted. A renamed binary or archive
     // (`note.so.old`) still resolves by content, where its magic decides; a
     // text file has no magic, so the extension under the wrapper is the only
     // evidence there is.
     strip_wrapper_suffix(path)
         .and_then(|inner| detect_from_extension(Path::new(&inner)))
-        .filter(FileType::is_source_code)
+        .filter(|ft| is_wrapper_inner_type(*ft))
+}
+
+/// Inner types trusted under a wrapper suffix.
+///
+/// The reason to read the extension out from under a wrapper is that these
+/// formats carry no signature of their own: once `.yaml` is hidden behind
+/// `.bak`, nothing in the bytes says what the file is, and it types as unknown —
+/// which means cleave skips it and not one rule ever sees it. That was the
+/// stated rationale for the carve-out, but the filter only admitted source
+/// code, so `deploy.yaml.quarantine` and `package.json.bak` still went
+/// untyped — exactly the incident-corpus names the wrapper list exists for.
+///
+/// Binaries and archives stay excluded: their magic is authoritative and is
+/// consulted before any of this, so trusting a name like `note.so.old` would
+/// only ever let a renamed payload claim a type its bytes do not support.
+fn is_wrapper_inner_type(ft: FileType) -> bool {
+    ft.is_source_code()
+        || matches!(
+            ft,
+            FileType::Yaml | FileType::Json | FileType::Xml | FileType::Text | FileType::Markdown
+        )
 }
 
 /// Suffixes that wrap a file without changing what it is. Kept deliberately
@@ -409,6 +443,10 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
             Some(FileType::Xml)
         }
         "json" => Some(FileType::Json),
+        // Generic YAML. The specific manifests that happen to be YAML
+        // (pnpm-lock.yaml, action.yml, .github/workflows/*) are matched by
+        // filename earlier in `detect_from_path`, so only the rest reach here.
+        "yaml" | "yml" => Some(FileType::Yaml),
         "gyp" | "gypi" => Some(FileType::Gyp),
         "plist" | "resx" => Some(FileType::Plist),
         "rtf" => Some(FileType::Rtf),
@@ -416,6 +454,14 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
             Some(FileType::OleDoc)
         }
         "msi" | "msp" | "mst" | "msm" => Some(FileType::Msi),
+        // Ubuntu Snap: a SquashFS image. The magic confirms the filesystem but
+        // not the package, so the extension is what separates the two.
+        "snap" => Some(FileType::Snap),
+        // Flatpak bundles carry no magic at a fixed offset — extension only.
+        "flatpak" => Some(FileType::Flatpak),
+        "squashfs" | "sqsh" => Some(FileType::SquashFs),
+        // Detached OpenPGP signatures published beside release artifacts.
+        "sig" | "asc" | "sign" => Some(FileType::PgpSignature),
         "docx" | "xlsx" | "pptx" | "docm" | "xlsm" | "pptm" | "dotx" | "dotm" | "xltx" | "xltm"
         | "xlam" | "ppam" | "potx" | "potm" | "ppsx" | "ppsm" | "sldx" | "sldm" => {
             Some(FileType::Ooxml)
@@ -470,6 +516,11 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "md" | "markdown" | "rmd" | "qmd" | "rnw" => Some(FileType::Markdown),
         "mk" | "mak" => Some(FileType::Makefile),
         "dockerfile" | "containerfile" => Some(FileType::Dockerfile),
+        // Checksum manifests shipped beside a release. Plain text listing
+        // "<hex>  <filename>" pairs — no structure worth its own type, but
+        // naming them keeps a release directory out of the unknown bucket.
+        "sha256sum" | "sha512sum" | "sha1sum" | "md5sum" | "sha256" | "sha512" | "checksum"
+        | "checksums" => Some(FileType::Text),
         "txt" | "text" | "b64" | "base64" => Some(FileType::Text),
         // Opaque binary "data" extensions that commonly carry encrypted/XOR'd payloads
         // (PlugX's Canon.dat, Cobalt Strike profiles, shellcode drops).

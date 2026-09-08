@@ -215,6 +215,7 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::SystemdService
         | FileType::DesktopEntry
         | FileType::Xml
+        | FileType::Yaml
         | FileType::PkgInfo
         | FileType::SrcInfo
         | FileType::Registry
@@ -270,6 +271,9 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::PythonSdist
         | FileType::OciImage
         | FileType::Xbps
+        | FileType::Snap
+        | FileType::Flatpak
+        | FileType::SquashFs
         | FileType::GentooBinpkg
         | FileType::Asar => "archive",
         FileType::Rtf | FileType::OleDoc | FileType::Ooxml | FileType::Pdf | FileType::Odf => {
@@ -281,7 +285,7 @@ fn file_group(ft: FileType) -> &'static str {
         FileType::Msi => "archive",
         FileType::Jpeg | FileType::Png | FileType::Svg => "image",
         FileType::Html | FileType::Markdown | FileType::Text => "text",
-        FileType::Pickle | FileType::Data | FileType::Unknown => "data",
+        FileType::Pickle | FileType::PgpSignature | FileType::Data | FileType::Unknown => "data",
     }
 }
 
@@ -418,6 +422,11 @@ pub enum FileType {
     DesktopEntry,
     /// Generic XML document (.xml, MSBuild .csproj, SVG, XML config files, etc.)
     Xml,
+    /// Generic YAML document (.yaml, .yml) that is not one of the specific
+    /// manifests above (a GitHub Actions workflow, a pnpm lockfile). YAML is the
+    /// default configuration language for CI, Kubernetes and model cards, so an
+    /// unrecognized one is worth naming rather than leaving as `unknown`.
+    Yaml,
     /// Python package metadata (PKG-INFO, METADATA)
     PkgInfo,
     /// Arch/AUR generated package metadata (.SRCINFO) — normalized mirror of PKGBUILD
@@ -474,6 +483,10 @@ pub enum FileType {
     /// install media. Identified by the volume-descriptor magic at sector 16;
     /// unpacked downstream by 7-Zip (ISO 9660, Joliet, Rock Ridge, and UDF).
     Iso,
+    /// SquashFS read-only filesystem image — `hsqs` (little-endian) or `sqsh`
+    /// (big-endian) superblock magic. Ships inside firmware images and appliance
+    /// builds, and is the wire format of a Snap package (see [`FileType::Snap`]).
+    SquashFs,
     /// Cabinet archive (.cab)
     Cab,
     /// Compiled HTML Help (.chm) — Microsoft ITSF/ITOL container with
@@ -547,6 +560,15 @@ pub enum FileType {
     /// Void Linux package (.xbps) — zstd-compressed tar carrying `props.plist`
     /// metadata. Distinguished from a generic `.tar.zst` by its extension.
     Xbps,
+    /// Ubuntu Snap package (.snap) — a SquashFS image carrying `meta/snap.yaml`.
+    /// Distinguished from a bare [`FileType::SquashFs`] image by its extension,
+    /// which is the only signal available without reading the filesystem.
+    Snap,
+    /// Flatpak single-file bundle (.flatpak) — an OSTree static delta in GVariant
+    /// framing. Unlike every other package format here it carries no magic at a
+    /// fixed offset and none is registered with `file(1)`, so the extension is
+    /// the identification.
+    Flatpak,
     /// Gentoo binary package (GLEP 78 `.gpkg.tar`) — an uncompressed tar
     /// bundling `metadata.tar.*`, `image.tar.*`, and a `Manifest`. Distinct
     /// from a generic tar by its `.gpkg.tar` extension.
@@ -591,6 +613,11 @@ pub enum FileType {
     Dockerfile,
     /// OpenDocument Format (.odt, .ods, .odp, .odg) — ZIP-based office documents
     Odf,
+    /// OpenPGP signature (.sig, .asc) — the detached signature published beside
+    /// a release artifact. Both the ASCII-armored and binary packet forms.
+    /// Provenance evidence rather than payload, and named so a release directory
+    /// does not read as a pile of unknowns.
+    PgpSignature,
     /// Plain text data (.txt, .text, or printable text with no stronger type)
     Text,
     /// Opaque binary data (.dat, .bin, .payload, .raw) — commonly carries
@@ -822,10 +849,12 @@ impl FileType {
             Self::Registry => "registry",
             Self::Json => "json",
             Self::Xml => "xml",
+            Self::Yaml => "yaml",
             Self::Plist => "plist",
             Self::Svg => "svg",
             Self::Html => "html",
             Self::Markdown => "markdown",
+            Self::PgpSignature => "pgp_signature",
             Self::Text => "text",
             Self::Data => "data",
             Self::Unknown => "unknown",
@@ -844,6 +873,7 @@ impl FileType {
             Self::SevenZ => "7z",
             Self::Rar => "rar",
             Self::Cab => "cab",
+            Self::SquashFs => "squashfs",
             Self::Asar => "asar",
             Self::Jar => "jar",
             // Packages.
@@ -865,6 +895,8 @@ impl FileType {
             Self::Ipa => "ipa",
             Self::Vsix => "vsix",
             Self::Xbps => "xbps",
+            Self::Snap => "snap",
+            Self::Flatpak => "flatpak",
             Self::ApkAndroid => "apk_android",
             Self::ApkAlpine => "apk_alpine",
             Self::PkgMacos => "pkg_macos",
@@ -955,10 +987,12 @@ impl FileType {
             "registry" => Self::Registry,
             "json" => Self::Json,
             "xml" => Self::Xml,
+            "yaml" => Self::Yaml,
             "plist" => Self::Plist,
             "svg" => Self::Svg,
             "html" => Self::Html,
             "markdown" => Self::Markdown,
+            "pgp_signature" => Self::PgpSignature,
             "text" => Self::Text,
             "data" => Self::Data,
             "unknown" => Self::Unknown,
@@ -976,6 +1010,7 @@ impl FileType {
             "7z" => Self::SevenZ,
             "rar" => Self::Rar,
             "cab" => Self::Cab,
+            "squashfs" => Self::SquashFs,
             "asar" => Self::Asar,
             "jar" => Self::Jar,
             "deb" => Self::Deb,
@@ -996,6 +1031,8 @@ impl FileType {
             "ipa" => Self::Ipa,
             "vsix" => Self::Vsix,
             "xbps" => Self::Xbps,
+            "snap" => Self::Snap,
+            "flatpak" => Self::Flatpak,
             "apk_android" => Self::ApkAndroid,
             "apk_alpine" => Self::ApkAlpine,
             "pkg_macos" => Self::PkgMacos,
@@ -1167,11 +1204,34 @@ fn allows_heuristic_extension_override(file_type: FileType) -> bool {
     )
 }
 
-fn has_yaml_extension(path: &Path) -> bool {
-    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-        return false;
-    };
-    ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
+/// True when a path's trailing dot-segment is a real extension rather than the
+/// tail of a version number.
+///
+/// `Path::extension` splits on the last dot, so `keyvault-keys@4.8.0` reports
+/// an extension of `"0"`, `react-redux@7.1.25` reports `"25"`, and `python3.11`
+/// reports `"11"`. Registry artifacts are routinely named this way — npm, crates
+/// and gem tarballs are stored as `<name>@<semver>` with no suffix at all.
+///
+/// Treating those digits as an unrecognized extension made every one of them an
+/// extension/content mismatch: content detection identifies the gzip tar, the
+/// "extension" matches nothing, and the file is reported as `archive_as_unknown`
+/// — a masquerade signal on an ordinary package. A run of digits claims nothing
+/// about a file's format, so it is not something content can disagree with.
+///
+/// The `.so.1.1` case has its own handling in `ext::has_versioned_so_suffix`,
+/// which assigns the type; this only decides whether an extension was named.
+fn has_named_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| !e.is_empty() && !e.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// True for the specific formats that are *written in* YAML. Their `.yml` /
+/// `.yaml` extension resolves to the generic [`FileType::Yaml`], so content
+/// detection refining it to one of these is agreement about the same file, not
+/// a masquerade — the relationship `.json` already has with `package.json`.
+const fn is_yaml_dialect(ft: FileType) -> bool {
+    matches!(ft, FileType::GithubActions | FileType::PnpmLock)
 }
 
 /// True when an extension/content disagreement is a known benign format
@@ -1263,11 +1323,9 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
         }
 
         let ext_match = match ext_ft {
+            Some(FileType::Yaml) if is_yaml_dialect(file_type) => ExtensionMatch::Consistent,
             Some(e) if e != file_type => ExtensionMatch::Different(e),
-            None if file_type == FileType::GithubActions && has_yaml_extension(path) => {
-                ExtensionMatch::Consistent
-            }
-            None if path.extension().is_some() => ExtensionMatch::Unknown,
+            None if has_named_extension(path) => ExtensionMatch::Unknown,
             Some(_) | None => ExtensionMatch::Consistent,
         };
         return Some(Detection {
@@ -1302,7 +1360,7 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
         if let Some(file_type) = heuristics::detect_from_content(data) {
             let ext_match = match ext_ft {
                 Some(e) if e != file_type => ExtensionMatch::Different(e),
-                None if path.extension().is_some() => ExtensionMatch::Unknown,
+                None if has_named_extension(path) => ExtensionMatch::Unknown,
                 Some(_) | None => ExtensionMatch::Consistent,
             };
             return Some(Detection {
@@ -2433,8 +2491,178 @@ function wpcf7_special_mail_tag( $output, $name, $html ) {
     }
 
     #[test]
+    fn magic_less_types_survive_a_wrapper_suffix() {
+        // A quarantined or backed-up config has no signature in its bytes, so
+        // the extension under the wrapper is the only evidence there is. Before
+        // this, only source code was read out from under a wrapper and these
+        // typed as unknown — meaning cleave skipped them and no rule ran.
+        let yaml = b"apiVersion: v1\nkind: Pod\nmetadata:\n  name: x\n";
+        let json = b"{\n  \"name\": \"x\"\n}\n";
+        assert_detect("deploy.yaml.quarantine", yaml, FileType::Yaml);
+        assert_detect("cfg.yaml.bak", yaml, FileType::Yaml);
+        assert_detect("package.json.bak", json, FileType::Json);
+        assert_detect("index.js.bak", b"const a = 1;\n", FileType::JavaScript);
+        // Binaries and archives are NOT typed from a name under a wrapper —
+        // their magic is authoritative, so a renamed payload cannot claim a
+        // type its bytes do not support.
+        assert!(
+            detect_path(Path::new("note.so.old")).is_none(),
+            "a binary must not be typed from its name under a wrapper"
+        );
+        assert!(detect_path(Path::new("app.tar.gz.bak")).is_none());
+    }
+
+    #[test]
+    fn version_suffix_is_not_an_unknown_extension() {
+        // Registry artifacts are stored as `<name>@<semver>` with no suffix.
+        // `Path::extension` splits on the last dot and reports "0"/"25", which
+        // was being read as an unrecognized extension — making every ordinary
+        // npm/crate/gem tarball an `archive_as_unknown` masquerade signal.
+        let gz = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03";
+        for name in [
+            "keyvault-keys@4.8.0",
+            "cranelift-native@0.118.0",
+            "react-redux@7.1.25",
+            "jsonpointer@v0.21.1",
+            "python3.11",
+        ] {
+            let det = detect(Path::new(name), gz).unwrap();
+            assert!(
+                !det.extension_mismatch(),
+                "{name} reported an extension mismatch on a version suffix"
+            );
+        }
+        // A named extension still counts, in both directions.
+        assert!(
+            !detect(Path::new("pkg-1.2.3.tgz"), gz)
+                .unwrap()
+                .extension_mismatch()
+        );
+        assert!(
+            detect(Path::new("photo.png"), gz)
+                .unwrap()
+                .extension_mismatch(),
+            "a real extension disagreeing with content is still a mismatch"
+        );
+    }
+
+    // ── Formats added from the gauntlet good-cohort "unknown" bucket ──
+    // Every case below is a real artifact that atomscan could not identify.
+
+    /// A SquashFS superblock: `hsqs` magic, then the 4.0 header fields.
+    fn squashfs_superblock() -> Vec<u8> {
+        let mut v = b"hsqs".to_vec();
+        // inodes, mkfs_time, block_size, fragments, compression, block_log,
+        // flags, ids, s_major(4), s_minor(0).
+        v.extend_from_slice(&10u32.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(&131_072u32.to_le_bytes());
+        v.extend_from_slice(&1u32.to_le_bytes());
+        for field in [1u16, 17, 0, 0, 4, 0] {
+            v.extend_from_slice(&field.to_le_bytes());
+        }
+        v.resize(256, 0);
+        v
+    }
+
+    #[test]
+    fn snap_is_squashfs_named_by_extension() {
+        // binwalk-ng_5.snap — a SquashFS image. The magic gives the filesystem;
+        // only the extension says it is a Snap package.
+        assert_detect("binwalk-ng_5.snap", &squashfs_superblock(), FileType::Snap);
+        assert_detect(
+            "firmware.squashfs",
+            &squashfs_superblock(),
+            FileType::SquashFs,
+        );
+        // Big-endian superblocks are the same filesystem.
+        let mut be = squashfs_superblock();
+        be[..4].copy_from_slice(b"sqsh");
+        assert_detect("rootfs.bin", &be, FileType::SquashFs);
+    }
+
+    #[test]
+    fn snap_extension_without_readable_body() {
+        // The draw hands us truncated or streamed artifacts too; the extension
+        // still names them.
+        assert_ext("binwalk-ng_5.snap", FileType::Snap);
+    }
+
+    #[test]
+    fn flatpak_is_extension_only() {
+        // Beekeeper-Studio-5.9.3-aarch64.flatpak — an OSTree static delta in
+        // GVariant framing, with no magic at a fixed offset to key on.
+        assert_ext("Beekeeper-Studio-5.9.3-aarch64.flatpak", FileType::Flatpak);
+    }
+
+    #[test]
+    fn pgp_signature_armored_and_by_extension() {
+        // OpenJDK21U-testimage_x64_mac_hotspot_21.0.12_8.tar.gz.sig — the `.sig`
+        // suffix follows a `.tar.gz`, so it must beat the archive fallbacks.
+        assert_ext(
+            "OpenJDK21U-testimage_x64_mac_hotspot_21.0.12_8.tar.gz.sig",
+            FileType::PgpSignature,
+        );
+        assert_detect(
+            "release.asc",
+            b"-----BEGIN PGP SIGNATURE-----\n\niQIzBAAB\n",
+            FileType::PgpSignature,
+        );
+    }
+
+    #[test]
+    fn checksum_manifest_is_text() {
+        // libdenort-x86_64-pc-windows-msvc.zip.sha256sum — the `.zip` in the
+        // middle of the name must not win.
+        assert_ext(
+            "libdenort-x86_64-pc-windows-msvc.zip.sha256sum",
+            FileType::Text,
+        );
+        assert_ext("SHASUMS256.txt", FileType::Text);
+    }
+
+    #[test]
+    fn generic_yaml_is_typed() {
+        // hle.yaml / config.yaml / gpqa.yaml from HuggingFace model repos.
+        assert_ext("hle.yaml", FileType::Yaml);
+        assert_ext("config.yml", FileType::Yaml);
+    }
+
+    #[test]
+    fn yaml_dialects_are_not_extension_mismatches() {
+        // A workflow is YAML: refining `.yml` to GithubActions is agreement
+        // about one file, not a masquerade. Regression guard — typing `.yml`
+        // as Yaml made every workflow file look like a mismatch.
+        let data = b"name: CI\n\non: [push]\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n";
+        let det = detect(Path::new("ci.yml"), data).unwrap();
+        assert_eq!(det.file_type, FileType::GithubActions);
+        assert!(!det.extension_mismatch());
+        let det = detect(Path::new("pnpm-lock.yaml"), b"lockfileVersion: 9\n").unwrap();
+        assert!(!det.extension_mismatch());
+    }
+
+    #[test]
+    fn new_types_round_trip_through_labels() {
+        for ft in [
+            FileType::Yaml,
+            FileType::Snap,
+            FileType::Flatpak,
+            FileType::SquashFs,
+            FileType::PgpSignature,
+        ] {
+            assert_eq!(FileType::from_label(ft.label()), Some(ft), "{ft:?}");
+        }
+    }
+
+    #[test]
     fn yaml_not_misclassified() {
-        assert!(detect(Path::new("config.yaml"), b"name: test\non: push\n").is_none());
+        // A plain YAML config is Yaml — not the language whose keywords its
+        // values happen to contain, and no longer an unknown. `on: push` is
+        // deliberately workflow-shaped: the GitHub Actions refinement needs a
+        // `jobs:` key too, so this must stay generic.
+        let det = detect(Path::new("config.yaml"), b"name: test\non: push\n").unwrap();
+        assert_eq!(det.file_type, FileType::Yaml);
+        assert!(!det.extension_mismatch());
     }
 
     #[test]

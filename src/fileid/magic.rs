@@ -312,6 +312,32 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
                 None
             }
         }
+        b'h' => {
+            // SquashFS superblock, little-endian: hsqs
+            if data.starts_with(b"hsqs") {
+                Some((squashfs_type(path), DetectionSource::Magic))
+            } else {
+                None
+            }
+        }
+        b's' => {
+            // SquashFS superblock, big-endian: sqsh
+            if data.starts_with(b"sqsh") {
+                Some((squashfs_type(path), DetectionSource::Magic))
+            } else {
+                None
+            }
+        }
+        b'-' => {
+            // ASCII-armored OpenPGP detached signature. The binary packet form
+            // has no byte we can claim safely — its tag byte collides with PNG
+            // and other formats — so that one is left to the extension.
+            if data.starts_with(b"-----BEGIN PGP SIGNATURE-----") {
+                Some((FileType::PgpSignature, DetectionSource::Magic))
+            } else {
+                None
+            }
+        }
         0xED => {
             // RPM: ED AB EE DB
             if data.len() >= 4 && data[1] == 0xAB && data[2] == 0xEE && data[3] == 0xDB {
@@ -502,6 +528,18 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
 /// headers; the name is the leading 16-byte field, space-padded and sometimes
 /// terminated with `/` (GNU). Used to tell a Debian package (first member
 /// `debian-binary`) from a static library (a symbol/string table or object).
+/// A SquashFS image is the wire format of a Snap package, so the superblock
+/// magic alone cannot tell the two apart — reading `meta/snap.yaml` would mean
+/// decompressing the filesystem. The `.snap` extension is the available signal,
+/// mirroring how `.xbps` separates a Void package from a generic zstd tar.
+fn squashfs_type(path: &Path) -> FileType {
+    if path_ends_with_ci(path, b".snap") {
+        FileType::Snap
+    } else {
+        FileType::SquashFs
+    }
+}
+
 fn ar_first_member_is(data: &[u8], want: &[u8]) -> bool {
     const AR_MAGIC_LEN: usize = 8; // "!<arch>\n"
     let Some(field) = data.get(AR_MAGIC_LEN..AR_MAGIC_LEN + 16) else {
