@@ -273,14 +273,33 @@ fn flush_yarn(out: &mut Refs<'_>, name: Option<&str>, version: Option<&str>, int
 /// The package name from a yarn.lock block header — the first `name@range` of a
 /// (possibly comma-separated, possibly quoted) spec key, with the range dropped.
 fn yarn_key_name(line: &str) -> Option<&str> {
+    // The header ends in `:`; splitting on the first one instead would cut an
+    // alias spec (`"a@npm:b@^1":`) in half.
     let key = line
-        .split(':')
-        .next()?
+        .trim_end()
+        .strip_suffix(':')?
         .split(',')
         .next()?
         .trim()
         .trim_matches('"');
-    npm_spec(key).map(|(name, _)| name)
+    npm_alias_target(key).or_else(|| npm_spec(key).map(|(name, _)| name))
+}
+
+/// The package an npm alias points at, for a spec key spelled
+/// `<local name>@npm:<real name>@<range>` — the form npm, Yarn and pnpm all
+/// use. Only the aliased-to package exists upstream, so `string-width-cjs@npm:
+/// string-width@^4.2.0` is a reference to `string-width`; taking the key at
+/// face value asks the registry for a package that was never published.
+///
+/// `None` for Yarn Berry's per-entry protocol (`lodash@npm:^4.17.21`), where
+/// what follows the protocol is a range rather than a package: a range holds no
+/// `@` of its own, so requiring a `name@range` split there is enough to tell
+/// the two apart.
+fn npm_alias_target(spec: &str) -> Option<&str> {
+    let (_, target) = spec.split_once("@npm:")?;
+    let (name, _range) = npm_spec(target)?;
+    name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '@' || c == '_')
+        .then_some(name)
 }
 
 /// `pnpm-lock.yaml`: the `packages` map is keyed by `/name@version` (v6) or
@@ -301,6 +320,9 @@ fn pnpm_lock(values: &Values, out: &mut Refs<'_>) {
         let Some((name, version)) = npm_spec(spec) else {
             continue;
         };
+        // `alias@npm:real@1.2.3` — the version is the alias key's own, but the
+        // package to fetch is the one aliased to.
+        let name = npm_alias_target(spec).unwrap_or(name);
         let pin = entry
             .get("resolution")
             .and_then(|r| r.get("integrity"))
@@ -1189,6 +1211,21 @@ fn push_locked_dep(
     let Some(version) = entry.get("version").and_then(JsonValue::as_str) else {
         return;
     };
+    // An alias installs one package under another name, and only the real
+    // package exists on the registry: `node_modules/string-width-cjs` fetches
+    // `string-width`. v2/v3 record the real package in `name`; v1 folds it into
+    // the version as `npm:<name>@<version>`.
+    let (name, version) = match version.strip_prefix("npm:").and_then(npm_spec) {
+        Some(aliased) => aliased,
+        None => (
+            entry
+                .get("name")
+                .and_then(JsonValue::as_str)
+                .filter(|aliased| !aliased.is_empty())
+                .unwrap_or(name),
+            version,
+        ),
+    };
     let pinned_hash = entry
         .get("integrity")
         .and_then(JsonValue::as_str)
@@ -2053,6 +2090,61 @@ mod tests {
             refs.iter()
                 .any(|r| r.locator == RefLocator::Purl("pkg:npm/lodash@4.17.21".into()))
         );
+    }
+
+    #[test]
+    fn npm_lock_aliases_resolve_to_the_real_package() {
+        // An alias installs one package under another name. Only the aliased-to
+        // package is on the registry — `string-width-cjs` was never published.
+        let v3 = serde_json::json!({
+            "lockfileVersion": 3,
+            "packages": {
+                "node_modules/string-width-cjs": {
+                    "name": "string-width",
+                    "version": "4.2.3",
+                    "resolved": "https://registry.npmjs.org/string-width/-/string-width-4.2.3.tgz"
+                }
+            }
+        });
+        let refs = derive(FileType::PackageLockJson, &[], &Values::from_json(v3));
+        assert_eq!(purls(&refs), vec!["pkg:npm/string-width@4.2.3"]);
+
+        // v1 folds the alias into the version.
+        let v1 = serde_json::json!({
+            "lockfileVersion": 1,
+            "dependencies": {
+                "strip-ansi-cjs": { "version": "npm:strip-ansi@6.0.1" },
+                "left-pad": { "version": "1.3.0" }
+            }
+        });
+        let refs = derive(FileType::PackageLockJson, &[], &Values::from_json(v1));
+        let p = purls(&refs);
+        assert!(p.contains(&"pkg:npm/strip-ansi@6.0.1"), "{p:?}");
+        assert!(p.contains(&"pkg:npm/left-pad@1.3.0"), "{p:?}");
+    }
+
+    #[test]
+    fn yarn_lock_alias_resolves_to_the_real_package() {
+        let lock = b"\"wrap-ansi-cjs@npm:wrap-ansi@^7.0.0\":\n  version \"7.0.0\"\n\n\
+            lodash@npm:^4.17.15:\n  version \"4.17.21\"\n";
+        let refs = derive(FileType::YarnLock, lock, &Values::new());
+        let p = purls(&refs);
+        assert!(p.contains(&"pkg:npm/wrap-ansi@7.0.0"), "{p:?}");
+        // Berry writes the protocol on every entry; that is a range, not an alias.
+        assert!(p.contains(&"pkg:npm/lodash@4.17.21"), "{p:?}");
+    }
+
+    #[test]
+    fn pnpm_lock_alias_resolves_to_the_real_package() {
+        let values = Values::from_json(serde_json::json!({
+            "packages": {
+                "string-width-cjs@npm:string-width@4.2.3": {
+                    "resolution": { "integrity": "sha512-EEEE" }
+                }
+            }
+        }));
+        let refs = derive(FileType::PnpmLock, &[], &values);
+        assert_eq!(purls(&refs), vec!["pkg:npm/string-width@4.2.3"]);
     }
 
     #[test]
