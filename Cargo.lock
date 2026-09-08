@@ -838,9 +838,9 @@ dependencies = [
 
 [[package]]
 name = "hybrid-array"
-version = "0.4.14"
+version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
+checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
 dependencies = [
  "typenum",
 ]
@@ -1758,7 +1758,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "1.10.0"
-source = "git+https://github.com/atomdrift-project/stng.git#5d4408a98ee7a0f18eb2c496bd82c16960f490f5"
+source = "git+https://github.com/atomdrift-project/stng.git#8fd3549563108c0be6e324edaa79f9040b30c163"
 dependencies = [
  "aho-corasick",
  "anyhow",
