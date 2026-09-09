@@ -67,6 +67,7 @@ mod nupkg;
 mod oci;
 mod ole2;
 mod ooxml;
+mod pbxproj;
 mod pdf;
 mod pe;
 mod pe_authenticode;
@@ -295,6 +296,7 @@ pub(crate) fn extract(
         | FileType::PyProjectToml => structured::extract_toml(bytes, values),
         FileType::GithubActions | FileType::PnpmLock => structured::extract_yaml(bytes, values),
         FileType::Plist => structured::extract_plist(bytes, values),
+        FileType::Pbxproj => pbxproj::extract(bytes, values, strings, metrics),
         FileType::PkgInfo => structured::extract_pkginfo(bytes, values),
         FileType::SrcInfo => pkgmeta::extract_srcinfo(bytes, values),
         FileType::Registry => registry::extract(bytes, values, metrics),

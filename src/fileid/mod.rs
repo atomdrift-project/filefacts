@@ -230,6 +230,8 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::YarnLock
         | FileType::PnpmLock
         | FileType::Plist
+        | FileType::Pbxproj
+        | FileType::Cmake
         | FileType::Makefile
         | FileType::Dockerfile => "config",
         FileType::Jar
@@ -579,6 +581,16 @@ pub enum FileType {
     AppleScript,
     /// Apple Property List (.plist)
     Plist,
+    /// Xcode project file (`project.pbxproj`) — an OpenStep-style property
+    /// list describing targets, build phases, and build settings. Kept
+    /// distinct from `Plist` because it is the only plist dialect that carries
+    /// executable build scripts, which is what makes it a supply-chain target.
+    Pbxproj,
+    /// CMake build script (`CMakeLists.txt`, `*.cmake`). Its own type rather
+    /// than generic text because it is executable build logic — `execute_process`
+    /// and `add_custom_command` run at configure and build time — so rules that
+    /// target build systems must be able to name it.
+    Cmake,
     /// Rich Text Format document (.rtf)
     Rtf,
     /// Legacy Microsoft Office document (OLE2/CFBF: .doc, .xls, .ppt, .msg)
@@ -765,6 +777,7 @@ impl FileType {
                 | Self::PyProjectToml
                 | Self::GithubActions
                 | Self::Plist
+                | Self::Pbxproj
                 | Self::PkgInfo
                 | Self::SrcInfo
                 | Self::Registry
@@ -851,6 +864,8 @@ impl FileType {
             Self::Xml => "xml",
             Self::Yaml => "yaml",
             Self::Plist => "plist",
+            Self::Pbxproj => "pbxproj",
+            Self::Cmake => "cmake",
             Self::Svg => "svg",
             Self::Html => "html",
             Self::Markdown => "markdown",
@@ -989,6 +1004,8 @@ impl FileType {
             "xml" => Self::Xml,
             "yaml" => Self::Yaml,
             "plist" => Self::Plist,
+            "pbxproj" => Self::Pbxproj,
+            "cmake" => Self::Cmake,
             "svg" => Self::Svg,
             "html" => Self::Html,
             "markdown" => Self::Markdown,

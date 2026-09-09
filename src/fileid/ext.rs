@@ -249,6 +249,17 @@ fn detect_from_filename(path: &Path) -> Option<FileType> {
     if name.eq_ignore_ascii_case("binding.gyp") {
         return Some(FileType::Gyp);
     }
+    // Xcode project. The name is fixed by the format -- it is always
+    // `<name>.xcodeproj/project.pbxproj` -- but the extension arm below still
+    // covers the file copied out of its bundle for analysis.
+    if name.eq_ignore_ascii_case("project.pbxproj") {
+        return Some(FileType::Pbxproj);
+    }
+    // CMake's entry point is always this exact name; `.cmake` modules are
+    // covered by the extension arm below.
+    if name.eq_ignore_ascii_case("cmakelists.txt") {
+        return Some(FileType::Cmake);
+    }
     if name.eq_ignore_ascii_case("cargo.toml") {
         return Some(FileType::CargoToml);
     }
@@ -449,6 +460,8 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "yaml" | "yml" => Some(FileType::Yaml),
         "gyp" | "gypi" => Some(FileType::Gyp),
         "plist" | "resx" => Some(FileType::Plist),
+        "pbxproj" => Some(FileType::Pbxproj),
+        "cmake" => Some(FileType::Cmake),
         "rtf" => Some(FileType::Rtf),
         "doc" | "msg" | "dot" | "ppt" | "pps" | "pot" | "ppa" | "xls" | "xlt" | "xla" => {
             Some(FileType::OleDoc)

@@ -528,6 +528,8 @@ pub const CATALOG: &[&str] = &[
     "office.vba_project_size",
     "office.xlm_sheet_count",
     "parse.error_count",
+    "pbxproj.object_count",
+    "pbxproj.script_count",
     "pdf.action_count",
     "pdf.annotation_count",
     "pdf.annotations_per_page",

@@ -458,6 +458,15 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
                 None
             }
         }
+        b'/' => {
+            // Xcode writes this exact comment as the first line of every
+            // `project.pbxproj`; it is the format's only signature.
+            if data.starts_with(b"// !$*UTF8*$!") {
+                Some((FileType::Pbxproj, DetectionSource::Magic))
+            } else {
+                None
+            }
+        }
         b'<' => {
             // PHP opening tag: <?php
             if data.starts_with(b"<?php") {
