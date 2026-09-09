@@ -2146,6 +2146,26 @@ mod tests {
         ))
     }
 
+    /// Execute a freshly staged shim once, untimed, so the timing assertions
+    /// below measure the recovery path and not the host's first-exec cost.
+    ///
+    /// EndpointSecurity clients (macOS XProtect, and any third-party agent
+    /// installed alongside it) hold the *first* `exec` of a newly written file
+    /// while they scan it, then cache the verdict; the same shim runs in
+    /// milliseconds afterwards. Measured at 11-36 s on one developer Mac, which
+    /// is many times every bound asserted here. Every shim used by a timed test
+    /// exits immediately when its first argument is `warmup`.
+    #[cfg(unix)]
+    fn warm_shim_exec(shim: &Path) {
+        let status = Command::new(shim)
+            .arg("warmup")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("warm-up exec of the shim");
+        assert!(status.success(), "shim warm-up exited with {status}");
+    }
+
     /// Stage a shell script that masquerades as `rizin`, prints a
     /// fixed stdout payload (escaping the canonical separators), and
     /// returns its directory so we can stitch it onto PATH. Returns
@@ -2313,6 +2333,8 @@ mod tests {
         let descendant_pid = dir.join("descendant.pid");
         let mut f = std::fs::File::create(&shim).unwrap();
         writeln!(f, "#!/bin/sh").unwrap();
+        // See `warm_shim_exec`: the untimed warm-up run must not fork a helper.
+        writeln!(f, "[ \"$1\" = warmup ] && exit 0").unwrap();
         // The descendant inherits stdout, then the shim exits immediately. If
         // the recovery path only reaps the group leader, `drain.join()` blocks
         // until this sleep ends and retains its Rayon caller in the meantime.
@@ -2329,6 +2351,8 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&shim, perms).unwrap();
         drop(f);
+
+        warm_shim_exec(&shim);
 
         let started = std::time::Instant::now();
         let rec = recover_with_bin_for_test(&shim, b"descendant cleanup fixture");
@@ -2438,6 +2462,8 @@ mod tests {
         let descendant_pid = dir.join("descendant.pid");
         let mut f = std::fs::File::create(&shim).unwrap();
         writeln!(f, "#!/bin/sh").unwrap();
+        // See `warm_shim_exec`: the untimed warm-up run must not block 300 s.
+        writeln!(f, "[ \"$1\" = warmup ] && exit 0").unwrap();
         writeln!(f, "printf '%s\\n' \"$$\" > '{}'", leader_pid.display()).unwrap();
         writeln!(f, "sleep 300 &").unwrap();
         writeln!(f, "descendant=$!").unwrap();
@@ -2452,6 +2478,8 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&shim, perms).unwrap();
         drop(f);
+
+        warm_shim_exec(&shim);
 
         let started = std::time::Instant::now();
         let rec = recover_with_bin_for_test(&shim, b"timeout cleanup fixture");
