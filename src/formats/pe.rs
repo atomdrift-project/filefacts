@@ -2393,6 +2393,18 @@ fn entry_and_overlay(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &m
                 metrics.insert(metric!("pe.entry_in_writable_section"), 1.0);
             }
             if let Ok(name) = section.name() {
+                // Entry belongs in a code section (`.text`, `CODE`).
+                // Resolving into a section outside the toolchain set is the
+                // redirection tell of a section-append infector — the PE
+                // analogue of ELF's note-cavity entry redirection. Packers
+                // also relocate the entry into their own section, so this is
+                // corroboration for composites and diffs rather than a
+                // standalone verdict; the `pe-entry-in-punctuated-section` /
+                // `-reloc-section` rules and the packer detectors carry the
+                // narrower standalone signals.
+                if !crate::is_well_known_section_name(name) {
+                    metrics.insert(metric!("pe.entry_in_nonstandard_section"), 1.0);
+                }
                 put_str(values, "pe.entry_section", name);
             }
             break;
@@ -3792,5 +3804,16 @@ mod tests {
     fn scan_resource_blob_empty_and_truncated() {
         assert_eq!(scan_resource_blob(&[]), (0, 0.0, 0));
         assert_eq!(scan_resource_blob(&[0x10, 0x00]), (0, 0.0, 0)); // < 4 bytes
+    }
+
+    /// The PE entry-section parity fields (mirroring ELF/Mach-O) emit on a
+    /// real binary and stay clean on a benign one: the entry resolves to a
+    /// toolchain code section, so no nonstandard-entry-section anomaly.
+    #[test]
+    fn pe_entry_parity_metrics_clean_on_fixture() {
+        let bytes = read_fixture("test.exe");
+        let (v, _, m) = run(&bytes);
+        assert!(v.get("pe.entry_section").is_some());
+        assert!(m.get("pe.entry_in_nonstandard_section").is_none());
     }
 }

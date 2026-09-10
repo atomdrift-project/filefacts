@@ -385,7 +385,19 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
         return None;
     }
 
-    let head = &data[..data.len().min(SCAN_LIMIT)];
+    // Take the scan window from the first byte that carries content. Padding a
+    // one-line payload off the left margin with several hundred spaces is a
+    // real evasion (seen on a `.woff2`-named Node loader with 997 leading
+    // spaces): it pushes enough scoring tokens out of a fixed-size head window
+    // to drop the file below THRESHOLD, and an unidentified file is skipped
+    // entirely by consumers. Skipping the run costs one `position` call and
+    // makes the window measure content rather than indentation.
+    let content_start = data
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(data.len());
+    let body = &data[content_start..];
+    let head = &body[..body.len().min(SCAN_LIMIT)];
     // Natural-language prose is never one of the scored languages either, but
     // it does quote their keywords: a novel has `const`, `let `, `var ` and
     // `new ` in every chapter, and 1 MB of it typed as JavaScript sends
@@ -397,9 +409,9 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
     }
 
     // If the head is mostly whitespace, also scan the tail
-    let scores = if is_mostly_whitespace(data, SCAN_LIMIT) && data.len() > SCAN_LIMIT {
-        let tail_start = data.len().saturating_sub(TAIL_SIZE);
-        let tail = &data[tail_start..];
+    let scores = if is_mostly_whitespace(body, SCAN_LIMIT) && body.len() > SCAN_LIMIT {
+        let tail_start = body.len().saturating_sub(TAIL_SIZE);
+        let tail = &body[tail_start..];
         let head_scores = scan_scores(head);
         let tail_scores = scan_scores(tail);
         let mut merged = [0u16; LANG_COUNT];

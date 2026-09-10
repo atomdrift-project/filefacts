@@ -19,6 +19,12 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         return None;
     }
 
+    // ISO base media (`.mp4`/`.m4a`/`.mov`): the size-prefixed `ftyp` box.
+    // Keyed at offset 4, so it cannot live in the first-byte jump table.
+    if data.len() >= 12 && &data[4..8] == b"ftyp" {
+        return Some((FileType::Mp4, DetectionSource::Magic));
+    }
+
     if looks_like_udif_dmg(data) {
         return Some((FileType::Dmg, DetectionSource::Magic));
     }
@@ -42,6 +48,24 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // tarball lights up at suspicious.
             if data.len() >= 4 && data[1] == 0x05 && data[2] == 0x16 && data[3] == 0x07 {
                 Some((FileType::Unknown, DetectionSource::Magic))
+            } else if data.len() >= 6
+                && data[1] == 0x00
+                && matches!(data[2], 0x01 | 0x02)
+                && data[3] == 0x00
+                && u16::from_le_bytes([data[4], data[5]]) > 0
+                && u16::from_le_bytes([data[4], data[5]]) <= 512
+            {
+                // Windows icon/cursor: reserved=0, type=1|2, then a plausible
+                // image count. Checked before the sfnt arm because sfnt 1.0 is
+                // `00 01 00 00`, which an icon header can never be (its type
+                // field would have to be 0x0100).
+                Some((FileType::Ico, DetectionSource::Magic))
+            } else if data.starts_with(&[0x00, 0x01, 0x00, 0x00]) {
+                // sfnt version 1.0 — the TrueType flavor every `.ttf` uses.
+                // Four bytes is a weak signature, so this arm is reached only
+                // after the AppleDouble check above and is confirmed
+                // downstream by formats/font.rs walking the table directory.
+                Some((FileType::Font, DetectionSource::Magic))
             } else if data.len() >= 8 && &data[1..4] == b"asm" && data[4..8] == [0x01, 0, 0, 0] {
                 // WebAssembly binary module: `\0asm` magic followed by the
                 // little-endian u32 version (`01 00 00 00`). The version guard
@@ -154,6 +178,39 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
                 None
             }
         }
+        b'G' => {
+            // GIF87a / GIF89a.
+            if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+                Some((FileType::Gif, DetectionSource::Magic))
+            } else {
+                None
+            }
+        }
+        b'O' => {
+            // OpenType with CFF outlines: the sfnt version is the tag `OTTO`.
+            if data.starts_with(b"OTTO") {
+                Some((FileType::Font, DetectionSource::Magic))
+            } else {
+                None
+            }
+        }
+        b'w' => {
+            // Web font wrappers: `wOFF` (WOFF 1) and `wOF2` (WOFF 2).
+            if data.starts_with(b"wOFF") || data.starts_with(b"wOF2") {
+                Some((FileType::Font, DetectionSource::Magic))
+            } else {
+                None
+            }
+        }
+        b't' => {
+            // Apple sfnt flavors: `true` (TrueType), `typ1` (PostScript in an
+            // sfnt wrapper), `ttcf` (TrueType collection).
+            if data.starts_with(b"true") || data.starts_with(b"typ1") || data.starts_with(b"ttcf") {
+                Some((FileType::Font, DetectionSource::Magic))
+            } else {
+                None
+            }
+        }
         0xD0 => {
             // OLE2/CFBF: D0 CF 11 E0 A1 B1 1A E1. Shared by Office documents
             // (.doc/.xls/.ppt/.msg) and Windows Installer packages (.msi/.msp);
@@ -195,6 +252,17 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // RAR: Rar!
             if data.starts_with(b"Rar!") {
                 Some((FileType::Rar, DetectionSource::Magic))
+            } else if (data.starts_with(b"RIFF") || data.starts_with(b"RIFX")) && data.len() >= 12 {
+                // RIFF container: `RIFF` + u32 length + form type. WAVE, WEBP
+                // and AVI share the wrapper, so the form type at offset 8
+                // decides which one this is.
+                Some((
+                    match &data[8..12] {
+                        b"WEBP" => FileType::Webp,
+                        _ => FileType::Wav,
+                    },
+                    DetectionSource::Magic,
+                ))
             } else {
                 None
             }
@@ -206,6 +274,13 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             } else if data.len() >= 12 && data.starts_with(b"FOR1") && &data[8..12] == b"BEAM" {
                 // Erlang/Elixir BEAM bytecode: IFF container `FOR1` <u32 size> `BEAM`.
                 Some((FileType::Beam, DetectionSource::Magic))
+            } else if data.len() >= 12
+                && data.starts_with(b"FORM")
+                && matches!(&data[8..12], b"AIFF" | b"AIFC")
+            {
+                // IFF audio shares the container family with BEAM above; the
+                // form type at offset 8 is what separates them.
+                Some((FileType::Aiff, DetectionSource::Magic))
             } else {
                 None
             }
@@ -230,6 +305,9 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // Compiled HTML Help: ITSF
             if data.starts_with(b"ITSF") {
                 Some((FileType::Chm, DetectionSource::Magic))
+            } else if data.starts_with(b"ID3") {
+                // ID3v2-tagged MPEG audio.
+                Some((FileType::Mp3, DetectionSource::Magic))
             } else {
                 None
             }
@@ -399,6 +477,15 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             }
         }
         b'B' => {
+            // BMP: `BM` plus a declared file size. Two bytes alone are a weak
+            // signature, so require the declared size to be structurally
+            // plausible before claiming it.
+            if data.starts_with(b"BM")
+                && data.len() >= 6
+                && u32::from_le_bytes([data[2], data[3], data[4], data[5]]) >= 14
+            {
+                return Some((FileType::Bmp, DetectionSource::Magic));
+            }
             // Bzip2: BZh
             if data.starts_with(b"BZh") {
                 let ft = if path_ends_with_ci(path, b".tar.bz2")

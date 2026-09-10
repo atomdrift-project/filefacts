@@ -1145,7 +1145,7 @@ mod tests {
             values_blob.extend_from_slice(&0x0000_001E_u32.to_le_bytes());
             values_blob.extend_from_slice(&len.to_le_bytes());
             values_blob.extend_from_slice(&s_bytes);
-            while values_blob.len() % 4 != 0 {
+            while !values_blob.len().is_multiple_of(4) {
                 values_blob.push(0);
             }
         }
@@ -1234,7 +1234,7 @@ mod tests {
                     values_blob.extend_from_slice(&v.to_le_bytes());
                 }
             }
-            while values_blob.len() % 4 != 0 {
+            while !values_blob.len().is_multiple_of(4) {
                 values_blob.push(0);
             }
         }

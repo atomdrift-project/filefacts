@@ -535,7 +535,9 @@ fn decode_field(raw: &[u8], ucs2: bool) -> String {
 
 fn decode_ucs2be(raw: &[u8]) -> String {
     let units: Vec<u16> = raw
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_be_bytes([c[0], c[1]]))
         .collect();
     String::from_utf16_lossy(&units)
@@ -1223,7 +1225,7 @@ impl Walk {
             };
 
             // System-use area: everything after the name, padded to even.
-            let su_start = 33 + name_len + usize::from(name_len % 2 == 0);
+            let su_start = 33 + name_len + usize::from(name_len.is_multiple_of(2));
             if let Some(su) = rec.get(su_start..) {
                 self.parse_susp(bytes, su, &mut entry, prefix, 0);
             }

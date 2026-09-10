@@ -892,7 +892,7 @@ fn build_minimal_iso(
         b.extend(both16(1)); // volume sequence number
         b.push(name.len() as u8);
         b.extend_from_slice(name);
-        if name.len() % 2 == 0 {
+        if name.len().is_multiple_of(2) {
             b.push(0); // pad the name field to an even length
         }
         b[0] = b.len() as u8;

@@ -831,7 +831,7 @@ fn looks_utf16be(buf: &[u8]) -> bool {
 
 fn decode_utf16(buf: &[u8], little_endian: bool) -> Option<String> {
     let mut units = Vec::with_capacity(buf.len() / 2);
-    for pair in buf.chunks_exact(2) {
+    for pair in buf.as_chunks::<2>().0 {
         let unit = if little_endian {
             u16::from_le_bytes([pair[0], pair[1]])
         } else {

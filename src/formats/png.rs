@@ -25,6 +25,7 @@ use crate::metric;
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
+use crate::formats::carrier::{self, Coverage};
 use crate::formats::common::{XorScan, extract_binary_strings};
 use crate::formats::image_stats;
 use crate::output::{Metrics, Strings, Values};
@@ -41,8 +42,15 @@ pub(super) fn extract(
     extract_binary_strings(bytes, strings, XorScan::No);
 
     if bytes.len() < 8 || &bytes[..8] != SIGNATURE {
+        // Named `.png` but not a PNG. Report what the bytes actually are so
+        // the masquerade is visible even though no chunk walk is possible.
+        carrier::emit(bytes, &Coverage::unrecognized(), values, metrics);
         return Ok(());
     }
+    // Shared carrier coverage, accumulated alongside the PNG-specific facts:
+    // an appended payload or a stowaway chunk is the same finding here as in
+    // a font or a WAV, and should read the same way.
+    let mut coverage = Coverage::new("png", 8);
 
     let mut chunks_total: usize = 0;
     let mut chunks_idat: usize = 0;
@@ -152,6 +160,18 @@ pub(super) fn extract(
             _ => {}
         }
 
+        // Text chunks legitimately hold author strings, so they are claimed
+        // but still searched for payload signatures. A chunk type outside the
+        // PNG/APNG standard set is deliberately *not* claimed: it is not part
+        // of the format's defined structure, so leaving it unclaimed makes it
+        // read as concealed space — which is what a `pWnZ` chunk holding an
+        // executable actually is. Every decoder skips it either way.
+        if matches!(ctype, "tEXt" | "zTXt" | "iTXt" | "eXIf") {
+            coverage.claim_freeform(i as u64, chunk_end as u64);
+        } else if is_standard_chunk(ctype) {
+            coverage.claim(i as u64, chunk_end as u64);
+        }
+
         i = chunk_end;
     }
 
@@ -205,6 +225,8 @@ pub(super) fn extract(
     metrics.insert(metric!("png.trailing_bytes"), trailing_bytes as f64);
     metrics.insert(metric!("png.text_chunk_bytes"), text_chunk_bytes as f64);
     metrics.insert(metric!("png.unknown_chunk_count"), unknown_count as f64);
+
+    carrier::emit(bytes, &coverage, values, metrics);
 
     // Best-effort pixel-statistic pass. Decoder errors are swallowed —
     // a PNG with a corrupted IDAT chunk or unsupported color depth
@@ -331,6 +353,11 @@ fn is_standard_chunk(t: &str) -> bool {
             | "acTL"
             | "fcTL"
             | "fdAT"
+            // PNG 3rd edition / HDR additions. Missing them made every
+            // GarageBand app icon report a 16-byte unaccounted-for region.
+            | "cICP"
+            | "mDCv"
+            | "cLLi"
     )
 }
 

@@ -527,7 +527,11 @@ impl<'a> ParsedFile<'a> {
             // respectively, and expose different identity/structure views.
             // A degraded rizin run is returned but not persisted, so a later
             // healthy run still gets to fill the entry.
-            let variant = extraction_cache_variant(self.fileid.file_type());
+            let variant = extraction_cache_variant(
+                self.fileid.file_type(),
+                self.fileid.extension_mismatch(),
+                self.fileid.extension_mismatch_transition(),
+            );
             // The cached form drops the byte-scan `text` rows (stng owns them);
             // they are rehydrated below. `open_with_cache` stores/loads the
             // lean snapshot, not the full `Extracted`.
@@ -570,11 +574,33 @@ impl<'a> ParsedFile<'a> {
     }
 }
 
-fn extraction_cache_variant(file_type: FileType) -> String {
+fn extraction_cache_variant(
+    file_type: FileType,
+    extension_mismatch: bool,
+    mismatch_transition: Option<(&'static str, &'static str)>,
+) -> String {
+    // The content/extension transition is path-derived but lands in the
+    // extraction output as `consistency.extension_content_mismatch.*`, so it
+    // belongs in the key: identical bytes named `x.woff2` and `x.wav` detect
+    // as the same type but produce different metrics, and must not share an
+    // entry. Without this, whichever name was scanned first won and every
+    // later identical-byte file inherited its verdict — a shell script named
+    // `.woff2` reported `script_as_unknown` (missing the masquerade) or a
+    // `.wav` reported `script_as_font` (inventing one), purely by scan order.
+    //
+    // The *group* is folded in rather than the raw extension, so the key
+    // space stays small: every unrecognised suffix collapses to one bucket,
+    // and the thousands of `.woff2` fonts in a tree still share entries.
+    let transition = match (extension_mismatch, mismatch_transition) {
+        (false, _) => std::borrow::Cow::Borrowed("-"),
+        (true, None) => std::borrow::Cow::Borrowed("?"),
+        (true, Some((content, ext))) => std::borrow::Cow::Owned(format!("{content}_as_{ext}")),
+    };
     format!(
-        "{};file_type={}",
+        "{};file_type={};mismatch={}",
         crate::rizin::cache_fingerprint(),
-        file_type.label()
+        file_type.label(),
+        transition
     )
 }
 
@@ -1313,6 +1339,40 @@ fn file_type_for_language(name: &str) -> Option<FileType> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The content/extension transition is path-derived but is written into
+    /// the extraction output, so it has to be part of the disk-cache key.
+    /// Identical bytes named `x.woff2` and `x.wav` detect as the same type,
+    /// and before this was folded in they shared a cache entry: whichever was
+    /// scanned first decided the mismatch metric for both, so a masquerade was
+    /// reported on the wrong file or missed on the right one depending only on
+    /// directory order.
+    #[test]
+    fn cache_variant_separates_extension_transitions() {
+        let as_font = extraction_cache_variant(FileType::Shell, true, Some(("script", "font")));
+        let as_unknown =
+            extraction_cache_variant(FileType::Shell, true, Some(("script", "unknown")));
+        let consistent = extraction_cache_variant(FileType::Shell, false, None);
+        assert_ne!(as_font, as_unknown);
+        assert_ne!(as_font, consistent);
+        assert_ne!(as_unknown, consistent);
+        // Same transition, same bytes, same detected type: still one entry, so
+        // a tree full of `.woff2` files does not lose cache sharing.
+        assert_eq!(
+            as_font,
+            extraction_cache_variant(FileType::Shell, true, Some(("script", "font")))
+        );
+    }
+
+    /// A mismatch whose transition could not be named must not collapse onto
+    /// the no-mismatch key.
+    #[test]
+    fn cache_variant_separates_unnamed_mismatch() {
+        assert_ne!(
+            extraction_cache_variant(FileType::Shell, true, None),
+            extraction_cache_variant(FileType::Shell, false, None)
+        );
+    }
     use super::*;
 
     #[test]
@@ -1338,12 +1398,12 @@ mod tests {
     #[test]
     fn extraction_cache_separates_path_dependent_file_types() {
         assert_ne!(
-            extraction_cache_variant(FileType::Gz),
-            extraction_cache_variant(FileType::Npm),
+            extraction_cache_variant(FileType::Gz, false, None),
+            extraction_cache_variant(FileType::Npm, false, None),
         );
         assert_eq!(
-            extraction_cache_variant(FileType::Npm),
-            extraction_cache_variant(FileType::Npm),
+            extraction_cache_variant(FileType::Npm, false, None),
+            extraction_cache_variant(FileType::Npm, false, None),
         );
     }
 

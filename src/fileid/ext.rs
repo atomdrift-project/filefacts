@@ -488,6 +488,23 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "pdf" => Some(FileType::Pdf),
         "jpg" | "jpeg" | "jpe" | "jfif" => Some(FileType::Jpeg),
         "png" => Some(FileType::Png),
+        // Font containers. `.woff2`/`.woff`/`.eot` are web-delivery
+        // wrappers, `.ttf`/`.otf` bare sfnt, `.ttc`/`.otc` collections.
+        // Mapping them buys structural validation (see formats/font.rs)
+        // for a family that is otherwise copied around unexamined.
+        "ttf" | "otf" | "ttc" | "otc" | "woff" | "woff2" | "eot" => Some(FileType::Font),
+        // Media containers. Each has a structure walker (formats/containers.rs)
+        // that reports which bytes the format accounts for, so a payload in
+        // the remainder is visible. Before these were mapped they had no file
+        // type at all and were skipped outright.
+        "wav" | "wave" => Some(FileType::Wav),
+        "aif" | "aiff" | "aifc" => Some(FileType::Aiff),
+        "mp3" => Some(FileType::Mp3),
+        "mp4" | "m4a" | "m4v" | "mov" => Some(FileType::Mp4),
+        "ico" | "cur" => Some(FileType::Ico),
+        "gif" => Some(FileType::Gif),
+        "bmp" | "dib" => Some(FileType::Bmp),
+        "webp" => Some(FileType::Webp),
         "pkl" | "pickle" | "joblib" => Some(FileType::Pickle),
         // Zip-based package ecosystems with unambiguous extensions get their
         // own type (the magic branch agrees when `PK` is present; this keeps

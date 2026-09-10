@@ -37,9 +37,11 @@ pub(crate) struct ExtractCtx<'a> {
 mod asar;
 mod binary_attribution;
 mod build_toolchain;
+mod carrier;
 mod chm;
 mod class;
 pub(crate) mod common;
+mod containers;
 mod crx;
 mod deb;
 mod dmg;
@@ -48,6 +50,7 @@ mod elf_dwarf;
 mod elf_dynamic;
 mod elf_hashes;
 mod elf_syscalls;
+mod font;
 mod gem;
 mod generic;
 mod go_buildinfo;
@@ -100,6 +103,25 @@ mod wasm;
 mod whl;
 mod xpi;
 mod zip;
+
+/// Run one container walker and emit the shared `media.*` facts.
+///
+/// Strings are extracted first: the masquerade case is exactly the one where
+/// the strings are the evidence, and cleave's recursive decode pipeline reads
+/// them to surface `metadata/encoded-payload/*` for base64 blobs and URLs
+/// hidden in the container.
+fn media_container(
+    bytes: &[u8],
+    values: &mut Values,
+    strings: &mut Strings,
+    metrics: &mut Metrics,
+    walk: fn(&[u8]) -> carrier::Coverage,
+) -> Result<(), Error> {
+    common::extract_binary_strings(bytes, strings, common::XorScan::No);
+    let coverage = walk(bytes);
+    carrier::emit(bytes, &coverage, values, metrics);
+    Ok(())
+}
 
 /// Drive the right extractor for `file_type` and merge its output into
 /// the public views. Unsupported types fall through to [`generic::extract`]
@@ -306,6 +328,27 @@ pub(crate) fn extract(
         FileType::Lnk => lnk::extract(bytes, values, strings, metrics),
         FileType::Pdf => pdf::extract(bytes, values, strings, metrics),
         FileType::Pickle => pickle::extract(bytes, values, strings, metrics),
+        FileType::Font => font::extract(bytes, values, strings, metrics),
+        // Media containers: walk the structure, then let carrier::emit turn
+        // the coverage into the shared `media.*` facts. Strings are extracted
+        // for all of them, which is also what enrols them in cleave's
+        // encoded-payload decode pipeline.
+        FileType::Wav | FileType::Webp => {
+            media_container(bytes, values, strings, metrics, containers::riff)
+        }
+        FileType::Aiff => media_container(bytes, values, strings, metrics, containers::iff),
+        FileType::Mp3 => media_container(bytes, values, strings, metrics, containers::mp3),
+        FileType::Mp4 => media_container(bytes, values, strings, metrics, containers::iso_bmff),
+        FileType::Ico => media_container(bytes, values, strings, metrics, containers::ico),
+        FileType::Gif => media_container(bytes, values, strings, metrics, containers::gif),
+        FileType::Bmp => media_container(bytes, values, strings, metrics, containers::bmp),
+        // SVG is XML text, so its strings come from the shared text fallback
+        // below rather than a binary scan; only the container coverage is
+        // added here.
+        FileType::Svg => {
+            carrier::emit(bytes, &containers::svg(bytes), values, metrics);
+            Ok(())
+        }
         FileType::Png => png::extract(bytes, values, strings, metrics),
         FileType::PythonBytecode => pyc::extract(bytes, values, strings, metrics),
         FileType::Rpm => rpm::extract(bytes, values, strings, metrics),

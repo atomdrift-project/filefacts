@@ -267,7 +267,7 @@ fn is_hex_like(s: &str) -> bool {
     }
     let hex_chars = s.bytes().filter(u8::is_ascii_hexdigit).count();
     let ratio = hex_chars as f64 / s.len() as f64;
-    ratio > 0.9 && s.len() % 2 == 0
+    ratio > 0.9 && s.len().is_multiple_of(2)
 }
 
 fn is_base64_like(s: &str) -> bool {

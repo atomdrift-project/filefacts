@@ -91,12 +91,12 @@ fn emit(words: &[u32], key: u32, raw_table: &[u8], values: &mut Values) {
         return;
     }
     let entries_words = &words[3..];
-    if entries_words.len() % 2 != 0 {
+    if !entries_words.len().is_multiple_of(2) {
         return;
     }
 
     let mut entries: Vec<JsonValue> = Vec::new();
-    for pair in entries_words.chunks_exact(2) {
+    for pair in entries_words.as_chunks::<2>().0 {
         let comp_id = pair[0];
         let count = pair[1];
         let build_id = (comp_id >> 16) & 0xffff;

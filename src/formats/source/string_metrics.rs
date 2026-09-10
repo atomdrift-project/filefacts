@@ -201,7 +201,7 @@ pub(super) fn emit(strings: &[&str], metrics: &mut Metrics) {
 }
 
 fn is_likely_base64(s: &str) -> bool {
-    if s.len() < 16 || s.len() % 4 != 0 {
+    if s.len() < 16 || !s.len().is_multiple_of(4) {
         return false;
     }
     // One pass: every char must be in the base64 alphabet, and a real payload
@@ -220,7 +220,7 @@ fn is_likely_base64(s: &str) -> bool {
 }
 
 fn is_hex_string(s: &str) -> bool {
-    if s.len() < 8 || s.len() % 2 != 0 {
+    if s.len() < 8 || !s.len().is_multiple_of(2) {
         return false;
     }
     let check = if s.starts_with("0x") || s.starts_with("0X") {

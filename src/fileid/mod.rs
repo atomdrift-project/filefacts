@@ -285,7 +285,20 @@ fn file_group(ft: FileType) -> &'static str {
         // are not documents — treat them as archive-class for mismatch
         // transitions (e.g. an MSI renamed `.doc` is archive→document).
         FileType::Msi => "archive",
-        FileType::Jpeg | FileType::Png | FileType::Svg => "image",
+        FileType::Jpeg
+        | FileType::Png
+        | FileType::Svg
+        | FileType::Ico
+        | FileType::Gif
+        | FileType::Bmp
+        | FileType::Webp => "image",
+        // Audio and video are their own classes: a payload renamed from
+        // `.wav` to `.png` is a real transition, not a benign refinement.
+        FileType::Wav | FileType::Aiff | FileType::Mp3 => "audio",
+        FileType::Mp4 => "video",
+        // Fonts are their own class, not images: a font renamed to `.png`
+        // is a format transition worth reporting, not a benign refinement.
+        FileType::Font => "font",
         FileType::Html | FileType::Markdown | FileType::Text => "text",
         FileType::Pickle | FileType::PgpSignature | FileType::Data | FileType::Unknown => "data",
     }
@@ -607,6 +620,28 @@ pub enum FileType {
     Jpeg,
     /// PNG image
     Png,
+    /// RIFF audio (`.wav`). Chunked container; see formats/containers.rs.
+    Wav,
+    /// IFF audio (`.aiff`, `.aifc`).
+    Aiff,
+    /// MPEG audio with optional ID3 tags (`.mp3`).
+    Mp3,
+    /// ISO base media (`.mp4`, `.m4a`, `.mov`) — a flat box sequence.
+    Mp4,
+    /// Windows icon or cursor (`.ico`, `.cur`). The favicon every web package
+    /// ships and nobody opens, which is what makes it a carrier.
+    Ico,
+    /// GIF image (`.gif`).
+    Gif,
+    /// Windows bitmap (`.bmp`).
+    Bmp,
+    /// RIFF image (`.webp`).
+    Webp,
+    /// Font container: sfnt (`.ttf`/`.otf`/`.ttc`), WOFF, WOFF2, or EOT.
+    /// One variant for the family because the abuse patterns are shared —
+    /// a payload wearing a font name, or a stowaway in the table gaps —
+    /// and the concrete container is reported as `font.format`.
+    Font,
     /// SVG image (.svg) — XML-based vector graphic. Unlike raster images it
     /// is text and can embed `<script>` / event handlers, making it a common
     /// phishing/HTML-smuggling carrier; classified as media but scanned as XML.
@@ -928,6 +963,15 @@ impl FileType {
             Self::Lnk => "lnk",
             Self::Jpeg => "jpeg",
             Self::Png => "png",
+            Self::Font => "font",
+            Self::Wav => "wav",
+            Self::Aiff => "aiff",
+            Self::Mp3 => "mp3",
+            Self::Mp4 => "mp4",
+            Self::Ico => "ico",
+            Self::Gif => "gif",
+            Self::Bmp => "bmp",
+            Self::Webp => "webp",
             Self::Pdf => "pdf",
             Self::Pickle => "pickle",
             Self::Odf => "odf",
@@ -1065,6 +1109,15 @@ impl FileType {
             "lnk" => Self::Lnk,
             "jpeg" => Self::Jpeg,
             "png" => Self::Png,
+            "font" => Self::Font,
+            "wav" => Self::Wav,
+            "aiff" => Self::Aiff,
+            "mp3" => Self::Mp3,
+            "mp4" => Self::Mp4,
+            "ico" => Self::Ico,
+            "gif" => Self::Gif,
+            "bmp" => Self::Bmp,
+            "webp" => Self::Webp,
             "pdf" => Self::Pdf,
             "pickle" => Self::Pickle,
             "odf" => Self::Odf,
@@ -1208,7 +1261,21 @@ fn is_shebang_juke(detected: FileType, ext_type: FileType) -> bool {
 fn allows_heuristic_extension_override(file_type: FileType) -> bool {
     matches!(
         file_type,
-        FileType::Zip
+        // A media extension is a container claim, not a language claim, and
+        // the whole point of naming a payload `fa-solid-500.woff2` or
+        // `favicon.ico` is that nothing looks inside. When the sniffer
+        // recognises real source in there, the source wins and
+        // `extension_mismatch` records the lie.
+        FileType::Font
+            | FileType::Wav
+            | FileType::Aiff
+            | FileType::Mp3
+            | FileType::Mp4
+            | FileType::Ico
+            | FileType::Gif
+            | FileType::Bmp
+            | FileType::Webp
+            | FileType::Zip
             | FileType::Jar
             | FileType::Xpi
             | FileType::Whl

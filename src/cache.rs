@@ -247,7 +247,7 @@ fn load_from_path<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
 /// entry read repeatedly costs at most one metadata write per window
 /// rather than one per read. A day is fine enough to order eviction
 /// candidates while leaving the common hot-entry hit a pure read.
-const LRU_TOUCH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const LRU_TOUCH_INTERVAL: Duration = Duration::from_hours(24);
 
 /// Best-effort relatime-style LRU touch: set `path`'s mtime to now, but
 /// only when its current mtime is already at least [`LRU_TOUCH_INTERVAL`]
@@ -350,7 +350,7 @@ const EVICTION_TARGET_DEN: usize = 10;
 /// Entries older than this are evicted regardless of the count/byte caps, so
 /// nothing lingers forever. Uses mtime, which [`load`] bumps on a hit, so a
 /// still-used entry is never dropped for age alone. 30 days.
-const MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const MAX_AGE: Duration = Duration::from_hours(30 * 24);
 
 /// Disk ceiling for the cache; over it, the oldest entries are evicted to 90%.
 /// The item cap usually binds first — this bounds the pathological case of a
@@ -931,7 +931,7 @@ mod tests {
     #[test]
     fn touch_lru_bumps_a_stale_entry() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let old = SystemTime::now() - Duration::from_secs(3 * 24 * 3600);
+        let old = SystemTime::now() - Duration::from_hours(3 * 24);
         let path = entry_with_mtime(tmp.path(), "e.bin", old);
         touch_lru(&path, old);
         let after = fs::metadata(&path)

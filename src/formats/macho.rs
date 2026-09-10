@@ -727,11 +727,13 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
 
     let entry = entry_point(macho);
     let mut wx_count: u64 = 0;
+    let mut exec_segment_count: u64 = 0;
     let mut wx_segments: Vec<JsonValue> = Vec::new();
     let mut text_writable = false;
     let mut pagezero_size: u64 = 0;
     let mut entry_in_writable = false;
     let mut entry_in_segment = false;
+    let mut entry_section: Option<String> = None;
     let mut has_data_const = false;
     let mut segments_out: Vec<JsonValue> = Vec::new();
     for segment in &macho.segments {
@@ -742,6 +744,9 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
         if writable && executable {
             wx_count += 1;
             wx_segments.push(JsonValue::String(name.clone()));
+        }
+        if executable {
+            exec_segment_count += 1;
         }
         if name == "__TEXT" && writable {
             text_writable = true;
@@ -758,6 +763,22 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
                 entry_in_segment = true;
                 if writable {
                     entry_in_writable = true;
+                }
+                // Resolve the entry to the section holding it, so a
+                // redirected entry in a grafted section (`__evil`,
+                // `.attack`) is nameable — the Mach-O analogue of ELF's
+                // entry_section / entry_in_nonstandard_section.
+                if entry_section.is_none()
+                    && let Ok(secs) = segment.sections()
+                {
+                    for (section, _data) in secs {
+                        let s_addr = section.addr;
+                        let s_end = s_addr.saturating_add(section.size);
+                        if section.size > 0 && entry >= s_addr && entry < s_end {
+                            entry_section = Some(section.name().unwrap_or("").to_string());
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -795,8 +816,20 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
         segments_out.push(JsonValue::Object(entry_obj));
     }
     metrics.insert(metric!("macho.wx_segment_count"), wx_count as f64);
+    metrics.insert(
+        metric!("macho.executable_segment_count"),
+        exec_segment_count as f64,
+    );
     if !wx_segments.is_empty() {
         values.insert("macho.wx_segments", JsonValue::Array(wx_segments));
+    }
+    if let Some(name) = entry_section {
+        // Entry belongs in __text; an entry resolving into a section
+        // outside the toolchain set is the redirection tell.
+        if !crate::is_well_known_section_name(&name) {
+            metrics.insert(metric!("macho.entry_in_nonstandard_section"), 1.0);
+        }
+        put_str(values, "macho.entry_section", &name);
     }
     if text_writable {
         metrics.insert(metric!("macho.text_segment_writable"), 1.0);
@@ -985,7 +1018,7 @@ fn data_in_code_kinds(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
     }
     let little_endian = macho.little_endian;
     let mut kinds = serde_json::Map::new();
-    for chunk in bytes[start..end].chunks_exact(8) {
+    for chunk in bytes[start..end].as_chunks::<8>().0 {
         let kind = if little_endian {
             u16::from_le_bytes([chunk[6], chunk[7]])
         } else {
@@ -1280,7 +1313,9 @@ fn build_version(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
         if tools_start + 8 <= tools_end {
             let little_endian = macho.little_endian;
             let tools: Vec<JsonValue> = bytes[tools_start..tools_end]
-                .chunks_exact(8)
+                .as_chunks::<8>()
+                .0
+                .iter()
                 .map(|c| {
                     let tool = read_u32(c, 0, little_endian);
                     let version = read_u32(c, 4, little_endian);
@@ -2220,5 +2255,16 @@ mod tests {
     #[test]
     fn mh_flag_names_empty_when_zero() {
         assert!(mh_flag_names(0).is_empty());
+    }
+
+    /// The Mach-O entry-anomaly parity metrics (mirroring ELF/PE) emit on a
+    /// real binary and stay clean on a benign one: exactly one executable
+    /// segment (__TEXT), and no nonstandard-entry-section anomaly.
+    #[test]
+    fn macho_entry_parity_metrics_clean_on_fixture() {
+        let bytes = read_fixture("test.macho");
+        let (_v, _, m) = run(&bytes);
+        assert_eq!(m.get("macho.executable_segment_count"), Some(1.0));
+        assert!(m.get("macho.entry_in_nonstandard_section").is_none());
     }
 }

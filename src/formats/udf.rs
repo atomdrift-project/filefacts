@@ -290,7 +290,9 @@ fn dstring(raw: Option<&[u8]>) -> Option<String> {
     let text = match raw.first() {
         Some(16) => {
             let units: Vec<u16> = body
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_be_bytes([c[0], c[1]]))
                 .collect();
             String::from_utf16_lossy(&units)
@@ -590,7 +592,9 @@ fn decode_d_characters(raw: &[u8]) -> String {
             let units: Vec<u16> = raw
                 .get(1..)
                 .unwrap_or_default()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_be_bytes([c[0], c[1]]))
                 .collect();
             String::from_utf16_lossy(&units)

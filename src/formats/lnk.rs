@@ -547,7 +547,9 @@ fn read_stringdata(bytes: &[u8], offset: usize, is_unicode: bool) -> Option<(Str
     // whitespace metrics are specifically designed to catch.
     let decoded = if is_unicode {
         let words: Vec<u16> = body
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         String::from_utf16_lossy(&words)
@@ -562,7 +564,7 @@ fn read_stringdata(bytes: &[u8], offset: usize, is_unicode: bool) -> Option<(Str
 fn read_utf16le_string(bytes: &[u8], offset: usize, len: usize) -> Option<String> {
     let slice = bytes.get(offset..offset + len)?;
     let mut words = Vec::new();
-    for c in slice.chunks_exact(2) {
+    for c in slice.as_chunks::<2>().0 {
         let w = u16::from_le_bytes([c[0], c[1]]);
         if w == 0 {
             break;
