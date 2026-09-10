@@ -87,6 +87,9 @@ pub(super) fn extract(
     table_counts(&elf, metrics);
     relocation_kinds(&elf, values);
     segments(&elf, values);
+    section_headers(&elf, values);
+    note_segment_coverage(&elf, bytes, metrics);
+    section_file_anomalies(&elf, bytes, metrics);
     rizin_fallback(
         NativeFormat::Elf,
         bytes,
@@ -734,7 +737,9 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
     let mut has_gnu_stack = false;
     let mut nx_enabled = true; // default: no executable stack signal
     let mut wx_segment_count: u64 = 0;
+    let mut executable_segment_count: u64 = 0;
     let mut entry_in_writable_segment = false;
+    let mut entry_in_exec_segment = false;
     let mut entry_in_any_segment = false;
     let mut interp_count: u64 = 0;
     let mut min_load_offset: Option<u64> = None;
@@ -752,6 +757,9 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
             if writable && executable {
                 wx_segment_count += 1;
             }
+            if executable {
+                executable_segment_count += 1;
+            }
             let span = ph.p_memsz.max(ph.p_filesz);
             let end = ph.p_vaddr.saturating_add(span);
             load_ranges.push((ph.p_vaddr, end, idx));
@@ -759,6 +767,9 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
                 entry_in_any_segment = true;
                 if writable {
                     entry_in_writable_segment = true;
+                }
+                if executable {
+                    entry_in_exec_segment = true;
                 }
                 entry_load_idx = Some(idx);
             }
@@ -797,11 +808,26 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
         f64::from(u8::from(!nx_enabled)),
     );
     metrics.insert(metric!("elf.wx_segment_count"), wx_segment_count as f64);
+    // Executable PT_LOAD segments. Modern toolchains emit exactly one
+    // (with `-z separate-code`); a second is the note-cavity / appended
+    // parasite tell — a grafted R+X segment beside the real text — and it
+    // fires even for an EPO infector that leaves the entry in `.text`.
+    metrics.insert(
+        metric!("elf.executable_segment_count"),
+        executable_segment_count as f64,
+    );
     if entry_in_writable_segment {
         metrics.insert(metric!("elf.entry_in_writable_segment"), 1.0);
     }
     if entry != 0 && !entry_in_any_segment {
         metrics.insert(metric!("elf.entry_outside_segments"), 1.0);
+    }
+    // Entry landing in a loadable segment that is not executable — an
+    // entry redirected into data. The loader would fault on a normal
+    // system, so no honest toolchain emits it; EPO/patch infectors that
+    // point the entry at a writable data blob do.
+    if entry != 0 && entry_in_any_segment && !entry_in_exec_segment {
+        metrics.insert(metric!("elf.entry_in_non_executable_segment"), 1.0);
     }
     if interp_count > 1 {
         metrics.insert(metric!("elf.multiple_pt_interp"), 1.0);
@@ -861,6 +887,30 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
     // Section header count mismatch — `e_shnum` vs walked sections.
     if usize::from(elf.header.e_shnum) != elf.section_headers.len() {
         metrics.insert(metric!("elf.section_header_count_mismatch"), 1.0);
+    }
+    // Program header count mismatch — `e_phnum` vs walked segments. The
+    // symmetric partner of the section check above; a header table that
+    // claims more entries than parse is corruption or table tampering.
+    if usize::from(elf.header.e_phnum) != elf.program_headers.len() {
+        metrics.insert(metric!("elf.program_header_count_mismatch"), 1.0);
+    }
+    // Section-name string table index past the section table. A loader
+    // reading section names would walk off the end; benign toolchains
+    // never emit this. `e_shstrndx == 0` with sections present is the
+    // "no names" convention, not an error, so only flag out-of-range.
+    if elf.header.e_shnum > 0 && elf.header.e_shstrndx >= elf.header.e_shnum {
+        metrics.insert(metric!("elf.shstrndx_out_of_range"), 1.0);
+    }
+    // e_ident padding (`EI_PAD`, bytes 9..16) is zero in every toolchain
+    // output; a non-zero byte there is a hidden-data / tamper channel.
+    // Surface both the flag and the bytes so a change diffs.
+    if elf.header.e_ident[9..16].iter().any(|&b| b != 0) {
+        metrics.insert(metric!("elf.ident_pad_nonzero"), 1.0);
+        put_str(
+            values,
+            "elf.ident_pad",
+            hex_encode(&elf.header.e_ident[9..16]),
+        );
     }
     // ET_REL (relocatable object) files legitimately omit PT_GNU_STACK
     // because they have no program headers; only flag absence for
@@ -1003,7 +1053,23 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
     metrics.insert(metric!("elf.note_count"), note_count as f64);
 
     if let Some(name) = entry_section {
+        // Entry points land in a code section — `.text`, occasionally
+        // `.init`/`.plt`. An entry resolving into a section outside the
+        // toolchain allowlist (`.attack`, a random appended name) is the
+        // entry-redirection tell shared by note-cavity, EPO, and appending
+        // infectors. Reuses the single well-known-section source of truth.
+        if !crate::is_well_known_section_name(&name) {
+            metrics.insert(metric!("elf.entry_in_nonstandard_section"), 1.0);
+        }
         put_str(values, "elf.entry_section", &name);
+    } else if entry != 0 && entry_in_any_segment && elf.section_headers.len() > 1 {
+        // The entry lands inside a loadable segment but no section covers
+        // it, even though a real section table is present. That is the
+        // note-cavity / appender infection against a target whose section
+        // headers survive: the injector grafts the executable segment and
+        // redirects the entry but omits a covering section (its `skip_shdr`
+        // path), so `entry_in_nonstandard_section` never fires. Flag it.
+        metrics.insert(metric!("elf.entry_outside_sections"), 1.0);
     }
 }
 
@@ -1305,9 +1371,11 @@ fn segments(elf: &Elf<'_>, values: &mut Values) {
                 JsonValue::String(phdr_type_name(ph.p_type).to_string()),
             );
             entry.insert("vaddr".into(), JsonValue::Number(ph.p_vaddr.into()));
+            entry.insert("paddr".into(), JsonValue::Number(ph.p_paddr.into()));
             entry.insert("file_offset".into(), JsonValue::Number(ph.p_offset.into()));
             entry.insert("file_size".into(), JsonValue::Number(ph.p_filesz.into()));
             entry.insert("memory_size".into(), JsonValue::Number(ph.p_memsz.into()));
+            entry.insert("align".into(), JsonValue::Number(ph.p_align.into()));
             // PF_R = 4, PF_W = 2, PF_X = 1. Emit a `rwx`-style string
             // matching how readelf prints segment flags.
             let r = ph.p_flags & 0x4 != 0;
@@ -1329,6 +1397,97 @@ fn segments(elf: &Elf<'_>, values: &mut Values) {
         .collect();
     if !segs.is_empty() {
         values.insert("elf.segments", JsonValue::Array(segs));
+    }
+}
+
+/// Emit `elf.sections[]` — one entry per section header, carrying every
+/// `Elf64_Shdr` field. The cross-format `Sections` list (name/addr/
+/// offset/size/flags/entropy) drives the `sections.*` metrics, but it
+/// cannot carry ELF-only fields (`sh_type`, `sh_link`, `sh_info`,
+/// `sh_addralign`, `sh_entsize`, the `sh_name` string-table index). This
+/// array does, so a grafted section header, a relocated string table, or
+/// any single field the section-header table changes is diff-visible.
+/// Names use the same `MAX_SECTION_NAME` cut as `sections()` because the
+/// string table is attacker-controlled and a `sh_name` can point at a
+/// run with no NUL.
+fn section_headers(elf: &Elf<'_>, values: &mut Values) {
+    let secs: Vec<JsonValue> = elf
+        .section_headers
+        .iter()
+        .map(|sh| {
+            let full = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
+            let name = match full.char_indices().nth(MAX_SECTION_NAME) {
+                Some((end, _)) => &full[..end],
+                None => full,
+            };
+            let mut entry = serde_json::Map::new();
+            entry.insert("name".into(), JsonValue::String(name.to_string()));
+            entry.insert("name_offset".into(), JsonValue::Number(sh.sh_name.into()));
+            entry.insert(
+                "type".into(),
+                JsonValue::String(shdr_type_name(sh.sh_type).to_string()),
+            );
+            entry.insert("type_raw".into(), JsonValue::Number(sh.sh_type.into()));
+            entry.insert(
+                "flags".into(),
+                JsonValue::Array(
+                    section_flags(sh.sh_flags)
+                        .into_iter()
+                        .map(|s| JsonValue::String(s.to_string()))
+                        .collect(),
+                ),
+            );
+            entry.insert(
+                "flags_hex".into(),
+                JsonValue::String(format!("{:x}", sh.sh_flags)),
+            );
+            entry.insert("addr".into(), JsonValue::Number(sh.sh_addr.into()));
+            entry.insert("file_offset".into(), JsonValue::Number(sh.sh_offset.into()));
+            entry.insert("size".into(), JsonValue::Number(sh.sh_size.into()));
+            entry.insert("link".into(), JsonValue::Number(sh.sh_link.into()));
+            entry.insert("info".into(), JsonValue::Number(sh.sh_info.into()));
+            entry.insert(
+                "addralign".into(),
+                JsonValue::Number(sh.sh_addralign.into()),
+            );
+            entry.insert("entsize".into(), JsonValue::Number(sh.sh_entsize.into()));
+            JsonValue::Object(entry)
+        })
+        .collect();
+    if !secs.is_empty() {
+        values.insert("elf.sections", JsonValue::Array(secs));
+    }
+}
+
+/// Section-header type (`sh_type`) to conventional name. Unknown values
+/// resolve to `"other"`; the raw number rides alongside in `type_raw`.
+fn shdr_type_name(sh_type: u32) -> &'static str {
+    use goblin::elf::section_header as sh;
+    match sh_type {
+        sh::SHT_NULL => "null",
+        sh::SHT_PROGBITS => "progbits",
+        sh::SHT_SYMTAB => "symtab",
+        sh::SHT_STRTAB => "strtab",
+        sh::SHT_RELA => "rela",
+        sh::SHT_HASH => "hash",
+        sh::SHT_DYNAMIC => "dynamic",
+        sh::SHT_NOTE => "note",
+        sh::SHT_NOBITS => "nobits",
+        sh::SHT_REL => "rel",
+        sh::SHT_SHLIB => "shlib",
+        sh::SHT_DYNSYM => "dynsym",
+        sh::SHT_INIT_ARRAY => "init_array",
+        sh::SHT_FINI_ARRAY => "fini_array",
+        sh::SHT_PREINIT_ARRAY => "preinit_array",
+        sh::SHT_GROUP => "group",
+        sh::SHT_SYMTAB_SHNDX => "symtab_shndx",
+        sh::SHT_GNU_ATTRIBUTES => "gnu_attributes",
+        sh::SHT_GNU_HASH => "gnu_hash",
+        sh::SHT_GNU_LIBLIST => "gnu_liblist",
+        sh::SHT_GNU_VERDEF => "gnu_verdef",
+        sh::SHT_GNU_VERNEED => "gnu_verneed",
+        sh::SHT_GNU_VERSYM => "gnu_versym",
+        _ => "other",
     }
 }
 
@@ -1503,7 +1662,59 @@ fn elf_header(elf: &Elf<'_>, values: &mut Values) {
     put_str(values, "elf.type", elf_type_string(elf.header.e_type));
     put_u64(values, "elf.entry", elf.header.e_entry);
     put_u64(values, "elf.version", u64::from(elf.header.e_version));
+    // e_ident residue beyond class/endian: OS/ABI, its version, and the
+    // EI_VERSION byte. A patched loader or a forged toolchain provenance
+    // shows here, and `elf.ident_version` disagreeing with `elf.version`
+    // is itself an anomaly.
+    put_str(values, "elf.osabi", osabi_string(elf.header.e_ident[7]));
+    put_u64(values, "elf.abi_version", u64::from(elf.header.e_ident[8]));
+    put_u64(
+        values,
+        "elf.ident_version",
+        u64::from(elf.header.e_ident[6]),
+    );
+    // Table offsets and entity sizes. `e_shoff` is the section-header
+    // table's file offset: appending infectors relocate it to EOF after
+    // grafting a section, so a moved `elf.shoff` is a direct infection
+    // tell that was previously invisible. `e_phoff`, the per-entry sizes,
+    // the header size, and `e_shstrndx` complete the ELF header so no
+    // header field can change without a diff noticing.
+    put_u64(values, "elf.phoff", elf.header.e_phoff);
+    put_u64(values, "elf.shoff", elf.header.e_shoff);
+    put_u64(values, "elf.shstrndx", u64::from(elf.header.e_shstrndx));
+    put_u64(values, "elf.ehsize", u64::from(elf.header.e_ehsize));
+    put_u64(values, "elf.phentsize", u64::from(elf.header.e_phentsize));
+    put_u64(values, "elf.shentsize", u64::from(elf.header.e_shentsize));
     e_flags(elf, values);
+}
+
+/// Decode the `EI_OSABI` byte (`e_ident[7]`) to the conventional name.
+/// Unknown values fall back to `osabi:<n>` so the raw value still diffs.
+fn osabi_string(osabi: u8) -> String {
+    let name = match osabi {
+        0 => "sysv",
+        1 => "hpux",
+        2 => "netbsd",
+        3 => "linux",
+        4 => "gnu_hurd",
+        6 => "solaris",
+        7 => "aix",
+        8 => "irix",
+        9 => "freebsd",
+        10 => "tru64",
+        11 => "modesto",
+        12 => "openbsd",
+        13 => "openvms",
+        14 => "nsk",
+        15 => "aros",
+        16 => "fenixos",
+        17 => "cloudabi",
+        64 => "arm_aeabi",
+        97 => "arm",
+        255 => "standalone",
+        _ => return format!("osabi:{osabi}"),
+    };
+    name.to_string()
 }
 
 /// Per-architecture decode of `e_flags`. x86 / x86_64 / aarch64
@@ -1966,19 +2177,157 @@ fn emit_symbol_kind_histograms(
 
 fn build_id(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     // GNU build-id lives in a SHT_NOTE section named `.note.gnu.build-id`
-    // (or `.gnu.build.attributes` in newer binutils). Walk note sections
-    // and find the one with `n_type == NT_GNU_BUILD_ID (3)` and owner
-    // `GNU`.
-    let Some(notes) = elf.iter_note_headers(bytes) else {
+    // (or `.gnu.build.attributes` in newer binutils), with a matching
+    // PT_NOTE program header. Read it from the *section table* first: a
+    // note-cavity infector flips that PT_NOTE program header to PT_LOAD
+    // but leaves the section — and the ID — byte-identical, so a
+    // segment-only walk (`iter_note_headers`) wrongly reports the ID as
+    // gone and destroys the "identity retained, execution redirected"
+    // evidence. Sections survive the repurposing; fall back to segments
+    // only for stripped binaries that carry no section headers.
+    let desc = gnu_build_id_desc(elf.iter_note_sections(bytes, None))
+        .or_else(|| gnu_build_id_desc(elf.iter_note_headers(bytes)));
+    if let Some(desc) = desc {
+        put_str(values, "elf.build_id", hex_encode(desc));
+        metrics.insert(metric!("elf.has_build_id"), 1.0);
+        metrics.insert(metric!("elf.build_id_length"), desc.len() as f64);
+    }
+}
+
+/// First GNU build-id (`n_type == NT_GNU_BUILD_ID`, owner `GNU`) in a
+/// note iterator, or `None`.
+fn gnu_build_id_desc(notes: Option<goblin::elf::note::NoteIterator<'_>>) -> Option<&[u8]> {
+    notes?
+        .flatten()
+        .find(|note| note.name == "GNU" && note.n_type == 3)
+        .map(|note| note.desc)
+}
+
+/// Flag `SHT_NOTE` sections whose bytes are not covered by any note
+/// program header (`PT_NOTE` or `PT_GNU_PROPERTY`). Linkers emit every
+/// note with a matching program header, so an uncovered note section is
+/// the note-cavity tell: an infector flipped the note's program header
+/// to an executable `PT_LOAD` and left the note — its GNU build-id
+/// included — intact in the section table. This is the positive
+/// "identity retained, execution redirected" signal that pairs with the
+/// entry / segment changes.
+///
+/// Two metrics: `elf.uncovered_note_count` counts every orphaned
+/// note section; `elf.build_id_uncovered` fires when the
+/// orphaned note is specifically the GNU build-id — the identity
+/// fingerprint present on disk yet invisible to the kernel / coredump /
+/// debuginfod path that reads it through the program headers. Only
+/// meaningful when the file has program headers (ET_EXEC / ET_DYN);
+/// relocatable objects legitimately have none.
+fn note_segment_coverage(elf: &Elf<'_>, bytes: &[u8], metrics: &mut Metrics) {
+    use goblin::elf::program_header::{PT_GNU_PROPERTY, PT_NOTE};
+    use goblin::elf::section_header::SHT_NOTE;
+    if elf.program_headers.is_empty() {
         return;
-    };
-    for note in notes.flatten() {
-        if note.name == "GNU" && note.n_type == 3 {
-            put_str(values, "elf.build_id", hex_encode(note.desc));
-            metrics.insert(metric!("elf.has_build_id"), 1.0);
-            metrics.insert(metric!("elf.build_id_length"), note.desc.len() as f64);
-            return;
+    }
+    let note_ranges: Vec<(u64, u64)> = elf
+        .program_headers
+        .iter()
+        .filter(|ph| ph.p_type == PT_NOTE || ph.p_type == PT_GNU_PROPERTY)
+        .map(|ph| (ph.p_offset, ph.p_offset.saturating_add(ph.p_filesz)))
+        .collect();
+    // SHF_ALLOC = 0x2. Only *loaded* notes are expected to have a note
+    // program header — the loader reads them from memory. Non-allocated
+    // notes (`.note.stapsdt` SystemTap probes, `.note.gnu.gold-version`,
+    // packaging notes) legitimately have no PT_NOTE, so gating on
+    // SHF_ALLOC keeps a benign static binary from tripping this.
+    const SHF_ALLOC: u64 = 0x2;
+    let mut uncovered = 0u64;
+    let mut build_id_orphaned = false;
+    for sh in &elf.section_headers {
+        if sh.sh_type != SHT_NOTE || sh.sh_size == 0 || sh.sh_flags & SHF_ALLOC == 0 {
+            continue;
         }
+        let start = sh.sh_offset;
+        let end = sh.sh_offset.saturating_add(sh.sh_size);
+        if note_ranges.iter().any(|(s, e)| start >= *s && end <= *e) {
+            continue;
+        }
+        uncovered += 1;
+        // Is the orphaned note the GNU build-id? Read it back through its
+        // own section name so the check is independent of ordering.
+        let name = elf.shdr_strtab.get_at(sh.sh_name);
+        if gnu_build_id_desc(elf.iter_note_sections(bytes, name)).is_some() {
+            build_id_orphaned = true;
+        }
+    }
+    if uncovered > 0 {
+        metrics.insert(metric!("elf.uncovered_note_count"), uncovered as f64);
+    }
+    if build_id_orphaned {
+        metrics.insert(metric!("elf.build_id_uncovered"), 1.0);
+    }
+}
+
+/// File-layout anomalies over the section table, keyed by file offset:
+/// sections whose bytes run past EOF, `SHF_ALLOC` sections mapped by no
+/// `PT_LOAD`, and mutually overlapping section ranges. Toolchains lay
+/// sections out as disjoint, in-bounds slices, each allocatable one
+/// inside a load segment; carving, appending, and packing break those
+/// invariants. NOBITS sections (`.bss`, `.tbss`) own no file bytes and
+/// are skipped.
+fn section_file_anomalies(elf: &Elf<'_>, bytes: &[u8], metrics: &mut Metrics) {
+    use goblin::elf::program_header::PT_LOAD;
+    const SHT_NOBITS: u32 = 8;
+    const SHF_ALLOC: u64 = 0x2;
+    let file_len = bytes.len() as u64;
+
+    let load_ranges: Vec<(u64, u64)> = elf
+        .program_headers
+        .iter()
+        .filter(|ph| ph.p_type == PT_LOAD)
+        .map(|ph| (ph.p_offset, ph.p_offset.saturating_add(ph.p_filesz)))
+        .collect();
+
+    let mut past_eof = 0u64;
+    let mut uncovered_alloc = 0u64;
+    let mut ranges: Vec<(u64, u64, usize)> = Vec::new();
+    for (idx, sh) in elf.section_headers.iter().enumerate() {
+        if sh.sh_type == SHT_NOBITS || sh.sh_size == 0 {
+            continue;
+        }
+        let start = sh.sh_offset;
+        let end = sh.sh_offset.saturating_add(sh.sh_size);
+        if end > file_len {
+            past_eof += 1;
+        }
+        if sh.sh_flags & SHF_ALLOC != 0
+            && !load_ranges.is_empty()
+            && !load_ranges.iter().any(|(s, e)| start >= *s && end <= *e)
+        {
+            uncovered_alloc += 1;
+        }
+        ranges.push((start, end, idx));
+    }
+
+    // Overlap: sort by start; a section whose end runs past the next
+    // section's start intersects it. Count distinct sections involved,
+    // mirroring `elf.segment_overlap_count`.
+    ranges.sort_unstable();
+    let mut overlap: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for w in ranges.windows(2) {
+        if w[0].1 > w[1].0 {
+            overlap.insert(w[0].2);
+            overlap.insert(w[1].2);
+        }
+    }
+
+    if past_eof > 0 {
+        metrics.insert(metric!("elf.section_past_eof_count"), past_eof as f64);
+    }
+    if uncovered_alloc > 0 {
+        metrics.insert(
+            metric!("elf.uncovered_alloc_section_count"),
+            uncovered_alloc as f64,
+        );
+    }
+    if !overlap.is_empty() {
+        metrics.insert(metric!("elf.section_overlap_count"), overlap.len() as f64);
     }
 }
 
@@ -2406,5 +2755,269 @@ mod tests {
         assert!(first.contains_key("flags_hex"));
         assert!(first.contains_key("perms"));
         assert!(first.contains_key("type"));
+        // Completeness: every program-header field is carried, including
+        // the previously-missing paddr/align.
+        for key in [
+            "vaddr",
+            "paddr",
+            "file_offset",
+            "file_size",
+            "memory_size",
+            "align",
+        ] {
+            assert!(first.contains_key(key), "segment missing {key}");
+        }
+
+        // The full ELF header is surfaced — table offsets and entity
+        // sizes included — so no header field can change unnoticed.
+        for key in [
+            "elf.phoff",
+            "elf.shoff",
+            "elf.shstrndx",
+            "elf.ehsize",
+            "elf.phentsize",
+            "elf.shentsize",
+            "elf.osabi",
+            "elf.abi_version",
+            "elf.ident_version",
+        ] {
+            assert!(v.get(key).is_some(), "header fact missing {key}");
+        }
+
+        // elf.sections[] carries every Elf64_Shdr field, including the
+        // ELF-only fields the cross-format Section list cannot hold.
+        let section_headers = v.get("elf.sections").and_then(|j| j.as_array()).unwrap();
+        assert!(!section_headers.is_empty());
+        let first_header = section_headers.first().unwrap().as_object().unwrap();
+        for key in [
+            "name",
+            "name_offset",
+            "type",
+            "type_raw",
+            "flags",
+            "flags_hex",
+            "addr",
+            "file_offset",
+            "size",
+            "link",
+            "info",
+            "addralign",
+            "entsize",
+        ] {
+            assert!(
+                first_header.contains_key(key),
+                "section header missing {key}"
+            );
+        }
+
+        // Executable PT_LOAD segments are counted for the grafted-segment
+        // (note-cavity) tell.
+        assert!(m.get("elf.executable_segment_count").unwrap() >= 1.0);
+    }
+
+    #[test]
+    fn osabi_string_decodes_known_and_falls_back() {
+        assert_eq!(osabi_string(0), "sysv");
+        assert_eq!(osabi_string(3), "linux");
+        assert_eq!(osabi_string(9), "freebsd");
+        // Unknown values keep the raw byte so a change still diffs.
+        assert_eq!(osabi_string(200), "osabi:200");
+    }
+
+    #[test]
+    fn shdr_type_name_covers_common_and_falls_back() {
+        assert_eq!(shdr_type_name(1), "progbits"); // SHT_PROGBITS
+        assert_eq!(shdr_type_name(7), "note"); // SHT_NOTE
+        assert_eq!(shdr_type_name(8), "nobits"); // SHT_NOBITS
+        // 0x4242 is unassigned (above the base SHT_* set, below SHT_LOOS).
+        assert_eq!(shdr_type_name(0x4242), "other");
+    }
+
+    /// Build a minimal, goblin-parseable ELF64 exercising the note-cavity
+    /// signals. `infected` selects the post-infection shape: the build-id
+    /// note's PT_NOTE program header is replaced by a second executable
+    /// PT_LOAD (the grafted `.attack` segment) and the entry is redirected
+    /// into `.attack`. The clean shape keeps a PT_NOTE over the build-id
+    /// note and the entry in `.text`. Virtual addresses equal file offsets
+    /// to keep the layout easy to reason about.
+    fn note_cavity_elf(infected: bool) -> Vec<u8> {
+        const EH: usize = 64;
+        const PH: usize = 56;
+        const SH: usize = 64;
+        const PHOFF: u64 = 64;
+        const TEXT_OFF: u64 = 0x200;
+        const NOTE_OFF: u64 = 0x300;
+        const ATTACK_OFF: u64 = 0x400;
+        const SHSTR_OFF: u64 = 0x500;
+        const SHT_OFF: u64 = 0x600;
+
+        fn w16(b: &mut [u8], off: usize, v: u16) {
+            b[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        }
+        fn w32(b: &mut [u8], off: usize, v: u32) {
+            b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        fn w64(b: &mut [u8], off: usize, v: u64) {
+            b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        fn put_ph(b: &mut [u8], base: usize, ty: u32, flags: u32, off: u64, va: u64, size: u64) {
+            w32(b, base, ty);
+            w32(b, base + 4, flags);
+            w64(b, base + 8, off);
+            w64(b, base + 16, va);
+            w64(b, base + 24, va); // p_paddr
+            w64(b, base + 32, size); // p_filesz
+            w64(b, base + 40, size); // p_memsz
+            w64(b, base + 48, 0x1000); // p_align
+        }
+        fn put_sh(b: &mut [u8], base: usize, name: u32, ty: u32, flags: u64, addr: u64, size: u64) {
+            w32(b, base, name);
+            w32(b, base + 4, ty);
+            w64(b, base + 8, flags);
+            w64(b, base + 16, addr);
+            w64(b, base + 24, addr); // sh_offset == addr in this layout
+            w64(b, base + 32, size);
+            w64(b, base + 48, 4); // sh_addralign
+        }
+
+        // Section-name string table.
+        let mut shstr = vec![0u8];
+        let text_name = shstr.len() as u32;
+        shstr.extend_from_slice(b".text\0");
+        let note_name = shstr.len() as u32;
+        shstr.extend_from_slice(b".note.gnu.build-id\0");
+        let attack_name = shstr.len() as u32;
+        shstr.extend_from_slice(b".attack\0");
+        let shstrtab_name = shstr.len() as u32;
+        shstr.extend_from_slice(b".shstrtab\0");
+
+        let mut buf = vec![0u8; 0x800];
+
+        // ELF header.
+        buf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        buf[4] = 2; // ELFCLASS64
+        buf[5] = 1; // ELFDATA2LSB
+        buf[6] = 1; // EV_CURRENT
+        w16(&mut buf, 16, 2); // e_type = ET_EXEC
+        w16(&mut buf, 18, 62); // e_machine = EM_X86_64
+        w32(&mut buf, 20, 1); // e_version
+        let entry = if infected { ATTACK_OFF } else { TEXT_OFF };
+        w64(&mut buf, 24, entry); // e_entry
+        w64(&mut buf, 32, PHOFF); // e_phoff
+        w64(&mut buf, 40, SHT_OFF); // e_shoff
+        w16(&mut buf, 52, EH as u16); // e_ehsize
+        w16(&mut buf, 54, PH as u16); // e_phentsize
+        w16(&mut buf, 56, 2); // e_phnum
+        w16(&mut buf, 58, SH as u16); // e_shentsize
+        w16(&mut buf, 60, 5); // e_shnum
+        w16(&mut buf, 62, 4); // e_shstrndx (.shstrtab)
+
+        // Program headers. PT_LOAD=1, PT_NOTE=4; PF_X=1, PF_R=4.
+        put_ph(&mut buf, PHOFF as usize, 1, 4 | 1, 0, 0, 0x210); // r-x LOAD over header+.text
+        if infected {
+            // Grafted r-x LOAD over .attack — highest vaddr, so last.
+            put_ph(
+                &mut buf,
+                PHOFF as usize + PH,
+                1,
+                4 | 1,
+                ATTACK_OFF,
+                ATTACK_OFF,
+                0x10,
+            );
+        } else {
+            // PT_NOTE covering the build-id note.
+            put_ph(
+                &mut buf,
+                PHOFF as usize + PH,
+                4,
+                4,
+                NOTE_OFF,
+                NOTE_OFF,
+                0x20,
+            );
+        }
+
+        // .text / .attack dummy code (nop; nop; nop; ret).
+        buf[TEXT_OFF as usize..TEXT_OFF as usize + 4].copy_from_slice(&[0x90, 0x90, 0x90, 0xc3]);
+        buf[ATTACK_OFF as usize..ATTACK_OFF as usize + 4]
+            .copy_from_slice(&[0x90, 0x90, 0x90, 0xc3]);
+
+        // GNU build-id note: namesz=4, descsz=16, type=NT_GNU_BUILD_ID(3),
+        // name "GNU\0", 16-byte descriptor.
+        let n = NOTE_OFF as usize;
+        w32(&mut buf, n, 4);
+        w32(&mut buf, n + 4, 16);
+        w32(&mut buf, n + 8, 3);
+        buf[n + 12..n + 16].copy_from_slice(b"GNU\0");
+        for b in buf.iter_mut().skip(n + 16).take(16) {
+            *b = 0xAB;
+        }
+
+        buf[SHSTR_OFF as usize..SHSTR_OFF as usize + shstr.len()].copy_from_slice(&shstr);
+
+        // Section headers. SHT_PROGBITS=1, SHT_NOTE=7, SHT_STRTAB=3;
+        // SHF_ALLOC=2, SHF_EXECINSTR=4.
+        let base = SHT_OFF as usize;
+        put_sh(&mut buf, base + SH, text_name, 1, 2 | 4, TEXT_OFF, 0x10);
+        put_sh(&mut buf, base + 2 * SH, note_name, 7, 2, NOTE_OFF, 0x20);
+        put_sh(
+            &mut buf,
+            base + 3 * SH,
+            attack_name,
+            1,
+            2 | 4,
+            ATTACK_OFF,
+            0x10,
+        );
+        // .shstrtab: not allocated, sh_offset is its file position.
+        let sb = base + 4 * SH;
+        w32(&mut buf, sb, shstrtab_name);
+        w32(&mut buf, sb + 4, 3);
+        w64(&mut buf, sb + 24, SHSTR_OFF);
+        w64(&mut buf, sb + 32, shstr.len() as u64);
+        w64(&mut buf, sb + 48, 1);
+
+        buf
+    }
+
+    #[test]
+    fn note_cavity_infected_trips_all_signals_and_retains_build_id() {
+        let (v, _, m) = run(&note_cavity_elf(true));
+        assert_eq!(m.get("elf.executable_segment_count"), Some(2.0));
+        assert_eq!(m.get("elf.entry_in_nonstandard_section"), Some(1.0));
+        assert_eq!(m.get("elf.entry_in_last_segment"), Some(1.0));
+        assert_eq!(m.get("elf.uncovered_note_count"), Some(1.0));
+        assert_eq!(m.get("elf.build_id_uncovered"), Some(1.0));
+        // Identity retained: read from the section table even though no
+        // PT_NOTE covers the build-id note any more.
+        assert!(v.get("elf.build_id").is_some());
+        assert_eq!(m.get("elf.has_build_id"), Some(1.0));
+    }
+
+    #[test]
+    fn note_cavity_clean_trips_no_infection_signals() {
+        let (v, _, m) = run(&note_cavity_elf(false));
+        assert_eq!(m.get("elf.executable_segment_count"), Some(1.0));
+        assert!(m.get("elf.entry_in_nonstandard_section").is_none());
+        assert!(m.get("elf.uncovered_note_count").is_none());
+        assert!(m.get("elf.build_id_uncovered").is_none());
+        // Build-id still read, here from the PT_NOTE-covered note section.
+        assert!(v.get("elf.build_id").is_some());
+    }
+
+    #[test]
+    fn header_and_layout_anomalies_fire_on_patched_bytes() {
+        let mut b = note_cavity_elf(false);
+        // Non-zero EI_PAD byte (e_ident[10]) — a hidden-data channel.
+        b[10] = 0x41;
+        // Blow up `.text` (section index 1) so its bytes run past EOF:
+        // sh_size lives at SHT_OFF(0x600) + 1*SH(64) + 32.
+        let sh_size_off = 0x600 + 64 + 32;
+        b[sh_size_off..sh_size_off + 8].copy_from_slice(&0x0010_0000u64.to_le_bytes());
+        let (v, _, m) = run(&b);
+        assert_eq!(m.get("elf.ident_pad_nonzero"), Some(1.0));
+        assert!(v.get("elf.ident_pad").is_some());
+        assert!(m.get("elf.section_past_eof_count").is_some());
     }
 }
