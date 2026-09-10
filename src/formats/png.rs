@@ -160,13 +160,13 @@ pub(super) fn extract(
             _ => {}
         }
 
-        // Text chunks legitimately hold author strings, so they are claimed
+        // Text/provenance chunks legitimately hold author metadata, so they are claimed
         // but still searched for payload signatures. A chunk type outside the
         // PNG/APNG standard set is deliberately *not* claimed: it is not part
         // of the format's defined structure, so leaving it unclaimed makes it
         // read as concealed space — which is what a `pWnZ` chunk holding an
         // executable actually is. Every decoder skips it either way.
-        if matches!(ctype, "tEXt" | "zTXt" | "iTXt" | "eXIf") {
+        if matches!(ctype, "tEXt" | "zTXt" | "iTXt" | "eXIf" | "caBX") {
             coverage.claim_freeform(i as u64, chunk_end as u64);
         } else if is_standard_chunk(ctype) {
             coverage.claim(i as u64, chunk_end as u64);
@@ -358,6 +358,10 @@ fn is_standard_chunk(t: &str) -> bool {
             | "cICP"
             | "mDCv"
             | "cLLi"
+            // C2PA Content Credentials, appendix A.2.2: a PNG manifest
+            // store lives in caBX. Recognizing its carrier does not verify
+            // the manifest or trust its claims; scan it as freeform above.
+            | "caBX"
     )
 }
 
@@ -494,6 +498,56 @@ mod tests {
             v.get("png.icc_profile_name").and_then(|x| x.as_str()),
             Some("sRGB")
         );
+    }
+
+    #[test]
+    fn c2pa_chunk_is_claimed_metadata_not_an_interior_hole() {
+        let mut manifest = b"\0\0\0\x14jumbc2pa metadata".to_vec();
+        manifest.resize(4096, b' ');
+        let png = build_png(&[(b"caBX", &manifest), (b"IEND", &[])]);
+        let (v, m) = run(&png);
+        assert_eq!(m.get("png.unknown_chunk_count"), Some(0.0));
+        assert!(v.get("png.unknown_chunks").is_none());
+        assert_eq!(m.get("media.gap_bytes"), Some(0.0));
+        assert_eq!(m.get("media.stowaway_bytes"), Some(0.0));
+        assert!(v.get("media.stowaway").is_none());
+        assert!(
+            v.get("png.chunks")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .contains(&json!("caBX"))
+        );
+    }
+
+    #[test]
+    fn c2pa_chunk_does_not_hide_an_embedded_executable() {
+        let mut payload = vec![0; 512];
+        payload[..2].copy_from_slice(b"MZ");
+        payload[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        payload[0x40..0x44].copy_from_slice(b"PE\0\0");
+        let png = build_png(&[(b"caBX", &payload), (b"IEND", &[])]);
+        let (v, m) = run(&png);
+        assert_eq!(m.get("media.gap_bytes"), Some(0.0));
+        assert!(
+            v.get("media.stowaway")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .contains(&json!("pe"))
+        );
+    }
+
+    #[test]
+    fn c2pa_chunk_does_not_claim_neighboring_unknown_chunks_or_trailers() {
+        let hidden = vec![b'X'; 1024];
+        let mut png = build_png(&[(b"caBX", b"provenance"), (b"sTeG", &hidden), (b"IEND", &[])]);
+        png.extend_from_slice(&hidden);
+        let (v, m) = run(&png);
+        assert_eq!(m.get("png.unknown_chunk_count"), Some(1.0));
+        assert_eq!(v.get("png.unknown_chunks"), Some(&json!(["sTeG"])));
+        assert!(m.get("media.gap_bytes").unwrap() >= 1024.0);
+        assert!(m.get("media.trailing_bytes").unwrap() >= 1000.0);
     }
 
     #[test]
