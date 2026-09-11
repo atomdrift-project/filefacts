@@ -83,6 +83,7 @@ enum View {
     Metrics,
     Sections,
     Symbols,
+    Flow,
     Identity,
     Imports,
     Exports,
@@ -245,6 +246,7 @@ fn write_json(parsed: &filefacts::ParsedFile<'_>, view: View) -> std::io::Result
         View::Metrics => serde_json::to_writer_pretty(&mut out, parsed.metrics())?,
         View::Sections => serde_json::to_writer_pretty(&mut out, parsed.sections())?,
         View::Symbols => serde_json::to_writer_pretty(&mut out, parsed.symbols())?,
+        View::Flow => serde_json::to_writer_pretty(&mut out, &parsed.flow())?,
         View::Identity => serde_json::to_writer_pretty(&mut out, parsed.identity())?,
         View::Imports => {
             serde_json::to_writer_pretty(&mut out, &symbols_of_kind(parsed, SymbolKind::Import))?
@@ -317,6 +319,7 @@ fn build_output(parsed: &filefacts::ParsedFile<'_>, view: View) -> Value {
         View::Metrics => serde_json::to_value(parsed.metrics()),
         View::Sections => serde_json::to_value(parsed.sections()),
         View::Symbols => serde_json::to_value(parsed.symbols()),
+        View::Flow => serde_json::to_value(parsed.flow()),
         View::Identity => serde_json::to_value(parsed.identity()),
         View::Imports => serde_json::to_value(symbols_of_kind(parsed, SymbolKind::Import)),
         View::Exports => serde_json::to_value(symbols_of_kind(parsed, SymbolKind::Export)),
@@ -360,6 +363,7 @@ fn parse_args() -> Result<ParseOutcome, String> {
             "--metrics" => set_view(&mut args.view, View::Metrics)?,
             "--sections" => set_view(&mut args.view, View::Sections)?,
             "--symbols" => set_view(&mut args.view, View::Symbols)?,
+            "--flow" => set_view(&mut args.view, View::Flow)?,
             "--identity" => set_view(&mut args.view, View::Identity)?,
             "--imports" => set_view(&mut args.view, View::Imports)?,
             "--exports" => set_view(&mut args.view, View::Exports)?,
@@ -410,6 +414,7 @@ fn parse_view(value: &str) -> Option<View> {
         "metrics" => View::Metrics,
         "sections" => View::Sections,
         "symbols" => View::Symbols,
+        "flow" => View::Flow,
         "identity" => View::Identity,
         "imports" => View::Imports,
         "exports" => View::Exports,
@@ -585,6 +590,7 @@ fn format_terminal(
                 View::Metrics => Box::new(render_metrics),
                 View::Sections => Box::new(|v| render_sections(v, None)),
                 View::Symbols => Box::new(render_symbols),
+                View::Flow => Box::new(render_values_tree),
                 View::Identity => Box::new(render_values_tree),
                 View::Imports => Box::new(render_imports),
                 View::Exports => Box::new(render_exports),
@@ -1602,6 +1608,7 @@ impl View {
             Self::Metrics => "metrics",
             Self::Sections => "sections",
             Self::Symbols => "symbols",
+            Self::Flow => "flow",
             Self::Identity => "identity",
             Self::Imports => "imports",
             Self::Exports => "exports",
@@ -1621,7 +1628,7 @@ usage: filefacts [options] [view] <path>
 
 views:
   fileid identity values text literals metrics sections symbols imports
-  exports functions calls members binds identifiers errors
+  exports functions calls members binds identifiers flow errors
 
 options:
   -f, --format <terminal|json>
@@ -1633,6 +1640,7 @@ options:
   --metrics          Emit only derived metrics.
   --sections         Emit only binary sections.
   --symbols          Emit the full Symbols view (all kinds).
+  --flow             Emit value relationships, or null when unavailable.
   --identity         Emit only the normalized identity claims.
   --imports          Emit only import symbols.
   --exports          Emit only export symbols.
@@ -1650,5 +1658,31 @@ options:
         eprint!("{msg}");
     } else {
         print!("{msg}");
+    }
+}
+
+#[cfg(test)]
+mod flow_tests {
+    use super::*;
+
+    #[test]
+    fn flow_is_a_format_neutral_view() {
+        assert_eq!(parse_view("flow"), Some(View::Flow));
+        assert_eq!(View::Flow.name(), "flow");
+        let parsed =
+            filefacts::open_with_path(Path::new("example.py"), b"send(acquire())\n").unwrap();
+        let value = build_output(&parsed, View::Flow);
+        assert_eq!(value["producer"], "tree-sitter");
+        assert_eq!(value["language"], "python");
+        assert!(value["values"].as_array().is_some());
+        assert_eq!(parsed.parse_count(), 1);
+    }
+
+    #[test]
+    fn unavailable_binary_flow_is_null_not_an_empty_graph() {
+        let bytes = include_bytes!("../../tests/fixtures/test.elf");
+        let parsed = filefacts::open_with_path(Path::new("example.elf"), bytes).unwrap();
+        assert!(parsed.flow().is_none());
+        assert!(build_output(&parsed, View::Flow).is_null());
     }
 }

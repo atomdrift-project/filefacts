@@ -65,6 +65,11 @@
 mod debug;
 mod error;
 mod formats;
+mod go_dependency_context;
+mod go_package_context;
+pub mod package_context;
+pub use go_dependency_context::{ReferenceMember, go_dependency_context};
+pub use go_package_context::go_source_context;
 mod output;
 mod registry;
 mod scan;
@@ -82,6 +87,19 @@ pub mod tools;
 pub mod rizin;
 
 pub use formats::source::decode_source_escapes;
+pub use formats::source::go_package_payload_flow;
+
+/// Additional reference metadata selected by filename, independently of the
+/// detected file type. Archive walkers must retain these even when detection
+/// calls them non-program data. Type-identified manifests need no exception.
+#[must_use]
+pub fn has_named_reference_metadata(path: &std::path::Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("go.work" | "go.work.sum" | "modules.txt")
+    )
+}
+
 /// VBA `<non-literal>` sentinel — the placeholder a VBA symbol's
 /// `target` field takes when the call was made through a variable
 /// or expression rather than a quoted literal. Re-exported flat from
@@ -90,6 +108,7 @@ pub use formats::source::decode_source_escapes;
 /// internal; VBA symbols flow out through the unified [`Symbols`]
 /// view like every other format.
 pub use formats::vba_symbols::NON_LITERAL_SENTINEL as VBA_NON_LITERAL_SENTINEL;
+pub use output::{Flow, FlowFunction, FlowOrigin, FlowOrigins, FlowTransfer, FlowValue};
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -180,6 +199,7 @@ pub struct ParsedFile<'a> {
     // `tree_cache()` and consumed by the single extraction pipeline
     // that fills `extracted`.
     tree_parse: OnceLock<Option<formats::source::TreeParse<'a>>>,
+    flow: OnceLock<Option<Flow>>,
     // Caller's cancellation flag, polled by long-running leaf work (currently
     // the tree-sitter parse). Borrowed rather than `Arc`-shared, and never
     // written here: filefacts only ever reads it.
@@ -393,6 +413,21 @@ impl<'a> ParsedFile<'a> {
         &self.extracted().symbols
     }
 
+    /// Lazily compute format-neutral value relationships.
+    /// No security policy or library model is assumed. Reading other views
+    /// does not pay for this graph, and repeated reads never parse again.
+    /// Returns `None` when flow extraction is unavailable, not an empty graph.
+    /// Currently only the source parser produces flow; binary flow recovery is
+    /// not implemented. The graph records its producer and known limitations.
+    pub fn flow(&self) -> Option<&Flow> {
+        self.flow
+            .get_or_init(|| {
+                let cache = self.tree_cache()?;
+                Some(formats::source::build_value_flow(cache, self.symbols()))
+            })
+            .as_ref()
+    }
+
     /// Normalized identity claims: who and what the artifact says it
     /// is, folded across formats into one shape and tagged
     /// claimed-vs-verified. Computed on first access and cached.
@@ -521,16 +556,20 @@ impl<'a> ParsedFile<'a> {
                 return self.run_pipeline();
             }
             // The disk cache is keyed by (content, filefacts build, detected
-            // type, rizin config). Type belongs in the key because detection
+            // type, basename, rizin config). Type belongs in the key because detection
             // may use the logical filename: identical gzip bytes named
             // `package.tgz` and `hash.sample` are npm and generic gzip inputs,
             // respectively, and expose different identity/structure views.
+            // Basename also produces facts independent of detected type:
+            // `build.rs` and `lib.rs` must not share `file.basename`, nor may
+            // Go workspace and module metadata inherit one another's context.
             // A degraded rizin run is returned but not persisted, so a later
             // healthy run still gets to fill the entry.
             let variant = extraction_cache_variant(
                 self.fileid.file_type(),
                 self.fileid.extension_mismatch(),
                 self.fileid.extension_mismatch_transition(),
+                self.basename.as_deref(),
             );
             // The cached form drops the byte-scan `text` rows (stng owns them);
             // they are rehydrated below. `open_with_cache` stores/loads the
@@ -578,6 +617,7 @@ fn extraction_cache_variant(
     file_type: FileType,
     extension_mismatch: bool,
     mismatch_transition: Option<(&'static str, &'static str)>,
+    basename: Option<&str>,
 ) -> String {
     // The content/extension transition is path-derived but lands in the
     // extraction output as `consistency.extension_content_mismatch.*`, so it
@@ -597,7 +637,7 @@ fn extraction_cache_variant(
         (true, Some((content, ext))) => std::borrow::Cow::Owned(format!("{content}_as_{ext}")),
     };
     format!(
-        "{};file_type={};mismatch={}",
+        "{};file_type={};mismatch={};basename={basename:?}",
         crate::rizin::cache_fingerprint(),
         file_type.label(),
         transition
@@ -1175,6 +1215,7 @@ pub fn open(bytes: &[u8]) -> Result<ParsedFile<'_>, Error> {
         fileid,
         basename: None,
         tree_parse: OnceLock::new(),
+        flow: OnceLock::new(),
         cancellation: None,
         extracted: OnceLock::new(),
         parse_count: AtomicU32::new(0),
@@ -1198,6 +1239,7 @@ pub fn open_with_path<'a>(path: &Path, bytes: &'a [u8]) -> Result<ParsedFile<'a>
         fileid,
         basename,
         tree_parse: OnceLock::new(),
+        flow: OnceLock::new(),
         cancellation: None,
         extracted: OnceLock::new(),
         parse_count: AtomicU32::new(0),
@@ -1223,6 +1265,7 @@ pub fn open_with_fileid<'a>(
         fileid,
         basename,
         tree_parse: OnceLock::new(),
+        flow: OnceLock::new(),
         cancellation: None,
         extracted: OnceLock::new(),
         parse_count: AtomicU32::new(0),
@@ -1258,6 +1301,7 @@ pub fn open_as<'a>(
         fileid: FileId::forced(file_type),
         basename,
         tree_parse: OnceLock::new(),
+        flow: OnceLock::new(),
         cancellation: None,
         extracted: OnceLock::new(),
         parse_count: AtomicU32::new(0),
@@ -1349,10 +1393,11 @@ mod tests {
     /// directory order.
     #[test]
     fn cache_variant_separates_extension_transitions() {
-        let as_font = extraction_cache_variant(FileType::Shell, true, Some(("script", "font")));
+        let as_font =
+            extraction_cache_variant(FileType::Shell, true, Some(("script", "font")), None);
         let as_unknown =
-            extraction_cache_variant(FileType::Shell, true, Some(("script", "unknown")));
-        let consistent = extraction_cache_variant(FileType::Shell, false, None);
+            extraction_cache_variant(FileType::Shell, true, Some(("script", "unknown")), None);
+        let consistent = extraction_cache_variant(FileType::Shell, false, None, None);
         assert_ne!(as_font, as_unknown);
         assert_ne!(as_font, consistent);
         assert_ne!(as_unknown, consistent);
@@ -1360,7 +1405,7 @@ mod tests {
         // a tree full of `.woff2` files does not lose cache sharing.
         assert_eq!(
             as_font,
-            extraction_cache_variant(FileType::Shell, true, Some(("script", "font")))
+            extraction_cache_variant(FileType::Shell, true, Some(("script", "font")), None)
         );
     }
 
@@ -1369,9 +1414,21 @@ mod tests {
     #[test]
     fn cache_variant_separates_unnamed_mismatch() {
         assert_ne!(
-            extraction_cache_variant(FileType::Shell, true, None),
-            extraction_cache_variant(FileType::Shell, false, None)
+            extraction_cache_variant(FileType::Shell, true, None, None),
+            extraction_cache_variant(FileType::Shell, false, None, None)
         );
+    }
+
+    #[test]
+    fn cache_variant_separates_basename_facts() {
+        // Identical Rust bytes can be a build hook or an ordinary module.
+        // Archive extraction and standalone scans must not inherit whichever
+        // basename happened to populate the content cache first.
+        let key = |name| extraction_cache_variant(FileType::Rust, false, None, name);
+        assert_ne!(key(Some("build.rs")), key(Some("lib.rs")));
+        assert_ne!(key(Some("build.rs")), key(None));
+        assert_ne!(key(Some("")), key(None));
+        assert_eq!(key(Some("build.rs")), key(Some("build.rs")));
     }
     use super::*;
 
@@ -1398,12 +1455,12 @@ mod tests {
     #[test]
     fn extraction_cache_separates_path_dependent_file_types() {
         assert_ne!(
-            extraction_cache_variant(FileType::Gz, false, None),
-            extraction_cache_variant(FileType::Npm, false, None),
+            extraction_cache_variant(FileType::Gz, false, None, None),
+            extraction_cache_variant(FileType::Npm, false, None, None),
         );
         assert_eq!(
-            extraction_cache_variant(FileType::Npm, false, None),
-            extraction_cache_variant(FileType::Npm, false, None),
+            extraction_cache_variant(FileType::Npm, false, None, None),
+            extraction_cache_variant(FileType::Npm, false, None, None),
         );
     }
 

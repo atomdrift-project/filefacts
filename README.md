@@ -61,16 +61,17 @@ make install
 ## Quick start
 
 ```bash
-# Inspect all available views in the terminal.
+# Inspect the default facts bundle in the terminal.
 filefacts suspect.bin
 
-# Emit the complete report as JSON.
+# Emit the default facts bundle as JSON.
 filefacts --format json suspect.bin
 
 # Request one focused view.
 filefacts metrics suspect.bin
 filefacts imports suspect.bin
 filefacts errors suspect.bin
+filefacts --format json --flow suspect.bin
 
 # Recursively inspect recognized files in a directory.
 filefacts --format json ./samples
@@ -89,9 +90,16 @@ Run `filefacts --help` for the complete view and output list.
 | `metrics` | Entropy, sizes, counts, and other numeric features |
 | `sections` | Executable sections and segments |
 | `symbols` | Imports, exports, functions, calls, members, and identifiers |
+| `flow` | Value relationships, producer, and limitations (opt-in) |
 | `archive_members` | Recursively discovered container entries |
 | `source_ast` | tree-sitter facts for recognized source languages |
 | `errors` | Recoverable parser and extractor diagnostics |
+
+`ParsedFile::flow()` returns the shared `Flow` model. The view is lazy and
+opt-in, so the default CLI bundle does not construct it. Currently the source
+parser produces flow; binary flow recovery is not implemented. Unsupported
+analysis returns `None` (`null` in CLI JSON), not an empty graph. Missing flow
+or missing relationships are not evidence that a file is safe.
 
 The schema is versioned with `SCHEMA_VERSION`. Views are cached as
 content-addressed, zstd-compressed records to make repeated corpus passes

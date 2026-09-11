@@ -856,7 +856,7 @@ fn arg_shape(node: Node<'_>, config: &LangConfig) -> ArgShape {
 /// Falls back to the shape-only [`Arg::Object`] / `Array` / `Function`
 /// / `Call` / `Expression` variants when the argument has no
 /// statically-recoverable value.
-fn build_arg(node: Node<'_>, source: &str, config: &LangConfig) -> Arg {
+pub(super) fn build_arg(node: Node<'_>, source: &str, config: &LangConfig) -> Arg {
     // PHP (and a few other grammars) wrap each call argument in an `argument`
     // node whose child is the real expression, and PHP double-quoted strings
     // are `encapsed_string` wrapping a `string_content`. Without unwrapping,
@@ -864,7 +864,9 @@ fn build_arg(node: Node<'_>, source: &str, config: &LangConfig) -> Arg {
     // would be lost — so `arg: { kind: string, ... }` rules could never match.
     // Descend through these wrappers to the inner value before shaping.
     let mut node = node;
-    while node.kind() == "argument" {
+    while node.kind() == "argument"
+        || (config.name == "rust" && node.kind() == "reference_expression")
+    {
         match first_named_child(node) {
             Some(inner) => node = inner,
             None => break,
@@ -955,7 +957,7 @@ fn parse_numeric_literal_node(node: Node<'_>, source: &str) -> Option<(String, i
 /// JS sandbox-escape pattern. Numeric or identifier indices stay
 /// computed (returns `None` for that path) since their values aren't
 /// statically resolvable to a property name.
-fn static_dotted_chain(
+pub(super) fn static_dotted_chain(
     node: Node<'_>,
     source: &str,
     config: &LangConfig,
@@ -969,6 +971,9 @@ fn static_dotted_chain(
     // non-static (dynamic access) — the conservative, no-symbol outcome.
     if depth >= MAX_AST_DEPTH {
         return None;
+    }
+    if config.name == "rust" && node.kind() == "scoped_identifier" {
+        return node.utf8_text(source.as_bytes()).ok().map(str::to_string);
     }
     if config.identifier_kinds.contains(&node.kind()) {
         return node.utf8_text(source.as_bytes()).ok().map(str::to_string);
@@ -1095,6 +1100,7 @@ fn is_assignment_kind(kind: &str) -> bool {
     matches!(
         kind,
         "assignment"
+            | "let_declaration"
             | "assignment_expression"
             | "augmented_assignment"
             | "assignment_statement"

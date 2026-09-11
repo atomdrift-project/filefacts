@@ -206,11 +206,10 @@ pub enum Symbol {
     /// computed (`obj[varName]()`, an anonymous function call, a method
     /// on a call result, …).
     ///
-    /// `args` carries only the *shape* of each argument in call order.
-    /// Literal values live canonically in the top-level `literals`
-    /// collection; rules that need to match arg content compose by
-    /// offset window (a literal whose offset falls inside the call's
-    /// extent).
+    /// `args` carries argument shapes and literal values in call order.
+    /// Value-producing relationships are supplied by `Flow`, linked to
+    /// this call by source byte offset. An identifier's name alone does not
+    /// establish its value or provenance.
     Call {
         /// Static dotted path to the function being called, or `None`
         /// for dynamic targets.
@@ -345,6 +344,11 @@ impl Symbols {
         self.0.iter()
     }
 
+    /// Mutable access for format-specific normalization during extraction.
+    pub(crate) fn iter_mut(&mut self) -> std::slice::IterMut<'_, Symbol> {
+        self.0.iter_mut()
+    }
+
     /// Iterate symbols of a specific kind (filtered view).
     pub fn iter_kind(&self, want: SymbolKind) -> impl Iterator<Item = &Symbol> {
         self.0.iter().filter(move |s| s.kind() == want)
@@ -366,6 +370,14 @@ impl<'a> IntoIterator for &'a Symbols {
     type IntoIter = std::slice::Iter<'a, Symbol>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut Symbols {
+    type Item = &'a mut Symbol;
+    type IntoIter = std::slice::IterMut<'a, Symbol>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter_mut()
     }
 }
 

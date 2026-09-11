@@ -146,6 +146,10 @@ pub(crate) fn extract(
     // extractors layer on top of (and may shadow with more accurate
     // values) what generic emits.
     generic::extract(bytes, values, strings, metrics);
+    if basename.is_some_and(|name| crate::has_named_reference_metadata(std::path::Path::new(name)))
+    {
+        values.insert("go_manifest.kind", serde_json::json!(basename));
+    }
 
     // Archive-backed types carry their container decomposition (archive +
     // compression) as facts, so a consumer can route on the underlying
@@ -312,10 +316,19 @@ pub(crate) fn extract(
         // still resolve instead of vanishing into a text/raw scan.
         FileType::Gyp => structured::extract_gyp(bytes, values, metrics),
         FileType::VsixManifest => vsix::extract(bytes, values, strings, metrics),
-        FileType::CargoToml
-        | FileType::CargoLock
-        | FileType::PoetryLock
-        | FileType::PyProjectToml => structured::extract_toml(bytes, values),
+        FileType::CargoToml => {
+            structured::extract_toml(bytes, values)?;
+            let mode = match values.get("package.build") {
+                Some(serde_json::Value::Bool(false)) => "disabled",
+                Some(serde_json::Value::String(_)) => "custom",
+                _ => "implicit",
+            };
+            values.insert("cargo.build_mode", serde_json::json!(mode));
+            Ok(())
+        }
+        FileType::CargoLock | FileType::PoetryLock | FileType::PyProjectToml => {
+            structured::extract_toml(bytes, values)
+        }
         FileType::GithubActions | FileType::PnpmLock => structured::extract_yaml(bytes, values),
         FileType::Plist => structured::extract_plist(bytes, values),
         FileType::Pbxproj => pbxproj::extract(bytes, values, strings, metrics),

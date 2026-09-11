@@ -14,6 +14,8 @@ use serde_json::Value as JsonValue;
 
 use crate::fileid::FileType;
 use crate::output::{HashAlgo, PinnedHash, RefKind, RefLocator, Reference, Values};
+pub(crate) mod go;
+mod manifests;
 
 /// Derive external references from a parsed file's `values`. `bytes` is the
 /// raw file, used to locate each reference's `evidence` for its byte offset.
@@ -26,6 +28,21 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Vec<
         cursor: 0,
         budget: MAX_LOCATE_SCAN,
     };
+    match values.get("go_manifest.kind").and_then(JsonValue::as_str) {
+        Some("go.work") => {
+            go::manifest(&mut out, "go.work");
+            return out.refs;
+        }
+        Some("go.work.sum") => {
+            go::sums(&mut out);
+            return out.refs;
+        }
+        Some("modules.txt") => {
+            go::vendor(&mut out);
+            return out.refs;
+        }
+        _ => {}
+    }
     // Only declared, structured dependencies live here. Imperative/undeclared
     // recognition (install-hook commands, shell/Dockerfile `npm install`,
     // `curl | sh`, URLs in variables) is fletch's `find`, which consumes these
@@ -34,10 +51,11 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Vec<
         FileType::Npm | FileType::PackageJson => npm(values, &mut out),
         FileType::PackageLockJson => npm_lock(values, &mut out),
         FileType::SrcInfo => srcinfo(values, &mut out),
-        FileType::GoMod => go_mod(&mut out),
-        FileType::GoSum => go_sum(&mut out),
+        FileType::GoMod => go::manifest(&mut out, "go.mod"),
+        FileType::GoSum => go::sums(&mut out),
         FileType::CargoToml => cargo_toml(values, &mut out),
         FileType::CargoLock => cargo_lock(values, &mut out),
+        FileType::PyProjectToml => manifests::pyproject(values, &mut out),
         FileType::RequirementsTxt => requirements_txt(&mut out),
         FileType::PoetryLock => poetry_lock(values, &mut out),
         FileType::PipfileLock => pipfile_lock(values, &mut out),
@@ -598,6 +616,7 @@ fn pypi_purl(name: &str, version: &str) -> String {
 /// are version *requirements* (ranges), not fetchable pins — those resolve in
 /// `Cargo.lock`, mirroring npm's manifest/lockfile split.
 fn cargo_toml(values: &Values, out: &mut Refs<'_>) {
+    manifests::cargo(values, out);
     if let Some(repo) = get_str(values, "package.repository") {
         out.push(
             locator_from_repo(repo),
@@ -641,97 +660,6 @@ fn cargo_lock(values: &Values, out: &mut Refs<'_>) {
             Some(pin),
         );
     }
-}
-
-/// `require` directives in a `go.mod` — the module's declared dependencies, each
-/// pinned to an exact version (Go has no version ranges). Handles both the
-/// single-line (`require mod v1.2.3`) and block (`require (\n  mod v1.2.3\n)`)
-/// forms; an `// indirect` trailer is informational and dropped. Hashes live in
-/// `go.sum`, so these carry no pin.
-fn go_mod(out: &mut Refs<'_>) {
-    let Some(text) = out.text else { return };
-    let mut in_block = false;
-    for line in text.lines() {
-        let line = strip_line_comment(line).trim();
-        // The `require` directive is the word followed by whitespace or `(` —
-        // not merely a prefix of a module path like `require.dev/x`.
-        let directive = line
-            .strip_prefix("require")
-            .filter(|rest| rest.is_empty() || rest.starts_with(['(', ' ', '\t']));
-        if let Some(rest) = directive {
-            let rest = rest.trim_start();
-            if rest == "(" {
-                in_block = true;
-            } else if !rest.is_empty() {
-                push_go_dep(out, rest, "go.mod"); // single-line require
-            }
-        } else if in_block {
-            if line == ")" {
-                in_block = false;
-            } else if !line.is_empty() {
-                push_go_dep(out, line, "go.mod");
-            }
-        }
-    }
-}
-
-/// `go.sum` lines: `<module> <version> h1:<base64>` pins the module zip;
-/// `<module> <version>/go.mod h1:<base64>` pins only its go.mod. Emit a pinned
-/// reference for the former (the fetchable artifact); skip the `/go.mod` lines.
-fn go_sum(out: &mut Refs<'_>) {
-    let Some(text) = out.text else { return };
-    for line in text.lines() {
-        let mut fields = line.split_whitespace();
-        let (Some(module), Some(version), Some(hash)) =
-            (fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        let Some(h1) = hash.strip_prefix("h1:") else {
-            continue;
-        };
-        if version.ends_with("/go.mod") {
-            continue;
-        }
-        let pin = PinnedHash {
-            algo: HashAlgo::GoModH1,
-            value: h1.to_string(),
-        };
-        out.push(
-            RefLocator::Purl(go_purl(module, version)),
-            RefKind::Dependency,
-            "go.sum",
-            line.trim(),
-            Some(pin),
-        );
-    }
-}
-
-/// Push a `module version` pair (a `go.mod` require line or block entry) as a
-/// Go dependency. Ignores malformed lines that aren't `path version`.
-fn push_go_dep(out: &mut Refs<'_>, entry: &str, source: &str) {
-    let mut fields = entry.split_whitespace();
-    let (Some(module), Some(version)) = (fields.next(), fields.next()) else {
-        return;
-    };
-    out.push(
-        RefLocator::Purl(go_purl(module, version)),
-        RefKind::Dependency,
-        source,
-        entry,
-        None,
-    );
-}
-
-/// `pkg:golang/<module>@<version>`. The module path keeps its real case (the
-/// case-folding GOPROXY needs is a transport concern, applied at fetch time).
-fn go_purl(module: &str, version: &str) -> String {
-    format!("pkg:golang/{module}@{version}")
-}
-
-/// Drop a `//` line comment (e.g. `go.mod`'s `// indirect`), leaving the rest.
-fn strip_line_comment(line: &str) -> &str {
-    line.split_once("//").map_or(line, |(code, _)| code)
 }
 
 /// Budget for whole-file evidence searches, in bytes scanned.
@@ -1946,15 +1874,17 @@ mod tests {
     }
 
     #[test]
-    fn go_sum_pins_module_zips_and_skips_go_mod_lines() {
+    fn go_sum_preserves_both_hash_kinds_without_selecting_dependencies() {
         let gosum = b"github.com/foo/bar v1.2.3 h1:AAAA=\n\
             github.com/foo/bar v1.2.3/go.mod h1:BBBB=\n";
         let refs = derive(FileType::GoSum, gosum, &Values::new());
         assert_eq!(
             refs.len(),
-            1,
-            "only the module-zip line, not the /go.mod line"
+            2,
+            "preserve module and metadata checksums independently"
         );
+        assert!(refs.iter().all(|r| r.kind == RefKind::Undefined));
+        assert_eq!(refs[1].source, "go.sum.go.mod");
         let r = &refs[0];
         assert_eq!(
             r.locator,

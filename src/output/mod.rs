@@ -22,10 +22,12 @@
 //! - [`Symbols`] — unified named-entity facts (imports, exports,
 //!   functions, calls, members, binds, identifiers) tagged by
 //!   [`SymbolKind`].
+//! - [`Flow`] — value relationships, producer, and known limitations.
 //! - [`Errors`] — recoverable extractor diagnostics.
 
 mod archive;
 mod errors;
+mod flow;
 mod identity;
 mod metric_keys;
 mod metrics;
@@ -38,6 +40,7 @@ mod values;
 
 pub use archive::{ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership};
 pub use errors::{ErrorKind, Errors, ParseError, Stage};
+pub use flow::{Flow, FlowFunction, FlowOrigin, FlowOrigins, FlowTransfer, FlowValue};
 pub use identity::{Claim, Identity, Party, Signer, Trust, Url, UrlKind};
 pub use metric_keys::{
     CATALOG, FAMILIES, MetricKey, QueryLimit, archive_entry_type_count, archive_method_count,

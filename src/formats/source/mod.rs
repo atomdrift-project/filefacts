@@ -12,6 +12,11 @@ mod ast_walk;
 mod call_target_metrics;
 mod comment_metrics;
 mod escapes;
+mod go_syntax;
+mod payload_flow;
+mod value_flow;
+pub use payload_flow::go_package_payload_flow;
+mod rust_syntax;
 
 /// Decode the escape sequences a parsed source string literal carries, so a
 /// consumer sees the text the program will actually use rather than the way the
@@ -96,7 +101,10 @@ pub(super) fn extract(
     comment_metrics::emit(source, config.comment_style, metrics, &mut strings.comments);
 
     extract_strings(root, source, config, strings);
-    let imports = collect_imports(config.language, source, root, config.import_query);
+    let mut imports = collect_imports(config.language, source, root, config.import_query);
+    if config.name == "rust" {
+        imports.items = rust_syntax::imports(root, source);
+    }
     let functions = collect_query(config.language, source, root, config.function_query);
     let classes = collect_query(config.language, source, root, config.class_query);
     emit_query_limit_metrics(metrics, "imports", &imports);
@@ -180,6 +188,7 @@ pub(super) fn extract(
         "source.language",
         JsonValue::String(config.name.to_string()),
     );
+    payload_flow::emit(root, source, config.name, values);
 
     Ok(())
 }
@@ -197,6 +206,15 @@ pub(crate) fn build_symbols(
     let source = cache.source();
     let root = cache.tree().root_node();
     ast_walk::walk(root, source, config, symbols_out, metrics);
+    if config.name == "rust" {
+        rust_syntax::resolve_calls(symbols_out);
+    }
+}
+
+pub(crate) fn build_value_flow(cache: &TreeCache<'_>, symbols: &crate::Symbols) -> crate::Flow {
+    let config =
+        langs::config_for(cache.file_type()).expect("tree_cache implies language configuration");
+    value_flow::build(cache.tree().root_node(), cache.source(), config, symbols)
 }
 
 fn extract_strings(

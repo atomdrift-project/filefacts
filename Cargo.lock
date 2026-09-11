@@ -1734,9 +1734,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.16.0"
+version = "1.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
+checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
 
 [[package]]
 name = "spin"
@@ -1763,7 +1763,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "1.11.0"
-source = "git+https://github.com/atomdrift-project/stng.git#8773aa54a4ab7c4c865298d3f44696ec02c9e8a5"
+source = "git+https://github.com/atomdrift-project/stng.git#5f427e67a9d49c7212707e1d89a10dd860900692"
 dependencies = [
  "aho-corasick",
  "anyhow",
