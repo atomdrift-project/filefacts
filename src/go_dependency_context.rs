@@ -134,7 +134,7 @@ fn reconcile(
         result.locator = replacement.locator.clone();
         result.pinned_hash = None;
         result.content_sha256 = None;
-        result.source = replacement.source.clone();
+        result.source.clone_from(&replacement.source);
         result.evidence = format!(
             "{}; {}: {}",
             reference.evidence, owner, replacement.evidence
@@ -158,7 +158,7 @@ fn reconcile(
         if pins.iter().any(|r| r.pinned_hash != pin.pinned_hash) {
             return unresolved(reference, "checksum-conflict");
         }
-        result.pinned_hash = pin.pinned_hash.clone();
+        result.pinned_hash.clone_from(&pin.pinned_hash);
     }
     result
 }

@@ -1665,12 +1665,27 @@ options:
 mod flow_tests {
     use super::*;
 
+    /// Hermetic `open_with_path`: `flow_is_a_format_neutral_view` asserts
+    /// `parse_count() == 1`, which only holds when this process actually runs
+    /// the extraction pipeline. The disk cache is off by default only inside
+    /// filefacts' own unit tests (`!cfg!(test)` in `cache`); that guard does
+    /// not reach this binary target, where the crate is linked as an ordinary
+    /// dependency, so a warm entry from a prior run would leave the count at
+    /// 0. Mirrors the wrapper in `tests/integration.rs`. Idempotent and safe
+    /// under parallel test execution.
+    fn open_with_path<'a>(
+        path: &Path,
+        bytes: &'a [u8],
+    ) -> Result<filefacts::ParsedFile<'a>, filefacts::Error> {
+        filefacts::cache::set_caching_enabled(false);
+        filefacts::open_with_path(path, bytes)
+    }
+
     #[test]
     fn flow_is_a_format_neutral_view() {
         assert_eq!(parse_view("flow"), Some(View::Flow));
         assert_eq!(View::Flow.name(), "flow");
-        let parsed =
-            filefacts::open_with_path(Path::new("example.py"), b"send(acquire())\n").unwrap();
+        let parsed = open_with_path(Path::new("example.py"), b"send(acquire())\n").unwrap();
         let value = build_output(&parsed, View::Flow);
         assert_eq!(value["producer"], "tree-sitter");
         assert_eq!(value["language"], "python");
@@ -1681,7 +1696,7 @@ mod flow_tests {
     #[test]
     fn unavailable_binary_flow_is_null_not_an_empty_graph() {
         let bytes = include_bytes!("../../tests/fixtures/test.elf");
-        let parsed = filefacts::open_with_path(Path::new("example.elf"), bytes).unwrap();
+        let parsed = open_with_path(Path::new("example.elf"), bytes).unwrap();
         assert!(parsed.flow().is_none());
         assert!(build_output(&parsed, View::Flow).is_null());
     }
