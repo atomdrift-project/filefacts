@@ -993,12 +993,23 @@ pub(super) fn static_dotted_chain(
             return Some(folded);
         }
     }
+    // A call in receiver position contributes the name of what it called, and
+    // nothing else: `open(p).read()` is `open.read`.
+    //
+    // This used to append `()`, which read as "a call happened here" but was
+    // really positional — the outermost call is named by `record_call` from
+    // its callee and never got parens, so `platform.system()` was
+    // `platform.system` while `open(p).read()` was `open().read`. One call,
+    // two spellings, depending on where it sat. Rule authors reasonably wrote
+    // `.system()` and matched nothing.
+    //
+    // Without the parens a symbol is one thing everywhere: a dotted path of
+    // identifiers, the same shape a stripped binary's symbol table yields.
     if config.call_kinds.contains(&node.kind()) {
         let callee = node
             .child_by_field_name(config.callee_field)
             .or_else(|| first_named_child(node))?;
-        let target = static_dotted_chain(callee, source, config, depth + 1)?;
-        return Some(format!("{target}()"));
+        return static_dotted_chain(callee, source, config, depth + 1);
     }
     // Constructor type names: Java `type_identifier` / `scoped_type_identifier`
     // (`new ProcessBuilder()`, `new java.io.File()`) and similar type-name

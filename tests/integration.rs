@@ -342,8 +342,8 @@ def run_command():
 
     let targets = call_targets(&parsed);
     assert!(
-        targets.contains(&"sp.check_output().decode".to_string()),
-        "method calls on call results should keep the source chain, got {targets:?}",
+        targets.contains(&"sp.check_output.decode".to_string()),
+        "method calls on call results should keep the dotted chain, got {targets:?}",
     );
 
     // Module-level string binding for API_URL — verify the bind exists

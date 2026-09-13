@@ -621,13 +621,18 @@ mod tests {
         assert!(found.values.is_empty());
     }
 
+    /// A method on a call result is its own value with its own target, and its
+    /// receiver points at the inner call. The target is a plain dotted path —
+    /// `acquire.unwrap`, not `acquire().unwrap` — because a call contributes
+    /// only the name of what it called; the receiver link, not the spelling,
+    /// is what records that a call sat in the middle.
     #[test]
     fn chained_calls_have_distinct_targets_and_receivers() {
         let flow = graph("a.rs", "fn run(){send(acquire(\"key\").unwrap());}");
         let outer = flow
             .values
             .iter()
-            .find(|v| v.target.as_deref() == Some("acquire().unwrap"))
+            .find(|v| v.target.as_deref() == Some("acquire.unwrap"))
             .unwrap();
         let inner = &flow.values[outer.receiver.unwrap()];
         assert_eq!(inner.offset, outer.offset);
