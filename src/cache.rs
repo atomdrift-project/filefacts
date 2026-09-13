@@ -338,7 +338,10 @@ const SHARD_COUNT: usize = 256;
 
 /// Default ceiling on retained cache entries. On reaching it, the oldest
 /// (least-recently-used) entries are evicted; see [`enforce_limits`].
-pub const DEFAULT_MAX_ITEMS: usize = 16_000;
+///
+/// Shared with stng's and fletch's `cache_sweep`, so every atomdrift cache
+/// quotes one ceiling.
+pub const DEFAULT_MAX_ITEMS: usize = 16_384;
 
 /// Post-eviction target as a fraction of the cap (9/10). Evicting to 90%
 /// rather than exactly to the cap stops a cache sitting at the ceiling from
