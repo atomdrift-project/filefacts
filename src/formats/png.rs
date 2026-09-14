@@ -1,9 +1,9 @@
 //! PNG image extractor.
 //!
-//! Single linear pass over the PNG chunk table. We don't decompress
-//! anything — IDAT bodies, zTXt zlib payloads, and iCCP profile
-//! contents are skipped. Trait authors get the structural facts that
-//! survive a no-zlib walk:
+//! Single linear pass over the PNG chunk table. IDAT bodies are joined only
+//! for a bounded zlib-consumption pass, which lets carrier analysis distinguish
+//! rendered image data from bytes hidden after the zlib stream. zTXt zlib
+//! payloads and iCCP profile contents are skipped. Trait authors get:
 //!
 //! - `png.dimensions.{width, height, bit_depth, color_type,
 //!   interlace, filter, compression}` from `IHDR`.
@@ -23,6 +23,7 @@
 
 use crate::metric;
 use serde_json::{Value as JsonValue, json};
+use std::io::{Read, sink};
 
 use crate::error::Error;
 use crate::formats::carrier::{self, Coverage};
@@ -32,6 +33,20 @@ use crate::output::{Metrics, Strings, Values};
 use crate::scan::entropy;
 
 const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
+/// Keep the extra IDAT copy and inflation work bounded. Pixel statistics use
+/// the same decoded-size ceiling; larger images still receive all structural
+/// facts, but skip this best-effort concealment check.
+const MAX_IDAT_ANALYSIS_BYTES: usize = 64 * 1024 * 1024;
+const MAX_IDAT_DECODE_BYTES: u64 = image_stats::MAX_DECODE_BYTES as u64;
+
+#[derive(Clone, Copy)]
+struct IdatExtent {
+    chunk_start: usize,
+    body_start: usize,
+    body_end: usize,
+    chunk_end: usize,
+}
 
 pub(super) fn extract(
     bytes: &[u8],
@@ -57,6 +72,7 @@ pub(super) fn extract(
     let mut chunks_after_iend: usize = 0;
     let mut text_chunk_bytes: usize = 0;
     let mut unknown_count: usize = 0;
+    let mut idat_extents: Vec<IdatExtent> = Vec::new();
     let mut iend_seen = false;
     let mut last_chunk_end: usize = 8;
 
@@ -114,7 +130,15 @@ pub(super) fn extract(
                     JsonValue::String(if body[12] == 1 { "adam7" } else { "none" }.to_string()),
                 );
             }
-            "IDAT" => chunks_idat += 1,
+            "IDAT" => {
+                chunks_idat += 1;
+                idat_extents.push(IdatExtent {
+                    chunk_start: i,
+                    body_start,
+                    body_end: body_start + length,
+                    chunk_end,
+                });
+            }
             "IEND" => iend_seen = true,
             "tEXt" | "zTXt" | "iTXt" => {
                 text_chunk_bytes += length;
@@ -168,6 +192,8 @@ pub(super) fn extract(
         // executable actually is. Every decoder skips it either way.
         if matches!(ctype, "tEXt" | "zTXt" | "iTXt" | "eXIf" | "caBX") {
             coverage.claim_freeform(i as u64, chunk_end as u64);
+        } else if ctype == "IDAT" {
+            // Deferred until all IDAT bodies can be treated as one zlib stream.
         } else if is_standard_chunk(ctype) {
             coverage.claim(i as u64, chunk_end as u64);
         }
@@ -181,6 +207,18 @@ pub(super) fn extract(
     }
     if chunks_after_iend > 0 {
         features.push("post_iend_chunks");
+    }
+
+    let idat_bytes: usize = idat_extents
+        .iter()
+        .map(|extent| extent.body_end - extent.body_start)
+        .sum();
+    let idat_zlib_bytes = claim_idat_stream(bytes, &idat_extents, &mut coverage);
+    let idat_unused_bytes = idat_zlib_bytes
+        .map(|used| idat_bytes.saturating_sub(used))
+        .unwrap_or(0);
+    if idat_unused_bytes > 64 {
+        features.push("idat_trailing_data");
     }
 
     if !dim_obj.is_empty() {
@@ -225,6 +263,12 @@ pub(super) fn extract(
     metrics.insert(metric!("png.trailing_bytes"), trailing_bytes as f64);
     metrics.insert(metric!("png.text_chunk_bytes"), text_chunk_bytes as f64);
     metrics.insert(metric!("png.unknown_chunk_count"), unknown_count as f64);
+    metrics.insert(metric!("png.idat_bytes"), idat_bytes as f64);
+    metrics.insert(
+        metric!("png.idat_zlib_bytes"),
+        idat_zlib_bytes.unwrap_or(idat_bytes) as f64,
+    );
+    metrics.insert(metric!("png.idat_unused_bytes"), idat_unused_bytes as f64);
 
     carrier::emit(bytes, &coverage, values, metrics);
 
@@ -234,6 +278,80 @@ pub(super) fn extract(
     extract_pixel_stats(bytes, metrics);
 
     Ok(())
+}
+
+/// Claim the portion of concatenated IDAT data consumed by the first zlib
+/// stream. PNG decoders stop there; bytes after it are not pixels even when an
+/// attacker wraps them in additional, syntactically valid IDAT chunks.
+///
+/// Returns the consumed IDAT byte count when the bounded decode reaches the
+/// end of a valid zlib stream. On malformed or oversized data every IDAT is
+/// conservatively claimed and `None` is returned.
+fn claim_idat_stream(
+    bytes: &[u8],
+    extents: &[IdatExtent],
+    coverage: &mut Coverage,
+) -> Option<usize> {
+    let total = extents.iter().try_fold(0usize, |sum, extent| {
+        sum.checked_add(extent.body_end - extent.body_start)
+    })?;
+    if total == 0 || total > MAX_IDAT_ANALYSIS_BYTES {
+        claim_all_idat(extents, coverage);
+        return None;
+    }
+
+    let mut input = Vec::with_capacity(total);
+    for extent in extents {
+        input.extend_from_slice(&bytes[extent.body_start..extent.body_end]);
+    }
+
+    let mut decoder = flate2::bufread::ZlibDecoder::new(input.as_slice());
+    let copied = match std::io::copy(
+        &mut decoder.by_ref().take(MAX_IDAT_DECODE_BYTES + 1),
+        &mut sink(),
+    ) {
+        Ok(copied) => copied,
+        Err(_) => {
+            claim_all_idat(extents, coverage);
+            return None;
+        }
+    };
+    if copied > MAX_IDAT_DECODE_BYTES {
+        claim_all_idat(extents, coverage);
+        return None;
+    }
+    let Ok(consumed) = usize::try_from(decoder.total_in()) else {
+        claim_all_idat(extents, coverage);
+        return None;
+    };
+    if consumed == 0 || consumed > total {
+        claim_all_idat(extents, coverage);
+        return None;
+    }
+
+    let mut logical_start = 0usize;
+    for extent in extents {
+        let body_len = extent.body_end - extent.body_start;
+        let logical_end = logical_start + body_len;
+        let used_here = consumed.saturating_sub(logical_start).min(body_len);
+
+        // Chunk length/type and CRC remain valid structure even when some or
+        // all of the body is ignored by the image decoder.
+        coverage.claim(
+            extent.chunk_start as u64,
+            (extent.body_start + used_here) as u64,
+        );
+        coverage.claim(extent.body_end as u64, extent.chunk_end as u64);
+
+        logical_start = logical_end;
+    }
+    Some(consumed)
+}
+
+fn claim_all_idat(extents: &[IdatExtent], coverage: &mut Coverage) {
+    for extent in extents {
+        coverage.claim(extent.chunk_start as u64, extent.chunk_end as u64);
+    }
 }
 
 /// Decode the PNG (cap-protected) and emit pixel-statistic metrics:
@@ -611,6 +729,37 @@ mod tests {
         assert_eq!(m.get("png.idat_chunk_count"), Some(3.0));
         assert_eq!(m.get("png.chunk_count"), Some(5.0));
         assert_eq!(m.get("png.chunks_after_iend"), Some(0.0));
+    }
+
+    #[test]
+    fn idat_payload_after_zlib_stream_is_stowaway() {
+        use std::io::Write;
+
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"\0rendered pixels").unwrap();
+        let compressed = encoder.finish().unwrap();
+        let split = compressed.len() / 2;
+        let hidden: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let mut final_idat = compressed[split..].to_vec();
+        final_idat.extend_from_slice(&hidden);
+        let png = build_png(&[
+            (b"IDAT", &compressed[..split]),
+            (b"IDAT", &final_idat),
+            (b"IEND", &[]),
+        ]);
+
+        let (v, m) = run(&png);
+        assert_eq!(
+            m.get("png.idat_bytes"),
+            Some((compressed.len() + hidden.len()) as f64)
+        );
+        assert_eq!(m.get("png.idat_zlib_bytes"), Some(compressed.len() as f64));
+        assert_eq!(m.get("png.idat_unused_bytes"), Some(hidden.len() as f64));
+        assert_eq!(m.get("media.stowaway_bytes"), Some(hidden.len() as f64));
+        assert_eq!(m.get("media.gap_bytes"), Some(hidden.len() as f64));
+        assert_eq!(v.get("media.stowaway"), Some(&json!(["high_entropy"])));
+        assert_eq!(v.get("media.valid"), Some(&json!(false)));
     }
 
     #[test]
