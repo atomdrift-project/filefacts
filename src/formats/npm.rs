@@ -157,9 +157,11 @@ fn repository_directory(value: Option<&JsonValue>) -> Option<&str> {
 /// repository — the clone-and-rename shape, where there is no hostile code
 /// to find because the payload is a later version.
 ///
-/// Compared on a folded slug, because the noise is predictable: a `@scope/`
-/// prefix, a `.git` suffix, and `-`/`_`/case spelling all differ without
-/// disagreeing, so `@tailwindcss/forms` and `tailwindcss-forms` agree.
+/// Compared on folded slugs, because the noise is predictable: a `.git`
+/// suffix and `-`/`_`/case spelling all differ without disagreeing. For a
+/// scoped package, accept either the full scope-plus-name slug or the package
+/// name alone: both `@tailwindcss/forms` in `tailwindcss-forms` and
+/// `@alice/tool` in `tool` are ordinary same-project naming shapes.
 ///
 /// Deliberately literal beyond that. A package legitimately named `foo` in a
 /// repo called `foo-js` will read as a mismatch — which is why this is one
@@ -174,14 +176,14 @@ fn name_repo_mismatch(obj: &serde_json::Map<String, JsonValue>) -> Option<bool> 
     if repository_directory(obj.get("repository")).is_some() {
         return None;
     }
-    // A scoped name is `@scope/pkg`, whose slug is the two joined — the scope
-    // is part of the identity, not a path.
-    let name = slug(obj.get("name")?.as_str()?);
+    let raw_name = obj.get("name")?.as_str()?;
+    let name = slug(raw_name);
+    let unscoped_name = slug(raw_name.rsplit('/').next().unwrap_or(raw_name));
     let repo = repo_slug(&repository_url(obj.get("repository"))?);
-    if name.is_empty() || repo.is_empty() {
+    if name.is_empty() || unscoped_name.is_empty() || repo.is_empty() {
         return None;
     }
-    Some(name != repo)
+    Some(name != repo && unscoped_name != repo)
 }
 
 /// Whether a marketplace extension's publisher disagrees with the owner of
@@ -489,6 +491,10 @@ mod tests {
             (
                 "@tailwindcss/forms",
                 "https://github.com/tailwindlabs/tailwindcss-forms",
+            ),
+            (
+                "@h3nr1-d14z/nat-gate",
+                "git+https://github.com/h3nr1-d14z/nat-gate.git",
             ),
             ("Lodash", "https://github.com/lodash/lodash.git"),
             (
