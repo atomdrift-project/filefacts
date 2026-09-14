@@ -195,10 +195,15 @@ pub(super) fn extract(
             .pclntab
             .is_some_and(super::go_buildinfo::has_pclntab_magic);
         super::go_buildinfo::detect(bytes, values, "pe", None, &go_sections);
+        // A Go PE may fold `.gopclntab` into `.rdata` and omit a literal
+        // `.gopclntab` section. Build-info is still authoritative Go
+        // evidence, and in that layout the native parser supplies no typed
+        // function inventory for the Rizin fallback to skip over.
+        let has_go_function_metadata = has_go_pclntab || values.get("pe.go").is_some();
         super::build_toolchain::from_pe_rich(values);
         // Importless PEs are the narrow parsed-PE class where function
         // recovery can correlate API-hash callsites. It shares the same
-        // cross-platform admission facts, including the Go exclusion.
+        // cross-platform admission facts, including Go metadata detection.
         rizin_importless_analysis(
             &pe,
             bytes,
@@ -207,7 +212,7 @@ pub(super) fn extract(
             sections_out,
             symbols_out,
             metrics,
-            has_go_pclntab,
+            has_go_function_metadata,
         );
         rizin_fallback_with_sections(
             bytes,
@@ -215,7 +220,7 @@ pub(super) fn extract(
             symbols_out,
             sections_out,
             metrics,
-            has_go_pclntab,
+            has_go_function_metadata,
         );
         return Ok(());
     }
@@ -437,7 +442,7 @@ fn rizin_importless_analysis(
     sections: &[Section],
     symbols: &mut crate::Symbols,
     metrics: &mut Metrics,
-    go_pclntab: bool,
+    go_function_metadata: bool,
 ) {
     const MAX_IMPORTLESS_ANALYSIS_BYTES: usize = 5 * 1024 * 1024;
     if bytes.len() > MAX_IMPORTLESS_ANALYSIS_BYTES
@@ -454,13 +459,15 @@ fn rizin_importless_analysis(
         sections,
         symbols,
         metrics,
-        go_pclntab,
+        go_function_metadata,
     )
     .runs()
     {
         return;
     }
-    let Some(recovery) = crate::rizin::recover_with_symbols(bytes, symbols.len()) else {
+    let Some(recovery) =
+        crate::rizin::recover_with_symbols(bytes, symbols.len(), go_function_metadata)
+    else {
         return;
     };
     recover_api_hash_requests(pe, bytes, values, metrics, &recovery);

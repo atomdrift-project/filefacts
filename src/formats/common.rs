@@ -221,7 +221,7 @@ struct RizinProfile {
     function_count: usize,
     section_count: usize,
     stripped: Option<bool>,
-    go_pclntab: bool,
+    go_function_metadata: bool,
     string_count: usize,
     string_bytes: usize,
     code_entropy: Option<f64>,
@@ -258,8 +258,17 @@ const HIGH_CODE_ENTROPY: f64 = 7.2;
 /// weighted score to tune: each branch states the fact that justifies paying
 /// for deep recovery.
 fn decide_rizin(profile: RizinProfile) -> RizinDecision {
-    if profile.go_pclntab {
-        return RizinDecision::Skip("Go pclntab provides the function inventory");
+    if profile.go_function_metadata && profile.function_count > 0 {
+        return RizinDecision::Skip("typed Go function inventory available");
+    }
+
+    // Go build metadata / pclntab identifies a binary whose function names
+    // are recoverable, but the string extractor's PclntabSymbol rows are a
+    // mixed name pool (packages, types, fields, paths, and functions), not a
+    // typed function inventory. If no typed functions made it into `symbols`,
+    // let Rizin provide the actual function table.
+    if profile.go_function_metadata {
+        return RizinDecision::Analyze("Go function inventory needs recovery");
     }
 
     // A PE whose native parser could not recover even its section table needs
@@ -332,7 +341,7 @@ pub(super) fn rizin_decision(
     sections: &[Section],
     symbols: &crate::Symbols,
     metrics: &crate::output::Metrics,
-    go_pclntab: bool,
+    go_function_metadata: bool,
 ) -> RizinDecision {
     let string_bytes = strings.text.iter().fold(0_usize, |total, string| {
         total.saturating_add(string.value.len())
@@ -346,7 +355,7 @@ pub(super) fn rizin_decision(
             .count(),
         section_count: sections.len(),
         stripped: metrics.get("binary.is_stripped").map(|value| value != 0.0),
-        go_pclntab,
+        go_function_metadata,
         string_count: strings.text.len(),
         string_bytes,
         code_entropy: weighted_code_entropy(sections),
@@ -364,10 +373,16 @@ pub(super) fn rizin_fallback(
     sections: &[Section],
     symbols: &mut crate::Symbols,
     metrics: &mut crate::output::Metrics,
-    go_pclntab: bool,
+    go_function_metadata: bool,
 ) {
     let decision = rizin_decision(
-        format, bytes, strings, sections, symbols, metrics, go_pclntab,
+        format,
+        bytes,
+        strings,
+        sections,
+        symbols,
+        metrics,
+        go_function_metadata,
     );
     tracing::debug!(
         ?format,
@@ -379,7 +394,7 @@ pub(super) fn rizin_fallback(
     if !decision.runs() {
         return;
     }
-    match crate::rizin::recover_with_symbols(bytes, symbols.len()) {
+    match crate::rizin::recover_with_symbols(bytes, symbols.len(), go_function_metadata) {
         Some(recovery) => {
             recovery.apply(symbols, metrics);
         }
@@ -419,12 +434,18 @@ pub(super) fn rizin_fallback_with_sections(
     symbols: &mut crate::Symbols,
     sections: &mut Vec<crate::output::Section>,
     metrics: &mut crate::output::Metrics,
-    go_pclntab: bool,
+    go_function_metadata: bool,
 ) {
-    // Skip the spawn entirely when goblin already gave us *anything* —
-    // any symbol or any section. Matches cleave's historical "all
-    // empty → run rizin" gate.
-    if !symbols.is_empty() || !sections.is_empty() {
+    // Normally goblin's native symbols or sections are enough to avoid an
+    // expensive disassembly. Go is the exception: its native parser can
+    // expose sections and imports while still having no typed functions;
+    // allow Rizin to fill that missing function inventory.
+    let has_functions = symbols
+        .iter()
+        .any(|symbol| symbol.kind() == crate::SymbolKind::Function);
+    let has_native_inventory = !symbols.is_empty() || !sections.is_empty();
+    let needs_go_function_recovery = go_function_metadata && !has_functions;
+    if has_native_inventory && !needs_go_function_recovery {
         return;
     }
     let decision = rizin_decision(
@@ -434,7 +455,7 @@ pub(super) fn rizin_fallback_with_sections(
         sections,
         symbols,
         metrics,
-        go_pclntab,
+        go_function_metadata,
     );
     tracing::debug!(
         format = ?NativeFormat::Pe,
@@ -446,13 +467,14 @@ pub(super) fn rizin_fallback_with_sections(
     if !decision.runs() {
         return;
     }
-    let recovery = match crate::rizin::recover_with_symbols(bytes, symbols.len()) {
-        Some(recovery) => recovery,
-        None => {
-            note_incomplete_recovery(metrics);
-            return;
-        }
-    };
+    let recovery =
+        match crate::rizin::recover_with_symbols(bytes, symbols.len(), go_function_metadata) {
+            Some(recovery) => recovery,
+            None => {
+                note_incomplete_recovery(metrics);
+                return;
+            }
+        };
     let counts = recovery.apply_with_sections(symbols, sections, metrics);
     if counts.imports > 0 {
         metrics.insert(metric!("pe.recovered_imports"), f64::from(counts.imports));
@@ -550,7 +572,7 @@ mod tests {
             function_count: 0,
             section_count: 8,
             stripped: Some(false),
-            go_pclntab: false,
+            go_function_metadata: false,
             string_count: 10_000,
             string_bytes: 4 << 20,
             code_entropy: Some(6.2),
@@ -600,17 +622,23 @@ mod tests {
     }
 
     #[test]
-    fn go_pclntab_skips_rizin_on_every_platform() {
+    fn go_without_typed_functions_is_admitted_on_every_platform() {
         for format in [NativeFormat::Elf, NativeFormat::MachO, NativeFormat::Pe] {
             let mut profile = transparent_profile(format);
-            profile.go_pclntab = true;
+            profile.go_function_metadata = true;
             profile.stripped = Some(true);
             profile.string_count = 0;
             profile.string_bytes = 0;
             profile.code_entropy = Some(8.0);
             assert!(matches!(
                 decide_rizin(profile),
-                RizinDecision::Skip("Go pclntab provides the function inventory")
+                RizinDecision::Analyze("Go function inventory needs recovery")
+            ));
+
+            profile.function_count = 1;
+            assert!(matches!(
+                decide_rizin(profile),
+                RizinDecision::Skip("typed Go function inventory available")
             ));
         }
     }
@@ -683,7 +711,7 @@ mod tests {
             function_count: 0,
             section_count: 20,
             stripped: Some(false),
-            go_pclntab: false,
+            go_function_metadata: false,
             string_count: 330_028,
             string_bytes: 40 << 20,
             code_entropy: Some(6.39),

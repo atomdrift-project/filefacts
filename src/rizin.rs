@@ -112,11 +112,21 @@ const RIZIN_METRICS_ARGS: &[&str] = &[
 ///   ELF and Mach-O samples (overdrive arm64 `.so` 3,646 of 3,741 in 2.8 s
 ///   vs 25 s; a 61 MB arm64 Mach-O 89,227 of 89,675 in 63 s vs 209 s).
 ///
-/// Both fast scripts are approximations of `aaa`, accepted for the
+/// The non-Go fast scripts are approximations of `aaa`, accepted for the
 /// latency; the function count and CFG aggregates they feed can differ by
-/// a few percent from a full pass.
-fn analysis_script(bytes: &[u8], symbol_count: usize) -> (&'static str, &'static str) {
-    if is_pe_x86(bytes) {
+/// a few percent from a full pass. Go deliberately uses the full script so
+/// Rizin's pclntab symbol names are retained.
+fn analysis_script(
+    bytes: &[u8],
+    symbol_count: usize,
+    go_function_metadata: bool,
+) -> (&'static str, &'static str) {
+    if go_function_metadata {
+        // Go's pclntab names are recovered during the full analysis pass.
+        // The faster PE script finds the code ranges but leaves these
+        // functions as fcn.* because it does not run the Go symbol pass.
+        (RIZIN_METRICS_SCRIPT, "go-full")
+    } else if is_pe_x86(bytes) {
         (RIZIN_METRICS_SCRIPT_PE_X86, "pe-x86")
     } else if symbol_count == 0 {
         (RIZIN_METRICS_SCRIPT, "full")
@@ -471,23 +481,27 @@ pub fn cache_fingerprint() -> String {
         return "rizin=none".to_string();
     }
     let version = rizin_version().unwrap_or("unknown");
-    // `opaque-v3`: PE x86/x86-64 recoveries come from `aa; aac`, everything
+    // `opaque-v4`: Go recoveries use full `aaa`; PE x86/x86-64 recoveries come from `aa; aac`, everything
     // else from `aa; aac; aap` with an `aaa` rerun under the coverage floor
     // (see `analysis_script`); cached extractions from the `aaa` era must
     // not mix.
     if native_arch_only() {
         format!(
-            "rizin={version}|policy=opaque-v3|native={}",
+            "rizin={version}|policy=opaque-v4|native={}",
             std::env::consts::ARCH
         )
     } else {
-        format!("rizin={version}|policy=opaque-v3")
+        format!("rizin={version}|policy=opaque-v4")
     }
 }
 
 /// [`recover`] with the caller's static symbol inventory size, which picks
 /// the analysis depth (see [`analysis_script`]).
-pub(crate) fn recover_with_symbols(bytes: &[u8], symbol_count: usize) -> Option<RizinRecovery> {
+pub(crate) fn recover_with_symbols(
+    bytes: &[u8],
+    symbol_count: usize,
+    go_function_metadata: bool,
+) -> Option<RizinRecovery> {
     if is_disabled() {
         return None;
     }
@@ -523,7 +537,12 @@ pub(crate) fn recover_with_symbols(bytes: &[u8], symbol_count: usize) -> Option<
     > = std::sync::Mutex::new(None);
     let key: [u8; 32] = {
         use sha2::Digest as _;
-        sha2::Sha256::digest(bytes).into()
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(bytes);
+        // The Go path selects a different Rizin script, so it must not share
+        // an in-process recovery memo entry with the generic PE path.
+        hasher.update([go_function_metadata as u8]);
+        hasher.finalize().into()
     };
     if let Ok(guard) = MEMO.lock()
         && let Some(map) = guard.as_ref()
@@ -532,7 +551,7 @@ pub(crate) fn recover_with_symbols(bytes: &[u8], symbol_count: usize) -> Option<
         tracing::debug!(bytes = bytes.len(), "rizin recover: in-run memo hit");
         return hit.clone();
     }
-    let result = recover_with_bin(bin, bytes, symbol_count);
+    let result = recover_with_bin(bin, bytes, symbol_count, go_function_metadata);
     if let Ok(mut guard) = MEMO.lock() {
         let map = guard.get_or_insert_with(std::collections::HashMap::default);
         if map.len() >= RIZIN_MEMO_MAX {
@@ -549,11 +568,16 @@ pub(crate) fn recover_with_symbols(bytes: &[u8], symbol_count: usize) -> Option<
 /// deterministically without a real rizin install.
 #[cfg(test)]
 fn recover_with_bin_for_test(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
-    recover_with_bin(bin, bytes, 0)
+    recover_with_bin(bin, bytes, 0, false)
 }
 
-fn recover_with_bin(bin: &Path, bytes: &[u8], symbol_count: usize) -> Option<RizinRecovery> {
-    let (script, label) = analysis_script(bytes, symbol_count);
+fn recover_with_bin(
+    bin: &Path,
+    bytes: &[u8],
+    symbol_count: usize,
+    go_function_metadata: bool,
+) -> Option<RizinRecovery> {
+    let (script, label) = analysis_script(bytes, symbol_count, go_function_metadata);
     recover_with_script(bin, bytes, script, label)
 }
 
@@ -1554,35 +1578,43 @@ mod tests {
             b[0x64..0x66].copy_from_slice(&machine.to_le_bytes());
             b
         }
-        assert_eq!(analysis_script(&pe(0x8664), 5).1, "pe-x86");
-        assert_eq!(analysis_script(&pe(0x014c), 5).1, "pe-x86");
+        assert_eq!(analysis_script(&pe(0x8664), 5, false).1, "pe-x86");
+        assert_eq!(analysis_script(&pe(0x014c), 5, false).1, "pe-x86");
         assert_eq!(
-            analysis_script(&pe(0x8664), 0).1,
+            analysis_script(&pe(0x8664), 0, false).1,
             "pe-x86",
             "PE x86 is exact even without symbols"
         );
         assert_eq!(
-            analysis_script(&pe(0xaa64), 5).1,
+            analysis_script(&pe(0xaa64), 5, false).1,
             "prelude",
             "arm64 PE takes the prelude script"
         );
-        assert_eq!(analysis_script(b"\x7fELF\x02\x01\x01", 5).1, "prelude");
         assert_eq!(
-            analysis_script(b"\x7fELF\x02\x01\x01", 0).1,
+            analysis_script(b"\x7fELF\x02\x01\x01", 5, false).1,
+            "prelude"
+        );
+        assert_eq!(
+            analysis_script(b"\x7fELF\x02\x01\x01", 0, false).1,
             "full",
             "no symbol inventory keeps aaa"
         );
         assert_eq!(
-            analysis_script(b"MZ", 5).1,
+            analysis_script(b"MZ", 5, false).1,
             "prelude",
             "truncated header is not PE x86"
         );
         let mut bad = pe(0x8664);
         bad[0x3c..0x40].copy_from_slice(&0xffff_fff0u32.to_le_bytes());
         assert_eq!(
-            analysis_script(&bad, 5).1,
+            analysis_script(&bad, 5, false).1,
             "prelude",
             "e_lfanew out of range is not PE x86"
+        );
+        assert_eq!(
+            analysis_script(&pe(0x8664), 5, true).1,
+            "go-full",
+            "Go metadata needs the symbol-naming pass"
         );
     }
 
@@ -2025,7 +2057,7 @@ mod tests {
         // only the observable contract: disabled → None.
         let _g = scoped_disable();
         assert!(is_disabled());
-        let r = recover_with_symbols(b"unused bytes for disabled probe", 0);
+        let r = recover_with_symbols(b"unused bytes for disabled probe", 0, false);
         assert!(r.is_none(), "disabled rizin must return None");
     }
 
