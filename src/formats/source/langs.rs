@@ -86,6 +86,25 @@ pub(super) struct LangConfig {
     pub(super) binary_op_kinds: &'static [&'static str],
 }
 
+impl LangConfig {
+    /// Locate a call's argument list for both symbol and value-flow extraction.
+    /// Elixir's `arguments` is an immediate named child, not a grammar field.
+    /// Do not search descendants: a nested call or do-block owns its own args.
+    pub(super) fn argument_list<'tree>(
+        &self,
+        node: tree_sitter::Node<'tree>,
+    ) -> Option<tree_sitter::Node<'tree>> {
+        node.child_by_field_name(self.arguments_field).or_else(|| {
+            if self.name != "elixir" {
+                return None;
+            }
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| child.kind() == "arguments")
+        })
+    }
+}
+
 pub(super) fn config_for(file_type: FileType) -> Option<&'static LangConfig> {
     Some(match file_type {
         FileType::JavaScript => &JAVASCRIPT,

@@ -167,7 +167,7 @@ impl Builder<'_> {
                 for arg in node.children_by_field_name("argument", &mut cursor) {
                     inputs.push(self.eval(arg, bindings, returns, depth + 1));
                 }
-            } else if let Some(args) = node.child_by_field_name(self.config.arguments_field) {
+            } else if let Some(args) = self.config.argument_list(node) {
                 for arg in children(args) {
                     inputs.push(self.eval(arg, bindings, returns, depth + 1));
                 }

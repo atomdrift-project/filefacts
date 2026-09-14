@@ -793,6 +793,69 @@ fn numeric_array_max_length_metric() {
 }
 
 #[test]
+fn elixir_call_arguments_survive_unfielded_argument_lists() {
+    for source in [
+        "System.cmd(\"printf\", [\"hello\"])\n",
+        "System.cmd \"printf\", [\"hello\"]\n",
+    ] {
+        let p = open_with_path(std::path::Path::new("args.ex"), source.as_bytes()).unwrap();
+        let args = p
+            .symbols()
+            .iter_kind(SymbolKind::Call)
+            .find_map(|s| match s {
+                Symbol::Call {
+                    target: Some(t),
+                    args,
+                    ..
+                } if t == "System.cmd" => Some(args),
+                _ => None,
+            })
+            .expect("System.cmd call");
+        assert_eq!(args.len(), 2, "{source}: {args:?}");
+        assert!(matches!(&args[0], filefacts::Arg::String { value } if value == "printf"));
+        let flow = p.flow().expect("source flow");
+        let call = flow
+            .values
+            .iter()
+            .find(|v| v.target.as_deref() == Some("System.cmd"))
+            .unwrap();
+        assert_eq!(call.inputs.len(), 2, "symbol and flow arguments must agree");
+        assert!(matches!(&flow.values[call.inputs[0]].literal,
+            Some(filefacts::Arg::String { value }) if value == "printf"));
+        assert_eq!(p.parse_count(), 1);
+    }
+}
+
+#[test]
+fn elixir_arguments_do_not_include_nested_calls_or_do_blocks() {
+    let source =
+        b"consume(produce(\"inner\"), \"outer\")\nempty()\nwrapper do\n nested(\"body\")\nend\n";
+    let p = open_with_path(std::path::Path::new("nested.ex"), source).unwrap();
+    for (name, count) in [
+        ("consume", 2),
+        ("produce", 1),
+        ("empty", 0),
+        ("wrapper", 0),
+        ("nested", 1),
+    ] {
+        let args = p
+            .symbols()
+            .iter_kind(SymbolKind::Call)
+            .find_map(|s| match s {
+                Symbol::Call {
+                    target: Some(t),
+                    args,
+                    ..
+                } if t == name => Some(args),
+                _ => None,
+            })
+            .expect(name);
+        assert_eq!(args.len(), count, "{name}: {args:?}");
+    }
+    assert_eq!(p.parse_count(), 1);
+}
+
+#[test]
 fn numeric_sequence_max_length_metric() {
     // JS comma sequence of numeric literals (comma-constant obfuscation).
     let js = b"var x = (1, 2, 3, 4, 5);\n";

@@ -774,7 +774,7 @@ impl State {
         let callee = node
             .child_by_field_name(config.callee_field)
             .or_else(|| first_named_child(node));
-        let args_node = node.child_by_field_name(config.arguments_field);
+        let args_node = config.argument_list(node);
 
         let target = callee.and_then(|c| static_dotted_chain(c, source, config, 0));
         if config.name == "bash" && target.as_deref().is_some_and(|t| t.starts_with('-')) {
