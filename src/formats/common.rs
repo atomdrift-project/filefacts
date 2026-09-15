@@ -69,6 +69,46 @@ fn push_stng_strings(
     strings.text_key = text_key;
 }
 
+/// Return the payload of a malformed UTF-16 wrapper.
+///
+/// A few script builders prepend a UTF-16 BOM to ordinary UTF-8 source to
+/// defeat consumers that choose the decoder from those two bytes alone. Do not
+/// reinterpret real UTF-16: ASCII UTF-16 has NUL padding, while this malformed
+/// form is valid UTF-8 with no embedded NULs after its BOM. A trailing NUL is
+/// tolerated as a text terminator.
+fn malformed_utf16_bom_payload(bytes: &[u8]) -> Option<&[u8]> {
+    let payload = bytes
+        .strip_prefix(&[0xff, 0xfe])
+        .or_else(|| bytes.strip_prefix(&[0xfe, 0xff]))?;
+    let text_end = payload
+        .iter()
+        .rposition(|&byte| byte != 0)
+        .map_or(0, |i| i + 1);
+    let text = &payload[..text_end];
+    (!text.contains(&0) && std::str::from_utf8(text).is_ok()).then_some(payload)
+}
+
+fn extract_malformed_utf16_bom_text_strings(
+    bytes: &[u8],
+    strings: &mut Strings,
+    xor: XorScan,
+) -> bool {
+    let Some(payload) = malformed_utf16_bom_payload(bytes) else {
+        return false;
+    };
+    let opts = string_opts_for(xor, payload);
+    let mut rows = stng::cached_strings_with_options(payload, &opts).to_vec();
+    for row in &mut rows {
+        row.data_offset = row.data_offset.saturating_add(2);
+    }
+    push_stng_strings(
+        std::sync::Arc::from(rows),
+        stng::cache_key_for(payload, &opts),
+        strings,
+    );
+    true
+}
+
 /// Extract strings from a binary stng parses itself. Used as the fallback when
 /// the format handler's own goblin parse failed (malformed input) — see
 /// [`extract_binary_strings_from_object`] for the fast path that reuses an
@@ -132,6 +172,9 @@ pub(super) fn has_xor_intent(bytes: &[u8]) -> bool {
 /// [`extract_binary_strings`] but for text/source bytes; callers gate source
 /// files on [`has_xor_intent`].
 pub(super) fn extract_text_strings(bytes: &[u8], strings: &mut Strings, xor: XorScan) {
+    if extract_malformed_utf16_bom_text_strings(bytes, strings, xor) {
+        return;
+    }
     let opts = string_opts_for(xor, bytes);
     push_stng_strings(
         stng::cached_strings_with_options(bytes, &opts),
@@ -561,9 +604,10 @@ pub(super) fn hex_nibble(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LARGE_RIZIN_INPUT, NativeFormat, RizinDecision, RizinProfile, basename, cfb_entry_path,
-        decide_rizin, has_xor_intent, hex_encode, stem,
+        LARGE_RIZIN_INPUT, NativeFormat, RizinDecision, RizinProfile, XorScan, basename,
+        cfb_entry_path, decide_rizin, extract_text_strings, has_xor_intent, hex_encode, stem,
     };
+    use crate::output::Strings;
 
     fn transparent_profile(format: NativeFormat) -> RizinProfile {
         RizinProfile {
@@ -842,6 +886,36 @@ mod tests {
         assert!(
             paths.iter().all(|p| !p.contains('\\')),
             "no host separator should survive: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_utf16_bom_utf8_payload_preserves_string_offsets() {
+        let bytes = b"\xff\xfe@echo off\r\npowershell -command Invoke-WebRequest\r\n\0";
+        let mut strings = Strings::new();
+
+        extract_text_strings(bytes, &mut strings, XorScan::No);
+
+        let command = strings
+            .text
+            .ascii()
+            .find(|s| s.value.contains("Invoke-WebRequest"))
+            .expect("malformed BOM wrapper must expose its text");
+        assert_eq!(command.data_offset, 13);
+    }
+
+    #[test]
+    fn malformed_utf16_bom_batch_reaches_the_public_text_view() {
+        let bytes = b"\xff\xfe@echo off\r\npowershell -command Invoke-WebRequest\r\n\0";
+        let parsed = crate::open_with_path(std::path::Path::new("dropper.bat"), bytes)
+            .expect("batch fixture opens");
+
+        assert!(
+            parsed
+                .text()
+                .ascii()
+                .any(|s| s.value.contains("Invoke-WebRequest")),
+            "source fallback must retain malformed BOM-wrapped batch text"
         );
     }
 }
