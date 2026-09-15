@@ -66,6 +66,9 @@ stng = { git = "https://github.com/atomdrift-project/stng.git" }
 # only — never for decompression or extraction.
 zip = "2"
 tar = "0.4"
+# 7z header reader. Like zip and tar, filefacts uses it only to enumerate
+# archive metadata; member payloads are never decompressed here.
+sevenz-rust = { version = "=0.6.1", features = ["aes256"] }
 # XML parser for VSIX / WiX-style manifests. Pure Rust, no external
 # binary calls.
 roxmltree = "0.21"

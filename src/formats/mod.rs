@@ -92,6 +92,7 @@ mod rpm;
 mod rtf;
 mod rust_crate;
 mod scpt;
+mod sevenz;
 pub(crate) mod source;
 mod source_meta;
 mod structured;
@@ -263,6 +264,10 @@ pub(crate) fn extract(
         | FileType::GentooBinpkg => {
             tar::extract(bytes, file_type, values, metrics, archive_members)
         }
+        // 7z's header holds the member table even when its payload streams
+        // are encrypted. Keep this metadata-only, matching the ZIP/TAR
+        // extractors: cleave owns any recursive extraction.
+        FileType::SevenZ => sevenz::extract(bytes, values, metrics, archive_members),
         // Compressed-tar packages (Alpine apk, FreeBSD/Arch pkg, Void xbps):
         // same handling as the other compressed-tar variants — format label
         // only; cleave decompresses and re-submits the members. Void's
