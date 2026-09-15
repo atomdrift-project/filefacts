@@ -240,6 +240,25 @@ impl Builder<'_> {
             return id;
         }
         if matches!(node.kind(), "if_statement" | "if_expression") {
+            // Go's initializer executes before the condition and is visible
+            // in both branches. Short declarations belong to the implicit if
+            // scope; ordinary assignments still update the surrounding scope.
+            let mut shadowed = HashMap::new();
+            if self.config.name == "go" {
+                if let Some(initializer) = node.child_by_field_name("initializer") {
+                    if initializer.kind() == "short_var_declaration" {
+                        if let Some(pattern) = initializer.child_by_field_name("left") {
+                            let mut declared = HashMap::new();
+                            self.bind(pattern, 0, &mut declared);
+                            for name in declared.into_keys() {
+                                let previous = bindings.get(&name).copied();
+                                shadowed.insert(name, previous);
+                            }
+                        }
+                    }
+                    self.eval(initializer, bindings, returns, depth + 1);
+                }
+            }
             if let Some(condition) = node.child_by_field_name("condition") {
                 self.eval(condition, bindings, returns, depth + 1);
             }
@@ -258,6 +277,13 @@ impl Builder<'_> {
                             merged.insert(name, id);
                         }
                     }
+                }
+            }
+            for (name, previous) in shadowed {
+                if let Some(id) = previous {
+                    merged.insert(name, id);
+                } else {
+                    merged.remove(&name);
                 }
             }
             *bindings = merged;
@@ -489,6 +515,71 @@ mod tests {
         ] {
             let flow = graph(path, source);
             assert!(reaches(&flow, "send", "acquire"), "{path}: {flow:?}");
+        }
+    }
+
+    #[test]
+    fn go_if_initializers_preserve_flow_and_lexical_scope() {
+        for (body, sink, expected) in [
+            (
+                "if value := acquire(); value != nil { send(value) }",
+                "send",
+                true,
+            ),
+            ("if value := acquire(); check(value) {}", "check", true),
+            (
+                "if value := acquire(); flag { } else { send(value) }",
+                "send",
+                true,
+            ),
+            (
+                "if value := acquire(); flag { } else if other { send(value) }",
+                "send",
+                true,
+            ),
+            (
+                "if value, ok := acquire(); ok { send(value) }",
+                "send",
+                true,
+            ),
+            (
+                "value := \"public\"; if value = acquire(); flag {}; send(value)",
+                "send",
+                true,
+            ),
+            (
+                "value := \"public\"; if value := acquire(); flag { check(value) }; send(value)",
+                "send",
+                false,
+            ),
+            (
+                "value := acquire(); if value := \"public\"; flag { check(value) }; send(value)",
+                "send",
+                true,
+            ),
+            (
+                "if value := acquire(); flag { value = \"public\"; send(value) }",
+                "send",
+                false,
+            ),
+            (
+                "if value := acquire(); flag { value := \"public\"; send(value) }",
+                "send",
+                false,
+            ),
+        ] {
+            let source = format!("package p\nfunc run(){{ {body} }}");
+            let flow = graph("a.go", &source);
+            assert!(!flow.limitations.contains("parse-error"), "{body}");
+            assert_eq!(reaches(&flow, sink, "acquire"), expected, "{body}");
+            assert_eq!(
+                flow.values
+                    .iter()
+                    .filter(|v| v.target.as_deref() == Some("acquire"))
+                    .count(),
+                1,
+                "initializer calls must be retained exactly once: {body}",
+            );
         }
     }
     #[test]

@@ -23,16 +23,39 @@ use serde_json::Value as JsonValue;
 use crate::formats::common::put_str;
 use crate::output::Values;
 
+#[allow(dead_code)]
 pub(super) fn extract(manifest_bytes: &[u8], values: &mut Values) {
+    extract_at(manifest_bytes, None, values);
+}
+
+pub(super) fn extract_at(manifest_bytes: &[u8], file_offset: Option<u64>, values: &mut Values) {
     let Ok(text) = std::str::from_utf8(manifest_bytes) else {
         return;
     };
 
-    if let Some(level) = attribute_value(text, "requestedExecutionLevel", "level") {
-        put_str(values, "pe.manifest.requested_execution_level", level);
+    if let Some((level, rel)) =
+        attribute_value_with_offset(text, "requestedExecutionLevel", "level")
+    {
+        put_str_at(
+            values,
+            "pe.manifest.requested_execution_level",
+            level,
+            file_offset,
+            manifest_bytes,
+            Some(rel),
+        );
     }
-    if let Some(ui) = attribute_value(text, "requestedExecutionLevel", "uiAccess") {
-        put_str(values, "pe.manifest.ui_access", ui);
+    if let Some((ui, rel)) =
+        attribute_value_with_offset(text, "requestedExecutionLevel", "uiAccess")
+    {
+        put_str_at(
+            values,
+            "pe.manifest.ui_access",
+            ui,
+            file_offset,
+            manifest_bytes,
+            Some(rel),
+        );
     }
 
     // Top-level `<assemblyIdentity>` describes the assembly itself.
@@ -40,12 +63,26 @@ pub(super) fn extract(manifest_bytes: &[u8], values: &mut Values) {
     // the root and one inside each `<dependentAssembly>`. The first
     // occurrence in document order is the canonical "this assembly"
     // record; later occurrences are dependency declarations.
-    if let Some(tag) = first_tag(text, "assemblyIdentity") {
-        if let Some(name) = attr_value_in_tag(tag, "name") {
-            put_str(values, "pe.manifest.assembly_identity.name", name);
+    if let Some((tag, tag_start)) = first_tag_with_offset(text, "assemblyIdentity") {
+        if let Some((name, rel)) = attr_value_in_tag_with_offset(tag, "name") {
+            put_str_at(
+                values,
+                "pe.manifest.assembly_identity.name",
+                name,
+                file_offset,
+                manifest_bytes,
+                Some(tag_start + 1 + rel),
+            );
         }
-        if let Some(version) = attr_value_in_tag(tag, "version") {
-            put_str(values, "pe.manifest.assembly_identity.version", version);
+        if let Some((version, rel)) = attr_value_in_tag_with_offset(tag, "version") {
+            put_str_at(
+                values,
+                "pe.manifest.assembly_identity.version",
+                version,
+                file_offset,
+                manifest_bytes,
+                Some(tag_start + 1 + rel),
+            );
         }
     }
 
@@ -63,8 +100,15 @@ pub(super) fn extract(manifest_bytes: &[u8], values: &mut Values) {
     // Free-text `<description>` element. Many real-world manifests
     // omit it; UAC installers and Microsoft inbox tools tend to set
     // it to a recognisable string.
-    if let Some(desc) = element_text(text, "description") {
-        put_str(values, "pe.manifest.description", desc);
+    if let Some((desc, rel)) = element_text_with_offset(text, "description") {
+        put_str_at(
+            values,
+            "pe.manifest.description",
+            desc,
+            file_offset,
+            manifest_bytes,
+            Some(rel),
+        );
     }
 
     let supported: Vec<JsonValue> = supported_os_ids(text)
@@ -78,33 +122,96 @@ pub(super) fn extract(manifest_bytes: &[u8], values: &mut Values) {
     // `dpiAware` and `dpiAwareness` are element text nodes, not
     // attributes, but they live inside `<application>` and the
     // simple-grep approach still works.
-    if let Some(v) = element_text(text, "dpiAware") {
-        put_str(values, "pe.manifest.dpi_aware", v);
+    if let Some((v, rel)) = element_text_with_offset(text, "dpiAware") {
+        put_str_at(
+            values,
+            "pe.manifest.dpi_aware",
+            v,
+            file_offset,
+            manifest_bytes,
+            Some(rel),
+        );
     }
-    if let Some(v) = element_text(text, "dpiAwareness") {
-        put_str(values, "pe.manifest.dpi_awareness", v);
+    if let Some((v, rel)) = element_text_with_offset(text, "dpiAwareness") {
+        put_str_at(
+            values,
+            "pe.manifest.dpi_awareness",
+            v,
+            file_offset,
+            manifest_bytes,
+            Some(rel),
+        );
     }
-    if let Some(v) = element_text(text, "longPathAware") {
-        put_str(values, "pe.manifest.long_path_aware", v);
+    if let Some((v, rel)) = element_text_with_offset(text, "longPathAware") {
+        put_str_at(
+            values,
+            "pe.manifest.long_path_aware",
+            v,
+            file_offset,
+            manifest_bytes,
+            Some(rel),
+        );
     }
-    if let Some(v) = element_text(text, "autoElevate") {
-        put_str(values, "pe.manifest.auto_elevate", v);
+    if let Some((v, rel)) = element_text_with_offset(text, "autoElevate") {
+        put_str_at(
+            values,
+            "pe.manifest.auto_elevate",
+            v,
+            file_offset,
+            manifest_bytes,
+            Some(rel),
+        );
+    }
+}
+
+/// Store a manifest value and, when the resource parser gave us the resource's
+/// file offset, store the exact byte offset of the value's first UTF-8 byte.
+/// The offset is intentionally omitted when the enclosing resource could not be
+/// mapped back to the input buffer; a semantic label is safer than a guessed
+/// header offset in that degraded case.
+fn put_str_at(
+    values: &mut Values,
+    path: &str,
+    value: String,
+    file_offset: Option<u64>,
+    manifest_bytes: &[u8],
+    relative_offset: Option<usize>,
+) {
+    let value_offset = file_offset.and_then(|base| {
+        relative_offset
+            .filter(|&relative| {
+                relative <= manifest_bytes.len()
+                    && value.len() <= manifest_bytes.len().saturating_sub(relative)
+            })
+            .map(|relative| base.saturating_add(relative as u64))
+    });
+    put_str(values, path, value);
+    if let Some(offset) = value_offset {
+        values.insert(
+            &format!("{path}_offset"),
+            serde_json::Value::Number(offset.into()),
+        );
     }
 }
 
 /// Return the value of `attr` on the first `<elem ... attr="value" …>`
 /// tag in the input. Trims whitespace. Returns `None` when the element
 /// or attribute is not present.
-fn attribute_value(text: &str, elem: &str, attr: &str) -> Option<String> {
+fn attribute_value_with_offset(text: &str, elem: &str, attr: &str) -> Option<(String, usize)> {
     let tag_start = find_open_tag(text, elem)?;
     let tag_end = text[tag_start..]
         .find('>')
         .map_or(text.len(), |n| tag_start + n);
     let tag = &text[tag_start..tag_end];
-    attr_value_in_tag(tag, attr)
+    let (value, relative) = attr_value_in_tag_with_offset(tag, attr)?;
+    Some((value, tag_start + relative))
 }
 
 fn attr_value_in_tag(tag: &str, attr: &str) -> Option<String> {
+    attr_value_in_tag_with_offset(tag, attr).map(|(value, _)| value)
+}
+
+fn attr_value_in_tag_with_offset(tag: &str, attr: &str) -> Option<(String, usize)> {
     let pattern = format!("{attr}=");
     let mut search_from = 0;
     while let Some(rel) = tag[search_from..].find(&pattern) {
@@ -121,14 +228,17 @@ fn attr_value_in_tag(tag: &str, attr: &str) -> Option<String> {
             search_from = idx + pattern.len();
             continue;
         }
-        let after = tag[idx + pattern.len()..].trim_start();
+        let raw_after = &tag[idx + pattern.len()..];
+        let after = raw_after.trim_start();
+        let leading_whitespace = raw_after.len() - after.len();
         let quote = after.chars().next()?;
         if quote != '"' && quote != '\'' {
             return None;
         }
         let rest = &after[1..];
         let end = rest.find(quote)?;
-        return Some(rest[..end].to_string());
+        let value_start = idx + pattern.len() + leading_whitespace + quote.len_utf8();
+        return Some((rest[..end].to_string(), value_start));
     }
     None
 }
@@ -185,10 +295,14 @@ fn supported_os_ids(text: &str) -> Vec<String> {
 /// between `<` and `>`, exclusive of those delimiters). Used when the
 /// caller wants to scan multiple attributes off the same element.
 fn first_tag<'a>(text: &'a str, elem: &str) -> Option<&'a str> {
+    first_tag_with_offset(text, elem).map(|(tag, _)| tag)
+}
+
+fn first_tag_with_offset<'a>(text: &'a str, elem: &str) -> Option<(&'a str, usize)> {
     let open = find_open_tag(text, elem)?;
     let after = open + 1;
     let close = after + text[after..].find('>')?;
-    Some(&text[after..close])
+    Some((&text[after..close], open))
 }
 
 /// Walk every `<dependentAssembly>` block and pull the `name@version`
@@ -224,17 +338,21 @@ fn dependencies(text: &str) -> Vec<String> {
     out
 }
 
-/// Return the text content of the first `<elem>…</elem>` pair.
-fn element_text(text: &str, elem: &str) -> Option<String> {
+/// Return the text content and byte-relative value start of the first
+/// `<elem>…</elem>` pair. The offset points to the first non-whitespace byte
+/// of the text content, matching the value emitted to the fact map.
+fn element_text_with_offset(text: &str, elem: &str) -> Option<(String, usize)> {
     let open = find_open_tag(text, elem)?;
     let tag_end = text[open..].find('>').map(|n| open + n + 1)?;
     let close_marker = format!("</{elem}");
     let close = text[tag_end..].find(&close_marker)?;
-    let value = text[tag_end..tag_end + close].trim();
+    let raw = &text[tag_end..tag_end + close];
+    let value = raw.trim();
     if value.is_empty() {
         None
     } else {
-        Some(value.to_string())
+        let leading_whitespace = raw.len() - raw.trim_start().len();
+        Some((value.to_string(), tag_end + leading_whitespace))
     }
 }
 
@@ -278,6 +396,37 @@ mod tests {
             v.get("pe.manifest.ui_access").and_then(|x| x.as_str()),
             Some("false")
         );
+    }
+
+    #[test]
+    fn offsets_anchor_manifest_values_to_their_exact_bytes() {
+        let base = 0x4000_u64;
+        let mut v = crate::Values::new();
+        extract_at(SAMPLE.as_bytes(), Some(base), &mut v);
+
+        let checks = [
+            (
+                "pe.manifest.requested_execution_level",
+                "requireAdministrator",
+                0,
+            ),
+            ("pe.manifest.ui_access", "false", 0),
+            ("pe.manifest.dpi_aware", "true", 0),
+            ("pe.manifest.long_path_aware", "true", 1),
+        ];
+        for (path, value, occurrence) in checks {
+            assert_eq!(v.get(path).and_then(|x| x.as_str()), Some(value));
+            let offset = v
+                .get(&format!("{path}_offset"))
+                .and_then(|x| x.as_u64())
+                .unwrap();
+            let relative = SAMPLE
+                .match_indices(value)
+                .nth(occurrence)
+                .map(|(offset, _)| offset)
+                .unwrap();
+            assert_eq!(offset, base + relative as u64);
+        }
     }
 
     #[test]

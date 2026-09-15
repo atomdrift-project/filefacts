@@ -1125,6 +1125,8 @@ fn emit_binary_aggregates(
     let mut largest: u64 = 0;
     let mut code_entropy_sum = 0.0_f64;
     let mut data_entropy_sum = 0.0_f64;
+    let mut code_spans = Vec::new();
+    let mut data_spans = Vec::new();
     for s in sections {
         let is_exec = s.is_executable();
         let is_write = s.is_writable();
@@ -1134,21 +1136,29 @@ fn emit_binary_aggregates(
         if is_exec {
             code_size = code_size.saturating_add(on_disk);
             code_entropy_sum += entropy * on_disk as f64;
+            if on_disk > 0 {
+                code_spans.push(Span::new(s.file_offset, on_disk));
+            }
         } else if is_write {
             data_size = data_size.saturating_add(on_disk);
             data_entropy_sum += entropy * on_disk as f64;
+            if on_disk > 0 {
+                data_spans.push(Span::new(s.file_offset, on_disk));
+            }
         }
     }
     if code_size > 0 {
-        metrics.insert(
+        metrics.insert_located(
             metric!("binary.code_entropy"),
             code_entropy_sum / code_size as f64,
+            code_spans,
         );
     }
     if data_size > 0 {
-        metrics.insert(
+        metrics.insert_located(
             metric!("binary.data_entropy"),
             data_entropy_sum / data_size as f64,
+            data_spans,
         );
     }
     if code_size + data_size > 0 {
@@ -1159,9 +1169,14 @@ fn emit_binary_aggregates(
     }
     let file_size = bytes.len() as u64;
     if file_size > 0 && largest > 0 {
-        metrics.insert(
+        let largest_spans = sections
+            .iter()
+            .filter(|s| s.file_size == largest && s.file_size > 0)
+            .map(|s| Span::new(s.file_offset, s.file_size));
+        metrics.insert_located(
             metric!("binary.largest_section_ratio"),
             largest as f64 / file_size as f64,
+            largest_spans,
         );
     }
 

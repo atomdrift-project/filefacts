@@ -151,7 +151,11 @@ pub(super) fn extract(
                     super::pe_version_info::extract(vi, bytes, values, metrics);
                 }
                 if let Some(ref md) = rd.manifest_data {
-                    super::pe_manifest::extract(md.data, values);
+                    // Goblin exposes the manifest bytes as a slice into the
+                    // original PE. Recover that slice's exact file offset so
+                    // value facts can carry real locations into cleave.
+                    let manifest_offset = slice_file_offset(bytes, md.data);
+                    super::pe_manifest::extract_at(md.data, manifest_offset, values);
                 }
             });
             if let goblin_safe::GoblinOutcome::Panicked(msg) = walk {
@@ -259,6 +263,19 @@ pub(super) fn extract(
     // when goblin did supply something, so it's safe to call unconditionally.
     rizin_fallback_with_sections(bytes, strings, symbols_out, sections_out, metrics, false);
     Ok(())
+}
+
+/// Return the file offset of `slice` within `bytes`. Goblin's resource parser
+/// returns borrowed slices into the same PE buffer, so the pointer difference
+/// is a precise mapping back to on-disk bytes. If a future parser returns a
+/// separately-owned buffer, the safety check makes the location disappear
+/// rather than producing an invalid offset.
+fn slice_file_offset(bytes: &[u8], slice: &[u8]) -> Option<u64> {
+    let base = bytes.as_ptr() as usize;
+    let start = slice.as_ptr() as usize;
+    let end = start.checked_add(slice.len())?;
+    let bytes_end = base.checked_add(bytes.len())?;
+    (start >= base && end <= bytes_end).then_some((start - base) as u64)
 }
 
 /// Cheap native-code indicators for manual Windows API resolution.
@@ -2289,33 +2306,68 @@ fn clr_resources(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
         return;
     }
 
-    let (count, max_entropy, max_size) = scan_resource_blob(&bytes[base..end]);
+    let (count, max_entropy, max_size, entropy_span, size_span) =
+        scan_resource_blob(&bytes[base..end]);
     if count == 0 {
         return;
     }
     metrics.insert(metric!("pe.clr.managed_resource_count"), count as f64);
-    metrics.insert(metric!("pe.clr.managed_resource_max_entropy"), max_entropy);
-    metrics.insert(metric!("pe.clr.managed_resource_max_size"), max_size as f64);
+    if let Some(span) = entropy_span {
+        let span = crate::output::Span::new(base as u64 + span.offset, span.len);
+        metrics.insert_located(
+            metric!("pe.clr.managed_resource_max_entropy"),
+            max_entropy,
+            [span],
+        );
+    } else {
+        metrics.insert(metric!("pe.clr.managed_resource_max_entropy"), max_entropy);
+    }
+    if let Some(span) = size_span {
+        let span = crate::output::Span::new(base as u64 + span.offset, span.len);
+        metrics.insert_located(
+            metric!("pe.clr.managed_resource_max_size"),
+            max_size as f64,
+            [span],
+        );
+    } else {
+        metrics.insert(metric!("pe.clr.managed_resource_max_size"), max_size as f64);
+    }
 }
 
 /// Walk a CLR resources blob (`[u32 len][bytes]` chunks) and return
-/// `(count, max_entropy, max_size)`. A length that runs past the blob stops the
+/// `(count, max_entropy, max_size, entropy_span, size_span)`. A length that runs past the blob stops the
 /// walk — a corrupt or non-consecutive layout yields a short count, never a
 /// panic or over-read.
-fn scan_resource_blob(blob: &[u8]) -> (u64, f64, u64) {
-    let (mut count, mut max_entropy, mut max_size, mut p) = (0u64, 0.0f64, 0u64, 0usize);
+fn scan_resource_blob(
+    blob: &[u8],
+) -> (
+    u64,
+    f64,
+    u64,
+    Option<crate::output::Span>,
+    Option<crate::output::Span>,
+) {
+    let (mut count, mut max_entropy, mut max_size, mut entropy_span, mut size_span, mut p) =
+        (0u64, 0.0f64, 0u64, None, None, 0usize);
     while p + 4 <= blob.len() {
         let len = u32::from_le_bytes([blob[p], blob[p + 1], blob[p + 2], blob[p + 3]]) as usize;
         p += 4;
         if len == 0 || p + len > blob.len() {
             break;
         }
-        max_entropy = max_entropy.max(entropy::shannon(&blob[p..p + len]));
-        max_size = max_size.max(len as u64);
+        let chunk_entropy = entropy::shannon(&blob[p..p + len]);
+        if chunk_entropy > max_entropy {
+            max_entropy = chunk_entropy;
+            entropy_span = Some(crate::output::Span::new(p as u64, len as u64));
+        }
+        if len as u64 > max_size {
+            max_size = len as u64;
+            size_span = Some(crate::output::Span::new(p as u64, len as u64));
+        }
         count += 1;
         p += len;
     }
-    (count, max_entropy, max_size)
+    (count, max_entropy, max_size, entropy_span, size_span)
 }
 
 fn tls_callbacks(pe: &PE<'_>, values: &mut Values, metrics: &mut Metrics) {
@@ -3789,10 +3841,12 @@ mod tests {
         let low = vec![b'A'; 256]; // entropy 0
         let high: Vec<u8> = (0..=255u8).cycle().take(4096).collect(); // entropy ~8
         let blob = resource_blob(&[&low, &high]);
-        let (count, max_entropy, max_size) = scan_resource_blob(&blob);
+        let (count, max_entropy, max_size, entropy_span, size_span) = scan_resource_blob(&blob);
         assert_eq!(count, 2);
         assert_eq!(max_size, 4096);
         assert!(max_entropy > 7.0, "max_entropy {max_entropy}");
+        assert_eq!(entropy_span.map(|s| s.offset), Some(264));
+        assert_eq!(size_span.map(|s| s.offset), Some(264));
     }
 
     #[test]
@@ -3802,15 +3856,15 @@ mod tests {
         let mut blob = resource_blob(&[b"hello there friend"]);
         blob.extend_from_slice(&u32::MAX.to_le_bytes());
         blob.extend_from_slice(b"trailing");
-        let (count, _, max_size) = scan_resource_blob(&blob);
+        let (count, _, max_size, _, _) = scan_resource_blob(&blob);
         assert_eq!(count, 1);
         assert_eq!(max_size, 18);
     }
 
     #[test]
     fn scan_resource_blob_empty_and_truncated() {
-        assert_eq!(scan_resource_blob(&[]), (0, 0.0, 0));
-        assert_eq!(scan_resource_blob(&[0x10, 0x00]), (0, 0.0, 0)); // < 4 bytes
+        assert_eq!(scan_resource_blob(&[]), (0, 0.0, 0, None, None));
+        assert_eq!(scan_resource_blob(&[0x10, 0x00]), (0, 0.0, 0, None, None)); // < 4 bytes
     }
 
     /// The PE entry-section parity fields (mirroring ELF/Mach-O) emit on a
