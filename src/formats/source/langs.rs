@@ -812,7 +812,13 @@ static PERL: LangConfig = LangConfig {
         (package_statement (package) @class)
         (class_statement (package) @class)
     "#,
-    call_kinds: &["function_call_expression", "method_call_expression"],
+    call_kinds: &[
+        "function_call_expression",
+        // The Perl grammar uses this for ordinary calls without parentheses.
+        // It has the same function/arguments fields as a parenthesized call.
+        "ambiguous_function_call_expression",
+        "method_call_expression",
+    ],
     callee_field: "function",
     arguments_field: "arguments",
     member_kinds: &["method_call_expression"],

@@ -63,6 +63,22 @@ fn function_names(parsed: &filefacts::ParsedFile<'_>) -> Vec<String> {
 }
 
 #[test]
+fn cpan_makefile_pl_retains_perl_calls() {
+    let bytes = b"use strict;\nuse warnings;\nuse ExtUtils::MakeMaker;\nWriteMakefile(NAME => 'Example');\n";
+    let parsed = open_with_path(std::path::Path::new("Example-1.0/Makefile.PL"), bytes).unwrap();
+    assert_eq!(parsed.fileid().file_type(), FileType::Perl);
+    assert!(
+        call_targets(&parsed)
+            .iter()
+            .any(|name| name == "WriteMakefile")
+    );
+    let _ = parsed.values();
+    let _ = parsed.metrics();
+    let _ = parsed.flow();
+    assert_eq!(parsed.parse_count(), 1);
+}
+
+#[test]
 fn json_manifest_parses_once_through_all_views() {
     let bytes = br#"{"name":"sample","version":"1.0.0","scripts":{"preinstall":"echo hi"}}"#;
     let parsed = open_with_path(std::path::Path::new("package.json"), bytes).unwrap();
@@ -827,6 +843,177 @@ fn elixir_call_arguments_survive_unfielded_argument_lists() {
 }
 
 #[test]
+fn perl_static_function_nodes_retain_call_targets() {
+    let source = br#"
+use strict;
+emit('one');
+Example::emit('two');
+system('printf', 'three');
+my $callback = sub { return 'four' };
+&$callback('five');
+# counterfeit('six');
+my $doc = "pretend('seven')";
+"#;
+    let p = open_with_path(std::path::Path::new("calls.pl"), source).unwrap();
+    assert_eq!(call_targets(&p), ["emit", "Example::emit", "system"]);
+    let flow = p.flow().unwrap();
+    let targets: Vec<_> = flow
+        .values
+        .iter()
+        .filter_map(|v| v.target.as_deref())
+        .collect();
+    assert_eq!(targets, ["emit", "Example::emit", "system"]);
+    assert_eq!(p.parse_count(), 1);
+}
+
+#[test]
+fn perl_method_calls_retain_receiver_and_static_method() {
+    let source = br#"
+Example::Client->new('hello');
+$client->emit('hello');
+Example::Client->new()->emit('hello');
+$client->$method('hello');
+${factory()}->emit('hello');
+# $client->comment_only('hello');
+my $documentation = '$client->quoted_only("hello")';
+"#;
+    let parsed = open_with_path(std::path::Path::new("methods.pl"), source).unwrap();
+    let targets = call_targets(&parsed);
+    for expected in [
+        "Example::Client.new",
+        "$client.emit",
+        "Example::Client.new.emit",
+    ] {
+        assert!(
+            targets.iter().any(|target| target == expected),
+            "{targets:?}"
+        );
+    }
+    assert!(!targets.iter().any(|target| target == "Example::Client"));
+    assert!(!targets.iter().any(|target| target.contains("$method")));
+    assert!(
+        !targets
+            .iter()
+            .any(|target| target.contains("comment_only") || target.contains("quoted_only"))
+    );
+    let calls: Vec<_> = parsed.symbols().iter_kind(SymbolKind::Call).collect();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| matches!(call, Symbol::Call { target: None, .. }))
+            .count(),
+        2
+    );
+    let flow = parsed.flow().unwrap();
+    for call in calls {
+        let Symbol::Call {
+            target,
+            offset: Some(offset),
+            ..
+        } = call
+        else {
+            unreachable!()
+        };
+        assert!(flow.values.iter().any(|value| value.kind == "call"
+            && value.offset == *offset as usize
+            && value.target.as_ref() == target.as_ref()));
+    }
+    assert_eq!(parsed.parse_count(), 1);
+}
+
+#[test]
+fn perl_single_argument_is_not_mistaken_for_argument_list() {
+    let source = b"emit('one'); emit(17); emit(inner('nested')); emit('a', 'b'); emit();\n";
+    let p = open_with_path(std::path::Path::new("args.pl"), source).unwrap();
+    let calls: Vec<_> = p
+        .symbols()
+        .iter_kind(SymbolKind::Call)
+        .filter_map(|s| match s {
+            Symbol::Call {
+                target: Some(t),
+                args,
+                ..
+            } if t == "emit" => Some(args),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 5);
+    assert!(matches!(calls[0].as_slice(), [filefacts::Arg::String { value }] if value == "one"));
+    assert!(matches!(
+        calls[1].as_slice(),
+        [filefacts::Arg::Number { value: 17, .. }]
+    ));
+    assert!(matches!(calls[2].as_slice(), [filefacts::Arg::Call]));
+    assert_eq!(calls[3].len(), 2);
+    assert!(calls[4].is_empty());
+    let flow = p.flow().unwrap();
+    let inputs: Vec<_> = flow
+        .values
+        .iter()
+        .filter(|v| v.target.as_deref() == Some("emit"))
+        .map(|v| v.inputs.as_slice())
+        .collect();
+    assert_eq!(
+        inputs.iter().map(|i| i.len()).collect::<Vec<_>>(),
+        [1, 1, 1, 2, 0]
+    );
+    assert!(
+        matches!(&flow.values[inputs[0][0]].literal, Some(filefacts::Arg::String { value }) if value == "one")
+    );
+    assert_eq!(flow.values[inputs[2][0]].target.as_deref(), Some("inner"));
+    assert_eq!(p.parse_count(), 1);
+}
+
+#[test]
+fn perl_unparenthesized_calls_retain_targets_and_arguments() {
+    let source = br#"
+notify('one', 'two');
+notify 'one', 'two';
+system('printf', '%s', 'hello');
+system 'printf', '%s', 'hello';
+open($input, '<', 'README');
+open $input, '<', 'README';
+# pretend 'comment';
+my $example = "counterfeit 'quoted'";
+"#;
+    let parsed = open_with_path(std::path::Path::new("list_calls.pl"), source).unwrap();
+    let calls: Vec<_> = parsed.symbols().iter_kind(SymbolKind::Call).collect();
+    assert_eq!(
+        call_targets(&parsed),
+        ["notify", "notify", "system", "system", "open", "open"]
+    );
+    let flow = parsed.flow().unwrap();
+    for pair in calls.as_chunks::<2>().0 {
+        let (
+            Symbol::Call {
+                args: parenthesized,
+                ..
+            },
+            Symbol::Call {
+                args: bare,
+                target,
+                offset: Some(offset),
+            },
+        ) = (pair[0], pair[1])
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            serde_json::to_value(parenthesized).unwrap(),
+            serde_json::to_value(bare).unwrap()
+        );
+        let value = flow
+            .values
+            .iter()
+            .find(|value| value.kind == "call" && value.offset == *offset as usize)
+            .unwrap();
+        assert_eq!(value.target.as_ref(), target.as_ref());
+        assert_eq!(value.inputs.len(), bare.len());
+    }
+    assert_eq!(parsed.parse_count(), 1);
+}
+
+#[test]
 fn elixir_arguments_do_not_include_nested_calls_or_do_blocks() {
     let source =
         b"consume(produce(\"inner\"), \"outer\")\nempty()\nwrapper do\n nested(\"body\")\nend\n";
@@ -853,6 +1040,69 @@ fn elixir_arguments_do_not_include_nested_calls_or_do_blocks() {
         assert_eq!(args.len(), count, "{name}: {args:?}");
     }
     assert_eq!(p.parse_count(), 1);
+}
+
+fn elixir_heredoc_cases() -> [(&'static str, &'static str); 8] {
+    [
+        (
+            "\"\"\"\n  hello\n    world\\n\n  \"\"\"",
+            "hello\n  world\n\n",
+        ),
+        ("'''\n  hello\\tworld\n  '''", "hello\tworld\n"),
+        ("\"\"\"\n  \"\"\"", ""),
+        ("\"\"\"\n  héllo\n\n    tail\n  \"\"\"", "héllo\n\n  tail\n"),
+        ("\"  first\n  second\"", "  first\n  second"),
+        ("\"\"\"\n  keep margin\n\"\"\"", "  keep margin\n"),
+        ("\"\"\"\n\tline\\nnext\n\t\"\"\"", "line\nnext\n"),
+        ("\"\"\"\n  \\\"quoted\\\"\\\\n\n  \"\"\"", "\"quoted\"\\n\n"),
+    ]
+}
+
+#[test]
+fn elixir_heredoc_literals_strip_delimiters_and_indentation() {
+    for (literal, expected) in elixir_heredoc_cases() {
+        let source = format!("consume({literal})\n");
+        let p = open_with_path(std::path::Path::new("heredoc.ex"), source.as_bytes()).unwrap();
+        assert!(
+            p.literals().iter().any(|s| s.text == expected),
+            "{literal}: {:?}",
+            p.literals()
+        );
+        assert_eq!(p.parse_count(), 1);
+    }
+}
+
+#[test]
+fn elixir_heredoc_arguments_agree_with_flow_values() {
+    for (literal, expected) in elixir_heredoc_cases() {
+        let source = format!("consume({literal})\n");
+        let p = open_with_path(std::path::Path::new("heredoc.ex"), source.as_bytes()).unwrap();
+        let args = p
+            .symbols()
+            .iter_kind(SymbolKind::Call)
+            .find_map(|s| match s {
+                Symbol::Call {
+                    target: Some(t),
+                    args,
+                    ..
+                } if t == "consume" => Some(args),
+                _ => None,
+            })
+            .expect("consume call");
+        assert!(
+            matches!(&args[0], filefacts::Arg::String { value } if value == expected),
+            "{literal}: {args:?}"
+        );
+        let flow = p.flow().expect("source flow");
+        let call = flow
+            .values
+            .iter()
+            .find(|v| v.target.as_deref() == Some("consume"))
+            .unwrap();
+        assert!(matches!(&flow.values[call.inputs[0]].literal,
+            Some(filefacts::Arg::String { value }) if value == expected));
+        assert_eq!(p.parse_count(), 1);
+    }
 }
 
 #[test]

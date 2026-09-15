@@ -82,6 +82,38 @@ pub(super) fn decode(s: &str) -> String {
     out
 }
 
+/// Normalize Elixir's triple-quoted string/charlist syntax before escape
+/// decoding. Closing-delimiter indentation, not minimum content indentation,
+/// determines the margin removed from each line. Called only for Elixir:
+/// Python triple quotes, for example, do not strip this margin.
+pub(super) fn decode_elixir_heredoc(raw: &str) -> Option<String> {
+    let delimiter = if raw.starts_with("\"\"\"") {
+        "\"\"\""
+    } else {
+        "'''"
+    };
+    let inner = raw.strip_prefix(delimiter)?.strip_suffix(delimiter)?;
+    let (opening, body) = inner.split_once('\n')?;
+    if !opening.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\r')) {
+        return None;
+    }
+    let closing_line = body.rfind('\n').map_or(0, |i| i + 1);
+    let indent = &body[closing_line..];
+    if !indent.bytes().all(|b| matches!(b, b' ' | b'\t')) {
+        return None;
+    }
+    let mut normalized = String::with_capacity(body.len());
+    for line in body[..closing_line].split_inclusive('\n') {
+        let margin = line
+            .bytes()
+            .take(indent.len())
+            .take_while(|b| matches!(b, b' ' | b'\t'))
+            .count();
+        normalized.push_str(&line[margin..]);
+    }
+    Some(decode(&normalized))
+}
+
 /// Read exactly `n` hex digits, consuming them only if all `n` are present.
 fn take_hex_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, n: usize) -> Option<u32> {
     // Read from a clone and commit only on success, so a truncated escape
@@ -159,6 +191,19 @@ fn decode_unicode_escape_inner(
 #[cfg(test)]
 mod tests {
     use super::decode;
+
+    #[test]
+    fn elixir_heredoc_requires_complete_delimiters_and_margin() {
+        for raw in [
+            "\"\"\"\ntext",
+            "\"\"\"text\"\"\"",
+            "\"\"\"\ntext\"\"\"",
+            "\"\"\"\ntext\n'''",
+            "\"plain\"",
+        ] {
+            assert_eq!(super::decode_elixir_heredoc(raw), None, "{raw:?}");
+        }
+    }
 
     #[test]
     fn hex_escapes_are_decoded() {

@@ -771,9 +771,14 @@ impl State {
     }
 
     fn record_call(&mut self, node: Node<'_>, source: &str, config: &LangConfig) {
-        let callee = node
-            .child_by_field_name(config.callee_field)
-            .or_else(|| first_named_child(node));
+        // Perl stores the receiver and method on the call itself, not under
+        // a `function` child. Its first child is only the receiver.
+        let callee = if config.name == "perl" && node.kind() == "method_call_expression" {
+            Some(node)
+        } else {
+            node.child_by_field_name(config.callee_field)
+                .or_else(|| first_named_child(node))
+        };
         let args_node = config.argument_list(node);
 
         let target = callee.and_then(|c| static_dotted_chain(c, source, config, 0));
@@ -788,12 +793,18 @@ impl State {
                 args.push(build_arg(arg, source, config));
             }
         } else if let Some(args_root) = args_node {
-            let mut cursor = args_root.walk();
-            for arg in args_root.named_children(&mut cursor) {
-                if arg.kind() == "command_argument_sep" {
-                    continue;
+            // Perl's arguments field is an expression, not a wrapper. Only
+            // a comma-separated list has children representing distinct args.
+            if config.name == "perl" && args_root.kind() != "list_expression" {
+                args.push(build_arg(args_root, source, config));
+            } else {
+                let mut cursor = args_root.walk();
+                for arg in args_root.named_children(&mut cursor) {
+                    if arg.kind() == "command_argument_sep" {
+                        continue;
+                    }
+                    args.push(build_arg(arg, source, config));
                 }
-                args.push(build_arg(arg, source, config));
             }
         }
 
@@ -875,13 +886,13 @@ pub(super) fn build_arg(node: Node<'_>, source: &str, config: &LangConfig) -> Ar
     // PHP double-quoted strings are `encapsed_string` (quoted, so `decode`
     // works) but aren't in `string_kinds`, so shape them as String directly.
     if node.kind() == "encapsed_string" {
-        return match decode_string_literal(node, source) {
+        return match decode_string_literal(node, source, config) {
             Some(value) => Arg::String { value },
             None => Arg::Expression,
         };
     }
     match arg_shape(node, config) {
-        ArgShape::String => match decode_string_literal(node, source) {
+        ArgShape::String => match decode_string_literal(node, source, config) {
             Some(value) => Arg::String { value },
             None => Arg::Expression,
         },
@@ -975,12 +986,39 @@ pub(super) fn static_dotted_chain(
     if config.name == "rust" && node.kind() == "scoped_identifier" {
         return node.utf8_text(source.as_bytes()).ok().map(str::to_string);
     }
+    // Perl aliases both bareword callees and builtin names to `function`.
+    // A leaf is a static name; non-leaf forms can dereference a code variable
+    // (`&$callback`) and must remain unresolved rather than becoming symbols.
+    if config.name == "perl" && node.kind() == "function" && node.named_child_count() == 0 {
+        return node.utf8_text(source.as_bytes()).ok().map(str::to_string);
+    }
+    // A simple Perl scalar is a lexical receiver spelling, not a resolved
+    // runtime type. Dereferences and computed variable names stay unknown.
+    if config.name == "perl" && node.kind() == "scalar" {
+        let name = node.named_child(0)?;
+        if name.kind() == "varname" && name.named_child_count() == 0 {
+            let value = name.utf8_text(source.as_bytes()).ok()?;
+            if !value.is_empty()
+                && value
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == ':')
+            {
+                return node.utf8_text(source.as_bytes()).ok().map(str::to_string);
+            }
+        }
+        return None;
+    }
     if config.identifier_kinds.contains(&node.kind()) {
         return node.utf8_text(source.as_bytes()).ok().map(str::to_string);
     }
     if config.member_kinds.contains(&node.kind()) {
         let object = node.child_by_field_name(config.member_object_field)?;
         let prop = node.child_by_field_name(config.member_property_field)?;
+        // `$receiver->$method(...)` has a scalar child inside `method`;
+        // unlike a bareword method, its name is chosen at runtime.
+        if config.name == "perl" && prop.named_child_count() != 0 {
+            return None;
+        }
         let object_path = static_dotted_chain(object, source, config, depth + 1)?;
         let prop_text = prop.utf8_text(source.as_bytes()).ok()?;
         if prop_text.is_empty() {
@@ -1071,7 +1109,7 @@ fn try_fold_string_subscript(
         return None;
     }
     let object_path = static_dotted_chain(object, source, config, depth + 1)?;
-    let prop = decode_string_literal(index, source)?;
+    let prop = decode_string_literal(index, source, config)?;
     // Conservative: only fold string indices whose content looks like
     // an identifier (alphanumeric + underscore, no leading digit).
     // Skips `"foo bar"` or `"123"` that wouldn't be valid as dotted
@@ -1087,8 +1125,11 @@ fn try_fold_string_subscript(
     Some(format!("{object_path}.{prop}"))
 }
 
-fn decode_string_literal(node: Node<'_>, source: &str) -> Option<String> {
+fn decode_string_literal(node: Node<'_>, source: &str, config: &LangConfig) -> Option<String> {
     let raw = node.utf8_text(source.as_bytes()).ok()?;
+    if config.name == "elixir" && (raw.starts_with("\"\"\"") || raw.starts_with("'''")) {
+        return super::escapes::decode_elixir_heredoc(raw);
+    }
     let bytes = raw.as_bytes();
     if bytes.len() < 2 {
         return None;

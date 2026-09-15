@@ -285,6 +285,7 @@ fn is_url(s: &str) -> bool {
         || lower.starts_with("file://")
         || lower.starts_with("ws://")
         || lower.starts_with("wss://")
+        || super::looks_like_protocolless_url(s)
 }
 
 fn is_file_path(s: &str) -> bool {
@@ -475,5 +476,12 @@ mod tests {
             &mut m,
         );
         assert_eq!(m.get("strings.shell"), Some(2.0));
+    }
+
+    #[test]
+    fn protocol_less_host_path_counts_as_url() {
+        let mut m = Metrics::new();
+        emit(&["cdn.jsdelivr.net/gh/123456/repo/stage"], &mut m);
+        assert_eq!(m.get("strings.url_count"), Some(1.0));
     }
 }

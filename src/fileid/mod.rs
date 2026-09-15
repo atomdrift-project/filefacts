@@ -667,8 +667,8 @@ pub enum FileType {
     PgpSignature,
     /// Plain text data (.txt, .text, or printable text with no stronger type)
     Text,
-    /// Opaque binary data (.dat, .bin, .payload, .raw) — commonly carries
-    /// encrypted/XOR'd malware payloads. Routed through the generic analyzer
+    /// Opaque or sidecar data (.dat, .bin, .payload, .raw, and .map) — commonly carries
+    /// encrypted/XOR-d payloads or source-map embedded code. Routed through the generic analyzer
     /// so string extraction, entropy, and encoded-payload detection still fire.
     Data,
     /// File type could not be determined
@@ -1951,6 +1951,21 @@ message CommandMessage {
     }
 
     #[test]
+    fn cpan_makefile_pl_is_perl() {
+        for name in ["Makefile.PL", "makefile.pl", "MAKEFILE.PL", "Build.PL"] {
+            assert_ext(name, FileType::Perl);
+            assert_detect(
+                &format!("distribution/{name}"),
+                b"use ExtUtils::MakeMaker;\nWriteMakefile(NAME => 'Example');\n",
+                FileType::Perl,
+            );
+        }
+        for name in ["Makefile", "Makefile.debug", "Makefile.in", "GNUmakefile"] {
+            assert_detect(name, b"all:\n\techo hi\n", FileType::Makefile);
+        }
+    }
+
+    #[test]
     fn perl_by_shebang() {
         assert_detect("tool", b"#!/usr/bin/perl\nuse strict;\n", FileType::Perl);
     }
@@ -2759,6 +2774,12 @@ function wpcf7_special_mail_tag( $output, $name, $html ) {
     #[test]
     fn txt_detects_as_text() {
         assert_detect("notes.txt", b"some text here", FileType::Text);
+    }
+
+    #[test]
+    fn source_map_sidecars_detect_as_data() {
+        assert_ext("package/parse.ts.map", FileType::Data);
+        assert_ext("bundle.map", FileType::Data);
     }
 
     #[test]

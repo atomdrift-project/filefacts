@@ -225,6 +225,7 @@ pub(crate) fn is_data_format(path: &Path) -> bool {
             | "elv"
             | "nu"
             | "fish"
+            | "map"
     )
 }
 
@@ -296,6 +297,11 @@ fn detect_from_filename(path: &Path) -> Option<FileType> {
     }
     if name == "Containerfile" || name.starts_with("Containerfile.") {
         return Some(FileType::Dockerfile);
+    }
+    // CPAN's MakeMaker entry point generates a Makefile; it is itself Perl.
+    // Settle the canonical name before the broad Makefile variant prefix.
+    if name.eq_ignore_ascii_case("Makefile.PL") {
+        return Some(FileType::Perl);
     }
     if name.starts_with("Makefile") || name.starts_with("GNUmakefile") {
         return Some(FileType::Makefile);
@@ -552,6 +558,10 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "sha256sum" | "sha512sum" | "sha1sum" | "md5sum" | "sha256" | "sha512" | "checksum"
         | "checksums" => Some(FileType::Text),
         "txt" | "text" | "b64" | "base64" => Some(FileType::Text),
+        // Source maps are structured data sidecars. Keeping them as Data lets the
+        // archive analyzer inspect both ordinary JSON maps and raw embedded
+        // Base64 payloads instead of dropping them as unknown members.
+        "map" => Some(FileType::Data),
         // Opaque binary "data" extensions that commonly carry encrypted/XOR'd payloads
         // (PlugX's Canon.dat, Cobalt Strike profiles, shellcode drops).
         "dat" | "bin" | "payload" | "raw" => Some(FileType::Data),
@@ -902,6 +912,7 @@ mod tests {
         assert!(is_data_format(Path::new("data.json")));
         assert!(is_data_format(Path::new("evil.service")));
         assert!(is_data_format(Path::new("notes.txt")));
+        assert!(is_data_format(Path::new("package/parse.ts.map")));
         assert!(!is_data_format(Path::new("script.py")));
         assert!(!is_data_format(Path::new("binary")));
     }

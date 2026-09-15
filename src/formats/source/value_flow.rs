@@ -160,7 +160,11 @@ impl Builder<'_> {
             }
         }
         if self.config.call_kinds.contains(&node.kind()) {
-            let callee = node.child_by_field_name(self.config.callee_field);
+            let callee = if self.config.name == "perl" && node.kind() == "method_call_expression" {
+                Some(node)
+            } else {
+                node.child_by_field_name(self.config.callee_field)
+            };
             let mut inputs = Vec::new();
             if self.config.arguments_field == "argument" {
                 let mut cursor = node.walk();
@@ -168,8 +172,12 @@ impl Builder<'_> {
                     inputs.push(self.eval(arg, bindings, returns, depth + 1));
                 }
             } else if let Some(args) = self.config.argument_list(node) {
-                for arg in children(args) {
-                    inputs.push(self.eval(arg, bindings, returns, depth + 1));
+                if self.config.name == "perl" && args.kind() != "list_expression" {
+                    inputs.push(self.eval(args, bindings, returns, depth + 1));
+                } else {
+                    for arg in children(args) {
+                        inputs.push(self.eval(arg, bindings, returns, depth + 1));
+                    }
                 }
             }
             let receiver = callee

