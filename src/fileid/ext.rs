@@ -539,6 +539,7 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "cab" | "msu" => Some(FileType::Cab),
         "chm" => Some(FileType::Chm),
         "asar" => Some(FileType::Asar),
+        "cpio" => Some(FileType::Cpio),
         "gz" => Some(FileType::Gz),
         "bz2" => Some(FileType::Bz2),
         "xz" => Some(FileType::Xz),

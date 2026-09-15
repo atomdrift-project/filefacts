@@ -501,6 +501,15 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
                 None
             }
         }
+        b'0' => {
+            // ASCII CPIO. The six-digit magic alone is six ordinary digits, so
+            // require the whole fixed-size header to be digits of its radix.
+            if looks_like_ascii_cpio(data) {
+                Some((FileType::Cpio, DetectionSource::Magic))
+            } else {
+                None
+            }
+        }
         b'7' => {
             // 7z: 37 7A BC AF 27 1C
             if data.starts_with(b"7z\xBC\xAF\x27\x1C") {
@@ -645,6 +654,23 @@ fn ar_first_member_is(data: &[u8], want: &[u8]) -> bool {
     let name = &field[..end];
     let name = name.strip_suffix(b"/").unwrap_or(name);
     name == want
+}
+
+/// ASCII CPIO (`odc`, `newc`, `newc`+checksum), identified by a complete and
+/// well-formed fixed-size first header rather than by the magic alone. Binary
+/// and RPM-stripped CPIO carry different framing and are not claimed here.
+fn looks_like_ascii_cpio(data: &[u8]) -> bool {
+    let (header, radix) = match data.get(..6) {
+        Some(b"070707") => (76, 8),
+        Some(b"070701" | b"070702") => (110, 16),
+        _ => return false,
+    };
+    data.get(6..header).is_some_and(|fields| {
+        fields.iter().all(|b| match radix {
+            8 => matches!(b, b'0'..=b'7'),
+            _ => b.is_ascii_hexdigit(),
+        })
+    })
 }
 
 fn looks_like_udif_dmg(data: &[u8]) -> bool {

@@ -42,6 +42,7 @@ mod chm;
 mod class;
 pub(crate) mod common;
 mod containers;
+mod cpio;
 mod crx;
 mod deb;
 mod dmg;
@@ -90,6 +91,7 @@ mod registry;
 mod rpm;
 mod rtf;
 mod rust_crate;
+mod scpt;
 pub(crate) mod source;
 mod source_meta;
 mod structured;
@@ -169,6 +171,7 @@ pub(crate) fn extract(
     }
 
     let result = match file_type {
+        FileType::AppleScript => scpt::extract(bytes, values, strings, metrics, symbols),
         FileType::Pe => pe::extract(bytes, values, strings, metrics, sections, symbols, errors),
         FileType::Elf => elf::extract(bytes, values, strings, metrics, sections, symbols, errors),
         FileType::Wasm => wasm::extract(bytes, values, strings, metrics, sections, symbols, errors),
@@ -205,6 +208,7 @@ pub(crate) fn extract(
         // decode the header for the public key and derived extension id.
         FileType::Crx => crx::extract(bytes, values, metrics, archive_members),
         FileType::Asar => asar::extract(bytes, values, metrics, archive_members),
+        FileType::Cpio => cpio::extract(bytes, values, archive_members),
         FileType::Ooxml => {
             // Open the ZIP container once: generic archive facts first,
             // then the OOXML-specific `office.*` layer from the same handle.

@@ -13,6 +13,7 @@ struct Builder<'a> {
     aliases: HashMap<String, String>,
     flow: Flow,
     steps: usize,
+    in_function: bool,
 }
 
 fn children(node: Node<'_>) -> Vec<Node<'_>> {
@@ -108,8 +109,19 @@ impl Builder<'_> {
             return 0;
         }
         self.steps += 1;
-        if definition(node)
-            || node.kind().contains("comment")
+        if definition(node) {
+            // The outer function walk deliberately stops at named functions.
+            // Anonymous definitions encountered while evaluating their bodies
+            // must report the same limitation as top-level callbacks, rather
+            // than silently omitting all calls inside the callback.
+            if function_name(node).is_none() {
+                self.flow.limitations.insert("anonymous-function".into());
+            } else if self.in_function {
+                self.flow.limitations.insert("nested-function".into());
+            }
+            return 0;
+        }
+        if node.kind().contains("comment")
             || node.kind().starts_with("import")
             || node.kind() == "use_declaration"
         {
@@ -133,18 +145,27 @@ impl Builder<'_> {
             }
             return id;
         }
-        if matches!(
+        // Some grammars name the `+=` form directly; others reuse the plain
+        // assignment kind and hang the operator off it. Each kind is named
+        // once here so the two spellings cannot drift apart.
+        let augmented = matches!(
             node.kind(),
-            "assignment"
-                | "assignment_expression"
-                | "assignment_statement"
-                | "short_var_declaration"
-                | "let_declaration"
-                | "let_condition"
-                | "variable_declarator"
-                | "var_spec"
-                | "init_declarator"
-        ) {
+            "augmented_assignment_expression" | "augmented_assignment" | "compound_assignment_expr"
+        );
+        if augmented
+            || matches!(
+                node.kind(),
+                "assignment"
+                    | "assignment_expression"
+                    | "assignment_statement"
+                    | "short_var_declaration"
+                    | "let_declaration"
+                    | "let_condition"
+                    | "variable_declarator"
+                    | "var_spec"
+                    | "init_declarator"
+            )
+        {
             let target = node
                 .child_by_field_name("left")
                 .or_else(|| node.child_by_field_name("pattern"))
@@ -154,7 +175,36 @@ impl Builder<'_> {
                 .child_by_field_name("right")
                 .or_else(|| node.child_by_field_name("value"));
             if let (Some(target), Some(value)) = (target, value) {
-                let id = self.eval(value, bindings, returns, depth + 1);
+                let compound = augmented
+                    || node
+                        .child_by_field_name("operator")
+                        .is_some_and(|operator| !matches!(self.text(operator), "=" | ":="));
+                let previous = if compound {
+                    // Go wraps even a single assignment place in an
+                    // expression_list. Do not treat that wrapper as a new name.
+                    let place =
+                        if target.kind() == "expression_list" && target.named_child_count() == 1 {
+                            target.named_child(0).unwrap_or(target)
+                        } else {
+                            target
+                        };
+                    if self.config.identifier_kinds.contains(&place.kind()) {
+                        bindings.get(self.text(place)).copied().unwrap_or(0)
+                    } else {
+                        self.flow
+                            .limitations
+                            .insert("compound-assignment-target".into());
+                        0
+                    }
+                } else {
+                    0
+                };
+                let value_id = self.eval(value, bindings, returns, depth + 1);
+                let id = if compound {
+                    self.add("merge", node, vec![previous, value_id])
+                } else {
+                    value_id
+                };
                 self.bind(target, id, bindings);
                 return id;
             }
@@ -383,6 +433,7 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
             ..Default::default()
         },
         steps: 0,
+        in_function: false,
     };
     builder
         .flow
@@ -436,7 +487,9 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
                     }
                 }
                 if let Some(body) = node.child_by_field_name("body") {
+                    builder.in_function = true;
                     let tail = builder.eval(body, &mut bindings, &mut function.returns, 0);
+                    builder.in_function = false;
                     if config.name == "rust" {
                         function.returns.push(tail);
                     }
@@ -486,6 +539,72 @@ mod tests {
             })
     }
     #[test]
+    fn anonymous_function_limitations_survive_named_function_boundaries() {
+        for (path, source) in [
+            ("a.js", "register(() => send(acquire()));"),
+            (
+                "a.js",
+                "function activate(){register(() => send(acquire()));}",
+            ),
+            (
+                "a.js",
+                "function activate(){register(function(){send(acquire());});}",
+            ),
+            (
+                "a.ts",
+                "function activate(){register(() => send(acquire()));}",
+            ),
+            (
+                "a.py",
+                "def activate():\n register(lambda: send(acquire()))\n",
+            ),
+            (
+                "a.go",
+                "package p\nfunc activate(){register(func(){send(acquire())})}",
+            ),
+        ] {
+            let flow = graph(path, source);
+            assert!(
+                !flow.limitations.contains("parse-error"),
+                "{path}: {flow:?}"
+            );
+            assert!(
+                flow.limitations.contains("anonymous-function"),
+                "{path}: {flow:?}"
+            );
+            assert!(
+                flow.values
+                    .iter()
+                    .any(|v| v.target.as_deref() == Some("register")),
+                "{path}"
+            );
+            // This diagnostic repair must not invent a modeled callback body.
+            assert!(
+                !flow
+                    .values
+                    .iter()
+                    .any(|v| v.target.as_deref() == Some("send")),
+                "{path}"
+            );
+        }
+        let direct = graph("a.js", "function activate(){send(acquire());}");
+        assert!(!direct.limitations.contains("anonymous-function"));
+        assert!(reaches(&direct, "send", "acquire"));
+        assert!(!direct.limitations.contains("nested-function"));
+        let nested = graph(
+            "a.js",
+            "function outer(){function inner(){register(() => send(acquire()));} inner();}",
+        );
+        assert!(nested.limitations.contains("nested-function"));
+        assert!(!nested.functions.contains_key("inner"));
+        assert!(
+            !nested
+                .values
+                .iter()
+                .any(|v| v.target.as_deref() == Some("send"))
+        );
+    }
+    #[test]
     fn shared_assignment_and_helper_contract() {
         for (path, source) in [
             (
@@ -516,6 +635,65 @@ mod tests {
             let flow = graph(path, source);
             assert!(reaches(&flow, "send", "acquire"), "{path}: {flow:?}");
         }
+    }
+
+    #[test]
+    fn compound_assignments_preserve_both_operands_and_later_overwrites() {
+        for (path, prefix, initial, suffix) in [
+            ("a.js", "function run(){", "let value=left();", "}"),
+            ("a.ts", "function run(){", "let value=left();", "}"),
+            ("a.py", "def run():\n ", "value=left();", "\n"),
+            ("a.go", "package p\nfunc run(){", "value:=left();", "}"),
+            ("a.rs", "fn run(){", "let mut value=left();", "}"),
+            ("a.c", "void run(){", "int value=left();", "}"),
+        ] {
+            for (tail, left_expected, right_expected) in [
+                ("value+=right();send(value);", true, true),
+                ("value=right();send(value);", false, true),
+                ("value+=right();value=0;send(value);", false, false),
+                ("value+=right();send(0);", false, false),
+                ("value+=opaque(right());send(value);", true, false),
+            ] {
+                let source = format!("{prefix}{initial}{tail}{suffix}");
+                let flow = graph(path, &source);
+                assert!(
+                    !flow.limitations.contains("parse-error"),
+                    "{path}: {source}"
+                );
+                assert_eq!(
+                    reaches(&flow, "send", "left"),
+                    left_expected,
+                    "{path}: {source}"
+                );
+                assert_eq!(
+                    reaches(&flow, "send", "right"),
+                    right_expected,
+                    "{path}: {source}"
+                );
+            }
+        }
+        let ordered = graph(
+            "a.js",
+            "function run(){let value=left();value+=(value=right());send(value);}",
+        );
+        assert!(reaches(&ordered, "send", "left"));
+        assert!(reaches(&ordered, "send", "right"));
+        for target in ["left", "right"] {
+            assert_eq!(
+                ordered
+                    .values
+                    .iter()
+                    .filter(|v| v.target.as_deref() == Some(target))
+                    .count(),
+                1
+            );
+        }
+        let member = graph(
+            "a.js",
+            "function run(){let obj={};obj.value+=right();send(obj.value);}",
+        );
+        assert!(member.limitations.contains("compound-assignment-target"));
+        assert!(!reaches(&member, "send", "right"));
     }
 
     #[test]

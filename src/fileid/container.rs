@@ -36,6 +36,8 @@ pub enum ArchiveFormat {
     /// POSIX/GNU/pax tar — the container under gem, crate, sdist, npm, the
     /// compressed-tar distro packages, and OCI/Gentoo image bundles.
     Tar,
+    /// ASCII CPIO member stream, without a compression wrapper.
+    Cpio,
     /// ZIP — the container under jar, whl, nupkg, vsix, xpi, crx, conda,
     /// egg, ipa, apk (Android), odf, and bare zips.
     Zip,
@@ -64,6 +66,7 @@ impl ArchiveFormat {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Tar => "tar",
+            Self::Cpio => "cpio",
             Self::Zip => "zip",
             Self::Ar => "ar",
             Self::Xar => "xar",
@@ -211,6 +214,7 @@ impl FileType {
             | Self::Odf
             | Self::Crx => Zip,
             Self::Deb => Ar,
+            Self::Cpio => ArchiveFormat::Cpio,
             Self::PkgMacos => Xar,
             Self::SevenZ => SevenZip,
             Self::Rar => Rar,

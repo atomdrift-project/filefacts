@@ -63,6 +63,7 @@
 #![doc(html_root_url = "https://docs.rs/filefacts/0.1.0")]
 
 mod debug;
+mod embedded_sources;
 mod error;
 mod formats;
 mod go_dependency_context;
@@ -114,6 +115,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+pub use embedded_sources::EmbeddedSource;
 pub use error::Error;
 pub use fileid::{ArchiveFormat, Compression, Container, FileId, FileType, container_of};
 pub use output::{
@@ -340,6 +342,18 @@ impl<'a> ParsedFile<'a> {
     /// Structural key-value view. Computed on first access and cached.
     pub fn values(&self) -> &Values {
         &self.extracted().values
+    }
+
+    /// Declared script bodies in a supported container format. Bodies borrow
+    /// the parsed values; no script is executed and no reference is fetched.
+    /// Unknown interpreters remain explicit rather than being guessed from text.
+    pub fn embedded_sources(&self) -> impl Iterator<Item = EmbeddedSource<'_>> {
+        // Each reader sees the value tree only for the format it understands,
+        // and only that format pays for the extraction.
+        let file_type = self.fileid.file_type();
+        let actions = (file_type == FileType::GithubActions).then(|| self.values());
+        let rpm = (file_type == FileType::Rpm).then(|| self.values());
+        embedded_sources::github_actions(actions).chain(embedded_sources::rpm(rpm))
     }
 
     /// Byte-scan extracted strings (printable ASCII / UTF-16LE runs).

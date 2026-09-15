@@ -6,6 +6,9 @@
 //! BUILDHOST, PACKAGER, …). The header tag set covers the
 //! canonical fields `rpm -qpi` shows.
 //!
+//! Basic declared scriptlets are also exposed as data. No interpreter, macro
+//! expansion or queryformat runs during extraction.
+//!
 //! Schema:
 //!
 //! - `rpm.{name, version, release, epoch, summary, license, url,
@@ -136,8 +139,132 @@ pub(super) fn extract(
     for entry in &main_entries {
         apply_main_tag(entry, main_data, values, metrics);
     }
+    extract_scriptlets(&main_entries, main_data, values)
+}
 
-    Ok(())
+// RPM tag triplets: body, interpreter argv, processing flags. Triggers use
+// different array schemas, not these scalar lifecycle scriptlet tags.
+const SCRIPTLETS: [(&str, u32, u32, u32); 9] = [
+    ("prein", 1023, 1085, 5020),
+    ("postin", 1024, 1086, 5021),
+    ("preun", 1025, 1087, 5022),
+    ("postun", 1026, 1088, 5023),
+    ("pretrans", 1151, 1153, 5024),
+    ("posttrans", 1152, 1154, 5025),
+    ("preuntrans", 5103, 5105, 5107),
+    ("postuntrans", 5104, 5106, 5108),
+    ("verify", 1079, 1091, 5026),
+];
+const MAX_SCRIPT_BYTES: usize = 1024 * 1024;
+const MAX_PROGRAM_ARGS: u32 = 64;
+const MAX_PROGRAM_BYTES: usize = 64 * 1024;
+
+/// The outcome of a header-tag lookup. RPM permits at most one entry per tag,
+/// so a duplicate leaves the value ambiguous — a distinct state from absent,
+/// which for a scriptlet simply means "take the runtime default".
+enum Tag<'a> {
+    Absent,
+    Duplicated,
+    Found(&'a IndexEntry),
+}
+
+fn unique_tag(entries: &[IndexEntry], tag: u32) -> Tag<'_> {
+    let mut found = entries.iter().filter(|e| e.tag == tag);
+    match (found.next(), found.next()) {
+        (Some(entry), None) => Tag::Found(entry),
+        (Some(_), Some(_)) => Tag::Duplicated,
+        (None, _) => Tag::Absent,
+    }
+}
+
+fn script_body<'a>(entry: &IndexEntry, data: &'a [u8]) -> Option<&'a str> {
+    if entry.typ != 6 || entry.count != 1 {
+        return None;
+    }
+    let bytes = data.get(entry.offset as usize..)?;
+    let end = bytes
+        .iter()
+        .take(MAX_SCRIPT_BYTES + 1)
+        .position(|&b| b == 0)?;
+    std::str::from_utf8(&bytes[..end]).ok()
+}
+
+fn program_args(entry: &IndexEntry, data: &[u8]) -> Option<Vec<String>> {
+    // rpmbuild preserves STRING for a single interpreter for legacy compatibility;
+    // STRING_ARRAY is used for interpreter argv. Normalize both to the same view.
+    if !matches!(entry.typ, 6 | 8)
+        || (entry.typ == 6 && entry.count != 1)
+        || entry.count == 0
+        || entry.count > MAX_PROGRAM_ARGS
+    {
+        return None;
+    }
+    let rest = data.get(entry.offset as usize..)?;
+    let mut rest = &rest[..rest.len().min(MAX_PROGRAM_BYTES)];
+    let mut result = Vec::with_capacity(entry.count as usize);
+    for _ in 0..entry.count {
+        let end = rest.iter().position(|&b| b == 0)?;
+        result.push(std::str::from_utf8(&rest[..end]).ok()?.to_owned());
+        rest = &rest[end + 1..];
+    }
+    Some(result)
+}
+
+fn extract_scriptlets(
+    entries: &[IndexEntry],
+    data: &[u8],
+    values: &mut Values,
+) -> Result<(), Error> {
+    let mut scripts = serde_json::Map::new();
+    let mut incomplete = false;
+    for (name, body_tag, prog_tag, flags_tag) in SCRIPTLETS {
+        let body = match unique_tag(entries, body_tag) {
+            Tag::Absent => continue,
+            Tag::Found(entry) => script_body(entry, data),
+            Tag::Duplicated => None,
+        };
+        let Some(body) = body else {
+            incomplete = true;
+            continue;
+        };
+        let mut script = serde_json::Map::new();
+        script.insert("body".into(), JsonValue::String(body.into()));
+        // An absent tag is not a defect: the runtime default is /bin/sh with
+        // no flags. A tag that is present but duplicated or undecodable
+        // records Null — it exists, but its value is not established. No
+        // decoded program or flags value is itself Null, so Null is the
+        // single mark of incomplete evidence.
+        let program = match unique_tag(entries, prog_tag) {
+            Tag::Absent => None,
+            Tag::Found(e) => Some(program_args(e, data).map_or(JsonValue::Null, |a| json!(a))),
+            Tag::Duplicated => Some(JsonValue::Null),
+        };
+        let flags = match unique_tag(entries, flags_tag) {
+            Tag::Absent => None,
+            Tag::Found(e) => Some(decode_u32(e, data).map_or(JsonValue::Null, |f| json!(f))),
+            Tag::Duplicated => Some(JsonValue::Null),
+        };
+        for (key, value) in [("program", program), ("flags", flags)] {
+            if let Some(value) = value {
+                incomplete |= value.is_null();
+                script.insert(key.into(), value);
+            }
+        }
+        scripts.insert(name.into(), JsonValue::Object(script));
+    }
+    if !scripts.is_empty() {
+        values.insert("rpm.scriptlets", JsonValue::Object(scripts));
+    }
+    // Preserve independently valid scripts and metadata before reporting the
+    // partial parse. Bounds also cap copied bodies at nine MiB in aggregate.
+    if incomplete {
+        Err(Error::malformed(
+            "rpm",
+            "scriptlet evidence incomplete: invalid, duplicate or oversized tag",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn apply_main_tag(entry: &IndexEntry, data: &[u8], values: &mut Values, metrics: &mut Metrics) {
@@ -256,6 +383,161 @@ fn read_header(slice: &[u8]) -> Option<(Vec<IndexEntry>, &[u8], usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn script_rpm(tags: Vec<(u32, u32, u32, Vec<u8>)>) -> Vec<u8> {
+        let mut out = vec![0; 96];
+        out[..4].copy_from_slice(&RPM_LEAD_MAGIC);
+        out.extend_from_slice(&[0x8e, 0xad, 0xe8, 1]);
+        out.extend_from_slice(&[0; 12]);
+        out.extend_from_slice(&[0x8e, 0xad, 0xe8, 1]);
+        out.extend_from_slice(&[0; 4]);
+        out.extend_from_slice(&(tags.len() as u32).to_be_bytes());
+        let size: usize = tags.iter().map(|t| t.3.len()).sum();
+        out.extend_from_slice(&(size as u32).to_be_bytes());
+        let mut offset = 0u32;
+        for (tag, typ, count, value) in &tags {
+            for field in [*tag, *typ, offset, *count] {
+                out.extend_from_slice(&field.to_be_bytes());
+            }
+            offset += value.len() as u32;
+        }
+        for (_, _, _, value) in tags {
+            out.extend(value);
+        }
+        out
+    }
+
+    #[test]
+    fn declared_lifecycle_scriptlets_are_separate_units() {
+        let mut tags = vec![(1000, 6, 1, b"fixture\0".to_vec())];
+        for (_, body, program, _) in SCRIPTLETS {
+            tags.push((body, 6, 1, b"echo 'ready'\n\0".to_vec()));
+            tags.push((program, 6, 1, b"/bin/sh\0".to_vec()));
+        }
+        let bytes = script_rpm(tags);
+        let parsed = crate::open(&bytes).unwrap();
+        let sources: Vec<_> = parsed.embedded_sources().collect();
+        assert_eq!(sources.len(), 9);
+        for (name, _, _, _) in SCRIPTLETS {
+            let pointer = format!("/rpm/scriptlets/{name}/body");
+            let source = sources.iter().find(|s| s.pointer == pointer).unwrap();
+            assert_eq!(source.source, "echo 'ready'\n");
+            assert_eq!(source.file_type, Some(crate::FileType::Shell));
+        }
+        assert!(parsed.errors().is_empty());
+        assert_eq!(
+            parsed.values().get("rpm.name").unwrap().as_str(),
+            Some("fixture")
+        );
+    }
+
+    #[test]
+    fn declared_interpreters_defaults_and_processing_flags() {
+        use crate::FileType;
+        for (program, expected) in [
+            (None, Some(FileType::Shell)),
+            (Some("/usr/bin/python3"), Some(FileType::Python)),
+            (Some("/usr/bin/perl"), Some(FileType::Perl)),
+            (Some("/usr/bin/ruby"), Some(FileType::Ruby)),
+            (Some("<lua>"), Some(FileType::Lua)),
+            (Some("/usr/local/bin/custom"), None),
+        ] {
+            let mut tags = vec![(1024, 6, 1, b"print('ready')\0".to_vec())];
+            if let Some(program) = program {
+                tags.push((1086, 8, 1, format!("{program}\0").into_bytes()));
+            }
+            let bytes = script_rpm(tags);
+            let parsed = crate::open(&bytes).unwrap();
+            assert_eq!(
+                parsed.embedded_sources().next().unwrap().file_type,
+                expected
+            );
+        }
+        for tag in [
+            (5021, 4, 1, 1u32.to_be_bytes().to_vec()),
+            (1086, 8, 2, b"/bin/sh\0-c\0".to_vec()),
+        ] {
+            let bytes = script_rpm(vec![(1024, 6, 1, b"echo 'ready'\0".to_vec()), tag]);
+            let parsed = crate::open(&bytes).unwrap();
+            assert!(
+                parsed
+                    .embedded_sources()
+                    .next()
+                    .unwrap()
+                    .file_type
+                    .is_none()
+            );
+            assert!(parsed.errors().is_empty());
+        }
+    }
+
+    #[test]
+    fn invalid_bodies_do_not_hide_later_valid_scriptlets() {
+        for bad in [
+            (1023, 8, 1, b"echo bad\0".to_vec()),
+            (1023, 6, 2, b"echo bad\0".to_vec()),
+            (1023, 6, 1, vec![0xff, 0]),
+        ] {
+            let bytes = script_rpm(vec![bad, (1024, 6, 1, b"echo 'ready'\0".to_vec())]);
+            let parsed = crate::open(&bytes).unwrap();
+            assert_eq!(parsed.embedded_sources().count(), 1);
+            assert!(!parsed.errors().is_empty());
+        }
+        for bad in [b"unterminated".to_vec(), vec![b'x'; MAX_SCRIPT_BYTES + 1]] {
+            let bytes = script_rpm(vec![
+                (1024, 6, 1, b"echo 'ready'\0".to_vec()),
+                (1023, 6, 1, bad),
+            ]);
+            let parsed = crate::open(&bytes).unwrap();
+            assert_eq!(parsed.embedded_sources().count(), 1);
+            assert!(!parsed.errors().is_empty());
+        }
+    }
+
+    #[test]
+    fn duplicate_body_is_ambiguous_and_invalid_program_never_defaults() {
+        let bytes = script_rpm(vec![
+            (1024, 6, 1, b"echo first\0".to_vec()),
+            (1024, 6, 1, b"echo second\0".to_vec()),
+            (1026, 6, 1, b"echo third\0".to_vec()),
+        ]);
+        let parsed = crate::open(&bytes).unwrap();
+        assert_eq!(parsed.embedded_sources().count(), 1);
+        assert!(!parsed.errors().is_empty());
+        for bad in [
+            (1086, 6, 2, b"/bin/sh\0-c\0".to_vec()),
+            (1086, 7, 1, b"/bin/sh\0".to_vec()),
+            (1086, 6, 1, b"/bin/sh".to_vec()),
+            (1086, 8, 0, Vec::new()),
+            (1086, 8, 1, b"/bin/sh".to_vec()),
+            (1086, 8, u32::MAX, Vec::new()),
+            (5021, 6, 1, b"0\0".to_vec()),
+        ] {
+            let bytes = script_rpm(vec![(1024, 6, 1, b"echo 'ready'\0".to_vec()), bad]);
+            let parsed = crate::open(&bytes).unwrap();
+            assert!(
+                parsed
+                    .embedded_sources()
+                    .next()
+                    .unwrap()
+                    .file_type
+                    .is_none()
+            );
+            assert!(!parsed.errors().is_empty());
+        }
+    }
+
+    #[test]
+    fn descriptive_header_strings_are_not_scriptlets() {
+        let bytes = script_rpm(vec![
+            (1000, 6, 1, b"fixture\0".to_vec()),
+            (1004, 9, 1, b"echo 'ready'\0".to_vec()),
+            (1086, 8, 1, b"/bin/sh\0".to_vec()),
+        ]);
+        let parsed = crate::open(&bytes).unwrap();
+        assert_eq!(parsed.embedded_sources().count(), 0);
+        assert!(parsed.errors().is_empty());
+    }
 
     fn build_minimal_rpm() -> Vec<u8> {
         let mut out = Vec::new();

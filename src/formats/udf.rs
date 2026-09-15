@@ -359,7 +359,7 @@ struct FileEntry {
     info_length: u64,
     permissions: u32,
     mtime_unix: Option<i64>,
-    /// First data extent, when the file's bytes are one contiguous run
+    /// First data extent as (length, block), when the file's bytes are one contiguous run
     /// outside the entry itself.
     first_extent: Option<(u32, u32)>,
     /// Data stored inline in the entry (AD type 3).
@@ -402,9 +402,9 @@ fn parse_file_entry(block: &[u8]) -> Option<FileEntry> {
     let ads = block.get(ad_start..ad_start.checked_add(l_ad)?)?;
     entry.first_extent = match ad_type {
         // short_ad: length u32 (high 2 bits are the extent type), position u32
-        0 => Some((u32_le(ads, 4)?, u32_le(ads, 0)? & 0x3FFF_FFFF)),
+        0 => Some((u32_le(ads, 0)? & 0x3FFF_FFFF, u32_le(ads, 4)?)),
         // long_ad: length u32, block u32, partition u16, impl [6]
-        1 => Some((u32_le(ads, 4)?, u32_le(ads, 0)? & 0x3FFF_FFFF)),
+        1 => Some((u32_le(ads, 0)? & 0x3FFF_FFFF, u32_le(ads, 4)?)),
         _ => None,
     };
     Some(entry)
@@ -559,7 +559,8 @@ fn parse_fids(data: &[u8]) -> Vec<(String, u32, bool)> {
         }
         let characteristics = rec.get(18).copied().unwrap_or(0);
         let l_fi = rec.get(19).copied().unwrap_or(0) as usize;
-        let icb_block = u32_le(rec, 20).unwrap_or(0);
+        // The ICB is a long_ad at +20: extent length first, then block number.
+        let icb_block = u32_le(rec, 24).unwrap_or(0);
         let l_iu = u16_le(rec, 36).unwrap_or(0) as usize;
         let name_off = 38 + l_iu;
         let total = name_off + l_fi;
@@ -652,5 +653,55 @@ mod tests {
     #[test]
     fn file_identifiers_reject_a_non_fid_run() {
         assert!(parse_fids(&[0_u8; 64]).is_empty());
+    }
+
+    #[test]
+    fn walks_partition_relative_udf_file_extents() {
+        // Different lengths and block numbers catch accidentally interchanged
+        // allocation-descriptor fields. Exercise both short_ad and long_ad,
+        // extended attributes before the AD, and a nonzero partition base.
+        for ad_type in [0_u16, 1] {
+            let mut bytes = vec![0_u8; 5 * SECTOR];
+            let name = b"\x08payload.dll";
+            let record_len = (38 + name.len()).div_ceil(4) * 4;
+            for (sector, file_type, length, data_block, ea_len) in [
+                (1, 4_u8, record_len as u64, 1_u32, 24_usize),
+                (3, 5_u8, 4_u64, 3_u32, 0_usize),
+            ] {
+                let fe = &mut bytes[sector * SECTOR..(sector + 1) * SECTOR];
+                fe[0..2].copy_from_slice(&tag::FILE_ENTRY.to_le_bytes());
+                fe[27] = file_type;
+                fe[34..36].copy_from_slice(&ad_type.to_le_bytes());
+                fe[56..64].copy_from_slice(&length.to_le_bytes());
+                fe[168..172].copy_from_slice(&(ea_len as u32).to_le_bytes());
+                let ad_len = if ad_type == 0 { 8_u32 } else { 16_u32 };
+                fe[172..176].copy_from_slice(&ad_len.to_le_bytes());
+                let ad = 176 + ea_len;
+                fe[ad..ad + 4].copy_from_slice(&(length as u32).to_le_bytes());
+                fe[ad + 4..ad + 8].copy_from_slice(&data_block.to_le_bytes());
+            }
+            let fid = &mut bytes[2 * SECTOR..3 * SECTOR];
+            fid[0..2].copy_from_slice(&tag::FILE_IDENTIFIER.to_le_bytes());
+            fid[16..18].copy_from_slice(&1_u16.to_le_bytes());
+            fid[19] = name.len() as u8;
+            fid[20..24].copy_from_slice(&(SECTOR as u32).to_le_bytes());
+            fid[24..28].copy_from_slice(&2_u32.to_le_bytes());
+            fid[38..38 + name.len()].copy_from_slice(name);
+            bytes[4 * SECTOR..4 * SECTOR + 4].copy_from_slice(b"MZ!!");
+            let vol = Volume {
+                bytes: &bytes,
+                partition_start: 1,
+                block_size: SECTOR as u32,
+            };
+            let mut walk = TreeWalk::new(&vol);
+            walk.run(0);
+            assert_eq!(walk.file_count, 1);
+            assert_eq!(walk.members.len(), 1);
+            let member = &walk.members[0];
+            assert_eq!(member.path, "payload.dll");
+            assert_eq!(member.size_bytes, 4);
+            assert_eq!(member.offsets.data, Some((4 * SECTOR) as u64));
+            assert!(!walk.truncated);
+        }
     }
 }

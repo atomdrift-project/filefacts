@@ -237,6 +237,7 @@ fn file_group(ft: FileType) -> &'static str {
         FileType::Jar
         | FileType::Zip
         | FileType::Tar
+        | FileType::Cpio
         | FileType::TarGz
         | FileType::TarBz2
         | FileType::TarXz
@@ -458,6 +459,8 @@ pub enum FileType {
     Zip,
     /// TAR archive (plain, no compression)
     Tar,
+    /// ASCII CPIO archive (odc, newc, or newc checksum layout).
+    Cpio,
     /// Gzip-compressed TAR (.tar.gz, .tgz, .crate)
     TarGz,
     /// Bzip2-compressed TAR (.tar.bz2, .tbz2)
@@ -693,6 +696,7 @@ impl FileType {
             self,
             Self::Zip
                 | Self::Tar
+                | Self::Cpio
                 | Self::TarGz
                 | Self::TarBz2
                 | Self::TarXz
@@ -911,6 +915,7 @@ impl FileType {
             // Archive containers and compression.
             Self::Zip => "zip",
             Self::Tar => "tar",
+            Self::Cpio => "cpio",
             Self::TarGz => "tar.gz",
             Self::TarBz2 => "tar.bz2",
             Self::TarXz => "tar.xz",
@@ -1059,6 +1064,7 @@ impl FileType {
             "unknown" => Self::Unknown,
             "zip" => Self::Zip,
             "tar" => Self::Tar,
+            "cpio" => Self::Cpio,
             "tar.gz" => Self::TarGz,
             "tar.bz2" => Self::TarBz2,
             "tar.xz" => Self::TarXz,

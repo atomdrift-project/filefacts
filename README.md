@@ -79,6 +79,9 @@ filefacts --format json ./samples
 
 Run `filefacts --help` for the complete view and output list.
 
+[Compiled AppleScript](docs/SCPT.md) exposes literals, calls, and known arguments
+without running the script.
+
 ## Available views
 
 | View | Contents |
