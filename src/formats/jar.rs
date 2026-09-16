@@ -4,18 +4,29 @@
 //!
 //! - `jar.manifest.{manifest_version, main_class, created_by, built_by,
 //!   build_jdk, build_jdk_spec, build_time, archiver_version,
-//!   class_path, implementation_*, specification_*, bundle_*, sealed,
-//!   permissions, application_*, codebase, trusted_*, start_class,
-//!   spring_boot_version, spring_boot_classes, spring_boot_lib}` —
+//!   class_path, premain_class, agent_class, launcher_agent_class,
+//!   boot_class_path, can_redefine_classes, can_retransform_classes,
+//!   can_set_native_method_prefix, automatic_module_name, multi_release,
+//!   add_exports, add_opens, enable_native_access, extension_name,
+//!   implementation_*, specification_*, bundle_*, fragment_host,
+//!   require_bundle, import_package, export_package, dynamic_import_package,
+//!   require_capability, provide_capability, sealed, permissions,
+//!   application_*, codebase, trusted_*, start_class, spring_boot_version,
+//!   spring_boot_classes, spring_boot_lib}` —
 //!   tracked headers from `META-INF/MANIFEST.MF` parsed with the
-//!   JAR continuation-line convention (single-space prefix).
+//!   JAR continuation-line convention (single-space prefix). Derived
+//!   `section_count`, `entry_count`, `attribute_count`, `digest_count`,
+//!   `digest_algorithms`, `class_path_count`, and `boot_class_path_count`
+//!   describe the manifest's section structure.
 //! - `jar.pom.{group_id, artifact_id, version}` — first
 //!   `META-INF/maven/<g>/<a>/pom.properties` we find.
 //! - `jar.features[]` — Pike-style flag array (`signed`,
-//!   `multi_release`, `native_libs`, `embedded_jars`).
+//!   `multi_release`, `native_libs`, `embedded_jars`, `services`,
+//!   `java_agents`, `osgi_activator`).
 //! - `jar.class_count`, `jar.entry_count`, `jar.embedded_jar_count`,
-//!   `jar.signature_count` — flat counts also surfaced as
-//!   `metrics.jar.*`.
+//!   `jar.signature_count`, `jar.signature_block_count`,
+//!   `jar.native_lib_count`, `jar.service_count`, `jar.versioned_class_count`,
+//!   and `jar.index_count` — flat counts also surfaced as `metrics.jar.*`.
 //!
 //! The generic archive walk (`archive.members[]`,
 //! `archive.compression.*`) runs on the same ZIP handle before this
@@ -23,7 +34,7 @@
 
 use crate::metric;
 use serde_json::{Value as JsonValue, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
 use crate::error::Error;
@@ -45,6 +56,24 @@ const TRACKED_HEADERS: &[(&str, &str)] = &[
     ("Build-Date", "build_date"),
     ("Archiver-Version", "archiver_version"),
     ("Class-Path", "class_path"),
+    ("Premain-Class", "premain_class"),
+    ("Agent-Class", "agent_class"),
+    ("Launcher-Agent-Class", "launcher_agent_class"),
+    ("Boot-Class-Path", "boot_class_path"),
+    ("Can-Redefine-Classes", "can_redefine_classes"),
+    ("Can-Retransform-Classes", "can_retransform_classes"),
+    (
+        "Can-Set-Native-Method-Prefix",
+        "can_set_native_method_prefix",
+    ),
+    ("Automatic-Module-Name", "automatic_module_name"),
+    ("Multi-Release", "multi_release"),
+    ("Add-Exports", "add_exports"),
+    ("Add-Opens", "add_opens"),
+    ("Enable-Native-Access", "enable_native_access"),
+    ("Extension-Name", "extension_name"),
+    ("Implementation-URL", "implementation_url"),
+    ("Specification-URL", "specification_url"),
     ("Implementation-Title", "implementation_title"),
     ("Implementation-Version", "implementation_version"),
     ("Implementation-Vendor", "implementation_vendor"),
@@ -58,10 +87,22 @@ const TRACKED_HEADERS: &[(&str, &str)] = &[
     ("Bundle-SymbolicName", "bundle_symbolic_name"),
     ("Bundle-Version", "bundle_version"),
     ("Bundle-Vendor", "bundle_vendor"),
+    ("Bundle-ManifestVersion", "bundle_manifest_version"),
+    ("Bundle-Activator", "bundle_activator"),
+    ("Bundle-ActivationPolicy", "bundle_activation_policy"),
+    ("Bundle-ClassPath", "bundle_class_path"),
+    ("Bundle-NativeCode", "bundle_native_code"),
     (
         "Bundle-RequiredExecutionEnvironment",
         "bundle_required_execution_environment",
     ),
+    ("Fragment-Host", "fragment_host"),
+    ("Require-Bundle", "require_bundle"),
+    ("Import-Package", "import_package"),
+    ("Export-Package", "export_package"),
+    ("DynamicImport-Package", "dynamic_import_package"),
+    ("Require-Capability", "require_capability"),
+    ("Provide-Capability", "provide_capability"),
     ("Sealed", "sealed"),
     ("Permissions", "permissions"),
     ("Application-Name", "application_name"),
@@ -87,9 +128,13 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     let mut class_count: u32 = 0;
     let mut signature_count: u32 = 0;
     let mut embedded_jar_count: u32 = 0;
-    let mut native_libs = false;
+    let mut native_lib_count: u32 = 0;
     let mut multi_release = false;
-    let mut manifest: BTreeMap<String, String> = BTreeMap::new();
+    let mut service_count: u32 = 0;
+    let mut versioned_class_count: u32 = 0;
+    let mut signature_block_count: u32 = 0;
+    let mut index_count: u32 = 0;
+    let mut manifest: Option<ManifestFacts> = None;
     let mut pom_group: Option<String> = None;
     let mut pom_artifact: Option<String> = None;
     let mut pom_version: Option<String> = None;
@@ -110,7 +155,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             .as_deref()
         {
             Some("class") => class_count += 1,
-            Some("so" | "dll" | "dylib" | "jnilib") => native_libs = true,
+            Some("so" | "dll" | "dylib" | "jnilib") => native_lib_count += 1,
             Some("jar" | "war" | "ear") => {
                 embedded_jar_count += 1;
             }
@@ -119,8 +164,26 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         if name.starts_with("META-INF/") && name.ends_with(".SF") {
             signature_count += 1;
         }
+        if name.starts_with("META-INF/")
+            && name.rsplit('.').next().is_some_and(|ext| {
+                ["RSA", "DSA", "EC", "SIG"]
+                    .iter()
+                    .any(|sig| ext.eq_ignore_ascii_case(sig))
+            })
+        {
+            signature_block_count += 1;
+        }
         if name.starts_with("META-INF/versions/") {
             multi_release = true;
+        }
+        if name.starts_with("META-INF/services/") {
+            service_count += 1;
+        }
+        if name.starts_with("META-INF/versions/") && name.ends_with(".class") {
+            versioned_class_count += 1;
+        }
+        if name == "META-INF/INDEX.LIST" {
+            index_count += 1;
         }
         if name == "META-INF/MANIFEST.MF" {
             if let Some(text) = read_text(zip, name) {
@@ -142,14 +205,58 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         }
     }
 
-    if entry_count == 0 && manifest.is_empty() {
+    if entry_count == 0 && manifest.as_ref().is_none_or(ManifestFacts::is_empty) {
         return Ok(());
     }
 
-    if !manifest.is_empty() {
+    let class_path_count = manifest
+        .as_ref()
+        .and_then(|m| m.headers.get("class_path"))
+        .map(|v| v.split_whitespace().count() as u32)
+        .unwrap_or(0);
+    let boot_class_path_count = manifest
+        .as_ref()
+        .and_then(|m| m.headers.get("boot_class_path"))
+        .map(|v| v.split_whitespace().count() as u32)
+        .unwrap_or(0);
+    let has_java_agents = manifest_has_agent(manifest.as_ref());
+    let has_osgi_activator = manifest
+        .as_ref()
+        .is_some_and(|m| m.headers.contains_key("bundle_activator"));
+
+    if let Some(manifest) = manifest.as_ref() {
         let mut obj = serde_json::Map::new();
-        for (k, v) in manifest {
-            obj.insert(k, JsonValue::String(v));
+        for (k, v) in &manifest.headers {
+            obj.insert(k.clone(), JsonValue::String(v.clone()));
+        }
+        if manifest.section_count > 0 {
+            obj.insert("section_count".into(), json!(manifest.section_count));
+        }
+        if manifest.entry_count > 0 {
+            obj.insert("entry_count".into(), json!(manifest.entry_count));
+        }
+        if manifest.attribute_count > 0 {
+            obj.insert("attribute_count".into(), json!(manifest.attribute_count));
+        }
+        if manifest.digest_count > 0 {
+            obj.insert("digest_count".into(), json!(manifest.digest_count));
+            obj.insert(
+                "digest_algorithms".into(),
+                JsonValue::Array(
+                    manifest
+                        .digest_algorithms
+                        .iter()
+                        .cloned()
+                        .map(JsonValue::String)
+                        .collect(),
+                ),
+            );
+        }
+        if class_path_count > 0 {
+            obj.insert("class_path_count".into(), json!(class_path_count));
+        }
+        if boot_class_path_count > 0 {
+            obj.insert("boot_class_path_count".into(), json!(boot_class_path_count));
         }
         values.insert("jar.manifest", JsonValue::Object(obj));
     }
@@ -174,11 +281,20 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     if multi_release {
         features.push("multi_release");
     }
-    if native_libs {
+    if native_lib_count > 0 {
         features.push("native_libs");
     }
     if embedded_jar_count > 0 {
         features.push("embedded_jars");
+    }
+    if service_count > 0 {
+        features.push("services");
+    }
+    if has_java_agents {
+        features.push("java_agents");
+    }
+    if has_osgi_activator {
+        features.push("osgi_activator");
     }
     if !features.is_empty() {
         values.insert(
@@ -200,6 +316,21 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     if signature_count > 0 {
         values.insert("jar.signature_count", json!(signature_count));
     }
+    if signature_block_count > 0 {
+        values.insert("jar.signature_block_count", json!(signature_block_count));
+    }
+    if native_lib_count > 0 {
+        values.insert("jar.native_lib_count", json!(native_lib_count));
+    }
+    if service_count > 0 {
+        values.insert("jar.service_count", json!(service_count));
+    }
+    if versioned_class_count > 0 {
+        values.insert("jar.versioned_class_count", json!(versioned_class_count));
+    }
+    if index_count > 0 {
+        values.insert("jar.index_count", json!(index_count));
+    }
     metrics.insert(metric!("jar.entry_count"), f64::from(entry_count));
     metrics.insert(metric!("jar.class_count"), f64::from(class_count));
     metrics.insert(
@@ -207,6 +338,43 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         f64::from(embedded_jar_count),
     );
     metrics.insert(metric!("jar.signature_count"), f64::from(signature_count));
+    metrics.insert(
+        metric!("jar.signature_block_count"),
+        f64::from(signature_block_count),
+    );
+    metrics.insert(metric!("jar.native_lib_count"), f64::from(native_lib_count));
+    metrics.insert(metric!("jar.service_count"), f64::from(service_count));
+    metrics.insert(
+        metric!("jar.versioned_class_count"),
+        f64::from(versioned_class_count),
+    );
+    metrics.insert(metric!("jar.index_count"), f64::from(index_count));
+    if let Some(manifest) = manifest.as_ref() {
+        metrics.insert(
+            metric!("jar.manifest.entry_count"),
+            f64::from(manifest.entry_count),
+        );
+        metrics.insert(
+            metric!("jar.manifest.section_count"),
+            f64::from(manifest.section_count),
+        );
+        metrics.insert(
+            metric!("jar.manifest.attribute_count"),
+            f64::from(manifest.attribute_count),
+        );
+        metrics.insert(
+            metric!("jar.manifest.digest_count"),
+            f64::from(manifest.digest_count),
+        );
+        metrics.insert(
+            metric!("jar.manifest.class_path_count"),
+            f64::from(class_path_count),
+        );
+        metrics.insert(
+            metric!("jar.manifest.boot_class_path_count"),
+            f64::from(boot_class_path_count),
+        );
+    }
 
     Ok(())
 }
@@ -230,43 +398,115 @@ fn read_text<R: std::io::Read + std::io::Seek>(
     String::from_utf8(buf).ok()
 }
 
-/// Parse a `MANIFEST.MF` text body and return the tracked headers
-/// keyed by their snake_case names. The JAR manifest format wraps
-/// long values onto continuation lines that start with a single
-/// space — handled here so `Implementation-Title: A very long…`
-/// values survive intact.
-fn parse_manifest(text: &str) -> BTreeMap<String, String> {
-    let mut joined: Vec<String> = Vec::new();
+/// Facts parsed from a `MANIFEST.MF` text body. The JAR manifest format wraps
+/// long values onto continuation lines that start with a single space —
+/// handled here so `Implementation-Title: A very long…` values survive intact.
+#[derive(Debug, Default)]
+struct ManifestFacts {
+    headers: BTreeMap<String, String>,
+    section_count: u32,
+    entry_count: u32,
+    attribute_count: u32,
+    digest_count: u32,
+    digest_algorithms: BTreeSet<String>,
+}
+
+impl ManifestFacts {
+    fn is_empty(&self) -> bool {
+        self.headers.is_empty()
+            && self.section_count == 0
+            && self.entry_count == 0
+            && self.attribute_count == 0
+            && self.digest_count == 0
+    }
+}
+
+fn manifest_has_agent(manifest: Option<&ManifestFacts>) -> bool {
+    manifest.is_some_and(|m| {
+        [
+            "premain_class",
+            "agent_class",
+            "launcher_agent_class",
+            "boot_class_path",
+            "can_redefine_classes",
+            "can_retransform_classes",
+            "can_set_native_method_prefix",
+        ]
+        .iter()
+        .any(|key| m.headers.contains_key(*key))
+    })
+}
+
+/// Parse a `MANIFEST.MF` text body into tracked headers and structural facts.
+/// A non-main section is an entry when it carries a `Name:` attribute. Digest
+/// attributes are counted and their algorithm names are retained, but
+/// attacker-controlled entry names are deliberately not copied into values;
+/// the generic archive member table already carries those names.
+fn parse_manifest(text: &str) -> Option<ManifestFacts> {
+    let mut sections: Vec<Vec<String>> = Vec::new();
+    let mut section: Vec<String> = Vec::new();
     for line in text.lines() {
+        if line.is_empty() {
+            if !section.is_empty() {
+                sections.push(std::mem::take(&mut section));
+            }
+            continue;
+        }
         if let Some(stripped) = line.strip_prefix(' ') {
-            if let Some(last) = joined.last_mut() {
+            if let Some(last) = section.last_mut() {
                 last.push_str(stripped);
                 continue;
             }
         }
-        joined.push(line.to_string());
+        section.push(line.to_string());
     }
-    let mut out = BTreeMap::new();
-    for line in joined {
-        let line = line.trim_end();
-        if line.is_empty() {
-            continue;
+    if !section.is_empty() {
+        sections.push(section);
+    }
+
+    if sections.is_empty() {
+        return None;
+    }
+
+    let mut facts = ManifestFacts::default();
+    facts.section_count = sections.len().saturating_sub(1) as u32;
+    for (section_index, section) in sections.into_iter().enumerate() {
+        let mut named = false;
+        for line in section {
+            let Some((key, value)) = line.trim_end().split_once(':') else {
+                continue;
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            facts.attribute_count += 1;
+            if key.eq_ignore_ascii_case("Name") {
+                named = true;
+            }
+            let digest_suffix = "-Digest";
+            if key.len() > digest_suffix.len()
+                && key[key.len() - digest_suffix.len()..].eq_ignore_ascii_case(digest_suffix)
+            {
+                facts.digest_count += 1;
+                facts
+                    .digest_algorithms
+                    .insert(key[..key.len() - digest_suffix.len()].to_ascii_lowercase());
+            }
+            if let Some((_, snake)) = TRACKED_HEADERS
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            {
+                facts
+                    .headers
+                    .insert((*snake).to_string(), value.to_string());
+            }
         }
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        let value = value.trim();
-        if value.is_empty() {
-            continue;
-        }
-        if let Some((_, snake)) = TRACKED_HEADERS
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(key))
-        {
-            out.insert((*snake).to_string(), value.to_string());
+        if section_index > 0 && named {
+            facts.entry_count += 1;
         }
     }
-    out
+    Some(facts)
 }
 
 #[cfg(test)]
@@ -336,13 +576,64 @@ mod tests {
     }
 
     #[test]
+    fn manifest_agent_and_signature_metadata_surface() {
+        let jar = build_jar(&[(
+            "META-INF/MANIFEST.MF",
+            b"Manifest-Version: 1.0\n\
+              Premain-Class: com.example.Agent\n\
+              Can-Redefine-Classes: true\n\
+              Class-Path: one.jar two.jar\n\
+              Boot-Class-Path: boot.jar\n\
+              Bundle-Activator: com.example.Activator\n\
+              \n\
+              Name: com/example/Main.class\n\
+              SHA-256-Digest: deadbeef\n",
+        )]);
+        let (v, m) = run(&jar);
+        assert_eq!(
+            v.get("jar.manifest.premain_class").and_then(|x| x.as_str()),
+            Some("com.example.Agent")
+        );
+        assert_eq!(
+            v.get("jar.manifest.entry_count").and_then(|x| x.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            v.get("jar.manifest.digest_algorithms")
+                .and_then(|x| x.as_array())
+                .and_then(|x| x.first())
+                .and_then(|x| x.as_str()),
+            Some("sha-256")
+        );
+        assert_eq!(
+            v.get("jar.manifest.bundle_activator")
+                .and_then(|x| x.as_str()),
+            Some("com.example.Activator")
+        );
+        assert_eq!(m.get("jar.manifest.attribute_count"), Some(8.0));
+        assert_eq!(m.get("jar.manifest.section_count"), Some(1.0));
+        assert_eq!(m.get("jar.manifest.digest_count"), Some(1.0));
+        assert_eq!(m.get("jar.manifest.class_path_count"), Some(2.0));
+        assert_eq!(m.get("jar.manifest.boot_class_path_count"), Some(1.0));
+        let feats = v.get("jar.features").and_then(|x| x.as_array()).unwrap();
+        assert!(feats.iter().any(|x| x == "java_agents"));
+        assert!(feats.iter().any(|x| x == "osgi_activator"));
+    }
+
+    #[test]
     fn structural_features_detected() {
         let jar = build_jar(&[
             ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n"),
             ("com/example/Foo.class", b"\xca\xfe\xba\xbe"),
             ("META-INF/SIG.SF", b"Signature-Version: 1.0\n"),
+            ("META-INF/SIG.RSA", b"signature block"),
             ("lib/native.so", b"\x7fELF"),
             ("BOOT-INF/lib/dep.jar", b"PK\x03\x04"),
+            (
+                "META-INF/services/com.example.Service",
+                b"com.example.Impl\n",
+            ),
+            ("META-INF/INDEX.LIST", b"JarIndex-Version: 1.0\n"),
             (
                 "META-INF/versions/11/com/example/Foo.class",
                 b"\xca\xfe\xba\xbe",
@@ -350,12 +641,18 @@ mod tests {
         ]);
         let (v, m) = run(&jar);
         assert_eq!(m.get("jar.class_count"), Some(2.0));
+        assert_eq!(m.get("jar.signature_block_count"), Some(1.0));
+        assert_eq!(m.get("jar.native_lib_count"), Some(1.0));
+        assert_eq!(m.get("jar.service_count"), Some(1.0));
+        assert_eq!(m.get("jar.versioned_class_count"), Some(1.0));
+        assert_eq!(m.get("jar.index_count"), Some(1.0));
         let feats = v.get("jar.features").and_then(|x| x.as_array()).unwrap();
         let names: Vec<&str> = feats.iter().filter_map(|x| x.as_str()).collect();
         assert!(names.contains(&"signed"));
         assert!(names.contains(&"multi_release"));
         assert!(names.contains(&"native_libs"));
         assert!(names.contains(&"embedded_jars"));
+        assert!(names.contains(&"services"));
     }
 
     #[test]
