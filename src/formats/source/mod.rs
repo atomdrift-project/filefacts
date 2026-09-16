@@ -907,6 +907,64 @@ mod tests {
         );
     }
 
+    /// Zig's grammar stores field access under `member` and positional call
+    /// arguments as direct expression children. Both must be projected into
+    /// the shared symbols view so rules can match `ch.txtFields("...")` and
+    /// inspect its literal argument without a language-specific escape hatch.
+    #[test]
+    fn zig_calls_include_static_targets_members_and_arguments() {
+        let src = br#"const ch = @import("channels.zig");
+pub fn run() void {
+    _ = ch.gateOk("gate");
+    if (!ch.gateOk("negated")) return;
+    _ = ch.txtFields("relay.example", "out");
+    _ = ch.gateOk(true);
+}
+"#;
+        let parsed = crate::open_with_path(std::path::Path::new("main.zig"), src).unwrap();
+        let _ = parsed.values();
+
+        let calls: Vec<(&str, usize, bool)> = parsed
+            .symbols()
+            .iter_kind(crate::SymbolKind::Call)
+            .filter_map(|s| match s {
+                crate::Symbol::Call {
+                    target: Some(target),
+                    args,
+                    ..
+                } => Some((
+                    target.as_str(),
+                    args.len(),
+                    args.iter()
+                        .any(|arg| matches!(arg, crate::Arg::Bool { value: true })),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            calls
+                .iter()
+                .any(|(target, argc, _)| *target == "ch.txtFields" && *argc == 2)
+                && calls
+                    .iter()
+                    .any(|(target, _, has_true)| *target == "ch.gateOk" && *has_true),
+            "expected static Zig call target and two arguments, got {calls:?}"
+        );
+
+        let members: Vec<&str> = parsed
+            .symbols()
+            .iter_kind(crate::SymbolKind::Member)
+            .filter_map(|s| match s {
+                crate::Symbol::Member { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            members.contains(&"ch.txtFields"),
+            "expected Zig field chain, got {members:?}"
+        );
+    }
+
     /// Helper: parse `src` as a source file with the given extension
     /// and return the import names + (function name, decl) pairs from
     /// the unified [`crate::Symbols`] view. Asserts the file classified

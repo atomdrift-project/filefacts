@@ -787,7 +787,21 @@ impl State {
         }
 
         let mut args: Vec<Arg> = Vec::new();
-        if config.arguments_field == "argument" {
+        if config.name == "zig" {
+            // Zig's call_expression grammar exposes the callee as a named
+            // `function` field, but positional arguments are anonymous
+            // expression children (there is no named `arguments` wrapper).
+            // The first named child is the callee; the remaining named
+            // children are the arguments in source order.
+            let callee_start = callee.map(|c| c.start_byte());
+            let mut cursor = node.walk();
+            for arg in node.named_children(&mut cursor) {
+                if Some(arg.start_byte()) == callee_start {
+                    continue;
+                }
+                args.push(build_arg(arg, source, config));
+            }
+        } else if config.arguments_field == "argument" {
             let mut cursor = node.walk();
             for arg in node.children_by_field_name(config.arguments_field, &mut cursor) {
                 args.push(build_arg(arg, source, config));

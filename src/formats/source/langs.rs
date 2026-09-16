@@ -897,10 +897,15 @@ static ZIG: LangConfig = LangConfig {
     arguments_field: "arguments",
     member_kinds: &["field_expression"],
     member_object_field: "object",
-    member_property_field: "field",
+    // tree-sitter-zig names the right-hand side of a field expression
+    // `member` (not `field`, which is used by several other grammars).
+    // Keeping this aligned with node-types.json is what lets static call
+    // targets such as `ch.txtFields` and member chains surface in facts.
+    member_property_field: "member",
     identifier_kinds: &["identifier", "builtin_identifier"],
     number_kinds: &["integer", "float"],
-    bool_kinds: &["true", "false"],
+    // Zig uses a single `boolean` node kind for both true and false.
+    bool_kinds: &["boolean"],
     null_kinds: &["null"],
     object_kinds: &["struct_initializer", "anonymous_struct_initializer"],
     array_kinds: &[],
