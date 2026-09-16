@@ -408,30 +408,44 @@ fn decompress_vba(data: &[u8]) -> Result<Vec<u8>, &'static str> {
     Ok(output)
 }
 
-/// Compute the offset-bit count for a copy token at the given
-/// decompressed-position (MS-OVBA §2.4.1.3.19.1). Smaller positions
-/// reserve more bits for the length field; the longer the chunk
-/// runs, the more bits the offset claims.
+/// Number of bits a copy token spends on its offset, for a token at the
+/// given position within the current chunk (MS-OVBA §2.4.1.3.19.1).
+///
+/// The spec is `max(4, ceil(log2(DecompressedCurrent - DecompressedChunkStart)))`,
+/// capped at 12: early in a chunk there is little to point back at, so the
+/// offset is cheap and the length gets the remaining bits; as the chunk fills,
+/// the offset claims more.
+///
+/// This ran the other way round -- 12 bits at the start of a chunk, shrinking
+/// toward 4 -- so every copy token decoded with the wrong split and produced
+/// plausible-looking but wrong bytes. The dir stream of a real `vbaProject.bin`
+/// came out with `04` bytes turned into `00`, which is enough to make its
+/// record sizes nonsense and yield zero modules: every OOXML document's macro
+/// source was silently unavailable, and so was the OLE2 path's.
 fn max_bit_count(decompressed_pos: usize) -> u16 {
-    if decompressed_pos <= 0x80 {
-        return 12;
-    }
-    let mut bits = 12u16;
-    let mut threshold = 0x80usize;
-    // `checked_mul(2)` returns `None` when the next doubling would
-    // wrap — that's the exit condition for `usize::MAX`-style inputs
-    // that would otherwise spin the loop forever (the verbatim port
-    // of cleave's code had this bug; this is the fix).
-    while threshold < decompressed_pos {
-        let Some(next) = threshold.checked_mul(2) else {
-            break;
-        };
-        threshold = next;
-        if bits > 4 {
-            bits -= 1;
-        }
+    let mut bits = 4u16;
+    while bits < 12 && (1usize << bits) < decompressed_pos {
+        bits += 1;
     }
     bits
+}
+
+/// Offset of the first MODULE record, found via the PROJECTMODULES header.
+///
+/// Returns the position just past PROJECTMODULES and its PROJECTCOOKIE
+/// (`Id=0x0013, Size=0x0002`), which is where the MODULENAME chain begins.
+fn find_project_modules(data: &[u8]) -> Option<usize> {
+    const PROJECT_MODULES: [u8; 6] = [0x0F, 0x00, 0x02, 0x00, 0x00, 0x00];
+    let at = data
+        .windows(PROJECT_MODULES.len())
+        .position(|w| w == PROJECT_MODULES)?;
+    // PROJECTMODULES: id(2) size(4) count(2)
+    let mut pos = at + 8;
+    // PROJECTCOOKIE: id(2) size(4) cookie(2)
+    if data.get(pos..pos + 2) == Some(&[0x13, 0x00]) {
+        pos += 8;
+    }
+    (pos < data.len()).then_some(pos)
 }
 
 /// Parse the decompressed dir stream into per-module metadata
@@ -439,7 +453,20 @@ fn max_bit_count(decompressed_pos: usize) -> u16 {
 /// stream, module kind). Per MS-OVBA §2.3.4.2.
 fn parse_dir_stream(data: &[u8]) -> Vec<ModuleInfo> {
     let mut out = Vec::new();
-    let mut pos = 0usize;
+    // Start at PROJECTMODULES rather than at byte zero.
+    //
+    // The records before it cannot be walked by `id`/`size` alone, and trying
+    // reached no module at all on real files. PROJECTVERSION (0x0009) declares
+    // Size 4 but carries 6 bytes, because the field is Reserved rather than a
+    // length; and the PROJECTREFERENCES that follow have per-kind layouts with
+    // their own embedded sizes. A project without references is rare enough --
+    // `stdole` is in nearly all of them -- that the walk fell over on
+    // essentially every document, which is why office.vba.modules[] was empty
+    // everywhere and no rule ever saw a line of macro source.
+    //
+    // PROJECTMODULES is `Id=0x000F, Size=0x00000002`, and the MODULE records
+    // after it are a clean id/size chain, which is the part this needs.
+    let mut pos = find_project_modules(data).unwrap_or(0);
     while pos + 6 <= data.len() {
         let record_id = u16::from_le_bytes([data[pos], data[pos + 1]]);
         let record_size =
@@ -585,15 +612,71 @@ mod tests {
 
     #[test]
     fn max_bit_count_matches_spec_steps() {
-        // ≤0x80 → 12 bits for the offset.
-        assert_eq!(max_bit_count(0), 12);
-        assert_eq!(max_bit_count(0x80), 12);
-        // Each doubling past 0x80 shaves one bit, floor 4.
-        assert_eq!(max_bit_count(0x81), 11);
-        assert_eq!(max_bit_count(0x101), 10);
-        assert_eq!(max_bit_count(0x201), 9);
-        // Tail saturates at 4.
-        assert!(max_bit_count(usize::MAX) >= 4);
+        // MAX(4, CeilingLog2(DecompressedCurrent - DecompressedChunkStart)),
+        // capped at 12 (MS-OVBA 2.4.1.3.19.1). It grows with the position;
+        // it used to shrink, which decoded every copy token wrongly.
+        assert_eq!(max_bit_count(0), 4);
+        assert_eq!(max_bit_count(4), 4);
+        assert_eq!(max_bit_count(16), 4);
+        assert_eq!(max_bit_count(17), 5);
+        assert_eq!(max_bit_count(32), 5);
+        assert_eq!(max_bit_count(33), 6);
+        assert_eq!(max_bit_count(0x800), 11);
+        assert_eq!(max_bit_count(0x1000), 12);
+        // Capped, and never spins on a huge input.
+        assert_eq!(max_bit_count(usize::MAX), 12);
+    }
+
+    /// A dir stream shaped like a real one: the PROJECTVERSION quirk, one
+    /// reference, then the modules.
+    fn realistic_dir_stream() -> Vec<u8> {
+        let mut d = Vec::new();
+        let rec = |d: &mut Vec<u8>, id: u16, body: &[u8]| {
+            d.extend_from_slice(&id.to_le_bytes());
+            d.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            d.extend_from_slice(body);
+        };
+        rec(&mut d, 0x0001, &1u32.to_le_bytes()); // SysKind
+        rec(&mut d, 0x0002, &0x0409u32.to_le_bytes()); // Lcid
+        rec(&mut d, 0x0003, &0x04e4u16.to_le_bytes()); // CodePage
+        rec(&mut d, 0x0004, b"Project"); // Name
+        // PROJECTVERSION: Size is Reserved and reads 4, the payload is 6.
+        d.extend_from_slice(&0x0009u16.to_le_bytes());
+        d.extend_from_slice(&4u32.to_le_bytes());
+        d.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        // A registered reference, whose layout the generic walk cannot follow.
+        rec(&mut d, 0x0016, b"stdole");
+        rec(
+            &mut d,
+            0x000D,
+            b"*\\G{00020430-0000-0000-C000-000000000046}#2.0#0#stdole2.tlb#OLE",
+        );
+        d.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        // PROJECTMODULES + PROJECTCOOKIE, then one module.
+        d.extend_from_slice(&0x000Fu16.to_le_bytes());
+        d.extend_from_slice(&2u32.to_le_bytes());
+        d.extend_from_slice(&1u16.to_le_bytes());
+        d.extend_from_slice(&0x0013u16.to_le_bytes());
+        d.extend_from_slice(&2u32.to_le_bytes());
+        d.extend_from_slice(&0u16.to_le_bytes());
+        rec(&mut d, 0x0019, b"ThisDocument"); // MODULENAME
+        rec(&mut d, 0x001A, b"ThisDocument"); // MODULESTREAMNAME
+        rec(&mut d, 0x0031, &0x2Au32.to_le_bytes()); // MODULEOFFSET
+        rec(&mut d, 0x0022, &[]); // MODULETYPE: class
+        rec(&mut d, 0x002B, &[]); // MODULETERMINATOR
+        d
+    }
+
+    #[test]
+    fn modules_are_found_past_the_version_quirk_and_the_references() {
+        // Walking from byte zero by id/size reaches no module on a real file:
+        // PROJECTVERSION lies about its length and the references have their
+        // own layouts. Anchoring on PROJECTMODULES steps over both.
+        let infos = parse_dir_stream(&realistic_dir_stream());
+        assert_eq!(infos.len(), 1, "expected one module");
+        assert_eq!(infos[0].name, "ThisDocument");
+        assert_eq!(infos[0].stream_name, "ThisDocument");
+        assert_eq!(infos[0].offset, 0x2A);
     }
 
     #[test]
@@ -631,14 +714,10 @@ mod tests {
         // the token (=1). High bits unused.
         input.push(0b0001_0000);
         input.extend_from_slice(b"ABCD");
-        // Token at decompressed_pos=4 where max_bit_count=12. Per
-        // MS-OVBA §2.4.1.3.19.3 the offset_field occupies the high
-        // `bit_count` bits and length_field the low `16 - bit_count`
-        // bits — so for bit_count=12, offset has 12 bits in the
-        // upper half and length has 4 bits in the lower nibble.
-        // Want length=3, offset=4 → length_field=0, offset_field=3
-        // → token = (3 << 4) | 0 = 0x0030.
-        let token = 0x0030u16;
+        // Token at decompressed_pos=4, where BitCount is 4: the offset
+        // occupies the top 4 bits and the length the low 12. Want length=3,
+        // offset=4 -> length_field=0, offset_field=3 -> (3 << 12) | 0.
+        let token = 0x3000u16;
         input.extend_from_slice(&token.to_le_bytes());
         let out = decompress_vba(&input).unwrap();
         assert_eq!(&out, b"ABCDABC");
