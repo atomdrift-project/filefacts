@@ -737,7 +737,7 @@ pub(super) fn enumerate_extra_tags(extra: &[u8]) -> std::collections::BTreeSet<u
 /// `.DS_Store`, Windows `Thumbs.db` / `desktop.ini`. Counted as
 /// `archive.noise_file_count`. Conservative — files matching these
 /// patterns indicate sloppy packaging, not malice on their own.
-fn is_noise_filename(path: &str) -> bool {
+pub(super) fn is_noise_filename(path: &str) -> bool {
     if path.starts_with("__MACOSX/") {
         return true;
     }

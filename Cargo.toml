@@ -65,6 +65,8 @@ stng = { git = "https://github.com/atomdrift-project/stng.git" }
 # Archive index readers. We use these for header/central-directory enumeration
 # only — never for decompression or extraction.
 zip = "2"
+# MS-CAB header reader: CFHEADER/CFFOLDER/CFFILE only, no block decompression.
+cab = "0.6"
 tar = "0.4"
 # 7z header reader. Like zip and tar, filefacts uses it only to enumerate
 # archive metadata; member payloads are never decompressed here.

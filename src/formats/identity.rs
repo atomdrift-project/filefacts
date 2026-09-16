@@ -71,6 +71,14 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Iden
         FileType::Rtf => rtf(values, &mut id),
         FileType::Png => png(values, &mut id),
         FileType::Lnk => lnk(values, &mut id),
+        FileType::Cab => cab(values, &mut id),
+        FileType::ApkAlpine => apk_alpine(values, &mut id),
+        FileType::ApkAndroid => apk_android(values, &mut id),
+        FileType::Iso => iso(values, &mut id),
+        FileType::Dmg => dmg(values, &mut id),
+        FileType::Tar | FileType::TarGz | FileType::TarBz2 | FileType::TarXz | FileType::TarZst => {
+            tar(values, &mut id)
+        }
         FileType::Rpm => rpm(values, &mut id),
         FileType::Deb => deb(values, &mut id),
         _ => {}
@@ -80,6 +88,13 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Iden
     // executables regardless of format.
     if matches!(file_type, FileType::Pe | FileType::Elf | FileType::MachO) {
         build_path(bytes, values, &mut id);
+    }
+
+    // The compiler that emitted the object, straight from DWARF. Carried by
+    // ELF regardless of what else the file claims, and often the only
+    // provenance an unsigned Linux binary has.
+    if matches!(file_type, FileType::Elf) {
+        dwarf_producer(values, &mut id);
     }
 
     // Interior source identity — a WordPress plugin header or an autoconf
@@ -244,6 +259,208 @@ fn pe(values: &Values, id: &mut Identity) {
     if let Some(t) = get_str(values, "pe.signatures[0].thumbprint_sha256") {
         id.unique_ids
             .insert("authenticode_thumbprint_sha256".into(), t.to_string());
+    }
+}
+
+/// A cabinet's only identity claim is its appended Authenticode signature --
+/// CFHEADER carries no publisher, product or version field. The signature blob
+/// is published in the PE `signatures[0]` shape, so the mapping is the PE one.
+fn cab(values: &Values, id: &mut Identity) {
+    if let Some(ci) = values.get("cab.signatures[0]").and_then(cert_from_obj) {
+        if let Some(o) = &ci.o {
+            id.organization = Some(Claim {
+                value: o.clone(),
+                source: "cab.signatures[0]".into(),
+                verified: ci.verified,
+            });
+        }
+        id.trust = cert_trust(&ci);
+        id.signer = Some(signer_struct(&ci, "cab.signatures[0]"));
+    }
+    if let Some(t) = get_str(values, "cab.signatures[0].thumbprint_sha256") {
+        id.unique_ids
+            .insert("authenticode_thumbprint_sha256".into(), t.to_string());
+    }
+}
+
+/// ISO 9660 records who made the image in the Primary Volume Descriptor:
+/// a volume name, a publisher, a data preparer and the authoring application.
+/// They are free text an operator fills in, so every claim here is unverified
+/// -- but a mastering tool stamps itself consistently, which is what makes a
+/// blank or imitated field worth seeing next to a real one.
+fn iso(values: &Values, id: &mut Identity) {
+    if let Some(volume) = get_str(values, "iso.volume_id") {
+        id.name = Some(Claim::claimed(volume, "iso.volume_id"));
+    }
+    if let Some(publisher) = get_str(values, "iso.publisher_id") {
+        id.organization = Some(Claim::claimed(publisher, "iso.publisher_id"));
+    } else if let Some(preparer) = get_str(values, "iso.preparer_id") {
+        // The preparer is a weaker claim than the publisher, so it only
+        // stands in when no publisher was recorded.
+        id.organization = Some(Claim::claimed(preparer, "iso.preparer_id"));
+    }
+    // `iso.builder` is the normalized mastering-tool name; prefer it over the
+    // raw application field it was derived from.
+    if let Some(builder) = get_str(values, "iso.builder") {
+        id.producer = Some(Claim::claimed(builder, "iso.builder"));
+    } else if let Some(app) = get_str(values, "iso.application_id") {
+        id.producer = Some(Claim::claimed(app, "iso.application_id"));
+    }
+    for (key, name) in [
+        ("iso.volume_set_id", "iso_volume_set_id"),
+        ("iso.udf.logical_volume_id", "udf_logical_volume_id"),
+        ("iso.udf.volume_set_id", "udf_volume_set_id"),
+        ("iso.udf.implementation_id", "udf_implementation_id"),
+    ] {
+        if let Some(v) = get_str(values, key) {
+            id.unique_ids.insert(name.into(), v.to_string());
+        }
+    }
+}
+
+/// A disk image names its volume and records the tool that formatted it --
+/// the closest thing a DMG has to provenance, since UDIF itself carries no
+/// publisher field and the image need not be signed.
+fn dmg(values: &Values, id: &mut Identity) {
+    if let Some(volume) = get_str(values, "dmg.volume.name") {
+        id.name = Some(Claim::claimed(volume, "dmg.volume.name"));
+    }
+    if let Some(tool) = get_str(values, "dmg.volume.formatted_by") {
+        id.producer = Some(Claim::claimed(tool, "dmg.volume.formatted_by"));
+    }
+    // `dmg.volume.last_mounted_version` is deliberately NOT a producer. It is
+    // the HFS+ `lastMountedVersion` field, which holds an implementation
+    // signature such as `HFSJ` or `10.0` -- the thing that last mounted the
+    // volume, not the thing that made the image. Mapping it produced a
+    // confident `producer: "HFSJ"` on real samples, which is a fabricated
+    // claim, and a wrong identity is worse than an absent one.
+}
+
+/// POSIX tar stores the owning user and group *names* beside the numeric ids,
+/// so an archive built outside a clean packaging environment carries the
+/// build account in it -- the same class of accidental provenance as a PDB
+/// path. Recorded as parties rather than as an organization: these name a
+/// person or a service account, not a publisher.
+fn tar(values: &Values, id: &mut Identity) {
+    for key in ["archive.builder.unames", "archive.builder.gnames"] {
+        let Some(list) = values.get(key).and_then(JsonValue::as_array) else {
+            continue;
+        };
+        for name in list.iter().filter_map(JsonValue::as_str) {
+            // root/wheel and the like say nothing about who built it.
+            if matches!(name, "root" | "wheel" | "staff" | "users" | "nobody" | "") {
+                continue;
+            }
+            if !id.authors.iter().any(|p| p.name.as_deref() == Some(name)) {
+                id.authors.push(Party {
+                    name: Some(name.to_string()),
+                    email: None,
+                    url: None,
+                    role: "builder".into(),
+                    source: key.into(),
+                });
+            }
+        }
+    }
+}
+
+/// `DW_AT_producer` names the compiler and its flags.
+fn dwarf_producer(values: &Values, id: &mut Identity) {
+    if id.producer.is_some() {
+        return;
+    }
+    if let Some(p) = values
+        .get("elf.dwarf.producers")
+        .and_then(JsonValue::as_array)
+        .and_then(|a| a.first())
+        .and_then(JsonValue::as_str)
+    {
+        id.producer = Some(Claim::claimed(p, "elf.dwarf.producers"));
+    }
+}
+
+/// Alpine `.PKGINFO` is a publisher manifest in the same family as a wheel's
+/// `METADATA` or a gem's `metadata.gz`, so it maps the same way.
+fn apk_alpine(values: &Values, id: &mut Identity) {
+    if let Some(name) = get_str(values, "apk.pkgname") {
+        id.name = Some(Claim::claimed(name, "apk.pkgname"));
+    }
+    if let Some(version) = get_str(values, "apk.pkgver") {
+        id.version = Some(Claim::claimed(version, "apk.pkgver"));
+    }
+    // `origin` names the source build a package came out of -- the project,
+    // where `pkgname` may be only one of its subpackages.
+    if let Some(origin) = get_str(values, "apk.origin") {
+        id.project = Some(Claim::claimed(origin, "apk.origin"));
+    }
+    if let Some(builder) = get_str(values, "apk.builder") {
+        id.producer = Some(Claim::claimed(builder, "apk.builder"));
+    }
+    // Both fields carry a `Name <email>` contact, the same shape
+    // `split_contact` already unpacks for deb and wheel.
+    for (key, role) in [
+        ("apk.maintainer", "maintainer"),
+        ("apk.packager", "packager"),
+    ] {
+        if let Some(raw) = get_str(values, key) {
+            let (name, email) = split_contact(None, Some(raw));
+            push_author(id, name, email, None, role, key);
+        }
+    }
+    if let Some(url) = get_str(values, "apk.url") {
+        push_url(id, UrlKind::Homepage, url, "apk.url");
+    }
+    // The commit the package was built from, and the digest of its data
+    // segment: both pin this artifact to a specific build.
+    for (key, name) in [
+        ("apk.commit", "vcs_commit"),
+        ("apk.datahash", "apk_datahash"),
+    ] {
+        if let Some(v) = get_str(values, key)
+            && v != "unknown"
+        {
+            id.unique_ids.insert(name.into(), v.to_string());
+        }
+    }
+}
+
+/// An Android app's `package` is its canonical identifier -- the name the
+/// platform installs it under and the one a store listing resolves. The v1
+/// signing certificate is the only party claim an APK carries; Android itself
+/// treats that key, not the package name, as the app's real identity across
+/// updates, so the thumbprint is the durable correlator.
+fn apk_android(values: &Values, id: &mut Identity) {
+    if let Some(pkg) = get_str(values, "android.package") {
+        id.identifier = Some(Claim::claimed(pkg, "android.package"));
+    }
+    // The display label is what a user actually sees, which is what makes it
+    // the field an impersonating app fills with a brand it does not own -- but
+    // most manifests store it as a reference into `resources.arsc` rather than
+    // inline. An unresolved `@0x7f0c0043` is a pointer, not a name, and
+    // recording it as one would put a meaningless string in front of an
+    // analyst on almost every APK. Only an inline label becomes identity.
+    if let Some(label) = get_str(values, "android.app_label").filter(|l| !l.starts_with("@0x")) {
+        id.name = Some(Claim::claimed(label, "android.app_label"));
+    }
+    if let Some(version) =
+        get_str(values, "android.version_name").or_else(|| get_str(values, "android.version_code"))
+    {
+        id.version = Some(Claim::claimed(version, "android.version_name"));
+    }
+    if let Some(ci) = values.get("android.signatures[0]").and_then(cert_from_obj) {
+        if let Some(o) = &ci.o {
+            id.organization = Some(Claim {
+                value: o.clone(),
+                source: "android.signatures[0]".into(),
+                verified: ci.verified,
+            });
+        }
+        id.trust = cert_trust(&ci);
+        id.signer = Some(signer_struct(&ci, "android.signatures[0]"));
+    }
+    if let Some(t) = get_str(values, "android.signatures[0].thumbprint_sha256") {
+        id.unique_ids
+            .insert("apk_signer_thumbprint_sha256".into(), t.to_string());
     }
 }
 
@@ -1223,5 +1440,129 @@ mod filename_tests {
         ] {
             assert_eq!(split_name_version(base), None, "{base:?} must not split");
         }
+    }
+}
+
+#[cfg(test)]
+mod container_identity_tests {
+    use super::{Identity, Values, dmg, iso, tar};
+
+    fn values_from(pairs: &[(&str, serde_json::Value)]) -> Values {
+        let mut v = Values::default();
+        for (k, val) in pairs {
+            v.insert(k, val.clone());
+        }
+        v
+    }
+
+    #[test]
+    fn iso_volume_descriptor_becomes_identity() {
+        let values = values_from(&[
+            ("iso.volume_id", serde_json::json!("DESKTOP")),
+            ("iso.publisher_id", serde_json::json!("ACME LTD")),
+            ("iso.preparer_id", serde_json::json!("SHOULD NOT WIN")),
+            ("iso.builder", serde_json::json!("imgburn")),
+            ("iso.application_id", serde_json::json!("SHOULD NOT WIN")),
+            (
+                "iso.udf.implementation_id",
+                serde_json::json!("*UDF LV Info"),
+            ),
+        ]);
+        let mut id = Identity::default();
+        iso(&values, &mut id);
+        assert_eq!(id.name.unwrap().value, "DESKTOP");
+        // Publisher outranks preparer; the normalized builder outranks the raw
+        // application field it was derived from.
+        assert_eq!(id.organization.unwrap().value, "ACME LTD");
+        assert_eq!(id.producer.unwrap().value, "imgburn");
+        assert_eq!(
+            id.unique_ids
+                .get("udf_implementation_id")
+                .map(String::as_str),
+            Some("*UDF LV Info")
+        );
+    }
+
+    #[test]
+    fn iso_preparer_stands_in_only_without_a_publisher() {
+        let values = values_from(&[("iso.preparer_id", serde_json::json!("PREPARER"))]);
+        let mut id = Identity::default();
+        iso(&values, &mut id);
+        assert_eq!(id.organization.unwrap().value, "PREPARER");
+    }
+
+    #[test]
+    fn dmg_does_not_invent_a_producer_from_the_hfs_mount_signature() {
+        // `HFSJ` / `10.0` are HFS+ lastMountedVersion values, not tools. An
+        // earlier draft mapped this field and produced a confident but
+        // fabricated `producer` on real samples.
+        let values = values_from(&[("dmg.volume.last_mounted_version", serde_json::json!("HFSJ"))]);
+        let mut id = Identity::default();
+        dmg(&values, &mut id);
+        assert!(id.producer.is_none(), "{:?}", id.producer);
+    }
+
+    #[test]
+    fn tar_owner_names_become_builder_parties_without_generic_accounts() {
+        let values = values_from(&[
+            (
+                "archive.builder.unames",
+                serde_json::json!(["jenkins", "root"]),
+            ),
+            (
+                "archive.builder.gnames",
+                serde_json::json!(["staff", "devs"]),
+            ),
+        ]);
+        let mut id = Identity::default();
+        tar(&values, &mut id);
+        let names: Vec<_> = id
+            .authors
+            .iter()
+            .filter_map(|p| p.name.as_deref())
+            .collect();
+        assert_eq!(names, vec!["jenkins", "devs"]);
+        assert!(id.authors.iter().all(|p| p.role == "builder"));
+    }
+}
+
+#[cfg(test)]
+mod android_identity_tests {
+    use super::{Identity, Values, apk_android};
+
+    fn values_from(pairs: &[(&str, serde_json::Value)]) -> Values {
+        let mut v = Values::default();
+        for (k, val) in pairs {
+            v.insert(k, val.clone());
+        }
+        v
+    }
+
+    #[test]
+    fn package_is_the_identifier_and_inline_label_is_the_name() {
+        let values = values_from(&[
+            ("android.package", serde_json::json!("com.example.app")),
+            ("android.app_label", serde_json::json!("Ameli")),
+            ("android.version_name", serde_json::json!("1.2.3")),
+        ]);
+        let mut id = Identity::default();
+        apk_android(&values, &mut id);
+        assert_eq!(id.identifier.unwrap().value, "com.example.app");
+        assert_eq!(id.name.unwrap().value, "Ameli");
+        assert_eq!(id.version.unwrap().value, "1.2.3");
+    }
+
+    #[test]
+    fn an_unresolved_resource_reference_is_not_a_name() {
+        // Most manifests store the label as a pointer into resources.arsc.
+        let values = values_from(&[
+            ("android.package", serde_json::json!("com.example.app")),
+            ("android.app_label", serde_json::json!("@0x7f0c0043")),
+        ]);
+        let mut id = Identity::default();
+        apk_android(&values, &mut id);
+        assert!(id.name.is_none(), "{:?}", id.name);
+        // The package still identifies it.
+        assert_eq!(id.identifier.unwrap().value, "com.example.app");
     }
 }

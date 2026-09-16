@@ -34,9 +34,13 @@ pub(crate) struct ExtractCtx<'a> {
     pub(crate) basename: Option<&'a str>,
 }
 
+mod apk_alpine;
+mod apk_android;
 mod asar;
+mod axml;
 mod binary_attribution;
 mod build_toolchain;
+mod cab;
 mod carrier;
 mod chm;
 mod class;
@@ -179,17 +183,20 @@ pub(crate) fn extract(
         FileType::MachO => {
             macho::extract(bytes, values, strings, metrics, sections, symbols, errors)
         }
-        FileType::Zip
-        | FileType::Odf
-        | FileType::ApkAndroid
-        | FileType::Conda
-        | FileType::Egg
-        | FileType::Ipa => {
+        // An APK is a zip: walk it for members, then read AndroidManifest.xml
+        // and the v1 signature block for the android.* identity facts.
+        FileType::ApkAndroid => {
+            let mut archive = zip::open_archive(bytes)?;
+            zip::extract_from_archive(&mut archive, bytes, values, metrics, archive_members)?;
+            apk_android::extract_from_archive(&mut archive, values, metrics)
+        }
+        FileType::Zip | FileType::Odf | FileType::Conda | FileType::Egg | FileType::Ipa => {
             // Zip-based packages (Android apk, conda, egg, ipa): the generic
             // archive walk surfaces their member listing and the identity
             // manifests inside (PKG-INFO, Info.plist, …).
             zip::extract(bytes, values, metrics, archive_members)
         }
+        FileType::Cab => cab::extract(bytes, values, metrics, archive_members),
         FileType::Nupkg => {
             // Open the ZIP once: generic archive facts, then the inner
             // `.nuspec` for the nupkg.* NuGet publisher identity.
@@ -272,7 +279,12 @@ pub(crate) fn extract(
         // same handling as the other compressed-tar variants — format label
         // only; cleave decompresses and re-submits the members. Void's
         // `props.plist` identity needs a plist parse, deferred for now.
-        FileType::ApkAlpine | FileType::PkgFreebsd | FileType::PkgArch | FileType::Xbps => {
+        // An Alpine package is concatenated gzip streams, not a plain
+        // `.tar.gz`, so the generic tar walk declines it. Read the control
+        // segment for the apk.* publisher identity the way npm/crate/gem read
+        // theirs; cleave still decompresses and re-submits the members.
+        FileType::ApkAlpine => apk_alpine::extract(bytes, values, metrics),
+        FileType::PkgFreebsd | FileType::PkgArch | FileType::Xbps => {
             tar::extract(bytes, file_type, values, metrics, archive_members)
         }
         // A Python sdist is a gzip tar: read `<root>/PKG-INFO` for the
