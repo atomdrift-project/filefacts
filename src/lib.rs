@@ -799,15 +799,40 @@ fn run_extraction(
 /// `ast.call_count`/`ast.member_count`; identifier occurrence counts come
 /// from `identifier_metrics` — `identifiers.count`/`identifiers.unique`)
 /// for whichever kinds have at least one entry.
+/// Whether an exported symbol represents a callable/public API rather than a
+/// compiler or loader artifact.
+///
+/// Itanium-ABI RTTI (`_ZTI*` typeinfo, `_ZTS*` typename, `_ZTV*` vtable,
+/// `_ZTT*` VTT) is emitted by the C++ compiler for any type used with
+/// exceptions or `dynamic_cast`; `mh_execute_header` is the Mach-O image
+/// header every executable exports. Neither says a caller can do anything
+/// with this binary.
+fn is_api_export(name: &str) -> bool {
+    let bare = name.trim_start_matches('_');
+    if bare == "mh_execute_header" {
+        return false;
+    }
+    !(bare.starts_with("ZTI")
+        || bare.starts_with("ZTS")
+        || bare.starts_with("ZTV")
+        || bare.starts_with("ZTT"))
+}
+
 fn emit_symbol_kind_counts(symbols: &Symbols, metrics: &mut Metrics) {
     let mut imports = 0u64;
     let mut exports = 0u64;
+    let mut api_exports = 0u64;
     let mut functions = 0u64;
     let mut binds = 0u64;
     for s in symbols {
         match s.kind() {
             SymbolKind::Import => imports += 1,
-            SymbolKind::Export => exports += 1,
+            SymbolKind::Export => {
+                exports += 1;
+                if is_api_export(s.name().unwrap_or_default()) {
+                    api_exports += 1;
+                }
+            }
             SymbolKind::Function => functions += 1,
             SymbolKind::Bind => binds += 1,
             SymbolKind::Call | SymbolKind::Member | SymbolKind::Identifier => {}
@@ -818,6 +843,16 @@ fn emit_symbol_kind_counts(symbols: &Symbols, metrics: &mut Metrics) {
     }
     if exports > 0 {
         metrics.insert(metric!("exports.count"), exports as f64);
+        // Exports minus the ones the toolchain emits on its own. A rule that
+        // reads "this has a real public API, so treat it as a library" must not
+        // be satisfied by artifacts: any C++ binary built with exceptions
+        // exports typeinfo and typename symbols whether or not it exports
+        // anything a caller could use, and a Mach-O executable always exports
+        // `mh_execute_header`. An obfuscated stub with zero real exports
+        // reaches four on artifacts alone, which is enough to trip an
+        // `exports.count >= 4` suppression and silence the rules that would
+        // have described it.
+        metrics.insert(metric!("exports.api_count"), api_exports as f64);
     }
     if functions > 0 {
         metrics.insert(metric!("functions.count"), functions as f64);
@@ -1674,5 +1709,38 @@ mod tests {
         assert_eq!(entry.stage, Stage::SourceParse);
         assert!(entry.message.contains("tree-sitter parse skipped"));
         assert_eq!(metrics.get("parse.error_count"), Some(1.0));
+    }
+}
+
+#[cfg(test)]
+mod api_export_tests {
+    use super::is_api_export;
+
+    /// Compiler and loader artifacts must not count as a public API.
+    ///
+    /// Any C++ binary built with exceptions exports Itanium-ABI RTTI, and every
+    /// Mach-O executable exports its image header. A stub with no real exports
+    /// reaches four on those alone, which is enough to satisfy an
+    /// `exports.api_count >= 4` suppression and silence the obfuscation rules
+    /// that would otherwise describe it.
+    #[test]
+    fn rtti_and_image_header_are_not_api_exports() {
+        for artifact in [
+            "__ZTISt9exception",
+            "_ZTSSt11logic_error",
+            "__ZTVN10__cxxabiv117__class_type_infoE",
+            "__ZTTSt13basic_fstream",
+            "_mh_execute_header",
+            "mh_execute_header",
+        ] {
+            assert!(!is_api_export(artifact), "{artifact} should not count");
+        }
+    }
+
+    #[test]
+    fn ordinary_symbols_are_api_exports() {
+        for real in ["_main", "curl_easy_init", "_SSL_connect", "ZLibDecompress"] {
+            assert!(is_api_export(real), "{real} should count");
+        }
     }
 }
