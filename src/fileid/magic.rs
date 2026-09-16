@@ -947,9 +947,12 @@ fn looks_like_github_actions_workflow(path: &Path, data: &[u8]) -> bool {
 /// carries no size to step by; the walk stops there and the caller falls back
 /// to the loose test rather than reporting a confident "no".
 fn zip_has_top_level_entry(data: &[u8], name: &[u8]) -> Option<bool> {
-    /// Entries to walk. A package names its content types first; nothing
-    /// legitimate buries it behind hundreds of parts.
-    const MAX_ENTRIES: usize = 256;
+    /// Entries to walk. A package names its content types first, but the
+    /// marker this is also asked about -- an APK's `AndroidManifest.xml` --
+    /// sits wherever the packager put it: entry 905 in one 21 MB sample here.
+    /// Each step is a bounds check and three integer reads, so the ceiling is
+    /// set by what a real archive holds rather than by what the walk costs.
+    const MAX_ENTRIES: usize = 8192;
 
     let u16_at = |off: usize| -> Option<usize> {
         let b = data.get(off..off + 2)?;
@@ -983,13 +986,29 @@ fn zip_has_top_level_entry(data: &[u8], name: &[u8]) -> Option<bool> {
         if data.get(off + 30..off + 30 + name_len)? == name {
             return Some(true);
         }
-        // Bit 3: sizes live in a trailing data descriptor, not here.
+        // Bit 3: the sizes are repeated in a trailing data descriptor. When
+        // the local header carries them too they can still be stepped by;
+        // when it does not, there is nothing to step by and the walk stops.
         if flags & 0x08 != 0 && compressed == 0 {
             return None;
         }
-        let next = off.checked_add(30 + name_len + extra_len + compressed)?;
+        let mut next = off.checked_add(30 + name_len + extra_len + compressed)?;
         if next > data.len() {
             return None;
+        }
+        if flags & 0x08 != 0 && data.get(next..next + 4) == Some(b"PK\x07\x08") {
+            // Signature + crc + two sizes, four bytes each, or eight each in
+            // zip64. Which one is in use is not declared here, so take the
+            // length that lands on something a chain can continue with.
+            next = [16usize, 24]
+                .into_iter()
+                .map(|skip| next + skip)
+                .find(|&candidate| {
+                    matches!(
+                        data.get(candidate..candidate + 4),
+                        Some(b"PK\x03\x04" | b"PK\x01\x02" | b"PK\x05\x06")
+                    )
+                })?;
         }
         off = next;
     }
@@ -1097,6 +1116,15 @@ fn classify_pk(path: &Path, data: &[u8]) -> (FileType, DetectionSource) {
             | "odi"
     ) {
         return (FileType::Odf, DetectionSource::Magic);
+    }
+
+    // Android by content. An APK delivered without its extension -- renamed,
+    // or pulled from a feed that strips names -- otherwise reaches none of the
+    // Android analysis at all: one 21 MB sample here was classified as an
+    // Office document because the OpenDocument namespace URI appears
+    // somewhere in its resources.
+    if zip_has_top_level_entry(data, b"AndroidManifest.xml") == Some(true) {
+        return (FileType::ApkAndroid, DetectionSource::Magic);
     }
 
     // OOXML by content (scan for [Content_Types].xml) — but not for archive containers
@@ -2053,6 +2081,55 @@ mod tests {
         }
         out.extend_from_slice(b"PK\x01\x02");
         out
+    }
+
+    #[test]
+    fn a_data_descriptor_chain_is_still_walkable() {
+        // Android's packager writes entries with general-purpose bit 3 set
+        // and the sizes present in the local header anyway, followed by a
+        // PK\x07\x08 descriptor record. Treating that record as the end of
+        // the chain made every such zip unwalkable -- which is how a 21 MB
+        // APK fell through to a substring match and was called an Office
+        // document.
+        let mut zip = Vec::new();
+        for (name, body) in [
+            ("META-INF/MANIFEST.MF", b"Manifest".as_slice()),
+            ("AndroidManifest.xml", b"\x03\x00"),
+        ] {
+            zip.extend_from_slice(b"PK\x03\x04");
+            zip.extend_from_slice(&[0u8; 2]);
+            zip.extend_from_slice(&0x08u16.to_le_bytes()); // flags: bit 3
+            zip.extend_from_slice(&[0u8; 10]);
+            zip.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            zip.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            zip.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            zip.extend_from_slice(&0u16.to_le_bytes());
+            zip.extend_from_slice(name.as_bytes());
+            zip.extend_from_slice(body);
+            zip.extend_from_slice(b"PK\x07\x08");
+            zip.extend_from_slice(&[0u8; 12]);
+        }
+        zip.extend_from_slice(b"PK\x01\x02");
+        assert_eq!(
+            zip_has_top_level_entry(&zip, b"AndroidManifest.xml"),
+            Some(true)
+        );
+        assert_eq!(
+            classify_pk(Path::new("nameless"), &zip).0,
+            FileType::ApkAndroid
+        );
+    }
+
+    #[test]
+    fn an_extensionless_android_package_is_still_an_apk() {
+        let apk = zip_of(&[
+            ("AndroidManifest.xml", b"\x03\x00\x08\x00"),
+            ("classes.dex", b"dex"),
+        ]);
+        assert_eq!(
+            classify_pk(Path::new("VirusShare_52b318f"), &apk).0,
+            FileType::ApkAndroid
+        );
     }
 
     #[test]
