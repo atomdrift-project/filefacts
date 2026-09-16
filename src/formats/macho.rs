@@ -2299,4 +2299,38 @@ mod tests {
         assert_eq!(m.get("macho.executable_segment_count"), Some(1.0));
         assert!(m.get("macho.entry_in_nonstandard_section").is_none());
     }
+
+    /// The chained-fixups fallback must not fire on a binary that has bind
+    /// opcodes, or every such import would be emitted twice.
+    ///
+    /// `test.macho` carries `LC_DYLD_INFO_ONLY`, so `macho.imports()` returns
+    /// its imports and the symtab fallback must stay out of the way. The
+    /// fallback exists for `LC_DYLD_CHAINED_FIXUPS` binaries -- macOS 12 and
+    /// later -- where `macho.imports()` returns nothing at all and the
+    /// undefined externals in `LC_SYMTAB` are the only record of what the
+    /// binary imports.
+    #[test]
+    fn bind_imports_are_not_duplicated_by_the_symtab_fallback() {
+        use std::collections::HashMap;
+        let bytes = read_fixture("test.macho");
+        let parsed = crate::open(&bytes).unwrap();
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        let mut total = 0usize;
+        for sym in parsed.symbols().iter_kind(crate::SymbolKind::Import) {
+            if let crate::Symbol::Import { name, library, .. } = sym {
+                total += 1;
+                *counts.entry(name.as_str()).or_default() += 1;
+                // The bind path always attributes a dylib; the fallback never
+                // does. Every import here must have come from the bind path.
+                assert!(
+                    library.is_some(),
+                    "{name} has no library: emitted by the chained-fixups \
+                     fallback on a binary that has bind opcodes"
+                );
+            }
+        }
+        assert!(total > 0, "fixture should have imports");
+        let dupes: Vec<_> = counts.iter().filter(|(_, n)| **n > 1).collect();
+        assert!(dupes.is_empty(), "duplicated imports: {dupes:?}");
+    }
 }
