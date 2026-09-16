@@ -96,6 +96,21 @@ impl Text {
     pub(crate) fn from_rows(rows: std::sync::Arc<[stng::ExtractedString]>) -> Self {
         Self { rows }
     }
+    /// Append rows extracted from somewhere other than the file's own bytes.
+    ///
+    /// Costs an allocation, because `rows` is a shared `Arc` slice that
+    /// consumers borrow rather than copy. That is the right trade only where
+    /// the extra rows cannot be had any other way -- text recovered from a
+    /// decoded blob, whose plaintext does not exist anywhere in the file --
+    /// so every other path keeps using [`Text::from_rows`] and stays copy-free.
+    pub(crate) fn append_rows(&mut self, extra: &[stng::ExtractedString]) {
+        if extra.is_empty() {
+            return;
+        }
+        let mut rows: Vec<stng::ExtractedString> = self.rows.iter().cloned().collect();
+        rows.extend_from_slice(extra);
+        self.rows = rows.into();
+    }
     /// The shared row slice — lets consumers hold an `Arc` clone (a refcount
     /// bump) rather than cloning the string data.
     pub fn rows(&self) -> &std::sync::Arc<[stng::ExtractedString]> {
@@ -279,6 +294,14 @@ pub(crate) struct Strings {
     /// instead of persisting a second copy. `None` when no text tier ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) text_key: Option<String>,
+    /// Cache keys for row sets appended from buffers the file does not
+    /// literally contain -- text recovered by decoding something inside it.
+    /// Kept as keys for the same reason `text_key` is: the disk cache drops
+    /// the rows and rehydrates every set from stng, so a decoded payload's
+    /// strings survive a cache round-trip instead of vanishing on the second
+    /// scan of the same file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) extra_text_keys: Vec<String>,
 }
 
 impl Strings {
@@ -382,6 +405,7 @@ mod tests {
             literals,
             comments: Comments::new(),
             text_key: None,
+            extra_text_keys: Vec::new(),
         };
         let spans: Vec<(Span, &str)> = strings.text_spans().collect();
         assert_eq!(

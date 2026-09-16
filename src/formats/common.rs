@@ -122,6 +122,30 @@ pub(super) fn extract_binary_strings(bytes: &[u8], strings: &mut Strings, xor: X
     );
 }
 
+/// Add the strings of a buffer the file does not literally contain.
+///
+/// [`extract_binary_strings`] *replaces* `strings.text`, because for every
+/// ordinary format there is one buffer and one extraction. A carrier that
+/// hides text behind an encoding has two: its own bytes, and what decodes out
+/// of them. This appends the second set rather than substituting it, and drops
+/// the text cache key, because the rows no longer describe the raw bytes that
+/// key was computed from.
+pub(super) fn append_decoded_strings(bytes: &[u8], strings: &mut Strings, xor: XorScan) {
+    let opts = string_opts_for(xor, bytes);
+    let extracted = stng::cached_strings_with_options(bytes, &opts);
+    if extracted.is_empty() {
+        return;
+    }
+    strings.text.append_rows(&extracted);
+    // Record the key rather than clearing `text_key`. Clearing it reads as
+    // "no text tier ran", and the disk cache honours that literally: it drops
+    // the rows and rehydrates nothing, so the second scan of the same file
+    // sees no strings at all -- including the ones the file does contain.
+    if let Some(key) = stng::cache_key_for(bytes, &opts) {
+        strings.extra_text_keys.push(key);
+    }
+}
+
 /// Extract strings from a goblin object the caller already parsed, so the
 /// binary isn't parsed a second time inside stng. stng re-parses only for
 /// `Object::Unknown`; filefacts only ever passes a recognised Mach-O / ELF / PE
