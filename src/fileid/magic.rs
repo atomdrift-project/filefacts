@@ -934,6 +934,77 @@ fn looks_like_github_actions_workflow(path: &Path, data: &[u8]) -> bool {
     false
 }
 
+/// Whether `name` is the name of a **top-level** entry in this zip.
+///
+/// A plain `memmem` for `[Content_Types].xml` answers a different question:
+/// whether the bytes appear anywhere. They do whenever a zip stores an Office
+/// document uncompressed, because the inner package's own header is then
+/// present verbatim in the outer file -- which is how a zip holding one
+/// `.docx` came to be identified as a `.docx`, and its members never walked.
+///
+/// So walk the local-header chain, stepping over each entry's data by its
+/// declared compressed size. An entry written with a streaming data descriptor
+/// carries no size to step by; the walk stops there and the caller falls back
+/// to the loose test rather than reporting a confident "no".
+fn zip_has_top_level_entry(data: &[u8], name: &[u8]) -> Option<bool> {
+    /// Entries to walk. A package names its content types first; nothing
+    /// legitimate buries it behind hundreds of parts.
+    const MAX_ENTRIES: usize = 256;
+
+    let u16_at = |off: usize| -> Option<usize> {
+        let b = data.get(off..off + 2)?;
+        Some(u16::from_le_bytes([b[0], b[1]]) as usize)
+    };
+    let u32_at = |off: usize| -> Option<usize> {
+        let b = data.get(off..off + 4)?;
+        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    };
+
+    let mut off = 0usize;
+    for _ in 0..MAX_ENTRIES {
+        let sig = data.get(off..off + 4)?;
+        if sig != b"PK\x03\x04" {
+            // Only a real end-of-chain marker answers the question. Anything
+            // else means the walk lost the thread, and a lost walk must not
+            // report "no": the malformed packages this corpus is full of --
+            // a header whose name length and compressed size are nonsense --
+            // are still Office documents, and saying otherwise routes them to
+            // a reader that rejects them outright.
+            let clean_end = matches!(
+                sig,
+                b"PK\x01\x02" | b"PK\x05\x06" | b"PK\x06\x06" | b"PK\x06\x07"
+            );
+            return clean_end.then_some(false);
+        }
+        let flags = u16_at(off + 6)?;
+        let compressed = u32_at(off + 18)?;
+        let name_len = u16_at(off + 26)?;
+        let extra_len = u16_at(off + 28)?;
+        if data.get(off + 30..off + 30 + name_len)? == name {
+            return Some(true);
+        }
+        // Bit 3: sizes live in a trailing data descriptor, not here.
+        if flags & 0x08 != 0 && compressed == 0 {
+            return None;
+        }
+        let next = off.checked_add(30 + name_len + extra_len + compressed)?;
+        if next > data.len() {
+            return None;
+        }
+        off = next;
+    }
+    None
+}
+
+/// Whether the zip is an Open Packaging Conventions package.
+fn is_opc_package(data: &[u8]) -> bool {
+    match zip_has_top_level_entry(data, b"[Content_Types].xml") {
+        Some(answer) => answer,
+        // Unwalkable: keep the older, looser test rather than deciding.
+        None => memchr::memmem::find(data, b"[Content_Types].xml").is_some(),
+    }
+}
+
 /// Classify PK (ZIP) archives into JAR, OOXML, or generic Archive.
 ///
 /// ZIP-based formats share the same magic bytes, so disambiguation requires
@@ -987,10 +1058,23 @@ fn classify_pk(path: &Path, data: &[u8]) -> (FileType, DetectionSource) {
         return (FileType::Vsix, DetectionSource::Magic);
     }
 
+    // An Office extension is a claim, not the format. Every OOXML document is
+    // an Open Packaging Conventions zip and every one of them names
+    // `[Content_Types].xml` as its first entry, so requiring the marker costs
+    // a real document nothing -- and a zip that merely *calls* itself `.xlsm`
+    // is identified as the zip it is.
+    //
+    // That difference decides whether anything looks inside. A file typed
+    // Ooxml goes to the office analyzer, which reads OPC parts and finds none;
+    // a file typed Zip goes to the archive analyzer, which walks the members.
+    // Three samples here are zips holding one payload apiece -- a `documents.doc`
+    // under an `.xlsm` name, a `.pdf.url` shortcut beside a decoy docx -- and
+    // none of those members were ever analyzed.
     if matches!(
         ext,
         "docx" | "xlsx" | "pptx" | "docm" | "xlsm" | "pptm" | "dotx" | "dotm" | "xltx" | "xltm"
-    ) {
+    ) && is_opc_package(data)
+    {
         return (FileType::Ooxml, DetectionSource::Magic);
     }
 
@@ -1043,13 +1127,19 @@ fn classify_pk(path: &Path, data: &[u8]) -> (FileType, DetectionSource) {
             | "xapk"
             | "cbz"
     );
-    if !is_archive_opc && memchr::memmem::find(data, b"[Content_Types].xml").is_some() {
+    if !is_archive_opc && is_opc_package(data) {
         return (FileType::Ooxml, DetectionSource::Magic);
     }
 
     // ODF by content — first ZIP entry is an uncompressed "mimetype" file
     // containing "application/vnd.oasis.opendocument."
-    if memchr::memmem::find(data, b"application/vnd.oasis.opendocument.").is_some() {
+    // The ODF marker has to be the package's own, not a string that happens to
+    // appear inside it. An OpenDocument file stores `mimetype` as its first
+    // entry; an Android package 21 MB wide can carry the namespace URI in any
+    // of its resources, and was being called an OpenDocument file for it.
+    if memchr::memmem::find(data, b"application/vnd.oasis.opendocument.").is_some()
+        && zip_has_top_level_entry(data, b"mimetype") != Some(false)
+    {
         return (FileType::Odf, DetectionSource::Magic);
     }
 
@@ -1591,9 +1681,14 @@ mod tests {
 
     #[test]
     fn ooxml_by_extension() {
-        let data = b"PK\x03\x04some office content";
+        // With the OPC marker the extension is believed; without it the file
+        // is what it is, which is a zip.
+        let data = b"PK\x03\x04[Content_Types].xml";
         let (ft, _) = detect_from_content(Path::new("report.docx"), data).unwrap();
         assert_eq!(ft, FileType::Ooxml);
+        let plain = b"PK\x03\x04some office content";
+        let (ft, _) = detect_from_content(Path::new("report.docx"), plain).unwrap();
+        assert_eq!(ft, FileType::Zip);
     }
 
     #[test]
@@ -1941,6 +2036,95 @@ mod tests {
         let (ft, _) =
             detect_from_content(Path::new("demo-1.0-1-x86_64.pkg.tar.zst"), &zst).unwrap();
         assert_eq!(ft, FileType::PkgArch);
+    }
+
+    /// Build a zip local-header chain from (name, stored-data) pairs.
+    fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (name, body) in entries {
+            out.extend_from_slice(b"PK\x03\x04");
+            out.extend_from_slice(&[0u8; 14]); // version..crc
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes()); // compressed
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes()); // uncompressed
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // extra
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(body);
+        }
+        out.extend_from_slice(b"PK\x01\x02");
+        out
+    }
+
+    #[test]
+    fn a_stored_office_member_does_not_make_the_outer_zip_a_package() {
+        // The outer file holds one `.xlsx`, uncompressed, so the inner
+        // package's own `[Content_Types].xml` header is present verbatim in
+        // the outer bytes. A substring test calls the carrier an OOXML
+        // document and nothing walks its members; the entry walk does not.
+        let inner = zip_of(&[("[Content_Types].xml", b"<Types/>")]);
+        let outer = zip_of(&[("Persons_status_details_list.xlsx", &inner)]);
+        assert!(memchr::memmem::find(&outer, b"[Content_Types].xml").is_some());
+        assert_eq!(
+            zip_has_top_level_entry(&outer, b"[Content_Types].xml"),
+            Some(false)
+        );
+        assert_eq!(
+            classify_pk(Path::new("carrier.docx"), &outer).0,
+            FileType::Zip
+        );
+        // The inner document is still recognized on its own.
+        assert_eq!(
+            classify_pk(Path::new("inner.xlsx"), &inner).0,
+            FileType::Ooxml
+        );
+    }
+
+    #[test]
+    fn a_malformed_header_falls_back_rather_than_denying() {
+        // A weaponized package whose first header declares a nonsense name
+        // length and a half-gigabyte compressed size inside a 15 KB file.
+        // The walk cannot follow that, and must not conclude "not a package":
+        // these are Office documents, deliberately broken.
+        let mut zip = zip_of(&[("[Content_Types].xml", b"<Types/>")]);
+        zip[18..22].copy_from_slice(&538_968_429u32.to_le_bytes());
+        zip[26..28].copy_from_slice(&4096u16.to_le_bytes());
+        assert_eq!(zip_has_top_level_entry(&zip, b"[Content_Types].xml"), None);
+        assert_eq!(classify_pk(Path::new("lure.docx"), &zip).0, FileType::Ooxml);
+    }
+
+    #[test]
+    fn a_streaming_entry_falls_back_rather_than_denying() {
+        // Bit 3 puts the sizes in a trailing descriptor, so the chain cannot
+        // be stepped. Returning "not a package" there would misclassify real
+        // documents written by streaming producers.
+        let mut zip = zip_of(&[("word/document.xml", b"x")]);
+        zip[6] = 0x08; // general-purpose bit 3
+        zip[18..22].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(zip_has_top_level_entry(&zip, b"[Content_Types].xml"), None);
+    }
+
+    #[test]
+    fn an_office_extension_without_the_opc_marker_is_a_zip() {
+        // The evasion this closes: rename a zip to `.xlsm` and the office
+        // analyzer takes it, finds no OPC parts, and nothing walks the members.
+        let mut zip = b"PK\x03\x04".to_vec();
+        zip.extend_from_slice(b"\x14\x00\x00\x00\x08\x00");
+        zip.extend_from_slice(b"documents.doc");
+        zip.extend(std::iter::repeat_n(0u8, 64));
+        let (ft, _) = classify_pk(Path::new("invoice.xlsm"), &zip);
+        assert_eq!(ft, FileType::Zip);
+    }
+
+    #[test]
+    fn an_office_extension_with_the_opc_marker_is_still_ooxml() {
+        let mut zip = b"PK\x03\x04".to_vec();
+        zip.extend_from_slice(b"\x14\x00\x00\x00\x08\x00");
+        zip.extend_from_slice(b"[Content_Types].xml");
+        zip.extend(std::iter::repeat_n(0u8, 64));
+        for name in ["a.docx", "a.xlsm", "a.pptm", "a.dotx"] {
+            let (ft, _) = classify_pk(Path::new(name), &zip);
+            assert_eq!(ft, FileType::Ooxml, "{name}");
+        }
     }
 
     #[test]

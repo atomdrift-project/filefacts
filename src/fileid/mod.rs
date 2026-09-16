@@ -2344,9 +2344,15 @@ message CommandMessage {
 
     #[test]
     fn ooxml_by_ext_magic() {
-        assert_detect("report.docx", b"PK\x03\x04office", FileType::Ooxml);
-        assert_detect("sheet.xlsx", b"PK\x03\x04office", FileType::Ooxml);
-        assert_detect("slides.pptx", b"PK\x03\x04office", FileType::Ooxml);
+        // The Office extension is honoured only when the bytes back it up.
+        // Every OOXML document is an OPC package and names
+        // `[Content_Types].xml` as its first entry; a zip that only carries
+        // the extension is a zip, and is analyzed as one.
+        let opc = b"PK\x03\x04[Content_Types].xml".as_slice();
+        assert_detect("report.docx", opc, FileType::Ooxml);
+        assert_detect("sheet.xlsx", opc, FileType::Ooxml);
+        assert_detect("slides.pptx", opc, FileType::Ooxml);
+        assert_detect("report.docx", b"PK\x03\x04office", FileType::Zip);
     }
 
     #[test]
