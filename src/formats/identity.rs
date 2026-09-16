@@ -879,6 +879,12 @@ fn png(values: &Values, id: &mut Identity) {
     }
 }
 
+/// A shortcut is a record of the machine that built it. The tracker block is
+/// the well-known part, but the LinkInfo volume fields identify that machine
+/// just as well and survive on shortcuts that carry no tracker at all: the
+/// serial is the NTFS volume id of the drive the target sat on, and the label
+/// is whatever its owner named it. Neither is chosen for distribution, which
+/// is what makes them useful for grouping a campaign's shortcuts together.
 fn lnk(values: &Values, id: &mut Identity) {
     if let Some(machine) = get_str(values, "lnk.tracker.machine_id") {
         id.unique_ids
@@ -886,6 +892,22 @@ fn lnk(values: &Values, id: &mut Identity) {
     }
     if let Some(mac) = get_str(values, "lnk.tracker.mac_address") {
         id.unique_ids.insert("mac_address".into(), mac.to_string());
+    }
+    if let Some(serial) = values.get("lnk.volume.serial").and_then(|v| {
+        v.as_u64()
+            .map(|n| n.to_string())
+            .or_else(|| v.as_str().map(str::to_string))
+    }) {
+        id.unique_ids.insert("lnk_volume_serial".into(), serial);
+    }
+    if let Some(label) = get_str(values, "lnk.volume.name") {
+        id.unique_ids
+            .insert("lnk_volume_label".into(), label.to_string());
+    }
+    // The build machine's own name, when the shortcut carries a tracker.
+    if let Some(host) = get_str(values, "lnk.tracker.machine_name") {
+        id.unique_ids
+            .insert("lnk_machine_name".into(), host.to_string());
     }
 }
 
