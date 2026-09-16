@@ -915,6 +915,7 @@ mod tests {
             }],
             root: 0,
             version: "1.10".into(),
+            truncated: None,
         }
     }
 

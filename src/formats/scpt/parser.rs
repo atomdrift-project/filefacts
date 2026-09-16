@@ -88,13 +88,18 @@ pub(super) struct Parsed {
     pub nodes: Vec<Node>,
     pub root: usize,
     pub version: String,
+    /// Why the walk stopped early, if it did. The nodes already built stay
+    /// usable: a truncated tree still yields the Apple Events, handlers and
+    /// literals found before the stop, which is what an analyst needs from a
+    /// sample that is malformed precisely so nothing can read it.
+    pub truncated: Option<String>,
 }
 
 const MAX_INPUT: usize = 64 * 1024 * 1024;
 const MAX_DATA: usize = 32 * 1024 * 1024;
 const MAX_NODES: usize = 262_144;
 const MAX_EDGES: usize = 1_048_576;
-const MAX_DEPTH: usize = 256;
+const MAX_DEPTH: usize = 65_536;
 const REF_SLOTS: usize = 32_768;
 
 /// An unfinished vector. Reference words remain borrowed from the input, so a
@@ -116,10 +121,21 @@ struct Reader<'a> {
     edges: usize,
 }
 
+/// Whether an error came from one of this parser's own ceilings rather than
+/// from the file being malformed. These are the four `*_limit exceeded`
+/// messages raised by `object`, `vector` and the arena guards.
+fn is_budget(reason: &str) -> bool {
+    reason.ends_with("limit exceeded")
+}
+
 pub(super) fn parse(bytes: &[u8]) -> Result<Parsed, String> {
     let mut reader = Reader::new(bytes)?;
+    // A file that cannot produce a header or a root object is not a readable
+    // FAS stream at all; there is nothing partial to hand back. Everything
+    // after this point is recoverable.
     let version = reader.header()?;
     let root = reader.object(0)?;
+    let mut truncated = None;
     while let Some(frame) = reader.pending.last_mut() {
         if frame.next == frame.count {
             reader.pending.pop();
@@ -132,7 +148,26 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Parsed, String> {
         let id = i16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
         let child = match usize::try_from(id).ok().and_then(|id| reader.refs[id]) {
             Some(node) => node,
-            None => reader.object(id)?,
+            None => match reader.object(id) {
+                Ok(node) => node,
+                // A budget we imposed is not the file's fault, and failing the
+                // whole extraction over one handed an attacker a way to erase
+                // every fact at once: exceed a ceiling anywhere and the
+                // extractor reported nothing -- no events, no literals, no
+                // handlers -- for a sample whose readable remainder is exactly
+                // the evidence. Stop walking, keep what was built, and report
+                // the reason through `scpt.limits`.
+                //
+                // Structural corruption still fails loudly. A stream that is
+                // truncated or malformed is the file lying about its own
+                // shape, and accepting an arbitrary prefix of one would make a
+                // successful parse meaningless.
+                Err(reason) if is_budget(&reason) => {
+                    truncated = Some(reason);
+                    break;
+                }
+                Err(reason) => return Err(reason),
+            },
         };
         if let Value::Vector { items, .. } = &mut reader.nodes[parent].value {
             // Capacity for every edge, including metadata, was reserved once.
@@ -143,6 +178,7 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Parsed, String> {
         nodes: reader.nodes,
         root,
         version,
+        truncated,
     })
 }
 
@@ -851,9 +887,21 @@ mod tests {
         valid.extend(header(1, -1, 0));
         let p = parse(&stream(&valid)).unwrap();
         assert_eq!(p.nodes.len(), MAX_DEPTH + 1);
+        assert!(p.truncated.is_none());
         b.extend(vector(16, -1, None, &[-1]));
         b.extend(header(1, -1, 0));
-        assert_error(&stream(&b), "nesting limit");
+        // Past the ceiling the walk stops but the file still parses: the nodes
+        // built before the stop are kept and the reason is reported, rather
+        // than the whole extraction failing and reporting nothing.
+        let over = parse(&stream(&b)).unwrap();
+        assert!(
+            over.truncated
+                .as_deref()
+                .is_some_and(|r| r.contains("nesting limit")),
+            "{:?}",
+            over.truncated
+        );
+        assert!(over.nodes.len() > MAX_DEPTH, "partial nodes retained");
     }
 
     #[test]
@@ -880,7 +928,17 @@ mod tests {
         for _ in 0..17 {
             b.extend(vector(16, -1, None, &vec![0; 65535]));
         }
-        assert_error(&stream(&b), "edge limit");
+        // Bounded, and reported: the walk stops at the ceiling and says so
+        // rather than discarding the nodes it already built.
+        let p = parse(&stream(&b)).unwrap();
+        assert!(
+            p.truncated
+                .as_deref()
+                .is_some_and(|r| r.contains("edge limit")),
+            "{:?}",
+            p.truncated
+        );
+        assert!(p.nodes.len() <= MAX_NODES);
     }
 
     #[test]
@@ -892,7 +950,15 @@ mod tests {
                 b.extend(header(1, -1, 0));
             }
         }
-        assert_error(&stream(&b), "object limit");
+        let p = parse(&stream(&b)).unwrap();
+        assert!(
+            p.truncated
+                .as_deref()
+                .is_some_and(|r| r.contains("object limit")),
+            "{:?}",
+            p.truncated
+        );
+        assert!(p.nodes.len() <= MAX_NODES);
     }
 
     #[test]

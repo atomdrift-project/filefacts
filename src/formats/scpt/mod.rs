@@ -117,6 +117,9 @@ pub(super) fn extract(
     let mut call_count = 0;
     let mut decoded_count = 0;
     let mut limitations = Vec::new();
+    if let Some(reason) = &parsed.truncated {
+        limitations.push(json!({"reason": reason, "stage": "parse"}));
+    }
     if text_reader.limited {
         limitations.push(json!({"reason": "stored text work limit reached"}));
     }
@@ -181,6 +184,19 @@ pub(super) fn extract(
     metrics.insert(metric!("scpt.handlers"), handler_count as f64);
     metrics.insert(metric!("scpt.calls"), call_count as f64);
     metrics.insert(metric!("scpt.decoded"), decoded_count as f64);
+    // Distinct Apple Events the script reaches for. The individual events are
+    // already imports, but the count is what separates a one-shot dialog from
+    // a script driving the shell, the loader and the delay timer at once.
+    metrics.insert(metric!("scpt.events"), imports.len() as f64);
+    // The walk stopped at one of the parser's ceilings. Worth its own metric
+    // rather than living only in `scpt.limits` prose: a compiled AppleScript
+    // built deep enough to exhaust a static parser is itself the signal, and
+    // it used to be indistinguishable from a clean parse because the whole
+    // extraction failed and reported nothing at all.
+    metrics.insert(
+        metric!("scpt.truncated"),
+        f64::from(u8::from(parsed.truncated.is_some())),
+    );
     Ok(())
 }
 
@@ -245,6 +261,7 @@ mod tests {
             }],
             root: 0,
             version: "1.10".into(),
+            truncated: None,
         };
         let mut reader = TextReader::new(6);
         assert_eq!(reader.read(&parsed, &[0]), Some((100, "AB".into())));
