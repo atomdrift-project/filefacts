@@ -234,19 +234,36 @@ pub(super) fn extract(
 /// as the legacy [`extract`] path and populate `office.vba.*`
 /// identically. This mirrors the `FileType::OleDoc` dispatch so macros in
 /// `.docm`/`.xlsm`/`.pptm` are decompressed, not merely flagged by stream
-/// path. A document carries a single `vbaProject.bin`; the first match
-/// wins, matching the legacy extractor's selection.
+/// path. A document carries a single VBA project; the first part the
+/// package declares as one wins, falling back to the conventional
+/// `vbaProject.bin` name when nothing is declared.
 pub(super) fn extract_from_zip<R: Read + Seek>(
     zip: &mut zip::ZipArchive<R>,
     values: &mut Values,
     metrics: &mut Metrics,
     symbols_out: &mut crate::output::Symbols,
 ) {
-    let Some(name) = zip
-        .file_names()
-        .find(|n| n.to_ascii_lowercase().ends_with("vbaproject.bin"))
-        .map(str::to_string)
-    else {
+    // Find the part by what the package says it is, not by what it is called.
+    //
+    // `office.macros` comes from `[Content_Types].xml`, which is where the
+    // package declares which part is the VBA project. Matching on the name
+    // `vbaProject.bin` instead meant a package that renamed it extracted no
+    // macros at all -- and renaming it is free: one sample here declares
+    // `Default Extension="bin" ContentType="application/vnd.ms-office.vbaProject"`
+    // and ships the project as `A@@@@.../Vasp7676CDT11.bin`, 273 KB of it.
+    let declared = values
+        .get("office.macros")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_str)
+        .find(|n| zip.index_for_name(n).is_some())
+        .map(str::to_string);
+    let Some(name) = declared.or_else(|| {
+        zip.file_names()
+            .find(|n| n.to_ascii_lowercase().ends_with("vbaproject.bin"))
+            .map(str::to_string)
+    }) else {
         return;
     };
     let Ok(mut entry) = zip.by_name(&name) else {
@@ -497,12 +514,19 @@ fn parse_dir_stream(data: &[u8]) -> Vec<ModuleInfo> {
                     ]) as usize;
                     match sub_id {
                         0x001A => {
-                            // MODULESTREAMNAME (MBCS)
+                            // MODULESTREAMNAME, MBCS, followed by the same
+                            // name in UTF-16LE (0x0032).
+                            //
+                            // Prefer the Unicode one. The MBCS form is
+                            // code-page bytes, and reading it as UTF-8 turns
+                            // any non-ASCII letter into a replacement
+                            // character -- so a project with a module called
+                            // `Módulo1` looked for a stream named `M?dulo1`,
+                            // found nothing, and yielded no source at all.
+                            // Every non-English VBA project extracted empty.
                             pos += 6;
                             info.stream_name = read_ascii_string(data, pos, sub_size);
                             pos += sub_size;
-                            // Skip the trailing UTF-16LE variant
-                            // (0x0032) if present.
                             if pos + 6 <= data.len()
                                 && u16::from_le_bytes([data[pos], data[pos + 1]]) == 0x0032
                             {
@@ -512,6 +536,9 @@ fn parse_dir_stream(data: &[u8]) -> Vec<ModuleInfo> {
                                     data[pos + 4],
                                     data[pos + 5],
                                 ]) as usize;
+                                if let Some(wide) = read_utf16_string(data, pos + 6, next_size) {
+                                    info.stream_name = wide;
+                                }
                                 pos += 6 + next_size;
                             }
                         }
@@ -573,18 +600,78 @@ fn parse_dir_stream(data: &[u8]) -> Vec<ModuleInfo> {
     out
 }
 
-fn read_ascii_string(data: &[u8], pos: usize, len: usize) -> String {
-    if pos + len > data.len() {
-        return String::new();
+/// Decode a UTF-16LE run of `len` bytes starting at `pos`.
+///
+/// Returns `None` when the run is truncated, has an odd length, is not
+/// well-formed UTF-16, or holds nothing but NUL padding — in each case the
+/// caller keeps the MBCS name it already read.
+fn read_utf16_string(data: &[u8], pos: usize, len: usize) -> Option<String> {
+    let bytes = slice_at(data, pos, len)?;
+    if bytes.len() % 2 != 0 {
+        return None;
     }
-    String::from_utf8_lossy(&data[pos..pos + len])
+    let units = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .copied()
+        .map(u16::from_le_bytes);
+    let mut s: String = char::decode_utf16(units).collect::<Result<_, _>>().ok()?;
+    s.truncate(s.trim_end_matches('\0').len());
+    (!s.is_empty()).then_some(s)
+}
+
+/// Decode a `len`-byte MBCS run as UTF-8, lossily. Bytes outside ASCII are
+/// code-page dependent and become replacement characters; prefer the
+/// UTF-16LE variant that MS-OVBA pairs with most of these fields.
+fn read_ascii_string(data: &[u8], pos: usize, len: usize) -> String {
+    let Some(bytes) = slice_at(data, pos, len) else {
+        return String::new();
+    };
+    String::from_utf8_lossy(bytes)
         .trim_end_matches('\0')
         .to_string()
+}
+
+/// `data[pos..pos + len]`, or `None` if that range is not wholly within
+/// `data`. Avoids the overflow that a bare `pos + len` risks on lengths read
+/// from the file.
+fn slice_at(data: &[u8], pos: usize, len: usize) -> Option<&[u8]> {
+    data.get(pos..)?.get(..len)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_unicode_stream_name_survives_where_the_mbcs_one_is_mangled() {
+        // `Módulo1` in UTF-16LE. The MBCS twin of this field is code-page
+        // bytes, so the lossy UTF-8 read of it cannot round-trip the accent.
+        let wide: Vec<u8> = "M\u{f3}dulo1"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(
+            read_utf16_string(&wide, 0, wide.len()).as_deref(),
+            Some("M\u{f3}dulo1")
+        );
+    }
+
+    #[test]
+    fn a_malformed_unicode_stream_name_is_rejected_rather_than_guessed() {
+        let wide: Vec<u8> = "Mod1".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        // Truncated: the declared length runs past the end of the stream.
+        assert_eq!(read_utf16_string(&wide, 0, wide.len() + 2), None);
+        // A length that cannot be whole UTF-16 code units.
+        assert_eq!(read_utf16_string(&wide, 0, 3), None);
+        // An unpaired surrogate.
+        assert_eq!(read_utf16_string(&[0x00, 0xD8], 0, 2), None);
+        // NUL padding alone carries no name.
+        assert_eq!(read_utf16_string(&[0, 0, 0, 0], 0, 4), None);
+        // An offset past the end does not panic.
+        assert_eq!(read_utf16_string(&wide, wide.len() + 9, 2), None);
+    }
 
     #[test]
     fn decompress_empty_input_yields_empty_output() {
@@ -677,6 +764,38 @@ mod tests {
         assert_eq!(infos[0].name, "ThisDocument");
         assert_eq!(infos[0].stream_name, "ThisDocument");
         assert_eq!(infos[0].offset, 0x2A);
+    }
+
+    #[test]
+    fn a_non_ascii_module_name_comes_from_the_unicode_record() {
+        // `Módulo1` in code-page bytes is not UTF-8, so reading the MBCS
+        // record gives `M<replacement>dulo1` and the stream lookup misses.
+        // MS-OVBA writes the same name in UTF-16 right after it.
+        let mut d = Vec::new();
+        d.extend_from_slice(&0x000Fu16.to_le_bytes());
+        d.extend_from_slice(&2u32.to_le_bytes());
+        d.extend_from_slice(&1u16.to_le_bytes());
+        let rec = |d: &mut Vec<u8>, id: u16, body: &[u8]| {
+            d.extend_from_slice(&id.to_le_bytes());
+            d.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            d.extend_from_slice(body);
+        };
+        rec(&mut d, 0x0019, b"M\xf3dulo1"); // MODULENAME, cp1252
+        rec(&mut d, 0x001A, b"M\xf3dulo1"); // MODULESTREAMNAME, cp1252
+        let wide: Vec<u8> = "Módulo1"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        rec(&mut d, 0x0032, &wide); // the Unicode variant
+        rec(&mut d, 0x0031, &4u32.to_le_bytes());
+        rec(&mut d, 0x002B, &[]);
+
+        let infos = parse_dir_stream(&d);
+        assert_eq!(infos.len(), 1);
+        assert_eq!(
+            infos[0].stream_name, "Módulo1",
+            "stream name must come from the UTF-16 record"
+        );
     }
 
     #[test]

