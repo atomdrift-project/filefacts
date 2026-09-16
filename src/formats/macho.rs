@@ -317,6 +317,7 @@ fn extract_symbols(macho: &MachO<'_>, symbols_out: &mut crate::Symbols) {
     // (lowercased, basename only, `.dylib`/`.tbd` suffix stripped) so
     // trait authors can match against `"libsystem.b"` rather than
     // `"/usr/lib/libSystem.B.dylib"`.
+    let mut bind_imports = 0usize;
     if let Ok(imports) = macho.imports() {
         for imp in &imports {
             let library = normalize_dylib_path(imp.dylib);
@@ -324,6 +325,7 @@ fn extract_symbols(macho: &MachO<'_>, symbols_out: &mut crate::Symbols) {
             // when the symbol has no `LC_SYMTAB` entry (rare, e.g.
             // dyld-info-only binaries).
             let offset = name_offsets.get(imp.name).copied().unwrap_or(imp.offset);
+            bind_imports += 1;
             symbols_out.push(crate::Symbol::Import {
                 // Record the base symbol, not the Darwin `$VARIANT` spelling,
                 // so anchored trait matchers and imphash see `popen` rather
@@ -337,6 +339,36 @@ fn extract_symbols(macho: &MachO<'_>, symbols_out: &mut crate::Symbols) {
             });
         }
         // Import count flows through cross-format `imports.count`.
+    }
+
+    // Chained-fixups fallback.
+    //
+    // `macho.imports()` reads dyld *bind opcodes* (`LC_DYLD_INFO`). Binaries
+    // linked for macOS 12 and later carry `LC_DYLD_CHAINED_FIXUPS` instead and
+    // have no bind opcodes at all, so that call returns an empty list and the
+    // binary appeared to import nothing -- which is every current macOS build,
+    // malware included. A stealer whose only libc import is `system` looked
+    // identical to a binary with no imports whatsoever, and every `type:
+    // import` trait was blind to it.
+    //
+    // The undefined external symbols in `LC_SYMTAB` are those same imports,
+    // and `import_name_offsets` has already walked them to build the offset
+    // map above, so recovering them costs nothing extra. The dylib each one
+    // resolves to lives in the fixup chains rather than the symbol table, so
+    // `library` is left unset here instead of guessed at -- trait matchers key
+    // on the symbol name, and a wrong library is worse than none.
+    if bind_imports == 0 && !name_offsets.is_empty() {
+        let mut names: Vec<(&str, u64)> = name_offsets.iter().map(|(n, o)| (*n, *o)).collect();
+        names.sort_unstable();
+        for (name, offset) in names {
+            symbols_out.push(crate::Symbol::Import {
+                name: strip_darwin_symbol_variant(name).to_string(),
+                alias: None,
+                library: None,
+                offset: Some(offset),
+                ordinal: None,
+            });
+        }
     }
 
     // Exports — recovered from the dyld export trie. Re-exports
