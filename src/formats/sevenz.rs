@@ -51,6 +51,7 @@ pub(super) fn extract(
     let mut script_count = 0u64;
     let mut nested_archive_count = 0u64;
     let mut traversal_count = 0u64;
+    let mut encrypted_count = 0u64;
 
     for (index, entry) in archive.files.iter().enumerate() {
         let path = entry.name().replace('\\', "/");
@@ -93,6 +94,7 @@ pub(super) fn extract(
         }
         if encrypted {
             member.insert("encrypted".into(), JsonValue::Bool(true));
+            encrypted_count += 1;
         }
         if let Some(mtime) = mtime_unix {
             member.insert("mtime_unix".into(), JsonValue::Number(mtime.into()));
@@ -150,6 +152,15 @@ pub(super) fn extract(
     metrics.insert(
         metric!("archive.path_traversal_count"),
         traversal_count as f64,
+    );
+    // 7z carries its encryption in the coder chain rather than a per-entry
+    // flag, so this had no ZIP-shaped counterpart and was simply never
+    // emitted: every rule gated on `archive.security.encrypted_count` was
+    // unreachable for 7z, including the password-protected sideload bundles
+    // that are the format's most common malicious shape.
+    metrics.insert(
+        metric!("archive.security.encrypted_count"),
+        encrypted_count as f64,
     );
     Ok(())
 }
@@ -221,6 +232,40 @@ mod tests {
             Some("7z")
         );
         assert_eq!(metrics.get("archive.file_count"), Some(1.0));
+        // Emitted even when nothing is encrypted: a rule gated on `min: 1`
+        // and the ML feature both need absence to be a reported zero rather
+        // than a missing key.
+        assert_eq!(metrics.get("archive.security.encrypted_count"), Some(0.0));
         assert_eq!(typed_members.len(), members.len());
+    }
+
+    /// The shape the malicious bundles use: AES-encrypted payload streams with
+    /// the header left in the clear, so the member table still reads without a
+    /// password. 7z expresses that through the folder's coder chain rather than
+    /// a per-entry flag, which is why it needs its own count.
+    #[test]
+    fn aes_payload_streams_are_counted_as_encrypted() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("drop");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("Setup.exe"), b"not an executable").unwrap();
+        let archive_path = temp.path().join("payload.7z");
+
+        let mut writer = sevenz_rust::SevenZWriter::create(&archive_path).unwrap();
+        writer.set_content_methods(vec![
+            sevenz_rust::AesEncoderOptions::new(sevenz_rust::Password::from("hunter2")).into(),
+            sevenz_rust::SevenZMethod::LZMA2.into(),
+        ]);
+        writer.push_source_path(&source, |_| true).unwrap();
+        writer.finish().unwrap();
+
+        let bytes = fs::read(archive_path).unwrap();
+        let mut values = Values::default();
+        let mut metrics = Metrics::default();
+        let mut typed_members = Vec::new();
+        extract(&bytes, &mut values, &mut metrics, &mut typed_members).unwrap();
+
+        assert_eq!(metrics.get("archive.security.encrypted_count"), Some(1.0));
+        assert!(typed_members.iter().all(|member| member.encrypted));
     }
 }
