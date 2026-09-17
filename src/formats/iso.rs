@@ -299,9 +299,26 @@ fn finish(
         let actual = bytes.len() as u64;
         metrics.insert(metric!("iso.declared_bytes"), declared as f64);
         if actual > declared {
-            let trailing = actual - declared;
-            metrics.insert(metric!("iso.trailing_bytes"), trailing as f64);
-            anomalies.push("trailing-data");
+            // A hybrid image keeps its content in a partition, so the bytes
+            // past the ISO volume are claimed by the partition table rather
+            // than appended. Count only what lies past the last partition.
+            let partition_end = partition_claimed_ranges(bytes)
+                .into_iter()
+                .map(|(_, end)| end)
+                .max()
+                .unwrap_or(0);
+            if partition_end > declared {
+                metrics.insert(metric!("iso.partitioned_bytes"), partition_end as f64);
+                anomalies.push("hybrid-partitioned");
+            }
+            let trailing_from = declared.max(partition_end);
+            if actual > trailing_from {
+                metrics.insert(
+                    metric!("iso.trailing_bytes"),
+                    (actual - trailing_from) as f64,
+                );
+                anomalies.push("trailing-data");
+            }
         } else if actual < declared {
             metrics.insert(metric!("iso.missing_bytes"), (declared - actual) as f64);
             anomalies.push("truncated-image");
@@ -1658,6 +1675,55 @@ const MIN_UNCLAIMED_BYTES: u64 = 4096;
 ///
 /// All-zero runs are excluded: an image is padded to a sector, and empty
 /// padding is not evidence of anything.
+/// The byte ranges an MBR/GPT partition table in the system area claims.
+///
+/// A hybrid image (`xorriso -isohybrid-mbr`, and every Linux/BSD installer
+/// built that way) carries a partition table in LBA 0 alongside the ISO 9660
+/// descriptors. Its content lives in a partition, so the ISO volume can be
+/// tiny while the file is gigabytes: Redox's desktop livedisk declares 21
+/// sectors (43,008 bytes) of ISO 9660 and is 603,979,776 bytes long, with one
+/// 0xEE (GPT protective) entry spanning the whole image.
+///
+/// Those bytes are accounted for — by the partition table — so they are not
+/// "unclaimed". Without this, the entire filesystem is reported as one
+/// `trailing` member and every data-file rule runs across a whole operating
+/// system as an opaque blob.
+///
+/// Only entries that actually describe a range count. Bytes past the last
+/// partition are still unaccounted for and are still reported, so a payload
+/// appended after the partitioned area does not hide behind this.
+fn partition_claimed_ranges(bytes: &[u8]) -> Vec<(u64, u64)> {
+    let area = bytes
+        .get(..SYSTEM_AREA_SECTORS * SECTOR)
+        .unwrap_or_default();
+    if area.get(510..512) != Some(&[0x55, 0xAA]) {
+        return Vec::new();
+    }
+    // LBA size is fixed at 512 for the MBR entry format regardless of the
+    // ISO's own 2048-byte sectors.
+    const LBA: u64 = 512;
+    let total = bytes.len() as u64;
+    let mut out = Vec::new();
+    for i in 0..4 {
+        let off = 446 + i * 16;
+        let Some(e) = area.get(off..off + 16) else {
+            break;
+        };
+        let ptype = e.get(4).copied().unwrap_or(0);
+        let start = u64::from(u32_le(e, 8).unwrap_or(0));
+        let count = u64::from(u32_le(e, 12).unwrap_or(0));
+        if ptype == 0 || count == 0 {
+            continue;
+        }
+        let begin = start.saturating_mul(LBA).min(total);
+        let end = start.saturating_add(count).saturating_mul(LBA).min(total);
+        if end > begin {
+            out.push((begin, end));
+        }
+    }
+    out
+}
+
 fn unclaimed_regions(
     files: &[File],
     pvd: &Pvd,
@@ -1687,12 +1753,22 @@ fn unclaimed_regions(
     if declared > cursor && declared - cursor >= MIN_UNCLAIMED_BYTES {
         out.push(("slack", cursor, declared - cursor));
     }
-    // Bytes past the volume the descriptors declare. No mastering tool
-    // writes here; an appended payload does. Reported whatever its size —
-    // unlike interior padding, any trailing byte is unaccounted for.
+    // Bytes past the volume the descriptors declare. On a plain image no
+    // mastering tool writes here and an appended payload does, so any
+    // trailing byte is unaccounted for. On a hybrid image the partition
+    // table claims them, and only what lies past the last partition is
+    // genuinely unaccounted.
     let actual = bytes.len() as u64;
     if actual > declared {
-        out.push(("trailing", declared, actual - declared));
+        let partition_end = partition_claimed_ranges(bytes)
+            .into_iter()
+            .map(|(_, end)| end)
+            .max()
+            .unwrap_or(0);
+        let trailing_from = declared.max(partition_end);
+        if actual > trailing_from {
+            out.push(("trailing", trailing_from, actual - trailing_from));
+        }
     }
 
     out.retain(|(kind, off, len)| {
@@ -1885,6 +1961,61 @@ fn emit_members(files: &[File], archive_members: &mut Vec<ArchiveMember>) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Build a system area (16 * 2048 bytes) carrying an MBR whose single
+    /// entry starts at `start_lba` and spans `sectors` 512-byte LBAs.
+    fn system_area_with_partition(start_lba: u32, sectors: u32) -> Vec<u8> {
+        let mut area = vec![0u8; SYSTEM_AREA_SECTORS * SECTOR];
+        let e = 446;
+        area[e + 4] = 0xEE; // GPT protective
+        area[e + 8..e + 12].copy_from_slice(&start_lba.to_le_bytes());
+        area[e + 12..e + 16].copy_from_slice(&sectors.to_le_bytes());
+        area[510] = 0x55;
+        area[511] = 0xAA;
+        area
+    }
+
+    #[test]
+    fn hybrid_partition_claims_bytes_past_the_iso_volume() {
+        // Redox's desktop livedisk: ISO 9660 declares 21 sectors (43,008
+        // bytes) while the file is 604 MB, with one 0xEE entry covering the
+        // whole image. Those bytes are claimed by the partition table, so
+        // none of them is "unclaimed" — without this the entire operating
+        // system is reported as one `trailing` member and every data-file
+        // rule runs over it as an opaque blob.
+        let total = 4 * 1024 * 1024usize;
+        let mut bytes = system_area_with_partition(1, (total / 512) as u32 - 1);
+        bytes.resize(total, 0xAB);
+        let ranges = partition_claimed_ranges(&bytes);
+        assert_eq!(
+            ranges,
+            vec![(512, total as u64)],
+            "partition must claim to EOF"
+        );
+    }
+
+    #[test]
+    fn payload_appended_past_the_last_partition_is_still_trailing() {
+        // The exemption must not become a blanket one: bytes beyond where the
+        // partition table stops are still unaccounted for.
+        let part_end = 1024 * 1024usize;
+        let total = part_end + 64 * 1024;
+        let mut bytes = system_area_with_partition(1, (part_end / 512) as u32 - 1);
+        bytes.resize(total, 0xCD);
+        let ranges = partition_claimed_ranges(&bytes);
+        let claimed_end = ranges.iter().map(|(_, e)| *e).max().unwrap_or(0);
+        assert_eq!(claimed_end, part_end as u64);
+        assert!(
+            (total as u64) > claimed_end,
+            "bytes past the partition remain unaccounted and are reported as trailing"
+        );
+    }
+
+    #[test]
+    fn plain_image_without_a_boot_signature_claims_nothing() {
+        let bytes = vec![0u8; SYSTEM_AREA_SECTORS * SECTOR + 4096];
+        assert!(partition_claimed_ranges(&bytes).is_empty());
+    }
 
     #[test]
     fn joliet_levels_recognised() {

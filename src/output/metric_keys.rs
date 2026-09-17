@@ -493,6 +493,7 @@ pub const CATALOG: &[&str] = &[
     "iso.missing_bytes",
     "iso.modified_gmt_offset_minutes",
     "iso.modified_unix",
+    "iso.partitioned_bytes",
     "iso.path_table_bytes",
     "iso.setuid_file_count",
     "iso.surfaced_file_count",

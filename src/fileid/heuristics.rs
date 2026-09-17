@@ -197,6 +197,17 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"SETLOCAL", Lang::Batch, 5),
     (b"GOTO ", Lang::Batch, 5),
     (b"IF EXIST", Lang::Batch, 5),
+    // The three above are upper-case only, and batch is a case-insensitive
+    // language that people write in lower case. A script that opens with
+    // something other than `@echo off` therefore scored zero for Batch and
+    // was typed by its extension -- vxheaven's `Virus.BAT.Companion.a` starts
+    // `@ctty nul` and was read as an ar archive because its variant letter is
+    // `.a`. Adding lower-case `goto`/`if exist` would collide with C and Go;
+    // these four are spelled the same way nowhere else.
+    (b"errorlevel", Lang::Batch, 10),
+    (b"ERRORLEVEL", Lang::Batch, 10),
+    (b"ctty ", Lang::Batch, 10),
+    (b"attrib +", Lang::Batch, 5),
     // ── VBScript ──
     (b"WScript.", Lang::Vbs, 10),
     (b"Option Explicit", Lang::Vbs, 10),
@@ -1309,5 +1320,32 @@ mod binary_guard_tests {
     fn utf8_source_with_accents_is_not_binary() {
         let src = "(ns café.core)\n(defn saluer [n] (str \"bonjour \" n))\n(defn adieu [n] (str \"au revoir \" n))\n".as_bytes();
         assert_eq!(detect_from_content(src), Some(FileType::Clojure));
+    }
+}
+
+#[cfg(test)]
+mod lowercase_batch_heuristic_tests {
+    use super::*;
+
+    /// Batch is case-insensitive and is usually written in lower case. A
+    /// script that does not open with `@echo off` used to score zero.
+    #[test]
+    fn lowercase_batch_body_is_recognised() {
+        let data = b"@ctty nul\nfor %%f in (*.com) do set K=%%f\nattrib +h Y%K%\ngoto end\n:end\n";
+        assert_eq!(detect_from_content(data), Some(FileType::Batch));
+    }
+
+    /// `errorlevel` is spelled that way in no other language.
+    #[test]
+    fn errorlevel_marks_a_batch_script() {
+        let data = b"find \"CW\" <%1 >nul\nif not errorlevel 1 goto c\nren %1 vir.tmp\n";
+        assert_eq!(detect_from_content(data), Some(FileType::Batch));
+    }
+
+    /// C's `goto` is deliberately not a batch token, so C source is untouched.
+    #[test]
+    fn c_goto_is_not_batch() {
+        let data = b"int f(int x){ if(!x) goto done; return 1; done: return 0; }\n";
+        assert_ne!(detect_from_content(data), Some(FileType::Batch));
     }
 }
