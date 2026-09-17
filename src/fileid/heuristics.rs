@@ -576,7 +576,82 @@ fn looks_like_structured_data(data: &[u8]) -> bool {
             structured += 1;
         }
     }
-    significant >= MIN_YAML_LINES && structured * 10 >= significant * 7
+    if significant >= MIN_YAML_LINES && structured * 10 >= significant * 7 {
+        return true;
+    }
+
+    looks_like_rfc822_stanzas(head)
+}
+
+/// `true` for an RFC822/deb822 stanza document: `Field-Name: value` lines whose
+/// continuations are folded onto following lines that begin with a space.
+///
+/// Debian's `control`, APT's `Packages`/`Sources` and its `Translation-*`
+/// description catalogues are all this shape, and the folded continuations are
+/// free English prose -- which is why the YAML check above cannot see them: a
+/// wrapped sentence is not a node line, so the ratio collapses even though
+/// every field line is structured. APT's `Translation-en` is 32 MB of package
+/// descriptions, and "This package contains…" occurring six times in the first
+/// 4 KB was enough to type the whole catalogue as Kotlin and run credential
+/// rules over English sentences.
+fn looks_like_rfc822_stanzas(head: &[u8]) -> bool {
+    let mut lines = head.split(|&b| b == b'\n').peekable();
+    let mut fields = 0usize;
+    let mut folded = 0usize;
+    let mut other = 0usize;
+    let mut first_significant_is_field = false;
+    let mut seen_significant = false;
+
+    while let Some(line) = lines.next() {
+        // Drop the trailing partial line left by the scan cut rather than judge it.
+        if lines.peek().is_none() && head.len() == SCAN_LIMIT {
+            break;
+        }
+        if line.trim_ascii().is_empty() {
+            continue;
+        }
+        // A folded continuation belongs to the field above it, so it is not
+        // evidence either way -- but it only counts as one after a field.
+        if matches!(line.first(), Some(b' ' | b'\t')) {
+            if fields > 0 {
+                folded += 1;
+                continue;
+            }
+            other += 1;
+            continue;
+        }
+        let is_field = is_rfc822_field_line(line);
+        if !seen_significant {
+            seen_significant = true;
+            first_significant_is_field = is_field;
+        }
+        if is_field {
+            fields += 1;
+        } else {
+            other += 1;
+        }
+    }
+
+    // Every unfolded line must be a field, the document must open with one, and
+    // there must be enough of them to be a stanza rather than a stray `Note:`.
+    first_significant_is_field && other == 0 && fields >= MIN_YAML_LINES && folded > 0
+}
+
+/// `true` for `Field-Name: value` with an RFC822 field name -- printable ASCII
+/// without spaces or a colon. Rejects a Kotlin `package a.b` (no colon), a C
+/// label (no value) and a prose line containing a mid-sentence colon.
+fn is_rfc822_field_line(line: &[u8]) -> bool {
+    let end = match line.iter().position(|&b| b == b':') {
+        Some(0) | None => return false,
+        Some(i) => i,
+    };
+    if !line[..end]
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return false;
+    }
+    matches!(line.get(end + 1), None | Some(b' ') | Some(b'\r'))
 }
 
 /// `true` for a line that opens a YAML sequence entry, a block mapping key, or
@@ -1087,6 +1162,43 @@ class BaselineProfileGenerator {
 ./autoconf.texi.  This manual is for GNU Autoconf, a\n\
 package for creating scripts to configure source code packages.\n";
         assert_eq!(detect_from_content(data), None);
+    }
+
+    #[test]
+    fn apt_translation_catalogue_is_not_kotlin() {
+        // /var/lib/apt/lists/*_i18n_Translation-en: deb822 stanzas whose folded
+        // continuations are English package descriptions. Six occurrences of
+        // "package " in the first 4 KB scored Kotlin 30 against a threshold of
+        // 10, so 32 MB of prose was parsed as Kotlin and the JVM credential
+        // rules fired on it (`id_rsa`, /etc/shadow and crontab lines all appear
+        // in the descriptions of openssh-client, passwd and cron).
+        let data = b"Package: 0ad-data\n\
+Description-md5: 26581e685027d5ae84824362a4ba59ee\n\
+Description-en: Real-time strategy game of ancient warfare (data files)\n\
+\x20 0 A.D. is a free, open-source, cross-platform real-time strategy game.\n\
+\x20.\n\
+\x20This package contains the main data files required by 0 A.D.\n\
+\n\
+Package: openssh-client\n\
+Description-md5: 9d1b1b0e8e2b0e4e0e6a9e4f9c6b5a3d\n\
+Description-en: secure shell (SSH) client\n\
+\x20This package provides the ssh client and reads ~/.ssh/id_rsa.\n";
+        assert_eq!(detect_from_content(data), None);
+    }
+
+    #[test]
+    fn kotlin_package_declaration_is_not_a_deb822_field() {
+        // The stanza check must not swallow real Kotlin: `package a.b` has no
+        // colon, so the file's first significant line is not a field line.
+        let data = b"package com.example.app\n\
+\n\
+import kotlin.io.println\n\
+\n\
+suspend fun main() {\n\
+    val greeting = \"hi\"\n\
+    println(greeting)\n\
+}\n";
+        assert_eq!(detect_from_content(data), Some(FileType::Kotlin));
     }
 
     #[test]
