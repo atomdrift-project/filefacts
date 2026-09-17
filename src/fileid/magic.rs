@@ -277,6 +277,16 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // RAR: Rar!
             if data.starts_with(b"Rar!") {
                 Some((FileType::Rar, DetectionSource::Magic))
+            } else if data.starts_with(b"REGEDIT4") {
+                // A .reg file's first line names the format. `FileType::Registry`
+                // was reachable only from a `.reg` extension, so a registry
+                // script under any other name -- vxheaven's
+                // `Trojan.WinREG.AntiFireWall.a`, where the `.a` is a variant
+                // letter -- was typed by whatever the trailing component
+                // happened to mean. Nothing but a registry script opens with
+                // this line. REGEDIT4 is the Windows 9x/NT4 spelling; the
+                // Windows 2000+ one is handled in the `W` arm below.
+                Some((FileType::Registry, DetectionSource::Magic))
             } else if (data.starts_with(b"RIFF") || data.starts_with(b"RIFX")) && data.len() >= 12 {
                 // RIFF container: `RIFF` + u32 length + form type. WAVE, WEBP
                 // and AVI share the wrapper, so the form type at offset 8
@@ -584,6 +594,17 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // `project.pbxproj`; it is the format's only signature.
             if data.starts_with(b"// !$*UTF8*$!") {
                 Some((FileType::Pbxproj, DetectionSource::Magic))
+            } else {
+                None
+            }
+        }
+        b'W' => {
+            // `Windows Registry Editor Version 5.00` — the modern .reg header,
+            // written as UTF-8 or (far more often) UTF-16LE with a BOM, which
+            // the BOM-stripping caller has already unwrapped by the time this
+            // runs. Same reasoning as the `REGEDIT4` arm above.
+            if data.starts_with(b"Windows Registry Editor Version") {
+                Some((FileType::Registry, DetectionSource::Magic))
             } else {
                 None
             }
@@ -2429,6 +2450,41 @@ mod html_doctype_magic_tests {
         assert_ne!(
             detect_from_content(Path::new("x.tmpl"), data).map(|(ft, _)| ft),
             Some(FileType::Html)
+        );
+    }
+}
+
+#[cfg(test)]
+mod registry_script_magic_tests {
+    use super::*;
+
+    /// The Windows 9x/NT4 header, under a name that claims another type.
+    #[test]
+    fn regedit4_header_is_a_registry_script() {
+        let data = b"REGEDIT4\r\n\r\n[HKEY_LOCAL_MACHINE\\Software\\Foo]\r\n\"Bar\"=\"baz\"\r\n";
+        assert_eq!(
+            detect_from_content(Path::new("Trojan.WinREG.AntiFireWall.a"), data).map(|(ft, _)| ft),
+            Some(FileType::Registry)
+        );
+    }
+
+    /// The Windows 2000+ header.
+    #[test]
+    fn modern_registry_header_is_a_registry_script() {
+        let data = b"Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\X]\r\n";
+        assert_eq!(
+            detect_from_content(Path::new("x"), data).map(|(ft, _)| ft),
+            Some(FileType::Registry)
+        );
+    }
+
+    /// Prose that merely begins with the same word is not a registry script.
+    #[test]
+    fn unrelated_w_text_is_not_a_registry_script() {
+        let data = b"Windows compatibility notes\n\nThis document describes...\n";
+        assert_ne!(
+            detect_from_content(Path::new("notes.txt"), data).map(|(ft, _)| ft),
+            Some(FileType::Registry)
         );
     }
 }

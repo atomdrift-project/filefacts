@@ -424,6 +424,13 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         // content-score as Kotlin. Treat as text so C2/protocol traits can still
         // match without source-language misclassification.
         "proto" => Some(FileType::Text),
+        // YARA rule sources. No dedicated analyzer; `rule X { strings: ... }`
+        // with `$`-prefixed identifiers content-scores as PHP, Kotlin, Python or
+        // shell, so a shipped rule corpus runs those languages' traits over what
+        // is really a list of detection patterns -- and the patterns are quoted
+        // malware strings, so the rules fire on the rule. Treat as text: strings
+        // and URLs are still extracted, no source language is claimed.
+        "yar" | "yara" => Some(FileType::Text),
         "go" => Some(FileType::Go),
         "rs" => Some(FileType::Rust),
         "java" => Some(FileType::Java),
@@ -1045,6 +1052,24 @@ mod tests {
                 detect_from_path(Path::new(name)),
                 Some(FileType::Text),
                 "{name} should be Text, not Shell"
+            );
+        }
+    }
+
+    #[test]
+    fn yara_rule_extension_is_text_not_source_language() {
+        // A rule corpus is a list of quoted malware strings. Typed as a source
+        // language it runs that language's traits over its own detection
+        // patterns, so the rules fire on the rules.
+        for name in [
+            "apt_cryptominer.yar",
+            "rules/Multi_Cryptominer_Xmrig.yara",
+            "THIRD_PARTY/IcedID.YARA",
+        ] {
+            assert_eq!(
+                detect_from_path(Path::new(name)),
+                Some(FileType::Text),
+                "{name} should be Text, not PHP/Kotlin/Python/Shell"
             );
         }
     }
