@@ -1291,6 +1291,17 @@ fn allows_heuristic_extension_override(file_type: FileType) -> bool {
             | FileType::Chm
             | FileType::Rar
             | FileType::SevenZ
+            // `.a`/`.lib` claim an ar archive, and a real one starts with
+            // `!<arch>\n` -- magic that stage 1 always catches. So an `.a`
+            // that reaches this fallback is never a static library; the
+            // extension is the only thing saying otherwise. vxheaven names
+            // its samples `Virus.DOS.Jerusalem.1347.a`, `Exploit.HTML.
+            // HTHelp.a`, `Trojan.BAT.DelAll.a` -- a variant letter, not an
+            // extension -- and all twenty in the triage corpus were typed
+            // `static-lib` and analysed as opaque binaries. Letting the
+            // sniffer look inside recovers the HTML, batch and registry ones
+            // as what they are.
+            | FileType::StaticLib
     )
 }
 
@@ -3190,5 +3201,42 @@ function wpcf7_special_mail_tag( $output, $name, $html ) {
         let ft: FileType = serde_json::from_str("\"python_sdist\"").unwrap();
         assert_eq!(ft, FileType::PythonSdist);
         assert!(serde_json::from_str::<FileType>("\"tar_gz\"").is_err());
+    }
+}
+
+#[cfg(test)]
+mod static_lib_extension_override_tests {
+    use super::*;
+
+    /// A real ar archive is caught by magic in stage 1 and is unaffected.
+    #[test]
+    fn real_ar_archive_still_wins() {
+        let mut data = b"!<arch>\n".to_vec();
+        data.extend_from_slice(&[0x20; 64]);
+        assert_eq!(
+            detect(Path::new("libfoo.a"), &data).map(|d| d.file_type),
+            Some(FileType::StaticLib)
+        );
+    }
+
+    /// vxheaven appends a variant letter, so `Trojan.BAT.DelAll.a` looks like
+    /// an ar archive by extension while being a batch script. Since a genuine
+    /// `.a` always carries `!<arch>`, the sniffer is allowed to look inside.
+    #[test]
+    fn batch_body_named_dot_a_is_batch() {
+        let data = b"@echo off\r\nif not exist c:\\x.bat goto skip\r\nfor %%f in (*.bat) do call %%f\r\n:skip\r\n";
+        let d = detect(Path::new("Trojan.BAT.DelAll.a"), data).expect("detected");
+        assert_ne!(d.file_type, FileType::StaticLib);
+        assert!(d.extension_mismatch());
+    }
+
+    /// The extension is still the fallback when nothing recognises the body.
+    #[test]
+    fn unrecognised_body_named_dot_a_falls_back_to_static_lib() {
+        let data = [0xe9u8, 0x12, 0x00, 0xb4, 0x09, 0xcd, 0x21, 0xc3];
+        assert_eq!(
+            detect(Path::new("Virus.DOS.Trivial.40.a"), &data).map(|d| d.file_type),
+            Some(FileType::StaticLib)
+        );
     }
 }

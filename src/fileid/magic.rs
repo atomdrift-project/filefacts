@@ -77,8 +77,16 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
                 // `00 01 00 00`, which an icon header can never be (its type
                 // field would have to be 0x0100).
                 Some((FileType::Ico, DetectionSource::Magic))
-            } else if data.starts_with(&[0x00, 0x01, 0x00, 0x00]) {
+            } else if data.starts_with(&[0x00, 0x01, 0x00, 0x00])
+                && !data[4..].starts_with(b"Standard Jet DB")
+                && !data[4..].starts_with(b"Standard ACE DB")
+            {
                 // sfnt version 1.0 — the TrueType flavor every `.ttf` uses.
+                // A Microsoft Access database opens with the same four bytes
+                // and then names its engine, so an .mdb/.accdb would otherwise
+                // be handed to the font parser and read as a corrupt font
+                // rather than as a database with macros in it. Seen on
+                // vxheaven's Virus.MSAccess.Detox.a.
                 // Four bytes is a weak signature, so this arm is reached only
                 // after the AppleDouble check above and is confirmed
                 // downstream by formats/font.rs walking the table directory.
@@ -584,6 +592,24 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // PHP opening tag: <?php
             if data.starts_with(b"<?php") {
                 Some((FileType::Php, DetectionSource::Magic))
+            } else if data.len() >= 14 && data[..14].eq_ignore_ascii_case(b"<!DOCTYPE html") {
+                // HTML had no content detection at all: `FileType::Html` was
+                // only ever produced from a `.html`/`.htm`/`.hta` extension,
+                // and `looks_like_html` existed solely to *reject* that claim.
+                // A page under any other name was typed by its extension and
+                // analysed as whatever that extension meant -- vxheaven's
+                // `Trojan.JS.DeltreeY.c` (the `.c` is a variant letter) was
+                // read as C source, and the whole `html/` corpus arrives
+                // under names like it.
+                //
+                // Only the unambiguous prefix is accepted here. Nothing but a
+                // web page opens `<!DOCTYPE html`, so this cannot take a file
+                // away from a format that has a real claim on it; the looser
+                // `<html`/`<body`/`<div` shapes stay out of magic because
+                // they also appear at the top of templates, fragments and XML
+                // dialects that other arms own. `<!DOCTYPE svg` is unaffected
+                // -- the root name is part of what is compared.
+                Some((FileType::Html, DetectionSource::Magic))
             } else if let Some(r) = detect_xml_plist(data) {
                 Some(r)
             } else {
@@ -2315,5 +2341,94 @@ mod odf_confirmation_tests {
     fn odf_extension_still_wins() {
         let d = unwalkable_zip_mentioning_odf();
         assert_eq!(classify_pk(Path::new("x.odt"), &d).0, FileType::Odf);
+    }
+}
+
+#[cfg(test)]
+mod jet_db_sfnt_collision_tests {
+    use super::*;
+
+    /// A real TrueType font still identifies as a font.
+    #[test]
+    fn sfnt_version_one_is_still_a_font() {
+        let mut data = vec![0x00, 0x01, 0x00, 0x00];
+        data.extend_from_slice(&[0x00, 0x0a, 0x00, 0x80, 0x00, 0x03, 0x00, 0x20]);
+        data.extend_from_slice(b"cmap");
+        assert_eq!(
+            detect_from_content(Path::new("x.ttf"), &data).map(|(ft, _)| ft),
+            Some(FileType::Font)
+        );
+    }
+
+    /// An Access database opens with the same four bytes and must not be
+    /// handed to the font parser.
+    #[test]
+    fn jet_db_header_is_not_a_font() {
+        let mut data = vec![0x00, 0x01, 0x00, 0x00];
+        data.extend_from_slice(b"Standard Jet DB\x00");
+        data.extend_from_slice(&[0u8; 32]);
+        assert_ne!(
+            detect_from_content(Path::new("db.mdb"), &data).map(|(ft, _)| ft),
+            Some(FileType::Font)
+        );
+    }
+
+    /// The newer ACE engine names itself the same way.
+    #[test]
+    fn ace_db_header_is_not_a_font() {
+        let mut data = vec![0x00, 0x01, 0x00, 0x00];
+        data.extend_from_slice(b"Standard ACE DB\x00");
+        data.extend_from_slice(&[0u8; 32]);
+        assert_ne!(
+            detect_from_content(Path::new("db.accdb"), &data).map(|(ft, _)| ft),
+            Some(FileType::Font)
+        );
+    }
+}
+
+#[cfg(test)]
+mod html_doctype_magic_tests {
+    use super::*;
+
+    /// A page under a name that claims another language is still a page.
+    #[test]
+    fn doctype_html_is_detected_by_content() {
+        let data =
+            b"<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\">\n<HTML></HTML>";
+        assert_eq!(
+            detect_from_content(Path::new("Trojan.JS.DeltreeY.c"), data).map(|(ft, _)| ft),
+            Some(FileType::Html)
+        );
+    }
+
+    /// The doctype keyword is case-insensitive in HTML and in the wild.
+    #[test]
+    fn lowercase_doctype_html_is_detected() {
+        let data = b"<!doctype html>\n<html><body>x</body></html>";
+        assert_eq!(
+            detect_from_content(Path::new("x"), data).map(|(ft, _)| ft),
+            Some(FileType::Html)
+        );
+    }
+
+    /// The SVG arm compares the root name, so it keeps its own doctype.
+    #[test]
+    fn doctype_svg_is_not_html() {
+        let data = b"<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"x\">\n<svg xmlns=\"x\"/>";
+        assert_ne!(
+            detect_from_content(Path::new("x.svg"), data).map(|(ft, _)| ft),
+            Some(FileType::Html)
+        );
+    }
+
+    /// A bare `<html>` with no doctype stays out of magic: that shape also
+    /// opens templates and fragments other arms own.
+    #[test]
+    fn bare_html_root_is_not_promoted_by_magic() {
+        let data = b"<html><body>x</body></html>";
+        assert_ne!(
+            detect_from_content(Path::new("x.tmpl"), data).map(|(ft, _)| ft),
+            Some(FileType::Html)
+        );
     }
 }
