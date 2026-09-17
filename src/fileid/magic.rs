@@ -1182,8 +1182,18 @@ fn classify_pk(path: &Path, data: &[u8]) -> (FileType, DetectionSource) {
     // appear inside it. An OpenDocument file stores `mimetype` as its first
     // entry; an Android package 21 MB wide can carry the namespace URI in any
     // of its resources, and was being called an OpenDocument file for it.
+    //
+    // `== Some(true)`, not `!= Some(false)`. `zip_has_top_level_entry` returns
+    // `None` when the walk loses the thread, deliberately, so that a malformed
+    // header cannot produce a confident "no" -- and the looser comparison then
+    // read that uncertainty as a yes. An 88MB .xapk whose walk ran out was
+    // typed OpenDocument on the strength of the namespace URI appearing
+    // somewhere in it, and got no Android analysis at all. The Android branch
+    // above already requires positive confirmation; this now matches it. A
+    // genuine ODF whose walk fails falls through to Zip, which still reaches
+    // archive analysis -- the cheaper mistake by far.
     if memchr::memmem::find(data, b"application/vnd.oasis.opendocument.").is_some()
-        && zip_has_top_level_entry(data, b"mimetype") != Some(false)
+        && zip_has_top_level_entry(data, b"mimetype") == Some(true)
     {
         return (FileType::Odf, DetectionSource::Magic);
     }
@@ -2275,5 +2285,35 @@ mod tests {
     #[test]
     fn too_short_returns_none() {
         assert!(detect_from_content(Path::new("x"), b"x").is_none());
+    }
+}
+
+#[cfg(test)]
+mod odf_confirmation_tests {
+    use super::*;
+
+    /// A ZIP whose local-header walk cannot complete, carrying the
+    /// OpenDocument namespace URI somewhere in its body -- the shape of the
+    /// 88MB .xapk that was typed OpenDocument.
+    fn unwalkable_zip_mentioning_odf() -> Vec<u8> {
+        let mut d = b"PK\x03\x04".to_vec();
+        // A local header with a nonsense name length, so the walk loses the
+        // thread and reports `None` rather than a confident "no".
+        d.extend_from_slice(&[0xFF; 26]);
+        d.extend_from_slice(b"application/vnd.oasis.opendocument.text");
+        d.resize(4096, 0x41);
+        d
+    }
+
+    #[test]
+    fn indeterminate_walk_is_not_opendocument() {
+        let d = unwalkable_zip_mentioning_odf();
+        assert_ne!(classify_pk(Path::new("x.xapk"), &d).0, FileType::Odf);
+    }
+
+    #[test]
+    fn odf_extension_still_wins() {
+        let d = unwalkable_zip_mentioning_odf();
+        assert_eq!(classify_pk(Path::new("x.odt"), &d).0, FileType::Odf);
     }
 }
