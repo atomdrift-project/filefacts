@@ -1464,7 +1464,10 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
     // Stage 4: Extension fallback (used when no content-first detector resolved
     // and the filename was not well-known).
     if let Some(file_type) = ext_ft {
-        // HTML extension requires content validation
+        // HTML extension requires content validation. Use the extended window:
+        // reaching here means the filename claims HTML, and that claim is what
+        // licenses looking past a short prefix. Otherwise front-padding the file
+        // downgrades it to Unknown, which matches no trait at all.
         if file_type == FileType::Html && !heuristics::looks_like_html(data) {
             return None;
         }
@@ -2456,6 +2459,32 @@ message CommandMessage {
         // SVG belongs to the media (image) group so a binary renamed .svg is a
         // binary→image masquerade, even though its content is scanned as XML.
         assert_eq!(file_group(FileType::Svg), "image");
+    }
+
+    #[test]
+    fn hta_is_html() {
+        // mshta.exe runs an HTML Application as a local-trust program, and the
+        // extension went unmapped, so every .hta landed as Unknown -- a type no
+        // trait targets, which made this long-standing malware delivery format
+        // invisible to rule matching.
+        assert_detect(
+            "installer.hta",
+            b"<html><head><hta:application id=\"a\"/></head><body></body></html>",
+            FileType::Html,
+        );
+    }
+
+    #[test]
+    fn front_padded_html_is_still_html() {
+        // Observed evasion: an .hta dropper opened with `try {` and ~275 KB of
+        // `;` before its first `<html>`, pushing the markup past the old 4 KiB
+        // content check. Falling back to Unknown is the worst outcome available
+        // -- it matches no trait at all -- so the extension-corroborated check
+        // has to see through the padding.
+        let mut data = b"try {\n".to_vec();
+        data.resize(300 * 1024, b';');
+        data.extend_from_slice(b"\n<html><head><title>x</title></head></html>\n} catch(e) {}");
+        assert_detect("padded.hta", &data, FileType::Html);
     }
 
     #[test]

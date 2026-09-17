@@ -551,7 +551,15 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "xz" => Some(FileType::Xz),
         "lzma" => Some(FileType::Lzma),
         "zst" => Some(FileType::Zst),
-        "html" | "htm" => Some(FileType::Html),
+        // `.hta` is an HTML Application: mshta.exe runs it as a local-trust
+        // program, so it is markup on disk but a script in effect. It is a
+        // long-standing malware delivery format and was previously unmapped,
+        // which left every `.hta` as Unknown -- and an Unknown file matches no
+        // trait, since every trait declares the types it targets. Classified as
+        // Html so existing markup/script analysis applies; a first-class Hta
+        // type would be better still, but that needs a matching variant in the
+        // consumer's rule file-type enum.
+        "html" | "htm" | "hta" => Some(FileType::Html),
         // R Markdown / Quarto / Sweave are markdown documents with embedded
         // code chunks — classify as Markdown so they aren't analysed as source
         // code (their YAML frontmatter and code chunks otherwise trip

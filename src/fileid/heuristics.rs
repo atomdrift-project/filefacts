@@ -710,6 +710,21 @@ fn has_php_tag(data: &[u8]) -> bool {
     !saw_xml_pi && find(data, b"?>").is_some()
 }
 
+/// How far into a file [`looks_like_html`] will look for markup.
+///
+/// The only caller reaches this after the *extension* has already claimed an
+/// HTML type, so the question is "does the content corroborate the name", not
+/// "what is this file". A short prefix answers that badly: padding the front of
+/// the file is then all it takes to be classified Unknown, and an Unknown file
+/// matches no trait at all, since every trait declares the types it targets.
+///
+/// That is a real evasion, not a hypothetical. An `.hta` dropper was observed
+/// opening with `try {` and roughly 275 KB of `;` before its first `<html>` --
+/// well past any reasonable sniffing prefix, and classified Unknown because of
+/// it. One megabyte is far enough to see through that while still bounding the
+/// scan on a large file.
+const HTML_SCAN_WINDOW: usize = 1 << 20;
+
 /// Check if content looks like HTML (has actual markup tags).
 pub(crate) fn looks_like_html(data: &[u8]) -> bool {
     static HTML_AC: OnceLock<Option<aho_corasick::AhoCorasick>> = OnceLock::new();
@@ -730,7 +745,7 @@ pub(crate) fn looks_like_html(data: &[u8]) -> bool {
             .ok()
     });
 
-    let head = &data[..data.len().min(4096)];
+    let head = &data[..data.len().min(HTML_SCAN_WINDOW)];
     ac.as_ref().is_some_and(|ac| ac.is_match(head))
 }
 
