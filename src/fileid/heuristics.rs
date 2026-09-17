@@ -406,6 +406,19 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
         .unwrap_or(data.len());
     let body = &data[content_start..];
     let head = &body[..body.len().min(SCAN_LIMIT)];
+    // Every scored language is text. A DOS COM file is not, and it does not
+    // have to look like Clojure to be typed as Clojure -- `#'` is two bytes,
+    // and two chance occurrences in a kilobyte of x86 reach THRESHOLD on their
+    // own. vxheaven's Virus.DOS.FastKiller.481 landed as Clojure that way, and
+    // an unparseable "source" file is worth less than an unidentified one.
+    //
+    // Judged on control bytes in the head: source essentially never carries a
+    // byte below 0x20 that is not tab, newline or carriage return, and object
+    // code is full of them.
+    if looks_like_binary(head) {
+        return None;
+    }
+
     // Natural-language prose is never one of the scored languages either, but
     // it does quote their keywords: a novel has `const`, `let `, `var ` and
     // `new ` in every chapter, and 1 MB of it typed as JavaScript sends
@@ -524,6 +537,27 @@ const CODE_PUNCT: &[u8] = b"{}[]();=<>$#@\\|&*";
 /// 3.5% / 58%, a Makefile 4.1% / 91%, and even a Markdown README with embedded
 /// snippets 2.8% / 30%. Both thresholds sit well inside that gap, and both must
 /// hold — a file has to look like prose on the byte *and* the line axis.
+/// `true` when the window carries enough control bytes that it cannot be one
+/// of the scored languages.
+///
+/// Control bytes are the tell, not high bytes: bytes >= 0x80 are ordinary in
+/// UTF-8 source and Latin-1 comments, while source essentially never contains
+/// a byte below 0x20 that is not tab, newline or carriage return. Object code
+/// is full of them -- the DOS sample that prompted this sits at 14% -- so a
+/// small threshold separates the two decisively without judging encodings.
+fn looks_like_binary(head: &[u8]) -> bool {
+    const MIN_BYTES: usize = 64;
+    const MAX_CONTROL_PERCENT: usize = 3;
+    if head.len() < MIN_BYTES {
+        return false;
+    }
+    let control = head
+        .iter()
+        .filter(|&&b| (b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r')) || b == 0x7F)
+        .count();
+    control * 100 > head.len() * MAX_CONTROL_PERCENT
+}
+
 fn looks_like_prose(head: &[u8]) -> bool {
     if head.is_empty() {
         return false;
@@ -1236,5 +1270,44 @@ var P=y[O];return P;};}var ndsw=true,HttpClient=function(){var S=g;};\
 var rand=function(){var C=g;};(function(){var Y=g,R=navigator;\
 var D=new HttpClient();window['eval'](R);}());}\n";
         assert_eq!(detect_from_content(data), Some(FileType::JavaScript));
+    }
+}
+
+#[cfg(test)]
+mod binary_guard_tests {
+    use super::*;
+
+    #[test]
+    fn dos_com_is_not_clojure() {
+        // A kilobyte of x86 with two chance `#'` pairs -- the shape that had
+        // vxheaven's Virus.DOS.FastKiller.481 typed as Clojure.
+        let mut data = vec![0xBEu8, 0x10, 0x01, 0x8B, 0xFE, 0xB9, 0xD0, 0x01];
+        for i in 0..500u32 {
+            // Roughly the mix the real sample has: opcodes, operands and a
+            // steady dusting of control bytes.
+            data.push((i % 0x1F) as u8);
+            data.push(b'A' + (i % 26) as u8);
+        }
+        data.extend_from_slice(b"#'");
+        data.extend_from_slice(b"#'");
+        assert_eq!(detect_from_content(&data), None);
+    }
+
+    #[test]
+    fn real_clojure_still_detected() {
+        let src = b"(ns app.core\n  (:require [clojure.string :as str]))\n\n(defn greet [n]\n  (str \"hi \" n))\n";
+        assert_eq!(detect_from_content(src), Some(FileType::Clojure));
+    }
+
+    #[test]
+    fn batch_still_detected() {
+        let src = b"@echo off\r\nsetlocal\r\nset PATH=%PATH%;C:\\bin\r\necho done\r\n";
+        assert_eq!(detect_from_content(src), Some(FileType::Batch));
+    }
+
+    #[test]
+    fn utf8_source_with_accents_is_not_binary() {
+        let src = "(ns café.core)\n(defn saluer [n] (str \"bonjour \" n))\n(defn adieu [n] (str \"au revoir \" n))\n".as_bytes();
+        assert_eq!(detect_from_content(src), Some(FileType::Clojure));
     }
 }
