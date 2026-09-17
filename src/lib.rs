@@ -1568,6 +1568,39 @@ mod tests {
     }
 
     #[test]
+    fn pe_instruction_xor_strings_keep_provenance_across_snapshot() {
+        // Synthetic PE containing only a decoder and inert API-name strings.
+        // Names recovered from content must not be promoted into PE imports.
+        let _rizin = crate::rizin::scoped_disable_current_thread();
+        let bytes = include_bytes!("../tests/fixtures/pe-xor-decoder.exe");
+        let extracted = open(bytes).unwrap().run_pipeline();
+        let check = |e: &Extracted| {
+            let network = e
+                .strings
+                .text
+                .iter()
+                .find(|s| s.value == "InternetReadFile")
+                .expect("instruction-derived XOR string must reach filefacts text");
+            assert_eq!(network.method, stng::StringMethod::XorDecode);
+            assert_eq!(
+                network.source_spans().collect::<Vec<_>>(),
+                vec![(0x800, 16), (0x600, 21)]
+            );
+            assert!(e.strings.text.iter().any(|s| s.value == "ShellExecuteW"));
+            assert!(!e.symbols.iter().any(|s| s.kind() == SymbolKind::Import));
+        };
+        check(&extracted);
+        let snapshot = ExtractedSnapshot::from(extracted);
+        let json = serde_json::to_vec(&snapshot).unwrap();
+        let restored: ExtractedSnapshot = serde_json::from_slice(&json).unwrap();
+        check(
+            &restored
+                .into_extracted()
+                .expect("stng cache must preserve decoded rows"),
+        );
+    }
+
+    #[test]
     fn snapshot_rehydrates_strings_decoded_out_of_the_file() {
         // The regression this guards: an RTF's `\objdata` hex decodes to a
         // command that appears nowhere in the file's bytes. Those rows are

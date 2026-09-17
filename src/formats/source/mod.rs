@@ -101,7 +101,8 @@ pub(super) fn extract(
     comment_metrics::emit(source, config.comment_style, metrics, &mut strings.comments);
 
     extract_strings(root, source, config, strings);
-    let mut imports = collect_imports(config.language, source, root, config.import_query);
+    let (mut imports, import_libraries) =
+        collect_imports(config.language, source, root, config.import_query);
     if config.name == "rust" {
         imports.items = rust_syntax::imports(root, source);
     }
@@ -134,11 +135,9 @@ pub(super) fn extract(
     emit_text_ratios(metrics, total_lines);
 
     // Push source-language imports / functions / classes into the
-    // unified Symbols view. `library` stays unset — source-language
-    // imports are module-scoped strings, not library-tagged. Source
-    // tag is the language name (`"javascript"`, `"python"`, `"go"`,
-    // …) so trait matchers can filter by language without consulting
-    // file_type.
+    // unified Symbols view. Python from-import members retain their owning
+    // module, including its relative prefix. Module imports remain standalone
+    // facts, preserving module-level matching alongside the member bindings.
     for (name, offset) in &imports.items {
         // Source-language aliased imports arrive as `module as local` (the raw
         // `aliased_import` node text). Split so the symbol name is the bare
@@ -151,7 +150,7 @@ pub(super) fn extract(
         symbols_out.push(crate::Symbol::Import {
             name: bare,
             alias,
-            library: None,
+            library: import_libraries.get(offset).cloned(),
             offset: Some(*offset),
             ordinal: None,
         });
@@ -503,18 +502,20 @@ fn collect_imports(
     source: &str,
     root: Node<'_>,
     query_src: &'static str,
-) -> QueryCollection {
+) -> (QueryCollection, std::collections::HashMap<u64, String>) {
     if query_src.is_empty() {
-        return QueryCollection::default();
+        return Default::default();
     }
     let Some(query) = cached_query(language_fn, query_src) else {
-        return QueryCollection::default();
+        return Default::default();
     };
     let capture_names = query.capture_names();
     let mut cursor = QueryCursor::new();
     cursor.set_match_limit(SOURCE_QUERY_MATCH_LIMIT);
     cursor.set_byte_range(0..source.len().min(SOURCE_QUERY_BYTE_LIMIT));
-    let mut seen: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    // Keep equal member names from distinct modules separate.
+    let mut seen = std::collections::BTreeMap::new();
+    let mut libraries = std::collections::HashMap::new();
     let query_start = Instant::now();
     let timed_out = Cell::new(false);
     let output_limited = Cell::new(false);
@@ -540,9 +541,30 @@ fn collect_imports(
                     if cleaned.is_empty() {
                         continue;
                     }
+                    // Read alias fields structurally: Python permits tabs,
+                    // repeated spaces and line continuations around `as`.
+                    let cleaned = if cap.node.kind() == "aliased_import" {
+                        match (
+                            cap.node.child_by_field_name("name"),
+                            cap.node.child_by_field_name("alias"),
+                        ) {
+                            (Some(module), Some(alias)) => format!(
+                                "{} as {}",
+                                module.utf8_text(source.as_bytes()).unwrap_or("").trim(),
+                                alias.utf8_text(source.as_bytes()).unwrap_or("").trim()
+                            ),
+                            _ => cleaned,
+                        }
+                    } else {
+                        cleaned
+                    };
                     let qualified = qualify_relative_member(cap.node, cleaned, source);
                     let offset = cap.node.start_byte() as u64;
-                    seen.entry(qualified).or_insert(offset);
+                    let library = python_import_library(cap.node, source);
+                    if let Some(library) = &library {
+                        libraries.insert(offset, library.clone());
+                    }
+                    seen.entry((qualified, library)).or_insert(offset);
                     if seen.len() >= SOURCE_QUERY_OUTPUT_LIMIT {
                         output_limited.set(true);
                         break;
@@ -554,12 +576,31 @@ fn collect_imports(
             }
         }
     }
-    QueryCollection {
-        items: seen.into_iter().collect(),
-        timed_out: timed_out.get(),
-        match_limited: cursor.did_exceed_match_limit(),
-        output_limited: output_limited.get(),
+    (
+        QueryCollection {
+            items: seen
+                .into_iter()
+                .map(|((name, _), offset)| (name, offset))
+                .collect(),
+            timed_out: timed_out.get(),
+            match_limited: cursor.did_exceed_match_limit(),
+            output_limited: output_limited.get(),
+        },
+        libraries,
+    )
+}
+
+/// The owner of a Python from-import member, never the module capture itself.
+fn python_import_library(node: Node<'_>, source: &str) -> Option<String> {
+    let parent = node.parent()?;
+    if parent.kind() != "import_from_statement" {
+        return None;
     }
+    let module = parent.child_by_field_name("module_name")?;
+    if module.id() == node.id() {
+        return None;
+    }
+    Some(module.utf8_text(source.as_bytes()).ok()?.trim().to_string())
 }
 
 /// When `node` is the imported-member field of a Python relative
@@ -866,9 +907,44 @@ mod tests {
         let names: std::collections::HashSet<&str> = imports.iter().map(|(n, _, _)| *n).collect();
         assert!(names.contains("os"), "got names {names:?}");
         assert!(names.contains("hashlib"));
-        for (_, lib, has_offset) in &imports {
-            assert!(lib.is_none());
+        assert!(
+            imports
+                .iter()
+                .any(|(name, lib, _)| *name == "path" && *lib == Some("sys"))
+        );
+        for (_, _, has_offset) in &imports {
             assert!(*has_offset);
+        }
+    }
+
+    #[test]
+    fn python_from_import_owners_and_aliases_are_preserved() {
+        let src = b"from os import path as p\nfrom sys import path as p\nfrom .pkg import path as p\nimport requests as r\nfrom os import system\t as   Run\n";
+        let parsed = crate::open_with_path(std::path::Path::new("imports.py"), src).unwrap();
+        let imports: Vec<_> = parsed
+            .symbols()
+            .iter_kind(crate::SymbolKind::Import)
+            .filter_map(|s| match s {
+                crate::Symbol::Import {
+                    name,
+                    library,
+                    alias,
+                    ..
+                } => Some((name.as_str(), library.as_deref(), alias.as_deref())),
+                _ => None,
+            })
+            .collect();
+        for expected in [
+            ("path", Some("os"), Some("p")),
+            ("path", Some("sys"), Some("p")),
+            (".pkg.path", Some(".pkg"), Some("p")),
+            ("requests", None, Some("r")),
+            ("system", Some("os"), Some("Run")),
+        ] {
+            assert!(
+                imports.contains(&expected),
+                "missing {expected:?}: {imports:?}"
+            );
         }
     }
 
