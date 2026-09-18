@@ -1079,7 +1079,11 @@ fn zip_has_top_level_entry(data: &[u8], name: &[u8]) -> Option<bool> {
         }
         off = next;
     }
-    None
+    // Reached MAX_ENTRIES while cleanly walking valid local headers without
+    // seeing `name`. A package whose identity marker sits at the root (an
+    // OOXML document's `[Content_Types].xml` or an APK's `AndroidManifest.xml`)
+    // never places it after 8,192 entries.
+    Some(false)
 }
 
 /// Whether the zip is an Open Packaging Conventions package.
@@ -2230,6 +2234,31 @@ mod tests {
         assert_eq!(
             classify_pk(Path::new("inner.xlsx"), &inner).0,
             FileType::Ooxml
+        );
+    }
+
+    #[test]
+    fn a_large_archive_exceeding_max_entries_is_not_an_ooxml_package() {
+        // A large archive whose first MAX_ENTRIES members do not include
+        // `[Content_Types].xml` must not fall back to a loose substring match
+        // and classify the carrier as OOXML just because an inner script/exploit
+        // mentions `[Content_Types].xml`.
+        let mut entries = Vec::new();
+        for i in 0..8200 {
+            entries.push((format!("file_{i}.txt"), b"dummy content".as_slice()));
+        }
+        let entries_ref: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(name, body)| (name.as_str(), *body))
+            .collect();
+        let zip = zip_of(&entries_ref);
+        assert_eq!(
+            zip_has_top_level_entry(&zip, b"[Content_Types].xml"),
+            Some(false)
+        );
+        assert_eq!(
+            classify_pk(Path::new("release-6.4.124"), &zip).0,
+            FileType::Zip
         );
     }
 
