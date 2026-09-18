@@ -42,6 +42,27 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         return Some((FileType::Text, DetectionSource::Magic));
     }
 
+    // An HTML document, whatever it is called and however it is indented.
+    // Keyed off `head` rather than `data` because real pages are not flush
+    // left: four VirusShare samples open with four spaces before the doctype,
+    // which a `starts_with` on byte 0 misses, and they were then scored as
+    // JavaScript on the strength of the jQuery inside them.
+    //
+    // Both unambiguous openings are accepted. Nothing but a web page starts
+    // `<!DOCTYPE html`, and a file whose first bytes are `<html` is one too --
+    // that is narrower than the `<body`/`<div`/`<script` shapes, which also
+    // open templates and fragments that other arms own and which stay out of
+    // magic deliberately. `<!DOCTYPE svg` and an `<?xml` prolog are unaffected:
+    // neither begins with either of these.
+    if head.len() >= 5 {
+        let doctype_html = head.len() >= 14 && head[..14].eq_ignore_ascii_case(b"<!DOCTYPE html");
+        let html_root = head[..5].eq_ignore_ascii_case(b"<html")
+            && head.get(5).is_none_or(|c| !c.is_ascii_alphanumeric());
+        if doctype_html || html_root {
+            return Some((FileType::Html, DetectionSource::Magic));
+        }
+    }
+
     if looks_like_udif_dmg(data) {
         return Some((FileType::Dmg, DetectionSource::Magic));
     }
@@ -613,24 +634,6 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // PHP opening tag: <?php
             if data.starts_with(b"<?php") {
                 Some((FileType::Php, DetectionSource::Magic))
-            } else if data.len() >= 14 && data[..14].eq_ignore_ascii_case(b"<!DOCTYPE html") {
-                // HTML had no content detection at all: `FileType::Html` was
-                // only ever produced from a `.html`/`.htm`/`.hta` extension,
-                // and `looks_like_html` existed solely to *reject* that claim.
-                // A page under any other name was typed by its extension and
-                // analysed as whatever that extension meant -- vxheaven's
-                // `Trojan.JS.DeltreeY.c` (the `.c` is a variant letter) was
-                // read as C source, and the whole `html/` corpus arrives
-                // under names like it.
-                //
-                // Only the unambiguous prefix is accepted here. Nothing but a
-                // web page opens `<!DOCTYPE html`, so this cannot take a file
-                // away from a format that has a real claim on it; the looser
-                // `<html`/`<body`/`<div` shapes stay out of magic because
-                // they also appear at the top of templates, fragments and XML
-                // dialects that other arms own. `<!DOCTYPE svg` is unaffected
-                // -- the root name is part of what is compared.
-                Some((FileType::Html, DetectionSource::Magic))
             } else if let Some(r) = detect_xml_plist(data) {
                 Some(r)
             } else {
@@ -2442,13 +2445,35 @@ mod html_doctype_magic_tests {
         );
     }
 
-    /// A bare `<html>` with no doctype stays out of magic: that shape also
-    /// opens templates and fragments other arms own.
+    /// Real pages are not flush left. Four VirusShare samples open with four
+    /// spaces before the doctype and were scored as JavaScript for the jQuery
+    /// inside them.
     #[test]
-    fn bare_html_root_is_not_promoted_by_magic() {
-        let data = b"<html><body>x</body></html>";
+    fn indented_doctype_is_still_html() {
+        let data = b"    <!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\">\n<html>";
+        assert_eq!(
+            detect_from_content(Path::new("VirusShare_4bcf5cc475"), data).map(|(ft, _)| ft),
+            Some(FileType::Html)
+        );
+    }
+
+    /// A file whose first bytes are `<html` is a page, doctype or not.
+    #[test]
+    fn bare_html_root_is_html() {
+        let data = b"<html data-adblockkey=\"MFwwDQYJ\"><head><title>Redirecting</title>";
+        assert_eq!(
+            detect_from_content(Path::new("VirusShare_f54b1d8fed"), data).map(|(ft, _)| ft),
+            Some(FileType::Html)
+        );
+    }
+
+    /// The root-element check stops at a word boundary, so an XML document
+    /// whose root merely begins with those letters is untouched.
+    #[test]
+    fn htmlspecialchars_root_is_not_html() {
+        let data = b"<htmlspecialchars>not a page</htmlspecialchars>";
         assert_ne!(
-            detect_from_content(Path::new("x.tmpl"), data).map(|(ft, _)| ft),
+            detect_from_content(Path::new("x.xml"), data).map(|(ft, _)| ft),
             Some(FileType::Html)
         );
     }
