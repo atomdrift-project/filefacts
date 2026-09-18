@@ -298,8 +298,16 @@ fn plist_to_json(value: plist::Value) -> JsonValue {
             .unwrap_or(JsonValue::Null),
         P::Real(f) => serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number),
         P::Boolean(b) => JsonValue::Bool(b),
-        P::Date(d) => JsonValue::String(format!("{d:?}")),
+        P::Date(d) => JsonValue::String(d.to_xml_format()),
         P::Data(bytes) => JsonValue::String(base64_encode(&bytes)),
+        // A keyed-archive object reference, which only the binary form can
+        // encode. Spelled the way `plutil -convert xml1` spells it so a rule
+        // written against either form of the same archive matches both.
+        P::Uid(uid) => {
+            let mut obj = Map::new();
+            obj.insert("CF$UID".to_string(), JsonValue::Number(uid.get().into()));
+            JsonValue::Object(obj)
+        }
         P::Array(arr) => JsonValue::Array(arr.into_iter().map(plist_to_json).collect()),
         P::Dictionary(dict) => {
             let mut obj = Map::new();
@@ -624,6 +632,92 @@ mod tests {
         let mut v = Values::new();
         extract_yaml(b"name: x\non:\n  push:\n    branches: [main]\n", &mut v).unwrap();
         assert_eq!(v.get("name").and_then(|x| x.as_str()), Some("x"));
+    }
+
+    /// The same dictionary written as a binary plist and as an XML plist
+    /// lands in `values` identically: the binary reader is chosen from the
+    /// `bplist00` magic, not from anything the caller passes.
+    #[test]
+    fn binary_plist_matches_xml_plist() {
+        let mut dict = plist::Dictionary::new();
+        dict.insert("CFBundleIdentifier".into(), "com.example.dropper".into());
+        dict.insert("LSUIElement".into(), true.into());
+        dict.insert("Count".into(), 42.into());
+        dict.insert("Ratio".into(), 0.5.into());
+        dict.insert("Blob".into(), plist::Value::Data(b"Man".to_vec()));
+        dict.insert(
+            "Args".into(),
+            plist::Value::Array(vec!["-c".into(), "curl http://x".into()]),
+        );
+        let root = plist::Value::Dictionary(dict);
+
+        let mut binary = Vec::new();
+        root.to_writer_binary(&mut binary).unwrap();
+        assert!(binary.starts_with(b"bplist00"));
+        let mut xml = Vec::new();
+        root.to_writer_xml(&mut xml).unwrap();
+
+        let mut from_binary = Values::new();
+        extract_plist(&binary, &mut from_binary).unwrap();
+        let mut from_xml = Values::new();
+        extract_plist(&xml, &mut from_xml).unwrap();
+        assert_eq!(from_binary.as_json(), from_xml.as_json());
+
+        assert_eq!(
+            from_binary.get("CFBundleIdentifier").unwrap(),
+            "com.example.dropper"
+        );
+        assert_eq!(from_binary.get("LSUIElement").unwrap(), true);
+        assert_eq!(from_binary.get("Count").unwrap(), 42);
+        assert_eq!(from_binary.get("Ratio").unwrap(), 0.5);
+        assert_eq!(from_binary.get("Blob").unwrap(), "TWFu");
+        assert_eq!(from_binary.get("Args[1]").unwrap(), "curl http://x");
+    }
+
+    /// NSKeyedArchiver output is the common binary-only plist. Its `$class`
+    /// object references decode to `CF$UID` dictionaries instead of nulls.
+    #[test]
+    fn binary_plist_keyed_archive_uids_are_preserved() {
+        let mut class = plist::Dictionary::new();
+        class.insert("$classname".into(), "NSMutableDictionary".into());
+        let mut object = plist::Dictionary::new();
+        object.insert("$class".into(), plist::Value::Uid(plist::Uid::new(2)));
+        let mut root = plist::Dictionary::new();
+        root.insert("$archiver".into(), "NSKeyedArchiver".into());
+        root.insert(
+            "$objects".into(),
+            plist::Value::Array(vec![
+                "$null".into(),
+                plist::Value::Dictionary(object),
+                plist::Value::Dictionary(class),
+            ]),
+        );
+        let mut binary = Vec::new();
+        plist::Value::Dictionary(root)
+            .to_writer_binary(&mut binary)
+            .unwrap();
+
+        let mut values = Values::new();
+        extract_plist(&binary, &mut values).unwrap();
+        assert_eq!(values.get("$archiver").unwrap(), "NSKeyedArchiver");
+        assert_eq!(values.get("$objects[1].$class.CF$UID").unwrap(), 2);
+        assert_eq!(
+            values.get("$objects[2].$classname").unwrap(),
+            "NSMutableDictionary"
+        );
+    }
+
+    #[test]
+    fn binary_plist_truncated_is_an_error() {
+        let mut dict = plist::Dictionary::new();
+        dict.insert("k".into(), "v".into());
+        let mut binary = Vec::new();
+        plist::Value::Dictionary(dict)
+            .to_writer_binary(&mut binary)
+            .unwrap();
+        let mut values = Values::new();
+        assert!(extract_plist(&binary[..binary.len() / 2], &mut values).is_err());
+        assert!(extract_plist(b"bplist00", &mut values).is_err());
     }
 
     #[test]

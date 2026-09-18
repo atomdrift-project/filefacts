@@ -462,10 +462,11 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "service" => Some(FileType::SystemdService),
         "desktop" => Some(FileType::DesktopEntry),
         "svg" => Some(FileType::Svg),
+        // Interface Builder sources (.xib, .storyboard) are XML; their
+        // compiled form is `Nib`.
         "xml" | "csproj" | "vbproj" | "fsproj" | "proj" | "props" | "targets" | "vcxproj"
-        | "xaml" | "config" | "settings" | "nuspec" | "wsdl" | "xsd" | "xsl" | "xslt" => {
-            Some(FileType::Xml)
-        }
+        | "xaml" | "config" | "settings" | "nuspec" | "wsdl" | "xsd" | "xsl" | "xslt" | "xib"
+        | "storyboard" => Some(FileType::Xml),
         "json" => Some(FileType::Json),
         // Generic YAML. The specific manifests that happen to be YAML
         // (pnpm-lock.yaml, action.yml, .github/workflows/*) are matched by
@@ -473,6 +474,7 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "yaml" | "yml" => Some(FileType::Yaml),
         "gyp" | "gypi" => Some(FileType::Gyp),
         "plist" | "resx" => Some(FileType::Plist),
+        "nib" => Some(FileType::Nib),
         "pbxproj" => Some(FileType::Pbxproj),
         "cmake" => Some(FileType::Cmake),
         "rtf" => Some(FileType::Rtf),

@@ -405,9 +405,28 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             }
         }
         b'b' => {
-            // Binary Plist: bplist
+            // Binary Plist: bplist. A `.nib` with this magic is a keyed-archive
+            // nib (NSKeyedArchiver output inside an older nib bundle): the
+            // plist is only the container, and the extension is what the
+            // loader honours, so it keeps its nib identity.
             if data.starts_with(b"bplist") {
-                Some((FileType::Plist, DetectionSource::Magic))
+                let is_nib = path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("nib"));
+                let ty = if is_nib {
+                    FileType::Nib
+                } else {
+                    FileType::Plist
+                };
+                Some((ty, DetectionSource::Magic))
+            } else {
+                None
+            }
+        }
+        b'N' => {
+            // Compiled Interface Builder archive (NIBArchive)
+            if data.starts_with(b"NIBArchive") {
+                Some((FileType::Nib, DetectionSource::Magic))
             } else {
                 None
             }
@@ -1657,6 +1676,29 @@ mod tests {
     fn plist_xml() {
         let data = b"<?xml version=\"1.0\"?>\n<!DOCTYPE plist PUBLIC>";
         let (ft, _) = detect_from_content(Path::new("Info.plist"), data).unwrap();
+        assert_eq!(ft, FileType::Plist);
+    }
+
+    #[test]
+    fn nib_archive() {
+        let data = b"NIBArchive\x01\x00\x00\x00\x0a\x00\x00\x00";
+        let (ft, src) = detect_from_content(Path::new("MainMenu.nib"), data).unwrap();
+        assert_eq!(ft, FileType::Nib);
+        assert_eq!(src, DetectionSource::Magic);
+        // The magic alone identifies it; the name is not consulted.
+        let (ft, _) = detect_from_content(Path::new("payload.bin"), data).unwrap();
+        assert_eq!(ft, FileType::Nib);
+    }
+
+    #[test]
+    fn nib_keyed_archive_keeps_nib_identity() {
+        let data = b"bplist00\x00\x00\x00\x00";
+        let (ft, _) = detect_from_content(Path::new("keyedobjects.nib"), data).unwrap();
+        assert_eq!(ft, FileType::Nib);
+        let (ft, _) = detect_from_content(Path::new("Objects.NIB"), data).unwrap();
+        assert_eq!(ft, FileType::Nib);
+        // Without the nib extension the same bytes are a plain binary plist.
+        let (ft, _) = detect_from_content(Path::new("prefs"), data).unwrap();
         assert_eq!(ft, FileType::Plist);
     }
 

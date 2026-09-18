@@ -70,6 +70,7 @@ mod macho;
 mod macho_code_signature;
 mod macho_hashes;
 mod markdown;
+mod nib;
 mod npm;
 mod nupkg;
 mod oci;
@@ -352,6 +353,7 @@ pub(crate) fn extract(
         }
         FileType::GithubActions | FileType::PnpmLock => structured::extract_yaml(bytes, values),
         FileType::Plist => structured::extract_plist(bytes, values),
+        FileType::Nib => nib::extract(bytes, values, strings, metrics),
         FileType::Pbxproj => pbxproj::extract(bytes, values, strings, metrics),
         FileType::PkgInfo => structured::extract_pkginfo(bytes, values),
         FileType::SrcInfo => pkgmeta::extract_srcinfo(bytes, values),
