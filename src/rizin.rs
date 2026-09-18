@@ -1504,12 +1504,17 @@ mod tests {
     use super::*;
     use crate::output::Metrics;
 
-    /// Tests that interact with the process-global `RIZIN_PGIDS`
-    /// registry — the live shim spawns and the `kill_all_rizin_groups`
-    /// reaper — must hold this mutex for the duration of their run.
-    /// Without it the reaper test SIGKILLs shims registered by other
-    /// in-flight tests, producing intermittent "shim recovery missing"
-    /// failures under cargo's default parallel test execution.
+    /// Tests that touch process-global rizin state must hold this mutex
+    /// for the duration of their run. Two registries are at stake:
+    ///
+    /// * `RIZIN_PGIDS` — without the lock the reaper test SIGKILLs shims
+    ///   registered by other in-flight tests, producing intermittent
+    ///   "shim recovery missing" failures.
+    /// * `RIZIN_DISABLED` — `is_disabled()` ORs in this global counter, so
+    ///   one test's `scoped_disable()` guard is visible to every other
+    ///   test, on every thread. Without the lock a sibling's guard makes
+    ///   the thread-local-mute test observe a muted worker thread, and
+    ///   makes the counter-delta assertions read a moving baseline.
     fn rizin_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         // `unwrap_or_else` so a poisoned mutex (from a panicking test
@@ -2002,8 +2007,9 @@ mod tests {
 
     #[test]
     fn scoped_disable_increments_and_restores_disable_count() {
-        // Read the baseline because parallel tests may also be holding
-        // a guard — we assert the *delta*, not the absolute value.
+        let _lock = rizin_test_lock();
+        // Assert the *delta*, not the absolute value: the lock keeps
+        // sibling guards out, but the counter is process-lifetime state.
         let before = RIZIN_DISABLED.load(Ordering::SeqCst);
         {
             let _g = scoped_disable();
@@ -2015,6 +2021,7 @@ mod tests {
 
     #[test]
     fn scoped_disable_stacks() {
+        let _lock = rizin_test_lock();
         let before = RIZIN_DISABLED.load(Ordering::SeqCst);
         let g1 = scoped_disable();
         let g2 = scoped_disable();
@@ -2030,6 +2037,10 @@ mod tests {
     /// symbols from a binary being analyzed concurrently.
     #[test]
     fn thread_local_disable_does_not_leak_across_threads() {
+        // The lock is what makes `!is_disabled()` meaningful here: a
+        // sibling test's global `scoped_disable()` would otherwise mute
+        // the worker thread and fail the assertion below.
+        let _lock = rizin_test_lock();
         let guard = scoped_disable_current_thread();
         assert!(is_disabled(), "muted on the thread that asked");
         let other = std::thread::spawn(is_disabled).join().unwrap();
@@ -2052,9 +2063,10 @@ mod tests {
     #[test]
     fn recover_short_circuits_when_disabled() {
         // With a guard active, the public `recover()` entry returns
-        // None before touching PATH or spawning anything. We can't
-        // assert the absolute counters (parallel tests mutate them),
-        // only the observable contract: disabled → None.
+        // None before touching PATH or spawning anything. We assert only
+        // the observable contract — disabled → None — not the counters,
+        // which carry over from earlier tests in the process.
+        let _lock = rizin_test_lock();
         let _g = scoped_disable();
         assert!(is_disabled());
         let r = recover_with_symbols(b"unused bytes for disabled probe", 0, false);
