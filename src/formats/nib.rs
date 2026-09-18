@@ -132,19 +132,6 @@ pub(super) fn extract(
     };
     let string_count = strings.literals.len() - literal_count_before;
 
-    values.insert("nib.format", JsonValue::String(format.into()));
-    for (path, set) in [
-        ("nib.classes", &facts.classes),
-        ("nib.class_names", &facts.class_names),
-        ("nib.modules", &facts.modules),
-        ("nib.outlets", &facts.outlets),
-        ("nib.actions", &facts.actions),
-        ("nib.bindings", &facts.bindings),
-        ("nib.resources", &facts.resources),
-    ] {
-        let list = set.iter().cloned().map(JsonValue::String).collect();
-        values.insert(path, JsonValue::Array(list));
-    }
     metrics.insert(metric!("nib.object_count"), facts.object_count as f64);
     metrics.insert(metric!("nib.class_count"), facts.classes.len() as f64);
     metrics.insert(
@@ -156,6 +143,29 @@ pub(super) fn extract(
         facts.connection_count as f64,
     );
     metrics.insert(metric!("nib.string_count"), string_count as f64);
+    tracing::debug!(
+        format,
+        objects = facts.object_count,
+        classes = facts.classes.len(),
+        class_names = facts.class_names.len(),
+        connections = facts.connection_count,
+        strings = string_count,
+        "nib extracted"
+    );
+
+    values.insert("nib.format", JsonValue::String(format.into()));
+    for (path, set) in [
+        ("nib.classes", facts.classes),
+        ("nib.class_names", facts.class_names),
+        ("nib.modules", facts.modules),
+        ("nib.outlets", facts.outlets),
+        ("nib.actions", facts.actions),
+        ("nib.bindings", facts.bindings),
+        ("nib.resources", facts.resources),
+    ] {
+        let list = set.into_iter().map(JsonValue::String).collect();
+        values.insert(path, JsonValue::Array(list));
+    }
     Ok(())
 }
 
@@ -215,13 +225,14 @@ impl Archive {
         if data.len() < HEADER_LEN {
             return Err(Error::malformed("nib", "truncated NIBArchive header"));
         }
-        let mut header = Cursor {
-            data,
-            pos: MAGIC.len(),
+        // Ten little-endian words follow the magic; the length check above
+        // is what makes the fixed slicing below safe.
+        let word = |i: usize| {
+            let at = MAGIC.len() + 4 * i;
+            u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]])
         };
-        let mut word = || header.u32().map(|v| v as usize);
         let [
-            _constant,
+            constant,
             format_version,
             object_count,
             object_offset,
@@ -231,7 +242,14 @@ impl Archive {
             value_offset,
             class_count,
             class_offset,
-        ] = std::array::from_fn(|_| word().unwrap_or(0));
+        ] = std::array::from_fn(word);
+        if constant != 1 {
+            tracing::debug!(
+                constant,
+                format_version,
+                "unexpected NIBArchive header constant"
+            );
+        }
 
         let objects = parse_table(data, object_count, object_offset, "object", |c| {
             Some(Object {
@@ -271,7 +289,7 @@ impl Archive {
             Some(String::from_utf8_lossy(name).into_owned())
         })?;
         Ok(Self {
-            format_version: format_version as u32,
+            format_version,
             objects,
             keys,
             values,
@@ -294,24 +312,24 @@ impl Archive {
             .find(|v| self.keys.get(v.key).is_some_and(|k| k == key))
     }
 
-    /// Resolve a value to its string, following one object reference into an
-    /// `NSString`, whose text is the `NS.bytes` data value.
+    /// Resolve a value to its string and offset. Inline data is the string
+    /// itself; an object reference is followed exactly one hop, into an
+    /// `NSString` whose text is its `NS.bytes` data value, so a reference
+    /// cycle in a crafted file cannot recurse.
     fn string<'a>(&'a self, data: &'a [u8], value: &Value) -> Option<(&'a str, usize)> {
-        match &value.payload {
-            Payload::Data(range) => {
-                let text = std::str::from_utf8(data.get(range.clone())?).ok()?;
-                Some((text, range.start))
-            }
+        let range = match &value.payload {
+            Payload::Data(range) => range,
             Payload::Ref(index) => {
                 let target = self.objects.get(*index)?;
-                let bytes = self.field(target, "NS.bytes")?;
-                match &bytes.payload {
-                    Payload::Data(_) => self.string(data, bytes),
-                    _ => None,
+                match &self.field(target, "NS.bytes")?.payload {
+                    Payload::Data(range) => range,
+                    _ => return None,
                 }
             }
-            _ => None,
-        }
+            Payload::Scalar => return None,
+        };
+        let text = std::str::from_utf8(data.get(range.clone())?).ok()?;
+        Some((text, range.start))
     }
 
     fn collect(&self, data: &[u8], facts: &mut Facts, strings: &mut Strings) {
@@ -340,14 +358,17 @@ impl Archive {
 }
 
 /// Read `count` entries starting at `offset`. Every entry is at least one
-/// byte, so a count beyond the file is rejected before anything is allocated.
+/// byte, so a count beyond the file is rejected up front, and the vector
+/// grows only as entries actually parse rather than reserving for the
+/// header's claim.
 fn parse_table<T>(
     data: &[u8],
-    count: usize,
-    offset: usize,
+    count: u32,
+    offset: u32,
     what: &'static str,
     mut read: impl FnMut(&mut Cursor<'_>) -> Option<T>,
 ) -> Result<Vec<T>, Error> {
+    let (count, offset) = (count as usize, offset as usize);
     if offset > data.len() || count > data.len() - offset {
         return Err(Error::malformed(
             "nib",
@@ -355,7 +376,7 @@ fn parse_table<T>(
         ));
     }
     let mut cursor = Cursor { data, pos: offset };
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::new();
     for index in 0..count {
         let Some(entry) = read(&mut cursor) else {
             return Err(Error::malformed(
@@ -381,16 +402,12 @@ impl<'a> Cursor<'a> {
         Some(slice)
     }
 
-    fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
-        self.take(N)?.try_into().ok()
-    }
-
     fn u8(&mut self) -> Option<u8> {
         Some(self.take(1)?[0])
     }
 
     fn u32(&mut self) -> Option<u32> {
-        self.array().map(u32::from_le_bytes)
+        self.take(4)?.try_into().ok().map(u32::from_le_bytes)
     }
 
     /// NIBArchive varint: little-endian 7-bit groups, with the high bit set
@@ -447,16 +464,11 @@ fn collect_keyed(bytes: &[u8], facts: &mut Facts, strings: &mut Strings) -> Resu
         (text != "$null").then(|| text.to_string())
     };
 
-    let mut seen = BTreeSet::new();
-    let mut note_string = |strings: &mut Strings, text: &str| {
-        if !text.is_empty() && text != "$null" && seen.insert(text.to_string()) {
-            push_literal(strings, text, locate(bytes, text));
-        }
-    };
-
+    // Literals are deduplicated by text borrowed from the parsed archive.
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
     for object in objects {
         match object {
-            P::String(text) => note_string(strings, text),
+            P::String(text) => note_string(&mut seen, strings, bytes, text),
             P::Dictionary(dict) => {
                 // `$classname` and friends are archiver bookkeeping, not
                 // strings the nib carries; the class names have their own fact.
@@ -464,18 +476,30 @@ fn collect_keyed(bytes: &[u8], facts: &mut Facts, strings: &mut Strings) -> Resu
                     if let P::String(text) = value
                         && !key.starts_with('$')
                     {
-                        note_string(strings, text);
+                        note_string(&mut seen, strings, bytes, text);
                     }
                 }
-                let Some(class) = class_name(objects, dict) else {
-                    continue;
-                };
-                facts.note_object(class, |key| dict.get(key).and_then(resolve));
+                if let Some(class) = class_name(objects, dict) {
+                    facts.note_object(class, |key| dict.get(key).and_then(resolve));
+                }
             }
             _ => {}
         }
     }
     Ok(archiver)
+}
+
+/// Publish one keyed-archive string as a literal, once per distinct text.
+/// Entry 0 of `$objects` is the archiver's `$null` sentinel, not a string.
+fn note_string<'a>(
+    seen: &mut BTreeSet<&'a str>,
+    strings: &mut Strings,
+    bytes: &[u8],
+    text: &'a str,
+) {
+    if !text.is_empty() && text != "$null" && seen.insert(text) {
+        push_literal(strings, text, locate(bytes, text));
+    }
 }
 
 /// Follow an object's `$class` UID to its class descriptor's `$classname`.
@@ -497,18 +521,12 @@ fn class_name<'a>(objects: &'a [plist::Value], object: &plist::Dictionary) -> Op
 /// front of `DropperController`. Zero when the string is not stored
 /// verbatim.
 fn locate(bytes: &[u8], text: &str) -> usize {
-    let (marker, body): (u8, Vec<u8>) = if text.is_ascii() {
-        (0x50, text.as_bytes().to_vec())
+    let (marker, body, count): (u8, Vec<u8>, usize) = if text.is_ascii() {
+        (0x50, text.as_bytes().to_vec(), text.len())
     } else {
-        (
-            0x60,
-            text.encode_utf16().flat_map(u16::to_be_bytes).collect(),
-        )
-    };
-    let count = if text.is_ascii() {
-        text.len()
-    } else {
-        text.encode_utf16().count()
+        let body: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        let count = body.len() / 2;
+        (0x60, body, count)
     };
     let mut needle = match count {
         0..=14 => vec![marker | count as u8],
