@@ -455,7 +455,7 @@ fn collect_query(
     {
         let mut matches = cursor.matches_with_options(&query, root, source.as_bytes(), options);
         while let Some(m) = matches.next() {
-            for cap in m.captures {
+            for cap in m.captures() {
                 let name = capture_names.get(cap.index as usize).copied().unwrap_or("");
                 if name.starts_with('_') {
                     continue;
@@ -531,7 +531,7 @@ fn collect_imports(
     {
         let mut matches = cursor.matches_with_options(&query, root, source.as_bytes(), options);
         while let Some(m) = matches.next() {
-            for cap in m.captures {
+            for cap in m.captures() {
                 let name = capture_names.get(cap.index as usize).copied().unwrap_or("");
                 if name.starts_with('_') {
                     continue;

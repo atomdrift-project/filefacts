@@ -1459,9 +1459,9 @@ dependencies = [
 
 [[package]]
 name = "psl"
-version = "2.1.233"
+version = "2.1.234"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d667537a353e4c20b5d98fd3ea6dc687dfdf6b7e30662c74ce51308cae5b2474"
+checksum = "44c71eb2c627c423ee9e66a236dc8fed3daad9762e36326405134e2af928eba9"
 dependencies = [
  "psl-types",
 ]
@@ -2189,8 +2189,8 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter"
-version = "0.27.0"
-source = "git+https://github.com/tstromberg/tree-sitter?branch=master#7a5463546452b4a4f2e9b18d242052c7d12a23d9"
+version = "0.28.0"
+source = "git+https://github.com/tstromberg/tree-sitter?branch=master#a88e37f7c2202fa9dd2869ccf9c40d022460e73b"
 dependencies = [
  "cc",
  "regex",
@@ -2311,7 +2311,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-language"
 version = "0.1.8"
-source = "git+https://github.com/tstromberg/tree-sitter?branch=master#7a5463546452b4a4f2e9b18d242052c7d12a23d9"
+source = "git+https://github.com/tstromberg/tree-sitter?branch=master#a88e37f7c2202fa9dd2869ccf9c40d022460e73b"
 
 [[package]]
 name = "tree-sitter-lua"
