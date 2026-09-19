@@ -78,6 +78,13 @@ const RIZIN_METRICS_SCRIPT_PE_X86: &str =
 /// [`analysis_script`].
 const RIZIN_METRICS_SCRIPT_PRELUDE: &str = "iij; echo ===SEP===; iEj; echo ===SEP===; aa; aac; aap; echo ===SEP===; aflj; echo ===SEP===; iSj";
 
+/// [`RIZIN_METRICS_SCRIPT`] with `aa; aac; aalg` in place of `aaa`, for Go
+/// images — see [`analysis_script`]. `aalg` ("recover and analyze all Golang
+/// functions and strings") is the pclntab pass that `aaa` reaches only after
+/// its full discovery sweep, so seeding with `aa; aac` and calling it
+/// directly reproduces the whole function table without the sweep.
+const RIZIN_METRICS_SCRIPT_GO: &str = "iij; echo ===SEP===; iEj; echo ===SEP===; aa; aac; aalg; echo ===SEP===; aflj; echo ===SEP===; iSj";
+
 /// Rizin switches that remove work whose output filefacts never consumes.
 /// Keep this separate from the input path so the contract is directly tested.
 /// The analysis script (`-c …`) is appended per input by [`analysis_script`].
@@ -112,20 +119,30 @@ const RIZIN_METRICS_ARGS: &[&str] = &[
 ///   ELF and Mach-O samples (overdrive arm64 `.so` 3,646 of 3,741 in 2.8 s
 ///   vs 25 s; a 61 MB arm64 Mach-O 89,227 of 89,675 in 63 s vs 209 s).
 ///
+/// * Go images take `aa; aac; aalg`: `aalg` is rizin's dedicated pclntab
+///   pass, which `aaa` runs only at the end of its full sweep. Measured
+///   2026-09-19 on the two 8.6 MB Go toolchain binaries in the cyclotron
+///   corpus (`go/pkg/tool/linux_amd64/{fix,vet}`, rizin 0.8.2): byte-identical
+///   function tables — 6,980 and 6,947 functions, 6,923 and 6,892 pclntab
+///   names, every one at the same offset with the same name — in 8.97 s and
+///   10.96 s against 14.40 s and 14.30 s for `aaa`.
+///
 /// The non-Go fast scripts are approximations of `aaa`, accepted for the
 /// latency; the function count and CFG aggregates they feed can differ by
-/// a few percent from a full pass. Go deliberately uses the full script so
-/// Rizin's pclntab symbol names are retained.
+/// a few percent from a full pass. The Go script is not an approximation:
+/// it reproduced the full table exactly on both samples, because it runs the
+/// same pclntab recovery `aaa` would.
 fn analysis_script(
     bytes: &[u8],
     symbol_count: usize,
     go_function_metadata: bool,
 ) -> (&'static str, &'static str) {
     if go_function_metadata {
-        // Go's pclntab names are recovered during the full analysis pass.
-        // The faster PE script finds the code ranges but leaves these
-        // functions as fcn.* because it does not run the Go symbol pass.
-        (RIZIN_METRICS_SCRIPT, "go-full")
+        // Go's pclntab names come from `aalg`, which the PE/prelude scripts
+        // do not run — they find the code ranges but leave these functions
+        // as fcn.*. Calling it directly costs the recovery without `aaa`'s
+        // preceding full sweep.
+        (RIZIN_METRICS_SCRIPT_GO, "go-pclntab")
     } else if is_pe_x86(bytes) {
         (RIZIN_METRICS_SCRIPT_PE_X86, "pe-x86")
     } else if symbol_count == 0 {
@@ -481,17 +498,17 @@ pub fn cache_fingerprint() -> String {
         return "rizin=none".to_string();
     }
     let version = rizin_version().unwrap_or("unknown");
-    // `opaque-v4`: Go recoveries use full `aaa`; PE x86/x86-64 recoveries come from `aa; aac`, everything
-    // else from `aa; aac; aap` with an `aaa` rerun under the coverage floor
-    // (see `analysis_script`); cached extractions from the `aaa` era must
-    // not mix.
+    // `opaque-v5`: Go recoveries come from `aa; aac; aalg`; PE x86/x86-64 from
+    // `aa; aac`, everything else from `aa; aac; aap` with an `aaa` rerun under
+    // the coverage floor (see `analysis_script`); cached extractions from an
+    // earlier policy must not mix.
     if native_arch_only() {
         format!(
-            "rizin={version}|policy=opaque-v4|native={}",
+            "rizin={version}|policy=opaque-v5|native={}",
             std::env::consts::ARCH
         )
     } else {
-        format!("rizin={version}|policy=opaque-v4")
+        format!("rizin={version}|policy=opaque-v5")
     }
 }
 
@@ -1618,8 +1635,8 @@ mod tests {
         );
         assert_eq!(
             analysis_script(&pe(0x8664), 5, true).1,
-            "go-full",
-            "Go metadata needs the symbol-naming pass"
+            "go-pclntab",
+            "Go metadata needs the pclntab pass, and takes it directly"
         );
     }
 
