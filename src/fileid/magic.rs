@@ -671,11 +671,25 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
     // These are guarded by cheap pre-checks to avoid unnecessary work.
 
     // Uncompressed tar carries no leading magic — the `ustar` signature sits at
-    // offset 257. Only OCI/Docker image tarballs are promoted from the generic
-    // `Tar` type here; any other tar falls through to the extension fallback.
+    // offset 257. OCI/Docker image tarballs get their own type; everything else
+    // with that signature is a plain tar.
+    //
+    // This used to fall through to the extension fallback, which meant a tar
+    // was only recognized when it was *named* `.tar`: the same bytes under any
+    // other extension were typed `Data` and never walked, so every member went
+    // unanalyzed. That is a detection gap an attacker gets for free by renaming
+    // a file — an XMRig 6.24.0 release tarball named `<sha256>.bin` scored one
+    // finding as an opaque blob and six once renamed to `.tar`.
+    //
+    // `.gem` is excluded because a gem is *also* an uncompressed ustar tar and
+    // carries its own semantics; it has no magic of its own, so the extension
+    // fallback is the only thing that can type it.
     if data.len() > 262 && &data[257..262] == b"ustar" {
         if tar_is_oci_image(data) {
             return Some((FileType::OciImage, DetectionSource::Magic));
+        }
+        if !matches!(super::ext::detect_from_path(path), Some(FileType::Gem)) {
+            return Some((FileType::Tar, DetectionSource::Magic));
         }
     }
 
@@ -2038,9 +2052,38 @@ mod tests {
         let (ft, _) = detect_from_content(Path::new("saved.tar"), &docker).unwrap();
         assert_eq!(ft, FileType::OciImage);
 
-        // A plain tar with neither marker pair stays a generic tar.
+        // A plain tar with neither marker pair is a generic tar. This used to
+        // assert `is_none()` -- the ustar branch bailed and Stage 4 recovered
+        // the type from the `.tar` extension. The resulting FileType was the
+        // same; only the DetectionSource differed. Asserting the type keeps
+        // the guarantee that actually matters (an OCI bundle is not a plain
+        // tar) without pinning the stage that supplies it.
         let plain = build_plain_tar(&[("README", b"hi"), ("src/main.rs", b"fn main(){}")]);
-        assert!(detect_from_content(Path::new("plain.tar"), &plain).is_none());
+        let (ft, _) = detect_from_content(Path::new("plain.tar"), &plain).unwrap();
+        assert_eq!(ft, FileType::Tar);
+    }
+
+    #[test]
+    fn ustar_tar_detected_regardless_of_extension() {
+        // The ustar signature at offset 257 identifies a tar on its own, so a
+        // tar is walked whatever it is named. Previously only `.tar` was
+        // recognized and the same bytes under any other extension were typed
+        // Data and never descended into -- an XMRig release tarball named
+        // `<sha256>.bin` produced one finding instead of six.
+        let plain = build_plain_tar(&[("README", b"hi"), ("src/main.rs", b"fn main(){}")]);
+        for name in ["payload.bin", "image.png", "noextension"] {
+            let (ft, src) = detect_from_content(Path::new(name), &plain)
+                .unwrap_or_else(|| panic!("{name} was not detected as a tar"));
+            assert_eq!(ft, FileType::Tar, "{name}");
+            assert_eq!(src, DetectionSource::Magic, "{name}");
+        }
+
+        // `.gem` is also an uncompressed ustar tar and has no magic of its
+        // own, so the extension must keep naming it.
+        assert!(!matches!(
+            detect_from_content(Path::new("rails.gem"), &plain),
+            Some((FileType::Tar, _))
+        ));
     }
 
     #[test]
