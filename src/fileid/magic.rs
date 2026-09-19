@@ -406,19 +406,12 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         }
         b'b' => {
             // Binary Plist: bplist. A `.nib` with this magic is a keyed-archive
-            // nib (NSKeyedArchiver output inside an older nib bundle): the
-            // plist is only the container, and the extension is what the
-            // loader honours, so it keeps its nib identity.
+            // nib (NSKeyedArchiver output inside an older nib bundle), but the
+            // bytes are a plain property list either way -- type it Plist so
+            // every plist-aware consumer (including rule engines that don't
+            // know a distinct Nib type) can address it.
             if data.starts_with(b"bplist") {
-                let is_nib = path
-                    .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("nib"));
-                let ty = if is_nib {
-                    FileType::Nib
-                } else {
-                    FileType::Plist
-                };
-                Some((ty, DetectionSource::Magic))
+                Some((FileType::Plist, DetectionSource::Magic))
             } else {
                 None
             }
@@ -1705,13 +1698,16 @@ mod tests {
     }
 
     #[test]
-    fn nib_keyed_archive_keeps_nib_identity() {
+    fn nib_keyed_archive_types_as_plist() {
+        // A keyed-archive nib (NSKeyedArchiver bplist inside an older nib
+        // bundle) is still a plain property list on disk, regardless of the
+        // `.nib` extension -- type it Plist so plist-aware rules can address
+        // it. Only the distinct NIBArchive binary format keeps FileType::Nib.
         let data = b"bplist00\x00\x00\x00\x00";
         let (ft, _) = detect_from_content(Path::new("keyedobjects.nib"), data).unwrap();
-        assert_eq!(ft, FileType::Nib);
+        assert_eq!(ft, FileType::Plist);
         let (ft, _) = detect_from_content(Path::new("Objects.NIB"), data).unwrap();
-        assert_eq!(ft, FileType::Nib);
-        // Without the nib extension the same bytes are a plain binary plist.
+        assert_eq!(ft, FileType::Plist);
         let (ft, _) = detect_from_content(Path::new("prefs"), data).unwrap();
         assert_eq!(ft, FileType::Plist);
     }

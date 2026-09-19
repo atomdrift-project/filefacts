@@ -318,7 +318,16 @@ fn extract_symbols(macho: &MachO<'_>, symbols_out: &mut crate::Symbols) {
     // trait authors can match against `"libsystem.b"` rather than
     // `"/usr/lib/libSystem.B.dylib"`.
     let mut bind_imports = 0usize;
-    if let Ok(imports) = macho.imports() {
+    // `imports()` walks dyld bind opcodes lazily, after `parse_mach` has
+    // already returned, so the parse-time guard does not cover it. goblin
+    // 0.10.7 indexes the libs table with an unchecked ordinal
+    // (mach/imports.rs:103) and panics on a malformed one. LLVM's test corpus
+    // is full of deliberately malformed Mach-O, and a panic on a rayon worker
+    // took down the whole scan of llvm-toolchain-17 (142MB) with SIGSEGV.
+    // `extract_symbols` has no error sink, so a panic here is contained by
+    // yielding no imports rather than being recorded; the parse-level
+    // `macho.parse_panicked` path already covers reporting.
+    if let goblin_safe::GoblinOutcome::Ok(imports) = goblin_safe::catch(|| macho.imports()) {
         for imp in &imports {
             let library = normalize_dylib_path(imp.dylib);
             // Prefer the name-string offset; fall back to the bind slot
@@ -375,7 +384,9 @@ fn extract_symbols(macho: &MachO<'_>, symbols_out: &mut crate::Symbols) {
     // (e.g. `libSystem` forwarding to `libdyld`) come through as
     // regular `Export` entries; we surface only the name here, with
     // forwarded-target handling left to a follow-up.
-    if let Ok(exports) = macho.exports() {
+    // Same exposure as `imports()` above: the export trie is walked lazily and
+    // goblin indexes it unchecked (mach/exports.rs:99).
+    if let goblin_safe::GoblinOutcome::Ok(exports) = goblin_safe::catch(|| macho.exports()) {
         for exp in &exports {
             symbols_out.push(crate::Symbol::Export {
                 // Normalize the same Darwin `$VARIANT` suffix as imports: these
