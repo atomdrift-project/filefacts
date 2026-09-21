@@ -72,6 +72,7 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Iden
         FileType::Png => png(values, &mut id),
         FileType::Lnk => lnk(values, &mut id),
         FileType::Cab => cab(values, &mut id),
+        FileType::Rar => rar(values, &mut id),
         FileType::ApkAlpine => apk_alpine(values, &mut id),
         FileType::ApkAndroid => apk_android(values, &mut id),
         FileType::Iso => iso(values, &mut id),
@@ -280,6 +281,15 @@ fn cab(values: &Values, id: &mut Identity) {
     if let Some(t) = get_str(values, "cab.signatures[0].thumbprint_sha256") {
         id.unique_ids
             .insert("authenticode_thumbprint_sha256".into(), t.to_string());
+    }
+}
+
+/// RAR 5 stores the original archive name and (optionally) the time it was
+/// created in a main-header extra record. Both are operator-chosen, so they
+/// are unverified claims — the same class of provenance as an ISO volume id.
+fn rar(values: &Values, id: &mut Identity) {
+    if let Some(name) = get_str(values, "rar.original_name") {
+        id.name = Some(Claim::claimed(name, "rar.original_name"));
     }
 }
 

@@ -91,6 +91,7 @@ mod pkgmeta;
 mod png;
 mod pyc;
 mod python_sdist;
+mod rar;
 pub(crate) mod references;
 mod registry;
 mod rpm;
@@ -198,6 +199,9 @@ pub(crate) fn extract(
             zip::extract(bytes, values, metrics, archive_members)
         }
         FileType::Cab => cab::extract(bytes, values, metrics, archive_members),
+        // RAR's headers hold the member table even when payloads are encrypted.
+        // Metadata-only, matching CAB/7z: never decompress, never shell out.
+        FileType::Rar => rar::extract(bytes, values, metrics, archive_members),
         FileType::Nupkg => {
             // Open the ZIP once: generic archive facts, then the inner
             // `.nuspec` for the nupkg.* NuGet publisher identity.

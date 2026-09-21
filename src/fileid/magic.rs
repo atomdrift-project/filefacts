@@ -42,6 +42,14 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         return Some((FileType::Text, DetectionSource::Magic));
     }
 
+    // Yarn v1 lockfile. Hopper copies are often renamed `yarn.<sha>.lock`
+    // and miss the exact-basename arm, scoring unknown so lockfile traits
+    // never run.
+    let yarn_probe = &data[..data.len().min(512)];
+    if memchr::memmem::find(yarn_probe, b"yarn lockfile v1").is_some() {
+        return Some((FileType::YarnLock, DetectionSource::Magic));
+    }
+
     // An HTML document, whatever it is called and however it is indented.
     // Keyed off `head` rather than `data` because real pages are not flush
     // left: four VirusShare samples open with four spaces before the doctype,
@@ -1521,6 +1529,8 @@ fn detect_manifest(path: &Path, data: &[u8]) -> Option<FileType> {
         _ => {
             if name.ends_with(".vsixmanifest") {
                 Some(FileType::VsixManifest)
+            } else if name.starts_with("yarn.") && name.ends_with(".lock") {
+                Some(FileType::YarnLock)
             } else {
                 None
             }
