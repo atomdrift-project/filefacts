@@ -1395,6 +1395,81 @@ fn mark_replaces(file_type: FileType) -> bool {
     )
 }
 
+/// A leading tag. Used when the extension is a variant letter (`.sc`, `.ex`)
+/// rather than a claim that the body is that language.
+fn leading_markup(data: &[u8]) -> bool {
+    let n = data.len().min(32);
+    let rest = data[..n].trim_ascii_start();
+    let starts = |prefix: &[u8]| {
+        rest.len() >= prefix.len() && rest[..prefix.len()].eq_ignore_ascii_case(prefix)
+    };
+    starts(b"<script")
+        || starts(b"<html")
+        || starts(b"<!doctype")
+        || starts(b"<body")
+        || starts(b"<iframe")
+}
+
+/// `.sc` markup. Ammonite worksheets keep the extension; a leading tag does not.
+fn sc_name_is_markup(path: &Path, data: &[u8]) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    ext.eq_ignore_ascii_case("sc") && leading_markup(data)
+}
+
+/// `.ex` is Elixir and a vxheaven variant letter. `.exs` stays Elixir.
+/// A leading mark of another format wins; `defmodule` does not.
+fn ex_variant_override(path: &Path, data: &[u8]) -> Option<FileType> {
+    let ext = path.extension().and_then(|e| e.to_str())?;
+    if !ext.eq_ignore_ascii_case("ex") {
+        return None;
+    }
+    if let Some(marked) = heuristics::unmistakable(data) {
+        return Some(marked);
+    }
+    if leading_markup(data) || utf16le_markup(data) {
+        return Some(FileType::Html);
+    }
+    if leading_batch(data) {
+        return Some(FileType::Batch);
+    }
+    None
+}
+
+fn leading_batch(data: &[u8]) -> bool {
+    let n = data.len().min(80);
+    let rest = data[..n].trim_ascii_start();
+    if rest.len() < 5 || !rest[..5].eq_ignore_ascii_case(b"@echo") {
+        return false;
+    }
+    let line_end = rest
+        .iter()
+        .position(|b| *b == b'\n' || *b == b'\r')
+        .unwrap_or(rest.len());
+    rest[..line_end]
+        .windows(3)
+        .any(|w| w.eq_ignore_ascii_case(b"off"))
+}
+
+fn utf16le_markup(data: &[u8]) -> bool {
+    let Some(rest) = data.strip_prefix(b"\xff\xfe") else {
+        return false;
+    };
+    let mut text = [0u8; 16];
+    let mut n = 0;
+    let mut i = 0;
+    while i + 1 < rest.len() && n < text.len() {
+        if rest[i + 1] != 0 {
+            return false;
+        }
+        text[n] = rest[i];
+        n += 1;
+        i += 2;
+    }
+    leading_markup(&text[..n])
+}
+
 fn prose_extension_may_be_source(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
@@ -1580,6 +1655,24 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
 
     let ext_ft = ext::detect_from_path(path);
     let heuristic_may_override_ext = ext_ft.is_none_or(allows_heuristic_extension_override);
+
+    // `.sc` is an Ammonite worksheet and also a vxheaven variant letter.
+    // A worksheet starts with Scala. A file whose first token is markup is
+    // the page, and `.scala` is left alone.
+    if sc_name_is_markup(path, data) {
+        return Some(Detection {
+            file_type: FileType::Html,
+            source: DetectionSource::Heuristic,
+            ext_match: ExtensionMatch::Different(FileType::Scala),
+        });
+    }
+    if let Some(kind) = ex_variant_override(path, data) {
+        return Some(Detection {
+            file_type: kind,
+            source: DetectionSource::Heuristic,
+            ext_match: ExtensionMatch::Different(FileType::Elixir),
+        });
+    }
 
     // One unmistakable mark beats the language scorer. It only replaces a
     // weak or absent extension (`.txt`, `.m`, `.lua`, a page typed HTML
@@ -2350,6 +2443,56 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
     #[test]
     fn scala_by_ext() {
         assert_ext("App.scala", FileType::Scala);
+    }
+
+    #[test]
+    fn sc_markup_is_html_and_scala_script_stays_scala() {
+        assert_detect(
+            "Trojan.sc",
+            b" <script>function x(){return 1}</script>\n",
+            FileType::Html,
+        );
+        assert_detect(
+            "worksheet.sc",
+            b"import scala.util._\nprintln(1)\n",
+            FileType::Scala,
+        );
+        assert_detect(
+            "App.scala",
+            b"<script>not really</script>\nobject App\n",
+            FileType::Scala,
+        );
+    }
+
+    #[test]
+    fn ex_variant_letter_yields_to_a_leading_mark() {
+        assert_detect(
+            "Trojan.BAT.Agent.ex",
+            b"@echo       off\r\ncopy a b\r\n",
+            FileType::Batch,
+        );
+        assert_detect(
+            "Backdoor.ASP.Ace.ex",
+            b"<%@ LANGUAGE = VBScript.Encode %>\r\n<%\r\n",
+            FileType::Asp,
+        );
+        assert_detect(
+            "Exploit.JS.RealPlr.ex",
+            b"<sCrIpT lAnGuAgE=\"jAvAsCrIpT\">\r\n",
+            FileType::Html,
+        );
+        let mut utf16 = vec![0xff, 0xfe];
+        for b in b"<!DOCTYPE HTML" {
+            utf16.push(*b);
+            utf16.push(0);
+        }
+        assert_detect("Trojan.JS.Agent.ex", &utf16, FileType::Html);
+        assert_detect(
+            "revshell.ex",
+            b"defmodule Revshell do\n  def run do\n  end\nend\n",
+            FileType::Elixir,
+        );
+        assert_detect("tool.exs", b"@echo off\r\n", FileType::Elixir);
     }
 
     // ── C/C++ ────────────────────────────────────────────────────────
