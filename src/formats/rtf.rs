@@ -604,11 +604,29 @@ fn shape(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     while i < bytes.len() {
         match bytes[i] {
             b'\\' if bytes.get(i + 1).is_some_and(|b| b.is_ascii_alphabetic()) => {
-                control_words += 1;
-                i += 1;
-                while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
-                    i += 1;
+                // A control word is letters, an optional parameter, then a
+                // delimiter. Encrypted bytes after a stub header are full of
+                // `\` + letter pairs; counting those made a payload look as
+                // dense as a document and the sparse-body check never fired.
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j].is_ascii_alphabetic() {
+                    j += 1;
                 }
+                if bytes.get(j) == Some(&b'-') {
+                    j += 1;
+                }
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                let delimited = j == bytes.len()
+                    || matches!(
+                        bytes[j],
+                        b' ' | b'\\' | b'{' | b'}' | b'\n' | b'\r' | b'\t' | b';'
+                    );
+                if delimited {
+                    control_words += 1;
+                }
+                i = j;
             }
             b'{' => {
                 braces_open += 1;
@@ -745,6 +763,20 @@ mod tests {
         let sparse = m2.get("rtf.control_word_density").unwrap();
         assert!(sparse < 1.0, "wrapper density {sparse}");
         assert!(dense > sparse * 20.0, "{dense} vs {sparse}");
+
+        // A NUL where the version digit belongs, then a run of `\` + letter
+        // that is not a control word. The delimiter keeps those out of the
+        // count, so the body still reads as a payload.
+        let mut broken = b"{\\rtf\x00".to_vec();
+        for _ in 0..8_000 {
+            broken.extend_from_slice(b"\\A\xff");
+        }
+        let (_, m3) = extract_rtf(&broken);
+        let broken_density = m3.get("rtf.control_word_density").unwrap();
+        assert!(
+            broken_density < 10.0,
+            "broken-header density {broken_density}"
+        );
     }
 
     #[test]

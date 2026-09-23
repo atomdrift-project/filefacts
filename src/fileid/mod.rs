@@ -1732,6 +1732,21 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
         }
     }
 
+    // A unit file and a desktop entry are text. The `.Service` on
+    // `Virus.Boot.Stoned.Service` is a variant letter on a boot sector,
+    // and a binary `.desktop` is the same kind of misname.
+    if let Some(ext) =
+        ext_ft.filter(|ft| matches!(ft, FileType::SystemdService | FileType::DesktopEntry))
+    {
+        if heuristics::binary_not_source(data) {
+            return Some(Detection {
+                file_type: FileType::Data,
+                source: DetectionSource::Heuristic,
+                ext_match: ExtensionMatch::Different(ext),
+            });
+        }
+    }
+
     // Stage 4: Extension fallback (used when no content-first detector resolved
     // and the filename was not well-known).
     if let Some(file_type) = ext_ft {
@@ -2578,6 +2593,33 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
     }
 
     #[test]
+    fn axml_magic_is_xml() {
+        let mut doc = vec![0x03, 0x00, 0x08, 0x00, 0, 0, 0, 0, 0x01, 0x00, 0x1c, 0x00];
+        let len = u32::try_from(doc.len()).unwrap().to_le_bytes();
+        doc[4..8].copy_from_slice(&len);
+        assert_detect("res/K1.xml", &doc, FileType::Xml);
+        assert_detect("res/K1.bin", &doc, FileType::Xml);
+        let mut short = doc.clone();
+        short[4] = 0xff;
+        // `.bin` is data by extension. A size field that does not cover the
+        // buffer must not promote it to XML.
+        let det = detect(Path::new("res/K1.bin"), &short).unwrap();
+        assert_eq!(det.file_type, FileType::Data);
+    }
+
+    #[test]
+    fn binary_service_or_desktop_suffix_is_data() {
+        // `0x01` keeps the body binary without a lane of NULs, which
+        // would otherwise read as UTF-16 text and stay on the extension.
+        let mut boot = vec![0x01; 512];
+        boot[0] = 0xEA;
+        boot[510] = 0x55;
+        boot[511] = 0xAA;
+        assert_detect("Virus.Boot.Stoned.Service", &boot, FileType::Data);
+        assert_detect("payload.desktop", &boot, FileType::Data);
+    }
+
+    #[test]
     fn systemd_service_drop_in() {
         assert_ext(
             "/etc/systemd/system/ssh.service.d/override.conf",
@@ -2907,6 +2949,22 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
             b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR",
             FileType::Png,
         );
+    }
+
+    #[test]
+    fn riff_form_type_selects_wave_and_leaves_a_cursor_alone() {
+        let mut wave = b"RIFF".to_vec();
+        wave.extend_from_slice(&16u32.to_le_bytes());
+        wave.extend_from_slice(b"WAVE");
+        assert_detect("clip.wav", &wave, FileType::Wav);
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&16u32.to_le_bytes());
+        webp.extend_from_slice(b"WEBP");
+        assert_detect("pic.webp", &webp, FileType::Webp);
+        let mut cursor = b"RIFF".to_vec();
+        cursor.extend_from_slice(&16u32.to_le_bytes());
+        cursor.extend_from_slice(b"ACON");
+        assert!(detect(Path::new("cursor.ani"), &cursor).is_none());
     }
 
     #[test]

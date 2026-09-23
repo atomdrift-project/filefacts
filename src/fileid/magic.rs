@@ -17,6 +17,23 @@ const LNK_MAGIC: &[u8] = &[
 /// case-insensitively, as Windows itself matches them.
 const URL_SHORTCUT_SECTION: &[u8] = b"[InternetShortcut]";
 
+/// Compiled Android XML. The container chunk says how long the document is,
+/// and the next chunk is the string pool. Both have to agree; `03 00 08 00`
+/// by itself is four bytes and shows up in unrelated binaries.
+fn looks_like_axml(data: &[u8]) -> bool {
+    if data.len() < 12 || data.len() > 16 * 1024 * 1024 {
+        return false;
+    }
+    let chunk_type = u16::from_le_bytes([data[0], data[1]]);
+    let header_size = u16::from_le_bytes([data[2], data[3]]);
+    let file_size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    chunk_type == 0x0003
+        && header_size == 8
+        && file_size == data.len()
+        && data[8] == 0x01
+        && data[9] == 0x00
+}
+
 /// Detect file type from content. Returns the type and how it was detected.
 pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType, DetectionSource)> {
     if data.len() < 2 {
@@ -66,6 +83,14 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
     // is only the fallback for a file that does not carry the header.
     if head.len() >= 4 && head.starts_with(b"%!PS") {
         return Some((FileType::PostScript, DetectionSource::Magic));
+    }
+
+    // Android binary XML: chunk type 0x0003, header size 8, a file-size field
+    // that covers this buffer, and a string-pool chunk next. A `.xml` name
+    // used to be the only signal, so a compiled layout was "XML" by extension
+    // while the text parser never saw a tag.
+    if looks_like_axml(data) {
+        return Some((FileType::Xml, DetectionSource::Magic));
     }
 
     if head.len() >= 5 {
@@ -325,14 +350,13 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             } else if (data.starts_with(b"RIFF") || data.starts_with(b"RIFX")) && data.len() >= 12 {
                 // RIFF container: `RIFF` + u32 length + form type. WAVE, WEBP
                 // and AVI share the wrapper, so the form type at offset 8
-                // decides which one this is.
-                Some((
-                    match &data[8..12] {
-                        b"WEBP" => FileType::Webp,
-                        _ => FileType::Wav,
-                    },
-                    DetectionSource::Magic,
-                ))
+                // decides. An animated cursor (`ACON`) is not audio.
+                let kind = match &data[8..12] {
+                    b"WEBP" => Some(FileType::Webp),
+                    b"WAVE" => Some(FileType::Wav),
+                    _ => None,
+                };
+                kind.map(|file_type| (file_type, DetectionSource::Magic))
             } else {
                 None
             }
