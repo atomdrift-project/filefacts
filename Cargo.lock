@@ -1459,9 +1459,9 @@ dependencies = [
 
 [[package]]
 name = "psl"
-version = "2.1.235"
+version = "2.1.236"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8319b56ff38ca0522b4e1e40bfa2b5de7f62dc89fc1e9033eac365551ec58e0e"
+checksum = "95538218f9dd0a4b7e06f87b3d7a4e176c99b8a57bb2836f35e40a69ffda3dd9"
 dependencies = [
  "psl-types",
 ]
@@ -1876,7 +1876,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "1.12.0"
-source = "git+https://github.com/atomdrift-project/stng.git#d115bef8b3316d63592ff9b8b8686951d9b5d889"
+source = "git+https://github.com/atomdrift-project/stng.git#660badeeebf3d262605776fabd62fd10337e002b"
 dependencies = [
  "aho-corasick",
  "anyhow",
