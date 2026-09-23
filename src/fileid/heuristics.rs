@@ -187,7 +187,21 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     // leading `<?php` tag. Score PHP-specific globals and WordPress hook idioms
     // so `elseif ` in those files does not incorrectly win as Lua.
     (b"<?php", Lang::Php, 10),
+    // A short open tag at a line break (`<?` then whitespace). `<?php` is
+    // scored above, and this form does not match `<?xml`. One
+    // `stripslashes(` plus a `document.write` later in the same head used
+    // to tie JavaScript and leave the file unidentified.
+    (b"<?\n", Lang::Php, 10),
+    (b"<?\r", Lang::Php, 10),
+    (b"<? ", Lang::Php, 10),
     (b"$_SERVER", Lang::Php, 10),
+    // PHP 4 class properties are `var $name`. The same `var ` prefix is a
+    // JavaScript declaration; the JS scorer skips the `$` form so a short-tag
+    // webshell full of `var $pwd` does not tie and stay unidentified.
+    (b"var $", Lang::Php, 10),
+    // Posted-command webshells unescape with stripslashes(). No other
+    // language spells that function.
+    (b"stripslashes(", Lang::Php, 10),
     (b"$_POST", Lang::Php, 10),
     (b"$_GET", Lang::Php, 10),
     (b"add_filter(", Lang::Php, 10),
@@ -381,6 +395,31 @@ fn scan_scores(data: &[u8]) -> [u16; LANG_COUNT] {
             {
                 continue;
             }
+            // `var $name` is a PHP 4 property, not a JavaScript binding.
+            if m == b"var " && data.get(mat.end()) == Some(&b'$') {
+                continue;
+            }
+            // "itself." contains `self.`, "Applet " contains `let `, and
+            // "eval " contains `val `. A declaration sits on a token boundary;
+            // `let ` followed by a function word is prose.
+            if matches!(
+                m,
+                b"let " | b"var " | b"const " | b"def " | b"except " | b"self." | b"val "
+            ) && mat.start() > 0
+                && data[mat.start() - 1].is_ascii_alphanumeric()
+            {
+                continue;
+            }
+            if m == b"let " {
+                let rest = &data[mat.end()..];
+                const PROSE: &[&[u8]] = &[
+                    b"the ", b"the\n", b"a ", b"an ", b"us ", b"me ", b"it ", b"you ", b"them ",
+                    b"this ", b"that ", b"your ", b"there ", b"him ", b"her ",
+                ];
+                if PROSE.iter().any(|word| rest.starts_with(word)) {
+                    continue;
+                }
+            }
             let entry = &s.entries[mat.pattern().as_usize()];
             let idx = entry.lang.idx();
             scores[idx] = scores[idx].saturating_add(u16::from(entry.weight));
@@ -458,6 +497,29 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
     } else {
         scan_scores(head)
     };
+    // A preface can push the real language just past the first window: an ASP
+    // one-liner list, then `<?php` shells a few hundred bytes later. Only the
+    // next window may replace a head that never became conclusive.
+    let scores = if !is_mostly_whitespace(body, SCAN_LIMIT) && body.len() > SCAN_LIMIT {
+        let head_best = scores.iter().copied().max().unwrap_or(0);
+        if head_best < 20 {
+            let next = &body[SCAN_LIMIT..body.len().min(SCAN_LIMIT * 2)];
+            let next_scores = scan_scores(next);
+            let next_best = next_scores.iter().copied().max().unwrap_or(0);
+            if next_best >= THRESHOLD
+                && next_best > head_best
+                && (head_best == 0 || head_best * 100 / next_best <= 60)
+            {
+                next_scores
+            } else {
+                scores
+            }
+        } else {
+            scores
+        }
+    } else {
+        scores
+    };
 
     // Find the best and second-best scoring languages
     let mut best_lang: Option<Lang> = None;
@@ -522,7 +584,7 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
     // targets: a fragment cut from a larger file loses its opening tag but keeps
     // the closing one.
     if lang == Lang::Php {
-        let tagged = has_php_tag(&data[..data.len().min(SCAN_LIMIT)])
+        let tagged = has_php_tag(&data[..data.len().min(SCAN_LIMIT * 2)])
             || (is_mostly_whitespace(data, SCAN_LIMIT)
                 && data.len() > SCAN_LIMIT
                 && has_php_tag(&data[data.len().saturating_sub(TAIL_SIZE)..]));
@@ -571,6 +633,32 @@ fn looks_like_binary(head: &[u8]) -> bool {
         .filter(|&&b| (b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r')) || b == 0x7F)
         .count();
     control * 100 > head.len() * MAX_CONTROL_PERCENT
+}
+
+/// Object code wearing a source extension (a DOS COM named `Burger.m` or
+/// `Trivial.45.t`). UTF-16 text is mostly NULs and would otherwise look the
+/// same; a BOM or a lane of NULs keeps that as text for the extension fallback.
+pub(crate) fn binary_not_source(data: &[u8]) -> bool {
+    let content_start = if data.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        3
+    } else {
+        0
+    };
+    let head = &data[content_start..data.len().min(content_start + SCAN_LIMIT)];
+    looks_like_binary(head) && !looks_like_utf16_text(head)
+}
+
+fn looks_like_utf16_text(head: &[u8]) -> bool {
+    if head.starts_with(&[0xFF, 0xFE]) || head.starts_with(&[0xFE, 0xFF]) {
+        return true;
+    }
+    if head.len() < 64 {
+        return false;
+    }
+    let pairs = head.len() / 2;
+    let nul_even = head.iter().step_by(2).filter(|&&b| b == 0).count();
+    let nul_odd = head.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
+    nul_even * 5 > pairs * 4 || nul_odd * 5 > pairs * 4
 }
 
 fn looks_like_prose(head: &[u8]) -> bool {
@@ -945,6 +1033,70 @@ traits:
         // The opening tag settles it.
         let tagged = b"<?php\n$x = $_POST['a'];\necho $x;\n";
         assert_eq!(detect_from_content(tagged), Some(FileType::Php));
+    }
+
+    #[test]
+    fn php4_var_properties_are_php_not_javascript() {
+        // `var $name` is a PHP 4 property. Scoring it as JavaScript `var `
+        // tied the two languages and left the file unidentified.
+        let data = b"<?\nclass backdoor {\n  var $pwd;\n  var $shell;\n  function shell() {\n    system($this->shell);\n    echo $_SERVER['PHP_SELF'];\n  }\n}\n";
+        assert_eq!(detect_from_content(data), Some(FileType::Php));
+    }
+
+    #[test]
+    fn short_tag_stripslashes_webshell_is_php() {
+        let data = b"<?\n$cmd = stripslashes($cmd);\nsystem($cmd);\n";
+        assert_eq!(detect_from_content(data), Some(FileType::Php));
+    }
+
+    #[test]
+    fn itself_and_except_prose_is_not_python() {
+        let data = b"Modified Version, except to acknowledge the contribution.\n\
+Original or Modified Versions may be sold by itself.\n";
+        assert_eq!(detect_from_content(data), None);
+    }
+
+    #[test]
+    fn let_the_and_applet_prose_is_not_javascript() {
+        let data = b"If you discover a problem, post a message and let the rest of us know.\n\
+Coordinate with the Applet Maintainer before sweeping changes.\n";
+        assert_eq!(detect_from_content(data), None);
+    }
+
+    #[test]
+    fn python_self_attribute_and_except_still_detected() {
+        let data = b"try:\n    self.foo()\nexcept Exception:\n    pass\n";
+        assert_eq!(detect_from_content(data), Some(FileType::Python));
+    }
+
+    #[test]
+    fn javascript_let_binding_still_detected() {
+        let data =
+            b"function main() {\n  let count = 1;\n  let total = count;\n  return total;\n}\n";
+        assert_eq!(detect_from_content(data), Some(FileType::JavaScript));
+    }
+
+    #[test]
+    fn eval_call_is_not_kotlin_val() {
+        let data = b"<%\nre = request(\"sb\")\neval(request(0))\nexecute re\n%>\n";
+        assert_ne!(detect_from_content(data), Some(FileType::Kotlin));
+    }
+
+    #[test]
+    fn kotlin_val_bindings_still_detected() {
+        let data = b"fun main() {\n  val count = 1\n  val total = count\n}\n";
+        assert_eq!(detect_from_content(data), Some(FileType::Kotlin));
+    }
+
+    #[test]
+    fn php_just_past_the_first_window_is_still_php() {
+        let mut data = Vec::new();
+        for _ in 0..600 {
+            data.extend_from_slice(b"/* x */\n");
+        }
+        data.extend_from_slice(b"<?php\n$x = $_POST['a'];\neval($x);\n");
+        assert!(data.len() > SCAN_LIMIT);
+        assert_eq!(detect_from_content(&data), Some(FileType::Php));
     }
 
     #[test]

