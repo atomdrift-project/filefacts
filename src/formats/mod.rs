@@ -503,6 +503,29 @@ pub(crate) fn extract(
             common::XorScan::No
         };
         common::extract_text_strings(bytes, strings, xor);
+        // A compressed Flash movie (CWS) stores its strings past a zlib
+        // stream. The raw bytes are codec noise; the movie is the text.
+        if let Some(movie) = inflate_cws(bytes) {
+            common::extract_text_strings(&movie, strings, common::XorScan::No);
+        }
+    }
+
+    /// Inflate a CWS body. The u32 at offset 4 is the uncompressed movie size,
+    /// header included. Refuse anything past a megabyte so a hostile length
+    /// cannot expand without bound.
+    fn inflate_cws(bytes: &[u8]) -> Option<Vec<u8>> {
+        use std::io::Read;
+        if bytes.len() < 8 || !bytes.starts_with(b"CWS") {
+            return None;
+        }
+        let declared = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
+        if !(8..=1 << 20).contains(&declared) {
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut dec = flate2::read::ZlibDecoder::new(&bytes[8..]).take(declared as u64);
+        dec.read_to_end(&mut out).ok()?;
+        if out.is_empty() { None } else { Some(out) }
     }
 
     // Cross-format binary attribution derived from the merged symbol
@@ -520,4 +543,33 @@ pub(crate) fn extract(
     source_meta::extract(bytes, file_type, values);
 
     result
+}
+
+#[cfg(test)]
+mod cws_string_tests {
+    use std::io::Write;
+
+    #[test]
+    fn inflated_cws_exposes_the_remote_movie_url() {
+        let movie = b"http://cdn.example/x\x00ff.swf\x00";
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(movie).unwrap();
+        let compressed = enc.finish().unwrap();
+        let mut file = b"CWS\x08".to_vec();
+        file.extend_from_slice(&((8 + movie.len()) as u32).to_le_bytes());
+        file.extend_from_slice(&compressed);
+        let opened = crate::open(&file).unwrap();
+        let extracted = opened.extracted();
+        let text: Vec<&str> = extracted
+            .strings
+            .text
+            .iter()
+            .map(|s| s.value.as_str())
+            .collect();
+        assert!(
+            text.iter().any(|s| s.contains("http://cdn.example/x")),
+            "{text:?}"
+        );
+        assert!(text.iter().any(|s| s.contains("ff.swf")), "{text:?}");
+    }
 }
