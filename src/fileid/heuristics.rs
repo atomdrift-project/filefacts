@@ -502,7 +502,11 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
     // next window may replace a head that never became conclusive.
     let scores = if !is_mostly_whitespace(body, SCAN_LIMIT) && body.len() > SCAN_LIMIT {
         let head_best = scores.iter().copied().max().unwrap_or(0);
-        if head_best < 20 {
+        // 40 is two conclusive tokens, or a handful of supporting ones. A
+        // preface of `var ` / `eval ` hits that and hides `<?php` a few
+        // hundred bytes later. A head that already looks like a real unit
+        // stays as it is.
+        if head_best < 40 {
             let next = &body[SCAN_LIMIT..body.len().min(SCAN_LIMIT * 2)];
             let next_scores = scan_scores(next);
             let next_best = next_scores.iter().copied().max().unwrap_or(0);
