@@ -898,6 +898,108 @@ pub(crate) fn looks_like_html(data: &[u8]) -> bool {
     ac.as_ref().is_some_and(|ac| ac.is_match(head))
 }
 
+/// A mark that belongs to one format and almost nothing else.
+///
+/// Checked against a short prefix, in order, case-folded where the format
+/// itself is. This is not the language scorer: a weighted token fight is how
+/// a JSP page became Python and a mIRC script became Lua. One needle, one type.
+pub(crate) fn unmistakable(data: &[u8]) -> Option<FileType> {
+    let data = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(data);
+    let head = &data[..data.len().min(2048)];
+    // `<%@ Page Language="C#"` is ASP.NET. `<%@ page` / `<%@page` otherwise
+    // is JSP. Classic ASP is `<%@ Language` with no `page` word. The ASP
+    // forms have to win, or the shared `<%@ page` prefix swallows them.
+    if looks_like_asp_directive(head) {
+        return Some(FileType::Asp);
+    }
+    if contains_ci(head, b"<%@page")
+        || contains_ci(head, b"<%@ page")
+        || contains(head, b"<jsp:root")
+        || contains(head, b"<jsp:directive.page")
+    {
+        return Some(FileType::Jsp);
+    }
+    if contains_ci(head, b"<cfset")
+        || contains_ci(head, b"<cfoutput")
+        || contains_ci(head, b"<cfscript")
+        || contains_ci(head, b"<cfquery")
+        || contains_ci(head, b"<cfparam")
+    {
+        return Some(FileType::Cfml);
+    }
+    if contains_ci(head, b"on *:text:")
+        || contains_ci(head, b"on *:join:")
+        || contains_ci(head, b"on *:part:")
+        || contains_ci(head, b"on 1:text:")
+        || contains_ci(head, b"on 1:join:")
+    {
+        return Some(FileType::Mirc);
+    }
+    if contains(head, b"^on ") || contains(head, b"^alias ") {
+        return Some(FileType::IrcII);
+    }
+    if contains(head, b"\\documentclass")
+        || contains(head, b"\\NeedsTeXFormat")
+        || contains(head, b"\\ProvidesClass")
+        || contains(head, b"\\ProvidesPackage")
+    {
+        return Some(FileType::Tex);
+    }
+    if looks_like_yara(head) {
+        return Some(FileType::Yara);
+    }
+    None
+}
+
+/// DOS COM has no header. `CD 21` is `INT 21h`, the DOS syscall, and it sits
+/// near the front of the infectors that were wearing a source extension.
+pub(crate) fn looks_like_dos_com(data: &[u8]) -> bool {
+    let head = &data[..data.len().min(256)];
+    head.windows(2).any(|w| w == [0xCD, 0x21])
+}
+
+fn looks_like_asp_directive(head: &[u8]) -> bool {
+    if contains_ci(head, b"<%@language") || contains_ci(head, b"<%@ language") {
+        return true;
+    }
+    let page = contains_ci(head, b"<%@page") || contains_ci(head, b"<%@ page");
+    page && (contains_ci(head, b"language=\"c#\"")
+        || contains_ci(head, b"language=\"vb\"")
+        || contains_ci(head, b"language='c#'")
+        || contains_ci(head, b"language='vb'"))
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
+fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && hay
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
+}
+
+/// `rule <name>` plus both section labels. YARA keywords are lowercase;
+/// requiring all three keeps an English sentence that says "rule" from matching.
+fn looks_like_yara(head: &[u8]) -> bool {
+    let rule = head.split(|&b| b == b'\n').any(|line| {
+        let line = trim_ascii_start(line);
+        line.starts_with(b"rule ")
+            || line.starts_with(b"private rule ")
+            || line.starts_with(b"global rule ")
+    });
+    rule && contains(head, b"strings:") && contains(head, b"condition:")
+}
+
+fn trim_ascii_start(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    &bytes[start..]
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

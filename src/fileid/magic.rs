@@ -62,6 +62,12 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
     // open templates and fragments that other arms own and which stay out of
     // magic deliberately. `<!DOCTYPE svg` and an `<?xml` prolog are unaffected:
     // neither begins with either of these.
+    // PostScript and EPS. `%!PS` at the start is the format; a `.ps` extension
+    // is only the fallback for a file that does not carry the header.
+    if head.len() >= 4 && head.starts_with(b"%!PS") {
+        return Some((FileType::PostScript, DetectionSource::Magic));
+    }
+
     if head.len() >= 5 {
         let doctype_html = head.len() >= 14 && head[..14].eq_ignore_ascii_case(b"<!DOCTYPE html");
         let html_root = head[..5].eq_ignore_ascii_case(b"<html")

