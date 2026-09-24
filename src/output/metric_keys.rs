@@ -779,6 +779,7 @@ pub const CATALOG: &[&str] = &[
     "registry.has_install_script",
     "registry.is_deprecated",
     "registry.maintainers",
+    "registry.name_lookalike",
     "registry.package_age_days",
     "registry.previous_published_at",
     "registry.published_at",
