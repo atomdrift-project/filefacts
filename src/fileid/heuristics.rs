@@ -52,11 +52,12 @@ enum Lang {
     Dockerfile,
     Clojure,
     AppleScript,
+    ObjectiveC,
 }
 
 /// All languages in index order. Used to map score indices back to Lang values
 /// without unsafe transmute.
-const LANGS: [Lang; 14] = [
+const LANGS: [Lang; 15] = [
     Lang::Shell,
     Lang::Python,
     Lang::PowerShell,
@@ -71,6 +72,7 @@ const LANGS: [Lang; 14] = [
     Lang::Dockerfile,
     Lang::Clojure,
     Lang::AppleScript,
+    Lang::ObjectiveC,
 ];
 
 const LANG_COUNT: usize = LANGS.len();
@@ -93,6 +95,7 @@ impl Lang {
             Self::Dockerfile => 11,
             Self::Clojure => 12,
             Self::AppleScript => 13,
+            Self::ObjectiveC => 14,
         }
     }
 
@@ -112,7 +115,13 @@ impl Lang {
             Self::Dockerfile => FileType::Dockerfile,
             Self::Clojure => FileType::Clojure,
             Self::AppleScript => FileType::AppleScript,
+            Self::ObjectiveC => FileType::ObjectiveC,
         }
+    }
+
+    /// The scored language a file type names, if the table scores it.
+    fn from_file_type(ft: FileType) -> Option<Self> {
+        LANGS.into_iter().find(|l| l.to_file_type() == ft)
     }
 }
 
@@ -226,6 +235,18 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"ERRORLEVEL", Lang::Batch, 10),
     (b"ctty ", Lang::Batch, 10),
     (b"attrib +", Lang::Batch, 5),
+    // `@` before a command suppresses its echo, and `if exist` is the batch
+    // file test. Scripts that never say `@echo off` still write
+    // `@if exist C:\x del C:\x` on every line -- vxheaven's Trojan.BAT.DelFiles.m
+    // did, and was typed Objective-C from its variant letter. SCSS has `@if`
+    // but never `@if exist`.
+    (b"@if exist ", Lang::Batch, 10),
+    // The doubled `%%` is how a batch file spells a loop variable.
+    (b"for %%", Lang::Batch, 10),
+    (b"@if not exist ", Lang::Batch, 10),
+    (b"@deltree ", Lang::Batch, 10),
+    (b"@del ", Lang::Batch, 5),
+    (b"@copy ", Lang::Batch, 5),
     // ── VBScript ──
     (b"WScript.", Lang::Vbs, 10),
     (b"Option Explicit", Lang::Vbs, 10),
@@ -333,6 +354,24 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"end repeat", Lang::AppleScript, 5),
     (b"on run", Lang::AppleScript, 5),
     (b"with hidden answer", Lang::AppleScript, 10),
+    // ── Objective-C ──
+    // The compiler directives no C, C++ or Swift file spells. Objective-C is
+    // a superset of C, so a real `.m` also scores for C on every `#include`;
+    // `detect_from_content` resolves that pairing toward Objective-C. Without
+    // these a genuine `.m` scored only as C and lost its type.
+    // `@property` alone is a Python decorator, so only the attribute form.
+    (b"@interface ", Lang::ObjectiveC, 10),
+    (b"@implementation ", Lang::ObjectiveC, 10),
+    (b"@autoreleasepool", Lang::ObjectiveC, 10),
+    (b"@selector(", Lang::ObjectiveC, 10),
+    (b"@synthesize ", Lang::ObjectiveC, 10),
+    (b"@property (", Lang::ObjectiveC, 10),
+    (b"@property(", Lang::ObjectiveC, 10),
+    (b"#import <", Lang::ObjectiveC, 10),
+    (b"#import \"", Lang::ObjectiveC, 10),
+    (b"NSLog(@\"", Lang::ObjectiveC, 10),
+    (b"alloc] init", Lang::ObjectiveC, 10),
+    (b"@end\n", Lang::ObjectiveC, 5),
 ];
 
 struct AcScanner {
@@ -392,6 +431,16 @@ fn scan_scores(data: &[u8]) -> [u16; LANG_COUNT] {
             let m = &data[mat.start()..mat.end()];
             if (m == b"document." || m == b"window.")
                 && !data.get(mat.end()).is_some_and(u8::is_ascii_lowercase)
+            {
+                continue;
+            }
+            // `start WScript.exe x.vbs` is a batch file launching the host, not
+            // VBScript calling it; the object model is `WScript.Echo`,
+            // `WScript.CreateObject`, never `.exe`.
+            if m == b"WScript."
+                && data
+                    .get(mat.end()..mat.end() + 3)
+                    .is_some_and(|x| x.eq_ignore_ascii_case(b"exe"))
             {
                 continue;
             }
@@ -540,11 +589,27 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
         }
     }
 
-    let lang = best_lang?;
+    let mut lang = best_lang?;
 
     // Must meet threshold
     if best_score < THRESHOLD {
         return None;
+    }
+
+    // Objective-C is C plus directives C never has, so every `#include` in a
+    // `.m` scores for C and a large file drowns the handful of `@interface`
+    // lines. Any conclusive Objective-C directive settles it.
+    let objc = scores[Lang::ObjectiveC.idx()];
+    if lang == Lang::C && objc >= THRESHOLD {
+        lang = Lang::ObjectiveC;
+        best_score = objc;
+        // Still ambiguous against any language other than its own C base.
+        second_score = LANGS
+            .iter()
+            .filter(|l| !matches!(l, Lang::C | Lang::ObjectiveC))
+            .map(|l| scores[l.idx()])
+            .max()
+            .unwrap_or(0);
     }
 
     // Ambiguity: if the second-best is close (within 60%), bail
@@ -627,8 +692,13 @@ const CODE_PUNCT: &[u8] = b"{}[]();=<>$#@\\|&*";
 /// is full of them -- the DOS sample that prompted this sits at 14% -- so a
 /// small threshold separates the two decisively without judging encodings.
 fn looks_like_binary(head: &[u8]) -> bool {
-    const MIN_BYTES: usize = 64;
+    const MIN_BYTES: usize = 8;
     const MAX_CONTROL_PERCENT: usize = 3;
+    // Below a line of text the percentage alone is one stray byte, so a short
+    // window needs a few control bytes outright. The 27-byte COM infectors
+    // (vxheaven's Virus.DOS.Trivial.27.m) carry ten; they used to be judged
+    // too short to call and stayed Objective-C.
+    const MIN_CONTROL_SHORT: usize = 3;
     if head.len() < MIN_BYTES {
         return false;
     }
@@ -637,6 +707,7 @@ fn looks_like_binary(head: &[u8]) -> bool {
         .filter(|&&b| (b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r')) || b == 0x7F)
         .count();
     control * 100 > head.len() * MAX_CONTROL_PERCENT
+        && (head.len() >= 64 || control >= MIN_CONTROL_SHORT)
 }
 
 /// Object code wearing a source extension (a DOS COM named `Burger.m` or
@@ -652,6 +723,12 @@ pub(crate) fn binary_not_source(data: &[u8]) -> bool {
     looks_like_binary(head) && !looks_like_utf16_text(head)
 }
 
+/// UTF-16 text, which the byte-oriented scorer cannot read. Content cannot
+/// judge it, so the extension stays the word on it.
+pub(crate) fn is_utf16_text(data: &[u8]) -> bool {
+    looks_like_utf16_text(&data[..data.len().min(SCAN_LIMIT)])
+}
+
 fn looks_like_utf16_text(head: &[u8]) -> bool {
     if head.starts_with(&[0xFF, 0xFE]) || head.starts_with(&[0xFE, 0xFF]) {
         return true;
@@ -662,7 +739,80 @@ fn looks_like_utf16_text(head: &[u8]) -> bool {
     let pairs = head.len() / 2;
     let nul_even = head.iter().step_by(2).filter(|&&b| b == 0).count();
     let nul_odd = head.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
-    nul_even * 5 > pairs * 4 || nul_odd * 5 > pairs * 4
+    // One lane of NULs beside a lane of characters. A zero-filled header
+    // (an Access database, a boot sector's padding) is NUL in both lanes and
+    // is not text -- it used to pass as UTF-16 and keep a `.c` name.
+    let mostly = |n: usize| n * 5 > pairs * 4;
+    let sparse = |n: usize| n * 5 < pairs;
+    (mostly(nul_even) && sparse(nul_odd)) || (mostly(nul_odd) && sparse(nul_even))
+}
+
+/// Whether the body carries any scored token of `ft`'s language. `false` for a
+/// language the table does not score.
+pub(crate) fn has_language_evidence(ft: FileType, data: &[u8]) -> bool {
+    let Some(lang) = Lang::from_file_type(ft) else {
+        return false;
+    };
+    let body = trim_ascii_start(data);
+    scan_scores(&body[..body.len().min(SCAN_LIMIT)])[lang.idx()] > 0
+}
+
+/// C statement structure: statements ended with `;` alongside braces, a C
+/// comment, or a preprocessor line. Objective-C is a superset of C, so a `.m`
+/// holding plain C (`int main(...) { GoFunc(); }`) is still what its name says;
+/// a MATLAB script, a hosts file, or a batch file under the same letter is not.
+pub(crate) fn looks_like_c_family(data: &[u8]) -> bool {
+    let head = &data[..data.len().min(SCAN_LIMIT)];
+    let statement_end = head
+        .split(|&b| b == b'\n')
+        .any(|line| line.trim_ascii_end().ends_with(b";"));
+    statement_end
+        && (head.contains(&b'{')
+            || contains(head, b"/*")
+            || contains(head, b"//")
+            || head
+                .split(|&b| b == b'\n')
+                .any(|l| trim_ascii_start(l).first() == Some(&b'#')))
+}
+
+/// Content that contradicts a source-language extension, and what it is
+/// instead. The extension is the last word, not the first: `Trojan.BAT.Looper.t`
+/// is a batch file whatever Perl's `.t` says, and `Exploit.JS.RealPlr.ko` is a
+/// page. Two ways to be contradicted:
+///
+/// * the body opens as markup, which no source language (bar the template
+///   ones, which stay with their extension) begins with;
+/// * the scorer names batch or VBScript outright and finds not one token of
+///   the claimed language. Only those two: their conclusive tokens (`@echo`,
+///   `WScript.`) occur nowhere else, while a weaker win -- JavaScript over an
+///   nmap `.lua` library, Kotlin over a venv's `Activate.ps1` -- is the token
+///   fight the extension exists to settle. A claimed language the table does
+///   not score cannot be judged this way, so its extension stands.
+pub(crate) fn contradicts_extension(ext: FileType, data: &[u8]) -> Option<FileType> {
+    // Template languages open with markup by design, and Scala has XML
+    // literals; their extensions stand.
+    if matches!(
+        ext,
+        FileType::Php
+            | FileType::Asp
+            | FileType::Jsp
+            | FileType::Cfml
+            | FileType::Html
+            | FileType::Scala
+    ) {
+        return None;
+    }
+    let body = trim_ascii_start(data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(data));
+    if body.first() == Some(&b'<') && looks_like_html(data) {
+        return Some(FileType::Html);
+    }
+    let claimed = Lang::from_file_type(ext)?;
+    let found = detect_from_content(data)?;
+    if found == ext || !matches!(found, FileType::Batch | FileType::Vbs) {
+        return None;
+    }
+    let head = &body[..body.len().min(SCAN_LIMIT)];
+    (scan_scores(head)[claimed.idx()] == 0).then_some(found)
 }
 
 fn looks_like_prose(head: &[u8]) -> bool {
@@ -927,12 +1077,7 @@ pub(crate) fn unmistakable(data: &[u8]) -> Option<FileType> {
     {
         return Some(FileType::Cfml);
     }
-    if contains_ci(head, b"on *:text:")
-        || contains_ci(head, b"on *:join:")
-        || contains_ci(head, b"on *:part:")
-        || contains_ci(head, b"on 1:text:")
-        || contains_ci(head, b"on 1:join:")
-    {
+    if looks_like_mirc(head) {
         return Some(FileType::Mirc);
     }
     if contains(head, b"^on ") || contains(head, b"^alias ") {
@@ -951,11 +1096,179 @@ pub(crate) fn unmistakable(data: &[u8]) -> Option<FileType> {
     None
 }
 
+/// mIRC events a remote script handles. The `on <level>:<EVENT>:` header is
+/// mIRC's own syntax; the level varies (`1`, `10`, `*`, `@1`) and so does the
+/// event, and matching only `on 1:TEXT:` left `on 10:TEXT:` and
+/// `on 1:START:` worms typed from their `.a` / `.m` variant letter.
+const MIRC_EVENTS: &[&[u8]] = &[
+    b"action",
+    b"active",
+    b"agent",
+    b"ban",
+    b"chat",
+    b"close",
+    b"connect",
+    b"ctcpreply",
+    b"dccserver",
+    b"deop",
+    b"dehelp",
+    b"devoice",
+    b"dialog",
+    b"disconnect",
+    b"error",
+    b"exit",
+    b"filercvd",
+    b"filesent",
+    b"getfail",
+    b"help",
+    b"hotlink",
+    b"input",
+    b"invite",
+    b"join",
+    b"keydown",
+    b"kick",
+    b"load",
+    b"logon",
+    b"mode",
+    b"nick",
+    b"notice",
+    b"notify",
+    b"op",
+    b"open",
+    b"part",
+    b"ping",
+    b"quit",
+    b"rawmode",
+    b"sendfail",
+    b"serv",
+    b"signal",
+    b"snotice",
+    b"sockclose",
+    b"socklisten",
+    b"sockopen",
+    b"sockread",
+    b"sockwrite",
+    b"start",
+    b"text",
+    b"topic",
+    b"udpread",
+    b"unload",
+    b"unotify",
+    b"usermode",
+    b"voice",
+];
+
+/// Identifiers only mIRC's scripting language has: `$+` concatenation and the
+/// file built-ins. ircII shares the `alias name {` form but none of these.
+const MIRC_IDENTIFIERS: &[&[u8]] = &[
+    b" $+ ",
+    b"$exists(",
+    b"$lines(",
+    b"$mircdir",
+    b"$findfile(",
+    b"$read(",
+    b".timer",
+];
+
+/// A mIRC remote script: an `on <level>:<EVENT>:` handler at the start of a
+/// line, an `alias name {` block written with mIRC identifiers, or the
+/// `[script]` / `[aliases]` INI mIRC saves scripts as, whose lines are
+/// numbered `n0=`, `n1=`.
+fn looks_like_mirc(head: &[u8]) -> bool {
+    // vxheaven's Trojan.IRC.Nullpy is all aliases; the one batch token in it,
+    // `@echo off`, is a line the script writes into the `.bat` it drops, and
+    // it was typed batch.
+    let alias_block = head
+        .split(|&b| b == b'\n')
+        .any(|line| is_mirc_alias_header(trim_ascii_start(line)));
+    if alias_block && MIRC_IDENTIFIERS.iter().any(|id| contains_ci(head, id)) {
+        return true;
+    }
+    for section in [&b"[script]"[..], b"[aliases]", b"[variables]", b"[users]"] {
+        if let Some(at) = find_ci(head, section) {
+            let rest = &head[at + section.len()..];
+            let rest = trim_ascii_start(rest);
+            if rest.starts_with(b"n0=") {
+                return true;
+            }
+        }
+    }
+    head.split(|&b| b == b'\n').any(|line| {
+        let mut line = trim_ascii_start(line);
+        // A saved script prefixes every line with its number: `n12=on ...`.
+        if line.first() == Some(&b'n') {
+            let digits = line[1..].iter().take_while(|b| b.is_ascii_digit()).count();
+            if digits > 0 && line.get(1 + digits) == Some(&b'=') {
+                line = trim_ascii_start(&line[2 + digits..]);
+            }
+        }
+        is_mirc_event_header(line)
+    })
+}
+
+/// `alias name {` -- a named block definition.
+fn is_mirc_alias_header(line: &[u8]) -> bool {
+    if line.len() < 6 || !line[..6].eq_ignore_ascii_case(b"alias ") {
+        return false;
+    }
+    let rest = trim_ascii_start(&line[6..]);
+    let name_len = rest
+        .iter()
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+        .count();
+    name_len > 0 && trim_ascii_start(&rest[name_len..]).first() == Some(&b'{')
+}
+
+/// `on 1:TEXT:`, `on *:JOIN:`, `on @10:PART:`, `ctcp 1:VERSION:`.
+fn is_mirc_event_header(line: &[u8]) -> bool {
+    let rest = if line.len() >= 3 && line[..3].eq_ignore_ascii_case(b"on ") {
+        &line[3..]
+    } else {
+        return false;
+    };
+    let level_len = rest
+        .iter()
+        .take_while(|&&b| {
+            b.is_ascii_digit() || matches!(b, b'*' | b'@' | b'!' | b'+' | b'&' | b'^' | b'$')
+        })
+        .count();
+    if level_len == 0 || level_len > 6 || rest.get(level_len) != Some(&b':') {
+        return false;
+    }
+    let event = &rest[level_len + 1..];
+    let word_len = event.iter().take_while(|b| b.is_ascii_alphabetic()).count();
+    word_len > 0
+        && event.get(word_len) == Some(&b':')
+        && MIRC_EVENTS
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(&event[..word_len]))
+}
+
+fn find_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle))
+}
+
 /// DOS COM has no header. `CD 21` is `INT 21h`, the DOS syscall, and it sits
 /// near the front of the infectors that were wearing a source extension.
 pub(crate) fn looks_like_dos_com(data: &[u8]) -> bool {
     let head = &data[..data.len().min(256)];
     head.windows(2).any(|w| w == [0xCD, 0x21])
+}
+
+/// Largest image DOS will load as a `.COM`: one 64 KiB segment minus the
+/// 256-byte PSP.
+pub(crate) const DOS_COM_MAX_SIZE: usize = 0xFF00;
+
+/// A headerless binary with no telling name that is still shaped like a DOS
+/// COM program. Stricter than [`looks_like_dos_com`] because nothing but the
+/// bytes vouches for it: the size bound is what keeps a large ciphertext or
+/// firmware blob with a chance `CD 21` near the front from becoming a program.
+pub(crate) fn looks_like_unnamed_dos_com(data: &[u8]) -> bool {
+    data.len() >= 16
+        && data.len() <= DOS_COM_MAX_SIZE
+        && binary_not_source(data)
+        && looks_like_dos_com(data)
 }
 
 fn looks_like_asp_directive(head: &[u8]) -> bool {
