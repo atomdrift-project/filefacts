@@ -650,6 +650,7 @@ pub const CATALOG: &[&str] = &[
     "pdf.trailer_count",
     "pdf.trailing_bytes_after_eof",
     "pdf.unreferenced_object_count",
+    "pdf.upload_directory_uri_count",
     "pdf.uri_action_count",
     "pdf.uri_actions_per_page",
     "pdf.visible_object_count",

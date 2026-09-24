@@ -298,6 +298,7 @@ pub(super) fn extract(
     actions.extend(objstm_actions(&objstm_text));
     let uri_action_count = action_count_by_kind(&actions, "uri");
     let javascript_action_count = action_count_by_kind(&actions, "javascript");
+    let upload_directory_uri_count = count_upload_directory_uris(&actions);
     if !actions.is_empty() {
         metrics.insert(metric!("pdf.action_count"), actions.len() as f64);
         values.insert("pdf.actions", JsonValue::Array(actions));
@@ -310,6 +311,12 @@ pub(super) fn extract(
     }
     if uri_action_count > 0 {
         metrics.insert(metric!("pdf.uri_action_count"), f64::from(uri_action_count));
+    }
+    if upload_directory_uri_count > 0 {
+        metrics.insert(
+            metric!("pdf.upload_directory_uri_count"),
+            f64::from(upload_directory_uri_count),
+        );
     }
 
     // Full-content JavaScript payloads — one entry per `/JS` site
@@ -1381,6 +1388,29 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// URI actions whose path is a CMS upload directory (`/wp-content/uploads/`,
+/// `/system/files/webform/`). One such citation is ordinary; a doorway is
+/// built out of many of them.
+fn count_upload_directory_uris(actions: &[JsonValue]) -> u32 {
+    let mut n = 0_u32;
+    for action in actions {
+        let Some(obj) = action.as_object() else {
+            continue;
+        };
+        if obj.get("kind").and_then(JsonValue::as_str) != Some("uri") {
+            continue;
+        }
+        let Some(snippet) = obj.get("snippet").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let lower = snippet.to_ascii_lowercase();
+        if lower.contains("/wp-content/uploads/") || lower.contains("/system/files/webform/") {
+            n = n.saturating_add(1);
+        }
+    }
+    n
+}
+
 /// Count action entries from `scan_actions` whose `kind` matches.
 /// Used to surface `pdf.javascript_action_count` and
 /// `pdf.uri_action_count` from the same action table the kv view
@@ -1978,6 +2008,10 @@ fn derive_form_field_metrics(fields: &[JsonValue], metrics: &mut Metrics) {
             .and_then(JsonValue::as_str)
             .unwrap_or("")
             .to_string();
+        let field_type = obj
+            .and_then(|o| o.get("field_type"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or("");
         let rect = obj
             .and_then(|o| o.get("rect"))
             .and_then(JsonValue::as_str)
@@ -1999,7 +2033,9 @@ fn derive_form_field_metrics(fields: &[JsonValue], metrics: &mut Metrics) {
                 .or_insert(0) += 1;
         }
         if let Some(r) = parse_rect(&rect) {
-            if r == [0.0, 0.0, 0.0, 0.0] {
+            // A signature widget with no appearance box is how an invisible
+            // certification is stored. It is not a hidden payload field.
+            if r == [0.0, 0.0, 0.0, 0.0] && !field_type.eq_ignore_ascii_case("Sig") {
                 hidden_zero_rect += 1;
             }
             rects.push(r);
@@ -2510,6 +2546,26 @@ mod tests {
             %%EOF";
         let (_, m) = extract_pdf(pdf);
         assert_eq!(m.get("pdf.duplicate_form_rect_count"), Some(1.0));
+    }
+
+    #[test]
+    fn signature_zero_rect_is_not_a_hidden_field() {
+        let pdf = b"%PDF-1.4\n\
+            10 0 obj << /Subtype /Widget /T (Signature1) /FT /Sig /Rect [0 0 0 0] >> endobj\n\
+            %%EOF";
+        let (_, m) = extract_pdf(pdf);
+        assert_eq!(m.get("pdf.hidden_zero_rect_field_count"), Some(0.0));
+    }
+
+    #[test]
+    fn upload_directory_uris_counted() {
+        let pdf = b"%PDF-1.7\n\
+3 0 obj << /S /URI /URI (https://events.example/wp-content/uploads/2017/12/slides.pdf) >> endobj\n\
+4 0 obj << /S /URI /URI (https://example.invalid/system/files/webform/x) >> endobj\n\
+5 0 obj << /S /URI /URI (https://kernel.org/doc/html/latest/bpf/verifier.html) >> endobj\n\
+%%EOF";
+        let (_, m) = extract_pdf(pdf);
+        assert_eq!(m.get("pdf.upload_directory_uri_count"), Some(2.0));
     }
 
     #[test]
