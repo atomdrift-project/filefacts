@@ -52,7 +52,12 @@ const RIZIN_MEMORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Per-process byte cap on a rizin subprocess's stdout. Mirrors
 /// cleave's defence: pathological inputs can produce gigabytes of
 /// JSON; we kill the process group on overflow and record the reason.
-const MAX_SUBPROCESS_OUTPUT: usize = 100 * 1024 * 1024;
+///
+/// 200 MiB, doubled from 100 MiB: a 75 MB Go Terraform provider (~84k
+/// functions) overflowed 100 MiB in `aflj` alone, and an overflow discards
+/// every rizin fact for the binary, so its function names and call edges
+/// were invisible to rules.
+const MAX_SUBPROCESS_OUTPUT: usize = 200 * 1024 * 1024;
 /// How long to wait for the stdout drain thread after the child is known dead
 /// before abandoning it. The drain normally returns the instant the last write
 /// handle closes; this bound exists only so a handle we cannot reach (one an
@@ -78,12 +83,13 @@ const RIZIN_METRICS_SCRIPT_PE_X86: &str =
 /// [`analysis_script`].
 const RIZIN_METRICS_SCRIPT_PRELUDE: &str = "iij; echo ===SEP===; iEj; echo ===SEP===; aa; aac; aap; echo ===SEP===; aflj; echo ===SEP===; iSj";
 
-/// [`RIZIN_METRICS_SCRIPT`] with `aa; aac; aalg` in place of `aaa`, for Go
+/// [`RIZIN_METRICS_SCRIPT`] with `aalg; aa; aac` in place of `aaa`, for Go
 /// images — see [`analysis_script`]. `aalg` ("recover and analyze all Golang
 /// functions and strings") is the pclntab pass that `aaa` reaches only after
-/// its full discovery sweep, so seeding with `aa; aac` and calling it
-/// directly reproduces the whole function table without the sweep.
-const RIZIN_METRICS_SCRIPT_GO: &str = "iij; echo ===SEP===; iEj; echo ===SEP===; aa; aac; aalg; echo ===SEP===; aflj; echo ===SEP===; iSj";
+/// its full discovery sweep. It runs FIRST: `aalg` names the functions it
+/// creates but does not rename ones `aa`/`aac` already created as `fcn.*`,
+/// so the old `aa; aac; aalg` order left most of a Go binary unnamed.
+const RIZIN_METRICS_SCRIPT_GO: &str = "iij; echo ===SEP===; iEj; echo ===SEP===; aalg; aa; aac; echo ===SEP===; aflj; echo ===SEP===; iSj";
 
 /// Rizin switches that remove work whose output filefacts never consumes.
 /// Keep this separate from the input path so the contract is directly tested.
@@ -119,13 +125,14 @@ const RIZIN_METRICS_ARGS: &[&str] = &[
 ///   ELF and Mach-O samples (overdrive arm64 `.so` 3,646 of 3,741 in 2.8 s
 ///   vs 25 s; a 61 MB arm64 Mach-O 89,227 of 89,675 in 63 s vs 209 s).
 ///
-/// * Go images take `aa; aac; aalg`: `aalg` is rizin's dedicated pclntab
-///   pass, which `aaa` runs only at the end of its full sweep. Measured
-///   2026-09-19 on the two 8.6 MB Go toolchain binaries in the cyclotron
-///   corpus (`go/pkg/tool/linux_amd64/{fix,vet}`, rizin 0.8.2): byte-identical
-///   function tables — 6,980 and 6,947 functions, 6,923 and 6,892 pclntab
-///   names, every one at the same offset with the same name — in 8.97 s and
-///   10.96 s against 14.40 s and 14.30 s for `aaa`.
+/// * Go images take `aalg; aa; aac`: `aalg` is rizin's dedicated pclntab
+///   pass, which `aaa` runs only at the end of its full sweep. It must come
+///   first. Re-measured 2026-09-24 (rizin 0.8.2) on the local toolchain's
+///   `go/pkg/tool/linux_amd64/{vet,fix}`: `aa; aac; aalg` left 4,340 of
+///   7,065 and 4,396 of 7,140 functions as unnamed `fcn.*`; `aalg; aa; aac`
+///   left 58 and 60, for ~1 s more. On a 75 MB Go Terraform provider it
+///   left 1,105 unnamed instead of 22,777 — including the loader functions a
+///   rule needed — and ran faster (173 s vs 211 s).
 ///
 /// The non-Go fast scripts are approximations of `aaa`, accepted for the
 /// latency; the function count and CFG aggregates they feed can differ by
@@ -498,17 +505,17 @@ pub fn cache_fingerprint() -> String {
         return "rizin=none".to_string();
     }
     let version = rizin_version().unwrap_or("unknown");
-    // `opaque-v5`: Go recoveries come from `aa; aac; aalg`; PE x86/x86-64 from
+    // `opaque-v6`: Go recoveries come from `aalg; aa; aac`; PE x86/x86-64 from
     // `aa; aac`, everything else from `aa; aac; aap` with an `aaa` rerun under
     // the coverage floor (see `analysis_script`); cached extractions from an
     // earlier policy must not mix.
     if native_arch_only() {
         format!(
-            "rizin={version}|policy=opaque-v5|native={}",
+            "rizin={version}|policy=opaque-v6|native={}",
             std::env::consts::ARCH
         )
     } else {
-        format!("rizin={version}|policy=opaque-v5")
+        format!("rizin={version}|policy=opaque-v6")
     }
 }
 
@@ -698,8 +705,8 @@ fn recover_with_script(
     // Without this, `aflj` output on a binary with thousands of
     // discovered functions overflows the pipe buffer (~64 KB on
     // macOS), the child blocks on write, and `wait_with_output()`
-    // deadlocks waiting for exit. Capped at 100 MiB to bound the
-    // worst-case adversarial blob; matches cleave's defence. On
+    // deadlocks waiting for exit. Capped at MAX_SUBPROCESS_OUTPUT to
+    // bound the worst-case adversarial blob. On
     // overflow the reader thread SIGKILLs the rizin process group so
     // both pipes close promptly.
     let mut stdout_handle = match child.stdout.take() {
@@ -2015,6 +2022,76 @@ mod tests {
             assert_ne!(first, "rizin=none");
         } else {
             assert_eq!(first, "rizin=none");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Go recovery: `aalg` must run before discovery
+    // ------------------------------------------------------------------
+
+    /// `aalg` names only the functions it creates; one `aa`/`aac` already made
+    /// stays `fcn.*`. The Go script ran `aa; aac; aalg` and left most of every
+    /// Go binary unnamed. Host-independent guard on the order.
+    #[test]
+    fn go_script_runs_aalg_before_discovery() {
+        let (script, label) = analysis_script(b"", 1, true);
+        assert_eq!(label, "go-pclntab");
+        let aalg = script.find("aalg").expect("Go script runs aalg");
+        let aa = script.find("aa;").expect("Go script runs aa");
+        assert!(aalg < aa, "aalg must precede aa: {script}");
+        assert!(!script.contains("aa; aac; aalg"), "{script}");
+    }
+
+    /// End to end on a stripped Go binary whose functions carry long
+    /// module-qualified and generic names (see
+    /// tests/fixtures/go-pclntab-names.md). In the old order none of its five
+    /// `sealedpayload` functions came back named and 1,514 of 2,082 were
+    /// `fcn.*`. Skips when rizin is not installed.
+    #[test]
+    fn go_recovery_names_pclntab_functions() {
+        if !available() {
+            return;
+        }
+        let compressed = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/go-pclntab-names.zst"
+        ))
+        .expect("fixture present");
+        let bytes = zstd::decode_all(compressed.as_slice()).expect("fixture decompresses");
+        // This spawns a real rizin, so it needs the same protection as the
+        // shim tests: the reaper test SIGKILLs every registered process group
+        // and the timeout test installs a sub-second `RIZIN_TIMEOUT_SECS`, and
+        // either turns an in-flight recovery into `None`. `recover_with_bin`
+        // rather than `recover_with_symbols` for the same reason the shim
+        // tests use it — the public entry also honours a sibling's
+        // `scoped_disable()` (see `recover_with_script`).
+        let _lock = rizin_test_lock();
+        let bin = rizin_binary().expect("available() found rizin");
+        let rec = recover_with_bin(bin, &bytes, 0, true).expect("rizin recovers the fixture");
+
+        let total = rec.functions.len();
+        let unnamed = rec
+            .functions
+            .iter()
+            .filter(|f| f.name.starts_with("fcn."))
+            .count();
+        let ours: Vec<&str> = rec
+            .functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .filter(|n| n.contains("sealedpayload"))
+            .collect();
+
+        assert!(total > 1000, "recovered only {total} functions");
+        assert!(
+            unnamed * 10 < total,
+            "{unnamed} of {total} functions left as fcn.* -- is aalg running first?"
+        );
+        for want in ["OpenSealedPayload", "ReportLength", "mustValue"] {
+            assert!(
+                ours.iter().any(|n| n.contains(want)),
+                "{want} not recovered by name; got {ours:?}"
+            );
         }
     }
 

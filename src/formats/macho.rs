@@ -244,7 +244,7 @@ fn analyze_slice(macho: &MachO<'_>, slice_bytes: &[u8]) -> JsonValue {
         &mut slice_values,
         &mut throwaway_metrics,
     );
-    extract_symbols(macho, &mut throwaway_symbols);
+    extract_symbols(macho, slice_bytes, &mut throwaway_symbols);
     super::macho_hashes::emit(macho, &mut slice_values, &throwaway_symbols);
 
     let import_count = throwaway_symbols.iter_kind(SymbolKind::Import).count() as u64;
@@ -291,7 +291,7 @@ fn single_arch(
 ) {
     extract_sections(macho, bytes, metrics, sections_out);
     extract_header_and_loads(macho, bytes, values, metrics);
-    extract_symbols(macho, symbols_out);
+    extract_symbols(macho, bytes, symbols_out);
     super::macho_hashes::emit(macho, values, symbols_out);
     super::build_toolchain::from_macho(values, sections_out);
 }
@@ -303,7 +303,7 @@ fn single_arch(
 /// `macho-bind` for two-level-namespace bind imports (carrying the
 /// resolving dylib stem), `macho-trie` for exports recovered from
 /// the dyld export trie.
-fn extract_symbols(macho: &MachO<'_>, symbols_out: &mut crate::Symbols) {
+fn extract_symbols(macho: &MachO<'_>, bytes: &[u8], symbols_out: &mut crate::Symbols) {
     // Map each undefined external symbol to the file offset of its name in
     // the `LC_SYMTAB` string table. goblin's `Import::offset` is the dyld
     // *bind* slot (a pointer in `__got`/`__DATA`, binary data), but every
@@ -385,8 +385,18 @@ fn extract_symbols(macho: &MachO<'_>, symbols_out: &mut crate::Symbols) {
     // regular `Export` entries; we surface only the name here, with
     // forwarded-target handling left to a follow-up.
     // Same exposure as `imports()` above: the export trie is walked lazily and
-    // goblin indexes it unchecked (mach/exports.rs:99).
-    if let goblin_safe::GoblinOutcome::Ok(exports) = goblin_safe::catch(|| macho.exports()) {
+    // goblin indexes it unchecked (mach/exports.rs:99). Worse than a panic, a
+    // trie with an edge back to an ancestor walks forever, and `catch` cannot
+    // interrupt a walk that never faults — so the trie is checked for loops
+    // first and a malformed one yields no exports (see `validate_export_trie`).
+    let exports = match goblin_safe::validate_export_trie(macho, bytes) {
+        Ok(()) => goblin_safe::catch(|| macho.exports()),
+        Err(reason) => {
+            tracing::debug!(reason, "skipping Mach-O exports: malformed export trie");
+            goblin_safe::GoblinOutcome::Failed(goblin::error::Error::Malformed(reason))
+        }
+    };
+    if let goblin_safe::GoblinOutcome::Ok(exports) = exports {
         for exp in &exports {
             symbols_out.push(crate::Symbol::Export {
                 // Normalize the same Darwin `$VARIANT` suffix as imports: these

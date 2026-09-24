@@ -480,6 +480,136 @@ pub(crate) fn parse_mach(data: &[u8]) -> GoblinOutcome<Mach<'_>> {
     catch(|| Mach::parse(data))
 }
 
+/// Pre-validate the dyld export trie before `macho.exports()` walks it.
+///
+/// goblin's `ExportTrie::walk_trie` (mach/exports.rs, 0.10.7 and master)
+/// recurses into every child edge with no visited set, no depth bound and no
+/// requirement that a child lie past its parent. A trie whose edge points back
+/// at an ancestor therefore never terminates: each level clones the growing
+/// symbol prefix and pushes another `Export`, and the process is out of memory
+/// long before the stack is — measured at 16 GiB in 6 s on a 232 KiB arm64
+/// binary whose root edge pointed at offset 0 (llvm-objdump rejects the same
+/// file with "loop in children in export trie data"). Neither `catch` nor a
+/// panic hook can stop a walk that never faults.
+///
+/// This walks the same nodes goblin will, iteratively, and refuses the trie on
+/// the first revisited node or branch count the trie cannot hold. Anything
+/// goblin would itself reject (a truncated ULEB, an edge past the file) is
+/// waved through: goblin's own `Err` is the more precise report for those.
+///
+/// Mirrors goblin's selection of the trie: the last `LC_DYLD_INFO`,
+/// `LC_DYLD_INFO_ONLY` or `LC_DYLD_EXPORTS_TRIE` command wins.
+pub(crate) fn validate_export_trie(
+    macho: &goblin::mach::MachO<'_>,
+    bytes: &[u8],
+) -> Result<(), String> {
+    use goblin::mach::load_command::CommandVariant;
+    let mut location = None;
+    for lc in &macho.load_commands {
+        match &lc.command {
+            CommandVariant::DyldInfo(c) | CommandVariant::DyldInfoOnly(c) => {
+                location = Some((c.export_off as usize, c.export_size as usize));
+            }
+            CommandVariant::DyldExportsTrie(c) => {
+                location = Some((c.dataoff as usize, c.datasize as usize));
+            }
+            _ => {}
+        }
+    }
+    match location {
+        Some((start, size)) => validate_export_trie_bytes(bytes, start, size),
+        None => Ok(()),
+    }
+}
+
+/// [`validate_export_trie`] on an explicit trie range; the walk itself.
+fn validate_export_trie_bytes(bytes: &[u8], start: usize, size: usize) -> Result<(), String> {
+    // goblin's `new_impl` collapses an out-of-file range to an empty trie.
+    let Some(end) = start.checked_add(size).filter(|end| *end <= bytes.len()) else {
+        return Ok(());
+    };
+    // One flag per byte of the trie: a node is at least one byte, so the
+    // visited set is bounded by the trie's own size.
+    let mut visited = vec![false; size];
+    let mut pending = vec![start];
+    while let Some(node) = pending.pop() {
+        // goblin's `walk_trie` returns Ok for a node at or past the end.
+        if node >= end {
+            continue;
+        }
+        if std::mem::replace(&mut visited[node - start], true) {
+            return Err(format!(
+                "export trie loops back to node {:#x} (trie {:#x}..{:#x})",
+                node, start, end
+            ));
+        }
+        let mut offset = node;
+        let Some(terminal_size) = read_uleb128(bytes, &mut offset) else {
+            return Ok(());
+        };
+        let children_start = if terminal_size == 0 {
+            offset
+        } else {
+            let Some(next) = offset.checked_add(terminal_size as usize) else {
+                return Ok(());
+            };
+            next
+        };
+        offset = children_start;
+        let Some(nbranches) = read_uleb128(bytes, &mut offset) else {
+            return Ok(());
+        };
+        // Every edge takes at least one byte, so a count the remaining trie
+        // cannot hold is forged; goblin would only stop walking it once a read
+        // fell off the end of the file. This also bounds the loop below.
+        if nbranches > (end - offset.min(end)) as u64 {
+            return Err(format!(
+                "export trie node {:#x} claims {} branches in {} bytes",
+                node,
+                nbranches,
+                end - offset.min(end)
+            ));
+        }
+        for _ in 0..nbranches {
+            let Some(label_len) = bytes[offset..].iter().position(|&b| b == 0) else {
+                return Ok(());
+            };
+            offset += label_len + 1;
+            let Some(child) = read_uleb128(bytes, &mut offset) else {
+                return Ok(());
+            };
+            // goblin: `next_node = uleb + self.location.start`.
+            let Some(child) = usize::try_from(child)
+                .ok()
+                .and_then(|c| c.checked_add(start))
+            else {
+                return Ok(());
+            };
+            pending.push(child);
+        }
+    }
+    Ok(())
+}
+
+/// Read an unsigned LEB128 the way `scroll::Uleb128::read` does, returning
+/// `None` where goblin would return `Err` (truncated or over 64 bits).
+fn read_uleb128(bytes: &[u8], offset: &mut usize) -> Option<u64> {
+    let mut value: u64 = 0;
+    let mut shift = 0u32;
+    loop {
+        let byte = *bytes.get(*offset)?;
+        *offset += 1;
+        if shift >= 64 {
+            return None;
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+        shift += 7;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,5 +877,70 @@ mod tests {
             result,
             GoblinOutcome::Failed(_) | GoblinOutcome::Panicked(_)
         ));
+    }
+
+    /// A two-node trie as a linker emits it: a non-terminal root with one
+    /// edge `_a` to a terminal leaf (flags 0, address 0x10, no children).
+    const WELL_FORMED_TRIE: &[u8] = &[
+        0x00, 0x01, b'_', b'a', 0x00, 0x06, // root @0: 1 branch, child @6
+        0x02, 0x00, 0x10, 0x00, // leaf @6: terminal, no children
+    ];
+
+    #[test]
+    fn export_trie_accepts_well_formed() {
+        assert!(validate_export_trie_bytes(WELL_FORMED_TRIE, 0, WELL_FORMED_TRIE.len()).is_ok());
+        // Embedded past a header, as in a real file.
+        let mut file = vec![0xAAu8; 64];
+        file.extend_from_slice(WELL_FORMED_TRIE);
+        assert!(validate_export_trie_bytes(&file, 64, WELL_FORMED_TRIE.len()).is_ok());
+    }
+
+    /// The leptris shape: the root's only edge points back at the root, so
+    /// goblin's walk never ends. llvm-objdump: "loop in children in export
+    /// trie data at node: 0x0 back to node: 0x0".
+    #[test]
+    fn export_trie_rejects_root_self_loop() {
+        let trie = [0x00, 0x01, b'_', b'a', 0x00, 0x00];
+        let err = validate_export_trie_bytes(&trie, 0, trie.len()).expect_err("loop must trip");
+        assert!(err.contains("loops back"), "unexpected reason: {err}");
+    }
+
+    #[test]
+    fn export_trie_rejects_deep_cycle() {
+        // root -> leaf, and the leaf (terminal with one child) points at root.
+        let trie = [
+            0x00, 0x01, b'_', b'a', 0x00, 0x06, // root @0 -> @6
+            0x02, 0x00, 0x10, 0x01, b'b', 0x00, 0x00, // leaf @6, 1 child -> @0
+        ];
+        assert!(validate_export_trie_bytes(&trie, 0, trie.len()).is_err());
+    }
+
+    #[test]
+    fn export_trie_rejects_forged_branch_count() {
+        // Root claims 100 branches in a 6-byte trie.
+        let trie = [0x00, 0x64, b'_', b'a', 0x00, 0x06];
+        let err = validate_export_trie_bytes(&trie, 0, trie.len()).expect_err("count must trip");
+        assert!(err.contains("branches"), "unexpected reason: {err}");
+    }
+
+    #[test]
+    fn export_trie_waves_through_what_goblin_rejects() {
+        // Range past the file: goblin treats it as an empty trie.
+        assert!(validate_export_trie_bytes(WELL_FORMED_TRIE, 4, 100).is_ok());
+        assert!(validate_export_trie_bytes(&[], 0, 0).is_ok());
+        // Truncated ULEB / label: goblin's own Err is the report.
+        assert!(validate_export_trie_bytes(&[0x00, 0x01, b'_'], 0, 3).is_ok());
+        assert!(validate_export_trie_bytes(&[0x80], 0, 1).is_ok());
+    }
+
+    #[test]
+    fn uleb128_matches_scroll() {
+        let mut off = 0;
+        assert_eq!(read_uleb128(&[0xE5, 0x8E, 0x26], &mut off), Some(624_485));
+        assert_eq!(off, 3);
+        let mut off = 0;
+        assert_eq!(read_uleb128(&[0x80], &mut off), None);
+        let mut off = 0;
+        assert_eq!(read_uleb128(&[0xff; 11], &mut off), None);
     }
 }

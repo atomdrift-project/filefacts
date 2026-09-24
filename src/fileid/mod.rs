@@ -2581,6 +2581,19 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
         assert_detect("prog.bin", &com, FileType::DosCom);
     }
 
+    /// Size alone is not enough: a small binary with no `INT 21h` near the
+    /// front stays what it was, so an arbitrary short blob is not a program.
+    #[test]
+    fn small_binary_without_int21_is_not_dos_com() {
+        let mut blob = vec![0x90u8; 80];
+        for i in (0..80).step_by(8) {
+            blob[i] = 0x01;
+        }
+        assert_detect("prog.bin", &blob, FileType::Data);
+        let det = detect(Path::new("prog"), &blob);
+        assert!(det.is_none_or(|d| d.file_type != FileType::DosCom));
+    }
+
     /// The same bytes past the 64 KiB COM limit are not a COM program: that is
     /// how a ciphertext or firmware blob with a chance `CD 21` stays data.
     #[test]
