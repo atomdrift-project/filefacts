@@ -590,7 +590,9 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         // naming them keeps a release directory out of the unknown bucket.
         "sha256sum" | "sha512sum" | "sha1sum" | "md5sum" | "sha256" | "sha512" | "checksum"
         | "checksums" => Some(FileType::Text),
-        "txt" | "text" | "b64" | "base64" => Some(FileType::Text),
+        "txt" | "text" | "b64" | "base64" | "rst" | "adoc" | "csv" | "tsv" | "log" => {
+            Some(FileType::Text)
+        }
         // Source maps are structured data sidecars. Keeping them as Data lets the
         // archive analyzer inspect both ordinary JSON maps and raw embedded
         // Base64 payloads instead of dropping them as unknown members.

