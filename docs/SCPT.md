@@ -70,8 +70,8 @@ Shared decoding accepts up to 4,096 literals and 8 MiB of input, with a
 256 KiB limit per literal. Output is capped at 4,096 strings and 8 MiB.
 Limits appear in `scpt.limits`; decoded results count toward `scpt.decoded`.
 
-Extraction currently requires `Fasd` at byte zero. Shebang-prefixed compiled
-scripts are not extracted, although the structural reader accepts the prefix.
+Extraction requires `Fasd` at byte zero or directly after a shebang line, so
+`#!/usr/bin/osascript`-prefixed compiled scripts are extracted too.
 
 String recovery currently recognizes five complete arithmetic decoder bodies,
 including their literal types, loop edges, and parameter counts. Recognition

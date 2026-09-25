@@ -135,7 +135,9 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"if [", Lang::Shell, 5),
     (b"case $", Lang::Shell, 5),
     (b"; then\n", Lang::Shell, 5),
+    (b"; then\r", Lang::Shell, 5),
     (b"; do\n", Lang::Shell, 5),
+    (b"; do\r", Lang::Shell, 5),
     (b" && curl ", Lang::Shell, 10),
     // Extensionless one-liners (`nohup curl -s https://… | bash`) carry no
     // shebang and no shell extension, so they used to stay Unknown and every
@@ -188,7 +190,9 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"use strict;", Lang::Perl, 10),
     (b"use warnings;", Lang::Perl, 10),
     (b"use strict\n", Lang::Perl, 10),
+    (b"use strict\r", Lang::Perl, 10),
     (b"use warnings\n", Lang::Perl, 10),
+    (b"use warnings\r", Lang::Perl, 10),
     (b"my $", Lang::Perl, 5),
     (b"chomp", Lang::Perl, 5),
     // ── PHP ──
@@ -333,6 +337,7 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"(ns ", Lang::Clojure, 10),
     (b":require ", Lang::Clojure, 10),
     (b":require\n", Lang::Clojure, 10),
+    (b":require\r", Lang::Clojure, 10),
     (b"#?(:clj", Lang::Clojure, 10),
     (b"#?(:cljs", Lang::Clojure, 10),
     (b"(let [", Lang::Clojure, 5),
@@ -372,6 +377,7 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"NSLog(@\"", Lang::ObjectiveC, 10),
     (b"alloc] init", Lang::ObjectiveC, 10),
     (b"@end\n", Lang::ObjectiveC, 5),
+    (b"@end\r", Lang::ObjectiveC, 5),
 ];
 
 struct AcScanner {
@@ -1354,6 +1360,15 @@ mod tests {
     fn shell_heuristic() {
         let data = b"export PATH=/usr/bin\nif [ -f /etc/foo ]; then\n  echo ok\nfi\n";
         assert_eq!(detect_from_content(data), Some(FileType::Shell));
+    }
+
+    /// Line-anchored tokens must score under CRLF endings too.
+    #[test]
+    fn crlf_line_tokens() {
+        let sh = b"if [ -f /etc/foo ]; then\r\n  echo ok\r\nfi\r\n";
+        assert_eq!(detect_from_content(sh), Some(FileType::Shell));
+        let pl = b"use strict\r\n;\r\nprint 1;\r\n";
+        assert_eq!(detect_from_content(pl), Some(FileType::Perl));
     }
 
     #[test]

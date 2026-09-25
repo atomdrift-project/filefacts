@@ -1641,6 +1641,17 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
             }
         }
 
+        // Node, Deno and Bun all run TypeScript, so a JavaScript-runtime
+        // shebang on a `.ts` file names the runtime, not another language.
+        let file_type = if source == DetectionSource::Shebang
+            && file_type == FileType::JavaScript
+            && ext_ft == Some(FileType::TypeScript)
+        {
+            FileType::TypeScript
+        } else {
+            file_type
+        };
+
         let ext_match = match ext_ft {
             Some(FileType::Yaml) if is_yaml_dialect(file_type) => ExtensionMatch::Consistent,
             Some(e) if e != file_type => ExtensionMatch::Different(e),
@@ -2183,6 +2194,27 @@ mod tests {
         assert_detect(
             "tool",
             b"#!/usr/bin/env node\nconsole.log('hi');\n",
+            FileType::JavaScript,
+        );
+    }
+
+    #[test]
+    fn javascript_runtime_shebang_on_typescript_stays_typescript() {
+        for shebang in [
+            "#!/usr/bin/env node",
+            "#!/usr/bin/env -S deno run",
+            "#!/usr/bin/env bun",
+        ] {
+            let data = format!("{shebang}\nconst x: number = 1;\n");
+            let det = detect(Path::new("cli.ts"), data.as_bytes()).unwrap();
+            assert_eq!(det.file_type, FileType::TypeScript, "{shebang}");
+            assert_eq!(det.source, DetectionSource::Shebang, "{shebang}");
+            assert!(!det.extension_mismatch(), "{shebang}");
+        }
+        // Without the extension, the runtime is all there is to go on.
+        assert_detect(
+            "cli",
+            b"#!/usr/bin/env node\nconst x = 1;\n",
             FileType::JavaScript,
         );
     }
@@ -2990,7 +3022,15 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
 
     #[test]
     fn freebsd_pkg_zstd_is_not_extension_mismatch() {
-        let data = zstd::encode_all(&b"+COMPACT_MANIFEST\0payload"[..], 3).unwrap();
+        let data = {
+            let mut tar = tar::Builder::new(Vec::new());
+            let mut h = tar::Header::new_ustar();
+            h.set_path("+COMPACT_MANIFEST").unwrap();
+            h.set_size(7);
+            h.set_cksum();
+            tar.append(&h, &b"payload"[..]).unwrap();
+            zstd::encode_all(&tar.into_inner().unwrap()[..], 3).unwrap()
+        };
         // FreeBSD `.pkg` (zstd tar) now carries its own ecosystem type; the
         // `.pkg`→macOS extension default is a benign refinement, suppressed at
         // the FileId level where consumers read it.

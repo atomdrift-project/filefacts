@@ -73,8 +73,14 @@ pub(super) fn extract(
     metrics: &mut Metrics,
     symbols: &mut Symbols,
 ) -> Result<(), Error> {
-    // Plaintext AppleScript retains the generic extraction path.
-    if !bytes.starts_with(b"Fasd") {
+    // Plaintext AppleScript retains the generic extraction path. A compiled
+    // script may carry a `#!/usr/bin/osascript` line ahead of its magic; the
+    // parser skips it, so only the gate needs to look past it.
+    let body = match bytes.strip_prefix(b"#!") {
+        Some(rest) => memchr::memchr(b'\n', rest).map_or(&[][..], |nl| &rest[nl + 1..]),
+        None => bytes,
+    };
+    if !body.starts_with(b"Fasd") {
         return Ok(());
     }
     let parsed = parser::parse(bytes).map_err(|e| Error::malformed("scpt", e))?;
@@ -319,6 +325,28 @@ mod tests {
                 {"reason": "stored text work limit reached"}
             ]))
         );
+    }
+
+    #[test]
+    fn shebang_prefixed_compiled_script_is_extracted() {
+        let mut bytes = b"#!/usr/bin/osascript\n".to_vec();
+        bytes.extend_from_slice(&parser::test_fixture());
+        let parsed = crate::open(&bytes).unwrap();
+        assert_eq!(parsed.fileid().file_type(), crate::FileType::AppleScript);
+        assert!(
+            parsed
+                .literals()
+                .iter()
+                .any(|s| s.text == "Hello World" && s.method.as_deref() == Some("scpt-literal"))
+        );
+    }
+
+    #[test]
+    fn shebang_prefixed_plaintext_is_not_parsed() {
+        let bytes = b"#!/usr/bin/osascript\ndo shell script \"id\"\n";
+        let parsed = crate::open(bytes).unwrap();
+        assert_eq!(parsed.fileid().file_type(), crate::FileType::AppleScript);
+        assert!(parsed.errors().is_empty());
     }
 
     #[test]

