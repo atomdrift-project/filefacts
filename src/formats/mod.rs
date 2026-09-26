@@ -29,6 +29,11 @@ pub(crate) struct ExtractCtx<'a> {
     pub(crate) sections: &'a mut Vec<Section>,
     pub(crate) symbols: &'a mut Symbols,
     pub(crate) errors: &'a mut Errors,
+    /// End of the executable image in file offsets, for formats whose
+    /// image extends past its last section (Mach-O `__LINKEDIT`, the ELF
+    /// section-header table). The `binary.*overlay*` metrics count only
+    /// bytes past both this and the last section. `None` = sections only.
+    pub(crate) image_end: &'a mut Option<u64>,
     /// File basename, when known — lets format-agnostic types (e.g. Shell)
     /// dispatch on a recognized filename such as `PKGBUILD`.
     pub(crate) basename: Option<&'a str>,
@@ -149,6 +154,7 @@ pub(crate) fn extract(
         sections,
         symbols,
         errors,
+        image_end,
         basename,
     } = ctx;
     // Every file gets the generic byte-level metrics. Format-specific
@@ -180,11 +186,13 @@ pub(crate) fn extract(
     let result = match file_type {
         FileType::AppleScript => scpt::extract(bytes, values, strings, metrics, symbols),
         FileType::Pe => pe::extract(bytes, values, strings, metrics, sections, symbols, errors),
-        FileType::Elf => elf::extract(bytes, values, strings, metrics, sections, symbols, errors),
+        FileType::Elf => elf::extract(
+            bytes, values, strings, metrics, sections, symbols, errors, image_end,
+        ),
         FileType::Wasm => wasm::extract(bytes, values, strings, metrics, sections, symbols, errors),
-        FileType::MachO => {
-            macho::extract(bytes, values, strings, metrics, sections, symbols, errors)
-        }
+        FileType::MachO => macho::extract(
+            bytes, values, strings, metrics, sections, symbols, errors, image_end,
+        ),
         // An APK is a zip: walk it for members, then read AndroidManifest.xml
         // and the v1 signature block for the android.* identity facts.
         FileType::ApkAndroid => {

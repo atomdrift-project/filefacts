@@ -1524,3 +1524,88 @@ fn iso_without_hidden_space_reports_no_slack() {
         Some("mkisofs")
     );
 }
+
+/// Deterministic high-entropy filler standing in for an appended payload.
+fn pseudo_random(len: usize) -> Vec<u8> {
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+/// `binary.overlay_size`/`binary.overlay_entropy` for `bytes`, asserting
+/// the entropy span starts exactly where the overlay does.
+fn overlay_of(bytes: &[u8]) -> Option<(u64, u64)> {
+    let parsed = open(bytes).unwrap();
+    let metrics = parsed.metrics();
+    let size = metrics.get("binary.overlay_size")? as u64;
+    assert_eq!(metrics.get("binary.has_overlay"), Some(1.0));
+    let entropy = metrics
+        .fact("binary.overlay_entropy")
+        .expect("overlay entropy");
+    assert_eq!(entropy.spans.len(), 1);
+    assert_eq!(entropy.spans[0].len, size);
+    Some((entropy.spans[0].offset, size))
+}
+
+/// Mach-O's last segment is `__LINKEDIT`, which has no sections but holds
+/// the symbol tables, dyld info and code signature through EOF. It is
+/// part of the image, not an overlay.
+#[test]
+fn macho_linkedit_is_not_an_overlay() {
+    let bytes = std::fs::read("tests/fixtures/test.macho").expect("Mach-O fixture present");
+    assert_eq!(overlay_of(&bytes), None);
+}
+
+/// Bytes appended past `__LINKEDIT` are still a real overlay.
+#[test]
+fn macho_bytes_past_linkedit_are_an_overlay() {
+    let mut bytes = std::fs::read("tests/fixtures/test.macho").expect("Mach-O fixture present");
+    let image_len = bytes.len() as u64;
+    bytes.extend(pseudo_random(4096));
+    assert_eq!(overlay_of(&bytes), Some((image_len, 4096)));
+    let parsed = open(&bytes).unwrap();
+    assert!(parsed.metrics().get("binary.overlay_entropy").unwrap() > 7.0);
+}
+
+/// A universal binary: the overlay is measured in whole-file offsets past
+/// the last slice's image, not against the slice-relative section offsets.
+#[test]
+fn fat_macho_overlay_is_past_the_last_slice() {
+    let slice = std::fs::read("tests/fixtures/test.macho").expect("Mach-O fixture present");
+    let slice_offset = 0x1000_u32;
+    let mut bytes = Vec::new();
+    bytes.extend(0xCAFE_BABE_u32.to_be_bytes());
+    bytes.extend(1_u32.to_be_bytes()); // nfat_arch
+    bytes.extend(0x0100_0007_u32.to_be_bytes()); // CPU_TYPE_X86_64
+    bytes.extend(3_u32.to_be_bytes()); // CPU_SUBTYPE_X86_64_ALL
+    bytes.extend(slice_offset.to_be_bytes());
+    bytes.extend((slice.len() as u32).to_be_bytes());
+    bytes.extend(12_u32.to_be_bytes()); // align 2^12
+    bytes.resize(slice_offset as usize, 0);
+    bytes.extend(&slice);
+    assert_eq!(open(&bytes).unwrap().fileid().file_type(), FileType::MachO);
+    assert_eq!(overlay_of(&bytes), None);
+
+    let image_len = bytes.len() as u64;
+    bytes.extend(pseudo_random(1000));
+    assert_eq!(overlay_of(&bytes), Some((image_len, 1000)));
+}
+
+/// The ELF section-header table sits after every section, at EOF; it is
+/// part of the image, not an overlay. The fixture carries 220 genuinely
+/// appended bytes past its table (e_shoff 21264 + 26 * 64 = 22928): only
+/// those are the overlay, and further appended bytes extend it.
+#[test]
+fn elf_overlay_starts_after_section_header_table() {
+    let mut bytes = std::fs::read("tests/fixtures/test.elf").expect("ELF fixture present");
+    assert_eq!(bytes.len(), 22928 + 220);
+    assert_eq!(overlay_of(&bytes), Some((22928, 220)));
+    bytes.extend(pseudo_random(2048));
+    assert_eq!(overlay_of(&bytes), Some((22928, 220 + 2048)));
+}

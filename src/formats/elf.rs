@@ -30,6 +30,7 @@ pub(super) fn extract(
     sections_out: &mut Vec<Section>,
     symbols_out: &mut crate::Symbols,
     errors_out: &mut Errors,
+    image_end: &mut Option<u64>,
 ) -> Result<(), Error> {
     // Wrap goblin parse in catch_unwind. ELF's dynamic-section
     // walker has panicked on malformed `DT_*` tables; `parse_elf`
@@ -64,6 +65,7 @@ pub(super) fn extract(
     elf_header(&elf, values);
     dynamic(&elf, values);
     sections(&elf, bytes, metrics, sections_out);
+    *image_end = Some(image_end_of(&elf));
     symbols(&elf, values, metrics, symbols_out);
     build_id(&elf, bytes, values, metrics);
     interpreter(&elf, values);
@@ -1916,6 +1918,41 @@ fn sections(elf: &Elf<'_>, bytes: &[u8], _metrics: &mut Metrics, sections_out: &
     }
 }
 
+/// File offset one past the last byte the image itself accounts for,
+/// beyond its sections: the ELF header, the program-header table, every
+/// segment's on-disk extent, and the section-header table — which the
+/// linker writes after all sections, at EOF. Only bytes past this are
+/// appended payload, i.e. an overlay. Declared extents are not clamped
+/// to the input: an end past EOF simply means there is no overlay.
+fn image_end_of(elf: &Elf<'_>) -> u64 {
+    let h = &elf.header;
+    let table_end = |off: u64, count: usize, entsize: u16| {
+        if off == 0 || count == 0 {
+            return 0;
+        }
+        off.saturating_add((count as u64).saturating_mul(u64::from(entsize)))
+    };
+    let mut end = u64::from(h.e_ehsize)
+        .max(table_end(
+            h.e_phoff,
+            elf.program_headers.len(),
+            h.e_phentsize,
+        ))
+        // `section_headers.len()` rather than `e_shnum`: with >= 0xff00
+        // sections the real count lives in section 0's `sh_size`.
+        .max(table_end(
+            h.e_shoff,
+            elf.section_headers.len(),
+            h.e_shentsize,
+        ));
+    for ph in &elf.program_headers {
+        if ph.p_filesz > 0 {
+            end = end.max(ph.p_offset.saturating_add(ph.p_filesz));
+        }
+    }
+    end
+}
+
 fn section_entropy(bytes: &[u8], offset: u64, size: u64) -> f64 {
     if size == 0 {
         return 0.0;
@@ -2414,6 +2451,7 @@ mod tests {
             &mut sections,
             &mut symbols,
             &mut errors,
+            &mut None,
         );
         (v, s, m)
     }
@@ -2651,6 +2689,7 @@ mod tests {
             &mut sections,
             &mut symbols,
             &mut errors,
+            &mut None,
         );
         symbols
     }

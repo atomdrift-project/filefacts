@@ -684,6 +684,7 @@ fn run_extraction(
     let mut metrics = Metrics::new();
     let mut archive_members = Vec::new();
     let mut sections: Vec<Section> = Vec::new();
+    let mut image_end: Option<u64> = None;
     let mut symbols = Symbols::new();
     let mut errors = Errors::new();
     if let Some(name) = basename {
@@ -731,6 +732,7 @@ fn run_extraction(
                 sections: &mut sections,
                 symbols: &mut symbols,
                 errors: &mut errors,
+                image_end: &mut image_end,
                 basename,
             },
         )
@@ -771,7 +773,7 @@ fn run_extraction(
     // `sections.*` path convention.
     if !sections.is_empty() {
         emit_section_metrics(&sections, &mut metrics);
-        emit_binary_aggregates(&sections, &strings, bytes, &mut metrics);
+        emit_binary_aggregates(&sections, &strings, bytes, image_end, &mut metrics);
     }
 
     // Per-kind counts for ergonomic rule filtering. Derived from the
@@ -1095,8 +1097,13 @@ fn is_well_known_section_name(name: &str) -> bool {
 ///   simple structural ratios over `Sections.file_size`.
 /// - `binary.has_overlay`, `binary.overlay_size`,
 ///   `binary.overlay_ratio`, `binary.overlay_entropy` — bytes beyond
-///   the last on-disk section extent (PE installer droppers, ELF
-///   self-extractors).
+///   the last on-disk section extent and beyond `image_end` (PE installer
+///   droppers, ELF self-extractors). `image_end` is the format's own end
+///   of image where that lies past the sections: Mach-O's section-less
+///   `__LINKEDIT` segment (symbols, dyld info, code signature) and the
+///   ELF section-header table would otherwise read as an overlay on
+///   every binary. PE passes `None`: its overlay stays "past the last
+///   section's raw data", Authenticode table included.
 /// Cap on located high-entropy string spans. The count metric is exact; the
 /// spans are a bounded sample for localisation.
 const MAX_STRING_SPANS: usize = 64;
@@ -1105,6 +1112,7 @@ fn emit_binary_aggregates(
     sections: &Sections,
     strings: &output::Strings,
     bytes: &[u8],
+    image_end: Option<u64>,
     metrics: &mut Metrics,
 ) {
     // -- Strings ------------------------------------------------------
@@ -1242,14 +1250,16 @@ fn emit_binary_aggregates(
     }
 
     // -- Overlay ------------------------------------------------------
-    // Last on-disk extent across sections. Anything past it is
-    // appended payload (NSIS installer stubs, self-extractors).
+    // Last on-disk extent across sections and the format's own image
+    // end. Anything past it is appended payload (NSIS installer stubs,
+    // self-extractors).
     let last_extent = sections
         .as_slice()
         .iter()
         .map(|s| s.file_offset.saturating_add(s.file_size))
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(image_end.unwrap_or(0));
     if last_extent > 0 && file_size > last_extent {
         let overlay_size = file_size - last_extent;
         metrics.insert(metric!("binary.has_overlay"), 1.0);

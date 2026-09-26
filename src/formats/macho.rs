@@ -31,6 +31,7 @@ pub(super) fn extract(
     sections_out: &mut Vec<Section>,
     symbols_out: &mut crate::Symbols,
     errors_out: &mut Errors,
+    image_end: &mut Option<u64>,
 ) -> Result<(), Error> {
     // Wrap goblin parse in catch_unwind. Fat-header arithmetic
     // overflow on malformed Mach-O has historically panicked
@@ -73,10 +74,11 @@ pub(super) fn extract(
     let (go_pclntab, go_rodata) = match parsed {
         Mach::Binary(macho) => {
             single_arch(&macho, bytes, values, metrics, sections_out, symbols_out);
+            *image_end = Some(image_end_of(&macho));
             macho_go_sections(&macho)
         }
         Mach::Fat(fat) => {
-            fat_binary(bytes, &fat, values, metrics, sections_out, symbols_out);
+            *image_end = fat_binary(bytes, &fat, values, metrics, sections_out, symbols_out);
             if crate::rizin::native_arch_only() {
                 native_rizin_range = native_slice_range(bytes, &fat);
             }
@@ -165,6 +167,9 @@ fn native_slice_range(bytes: &[u8], fat: &mach::MultiArch<'_>) -> Option<(usize,
     None
 }
 
+/// Analyse every slice of a fat binary; returns the end of the last
+/// slice's image in whole-file offsets (see [`image_end_of`]), or `None`
+/// when no slice parsed.
 fn fat_binary(
     bytes: &[u8],
     fat: &mach::MultiArch<'_>,
@@ -172,8 +177,9 @@ fn fat_binary(
     metrics: &mut Metrics,
     sections_out: &mut Vec<Section>,
     symbols_out: &mut crate::Symbols,
-) {
+) -> Option<u64> {
     let mut archs: Vec<JsonValue> = Vec::new();
+    let mut image_end: Option<u64> = None;
     for (idx, slice) in fat.iter_arches().enumerate() {
         let Ok(arch) = slice else { continue };
         // `arch.offset` and `arch.size` come from the fat header — on
@@ -191,6 +197,8 @@ fn fat_binary(
         let Ok(macho) = MachO::parse(slice_bytes, 0) else {
             continue;
         };
+        let slice_end = u64::from(arch.offset).saturating_add(image_end_of(&macho));
+        image_end = image_end.max(Some(slice_end));
         // Every slice gets the same forensic analysis as a single-arch
         // binary: full header/load-command extraction, code signature,
         // similarity hashes, segments. The result lands in this
@@ -217,6 +225,75 @@ fn fat_binary(
     }
     metrics.insert(metric!("macho.slice_count"), archs.len() as f64);
     values.insert("macho.slices", JsonValue::Array(archs));
+    image_end
+}
+
+/// File offset one past the last byte the image itself accounts for:
+/// the load-command area, every segment's on-disk extent (including
+/// `__LINKEDIT`, which has no sections yet holds the symbol/string
+/// tables, dyld info and the code signature), and the linkedit blobs and
+/// relocation tables the load commands point at directly (an `MH_OBJECT`
+/// has no `__LINKEDIT` segment, so its symtab sits past every segment).
+/// Only bytes past this are appended payload, i.e. an overlay.
+///
+/// Offsets are relative to the start of this Mach-O (a fat slice's
+/// start, not the fat file's). Declared extents are not clamped to the
+/// input: an end past EOF simply means there is no overlay.
+fn image_end_of(macho: &MachO<'_>) -> u64 {
+    use goblin::mach::load_command::CommandVariant as Cmd;
+
+    fn extent(off: u32, count: u32, entry_size: u64) -> u64 {
+        if count == 0 {
+            return 0;
+        }
+        u64::from(off).saturating_add(u64::from(count).saturating_mul(entry_size))
+    }
+    fn blob(off: u32, size: u32) -> u64 {
+        extent(off, size, 1)
+    }
+
+    let header_size: u64 = if macho.is_64 { 32 } else { 28 };
+    let nlist_size: u64 = if macho.is_64 { 16 } else { 12 };
+    let mut end = header_size.saturating_add(u64::from(macho.header.sizeofcmds));
+    for segment in &macho.segments {
+        if segment.filesize > 0 {
+            end = end.max(segment.fileoff.saturating_add(segment.filesize));
+        }
+        // `MH_OBJECT` relocation entries (8 bytes each) live outside
+        // any segment.
+        if let Ok(sections) = segment.sections() {
+            for (section, _) in sections {
+                end = end.max(extent(section.reloff, section.nreloc, 8));
+            }
+        }
+    }
+    for lc in &macho.load_commands {
+        let blob_end = match &lc.command {
+            Cmd::Symtab(c) => extent(c.symoff, c.nsyms, nlist_size).max(blob(c.stroff, c.strsize)),
+            Cmd::Dysymtab(c) => extent(c.indirectsymoff, c.nindirectsyms, 4)
+                .max(extent(c.extrefsymoff, c.nextrefsyms, 4))
+                .max(extent(c.extreloff, c.nextrel, 8))
+                .max(extent(c.locreloff, c.nlocrel, 8)),
+            Cmd::DyldInfo(c) | Cmd::DyldInfoOnly(c) => blob(c.rebase_off, c.rebase_size)
+                .max(blob(c.bind_off, c.bind_size))
+                .max(blob(c.weak_bind_off, c.weak_bind_size))
+                .max(blob(c.lazy_bind_off, c.lazy_bind_size))
+                .max(blob(c.export_off, c.export_size)),
+            Cmd::CodeSignature(c)
+            | Cmd::SegmentSplitInfo(c)
+            | Cmd::FunctionStarts(c)
+            | Cmd::DataInCode(c)
+            | Cmd::DylibCodeSignDrs(c)
+            | Cmd::LinkerOptimizationHint(c)
+            | Cmd::DyldExportsTrie(c)
+            | Cmd::DyldChainedFixups(c) => blob(c.dataoff, c.datasize),
+            // LC_LINKER_OPTION shares goblin's LinkeditDataCommand shape
+            // but its payload is inline in the command, not in linkedit.
+            _ => 0,
+        };
+        end = end.max(blob_end);
+    }
+    end
 }
 
 /// Run the full single-arch extractor on a slice and return the
@@ -2045,6 +2122,7 @@ mod tests {
             &mut sections,
             &mut symbols,
             &mut errors,
+            &mut None,
         );
     }
 
@@ -2068,6 +2146,7 @@ mod tests {
             &mut sections,
             &mut symbols,
             &mut errors,
+            &mut None,
         );
         (v, s, m, symbols)
     }
@@ -2275,6 +2354,7 @@ mod tests {
             &mut sections,
             &mut symbols,
             &mut errors,
+            &mut None,
         )
         .unwrap();
         // The trivial test.macho fixture might have no exports but
