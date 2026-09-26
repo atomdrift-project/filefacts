@@ -140,6 +140,17 @@ pub(super) fn extract(
         JsonValue::Array(streams.iter().cloned().map(JsonValue::String).collect()),
     );
 
+    if kind == "msg" {
+        let attachments = msg_attachments(&mut comp, &streams);
+        metrics.insert(
+            metric!("office.msg.attachment_count"),
+            attachments.len() as f64,
+        );
+        if !attachments.is_empty() {
+            values.insert("office.msg.attachments", JsonValue::Array(attachments));
+        }
+    }
+
     let summary_data = read_stream_data(&mut comp, "\x05SummaryInformation");
     let summary_security_encrypted = summary_data
         .as_deref()
@@ -585,6 +596,205 @@ fn boundsheets(data: &[u8]) -> Vec<BoundSheet> {
         }
     }
     out
+}
+
+/// Storage-name prefix of an Outlook attachment object (MS-OXMSG §2.2.2).
+const MSG_ATTACH_STORAGE_PREFIX: &str = "__attach_version1.0_#";
+
+/// Attachments described per message. Outlook caps a message well below
+/// this; the bound only stops a hostile file from inflating the values tree.
+const MAX_MSG_ATTACHMENTS: usize = 64;
+
+/// Longest string property read for an attachment (filename, MIME type,
+/// content id). Real values are a few hundred bytes at most.
+const MAX_MSG_STRING_BYTES: u64 = 4096;
+
+/// `PidTagAttachMethod` value for an attached message (MS-OXCMSG §2.2.2.9).
+const ATTACH_EMBEDDED_MSG: u32 = 5;
+
+/// Describe the attachments of an Outlook `.msg` (MS-OXMSG): one object per
+/// top-level `__attach_version1.0_#XXXXXXXX` storage, carrying the
+/// properties a rule wants to key on without reading the payload.
+///
+/// - `filename` — `PidTagAttachLongFilename`, falling back to
+///   `PidTagAttachFilename` (8.3) and `PidTagDisplayName`, as written.
+/// - `extension` — lowercased suffix of `filename`, when it has one.
+/// - `mime` — `PidTagAttachMimeTag`; `content_id` — `PidTagAttachContentId`.
+/// - `size` — byte length of the `PidTagAttachDataBinary` stream.
+/// - `method` — `PidTagAttachMethod` (`by_value`, `embedded_message`, `ole`,
+///   ...); an embedded message or OLE object has no binary stream, its
+///   payload is the `__substg1.0_3701000D` storage.
+/// - `hidden` — `PidTagAttachmentHidden`, emitted only when set.
+///
+/// Attachments of an attached message live under that message's storage and
+/// are not listed here.
+fn msg_attachments<T: Read + std::io::Seek>(
+    comp: &mut cfb::CompoundFile<T>,
+    streams: &[String],
+) -> Vec<JsonValue> {
+    let storages: Vec<&String> = streams
+        .iter()
+        .filter(|p| {
+            p.strip_prefix('/').is_some_and(|name| {
+                name.starts_with(MSG_ATTACH_STORAGE_PREFIX) && !name.contains('/')
+            })
+        })
+        .take(MAX_MSG_ATTACHMENTS)
+        .collect();
+
+    let mut out = Vec::with_capacity(storages.len());
+    for storage in storages {
+        let mut obj = serde_json::Map::new();
+        let filename = ["3707", "3704", "3001"]
+            .iter()
+            .find_map(|id| read_msg_string(comp, storage, id));
+        if let Some(name) = filename {
+            if let Some(ext) = attachment_extension(&name) {
+                obj.insert("extension".into(), JsonValue::String(ext));
+            }
+            obj.insert("filename".into(), JsonValue::String(name));
+        }
+        if let Some(mime) = read_msg_string(comp, storage, "370E") {
+            obj.insert("mime".into(), JsonValue::String(mime));
+        }
+        if let Some(cid) = read_msg_string(comp, storage, "3712") {
+            obj.insert("content_id".into(), JsonValue::String(cid));
+        }
+        if let Ok(entry) = comp.entry(format!("{storage}/__substg1.0_37010102")) {
+            if entry.is_stream() {
+                obj.insert("size".into(), JsonValue::from(entry.len()));
+            }
+        }
+        let props = msg_attachment_properties(comp, storage);
+        let method = props.method.or_else(|| {
+            // Writers that omit the property still store an attached
+            // message / OLE object as a sub-storage.
+            comp.is_storage(format!("{storage}/__substg1.0_3701000D"))
+                .then_some(ATTACH_EMBEDDED_MSG)
+        });
+        if let Some(method) = method.and_then(attach_method_name) {
+            obj.insert("method".into(), JsonValue::String(method.into()));
+        }
+        if props.hidden {
+            obj.insert("hidden".into(), JsonValue::Bool(true));
+        }
+        out.push(JsonValue::Object(obj));
+    }
+    out
+}
+
+fn attach_method_name(method: u32) -> Option<&'static str> {
+    Some(match method {
+        0 => "none",
+        1 => "by_value",
+        2 => "by_reference",
+        4 => "by_reference_only",
+        5 => "embedded_message",
+        6 => "ole",
+        _ => return None,
+    })
+}
+
+/// Fixed-size properties read from an attachment's property stream.
+#[derive(Default)]
+struct MsgAttachmentProperties {
+    method: Option<u32>,
+    hidden: bool,
+}
+
+/// Parse `__properties_version1.0` of an attachment storage: an 8-byte
+/// reserved header, then 16-byte entries of `tag (u32) | flags (u32) |
+/// value (8 bytes)` (MS-OXMSG §2.4.2). Only fixed-width values are inline,
+/// which is all this reads.
+fn msg_attachment_properties<T: Read + std::io::Seek>(
+    comp: &mut cfb::CompoundFile<T>,
+    storage: &str,
+) -> MsgAttachmentProperties {
+    const PID_TAG_ATTACH_METHOD: u32 = 0x3705_0003;
+    const PID_TAG_ATTACHMENT_HIDDEN: u32 = 0x7FFE_000B;
+    const HEADER: usize = 8;
+    const ENTRY: usize = 16;
+    // An attachment carries a few dozen properties; bound the read anyway.
+    const MAX_BYTES: u64 = 64 * 1024;
+
+    let mut props = MsgAttachmentProperties::default();
+    let Ok(stream) = comp.open_stream(format!("{storage}/__properties_version1.0")) else {
+        return props;
+    };
+    let mut data = Vec::new();
+    if stream.take(MAX_BYTES).read_to_end(&mut data).is_err() {
+        return props;
+    }
+    for entry in data
+        .get(HEADER..)
+        .unwrap_or_default()
+        .as_chunks::<ENTRY>()
+        .0
+    {
+        let tag = read_u32_le(entry, 0);
+        let value = read_u32_le(entry, 8);
+        match tag {
+            PID_TAG_ATTACH_METHOD => props.method = Some(value),
+            PID_TAG_ATTACHMENT_HIDDEN => props.hidden = value & 0xFF != 0,
+            _ => {}
+        }
+    }
+    props
+}
+
+/// Read a string property stream `__substg1.0_<id><type>` of `storage`,
+/// preferring the Unicode (`001F`, UTF-16LE) spelling over the 8-bit
+/// (`001E`) one. NULs are stripped and surrounding whitespace trimmed;
+/// empty values read as absent.
+fn read_msg_string<T: Read + std::io::Seek>(
+    comp: &mut cfb::CompoundFile<T>,
+    storage: &str,
+    prop_id: &str,
+) -> Option<String> {
+    for (prop_type, wide) in [("001F", true), ("001E", false)] {
+        let Ok(stream) = comp.open_stream(format!("{storage}/__substg1.0_{prop_id}{prop_type}"))
+        else {
+            continue;
+        };
+        let mut data = Vec::new();
+        if stream
+            .take(MAX_MSG_STRING_BYTES)
+            .read_to_end(&mut data)
+            .is_err()
+        {
+            continue;
+        }
+        let text = if wide {
+            let units: Vec<u16> = data
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
+                .collect();
+            String::from_utf16_lossy(&units)
+        } else {
+            String::from_utf8_lossy(&data).into_owned()
+        };
+        let text: String = text.chars().filter(|c| *c != '\0').collect();
+        let text = text.trim();
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    None
+}
+
+/// Lowercased extension of an attachment filename: the text after the last
+/// `.` of its final path segment, when that is non-empty, at most 16
+/// characters, and free of whitespace.
+fn attachment_extension(filename: &str) -> Option<String> {
+    let base = super::common::basename(filename);
+    let (stem, ext) = base.rsplit_once('.')?;
+    let usable = !stem.is_empty()
+        && !ext.is_empty()
+        && ext.chars().count() <= 16
+        && !ext.chars().any(char::is_whitespace);
+    usable.then(|| ext.to_lowercase())
 }
 
 fn read_stream_data<T: Read + std::io::Seek>(
@@ -1058,6 +1268,114 @@ mod tests {
         let features = v.get("office.features").and_then(|x| x.as_array()).unwrap();
         let names: Vec<&str> = features.iter().filter_map(|x| x.as_str()).collect();
         assert!(names.contains(&"encryption"));
+    }
+
+    fn utf16(s: &str) -> Vec<u8> {
+        s.encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+
+    /// Attachment property stream: 8-byte header + one 16-byte entry per
+    /// (tag, u32 value).
+    fn attach_props(entries: &[(u32, u32)]) -> Vec<u8> {
+        let mut out = vec![0u8; 8];
+        for (tag, value) in entries {
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&6u32.to_le_bytes()); // flags
+            out.extend_from_slice(&value.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn describes_msg_attachments() {
+        let long = utf16("Re comprobante.Tutela.XHTML");
+        let mime = utf16("text/html");
+        let short = utf16("image001.png");
+        let cid = utf16("image001.png@01D0");
+        let hidden = attach_props(&[(0x3705_0003, 1), (0x7FFE_000B, 1)]);
+        let a0 = "/__attach_version1.0_#00000000";
+        let a1 = "/__attach_version1.0_#00000001";
+        let a2 = "/__attach_version1.0_#00000002";
+        let cfb = build_cfb(&[
+            ("/__substg1.0_0037001F", &utf16("subject")),
+            (&format!("{a0}/__substg1.0_37010102"), b"<svg/>"),
+            (&format!("{a0}/__substg1.0_3707001F"), &long),
+            (&format!("{a0}/__substg1.0_370E001F"), &mime),
+            (&format!("{a1}/__substg1.0_37010102"), b"\x89PNG...."),
+            (&format!("{a1}/__substg1.0_3704001F"), &short),
+            (&format!("{a1}/__substg1.0_3712001F"), &cid),
+            (&format!("{a1}/__properties_version1.0"), &hidden),
+            (
+                &format!("{a2}/__substg1.0_3701000D/__substg1.0_0037001F"),
+                &utf16("inner"),
+            ),
+            (
+                &format!("{a2}/__substg1.0_3001001F"),
+                &utf16("Fwd: invoice"),
+            ),
+        ]);
+        let (v, m) = run(&cfb);
+        assert_eq!(v.get("office.kind").and_then(|x| x.as_str()), Some("msg"));
+        assert_eq!(m.get("office.msg.attachment_count"), Some(3.0));
+
+        let list = v
+            .get("office.msg.attachments")
+            .and_then(|x| x.as_array())
+            .expect("attachments listed");
+        let by_name = |name: &str| {
+            list.iter()
+                .find(|a| a.get("filename").and_then(|f| f.as_str()) == Some(name))
+                .unwrap_or_else(|| panic!("no attachment named {name}: {list:?}"))
+        };
+
+        let svg = by_name("Re comprobante.Tutela.XHTML");
+        assert_eq!(svg.get("extension").and_then(|x| x.as_str()), Some("xhtml"));
+        assert_eq!(svg.get("mime").and_then(|x| x.as_str()), Some("text/html"));
+        assert_eq!(svg.get("size").and_then(serde_json::Value::as_u64), Some(6));
+        assert!(svg.get("hidden").is_none());
+
+        let png = by_name("image001.png");
+        assert_eq!(png.get("extension").and_then(|x| x.as_str()), Some("png"));
+        assert_eq!(
+            png.get("content_id").and_then(|x| x.as_str()),
+            Some("image001.png@01D0")
+        );
+        assert_eq!(png.get("method").and_then(|x| x.as_str()), Some("by_value"));
+        assert_eq!(png.get("hidden"), Some(&serde_json::Value::Bool(true)));
+
+        let msg = by_name("Fwd: invoice");
+        assert!(msg.get("extension").is_none());
+        assert!(msg.get("size").is_none());
+        assert_eq!(
+            msg.get("method").and_then(|x| x.as_str()),
+            Some("embedded_message")
+        );
+    }
+
+    #[test]
+    fn msg_without_attachments_reports_zero() {
+        let cfb = build_cfb(&[("/__substg1.0_0037001F", &utf16("hello"))]);
+        let (v, m) = run(&cfb);
+        assert_eq!(m.get("office.msg.attachment_count"), Some(0.0));
+        assert!(v.get("office.msg.attachments").is_none());
+    }
+
+    #[test]
+    fn attachment_extension_rules() {
+        assert_eq!(attachment_extension("a.PDF").as_deref(), Some("pdf"));
+        assert_eq!(attachment_extension("x.tar.gz").as_deref(), Some("gz"));
+        assert_eq!(
+            attachment_extension("C:\\t\\run.lnk").as_deref(),
+            Some("lnk")
+        );
+        assert_eq!(attachment_extension(".htaccess"), None);
+        assert_eq!(attachment_extension("noext"), None);
+        assert_eq!(attachment_extension("trailing."), None);
+        assert_eq!(attachment_extension("a.b c"), None);
     }
 
     #[test]

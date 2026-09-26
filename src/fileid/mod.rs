@@ -28,6 +28,7 @@ mod scripts;
 pub use container::{ArchiveFormat, Compression, Container, container_of};
 
 use std::path::Path;
+use stng::{RepeatingXorKey, recover_repeating_xor_pe};
 
 use serde::Serialize;
 
@@ -54,6 +55,9 @@ pub struct FileId {
     /// describe the mismatch as a content-group→extension-group transition
     /// without deciding, here, whether that transition is dangerous.
     pub(crate) mismatch_ext_type: Option<FileType>,
+    /// The key of a PE under a repeating XOR key; see [`identify`].
+    #[serde(skip)]
+    pub(crate) xor_pe_key: Option<RepeatingXorKey>,
 }
 
 impl FileId {
@@ -72,7 +76,8 @@ impl FileId {
     /// content always wins when magic bytes are conclusive.
     #[must_use]
     pub fn from_path_and_bytes(path: &Path, bytes: &[u8]) -> Self {
-        match detect(path, bytes) {
+        let (detection, xor_pe_key) = identify(path, bytes);
+        match detection {
             Some(d) => {
                 // Apply benign carve-outs (AppleDouble sidecars, Android APK,
                 // XHTML) so the reported mismatch is an evasion signal rather
@@ -85,6 +90,7 @@ impl FileId {
                     source: d.source,
                     extension_mismatch: mismatch,
                     mismatch_ext_type: if mismatch { d.extension_type() } else { None },
+                    xor_pe_key,
                 }
             }
             None => Self {
@@ -92,6 +98,7 @@ impl FileId {
                 source: DetectionSource::Heuristic,
                 extension_mismatch: false,
                 mismatch_ext_type: None,
+                xor_pe_key: None,
             },
         }
     }
@@ -115,6 +122,7 @@ impl FileId {
             source: DetectionSource::Forced,
             extension_mismatch: false,
             mismatch_ext_type: None,
+            xor_pe_key: None,
         }
     }
 
@@ -122,6 +130,13 @@ impl FileId {
     #[must_use]
     pub fn file_type(&self) -> FileType {
         self.file_type
+    }
+
+    /// For opaque data that is a PE under a repeating XOR key, the key that
+    /// decodes it. Recovered once, during identification.
+    #[must_use]
+    pub fn xor_pe_key(&self) -> Option<RepeatingXorKey> {
+        self.xor_pe_key
     }
 
     /// How the type was determined.
@@ -1592,6 +1607,39 @@ fn is_benign_extension_mismatch(path: &Path, data: &[u8], det: Detection) -> boo
 /// Returns `None` if the file format cannot be identified.
 #[must_use]
 pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
+    identify(path, data).0
+}
+
+/// [`detect`], plus the key when the file is a PE under a repeating XOR key,
+/// as droppers ship their payload inside a jar or package (`hvnc.enc`,
+/// `payload.bin`). Magic cannot see such a file, and as Unknown it was skipped
+/// outright; as Data it reaches the generic analyzer, and the key lets the
+/// consumer decode the image. It is recovered from known plaintext and checked
+/// against the PE header, so this cannot claim random bytes. Only opaque
+/// outcomes (Data, or nothing recognised) are tried: anything else was
+/// identified by its own bytes.
+pub(crate) fn identify(path: &Path, data: &[u8]) -> (Option<Detection>, Option<RepeatingXorKey>) {
+    match detect_known(path, data) {
+        Some(d) if d.file_type == FileType::Data => (Some(d), recover_repeating_xor_pe(data)),
+        Some(d) => (Some(d), None),
+        None => match recover_repeating_xor_pe(data) {
+            // An unrecognised extension (`.enc`) says nothing that opaque
+            // data contradicts.
+            Some(key) => (
+                Some(Detection {
+                    file_type: FileType::Data,
+                    source: DetectionSource::Heuristic,
+                    ext_match: ExtensionMatch::Consistent,
+                }),
+                Some(key),
+            ),
+            None => (unnamed_dos_com(path, data), None),
+        },
+    }
+}
+
+/// Everything [`identify`] recognises without key recovery.
+fn detect_known(path: &Path, data: &[u8]) -> Option<Detection> {
     // Stage 1: Content-based detection (magic bytes, shebangs)
     if let Some((file_type, source)) = magic::detect_from_content(path, data) {
         let ext_ft = ext::detect_from_path(path);
@@ -1861,22 +1909,22 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
         });
     }
 
-    // No extension and nothing above recognised it. Corpora name samples by
-    // hash, so a DOS COM there has no `.com` to go on; without this it was
-    // Unknown, which no trait walks, and every DOS rule was blind to it.
-    if heuristics::looks_like_unnamed_dos_com(data) {
-        return Some(Detection {
-            file_type: FileType::DosCom,
-            source: DetectionSource::Heuristic,
-            ext_match: if has_named_extension(path) {
-                ExtensionMatch::Unknown
-            } else {
-                ExtensionMatch::Consistent
-            },
-        });
-    }
-
     None
+}
+
+/// Nothing recognised the file. Corpora name samples by hash, so a DOS COM
+/// there has no `.com` to go on; without this it was Unknown, which no trait
+/// walks, and every DOS rule was blind to it.
+fn unnamed_dos_com(path: &Path, data: &[u8]) -> Option<Detection> {
+    heuristics::looks_like_unnamed_dos_com(data).then(|| Detection {
+        file_type: FileType::DosCom,
+        source: DetectionSource::Heuristic,
+        ext_match: if has_named_extension(path) {
+            ExtensionMatch::Unknown
+        } else {
+            ExtensionMatch::Consistent
+        },
+    })
 }
 
 /// Types whose extension names a language or script, so a body that is not
@@ -2667,6 +2715,37 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
         );
         assert_detect("prog", &com, FileType::DosCom);
         assert_detect("prog.bin", &com, FileType::DosCom);
+    }
+
+    /// A PE under a repeating XOR key is opaque data, not Unknown: that is
+    /// what routes it to the generic analyzer and the `xor.*` facts.
+    #[test]
+    fn xor_encoded_pe_is_data() {
+        let pe = include_bytes!("../../tests/fixtures/test.exe");
+        let key = [0x55, 0x64, 0xee, 0x58, 0x6f, 0x83, 0xb8, 0x02];
+        let enc: Vec<u8> = pe
+            .iter()
+            .zip(key.iter().cycle())
+            .map(|(b, k)| b ^ k)
+            .collect();
+        // `.bin` is Data by name; the others reach Data only through the key.
+        for name in ["hvnc.enc", "payload", "payload.bin"] {
+            let det = detect(Path::new(name), &enc).expect("detected");
+            assert_eq!(det.file_type, FileType::Data, "{name}");
+            assert!(!det.extension_mismatch(), "{name}");
+            let id = FileId::from_path_and_bytes(Path::new(name), &enc);
+            assert_eq!(
+                id.xor_pe_key().map(|k| k.bytes().to_vec()),
+                Some(key.to_vec())
+            );
+        }
+        // The plaintext image is still a PE by its magic, and carries no key.
+        assert_detect("hvnc.enc", pe, FileType::Pe);
+        assert!(
+            FileId::from_path_and_bytes(Path::new("a.exe"), pe)
+                .xor_pe_key()
+                .is_none()
+        );
     }
 
     /// Size alone is not enough: a small binary with no `INT 21h` near the

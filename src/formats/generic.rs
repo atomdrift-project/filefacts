@@ -46,6 +46,26 @@ pub(super) fn extract(
     }
 }
 
+/// Record the key of a PE hidden under a repeating XOR key, which
+/// identification recovered (see [`crate::FileId::xor_pe_key`]).
+///
+/// - `xor.has_embedded_pe` — 1 when the whole file decodes to a PE.
+/// - `xor.pe_key_length` — the key's period in bytes (smallest that decodes).
+/// - value `xor.pe_key` — the key as lowercase hex, aligned to offset 0
+///   (`plain[i] = bytes[i] ^ key[i % len]`), for consumers that decode it.
+pub(super) fn extract_xor_pe(
+    key: stng::RepeatingXorKey,
+    values: &mut Values,
+    metrics: &mut Metrics,
+) {
+    metrics.insert(metric!("xor.has_embedded_pe"), 1.0);
+    metrics.insert(metric!("xor.pe_key_length"), key.period() as f64);
+    values.insert(
+        "xor.pe_key",
+        serde_json::Value::String(super::common::hex_encode(key.bytes())),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +189,37 @@ mod tests {
             m.fact("binary.peak_region_entropy").unwrap().spans,
             vec![Span::new(4096, 2048)]
         );
+    }
+
+    /// An XOR-encoded PE opened through the full pipeline is typed Data and
+    /// carries the key; a plaintext PE and random bytes carry nothing.
+    #[test]
+    fn xor_encoded_pe_emits_key_facts() {
+        let pe = include_bytes!("../../tests/fixtures/test.exe");
+        let key = [0x0f, 0x1e, 0x2d, 0x3c];
+        let enc: Vec<u8> = pe
+            .iter()
+            .zip(key.iter().cycle())
+            .map(|(b, k)| b ^ k)
+            .collect();
+        for name in ["hvnc.enc", "payload.bin"] {
+            let parsed = crate::open_with_path(std::path::Path::new(name), &enc).unwrap();
+            assert_eq!(parsed.fileid().file_type(), crate::FileType::Data);
+            assert_eq!(parsed.metrics().get("xor.has_embedded_pe"), Some(1.0));
+            assert_eq!(parsed.metrics().get("xor.pe_key_length"), Some(4.0));
+            assert_eq!(
+                parsed.values().get("xor.pe_key"),
+                Some(&serde_json::json!("0f1e2d3c"))
+            );
+        }
+
+        let plain = crate::open_with_path(std::path::Path::new("a.exe"), pe).unwrap();
+        assert_eq!(plain.metrics().get("xor.pe_key_length"), None);
+        let noise: Vec<u8> = (0..4096u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let blob = crate::open_with_path(std::path::Path::new("blob.bin"), &noise).unwrap();
+        assert_eq!(blob.metrics().get("xor.pe_key_length"), None);
+        assert!(blob.values().get("xor.pe_key").is_none());
     }
 }

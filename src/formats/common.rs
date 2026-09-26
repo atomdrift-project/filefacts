@@ -502,6 +502,7 @@ pub(super) fn rizin_fallback_with_sections(
     sections: &mut Vec<crate::output::Section>,
     metrics: &mut crate::output::Metrics,
     go_function_metadata: bool,
+    declares_exports: bool,
 ) {
     // Normally goblin's native symbols or sections are enough to avoid an
     // expensive disassembly. Go is the exception: its native parser can
@@ -542,6 +543,11 @@ pub(super) fn rizin_fallback_with_sections(
                 return;
             }
         };
+    let recovery = if declares_exports {
+        recovery
+    } else {
+        recovery.without_exports()
+    };
     let counts = recovery.apply_with_sections(symbols, sections, metrics);
     if counts.imports > 0 {
         metrics.insert(metric!("pe.recovered_imports"), f64::from(counts.imports));

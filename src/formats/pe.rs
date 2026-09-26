@@ -225,6 +225,7 @@ pub(super) fn extract(
             sections_out,
             metrics,
             has_go_function_metadata,
+            declares_export_directory(pe.header.optional_header.as_ref()),
         );
         return Ok(());
     }
@@ -261,8 +262,25 @@ pub(super) fn extract(
     // zero imports, breaking every section-scoped trait. The success branch
     // already calls this; the header-only branch must too. The helper no-ops
     // when goblin did supply something, so it's safe to call unconditionally.
-    rizin_fallback_with_sections(bytes, strings, symbols_out, sections_out, metrics, false);
+    rizin_fallback_with_sections(
+        bytes,
+        strings,
+        symbols_out,
+        sections_out,
+        metrics,
+        false,
+        declares_export_directory(header.optional_header.as_ref()),
+    );
     Ok(())
+}
+
+/// Whether the optional header points at an export directory. Without one
+/// the loader resolves no exports, so any a disassembler recovers are other
+/// global symbols (Go's `gopclntab`) and must not reach the export view.
+/// Unset and zeroed slots both mean absent, as in [`data_directories`].
+fn declares_export_directory(opt: Option<&goblin::pe::optional_header::OptionalHeader>) -> bool {
+    opt.and_then(|opt| opt.data_directories.get_export_table())
+        .is_some_and(|dir| dir.virtual_address != 0 || dir.size != 0)
 }
 
 /// Return the file offset of `slice` within `bytes`. Goblin's resource parser
@@ -488,6 +506,11 @@ fn rizin_importless_analysis(
         return;
     };
     recover_api_hash_requests(pe, bytes, values, metrics, &recovery);
+    let recovery = if declares_export_directory(pe.header.optional_header.as_ref()) {
+        recovery
+    } else {
+        recovery.without_exports()
+    };
     let counts = recovery.apply(symbols, metrics);
     metrics.insert(metric!("pe.rizin_importless_analysis"), 1.0);
     if counts.functions > 0 {

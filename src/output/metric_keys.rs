@@ -588,6 +588,7 @@ pub const CATALOG: &[&str] = &[
     "office.external_relationship_count",
     "office.hidden_sheet_count",
     "office.macro_count",
+    "office.msg.attachment_count",
     "office.name_count",
     "office.sheet_count",
     "office.stream_count",
@@ -903,6 +904,8 @@ pub const CATALOG: &[&str] = &[
     "wasm.import_count",
     "wasm.section_count",
     "whl.native_extension_count",
+    "xor.has_embedded_pe",
+    "xor.pe_key_length",
 ];
 
 /// Metric keys whose last segment is data rather than a fixed name.

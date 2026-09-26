@@ -635,6 +635,7 @@ impl<'a> ParsedFile<'a> {
             self.tree_cache(),
             self.tree_parse()
                 .and_then(formats::source::TreeParse::diagnostic),
+            self.fileid.xor_pe_key(),
         )
     }
 }
@@ -678,6 +679,7 @@ fn run_extraction(
     basename: Option<&str>,
     tree_cache: Option<&formats::source::TreeCache<'_>>,
     tree_diagnostic: Option<&formats::source::TreeSitterDiagnostic>,
+    xor_pe_key: Option<stng::RepeatingXorKey>,
 ) -> Extracted {
     let mut values = Values::new();
     let mut strings = output::Strings::new();
@@ -734,6 +736,7 @@ fn run_extraction(
                 errors: &mut errors,
                 image_end: &mut image_end,
                 basename,
+                xor_pe_key,
             },
         )
     }));

@@ -1226,6 +1226,15 @@ impl RizinRecovery {
         self.apply_inner(symbols_out, Some(sections_out), metrics)
     }
 
+    /// Discard the recovered exports. A PE whose optional header declares no
+    /// export directory has no exports the loader can resolve, yet `iEj`
+    /// still lists global symbols there — on every Go PE it reports the
+    /// `gopclntab` COFF symbol. The caller knows the format; rizin does not.
+    pub(crate) fn without_exports(mut self) -> Self {
+        self.exports.clear();
+        self
+    }
+
     fn apply_inner(
         self,
         symbols_out: &mut crate::Symbols,

@@ -37,6 +37,9 @@ pub(crate) struct ExtractCtx<'a> {
     /// File basename, when known — lets format-agnostic types (e.g. Shell)
     /// dispatch on a recognized filename such as `PKGBUILD`.
     pub(crate) basename: Option<&'a str>,
+    /// The repeating XOR key identification recovered (see
+    /// [`crate::FileId::xor_pe_key`]), recorded as the `xor.*` facts.
+    pub(crate) xor_pe_key: Option<stng::RepeatingXorKey>,
 }
 
 mod apk_alpine;
@@ -156,11 +159,15 @@ pub(crate) fn extract(
         errors,
         image_end,
         basename,
+        xor_pe_key,
     } = ctx;
     // Every file gets the generic byte-level metrics. Format-specific
     // extractors layer on top of (and may shadow with more accurate
     // values) what generic emits.
     generic::extract(bytes, values, strings, metrics);
+    if let Some(key) = xor_pe_key {
+        generic::extract_xor_pe(key, values, metrics);
+    }
     if basename.is_some_and(|name| crate::has_named_reference_metadata(std::path::Path::new(name)))
     {
         values.insert("go_manifest.kind", serde_json::json!(basename));
