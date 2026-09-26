@@ -9,10 +9,11 @@
 //! forensic analyst wants to see.
 //!
 //! We expose the *primary signer*'s certificate fields plus the
-//! signature's digest algorithm. RFC 3161 countersignatures and full
-//! certificate chains are parked for a richer extractor later — what we
-//! emit here is enough to answer "who claims to have signed this, and
-//! when did the cert expire?".
+//! signature's digest algorithm, enough to answer "who claims to have
+//! signed this, and when did the cert expire?". `chain_sha256` answers
+//! "who vouches for that claim": the thumbprints of the certificates whose
+//! keys verifiably signed the signer's certificate and each other. Names in
+//! it prove nothing; thumbprints do, and pinning them is left to consumers.
 
 use cms::content_info::ContentInfo;
 use cms::signed_data::SignedData;
@@ -196,10 +197,9 @@ fn parse_pkcs7(der_bytes: &[u8]) -> Option<JsonValue> {
                 "thumbprint_sha1".into(),
                 JsonValue::String(hex_encode(&Sha1::digest(&cert_der))),
             );
-            obj.insert(
-                "thumbprint_sha256".into(),
-                JsonValue::String(hex_encode(&Sha256::digest(&cert_der))),
-            );
+        }
+        if let Some(thumbprint) = thumbprint_sha256(cert) {
+            obj.insert("thumbprint_sha256".into(), JsonValue::String(thumbprint));
         }
     }
 
@@ -244,6 +244,11 @@ fn parse_pkcs7(der_bytes: &[u8]) -> Option<JsonValue> {
     // of signed-attributes (one of which carries the
     // SpcIndirectDataContent that claims the PE image hash).
     if let Some(cert) = signer_cert {
+        let chain = verified_chain(&signed_data, cert)
+            .into_iter()
+            .map(JsonValue::String)
+            .collect();
+        obj.insert("chain_sha256".into(), JsonValue::Array(chain));
         match verify_signer_signature(signer, cert) {
             VerifyOutcome::Verified => {
                 obj.insert("verified".into(), JsonValue::Bool(true));
@@ -473,6 +478,81 @@ fn verify_ecdsa(
         // unsupported rather than producing a misleading mismatch.
         _ => VerifyOutcome::Unsupported,
     }
+}
+
+/// The signer certificate, then each certificate in the SignedData bag whose
+/// public key verifiably signed the one before it, as SHA-256 thumbprints.
+///
+/// Names prove nothing: anyone can mint a certificate whose subject reads
+/// "Microsoft Code Signing PCA 2011". A link is added only when the issuer's
+/// key verifies the child's signature over its TBSCertificate, so a real CA's
+/// thumbprint appears here only if that CA's private key signed the chain
+/// below it. Which CAs to trust is policy and stays with the consumer, which
+/// pins thumbprints; this reports only what the cryptography proves.
+///
+/// The walk stops at a self-issued certificate, at the first link that does
+/// not verify or uses an algorithm we cannot check, or at `MAX_CHAIN`. Every
+/// failure shortens the chain; none can add a certificate to it.
+fn verified_chain(signed_data: &SignedData, signer: &x509_cert::Certificate) -> Vec<String> {
+    const MAX_CHAIN: usize = 8;
+    let bag: Vec<&x509_cert::Certificate> = signed_data
+        .certificates
+        .iter()
+        .flat_map(|set| set.0.iter())
+        .filter_map(|entry| match entry {
+            cms::cert::CertificateChoices::Certificate(cert) => Some(cert),
+            _ => None,
+        })
+        .collect();
+    let mut chain = Vec::new();
+    let mut cert = signer;
+    while let Some(thumbprint) = thumbprint_sha256(cert) {
+        if chain.contains(&thumbprint) {
+            break;
+        }
+        chain.push(thumbprint);
+        let tbs = &cert.tbs_certificate;
+        if chain.len() == MAX_CHAIN || tbs.issuer == tbs.subject {
+            break;
+        }
+        let Some(issuer) = bag
+            .iter()
+            .copied()
+            .find(|c| c.tbs_certificate.subject == tbs.issuer && signs(c, cert))
+        else {
+            break;
+        };
+        cert = issuer;
+    }
+    chain
+}
+
+/// Whether `issuer`'s public key verifies `child`'s certificate signature.
+fn signs(issuer: &x509_cert::Certificate, child: &x509_cert::Certificate) -> bool {
+    let alg = child.signature_algorithm.oid.to_string();
+    let digest = match alg.as_str() {
+        "1.2.840.113549.1.1.5" | "1.2.840.10045.4.1" => "1.3.14.3.2.26",
+        "1.2.840.113549.1.1.11" | "1.2.840.10045.4.3.2" => "2.16.840.1.101.3.4.2.1",
+        "1.2.840.113549.1.1.12" | "1.2.840.10045.4.3.3" => "2.16.840.1.101.3.4.2.2",
+        "1.2.840.113549.1.1.13" | "1.2.840.10045.4.3.4" => "2.16.840.1.101.3.4.2.3",
+        _ => return false,
+    };
+    let (Ok(tbs), Some(signature)) = (child.tbs_certificate.to_der(), child.signature.as_bytes())
+    else {
+        return false;
+    };
+    let outcome = if is_rsa_oid(&alg) {
+        verify_rsa(issuer, digest, &tbs, signature)
+    } else {
+        verify_ecdsa(issuer, digest, &tbs, signature)
+    };
+    matches!(outcome, VerifyOutcome::Verified)
+}
+
+fn thumbprint_sha256(cert: &x509_cert::Certificate) -> Option<String> {
+    cert.to_der()
+        .ok()
+        .map(|der| hex_encode(&Sha256::digest(&der)))
 }
 
 /// Signing time from a countersignature, for the common case where the signer
@@ -938,6 +1018,249 @@ mod tests {
         read_tlv, signature_algorithm_name, trim_to_der_object,
     };
     use der::oid::ObjectIdentifier;
+
+    /// A real Authenticode blob: Tencent's leaf, issued by DigiCert's SHA2
+    /// Assured ID Code Signing CA (the root is not in the bag).
+    const DIGICERT_TENCENT: &[u8] =
+        include_bytes!("../../tests/fixtures/authenticode-digicert-tencent.p7b");
+    const TENCENT_LEAF: &str = "9a989f4a4ff379a003d2f6dfe471f598fd583f3dbcf18aff5fea42dd5a83d8d9";
+    const DIGICERT_CODE_SIGNING_CA: &str =
+        "51044706bd237b91b89b781337e6d62656c69f0fcffbe8e43741367948127862";
+
+    fn parse(blob: &[u8]) -> serde_json::Value {
+        super::parse_pkcs7(trim_to_der_object(blob).unwrap()).unwrap()
+    }
+
+    fn chain(sig: &serde_json::Value) -> Vec<&str> {
+        sig["chain_sha256"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn chain_follows_issuers_whose_keys_verify() {
+        let sig = parse(DIGICERT_TENCENT);
+        assert_eq!(chain(&sig), [TENCENT_LEAF, DIGICERT_CODE_SIGNING_CA]);
+        assert_eq!(sig["thumbprint_sha256"], TENCENT_LEAF);
+    }
+
+    /// Certs-only bags produced by `tests/fixtures/chains/generate.sh`.
+    mod bags {
+        use der::{Decode, Encode};
+        use sha2::{Digest, Sha256};
+
+        pub(super) struct Bag {
+            pub(super) sd: cms::signed_data::SignedData,
+        }
+
+        impl Bag {
+            pub(super) fn load(bytes: &[u8]) -> Self {
+                let ci = cms::content_info::ContentInfo::from_der(bytes).unwrap();
+                Self {
+                    sd: ci.content.decode_as().unwrap(),
+                }
+            }
+
+            pub(super) fn certs(&self) -> Vec<&x509_cert::Certificate> {
+                self.sd
+                    .certificates
+                    .iter()
+                    .flat_map(|set| set.0.iter())
+                    .filter_map(|entry| match entry {
+                        cms::cert::CertificateChoices::Certificate(c) => Some(c),
+                        _ => None,
+                    })
+                    .collect()
+            }
+
+            /// The certificate with this CN whose issuer has `issuer_cn`.
+            pub(super) fn cert(&self, cn: &str, issuer_cn: &str) -> &x509_cert::Certificate {
+                self.certs()
+                    .into_iter()
+                    .find(|c| {
+                        c.tbs_certificate.subject.to_string() == format!("CN={cn}")
+                            && c.tbs_certificate.issuer.to_string() == format!("CN={issuer_cn}")
+                    })
+                    .unwrap()
+            }
+
+            /// `verified_chain` from `signer`, as subject names.
+            pub(super) fn walk(&self, signer: &x509_cert::Certificate) -> Vec<String> {
+                super::super::verified_chain(&self.sd, signer)
+                    .iter()
+                    .map(|t| self.name_of(t))
+                    .collect()
+            }
+
+            pub(super) fn thumbprint(cert: &x509_cert::Certificate) -> String {
+                super::super::hex_encode(&Sha256::digest(cert.to_der().unwrap()))
+            }
+
+            fn name_of(&self, thumbprint: &str) -> String {
+                let cert = self
+                    .certs()
+                    .into_iter()
+                    .find(|c| Self::thumbprint(c) == thumbprint)
+                    .unwrap();
+                cert.tbs_certificate
+                    .subject
+                    .to_string()
+                    .trim_start_matches("CN=")
+                    .to_string()
+            }
+        }
+    }
+
+    const BAG_IMPOSTOR_ONLY: &[u8] =
+        include_bytes!("../../tests/fixtures/chains/rsa-impostor-only.p7b");
+    const BAG_IMPOSTOR_AND_REAL: &[u8] =
+        include_bytes!("../../tests/fixtures/chains/rsa-impostor-and-real.p7b");
+    const BAG_SHA1: &[u8] = include_bytes!("../../tests/fixtures/chains/sha1.p7b");
+    const BAG_ECDSA: &[u8] = include_bytes!("../../tests/fixtures/chains/ecdsa.p7b");
+    const BAG_OFFPAIR: &[u8] = include_bytes!("../../tests/fixtures/chains/offpair.p7b");
+    const BAG_DEPTH: &[u8] = include_bytes!("../../tests/fixtures/chains/depth.p7b");
+    const BAG_LOOP: &[u8] = include_bytes!("../../tests/fixtures/chains/loop.p7b");
+
+    /// A CA with the real issuer's exact name but its own key must never be
+    /// linked. Bag order is DER-sorted on decode, so this is checked both
+    /// ways: alone, the walk has to try the impostor and reject it; beside the
+    /// real CA, it has to pick the one whose key actually signed the leaf.
+    #[test]
+    fn chain_rejects_an_impostor_with_the_issuers_name() {
+        let alone = bags::Bag::load(BAG_IMPOSTOR_ONLY);
+        assert_eq!(
+            alone.walk(alone.cert("Chain Leaf", "Chain CA")),
+            ["Chain Leaf"]
+        );
+
+        let both = bags::Bag::load(BAG_IMPOSTOR_AND_REAL);
+        let leaf = both.cert("Chain Leaf", "Chain CA");
+        assert_eq!(both.walk(leaf), ["Chain Leaf", "Chain CA", "Chain Root"]);
+        let chain = super::verified_chain(&both.sd, leaf);
+        assert_eq!(
+            chain[1],
+            bags::Bag::thumbprint(both.cert("Chain CA", "Chain Root"))
+        );
+        assert!(!chain.contains(&bags::Bag::thumbprint(both.cert("Chain CA", "Chain CA"))));
+    }
+
+    #[test]
+    fn chain_stops_at_a_self_issued_certificate() {
+        let bag = bags::Bag::load(BAG_IMPOSTOR_AND_REAL);
+        assert_eq!(
+            bag.walk(bag.cert("Chain Root", "Chain Root")),
+            ["Chain Root"]
+        );
+    }
+
+    #[test]
+    fn chain_stops_when_the_issuer_is_not_in_the_bag() {
+        let bag = bags::Bag::load(BAG_SHA1);
+        let other = bags::Bag::load(BAG_ECDSA);
+        // An EC leaf walked against a bag that does not hold its issuer.
+        let leaf = other.cert("EC Leaf", "EC CA");
+        assert_eq!(super::verified_chain(&bag.sd, leaf).len(), 1);
+    }
+
+    /// Legacy SHA-1 links (VC++ 2010-era Microsoft chains) must verify.
+    #[test]
+    fn chain_follows_sha1_rsa_links() {
+        let bag = bags::Bag::load(BAG_SHA1);
+        assert_eq!(
+            bag.walk(bag.cert("SHA1 Leaf", "SHA1 Root")),
+            ["SHA1 Leaf", "SHA1 Root"]
+        );
+    }
+
+    /// P-384 root over a P-256 CA (ecdsa-with-SHA384) over a leaf
+    /// (ecdsa-with-SHA256): the issuer's curve, not the child's, decides.
+    #[test]
+    fn chain_follows_ecdsa_links_across_curves() {
+        let bag = bags::Bag::load(BAG_ECDSA);
+        assert_eq!(
+            bag.walk(bag.cert("EC Leaf", "EC CA")),
+            ["EC Leaf", "EC CA", "EC Root"]
+        );
+    }
+
+    /// A link the verifier cannot check (P-256 key, SHA-384 signature) ends
+    /// the walk rather than being assumed good.
+    #[test]
+    fn chain_stops_at_an_unverifiable_algorithm() {
+        let bag = bags::Bag::load(BAG_OFFPAIR);
+        assert_eq!(
+            bag.walk(bag.cert("Offpair Leaf", "Offpair CA")),
+            ["Offpair Leaf"]
+        );
+    }
+
+    #[test]
+    fn chain_is_capped_at_eight_certificates() {
+        let bag = bags::Bag::load(BAG_DEPTH);
+        let chain = bag.walk(bag.cert("Depth 9", "Depth 8"));
+        assert_eq!(chain.len(), 8);
+        assert_eq!(chain.first().unwrap(), "Depth 9");
+        assert_eq!(chain.last().unwrap(), "Depth 2");
+    }
+
+    /// Two CAs certifying each other must not make the walk loop.
+    #[test]
+    fn chain_terminates_on_cross_signed_cycles() {
+        let bag = bags::Bag::load(BAG_LOOP);
+        assert_eq!(
+            bag.walk(bag.cert("Loop Leaf", "Loop A")),
+            ["Loop Leaf", "Loop A", "Loop B"]
+        );
+    }
+
+    /// The emitted chain starts with the same thumbprint the signer fields use.
+    #[test]
+    fn chain_starts_with_the_signer_thumbprint() {
+        let sig = parse(DIGICERT_TENCENT);
+        assert_eq!(sig["chain_sha256"][0], sig["thumbprint_sha256"]);
+    }
+
+    /// Every name still lines up after one byte of the leaf's certificate
+    /// signature changes, but the CA's key no longer verifies it, so the CA
+    /// must drop out of the chain. This is the forgery the chain exists to
+    /// stop: a leaf that merely claims a well-known issuer.
+    #[test]
+    fn chain_stops_where_a_signature_does_not_verify() {
+        use der::Decode;
+        let blob = trim_to_der_object(DIGICERT_TENCENT).unwrap();
+        let ci = cms::content_info::ContentInfo::from_der(blob).unwrap();
+        let sd: cms::signed_data::SignedData = ci.content.decode_as().unwrap();
+        let leaf_sig = sd
+            .certificates
+            .iter()
+            .flat_map(|set| set.0.iter())
+            .find_map(|entry| match entry {
+                cms::cert::CertificateChoices::Certificate(c)
+                    if c.tbs_certificate.subject != c.tbs_certificate.issuer
+                        && c.tbs_certificate.subject.to_string().contains("Tencent") =>
+                {
+                    c.signature.as_bytes().map(<[u8]>::to_vec)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let at = blob
+            .windows(leaf_sig.len())
+            .position(|w| w == leaf_sig)
+            .unwrap();
+        let mut forged = blob.to_vec();
+        forged[at + leaf_sig.len() - 1] ^= 0x01;
+
+        let sig = parse(&forged);
+        let links = chain(&sig);
+        assert_eq!(links.len(), 1, "only the (altered) leaf itself: {links:?}");
+        assert!(!links.contains(&DIGICERT_CODE_SIGNING_CA));
+        // The signer's own signature over the signed attributes is untouched.
+        assert_eq!(sig["verified"], true);
+    }
 
     #[test]
     fn known_digest_oids() {

@@ -2343,6 +2343,28 @@ mod tests {
     }
 
     #[test]
+    fn msix_bundle_manifest_past_the_entry_cap_is_still_a_zip() {
+        let mut entries: Vec<(String, &[u8])> = (0..ZipNames::MAX_ENTRIES + 10)
+            .map(|i| (format!("App_{i}.msix"), &b""[..]))
+            .collect();
+        entries.push(("AppxMetadata/AppxBundleManifest.xml".into(), b"<Bundle/>"));
+        entries.push(("[Content_Types].xml".into(), b"<Types/>"));
+        let refs: Vec<(&str, &[u8])> = entries.iter().map(|(n, b)| (n.as_str(), *b)).collect();
+        let zip = zip_of(&refs);
+        assert_eq!(classify_pk(Path::new("bundle"), &zip).0, FileType::Zip);
+    }
+
+    /// The APPX marker must not pull a real Office document out of Ooxml.
+    #[test]
+    fn office_document_without_appx_manifest_stays_ooxml() {
+        let docx = zip_of(&[
+            ("[Content_Types].xml", b"<Types/>"),
+            ("word/document.xml", b"<w:document/>"),
+        ]);
+        assert_eq!(classify_pk(Path::new("report"), &docx).0, FileType::Ooxml);
+    }
+
+    #[test]
     fn msix_manifest_past_the_entry_cap_is_still_a_zip() {
         let mut entries: Vec<(String, &[u8])> = (0..ZipNames::MAX_ENTRIES + 10)
             .map(|i| (format!("VFS/f{i}.pyc"), &b""[..]))
