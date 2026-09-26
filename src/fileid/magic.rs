@@ -1318,6 +1318,7 @@ struct ZipMarks {
     content_types: bool,
     mimetype: bool,
     vsix: bool,
+    appx: bool,
     nuspec: bool,
     jar: bool,
     wheel: bool,
@@ -1340,6 +1341,7 @@ impl ZipMarks {
                 b"[Content_Types].xml" => m.content_types = true,
                 b"mimetype" => m.mimetype = true,
                 b"extension.vsixmanifest" => m.vsix = true,
+                b"AppxManifest.xml" | b"AppxMetadata/AppxBundleManifest.xml" => m.appx = true,
                 b"META-INF/MANIFEST.MF" => m.jar = true,
                 b"EGG-INFO/PKG-INFO" => m.egg = true,
                 b"metadata.json" => m.conda_metadata = true,
@@ -1444,6 +1446,13 @@ fn classify_pk(path: &Path, data: &[u8]) -> (FileType, DetectionSource) {
     } else if m.vsix || loose(b"extension.vsixmanifest") {
         // VSIX and NuGet are OPC zips too; their manifests win.
         FileType::Vsix
+    } else if m.appx || loose(b"AppxManifest.xml") || loose(b"AppxMetadata/AppxBundleManifest.xml")
+    {
+        // So are MSIX/APPX packages, which carry whole application trees
+        // (a bundled Python runtime, helper executables) that only the archive
+        // analyzer walks. The manifest is usually written last, past the
+        // entry cap on a large package, hence the loose fallback.
+        FileType::Zip
     } else if opc && m.nuspec {
         FileType::Nupkg
     } else if opc && !ARCHIVE_EXTS.contains(&ext) {
@@ -2309,6 +2318,43 @@ mod tests {
         data.extend_from_slice(b"extension.vsixmanifest\0[Content_Types].xml");
         let (ft, _) = detect_from_content(Path::new("artifact.sample"), &data).unwrap();
         assert_eq!(ft, FileType::Vsix);
+    }
+
+    #[test]
+    fn msix_by_manifest_without_extension() {
+        let zip = zip_of(&[
+            ("PythonRuntime/python.exe", b"MZ"),
+            ("AppxManifest.xml", b"<Package/>"),
+            ("[Content_Types].xml", b"<Types/>"),
+            ("AppxSignature.p7x", b""),
+        ]);
+        assert_eq!(
+            classify_pk(Path::new("FkSA3WUIlyfC"), &zip).0,
+            FileType::Zip
+        );
+        let bundle = zip_of(&[
+            ("AppxMetadata/AppxBundleManifest.xml", b"<Bundle/>"),
+            ("[Content_Types].xml", b"<Types/>"),
+        ]);
+        assert_eq!(
+            classify_pk(Path::new("bundle.bin"), &bundle).0,
+            FileType::Zip
+        );
+    }
+
+    #[test]
+    fn msix_manifest_past_the_entry_cap_is_still_a_zip() {
+        let mut entries: Vec<(String, &[u8])> = (0..ZipNames::MAX_ENTRIES + 10)
+            .map(|i| (format!("VFS/f{i}.pyc"), &b""[..]))
+            .collect();
+        entries.push(("AppxManifest.xml".into(), b"<Package/>"));
+        entries.push(("[Content_Types].xml".into(), b"<Types/>"));
+        let refs: Vec<(&str, &[u8])> = entries.iter().map(|(n, b)| (n.as_str(), *b)).collect();
+        let zip = zip_of(&refs);
+        assert_eq!(
+            classify_pk(Path::new("FkSA3WUIlyfC"), &zip).0,
+            FileType::Zip
+        );
     }
 
     #[test]
