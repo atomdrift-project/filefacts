@@ -285,6 +285,16 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"ipairs(", Lang::Lua, 5),
     (b"pairs(", Lang::Lua, 5),
     (b"elseif ", Lang::Lua, 5),
+    // Obfuscated Lua (Prometheus, Luraph and kin) ships as one minified line,
+    // and the environment calls above sit at its far end, past every window.
+    // A bare `...` parameter list is Lua's vararg -- JavaScript's rest
+    // parameter needs a name -- and `local function` is spelled nowhere else.
+    // Minifiers glue `end` to the preceding bracket; no other scored language
+    // closes a block that way.
+    (b"function(...)", Lang::Lua, 10),
+    (b"local function ", Lang::Lua, 10),
+    (b"]end ", Lang::Lua, 5),
+    (b")end ", Lang::Lua, 5),
     // ── JavaScript ──
     (b"module.exports", Lang::JavaScript, 10),
     (b"(function(", Lang::JavaScript, 5),
@@ -1463,6 +1473,21 @@ mod tests {
     fn lua_setmetatable() {
         let data = b"local t = {}\nsetmetatable(t, {__index = function() end})\n";
         assert_eq!(detect_from_content(data), Some(FileType::Lua));
+    }
+
+    #[test]
+    fn minified_obfuscated_lua() {
+        // Prometheus-style output: one line, no environment calls in the head.
+        let data = br#"return(function(...)local J=function(E)local H,v=E[#E],""for J=1,#H,1 do v=v..H[E[J]]end return v end local E={J({1;3,2,{"\110","\108"}})}end)(...)"#;
+        assert_eq!(detect_from_content(data), Some(FileType::Lua));
+        let data = b"local function f(a) return a end\nlocal function g(b) return f(b) end\n";
+        assert_eq!(detect_from_content(data), Some(FileType::Lua));
+    }
+
+    #[test]
+    fn javascript_rest_parameters_are_not_lua() {
+        let data = b"const f = function(...args) { return args.length; };\nmodule.exports = f;\n";
+        assert_eq!(detect_from_content(data), Some(FileType::JavaScript));
     }
 
     #[test]

@@ -198,10 +198,16 @@ pub(crate) fn evidence_within(text: &[u8], window: usize) -> Evidence {
     // Droppers bury their code under a payload or thousands of junk lines;
     // what they run is often at the end. The tail only speaks when the head
     // could not: a clear opening is not outvoted by a megabyte of payload.
+    // A tail with no line break starts at an arbitrary byte of a line the head
+    // already opened, not at a line start: it can begin inside a string and
+    // invert the quote tracking. A 355 KB one-line Lua payload cut that way
+    // read its `if v<x then` as a VBScript `If`, and one strong line decides
+    // a file of three lines or fewer.
     if text.len() > 2 * window && ev.verdict().is_none() {
         let tail = &text[text.len() - window..];
-        let tail = memchr::memchr2(b'\n', b'\r', tail).map_or(tail, |at| &tail[at + 1..]);
-        ev.read(tail, false);
+        if let Some(at) = memchr::memchr2(b'\n', b'\r', tail) {
+            ev.read(&tail[at + 1..], false);
+        }
     }
     ev
 }
@@ -2867,6 +2873,18 @@ alias tk.addmsg {\n\t@ tk.matched = rmatch($0 $^\\1-)\n\tif (tk.matched)\n\t{\n\
     }
 
     /// A payload in front of the script does not hide it.
+    #[test]
+    fn one_line_tail_is_not_a_line() {
+        // One minified line of Lua, far longer than both windows. The tail cut
+        // lands inside `s`, so a reader starting there sees every quote
+        // inverted and the `:` in `t` as a statement separator, leaving a bare
+        // `if v<1 then` -- a strong VBScript line.
+        let mut data = b"local s=\"".to_vec();
+        data.resize(data.len() + 3 * WINDOW, b'A');
+        data.extend_from_slice(b"\";local t=\"a:if v<1 then y=2 end\"");
+        assert_eq!(verdict(&data), None);
+    }
+
     #[test]
     fn code_after_a_payload_is_read() {
         // Padding a VBScript can run: comment lines.
