@@ -63,6 +63,22 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         return Some((FileType::Text, DetectionSource::Magic));
     }
 
+    // Windows Script Host documents: a `.wsf` job, a `.wsc` component or a
+    // `.sct` scriptlet is XML whose `<script language=...>` names what runs.
+    // The XML arm below would call the prolog'd ones plain XML, and markup
+    // sniffing called the rest HTML, so a VBScript dropper in a `<job>` was
+    // never scored as a script.
+    if let Some(ft) = windows_script_host(data) {
+        return Some((ft, DetectionSource::Magic));
+    }
+
+    // Script Encoder output (`.vbe`, `.jse`): `#@~^`, a six-character base64
+    // length, `==`. The body is ciphertext full of control bytes, so it was
+    // typed opaque data.
+    if let Some(ft) = encoded_script(path, head) {
+        return Some((ft, DetectionSource::Magic));
+    }
+
     // Lockfiles announce themselves in their opening lines. Hopper copies are
     // often renamed `yarn.<sha>.lock`, so the header, not the name, has to
     // carry them to the lockfile traits.
@@ -543,13 +559,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             }
         }
         b'B' => {
-            // BMP: `BM` plus a declared file size. Two bytes alone are a weak
-            // signature, so require the declared size to be structurally
-            // plausible before claiming it.
-            if data.starts_with(b"BM")
-                && data.len() >= 6
-                && u32::from_le_bytes([data[2], data[3], data[4], data[5]]) >= 14
-            {
+            if looks_like_bmp(data) {
                 Some((FileType::Bmp, DetectionSource::Magic))
             } else if data.len() >= 10
                 && data.starts_with(b"BZh")
@@ -1474,6 +1484,168 @@ fn lowercase_ext(path: &Path) -> Option<String> {
         return None;
     };
     Some(ext.to_string())
+}
+
+/// A Windows bitmap: `BM`, then the info header that follows the 14-byte file
+/// header. `BM` alone is two letters, and the file-size field is routinely
+/// wrong in real bitmaps (truncated downloads, writers that leave it zero), so
+/// the claim rests on the info header instead: its size field names one of the
+/// header versions Windows and OS/2 defined, it has one colour plane, and its
+/// pixel depth is one a decoder accepts.
+fn looks_like_bmp(data: &[u8]) -> bool {
+    data.starts_with(b"BM") && data.len() > 14 && looks_like_dib_header(&data[14..])
+}
+
+/// A bitmap info header (`BITMAPCOREHEADER` through `BITMAPV5HEADER`, and
+/// OS/2's variants). This is also the whole start of a headerless `.dib`.
+pub(crate) fn looks_like_dib_header(dib: &[u8]) -> bool {
+    let u16_at = |i: usize| dib.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let Some(size) = dib
+        .get(..4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    else {
+        return false;
+    };
+    // The 12-byte core header has 16-bit dimensions; every later one 32-bit.
+    let (planes, bits) = match size {
+        12 => (u16_at(8), u16_at(10)),
+        16 | 40 | 52 | 56 | 64 | 108 | 124 => (u16_at(12), u16_at(14)),
+        _ => return false,
+    };
+    planes == Some(1) && matches!(bits, Some(0 | 1 | 2 | 4 | 8 | 16 | 24 | 32 | 48 | 64))
+}
+
+/// How far into a Windows Script Host document the `<script>` element is
+/// looked for. Droppers pad the opening tags with whitespace.
+const WSH_SCRIPT_WINDOW: usize = 64 * 1024;
+
+/// A `.wsf` / `.wsc` / `.sct` document, typed by the language of its first
+/// `<script>`: VBScript or JScript. The root element decides it is one --
+/// `<job>`, `<package>`, `<component>` or `<scriptlet>`; an HTML page with a
+/// VBScript block stays HTML.
+fn windows_script_host(data: &[u8]) -> Option<FileType> {
+    // These are written by hand in Notepad as often as by tools, UTF-16 included.
+    let decoded;
+    let data = if data.starts_with(b"\xFF\xFE") || data.starts_with(b"\xFE\xFF") {
+        decoded = super::heuristics::decoded_text(data)?;
+        &decoded[..]
+    } else {
+        data
+    };
+    // `<!-- :` is cmd.exe's half of a batch/WSF hybrid: the batch lines hide
+    // in that comment, and cmd.exe runs them first. The batch grammar decides.
+    let opening = data.trim_ascii_start();
+    if opening.len() >= 6 && opening[..6].eq_ignore_ascii_case(b"<!-- :") {
+        return None;
+    }
+    let head = xml_head(data)?;
+    let root = head.root?;
+    if !["job", "package", "component", "scriptlet"]
+        .iter()
+        .any(|r| root.eq_ignore_ascii_case(r.as_bytes()))
+    {
+        return None;
+    }
+    let window = &data[..data.len().min(WSH_SCRIPT_WINDOW)];
+    let mut from = 0;
+    while let Some(at) = find_ci(&window[from..], b"<script") {
+        let tag_start = from + at + b"<script".len();
+        let tag = &window[tag_start..];
+        let tag = &tag[..memchr::memchr(b'>', tag).unwrap_or(tag.len())];
+        if let Some(language) = attribute_value(tag, b"language") {
+            let language = decode_char_refs(language).to_ascii_lowercase();
+            if language.starts_with("vbs") {
+                return Some(FileType::Vbs);
+            }
+            if language.starts_with("jscript") || language.starts_with("javascript") {
+                return Some(FileType::JavaScript);
+            }
+        }
+        from = tag_start;
+    }
+    None
+}
+
+/// The value of `name="..."` (or single-quoted) inside a tag, whitespace
+/// around the `=` allowed.
+fn attribute_value<'a>(tag: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let mut from = 0;
+    while let Some(at) = find_ci(&tag[from..], name) {
+        let start = from + at;
+        let rest = tag[start + name.len()..].trim_ascii_start();
+        let boundary = start == 0 || tag[start - 1].is_ascii_whitespace();
+        if let (true, Some(value)) = (boundary, rest.strip_prefix(b"=")) {
+            let value = value.trim_ascii_start();
+            let quote = *value.first()?;
+            if quote == b'"' || quote == b'\'' {
+                let inner = &value[1..];
+                return Some(&inner[..memchr::memchr(quote, inner).unwrap_or(inner.len())]);
+            }
+            let end = value
+                .iter()
+                .position(|b| b.is_ascii_whitespace() || *b == b'/')
+                .unwrap_or(value.len());
+            return Some(&value[..end]);
+        }
+        from = start + name.len();
+    }
+    None
+}
+
+/// Resolve `&#86;` / `&#x56;` character references, which obfuscated
+/// scriptlets use to spell `VBScript` without the letters.
+fn decode_char_refs(value: &[u8]) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some((&b, tail)) = rest.split_first() {
+        if b == b'&' && tail.first() == Some(&b'#') {
+            if let Some(end) = tail.iter().position(|&c| c == b';') {
+                let digits = std::str::from_utf8(&tail[1..end]).unwrap_or("");
+                let code = match digits.strip_prefix(['x', 'X']) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => digits.parse().ok(),
+                };
+                if let Some(c) = code.and_then(char::from_u32) {
+                    out.push(c);
+                    rest = &tail[end + 1..];
+                    continue;
+                }
+            }
+        }
+        out.push(char::from(b));
+        rest = tail;
+    }
+    out
+}
+
+fn find_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle))
+}
+
+/// Script Encoder output: `#@~^` + base64 length + `==`. The cipher hides
+/// which language was encoded, so the one call the bytes cannot make falls to
+/// the name: `.jse` is JScript, anything else the far more common VBScript.
+fn encoded_script(path: &Path, head: &[u8]) -> Option<FileType> {
+    let head = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
+    let rest = head.strip_prefix(b"#@~^")?;
+    let length = rest.get(..6)?;
+    if !length
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/'))
+        || rest.get(6..8) != Some(b"==")
+    {
+        return None;
+    }
+    let jse = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("jse"));
+    Some(if jse {
+        FileType::JavaScript
+    } else {
+        FileType::Vbs
+    })
 }
 
 /// Type a markup document by its root element: `plist`, `svg`, a known XML
@@ -3108,5 +3280,80 @@ mod registry_script_magic_tests {
             detect_from_content(Path::new("notes.txt"), data).map(|(ft, _)| ft),
             Some(FileType::Registry)
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod windows_script_host_tests {
+    use super::*;
+
+    #[test]
+    fn character_references_resolve() {
+        assert_eq!(decode_char_refs(b"&#86;&#66;&#x53;cript"), "VBScript");
+        // A malformed reference is left as it is.
+        assert_eq!(decode_char_refs(b"&#zz;x"), "&#zz;x");
+    }
+
+    #[test]
+    fn attribute_values() {
+        assert_eq!(
+            attribute_value(b" language='JScript' src=x", b"language"),
+            Some(&b"JScript"[..])
+        );
+        assert_eq!(
+            attribute_value(b"\r\nlanguage = \"VBScript\"", b"language"),
+            Some(&b"VBScript"[..])
+        );
+        assert_eq!(
+            attribute_value(b" language=VBS/", b"language"),
+            Some(&b"VBS"[..])
+        );
+        // `xlanguage` is a different attribute.
+        assert_eq!(
+            attribute_value(b" xlanguage=\"VBScript\"", b"language"),
+            None
+        );
+    }
+
+    #[test]
+    fn script_host_roots_only() {
+        let job = b"<component>\n<script language=\"VBScript\">x = 1</script>\n</component>\n";
+        assert_eq!(windows_script_host(job), Some(FileType::Vbs));
+        // No language, or one the host does not run: not claimed.
+        assert_eq!(
+            windows_script_host(b"<job><script>x = 1</script></job>"),
+            None
+        );
+        assert_eq!(
+            windows_script_host(b"<job><script language=\"PerlScript\">1;</script></job>"),
+            None
+        );
+        // Other XML is left to the XML arm.
+        assert_eq!(
+            windows_script_host(
+                b"<?xml version=\"1.0\"?><rss><script language=\"VBScript\"/></rss>"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn dib_header_versions() {
+        let header = |size: u32, planes: u16, bits: u16| {
+            let mut h = size.to_le_bytes().to_vec();
+            h.resize(40, 0);
+            let at = if size == 12 { 8 } else { 12 };
+            h[at..at + 2].copy_from_slice(&planes.to_le_bytes());
+            h[at + 2..at + 4].copy_from_slice(&bits.to_le_bytes());
+            h
+        };
+        for size in [12, 16, 40, 52, 56, 64, 108, 124] {
+            assert!(looks_like_dib_header(&header(size, 1, 8)), "size {size}");
+        }
+        assert!(!looks_like_dib_header(&header(41, 1, 8)));
+        assert!(!looks_like_dib_header(&header(40, 0, 8)));
+        assert!(!looks_like_dib_header(&header(40, 1, 3)));
+        assert!(!looks_like_dib_header(&[40, 0, 0]));
     }
 }

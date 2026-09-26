@@ -10,9 +10,12 @@
 //! Each language has at least one conclusive (weight=10) pattern and 2-3
 //! supporting patterns. This keeps the automaton small and cache-friendly.
 
-use std::sync::OnceLock;
+use std::{borrow::Cow, sync::OnceLock};
 
-use super::FileType;
+use super::{
+    FileType, scripts,
+    scripts::{contains, contains_ci, find_ci},
+};
 
 /// Minimum bytes of non-whitespace content required before we trust heuristics.
 const MIN_CONTENT_BYTES: usize = 16;
@@ -25,6 +28,14 @@ const TAIL_SIZE: usize = 2048;
 
 /// Minimum score to consider a language match.
 const THRESHOLD: u16 = 10;
+
+/// How much of a named source file [`contradicts_extension`] reads with the
+/// line grammars. A script misnamed as another language shows it early.
+const CONTRADICTION_WINDOW: usize = 8 * 1024;
+
+/// Most UTF-16 text that is narrowed for scoring. Far past every window the
+/// scorers read, including the tail of a padded file.
+const DECODE_LIMIT: usize = 4 << 20;
 
 /// Significant lines a document needs before its shape is judged as YAML. Short
 /// fragments carry too little structure to separate a mapping from prose.
@@ -491,6 +502,13 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
         return None;
     }
 
+    // Every scorer below reads bytes. Windows scripts are routinely saved as
+    // UTF-16, which reads as alternating NULs -- two thirds of the VBScript
+    // droppers in one triage set were, and none of them scored at all.
+    if let Some(text) = decoded_text(data) {
+        return detect_from_content(&text);
+    }
+
     // Detection rules, CI configuration, and package manifests quote the very
     // tokens this table scores: a rule pack hunting Python stagers contains
     // `import os`, one hunting macOS stealers contains `do shell script`. The
@@ -515,6 +533,20 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
         .unwrap_or(data.len());
     let body = &data[content_start..];
     let head = &body[..body.len().min(SCAN_LIMIT)];
+    // Batch, VBScript, mIRC and ircII are read line by line, verb first. That
+    // runs ahead of the binary and prose guards on purpose: batch files carry
+    // ANSI escapes and `echo` whole paragraphs, and the line grammar is what
+    // tells a script that talks from prose that mentions a command.
+    let script = scripts::evidence(body);
+    // A Dockerfile's `COPY src /dst` reads as a Windows `copy` with a switch;
+    // one that opens with `FROM` or `ARG` is left to the token table.
+    let verdict = script
+        .verdict()
+        .filter(|_| !starts_with_dockerfile_instruction(body));
+    if let Some(ft) = verdict {
+        return Some(ft);
+    }
+
     // Every scored language is text. A DOS COM file is not, and it does not
     // have to look like Clojure to be typed as Clojure -- `#'` is two bytes,
     // and two chance occurrences in a kilobyte of x86 reach THRESHOLD on their
@@ -579,6 +611,17 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
     } else {
         scores
     };
+
+    // Batch's and VBScript's tokens are quoted by everything that drops or
+    // launches them: a VBScript writing `@echo off` into a `.bat`, a makefile
+    // recipe's `@echo`, JScript's `new ActiveXObject("WScript.Shell")`. Their
+    // score only stands when some line is actually written in the language.
+    let mut scores = scores;
+    for (lang, ft) in [(Lang::Batch, FileType::Batch), (Lang::Vbs, FileType::Vbs)] {
+        if script.has_lines() && (!script.supports(ft) || script.rules_out(ft)) {
+            scores[lang.idx()] = 0;
+        }
+    }
 
     // Find the best and second-best scoring languages
     let mut best_lang: Option<Lang> = None;
@@ -682,6 +725,22 @@ const PROSE_GUARD_MIN_BYTES: usize = 1024;
 /// and the shell/comment sigils.
 const CODE_PUNCT: &[u8] = b"{}[]();=<>$#@\\|&*";
 
+fn is_code_punct(b: u8) -> bool {
+    CODE_PUNCT_TABLE[usize::from(b)]
+}
+
+/// [`CODE_PUNCT`] as a lookup table: prose screening reads every byte of the
+/// head, and a table is one load where a slice search is a call.
+const CODE_PUNCT_TABLE: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut i = 0;
+    while i < CODE_PUNCT.len() {
+        table[CODE_PUNCT[i] as usize] = true;
+        i += 1;
+    }
+    table
+};
+
 /// True when `head` reads like natural-language text rather than source.
 ///
 /// Measured on the first 4 KiB: prose (novels, licenses) has 0.15-0.3% code
@@ -736,11 +795,16 @@ pub(crate) fn is_utf16_text(data: &[u8]) -> bool {
 }
 
 fn looks_like_utf16_text(head: &[u8]) -> bool {
-    if head.starts_with(&[0xFF, 0xFE]) || head.starts_with(&[0xFE, 0xFF]) {
-        return true;
-    }
+    head.starts_with(&[0xFF, 0xFE])
+        || head.starts_with(&[0xFE, 0xFF])
+        || utf16_lanes(head).is_some()
+}
+
+/// The byte order of UTF-16 text without a byte-order mark: `Some(true)` for
+/// little-endian, whose ASCII leaves the odd bytes NUL.
+fn utf16_lanes(head: &[u8]) -> Option<bool> {
     if head.len() < 64 {
-        return false;
+        return None;
     }
     let pairs = head.len() / 2;
     let nul_even = head.iter().step_by(2).filter(|&&b| b == 0).count();
@@ -750,7 +814,54 @@ fn looks_like_utf16_text(head: &[u8]) -> bool {
     // is not text -- it used to pass as UTF-16 and keep a `.c` name.
     let mostly = |n: usize| n * 5 > pairs * 4;
     let sparse = |n: usize| n * 5 < pairs;
-    (mostly(nul_even) && sparse(nul_odd)) || (mostly(nul_odd) && sparse(nul_even))
+    if mostly(nul_odd) && sparse(nul_even) {
+        Some(true)
+    } else if mostly(nul_even) && sparse(nul_odd) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// The text the scorers should read instead of `data`, when that differs:
+/// UTF-16 narrowed to UTF-8, or a UTF-16 byte-order mark dropped from the
+/// 8-bit text behind it. The mark in front of plain ASCII is a batch trick --
+/// editors render the script as CJK, and cmd.exe runs it anyway.
+pub(crate) fn decoded_text(data: &[u8]) -> Option<Cow<'_, [u8]>> {
+    // UTF-16 spells a line of ASCII with a NUL in every other byte; text
+    // without a byte-order mark or an early NUL is not UTF-16.
+    if !matches!(data, [0xFF, 0xFE, ..] | [0xFE, 0xFF, ..])
+        && memchr::memchr(0, &data[..data.len().min(64)]).is_none()
+    {
+        return None;
+    }
+    let (bom, body) = match data {
+        [0xFF, 0xFE, rest @ ..] => (Some(true), rest),
+        [0xFE, 0xFF, rest @ ..] => (Some(false), rest),
+        _ => (None, data),
+    };
+    let probe = &body[..body.len().min(SCAN_LIMIT)];
+    // UTF-16 spells ASCII with every other byte NUL. 8-bit text behind the
+    // mark has next to none -- a stray one at the end is not an encoding.
+    let nuls = probe.iter().filter(|&&b| b == 0).count();
+    let little_endian = match (bom, utf16_lanes(probe)) {
+        (_, Some(le)) => le,
+        (Some(_), None) if nuls * 10 < probe.len() => return Some(Cow::Borrowed(body)),
+        (Some(le), None) => le,
+        (None, None) => return None,
+    };
+    let body = &body[..body.len().min(DECODE_LIMIT)];
+    let units = body.as_chunks::<2>().0.iter().map(|pair| {
+        if little_endian {
+            u16::from_le_bytes([pair[0], pair[1]])
+        } else {
+            u16::from_be_bytes([pair[0], pair[1]])
+        }
+    });
+    let text: String = char::decode_utf16(units)
+        .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect();
+    Some(Cow::Owned(text.into_bytes()))
 }
 
 /// Whether the body carries any scored token of `ft`'s language. `false` for a
@@ -784,8 +895,11 @@ pub(crate) fn looks_like_c_family(data: &[u8]) -> bool {
 /// Content that contradicts a source-language extension, and what it is
 /// instead. The extension is the last word, not the first: `Trojan.BAT.Looper.t`
 /// is a batch file whatever Perl's `.t` says, and `Exploit.JS.RealPlr.ko` is a
-/// page. Two ways to be contradicted:
+/// page. Three ways to be contradicted:
 ///
+/// * the line grammars read batch, VBScript, mIRC or ircII plainly and find
+///   no line of the claimed language -- a `.vbs` that is obfuscated batch, a
+///   `.bat` that is VBScript, a `.mrc` holding an ircII script;
 /// * the body opens as markup, which no source language (bar the template
 ///   ones, which stay with their extension) begins with;
 /// * the scorer names batch or VBScript outright and finds not one token of
@@ -808,24 +922,51 @@ pub(crate) fn contradicts_extension(ext: FileType, data: &[u8]) -> Option<FileTy
     ) {
         return None;
     }
-    let body = trim_ascii_start(data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(data));
-    if body.first() == Some(&b'<') && looks_like_html(data) {
+    let text = decoded_text(data).unwrap_or(Cow::Borrowed(data));
+    let body = trim_ascii_start(text.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&text));
+    // Ahead of the markup check: a batch file may open `<!-- :` to double as
+    // the WSF or HTA it carries further down. This runs on every source file
+    // with a name, so it reads less than a nameless file gets.
+    let script = scripts::evidence_within(body, CONTRADICTION_WINDOW);
+    if let Some(found) = script.verdict() {
+        let scores = scan_scores(&body[..body.len().min(SCAN_LIMIT)]);
+        let claimed = Lang::from_file_type(ext);
+        if found == ext || script.supports(ext) || claimed.is_some_and(|l| scores[l.idx()] > 0) {
+            return None;
+        }
+        // The name stands unless the body outweighs it. One command line does
+        // not: `msiexec /i URL` is as much PowerShell as batch. A name whose
+        // language nothing here reads (Elixir, Go) cannot be shown absent, so
+        // only a run of lines overrides it -- `@echo off` alone is also an
+        // Elixir module attribute.
+        let tokens_agree = claimed.is_some()
+            && Lang::from_file_type(found).is_some_and(|l| scores[l.idx()] >= THRESHOLD);
+        return (script.conclusive(found) || tokens_agree).then_some(found);
+    }
+    if body.first() == Some(&b'<') && looks_like_html(&text) {
         return Some(FileType::Html);
     }
     let claimed = Lang::from_file_type(ext)?;
+    // Only batch or VBScript can contradict a name this way, and the scorer
+    // names neither without its tokens in the head. Most source files stop
+    // here instead of being scored in full.
+    let head = &body[..body.len().min(SCAN_LIMIT)];
+    let scores = scan_scores(head);
+    if scores[Lang::Batch.idx()] < THRESHOLD && scores[Lang::Vbs.idx()] < THRESHOLD {
+        return None;
+    }
     let found = detect_from_content(data)?;
     if found == ext || !matches!(found, FileType::Batch | FileType::Vbs) {
         return None;
     }
-    let head = &body[..body.len().min(SCAN_LIMIT)];
-    (scan_scores(head)[claimed.idx()] == 0).then_some(found)
+    (scores[claimed.idx()] == 0).then_some(found)
 }
 
 fn looks_like_prose(head: &[u8]) -> bool {
     if head.is_empty() {
         return false;
     }
-    let punct = head.iter().filter(|b| CODE_PUNCT.contains(b)).count();
+    let punct = head.iter().filter(|&&b| is_code_punct(b)).count();
     let mut lines = 0usize;
     let mut code_lines = 0usize;
     for line in head.split(|&b| b == b'\n') {
@@ -833,7 +974,7 @@ fn looks_like_prose(head: &[u8]) -> bool {
             continue;
         }
         lines += 1;
-        if line.iter().any(|b| CODE_PUNCT.contains(b)) {
+        if line.iter().any(|&b| is_code_punct(b)) {
             code_lines += 1;
         }
     }
@@ -1083,11 +1224,8 @@ pub(crate) fn unmistakable(data: &[u8]) -> Option<FileType> {
     {
         return Some(FileType::Cfml);
     }
-    if looks_like_mirc(head) {
-        return Some(FileType::Mirc);
-    }
-    if contains(head, b"^on ") || contains(head, b"^alias ") {
-        return Some(FileType::IrcII);
+    if let Some(irc) = scripts::irc_mark(&data[..data.len().min(4096)]) {
+        return Some(irc);
     }
     if contains(head, b"\\documentclass")
         || contains(head, b"\\NeedsTeXFormat")
@@ -1100,159 +1238,6 @@ pub(crate) fn unmistakable(data: &[u8]) -> Option<FileType> {
         return Some(FileType::Yara);
     }
     None
-}
-
-/// mIRC events a remote script handles. The `on <level>:<EVENT>:` header is
-/// mIRC's own syntax; the level varies (`1`, `10`, `*`, `@1`) and so does the
-/// event, and matching only `on 1:TEXT:` left `on 10:TEXT:` and
-/// `on 1:START:` worms typed from their `.a` / `.m` variant letter.
-const MIRC_EVENTS: &[&[u8]] = &[
-    b"action",
-    b"active",
-    b"agent",
-    b"ban",
-    b"chat",
-    b"close",
-    b"connect",
-    b"ctcpreply",
-    b"dccserver",
-    b"deop",
-    b"dehelp",
-    b"devoice",
-    b"dialog",
-    b"disconnect",
-    b"error",
-    b"exit",
-    b"filercvd",
-    b"filesent",
-    b"getfail",
-    b"help",
-    b"hotlink",
-    b"input",
-    b"invite",
-    b"join",
-    b"keydown",
-    b"kick",
-    b"load",
-    b"logon",
-    b"mode",
-    b"nick",
-    b"notice",
-    b"notify",
-    b"op",
-    b"open",
-    b"part",
-    b"ping",
-    b"quit",
-    b"rawmode",
-    b"sendfail",
-    b"serv",
-    b"signal",
-    b"snotice",
-    b"sockclose",
-    b"socklisten",
-    b"sockopen",
-    b"sockread",
-    b"sockwrite",
-    b"start",
-    b"text",
-    b"topic",
-    b"udpread",
-    b"unload",
-    b"unotify",
-    b"usermode",
-    b"voice",
-];
-
-/// Identifiers only mIRC's scripting language has: `$+` concatenation and the
-/// file built-ins. ircII shares the `alias name {` form but none of these.
-const MIRC_IDENTIFIERS: &[&[u8]] = &[
-    b" $+ ",
-    b"$exists(",
-    b"$lines(",
-    b"$mircdir",
-    b"$findfile(",
-    b"$read(",
-    b".timer",
-];
-
-/// A mIRC remote script: an `on <level>:<EVENT>:` handler at the start of a
-/// line, an `alias name {` block written with mIRC identifiers, or the
-/// `[script]` / `[aliases]` INI mIRC saves scripts as, whose lines are
-/// numbered `n0=`, `n1=`.
-fn looks_like_mirc(head: &[u8]) -> bool {
-    // vxheaven's Trojan.IRC.Nullpy is all aliases; the one batch token in it,
-    // `@echo off`, is a line the script writes into the `.bat` it drops, and
-    // it was typed batch.
-    let alias_block = head
-        .split(|&b| b == b'\n')
-        .any(|line| is_mirc_alias_header(trim_ascii_start(line)));
-    if alias_block && MIRC_IDENTIFIERS.iter().any(|id| contains_ci(head, id)) {
-        return true;
-    }
-    for section in [&b"[script]"[..], b"[aliases]", b"[variables]", b"[users]"] {
-        if let Some(at) = find_ci(head, section) {
-            let rest = &head[at + section.len()..];
-            let rest = trim_ascii_start(rest);
-            if rest.starts_with(b"n0=") {
-                return true;
-            }
-        }
-    }
-    head.split(|&b| b == b'\n').any(|line| {
-        let mut line = trim_ascii_start(line);
-        // A saved script prefixes every line with its number: `n12=on ...`.
-        if line.first() == Some(&b'n') {
-            let digits = line[1..].iter().take_while(|b| b.is_ascii_digit()).count();
-            if digits > 0 && line.get(1 + digits) == Some(&b'=') {
-                line = trim_ascii_start(&line[2 + digits..]);
-            }
-        }
-        is_mirc_event_header(line)
-    })
-}
-
-/// `alias name {` -- a named block definition.
-fn is_mirc_alias_header(line: &[u8]) -> bool {
-    if line.len() < 6 || !line[..6].eq_ignore_ascii_case(b"alias ") {
-        return false;
-    }
-    let rest = trim_ascii_start(&line[6..]);
-    let name_len = rest
-        .iter()
-        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
-        .count();
-    name_len > 0 && trim_ascii_start(&rest[name_len..]).first() == Some(&b'{')
-}
-
-/// `on 1:TEXT:`, `on *:JOIN:`, `on @10:PART:`, `ctcp 1:VERSION:`.
-fn is_mirc_event_header(line: &[u8]) -> bool {
-    let rest = if line.len() >= 3 && line[..3].eq_ignore_ascii_case(b"on ") {
-        &line[3..]
-    } else {
-        return false;
-    };
-    let level_len = rest
-        .iter()
-        .take_while(|&&b| {
-            b.is_ascii_digit() || matches!(b, b'*' | b'@' | b'!' | b'+' | b'&' | b'^' | b'$')
-        })
-        .count();
-    if level_len == 0 || level_len > 6 || rest.get(level_len) != Some(&b':') {
-        return false;
-    }
-    let event = &rest[level_len + 1..];
-    let word_len = event.iter().take_while(|b| b.is_ascii_alphabetic()).count();
-    word_len > 0
-        && event.get(word_len) == Some(&b':')
-        && MIRC_EVENTS
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case(&event[..word_len]))
-}
-
-fn find_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len())
-        .position(|w| w.eq_ignore_ascii_case(needle))
 }
 
 /// DOS COM has no header. `CD 21` is `INT 21h`, the DOS syscall, and it sits
@@ -1278,25 +1263,30 @@ pub(crate) fn looks_like_unnamed_dos_com(data: &[u8]) -> bool {
 }
 
 fn looks_like_asp_directive(head: &[u8]) -> bool {
-    if contains_ci(head, b"<%@language") || contains_ci(head, b"<%@ language") {
-        return true;
+    // Classic ASP's own directives. `<%@codepage=936%>` opens a good share of
+    // the Chinese-language webshells.
+    let mut from = 0;
+    while let Some(at) = find_ci(&head[from..], b"<%@") {
+        let rest = trim_ascii_start(&head[from + at + 3..]);
+        let directive = [
+            &b"language"[..],
+            b"codepage",
+            b"enablesessionstate",
+            b"lcid",
+            b"transaction",
+        ]
+        .iter()
+        .any(|d| rest.len() >= d.len() && rest[..d.len()].eq_ignore_ascii_case(d));
+        if directive {
+            return true;
+        }
+        from += at + 3;
     }
     let page = contains_ci(head, b"<%@page") || contains_ci(head, b"<%@ page");
     page && (contains_ci(head, b"language=\"c#\"")
         || contains_ci(head, b"language=\"vb\"")
         || contains_ci(head, b"language='c#'")
         || contains_ci(head, b"language='vb'"))
-}
-
-fn contains(hay: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
-}
-
-fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && hay
-            .windows(needle.len())
-            .any(|w| w.eq_ignore_ascii_case(needle))
 }
 
 /// `rule <name>` plus both section labels. YARA keywords are lowercase;
@@ -1945,5 +1935,59 @@ mod lowercase_batch_heuristic_tests {
     fn c_goto_is_not_batch() {
         let data = b"int f(int x){ if(!x) goto done; return 1; done: return 0; }\n";
         assert_ne!(detect_from_content(data), Some(FileType::Batch));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod decoded_text_tests {
+    use super::*;
+
+    fn utf16(text: &str, little_endian: bool) -> Vec<u8> {
+        text.encode_utf16()
+            .flat_map(|u| {
+                if little_endian {
+                    u.to_le_bytes()
+                } else {
+                    u.to_be_bytes()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn utf16_is_narrowed() {
+        let text = "Set x = CreateObject(\"WScript.Shell\") ' caf\u{e9}\r\n".repeat(4);
+        let mut le = vec![0xFF, 0xFE];
+        le.extend(utf16(&text, true));
+        assert_eq!(decoded_text(&le).unwrap().as_ref(), text.as_bytes());
+        let mut be = vec![0xFE, 0xFF];
+        be.extend(utf16(&text, false));
+        assert_eq!(decoded_text(&be).unwrap().as_ref(), text.as_bytes());
+        // No mark: the lane of NULs says which order.
+        assert_eq!(
+            decoded_text(&utf16(&text, true)).unwrap().as_ref(),
+            text.as_bytes()
+        );
+        assert_eq!(
+            decoded_text(&utf16(&text, false)).unwrap().as_ref(),
+            text.as_bytes()
+        );
+        // Short text with a mark still decodes.
+        let mut short = vec![0xFF, 0xFE];
+        short.extend(utf16("MsgBox 1", true));
+        assert_eq!(decoded_text(&short).unwrap().as_ref(), b"MsgBox 1");
+    }
+
+    #[test]
+    fn mark_on_eight_bit_text_is_dropped() {
+        let data = b"\xff\xfe&cls\r\nstart \"\" x.exe\r\n\x00";
+        assert_eq!(decoded_text(data).unwrap().as_ref(), &data[2..]);
+    }
+
+    #[test]
+    fn ordinary_bytes_are_left_alone() {
+        assert!(decoded_text(b"@echo off\r\n").is_none());
+        assert!(decoded_text(&[0u8; 256]).is_none());
     }
 }
