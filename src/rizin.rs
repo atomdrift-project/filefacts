@@ -1964,6 +1964,24 @@ mod tests {
     }
 
     #[test]
+    fn without_exports_drops_only_the_export_view() {
+        let recovery = make_recovery(
+            r#"{
+                "imports": [{"name":"open","libname":"libc.so"}],
+                "exports": [{"name":"gopclntab","vaddr":4096}],
+                "functions": [{"name":"main","offset":4096,"cc":5,"nbbs":10}]
+            }"#,
+        );
+        let mut symbols = Symbols::new();
+        let mut metrics = Metrics::new();
+        let counts = recovery.without_exports().apply(&mut symbols, &mut metrics);
+        assert_eq!(counts.exports, 0);
+        assert_eq!(count_kind(&symbols, SymbolKind::Export), 0);
+        assert_eq!(count_kind(&symbols, SymbolKind::Import), 1);
+        assert_eq!(count_kind(&symbols, SymbolKind::Function), 1);
+    }
+
+    #[test]
     fn apply_aggregates_complexity_correctly() {
         // Three functions with cc 1, 3, 5 → mean = 3, max = 5.
         // nbbs 2, 4, 6 → mean = 4, total = 12.
@@ -2102,6 +2120,36 @@ mod tests {
                 "{want} not recovered by name; got {ours:?}"
             );
         }
+    }
+
+    /// End to end on a Go PE with no export directory (see
+    /// tests/fixtures/go-pe-no-exports.md). Rizin recovers its functions but
+    /// also lists the `gopclntab` symbol under `iEj`; that must not reach the
+    /// export view. Skips when rizin is not installed.
+    #[test]
+    fn go_pe_without_export_directory_recovers_no_exports() {
+        if !available() {
+            return;
+        }
+        let compressed = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/go-pe-no-exports.exe.zst"
+        ))
+        .expect("fixture present");
+        let bytes = zstd::decode_all(compressed.as_slice()).expect("fixture decompresses");
+        // Held for the whole parse: the reaper and timeout tests would turn
+        // this recovery into `None`, and an empty recovery passes vacuously.
+        let _lock = rizin_test_lock();
+        let parsed = crate::open(&bytes).expect("fixture parses as PE");
+
+        let symbols = parsed.symbols();
+        assert!(
+            count_kind(symbols, SymbolKind::Function) > 0,
+            "rizin did not run, so the export check below proves nothing"
+        );
+        let exports: Vec<&Symbol> = symbols.iter_kind(SymbolKind::Export).collect();
+        assert!(exports.is_empty(), "phantom exports: {exports:?}");
+        assert!(parsed.metrics().get("pe.recovered_exports").is_none());
     }
 
     // ------------------------------------------------------------------

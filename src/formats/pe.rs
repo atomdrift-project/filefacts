@@ -3337,6 +3337,33 @@ mod tests {
     }
 
     #[test]
+    fn declares_export_directory_reads_the_export_slot() {
+        use goblin::pe::data_directories::{DataDirectories, DataDirectory};
+        use goblin::pe::optional_header::{OptionalHeader, StandardFields, WindowsFields};
+        let header = |slot: Option<(u32, u32)>| {
+            let mut dirs = DataDirectories::default();
+            dirs.data_directories[0] = slot.map(|(virtual_address, size)| {
+                let dir = DataDirectory {
+                    virtual_address,
+                    size,
+                };
+                (0, dir)
+            });
+            OptionalHeader {
+                standard_fields: StandardFields::default(),
+                windows_fields: WindowsFields::default(),
+                data_directories: dirs,
+            }
+        };
+        assert!(!declares_export_directory(None));
+        assert!(!declares_export_directory(Some(&header(None))));
+        assert!(!declares_export_directory(Some(&header(Some((0, 0))))));
+        assert!(declares_export_directory(Some(&header(Some((
+            0x2000, 0x40
+        ))))));
+    }
+
+    #[test]
     fn format_guid_renders_mvid_like_ikdasm() {
         // #GUID heap bytes (first three fields little-endian) for the MVID
         // ikdasm prints as {3C2F06E5-115F-41C1-9886-1F7748FBEF06}.
