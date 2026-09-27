@@ -816,6 +816,7 @@ pub const CATALOG: &[&str] = &[
     "sections.name_entropy",
     "sections.nonstandard_count",
     "sections.writable_count",
+    "shellcode.getpc_offset",
     "source.ast_unavailable",
     "source.ast_unavailable.parse_cancelled",
     "source.ast_unavailable.parse_failed",

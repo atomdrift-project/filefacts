@@ -24,6 +24,7 @@ mod ext;
 mod heuristics;
 mod magic;
 mod scripts;
+pub(crate) mod shellcode;
 
 pub use container::{ArchiveFormat, Compression, Container, container_of};
 
@@ -190,7 +191,8 @@ fn file_group(ft: FileType) -> &'static str {
         | FileType::Dex
         | FileType::StaticLib
         | FileType::Lnk
-        | FileType::DosCom => "binary",
+        | FileType::DosCom
+        | FileType::Shellcode => "binary",
         // Interpreted scripting languages (cleave's `scripts` for-group).
         FileType::Shell
         | FileType::Batch
@@ -705,6 +707,9 @@ pub enum FileType {
     PostScript,
     /// DOS COM executable. No header of its own; `INT 21h` (`CD 21`) is the syscall.
     DosCom,
+    /// Headerless x86 / x86-64 position-independent code, recognised by the
+    /// GetPC idiom it opens with (see `fileid::shellcode`).
+    Shellcode,
     /// mIRC script (`.mrc`).
     Mirc,
     /// ircII or EPIC script. The `^on` / `^alias` hook syntax is the mark.
@@ -807,6 +812,7 @@ impl FileType {
                 | Self::Wasm
                 | Self::Dex
                 | Self::DosCom
+                | Self::Shellcode
         )
     }
 
@@ -971,6 +977,7 @@ impl FileType {
             Self::Yara => "yara",
             Self::PostScript => "postscript",
             Self::DosCom => "dos_com",
+            Self::Shellcode => "shellcode",
             Self::Mirc => "mirc",
             Self::IrcII => "ircii",
             Self::Markdown => "markdown",
@@ -1131,6 +1138,7 @@ impl FileType {
             "yara" => Self::Yara,
             "postscript" => Self::PostScript,
             "dos_com" => Self::DosCom,
+            "shellcode" => Self::Shellcode,
             "mirc" => Self::Mirc,
             "ircii" => Self::IrcII,
             "markdown" => Self::Markdown,
@@ -1633,7 +1641,7 @@ pub(crate) fn identify(path: &Path, data: &[u8]) -> (Option<Detection>, Option<R
                 }),
                 Some(key),
             ),
-            None => (unnamed_dos_com(path, data), None),
+            None => (unnamed_program(path, data), None),
         },
     }
 }
@@ -1893,14 +1901,16 @@ fn detect_known(path: &Path, data: &[u8]) -> Option<Detection> {
             return None;
         }
         // `.bin`/`.dat`/`.raw` say nothing about the content, and DOS samples
-        // routinely carry them. A COM-shaped body under a generic data name is
-        // the program, not opaque data.
-        if file_type == FileType::Data && heuristics::looks_like_unnamed_dos_com(data) {
-            return Some(Detection {
-                file_type: FileType::DosCom,
-                source: DetectionSource::Heuristic,
-                ext_match: ExtensionMatch::Different(FileType::Data),
-            });
+        // and carved shellcode routinely carry them. A program-shaped body
+        // under a generic data name is the program, not opaque data.
+        if file_type == FileType::Data {
+            if let Some(program) = headerless_program(data) {
+                return Some(Detection {
+                    file_type: program,
+                    source: DetectionSource::Heuristic,
+                    ext_match: ExtensionMatch::Different(FileType::Data),
+                });
+            }
         }
         return Some(Detection {
             file_type,
@@ -1913,11 +1923,11 @@ fn detect_known(path: &Path, data: &[u8]) -> Option<Detection> {
 }
 
 /// Nothing recognised the file. Corpora name samples by hash, so a DOS COM
-/// there has no `.com` to go on; without this it was Unknown, which no trait
-/// walks, and every DOS rule was blind to it.
-fn unnamed_dos_com(path: &Path, data: &[u8]) -> Option<Detection> {
-    heuristics::looks_like_unnamed_dos_com(data).then(|| Detection {
-        file_type: FileType::DosCom,
+/// there has no `.com` to go on, and carved shellcode has no name at all;
+/// without this they were Unknown, which no trait walks.
+fn unnamed_program(path: &Path, data: &[u8]) -> Option<Detection> {
+    headerless_program(data).map(|file_type| Detection {
+        file_type,
         source: DetectionSource::Heuristic,
         ext_match: if has_named_extension(path) {
             ExtensionMatch::Unknown
@@ -1925,6 +1935,18 @@ fn unnamed_dos_com(path: &Path, data: &[u8]) -> Option<Detection> {
             ExtensionMatch::Consistent
         },
     })
+}
+
+/// A program with no header of its own: a DOS COM, else x86 code that opens
+/// with a GetPC idiom. DOS COM is checked first; its test is the older one.
+fn headerless_program(data: &[u8]) -> Option<FileType> {
+    if heuristics::looks_like_unnamed_dos_com(data) {
+        Some(FileType::DosCom)
+    } else if shellcode::detect(data).is_some() {
+        Some(FileType::Shellcode)
+    } else {
+        None
+    }
 }
 
 /// Types whose extension names a language or script, so a body that is not
@@ -1957,11 +1979,13 @@ fn is_magic_defined(ft: FileType) -> bool {
     )
 }
 
-/// Object code with no header: a DOS COM program when it calls DOS, otherwise
-/// opaque data.
+/// Object code with no header: a DOS COM program when it calls DOS, x86
+/// shellcode when it opens with a GetPC idiom, otherwise opaque data.
 fn binary_body_type(data: &[u8]) -> FileType {
     if heuristics::looks_like_dos_com(data) {
         FileType::DosCom
+    } else if shellcode::detect(data).is_some() {
+        FileType::Shellcode
     } else {
         FileType::Data
     }
@@ -2715,6 +2739,56 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
         );
         assert_detect("prog", &com, FileType::DosCom);
         assert_detect("prog.bin", &com, FileType::DosCom);
+    }
+
+    /// Opaque bytes after a call/pop GetPC stub: the shape of a carved,
+    /// encoded stage. Unknown before, so no rule could reach it.
+    fn call_pop_blob() -> Vec<u8> {
+        let mut state = 0x2545_F491u32;
+        let mut blob: Vec<u8> = (0..512)
+            .map(|_| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (state >> 24) as u8
+            })
+            .collect();
+        blob[..5].copy_from_slice(&[0xE8, 0xFB, 0x01, 0, 0]); // call → 0x200
+        blob.resize(0x210, 0);
+        blob[0x200] = 0x5A; // pop edx
+        blob
+    }
+
+    #[test]
+    fn headerless_shellcode_is_shellcode() {
+        let sc = call_pop_blob();
+        for name in [
+            "agent.bin.sgn",
+            "prog",
+            "stage.bin",
+            "payload.dat",
+            "a.exe",
+            "x.c",
+        ] {
+            assert_detect(name, &sc, FileType::Shellcode);
+        }
+        assert_eq!(FileId::from_bytes(&sc).file_type(), FileType::Shellcode);
+        assert_eq!(FileType::from_label("shellcode"), Some(FileType::Shellcode));
+        assert!(FileType::Shellcode.is_binary());
+    }
+
+    #[test]
+    fn known_formats_beat_shellcode() {
+        let mut pe = call_pop_blob();
+        pe[..2].copy_from_slice(b"MZ");
+        assert_ne!(
+            detect(Path::new("a.bin"), &pe).map(|d| d.file_type),
+            Some(FileType::Shellcode)
+        );
+        // Without the stub's pop, it stays what it was.
+        let mut data = call_pop_blob();
+        data[0x200] = 0x90;
+        assert!(
+            detect(Path::new("blob"), &data).is_none_or(|d| d.file_type != FileType::Shellcode)
+        );
     }
 
     /// A PE under a repeating XOR key is opaque data, not Unknown: that is
@@ -4133,6 +4207,7 @@ function wpcf7_special_mail_tag( $output, $name, $html ) {
             FileType::Yara,
             FileType::PostScript,
             FileType::DosCom,
+            FileType::Shellcode,
             FileType::Mirc,
             FileType::IrcII,
             FileType::Markdown,

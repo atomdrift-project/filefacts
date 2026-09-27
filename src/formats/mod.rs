@@ -107,6 +107,7 @@ mod rtf;
 mod rust_crate;
 mod scpt;
 mod sevenz;
+mod shellcode;
 pub(crate) mod source;
 mod source_meta;
 mod structured;
@@ -381,6 +382,10 @@ pub(crate) fn extract(
         FileType::JavaClass => class::extract(bytes, values, strings, metrics, symbols),
         FileType::Jpeg => jpeg::extract(bytes, values, strings, metrics),
         FileType::Lnk => lnk::extract(bytes, values, strings, metrics),
+        FileType::Shellcode => {
+            shellcode::extract(bytes, values, metrics);
+            Ok(())
+        }
         FileType::Pdf => pdf::extract(bytes, values, strings, metrics),
         FileType::Pickle => pickle::extract(bytes, values, strings, metrics),
         FileType::Font => font::extract(bytes, values, strings, metrics),
