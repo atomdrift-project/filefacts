@@ -117,7 +117,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 pub use embedded_sources::EmbeddedSource;
 pub use error::Error;
-pub use fileid::{ArchiveFormat, Compression, Container, FileId, FileType, container_of};
+pub use fileid::{
+    ArchiveFormat, Compression, Container, DecodedDosComPayload, DosComXorMethod, FileId, FileType,
+    container_of, decode_dos_com_xor_payload,
+};
 pub use output::{
     ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Arg, ArgShape, CATALOG,
     Claim, Comments, ErrorKind, Errors, ExtractedString, FAMILIES, Fact, HashAlgo, Identity,

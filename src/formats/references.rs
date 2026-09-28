@@ -933,8 +933,9 @@ fn push_local_ref(out: &mut Refs<'_>, path: &str, source: &str) {
 /// text — the dependency map is not mirrored into `values`. Each becomes a
 /// fetchable npm reference: an exact pin (`1.2.3`) resolves straight to its
 /// tarball like a lockfile entry, while a range, dist-tag, or wildcard is
-/// emitted versionless for the fetcher to resolve against the registry. Only
-/// `dependencies`/`optionalDependencies` are followed — `devDependencies` and
+/// emitted as an unversioned coordinate with its spec preserved for the
+/// fetcher to resolve against the registry. Only `dependencies` and
+/// `optionalDependencies` are followed — `devDependencies` and
 /// `peerDependencies` are not installed for a consumed package, so they are not
 /// part of the delivered supply chain. A no-op for a binary `.tgz` (no text).
 fn npm_manifest_deps(out: &mut Refs<'_>) {
@@ -1003,7 +1004,7 @@ fn npm_registry_locator(name: &str, spec: &str) -> Option<RefLocator> {
         RefLocator::Purl(if is_exact_npm_version(spec) {
             npm_purl(name, spec)
         } else {
-            npm_purl_unversioned(name)
+            npm_purl_unversioned(name, spec)
         })
     })
 }
@@ -1021,13 +1022,14 @@ fn is_local_npm_spec(spec: &str) -> bool {
 
 /// Split an `npm:` alias body into the aliased package and its range. The name
 /// may be scoped, so the separating `@` is the one after position 0; with no
-/// range the alias tracks whatever the registry serves (`*`).
+/// range the requirement is empty and the alias tracks the registry's current
+/// release.
 fn split_npm_alias(alias: &str) -> (&str, &str) {
     let at = match alias.strip_prefix('@') {
         Some(scoped) => scoped.find('@').map(|i| i + 1),
         None => alias.find('@'),
     };
-    at.map_or((alias, "*"), |i| (&alias[..i], &alias[i + 1..]))
+    at.map_or((alias, ""), |i| (&alias[..i], &alias[i + 1..]))
 }
 
 /// A spec fetched from a forge or a URL rather than the registry, as its
@@ -1071,21 +1073,49 @@ fn npm_forge_shorthand(spec: &str) -> Option<String> {
         .then(|| format!("https://{host}/{owner}/{repo}"))
 }
 
-/// An npm PURL with no version — a manifest dependency whose declared spec is a
-/// range/tag/wildcard rather than a single version. The fetcher resolves it to
-/// the registry's current release.
-fn npm_purl_unversioned(name: &str) -> String {
-    match name.strip_prefix('@').and_then(|s| s.split_once('/')) {
+/// An npm PURL with no pinned version, retaining the declared range or tag as
+/// a qualifier so the fetcher can resolve exactly what the package manager
+/// would install. A rangeless or wildcard spec is the bare coordinate.
+fn npm_purl_unversioned(name: &str, spec: &str) -> String {
+    let mut purl = match name.strip_prefix('@').and_then(|s| s.split_once('/')) {
         Some((scope, pkg)) => format!("pkg:npm/%40{scope}/{pkg}"),
         None => format!("pkg:npm/{name}"),
+    };
+    push_version_requirement(&mut purl, spec);
+    purl
+}
+
+/// Append a declared install constraint to an unversioned PURL as a
+/// `version_requirement` qualifier. PURL itself has no range syntax, so this
+/// is a house convention for the fetcher; an empty or `*` requirement carries
+/// no information and is omitted, leaving the plain coordinate.
+fn push_version_requirement(purl: &mut String, requirement: &str) {
+    let requirement = requirement.trim();
+    if requirement.is_empty() || requirement == "*" {
+        return;
     }
+    purl.push_str("?version_requirement=");
+    purl.push_str(&purl_encode(requirement));
+}
+
+/// Percent-encode a PURL component, keeping only the unreserved characters.
+fn purl_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// Whether an npm dependency spec is a single concrete version
 /// (`MAJOR.MINOR.PATCH[-prerelease]`) rather than a range, comparator, union,
 /// dist-tag, or partial/wildcard. Errs toward "not exact": a misjudged exact
-/// would build a bogus tarball URL, whereas a non-exact simply resolves to the
-/// registry's current version.
+/// would build a bogus tarball URL, whereas a non-exact keeps its install
+/// requirement or dist-tag for the fetcher.
 fn is_exact_npm_version(spec: &str) -> bool {
     spec.starts_with(|c: char| c.is_ascii_digit())
         && spec.split('.').count() >= 3
@@ -1393,7 +1423,7 @@ mod tests {
     fn package_json_deps_pin_exact_and_unversion_ranges() {
         // A manifest declares an exact pin, a caret range, a scoped range, and
         // an optional dep; dev deps are ignored. Exact → versioned PURL;
-        // anything else → versionless PURL for the fetcher to resolve.
+        // non-exact specs retain their constraint on an unversioned PURL.
         let manifest = br#"{
             "name": "app",
             "dependencies": {
@@ -1413,9 +1443,18 @@ mod tests {
             })
             .collect();
         assert!(purls.contains(&"pkg:npm/left-pad@1.3.0"), "{purls:?}");
-        assert!(purls.contains(&"pkg:npm/easy-day-js"), "{purls:?}");
-        assert!(purls.contains(&"pkg:npm/%40scope/util"), "{purls:?}");
-        assert!(purls.contains(&"pkg:npm/fsevents"), "{purls:?}");
+        assert!(
+            purls.contains(&"pkg:npm/easy-day-js?version_requirement=%5E1.11.21"),
+            "{purls:?}"
+        );
+        assert!(
+            purls.contains(&"pkg:npm/%40scope/util?version_requirement=~2.0.0"),
+            "{purls:?}"
+        );
+        assert!(
+            purls.contains(&"pkg:npm/fsevents"),
+            "a wildcard adds nothing to the coordinate: {purls:?}"
+        );
         assert!(
             !purls.iter().any(|p| p.contains("typescript")),
             "devDependencies must not be fetched: {purls:?}"
@@ -1423,7 +1462,7 @@ mod tests {
         // The declared range is preserved as evidence for the report.
         let easy = refs
             .iter()
-            .find(|r| matches!(&r.locator, RefLocator::Purl(p) if p == "pkg:npm/easy-day-js"))
+            .find(|r| matches!(&r.locator, RefLocator::Purl(p) if p == "pkg:npm/easy-day-js?version_requirement=%5E1.11.21"))
             .expect("easy-day-js ref");
         assert_eq!(easy.evidence, "easy-day-js@^1.11.21");
         assert_eq!(easy.kind, RefKind::Dependency);
@@ -1515,7 +1554,10 @@ mod tests {
         }
         // An alias names the aliased package, never the local import name.
         assert!(has("pkg:npm/left-pad@1.3.0"), "{locators:?}");
-        assert!(has("pkg:npm/%40scope/util"), "{locators:?}");
+        assert!(
+            has("pkg:npm/%40scope/util"),
+            "a rangeless alias is the bare coordinate: {locators:?}"
+        );
         assert!(
             !locators
                 .iter()
@@ -1532,8 +1574,12 @@ mod tests {
         );
         // A plain URL is fetched verbatim.
         assert!(has("https://example.com/foo.tgz"), "{locators:?}");
-        // The ordinary registry range is untouched.
-        assert!(has("pkg:npm/range-dep"), "{locators:?}");
+        // The ordinary registry range remains a registry dependency with its
+        // install constraint retained.
+        assert!(
+            has("pkg:npm/range-dep?version_requirement=%5E1.6.0"),
+            "{locators:?}"
+        );
         assert_eq!(refs.len(), 8, "one ref per non-local spec: {locators:?}");
     }
 
@@ -1541,8 +1587,8 @@ mod tests {
     fn npm_alias_splits_scoped_and_unversioned_forms() {
         assert_eq!(split_npm_alias("left-pad@1.3.0"), ("left-pad", "1.3.0"));
         assert_eq!(split_npm_alias("@scope/util@^2"), ("@scope/util", "^2"));
-        assert_eq!(split_npm_alias("@scope/util"), ("@scope/util", "*"));
-        assert_eq!(split_npm_alias("left-pad"), ("left-pad", "*"));
+        assert_eq!(split_npm_alias("@scope/util"), ("@scope/util", ""));
+        assert_eq!(split_npm_alias("left-pad"), ("left-pad", ""));
     }
 
     #[test]

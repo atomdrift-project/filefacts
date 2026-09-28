@@ -12,6 +12,7 @@
 
 use std::{borrow::Cow, sync::OnceLock};
 
+use super::doscom::DOS_COM_MAX_SIZE;
 use super::{
     FileType, scripts,
     scripts::{contains, contains_ci, find_ci},
@@ -206,6 +207,7 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"[CmdletBinding(", Lang::PowerShell, 10),
     (b"Add-Type -", Lang::PowerShell, 10),
     (b"$env:", Lang::PowerShell, 5),
+    (b"[Byte[]]", Lang::PowerShell, 10),
     // ── Perl ──
     (b"use strict;", Lang::Perl, 10),
     (b"use warnings;", Lang::Perl, 10),
@@ -731,6 +733,53 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
     }
 
     Some(lang.to_file_type())
+}
+
+/// PowerShell droppers sometimes conceal commands in a decimal byte array:
+/// `$name = @(83,116,97,114,116,...)`. The ordinary keyword scorer cannot see
+/// any of the commands until that array is decoded. This shape is distinctive
+/// enough to disambiguate an otherwise ambiguous `.ps` suffix when no PostScript
+/// header is present.
+pub(crate) fn has_powershell_char_code_array(data: &[u8]) -> bool {
+    let head = &data[..data.len().min(SCAN_LIMIT)];
+    let Some(start) = head.windows(2).position(|w| w == b"@(") else {
+        return false;
+    };
+    // Require an assignment immediately before the array, allowing whitespace.
+    let prefix = &head[..start];
+    if prefix.iter().rev().find(|b| !b.is_ascii_whitespace()) != Some(&b'=') {
+        return false;
+    }
+
+    let mut i = start + 2;
+    let mut count = 0;
+    loop {
+        while head.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        let digits = i;
+        let mut value = 0u16;
+        while let Some(b @ b'0'..=b'9') = head.get(i).copied() {
+            value = value * 10 + u16::from(b - b'0');
+            if value > 255 {
+                return false;
+            }
+            i += 1;
+        }
+        let width = i - digits;
+        if width == 0 || width > 3 {
+            return false;
+        }
+        count += 1;
+        while head.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        match head.get(i) {
+            Some(b',') => i += 1,
+            Some(b')') => return count >= 8,
+            _ => return false,
+        }
+    }
 }
 
 /// First offset of `needle` in `haystack`.
@@ -1259,26 +1308,33 @@ pub(crate) fn unmistakable(data: &[u8]) -> Option<FileType> {
     None
 }
 
-/// DOS COM has no header. `CD 21` is `INT 21h`, the DOS syscall, and it sits
-/// near the front of the infectors that were wearing a source extension.
+/// DOS COM has no header. A visible `CD 21` is strong evidence; compact
+/// encrypted samples may instead start with a recognized in-place XOR stub.
 pub(crate) fn looks_like_dos_com(data: &[u8]) -> bool {
-    let head = &data[..data.len().min(256)];
-    head.windows(2).any(|w| w == [0xCD, 0x21])
+    if data.len() > DOS_COM_MAX_SIZE {
+        return false;
+    }
+    let head = &data[..data.len().min(4096)];
+    head.windows(2).any(|w| w == [0xCD, 0x21]) || super::doscom::looks_like_xor_stub(data)
 }
 
-/// Largest image DOS will load as a `.COM`: one 64 KiB segment minus the
-/// 256-byte PSP.
-pub(crate) const DOS_COM_MAX_SIZE: usize = 0xFF00;
-
 /// A headerless binary with no telling name that is still shaped like a DOS
-/// COM program. Stricter than [`looks_like_dos_com`] because nothing but the
-/// bytes vouches for it: the size bound is what keeps a large ciphertext or
-/// firmware blob with a chance `CD 21` near the front from becoming a program.
+/// COM program. A single `CD 21` is too common in arbitrary binary metadata,
+/// so unnamed files need an adjacent DOS service selector or a recognized XOR
+/// stub before we assign an executable type.
 pub(crate) fn looks_like_unnamed_dos_com(data: &[u8]) -> bool {
     data.len() >= 16
         && data.len() <= DOS_COM_MAX_SIZE
         && binary_not_source(data)
-        && looks_like_dos_com(data)
+        && (has_dos_service_call(data) || super::doscom::looks_like_xor_stub(data))
+}
+
+fn has_dos_service_call(data: &[u8]) -> bool {
+    data.windows(4)
+        .any(|w| w[0] == 0xB4 && w[2..] == [0xCD, 0x21])
+        || data
+            .windows(5)
+            .any(|w| w[0] == 0xB8 && w[3..] == [0xCD, 0x21])
 }
 
 fn looks_like_asp_directive(head: &[u8]) -> bool {

@@ -25,6 +25,18 @@ const UTF8_FLAG: u32 = 1 << 8;
 /// this bounds a crafted file without truncating a real one.
 const MAX_ELEMENTS: usize = 4096;
 
+/// Identify a compiled Android XML document before passing arbitrary XML or
+/// binary data through the tolerant chunk walker.
+pub(super) fn looks_like_axml(data: &[u8]) -> bool {
+    if data.len() < 12 || data.len() > 16 * 1024 * 1024 {
+        return false;
+    }
+    u16_at(data, 0) == Some(0x0003)
+        && u16_at(data, 2) == Some(8)
+        && u32_at(data, 4) == Some(data.len() as u32)
+        && u16_at(data, 8) == Some(TYPE_STRING_POOL)
+}
+
 fn u16_at(b: &[u8], off: usize) -> Option<u16> {
     Some(u16::from_le_bytes([*b.get(off)?, *b.get(off + 1)?]))
 }
@@ -156,6 +168,32 @@ pub(super) fn parse(bytes: &[u8]) -> Vec<Element> {
         off += size;
     }
     elements
+}
+
+/// Publish decoded string-valued Android XML attributes. The ordinary byte
+/// string scanner cannot see strings in AXML's indexed UTF-8/UTF-16 pool, but
+/// those values include the visible copy, button labels, and input hints in
+/// lock screens and overlays.
+pub(super) fn extract_values(bytes: &[u8], values: &mut crate::output::Values) {
+    let elements = parse(bytes);
+    if elements.is_empty() {
+        return;
+    }
+    let flattened: Vec<_> = elements
+        .iter()
+        .flat_map(|element| {
+            element.attrs.iter().map(|(attribute, value)| {
+                serde_json::json!({
+                    "element": element.name,
+                    "attribute": attribute,
+                    "value": value,
+                })
+            })
+        })
+        .collect();
+    if !flattened.is_empty() {
+        values.insert("android_xml.values", serde_json::Value::Array(flattened));
+    }
 }
 
 fn parse_start_element(chunk: &[u8], pool: &[String]) -> Option<Element> {

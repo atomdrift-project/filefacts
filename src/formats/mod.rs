@@ -166,6 +166,9 @@ pub(crate) fn extract(
     // extractors layer on top of (and may shadow with more accurate
     // values) what generic emits.
     generic::extract(bytes, values, strings, metrics);
+    if file_type == FileType::Xml && axml::looks_like_axml(bytes) {
+        axml::extract_values(bytes, values);
+    }
     if let Some(key) = xor_pe_key {
         generic::extract_xor_pe(key, values, metrics);
     }

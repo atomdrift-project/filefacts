@@ -20,6 +20,7 @@
 //! ```
 
 pub mod container;
+mod doscom;
 mod ext;
 mod heuristics;
 mod magic;
@@ -27,6 +28,7 @@ mod scripts;
 pub(crate) mod shellcode;
 
 pub use container::{ArchiveFormat, Compression, Container, container_of};
+pub use doscom::{DecodedDosComPayload, DosComXorMethod, decode_dos_com_xor_payload};
 
 use std::path::Path;
 use stng::{RepeatingXorKey, recover_repeating_xor_pe};
@@ -184,6 +186,7 @@ fn file_group(ft: FileType) -> &'static str {
         FileType::MachO
         | FileType::Elf
         | FileType::Pe
+        | FileType::Ne
         | FileType::JavaClass
         | FileType::PythonBytecode
         | FileType::Beam
@@ -355,6 +358,8 @@ pub enum FileType {
     Elf,
     /// PE binary (Windows executable, DLL)
     Pe,
+    /// Windows New Executable (16-bit NE) binary
+    Ne,
     /// Unix shell script (bash, sh, zsh, etc.)
     Shell,
     /// Windows batch file (.bat, .cmd)
@@ -795,6 +800,8 @@ impl FileType {
                 | Self::GentooBinpkg
                 | Self::Asar
                 | Self::Jar
+                | Self::Snap
+                | Self::SquashFs
         )
     }
 
@@ -805,6 +812,7 @@ impl FileType {
             self,
             Self::Elf
                 | Self::Pe
+                | Self::Ne
                 | Self::MachO
                 | Self::JavaClass
                 | Self::PythonBytecode
@@ -901,6 +909,7 @@ impl FileType {
             Self::MachO => "macho",
             Self::Elf => "elf",
             Self::Pe => "pe",
+            Self::Ne => "ne",
             Self::JavaClass => "java_class",
             Self::PythonBytecode => "python_bytecode",
             Self::Beam => "beam",
@@ -1065,6 +1074,7 @@ impl FileType {
             "macho" => Self::MachO,
             "elf" => Self::Elf,
             "pe" => Self::Pe,
+            "ne" => Self::Ne,
             "java_class" => Self::JavaClass,
             "python_bytecode" => Self::PythonBytecode,
             "beam" => Self::Beam,
@@ -1564,9 +1574,15 @@ fn is_benign_extension_mismatch(path: &Path, data: &[u8], det: Detection) -> boo
     let content = det.file_type;
     let name_ends_ci = |suffix: &str| {
         path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-            n.len() >= suffix.len() && n[n.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+            n.len() >= suffix.len()
+                && n.as_bytes()[n.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
         })
     };
+    // `.exe` is shared by the older 16-bit Windows NE format and PE. The
+    // extension database resolves it to PE, but NE content is a valid `.exe`.
+    if name_ends_ci(".exe") && ext_type == FileType::Pe && content == FileType::Ne {
+        return true;
+    }
     // Android/Alpine APK: `.apk` (extension maps to Zip) resolved by container
     // magic to the ecosystem-specific type. Both are legitimate `.apk`s — the
     // disambiguation is the point, not an evasion signal.
@@ -1780,6 +1796,21 @@ fn detect_known(path: &Path, data: &[u8]) -> Option<Detection> {
                 ext_match,
             });
         }
+    }
+
+    // `.ps` is shared by PostScript and PowerShell. A strong PowerShell content
+    // score disambiguates script payloads, while the `%!PS` magic above keeps
+    // real PostScript authoritative.
+    if ext_ft == Some(FileType::PostScript)
+        && !data.trim_ascii_start().starts_with(b"%!PS")
+        && (heuristics::detect_from_content(data) == Some(FileType::PowerShell)
+            || heuristics::has_powershell_char_code_array(data))
+    {
+        return Some(Detection {
+            file_type: FileType::PowerShell,
+            source: DetectionSource::Heuristic,
+            ext_match: ExtensionMatch::Different(FileType::PostScript),
+        });
     }
 
     // Stage 3: Content heuristics for unknown extensions and extension-claimed
@@ -2713,8 +2744,7 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
         for i in (0..80).step_by(8) {
             com[i] = 0x01;
         }
-        com[11] = 0xCD;
-        com[12] = 0x21;
+        com[10..14].copy_from_slice(&[0xB4, 0x4C, 0xCD, 0x21]);
         assert_detect("Burger.m", &com, FileType::DosCom);
         assert_detect("Trivial.45.t", &com, FileType::DosCom);
         assert_detect("prog.com", &com, FileType::DosCom);
@@ -2730,8 +2760,7 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
         for i in (0..80).step_by(8) {
             com[i] = 0x01;
         }
-        com[11] = 0xCD;
-        com[12] = 0x21;
+        com[10..14].copy_from_slice(&[0xB4, 0x4C, 0xCD, 0x21]);
         assert_detect(
             "0f3a9c1e2b7d4f6a8e5c3b1a9d7f5e3c1b9a7d5f3e1c9b7a5d3f1e9c7b5a3d1f",
             &com,
@@ -2791,6 +2820,18 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
         );
     }
 
+    #[test]
+    fn kotlin_native_metadata_with_incidental_int21_is_data() {
+        let mut knf = vec![0u8; 0x520];
+        knf[..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        knf[0x500..0x507].copy_from_slice(&[0x26, 0xE7, 0x26, 0xF4, 0x26, 0xCD, 0x21]);
+        assert!(
+            detect(Path::new("45_js.knf"), &knf)
+                .is_none_or(|detection| detection.file_type != FileType::DosCom),
+            "Kotlin/Native metadata must not be classified as DOS COM"
+        );
+    }
+
     /// A PE under a repeating XOR key is opaque data, not Unknown: that is
     /// what routes it to the generic analyzer and the `xor.*` facts.
     #[test]
@@ -2839,7 +2880,7 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
     /// how a ciphertext or firmware blob with a chance `CD 21` stays data.
     #[test]
     fn oversized_blob_with_int21_is_not_dos_com() {
-        let mut blob = vec![0x01u8; heuristics::DOS_COM_MAX_SIZE + 1];
+        let mut blob = vec![0x01u8; doscom::DOS_COM_MAX_SIZE + 1];
         blob[11] = 0xCD;
         blob[12] = 0x21;
         assert_detect("prog.bin", &blob, FileType::Data);
@@ -3313,6 +3354,8 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
         assert!(FileType::SevenZ.is_archive());
         assert!(FileType::Deb.is_archive());
         assert!(FileType::Jar.is_archive());
+        assert!(FileType::Snap.is_archive());
+        assert!(FileType::SquashFs.is_archive());
         assert!(!FileType::Elf.is_archive());
         assert!(!FileType::Python.is_archive());
     }

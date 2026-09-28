@@ -1,20 +1,8 @@
 //! Declarative dependency and local-entry references. No package code runs.
 use super::{
     JsonValue, RefKind, RefLocator, Refs, Values, is_exact_npm_version, locator_from_repo,
-    push_local_ref, pypi_purl,
+    purl_encode as encode, push_local_ref, push_version_requirement, pypi_purl,
 };
-
-fn encode(s: &str) -> String {
-    s.bytes()
-        .map(|b| {
-            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-                char::from(b).to_string()
-            } else {
-                format!("%{b:02X}")
-            }
-        })
-        .collect()
-}
 
 pub(super) fn cargo(values: &Values, out: &mut Refs<'_>) {
     let root = values.as_json();
@@ -132,7 +120,7 @@ fn cargo_table(
             purl.push('@');
             purl.push_str(exact);
         } else {
-            purl.push_str(&format!("?version_requirement={}", encode(requirement)));
+            push_version_requirement(&mut purl, requirement);
         }
         let kind = if let Some(registry) = spec.get("registry").and_then(JsonValue::as_str) {
             purl.push_str(if purl.contains('?') { "&" } else { "?" });
@@ -262,10 +250,10 @@ fn python_requirement(spec: &str, source: &str, out: &mut Refs<'_>) {
         .filter(|v| !v.contains([',', '*', ' ']))
     {
         format!("{base}@{}", encode(exact))
-    } else if rest.is_empty() {
-        base
     } else {
-        format!("{base}?version_requirement={}", encode(rest))
+        let mut purl = base;
+        push_version_requirement(&mut purl, rest);
+        purl
     };
     if let Some(marker) = marker {
         purl.push_str(if purl.contains('?') { "&" } else { "?" });
@@ -288,7 +276,7 @@ mod tests {
     #[test]
     fn cargo_roles_aliases_ranges_workspace_and_disabled_build() {
         let values = Values::from_json(
-            serde_json::json!({"package":{"name":"x","build":false},"dependencies":{"json":{"package":"serde_json","version":"=1.0.1"},"serde":"1.0"},"build-dependencies":{"cc":{"workspace":true}},"workspace":{"dependencies":{"cc":"=1.0.99"}},"target":{"cfg(unix)":{"build-dependencies":{"bindgen":"0.69"}}},"dev-dependencies":{"tempfile":"3"}}),
+            serde_json::json!({"package":{"name":"x","build":false},"dependencies":{"json":{"package":"serde_json","version":"=1.0.1"},"serde":"1.0","anyhow":"*","log":{"optional":true}},"build-dependencies":{"cc":{"workspace":true}},"workspace":{"dependencies":{"cc":"=1.0.99"}},"target":{"cfg(unix)":{"build-dependencies":{"bindgen":"0.69"}}},"dev-dependencies":{"tempfile":"3"}}),
         );
         let refs = derive(FileType::CargoToml, &[], &values);
         assert!(
@@ -300,6 +288,21 @@ mod tests {
                 .any(|r| r.source.contains("build-dependencies.cc")
                     && r.locator == RefLocator::Purl("pkg:cargo/cc@1.0.99".into()))
         );
+        // A range rides along as a qualifier; a wildcard or missing
+        // requirement is the bare coordinate.
+        let purls: Vec<&str> = refs
+            .iter()
+            .filter_map(|r| match &r.locator {
+                RefLocator::Purl(p) => Some(p.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            purls.contains(&"pkg:cargo/serde?version_requirement=1.0"),
+            "{purls:?}"
+        );
+        assert!(purls.contains(&"pkg:cargo/anyhow"), "{purls:?}");
+        assert!(purls.contains(&"pkg:cargo/log"), "{purls:?}");
         assert!(
             refs.iter()
                 .any(|r| r.source.contains("cfg(unix)") && r.is_fetch_target())

@@ -39,6 +39,14 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
     if data.len() < 2 {
         return None;
     }
+    // Compiled ColdFusion templates retain a clear-text Allaire header while
+    // the template body is encrypted. Treat it as content identity so a
+    // renamed `.cfm` file still reaches the CFML static decoder.
+    if data.starts_with(b"Allaire Cold Fusion Template\nHeader Size: ")
+        || data.starts_with(b"Allaire Cold Fusion Template\r\nHeader Size: ")
+    {
+        return Some((FileType::Cfml, DetectionSource::Magic));
+    }
     // Every binary header this module claims by a short signature carries a
     // NUL or control byte near the front; a script that merely opens with the
     // same letters (`MZ=1;…`, `true && …`, `GIF89a=…`) carries none.
@@ -188,9 +196,16 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             }
         }
         b'M' => {
-            // PE: MZ, or Cabinet: MSCF
+            // MZ-prefixed Windows programs include both PE and the older NE
+            // format. Route NE to its own generic-binary file type instead of
+            // calling it PE (which the PE analyzer correctly rejects).
             if data[1] == b'Z' {
-                Some((FileType::Pe, DetectionSource::Magic))
+                let file_type = if looks_like_ne_executable(data) {
+                    FileType::Ne
+                } else {
+                    FileType::Pe
+                };
+                Some((file_type, DetectionSource::Magic))
             } else if data.len() >= 4 && data[1] == b'S' && data[2] == b'C' && data[3] == b'F' {
                 Some((FileType::Cab, DetectionSource::Magic))
             } else {
@@ -682,12 +697,12 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         return Some((ft.unwrap_or(FileType::Tar), DetectionSource::Magic));
     }
 
-    // Python bytecode: a little-endian magic number that ends in `\r\n`,
-    // then flags or a timestamp. CPython 2.0–2.7 used 50823..=62211; 3.x
-    // counts up from 3000 (3.14 is 3627).
+    // Python bytecode: a supported little-endian magic number ending in CRLF,
+    // then flags or a timestamp. Match known CPython releases so unrelated
+    // binary formats cannot claim a pyc type by coincidence.
     if !text && data.len() >= 8 && &data[2..4] == b"\r\n" {
         let magic = u16::from_le_bytes([data[0], data[1]]);
-        if (3000..4000).contains(&magic) || (50823..=62211).contains(&magic) {
+        if is_supported_python_bytecode_magic(magic) {
             return Some((FileType::PythonBytecode, DetectionSource::Magic));
         }
     }
@@ -724,6 +739,35 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
     }
 
     None
+}
+
+/// Magic numbers for Python versions whose bytecode layout is handled by
+/// the PYC facts extractor. Broad numeric ranges admit unrelated binary
+/// formats whose first four bytes happen to end in CRLF.
+fn is_supported_python_bytecode_magic(magic: u16) -> bool {
+    matches!(
+        magic,
+        3379
+            | 3390..=3394
+            | 3400..=3413
+            | 3420..=3425
+            | 3430..=3439
+            | 3450..=3495
+            | 3500..=3531
+            | 3550..=3571
+            | 3627
+            | 62211
+    )
+}
+
+/// Check the DOS MZ header's `e_lfanew` pointer for a Windows NE signature.
+/// NE is a 16-bit executable format; it must not be routed to the PE parser.
+fn looks_like_ne_executable(data: &[u8]) -> bool {
+    if data.len() < 0x40 || &data[..2] != b"MZ" {
+        return false;
+    }
+    let offset = u32::from_le_bytes([data[0x3c], data[0x3d], data[0x3e], data[0x3f]]) as usize;
+    data.get(offset..offset.saturating_add(2)) == Some(b"NE")
 }
 
 /// Peek the first `ar` member's name and compare it to `want`.
@@ -3010,6 +3054,11 @@ mod tests {
         assert_eq!(content_type("x", pyc), Some(FileType::PythonBytecode));
         let py27 = b"\x03\xf3\r\n\xde\x1d\xef\x50c\0\0\0\0\0\0\0\0\x02\0\0\0";
         assert_eq!(content_type("x", py27), Some(FileType::PythonBytecode));
+        // Kotlin/Native metadata begins with 0xCC0A followed by CRLF. That
+        // happens to lie in a broad historical Python range, but is not a
+        // CPython magic number and must stay an ordinary binary data member.
+        let kotlin_metadata = b"\x0a\xcc\r\n\x0a\x00\x00\x00nativeFill\n";
+        assert_eq!(content_type("x", kotlin_metadata), None);
         // Text whose first line is one character, re-converted to CR CR LF.
         assert_eq!(content_type("x", b"{\r\r\n\"a\": 1\r\r\n}\r\r\n"), None);
     }

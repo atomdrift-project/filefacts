@@ -458,6 +458,9 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "vbs" | "vbe" | "wsf" | "wsc" | "wsh" => Some(FileType::Vbs),
         "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" | "hxx" | "hh" | "pas" | "dpr" | "asm" | "s"
         | "nasm" => Some(FileType::C),
+        // Microsoft Interface Definition Language is C-like source; treating it as C
+        // enables source facts even when content heuristics do not recognize MIDL syntax.
+        "idl" => Some(FileType::C),
         "lua" => Some(FileType::Lua),
         "cs" => Some(FileType::CSharp),
         "swift" => Some(FileType::Swift),
@@ -507,7 +510,7 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         | "odb" | "odc" | "odi" => Some(FileType::Odf),
         "exe" | "dll" | "sys" | "scr" | "cpl" | "ocx" | "drv" | "efi" | "pyd" => Some(FileType::Pe),
         "so" | "elf" | "ko" => Some(FileType::Elf),
-        "dylib" | "bundle" => Some(FileType::MachO),
+        "dylib" | "bundle" | "macho" => Some(FileType::MachO),
         "lnk" => Some(FileType::Lnk),
         "pdf" => Some(FileType::Pdf),
         "jpg" | "jpeg" | "jpe" | "jfif" => Some(FileType::Jpeg),
@@ -962,6 +965,10 @@ mod tests {
 
     #[test]
     fn source_alias_extensions() {
+        assert_eq!(
+            detect_from_path(Path::new("windows.foundation.idl")),
+            Some(FileType::C)
+        );
         assert_eq!(
             detect_from_path(Path::new("payload.jse")),
             Some(FileType::JavaScript)
