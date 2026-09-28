@@ -2,7 +2,7 @@
 //!
 //! The member listing comes from the generic [`super::tar`] walker; this
 //! module adds the publisher identity that lives inside the manifest:
-//! the package name, version, author and maintainer names/emails, and
+//! the package name, version, description, author and maintainer names/emails, and
 //! the repository/homepage URLs. Emails are the strongest cross-package
 //! identifier npm carries, so they are surfaced as structured fields the
 //! identity normalizer rolls up.
@@ -77,6 +77,12 @@ pub(super) fn emit(manifest: &JsonValue, values: &mut Values, metrics: &mut Metr
     }
     if let Some(version) = obj.get("version").and_then(JsonValue::as_str) {
         values.insert("npm.version", JsonValue::String(version.to_string()));
+    }
+    if let Some(description) = obj.get("description").and_then(JsonValue::as_str) {
+        values.insert(
+            "npm.description",
+            JsonValue::String(description.to_string()),
+        );
     }
     if let Some(homepage) = obj.get("homepage").and_then(JsonValue::as_str) {
         values.insert("npm.homepage", JsonValue::String(homepage.to_string()));
@@ -402,6 +408,7 @@ mod tests {
         let manifest = serde_json::json!({
             "name": "left-pad",
             "version": "1.3.0",
+            "description": "String left pad",
             "author": "Azer Koculu <azer@example.com> (http://azer.bike)",
             "repository": { "url": "git+https://github.com/azer/left-pad.git" }
         });
@@ -411,6 +418,10 @@ mod tests {
         assert_eq!(
             values.get("npm.name").and_then(JsonValue::as_str),
             Some("left-pad")
+        );
+        assert_eq!(
+            values.get("npm.description").and_then(JsonValue::as_str),
+            Some("String left pad")
         );
         assert_eq!(
             values.get("npm.author.email").and_then(JsonValue::as_str),

@@ -52,6 +52,7 @@ fn parse_nuspec(text: &str, values: &mut Values) {
         ("id", "nupkg.id"),
         ("version", "nupkg.version"),
         ("title", "nupkg.title"),
+        ("description", "nupkg.description"),
         ("authors", "nupkg.authors"),
         ("owners", "nupkg.owners"),
         ("projectUrl", "nupkg.project_url"),
@@ -85,9 +86,14 @@ mod tests {
                 <authors>Acme Corp</authors>
                 <owners>Acme Corp</owners>
                 <projectUrl>https://acme.test</projectUrl>
+                <description>Widgets for .NET</description>
             </metadata></package>"#;
         let mut v = Values::new();
         parse_nuspec(xml, &mut v);
+        assert_eq!(
+            v.get("nupkg.description").and_then(|x| x.as_str()),
+            Some("Widgets for .NET")
+        );
         assert_eq!(
             v.get("nupkg.id").and_then(|x| x.as_str()),
             Some("Acme.Widgets")

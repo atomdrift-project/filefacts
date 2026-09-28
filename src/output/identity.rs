@@ -198,6 +198,15 @@ pub struct Identity {
     /// Declared version.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<Claim>,
+    /// The artifact's one-line account of itself: the npm `description`,
+    /// a wheel's `Summary`, a gem's `summary`, a deb's synopsis, a PE's
+    /// `FileDescription`. Always
+    /// claimed, never verified: it is whatever the publisher typed. It is
+    /// valuable exactly because it is checkable, since a package describing
+    /// itself as a "CLI core binary for Windows x64" should ship one.
+    /// Whitespace is collapsed and the text is truncated to a sentence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<Claim>,
     /// People associated with the artifact (authors, maintainers,
     /// `last_modified_by`).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -206,6 +215,11 @@ pub struct Identity {
     /// PE `CompanyName`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organization: Option<Claim>,
+    /// Claimed copyright notice (PE `LegalCopyright`, Mach-O
+    /// `NSHumanReadableCopyright`). Names a rights holder that a reader can
+    /// compare with the company and the signer. Whitespace is collapsed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copyright: Option<Claim>,
     /// The tool that produced the artifact (authoring application,
     /// PDF producer, build toolchain).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -250,8 +264,10 @@ impl Identity {
             && self.identifier.is_none()
             && self.project.is_none()
             && self.version.is_none()
+            && self.description.is_none()
             && self.authors.is_empty()
             && self.organization.is_none()
+            && self.copyright.is_none()
             && self.producer.is_none()
             && self.build_path.is_none()
             && self.signer.is_none()

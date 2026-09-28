@@ -55,9 +55,9 @@ fn read_manifest<R: Read + std::io::Seek>(zip: &mut ::zip::ZipArchive<R>) -> Opt
     serde_json::from_slice(&buf).ok()
 }
 
-/// Emit `crx.author` / `crx.author_email` / `crx.homepage_url` from a
-/// parsed Chrome `manifest.json`. `author` may be a bare string or an
-/// `{ "email": … }` object (MV3).
+/// Emit `crx.author` / `crx.author_email` / `crx.homepage_url` /
+/// `crx.description` from a parsed Chrome `manifest.json`. `author` may be a
+/// bare string or an `{ "email": … }` object (MV3).
 fn emit_manifest_identity(manifest: &JsonValue, values: &mut Values) {
     match manifest.get("author") {
         Some(JsonValue::String(s)) if !s.is_empty() => {
@@ -72,6 +72,17 @@ fn emit_manifest_identity(manifest: &JsonValue, values: &mut Values) {
     }
     if let Some(url) = manifest.get("homepage_url").and_then(JsonValue::as_str) {
         values.insert("crx.homepage_url", JsonValue::String(url.to_string()));
+    }
+    // `__MSG_*__` is a localization placeholder, not the extension's words.
+    if let Some(description) = manifest
+        .get("description")
+        .and_then(JsonValue::as_str)
+        .filter(|d| !d.is_empty() && !d.starts_with("__MSG_"))
+    {
+        values.insert(
+            "crx.description",
+            JsonValue::String(description.to_string()),
+        );
     }
 }
 
@@ -244,6 +255,22 @@ fn matching_developer_public_key<'a>(header: &'a [u8], crx_id: &[u8]) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifest_description_extracted_unless_localized() {
+        let mut v = Values::new();
+        emit_manifest_identity(
+            &serde_json::json!({"description": "Blocks trackers"}),
+            &mut v,
+        );
+        assert_eq!(
+            v.get("crx.description").and_then(JsonValue::as_str),
+            Some("Blocks trackers")
+        );
+        let mut v = Values::new();
+        emit_manifest_identity(&serde_json::json!({"description": "__MSG_desc__"}), &mut v);
+        assert!(v.get("crx.description").is_none());
+    }
 
     #[test]
     fn extension_id_maps_nibbles_to_a_through_p() {

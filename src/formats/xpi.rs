@@ -107,9 +107,10 @@ fn read_manifest<R: Read + Seek>(zip: &mut ::zip::ZipArchive<R>) -> Option<JsonV
     serde_json::from_slice(&buf).ok()
 }
 
-/// Emit `xpi.author` / `xpi.homepage_url` and a non-localized name from a
-/// parsed WebExtension `manifest.json`. `name` is skipped when it is an
-/// `__MSG_*__` localization placeholder.
+/// Emit `xpi.author` / `xpi.homepage_url` and a non-localized name and
+/// description from a parsed WebExtension `manifest.json`. `name` and
+/// `description` are skipped when they are `__MSG_*__` localization
+/// placeholders.
 fn emit_manifest_identity(manifest: &JsonValue, values: &mut Values) {
     if let Some(author) = manifest.get("author").and_then(JsonValue::as_str) {
         if !author.is_empty() {
@@ -118,6 +119,17 @@ fn emit_manifest_identity(manifest: &JsonValue, values: &mut Values) {
     }
     if let Some(url) = manifest.get("homepage_url").and_then(JsonValue::as_str) {
         values.insert("xpi.homepage_url", JsonValue::String(url.to_string()));
+    }
+    // `__MSG_*__` is a localization placeholder, not the extension's words.
+    if let Some(description) = manifest
+        .get("description")
+        .and_then(JsonValue::as_str)
+        .filter(|d| !d.is_empty() && !d.starts_with("__MSG_"))
+    {
+        values.insert(
+            "xpi.description",
+            JsonValue::String(description.to_string()),
+        );
     }
     if let Some(name) = manifest.get("name").and_then(JsonValue::as_str) {
         if !name.is_empty() && !name.starts_with("__MSG_") {
@@ -224,6 +236,23 @@ mod tests {
                 .and_then(|x| x.as_bool()),
             Some(true)
         );
+    }
+
+    #[test]
+    fn manifest_description_extracted_unless_localized() {
+        let xpi = build_xpi(&[(
+            "manifest.json",
+            br#"{"name":"Tabby","description":"Tidies tabs"}"#,
+        )]);
+        assert_eq!(
+            run(&xpi).get("xpi.description").and_then(|x| x.as_str()),
+            Some("Tidies tabs")
+        );
+        let xpi = build_xpi(&[(
+            "manifest.json",
+            br#"{"description":"__MSG_extDescription__"}"#,
+        )]);
+        assert!(run(&xpi).get("xpi.description").is_none());
     }
 
     #[test]

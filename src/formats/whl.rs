@@ -141,7 +141,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         // Pull the authorship fields — the publisher identity a wheel
         // carries that the filename and dir name don't.
         if let Some(meta) = read_text_member(zip, &format!("{dist_info}/METADATA")) {
-            emit_metadata_authors(&meta, values);
+            emit_metadata_identity(&meta, values);
         }
     }
     if has_wheel {
@@ -260,11 +260,11 @@ fn read_text_member<R: Read + Seek>(zip: &mut ::zip::ZipArchive<R>, name: &str) 
     String::from_utf8(buf).ok()
 }
 
-/// Emit `whl.author` / `whl.maintainer` (+ `_email`) and `whl.home_page`
-/// from an RFC 822 `METADATA` header block. Headers end at the first
+/// Emit `whl.author` / `whl.maintainer` (+ `_email`), `whl.home_page` and
+/// the one-line `whl.summary` from an RFC 822 `METADATA` header block. Headers end at the first
 /// blank line (the long `Description` body follows); only the first
 /// occurrence of each field is taken, and `UNKNOWN` placeholders skipped.
-fn emit_metadata_authors(meta: &str, values: &mut Values) {
+fn emit_metadata_identity(meta: &str, values: &mut Values) {
     let put_first = |values: &mut Values, key: &str, val: &str| {
         if !val.is_empty() && val != "UNKNOWN" && values.get(key).is_none() {
             values.insert(key, JsonValue::String(val.to_string()));
@@ -284,6 +284,7 @@ fn emit_metadata_authors(meta: &str, values: &mut Values) {
             "maintainer" => put_first(values, "whl.maintainer", value),
             "maintainer-email" => put_first(values, "whl.maintainer_email", value),
             "home-page" => put_first(values, "whl.home_page", value),
+            "summary" => put_first(values, "whl.summary", value),
             _ => {}
         }
     }
@@ -325,7 +326,7 @@ mod tests {
             ("mypkg/__init__.py", b""),
             (
                 "mypkg-1.0.0.dist-info/METADATA",
-                b"Metadata-Version: 2.1\nName: mypkg\nVersion: 1.0.0\nAuthor: trtkajko\nAuthor-email: <mail@mail.com>\nHome-page: https://example.test\n\nLong description body\n",
+                b"Metadata-Version: 2.1\nName: mypkg\nVersion: 1.0.0\nSummary: A tiny package\nAuthor: trtkajko\nAuthor-email: <mail@mail.com>\nHome-page: https://example.test\n\nLong description body\n",
             ),
             ("mypkg-1.0.0.dist-info/RECORD", b"mypkg/__init__.py,,0\n"),
         ]);
@@ -341,6 +342,10 @@ mod tests {
         assert_eq!(
             v.get("whl.home_page").and_then(|x| x.as_str()),
             Some("https://example.test")
+        );
+        assert_eq!(
+            v.get("whl.summary").and_then(|x| x.as_str()),
+            Some("A tiny package")
         );
     }
 

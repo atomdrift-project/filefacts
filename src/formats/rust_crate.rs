@@ -70,6 +70,7 @@ fn emit(manifest: &toml::Value, values: &mut Values) {
     };
     put("crate.name", "name");
     put("crate.version", "version");
+    put("crate.description", "description");
     put("crate.repository", "repository");
     put("crate.homepage", "homepage");
     if let Some(authors) = pkg.get("authors").and_then(toml::Value::as_array) {
@@ -95,6 +96,7 @@ mod tests {
             [package]
             name = "widget"
             version = "0.3.1"
+            description = "Widgets for gadgets"
             authors = ["Jane Dev <jane@example.test>"]
             repository = "https://example.test/widget"
         "#;
@@ -102,6 +104,10 @@ mod tests {
         let mut v = Values::new();
         emit(&manifest, &mut v);
         assert_eq!(v.get("crate.name").and_then(|x| x.as_str()), Some("widget"));
+        assert_eq!(
+            v.get("crate.description").and_then(|x| x.as_str()),
+            Some("Widgets for gadgets")
+        );
         assert_eq!(
             v.get("crate.version").and_then(|x| x.as_str()),
             Some("0.3.1")

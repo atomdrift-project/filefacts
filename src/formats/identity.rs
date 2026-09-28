@@ -85,10 +85,21 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Iden
         _ => {}
     }
 
+    // What the artifact says it is for, and whose it is, in its own words.
+    description(values, &mut id);
+
     // Build-time source path — an origin artifact carried by native
     // executables regardless of format.
     if matches!(file_type, FileType::Pe | FileType::Elf | FileType::MachO) {
         build_path(bytes, values, &mut id);
+    }
+
+    // A Go binary's main module, when nothing stronger named the project.
+    match file_type {
+        FileType::Pe => go_module("pe", values, &mut id),
+        FileType::Elf => go_module("elf", values, &mut id),
+        FileType::MachO => go_module("macho", values, &mut id),
+        _ => {}
     }
 
     // The compiler that emitted the object, straight from DWARF. Carried by
@@ -371,6 +382,39 @@ fn tar(values: &Values, id: &mut Identity) {
                 });
             }
         }
+    }
+}
+
+/// A Go binary's main module path and version, from its embedded build info
+/// (what `go version -m` prints). It names the project the binary was built
+/// from — `github.com/gitleaks/gitleaks` — which is often the only identity an
+/// unsigned Go tool carries, so it fills `project` and `version` only when a
+/// version resource or signature has not already.
+fn go_module(prefix: &str, values: &Values, id: &mut Identity) {
+    let Some(module) = values
+        .get(&format!("{prefix}.go"))
+        .and_then(|go| go.get("module"))
+    else {
+        return;
+    };
+    let field = |key: &str| {
+        module
+            .get(key)
+            .and_then(JsonValue::as_str)
+            .filter(|v| !v.is_empty() && *v != "(devel)")
+    };
+    if id.project.is_none()
+        && let Some(path) = field("path")
+    {
+        id.project = Some(Claim::claimed(path, format!("{prefix}.go.module.path")));
+    }
+    if id.version.is_none()
+        && let Some(version) = field("version")
+    {
+        id.version = Some(Claim::claimed(
+            version,
+            format!("{prefix}.go.module.version"),
+        ));
     }
 }
 
@@ -793,6 +837,74 @@ fn deb(values: &Values, id: &mut Identity) {
         let (name, email, url) = parse_person(maintainer);
         push_author(id, name, email, url, "maintainer", "deb.maintainer");
     }
+}
+
+/// Self-description keys, one per package format: npm `description`, wheel
+/// and sdist `Summary`, crate `description`, gem `summary`, NuGet
+/// `<description>`, VSIX `<Description>`, WebExtension `description`, and the
+/// deb / rpm / Alpine one-line synopsis, and a PE's `FileDescription`. Each is
+/// emitted only by its own format's extractor, so the first present key is the
+/// artifact's.
+const DESCRIPTION_KEYS: &[&str] = &[
+    "npm.description",
+    "whl.summary",
+    "python.summary",
+    "crate.description",
+    "gem.summary",
+    "nupkg.description",
+    "vsix.description",
+    "crx.description",
+    "xpi.description",
+    "deb.summary",
+    "rpm.summary",
+    "apk.pkgdesc",
+    "pe.version.description",
+];
+
+/// Copyright notice keys: a PE's `LegalCopyright`, then a Mach-O's embedded
+/// `__info_plist` notice, then that plist's older `CFBundleGetInfoString`
+/// (conventionally `"<version>, Copyright <holder>"`).
+const COPYRIGHT_KEYS: &[&str] = &[
+    "pe.version.copyright",
+    "macho.info_plist.NSHumanReadableCopyright",
+    "macho.info_plist.CFBundleGetInfoString",
+];
+
+/// Longest self-description kept, in characters: a sentence, not a README.
+/// NuGet and VSIX descriptions run to paragraphs; the opening is the claim.
+const MAX_DESCRIPTION: usize = 160;
+
+/// The artifact's self-description and copyright notice. Both are text
+/// anyone can write, so both are claimed, never verified.
+fn description(values: &Values, id: &mut Identity) {
+    id.description = first_claim(values, DESCRIPTION_KEYS)
+        .and_then(|(raw, src)| Some(Claim::claimed(one_line(raw)?, src)));
+    id.copyright = first_claim(values, COPYRIGHT_KEYS)
+        .and_then(|(raw, src)| Some(Claim::claimed(one_line(raw)?, src)));
+}
+
+/// `raw` with whitespace collapsed and cut to [`MAX_DESCRIPTION`], or `None`
+/// when nothing, or only a placeholder, remains.
+fn one_line(raw: &str) -> Option<String> {
+    let mut text = String::with_capacity(raw.len().min(MAX_DESCRIPTION * 4));
+    for (i, word) in raw.split_whitespace().enumerate() {
+        if i > 0 {
+            text.push(' ');
+        }
+        text.push_str(word);
+    }
+    // Python metadata writes `UNKNOWN` for a field the author left out.
+    if text.is_empty() || text == "UNKNOWN" {
+        return None;
+    }
+    // Cut at the last kept character only when there is one past the limit.
+    let mut starts = text.char_indices().map(|(i, _)| i);
+    if let (Some(cut), Some(_)) = (starts.nth(MAX_DESCRIPTION - 1), starts.next()) {
+        text.truncate(cut);
+        text.truncate(text.trim_end().len());
+        text.push('…');
+    }
+    Some(text)
 }
 
 // ---------------------------------------------------------------------
@@ -1476,6 +1588,47 @@ mod filename_tests {
 }
 
 #[cfg(test)]
+mod go_module_identity_tests {
+    use super::{Claim, Identity, Values, go_module};
+
+    fn go_values(prefix: &str, module: &serde_json::Value) -> Values {
+        let mut v = Values::default();
+        v.insert(
+            &format!("{prefix}.go"),
+            serde_json::json!({ "module": module }),
+        );
+        v
+    }
+
+    #[test]
+    fn go_main_module_names_an_unlabelled_binary() {
+        let values = go_values(
+            "pe",
+            &serde_json::json!({"path": "github.com/gitleaks/gitleaks", "version": "v8.18.0"}),
+        );
+        let mut id = Identity::default();
+        go_module("pe", &values, &mut id);
+        assert_eq!(id.project.unwrap().value, "github.com/gitleaks/gitleaks");
+        assert_eq!(id.version.unwrap().value, "v8.18.0");
+    }
+
+    #[test]
+    fn go_main_module_yields_to_a_version_resource() {
+        let values = go_values(
+            "elf",
+            &serde_json::json!({"path": "example.com/tool", "version": "(devel)"}),
+        );
+        let mut id = Identity {
+            project: Some(Claim::claimed("Acme Suite", "pe.version.product_name")),
+            ..Identity::default()
+        };
+        go_module("elf", &values, &mut id);
+        assert_eq!(id.project.unwrap().value, "Acme Suite");
+        assert!(id.version.is_none(), "`(devel)` is not a version");
+    }
+}
+
+#[cfg(test)]
 mod container_identity_tests {
     use super::{Identity, Values, dmg, iso, tar};
 
@@ -1596,5 +1749,124 @@ mod android_identity_tests {
         assert!(id.name.is_none(), "{:?}", id.name);
         // The package still identifies it.
         assert_eq!(id.identifier.unwrap().value, "com.example.app");
+    }
+}
+
+#[cfg(test)]
+mod description_tests {
+    use super::{FileType, MAX_DESCRIPTION, Values, derive};
+
+    fn describe(file_type: FileType, key: &str, text: &str) -> Option<(String, String)> {
+        let mut values = Values::default();
+        values.insert(key, serde_json::json!(text));
+        derive(file_type, b"", &values)
+            .description
+            .map(|c| (c.value, c.source))
+    }
+
+    #[test]
+    fn package_self_description_is_a_claim_with_its_source() {
+        let mut values = Values::default();
+        values.insert("npm.name", serde_json::json!("@acme/cli-win32-x64"));
+        values.insert(
+            "npm.description",
+            serde_json::json!("Sandbox CLI core binary for Windows x64"),
+        );
+        let id = derive(FileType::Npm, b"", &values);
+        let c = id.description.expect("description");
+        assert_eq!(c.value, "Sandbox CLI core binary for Windows x64");
+        assert_eq!(c.source, "npm.description");
+        assert!(!c.verified);
+    }
+
+    #[test]
+    fn each_format_contributes_its_own_field() {
+        for (file_type, key) in [
+            (FileType::PackageJson, "npm.description"),
+            (FileType::Whl, "whl.summary"),
+            (FileType::PythonSdist, "python.summary"),
+            (FileType::Crate, "crate.description"),
+            (FileType::Gem, "gem.summary"),
+            (FileType::Nupkg, "nupkg.description"),
+            (FileType::Vsix, "vsix.description"),
+            (FileType::Crx, "crx.description"),
+            (FileType::Xpi, "xpi.description"),
+            (FileType::Deb, "deb.summary"),
+            (FileType::Rpm, "rpm.summary"),
+            (FileType::ApkAlpine, "apk.pkgdesc"),
+            (FileType::Pe, "pe.version.description"),
+        ] {
+            assert_eq!(
+                describe(file_type, key, "does a thing"),
+                Some(("does a thing".into(), key.into())),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn whitespace_is_collapsed_and_placeholders_dropped() {
+        assert_eq!(
+            describe(
+                FileType::Nupkg,
+                "nupkg.description",
+                "  Line one.\n\t  Line two.  "
+            )
+            .map(|(v, _)| v),
+            Some("Line one. Line two.".into())
+        );
+        assert_eq!(
+            describe(FileType::PythonSdist, "python.summary", "UNKNOWN"),
+            None
+        );
+        assert_eq!(describe(FileType::Npm, "npm.description", " \n "), None);
+    }
+
+    #[test]
+    fn binaries_claim_their_copyright_notice() {
+        let mut values = Values::default();
+        values.insert(
+            "pe.version.copyright",
+            serde_json::json!("Copyright (C)  2024\tTencent."),
+        );
+        let c = derive(FileType::Pe, b"", &values)
+            .copyright
+            .expect("PE copyright");
+        assert_eq!(
+            (c.value.as_str(), c.source.as_str(), c.verified),
+            ("Copyright (C) 2024 Tencent.", "pe.version.copyright", false)
+        );
+
+        let mut values = Values::default();
+        values.insert(
+            "macho.info_plist",
+            serde_json::json!({
+                "CFBundleGetInfoString": "1.0, Copyright Acme",
+                "NSHumanReadableCopyright": "© 2024 Acme Inc.",
+            }),
+        );
+        let c = derive(FileType::MachO, b"", &values)
+            .copyright
+            .expect("Mach-O copyright");
+        assert_eq!(c.value, "© 2024 Acme Inc.");
+        assert_eq!(c.source, "macho.info_plist.NSHumanReadableCopyright");
+
+        let mut values = Values::default();
+        values.insert("pe.version.copyright", serde_json::json!("  "));
+        assert!(derive(FileType::Pe, b"", &values).copyright.is_none());
+    }
+
+    #[test]
+    fn long_descriptions_are_cut_to_a_sentence() {
+        let exact = "é".repeat(MAX_DESCRIPTION);
+        assert_eq!(
+            describe(FileType::Npm, "npm.description", &exact).map(|(v, _)| v),
+            Some(exact.clone()),
+            "a description at the limit is kept whole"
+        );
+        let long = format!("{exact}x");
+        let (cut, _) = describe(FileType::Npm, "npm.description", &long).expect("cut");
+        assert_eq!(cut.chars().count(), MAX_DESCRIPTION);
+        assert!(cut.ends_with('…'));
     }
 }
