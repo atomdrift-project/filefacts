@@ -505,6 +505,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "des"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffdd80ce8ce993de27e9f063a444a4d53ce8e8db4c1f00cc03af5ad5a9867a1e"
+dependencies = [
+ "cipher",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1876,13 +1885,14 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "1.12.0"
-source = "git+https://github.com/atomdrift-project/stng.git#33bededbdc70739bd8b43b6ec18ba09a5eacba02"
+source = "git+https://github.com/atomdrift-project/stng.git#5ff2dc905f9b65913e42b1888c9db8fb98e4e635"
 dependencies = [
  "aho-corasick",
  "anyhow",
  "base64 0.22.1",
  "clap",
  "data-encoding",
+ "des",
  "dirs",
  "flate2",
  "goblin",
