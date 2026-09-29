@@ -50,6 +50,7 @@ mod binary_attribution;
 mod build_toolchain;
 mod cab;
 mod carrier;
+pub(crate) mod cfml;
 mod chm;
 mod class;
 pub(crate) mod common;

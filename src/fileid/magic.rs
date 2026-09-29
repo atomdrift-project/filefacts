@@ -50,7 +50,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
     // Every binary header this module claims by a short signature carries a
     // NUL or control byte near the front; a script that merely opens with the
     // same letters (`MZ=1;…`, `true && …`, `GIF89a=…`) carries none.
-    let text = is_text(&data[..data.len().min(TEXT_PROBE)]);
+    let text = content_is_text(data);
 
     // ISO base media (`.mp4`/`.m4a`/`.mov`): the size-prefixed `ftyp` box.
     // Keyed at offset 4, so it cannot live in the first-byte jump table.
@@ -865,7 +865,8 @@ const TEXT_PROBE: usize = 64;
 
 /// Whether `head` reads as plain text: UTF-8 with no control bytes other
 /// than whitespace. A character cut off by the end of the probe still counts.
-fn is_text(head: &[u8]) -> bool {
+pub(crate) fn content_is_text(data: &[u8]) -> bool {
+    let head = &data[..data.len().min(TEXT_PROBE)];
     let control = |b: &u8| (*b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r' | 0x0C)) || *b == 0x7F;
     if head.iter().any(control) {
         return false;

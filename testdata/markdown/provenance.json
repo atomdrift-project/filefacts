@@ -1,0 +1,25 @@
+{
+  "archive_sha256": "ca4dd0641078ef575ce3b88d6d16f75ddbe2f64e6ef14e58c56294eb47acd7d3",
+  "files": [
+    {
+      "fixture": "puppeteer-browsers-readme.md",
+      "archive_member": "extension/node_modules/@puppeteer/browsers/README.md",
+      "sha256": "08ceb841b14b185ad478b0338980f1ac06124b296e0931d8d73cbb088c5e55fa"
+    },
+    {
+      "fixture": "https-proxy-agent-readme.md",
+      "archive_member": "extension/node_modules/https-proxy-agent/README.md",
+      "sha256": "462697a398c1bbbfd771bf58829aba65a1c620b072749a76a6ab1c25f62e9edc"
+    },
+    {
+      "fixture": "debug-readme.md",
+      "archive_member": "extension/node_modules/debug/README.md",
+      "sha256": "486cb669048bd5014adf9ea117e27a45c4e61b0e668f464c724273beb8170797"
+    },
+    {
+      "fixture": "proxy-agent-readme.md",
+      "archive_member": "extension/node_modules/proxy-agent/README.md",
+      "sha256": "02f4d7c654ebdedbff38d63a65b116cc48b13b49573cf83784b91dbf92a579d3"
+    }
+  ]
+}

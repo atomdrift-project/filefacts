@@ -205,6 +205,7 @@ pub struct ParsedFile<'a> {
     // that fills `extracted`.
     tree_parse: OnceLock<Option<formats::source::TreeParse<'a>>>,
     flow: OnceLock<Option<Flow>>,
+    cfml_parse: OnceLock<Option<formats::cfml::Parsed>>,
     // Caller's cancellation flag, polled by long-running leaf work (currently
     // the tree-sitter parse). Borrowed rather than `Arc`-shared, and never
     // written here: filefacts only ever reads it.
@@ -446,9 +447,12 @@ impl<'a> ParsedFile<'a> {
     /// No security policy or library model is assumed. Reading other views
     /// does not pay for this graph, and repeated reads never parse again.
     /// Returns `None` when flow extraction is unavailable, not an empty graph.
-    /// Currently only the source parser produces flow; binary flow recovery is
+    /// Source parsers (tree-sitter and bounded CFML tags) produce flow; binary flow recovery is
     /// not implemented. The graph records its producer and known limitations.
     pub fn flow(&self) -> Option<&Flow> {
+        if let Some(parsed) = self.cfml_parse() {
+            return Some(&parsed.flow);
+        }
         self.flow
             .get_or_init(|| {
                 let cache = self.tree_cache()?;
@@ -579,6 +583,15 @@ impl<'a> ParsedFile<'a> {
         self.parse_count.load(Ordering::Acquire)
     }
 
+    fn cfml_parse(&self) -> Option<&formats::cfml::Parsed> {
+        if self.fileid.file_type() != FileType::Cfml {
+            return None;
+        }
+        self.cfml_parse
+            .get_or_init(|| Some(formats::cfml::parse(self.bytes)))
+            .as_ref()
+    }
+
     fn extracted(&self) -> &Extracted {
         self.extracted.get_or_init(|| {
             if !cache::caching_enabled() {
@@ -629,7 +642,7 @@ impl<'a> ParsedFile<'a> {
     /// cache or returned directly.
     fn run_pipeline(&self) -> Extracted {
         self.parse_count.fetch_add(1, Ordering::AcqRel);
-        run_extraction(
+        let mut extracted = run_extraction(
             self.bytes,
             self.fileid.file_type(),
             self.fileid.extension_mismatch(),
@@ -639,7 +652,13 @@ impl<'a> ParsedFile<'a> {
             self.tree_parse()
                 .and_then(formats::source::TreeParse::diagnostic),
             self.fileid.xor_pe_key(),
-        )
+        );
+        if let Some(parsed) = self.cfml_parse() {
+            for symbol in parsed.symbols.iter() {
+                extracted.symbols.push(symbol.clone());
+            }
+        }
+        extracted
     }
 }
 
@@ -1203,18 +1222,18 @@ fn emit_binary_aggregates(
     let mut code_spans = Vec::new();
     let mut data_spans = Vec::new();
     for s in sections {
-        let is_exec = s.is_executable();
-        let is_write = s.is_writable();
+        let is_code = s.is_code();
+        let is_data = s.is_writable() || s.flags.iter().any(|flag| flag == "data");
         let on_disk = s.file_size;
         largest = largest.max(on_disk);
         let entropy = s.entropy.unwrap_or(0.0);
-        if is_exec {
+        if is_code {
             code_size = code_size.saturating_add(on_disk);
             code_entropy_sum += entropy * on_disk as f64;
             if on_disk > 0 {
                 code_spans.push(Span::new(s.file_offset, on_disk));
             }
-        } else if is_write {
+        } else if is_data {
             data_size = data_size.saturating_add(on_disk);
             data_entropy_sum += entropy * on_disk as f64;
             if on_disk > 0 {
@@ -1308,6 +1327,7 @@ pub fn open(bytes: &[u8]) -> Result<ParsedFile<'_>, Error> {
         basename: None,
         tree_parse: OnceLock::new(),
         flow: OnceLock::new(),
+        cfml_parse: OnceLock::new(),
         cancellation: None,
         extracted: OnceLock::new(),
         parse_count: AtomicU32::new(0),
@@ -1332,6 +1352,7 @@ pub fn open_with_path<'a>(path: &Path, bytes: &'a [u8]) -> Result<ParsedFile<'a>
         basename,
         tree_parse: OnceLock::new(),
         flow: OnceLock::new(),
+        cfml_parse: OnceLock::new(),
         cancellation: None,
         extracted: OnceLock::new(),
         parse_count: AtomicU32::new(0),
@@ -1358,6 +1379,7 @@ pub fn open_with_fileid<'a>(
         basename,
         tree_parse: OnceLock::new(),
         flow: OnceLock::new(),
+        cfml_parse: OnceLock::new(),
         cancellation: None,
         extracted: OnceLock::new(),
         parse_count: AtomicU32::new(0),
@@ -1394,6 +1416,7 @@ pub fn open_as<'a>(
         basename,
         tree_parse: OnceLock::new(),
         flow: OnceLock::new(),
+        cfml_parse: OnceLock::new(),
         cancellation: None,
         extracted: OnceLock::new(),
         parse_count: AtomicU32::new(0),

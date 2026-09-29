@@ -57,7 +57,32 @@ pub(super) fn extract_generic_json(
     }
 
     metrics.insert(metric!("json.parsed_bytes"), bytes.len() as f64);
-    extract_json(bytes, values)
+    if let Ok(parsed) = serde_json::from_slice::<JsonValue>(bytes) {
+        promote_root(parsed, values);
+        return Ok(());
+    }
+    // JSON with comments. VS Code's own workspace files (`.vscode/tasks.json`,
+    // `settings.json`, `launch.json`), `tsconfig.json` and most `.eslintrc`
+    // variants are JSONC by specification: `//` and `/* */` comments and
+    // trailing commas are legal there, and their consumers parse them fine.
+    // A strict-only parse dropped the whole value tree for every such file,
+    // so a folder-open task with a trailing comma had no `tasks[*].command`
+    // for any value path to read -- a gap one campaign relied on to slip a
+    // hidden autorun past scanners that parse strictly. Fall back to the same
+    // tolerant parser gyp uses, with JSONC comment syntax, and record that
+    // the fallback was needed: a document that is not strict JSON is a fact
+    // worth keeping, without losing the tree.
+    match parse_jsonc(bytes) {
+        Some(parsed) => {
+            metrics.insert(metric!("json.parse_lenient"), 1.0);
+            promote_root(parsed, values);
+            Ok(())
+        }
+        None => Err(Error::malformed(
+            "json",
+            "not valid JSON or JSONC".to_string(),
+        )),
+    }
 }
 
 /// Parse a node-gyp build manifest (`binding.gyp`, `.gyp`, `.gypi`).
@@ -366,9 +391,26 @@ const MAX_GYP_DEPTH: usize = 64;
 /// Returns `None` on anything it cannot parse, so the caller falls back exactly
 /// as before — never a partial or guessed tree.
 fn parse_gyp(content: &[u8]) -> Option<JsonValue> {
+    parse_lenient(content, CommentStyle::Python)
+}
+
+/// Tolerant parse of JSON with comments (JSONC): `//` and `/* */` comments
+/// and trailing commas, on top of strict JSON. Same parser as gyp with the
+/// comment syntax swapped; single-quoted strings and hex numbers are accepted
+/// as well, which only ever widens what a file can say and never changes the
+/// tree of a document strict JSON already accepted (strict runs first).
+///
+/// Returns `None` on anything it cannot parse, so the caller reports the
+/// malformed document exactly as before -- never a partial or guessed tree.
+fn parse_jsonc(content: &[u8]) -> Option<JsonValue> {
+    parse_lenient(content, CommentStyle::Jsonc)
+}
+
+fn parse_lenient(content: &[u8], comments: CommentStyle) -> Option<JsonValue> {
     let mut parser = GypParser {
         bytes: content,
         pos: 0,
+        comments,
     };
     parser.skip_trivia();
     let value = parser.parse_value(0)?;
@@ -384,6 +426,16 @@ fn parse_gyp(content: &[u8]) -> Option<JsonValue> {
 struct GypParser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    comments: CommentStyle,
+}
+
+/// Which comment syntax the tolerant parser skips as whitespace.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommentStyle {
+    /// gyp (Python literal): `#` to end of line.
+    Python,
+    /// JSON with comments: `//` to end of line and `/* ... */` blocks.
+    Jsonc,
 }
 
 impl GypParser<'_> {
@@ -395,19 +447,42 @@ impl GypParser<'_> {
         self.pos >= self.bytes.len()
     }
 
-    /// Skip ASCII whitespace and `#` line comments (gyp's only comment form).
+    /// Skip ASCII whitespace and comments in the configured style.
     fn skip_trivia(&mut self) {
         while let Some(c) = self.peek() {
             if c.is_ascii_whitespace() {
                 self.pos += 1;
-            } else if c == b'#' {
-                while let Some(c) = self.peek() {
-                    self.pos += 1;
-                    if c == b'\n' {
-                        break;
+            } else if c == b'#' && self.comments == CommentStyle::Python {
+                self.skip_line();
+            } else if c == b'/' && self.comments == CommentStyle::Jsonc {
+                match self.bytes.get(self.pos + 1) {
+                    Some(b'/') => self.skip_line(),
+                    Some(b'*') => {
+                        self.pos += 2;
+                        // An unterminated block comment swallows the rest of
+                        // the document; the parse then fails at end of input
+                        // exactly as strict JSON would.
+                        while self.pos < self.bytes.len() {
+                            if self.bytes[self.pos..].starts_with(b"*/") {
+                                self.pos += 2;
+                                break;
+                            }
+                            self.pos += 1;
+                        }
                     }
+                    _ => break,
                 }
             } else {
+                break;
+            }
+        }
+    }
+
+    /// Consume through the next newline (line comment body).
+    fn skip_line(&mut self) {
+        while let Some(c) = self.peek() {
+            self.pos += 1;
+            if c == b'\n' {
                 break;
             }
         }
@@ -763,6 +838,86 @@ mod tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn generic_json_strict_path_leaves_no_lenient_marker() {
+        let json = br#"{"version":"2.0.0","tasks":[{"command":"node ./x.js"}]}"#;
+        let mut v = Values::new();
+        let mut m = Metrics::new();
+        extract_generic_json(json, &mut v, &mut m).unwrap();
+        assert_eq!(
+            v.get("tasks[0].command").and_then(|x| x.as_str()),
+            Some("node ./x.js")
+        );
+        assert!(m.get("json.parse_lenient").is_none());
+    }
+
+    #[test]
+    fn generic_json_trailing_comma_still_yields_the_task_tree() {
+        // The PolinRider tasks.json shape: a trailing comma after the last
+        // task object. VS Code runs it; strict JSON rejects it, and before
+        // the fallback no `tasks[*].command` value existed to match.
+        let json = br#"{
+          "version": "2.0.0",
+          "tasks": [
+            {
+              "label": "eslint-check",
+              "type": "shell",
+              "command": "node ./public/fonts/fa-solid-300.llf",
+              "hide": true,
+              "runOptions": { "runOn": "folderOpen" }
+            },
+          ]
+        }"#;
+        let mut v = Values::new();
+        let mut m = Metrics::new();
+        extract_generic_json(json, &mut v, &mut m).unwrap();
+        assert_eq!(
+            v.get("tasks[0].command").and_then(|x| x.as_str()),
+            Some("node ./public/fonts/fa-solid-300.llf")
+        );
+        assert_eq!(
+            v.get("tasks[0].runOptions.runOn").and_then(|x| x.as_str()),
+            Some("folderOpen")
+        );
+        assert_eq!(m.get("json.parse_lenient"), Some(1.0));
+    }
+
+    #[test]
+    fn generic_json_line_and_block_comments_are_trivia() {
+        // A settings.json as VS Code users actually write it. A `//` inside a
+        // string value must survive as content, not open a comment.
+        let json = br#"{
+          // Automatically saves files after a delay
+          "files.autoSave": "off",
+          /* hide the terminal */ "terminal.integrated.hideOnStartup": "always",
+          "url": "https://example.com/a", // trailing comment
+        }"#;
+        let mut v = Values::new();
+        let mut m = Metrics::new();
+        extract_generic_json(json, &mut v, &mut m).unwrap();
+        // Dotted setting names are literal keys, so read the tree directly
+        // rather than through the path-splitting `get`.
+        let root = v.as_json();
+        assert_eq!(root["files.autoSave"].as_str(), Some("off"));
+        assert_eq!(
+            root["terminal.integrated.hideOnStartup"].as_str(),
+            Some("always")
+        );
+        assert_eq!(root["url"].as_str(), Some("https://example.com/a"));
+        assert_eq!(m.get("json.parse_lenient"), Some(1.0));
+    }
+
+    #[test]
+    fn generic_json_garbage_and_unterminated_comment_fail_cleanly() {
+        let mut v = Values::new();
+        let mut m = Metrics::new();
+        assert!(extract_generic_json(b"{ this is not json }", &mut v, &mut m).is_err());
+        assert!(extract_generic_json(b"{ /* open forever \"a\": 1 }", &mut v, &mut m).is_err());
+        // gyp's `#` comments are not JSONC comments.
+        assert!(extract_generic_json(b"{ # nope\n \"a\": 1 }", &mut v, &mut m).is_err());
+        assert!(v.get("a").is_none());
     }
 
     #[test]

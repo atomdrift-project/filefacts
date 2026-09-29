@@ -24,6 +24,7 @@ mod doscom;
 mod ext;
 mod heuristics;
 mod magic;
+mod markdown;
 mod scripts;
 pub(crate) mod shellcode;
 
@@ -1746,19 +1747,6 @@ fn detect_known(path: &Path, data: &[u8]) -> Option<Detection> {
         });
     }
 
-    // Stage 2: Well-known filename match (LICENSE, package.json, Makefile,
-    // …). These are explicit names users type — no aliasing or content
-    // ambiguity, so they outrank both heuristics and extension fallback.
-    if ext::is_filename_match(path) {
-        if let Some(file_type) = ext::detect_from_path(path) {
-            return Some(Detection {
-                file_type,
-                source: DetectionSource::Filename,
-                ext_match: ExtensionMatch::Consistent,
-            });
-        }
-    }
-
     let ext_ft = ext::detect_from_path(path);
     let heuristic_may_override_ext = ext_ft.is_none_or(allows_heuristic_extension_override);
 
@@ -1813,12 +1801,22 @@ fn detect_known(path: &Path, data: &[u8]) -> Option<Detection> {
         });
     }
 
-    // Stage 3: Content heuristics for unknown extensions and extension-claimed
-    // containers/polyglots. Ordinary source extensions stay authoritative here:
-    // language keyword scoring is too weak to override `.go`, `.js`, `.swift`,
-    // etc. Container extensions are different because a non-magic `.zip` body
-    // may be a script payload wearing an archive name.
-    if (heuristic_may_override_ext && !ext::is_data_format(path))
+    // Stage 3: Content heuristics can override a filename-only type and weak
+    // extensions, and inspect extension-claimed containers/polyglots. Ordinary
+    // source extensions stay authoritative here: language keyword scoring is
+    // too weak to override `.go`, `.js`, `.swift`, etc. A non-magic `.zip` body
+    // may still be a script payload wearing an archive name.
+    // A document's fenced examples are not its execution language. Keep
+    // content-first detection for scripts renamed .md; actual Markdown needs
+    // both a leading heading and a complete fenced block before this applies.
+    if ext_ft == Some(FileType::Markdown) && markdown::document_structure(data) {
+        return Some(Detection {
+            file_type: FileType::Markdown,
+            source: DetectionSource::Heuristic,
+            ext_match: ExtensionMatch::Consistent,
+        });
+    }
+    if ((heuristic_may_override_ext || ext::is_filename_match(path)) && !ext::is_data_format(path))
         || prose_extension_may_be_source(path)
     {
         if let Some(file_type) = heuristics::detect_from_content(data) {
@@ -1833,6 +1831,38 @@ fn detect_known(path: &Path, data: &[u8]) -> Option<Detection> {
                 ext_match,
             });
         }
+    }
+
+    // Content signatures and language patterns have had the first chance to
+    // identify the body. An exact filename is only a fallback when its bytes
+    // carry no stronger evidence.
+    if ext::is_filename_match(path) {
+        if let Some(file_type) = ext::detect_from_path(path) {
+            return Some(Detection {
+                file_type,
+                source: DetectionSource::Filename,
+                ext_match: ExtensionMatch::Consistent,
+            });
+        }
+    }
+
+    // The fast text probe handles named but unregistered suffixes such as `.conf`.
+    // Leave extensionless files unclassified unless a stronger content rule
+    // recognizes them; many corpus files use opaque extensionless names.
+    if ext_ft.is_none()
+        && has_named_extension(path)
+        && !data.is_empty()
+        && magic::content_is_text(data)
+    {
+        return Some(Detection {
+            file_type: FileType::Text,
+            source: DetectionSource::Heuristic,
+            ext_match: if has_named_extension(path) {
+                ExtensionMatch::Unknown
+            } else {
+                ExtensionMatch::Consistent
+            },
+        });
     }
 
     // Object code with a source extension is not that language. DOS COM samples
@@ -4042,6 +4072,37 @@ function wpcf7_special_mail_tag( $output, $name, $html ) {
         // suspicious "extension says X but content is Y" finding).
         assert!(det.extension_mismatch());
         assert_eq!(det.extension_type(), Some(FileType::Zip));
+    }
+
+    #[test]
+    fn content_heuristic_precedes_well_known_filename() {
+        let body = b"On Error Resume Next\r\n\
+            Dim S1, FSO, Shell\r\n\
+            Set FSO = CreateObject(\"Scripting.FileSystemObject\")\r\n\
+            Set Shell = CreateObject(\"WScript.Shell\")\r\n\
+            Set S1 = CreateObject(\"ADODB.Stream\")\r\n";
+        let det = detect(Path::new("Makefile"), body).unwrap();
+        assert_eq!(det.file_type, FileType::Vbs);
+        assert_eq!(det.source, DetectionSource::Heuristic);
+        assert!(det.extension_mismatch());
+    }
+
+    #[test]
+    fn readable_unknown_extension_is_detected_as_text_from_content() {
+        let det = detect(
+            Path::new("override.conf"),
+            b"install demo /sbin/modprobe --ignore-install demo\n",
+        )
+        .unwrap();
+        assert_eq!(det.file_type, FileType::Text);
+        assert_eq!(det.source, DetectionSource::Heuristic);
+        assert_eq!(det.ext_match, ExtensionMatch::Unknown);
+    }
+
+    #[test]
+    fn binary_unknown_extension_is_not_called_text_from_filename() {
+        let det = detect(Path::new("override.conf"), b"\x00\x01\x02\x03binary");
+        assert!(det.is_none() || det.unwrap().file_type != FileType::Text);
     }
 
     /// Same idea, but with PowerShell content under a `.zip` extension —

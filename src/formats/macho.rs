@@ -213,6 +213,7 @@ fn fat_binary(
         }
         archs.push(slice_entry);
         if idx == 0 {
+            let first_section = sections_out.len();
             single_arch(
                 &macho,
                 slice_bytes,
@@ -221,6 +222,13 @@ fn fat_binary(
                 sections_out,
                 symbols_out,
             );
+            // Unified sections address the whole input; load-command offsets
+            // address the slice. Entropy was already computed on slice bytes.
+            for section in &mut sections_out[first_section..] {
+                if section.file_size > 0 {
+                    section.file_offset = section.file_offset.saturating_add(start as u64);
+                }
+            }
         }
     }
     metrics.insert(metric!("macho.slice_count"), archs.len() as f64);
@@ -607,16 +615,43 @@ fn extract_sections(
             } else {
                 format!("{segment_name},{section_name}")
             };
-            let file_offset = u64::from(section.offset);
-            let file_size = section.size;
+            let zero_filled = matches!(
+                section.flags & mach::constants::SECTION_TYPE,
+                mach::constants::S_ZEROFILL
+                    | mach::constants::S_GB_ZEROFILL
+                    | mach::constants::S_THREAD_LOCAL_ZEROFILL
+            );
+            let file_offset = if zero_filled {
+                0
+            } else {
+                u64::from(section.offset)
+            };
+            let file_size = if zero_filled { 0 } else { section.size };
             let entropy = (file_size > 0).then(|| section_entropy(bytes, file_offset, file_size));
+            // __TEXT also holds constants and unwind metadata. Segment execute
+            // permission must not make those bytes count as instruction code.
+            let contains_instructions = section.flags
+                & (mach::constants::S_ATTR_PURE_INSTRUCTIONS
+                    | mach::constants::S_ATTR_SOME_INSTRUCTIONS)
+                != 0
+                || section.flags & mach::constants::SECTION_TYPE == mach::constants::S_SYMBOL_STUBS;
+            let section_flags = flags
+                .iter()
+                .copied()
+                .chain(std::iter::once(if contains_instructions {
+                    "code"
+                } else {
+                    "data"
+                }))
+                .map(str::to_string)
+                .collect();
             sections_out.push(Section {
                 name: display,
                 vaddr: section.addr,
                 vsize: section.size,
                 file_offset,
                 file_size,
-                flags: flags.iter().map(|s| (*s).to_string()).collect(),
+                flags: section_flags,
                 flags_raw: Some(initprot),
                 entropy,
             });

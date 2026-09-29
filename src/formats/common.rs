@@ -389,7 +389,7 @@ fn decide_rizin(profile: RizinProfile) -> RizinDecision {
 fn weighted_code_entropy(sections: &[Section]) -> Option<f64> {
     let (weighted, bytes) = sections
         .iter()
-        .filter(|section| section.is_executable())
+        .filter(|section| section.is_code())
         .filter_map(|section| {
             section
                 .entropy

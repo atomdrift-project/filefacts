@@ -9,14 +9,16 @@ const STEP_LIMIT: usize = 100_000;
 /// One value in a file-local graph. IDs are indexes, local to this graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowValue {
-    /// `literal`, `parameter`, `call`, `merge`, or `unknown`.
+    /// `literal`, `parameter`, `call`, `member`, `merge`, `concat`,
+    /// `alternative`, or `unknown`. Only `alternative` denotes whole values
+    /// chosen by control flow; `merge` may combine arbitrary dependencies.
     pub kind: String,
     /// File byte offset, never a trait ID or virtual address.
     pub offset: usize,
     /// Original argument shape/value, using the existing symbol vocabulary.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub literal: Option<Arg>,
-    /// Static call target; absent for a computed callee.
+    /// Static call target or canonical member-read path; absent when computed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     /// Ordered call arguments, or merged value inputs.
@@ -87,6 +89,59 @@ pub struct FlowOrigins {
 }
 
 impl Flow {
+    /// Return proven complete literal values, optionally projected from a
+    /// named field. Unlike provenance, concatenation operands and modeled
+    /// call inputs are not complete return values. Producers may attach a
+    /// computed literal to a concat node. Unsupported shapes remain opaque.
+    #[must_use]
+    pub fn complete_values(&self, start: usize, field: Option<&str>, budget: usize) -> FlowOrigins {
+        let mut out = FlowOrigins::default();
+        let mut pending = vec![(start, field, 0usize)];
+        let mut seen = BTreeSet::new();
+        let mut left = budget.min(STEP_LIMIT);
+        while let Some((id, field, depth)) = pending.pop() {
+            if left == 0 || depth > 64 {
+                out.incomplete = true;
+                break;
+            }
+            left -= 1;
+            if !seen.insert((id, field)) {
+                continue;
+            }
+            let Some(value) = self.values.get(id) else {
+                out.incomplete = true;
+                continue;
+            };
+            if field.is_none()
+                && matches!(
+                    value.literal.as_ref(),
+                    Some(Arg::String { .. } | Arg::Number { .. } | Arg::Bool { .. } | Arg::Null)
+                )
+            {
+                out.values.insert(FlowOrigin {
+                    value: id,
+                    bindings: BTreeMap::new(),
+                });
+            } else if value.kind == "alternative" {
+                if value.inputs.len().saturating_add(pending.len()) > left {
+                    out.incomplete = true;
+                    break;
+                }
+                pending.extend(value.inputs.iter().map(|id| (*id, field, depth + 1)));
+            } else if let Some(field) = field {
+                if matches!(value.kind.as_str(), "object" | "keyword") {
+                    if let Some(id) = value.fields.get(field) {
+                        pending.push((*id, None, depth + 1));
+                    }
+                } else {
+                    out.incomplete = true;
+                }
+            } else {
+                out.incomplete = true;
+            }
+        }
+        out
+    }
     /// Walk value dependencies using only declared library transfers and local
     /// helper bodies. Contextual parameter substitution prevents callers of an
     /// identity helper from contaminating each other's return values.
@@ -179,7 +234,7 @@ impl Flow {
                 // Keyword arguments require explicit projection by name. They
                 // are not positional object payloads (headers != data/json).
                 "keyword" => {}
-                "merge" => next.extend(value.inputs.iter().copied()),
+                "merge" | "concat" | "alternative" => next.extend(value.inputs.iter().copied()),
                 "parameter" => {
                     if let Some(actual) = bindings.get(&id) {
                         next.push(*actual);

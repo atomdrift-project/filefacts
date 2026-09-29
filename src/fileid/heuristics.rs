@@ -517,7 +517,7 @@ fn scan_scores(data: &[u8]) -> [u16; LANG_COUNT] {
 }
 
 /// Try to identify a file type from content patterns.
-/// Only called when magic bytes and extension both failed.
+/// Called after magic detection when the filename does not provide a strong content type.
 pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
     if data.len() < 4 {
         return None;

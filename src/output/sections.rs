@@ -49,7 +49,8 @@ pub struct Section {
     /// `uninitialized_data`, `executable`, `readable`, `writable`,
     /// `discardable`. ELF: `alloc`, `write`, `execinstr`, `merge`,
     /// `strings`, `info_link`, `tls`. Mach-O: `executable`,
-    /// `readable`, `writable` distilled from the segment `initprot`.
+    /// `readable`, `writable` distilled from the segment `initprot`, plus
+    /// `code` or `data` from the section's instruction attributes/type.
     pub flags: Vec<String>,
     /// Raw format-specific flag bitmask backing [`Self::flags`]. PE:
     /// the `IMAGE_SCN_*` `characteristics` u32. ELF: the `sh_flags`
@@ -71,6 +72,12 @@ impl Section {
         self.flags
             .iter()
             .any(|f| f == "executable" || f == "execinstr")
+    }
+
+    /// Instruction-bearing executable section. Mach-O data can share an
+    /// executable segment with code; its explicit `data` flag excludes it.
+    pub fn is_code(&self) -> bool {
+        self.is_executable() && !self.flags.iter().any(|flag| flag == "data")
     }
 
     /// `true` when the section carries a write flag, under either the

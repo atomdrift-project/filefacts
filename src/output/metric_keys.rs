@@ -538,6 +538,7 @@ pub const CATALOG: &[&str] = &[
     "jpeg.maker_note_bytes",
     "jpeg.segment_count",
     "jpeg.soi_count",
+    "json.parse_lenient",
     "json.parse_limit_bytes",
     "json.parsed_bytes",
     "lnk.args_leading_spaces",
