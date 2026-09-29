@@ -25,10 +25,10 @@ use std::time::{Duration, Instant};
 /// builds. We can't catch a C `abort` from Rust, so the only safe
 /// option is to refuse parses that are likely to trip it.
 ///
-/// 2 MB matches cleave's `MAX_AST_FILE_BYTES`. Files this large are
-/// almost always machine-generated (protobuf descriptors, minified
-/// bundles) and gain little from AST analysis anyway.
-const MAX_AST_FILE_BYTES: usize = 2 * 1024 * 1024;
+/// 4 MiB bounds parser memory and CPU for audited grammars while allowing
+/// ordinary larger source files to retain AST analysis. The separate wall
+/// budget below remains a backstop for pathological parser behavior.
+const MAX_AST_FILE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Wall-clock backstop for a single parse. Input is already byte-capped by
 /// [`parse_cap_bytes`], so this exists only for the case size cannot bound:
@@ -152,7 +152,7 @@ impl TreeSitterDiagnostic {
         Self {
             metric: metric!("source.ast_unavailable.tree_sitter_guard"),
             message: format!(
-                "tree-sitter parse skipped for {language}: {bytes} bytes exceeds scanner-risk guard ({audit:?})"
+                "tree-sitter parse skipped for {language}: {bytes} bytes exceeds source-size or scanner-state safety guard ({audit:?})"
             ),
         }
     }
@@ -215,7 +215,7 @@ impl<'a> TreeCache<'a> {
                 language = config.name,
                 bytes = source.len(),
                 audit = ?scanner_audit(file_type),
-                "skipping tree-sitter parse to avoid 1024-byte scanner-state overflow"
+                "skipping tree-sitter parse due to source-size or scanner-state safety guard"
             );
             return Ok(TreeParse::Unavailable(diagnostic));
         }
@@ -531,6 +531,32 @@ mod tests {
     fn skips_oversized_source() {
         let huge = "x = 1\n".repeat(MAX_AST_FILE_BYTES);
         assert!(would_overflow_scanner_state(FileType::Python, &huge));
+    }
+
+    #[test]
+    fn audited_javascript_size_cap_is_four_mibibytes() {
+        assert_eq!(
+            parse_cap_bytes(scanner_audit(FileType::JavaScript)),
+            4 * 1024 * 1024
+        );
+        // The general size cap must not mistake a normal large JS file for
+        // scanner-state pressure: JavaScript's external scanner is bounded.
+        let source = "const value = 1;\n".repeat(180_000);
+        assert!(source.len() > 2 * 1024 * 1024);
+        assert!(source.len() < MAX_AST_FILE_BYTES);
+        assert!(!would_overflow_scanner_state(FileType::JavaScript, &source));
+    }
+
+    #[test]
+    fn parses_javascript_above_the_old_two_mibibyte_cap() {
+        let source = "const value = 1;\n".repeat(180_000);
+        assert!(source.len() > 2 * 1024 * 1024);
+        let parsed = TreeCache::parse(source.as_bytes(), FileType::JavaScript, None)
+            .expect("bounded JavaScript source should parse");
+        assert!(
+            parsed.cache().is_some(),
+            "audited JavaScript below 4 MiB should retain AST facts"
+        );
     }
 
     /// An exhausted budget must degrade to a diagnostic, not an `Err` and not a

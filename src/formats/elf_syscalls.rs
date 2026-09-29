@@ -126,8 +126,10 @@ fn exec_regions<'a>(elf: &'a Elf<'_>, bytes: &'a [u8]) -> impl Iterator<Item = (
     ranges.sort_unstable();
     let mut covered = 0;
     ranges.into_iter().filter_map(move |(start, size)| {
-        let end = start.checked_add(size)?;
-        if end > bytes.len() || end <= covered {
+        // A truncated file still holds the head of its code; scan what is
+        // present rather than dropping the whole region.
+        let end = start.checked_add(size)?.min(bytes.len());
+        if end <= start || end <= covered {
             return None;
         }
         let start = start.max(covered);

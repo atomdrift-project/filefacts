@@ -366,6 +366,7 @@ pub const CATALOG: &[&str] = &[
     "elf.relacount",
     "elf.rodata_writable",
     "elf.section_header_count_mismatch",
+    "elf.section_headers_truncated",
     "elf.section_overlap_count",
     "elf.section_past_eof_count",
     "elf.section_relocation_group_count",

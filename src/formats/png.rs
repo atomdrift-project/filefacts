@@ -194,7 +194,9 @@ pub(super) fn extract(
             coverage.claim_freeform(i as u64, chunk_end as u64);
         } else if ctype == "IDAT" {
             // Deferred until all IDAT bodies can be treated as one zlib stream.
-        } else if is_standard_chunk(ctype) {
+        } else if is_standard_chunk(ctype)
+            || is_well_formed_aapt_chunk(ctype, body, &bytes[body_start + length..chunk_end])
+        {
             coverage.claim(i as u64, chunk_end as u64);
         }
 
@@ -483,6 +485,35 @@ fn is_standard_chunk(t: &str) -> bool {
     )
 }
 
+/// Android's aapt writes three private chunks into every compiled nine-patch
+/// (`*.9.png` inside an APK): `npTc` (the stretch/padding divs), `npOl`
+/// (optical outline) and `npLb` (layout bounds). They stay in
+/// `png.unknown_chunks` because they are outside the PNG standard, but a
+/// chunk whose body is exactly the fixed aapt layout, with a valid CRC, is
+/// structure rather than concealed space. The length check is what keeps
+/// this from being a name-only exemption: a payload renamed `npTc` does not
+/// fit `32 + 4 * (xDivs + yDivs + colors)`, and `npOl`/`npLb` are fixed-size
+/// records (six and four 32-bit fields).
+fn is_well_formed_aapt_chunk(ctype: &str, body: &[u8], crc: &[u8]) -> bool {
+    let shape_ok = match ctype {
+        "npTc" => {
+            body.len() >= 32
+                && body.len()
+                    == 32 + 4 * (usize::from(body[1]) + usize::from(body[2]) + usize::from(body[3]))
+        }
+        "npOl" => body.len() == 24,
+        "npLb" => body.len() == 16,
+        _ => false,
+    };
+    if !shape_ok || crc.len() != 4 {
+        return false;
+    }
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(ctype.as_bytes());
+    hasher.update(body);
+    hasher.finalize() == u32::from_be_bytes([crc[0], crc[1], crc[2], crc[3]])
+}
+
 /// Parse the keyword + value out of any PNG text chunk variant.
 /// All three (`tEXt`, `zTXt`, `iTXt`) start with a NUL-terminated
 /// keyword; what follows differs. We surface the keyword always,
@@ -555,7 +586,10 @@ mod tests {
             out.extend_from_slice(&(body.len() as u32).to_be_bytes());
             out.extend_from_slice(*ctype);
             out.extend_from_slice(body);
-            out.extend_from_slice(&[0; 4]); // CRC (we don't check it)
+            let mut crc = crc32fast::Hasher::new();
+            crc.update(*ctype);
+            crc.update(body);
+            out.extend_from_slice(&crc.finalize().to_be_bytes());
         }
         out
     }
@@ -666,6 +700,54 @@ mod tests {
         assert_eq!(v.get("png.unknown_chunks"), Some(&json!(["sTeG"])));
         assert!(m.get("media.gap_bytes").unwrap() >= 1024.0);
         assert!(m.get("media.trailing_bytes").unwrap() >= 1000.0);
+    }
+
+    fn ninepatch_body(x: u8, y: u8, colors: u8) -> Vec<u8> {
+        let mut body = vec![0u8; 32 + 4 * (x as usize + y as usize + colors as usize)];
+        body[0] = 1;
+        body[1] = x;
+        body[2] = y;
+        body[3] = colors;
+        body
+    }
+
+    #[test]
+    fn aapt_ninepatch_chunks_are_claimed_structure() {
+        let np_tc = ninepatch_body(2, 2, 9);
+        let png = build_png(&[
+            (b"npOl", &[0u8; 24]),
+            (b"npTc", &np_tc),
+            (b"npLb", &[0u8; 16]),
+            (b"IEND", &[]),
+        ]);
+        let (v, m) = run(&png);
+        // Still reported as non-standard chunk types...
+        assert_eq!(m.get("png.unknown_chunk_count"), Some(3.0));
+        assert!(v.get("png.unknown_chunks").is_some());
+        // ...but not as unaccounted-for bytes.
+        assert_eq!(m.get("media.gap_bytes"), Some(0.0));
+        assert_eq!(m.get("media.stowaway_bytes"), Some(0.0));
+    }
+
+    #[test]
+    fn payload_named_nptc_is_still_a_hole() {
+        // Right name, wrong shape: counts claim 13 entries but the body is 1 KiB.
+        let mut body = ninepatch_body(2, 2, 9);
+        body.resize(1024, b'X');
+        let png = build_png(&[(b"npTc", &body), (b"IEND", &[])]);
+        let (_, m) = run(&png);
+        assert!(m.get("media.gap_bytes").unwrap() >= 1024.0);
+    }
+
+    #[test]
+    fn nptc_with_bad_crc_is_still_a_hole() {
+        let body = ninepatch_body(2, 2, 9);
+        let mut png = build_png(&[(b"npTc", &body), (b"IEND", &[])]);
+        // Flip one CRC byte of the npTc chunk (8 sig + 8 header + body).
+        let crc_at = 8 + 8 + body.len();
+        png[crc_at] ^= 0xff;
+        let (_, m) = run(&png);
+        assert!(m.get("media.gap_bytes").unwrap() >= body.len() as f64);
     }
 
     #[test]

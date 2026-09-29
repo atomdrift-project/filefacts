@@ -38,13 +38,28 @@ pub(super) fn extract(
     // failure into the typed errors view and return Ok so the
     // byte-level metrics already in `metrics`/`strings` from the
     // generic pass survive.
+    // Owns the header-patched copy when the section header table was cut
+    // off; declared here so the parse borrowing it outlives the match.
+    let detached;
     let elf = match goblin_safe::parse_elf(bytes) {
         goblin_safe::GoblinOutcome::Ok(elf) => elf,
         goblin_safe::GoblinOutcome::Failed(e) => {
-            extract_binary_strings(bytes, strings, XorScan::Yes);
-            errors_out.record_malformed(crate::Stage::ElfParse, e.to_string());
-            metrics.insert(metric!("elf.parse_failed"), 1.0);
-            return Ok(());
+            // A truncated file loses its trailing section header table first.
+            // Parse the segment view instead of discarding the whole binary;
+            // offsets are unchanged, so `bytes` stays authoritative below.
+            detached = goblin_safe::elf_without_truncated_section_headers(bytes);
+            if let Some(patched) = detached.as_deref()
+                && let goblin_safe::GoblinOutcome::Ok(elf) = goblin_safe::parse_elf(patched)
+            {
+                errors_out.record_malformed(crate::Stage::ElfParse, e.to_string());
+                metrics.insert(metric!("elf.section_headers_truncated"), 1.0);
+                elf
+            } else {
+                extract_binary_strings(bytes, strings, XorScan::Yes);
+                errors_out.record_malformed(crate::Stage::ElfParse, e.to_string());
+                metrics.insert(metric!("elf.parse_failed"), 1.0);
+                return Ok(());
+            }
         }
         goblin_safe::GoblinOutcome::Panicked(msg) => {
             extract_binary_strings(bytes, strings, XorScan::Yes);

@@ -1492,15 +1492,23 @@ fn merge_namespaces(entries: Vec<Entry>, anomalies: &mut Vec<&'static str>) -> V
 
     // Which namespaces exist at all — a file missing from one of them is
     // only interesting when that namespace is otherwise populated.
+    //
+    // Directories are left out: each namespace writes its own directory
+    // records, so a directory's extent never matches across trees and every
+    // subdirectory of a Joliet image would otherwise read as hidden.
     let mut present: Vec<&'static str> = Vec::new();
-    for f in &files {
+    for f in files.iter().filter(|f| !f.is_dir) {
         for ns in &f.namespaces {
             if !present.contains(ns) {
                 present.push(ns);
             }
         }
     }
-    if present.len() > 1 && files.iter().any(|f| f.namespaces.len() < present.len()) {
+    if present.len() > 1
+        && files
+            .iter()
+            .any(|f| !f.is_dir && f.namespaces.len() < present.len())
+    {
         anomalies.push("tree-only-file");
     }
     files
@@ -2015,6 +2023,57 @@ mod tests {
     fn plain_image_without_a_boot_signature_claims_nothing() {
         let bytes = vec![0u8; SYSTEM_AREA_SECTORS * SECTOR + 4096];
         assert!(partition_claimed_ranges(&bytes).is_empty());
+    }
+
+    fn entry(namespace: Namespace, path: &str, lba: u32, size: u32, flags: u8) -> Entry {
+        Entry {
+            namespace,
+            path: path.to_string(),
+            alt_name: None,
+            lba,
+            size,
+            flags,
+            recorded: None,
+            depth: 1,
+            contiguous: true,
+            ext_attr_sectors: 0,
+            mode: None,
+            uid: None,
+            gid: None,
+            symlink: None,
+        }
+    }
+
+    #[test]
+    fn subdirectory_in_both_namespaces_is_not_tree_only() {
+        // Each namespace writes its own directory records, so `/READ` and
+        // `/Read` sit at different extents even though they are the same
+        // directory. Only a file's extent is shared across trees.
+        let entries = vec![
+            entry(Namespace::Iso9660, "/READ", 20, 2048, 0x02),
+            entry(Namespace::Iso9660, "/READ/READ.TXT", 33, 19, 0),
+            entry(Namespace::Joliet, "/Read", 24, 2048, 0x02),
+            entry(Namespace::Joliet, "/Read/read.txt", 33, 19, 0),
+        ];
+        let mut anomalies = Vec::new();
+        let files = merge_namespaces(entries, &mut anomalies);
+        assert!(
+            !anomalies.contains(&"tree-only-file"),
+            "directories must not count: {anomalies:?}"
+        );
+        assert_eq!(files.iter().filter(|f| !f.is_dir).count(), 1);
+    }
+
+    #[test]
+    fn file_in_one_namespace_is_still_tree_only() {
+        let entries = vec![
+            entry(Namespace::Iso9660, "/README.TXT", 33, 19, 0),
+            entry(Namespace::Joliet, "/ReadMe.txt", 33, 19, 0),
+            entry(Namespace::Joliet, "/invoice.exe", 34, 4096, 0),
+        ];
+        let mut anomalies = Vec::new();
+        merge_namespaces(entries, &mut anomalies);
+        assert!(anomalies.contains(&"tree-only-file"));
     }
 
     #[test]

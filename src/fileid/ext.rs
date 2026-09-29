@@ -88,6 +88,18 @@ pub(crate) fn detect_from_path(path: &Path) -> Option<FileType> {
         return Some(FileType::Jar);
     }
 
+    // mysqltest scripts (`t/*.test`, `include/*.inc`) and their recorded
+    // output (`r/*.result`) in MySQL, MariaDB and Percona source trees. The
+    // dialect is SQL plus `--source`/`--echo`/`--let` directives, with no
+    // analyzer of its own; by content it scores as JavaScript, Python,
+    // Clojure or Kotlin depending on the statements in each file, and that
+    // language's rules then read test SQL as program code. Same reasoning as
+    // `.sql` below. Bound to the directory, since `.test` and `.inc` are
+    // generic extensions elsewhere (Tcl tests, PHP and Pascal includes).
+    if is_mysqltest_file(&path_str) {
+        return Some(FileType::Text);
+    }
+
     // Single extension
     if let Some(ft) = detect_from_extension(path) {
         return Some(ft);
@@ -173,6 +185,14 @@ pub(crate) fn is_filename_match(path: &Path) -> bool {
 
 /// `true` for a GitHub Actions workflow file: a `.yml`/`.yaml` under a
 /// `.github/workflows/` directory (either path separator).
+fn is_mysqltest_file(path_str: &str) -> bool {
+    let p = path_str.replace('\\', "/");
+    (p.starts_with("mysql-test/") || p.contains("/mysql-test/"))
+        && [".test", ".result", ".inc"]
+            .iter()
+            .any(|ext| ends_with_ci(p.as_bytes(), ext.as_bytes()))
+}
+
 fn is_github_workflow(path_str: &str) -> bool {
     (path_str.contains(".github/workflows/") || path_str.contains(".github\\workflows\\"))
         && (ends_with_ci(path_str.as_bytes(), b".yml")
@@ -249,6 +269,14 @@ fn detect_from_filename(path: &Path) -> Option<FileType> {
     }
     if name.eq_ignore_ascii_case("binding.gyp") {
         return Some(FileType::Gyp);
+    }
+    // npm/yarn run-control files are INI-style `key=value` text with no
+    // extension (`Path::extension` of `.npmrc` is None), so they fell through
+    // to Unknown and matched no trait. They carry `node-options`, `script-shell`
+    // and registry/token settings that change what every `npm` invocation in
+    // the project runs, so they need to reach text rules.
+    if name.eq_ignore_ascii_case(".npmrc") || name.eq_ignore_ascii_case(".yarnrc") {
+        return Some(FileType::Text);
     }
     // Xcode project. The name is fixed by the format -- it is always
     // `<name>.xcodeproj/project.pbxproj` -- but the extension arm below still
@@ -479,7 +507,12 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "xml" | "csproj" | "vbproj" | "fsproj" | "proj" | "props" | "targets" | "vcxproj"
         | "xaml" | "config" | "settings" | "nuspec" | "wsdl" | "xsd" | "xsl" | "xslt" | "xib"
         | "storyboard" => Some(FileType::Xml),
-        "json" => Some(FileType::Json),
+        // VS Code multi-root workspace files are JSONC (comments, trailing
+        // commas) and can carry a `tasks` block with `runOn: folderOpen`, the
+        // same autorun surface as `.vscode/tasks.json`. Typed as text, they
+        // were invisible to every JSON rule; the generic JSON extractor's
+        // JSONC fallback parses them.
+        "json" | "code-workspace" => Some(FileType::Json),
         // Generic YAML. The specific manifests that happen to be YAML
         // (pnpm-lock.yaml, action.yml, .github/workflows/*) are matched by
         // filename earlier in `detect_from_path`, so only the rest reach here.
@@ -634,6 +667,28 @@ fn ends_with_ci(haystack: &[u8], needle: &[u8]) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autorun_config_carriers_are_typed() {
+        // `.code-workspace` is JSONC with a possible folder-open `tasks` block.
+        assert_eq!(
+            detect_from_path(Path::new("api.code-workspace")),
+            Some(FileType::Json)
+        );
+        // Run-control dotfiles have no `Path::extension`; match by name.
+        for name in [".npmrc", "sub/.NPMRC", ".yarnrc"] {
+            assert_eq!(
+                detect_from_path(Path::new(name)),
+                Some(FileType::Text),
+                "{name}"
+            );
+        }
+        // `.yarnrc.yml` keeps its YAML extension typing.
+        assert_eq!(
+            detect_from_path(Path::new(".yarnrc.yml")),
+            Some(FileType::Yaml)
+        );
+    }
 
     #[test]
     fn python_extension() {
@@ -1092,6 +1147,31 @@ mod tests {
                 "{name} should be Yara, not PHP/Kotlin/Python/Shell"
             );
         }
+    }
+
+    #[test]
+    fn mysqltest_scripts_are_text() {
+        for name in [
+            "mariadb-11.8.6/mysql-test/main/gis-rtree.test",
+            "mariadb-11.8.6/mysql-test/include/mix1.inc",
+            "storage/columnstore/columnstore/mysql-test/columnstore/basic/r/ctype_cmp_char1_latin1_swedish_ci.result",
+            "mysql-test/suite/innodb/t/instant_alter_bugs.test",
+        ] {
+            assert_eq!(
+                detect_from_path(Path::new(name)),
+                Some(FileType::Text),
+                "{name} should be Text, not a content-sniffed language"
+            );
+        }
+        // Outside a mysql-test tree the generic extensions are left alone.
+        assert_ne!(
+            detect_from_path(Path::new("sqlite/test/select1.test")),
+            Some(FileType::Text)
+        );
+        assert_ne!(
+            detect_from_path(Path::new("mysql-test/lib/My/Platform.pm")),
+            Some(FileType::Text)
+        );
     }
 
     #[test]

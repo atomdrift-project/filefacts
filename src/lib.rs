@@ -1811,6 +1811,26 @@ mod tests {
         assert!(parsed.metrics().get("elf.parse_failed").is_some());
     }
 
+    /// A file cut off before its trailing section header table still has an
+    /// intact ELF header and program headers; those must be parsed rather
+    /// than the whole binary reported as unparseable.
+    #[test]
+    fn truncated_elf_section_table_keeps_segment_view() {
+        let full = include_bytes!("../tests/fixtures/test.elf");
+        let shoff =
+            usize::try_from(u64::from_le_bytes(full[0x28..0x30].try_into().unwrap())).unwrap();
+        let parsed = open(&full[..shoff + 64]).unwrap();
+        let _ = parsed.values();
+        assert!(parsed.metrics().get("elf.parse_failed").is_none());
+        assert!(
+            parsed
+                .metrics()
+                .get("elf.section_headers_truncated")
+                .is_some()
+        );
+        assert!(parsed.metrics().get("elf.program_header_count").is_some());
+    }
+
     #[test]
     fn guarded_tree_sitter_skip_records_source_error_and_metric() {
         // Perl is intentionally treated as an unaudited external-scanner grammar

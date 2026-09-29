@@ -475,6 +475,56 @@ pub(crate) fn parse_elf(data: &[u8]) -> GoblinOutcome<Elf<'_>> {
     catch(|| Elf::parse(data))
 }
 
+/// A copy of `data` with the section header table detached, when that table
+/// lies past end of file.
+///
+/// Truncated binaries are common in malware feeds (partial downloads,
+/// size-capped collectors). The section header table sits at the end of a
+/// typical ELF, so it is the first thing lost, and goblin then rejects the
+/// whole file even though the ELF header and program headers -- all a loader
+/// needs -- are intact. Zeroing `e_shoff`/`e_shnum`/`e_shstrndx` lets goblin
+/// parse the segment view; every file offset is unchanged, so the result can
+/// be read alongside the original bytes. `None` when the table is in bounds
+/// (the failure lies elsewhere) or the header itself is truncated.
+pub(crate) fn elf_without_truncated_section_headers(data: &[u8]) -> Option<Vec<u8>> {
+    let is64 = match data.get(4)? {
+        1 => false,
+        2 => true,
+        _ => return None,
+    };
+    let big_endian = match data.get(5)? {
+        1 => false,
+        2 => true,
+        _ => return None,
+    };
+    let (shoff_at, shoff_len, shentsize_at, shnum_at, shstrndx_at) = if is64 {
+        (0x28, 8, 0x3A, 0x3C, 0x3E)
+    } else {
+        (0x20, 4, 0x2E, 0x30, 0x32)
+    };
+    let read = |at: usize, len: usize| -> Option<u64> {
+        let field = data.get(at..at + len)?;
+        let fold = |acc: u64, b: &u8| (acc << 8) | u64::from(*b);
+        Some(if big_endian {
+            field.iter().fold(0, fold)
+        } else {
+            field.iter().rev().fold(0, fold)
+        })
+    };
+    let shoff = read(shoff_at, shoff_len)?;
+    let table_end = read(shnum_at, 2)?
+        .checked_mul(read(shentsize_at, 2)?)
+        .and_then(|size| size.checked_add(shoff))?;
+    if shoff == 0 || table_end <= data.len() as u64 {
+        return None;
+    }
+    let mut patched = data.to_vec();
+    patched[shoff_at..shoff_at + shoff_len].fill(0);
+    patched[shnum_at..shnum_at + 2].fill(0);
+    patched[shstrndx_at..shstrndx_at + 2].fill(0);
+    Some(patched)
+}
+
 /// Parse a Mach-O (single arch or fat), panic-safe.
 pub(crate) fn parse_mach(data: &[u8]) -> GoblinOutcome<Mach<'_>> {
     catch(|| Mach::parse(data))

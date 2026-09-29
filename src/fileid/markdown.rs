@@ -26,6 +26,7 @@ pub(super) fn document_structure(data: &[u8]) -> bool {
     }
 
     let mut fence = None;
+    let mut in_list = false;
     for line in lines {
         // A truncated final line cannot establish a closing fence.
         if data.len() > WINDOW && line.as_ptr_range().end == head.as_ptr_range().end {
@@ -33,7 +34,15 @@ pub(super) fn document_structure(data: &[u8]) -> bool {
         }
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         let spaces = line.iter().take_while(|b| **b == b' ').count();
-        if spaces > 3 {
+        if fence.is_none() && spaces <= 3 && !line.trim_ascii().is_empty() {
+            in_list = list_item(&line[spaces..]);
+        }
+        // Four spaces is an indented code block at the top level, but inside
+        // a list item it is the item's content indent, and a fence there is
+        // still a fence. wolfSSL's IDE/WORKBENCH/README.md indents every
+        // example under a numbered step that way and typed as C.
+        let max_indent = if in_list { 7 } else { 3 };
+        if spaces > max_indent {
             continue;
         }
         let line = &line[spaces..];
@@ -60,11 +69,42 @@ pub(super) fn document_structure(data: &[u8]) -> bool {
     false
 }
 
+/// A bullet (`-`, `*`, `+`) or ordered (`1.`, `1)`) list marker followed by a
+/// space. A line that starts anything else at the margin ends the list.
+fn list_item(line: &[u8]) -> bool {
+    let digits = line.iter().take_while(|b| b.is_ascii_digit()).count();
+    let marker = match (digits, line.get(digits)) {
+        (0, Some(b'-' | b'*' | b'+')) => 1,
+        (1..=9, Some(b'.' | b')')) => digits + 1,
+        _ => return false,
+    };
+    line.get(marker).is_some_and(|b| *b == b' ' || *b == b'\t')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{FileId, FileType};
     use std::path::Path;
+
+    #[test]
+    fn fences_indented_under_list_items_count() {
+        let doc = b"## Workbench with wolfSSL\n\
+1. Include the following at the top of usrAppInit.c:\n\n\
+    ```c\n\
+    #include <wolfssl/ssl.h>\n\
+    extern int benchmark_test(void* args);\n\
+    ```\n\n\
+2. Call it from `usrAppInit()`:\n\n\
+    ```c\n\
+    typedef struct func_args { int argc; char** argv; } func_args;\n\
+    func_args args;\n\
+    wolfcrypt_test(&args);\n\
+    ```\n";
+        assert!(document_structure(doc));
+        let id = FileId::from_path_and_bytes(Path::new("README.md"), doc);
+        assert_eq!(id.file_type(), FileType::Markdown);
+    }
 
     #[test]
     fn original_readmes_with_program_examples_remain_markdown() {

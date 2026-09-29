@@ -53,10 +53,19 @@ use serde_json::Value as JsonValue;
 
 pub(crate) use parse::{TreeCache, TreeParse, TreeSitterDiagnostic};
 
-const SOURCE_QUERY_MATCH_LIMIT: u32 = 50_000;
+// Tree-sitter's query match limit bounds simultaneous in-progress matches,
+// protecting against recursive/ambiguous query triggers. Allow ordinary
+// large source files more headroom while retaining a finite ceiling.
+const SOURCE_QUERY_MATCH_LIMIT: u32 = 100_000;
 const SOURCE_QUERY_BYTE_LIMIT: usize = 2 * 1024 * 1024;
 const SOURCE_QUERY_WALL_BUDGET: Duration = Duration::from_millis(250);
 const SOURCE_QUERY_OUTPUT_LIMIT: usize = 10_000;
+
+fn source_query_cursor() -> QueryCursor {
+    let mut cursor = QueryCursor::new();
+    cursor.set_match_limit(SOURCE_QUERY_MATCH_LIMIT);
+    cursor
+}
 
 fn source_query_wall_budget() -> Duration {
     if cfg!(test) {
@@ -432,8 +441,7 @@ fn collect_query(
         return QueryCollection::default();
     };
     let capture_names = query.capture_names();
-    let mut cursor = QueryCursor::new();
-    cursor.set_match_limit(SOURCE_QUERY_MATCH_LIMIT);
+    let mut cursor = source_query_cursor();
     cursor.set_byte_range(0..source.len().min(SOURCE_QUERY_BYTE_LIMIT));
     // De-duplicate by name, keeping the first (smallest) offset for
     // each. A repeated `import os` shows up once; the offset points
@@ -510,8 +518,7 @@ fn collect_imports(
         return Default::default();
     };
     let capture_names = query.capture_names();
-    let mut cursor = QueryCursor::new();
-    cursor.set_match_limit(SOURCE_QUERY_MATCH_LIMIT);
+    let mut cursor = source_query_cursor();
     cursor.set_byte_range(0..source.len().min(SOURCE_QUERY_BYTE_LIMIT));
     // Keep equal member names from distinct modules separate.
     let mut seen = std::collections::BTreeMap::new();
@@ -828,6 +835,12 @@ fn emit_text_ratios(metrics: &mut Metrics, total_lines: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_query_match_limit_allows_more_headroom_for_recursive_queries() {
+        let cursor = source_query_cursor();
+        assert_eq!(cursor.match_limit(), 100_000);
+    }
 
     #[test]
     fn strip_quotes_handles_three_quote_kinds() {
