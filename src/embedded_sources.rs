@@ -16,21 +16,59 @@ pub struct EmbeddedSource<'a> {
     pub file_type: Option<FileType>,
 }
 
-fn shell_type(shell: Option<&Value>) -> Option<FileType> {
-    match shell?.as_str()? {
+/// Interpreter for a declared `shell:` value: a GitHub built-in name, or a
+/// custom `command [options] {0}` template whose command is one of them
+/// (`bash -e {0}`, `/bin/sh -x {0}`).
+fn shell_type(shell: &Value) -> Option<FileType> {
+    let shell = shell.as_str()?;
+    let mut words = shell.split_whitespace();
+    let command = words.next()?;
+    // A dynamic expression is resolved at run time. A multi-word value that
+    // is not a `{0}` template is not a shell GitHub would accept.
+    if shell.contains("${{") || (words.next().is_some() && !shell.contains("{0}")) {
+        return None;
+    }
+    match command.rsplit('/').next()? {
         "bash" | "sh" => Some(FileType::Shell),
         "pwsh" | "powershell" => Some(FileType::PowerShell),
-        "python" => Some(FileType::Python),
-        // Do not guess custom command templates, dynamic expressions, or the
-        // OS-dependent default shell. Consumers can surface these omissions.
+        "python" | "python3" => Some(FileType::Python),
+        // `cmd` and other custom interpreters stay explicit unknowns.
         _ => None,
     }
+}
+
+/// Whether any string anywhere in `value` satisfies `pred`.
+fn any_string(value: &Value, pred: &dyn Fn(&str) -> bool) -> bool {
+    match value {
+        Value::String(s) => pred(s),
+        Value::Array(items) => items.iter().any(|v| any_string(v, pred)),
+        Value::Object(map) => map.values().any(|v| any_string(v, pred)),
+        _ => false,
+    }
+}
+
+/// GitHub's shell for a workflow step that declares none: `bash` on Linux
+/// and macOS runners, `pwsh` on Windows. Runner labels are AND-ed, so any
+/// Windows label selects Windows. A dynamic `runs-on` is resolved to bash
+/// only when neither it nor the job's matrix names Windows; with no
+/// `runs-on` at all the job is malformed and the shell stays unknown.
+fn runner_default(job: &Value) -> Option<FileType> {
+    let windows = |s: &str| s.to_ascii_lowercase().contains("windows");
+    let runs_on = job.get("runs-on")?;
+    if any_string(runs_on, &windows) {
+        return Some(FileType::PowerShell);
+    }
+    let dynamic = any_string(runs_on, &|s: &str| s.contains("${{"));
+    if dynamic && job.get("strategy").is_some_and(|s| any_string(s, &windows)) {
+        return None;
+    }
+    Some(FileType::Shell)
 }
 
 fn steps<'a>(
     value: Option<&'a Value>,
     prefix: String,
-    default_shell: Option<&'a Value>,
+    default_shell: Option<FileType>,
 ) -> impl Iterator<Item = EmbeddedSource<'a>> {
     value
         .and_then(Value::as_array)
@@ -47,7 +85,7 @@ fn steps<'a>(
             Some(EmbeddedSource {
                 pointer: format!("{prefix}/{index}/run"),
                 source,
-                file_type: shell_type(step.get("shell").or(default_shell)),
+                file_type: step.get("shell").map_or(default_shell, shell_type),
             })
         })
 }
@@ -64,7 +102,10 @@ pub(crate) fn github_actions(values: Option<&Values>) -> impl Iterator<Item = Em
         steps(action_steps, "/runs/steps".to_owned(), None).chain(
             jobs.into_iter().flatten().flat_map(move |(name, job)| {
                 let escaped = name.replace('~', "~0").replace('/', "~1");
-                let default = job.pointer("/defaults/run/shell").or(workflow_default);
+                let default = job
+                    .pointer("/defaults/run/shell")
+                    .or(workflow_default)
+                    .map_or_else(|| runner_default(job), shell_type);
                 steps(job.get("steps"), format!("/jobs/{escaped}/steps"), default)
             }),
         )
@@ -200,9 +241,78 @@ jobs:
                 Some(FileType::PowerShell),
                 Some(FileType::Python),
                 None,
-                None,
+                Some(FileType::Shell),
                 None,
                 Some(FileType::Shell),
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_templates_name_their_interpreter() {
+        let shell = |s: &str| shell_type(&Value::from(s));
+        assert_eq!(shell("bash"), Some(FileType::Shell));
+        assert_eq!(shell("bash -e {0}"), Some(FileType::Shell));
+        assert_eq!(
+            shell("bash --noprofile --norc -eo pipefail {0}"),
+            Some(FileType::Shell)
+        );
+        assert_eq!(shell("/bin/sh -x {0}"), Some(FileType::Shell));
+        assert_eq!(
+            shell("pwsh -command \". '{0}'\""),
+            Some(FileType::PowerShell)
+        );
+        assert_eq!(shell("python3 {0}"), Some(FileType::Python));
+        // Not a template, a dynamic value, or an interpreter we do not type.
+        assert_eq!(shell("bash -e"), None);
+        assert_eq!(shell("${{ matrix.shell }} {0}"), None);
+        assert_eq!(shell("cmd"), None);
+        assert_eq!(shell("perl {0}"), None);
+        assert_eq!(shell(""), None);
+    }
+
+    #[test]
+    fn undeclared_workflow_shell_follows_the_runner() {
+        let actual = sources(
+            br#"
+on: push
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps: [{run: echo linux}]
+  labels:
+    runs-on: [self-hosted, linux, x64]
+    steps: [{run: echo labels}]
+  windows:
+    runs-on: windows-2022
+    steps: [{run: Write-Output windows}]
+  group:
+    runs-on: {group: ci, labels: [Windows]}
+    steps: [{run: Write-Output group}]
+  matrix:
+    runs-on: ${{ matrix.os }}
+    strategy: {matrix: {os: [ubuntu-latest, windows-latest]}}
+    steps: [{run: echo ambiguous}]
+  dynamic:
+    runs-on: ${{ matrix.os }}
+    strategy: {matrix: {os: [ubuntu-latest, macos-latest]}}
+    steps: [{run: echo unix}, {shell: pwsh, run: Write-Output explicit}]
+"#,
+        );
+        assert_eq!(
+            actual
+                .iter()
+                .map(|s| (s.0.as_str(), s.2))
+                .collect::<Vec<_>>(),
+            // Jobs are visited in key order.
+            vec![
+                ("/jobs/dynamic/steps/0/run", Some(FileType::Shell)),
+                ("/jobs/dynamic/steps/1/run", Some(FileType::PowerShell)),
+                ("/jobs/group/steps/0/run", Some(FileType::PowerShell)),
+                ("/jobs/labels/steps/0/run", Some(FileType::Shell)),
+                ("/jobs/linux/steps/0/run", Some(FileType::Shell)),
+                ("/jobs/matrix/steps/0/run", None),
+                ("/jobs/windows/steps/0/run", Some(FileType::PowerShell)),
             ]
         );
     }

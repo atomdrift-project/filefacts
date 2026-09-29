@@ -640,6 +640,18 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
                 _ => None,
             }
         }
+        b'\n' | b'\r' | b' ' | b'\t' => {
+            // Blank lines ahead of a shebang: the kernel will not exec it, but
+            // a script served to `curl … | sh` or run as `bash x` executes the
+            // body all the same, so it is still that language. Bounded so a
+            // stray `#!` deep in whitespace-padded text is not a shebang.
+            let rest = data.trim_ascii_start();
+            if data.len() - rest.len() <= 64 && rest.starts_with(b"#!") {
+                detect_shebang(rest)
+            } else {
+                None
+            }
+        }
         b'/' => {
             // Xcode writes this exact comment as the first line of every
             // `project.pbxproj`; it is the format's only signature.
@@ -2049,6 +2061,20 @@ mod tests {
         let (ft, src) = detect_from_content(Path::new("script"), data).unwrap();
         assert_eq!(ft, FileType::Shell);
         assert_eq!(src, DetectionSource::Shebang);
+    }
+
+    #[test]
+    fn shebang_after_blank_lines() {
+        let data = b"\n\n#!/bin/bash\nset -e\necho hello\n";
+        let (ft, src) = detect_from_content(Path::new("linux"), data).unwrap();
+        assert_eq!(ft, FileType::Shell);
+        assert_eq!(src, DetectionSource::Shebang);
+
+        let padded = [&[b' '; 80][..], b"#!/bin/sh\necho hi\n"].concat();
+        assert!(
+            detect_from_content(Path::new("x"), &padded)
+                .is_none_or(|(_, src)| src != DetectionSource::Shebang)
+        );
     }
 
     #[test]
