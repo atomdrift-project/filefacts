@@ -4,14 +4,10 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 /// Kinds of the `source.payload_flow.events` reported for `source`.
-///
-/// Integration tests link filefacts as an ordinary dependency, without
-/// `cfg(test)`, so its disk cache is on by default and would write into the
-/// developer's real cache directory. Switch it off before opening, as
-/// `tests/integration.rs` does.
 fn event_kinds(source: &str) -> BTreeSet<String> {
-    filefacts::cache::set_caching_enabled(false);
-    let parsed = filefacts::open_with_path(Path::new("index.js"), source.as_bytes()).unwrap();
+    let parsed = filefacts::OpenOptions::new()
+        .path(Path::new("index.js"))
+        .open(source.as_bytes());
     parsed
         .values()
         .get("source.payload_flow.events")

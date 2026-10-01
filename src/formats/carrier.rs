@@ -36,6 +36,7 @@ use crate::formats::common::bytes_at::u32_le;
 use crate::metric;
 use crate::output::{Metrics, Values};
 use crate::scan::entropy;
+use crate::value_key;
 
 /// Bytes of alignment padding tolerated between two adjacent regions before
 /// the space between them counts as a hole. Chunked formats pad to 2- or
@@ -238,18 +239,24 @@ pub(crate) fn emit(bytes: &[u8], coverage: &Coverage, values: &mut Values, metri
 
     let valid = coverage.container.is_some() && problems.is_empty();
     if let Some(label) = coverage.container {
-        values.insert("media.container", JsonValue::String(label.to_string()));
+        values.insert_key(
+            value_key!("media.container"),
+            JsonValue::String(label.to_string()),
+        );
     } else {
         // Nothing here is the format the name claims. Say what it is instead:
         // this is the residue case, reached when the bytes carry no magic of
         // their own so no other analyzer claimed them.
         let kind = classify_region(bytes).unwrap_or("unknown");
-        values.insert("media.content_kind", JsonValue::String(kind.to_string()));
+        values.insert_key(
+            value_key!("media.content_kind"),
+            JsonValue::String(kind.to_string()),
+        );
     }
-    values.insert("media.valid", JsonValue::Bool(valid));
+    values.insert_key(value_key!("media.valid"), JsonValue::Bool(valid));
     if !stowaway.is_empty() {
-        values.insert(
-            "media.stowaway",
+        values.insert_key(
+            value_key!("media.stowaway"),
             JsonValue::Array(
                 stowaway
                     .iter()
@@ -259,8 +266,8 @@ pub(crate) fn emit(bytes: &[u8], coverage: &Coverage, values: &mut Values, metri
         );
     }
     if !problems.is_empty() {
-        values.insert(
-            "media.problems",
+        values.insert_key(
+            value_key!("media.problems"),
             JsonValue::Array(problems.into_iter().map(JsonValue::String).collect()),
         );
     }

@@ -117,7 +117,7 @@ pub(super) fn parse(bytes: &[u8], sig_off: usize, sig_size: usize, values: &mut 
             CSMAGIC_REQUIREMENTS => {
                 put_u64(
                     values,
-                    "macho.code_signature.requirements_size",
+                    value_key!("macho.code_signature.requirements_size"),
                     (blob.len() - 8) as u64,
                 );
                 parse_requirements_set(blob, values);
@@ -128,7 +128,7 @@ pub(super) fn parse(bytes: &[u8], sig_off: usize, sig_size: usize, values: &mut 
                 // signals a DER-encoded entitlements blob was found.
                 put_u64(
                     values,
-                    "macho.code_signature.der_entitlements_size",
+                    value_key!("macho.code_signature.der_entitlements_size"),
                     (blob.len() - 8) as u64,
                 );
             }
@@ -189,7 +189,7 @@ fn parse_code_directory(blob: &[u8], cd_base: usize, values: &mut Values) -> Opt
         // signature blob. Same coordinate space as the signature offset.
         put_u64(
             values,
-            "macho.code_signature.identifier_offset",
+            value_key!("macho.code_signature.identifier_offset"),
             (cd_base + ident_offset) as u64,
         );
     }
@@ -215,10 +215,14 @@ fn parse_code_directory(blob: &[u8], cd_base: usize, values: &mut Values) -> Opt
             bytes::u64_be(blob, 0x50),
         )
     {
-        put_u64(values, "macho.code_signature.exec_segment_base", exec_base);
         put_u64(
             values,
-            "macho.code_signature.exec_segment_limit",
+            value_key!("macho.code_signature.exec_segment_base"),
+            exec_base,
+        );
+        put_u64(
+            values,
+            value_key!("macho.code_signature.exec_segment_limit"),
             exec_limit,
         );
         // CS_EXECSEG_* flags: 0x1 main binary, 0x10 allow unsigned,
@@ -227,15 +231,19 @@ fn parse_code_directory(blob: &[u8], cd_base: usize, values: &mut Values) -> Opt
         // allow_root.
         put_u64(
             values,
-            "macho.code_signature.exec_segment_flags",
+            value_key!("macho.code_signature.exec_segment_flags"),
             exec_flags,
         );
     }
 
-    put_str(values, "macho.code_signature.hash", hash_label(hash_type));
+    put_str(
+        values,
+        value_key!("macho.code_signature.hash"),
+        hash_label(hash_type),
+    );
     put_u64(
         values,
-        "macho.code_signature.hash_size",
+        value_key!("macho.code_signature.hash_size"),
         u64::from(hash_size),
     );
     put_u64(
@@ -243,26 +251,30 @@ fn parse_code_directory(blob: &[u8], cd_base: usize, values: &mut Values) -> Opt
         value_key!("macho.code_signature.platform"),
         u64::from(platform),
     );
-    put_u64(values, "macho.code_signature.version", u64::from(version));
     put_u64(
         values,
-        "macho.code_signature.special_slots",
+        value_key!("macho.code_signature.version"),
+        u64::from(version),
+    );
+    put_u64(
+        values,
+        value_key!("macho.code_signature.special_slots"),
         u64::from(n_special_slots),
     );
     put_u64(
         values,
-        "macho.code_signature.code_slots",
+        value_key!("macho.code_signature.code_slots"),
         u64::from(n_code_slots),
     );
     put_u64(
         values,
-        "macho.code_signature.code_limit",
+        value_key!("macho.code_signature.code_limit"),
         u64::from(code_limit),
     );
     if page_size_log2 > 0 && page_size_log2 < 32 {
         put_u64(
             values,
-            "macho.code_signature.page_size",
+            value_key!("macho.code_signature.page_size"),
             1u64 << page_size_log2,
         );
     }
@@ -345,8 +357,8 @@ fn parse_requirements_set(blob: &[u8], values: &mut Values) {
         requirements.insert(key.to_string(), JsonValue::String(text));
     }
     if !requirements.is_empty() {
-        values.insert(
-            "macho.code_signature.requirements",
+        values.insert_key(
+            value_key!("macho.code_signature.requirements"),
             JsonValue::Object(requirements),
         );
     }
@@ -510,7 +522,11 @@ fn parse_entitlements(blob: &[u8], values: &mut Values) {
         // Surface raw text as a fallback so the consumer at least sees
         // what was claimed.
         if let Ok(s) = std::str::from_utf8(xml_bytes) {
-            put_str(values, "macho.code_signature.entitlements_xml", s);
+            put_str(
+                values,
+                value_key!("macho.code_signature.entitlements_xml"),
+                s,
+            );
         }
         return;
     };
@@ -530,7 +546,7 @@ fn parse_cms(blob: &[u8], values: &mut Values) {
     // the deep parse can't decode the SignedData.
     put_u64(
         values,
-        "macho.code_signature.cms_size",
+        value_key!("macho.code_signature.cms_size"),
         (blob.len() - 8) as u64,
     );
     // Apple emits the inner SignedData with BER indefinite-length

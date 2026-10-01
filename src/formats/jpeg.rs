@@ -20,6 +20,7 @@
 
 use crate::formats::carrier::{self, Coverage};
 use crate::metric;
+use crate::value_key;
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
@@ -174,22 +175,22 @@ pub(super) fn extract(
             exif.insert("copyright".into(), JsonValue::String(v));
         }
         if !exif.is_empty() {
-            values.insert("jpeg.exif", JsonValue::Object(exif));
+            values.insert_key(value_key!("jpeg.exif"), JsonValue::Object(exif));
         }
         state.features.insert(0, "exif");
     }
     if let Some(c) = state.comment {
-        put_str(values, "jpeg.comment", c);
+        put_str(values, value_key!("jpeg.comment"), c);
     }
     if let Some(t) = state.adobe_color_transform {
         // Nest under `jpeg.adobe.*` so additional APP14 fields
         // (DCTEncodeVersion, APP14Flags0/1) can land here in the
         // future without renaming the existing key.
-        values.insert("jpeg.adobe.color_transform", json!(t));
+        values.insert_key(value_key!("jpeg.adobe.color_transform"), json!(t));
     }
     if !state.features.is_empty() {
-        values.insert(
-            "jpeg.features",
+        values.insert_key(
+            value_key!("jpeg.features"),
             JsonValue::Array(
                 state
                     .features
@@ -219,7 +220,7 @@ pub(super) fn extract(
     metrics.insert(metric!("jpeg.comment_bytes"), state.comment_bytes as f64);
     metrics.insert(metric!("jpeg.exif_size"), state.exif_size as f64);
     let appended_bytes = eoi_pos.map_or(0u64, |p| bytes.len().saturating_sub(p) as u64);
-    metrics.insert(metric!("jpeg.appended_bytes"), appended_bytes as f64);
+    metrics.insert(metric!("jpeg.trailing_bytes"), appended_bytes as f64);
 
     // Best-effort pixel-statistic pass. Decoder errors are swallowed —
     // a JPEG with a weird color space or a truncated bitstream still
@@ -623,7 +624,7 @@ mod tests {
         let mut jpeg = build_jpeg(&[]);
         jpeg.extend_from_slice(b"hidden payload");
         let (_, m) = run(&jpeg);
-        assert_eq!(m.get("jpeg.appended_bytes"), Some(14.0));
+        assert_eq!(m.get("jpeg.trailing_bytes"), Some(14.0));
     }
 
     #[test]
@@ -648,7 +649,9 @@ mod tests {
 
         // Bytes that pass the SOI check but aren't decodable.
         for bytes in [jpeg, vec![0xFF, 0xD8, 0xFF, 0xD9]] {
-            let parsed = crate::open_with_path(std::path::Path::new("x.jpg"), &bytes).unwrap();
+            let parsed = crate::OpenOptions::new()
+                .path(std::path::Path::new("x.jpg"))
+                .open(&bytes);
             assert_eq!(parsed.fileid().file_type(), crate::FileType::Jpeg);
             let h = parsed.metrics().get("file.entropy").unwrap();
             assert!((h - entropy::shannon(&bytes)).abs() < 1e-9);

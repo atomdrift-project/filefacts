@@ -1260,32 +1260,41 @@ fn emit(
     metrics: &mut Metrics,
     archive_members: &mut Vec<ArchiveMember>,
 ) {
-    values.insert("archive.format.kind", JsonValue::String("rar".into()));
-    values.insert("rar.version", JsonValue::String(ar.version.to_string()));
-    values.insert("rar.solid", JsonValue::Bool(ar.solid));
-    values.insert("rar.volume", JsonValue::Bool(ar.volume));
-    values.insert("rar.locked", JsonValue::Bool(ar.locked));
-    values.insert("rar.recovery", JsonValue::Bool(ar.recovery));
-    values.insert(
-        "rar.headers_encrypted",
+    values.insert_key(
+        value_key!("archive.format.kind"),
+        JsonValue::String("rar".into()),
+    );
+    values.insert_key(
+        value_key!("rar.version"),
+        JsonValue::String(ar.version.to_string()),
+    );
+    values.insert_key(value_key!("rar.solid"), JsonValue::Bool(ar.solid));
+    values.insert_key(value_key!("rar.volume"), JsonValue::Bool(ar.volume));
+    values.insert_key(value_key!("rar.locked"), JsonValue::Bool(ar.locked));
+    values.insert_key(value_key!("rar.recovery"), JsonValue::Bool(ar.recovery));
+    values.insert_key(
+        value_key!("rar.headers_encrypted"),
         JsonValue::Bool(ar.headers_encrypted),
     );
-    values.insert("rar.end_present", JsonValue::Bool(ar.end_present));
-    values.insert("rar.quick_open", JsonValue::Bool(ar.quick_open));
+    values.insert_key(
+        value_key!("rar.end_present"),
+        JsonValue::Bool(ar.end_present),
+    );
+    values.insert_key(value_key!("rar.quick_open"), JsonValue::Bool(ar.quick_open));
     if ar.new_numbering {
-        values.insert("rar.new_numbering", JsonValue::Bool(true));
+        values.insert_key(value_key!("rar.new_numbering"), JsonValue::Bool(true));
     }
     if ar.authenticity {
-        values.insert("rar.authenticity_info", JsonValue::Bool(true));
+        values.insert_key(value_key!("rar.authenticity_info"), JsonValue::Bool(true));
     }
     if ar.first_volume {
-        values.insert("rar.first_volume", JsonValue::Bool(true));
+        values.insert_key(value_key!("rar.first_volume"), JsonValue::Bool(true));
     }
     if ar.not_last_volume {
-        values.insert("rar.not_last_volume", JsonValue::Bool(true));
+        values.insert_key(value_key!("rar.not_last_volume"), JsonValue::Bool(true));
     }
     if let Some(n) = ar.volume_number {
-        values.insert("rar.volume_number", JsonValue::Number(n.into()));
+        values.insert_key(value_key!("rar.volume_number"), JsonValue::Number(n.into()));
     }
     if let Some(ref name) = ar.original_name {
         values.insert_key(
@@ -1294,29 +1303,32 @@ fn emit(
         );
     }
     if let Some(t) = ar.created_unix {
-        values.insert("rar.created_unix", JsonValue::Number(t.into()));
+        values.insert_key(value_key!("rar.created_unix"), JsonValue::Number(t.into()));
     }
     if let Some(ref c) = ar.comment {
-        values.insert("rar.comment", JsonValue::String(c.clone()));
+        values.insert_key(value_key!("rar.comment"), JsonValue::String(c.clone()));
         metrics.insert(metric!("archive.has_comment"), 1.0);
         metrics.insert(metric!("archive.comment_size"), c.len() as f64);
     } else if ar.comment_packed {
-        values.insert("rar.comment_packed", JsonValue::Bool(true));
+        values.insert_key(value_key!("rar.comment_packed"), JsonValue::Bool(true));
         metrics.insert(metric!("archive.has_comment"), 1.0);
     }
     if let Some(v) = ar.crypt_version {
-        values.insert("rar.encryption.version", JsonValue::Number(v.into()));
+        values.insert_key(
+            value_key!("rar.encryption.version"),
+            JsonValue::Number(v.into()),
+        );
     }
     if let Some(k) = ar.kdf_count {
-        values.insert(
-            "rar.encryption.kdf_count",
+        values.insert_key(
+            value_key!("rar.encryption.kdf_count"),
             JsonValue::Number(u64::from(k).into()),
         );
         metrics.insert(metric!("rar.kdf_count"), f64::from(k));
     }
     if let Some(v) = ar.r4_encrypt_ver {
-        values.insert(
-            "rar.encryption.rar4_version",
+        values.insert_key(
+            value_key!("rar.encryption.rar4_version"),
             JsonValue::Number(u64::from(v).into()),
         );
     }
@@ -1328,11 +1340,11 @@ fn emit(
         if let Some(r) = ar.locator_rr {
             loc.insert("recovery_offset".into(), JsonValue::Number(r.into()));
         }
-        values.insert("rar.locator", JsonValue::Object(loc));
+        values.insert_key(value_key!("rar.locator"), JsonValue::Object(loc));
     }
     if !ar.services.is_empty() {
-        values.insert(
-            "rar.services",
+        values.insert_key(
+            value_key!("rar.services"),
             JsonValue::Array(
                 ar.services
                     .iter()
@@ -1342,11 +1354,14 @@ fn emit(
         );
     }
     if !ar.streams.is_empty() {
-        values.insert("rar.ntfs_streams", JsonValue::Array(ar.streams.clone()));
+        values.insert_key(
+            value_key!("rar.ntfs_streams"),
+            JsonValue::Array(ar.streams.clone()),
+        );
     }
     if !ar.extra_types.is_empty() {
-        values.insert(
-            "rar.extra_record_types",
+        values.insert_key(
+            value_key!("rar.extra_record_types"),
             JsonValue::Array(
                 ar.extra_types
                     .iter()
@@ -1356,11 +1371,20 @@ fn emit(
         );
     }
     if !ar.limits.is_empty() {
-        values.insert("rar.limits", JsonValue::Array(ar.limits.clone()));
+        values.insert_key(
+            value_key!("rar.limits"),
+            JsonValue::Array(ar.limits.clone()),
+        );
     }
     if let (Some(min), Some(max)) = (ar.unpack_min, ar.unpack_max) {
-        values.insert("rar.unpack_version.min", JsonValue::Number(min.into()));
-        values.insert("rar.unpack_version.max", JsonValue::Number(max.into()));
+        values.insert_key(
+            value_key!("rar.unpack_version.min"),
+            JsonValue::Number(min.into()),
+        );
+        values.insert_key(
+            value_key!("rar.unpack_version.max"),
+            JsonValue::Number(max.into()),
+        );
     }
 
     let mut stats = ArchiveStats::new(AGGS);
@@ -1376,22 +1400,28 @@ fn emit(
         members_json.push(JsonValue::Object(obj));
         archive_members.push(member);
     }
-    values.insert("rar.members", JsonValue::Array(members_json.clone()));
-    values.insert("archive.members", JsonValue::Array(members_json));
+    values.insert_key(
+        value_key!("rar.members"),
+        JsonValue::Array(members_json.clone()),
+    );
+    values.insert_key(
+        value_key!("archive.members"),
+        JsonValue::Array(members_json),
+    );
     stats.emit(values, metrics);
 
     metrics.insert(
         metric!("archive.extra_field_size"),
         ar.extra_field_size as f64,
     );
-    metrics.insert(metric!("archive.prefix_bytes"), ar.prefix as f64);
+    metrics.insert(metric!("archive.leading_bytes"), ar.prefix as f64);
     let trailing = bytes_len.saturating_sub(ar.end_offset.max(ar.prefix));
     metrics.insert(metric!("archive.trailing_bytes"), trailing as f64);
     if ar.prefix > 0 {
         metrics.insert(metric!("rar.sfx_bytes"), ar.prefix as f64);
     }
     metrics.insert(
-        metric!("rar.encrypted_header"),
+        metric!("rar.headers_encrypted"),
         f64::from(u8::from(ar.headers_encrypted)),
     );
     metrics.insert(metric!("rar.solid"), f64::from(u8::from(ar.solid)));
@@ -1745,7 +1775,7 @@ mod tests {
         let end = bytes.len();
         bytes.extend_from_slice(&[0x41; 32]);
         let (_, metrics, _) = run(&bytes);
-        assert_eq!(metrics.get("archive.prefix_bytes"), Some(4.0));
+        assert_eq!(metrics.get("archive.leading_bytes"), Some(4.0));
         assert_eq!(metrics.get("rar.sfx_bytes"), Some(4.0));
         assert_eq!(metrics.get("archive.trailing_bytes"), Some(32.0));
         assert!(end > 4);

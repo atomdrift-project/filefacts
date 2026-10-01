@@ -50,8 +50,8 @@ fn cargo_toml(bytes: &[u8], values: &mut Values, errors: &mut Errors) -> Option<
         }
     };
     if raw.len() as u64 > MAX_MANIFEST {
-        values.insert(
-            "crate.limits",
+        values.insert_key(
+            value_key!("crate.limits"),
             serde_json::json!([{
                 "stage": "manifest",
                 "reason": format!("{path} over the {MAX_MANIFEST}-byte cap; not parsed"),

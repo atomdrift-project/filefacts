@@ -49,7 +49,10 @@ pub(super) fn extract(
     values: &mut Values,
     metrics: &mut Metrics,
 ) -> Result<(), Error> {
-    values.insert("archive.format.kind", JsonValue::String("apk".into()));
+    values.insert_key(
+        value_key!("archive.format.kind"),
+        JsonValue::String("apk".into()),
+    );
 
     // Decompress a bounded prefix and walk the tar headers directly rather
     // than handing the stream to `tar::Archive`. The segments are separate
@@ -99,8 +102,8 @@ pub(super) fn extract(
     }
 
     if !signing_keys.is_empty() {
-        values.insert(
-            "apk.signing_keys",
+        values.insert_key(
+            value_key!("apk.signing_keys"),
             JsonValue::Array(signing_keys.into_iter().map(JsonValue::String).collect()),
         );
     }
@@ -151,10 +154,10 @@ pub(super) fn extract(
     }
 
     for (key, out) in [
-        ("pkgname", value_key!("apk.pkgname")),
-        ("pkgver", value_key!("apk.pkgver")),
-        ("pkgdesc", value_key!("apk.pkgdesc")),
-        ("url", value_key!("apk.url")),
+        ("pkgname", value_key!("apk.name")),
+        ("pkgver", value_key!("apk.version")),
+        ("pkgdesc", value_key!("apk.description")),
+        ("url", value_key!("apk.homepage")),
         ("license", value_key!("apk.license")),
         ("arch", value_key!("apk.arch")),
         ("origin", value_key!("apk.origin")),
@@ -169,16 +172,16 @@ pub(super) fn extract(
         }
     }
     if !depends.is_empty() {
-        metrics.insert(metric!("apk.depend_count"), depends.len() as f64);
-        values.insert("apk.depends", JsonValue::Array(depends));
+        metrics.insert(metric!("apk.dependency_count"), depends.len() as f64);
+        values.insert_key(value_key!("apk.dependencies"), JsonValue::Array(depends));
     }
     if !provides.is_empty() {
-        values.insert("apk.provides", JsonValue::Array(provides));
+        values.insert_key(value_key!("apk.provides"), JsonValue::Array(provides));
     }
     if let Some(size) = fields.get("size").and_then(|v| v.as_str())
         && let Ok(n) = size.parse::<f64>()
     {
-        metrics.insert(metric!("apk.declared_size"), n);
+        metrics.insert(metric!("apk.installed_size"), n);
     }
     // A package whose `origin` differs from its `pkgname` is a subpackage of
     // another build; when they match it is the primary artifact. Stated as a
@@ -237,7 +240,7 @@ mod tests {
         extract(&bytes, &mut values, &mut metrics).unwrap();
 
         assert_eq!(
-            values.get("apk.pkgname").and_then(JsonValue::as_str),
+            values.get("apk.name").and_then(JsonValue::as_str),
             Some("plugin-proposal-decorators")
         );
         assert_eq!(
@@ -245,9 +248,9 @@ mod tests {
             Some("melange")
         );
         // An empty value is skipped rather than recorded as an empty claim.
-        assert!(values.get("apk.url").is_none());
-        assert_eq!(metrics.get("apk.depend_count"), Some(2.0));
-        assert_eq!(metrics.get("apk.declared_size"), Some(69873.0));
+        assert!(values.get("apk.homepage").is_none());
+        assert_eq!(metrics.get("apk.dependency_count"), Some(2.0));
+        assert_eq!(metrics.get("apk.installed_size"), Some(69873.0));
         assert_eq!(metrics.get("apk.subpackage"), Some(0.0));
         assert_eq!(metrics.get("apk.signed"), Some(0.0));
     }
@@ -263,7 +266,7 @@ mod tests {
         extract(&bytes, &mut values, &mut metrics).unwrap();
 
         assert_eq!(
-            values.get("apk.pkgname").and_then(JsonValue::as_str),
+            values.get("apk.name").and_then(JsonValue::as_str),
             Some("busybox")
         );
         assert_eq!(metrics.get("apk.signed"), Some(1.0));
@@ -283,6 +286,6 @@ mod tests {
         let mut values = Values::default();
         let mut metrics = Metrics::default();
         extract(b"not gzip at all", &mut values, &mut metrics).unwrap();
-        assert!(values.get("apk.pkgname").is_none());
+        assert!(values.get("apk.name").is_none());
     }
 }

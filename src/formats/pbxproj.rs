@@ -28,7 +28,8 @@ use serde_json::{Map, Value as JsonValue};
 use crate::error::Error;
 use crate::formats::common::{XorScan, extract_binary_strings};
 use crate::metric;
-use crate::output::{Metrics, Strings, Values};
+use crate::output::{Metrics, Strings, ValueKey, Values};
+use crate::value_key;
 
 /// Build settings whose values are ordinary project configuration — long
 /// lists of flags and paths that would swamp `pbxproj.build_settings[]`
@@ -61,7 +62,7 @@ pub(super) fn extract(
 
     let cursor = std::io::Cursor::new(bytes);
     let parsed = plist::Value::from_reader(cursor)
-        .map_err(|e| Error::malformed("pbxproj", e.to_string()))?;
+        .map_err(|e| Error::malformed_with_source("pbxproj", e.to_string(), e))?;
     let json = plist_value_to_json(parsed);
 
     let JsonValue::Object(root) = json else {
@@ -103,22 +104,28 @@ pub(super) fn extract(
     metrics.insert(metric!("pbxproj.script_count"), scripts.len() as f64);
     metrics.insert(metric!("pbxproj.object_count"), isas.len() as f64);
 
-    let mut out = Map::new();
-    for (key, path) in [
-        ("archiveVersion", "archive_version"),
-        ("objectVersion", "object_version"),
-    ] {
-        if let Some(v) = root.get(key) {
-            out.insert(path.to_string(), v.clone());
-        }
-    }
-    out.insert("scripts".to_string(), JsonValue::Array(scripts));
-    out.insert("build_settings".to_string(), JsonValue::Array(settings));
-    out.insert("isa".to_string(), JsonValue::Array(isas));
+    let header: Vec<(ValueKey, JsonValue)> = [
+        ("archiveVersion", value_key!("pbxproj.archive_version")),
+        ("objectVersion", value_key!("pbxproj.object_version")),
+    ]
+    .into_iter()
+    .filter_map(|(field, key)| Some((key, root.get(field)?.clone())))
+    .collect();
 
+    // The derived facts replace, rather than merge into, a `pbxproj` key the
+    // document itself carries.
     let mut top = root;
-    top.insert("pbxproj".to_string(), JsonValue::Object(out));
+    top.insert("pbxproj".to_string(), JsonValue::Object(Map::new()));
     *values = Values::from_json(JsonValue::Object(top));
+    for (key, value) in header {
+        values.insert_key(key, value);
+    }
+    values.insert_key(value_key!("pbxproj.scripts"), JsonValue::Array(scripts));
+    values.insert_key(
+        value_key!("pbxproj.build_settings"),
+        JsonValue::Array(settings),
+    );
+    values.insert_key(value_key!("pbxproj.isa"), JsonValue::Array(isas));
     Ok(())
 }
 

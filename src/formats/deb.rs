@@ -10,11 +10,11 @@
 //!
 //! Emitted keys:
 //!
-//! - `deb.package`, `deb.version`, `deb.architecture` — core identity.
+//! - `deb.name`, `deb.version`, `deb.arch` — core identity.
 //! - `deb.maintainer`, `deb.section`, `deb.priority` — provenance / category.
 //! - `deb.summary` — the `Description` synopsis (first line).
-//! - `deb.depends[]` — runtime dependency package names (bounded).
-//! - `deb.installed_size` — declared installed size in KiB.
+//! - `deb.dependencies[]` — runtime dependency package names (bounded).
+//! - `deb.installed_size_kib` — declared installed size in KiB.
 //! - `deb.limits[]` — `{stage, reason}` when the control archive was left
 //!   unread by design: an `xz` (or other undecodable) `control.tar`, or one
 //!   that inflates past the size cap. A control archive that fails to
@@ -27,7 +27,7 @@ use std::io::{Cursor, Read};
 use serde_json::Value as JsonValue;
 
 use crate::error::Error;
-use crate::output::{Errors, Metrics, Stage, Values};
+use crate::output::{Errors, Metrics, Stage, ValueKey, Values};
 use crate::value_key;
 
 const AR_MAGIC: &[u8] = b"!<arch>\n";
@@ -87,8 +87,8 @@ pub(super) fn extract(
                 Ok(Some(control)) => parse_control(&control, values, metrics),
                 // No `control` file inside: nothing to read, nothing failed.
                 Ok(None) => {}
-                Err(ControlError::Unread(reason)) => values.insert(
-                    "deb.limits",
+                Err(ControlError::Unread(reason)) => values.insert_key(
+                    value_key!("deb.limits"),
                     serde_json::json!([{ "stage": "control-archive", "reason": reason }]),
                 ),
                 Err(ControlError::Malformed(why)) => {
@@ -195,26 +195,26 @@ fn parse_control(control: &[u8], values: &mut Values, metrics: &mut Metrics) {
             continue;
         }
         match key.trim() {
-            "Package" => insert_str(values, value_key!("deb.package"), value),
+            "Package" => insert_str(values, value_key!("deb.name"), value),
             "Version" => insert_str(values, value_key!("deb.version"), value),
-            "Architecture" => insert_str(values, "deb.architecture", value),
+            "Architecture" => insert_str(values, value_key!("deb.arch"), value),
             "Maintainer" => insert_str(values, value_key!("deb.maintainer"), value),
-            "Section" => insert_str(values, "deb.section", value),
-            "Priority" => insert_str(values, "deb.priority", value),
+            "Section" => insert_str(values, value_key!("deb.section"), value),
+            "Priority" => insert_str(values, value_key!("deb.priority"), value),
             // `Description`'s first line is the synopsis; the indented
             // continuation lines (the long description) are skipped above.
             "Description" => insert_str(values, value_key!("deb.summary"), value),
             "Installed-Size" => {
                 if let Ok(kib) = value.parse::<f64>() {
-                    metrics.insert(metric!("deb.installed_size"), kib);
+                    metrics.insert(metric!("deb.installed_size_kib"), kib);
                 }
             }
             "Depends" => {
                 let names = dependency_names(value);
                 if !names.is_empty() {
-                    metrics.insert(metric!("deb.depends_count"), names.len() as f64);
-                    values.insert(
-                        "deb.depends",
+                    metrics.insert(metric!("deb.dependency_count"), names.len() as f64);
+                    values.insert_key(
+                        value_key!("deb.dependencies"),
                         JsonValue::Array(names.into_iter().map(JsonValue::String).collect()),
                     );
                 }
@@ -246,9 +246,8 @@ fn dependency_names(field: &str) -> Vec<String> {
     names
 }
 
-/// `key` is a plain string or a checked key from `value_key!`.
-fn insert_str(values: &mut Values, key: impl AsRef<str>, value: &str) {
-    values.insert(key.as_ref(), JsonValue::String(value.to_string()));
+fn insert_str(values: &mut Values, key: ValueKey, value: &str) {
+    values.insert_key(key, JsonValue::String(value.to_string()));
 }
 
 #[cfg(test)]
@@ -342,23 +341,17 @@ Description: A demo package\n\
         assert!(e.is_empty(), "{e:?}");
         assert!(v.get("deb.limits").is_none());
 
-        assert_eq!(
-            v.get("deb.package").and_then(|x| x.as_str()),
-            Some("demo-pkg")
-        );
+        assert_eq!(v.get("deb.name").and_then(|x| x.as_str()), Some("demo-pkg"));
         assert_eq!(
             v.get("deb.version").and_then(|x| x.as_str()),
             Some("1.2.3-1")
         );
-        assert_eq!(
-            v.get("deb.architecture").and_then(|x| x.as_str()),
-            Some("amd64")
-        );
+        assert_eq!(v.get("deb.arch").and_then(|x| x.as_str()), Some("amd64"));
         assert_eq!(
             v.get("deb.summary").and_then(|x| x.as_str()),
             Some("A demo package")
         );
-        assert_eq!(m.get("deb.installed_size"), Some(512.0));
+        assert_eq!(m.get("deb.installed_size_kib"), Some(512.0));
     }
 
     #[test]
@@ -367,7 +360,7 @@ Description: A demo package\n\
         let (v, _, _) = run(&deb);
 
         let deps: Vec<&str> = v
-            .get("deb.depends")
+            .get("deb.dependencies")
             .and_then(|x| x.as_array())
             .unwrap()
             .iter()
@@ -397,7 +390,7 @@ Description: A demo package\n\
             (Stage::TarParse, crate::ErrorKind::Malformed)
         );
         assert!(e.as_slice()[0].message.starts_with("control.tar.gz:"));
-        assert!(v.get("deb.package").is_none());
+        assert!(v.get("deb.name").is_none());
         assert!(v.get("deb.limits").is_none());
     }
 
@@ -478,7 +471,7 @@ Description: A demo package\n\
             (Stage::FormatExtract, crate::ErrorKind::Malformed)
         );
         assert!(e.as_slice()[0].message.contains("past the end of the file"));
-        assert!(v.get("deb.package").is_none());
+        assert!(v.get("deb.name").is_none());
     }
 
     #[test]
@@ -489,6 +482,6 @@ Description: A demo package\n\
         let (v, _, e) = run(&deb_with_control_member("control.tar", &tar));
         assert!(e.is_empty(), "{e:?}");
         assert!(v.get("deb.limits").is_none());
-        assert!(v.get("deb.package").is_none());
+        assert!(v.get("deb.name").is_none());
     }
 }

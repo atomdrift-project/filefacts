@@ -6,16 +6,72 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const STEP_LIMIT: usize = 100_000;
 
+/// What a [`FlowValue`] is. Serialized as the lowercase name (`"call"`).
+///
+/// Only [`Alternative`](Self::Alternative) denotes whole values chosen by
+/// control flow; [`Merge`](Self::Merge) may combine arbitrary dependencies.
+/// [`Object`](Self::Object) and [`Keyword`](Self::Keyword) carry their
+/// entries in [`FlowValue::fields`]. New kinds may be added in a minor
+/// release, so a `match` outside this crate needs a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FlowKind {
+    /// A constant; its value is in [`FlowValue::literal`].
+    Literal,
+    /// A local helper's parameter, listed in [`FlowFunction::parameters`].
+    Parameter,
+    /// A call: [`FlowValue::target`] when static, arguments in
+    /// [`FlowValue::inputs`], receiver in [`FlowValue::receiver`].
+    Call,
+    /// A member read; [`FlowValue::target`] is its canonical path.
+    Member,
+    /// Any combination of its inputs, such as an assignment that may keep
+    /// the previous value or a binary operation.
+    Merge,
+    /// String concatenation or interpolation of its inputs, in order.
+    Concat,
+    /// Exactly one of its inputs, chosen by control flow.
+    Alternative,
+    /// An object or map literal; entries in [`FlowValue::fields`].
+    Object,
+    /// Named arguments: a keyword argument, or a CFML tag's attributes.
+    /// Entries in [`FlowValue::fields`], reached only by name.
+    Keyword,
+    /// A value the producer could not model.
+    Unknown,
+}
+
+impl FlowKind {
+    /// The serialized name, such as `"call"`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Literal => "literal",
+            Self::Parameter => "parameter",
+            Self::Call => "call",
+            Self::Member => "member",
+            Self::Merge => "merge",
+            Self::Concat => "concat",
+            Self::Alternative => "alternative",
+            Self::Object => "object",
+            Self::Keyword => "keyword",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for FlowKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One value in a file-local graph. IDs are indexes, local to this graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowValue {
-    /// `literal`, `parameter`, `call`, `member`, `merge`, `concat`,
-    /// `alternative`, `object`, `keyword`, or `unknown`. Only `alternative`
-    /// denotes whole values chosen by control flow; `merge` may combine
-    /// arbitrary dependencies. `object` (an object or map literal) and
-    /// `keyword` (named arguments: a keyword argument, or a CFML tag's
-    /// attributes) carry their entries in `fields`.
-    pub kind: String,
+    /// What this value is; see [`FlowKind`].
+    pub kind: FlowKind,
     /// File byte offset, never a trait ID or virtual address.
     pub offset: usize,
     /// Original argument shape/value, using the existing symbol vocabulary.
@@ -125,14 +181,14 @@ impl Flow {
                     value: id,
                     bindings: BTreeMap::new(),
                 });
-            } else if value.kind == "alternative" {
+            } else if value.kind == FlowKind::Alternative {
                 if value.inputs.len().saturating_add(pending.len()) > left {
                     out.incomplete = true;
                     break;
                 }
                 pending.extend(value.inputs.iter().map(|id| (*id, field, depth + 1)));
             } else if let Some(field) = field {
-                if matches!(value.kind.as_str(), "object" | "keyword") {
+                if matches!(value.kind, FlowKind::Object | FlowKind::Keyword) {
                     if let Some(id) = value.fields.get(field) {
                         pending.push((*id, None, depth + 1));
                     }
@@ -216,13 +272,13 @@ impl Flow {
                 continue;
             };
             if let Some(field) = field {
-                if matches!(value.kind.as_str(), "object" | "keyword") {
+                if matches!(value.kind, FlowKind::Object | FlowKind::Keyword) {
                     if let Some(id) = value.fields.get(field) {
                         pending.push((*id, bindings, depth + 1, None));
                     }
                     continue;
                 }
-                if value.kind == "literal" {
+                if value.kind == FlowKind::Literal {
                     continue;
                 }
             } else {
@@ -232,13 +288,15 @@ impl Flow {
                 });
             }
             let mut next = Vec::new();
-            match value.kind.as_str() {
-                "object" => next.extend(value.fields.values().copied()),
+            match value.kind {
+                FlowKind::Object => next.extend(value.fields.values().copied()),
                 // Keyword arguments require explicit projection by name. They
                 // are not positional object payloads (headers != data/json).
-                "keyword" => {}
-                "merge" | "concat" | "alternative" => next.extend(value.inputs.iter().copied()),
-                "parameter" => {
+                FlowKind::Keyword => {}
+                FlowKind::Merge | FlowKind::Concat | FlowKind::Alternative => {
+                    next.extend(value.inputs.iter().copied());
+                }
+                FlowKind::Parameter => {
                     if let Some(actual) = bindings.get(&id) {
                         next.push(*actual);
                     } else {
@@ -260,7 +318,9 @@ impl Flow {
                                         return out;
                                     }
                                     left -= 1;
-                                    if call.kind == "call" && call.target.as_deref() == Some(name) {
+                                    if call.kind == FlowKind::Call
+                                        && call.target.as_deref() == Some(name)
+                                    {
                                         if let Some(actual) = call.inputs.get(position) {
                                             next.push(*actual);
                                         }
@@ -270,7 +330,7 @@ impl Flow {
                         }
                     }
                 }
-                "call" => {
+                FlowKind::Call => {
                     if let Some(function) =
                         value.target.as_ref().and_then(|t| self.functions.get(t))
                     {
@@ -316,8 +376,8 @@ impl Flow {
                         }
                     }
                 }
-                "unknown" => out.incomplete = true,
-                _ => {}
+                FlowKind::Unknown => out.incomplete = true,
+                FlowKind::Literal | FlowKind::Member => {}
             }
             pending.extend(
                 next.into_iter()
@@ -325,5 +385,101 @@ impl Flow {
             );
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every kind with the JSON string it has always serialized as.
+    const KINDS: [(FlowKind, &str); 10] = [
+        (FlowKind::Literal, "literal"),
+        (FlowKind::Parameter, "parameter"),
+        (FlowKind::Call, "call"),
+        (FlowKind::Member, "member"),
+        (FlowKind::Merge, "merge"),
+        (FlowKind::Concat, "concat"),
+        (FlowKind::Alternative, "alternative"),
+        (FlowKind::Object, "object"),
+        (FlowKind::Keyword, "keyword"),
+        (FlowKind::Unknown, "unknown"),
+    ];
+
+    #[test]
+    fn kind_serializes_as_its_former_string() {
+        for (kind, name) in KINDS {
+            assert_eq!(serde_json::to_value(kind).unwrap(), name);
+            assert_eq!(kind.as_str(), name);
+            assert_eq!(kind.to_string(), name);
+            let back: FlowKind = serde_json::from_value(serde_json::json!(name)).unwrap();
+            assert_eq!(back, kind);
+        }
+        assert!(serde_json::from_str::<FlowKind>("\"Call\"").is_err());
+    }
+
+    #[test]
+    fn value_json_is_unchanged() {
+        let value = FlowValue {
+            kind: FlowKind::Call,
+            offset: 7,
+            literal: None,
+            target: Some("fetch".into()),
+            inputs: vec![1, 2],
+            receiver: None,
+            fields: BTreeMap::new(),
+        };
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"{"kind":"call","offset":7,"target":"fetch","inputs":[1,2]}"#
+        );
+        let back: FlowValue =
+            serde_json::from_str(&serde_json::to_string(&value).unwrap()).unwrap();
+        assert_eq!(back.kind, FlowKind::Call);
+    }
+
+    /// Keyword entries are reached only by name, object entries also
+    /// positionally; alternatives are complete values, merges are not.
+    #[test]
+    fn traversal_reads_kinds() {
+        let literal = |offset| FlowValue {
+            kind: FlowKind::Literal,
+            offset,
+            literal: Some(Arg::String {
+                value: offset.to_string(),
+            }),
+            target: None,
+            inputs: Vec::new(),
+            receiver: None,
+            fields: BTreeMap::new(),
+        };
+        let node = |kind, inputs: Vec<usize>, fields: &[(&str, usize)]| FlowValue {
+            kind,
+            offset: 0,
+            literal: None,
+            target: None,
+            inputs,
+            receiver: None,
+            fields: fields.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+        };
+        let flow = Flow {
+            values: vec![
+                literal(0),
+                literal(1),
+                node(FlowKind::Alternative, vec![0, 1], &[]),
+                node(FlowKind::Merge, vec![0, 1], &[]),
+                node(FlowKind::Keyword, Vec::new(), &[("a", 0)]),
+                node(FlowKind::Object, Vec::new(), &[("a", 1)]),
+            ],
+            ..Flow::default()
+        };
+        let complete = flow.complete_values(2, None, 100);
+        assert_eq!(complete.values.len(), 2);
+        assert!(!complete.incomplete);
+        assert!(flow.complete_values(3, None, 100).incomplete);
+        let ids = |o: FlowOrigins| o.values.into_iter().map(|v| v.value).collect::<Vec<_>>();
+        assert_eq!(ids(flow.complete_values(4, Some("a"), 100)), [0]);
+        assert_eq!(ids(flow.origins(4, &[], 100)), [4]);
+        assert_eq!(ids(flow.origins(5, &[], 100)), [1, 5]);
     }
 }

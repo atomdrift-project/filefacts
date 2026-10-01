@@ -29,6 +29,7 @@
 //!   the raw count).
 
 use crate::metric;
+use crate::value_key;
 use serde_json::{Value as JsonValue, json};
 
 use crate::bytes::{self, Reader};
@@ -71,7 +72,7 @@ pub(super) fn extract(
     itsf.insert("version".into(), json!(version));
     itsf.insert("timestamp_counter".into(), json!(timestamp_counter));
     itsf.insert("lcid".into(), json!(lcid));
-    values.insert("chm.itsf", JsonValue::Object(itsf));
+    values.insert_key(value_key!("chm.itsf"), JsonValue::Object(itsf));
     // The LCID is reachable via `chm.itsf.lcid` (nested value).
     // Don't dual-emit as a flat `chm.itsf_lcid` metric.
 
@@ -175,8 +176,8 @@ pub(super) fn extract(
         push_unique(&mut features, "html");
     }
     if !features.is_empty() {
-        values.insert(
-            "chm.features",
+        values.insert_key(
+            value_key!("chm.features"),
             JsonValue::Array(
                 features
                     .into_iter()
@@ -186,8 +187,8 @@ pub(super) fn extract(
         );
     }
     if !user_entries.is_empty() {
-        values.insert(
-            "chm.entries",
+        values.insert_key(
+            value_key!("chm.entries"),
             JsonValue::Array(user_entries.into_iter().map(JsonValue::String).collect()),
         );
     }
@@ -214,8 +215,8 @@ pub(super) fn extract(
         if let Some(body) = read_uncompressed(bytes, data_offset, name_list_entry) {
             let sections = parse_namelist(body);
             if !sections.is_empty() {
-                values.insert(
-                    "chm.content_sections",
+                values.insert_key(
+                    value_key!("chm.content_sections"),
                     JsonValue::Array(sections.into_iter().map(JsonValue::String).collect()),
                 );
             }
@@ -322,7 +323,7 @@ fn emit_lzx_framing(
     lzx.insert("block_len".into(), json!(rt.block_len));
     lzx.insert("uncompressed_size".into(), json!(rt.uncompressed_size));
     lzx.insert("compressed_size".into(), json!(content.length));
-    values.insert("chm.lzx", JsonValue::Object(lzx));
+    values.insert_key(value_key!("chm.lzx"), JsonValue::Object(lzx));
 
     metrics.insert(metric!("chm.lzx_reset_count"), rt.reset_count as f64);
     // Compression ratio is a classic forensic signal — values
@@ -574,7 +575,7 @@ fn emit_system(data: &[u8], values: &mut Values) -> SystemSummary {
         }
     }
     if !sys.is_empty() {
-        values.insert("chm.system", JsonValue::Object(sys));
+        values.insert_key(value_key!("chm.system"), JsonValue::Object(sys));
     }
     summary
 }

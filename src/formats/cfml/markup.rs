@@ -432,7 +432,7 @@ pub(super) fn decode_references(text: &str) -> Result<Option<String>, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Arg, Symbol};
+    use crate::{Arg, FlowKind, Symbol};
     use std::collections::BTreeSet;
 
     fn controls(source: &[u8]) -> BTreeSet<(String, String)> {
@@ -441,7 +441,7 @@ mod tests {
             .values
             .iter()
             .filter(|v| {
-                v.kind == "call"
+                v.kind == FlowKind::Call
                     && v.target.as_deref().is_some_and(|t| {
                         t.starts_with("html:") || matches!(t, "cfinput" | "cftextarea" | "cfselect")
                     })
@@ -578,7 +578,7 @@ mod tests {
             .flow
             .values
             .iter()
-            .filter(|v| v.kind == "concat")
+            .filter(|v| v.kind == FlowKind::Concat)
             .filter_map(|v| match &v.literal {
                 Some(Arg::String { value }) => Some(value.len()),
                 _ => None,

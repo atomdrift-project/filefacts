@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 use serde_json::Value as JsonValue;
 
 use crate::output::{Symbol, SymbolKind, Symbols, Values};
+use crate::value_key;
 
 pub(super) fn emit(symbols: &Symbols, values: &mut Values) {
     sanitizers(symbols, values);
@@ -66,8 +67,8 @@ fn sanitizers(symbols: &Symbols, values: &mut Values) {
     if out.is_empty() {
         return;
     }
-    values.insert(
-        "binary.sanitizers",
+    values.insert_key(
+        value_key!("binary.sanitizers"),
         JsonValue::Array(
             out.into_iter()
                 .map(|s| JsonValue::String(s.into()))
@@ -92,8 +93,8 @@ fn fortify(symbols: &Symbols, values: &mut Values) {
     if out.is_empty() {
         return;
     }
-    values.insert(
-        "binary.fortify",
+    values.insert_key(
+        value_key!("binary.fortify"),
         JsonValue::Array(out.into_iter().map(JsonValue::String).collect()),
     );
 }

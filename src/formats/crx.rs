@@ -74,8 +74,8 @@ fn read_manifest<R: Read + std::io::Seek>(
         return None;
     }
     if buf.len() as u64 > MAX {
-        values.insert(
-            "crx.limits",
+        values.insert_key(
+            value_key!("crx.limits"),
             serde_json::json!([{
                 "stage": "manifest",
                 "reason": format!("{NAME} over the {MAX}-byte cap; not parsed"),
@@ -140,7 +140,7 @@ pub(super) fn browser_manifest_json(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     std::borrow::Cow::Owned(out)
 }
 
-/// Emit `crx.author` / `crx.author_email` / `crx.homepage_url` /
+/// Emit `crx.author` / `crx.author_email` / `crx.homepage` /
 /// `crx.description` from a parsed Chrome `manifest.json`. `author` may be a
 /// bare string or an `{ "email": … }` object (MV3).
 fn emit_manifest_identity(manifest: &JsonValue, values: &mut Values) {
@@ -160,7 +160,7 @@ fn emit_manifest_identity(manifest: &JsonValue, values: &mut Values) {
     }
     if let Some(url) = manifest.get("homepage_url").and_then(JsonValue::as_str) {
         values.insert_key(
-            value_key!("crx.homepage_url"),
+            value_key!("crx.homepage"),
             JsonValue::String(url.to_string()),
         );
     }
@@ -184,7 +184,7 @@ fn header(bytes: &[u8], values: &mut Values) {
     let Some(version) = u32_le(bytes, 4) else {
         return;
     };
-    values.insert("crx.version", JsonValue::from(version));
+    values.insert_key(value_key!("crx.version"), JsonValue::from(version));
 
     match version {
         2 => {

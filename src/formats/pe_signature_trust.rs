@@ -102,8 +102,8 @@ pub(super) fn derive(values: &mut Values, metrics: &mut Metrics, now: i64) {
         value_key!("pe.signatures"),
         JsonValue::Array(annotated.clone()),
     );
-    values.insert(
-        "pe.signature_integrity",
+    values.insert_key(
+        value_key!("pe.signature_integrity"),
         JsonValue::String(worst.to_string()),
     );
     if let Some(days) = expired_days(&annotated, now) {

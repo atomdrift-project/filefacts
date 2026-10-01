@@ -274,9 +274,9 @@ mod tests {
     #[test]
     fn go_vendor_truncation_is_explicit() {
         let text = "# example.test/lib v1.0.0\n".repeat(20_001);
-        let parsed =
-            crate::open_with_path(std::path::Path::new("vendor/modules.txt"), text.as_bytes())
-                .unwrap();
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new("vendor/modules.txt"))
+            .open(text.as_bytes());
         assert!(
             parsed
                 .references()

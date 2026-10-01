@@ -19,6 +19,7 @@ use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_valu
 use crate::error::Error;
 use crate::fileid::FileType;
 use crate::output::{ArchiveMember, ArchiveOffsets, ArchiveOwnership, Metrics, Values};
+use crate::value_key;
 
 /// The shared aggregates a tar reports. Only regular entries are files, and
 /// only their sizes are summed. Tar has no per-entry compression, encryption
@@ -58,8 +59,8 @@ pub(super) fn extract(
     metrics: &mut Metrics,
     archive_members: &mut Vec<ArchiveMember>,
 ) -> Result<(), Error> {
-    values.insert(
-        "archive.format.kind",
+    values.insert_key(
+        value_key!("archive.format.kind"),
         JsonValue::String(format_label(file_type).into()),
     );
 
@@ -78,9 +79,9 @@ pub(super) fn extract(
 
     for entry in archive
         .entries()
-        .map_err(|e| Error::malformed("tar", e.to_string()))?
+        .map_err(|e| Error::malformed_with_source("tar", e.to_string(), e))?
     {
-        let entry = entry.map_err(|e| Error::malformed("tar", e.to_string()))?;
+        let entry = entry.map_err(|e| Error::malformed_with_source("tar", e.to_string(), e))?;
         let header = entry.header();
         let kind = header.entry_type();
 
@@ -150,7 +151,7 @@ pub(super) fn extract(
         archive_members.push(member);
     }
 
-    values.insert("archive.members", JsonValue::Array(members));
+    values.insert_key(value_key!("archive.members"), JsonValue::Array(members));
     stats.emit(values, metrics);
     Ok(())
 }
@@ -403,7 +404,9 @@ mod tests {
         gz.write_all(&tar).unwrap();
         let bytes = gz.finish().unwrap();
 
-        let parsed = crate::open_with_path(std::path::Path::new("pkg.tar.gz"), &bytes).unwrap();
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new("pkg.tar.gz"))
+            .open(&bytes);
         assert_eq!(parsed.fileid().file_type(), FileType::TarGz);
         assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
         assert_eq!(

@@ -25,6 +25,7 @@
 use crate::error::Error;
 use crate::metric;
 use crate::output::{ErrorKind, Errors, Metrics, Section, Stage, Strings, Symbols, Values};
+use crate::value_key;
 use serde_json::Value as JsonValue;
 
 /// Defensive caps so a malformed module with inflated section/vector counts
@@ -215,11 +216,11 @@ fn extract_memory(body: &[u8], values: &mut Values) {
     }
     let Some(flags) = r.byte() else { return };
     let Some(min) = r.uleb() else { return };
-    values.insert("wasm.memory.initial", JsonValue::from(min));
+    values.insert_key(value_key!("wasm.memory.initial"), JsonValue::from(min));
     if flags & 0x01 != 0
         && let Some(max) = r.uleb()
     {
-        values.insert("wasm.memory.max", JsonValue::from(max));
+        values.insert_key(value_key!("wasm.memory.max"), JsonValue::from(max));
     }
 }
 
@@ -245,8 +246,11 @@ fn extract_producers(r: &mut Reader<'_>, values: &mut Values) {
             }
         }
         if let Some(v) = first {
-            let key = format!("wasm.producers.{}", field.replace('-', "_"));
-            values.insert(&key, JsonValue::String(v));
+            values.insert_key_at(
+                value_key!("wasm.producers"),
+                &field.replace('-', "_"),
+                JsonValue::String(v),
+            );
         }
     }
 }
@@ -336,17 +340,23 @@ pub(super) fn extract(
         r.pos = end;
     }
 
-    values.insert("wasm.has_start", JsonValue::Bool(has_start));
+    values.insert_key(value_key!("wasm.has_start"), JsonValue::Bool(has_start));
     if !modules.is_empty() {
-        values.insert("wasm.import_modules", JsonValue::from(modules));
+        values.insert_key(value_key!("wasm.import_modules"), JsonValue::from(modules));
     }
     if !import_names.is_empty() {
         import_names.truncate(MAX_ENTRIES);
-        values.insert("wasm.imports", JsonValue::from(import_names.clone()));
+        values.insert_key(
+            value_key!("wasm.imports"),
+            JsonValue::from(import_names.clone()),
+        );
     }
     if !export_names.is_empty() {
         export_names.truncate(MAX_ENTRIES);
-        values.insert("wasm.exports", JsonValue::from(export_names.clone()));
+        values.insert_key(
+            value_key!("wasm.exports"),
+            JsonValue::from(export_names.clone()),
+        );
     }
 
     metrics.insert(metric!("wasm.import_count"), import_names.len() as f64);

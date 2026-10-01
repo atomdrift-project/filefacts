@@ -105,7 +105,7 @@ pub(super) fn walk(
     metrics.insert(metric!("ast.call_count"), call_count as f64);
     if state.max_member_chain_depth > 0 {
         metrics.insert(
-            metric!("ast.member_depth_max"),
+            metric!("ast.max_member_depth"),
             f64::from(state.max_member_chain_depth),
         );
     }
@@ -117,7 +117,7 @@ pub(super) fn walk(
     }
     if state.max_array_literal_length > 0 {
         metrics.insert(
-            metric!("ast.max_array_len"),
+            metric!("ast.max_array_length"),
             f64::from(state.max_array_literal_length),
         );
     }
@@ -188,7 +188,7 @@ pub(super) fn walk(
     }
     if state.max_numeric_sequence_length > 0 {
         metrics.insert(
-            metric!("ast.max_numeric_seq"),
+            metric!("ast.max_numeric_sequence"),
             f64::from(state.max_numeric_sequence_length),
         );
     }
@@ -562,7 +562,7 @@ struct State {
     xor_mod_loop_count: u32,
     /// Max count of numeric literals in a comma `sequence_expression`
     /// (`(1, 2, 3)`) — comma-constant obfuscation
-    /// (`ast.max_numeric_seq`).
+    /// (`ast.max_numeric_sequence`).
     max_numeric_sequence_length: u32,
     /// Count of parameterless functions whose body is a single
     /// `return <literal>` — dead-code / opaque padding helpers
@@ -1348,7 +1348,9 @@ mod tests {
     use super::*;
 
     fn walk_state(path: &str, src: &str) -> State {
-        let parsed = crate::open_with_path(std::path::Path::new(path), src.as_bytes()).unwrap();
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new(path))
+            .open(src.as_bytes());
         let ast = parsed.source_ast().expect("parsed source");
         let config = super::super::langs::config_for(ast.file_type).expect("language config");
         let mut state = State::default();

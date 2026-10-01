@@ -39,7 +39,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     metrics: &mut Metrics,
     errors: &mut Errors,
 ) -> Result<(), Error> {
-    // Parse the outer wheel filename (set by lib.rs from open_with_path)
+    // Parse the outer wheel filename (set by lib.rs from `OpenOptions::path`)
     // for PEP 427 components. The name_prefix here is the *outer*
     // claim of identity, distinct from `whl.distribution` parsed from
     // the dist-info directory inside the archive. When they disagree,
@@ -123,7 +123,10 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     let Some(ref dist_info) = dist_info_dir else {
         return Ok(());
     };
-    values.insert("whl.dist_info_dir", JsonValue::String(dist_info.clone()));
+    values.insert_key(
+        value_key!("whl.dist_info_dir"),
+        JsonValue::String(dist_info.clone()),
+    );
 
     // Parse `{distribution}-{version}.dist-info/` → (distribution, version).
     // Wheel spec: the distribution name is a PEP 503-normalized identifier;
@@ -144,7 +147,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     }
 
     if has_metadata {
-        values.insert("whl.has_metadata", JsonValue::Bool(true));
+        values.insert_key(value_key!("whl.has_metadata"), JsonValue::Bool(true));
         // The dist-info `METADATA` is an RFC 822 header block (PEP 566).
         // Pull the authorship fields — the publisher identity a wheel
         // carries that the filename and dir name don't.
@@ -158,20 +161,26 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         }
     }
     if has_wheel {
-        values.insert("whl.has_wheel", JsonValue::Bool(true));
+        values.insert_key(value_key!("whl.has_wheel"), JsonValue::Bool(true));
     }
     if has_record {
-        values.insert("whl.has_record", JsonValue::Bool(true));
+        values.insert_key(value_key!("whl.has_record"), JsonValue::Bool(true));
     }
     if has_record_jws {
-        values.insert("whl.signing.has_record_jws", JsonValue::Bool(true));
+        values.insert_key(
+            value_key!("whl.signing.has_record_jws"),
+            JsonValue::Bool(true),
+        );
     }
     if has_record_p7s {
-        values.insert("whl.signing.has_record_p7s", JsonValue::Bool(true));
+        values.insert_key(
+            value_key!("whl.signing.has_record_p7s"),
+            JsonValue::Bool(true),
+        );
     }
     if let Some(d) = data_dir {
-        values.insert("whl.has_data_dir", JsonValue::Bool(true));
-        values.insert("whl.data_dir", JsonValue::String(d));
+        values.insert_key(value_key!("whl.has_data_dir"), JsonValue::Bool(true));
+        values.insert_key(value_key!("whl.data_dir"), JsonValue::String(d));
     }
 
     metrics.insert(
@@ -179,12 +188,15 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         native_extension_count as f64,
     );
     if native_extension_count == 0 {
-        values.insert("whl.purelib_shape", JsonValue::Bool(true));
+        values.insert_key(value_key!("whl.purelib_shape"), JsonValue::Bool(true));
     }
 
     if !top_level.is_empty() {
         let packages: Vec<JsonValue> = top_level.into_iter().map(JsonValue::String).collect();
-        values.insert("whl.top_level_packages", JsonValue::Array(packages));
+        values.insert_key(
+            value_key!("whl.top_level_packages"),
+            JsonValue::Array(packages),
+        );
     }
 
     Ok(())
@@ -220,24 +232,30 @@ fn parse_wheel_filename(basename: &str, values: &mut Values) {
     if name.is_empty() || version.is_empty() {
         return;
     }
-    values.insert(
-        "whl.filename.name_prefix",
+    values.insert_key(
+        value_key!("whl.filename.name_prefix"),
         JsonValue::String(name.to_string()),
     );
-    values.insert(
-        "whl.filename.version",
+    values.insert_key(
+        value_key!("whl.filename.version"),
         JsonValue::String(version.to_string()),
     );
     if let Some(b) = build {
-        values.insert("whl.filename.build", JsonValue::String(b.to_string()));
+        values.insert_key(
+            value_key!("whl.filename.build"),
+            JsonValue::String(b.to_string()),
+        );
     }
-    values.insert(
-        "whl.filename.python_tag",
+    values.insert_key(
+        value_key!("whl.filename.python_tag"),
         JsonValue::String(python.to_string()),
     );
-    values.insert("whl.filename.abi_tag", JsonValue::String(abi.to_string()));
-    values.insert(
-        "whl.filename.platform_tag",
+    values.insert_key(
+        value_key!("whl.filename.abi_tag"),
+        JsonValue::String(abi.to_string()),
+    );
+    values.insert_key(
+        value_key!("whl.filename.platform_tag"),
         JsonValue::String(platform.to_string()),
     );
 }
@@ -294,7 +312,7 @@ fn read_text_member<R: Read + Seek>(
     }
 }
 
-/// Emit `whl.author` / `whl.maintainer` (+ `_email`), `whl.home_page` and
+/// Emit `whl.author` / `whl.maintainer` (+ `_email`), `whl.homepage` and
 /// the one-line `whl.summary` from an RFC 822 `METADATA` header block. Headers end at the first
 /// blank line (the long `Description` body follows); only the first
 /// occurrence of each field is taken, and `UNKNOWN` placeholders skipped.
@@ -317,7 +335,7 @@ fn emit_metadata_identity(meta: &str, values: &mut Values) {
             "author-email" => put_first(values, value_key!("whl.author_email"), value),
             "maintainer" => put_first(values, value_key!("whl.maintainer"), value),
             "maintainer-email" => put_first(values, value_key!("whl.maintainer_email"), value),
-            "home-page" => put_first(values, value_key!("whl.home_page"), value),
+            "home-page" => put_first(values, value_key!("whl.homepage"), value),
             "summary" => put_first(values, value_key!("whl.summary"), value),
             _ => {}
         }
@@ -444,7 +462,7 @@ mod tests {
             Some("<mail@mail.com>")
         );
         assert_eq!(
-            v.get("whl.home_page").and_then(|x| x.as_str()),
+            v.get("whl.homepage").and_then(|x| x.as_str()),
             Some("https://example.test")
         );
         assert_eq!(
@@ -728,11 +746,11 @@ mod tests {
             ("realpkg-1.0.0.dist-info/RECORD", b""),
         ]);
         // Pretend an attacker renamed the wheel to claim a different identity.
-        let parsed = crate::open_with_path(
-            std::path::Path::new("/tmp/fake_name-1.0.0-py3-none-any.whl"),
-            &whl,
-        )
-        .unwrap();
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new(
+                "/tmp/fake_name-1.0.0-py3-none-any.whl",
+            ))
+            .open(&whl);
         let v = parsed.values();
         assert_eq!(
             v.get("whl.filename.name_prefix").and_then(|x| x.as_str()),

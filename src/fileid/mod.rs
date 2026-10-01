@@ -485,6 +485,11 @@ file_types! {
         /// provider's account of a release (publish date, author, downloads,
         /// rating, deprecation), the serialized form of [`crate::Registry`].
         Registry => "registry", Config, STRUCTURED_DATA;
+        /// Windows registry export (`.reg`), the script `regedit` imports and
+        /// exports. Its first line names the format: `REGEDIT4`, or `Windows
+        /// Registry Editor Version 5.00` in UTF-8 or (as `regedit` writes it)
+        /// UTF-16LE behind a byte-order mark. Unrelated to [`Self::Registry`].
+        Reg => "reg", Config;
         /// Go module manifest (go.mod) — `require` directives are declared dependencies.
         GoMod => "go.mod", Config;
         /// Go module checksum database (go.sum) — pins every module to an `h1:` hash.
@@ -844,7 +849,7 @@ pub enum DetectionSource {
     /// `extension_type()` returns the type the shebang claimed.
     ExtensionOverridesShebang,
     /// Type asserted by the caller via [`FileId::forced`] /
-    /// [`crate::open_as`], bypassing detection. Used when the language is
+    /// [`crate::OpenOptions::file_type`], bypassing detection. Used when the language is
     /// already known from context the bytes alone don't carry — e.g. the
     /// inner source of a `python3 -c "<code>"` payload, whose extracted
     /// body has no shebang, extension, or magic to detect.
@@ -1689,7 +1694,9 @@ fn claims_source(ft: FileType) -> bool {
 fn is_magic_defined(ft: FileType) -> bool {
     matches!(
         ft,
-        FileType::StaticLib
+        // A registry export always opens with its header line.
+        FileType::Reg
+            | FileType::StaticLib
             | FileType::Elf
             | FileType::Pe
             | FileType::MachO

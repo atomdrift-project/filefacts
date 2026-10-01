@@ -235,7 +235,7 @@ pub(super) fn extract(
     }
 
     if !dim_obj.is_empty() {
-        values.insert("png.dimensions", JsonValue::Object(dim_obj));
+        values.insert_key(value_key!("png.dimensions"), JsonValue::Object(dim_obj));
     }
     if !text_kv.is_empty() {
         values.insert_key(value_key!("png.text"), JsonValue::Object(text_kv));
@@ -244,23 +244,23 @@ pub(super) fn extract(
         // tIME chunk per PNG spec is the "last image modification time"
         // — match the archive/LNK `*_modified` / `mtime_*` convention
         // instead of a vague "time".
-        values.insert("png.last_modified", JsonValue::String(t));
+        values.insert_key(value_key!("png.last_modified"), JsonValue::String(t));
     }
     if let Some(n) = icc_name {
-        values.insert("png.icc_profile_name", JsonValue::String(n));
+        values.insert_key(value_key!("png.icc_profile_name"), JsonValue::String(n));
     }
     if !chunks.is_empty() {
-        values.insert("png.chunks", JsonValue::Array(chunks));
+        values.insert_key(value_key!("png.chunks"), JsonValue::Array(chunks));
     }
     if !unknown_chunks.is_empty() {
-        values.insert(
-            "png.unknown_chunks",
+        values.insert_key(
+            value_key!("png.unknown_chunks"),
             JsonValue::Array(unknown_chunks.into_iter().map(JsonValue::String).collect()),
         );
     }
     if !features.is_empty() {
-        values.insert(
-            "png.features",
+        values.insert_key(
+            value_key!("png.features"),
             JsonValue::Array(
                 features
                     .into_iter()
@@ -272,7 +272,10 @@ pub(super) fn extract(
 
     metrics.insert(metric!("png.chunk_count"), chunks_total as f64);
     metrics.insert(metric!("png.idat_chunk_count"), chunks_idat as f64);
-    metrics.insert(metric!("png.chunks_after_iend"), chunks_after_iend as f64);
+    metrics.insert(
+        metric!("png.trailing_chunk_count"),
+        chunks_after_iend as f64,
+    );
     metrics.insert(metric!("png.trailing_bytes"), trailing_bytes as f64);
     metrics.insert(metric!("png.text_chunk_bytes"), text_chunk_bytes as f64);
     metrics.insert(metric!("png.unknown_chunk_count"), unknown_count as f64);
@@ -831,7 +834,7 @@ mod tests {
         let (_, m) = run(&png);
         assert_eq!(m.get("png.idat_chunk_count"), Some(3.0));
         assert_eq!(m.get("png.chunk_count"), Some(5.0));
-        assert_eq!(m.get("png.chunks_after_iend"), Some(0.0));
+        assert_eq!(m.get("png.trailing_chunk_count"), Some(0.0));
     }
 
     #[test]
@@ -873,7 +876,7 @@ mod tests {
             (b"tEXt", b"k\0v"),
         ]);
         let (_, m) = run(&png);
-        assert_eq!(m.get("png.chunks_after_iend"), Some(1.0));
+        assert_eq!(m.get("png.trailing_chunk_count"), Some(1.0));
     }
 
     #[test]
@@ -974,7 +977,9 @@ mod tests {
         assert!(m.get("file.entropy").is_none());
 
         for bytes in [broken, encode_rgb_png(16, 16, [128, 128, 128])] {
-            let parsed = crate::open_with_path(std::path::Path::new("x.png"), &bytes).unwrap();
+            let parsed = crate::OpenOptions::new()
+                .path(std::path::Path::new("x.png"))
+                .open(&bytes);
             assert_eq!(parsed.fileid().file_type(), crate::FileType::Png);
             let h = parsed.metrics().get("file.entropy").unwrap();
             assert!((h - entropy::shannon(&bytes)).abs() < 1e-9);

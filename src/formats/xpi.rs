@@ -68,25 +68,28 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         schemes.push(JsonValue::String("cose".into()));
     }
     if !schemes.is_empty() {
-        values.insert("xpi.signing.schemes", JsonValue::Array(schemes));
+        values.insert_key(value_key!("xpi.signing.schemes"), JsonValue::Array(schemes));
     }
 
     if has_manifest_json {
-        values.insert("xpi.has_web_extension_manifest", JsonValue::Bool(true));
+        values.insert_key(
+            value_key!("xpi.has_web_extension_manifest"),
+            JsonValue::Bool(true),
+        );
     }
     if has_install_rdf {
-        values.insert("xpi.has_install_rdf", JsonValue::Bool(true));
+        values.insert_key(value_key!("xpi.has_install_rdf"), JsonValue::Bool(true));
     }
     if has_chrome_manifest {
-        values.insert("xpi.has_chrome_manifest", JsonValue::Bool(true));
+        values.insert_key(value_key!("xpi.has_chrome_manifest"), JsonValue::Bool(true));
     }
     if has_install_rdf || has_chrome_manifest {
-        values.insert("xpi.legacy_xul_shape", JsonValue::Bool(true));
+        values.insert_key(value_key!("xpi.legacy_xul_shape"), JsonValue::Bool(true));
     }
     // Unsigned development/sideloaded XPI: a WebExtension manifest is
     // present but neither signing scheme is. AMO won't distribute these.
     if has_manifest_json && !pkcs7 && !cose {
-        values.insert("xpi.unsigned_shape", JsonValue::Bool(true));
+        values.insert_key(value_key!("xpi.unsigned_shape"), JsonValue::Bool(true));
     }
 
     // The WebExtension manifest declares the add-on's author and name —
@@ -120,8 +123,8 @@ fn read_manifest<R: Read + Seek>(
         return None;
     }
     if buf.len() as u64 > MAX {
-        values.insert(
-            "xpi.limits",
+        values.insert_key(
+            value_key!("xpi.limits"),
             serde_json::json!([{
                 "stage": "manifest",
                 "reason": format!("{NAME} over the {MAX}-byte cap; not parsed"),
@@ -134,7 +137,7 @@ fn read_manifest<R: Read + Seek>(
         .ok()
 }
 
-/// Emit `xpi.author` / `xpi.homepage_url` and a non-localized name and
+/// Emit `xpi.author` / `xpi.homepage` and a non-localized name and
 /// description from a parsed WebExtension `manifest.json`. `name` and
 /// `description` are skipped when they are `__MSG_*__` localization
 /// placeholders.
@@ -149,7 +152,7 @@ fn emit_manifest_identity(manifest: &JsonValue, values: &mut Values) {
     }
     if let Some(url) = manifest.get("homepage_url").and_then(JsonValue::as_str) {
         values.insert_key(
-            value_key!("xpi.homepage_url"),
+            value_key!("xpi.homepage"),
             JsonValue::String(url.to_string()),
         );
     }

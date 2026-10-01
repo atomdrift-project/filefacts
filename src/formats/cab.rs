@@ -227,23 +227,38 @@ pub(super) fn extract(
     let header = parse_header(bytes)?;
     let mut limits: Vec<JsonValue> = Vec::new();
 
-    values.insert("archive.format.kind", JsonValue::String("cab".into()));
-    values.insert(
-        "cab.version",
+    values.insert_key(
+        value_key!("archive.format.kind"),
+        JsonValue::String("cab".into()),
+    );
+    values.insert_key(
+        value_key!("cab.version"),
         JsonValue::String(format!("{}.{}", header.version_major, header.version_minor)),
     );
-    values.insert("cab.set_id", JsonValue::Number(header.set_id.into()));
-    values.insert("cab.set_index", JsonValue::Number(header.set_index.into()));
+    values.insert_key(
+        value_key!("cab.set_id"),
+        JsonValue::Number(header.set_id.into()),
+    );
+    values.insert_key(
+        value_key!("cab.set_index"),
+        JsonValue::Number(header.set_index.into()),
+    );
 
     // Spanning names are operator-chosen and travel with the campaign, so they
     // identify a set the way a PDB path identifies a build.
     if let Some((cabinet, disk)) = &header.prev_cabinet {
-        values.insert("cab.prev_cabinet", JsonValue::String(cabinet.clone()));
-        values.insert("cab.prev_disk", JsonValue::String(disk.clone()));
+        values.insert_key(
+            value_key!("cab.prev_cabinet"),
+            JsonValue::String(cabinet.clone()),
+        );
+        values.insert_key(value_key!("cab.prev_disk"), JsonValue::String(disk.clone()));
     }
     if let Some((cabinet, disk)) = &header.next_cabinet {
-        values.insert("cab.next_cabinet", JsonValue::String(cabinet.clone()));
-        values.insert("cab.next_disk", JsonValue::String(disk.clone()));
+        values.insert_key(
+            value_key!("cab.next_cabinet"),
+            JsonValue::String(cabinet.clone()),
+        );
+        values.insert_key(value_key!("cab.next_disk"), JsonValue::String(disk.clone()));
     }
     if !header.header_reserve.is_empty() {
         // abReserve is a spec-sanctioned opaque region every extractor skips,
@@ -253,8 +268,8 @@ pub(super) fn extract(
             .iter()
             .filter(|b| b.is_ascii_graphic() || **b == b' ')
             .count();
-        values.insert(
-            "cab.header_reserve",
+        values.insert_key(
+            value_key!("cab.header_reserve"),
             serde_json::json!({
                 "size": header.header_reserve.len(),
                 "all_zero": header.header_reserve.iter().all(|b| *b == 0),
@@ -420,9 +435,9 @@ pub(super) fn extract(
         }
     }
 
-    values.insert("archive.members", JsonValue::Array(members));
-    values.insert(
-        "cab.compression",
+    values.insert_key(value_key!("archive.members"), JsonValue::Array(members));
+    values.insert_key(
+        value_key!("cab.compression"),
         JsonValue::Array(
             compressions
                 .into_iter()
@@ -431,7 +446,7 @@ pub(super) fn extract(
         ),
     );
     if !limits.is_empty() {
-        values.insert("cab.limits", JsonValue::Array(limits));
+        values.insert_key(value_key!("cab.limits"), JsonValue::Array(limits));
     }
 
     stats.emit(values, metrics);

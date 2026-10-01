@@ -28,11 +28,9 @@ pub fn go_source_context(sources: &[(String, String)], incomplete: bool) -> Valu
             truncated = true;
             continue;
         }
-        let Ok(parsed) = crate::open_with_path(std::path::Path::new(path), source.as_bytes())
-        else {
-            truncated = true;
-            continue;
-        };
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new(path))
+            .open(source.as_bytes());
         // The package clause needs only the syntax tree, not the extraction
         // pipeline behind `values()`.
         let Some(package) = parsed

@@ -17,6 +17,7 @@
 mod lookalike;
 
 use crate::metric;
+use crate::value_key;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
@@ -200,29 +201,41 @@ impl Registry {
     /// (presence as `1.0`) cannot make that distinction; a `>= 1` threshold
     /// reads the same under both encodings.
     pub fn write_facts(&self, values: &mut Values, metrics: &mut Metrics) {
-        let mut put = |key: &str, v: Option<&str>| {
+        let mut put = |key: crate::ValueKey, v: Option<&str>| {
             if let Some(v) = v.filter(|s| !s.is_empty()) {
-                values.insert(key, JsonValue::String(v.to_string()));
+                values.insert_key(key, JsonValue::String(v.to_string()));
             }
         };
-        put("registry.ecosystem", Some(&self.ecosystem));
-        put("registry.name", Some(&self.name));
-        put("registry.version", Some(&self.version));
-        put("registry.latest_version", self.latest_version.as_deref());
-        put("registry.author", self.author.as_deref());
-        put("registry.title", self.title.as_deref());
-        put("registry.description", self.description.as_deref());
-        put("registry.homepage", self.homepage.as_deref());
-        put("registry.repository", self.repository.as_deref());
+        put(value_key!("registry.ecosystem"), Some(&self.ecosystem));
+        put(value_key!("registry.name"), Some(&self.name));
+        put(value_key!("registry.version"), Some(&self.version));
         put(
-            "registry.repository_commit",
+            value_key!("registry.latest_version"),
+            self.latest_version.as_deref(),
+        );
+        put(value_key!("registry.author"), self.author.as_deref());
+        put(value_key!("registry.title"), self.title.as_deref());
+        put(
+            value_key!("registry.description"),
+            self.description.as_deref(),
+        );
+        put(value_key!("registry.homepage"), self.homepage.as_deref());
+        put(
+            value_key!("registry.repository"),
+            self.repository.as_deref(),
+        );
+        put(
+            value_key!("registry.repository_commit"),
             self.repository_commit.as_deref(),
         );
-        put("registry.license", self.license.as_deref());
-        put("registry.deprecated", self.deprecated.as_deref());
-        put("registry.publisher", self.publisher.as_deref());
+        put(value_key!("registry.license"), self.license.as_deref());
         put(
-            "registry.publisher_email_domain",
+            value_key!("registry.deprecated"),
+            self.deprecated.as_deref(),
+        );
+        put(value_key!("registry.publisher"), self.publisher.as_deref());
+        put(
+            value_key!("registry.publisher_email_domain"),
             self.publisher_email_domain.as_deref(),
         );
 
@@ -232,7 +245,7 @@ impl Registry {
             }
         };
         num(
-            metric!("registry.published_at"),
+            metric!("registry.published_unix"),
             self.published_at.map(|v| v as f64),
         );
         num(
@@ -253,7 +266,7 @@ impl Registry {
             self.rating_count.map(|v| v as f64),
         );
         num(
-            metric!("registry.maintainers"),
+            metric!("registry.maintainer_count"),
             self.maintainers.map(f64::from),
         );
         // A boolean deprecation flag as a 0/1 metric, so a trait can gate on
@@ -267,11 +280,11 @@ impl Registry {
         // Release history — every count/measure is a metric so traits can
         // threshold it (e.g. `registry.releases_24h >= 3`, `package_age_days <= 7`).
         num(
-            metric!("registry.first_published_at"),
+            metric!("registry.first_published_unix"),
             self.first_published_at.map(|v| v as f64),
         );
         num(
-            metric!("registry.previous_published_at"),
+            metric!("registry.previous_published_unix"),
             self.previous_published_at.map(|v| v as f64),
         );
         num(

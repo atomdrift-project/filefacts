@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 use crate::Error;
 use crate::metric;
 use crate::output::{Arg, ExtractedString, Metrics, Strings, Symbol, Symbols, Values};
+use crate::value_key;
 use parser::Value;
 use serde_json::json;
 
@@ -85,8 +86,9 @@ pub(super) fn extract(
     if !body.starts_with(b"Fasd") {
         return Ok(());
     }
-    let parsed = parser::parse(bytes).map_err(|e| Error::malformed("scpt", e.to_string()))?;
-    values.insert("scpt.version", json!(parsed.version));
+    let parsed =
+        parser::parse(bytes).map_err(|e| Error::malformed_with_source("scpt", e.to_string(), e))?;
+    values.insert_key(value_key!("scpt.version"), json!(parsed.version));
     let mut seen_literals = BTreeSet::new();
     let mut text_reader = TextReader::new(MAX_LITERAL_BYTES);
     let mut imports = BTreeSet::new();
@@ -188,14 +190,14 @@ pub(super) fn extract(
     if limited {
         limitations.push(json!({"reason": "literal decode limit reached"}));
     }
-    values.insert("scpt.limits", json!(limitations));
-    metrics.insert(metric!("scpt.handlers"), handler_count as f64);
-    metrics.insert(metric!("scpt.calls"), call_count as f64);
-    metrics.insert(metric!("scpt.decoded"), decoded_count as f64);
+    values.insert_key(value_key!("scpt.limits"), json!(limitations));
+    metrics.insert(metric!("scpt.handler_count"), handler_count as f64);
+    metrics.insert(metric!("scpt.call_count"), call_count as f64);
+    metrics.insert(metric!("scpt.decoded_count"), decoded_count as f64);
     // Distinct Apple Events the script reaches for. The individual events are
     // already imports, but the count is what separates a one-shot dialog from
     // a script driving the shell, the loader and the delay timer at once.
-    metrics.insert(metric!("scpt.events"), imports.len() as f64);
+    metrics.insert(metric!("scpt.event_count"), imports.len() as f64);
     // The walk stopped at one of the parser's ceilings. Worth its own metric
     // rather than living only in `scpt.limits` prose: a compiled AppleScript
     // built deep enough to exhaust a static parser is itself the signal, and
@@ -215,7 +217,7 @@ mod tests {
     #[test]
     fn compiled_base64_exposes_decoded_text_without_changing_call_arguments() {
         let bytes = include_bytes!("../../../tests/fixtures/base64.scpt");
-        let parsed = crate::open(bytes).unwrap();
+        let parsed = crate::open(bytes);
         let literals = parsed.literals();
         let encoded = literals
             .iter()
@@ -243,7 +245,7 @@ mod tests {
     fn legacy_text_is_skipped_and_native_unicode_is_kept() {
         // FAS-12 stores single-byte text here; even byte length proves nothing.
         let bytes = b"FasdUAS 1.101.10\x0c\0\0\0\0\0\x04ABCD\0\0";
-        let parsed = crate::open(bytes).unwrap();
+        let parsed = crate::open(bytes);
         assert!(
             !parsed
                 .literals()
@@ -251,7 +253,7 @@ mod tests {
                 .any(|s| s.method.as_deref() == Some("scpt-literal"))
         );
         let bytes = parser::test_fixture();
-        let parsed = crate::open(&bytes).unwrap();
+        let parsed = crate::open(&bytes);
         assert!(parsed.literals().iter().any(|s| s.text == "Hello World"
             && s.method.as_deref() == Some("scpt-literal")
             && s.encoding.as_deref() == Some("utf16be")));
@@ -333,7 +335,7 @@ mod tests {
     fn shebang_prefixed_compiled_script_is_extracted() {
         let mut bytes = b"#!/usr/bin/osascript\n".to_vec();
         bytes.extend_from_slice(&parser::test_fixture());
-        let parsed = crate::open(&bytes).unwrap();
+        let parsed = crate::open(&bytes);
         assert_eq!(parsed.fileid().file_type(), crate::FileType::AppleScript);
         assert!(
             parsed
@@ -346,7 +348,7 @@ mod tests {
     #[test]
     fn shebang_prefixed_plaintext_is_not_parsed() {
         let bytes = b"#!/usr/bin/osascript\ndo shell script \"id\"\n";
-        let parsed = crate::open(bytes).unwrap();
+        let parsed = crate::open(bytes);
         assert_eq!(parsed.fileid().file_type(), crate::FileType::AppleScript);
         assert!(parsed.errors().is_empty());
     }
@@ -354,7 +356,7 @@ mod tests {
     #[test]
     fn compiler_fixture_exposes_literals_calls_and_no_variable_imports() {
         let bytes = parser::test_fixture();
-        let parsed = crate::open(&bytes).unwrap();
+        let parsed = crate::open(&bytes);
         assert!(parsed.literals().iter().any(|s| s.text == "Hello World"));
         assert!(parsed.symbols().iter().any(|s| matches!(s,
             Symbol::Call { target: Some(name), args, .. }
@@ -367,7 +369,7 @@ mod tests {
     #[test]
     fn obfuscated_stealer_exposes_commands_and_stored_targets() {
         let bytes = include_bytes!("../../../tests/fixtures/stage4.scpt");
-        let parsed = crate::open(bytes).unwrap();
+        let parsed = crate::open(bytes);
         let literals = parsed.literals();
         assert!(literals.iter().any(|s| s.text == "Cookies.binarycookies"));
         assert!(literals.iter().any(|s| s.text == "NoteStore.sqlite"));

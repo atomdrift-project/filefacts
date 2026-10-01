@@ -58,7 +58,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     };
 
     if let Some(kind) = detect_kind(&index) {
-        put_str(values, "office.kind", kind);
+        put_str(values, value_key!("office.kind"), kind);
     } else {
         return Ok(());
     }
@@ -187,7 +187,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
                     .is_some_and(|k| matches!(k, "pe" | "elf" | "macho"))
             })
             .count() as f64;
-        values.insert("office.embedded", JsonValue::Array(embedded));
+        values.insert_key(value_key!("office.embedded"), JsonValue::Array(embedded));
         metrics.insert(metric!("office.embedded_count"), count);
         if exec_count > 0.0 {
             metrics.insert(metric!("office.embedded_executable_count"), exec_count);
@@ -197,7 +197,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
 
     if !controls.is_empty() {
         let count = controls.len() as f64;
-        values.insert("office.controls", JsonValue::Array(controls));
+        values.insert_key(value_key!("office.controls"), JsonValue::Array(controls));
         metrics.insert(metric!("office.control_count"), count);
         push_feature(&mut features, "active_x");
     }
@@ -210,8 +210,8 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         .collect();
     if !external_relationships.is_empty() {
         let count = external_relationships.len() as f64;
-        values.insert(
-            "office.external_relationships",
+        values.insert_key(
+            value_key!("office.external_relationships"),
             JsonValue::Array(external_relationships),
         );
         metrics.insert(metric!("office.external_relationship_count"), count);
@@ -231,7 +231,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             .filter_map(|name| zip.by_name(name).ok().map(|e| e.size()))
             .sum();
         if vba_bytes > 0 {
-            metrics.insert(metric!("office.vba_project_size"), vba_bytes as f64);
+            metrics.insert(metric!("office.vba.project_size"), vba_bytes as f64);
         }
         values.insert_key(value_key!("office.macros"), JsonValue::Array(macros));
         metrics.insert(metric!("office.macro_count"), count);
@@ -277,14 +277,14 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     }
     if !dde_links.is_empty() {
         let count = dde_links.len() as f64;
-        values.insert("office.dde_links", JsonValue::Array(dde_links));
+        values.insert_key(value_key!("office.dde_links"), JsonValue::Array(dde_links));
         metrics.insert(metric!("office.dde_link_count"), count);
         push_feature(&mut features, "dde_links");
     }
     if !custom_ui_onload.is_empty() {
         let count = custom_ui_onload.len() as f64;
-        values.insert(
-            "office.custom_ui_onload",
+        values.insert_key(
+            value_key!("office.custom_ui_onload"),
             JsonValue::Array(custom_ui_onload),
         );
         metrics.insert(metric!("office.custom_ui_onload_count"), count);
@@ -292,8 +292,8 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     }
 
     if !features.is_empty() {
-        values.insert(
-            "office.features",
+        values.insert_key(
+            value_key!("office.features"),
             JsonValue::Array(
                 features
                     .into_iter()
@@ -1151,14 +1151,14 @@ mod tests {
         let (_, m) = run(&z);
         // The uncompressed size, not the stored size -- the whole point is
         // that it survives whatever the container did to it.
-        assert_eq!(m.get("office.vba_project_size"), Some(40_000.0));
+        assert_eq!(m.get("office.vba.project_size"), Some(40_000.0));
     }
 
     #[test]
     fn no_vba_project_size_without_macros() {
         let z = build_ooxml(&[("[Content_Types].xml", CONTENT_TYPES_DOCX.as_bytes())]);
         let (_, m) = run(&z);
-        assert_eq!(m.get("office.vba_project_size"), None);
+        assert_eq!(m.get("office.vba.project_size"), None);
     }
 
     #[test]

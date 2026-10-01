@@ -58,7 +58,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use filefacts::{Arg, ParsedFile, Symbol, SymbolKind};
+use filefacts::{Arg, OpenOptions, ParsedFile, Symbol, SymbolKind};
 use serde::Serialize;
 use serde::ser::{SerializeMap, Serializer};
 use serde_json::Value;
@@ -190,11 +190,11 @@ fn main() -> ExitCode {
     // Non-blocking and self-throttling — a short one-file run may exit
     // before it finishes and the next run resumes, while a long directory
     // scan lets it complete.
-    filefacts::cache::enable_by_default();
+    let options = OpenOptions::new().cache(filefacts::cache::env_override().unwrap_or(true));
     filefacts::cache::cleanup();
 
     let mut out = io::BufWriter::new(io::stdout().lock());
-    exit_code(run(&mut out, root, &args))
+    exit_code(run(&mut out, root, &args, &options))
 }
 
 /// Exit status for a run: `Ok(false)` means some file failed and was
@@ -215,9 +215,14 @@ fn exit_code(result: io::Result<bool>) -> ExitCode {
 
 /// Analyze `root`, walking it recursively when it is a directory. Returns
 /// `Ok(false)` when any file failed; an `Err` from `out` ends the walk.
-fn run(out: &mut impl Write, root: &Path, args: &Args) -> io::Result<bool> {
+fn run(
+    out: &mut impl Write,
+    root: &Path,
+    args: &Args,
+    options: &OpenOptions<'_>,
+) -> io::Result<bool> {
     if !root.is_dir() {
-        return analyze_one(out, root, args);
+        return analyze_one(out, root, args, options);
     }
     let mut ok = true;
     let mut stack = vec![root.to_path_buf()];
@@ -242,7 +247,7 @@ fn run(out: &mut impl Write, root: &Path, args: &Args) -> io::Result<bool> {
             let p = entry.path();
             match entry.file_type() {
                 Ok(ft) if ft.is_dir() => stack.push(p),
-                Ok(ft) if ft.is_file() => ok &= analyze_one(out, &p, args)?,
+                Ok(ft) if ft.is_file() => ok &= analyze_one(out, &p, args, options)?,
                 _ => {}
             }
         }
@@ -253,7 +258,12 @@ fn run(out: &mut impl Write, root: &Path, args: &Args) -> io::Result<bool> {
 // analyze_one parses one file and writes its rendered output. A file that
 // cannot be read, parsed or serialised is reported on stderr and yields
 // `Ok(false)` so a directory walk carries on; an `Err` means `out` failed.
-fn analyze_one(out: &mut impl Write, path: &Path, args: &Args) -> io::Result<bool> {
+fn analyze_one(
+    out: &mut impl Write,
+    path: &Path,
+    args: &Args,
+    options: &OpenOptions<'_>,
+) -> io::Result<bool> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
@@ -262,13 +272,7 @@ fn analyze_one(out: &mut impl Write, path: &Path, args: &Args) -> io::Result<boo
         }
     };
 
-    let parsed = match filefacts::open_with_path(path, &bytes) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("filefacts: {}: {e}", shown(path));
-            return Ok(false);
-        }
-    };
+    let parsed = options.clone().path(path).open(&bytes);
 
     let written = match args.format {
         // Stream JSON straight to `out`. Building an intermediate
@@ -1016,8 +1020,6 @@ fn format_metric_value(key: &str, raw: f64) -> String {
         || key.ends_with("_pct")
         || key.ends_with("entropy")
         || key.ends_with("_entropy")
-        || key.ends_with("entropy_mean")
-        || key.ends_with("entropy_max")
         || key.ends_with("entropy_variance")
         || key.ends_with("name_entropy")
     {
@@ -1528,6 +1530,8 @@ fn render_symbols(symbols: &[&Symbol]) -> String {
             Symbol::Member { .. } => ("member", String::new()),
             Symbol::Bind { .. } => ("bind", String::new()),
             Symbol::Identifier { .. } => ("identifier", String::new()),
+            // `Symbol` is non-exhaustive: a kind added later still renders.
+            _ => ("symbol", String::new()),
         };
         out.push_str(&format!(
             "  {kind} {name}{spacer}{extras}\n",
@@ -1728,20 +1732,12 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// Hermetic `open_with_path`: tests here assert `parse_count() == 1`,
-    /// which only holds when this process actually runs the extraction
-    /// pipeline. The disk cache is off by default only inside filefacts' own
-    /// unit tests (`!cfg!(test)` in `cache`); that guard does not reach this
-    /// binary target, where the crate is linked as an ordinary dependency,
-    /// so a warm entry from a prior run would leave the count at 0. Mirrors
-    /// the wrapper in `tests/integration.rs`. Idempotent and safe under
-    /// parallel test execution.
-    fn open_with_path<'a>(
-        path: &Path,
-        bytes: &'a [u8],
-    ) -> Result<ParsedFile<'a>, filefacts::Error> {
-        filefacts::cache::set_caching_enabled(false);
-        filefacts::open_with_path(path, bytes)
+    /// Hermetic open: tests here assert `parse_count() == 1`, which only
+    /// holds when this process actually runs the extraction pipeline, so the
+    /// disk cache is off explicitly — `FILEFACTS_CACHE` in the environment
+    /// must not let a warm entry from a prior run leave the count at 0.
+    fn open<'a>(path: &Path, bytes: &'a [u8]) -> ParsedFile<'a> {
+        OpenOptions::new().cache(false).path(path).open(bytes)
     }
 
     /// Parse `words` as a command line on which only `existing` names files.
@@ -1778,7 +1774,7 @@ mod tests {
 
     #[test]
     fn bundle_carries_every_view() {
-        let parsed = open_with_path(Path::new("example.py"), SOURCE).unwrap();
+        let parsed = open(Path::new("example.py"), SOURCE);
         let bundle = serde_json::to_value(Bundle(&parsed)).unwrap();
         let view_value = |view| serde_json::to_value(ViewData(&parsed, view)).unwrap();
         for &(view, name, _) in VIEWS {
@@ -1884,14 +1880,14 @@ mod tests {
 
     #[test]
     fn closed_output_ends_the_run_in_every_format() {
-        filefacts::cache::set_caching_enabled(false);
         let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/markdown"));
         for format in [Format::Terminal, Format::Json] {
             let args = Args {
                 format,
                 ..Args::default()
             };
-            let err = run(&mut ClosedPipe, dir, &args).unwrap_err();
+            let options = OpenOptions::new().cache(false);
+            let err = run(&mut ClosedPipe, dir, &args, &options).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "{format:?}");
         }
     }
@@ -1900,7 +1896,7 @@ mod tests {
     fn flow_is_a_format_neutral_view() {
         assert_eq!(View::from_name("flow"), Some(View::Flow));
         assert_eq!(View::Flow.name(), "flow");
-        let parsed = open_with_path(Path::new("example.py"), b"send(acquire())\n").unwrap();
+        let parsed = open(Path::new("example.py"), b"send(acquire())\n");
         let value = serde_json::to_value(ViewData(&parsed, View::Flow)).unwrap();
         assert_eq!(value["producer"], "tree-sitter");
         assert_eq!(value["language"], "python");
@@ -1911,7 +1907,7 @@ mod tests {
     #[test]
     fn unavailable_binary_flow_is_null_not_an_empty_graph() {
         let bytes = include_bytes!("../../tests/fixtures/test.elf");
-        let parsed = open_with_path(Path::new("example.elf"), bytes).unwrap();
+        let parsed = open(Path::new("example.elf"), bytes);
         assert!(parsed.flow().is_none());
         let value = serde_json::to_value(ViewData(&parsed, View::Flow)).unwrap();
         assert!(value.is_null());
@@ -1929,7 +1925,7 @@ mod tests {
         }
         zip.finish().unwrap();
 
-        let parsed = open_with_path(Path::new("x.zip"), &bytes).unwrap();
+        let parsed = open(Path::new("x.zip"), &bytes);
         let view = Some(View::ArchiveMembers);
         let text = format_terminal(Path::new("x.zip"), &parsed, view).unwrap();
         let rows: Vec<&str> = text.lines().filter(|l| l.contains(".txt")).collect();
@@ -1940,7 +1936,7 @@ mod tests {
 
     #[test]
     fn located_metric_renders_as_a_number() {
-        let parsed = open_with_path(Path::new("example.py"), SOURCE).unwrap();
+        let parsed = open(Path::new("example.py"), SOURCE);
         let located = parsed
             .metrics()
             .iter_facts()
@@ -1970,7 +1966,7 @@ mod tests {
             ("evil.json", br#"{"k\u001b[2J": ["\u001b]0;pwned\u0007"]}"#),
         ];
         for (name, bytes) in files {
-            let parsed = open_with_path(Path::new(name), bytes).unwrap();
+            let parsed = open(Path::new(name), bytes);
             let views = VIEWS.iter().map(|(view, _, _)| Some(*view));
             for view in std::iter::once(None).chain(views) {
                 let text = format_terminal(Path::new(name), &parsed, view).unwrap();

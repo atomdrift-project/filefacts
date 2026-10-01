@@ -43,7 +43,7 @@
 //!   load address, and the boot image's own extent.
 //! - `iso.system_area.*` — the 32 KiB before the descriptors: `empty`,
 //!   `mbr` (isohybrid), `gpt`, `apm`, or `data`.
-//! - `iso.files[]` + `iso.file_count` / `iso.dir_count` / `iso.max_depth` …
+//! - `iso.files[]` + `iso.file_count` / `iso.directory_count` / `iso.max_depth` …
 //! - `iso.anomalies[]` — structural findings worth a rule (`trailing-data`,
 //!   `extent-beyond-volume`, `overlapping-extents`, `tree-only-file`, …).
 //! - `iso.udf.*` — UDF revision, implementation identifier, volume names.
@@ -146,7 +146,7 @@ pub(super) fn extract(
         .iter()
         .map(|m| JsonValue::Object(member_value(m, Shape::FULL)))
         .collect();
-    values.insert("archive.members", JsonValue::Array(list));
+    values.insert_key(value_key!("archive.members"), JsonValue::Array(list));
     stats.emit(values, metrics);
     result
 }
@@ -160,7 +160,10 @@ fn walk_image(
     let descriptors = scan_descriptors(bytes);
     let mut anomalies: Vec<&'static str> = Vec::new();
     if descriptors.is_empty() {
-        values.insert("iso.format", JsonValue::String("unknown".into()));
+        values.insert_key(
+            value_key!("iso.format"),
+            JsonValue::String("unknown".into()),
+        );
         emit_system_area(bytes, values, metrics, &mut anomalies);
         anomalies.push("no-volume-descriptor");
         finish(values, metrics, &mut anomalies, &[], bytes, None);
@@ -207,7 +210,7 @@ fn walk_image(
         extensions.push("joliet");
         metrics.insert(metric!("iso.joliet_level"), f64::from(*level));
     }
-    values.insert("iso.joliet", JsonValue::Bool(joliet.is_some()));
+    values.insert_key(value_key!("iso.joliet"), JsonValue::Bool(joliet.is_some()));
 
     let mut udf_facts = udf::extract(bytes, values, metrics);
     if udf_facts.present {
@@ -222,7 +225,7 @@ fn walk_image(
         (false, true) => "udf",
         (false, false) => "unknown",
     };
-    values.insert("iso.format", JsonValue::String(format.into()));
+    values.insert_key(value_key!("iso.format"), JsonValue::String(format.into()));
 
     let Some(pvd) = primary else {
         // A UDF-only image has no ISO 9660 tree, so the UDF walk is the only
@@ -386,16 +389,16 @@ fn finish(
     let mut exts: Vec<&'static str> = extensions.to_vec();
     exts.sort_unstable();
     exts.dedup();
-    values.insert(
-        "iso.extensions",
+    values.insert_key(
+        value_key!("iso.extensions"),
         JsonValue::Array(exts.iter().map(|e| json!(e)).collect()),
     );
 
     anomalies.sort_unstable();
     anomalies.dedup();
     metrics.insert(metric!("iso.anomaly_count"), anomalies.len() as f64);
-    values.insert(
-        "iso.anomalies",
+    values.insert_key(
+        value_key!("iso.anomalies"),
         JsonValue::Array(anomalies.iter().map(|a| json!(a)).collect()),
     );
 }
@@ -479,7 +482,7 @@ fn emit_descriptor_set(descriptors: &[Descriptor<'_>], values: &mut Values, metr
         metric!("iso.volume_descriptor_count"),
         descriptors.len() as f64,
     );
-    values.insert("iso.volume_descriptors", JsonValue::Array(list));
+    values.insert_key(value_key!("iso.volume_descriptors"), JsonValue::Array(list));
 }
 
 fn descriptor_kind(ident: [u8; 5], kind: u8) -> &'static str {
@@ -722,7 +725,10 @@ fn emit_pvd(
     // came from so a rule can tell a real stamp from an imitation.
     if let Some((tool, source)) = detect_builder(pvd) {
         values.insert_key(value_key!("iso.builder"), JsonValue::String(tool.into()));
-        values.insert("iso.builder_source", JsonValue::String(source.into()));
+        values.insert_key(
+            value_key!("iso.builder_source"),
+            JsonValue::String(source.into()),
+        );
     }
     let blank = [
         &pvd.system_id,
@@ -734,7 +740,7 @@ fn emit_pvd(
     .iter()
     .filter(|f| f.is_empty())
     .count();
-    metrics.insert(metric!("iso.blank_identifier_fields"), blank as f64);
+    metrics.insert(metric!("iso.blank_identifier_count"), blank as f64);
 
     if pvd.logical_block_size != SECTOR as u16 {
         anomalies.push("nonstandard-block-size");
@@ -923,7 +929,10 @@ fn emit_system_area(
     } else {
         "data"
     };
-    values.insert("iso.system_area.kind", JsonValue::String(kind.into()));
+    values.insert_key(
+        value_key!("iso.system_area.kind"),
+        JsonValue::String(kind.into()),
+    );
 
     if kind == "mbr" || kind == "gpt" {
         let mut parts = Vec::new();
@@ -946,7 +955,10 @@ fn emit_system_area(
             }));
         }
         if !parts.is_empty() {
-            values.insert("iso.system_area.partitions", JsonValue::Array(parts));
+            values.insert_key(
+                value_key!("iso.system_area.partitions"),
+                JsonValue::Array(parts),
+            );
         }
     } else if kind == "data" {
         anomalies.push("nonzero-system-area");
@@ -969,11 +981,14 @@ fn emit_boot(
     archive_members: &mut Vec<ArchiveMember>,
 ) -> bool {
     let boot_system = decode_field(&field(body, 7, 32), false);
-    values.insert("iso.boot.system_id", JsonValue::String(boot_system.clone()));
+    values.insert_key(
+        value_key!("iso.boot.system_id"),
+        JsonValue::String(boot_system.clone()),
+    );
     if !boot_system.to_ascii_uppercase().starts_with("EL TORITO") {
         // A boot record that isn't El Torito still means "this image
         // claims to boot"; record the claim without inventing a catalog.
-        values.insert("iso.boot.bootable", JsonValue::Bool(true));
+        values.insert_key(value_key!("iso.boot.bootable"), JsonValue::Bool(true));
         return false;
     }
 
@@ -996,7 +1011,10 @@ fn emit_boot(
     }
     let manufacturer = decode_field(&field(catalog, 4, 24), false);
     if !manufacturer.is_empty() {
-        values.insert("iso.boot.manufacturer", JsonValue::String(manufacturer));
+        values.insert_key(
+            value_key!("iso.boot.manufacturer"),
+            JsonValue::String(manufacturer),
+        );
     }
 
     let mut entries = Vec::new();
@@ -1089,13 +1107,19 @@ fn emit_boot(
         metric!("iso.boot.bootable_entry_count"),
         f64::from(bootable_count),
     );
-    values.insert("iso.boot.bootable", JsonValue::Bool(bootable_count > 0));
-    values.insert(
-        "iso.boot.platforms",
+    values.insert_key(
+        value_key!("iso.boot.bootable"),
+        JsonValue::Bool(bootable_count > 0),
+    );
+    values.insert_key(
+        value_key!("iso.boot.platforms"),
         JsonValue::Array(platforms.iter().map(|p| json!(p)).collect()),
     );
-    values.insert("iso.boot.efi", JsonValue::Bool(platforms.contains(&"efi")));
-    values.insert("iso.boot.entries", JsonValue::Array(entries));
+    values.insert_key(
+        value_key!("iso.boot.efi"),
+        JsonValue::Bool(platforms.contains(&"efi")),
+    );
+    values.insert_key(value_key!("iso.boot.entries"), JsonValue::Array(entries));
     true
 }
 
@@ -1673,7 +1697,7 @@ fn emit_tree(
     }
 
     metrics.insert(metric!("iso.file_count"), file_count as f64);
-    metrics.insert(metric!("iso.dir_count"), dir_count as f64);
+    metrics.insert(metric!("iso.directory_count"), dir_count as f64);
     metrics.insert(metric!("iso.symlink_count"), symlink_count as f64);
     metrics.insert(metric!("iso.hidden_file_count"), hidden_count as f64);
     metrics.insert(
@@ -1717,11 +1741,11 @@ fn emit_tree(
     }
 
     extensions.sort_unstable();
-    values.insert(
-        "iso.file_extensions",
+    values.insert_key(
+        value_key!("iso.file_extensions"),
         JsonValue::Array(extensions.into_iter().map(JsonValue::String).collect()),
     );
-    values.insert("iso.files", JsonValue::Array(surfaced));
+    values.insert_key(value_key!("iso.files"), JsonValue::Array(surfaced));
 }
 
 /// Cap on unclaimed regions reported. A fragmented image must not turn into
@@ -1908,7 +1932,7 @@ fn emit_unclaimed(
         });
     }
     if !list.is_empty() {
-        values.insert("iso.unclaimed", JsonValue::Array(list));
+        values.insert_key(value_key!("iso.unclaimed"), JsonValue::Array(list));
     }
 }
 

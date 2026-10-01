@@ -61,7 +61,10 @@ pub(super) fn extract(
         );
     }
     if let Some(platform) = field_str(&spec, "platform") {
-        values.insert("gem.platform", JsonValue::String(platform.to_string()));
+        values.insert_key(
+            value_key!("gem.platform"),
+            JsonValue::String(platform.to_string()),
+        );
     }
     if let Some(summary) = field_str(&spec, "summary") {
         values.insert_key(
@@ -85,7 +88,7 @@ pub(super) fn extract(
         }
     }
     if !licenses.is_empty() {
-        values.insert("gem.licenses", string_array(&licenses));
+        values.insert_key(value_key!("gem.licenses"), string_array(&licenses));
     }
 
     // Same plural/singular split for authors (`authors` seq vs `author` scalar).

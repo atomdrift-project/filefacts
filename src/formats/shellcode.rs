@@ -13,13 +13,20 @@
 use crate::fileid::shellcode;
 use crate::metric;
 use crate::output::{Metrics, Values};
+use crate::value_key;
 
 pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     let Some(sc) = shellcode::detect(bytes) else {
         return;
     };
-    values.insert("shellcode.getpc", serde_json::json!(sc.getpc.label()));
-    values.insert("shellcode.arch", serde_json::json!(sc.arch.label()));
+    values.insert_key(
+        value_key!("shellcode.getpc"),
+        serde_json::json!(sc.getpc.label()),
+    );
+    values.insert_key(
+        value_key!("shellcode.arch"),
+        serde_json::json!(sc.arch.label()),
+    );
     metrics.insert(metric!("shellcode.getpc_offset"), sc.pop_offset as f64);
 }
 

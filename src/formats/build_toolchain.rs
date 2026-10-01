@@ -250,7 +250,11 @@ pub(super) fn from_pe_rich(values: &mut Values) {
 pub(super) fn from_macho(values: &mut Values, sections: &[crate::output::Section]) {
     let has_swift = sections.iter().any(|s| s.name.contains(",__swift5_"));
     if has_swift {
-        put_str(values, "build.toolchain.compiler", Family::Swift.as_str());
+        put_str(
+            values,
+            value_key!("build.toolchain.compiler"),
+            Family::Swift.as_str(),
+        );
         return;
     }
     let bv = values.get_key(value_key!("macho.build_version"));
@@ -278,9 +282,13 @@ pub(super) fn from_macho(values: &mut Values, sections: &[crate::output::Section
 }
 
 fn emit(values: &mut Values, family: Family, version: String) {
-    put_str(values, "build.toolchain.compiler", family.as_str());
+    put_str(
+        values,
+        value_key!("build.toolchain.compiler"),
+        family.as_str(),
+    );
     if !version.is_empty() {
-        put_str(values, "build.toolchain.version", version);
+        put_str(values, value_key!("build.toolchain.version"), version);
     }
 }
 

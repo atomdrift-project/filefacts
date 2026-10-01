@@ -6,6 +6,7 @@
 //! structured format they're looking at.
 
 use crate::metric;
+use crate::value_key;
 use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value as JsonValue};
@@ -27,8 +28,8 @@ pub(crate) const GENERIC_JSON_PARSE_LIMIT_BYTES: usize = 75 * 1024;
 /// content's top-level keys (when the root is an object) or wrap the
 /// non-object root under `value` (when it isn't).
 pub(super) fn extract_json(bytes: &[u8], values: &mut Values) -> Result<(), Error> {
-    let parsed: JsonValue =
-        serde_json::from_slice(bytes).map_err(|e| Error::malformed("json", e.to_string()))?;
+    let parsed: JsonValue = serde_json::from_slice(bytes)
+        .map_err(|e| Error::malformed_with_source("json", e.to_string(), e))?;
     promote_root(parsed, values);
     Ok(())
 }
@@ -46,17 +47,17 @@ pub(super) fn extract_generic_json(
         GENERIC_JSON_PARSE_LIMIT_BYTES as f64,
     );
     if bytes.len() > GENERIC_JSON_PARSE_LIMIT_BYTES {
-        values.insert("json.parse.skipped", JsonValue::Bool(true));
-        values.insert(
-            "json.parse.reason",
+        values.insert_key(value_key!("json.parse.skipped"), JsonValue::Bool(true));
+        values.insert_key(
+            value_key!("json.parse.reason"),
             JsonValue::String("size_limit".to_string()),
         );
-        values.insert(
-            "json.parse.limit_bytes",
+        values.insert_key(
+            value_key!("json.parse.limit_bytes"),
             JsonValue::Number((GENERIC_JSON_PARSE_LIMIT_BYTES as u64).into()),
         );
-        values.insert(
-            "json.parse.size_bytes",
+        values.insert_key(
+            value_key!("json.parse.size"),
             JsonValue::Number((bytes.len() as u64).into()),
         );
         return Ok(());
@@ -113,17 +114,17 @@ pub(super) fn extract_gyp(
         GENERIC_JSON_PARSE_LIMIT_BYTES as f64,
     );
     if bytes.len() > GENERIC_JSON_PARSE_LIMIT_BYTES {
-        values.insert("json.parse.skipped", JsonValue::Bool(true));
-        values.insert(
-            "json.parse.reason",
+        values.insert_key(value_key!("json.parse.skipped"), JsonValue::Bool(true));
+        values.insert_key(
+            value_key!("json.parse.reason"),
             JsonValue::String("size_limit".to_string()),
         );
-        values.insert(
-            "json.parse.limit_bytes",
+        values.insert_key(
+            value_key!("json.parse.limit_bytes"),
             JsonValue::Number((GENERIC_JSON_PARSE_LIMIT_BYTES as u64).into()),
         );
-        values.insert(
-            "json.parse.size_bytes",
+        values.insert_key(
+            value_key!("json.parse.size"),
             JsonValue::Number((bytes.len() as u64).into()),
         );
         return Ok(());
@@ -158,10 +159,10 @@ pub(super) fn extract_yaml(bytes: &[u8], values: &mut Values) -> Result<(), Erro
 /// Parse the bytes as TOML.
 pub(super) fn extract_toml(bytes: &[u8], values: &mut Values) -> Result<(), Error> {
     let text = std::str::from_utf8(bytes)
-        .map_err(|e| Error::malformed("toml", format!("input is not utf-8: {e}")))?;
+        .map_err(|e| Error::malformed_with_source("toml", format!("input is not utf-8: {e}"), e))?;
     let parsed: toml::Value = text
         .parse()
-        .map_err(|e: toml::de::Error| Error::malformed("toml", e.to_string()))?;
+        .map_err(|e: toml::de::Error| Error::malformed_with_source("toml", e.to_string(), e))?;
     let json = toml_to_json(parsed);
     promote_root(json, values);
     Ok(())
@@ -170,8 +171,8 @@ pub(super) fn extract_toml(bytes: &[u8], values: &mut Values) -> Result<(), Erro
 /// Parse the bytes as an Apple Property List (XML or binary form).
 pub(super) fn extract_plist(bytes: &[u8], values: &mut Values) -> Result<(), Error> {
     let cursor = std::io::Cursor::new(bytes);
-    let parsed: plist::Value =
-        plist::Value::from_reader(cursor).map_err(|e| Error::malformed("plist", e.to_string()))?;
+    let parsed: plist::Value = plist::Value::from_reader(cursor)
+        .map_err(|e| Error::malformed_with_source("plist", e.to_string(), e))?;
     let json = plist_to_json(parsed);
     promote_root(json, values);
     Ok(())
@@ -183,8 +184,9 @@ pub(super) fn extract_plist(bytes: &[u8], values: &mut Values) -> Result<(), Err
 /// array. Continuation lines (starting with whitespace) append to the
 /// previous header's value.
 pub(super) fn extract_pkginfo(bytes: &[u8], values: &mut Values) -> Result<(), Error> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|e| Error::malformed("pkginfo", format!("input is not utf-8: {e}")))?;
+    let text = std::str::from_utf8(bytes).map_err(|e| {
+        Error::malformed_with_source("pkginfo", format!("input is not utf-8: {e}"), e)
+    })?;
     let mut root: Map<String, JsonValue> = Map::new();
     let mut last_key: Option<String> = None;
 
@@ -235,9 +237,8 @@ fn promote_root(json: JsonValue, values: &mut Values) {
             *values = Values::from_json(JsonValue::Object(map));
         }
         other => {
-            let mut wrapper = Map::new();
-            wrapper.insert("root".to_string(), other);
-            *values = Values::from_json(JsonValue::Object(wrapper));
+            *values = Values::new();
+            values.insert_key(value_key!("root"), other);
         }
     }
 }
@@ -1869,5 +1870,46 @@ mod tests {
         let mut v = Values::new();
         let mut m = Metrics::new();
         assert!(extract_gyp(b"\x00\x01 not a manifest", &mut v, &mut m).is_err());
+    }
+
+    /// The parser error behind a `Malformed` is its `source()`, while the
+    /// rendered text, which lands in the errors view, keeps its exact wording.
+    #[test]
+    fn malformed_errors_keep_their_text_and_expose_the_parser_error() {
+        use std::error::Error as _;
+        let mut v = Values::new();
+
+        let err = extract_toml(b"name = \"x\"\nversion = \n", &mut v).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "malformed toml: TOML parse error at line 2, column 11\n  |\n2 | version = \n  |           ^\ninvalid string\nexpected `\"`, `'`\n"
+        );
+        let source = err.source().expect("toml source");
+        assert!(source.downcast_ref::<toml::de::Error>().is_some());
+
+        let err = extract_toml(b"\xff\xfe = 1\n", &mut v).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "malformed toml: input is not utf-8: invalid utf-8 sequence of 1 bytes from index 0"
+        );
+        let source = err.source().expect("utf-8 source");
+        assert!(source.downcast_ref::<std::str::Utf8Error>().is_some());
+
+        let err = extract_json(br#"{"a":"#, &mut v).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "malformed json: EOF while parsing a value at line 1 column 5"
+        );
+        let source = err.source().expect("json source");
+        assert!(source.downcast_ref::<serde_json::Error>().is_some());
+
+        // Structural checks of our own carry no cause.
+        let mut m = Metrics::new();
+        let err = extract_gyp(b"\x00\x01 not a manifest", &mut v, &mut m).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "malformed gyp: not valid JSON or gyp Python-literal syntax"
+        );
+        assert!(err.source().is_none());
     }
 }

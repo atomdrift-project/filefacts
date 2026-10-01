@@ -29,12 +29,12 @@ fn put_pdb_path(values: &mut Values, path: &str, path_offset: Option<u64>) {
     // Anchor the value at the filename string in the CodeView blob so a
     // `type: value` match on `pe.debug.pdb.path` renders in the hex view.
     if let Some(off) = path_offset {
-        put_u64(values, "pe.debug.pdb.path_offset", off);
+        put_u64(values, value_key!("pe.debug.pdb.path_offset"), off);
     }
     let name = basename(path);
     if !name.is_empty() {
-        put_str(values, "pe.debug.pdb.basename", name);
-        put_str(values, "pe.debug.pdb.stem", stem(name));
+        put_str(values, value_key!("pe.debug.pdb.basename"), name);
+        put_str(values, value_key!("pe.debug.pdb.stem"), stem(name));
     }
 }
 
@@ -64,7 +64,7 @@ pub(super) fn extract(debug: &DebugData<'_>, values: &mut Values, errors_out: &m
         })
         .collect();
     if !entries.is_empty() {
-        values.insert("pe.debug.entries", JsonValue::Array(entries));
+        values.insert_key(value_key!("pe.debug.entries"), JsonValue::Array(entries));
     }
 
     if let Some(ref cv) = debug.codeview_pdb70_debug_info {
@@ -83,7 +83,7 @@ pub(super) fn extract(debug: &DebugData<'_>, values: &mut Values, errors_out: &m
                 put_pdb_path(values, path, path_offset);
             }
         }
-        put_u64(values, "pe.debug.pdb.age", u64::from(cv.age));
+        put_u64(values, value_key!("pe.debug.pdb.age"), u64::from(cv.age));
     }
 }
 
@@ -104,8 +104,12 @@ fn codeview_pdb70(
             put_pdb_path(values, path, path_offset);
         }
     }
-    put_str(values, "pe.debug.pdb.guid", format_guid(&cv.signature));
-    put_u64(values, "pe.debug.pdb.age", u64::from(cv.age));
+    put_str(
+        values,
+        value_key!("pe.debug.pdb.guid"),
+        format_guid(&cv.signature),
+    );
+    put_u64(values, value_key!("pe.debug.pdb.age"), u64::from(cv.age));
 
     // Pair the GUID with the originating debug-entry timestamp so
     // consumers can build the same `<GUID><age>` PE-debug fingerprint
@@ -113,7 +117,7 @@ fn codeview_pdb70(
     if let Some(idd) = find_codeview_entry(directory) {
         put_i64(
             values,
-            "pe.debug.pdb.timestamp",
+            value_key!("pe.debug.pdb.timestamp"),
             i64::from(idd.time_date_stamp),
         );
     }
@@ -205,6 +209,7 @@ mod tests {
             &mut sections,
             &mut symbols,
             &mut errors,
+            &crate::rizin::Settings::default(),
         )
         .unwrap();
 

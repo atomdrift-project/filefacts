@@ -448,6 +448,9 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "kt" | "kts" => Some(FileType::Kotlin),
         "bat" | "cmd" => Some(FileType::Batch),
         "jcl" => Some(FileType::Jcl),
+        // A Windows registry export. Its header line is magic, so a `.reg`
+        // without one is typed by its content and reported as a mismatch.
+        "reg" => Some(FileType::Reg),
         "vbs" | "vbe" | "wsf" | "wsc" | "wsh" => Some(FileType::Vbs),
         "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" | "hxx" | "hh" | "pas" | "dpr" | "asm" | "s"
         | "nasm" => Some(FileType::C),
@@ -772,6 +775,19 @@ mod tests {
         assert_eq!(
             detect_from_path(Path::new("/tmp/data.json")),
             Some(FileType::Json)
+        );
+    }
+
+    #[test]
+    fn reg_extension_is_a_registry_export() {
+        assert_eq!(
+            detect_from_path(Path::new("C:\\Temp\\settings.REG")),
+            Some(FileType::Reg)
+        );
+        // `.registry.json` is package metadata, never a registry export.
+        assert_eq!(
+            detect_from_path(Path::new("left-pad@1.3.0.registry.json")),
+            Some(FileType::Registry)
         );
     }
 

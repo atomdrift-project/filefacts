@@ -32,15 +32,35 @@ the same parsers independently.
 
 ```toml
 [dependencies]
-filefacts = "1.3"
+filefacts = "2"
 ```
 
 ```rust
-let parsed = filefacts::open(&bytes)?;
+let parsed = filefacts::open(&bytes);
 let identity = parsed.fileid();
 let metrics = parsed.metrics();
 let symbols = parsed.symbols();
 ```
+
+`open` uses the library defaults. `OpenOptions` adds a path for identification,
+a known type, a cancellation flag, and per-file cache and Rizin settings:
+
+```rust
+use std::{path::Path, time::Duration};
+
+let parsed = filefacts::OpenOptions::new()
+    .path(Path::new("sample.exe"))
+    .cache(true)
+    .rizin_timeout(Duration::from_secs(60))
+    .open(&bytes);
+```
+
+Every setting belongs to the `ParsedFile` it opens; nothing is process-wide, so
+one process can open files under different settings at once. Version 2.0
+replaced `open_with_path`, `open_with_fileid`, `open_as`,
+`ParsedFile::with_cancellation`, the `cache::set_caching_enabled` /
+`enable_by_default` switches and the `rizin::disable` / `scoped_disable*` /
+`set_*` globals with these options.
 
 ### Homebrew CLI on macOS or Linux
 
@@ -112,24 +132,34 @@ parser produces flow; binary flow recovery is not implemented. Unsupported
 analysis returns `None` (`null` in CLI JSON), not an empty graph. Missing flow
 or missing relationships are not evidence that a file is safe.
 
+Value and metric keys follow one naming convention, described in
+[docs/NAMING.md](docs/NAMING.md). Schema v9 renamed 75 keys to fit it;
+[docs/schema-v9-renames.tsv](docs/schema-v9-renames.tsv) maps each old key to
+its new name for consumers migrating from v8. Moving from filefacts 1.x to
+2.0 (the API changes as well as the renames) is covered in
+[docs/MIGRATING.md](docs/MIGRATING.md).
+
 The schema is versioned with `SCHEMA_VERSION`. The CLI caches views on disk as
 content-addressed, zstd-compressed records under the user cache directory
 (for example `~/.cache/atomdrift/filefacts`) to make repeated corpus passes
 inexpensive. Library callers get the same cache only by opting in with
-`filefacts::cache::enable_by_default()` (or `set_caching_enabled(true)`);
-otherwise a `ParsedFile` never touches the disk. Entries are keyed by content
-and the filefacts source, so upgrading filefacts never serves stale results.
+`OpenOptions::cache(true)`; otherwise a `ParsedFile` never touches the disk.
+Entries are keyed by content, the filefacts source and every setting that
+changes the output, so upgrading filefacts or changing Rizin settings never
+serves stale results.
 
 Most parsing is in-process. For PE, ELF, and Mach-O files, filefacts can invoke
 an installed Rizin or radare2 subprocess to recover deeper control-flow and
 symbol information. Its presence and version are part of the cache key, so pin
-the analysis environment when producing reproducible training data.
+the analysis environment when producing reproducible training data. Turn it off
+per file with `OpenOptions::rizin(false)`, or bound it with `rizin_timeout`,
+`rizin_max_bytes` and `rizin_native_arch_only`.
 
 ### Environment variables
 
 | Variable | Effect |
 | --- | --- |
-| `FILEFACTS_CACHE` | `0` or `false` disables the disk cache; any other value enables it, including for library callers that did not opt in. `filefacts::cache::set_caching_enabled` overrides it. |
+| `FILEFACTS_CACHE` | `0` or `false` disables the disk cache; any other value enables it, including for library callers that did not choose. An explicit `OpenOptions::cache` overrides it. |
 | `FILEFACTS_DEBUG` | Any value other than empty, `0`, or `false` prints extractor diagnostics to stderr. |
 
 ## Coverage

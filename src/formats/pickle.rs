@@ -16,6 +16,7 @@
 //!   `persid`, `binpersid`, `ext1`, `ext2`, `ext4`).
 
 use crate::metric;
+use crate::value_key;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeSet, VecDeque};
 
@@ -77,17 +78,17 @@ pub(super) fn extract(
 
     if protocol >= 0 {
         metrics.insert(metric!("pickle.protocol"), f64::from(protocol));
-        put_str(values, "pickle.protocol", protocol.to_string());
+        put_str(values, value_key!("pickle.protocol"), protocol.to_string());
     }
     if !modules.is_empty() {
-        values.insert(
-            "pickle.modules",
+        values.insert_key(
+            value_key!("pickle.modules"),
             JsonValue::Array(modules.into_iter().map(JsonValue::String).collect()),
         );
     }
     if !globals.is_empty() {
-        values.insert(
-            "pickle.globals",
+        values.insert_key(
+            value_key!("pickle.globals"),
             JsonValue::Array(globals.into_iter().map(JsonValue::String).collect()),
         );
     }
@@ -98,10 +99,13 @@ pub(super) fn extract(
             .map(|name| JsonValue::String(name.to_ascii_lowercase()))
             .collect();
         if !dangerous.is_empty() {
-            values.insert("pickle.dangerous_opcodes", JsonValue::Array(dangerous));
+            values.insert_key(
+                value_key!("pickle.dangerous_opcodes"),
+                JsonValue::Array(dangerous),
+            );
         }
-        values.insert(
-            "pickle.opcodes",
+        values.insert_key(
+            value_key!("pickle.opcodes"),
             JsonValue::Array(
                 opcodes
                     .into_iter()

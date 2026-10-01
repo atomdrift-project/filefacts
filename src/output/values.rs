@@ -24,11 +24,11 @@ use super::value_keys::ValueKey;
 /// directly without a synthetic prefix — `fileid` already tells consumers
 /// which manifest format they're looking at.
 ///
-/// A key that one module writes and another reads back is declared in
-/// [`VALUE_CATALOG`](crate::VALUE_CATALOG), and both sides go through
-/// [`Self::insert_key`] and [`Self::get_key`] with
-/// [`value_key!`](crate::value_key), so a rename on either side fails the
-/// build instead of silently emptying the reader.
+/// Every key filefacts writes is declared in
+/// [`VALUE_CATALOG`](crate::VALUE_CATALOG) and written through
+/// [`Self::insert_key`] with [`value_key!`](crate::value_key). A reader in
+/// another module goes through [`Self::get_key`], so a rename on either side
+/// fails the build instead of silently emptying the reader.
 ///
 /// # Example
 ///
@@ -72,6 +72,10 @@ impl Values {
     /// Callers must not give one key both a value and children. Path
     /// segments containing `[`, `]`, or `.` are not supported — those
     /// characters are reserved for the lookup grammar.
+    ///
+    /// The path is unchecked, so filefacts' own extractors use
+    /// [`Self::insert_key`] instead, and a unit test rejects calls to this
+    /// method outside tests.
     pub fn insert(&mut self, path: &str, value: JsonValue) {
         let JsonValue::Object(ref mut root) = self.0 else {
             self.0 = JsonValue::Object(Map::new());

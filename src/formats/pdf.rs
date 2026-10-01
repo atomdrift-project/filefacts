@@ -92,7 +92,7 @@ pub(super) fn extract(
         header.insert("version".into(), JsonValue::String(version));
     }
     header.insert("count".into(), json!(header_count));
-    values.insert("pdf.header", JsonValue::Object(header));
+    values.insert_key(value_key!("pdf.header"), JsonValue::Object(header));
 
     // Structural counts — the cheap byte-level fingerprint.
     let eof_count = scan.get(Tok::Eof).all;
@@ -152,7 +152,7 @@ pub(super) fn extract(
                     .collect(),
             ),
         );
-        values.insert("pdf.catalog", JsonValue::Object(catalog));
+        values.insert_key(value_key!("pdf.catalog"), JsonValue::Object(catalog));
     }
 
     // `shape.*` — structural counts and flags. Cleave's parser
@@ -203,8 +203,8 @@ pub(super) fn extract(
     // `pdf.limits` like the archive walkers' limits, and stays out of
     // `errors` (which traits read as "the parser failed").
     if object_streams.skipped > 0 {
-        values.insert(
-            "pdf.limits",
+        values.insert_key(
+            value_key!("pdf.limits"),
             serde_json::json!([{
                 "stage": "object-stream-budget",
                 "reason": format!(
@@ -306,13 +306,10 @@ pub(super) fn extract(
         .last
         .map_or(0, |at| bytes.len().saturating_sub(at + b"%%EOF".len()));
     if trailing_bytes > 0 {
-        metrics.insert(
-            metric!("pdf.trailing_bytes_after_eof"),
-            trailing_bytes as f64,
-        );
+        metrics.insert(metric!("pdf.trailing_bytes"), trailing_bytes as f64);
     }
     if !shape.is_empty() {
-        values.insert("pdf.shape", JsonValue::Object(shape));
+        values.insert_key(value_key!("pdf.shape"), JsonValue::Object(shape));
     }
 
     // `/FlateDecode` count — the bulk of legitimate compressed
@@ -354,7 +351,7 @@ pub(super) fn extract(
     let upload_directory_uri_count = count_upload_directory_uris(&actions);
     if !actions.is_empty() {
         metrics.insert(metric!("pdf.action_count"), actions.len() as f64);
-        values.insert("pdf.actions", JsonValue::Array(actions));
+        values.insert_key(value_key!("pdf.actions"), JsonValue::Array(actions));
     }
     if javascript_action_count > 0 {
         metrics.insert(
@@ -389,7 +386,7 @@ pub(super) fn extract(
             .sum();
         metrics.insert(metric!("pdf.javascript_count"), js_payloads.len() as f64);
         metrics.insert(metric!("pdf.javascript_total_bytes"), total_bytes as f64);
-        values.insert("pdf.javascript", JsonValue::Array(js_payloads));
+        values.insert_key(value_key!("pdf.javascript"), JsonValue::Array(js_payloads));
     }
 
     // Embedded files — `{filename, size}` per `/Type /Filespec`
@@ -399,8 +396,8 @@ pub(super) fn extract(
     let embedded = scan_embedded_files(bytes, &dict_regions);
     if !embedded.is_empty() {
         metrics.insert(metric!("pdf.embedded_file_count"), embedded.len() as f64);
-        values.insert(
-            "pdf.embedded_files",
+        values.insert_key(
+            value_key!("pdf.embedded_files"),
             JsonValue::Array(
                 embedded
                     .into_iter()
@@ -423,8 +420,8 @@ pub(super) fn extract(
     // particular chain *appears* anywhere, not how many times.
     let chains = scan_filter_chains(bytes, &dict_regions);
     if !chains.is_empty() {
-        values.insert(
-            "pdf.filter_chains",
+        values.insert_key(
+            value_key!("pdf.filter_chains"),
             JsonValue::Array(chains.into_iter().map(JsonValue::String).collect()),
         );
     }
@@ -436,7 +433,7 @@ pub(super) fn extract(
     // chains (DCT, JBIG2, …) surface filter info only.
     let streams = scan_streams(bytes, &dict_regions);
     if !streams.is_empty() {
-        values.insert("pdf.streams", JsonValue::Array(streams));
+        values.insert_key(value_key!("pdf.streams"), JsonValue::Array(streams));
     }
 
     // AcroForm widget fields — `/Subtype /Widget` objects with a
@@ -448,7 +445,7 @@ pub(super) fn extract(
     derive_form_field_metrics(&form_fields, metrics);
     if !form_fields.is_empty() {
         metrics.insert(metric!("pdf.form_field_count"), form_fields.len() as f64);
-        values.insert("pdf.form_fields", JsonValue::Array(form_fields));
+        values.insert_key(value_key!("pdf.form_fields"), JsonValue::Array(form_fields));
     }
 
     // Per-page ratios — number of annotations / URI actions per
@@ -512,7 +509,7 @@ pub(super) fn extract(
     // pdf::parser. Now reachable through the metric-fold adapter
     // (`merge_filefacts_metrics`) so trait rules using `field: pdf.X`
     // resolve against filefacts' flat metric map.
-    metrics.insert(metric!("pdf.leading_bytes_before_header"), header_at as f64);
+    metrics.insert(metric!("pdf.leading_bytes"), header_at as f64);
     let sig_count = scan.type_count(TypeName::Sig) + scan.get(Tok::TypeSigSpaced).all;
     metrics.insert(
         metric!("pdf.signature_object_count"),
@@ -2349,7 +2346,7 @@ fn derive_form_field_metrics(fields: &[JsonValue], metrics: &mut Metrics) {
         f64::from(hidden_zero_rect),
     );
     metrics.insert(
-        metric!("pdf.decoded_form_value_max_len"),
+        metric!("pdf.decoded_form_value_max_length"),
         max_decoded_len as f64,
     );
 
@@ -2786,7 +2783,7 @@ mod tests {
         let pdf = b"GARBAGE_LEADING_NOISE_%PDF-1.7\n%%EOF\n";
         let (_, m) = extract_pdf(pdf);
         // `GARBAGE_LEADING_NOISE_` is 22 bytes; `%PDF-` starts at 22.
-        assert_eq!(m.get("pdf.leading_bytes_before_header"), Some(22.0));
+        assert_eq!(m.get("pdf.leading_bytes"), Some(22.0));
     }
 
     #[test]
@@ -2863,7 +2860,7 @@ mod tests {
             11 0 obj << /Subtype /Widget /T (long) /FT /Tx /Rect [0 0 10 10] /V (this is a longer value) >> endobj\n\
             %%EOF";
         let (_, m) = extract_pdf(pdf);
-        assert!(m.get("pdf.decoded_form_value_max_len").unwrap() >= 22.0);
+        assert!(m.get("pdf.decoded_form_value_max_length").unwrap() >= 22.0);
     }
 
     #[test]
@@ -3196,7 +3193,7 @@ mod tests {
         assert_eq!(m.get("pdf.object_count"), Some(10.0));
         assert_eq!(m.get("pdf.three_d_object_count"), Some(5.0));
         assert_eq!(m.get("pdf.signature_object_count"), Some(2.0));
-        assert_eq!(m.get("pdf.trailing_bytes_after_eof"), Some(8.0));
+        assert_eq!(m.get("pdf.trailing_bytes"), Some(8.0));
         assert_eq!(
             v.get("pdf.catalog.features"),
             Some(&json!([
@@ -3323,7 +3320,7 @@ mod tests {
         // `\n` + `GARBAGE_TAIL_PAYLOAD` (20 bytes) = 21 trailing bytes.
         let pdf = b"%PDF-1.7\n%%EOF\nGARBAGE_TAIL_PAYLOAD";
         let (_, m) = extract_pdf(pdf);
-        assert_eq!(m.get("pdf.trailing_bytes_after_eof"), Some(21.0));
+        assert_eq!(m.get("pdf.trailing_bytes"), Some(21.0));
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //!   populate these slots at load time via relocations; the resolved
 //!   entries let trait authors gate on `symbol` rather than addresses
 //!   that change with ASLR.
-//! - `elf.dynsym_funcs[]` — focused subset of `.dynsym` FUNC / IFUNC
+//! - `elf.dynsym_functions[]` — focused subset of `.dynsym` FUNC / IFUNC
 //!   entries (IFUNC, weak, hidden/protected, or undefined). The
 //!   uninteresting global-default-defined entries are reflected in the
 //!   import/export panes already.
@@ -23,6 +23,7 @@ use serde_json::Value as JsonValue;
 use crate::Stage;
 use crate::formats::goblin_safe;
 use crate::output::{Errors, Values};
+use crate::value_key;
 
 /// Emit `elf.verdef[]` records. Replaces the older flat
 /// `elf.provided_versions[]` projection.
@@ -60,7 +61,7 @@ pub(super) fn verdef(elf: &Elf<'_>, values: &mut Values, errors_out: &mut Errors
         out.push(JsonValue::Object(obj));
     }
     if !out.is_empty() {
-        values.insert("elf.verdef", JsonValue::Array(out));
+        values.insert_key(value_key!("elf.verdef"), JsonValue::Array(out));
     }
 }
 
@@ -80,8 +81,8 @@ pub(super) fn init_arrays(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
     let relocs = collect_init_relocations(elf);
 
     for (section, key) in [
-        (".init_array", "elf.init_array"),
-        (".fini_array", "elf.fini_array"),
+        (".init_array", value_key!("elf.init_array")),
+        (".fini_array", value_key!("elf.fini_array")),
     ] {
         let Some((sh_addr, slot_bytes)) = section_addr_and_bytes(elf, bytes, section) else {
             continue;
@@ -111,12 +112,12 @@ pub(super) fn init_arrays(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
             out.push(JsonValue::Object(node));
         }
         if !out.is_empty() {
-            values.insert(key, JsonValue::Array(out));
+            values.insert_key(key, JsonValue::Array(out));
         }
     }
 }
 
-/// Emit `elf.dynsym_funcs[]` — focused subset of FUNC / IFUNC dynsym
+/// Emit `elf.dynsym_functions[]` — focused subset of FUNC / IFUNC dynsym
 /// entries. Skips ordinary global-default-defined entries (those are
 /// already in the import/export panes); keeps IFUNC, weak, hidden /
 /// protected, and undefined ones.
@@ -186,7 +187,7 @@ pub(super) fn dynsym_funcs(elf: &Elf<'_>, values: &mut Values) {
         let nb = b.get("name").and_then(JsonValue::as_str).unwrap_or("");
         na.cmp(nb)
     });
-    values.insert("elf.dynsym_funcs", JsonValue::Array(out));
+    values.insert_key(value_key!("elf.dynsym_functions"), JsonValue::Array(out));
 }
 
 /// Look up a section by name and return `(sh_addr, slice)`.

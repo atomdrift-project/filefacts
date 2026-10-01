@@ -13,9 +13,9 @@ AppleEvents. Plaintext `.applescript` files keep their existing extraction.
 | `symbols`, `kind: call` | Decoded call instructions and known arguments |
 | `values.scpt.version` | UAS version |
 | `values.scpt.limits` | Reason for incomplete analysis; handler when applicable |
-| `metrics.scpt.handlers` | Handlers found |
-| `metrics.scpt.calls` | Call instructions found |
-| `metrics.scpt.decoded` | Recovered strings |
+| `metrics.scpt.handler_count` | Handlers found |
+| `metrics.scpt.call_count` | Call instructions found |
+| `metrics.scpt.decoded_count` | Recovered strings |
 
 An import proves that an event is referenced. A call proves that a decoded
 instruction names it. Neither proves runtime execution. Missing arguments
@@ -68,7 +68,7 @@ supported.
 
 Shared decoding accepts up to 4,096 literals and 8 MiB of input, with a
 256 KiB limit per literal. Output is capped at 4,096 strings and 8 MiB.
-Limits appear in `scpt.limits`; decoded results count toward `scpt.decoded`.
+Limits appear in `scpt.limits`; decoded results count toward `scpt.decoded_count`.
 
 Extraction requires `Fasd` at byte zero or directly after a shebang line, so
 `#!/usr/bin/osascript`-prefixed compiled scripts are extracted too.

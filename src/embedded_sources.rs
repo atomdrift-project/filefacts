@@ -160,7 +160,9 @@ mod tests {
     use super::*;
 
     fn sources(yaml: &[u8]) -> Vec<(String, String, Option<FileType>)> {
-        let parsed = crate::open_with_path(std::path::Path::new("action.yml"), yaml).unwrap();
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new("action.yml"))
+            .open(yaml);
         parsed
             .embedded_sources()
             .map(|s| (s.pointer, s.source.to_owned(), s.file_type))
@@ -345,11 +347,9 @@ jobs:
 
     #[test]
     fn plain_yaml_is_not_promoted_to_executable_source() {
-        let parsed = crate::open_with_path(
-            std::path::Path::new("config.yaml"),
-            b"runs:\n  using: composite\n  steps: [{shell: bash, run: echo example}]\n",
-        )
-        .unwrap();
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new("config.yaml"))
+            .open(b"runs:\n  using: composite\n  steps: [{shell: bash, run: echo example}]\n");
         assert_eq!(parsed.fileid().file_type(), FileType::Yaml);
         assert_eq!(parsed.embedded_sources().count(), 0);
     }

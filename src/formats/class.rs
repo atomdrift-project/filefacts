@@ -23,10 +23,11 @@
 //!   `Signature` attribute values.
 //! - `class.inner_classes[]` — distinct inner-class internal
 //!   names from the `InnerClasses` attribute.
-//! - `class.constant_pool_size` — metric also surfaced as
-//!   `metrics.class.constant_pool_size`.
+//! - `class.constant_pool_count` — metric also surfaced as
+//!   `metrics.class.constant_pool_count`.
 
 use crate::metric;
+use crate::value_key;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap};
 
@@ -180,8 +181,8 @@ pub(super) fn extract(
     class_refs.sort_unstable();
     class_refs.dedup();
     if !class_refs.is_empty() {
-        values.insert(
-            "class.class_refs",
+        values.insert_key(
+            value_key!("class.class_refs"),
             JsonValue::Array(
                 class_refs
                     .into_iter()
@@ -195,8 +196,8 @@ pub(super) fn extract(
     utf8.sort_unstable();
     utf8.dedup();
     if !utf8.is_empty() {
-        values.insert(
-            "class.strings",
+        values.insert_key(
+            value_key!("class.strings"),
             JsonValue::Array(
                 utf8.into_iter()
                     .take(MAX_CP_FACTS)
@@ -206,15 +207,23 @@ pub(super) fn extract(
         );
     }
 
-    put_u64(values, "class.major_version", u64::from(major_version));
-    put_u64(values, "class.minor_version", u64::from(minor_version));
+    put_u64(
+        values,
+        value_key!("class.major_version"),
+        u64::from(major_version),
+    );
+    put_u64(
+        values,
+        value_key!("class.minor_version"),
+        u64::from(minor_version),
+    );
     if let Some(jv) = java_version(major_version) {
-        put_str(values, "class.java_version", jv);
+        put_str(values, value_key!("class.java_version"), jv);
     }
     let flags = decode_access_flags(access_flags);
     if !flags.is_empty() {
-        values.insert(
-            "class.access_flags",
+        values.insert_key(
+            value_key!("class.access_flags"),
             JsonValue::Array(
                 flags
                     .into_iter()
@@ -224,27 +233,27 @@ pub(super) fn extract(
         );
     }
     if let Some(name) = cp.class_name(this_idx) {
-        put_str(values, "class.this_class", name.to_string());
+        put_str(values, value_key!("class.this_class"), name.to_string());
     }
     if let Some(name) = cp.class_name(super_idx) {
-        put_str(values, "class.super_class", name.to_string());
+        put_str(values, value_key!("class.super_class"), name.to_string());
     }
     let interfaces: Vec<JsonValue> = interface_idx
         .iter()
         .filter_map(|i| cp.class_name(*i).map(|s| JsonValue::String(s.to_string())))
         .collect();
     if !interfaces.is_empty() {
-        values.insert("class.interfaces", JsonValue::Array(interfaces));
+        values.insert_key(value_key!("class.interfaces"), JsonValue::Array(interfaces));
     }
     if let Some(s) = attrs.source_file {
-        put_str(values, "class.source_file", s);
+        put_str(values, value_key!("class.source_file"), s);
     }
     if let Some(s) = attrs.signature {
-        put_str(values, "class.signature", s);
+        put_str(values, value_key!("class.signature"), s);
     }
     if !attrs.inner_classes.is_empty() {
-        values.insert(
-            "class.inner_classes",
+        values.insert_key(
+            value_key!("class.inner_classes"),
             JsonValue::Array(
                 attrs
                     .inner_classes
@@ -254,8 +263,12 @@ pub(super) fn extract(
             ),
         );
     }
-    put_u64(values, "class.constant_pool_size", cp_count as u64);
-    metrics.insert(metric!("class.constant_pool_size"), cp_count as f64);
+    put_u64(
+        values,
+        value_key!("class.constant_pool_count"),
+        cp_count as u64,
+    );
+    metrics.insert(metric!("class.constant_pool_count"), cp_count as f64);
     metrics.insert(
         metric!("class.interface_count"),
         f64::from(interfaces_count),

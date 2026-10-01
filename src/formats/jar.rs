@@ -321,8 +321,8 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         features.push("osgi_activator");
     }
     if !features.is_empty() {
-        values.insert(
-            "jar.features",
+        values.insert_key(
+            value_key!("jar.features"),
             JsonValue::Array(
                 features
                     .into_iter()
@@ -332,28 +332,37 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         );
     }
 
-    values.insert("jar.entry_count", json!(entry_count));
-    values.insert("jar.class_count", json!(class_count));
+    values.insert_key(value_key!("jar.entry_count"), json!(entry_count));
+    values.insert_key(value_key!("jar.class_count"), json!(class_count));
     if embedded_jar_count > 0 {
-        values.insert("jar.embedded_jar_count", json!(embedded_jar_count));
+        values.insert_key(
+            value_key!("jar.embedded_jar_count"),
+            json!(embedded_jar_count),
+        );
     }
     if signature_count > 0 {
-        values.insert("jar.signature_count", json!(signature_count));
+        values.insert_key(value_key!("jar.signature_count"), json!(signature_count));
     }
     if signature_block_count > 0 {
-        values.insert("jar.signature_block_count", json!(signature_block_count));
+        values.insert_key(
+            value_key!("jar.signature_block_count"),
+            json!(signature_block_count),
+        );
     }
     if native_lib_count > 0 {
-        values.insert("jar.native_lib_count", json!(native_lib_count));
+        values.insert_key(value_key!("jar.native_lib_count"), json!(native_lib_count));
     }
     if service_count > 0 {
-        values.insert("jar.service_count", json!(service_count));
+        values.insert_key(value_key!("jar.service_count"), json!(service_count));
     }
     if versioned_class_count > 0 {
-        values.insert("jar.versioned_class_count", json!(versioned_class_count));
+        values.insert_key(
+            value_key!("jar.versioned_class_count"),
+            json!(versioned_class_count),
+        );
     }
     if index_count > 0 {
-        values.insert("jar.index_count", json!(index_count));
+        values.insert_key(value_key!("jar.index_count"), json!(index_count));
     }
     metrics.insert(metric!("jar.entry_count"), f64::from(entry_count));
     metrics.insert(metric!("jar.class_count"), f64::from(class_count));

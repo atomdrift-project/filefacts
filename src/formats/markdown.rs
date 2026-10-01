@@ -47,6 +47,7 @@ use serde_json::Value as JsonValue;
 use crate::error::Error;
 use crate::formats::common::put_str;
 use crate::output::{Metrics, Values};
+use crate::value_key;
 
 pub(super) fn extract(
     bytes: &[u8],
@@ -60,19 +61,19 @@ pub(super) fn extract(
     };
 
     if let Some(heading) = first_atx_heading(&text) {
-        put_str(values, "markdown.first_heading", heading);
+        put_str(values, value_key!("markdown.first_heading"), heading);
     }
 
     let repos = github_repos(&text);
     if !repos.is_empty() {
         let arr = repos.into_iter().map(JsonValue::String).collect::<Vec<_>>();
-        values.insert("markdown.github_repos", JsonValue::Array(arr));
+        values.insert_key(value_key!("markdown.github_repos"), JsonValue::Array(arr));
     }
 
     let pkgs = npm_packages(&text);
     if !pkgs.is_empty() {
         let arr = pkgs.into_iter().map(JsonValue::String).collect::<Vec<_>>();
-        values.insert("markdown.npm_packages", JsonValue::Array(arr));
+        values.insert_key(value_key!("markdown.npm_packages"), JsonValue::Array(arr));
     }
 
     let (installs, extensions) = install_packages(&text);
@@ -81,14 +82,20 @@ pub(super) fn extract(
             .into_iter()
             .map(JsonValue::String)
             .collect::<Vec<_>>();
-        values.insert("markdown.install_packages", JsonValue::Array(arr));
+        values.insert_key(
+            value_key!("markdown.install_packages"),
+            JsonValue::Array(arr),
+        );
     }
     if !extensions.is_empty() {
         let arr = extensions
             .into_iter()
             .map(JsonValue::String)
             .collect::<Vec<_>>();
-        values.insert("markdown.install_extensions", JsonValue::Array(arr));
+        values.insert_key(
+            value_key!("markdown.install_extensions"),
+            JsonValue::Array(arr),
+        );
     }
 
     Ok(())

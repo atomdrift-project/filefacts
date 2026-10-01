@@ -118,7 +118,10 @@ fn finalize(root: Map<String, JsonValue>, values: &mut Values) {
     sums.sort();
     sums.dedup();
     if !sums.is_empty() {
-        values.insert("pkg.checksums", JsonValue::String(sums.join(",")));
+        values.insert_key(
+            value_key!("pkg.checksums"),
+            JsonValue::String(sums.join(",")),
+        );
     }
     // Normalized GitHub-owner projections for provenance comparison in traits.
     // The upstream `url`'s owner and every github.com source's owner are emitted
@@ -131,7 +134,7 @@ fn finalize(root: Map<String, JsonValue>, values: &mut Values) {
     // comparable. Parsing lives here; the comparison is pure YAML.
     if let Some(JsonValue::String(url)) = root.get("url") {
         if let Some(owner) = github_owner(url) {
-            values.insert("pkg.url_github_owner", JsonValue::String(owner));
+            values.insert_key(value_key!("pkg.url_github_owner"), JsonValue::String(owner));
         }
     }
     let mut source_owners: Vec<JsonValue> = Vec::new();
@@ -155,7 +158,10 @@ fn finalize(root: Map<String, JsonValue>, values: &mut Values) {
         }
     }
     if !source_owners.is_empty() {
-        values.insert("pkg.source_github_owners", JsonValue::Array(source_owners));
+        values.insert_key(
+            value_key!("pkg.source_github_owners"),
+            JsonValue::Array(source_owners),
+        );
     }
     // Insert each field under `pkg.<field>` so the subtree merges alongside the
     // generic file.* values rather than replacing the whole values object.
@@ -219,8 +225,9 @@ fn split_array(body: &str) -> Vec<String> {
 
 /// Parse a `.SRCINFO`: `key = value` lines, leading tabs, repeated keys.
 pub(super) fn extract_srcinfo(bytes: &[u8], values: &mut Values) -> Result<(), crate::Error> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|e| crate::Error::malformed("srcinfo", format!("input is not utf-8: {e}")))?;
+    let text = std::str::from_utf8(bytes).map_err(|e| {
+        crate::Error::malformed_with_source("srcinfo", format!("input is not utf-8: {e}"), e)
+    })?;
     let mut root: Map<String, JsonValue> = Map::new();
     for line in text.lines() {
         let line = line.trim();

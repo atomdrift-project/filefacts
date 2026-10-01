@@ -33,6 +33,7 @@ pub(super) fn extract(
     symbols_out: &mut crate::Symbols,
     errors_out: &mut Errors,
     image_end: &mut Option<u64>,
+    rizin: &crate::rizin::Settings,
 ) -> Result<(), Error> {
     // Wrap goblin parse in catch_unwind. Fat-header arithmetic
     // overflow on malformed Mach-O has historically panicked
@@ -78,7 +79,7 @@ pub(super) fn extract(
     // the thin-binary case while the parsed Mach-O is in scope; the bytes
     // they reference outlive it. Fat binaries skip pclntab-based GoRoot
     // recovery (rare for Go) but still get build-id via the marker scan.
-    // When native-arch-only mode is on (e.g. `ascan ps`), hand rizin just the
+    // When the open asked for native-arch-only (e.g. `ascan ps`), hand rizin just the
     // host-native slice of a fat binary instead of the whole universal file —
     // the other slices will never run here and full `aaa` on each is the bulk
     // of the per-binary cost. Falls back to the whole input for thin binaries
@@ -107,7 +108,7 @@ pub(super) fn extract(
                 symbols_out,
                 errors_out,
             );
-            if crate::rizin::native_arch_only() {
+            if rizin.native_arch_only {
                 native_rizin_range = native_slice_range(bytes, &arches);
             }
             (None, None)
@@ -127,6 +128,7 @@ pub(super) fn extract(
             symbols_out,
             metrics,
             has_go_pclntab,
+            rizin,
         );
     }
     super::upx::detect(bytes, values);
@@ -291,7 +293,7 @@ fn fat_binary(
         }
     }
     metrics.insert(metric!("macho.slice_count"), slices.len() as f64);
-    values.insert("macho.slices", JsonValue::Array(slices));
+    values.insert_key(value_key!("macho.slices"), JsonValue::Array(slices));
     image_end
 }
 
@@ -744,7 +746,7 @@ fn extract_header_and_loads(
 ) {
     put_str(
         values,
-        "macho.cpu_type",
+        value_key!("macho.cpu_type"),
         cpu_kind_string(macho.header.cputype(), macho.header.cpusubtype()),
     );
     // Raw CPU type / file type / flags. The string-decoded fields above
@@ -753,22 +755,22 @@ fn extract_header_and_loads(
     // these `_raw` siblings.
     put_u64(
         values,
-        "macho.cpu_type_raw",
+        value_key!("macho.cpu_type_raw"),
         u64::from(macho.header.cputype()),
     );
     put_u64(
         values,
-        "macho.cpu_subtype",
+        value_key!("macho.cpu_subtype"),
         u64::from(macho.header.cpusubtype()),
     );
     put_str(
         values,
-        "macho.file_type",
+        value_key!("macho.file_type"),
         file_type_string(macho.header.filetype),
     );
     put_u64(
         values,
-        "macho.file_type_raw",
+        value_key!("macho.file_type_raw"),
         u64::from(macho.header.filetype),
     );
     // Pike-style decomposed flag array — matches `pe.dll_characteristics[]`
@@ -776,8 +778,8 @@ fn extract_header_and_loads(
     // that traits would have to mask themselves.
     let mh_flags = mh_flag_names(macho.header.flags);
     if !mh_flags.is_empty() {
-        values.insert(
-            "macho.flags",
+        values.insert_key(
+            value_key!("macho.flags"),
             JsonValue::Array(
                 mh_flags
                     .into_iter()
@@ -787,23 +789,27 @@ fn extract_header_and_loads(
         );
     }
     // Raw flags bitfield (typed consumers need the unmasked u32).
-    put_u64(values, "macho.flags_raw", u64::from(macho.header.flags));
+    put_u64(
+        values,
+        value_key!("macho.flags_raw"),
+        u64::from(macho.header.flags),
+    );
     put_str(
         values,
-        "macho.endian",
+        value_key!("macho.endian"),
         if macho.little_endian { "little" } else { "big" },
     );
     // 32-bit vs 64-bit. Trait authors read `macho.class_bits == 64`;
     // typed consumers (`MachoMetrics::class_bits`) take the same u64.
     put_u64(
         values,
-        "macho.class_bits",
+        value_key!("macho.class_bits"),
         if macho.is_64 { 64 } else { 32 },
     );
     // Entry point address — Mach-O's `entry` (LC_MAIN.entryoff) or
     // legacy LC_UNIXTHREAD thread-state PC. `old_style_entry` is set
     // when the entry came from LC_UNIXTHREAD.
-    put_u64(values, "macho.entry", macho.entry);
+    put_u64(values, value_key!("macho.entry"), macho.entry);
     if macho.old_style_entry {
         metrics.insert(metric!("macho.old_style_entry"), 1.0);
     }
@@ -812,7 +818,7 @@ fn extract_header_and_loads(
     // metric; `macho.load_commands_size` is new.
     put_u64(
         values,
-        "macho.load_commands_size",
+        value_key!("macho.load_commands_size"),
         u64::from(macho.header.sizeofcmds),
     );
 
@@ -825,7 +831,7 @@ fn extract_header_and_loads(
     // LC_LOAD_DYLIB count surfaces under the cross-format
     // `dependencies.count` metric. No per-format alias.
     metrics.insert(metric!("dependencies.count"), libs.len() as f64);
-    values.insert("macho.libraries", JsonValue::Array(libs));
+    values.insert_key(value_key!("macho.libraries"), JsonValue::Array(libs));
 
     let rpaths: Vec<JsonValue> = macho
         .rpaths
@@ -833,7 +839,7 @@ fn extract_header_and_loads(
         .map(|s| JsonValue::String((*s).to_string()))
         .collect();
     if !rpaths.is_empty() {
-        values.insert("macho.rpaths", JsonValue::Array(rpaths));
+        values.insert_key(value_key!("macho.rpaths"), JsonValue::Array(rpaths));
     }
 
     // Load commands are the most useful structural fingerprint of a
@@ -844,7 +850,7 @@ fn extract_header_and_loads(
         .map(|lc| JsonValue::String(load_command_name(lc.command.cmd()).to_string()))
         .collect();
     metrics.insert(metric!("macho.load_command_count"), lcs.len() as f64);
-    values.insert("macho.load_commands", JsonValue::Array(lcs));
+    values.insert_key(value_key!("macho.load_commands"), JsonValue::Array(lcs));
 
     // Find the LC_CODE_SIGNATURE entry — its `dataoff`/`datasize`
     // point at the embedded code-signature blob inside the
@@ -861,11 +867,19 @@ fn extract_header_and_loads(
         // when the deeper signature parse fails. The blob *offset*
         // isn't useful to downstream consumers (they don't seek into
         // it) so we skip it.
-        put_u64(values, "macho.code_signature_size", u64::from(cs.datasize));
+        put_u64(
+            values,
+            value_key!("macho.code_signature_size"),
+            u64::from(cs.datasize),
+        );
         metrics.insert(metric!("macho.code_signature_size"), f64::from(cs.datasize));
         // The blob's file offset — consumers anchor the code-signature
         // finding's evidence here rather than at the header.
-        put_u64(values, "macho.code_signature_offset", u64::from(cs.dataoff));
+        put_u64(
+            values,
+            value_key!("macho.code_signature_offset"),
+            u64::from(cs.dataoff),
+        );
         super::macho_code_signature::parse(
             bytes,
             cs.dataoff as usize,
@@ -882,10 +896,14 @@ fn extract_header_and_loads(
         mach::load_command::CommandVariant::Uuid(c) => Some((c.uuid, lc.offset)),
         _ => None,
     }) {
-        put_str(values, "macho.uuid", format_macho_uuid(&uuid));
+        put_str(values, value_key!("macho.uuid"), format_macho_uuid(&uuid));
         // Anchor the value at the 16 UUID bytes (past the 8-byte cmd/cmdsize
         // header), so a `value` match on `macho.uuid` renders in the hex view.
-        put_u64(values, "macho.uuid_offset", (lc_offset + 8) as u64);
+        put_u64(
+            values,
+            value_key!("macho.uuid_offset"),
+            (lc_offset + 8) as u64,
+        );
     }
 
     // __TEXT,__info_plist — many Apple tools embed a CFBundle-style
@@ -1035,7 +1053,10 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
         exec_segment_count as f64,
     );
     if !wx_segments.is_empty() {
-        values.insert("macho.wx_segments", JsonValue::Array(wx_segments));
+        values.insert_key(
+            value_key!("macho.wx_segments"),
+            JsonValue::Array(wx_segments),
+        );
     }
     if let Some(name) = entry_section {
         // Entry belongs in __text; an entry resolving into a section
@@ -1043,7 +1064,7 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
         if !crate::is_well_known_section_name(&name) {
             metrics.insert(metric!("macho.entry_in_nonstandard_section"), 1.0);
         }
-        put_str(values, "macho.entry_section", &name);
+        put_str(values, value_key!("macho.entry_section"), &name);
     }
     if text_writable {
         metrics.insert(metric!("macho.text_segment_writable"), 1.0);
@@ -1061,7 +1082,7 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
         metrics.insert(metric!("macho.has_data_const_segment"), 1.0);
     }
     if !segments_out.is_empty() {
-        values.insert("macho.segments", JsonValue::Array(segments_out));
+        values.insert_key(value_key!("macho.segments"), JsonValue::Array(segments_out));
     }
 }
 
@@ -1202,7 +1223,7 @@ fn function_starts(macho: &MachO<'_>, bytes: &[u8], values: &mut Values, metrics
         count += 1;
     }
     metrics.insert(metric!("macho.function_starts_count"), count as f64);
-    put_u64(values, "macho.function_starts_count", count);
+    put_u64(values, value_key!("macho.function_starts_count"), count);
 }
 
 /// `LC_DATA_IN_CODE` — table of (offset, length, kind) triples
@@ -1245,7 +1266,10 @@ fn data_in_code_kinds(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
         }
     }
     if !kinds.is_empty() {
-        values.insert("macho.data_in_code_kinds", JsonValue::Object(kinds));
+        values.insert_key(
+            value_key!("macho.data_in_code_kinds"),
+            JsonValue::Object(kinds),
+        );
     }
 }
 
@@ -1304,7 +1328,7 @@ fn linker_options(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
         }
     }
     if !all.is_empty() {
-        values.insert("macho.linker_options", JsonValue::Array(all));
+        values.insert_key(value_key!("macho.linker_options"), JsonValue::Array(all));
     }
 }
 
@@ -1366,7 +1390,7 @@ fn objc_image_info(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
                     JsonValue::Bool(true),
                 );
             }
-            values.insert("macho.objc", JsonValue::Object(obj));
+            values.insert_key(value_key!("macho.objc"), JsonValue::Object(obj));
             return;
         }
     }
@@ -1410,8 +1434,8 @@ fn swift_sections(macho: &MachO<'_>, values: &mut Values) {
         }
     }
     if !out.is_empty() {
-        values.insert(
-            "macho.swift_sections",
+        values.insert_key(
+            value_key!("macho.swift_sections"),
             JsonValue::Array(out.into_iter().map(JsonValue::String).collect()),
         );
     }
@@ -1483,7 +1507,7 @@ fn load_dylibs(macho: &MachO<'_>, values: &mut Values) {
         entries.push(JsonValue::Object(entry));
     }
     if !entries.is_empty() {
-        values.insert("macho.load_dylibs", JsonValue::Array(entries));
+        values.insert_key(value_key!("macho.load_dylibs"), JsonValue::Array(entries));
     }
 }
 
@@ -1622,7 +1646,11 @@ fn install_name(macho: &MachO<'_>, values: &mut Values) {
     if let Some(name) = macho.libs.first().copied() {
         if !name.is_empty() && name != "self" {
             put_str(values, value_key!("macho.install_name"), name);
-            put_str(values, "macho.install_name_kind", install_name_kind(name));
+            put_str(
+                values,
+                value_key!("macho.install_name_kind"),
+                install_name_kind(name),
+            );
         }
     }
 }
@@ -1673,7 +1701,7 @@ fn load_dylinker(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
     let name = tail.split(|&b| b == 0).next().unwrap_or(tail);
     if let Ok(s) = std::str::from_utf8(name) {
         if !s.is_empty() {
-            put_str(values, "macho.dyld_path", s);
+            put_str(values, value_key!("macho.dyld_path"), s);
         }
     }
 }
@@ -2098,7 +2126,7 @@ mod tests {
         .expect("fixture present");
         let bytes = zstd::decode_all(compressed.as_slice()).expect("fixture decompresses");
 
-        let parsed = crate::open(&bytes).expect("fixture parses");
+        let parsed = crate::open(&bytes);
         let imports: Vec<&str> = parsed
             .symbols()
             .iter_kind(crate::SymbolKind::Import)
@@ -2180,6 +2208,7 @@ mod tests {
             &mut symbols,
             &mut errors,
             &mut None,
+            &crate::rizin::Settings::default(),
         );
     }
 
@@ -2231,6 +2260,7 @@ mod tests {
             &mut symbols,
             &mut errors,
             &mut None,
+            &crate::rizin::Settings::default(),
         );
         (v, s, m, symbols)
     }
@@ -2439,6 +2469,7 @@ mod tests {
             &mut symbols,
             &mut errors,
             &mut None,
+            &crate::rizin::Settings::default(),
         )
         .unwrap();
         // The trivial test.macho fixture might have no exports but
@@ -2498,7 +2529,7 @@ mod tests {
     fn bind_imports_are_not_duplicated_by_the_symtab_fallback() {
         use std::collections::HashMap;
         let bytes = read_fixture("test.macho");
-        let parsed = crate::open(&bytes).unwrap();
+        let parsed = crate::open(&bytes);
         let mut counts: HashMap<&str, usize> = HashMap::new();
         let mut total = 0usize;
         for sym in parsed.symbols().iter_kind(crate::SymbolKind::Import) {

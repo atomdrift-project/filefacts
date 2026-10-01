@@ -3,7 +3,7 @@
 use crate::metric;
 use serde_json::Value as JsonValue;
 
-use crate::output::{Section, Strings, Text, Values};
+use crate::output::{Section, Strings, Text, ValueKey, Values};
 use crate::scan::{ascii, entropy};
 
 /// Whether stng's XOR seed search runs for a member.
@@ -177,12 +177,10 @@ pub(super) fn extract_text_strings(bytes: &[u8], strings: &mut Strings, xor: Xor
     push_stng_strings(stng::extract_strings_with_options(bytes, &opts), strings);
 }
 
-/// Convenience wrapper for emitting a string-typed value into `values`.
-///
-/// `path` is a plain string or a checked [`ValueKey`](crate::ValueKey) from
-/// `value_key!`, which the catalog test counts as a writer of that key.
-pub(super) fn put_str(values: &mut Values, path: impl AsRef<str>, s: impl Into<String>) {
-    values.insert(path.as_ref(), JsonValue::String(s.into()));
+/// Convenience wrapper for emitting a string-typed value into `values` at a
+/// checked key from `value_key!`.
+pub(super) fn put_str(values: &mut Values, key: ValueKey, s: impl Into<String>) {
+    values.insert_key(key, JsonValue::String(s.into()));
 }
 
 /// The path of a compound-file entry, always `/`-separated.
@@ -226,16 +224,15 @@ pub(crate) fn stem(name: &str) -> String {
     format!("{}{}", &name[..body_start], &body[..stem_end])
 }
 
-/// Convenience wrapper for emitting an integer-typed value. `path` is as for
-/// [`put_str`].
-pub(super) fn put_u64(values: &mut Values, path: impl AsRef<str>, n: u64) {
-    values.insert(path.as_ref(), JsonValue::Number(n.into()));
+/// Convenience wrapper for emitting an integer-typed value at a checked key.
+pub(super) fn put_u64(values: &mut Values, key: ValueKey, n: u64) {
+    values.insert_key(key, JsonValue::Number(n.into()));
 }
 
-/// Convenience wrapper for emitting a signed-integer value (for fields
-/// that are conventionally signed, e.g. Unix timestamps).
-pub(super) fn put_i64(values: &mut Values, path: &str, n: i64) {
-    values.insert(path, JsonValue::Number(n.into()));
+/// Convenience wrapper for emitting a signed-integer value at a checked key
+/// (for fields that are conventionally signed, e.g. Unix timestamps).
+pub(super) fn put_i64(values: &mut Values, key: ValueKey, n: i64) {
+    values.insert_key(key, JsonValue::Number(n.into()));
 }
 
 // Bool emissions intentionally absent: a "true/false" kv pair where
@@ -407,8 +404,9 @@ pub(super) fn rizin_decision(
 }
 
 /// Run full Rizin recovery only when the static facts say it is likely to add
-/// useful function metrics. Shared by ELF and Mach-O; PE uses the extended
-/// helper below so malformed images can recover sections too.
+/// useful function metrics and this open's `settings` admit `bytes`. Shared by
+/// ELF and Mach-O; PE uses the extended helper below so malformed images can
+/// recover sections too.
 pub(super) fn rizin_fallback(
     format: NativeFormat,
     bytes: &[u8],
@@ -417,6 +415,7 @@ pub(super) fn rizin_fallback(
     symbols: &mut crate::Symbols,
     metrics: &mut crate::output::Metrics,
     go_function_metadata: bool,
+    settings: &crate::rizin::Settings,
 ) {
     let decision = rizin_decision(
         format,
@@ -434,10 +433,10 @@ pub(super) fn rizin_fallback(
         reason = decision.reason(),
         "rizin admission decision"
     );
-    if !decision.runs() {
+    if !decision.runs() || !settings.admits(bytes) {
         return;
     }
-    match crate::rizin::recover_with_symbols(bytes, symbols.len(), go_function_metadata) {
+    match crate::rizin::recover_with_symbols(bytes, symbols.len(), go_function_metadata, settings) {
         Some(recovery) => {
             recovery.apply(symbols, metrics);
         }
@@ -446,16 +445,18 @@ pub(super) fn rizin_fallback(
 }
 
 /// Record that rizin *should* have recovered symbols here but its run
-/// didn't complete. Fires only when rizin is on PATH — i.e. the cache
-/// key (via [`crate::rizin::cache_fingerprint`]) claims rizin-grade
-/// recovery, yet this run produced nothing because rizin timed out, was
-/// killed on the output cap, was muted, or was skipped by the size gate.
-/// The empty table is an artefact of this run, not of the bytes, so the
-/// `binary.rizin_incomplete` marker lets a cache consumer treat the
+/// didn't complete. Fires only when rizin is on PATH and the settings
+/// admitted the input — i.e. the cache key (via
+/// [`crate::rizin::cache_fingerprint`]) claims rizin-grade recovery, yet
+/// this run produced nothing because rizin timed out, was killed on the
+/// output cap, or had latched itself off. The empty table is an artefact
+/// of this run, not of the bytes, so the `binary.rizin_incomplete` marker
+/// lets a cache consumer treat the
 /// payload as [`crate::cache::Computed::Transient`] and refuse to persist
 /// a poisoned entry (see [`crate::ParsedFile::rizin_recovery_incomplete`]).
-/// When rizin is absent the no-rizin result is correct for the
-/// environment — and keyed as such — so nothing is recorded.
+/// When rizin is absent, turned off, or skipped by the size cap, the
+/// no-rizin result is correct for the environment and settings — and keyed
+/// as such — so nothing is recorded.
 fn note_incomplete_recovery(metrics: &mut crate::output::Metrics) {
     if crate::rizin::available() {
         metrics.insert(metric!("binary.rizin_incomplete"), 1.0);
@@ -463,12 +464,12 @@ fn note_incomplete_recovery(metrics: &mut crate::output::Metrics) {
 }
 
 /// Extended rizin fallback for PE: tries to recover sections as well
-/// as symbols, and emits `*.recovered_*` metrics under the supplied
+/// as symbols, and emits `*.recovered_*_count` metrics under the supplied
 /// prefix so callers can attribute the recovered counts in trait
 /// rules.
 ///
 /// The caller passes the metric prefix (`"pe"`, `"elf"`, `"macho"`)
-/// so the emitted keys are `{prefix}.recovered_sections` etc. The
+/// so the emitted keys are `{prefix}.recovered_section_count` etc. The
 /// path stays tool-agnostic — if the disassembler ever swaps from
 /// rizin to radare2 / Ghidra the schema doesn't ripple.
 pub(super) fn rizin_fallback_with_sections(
@@ -479,6 +480,7 @@ pub(super) fn rizin_fallback_with_sections(
     metrics: &mut crate::output::Metrics,
     go_function_metadata: bool,
     declares_exports: bool,
+    settings: &crate::rizin::Settings,
 ) {
     // Normally goblin's native symbols or sections are enough to avoid an
     // expensive disassembly. Go is the exception: its native parser can
@@ -508,17 +510,21 @@ pub(super) fn rizin_fallback_with_sections(
         reason = decision.reason(),
         "rizin admission decision"
     );
-    if !decision.runs() {
+    if !decision.runs() || !settings.admits(bytes) {
         return;
     }
-    let recovery =
-        match crate::rizin::recover_with_symbols(bytes, symbols.len(), go_function_metadata) {
-            Some(recovery) => recovery,
-            None => {
-                note_incomplete_recovery(metrics);
-                return;
-            }
-        };
+    let recovery = match crate::rizin::recover_with_symbols(
+        bytes,
+        symbols.len(),
+        go_function_metadata,
+        settings,
+    ) {
+        Some(recovery) => recovery,
+        None => {
+            note_incomplete_recovery(metrics);
+            return;
+        }
+    };
     let recovery = if declares_exports {
         recovery
     } else {
@@ -526,19 +532,28 @@ pub(super) fn rizin_fallback_with_sections(
     };
     let counts = recovery.apply_with_sections(symbols, sections, metrics);
     if counts.imports > 0 {
-        metrics.insert(metric!("pe.recovered_imports"), f64::from(counts.imports));
+        metrics.insert(
+            metric!("pe.recovered_import_count"),
+            f64::from(counts.imports),
+        );
     }
     if counts.exports > 0 {
-        metrics.insert(metric!("pe.recovered_exports"), f64::from(counts.exports));
+        metrics.insert(
+            metric!("pe.recovered_export_count"),
+            f64::from(counts.exports),
+        );
     }
     if counts.functions > 0 {
         metrics.insert(
-            metric!("pe.recovered_functions"),
+            metric!("pe.recovered_function_count"),
             f64::from(counts.functions),
         );
     }
     if counts.sections > 0 {
-        metrics.insert(metric!("pe.recovered_sections"), f64::from(counts.sections));
+        metrics.insert(
+            metric!("pe.recovered_section_count"),
+            f64::from(counts.sections),
+        );
     }
 }
 
@@ -1032,8 +1047,9 @@ mod tests {
     #[test]
     fn malformed_utf16_bom_batch_reaches_the_public_text_view() {
         let bytes = b"\xff\xfe@echo off\r\npowershell -command Invoke-WebRequest\r\n\0";
-        let parsed = crate::open_with_path(std::path::Path::new("dropper.bat"), bytes)
-            .expect("batch fixture opens");
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new("dropper.bat"))
+            .open(bytes);
 
         assert!(
             parsed

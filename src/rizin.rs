@@ -12,6 +12,15 @@
 //! neither is installed, every call here returns `None` and extraction
 //! proceeds without rizin's contributions.
 //!
+//! # Configuration
+//!
+//! Per file, through [`crate::OpenOptions`]: on/off, the wall-clock budget,
+//! a size cap and native-arch slicing travel with each
+//! [`crate::ParsedFile`]. What stays process-wide here is what has to: the
+//! live process-group registry [`kill_all_rizin_groups`](crate::rizin::kill_all_rizin_groups)
+//! reaps from a signal handler, the [`stats`](crate::rizin::stats) counters, the binary discovery, and the latch that
+//! turns rizin off for good after too many abandoned output readers.
+//!
 //! # Subprocess discipline
 //!
 //! The minimum viable port covers the happy path: spawn, wait for
@@ -21,10 +30,9 @@
 //! `radare2/mod.rs` and ports across as #75c.
 
 use crate::metric;
-use std::cell::Cell;
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -173,6 +181,66 @@ fn is_pe_x86(bytes: &[u8]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Per-open settings.
+// ---------------------------------------------------------------------------
+
+/// The rizin settings of one [`crate::ParsedFile`], set through
+/// [`crate::OpenOptions`] and carried to every recovery it runs. Nothing here
+/// is process-wide, so two files opened with different settings never see
+/// each other's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Settings {
+    /// Run rizin at all (when it is installed).
+    pub(crate) enabled: bool,
+    /// Wall-clock budget for one rizin run.
+    pub(crate) timeout: Duration,
+    /// Skip rizin for inputs larger than this many bytes. `None` = no cap.
+    /// A full `aaa` on a 100 MB+ stripped binary costs minutes; a cap keeps a
+    /// directory of giant signed apps from dominating a latency-sensitive
+    /// scan.
+    pub(crate) max_bytes: Option<usize>,
+    /// Slice a fat Mach-O to the host-native architecture before rizin runs,
+    /// instead of handing rizin the whole universal binary. Halves the work on
+    /// a two-arch binary and skips a slice that never executes on this host.
+    pub(crate) native_arch_only: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout: RIZIN_TIMEOUT,
+            max_bytes: None,
+            native_arch_only: false,
+        }
+    }
+}
+
+impl Settings {
+    /// Whether these settings let rizin analyse `bytes` at all: it is enabled
+    /// and `bytes` is within the size cap. A refusal here is a property of the
+    /// settings, which [`cache_fingerprint`] keys, so the result it leaves
+    /// behind is as cacheable as a full recovery. Rizin being installed is
+    /// checked separately, by the recovery itself.
+    pub(crate) fn admits(&self, bytes: &[u8]) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        match self.max_bytes {
+            Some(max) if bytes.len() > max => {
+                tracing::debug!(
+                    bytes = bytes.len(),
+                    max,
+                    "rizin recover: skipped (over size cap)"
+                );
+                false
+            }
+            _ => true,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Process-wide hardening state.
 // ---------------------------------------------------------------------------
 
@@ -182,18 +250,15 @@ fn is_pe_x86(bytes: &[u8]) -> bool {
 /// subprocesses before a forced `process::exit`.
 static RIZIN_PGIDS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
-/// Counter — positive value means rizin invocation is disabled. Built
-/// as a counter (not a `bool`) so `scoped_disable` can RAII-stack
-/// without clobbering an outer `disable()` call.
-static RIZIN_DISABLED: AtomicUsize = AtomicUsize::new(0);
-
-/// Per-run rizin wall-clock budget, in seconds. `0` selects the [`RIZIN_TIMEOUT`]
-/// default. Lowered by latency-sensitive callers (e.g. `ascan ps`, which scans
-/// live process binaries where a multi-minute disassembly is never worth it).
-static RIZIN_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(0);
 /// Drain threads abandoned after [`DRAIN_GRACE`] (see `join_drain`). Non-zero
 /// means some process outside our reach held a copy of a rizin stdout pipe.
 static RIZIN_DRAINS_ABANDONED: AtomicU64 = AtomicU64::new(0);
+
+/// Latched by `join_drain` once [`RIZIN_MAX_ABANDONED_DRAINS`] readers have
+/// been abandoned: rizin then stays off for the rest of the process, whatever
+/// a file's [`Settings`] ask for. Process-wide because the leak it stops is:
+/// every abandoned reader is a parked thread of this process. Never cleared.
+static RIZIN_SELF_DISABLED: AtomicBool = AtomicBool::new(false);
 
 /// Abandoned drains after which rizin disables itself for the rest of the
 /// process. Each abandoned reader is an OS thread parked in `read_to_end`
@@ -202,18 +267,6 @@ static RIZIN_DRAINS_ABANDONED: AtomicU64 = AtomicU64::new(0);
 /// on a days-old worker is a leak with no bound but uptime, and a host whose
 /// rizin children keep escaping containment is not going to start behaving.
 const RIZIN_MAX_ABANDONED_DRAINS: u64 = 8;
-
-/// Skip rizin entirely for inputs larger than this many bytes. `0` disables the
-/// gate. Full `aaa` on a 100 MB+ stripped binary costs minutes; a size cap keeps
-/// a directory of giant signed apps from dominating a scan.
-static RIZIN_MAX_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-/// When set, fat Mach-O inputs are sliced to the host-native architecture before
-/// rizin runs, instead of handing rizin the whole universal binary. Cuts the
-/// work on multi-arch binaries roughly in half and avoids analysing a slice that
-/// will never execute on this host. Off by default (full-fidelity filesystem
-/// scans still cover every slice).
-static RIZIN_NATIVE_ARCH_ONLY: AtomicBool = AtomicBool::new(false);
 
 /// Poll interval while waiting for a rizin child to exit.
 ///
@@ -228,35 +281,6 @@ static RIZIN_NATIVE_ARCH_ONLY: AtomicBool = AtomicBool::new(false);
 /// (2026-09-05). Parking one worker for the length of a disassembly is the
 /// price of a wait loop that cannot be suspended.
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Set the per-run rizin timeout (seconds). `0` restores the default.
-pub fn set_timeout_secs(secs: u64) {
-    RIZIN_TIMEOUT_SECS.store(secs, Ordering::Relaxed);
-}
-
-/// Resolved rizin timeout: the override when set, else [`RIZIN_TIMEOUT`].
-fn rizin_timeout() -> Duration {
-    match RIZIN_TIMEOUT_SECS.load(Ordering::Relaxed) {
-        0 => RIZIN_TIMEOUT,
-        secs => Duration::from_secs(secs),
-    }
-}
-
-/// Skip rizin for inputs larger than `max_bytes`. `0` disables the gate.
-pub fn set_max_bytes(max_bytes: usize) {
-    RIZIN_MAX_BYTES.store(max_bytes, Ordering::Relaxed);
-}
-
-/// Slice fat Mach-O inputs to the host-native arch before running rizin.
-pub fn set_native_arch_only(enabled: bool) {
-    RIZIN_NATIVE_ARCH_ONLY.store(enabled, Ordering::Relaxed);
-}
-
-/// Whether fat Mach-O inputs should be sliced to the native arch before rizin.
-#[must_use]
-pub fn native_arch_only() -> bool {
-    RIZIN_NATIVE_ARCH_ONLY.load(Ordering::Relaxed)
-}
 
 /// Statistics (total, successes, timeouts, failures, memory_exceeded).
 static RIZIN_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -306,86 +330,6 @@ pub fn kill_all_rizin_groups() {
             }
         }
     }
-}
-
-/// Disable rizin globally for the rest of the process. There is no
-/// inverse: this is also the latch `join_drain` throws after too many
-/// abandoned readers, which must not be undone. For a reversible mute,
-/// use [`scoped_disable`].
-pub fn disable() {
-    RIZIN_DISABLED.fetch_add(1, Ordering::SeqCst);
-}
-
-/// RAII guard returned by [`scoped_disable`]. Re-enables rizin on
-/// drop. Multiple guards stack: rizin stays disabled until every
-/// guard is dropped.
-#[must_use = "dropping the guard immediately re-enables rizin; bind it to a \
-              variable that lives at least as long as the scope you intended to mute"]
-pub struct ScopedDisable {
-    _private: (),
-}
-
-impl Drop for ScopedDisable {
-    fn drop(&mut self) {
-        RIZIN_DISABLED.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-/// Disable rizin for the lifetime of the returned guard.
-///
-/// Process-global: every thread sees the mute. That is what a
-/// whole-scan policy (`--no-radare2`) wants, since the scan fans out
-/// across a thread pool. It is the WRONG tool for a per-file decision —
-/// see [`scoped_disable_current_thread`].
-pub fn scoped_disable() -> ScopedDisable {
-    RIZIN_DISABLED.fetch_add(1, Ordering::SeqCst);
-    ScopedDisable { _private: () }
-}
-
-thread_local! {
-    /// Per-thread mute depth; see [`scoped_disable_current_thread`].
-    static RIZIN_DISABLED_THREAD: Cell<usize> = const { Cell::new(0) };
-}
-
-/// RAII guard returned by [`scoped_disable_current_thread`]. Restores the
-/// calling thread's previous state on drop; guards stack.
-#[must_use = "dropping the guard immediately re-enables rizin; bind it to a \
-              variable that lives at least as long as the scope you intended to mute"]
-pub struct ScopedDisableThread {
-    _private: (),
-}
-
-impl Drop for ScopedDisableThread {
-    fn drop(&mut self) {
-        RIZIN_DISABLED_THREAD.with(|c| c.set(c.get().saturating_sub(1)));
-    }
-}
-
-/// Disable rizin **on the calling thread only**, for the guard's lifetime.
-///
-/// Use this to express a per-file policy ("this member is not a native
-/// binary, don't disassemble it"). [`scoped_disable`] cannot express that:
-/// it mutes the whole process, so while one thread skips disassembly for
-/// its own file, every binary being analyzed concurrently on other threads
-/// silently loses its symbols and metrics too — the traits derived from
-/// them vanish and the verdict shifts, non-deterministically with thread
-/// timing. Analyzers fan members out across rayon, so that is not
-/// hypothetical.
-///
-/// Sound because `recover_with_symbols` consults [`is_disabled`] synchronously on the
-/// thread that requested the parse: filefacts spawns no worker threads
-/// between the two (the only spawns are rizin's own stdout drain, after the
-/// check, and the unrelated cache sweep).
-pub fn scoped_disable_current_thread() -> ScopedDisableThread {
-    RIZIN_DISABLED_THREAD.with(|c| c.set(c.get() + 1));
-    ScopedDisableThread { _private: () }
-}
-
-/// `true` when rizin is muted for the calling thread — by the global
-/// [`disable`] / [`scoped_disable`], or by this thread's own
-/// [`scoped_disable_current_thread`].
-pub fn is_disabled() -> bool {
-    RIZIN_DISABLED.load(Ordering::SeqCst) > 0 || RIZIN_DISABLED_THREAD.with(Cell::get) > 0
 }
 
 /// Cumulative rizin subprocess counters as
@@ -480,26 +424,30 @@ fn rizin_version() -> Option<&'static str> {
         .as_deref()
 }
 
-/// Cache discriminator capturing the rizin configuration that changes
-/// the *correct* recovery for a given input and is stable across runs.
+/// Cache discriminator for the rizin side of an extraction: everything about
+/// rizin that changes a *persisted* result.
 ///
-/// Folded into the disk-cache key by [`crate::cache::cache_key`] so a
-/// payload recovered under one rizin setup is never served to a run with
-/// a different one. It captures:
+/// Folded into the disk-cache key (see [`crate::cache::cache_key`]) so a
+/// payload recovered under one rizin setup is never served to an open with a
+/// different one. It captures:
 ///
-/// * whether rizin is on PATH and its version — an upgraded rizin that
-///   discovers more functions must not reuse an older run's recovery;
+/// * whether rizin runs at all — not installed, or turned off by the
+///   settings, both give the same no-rizin result and share `rizin=none`;
+/// * its version — an upgraded rizin that discovers more functions must not
+///   reuse an older run's recovery;
 /// * native-arch slicing — a fat Mach-O analysed as a single host slice
-///   yields different symbols than the whole universal binary, so the
-///   host arch is mixed in while that mode is active.
+///   yields different symbols than the whole universal binary, so the host
+///   arch is mixed in while that mode is active;
+/// * the size cap — an input over it deterministically gets no recovery.
 ///
-/// Transient conditions (disabled, timeout, output cap, size gate) are
-/// deliberately *excluded*: those make a run's payload
-/// [`crate::cache::Computed::Transient`] instead of minting a distinct,
-/// persisted key.
-#[must_use]
-pub fn cache_fingerprint() -> String {
-    if !available() {
+/// The timeout is deliberately *excluded*. A run that completes is the same
+/// whatever its budget, and one that times out (like an output-cap kill or
+/// the abandoned-drain latch) marks its payload
+/// [`crate::cache::Computed::Transient`], which is never written. Keying on
+/// it would only split identical entries between hosts with different
+/// deadlines.
+pub(crate) fn cache_fingerprint(settings: &Settings) -> String {
+    if !settings.enabled || !available() {
         return "rizin=none".to_string();
     }
     let version = rizin_version().unwrap_or("unknown");
@@ -507,37 +455,31 @@ pub fn cache_fingerprint() -> String {
     // `aa; aac`, everything else from `aa; aac; aap` with an `aaa` rerun under
     // the coverage floor (see `analysis_script`); cached extractions from an
     // earlier policy must not mix.
-    if native_arch_only() {
-        format!(
-            "rizin={version}|policy=opaque-v6|native={}",
-            std::env::consts::ARCH
-        )
-    } else {
-        format!("rizin={version}|policy=opaque-v6")
+    let mut fingerprint = format!("rizin={version}|policy=opaque-v6");
+    if settings.native_arch_only {
+        fingerprint.push_str("|native=");
+        fingerprint.push_str(std::env::consts::ARCH);
     }
+    if let Some(max) = settings.max_bytes {
+        fingerprint.push_str(&format!("|max_bytes={max}"));
+    }
+    fingerprint
 }
 
 /// Run rizin recovery sized to the caller's static symbol inventory, which picks
 /// the analysis depth (see [`analysis_script`]).
+///
+/// The caller gates on [`Settings::admits`] first: a refusal there is a stable
+/// outcome of the settings, while `None` from here means a run that should
+/// have happened did not complete (rizin missing, timed out, killed on the
+/// output cap, or latched off after too many abandoned drains).
 pub(crate) fn recover_with_symbols(
     bytes: &[u8],
     symbol_count: usize,
     go_function_metadata: bool,
+    settings: &Settings,
 ) -> Option<RizinRecovery> {
-    if is_disabled() {
-        return None;
-    }
-    // Size gate: skip rizin for inputs above the configured cap. A 100 MB+
-    // stripped binary costs minutes of `aaa`; latency-sensitive callers set a
-    // cap so one giant doesn't dominate the scan. Counts as a skip, not a
-    // failure — goblin's typed views still stand in.
-    let max = RIZIN_MAX_BYTES.load(Ordering::Relaxed);
-    if max > 0 && bytes.len() > max {
-        tracing::debug!(
-            bytes = bytes.len(),
-            max,
-            "rizin recover: skipped (over size cap)"
-        );
+    if RIZIN_SELF_DISABLED.load(Ordering::Acquire) {
         return None;
     }
     let bin = rizin_binary()?;
@@ -546,13 +488,15 @@ pub(crate) fn recover_with_symbols(
     // binary several times (a vsix shipping per-language duplicates of every
     // Roslyn DLL, vendored copies of one .so) and each copy previously paid a
     // full `aaa` run — two identical 6.9 MB ELFs were 65 s each on one C#
-    // vsix. The recovery is a pure function of the bytes (same rizin build,
-    // same flags for the whole process), so replaying the parsed tables is
-    // exactly the work the second spawn would redo. This is not the
-    // persistent analysis cache (which CLEAVE_SKIP_CACHE governs): it lives
-    // and dies with the process. Failures are memoized too — a timeout on
-    // these bytes would time out again. Bounded by entry count; on overflow
-    // the map resets (duplicates cluster in time, so recency is all we need).
+    // vsix. The recovery is a pure function of the bytes and the script, so
+    // replaying the parsed tables is exactly the work the second spawn would
+    // redo. This is not the persistent analysis cache (which CLEAVE_SKIP_CACHE
+    // governs): it lives and dies with the process. Failures are memoized
+    // too — a timeout on these bytes would time out again under the same
+    // budget, which is why the budget is part of the key: a file opened with
+    // a longer timeout must get its own attempt. Bounded by entry count; on
+    // overflow the map resets (duplicates cluster in time, so recency is all
+    // we need).
     const RIZIN_MEMO_MAX: usize = 512;
     static MEMO: std::sync::Mutex<
         Option<std::collections::HashMap<[u8; 32], Option<RizinRecovery>>>,
@@ -564,6 +508,7 @@ pub(crate) fn recover_with_symbols(
         // The Go path selects a different Rizin script, so it must not share
         // an in-process recovery memo entry with the generic PE path.
         hasher.update([go_function_metadata as u8]);
+        hasher.update(settings.timeout.as_nanos().to_le_bytes());
         hasher.finalize().into()
     };
     if let Ok(guard) = MEMO.lock()
@@ -573,7 +518,13 @@ pub(crate) fn recover_with_symbols(
         tracing::debug!(bytes = bytes.len(), "rizin recover: in-run memo hit");
         return hit.clone();
     }
-    let result = recover_with_bin(bin, bytes, symbol_count, go_function_metadata);
+    let result = recover_with_bin(
+        bin,
+        bytes,
+        symbol_count,
+        go_function_metadata,
+        settings.timeout,
+    );
     if let Ok(mut guard) = MEMO.lock() {
         let map = guard.get_or_insert_with(std::collections::HashMap::default);
         if map.len() >= RIZIN_MEMO_MAX {
@@ -590,7 +541,7 @@ pub(crate) fn recover_with_symbols(
 /// deterministically without a real rizin install.
 #[cfg(test)]
 fn recover_with_bin_for_test(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> {
-    recover_with_bin(bin, bytes, 0, false)
+    recover_with_bin(bin, bytes, 0, false, RIZIN_TIMEOUT)
 }
 
 fn recover_with_bin(
@@ -598,9 +549,10 @@ fn recover_with_bin(
     bytes: &[u8],
     symbol_count: usize,
     go_function_metadata: bool,
+    timeout: Duration,
 ) -> Option<RizinRecovery> {
     let (script, label) = analysis_script(bytes, symbol_count, go_function_metadata);
-    recover_with_script(bin, bytes, script, label)
+    recover_with_script(bin, bytes, script, label, timeout)
 }
 
 fn recover_with_script(
@@ -608,12 +560,11 @@ fn recover_with_script(
     bytes: &[u8],
     script: &'static str,
     script_label: &'static str,
+    timeout: Duration,
 ) -> Option<RizinRecovery> {
-    // The disable check intentionally lives only in the public
-    // `recover()` entry, not here — tests inject a shim via
-    // `recover_with_bin_for_test` and need a deterministic spawn
-    // path that isn't affected by other tests' `scoped_disable`
-    // guards running in parallel.
+    // The self-disable latch is checked only in `recover_with_symbols`, not
+    // here — tests inject a shim via `recover_with_bin_for_test` and need a
+    // deterministic spawn path.
     RIZIN_TOTAL.fetch_add(1, Ordering::Relaxed);
 
     // Materialise the bytes as a temp file. Rizin requires a path —
@@ -746,7 +697,6 @@ fn recover_with_script(
     // avoids overflowing `Instant` if a caller supplies an intentionally
     // enormous timeout override. Once the child exits, the reader thread's
     // `read_to_end` returns naturally.
-    let timeout = rizin_timeout();
     let mut exit_status = None;
     while started.elapsed() < timeout {
         match child.try_wait() {
@@ -1078,7 +1028,7 @@ fn join_drain(rx: &std::sync::mpsc::Receiver<Vec<u8>>, child_id: u32) -> Vec<u8>
                  inherited the pipe). Recovery facts for this binary are lost."
             );
             if abandoned == RIZIN_MAX_ABANDONED_DRAINS {
-                disable();
+                RIZIN_SELF_DISABLED.store(true, Ordering::Release);
                 tracing::error!(
                     abandoned,
                     limit = RIZIN_MAX_ABANDONED_DRAINS,
@@ -1157,7 +1107,7 @@ pub(crate) struct RizinRecovery {
 
 /// Counts of entries rizin contributed to each typed view through
 /// [`RizinRecovery::apply`]. Returned so format extractors can emit
-/// the `*.recovered_*` metrics that signal "this view was filled in
+/// the `*.recovered_*_count` metrics that signal "this view was filled in
 /// by the disassembly-side fallback, not the format-native parser"
 /// — same pattern cleave used historically. The metric path is tool-
 /// agnostic because swapping rizin for radare2/Ghidra shouldn't ripple
@@ -1331,7 +1281,7 @@ impl RizinRecovery {
                     metric!("binary.avg_basic_blocks"),
                     sum as f64 / bb_values.len() as f64,
                 );
-                metrics.insert(metric!("binary.basic_blocks"), sum as f64);
+                metrics.insert(metric!("binary.basic_block_count"), sum as f64);
             }
 
             // Function-shape bucket counts. Detection traits target the
@@ -1357,9 +1307,9 @@ impl RizinRecovery {
                 .iter()
                 .filter(|f| f.callrefs.is_empty() && f.nbbs.is_some())
                 .count();
-            metrics.insert(metric!("binary.huge_func_count"), huge as f64);
-            metrics.insert(metric!("binary.tiny_func_count"), tiny as f64);
-            metrics.insert(metric!("binary.leaf_func_count"), leaf as f64);
+            metrics.insert(metric!("binary.huge_function_count"), huge as f64);
+            metrics.insert(metric!("binary.tiny_function_count"), tiny as f64);
+            metrics.insert(metric!("binary.leaf_function_count"), leaf as f64);
         }
         // `aflj.callrefs` carries concrete binary call sites even when the
         // target has no source-level symbol. Preserve direct CALL edges in
@@ -1532,17 +1482,12 @@ mod tests {
     use super::*;
     use crate::output::Metrics;
 
-    /// Tests that touch process-global rizin state must hold this mutex
-    /// for the duration of their run. Two registries are at stake:
-    ///
-    /// * `RIZIN_PGIDS` — without the lock the reaper test SIGKILLs shims
-    ///   registered by other in-flight tests, producing intermittent
-    ///   "shim recovery missing" failures.
-    /// * `RIZIN_DISABLED` — `is_disabled()` ORs in this global counter, so
-    ///   one test's `scoped_disable()` guard is visible to every other
-    ///   test, on every thread. Without the lock a sibling's guard makes
-    ///   the thread-local-mute test observe a muted worker thread, and
-    ///   makes the counter-delta assertions read a moving baseline.
+    /// Tests that spawn rizin (or a shim) or reap process groups must hold
+    /// this mutex for the duration of their run: `RIZIN_PGIDS` is
+    /// process-wide, and without the lock the reaper test SIGKILLs shims
+    /// registered by other in-flight tests, producing intermittent "shim
+    /// recovery missing" failures. Settings are per call, so no test can
+    /// mute or re-time another.
     fn rizin_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         // `unwrap_or_else` so a poisoned mutex (from a panicking test
@@ -1866,7 +1811,7 @@ mod tests {
         assert_eq!(metrics.get("binary.avg_complexity"), Some(5.0));
         assert_eq!(metrics.get("binary.max_complexity"), Some(5.0));
         assert_eq!(metrics.get("binary.avg_basic_blocks"), Some(10.0));
-        assert_eq!(metrics.get("binary.basic_blocks"), Some(10.0));
+        assert_eq!(metrics.get("binary.basic_block_count"), Some(10.0));
     }
 
     #[test]
@@ -1998,7 +1943,7 @@ mod tests {
         assert_eq!(metrics.get("binary.avg_complexity"), Some(3.0));
         assert_eq!(metrics.get("binary.max_complexity"), Some(5.0));
         assert_eq!(metrics.get("binary.avg_basic_blocks"), Some(4.0));
-        assert_eq!(metrics.get("binary.basic_blocks"), Some(12.0));
+        assert_eq!(metrics.get("binary.basic_block_count"), Some(12.0));
     }
 
     #[test]
@@ -2036,8 +1981,9 @@ mod tests {
         // absent it is the sentinel `rizin=none`; when present it names a
         // version (or `unknown`), so a no-rizin run and a rizin run never
         // collide on a cache key.
-        let first = cache_fingerprint();
-        let second = cache_fingerprint();
+        let settings = Settings::default();
+        let first = cache_fingerprint(&settings);
+        let second = cache_fingerprint(&settings);
         assert_eq!(first, second, "fingerprint must be stable per process");
         assert!(first.starts_with("rizin="), "fingerprint names the tool");
         if available() {
@@ -2045,6 +1991,57 @@ mod tests {
         } else {
             assert_eq!(first, "rizin=none");
         }
+    }
+
+    /// Every setting that changes a persisted result changes the fingerprint;
+    /// the timeout, which only ever produces an unpersisted result, does not.
+    #[test]
+    fn cache_fingerprint_tracks_output_affecting_settings() {
+        let base = Settings::default();
+        let off = Settings {
+            enabled: false,
+            ..base
+        };
+        assert_eq!(cache_fingerprint(&off), "rizin=none");
+        let slower = Settings {
+            timeout: Duration::from_secs(1),
+            ..base
+        };
+        assert_eq!(cache_fingerprint(&slower), cache_fingerprint(&base));
+        if !available() {
+            return;
+        }
+        assert_ne!(cache_fingerprint(&off), cache_fingerprint(&base));
+        let native = Settings {
+            native_arch_only: true,
+            ..base
+        };
+        let capped = Settings {
+            max_bytes: Some(1 << 20),
+            ..base
+        };
+        let distinct: std::collections::HashSet<String> = [base, off, native, capped]
+            .iter()
+            .map(cache_fingerprint)
+            .collect();
+        assert_eq!(distinct.len(), 4, "{distinct:?}");
+    }
+
+    #[test]
+    fn settings_admit_only_enabled_inputs_within_the_cap() {
+        let base = Settings::default();
+        assert!(base.admits(&[0; 64]));
+        let off = Settings {
+            enabled: false,
+            ..base
+        };
+        assert!(!off.admits(&[0; 64]));
+        let capped = Settings {
+            max_bytes: Some(64),
+            ..base
+        };
+        assert!(capped.admits(&[0; 64]));
+        assert!(!capped.admits(&[0; 65]));
     }
 
     // ------------------------------------------------------------------
@@ -2081,15 +2078,14 @@ mod tests {
         .expect("fixture present");
         let bytes = zstd::decode_all(compressed.as_slice()).expect("fixture decompresses");
         // This spawns a real rizin, so it needs the same protection as the
-        // shim tests: the reaper test SIGKILLs every registered process group
-        // and the timeout test installs a sub-second `RIZIN_TIMEOUT_SECS`, and
-        // either turns an in-flight recovery into `None`. `recover_with_bin`
-        // rather than `recover_with_symbols` for the same reason the shim
-        // tests use it — the public entry also honours a sibling's
-        // `scoped_disable()` (see `recover_with_script`).
+        // shim tests: the reaper test SIGKILLs every registered process group,
+        // which turns an in-flight recovery into `None`. `recover_with_bin`
+        // rather than `recover_with_symbols` so the in-run memo cannot answer
+        // in place of a real run.
         let _lock = rizin_test_lock();
         let bin = rizin_binary().expect("available() found rizin");
-        let rec = recover_with_bin(bin, &bytes, 0, true).expect("rizin recovers the fixture");
+        let rec = recover_with_bin(bin, &bytes, 0, true, RIZIN_TIMEOUT)
+            .expect("rizin recovers the fixture");
 
         let total = rec.functions.len();
         let unnamed = rec
@@ -2117,6 +2113,45 @@ mod tests {
         }
     }
 
+    /// Two files opened at the same time, one with rizin and one without,
+    /// each get exactly what they asked for: the setting travels with the
+    /// `ParsedFile`, so neither can mute or enable the other. Skips when rizin
+    /// is not installed.
+    #[test]
+    fn concurrent_opens_keep_their_own_rizin_settings() {
+        if !available() {
+            return;
+        }
+        let compressed = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/go-pe-no-exports.exe.zst"
+        ))
+        .expect("fixture present");
+        let bytes = zstd::decode_all(compressed.as_slice()).expect("fixture decompresses");
+        // The reaper test would turn the rizin-on recovery into `None`.
+        let _lock = rizin_test_lock();
+        let on = crate::OpenOptions::new().cache(false);
+        let off = crate::OpenOptions::new().cache(false).rizin(false);
+        let run = |options: &crate::OpenOptions<'_>| {
+            let parsed = options.open(&bytes);
+            (
+                count_kind(parsed.symbols(), SymbolKind::Function),
+                parsed.rizin_recovery_incomplete(),
+            )
+        };
+        let ((on_functions, on_incomplete), (off_functions, off_incomplete)) =
+            std::thread::scope(|scope| {
+                let with = scope.spawn(|| run(&on));
+                let without = scope.spawn(|| run(&off));
+                (with.join().unwrap(), without.join().unwrap())
+            });
+        assert!(on_functions > 0, "rizin-on open recovered no functions");
+        assert!(!on_incomplete);
+        assert_eq!(off_functions, 0, "rizin-off open ran rizin");
+        // Turned off on purpose is a stable result, not an incomplete one.
+        assert!(!off_incomplete);
+    }
+
     /// End to end on a Go PE with no export directory (see
     /// tests/fixtures/go-pe-no-exports.md). Rizin recovers its functions but
     /// also lists the `gopclntab` symbol under `iEj`; that must not reach the
@@ -2132,10 +2167,10 @@ mod tests {
         ))
         .expect("fixture present");
         let bytes = zstd::decode_all(compressed.as_slice()).expect("fixture decompresses");
-        // Held for the whole parse: the reaper and timeout tests would turn
-        // this recovery into `None`, and an empty recovery passes vacuously.
+        // Held for the whole parse: the reaper test would turn this recovery
+        // into `None`, and an empty recovery passes vacuously.
         let _lock = rizin_test_lock();
-        let parsed = crate::open(&bytes).expect("fixture parses as PE");
+        let parsed = crate::open(&bytes);
 
         let symbols = parsed.symbols();
         assert!(
@@ -2144,80 +2179,12 @@ mod tests {
         );
         let exports: Vec<&Symbol> = symbols.iter_kind(SymbolKind::Export).collect();
         assert!(exports.is_empty(), "phantom exports: {exports:?}");
-        assert!(parsed.metrics().get("pe.recovered_exports").is_none());
+        assert!(parsed.metrics().get("pe.recovered_export_count").is_none());
     }
 
     // ------------------------------------------------------------------
-    // Hardening: disable switch, scoped_disable RAII, stats counters
+    // Hardening: reaper, stats counters
     // ------------------------------------------------------------------
-
-    #[test]
-    fn scoped_disable_increments_and_restores_disable_count() {
-        let _lock = rizin_test_lock();
-        // Assert the *delta*, not the absolute value: the lock keeps
-        // sibling guards out, but the counter is process-lifetime state.
-        let before = RIZIN_DISABLED.load(Ordering::SeqCst);
-        {
-            let _g = scoped_disable();
-            assert!(is_disabled());
-            assert_eq!(RIZIN_DISABLED.load(Ordering::SeqCst), before + 1);
-        }
-        assert_eq!(RIZIN_DISABLED.load(Ordering::SeqCst), before);
-    }
-
-    #[test]
-    fn scoped_disable_stacks() {
-        let _lock = rizin_test_lock();
-        let before = RIZIN_DISABLED.load(Ordering::SeqCst);
-        let g1 = scoped_disable();
-        let g2 = scoped_disable();
-        assert_eq!(RIZIN_DISABLED.load(Ordering::SeqCst), before + 2);
-        drop(g1);
-        assert!(is_disabled(), "still disabled while outer guard alive");
-        drop(g2);
-        assert_eq!(RIZIN_DISABLED.load(Ordering::SeqCst), before);
-    }
-
-    /// A per-thread mute must not leak to other threads: that is the bug
-    /// where one archive member skipping disassembly silently stripped
-    /// symbols from a binary being analyzed concurrently.
-    #[test]
-    fn thread_local_disable_does_not_leak_across_threads() {
-        // The lock is what makes `!is_disabled()` meaningful here: a
-        // sibling test's global `scoped_disable()` would otherwise mute
-        // the worker thread and fail the assertion below.
-        let _lock = rizin_test_lock();
-        let guard = scoped_disable_current_thread();
-        assert!(is_disabled(), "muted on the thread that asked");
-        let other = std::thread::spawn(is_disabled).join().unwrap();
-        assert!(!other, "must NOT be muted on an unrelated thread");
-        drop(guard);
-        assert!(!is_disabled(), "restored on drop");
-    }
-
-    /// The global switch still covers every thread — `--no-radare2` applies
-    /// to a whole scan, which fans out across a pool.
-    #[test]
-    fn global_disable_still_applies_to_other_threads() {
-        let _lock = rizin_test_lock();
-        let guard = scoped_disable();
-        let other = std::thread::spawn(is_disabled).join().unwrap();
-        assert!(other, "global mute must reach other threads");
-        drop(guard);
-    }
-
-    #[test]
-    fn recover_short_circuits_when_disabled() {
-        // With a guard active, the public `recover()` entry returns
-        // None before touching PATH or spawning anything. We assert only
-        // the observable contract — disabled → None — not the counters,
-        // which carry over from earlier tests in the process.
-        let _lock = rizin_test_lock();
-        let _g = scoped_disable();
-        assert!(is_disabled());
-        let r = recover_with_symbols(b"unused bytes for disabled probe", 0, false);
-        assert!(r.is_none(), "disabled rizin must return None");
-    }
 
     #[test]
     #[cfg(unix)]
@@ -2633,16 +2600,6 @@ mod tests {
     fn timeout_kills_process_group_joins_reader_and_returns_worker() {
         let _lock = rizin_test_lock();
 
-        // Preserve a caller-installed override even if an assertion panics.
-        struct TimeoutReset(u64);
-        impl Drop for TimeoutReset {
-            fn drop(&mut self) {
-                RIZIN_TIMEOUT_SECS.store(self.0, Ordering::SeqCst);
-            }
-        }
-        let previous = RIZIN_TIMEOUT_SECS.swap(1, Ordering::SeqCst);
-        let _timeout_reset = TimeoutReset(previous);
-
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         let dir = unique_shim_dir("filefacts-rizin-timeoutshim");
@@ -2672,7 +2629,13 @@ mod tests {
         warm_shim_exec(&shim);
 
         let started = std::time::Instant::now();
-        let rec = recover_with_bin_for_test(&shim, b"timeout cleanup fixture");
+        let rec = recover_with_bin(
+            &shim,
+            b"timeout cleanup fixture",
+            0,
+            false,
+            Duration::from_secs(1),
+        );
         let elapsed = started.elapsed();
         assert!(rec.is_none(), "timed-out Rizin must not emit partial facts");
         assert!(

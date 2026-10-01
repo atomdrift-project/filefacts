@@ -6,6 +6,7 @@
 //! own detected file types.
 
 use crate::metric;
+use crate::value_key;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_value};
@@ -103,8 +104,9 @@ fn parse_index(bytes: &[u8]) -> Result<AsarIndex, Error> {
         .filter(|_| data_offset <= bytes.len() && data_offset >= header_end)
         .ok_or_else(|| Error::malformed("asar", "header extends past end of file"))?;
 
-    let header: JsonValue = serde_json::from_slice(json)
-        .map_err(|e| Error::malformed("asar", format!("invalid header json: {e}")))?;
+    let header: JsonValue = serde_json::from_slice(json).map_err(|e| {
+        Error::malformed_with_source("asar", format!("invalid header json: {e}"), e)
+    })?;
     let files = header
         .get("files")
         .and_then(JsonValue::as_object)
@@ -203,7 +205,10 @@ pub(super) fn extract(
     archive_members: &mut Vec<ArchiveMember>,
 ) -> Result<(), Error> {
     let index = parse_index(bytes)?;
-    values.insert("archive.format.kind", JsonValue::String("asar".into()));
+    values.insert_key(
+        value_key!("archive.format.kind"),
+        JsonValue::String("asar".into()),
+    );
     metrics.insert(metric!("archive.header_size"), index.header_size as f64);
 
     let mut walk = Walk {
@@ -214,16 +219,19 @@ pub(super) fn extract(
     };
     walk_files("", &index.files, &mut walk, archive_members);
 
-    values.insert("archive.members", JsonValue::Array(walk.members));
+    values.insert_key(
+        value_key!("archive.members"),
+        JsonValue::Array(walk.members),
+    );
     walk.stats.emit(values, metrics);
     // One entry type and one method by construction, declared even for an
     // archive with no files.
-    values.insert(
-        "archive.format.entry_types",
+    values.insert_key(
+        value_key!("archive.format.entry_types"),
         JsonValue::Array(vec![JsonValue::String("regular".into())]),
     );
-    values.insert(
-        "archive.compression.methods",
+    values.insert_key(
+        value_key!("archive.compression.methods"),
         JsonValue::Array(vec![JsonValue::String("stored".into())]),
     );
     metrics.insert(

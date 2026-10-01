@@ -94,6 +94,37 @@ impl Lang {
         }
     }
 
+    /// The file type this language's grammar parses; [`config_for`] resolves
+    /// it back to the language's [`LangConfig`].
+    pub(super) const fn file_type(self) -> FileType {
+        match self {
+            Self::JavaScript => FileType::JavaScript,
+            Self::TypeScript => FileType::TypeScript,
+            Self::Python => FileType::Python,
+            Self::Go => FileType::Go,
+            Self::Rust => FileType::Rust,
+            Self::Java => FileType::Java,
+            Self::Bash => FileType::Shell,
+            Self::Ruby => FileType::Ruby,
+            Self::Lua => FileType::Lua,
+            Self::CSharp => FileType::CSharp,
+            Self::C => FileType::C,
+            Self::Scala => FileType::Scala,
+            Self::ObjC => FileType::ObjectiveC,
+            Self::Kotlin => FileType::Kotlin,
+            Self::Swift => FileType::Swift,
+            Self::PowerShell => FileType::PowerShell,
+            Self::Php => FileType::Php,
+            Self::Perl => FileType::Perl,
+            Self::Groovy => FileType::Groovy,
+            Self::Zig => FileType::Zig,
+            Self::Elixir => FileType::Elixir,
+            Self::Makefile => FileType::Makefile,
+            Self::Clojure => FileType::Clojure,
+            Self::Batch => FileType::Batch,
+        }
+    }
+
     /// JavaScript or TypeScript, which share one runtime model (`process.env`,
     /// `fetch`, module-level execution).
     pub(super) const fn is_ecmascript(self) -> bool {
@@ -294,34 +325,45 @@ impl LangConfig {
     }
 }
 
+/// Every language configuration, one per [`Lang`].
+static ALL: [&LangConfig; 24] = [
+    &JAVASCRIPT,
+    &TYPESCRIPT,
+    &PYTHON,
+    &GO,
+    &RUST,
+    &JAVA,
+    &BASH,
+    &RUBY,
+    &LUA,
+    &CSHARP,
+    &C,
+    &SCALA,
+    &OBJC,
+    &KOTLIN,
+    &SWIFT,
+    &POWERSHELL,
+    &PHP,
+    &PERL,
+    &GROOVY,
+    &ZIG,
+    &ELIXIR,
+    &MAKEFILE,
+    &CLOJURE,
+    &BATCH,
+];
+
+/// The configuration for `file_type`, or `None` when it has no grammar.
 pub(super) fn config_for(file_type: FileType) -> Option<&'static LangConfig> {
-    Some(match file_type {
-        FileType::JavaScript => &JAVASCRIPT,
-        FileType::TypeScript => &TYPESCRIPT,
-        FileType::Python => &PYTHON,
-        FileType::Go => &GO,
-        FileType::Rust => &RUST,
-        FileType::Java => &JAVA,
-        FileType::Shell => &BASH,
-        FileType::Php => &PHP,
-        FileType::Ruby => &RUBY,
-        FileType::Lua => &LUA,
-        FileType::CSharp => &CSHARP,
-        FileType::C => &C,
-        FileType::Scala => &SCALA,
-        FileType::ObjectiveC => &OBJC,
-        FileType::Kotlin => &KOTLIN,
-        FileType::Swift => &SWIFT,
-        FileType::PowerShell => &POWERSHELL,
-        FileType::Perl => &PERL,
-        FileType::Groovy => &GROOVY,
-        FileType::Zig => &ZIG,
-        FileType::Elixir => &ELIXIR,
-        FileType::Makefile => &MAKEFILE,
-        FileType::Clojure => &CLOJURE,
-        FileType::Batch => &BATCH,
-        _ => return None,
-    })
+    ALL.into_iter()
+        .find(|config| config.lang.file_type() == file_type)
+}
+
+/// The file type whose language is labelled `name` ([`Lang::name`]).
+pub(super) fn file_type_named(name: &str) -> Option<FileType> {
+    ALL.into_iter()
+        .find(|config| config.name() == name)
+        .map(|config| config.lang.file_type())
 }
 
 static JAVASCRIPT: LangConfig = LangConfig {
@@ -1260,33 +1302,6 @@ static BATCH: LangConfig = LangConfig {
 mod tests {
     use super::*;
 
-    static ALL: [&LangConfig; 24] = [
-        &JAVASCRIPT,
-        &TYPESCRIPT,
-        &PYTHON,
-        &GO,
-        &RUST,
-        &JAVA,
-        &BASH,
-        &RUBY,
-        &LUA,
-        &CSHARP,
-        &C,
-        &SCALA,
-        &OBJC,
-        &KOTLIN,
-        &SWIFT,
-        &POWERSHELL,
-        &PHP,
-        &PERL,
-        &GROOVY,
-        &ZIG,
-        &ELIXIR,
-        &MAKEFILE,
-        &CLOJURE,
-        &BATCH,
-    ];
-
     /// A query that stops compiling after a grammar bump only logs at runtime
     /// and drops that language's symbols, so compile every one here and name
     /// each failure.
@@ -1316,6 +1331,18 @@ mod tests {
         let names: std::collections::HashSet<&str> = ALL.iter().map(|c| c.name()).collect();
         assert_eq!(langs.len(), ALL.len());
         assert_eq!(names.len(), ALL.len());
+    }
+
+    /// `config_for` and `file_type_named` both resolve through `Lang`, so each
+    /// language's file type and label must lead back to its own configuration.
+    #[test]
+    fn file_types_and_labels_resolve_to_their_config() {
+        for config in ALL {
+            let file_type = config.lang.file_type();
+            assert!(std::ptr::eq(config_for(file_type).unwrap(), config));
+            assert_eq!(file_type_named(config.name()), Some(file_type));
+        }
+        assert_eq!(file_type_named("cobol"), None);
     }
 
     #[test]

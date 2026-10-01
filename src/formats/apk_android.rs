@@ -110,11 +110,11 @@ fn manifest<R: Read + Seek>(
             }
             "uses-sdk" => {
                 for (attr, key) in [
-                    ("minSdkVersion", "android.min_sdk"),
-                    ("targetSdkVersion", "android.target_sdk"),
+                    ("minSdkVersion", value_key!("android.min_sdk")),
+                    ("targetSdkVersion", value_key!("android.target_sdk")),
                 ] {
                     if let Some(v) = get(attr).filter(|v| !v.is_empty()) {
-                        values.insert(key, JsonValue::String(v.to_string()));
+                        values.insert_key(key, JsonValue::String(v.to_string()));
                     }
                 }
             }
@@ -168,7 +168,10 @@ fn manifest<R: Read + Seek>(
             metric!("android.permission_count"),
             permissions.len() as f64,
         );
-        values.insert("android.permissions", JsonValue::Array(permissions));
+        values.insert_key(
+            value_key!("android.permissions"),
+            JsonValue::Array(permissions),
+        );
     }
     if !components.is_empty() {
         metrics.insert(metric!("android.component_count"), components.len() as f64);
@@ -176,7 +179,10 @@ fn manifest<R: Read + Seek>(
             metric!("android.exported_component_count"),
             exported_components as f64,
         );
-        values.insert("android.components", JsonValue::Array(components));
+        values.insert_key(
+            value_key!("android.components"),
+            JsonValue::Array(components),
+        );
     }
     // Stated as metrics as well as values so a rule can band them: shipping a
     // debuggable build, or targeting an old SDK to dodge a runtime restriction

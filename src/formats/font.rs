@@ -47,6 +47,7 @@
 //! `font.leading_whitespace_bytes`.
 
 use crate::metric;
+use crate::value_key;
 use serde_json::Value as JsonValue;
 use std::collections::HashSet;
 
@@ -209,14 +210,20 @@ pub(super) fn extract(
         report.flag("text_content");
     }
 
-    values.insert("font.format", JsonValue::String(format.label().to_string()));
-    values.insert("font.valid", JsonValue::Bool(report.structure_ok));
+    values.insert_key(
+        value_key!("font.format"),
+        JsonValue::String(format.label().to_string()),
+    );
+    values.insert_key(
+        value_key!("font.valid"),
+        JsonValue::Bool(report.structure_ok),
+    );
     if let Some(v) = report.sfnt_version.take() {
-        values.insert("font.sfnt_version", JsonValue::String(v));
+        values.insert_key(value_key!("font.sfnt_version"), JsonValue::String(v));
     }
     if !report.tables.is_empty() {
-        values.insert(
-            "font.tables",
+        values.insert_key(
+            value_key!("font.tables"),
             JsonValue::Array(
                 report
                     .tables
@@ -229,8 +236,8 @@ pub(super) fn extract(
     }
     if !report.unknown_tables.is_empty() {
         report.flag("unknown_tables");
-        values.insert(
-            "font.unknown_tables",
+        values.insert_key(
+            value_key!("font.unknown_tables"),
             JsonValue::Array(
                 report
                     .unknown_tables
@@ -242,12 +249,15 @@ pub(super) fn extract(
         );
     }
     if let Some(kind) = report.content_kind {
-        values.insert("font.content_kind", JsonValue::String(kind.to_string()));
+        values.insert_key(
+            value_key!("font.content_kind"),
+            JsonValue::String(kind.to_string()),
+        );
     }
     if !report.stowaway.is_empty() {
         report.flag("stowaway");
-        values.insert(
-            "font.stowaway",
+        values.insert_key(
+            value_key!("font.stowaway"),
             JsonValue::Array(
                 report
                     .stowaway
@@ -258,8 +268,8 @@ pub(super) fn extract(
         );
     }
     if !report.problems.is_empty() {
-        values.insert(
-            "font.problems",
+        values.insert_key(
+            value_key!("font.problems"),
             JsonValue::Array(
                 report
                     .problems
@@ -271,8 +281,8 @@ pub(super) fn extract(
         );
     }
     if !report.features.is_empty() {
-        values.insert(
-            "font.features",
+        values.insert_key(
+            value_key!("font.features"),
             JsonValue::Array(
                 report
                     .features

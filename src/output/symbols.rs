@@ -123,8 +123,12 @@ pub enum Arg {
 /// `#[serde(tag = "kind")]`. Each variant carries the fields that apply
 /// to its kind; unused fields are elided from JSON via
 /// `skip_serializing_if`.
+///
+/// New kinds may be added in a minor release, so a `match` outside this
+/// crate needs a wildcard arm.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Symbol {
     /// Foreign-symbol reference — something this file *uses* that is
     /// defined elsewhere.
@@ -269,8 +273,9 @@ pub enum Symbol {
 }
 
 /// Discriminator tag for filtering [`Symbols`] without matching on the
-/// full enum.
+/// full enum. Grows with [`Symbol`], so it is non-exhaustive too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum SymbolKind {
     /// [`Symbol::Import`].
     Import,
@@ -320,6 +325,51 @@ impl Symbol {
 }
 
 /// All [`Symbol`] facts collected from a file, in extraction order.
+///
+/// Read-only outside filefacts: iterate with [`Self::iter`] or `&symbols`.
+/// There is no mutable iteration, so this does not compile:
+///
+/// ```compile_fail
+/// let mut symbols = filefacts::Symbols::new();
+/// for symbol in &mut symbols {
+///     let _ = symbol;
+/// }
+/// ```
+///
+/// [`Symbol`] and [`SymbolKind`] are non-exhaustive, so a `match` naming
+/// every kind still needs a wildcard arm:
+///
+/// ```compile_fail
+/// use filefacts::SymbolKind;
+/// fn count(kind: SymbolKind) -> u8 {
+///     match kind {
+///         SymbolKind::Import | SymbolKind::Export | SymbolKind::Function => 0,
+///         SymbolKind::Call | SymbolKind::Member => 1,
+///         SymbolKind::Bind | SymbolKind::Identifier => 2,
+///     }
+/// }
+/// ```
+///
+/// ```
+/// use filefacts::{Symbol, SymbolKind, Symbols};
+/// fn imports(symbols: &Symbols) -> usize {
+///     symbols
+///         .iter()
+///         .filter(|s| match s.kind() {
+///             SymbolKind::Import => true,
+///             _ => false,
+///         })
+///         .count()
+/// }
+/// fn name(symbol: &Symbol) -> Option<&str> {
+///     match symbol {
+///         Symbol::Import { name, .. } => Some(name),
+///         _ => symbol.name(),
+///     }
+/// }
+/// assert_eq!(imports(&Symbols::new()), 0);
+/// let _ = name;
+/// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Symbols(Vec<Symbol>);
@@ -345,6 +395,12 @@ impl Symbols {
     }
 
     /// Mutable access for format-specific normalization during extraction.
+    /// Crate-private: callers outside filefacts read symbols, never rewrite
+    /// them, so there is no public `IntoIterator for &mut Symbols` either.
+    #[expect(
+        clippy::iter_without_into_iter,
+        reason = "mutable iteration is deliberately crate-private"
+    )]
     pub(crate) fn iter_mut(&mut self) -> std::slice::IterMut<'_, Symbol> {
         self.0.iter_mut()
     }
@@ -370,14 +426,6 @@ impl<'a> IntoIterator for &'a Symbols {
     type IntoIter = std::slice::Iter<'a, Symbol>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a mut Symbols {
-    type Item = &'a mut Symbol;
-    type IntoIter = std::slice::IterMut<'a, Symbol>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.iter_mut()
     }
 }
 
@@ -521,6 +569,21 @@ mod tests {
         let json = serde_json::to_string(&syms).unwrap();
         assert!(json.starts_with('['));
         assert!(json.contains("\"kind\":\"import\""));
+    }
+
+    #[test]
+    fn iter_mut_rewrites_in_place() {
+        let mut syms = Symbols::new();
+        syms.push(Symbol::Identifier {
+            name: "a".into(),
+            offset: None,
+        });
+        for symbol in syms.iter_mut() {
+            if let Symbol::Identifier { name, .. } = symbol {
+                name.push('b');
+            }
+        }
+        assert_eq!(syms.iter().next().and_then(Symbol::name), Some("ab"));
     }
 
     #[test]

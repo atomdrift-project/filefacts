@@ -5,9 +5,10 @@
 )]
 use sha2::{Digest, Sha256};
 const FAT: &[u8] = include_bytes!("../testdata/macho/lcg_xor_executable_constants.macho");
+/// The section views under test come from the static parse alone; rizin is
+/// off so an installed one cannot add to them.
 fn open(b: &[u8]) -> filefacts::ParsedFile<'_> {
-    filefacts::cache::set_caching_enabled(false);
-    filefacts::open(b).unwrap()
+    filefacts::OpenOptions::new().rizin(false).open(b)
 }
 fn thin() -> &'static [u8] {
     &FAT[0x4000..0x4000 + 48560]
@@ -46,7 +47,6 @@ fn entropy(b: &[u8]) -> f64 {
 }
 #[test]
 fn code_entropy_excludes_executable_constants_and_uses_real_file_spans() {
-    let _disable = filefacts::rizin::scoped_disable_current_thread();
     assert_eq!(
         format!("{:x}", Sha256::digest(FAT)),
         "a4c3c55d1ca3e406fa8db67d6b8ec395ebb2d8ba76f835bae987733d71ee8fb1"
@@ -103,7 +103,6 @@ fn code_entropy_excludes_executable_constants_and_uses_real_file_spans() {
 }
 #[test]
 fn fat_sections_are_rebased_once_without_changing_entropy() {
-    let _disable = filefacts::rizin::scoped_disable_current_thread();
     let fat = open(FAT);
     let t = open(thin());
     assert_eq!(fat.sections().len(), t.sections().len());
@@ -116,7 +115,6 @@ fn fat_sections_are_rebased_once_without_changing_entropy() {
 }
 #[test]
 fn instruction_attributes_and_stub_type_work_without_conventional_names() {
-    let _disable = filefacts::rizin::scoped_disable_current_thread();
     for flags in [0x80000000u32, 0x400, 8] {
         let mut b = thin().to_vec();
         let (_, h) = header(&b, "__const");
@@ -134,7 +132,6 @@ fn instruction_attributes_and_stub_type_work_without_conventional_names() {
 }
 #[test]
 fn instruction_attributes_do_not_override_non_executable_segment_permissions() {
-    let _disable = filefacts::rizin::scoped_disable_current_thread();
     let mut b = thin().to_vec();
     let (seg, _) = header(&b, "__text");
     b[seg + 60..seg + 64].copy_from_slice(&1u32.to_le_bytes());
@@ -150,7 +147,6 @@ fn instruction_attributes_do_not_override_non_executable_segment_permissions() {
 }
 #[test]
 fn zero_fill_sections_have_no_file_bytes_entropy_or_rebased_offset() {
-    let _disable = filefacts::rizin::scoped_disable_current_thread();
     for flags in [1u32, 0xc, 0x12] {
         for fat in [false, true] {
             let mut b = if fat { FAT.to_vec() } else { thin().to_vec() };
@@ -182,7 +178,6 @@ fn zero_fill_sections_have_no_file_bytes_entropy_or_rebased_offset() {
 }
 #[test]
 fn pe_and_elf_execute_flags_keep_their_existing_meaning() {
-    let _disable = filefacts::rizin::scoped_disable_current_thread();
     let p = open(thin());
     let mut s = p.sections().iter().next().unwrap().clone();
     for flags in [

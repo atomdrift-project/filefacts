@@ -1,8 +1,8 @@
 //! Source-language producer for the shared flow view.
 use super::langs::{Lang, LangConfig};
 use super::{MAX_FLOW_DEPTH, ast_walk, named_children};
-use crate::{Arg, Flow, FlowFunction, FlowValue, Symbol, Symbols};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use crate::{Arg, Flow, FlowFunction, FlowKind, FlowValue, Symbol, Symbols};
+use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
 
 const NODE_LIMIT: usize = 20_000;
@@ -11,7 +11,7 @@ const STEP_LIMIT: usize = 100_000;
 struct Builder<'a> {
     source: &'a str,
     config: &'a LangConfig,
-    aliases: HashMap<String, String>,
+    aliases: BTreeMap<String, String>,
     flow: Flow,
     steps: usize,
     in_function: bool,
@@ -70,14 +70,14 @@ impl Builder<'_> {
                 .iter()
                 .any(|child| child.kind() == "interpolation")
     }
-    fn add(&mut self, kind: &str, node: Node<'_>, inputs: Vec<usize>) -> usize {
+    fn add(&mut self, kind: FlowKind, node: Node<'_>, inputs: Vec<usize>) -> usize {
         if self.flow.values.len() >= NODE_LIMIT {
             self.flow.limitations.insert("node-budget".into());
             return 0;
         }
         let id = self.flow.values.len();
         self.flow.values.push(FlowValue {
-            kind: kind.into(),
+            kind,
             offset: node.start_byte(),
             literal: None,
             target: None,
@@ -87,7 +87,7 @@ impl Builder<'_> {
         });
         id
     }
-    fn bind(&self, node: Node<'_>, value: usize, bindings: &mut HashMap<String, usize>) {
+    fn bind(&self, node: Node<'_>, value: usize, bindings: &mut BTreeMap<String, usize>) {
         if self.config.identifier_kinds.contains(&node.kind()) {
             bindings.insert(self.text(node).to_string(), value);
         } else if matches!(
@@ -104,7 +104,7 @@ impl Builder<'_> {
     fn eval(
         &mut self,
         node: Node<'_>,
-        bindings: &mut HashMap<String, usize>,
+        bindings: &mut BTreeMap<String, usize>,
         returns: &mut Vec<usize>,
         depth: usize,
     ) -> usize {
@@ -147,7 +147,7 @@ impl Builder<'_> {
                 | Arg::Template { .. }
         ) && !self.interpolates(node)
         {
-            let id = self.add("literal", node, Vec::new());
+            let id = self.add(FlowKind::Literal, node, Vec::new());
             if id != 0
                 && let Some(value) = self.flow.values.get_mut(id)
             {
@@ -211,7 +211,7 @@ impl Builder<'_> {
                 };
                 let value_id = self.eval(value, bindings, returns, depth + 1);
                 let id = if compound {
-                    self.add("merge", node, vec![previous, value_id])
+                    self.add(FlowKind::Merge, node, vec![previous, value_id])
                 } else {
                     value_id
                 };
@@ -239,7 +239,7 @@ impl Builder<'_> {
             let receiver = callee
                 .and_then(|n| n.child_by_field_name(self.config.member_object_field))
                 .map(|n| self.eval(n, bindings, returns, depth + 1));
-            let id = self.add("call", node, inputs);
+            let id = self.add(FlowKind::Call, node, inputs);
             // Nested calls can have the same start offset (f().g()). Resolve
             // this callee with the symbol extractor's shared syntax helper;
             // an offset-to-single-target map would conflate the calls.
@@ -287,9 +287,9 @@ impl Builder<'_> {
                 }
             }
             let kind = if node.kind() == "keyword_argument" {
-                "keyword"
+                FlowKind::Keyword
             } else {
-                "object"
+                FlowKind::Object
             };
             let id = self.add(kind, node, Vec::new());
             if id != 0
@@ -303,12 +303,12 @@ impl Builder<'_> {
             // Go's initializer executes before the condition and is visible
             // in both branches. Short declarations belong to the implicit if
             // scope; ordinary assignments still update the surrounding scope.
-            let mut shadowed = HashMap::new();
+            let mut shadowed = BTreeMap::new();
             if self.config.lang == Lang::Go {
                 if let Some(initializer) = node.child_by_field_name("initializer") {
                     if initializer.kind() == "short_var_declaration" {
                         if let Some(pattern) = initializer.child_by_field_name("left") {
-                            let mut declared = HashMap::new();
+                            let mut declared = BTreeMap::new();
                             self.bind(pattern, 0, &mut declared);
                             for name in declared.into_keys() {
                                 let previous = bindings.get(&name).copied();
@@ -331,7 +331,10 @@ impl Builder<'_> {
                     for (name, id) in local {
                         if let Some(previous) = merged.get(&name).copied() {
                             if previous != id {
-                                merged.insert(name, self.add("merge", branch, vec![previous, id]));
+                                merged.insert(
+                                    name,
+                                    self.add(FlowKind::Merge, branch, vec![previous, id]),
+                                );
                             }
                         } else {
                             merged.insert(name, id);
@@ -347,7 +350,7 @@ impl Builder<'_> {
                 }
             }
             *bindings = merged;
-            return self.add("merge", node, values);
+            return self.add(FlowKind::Merge, node, values);
         }
         let sequential = matches!(
             node.kind(),
@@ -373,9 +376,9 @@ impl Builder<'_> {
         let before = if scoped {
             bindings.clone()
         } else {
-            HashMap::new()
+            BTreeMap::new()
         };
-        let mut declared = HashMap::new();
+        let mut declared = BTreeMap::new();
         if scoped {
             for child in named_children(node) {
                 let declarations = if matches!(
@@ -430,7 +433,7 @@ impl Builder<'_> {
         match inputs.as_slice() {
             [] => 0,
             [only] => *only,
-            _ => self.add("merge", node, inputs),
+            _ => self.add(FlowKind::Merge, node, inputs),
         }
     }
 }
@@ -439,7 +442,7 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
     let mut builder = Builder {
         source,
         config,
-        aliases: HashMap::new(),
+        aliases: BTreeMap::new(),
         flow: Flow {
             version: 1,
             producer: "tree-sitter".into(),
@@ -454,7 +457,9 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
         .limitations
         .insert("source-local-may-flow-not-reachability".into());
     if config.lang == Lang::Go {
-        builder.aliases = super::go_syntax::imports(root, source);
+        builder.aliases = super::go_syntax::imports(root, source)
+            .into_iter()
+            .collect();
     }
     for symbol in symbols {
         if let Symbol::Import { name, alias, .. } = symbol {
@@ -470,8 +475,8 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
     if source.len() > 2 * 1024 * 1024 {
         builder.flow.limitations.insert("source-byte-budget".into());
     } else {
-        builder.add("unknown", root, Vec::new());
-        let mut globals = HashMap::new();
+        builder.add(FlowKind::Unknown, root, Vec::new());
+        let mut globals = BTreeMap::new();
         builder.eval(root, &mut globals, &mut Vec::new(), 0);
         let mut stack = vec![root];
         let mut duplicate_names = BTreeSet::new();
@@ -495,7 +500,7 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
                             .or_else(|| param.child_by_field_name("name"))
                             .or_else(|| param.child_by_field_name("declarator"))
                             .unwrap_or(param);
-                        let id = builder.add("parameter", param, Vec::new());
+                        let id = builder.add(FlowKind::Parameter, param, Vec::new());
                         builder.bind(pattern, id, &mut bindings);
                         function.parameters.push(id);
                     }
@@ -536,8 +541,23 @@ mod tests {
     use super::*;
     use crate::FlowTransfer;
     fn graph(path: &str, source: &str) -> Flow {
-        let file = crate::open_with_path(std::path::Path::new(path), source.as_bytes()).unwrap();
+        let file = crate::OpenOptions::new()
+            .path(std::path::Path::new(path))
+            .open(source.as_bytes());
         file.flow().unwrap().clone()
+    }
+    #[test]
+    fn branch_merges_number_values_the_same_way_every_time() {
+        // Branch bindings were merged in HashMap order, so value ids changed
+        // from one build to the next.
+        let source = "def f(c):\n    a = 1\n    b = 2\n    d = 3\n    if c:\n        a = x()\n        b = y()\n        d = z()\n    else:\n        a = u()\n        b = v()\n        d = w()\n    return a, b, d\n";
+        let first = serde_json::to_string(&graph("m.py", source)).unwrap();
+        for _ in 0..20 {
+            assert_eq!(
+                serde_json::to_string(&graph("m.py", source)).unwrap(),
+                first
+            );
+        }
     }
     fn reaches(flow: &Flow, sink: &str, source: &str) -> bool {
         flow.values
@@ -987,8 +1007,9 @@ mod tests {
 
     #[test]
     fn flow_is_lazy_cached_and_uses_the_existing_parse() {
-        let file =
-            crate::open_with_path(std::path::Path::new("a.py"), b"send(acquire())\n").unwrap();
+        let file = crate::OpenOptions::new()
+            .path(std::path::Path::new("a.py"))
+            .open(b"send(acquire())\n");
         file.symbols();
         assert!(file.flow.get().is_none());
         let first = file.flow().unwrap();

@@ -13,10 +13,11 @@
 //!   `LegalCopyright`, …
 //!
 //! Goblin parses the whole resource tree for us and exposes typed
-//! accessors. We pull the strings into `pe.version_info.strings.<Key>`
-//! and decompose the `VS_FIXEDFILEINFO` into `pe.version_info.fixed.*`
-//! with format-conventional names — file_version as `"a.b.c.d"`,
-//! flag bits as a sorted string array, OS class as a stable label.
+//! accessors. We flatten the strings into snake_case `pe.version.*`
+//! leaves (`pe.version.company`, `pe.version.file_version`, …) and
+//! decompose the `VS_FIXEDFILEINFO` into `pe.version.{os,type,subtype,flags}`
+//! with format-conventional names — flag bits as a sorted string array,
+//! OS class as a stable label.
 
 use crate::metric;
 use goblin::pe::resource::{StringFileInfo, VersionInfo, VsFixedFileInfo};
@@ -24,7 +25,7 @@ use serde_json::Value as JsonValue;
 
 use crate::formats::common::bytes_at::u16_le;
 use crate::formats::common::{put_str, put_u64};
-use crate::output::{Metrics, Values};
+use crate::output::{Metrics, ValueKey, Values};
 use crate::value_key;
 
 pub(super) fn extract(
@@ -57,23 +58,23 @@ const MAX_VERSION_DEPTH: u8 = 8;
 /// capping the work a forged blob can demand.
 const MAX_VERSION_NODES: usize = 4096;
 
-/// Map a VS_VERSIONINFO `String` key to the `pe.version.*` leaf the value-tree
-/// uses (must match [`string_table`]), so the emitted `<leaf>_offset` companion
-/// lines up with the value path a trait queries.
-fn version_key_leaf(key: &str) -> Option<&'static str> {
+/// Map a VS_VERSIONINFO `String` key to the `_offset` companion of the
+/// `pe.version.*` leaf the value-tree uses (must match [`string_table`]), so
+/// the emitted offset lines up with the value path a trait queries.
+fn version_offset_key(key: &str) -> Option<ValueKey> {
     Some(match key {
-        "Comments" => "comments",
-        "CompanyName" => "company",
-        "FileDescription" => "description",
-        "FileVersion" => "file_version",
-        "InternalName" => "internal_name",
-        "LegalCopyright" => "copyright",
-        "LegalTrademarks" => "trademarks",
-        "OriginalFilename" => "original_filename",
-        "PrivateBuild" => "private_build",
-        "ProductName" => "product_name",
-        "ProductVersion" => "product_version",
-        "SpecialBuild" => "special_build",
+        "Comments" => value_key!("pe.version.comments_offset"),
+        "CompanyName" => value_key!("pe.version.company_offset"),
+        "FileDescription" => value_key!("pe.version.description_offset"),
+        "FileVersion" => value_key!("pe.version.file_version_offset"),
+        "InternalName" => value_key!("pe.version.internal_name_offset"),
+        "LegalCopyright" => value_key!("pe.version.copyright_offset"),
+        "LegalTrademarks" => value_key!("pe.version.trademarks_offset"),
+        "OriginalFilename" => value_key!("pe.version.original_filename_offset"),
+        "PrivateBuild" => value_key!("pe.version.private_build_offset"),
+        "ProductName" => value_key!("pe.version.product_name_offset"),
+        "ProductVersion" => value_key!("pe.version.product_version_offset"),
+        "SpecialBuild" => value_key!("pe.version.special_build_offset"),
         _ => return None,
     })
 }
@@ -144,14 +145,10 @@ fn walk_version_block(
         w_value_length
     };
 
-    if let Some(leaf) = version_key_leaf(&key)
+    if let Some(offset_key) = version_offset_key(&key)
         && value_off < block_end
     {
-        put_u64(
-            values,
-            format!("pe.version.{leaf}_offset"),
-            value_off as u64,
-        );
+        put_u64(values, offset_key, value_off as u64);
     }
 
     // Children follow the value, DWORD-aligned, up to this block's end.
@@ -329,21 +326,29 @@ fn fixed_file_info(fixed: &VsFixedFileInfo, values: &mut Values) {
     // ProductVersion that already lives on `pe.version.{file_version,
     // product_version}`. The fixed-info OS class / file type / flags
     // are unique to the binary header and stay.
-    put_str(values, "pe.version.os", file_os_label(fixed.file_os));
-    put_str(values, "pe.version.type", file_type_label(fixed.file_type));
+    put_str(
+        values,
+        value_key!("pe.version.os"),
+        file_os_label(fixed.file_os),
+    );
+    put_str(
+        values,
+        value_key!("pe.version.type"),
+        file_type_label(fixed.file_type),
+    );
     if fixed.file_type == 3 || fixed.file_type == 4 {
         // DRV (3) and FONT (4) types carry a subtype; for everything
         // else the field is `VFT2_UNKNOWN` and not worth surfacing.
         put_str(
             values,
-            "pe.version.subtype",
+            value_key!("pe.version.subtype"),
             file_subtype_label(fixed.file_type, fixed.file_subtype),
         );
     }
     let flags = file_flags(fixed.file_flags & fixed.file_flags_mask);
     if !flags.is_empty() {
-        values.insert(
-            "pe.version.flags",
+        values.insert_key(
+            value_key!("pe.version.flags"),
             JsonValue::Array(flags.into_iter().map(JsonValue::String).collect()),
         );
     }
@@ -372,7 +377,7 @@ fn string_table(strings: &StringFileInfo<'_>, values: &mut Values) {
         put_str(values, value_key!("pe.version.copyright"), v);
     }
     if let Some(v) = strings.legal_trademarks() {
-        put_str(values, "pe.version.trademarks", v);
+        put_str(values, value_key!("pe.version.trademarks"), v);
     }
     if let Some(v) = strings.original_filename() {
         put_str(values, value_key!("pe.version.original_filename"), v);
@@ -384,13 +389,13 @@ fn string_table(strings: &StringFileInfo<'_>, values: &mut Values) {
         put_str(values, value_key!("pe.version.product_version"), v);
     }
     if let Some(v) = strings.comments() {
-        put_str(values, "pe.version.comments", v);
+        put_str(values, value_key!("pe.version.comments"), v);
     }
     if let Some(v) = strings.private_build() {
-        put_str(values, "pe.version.private_build", v);
+        put_str(values, value_key!("pe.version.private_build"), v);
     }
     if let Some(v) = strings.special_build() {
-        put_str(values, "pe.version.special_build", v);
+        put_str(values, value_key!("pe.version.special_build"), v);
     }
 }
 

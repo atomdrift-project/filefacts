@@ -327,7 +327,7 @@ fn extract_project(
 
     if !modules.is_empty() {
         let count = modules.len() as f64;
-        values.insert("office.vba.modules", JsonValue::Array(modules));
+        values.insert_key(value_key!("office.vba.modules"), JsonValue::Array(modules));
         metrics.insert(metric!("office.vba.module_count"), count);
         // Aggregate symbol-extraction counters surface as metrics so
         // composite rules can count obfuscation signals without
@@ -390,7 +390,7 @@ fn extract_project(
         }
         if total_idents > 0 {
             metrics.insert(
-                metric!("office.vba.mean_identifier_length"),
+                metric!("office.vba.avg_identifier_length"),
                 total_chars as f64 / f64::from(total_idents),
             );
         }

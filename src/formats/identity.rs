@@ -456,11 +456,11 @@ fn dwarf_producer(values: &Values, id: &mut Identity) {
 /// Alpine `.PKGINFO` is a publisher manifest in the same family as a wheel's
 /// `METADATA` or a gem's `metadata.gz`, so it maps the same way.
 fn apk_alpine(values: &Values, id: &mut Identity) {
-    if let Some(name) = get_str(values, value_key!("apk.pkgname")) {
-        id.name = Some(Claim::claimed(name, "apk.pkgname"));
+    if let Some(name) = get_str(values, value_key!("apk.name")) {
+        id.name = Some(Claim::claimed(name, "apk.name"));
     }
-    if let Some(version) = get_str(values, value_key!("apk.pkgver")) {
-        id.version = Some(Claim::claimed(version, "apk.pkgver"));
+    if let Some(version) = get_str(values, value_key!("apk.version")) {
+        id.version = Some(Claim::claimed(version, "apk.version"));
     }
     // `origin` names the source build a package came out of -- the project,
     // where `pkgname` may be only one of its subpackages.
@@ -481,8 +481,8 @@ fn apk_alpine(values: &Values, id: &mut Identity) {
             push_author(id, name, email, None, role, key.as_str());
         }
     }
-    if let Some(url) = get_str(values, value_key!("apk.url")) {
-        push_url(id, UrlKind::Homepage, url, "apk.url");
+    if let Some(url) = get_str(values, value_key!("apk.homepage")) {
+        push_url(id, UrlKind::Homepage, url, "apk.homepage");
     }
     // The commit the package was built from, and the digest of its data
     // segment: both pin this artifact to a specific build.
@@ -574,8 +574,8 @@ fn crx(values: &Values, id: &mut Identity) {
         "author",
         "crx.author",
     );
-    if let Some(home) = get_str(values, value_key!("crx.homepage_url")) {
-        push_url(id, UrlKind::Homepage, home, "crx.homepage_url");
+    if let Some(home) = get_str(values, value_key!("crx.homepage")) {
+        push_url(id, UrlKind::Homepage, home, "crx.homepage");
     }
 }
 
@@ -598,17 +598,17 @@ fn xpi(values: &Values, id: &mut Identity) {
         "author",
         "xpi.author",
     );
-    if let Some(home) = get_str(values, value_key!("xpi.homepage_url")) {
-        push_url(id, UrlKind::Homepage, home, "xpi.homepage_url");
+    if let Some(home) = get_str(values, value_key!("xpi.homepage")) {
+        push_url(id, UrlKind::Homepage, home, "xpi.homepage");
     }
 }
 
 fn nupkg(values: &Values, id: &mut Identity) {
-    if let Some(pkg_id) = get_str(values, value_key!("nupkg.id")) {
-        id.identifier = Some(Claim::claimed(pkg_id, "nupkg.id"));
+    if let Some(pkg_id) = get_str(values, value_key!("nupkg.name")) {
+        id.identifier = Some(Claim::claimed(pkg_id, "nupkg.name"));
     }
     if let Some(name) = get_str(values, value_key!("nupkg.title"))
-        .or_else(|| get_str(values, value_key!("nupkg.id")))
+        .or_else(|| get_str(values, value_key!("nupkg.name")))
     {
         id.name = Some(Claim::claimed(name, "nupkg.title"));
     }
@@ -621,11 +621,11 @@ fn nupkg(values: &Values, id: &mut Identity) {
     for owner in split_list(get_str(values, value_key!("nupkg.owners"))) {
         push_author(id, Some(owner), None, None, "owner", "nupkg.owners");
     }
-    if let Some(url) = get_str(values, value_key!("nupkg.project_url")) {
-        push_url(id, UrlKind::Homepage, url, "nupkg.project_url");
+    if let Some(url) = get_str(values, value_key!("nupkg.homepage")) {
+        push_url(id, UrlKind::Homepage, url, "nupkg.homepage");
     }
-    if let Some(url) = get_str(values, value_key!("nupkg.repository_url")) {
-        push_url(id, UrlKind::Repository, url, "nupkg.repository_url");
+    if let Some(url) = get_str(values, value_key!("nupkg.repository")) {
+        push_url(id, UrlKind::Repository, url, "nupkg.repository");
     }
 }
 
@@ -668,8 +668,8 @@ fn wheel(values: &Values, id: &mut Identity) {
         get_str(values, value_key!("whl.maintainer_email")),
     );
     push_author(id, m_name, m_email, None, "maintainer", "whl.maintainer");
-    if let Some(home) = get_str(values, value_key!("whl.home_page")) {
-        push_url(id, UrlKind::Homepage, home, "whl.home_page");
+    if let Some(home) = get_str(values, value_key!("whl.homepage")) {
+        push_url(id, UrlKind::Homepage, home, "whl.homepage");
     }
 }
 
@@ -852,14 +852,14 @@ fn rpm(values: &Values, id: &mut Identity) {
         let (name, email, url) = parse_person(packager);
         push_author(id, name, email, url, "packager", "rpm.packager");
     }
-    if let Some(url) = get_str(values, value_key!("rpm.url")) {
-        push_url(id, UrlKind::Homepage, url, "rpm.url");
+    if let Some(url) = get_str(values, value_key!("rpm.homepage")) {
+        push_url(id, UrlKind::Homepage, url, "rpm.homepage");
     }
 }
 
 fn deb(values: &Values, id: &mut Identity) {
-    if let Some(name) = get_str(values, value_key!("deb.package")) {
-        id.name = Some(Claim::claimed(name, "deb.package"));
+    if let Some(name) = get_str(values, value_key!("deb.name")) {
+        id.name = Some(Claim::claimed(name, "deb.name"));
     }
     if let Some(version) = get_str(values, value_key!("deb.version")) {
         id.version = Some(Claim::claimed(version, "deb.version"));
@@ -888,7 +888,7 @@ const DESCRIPTION_KEYS: &[ValueKey] = &[
     value_key!("xpi.description"),
     value_key!("deb.summary"),
     value_key!("rpm.summary"),
-    value_key!("apk.pkgdesc"),
+    value_key!("apk.description"),
     value_key!("pe.version.description"),
 ];
 
@@ -1049,6 +1049,9 @@ fn png(values: &Values, id: &mut Identity) {
 /// is whatever its owner named it. Neither is chosen for distribution, which
 /// is what makes them useful for grouping a campaign's shortcuts together.
 fn lnk(values: &Values, id: &mut Identity) {
+    // The build machine's NetBIOS name, when the shortcut carries a tracker.
+    // The TrackerDataBlock calls it `MachineID`, so that is the field the
+    // extractor writes and the claim this reports.
     if let Some(machine) = get_str_at(values, value_key!("lnk.tracker"), "machine_id") {
         id.unique_ids
             .insert("machine_id".into(), machine.to_string());
@@ -1069,13 +1072,6 @@ fn lnk(values: &Values, id: &mut Identity) {
     if let Some(label) = get_str_at(values, value_key!("lnk.volume"), "name") {
         id.unique_ids
             .insert("lnk_volume_label".into(), label.to_string());
-    }
-    // The build machine's own name, when the shortcut carries a tracker. The
-    // TrackerDataBlock calls its NetBIOS name `MachineID`, so that is the
-    // field the extractor writes.
-    if let Some(host) = get_str_at(values, value_key!("lnk.tracker"), "machine_id") {
-        id.unique_ids
-            .insert("lnk_machine_name".into(), host.to_string());
     }
 }
 
@@ -1853,7 +1849,7 @@ mod description_tests {
             (FileType::Xpi, "xpi.description"),
             (FileType::Deb, "deb.summary"),
             (FileType::Rpm, "rpm.summary"),
-            (FileType::ApkAlpine, "apk.pkgdesc"),
+            (FileType::ApkAlpine, "apk.description"),
             (FileType::Pe, "pe.version.description"),
         ] {
             assert_eq!(
@@ -1928,5 +1924,38 @@ mod description_tests {
         let (cut, _) = describe(FileType::Npm, "npm.description", &long).expect("cut");
         assert_eq!(cut.chars().count(), MAX_DESCRIPTION);
         assert!(cut.ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod lnk_identity_tests {
+    use super::{FileType, Values, derive};
+
+    /// The tracker's NetBIOS name is reported once, as `machine_id`; it
+    /// used to be duplicated under `lnk_machine_name`.
+    #[test]
+    fn tracker_machine_name_is_reported_once() {
+        let mut values = Values::default();
+        values.insert(
+            "lnk.tracker",
+            serde_json::json!({"machine_id": "build-host-01", "mac_address": "22:33:44:55:66:77"}),
+        );
+        values.insert(
+            "lnk.volume",
+            serde_json::json!({"serial": 3_405_691_582u64, "name": "DATA"}),
+        );
+        let ids = derive(FileType::Lnk, b"", &values).unique_ids;
+        let keys: Vec<&str> = ids.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "lnk_volume_label",
+                "lnk_volume_serial",
+                "mac_address",
+                "machine_id"
+            ]
+        );
+        assert_eq!(ids["machine_id"], "build-host-01");
+        assert_eq!(ids["lnk_volume_serial"], "3405691582");
     }
 }

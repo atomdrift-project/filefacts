@@ -152,10 +152,7 @@ pub(super) fn emit(
         metrics.insert(metric!("comments.code"), f64::from(code_in_comments));
     }
     if url_in_comments > 0 {
-        metrics.insert(
-            metric!("comments.url_in_comments"),
-            f64::from(url_in_comments),
-        );
+        metrics.insert(metric!("comments.url_count"), f64::from(url_in_comments));
     }
     if base64_in_comments > 0 {
         metrics.insert(metric!("comments.base64"), f64::from(base64_in_comments));

@@ -229,7 +229,7 @@ fn emit_line_metrics(content: &str, metrics: &mut Metrics) {
     }
     if max_inline_whitespace_run > 0 {
         metrics.insert(
-            metric!("text.max_ws_run"),
+            metric!("text.max_whitespace_run"),
             f64::from(max_inline_whitespace_run),
         );
     }
@@ -611,11 +611,11 @@ mod tests {
     fn max_inline_whitespace_run_detects_payload_padding() {
         let padded = format!("export default config;{}global['!']=1;", " ".repeat(500));
         let m = run(&padded);
-        assert_eq!(m.get("text.max_ws_run"), Some(500.0));
+        assert_eq!(m.get("text.max_whitespace_run"), Some(500.0));
 
         // Leading indent should not count.
         let indented = format!("{}function foo() {{}}", " ".repeat(200));
         let m = run(&indented);
-        assert_eq!(m.get("text.max_ws_run"), Some(1.0));
+        assert_eq!(m.get("text.max_whitespace_run"), Some(1.0));
     }
 }

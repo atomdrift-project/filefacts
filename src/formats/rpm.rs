@@ -31,7 +31,7 @@ use serde_json::{Value as JsonValue, json};
 use crate::error::Error;
 use crate::formats::common::bytes_at::u32_be;
 use crate::formats::common::{XorScan, extract_binary_strings, put_str};
-use crate::output::{Errors, Metrics, Stage, Strings, Values};
+use crate::output::{Errors, Metrics, Stage, Strings, ValueKey, Values};
 use crate::value_key;
 
 const RPM_LEAD_MAGIC: [u8; 4] = [0xed, 0xab, 0xee, 0xdb];
@@ -126,7 +126,7 @@ pub(super) fn extract(
                     .collect(),
             ),
         );
-        values.insert("rpm.signature", JsonValue::Object(sig));
+        values.insert_key(value_key!("rpm.signature"), JsonValue::Object(sig));
     }
     // Advance past the signature header and round up to the 8-byte
     // alignment boundary the main header is expected to sit at.
@@ -278,47 +278,66 @@ fn apply_main_tag(entry: &IndexEntry, data: &[u8], values: &mut Values, metrics:
     match entry.tag {
         main_tag::NAME => set_string(values, value_key!("rpm.name"), entry, data),
         main_tag::VERSION => set_string(values, value_key!("rpm.version"), entry, data),
-        main_tag::RELEASE => set_string(values, "rpm.release", entry, data),
-        main_tag::EPOCH => set_u32(values, metrics, metric!("rpm.epoch"), entry, data),
+        main_tag::RELEASE => set_string(values, value_key!("rpm.release"), entry, data),
+        main_tag::EPOCH => set_u32(
+            values,
+            metrics,
+            value_key!("rpm.epoch"),
+            metric!("rpm.epoch"),
+            entry,
+            data,
+        ),
         main_tag::SUMMARY => set_string(values, value_key!("rpm.summary"), entry, data),
-        main_tag::BUILDTIME => set_u32(values, metrics, metric!("rpm.buildtime"), entry, data),
-        main_tag::BUILDHOST => set_string(values, "rpm.buildhost", entry, data),
-        main_tag::DISTRIBUTION => set_string(values, "rpm.distribution", entry, data),
+        main_tag::BUILDTIME => set_u32(
+            values,
+            metrics,
+            value_key!("rpm.buildtime"),
+            metric!("rpm.buildtime"),
+            entry,
+            data,
+        ),
+        main_tag::BUILDHOST => set_string(values, value_key!("rpm.buildhost"), entry, data),
+        main_tag::DISTRIBUTION => set_string(values, value_key!("rpm.distribution"), entry, data),
         main_tag::VENDOR => set_string(values, value_key!("rpm.vendor"), entry, data),
-        main_tag::LICENSE => set_string(values, "rpm.license", entry, data),
+        main_tag::LICENSE => set_string(values, value_key!("rpm.license"), entry, data),
         main_tag::PACKAGER => set_string(values, value_key!("rpm.packager"), entry, data),
-        main_tag::GROUP => set_string(values, "rpm.group", entry, data),
-        main_tag::URL => set_string(values, value_key!("rpm.url"), entry, data),
-        main_tag::OS => set_string(values, "rpm.os", entry, data),
-        main_tag::ARCH => set_string(values, "rpm.arch", entry, data),
-        main_tag::RPMVERSION => set_string(values, "rpm.rpmversion", entry, data),
-        main_tag::COOKIE => set_string(values, "rpm.cookie", entry, data),
-        main_tag::SOURCERPM => set_string(values, "rpm.sourcerpm", entry, data),
-        main_tag::PLATFORM => set_string(values, "rpm.platform", entry, data),
-        main_tag::PAYLOADFORMAT => set_string(values, "rpm.payload_format", entry, data),
-        main_tag::PAYLOADCOMPRESSOR => set_string(values, "rpm.payload_compressor", entry, data),
-        main_tag::PAYLOADFLAGS => set_string(values, "rpm.payload_flags", entry, data),
+        main_tag::GROUP => set_string(values, value_key!("rpm.group"), entry, data),
+        main_tag::URL => set_string(values, value_key!("rpm.homepage"), entry, data),
+        main_tag::OS => set_string(values, value_key!("rpm.os"), entry, data),
+        main_tag::ARCH => set_string(values, value_key!("rpm.arch"), entry, data),
+        main_tag::RPMVERSION => set_string(values, value_key!("rpm.rpmversion"), entry, data),
+        main_tag::COOKIE => set_string(values, value_key!("rpm.cookie"), entry, data),
+        main_tag::SOURCERPM => set_string(values, value_key!("rpm.sourcerpm"), entry, data),
+        main_tag::PLATFORM => set_string(values, value_key!("rpm.platform"), entry, data),
+        main_tag::PAYLOADFORMAT => {
+            set_string(values, value_key!("rpm.payload_format"), entry, data)
+        }
+        main_tag::PAYLOADCOMPRESSOR => {
+            set_string(values, value_key!("rpm.payload_compressor"), entry, data)
+        }
+        main_tag::PAYLOADFLAGS => set_string(values, value_key!("rpm.payload_flags"), entry, data),
         _ => {}
     }
 }
 
-/// `key` is a plain string or a checked key from `value_key!`.
-fn set_string(values: &mut Values, key: impl AsRef<str>, entry: &IndexEntry, data: &[u8]) {
+fn set_string(values: &mut Values, key: ValueKey, entry: &IndexEntry, data: &[u8]) {
     if let Some(v) = decode_string(entry, data) {
         put_str(values, key, v);
     }
 }
 
+/// Record an integer tag as both a value and a metric, under the same name.
 fn set_u32(
     values: &mut Values,
     metrics: &mut Metrics,
-    key: crate::MetricKey,
+    value_key: ValueKey,
+    metric_key: crate::MetricKey,
     entry: &IndexEntry,
     data: &[u8],
 ) {
     if let Some(v) = decode_u32(entry, data) {
-        values.insert(key.as_str(), json!(v));
-        metrics.insert(key, f64::from(v));
+        values.insert_key(value_key, json!(v));
+        metrics.insert(metric_key, f64::from(v));
     }
 }
 
@@ -371,9 +390,10 @@ impl HeaderError {
             Self::Malformed(why) => {
                 errors.record_malformed(Stage::RpmParse, format!("{stage}: {why}"))
             }
-            Self::TooLarge(reason) => {
-                values.insert("rpm.limits", json!([{ "stage": stage, "reason": reason }]))
-            }
+            Self::TooLarge(reason) => values.insert_key(
+                value_key!("rpm.limits"),
+                json!([{ "stage": stage, "reason": reason }]),
+            ),
         }
     }
 }
@@ -474,7 +494,7 @@ mod tests {
             tags.push((program, 6, 1, b"/bin/sh\0".to_vec()));
         }
         let bytes = script_rpm(tags);
-        let parsed = crate::open(&bytes).unwrap();
+        let parsed = crate::open(&bytes);
         let sources: Vec<_> = parsed.embedded_sources().collect();
         assert_eq!(sources.len(), 9);
         for (name, _, _, _) in SCRIPTLETS {
@@ -506,7 +526,7 @@ mod tests {
                 tags.push((1086, 8, 1, format!("{program}\0").into_bytes()));
             }
             let bytes = script_rpm(tags);
-            let parsed = crate::open(&bytes).unwrap();
+            let parsed = crate::open(&bytes);
             assert_eq!(
                 parsed.embedded_sources().next().unwrap().file_type,
                 expected
@@ -517,7 +537,7 @@ mod tests {
             (1086, 8, 2, b"/bin/sh\0-c\0".to_vec()),
         ] {
             let bytes = script_rpm(vec![(1024, 6, 1, b"echo 'ready'\0".to_vec()), tag]);
-            let parsed = crate::open(&bytes).unwrap();
+            let parsed = crate::open(&bytes);
             assert!(
                 parsed
                     .embedded_sources()
@@ -538,7 +558,7 @@ mod tests {
             (1023, 6, 1, vec![0xff, 0]),
         ] {
             let bytes = script_rpm(vec![bad, (1024, 6, 1, b"echo 'ready'\0".to_vec())]);
-            let parsed = crate::open(&bytes).unwrap();
+            let parsed = crate::open(&bytes);
             assert_eq!(parsed.embedded_sources().count(), 1);
             assert!(!parsed.errors().is_empty());
         }
@@ -547,7 +567,7 @@ mod tests {
                 (1024, 6, 1, b"echo 'ready'\0".to_vec()),
                 (1023, 6, 1, bad),
             ]);
-            let parsed = crate::open(&bytes).unwrap();
+            let parsed = crate::open(&bytes);
             assert_eq!(parsed.embedded_sources().count(), 1);
             assert!(!parsed.errors().is_empty());
         }
@@ -560,7 +580,7 @@ mod tests {
             (1024, 6, 1, b"echo second\0".to_vec()),
             (1026, 6, 1, b"echo third\0".to_vec()),
         ]);
-        let parsed = crate::open(&bytes).unwrap();
+        let parsed = crate::open(&bytes);
         assert_eq!(parsed.embedded_sources().count(), 1);
         assert!(!parsed.errors().is_empty());
         for bad in [
@@ -573,7 +593,7 @@ mod tests {
             (5021, 6, 1, b"0\0".to_vec()),
         ] {
             let bytes = script_rpm(vec![(1024, 6, 1, b"echo 'ready'\0".to_vec()), bad]);
-            let parsed = crate::open(&bytes).unwrap();
+            let parsed = crate::open(&bytes);
             assert!(
                 parsed
                     .embedded_sources()
@@ -593,7 +613,7 @@ mod tests {
             (1004, 9, 1, b"echo 'ready'\0".to_vec()),
             (1086, 8, 1, b"/bin/sh\0".to_vec()),
         ]);
-        let parsed = crate::open(&bytes).unwrap();
+        let parsed = crate::open(&bytes);
         assert_eq!(parsed.embedded_sources().count(), 0);
         assert!(parsed.errors().is_empty());
     }

@@ -21,7 +21,8 @@
 use serde_json::Value as JsonValue;
 
 use crate::formats::common::put_str;
-use crate::output::Values;
+use crate::output::{ValueKey, Values};
+use crate::value_key;
 
 #[allow(dead_code)]
 pub(super) fn extract(manifest_bytes: &[u8], values: &mut Values) {
@@ -38,7 +39,8 @@ pub(super) fn extract_at(manifest_bytes: &[u8], file_offset: Option<u64>, values
     {
         put_str_at(
             values,
-            "pe.manifest.requested_execution_level",
+            value_key!("pe.manifest.requested_execution_level"),
+            value_key!("pe.manifest.requested_execution_level_offset"),
             level,
             file_offset,
             manifest_bytes,
@@ -50,7 +52,8 @@ pub(super) fn extract_at(manifest_bytes: &[u8], file_offset: Option<u64>, values
     {
         put_str_at(
             values,
-            "pe.manifest.ui_access",
+            value_key!("pe.manifest.ui_access"),
+            value_key!("pe.manifest.ui_access_offset"),
             ui,
             file_offset,
             manifest_bytes,
@@ -67,7 +70,8 @@ pub(super) fn extract_at(manifest_bytes: &[u8], file_offset: Option<u64>, values
         if let Some((name, rel)) = attr_value_in_tag_with_offset(tag, "name") {
             put_str_at(
                 values,
-                "pe.manifest.assembly_identity.name",
+                value_key!("pe.manifest.assembly_identity.name"),
+                value_key!("pe.manifest.assembly_identity.name_offset"),
                 name,
                 file_offset,
                 manifest_bytes,
@@ -77,7 +81,8 @@ pub(super) fn extract_at(manifest_bytes: &[u8], file_offset: Option<u64>, values
         if let Some((version, rel)) = attr_value_in_tag_with_offset(tag, "version") {
             put_str_at(
                 values,
-                "pe.manifest.assembly_identity.version",
+                value_key!("pe.manifest.assembly_identity.version"),
+                value_key!("pe.manifest.assembly_identity.version_offset"),
                 version,
                 file_offset,
                 manifest_bytes,
@@ -91,8 +96,8 @@ pub(super) fn extract_at(manifest_bytes: &[u8], file_offset: Option<u64>, values
     // as `"name@version"` to mirror the `elf.needed_versions` shape.
     let deps = dependencies(text);
     if !deps.is_empty() {
-        values.insert(
-            "pe.manifest.dependencies",
+        values.insert_key(
+            value_key!("pe.manifest.dependencies"),
             JsonValue::Array(deps.into_iter().map(JsonValue::String).collect()),
         );
     }
@@ -103,7 +108,8 @@ pub(super) fn extract_at(manifest_bytes: &[u8], file_offset: Option<u64>, values
     if let Some((desc, rel)) = element_text_with_offset(text, "description") {
         put_str_at(
             values,
-            "pe.manifest.description",
+            value_key!("pe.manifest.description"),
+            value_key!("pe.manifest.description_offset"),
             desc,
             file_offset,
             manifest_bytes,
@@ -116,7 +122,10 @@ pub(super) fn extract_at(manifest_bytes: &[u8], file_offset: Option<u64>, values
         .map(JsonValue::String)
         .collect();
     if !supported.is_empty() {
-        values.insert("pe.manifest.supported_os", JsonValue::Array(supported));
+        values.insert_key(
+            value_key!("pe.manifest.supported_os"),
+            JsonValue::Array(supported),
+        );
     }
 
     // `dpiAware` and `dpiAwareness` are element text nodes, not
@@ -125,7 +134,8 @@ pub(super) fn extract_at(manifest_bytes: &[u8], file_offset: Option<u64>, values
     if let Some((v, rel)) = element_text_with_offset(text, "dpiAware") {
         put_str_at(
             values,
-            "pe.manifest.dpi_aware",
+            value_key!("pe.manifest.dpi_aware"),
+            value_key!("pe.manifest.dpi_aware_offset"),
             v,
             file_offset,
             manifest_bytes,
@@ -135,7 +145,8 @@ pub(super) fn extract_at(manifest_bytes: &[u8], file_offset: Option<u64>, values
     if let Some((v, rel)) = element_text_with_offset(text, "dpiAwareness") {
         put_str_at(
             values,
-            "pe.manifest.dpi_awareness",
+            value_key!("pe.manifest.dpi_awareness"),
+            value_key!("pe.manifest.dpi_awareness_offset"),
             v,
             file_offset,
             manifest_bytes,
@@ -145,7 +156,8 @@ pub(super) fn extract_at(manifest_bytes: &[u8], file_offset: Option<u64>, values
     if let Some((v, rel)) = element_text_with_offset(text, "longPathAware") {
         put_str_at(
             values,
-            "pe.manifest.long_path_aware",
+            value_key!("pe.manifest.long_path_aware"),
+            value_key!("pe.manifest.long_path_aware_offset"),
             v,
             file_offset,
             manifest_bytes,
@@ -155,7 +167,8 @@ pub(super) fn extract_at(manifest_bytes: &[u8], file_offset: Option<u64>, values
     if let Some((v, rel)) = element_text_with_offset(text, "autoElevate") {
         put_str_at(
             values,
-            "pe.manifest.auto_elevate",
+            value_key!("pe.manifest.auto_elevate"),
+            value_key!("pe.manifest.auto_elevate_offset"),
             v,
             file_offset,
             manifest_bytes,
@@ -164,14 +177,16 @@ pub(super) fn extract_at(manifest_bytes: &[u8], file_offset: Option<u64>, values
     }
 }
 
-/// Store a manifest value and, when the resource parser gave us the resource's
-/// file offset, store the exact byte offset of the value's first UTF-8 byte.
+/// Store a manifest value at `key` and, when the resource parser gave us the
+/// resource's file offset, store the exact byte offset of the value's first
+/// UTF-8 byte at `offset_key` (the key's `_offset` companion).
 /// The offset is intentionally omitted when the enclosing resource could not be
 /// mapped back to the input buffer; a semantic label is safer than a guessed
 /// header offset in that degraded case.
 fn put_str_at(
     values: &mut Values,
-    path: &str,
+    key: ValueKey,
+    offset_key: ValueKey,
     value: String,
     file_offset: Option<u64>,
     manifest_bytes: &[u8],
@@ -185,12 +200,9 @@ fn put_str_at(
             })
             .map(|relative| base.saturating_add(relative as u64))
     });
-    put_str(values, path, value);
+    put_str(values, key, value);
     if let Some(offset) = value_offset {
-        values.insert(
-            &format!("{path}_offset"),
-            serde_json::Value::Number(offset.into()),
-        );
+        values.insert_key(offset_key, serde_json::Value::Number(offset.into()));
     }
 }
 

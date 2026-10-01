@@ -12,6 +12,7 @@
 //! so a bad chunk stops the walk and keeps what came before it.
 
 use super::common::bytes_at::{u16_le, u32_le};
+use crate::value_key;
 
 /// One parsed element: its tag name and resolved attributes.
 pub(super) struct Element {
@@ -187,7 +188,10 @@ pub(super) fn extract_values(bytes: &[u8], values: &mut crate::output::Values) {
         })
         .collect();
     if !flattened.is_empty() {
-        values.insert("android_xml.values", serde_json::Value::Array(flattened));
+        values.insert_key(
+            value_key!("android_xml.values"),
+            serde_json::Value::Array(flattened),
+        );
     }
 }
 

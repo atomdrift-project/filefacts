@@ -420,7 +420,9 @@ mod tests {
     #[test]
     fn shell_function_statements_are_not_parameters() {
         let src = b"greet() {\n  echo a\n  echo b\n  echo c\n}\n";
-        let parsed = crate::open_with_path(std::path::Path::new("f.sh"), src).unwrap();
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new("f.sh"))
+            .open(src);
         let metrics = parsed.metrics();
         assert_eq!(metrics.get("functions.no_params_count"), Some(1.0));
         assert_eq!(metrics.get("functions.max_params"), None);

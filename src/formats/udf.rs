@@ -21,7 +21,7 @@
 //!   the UDF equivalent of the ISO 9660 builder stamp.
 //! - `iso.udf.partition_contents` — `+NSR02`/`+NSR03` (a real filesystem)
 //!   vs `+CD001` (an ISO 9660 shadow partition).
-//! - `iso.udf.file_count` / `iso.udf.dir_count` — from the tree walk.
+//! - `iso.udf.file_count` / `iso.udf.directory_count` — from the tree walk.
 
 use crate::metric;
 use serde_json::Value as JsonValue;
@@ -141,10 +141,16 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
             );
         }
         if !lv.domain.is_empty() {
-            values.insert("iso.udf.domain", JsonValue::String(lv.domain.clone()));
+            values.insert_key(
+                value_key!("iso.udf.domain"),
+                JsonValue::String(lv.domain.clone()),
+            );
         }
         if let Some(rev) = &lv.revision {
-            values.insert("iso.udf.revision", JsonValue::String(rev.clone()));
+            values.insert_key(
+                value_key!("iso.udf.revision"),
+                JsonValue::String(rev.clone()),
+            );
         }
         metrics.insert(
             metric!("iso.udf.logical_block_size"),
@@ -161,8 +167,8 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
         values.insert_key(value_key!("iso.udf.volume_set_id"), JsonValue::String(id));
     }
     if let Some(p) = &partition {
-        values.insert(
-            "iso.udf.partition_contents",
+        values.insert_key(
+            value_key!("iso.udf.partition_contents"),
             JsonValue::String(p.contents.clone()),
         );
         metrics.insert(metric!("iso.udf.partition_start_lba"), f64::from(p.start));
@@ -194,7 +200,7 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
         return facts;
     }
     if let Some(id) = dstring(fsd.get(304..336)) {
-        values.insert("iso.udf.file_set_id", JsonValue::String(id));
+        values.insert_key(value_key!("iso.udf.file_set_id"), JsonValue::String(id));
     }
     let Some(root) = LongAd::parse(fsd.get(400..416)) else {
         return facts;
@@ -206,9 +212,9 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
     facts.members = walk.members;
 
     metrics.insert(metric!("iso.udf.file_count"), walk.file_count as f64);
-    metrics.insert(metric!("iso.udf.dir_count"), walk.dir_count as f64);
+    metrics.insert(metric!("iso.udf.directory_count"), walk.dir_count as f64);
     if walk.truncated {
-        values.insert("iso.udf.tree_truncated", JsonValue::Bool(true));
+        values.insert_key(value_key!("iso.udf.tree_truncated"), JsonValue::Bool(true));
     }
     facts
 }

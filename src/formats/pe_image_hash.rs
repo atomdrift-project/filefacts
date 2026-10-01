@@ -256,6 +256,7 @@ mod tests {
             &mut sections,
             &mut symbols,
             &mut errors,
+            &crate::rizin::Settings::default(),
         )
         .unwrap();
         (v, m)

@@ -41,6 +41,9 @@ pub(crate) struct ExtractCtx<'a> {
     /// The repeating XOR key identification recovered (see
     /// [`crate::FileId::xor_pe_key`]), recorded as the `xor.*` facts.
     pub(crate) xor_pe_key: Option<stng::RepeatingXorKey>,
+    /// This open's rizin settings, for the native-binary extractors' symbol
+    /// recovery (see [`common::rizin_fallback`]).
+    pub(crate) rizin: crate::rizin::Settings,
 }
 
 mod apk_alpine;
@@ -164,6 +167,7 @@ pub(crate) fn extract(
         image_end,
         basename,
         xor_pe_key,
+        rizin,
     } = ctx;
     // Every file gets the generic byte-level metrics. Format-specific
     // extractors layer on top of (and may shadow with more accurate
@@ -187,25 +191,27 @@ pub(crate) fn extract(
     // Arch `.pkg.tar.*` is resolved from the bytes. Non-archive types emit
     // nothing.
     if let Some(container) = crate::fileid::container_of(file_type, bytes) {
-        values.insert(
-            "archive.container.archive",
+        values.insert_key(
+            value_key!("archive.container.archive"),
             serde_json::Value::String(container.archive.label().into()),
         );
-        values.insert(
-            "archive.container.compression",
+        values.insert_key(
+            value_key!("archive.container.compression"),
             serde_json::Value::String(container.compression.label().into()),
         );
     }
 
     let result = match file_type {
         FileType::AppleScript => scpt::extract(bytes, values, strings, metrics, symbols),
-        FileType::Pe => pe::extract(bytes, values, strings, metrics, sections, symbols, errors),
+        FileType::Pe => pe::extract(
+            bytes, values, strings, metrics, sections, symbols, errors, &rizin,
+        ),
         FileType::Elf => elf::extract(
-            bytes, values, strings, metrics, sections, symbols, errors, image_end,
+            bytes, values, strings, metrics, sections, symbols, errors, image_end, &rizin,
         ),
         FileType::Wasm => wasm::extract(bytes, values, strings, metrics, sections, symbols, errors),
         FileType::MachO => macho::extract(
-            bytes, values, strings, metrics, sections, symbols, errors, image_end,
+            bytes, values, strings, metrics, sections, symbols, errors, image_end, &rizin,
         ),
         // An APK is a zip: walk it for members, then read AndroidManifest.xml
         // and the v1 signature block for the android.* identity facts.
@@ -386,6 +392,13 @@ pub(crate) fn extract(
         FileType::PkgInfo => structured::extract_pkginfo(bytes, values),
         FileType::SrcInfo => pkgmeta::extract_srcinfo(bytes, values),
         FileType::Registry => registry::extract(bytes, values, metrics),
+        // A Windows registry export is a text script, not package metadata:
+        // `text.*` metrics for the UTF-8 spellings, and the shared string scan
+        // below for every encoding (`regedit` writes UTF-16LE).
+        FileType::Reg => {
+            source::extract_text_only(bytes, metrics);
+            Ok(())
+        }
         FileType::Chm => chm::extract(bytes, values, strings, metrics, image_end),
         FileType::JavaClass => class::extract(bytes, values, strings, metrics, symbols),
         FileType::Jpeg => jpeg::extract(bytes, values, strings, metrics),
@@ -586,7 +599,7 @@ mod cws_string_tests {
         let mut file = b"CWS\x08".to_vec();
         file.extend_from_slice(&((8 + movie.len()) as u32).to_le_bytes());
         file.extend_from_slice(&compressed);
-        let opened = crate::open(&file).unwrap();
+        let opened = crate::open(&file);
         let extracted = opened.extracted();
         let text: Vec<&str> = extracted
             .strings

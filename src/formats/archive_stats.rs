@@ -369,14 +369,20 @@ impl ArchiveStats {
             }
             Agg::Methods { always } => {
                 if always || !self.methods.is_empty() {
-                    values.insert("archive.compression.methods", key_list(&self.methods));
+                    values.insert_key(
+                        value_key!("archive.compression.methods"),
+                        key_list(&self.methods),
+                    );
                     for (method, count) in &self.methods {
                         metrics.insert(crate::archive_method_count(method), *count as f64);
                     }
                 }
             }
             Agg::EntryTypes => {
-                values.insert("archive.format.entry_types", key_list(&self.entry_types));
+                values.insert_key(
+                    value_key!("archive.format.entry_types"),
+                    key_list(&self.entry_types),
+                );
                 for (entry_type, count) in &self.entry_types {
                     metrics.insert(
                         crate::archive_entry_type_count(&entry_type.replace('-', "_")),
@@ -487,8 +493,14 @@ impl ArchiveStats {
         let (Some(min), Some(max)) = (timed().min(), timed().max()) else {
             return;
         };
-        values.insert("archive.timing.mtime_min", JsonValue::Number(min.into()));
-        values.insert("archive.timing.mtime_max", JsonValue::Number(max.into()));
+        values.insert_key(
+            value_key!("archive.timing.mtime_min"),
+            JsonValue::Number(min.into()),
+        );
+        values.insert_key(
+            value_key!("archive.timing.mtime_max"),
+            JsonValue::Number(max.into()),
+        );
         // `abs_diff`: a tar's base-256 mtime can span the whole i64 range.
         metrics.insert(
             metric!("archive.timing.mtime_spread_seconds"),
@@ -539,7 +551,7 @@ impl ArchiveStats {
             Dominance::TimedOnly => count as f64 / total.max(1) as f64,
         };
         metrics.insert(metric!("archive.timing.mtime_dominant_count"), count as f64);
-        metrics.insert(metric!("archive.timing.mtime_dominant_fraction"), fraction);
+        metrics.insert(metric!("archive.timing.mtime_dominant_ratio"), fraction);
         if count.saturating_mul(2) <= total || count >= total {
             return;
         }
@@ -571,8 +583,8 @@ impl ArchiveStats {
                 .collect(),
         };
         if !outliers.is_empty() {
-            values.insert(
-                "archive.timing.mtime_outlier_members",
+            values.insert_key(
+                value_key!("archive.timing.mtime_outlier_members"),
                 JsonValue::Array(outliers),
             );
         }
@@ -1065,7 +1077,7 @@ mod tests {
             Some(3.0)
         );
         assert_eq!(
-            metrics.get("archive.timing.mtime_dominant_fraction"),
+            metrics.get("archive.timing.mtime_dominant_ratio"),
             Some(0.75)
         );
         assert_eq!(metrics.get("archive.timing.mtime_outlier_count"), Some(1.0));
@@ -1093,7 +1105,7 @@ mod tests {
             Some(3.0)
         );
         assert_eq!(
-            metrics.get("archive.timing.mtime_dominant_fraction"),
+            metrics.get("archive.timing.mtime_dominant_ratio"),
             Some(0.6)
         );
         // The unstamped member counts toward the total but is never listed.

@@ -32,7 +32,7 @@ use crate::error::Error;
 use crate::formats::common::{
     XorScan, bytes_at, extract_binary_strings, format_guid, put_str, put_u64,
 };
-use crate::output::{Metrics, Strings, Values};
+use crate::output::{Metrics, Strings, ValueKey, Values};
 use crate::value_key;
 
 /// `{0001-4C00-0000-0000-AA00-3826B3713F}` — the canonical CLSID
@@ -136,7 +136,7 @@ pub(super) fn extract(
             ),
         );
     }
-    values.insert("lnk.header", JsonValue::Object(header));
+    values.insert_key(value_key!("lnk.header"), JsonValue::Object(header));
 
     // StringData sections.
     let is_unicode = link_flags & FLAG_IS_UNICODE != 0;
@@ -172,18 +172,39 @@ pub(super) fn extract(
     // fallback when there's no IDList (per MS-SHLLINK §2.5).
     if let Some((p, at)) = id_list_path.or(link_info_path) {
         if !p.is_empty() {
-            put_str(values, "lnk.target_path", p);
-            put_u64(values, "lnk.target_path_offset", at as u64);
+            put_str(values, value_key!("lnk.target_path"), p);
+            put_u64(values, value_key!("lnk.target_path_offset"), at as u64);
         }
     }
-    let string_keys: &[(u32, &str)] = &[
-        (FLAG_HAS_NAME, "lnk.description"),
-        (FLAG_HAS_RELATIVE_PATH, "lnk.relative_path"),
-        (FLAG_HAS_WORKING_DIR, "lnk.working_directory"),
-        (FLAG_HAS_ARGUMENTS, "lnk.arguments"),
-        (FLAG_HAS_ICON_LOCATION, "lnk.icon_location"),
+    // Each StringData field with the key of its `_offset` companion.
+    let string_keys: &[(u32, ValueKey, ValueKey)] = &[
+        (
+            FLAG_HAS_NAME,
+            value_key!("lnk.description"),
+            value_key!("lnk.description_offset"),
+        ),
+        (
+            FLAG_HAS_RELATIVE_PATH,
+            value_key!("lnk.relative_path"),
+            value_key!("lnk.relative_path_offset"),
+        ),
+        (
+            FLAG_HAS_WORKING_DIR,
+            value_key!("lnk.working_directory"),
+            value_key!("lnk.working_directory_offset"),
+        ),
+        (
+            FLAG_HAS_ARGUMENTS,
+            value_key!("lnk.arguments"),
+            value_key!("lnk.arguments_offset"),
+        ),
+        (
+            FLAG_HAS_ICON_LOCATION,
+            value_key!("lnk.icon_location"),
+            value_key!("lnk.icon_location_offset"),
+        ),
     ];
-    for (flag, key) in string_keys {
+    for &(flag, key, offset_key) in string_keys {
         if link_flags & flag == 0 {
             continue;
         }
@@ -195,7 +216,7 @@ pub(super) fn extract(
                     // padded argument fields to push the real command
                     // past the visible end of the properties dialog —
                     // detection traits consume these metric fields.
-                    if *key == "lnk.arguments" {
+                    if flag == FLAG_HAS_ARGUMENTS {
                         emit_argument_whitespace_metrics(metrics, &value);
                     }
                     put_str(values, key, value);
@@ -203,7 +224,7 @@ pub(super) fn extract(
                     // length prefix precede it). Consumers read the
                     // `<path>_offset` companion to turn a `value:` match
                     // into a byte-addressed span.
-                    put_u64(values, format!("{key}_offset"), (offset + 2) as u64);
+                    put_u64(values, offset_key, (offset + 2) as u64);
                 }
                 offset = next;
             }
@@ -230,10 +251,10 @@ pub(super) fn extract(
             EXTRA_ENVIRONMENT_VARIABLE_DATA => {
                 blocks.push("environment_variable");
                 if let Some((s, at)) = read_ansi_or_unicode_pair(block, 8, 268, 260, 520) {
-                    put_str(values, "lnk.environment_target", s);
+                    put_str(values, value_key!("lnk.environment_target"), s);
                     put_u64(
                         values,
-                        "lnk.environment_target_offset",
+                        value_key!("lnk.environment_target_offset"),
                         (offset + at) as u64,
                     );
                 }
@@ -267,23 +288,27 @@ pub(super) fn extract(
             EXTRA_SPECIAL_FOLDER_DATA => {
                 blocks.push("special_folder");
                 if let Some(id) = bytes_at::u32_le(block, 8) {
-                    put_u64(values, "lnk.special_folder_id", u64::from(id));
+                    put_u64(values, value_key!("lnk.special_folder_id"), u64::from(id));
                 }
             }
             EXTRA_DARWIN_DATA => {
                 blocks.push("darwin");
                 if let Some((s, at)) = read_ansi_or_unicode_pair(block, 8, 268, 260, 520) {
-                    put_str(values, "lnk.darwin_data", s);
-                    put_u64(values, "lnk.darwin_data_offset", (offset + at) as u64);
+                    put_str(values, value_key!("lnk.darwin_data"), s);
+                    put_u64(
+                        values,
+                        value_key!("lnk.darwin_data_offset"),
+                        (offset + at) as u64,
+                    );
                 }
             }
             EXTRA_ICON_ENVIRONMENT_DATA => {
                 blocks.push("icon_environment");
                 if let Some((s, at)) = read_ansi_or_unicode_pair(block, 8, 268, 260, 520) {
-                    put_str(values, "lnk.icon_environment_target", s);
+                    put_str(values, value_key!("lnk.icon_environment_target"), s);
                     put_u64(
                         values,
-                        "lnk.icon_environment_target_offset",
+                        value_key!("lnk.icon_environment_target_offset"),
                         (offset + at) as u64,
                     );
                 }
@@ -291,15 +316,19 @@ pub(super) fn extract(
             EXTRA_SHIM_DATA => {
                 blocks.push("shim");
                 if let Some(s) = read_utf16le_string(block, 8, block_size.saturating_sub(8)) {
-                    put_str(values, "lnk.shim_layer_name", s);
-                    put_u64(values, "lnk.shim_layer_name_offset", (offset + 8) as u64);
+                    put_str(values, value_key!("lnk.shim_layer_name"), s);
+                    put_u64(
+                        values,
+                        value_key!("lnk.shim_layer_name_offset"),
+                        (offset + 8) as u64,
+                    );
                 }
             }
             EXTRA_PROPERTY_STORE_DATA => blocks.push("property_store"),
             EXTRA_KNOWN_FOLDER_DATA => {
                 blocks.push("known_folder");
                 if let Some(g) = read_guid(block, 8) {
-                    put_str(values, "lnk.known_folder_id", g);
+                    put_str(values, value_key!("lnk.known_folder_id"), g);
                 }
             }
             EXTRA_VISTA_AND_ABOVE_IDLIST_DATA => blocks.push("vista_idlist"),
@@ -308,8 +337,8 @@ pub(super) fn extract(
         offset += block_size;
     }
     if !blocks.is_empty() {
-        values.insert(
-            "lnk.blocks",
+        values.insert_key(
+            value_key!("lnk.blocks"),
             JsonValue::Array(
                 blocks
                     .into_iter()
@@ -324,10 +353,10 @@ pub(super) fn extract(
 }
 
 /// Compute whitespace-obfuscation counts over an LNK argument
-/// string and emit them under `lnk.args_*`. Trait rules read these
+/// string and emit them under `lnk.arguments_*`. Trait rules read these
 /// raw counts and pick their own thresholds (e.g. the CVE-2025-9491
-/// "interpreter padding" composite uses `args_max_whitespace_run
-/// >= 50` plus `args_whitespace_total >= 100`). No derived
+/// "interpreter padding" composite uses `arguments_max_whitespace_run
+/// >= 50` plus `arguments_whitespace_count >= 100`). No derived
 /// decisions live here.
 fn emit_argument_whitespace_metrics(metrics: &mut Metrics, args: &str) {
     let mut leading_spaces = 0usize;
@@ -358,13 +387,16 @@ fn emit_argument_whitespace_metrics(metrics: &mut Metrics, args: &str) {
     if current_run > max_run {
         max_run = current_run;
     }
-    metrics.insert(metric!("lnk.args_leading_spaces"), leading_spaces as f64);
-    metrics.insert(metric!("lnk.args_leading_tabs"), leading_tabs as f64);
     metrics.insert(
-        metric!("lnk.args_whitespace_total"),
+        metric!("lnk.arguments_leading_spaces"),
+        leading_spaces as f64,
+    );
+    metrics.insert(metric!("lnk.arguments_leading_tabs"), leading_tabs as f64);
+    metrics.insert(
+        metric!("lnk.arguments_whitespace_count"),
         total_whitespace as f64,
     );
-    metrics.insert(metric!("lnk.args_max_whitespace_run"), max_run as f64);
+    metrics.insert(metric!("lnk.arguments_max_whitespace_run"), max_run as f64);
 }
 
 /// Map the SHLLINK `ShowCommand` value to its Windows `SW_*`
@@ -718,7 +750,7 @@ fn parse_link_info(
                 network.insert("provider".into(), json!(provider));
             }
             if !network.is_empty() {
-                values.insert("lnk.network", JsonValue::Object(network));
+                values.insert_key(value_key!("lnk.network"), JsonValue::Object(network));
             }
         }
     }
@@ -1100,12 +1132,14 @@ mod tests {
 
         // Identity reads the tracker's machine name back. It once asked for a
         // `machine_name` field that this extractor never writes, so the claim
-        // was silently empty on every shortcut.
+        // was silently empty on every shortcut. It is reported once, as
+        // `machine_id`; a `lnk_machine_name` duplicate was dropped.
         let id = super::super::identity::derive(crate::FileType::Lnk, &lnk, &v);
         assert_eq!(
-            id.unique_ids.get("lnk_machine_name").map(String::as_str),
+            id.unique_ids.get("machine_id").map(String::as_str),
             Some("build-host-01")
         );
+        assert!(!id.unique_ids.contains_key("lnk_machine_name"));
         assert_eq!(
             id.unique_ids.get("mac_address").map(String::as_str),
             Some("22:33:44:55:66:77")
@@ -1344,23 +1378,23 @@ mod tests {
         let mut args = " ".repeat(60);
         args.push_str("powershell.exe -enc AAAA");
         let (_, m) = run(&lnk_with_arguments(&args));
-        assert_eq!(m.get("lnk.args_leading_spaces"), Some(60.0));
-        assert_eq!(m.get("lnk.args_max_whitespace_run"), Some(60.0));
-        assert!(m.get("lnk.args_whitespace_total").unwrap() >= 60.0);
+        assert_eq!(m.get("lnk.arguments_leading_spaces"), Some(60.0));
+        assert_eq!(m.get("lnk.arguments_max_whitespace_run"), Some(60.0));
+        assert!(m.get("lnk.arguments_whitespace_count").unwrap() >= 60.0);
     }
 
     #[test]
     fn argument_whitespace_metrics_quiet_on_normal_args() {
         let (_, m) = run(&lnk_with_arguments("/c notepad.exe"));
-        assert!(m.get("lnk.args_max_whitespace_run").unwrap() < 50.0);
-        assert_eq!(m.get("lnk.args_leading_tabs"), Some(0.0));
+        assert!(m.get("lnk.arguments_max_whitespace_run").unwrap() < 50.0);
+        assert_eq!(m.get("lnk.arguments_leading_tabs"), Some(0.0));
     }
 
     #[test]
     fn argument_whitespace_metrics_count_leading_tabs() {
         let args = format!("{}cmd.exe", "\t".repeat(55));
         let (_, m) = run(&lnk_with_arguments(&args));
-        assert_eq!(m.get("lnk.args_leading_tabs"), Some(55.0));
-        assert_eq!(m.get("lnk.args_max_whitespace_run"), Some(55.0));
+        assert_eq!(m.get("lnk.arguments_leading_tabs"), Some(55.0));
+        assert_eq!(m.get("lnk.arguments_max_whitespace_run"), Some(55.0));
     }
 }

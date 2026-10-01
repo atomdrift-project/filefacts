@@ -26,6 +26,7 @@ use memchr::memmem;
 
 use crate::formats::common::put_str;
 use crate::output::Values;
+use crate::value_key;
 
 /// Set `binary.packer` (and `binary.packer_version` when decodable)
 /// if the file carries UPX's byte-level signatures. Safe to call on
@@ -35,9 +36,9 @@ pub(super) fn detect(bytes: &[u8], values: &mut Values) {
     if !has_upx_signature(bytes) {
         return;
     }
-    put_str(values, "binary.packer", "upx");
+    put_str(values, value_key!("binary.packer"), "upx");
     if let Some(version) = extract_version(bytes) {
-        put_str(values, "binary.packer_version", version);
+        put_str(values, value_key!("binary.packer_version"), version);
     }
 }
 

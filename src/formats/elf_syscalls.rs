@@ -8,6 +8,7 @@
 //! Work is bounded by the file size and records by MAX_CANDIDATES.
 
 use crate::metric;
+use crate::value_key;
 use goblin::elf::Elf;
 use goblin::elf::header::{EM_AARCH64, EM_X86_64};
 use goblin::elf::section_header::{SHF_EXECINSTR, SHT_NOBITS};
@@ -61,8 +62,8 @@ pub(super) fn emit(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &m
     if let Some((arch, direct)) = scanned {
         if !sites.is_empty() {
             let arr = sites.iter().map(site_json).collect();
-            values.insert("elf.syscalls_direct", JsonValue::Array(arr));
-            values.insert("elf.syscalls_arch", arch.into());
+            values.insert_key(value_key!("elf.syscalls_direct"), JsonValue::Array(arr));
+            values.insert_key(value_key!("elf.syscalls_arch"), arch.into());
         }
         if direct > 0 {
             metrics.insert(metric!("elf.direct_syscall_count"), direct as f64);

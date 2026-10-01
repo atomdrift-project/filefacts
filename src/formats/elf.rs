@@ -33,6 +33,7 @@ pub(super) fn extract(
     symbols_out: &mut crate::Symbols,
     errors_out: &mut Errors,
     image_end: &mut Option<u64>,
+    rizin: &crate::rizin::Settings,
 ) -> Result<(), Error> {
     // Wrap goblin parse in catch_unwind. ELF's dynamic-section
     // walker has panicked on malformed `DT_*` tables; `parse_elf`
@@ -119,6 +120,7 @@ pub(super) fn extract(
         symbols_out,
         metrics,
         has_go_pclntab(&elf, bytes),
+        rizin,
     );
     linker_family(&elf, values);
     comment_fingerprint(values);
@@ -187,7 +189,7 @@ fn linker_family(elf: &Elf<'_>, values: &mut Values) {
         None
     };
     if let Some(f) = family {
-        put_str(values, "elf.linker_family", f);
+        put_str(values, value_key!("elf.linker_family"), f);
         return;
     }
     // `.comment` fallback — covers GNU ld (no dedicated note) and
@@ -215,7 +217,7 @@ fn linker_family(elf: &Elf<'_>, values: &mut Values) {
         } else {
             continue;
         };
-        put_str(values, "elf.linker_family", family);
+        put_str(values, value_key!("elf.linker_family"), family);
         return;
     }
 }
@@ -283,7 +285,7 @@ fn comment_fingerprint(values: &mut Values) {
         None
     };
     if let Some(d) = distro {
-        put_str(values, "elf.distro", d);
+        put_str(values, value_key!("elf.distro"), d);
     }
 
     let (family, version) = if joined.starts_with("GCC:") || joined.contains("; GCC:") {
@@ -323,9 +325,9 @@ fn comment_fingerprint(values: &mut Values) {
         (None, None)
     };
     if let Some(f) = family {
-        put_str(values, "elf.toolchain_family", f);
+        put_str(values, value_key!("elf.toolchain_family"), f);
         if let Some(v) = version {
-            put_str(values, "elf.toolchain", format!("{f} {v}"));
+            put_str(values, value_key!("elf.toolchain"), format!("{f} {v}"));
         }
     }
 }
@@ -381,7 +383,10 @@ fn gcc_command_line(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
         return;
     }
     let collapsed: String = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
-    values.insert("elf.gcc_command_line", JsonValue::String(collapsed));
+    values.insert_key(
+        value_key!("elf.gcc_command_line"),
+        JsonValue::String(collapsed),
+    );
 }
 
 /// Decompose `DT_FLAGS` and `DT_FLAGS_1` bitfields into a flat string
@@ -401,8 +406,8 @@ fn dt_flags(elf: &Elf<'_>, values: &mut Values) {
         }
     }
     if !flags.is_empty() {
-        values.insert(
-            "elf.dt_flags",
+        values.insert_key(
+            value_key!("elf.dt_flags"),
             JsonValue::Array(
                 flags
                     .iter()
@@ -412,8 +417,8 @@ fn dt_flags(elf: &Elf<'_>, values: &mut Values) {
         );
     }
     if !flags1.is_empty() {
-        values.insert(
-            "elf.dt_flags_1",
+        values.insert_key(
+            value_key!("elf.dt_flags_1"),
             JsonValue::Array(
                 flags1
                     .iter()
@@ -507,7 +512,7 @@ fn package_note(notes: &[Note<'_>], values: &mut Values) {
         if json.is_null() {
             continue;
         }
-        values.insert("elf.package", json);
+        values.insert_key(value_key!("elf.package"), json);
         return;
     }
 }
@@ -534,7 +539,7 @@ fn abi_tag(notes: &[Note<'_>], values: &mut Values) {
                 "min_kernel".into(),
                 JsonValue::String(format!("{}.{}.{}", words[1], words[2], words[3])),
             );
-            values.insert("elf.abi", JsonValue::Object(obj));
+            values.insert_key(value_key!("elf.abi"), JsonValue::Object(obj));
             return;
         }
     }
@@ -621,7 +626,7 @@ fn gnu_property(elf: &Elf<'_>, notes: &[Note<'_>], values: &mut Values, metrics:
                             _ => None,
                         };
                         if let Some(s) = level {
-                            put_str(values, "elf.x86_isa_level", s);
+                            put_str(values, value_key!("elf.x86_isa_level"), s);
                         }
                     }
                 } else if is_aarch64 && pr_type == 0xC000_0001 && pr_datasz == 16 {
@@ -635,7 +640,7 @@ fn gnu_property(elf: &Elf<'_>, notes: &[Note<'_>], values: &mut Values, metrics:
                         JsonValue::String(pauth_platform_name(platform).into()),
                     );
                     entry.insert("version".into(), JsonValue::Number(version.into()));
-                    put_str(values, "elf.pauth_scheme", scheme);
+                    put_str(values, value_key!("elf.pauth_scheme"), scheme);
                 }
                 props.push(JsonValue::Object(entry));
             }
@@ -643,7 +648,7 @@ fn gnu_property(elf: &Elf<'_>, notes: &[Note<'_>], values: &mut Values, metrics:
             off = (data_end + 7) & !7;
         }
         if !props.is_empty() {
-            values.insert("elf.gnu_property", JsonValue::Array(props));
+            values.insert_key(value_key!("elf.gnu_property"), JsonValue::Array(props));
         }
         return;
     }
@@ -869,8 +874,8 @@ fn elf_numeric_metrics(
                 .map(|i| format!("PT_LOAD#{i}"))
                 .collect();
             names.sort();
-            values.insert(
-                "elf.overlapping_segments",
+            values.insert_key(
+                value_key!("elf.overlapping_segments"),
                 JsonValue::Array(names.into_iter().map(JsonValue::String).collect()),
             );
         }
@@ -913,7 +918,7 @@ fn elf_numeric_metrics(
         metrics.insert(metric!("elf.ident_pad_nonzero"), 1.0);
         put_str(
             values,
-            "elf.ident_pad",
+            value_key!("elf.ident_pad"),
             hex_encode(&elf.header.e_ident[9..16]),
         );
     }
@@ -1024,7 +1029,7 @@ fn elf_numeric_metrics(
     }
     if compressed_count > 0 {
         metrics.insert(
-            metric!("elf.compressed_sections_count"),
+            metric!("elf.compressed_section_count"),
             compressed_count as f64,
         );
     }
@@ -1056,7 +1061,7 @@ fn elf_numeric_metrics(
         if !crate::is_well_known_section_name(&name) {
             metrics.insert(metric!("elf.entry_in_nonstandard_section"), 1.0);
         }
-        put_str(values, "elf.entry_section", &name);
+        put_str(values, value_key!("elf.entry_section"), &name);
     } else if entry != 0 && entry_in_any_segment && elf.section_headers.len() > 1 {
         // The entry lands inside a loadable segment but no section covers
         // it, even though a real section table is present. That is the
@@ -1124,7 +1129,7 @@ fn relocation_kinds(elf: &Elf<'_>, values: &mut Values) {
     for (name, count) in counts {
         obj.insert(name, JsonValue::Number(count.into()));
     }
-    values.insert("elf.relocation_kinds", JsonValue::Object(obj));
+    values.insert_key(value_key!("elf.relocation_kinds"), JsonValue::Object(obj));
 }
 
 /// Per-machine relocation-type mnemonic. Returns the binutils name
@@ -1210,7 +1215,7 @@ fn relocation_kind_name(machine: u16, r_type: u32) -> String {
 /// - `dt_runpath_uses_origin` — `$ORIGIN` token in DT_RUNPATH (the
 ///   canonical relative-path runtime search base; common in modern
 ///   builds but sometimes abused).
-/// - `has_direct_loader_dep` — a library directly DT_NEEDEDs the
+/// - `has_direct_loader_dependency` — a library directly DT_NEEDEDs the
 ///   dynamic loader (`ld-linux-*.so.*`/`ld-musl-*.so.*`); legit libs
 ///   pick up the loader transitively via libc, so direct dependency
 ///   is a strong tampering tell.
@@ -1335,7 +1340,7 @@ fn dynamic_metrics(elf: &Elf<'_>, metrics: &mut Metrics) {
         );
     }
     if direct_loader_dep {
-        metrics.insert(metric!("elf.has_direct_loader_dep"), 1.0);
+        metrics.insert(metric!("elf.has_direct_loader_dependency"), 1.0);
     }
 
     // DT_RUNPATH $ORIGIN check — RUNPATH entries also serialise as
@@ -1391,7 +1396,7 @@ fn segments(elf: &Elf<'_>, values: &mut Values) {
         })
         .collect();
     if !segs.is_empty() {
-        values.insert("elf.segments", JsonValue::Array(segs));
+        values.insert_key(value_key!("elf.segments"), JsonValue::Array(segs));
     }
 }
 
@@ -1450,7 +1455,7 @@ fn section_headers(elf: &Elf<'_>, values: &mut Values) {
         })
         .collect();
     if !secs.is_empty() {
-        values.insert("elf.sections", JsonValue::Array(secs));
+        values.insert_key(value_key!("elf.sections"), JsonValue::Array(secs));
     }
 }
 
@@ -1572,7 +1577,10 @@ fn stripped_metadata(elf: &Elf<'_>, values: &mut Values, metrics: &mut Metrics) 
         stripped.len() as f64,
     );
     if !stripped.is_empty() {
-        values.insert("elf.stripped_metadata_sections", JsonValue::Array(stripped));
+        values.insert_key(
+            value_key!("elf.stripped_metadata_sections"),
+            JsonValue::Array(stripped),
+        );
     }
     // Dedicated `stripped_but_symtab_present` flag: `.comment` and
     // `.debug_*` removed but `.symtab` retained. Distinctive shape:
@@ -1606,7 +1614,7 @@ fn needed_versions(elf: &Elf<'_>, values: &mut Values, errors_out: &mut Errors) 
         }
     }
     if !out.is_empty() {
-        values.insert("elf.needed_versions", JsonValue::Array(out));
+        values.insert_key(value_key!("elf.needed_versions"), JsonValue::Array(out));
     }
 }
 
@@ -1639,35 +1647,55 @@ fn relro(elf: &Elf<'_>, values: &mut Values) {
     });
     put_str(
         values,
-        "elf.relro",
+        value_key!("elf.relro"),
         if bind_now { "full" } else { "partial" },
     );
 }
 
 fn elf_header(elf: &Elf<'_>, values: &mut Values) {
-    put_str(values, "elf.machine", machine_string(elf.header.e_machine));
     put_str(
         values,
-        "elf.class",
+        value_key!("elf.machine"),
+        machine_string(elf.header.e_machine),
+    );
+    put_str(
+        values,
+        value_key!("elf.class"),
         if elf.is_64 { "elf64" } else { "elf32" },
     );
     put_str(
         values,
-        "elf.endian",
+        value_key!("elf.endian"),
         if elf.little_endian { "little" } else { "big" },
     );
-    put_str(values, "elf.type", elf_type_string(elf.header.e_type));
-    put_u64(values, "elf.entry", elf.header.e_entry);
-    put_u64(values, "elf.version", u64::from(elf.header.e_version));
+    put_str(
+        values,
+        value_key!("elf.type"),
+        elf_type_string(elf.header.e_type),
+    );
+    put_u64(values, value_key!("elf.entry"), elf.header.e_entry);
+    put_u64(
+        values,
+        value_key!("elf.version"),
+        u64::from(elf.header.e_version),
+    );
     // e_ident residue beyond class/endian: OS/ABI, its version, and the
     // EI_VERSION byte. A patched loader or a forged toolchain provenance
     // shows here, and `elf.ident_version` disagreeing with `elf.version`
     // is itself an anomaly.
-    put_str(values, "elf.osabi", osabi_string(elf.header.e_ident[7]));
-    put_u64(values, "elf.abi_version", u64::from(elf.header.e_ident[8]));
+    put_str(
+        values,
+        value_key!("elf.osabi"),
+        osabi_string(elf.header.e_ident[7]),
+    );
     put_u64(
         values,
-        "elf.ident_version",
+        value_key!("elf.abi_version"),
+        u64::from(elf.header.e_ident[8]),
+    );
+    put_u64(
+        values,
+        value_key!("elf.ident_version"),
         u64::from(elf.header.e_ident[6]),
     );
     // Table offsets and entity sizes. `e_shoff` is the section-header
@@ -1676,12 +1704,28 @@ fn elf_header(elf: &Elf<'_>, values: &mut Values) {
     // tell that was previously invisible. `e_phoff`, the per-entry sizes,
     // the header size, and `e_shstrndx` complete the ELF header so no
     // header field can change without a diff noticing.
-    put_u64(values, "elf.phoff", elf.header.e_phoff);
-    put_u64(values, "elf.shoff", elf.header.e_shoff);
-    put_u64(values, "elf.shstrndx", u64::from(elf.header.e_shstrndx));
-    put_u64(values, "elf.ehsize", u64::from(elf.header.e_ehsize));
-    put_u64(values, "elf.phentsize", u64::from(elf.header.e_phentsize));
-    put_u64(values, "elf.shentsize", u64::from(elf.header.e_shentsize));
+    put_u64(values, value_key!("elf.phoff"), elf.header.e_phoff);
+    put_u64(values, value_key!("elf.shoff"), elf.header.e_shoff);
+    put_u64(
+        values,
+        value_key!("elf.shstrndx"),
+        u64::from(elf.header.e_shstrndx),
+    );
+    put_u64(
+        values,
+        value_key!("elf.ehsize"),
+        u64::from(elf.header.e_ehsize),
+    );
+    put_u64(
+        values,
+        value_key!("elf.phentsize"),
+        u64::from(elf.header.e_phentsize),
+    );
+    put_u64(
+        values,
+        value_key!("elf.shentsize"),
+        u64::from(elf.header.e_shentsize),
+    );
     e_flags(elf, values);
 }
 
@@ -1734,10 +1778,10 @@ fn e_flags(elf: &Elf<'_>, values: &mut Values) {
         header::EM_RISCV => decompose_riscv_eflags(raw, &mut flags),
         _ => {}
     }
-    put_u64(values, "elf.e_flags_raw", u64::from(raw));
+    put_u64(values, value_key!("elf.e_flags_raw"), u64::from(raw));
     if !flags.is_empty() {
-        values.insert(
-            "elf.e_flags",
+        values.insert_key(
+            value_key!("elf.e_flags"),
             JsonValue::Array(
                 flags
                     .into_iter()
@@ -1839,10 +1883,10 @@ fn dynamic(elf: &Elf<'_>, values: &mut Values) {
         .iter()
         .map(|lib| JsonValue::String((*lib).to_string()))
         .collect();
-    values.insert("elf.needed", JsonValue::Array(needed));
+    values.insert_key(value_key!("elf.needed"), JsonValue::Array(needed));
 
     if let Some(soname) = elf.soname {
-        put_str(values, "elf.soname", soname);
+        put_str(values, value_key!("elf.soname"), soname);
     }
     let rpaths: Vec<JsonValue> = elf
         .rpaths
@@ -1850,7 +1894,7 @@ fn dynamic(elf: &Elf<'_>, values: &mut Values) {
         .map(|r| JsonValue::String((*r).to_string()))
         .collect();
     if !rpaths.is_empty() {
-        values.insert("elf.rpath", JsonValue::Array(rpaths));
+        values.insert_key(value_key!("elf.rpath"), JsonValue::Array(rpaths));
     }
     let runpaths: Vec<JsonValue> = elf
         .runpaths
@@ -1858,7 +1902,7 @@ fn dynamic(elf: &Elf<'_>, values: &mut Values) {
         .map(|r| JsonValue::String((*r).to_string()))
         .collect();
     if !runpaths.is_empty() {
-        values.insert("elf.runpath", JsonValue::Array(runpaths));
+        values.insert_key(value_key!("elf.runpath"), JsonValue::Array(runpaths));
     }
 }
 
@@ -2104,7 +2148,7 @@ fn symbols(
         metrics.insert(metric!("elf.stack_canary"), 1.0);
     }
     if !ifuncs.is_empty() {
-        values.insert("elf.ifuncs", JsonValue::Array(ifuncs));
+        values.insert_key(value_key!("elf.ifuncs"), JsonValue::Array(ifuncs));
     }
     emit_symbol_kind_histograms(&sym_type_counts, &sym_bind_counts, &sym_vis_counts, values);
 }
@@ -2172,7 +2216,10 @@ fn emit_symbol_kind_histograms(
         }
     }
     if !by_type.is_empty() {
-        values.insert("elf.symbol_kinds.types", JsonValue::Object(by_type));
+        values.insert_key(
+            value_key!("elf.symbol_kinds.types"),
+            JsonValue::Object(by_type),
+        );
     }
     let mut by_bind = serde_json::Map::new();
     for (name, count) in BIND_NAMES.iter().zip(bindings) {
@@ -2181,7 +2228,10 @@ fn emit_symbol_kind_histograms(
         }
     }
     if !by_bind.is_empty() {
-        values.insert("elf.symbol_kinds.bindings", JsonValue::Object(by_bind));
+        values.insert_key(
+            value_key!("elf.symbol_kinds.bindings"),
+            JsonValue::Object(by_bind),
+        );
     }
     let mut by_vis = serde_json::Map::new();
     for (name, count) in VIS_NAMES.iter().zip(visibility) {
@@ -2190,7 +2240,10 @@ fn emit_symbol_kind_histograms(
         }
     }
     if !by_vis.is_empty() {
-        values.insert("elf.symbol_kinds.visibility", JsonValue::Object(by_vis));
+        values.insert_key(
+            value_key!("elf.symbol_kinds.visibility"),
+            JsonValue::Object(by_vis),
+        );
     }
 }
 
@@ -2214,7 +2267,7 @@ fn build_id(
     let section_notes = drain_notes(elf.iter_note_sections(bytes, None), errors_out);
     let desc = gnu_build_id_desc(&section_notes).or_else(|| gnu_build_id_desc(segment_notes));
     if let Some(desc) = desc {
-        put_str(values, "elf.build_id", hex_encode(desc));
+        put_str(values, value_key!("elf.build_id"), hex_encode(desc));
         metrics.insert(metric!("elf.has_build_id"), 1.0);
         metrics.insert(metric!("elf.build_id_length"), desc.len() as f64);
     }
@@ -2376,7 +2429,7 @@ fn section_file_anomalies(elf: &Elf<'_>, bytes: &[u8], metrics: &mut Metrics) {
 
 fn interpreter(elf: &Elf<'_>, values: &mut Values) {
     if let Some(interp) = elf.interpreter {
-        put_str(values, "elf.interpreter", interp);
+        put_str(values, value_key!("elf.interpreter"), interp);
     }
 }
 
@@ -2461,6 +2514,7 @@ mod tests {
             &mut symbols,
             &mut errors,
             &mut None,
+            &crate::rizin::Settings::default(),
         );
         (v, s, m)
     }
@@ -2702,6 +2756,7 @@ mod tests {
             &mut symbols,
             &mut errors,
             &mut None,
+            &crate::rizin::Settings::default(),
         );
         symbols
     }

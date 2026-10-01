@@ -36,6 +36,7 @@ pub(super) fn extract(
     sections_out: &mut Vec<Section>,
     symbols_out: &mut crate::Symbols,
     errors_out: &mut Errors,
+    rizin: &crate::rizin::Settings,
 ) -> Result<(), Error> {
     // All strings — ASCII, section names, and UTF-16 (resource / version-info)
     // runs — come from the single stng pass below: it scans the whole buffer
@@ -126,7 +127,7 @@ pub(super) fn extract(
                 // tampering signal.
                 let ts = rd.image_resource_directory.time_date_stamp;
                 if ts != 0 {
-                    put_u64(values, "pe.resource_timestamp", u64::from(ts));
+                    put_u64(values, value_key!("pe.resource_timestamp"), u64::from(ts));
                 }
                 // Presence flags emitted authoritatively from the
                 // resource directory walker — distinct from whether
@@ -221,6 +222,7 @@ pub(super) fn extract(
             symbols_out,
             metrics,
             has_go_function_metadata,
+            rizin,
         );
         rizin_fallback_with_sections(
             bytes,
@@ -230,6 +232,7 @@ pub(super) fn extract(
             metrics,
             has_go_function_metadata,
             declares_export_directory(pe.header.optional_header.as_ref()),
+            rizin,
         );
         return Ok(());
     }
@@ -245,7 +248,7 @@ pub(super) fn extract(
     let header = match goblin_safe::parse_pe_header(pe_bytes) {
         goblin_safe::GoblinOutcome::Ok(header) => header,
         goblin_safe::GoblinOutcome::Failed(e) => {
-            return Err(Error::malformed("pe", e.to_string()));
+            return Err(Error::malformed_with_source("pe", e.to_string(), e));
         }
         goblin_safe::GoblinOutcome::Panicked(msg) => {
             errors_out.record_panic(crate::Stage::PeParse, msg);
@@ -264,7 +267,10 @@ pub(super) fn extract(
     // so trait authors can branch on either path. The bool is
     // retained as the canonical "is this a partial parse?" key for
     // existing rules.
-    values.insert("pe.partial_parse", serde_json::Value::Bool(true));
+    values.insert_key(
+        value_key!("pe.partial_parse"),
+        serde_json::Value::Bool(true),
+    );
     errors_out.record_fallback(crate::Stage::PeParse, "header-only fallback");
     metrics.insert(metric!("pe.partial_parse"), 1.0);
     // goblin couldn't parse the section table / import directory at all
@@ -282,6 +288,7 @@ pub(super) fn extract(
         metrics,
         false,
         declares_export_directory(header.optional_header.as_ref()),
+        rizin,
     );
     Ok(())
 }
@@ -436,16 +443,22 @@ fn native_resolver_signals(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metri
         );
     }
     if !peb_sites.is_empty() {
-        values.insert("pe.peb_access_sites", JsonValue::Array(peb_sites));
+        values.insert_key(
+            value_key!("pe.peb_access_sites"),
+            JsonValue::Array(peb_sites),
+        );
     }
     if !export_walk_sites.is_empty() {
-        values.insert(
-            "pe.checked_export_walk_sites",
+        values.insert_key(
+            value_key!("pe.checked_export_walk_sites"),
             JsonValue::Array(export_walk_sites),
         );
     }
     if !hash_profiles.is_empty() {
-        values.insert("pe.api_hash_profiles", JsonValue::Array(hash_profiles));
+        values.insert_key(
+            value_key!("pe.api_hash_profiles"),
+            JsonValue::Array(hash_profiles),
+        );
     }
 }
 
@@ -484,6 +497,7 @@ fn rizin_importless_analysis(
     symbols: &mut crate::Symbols,
     metrics: &mut Metrics,
     go_function_metadata: bool,
+    rizin: &crate::rizin::Settings,
 ) {
     const MAX_IMPORTLESS_ANALYSIS_BYTES: usize = 5 * 1024 * 1024;
     if bytes.len() > MAX_IMPORTLESS_ANALYSIS_BYTES
@@ -503,11 +517,12 @@ fn rizin_importless_analysis(
         go_function_metadata,
     )
     .runs()
+        || !rizin.admits(bytes)
     {
         return;
     }
     let Some(recovery) =
-        crate::rizin::recover_with_symbols(bytes, symbols.len(), go_function_metadata)
+        crate::rizin::recover_with_symbols(bytes, symbols.len(), go_function_metadata, rizin)
     else {
         return;
     };
@@ -676,7 +691,10 @@ fn recover_api_hash_requests(
             f64::from(name_matches),
         );
     }
-    values.insert("pe.api_hash_resolver_requests", JsonValue::Array(requests));
+    values.insert_key(
+        value_key!("pe.api_hash_resolver_requests"),
+        JsonValue::Array(requests),
+    );
 }
 
 fn va_in_function(va: u64, start: u64, size: u64) -> bool {
@@ -1232,15 +1250,19 @@ fn coff_header(coff: &CoffHeader, values: &mut Values, metrics: &mut Metrics) {
     // forensic consumer doesn't need to navigate. `pe.machine` /
     // `pe.subsystem` / `pe.image_base` is what every Windows security
     // analyst reads.
-    put_str(values, "pe.machine", machine_string(coff.machine));
+    put_str(
+        values,
+        value_key!("pe.machine"),
+        machine_string(coff.machine),
+    );
     // Raw COFF machine + characteristics u16 values. Stable across
     // PE revisions and what downstream code that needs to round-trip
     // back to goblin's typed bitmasks looks at — distinct from the
     // string-flag projections above.
-    put_u64(values, "pe.machine_id", u64::from(coff.machine));
+    put_u64(values, value_key!("pe.machine_id"), u64::from(coff.machine));
     put_u64(
         values,
-        "pe.characteristics_raw",
+        value_key!("pe.characteristics_raw"),
         u64::from(coff.characteristics),
     );
     // PE's `TimeDateStamp` is a 32-bit Unix timestamp. Treat it as `i64`
@@ -1248,7 +1270,11 @@ fn coff_header(coff: &CoffHeader, values: &mut Values, metrics: &mut Metrics) {
     // signed/unsigned ambiguity. `sections.count` already exposes the
     // section count from a separate path; the COFF NumberOfSections
     // field would just duplicate it.
-    put_i64(values, "pe.timestamp", i64::from(coff.time_date_stamp));
+    put_i64(
+        values,
+        value_key!("pe.timestamp"),
+        i64::from(coff.time_date_stamp),
+    );
     metrics.insert(metric!("pe.timestamp"), f64::from(coff.time_date_stamp));
     // COFF symbol-table pointer + entry count. Modern toolchains zero
     // both (debug info goes to PDBs), so a non-zero pair flags an
@@ -1256,19 +1282,22 @@ fn coff_header(coff: &CoffHeader, values: &mut Values, metrics: &mut Metrics) {
     // from `pst != 0 && nst != 0`.
     put_u64(
         values,
-        "pe.coff.symbol_table_offset",
+        value_key!("pe.coff.symbol_table_offset"),
         u64::from(coff.pointer_to_symbol_table),
     );
     put_u64(
         values,
-        "pe.coff.number_of_symbol_table",
+        value_key!("pe.coff.symbol_count"),
         u64::from(coff.number_of_symbol_table),
     );
     let characteristics: Vec<JsonValue> = coff_characteristics(coff.characteristics)
         .into_iter()
         .map(|s| JsonValue::String(s.into()))
         .collect();
-    values.insert("pe.characteristics", JsonValue::Array(characteristics));
+    values.insert_key(
+        value_key!("pe.characteristics"),
+        JsonValue::Array(characteristics),
+    );
 }
 
 /// DOS-header fields downstream consumers need. Currently just
@@ -1277,7 +1306,7 @@ fn coff_header(coff: &CoffHeader, values: &mut Values, metrics: &mut Metrics) {
 fn dos_header(header: &goblin::pe::header::Header, values: &mut Values) {
     put_u64(
         values,
-        "pe.coff.dos_header_pe_pointer",
+        value_key!("pe.coff.dos_header_pe_pointer"),
         u64::from(header.dos_header.pe_pointer),
     );
 }
@@ -1286,23 +1315,31 @@ fn optional_header(opt: &OptionalHeader, values: &mut Values, metrics: &mut Metr
     let standard = &opt.standard_fields;
     let windows = &opt.windows_fields;
 
-    put_str(values, "pe.subsystem", subsystem_string(windows.subsystem));
-    put_u64(values, "pe.image_base", windows.image_base);
-    put_u64(values, "pe.image_size", u64::from(windows.size_of_image));
+    put_str(
+        values,
+        value_key!("pe.subsystem"),
+        subsystem_string(windows.subsystem),
+    );
+    put_u64(values, value_key!("pe.image_base"), windows.image_base);
+    put_u64(
+        values,
+        value_key!("pe.image_size"),
+        u64::from(windows.size_of_image),
+    );
     metrics.insert(metric!("pe.image_size"), f64::from(windows.size_of_image));
     put_u64(
         values,
-        "pe.headers_size",
+        value_key!("pe.headers_size"),
         u64::from(windows.size_of_headers),
     );
     put_u64(
         values,
-        "pe.entry_point",
+        value_key!("pe.entry_point"),
         u64::from(standard.address_of_entry_point),
     );
     put_str(
         values,
-        "pe.subsystem_version",
+        value_key!("pe.subsystem_version"),
         format!(
             "{}.{}",
             windows.major_subsystem_version, windows.minor_subsystem_version
@@ -1310,7 +1347,7 @@ fn optional_header(opt: &OptionalHeader, values: &mut Values, metrics: &mut Metr
     );
     put_str(
         values,
-        "pe.os_version",
+        value_key!("pe.os_version"),
         format!(
             "{}.{}",
             windows.major_operating_system_version, windows.minor_operating_system_version
@@ -1318,15 +1355,19 @@ fn optional_header(opt: &OptionalHeader, values: &mut Values, metrics: &mut Metr
     );
     // Raw optional-header u16/u32 fields. Cleave consumes the numeric
     // forms; the string projections above are for human-facing tools.
-    put_u64(values, "pe.subsystem_raw", u64::from(windows.subsystem));
     put_u64(
         values,
-        "pe.dll_characteristics_raw",
+        value_key!("pe.subsystem_raw"),
+        u64::from(windows.subsystem),
+    );
+    put_u64(
+        values,
+        value_key!("pe.dll_characteristics_raw"),
         u64::from(windows.dll_characteristics),
     );
     put_u64(
         values,
-        "pe.file_alignment",
+        value_key!("pe.file_alignment"),
         u64::from(windows.file_alignment),
     );
     metrics.insert(
@@ -1335,29 +1376,32 @@ fn optional_header(opt: &OptionalHeader, values: &mut Values, metrics: &mut Metr
     );
     put_u64(
         values,
-        "pe.section_alignment",
+        value_key!("pe.section_alignment"),
         u64::from(windows.section_alignment),
     );
     put_u64(
         values,
-        "pe.linker_major_version",
+        value_key!("pe.linker_major_version"),
         u64::from(standard.major_linker_version),
     );
     put_u64(
         values,
-        "pe.linker_minor_version",
+        value_key!("pe.linker_minor_version"),
         u64::from(standard.minor_linker_version),
     );
     put_u64(
         values,
-        "pe.number_of_rva_and_sizes",
+        value_key!("pe.data_directory_count"),
         u64::from(windows.number_of_rva_and_sizes),
     );
     let dll_chars: Vec<JsonValue> = dll_characteristics(windows.dll_characteristics)
         .into_iter()
         .map(|s| JsonValue::String(s.into()))
         .collect();
-    values.insert("pe.dll_characteristics", JsonValue::Array(dll_chars));
+    values.insert_key(
+        value_key!("pe.dll_characteristics"),
+        JsonValue::Array(dll_chars),
+    );
 }
 
 /// Cross-format `binary.is_pie` derivation for PE. ASLR opt-in via
@@ -1480,7 +1524,7 @@ fn imports(
     metrics.insert(metric!("dependencies.count"), by_dll.len() as f64);
 
     if let Some(hash) = imphash(pe) {
-        put_str(values, "pe.imphash", hash);
+        put_str(values, value_key!("pe.hashes.imphash"), hash);
     }
 }
 
@@ -1539,7 +1583,7 @@ fn exports(
     if let Some(export_data) = &pe.export_data {
         let ts = export_data.export_directory_table.time_date_stamp;
         if ts != 0 {
-            put_i64(values, "pe.export_timestamp", i64::from(ts));
+            put_i64(values, value_key!("pe.export_timestamp"), i64::from(ts));
             metrics.insert(metric!("pe.export_timestamp"), f64::from(ts));
         }
     }
@@ -1799,7 +1843,7 @@ fn resource_types(
             .iter()
             .map(|&id| JsonValue::String(rt_name(id).to_string()))
             .collect();
-        values.insert("pe.resource_types", JsonValue::Array(names));
+        values.insert_key(value_key!("pe.resource_types"), JsonValue::Array(names));
     }
 }
 
@@ -1927,7 +1971,7 @@ fn bound_imports(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut M
             })
         })
         .collect();
-    values.insert("pe.bound_imports", JsonValue::Array(modules));
+    values.insert_key(value_key!("pe.bound_imports"), JsonValue::Array(modules));
 
     metrics.insert(metric!("pe.bound_import_count"), out.len() as f64);
     // CRC-32 fingerprint over the canonical-sorted set so the
@@ -1998,7 +2042,7 @@ fn data_directories(pe: &PE<'_>, values: &mut Values) {
         }));
     }
     if !entries.is_empty() {
-        values.insert("pe.data_directories", JsonValue::Array(entries));
+        values.insert_key(value_key!("pe.data_directories"), JsonValue::Array(entries));
     }
 }
 
@@ -2131,7 +2175,10 @@ fn data_directory_anomalies(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metr
     );
     if anomalies.is_empty() {
         if !declared.is_empty() {
-            values.insert("pe.declared_data_directories", JsonValue::Array(declared));
+            values.insert_key(
+                value_key!("pe.declared_data_directories"),
+                JsonValue::Array(declared),
+            );
         }
         return;
     }
@@ -2151,8 +2198,14 @@ fn data_directory_anomalies(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metr
             nonzero_rva_zero_size as f64,
         );
     }
-    values.insert("pe.declared_data_directories", JsonValue::Array(declared));
-    values.insert("pe.data_directory_anomalies", JsonValue::Array(anomalies));
+    values.insert_key(
+        value_key!("pe.declared_data_directories"),
+        JsonValue::Array(declared),
+    );
+    values.insert_key(
+        value_key!("pe.data_directory_anomalies"),
+        JsonValue::Array(anomalies),
+    );
 }
 
 /// .NET / CLR metadata extracted from the COR20 header and metadata root.
@@ -2184,7 +2237,7 @@ fn data_directory_anomalies(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metr
 ///   clone that never had the private key is not, so `0` under a vendor brand
 ///   is a forgery / publisher-hijack tell — and a `1 -> 0` transition across
 ///   versions is a strong differential signal.
-/// - `pe.clr.strong_name_sig_size` — strong-name signature blob size (>0 with
+/// - `pe.clr.strong_name_signature_size` — strong-name signature blob size (>0 with
 ///   `strong_name_signed=0` = delay-signed or signature stripped)
 fn clr_metadata(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     use crate::formats::common::{put_str, put_u64};
@@ -2195,7 +2248,7 @@ fn clr_metadata(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Me
     // Raw structural reads (strings, raw words, identities) -> values.
     put_str(
         values,
-        "pe.clr.runtime_version",
+        value_key!("pe.clr.runtime_version"),
         format!(
             "{}.{}",
             hdr.major_runtime_version, hdr.minor_runtime_version
@@ -2203,13 +2256,13 @@ fn clr_metadata(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Me
     );
     let mdver = clr.metadata_header.version.trim_matches('\0').trim();
     if !mdver.is_empty() {
-        put_str(values, "pe.clr.metadata_version", mdver);
+        put_str(values, value_key!("pe.clr.metadata_version"), mdver);
     }
-    put_u64(values, "pe.clr.flags", u64::from(hdr.flags));
+    put_u64(values, value_key!("pe.clr.flags"), u64::from(hdr.flags));
     if hdr.entry_point_token_or_rva != 0 {
         put_u64(
             values,
-            "pe.clr.entry_point_token",
+            value_key!("pe.clr.entry_point_token"),
             u64::from(hdr.entry_point_token_or_rva),
         );
     }
@@ -2232,7 +2285,7 @@ fn clr_metadata(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Me
     );
     if hdr.strong_name_signature.size > 0 {
         metrics.insert(
-            metric!("pe.clr.strong_name_sig_size"),
+            metric!("pe.clr.strong_name_signature_size"),
             f64::from(hdr.strong_name_signature.size),
         );
     }
@@ -2249,7 +2302,7 @@ fn clr_metadata(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Me
     if let Some((names, guid_stream)) = md.and_then(parse_clr_streams) {
         if !names.is_empty() {
             let arr = names.into_iter().map(JsonValue::String).collect();
-            values.insert("pe.clr.streams", JsonValue::Array(arr));
+            values.insert_key(value_key!("pe.clr.streams"), JsonValue::Array(arr));
         }
         // The module MVID is the first GUID in the `#GUID` heap (Module.Mvid == 1).
         if let (Some((goff, gsize)), Some(md)) = (guid_stream, md) {
@@ -2258,7 +2311,7 @@ fn clr_metadata(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Me
                     .get(goff..goff.saturating_add(16))
                     .and_then(|g| <&[u8; 16]>::try_from(g).ok())
                 {
-                    put_str(values, "pe.clr.mvid", format_guid(mvid));
+                    put_str(values, value_key!("pe.clr.mvid"), format_guid(mvid));
                 }
             }
         }
@@ -2432,7 +2485,7 @@ fn tls_callbacks(pe: &PE<'_>, values: &mut Values, metrics: &mut Metrics) {
             JsonValue::Object(node)
         })
         .collect();
-    values.insert("pe.tls_callbacks", JsonValue::Array(entries));
+    values.insert_key(value_key!("pe.tls_callbacks"), JsonValue::Array(entries));
 }
 
 /// List PE section names whose `VirtualSize` significantly exceeds
@@ -2489,7 +2542,7 @@ fn entry_and_overlay(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &m
                 if !crate::is_well_known_section_name(name) {
                     metrics.insert(metric!("pe.entry_in_nonstandard_section"), 1.0);
                 }
-                put_str(values, "pe.entry_section", name);
+                put_str(values, value_key!("pe.entry_section"), name);
             }
             break;
         }
@@ -2581,14 +2634,14 @@ fn section_anomalies(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &m
     );
     metrics.insert(metric!("pe.bss_like_section_count"), bss_like as f64);
     if !overflow_names.is_empty() {
-        values.insert(
-            "pe.overflowing_sections",
+        values.insert_key(
+            value_key!("pe.overflowing_sections"),
             JsonValue::Array(overflow_names.into_iter().map(JsonValue::String).collect()),
         );
     }
     if !misaligned_names.is_empty() {
-        values.insert(
-            "pe.misaligned_sections",
+        values.insert_key(
+            value_key!("pe.misaligned_sections"),
             JsonValue::Array(
                 misaligned_names
                     .into_iter()
@@ -2629,8 +2682,8 @@ fn section_anomalies(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &m
                 metric!("pe.section_overlap_count"),
                 overlap_names.len() as f64,
             );
-            values.insert(
-                "pe.overlapping_sections",
+            values.insert_key(
+                value_key!("pe.overlapping_sections"),
                 JsonValue::Array(
                     overlap_names
                         .into_iter()
@@ -2832,7 +2885,7 @@ fn inflated_sections(pe: &PE<'_>, values: &mut Values) {
         })
         .collect();
     if !names.is_empty() {
-        values.insert("pe.inflated_sections", JsonValue::Array(names));
+        values.insert_key(value_key!("pe.inflated_sections"), JsonValue::Array(names));
     }
 }
 
@@ -2984,7 +3037,7 @@ fn load_config(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Met
         metrics.insert(metric!("pe.has_safe_seh"), 1.0);
     }
 
-    values.insert("pe.load_config", JsonValue::Object(obj));
+    values.insert_key(value_key!("pe.load_config"), JsonValue::Object(obj));
 }
 
 /// IMAGE_DELAYLOAD_DESCRIPTOR table walker. Delay-load imports are
@@ -3124,7 +3177,10 @@ fn delay_imports(
     }
 
     if !entries_out.is_empty() {
-        values.insert("pe.delay_imports", JsonValue::Array(entries_out));
+        values.insert_key(
+            value_key!("pe.delay_imports"),
+            JsonValue::Array(entries_out),
+        );
         metrics.insert(metric!("pe.delay_import_count"), total_imports as f64);
     }
 }
@@ -3229,8 +3285,8 @@ fn base_relocations(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mu
         cursor += block_size;
     }
     if block_count > 0 {
-        values.insert(
-            "pe.base_relocations",
+        values.insert_key(
+            value_key!("pe.base_relocations"),
             serde_json::json!({
                 "block_count": block_count,
                 "entry_count": entry_count,
@@ -3266,9 +3322,9 @@ fn base_relocations(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mu
         let section_raw = u64::from(section.size_of_raw_data);
         if section_raw > 0 {
             let overhang = section_raw.saturating_sub(parsed_bytes);
-            metrics.insert(metric!("pe.reloc_overhang_bytes"), overhang as f64);
+            metrics.insert(metric!("pe.relocation_overhang_bytes"), overhang as f64);
             metrics.insert(
-                metric!("pe.reloc_overhang_ratio"),
+                metric!("pe.relocation_overhang_ratio"),
                 overhang as f64 / section_raw as f64,
             );
         }
@@ -3455,6 +3511,7 @@ mod tests {
             &mut sections,
             &mut symbols,
             &mut errors,
+            &crate::rizin::Settings::default(),
         );
         (v, s, m)
     }
@@ -3782,6 +3839,7 @@ mod tests {
             &mut sections,
             &mut symbols,
             &mut errors,
+            &crate::rizin::Settings::default(),
         )
         .unwrap();
         for sym in symbols.iter_kind(crate::SymbolKind::Export) {
@@ -3814,6 +3872,7 @@ mod tests {
             &mut sections,
             &mut symbols,
             &mut errors,
+            &crate::rizin::Settings::default(),
         )
         .unwrap();
         let imports: Vec<&crate::Symbol> = symbols.iter_kind(crate::SymbolKind::Import).collect();

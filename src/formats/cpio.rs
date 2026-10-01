@@ -9,6 +9,7 @@ use serde_json::Value as JsonValue;
 use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_value};
 use crate::error::Error;
 use crate::output::{ArchiveMember, ArchiveOffsets, ArchiveOwnership, Metrics, Values};
+use crate::value_key;
 
 const MAX_ENTRIES: usize = 65_536;
 const MAX_NAME_BYTES: usize = 1024 * 1024;
@@ -83,11 +84,11 @@ pub(super) fn extract(
     metrics: &mut Metrics,
     members: &mut Vec<ArchiveMember>,
 ) -> Result<(), Error> {
-    values.insert("cpio.complete", serde_json::json!(false));
+    values.insert_key(value_key!("cpio.complete"), serde_json::json!(false));
     let first = members.len();
     let result = index(bytes, values, members, MAX_ENTRIES, MAX_METADATA_BYTES);
     if result.is_ok() {
-        values.insert("cpio.complete", serde_json::json!(true));
+        values.insert_key(value_key!("cpio.complete"), serde_json::json!(true));
     }
     // An incomplete stream keeps the members indexed before the fault, so
     // the aggregates cover those too.
@@ -107,7 +108,7 @@ pub(super) fn extract(
         .iter()
         .map(|m| JsonValue::Object(member_value(m, Shape::FULL)))
         .collect();
-    values.insert("archive.members", JsonValue::Array(list));
+    values.insert_key(value_key!("archive.members"), JsonValue::Array(list));
     stats.emit(values, metrics);
     result
 }
@@ -178,7 +179,10 @@ fn index(
             _ => return Err(invalid("unsupported or invalid CPIO header")),
         };
         if offset == 0 {
-            values.insert("cpio.variant", serde_json::json!(header.variant));
+            values.insert_key(
+                value_key!("cpio.variant"),
+                serde_json::json!(header.variant),
+            );
         }
         let name_size =
             usize::try_from(header.name_size).map_err(|_| invalid("name size overflow"))?;
@@ -453,7 +457,7 @@ mod tests {
     #[test]
     fn public_api_retains_partial_members_and_completion_state() {
         let mut bytes = fixture("070707");
-        let parsed = crate::open(&bytes).unwrap();
+        let parsed = crate::open(&bytes);
         assert_eq!(
             parsed.values().get("cpio.complete"),
             Some(&serde_json::json!(true))
@@ -461,7 +465,7 @@ mod tests {
         assert_eq!(parsed.archive_members().len(), 2);
         assert!(parsed.errors().is_empty());
         bytes.pop();
-        let parsed = crate::open(&bytes).unwrap();
+        let parsed = crate::open(&bytes);
         assert_eq!(
             parsed.values().get("cpio.complete"),
             Some(&serde_json::json!(false))
@@ -506,7 +510,7 @@ mod tests {
         entry(&mut bytes, "070701", "postinstall", b"x", 0o100755);
         // Newc's one-byte body has three alignment bytes after it.
         bytes.truncate(bytes.len() - 3);
-        let parsed = crate::open(&bytes).unwrap();
+        let parsed = crate::open(&bytes);
         assert_eq!(parsed.archive_members().len(), 1);
         let member = &parsed.archive_members()[0];
         assert_eq!(member.path, "postinstall");

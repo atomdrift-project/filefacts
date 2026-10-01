@@ -21,6 +21,7 @@ use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_valu
 use crate::error::Error;
 use crate::formats::common::bytes_at::u64_le;
 use crate::output::{ArchiveCompression, ArchiveMember, ArchiveOffsets, Metrics, Values};
+use crate::value_key;
 
 /// The shared aggregates a 7z reports. Path traversal is counted on files
 /// only.
@@ -88,9 +89,12 @@ pub(super) fn extract(
         bytes.len() as u64,
         password.as_ref(),
     )
-    .map_err(|err| Error::malformed("7z", err.to_string()))?;
+    .map_err(|err| Error::malformed_with_source("7z", err.to_string(), err))?;
 
-    values.insert("archive.format.kind", JsonValue::String("7z".into()));
+    values.insert_key(
+        value_key!("archive.format.kind"),
+        JsonValue::String("7z".into()),
+    );
 
     let folder_methods: Vec<Vec<&'static str>> = archive
         .folders
@@ -153,7 +157,7 @@ pub(super) fn extract(
         archive_members.push(member);
     }
 
-    values.insert("archive.members", JsonValue::Array(members));
+    values.insert_key(value_key!("archive.members"), JsonValue::Array(members));
     stats.emit(values, metrics);
     Ok(())
 }
@@ -261,7 +265,7 @@ fn decode_header(bytes: &[u8], r: &mut HeaderReader<'_>) -> Result<Option<Vec<u8
                 None,
             )
             .and_then(|lzma| lzma.take(unpack_size).read_to_end(&mut out))
-            .map_err(|e| Error::malformed("7z", format!("encoded header: {e}")))?;
+            .map_err(|e| Error::malformed_with_source("7z", format!("encoded header: {e}"), e))?;
         }
         // 7-Zip and the crate's own writer use LZMA; anything else cannot be
         // checked here.

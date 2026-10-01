@@ -60,16 +60,16 @@ pub(super) fn extract(
     // the first group. Scan the first 128 bytes which is plenty.
     let head = bytes.get(..128).unwrap_or(bytes);
     if let Some(version) = parse_numeric_control(head, b"\\rtf") {
-        put_str(values, "rtf.version", version);
+        put_str(values, value_key!("rtf.version"), version);
     }
     if let Some(cs) = parse_charset(head) {
-        put_str(values, "rtf.charset", cs);
+        put_str(values, value_key!("rtf.charset"), cs);
     }
     if let Some(cp) = parse_numeric_control(head, b"\\ansicpg") {
-        put_str(values, "rtf.codepage", cp);
+        put_str(values, value_key!("rtf.codepage"), cp);
     }
     if let Some(lang) = parse_numeric_control(head, b"\\deflang") {
-        put_str(values, "rtf.deflang", lang);
+        put_str(values, value_key!("rtf.deflang"), lang);
     }
 
     info_group(bytes, values);
@@ -304,7 +304,7 @@ fn fields(bytes: &[u8], values: &mut Values) {
         pos = end.max(abs + 8);
     }
     if !entries.is_empty() {
-        values.insert("rtf.fields", JsonValue::Array(entries));
+        values.insert_key(value_key!("rtf.fields"), JsonValue::Array(entries));
     }
 }
 
@@ -338,7 +338,7 @@ fn objects(bytes: &[u8], values: &mut Values, strings: &mut Strings, metrics: &m
     }
     entries.extend(objdata_objects(bytes, strings, metrics));
     if !entries.is_empty() {
-        values.insert("rtf.objects", JsonValue::Array(entries));
+        values.insert_key(value_key!("rtf.objects"), JsonValue::Array(entries));
     }
 }
 
@@ -529,8 +529,8 @@ fn features(bytes: &[u8], values: &mut Values) {
         }
     }
     if !found.is_empty() {
-        values.insert(
-            "rtf.features",
+        values.insert_key(
+            value_key!("rtf.features"),
             JsonValue::Array(
                 found
                     .into_iter()
@@ -610,9 +610,9 @@ fn shape(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     obj.insert("control_word_count".into(), json!(control_words));
     obj.insert("group_depth_max".into(), json!(max_depth));
     obj.insert("brace_count".into(), json!(braces_open + braces_close));
-    values.insert("rtf.shape", JsonValue::Object(obj));
+    values.insert_key(value_key!("rtf.shape"), JsonValue::Object(obj));
     metrics.insert(metric!("rtf.control_word_count"), control_words as f64);
-    metrics.insert(metric!("rtf.group_depth_max"), f64::from(max_depth));
+    metrics.insert(metric!("rtf.max_group_depth"), f64::from(max_depth));
     // Control words per kilobyte. A document is mostly formatting: real RTF
     // runs tens of control words per KB whatever its size. A file that opens
     // with `{\rtf` and then spends its bytes on something else -- a hex blob,

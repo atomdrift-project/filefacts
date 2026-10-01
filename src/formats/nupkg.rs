@@ -40,8 +40,8 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         return Ok(());
     }
     if buf.len() as u64 > MAX_NUSPEC {
-        values.insert(
-            "nupkg.limits",
+        values.insert_key(
+            value_key!("nupkg.limits"),
             serde_json::json!([{
                 "stage": "nuspec",
                 "reason": format!("{name} over the {MAX_NUSPEC}-byte cap; not parsed"),
@@ -64,14 +64,14 @@ fn parse_nuspec(text: &str, values: &mut Values) -> Result<(), roxmltree::Error>
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let doc = roxmltree::Document::parse(text)?;
     const FIELDS: &[(&str, ValueKey)] = &[
-        ("id", value_key!("nupkg.id")),
+        ("id", value_key!("nupkg.name")),
         ("version", value_key!("nupkg.version")),
         ("title", value_key!("nupkg.title")),
         ("description", value_key!("nupkg.description")),
         ("authors", value_key!("nupkg.authors")),
         ("owners", value_key!("nupkg.owners")),
-        ("projectUrl", value_key!("nupkg.project_url")),
-        ("repository", value_key!("nupkg.repository_url")),
+        ("projectUrl", value_key!("nupkg.homepage")),
+        ("repository", value_key!("nupkg.repository")),
     ];
     for (tag, key) in FIELDS {
         if let Some(node) = doc.descendants().find(|n| n.has_tag_name(*tag)) {
@@ -133,7 +133,7 @@ mod tests {
             b"<package><metadata><id>Acme</id></metadata></package>",
         )]));
         assert!(e.is_empty(), "{e:?}");
-        assert_eq!(v.get("nupkg.id").and_then(|x| x.as_str()), Some("Acme"));
+        assert_eq!(v.get("nupkg.name").and_then(|x| x.as_str()), Some("Acme"));
         let (_, e) = run(&nupkg_with(&[("lib/a.dll", b"MZ")]));
         assert!(e.is_empty(), "{e:?}");
     }
@@ -165,7 +165,7 @@ mod tests {
             Some("Widgets for .NET")
         );
         assert_eq!(
-            v.get("nupkg.id").and_then(|x| x.as_str()),
+            v.get("nupkg.name").and_then(|x| x.as_str()),
             Some("Acme.Widgets")
         );
         assert_eq!(
@@ -173,7 +173,7 @@ mod tests {
             Some("Acme Corp")
         );
         assert_eq!(
-            v.get("nupkg.project_url").and_then(|x| x.as_str()),
+            v.get("nupkg.homepage").and_then(|x| x.as_str()),
             Some("https://acme.test")
         );
     }

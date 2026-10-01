@@ -150,6 +150,8 @@ impl std::fmt::Display for ParseError {
     }
 }
 
+impl std::error::Error for ParseError {}
+
 pub(super) fn parse(bytes: &[u8]) -> Result<Parsed, ParseError> {
     let mut parser = Parser::new(bytes)?;
     // A file that cannot produce a header or a root object is not a readable

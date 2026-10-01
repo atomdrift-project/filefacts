@@ -27,43 +27,73 @@ use std::time::{Duration, Instant};
 /// 32 MiB bounds parser memory and CPU for grammars whose external scanner
 /// state is proven bounded or self-guarded, while admitting large ordinary
 /// bundles such as packaged webviews. Grammars with modeled scanner state keep
-/// a tighter cap. The wall budget below remains the backstop for pathological
-/// parser behavior.
+/// a tighter cap. The work budget and wall-clock backstop below bound
+/// pathological parser behavior.
 const MAX_AST_FILE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_MODELED_AST_FILE_BYTES: usize = 4 * 1024 * 1024;
 
-/// Wall-clock backstop for a single parse. Input is already byte-capped by
-/// [`parse_cap_bytes`], so this exists only for the case size cannot bound:
-/// tree-sitter's GLR error recovery on source crafted to maximize ambiguity,
-/// where cost climbs far faster than length.
+/// Work budget for one parse, counted in progress polls. tree-sitter polls the
+/// progress callback once per 100 parser operations
+/// (`OP_COUNT_PER_PARSER_CALLBACK_CHECK` in `parser.c`), so counting polls
+/// measures work, not time: the same bytes stop at the same point however
+/// loaded the machine is. The wall-clock budget this replaced fired on
+/// ordinary files under load, and the content-keyed disk cache then kept the
+/// shallower facts.
 ///
-/// Deliberately generous. A parse killed here yields no AST facts, so a budget
-/// tight enough to trip under ordinary load would quietly cost detection on
-/// benign files — the failure mode is invisible, which makes it worse than the
-/// one it prevents. 15 s is orders of magnitude above a normal 2 MB parse and
-/// is meant to fire only for genuinely pathological input, never as a
-/// throughput limiter. Raise it if `source.ast_unavailable.parse_timeout` ever
-/// shows up on samples that are merely large.
-const SOURCE_PARSE_WALL_BUDGET: Duration = Duration::from_secs(15);
+/// The budget is [`PARSE_WORK_BASE`] polls plus one per
+/// [`PARSE_BYTES_PER_POLL`] bytes of input. Calibrated on about 68k real
+/// source files and generated 1–30 MiB sources: the densest used 0.057 polls
+/// per byte and the largest total was 585k polls (a 30 MiB minified bundle),
+/// so every ordinary file stays under a tenth of its budget. The densest input
+/// we could build on purpose (100k nested parentheses in PowerShell) used 0.14
+/// polls per byte, so in practice the budget only stops input that is both
+/// huge and op-dense.
+const PARSE_WORK_BASE: u64 = 100_000;
+const PARSE_BYTES_PER_POLL: u64 = 2;
+
+/// Wall-clock backstop for one parse, separate from the work budget.
+/// Ordinary files never reach it — the slowest ordinary corpus parse took
+/// about 7 s on a loaded machine, a 30 MiB bundle — so their facts never
+/// depend on load.
+///
+/// It exists because the work budget counts operations, not their cost, and
+/// some inputs make single operations expensive: GLR error recovery over a
+/// deep stack of unclosed brackets (token soup, badly concatenated bundles),
+/// and external scanners that re-scan a long line for its column on every
+/// token (single-line Perl). Such input can run for minutes on a few hundred
+/// KiB while using a small fraction of its work budget. Only this backstop
+/// stops it, so whether it does can depend on load.
+const SOURCE_PARSE_WALL_BACKSTOP: Duration = Duration::from_secs(60);
 
 #[cfg(test)]
 thread_local! {
-    /// Override in milliseconds; `0` means [`SOURCE_PARSE_WALL_BUDGET`]. The
-    /// timeout path is otherwise unreachable in a unit test — provoking real
-    /// GLR blowup would need a fragile adversarial fixture.
+    /// Work budget override in progress polls; `0` means the calibrated
+    /// [`parse_work_budget`]. Lets a test exhaust the budget on ordinary
+    /// input instead of needing an adversarial fixture.
     ///
     /// Thread-local, not a global: parses run on the caller's thread, and a
-    /// process-wide knob would let one test's shortened budget cancel a
+    /// process-wide knob would let one test's shortened budget cut short a
     /// parse in another test running in parallel.
-    static PARSE_BUDGET_OVERRIDE_MS: Cell<u64> = const { Cell::new(0) };
+    static PARSE_WORK_OVERRIDE: Cell<u64> = const { Cell::new(0) };
 }
 
-fn parse_wall_budget() -> Duration {
+fn parse_work_budget(bytes: usize) -> u64 {
     #[cfg(test)]
-    if let ms @ 1.. = PARSE_BUDGET_OVERRIDE_MS.get() {
-        return Duration::from_millis(ms);
+    if let polls @ 1.. = PARSE_WORK_OVERRIDE.get() {
+        return polls;
     }
-    SOURCE_PARSE_WALL_BUDGET
+    PARSE_WORK_BASE.saturating_add(bytes as u64 / PARSE_BYTES_PER_POLL)
+}
+
+/// Why the progress callback abandoned a parse.
+#[derive(Clone, Copy)]
+enum ParseStop {
+    /// The caller raised its cancellation flag.
+    Cancelled,
+    /// The work budget ran out with the parser at byte `at`.
+    Budget { budget: u64, at: usize },
+    /// [`SOURCE_PARSE_WALL_BACKSTOP`] elapsed first.
+    Backstop,
 }
 
 /// Conservative cap for grammars whose scanner has not been audited
@@ -168,19 +198,35 @@ impl TreeSitterDiagnostic {
         }
     }
 
-    fn parse_timeout(language: &'static str, bytes: usize, budget: Duration) -> Self {
+    /// `source.ast_unavailable.parse_timeout` means the parse exhausted its
+    /// work budget or, for input that makes single operations expensive, hit
+    /// the wall-clock backstop. The metric keeps its historical name because
+    /// rules key on it; the message names the limit. This message is
+    /// deterministic, so it carries the offset where the budget ran out.
+    fn parse_work_exhausted(language: &'static str, bytes: usize, budget: u64, at: usize) -> Self {
         Self {
             metric: metric!("source.ast_unavailable.parse_timeout"),
             message: format!(
-                "tree-sitter parse for {language} exceeded {budget:?} on {bytes} bytes"
+                "tree-sitter parse for {language} exhausted its work budget of {budget} progress polls at byte {at} of {bytes}"
             ),
         }
     }
 
-    /// Kept distinct from [`Self::parse_timeout`]: a cancelled parse is the
-    /// caller shutting down and is expected, while a timed-out one means the
-    /// input beat the budget and is worth investigating. Folding them into one
-    /// metric would bury the second under the first on every Ctrl-C.
+    /// Same metric as [`Self::parse_work_exhausted`], for the
+    /// [`SOURCE_PARSE_WALL_BACKSTOP`]; whether this fires can depend on load.
+    fn parse_backstop(language: &'static str, bytes: usize) -> Self {
+        Self {
+            metric: metric!("source.ast_unavailable.parse_timeout"),
+            message: format!(
+                "tree-sitter parse for {language} hit the {SOURCE_PARSE_WALL_BACKSTOP:?} wall-clock backstop on {bytes} bytes"
+            ),
+        }
+    }
+
+    /// Kept distinct from the `parse_timeout` metric: a cancelled parse is
+    /// the caller shutting down and is expected, while a timed-out one means
+    /// the input exhausted a budget and is worth investigating. Folding them
+    /// into one metric would bury the second under the first on every Ctrl-C.
     fn parse_cancelled(language: &'static str, bytes: usize) -> Self {
         Self {
             metric: metric!("source.ast_unavailable.parse_cancelled"),
@@ -243,24 +289,30 @@ impl<'a> TreeCache<'a> {
                 let _ = std::io::stderr().flush();
                 let _ = std::io::stdout().flush();
             }
-            // The C core polls this between parse steps; `Break` unwinds it
-            // cleanly and yields `None`, which is why the backstop can be a
-            // plain deadline check rather than a thread kill.
-            let budget = parse_wall_budget();
-            let deadline = Instant::now() + budget;
-            let timed_out = Cell::new(false);
-            let cancelled = Cell::new(false);
-            let mut progress = |_: &tree_sitter::ParseState| -> ControlFlow<()> {
+            // The C core polls this once per 100 parse operations; `Break`
+            // unwinds it cleanly and yields `None`, so neither limit needs a
+            // thread kill.
+            let budget = parse_work_budget(source.len());
+            let deadline = Instant::now() + SOURCE_PARSE_WALL_BACKSTOP;
+            let polls = Cell::new(0u64);
+            let stop = Cell::new(None);
+            let mut progress = |state: &tree_sitter::ParseState| -> ControlFlow<()> {
                 // Cancellation first: it is a plain atomic load, and when the
-                // caller is shutting down there is no point consulting a clock.
+                // caller is shutting down there is no point counting work.
                 // `Relaxed` is right for a poll — the flag is a hint, and the
                 // worst a stale read costs is one more progress interval.
                 if cancel.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
-                    cancelled.set(true);
+                    stop.set(Some(ParseStop::Cancelled));
+                    return ControlFlow::Break(());
+                }
+                polls.set(polls.get() + 1);
+                if polls.get() > budget {
+                    let at = state.current_byte_offset();
+                    stop.set(Some(ParseStop::Budget { budget, at }));
                     return ControlFlow::Break(());
                 }
                 if Instant::now() >= deadline {
-                    timed_out.set(true);
+                    stop.set(Some(ParseStop::Backstop));
                     return ControlFlow::Break(());
                 }
                 ControlFlow::Continue(())
@@ -289,28 +341,34 @@ impl<'a> TreeCache<'a> {
                 // above: generic/text facts still flow, with a diagnostic
                 // naming why the AST is missing. Cancelling gets its own
                 // metric, or a Ctrl-C would look like a corrupt sample.
-                if cancelled.get() {
-                    return TreeParse::Unavailable(TreeSitterDiagnostic::parse_cancelled(
-                        config.name(),
-                        source.len(),
-                    ));
-                }
-                if timed_out.get() {
-                    tracing::warn!(
-                        language = config.name(),
-                        bytes = source.len(),
-                        budget_ms = budget.as_millis(),
-                        "tree-sitter parse exceeded its wall budget; AST facts dropped"
-                    );
-                    return TreeParse::Unavailable(TreeSitterDiagnostic::parse_timeout(
-                        config.name(),
-                        source.len(),
-                        budget,
-                    ));
-                }
-                return TreeParse::Unavailable(TreeSitterDiagnostic::parse_failed(
-                    "malformed source: tree-sitter parse returned None",
-                ));
+                let (language, bytes) = (config.name(), source.len());
+                return TreeParse::Unavailable(match stop.get() {
+                    Some(ParseStop::Cancelled) => {
+                        TreeSitterDiagnostic::parse_cancelled(language, bytes)
+                    }
+                    Some(ParseStop::Budget { budget, at }) => {
+                        tracing::warn!(
+                            language,
+                            bytes,
+                            budget,
+                            at,
+                            "tree-sitter parse exhausted its work budget; AST facts dropped"
+                        );
+                        TreeSitterDiagnostic::parse_work_exhausted(language, bytes, budget, at)
+                    }
+                    Some(ParseStop::Backstop) => {
+                        tracing::warn!(
+                            language,
+                            bytes,
+                            backstop_s = SOURCE_PARSE_WALL_BACKSTOP.as_secs(),
+                            "tree-sitter parse hit its wall-clock backstop; AST facts dropped"
+                        );
+                        TreeSitterDiagnostic::parse_backstop(language, bytes)
+                    }
+                    None => TreeSitterDiagnostic::parse_failed(
+                        "malformed source: tree-sitter parse returned None",
+                    ),
+                });
             };
             TreeParse::Parsed(Self {
                 source,
@@ -760,23 +818,60 @@ mod tests {
         assert!(would_overflow_scanner_state(FileType::JavaScript, &source));
     }
 
+    /// Parse with the work budget overridden to `polls`.
+    fn parse_with_work_budget(source: &[u8], file_type: FileType, polls: u64) -> TreeParse<'_> {
+        PARSE_WORK_OVERRIDE.set(polls);
+        let parsed = TreeCache::parse(source, file_type, None);
+        PARSE_WORK_OVERRIDE.set(0);
+        parsed
+    }
+
     /// An exhausted budget must degrade to a diagnostic, not a panic: the
     /// caller still emits generic/text facts for the file.
     #[test]
-    fn exhausted_wall_budget_degrades_to_a_diagnostic() {
-        // A budget of 1ms is already spent by the first progress poll, so this
-        // exercises the cancel path without needing adversarial input.
-        PARSE_BUDGET_OVERRIDE_MS.set(1);
+    fn exhausted_work_budget_degrades_to_a_diagnostic() {
+        // One poll is spent long before 40k lines are parsed, so this
+        // exercises the budget path without needing adversarial input.
         let source = "def f():\n    return 1\n".repeat(20_000);
-        let parsed = TreeCache::parse(source.as_bytes(), FileType::Python, None);
-        PARSE_BUDGET_OVERRIDE_MS.set(0);
-
+        let parsed = parse_with_work_budget(source.as_bytes(), FileType::Python, 1);
         let diagnostic = parsed
             .diagnostic()
-            .expect("a cancelled parse yields no tree");
+            .expect("an abandoned parse yields no tree");
         assert_eq!(
             diagnostic.metric.as_str(),
             "source.ast_unavailable.parse_timeout"
+        );
+        assert!(diagnostic.message.contains("work budget"));
+    }
+
+    /// The point of a work budget: the same input stops at the same place no
+    /// matter how fast the machine is running, so the facts (and the disk
+    /// cache entry built from them) are a function of the bytes alone. A
+    /// single-line Perl chain is genuinely pathological — its scanner
+    /// re-scans the line on every token — and an unrelated parse in between
+    /// shows the reused thread-local parser carries nothing over.
+    #[test]
+    fn exhausted_work_budget_stops_at_the_same_point_every_time() {
+        let source = format!("my $x = 1{};\n", "+1".repeat(5_000));
+        let stop_message = || {
+            let parsed = parse_with_work_budget(source.as_bytes(), FileType::Perl, 50);
+            parsed
+                .diagnostic()
+                .expect("50 polls cannot cover a 10k-token line")
+                .message
+                .clone()
+        };
+        let first = stop_message();
+        let other = "sub f { return 1 }\n".repeat(1_000);
+        assert!(
+            TreeCache::parse(other.as_bytes(), FileType::Perl, None)
+                .cache()
+                .is_some()
+        );
+        assert_eq!(first, stop_message());
+        assert!(
+            first.contains("work budget of 50 progress polls at byte "),
+            "{first}"
         );
     }
 
@@ -815,14 +910,35 @@ mod tests {
 
     /// The default budget is a backstop, not a throughput limiter: ordinary
     /// source must parse untouched. Guards against a future edit that makes the
-    /// deadline fire on normal files and silently sheds detection.
+    /// budget fire on normal files and silently sheds detection.
     #[test]
     fn default_budget_does_not_disturb_an_ordinary_parse() {
         let source = "def f():\n    return 1\n".repeat(20_000);
         let parsed = TreeCache::parse(source.as_bytes(), FileType::Python, None);
         assert!(
             parsed.cache().is_some(),
-            "a normal parse must not hit the wall budget"
+            "a normal parse must not hit the work budget"
+        );
+    }
+
+    /// The calibration promise: an ordinary large file fits in a tenth of
+    /// its budget. A 4 MiB minified bundle is close to the densest real
+    /// source measured (about 0.02 polls per byte).
+    #[test]
+    fn ordinary_large_file_parses_within_a_tenth_of_its_budget() {
+        let mut source = String::new();
+        let mut i = 0;
+        while source.len() < 4 * 1024 * 1024 {
+            source.push_str(&format!(
+                "function a{i}(e,t,n){{var r=n({i}),o=n.n(r);return e.exports=Object.assign({{}},t,{{x{i}:[1,2,3].map(function(u){{return u*{i}}}),y:\"s{i}\"+t.q}}),o}}"
+            ));
+            i += 1;
+        }
+        let tenth = parse_work_budget(source.len()) / 10;
+        let parsed = parse_with_work_budget(source.as_bytes(), FileType::JavaScript, tenth);
+        assert!(
+            parsed.cache().is_some(),
+            "an ordinary 4 MiB bundle must parse within a tenth of its budget"
         );
     }
 

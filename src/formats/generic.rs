@@ -7,6 +7,7 @@
 use crate::metric;
 use crate::output::{Metrics, Span, Strings, Values};
 use crate::scan::entropy;
+use crate::value_key;
 
 /// Run the generic byte-level pass. Always succeeds.
 pub(super) fn extract(
@@ -60,8 +61,8 @@ pub(super) fn extract_xor_pe(
 ) {
     metrics.insert(metric!("xor.has_embedded_pe"), 1.0);
     metrics.insert(metric!("xor.pe_key_length"), key.period() as f64);
-    values.insert(
-        "xor.pe_key",
+    values.insert_key(
+        value_key!("xor.pe_key"),
         serde_json::Value::String(super::common::hex_encode(key.bytes())),
     );
 }
@@ -203,7 +204,9 @@ mod tests {
             .map(|(b, k)| b ^ k)
             .collect();
         for name in ["hvnc.enc", "payload.bin"] {
-            let parsed = crate::open_with_path(std::path::Path::new(name), &enc).unwrap();
+            let parsed = crate::OpenOptions::new()
+                .path(std::path::Path::new(name))
+                .open(&enc);
             assert_eq!(parsed.fileid().file_type(), crate::FileType::Data);
             assert_eq!(parsed.metrics().get("xor.has_embedded_pe"), Some(1.0));
             assert_eq!(parsed.metrics().get("xor.pe_key_length"), Some(4.0));
@@ -213,12 +216,16 @@ mod tests {
             );
         }
 
-        let plain = crate::open_with_path(std::path::Path::new("a.exe"), pe).unwrap();
+        let plain = crate::OpenOptions::new()
+            .path(std::path::Path::new("a.exe"))
+            .open(pe);
         assert_eq!(plain.metrics().get("xor.pe_key_length"), None);
         let noise: Vec<u8> = (0..4096u32)
             .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
             .collect();
-        let blob = crate::open_with_path(std::path::Path::new("blob.bin"), &noise).unwrap();
+        let blob = crate::OpenOptions::new()
+            .path(std::path::Path::new("blob.bin"))
+            .open(&noise);
         assert_eq!(blob.metrics().get("xor.pe_key_length"), None);
         assert!(blob.values().get("xor.pe_key").is_none());
     }

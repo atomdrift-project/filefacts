@@ -130,14 +130,14 @@ pub(super) fn emit(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &m
         );
     }
     if !languages.is_empty() {
-        values.insert(
-            "elf.dwarf.languages",
+        values.insert_key(
+            value_key!("elf.dwarf.languages"),
             JsonValue::Array(languages.into_iter().map(JsonValue::String).collect()),
         );
     }
     if !source_files.is_empty() {
-        values.insert(
-            "elf.dwarf.source_files",
+        values.insert_key(
+            value_key!("elf.dwarf.source_files"),
             JsonValue::Array(source_files.into_iter().map(JsonValue::String).collect()),
         );
     }

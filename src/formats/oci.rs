@@ -47,7 +47,7 @@ pub(super) fn extract(
         emit_docker_manifest(&json, values, metrics);
     }
     if !limits.is_empty() {
-        values.insert("oci.limits", JsonValue::Array(limits));
+        values.insert_key(value_key!("oci.limits"), JsonValue::Array(limits));
     }
     Ok(())
 }
@@ -103,7 +103,7 @@ fn member(bytes: &[u8], name: &str) -> std::io::Result<Option<Vec<u8>>> {
 
 /// Emit `oci.*` facts from an OCI image index.
 fn emit_oci_index(index: &JsonValue, values: &mut Values, metrics: &mut Metrics) {
-    values.insert("oci.kind", JsonValue::String("oci".into()));
+    values.insert_key(value_key!("oci.kind"), JsonValue::String("oci".into()));
     let manifests = index.get("manifests").and_then(JsonValue::as_array);
     let Some(manifests) = manifests else { return };
     metrics.insert(metric!("oci.manifest_count"), manifests.len() as f64);
@@ -128,7 +128,7 @@ fn emit_oci_index(index: &JsonValue, values: &mut Values, metrics: &mut Metrics)
 
 /// Emit `oci.*` facts from a `docker save` `manifest.json` array.
 fn emit_docker_manifest(manifest: &JsonValue, values: &mut Values, metrics: &mut Metrics) {
-    values.insert("oci.kind", JsonValue::String("docker".into()));
+    values.insert_key(value_key!("oci.kind"), JsonValue::String("docker".into()));
     let images = manifest.as_array();
     let Some(images) = images else { return };
     metrics.insert(metric!("oci.image_count"), images.len() as f64);

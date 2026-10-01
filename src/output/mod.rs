@@ -41,7 +41,7 @@ mod values;
 
 pub use archive::{ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership};
 pub use errors::{ErrorKind, Errors, ParseError, Stage};
-pub use flow::{Flow, FlowFunction, FlowOrigin, FlowOrigins, FlowTransfer, FlowValue};
+pub use flow::{Flow, FlowFunction, FlowKind, FlowOrigin, FlowOrigins, FlowTransfer, FlowValue};
 pub use identity::{Claim, Identity, Party, Signer, Trust, Url, UrlKind};
 pub use metric_keys::{
     CATALOG, FAMILIES, MetricKey, QueryLimit, archive_entry_type_count, archive_method_count,
@@ -58,5 +58,5 @@ pub use strings::{Comments, ExtractedString, Literals, Text};
 // Not part of the public schema.
 pub(crate) use strings::Strings;
 pub use symbols::{Arg, ArgShape, Symbol, SymbolKind, Symbols};
-pub use value_keys::{VALUE_CATALOG, ValueKey, declared_value_key};
+pub use value_keys::{VALUE_CATALOG, VALUE_FAMILIES, ValueKey, declared_value_key};
 pub use values::Values;

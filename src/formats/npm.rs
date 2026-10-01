@@ -64,8 +64,8 @@ fn package_json(bytes: &[u8], values: &mut Values, errors: &mut Errors) -> Optio
         }
     };
     if raw.len() as u64 > MAX_MANIFEST {
-        values.insert(
-            "npm.limits",
+        values.insert_key(
+            value_key!("npm.limits"),
             serde_json::json!([{
                 "stage": "manifest",
                 "reason": format!("{MANIFEST} over the {MAX_MANIFEST}-byte cap; not parsed"),
@@ -143,12 +143,13 @@ pub(super) fn emit(manifest: &JsonValue, values: &mut Values, metrics: &mut Metr
     // source — a `postinstall` that fetches a remote stage is the classic
     // npm supply-chain vector.
     if let Some(scripts) = obj.get("scripts").and_then(JsonValue::as_object) {
-        for hook in ["preinstall", "install", "postinstall"] {
+        for (hook, key) in [
+            ("preinstall", value_key!("npm.scripts.preinstall")),
+            ("install", value_key!("npm.scripts.install")),
+            ("postinstall", value_key!("npm.scripts.postinstall")),
+        ] {
             if let Some(cmd) = scripts.get(hook).and_then(JsonValue::as_str) {
-                values.insert(
-                    &format!("npm.scripts.{hook}"),
-                    JsonValue::String(cmd.to_string()),
-                );
+                values.insert_key(key, JsonValue::String(cmd.to_string()));
             }
         }
     }

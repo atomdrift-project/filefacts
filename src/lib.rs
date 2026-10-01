@@ -29,7 +29,7 @@
 //!
 //! ```no_run
 //! let bytes = std::fs::read("sample.exe").unwrap();
-//! let parsed = filefacts::open(&bytes).unwrap();
+//! let parsed = filefacts::open(&bytes);
 //!
 //! println!("file type: {:?}", parsed.fileid().file_type());
 //! for (key, value) in parsed.values().iter() {
@@ -54,20 +54,37 @@
 //! bytes and writes into every view in one walk. There is no
 //! parsing during view materialisation that wasn't requested.
 //!
+//! ## Configuration
+//!
+//! [`open`] uses the library defaults. [`OpenOptions`] supplies a path, a
+//! known type or [`FileId`], a cancellation flag, and the cache and rizin
+//! settings. Every setting belongs to the [`ParsedFile`] it opens, so one
+//! process can open files under different settings at once.
+//!
+//! ```no_run
+//! use std::path::Path;
+//!
+//! let bytes = std::fs::read("sample.exe").unwrap();
+//! let parsed = filefacts::OpenOptions::new()
+//!     .path(Path::new("sample.exe"))
+//!     .rizin(false)
+//!     .open(&bytes);
+//! ```
+//!
 //! ## Side effects
 //!
 //! Opening a file only identifies it. The first view access runs the
 //! extraction, which may spawn an installed rizin: once per process to read
 //! its version, and per file to recover symbols from PE, ELF and Mach-O
-//! binaries (see [`rizin`]). Turn that off with [`rizin::disable`] or
-//! [`rizin::scoped_disable`].
+//! binaries (see [`rizin`]). Turn that off with [`OpenOptions::rizin`].
 //!
-//! The disk cache in [`cache`] is off unless the host opts in, with
-//! [`cache::enable_by_default`] (which `FILEFACTS_CACHE=0` still overrides)
-//! or [`cache::set_caching_enabled`]. When on, the first view access reads a
-//! matching entry from the user cache directory, or writes one after
-//! computing the views. The `filefacts` CLI opts in. Diagnostics are written
-//! to stderr only when `FILEFACTS_DEBUG` is set.
+//! The disk cache in [`cache`] is off unless the host opts in with
+//! [`OpenOptions::cache`], or the `FILEFACTS_CACHE` environment variable
+//! turns it on for hosts that did not choose. When on, the first view access
+//! reads a matching entry from the user cache directory, or writes one after
+//! computing the views. The `filefacts` CLI opts in (`FILEFACTS_CACHE=0`
+//! still turns it off). Diagnostics are written to stderr only when
+//! `FILEFACTS_DEBUG` is set.
 //!
 //! ## Stability
 //!
@@ -96,10 +113,10 @@ pub mod tools;
 
 /// Optional rizin/radare2 integration with hardened subprocess
 /// discipline (RLIMIT, PR_SET_PDEATHSIG, process-group SIGKILL on
-/// timeout / output-cap overflow). Exposed as a public module so host
-/// CLIs can mute it during scans (`scoped_disable`), reap in-flight
-/// workers (`kill_all_rizin_groups`) from a signal handler, and emit
-/// `tracing` telemetry (`log_stats`) at shutdown.
+/// timeout / output-cap overflow). Configured per file through
+/// [`OpenOptions`]; exposed as a public module only for what is genuinely
+/// process-wide: reaping in-flight workers (`kill_all_rizin_groups`) from a
+/// signal handler, and `tracing` telemetry (`stats`, `log_stats`).
 pub mod rizin;
 
 pub use formats::source::decode_source_escapes;
@@ -124,11 +141,12 @@ pub fn has_named_reference_metadata(path: &std::path::Path) -> bool {
 /// internal; VBA symbols flow out through the unified [`Symbols`]
 /// view like every other format.
 pub use formats::vba_symbols::NON_LITERAL_SENTINEL as VBA_NON_LITERAL_SENTINEL;
-pub use output::{Flow, FlowFunction, FlowOrigin, FlowOrigins, FlowTransfer, FlowValue};
+pub use output::{Flow, FlowFunction, FlowKind, FlowOrigin, FlowOrigins, FlowTransfer, FlowValue};
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
 
 pub use embedded_sources::EmbeddedSource;
 pub use error::Error;
@@ -138,9 +156,9 @@ pub use output::{
     Claim, Comments, ErrorKind, Errors, ExtractedString, FAMILIES, Fact, HashAlgo, Identity,
     Literals, MetricKey, Metrics, ParseError, Party, PinnedHash, QueryLimit, RefKind, RefLocator,
     Reference, Section, Sections, Signer, Span, SpanBuilder, Stage, Symbol, SymbolKind, Symbols,
-    Text, Trust, Url, UrlKind, VALUE_CATALOG, ValueKey, Values, archive_entry_type_count,
-    archive_method_count, ast_op, ast_op_density, declared, declared_value_key, dmg_codec_count,
-    extension_content_mismatch, source_query_limited,
+    Text, Trust, Url, UrlKind, VALUE_CATALOG, VALUE_FAMILIES, ValueKey, Values,
+    archive_entry_type_count, archive_method_count, ast_op, ast_op_density, declared,
+    declared_value_key, dmg_codec_count, extension_content_mismatch, source_query_limited,
 };
 pub use registry::Registry;
 
@@ -155,6 +173,34 @@ pub use registry::Registry;
 #[must_use]
 pub fn known_metrics() -> (&'static [&'static str], &'static [&'static str]) {
     (CATALOG, FAMILIES)
+}
+
+/// Every [`Values`] key this build can write, as fixed keys
+/// ([`VALUE_CATALOG`]) plus templates for keys with a data-derived segment
+/// inside the path ([`VALUE_FAMILIES`]).
+///
+/// This is the [`known_metrics`] counterpart for `type: values` rule fields.
+/// Unlike a metric, a value can be an object or an array that a rule reaches
+/// into, so a validator should accept a rule path when it:
+///
+/// - equals a fixed key;
+/// - extends a fixed key with `.` or `[`, as in `pe.signatures[0].subject`,
+///   `pdf.info.Author` or `npm.author.email`. This also covers data tails
+///   written below a key, such as `pkg.<field>` or `wasm.producers.<field>`;
+/// - matches a template, where each `<name>` placeholder stands for a
+///   non-empty run of characters other than `.` and `[`, either exactly or
+///   extended with `.` or `[` as above.
+///
+/// An index in a rule path, whether `[0]` or the `[*]` wildcard, matches the
+/// same way. One kind of path is outside this list: the parsed document of a
+/// structured format (JSON, YAML, TOML, plist, `PKG-INFO` and Xcode project
+/// files), which filefacts places at the values root verbatim. A rule that
+/// reads such a document's own fields, such as `scripts.postinstall` in a
+/// `package.json`, names data rather than a filefacts key, so the validator
+/// should not report it as unknown.
+#[must_use]
+pub fn known_values() -> (&'static [&'static str], &'static [&'static str]) {
+    (VALUE_CATALOG, VALUE_FAMILIES)
 }
 
 /// Schema version of the public output shape.
@@ -189,7 +235,21 @@ pub fn known_metrics() -> (&'static [&'static str], &'static [&'static str]) {
 /// number; unlocated metrics are unchanged. This is a value-shape change,
 /// so a consumer parsing every metric as a number must handle the object
 /// form. `stng::ExtractedString` also gains a `data_len` source extent.
-pub const SCHEMA_VERSION: &str = "8";
+///
+/// **v9** — 75 value and metric keys are renamed to follow one naming
+/// convention (21 value keys, 54 metric keys); no key changes meaning or
+/// value except its name. Package links and identity fold onto the
+/// cross-format names (`whl.home_page`, `crx.homepage_url`, `rpm.url` →
+/// `<fmt>.homepage`; `deb.package`, `nupkg.id`, `apk.pkgname` →
+/// `<fmt>.name`), `pe.imphash` moves to `pe.hashes.imphash` beside the ELF
+/// and Mach-O fingerprints, counts take `_count` (`scpt.handlers` →
+/// `scpt.handler_count`), abbreviations are spelled out
+/// (`binary.huge_func_count` → `binary.huge_function_count`), and units
+/// that are not bytes become a suffix (`deb.installed_size` →
+/// `deb.installed_size_kib`). Identity claim sources name the new keys.
+/// `docs/NAMING.md` states the convention and `docs/schema-v9-renames.tsv`
+/// lists every old → new pair.
+pub const SCHEMA_VERSION: &str = "9";
 
 /// A file with its bytes and lazily-computed metadata views.
 ///
@@ -211,11 +271,10 @@ pub const SCHEMA_VERSION: &str = "8";
 pub struct ParsedFile<'a> {
     bytes: &'a [u8],
     fileid: FileId,
-    // Basename of the file as supplied via `open_with_path` /
-    // `from_path`. None when the file was opened from a byte slice
-    // with no associated path. When present, surfaced as the
-    // `file.basename` value during extraction so traits can match
-    // against it via `type: value, path: file.basename`.
+    // Basename of the path given to `OpenOptions::path`. None when the
+    // file was opened from a byte slice with no associated path. When
+    // present, surfaced as the `file.basename` value during extraction so
+    // traits can match against it via `type: value, path: file.basename`.
     basename: Option<String>,
     // Shared tree-sitter parse for source files. Built once by
     // `tree_cache()` and consumed by the single extraction pipeline
@@ -227,7 +286,11 @@ pub struct ParsedFile<'a> {
     // Caller's cancellation flag, polled by long-running leaf work (currently
     // the tree-sitter parse). Borrowed rather than `Arc`-shared, and never
     // written here: filefacts only ever reads it.
-    cancellation: Option<&'a std::sync::atomic::AtomicBool>,
+    cancellation: Option<&'a AtomicBool>,
+    // Whether `extracted` reads and writes the disk cache.
+    cache: bool,
+    // This file's rizin settings, carried into the extraction.
+    rizin: rizin::Settings,
     extracted: OnceLock<Extracted>,
     // How many times this `ParsedFile` ran its extraction pipeline.
     // A correctly-implemented `ParsedFile` never reports more than 1
@@ -494,15 +557,16 @@ impl<'a> ParsedFile<'a> {
     ///
     /// `true` means rizin is installed (so the symbol/section views would
     /// normally be rizin-grade) yet this particular run produced nothing
-    /// — it timed out, was killed on the output cap, was muted, or
-    /// skipped the input by size. The bytes are unchanged, so a later run
-    /// may succeed; a caller caching analysis output keyed by content
-    /// **must not persist a payload while this is `true`**, or the
-    /// degraded result would be served to every future run. Pair with
-    /// [`crate::cache::Computed::Transient`] and
-    /// [`crate::rizin::cache_fingerprint`]. Always `false` when rizin is
-    /// not installed (the no-rizin result is correct for that
-    /// environment, and keyed as such).
+    /// — it timed out, was killed on the output cap, or had turned itself
+    /// off after too many abandoned output readers. The bytes are
+    /// unchanged, so a later run may succeed; a caller caching analysis
+    /// output keyed by content **must not persist a payload while this is
+    /// `true`**, or the degraded result would be served to every future
+    /// run. Pair with [`crate::cache::Computed::Transient`] and
+    /// [`OpenOptions::rizin_fingerprint`]. Always `false` when rizin is not
+    /// installed, turned off with [`OpenOptions::rizin`], or skipped the
+    /// input under [`OpenOptions::rizin_max_bytes`]: those results are
+    /// correct for that environment and those settings, and keyed as such.
     pub fn rizin_recovery_incomplete(&self) -> bool {
         rizin_incomplete(self.metrics())
     }
@@ -517,28 +581,6 @@ impl<'a> ParsedFile<'a> {
             | Symbol::Function { name, .. } => Some(name.as_str()),
             _ => None,
         })
-    }
-
-    /// Poll `flag` during long-running leaf work, abandoning it when the flag
-    /// goes true. Currently observed by the tree-sitter parse, the one leaf
-    /// that can run long on adversarial input without spawning a process.
-    ///
-    /// Cancelling is *not* an error: the affected view degrades to a
-    /// diagnostic (`source.ast_unavailable.parse_cancelled`) and every other
-    /// fact family still extracts, so a caller that cancels mid-file still
-    /// gets a usable — if shallower — result.
-    ///
-    /// The flag is borrowed, so it is the caller's job to keep it alive for
-    /// this `ParsedFile`. filefacts only ever reads it, never sets it, which
-    /// is what makes it safe to share across threads without an `Arc` here.
-    ///
-    /// Note that rizin is deliberately *not* wired to this: it enforces its
-    /// own hard wall-clock timeout and kills its process group, so it is
-    /// already bounded, and threading a flag to it would widen several
-    /// format-extractor signatures for no new guarantee.
-    pub fn with_cancellation(mut self, flag: &'a std::sync::atomic::AtomicBool) -> Self {
-        self.cancellation = Some(flag);
-        self
     }
 
     /// Borrow the shared tree-sitter parse, if this file is a source
@@ -597,11 +639,11 @@ impl<'a> ParsedFile<'a> {
 
     fn extracted(&self) -> &Extracted {
         self.extracted.get_or_init(|| {
-            if !cache::caching_enabled() {
+            if !self.cache {
                 return self.run_pipeline();
             }
             // The disk cache is keyed by (content, filefacts build, detected
-            // type, basename, rizin config). Type belongs in the key because detection
+            // type, basename, rizin settings). Type belongs in the key because detection
             // may use the logical filename: identical gzip bytes named
             // `package.tgz` and `hash.sample` are npm and generic gzip inputs,
             // respectively, and expose different identity/structure views.
@@ -611,6 +653,7 @@ impl<'a> ParsedFile<'a> {
             // A degraded rizin run is returned but not persisted, so a later
             // healthy run still gets to fill the entry.
             let variant = extraction_cache_variant(
+                &self.rizin,
                 self.fileid.file_type(),
                 self.fileid.extension_mismatch(),
                 self.fileid.extension_mismatch_transition(),
@@ -644,6 +687,7 @@ impl<'a> ParsedFile<'a> {
             self.tree_cache(),
             self.tree_parse()
                 .and_then(formats::source::TreeParse::diagnostic),
+            self.rizin,
         );
         match self.cfml_outcome() {
             Some(Ok(parsed)) => {
@@ -686,7 +730,11 @@ fn rizin_incomplete(metrics: &Metrics) -> bool {
         .is_some()
 }
 
+/// Everything besides the bytes and the build that a cached extraction
+/// depends on (see [`ParsedFile::extracted`]); [`cache::cache_key`] folds in
+/// the rest.
 fn extraction_cache_variant(
+    rizin: &rizin::Settings,
     file_type: FileType,
     extension_mismatch: bool,
     mismatch_transition: Option<(&'static str, &'static str)>,
@@ -711,7 +759,7 @@ fn extraction_cache_variant(
     };
     format!(
         "{};file_type={};mismatch={};basename={basename:?}",
-        crate::rizin::cache_fingerprint(),
+        rizin::cache_fingerprint(rizin),
         file_type.label(),
         transition
     )
@@ -723,6 +771,7 @@ fn run_extraction(
     basename: Option<&str>,
     tree_cache: Option<&formats::source::TreeCache<'_>>,
     tree_diagnostic: Option<&formats::source::TreeSitterDiagnostic>,
+    rizin: rizin::Settings,
 ) -> Extracted {
     let file_type = fileid.file_type();
     let extension_mismatch = fileid.extension_mismatch();
@@ -744,8 +793,8 @@ fn run_extraction(
             value_key!("file.basename"),
             serde_json::Value::String(name.to_string()),
         );
-        values.insert(
-            "file.stem",
+        values.insert_key(
+            value_key!("file.stem"),
             serde_json::Value::String(formats::common::stem(name)),
         );
     }
@@ -790,6 +839,7 @@ fn run_extraction(
                 image_end: &mut image_end,
                 basename,
                 xor_pe_key,
+                rizin,
             },
         )
     }));
@@ -804,7 +854,7 @@ fn run_extraction(
         Err(payload) => {
             let stage = stage_for(file_type);
             if stage == Stage::SourceExtract {
-                metrics.insert(metric!("source.extract_panic"), 1.0);
+                metrics.insert(metric!("source.extract_panicked"), 1.0);
                 metrics.insert(metric!("source.ast_unavailable"), 1.0);
             }
             errors.record_panic(stage, panic_payload_message(payload));
@@ -819,7 +869,7 @@ fn run_extraction(
             formats::source::build_symbols(cache, &mut symbols, &mut metrics);
         }));
         if let Err(payload) = walk_result {
-            metrics.insert(metric!("source.ast_walk_panic"), 1.0);
+            metrics.insert(metric!("source.ast_walk_panicked"), 1.0);
             metrics.insert(metric!("source.ast_unavailable"), 1.0);
             errors.record_panic(Stage::SourceAstWalk, panic_payload_message(payload));
         }
@@ -1029,12 +1079,12 @@ fn emit_section_metrics(sections: &Sections, metrics: &mut Metrics) {
         // can point at it; the mean has no single location.
         match max_span {
             Some(span) => {
-                metrics.insert_located(metric!("sections.entropy_max"), entropy_max, [span])
+                metrics.insert_located(metric!("sections.max_entropy"), entropy_max, [span])
             }
-            None => metrics.insert(metric!("sections.entropy_max"), entropy_max),
+            None => metrics.insert(metric!("sections.max_entropy"), entropy_max),
         }
         metrics.insert(
-            metric!("sections.entropy_mean"),
+            metric!("sections.avg_entropy"),
             entropy_sum / entropy_n as f64,
         );
     }
@@ -1344,6 +1394,8 @@ impl<'a> ParsedFile<'a> {
             flow: OnceLock::new(),
             cfml_parse: OnceLock::new(),
             cancellation: None,
+            cache: false,
+            rizin: rizin::Settings::default(),
             extracted: OnceLock::new(),
             parse_count: AtomicU32::new(0),
         }
@@ -1358,84 +1410,254 @@ fn basename_of(path: &Path) -> Option<String> {
         .map(|name| name.to_string_lossy().into_owned())
 }
 
-/// Open `bytes` for metadata extraction. The returned [`ParsedFile`]
-/// borrows the slice for its lifetime.
-///
-/// File-type identification uses content-only heuristics (magic bytes,
-/// shebang, lightweight pattern matching). Use [`open_with_path`] when
-/// the file's path / extension should also inform the identification.
-///
-/// Currently always `Ok`: identification falls back to
-/// [`FileType::Unknown`] rather than failing. The `Result` leaves room
-/// for a stricter contract without a breaking change.
-///
-/// No filesystem access happens here; the first view access may use the
-/// disk cache (see the crate-level "Side effects" section).
-pub fn open(bytes: &[u8]) -> Result<ParsedFile<'_>, Error> {
-    let fileid = FileId::from_bytes(bytes);
-    Ok(ParsedFile::new(bytes, fileid, None))
+/// How [`OpenOptions::open`] settles the file type.
+#[derive(Clone, Copy, Debug)]
+enum Identification {
+    /// Detect from the bytes, and from the path when one was given.
+    Detect,
+    /// The caller's type, bypassing detection ([`OpenOptions::file_type`]).
+    Forced(FileType),
+    /// The caller's own detection result ([`OpenOptions::fileid`]).
+    Precomputed(FileId),
 }
 
-/// Open `bytes` with the original path supplied for identification.
+/// How to open bytes as a [`ParsedFile`]: what identification may use, and
+/// the settings its extraction runs under.
 ///
-/// Some formats are only distinguishable via the file extension or
-/// well-known basename (e.g. `package.json` is JSON byte-for-byte but
-/// carries different metadata than a generic JSON document). Pass the
-/// path when you have it.
-pub fn open_with_path<'a>(path: &Path, bytes: &'a [u8]) -> Result<ParsedFile<'a>, Error> {
-    let fileid = FileId::from_path_and_bytes(path, bytes);
-    Ok(ParsedFile::new(bytes, fileid, basename_of(path)))
+/// Every setting belongs to the `ParsedFile` it opens. Nothing here is
+/// process-wide, so one process can open files under different settings at
+/// the same time — rizin on for one and off for another, the disk cache on
+/// for one and off for another — without either seeing the other's.
+///
+/// [`OpenOptions::new`] gives the library defaults; [`open`] is shorthand
+/// for opening with them. Setters consume and return the options, and
+/// [`open`](Self::open) borrows them, so one value configured once can open
+/// many files (clone it to vary the path per file):
+///
+/// ```no_run
+/// use std::path::Path;
+/// use std::time::Duration;
+///
+/// let options = filefacts::OpenOptions::new().rizin_timeout(Duration::from_secs(60));
+/// for name in ["a.exe", "b.so"] {
+///     let bytes = std::fs::read(name)?;
+///     let parsed = options.clone().path(Path::new(name)).open(&bytes);
+///     println!("{name}: {:?}", parsed.fileid().file_type());
+/// }
+/// # Ok::<(), std::io::Error>(())
+/// ```
+#[must_use]
+#[derive(Clone, Debug)]
+pub struct OpenOptions<'a> {
+    path: Option<PathBuf>,
+    identification: Identification,
+    cancellation: Option<&'a AtomicBool>,
+    cache: bool,
+    rizin: rizin::Settings,
 }
 
-/// Open `bytes` with a [`FileId`] the caller already computed via
-/// [`FileId::from_path_and_bytes`]. Identical to [`open_with_path`] minus the
-/// second detection pass: detection on a compressed tar inflates up to 64 MiB
-/// of it to decide npm/sdist, so a caller that has already paid for that
-/// (cleave's archive analyzer) must not pay it again.
-pub fn open_with_fileid<'a>(
-    path: &Path,
-    bytes: &'a [u8],
-    fileid: FileId,
-) -> Result<ParsedFile<'a>, Error> {
-    Ok(ParsedFile::new(bytes, fileid, basename_of(path)))
+impl Default for OpenOptions<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-/// Open `bytes` forcing a caller-known [`FileType`], bypassing content
-/// and extension detection.
+impl<'a> OpenOptions<'a> {
+    /// The library defaults:
+    ///
+    /// * identification from the bytes alone (until [`path`](Self::path)
+    ///   is given);
+    /// * no cancellation flag;
+    /// * the disk cache off, unless the `FILEFACTS_CACHE` environment
+    ///   variable turns it on (see [`cache::env_override`]);
+    /// * rizin on when it is installed, with a
+    ///   [`rizin::DEFAULT_RIZIN_TIMEOUT_SECS`] budget per run, no size cap,
+    ///   and every slice of a fat Mach-O analysed.
+    pub fn new() -> Self {
+        Self {
+            path: None,
+            identification: Identification::Detect,
+            cancellation: None,
+            cache: cache::env_override().unwrap_or(false),
+            rizin: rizin::Settings::default(),
+        }
+    }
+
+    /// The file's path, for identification and for `file.basename`.
+    ///
+    /// Some formats are only distinguishable by extension or well-known
+    /// basename (`package.json` is JSON byte for byte but carries different
+    /// metadata than a generic JSON document), so pass the path when you have
+    /// it. The basename is surfaced as the `file.basename` and `file.stem`
+    /// values. Nothing is read from the path.
+    pub fn path(mut self, path: &Path) -> Self {
+        self.path = Some(path.to_path_buf());
+        self
+    }
+
+    /// Force the file type, bypassing content and extension detection.
+    ///
+    /// Identification normally trusts magic bytes, then the path/extension,
+    /// then content heuristics. Some callers already know the language from
+    /// context the bytes don't carry, and detection would otherwise give the
+    /// wrong answer or fall back to [`FileType::Unknown`]. The motivating
+    /// case is an interpreter inline-code payload: the body extracted from
+    /// `python3 -c "<code>"` is genuine Python, but stripped of its shebang
+    /// and carried under a virtual path with no usable extension, so the
+    /// detector can't see it. Forcing the type lets
+    /// [`ParsedFile::source_ast`] select the correct tree-sitter grammar.
+    ///
+    /// A [`path`](Self::path) then only supplies the basename. Replaces an
+    /// earlier [`fileid`](Self::fileid).
+    pub fn file_type(mut self, file_type: FileType) -> Self {
+        self.identification = Identification::Forced(file_type);
+        self
+    }
+
+    /// Use a [`FileId`] the caller already computed with
+    /// [`FileId::from_path_and_bytes`] instead of detecting again. Detection
+    /// on a compressed tar inflates up to 64 MiB of it to decide npm/sdist,
+    /// so a caller that has already paid for that must not pay it twice.
+    ///
+    /// A [`path`](Self::path) then only supplies the basename. Replaces an
+    /// earlier [`file_type`](Self::file_type).
+    pub fn fileid(mut self, fileid: FileId) -> Self {
+        self.identification = Identification::Precomputed(fileid);
+        self
+    }
+
+    /// Poll `flag` during long-running leaf work, abandoning it when the flag
+    /// goes true. Currently observed by the tree-sitter parse, the one leaf
+    /// that can run long on adversarial input without spawning a process.
+    ///
+    /// Cancelling is *not* an error: the affected view degrades to a
+    /// diagnostic (`source.ast_unavailable.parse_cancelled`) and every other
+    /// fact family still extracts, so a caller that cancels mid-file still
+    /// gets a usable — if shallower — result.
+    ///
+    /// The flag is borrowed for the [`ParsedFile`]'s lifetime. filefacts
+    /// only ever reads it, never sets it, which is what makes it safe to
+    /// share across threads without an `Arc` here.
+    ///
+    /// Rizin is deliberately *not* wired to this: it enforces its own hard
+    /// wall-clock budget ([`rizin_timeout`](Self::rizin_timeout)) and kills
+    /// its process group, so it is already bounded.
+    pub fn cancellation(mut self, flag: &'a AtomicBool) -> Self {
+        self.cancellation = Some(flag);
+        self
+    }
+
+    /// Read and write the disk cache in [`cache`].
+    ///
+    /// When on, the first view access reads a matching entry from the user
+    /// cache directory, or writes one after computing the views; a later open
+    /// of the same bytes, under the same settings, skips the extraction (and
+    /// its rizin run). The key covers the bytes, the filefacts build, the
+    /// detected type, the basename and
+    /// [`rizin_fingerprint`](Self::rizin_fingerprint). Outranks
+    /// `FILEFACTS_CACHE`.
+    pub fn cache(mut self, enabled: bool) -> Self {
+        self.cache = enabled;
+        self
+    }
+
+    /// Run an installed rizin to recover symbols, functions and sections
+    /// from PE, ELF and Mach-O binaries the static parse leaves thin (see
+    /// [`rizin`]). On by default; turn it off to keep extraction free of
+    /// subprocesses.
+    pub fn rizin(mut self, enabled: bool) -> Self {
+        self.rizin.enabled = enabled;
+        self
+    }
+
+    /// Wall-clock budget for one rizin run; a run past it is killed with its
+    /// process group and the file keeps its static facts.
+    /// [`rizin::DEFAULT_RIZIN_TIMEOUT_SECS`] by default. Latency-sensitive
+    /// hosts lower it.
+    pub fn rizin_timeout(mut self, timeout: Duration) -> Self {
+        self.rizin.timeout = timeout;
+        self
+    }
+
+    /// Skip rizin for inputs larger than `max_bytes`. A full analysis of a
+    /// 100 MB+ stripped binary costs minutes, so a latency-sensitive host
+    /// caps it to keep one giant from dominating a scan. No cap by default.
+    pub fn rizin_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.rizin.max_bytes = Some(max_bytes);
+        self
+    }
+
+    /// Hand rizin only the host-native slice of a fat Mach-O instead of the
+    /// whole universal binary: the other slices never run on this host, and
+    /// analysing each is the bulk of the cost. Off by default, so a
+    /// filesystem scan covers every slice.
+    pub fn rizin_native_arch_only(mut self, enabled: bool) -> Self {
+        self.rizin.native_arch_only = enabled;
+        self
+    }
+
+    /// The rizin part of the disk-cache key for files opened with these
+    /// options: whether rizin runs (installed and enabled), its version,
+    /// native-arch slicing and the size cap — every rizin setting that
+    /// changes a persisted extraction. The timeout is not part of it: a run
+    /// that completes is the same under any budget, and one that times out
+    /// is never persisted (see [`ParsedFile::rizin_recovery_incomplete`]).
+    ///
+    /// For a host keying its own cache of results derived from filefacts.
+    #[must_use]
+    pub fn rizin_fingerprint(&self) -> String {
+        rizin::cache_fingerprint(&self.rizin)
+    }
+
+    /// Identify `bytes` and return a [`ParsedFile`] that borrows them.
+    ///
+    /// Identification falls back to [`FileType::Unknown`] rather than
+    /// failing, so this cannot fail. No filesystem access happens here; the
+    /// first view access runs the extraction, which may use the disk cache
+    /// and spawn rizin as these options allow.
+    pub fn open<'b>(&self, bytes: &'b [u8]) -> ParsedFile<'b>
+    where
+        'a: 'b,
+    {
+        let fileid = match (self.identification, self.path.as_deref()) {
+            (Identification::Detect, None) => FileId::from_bytes(bytes),
+            (Identification::Detect, Some(path)) => FileId::from_path_and_bytes(path, bytes),
+            (Identification::Forced(file_type), _) => FileId::forced(file_type),
+            (Identification::Precomputed(fileid), _) => fileid,
+        };
+        let mut parsed = ParsedFile::new(bytes, fileid, self.path.as_deref().and_then(basename_of));
+        parsed.cancellation = self.cancellation;
+        parsed.cache = self.cache;
+        parsed.rizin = self.rizin;
+        parsed
+    }
+}
+
+/// Open `bytes` with the default [`OpenOptions`]: identified from content
+/// alone (magic bytes, shebang, lightweight pattern matching), with the
+/// library's default cache and rizin settings. Use [`OpenOptions`] to supply
+/// a path, a known type, a cancellation flag or other settings.
 ///
-/// Identification normally trusts magic bytes, then the path/extension,
-/// then content heuristics. Some callers already know the language from
-/// context the bytes don't carry, and detection would otherwise give the
-/// wrong answer or fall back to [`FileType::Unknown`]. The motivating case
-/// is an interpreter inline-code payload: the body extracted from
-/// `python3 -c "<code>"` is genuine Python, but stripped of its shebang
-/// and carried under a virtual path with no usable extension, so the
-/// detector can't see it. Forcing the type lets `source_ast()` select the
-/// correct tree-sitter grammar and recover the payload's real AST.
-///
-/// `path` is retained only for its basename (so `file.basename` rules and
-/// well-known-name lookups still work); it does not influence the type.
-pub fn open_as<'a>(
-    path: &Path,
-    bytes: &'a [u8],
-    file_type: FileType,
-) -> Result<ParsedFile<'a>, Error> {
-    Ok(ParsedFile::new(
-        bytes,
-        FileId::forced(file_type),
-        basename_of(path),
-    ))
+/// The returned [`ParsedFile`] borrows the slice for its lifetime. No
+/// filesystem access happens here; the first view access may use the disk
+/// cache (see the crate-level "Side effects" section).
+pub fn open(bytes: &[u8]) -> ParsedFile<'_> {
+    OpenOptions::new().open(bytes)
 }
 
 /// Read a file from disk, identify it, and return its bytes paired
 /// with a [`FileId`].
 ///
-/// The bytes are returned so the caller can pass them on to
-/// [`open_with_path`] without re-reading the file:
+/// The bytes and identification are returned so the caller can open them
+/// without re-reading or re-identifying the file:
 ///
 /// ```no_run
-/// let (bytes, _id) = filefacts::from_path(std::path::Path::new("sample.exe"))?;
-/// let parsed = filefacts::open_with_path(std::path::Path::new("sample.exe"), &bytes)?;
+/// let path = std::path::Path::new("sample.exe");
+/// let (bytes, fileid) = filefacts::from_path(path)?;
+/// let parsed = filefacts::OpenOptions::new()
+///     .path(path)
+///     .fileid(fileid)
+///     .open(&bytes);
 /// # Ok::<(), filefacts::Error>(())
 /// ```
 pub fn from_path(path: &Path) -> Result<(Vec<u8>, FileId), Error> {
@@ -1448,57 +1670,49 @@ pub fn from_path(path: &Path) -> Result<(Vec<u8>, FileId), Error> {
 /// `language`. Used by rule engines that want to validate a query
 /// string at load time without holding a parsed file. Recognised
 /// language names match the values exposed under `values.source.language`
-/// (e.g. `"python"`, `"javascript"`, `"perl"`, `"makefile"`).
+/// (e.g. `"python"`, `"javascript"`, `"perl"`, `"makefile"`), plus a few
+/// common aliases such as `"js"`, `"shell"` and `"c#"`.
 ///
-/// Returns `Ok(())` on success; on failure, returns an `Error` whose
-/// message identifies whether the language is unknown or the query
-/// string is malformed.
+/// # Errors
+///
+/// [`Error::UnsupportedLanguage`] when no grammar answers to `language`, and
+/// [`Error::InvalidQuery`], carrying the [`tree_sitter::QueryError`], when
+/// `query` does not compile against it.
 pub fn validate_source_query(language: &str, query: &str) -> Result<(), Error> {
-    let Some(file_type) = file_type_for_language(language) else {
-        return Err(Error::malformed(
-            "source",
-            format!("unsupported language for ast query: {language}"),
-        ));
-    };
-    let Some(ts_lang) = formats::source::tree_sitter_language(file_type) else {
-        return Err(Error::malformed(
-            "source",
-            format!("no tree-sitter grammar registered for {language}"),
-        ));
-    };
+    let unsupported = || Error::UnsupportedLanguage(language.to_string());
+    let file_type = file_type_for_language(language).ok_or_else(unsupported)?;
+    let ts_lang = formats::source::tree_sitter_language(file_type).ok_or_else(unsupported)?;
     tree_sitter::Query::new(&ts_lang, query)
         .map(|_| ())
-        .map_err(|e| Error::malformed("source", format!("invalid tree-sitter query: {e}")))
+        .map_err(|source| Error::InvalidQuery {
+            language: language.to_string(),
+            source,
+        })
 }
 
+/// Alternative spellings [`validate_source_query`] accepts, each mapped to
+/// the `values.source.language` label it stands for.
+const SOURCE_LANGUAGE_ALIASES: &[(&str, &str)] = &[
+    ("js", "javascript"),
+    ("ts", "typescript"),
+    ("shell", "bash"),
+    ("c#", "csharp"),
+    ("ps1", "powershell"),
+    ("objective-c", "objc"),
+    ("clj", "clojure"),
+    ("cljs", "clojure"),
+    ("cljc", "clojure"),
+    ("make", "makefile"),
+];
+
+/// The source file type named `name`: a `values.source.language` label or
+/// one of [`SOURCE_LANGUAGE_ALIASES`].
 fn file_type_for_language(name: &str) -> Option<FileType> {
-    Some(match name {
-        "c" => FileType::C,
-        "python" => FileType::Python,
-        "javascript" | "js" => FileType::JavaScript,
-        "typescript" | "ts" => FileType::TypeScript,
-        "rust" => FileType::Rust,
-        "go" => FileType::Go,
-        "java" => FileType::Java,
-        "ruby" => FileType::Ruby,
-        "shell" | "bash" => FileType::Shell,
-        "php" => FileType::Php,
-        "csharp" | "c#" => FileType::CSharp,
-        "lua" => FileType::Lua,
-        "perl" => FileType::Perl,
-        "powershell" | "ps1" => FileType::PowerShell,
-        "swift" => FileType::Swift,
-        "objc" | "objective-c" => FileType::ObjectiveC,
-        "groovy" => FileType::Groovy,
-        "scala" => FileType::Scala,
-        "kotlin" => FileType::Kotlin,
-        "zig" => FileType::Zig,
-        "elixir" => FileType::Elixir,
-        "clojure" | "clj" | "cljs" | "cljc" => FileType::Clojure,
-        "makefile" | "make" => FileType::Makefile,
-        "batch" => FileType::Batch,
-        _ => return None,
-    })
+    let label = SOURCE_LANGUAGE_ALIASES
+        .iter()
+        .find_map(|&(alias, label)| (alias == name).then_some(label))
+        .unwrap_or(name);
+    formats::source::file_type_for_language(label)
 }
 
 #[cfg(test)]
@@ -1542,7 +1756,10 @@ mod tests {
         let mut source = b"<cfset a = ".to_vec();
         source.extend(std::iter::repeat_n(0xFF, 100));
         source.extend_from_slice(b".foo()>");
-        let parsed = open_as(Path::new("x.cfm"), &source, FileType::Cfml).unwrap();
+        let parsed = OpenOptions::new()
+            .path(Path::new("x.cfm"))
+            .file_type(FileType::Cfml)
+            .open(&source);
         let _ = parsed.flow();
         let _ = parsed.symbols();
     }
@@ -1564,7 +1781,7 @@ mod tests {
     fn non_utf8_basename_is_kept_lossily() {
         use std::os::unix::ffi::OsStrExt;
         let path = Path::new(std::ffi::OsStr::from_bytes(b"dropper-\xff.sh"));
-        let parsed = open_with_path(path, b"#!/bin/sh\necho hi\n").unwrap();
+        let parsed = OpenOptions::new().path(path).open(b"#!/bin/sh\necho hi\n");
         assert_eq!(
             parsed
                 .values()
@@ -1610,6 +1827,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn validate_source_query_accepts_aliases() {
+        for (alias, label) in SOURCE_LANGUAGE_ALIASES {
+            assert_eq!(
+                file_type_for_language(alias),
+                file_type_for_language(label),
+                "{alias}"
+            );
+            validate_source_query(alias, "(_) @node").unwrap_or_else(|e| panic!("{alias}: {e}"));
+        }
+    }
+
+    #[test]
+    fn validate_source_query_reports_unsupported_language() {
+        let err = validate_source_query("cobol", "(_) @node").unwrap_err();
+        assert!(matches!(&err, Error::UnsupportedLanguage(name) if name == "cobol"));
+        assert_eq!(err.to_string(), "unsupported language for ast query: cobol");
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn validate_source_query_reports_invalid_query_with_its_cause() {
+        let err = validate_source_query("python", "(no_such_node) @n").unwrap_err();
+        let Error::InvalidQuery { language, source } = &err else {
+            panic!("expected InvalidQuery, got {err:?}");
+        };
+        assert_eq!(language, "python");
+        assert_eq!(source.kind, tree_sitter::QueryErrorKind::NodeType);
+        assert_eq!(
+            err.to_string(),
+            format!("invalid tree-sitter query for python: {source}")
+        );
+        let cause = std::error::Error::source(&err).expect("source");
+        assert!(cause.downcast_ref::<tree_sitter::QueryError>().is_some());
+    }
+
     /// The content/extension transition is path-derived but is written into
     /// the extraction output, so it has to be part of the disk-cache key.
     /// Identical bytes named `x.woff2` and `x.wav` detect as the same type,
@@ -1619,11 +1872,27 @@ mod tests {
     /// directory order.
     #[test]
     fn cache_variant_separates_extension_transitions() {
-        let as_font =
-            extraction_cache_variant(FileType::Shell, true, Some(("script", "font")), None);
-        let as_unknown =
-            extraction_cache_variant(FileType::Shell, true, Some(("script", "unknown")), None);
-        let consistent = extraction_cache_variant(FileType::Shell, false, None, None);
+        let as_font = extraction_cache_variant(
+            &rizin::Settings::default(),
+            FileType::Shell,
+            true,
+            Some(("script", "font")),
+            None,
+        );
+        let as_unknown = extraction_cache_variant(
+            &rizin::Settings::default(),
+            FileType::Shell,
+            true,
+            Some(("script", "unknown")),
+            None,
+        );
+        let consistent = extraction_cache_variant(
+            &rizin::Settings::default(),
+            FileType::Shell,
+            false,
+            None,
+            None,
+        );
         assert_ne!(as_font, as_unknown);
         assert_ne!(as_font, consistent);
         assert_ne!(as_unknown, consistent);
@@ -1631,7 +1900,13 @@ mod tests {
         // a tree full of `.woff2` files does not lose cache sharing.
         assert_eq!(
             as_font,
-            extraction_cache_variant(FileType::Shell, true, Some(("script", "font")), None)
+            extraction_cache_variant(
+                &rizin::Settings::default(),
+                FileType::Shell,
+                true,
+                Some(("script", "font")),
+                None
+            )
         );
     }
 
@@ -1640,8 +1915,20 @@ mod tests {
     #[test]
     fn cache_variant_separates_unnamed_mismatch() {
         assert_ne!(
-            extraction_cache_variant(FileType::Shell, true, None, None),
-            extraction_cache_variant(FileType::Shell, false, None, None)
+            extraction_cache_variant(
+                &rizin::Settings::default(),
+                FileType::Shell,
+                true,
+                None,
+                None
+            ),
+            extraction_cache_variant(
+                &rizin::Settings::default(),
+                FileType::Shell,
+                false,
+                None,
+                None
+            )
         );
     }
 
@@ -1650,7 +1937,15 @@ mod tests {
         // Identical Rust bytes can be a build hook or an ordinary module.
         // Archive extraction and standalone scans must not inherit whichever
         // basename happened to populate the content cache first.
-        let key = |name| extraction_cache_variant(FileType::Rust, false, None, name);
+        let key = |name| {
+            extraction_cache_variant(
+                &rizin::Settings::default(),
+                FileType::Rust,
+                false,
+                None,
+                name,
+            )
+        };
         assert_ne!(key(Some("build.rs")), key(Some("lib.rs")));
         assert_ne!(key(Some("build.rs")), key(None));
         assert_ne!(key(Some("")), key(None));
@@ -1697,14 +1992,14 @@ mod tests {
     #[test]
     fn open_classifies_text() {
         let bytes = b"hello world\n";
-        let parsed = open(bytes).unwrap();
+        let parsed = open(bytes);
         assert_eq!(parsed.bytes(), bytes);
     }
 
     #[test]
     fn parse_count_is_one_after_any_view_access() {
         let bytes = b"{\"name\":\"test\"}";
-        let parsed = open(bytes).unwrap();
+        let parsed = open(bytes);
         assert_eq!(parsed.parse_count(), 0);
         let _ = parsed.values();
         assert_eq!(parsed.parse_count(), 1);
@@ -1717,7 +2012,7 @@ mod tests {
     #[test]
     fn chm_overlay_uses_archive_data_and_directory_extents() {
         let overlay = include_bytes!("../testdata/chm/overlay-persistence-sample.chm");
-        let parsed = open(overlay).unwrap();
+        let parsed = open(overlay);
         let metrics = parsed.metrics();
         assert_eq!(metrics.get("binary.has_overlay"), Some(1.0));
         assert_eq!(metrics.get("binary.overlay_size"), Some(1546.0));
@@ -1727,19 +2022,37 @@ mod tests {
         // Its full physical length is archive content, despite looking like
         // a suffix when only section-0 entries are considered.
         let directory_at_end = include_bytes!("../testdata/chm/directory-at-end.chm");
-        let parsed = open(directory_at_end).unwrap();
+        let parsed = open(directory_at_end);
         assert_eq!(parsed.metrics().get("binary.has_overlay"), None);
     }
 
     #[test]
     fn extraction_cache_separates_path_dependent_file_types() {
         assert_ne!(
-            extraction_cache_variant(FileType::Gz, false, None, None),
-            extraction_cache_variant(FileType::Npm, false, None, None),
+            extraction_cache_variant(&rizin::Settings::default(), FileType::Gz, false, None, None),
+            extraction_cache_variant(
+                &rizin::Settings::default(),
+                FileType::Npm,
+                false,
+                None,
+                None
+            ),
         );
         assert_eq!(
-            extraction_cache_variant(FileType::Npm, false, None, None),
-            extraction_cache_variant(FileType::Npm, false, None, None),
+            extraction_cache_variant(
+                &rizin::Settings::default(),
+                FileType::Npm,
+                false,
+                None,
+                None
+            ),
+            extraction_cache_variant(
+                &rizin::Settings::default(),
+                FileType::Npm,
+                false,
+                None,
+                None
+            ),
         );
     }
 
@@ -1753,7 +2066,7 @@ mod tests {
         // freshly computed snapshot to round-trip.
         let bytes =
             std::fs::read("tests/fixtures/test.exe").expect("test.exe fixture should exist");
-        let parsed = open(&bytes).unwrap();
+        let parsed = open(&bytes);
         let original = parsed.extracted();
         let json = serde_json::to_vec(original).expect("serialize Extracted");
         let restored: Extracted = serde_json::from_slice(&json).expect("deserialize Extracted");
@@ -1774,9 +2087,8 @@ mod tests {
     fn pe_instruction_xor_strings_keep_provenance_across_snapshot() {
         // Synthetic PE containing only a decoder and inert API-name strings.
         // Names recovered from content must not be promoted into PE imports.
-        let _rizin = crate::rizin::scoped_disable_current_thread();
         let bytes = include_bytes!("../tests/fixtures/pe-xor-decoder.exe");
-        let extracted = open(bytes).unwrap().run_pipeline();
+        let extracted = OpenOptions::new().rizin(false).open(bytes).run_pipeline();
         let check = |e: &Extracted| {
             let network = e
                 .strings
@@ -1818,7 +2130,7 @@ mod tests {
         let bytes =
             format!("{{\\rtf1\\ansi{{\\object\\objemb{{\\*\\objdata {hex}}}}}}}").into_bytes();
 
-        let extracted = open(&bytes).unwrap().run_pipeline();
+        let extracted = open(&bytes).run_pipeline();
         let has_command =
             |e: &Extracted| e.strings.text.iter().any(|s| s.value.contains("certutil"));
         assert!(has_command(&extracted), "decoded command should be present");
@@ -1840,7 +2152,7 @@ mod tests {
         // order) a fresh one does.
         let bytes =
             std::fs::read("tests/fixtures/test.exe").expect("test.exe fixture should exist");
-        let extracted = open(&bytes).unwrap().run_pipeline();
+        let extracted = open(&bytes).run_pipeline();
         let want: Vec<stng::ExtractedString> = extracted.strings.text.rows().to_vec();
         assert!(!want.is_empty(), "fixture should yield byte-scan strings");
 
@@ -1858,7 +2170,7 @@ mod tests {
     #[test]
     fn metrics_always_include_size_and_entropy() {
         let bytes = b"x".repeat(256);
-        let parsed = open(&bytes).unwrap();
+        let parsed = open(&bytes);
         let m = parsed.metrics();
         assert_eq!(m.get("file.size"), Some(256.0));
         assert!(m.get("file.entropy").unwrap() < 0.01);
@@ -1871,7 +2183,7 @@ mod tests {
     fn symbol_iter_walks_all_three_collections() {
         let bytes =
             std::fs::read("tests/fixtures/test.exe").expect("test.exe fixture should exist");
-        let parsed = open(&bytes).unwrap();
+        let parsed = open(&bytes);
         // Realize the views before iterating — the lazy parse runs
         // on first `.values()` access.
         let _ = parsed.values();
@@ -1895,7 +2207,7 @@ mod tests {
     fn healthy_pe_emits_no_parse_errors() {
         let bytes =
             std::fs::read("tests/fixtures/test.exe").expect("test.exe fixture should exist");
-        let parsed = open(&bytes).unwrap();
+        let parsed = open(&bytes);
         // Realize.
         let _ = parsed.values();
         assert!(parsed.errors().is_empty());
@@ -1913,7 +2225,7 @@ mod tests {
         // ELF by fileid, not enough for goblin to parse.
         let mut bytes = Vec::from(b"\x7fELF" as &[u8]);
         bytes.extend_from_slice(&[2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        let parsed = open(&bytes).unwrap();
+        let parsed = open(&bytes);
         let _ = parsed.values();
 
         // Byte-level metrics survive even though the format parse
@@ -1941,7 +2253,7 @@ mod tests {
         let full = include_bytes!("../tests/fixtures/test.elf");
         let shoff =
             usize::try_from(u64::from_le_bytes(full[0x28..0x30].try_into().unwrap())).unwrap();
-        let parsed = open(&full[..shoff + 64]).unwrap();
+        let parsed = open(&full[..shoff + 64]);
         let _ = parsed.values();
         assert!(parsed.metrics().get("elf.parse_failed").is_none());
         assert!(
@@ -1966,7 +2278,9 @@ mod tests {
         }
         source.push_str(&" ".repeat(600));
         source.push_str("pass\n");
-        let parsed = open_with_path(std::path::Path::new("deep.py"), source.as_bytes()).unwrap();
+        let parsed = OpenOptions::new()
+            .path(std::path::Path::new("deep.py"))
+            .open(source.as_bytes());
         let metrics = parsed.metrics();
 
         assert_eq!(parsed.fileid().file_type(), FileType::Python);
@@ -1985,6 +2299,133 @@ mod tests {
         assert_eq!(entry.stage, Stage::SourceParse);
         assert!(entry.message.contains("tree-sitter parse skipped"));
         assert_eq!(metrics.get("parse.error_count"), Some(1.0));
+    }
+
+    /// Bytes no other test (or earlier run) has cached.
+    fn unique_script(tag: &str) -> Vec<u8> {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        format!("#!/bin/sh\necho {tag} {} {ns}\n", std::process::id()).into_bytes()
+    }
+
+    /// Each `ParsedFile` reads and writes the disk cache only as its own
+    /// options say, whatever another file opened alongside asked for. (Unit
+    /// tests get a private cache root; see `cache::root_location`.)
+    #[test]
+    fn cache_setting_belongs_to_each_parsed_file() {
+        let bytes = unique_script("cache-setting");
+        let cached = OpenOptions::new().cache(true).rizin(false);
+
+        let first = cached.open(&bytes);
+        let _ = first.metrics();
+        assert_eq!(first.parse_count(), 1, "nothing cached yet");
+
+        let uncached = OpenOptions::new().cache(false).rizin(false).open(&bytes);
+        let _ = uncached.metrics();
+        assert_eq!(uncached.parse_count(), 1, "cache off: must not read it");
+
+        let second = cached.open(&bytes);
+        let _ = second.metrics();
+        assert_eq!(second.parse_count(), 0, "cache on: served the entry");
+        assert_eq!(
+            serde_json::to_value(second.values()).unwrap(),
+            serde_json::to_value(first.values()).unwrap()
+        );
+
+        // Rizin settings are part of the key: with rizin installed, a
+        // rizin-on open must not be served the rizin-off entry. Without it
+        // the two extractions are identical and rightly share one.
+        let rizin_on = OpenOptions::new().cache(true).open(&bytes);
+        let _ = rizin_on.metrics();
+        assert_eq!(rizin_on.parse_count(), u32::from(rizin::available()));
+    }
+
+    /// The cache key changes with every option that changes a persisted
+    /// extraction — rizin on/off, native-arch slicing, the size cap — and
+    /// not with the timeout, which only ever yields an unpersisted result.
+    #[test]
+    fn cache_key_tracks_every_output_affecting_option() {
+        let variant = |options: &OpenOptions<'_>| {
+            extraction_cache_variant(&options.rizin, FileType::Elf, false, None, None)
+        };
+        let base = OpenOptions::new();
+        let slower = base.clone().rizin_timeout(Duration::from_secs(5));
+        assert_eq!(variant(&base), variant(&slower));
+        assert!(variant(&base).starts_with(&base.rizin_fingerprint()));
+
+        let distinct: std::collections::HashSet<String> = [
+            base.clone(),
+            base.clone().rizin(false),
+            base.clone().rizin_native_arch_only(true),
+            base.clone().rizin_max_bytes(1 << 20),
+        ]
+        .iter()
+        .map(variant)
+        .collect();
+        // Without rizin installed none of these changes the output, and
+        // all four share the `rizin=none` key.
+        let expected = if rizin::available() { 4 } else { 1 };
+        assert_eq!(distinct.len(), expected, "{distinct:?}");
+    }
+
+    /// A raised cancellation flag abandons the source parse of the file it
+    /// was given to, leaving the other views intact; an unraised one, or
+    /// none, changes nothing.
+    #[test]
+    fn cancellation_flag_reaches_the_source_parse() {
+        let source = "def f():\n    return 1\n".repeat(20_000);
+        let path = Path::new("cancel.py");
+
+        let raised = AtomicBool::new(true);
+        let cancelled = OpenOptions::new()
+            .path(path)
+            .cancellation(&raised)
+            .open(source.as_bytes());
+        assert!(cancelled.source_ast().is_none());
+        let metrics = cancelled.metrics();
+        assert_eq!(
+            metrics.get("source.ast_unavailable.parse_cancelled"),
+            Some(1.0)
+        );
+        assert_eq!(metrics.get("file.size"), Some(source.len() as f64));
+
+        let lowered = AtomicBool::new(false);
+        let options = OpenOptions::new().path(path).cancellation(&lowered);
+        assert!(options.open(source.as_bytes()).source_ast().is_some());
+        // The flag belongs to the options that carried it, not the process.
+        let plain = OpenOptions::new().path(path).open(source.as_bytes());
+        assert!(plain.source_ast().is_some());
+    }
+
+    #[test]
+    fn open_options_identify_by_path_forced_type_or_precomputed_fileid() {
+        let bytes = b"{\"name\":\"x\",\"version\":\"1.0.0\"}";
+        let path = Path::new("package.json");
+        let by_path = OpenOptions::new().path(path).open(bytes);
+        assert_eq!(by_path.fileid().file_type(), FileType::PackageJson);
+        assert_ne!(open(bytes).fileid().file_type(), FileType::PackageJson);
+
+        // A forced type still takes the path's basename.
+        let forced = OpenOptions::new()
+            .path(path)
+            .file_type(FileType::Text)
+            .open(bytes);
+        assert_eq!(forced.fileid().file_type(), FileType::Text);
+        assert_eq!(
+            forced
+                .values()
+                .get("file.basename")
+                .and_then(|v| v.as_str()),
+            Some("package.json")
+        );
+
+        let fileid = FileId::from_path_and_bytes(path, bytes);
+        let precomputed = OpenOptions::new()
+            .file_type(FileType::Text)
+            .fileid(fileid)
+            .open(bytes);
+        assert_eq!(precomputed.fileid().file_type(), FileType::PackageJson);
     }
 }
 

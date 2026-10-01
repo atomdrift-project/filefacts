@@ -46,6 +46,7 @@ use crate::error::Error;
 use crate::formats::common::{XorScan, extract_binary_strings};
 use crate::metric;
 use crate::output::{ExtractedString, Metrics, Strings, Values};
+use crate::value_key;
 
 const MAGIC: &[u8] = b"NIBArchive";
 /// Magic, two format constants, then four (count, offset) pairs.
@@ -115,15 +116,15 @@ pub(super) fn extract(
     let literal_count_before = strings.literals.len();
     let format = if bytes.starts_with(MAGIC) {
         let archive = Archive::parse(bytes)?;
-        values.insert(
-            "nib.format_version",
+        values.insert_key(
+            value_key!("nib.format_version"),
             JsonValue::Number(archive.format_version.into()),
         );
         archive.collect(bytes, &mut facts, strings);
         "nibarchive"
     } else if bytes.starts_with(b"bplist") {
         let archiver = collect_keyed(bytes, &mut facts, strings)?;
-        values.insert("nib.archiver", JsonValue::String(archiver));
+        values.insert_key(value_key!("nib.archiver"), JsonValue::String(archiver));
         "keyed_archive"
     } else {
         return Err(Error::malformed(
@@ -154,18 +155,18 @@ pub(super) fn extract(
         "nib extracted"
     );
 
-    values.insert("nib.format", JsonValue::String(format.into()));
-    for (path, set) in [
-        ("nib.classes", facts.classes),
-        ("nib.class_names", facts.class_names),
-        ("nib.modules", facts.modules),
-        ("nib.outlets", facts.outlets),
-        ("nib.actions", facts.actions),
-        ("nib.bindings", facts.bindings),
-        ("nib.resources", facts.resources),
+    values.insert_key(value_key!("nib.format"), JsonValue::String(format.into()));
+    for (key, set) in [
+        (value_key!("nib.classes"), facts.classes),
+        (value_key!("nib.class_names"), facts.class_names),
+        (value_key!("nib.modules"), facts.modules),
+        (value_key!("nib.outlets"), facts.outlets),
+        (value_key!("nib.actions"), facts.actions),
+        (value_key!("nib.bindings"), facts.bindings),
+        (value_key!("nib.resources"), facts.resources),
     ] {
         let list = set.into_iter().map(JsonValue::String).collect();
-        values.insert(path, JsonValue::Array(list));
+        values.insert_key(key, JsonValue::Array(list));
     }
     Ok(())
 }
@@ -418,7 +419,7 @@ fn collect_keyed(bytes: &[u8], facts: &mut Facts, strings: &mut Strings) -> Resu
     use plist::Value as P;
 
     let root = plist::Value::from_reader(std::io::Cursor::new(bytes))
-        .map_err(|e| Error::malformed("nib", e.to_string()))?;
+        .map_err(|e| Error::malformed_with_source("nib", e.to_string(), e))?;
     let P::Dictionary(root) = root else {
         return Err(Error::malformed(
             "nib",

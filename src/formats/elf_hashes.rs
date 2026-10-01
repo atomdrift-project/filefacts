@@ -25,19 +25,20 @@ use md5::{Digest, Md5};
 
 use crate::formats::common::{hex_encode, put_str};
 use crate::output::{Symbol, SymbolKind, Symbols, Values};
+use crate::value_key;
 
 pub(super) fn emit(elf: &Elf<'_>, values: &mut Values, symbols: &Symbols) {
     if let Some(h) = imphash(symbols) {
-        put_str(values, "elf.hashes.imphash", h);
+        put_str(values, value_key!("elf.hashes.imphash"), h);
     }
     if let Some(h) = export_hash(symbols) {
-        put_str(values, "elf.hashes.export_hash", h);
+        put_str(values, value_key!("elf.hashes.export_hash"), h);
     }
     if let Some(h) = dyn_hash(elf) {
-        put_str(values, "elf.hashes.dyn_hash", h);
+        put_str(values, value_key!("elf.hashes.dyn_hash"), h);
     }
     if let Some(h) = symhash(elf) {
-        put_str(values, "elf.hashes.symhash", h);
+        put_str(values, value_key!("elf.hashes.symhash"), h);
     }
 }
 

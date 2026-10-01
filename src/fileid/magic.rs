@@ -364,7 +364,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
                 .is_some_and(|rest| utf16le_starts_with(rest, REGISTRY_EDITOR_HEADER))
             {
                 // What regedit exports: UTF-16LE behind a byte-order mark.
-                Some((FileType::Registry, DetectionSource::Magic))
+                Some((FileType::Reg, DetectionSource::Magic))
             } else {
                 None
             }
@@ -448,15 +448,15 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             if data.starts_with(b"Rar!") {
                 Some((FileType::Rar, DetectionSource::Magic))
             } else if data.starts_with(b"REGEDIT4") {
-                // A .reg file's first line names the format. `FileType::Registry`
-                // was reachable only from a `.reg` extension, so a registry
+                // A .reg file's first line names the format. `FileType::Reg`
+                // was once reachable only from a `.reg` extension, so a registry
                 // script under any other name -- vxheaven's
                 // `Trojan.WinREG.AntiFireWall.a`, where the `.a` is a variant
                 // letter -- was typed by whatever the trailing component
                 // happened to mean. Nothing but a registry script opens with
                 // this line. REGEDIT4 is the Windows 9x/NT4 spelling; the
                 // Windows 2000+ one is handled in the `W` arm below.
-                Some((FileType::Registry, DetectionSource::Magic))
+                Some((FileType::Reg, DetectionSource::Magic))
             } else if (data.starts_with(b"RIFF") || data.starts_with(b"RIFX")) && data.len() >= 12 {
                 // RIFF container: `RIFF` + u32 length + form type. WAVE, WEBP
                 // and AVI share the wrapper, so the form type at offset 8
@@ -709,7 +709,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             match data.strip_prefix(UTF8_BOM) {
                 Some(rest) if rest.starts_with(b"#!") => detect_shebang(rest),
                 Some(rest) if rest.starts_with(REGISTRY_EDITOR_HEADER) => {
-                    Some((FileType::Registry, DetectionSource::Magic))
+                    Some((FileType::Reg, DetectionSource::Magic))
                 }
                 _ => None,
             }
@@ -740,7 +740,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // UTF-8 BOM spellings are claimed in the 0xFF and 0xEF arms. Same
             // reasoning as the `REGEDIT4` arm above.
             if data.starts_with(REGISTRY_EDITOR_HEADER) {
-                Some((FileType::Registry, DetectionSource::Magic))
+                Some((FileType::Reg, DetectionSource::Magic))
             } else {
                 None
             }
@@ -975,7 +975,7 @@ fn has_text_header(ft: FileType) -> bool {
             | FileType::Xml
             | FileType::Plist
             | FileType::Svg
-            | FileType::Registry
+            | FileType::Reg
             | FileType::Pbxproj
             | FileType::PgpSignature
             | FileType::Pdf
@@ -3177,7 +3177,7 @@ mod tests {
         );
         assert_eq!(
             content_type("x", b"REGEDIT4\r\n[HKEY_CURRENT_USER]\r\n"),
-            Some(FileType::Registry)
+            Some(FileType::Reg)
         );
         let deb = b"!<arch>\ndebian-binary   1342177295  0     0     100644  4         `\n2.0\n";
         assert_eq!(content_type("x", deb), Some(FileType::Deb));
@@ -3539,7 +3539,7 @@ mod registry_script_magic_tests {
         let data = b"REGEDIT4\r\n\r\n[HKEY_LOCAL_MACHINE\\Software\\Foo]\r\n\"Bar\"=\"baz\"\r\n";
         assert_eq!(
             detect_from_content(Path::new("Trojan.WinREG.AntiFireWall.a"), data).map(|(ft, _)| ft),
-            Some(FileType::Registry)
+            Some(FileType::Reg)
         );
     }
 
@@ -3549,7 +3549,7 @@ mod registry_script_magic_tests {
         let data = b"Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\X]\r\n";
         assert_eq!(
             detect_from_content(Path::new("x"), data).map(|(ft, _)| ft),
-            Some(FileType::Registry)
+            Some(FileType::Reg)
         );
     }
 
@@ -3559,7 +3559,7 @@ mod registry_script_magic_tests {
         let data = b"Windows compatibility notes\n\nThis document describes...\n";
         assert_ne!(
             detect_from_content(Path::new("notes.txt"), data).map(|(ft, _)| ft),
-            Some(FileType::Registry)
+            Some(FileType::Reg)
         );
         let mut utf16 = vec![0xFF, 0xFE];
         utf16.extend(
@@ -3569,7 +3569,7 @@ mod registry_script_magic_tests {
         );
         assert_ne!(
             detect_from_content(Path::new("notes.txt"), &utf16).map(|(ft, _)| ft),
-            Some(FileType::Registry)
+            Some(FileType::Reg)
         );
     }
 
@@ -3585,13 +3585,64 @@ mod registry_script_magic_tests {
         for data in [utf16, utf8] {
             assert_eq!(
                 detect_from_content(Path::new("export.reg"), &data),
-                Some((FileType::Registry, DetectionSource::Magic))
+                Some((FileType::Reg, DetectionSource::Magic))
             );
             assert_eq!(
                 super::super::detect(Path::new("export.reg"), &data).map(|d| d.file_type),
-                Some(FileType::Registry)
+                Some(FileType::Reg)
             );
         }
+    }
+
+    /// Every header spelling under its own `.reg` name is consistent with
+    /// the extension. Before `.reg` was in the extension table, each one
+    /// reported a mismatch against an unknown extension.
+    #[test]
+    fn reg_extension_agrees_with_every_header_spelling() {
+        let body = "\r\n\r\n[HKEY_CURRENT_USER\\X]\r\n\"A\"=dword:00000001\r\n";
+        let modern = format!("Windows Registry Editor Version 5.00{body}");
+        let mut utf16 = vec![0xFF, 0xFE];
+        utf16.extend(modern.encode_utf16().flat_map(u16::to_le_bytes));
+        let mut utf8_bom = UTF8_BOM.to_vec();
+        utf8_bom.extend_from_slice(modern.as_bytes());
+        let regedit4 = format!("REGEDIT4{body}").into_bytes();
+        for data in [utf16, utf8_bom, modern.into_bytes(), regedit4] {
+            let det = super::super::detect(Path::new("Export.REG"), &data).unwrap();
+            assert_eq!(det.file_type, FileType::Reg);
+            assert_eq!(det.source, DetectionSource::Magic);
+            assert!(!det.extension_mismatch());
+            let id = crate::FileId::from_path_and_bytes(Path::new("export.reg"), &data);
+            assert_eq!(id.file_type().label(), "reg");
+            assert!(!id.extension_mismatch());
+        }
+    }
+
+    /// The header defines the format, so a `.reg` name on anything else is
+    /// a mismatch, and the body is typed by its content.
+    #[test]
+    fn reg_extension_without_a_header_is_a_mismatch() {
+        let prose = b"These notes describe how the settings were changed last week.\n";
+        let det = super::super::detect(Path::new("notes.reg"), prose).unwrap();
+        assert_eq!(det.file_type, FileType::Text);
+        assert!(det.extension_mismatch());
+        assert_eq!(det.extension_type(), Some(FileType::Reg));
+        // An empty file has nothing to contradict its name.
+        let empty = super::super::detect(Path::new("empty.reg"), b"").unwrap();
+        assert_eq!(empty.file_type, FileType::Reg);
+        assert!(!empty.extension_mismatch());
+    }
+
+    /// Package-registry metadata keeps `registry`; it shares nothing with a
+    /// registry export but the word.
+    #[test]
+    fn package_registry_metadata_is_not_a_registry_export() {
+        let doc = br#"{"ecosystem":"npm","name":"left-pad","version":"1.3.0"}"#;
+        let det = super::super::detect(Path::new("left-pad@1.3.0.registry.json"), doc).unwrap();
+        assert_eq!(det.file_type, FileType::Registry);
+        assert_eq!(det.file_type.label(), "registry");
+        assert_eq!(FileType::from_label("reg"), Some(FileType::Reg));
+        assert!(FileType::Registry.is_structured_data());
+        assert!(!FileType::Reg.is_structured_data());
     }
 }
 

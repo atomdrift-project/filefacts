@@ -58,8 +58,8 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         return Ok(());
     }
     if buf.len() as u64 > MAX_MANIFEST {
-        values.insert(
-            "vsix.limits",
+        values.insert_key(
+            value_key!("vsix.limits"),
             serde_json::json!([{
                 "stage": "manifest",
                 "reason": format!("{NAME} over the {MAX_MANIFEST}-byte cap; not parsed"),
@@ -114,7 +114,7 @@ pub(super) fn extract(
             }
         }
         if let Some(v) = node.attribute("TargetPlatform") {
-            put_str(values, "vsix.target_platform", v.to_string());
+            put_str(values, value_key!("vsix.target_platform"), v.to_string());
         }
         if !identity.is_empty() {
             values.insert_key(value_key!("vsix.identity"), JsonValue::Object(identity));
@@ -137,7 +137,10 @@ pub(super) fn extract(
     }
 
     // <Tags>foo,bar,baz</Tags>, <Categories>One,Two</Categories>
-    for (tag, key) in [("Tags", "vsix.tags"), ("Categories", "vsix.categories")] {
+    for (tag, key) in [
+        ("Tags", value_key!("vsix.tags")),
+        ("Categories", value_key!("vsix.categories")),
+    ] {
         if let Some(node) = doc.descendants().find(|n| n.has_tag_name(tag)) {
             if let Some(text) = node.text() {
                 let items: Vec<JsonValue> = text
@@ -147,7 +150,7 @@ pub(super) fn extract(
                     .map(|s| JsonValue::String(s.to_string()))
                     .collect();
                 if !items.is_empty() {
-                    values.insert(key, JsonValue::Array(items));
+                    values.insert_key(key, JsonValue::Array(items));
                 }
             }
         }
@@ -168,7 +171,7 @@ pub(super) fn extract(
         property_count += 1;
     }
     if !properties.is_empty() {
-        values.insert("vsix.properties", JsonValue::Object(properties));
+        values.insert_key(value_key!("vsix.properties"), JsonValue::Object(properties));
     }
     metrics.insert(metric!("vsix.property_count"), f64::from(property_count));
 
@@ -216,7 +219,7 @@ pub(super) fn extract(
         .collect();
     if !assets.is_empty() {
         metrics.insert(metric!("vsix.asset_count"), assets.len() as f64);
-        values.insert("vsix.assets", JsonValue::Array(assets));
+        values.insert_key(value_key!("vsix.assets"), JsonValue::Array(assets));
     }
 
     Ok(())

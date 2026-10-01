@@ -34,19 +34,19 @@ use crate::value_key;
 /// filled in).
 pub(super) fn emit(macho: &MachO<'_>, values: &mut Values, symbols: &Symbols) {
     if let Some(h) = imphash(symbols) {
-        put_str(values, "macho.hashes.imphash", h);
+        put_str(values, value_key!("macho.hashes.imphash"), h);
     }
     if let Some(h) = dylib_hash(macho) {
-        put_str(values, "macho.hashes.dylib_hash", h);
+        put_str(values, value_key!("macho.hashes.dylib_hash"), h);
     }
     if let Some(h) = export_hash(symbols) {
-        put_str(values, "macho.hashes.export_hash", h);
+        put_str(values, value_key!("macho.hashes.export_hash"), h);
     }
     if let Some(h) = symhash(macho) {
-        put_str(values, "macho.hashes.symhash", h);
+        put_str(values, value_key!("macho.hashes.symhash"), h);
     }
     if let Some(h) = entitlement_hash(values) {
-        put_str(values, "macho.hashes.entitlement_hash", h);
+        put_str(values, value_key!("macho.hashes.entitlement_hash"), h);
     }
 }
 

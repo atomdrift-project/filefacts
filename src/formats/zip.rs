@@ -13,6 +13,7 @@
 #![allow(clippy::case_sensitive_file_extension_comparisons)]
 
 use crate::metric;
+use crate::value_key;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
 
@@ -68,7 +69,8 @@ const AGGS: &[Agg] = &[
 ];
 
 pub(super) fn open_archive(bytes: &[u8]) -> Result<ZipArchive<Cursor<&[u8]>>, Error> {
-    ZipArchive::new(Cursor::new(bytes)).map_err(|e| Error::malformed("zip", e.to_string()))
+    ZipArchive::new(Cursor::new(bytes))
+        .map_err(|e| Error::malformed_with_source("zip", e.to_string(), e))
 }
 
 pub(super) fn extract(
@@ -108,13 +110,19 @@ fn walk_archive<R: Read + Seek>(
     archive_members: &mut Vec<ArchiveMember>,
     max_members: usize,
 ) -> Result<(), Error> {
-    values.insert("archive.format.kind", JsonValue::String("zip".into()));
+    values.insert_key(
+        value_key!("archive.format.kind"),
+        JsonValue::String("zip".into()),
+    );
 
     let comment = archive.comment();
     let has_comment = !comment.is_empty();
     if has_comment {
         let comment_str = String::from_utf8_lossy(comment).into_owned();
-        values.insert("archive.comment", JsonValue::String(comment_str));
+        values.insert_key(
+            value_key!("archive.comment"),
+            JsonValue::String(comment_str),
+        );
         metrics.insert(metric!("archive.comment_size"), comment.len() as f64);
     }
 
@@ -123,8 +131,8 @@ fn walk_archive<R: Read + Seek>(
     // still reports the full parsed count.
     let walked = archive.len().min(max_members);
     if walked < archive.len() {
-        values.insert(
-            "zip.limits",
+        values.insert_key(
+            value_key!("zip.limits"),
             serde_json::json!([{
                 "stage": "member-cap",
                 "reason": format!("walked {walked} of {} members", archive.len()),
@@ -143,7 +151,7 @@ fn walk_archive<R: Read + Seek>(
     for i in 0..walked {
         let entry = archive
             .by_index_raw(i)
-            .map_err(|e| Error::malformed("zip", format!("entry {i}: {e}")))?;
+            .map_err(|e| Error::malformed_with_source("zip", format!("entry {i}: {e}"), e))?;
 
         let mode = entry.unix_mode();
         let is_symlink = |m: u32| m & 0o170_000 == 0o120_000;
@@ -222,7 +230,7 @@ fn walk_archive<R: Read + Seek>(
         archive_members.push(member);
     }
 
-    values.insert("archive.members", JsonValue::Array(members));
+    values.insert_key(value_key!("archive.members"), JsonValue::Array(members));
     stats.emit(values, metrics);
     metrics.insert(metric!("archive.member_count"), archive.len() as f64);
     metrics.insert(metric!("archive.extra_field_size"), extra_field_size as f64);
@@ -231,7 +239,10 @@ fn walk_archive<R: Read + Seek>(
             .iter()
             .map(|t| JsonValue::from(*t))
             .collect();
-        values.insert("archive.extra_field_tags", JsonValue::Array(tags));
+        values.insert_key(
+            value_key!("archive.extra_field_tags"),
+            JsonValue::Array(tags),
+        );
     }
     if uses_zip64 {
         metrics.insert(metric!("archive.uses_zip64"), 1.0);
@@ -281,8 +292,8 @@ fn walk_archive<R: Read + Seek>(
         duplicate_member_count as f64,
     );
     if !duplicate_names.is_empty() {
-        values.insert(
-            "archive.duplicate_member_names",
+        values.insert_key(
+            value_key!("archive.duplicate_member_names"),
             JsonValue::Array(duplicate_names),
         );
     }
@@ -315,8 +326,8 @@ fn walk_archive<R: Read + Seek>(
     let signed_marker = members_includes(archive, "META-INF/cose.manifest")
         && members_includes(archive, "META-INF/cose.sig");
     if signed_marker {
-        values.insert(
-            "archive.signing.mozilla_extension_shape",
+        values.insert_key(
+            value_key!("archive.signing.mozilla_extension_shape"),
             JsonValue::Bool(true),
         );
     }
@@ -328,7 +339,10 @@ fn walk_archive<R: Read + Seek>(
         && archive_names(archive)
             .any(|n| n.starts_with("META-INF/") && (n.ends_with(".RSA") || n.ends_with(".DSA")));
     if jar_signed_shape {
-        values.insert("archive.signing.jar_signed_shape", JsonValue::Bool(true));
+        values.insert_key(
+            value_key!("archive.signing.jar_signed_shape"),
+            JsonValue::Bool(true),
+        );
     }
 
     // Chrome Web Store signed-extension shape. The `_metadata/verified_contents.json`
@@ -336,8 +350,8 @@ fn walk_archive<R: Read + Seek>(
     // signing pipeline and lets a CRX-renamed-to-.zip be told apart from
     // a generic ZIP without inspecting the CRX header.
     if members_includes(archive, "_metadata/verified_contents.json") {
-        values.insert(
-            "archive.signing.chrome_webstore_shape",
+        values.insert_key(
+            value_key!("archive.signing.chrome_webstore_shape"),
             JsonValue::Bool(true),
         );
     }
@@ -347,7 +361,7 @@ fn walk_archive<R: Read + Seek>(
     // and trailing bytes after the EOCD record (appended payloads).
     let prefix = scan_prefix_bytes(bytes);
     if prefix > 0 {
-        metrics.insert(metric!("archive.prefix_bytes"), prefix as f64);
+        metrics.insert(metric!("archive.leading_bytes"), prefix as f64);
     }
     let trailing = scan_trailing_bytes(bytes);
     if trailing > 0 {
@@ -964,7 +978,7 @@ mod tests {
         let mut polyglot = b"\x00".repeat(16);
         polyglot.extend_from_slice(&z);
         let (_, m) = run(&polyglot);
-        assert_eq!(m.get("archive.prefix_bytes"), Some(16.0));
+        assert_eq!(m.get("archive.leading_bytes"), Some(16.0));
     }
 
     #[test]
@@ -980,7 +994,7 @@ mod tests {
     fn no_prefix_or_trailing_for_clean_archive() {
         let z = build_zip(&[("a", b"x", CompressionMethod::Stored)]);
         let (_, m) = run(&z);
-        assert!(m.get("archive.prefix_bytes").is_none());
+        assert!(m.get("archive.leading_bytes").is_none());
         assert!(m.get("archive.trailing_bytes").is_none());
     }
 
@@ -1229,7 +1243,7 @@ mod tests {
         }
         let (v, m) = run(&buf.into_inner());
         // Three of four entries share the sentinel bucket → fraction = 0.75.
-        let fraction = m.get("archive.timing.mtime_dominant_fraction").unwrap();
+        let fraction = m.get("archive.timing.mtime_dominant_ratio").unwrap();
         assert!(
             (fraction - 0.75).abs() < 1e-9,
             "expected ~0.75, got {fraction}"
@@ -1260,7 +1274,7 @@ mod tests {
         }
         let (v, m) = run(&buf.into_inner());
         // Dominant fraction is 0.5, not strictly greater → no outliers.
-        assert_eq!(m.get("archive.timing.mtime_dominant_fraction"), Some(0.5));
+        assert_eq!(m.get("archive.timing.mtime_dominant_ratio"), Some(0.5));
         assert!(m.get("archive.timing.mtime_outlier_count").is_none());
         assert!(v.get("archive.timing.mtime_outlier_members").is_none());
     }
@@ -1350,5 +1364,19 @@ mod tests {
                 assert!(item.as_u64().is_some());
             }
         }
+    }
+
+    #[test]
+    fn unreadable_archive_keeps_its_text_and_exposes_the_zip_error() {
+        use std::error::Error as _;
+        let Err(err) = open_archive(b"PK\x03\x04garbage-not-a-zip-at-all") else {
+            panic!("garbage opened as a zip");
+        };
+        assert_eq!(
+            err.to_string(),
+            "malformed zip: invalid Zip archive: Could not find EOCD"
+        );
+        let source = err.source().expect("zip source");
+        assert!(source.downcast_ref::<zip::result::ZipError>().is_some());
     }
 }

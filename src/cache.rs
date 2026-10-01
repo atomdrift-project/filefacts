@@ -39,8 +39,10 @@
 //!   time. Any change to the extraction logic changes the hash and so
 //!   retires every prior entry without a manual bump, however the
 //!   consuming binary was built, copied or packaged.
-//! * **variant** — the caller's [`crate::rizin::cache_fingerprint`]
-//!   (rizin presence / version / native-arch slicing).
+//! * **variant** — what else the extraction depends on: for a
+//!   [`crate::ParsedFile`], the detected type, the basename and
+//!   [`crate::OpenOptions::rizin_fingerprint`] (whether rizin runs, its
+//!   version, native-arch slicing, the size cap).
 //!
 //! [`CACHE_SCHEMA_VERSION`] is the manual lever on top, reserved for
 //! deliberate format breaks; [`prune_old_versions`] removes superseded
@@ -65,67 +67,33 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicI8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
-/// Tri-state override for whether [`crate::ParsedFile`] self-caches:
-/// `0` = default, `1` = forced on, `-1` = forced off. A counter-free
-/// switch a host sets once; see [`set_caching_enabled`].
-static CACHING_OVERRIDE: AtomicI8 = AtomicI8::new(0);
-
-/// Whether caching is on when neither [`set_caching_enabled`] nor
-/// `FILEFACTS_CACHE` says otherwise. Off: a library getter should not write to
-/// the user's cache directory unless its host asked for that.
-static DEFAULT_ENABLED: AtomicBool = AtomicBool::new(false);
-
-/// Force the [`crate::open`]-time disk cache on or off for the rest of the
-/// process, ahead of `FILEFACTS_CACHE` and [`enable_by_default`]. A consumer
-/// that needs hermetic extraction (its own test suite, a reproducibility
-/// check) disables it here.
-pub fn set_caching_enabled(enabled: bool) {
-    CACHING_OVERRIDE.store(if enabled { 1 } else { -1 }, Ordering::Relaxed);
-}
-
-/// Turn the disk cache on for this process unless `FILEFACTS_CACHE` turns
-/// it off. For hosts that rescan the same files (the `filefacts` CLI, a
-/// corpus scanner); unlike [`set_caching_enabled`], it leaves the operator's
-/// environment in charge.
-pub fn enable_by_default() {
-    DEFAULT_ENABLED.store(true, Ordering::Relaxed);
-}
-
-/// Whether `open`-time self-caching is active.
+/// The `FILEFACTS_CACHE` environment setting: `Some(false)` for `0` or
+/// `false` (any case), `Some(true)` for any other value, `None` when unset.
 ///
-/// Resolution order:
-/// 1. a programmatic override from [`set_caching_enabled`];
-/// 2. the `FILEFACTS_CACHE` env var (`0` / `false` disables, anything
-///    else enables) — an ops/test escape hatch needing no recompile;
-/// 3. default: off, unless the host called [`enable_by_default`].
+/// The one place filefacts reads its environment for configuration. It feeds
+/// [`crate::OpenOptions::new`]'s cache default, so an operator can turn the
+/// cache on or off for a library host without a recompile; an explicit
+/// [`crate::OpenOptions::cache`] outranks it. A host that wants the cache on
+/// unless the operator says otherwise — the `filefacts` CLI — passes
+/// `env_override().unwrap_or(true)`. Read once per process: the environment
+/// is fixed at start, and this runs once per opened file.
 #[must_use]
-pub fn caching_enabled() -> bool {
-    // Cache the env lookup: this runs once per file on the scan hot path,
-    // and the environment is fixed at process start.
+pub fn env_override() -> Option<bool> {
     static ENV: OnceLock<Option<bool>> = OnceLock::new();
-    let env = *ENV.get_or_init(|| {
+    *ENV.get_or_init(|| {
         std::env::var("FILEFACTS_CACHE")
             .ok()
-            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-    });
-    resolve_caching(
-        CACHING_OVERRIDE.load(Ordering::Relaxed),
-        env,
-        DEFAULT_ENABLED.load(Ordering::Relaxed),
-    )
+            .map(|v| parse_env_setting(&v))
+    })
 }
 
-fn resolve_caching(override_state: i8, env: Option<bool>, default: bool) -> bool {
-    match override_state {
-        1 => true,
-        -1 => false,
-        _ => env.unwrap_or(default),
-    }
+fn parse_env_setting(value: &str) -> bool {
+    !(value == "0" || value.eq_ignore_ascii_case("false"))
 }
 
 /// On-disk cache schema version. Bump only on a deliberate, breaking
@@ -173,9 +141,10 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 ///   between builds, so a stale entry from an older filefacts must not be
 ///   reused;
 /// * the caller's `variant` — the detected file type plus
-///   [`crate::rizin::cache_fingerprint`] (rizin presence / version /
-///   native-arch slicing), since the *same* bytes yield different extraction
-///   under different path-assisted types or rizin configurations.
+///   [`crate::OpenOptions::rizin_fingerprint`] (whether rizin runs, its
+///   version, native-arch slicing, the size cap), since the *same* bytes
+///   yield different extraction under different path-assisted types or
+///   rizin configurations.
 ///
 /// `variant` may be empty for a computation that never involves rizin;
 /// the build fingerprint is always mixed in regardless.
@@ -196,8 +165,18 @@ pub fn cache_key(bytes: &[u8], variant: &str) -> String {
 /// computation: nothing is created or probed.
 fn root_location() -> Option<&'static Path> {
     static ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
-    ROOT.get_or_init(|| Some(dirs::cache_dir()?.join("atomdrift").join("filefacts")))
-        .as_deref()
+    ROOT.get_or_init(|| {
+        // filefacts' own unit tests that open with `cache(true)` must not
+        // read or write the developer's real cache: give each test process
+        // a private root, removed by nothing but the OS's temp cleanup.
+        if cfg!(test) {
+            return Some(
+                std::env::temp_dir().join(format!("filefacts-unit-cache-{}", std::process::id())),
+            );
+        }
+        Some(dirs::cache_dir()?.join("atomdrift").join("filefacts"))
+    })
+    .as_deref()
 }
 
 /// Root cache directory for filefacts. Returns the writable OS/user cache dir,
@@ -610,11 +589,11 @@ fn enforce_limits_in(version_dir: &Path, max_items: usize, max_bytes: u64) {
 ///
 /// Content addressing is only sound when the computation is reproducible
 /// from the key. Most degradation in optional disassembly is *stable*
-/// for a given environment (rizin absent, a specific version, native-arch
-/// slicing) and is handled by the [`cache_key`] `variant`. What remains
-/// are *transient* conditions — rizin timed out, was killed on the output
-/// cap, was muted by a latency-sensitive caller, or skipped by the size
-/// gate. A payload produced under one of those is still usable for the
+/// for a given environment and settings (rizin absent or turned off, a
+/// specific version, native-arch slicing, the size cap) and is handled by
+/// the [`cache_key`] `variant`. What remains are *transient* conditions —
+/// rizin timed out, was killed on the output cap, or turned itself off
+/// after too many abandoned output readers. A payload produced under one of those is still usable for the
 /// current call but must not be written: persisting it would poison the
 /// entry, and every later run — whatever its own rizin setup — would
 /// reuse the degraded result.
@@ -646,10 +625,10 @@ impl<T> Computed<T> {
 /// `compute` itself returns `None`.
 ///
 /// `variant` discriminates inputs whose correct analysis depends on the
-/// environment — pass [`crate::rizin::cache_fingerprint`], or `""` when
+/// environment — pass [`crate::OpenOptions::rizin_fingerprint`], or `""` when
 /// the computation never involves rizin. A [`Computed::Transient`]
 /// result is returned to the caller but never written, so a degraded
-/// rizin run (timeout, output-cap kill, mute, size gate) cannot poison
+/// rizin run (timeout, output-cap kill) cannot poison
 /// the entry for a later healthy run.
 ///
 /// The cache key includes the schema version implicitly (it lives in
@@ -734,16 +713,13 @@ mod tests {
     }
 
     #[test]
-    fn caching_is_opt_in_and_the_environment_outranks_the_default() {
-        // Library default: off.
-        assert!(!resolve_caching(0, None, false));
-        // `enable_by_default` turns it on, but `FILEFACTS_CACHE=0` still wins.
-        assert!(resolve_caching(0, None, true));
-        assert!(!resolve_caching(0, Some(false), true));
-        assert!(resolve_caching(0, Some(true), false));
-        // `set_caching_enabled` outranks both.
-        assert!(!resolve_caching(-1, Some(true), true));
-        assert!(resolve_caching(1, Some(false), false));
+    fn env_setting_disables_only_on_zero_or_false() {
+        assert!(!parse_env_setting("0"));
+        assert!(!parse_env_setting("false"));
+        assert!(!parse_env_setting("FALSE"));
+        assert!(parse_env_setting("1"));
+        assert!(parse_env_setting("yes"));
+        assert!(parse_env_setting(""));
     }
 
     #[test]

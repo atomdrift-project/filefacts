@@ -79,15 +79,18 @@ pub(super) fn extract(
 ) -> Result<(), Error> {
     let koly = Koly::parse(bytes).ok_or_else(|| Error::malformed("dmg", "missing koly trailer"))?;
 
-    values.insert("dmg.format", JsonValue::String("UDIF".into()));
-    values.insert("dmg.udif_version", JsonValue::Number(koly.version.into()));
-    values.insert(
-        "dmg.image_variant",
+    values.insert_key(value_key!("dmg.format"), JsonValue::String("UDIF".into()));
+    values.insert_key(
+        value_key!("dmg.udif_version"),
+        JsonValue::Number(koly.version.into()),
+    );
+    values.insert_key(
+        value_key!("dmg.image_variant"),
         JsonValue::Number(koly.image_variant.into()),
     );
     metrics.insert(metric!("dmg.sector_count"), koly.sector_count as f64);
     let uncompressed = koly.sector_count.saturating_mul(SECTOR);
-    metrics.insert(metric!("dmg.total_uncompressed_bytes"), uncompressed as f64);
+    metrics.insert(metric!("dmg.uncompressed_size"), uncompressed as f64);
     metrics.insert(metric!("dmg.data_fork_bytes"), koly.data_fork_length as f64);
     if koly.data_fork_length > 0 {
         // >1 means the image expands on mount; the small hash-named samples in
@@ -104,7 +107,7 @@ pub(super) fn extract(
     // (`disk image (Apple_HFS : 4)`) — no decompression required, so it
     // works for every codec including LZFSE.
     if let Some(fs) = partitions.iter().find_map(|p| fs_from_name(&p.name)) {
-        values.insert("dmg.filesystem", JsonValue::String(fs.into()));
+        values.insert_key(value_key!("dmg.filesystem"), JsonValue::String(fs.into()));
     }
 
     emit_partitions(&partitions, values, metrics, archive_members);
@@ -316,15 +319,21 @@ fn emit_partitions(
         archive_members.push(member);
     }
 
-    values.insert("dmg.partitions", JsonValue::Array(members));
-    values.insert("archive.members", JsonValue::Array(archive_values));
+    values.insert_key(value_key!("dmg.partitions"), JsonValue::Array(members));
+    values.insert_key(
+        value_key!("archive.members"),
+        JsonValue::Array(archive_values),
+    );
     stats.emit(values, metrics);
 
     let codecs: Vec<JsonValue> = codec_counts
         .keys()
         .map(|k| JsonValue::String((*k).into()))
         .collect();
-    values.insert("dmg.compression.codecs", JsonValue::Array(codecs));
+    values.insert_key(
+        value_key!("dmg.compression.codecs"),
+        JsonValue::Array(codecs),
+    );
     for (codec, count) in &codec_counts {
         metrics.insert(crate::dmg_codec_count(codec), *count as f64);
     }
@@ -339,7 +348,10 @@ fn emit_partitions(
         ["adc"] => "UDCO",
         _ => "mixed",
     };
-    values.insert("dmg.udif_format", JsonValue::String(format.into()));
+    values.insert_key(
+        value_key!("dmg.udif_format"),
+        JsonValue::String(format.into()),
+    );
 }
 
 /// Read the filesystem partition's volume superblock. Best-effort: only
@@ -429,7 +441,10 @@ fn hfs_volume_facts(prefix: &[u8], values: &mut Values, metrics: &mut Metrics) -
         b"HX" => "HFSX",
         _ => return None,
     };
-    values.insert("dmg.volume.filesystem", JsonValue::String(fs.into()));
+    values.insert_key(
+        value_key!("dmg.volume.filesystem"),
+        JsonValue::String(fs.into()),
+    );
 
     // `lastMountedVersion` (e.g. `10.0`, `HFSJ`, `fsck`) fingerprints the
     // last writer — a coarse creating-tool signal.
@@ -439,7 +454,10 @@ fn hfs_volume_facts(prefix: &[u8], values: &mut Values, metrics: &mut Metrics) -
         .map(|&b| b as char)
         .collect();
     if !lmv.is_empty() {
-        values.insert("dmg.volume.last_mounted_version", JsonValue::String(lmv));
+        values.insert_key(
+            value_key!("dmg.volume.last_mounted_version"),
+            JsonValue::String(lmv),
+        );
     }
 
     // Dates are seconds since 1904. Per the HFS+ spec `createDate` is local
@@ -448,10 +466,16 @@ fn hfs_volume_facts(prefix: &[u8], values: &mut Values, metrics: &mut Metrics) -
     let create = u32_be(vh, 16)?;
     let modify = u32_be(vh, 20)?;
     if let Some(t) = hfs_to_unix(create) {
-        values.insert("dmg.volume.created_unix", JsonValue::Number(t.into()));
+        values.insert_key(
+            value_key!("dmg.volume.created_unix"),
+            JsonValue::Number(t.into()),
+        );
     }
     if let Some(t) = hfs_to_unix(modify) {
-        values.insert("dmg.volume.modified_unix", JsonValue::Number(t.into()));
+        values.insert_key(
+            value_key!("dmg.volume.modified_unix"),
+            JsonValue::Number(t.into()),
+        );
     }
     if let (Some(c), Some(m)) = (hfs_to_unix(create), hfs_to_unix(modify)) {
         metrics.insert(metric!("dmg.volume.timezone_skew_seconds"), (c - m) as f64);
@@ -474,7 +498,10 @@ fn apfs_volume_facts(prefix: &[u8], values: &mut Values, metrics: &mut Metrics) 
     let block = magic.checked_sub(32)?;
     let sb = prefix.get(block..block.checked_add(704 + 256)?)?;
 
-    values.insert("dmg.volume.filesystem", JsonValue::String("APFS".into()));
+    values.insert_key(
+        value_key!("dmg.volume.filesystem"),
+        JsonValue::String("APFS".into()),
+    );
 
     // The fs-object counters live in the volume's b-tree; sealed
     // distribution volumes leave the superblock copies zeroed. Emit only
@@ -491,7 +518,10 @@ fn apfs_volume_facts(prefix: &[u8], values: &mut Values, metrics: &mut Metrics) 
     }
 
     if let Some(t) = apfs_ns_to_unix(u64_le(sb, 256)?) {
-        values.insert("dmg.volume.modified_unix", JsonValue::Number(t.into()));
+        values.insert_key(
+            value_key!("dmg.volume.modified_unix"),
+            JsonValue::Number(t.into()),
+        );
     }
     // `apfs_formatted_by`: a 32-byte id (`newfs_apfs (NNNN.NN.N)`) and the
     // nanosecond timestamp it was laid down — a precise build-environment
@@ -500,7 +530,10 @@ fn apfs_volume_facts(prefix: &[u8], values: &mut Values, metrics: &mut Metrics) 
         values.insert_key(value_key!("dmg.volume.formatted_by"), JsonValue::String(id));
     }
     if let Some(t) = apfs_ns_to_unix(u64_le(sb, 304)?) {
-        values.insert("dmg.volume.created_unix", JsonValue::Number(t.into()));
+        values.insert_key(
+            value_key!("dmg.volume.created_unix"),
+            JsonValue::Number(t.into()),
+        );
     }
     if let Some(name) = c_string(sb, 704, 256) {
         values.insert_key(value_key!("dmg.volume.name"), JsonValue::String(name));

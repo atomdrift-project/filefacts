@@ -62,8 +62,8 @@ pub(super) fn extract(
     // whole `office.*` view, and a malformed compound file is itself an
     // evasion shape, so the failure is reported rather than passed as an
     // empty document.
-    let mut comp =
-        cfb::CompoundFile::open(cursor).map_err(|e| Error::malformed("ole2", e.to_string()))?;
+    let mut comp = cfb::CompoundFile::open(cursor)
+        .map_err(|e| Error::malformed_with_source("ole2", e.to_string(), e))?;
 
     let mut streams: Vec<String> = Vec::new();
     let mut macro_count: u64 = 0;
@@ -136,11 +136,11 @@ pub(super) fn extract(
     }
 
     let kind = detect_kind(&streams);
-    put_str(values, "office.kind", kind);
+    put_str(values, value_key!("office.kind"), kind);
 
     metrics.insert(metric!("office.stream_count"), streams.len() as f64);
-    values.insert(
-        "office.streams",
+    values.insert_key(
+        value_key!("office.streams"),
         JsonValue::Array(streams.iter().cloned().map(JsonValue::String).collect()),
     );
 
@@ -151,7 +151,10 @@ pub(super) fn extract(
             attachments.len() as f64,
         );
         if !attachments.is_empty() {
-            values.insert("office.msg.attachments", JsonValue::Array(attachments));
+            values.insert_key(
+                value_key!("office.msg.attachments"),
+                JsonValue::Array(attachments),
+            );
         }
     }
 
@@ -193,8 +196,8 @@ pub(super) fn extract(
         metrics.insert(metric!("office.name_count"), names.len() as f64);
         // XLM payloads live in defined names -- each one labels a cell the
         // macro sheet calls -- so the names themselves are worth reading.
-        values.insert(
-            "office.names",
+        values.insert_key(
+            value_key!("office.names"),
             JsonValue::Array(
                 names
                     .iter()
@@ -209,8 +212,8 @@ pub(super) fn extract(
         let xlm = sheets.iter().filter(|s| s.kind == SHEET_XLM).count();
         let hidden = sheets.iter().filter(|s| s.visibility != 0).count();
         metrics.insert(metric!("office.sheet_count"), sheets.len() as f64);
-        values.insert(
-            "office.sheet_names",
+        values.insert_key(
+            value_key!("office.sheet_names"),
             JsonValue::Array(
                 sheets
                     .iter()
@@ -250,15 +253,15 @@ pub(super) fn extract(
     if !dangerous_clsids.is_empty() {
         features.push("dangerous_clsid");
         let count = dangerous_clsids.len() as f64;
-        values.insert(
-            "office.dangerous_clsids",
+        values.insert_key(
+            value_key!("office.dangerous_clsids"),
             JsonValue::Array(dangerous_clsids),
         );
         metrics.insert(metric!("office.dangerous_clsid_count"), count);
     }
     if !features.is_empty() {
-        values.insert(
-            "office.features",
+        values.insert_key(
+            value_key!("office.features"),
             JsonValue::Array(
                 features
                     .into_iter()
@@ -317,7 +320,7 @@ pub(super) fn extract(
             obj.insert("app_version".into(), JsonValue::String(co.prog_id));
         }
         if !obj.is_empty() {
-            values.insert("office.compobj", JsonValue::Object(obj));
+            values.insert_key(value_key!("office.compobj"), JsonValue::Object(obj));
         }
     }
 
@@ -1147,7 +1150,9 @@ mod tests {
         let result = extract(&bytes, &mut Values::new(), &mut Metrics::new(), &mut errors);
         assert!(result.is_err(), "malformed compound file must not pass");
 
-        let parsed = crate::open_with_path(std::path::Path::new("x.doc"), &bytes).unwrap();
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new("x.doc"))
+            .open(&bytes);
         assert!(
             parsed
                 .errors()

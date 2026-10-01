@@ -1,6 +1,6 @@
 //! Policy-free relationships for the supported CFML tag subset.
 use super::{Tag, attributes, scan};
-use crate::{Arg, ArgShape, Flow, FlowValue, Symbol, Symbols};
+use crate::{Arg, ArgShape, Flow, FlowKind, FlowValue, Symbol, Symbols};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
@@ -124,7 +124,7 @@ impl Builder<'_> {
                 .unwrap_or(0);
         let left_value = self.expr(left_range, 0);
         let right_value = self.expr(right_range, 0);
-        let operator = self.add("literal", operator_offset, Vec::new());
+        let operator = self.add(FlowKind::Literal, operator_offset, Vec::new());
         if operator == 0 {
             return;
         }
@@ -134,7 +134,7 @@ impl Builder<'_> {
             });
         }
         let call = self.add(
-            "call",
+            FlowKind::Call,
             tag.span.start,
             vec![left_value, operator, right_value],
         );
@@ -279,7 +279,7 @@ impl Builder<'_> {
         if let Some(id) = self.bindings.get(&path) {
             return *id;
         }
-        let id = self.add("member", r.start, Vec::new());
+        let id = self.add(FlowKind::Member, r.start, Vec::new());
         if id != 0
             && let Some(value) = self.result.flow.values.get_mut(id)
         {
@@ -335,14 +335,14 @@ impl Builder<'_> {
         }
     }
 
-    fn add(&mut self, kind: &str, offset: usize, inputs: Vec<usize>) -> usize {
+    fn add(&mut self, kind: FlowKind, offset: usize, inputs: Vec<usize>) -> usize {
         if self.result.flow.values.len() >= MAX_VALUES {
             self.result.flow.limitations.insert("node-budget".into());
             return 0;
         }
         let id = self.result.flow.values.len();
         self.result.flow.values.push(FlowValue {
-            kind: kind.into(),
+            kind,
             offset,
             inputs,
             literal: None,
@@ -385,7 +385,7 @@ impl Builder<'_> {
                 _ => None,
             }
         });
-        let id = self.add("concat", offset, inputs);
+        let id = self.add(FlowKind::Concat, offset, inputs);
         if id == 0 {
             return 0;
         }
@@ -415,7 +415,7 @@ impl Builder<'_> {
         id
     }
     fn string_literal(&mut self, r: Range<usize>, quote: Option<u8>) -> usize {
-        let id = self.add("literal", r.start, Vec::new());
+        let id = self.add(FlowKind::Literal, r.start, Vec::new());
         if id != 0
             && let Some(entry) = self.result.flow.values.get_mut(id)
         {
@@ -596,7 +596,7 @@ impl Builder<'_> {
                         start = end + 1;
                     }
                 }
-                let id = self.add("call", r.start, inputs);
+                let id = self.add(FlowKind::Call, r.start, inputs);
                 if id != 0 {
                     let mut truncated = false;
                     let values = &self.result.flow.values;
@@ -615,7 +615,7 @@ impl Builder<'_> {
                                 self.symbol_literal_bytes += text.len();
                             }
                             value.literal.clone().unwrap_or_else(|| {
-                                if value.kind == "call" {
+                                if value.kind == FlowKind::Call {
                                     Arg::Call
                                 } else {
                                     Arg::Expression
@@ -669,7 +669,7 @@ impl Builder<'_> {
             return 0;
         }
         if name.contains('.') {
-            let id = self.add("member", r.start, Vec::new());
+            let id = self.add(FlowKind::Member, r.start, Vec::new());
             if id != 0
                 && let Some(value) = self.result.flow.values.get_mut(id)
             {
@@ -692,7 +692,7 @@ impl Builder<'_> {
                     if let Some(id) = self.bindings.get(&path) {
                         return *id;
                     }
-                    let id = self.add("member", r.start, Vec::new());
+                    let id = self.add(FlowKind::Member, r.start, Vec::new());
                     if id != 0
                         && let Some(value) = self.result.flow.values.get_mut(id)
                     {
@@ -849,7 +849,7 @@ impl Builder<'_> {
             .flow
             .values
             .get(value)
-            .is_some_and(|v| v.kind == "call" && v.offset == rhs.start)
+            .is_some_and(|v| v.kind == FlowKind::Call && v.offset == rhs.start)
         {
             shape = ArgShape::Call;
         }
@@ -944,7 +944,7 @@ impl Builder<'_> {
         let Some(offset) = self.result.flow.values.get(call).map(|v| v.offset) else {
             return;
         };
-        let result = self.add("call", offset, vec![object]);
+        let result = self.add(FlowKind::Call, offset, vec![object]);
         if result == 0 {
             self.bindings.remove(&name);
             return;
@@ -967,7 +967,7 @@ impl Builder<'_> {
         let offset = range.start;
         let value = self.expr(range, 0);
         let value = if known_scope { value } else { 0 };
-        let call = self.add("call", offset, vec![value]);
+        let call = self.add(FlowKind::Call, offset, vec![value]);
         if call == 0 {
             return;
         }
@@ -1011,7 +1011,7 @@ impl Builder<'_> {
                 None
             };
             let mut value = if html && !interpolate {
-                let id = self.add("literal", attr.value.start, Vec::new());
+                let id = self.add(FlowKind::Literal, attr.value.start, Vec::new());
                 if id != 0
                     && let Some(entry) = self.result.flow.values.get_mut(id)
                 {
@@ -1043,7 +1043,7 @@ impl Builder<'_> {
                         match super::markup::decode_references(text) {
                             Ok(Some(decoded)) => {
                                 self.folded_bytes += decoded.len();
-                                let id = self.add("concat", attr.value.start, vec![value]);
+                                let id = self.add(FlowKind::Concat, attr.value.start, vec![value]);
                                 if id != 0
                                     && let Some(entry) = self.result.flow.values.get_mut(id)
                                 {
@@ -1062,14 +1062,14 @@ impl Builder<'_> {
             }
             fields.insert(key, value);
         }
-        let object = self.add("keyword", tag.span.start, Vec::new());
+        let object = self.add(FlowKind::Keyword, tag.span.start, Vec::new());
         if object == 0 {
             return;
         }
         if let Some(value) = self.result.flow.values.get_mut(object) {
             value.fields = fields;
         }
-        let call = self.add("call", tag.span.start, vec![object]);
+        let call = self.add(FlowKind::Call, tag.span.start, vec![object]);
         if call == 0 {
             return;
         }
@@ -1114,7 +1114,7 @@ impl Builder<'_> {
             let id = if ids.len() == 1 {
                 *ids.first().unwrap()
             } else {
-                self.add("alternative", offset, ids.into_iter().collect())
+                self.add(FlowKind::Alternative, offset, ids.into_iter().collect())
             };
             self.bindings.insert(key, id);
         }
@@ -1146,7 +1146,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
             },
         },
     };
-    b.add("unknown", 0, Vec::new());
+    b.add(FlowKind::Unknown, 0, Vec::new());
     b.gap("source-local-may-flow-not-reachability");
     if let Some(limit) = syntax.limitation {
         b.gap(&format!("syntax-{limit:?}"));
@@ -1768,7 +1768,7 @@ mod tests {
         ] {
             let p = parse(format!("<cfset x=Decrypt({expr},'key')>").as_bytes());
             assert!(
-                !p.flow.values.iter().any(|v| v.kind == "member"
+                !p.flow.values.iter().any(|v| v.kind == FlowKind::Member
                     && v.target
                         .as_deref()
                         .is_some_and(|s| s.ends_with(".password"))),
@@ -1888,14 +1888,14 @@ mod tests {
             .flow
             .values
             .iter()
-            .position(|v| v.kind == "alternative")
+            .position(|v| v.kind == FlowKind::Alternative)
             .unwrap();
         assert!(p.flow.complete_values(id, None, 0).incomplete);
         assert!(p.flow.complete_values(usize::MAX, None, 10).incomplete);
-        p.flow.values[id].kind = "merge".into();
+        p.flow.values[id].kind = FlowKind::Merge;
         let result = p.flow.complete_values(id, None, 100);
         assert!(result.values.is_empty() && result.incomplete);
-        p.flow.values[id].kind = "alternative".into();
+        p.flow.values[id].kind = FlowKind::Alternative;
         p.flow.values[id].inputs = vec![id];
         assert!(p.flow.complete_values(id, None, 100).values.is_empty());
         let literal = p
@@ -1931,7 +1931,7 @@ mod tests {
             .flow
             .values
             .iter()
-            .filter(|v| v.kind == "concat")
+            .filter(|v| v.kind == FlowKind::Concat)
             .filter_map(|v| match &v.literal {
                 Some(Arg::String { value }) => Some(value.len()),
                 _ => None,
@@ -2045,7 +2045,7 @@ mod tests {
             else {
                 panic!()
             };
-            assert!(p.flow.values.iter().any(|v| v.kind == "call"
+            assert!(p.flow.values.iter().any(|v| v.kind == FlowKind::Call
                 && &v.target == target
                 && Some(v.offset as u64) == *offset
                 && v.inputs.len() == args.len()));
@@ -2061,12 +2061,10 @@ mod tests {
     #[test]
     fn retained_devshell_exposes_encrypt_argument_provenance() {
         let bytes = include_bytes!("../../../testdata/cfml/encrypted_shell_decoded.cfm");
-        let parsed = crate::open_as(
-            std::path::Path::new("decoded.cfm"),
-            bytes,
-            crate::FileType::Cfml,
-        )
-        .unwrap();
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new("decoded.cfm"))
+            .file_type(crate::FileType::Cfml)
+            .open(bytes);
         let flow = parsed.flow().unwrap();
         let symbol = parsed.symbols().iter().find(|s| matches!(s, Symbol::Call { target, .. } if target.as_deref() == Some("encrypt"))).unwrap();
         let Symbol::Call { offset, args, .. } = symbol else {
@@ -2102,7 +2100,7 @@ mod tests {
             !plain
                 .values
                 .iter()
-                .any(|v| p.flow.values[v.value].kind == "member")
+                .any(|v| p.flow.values[v.value].kind == FlowKind::Member)
         );
         let models = [crate::FlowTransfer {
             call: "replace".into(),
@@ -2138,7 +2136,7 @@ mod tests {
         assert!(
             call.inputs
                 .iter()
-                .all(|id| p.flow.values[*id].kind == "literal")
+                .all(|id| p.flow.values[*id].kind == FlowKind::Literal)
         );
         assert!(
             !targets(br#"<cfset a='Form.path & getParameter(x)'><cfexecute name='#a#'>"#)
@@ -2275,7 +2273,12 @@ mod tests {
             panic!()
         };
         assert_eq!(*offset, Some(2));
-        let call = p.flow.values.iter().find(|v| v.kind == "call").unwrap();
+        let call = p
+            .flow
+            .values
+            .iter()
+            .find(|v| v.kind == FlowKind::Call)
+            .unwrap();
         assert_eq!(call.offset, 2);
         assert_eq!(&call.target, target);
         assert_eq!(call.inputs.len(), args.len());
@@ -2325,9 +2328,10 @@ mod tests {
             include_bytes!("../../../testdata/cfml/datasource_shell.cfm").as_slice(),
             include_bytes!("../../../testdata/cfml/encrypted_shell_decoded.cfm").as_slice(),
         ] {
-            let parsed =
-                crate::open_as(std::path::Path::new("a.cfm"), bytes, crate::FileType::Cfml)
-                    .unwrap();
+            let parsed = crate::OpenOptions::new()
+                .path(std::path::Path::new("a.cfm"))
+                .file_type(crate::FileType::Cfml)
+                .open(bytes);
             let flow = parsed.flow().unwrap();
             assert_eq!(flow.producer, "cfml-tags");
             assert!(std::ptr::eq(flow, parsed.flow().unwrap()));
@@ -2343,7 +2347,7 @@ mod tests {
                         continue;
                     }
                     count += 1;
-                    assert!(flow.values.iter().any(|v| v.kind == "call"
+                    assert!(flow.values.iter().any(|v| v.kind == FlowKind::Call
                         && Some(v.offset as u64) == *offset
                         && &v.target == target
                         && v.inputs.len() == args.len()));
@@ -2353,7 +2357,7 @@ mod tests {
             let call = flow
                 .values
                 .iter()
-                .find(|v| v.kind == "call" && v.target.as_deref() == Some("cfexecute"))
+                .find(|v| v.kind == FlowKind::Call && v.target.as_deref() == Some("cfexecute"))
                 .unwrap();
             let origins = flow.field_origins(call.inputs[0], "name", &[], 10_000);
             assert!(origins.values.iter().any(|v| matches!(
@@ -2362,12 +2366,10 @@ mod tests {
             )));
             assert!(parsed.parse_count() <= 1);
         }
-        let plain = crate::open_as(
-            std::path::Path::new("a.txt"),
-            b"hello",
-            crate::FileType::Text,
-        )
-        .unwrap();
+        let plain = crate::OpenOptions::new()
+            .path(std::path::Path::new("a.txt"))
+            .file_type(crate::FileType::Text)
+            .open(b"hello");
         assert!(plain.flow().is_none());
     }
 
@@ -2613,7 +2615,7 @@ mod response_tests {
                 .find(|v| v.target.as_deref() == Some(name))
                 .unwrap();
             assert!(source[call.offset..].starts_with(format!("<{name}").as_bytes()));
-            assert_eq!(p.flow.values[call.inputs[0]].kind, "keyword");
+            assert_eq!(p.flow.values[call.inputs[0]].kind, FlowKind::Keyword);
         }
     }
     #[test]

@@ -277,9 +277,9 @@ mod tests {
             .iter()
             .map(|(path, content)| {
                 let member_path = path.rsplit("!!").next().unwrap();
-                let parsed =
-                    crate::open_with_path(std::path::Path::new(member_path), content.as_bytes())
-                        .unwrap();
+                let parsed = crate::OpenOptions::new()
+                    .path(std::path::Path::new(member_path))
+                    .open(content.as_bytes());
                 ((*path).to_string(), parsed.references().to_vec())
             })
             .collect();

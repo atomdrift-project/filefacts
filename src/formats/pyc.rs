@@ -20,6 +20,7 @@
 //!   `co_filename` strings.
 
 use crate::metric;
+use crate::value_key;
 use serde_json::Value as JsonValue;
 
 use crate::error::Error;
@@ -55,31 +56,31 @@ pub(super) fn extract(
 
     put_str(
         values,
-        "pyc.magic",
+        value_key!("pyc.magic"),
         format!(
             "{:08x}",
             u32::from_le_bytes([header[0], header[1], header[2], header[3]])
         ),
     );
     if let Some(ver) = python_version_for_magic(magic_word) {
-        put_str(values, "pyc.python_version", ver);
+        put_str(values, value_key!("pyc.python_version"), ver);
     }
     if is_hash_based {
         // Per the convention, omit the `is_hash_based: true` bool
         // and use a presence-only key instead — `exists:
         // pyc.hash` flags the variant for traits without a bool.
         let hash_hex: String = header[8..16].iter().map(|b| format!("{b:02x}")).collect();
-        put_str(values, "pyc.hash", hash_hex);
+        put_str(values, value_key!("pyc.hash"), hash_hex);
     } else {
         let ts = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
         let sz = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
         if ts != 0 {
             metrics.insert(metric!("pyc.timestamp"), f64::from(ts));
-            put_str(values, "pyc.timestamp", ts.to_string());
+            put_str(values, value_key!("pyc.timestamp"), ts.to_string());
         }
         if sz != 0 {
             metrics.insert(metric!("pyc.source_size"), f64::from(sz));
-            put_str(values, "pyc.source_size", sz.to_string());
+            put_str(values, value_key!("pyc.source_size"), sz.to_string());
         }
     }
 
@@ -87,8 +88,8 @@ pub(super) fn extract(
     let source_files = scan_source_files(body);
     if !source_files.is_empty() {
         metrics.insert(metric!("pyc.source_file_count"), source_files.len() as f64);
-        values.insert(
-            "pyc.source_files",
+        values.insert_key(
+            value_key!("pyc.source_files"),
             JsonValue::Array(source_files.into_iter().map(JsonValue::String).collect()),
         );
     }

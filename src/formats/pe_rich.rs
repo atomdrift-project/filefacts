@@ -110,14 +110,14 @@ fn emit(words: &[u32], key: u32, raw_table: &[u8], values: &mut Values) {
         }));
     }
 
-    put_u64(values, "pe.rich.key", u64::from(key));
+    put_u64(values, value_key!("pe.rich.key"), u64::from(key));
     values.insert_key(value_key!("pe.rich.entries"), JsonValue::Array(entries));
 
     // The "rich hash" is MD5 over the *decrypted* table bytes (DanS
     // through last entry, post-XOR). Distinct from "rich pv hash"
     // which uses the encrypted form. We emit the decrypted version
     // because it's the one VT and YARA conventions converged on.
-    put_str(values, "pe.rich.hash", rich_md5(raw_table, key));
+    put_str(values, value_key!("pe.rich.hash"), rich_md5(raw_table, key));
 }
 
 fn rich_md5(encrypted: &[u8], key: u32) -> String {
