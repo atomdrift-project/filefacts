@@ -20,6 +20,7 @@
 
 use crate::formats::common::{put_str, read_uleb128};
 use crate::output::Values;
+use crate::value_key;
 
 /// Family identifier emitted as `build.toolchain.compiler`. The set
 /// stays explicit so trait authors can match `exact:` cleanly.
@@ -64,7 +65,7 @@ pub(super) fn from_elf(values: &mut Values, sections: &[crate::output::Section],
         return;
     }
     if let Some(entries) = values
-        .get("elf.comment")
+        .get_key(value_key!("elf.comment"))
         .and_then(serde_json::Value::as_array)
         .cloned()
     {
@@ -230,7 +231,7 @@ fn recognize_comment(text: &str) -> Option<(Family, String)> {
 /// inspect `pe.rich.entries[*]` directly.
 pub(super) fn from_pe_rich(values: &mut Values) {
     if values
-        .get("pe.rich.entries")
+        .get_key(value_key!("pe.rich.entries"))
         .and_then(serde_json::Value::as_array)
         .is_some_and(|a| !a.is_empty())
     {
@@ -252,7 +253,7 @@ pub(super) fn from_macho(values: &mut Values, sections: &[crate::output::Section
         put_str(values, "build.toolchain.compiler", Family::Swift.as_str());
         return;
     }
-    let bv = values.get("macho.build_version");
+    let bv = values.get_key(value_key!("macho.build_version"));
     let clang_version = bv
         .and_then(|v| v.get("tools"))
         .and_then(serde_json::Value::as_array)

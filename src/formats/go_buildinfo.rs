@@ -43,7 +43,7 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::formats::common::bytes_at::u32_le;
 use crate::formats::common::read_uleb128;
-use crate::output::Values;
+use crate::output::{ValueKey, Values};
 
 const MAGIC: &[u8] = b"\xff Go buildinf:";
 
@@ -100,10 +100,12 @@ pub(super) fn has_pclntab_magic(data: &[u8]) -> bool {
         .is_some_and(|magic| PCLNTAB_MAGICS.contains(&magic))
 }
 
+/// Emit the build info found in `bytes` as one object at `key` (`pe.go`,
+/// `elf.go` or `macho.go`).
 pub(super) fn detect(
     bytes: &[u8],
     values: &mut Values,
-    key_prefix: &str,
+    key: ValueKey,
     resolve_va: Option<&dyn Fn(u64) -> Option<usize>>,
     sections: &GoSections<'_>,
 ) {
@@ -118,7 +120,6 @@ pub(super) fn detect(
     let flags = header[15];
     let inline = flags & 0x2 != 0;
 
-    let key = format!("{key_prefix}.go");
     let mut obj = Map::new();
     if inline {
         // Payload starts at a 32-byte alignment from the magic.
@@ -158,7 +159,7 @@ pub(super) fn detect(
     if obj.is_empty() {
         return;
     }
-    values.insert(&key, JsonValue::Object(obj));
+    values.insert_key(key, JsonValue::Object(obj));
 }
 
 /// Recover the Go build id. Prefers the ELF `.note.go.buildid` note;
@@ -617,7 +618,7 @@ mod tests {
         detect(
             &blob,
             &mut values,
-            "elf",
+            crate::value_key!("elf.go"),
             Some(&resolve),
             &GoSections::default(),
         );

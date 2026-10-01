@@ -39,6 +39,7 @@ use std::io::{Read, Seek};
 
 use crate::error::Error;
 use crate::output::{Errors, Metrics, Stage, Values};
+use crate::value_key;
 
 /// Cap on a single text entry we'll decompress for parsing
 /// (MANIFEST.MF / pom.properties). 1 MiB is generous; anything
@@ -281,7 +282,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         if boot_class_path_count > 0 {
             obj.insert("boot_class_path_count".into(), json!(boot_class_path_count));
         }
-        values.insert("jar.manifest", JsonValue::Object(obj));
+        values.insert_key(value_key!("jar.manifest"), JsonValue::Object(obj));
     }
     if pom_group.is_some() || pom_artifact.is_some() || pom_version.is_some() {
         let mut pom = serde_json::Map::new();
@@ -294,7 +295,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         if let Some(v) = pom_version {
             pom.insert("version".into(), JsonValue::String(v));
         }
-        values.insert("jar.pom", JsonValue::Object(pom));
+        values.insert_key(value_key!("jar.pom"), JsonValue::Object(pom));
     }
 
     let mut features: Vec<&'static str> = Vec::new();

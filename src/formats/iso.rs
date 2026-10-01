@@ -62,6 +62,7 @@ use crate::error::Error;
 use crate::formats::common::bytes_at::{u16_le, u32_be, u32_le};
 use crate::output::{ArchiveMember, ArchiveOffsets, ArchiveOwnership, Metrics, Values};
 use crate::scan::days_from_civil;
+use crate::value_key;
 
 use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_value};
 use super::udf;
@@ -638,20 +639,23 @@ fn emit_pvd(
     anomalies: &mut Vec<&'static str>,
 ) {
     let idents = [
-        ("iso.system_id", &pvd.system_id),
-        ("iso.volume_id", &pvd.volume_id),
-        ("iso.volume_set_id", &pvd.volume_set_id),
-        ("iso.publisher_id", &pvd.publisher_id),
-        ("iso.preparer_id", &pvd.preparer_id),
-        ("iso.application_id", &pvd.application_id),
-        ("iso.copyright_file", &pvd.copyright_file),
-        ("iso.abstract_file", &pvd.abstract_file),
-        ("iso.bibliographic_file", &pvd.bibliographic_file),
+        (value_key!("iso.system_id"), &pvd.system_id),
+        (value_key!("iso.volume_id"), &pvd.volume_id),
+        (value_key!("iso.volume_set_id"), &pvd.volume_set_id),
+        (value_key!("iso.publisher_id"), &pvd.publisher_id),
+        (value_key!("iso.preparer_id"), &pvd.preparer_id),
+        (value_key!("iso.application_id"), &pvd.application_id),
+        (value_key!("iso.copyright_file"), &pvd.copyright_file),
+        (value_key!("iso.abstract_file"), &pvd.abstract_file),
+        (
+            value_key!("iso.bibliographic_file"),
+            &pvd.bibliographic_file,
+        ),
     ];
     for (key, raw) in idents {
         let text = decode_field(raw, false);
         if !text.is_empty() {
-            values.insert(key, JsonValue::String(text));
+            values.insert_key(key, JsonValue::String(text));
         }
     }
 
@@ -717,7 +721,7 @@ fn emit_pvd(
     // is the normalised name, `iso.builder_source` says which field it
     // came from so a rule can tell a real stamp from an imitation.
     if let Some((tool, source)) = detect_builder(pvd) {
-        values.insert("iso.builder", JsonValue::String(tool.into()));
+        values.insert_key(value_key!("iso.builder"), JsonValue::String(tool.into()));
         values.insert("iso.builder_source", JsonValue::String(source.into()));
     }
     let blank = [

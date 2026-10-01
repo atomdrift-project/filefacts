@@ -28,6 +28,7 @@ use std::io::{Read, Seek};
 
 use crate::error::Error;
 use crate::output::{Errors, Metrics, Stage, Values};
+use crate::value_key;
 
 pub(super) fn extract_from_archive<R: Read + Seek>(
     zip: &mut ::zip::ZipArchive<R>,
@@ -140,11 +141,17 @@ fn read_manifest<R: Read + Seek>(
 fn emit_manifest_identity(manifest: &JsonValue, values: &mut Values) {
     if let Some(author) = manifest.get("author").and_then(JsonValue::as_str) {
         if !author.is_empty() {
-            values.insert("xpi.author", JsonValue::String(author.to_string()));
+            values.insert_key(
+                value_key!("xpi.author"),
+                JsonValue::String(author.to_string()),
+            );
         }
     }
     if let Some(url) = manifest.get("homepage_url").and_then(JsonValue::as_str) {
-        values.insert("xpi.homepage_url", JsonValue::String(url.to_string()));
+        values.insert_key(
+            value_key!("xpi.homepage_url"),
+            JsonValue::String(url.to_string()),
+        );
     }
     // `__MSG_*__` is a localization placeholder, not the extension's words.
     if let Some(description) = manifest
@@ -152,18 +159,21 @@ fn emit_manifest_identity(manifest: &JsonValue, values: &mut Values) {
         .and_then(JsonValue::as_str)
         .filter(|d| !d.is_empty() && !d.starts_with("__MSG_"))
     {
-        values.insert(
-            "xpi.description",
+        values.insert_key(
+            value_key!("xpi.description"),
             JsonValue::String(description.to_string()),
         );
     }
     if let Some(name) = manifest.get("name").and_then(JsonValue::as_str) {
         if !name.is_empty() && !name.starts_with("__MSG_") {
-            values.insert("xpi.name", JsonValue::String(name.to_string()));
+            values.insert_key(value_key!("xpi.name"), JsonValue::String(name.to_string()));
         }
     }
     if let Some(version) = manifest.get("version").and_then(JsonValue::as_str) {
-        values.insert("xpi.version", JsonValue::String(version.to_string()));
+        values.insert_key(
+            value_key!("xpi.version"),
+            JsonValue::String(version.to_string()),
+        );
     }
 }
 

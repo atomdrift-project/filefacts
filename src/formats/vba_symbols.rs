@@ -40,7 +40,7 @@ pub const NON_LITERAL_SENTINEL: &str = "<non-literal>";
 
 /// Aggregate counters from one module's symbol extraction. Folded
 /// into the per-document `office.vba.*_count` metric keys by
-/// [`formats::vba::extract`]. Not exposed publicly — consumers read
+/// [`crate::formats::vba::extract`]. Not exposed publicly — consumers read
 /// the metric map.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct VbaSymbolStats {
@@ -57,7 +57,7 @@ pub(crate) struct VbaSymbolStats {
 /// into `symbols_out` and returns the per-module aggregate counters.
 ///
 /// Crate-internal: VBA symbols flow out through the unified
-/// [`crate::Symbols`] view populated by [`formats::vba::extract`],
+/// [`crate::Symbols`] view populated by [`crate::formats::vba::extract`],
 /// not through a public per-module function.
 pub(crate) fn extract(source: &str, symbols_out: &mut crate::output::Symbols) -> VbaSymbolStats {
     let mut stats = VbaSymbolStats::default();

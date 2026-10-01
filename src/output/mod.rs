@@ -36,6 +36,7 @@ mod sections;
 mod spans;
 mod strings;
 mod symbols;
+mod value_keys;
 mod values;
 
 pub use archive::{ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership};
@@ -57,4 +58,5 @@ pub use strings::{Comments, ExtractedString, Literals, Text};
 // Not part of the public schema.
 pub(crate) use strings::Strings;
 pub use symbols::{Arg, ArgShape, Symbol, SymbolKind, Symbols};
+pub use value_keys::{VALUE_CATALOG, ValueKey, declared_value_key};
 pub use values::Values;

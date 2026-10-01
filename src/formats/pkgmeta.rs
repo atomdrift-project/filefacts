@@ -18,6 +18,7 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::Values;
 use crate::output::{Errors, Stage};
+use crate::value_key;
 
 /// Fields that are conventionally arrays in a PKGBUILD/.SRCINFO, so we always
 /// emit them as arrays (even with a single element) for stable comparison.
@@ -159,7 +160,7 @@ fn finalize(root: Map<String, JsonValue>, values: &mut Values) {
     // Insert each field under `pkg.<field>` so the subtree merges alongside the
     // generic file.* values rather than replacing the whole values object.
     for (key, value) in root {
-        values.insert(&format!("pkg.{key}"), value);
+        values.insert_key_at(value_key!("pkg"), &key, value);
     }
 }
 

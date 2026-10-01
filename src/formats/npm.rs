@@ -27,6 +27,7 @@ use crate::error::Error;
 use crate::fileid::FileType;
 use crate::metric;
 use crate::output::{ArchiveMember, Errors, Metrics, Stage, Values};
+use crate::value_key;
 
 /// Manifests larger than this are almost certainly hostile padding; we
 /// stop reading rather than buffer them.
@@ -106,31 +107,37 @@ pub(super) fn emit(manifest: &JsonValue, values: &mut Values, metrics: &mut Metr
         return;
     };
     if let Some(name) = obj.get("name").and_then(JsonValue::as_str) {
-        values.insert("npm.name", JsonValue::String(name.to_string()));
+        values.insert_key(value_key!("npm.name"), JsonValue::String(name.to_string()));
     }
     if let Some(version) = obj.get("version").and_then(JsonValue::as_str) {
-        values.insert("npm.version", JsonValue::String(version.to_string()));
+        values.insert_key(
+            value_key!("npm.version"),
+            JsonValue::String(version.to_string()),
+        );
     }
     if let Some(description) = obj.get("description").and_then(JsonValue::as_str) {
-        values.insert(
-            "npm.description",
+        values.insert_key(
+            value_key!("npm.description"),
             JsonValue::String(description.to_string()),
         );
     }
     if let Some(homepage) = obj.get("homepage").and_then(JsonValue::as_str) {
-        values.insert("npm.homepage", JsonValue::String(homepage.to_string()));
+        values.insert_key(
+            value_key!("npm.homepage"),
+            JsonValue::String(homepage.to_string()),
+        );
     }
     if let Some(url) = repository_url(obj.get("repository")) {
-        values.insert("npm.repository.url", JsonValue::String(url));
+        values.insert_key(value_key!("npm.repository.url"), JsonValue::String(url));
     }
     if let Some(author) = person(obj.get("author")) {
         for (field, value) in author.named_fields() {
-            values.insert(&format!("npm.author.{field}"), JsonValue::String(value));
+            values.insert_key_at(value_key!("npm.author"), field, JsonValue::String(value));
         }
     }
     let maintainers = people(obj.get("maintainers"));
     if !maintainers.is_empty() {
-        values.insert("npm.maintainers", JsonValue::Array(maintainers));
+        values.insert_key(value_key!("npm.maintainers"), JsonValue::Array(maintainers));
     }
     // Install-time lifecycle hooks: the command string is the reference
     // source — a `postinstall` that fetches a remote stage is the classic

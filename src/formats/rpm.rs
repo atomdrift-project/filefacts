@@ -32,6 +32,7 @@ use crate::error::Error;
 use crate::formats::common::bytes_at::u32_be;
 use crate::formats::common::{XorScan, extract_binary_strings, put_str};
 use crate::output::{Errors, Metrics, Stage, Strings, Values};
+use crate::value_key;
 
 const RPM_LEAD_MAGIC: [u8; 4] = [0xed, 0xab, 0xee, 0xdb];
 const RPM_HEADER_MAGIC: [u8; 3] = [0x8e, 0xad, 0xe8];
@@ -259,7 +260,7 @@ fn extract_scriptlets(
         scripts.insert(name.into(), JsonValue::Object(script));
     }
     if !scripts.is_empty() {
-        values.insert("rpm.scriptlets", JsonValue::Object(scripts));
+        values.insert_key(value_key!("rpm.scriptlets"), JsonValue::Object(scripts));
     }
     // Preserve independently valid scripts and metadata before reporting the
     // partial parse. Bounds also cap copied bodies at nine MiB in aggregate.
@@ -275,19 +276,19 @@ fn extract_scriptlets(
 
 fn apply_main_tag(entry: &IndexEntry, data: &[u8], values: &mut Values, metrics: &mut Metrics) {
     match entry.tag {
-        main_tag::NAME => set_string(values, "rpm.name", entry, data),
-        main_tag::VERSION => set_string(values, "rpm.version", entry, data),
+        main_tag::NAME => set_string(values, value_key!("rpm.name"), entry, data),
+        main_tag::VERSION => set_string(values, value_key!("rpm.version"), entry, data),
         main_tag::RELEASE => set_string(values, "rpm.release", entry, data),
         main_tag::EPOCH => set_u32(values, metrics, metric!("rpm.epoch"), entry, data),
-        main_tag::SUMMARY => set_string(values, "rpm.summary", entry, data),
+        main_tag::SUMMARY => set_string(values, value_key!("rpm.summary"), entry, data),
         main_tag::BUILDTIME => set_u32(values, metrics, metric!("rpm.buildtime"), entry, data),
         main_tag::BUILDHOST => set_string(values, "rpm.buildhost", entry, data),
         main_tag::DISTRIBUTION => set_string(values, "rpm.distribution", entry, data),
-        main_tag::VENDOR => set_string(values, "rpm.vendor", entry, data),
+        main_tag::VENDOR => set_string(values, value_key!("rpm.vendor"), entry, data),
         main_tag::LICENSE => set_string(values, "rpm.license", entry, data),
-        main_tag::PACKAGER => set_string(values, "rpm.packager", entry, data),
+        main_tag::PACKAGER => set_string(values, value_key!("rpm.packager"), entry, data),
         main_tag::GROUP => set_string(values, "rpm.group", entry, data),
-        main_tag::URL => set_string(values, "rpm.url", entry, data),
+        main_tag::URL => set_string(values, value_key!("rpm.url"), entry, data),
         main_tag::OS => set_string(values, "rpm.os", entry, data),
         main_tag::ARCH => set_string(values, "rpm.arch", entry, data),
         main_tag::RPMVERSION => set_string(values, "rpm.rpmversion", entry, data),
@@ -301,7 +302,8 @@ fn apply_main_tag(entry: &IndexEntry, data: &[u8], values: &mut Values, metrics:
     }
 }
 
-fn set_string(values: &mut Values, key: &str, entry: &IndexEntry, data: &[u8]) {
+/// `key` is a plain string or a checked key from `value_key!`.
+fn set_string(values: &mut Values, key: impl AsRef<str>, entry: &IndexEntry, data: &[u8]) {
     if let Some(v) = decode_string(entry, data) {
         put_str(values, key, v);
     }

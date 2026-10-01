@@ -142,7 +142,7 @@ fn rpm_interpreter(script: &Value) -> Option<FileType> {
 
 pub(crate) fn rpm(values: Option<&Values>) -> impl Iterator<Item = EmbeddedSource<'_>> {
     values
-        .and_then(|v| v.as_json().pointer("/rpm/scriptlets"))
+        .and_then(|v| v.get_key(crate::value_key!("rpm.scriptlets")))
         .and_then(Value::as_object)
         .into_iter()
         .flatten()

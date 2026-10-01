@@ -31,6 +31,7 @@ use crate::bytes;
 use crate::error::Error;
 use crate::metric;
 use crate::output::{ArchiveCompression, ArchiveMember, ArchiveOffsets, Metrics, Values};
+use crate::value_key;
 
 /// The shared aggregates a cabinet reports. Every CFFILE is a file (paths
 /// carry their folders inline), and a hidden member is one with the DOS
@@ -324,7 +325,7 @@ pub(super) fn extract(
         && let Some(blob) = tail.get(..der_len.min(tail.len()))
         && let Some(sig) = super::pe_authenticode::parse_cms_blob(blob)
     {
-        values.insert("cab.signatures", JsonValue::Array(vec![sig]));
+        values.insert_key(value_key!("cab.signatures"), JsonValue::Array(vec![sig]));
         metrics.insert(metric!("cab.signature_bytes"), der_len as f64);
         // Whatever sits past the signature is genuinely unaccounted for: the
         // cabinet ended at `cbCabinet` and the signature ended here.

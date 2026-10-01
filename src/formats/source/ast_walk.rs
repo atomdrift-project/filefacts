@@ -533,8 +533,6 @@ struct State {
     /// etc. — so naming-pattern rules (`c2_server`, `BackdoorListener`,
     /// `xmrig`) can fire via `type: name, kind: identifier`.
     identifiers: BTreeMap<String, u64>,
-    /// Every operator occurrence (`^`, `%`, `<<=`, …) with its byte offset,
-    /// in source order. Emitted as [`Symbol::Op`] so density rules can count
     /// Per-operator occurrence counts keyed by canonical name (`xor` → 12,
     /// `mod` → 3, …), tallied during the single existing walk. Emitted as
     /// `ast.op.<name>` metrics so density rules match O(1) via `type: metrics`

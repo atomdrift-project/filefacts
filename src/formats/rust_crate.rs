@@ -16,7 +16,8 @@ use tar::Archive;
 
 use crate::error::Error;
 use crate::fileid::FileType;
-use crate::output::{ArchiveMember, Errors, Metrics, Stage, Values};
+use crate::output::{ArchiveMember, Errors, Metrics, Stage, ValueKey, Values};
+use crate::value_key;
 
 /// Manifests above this are not legitimate — stop rather than buffer them.
 const MAX_MANIFEST: u64 = 1 << 20;
@@ -106,18 +107,18 @@ fn emit(manifest: &toml::Value, values: &mut Values) {
     let Some(pkg) = manifest.get("package") else {
         return;
     };
-    let mut put = |key: &str, field: &str| {
+    let mut put = |key: ValueKey, field: &str| {
         if let Some(v) = pkg.get(field).and_then(toml::Value::as_str) {
             if !v.is_empty() {
-                values.insert(key, JsonValue::String(v.to_string()));
+                values.insert_key(key, JsonValue::String(v.to_string()));
             }
         }
     };
-    put("crate.name", "name");
-    put("crate.version", "version");
-    put("crate.description", "description");
-    put("crate.repository", "repository");
-    put("crate.homepage", "homepage");
+    put(value_key!("crate.name"), "name");
+    put(value_key!("crate.version"), "version");
+    put(value_key!("crate.description"), "description");
+    put(value_key!("crate.repository"), "repository");
+    put(value_key!("crate.homepage"), "homepage");
     if let Some(authors) = pkg.get("authors").and_then(toml::Value::as_array) {
         let list: Vec<JsonValue> = authors
             .iter()
@@ -126,7 +127,7 @@ fn emit(manifest: &toml::Value, values: &mut Values) {
             .map(|s| JsonValue::String(s.to_string()))
             .collect();
         if !list.is_empty() {
-            values.insert("crate.authors", JsonValue::Array(list));
+            values.insert_key(value_key!("crate.authors"), JsonValue::Array(list));
         }
     }
 }

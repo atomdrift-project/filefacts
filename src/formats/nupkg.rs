@@ -10,7 +10,8 @@ use std::io::{Read, Seek};
 use serde_json::Value as JsonValue;
 
 use crate::error::Error;
-use crate::output::{Errors, Metrics, Stage, Values};
+use crate::output::{Errors, Metrics, Stage, ValueKey, Values};
+use crate::value_key;
 
 /// A `.nuspec` above this is not legitimate — stop rather than buffer it.
 const MAX_NUSPEC: u64 = 1 << 20;
@@ -62,15 +63,15 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
 fn parse_nuspec(text: &str, values: &mut Values) -> Result<(), roxmltree::Error> {
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let doc = roxmltree::Document::parse(text)?;
-    const FIELDS: &[(&str, &str)] = &[
-        ("id", "nupkg.id"),
-        ("version", "nupkg.version"),
-        ("title", "nupkg.title"),
-        ("description", "nupkg.description"),
-        ("authors", "nupkg.authors"),
-        ("owners", "nupkg.owners"),
-        ("projectUrl", "nupkg.project_url"),
-        ("repository", "nupkg.repository_url"),
+    const FIELDS: &[(&str, ValueKey)] = &[
+        ("id", value_key!("nupkg.id")),
+        ("version", value_key!("nupkg.version")),
+        ("title", value_key!("nupkg.title")),
+        ("description", value_key!("nupkg.description")),
+        ("authors", value_key!("nupkg.authors")),
+        ("owners", value_key!("nupkg.owners")),
+        ("projectUrl", value_key!("nupkg.project_url")),
+        ("repository", value_key!("nupkg.repository_url")),
     ];
     for (tag, key) in FIELDS {
         if let Some(node) = doc.descendants().find(|n| n.has_tag_name(*tag)) {
@@ -81,7 +82,7 @@ fn parse_nuspec(text: &str, values: &mut Values) -> Result<(), roxmltree::Error>
                 node.text().map(str::trim)
             };
             if let Some(value) = value.filter(|v| !v.is_empty()) {
-                values.insert(key, JsonValue::String(value.to_string()));
+                values.insert_key(*key, JsonValue::String(value.to_string()));
             }
         }
     }

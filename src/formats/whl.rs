@@ -26,11 +26,12 @@
 //!   `.dist-info` and `.data`. These are the import-able package names.
 
 use crate::metric;
+use crate::value_key;
 use serde_json::Value as JsonValue;
 use std::io::{Read, Seek};
 
 use crate::error::Error;
-use crate::output::{Errors, Metrics, Stage, Values};
+use crate::output::{Errors, Metrics, Stage, ValueKey, Values};
 
 pub(super) fn extract_from_archive<R: Read + Seek>(
     zip: &mut ::zip::ZipArchive<R>,
@@ -44,7 +45,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     // the dist-info directory inside the archive. When they disagree,
     // it's an impersonation/repack signal.
     if let Some(basename) = values
-        .get("file.basename")
+        .get_key(value_key!("file.basename"))
         .and_then(JsonValue::as_str)
         .map(str::to_string)
     {
@@ -130,8 +131,14 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     if let Some(stem) = dist_info.strip_suffix(".dist-info") {
         if let Some((dist, ver)) = stem.rsplit_once('-') {
             if !dist.is_empty() && !ver.is_empty() {
-                values.insert("whl.distribution", JsonValue::String(dist.to_string()));
-                values.insert("whl.version", JsonValue::String(ver.to_string()));
+                values.insert_key(
+                    value_key!("whl.distribution"),
+                    JsonValue::String(dist.to_string()),
+                );
+                values.insert_key(
+                    value_key!("whl.version"),
+                    JsonValue::String(ver.to_string()),
+                );
             }
         }
     }
@@ -292,9 +299,9 @@ fn read_text_member<R: Read + Seek>(
 /// blank line (the long `Description` body follows); only the first
 /// occurrence of each field is taken, and `UNKNOWN` placeholders skipped.
 fn emit_metadata_identity(meta: &str, values: &mut Values) {
-    let put_first = |values: &mut Values, key: &str, val: &str| {
-        if !val.is_empty() && val != "UNKNOWN" && values.get(key).is_none() {
-            values.insert(key, JsonValue::String(val.to_string()));
+    let put_first = |values: &mut Values, key: ValueKey, val: &str| {
+        if !val.is_empty() && val != "UNKNOWN" && values.get_key(key).is_none() {
+            values.insert_key(key, JsonValue::String(val.to_string()));
         }
     };
     for line in meta.lines() {
@@ -306,12 +313,12 @@ fn emit_metadata_identity(meta: &str, values: &mut Values) {
         };
         let value = value.trim();
         match field.trim().to_ascii_lowercase().as_str() {
-            "author" => put_first(values, "whl.author", value),
-            "author-email" => put_first(values, "whl.author_email", value),
-            "maintainer" => put_first(values, "whl.maintainer", value),
-            "maintainer-email" => put_first(values, "whl.maintainer_email", value),
-            "home-page" => put_first(values, "whl.home_page", value),
-            "summary" => put_first(values, "whl.summary", value),
+            "author" => put_first(values, value_key!("whl.author"), value),
+            "author-email" => put_first(values, value_key!("whl.author_email"), value),
+            "maintainer" => put_first(values, value_key!("whl.maintainer"), value),
+            "maintainer-email" => put_first(values, value_key!("whl.maintainer_email"), value),
+            "home-page" => put_first(values, value_key!("whl.home_page"), value),
+            "summary" => put_first(values, value_key!("whl.summary"), value),
             _ => {}
         }
     }

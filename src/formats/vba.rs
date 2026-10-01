@@ -27,6 +27,7 @@
 //! `office.limits` instead.
 
 use crate::metric;
+use crate::value_key;
 use std::io::{Cursor, Read, Seek};
 
 use serde_json::Value as JsonValue;
@@ -46,7 +47,7 @@ const MAX_MODULES: usize = 256;
 
 /// Walk the CFB and surface VBA modules under `office.vba.*`. The
 /// dispatcher is expected to have already opened the file via
-/// [`ole2::extract`]; this re-opens it because the cfb crate keeps
+/// [`super::ole2::extract`]; this re-opens it because the cfb crate keeps
 /// the archive handle mutable internally and we'd otherwise have to
 /// thread it through the dispatch contract.
 ///
@@ -115,12 +116,12 @@ impl<'a> Report<'a> {
             return;
         }
         let mut limits = values
-            .get("office.limits")
+            .get_key(value_key!("office.limits"))
             .and_then(JsonValue::as_array)
             .cloned()
             .unwrap_or_default();
         limits.extend(self.limits);
-        values.insert("office.limits", JsonValue::Array(limits));
+        values.insert_key(value_key!("office.limits"), JsonValue::Array(limits));
     }
 }
 
@@ -441,7 +442,7 @@ pub(super) fn extract_from_zip<R: Read + Seek>(
     // `Default Extension="bin" ContentType="application/vnd.ms-office.vbaProject"`
     // and ships the project as `A@@@@.../Vasp7676CDT11.bin`, 273 KB of it.
     let declared = values
-        .get("office.macros")
+        .get_key(value_key!("office.macros"))
         .and_then(JsonValue::as_array)
         .into_iter()
         .flatten()

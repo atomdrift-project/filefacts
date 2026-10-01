@@ -31,6 +31,7 @@ use crate::formats::common::{XorScan, extract_binary_strings};
 use crate::formats::image_stats;
 use crate::output::{Metrics, Strings, Values};
 use crate::scan::entropy;
+use crate::value_key;
 
 const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 
@@ -237,7 +238,7 @@ pub(super) fn extract(
         values.insert("png.dimensions", JsonValue::Object(dim_obj));
     }
     if !text_kv.is_empty() {
-        values.insert("png.text", JsonValue::Object(text_kv));
+        values.insert_key(value_key!("png.text"), JsonValue::Object(text_kv));
     }
     if let Some(t) = time_value {
         // tIME chunk per PNG spec is the "last image modification time"

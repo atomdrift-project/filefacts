@@ -20,6 +20,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::metric;
 use crate::output::{ArchiveMember, Metrics, Values};
+use crate::value_key;
 
 /// Year-2100 ceiling for a believable member timestamp, as Unix seconds. A
 /// fixed ceiling needs no wall clock, so it works offline and survives
@@ -460,10 +461,16 @@ impl ArchiveStats {
             }
             Agg::BuilderNames => {
                 if !self.unames.is_empty() {
-                    values.insert("archive.builder.unames", string_list(&self.unames));
+                    values.insert_key(
+                        value_key!("archive.builder.unames"),
+                        string_list(&self.unames),
+                    );
                 }
                 if !self.gnames.is_empty() {
-                    values.insert("archive.builder.gnames", string_list(&self.gnames));
+                    values.insert_key(
+                        value_key!("archive.builder.gnames"),
+                        string_list(&self.gnames),
+                    );
                 }
             }
             Agg::SentinelMtimes => metrics.insert(

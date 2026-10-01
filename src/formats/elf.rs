@@ -6,6 +6,7 @@
 //! GNU build-id when present.
 
 use crate::metric;
+use crate::value_key;
 use goblin::elf::note::{Note, NoteIterator};
 use goblin::elf::{Elf, dynamic, header, program_header};
 use serde_json::Value as JsonValue;
@@ -153,7 +154,13 @@ pub(super) fn extract(
             pclntab: read_section(&elf, bytes, ".gopclntab"),
             rodata: read_section(&elf, bytes, ".rodata"),
         };
-        super::go_buildinfo::detect(bytes, values, "elf", Some(&resolve), &go_sections);
+        super::go_buildinfo::detect(
+            bytes,
+            values,
+            value_key!("elf.go"),
+            Some(&resolve),
+            &go_sections,
+        );
     }
     super::build_toolchain::from_elf(values, sections_out, bytes);
 
@@ -186,7 +193,7 @@ fn linker_family(elf: &Elf<'_>, values: &mut Values) {
     // `.comment` fallback — covers GNU ld (no dedicated note) and
     // toolchains that append `ld.lld` / `mold` strings inline.
     let Some(entries) = values
-        .get("elf.comment")
+        .get_key(value_key!("elf.comment"))
         .and_then(serde_json::Value::as_array)
         .cloned()
     else {
@@ -223,7 +230,7 @@ fn linker_family(elf: &Elf<'_>, values: &mut Values) {
 /// the raw `elf.comment[]` entries; these are the common cases.
 fn comment_fingerprint(values: &mut Values) {
     let Some(entries) = values
-        .get("elf.comment")
+        .get_key(value_key!("elf.comment"))
         .and_then(serde_json::Value::as_array)
         .cloned()
     else {
@@ -349,8 +356,8 @@ fn comment(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metri
     // above 1 means objects from multiple toolchains were merged.
     let distinct: std::collections::HashSet<&str> = texts.iter().map(String::as_str).collect();
     metrics.insert(metric!("elf.comment_distinct_count"), distinct.len() as f64);
-    values.insert(
-        "elf.comment",
+    values.insert_key(
+        value_key!("elf.comment"),
         JsonValue::Array(texts.into_iter().map(JsonValue::String).collect()),
     );
 }

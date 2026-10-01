@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::formats::common::bytes_at::{u16_le, u32_le};
 use crate::output::Values;
+use crate::value_key;
 
 /// Parse the Certificate Table contents `cert_table_bytes` (the bytes
 /// the PE optional header's directory entry points at) and write
@@ -73,7 +74,7 @@ pub(super) fn parse(cert_table_bytes: &[u8], values: &mut Values) {
         pos += (length + 7) & !7;
     }
     if !signatures.is_empty() {
-        values.insert("pe.signatures", JsonValue::Array(signatures));
+        values.insert_key(value_key!("pe.signatures"), JsonValue::Array(signatures));
     }
 }
 
@@ -600,7 +601,7 @@ fn extract_countersignature_time(signer: &cms::signed_data::SignerInfo) -> Optio
 ///
 /// The token is navigated by hand rather than through `cms::SignedData`:
 /// these tokens carry the optional `crls [1]` field, which that model rejects
-/// ("unexpected ASN.1 DER tag: got CONTEXT-SPECIFIC [1]"). Only one value is
+/// (`unexpected ASN.1 DER tag: got CONTEXT-SPECIFIC [1]`). Only one value is
 /// wanted, and it sits at a fixed place relative to the `id-ct-TSTInfo`
 /// content-type OID, so the search anchors there and reads forward.
 fn extract_rfc3161_gen_time(signer: &cms::signed_data::SignerInfo) -> Option<(String, i64)> {

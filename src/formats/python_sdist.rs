@@ -18,7 +18,8 @@ use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::fileid::FileType;
-use crate::output::{ArchiveMember, Errors, Metrics, Stage, Values};
+use crate::output::{ArchiveMember, Errors, Metrics, Stage, ValueKey, Values};
+use crate::value_key;
 
 /// `PKG-INFO` headers larger than this are almost certainly hostile padding;
 /// we stop reading rather than buffer them.
@@ -89,27 +90,36 @@ fn pkg_info(bytes: &[u8]) -> Result<Option<String>, (Stage, String)> {
 /// Emit `python.*` identity values from a parsed `PKG-INFO` header block.
 fn emit(text: &str, values: &mut Values) {
     let headers = Headers::parse(text);
-    let set = |values: &mut Values, key: &str, field: &str| {
+    let set = |values: &mut Values, key: ValueKey, field: &str| {
         if let Some(v) = headers.first(field) {
-            values.insert(key, JsonValue::String(v.to_string()));
+            values.insert_key(key, JsonValue::String(v.to_string()));
         }
     };
-    set(values, "python.name", "name");
-    set(values, "python.version", "version");
-    set(values, "python.summary", "summary");
-    set(values, "python.license", "license");
-    set(values, "python.homepage", "home-page");
-    set(values, "python.requires_python", "requires-python");
+    set(values, value_key!("python.name"), "name");
+    set(values, value_key!("python.version"), "version");
+    set(values, value_key!("python.summary"), "summary");
+    set(values, value_key!("python.license"), "license");
+    set(values, value_key!("python.homepage"), "home-page");
+    set(
+        values,
+        value_key!("python.requires_python"),
+        "requires-python",
+    );
 
-    emit_person(&headers, "author", values, "python.author");
-    emit_person(&headers, "maintainer", values, "python.maintainer");
+    emit_person(&headers, "author", values, value_key!("python.author"));
+    emit_person(
+        &headers,
+        "maintainer",
+        values,
+        value_key!("python.maintainer"),
+    );
 }
 
-/// Emit a `<prefix>.name` / `<prefix>.email` pair from the `<role>` /
+/// Emit a `<key>.name` / `<key>.email` pair from the `<role>` /
 /// `<role>-email` headers. Modern `PKG-INFO` often carries the name only in
 /// the `*-email` header's `"Name <email>"` form, so the name falls back to
 /// that when the plain `<role>` header is absent.
-fn emit_person(headers: &Headers, role: &str, values: &mut Values, prefix: &str) {
+fn emit_person(headers: &Headers, role: &str, values: &mut Values, key: ValueKey) {
     let email_field = format!("{role}-email");
     let raw_email = headers.first(&email_field);
     let email = raw_email.and_then(extract_email);
@@ -118,10 +128,10 @@ fn emit_person(headers: &Headers, role: &str, values: &mut Values, prefix: &str)
         .map(str::to_string)
         .or_else(|| raw_email.and_then(strip_email));
     if let Some(name) = name.filter(|n| !n.is_empty()) {
-        values.insert(&format!("{prefix}.name"), JsonValue::String(name));
+        values.insert_key_at(key, "name", JsonValue::String(name));
     }
     if let Some(email) = email {
-        values.insert(&format!("{prefix}.email"), JsonValue::String(email));
+        values.insert_key_at(key, "email", JsonValue::String(email));
     }
 }
 

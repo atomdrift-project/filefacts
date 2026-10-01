@@ -1,4 +1,5 @@
 //! Rust use trees and scoped call names, without compiler execution.
+use crate::value_key;
 use crate::{Symbol, Symbols};
 use std::collections::HashMap;
 use tree_sitter::Node;
@@ -149,7 +150,10 @@ pub(super) fn execution_facts(root: Node<'_>, source: &str, values: &mut crate::
     }
     initializers.sort_unstable();
     initializers.dedup();
-    values.insert("source.rust.modules", serde_json::json!(modules));
+    values.insert_key(
+        value_key!("source.rust.modules"),
+        serde_json::json!(modules),
+    );
     values.insert("source.rust.proc_macro", serde_json::json!(proc_macro));
     values.insert("source.rust.initializers", serde_json::json!(initializers));
 }

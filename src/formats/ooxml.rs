@@ -25,14 +25,15 @@
 //!   present (one per OOXML application; usually a single entry).
 
 use crate::metric;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek};
 
 use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::{bytes_at, put_str};
-use crate::output::{ErrorKind, Errors, Metrics, Stage, Values};
+use crate::output::{ErrorKind, Errors, Metrics, Stage, ValueKey, Values};
+use crate::value_key;
 
 /// Read cap for the named parts the `office.*` layer is built from.
 /// `[Content_Types].xml` and the `.rels` parts grow with the part count, so
@@ -64,17 +65,16 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
 
     if let Some(core) = parse_core_props(zip, errors) {
         for (key, value) in core {
-            let path = format!("office.{key}");
-            values.insert(&path, value);
+            values.insert_key(key, value);
         }
     }
 
     if let Some((app, company)) = parse_app_props(zip, errors) {
         if let Some(app) = app {
-            put_str(values, "office.application", app);
+            put_str(values, value_key!("office.application"), app);
         }
         if let Some(company) = company {
-            put_str(values, "office.company", company);
+            put_str(values, value_key!("office.company"), company);
         }
     }
 
@@ -233,7 +233,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         if vba_bytes > 0 {
             metrics.insert(metric!("office.vba_project_size"), vba_bytes as f64);
         }
-        values.insert("office.macros", JsonValue::Array(macros));
+        values.insert_key(value_key!("office.macros"), JsonValue::Array(macros));
         metrics.insert(metric!("office.macro_count"), count);
     }
 
@@ -264,8 +264,8 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         custom_ui_onload.extend(extract_custom_ui_onload(&text, name));
     }
     if oversized_parts > 0 {
-        values.insert(
-            "office.limits",
+        values.insert_key(
+            value_key!("office.limits"),
             serde_json::json!([{
                 "stage": "part-scan",
                 "reason": format!(
@@ -693,38 +693,38 @@ fn detect_kind(index: &OoxmlIndex) -> Option<&'static str> {
 fn parse_core_props<R: Read + std::io::Seek>(
     zip: &mut ::zip::ZipArchive<R>,
     errors: &mut Errors,
-) -> Option<serde_json::Map<String, JsonValue>> {
+) -> Option<BTreeMap<ValueKey, JsonValue>> {
     const CORE: &str = "docProps/core.xml";
     let text = read_named_part(zip, CORE, errors)?;
     let doc = roxmltree::Document::parse(&text)
         .map_err(|e| errors.record_malformed(Stage::OoxmlParse, format!("{CORE}: {e}")))
         .ok()?;
-    let mut out = serde_json::Map::new();
+    let mut out = BTreeMap::new();
     for node in doc.descendants() {
         let name = node.tag_name().name();
         // Dublin Core elements live in two namespaces (`dc:` and
         // `cp:`); `tag_name().name()` strips the prefix so we match
         // by local-name alone.
         let key = match name {
-            "title" => "title",
-            "creator" => "creator",
-            "subject" => "subject",
-            "description" => "description",
-            "keywords" => "keywords",
-            "lastModifiedBy" => "last_modified_by",
-            "created" => "created",
-            "modified" => "modified",
-            "category" => "category",
-            "contentStatus" => "content_status",
-            "revision" => "revision",
+            "title" => value_key!("office.title"),
+            "creator" => value_key!("office.creator"),
+            "subject" => value_key!("office.subject"),
+            "description" => value_key!("office.description"),
+            "keywords" => value_key!("office.keywords"),
+            "lastModifiedBy" => value_key!("office.last_modified_by"),
+            "created" => value_key!("office.created"),
+            "modified" => value_key!("office.modified"),
+            "category" => value_key!("office.category"),
+            "contentStatus" => value_key!("office.content_status"),
+            "revision" => value_key!("office.revision"),
             _ => continue,
         };
         let Some(text) = node.text() else {
             continue;
         };
         let trimmed = text.trim();
-        if !trimmed.is_empty() && !out.contains_key(key) {
-            out.insert(key.into(), JsonValue::String(trimmed.to_string()));
+        if !trimmed.is_empty() && !out.contains_key(&key) {
+            out.insert(key, JsonValue::String(trimmed.to_string()));
         }
     }
     Some(out)

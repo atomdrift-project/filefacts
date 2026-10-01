@@ -12,6 +12,7 @@
 //! exports views rather than being mirrored into `values`.
 
 use crate::metric;
+use crate::value_key;
 use goblin::pe::{PE, header::CoffHeader, optional_header::OptionalHeader};
 use memchr::memmem;
 use serde_json::Value as JsonValue;
@@ -200,12 +201,13 @@ pub(super) fn extract(
         let has_go_pclntab = go_sections
             .pclntab
             .is_some_and(super::go_buildinfo::has_pclntab_magic);
-        super::go_buildinfo::detect(bytes, values, "pe", None, &go_sections);
+        super::go_buildinfo::detect(bytes, values, value_key!("pe.go"), None, &go_sections);
         // A Go PE may fold `.gopclntab` into `.rdata` and omit a literal
         // `.gopclntab` section. Build-info is still authoritative Go
         // evidence, and in that layout the native parser supplies no typed
         // function inventory for the Rizin fallback to skip over.
-        let has_go_function_metadata = has_go_pclntab || values.get("pe.go").is_some();
+        let has_go_function_metadata =
+            has_go_pclntab || values.get_key(value_key!("pe.go")).is_some();
         super::build_toolchain::from_pe_rich(values);
         // Importless PEs are the narrow parsed-PE class where function
         // recovery can correlate API-hash callsites. It shares the same
@@ -2996,7 +2998,7 @@ fn load_config(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Met
 ///
 /// Emits `pe.delay_imports[]` (one descriptor per DLL with timestamp,
 /// rva_based flag, and import count) and pushes each resolved symbol
-/// into the typed [`Imports`] view with `source: "pe-delay"` so the
+/// into the typed [`crate::Symbols`] view as `Symbol::Import` with `source: "pe-delay"` so the
 /// flattened import set matches what `dumpbin /dependents` would show.
 fn delay_imports(
     pe: &PE<'_>,

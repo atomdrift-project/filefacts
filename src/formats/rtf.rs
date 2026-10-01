@@ -40,6 +40,7 @@ use crate::formats::common::{
     XorScan, append_decoded_strings, extract_binary_strings, hex_nibble, put_str,
 };
 use crate::output::{Metrics, Strings, Values};
+use crate::value_key;
 
 pub(super) fn extract(
     bytes: &[u8],
@@ -187,7 +188,7 @@ fn info_group(bytes: &[u8], values: &mut Values) {
         i = child_end + 1;
     }
     if !info.is_empty() {
-        values.insert("rtf.info", JsonValue::Object(info));
+        values.insert_key(value_key!("rtf.info"), JsonValue::Object(info));
     }
 }
 

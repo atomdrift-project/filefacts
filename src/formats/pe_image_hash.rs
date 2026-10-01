@@ -24,6 +24,7 @@
 //!   region the signature authenticates.
 
 use crate::metric;
+use serde_json::Value as JsonValue;
 use sha1::Sha1;
 use sha2::digest::DynDigest;
 use sha2::{Digest, Sha256, Sha384, Sha512};
@@ -35,8 +36,9 @@ use goblin::pe::optional_header::{
     SIZEOF_WINDOWS_FIELDS_64,
 };
 
-use crate::formats::common::{hex_encode, put_str};
+use crate::formats::common::hex_encode;
 use crate::output::{Metrics, Values};
+use crate::value_key;
 
 /// Authenticode digest algorithm. `Sha256` is the modern default;
 /// `Sha1` survives as the algorithm used on dual-signed legacy
@@ -110,7 +112,11 @@ pub(super) fn extract(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &
         let Some(digest) = regions.digest(bytes, alg) else {
             return;
         };
-        put_str(values, &format!("pe.image_hash.{}", alg.name()), digest);
+        values.insert_key_at(
+            value_key!("pe.image_hash"),
+            alg.name(),
+            JsonValue::String(digest),
+        );
     }
     if regions.overlay_padding > 0 {
         metrics.insert(

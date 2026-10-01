@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as JsonValue};
 
+use super::value_keys::ValueKey;
+
 /// Structural key-value data extracted from a file.
 ///
 /// `Values` is the natural-shape projection of whatever a format defines:
@@ -21,6 +23,12 @@ use serde_json::{Map, Value as JsonValue};
 /// `elf.dynamic.needed[]`. A JSON manifest's parsed content is exposed
 /// directly without a synthetic prefix — `fileid` already tells consumers
 /// which manifest format they're looking at.
+///
+/// A key that one module writes and another reads back is declared in
+/// [`VALUE_CATALOG`](crate::VALUE_CATALOG), and both sides go through
+/// [`Self::insert_key`] and [`Self::get_key`] with
+/// [`value_key!`](crate::value_key), so a rename on either side fails the
+/// build instead of silently emptying the reader.
 ///
 /// # Example
 ///
@@ -79,6 +87,36 @@ impl Values {
         navigate(&self.0, path)
     }
 
+    /// [`Self::insert`] for a catalog-checked key:
+    /// `values.insert_key(value_key!("…"), v)` fails to build on a key that
+    /// is not declared, where `insert` would write it unchecked.
+    pub fn insert_key(&mut self, key: ValueKey, value: JsonValue) {
+        self.insert(key.as_str(), value);
+    }
+
+    /// [`Self::insert_key`] below a checked base key: writes
+    /// `<key>.<rest>`, for a key whose tail is data (a field name read from
+    /// the file). `rest` follows the same rules as a path given to
+    /// [`Self::insert`].
+    pub fn insert_key_at(&mut self, key: ValueKey, rest: &str, value: JsonValue) {
+        self.insert(&format!("{key}.{rest}"), value);
+    }
+
+    /// [`Self::get`] for a catalog-checked key:
+    /// `values.get_key(value_key!("…"))` fails to build on a key that is not
+    /// declared, where `get` would just return `None` forever.
+    pub fn get_key(&self, key: ValueKey) -> Option<&JsonValue> {
+        self.get(key.as_str())
+    }
+
+    /// [`Self::get_key`], then `rest` relative to it, for a key whose tail is
+    /// data: an array index (`"[0]"`, `"[0].subject"`) or a field below an
+    /// object (`"name"`). `get_key_at(k, "[0].x")` reads what `get` reads at
+    /// `"<k>[0].x"`, and `get_key_at(k, "x")` what it reads at `"<k>.x"`.
+    pub fn get_key_at(&self, key: ValueKey, rest: &str) -> Option<&JsonValue> {
+        navigate(self.get_key(key)?, rest)
+    }
+
     /// Borrow the underlying JSON representation. Useful when integrating
     /// with downstream tools that already expect `serde_json::Value`.
     pub fn as_json(&self) -> &JsonValue {
@@ -125,7 +163,7 @@ fn insert_path(root: &mut Map<String, JsonValue>, path: &str, value: JsonValue) 
     }
 }
 
-fn navigate<'a>(value: &'a JsonValue, path: &str) -> Option<&'a JsonValue> {
+pub(super) fn navigate<'a>(value: &'a JsonValue, path: &str) -> Option<&'a JsonValue> {
     let mut cur = value;
     for raw in path.split('.') {
         let (key, idx) = split_index(raw);
@@ -244,6 +282,35 @@ mod tests {
         let mut v = Values::new();
         v.insert("x", json!(1));
         assert!(!v.is_empty());
+    }
+
+    /// The checked accessors read and write exactly what the string
+    /// accessors do at the joined path, so converting a call site cannot
+    /// change output.
+    #[test]
+    fn checked_accessors_match_string_paths() {
+        let mut v = Values::new();
+        v.insert_key(
+            crate::value_key!("pe.signatures"),
+            json!([{"subject": "CN=a", "thumbprint_sha256": "ab"}]),
+        );
+        v.insert_key_at(crate::value_key!("npm.author"), "email", json!("a@b"));
+        v.insert("npm.author.name", json!("A"));
+
+        let sigs = crate::value_key!("pe.signatures");
+        assert_eq!(v.get_key(sigs), v.get("pe.signatures"));
+        for rest in ["[0]", "[0].thumbprint_sha256", "[1]", "[0].missing", ""] {
+            let joined = if rest.is_empty() || rest.starts_with('[') {
+                format!("pe.signatures{rest}")
+            } else {
+                format!("pe.signatures.{rest}")
+            };
+            assert_eq!(v.get_key_at(sigs, rest), v.get(&joined), "{rest:?}");
+        }
+        let author = crate::value_key!("npm.author");
+        assert_eq!(v.get_key_at(author, "email"), Some(&json!("a@b")));
+        assert_eq!(v.get_key_at(author, "name"), v.get("npm.author.name"));
+        assert!(v.get_key(crate::value_key!("pe.go")).is_none());
     }
 
     #[test]

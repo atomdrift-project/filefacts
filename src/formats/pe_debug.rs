@@ -17,6 +17,7 @@ use crate::Stage;
 use crate::formats::common::{basename, format_guid, put_i64, put_str, put_u64, stem};
 use crate::formats::goblin_safe;
 use crate::output::{Errors, Values};
+use crate::value_key;
 
 /// Emit the PDB path and its derived basename + stem. The path itself
 /// is the forensic anchor; basename and stem are the comparison
@@ -24,7 +25,7 @@ use crate::output::{Errors, Values};
 /// filename (build-pipeline anomaly / commodity-malware repacks reuse
 /// PDB stems across renamed binaries).
 fn put_pdb_path(values: &mut Values, path: &str, path_offset: Option<u64>) {
-    put_str(values, "pe.debug.pdb.path", path);
+    put_str(values, value_key!("pe.debug.pdb.path"), path);
     // Anchor the value at the filename string in the CodeView blob so a
     // `type: value` match on `pe.debug.pdb.path` renders in the hex view.
     if let Some(off) = path_offset {

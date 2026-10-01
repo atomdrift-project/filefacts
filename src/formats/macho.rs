@@ -11,6 +11,7 @@
 
 use crate::bytes;
 use crate::metric;
+use crate::value_key;
 use goblin::mach::{self, Mach, MachO};
 use serde_json::Value as JsonValue;
 
@@ -20,7 +21,7 @@ use crate::formats::common::{
     plist_to_json, put_str, put_u64, rizin_fallback, section_entropy,
 };
 use crate::formats::goblin_safe;
-use crate::output::{Errors, Metrics, Section, Strings, Values};
+use crate::output::{Errors, Metrics, Section, Strings, ValueKey, Values};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn extract(
@@ -134,7 +135,7 @@ pub(super) fn extract(
         pclntab: go_pclntab,
         rodata: go_rodata,
     };
-    super::go_buildinfo::detect(bytes, values, "macho", None, &go_sections);
+    super::go_buildinfo::detect(bytes, values, value_key!("macho.go"), None, &go_sections);
     Ok(())
 }
 
@@ -1552,7 +1553,7 @@ fn build_version(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
             }
         }
     }
-    values.insert("macho.build_version", JsonValue::Object(obj));
+    values.insert_key(value_key!("macho.build_version"), JsonValue::Object(obj));
 }
 
 /// The `crate::bytes` reader for a `u32` in `macho`'s byte order.
@@ -1597,7 +1598,7 @@ fn source_version(macho: &MachO<'_>, values: &mut Values) {
     let e = sv & 0x3FF;
     put_str(
         values,
-        "macho.source_version",
+        value_key!("macho.source_version"),
         format!("{a}.{b}.{c}.{d}.{e}"),
     );
 }
@@ -1620,7 +1621,7 @@ fn install_name(macho: &MachO<'_>, values: &mut Values) {
     // `libs[0]` when the binary is a dylib and the slot isn't `self`.
     if let Some(name) = macho.libs.first().copied() {
         if !name.is_empty() && name != "self" {
-            put_str(values, "macho.install_name", name);
+            put_str(values, value_key!("macho.install_name"), name);
             put_str(values, "macho.install_name_kind", install_name_kind(name));
         }
     }
@@ -1736,11 +1737,11 @@ fn info_plist_section(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
     // self-installing daemons (`ProgramArguments`, `KeepAlive`,
     // `RunAtLoad`, …). Surfaced under sibling subtrees so trait
     // authors can read both with the same shape.
-    for (section_name, value_key) in [
-        ("__info_plist", "macho.info_plist"),
-        ("__launchd_plist", "macho.launchd_plist"),
+    for (section_name, key) in [
+        ("__info_plist", value_key!("macho.info_plist")),
+        ("__launchd_plist", value_key!("macho.launchd_plist")),
     ] {
-        emit_embedded_plist(macho, bytes, values, section_name, value_key);
+        emit_embedded_plist(macho, bytes, values, section_name, key);
     }
 }
 
@@ -1755,7 +1756,7 @@ fn emit_embedded_plist(
     bytes: &[u8],
     values: &mut Values,
     section_name: &str,
-    value_key: &str,
+    key: ValueKey,
 ) {
     for segment in &macho.segments {
         let Some(sections) = segment_sections(segment) else {
@@ -1782,7 +1783,7 @@ fn emit_embedded_plist(
                 return;
             };
             if let Ok(parsed) = plist::Value::from_reader(std::io::Cursor::new(plist_bytes)) {
-                values.insert(value_key, plist_to_json(parsed, 0));
+                values.insert_key(key, plist_to_json(parsed, 0));
             }
             return;
         }

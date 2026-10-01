@@ -27,6 +27,7 @@ use serde_json::Value as JsonValue;
 
 use crate::formats::common::{hex_encode, put_str};
 use crate::output::{Symbol, SymbolKind, Symbols, Values};
+use crate::value_key;
 
 /// Populate `macho.hashes.*` from the parsed Mach-O plus the unified
 /// symbols view (which the imports/exports extractor has already
@@ -144,7 +145,7 @@ fn symhash(macho: &MachO<'_>) -> Option<String> {
 /// inside `com.apple.security.application-groups`). Mirrors the
 /// construction from Greg Lesnewich + Jacob Latonis's OBTS v7 talk.
 fn entitlement_hash(values: &Values) -> Option<String> {
-    let entitlements = values.get("macho.code_signature.entitlements")?;
+    let entitlements = values.get_key(value_key!("macho.code_signature.entitlements"))?;
     let JsonValue::Object(map) = entitlements else {
         return None;
     };

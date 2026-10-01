@@ -7,6 +7,7 @@
 use super::langs::Lang;
 use super::{MAX_FLOW_DEPTH, named_children};
 use crate::Values;
+use crate::value_key;
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use tree_sitter::Node;
@@ -284,14 +285,14 @@ fn emit_seeded(
             }
         }
         values.insert("source.go.initialization_http", json!(startup.http));
-        values.insert(
-            "source.go.initialization_events",
+        values.insert_key(
+            value_key!("source.go.initialization_events"),
             json!(events_for(&startup, "<initialization>", 0)),
         );
     }
     events.sort_by_cached_key(serde_json::Value::to_string);
     events.dedup();
-    values.insert("source.payload_flow.events", json!(events));
+    values.insert_key(value_key!("source.payload_flow.events"), json!(events));
     values.insert("source.payload_flow.truncated", json!(a.truncated));
     // Top-level facts include direct calls and calls to resolved local helpers,
     // but not merely exported/uninvoked functions or constant-false branches.

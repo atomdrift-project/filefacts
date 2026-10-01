@@ -21,7 +21,8 @@ use aho_corasick::AhoCorasick;
 use serde_json::Value as JsonValue;
 
 use crate::fileid::FileType;
-use crate::output::{Claim, Identity, Party, Signer, Trust, Url, UrlKind, Values};
+use crate::output::{Claim, Identity, Party, Signer, Trust, Url, UrlKind, ValueKey, Values};
+use crate::value_key;
 
 // TODO(sigstore): external-signature verification seam.
 //
@@ -96,9 +97,9 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Iden
 
     // A Go binary's main module, when nothing stronger named the project.
     match file_type {
-        FileType::Pe => go_module("pe", values, &mut id),
-        FileType::Elf => go_module("elf", values, &mut id),
-        FileType::MachO => go_module("macho", values, &mut id),
+        FileType::Pe => go_module(value_key!("pe.go"), values, &mut id),
+        FileType::Elf => go_module(value_key!("elf.go"), values, &mut id),
+        FileType::MachO => go_module(value_key!("macho.go"), values, &mut id),
         _ => {}
     }
 
@@ -129,13 +130,19 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Iden
 // ---------------------------------------------------------------------
 
 fn macho(values: &Values, bytes: &[u8], id: &mut Identity) {
-    let signed = values.get("macho.code_signature.identifier").is_some()
-        || values.get("macho.code_signature.cdhash").is_some()
-        || values.get("macho.code_signature.flags").is_some();
-    let cms = values.get("macho.code_signature.cms");
+    let signed = values
+        .get_key(value_key!("macho.code_signature.identifier"))
+        .is_some()
+        || values
+            .get_key(value_key!("macho.code_signature.cdhash"))
+            .is_some()
+        || values
+            .get_key(value_key!("macho.code_signature.flags"))
+            .is_some();
+    let cms = values.get_key(value_key!("macho.code_signature.cms"));
     let cms_present = cms.is_some();
 
-    if let Some(ident) = get_str(values, "macho.code_signature.identifier") {
+    if let Some(ident) = get_str(values, value_key!("macho.code_signature.identifier")) {
         // The identifier lives in the CodeDirectory, which the signature
         // covers — but only a real CMS chain *proves* who set it.
         id.identifier = Some(Claim {
@@ -144,14 +151,14 @@ fn macho(values: &Values, bytes: &[u8], id: &mut Identity) {
             verified: cms_present,
         });
     }
-    if let Some(team) = get_str(values, "macho.code_signature.team_id") {
+    if let Some(team) = get_str(values, value_key!("macho.code_signature.team_id")) {
         id.team_id = Some(Claim {
             value: team.to_string(),
             source: "macho.code_signature.team_id".into(),
             verified: cms_present,
         });
     }
-    if let Some(cdhash) = get_str(values, "macho.code_signature.cdhash") {
+    if let Some(cdhash) = get_str(values, value_key!("macho.code_signature.cdhash")) {
         id.unique_ids.insert("cdhash".into(), cdhash.to_string());
     }
 
@@ -169,10 +176,10 @@ fn macho(values: &Values, bytes: &[u8], id: &mut Identity) {
 
     // Trust resolution, in precedence order.
     let platform = values
-        .get("macho.code_signature.platform")
+        .get_key(value_key!("macho.code_signature.platform"))
         .and_then(JsonValue::as_u64)
         .unwrap_or(0);
-    let ad_hoc = flag_set(values, "macho.code_signature.flags", "ad_hoc");
+    let ad_hoc = flag_set(values, value_key!("macho.code_signature.flags"), "ad_hoc");
     if id.trust == Trust::Unsigned && signed {
         id.trust = if ad_hoc {
             Trust::AdHoc
@@ -189,7 +196,7 @@ fn macho(values: &Values, bytes: &[u8], id: &mut Identity) {
     // For a platform/system binary with no CMS organization, infer the
     // vendor from the reverse-DNS identifier (`com.apple.ls` → Apple).
     if id.organization.is_none() && id.trust == Trust::System {
-        if let Some(ident) = get_str(values, "macho.code_signature.identifier") {
+        if let Some(ident) = get_str(values, value_key!("macho.code_signature.identifier")) {
             if let Some(org) = org_from_reverse_dns(ident) {
                 id.organization = Some(Claim::claimed(org, "macho.code_signature.identifier"));
             }
@@ -200,7 +207,7 @@ fn macho(values: &Values, bytes: &[u8], id: &mut Identity) {
     // Gated to Apple binaries — the only ones that carry it — so the
     // overwhelming majority of Mach-O files never pay for the scan.
     let apple = id.trust == Trust::System
-        || get_str(values, "macho.code_signature.identifier")
+        || get_str(values, value_key!("macho.code_signature.identifier"))
             .is_some_and(|i| i.starts_with("com.apple."));
     if apple {
         if let Some(prog) = scan_token(bytes, b"PROGRAM:") {
@@ -213,7 +220,7 @@ fn macho(values: &Values, bytes: &[u8], id: &mut Identity) {
 
     // Name fallbacks: install-name basename, then identifier tail.
     if id.name.is_none() {
-        if let Some(install) = get_str(values, "macho.install_name") {
+        if let Some(install) = get_str(values, value_key!("macho.install_name")) {
             let base = install.rsplit('/').next().unwrap_or(install);
             if !base.is_empty() {
                 id.name = Some(Claim::claimed(base, "macho.install_name"));
@@ -221,14 +228,14 @@ fn macho(values: &Values, bytes: &[u8], id: &mut Identity) {
         }
     }
     if id.name.is_none() {
-        if let Some(ident) = get_str(values, "macho.code_signature.identifier") {
+        if let Some(ident) = get_str(values, value_key!("macho.code_signature.identifier")) {
             if let Some(tail) = ident.rsplit('.').next() {
                 id.name = Some(Claim::claimed(tail, "macho.code_signature.identifier"));
             }
         }
     }
 
-    if let Some(sv) = get_str(values, "macho.source_version") {
+    if let Some(sv) = get_str(values, value_key!("macho.source_version")) {
         if sv != "0.0.0" {
             id.version = Some(Claim::claimed(sv, "macho.source_version"));
         }
@@ -236,26 +243,29 @@ fn macho(values: &Values, bytes: &[u8], id: &mut Identity) {
 }
 
 fn pe(values: &Values, id: &mut Identity) {
-    if let Some(name) = get_str(values, "pe.version.original_filename")
-        .or_else(|| get_str(values, "pe.version.internal_name"))
+    if let Some(name) = get_str(values, value_key!("pe.version.original_filename"))
+        .or_else(|| get_str(values, value_key!("pe.version.internal_name")))
     {
         id.name = Some(Claim::claimed(name, "pe.version.original_filename"));
     }
     // ProductName names the larger product/suite the file belongs to —
     // the closest PE analogue to a source project.
-    if let Some(product) = get_str(values, "pe.version.product_name") {
+    if let Some(product) = get_str(values, value_key!("pe.version.product_name")) {
         id.project = Some(Claim::claimed(product, "pe.version.product_name"));
     }
-    if let Some(company) = get_str(values, "pe.version.company") {
+    if let Some(company) = get_str(values, value_key!("pe.version.company")) {
         id.organization = Some(Claim::claimed(company, "pe.version.company"));
     }
-    if let Some(version) = get_str(values, "pe.version.file_version")
-        .or_else(|| get_str(values, "pe.version.product_version"))
+    if let Some(version) = get_str(values, value_key!("pe.version.file_version"))
+        .or_else(|| get_str(values, value_key!("pe.version.product_version")))
     {
         id.version = Some(Claim::claimed(version, "pe.version.file_version"));
     }
 
-    if let Some(ci) = values.get("pe.signatures[0]").and_then(cert_from_obj) {
+    if let Some(ci) = values
+        .get_key_at(value_key!("pe.signatures"), "[0]")
+        .and_then(cert_from_obj)
+    {
         // A verified signer certificate outranks the self-asserted
         // CompanyName for the organization field.
         if let Some(o) = &ci.o {
@@ -268,7 +278,7 @@ fn pe(values: &Values, id: &mut Identity) {
         id.trust = cert_trust(&ci);
         id.signer = Some(signer_struct(&ci, "pe.signatures[0]"));
     }
-    if let Some(t) = get_str(values, "pe.signatures[0].thumbprint_sha256") {
+    if let Some(t) = get_str_at(values, value_key!("pe.signatures"), "[0].thumbprint_sha256") {
         id.unique_ids
             .insert("authenticode_thumbprint_sha256".into(), t.to_string());
     }
@@ -278,7 +288,10 @@ fn pe(values: &Values, id: &mut Identity) {
 /// CFHEADER carries no publisher, product or version field. The signature blob
 /// is published in the PE `signatures[0]` shape, so the mapping is the PE one.
 fn cab(values: &Values, id: &mut Identity) {
-    if let Some(ci) = values.get("cab.signatures[0]").and_then(cert_from_obj) {
+    if let Some(ci) = values
+        .get_key_at(value_key!("cab.signatures"), "[0]")
+        .and_then(cert_from_obj)
+    {
         if let Some(o) = &ci.o {
             id.organization = Some(Claim {
                 value: o.clone(),
@@ -289,7 +302,11 @@ fn cab(values: &Values, id: &mut Identity) {
         id.trust = cert_trust(&ci);
         id.signer = Some(signer_struct(&ci, "cab.signatures[0]"));
     }
-    if let Some(t) = get_str(values, "cab.signatures[0].thumbprint_sha256") {
+    if let Some(t) = get_str_at(
+        values,
+        value_key!("cab.signatures"),
+        "[0].thumbprint_sha256",
+    ) {
         id.unique_ids
             .insert("authenticode_thumbprint_sha256".into(), t.to_string());
     }
@@ -299,7 +316,7 @@ fn cab(values: &Values, id: &mut Identity) {
 /// created in a main-header extra record. Both are operator-chosen, so they
 /// are unverified claims — the same class of provenance as an ISO volume id.
 fn rar(values: &Values, id: &mut Identity) {
-    if let Some(name) = get_str(values, "rar.original_name") {
+    if let Some(name) = get_str(values, value_key!("rar.original_name")) {
         id.name = Some(Claim::claimed(name, "rar.original_name"));
     }
 }
@@ -310,28 +327,34 @@ fn rar(values: &Values, id: &mut Identity) {
 /// -- but a mastering tool stamps itself consistently, which is what makes a
 /// blank or imitated field worth seeing next to a real one.
 fn iso(values: &Values, id: &mut Identity) {
-    if let Some(volume) = get_str(values, "iso.volume_id") {
+    if let Some(volume) = get_str(values, value_key!("iso.volume_id")) {
         id.name = Some(Claim::claimed(volume, "iso.volume_id"));
     }
-    if let Some(publisher) = get_str(values, "iso.publisher_id") {
+    if let Some(publisher) = get_str(values, value_key!("iso.publisher_id")) {
         id.organization = Some(Claim::claimed(publisher, "iso.publisher_id"));
-    } else if let Some(preparer) = get_str(values, "iso.preparer_id") {
+    } else if let Some(preparer) = get_str(values, value_key!("iso.preparer_id")) {
         // The preparer is a weaker claim than the publisher, so it only
         // stands in when no publisher was recorded.
         id.organization = Some(Claim::claimed(preparer, "iso.preparer_id"));
     }
     // `iso.builder` is the normalized mastering-tool name; prefer it over the
     // raw application field it was derived from.
-    if let Some(builder) = get_str(values, "iso.builder") {
+    if let Some(builder) = get_str(values, value_key!("iso.builder")) {
         id.producer = Some(Claim::claimed(builder, "iso.builder"));
-    } else if let Some(app) = get_str(values, "iso.application_id") {
+    } else if let Some(app) = get_str(values, value_key!("iso.application_id")) {
         id.producer = Some(Claim::claimed(app, "iso.application_id"));
     }
     for (key, name) in [
-        ("iso.volume_set_id", "iso_volume_set_id"),
-        ("iso.udf.logical_volume_id", "udf_logical_volume_id"),
-        ("iso.udf.volume_set_id", "udf_volume_set_id"),
-        ("iso.udf.implementation_id", "udf_implementation_id"),
+        (value_key!("iso.volume_set_id"), "iso_volume_set_id"),
+        (
+            value_key!("iso.udf.logical_volume_id"),
+            "udf_logical_volume_id",
+        ),
+        (value_key!("iso.udf.volume_set_id"), "udf_volume_set_id"),
+        (
+            value_key!("iso.udf.implementation_id"),
+            "udf_implementation_id",
+        ),
     ] {
         if let Some(v) = get_str(values, key) {
             id.unique_ids.insert(name.into(), v.to_string());
@@ -343,10 +366,10 @@ fn iso(values: &Values, id: &mut Identity) {
 /// the closest thing a DMG has to provenance, since UDIF itself carries no
 /// publisher field and the image need not be signed.
 fn dmg(values: &Values, id: &mut Identity) {
-    if let Some(volume) = get_str(values, "dmg.volume.name") {
+    if let Some(volume) = get_str(values, value_key!("dmg.volume.name")) {
         id.name = Some(Claim::claimed(volume, "dmg.volume.name"));
     }
-    if let Some(tool) = get_str(values, "dmg.volume.formatted_by") {
+    if let Some(tool) = get_str(values, value_key!("dmg.volume.formatted_by")) {
         id.producer = Some(Claim::claimed(tool, "dmg.volume.formatted_by"));
     }
     // `dmg.volume.last_mounted_version` is deliberately NOT a producer. It is
@@ -363,8 +386,11 @@ fn dmg(values: &Values, id: &mut Identity) {
 /// path. Recorded as parties rather than as an organization: these name a
 /// person or a service account, not a publisher.
 fn tar(values: &Values, id: &mut Identity) {
-    for key in ["archive.builder.unames", "archive.builder.gnames"] {
-        let Some(list) = values.get(key).and_then(JsonValue::as_array) else {
+    for key in [
+        value_key!("archive.builder.unames"),
+        value_key!("archive.builder.gnames"),
+    ] {
+        let Some(list) = values.get_key(key).and_then(JsonValue::as_array) else {
             continue;
         };
         for name in list.iter().filter_map(JsonValue::as_str) {
@@ -378,7 +404,7 @@ fn tar(values: &Values, id: &mut Identity) {
                     email: None,
                     url: None,
                     role: "builder".into(),
-                    source: key.into(),
+                    source: key.to_string(),
                 });
             }
         }
@@ -390,11 +416,8 @@ fn tar(values: &Values, id: &mut Identity) {
 /// from — `github.com/gitleaks/gitleaks` — which is often the only identity an
 /// unsigned Go tool carries, so it fills `project` and `version` only when a
 /// version resource or signature has not already.
-fn go_module(prefix: &str, values: &Values, id: &mut Identity) {
-    let Some(module) = values
-        .get(&format!("{prefix}.go"))
-        .and_then(|go| go.get("module"))
-    else {
+fn go_module(key: ValueKey, values: &Values, id: &mut Identity) {
+    let Some(module) = values.get_key_at(key, "module") else {
         return;
     };
     let field = |key: &str| {
@@ -406,15 +429,12 @@ fn go_module(prefix: &str, values: &Values, id: &mut Identity) {
     if id.project.is_none()
         && let Some(path) = field("path")
     {
-        id.project = Some(Claim::claimed(path, format!("{prefix}.go.module.path")));
+        id.project = Some(Claim::claimed(path, format!("{key}.module.path")));
     }
     if id.version.is_none()
         && let Some(version) = field("version")
     {
-        id.version = Some(Claim::claimed(
-            version,
-            format!("{prefix}.go.module.version"),
-        ));
+        id.version = Some(Claim::claimed(version, format!("{key}.module.version")));
     }
 }
 
@@ -424,7 +444,7 @@ fn dwarf_producer(values: &Values, id: &mut Identity) {
         return;
     }
     if let Some(p) = values
-        .get("elf.dwarf.producers")
+        .get_key(value_key!("elf.dwarf.producers"))
         .and_then(JsonValue::as_array)
         .and_then(|a| a.first())
         .and_then(JsonValue::as_str)
@@ -436,39 +456,39 @@ fn dwarf_producer(values: &Values, id: &mut Identity) {
 /// Alpine `.PKGINFO` is a publisher manifest in the same family as a wheel's
 /// `METADATA` or a gem's `metadata.gz`, so it maps the same way.
 fn apk_alpine(values: &Values, id: &mut Identity) {
-    if let Some(name) = get_str(values, "apk.pkgname") {
+    if let Some(name) = get_str(values, value_key!("apk.pkgname")) {
         id.name = Some(Claim::claimed(name, "apk.pkgname"));
     }
-    if let Some(version) = get_str(values, "apk.pkgver") {
+    if let Some(version) = get_str(values, value_key!("apk.pkgver")) {
         id.version = Some(Claim::claimed(version, "apk.pkgver"));
     }
     // `origin` names the source build a package came out of -- the project,
     // where `pkgname` may be only one of its subpackages.
-    if let Some(origin) = get_str(values, "apk.origin") {
+    if let Some(origin) = get_str(values, value_key!("apk.origin")) {
         id.project = Some(Claim::claimed(origin, "apk.origin"));
     }
-    if let Some(builder) = get_str(values, "apk.builder") {
+    if let Some(builder) = get_str(values, value_key!("apk.builder")) {
         id.producer = Some(Claim::claimed(builder, "apk.builder"));
     }
     // Both fields carry a `Name <email>` contact, the same shape
     // `split_contact` already unpacks for deb and wheel.
     for (key, role) in [
-        ("apk.maintainer", "maintainer"),
-        ("apk.packager", "packager"),
+        (value_key!("apk.maintainer"), "maintainer"),
+        (value_key!("apk.packager"), "packager"),
     ] {
         if let Some(raw) = get_str(values, key) {
             let (name, email) = split_contact(None, Some(raw));
-            push_author(id, name, email, None, role, key);
+            push_author(id, name, email, None, role, key.as_str());
         }
     }
-    if let Some(url) = get_str(values, "apk.url") {
+    if let Some(url) = get_str(values, value_key!("apk.url")) {
         push_url(id, UrlKind::Homepage, url, "apk.url");
     }
     // The commit the package was built from, and the digest of its data
     // segment: both pin this artifact to a specific build.
     for (key, name) in [
-        ("apk.commit", "vcs_commit"),
-        ("apk.datahash", "apk_datahash"),
+        (value_key!("apk.commit"), "vcs_commit"),
+        (value_key!("apk.datahash"), "apk_datahash"),
     ] {
         if let Some(v) = get_str(values, key)
             && v != "unknown"
@@ -484,7 +504,7 @@ fn apk_alpine(values: &Values, id: &mut Identity) {
 /// treats that key, not the package name, as the app's real identity across
 /// updates, so the thumbprint is the durable correlator.
 fn apk_android(values: &Values, id: &mut Identity) {
-    if let Some(pkg) = get_str(values, "android.package") {
+    if let Some(pkg) = get_str(values, value_key!("android.package")) {
         id.identifier = Some(Claim::claimed(pkg, "android.package"));
     }
     // The display label is what a user actually sees, which is what makes it
@@ -493,15 +513,20 @@ fn apk_android(values: &Values, id: &mut Identity) {
     // inline. An unresolved `@0x7f0c0043` is a pointer, not a name, and
     // recording it as one would put a meaningless string in front of an
     // analyst on almost every APK. Only an inline label becomes identity.
-    if let Some(label) = get_str(values, "android.app_label").filter(|l| !l.starts_with("@0x")) {
+    if let Some(label) =
+        get_str(values, value_key!("android.app_label")).filter(|l| !l.starts_with("@0x"))
+    {
         id.name = Some(Claim::claimed(label, "android.app_label"));
     }
-    if let Some(version) =
-        get_str(values, "android.version_name").or_else(|| get_str(values, "android.version_code"))
+    if let Some(version) = get_str(values, value_key!("android.version_name"))
+        .or_else(|| get_str(values, value_key!("android.version_code")))
     {
         id.version = Some(Claim::claimed(version, "android.version_name"));
     }
-    if let Some(ci) = values.get("android.signatures[0]").and_then(cert_from_obj) {
+    if let Some(ci) = values
+        .get_key_at(value_key!("android.signatures"), "[0]")
+        .and_then(cert_from_obj)
+    {
         if let Some(o) = &ci.o {
             id.organization = Some(Claim {
                 value: o.clone(),
@@ -512,14 +537,18 @@ fn apk_android(values: &Values, id: &mut Identity) {
         id.trust = cert_trust(&ci);
         id.signer = Some(signer_struct(&ci, "android.signatures[0]"));
     }
-    if let Some(t) = get_str(values, "android.signatures[0].thumbprint_sha256") {
+    if let Some(t) = get_str_at(
+        values,
+        value_key!("android.signatures"),
+        "[0].thumbprint_sha256",
+    ) {
         id.unique_ids
             .insert("apk_signer_thumbprint_sha256".into(), t.to_string());
     }
 }
 
 fn crx(values: &Values, id: &mut Identity) {
-    if let Some(ext_id) = get_str(values, "crx.extension_id") {
+    if let Some(ext_id) = get_str(values, value_key!("crx.extension_id")) {
         // CRX3 carries the canonical extension id in SignedData. The parser
         // identifies a matching developer proof key when present, but does not
         // cryptographically verify that proof, so this remains an unverified
@@ -531,7 +560,7 @@ fn crx(values: &Values, id: &mut Identity) {
         });
         id.unique_ids.insert("crx_id".into(), ext_id.to_string());
     }
-    if let Some(pk) = get_str(values, "crx.public_key_sha256") {
+    if let Some(pk) = get_str(values, value_key!("crx.public_key_sha256")) {
         id.unique_ids
             .insert("public_key_sha256".into(), pk.to_string());
         id.trust = Trust::Unverified;
@@ -539,13 +568,13 @@ fn crx(values: &Values, id: &mut Identity) {
     // Developer-declared author from the extension manifest.
     push_author(
         id,
-        get_str(values, "crx.author").map(str::to_string),
-        get_str(values, "crx.author_email").map(str::to_string),
+        get_str(values, value_key!("crx.author")).map(str::to_string),
+        get_str(values, value_key!("crx.author_email")).map(str::to_string),
         None,
         "author",
         "crx.author",
     );
-    if let Some(home) = get_str(values, "crx.homepage_url") {
+    if let Some(home) = get_str(values, value_key!("crx.homepage_url")) {
         push_url(id, UrlKind::Homepage, home, "crx.homepage_url");
     }
 }
@@ -555,51 +584,53 @@ fn crx(values: &Values, id: &mut Identity) {
 // ---------------------------------------------------------------------
 
 fn xpi(values: &Values, id: &mut Identity) {
-    if let Some(name) = get_str(values, "xpi.name") {
+    if let Some(name) = get_str(values, value_key!("xpi.name")) {
         id.name = Some(Claim::claimed(name, "xpi.name"));
     }
-    if let Some(version) = get_str(values, "xpi.version") {
+    if let Some(version) = get_str(values, value_key!("xpi.version")) {
         id.version = Some(Claim::claimed(version, "xpi.version"));
     }
     push_author(
         id,
-        get_str(values, "xpi.author").map(str::to_string),
+        get_str(values, value_key!("xpi.author")).map(str::to_string),
         None,
         None,
         "author",
         "xpi.author",
     );
-    if let Some(home) = get_str(values, "xpi.homepage_url") {
+    if let Some(home) = get_str(values, value_key!("xpi.homepage_url")) {
         push_url(id, UrlKind::Homepage, home, "xpi.homepage_url");
     }
 }
 
 fn nupkg(values: &Values, id: &mut Identity) {
-    if let Some(pkg_id) = get_str(values, "nupkg.id") {
+    if let Some(pkg_id) = get_str(values, value_key!("nupkg.id")) {
         id.identifier = Some(Claim::claimed(pkg_id, "nupkg.id"));
     }
-    if let Some(name) = get_str(values, "nupkg.title").or_else(|| get_str(values, "nupkg.id")) {
+    if let Some(name) = get_str(values, value_key!("nupkg.title"))
+        .or_else(|| get_str(values, value_key!("nupkg.id")))
+    {
         id.name = Some(Claim::claimed(name, "nupkg.title"));
     }
-    if let Some(version) = get_str(values, "nupkg.version") {
+    if let Some(version) = get_str(values, value_key!("nupkg.version")) {
         id.version = Some(Claim::claimed(version, "nupkg.version"));
     }
-    for author in split_list(get_str(values, "nupkg.authors")) {
+    for author in split_list(get_str(values, value_key!("nupkg.authors"))) {
         push_author(id, Some(author), None, None, "author", "nupkg.authors");
     }
-    for owner in split_list(get_str(values, "nupkg.owners")) {
+    for owner in split_list(get_str(values, value_key!("nupkg.owners"))) {
         push_author(id, Some(owner), None, None, "owner", "nupkg.owners");
     }
-    if let Some(url) = get_str(values, "nupkg.project_url") {
+    if let Some(url) = get_str(values, value_key!("nupkg.project_url")) {
         push_url(id, UrlKind::Homepage, url, "nupkg.project_url");
     }
-    if let Some(url) = get_str(values, "nupkg.repository_url") {
+    if let Some(url) = get_str(values, value_key!("nupkg.repository_url")) {
         push_url(id, UrlKind::Repository, url, "nupkg.repository_url");
     }
 }
 
 fn vsix(values: &Values, id: &mut Identity) {
-    if let Some(ext_id) = get_str(values, "vsix.identity.id") {
+    if let Some(ext_id) = get_str_at(values, value_key!("vsix.identity"), "id") {
         id.identifier = Some(Claim::claimed(ext_id, "vsix.identity.id"));
         if id.name.is_none() {
             if let Some(tail) = ext_id.rsplit('.').next() {
@@ -607,49 +638,49 @@ fn vsix(values: &Values, id: &mut Identity) {
             }
         }
     }
-    if let Some(display) = get_str(values, "vsix.display_name") {
+    if let Some(display) = get_str(values, value_key!("vsix.display_name")) {
         id.name = Some(Claim::claimed(display, "vsix.display_name"));
     }
-    if let Some(version) = get_str(values, "vsix.identity.version") {
+    if let Some(version) = get_str_at(values, value_key!("vsix.identity"), "version") {
         id.version = Some(Claim::claimed(version, "vsix.identity.version"));
     }
-    if let Some(publisher) = get_str(values, "vsix.identity.publisher") {
+    if let Some(publisher) = get_str_at(values, value_key!("vsix.identity"), "publisher") {
         id.team_id = Some(Claim::claimed(publisher, "vsix.identity.publisher"));
     }
 }
 
 fn wheel(values: &Values, id: &mut Identity) {
-    if let Some(name) = get_str(values, "whl.distribution") {
+    if let Some(name) = get_str(values, value_key!("whl.distribution")) {
         id.name = Some(Claim::claimed(name, "whl.distribution"));
     }
-    if let Some(version) = get_str(values, "whl.version") {
+    if let Some(version) = get_str(values, value_key!("whl.version")) {
         id.version = Some(Claim::claimed(version, "whl.version"));
     }
     // Authorship from the dist-info METADATA. `*-email` fields may carry a
     // bare address or a `Name <email>` pair.
     let (a_name, a_email) = split_contact(
-        get_str(values, "whl.author"),
-        get_str(values, "whl.author_email"),
+        get_str(values, value_key!("whl.author")),
+        get_str(values, value_key!("whl.author_email")),
     );
     push_author(id, a_name, a_email, None, "author", "whl.author");
     let (m_name, m_email) = split_contact(
-        get_str(values, "whl.maintainer"),
-        get_str(values, "whl.maintainer_email"),
+        get_str(values, value_key!("whl.maintainer")),
+        get_str(values, value_key!("whl.maintainer_email")),
     );
     push_author(id, m_name, m_email, None, "maintainer", "whl.maintainer");
-    if let Some(home) = get_str(values, "whl.home_page") {
+    if let Some(home) = get_str(values, value_key!("whl.home_page")) {
         push_url(id, UrlKind::Homepage, home, "whl.home_page");
     }
 }
 
 fn jar(values: &Values, id: &mut Identity) {
-    if let Some(name) = get_str(values, "jar.manifest.implementation_title")
-        .or_else(|| get_str(values, "jar.pom.artifact_id"))
+    if let Some(name) = get_str_at(values, value_key!("jar.manifest"), "implementation_title")
+        .or_else(|| get_str_at(values, value_key!("jar.pom"), "artifact_id"))
     {
         id.name = Some(Claim::claimed(name, "jar.manifest.implementation_title"));
     }
-    if let Some(version) = get_str(values, "jar.manifest.implementation_version")
-        .or_else(|| get_str(values, "jar.pom.version"))
+    if let Some(version) = get_str_at(values, value_key!("jar.manifest"), "implementation_version")
+        .or_else(|| get_str_at(values, value_key!("jar.pom"), "version"))
     {
         id.version = Some(Claim::claimed(
             version,
@@ -658,36 +689,36 @@ fn jar(values: &Values, id: &mut Identity) {
     }
     // Maven coordinates form a stable `group:artifact` identifier.
     if let (Some(group), Some(artifact)) = (
-        get_str(values, "jar.pom.group_id"),
-        get_str(values, "jar.pom.artifact_id"),
+        get_str_at(values, value_key!("jar.pom"), "group_id"),
+        get_str_at(values, value_key!("jar.pom"), "artifact_id"),
     ) {
         id.identifier = Some(Claim::claimed(format!("{group}:{artifact}"), "jar.pom"));
     }
-    if let Some(vendor) = get_str(values, "jar.manifest.implementation_vendor")
-        .or_else(|| get_str(values, "jar.manifest.bundle_vendor"))
-        .or_else(|| get_str(values, "jar.manifest.specification_vendor"))
+    if let Some(vendor) = get_str_at(values, value_key!("jar.manifest"), "implementation_vendor")
+        .or_else(|| get_str_at(values, value_key!("jar.manifest"), "bundle_vendor"))
+        .or_else(|| get_str_at(values, value_key!("jar.manifest"), "specification_vendor"))
     {
         id.organization = Some(Claim::claimed(vendor, "jar.manifest.implementation_vendor"));
     }
-    if let Some(producer) = get_str(values, "jar.manifest.created_by") {
+    if let Some(producer) = get_str_at(values, value_key!("jar.manifest"), "created_by") {
         id.producer = Some(Claim::claimed(producer, "jar.manifest.created_by"));
     }
     // `Built-By` is the build account — an origin-host artifact, the JAR
     // analogue of a binary's embedded build path.
-    if let Some(built_by) = get_str(values, "jar.manifest.built_by") {
+    if let Some(built_by) = get_str_at(values, value_key!("jar.manifest"), "built_by") {
         id.unique_ids
             .insert("build_user".into(), built_by.to_string());
     }
 }
 
 fn gem(values: &Values, id: &mut Identity) {
-    if let Some(name) = get_str(values, "gem.name") {
+    if let Some(name) = get_str(values, value_key!("gem.name")) {
         id.name = Some(Claim::claimed(name, "gem.name"));
     }
-    if let Some(version) = get_str(values, "gem.version") {
+    if let Some(version) = get_str(values, value_key!("gem.version")) {
         id.version = Some(Claim::claimed(version, "gem.version"));
     }
-    for author in str_array(values, "gem.authors") {
+    for author in str_array(values, value_key!("gem.authors")) {
         push_author(
             id,
             Some(author.to_string()),
@@ -697,28 +728,28 @@ fn gem(values: &Values, id: &mut Identity) {
             "gem.authors",
         );
     }
-    if let Some(home) = get_str(values, "gem.homepage") {
+    if let Some(home) = get_str(values, value_key!("gem.homepage")) {
         push_url(id, UrlKind::Homepage, home, "gem.homepage");
     }
 }
 
 fn npm(values: &Values, id: &mut Identity) {
-    if let Some(name) = get_str(values, "npm.name") {
+    if let Some(name) = get_str(values, value_key!("npm.name")) {
         id.name = Some(Claim::claimed(name, "npm.name"));
         id.identifier = Some(Claim::claimed(name, "npm.name"));
     }
-    if let Some(version) = get_str(values, "npm.version") {
+    if let Some(version) = get_str(values, value_key!("npm.version")) {
         id.version = Some(Claim::claimed(version, "npm.version"));
     }
     push_author(
         id,
-        get_str(values, "npm.author.name").map(str::to_string),
-        get_str(values, "npm.author.email").map(str::to_string),
-        get_str(values, "npm.author.url").map(str::to_string),
+        get_str_at(values, value_key!("npm.author"), "name").map(str::to_string),
+        get_str_at(values, value_key!("npm.author"), "email").map(str::to_string),
+        get_str_at(values, value_key!("npm.author"), "url").map(str::to_string),
         "author",
         "npm.author",
     );
-    if let Some(JsonValue::Array(maintainers)) = values.get("npm.maintainers") {
+    if let Some(JsonValue::Array(maintainers)) = values.get_key(value_key!("npm.maintainers")) {
         for m in maintainers {
             push_author(
                 id,
@@ -734,59 +765,59 @@ fn npm(values: &Values, id: &mut Identity) {
             );
         }
     }
-    if let Some(repo) = get_str(values, "npm.repository.url") {
+    if let Some(repo) = get_str(values, value_key!("npm.repository.url")) {
         push_url(id, UrlKind::Repository, repo, "npm.repository.url");
     }
-    if let Some(home) = get_str(values, "npm.homepage") {
+    if let Some(home) = get_str(values, value_key!("npm.homepage")) {
         push_url(id, UrlKind::Homepage, home, "npm.homepage");
     }
 }
 
 fn rust_crate(values: &Values, id: &mut Identity) {
-    if let Some(name) = get_str(values, "crate.name") {
+    if let Some(name) = get_str(values, value_key!("crate.name")) {
         id.name = Some(Claim::claimed(name, "crate.name"));
         id.identifier = Some(Claim::claimed(name, "crate.name"));
     }
-    if let Some(version) = get_str(values, "crate.version") {
+    if let Some(version) = get_str(values, value_key!("crate.version")) {
         id.version = Some(Claim::claimed(version, "crate.version"));
     }
-    for author in str_array(values, "crate.authors") {
+    for author in str_array(values, value_key!("crate.authors")) {
         let (name, email, _) = parse_person(author);
         push_author(id, name, email, None, "author", "crate.authors");
     }
-    if let Some(repo) = get_str(values, "crate.repository") {
+    if let Some(repo) = get_str(values, value_key!("crate.repository")) {
         push_url(id, UrlKind::Repository, repo, "crate.repository");
     }
-    if let Some(home) = get_str(values, "crate.homepage") {
+    if let Some(home) = get_str(values, value_key!("crate.homepage")) {
         push_url(id, UrlKind::Homepage, home, "crate.homepage");
     }
 }
 
 fn python_sdist(values: &Values, id: &mut Identity) {
-    if let Some(name) = get_str(values, "python.name") {
+    if let Some(name) = get_str(values, value_key!("python.name")) {
         id.name = Some(Claim::claimed(name, "python.name"));
         id.identifier = Some(Claim::claimed(name, "python.name"));
     }
-    if let Some(version) = get_str(values, "python.version") {
+    if let Some(version) = get_str(values, value_key!("python.version")) {
         id.version = Some(Claim::claimed(version, "python.version"));
     }
     push_author(
         id,
-        get_str(values, "python.author.name").map(str::to_string),
-        get_str(values, "python.author.email").map(str::to_string),
+        get_str_at(values, value_key!("python.author"), "name").map(str::to_string),
+        get_str_at(values, value_key!("python.author"), "email").map(str::to_string),
         None,
         "author",
         "python.author",
     );
     push_author(
         id,
-        get_str(values, "python.maintainer.name").map(str::to_string),
-        get_str(values, "python.maintainer.email").map(str::to_string),
+        get_str_at(values, value_key!("python.maintainer"), "name").map(str::to_string),
+        get_str_at(values, value_key!("python.maintainer"), "email").map(str::to_string),
         None,
         "maintainer",
         "python.maintainer",
     );
-    if let Some(home) = get_str(values, "python.homepage") {
+    if let Some(home) = get_str(values, value_key!("python.homepage")) {
         push_url(id, UrlKind::Homepage, home, "python.homepage");
     }
 }
@@ -794,12 +825,12 @@ fn python_sdist(values: &Values, id: &mut Identity) {
 fn oci(values: &Values, id: &mut Identity) {
     // The first image ref is the closest thing an image bundle has to a name;
     // the config/manifest digest is its strongest unique identifier.
-    if let Some(first_ref) = str_array(values, "oci.ref").next() {
+    if let Some(first_ref) = str_array(values, value_key!("oci.ref")).next() {
         id.name = Some(Claim::claimed(first_ref, "oci.ref"));
     }
-    if let Some(digest) = str_array(values, "oci.config.digest")
+    if let Some(digest) = str_array(values, value_key!("oci.config.digest"))
         .next()
-        .or_else(|| str_array(values, "oci.manifest.digest").next())
+        .or_else(|| str_array(values, value_key!("oci.manifest.digest")).next())
     {
         id.identifier = Some(Claim::claimed(digest, "oci.config.digest"));
         id.unique_ids
@@ -808,32 +839,32 @@ fn oci(values: &Values, id: &mut Identity) {
 }
 
 fn rpm(values: &Values, id: &mut Identity) {
-    if let Some(name) = get_str(values, "rpm.name") {
+    if let Some(name) = get_str(values, value_key!("rpm.name")) {
         id.name = Some(Claim::claimed(name, "rpm.name"));
     }
-    if let Some(version) = get_str(values, "rpm.version") {
+    if let Some(version) = get_str(values, value_key!("rpm.version")) {
         id.version = Some(Claim::claimed(version, "rpm.version"));
     }
-    if let Some(vendor) = get_str(values, "rpm.vendor") {
+    if let Some(vendor) = get_str(values, value_key!("rpm.vendor")) {
         id.organization = Some(Claim::claimed(vendor, "rpm.vendor"));
     }
-    if let Some(packager) = get_str(values, "rpm.packager") {
+    if let Some(packager) = get_str(values, value_key!("rpm.packager")) {
         let (name, email, url) = parse_person(packager);
         push_author(id, name, email, url, "packager", "rpm.packager");
     }
-    if let Some(url) = get_str(values, "rpm.url") {
+    if let Some(url) = get_str(values, value_key!("rpm.url")) {
         push_url(id, UrlKind::Homepage, url, "rpm.url");
     }
 }
 
 fn deb(values: &Values, id: &mut Identity) {
-    if let Some(name) = get_str(values, "deb.package") {
+    if let Some(name) = get_str(values, value_key!("deb.package")) {
         id.name = Some(Claim::claimed(name, "deb.package"));
     }
-    if let Some(version) = get_str(values, "deb.version") {
+    if let Some(version) = get_str(values, value_key!("deb.version")) {
         id.version = Some(Claim::claimed(version, "deb.version"));
     }
-    if let Some(maintainer) = get_str(values, "deb.maintainer") {
+    if let Some(maintainer) = get_str(values, value_key!("deb.maintainer")) {
         let (name, email, url) = parse_person(maintainer);
         push_author(id, name, email, url, "maintainer", "deb.maintainer");
     }
@@ -845,29 +876,30 @@ fn deb(values: &Values, id: &mut Identity) {
 /// deb / rpm / Alpine one-line synopsis, and a PE's `FileDescription`. Each is
 /// emitted only by its own format's extractor, so the first present key is the
 /// artifact's.
-const DESCRIPTION_KEYS: &[&str] = &[
-    "npm.description",
-    "whl.summary",
-    "python.summary",
-    "crate.description",
-    "gem.summary",
-    "nupkg.description",
-    "vsix.description",
-    "crx.description",
-    "xpi.description",
-    "deb.summary",
-    "rpm.summary",
-    "apk.pkgdesc",
-    "pe.version.description",
+const DESCRIPTION_KEYS: &[ValueKey] = &[
+    value_key!("npm.description"),
+    value_key!("whl.summary"),
+    value_key!("python.summary"),
+    value_key!("crate.description"),
+    value_key!("gem.summary"),
+    value_key!("nupkg.description"),
+    value_key!("vsix.description"),
+    value_key!("crx.description"),
+    value_key!("xpi.description"),
+    value_key!("deb.summary"),
+    value_key!("rpm.summary"),
+    value_key!("apk.pkgdesc"),
+    value_key!("pe.version.description"),
 ];
 
-/// Copyright notice keys: a PE's `LegalCopyright`, then a Mach-O's embedded
-/// `__info_plist` notice, then that plist's older `CFBundleGetInfoString`
-/// (conventionally `"<version>, Copyright <holder>"`).
-const COPYRIGHT_KEYS: &[&str] = &[
-    "pe.version.copyright",
-    "macho.info_plist.NSHumanReadableCopyright",
-    "macho.info_plist.CFBundleGetInfoString",
+/// Copyright notice fields, as a key and the path below it: a PE's
+/// `LegalCopyright`, then a Mach-O's embedded `__info_plist` notice, then that
+/// plist's older `CFBundleGetInfoString` (conventionally
+/// `"<version>, Copyright <holder>"`).
+const COPYRIGHT_FIELDS: &[(ValueKey, &str)] = &[
+    (value_key!("pe.version.copyright"), ""),
+    (value_key!("macho.info_plist"), "NSHumanReadableCopyright"),
+    (value_key!("macho.info_plist"), "CFBundleGetInfoString"),
 ];
 
 /// Longest self-description kept, in characters: a sentence, not a README.
@@ -879,8 +911,17 @@ const MAX_DESCRIPTION: usize = 160;
 fn description(values: &Values, id: &mut Identity) {
     id.description = first_claim(values, DESCRIPTION_KEYS)
         .and_then(|(raw, src)| Some(Claim::claimed(one_line(raw)?, src)));
-    id.copyright = first_claim(values, COPYRIGHT_KEYS)
-        .and_then(|(raw, src)| Some(Claim::claimed(one_line(raw)?, src)));
+    id.copyright = COPYRIGHT_FIELDS
+        .iter()
+        .find_map(|&(key, field)| Some((get_str_at(values, key, field)?, key, field)))
+        .and_then(|(raw, key, field)| {
+            let src = if field.is_empty() {
+                key.to_string()
+            } else {
+                format!("{key}.{field}")
+            };
+            Some(Claim::claimed(one_line(raw)?, src))
+        });
 }
 
 /// `raw` with whitespace collapsed and cut to [`MAX_DESCRIPTION`], or `None`
@@ -914,10 +955,10 @@ fn one_line(raw: &str) -> Option<String> {
 /// OLE2 (`.doc`/`.xls`/`.ppt`) and OOXML (`.docx`/…) both expose their
 /// document properties under the shared `office.*` namespace.
 fn office(values: &Values, id: &mut Identity) {
-    if let Some(title) = get_str(values, "office.title") {
+    if let Some(title) = get_str(values, value_key!("office.title")) {
         id.title = Some(Claim::claimed(title, "office.title"));
     }
-    if let Some(creator) = get_str(values, "office.creator") {
+    if let Some(creator) = get_str(values, value_key!("office.creator")) {
         push_author(
             id,
             Some(creator.to_string()),
@@ -927,7 +968,7 @@ fn office(values: &Values, id: &mut Identity) {
             "office.creator",
         );
     }
-    if let Some(modifier) = get_str(values, "office.last_modified_by") {
+    if let Some(modifier) = get_str(values, value_key!("office.last_modified_by")) {
         push_author(
             id,
             Some(modifier.to_string()),
@@ -937,7 +978,7 @@ fn office(values: &Values, id: &mut Identity) {
             "office.last_modified_by",
         );
     }
-    if let Some(manager) = get_str(values, "office.manager") {
+    if let Some(manager) = get_str(values, value_key!("office.manager")) {
         push_author(
             id,
             Some(manager.to_string()),
@@ -947,19 +988,19 @@ fn office(values: &Values, id: &mut Identity) {
             "office.manager",
         );
     }
-    if let Some(company) = get_str(values, "office.company") {
+    if let Some(company) = get_str(values, value_key!("office.company")) {
         id.organization = Some(Claim::claimed(company, "office.company"));
     }
-    if let Some(app) = get_str(values, "office.application") {
+    if let Some(app) = get_str(values, value_key!("office.application")) {
         id.producer = Some(Claim::claimed(app, "office.application"));
     }
 }
 
 fn pdf(values: &Values, id: &mut Identity) {
-    if let Some(title) = get_str(values, "pdf.info.title") {
+    if let Some(title) = get_str_at(values, value_key!("pdf.info"), "title") {
         id.title = Some(Claim::claimed(title, "pdf.info.title"));
     }
-    if let Some(author) = get_str(values, "pdf.info.author") {
+    if let Some(author) = get_str_at(values, value_key!("pdf.info"), "author") {
         push_author(
             id,
             Some(author.to_string()),
@@ -969,18 +1010,18 @@ fn pdf(values: &Values, id: &mut Identity) {
             "pdf.info.author",
         );
     }
-    if let Some(producer) =
-        get_str(values, "pdf.info.producer").or_else(|| get_str(values, "pdf.info.creator"))
+    if let Some(producer) = get_str_at(values, value_key!("pdf.info"), "producer")
+        .or_else(|| get_str_at(values, value_key!("pdf.info"), "creator"))
     {
         id.producer = Some(Claim::claimed(producer, "pdf.info.producer"));
     }
 }
 
 fn rtf(values: &Values, id: &mut Identity) {
-    if let Some(title) = get_str(values, "rtf.info.title") {
+    if let Some(title) = get_str_at(values, value_key!("rtf.info"), "title") {
         id.title = Some(Claim::claimed(title, "rtf.info.title"));
     }
-    if let Some(author) = get_str(values, "rtf.info.author") {
+    if let Some(author) = get_str_at(values, value_key!("rtf.info"), "author") {
         push_author(
             id,
             Some(author.to_string()),
@@ -990,13 +1031,13 @@ fn rtf(values: &Values, id: &mut Identity) {
             "rtf.info.author",
         );
     }
-    if let Some(company) = get_str(values, "rtf.info.company") {
+    if let Some(company) = get_str_at(values, value_key!("rtf.info"), "company") {
         id.organization = Some(Claim::claimed(company, "rtf.info.company"));
     }
 }
 
 fn png(values: &Values, id: &mut Identity) {
-    if let Some(software) = get_str(values, "png.text.software") {
+    if let Some(software) = get_str_at(values, value_key!("png.text"), "software") {
         id.producer = Some(Claim::claimed(software, "png.text.software"));
     }
 }
@@ -1008,26 +1049,31 @@ fn png(values: &Values, id: &mut Identity) {
 /// is whatever its owner named it. Neither is chosen for distribution, which
 /// is what makes them useful for grouping a campaign's shortcuts together.
 fn lnk(values: &Values, id: &mut Identity) {
-    if let Some(machine) = get_str(values, "lnk.tracker.machine_id") {
+    if let Some(machine) = get_str_at(values, value_key!("lnk.tracker"), "machine_id") {
         id.unique_ids
             .insert("machine_id".into(), machine.to_string());
     }
-    if let Some(mac) = get_str(values, "lnk.tracker.mac_address") {
+    if let Some(mac) = get_str_at(values, value_key!("lnk.tracker"), "mac_address") {
         id.unique_ids.insert("mac_address".into(), mac.to_string());
     }
-    if let Some(serial) = values.get("lnk.volume.serial").and_then(|v| {
-        v.as_u64()
-            .map(|n| n.to_string())
-            .or_else(|| v.as_str().map(str::to_string))
-    }) {
+    if let Some(serial) = values
+        .get_key_at(value_key!("lnk.volume"), "serial")
+        .and_then(|v| {
+            v.as_u64()
+                .map(|n| n.to_string())
+                .or_else(|| v.as_str().map(str::to_string))
+        })
+    {
         id.unique_ids.insert("lnk_volume_serial".into(), serial);
     }
-    if let Some(label) = get_str(values, "lnk.volume.name") {
+    if let Some(label) = get_str_at(values, value_key!("lnk.volume"), "name") {
         id.unique_ids
             .insert("lnk_volume_label".into(), label.to_string());
     }
-    // The build machine's own name, when the shortcut carries a tracker.
-    if let Some(host) = get_str(values, "lnk.tracker.machine_name") {
+    // The build machine's own name, when the shortcut carries a tracker. The
+    // TrackerDataBlock calls its NetBIOS name `MachineID`, so that is the
+    // field the extractor writes.
+    if let Some(host) = get_str_at(values, value_key!("lnk.tracker"), "machine_id") {
         id.unique_ids
             .insert("lnk_machine_name".into(), host.to_string());
     }
@@ -1039,10 +1085,10 @@ fn lnk(values: &Values, id: &mut Identity) {
 
 fn build_path(bytes: &[u8], values: &Values, id: &mut Identity) {
     let mut candidates: Vec<(String, &'static str)> = Vec::new();
-    if let Some(pdb) = get_str(values, "pe.debug.pdb.path") {
+    if let Some(pdb) = get_str(values, value_key!("pe.debug.pdb.path")) {
         candidates.push((pdb.to_string(), "pe.debug.pdb.path"));
     }
-    for dir in str_array(values, "elf.dwarf.comp_dirs") {
+    for dir in str_array(values, value_key!("elf.dwarf.comp_dirs")) {
         candidates.push((dir.to_string(), "elf.dwarf.comp_dirs"));
     }
     // Fall back to a byte scan only when no structured build path was
@@ -1322,8 +1368,8 @@ fn source(values: &Values, id: &mut Identity) {
     let display = first_claim(
         values,
         &[
-            "source.wordpress.plugin_name",
-            "source.wordpress.theme_name",
+            value_key!("source.wordpress.plugin_name"),
+            value_key!("source.wordpress.theme_name"),
         ],
     );
     if let Some((name, src)) = display {
@@ -1337,9 +1383,9 @@ fn source(values: &Values, id: &mut Identity) {
     let name = first_claim(
         values,
         &[
-            "source.wordpress.slug",
-            "source.wordpress.text_domain",
-            "source.autoconf.name",
+            value_key!("source.wordpress.slug"),
+            value_key!("source.wordpress.text_domain"),
+            value_key!("source.autoconf.name"),
         ],
     )
     .or(display);
@@ -1348,7 +1394,10 @@ fn source(values: &Values, id: &mut Identity) {
     }
     let version = first_claim(
         values,
-        &["source.wordpress.version", "source.autoconf.version"],
+        &[
+            value_key!("source.wordpress.version"),
+            value_key!("source.autoconf.version"),
+        ],
     );
     if let Some((v, src)) = version {
         id.version.get_or_insert_with(|| Claim::claimed(v, src));
@@ -1357,9 +1406,9 @@ fn source(values: &Values, id: &mut Identity) {
 
 /// The first present key's `(value, key)` — the value plus the field to
 /// credit it to, so a claim records where it actually came from.
-fn first_claim<'a>(values: &'a Values, keys: &[&'static str]) -> Option<(&'a str, &'static str)> {
+fn first_claim<'a>(values: &'a Values, keys: &[ValueKey]) -> Option<(&'a str, &'static str)> {
     keys.iter()
-        .find_map(|&k| get_str(values, k).map(|v| (v, k)))
+        .find_map(|&k| get_str(values, k).map(|v| (v, k.as_str())))
 }
 
 // ---------------------------------------------------------------------
@@ -1384,7 +1433,7 @@ fn filename_fallback(values: &Values, id: &mut Identity) {
     if id.name.is_some() {
         return;
     }
-    let Some(base) = get_str(values, "file.basename") else {
+    let Some(base) = get_str(values, value_key!("file.basename")) else {
         return;
     };
     let Some((name, version)) = split_name_version(base) else {
@@ -1454,13 +1503,20 @@ fn strip_date_prefix(stem: &str) -> &str {
     }
 }
 
-fn get_str<'a>(values: &'a Values, key: &str) -> Option<&'a str> {
-    values.get(key).and_then(JsonValue::as_str)
+fn get_str(values: &Values, key: ValueKey) -> Option<&str> {
+    values.get_key(key).and_then(JsonValue::as_str)
 }
 
-fn str_array<'a>(values: &'a Values, key: &str) -> impl Iterator<Item = &'a str> {
+/// [`get_str`] for the path `rest` below `key`: a field of an object the
+/// writer emits whole (`pdf.info` → `title`) or an array element
+/// (`pe.signatures` → `[0].thumbprint_sha256`).
+fn get_str_at<'a>(values: &'a Values, key: ValueKey, rest: &str) -> Option<&'a str> {
+    values.get_key_at(key, rest).and_then(JsonValue::as_str)
+}
+
+fn str_array(values: &Values, key: ValueKey) -> impl Iterator<Item = &str> {
     values
-        .get(key)
+        .get_key(key)
         .and_then(JsonValue::as_array)
         .into_iter()
         .flatten()
@@ -1479,9 +1535,9 @@ fn split_list(value: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-fn flag_set(values: &Values, key: &str, flag: &str) -> bool {
+fn flag_set(values: &Values, key: ValueKey, flag: &str) -> bool {
     values
-        .get(key)
+        .get_key(key)
         .and_then(JsonValue::as_array)
         .is_some_and(|a| a.iter().filter_map(JsonValue::as_str).any(|s| s == flag))
 }
@@ -1593,6 +1649,7 @@ mod filename_tests {
 #[cfg(test)]
 mod go_module_identity_tests {
     use super::{Claim, Identity, Values, go_module};
+    use crate::value_key;
 
     fn go_values(prefix: &str, module: &serde_json::Value) -> Values {
         let mut v = Values::default();
@@ -1610,7 +1667,7 @@ mod go_module_identity_tests {
             &serde_json::json!({"path": "github.com/gitleaks/gitleaks", "version": "v8.18.0"}),
         );
         let mut id = Identity::default();
-        go_module("pe", &values, &mut id);
+        go_module(value_key!("pe.go"), &values, &mut id);
         assert_eq!(id.project.unwrap().value, "github.com/gitleaks/gitleaks");
         assert_eq!(id.version.unwrap().value, "v8.18.0");
     }
@@ -1625,7 +1682,7 @@ mod go_module_identity_tests {
             project: Some(Claim::claimed("Acme Suite", "pe.version.product_name")),
             ..Identity::default()
         };
-        go_module("elf", &values, &mut id);
+        go_module(value_key!("elf.go"), &values, &mut id);
         assert_eq!(id.project.unwrap().value, "Acme Suite");
         assert!(id.version.is_none(), "`(devel)` is not a version");
     }

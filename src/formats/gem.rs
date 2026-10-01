@@ -25,6 +25,7 @@ use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::output::{Metrics, Values};
+use crate::value_key;
 
 use super::structured::parse_yaml;
 
@@ -50,20 +51,29 @@ pub(super) fn extract(
     };
 
     if let Some(name) = field_str(&spec, "name") {
-        values.insert("gem.name", JsonValue::String(name.to_string()));
+        values.insert_key(value_key!("gem.name"), JsonValue::String(name.to_string()));
     }
     // `version` is a nested `!ruby/object:Gem::Version` mapping: { version: x }.
     if let Some(version) = spec.get("version").and_then(|v| field_str(v, "version")) {
-        values.insert("gem.version", JsonValue::String(version.to_string()));
+        values.insert_key(
+            value_key!("gem.version"),
+            JsonValue::String(version.to_string()),
+        );
     }
     if let Some(platform) = field_str(&spec, "platform") {
         values.insert("gem.platform", JsonValue::String(platform.to_string()));
     }
     if let Some(summary) = field_str(&spec, "summary") {
-        values.insert("gem.summary", JsonValue::String(summary.to_string()));
+        values.insert_key(
+            value_key!("gem.summary"),
+            JsonValue::String(summary.to_string()),
+        );
     }
     if let Some(homepage) = field_str(&spec, "homepage") {
-        values.insert("gem.homepage", JsonValue::String(homepage.to_string()));
+        values.insert_key(
+            value_key!("gem.homepage"),
+            JsonValue::String(homepage.to_string()),
+        );
     }
 
     // `licenses` (plural, a sequence) is current; `license` (singular) is the
@@ -86,7 +96,7 @@ pub(super) fn extract(
         }
     }
     if !authors.is_empty() {
-        values.insert("gem.authors", string_array(&authors));
+        values.insert_key(value_key!("gem.authors"), string_array(&authors));
     }
 
     extract_dependencies(&spec, values, metrics);
@@ -160,7 +170,10 @@ fn extract_dependencies(spec: &JsonValue, values: &mut Values, metrics: &mut Met
         development_count as f64,
     );
     if !runtime.is_empty() {
-        values.insert("gem.runtime_dependencies", string_array(&runtime));
+        values.insert_key(
+            value_key!("gem.runtime_dependencies"),
+            string_array(&runtime),
+        );
     }
 }
 

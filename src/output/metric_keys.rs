@@ -58,7 +58,7 @@ impl std::fmt::Display for MetricKey {
 }
 
 /// `str` equality usable from a `const` context.
-const fn str_eq(a: &str, b: &str) -> bool {
+pub(super) const fn str_eq(a: &str, b: &str) -> bool {
     let (mut a, mut b) = (a.as_bytes(), b.as_bytes());
     loop {
         match (a, b) {

@@ -19,6 +19,7 @@ use flate2::read::GzDecoder;
 
 use crate::fileid::FileType;
 use crate::output::Values;
+use crate::value_key;
 
 /// WordPress reads plugin/theme headers from the first 8 KiB of a file; so
 /// do we. Also the cap on how much of any candidate member we inflate.
@@ -81,15 +82,15 @@ fn wordpress_header(text: &str, values: &mut Values) -> bool {
         field.get_or_insert(value);
     }
     match (plugin, theme) {
-        (Some(p), _) => values.insert("source.wordpress.plugin_name", p.into()),
-        (None, Some(t)) => values.insert("source.wordpress.theme_name", t.into()),
+        (Some(p), _) => values.insert_key(value_key!("source.wordpress.plugin_name"), p.into()),
+        (None, Some(t)) => values.insert_key(value_key!("source.wordpress.theme_name"), t.into()),
         (None, None) => return false, // Version alone is not a WP header.
     }
     if let Some(td) = text_domain {
-        values.insert("source.wordpress.text_domain", td.into());
+        values.insert_key(value_key!("source.wordpress.text_domain"), td.into());
     }
     if let Some(v) = version {
-        values.insert("source.wordpress.version", v.into());
+        values.insert_key(value_key!("source.wordpress.version"), v.into());
     }
     true
 }
@@ -131,9 +132,9 @@ fn autoconf_ac_init(text: &str, values: &mut Values) -> bool {
     {
         return false;
     }
-    values.insert("source.autoconf.name", name.into());
+    values.insert_key(value_key!("source.autoconf.name"), name.into());
     if !version.is_empty() && !version.contains('$') && !version.starts_with("m4_") {
-        values.insert("source.autoconf.version", version.into());
+        values.insert_key(value_key!("source.autoconf.version"), version.into());
     }
     true
 }
@@ -161,10 +162,10 @@ fn configure_package_vars(text: &str, values: &mut Values) -> bool {
     let mut found = false;
     for line in text.lines() {
         if let Some(v) = configure_var(line, "PACKAGE_TARNAME") {
-            values.insert("source.autoconf.name", v.into());
+            values.insert_key(value_key!("source.autoconf.name"), v.into());
             found = true;
         } else if let Some(v) = configure_var(line, "PACKAGE_VERSION") {
-            values.insert("source.autoconf.version", v.into());
+            values.insert_key(value_key!("source.autoconf.version"), v.into());
             found = true;
         }
     }
@@ -238,7 +239,7 @@ fn probe_members(members: &[(String, Vec<u8>)], values: &mut Values) {
                 && !dir.is_empty()
                 && dir.len() <= MAX_SLUG
             {
-                values.insert("source.wordpress.slug", dir.into());
+                values.insert_key(value_key!("source.wordpress.slug"), dir.into());
             }
         }
         if !ac_done {

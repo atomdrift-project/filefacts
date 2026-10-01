@@ -45,6 +45,7 @@
 //! by content hash knows exactly which one field to recompute or drop.
 
 use crate::metric;
+use crate::value_key;
 use serde_json::{Map, Value as JsonValue};
 
 use crate::Values;
@@ -74,7 +75,7 @@ fn severity(state: &str) -> u8 {
 /// derivation stays a pure function — the same convention `registry::with_age`
 /// uses for its wall-clock-relative fields.
 pub(super) fn derive(values: &mut Values, metrics: &mut Metrics, now: i64) {
-    let Some(JsonValue::Array(signatures)) = values.get("pe.signatures") else {
+    let Some(JsonValue::Array(signatures)) = values.get_key(value_key!("pe.signatures")) else {
         return;
     };
     let signatures = signatures.clone();
@@ -97,7 +98,10 @@ pub(super) fn derive(values: &mut Values, metrics: &mut Metrics, now: i64) {
         })
         .collect();
 
-    values.insert("pe.signatures", JsonValue::Array(annotated.clone()));
+    values.insert_key(
+        value_key!("pe.signatures"),
+        JsonValue::Array(annotated.clone()),
+    );
     values.insert(
         "pe.signature_integrity",
         JsonValue::String(worst.to_string()),
@@ -149,7 +153,9 @@ fn annotate(obj: &mut Map<String, JsonValue>, values: &Values) -> &'static str {
 fn digest_matches(obj: &Map<String, JsonValue>, values: &Values) -> Option<bool> {
     let claimed = obj.get("signature_digest")?.as_str()?;
     let alg = obj.get("signature_digest_algorithm")?.as_str()?;
-    let recomputed = values.get(&format!("pe.image_hash.{alg}"))?.as_str()?;
+    let recomputed = values
+        .get_key_at(value_key!("pe.image_hash"), alg)?
+        .as_str()?;
     Some(claimed.eq_ignore_ascii_case(recomputed))
 }
 

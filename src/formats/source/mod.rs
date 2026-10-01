@@ -646,7 +646,7 @@ pub(crate) fn supports(file_type: FileType) -> bool {
     langs::config_for(file_type).is_some()
 }
 
-/// Resolve `file_type` to its tree-sitter [`Language`]. Used by callers
+/// Resolve `file_type` to its tree-sitter [`Language`](tree_sitter::Language). Used by callers
 /// that want to compile a tree-sitter query against the same grammar
 /// filefacts uses internally — e.g. rule-engine load-time validation.
 pub(crate) fn tree_sitter_language(file_type: FileType) -> Option<tree_sitter::Language> {
@@ -656,7 +656,7 @@ pub(crate) fn tree_sitter_language(file_type: FileType) -> Option<tree_sitter::L
 /// Emit text-level metrics (`text.*`) without a tree-sitter parse.
 ///
 /// Called from the format dispatcher for text-like languages that
-/// don't yet have a [`LangConfig`] entry (Vbs, Batch, …). Only emits
+/// don't yet have a [`LangConfig`](langs::LangConfig) entry (Vbs, Batch, …). Only emits
 /// the byte-level / line-level / whitespace metrics that don't need
 /// an AST — language-agnostic by construction.
 pub(crate) fn extract_text_only(bytes: &[u8], metrics: &mut Metrics) {

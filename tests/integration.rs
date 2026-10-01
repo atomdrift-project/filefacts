@@ -1215,7 +1215,8 @@ fn build_minimal_iso(
         if name.len().is_multiple_of(2) {
             b.push(0); // pad the name field to an even length
         }
-        b[0] = b.len() as u8;
+        let len = b.len() as u8;
+        *b.first_mut().expect("a directory record has a length byte") = len;
         b
     }
 
@@ -1305,7 +1306,9 @@ fn build_minimal_iso(
     let mut img = vec![0_u8; total as usize * SECTOR];
     let mut put = |lba: u32, blob: &[u8]| {
         let start = lba as usize * SECTOR;
-        img[start..start + blob.len()].copy_from_slice(blob);
+        img.get_mut(start..start + blob.len())
+            .expect("every blob fits the image")
+            .copy_from_slice(blob);
     };
 
     put(
@@ -1559,9 +1562,11 @@ fn overlay_of(bytes: &[u8]) -> Option<(u64, u64)> {
     let entropy = metrics
         .fact("binary.overlay_entropy")
         .expect("overlay entropy");
-    assert_eq!(entropy.spans.len(), 1);
-    assert_eq!(entropy.spans[0].len, size);
-    Some((entropy.spans[0].offset, size))
+    let [span] = entropy.spans.as_slice() else {
+        panic!("one overlay span, got {:?}", entropy.spans);
+    };
+    assert_eq!(span.len, size);
+    Some((span.offset, size))
 }
 
 /// Mach-O's last segment is `__LINKEDIT`, which has no sections but holds

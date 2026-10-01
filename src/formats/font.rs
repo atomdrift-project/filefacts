@@ -716,7 +716,7 @@ enum RegionKind {
 }
 
 /// Examine one region and fold what it contains into the stowaway verdict.
-/// Classification itself is [`carrier::classify_region`], shared with every
+/// Classification itself is [`super::carrier::classify_region`], shared with every
 /// other container so a payload is named the same way wherever it hides.
 fn note_region(bytes: &[u8], start: u64, end: u64, report: &mut Report, kind: RegionKind) {
     let (Ok(start), Ok(end)) = (usize::try_from(start), usize::try_from(end)) else {

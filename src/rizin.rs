@@ -517,7 +517,7 @@ pub fn cache_fingerprint() -> String {
     }
 }
 
-/// [`recover`] with the caller's static symbol inventory size, which picks
+/// Run rizin recovery sized to the caller's static symbol inventory, which picks
 /// the analysis depth (see [`analysis_script`]).
 pub(crate) fn recover_with_symbols(
     bytes: &[u8],
@@ -1210,7 +1210,7 @@ impl RizinRecovery {
         self.apply_inner(symbols_out, None, metrics)
     }
 
-    /// Variant of [`apply`] that also recovers sections. PE / ELF /
+    /// Variant of [`Self::apply`] that also recovers sections. PE / ELF /
     /// Mach-O extractors call this when goblin returned an empty
     /// section table (packed binaries are the common case).
     pub(crate) fn apply_with_sections(

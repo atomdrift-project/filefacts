@@ -29,6 +29,7 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
 
 use crate::output::{Metrics, Values};
+use crate::value_key;
 
 /// Maximum source-file names to retain. Real binaries can have
 /// thousands of CUs (one per .o); we just need enough for attribution.
@@ -117,14 +118,14 @@ pub(super) fn emit(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &m
     }
 
     if !producers.is_empty() {
-        values.insert(
-            "elf.dwarf.producers",
+        values.insert_key(
+            value_key!("elf.dwarf.producers"),
             JsonValue::Array(producers.into_iter().map(JsonValue::String).collect()),
         );
     }
     if !comp_dirs.is_empty() {
-        values.insert(
-            "elf.dwarf.comp_dirs",
+        values.insert_key(
+            value_key!("elf.dwarf.comp_dirs"),
             JsonValue::Array(comp_dirs.into_iter().map(JsonValue::String).collect()),
         );
     }

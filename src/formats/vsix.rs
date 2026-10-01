@@ -27,6 +27,7 @@ use serde_json::Value as JsonValue;
 use crate::error::Error;
 use crate::formats::common::{XorScan, extract_binary_strings, put_str};
 use crate::output::{Errors, Metrics, Stage, Strings, Values};
+use crate::value_key;
 
 /// Manifests above this are not legitimate — stop reading rather than
 /// buffer a zip-bomb member.
@@ -116,14 +117,14 @@ pub(super) fn extract(
             put_str(values, "vsix.target_platform", v.to_string());
         }
         if !identity.is_empty() {
-            values.insert("vsix.identity", JsonValue::Object(identity));
+            values.insert_key(value_key!("vsix.identity"), JsonValue::Object(identity));
         }
     }
 
     // <DisplayName>…</DisplayName>, <Description>…</Description>
     for (tag, key) in [
-        ("DisplayName", "vsix.display_name"),
-        ("Description", "vsix.description"),
+        ("DisplayName", value_key!("vsix.display_name")),
+        ("Description", value_key!("vsix.description")),
     ] {
         if let Some(node) = doc.descendants().find(|n| n.has_tag_name(tag)) {
             if let Some(text) = node.text() {
@@ -189,7 +190,7 @@ pub(super) fn extract(
         .filter(|v| v.as_object().is_some_and(|o| !o.is_empty()))
         .collect();
     if !deps.is_empty() {
-        values.insert("vsix.dependencies", JsonValue::Array(deps));
+        values.insert_key(value_key!("vsix.dependencies"), JsonValue::Array(deps));
     }
 
     // <Asset Type="…" Path="…" /> — file roster within the VSIX

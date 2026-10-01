@@ -30,6 +30,7 @@ use serde_json::{Value as JsonValue, json};
 use crate::formats::common::bytes_at::u32_le;
 use crate::formats::common::{hex_encode, put_str, put_u64};
 use crate::output::Values;
+use crate::value_key;
 
 const RICH_MAGIC: &[u8; 4] = b"Rich";
 // "DanS" little-endian read as u32: 'D'=0x44, 'a'=0x61, 'n'=0x6e, 'S'=0x53.
@@ -110,7 +111,7 @@ fn emit(words: &[u32], key: u32, raw_table: &[u8], values: &mut Values) {
     }
 
     put_u64(values, "pe.rich.key", u64::from(key));
-    values.insert("pe.rich.entries", JsonValue::Array(entries));
+    values.insert_key(value_key!("pe.rich.entries"), JsonValue::Array(entries));
 
     // The "rich hash" is MD5 over the *decrypted* table bytes (DanS
     // through last entry, post-XOR). Distinct from "rich pv hash"

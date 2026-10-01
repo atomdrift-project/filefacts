@@ -31,6 +31,7 @@ use crate::metric;
 use crate::output::{
     ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Metrics, Values,
 };
+use crate::value_key;
 
 const MAX_SFX: usize = 1024 * 1024;
 const MAX_HEADER: usize = 2 * 1024 * 1024;
@@ -1287,7 +1288,10 @@ fn emit(
         values.insert("rar.volume_number", JsonValue::Number(n.into()));
     }
     if let Some(ref name) = ar.original_name {
-        values.insert("rar.original_name", JsonValue::String(name.clone()));
+        values.insert_key(
+            value_key!("rar.original_name"),
+            JsonValue::String(name.clone()),
+        );
     }
     if let Some(t) = ar.created_unix {
         values.insert("rar.created_unix", JsonValue::Number(t.into()));

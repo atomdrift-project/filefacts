@@ -25,6 +25,7 @@ use serde_json::Value as JsonValue;
 use crate::formats::common::bytes_at::u16_le;
 use crate::formats::common::{put_str, put_u64};
 use crate::output::{Metrics, Values};
+use crate::value_key;
 
 pub(super) fn extract(
     info: &VersionInfo<'_>,
@@ -148,7 +149,7 @@ fn walk_version_block(
     {
         put_u64(
             values,
-            &format!("pe.version.{leaf}_offset"),
+            format!("pe.version.{leaf}_offset"),
             value_off as u64,
         );
     }
@@ -356,31 +357,31 @@ fn string_table(strings: &StringFileInfo<'_>, values: &mut Values) {
     // we honour the *concepts* but keep the path style consistent with
     // the rest of filefacts.
     if let Some(v) = strings.company_name() {
-        put_str(values, "pe.version.company", v);
+        put_str(values, value_key!("pe.version.company"), v);
     }
     if let Some(v) = strings.file_description() {
-        put_str(values, "pe.version.description", v);
+        put_str(values, value_key!("pe.version.description"), v);
     }
     if let Some(v) = strings.file_version() {
-        put_str(values, "pe.version.file_version", v);
+        put_str(values, value_key!("pe.version.file_version"), v);
     }
     if let Some(v) = strings.internal_name() {
-        put_str(values, "pe.version.internal_name", v);
+        put_str(values, value_key!("pe.version.internal_name"), v);
     }
     if let Some(v) = strings.legal_copyright() {
-        put_str(values, "pe.version.copyright", v);
+        put_str(values, value_key!("pe.version.copyright"), v);
     }
     if let Some(v) = strings.legal_trademarks() {
         put_str(values, "pe.version.trademarks", v);
     }
     if let Some(v) = strings.original_filename() {
-        put_str(values, "pe.version.original_filename", v);
+        put_str(values, value_key!("pe.version.original_filename"), v);
     }
     if let Some(v) = strings.product_name() {
-        put_str(values, "pe.version.product_name", v);
+        put_str(values, value_key!("pe.version.product_name"), v);
     }
     if let Some(v) = strings.product_version() {
-        put_str(values, "pe.version.product_version", v);
+        put_str(values, value_key!("pe.version.product_version"), v);
     }
     if let Some(v) = strings.comments() {
         put_str(values, "pe.version.comments", v);

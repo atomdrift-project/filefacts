@@ -1,7 +1,7 @@
 //! Bounded, static AppleScript bytecode analysis. No Apple events are executed.
 //!
 //! Parser contract: vector `items` EXCLUDE the runtime tag. A Bytes node's
-//! `offset` MUST address data[0], not its serialized object header. Function
+//! `offset` MUST address `data[0]`, not its serialized object header. Function
 //! offsets address the function node; call/recovery offsets address opcodes.
 //!
 //! Opcode names, widths and function layout are based on disassembler.py and

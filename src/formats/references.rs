@@ -3,7 +3,7 @@
 //! across formats into [`Reference`] rows.
 //!
 //! Mirrors [`super::identity`]: format parsers write `values`, and
-//! [`derive`] reads them back into one typed view. PURL is preferred over
+//! [`derive()`] reads them back into one typed view. PURL is preferred over
 //! a raw URL wherever the ecosystem is identifiable, for disambiguation; an
 //! intra-artifact target is a [`RefLocator::Path`].
 
@@ -14,6 +14,7 @@ use serde_json::Value as JsonValue;
 
 use crate::fileid::FileType;
 use crate::output::{HashAlgo, PinnedHash, RefKind, RefLocator, Reference, Values};
+use crate::value_key;
 pub(crate) mod go;
 mod manifests;
 
@@ -28,7 +29,10 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Vec<
         cursor: 0,
         budget: MAX_LOCATE_SCAN,
     };
-    match values.get("go_manifest.kind").and_then(JsonValue::as_str) {
+    match values
+        .get_key(value_key!("go_manifest.kind"))
+        .and_then(JsonValue::as_str)
+    {
         Some("go.work") => {
             go::manifest(&mut out, "go.work");
             return out.refs;
@@ -511,7 +515,7 @@ fn gemfile_lock(out: &mut Refs<'_>) {
 /// the `faraday-multipart` gem).
 fn gem_runtime_deps(values: &Values, out: &mut Refs<'_>) {
     let Some(deps) = values
-        .get("gem.runtime_dependencies")
+        .get_key(value_key!("gem.runtime_dependencies"))
         .and_then(JsonValue::as_array)
     else {
         return;
@@ -540,7 +544,7 @@ fn gem_runtime_deps(values: &Values, out: &mut Refs<'_>) {
 /// resolvable extension identity and is skipped rather than turned into a bad ref.
 fn vsix_deps(values: &Values, out: &mut Refs<'_>) {
     let Some(deps) = values
-        .get("vsix.dependencies")
+        .get_key(value_key!("vsix.dependencies"))
         .and_then(JsonValue::as_array)
     else {
         return;
@@ -617,7 +621,7 @@ fn pypi_purl(name: &str, version: &str) -> String {
 /// `Cargo.lock`, mirroring npm's manifest/lockfile split.
 fn cargo_toml(values: &Values, out: &mut Refs<'_>) {
     manifests::cargo(values, out);
-    if let Some(repo) = get_str(values, "package.repository") {
+    if let Some(repo) = document_str(values, "package.repository") {
         out.push(
             locator_from_repo(repo),
             RefKind::Repository,
@@ -767,7 +771,10 @@ fn anchor_from_locator(loc: &RefLocator) -> String {
 /// npm: the declared source repository (identity). Install-hook command/URL
 /// hunting lives in `fletch::find`.
 fn npm(values: &Values, out: &mut Refs<'_>) {
-    if let Some(repo) = get_str(values, "npm.repository.url") {
+    if let Some(repo) = values
+        .get_key(value_key!("npm.repository.url"))
+        .and_then(JsonValue::as_str)
+    {
         out.push(
             locator_from_repo(repo),
             RefKind::Repository,
@@ -1227,7 +1234,10 @@ fn parse_integrity(s: &str) -> Option<PinnedHash> {
 /// This is the PKGBUILD's machine-readable metadata, already parsed under
 /// `pkg.*` by `pkgmeta::extract_srcinfo`, so no bash is parsed here.
 fn srcinfo(values: &Values, out: &mut Refs<'_>) {
-    let Some(pkg) = values.as_json().get("pkg").and_then(JsonValue::as_object) else {
+    let Some(pkg) = values
+        .get_key(value_key!("pkg"))
+        .and_then(JsonValue::as_object)
+    else {
         return;
     };
 
@@ -1375,8 +1385,11 @@ fn purl_from_forge(repo: &str) -> Option<String> {
     ))
 }
 
-fn get_str<'a>(values: &'a Values, key: &str) -> Option<&'a str> {
-    values.get(key).and_then(JsonValue::as_str)
+/// A string at `path` in a manifest's verbatim document tree, such as
+/// `package.repository` in a `Cargo.toml`. The path comes from the manifest
+/// format, not from an extractor, so it is not a cataloged value key.
+fn document_str<'a>(values: &'a Values, path: &str) -> Option<&'a str> {
+    values.get(path).and_then(JsonValue::as_str)
 }
 
 #[cfg(test)]

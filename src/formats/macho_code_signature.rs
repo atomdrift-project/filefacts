@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 use crate::bytes::{self, Reader};
 use crate::formats::common::{hex_encode, plist_to_json, put_str, put_u64};
 use crate::output::Values;
+use crate::value_key;
 
 /// Outer wrapper magic. Every embedded code signature starts here.
 const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade_0cc0;
@@ -182,7 +183,7 @@ fn parse_code_directory(blob: &[u8], cd_base: usize, values: &mut Values) -> Opt
     let [hash_size, hash_type, platform, page_size_log2] = cd.array()?;
 
     if let Some(ident) = read_cstr(blob, ident_offset) {
-        put_str(values, "macho.code_signature.identifier", ident);
+        put_str(values, value_key!("macho.code_signature.identifier"), ident);
         // Absolute file offset of the identifier C-string, so consumers can
         // anchor it at the string itself rather than at the CodeDirectory or
         // signature blob. Same coordinate space as the signature offset.
@@ -200,7 +201,7 @@ fn parse_code_directory(blob: &[u8], cd_base: usize, values: &mut Values) -> Opt
         && let Some(team) = read_cstr(blob, team_offset as usize)
         && !team.is_empty()
     {
-        put_str(values, "macho.code_signature.team_id", team);
+        put_str(values, value_key!("macho.code_signature.team_id"), team);
     }
 
     // Executable-segment descriptor — present from version 0x20400
@@ -237,7 +238,11 @@ fn parse_code_directory(blob: &[u8], cd_base: usize, values: &mut Values) -> Opt
         "macho.code_signature.hash_size",
         u64::from(hash_size),
     );
-    put_u64(values, "macho.code_signature.platform", u64::from(platform));
+    put_u64(
+        values,
+        value_key!("macho.code_signature.platform"),
+        u64::from(platform),
+    );
     put_u64(values, "macho.code_signature.version", u64::from(version));
     put_u64(
         values,
@@ -267,8 +272,8 @@ fn parse_code_directory(blob: &[u8], cd_base: usize, values: &mut Values) -> Opt
     // on `macho.code_signature.flags`, so a separate `is_ad_hoc`
     // boolean would only restate the array's contents.
     let flag_names = code_signature_flags(flags);
-    values.insert(
-        "macho.code_signature.flags",
+    values.insert_key(
+        value_key!("macho.code_signature.flags"),
         JsonValue::Array(flag_names.into_iter().map(JsonValue::String).collect()),
     );
 
@@ -276,7 +281,11 @@ fn parse_code_directory(blob: &[u8], cd_base: usize, values: &mut Values) -> Opt
     // value macOS reports in `codesign -dv --verbose=4` and the one
     // used for notarisation lookups.
     let digest = Sha256::digest(blob);
-    put_str(values, "macho.code_signature.cdhash", hex_encode(&digest));
+    put_str(
+        values,
+        value_key!("macho.code_signature.cdhash"),
+        hex_encode(&digest),
+    );
     Some(())
 }
 
@@ -506,7 +515,7 @@ fn parse_entitlements(blob: &[u8], values: &mut Values) {
         return;
     };
     let json = plist_to_json(parsed, 0);
-    values.insert("macho.code_signature.entitlements", json);
+    values.insert_key(value_key!("macho.code_signature.entitlements"), json);
 }
 
 fn parse_cms(blob: &[u8], values: &mut Values) {
@@ -534,7 +543,7 @@ fn parse_cms(blob: &[u8], values: &mut Values) {
         return;
     };
     if let Some(sig) = super::pe_authenticode::parse_cms_blob(der) {
-        values.insert("macho.code_signature.cms", sig);
+        values.insert_key(value_key!("macho.code_signature.cms"), sig);
     }
 }
 

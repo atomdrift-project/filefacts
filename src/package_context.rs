@@ -17,6 +17,15 @@ fn text<'a>(member: &'a SourceMember<'_>, key: &str) -> Option<&'a str> {
     member.values.get(key).and_then(Value::as_str)
 }
 
+/// Whether the flattened path `path` is `<array>[<i>].<field>`: one field of
+/// an element of the array at `array`.
+fn element_field(path: &str, array: crate::ValueKey, field: &str) -> bool {
+    path.strip_prefix(array.as_str())
+        .and_then(|rest| rest.strip_suffix(field))
+        .and_then(|rest| rest.strip_suffix("]."))
+        .is_some_and(|rest| rest.starts_with('['))
+}
+
 /// Directory of a logical member path, separator included: through its last
 /// `/`, or through its last `!!` archive delimiter when that comes later, so
 /// members of sibling archives (`x/a.zip!!main.go`, `x/b.zip!!main.go`) never
@@ -77,7 +86,7 @@ pub fn cargo_source_context(members: &[SourceMember<'_>]) -> Value {
     {
         let boundary = &manifest.path[..manifest.path.len() - "Cargo.toml".len()];
         let mut entries = Vec::new();
-        if text(manifest, "cargo.build_mode") != Some("disabled") {
+        if text(manifest, crate::value_key!("cargo.build_mode").as_str()) != Some("disabled") {
             entries.push((
                 text(manifest, "package.build").unwrap_or("build.rs"),
                 "build",
@@ -118,12 +127,12 @@ pub fn cargo_source_context(members: &[SourceMember<'_>]) -> Value {
                     continue;
                 };
                 for (key, value) in file.values {
-                    if key.starts_with("source.payload_flow.events[") && key.ends_with("].kind") {
+                    if element_field(key, crate::value_key!("source.payload_flow.events"), "kind") {
                         if let Some(kind) = value.as_str() {
                             kinds.insert(kind.to_string());
                         }
                     }
-                    if !key.starts_with("source.rust.modules[") || !key.ends_with("].name") {
+                    if !element_field(key, crate::value_key!("source.rust.modules"), "name") {
                         continue;
                     }
                     let Some(name) = value.as_str() else { continue };
@@ -211,6 +220,22 @@ mod tests {
         manifest.insert("cargo.build_mode".into(), json!("disabled"));
         assert_eq!(run(&manifest)["targets"], json!([]));
     }
+    #[test]
+    fn element_field_matches_only_array_element_fields() {
+        let events = crate::value_key!("source.payload_flow.events");
+        for (path, expected) in [
+            ("source.payload_flow.events[0].kind", true),
+            ("source.payload_flow.events[12].kind", true),
+            ("source.payload_flow.events[0].kinds", false),
+            ("source.payload_flow.events.kind", false),
+            ("source.payload_flow.events_extra[0].kind", false),
+            ("source.payload_flow.events[0]", false),
+            ("source.payload_flow.events].kind", false),
+        ] {
+            assert_eq!(element_field(path, events, "kind"), expected, "{path}");
+        }
+    }
+
     #[test]
     fn paths_do_not_escape_archive_or_package() {
         for path in [

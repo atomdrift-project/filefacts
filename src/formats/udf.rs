@@ -29,6 +29,7 @@ use std::collections::{HashSet, VecDeque};
 
 use crate::formats::common::bytes_at::{u16_le, u32_le, u64_le};
 use crate::output::{ArchiveMember, ArchiveOffsets, Metrics, Values};
+use crate::value_key;
 
 use super::iso::SECTOR;
 
@@ -134,8 +135,8 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
 
     if let Some(lv) = &lvd {
         if !lv.identifier.is_empty() {
-            values.insert(
-                "iso.udf.logical_volume_id",
+            values.insert_key(
+                value_key!("iso.udf.logical_volume_id"),
                 JsonValue::String(lv.identifier.clone()),
             );
         }
@@ -151,10 +152,13 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
         );
     }
     if let Some(id) = impl_id {
-        values.insert("iso.udf.implementation_id", JsonValue::String(id));
+        values.insert_key(
+            value_key!("iso.udf.implementation_id"),
+            JsonValue::String(id),
+        );
     }
     if let Some(id) = volume_set_id {
-        values.insert("iso.udf.volume_set_id", JsonValue::String(id));
+        values.insert_key(value_key!("iso.udf.volume_set_id"), JsonValue::String(id));
     }
     if let Some(p) = &partition {
         values.insert(

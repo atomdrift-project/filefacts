@@ -196,7 +196,7 @@ pub fn max_bytes_from_env_or(var: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Entry ceiling from `var`, or the [`DEFAULT_MAX_ENTRIES`] default.
+/// Entry ceiling from `var`, or the `DEFAULT_MAX_ENTRIES` default.
 #[must_use]
 pub fn max_entries_from_env(var: &str) -> usize {
     std::env::var(var)

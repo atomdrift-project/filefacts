@@ -28,6 +28,7 @@
 //! that supply-chain detection traits care about most.
 
 use crate::metric;
+use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
 
 use serde_json::Value as JsonValue;
@@ -35,7 +36,8 @@ use serde_json::Value as JsonValue;
 use crate::bytes::{self, Reader};
 use crate::error::Error;
 use crate::formats::common::put_str;
-use crate::output::{Errors, Metrics, Stage, Values};
+use crate::output::{Errors, Metrics, Stage, ValueKey, Values};
+use crate::value_key;
 
 /// Hard cap on the number of stream entries we enumerate. Real Office
 /// documents have ≤ a few hundred; the cap keeps a hostile compound
@@ -271,7 +273,7 @@ pub(super) fn extract(
     // for a control-character storage). Emit the same `office.*`
     // paths as OOXML so rules do not care which container supplied
     // the property.
-    let mut props: serde_json::Map<String, JsonValue> = summary_data
+    let mut props: BTreeMap<ValueKey, JsonValue> = summary_data
         .as_deref()
         .map(parse_summary_information)
         .unwrap_or_default();
@@ -284,8 +286,7 @@ pub(super) fn extract(
         }
     }
     for (key, value) in props {
-        let path = format!("office.{key}");
-        values.insert(&path, value);
+        values.insert_key(key, value);
     }
 
     // CompObj stream — `\x01CompObj` carries the OLE-class identity
@@ -333,8 +334,8 @@ pub(super) fn extract(
 /// - Per-section header: FMTID (16 bytes) + offset (4 bytes).
 /// - Section body: size (4) + property count (4) + (PID, offset) pairs.
 /// - Each property entry: type tag (4) + value bytes (length depends on type).
-fn parse_summary_information(data: &[u8]) -> serde_json::Map<String, JsonValue> {
-    let mut out = serde_json::Map::new();
+fn parse_summary_information(data: &[u8]) -> BTreeMap<ValueKey, JsonValue> {
+    let mut out = BTreeMap::new();
     let Some(section) = locate_first_section(data) else {
         return out;
     };
@@ -343,28 +344,28 @@ fn parse_summary_information(data: &[u8]) -> serde_json::Map<String, JsonValue> 
         // canonical names as the OOXML core-properties schema so
         // traits don't have to special-case the format.
         let key = match pid {
-            0x02 => "title",
-            0x03 => "subject",
-            0x04 => "creator", // PIDSI_AUTHOR
-            0x05 => "keywords",
-            0x06 => "description", // PIDSI_COMMENTS
-            0x07 => "template",
-            0x08 => "last_modified_by",  // PIDSI_LASTAUTHOR
-            0x09 => "revision",          // VT_LPSTR holding a decimal string
-            0x0B => "last_printed",      // VT_FILETIME
-            0x0C => "created",           // VT_FILETIME
-            0x0D => "modified",          // PIDSI_LASTSAVE_DTM, VT_FILETIME
-            0x12 => "application",       // PIDSI_APPNAME
-            0x13 => "document_security", // PIDSI_DOC_SECURITY, VT_I4 bitfield
+            0x02 => value_key!("office.title"),
+            0x03 => value_key!("office.subject"),
+            0x04 => value_key!("office.creator"), // PIDSI_AUTHOR
+            0x05 => value_key!("office.keywords"),
+            0x06 => value_key!("office.description"), // PIDSI_COMMENTS
+            0x07 => value_key!("office.template"),
+            0x08 => value_key!("office.last_modified_by"), // PIDSI_LASTAUTHOR
+            0x09 => value_key!("office.revision"),         // VT_LPSTR holding a decimal string
+            0x0B => value_key!("office.last_printed"),     // VT_FILETIME
+            0x0C => value_key!("office.created"),          // VT_FILETIME
+            0x0D => value_key!("office.modified"),         // PIDSI_LASTSAVE_DTM, VT_FILETIME
+            0x12 => value_key!("office.application"),      // PIDSI_APPNAME
+            0x13 => value_key!("office.document_security"), // PIDSI_DOC_SECURITY, VT_I4 bitfield
             _ => continue,
         };
-        if out.contains_key(key) {
+        if out.contains_key(&key) {
             continue;
         }
         if let Some(value) =
             read_property(section, val_off).or_else(|| read_property_i32(section, val_off))
         {
-            out.insert(key.into(), value);
+            out.insert(key, value);
         }
     }
     out
@@ -375,8 +376,8 @@ fn parse_summary_information(data: &[u8]) -> serde_json::Map<String, JsonValue> 
 /// The full DSI also carries
 /// custom user-defined properties in a second section; we skip those
 /// for now — trait rules that care will get their own slice.
-fn parse_document_summary_information(data: &[u8]) -> serde_json::Map<String, JsonValue> {
-    let mut out = serde_json::Map::new();
+fn parse_document_summary_information(data: &[u8]) -> BTreeMap<ValueKey, JsonValue> {
+    let mut out = BTreeMap::new();
     let Some(section) = locate_first_section(data) else {
         return out;
     };
@@ -384,22 +385,22 @@ fn parse_document_summary_information(data: &[u8]) -> serde_json::Map<String, Js
         // PIDDSI_* per MS-OLEPS §2.4.2. We only surface the fields
         // that have a matching OOXML core / app-properties slot.
         let key = match pid {
-            0x02 => "category",
-            0x05 => "presentation_format",
-            0x09 => "slide_count",    // VT_I4
-            0x10 => "manager",        // VT_LPSTR
-            0x11 => "company",        // VT_LPSTR
-            0x13 => "security_flag",  // VT_I4 — bitfield
-            0x1A => "hyperlink_base", // VT_LPSTR
+            0x02 => value_key!("office.category"),
+            0x05 => value_key!("office.presentation_format"),
+            0x09 => value_key!("office.slide_count"), // VT_I4
+            0x10 => value_key!("office.manager"),     // VT_LPSTR
+            0x11 => value_key!("office.company"),     // VT_LPSTR
+            0x13 => value_key!("office.security_flag"), // VT_I4 — bitfield
+            0x1A => value_key!("office.hyperlink_base"), // VT_LPSTR
             _ => continue,
         };
-        if out.contains_key(key) {
+        if out.contains_key(&key) {
             continue;
         }
         if let Some(value) =
             read_property(section, val_off).or_else(|| read_property_i32(section, val_off))
         {
-            out.insert(key.into(), value);
+            out.insert(key, value);
         }
     }
     out
@@ -854,8 +855,8 @@ fn read_property_i32(section: &[u8], offset: usize) -> Option<JsonValue> {
 /// - 0..4   ByteOrder (0xFFFE) | Version (2)
 /// - 4..24  OS / CLSID — skipped
 /// - 24..28 Section count (u32, must be ≥ 1)
-/// - 28..44 Section[0].FMTID
-/// - 44..48 Section[0].Offset → `data[offset..]` is the section body
+/// - 28..44 `Section[0].FMTID`
+/// - 44..48 `Section[0].Offset` → `data[offset..]` is the section body
 fn locate_first_section(data: &[u8]) -> Option<&[u8]> {
     if data.len() < 48 {
         return None;

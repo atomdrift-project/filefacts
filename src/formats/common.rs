@@ -148,7 +148,7 @@ pub(super) fn extract_binary_strings_from_object(
 ///   PowerShell `-bxor`, `.xor(`, etc.
 ///
 /// Binaries are never gated this way — their decode logic is machine code, not
-/// greppable text — so this is only consulted for [`FileType::is_source_code`].
+/// greppable text — so this is only consulted for [`crate::FileType::is_source_code`].
 pub(super) fn has_xor_intent(bytes: &[u8]) -> bool {
     if memchr::memchr(b'^', bytes).is_some() {
         return true;
@@ -178,8 +178,11 @@ pub(super) fn extract_text_strings(bytes: &[u8], strings: &mut Strings, xor: Xor
 }
 
 /// Convenience wrapper for emitting a string-typed value into `values`.
-pub(super) fn put_str(values: &mut Values, path: &str, s: impl Into<String>) {
-    values.insert(path, JsonValue::String(s.into()));
+///
+/// `path` is a plain string or a checked [`ValueKey`](crate::ValueKey) from
+/// `value_key!`, which the catalog test counts as a writer of that key.
+pub(super) fn put_str(values: &mut Values, path: impl AsRef<str>, s: impl Into<String>) {
+    values.insert(path.as_ref(), JsonValue::String(s.into()));
 }
 
 /// The path of a compound-file entry, always `/`-separated.
@@ -223,9 +226,10 @@ pub(crate) fn stem(name: &str) -> String {
     format!("{}{}", &name[..body_start], &body[..stem_end])
 }
 
-/// Convenience wrapper for emitting an integer-typed value.
-pub(super) fn put_u64(values: &mut Values, path: &str, n: u64) {
-    values.insert(path, JsonValue::Number(n.into()));
+/// Convenience wrapper for emitting an integer-typed value. `path` is as for
+/// [`put_str`].
+pub(super) fn put_u64(values: &mut Values, path: impl AsRef<str>, n: u64) {
+    values.insert(path.as_ref(), JsonValue::Number(n.into()));
 }
 
 /// Convenience wrapper for emitting a signed-integer value (for fields

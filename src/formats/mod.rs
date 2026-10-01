@@ -10,13 +10,14 @@
 //! [`FileType`] produced by [`crate::fileid`].
 //!
 //! [`Values`]: crate::Values
-//! [`Strings`]: crate::Strings
+//! [`Strings`]: crate::output::Strings
 //! [`Metrics`]: crate::Metrics
 //! [`FileType`]: crate::FileType
 
 use crate::error::Error;
 use crate::fileid::FileType;
 use crate::output::{ArchiveMember, Errors, Metrics, Section, Strings, Symbols, Values};
+use crate::value_key;
 
 /// Mutable output collectors that every format extractor writes into.
 /// Bundled to keep the [`extract`] dispatch signature manageable and
@@ -176,7 +177,7 @@ pub(crate) fn extract(
     }
     if basename.is_some_and(|name| crate::has_named_reference_metadata(std::path::Path::new(name)))
     {
-        values.insert("go_manifest.kind", serde_json::json!(basename));
+        values.insert_key(value_key!("go_manifest.kind"), serde_json::json!(basename));
     }
 
     // Archive-backed types carry their container decomposition (archive +
@@ -372,7 +373,7 @@ pub(crate) fn extract(
                 Some(serde_json::Value::String(_)) => "custom",
                 _ => "implicit",
             };
-            values.insert("cargo.build_mode", serde_json::json!(mode));
+            values.insert_key(value_key!("cargo.build_mode"), serde_json::json!(mode));
             Ok(())
         }
         FileType::CargoLock | FileType::PoetryLock | FileType::PyProjectToml => {

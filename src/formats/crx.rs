@@ -28,6 +28,7 @@ use crate::error::Error;
 use crate::formats::common::bytes_at::u32_le;
 use crate::formats::common::hex_encode;
 use crate::output::{ArchiveMember, Errors, Metrics, Stage, Values};
+use crate::value_key;
 
 pub(super) fn extract(
     bytes: &[u8],
@@ -145,17 +146,23 @@ pub(super) fn browser_manifest_json(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {
 fn emit_manifest_identity(manifest: &JsonValue, values: &mut Values) {
     match manifest.get("author") {
         Some(JsonValue::String(s)) if !s.is_empty() => {
-            values.insert("crx.author", JsonValue::String(s.clone()));
+            values.insert_key(value_key!("crx.author"), JsonValue::String(s.clone()));
         }
         Some(JsonValue::Object(o)) => {
             if let Some(email) = o.get("email").and_then(JsonValue::as_str) {
-                values.insert("crx.author_email", JsonValue::String(email.to_string()));
+                values.insert_key(
+                    value_key!("crx.author_email"),
+                    JsonValue::String(email.to_string()),
+                );
             }
         }
         _ => {}
     }
     if let Some(url) = manifest.get("homepage_url").and_then(JsonValue::as_str) {
-        values.insert("crx.homepage_url", JsonValue::String(url.to_string()));
+        values.insert_key(
+            value_key!("crx.homepage_url"),
+            JsonValue::String(url.to_string()),
+        );
     }
     // `__MSG_*__` is a localization placeholder, not the extension's words.
     if let Some(description) = manifest
@@ -163,8 +170,8 @@ fn emit_manifest_identity(manifest: &JsonValue, values: &mut Values) {
         .and_then(JsonValue::as_str)
         .filter(|d| !d.is_empty() && !d.starts_with("__MSG_"))
     {
-        values.insert(
-            "crx.description",
+        values.insert_key(
+            value_key!("crx.description"),
             JsonValue::String(description.to_string()),
         );
     }
@@ -185,11 +192,14 @@ fn header(bytes: &[u8], values: &mut Values) {
                 return;
             };
             let digest = Sha256::digest(public_key);
-            values.insert(
-                "crx.public_key_sha256",
+            values.insert_key(
+                value_key!("crx.public_key_sha256"),
                 JsonValue::String(hex_encode(&digest)),
             );
-            values.insert("crx.extension_id", JsonValue::String(extension_id(&digest)));
+            values.insert_key(
+                value_key!("crx.extension_id"),
+                JsonValue::String(extension_id(&digest)),
+            );
         }
         3 => {
             let Some(header) = crx3_header(bytes) else {
@@ -198,11 +208,14 @@ fn header(bytes: &[u8], values: &mut Values) {
             let Some(crx_id) = signed_crx_id(header) else {
                 return;
             };
-            values.insert("crx.extension_id", JsonValue::String(extension_id(crx_id)));
+            values.insert_key(
+                value_key!("crx.extension_id"),
+                JsonValue::String(extension_id(crx_id)),
+            );
             if let Some(public_key) = matching_developer_public_key(header, crx_id) {
                 let digest = Sha256::digest(public_key);
-                values.insert(
-                    "crx.public_key_sha256",
+                values.insert_key(
+                    value_key!("crx.public_key_sha256"),
                     JsonValue::String(hex_encode(&digest)),
                 );
             }

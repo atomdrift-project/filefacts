@@ -23,7 +23,8 @@ use std::io::{Cursor, Read};
 use serde_json::Value as JsonValue;
 
 use crate::error::Error;
-use crate::output::{Errors, Metrics, Stage, Values};
+use crate::output::{Errors, Metrics, Stage, ValueKey, Values};
+use crate::value_key;
 
 /// Manifests larger than this are not the small index/manifest JSON we want;
 /// stop reading rather than buffer them.
@@ -121,8 +122,8 @@ fn emit_oci_index(index: &JsonValue, values: &mut Values, metrics: &mut Metrics)
             refs.insert(r.to_string());
         }
     }
-    insert_set(values, "oci.manifest.digest", digests);
-    insert_set(values, "oci.ref", refs);
+    insert_set(values, value_key!("oci.manifest.digest"), digests);
+    insert_set(values, value_key!("oci.ref"), refs);
 }
 
 /// Emit `oci.*` facts from a `docker save` `manifest.json` array.
@@ -153,8 +154,8 @@ fn emit_docker_manifest(manifest: &JsonValue, values: &mut Values, metrics: &mut
             .and_then(JsonValue::as_array)
             .map_or(0, Vec::len) as u64;
     }
-    insert_set(values, "oci.ref", refs);
-    insert_set(values, "oci.config.digest", configs);
+    insert_set(values, value_key!("oci.ref"), refs);
+    insert_set(values, value_key!("oci.config.digest"), configs);
     metrics.insert(metric!("oci.layer_count"), layers as f64);
 }
 
@@ -176,12 +177,12 @@ fn normalize_digest(config: &str) -> String {
 }
 
 /// Insert a set of strings as a JSON array value, skipping the key when empty.
-fn insert_set(values: &mut Values, key: &str, set: BTreeSet<String>) {
+fn insert_set(values: &mut Values, key: ValueKey, set: BTreeSet<String>) {
     if set.is_empty() {
         return;
     }
     let arr = set.into_iter().map(JsonValue::String).collect();
-    values.insert(key, JsonValue::Array(arr));
+    values.insert_key(key, JsonValue::Array(arr));
 }
 
 #[cfg(test)]

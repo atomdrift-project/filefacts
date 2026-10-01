@@ -33,6 +33,7 @@ use crate::formats::common::{
     XorScan, bytes_at, extract_binary_strings, format_guid, put_str, put_u64,
 };
 use crate::output::{Metrics, Strings, Values};
+use crate::value_key;
 
 /// `{0001-4C00-0000-0000-AA00-3826B3713F}` — the canonical CLSID
 /// in the SHLLINK header. The leading u32 doubles as the header
@@ -202,7 +203,7 @@ pub(super) fn extract(
                     // length prefix precede it). Consumers read the
                     // `<path>_offset` companion to turn a `value:` match
                     // into a byte-addressed span.
-                    put_u64(values, &format!("{key}_offset"), (offset + 2) as u64);
+                    put_u64(values, format!("{key}_offset"), (offset + 2) as u64);
                 }
                 offset = next;
             }
@@ -260,7 +261,7 @@ pub(super) fn extract(
                     }
                 }
                 if !tr.is_empty() {
-                    values.insert("lnk.tracker", JsonValue::Object(tr));
+                    values.insert_key(value_key!("lnk.tracker"), JsonValue::Object(tr));
                 }
             }
             EXTRA_SPECIAL_FOLDER_DATA => {
@@ -679,7 +680,7 @@ fn parse_link_info(
                 volume.insert("name".into(), JsonValue::String(name));
                 volume.insert("name_offset".into(), json!(block_base + volume_id_off + at));
             }
-            values.insert("lnk.volume", JsonValue::Object(volume));
+            values.insert_key(value_key!("lnk.volume"), JsonValue::Object(volume));
         }
     }
 
@@ -1096,6 +1097,19 @@ mod tests {
         let blocks = v.get("lnk.blocks").and_then(|x| x.as_array()).unwrap();
         let names: Vec<&str> = blocks.iter().filter_map(|x| x.as_str()).collect();
         assert!(names.contains(&"tracker"));
+
+        // Identity reads the tracker's machine name back. It once asked for a
+        // `machine_name` field that this extractor never writes, so the claim
+        // was silently empty on every shortcut.
+        let id = super::super::identity::derive(crate::FileType::Lnk, &lnk, &v);
+        assert_eq!(
+            id.unique_ids.get("lnk_machine_name").map(String::as_str),
+            Some("build-host-01")
+        );
+        assert_eq!(
+            id.unique_ids.get("mac_address").map(String::as_str),
+            Some("22:33:44:55:66:77")
+        );
     }
 
     #[test]

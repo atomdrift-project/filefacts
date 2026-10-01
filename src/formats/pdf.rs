@@ -37,6 +37,7 @@ use std::sync::LazyLock;
 use crate::error::Error;
 use crate::formats::common::{XorScan, extract_binary_strings, hex_nibble};
 use crate::output::{Metrics, Strings, Values};
+use crate::value_key;
 
 /// Cap on the snippet text we surface per action. Long JavaScript
 /// payloads exist in malicious PDFs but the *first* few hundred
@@ -570,7 +571,7 @@ fn info_dict(bytes: &[u8], scan: &TokenScan, values: &mut Values) {
         }
     }
     if !info.is_empty() {
-        values.insert("pdf.info", JsonValue::Object(info));
+        values.insert_key(value_key!("pdf.info"), JsonValue::Object(info));
     }
 }
 

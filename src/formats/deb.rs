@@ -28,6 +28,7 @@ use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::output::{Errors, Metrics, Stage, Values};
+use crate::value_key;
 
 const AR_MAGIC: &[u8] = b"!<arch>\n";
 /// `ar` member headers are a fixed 60 bytes.
@@ -194,15 +195,15 @@ fn parse_control(control: &[u8], values: &mut Values, metrics: &mut Metrics) {
             continue;
         }
         match key.trim() {
-            "Package" => insert_str(values, "deb.package", value),
-            "Version" => insert_str(values, "deb.version", value),
+            "Package" => insert_str(values, value_key!("deb.package"), value),
+            "Version" => insert_str(values, value_key!("deb.version"), value),
             "Architecture" => insert_str(values, "deb.architecture", value),
-            "Maintainer" => insert_str(values, "deb.maintainer", value),
+            "Maintainer" => insert_str(values, value_key!("deb.maintainer"), value),
             "Section" => insert_str(values, "deb.section", value),
             "Priority" => insert_str(values, "deb.priority", value),
             // `Description`'s first line is the synopsis; the indented
             // continuation lines (the long description) are skipped above.
-            "Description" => insert_str(values, "deb.summary", value),
+            "Description" => insert_str(values, value_key!("deb.summary"), value),
             "Installed-Size" => {
                 if let Ok(kib) = value.parse::<f64>() {
                     metrics.insert(metric!("deb.installed_size"), kib);
@@ -245,8 +246,9 @@ fn dependency_names(field: &str) -> Vec<String> {
     names
 }
 
-fn insert_str(values: &mut Values, key: &str, value: &str) {
-    values.insert(key, JsonValue::String(value.to_string()));
+/// `key` is a plain string or a checked key from `value_key!`.
+fn insert_str(values: &mut Values, key: impl AsRef<str>, value: &str) {
+    values.insert(key.as_ref(), JsonValue::String(value.to_string()));
 }
 
 #[cfg(test)]

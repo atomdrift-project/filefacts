@@ -40,6 +40,7 @@ use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_valu
 use crate::bytes::{u32_be, u64_be, u64_le};
 use crate::error::Error;
 use crate::output::{ArchiveCompression, ArchiveMember, ArchiveOffsets, Metrics, Values};
+use crate::value_key;
 
 /// The shared aggregates over a disk image's partitions. A partition name
 /// (`disk image (Apple_HFS : 4)`) is a label, not a file name, so none of the
@@ -496,13 +497,13 @@ fn apfs_volume_facts(prefix: &[u8], values: &mut Values, metrics: &mut Metrics) 
     // nanosecond timestamp it was laid down — a precise build-environment
     // fingerprint and creation time.
     if let Some(id) = c_string(sb, 272, 32) {
-        values.insert("dmg.volume.formatted_by", JsonValue::String(id));
+        values.insert_key(value_key!("dmg.volume.formatted_by"), JsonValue::String(id));
     }
     if let Some(t) = apfs_ns_to_unix(u64_le(sb, 304)?) {
         values.insert("dmg.volume.created_unix", JsonValue::Number(t.into()));
     }
     if let Some(name) = c_string(sb, 704, 256) {
-        values.insert("dmg.volume.name", JsonValue::String(name));
+        values.insert_key(value_key!("dmg.volume.name"), JsonValue::String(name));
     }
     Some(())
 }

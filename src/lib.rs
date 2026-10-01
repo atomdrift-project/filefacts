@@ -138,8 +138,9 @@ pub use output::{
     Claim, Comments, ErrorKind, Errors, ExtractedString, FAMILIES, Fact, HashAlgo, Identity,
     Literals, MetricKey, Metrics, ParseError, Party, PinnedHash, QueryLimit, RefKind, RefLocator,
     Reference, Section, Sections, Signer, Span, SpanBuilder, Stage, Symbol, SymbolKind, Symbols,
-    Text, Trust, Url, UrlKind, Values, archive_entry_type_count, archive_method_count, ast_op,
-    ast_op_density, declared, dmg_codec_count, extension_content_mismatch, source_query_limited,
+    Text, Trust, Url, UrlKind, VALUE_CATALOG, ValueKey, Values, archive_entry_type_count,
+    archive_method_count, ast_op, ast_op_density, declared, declared_value_key, dmg_codec_count,
+    extension_content_mismatch, source_query_limited,
 };
 pub use registry::Registry;
 
@@ -739,7 +740,10 @@ fn run_extraction(
         errors.record_panic(Stage::Identify, "file identification panicked");
     }
     if let Some(name) = basename {
-        values.insert("file.basename", serde_json::Value::String(name.to_string()));
+        values.insert_key(
+            value_key!("file.basename"),
+            serde_json::Value::String(name.to_string()),
+        );
         values.insert(
             "file.stem",
             serde_json::Value::String(formats::common::stem(name)),
@@ -1260,10 +1264,14 @@ fn emit_binary_aggregates(
             data_spans,
         );
     }
-    if code_size + data_size > 0 {
+    // Both sums come from file-declared section sizes; adding them as `u64`
+    // overflowed on forged sizes near `u64::MAX`, and saturating would skew
+    // the ratio, so take it in floating point.
+    let classified = code_size as f64 + data_size as f64;
+    if classified > 0.0 {
         metrics.insert(
             metric!("binary.code_to_data_ratio"),
-            code_size as f64 / (code_size + data_size) as f64,
+            code_size as f64 / classified,
         );
     }
     let file_size = bytes.len() as u64;
@@ -1496,6 +1504,29 @@ fn file_type_for_language(name: &str) -> Option<FileType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forged_section_sizes_do_not_overflow_the_code_data_ratio() {
+        // Two sections each claiming nearly `u64::MAX` bytes: the code and
+        // data sums used to be added unchecked.
+        let section = |name: &str, flag: &str| Section {
+            name: name.into(),
+            vaddr: 0,
+            vsize: 0,
+            file_offset: 0,
+            file_size: u64::MAX - 1,
+            flags: vec![flag.into()],
+            flags_raw: None,
+            entropy: Some(1.0),
+        };
+        let sections = Sections::from_iter([section("a", "executable"), section("b", "data")]);
+        let mut metrics = Metrics::new();
+        emit_binary_aggregates(&sections, &output::Strings::new(), b"x", &mut metrics);
+        assert_eq!(
+            metrics.get_key(&metric!("binary.code_to_data_ratio")),
+            Some(0.5)
+        );
+    }
 
     #[test]
     fn guarded_turns_a_panic_into_its_message() {

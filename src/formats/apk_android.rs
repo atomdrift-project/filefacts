@@ -19,6 +19,7 @@ use serde_json::{Value as JsonValue, json};
 use crate::error::Error;
 use crate::metric;
 use crate::output::{Errors, Metrics, Stage, Values};
+use crate::value_key;
 
 /// Manifest bytes to read. Real manifests are tens of KB; this bounds a
 /// decompression bomb disguised as one.
@@ -95,15 +96,15 @@ fn manifest<R: Read + Seek>(
         match el.name.as_str() {
             "manifest" => {
                 for (attr, key) in [
-                    ("package", "android.package"),
-                    ("versionName", "android.version_name"),
-                    ("versionCode", "android.version_code"),
-                    ("compileSdkVersion", "android.compile_sdk"),
-                    ("installLocation", "android.install_location"),
-                    ("sharedUserId", "android.shared_user_id"),
+                    ("package", value_key!("android.package")),
+                    ("versionName", value_key!("android.version_name")),
+                    ("versionCode", value_key!("android.version_code")),
+                    ("compileSdkVersion", value_key!("android.compile_sdk")),
+                    ("installLocation", value_key!("android.install_location")),
+                    ("sharedUserId", value_key!("android.shared_user_id")),
                 ] {
                     if let Some(v) = get(attr).filter(|v| !v.is_empty()) {
-                        values.insert(key, JsonValue::String(v.to_string()));
+                        values.insert_key(key, JsonValue::String(v.to_string()));
                     }
                 }
             }
@@ -119,15 +120,21 @@ fn manifest<R: Read + Seek>(
             }
             "application" => {
                 for (attr, key) in [
-                    ("label", "android.app_label"),
-                    ("name", "android.app_class"),
-                    ("debuggable", "android.debuggable"),
-                    ("allowBackup", "android.allow_backup"),
-                    ("usesCleartextTraffic", "android.cleartext_traffic"),
-                    ("networkSecurityConfig", "android.network_security_config"),
+                    ("label", value_key!("android.app_label")),
+                    ("name", value_key!("android.app_class")),
+                    ("debuggable", value_key!("android.debuggable")),
+                    ("allowBackup", value_key!("android.allow_backup")),
+                    (
+                        "usesCleartextTraffic",
+                        value_key!("android.cleartext_traffic"),
+                    ),
+                    (
+                        "networkSecurityConfig",
+                        value_key!("android.network_security_config"),
+                    ),
                 ] {
                     if let Some(v) = get(attr).filter(|v| !v.is_empty()) {
-                        values.insert(key, JsonValue::String(v.to_string()));
+                        values.insert_key(key, JsonValue::String(v.to_string()));
                     }
                 }
             }
@@ -174,7 +181,11 @@ fn manifest<R: Read + Seek>(
     // Stated as metrics as well as values so a rule can band them: shipping a
     // debuggable build, or targeting an old SDK to dodge a runtime restriction
     // the platform added later, are both choices worth thresholding on.
-    if values.get("android.debuggable").and_then(JsonValue::as_str) == Some("true") {
+    if values
+        .get_key(value_key!("android.debuggable"))
+        .and_then(JsonValue::as_str)
+        == Some("true")
+    {
         metrics.insert(metric!("android.debuggable"), 1.0);
     }
     for (key, metric_key) in [
@@ -232,7 +243,10 @@ fn signer<R: Read + Seek>(
         }
     }
     if !signatures.is_empty() {
-        values.insert("android.signatures", JsonValue::Array(signatures));
+        values.insert_key(
+            value_key!("android.signatures"),
+            JsonValue::Array(signatures),
+        );
     }
     if let Some(first) = first_failure {
         errors.record_malformed(

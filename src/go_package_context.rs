@@ -111,12 +111,16 @@ pub fn go_source_context(sources: &[(String, String)], incomplete: bool) -> Valu
                 let mut behaviors = BTreeSet::new();
                 let files = facts.get("files").and_then(Value::as_array);
                 for file in files.into_iter().flatten() {
-                    for (pointer, prefix) in [
-                        ("/facts/source/go/initialization_events", "initialization"),
-                        ("/facts/source/payload_flow/events", "runtime"),
+                    for (key, prefix) in [
+                        (
+                            crate::value_key!("source.go.initialization_events"),
+                            "initialization",
+                        ),
+                        (crate::value_key!("source.payload_flow.events"), "runtime"),
                     ] {
                         for event in file
-                            .pointer(pointer)
+                            .get("facts")
+                            .and_then(|facts| key.get_in(facts))
                             .and_then(Value::as_array)
                             .into_iter()
                             .flatten()
