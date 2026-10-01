@@ -1574,10 +1574,10 @@ fn authenticode_from_header(
     let Some((offset, size)) = cert_table_extent(opt, metrics) else {
         return;
     };
-    if offset.saturating_add(size) > bytes.len() {
+    let Some(table) = cert_table_bytes(bytes, offset, size) else {
         return;
-    }
-    super::pe_authenticode::parse(&bytes[offset..offset + size], values);
+    };
+    super::pe_authenticode::parse(table, values);
 }
 
 fn authenticode(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
@@ -1605,11 +1605,19 @@ fn authenticode(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Me
     // When the bytes the cert-table points at fall outside the file, the
     // header has been tampered with — emit a flag so downstream callers
     // don't have to redo the bounds check.
-    if offset > 0 && offset.saturating_add(size) > bytes.len() {
-        metrics.insert(metric!("pe.security_directory_out_of_bounds"), 1.0);
+    let Some(table) = cert_table_bytes(bytes, offset, size) else {
+        if offset > 0 {
+            metrics.insert(metric!("pe.security_directory_out_of_bounds"), 1.0);
+        }
         return;
-    }
-    super::pe_authenticode::parse(&bytes[offset..offset + size], values);
+    };
+    super::pe_authenticode::parse(table, values);
+}
+
+/// The certificate table's bytes, or `None` when the directory points
+/// outside the file.
+fn cert_table_bytes(bytes: &[u8], offset: usize, size: usize) -> Option<&[u8]> {
+    bytes.get(offset..offset.checked_add(size)?)
 }
 
 fn machine_string(machine: u16) -> &'static str {
@@ -3450,6 +3458,33 @@ mod tests {
     fn read_fixture(name: &str) -> Vec<u8> {
         let path = format!("tests/fixtures/{name}");
         std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"))
+    }
+
+    #[test]
+    fn certificate_table_at_offset_zero_past_eof_does_not_panic() {
+        let mut bytes = read_fixture("test.exe");
+        let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+        let optional_offset = pe_offset + 24;
+        let directory_offset = match u16::from_le_bytes(
+            bytes[optional_offset..optional_offset + 2]
+                .try_into()
+                .unwrap(),
+        ) {
+            0x10b => optional_offset + 96,
+            0x20b => optional_offset + 112,
+            magic => panic!("unexpected fixture optional-header magic {magic:#x}"),
+        };
+        // Certificate table (directory 4): file offset 0, size past EOF.
+        let cert_offset = directory_offset + 4 * 8;
+        bytes[cert_offset..cert_offset + 4].fill(0);
+        bytes[cert_offset + 4..cert_offset + 8].copy_from_slice(&0x7fff_ffff_u32.to_le_bytes());
+
+        let (values, _, metrics) = run(&bytes);
+        assert_eq!(
+            metrics.get("pe.cert_table_size"),
+            Some(f64::from(0x7fff_ffff_u32))
+        );
+        assert!(values.get("pe.signatures").is_none());
     }
 
     #[test]

@@ -311,10 +311,10 @@ pub fn kill_all_rizin_groups() {
     let _ = pgids;
 }
 
-/// Disable rizin globally for the rest of the process. Each call must
-/// be paired with the inverse via `enable()` or scoped via
-/// `scoped_disable()`. Used by tests and benches to ensure
-/// deterministic behaviour without actually invoking rizin.
+/// Disable rizin globally for the rest of the process. There is no
+/// inverse: this is also the latch `join_drain` throws after too many
+/// abandoned readers, which must not be undone. For a reversible mute,
+/// use [`scoped_disable`].
 pub fn disable() {
     RIZIN_DISABLED.fetch_add(1, Ordering::SeqCst);
 }
@@ -352,7 +352,8 @@ thread_local! {
 
 /// RAII guard returned by [`scoped_disable_current_thread`]. Restores the
 /// calling thread's previous state on drop; guards stack.
-#[must_use = "dropping the guard immediately re-enables rizin; bind it to a               variable that lives at least as long as the scope you intended to mute"]
+#[must_use = "dropping the guard immediately re-enables rizin; bind it to a \
+              variable that lives at least as long as the scope you intended to mute"]
 pub struct ScopedDisableThread {
     _private: (),
 }

@@ -2,6 +2,21 @@
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Parent of a logical member path: the text before its last `/`, or through
+/// its last `!!` archive delimiter when that comes later, so members of
+/// sibling archives (`x/a.zip!!main.go`, `x/b.zip!!main.go`) never share a
+/// package.
+fn package_directory(path: &str) -> &str {
+    let slash = path.rfind('/');
+    let archive = path.rfind("!!").map(|i| i + 2);
+    match (slash, archive) {
+        (Some(slash), Some(archive)) if archive > slash => &path[..archive],
+        (Some(slash), _) => &path[..slash],
+        (None, Some(archive)) => &path[..archive],
+        (None, None) => "",
+    }
+}
+
 /// Analyze supplied Go members without filesystem access or execution. Package
 /// directories, test variants, and build constraints bound helper resolution.
 /// An incomplete input or analysis budget remains explicit in the result.
@@ -30,18 +45,14 @@ pub fn go_source_context(sources: &[(String, String)], incomplete: bool) -> Valu
         else {
             continue;
         };
-        let directory = path
-            .rsplit_once('/')
-            .map_or_else(|| path.rsplit_once('!').map_or("", |(p, _)| p), |(p, _)| p);
+        let directory = package_directory(path);
         let mut variant = source
             .lines()
             .filter_map(|l| l.strip_prefix("//go:build "))
             .collect::<Vec<_>>()
             .join(" && ");
-        let stem = path
-            .rsplit('/')
-            .next()
-            .unwrap_or(path)
+        let stem = path[package_directory(path).len()..]
+            .trim_start_matches('/')
             .trim_end_matches(".go")
             .trim_end_matches("_test");
         for part in stem.split('_').skip(1) {
@@ -126,4 +137,33 @@ pub fn go_source_context(sources: &[(String, String)], incomplete: bool) -> Valu
         }
     }
     json!({"packages":packages,"truncated":truncated})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn package_directory_keeps_sibling_archives_apart() {
+        assert_eq!(package_directory("pkg/a.go"), "pkg");
+        assert_eq!(package_directory("main.go"), "");
+        assert_eq!(package_directory("x/a.zip!!main.go"), "x/a.zip!!");
+        assert_eq!(package_directory("x/a.zip!!sub/main.go"), "x/a.zip!!sub");
+
+        let source = "package main\nfunc main(){}\n".to_string();
+        let context = go_source_context(
+            &[
+                ("x/a.zip!!main.go".into(), source.clone()),
+                ("x/b.zip!!main.go".into(), source),
+            ],
+            false,
+        );
+        let directories: BTreeSet<_> = context["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["directory"].as_str())
+            .collect();
+        assert_eq!(directories, BTreeSet::from(["x/a.zip!!", "x/b.zip!!"]));
+    }
 }

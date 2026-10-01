@@ -2403,6 +2403,9 @@ fn machine_string(machine: u16) -> &'static str {
         header::EM_S390 => "s390",
         header::EM_SPARCV9 => "sparc64",
         header::EM_LOONGARCH => "loongarch",
+        header::EM_VIDEOCORE3 => "videocore3",
+        header::EM_QDSP6 => "qdsp6",
+        header::EM_XTENSA => "xtensa",
         _ => "unknown",
     }
 }
@@ -2599,6 +2602,9 @@ mod tests {
         assert_eq!(machine_string(header::EM_PPC64), "powerpc64");
         assert_eq!(machine_string(header::EM_S390), "s390");
         assert_eq!(machine_string(header::EM_LOONGARCH), "loongarch");
+        assert_eq!(machine_string(header::EM_VIDEOCORE3), "videocore3");
+        assert_eq!(machine_string(header::EM_QDSP6), "qdsp6");
+        assert_eq!(machine_string(header::EM_XTENSA), "xtensa");
         assert_eq!(machine_string(0xeeee), "unknown");
     }
 

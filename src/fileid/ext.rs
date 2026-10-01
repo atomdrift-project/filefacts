@@ -633,9 +633,10 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         // archive analyzer inspect both ordinary JSON maps and raw embedded
         // Base64 payloads instead of dropping them as unknown members.
         "map" => Some(FileType::Data),
-        // Opaque binary "data" extensions that commonly carry encrypted/XOR'd payloads
-        // (PlugX's Canon.dat, Cobalt Strike profiles, shellcode drops).
-        "dat" | "bin" | "payload" | "raw" => Some(FileType::Data),
+        // Generic data suffixes that do not imply a more specific format.
+        // Includes opaque payload blobs and common database filenames; content
+        // signatures still take precedence over this path-based fallback.
+        "dat" | "bin" | "db" | "payload" | "raw" => Some(FileType::Data),
         _ => None,
     }
 }

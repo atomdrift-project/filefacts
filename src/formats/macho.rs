@@ -71,6 +71,7 @@ pub(super) fn extract(
     // of the per-binary cost. Falls back to the whole input for thin binaries
     // or when no native slice is found.
     let mut native_rizin_range: Option<(usize, usize)> = None;
+    let mut run_rizin = true;
     let (go_pclntab, go_rodata) = match parsed {
         Mach::Binary(macho) => {
             single_arch(&macho, bytes, values, metrics, sections_out, symbols_out);
@@ -79,6 +80,14 @@ pub(super) fn extract(
         }
         Mach::Fat(fat) => {
             *image_end = fat_binary(bytes, &fat, values, metrics, sections_out, symbols_out);
+            // A header claiming more entries than the file can hold is not a
+            // universal binary rizin can use, and rizin spends its whole
+            // timeout walking the claimed entries.
+            run_rizin = fat.narches
+                <= bytes
+                    .len()
+                    .saturating_sub(goblin::mach::fat::SIZEOF_FAT_HEADER)
+                    / goblin::mach::fat::SIZEOF_FAT_ARCH;
             if crate::rizin::native_arch_only() {
                 native_rizin_range = native_slice_range(bytes, &fat);
             }
@@ -90,15 +99,17 @@ pub(super) fn extract(
         None => bytes,
     };
     let has_go_pclntab = go_pclntab.is_some_and(super::go_buildinfo::has_pclntab_magic);
-    rizin_fallback(
-        NativeFormat::MachO,
-        rizin_bytes,
-        strings,
-        sections_out,
-        symbols_out,
-        metrics,
-        has_go_pclntab,
-    );
+    if run_rizin {
+        rizin_fallback(
+            NativeFormat::MachO,
+            rizin_bytes,
+            strings,
+            sections_out,
+            symbols_out,
+            metrics,
+            has_go_pclntab,
+        );
+    }
     super::upx::detect(bytes, values);
     let go_sections = super::go_buildinfo::GoSections {
         buildid_note: None,
@@ -132,6 +143,11 @@ fn macho_go_sections<'a>(macho: &MachO<'a>) -> (Option<&'a [u8]>, Option<&'a [u8
     (pclntab, const_data.or(rodata))
 }
 
+/// Most fat-header entries examined. `iter_arches` runs to the header's
+/// `nfat_arch` (up to `u32::MAX`) without checking it against the buffer, and
+/// each in-bounds entry costs a full slice analysis; real binaries carry a few.
+const MAX_FAT_ARCHES: usize = 64;
+
 /// Byte range of the host-native architecture slice within a fat Mach-O, used to
 /// hand rizin only the slice that can run on this host (see `extract`). Matches
 /// on `cputype` so `arm64` and `arm64e` (same cputype, different subtype) both
@@ -150,8 +166,9 @@ fn native_slice_range(bytes: &[u8], fat: &mach::MultiArch<'_>) -> Option<(usize,
     if NATIVE_CPU_TYPE == 0 {
         return None;
     }
-    for slice in fat.iter_arches() {
-        let Ok(arch) = slice else { continue };
+    for slice in fat.iter_arches().take(MAX_FAT_ARCHES) {
+        // Entries are contiguous, so the first unreadable one ends the table.
+        let Ok(arch) = slice else { break };
         if arch.cputype != NATIVE_CPU_TYPE {
             continue;
         }
@@ -180,8 +197,9 @@ fn fat_binary(
 ) -> Option<u64> {
     let mut archs: Vec<JsonValue> = Vec::new();
     let mut image_end: Option<u64> = None;
-    for (idx, slice) in fat.iter_arches().enumerate() {
-        let Ok(arch) = slice else { continue };
+    for (idx, slice) in fat.iter_arches().take(MAX_FAT_ARCHES).enumerate() {
+        // Entries are contiguous, so the first unreadable one ends the table.
+        let Ok(arch) = slice else { break };
         // `arch.offset` and `arch.size` come from the fat header — on
         // a misclassified CAFEBABE input (Java `.class` mistaken for
         // Mach-O fat) they are random bytes and routinely overflow
@@ -2158,6 +2176,21 @@ mod tests {
             &mut symbols,
             &mut errors,
             &mut None,
+        );
+    }
+
+    #[test]
+    fn fat_header_arch_count_is_bounded_by_the_buffer() {
+        // nfat_arch = u32::MAX over a 1 KiB file. goblin's `iter_arches`
+        // does not check the count against the buffer, so the walk must.
+        // Rizin stays enabled: handed this header, it runs to its timeout.
+        let mut bytes = vec![0xCA, 0xFE, 0xBA, 0xBE, 0xFF, 0xFF, 0xFF, 0xFF];
+        bytes.resize(1024, 0);
+        let (_, _, metrics) = run(&bytes);
+        assert!(
+            metrics
+                .get("macho.slice_count")
+                .is_none_or(|n| n <= MAX_FAT_ARCHES as f64)
         );
     }
 

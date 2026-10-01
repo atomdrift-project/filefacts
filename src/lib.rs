@@ -117,10 +117,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 pub use embedded_sources::EmbeddedSource;
 pub use error::Error;
-pub use fileid::{
-    ArchiveFormat, Compression, Container, DecodedDosComPayload, DosComXorMethod, FileId, FileType,
-    container_of, decode_dos_com_xor_payload,
-};
+pub use fileid::{ArchiveFormat, Compression, Container, FileId, FileType, container_of};
 pub use output::{
     ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Arg, ArgShape, CATALOG,
     Claim, Comments, ErrorKind, Errors, ExtractedString, FAMILIES, Fact, HashAlgo, Identity,
@@ -798,7 +795,10 @@ fn run_extraction(
     // `sections.*` path convention.
     if !sections.is_empty() {
         emit_section_metrics(&sections, &mut metrics);
-        emit_binary_aggregates(&sections, &strings, bytes, image_end, &mut metrics);
+        emit_binary_aggregates(&sections, &strings, bytes, &mut metrics);
+    }
+    if image_end.is_some() || !sections.is_empty() {
+        emit_binary_overlay(&sections, bytes, image_end, &mut metrics);
     }
 
     // Per-kind counts for ergonomic rule filtering. Derived from the
@@ -1137,7 +1137,6 @@ fn emit_binary_aggregates(
     sections: &Sections,
     strings: &output::Strings,
     bytes: &[u8],
-    image_end: Option<u64>,
     metrics: &mut Metrics,
 ) {
     // -- Strings ------------------------------------------------------
@@ -1273,11 +1272,16 @@ fn emit_binary_aggregates(
             largest_spans,
         );
     }
+}
 
-    // -- Overlay ------------------------------------------------------
-    // Last on-disk extent across sections and the format's own image
-    // end. Anything past it is appended payload (NSIS installer stubs,
-    // self-extractors).
+fn emit_binary_overlay(
+    sections: &Sections,
+    bytes: &[u8],
+    image_end: Option<u64>,
+    metrics: &mut Metrics,
+) {
+    // Last on-disk extent across sections and the format's own image end.
+    let file_size = bytes.len() as u64;
     let last_extent = sections
         .as_slice()
         .iter()
@@ -1492,12 +1496,49 @@ fn file_type_for_language(name: &str) -> Option<FileType> {
         "elixir" => FileType::Elixir,
         "clojure" | "clj" | "cljs" | "cljc" => FileType::Clojure,
         "makefile" | "make" => FileType::Makefile,
+        "batch" => FileType::Batch,
         _ => return None,
     })
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn validate_source_query_accepts_every_parser_language() {
+        for language in [
+            "javascript",
+            "typescript",
+            "python",
+            "go",
+            "rust",
+            "java",
+            "bash",
+            "ruby",
+            "lua",
+            "csharp",
+            "c",
+            "scala",
+            "objc",
+            "kotlin",
+            "swift",
+            "powershell",
+            "php",
+            "perl",
+            "groovy",
+            "zig",
+            "elixir",
+            "makefile",
+            "clojure",
+            "batch",
+        ] {
+            let file_type = file_type_for_language(language)
+                .unwrap_or_else(|| panic!("{language} has a parser but no query mapping"));
+            assert!(formats::source::supports(file_type), "{language}");
+            validate_source_query(language, "(_) @node")
+                .unwrap_or_else(|e| panic!("{language}: {e}"));
+        }
+    }
 
     /// The content/extension transition is path-derived but is written into
     /// the extraction output, so it has to be part of the disk-cache key.
@@ -1565,6 +1606,23 @@ mod tests {
         let _ = parsed.literals();
         let _ = parsed.metrics();
         assert_eq!(parsed.parse_count(), 1, "subsequent views must not reparse");
+    }
+
+    #[test]
+    fn chm_overlay_uses_archive_data_and_directory_extents() {
+        let overlay = include_bytes!("../testdata/chm/overlay-persistence-sample.chm");
+        let parsed = open(overlay).unwrap();
+        let metrics = parsed.metrics();
+        assert_eq!(metrics.get("binary.has_overlay"), Some(1.0));
+        assert_eq!(metrics.get("binary.overlay_size"), Some(1546.0));
+        assert!(metrics.get("binary.overlay_entropy").is_some());
+
+        // This CHM stores its directory after the compressed data stream.
+        // Its full physical length is archive content, despite looking like
+        // a suffix when only section-0 entries are considered.
+        let directory_at_end = include_bytes!("../testdata/chm/directory-at-end.chm");
+        let parsed = open(directory_at_end).unwrap();
+        assert_eq!(parsed.metrics().get("binary.has_overlay"), None);
     }
 
     #[test]
@@ -1833,14 +1891,21 @@ mod tests {
 
     #[test]
     fn guarded_tree_sitter_skip_records_source_error_and_metric() {
-        // Perl is intentionally treated as an unaudited external-scanner grammar
-        // and capped before invoking tree-sitter. The skip should be visible to
-        // callers instead of silently looking like a source file with no AST.
-        let source = "use strict;\nmy $x = 1;\n".repeat(4_000);
-        let parsed = open_with_path(std::path::Path::new("large.pl"), source.as_bytes()).unwrap();
+        // Python's scanner state is modeled, and indentation this deep would
+        // overflow its serialization buffer, so tree-sitter is never invoked.
+        // The skip should be visible to callers instead of silently looking
+        // like a source file with no AST.
+        let mut source = String::new();
+        for depth in 0..600 {
+            source.push_str(&" ".repeat(depth));
+            source.push_str("if x:\n");
+        }
+        source.push_str(&" ".repeat(600));
+        source.push_str("pass\n");
+        let parsed = open_with_path(std::path::Path::new("deep.py"), source.as_bytes()).unwrap();
         let metrics = parsed.metrics();
 
-        assert_eq!(parsed.fileid().file_type(), FileType::Perl);
+        assert_eq!(parsed.fileid().file_type(), FileType::Python);
         assert!(metrics.get("file.size").is_some());
         assert_eq!(metrics.get("source.ast_unavailable"), Some(1.0));
         assert_eq!(

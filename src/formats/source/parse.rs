@@ -25,10 +25,13 @@ use std::time::{Duration, Instant};
 /// builds. We can't catch a C `abort` from Rust, so the only safe
 /// option is to refuse parses that are likely to trip it.
 ///
-/// 4 MiB bounds parser memory and CPU for audited grammars while allowing
-/// ordinary larger source files to retain AST analysis. The separate wall
-/// budget below remains a backstop for pathological parser behavior.
-const MAX_AST_FILE_BYTES: usize = 4 * 1024 * 1024;
+/// 32 MiB bounds parser memory and CPU for grammars whose external scanner
+/// state is proven bounded or self-guarded, while admitting large ordinary
+/// bundles such as packaged webviews. Grammars with modeled scanner state keep
+/// a tighter cap. The wall budget below remains the backstop for pathological
+/// parser behavior.
+const MAX_AST_FILE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_MODELED_AST_FILE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Wall-clock backstop for a single parse. Input is already byte-capped by
 /// [`parse_cap_bytes`], so this exists only for the case size cannot bound:
@@ -259,8 +262,19 @@ impl<'a> TreeCache<'a> {
                 }
                 ControlFlow::Continue(())
             };
+            // tree-sitter-bash 0.25 does not know Bash 5.3's `~`/`~~` case
+            // inversion operators. Normalize their spelling to the grammar's
+            // existing `^`/`^^` case-modification productions. Replacements
+            // are length-preserving, so AST ranges still address the original
+            // source retained by TreeCache. This is syntax-only: FileFacts
+            // does not evaluate the expansion, and source-backed facts keep
+            // seeing the exact original operator bytes.
+            let normalized_shell = (file_type == FileType::Shell)
+                .then(|| normalize_bash_case_modification(source))
+                .flatten();
+            let parser_source = normalized_shell.as_deref().unwrap_or(source);
             let mut read = |offset: usize, _: tree_sitter::Point| -> &[u8] {
-                source.as_bytes().get(offset..).unwrap_or_default()
+                parser_source.as_bytes().get(offset..).unwrap_or_default()
             };
             let parsed = parser.parse_with_options(
                 &mut read,
@@ -315,6 +329,110 @@ impl<'a> TreeCache<'a> {
     pub(crate) fn file_type(&self) -> FileType {
         self.file_type
     }
+}
+
+/// Normalize Bash 5.3 `${parameter~pattern}` and `${parameter~~pattern}`
+/// operators for the older tree-sitter-bash grammar while preserving every
+/// byte offset. The original source remains authoritative for source-backed
+/// facts. Only simple Bash parameter names and special parameters are
+/// recognized; unsupported or malformed forms are left untouched and follow
+/// the normal parser recovery path.
+fn normalize_bash_case_modification(source: &str) -> Option<String> {
+    let bytes = source.as_bytes();
+    if !source.contains('~') {
+        return None;
+    }
+    // Every operator needs a `}` after it. Comparing against the last `}`
+    // keeps that check O(1) rather than rescanning the tail per `${`.
+    let last_close = memchr::memrchr(b'}', bytes)?;
+
+    let mut search_from = 0;
+    let mut normalized = None;
+    while let Some(relative) = source[search_from..].find("${") {
+        let brace = search_from + relative;
+        let Some((operator, operator_len)) =
+            bash_case_modification_operator(bytes, brace, last_close)
+        else {
+            search_from = brace + 2;
+            continue;
+        };
+        let output = normalized.get_or_insert_with(|| bytes.to_vec());
+        output[operator..operator + operator_len].copy_from_slice(if operator_len == 2 {
+            b"^^"
+        } else {
+            b"^"
+        });
+        search_from = operator + operator_len;
+    }
+    let normalized = normalized?;
+    // Replacements are ASCII and length-preserving, so valid UTF-8 stays valid.
+    Some(String::from_utf8(normalized).expect("ASCII replacement preserves UTF-8"))
+}
+
+/// Longest `name[subscript]` scanned for its closing `]`. Unbounded, a run of
+/// unterminated `${a[` openers would each rescan the rest of the file.
+const MAX_BASH_SUBSCRIPT: usize = 1024;
+
+fn bash_case_modification_operator(
+    bytes: &[u8],
+    brace: usize,
+    last_close: usize,
+) -> Option<(usize, usize)> {
+    let mut index = brace.checked_add(2)?;
+    // `${!name~~}` is indirect expansion, while `${!~~}` applies case
+    // inversion to Bash's special `!` parameter.
+    if bytes.get(index) == Some(&b'!') && bytes.get(index + 1..index + 2) != Some(b"~") {
+        index += 1;
+    }
+
+    match *bytes.get(index)? {
+        b'@' | b'*' | b'#' | b'?' | b'$' | b'!' | b'-' => index += 1,
+        b'0'..=b'9' => {
+            while matches!(bytes.get(index), Some(b'0'..=b'9')) {
+                index += 1;
+            }
+        }
+        b'A'..=b'Z' | b'a'..=b'z' | b'_' => {
+            index += 1;
+            while matches!(
+                bytes.get(index),
+                Some(b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_')
+            ) {
+                index += 1;
+            }
+            if bytes.get(index) == Some(&b'[') {
+                let subscript = &bytes[index..];
+                let subscript = &subscript[..subscript.len().min(MAX_BASH_SUBSCRIPT)];
+                let mut depth = 0usize;
+                let close = subscript.iter().position(|&byte| {
+                    match byte {
+                        b'[' => depth += 1,
+                        b']' => {
+                            depth -= 1;
+                            return depth == 0;
+                        }
+                        _ => {}
+                    }
+                    false
+                })?;
+                index += close + 1;
+            }
+        }
+        _ => return None,
+    }
+
+    if bytes.get(index) != Some(&b'~') {
+        return None;
+    }
+    let operator_len = if bytes.get(index + 1) == Some(&b'~') {
+        2
+    } else {
+        1
+    };
+    // Require a closing brace after the operator. The optional pattern may
+    // contain nested expansions; this check only rejects obviously truncated
+    // input and does not parse that pattern.
+    (last_close >= index + operator_len).then_some((index, operator_len))
 }
 
 /// Pre-check input that could overflow a tree-sitter external scanner's
@@ -399,12 +517,10 @@ fn scanner_audit(file_type: FileType) -> ScannerAudit {
         // Can overflow; modeled in [`estimated_python_scanner_bytes`].
         FileType::Python => Modeled,
 
-        // Perl's `serialize()` in `ts-parser-perl` writes up to
-        // 255 × `sizeof(TSPQuote)` (~3 KB) without a buffer-size guard,
-        // so deeply quoted input can overflow. Treat as `Unaudited`
-        // for now — the 64 KB cap blocks the bulk of the risk; a
-        // proper model (like Python's) would be the long-term fix.
-        FileType::Perl => Unaudited,
+        // `ts-parser-perl` 1.2.1 caps the quote stack to the remaining
+        // serialization buffer, bounds its heredoc queue to eight entries,
+        // and clamps that queue again during deserialization.
+        FileType::Perl => SelfGuarded,
 
         _ => Unaudited,
     }
@@ -414,9 +530,8 @@ fn scanner_audit(file_type: FileType) -> ScannerAudit {
 /// grammar with the given audit category.
 fn parse_cap_bytes(audit: ScannerAudit) -> usize {
     match audit {
-        ScannerAudit::Bounded | ScannerAudit::SelfGuarded | ScannerAudit::Modeled => {
-            MAX_AST_FILE_BYTES
-        }
+        ScannerAudit::Bounded | ScannerAudit::SelfGuarded => MAX_AST_FILE_BYTES,
+        ScannerAudit::Modeled => MAX_MODELED_AST_FILE_BYTES,
         ScannerAudit::Unaudited => UNAUDITED_GRAMMAR_CAP_BYTES,
     }
 }
@@ -527,36 +642,121 @@ fn estimated_python_delimiter_depth(source: &str) -> usize {
 mod tests {
     use super::*;
 
+    fn count_case_flip_nodes(node: tree_sitter::Node<'_>, source: &str) -> usize {
+        let mut count = usize::from(
+            node.kind() == "expansion"
+                && source
+                    .get(node.start_byte()..node.end_byte())
+                    .is_some_and(|text| text.contains('~')),
+        );
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            count += count_case_flip_nodes(child, source);
+        }
+        count
+    }
+
+    #[test]
+    fn bash_53_case_modifications_parse_with_original_source_ranges() {
+        let source = r#"printf '%s' "${value~}" "${@~~[[:lower:]]}""#;
+        let parsed = TreeCache::parse(source.as_bytes(), FileType::Shell, None)
+            .expect("Bash source should parse");
+        let cache = parsed
+            .cache()
+            .expect("Bash 5.3 syntax should retain AST facts");
+        assert!(!cache.tree().root_node().has_error());
+        assert_eq!(cache.source(), source);
+        assert_eq!(
+            count_case_flip_nodes(cache.tree().root_node(), cache.source()),
+            2
+        );
+    }
+
+    #[test]
+    fn bash_53_normalizer_leaves_other_double_tildes_alone() {
+        let source = "echo ${value/~~/x} ${fallback:-~~} ~~";
+        assert!(normalize_bash_case_modification(source).is_none());
+        assert!(normalize_bash_case_modification("echo ${value^^}").is_none());
+    }
+
+    #[test]
+    fn bash_53_normalizer_handles_special_indirect_and_array_parameters() {
+        let source = "echo ${!~~} ${!value~~} ${array[@]~~[[:lower:]]}";
+        assert_eq!(
+            normalize_bash_case_modification(source).as_deref(),
+            Some("echo ${!^^} ${!value^^} ${array[@]^^[[:lower:]]}")
+        );
+    }
+
+    #[test]
+    fn bash_53_normalizer_is_linear_on_unterminated_openers() {
+        // Each opener used to rescan the rest of the input for `]` or `}`.
+        let unterminated = "${a[".repeat(64 * 1024) + "~}";
+        assert!(normalize_bash_case_modification(&unterminated).is_none());
+        let far_close = "${a~".repeat(64 * 1024) + "}";
+        assert_eq!(
+            normalize_bash_case_modification(&far_close),
+            Some("${a^".repeat(64 * 1024) + "}")
+        );
+        let long_subscript = format!("${{a[{}]~}}", "1".repeat(MAX_BASH_SUBSCRIPT));
+        assert!(normalize_bash_case_modification(&long_subscript).is_none());
+    }
+
+    #[test]
+    fn bash_53_obfuscated_shell_regression_parses_without_losing_original_offsets() {
+        let source =
+            include_bytes!("../../../testdata/shell/bash53-case-inversion/4a5376aa6c33.sh");
+        let parsed = TreeCache::parse(source, FileType::Shell, None)
+            .expect("retained Bash obfuscation sample should parse");
+        let cache = parsed
+            .cache()
+            .expect("Bash 5.3 operator should not discard shell AST facts");
+        assert!(!cache.tree().root_node().has_error());
+        let source = std::str::from_utf8(source).expect("sample is ASCII");
+        assert_eq!(cache.source(), source);
+        assert_eq!(count_case_flip_nodes(cache.tree().root_node(), source), 2);
+    }
+
     #[test]
     fn skips_oversized_source() {
-        let huge = "x = 1\n".repeat(MAX_AST_FILE_BYTES);
+        let huge = "x = 1\n".repeat(MAX_MODELED_AST_FILE_BYTES / 6 + 1);
         assert!(would_overflow_scanner_state(FileType::Python, &huge));
     }
 
     #[test]
-    fn audited_javascript_size_cap_is_four_mibibytes() {
+    fn bounded_javascript_has_thirty_two_mibibyte_cap_while_python_stays_tighter() {
         assert_eq!(
             parse_cap_bytes(scanner_audit(FileType::JavaScript)),
+            32 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_cap_bytes(scanner_audit(FileType::Python)),
             4 * 1024 * 1024
         );
-        // The general size cap must not mistake a normal large JS file for
-        // scanner-state pressure: JavaScript's external scanner is bounded.
-        let source = "const value = 1;\n".repeat(180_000);
-        assert!(source.len() > 2 * 1024 * 1024);
+        // JavaScript's external scanner serializes no state, so ordinary
+        // bundled source beyond the former 16 MiB cap is not scanner-state pressure.
+        let source = format!("/*{}*/\nconst value = 1;", "x".repeat(20 * 1024 * 1024));
+        assert!(source.len() > 16 * 1024 * 1024);
         assert!(source.len() < MAX_AST_FILE_BYTES);
         assert!(!would_overflow_scanner_state(FileType::JavaScript, &source));
     }
 
     #[test]
-    fn parses_javascript_above_the_old_two_mibibyte_cap() {
-        let source = "const value = 1;\n".repeat(180_000);
-        assert!(source.len() > 2 * 1024 * 1024);
+    fn parses_javascript_above_the_old_sixteen_mibibyte_cap() {
+        let source = format!("/*{}*/\nconst value = 1;", "x".repeat(20 * 1024 * 1024));
+        assert!(source.len() > 16 * 1024 * 1024);
         let parsed = TreeCache::parse(source.as_bytes(), FileType::JavaScript, None)
             .expect("bounded JavaScript source should parse");
         assert!(
             parsed.cache().is_some(),
-            "audited JavaScript below 4 MiB should retain AST facts"
+            "audited JavaScript below 32 MiB should retain AST facts"
         );
+    }
+
+    #[test]
+    fn bounded_javascript_still_refuses_source_above_thirty_two_mibibytes() {
+        let source = "x".repeat(MAX_AST_FILE_BYTES + 1);
+        assert!(would_overflow_scanner_state(FileType::JavaScript, &source));
     }
 
     /// An exhausted budget must degrade to a diagnostic, not an `Err` and not a
@@ -689,18 +889,53 @@ def greet(name, count):
 
     #[test]
     fn unaudited_grammars_use_tight_cap() {
-        // Perl is known-unguarded and routed to `Unaudited`. The cap
-        // for unaudited grammars must be the tighter
-        // `UNAUDITED_GRAMMAR_CAP_BYTES`, not the 2 MB default — a
-        // 200 KB Perl source should be rejected even though the same
-        // size is fine for audited grammars.
+        // Unrecognized text has no grammar audit entry. Keep it below
+        // the normal parser cap until a grammar is added and audited.
         let source = "1;\n".repeat(80_000); // ~240 KB.
         assert!(source.len() > UNAUDITED_GRAMMAR_CAP_BYTES);
         assert!(source.len() < MAX_AST_FILE_BYTES);
-        assert!(would_overflow_scanner_state(FileType::Perl, &source));
-        // The same source under an audited grammar with a 2 MB cap
-        // passes through (Shell is `SelfGuarded`).
+        assert!(would_overflow_scanner_state(FileType::Text, &source));
+        // The same source under an audited, self-guarded grammar passes.
         assert!(!would_overflow_scanner_state(FileType::Shell, &source));
+    }
+
+    #[test]
+    fn parses_large_perl_source_with_self_guarded_scanner() {
+        assert_eq!(scanner_audit(FileType::Perl), ScannerAudit::SelfGuarded);
+        assert_eq!(
+            parse_cap_bytes(scanner_audit(FileType::Perl)),
+            MAX_AST_FILE_BYTES
+        );
+
+        // Mirrors ordinary installed tooling such as Wine's 95 KB winemaker
+        // script: large source size alone does not imply a deep quote stack.
+        let source = format!("#{}\nmy $value = 1;\n", "x".repeat(95_000));
+        assert!(source.len() > UNAUDITED_GRAMMAR_CAP_BYTES);
+        assert!(!would_overflow_scanner_state(FileType::Perl, &source));
+        let parsed = TreeCache::parse(source.as_bytes(), FileType::Perl, None)
+            .expect("self-guarded Perl scanner should parse large ordinary source");
+        let cache = parsed
+            .cache()
+            .expect("large Perl source should retain AST facts");
+        assert!(!cache.tree().root_node().has_error());
+    }
+
+    #[test]
+    fn deeply_nested_perl_quotes_stay_within_scanner_serialization_buffer() {
+        let mut source = String::from("my $value = ");
+        for _ in 0..80 {
+            source.push_str("qq{ ${\\ ");
+        }
+        source.push_str("'value'");
+        for _ in 0..80 {
+            source.push_str(" }}");
+        }
+        source.push_str(";\n");
+
+        assert!(!would_overflow_scanner_state(FileType::Perl, &source));
+        let parsed = TreeCache::parse(source.as_bytes(), FileType::Perl, None)
+            .expect("self-guarded scanner must not abort on deep quote stacks");
+        assert!(parsed.cache().is_some());
     }
 
     #[test]
@@ -737,19 +972,13 @@ def greet(name, count):
         ];
         for ft in audited {
             // Bounded/SelfGuarded/Modeled — anything but Unaudited
-            // counts as "explicit entry". Perl is the only audited
-            // type that maps to Unaudited (with a comment explaining
-            // why), so allow it.
+            // counts as an explicit scanner audit entry.
             let audit = scanner_audit(*ft);
-            if *ft == FileType::Perl {
-                assert_eq!(audit, ScannerAudit::Unaudited);
-            } else {
-                assert_ne!(
-                    audit,
-                    ScannerAudit::Unaudited,
-                    "{ft:?} fell through to Unaudited — add explicit audit entry"
-                );
-            }
+            assert_ne!(
+                audit,
+                ScannerAudit::Unaudited,
+                "{ft:?} fell through to Unaudited — add explicit audit entry"
+            );
         }
     }
 

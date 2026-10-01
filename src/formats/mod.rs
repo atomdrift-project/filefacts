@@ -382,7 +382,7 @@ pub(crate) fn extract(
         FileType::PkgInfo => structured::extract_pkginfo(bytes, values),
         FileType::SrcInfo => pkgmeta::extract_srcinfo(bytes, values),
         FileType::Registry => registry::extract(bytes, values, metrics),
-        FileType::Chm => chm::extract(bytes, values, strings, metrics),
+        FileType::Chm => chm::extract(bytes, values, strings, metrics, image_end),
         FileType::JavaClass => class::extract(bytes, values, strings, metrics, symbols),
         FileType::Jpeg => jpeg::extract(bytes, values, strings, metrics),
         FileType::Lnk => lnk::extract(bytes, values, strings, metrics),

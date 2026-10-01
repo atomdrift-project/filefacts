@@ -42,6 +42,7 @@ pub(super) fn extract(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
+    image_end: &mut Option<u64>,
 ) -> Result<(), Error> {
     extract_binary_strings(bytes, strings, XorScan::No);
 
@@ -75,6 +76,34 @@ pub(super) fn extract(
     if entries.is_empty() {
         return Ok(());
     }
+
+    // The archive consists of the ITSF directory and the physical data
+    // extents for section-0 entries. Section-1 offsets are logical offsets
+    // into the LZX stream and cannot be used as file offsets. This handles
+    // both common layouts: data before the directory, and a directory at
+    // the end of the file. Ignore invalid entry extents rather than letting
+    // malformed offsets hide an appended payload.
+    let Some(directory_end) = section1_offset.checked_add(section1_length) else {
+        return Ok(());
+    };
+    let mut logical_end = directory_end as u64;
+    for entry in entries.iter().filter(|entry| entry.section == 0) {
+        let (Ok(offset), Ok(length)) =
+            (usize::try_from(entry.offset), usize::try_from(entry.length))
+        else {
+            continue;
+        };
+        let Some(end) = data_offset
+            .checked_add(offset)
+            .and_then(|start| start.checked_add(length))
+        else {
+            continue;
+        };
+        if end <= bytes.len() {
+            logical_end = logical_end.max(end as u64);
+        }
+    }
+    *image_end = Some(image_end.unwrap_or(0).max(logical_end));
 
     // Presence-flag accumulator + user-visible entry list + roll-ups.
     let mut features: Vec<&'static str> = Vec::new();
@@ -615,7 +644,8 @@ mod tests {
         let mut v = Values::new();
         let mut s = Strings::default();
         let mut m = Metrics::new();
-        extract(bytes, &mut v, &mut s, &mut m).unwrap();
+        let mut image_end = None;
+        extract(bytes, &mut v, &mut s, &mut m, &mut image_end).unwrap();
         (v, m)
     }
 

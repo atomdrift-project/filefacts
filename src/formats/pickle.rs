@@ -147,12 +147,10 @@ fn payload_size(op: u8, i: usize, scan: &[u8]) -> Option<usize> {
         Some(2 + nl)
     };
     let read_len_prefixed = |len_bytes: usize, len_value: usize| -> Option<usize> {
-        let frame = 1 + len_bytes + len_value;
-        if i + frame > scan.len() {
-            None
-        } else {
-            Some(frame)
-        }
+        // `len_value` comes from the file; unchecked, a u64 length wraps the
+        // frame to 0 and the caller's scan never advances.
+        let frame = len_value.checked_add(1 + len_bytes)?;
+        (i.checked_add(frame)? <= scan.len()).then_some(frame)
     };
     match op {
         0x80 | b'K' | 0x82 | b'h' | b'q' => Some(2),
@@ -177,7 +175,7 @@ fn payload_size(op: u8, i: usize, scan: &[u8]) -> Option<usize> {
         }
         0x8D | 0x96 => {
             let bytes = scan.get(i + 1..i + 9)?.try_into().ok()?;
-            let len = u64::from_le_bytes(bytes) as usize;
+            let len = usize::try_from(u64::from_le_bytes(bytes)).ok()?;
             read_len_prefixed(8, len)
         }
         _ => Some(1),
@@ -369,6 +367,16 @@ mod tests {
         let mut m = Metrics::new();
         extract(bytes, &mut v, &mut s, &mut m).unwrap();
         (v, m)
+    }
+
+    #[test]
+    fn oversized_binbytes8_length_ends_the_scan() {
+        // PROTO 4, then BINBYTES8 whose length makes `1 + 8 + len` wrap to 0.
+        let data = [
+            0x80, 4, 0x8D, 0xF7, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        ];
+        let (_, m) = run(&data);
+        assert_eq!(m.get("pickle.protocol"), Some(4.0));
     }
 
     #[test]

@@ -272,8 +272,15 @@ pub(super) fn extract_from_zip<R: Read + Seek>(
     if entry.size() > MAX_STREAM_SIZE {
         return;
     }
+    // `size()` is the header's claim; the zip reader does not stop the
+    // inflater there, so cap the actual output as well.
     let mut bytes = Vec::with_capacity(entry.size() as usize);
-    if entry.read_to_end(&mut bytes).is_err() {
+    if (&mut entry)
+        .take(MAX_STREAM_SIZE + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > MAX_STREAM_SIZE
+    {
         return;
     }
     extract(&bytes, values, metrics, symbols_out);

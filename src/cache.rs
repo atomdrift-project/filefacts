@@ -285,13 +285,18 @@ fn store_at_path<T: serde::Serialize>(path: &Path, value: &T) {
     let Ok(compressed) = zstd::encode_all(&serialized[..], 3) else {
         return;
     };
-    let tmp = path.with_extension("tmp");
-    if let Ok(mut f) = fs::File::create(&tmp) {
-        if f.write_all(&compressed).is_ok() {
-            let _ = fs::rename(&tmp, path);
-        } else {
-            let _ = fs::remove_file(&tmp);
-        }
+    // A uniquely named sibling, not `path.with_extension("tmp")`: two
+    // processes storing the same key would otherwise write through one temp
+    // file and could rename a mix of both into place. Dropped unpersisted,
+    // the temp file deletes itself.
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let Ok(mut tmp) = tempfile::NamedTempFile::new_in(dir) else {
+        return;
+    };
+    if tmp.write_all(&compressed).is_ok() {
+        let _ = tmp.persist(path);
     }
 }
 
@@ -674,6 +679,24 @@ mod tests {
         let loaded: Payload =
             load_from_path(&path).expect("cache should hit immediately after store");
         assert_eq!(loaded, original);
+    }
+
+    #[test]
+    fn concurrent_stores_of_one_key_leave_a_whole_entry() {
+        let bytes = unique_bytes("concurrent_store");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sha = sha256_hex(&bytes);
+        let path = test_entry_path(tmp.path(), &sha).expect("cache path");
+        let payloads: Vec<Vec<u32>> = (0..8).map(|i| vec![i; 64 * 1024]).collect();
+        std::thread::scope(|scope| {
+            for payload in &payloads {
+                scope.spawn(|| store_at_path(&path, payload));
+            }
+        });
+        let loaded: Vec<u32> = load_from_path(&path).expect("entry must decode");
+        assert!(payloads.contains(&loaded));
+        let files = fs::read_dir(path.parent().unwrap()).unwrap().count();
+        assert_eq!(files, 1, "temp files must not be left behind");
     }
 
     #[test]

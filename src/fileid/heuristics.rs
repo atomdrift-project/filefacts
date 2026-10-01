@@ -12,7 +12,6 @@
 
 use std::{borrow::Cow, sync::OnceLock};
 
-use super::doscom::DOS_COM_MAX_SIZE;
 use super::{
     FileType, scripts,
     scripts::{contains, contains_ci, find_ci},
@@ -23,6 +22,9 @@ const MIN_CONTENT_BYTES: usize = 16;
 
 /// Maximum bytes to scan for heuristics.
 const SCAN_LIMIT: usize = 4096;
+
+/// Largest image a DOS COM program can occupy: one 64 KiB segment less the PSP.
+pub(super) const DOS_COM_MAX_SIZE: usize = 0xFF00;
 
 /// How many bytes from the end to check when the head is mostly whitespace.
 const TAIL_SIZE: usize = 2048;
@@ -376,7 +378,6 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"(if-let [", Lang::Clojure, 5),
     (b"(when-let [", Lang::Clojure, 5),
     (b"(fn [", Lang::Clojure, 5),
-    (b"#'", Lang::Clojure, 5),
     // ── AppleScript ──
     // AMOS/Shub-family stealers are routinely delivered as plaintext AppleScript
     // with a random or `.unknown` extension, so content sniffing matters. These
@@ -1271,6 +1272,30 @@ pub(crate) fn looks_like_html(data: &[u8]) -> bool {
 pub(crate) fn unmistakable(data: &[u8]) -> Option<FileType> {
     let data = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(data);
     let head = &data[..data.len().min(2048)];
+    if looks_like_git_config(head) {
+        return Some(FileType::Text);
+    }
+    // Manual pages are troff input, not source code. Roff's short requests
+    // (for example `.B`, `.I`, and `.PP`) collide with source-language
+    // tokens, so recognize a page title together with several distinct
+    // requests before the language scorer can mistake prose for JavaScript.
+    if looks_like_roff_man_page(head) {
+        return Some(FileType::Text);
+    }
+    // Makefile fragments often have no canonical basename, and media-like
+    // suffixes are used for library-specific include fragments (for example,
+    // `makefile.jpeg` and `makefile.png`). Strong make syntax in the bytes is
+    // more reliable than that suffix; a valid media signature has already
+    // won in magic::detect_from_content before this heuristic runs.
+    if looks_like_makefile(head) {
+        return Some(FileType::Makefile);
+    }
+    // Ace ships JSP snippets as a JavaScript AMD module. Its snippet strings
+    // contain many JSP page directives, so recognize the wrapper before those
+    // embedded examples can make a snippet catalog look like a server page.
+    if contains_ci(head, b"define(\"ace/snippets/") && contains_ci(head, b"exports.snippetText") {
+        return Some(FileType::JavaScript);
+    }
     // `<%@ Page Language="C#"` is ASP.NET. `<%@ page` / `<%@page` otherwise
     // is JSP. Classic ASP is `<%@ Language` with no `page` word. The ASP
     // forms have to win, or the shared `<%@ page` prefix swallows them.
@@ -1308,25 +1333,316 @@ pub(crate) fn unmistakable(data: &[u8]) -> Option<FileType> {
     None
 }
 
-/// DOS COM has no header. A visible `CD 21` is strong evidence; compact
-/// encrypted samples may instead start with a recognized in-place XOR stub.
+/// Recognize Git's config syntax from a bounded prefix. `.git/config` has no
+/// extension and content is its only reliable identity; content must also win
+/// over a misleading filename such as `Makefile` or `settings.py`.
+pub(crate) fn looks_like_git_config(data: &[u8]) -> bool {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Section {
+        Core,
+        Remote,
+        Branch,
+        Filter,
+        User,
+        Other,
+    }
+
+    let data = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(data);
+    let head = &data[..data.len().min(SCAN_LIMIT)];
+    if head.is_empty() || looks_like_binary(head) {
+        return false;
+    }
+
+    let mut section = Section::Other;
+    let mut recognized_section = false;
+    let mut recognized_key = false;
+    let mut meaningful_lines = 0usize;
+    let mut config_lines = 0usize;
+
+    for raw_line in head.split(|&byte| byte == b'\n') {
+        let line = raw_line.trim_ascii();
+        if line.is_empty() || line.starts_with(b"#") || line.starts_with(b";") {
+            continue;
+        }
+        meaningful_lines += 1;
+
+        if line.starts_with(b"[") && line.ends_with(b"]") {
+            let name = &line[1..line.len() - 1];
+            section = if name.eq_ignore_ascii_case(b"core") {
+                recognized_section = true;
+                Section::Core
+            } else if git_config_subsection(name, b"remote") {
+                recognized_section = true;
+                Section::Remote
+            } else if git_config_subsection(name, b"branch") {
+                recognized_section = true;
+                Section::Branch
+            } else if git_config_subsection(name, b"filter") {
+                recognized_section = true;
+                Section::Filter
+            } else if name.eq_ignore_ascii_case(b"user") {
+                recognized_section = true;
+                Section::User
+            } else {
+                Section::Other
+            };
+            config_lines += 1;
+            continue;
+        }
+
+        let Some(equal) = line.iter().position(|&byte| byte == b'=') else {
+            continue;
+        };
+        let key = line[..equal].trim_ascii();
+        if key.is_empty()
+            || !key
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'.'))
+        {
+            continue;
+        }
+        config_lines += 1;
+        let known = match section {
+            Section::Core => [
+                b"repositoryformatversion".as_slice(),
+                b"filemode",
+                b"bare",
+                b"logallrefupdates",
+                b"ignorecase",
+                b"precomposeunicode",
+                b"symlinks",
+                b"worktree",
+                b"fsmonitor",
+                b"hookspath",
+                b"excludesfile",
+            ]
+            .iter()
+            .any(|candidate| key.eq_ignore_ascii_case(candidate)),
+            Section::Remote => [
+                b"url".as_slice(),
+                b"fetch",
+                b"pushurl",
+                b"mirror",
+                b"tagopt",
+            ]
+            .iter()
+            .any(|candidate| key.eq_ignore_ascii_case(candidate)),
+            Section::Branch => [b"remote".as_slice(), b"merge", b"rebase", b"pushremote"]
+                .iter()
+                .any(|candidate| key.eq_ignore_ascii_case(candidate)),
+            Section::Filter => [b"clean".as_slice(), b"smudge", b"process", b"required"]
+                .iter()
+                .any(|candidate| key.eq_ignore_ascii_case(candidate)),
+            Section::User => [b"name".as_slice(), b"email", b"signingkey"]
+                .iter()
+                .any(|candidate| key.eq_ignore_ascii_case(candidate)),
+            Section::Other => false,
+        };
+        recognized_key |= known;
+    }
+
+    recognized_section
+        && recognized_key
+        && meaningful_lines >= 2
+        && config_lines * 10 >= meaningful_lines * 9
+}
+
+fn git_config_subsection(header: &[u8], name: &[u8]) -> bool {
+    let Some(rest) = header.get(name.len()..) else {
+        return false;
+    };
+    header[..name.len()].eq_ignore_ascii_case(name)
+        && rest.starts_with(b" \"")
+        && rest.len() > 3
+        && rest.ends_with(b"\"")
+}
+
+/// Recognize traditional `man` pages by their title request and a varied set
+/// of formatting requests. A single `.TH` or `.SH` line in code or prose is
+/// too weak; distinct requests make the roff document structure explicit.
+fn looks_like_roff_man_page(head: &[u8]) -> bool {
+    const REQUESTS: [&[u8]; 19] = [
+        b"TH", b"SH", b"SS", b"PP", b"LP", b"P", b"TP", b"IP", b"B", b"I", b"BR", b"BI", b"RB",
+        b"IR", b"nf", b"fi", b"de", b"ds", b"sp",
+    ];
+
+    let mut seen = [false; REQUESTS.len()];
+    let mut distinct = 0usize;
+    let mut has_title = false;
+
+    for line in head.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some((&control, rest)) = line.split_first() else {
+            continue;
+        };
+        if control != b'.' && control != b'\'' {
+            continue;
+        }
+        let end = rest
+            .iter()
+            .position(u8::is_ascii_whitespace)
+            .unwrap_or(rest.len());
+        let request = &rest[..end];
+        if request == b"TH" {
+            has_title = true;
+        }
+        if let Some(index) = REQUESTS.iter().position(|known| *known == request) {
+            if !seen[index] {
+                seen[index] = true;
+                distinct += 1;
+            }
+        }
+    }
+
+    has_title && distinct >= 5
+}
+
+/// Recognize compact Makefile fragments from independent make-language
+/// structures. The assignment plus `$(shell ...)` form covers
+/// library-specific include fragments; a target followed by a tab-indented
+/// recipe covers ordinary build files.
+fn looks_like_makefile(head: &[u8]) -> bool {
+    let mut assignments = 0usize;
+    let mut shell_functions = 0usize;
+    let mut include_directives = 0usize;
+    let mut has_target = false;
+    let mut has_recipe = false;
+
+    for line in head.split(|&byte| byte == b'\n') {
+        let trimmed = line.trim_ascii();
+        if trimmed.is_empty() || trimmed.starts_with(b"#") {
+            continue;
+        }
+        if line.starts_with(b"\t") {
+            has_recipe = true;
+        }
+        if trimmed.starts_with(b"include ") || trimmed.starts_with(b"-include ") {
+            include_directives += 1;
+        }
+        if trimmed.windows(8).any(|window| window == b"$(shell ") {
+            shell_functions += 1;
+        }
+
+        let operators = [
+            b"?=".as_slice(),
+            b":=".as_slice(),
+            b"+=".as_slice(),
+            b"=".as_slice(),
+        ];
+        if let Some(index) = operators
+            .iter()
+            .find_map(|operator| trimmed.windows(operator.len()).position(|w| w == *operator))
+        {
+            let name = trimmed[..index].trim_ascii_end();
+            if !name.is_empty()
+                && name
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                assignments += 1;
+            }
+        } else if line == trimmed && !trimmed.starts_with(b"//") {
+            // Make target definitions start in column zero. Requiring that
+            // also prevents indented source comments such as `//post:` from
+            // combining with unrelated tab-indented code into a false match.
+            let Some(colon) = trimmed.iter().position(|&byte| byte == b':') else {
+                continue;
+            };
+            let target = &trimmed[..colon];
+            if !target.is_empty() && !target.iter().any(u8::is_ascii_whitespace) {
+                has_target = true;
+            }
+        }
+    }
+
+    (assignments >= 2 && (shell_functions > 0 || include_directives > 0))
+        || (has_target && has_recipe)
+}
+
+/// DOS COM has no header. A visible `CD 21` is strong evidence.
 pub(crate) fn looks_like_dos_com(data: &[u8]) -> bool {
     if data.len() > DOS_COM_MAX_SIZE {
         return false;
     }
     let head = &data[..data.len().min(4096)];
-    head.windows(2).any(|w| w == [0xCD, 0x21]) || super::doscom::looks_like_xor_stub(data)
+    head.windows(2).any(|w| w == [0xCD, 0x21])
+}
+
+/// Recognize a standalone FAT12/16/32 volume boot sector. Require the BIOS
+/// jump, 0x55AA boot signature, and mutually plausible BPB fields; the final
+/// two bytes alone are common in unrelated 512-byte data and are not enough.
+pub(crate) fn looks_like_fat_boot_sector(data: &[u8]) -> bool {
+    if data.len() < 512
+        || data[510..512] != [0x55, 0xAA]
+        || !matches!(data[0], 0xE9 | 0xEB)
+        || (data[0] == 0xEB && data[2] != 0x90)
+    {
+        return false;
+    }
+
+    let bytes_per_sector = u16::from_le_bytes([data[11], data[12]]);
+    let sectors_per_cluster = data[13];
+    let reserved_sectors = u16::from_le_bytes([data[14], data[15]]);
+    let fat_count = data[16];
+    let total_sectors_16 = u16::from_le_bytes([data[19], data[20]]);
+    let media = data[21];
+    let fat_size_16 = u16::from_le_bytes([data[22], data[23]]);
+    let sectors_per_track = u16::from_le_bytes([data[24], data[25]]);
+    let heads = u16::from_le_bytes([data[26], data[27]]);
+    let total_sectors_32 = u32::from_le_bytes([data[32], data[33], data[34], data[35]]);
+    let fat_size_32 = u32::from_le_bytes([data[36], data[37], data[38], data[39]]);
+
+    let valid_sector_size = matches!(bytes_per_sector, 512 | 1024 | 2048 | 4096);
+    let valid_cluster_size = sectors_per_cluster.is_power_of_two() && sectors_per_cluster <= 128;
+    let valid_media = media == 0xF0 || media >= 0xF8;
+    let has_fat_size = fat_size_16 != 0 || fat_size_32 != 0;
+    let has_volume_size = total_sectors_16 != 0 || total_sectors_32 != 0;
+
+    valid_sector_size
+        && valid_cluster_size
+        && reserved_sectors != 0
+        && (1..=4).contains(&fat_count)
+        && valid_media
+        && has_fat_size
+        && has_volume_size
+        && (1..=63).contains(&sectors_per_track)
+        && heads != 0
 }
 
 /// A headerless binary with no telling name that is still shaped like a DOS
 /// COM program. A single `CD 21` is too common in arbitrary binary metadata,
-/// so unnamed files need an adjacent DOS service selector or a recognized XOR
-/// stub before we assign an executable type.
+/// so unnamed files need an adjacent DOS service selector or a complete
+/// overwriter shape before we assign an executable type.
 pub(crate) fn looks_like_unnamed_dos_com(data: &[u8]) -> bool {
     data.len() >= 16
         && data.len() <= DOS_COM_MAX_SIZE
-        && binary_not_source(data)
-        && (has_dos_service_call(data) || super::doscom::looks_like_xor_stub(data))
+        && ((binary_not_source(data) && has_dos_service_call(data))
+            || looks_like_dos_com_overwriter(data))
+}
+
+/// A short DOS overwriter may be mostly zero-padded, so the general binary
+/// classifier can treat its bytes as text-like. Require its complete small
+/// execution shape before overriding that result: repeated DOS interrupts,
+/// DOS termination, and a COM wildcard in the code/data prefix.
+fn looks_like_dos_com_overwriter(data: &[u8]) -> bool {
+    if !(64..=DOS_COM_MAX_SIZE).contains(&data.len()) {
+        return false;
+    }
+    let prefix = &data[..data.len().min(256)];
+    let dos_calls = prefix.windows(2).filter(|w| *w == [0xCD, 0x21]).count();
+    dos_calls >= 2
+        && prefix.windows(2).any(|w| w == [0xCD, 0x20])
+        && contains_ascii_case_insensitive(prefix, b"*.com\0")
+}
+
+fn contains_ascii_case_insensitive(data: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && data.windows(needle.len()).any(|window| {
+            window
+                .iter()
+                .zip(needle)
+                .all(|(left, right)| left.eq_ignore_ascii_case(right))
+        })
 }
 
 fn has_dos_service_call(data: &[u8]) -> bool {
@@ -1360,8 +1676,10 @@ fn looks_like_asp_directive(head: &[u8]) -> bool {
     let page = contains_ci(head, b"<%@page") || contains_ci(head, b"<%@ page");
     page && (contains_ci(head, b"language=\"c#\"")
         || contains_ci(head, b"language=\"vb\"")
+        || contains_ci(head, b"language=\"jscript\"")
         || contains_ci(head, b"language='c#'")
-        || contains_ci(head, b"language='vb'"))
+        || contains_ci(head, b"language='vb'")
+        || contains_ci(head, b"language='jscript'"))
 }
 
 /// `rule <name>` plus both section labels. YARA keywords are lowercase;
@@ -1388,6 +1706,115 @@ fn trim_ascii_start(bytes: &[u8]) -> &[u8] {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn fat12_boot_sector() -> [u8; 512] {
+        let mut data = [0u8; 512];
+        data[..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
+        data[3..11].copy_from_slice(b"MSDOS5.0");
+        data[11..13].copy_from_slice(&512u16.to_le_bytes());
+        data[13] = 1;
+        data[14..16].copy_from_slice(&1u16.to_le_bytes());
+        data[16] = 2;
+        data[17..19].copy_from_slice(&224u16.to_le_bytes());
+        data[19..21].copy_from_slice(&2880u16.to_le_bytes());
+        data[21] = 0xF0;
+        data[22..24].copy_from_slice(&9u16.to_le_bytes());
+        data[24..26].copy_from_slice(&18u16.to_le_bytes());
+        data[26..28].copy_from_slice(&2u16.to_le_bytes());
+        data[510..].copy_from_slice(&[0x55, 0xAA]);
+        data
+    }
+
+    fn fat32_boot_sector() -> [u8; 512] {
+        let mut data = [0u8; 512];
+        data[..3].copy_from_slice(&[0xEB, 0x58, 0x90]);
+        data[3..11].copy_from_slice(b"MSWIN4.1");
+        data[11..13].copy_from_slice(&512u16.to_le_bytes());
+        data[13] = 8;
+        data[14..16].copy_from_slice(&32u16.to_le_bytes());
+        data[16] = 2;
+        data[21] = 0xF8;
+        data[24..26].copy_from_slice(&63u16.to_le_bytes());
+        data[26..28].copy_from_slice(&255u16.to_le_bytes());
+        data[32..36].copy_from_slice(&1_000_000u32.to_le_bytes());
+        data[36..40].copy_from_slice(&976u32.to_le_bytes());
+        data[510..].copy_from_slice(&[0x55, 0xAA]);
+        data
+    }
+
+    #[test]
+    fn padded_dos_com_overwriter_is_recognized_without_loose_interrupt_matches() {
+        const ANTON: &[u8] = include_bytes!("../../testdata/dos-com/anton-97");
+        assert!(looks_like_dos_com_overwriter(ANTON));
+
+        let mut one_interrupt = vec![0u8; 5120];
+        one_interrupt[0..6].copy_from_slice(b"*.COM\0");
+        one_interrupt[16..18].copy_from_slice(&[0xCD, 0x21]);
+        one_interrupt[32..34].copy_from_slice(&[0xCD, 0x20]);
+        assert!(!looks_like_dos_com_overwriter(&one_interrupt));
+
+        let mut no_wildcard = one_interrupt.clone();
+        no_wildcard[24..26].copy_from_slice(&[0xCD, 0x21]);
+        no_wildcard[0..6].copy_from_slice(b"plain\0");
+        assert!(!looks_like_dos_com_overwriter(&no_wildcard));
+
+        let text = b"uses INT 21 and INT 20 while searching *.COM\n";
+        assert!(!looks_like_dos_com_overwriter(text));
+    }
+
+    #[test]
+    fn fat_boot_sector_accepts_valid_fat12_and_fat32_bpbs() {
+        let sector = fat12_boot_sector();
+        assert!(looks_like_fat_boot_sector(&sector));
+        assert!(looks_like_fat_boot_sector(&fat32_boot_sector()));
+    }
+
+    #[test]
+    fn fat_boot_sector_rejects_each_required_bpb_field_when_invalid() {
+        let sector = fat12_boot_sector();
+        let mut mutations: Vec<(&str, Box<dyn Fn(&mut [u8; 512])>)> = vec![
+            (
+                "bytes per sector",
+                Box::new(|b| b[11..13].copy_from_slice(&513u16.to_le_bytes())),
+            ),
+            ("cluster size", Box::new(|b| b[13] = 3)),
+            ("reserved sectors", Box::new(|b| b[14..16].fill(0))),
+            ("fat count", Box::new(|b| b[16] = 0)),
+            ("media descriptor", Box::new(|b| b[21] = 0)),
+            (
+                "fat size",
+                Box::new(|b| {
+                    b[22..24].fill(0);
+                    b[36..40].fill(0);
+                }),
+            ),
+            (
+                "volume size",
+                Box::new(|b| {
+                    b[19..21].fill(0);
+                    b[32..36].fill(0);
+                }),
+            ),
+            ("sectors per track", Box::new(|b| b[24..26].fill(0))),
+            ("head count", Box::new(|b| b[26..28].fill(0))),
+            ("jump opcode", Box::new(|b| b[0] = 0x90)),
+            ("short jump NOP", Box::new(|b| b[2] = 0x91)),
+            ("boot signature", Box::new(|b| b[511] = 0)),
+        ];
+        for (name, mutate) in mutations.drain(..) {
+            let mut invalid = sector;
+            mutate(&mut invalid);
+            assert!(
+                !looks_like_fat_boot_sector(&invalid),
+                "accepted invalid {name}"
+            );
+        }
+
+        let mut signature_only = [0x41u8; 512];
+        signature_only[510..].copy_from_slice(&[0x55, 0xAA]);
+        assert!(!looks_like_fat_boot_sector(&signature_only));
+        assert!(!looks_like_fat_boot_sector(&sector[..511]));
+    }
 
     #[test]
     fn prose_with_keywords_is_not_source() {
@@ -2037,6 +2464,15 @@ mod binary_guard_tests {
     fn real_clojure_still_detected() {
         let src = b"(ns app.core\n  (:require [clojure.string :as str]))\n\n(defn greet [n]\n  (str \"hi \" n))\n";
         assert_eq!(detect_from_content(src), Some(FileType::Clojure));
+    }
+
+    #[test]
+    fn python_comments_with_clojure_var_quote_tokens_stay_python() {
+        // A sample uploader comments out lists of tags as `#'exe`, `#'elf`,
+        // etc. Treating that Python comment prefix as Clojure's var-quote
+        // reader macro outweighed strong Python imports and function syntax.
+        let src = b"import os\nimport json\nimport requests\n\ndef submit_samples(auth_key, folder_path):\n    tags = [\n        #'exe', #'elf', #'trojan', #'dropper',\n    ]\n    try:\n        response = requests.post(url, files=tags)\n    except Exception as e:\n        print(e)\n";
+        assert_eq!(detect_from_content(src), Some(FileType::Python));
     }
 
     #[test]

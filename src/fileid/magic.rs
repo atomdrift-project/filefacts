@@ -5,6 +5,7 @@
 
 use std::{io::Read, path::Path};
 
+use super::scripts::find_ci;
 use super::{ArchiveFormat, Compression, DetectionSource, FileType, container_of};
 
 /// LNK shell link CLSID header (20 bytes).
@@ -51,6 +52,24 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
     // NUL or control byte near the front; a script that merely opens with the
     // same letters (`MZ=1;…`, `true && …`, `GIF89a=…`) carries none.
     let text = content_is_text(data);
+
+    // A Go module manifest has no magic bytes, but its first non-comment
+    // directive is unambiguous. Detect it from content so renamed `go.mod`
+    // files still reach module-aware facts and rules before extension fallback.
+    if text && looks_like_go_mod(data) {
+        // Keep the canonical manifest name as a consistent identity while
+        // allowing content to override every other filename or extension.
+        let source = if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("go.mod"))
+        {
+            DetectionSource::Filename
+        } else {
+            DetectionSource::Heuristic
+        };
+        return Some((FileType::GoMod, source));
+    }
 
     // ISO base media (`.mp4`/`.m4a`/`.mov`): the size-prefixed `ftyp` box.
     // Keyed at offset 4, so it cannot live in the first-byte jump table.
@@ -124,7 +143,31 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         let doctype_html = head.len() >= 14 && head[..14].eq_ignore_ascii_case(b"<!DOCTYPE html");
         let html_root = head[..5].eq_ignore_ascii_case(b"<html")
             && head.get(5).is_none_or(|c| !c.is_ascii_alphanumeric());
-        if doctype_html || html_root {
+        // Some compromised pages prepend a short external-script loader before
+        // the doctype. The complete document root still provides stronger type
+        // evidence than a hash-like or misleading filename. Keep this bounded
+        // and require the doctype and root together so ordinary JavaScript
+        // fragments containing one HTML token do not become documents.
+        let prefixed_html_document = {
+            let prefix = &head[..head.len().min(512)];
+            let doctype = prefix
+                .windows(14)
+                .position(|w| w.eq_ignore_ascii_case(b"<!DOCTYPE html"));
+            let root = prefix
+                .windows(5)
+                .position(|w| w.eq_ignore_ascii_case(b"<html"));
+            let starts_with_script = prefix
+                .get(..7)
+                .is_some_and(|tag| tag.eq_ignore_ascii_case(b"<script"));
+            let script_end = prefix
+                .windows(9)
+                .position(|w| w.eq_ignore_ascii_case(b"</script>"));
+            starts_with_script
+                && matches!((doctype, root, script_end), (Some(d), Some(r), Some(e)) if e < d && d < r)
+                && root
+                    .is_some_and(|r| prefix.get(r + 5).is_none_or(|c| !c.is_ascii_alphanumeric()))
+        };
+        if doctype_html || html_root || prefixed_html_document {
             return Some((FileType::Html, DetectionSource::Magic));
         }
     }
@@ -1684,11 +1727,6 @@ fn decode_char_refs(value: &[u8]) -> String {
     out
 }
 
-fn find_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len())
-        .position(|w| w.eq_ignore_ascii_case(needle))
-}
-
 /// Script Encoder output: `#@~^` + base64 length + `==`. The cipher hides
 /// which language was encoded, so the one call the bytes cannot make falls to
 /// the name: `.jse` is JScript, anything else the far more common VBScript.
@@ -1915,6 +1953,57 @@ fn detect_tampered_pe(data: &[u8]) -> Option<FileType> {
     None
 }
 
+/// Maximum prefix examined when identifying a Go module manifest by content.
+const GO_MOD_HEAD_LIMIT: usize = 4096;
+
+/// Go's module directive is the first non-comment directive in a `go.mod`.
+/// Checking that narrow grammar is constant-space and avoids assigning module
+/// semantics to ordinary prose or Go source declarations such as `export module`.
+fn looks_like_go_mod(data: &[u8]) -> bool {
+    let head = &data[..data.len().min(GO_MOD_HEAD_LIMIT)];
+    let Ok(text) = std::str::from_utf8(head) else {
+        return false;
+    };
+    let Some(line) = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("//"))
+    else {
+        return false;
+    };
+    let Some(rest) = line.strip_prefix("module") else {
+        return false;
+    };
+    if !(rest.starts_with(' ') || rest.starts_with('\t')) {
+        return false;
+    }
+    let rest = rest.trim_start();
+    let comment = rest
+        .find("//")
+        .filter(|&offset| offset > 0 && rest.as_bytes()[offset - 1].is_ascii_whitespace());
+    let rest = comment.map_or(rest, |offset| &rest[..offset]).trim();
+    if rest.is_empty() || rest.split_whitespace().count() != 1 {
+        return false;
+    }
+
+    let path = if rest.len() >= 2
+        && ((rest.starts_with('"') && rest.ends_with('"'))
+            || (rest.starts_with('`') && rest.ends_with('`')))
+    {
+        &rest[1..rest.len() - 1]
+    } else {
+        rest
+    };
+    !path.is_empty()
+        && path.bytes().any(|b| b.is_ascii_alphanumeric())
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"./_~-!".contains(&b))
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != ".." && !part.starts_with('.'))
+}
+
 /// Detect manifest file types that require content inspection.
 fn detect_manifest(path: &Path, data: &[u8]) -> Option<FileType> {
     let file_name = path.file_name()?.to_str()?;
@@ -1973,6 +2062,32 @@ mod tests {
 
     fn is_svg(data: &[u8]) -> bool {
         detect_xml(data).map(|(ft, _)| ft) == Some(FileType::Svg)
+    }
+
+    #[test]
+    fn go_mod_content_signature_is_bounded_and_specific() {
+        assert!(looks_like_go_mod(
+            b"// generated\r\n\r\nmodule example.org/shell_reverse_tcp // module path\r\ngo 1.23.4\r\n"
+        ));
+        assert!(looks_like_go_mod(b"module shell_reverse_tcp\n"));
+        assert!(looks_like_go_mod(b"module\texample.org/tool\n"));
+        assert!(!looks_like_go_mod(
+            b"module shell_reverse_tcp is a phrase\n"
+        ));
+        assert!(!looks_like_go_mod(b"module example.org//tool\n"));
+        assert!(!looks_like_go_mod(b"module ./relative\n"));
+        assert!(!looks_like_go_mod(b"module \"\n"));
+        assert!(!looks_like_go_mod(b"export module shell_reverse_tcp;\n"));
+        assert!(!looks_like_go_mod(
+            b"// module shell_reverse_tcp\npackage main\n"
+        ));
+    }
+
+    #[test]
+    fn go_mod_content_signature_only_needs_the_prefix() {
+        let mut data = b"module example.org/tool\ngo 1.23\n".to_vec();
+        data.resize(GO_MOD_HEAD_LIMIT + 256, b' ');
+        assert!(looks_like_go_mod(&data));
     }
 
     #[test]
@@ -3326,6 +3441,7 @@ mod jet_db_sfnt_collision_tests {
 #[cfg(test)]
 mod html_doctype_magic_tests {
     use super::*;
+    use crate::FileId;
 
     /// A page under a name that claims another language is still a page.
     #[test]
@@ -3387,6 +3503,33 @@ mod html_doctype_magic_tests {
         let data = b"<htmlspecialchars>not a page</htmlspecialchars>";
         assert_ne!(
             detect_from_content(Path::new("x.xml"), data).map(|(ft, _)| ft),
+            Some(FileType::Html)
+        );
+    }
+
+    /// A short injected loader before a complete document must not hide the
+    /// page from content-based type detection under an extensionless name.
+    #[test]
+    fn doctype_html_after_leading_script_is_detected_by_content() {
+        let data = b"<script src='https://example.invalid/stat.js'></script>\n<!DOCTYPE html>\n<html><head><title>x</title></head><body>x</body></html>";
+        let extensionless = FileId::from_path_and_bytes(Path::new("VirusShare_0123456789"), data);
+        assert_eq!(extensionless.file_type(), FileType::Html);
+        assert_eq!(extensionless.source(), DetectionSource::Magic);
+        assert!(!extensionless.extension_mismatch());
+
+        let misleading_name = FileId::from_path_and_bytes(Path::new("page.js"), data);
+        assert_eq!(misleading_name.file_type(), FileType::Html);
+        assert_eq!(misleading_name.source(), DetectionSource::Magic);
+        assert!(misleading_name.extension_mismatch());
+    }
+
+    /// A script with an HTML doctype in its source string but no HTML root is
+    /// still a script, rather than an HTML document.
+    #[test]
+    fn doctype_string_without_html_root_is_not_a_document() {
+        let data = b"const x = '<!DOCTYPE html>'; eval(x);";
+        assert_ne!(
+            detect_from_content(Path::new("x"), data).map(|(ft, _)| ft),
             Some(FileType::Html)
         );
     }
