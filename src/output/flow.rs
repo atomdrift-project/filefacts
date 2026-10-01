@@ -10,8 +10,11 @@ const STEP_LIMIT: usize = 100_000;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowValue {
     /// `literal`, `parameter`, `call`, `member`, `merge`, `concat`,
-    /// `alternative`, or `unknown`. Only `alternative` denotes whole values
-    /// chosen by control flow; `merge` may combine arbitrary dependencies.
+    /// `alternative`, `object`, `keyword`, or `unknown`. Only `alternative`
+    /// denotes whole values chosen by control flow; `merge` may combine
+    /// arbitrary dependencies. `object` (an object or map literal) and
+    /// `keyword` (named arguments: a keyword argument, or a CFML tag's
+    /// attributes) carry their entries in `fields`.
     pub kind: String,
     /// File byte offset, never a trait ID or virtual address.
     pub offset: usize,

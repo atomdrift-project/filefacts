@@ -22,6 +22,8 @@
 //! UPX), and the simplest packer to identify reliably from byte
 //! signatures alone.
 
+use memchr::memmem;
+
 use crate::formats::common::put_str;
 use crate::output::Values;
 
@@ -46,7 +48,7 @@ pub(super) fn detect(bytes: &[u8], values: &mut Values) {
 /// compressed data — but we accept the magic too because the banner
 /// is sometimes overwritten by re-packers.
 fn has_upx_signature(bytes: &[u8]) -> bool {
-    if find_bytes(bytes, b"$Info: This file is packed with the UPX").is_some() {
+    if memmem::find(bytes, b"$Info: This file is packed with the UPX").is_some() {
         return true;
     }
     // Magic only matches when it lands inside the stub region (first
@@ -56,12 +58,12 @@ fn has_upx_signature(bytes: &[u8]) -> bool {
     // the search avoids false positives from random `UPX!` triples
     // inside arbitrary file content.
     let head_window = bytes.len().min(16 * 1024);
-    if find_bytes(&bytes[..head_window], b"UPX!").is_some() {
+    if memmem::find(&bytes[..head_window], b"UPX!").is_some() {
         return true;
     }
     if bytes.len() >= 64 {
         let tail_start = bytes.len().saturating_sub(64);
-        if find_bytes(&bytes[tail_start..], b"UPX!").is_some() {
+        if memmem::find(&bytes[tail_start..], b"UPX!").is_some() {
             return true;
         }
     }
@@ -73,18 +75,12 @@ fn has_upx_signature(bytes: &[u8]) -> bool {
 /// Rights Reserved. $`; we keep just the `<version>` token.
 fn extract_version(bytes: &[u8]) -> Option<String> {
     let needle = b"$Id: UPX ";
-    let start = find_bytes(bytes, needle)? + needle.len();
+    let start = memmem::find(bytes, needle)? + needle.len();
     let rest = bytes.get(start..)?;
     // Version runs up to the next whitespace.
     let end = rest.iter().position(|&b| b == b' ' || b == b'\t')?;
     let v = &rest[..end];
     std::str::from_utf8(v).ok().map(str::to_string)
-}
-
-/// Naive substring search. The needles here are short and rare
-/// enough that a memchr-driven scan would not measurably help.
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]

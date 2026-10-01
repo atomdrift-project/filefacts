@@ -83,7 +83,7 @@ pub(super) fn extract(
     if !body.starts_with(b"Fasd") {
         return Ok(());
     }
-    let parsed = parser::parse(bytes).map_err(|e| Error::malformed("scpt", e))?;
+    let parsed = parser::parse(bytes).map_err(|e| Error::malformed("scpt", e.to_string()))?;
     values.insert("scpt.version", json!(parsed.version));
     let mut seen_literals = BTreeSet::new();
     let mut text_reader = TextReader::new(MAX_LITERAL_BYTES);

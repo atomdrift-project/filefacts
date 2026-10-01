@@ -75,16 +75,18 @@ const fn str_eq(a: &str, b: &str) -> bool {
 
 /// Resolve a literal against [`CATALOG`], or fail the build.
 ///
-/// Call it through [`metric!`](crate::metric), which forces the `const`
-/// context that turns an undeclared key into a compile error. Calling it
-/// directly from runtime code would defer the panic to runtime and defeat
-/// the whole arrangement.
+/// An implementation detail of [`metric!`](crate::metric), public only
+/// because an exported macro can only call public items; it is not part of
+/// the supported API. `metric!` forces the `const` context that turns an
+/// undeclared key into a compile error. Calling this directly from runtime
+/// code would defer the panic to runtime and defeat the whole arrangement.
 ///
 /// # Panics
 ///
 /// If `name` is not in [`CATALOG`]. Through `metric!` this is a `const`
 /// evaluation failure — a build error pointing at the offending call site —
 /// which is the intended and only expected way to hit it.
+#[doc(hidden)]
 #[must_use]
 pub const fn declared(name: &'static str) -> MetricKey {
     let mut i = 0;
@@ -857,7 +859,6 @@ pub const CATALOG: &[&str] = &[
     "text.char_entropy",
     "text.digit_ratio",
     "text.dynamic_import_ratio",
-    "text.dynamic_string_ratio",
     "text.empty_line_ratio",
     "text.encoded_string_ratio",
     "text.escape_density",

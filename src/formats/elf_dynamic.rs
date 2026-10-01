@@ -20,18 +20,22 @@
 use goblin::elf::Elf;
 use serde_json::Value as JsonValue;
 
-use crate::output::Values;
+use crate::Stage;
+use crate::formats::goblin_safe;
+use crate::output::{Errors, Values};
 
 /// Emit `elf.verdef[]` records. Replaces the older flat
 /// `elf.provided_versions[]` projection.
-pub(super) fn verdef(elf: &Elf<'_>, values: &mut Values) {
+pub(super) fn verdef(elf: &Elf<'_>, values: &mut Values, errors_out: &mut Errors) {
     let Some(verdef) = elf.verdef.as_ref() else {
         return;
     };
     let mut out: Vec<JsonValue> = Vec::new();
-    for def in verdef.iter() {
-        let mut aux_iter = def.iter();
-        let Some(first) = aux_iter.next() else {
+    // Both levels are lazy walks along file-controlled `vd_next` / `vda_next`
+    // links.
+    for def in goblin_safe::drain_or_record(verdef.iter(), errors_out, Stage::ElfParse) {
+        let aux = goblin_safe::drain_or_record(def.iter(), errors_out, Stage::ElfParse);
+        let Some(first) = aux.first() else {
             continue;
         };
         let name = elf.dynstrtab.get_at(first.vda_name).unwrap_or("");
@@ -40,8 +44,8 @@ pub(super) fn verdef(elf: &Elf<'_>, values: &mut Values) {
         }
         // Spec allows multiple aux entries past the head; mainstream
         // toolchains emit at most one (the immediate predecessor).
-        let parent = aux_iter
-            .next()
+        let parent = aux
+            .get(1)
             .and_then(|a| elf.dynstrtab.get_at(a.vda_name))
             .filter(|s| !s.is_empty());
         let is_base = def.vd_flags & 0x1 != 0;

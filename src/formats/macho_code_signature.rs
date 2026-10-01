@@ -21,10 +21,10 @@
 //! **big-endian** — uniquely among Mach-O structures, which are
 //! otherwise host-endian.
 
-use serde_json::{Map, Value as JsonValue};
+use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
-use crate::formats::common::{hex_encode, put_str, put_u64};
+use crate::formats::common::{hex_encode, plist_to_json, put_str, put_u64};
 use crate::output::Values;
 
 /// Outer wrapper magic. Every embedded code signature starts here.
@@ -43,11 +43,6 @@ const CSMAGIC_BLOBWRAPPER: u32 = 0xfade_0b01;
 /// AND/OR/NOT operators); the cap bounds stack usage on adversarial
 /// blobs that chain operators arbitrarily deep.
 const MAX_REQUIREMENT_DEPTH: u8 = 32;
-
-/// Maximum recursion depth honoured when projecting a parsed plist
-/// into JSON. Bounds stack usage on plists whose value graph nests
-/// arrays and dictionaries beyond what real macOS artifacts emit.
-const MAX_PLIST_DEPTH: u8 = 64;
 
 /// Upper bound on the XML plist payload we hand to `plist::from_bytes`
 /// in `parse_entitlements`. Real entitlements blobs are at most a few
@@ -614,37 +609,6 @@ fn code_signature_flags(flags: u32) -> Vec<String> {
         out.push("linker_signed".to_string());
     }
     out
-}
-
-fn plist_to_json(value: plist::Value, depth: u8) -> JsonValue {
-    use plist::Value as P;
-    if depth > MAX_PLIST_DEPTH {
-        return JsonValue::Null;
-    }
-    match value {
-        P::String(s) => JsonValue::String(s),
-        P::Integer(i) => i
-            .as_signed()
-            .map(|n| JsonValue::Number(n.into()))
-            .or_else(|| i.as_unsigned().map(|u| JsonValue::Number(u.into())))
-            .unwrap_or(JsonValue::Null),
-        P::Real(f) => serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number),
-        P::Boolean(b) => JsonValue::Bool(b),
-        P::Date(d) => JsonValue::String(format!("{d:?}")),
-        P::Array(arr) => JsonValue::Array(
-            arr.into_iter()
-                .map(|v| plist_to_json(v, depth + 1))
-                .collect(),
-        ),
-        P::Dictionary(dict) => {
-            let mut obj = Map::new();
-            for (k, v) in dict {
-                obj.insert(k, plist_to_json(v, depth + 1));
-            }
-            JsonValue::Object(obj)
-        }
-        _ => JsonValue::Null,
-    }
 }
 
 #[cfg(test)]

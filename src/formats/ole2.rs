@@ -34,7 +34,7 @@ use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::put_str;
-use crate::output::{Metrics, Values};
+use crate::output::{Errors, Metrics, Stage, Values};
 
 /// Hard cap on the number of stream entries we enumerate. Real Office
 /// documents have ≤ a few hundred; the cap keeps a hostile compound
@@ -52,14 +52,15 @@ pub(super) fn extract(
     bytes: &[u8],
     values: &mut Values,
     metrics: &mut Metrics,
+    errors: &mut Errors,
 ) -> Result<(), Error> {
     let cursor = Cursor::new(bytes);
-    let Ok(mut comp) = cfb::CompoundFile::open(cursor) else {
-        // Magic-byte detection might pick up something with the same
-        // header signature that isn't a parseable OLE2 file. Silent
-        // bail keeps the dispatcher's contract simple.
-        return Ok(());
-    };
+    // A file carrying the OLE2 signature that `cfb` cannot open loses the
+    // whole `office.*` view, and a malformed compound file is itself an
+    // evasion shape, so the failure is reported rather than passed as an
+    // empty document.
+    let mut comp =
+        cfb::CompoundFile::open(cursor).map_err(|e| Error::malformed("ole2", e.to_string()))?;
 
     let mut streams: Vec<String> = Vec::new();
     let mut macro_count: u64 = 0;
@@ -151,11 +152,11 @@ pub(super) fn extract(
         }
     }
 
-    let summary_data = read_stream_data(&mut comp, "\x05SummaryInformation");
+    let summary_data = read_stream_data(&mut comp, "\x05SummaryInformation", errors);
     let summary_security_encrypted = summary_data
         .as_deref()
         .is_some_and(summary_document_security_encrypted);
-    let word_document_encrypted = word_document_encrypted(&mut comp);
+    let word_document_encrypted = word_document_encrypted(&mut comp, errors);
 
     if macro_count > 0 {
         features.push("macros");
@@ -167,7 +168,7 @@ pub(super) fn extract(
     // so a workbook still declaring one is worth reporting on its own.
     let workbook = ["Workbook", "Book"]
         .iter()
-        .find_map(|name| read_stream_data(&mut comp, name))
+        .find_map(|name| read_stream_data(&mut comp, name, errors))
         .unwrap_or_default();
     let workbook = if biff_encrypted(&workbook) {
         Vec::new()
@@ -276,12 +277,9 @@ pub(super) fn extract(
     // DocumentSummaryInformation extends the summary set with
     // manager / company / security_flag / hyperlink_base — fields
     // OOXML carries in `docProps/app.xml`.
-    if let Ok(mut stream) = comp.open_stream("\x05DocumentSummaryInformation") {
-        let mut data = Vec::new();
-        if stream.read_to_end(&mut data).is_ok() {
-            for (k, v) in parse_document_summary_information(&data) {
-                props.entry(k).or_insert(v);
-            }
+    if let Some(data) = read_stream_data(&mut comp, "\x05DocumentSummaryInformation", errors) {
+        for (k, v) in parse_document_summary_information(&data) {
+            props.entry(k).or_insert(v);
         }
     }
     for (key, value) in props {
@@ -294,33 +292,30 @@ pub(super) fn extract(
     // (`Excel.Sheet.8`, `Word.Document.8`, `PowerPoint.Show.8`, …) —
     // a `.doc` file whose CompObj declares Excel is the canonical
     // CVE-2017-0199 extension-mismatch shape.
-    if let Ok(mut stream) = comp.open_stream("\x01CompObj") {
-        let mut data = Vec::new();
-        if stream.read_to_end(&mut data).is_ok() {
-            if let Some(co) = parse_compobj(&data) {
-                let mut obj = serde_json::Map::new();
-                if !co.user_type.is_empty() {
-                    obj.insert("user_type".into(), JsonValue::String(co.user_type));
-                }
-                if !co.clipboard_format.is_empty() {
-                    obj.insert(
-                        "clipboard_format".into(),
-                        JsonValue::String(co.clipboard_format),
-                    );
-                }
-                if !co.app_version.is_empty() {
-                    // Naming note: cleave-side called this
-                    // `app_version`, but MS-OLEDS calls it the
-                    // ProgID. We surface both — `prog_id` is the
-                    // forward-looking name (matches the spec);
-                    // `app_version` stays for trait-rule continuity.
-                    obj.insert("prog_id".into(), JsonValue::String(co.app_version.clone()));
-                    obj.insert("app_version".into(), JsonValue::String(co.app_version));
-                }
-                if !obj.is_empty() {
-                    values.insert("office.compobj", JsonValue::Object(obj));
-                }
-            }
+    if let Some(co) =
+        read_stream_data(&mut comp, "\x01CompObj", errors).and_then(|data| parse_compobj(&data))
+    {
+        let mut obj = serde_json::Map::new();
+        if !co.user_type.is_empty() {
+            obj.insert("user_type".into(), JsonValue::String(co.user_type));
+        }
+        if !co.clipboard_format.is_empty() {
+            obj.insert(
+                "clipboard_format".into(),
+                JsonValue::String(co.clipboard_format),
+            );
+        }
+        if !co.prog_id.is_empty() {
+            // Naming note: cleave-side called this
+            // `app_version`, but MS-OLEDS calls it the
+            // ProgID. We surface both — `prog_id` is the
+            // forward-looking name (matches the spec);
+            // `app_version` stays for trait-rule continuity.
+            obj.insert("prog_id".into(), JsonValue::String(co.prog_id.clone()));
+            obj.insert("app_version".into(), JsonValue::String(co.prog_id));
+        }
+        if !obj.is_empty() {
+            values.insert("office.compobj", JsonValue::Object(obj));
         }
     }
 
@@ -797,13 +792,26 @@ fn attachment_extension(filename: &str) -> Option<String> {
     usable.then(|| ext.to_lowercase())
 }
 
+/// Read a whole stream. An absent stream is `None` and normal; one that is
+/// listed but cannot be read (a broken sector chain) is also recorded, since
+/// whatever is built from it would otherwise just be missing.
 fn read_stream_data<T: Read + std::io::Seek>(
     comp: &mut cfb::CompoundFile<T>,
     path: &str,
+    errors: &mut Errors,
 ) -> Option<Vec<u8>> {
     let mut stream = comp.open_stream(path).ok()?;
     let mut data = Vec::new();
-    stream.read_to_end(&mut data).ok()?;
+    if let Err(e) = stream.read_to_end(&mut data) {
+        errors.record_malformed(
+            Stage::Ole2Parse,
+            format!(
+                "stream {:?} unreadable: {e}",
+                path.trim_start_matches(['\x01', '\x05'])
+            ),
+        );
+        return None;
+    }
     Some(data)
 }
 
@@ -841,8 +849,11 @@ fn property_i32_by_pid(section: &[u8], wanted_pid: u32) -> Option<i32> {
     None
 }
 
-fn word_document_encrypted<T: Read + std::io::Seek>(comp: &mut cfb::CompoundFile<T>) -> bool {
-    let Some(data) = read_stream_data(comp, "WordDocument") else {
+fn word_document_encrypted<T: Read + std::io::Seek>(
+    comp: &mut cfb::CompoundFile<T>,
+    errors: &mut Errors,
+) -> bool {
+    let Some(data) = read_stream_data(comp, "WordDocument", errors) else {
         return false;
     };
     if data.len() < 12 {
@@ -1025,7 +1036,8 @@ fn read_u32_le(buf: &[u8], off: usize) -> u32 {
 struct CompObjData {
     user_type: String,
     clipboard_format: String,
-    app_version: String,
+    /// Emitted as both `prog_id` and the legacy `app_version` key.
+    prog_id: String,
 }
 
 /// Parse the CompObj stream layout (MS-OLEDS §2.3.6.1).
@@ -1035,8 +1047,7 @@ struct CompObjData {
 ///   - AnsiUserType: LengthPrefixedAnsiString
 ///   - AnsiClipboardFormat: ClipboardFormatOrAnsiString (4-byte
 ///     registered ID OR length-prefixed string)
-///   - Reserved3: optional LengthPrefixedAnsiString (the ProgID,
-///     surfaced as `app_version` for trait-rule continuity)
+///   - Reserved3: optional LengthPrefixedAnsiString (the ProgID)
 ///
 /// `LengthPrefixedAnsiString` = u32 LE length (including trailing
 /// NUL) + that many bytes. Length 0 means absent.
@@ -1083,10 +1094,8 @@ fn parse_compobj(data: &[u8]) -> Option<CompObjData> {
         }
     }
 
-    // ProgID — surfaced as `app_version` because the existing
-    // forensic trait corpus references it under that name.
     if let Some((s, _)) = read_length_prefixed_ansi(&data[pos..]) {
-        out.app_version = s;
+        out.prog_id = s;
     }
 
     Some(out)
@@ -1180,8 +1189,64 @@ mod tests {
     fn run(bytes: &[u8]) -> (Values, Metrics) {
         let mut v = Values::new();
         let mut m = Metrics::new();
-        let _ = extract(bytes, &mut v, &mut m);
+        let _ = extract(bytes, &mut v, &mut m, &mut Errors::new());
         (v, m)
+    }
+
+    /// A file with the OLE2 signature that `cfb` cannot open used to come
+    /// back as an empty, error-free document.
+    #[test]
+    fn unopenable_compound_file_is_reported() {
+        let mut bytes = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1".to_vec();
+        bytes.resize(1024, 0xAB);
+        let mut errors = Errors::new();
+        let result = extract(&bytes, &mut Values::new(), &mut Metrics::new(), &mut errors);
+        assert!(result.is_err(), "malformed compound file must not pass");
+
+        let parsed = crate::open_with_path(std::path::Path::new("x.doc"), &bytes).unwrap();
+        assert!(
+            parsed
+                .errors()
+                .iter()
+                .any(|e| e.stage == Stage::Ole2Parse && e.message.contains("ole2")),
+            "{:?}",
+            parsed.errors()
+        );
+    }
+
+    /// End the longest run of consecutive FAT entries early, so the stream
+    /// stored there (the only multi-sector one) claims more bytes than its
+    /// sector chain holds.
+    fn cut_stream_chain(bytes: &mut [u8]) {
+        let sector = 1usize << u16::from_le_bytes([bytes[0x1E], bytes[0x1F]]);
+        let fat_sector = u32::from_le_bytes(bytes[0x4C..0x50].try_into().unwrap()) as usize;
+        let fat = (fat_sector + 1) * sector;
+        let entry =
+            |b: &[u8], k: usize| u32::from_le_bytes(b[fat + 4 * k..][..4].try_into().unwrap());
+        let start = (0..sector / 4 - 3)
+            .find(|&i| (0..3).all(|k| entry(bytes, i + k) == (i + k + 1) as u32))
+            .expect("multi-sector stream chain");
+        let at = fat + 4 * (start + 1);
+        bytes[at..at + 4].copy_from_slice(&0xFFFF_FFFEu32.to_le_bytes());
+    }
+
+    /// A listed stream whose sector chain ends early is recorded, not treated
+    /// as absent.
+    #[test]
+    fn unreadable_stream_is_recorded() {
+        let body = vec![0x5A; 64 * 1024];
+        let mut bytes = build_cfb(&[("/WordDocument", &body)]);
+        cut_stream_chain(&mut bytes);
+        let mut errors = Errors::new();
+        let mut v = Values::new();
+        extract(&bytes, &mut v, &mut Metrics::new(), &mut errors).unwrap();
+        assert_eq!(v.get("office.kind").and_then(|x| x.as_str()), Some("doc"));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("WordDocument") && e.stage == Stage::Ole2Parse),
+            "{errors:?}"
+        );
     }
 
     /// Build a tiny in-memory CFB with the given stream paths and

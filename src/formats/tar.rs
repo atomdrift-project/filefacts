@@ -5,13 +5,15 @@
 //! never decompresses entry content — it walks headers and skips over
 //! the data blocks via stream-position arithmetic.
 //!
-//! Handles plain `.tar`, plus the gzip/bzip2/xz/zstd-wrapped variants —
-//! the wrapper is identified by the [`FileType`] and a streaming
-//! decompressor is wrapped around the cursor before walking. *Only* the
-//! header bytes are decompressed; entry data is skipped.
+//! Only uncompressed tars are walked: plain `.tar` and the packages built on
+//! one (gem, OCI image, Gentoo binpkg). The gzip/bzip2/xz/zstd-wrapped
+//! variants and the packages built on them (npm, crate, sdist, Alpine apk,
+//! FreeBSD/Arch pkg, xbps) get the `archive.format.kind` label and nothing
+//! else: cleave decompresses them and re-submits the inner tar, which is
+//! walked then. Package identity for the gzipped ones is read by their own
+//! modules, not here.
 
 use crate::metric;
-use std::io::{self, Read};
 
 use serde_json::Value as JsonValue;
 
@@ -31,7 +33,16 @@ pub(super) fn extract(
         JsonValue::String(format_label(file_type).into()),
     );
 
-    let mut archive = open_archive(bytes, file_type)?;
+    // A compressed variant is reported by label only (see the module doc).
+    // That is the designed outcome for a well-formed file, not a parse
+    // failure, so it returns Ok rather than an error the caller would record.
+    if crate::fileid::container_of(file_type, bytes)
+        .is_some_and(|c| c.compression != crate::fileid::Compression::None)
+    {
+        return Ok(());
+    }
+
+    let mut archive = tar::Archive::new(bytes);
     let mut members: Vec<JsonValue> = Vec::new();
     let mut entry_type_counts: std::collections::BTreeMap<String, u64> =
         std::collections::BTreeMap::new();
@@ -387,49 +398,6 @@ fn format_label(file_type: FileType) -> &'static str {
     }
 }
 
-/// Wrap the input bytes in a tar::Archive over the appropriate
-/// decompressor. We don't decompress the *content* of any entry — only
-/// the small fraction of stream bytes the tar walker reads to consume
-/// each entry's header — but the wrapper still has to handle the
-/// compressed stream so headers land in the right place.
-fn open_archive(
-    bytes: &[u8],
-    file_type: FileType,
-) -> Result<tar::Archive<Box<dyn Read + '_>>, Error> {
-    let cursor = io::Cursor::new(bytes);
-    // Compressed wrappers. filefacts doesn't take a dep on the compressor
-    // crates yet; for now we report the format label and decline to walk
-    // entries when the bytes are compressed. (Cleave can hand filefacts
-    // the *decompressed* tar bytes and get the full member listing.)
-    // `Gem` is an *uncompressed* `ustar` tar — it falls through to the plain
-    // walker below. The compressed variants (including Alpine's gzip `.apk`)
-    // are reported by format label only.
-    if matches!(
-        file_type,
-        FileType::TarGz
-            | FileType::TarBz2
-            | FileType::TarXz
-            | FileType::TarZst
-            | FileType::ApkAlpine
-            | FileType::Npm
-            | FileType::Crate
-            | FileType::PkgFreebsd
-            | FileType::PkgArch
-            | FileType::PythonSdist
-            | FileType::Xbps
-    ) {
-        return Err(Error::malformed(
-            "tar",
-            format!(
-                "compressed tar variants are reported by format only; \
-                 decompress the wrapper before passing to filefacts (variant={file_type:?})"
-            ),
-        ));
-    }
-    let reader: Box<dyn Read + '_> = Box::new(cursor);
-    Ok(tar::Archive::new(reader))
-}
-
 fn tar_entry_type(t: tar::EntryType) -> &'static str {
     use tar::EntryType;
     match t {
@@ -628,23 +596,46 @@ mod tests {
 
     #[test]
     fn compressed_variants_report_format_only() {
-        // Bytes don't matter — open_archive rejects compressed variants.
+        // Bytes don't matter — compressed variants are never walked here.
         let mut values = Values::new();
         let mut metrics = Metrics::new();
         let mut archive_members = Vec::new();
-        let _ = extract(
+        let result = extract(
             b"any bytes",
             FileType::TarGz,
             &mut values,
             &mut metrics,
             &mut archive_members,
         );
+        assert!(result.is_ok(), "label-only is not a parse failure");
         assert_eq!(
             values.get("archive.format.kind").and_then(|x| x.as_str()),
             Some("tar.gz")
         );
-        // The walker bailed; no members.
         assert!(values.get("archive.members").is_none());
+    }
+
+    /// A well-formed `.tar.gz` used to come back with a `malformed` error,
+    /// because declining to walk the compressed stream was reported as a
+    /// failed parse.
+    #[test]
+    fn valid_tar_gz_opens_without_errors() {
+        use std::io::Write;
+        let tar = build_tar(&[("pkg/README", 0o644, 0, 0, 1_700_000_000, b"hello\n")]);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar).unwrap();
+        let bytes = gz.finish().unwrap();
+
+        let parsed = crate::open_with_path(std::path::Path::new("pkg.tar.gz"), &bytes).unwrap();
+        assert_eq!(parsed.fileid().file_type(), FileType::TarGz);
+        assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
+        assert_eq!(
+            parsed
+                .values()
+                .get("archive.format.kind")
+                .and_then(|x| x.as_str()),
+            Some("tar.gz")
+        );
     }
 
     #[test]

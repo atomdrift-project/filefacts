@@ -9,14 +9,15 @@
 //! # Layout
 //!
 //! ```text
-//! {cache_dir}/atomdrift/filefacts/v{SCHEMA_VERSION}/{key[0..2]}/{key}.bin
+//! {cache_dir}/atomdrift/filefacts/v{CACHE_SCHEMA_VERSION}/{key[0..2]}/{key}.bin
 //! ```
 //!
 //! On the host platforms this resolves (via [`dirs::cache_dir`]) to the
 //! idiomatic per-OS cache root: `~/Library/Caches/atomdrift/filefacts`
 //! (macOS), `~/.cache/atomdrift/filefacts` (Linux/XDG),
 //! `%LOCALAPPDATA%\atomdrift\filefacts` (Windows). The two-character
-//! shard keeps any single directory bounded.
+//! shard keeps any single directory bounded. Lookups never create
+//! directories; a shard appears with the first entry stored in it.
 //!
 //! # Format
 //!
@@ -24,21 +25,20 @@
 //! (not a positional format like bincode) is deliberate: the cached
 //! types carry `#[serde(skip_serializing_if)]` fields, which a
 //! self-describing format round-trips correctly and a positional one
-//! silently corrupts. Writes go through a `.tmp` file followed by an
-//! atomic rename so two processes hashing the same input cannot corrupt
-//! the entry.
+//! silently corrupts. Writes go through a uniquely named `.tmp*` file in
+//! the shard followed by an atomic rename, so two processes hashing the
+//! same input cannot corrupt the entry.
 //!
 //! # Invalidation
 //!
 //! The cache key is `sha256(content ∥ build_fingerprint ∥ variant)`:
 //!
 //! * **content** — the input bytes.
-//! * **`build_fingerprint`** — filefacts' crate version *and* the running
-//!   executable's mtime. filefacts is statically linked, so any change to
-//!   its extraction logic forces the consumer to recompile, which moves
-//!   the mtime and so retires every prior entry without a manual bump.
-//!   The crate version covers released artifacts where the mtime may be
-//!   reset by packaging.
+//! * **`build_fingerprint`** — filefacts' crate version and a hash of its
+//!   source (`src/**` plus `Cargo.lock`), computed by `build.rs` at compile
+//!   time. Any change to the extraction logic changes the hash and so
+//!   retires every prior entry without a manual bump, however the
+//!   consuming binary was built, copied or packaged.
 //! * **variant** — the caller's [`crate::rizin::cache_fingerprint`]
 //!   (rizin presence / version / native-arch slicing).
 //!
@@ -56,8 +56,9 @@
 //! cache uses, so the two projects bound their caches consistently.
 //! [`cleanup`] runs the sweep on a background thread — the entry point a
 //! consumer calls at startup — and an on-write trigger kicks off the same
-//! sweep when a store pushes the cache over the ceiling mid-run.
-//! Everything here is best-effort: the cache is a performance
+//! sweep when a store pushes the cache over the ceiling mid-run. The
+//! sweep also removes temp files orphaned by a writer that died before its
+//! rename. Everything here is best-effort: the cache is a performance
 //! optimisation, never a source of truth.
 
 use std::fs;
@@ -74,12 +75,25 @@ use sha2::{Digest, Sha256};
 /// switch a host sets once; see [`set_caching_enabled`].
 static CACHING_OVERRIDE: AtomicI8 = AtomicI8::new(0);
 
-/// Force the [`crate::open`]-time disk cache on or off for
-/// the rest of the process. Overrides the default (on, except inside
-/// filefacts' own test runs). A consumer that needs hermetic extraction
-/// — its own test suite, a reproducibility check — disables it here.
+/// Whether caching is on when neither [`set_caching_enabled`] nor
+/// `FILEFACTS_CACHE` says otherwise. Off: a library getter should not write to
+/// the user's cache directory unless its host asked for that.
+static DEFAULT_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Force the [`crate::open`]-time disk cache on or off for the rest of the
+/// process, ahead of `FILEFACTS_CACHE` and [`enable_by_default`]. A consumer
+/// that needs hermetic extraction (its own test suite, a reproducibility
+/// check) disables it here.
 pub fn set_caching_enabled(enabled: bool) {
     CACHING_OVERRIDE.store(if enabled { 1 } else { -1 }, Ordering::Relaxed);
+}
+
+/// Turn the disk cache on for this process unless `FILEFACTS_CACHE` turns
+/// it off. For hosts that rescan the same files (the `filefacts` CLI, a
+/// corpus scanner); unlike [`set_caching_enabled`], it leaves the operator's
+/// environment in charge.
+pub fn enable_by_default() {
+    DEFAULT_ENABLED.store(true, Ordering::Relaxed);
 }
 
 /// Whether `open`-time self-caching is active.
@@ -88,22 +102,29 @@ pub fn set_caching_enabled(enabled: bool) {
 /// 1. a programmatic override from [`set_caching_enabled`];
 /// 2. the `FILEFACTS_CACHE` env var (`0` / `false` disables, anything
 ///    else enables) — an ops/test escape hatch needing no recompile;
-/// 3. default: on, except when filefacts itself is under `cargo test`
-///    (kept hermetic so fixture assertions never read a shared entry).
+/// 3. default: off, unless the host called [`enable_by_default`].
 #[must_use]
 pub fn caching_enabled() -> bool {
-    match CACHING_OVERRIDE.load(Ordering::Relaxed) {
+    // Cache the env lookup: this runs once per file on the scan hot path,
+    // and the environment is fixed at process start.
+    static ENV: OnceLock<Option<bool>> = OnceLock::new();
+    let env = *ENV.get_or_init(|| {
+        std::env::var("FILEFACTS_CACHE")
+            .ok()
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+    });
+    resolve_caching(
+        CACHING_OVERRIDE.load(Ordering::Relaxed),
+        env,
+        DEFAULT_ENABLED.load(Ordering::Relaxed),
+    )
+}
+
+fn resolve_caching(override_state: i8, env: Option<bool>, default: bool) -> bool {
+    match override_state {
         1 => true,
         -1 => false,
-        // Cache the env-derived default: this runs once per file on the
-        // scan hot path, and the environment is fixed at process start.
-        _ => {
-            static DEFAULT: OnceLock<bool> = OnceLock::new();
-            *DEFAULT.get_or_init(|| match std::env::var("FILEFACTS_CACHE") {
-                Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
-                Err(_) => !cfg!(test),
-            })
-        }
+        _ => env.unwrap_or(default),
     }
 }
 
@@ -115,27 +136,17 @@ pub fn caching_enabled() -> bool {
 /// fingerprint into the key.
 pub const CACHE_SCHEMA_VERSION: u32 = 6;
 
-/// Process-wide build identity mixed into every cache key.
+/// Build identity mixed into every cache key: `{crate version}+{source
+/// hash}`, where `build.rs` hashes the crate's `src/**` and `Cargo.lock`.
 ///
-/// `{crate version}+{executable mtime}`. The mtime is the load-bearing
-/// half: filefacts links statically, so changing its code forces the
-/// consuming binary to relink, which bumps its mtime and invalidates
-/// every entry from the old build — the simplest correct answer to "the
-/// extraction logic changed." Probed once; `0` mtime when the executable
-/// path or its metadata is unavailable (the crate version still differs
-/// across releases).
-fn build_fingerprint() -> &'static str {
-    static FP: OnceLock<String> = OnceLock::new();
-    FP.get_or_init(|| {
-        let exe_mtime = std::env::current_exe()
-            .and_then(fs::metadata)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_secs());
-        format!("{}+{exe_mtime}", env!("CARGO_PKG_VERSION"))
-    })
-}
+/// Derived from the source rather than the running executable, so it holds
+/// where an mtime would not: an embedding host whose own binary is not
+/// filefacts, Nix store paths (mtime 1), `cp -p` and container layers.
+const BUILD_FINGERPRINT: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "+",
+    env!("FILEFACTS_SOURCE_HASH")
+);
 
 /// Lowercase hex-encode a byte slice.
 fn hex(bytes: &[u8]) -> String {
@@ -175,43 +186,69 @@ pub fn cache_key(bytes: &[u8], variant: &str) -> String {
     // Domain-separated so no concatenation of (content, build, variant)
     // can collide with a different split of the same bytes.
     hasher.update([0u8]);
-    hasher.update(build_fingerprint().as_bytes());
+    hasher.update(BUILD_FINGERPRINT.as_bytes());
     hasher.update([0u8]);
     hasher.update(variant.as_bytes());
     hex(&hasher.finalize())
 }
 
-/// Root cache directory for filefacts. Returns the writable OS/user cache dir,
-/// or `None` when no user cache directory is available.
-pub fn cache_root() -> Option<PathBuf> {
-    let c = dirs::cache_dir()?.join("atomdrift").join("filefacts");
-    if fs::create_dir_all(&c).is_ok() {
-        let probe = c.join(".write-test");
-        if fs::write(&probe, b"ok").is_ok() {
-            let _ = fs::remove_file(&probe);
-            return Some(c);
-        }
-    }
-    None
+/// `{cache_dir}/atomdrift/filefacts`, resolved once per process. Pure path
+/// computation: nothing is created or probed.
+fn root_location() -> Option<&'static Path> {
+    static ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
+    ROOT.get_or_init(|| Some(dirs::cache_dir()?.join("atomdrift").join("filefacts")))
+        .as_deref()
 }
 
-/// Directory holding cache entries for the current schema version.
+/// Root cache directory for filefacts. Returns the writable OS/user cache dir,
+/// or `None` when no user cache directory is available. Created and probed
+/// for writability once per process; later calls return the first answer.
+pub fn cache_root() -> Option<PathBuf> {
+    static WRITABLE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    WRITABLE
+        .get_or_init(|| {
+            let root = root_location()?;
+            fs::create_dir_all(root).ok()?;
+            // An anonymous temp file: nothing to clean up, and nothing left
+            // behind if the process dies mid-probe.
+            tempfile::tempfile_in(root).ok()?;
+            Some(root.to_path_buf())
+        })
+        .clone()
+}
+
+/// `v{CACHE_SCHEMA_VERSION}` under `root`.
+fn version_location(root: &Path) -> PathBuf {
+    root.join(format!("v{CACHE_SCHEMA_VERSION}"))
+}
+
+/// Where the entry for `sha_hex` lives under `root`. Pure path computation,
+/// so a lookup that misses leaves no directories behind; [`store_at_path`]
+/// creates the shard when it writes.
+fn entry_location(root: &Path, sha_hex: &str) -> Option<PathBuf> {
+    let shard = sha_hex.get(..2)?;
+    Some(
+        version_location(root)
+            .join(shard)
+            .join(format!("{sha_hex}.bin")),
+    )
+}
+
+/// Directory holding cache entries for the current schema version, created
+/// if missing.
 pub fn version_dir() -> Option<PathBuf> {
-    let root = cache_root()?;
-    let dir = root.join(format!("v{CACHE_SCHEMA_VERSION}"));
+    let dir = version_location(&cache_root()?);
     fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
 
 /// Full on-disk path for a cache entry with the given SHA-256 hex
-/// digest. Creates the two-char shard directory if missing.
+/// digest. Creates the two-char shard directory if missing; [`load`] and
+/// [`is_cached`] resolve the same path without creating anything.
 pub fn entry_path(sha_hex: &str) -> Option<PathBuf> {
-    if sha_hex.len() < 2 {
-        return None;
-    }
-    let dir = version_dir()?.join(&sha_hex[..2]);
-    fs::create_dir_all(&dir).ok()?;
-    Some(dir.join(format!("{sha_hex}.bin")))
+    let path = entry_location(&cache_root()?, sha_hex)?;
+    fs::create_dir_all(path.parent()?).ok()?;
+    Some(path)
 }
 
 /// Read + decompress + decode a cached payload. Returns `None` when
@@ -219,8 +256,7 @@ pub fn entry_path(sha_hex: &str) -> Option<PathBuf> {
 /// last is treated as a cache miss rather than an error — a bad
 /// cache file gets overwritten on the next write).
 pub fn load<T: serde::de::DeserializeOwned>(sha_hex: &str) -> Option<T> {
-    let path = entry_path(sha_hex)?;
-    load_from_path(&path)
+    load_from_path(&entry_location(root_location()?, sha_hex)?)
 }
 
 /// Read one cache entry from an already-resolved path.
@@ -271,13 +307,25 @@ fn touch_lru(path: &Path, current_mtime: SystemTime) {
 /// disk failures are swallowed; the cache is a performance
 /// optimisation, not a source of truth.
 pub fn store<T: serde::Serialize>(sha_hex: &str, value: &T) {
-    let Some(path) = entry_path(sha_hex) else {
+    let Some(path) = root_location().and_then(|root| entry_location(root, sha_hex)) else {
         return;
     };
     store_at_path(&path, value);
 }
 
-/// Write one cache entry to an already-resolved path.
+/// Name prefix of the temp files [`store_at_path`] writes through. Spelled
+/// out (it is also `tempfile`'s default) because the sweep matches on it.
+const TEMP_PREFIX: &str = ".tmp";
+
+/// Create the temp file a store writes through, in the entry's shard.
+fn temp_in(dir: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+    tempfile::Builder::new()
+        .prefix(TEMP_PREFIX)
+        .tempfile_in(dir)
+}
+
+/// Write one cache entry to an already-resolved path, creating its shard
+/// directory if needed.
 fn store_at_path<T: serde::Serialize>(path: &Path, value: &T) {
     let Ok(serialized) = serde_json::to_vec(value) else {
         return;
@@ -292,7 +340,10 @@ fn store_at_path<T: serde::Serialize>(path: &Path, value: &T) {
     let Some(dir) = path.parent() else {
         return;
     };
-    let Ok(mut tmp) = tempfile::NamedTempFile::new_in(dir) else {
+    if fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let Ok(mut tmp) = temp_in(dir) else {
         return;
     };
     if tmp.write_all(&compressed).is_ok() {
@@ -303,10 +354,10 @@ fn store_at_path<T: serde::Serialize>(path: &Path, value: &T) {
 /// Remove cache directories from schema versions earlier than the
 /// current one. Best-effort; failures are ignored.
 pub fn prune_old_versions() {
-    let Some(root) = cache_root() else {
+    let Some(root) = root_location() else {
         return;
     };
-    prune_old_versions_in(&root);
+    prune_old_versions_in(root);
 }
 
 fn prune_old_versions_in(root: &std::path::Path) {
@@ -441,10 +492,11 @@ fn maybe_trigger_sweep(sha_hex: &str) {
     // 1.5× the per-shard mean: enough slack that a shard crossing it
     // reliably implies the whole cache is over, not just Poisson noise.
     let per_shard_trigger = max_items / SHARD_COUNT * 3 / 2 + 1;
-    let (Some(dir), Some(shard)) = (version_dir(), sha_hex.get(..2)) else {
+    let (Some(root), Some(shard)) = (root_location(), sha_hex.get(..2)) else {
         return;
     };
-    let count = fs::read_dir(dir.join(shard)).map_or(0, |it| it.flatten().count());
+    let count =
+        fs::read_dir(version_location(root).join(shard)).map_or(0, |it| it.flatten().count());
     if count > per_shard_trigger {
         spawn_sweep(max_items);
     }
@@ -458,21 +510,38 @@ fn maybe_trigger_sweep(sha_hex: &str) {
 /// 2. If the cache still exceeds `max_items` entries or the on-disk byte cap,
 ///    evict the oldest until both are within 90% of their caps.
 ///
-/// The cache key folds in the build fingerprint, so every filefacts rebuild
-/// orphans the previous build's entries; because those orphans are never read
-/// again their mtime never advances, so they age out and are evicted first.
-/// Prefer [`cleanup`], which runs this off the hot path.
+/// Temp files older than 15 minutes are removed along the way: they were
+/// left by a writer that died before its rename.
+///
+/// The cache key folds in the build fingerprint, so every change to
+/// filefacts' source orphans the previous build's entries; because those
+/// orphans are never read again their mtime never advances, so they age out
+/// and are evicted first. Prefer [`cleanup`], which runs this off the hot
+/// path.
 pub fn enforce_limits(max_items: usize) {
-    let Some(dir) = version_dir() else {
+    let Some(root) = root_location() else {
         return;
     };
-    enforce_limits_in(&dir, max_items, MAX_BYTES);
+    enforce_limits_in(&version_location(root), max_items, MAX_BYTES);
+}
+
+/// A temp file this old was orphaned by a writer that died before its
+/// rename: a live store creates, writes and renames it within moments.
+const ORPHANED_TEMP_AGE: Duration = Duration::from_mins(15);
+
+/// Whether `name` is a store's temp file: [`TEMP_PREFIX`], or the
+/// `{key}.tmp` sibling that builds before the uniquely named temp files
+/// wrote into the same version dir.
+fn is_temp_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|n| n.starts_with(TEMP_PREFIX) || n.ends_with(".tmp"))
 }
 
 fn enforce_limits_in(version_dir: &Path, max_items: usize, max_bytes: u64) {
     let Ok(shards) = fs::read_dir(version_dir) else {
         return;
     };
+    let now = SystemTime::now();
     // One transient (path, mtime, bytes) per live entry — a few MB at the
     // default ceiling, freed as soon as the sweep returns.
     let mut entries: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
@@ -482,9 +551,11 @@ fn enforce_limits_in(version_dir: &Path, max_items: usize, max_bytes: u64) {
         };
         for file in files.flatten() {
             let path = file.path();
-            // Manage only finished entries; skip in-flight `.tmp` writes
-            // and any stray non-entry files.
-            if path.extension().is_none_or(|ext| ext != "bin") {
+            let is_entry = path.extension().is_some_and(|ext| ext == "bin");
+            let is_temp = !is_entry && is_temp_name(&file.file_name());
+            // Manage finished entries and temp files; leave any stray
+            // non-entry file alone.
+            if !is_entry && !is_temp {
                 continue;
             }
             let Ok(meta) = file.metadata() else {
@@ -493,12 +564,16 @@ fn enforce_limits_in(version_dir: &Path, max_items: usize, max_bytes: u64) {
             let Ok(mtime) = meta.modified() else {
                 continue;
             };
-            entries.push((path, mtime, meta.len()));
+            if is_entry {
+                entries.push((path, mtime, meta.len()));
+            } else if now.duration_since(mtime).unwrap_or_default() > ORPHANED_TEMP_AGE {
+                // A recent temp file may be an in-flight write; keep it.
+                let _ = fs::remove_file(&path);
+            }
         }
     }
 
     // Age pass: drop anything past the TTL outright, whatever the counts.
-    let now = SystemTime::now();
     entries.retain(|(path, mtime, _)| {
         if now.duration_since(*mtime).unwrap_or_default() > MAX_AGE {
             let _ = fs::remove_file(path);
@@ -584,7 +659,13 @@ where
     T: serde::Serialize + serde::de::DeserializeOwned,
     F: FnOnce(&[u8]) -> Option<Computed<T>>,
 {
-    open_with_cache_in(bytes, variant, entry_path, maybe_trigger_sweep, compute)
+    open_with_cache_in(
+        bytes,
+        variant,
+        |key| entry_location(root_location()?, key),
+        maybe_trigger_sweep,
+        compute,
+    )
 }
 
 fn open_with_cache_in<T, F, P, S>(
@@ -623,8 +704,11 @@ where
 
 /// Best-effort cache-entry path predicate. Returns `true` when a cached
 /// entry for the given bytes under `variant` already exists on disk.
+/// Read-only: creates nothing.
 pub fn is_cached(bytes: &[u8], variant: &str) -> bool {
-    entry_path(&cache_key(bytes, variant)).is_some_and(|p| p.exists())
+    root_location()
+        .and_then(|root| entry_location(root, &cache_key(bytes, variant)))
+        .is_some_and(|p| p.exists())
 }
 
 #[cfg(test)]
@@ -646,6 +730,19 @@ mod tests {
         let shard = root.join(sha_hex.get(..2)?);
         fs::create_dir_all(&shard).ok()?;
         Some(shard.join(format!("{sha_hex}.bin")))
+    }
+
+    #[test]
+    fn caching_is_opt_in_and_the_environment_outranks_the_default() {
+        // Library default: off.
+        assert!(!resolve_caching(0, None, false));
+        // `enable_by_default` turns it on, but `FILEFACTS_CACHE=0` still wins.
+        assert!(resolve_caching(0, None, true));
+        assert!(!resolve_caching(0, Some(false), true));
+        assert!(resolve_caching(0, Some(true), false));
+        // `set_caching_enabled` outranks both.
+        assert!(!resolve_caching(-1, Some(true), true));
+        assert!(resolve_caching(1, Some(false), false));
     }
 
     #[test]
@@ -822,10 +919,54 @@ mod tests {
 
     #[test]
     fn missing_entry_loads_to_none() {
-        // SHA of bytes we never wrote.
+        // SHA of bytes we never wrote, in a private root rather than the
+        // developer's real cache.
+        let tmp = tempfile::tempdir().expect("tempdir");
         let sha = sha256_hex(&unique_bytes("missing"));
-        let v: Option<u32> = load(&sha);
+        let path = entry_location(tmp.path(), &sha).expect("cache path");
+        let v: Option<u32> = load_from_path(&path);
         assert!(v.is_none());
+    }
+
+    #[test]
+    fn lookups_do_not_create_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("filefacts");
+        let bytes = unique_bytes("lookup_no_mkdir");
+        let path_for = |key: &str| entry_location(&root, key);
+        // A miss whose result is not persisted, and a plain load, both
+        // leave the cache root untouched.
+        let transient = open_with_cache_in::<u32, _, _, _>(
+            &bytes,
+            "",
+            path_for,
+            |_| {},
+            |_| Some(Computed::Transient(1)),
+        );
+        assert_eq!(transient, Some(1));
+        let path = path_for(&cache_key(&bytes, "")).expect("cache path");
+        assert_eq!(load_from_path::<u32>(&path), None);
+        assert!(!root.exists(), "a lookup must not create directories");
+        // The first store creates the shard it writes into.
+        let stored = open_with_cache_in::<u32, _, _, _>(
+            &bytes,
+            "",
+            path_for,
+            |_| {},
+            |_| Some(Computed::Cacheable(2)),
+        );
+        assert_eq!(stored, Some(2));
+        assert_eq!(load_from_path::<u32>(&path), Some(2));
+    }
+
+    #[test]
+    fn build_fingerprint_is_a_source_hash() {
+        // Not the executable's mtime: a fixed-width hash of the source that
+        // `build.rs` computes, so it changes exactly when the code does.
+        let (version, hash) = BUILD_FINGERPRINT.split_once('+').expect("version+hash");
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(hash.len(), 16, "{hash}");
+        assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()), "{hash}");
     }
 
     #[test]
@@ -952,6 +1093,38 @@ mod tests {
             inflight.exists(),
             "a non-.bin in-flight write is never swept"
         );
+    }
+
+    #[test]
+    fn enforce_limits_removes_orphaned_temp_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shard = tmp.path().join("ab");
+        fs::create_dir_all(&shard).expect("shard");
+        let now = SystemTime::now();
+        let stale = now - ORPHANED_TEMP_AGE - Duration::from_secs(60);
+        // A temp file named the way `store_at_path` names it, left behind as
+        // if its writer died before the rename.
+        let (_, orphan) = temp_in(&shard)
+            .expect("temp file")
+            .keep()
+            .expect("keep temp file");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&orphan)
+            .expect("open for mtime")
+            .set_modified(stale)
+            .expect("set mtime");
+        // The `{key}.tmp` sibling older builds wrote through.
+        let legacy = entry_with_mtime(&shard, "ab12.tmp", stale);
+        let inflight = entry_with_mtime(&shard, ".tmpXyZ123", now);
+        let stray = entry_with_mtime(&shard, "notes.txt", stale);
+        let entry = entry_with_mtime(&shard, "ab34.bin", now);
+        enforce_limits_in(tmp.path(), 10_000, MAX_BYTES);
+        assert!(!orphan.exists(), "an orphaned temp file is swept");
+        assert!(!legacy.exists(), "a legacy orphaned temp file is swept");
+        assert!(inflight.exists(), "a recent temp file may be in flight");
+        assert!(stray.exists(), "only temp files are swept");
+        assert!(entry.exists(), "entries under the caps are kept");
     }
 
     #[test]

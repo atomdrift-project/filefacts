@@ -1,10 +1,9 @@
 //! Microsoft Cabinet (MS-CAB) header extractor.
 //!
-//! CAB was identified by magic and classified as an archive container, but had
-//! no arm in the extractor dispatch, so `archive.members` came back empty for
-//! every cabinet. Every rule reading `archive.members[*]` was therefore inert
-//! against a format that is a routine Windows malware carrier -- and, as
-//! `.msu`, a routine update-package disguise.
+//! Reports a cabinet's member table (`archive.members`) and its header facts
+//! (`cab.*`): version, set id/index, spanning names, reserve areas, and any
+//! Authenticode signature appended past `cbCabinet`. Cabinets are a routine
+//! Windows malware carrier and, as `.msu`, a routine update-package disguise.
 //!
 //! The CFHEADER is parsed here rather than taken from the `cab` crate, which
 //! reads the interesting fields and then discards them: `cbCabinet`, the
@@ -28,6 +27,7 @@ use std::io::Cursor;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::error::Error;
+use crate::formats::common::bytes_at;
 use crate::metric;
 use crate::output::{ArchiveCompression, ArchiveMember, ArchiveOffsets, Metrics, Values};
 
@@ -58,11 +58,11 @@ struct Header {
 }
 
 fn u16_at(b: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([b[off], b[off + 1]])
+    bytes_at::u16_le(b, off).unwrap_or(0)
 }
 
 fn u32_at(b: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+    bytes_at::u32_le(b, off).unwrap_or(0)
 }
 
 /// Read a NUL-terminated string, returning it and the offset just past it.
@@ -137,9 +137,6 @@ fn parse_header(bytes: &[u8]) -> Result<Header, Error> {
     })
 }
 
-/// Whether a DER blob is a PKCS#7 ContentInfo wrapping SignedData -- the
-/// Authenticode shape. Checked before handing bytes to the CMS parser so an
-/// ordinary appended payload is not run through an ASN.1 decoder.
 /// Total encoded length of a DER TLV at the start of `der`, header included.
 /// The CMS decoder rejects any bytes past the structure it is handed, and a
 /// signed cabinet is not obliged to end at its signature -- the samples here
@@ -160,6 +157,9 @@ fn der_total_len(der: &[u8]) -> Option<usize> {
     Some(2 + count + len)
 }
 
+/// Whether a DER blob is a PKCS#7 ContentInfo wrapping SignedData -- the
+/// Authenticode shape. Checked before handing bytes to the CMS parser so an
+/// ordinary appended payload is not run through an ASN.1 decoder.
 fn is_pkcs7_signed_data(der: &[u8]) -> bool {
     // SEQUENCE, then OID 1.2.840.113549.1.7.2 (signedData) within the first
     // few bytes of the ContentInfo.
@@ -619,6 +619,16 @@ mod tests {
             Some("1.3")
         );
         assert!(metrics.get("cab.declared_total_size").unwrap() > 0.0);
+    }
+
+    /// The fixed-width readers bounds-check instead of indexing, so a read
+    /// past the end yields 0 rather than a panic.
+    #[test]
+    fn field_readers_do_not_panic_past_the_end() {
+        assert_eq!(u16_at(&[0x34, 0x12], 0), 0x1234);
+        assert_eq!(u16_at(&[0x34], 0), 0);
+        assert_eq!(u32_at(&[0; 6], 3), 0);
+        assert_eq!(u32_at(&[], usize::MAX), 0);
     }
 
     #[test]

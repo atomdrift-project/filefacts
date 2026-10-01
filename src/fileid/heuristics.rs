@@ -1,7 +1,7 @@
 //! Lightweight content heuristics for files where neither magic bytes nor
 //! extension gave a result.
 //!
-//! Uses a single Aho-Corasick automaton (built once, cached in a `OnceLock`)
+//! Uses a single Aho-Corasick automaton (built once, cached in a `LazyLock`)
 //! to scan the file prefix in one pass. Pattern hits are bucketed by language
 //! and scored. This replaces ~80 independent `memmem::find` calls with a
 //! single linear scan.
@@ -10,11 +10,14 @@
 //! Each language has at least one conclusive (weight=10) pattern and 2-3
 //! supporting patterns. This keeps the automaton small and cache-friendly.
 
-use std::{borrow::Cow, sync::OnceLock};
+use std::{borrow::Cow, sync::LazyLock};
+
+use aho_corasick::AhoCorasick;
 
 use super::{
     FileType, scripts,
     scripts::{contains, contains_ci, find_ci},
+    strip_utf8_bom,
 };
 
 /// Minimum bytes of non-whitespace content required before we trust heuristics.
@@ -31,6 +34,15 @@ const TAIL_SIZE: usize = 2048;
 
 /// Minimum score to consider a language match.
 const THRESHOLD: u16 = 10;
+
+/// A head scoring this much is two conclusive tokens, or a handful of
+/// supporting ones: it already looks like a real unit, so the window after it
+/// may not replace it.
+const SETTLED_HEAD_SCORE: u16 = 40;
+
+/// How close, as a percentage of the best score, a runner-up may come before
+/// the two are too close to call.
+const AMBIGUOUS_PERCENT: u32 = 60;
 
 /// How much of a named source file [`contradicts_extension`] reads with the
 /// line grammars. A script misnamed as another language shows it early.
@@ -50,8 +62,31 @@ struct PatternEntry {
     weight: u8,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Lang {
+/// Declares [`Lang`], [`LANGS`] and [`Lang::to_file_type`] from one list, so
+/// a language's score index, its place in `LANGS` and the [`FileType`] it
+/// reports cannot drift apart. Each name is also the `FileType` it reports.
+macro_rules! scored_languages {
+    ($($lang:ident),+ $(,)?) => {
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum Lang {
+            $($lang),+
+        }
+
+        /// All languages in score-index order, which is also the order a tie
+        /// for the best score is broken in.
+        const LANGS: &[Lang] = &[$(Lang::$lang),+];
+
+        impl Lang {
+            fn to_file_type(self) -> FileType {
+                match self {
+                    $(Self::$lang => FileType::$lang),+
+                }
+            }
+        }
+    };
+}
+
+scored_languages! {
     Shell,
     Python,
     PowerShell,
@@ -69,73 +104,17 @@ enum Lang {
     ObjectiveC,
 }
 
-/// All languages in index order. Used to map score indices back to Lang values
-/// without unsafe transmute.
-const LANGS: [Lang; 15] = [
-    Lang::Shell,
-    Lang::Python,
-    Lang::PowerShell,
-    Lang::Perl,
-    Lang::Php,
-    Lang::Batch,
-    Lang::Vbs,
-    Lang::Lua,
-    Lang::JavaScript,
-    Lang::C,
-    Lang::Kotlin,
-    Lang::Dockerfile,
-    Lang::Clojure,
-    Lang::AppleScript,
-    Lang::ObjectiveC,
-];
-
 const LANG_COUNT: usize = LANGS.len();
 
 impl Lang {
-    /// Index into the scores array.
+    /// Index into the scores array: the declaration order of [`LANGS`].
     const fn idx(self) -> usize {
-        match self {
-            Self::Shell => 0,
-            Self::Python => 1,
-            Self::PowerShell => 2,
-            Self::Perl => 3,
-            Self::Php => 4,
-            Self::Batch => 5,
-            Self::Vbs => 6,
-            Self::Lua => 7,
-            Self::JavaScript => 8,
-            Self::C => 9,
-            Self::Kotlin => 10,
-            Self::Dockerfile => 11,
-            Self::Clojure => 12,
-            Self::AppleScript => 13,
-            Self::ObjectiveC => 14,
-        }
-    }
-
-    fn to_file_type(self) -> FileType {
-        match self {
-            Self::Shell => FileType::Shell,
-            Self::Python => FileType::Python,
-            Self::PowerShell => FileType::PowerShell,
-            Self::Perl => FileType::Perl,
-            Self::Php => FileType::Php,
-            Self::Batch => FileType::Batch,
-            Self::Vbs => FileType::Vbs,
-            Self::Lua => FileType::Lua,
-            Self::JavaScript => FileType::JavaScript,
-            Self::C => FileType::C,
-            Self::Kotlin => FileType::Kotlin,
-            Self::Dockerfile => FileType::Dockerfile,
-            Self::Clojure => FileType::Clojure,
-            Self::AppleScript => FileType::AppleScript,
-            Self::ObjectiveC => FileType::ObjectiveC,
-        }
+        self as usize
     }
 
     /// The scored language a file type names, if the table scores it.
     fn from_file_type(ft: FileType) -> Option<Self> {
-        LANGS.into_iter().find(|l| l.to_file_type() == ft)
+        LANGS.iter().copied().find(|l| l.to_file_type() == ft)
     }
 }
 
@@ -414,27 +393,21 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
 ];
 
 struct AcScanner {
-    ac: Option<aho_corasick::AhoCorasick>,
+    ac: AhoCorasick,
     entries: Vec<PatternEntry>,
 }
 
-fn build_scanner() -> AcScanner {
-    let patterns: Vec<&[u8]> = PATTERNS.iter().map(|(p, _, _)| *p).collect();
-    let ac = aho_corasick::AhoCorasick::builder().build(&patterns).ok();
-    let entries: Vec<PatternEntry> = PATTERNS
+/// The automaton over [`PATTERNS`]. The patterns are fixed at compile time,
+/// so a build failure is a bug in this file, not something an input can cause;
+/// it panics on first use rather than quietly disabling every language.
+static SCANNER: LazyLock<AcScanner> = LazyLock::new(|| AcScanner {
+    ac: AhoCorasick::new(PATTERNS.iter().map(|(pattern, _, _)| pattern))
+        .expect("heuristic patterns are a valid Aho-Corasick set"),
+    entries: PATTERNS
         .iter()
-        .map(|(_, lang, weight)| PatternEntry {
-            lang: *lang,
-            weight: *weight,
-        })
-        .collect();
-    AcScanner { ac, entries }
-}
-
-fn scanner() -> &'static AcScanner {
-    static SCANNER: OnceLock<AcScanner> = OnceLock::new();
-    SCANNER.get_or_init(build_scanner)
-}
+        .map(|&(_, lang, weight)| PatternEntry { lang, weight })
+        .collect(),
+});
 
 /// Check if the first `limit` bytes are mostly whitespace.
 fn is_mostly_whitespace(data: &[u8], limit: usize) -> bool {
@@ -445,73 +418,71 @@ fn is_mostly_whitespace(data: &[u8], limit: usize) -> bool {
 
 /// Single-pass scan using Aho-Corasick. Returns per-language scores.
 fn scan_scores(data: &[u8]) -> [u16; LANG_COUNT] {
-    let s = scanner();
+    let s = &*SCANNER;
     let mut scores = [0u16; LANG_COUNT];
 
-    if let Some(ac) = &s.ac {
-        for mat in ac.find_overlapping_iter(data) {
-            // `===` (JS strict-equality) must not score when it is part of a
-            // longer run of '=' — e.g. "=========" separator lines or reST/
-            // Markdown header rules. Overlapping matches across such a run would
-            // otherwise inflate the JavaScript score and mis-type plain text.
-            if &data[mat.start()..mat.end()] == b"===" {
-                let prev_eq = mat.start() > 0 && data[mat.start() - 1] == b'=';
-                let next_eq = mat.end() < data.len() && data[mat.end()] == b'=';
-                if prev_eq || next_eq {
-                    continue;
-                }
-            }
-            // `document.`/`window.` are JS DOM-global accesses only when a member
-            // name follows (document.getElementById, window.location). English
-            // prose ends sentences with "…this document." / "…the window.", where
-            // the dot is followed by whitespace/EOL/an uppercase next sentence —
-            // never a lowercase member. Require a lowercase member char so a
-            // license, README, or changelog does not score as JavaScript.
-            let m = &data[mat.start()..mat.end()];
-            if (m == b"document." || m == b"window.")
-                && !data.get(mat.end()).is_some_and(u8::is_ascii_lowercase)
-            {
+    for mat in s.ac.find_overlapping_iter(data) {
+        // `===` (JS strict-equality) must not score when it is part of a
+        // longer run of '=' — e.g. "=========" separator lines or reST/
+        // Markdown header rules. Overlapping matches across such a run would
+        // otherwise inflate the JavaScript score and mis-type plain text.
+        if &data[mat.start()..mat.end()] == b"===" {
+            let prev_eq = mat.start() > 0 && data[mat.start() - 1] == b'=';
+            let next_eq = mat.end() < data.len() && data[mat.end()] == b'=';
+            if prev_eq || next_eq {
                 continue;
             }
-            // `start WScript.exe x.vbs` is a batch file launching the host, not
-            // VBScript calling it; the object model is `WScript.Echo`,
-            // `WScript.CreateObject`, never `.exe`.
-            if m == b"WScript."
-                && data
-                    .get(mat.end()..mat.end() + 3)
-                    .is_some_and(|x| x.eq_ignore_ascii_case(b"exe"))
-            {
-                continue;
-            }
-            // `var $name` is a PHP 4 property, not a JavaScript binding.
-            if m == b"var " && data.get(mat.end()) == Some(&b'$') {
-                continue;
-            }
-            // "itself." contains `self.`, "Applet " contains `let `, and
-            // "eval " contains `val `. A declaration sits on a token boundary;
-            // `let ` followed by a function word is prose.
-            if matches!(
-                m,
-                b"let " | b"var " | b"const " | b"def " | b"except " | b"self." | b"val "
-            ) && mat.start() > 0
-                && data[mat.start() - 1].is_ascii_alphanumeric()
-            {
-                continue;
-            }
-            if m == b"let " {
-                let rest = &data[mat.end()..];
-                const PROSE: &[&[u8]] = &[
-                    b"the ", b"the\n", b"a ", b"an ", b"us ", b"me ", b"it ", b"you ", b"them ",
-                    b"this ", b"that ", b"your ", b"there ", b"him ", b"her ",
-                ];
-                if PROSE.iter().any(|word| rest.starts_with(word)) {
-                    continue;
-                }
-            }
-            let entry = &s.entries[mat.pattern().as_usize()];
-            let idx = entry.lang.idx();
-            scores[idx] = scores[idx].saturating_add(u16::from(entry.weight));
         }
+        // `document.`/`window.` are JS DOM-global accesses only when a member
+        // name follows (document.getElementById, window.location). English
+        // prose ends sentences with "…this document." / "…the window.", where
+        // the dot is followed by whitespace/EOL/an uppercase next sentence —
+        // never a lowercase member. Require a lowercase member char so a
+        // license, README, or changelog does not score as JavaScript.
+        let m = &data[mat.start()..mat.end()];
+        if (m == b"document." || m == b"window.")
+            && !data.get(mat.end()).is_some_and(u8::is_ascii_lowercase)
+        {
+            continue;
+        }
+        // `start WScript.exe x.vbs` is a batch file launching the host, not
+        // VBScript calling it; the object model is `WScript.Echo`,
+        // `WScript.CreateObject`, never `.exe`.
+        if m == b"WScript."
+            && data
+                .get(mat.end()..mat.end() + 3)
+                .is_some_and(|x| x.eq_ignore_ascii_case(b"exe"))
+        {
+            continue;
+        }
+        // `var $name` is a PHP 4 property, not a JavaScript binding.
+        if m == b"var " && data.get(mat.end()) == Some(&b'$') {
+            continue;
+        }
+        // "itself." contains `self.`, "Applet " contains `let `, and
+        // "eval " contains `val `. A declaration sits on a token boundary;
+        // `let ` followed by a function word is prose.
+        if matches!(
+            m,
+            b"let " | b"var " | b"const " | b"def " | b"except " | b"self." | b"val "
+        ) && mat.start() > 0
+            && data[mat.start() - 1].is_ascii_alphanumeric()
+        {
+            continue;
+        }
+        if m == b"let " {
+            let rest = &data[mat.end()..];
+            const PROSE: &[&[u8]] = &[
+                b"the ", b"the\n", b"a ", b"an ", b"us ", b"me ", b"it ", b"you ", b"them ",
+                b"this ", b"that ", b"your ", b"there ", b"him ", b"her ",
+            ];
+            if PROSE.iter().any(|word| rest.starts_with(word)) {
+                continue;
+            }
+        }
+        let entry = &s.entries[mat.pattern().as_usize()];
+        let idx = entry.lang.idx();
+        scores[idx] = scores[idx].saturating_add(u16::from(entry.weight));
     }
 
     scores
@@ -611,17 +582,16 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
     // next window may replace a head that never became conclusive.
     let scores = if !is_mostly_whitespace(body, SCAN_LIMIT) && body.len() > SCAN_LIMIT {
         let head_best = scores.iter().copied().max().unwrap_or(0);
-        // 40 is two conclusive tokens, or a handful of supporting ones. A
-        // preface of `var ` / `eval ` hits that and hides `<?php` a few
+        // A preface of `var ` / `eval ` scores too, and hides `<?php` a few
         // hundred bytes later. A head that already looks like a real unit
         // stays as it is.
-        if head_best < 40 {
+        if head_best < SETTLED_HEAD_SCORE {
             let next = &body[SCAN_LIMIT..body.len().min(SCAN_LIMIT * 2)];
             let next_scores = scan_scores(next);
             let next_best = next_scores.iter().copied().max().unwrap_or(0);
             if next_best >= THRESHOLD
                 && next_best > head_best
-                && (head_best == 0 || head_best * 100 / next_best <= 60)
+                && (head_best == 0 || !too_close(head_best, next_best))
             {
                 next_scores
             } else {
@@ -683,8 +653,8 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
             .unwrap_or(0);
     }
 
-    // Ambiguity: if the second-best is close (within 60%), bail
-    if second_score > 0 && second_score * 100 / best_score > 60 {
+    // Ambiguity: if the second-best is close, bail
+    if second_score > 0 && too_close(second_score, best_score) {
         return None;
     }
 
@@ -736,6 +706,13 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
     Some(lang.to_file_type())
 }
 
+/// Whether `runner_up` scores within [`AMBIGUOUS_PERCENT`] of `best`, which
+/// must be non-zero. Widened first: a saturated score times 100 overflows
+/// `u16`.
+fn too_close(runner_up: u16, best: u16) -> bool {
+    u32::from(runner_up) * 100 / u32::from(best) > AMBIGUOUS_PERCENT
+}
+
 /// PowerShell droppers sometimes conceal commands in a decimal byte array:
 /// `$name = @(83,116,97,114,116,...)`. The ordinary keyword scorer cannot see
 /// any of the commands until that array is decoded. This shape is distinctive
@@ -783,7 +760,6 @@ pub(crate) fn has_powershell_char_code_array(data: &[u8]) -> bool {
     }
 }
 
-/// First offset of `needle` in `haystack`.
 /// Only inputs at least this large are screened by [`looks_like_prose`]: a
 /// tiny script (`echo hi`) can legitimately have no code punctuation at all,
 /// and a mis-typed tiny file costs nothing to parse.
@@ -810,13 +786,6 @@ const CODE_PUNCT_TABLE: [bool; 256] = {
     table
 };
 
-/// True when `head` reads like natural-language text rather than source.
-///
-/// Measured on the first 4 KiB: prose (novels, licenses) has 0.15-0.3% code
-/// punctuation with ~4% of lines carrying any; minified JS 6.5% / 93%, Rust
-/// 3.5% / 58%, a Makefile 4.1% / 91%, and even a Markdown README with embedded
-/// snippets 2.8% / 30%. Both thresholds sit well inside that gap, and both must
-/// hold — a file has to look like prose on the byte *and* the line axis.
 /// `true` when the window carries enough control bytes that it cannot be one
 /// of the scored languages.
 ///
@@ -825,6 +794,12 @@ const CODE_PUNCT_TABLE: [bool; 256] = {
 /// a byte below 0x20 that is not tab, newline or carriage return. Object code
 /// is full of them -- the DOS sample that prompted this sits at 14% -- so a
 /// small threshold separates the two decisively without judging encodings.
+///
+/// Stricter than `scripts::is_binary`, which also excuses form feed, ESC, SUB
+/// and IRC formatting codes: the line grammars read batch and mIRC scripts,
+/// whose `echo` lines and messages carry them, while the languages scored here
+/// do not. `magic::content_is_text` reads only 64 bytes, so it allows no
+/// control byte at all bar form feed.
 fn looks_like_binary(head: &[u8]) -> bool {
     const MIN_BYTES: usize = 8;
     const MAX_CONTROL_PERCENT: usize = 3;
@@ -848,12 +823,8 @@ fn looks_like_binary(head: &[u8]) -> bool {
 /// `Trivial.45.t`). UTF-16 text is mostly NULs and would otherwise look the
 /// same; a BOM or a lane of NULs keeps that as text for the extension fallback.
 pub(crate) fn binary_not_source(data: &[u8]) -> bool {
-    let content_start = if data.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        3
-    } else {
-        0
-    };
-    let head = &data[content_start..data.len().min(content_start + SCAN_LIMIT)];
+    let body = strip_utf8_bom(data);
+    let head = &body[..body.len().min(SCAN_LIMIT)];
     looks_like_binary(head) && !looks_like_utf16_text(head)
 }
 
@@ -939,7 +910,7 @@ pub(crate) fn has_language_evidence(ft: FileType, data: &[u8]) -> bool {
     let Some(lang) = Lang::from_file_type(ft) else {
         return false;
     };
-    let body = trim_ascii_start(data);
+    let body = data.trim_ascii_start();
     scan_scores(&body[..body.len().min(SCAN_LIMIT)])[lang.idx()] > 0
 }
 
@@ -958,7 +929,7 @@ pub(crate) fn looks_like_c_family(data: &[u8]) -> bool {
             || contains(head, b"//")
             || head
                 .split(|&b| b == b'\n')
-                .any(|l| trim_ascii_start(l).first() == Some(&b'#')))
+                .any(|l| l.trim_ascii_start().first() == Some(&b'#')))
 }
 
 /// Content that contradicts a source-language extension, and what it is
@@ -992,7 +963,7 @@ pub(crate) fn contradicts_extension(ext: FileType, data: &[u8]) -> Option<FileTy
         return None;
     }
     let text = decoded_text(data).unwrap_or(Cow::Borrowed(data));
-    let body = trim_ascii_start(text.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&text));
+    let body = strip_utf8_bom(&text).trim_ascii_start();
     // Ahead of the markup check: a batch file may open `<!-- :` to double as
     // the WSF or HTA it carries further down. This runs on every source file
     // with a name, so it reads less than a nameless file gets.
@@ -1031,6 +1002,13 @@ pub(crate) fn contradicts_extension(ext: FileType, data: &[u8]) -> Option<FileTy
     (scores[claimed.idx()] == 0).then_some(found)
 }
 
+/// True when `head` reads like natural-language text rather than source.
+///
+/// Measured on the first 4 KiB: prose (novels, licenses) has 0.15-0.3% code
+/// punctuation with ~4% of lines carrying any; minified JS 6.5% / 93%, Rust
+/// 3.5% / 58%, a Makefile 4.1% / 91%, and even a Markdown README with embedded
+/// snippets 2.8% / 30%. Both thresholds sit well inside that gap, and both must
+/// hold — a file has to look like prose on the byte *and* the line axis.
 fn looks_like_prose(head: &[u8]) -> bool {
     if head.is_empty() {
         return false;
@@ -1053,10 +1031,6 @@ fn looks_like_prose(head: &[u8]) -> bool {
     punct * 100 < head.len() && code_lines * 100 < lines * 15
 }
 
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
 /// `true` when the bytes read as a structured-data document — a JSON object or
 /// array, or a YAML block mapping — rather than as code in any scored language.
 /// Kept deliberately shape-based: it asks how the lines are built, never which
@@ -1070,7 +1044,9 @@ fn looks_like_structured_data(data: &[u8]) -> bool {
     }
     let body = head.trim_ascii_start();
     // JSON: opens a container and carries at least one quoted key.
-    if (body.starts_with(b"{") || body.starts_with(b"[")) && find(body, b"\":").is_some() {
+    if (body.starts_with(b"{") || body.starts_with(b"["))
+        && memchr::memmem::find(body, b"\":").is_some()
+    {
         return true;
     }
     // YAML: block mappings and sequence entries dominate the significant lines.
@@ -1213,7 +1189,7 @@ fn starts_with_dockerfile_instruction(data: &[u8]) -> bool {
 fn has_php_tag(data: &[u8]) -> bool {
     let mut saw_xml_pi = false;
     let mut offset = 0;
-    while let Some(pos) = find(&data[offset..], b"<?") {
+    while let Some(pos) = memchr::memmem::find(&data[offset..], b"<?") {
         let after = offset + pos + 2;
         if data[after..].len() >= 3 && data[after..after + 3].eq_ignore_ascii_case(b"xml") {
             saw_xml_pi = true;
@@ -1222,7 +1198,7 @@ fn has_php_tag(data: &[u8]) -> bool {
         }
         offset = after;
     }
-    !saw_xml_pi && find(data, b"?>").is_some()
+    !saw_xml_pi && memchr::memmem::find(data, b"?>").is_some()
 }
 
 /// How far into a file [`looks_like_html`] will look for markup.
@@ -1240,28 +1216,28 @@ fn has_php_tag(data: &[u8]) -> bool {
 /// scan on a large file.
 const HTML_SCAN_WINDOW: usize = 1 << 20;
 
+/// Tags that only markup carries. Static like [`SCANNER`]'s patterns, so a
+/// build failure is a bug here: it panics rather than calling nothing HTML.
+static HTML_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
+    AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build([
+            "<!doctype html",
+            "<html",
+            "<head",
+            "<body",
+            "<script",
+            "<div",
+            "<span",
+            "<p>",
+            "<meta",
+        ])
+        .expect("HTML tags are a valid Aho-Corasick set")
+});
+
 /// Check if content looks like HTML (has actual markup tags).
 pub(crate) fn looks_like_html(data: &[u8]) -> bool {
-    static HTML_AC: OnceLock<Option<aho_corasick::AhoCorasick>> = OnceLock::new();
-    let ac = HTML_AC.get_or_init(|| {
-        aho_corasick::AhoCorasick::builder()
-            .ascii_case_insensitive(true)
-            .build([
-                "<!doctype html",
-                "<html",
-                "<head",
-                "<body",
-                "<script",
-                "<div",
-                "<span",
-                "<p>",
-                "<meta",
-            ])
-            .ok()
-    });
-
-    let head = &data[..data.len().min(HTML_SCAN_WINDOW)];
-    ac.as_ref().is_some_and(|ac| ac.is_match(head))
+    HTML_AC.is_match(&data[..data.len().min(HTML_SCAN_WINDOW)])
 }
 
 /// A mark that belongs to one format and almost nothing else.
@@ -1270,7 +1246,7 @@ pub(crate) fn looks_like_html(data: &[u8]) -> bool {
 /// itself is. This is not the language scorer: a weighted token fight is how
 /// a JSP page became Python and a mIRC script became Lua. One needle, one type.
 pub(crate) fn unmistakable(data: &[u8]) -> Option<FileType> {
-    let data = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(data);
+    let data = strip_utf8_bom(data);
     let head = &data[..data.len().min(2048)];
     if looks_like_git_config(head) {
         return Some(FileType::Text);
@@ -1347,7 +1323,7 @@ pub(crate) fn looks_like_git_config(data: &[u8]) -> bool {
         Other,
     }
 
-    let data = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(data);
+    let data = strip_utf8_bom(data);
     let head = &data[..data.len().min(SCAN_LIMIT)];
     if head.is_empty() || looks_like_binary(head) {
         return false;
@@ -1632,17 +1608,7 @@ fn looks_like_dos_com_overwriter(data: &[u8]) -> bool {
     let dos_calls = prefix.windows(2).filter(|w| *w == [0xCD, 0x21]).count();
     dos_calls >= 2
         && prefix.windows(2).any(|w| w == [0xCD, 0x20])
-        && contains_ascii_case_insensitive(prefix, b"*.com\0")
-}
-
-fn contains_ascii_case_insensitive(data: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && data.windows(needle.len()).any(|window| {
-            window
-                .iter()
-                .zip(needle)
-                .all(|(left, right)| left.eq_ignore_ascii_case(right))
-        })
+        && contains_ci(prefix, b"*.com\0")
 }
 
 fn has_dos_service_call(data: &[u8]) -> bool {
@@ -1658,7 +1624,7 @@ fn looks_like_asp_directive(head: &[u8]) -> bool {
     // the Chinese-language webshells.
     let mut from = 0;
     while let Some(at) = find_ci(&head[from..], b"<%@") {
-        let rest = trim_ascii_start(&head[from + at + 3..]);
+        let rest = head[from + at + 3..].trim_ascii_start();
         let directive = [
             &b"language"[..],
             b"codepage",
@@ -1686,7 +1652,7 @@ fn looks_like_asp_directive(head: &[u8]) -> bool {
 /// requiring all three keeps an English sentence that says "rule" from matching.
 fn looks_like_yara(head: &[u8]) -> bool {
     let rule = head.split(|&b| b == b'\n').any(|line| {
-        let line = trim_ascii_start(line);
+        let line = line.trim_ascii_start();
         line.starts_with(b"rule ")
             || line.starts_with(b"private rule ")
             || line.starts_with(b"global rule ")
@@ -1694,16 +1660,7 @@ fn looks_like_yara(head: &[u8]) -> bool {
     rule && contains(head, b"strings:") && contains(head, b"condition:")
 }
 
-fn trim_ascii_start(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    &bytes[start..]
-}
-
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -1839,6 +1796,46 @@ mod tests {
             detect_from_content(data.as_bytes()),
             Some(FileType::JavaScript)
         );
+    }
+
+    /// Both automata are built from static patterns, and a failure to build
+    /// either must not pass as "no language here".
+    #[test]
+    fn pattern_automata_build() {
+        assert_eq!(SCANNER.ac.patterns_len(), PATTERNS.len());
+        assert_eq!(SCANNER.entries.len(), PATTERNS.len());
+        assert!(HTML_AC.is_match(b"<HTML>"));
+    }
+
+    /// A score index, its place in `LANGS` and its file type agree.
+    #[test]
+    fn languages_round_trip_through_file_types() {
+        for (i, &lang) in LANGS.iter().enumerate() {
+            assert_eq!(lang.idx(), i, "{lang:?}");
+            assert_eq!(Lang::from_file_type(lang.to_file_type()), Some(lang));
+        }
+        assert_eq!(Lang::from_file_type(FileType::Go), None);
+    }
+
+    /// Two languages both past 655 points used to overflow `u16` when their
+    /// ratio was taken, which panics in a debug build. They are simply too
+    /// close to call.
+    #[test]
+    fn saturated_scores_are_compared_without_overflow() {
+        let data = b"self.;cd /;".repeat(SCAN_LIMIT / 11);
+        let scores = scan_scores(&data);
+        assert!(scores[Lang::Python.idx()] > 655 && scores[Lang::Shell.idx()] > 655);
+        assert_eq!(detect_from_content(&data), None);
+    }
+
+    #[test]
+    fn binary_judgement_reads_past_a_utf8_bom() {
+        let mut data = b"\xEF\xBB\xBF".to_vec();
+        data.extend_from_slice(b"\x01\x02\x03\x04\x05\x06\x07\x08 mostly text\n");
+        assert!(binary_not_source(&data));
+        assert!(!binary_not_source(
+            b"\xEF\xBB\xBF#import <Foundation/Foundation.h>\n"
+        ));
     }
 
     #[test]
@@ -2516,7 +2513,6 @@ mod lowercase_batch_heuristic_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod decoded_text_tests {
     use super::*;
 

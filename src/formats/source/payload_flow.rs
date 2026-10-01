@@ -4,9 +4,10 @@
 //! Track assignments and local helper summaries, keeping HTTP authentication
 //! separate from request bodies. Unknown code is not assumed to be an HTTP
 //! client. Analysis limits are surfaced rather than reported as clean scans.
+use super::{MAX_FLOW_DEPTH, named_children};
 use crate::Values;
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tree_sitter::Node;
 
 type Bits = u64;
@@ -41,19 +42,15 @@ struct Summary {
     reads: Bits,
 }
 
-struct Analysis<'s, 't> {
+struct Analysis<'s> {
     source: &'s str,
     language: &'s str,
     aliases: HashMap<String, String>,
-    functions: BTreeMap<String, Node<'t>>,
+    /// Node ids of test-only code, which is never evaluated.
+    excluded: HashSet<usize>,
     summaries: BTreeMap<String, Summary>,
     budget: usize,
     truncated: bool,
-}
-
-fn children(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).collect()
 }
 
 fn function(node: Node<'_>) -> bool {
@@ -66,21 +63,32 @@ fn function(node: Node<'_>) -> bool {
     )
 }
 
-fn excluded(node: Node<'_>, source: &str) -> bool {
-    let mut previous = node.prev_named_sibling();
-    while let Some(attr) = previous {
-        if attr.kind() != "attribute_item" {
-            break;
+/// Ids of Rust nodes preceded by a run of attributes that includes
+/// `#[cfg(test)]` or `#[test]`. The run is tracked while iterating each node's
+/// children: asking `Node::prev_named_sibling` per evaluated node instead
+/// costs a walk down from the root every time.
+fn test_only(root: Node<'_>, source: &str) -> HashSet<usize> {
+    let mut excluded = HashSet::new();
+    let mut stack = vec![root];
+    let mut cursor = root.walk();
+    while let Some(node) = stack.pop() {
+        let mut after_test_attribute = false;
+        for child in node.named_children(&mut cursor) {
+            if after_test_attribute {
+                excluded.insert(child.id());
+            }
+            if child.kind() == "attribute_item" {
+                let text = source[child.byte_range()]
+                    .split_whitespace()
+                    .collect::<String>();
+                after_test_attribute |= text == "#[cfg(test)]" || text == "#[test]";
+            } else {
+                after_test_attribute = false;
+            }
+            stack.push(child);
         }
-        let text = source[attr.byte_range()]
-            .split_whitespace()
-            .collect::<String>();
-        if text == "#[cfg(test)]" || text == "#[test]" {
-            return true;
-        }
-        previous = attr.prev_named_sibling();
     }
-    false
+    excluded
 }
 
 pub(super) fn emit(root: Node<'_>, source: &str, language: &str, values: &mut Values) {
@@ -116,7 +124,12 @@ fn emit_seeded(
         source,
         language,
         aliases: HashMap::new(),
-        functions: BTreeMap::new(),
+        // Test attributes are Rust syntax; no other grammar has them.
+        excluded: if language == "rust" {
+            test_only(root, source)
+        } else {
+            HashSet::new()
+        },
         summaries: seeds.clone(),
         budget: LIMIT,
         truncated: false,
@@ -145,9 +158,10 @@ fn emit_seeded(
         }
     }
     let mut stack = vec![root];
+    let mut functions = BTreeMap::new();
     let mut ambiguous = Vec::new();
     while let Some(node) = stack.pop() {
-        if excluded(node, source) {
+        if a.excluded.contains(&node.id()) {
             continue;
         }
         if function(node) {
@@ -157,7 +171,7 @@ fn emit_seeded(
                 } else {
                     a.text(name).to_string()
                 };
-                if a.functions.insert(key.clone(), node).is_some() {
+                if functions.insert(key.clone(), node).is_some() {
                     ambiguous.push(key);
                 }
             }
@@ -171,7 +185,7 @@ fn emit_seeded(
             ) {
                 if matches!(value.kind(), "arrow_function" | "function_expression") {
                     let key = a.text(name).to_string();
-                    if a.functions.insert(key.clone(), value).is_some() {
+                    if functions.insert(key.clone(), value).is_some() {
                         ambiguous.push(key);
                     }
                     continue;
@@ -181,16 +195,15 @@ fn emit_seeded(
         if node.kind() == "import_statement" || node.kind() == "import_from_statement" {
             a.python_imports(node);
         }
-        stack.extend(children(node));
+        stack.extend(named_children(node));
         if stack.len() > 10_000 {
             a.truncated = true;
             break;
         }
     }
     for name in ambiguous {
-        a.functions.remove(&name);
+        functions.remove(&name);
     }
-    let functions = a.functions.clone();
     // Fixed point handles helper declaration order and bounded recursion.
     for iteration in 0..8 {
         let before = a.summaries.clone();
@@ -201,7 +214,11 @@ fn emit_seeded(
         for (name, node) in &functions {
             let mut bindings = globals.clone();
             if let Some(params) = node.child_by_field_name("parameters") {
-                for (index, param) in children(params).into_iter().enumerate().take(PARAM_COUNT) {
+                for (index, param) in named_children(params)
+                    .into_iter()
+                    .enumerate()
+                    .take(PARAM_COUNT)
+                {
                     let pat = param
                         .child_by_field_name("pattern")
                         .or_else(|| param.child_by_field_name("name"))
@@ -271,7 +288,7 @@ fn emit_seeded(
             json!(events_for(&startup, "<initialization>", 0)),
         );
     }
-    events.sort_by_key(|event| event.to_string());
+    events.sort_by_cached_key(serde_json::Value::to_string);
     events.dedup();
     values.insert("source.payload_flow.events", json!(events));
     values.insert("source.payload_flow.truncated", json!(a.truncated));
@@ -385,7 +402,7 @@ fn events_for(summary: &Summary, name: &str, offset: usize) -> Vec<serde_json::V
     events
 }
 
-impl<'s, 't> Analysis<'s, 't> {
+impl<'s> Analysis<'s> {
     fn text(&self, node: Node<'_>) -> &'s str {
         &self.source[node.byte_range()]
     }
@@ -403,7 +420,7 @@ impl<'s, 't> Analysis<'s, 't> {
         let module = node
             .child_by_field_name("module_name")
             .map(|n| self.text(n).to_string());
-        for child in children(node) {
+        for child in named_children(node) {
             if Some(child) == node.child_by_field_name("module_name") {
                 continue;
             }
@@ -434,23 +451,23 @@ impl<'s, 't> Analysis<'s, 't> {
             if node.kind() == "identifier" {
                 bindings.insert(self.text(node).to_string(), bits);
             } else if !matches!(node.kind(), "type_identifier" | "scoped_identifier") {
-                stack.extend(children(node));
+                stack.extend(named_children(node));
             }
         }
     }
     fn eval(
         &mut self,
-        node: Node<'t>,
+        node: Node<'_>,
         bindings: &mut HashMap<String, Bits>,
         out: &mut Summary,
         depth: usize,
     ) -> Bits {
-        if self.budget == 0 || depth > 96 {
+        if self.budget == 0 || depth > MAX_FLOW_DEPTH {
             self.truncated = true;
             return 0;
         }
         self.budget -= 1;
-        if excluded(node, self.source)
+        if self.excluded.contains(&node.id())
             || function(node)
             || matches!(
                 node.kind(),
@@ -479,7 +496,7 @@ impl<'s, 't> Analysis<'s, 't> {
                 .is_some_and(|n| matches!(self.text(n), "format" | "format_args" | "std::format"))
         {
             let mut bits = self.all(node, bindings, out, depth + 1);
-            let mut stack = children(node);
+            let mut stack = named_children(node);
             while let Some(child) = stack.pop() {
                 if child.kind() == "string_literal" {
                     let literal = self.text(child);
@@ -505,7 +522,7 @@ impl<'s, 't> Analysis<'s, 't> {
                         index += 1;
                     }
                 } else {
-                    stack.extend(children(child));
+                    stack.extend(named_children(child));
                 }
             }
             return bits;
@@ -699,7 +716,7 @@ impl<'s, 't> Analysis<'s, 't> {
                 // `object` is already evaluated; letting the fallback `all`
                 // evaluate it again would double the work at every link of a
                 // member chain.
-                return children(node)
+                return named_children(node)
                     .into_iter()
                     .filter(|child| Some(*child) != object)
                     .fold(object_bits.unwrap_or(0), |bits, child| {
@@ -731,14 +748,14 @@ impl<'s, 't> Analysis<'s, 't> {
                 HashMap::new()
             };
             let mut declared = HashMap::new();
-            for child in children(node) {
+            for child in named_children(node) {
                 if scoped && child.kind() == "let_declaration" {
                     if let Some(pattern) = child.child_by_field_name("pattern") {
                         self.bind(pattern, 0, &mut declared);
                     }
                 }
                 if scoped && child.kind() == "lexical_declaration" {
-                    for declaration in children(child) {
+                    for declaration in named_children(child) {
                         if let Some(name) = declaration.child_by_field_name("name") {
                             self.bind(name, 0, &mut declared);
                         }
@@ -759,18 +776,18 @@ impl<'s, 't> Analysis<'s, 't> {
     }
     fn all(
         &mut self,
-        node: Node<'t>,
+        node: Node<'_>,
         bindings: &mut HashMap<String, Bits>,
         out: &mut Summary,
         depth: usize,
     ) -> Bits {
-        children(node)
+        named_children(node)
             .into_iter()
             .fold(0, |bits, n| bits | self.eval(n, bindings, out, depth + 1))
     }
     fn call(
         &mut self,
-        node: Node<'t>,
+        node: Node<'_>,
         bindings: &mut HashMap<String, Bits>,
         out: &mut Summary,
         depth: usize,
@@ -804,7 +821,7 @@ impl<'s, 't> Analysis<'s, 't> {
             .unwrap_or_else(|| name.rsplit("::").next().unwrap_or(&name));
         let args = node
             .child_by_field_name("arguments")
-            .map(children)
+            .map(named_children)
             .unwrap_or_default();
         let bits: Vec<Bits> = args
             .iter()
@@ -868,7 +885,7 @@ impl<'s, 't> Analysis<'s, 't> {
                             let Some(child) = n.named_child(0) else { break };
                             n = child;
                         }
-                        children(n)
+                        named_children(n)
                     })
                     .unwrap_or_default()
             } else {
@@ -968,7 +985,7 @@ impl<'s, 't> Analysis<'s, 't> {
         if name == "fetch" {
             out.http = true;
             if let Some(options) = args.get(1) {
-                for pair in children(*options) {
+                for pair in named_children(*options) {
                     if pair
                         .child_by_field_name("key")
                         .is_some_and(|n| self.text(n).trim_matches(['\'', '"']) == "body")
@@ -1274,6 +1291,30 @@ mod tests {
             "[]"
         );
     }
+    /// Code is test-only when any attribute in the run directly before it is
+    /// `#[cfg(test)]` or `#[test]`; anything else in between ends the run.
+    #[test]
+    fn test_attribute_runs_exclude_only_the_item_they_gate() {
+        let send = "{ureq::post(endpoint).send_json(std::env::vars());}";
+        for gated in [
+            format!("#[cfg(test)] #[allow(dead_code)] fn run(){send}"),
+            format!("#[allow(dead_code)] #[test] fn run(){send}"),
+            format!("fn run(){{ #[cfg(test)] {{ let _ = 1; }} #[cfg(test)] {send} }}"),
+        ] {
+            assert_eq!(kinds("lib.rs", &gated), "[]", "{gated}");
+        }
+        for live in [
+            format!("#[inline] fn run(){send}"),
+            format!("#[cfg(test)] fn helper(){{}} fn run(){send}"),
+            format!("#[cfg(test)]\n// note\nfn run(){send}"),
+        ] {
+            assert!(
+                kinds("lib.rs", &live).contains("environment-http-body"),
+                "{live}"
+            );
+        }
+    }
+
     #[test]
     fn typed_http_helper_and_curl_payload_only() {
         assert!(kinds("lib.rs","use reqwest::blocking::Client; fn send(c:&Client,data:&str){c.post(endpoint).body(data).send();} fn run(){let c=Client::new();let data=std::fs::read(path);send(&c,&data);}").contains("file-http-body"));

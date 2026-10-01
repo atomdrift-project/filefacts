@@ -13,12 +13,14 @@
 
 use crate::metric;
 use goblin::pe::{PE, header::CoffHeader, optional_header::OptionalHeader};
+use memchr::memmem;
 use serde_json::Value as JsonValue;
 
 use crate::error::Error;
+use crate::formats::common::bytes_at::{u16_le, u32_le, u64_le};
 use crate::formats::common::{
-    XorScan, extract_binary_strings, extract_binary_strings_from_object, hex_encode, put_i64,
-    put_str, put_u64, rizin_decision, rizin_fallback_with_sections,
+    XorScan, extract_binary_strings, extract_binary_strings_from_object, format_guid, hex_encode,
+    put_i64, put_str, put_u64, rizin_decision, rizin_fallback_with_sections, section_entropy,
 };
 use crate::formats::goblin_safe;
 use crate::output::{Errors, Metrics, Section, Strings, Values};
@@ -69,8 +71,8 @@ pub(super) fn extract(
     // both as a metric and in the structured errors view — a forged import
     // table is a fact worth carrying, and its absence would otherwise read
     // as "this binary imports nothing".
-    if let Some(reason) = &parse.imports_skipped {
-        errors_out.record_malformed(crate::Stage::PeParse, reason.clone());
+    if let Some(reason) = parse.imports_skipped {
+        errors_out.record_malformed(crate::Stage::PeParse, reason.to_string());
         metrics.insert(metric!("pe.import_table_unwalkable"), 1.0);
     }
     let parse_outcome = parse.outcome;
@@ -164,7 +166,7 @@ pub(super) fn extract(
             }
         }
         if let Some(ref dbg) = pe.debug_data {
-            super::pe_debug::extract(dbg, values);
+            super::pe_debug::extract(dbg, values, errors_out);
         }
         bound_imports(&pe, bytes, values, metrics);
         delay_imports(&pe, bytes, values, metrics, symbols_out);
@@ -238,8 +240,16 @@ pub(super) fn extract(
     // we can still surface machine / subsystem / characteristics +
     // Authenticode for binaries whose import directory is malformed
     // or stripped (packed installers, Go binaries, obfuscated builds).
-    let header = goblin::pe::header::Header::parse(pe_bytes)
-        .map_err(|e| Error::malformed("pe", e.to_string()))?;
+    let header = match goblin_safe::parse_pe_header(pe_bytes) {
+        goblin_safe::GoblinOutcome::Ok(header) => header,
+        goblin_safe::GoblinOutcome::Failed(e) => {
+            return Err(Error::malformed("pe", e.to_string()));
+        }
+        goblin_safe::GoblinOutcome::Panicked(msg) => {
+            errors_out.record_panic(crate::Stage::PeParse, msg);
+            return Ok(());
+        }
+    };
     coff_header(&header.coff_header, values, metrics);
     dos_header(&header, values);
     if let Some(ref opt) = header.optional_header {
@@ -322,7 +332,9 @@ fn native_resolver_signals(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metri
         let Some(code) = bytes.get(start..end) else {
             continue;
         };
-        for local_offset in find_bytes(code, b"\x64\xa1\x30\x00\x00\x00") {
+        // memmem reports non-overlapping matches; no opcode needle searched
+        // for in this file can overlap itself, so that is every match.
+        for local_offset in memmem::find_iter(code, b"\x64\xa1\x30\x00\x00\x00") {
             peb_x86 += 1;
             peb_sites.push(native_site(
                 pe,
@@ -334,7 +346,7 @@ fn native_resolver_signals(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metri
                 }),
             ));
         }
-        for local_offset in find_bytes(code, b"\x65\x48\x8b\x04\x25\x60\x00\x00\x00") {
+        for local_offset in memmem::find_iter(code, b"\x65\x48\x8b\x04\x25\x60\x00\x00\x00") {
             peb_x64 += 1;
             peb_sites.push(native_site(
                 pe,
@@ -433,14 +445,6 @@ fn native_resolver_signals(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metri
     if !hash_profiles.is_empty() {
         values.insert("pe.api_hash_profiles", JsonValue::Array(hash_profiles));
     }
-}
-
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
-    haystack
-        .windows(needle.len())
-        .enumerate()
-        .filter_map(|(offset, window)| (window == needle).then_some(offset))
-        .collect()
 }
 
 fn native_site(
@@ -1075,8 +1079,8 @@ fn find_custom_byte_hash_profiles_x86(bytes: &[u8]) -> Vec<ApiHashProfile> {
             });
             let normalization_start = start.saturating_sub(32);
             let normalization = bytes.get(normalization_start..start).is_some_and(|prefix| {
-                find_bytes(prefix, b"\x80\xcd\x20").len() == 1
-                    && find_bytes(prefix, b"\x80\xf9\x1a").len() == 1
+                memmem::find_iter(prefix, b"\x80\xcd\x20").count() == 1
+                    && memmem::find_iter(prefix, b"\x80\xf9\x1a").count() == 1
                     && prefix.windows(2).any(|window| window == [0x0f, 0x43])
             });
             Some(ApiHashProfile {
@@ -1155,8 +1159,8 @@ fn find_xor_rotate_multiply_hash_profiles_x86(bytes: &[u8]) -> Vec<ApiHashProfil
         let normalization = bytes
             .get(normalization_start..byte_load)
             .is_some_and(|prefix| {
-                find_bytes(prefix, b"\x80\xca\x20").len()
-                    + find_bytes(prefix, b"\x80\xce\x20").len()
+                memmem::find_iter(prefix, b"\x80\xca\x20").count()
+                    + memmem::find_iter(prefix, b"\x80\xce\x20").count()
                     > 0
                     && prefix
                         .windows(3)
@@ -1377,19 +1381,6 @@ fn sections(pe: &PE<'_>, bytes: &[u8], _metrics: &mut Metrics, sections_out: &mu
             entropy,
         });
     }
-}
-
-fn section_entropy(bytes: &[u8], offset: u64, size: u64) -> f64 {
-    if size == 0 {
-        return 0.0;
-    }
-    let start = usize::try_from(offset).unwrap_or(usize::MAX);
-    let end = start.saturating_add(usize::try_from(size).unwrap_or(usize::MAX));
-    if start >= bytes.len() {
-        return 0.0;
-    }
-    let end = end.min(bytes.len());
-    entropy::shannon(&bytes[start..end])
 }
 
 /// Compute the canonical *imphash* — MD5 of the comma-joined,
@@ -1872,12 +1863,17 @@ fn bound_imports(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut M
     }
     let mut out: Vec<Desc> = Vec::new();
     let mut cursor = 0_usize;
-    while cursor + 8 <= table.len() && out.len() < 64 {
-        let time_date = u32::from_le_bytes(table[cursor..cursor + 4].try_into().unwrap());
-        let name_off =
-            u16::from_le_bytes(table[cursor + 4..cursor + 6].try_into().unwrap()) as usize;
-        let forwarder_count =
-            u16::from_le_bytes(table[cursor + 6..cursor + 8].try_into().unwrap()) as u32;
+    while out.len() < 64 {
+        // A descriptor is 8 bytes; a short tail ends the table.
+        let (Some(time_date), Some(name_off), Some(forwarder_count)) = (
+            u32_le(table, cursor),
+            u16_le(table, cursor.saturating_add(4)),
+            u16_le(table, cursor.saturating_add(6)),
+        ) else {
+            break;
+        };
+        let name_off = usize::from(name_off);
+        let forwarder_count = u32::from(forwarder_count);
 
         // All-zero descriptor terminates the list.
         if time_date == 0 && name_off == 0 && forwarder_count == 0 {
@@ -2054,11 +2050,12 @@ fn data_directory_anomalies(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metr
         let Some(entry_offset) = directory_offset.checked_add(index.saturating_mul(8)) else {
             break;
         };
-        let Some(entry) = bytes.get(entry_offset..entry_offset.saturating_add(8)) else {
+        let (Some(rva), Some(size)) = (
+            u32_le(bytes, entry_offset),
+            u32_le(bytes, entry_offset.saturating_add(4)),
+        ) else {
             break;
         };
-        let rva = u32::from_le_bytes(entry[..4].try_into().expect("fixed-width slice"));
-        let size = u32::from_le_bytes(entry[4..].try_into().expect("fixed-width slice"));
         if rva == 0 && size == 0 {
             continue;
         }
@@ -2238,8 +2235,11 @@ fn clr_metadata(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Me
         // The module MVID is the first GUID in the `#GUID` heap (Module.Mvid == 1).
         if let (Some((goff, gsize)), Some(md)) = (guid_stream, md) {
             if gsize >= 16 {
-                if let Some(s) = md.get(goff..goff + 16).and_then(format_guid) {
-                    put_str(values, "pe.clr.mvid", s);
+                if let Some(mvid) = md
+                    .get(goff..goff.saturating_add(16))
+                    .and_then(|g| <&[u8; 16]>::try_from(g).ok())
+                {
+                    put_str(values, "pe.clr.mvid", format_guid(mvid));
                 }
             }
         }
@@ -2251,23 +2251,20 @@ fn clr_metadata(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Me
 /// and the `(offset, size)` of the `#GUID` heap (offsets relative to the blob
 /// start). Returns `None` when the signature or layout is malformed.
 fn parse_clr_streams(md: &[u8]) -> Option<(Vec<String>, Option<(usize, usize)>)> {
-    let rd_u32 = |b: &[u8], p: usize| -> Option<usize> {
-        b.get(p..p + 4)
-            .map(|s| u32::from_le_bytes(s.try_into().unwrap()) as usize)
-    };
+    let rd_u32 = |p: usize| u32_le(md, p).map(|v| v as usize);
     if md.get(0..4)? != b"BSJB" {
         return None;
     }
-    let version_len = rd_u32(md, 12)?;
+    let version_len = rd_u32(12)?;
     // Flags (u16) + Streams (u16) follow the 4-byte-padded version string.
     let mut p = 16usize.checked_add((version_len + 3) & !3)?;
-    let n_streams = u16::from_le_bytes(md.get(p + 2..p + 4)?.try_into().unwrap());
+    let n_streams = u16_le(md, p + 2)?;
     p += 4;
     let mut names = Vec::new();
     let mut guid_stream = None;
     for _ in 0..n_streams {
-        let s_off = rd_u32(md, p)?;
-        let s_size = rd_u32(md, p + 4)?;
+        let s_off = rd_u32(p)?;
+        let s_size = rd_u32(p + 4)?;
         p += 8;
         // Name: null-terminated ASCII, whole field padded to a 4-byte boundary.
         let start = p;
@@ -2282,33 +2279,6 @@ fn parse_clr_streams(md: &[u8]) -> Option<(Vec<String>, Option<(usize, usize)>)>
         p = start.checked_add(((p - start) + 1 + 3) & !3)?;
     }
     Some((names, guid_stream))
-}
-
-/// Format a 16-byte .NET GUID (MVID) as the canonical
-/// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` string. The first three fields are
-/// stored little-endian and the last two byte-for-byte, matching how the CLR
-/// (and `ikdasm`) render the module MVID.
-fn format_guid(g: &[u8]) -> Option<String> {
-    let g: &[u8; 16] = g.get(..16)?.try_into().ok()?;
-    Some(format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        g[3],
-        g[2],
-        g[1],
-        g[0],
-        g[5],
-        g[4],
-        g[7],
-        g[6],
-        g[8],
-        g[9],
-        g[10],
-        g[11],
-        g[12],
-        g[13],
-        g[14],
-        g[15],
-    ))
 }
 
 /// Measure the embedded managed (CLR) resources that the Win32 resource walk
@@ -2862,34 +2832,25 @@ fn load_config(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Met
     let Some(start) = rva_to_file_offset(pe, dd.virtual_address) else {
         return;
     };
-    if start + 4 > bytes.len() {
+    let Some(embedded_size) = u32_le(bytes, start).map(|v| v as usize) else {
         return;
-    }
-    let embedded_size = u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()) as usize;
+    };
     if embedded_size < 4 {
         return;
     }
     let end = start.saturating_add(embedded_size).min(bytes.len());
-    let slice = &bytes[start..end];
+    let Some(slice) = bytes.get(start..end) else {
+        return;
+    };
     let is_64 = matches!(opt.standard_fields.magic, MAGIC_64);
     let mut obj = serde_json::Map::new();
     obj.insert("size".into(), JsonValue::Number(embedded_size.into()));
 
-    let read_u32 = |off: usize| -> Option<u32> {
-        slice
-            .get(off..off + 4)
-            .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
-    };
-    let read_u64 = |off: usize| -> Option<u64> {
-        slice
-            .get(off..off + 8)
-            .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
-    };
     let read_ptr = |off: usize| -> Option<u64> {
         if is_64 {
-            read_u64(off)
+            u64_le(slice, off)
         } else {
-            read_u32(off).map(u64::from)
+            u32_le(slice, off).map(u64::from)
         }
     };
 
@@ -2965,7 +2926,7 @@ fn load_config(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Met
         false,
     );
 
-    if let Some(flags) = read_u32(guard_flags_off) {
+    if let Some(flags) = u32_le(slice, guard_flags_off) {
         // Both forms — raw u32 for round-trip and a string-flag array
         // for human-readable trait matches against `cf_instrumented`
         // / `cfw_instrumented`. Zero is still emitted; "no flags set"
@@ -3039,14 +3000,18 @@ fn delay_imports(
     let mut total_imports = 0_u64;
     let mut cursor = table_off;
     let mut desc_idx = 0;
-    while desc_idx < MAX_DESCRIPTORS && cursor + DESC_SIZE <= bytes.len() {
-        let attrs = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-        let name_va = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap());
-        // Skip ModuleHandle (offset 8) — runtime cache, no forensic value.
-        let _iat_va = u32::from_le_bytes(bytes[cursor + 12..cursor + 16].try_into().unwrap());
-        let int_va = u32::from_le_bytes(bytes[cursor + 16..cursor + 20].try_into().unwrap());
+    while desc_idx < MAX_DESCRIPTORS {
+        let Some(desc) = bytes.get(cursor..cursor.saturating_add(DESC_SIZE)) else {
+            break;
+        };
+        let field = |at: usize| u32_le(desc, at).unwrap_or(0);
+        let attrs = field(0);
+        let name_va = field(4);
+        // Skip ModuleHandle (offset 8) and the IAT (offset 12) — runtime
+        // state, no forensic value.
+        let int_va = field(16);
         // BoundIAT, UnloadIAT — also runtime caches.
-        let timestamp = u32::from_le_bytes(bytes[cursor + 28..cursor + 32].try_into().unwrap());
+        let timestamp = field(28);
         cursor += DESC_SIZE;
         desc_idx += 1;
 
@@ -3056,13 +3021,7 @@ fn delay_imports(
         // Attributes bit 0 (`RvaBased`) tells us whether `name`/`iat`/`int`
         // are RVAs (modern linkers) or absolute VAs (legacy / VC6 era).
         let rva_based = attrs & 1 != 0;
-        let to_rva = |v: u32| -> u32 {
-            if rva_based {
-                v
-            } else {
-                v.saturating_sub(image_base as u32)
-            }
-        };
+        let to_rva = |v: u32| delay_import_rva(v, rva_based, image_base);
 
         let dll = read_cstring_at_rva(pe, bytes, to_rva(name_va));
         if dll.is_empty() {
@@ -3082,20 +3041,18 @@ fn delay_imports(
                 0x8000_0000
             };
             for _ in 0..MAX_FUNCTIONS_PER_DLL {
-                if int_off + ptr_size > bytes.len() {
-                    break;
-                }
                 // Keep the file offset of the INT entry before advancing.
                 // Delay imports are real symbol evidence too; dropping this
                 // offset leaves symbol matches with only the semantic
                 // `"import"` location, so cleave cannot anchor their context.
                 let entry_off = int_off;
                 let entry = if is_64 {
-                    u64::from_le_bytes(bytes[int_off..int_off + 8].try_into().unwrap())
+                    u64_le(bytes, int_off)
                 } else {
-                    u64::from(u32::from_le_bytes(
-                        bytes[int_off..int_off + 4].try_into().unwrap(),
-                    ))
+                    u32_le(bytes, int_off).map(u64::from)
+                };
+                let Some(entry) = entry else {
+                    break;
                 };
                 int_off += ptr_size;
                 if entry == 0 {
@@ -3139,6 +3096,18 @@ fn delay_imports(
         values.insert("pe.delay_imports", JsonValue::Array(entries_out));
         metrics.insert(metric!("pe.delay_import_count"), total_imports as f64);
     }
+}
+
+/// Resolve a delay-load descriptor field to an RVA. `RvaBased` descriptors
+/// already hold RVAs; legacy ones hold VAs, which only fit the 32-bit field
+/// under a PE32 image base. Subtracting in 64 bits keeps a PE32+ base from
+/// being truncated to a low half that a forged VA can then match.
+fn delay_import_rva(value: u32, rva_based: bool, image_base: u64) -> u32 {
+    if rva_based {
+        return value;
+    }
+    // The difference never exceeds `value`, so it always fits.
+    u32::try_from(u64::from(value).saturating_sub(image_base)).unwrap_or(0)
 }
 
 /// Read a NUL-terminated C string at the given RVA. Returns an empty
@@ -3202,9 +3171,11 @@ fn base_relocations(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mu
     let mut entry_count = 0_u64;
     let mut absolute_count = 0_u64; // type 0 — pure padding, no real reloc
     while cursor + 8 <= end {
-        let _page_rva = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-        let block_size =
-            u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+        // The block header is `{ page_rva: u32, block_size: u32 }`; only the
+        // size matters here.
+        let Some(block_size) = u32_le(bytes, cursor + 4).map(|v| v as usize) else {
+            break;
+        };
         if block_size < 8 || cursor + block_size > end {
             break;
         }
@@ -3215,7 +3186,9 @@ fn base_relocations(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mu
             if off + 2 > end {
                 break;
             }
-            let word = u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap());
+            let Some(word) = u16_le(bytes, off) else {
+                break;
+            };
             let kind = word >> 12;
             if kind == 0 {
                 absolute_count += 1;
@@ -3372,21 +3345,6 @@ mod tests {
     }
 
     #[test]
-    fn format_guid_renders_mvid_like_ikdasm() {
-        // #GUID heap bytes (first three fields little-endian) for the MVID
-        // ikdasm prints as {3C2F06E5-115F-41C1-9886-1F7748FBEF06}.
-        let bytes = [
-            0xe5, 0x06, 0x2f, 0x3c, 0x5f, 0x11, 0xc1, 0x41, 0x98, 0x86, 0x1f, 0x77, 0x48, 0xfb,
-            0xef, 0x06,
-        ];
-        assert_eq!(
-            format_guid(&bytes).as_deref(),
-            Some("3c2f06e5-115f-41c1-9886-1f7748fbef06")
-        );
-        assert_eq!(format_guid(&[0u8; 8]), None);
-    }
-
-    #[test]
     fn parse_clr_streams_reads_standard_heaps() {
         // Minimal metadata root: BSJB, version "v4.0" (len 4), flags=0,
         // streams=2, then #GUID (offset 0x20, size 16) and #Blob headers.
@@ -3409,6 +3367,22 @@ mod tests {
         assert_eq!(names, vec!["#GUID".to_string(), "#Blob".to_string()]);
         assert_eq!(guid, Some((0x20, 16)));
         assert!(parse_clr_streams(&b"NOPE"[..]).is_none());
+        // Truncation fails softly wherever it cuts; only the last name's
+        // two padding bytes are optional.
+        for cut in 0..md.len() - 2 {
+            assert!(parse_clr_streams(&md[..cut]).is_none(), "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn delay_import_vas_resolve_against_the_full_image_base() {
+        // RvaBased descriptors pass through untouched.
+        assert_eq!(delay_import_rva(0x2000, true, 0x1_4000_0000), 0x2000);
+        // Legacy VA-based descriptor in a PE32 image.
+        assert_eq!(delay_import_rva(0x0040_2000, false, 0x0040_0000), 0x2000);
+        // A PE32+ base is above every 32-bit VA. Truncating it to its low
+        // half (0x4000_0000) would turn this forged VA into RVA 0x2000.
+        assert_eq!(delay_import_rva(0x4000_2000, false, 0x1_4000_0000), 0);
     }
 
     #[test]

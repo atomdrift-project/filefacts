@@ -18,7 +18,7 @@
 //! sections) the *first* recognizable token wins, since that's the
 //! one a linker user would point at when asked "what built this?".
 
-use crate::formats::common::put_str;
+use crate::formats::common::{put_str, read_uleb128};
 use crate::output::Values;
 
 /// Family identifier emitted as `build.toolchain.compiler`. The set
@@ -164,30 +164,14 @@ fn read_go_buildinfo(bytes: &[u8], offset: u64, size: u64) -> Option<String> {
         return None;
     }
     // Inline data begins at byte 32 (the 32-byte header is fixed).
-    let (version_len, varint_size) = read_uvarint(buf.get(32..)?)?;
-    let version_start = 32usize.checked_add(varint_size)?;
+    let mut version_start = 32;
+    let version_len = usize::try_from(read_uleb128(buf, &mut version_start)?).ok()?;
     let version_end = version_start.checked_add(version_len)?;
     if version_end > buf.len() {
         return None;
     }
     let version = std::str::from_utf8(&buf[version_start..version_end]).ok()?;
     Some(version.trim_start_matches("go").to_string())
-}
-
-/// Decode a Go-style unsigned varint (LEB128) from `bytes`. Returns
-/// `(value, bytes_consumed)` or `None` on malformed input. Capped
-/// at 10 bytes (the maximum length for a 64-bit varint).
-fn read_uvarint(bytes: &[u8]) -> Option<(usize, usize)> {
-    let mut value: u64 = 0;
-    let mut shift: u32 = 0;
-    for (i, &b) in bytes.iter().take(10).enumerate() {
-        value |= u64::from(b & 0x7f) << shift;
-        if b & 0x80 == 0 {
-            return Some((usize::try_from(value).ok()?, i + 1));
-        }
-        shift += 7;
-    }
-    None
 }
 
 /// Match a single `.comment` token against the known toolchain
@@ -335,5 +319,22 @@ mod tests {
     #[test]
     fn ignores_unknown_banner() {
         assert!(recognize_comment("some other text").is_none());
+    }
+
+    #[test]
+    fn go_buildinfo_inline_version_is_read() {
+        let mut blob = b"\xff Go buildinf:".to_vec();
+        blob.extend_from_slice(&[8, 0x2]); // ptr_size, inline-string flag
+        blob.resize(32, 0);
+        blob.push(8); // uvarint length
+        blob.extend_from_slice(b"go1.21.5");
+        let len = blob.len() as u64;
+        assert_eq!(read_go_buildinfo(&blob, 0, len).as_deref(), Some("1.21.5"));
+        // A length running past the section, or a truncated uvarint, is no
+        // version.
+        assert_eq!(read_go_buildinfo(&blob, 0, len - 1), None);
+        blob.truncate(32);
+        blob.push(0x88);
+        assert_eq!(read_go_buildinfo(&blob, 0, 33), None);
     }
 }

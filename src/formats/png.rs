@@ -359,13 +359,10 @@ fn claim_all_idat(extents: &[IdatExtent], coverage: &mut Coverage) {
 /// Decode the PNG (cap-protected) and emit pixel-statistic metrics:
 /// dimensions, per-channel entropy, edge density, histogram flatness,
 /// compression ratio, and PNG-specific alpha entropy.
-/// `file.entropy` is the Shannon entropy of the raw file
-/// bytes — emitted unconditionally because it's cheap and useful even
-/// when the pixel decode bails.
+/// Whole-file `file.entropy` is not repeated here: the generic pass emits it
+/// for every file before this extractor runs.
 fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
     use png::Decoder;
-
-    metrics.insert(metric!("file.entropy"), entropy::shannon(bytes));
 
     let decoder = Decoder::new(bytes);
     let Ok(mut reader) = decoder.read_info() else {
@@ -909,8 +906,6 @@ mod tests {
         assert!(m.get("png.compression_ratio").unwrap() > 0.0);
         // No alpha channel — a_entropy stays 0.
         assert_eq!(m.get("png.a_entropy"), Some(0.0));
-        // file.entropy emitted as Shannon of raw file bytes.
-        assert!(m.get("file.entropy").unwrap() > 0.0);
     }
 
     #[test]
@@ -942,14 +937,23 @@ mod tests {
         assert!(r > 0.0 && g > 0.0 && b > 0.0);
     }
 
+    /// `file.entropy` comes from the generic pass that runs ahead of every
+    /// extractor, so the PNG extractor no longer computes it a second time;
+    /// the full pipeline still reports it, decodable or not.
     #[test]
-    fn malformed_png_decode_still_emits_binary_entropy() {
+    fn file_entropy_comes_from_the_generic_pass() {
         // Valid PNG signature + IHDR claiming a width that overruns
-        // the IDAT stream. Decode fails; file.entropy still
-        // emits because it doesn't depend on the decoder.
+        // the IDAT stream, so the pixel decode fails.
         let ihdr = vec![0, 0, 0, 100, 0, 0, 0, 100, 8, 2, 0, 0, 0];
-        let png = build_png(&[(b"IHDR", &ihdr), (b"IDAT", &[0; 4]), (b"IEND", &[])]);
-        let (_, m) = run(&png);
-        assert!(m.get("file.entropy").is_some());
+        let broken = build_png(&[(b"IHDR", &ihdr), (b"IDAT", &[0; 4]), (b"IEND", &[])]);
+        let (_, m) = run(&broken);
+        assert!(m.get("file.entropy").is_none());
+
+        for bytes in [broken, encode_rgb_png(16, 16, [128, 128, 128])] {
+            let parsed = crate::open_with_path(std::path::Path::new("x.png"), &bytes).unwrap();
+            assert_eq!(parsed.fileid().file_type(), crate::FileType::Png);
+            let h = parsed.metrics().get("file.entropy").unwrap();
+            assert!((h - entropy::shannon(&bytes)).abs() < 1e-9);
+        }
     }
 }

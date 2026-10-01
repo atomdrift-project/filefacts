@@ -14,12 +14,13 @@
 //! contains no language-specific code itself.
 
 use crate::metric;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use tree_sitter::Node;
 
 use crate::output::{Arg, ArgShape, Metrics, Symbol, Symbols};
 
+use super::decode_string_literal;
 use super::langs::LangConfig;
 
 /// Hard cap on AST recursion depth.
@@ -42,7 +43,7 @@ pub(super) fn walk(
     metrics: &mut Metrics,
 ) {
     let mut state = State::default();
-    state.walk_node(root, source, config, 0);
+    state.walk_node(root, source, config, 0, "");
 
     // Drain the per-symbol-kind buffers into the unified Symbols view.
     let call_count = state.calls.len() as u64;
@@ -279,20 +280,32 @@ fn subtree_has_mod(node: Node<'_>, source: &str, depth: u32) -> bool {
     false
 }
 
+/// Function definitions across the grammars: declarations, expressions,
+/// arrows, methods, lambdas and Rust `fn` items. The shape detectors below
+/// and their ratio denominator (`State::function_count`) share this one
+/// predicate, so no shape is counted for a kind the denominator leaves out.
+/// Named nodes only: Python's `lambda` keyword token shares its kind name
+/// with the expression it starts.
+fn is_function_definition(node: Node<'_>) -> bool {
+    node.is_named()
+        && matches!(
+            node.kind(),
+            "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "function_definition"
+                | "lambda"
+                | "method_definition"
+                | "function_item"
+        )
+}
+
 /// True when `node` is a function whose entire body is `return <ident>` and
 /// `<ident>` names one of the function's own parameters — the identity-proxy
 /// obfuscation shape (`function(x){ return x }`, `lambda x: x`). The
 /// param↔return backreference is why a regex can't express this.
 fn is_identity_function(node: Node<'_>, source: &str) -> bool {
-    if !matches!(
-        node.kind(),
-        "function_declaration"
-            | "function_expression"
-            | "arrow_function"
-            | "function_definition"
-            | "lambda"
-            | "method_definition"
-    ) {
+    if !is_function_definition(node) {
         return false;
     }
     let bytes = source.as_bytes();
@@ -368,14 +381,7 @@ fn returned_identifier<'a>(body: Node<'_>, bytes: &'a [u8]) -> Option<&'a str> {
 /// return a fixed string — replaces tree-sitter `(function_declaration body:
 /// (statement_block (return_statement (string))))` queries.
 fn is_string_return_function(node: Node<'_>) -> bool {
-    if !matches!(
-        node.kind(),
-        "function_declaration"
-            | "function_expression"
-            | "arrow_function"
-            | "function_definition"
-            | "method_definition"
-    ) {
+    if !is_function_definition(node) {
         return false;
     }
     let Some(body) = node.child_by_field_name("body") else {
@@ -434,21 +440,17 @@ fn is_literal_or_identifier(node: Node<'_>) -> bool {
 /// dilute static and ML analysis. Parameterless distinguishes it from an
 /// identity proxy (`function(x){ return x }`).
 fn is_const_return_function(node: Node<'_>) -> bool {
-    if !matches!(
-        node.kind(),
-        "function_declaration"
-            | "function_expression"
-            | "arrow_function"
-            | "function_definition"
-            | "method_definition"
-    ) {
+    if !is_function_definition(node) {
         return false;
     }
-    // Parameterless: a `parameters`/`formal_parameters` node with no named children.
-    let Some(params) = node.child_by_field_name("parameters") else {
-        return false;
+    // Parameterless: a `parameters`/`formal_parameters` node with no named
+    // children. Python's `lambda: 0` has no parameter list at all, while a
+    // JS `x => 0` keeps its lone parameter under `parameter` instead.
+    let parameterless = match node.child_by_field_name("parameters") {
+        Some(params) => params.named_child_count() == 0,
+        None => node.kind() == "lambda",
     };
-    if params.named_child_count() != 0 {
+    if !parameterless {
         return false;
     }
     let Some(body) = node.child_by_field_name("body") else {
@@ -509,6 +511,9 @@ struct State {
     calls: Vec<Symbol>,
     binds: Vec<Symbol>,
     members: BTreeMap<String, u64>,
+    /// Ids of member/subscript nodes inside a chain whose outermost node
+    /// already recorded their paths; the walk skips each as it passes.
+    resolved_links: HashSet<usize>,
     /// Dedup'd bare-identifier names with first-seen byte offset.
     /// Captures every identifier-kind token across the file — variable
     /// references, parameter names, type names, function-call targets,
@@ -571,7 +576,14 @@ struct State {
 }
 
 impl State {
-    fn walk_node(&mut self, node: Node<'_>, source: &str, config: &LangConfig, depth: u32) {
+    fn walk_node(
+        &mut self,
+        node: Node<'_>,
+        source: &str,
+        config: &LangConfig,
+        depth: u32,
+        parent_kind: &str,
+    ) {
         self.node_count += 1;
         if depth > self.max_depth {
             self.max_depth = depth;
@@ -581,25 +593,18 @@ impl State {
             return;
         }
 
-        // Member chains we treat as a property of the *outermost* member
-        // expression in a chain — descending into nested member nodes
-        // would duplicate the chain prefix. Subscript-with-string-index
-        // (`obj["constructor"]`) folds into the same path via
-        // `static_dotted_chain`'s normalisation, so a JS sandbox-escape
-        // pattern like `obj["constructor"]["constructor"]("...")` lands
-        // as a member chain instead of dropping out as a dynamic access.
-        if config.member_kinds.contains(&node.kind()) || is_subscript_kind(node.kind()) {
-            if let Some(chain) = static_dotted_chain(node, source, config, 0) {
-                let depth_n = u32::try_from(chain.matches('.').count()).unwrap_or(u32::MAX) + 1;
-                if depth_n > self.max_member_chain_depth {
-                    self.max_member_chain_depth = depth_n;
-                }
-                self.members
-                    .entry(chain)
-                    .or_insert(node.start_byte() as u64);
-            }
-            // Continue walking children so we still find string
-            // literals, call expressions, etc. inside member chains.
+        // A member chain resolves once, at its outermost node, which also
+        // records every static prefix on its receiver side (`a.b` of
+        // `a.b.c`). The walk still descends through the chain for the calls
+        // and literals inside it, but does not resolve those prefixes again.
+        // Subscript-with-string-index (`obj["constructor"]`) folds into the
+        // same path, so a JS sandbox-escape pattern like
+        // `obj["constructor"]["constructor"]("...")` lands as a member chain
+        // instead of dropping out as a dynamic access.
+        if (config.member_kinds.contains(&node.kind()) || is_subscript_kind(node.kind()))
+            && !self.resolved_links.remove(&node.id())
+        {
+            self.record_member_chain(node, source, config, depth);
         }
 
         if config.call_kinds.contains(&node.kind()) {
@@ -711,15 +716,7 @@ impl State {
         // Tally every function-definition node so the const/string-return
         // shapes can be reported as a fraction of all functions, not a raw
         // count that simply grows with the file.
-        if matches!(
-            node.kind(),
-            "function_declaration"
-                | "function_expression"
-                | "arrow_function"
-                | "function_definition"
-                | "lambda"
-                | "method_definition"
-        ) {
+        if is_function_definition(node) {
             self.function_count += 1;
         }
 
@@ -754,10 +751,10 @@ impl State {
 
         // String concatenation chains: `a + b + c + ...` builds
         // left-leaning nested binary expressions in every grammar we
-        // support. Measure the chain length when we hit the *outermost*
-        // node (the one whose parent isn't also a `+` binary
-        // expression), then skip recursion into the chain.
-        if is_string_concat_root(node, config) {
+        // support. Measure the chain length once, at the *outermost* node
+        // (the one whose parent isn't also a binary expression); the walk
+        // below still visits the inner links, which are not roots.
+        if is_string_concat_root(node, parent_kind, config) {
             let len = string_concat_chain_length(node, config);
             if len > self.max_string_concat_chain {
                 self.max_string_concat_chain = len;
@@ -766,7 +763,47 @@ impl State {
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            self.walk_node(child, source, config, depth + 1);
+            self.walk_node(child, source, config, depth + 1, node.kind());
+        }
+    }
+
+    /// Record the static path of the chain rooted at `node`, at walk depth
+    /// `depth`, and of each member/subscript prefix inside it.
+    fn record_member_chain(
+        &mut self,
+        node: Node<'_>,
+        source: &str,
+        config: &LangConfig,
+        depth: u32,
+    ) {
+        let mut path = String::new();
+        let mut links = Vec::new();
+        if chain_into(node, source, config, 0, 0, &mut path, Some(&mut links)).is_none() {
+            return;
+        }
+        // Every prefix has fewer links than the full path.
+        let depth_n = u32::try_from(path.matches('.').count()).unwrap_or(u32::MAX) + 1;
+        if depth_n > self.max_member_chain_depth {
+            self.max_member_chain_depth = depth_n;
+        }
+        for link in links {
+            // The walk never reaches a link past the depth cap, so it gets no
+            // member of its own.
+            if depth + link.level >= MAX_AST_DEPTH {
+                continue;
+            }
+            if link.level > 0 {
+                self.resolved_links.insert(link.id);
+            }
+            // A path seen more than once keeps its first offset in source
+            // order, whichever chain reached it first.
+            let prefix = &path[..link.path_len];
+            match self.members.get_mut(prefix) {
+                Some(offset) => *offset = (*offset).min(link.offset),
+                None => {
+                    self.members.insert(prefix.to_string(), link.offset);
+                }
+            }
         }
     }
 
@@ -988,23 +1025,53 @@ pub(super) fn static_dotted_chain(
     config: &LangConfig,
     depth: u32,
 ) -> Option<String> {
+    let mut path = String::new();
+    chain_into(node, source, config, depth, 0, &mut path, None)?;
+    Some(path)
+}
+
+/// A member or subscript node on the receiver side of a chain resolved by
+/// [`chain_into`], `level` tree levels below the chain's root. Its own path
+/// is the first `path_len` bytes of the root's.
+struct ChainLink {
+    id: usize,
+    offset: u64,
+    level: u32,
+    path_len: usize,
+}
+
+/// [`static_dotted_chain`], appending the path to `path` and, when `links` is
+/// given, reporting every member/subscript node it resolved on the way. On
+/// `None`, `path` and `links` hold partial output.
+fn chain_into(
+    node: Node<'_>,
+    source: &str,
+    config: &LangConfig,
+    depth: u32,
+    level: u32,
+    path: &mut String,
+    mut links: Option<&mut Vec<ChainLink>>,
+) -> Option<()> {
     // A member/subscript/call chain (`a.b.c…`, `obj["x"]["y"]…`, `f()()…`) is
     // a left-leaning tree as deep as it is long, and this function recurses
-    // one frame per link while allocating a `String` at each. An adversarial
-    // chain thousands deep would overflow the stack before `walk_node`'s own
-    // guard ever returns. Bail at the shared cap and treat the chain as
-    // non-static (dynamic access) — the conservative, no-symbol outcome.
+    // one frame per link. An adversarial chain thousands deep would overflow
+    // the stack before `walk_node`'s own guard ever returns. Bail at the
+    // shared cap and treat the chain as non-static (dynamic access) — the
+    // conservative, no-symbol outcome.
     if depth >= MAX_AST_DEPTH {
         return None;
     }
+    let text = || node.utf8_text(source.as_bytes()).ok();
     if config.name == "rust" && node.kind() == "scoped_identifier" {
-        return node.utf8_text(source.as_bytes()).ok().map(str::to_string);
+        path.push_str(text()?);
+        return Some(());
     }
     // Perl aliases both bareword callees and builtin names to `function`.
     // A leaf is a static name; non-leaf forms can dereference a code variable
     // (`&$callback`) and must remain unresolved rather than becoming symbols.
     if config.name == "perl" && node.kind() == "function" && node.named_child_count() == 0 {
-        return node.utf8_text(source.as_bytes()).ok().map(str::to_string);
+        path.push_str(text()?);
+        return Some(());
     }
     // A simple Perl scalar is a lexical receiver spelling, not a resolved
     // runtime type. Dereferences and computed variable names stay unknown.
@@ -1017,13 +1084,15 @@ pub(super) fn static_dotted_chain(
                     .chars()
                     .all(|c| c.is_alphanumeric() || c == '_' || c == ':')
             {
-                return node.utf8_text(source.as_bytes()).ok().map(str::to_string);
+                path.push_str(text()?);
+                return Some(());
             }
         }
         return None;
     }
     if config.identifier_kinds.contains(&node.kind()) {
-        return node.utf8_text(source.as_bytes()).ok().map(str::to_string);
+        path.push_str(text()?);
+        return Some(());
     }
     if config.member_kinds.contains(&node.kind()) {
         let object = node.child_by_field_name(config.member_object_field)?;
@@ -1033,16 +1102,43 @@ pub(super) fn static_dotted_chain(
         if config.name == "perl" && prop.named_child_count() != 0 {
             return None;
         }
-        let object_path = static_dotted_chain(object, source, config, depth + 1)?;
+        chain_into(
+            object,
+            source,
+            config,
+            depth + 1,
+            level + 1,
+            path,
+            links.as_deref_mut(),
+        )?;
         let prop_text = prop.utf8_text(source.as_bytes()).ok()?;
         if prop_text.is_empty() {
             return None;
         }
-        return Some(format!("{object_path}.{prop_text}"));
+        path.push('.');
+        path.push_str(prop_text);
+        push_link(links, node, level, path);
+        return Some(());
     }
     if is_subscript_kind(node.kind()) {
-        if let Some(folded) = try_fold_string_subscript(node, source, config, depth + 1) {
-            return Some(folded);
+        let (path_len, links_len) = (path.len(), links.as_ref().map_or(0, |l| l.len()));
+        if fold_string_subscript_into(
+            node,
+            source,
+            config,
+            depth + 1,
+            level,
+            path,
+            links.as_deref_mut(),
+        )
+        .is_some()
+        {
+            push_link(links, node, level, path);
+            return Some(());
+        }
+        path.truncate(path_len);
+        if let Some(links) = links.as_deref_mut() {
+            links.truncate(links_len);
         }
     }
     // A call in receiver position contributes the name of what it called, and
@@ -1061,7 +1157,7 @@ pub(super) fn static_dotted_chain(
         let callee = node
             .child_by_field_name(config.callee_field)
             .or_else(|| first_named_child(node))?;
-        return static_dotted_chain(callee, source, config, depth + 1);
+        return chain_into(callee, source, config, depth + 1, level + 1, path, links);
     }
     // Constructor type names: Java `type_identifier` / `scoped_type_identifier`
     // (`new ProcessBuilder()`, `new java.io.File()`) and similar type-name
@@ -1073,13 +1169,21 @@ pub(super) fn static_dotted_chain(
         // `qualified_name` covers C# `new System.Random()` — its text is the
         // already-dotted type name. Together with the `type_identifier` arm
         // this resolves constructor callees that aren't bare identifiers.
-        return node
-            .utf8_text(source.as_bytes())
-            .ok()
-            .map(str::to_string)
-            .filter(|s| !s.is_empty());
+        path.push_str(text().filter(|s| !s.is_empty())?);
+        return Some(());
     }
     None
+}
+
+fn push_link(links: Option<&mut Vec<ChainLink>>, node: Node<'_>, level: u32, path: &str) {
+    if let Some(links) = links {
+        links.push(ChainLink {
+            id: node.id(),
+            offset: node.start_byte() as u64,
+            level,
+            path_len: path.len(),
+        });
+    }
 }
 
 /// Tree-sitter node kinds for subscript / index access across our
@@ -1102,13 +1206,16 @@ fn is_subscript_kind(kind: &str) -> bool {
 ///
 /// Returns `None` for non-literal indices (variable, expression,
 /// numeric) — those genuinely are dynamic accesses.
-fn try_fold_string_subscript(
+fn fold_string_subscript_into(
     node: Node<'_>,
     source: &str,
     config: &LangConfig,
     depth: u32,
-) -> Option<String> {
-    // Mutually recursive with `static_dotted_chain` for nested subscripts
+    level: u32,
+    path: &mut String,
+    links: Option<&mut Vec<ChainLink>>,
+) -> Option<()> {
+    // Mutually recursive with `chain_into` for nested subscripts
     // (`obj["x"]["y"]…`); share its depth budget so the pair can't outrun the
     // cap between them.
     if depth >= MAX_AST_DEPTH {
@@ -1122,7 +1229,7 @@ fn try_fold_string_subscript(
     if !config.string_kinds.contains(&index.kind()) {
         return None;
     }
-    let object_path = static_dotted_chain(object, source, config, depth + 1)?;
+    chain_into(object, source, config, depth + 1, level + 1, path, links)?;
     let prop = decode_string_literal(index, source, config)?;
     // Conservative: only fold string indices whose content looks like
     // an identifier (alphanumeric + underscore, no leading digit).
@@ -1136,30 +1243,9 @@ fn try_fold_string_subscript(
     if !chars.all(|c| c.is_alphanumeric() || c == '_') {
         return None;
     }
-    Some(format!("{object_path}.{prop}"))
-}
-
-fn decode_string_literal(node: Node<'_>, source: &str, config: &LangConfig) -> Option<String> {
-    let raw = node.utf8_text(source.as_bytes()).ok()?;
-    if config.name == "elixir" && (raw.starts_with("\"\"\"") || raw.starts_with("'''")) {
-        return super::escapes::decode_elixir_heredoc(raw);
-    }
-    let bytes = raw.as_bytes();
-    if bytes.len() < 2 {
-        return None;
-    }
-    let open = bytes[0];
-    if !matches!(open, b'"' | b'\'' | b'`') || bytes[bytes.len() - 1] != open {
-        return None;
-    }
-    let body = std::str::from_utf8(&bytes[1..bytes.len() - 1]).ok()?;
-    // In a raw literal the backslash *is* the character — Go's backtick
-    // strings and Rust/C# raw and verbatim forms all carry it literally.
-    let kind = node.kind();
-    if kind.contains("raw") || kind.contains("verbatim") {
-        return Some(body.to_string());
-    }
-    Some(super::escapes::decode(body))
+    path.push('.');
+    path.push_str(&prop);
+    Some(())
 }
 
 fn is_assignment_kind(kind: &str) -> bool {
@@ -1194,7 +1280,9 @@ fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
     node.named_children(&mut cursor).next()
 }
 
-fn is_string_concat_root(node: Node<'_>, config: &LangConfig) -> bool {
+/// `parent_kind` comes down from the walk: `Node::parent` walks down from the
+/// root, which would make checking every node quadratic in tree depth.
+fn is_string_concat_root(node: Node<'_>, parent_kind: &str, config: &LangConfig) -> bool {
     if !config.binary_op_kinds.contains(&node.kind()) {
         return false;
     }
@@ -1205,12 +1293,9 @@ fn is_string_concat_root(node: Node<'_>, config: &LangConfig) -> bool {
     if op_text != "+" {
         return false;
     }
-    // Root only if the parent isn't also a `+` binary expression
-    // (otherwise we'd record the chain at every level).
-    !matches!(
-        node.parent(),
-        Some(p) if config.binary_op_kinds.contains(&p.kind())
-    )
+    // Root only if the parent isn't also a binary expression (otherwise
+    // we'd record the chain at every level).
+    !config.binary_op_kinds.contains(&parent_kind)
 }
 
 fn string_concat_chain_length(node: Node<'_>, config: &LangConfig) -> u32 {
@@ -1251,5 +1336,48 @@ impl<'tree> NodeOpExt<'tree> for Node<'tree> {
         // every grammar we use. `kind()` returns text borrowed from the
         // node, so preserve that lifetime instead of claiming it is static.
         Some(self.kind())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn walk_state(path: &str, src: &str) -> State {
+        let parsed = crate::open_with_path(std::path::Path::new(path), src.as_bytes()).unwrap();
+        let ast = parsed.source_ast().expect("parsed source");
+        let config = super::super::langs::config_for(ast.file_type).expect("language config");
+        let mut state = State::default();
+        state.walk_node(ast.tree.root_node(), ast.source, config, 0, "");
+        state
+    }
+
+    /// `function_count` is the denominator of the const/string-return ratios,
+    /// so every kind the shape detectors accept must be counted, Rust `fn`
+    /// items included.
+    #[test]
+    fn rust_fn_items_count_toward_the_function_total() {
+        let state = walk_state(
+            "lib.rs",
+            "fn a() {}\nfn b() -> u8 { 1 }\nimpl X { fn c(&self) {} }\n",
+        );
+        assert_eq!(state.function_count, 3);
+    }
+
+    /// Python lambdas are counted as functions (once each, not again for the
+    /// `lambda` keyword), so the shape detectors must see them too.
+    /// `lambda: 0` has no parameter list at all.
+    #[test]
+    fn python_lambdas_take_constant_and_string_return_shapes() {
+        let state = walk_state(
+            "shapes.py",
+            "a = lambda: 0\nb = lambda: None\nc = lambda x: 0\nd = lambda: 'x'\ne = lambda x: x\n",
+        );
+        assert_eq!(state.function_count, 5);
+        assert_eq!(state.const_return_fn_count, 3);
+        assert_eq!(state.string_return_fn_count, 1);
+        assert_eq!(state.identity_fn_count, 1);
+        // A JavaScript arrow's lone parameter sits outside `parameters`.
+        assert_eq!(walk_state("a.js", "f = x => 0;\n").const_return_fn_count, 0);
     }
 }

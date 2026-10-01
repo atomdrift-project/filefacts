@@ -2489,6 +2489,10 @@ fn ascii_spaces(window: &[u8]) -> std::borrow::Cow<'_, [u8]> {
 /// lines), SUB (the DOS end-of-file mark), and IRC's formatting codes -- bold,
 /// colour, reset, reverse, italic, underline -- which mIRC scripts put in the
 /// messages they send.
+///
+/// The same share-of-the-window test as `heuristics::looks_like_binary`, which
+/// excuses none of these: the languages it scores do not print them, and a
+/// line grammar has to read past them.
 fn is_binary(window: &[u8]) -> bool {
     let text_control = |b: u8| {
         matches!(
@@ -2550,7 +2554,6 @@ pub(crate) fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

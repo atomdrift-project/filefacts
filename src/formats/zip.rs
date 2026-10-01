@@ -21,13 +21,13 @@ use zip::{CompressionMethod, ZipArchive};
 use crate::error::Error;
 use crate::output::{ArchiveMember, Metrics, Values};
 
-/// Upper bound on how many entries we'll preallocate for when reading
-/// a zip's central directory. Zip64 lets the entry count run to 2^64,
-/// and the count lands in the EOCD before any byte of any entry has
-/// been verified — so it's attacker-controlled. 65_536 fits a generous
-/// real-world archive (the JDK ships a few thousand classes per jar);
-/// anything beyond that should grow on demand rather than be reserved
-/// up front.
+/// Cap on how many central-directory entries are walked into
+/// `archive.members`. `ZipArchive::len()` counts the entries the `zip` crate
+/// actually parsed (each at least 46 bytes of central directory, de-duplicated
+/// by name), so it is bounded by the input size, not by the count the EOCD
+/// declares. A large input can still hold millions, though, and each walked
+/// entry costs a JSON member and an [`ArchiveMember`]. 65_536 fits a generous
+/// real-world archive (the JDK ships a few thousand classes per jar).
 pub(super) const MAX_ZIP_MEMBERS: usize = 65_536;
 
 pub(super) fn open_archive(bytes: &[u8]) -> Result<ZipArchive<Cursor<&[u8]>>, Error> {
@@ -51,6 +51,26 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     metrics: &mut Metrics,
     archive_members: &mut Vec<ArchiveMember>,
 ) -> Result<(), Error> {
+    walk_archive(
+        archive,
+        bytes,
+        values,
+        metrics,
+        archive_members,
+        MAX_ZIP_MEMBERS,
+    )
+}
+
+/// [`extract_from_archive`] with the member cap as a parameter, so the cap
+/// can be exercised without building a 65k-entry archive.
+fn walk_archive<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    bytes: &[u8],
+    values: &mut Values,
+    metrics: &mut Metrics,
+    archive_members: &mut Vec<ArchiveMember>,
+    max_members: usize,
+) -> Result<(), Error> {
     values.insert("archive.format.kind", JsonValue::String("zip".into()));
 
     let comment = archive.comment();
@@ -61,11 +81,20 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         metrics.insert(metric!("archive.comment_size"), comment.len() as f64);
     }
 
-    // Cap the preallocation: `archive.len()` is the central-directory
-    // entry count, which on Zip64 is attacker-controlled up to 2^64.
-    // A malicious archive claiming millions of entries would OOM the
-    // process before we walked the first one.
-    let mut members: Vec<JsonValue> = Vec::with_capacity(archive.len().min(MAX_ZIP_MEMBERS));
+    // Entries past the cap are not walked, so every per-member list and
+    // count below covers the first `walked` entries; `archive.member_count`
+    // still reports the full parsed count.
+    let walked = archive.len().min(max_members);
+    if walked < archive.len() {
+        values.insert(
+            "zip.limits",
+            serde_json::json!([{
+                "stage": "member-cap",
+                "reason": format!("walked {walked} of {} members", archive.len()),
+            }]),
+        );
+    }
+    let mut members: Vec<JsonValue> = Vec::with_capacity(walked);
     let mut compression_counts: std::collections::BTreeMap<String, u64> =
         std::collections::BTreeMap::new();
     let mut entry_type_counts: std::collections::BTreeMap<String, u64> =
@@ -115,7 +144,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     let mut mtime_buckets: std::collections::BTreeMap<Option<i64>, Vec<String>> =
         std::collections::BTreeMap::new();
 
-    for i in 0..archive.len() {
+    for i in 0..walked {
         let entry = archive
             .by_index_raw(i)
             .map_err(|e| Error::malformed("zip", format!("entry {i}: {e}")))?;
@@ -568,7 +597,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     // covers a strict majority (>50%) of members, every other member
     // is reported as an "outlier" — the supply-chain "13 files at
     // sentinel + 1 file with a real timestamp" signal.
-    let total_members = archive.len();
+    let total_members = walked;
     if total_members > 0 && !mtime_buckets.is_empty() {
         let (dominant_count, dominant_key) = mtime_buckets
             .iter()
@@ -682,8 +711,6 @@ fn scan_central_directory(bytes: &[u8], cd_start: usize) -> Vec<RawCdhEntry> {
             break;
         }
         let crc = u32::from_le_bytes([bytes[i + 16], bytes[i + 17], bytes[i + 18], bytes[i + 19]]);
-        let csize =
-            u32::from_le_bytes([bytes[i + 20], bytes[i + 21], bytes[i + 22], bytes[i + 23]]);
         let usize_ =
             u32::from_le_bytes([bytes[i + 24], bytes[i + 25], bytes[i + 26], bytes[i + 27]]);
         let name_len = u16::from_le_bytes([bytes[i + 28], bytes[i + 29]]) as usize;
@@ -706,7 +733,6 @@ fn scan_central_directory(bytes: &[u8], cd_start: usize) -> Vec<RawCdhEntry> {
             uncompressed_size: u64::from(usize_),
             parsed_mtime,
         });
-        let _ = csize;
         i = name_end + extra_len + comment_len;
     }
     out
@@ -1055,6 +1081,34 @@ mod tests {
             w.finish().unwrap();
         }
         buf.into_inner()
+    }
+
+    /// The member walk stops at the cap and says so; the uncapped count stays
+    /// in `archive.member_count`.
+    #[test]
+    fn member_walk_stops_at_cap_and_records_limit() {
+        let z = build_zip(&[
+            ("a.txt", b"a", CompressionMethod::Stored),
+            ("b.txt", b"b", CompressionMethod::Stored),
+            ("c.txt", b"c", CompressionMethod::Stored),
+        ]);
+        let mut archive = open_archive(&z).unwrap();
+        let mut v = Values::new();
+        let mut m = Metrics::new();
+        let mut typed = Vec::new();
+        walk_archive(&mut archive, &z, &mut v, &mut m, &mut typed, 2).unwrap();
+
+        let members = v.get("archive.members").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(members.len(), 2);
+        assert_eq!(typed.len(), 2);
+        assert_eq!(m.get("archive.file_count"), Some(2.0));
+        assert_eq!(m.get("archive.member_count"), Some(3.0));
+        let limits = v.get("zip.limits").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(limits[0]["stage"].as_str(), Some("member-cap"));
+
+        // Under the cap, nothing is recorded.
+        let (v, _) = run(&z);
+        assert!(v.get("zip.limits").is_none());
     }
 
     #[test]

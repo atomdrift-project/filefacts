@@ -230,16 +230,11 @@ pub(super) fn extract(
 
 /// Decode the JPEG (cap-protected) and emit pixel-statistic metrics:
 /// dimensions, per-channel entropy, edge density, histogram flatness.
-/// `file.entropy` is the Shannon entropy of the raw file
-/// bytes — emitted unconditionally because it's cheap and useful even
-/// when the pixel decode bails.
+/// Whole-file `file.entropy` is not repeated here: the generic pass emits it
+/// for every file before this extractor runs.
 fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
     use jpeg_decoder::Decoder;
     use std::io::Cursor;
-
-    // Always emit overall-file entropy — trait engines threshold on
-    // this for encrypted/compressed payload detection.
-    metrics.insert(metric!("file.entropy"), entropy::shannon(bytes));
 
     let mut decoder = Decoder::new(Cursor::new(bytes));
     if decoder.read_info().is_err() {
@@ -634,19 +629,22 @@ mod tests {
         assert_eq!(m.get("jpeg.exif_size"), Some(26.0));
     }
 
+    /// `file.entropy` comes from the generic pass that runs ahead of every
+    /// extractor, so the JPEG extractor no longer computes it a second time;
+    /// the full pipeline still reports it, decodable or not.
     #[test]
-    fn emits_binary_overall_entropy() {
+    fn file_entropy_comes_from_the_generic_pass() {
         let jpeg = build_jpeg(&[(0xFE, b"hello".to_vec())]);
         let (_, m) = run(&jpeg);
-        assert!(m.get("file.entropy").is_some());
-    }
+        assert!(m.get("file.entropy").is_none());
 
-    #[test]
-    fn malformed_jpeg_still_emits_binary_entropy() {
         // Bytes that pass the SOI check but aren't decodable.
-        let bytes = vec![0xFF, 0xD8, 0xFF, 0xD9];
-        let (_, m) = run(&bytes);
-        assert!(m.get("file.entropy").is_some());
+        for bytes in [jpeg, vec![0xFF, 0xD8, 0xFF, 0xD9]] {
+            let parsed = crate::open_with_path(std::path::Path::new("x.jpg"), &bytes).unwrap();
+            assert_eq!(parsed.fileid().file_type(), crate::FileType::Jpeg);
+            let h = parsed.metrics().get("file.entropy").unwrap();
+            assert!((h - entropy::shannon(&bytes)).abs() < 1e-9);
+        }
     }
 
     #[test]

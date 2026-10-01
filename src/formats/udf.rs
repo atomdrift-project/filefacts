@@ -25,6 +25,7 @@
 
 use crate::metric;
 use serde_json::Value as JsonValue;
+use std::collections::{HashSet, VecDeque};
 
 use crate::formats::common::bytes_at::{u16_le, u32_le, u64_le};
 use crate::output::{ArchiveMember, ArchiveOffsets, Metrics, Values};
@@ -425,7 +426,7 @@ fn timestamp(raw: Option<&[u8]>) -> Option<i64> {
 struct TreeWalk<'a, 'v> {
     vol: &'v Volume<'a>,
     members: Vec<ArchiveMember>,
-    visited: Vec<u32>,
+    visited: HashSet<u32>,
     file_count: u64,
     dir_count: u64,
     truncated: bool,
@@ -436,7 +437,7 @@ impl<'a, 'v> TreeWalk<'a, 'v> {
         Self {
             vol,
             members: Vec::new(),
-            visited: Vec::new(),
+            visited: HashSet::new(),
             file_count: 0,
             dir_count: 0,
             truncated: false,
@@ -444,19 +445,15 @@ impl<'a, 'v> TreeWalk<'a, 'v> {
     }
 
     fn run(&mut self, root_icb: u32) {
-        let mut queue = vec![(root_icb, String::new(), 0_u32)];
-        let mut head = 0;
-        while head < queue.len() {
-            let (icb, prefix, depth) = queue[head].clone();
-            head += 1;
+        let mut queue = VecDeque::from([(root_icb, String::new(), 0_u32)]);
+        while let Some((icb, prefix, depth)) = queue.pop_front() {
             if self.visited.len() >= MAX_DIRS || self.members.len() >= MAX_ENTRIES {
                 self.truncated = true;
                 return;
             }
-            if depth > MAX_DEPTH || self.visited.contains(&icb) {
+            if depth > MAX_DEPTH || !self.visited.insert(icb) {
                 continue;
             }
-            self.visited.push(icb);
             self.dir_count += 1;
 
             let Some(block) = self.vol.block(icb) else {
@@ -479,7 +476,7 @@ impl<'a, 'v> TreeWalk<'a, 'v> {
             for (name, child_icb, is_dir) in parse_fids(&data) {
                 let path = format!("{prefix}/{name}");
                 if is_dir {
-                    queue.push((child_icb, path, depth + 1));
+                    queue.push_back((child_icb, path, depth + 1));
                     continue;
                 }
                 self.emit_file(&path, child_icb);
@@ -612,7 +609,6 @@ fn decode_d_characters(raw: &[u8]) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

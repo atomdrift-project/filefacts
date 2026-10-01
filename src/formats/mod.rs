@@ -68,7 +68,7 @@ mod font;
 mod gem;
 mod generic;
 mod go_buildinfo;
-mod goblin_safe;
+pub(crate) mod goblin_safe;
 pub(crate) mod identity;
 mod image_stats;
 pub(crate) mod iso;
@@ -247,7 +247,7 @@ pub(crate) fn extract(
             // then the OOXML-specific `office.*` layer from the same handle.
             let mut archive = zip::open_archive(bytes)?;
             zip::extract_from_archive(&mut archive, bytes, values, metrics, archive_members)?;
-            ooxml::extract_from_archive(&mut archive, values, metrics)?;
+            ooxml::extract_from_archive(&mut archive, values, metrics, errors)?;
             // Decompress macros from any `vbaProject.bin` member so
             // `office.vba.modules[]` is populated for OOXML, mirroring the
             // OleDoc arm. Best-effort: a macro-free doc leaves it unset.
@@ -255,7 +255,7 @@ pub(crate) fn extract(
             Ok(())
         }
         FileType::OleDoc | FileType::Msi => {
-            ole2::extract(bytes, values, metrics)?;
+            ole2::extract(bytes, values, metrics, errors)?;
             // VBA module source-text extraction (best-effort).
             // `vba::extract` is silent on failure — a doc without
             // macros just leaves `office.vba.*` unpopulated. MSI rarely
@@ -390,7 +390,7 @@ pub(crate) fn extract(
             shellcode::extract(bytes, values, metrics);
             Ok(())
         }
-        FileType::Pdf => pdf::extract(bytes, values, strings, metrics),
+        FileType::Pdf => pdf::extract(bytes, values, strings, metrics, errors),
         FileType::Pickle => pickle::extract(bytes, values, strings, metrics),
         FileType::Font => font::extract(bytes, values, strings, metrics),
         // Media containers: walk the structure, then let carrier::emit turn

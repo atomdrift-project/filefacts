@@ -48,10 +48,11 @@
 
 use crate::metric;
 use serde_json::Value as JsonValue;
+use std::collections::HashSet;
 
 use crate::error::Error;
 use crate::formats::carrier::{classify_region, leading_whitespace, printable_ratio};
-use crate::formats::common::{XorScan, extract_binary_strings};
+use crate::formats::common::{XorScan, extract_binary_strings, hex_encode};
 use crate::output::{Metrics, Strings, Values};
 use crate::scan::entropy;
 
@@ -62,9 +63,15 @@ const WOFF_RECORD_LEN: usize = 20;
 /// Offset of the EOT `MagicNumber` field (`0x504C`, little-endian).
 const EOT_MAGIC_OFFSET: usize = 34;
 
+/// Most table records read from one directory. OpenType registers about a
+/// hundred tags and a font carries each at most once; real fonts hold 10-40.
+const MAX_TABLES: usize = 1024;
+
 /// A table directory entry reduced to what structural analysis needs.
 struct TableEntry {
-    tag: String,
+    /// `None` for a WOFF container region (metadata or private block),
+    /// which claims bytes but is not a table.
+    tag: Option<[u8; 4]>,
     offset: u64,
     length: u64,
 }
@@ -100,8 +107,11 @@ impl Format {
 /// Accumulates the structural verdict as the pass walks the container.
 #[derive(Default)]
 struct Report {
+    /// Distinct table tags as labels, in directory order.
     tables: Vec<String>,
     unknown_tables: Vec<String>,
+    /// The raw tags behind `tables`, for O(1) de-duplication.
+    seen_tables: HashSet<[u8; 4]>,
     features: Vec<&'static str>,
     problems: Vec<String>,
     sfnt_version: Option<String>,
@@ -339,6 +349,10 @@ fn read_sfnt_dir(bytes: &[u8], base: usize, report: &mut Report) -> (Vec<TableEn
     report.sfnt_version = Some(sfnt_version_label(&header[..4]));
 
     let num_tables = u16::from_be_bytes([header[4], header[5]]) as usize;
+    if num_tables > MAX_TABLES {
+        report.problem("implausible table count");
+        return (Vec::new(), 0);
+    }
     let dir_start = base + 12;
     let Some(dir_end) = num_tables
         .checked_mul(SFNT_RECORD_LEN)
@@ -347,24 +361,22 @@ fn read_sfnt_dir(bytes: &[u8], base: usize, report: &mut Report) -> (Vec<TableEn
         report.problem("table count overflows");
         return (Vec::new(), 0);
     };
-    if dir_end > bytes.len() {
+    let Some(dir) = bytes.get(dir_start..dir_end) else {
         report.problem("table directory truncated");
         report.flag("truncated");
         return (Vec::new(), 0);
-    }
+    };
 
-    let mut entries = Vec::with_capacity(num_tables);
-    for i in 0..num_tables {
-        let rec = &bytes[dir_start + i * SFNT_RECORD_LEN..dir_start + (i + 1) * SFNT_RECORD_LEN];
-        let tag = tag_label(&rec[..4]);
-        let offset = u64::from(u32::from_be_bytes([rec[8], rec[9], rec[10], rec[11]]));
-        let length = u64::from(u32::from_be_bytes([rec[12], rec[13], rec[14], rec[15]]));
-        entries.push(TableEntry {
-            tag,
-            offset,
-            length,
-        });
-    }
+    let entries = dir
+        .as_chunks::<SFNT_RECORD_LEN>()
+        .0
+        .iter()
+        .map(|rec| TableEntry {
+            tag: Some([rec[0], rec[1], rec[2], rec[3]]),
+            offset: u64::from(u32::from_be_bytes([rec[8], rec[9], rec[10], rec[11]])),
+            length: u64::from(u32::from_be_bytes([rec[12], rec[13], rec[14], rec[15]])),
+        })
+        .collect();
     (entries, dir_end as u64)
 }
 
@@ -397,6 +409,10 @@ fn walk_collection(bytes: &[u8], report: &mut Report) {
     // The header itself, plus the offset array, is covered ground.
     let mut dir_end = (12 + num_fonts * 4) as u64;
     let mut all: Vec<TableEntry> = Vec::new();
+    // Members that share a directory contribute identical entries, which
+    // the dedup below would collapse anyway; walk each directory once so a
+    // header pointing all 512 members at one large directory costs one walk.
+    let mut walked = HashSet::new();
     for i in 0..num_fonts {
         let at = 12 + i * 4;
         let Some(rec) = bytes.get(at..at + 4) else {
@@ -405,6 +421,9 @@ fn walk_collection(bytes: &[u8], report: &mut Report) {
             return;
         };
         let off = u32::from_be_bytes([rec[0], rec[1], rec[2], rec[3]]) as usize;
+        if !walked.insert(off) {
+            continue;
+        }
         if off >= bytes.len() {
             report.problem("collection member offset out of bounds");
             report.flag("table_out_of_bounds");
@@ -436,6 +455,10 @@ fn walk_woff(bytes: &[u8], report: &mut Report) {
     note_declared_size(declared, bytes.len(), report);
 
     let num_tables = u16::from_be_bytes([header[12], header[13]]) as usize;
+    if num_tables > MAX_TABLES {
+        report.problem("implausible table count");
+        return;
+    }
     let dir_start = 44usize;
     let Some(dir_end) = num_tables
         .checked_mul(WOFF_RECORD_LEN)
@@ -444,29 +467,27 @@ fn walk_woff(bytes: &[u8], report: &mut Report) {
         report.problem("table count overflows");
         return;
     };
-    if dir_end > bytes.len() {
+    let Some(dir) = bytes.get(dir_start..dir_end) else {
         report.problem("table directory truncated");
         report.flag("truncated");
         return;
-    }
+    };
 
-    let mut entries = Vec::with_capacity(num_tables);
-    for i in 0..num_tables {
-        let rec = &bytes[dir_start + i * WOFF_RECORD_LEN..dir_start + (i + 1) * WOFF_RECORD_LEN];
-        let tag = tag_label(&rec[..4]);
-        let offset = u64::from(u32::from_be_bytes([rec[4], rec[5], rec[6], rec[7]]));
-        // compLength is the on-disk extent; origLength is the inflated size.
-        let length = u64::from(u32::from_be_bytes([rec[8], rec[9], rec[10], rec[11]]));
-        entries.push(TableEntry {
-            tag,
-            offset,
-            length,
-        });
-    }
+    let mut entries: Vec<TableEntry> = dir
+        .as_chunks::<WOFF_RECORD_LEN>()
+        .0
+        .iter()
+        .map(|rec| TableEntry {
+            tag: Some([rec[0], rec[1], rec[2], rec[3]]),
+            offset: u64::from(u32::from_be_bytes([rec[4], rec[5], rec[6], rec[7]])),
+            // compLength is the on-disk extent; origLength is the inflated size.
+            length: u64::from(u32::from_be_bytes([rec[8], rec[9], rec[10], rec[11]])),
+        })
+        .collect();
     // The metadata and private blocks are legitimate parts of the container,
     // so count them as covered rather than reporting them as stowaways.
     let mut extra = Vec::new();
-    for (off_at, len_at, name) in [(24usize, 28usize, "__meta"), (36usize, 40usize, "__priv")] {
+    for (off_at, len_at) in [(24usize, 28usize), (36usize, 40usize)] {
         let off = u64::from(u32::from_be_bytes([
             header[off_at],
             header[off_at + 1],
@@ -481,7 +502,7 @@ fn walk_woff(bytes: &[u8], report: &mut Report) {
         ]));
         if off > 0 && len > 0 {
             extra.push(TableEntry {
-                tag: name.to_string(),
+                tag: None,
                 offset: off,
                 length: len,
             });
@@ -507,9 +528,13 @@ fn walk_woff2(bytes: &[u8], report: &mut Report) {
     ]));
     note_declared_size(declared, bytes.len(), report);
 
-    let num_tables = u16::from_be_bytes([header[12], header[13]]);
+    let num_tables = u16::from_be_bytes([header[12], header[13]]) as usize;
     if num_tables == 0 {
         report.problem("no tables declared");
+    }
+    if num_tables > MAX_TABLES {
+        report.problem("implausible table count");
+        return;
     }
     let compressed = u64::from(u32::from_be_bytes([
         header[20], header[21], header[22], header[23],
@@ -580,16 +605,18 @@ fn record_tables(bytes: &[u8], dir_end: u64, entries: &[TableEntry], report: &mu
 
     let mut extents: Vec<(u64, u64)> = Vec::with_capacity(entries.len());
     for e in entries {
-        // `__meta`/`__priv` are synthetic container regions, not real tags.
-        if !e.tag.starts_with("__") {
-            if !report.tables.contains(&e.tag) {
-                report.tables.push(e.tag.clone());
-            }
-            if !is_registered_tag(&e.tag) {
-                report.unknown_table_bytes = report.unknown_table_bytes.saturating_add(e.length);
-                if !report.unknown_tables.contains(&e.tag) {
-                    report.unknown_tables.push(e.tag.clone());
+        // Untagged entries are WOFF container regions, not tables.
+        let registered = e.tag.is_some_and(is_registered_tag);
+        if let Some(tag) = e.tag {
+            if report.seen_tables.insert(tag) {
+                let label = tag_label(&tag);
+                if !registered {
+                    report.unknown_tables.push(label.clone());
                 }
+                report.tables.push(label);
+            }
+            if !registered {
+                report.unknown_table_bytes = report.unknown_table_bytes.saturating_add(e.length);
             }
         }
         report.largest_table_bytes = report.largest_table_bytes.max(e.length);
@@ -610,9 +637,13 @@ fn record_tables(bytes: &[u8], dir_end: u64, entries: &[TableEntry], report: &mu
         // reads it. `name`/`post` are scanned too: they are the format's
         // string tables, so an executable or archive signature in them is
         // unambiguous even though readable text there is expected.
-        if !is_registered_tag(&e.tag) {
+        if !registered {
             note_region(bytes, e.offset, end, report, RegionKind::Unclaimed);
-        } else if matches!(e.tag.as_str(), "name" | "post") {
+        } else if e
+            .tag
+            .as_ref()
+            .is_some_and(|t| matches!(t, b"name" | b"post"))
+        {
             note_region(bytes, e.offset, end, report, RegionKind::StringTable);
         }
     }
@@ -659,13 +690,18 @@ fn record_tables(bytes: &[u8], dir_end: u64, entries: &[TableEntry], report: &mu
         note_region(bytes, covered_to, file_len, report, RegionKind::Unclaimed);
     }
 
-    for tag in report.tables.clone() {
-        match tag.as_str() {
-            "DSIG" => report.flag("signed"),
-            "fvar" => report.flag("variable"),
-            "CBDT" | "EBDT" | "sbix" | "SVG " => report.flag("bitmap"),
-            _ => {}
-        }
+    let flags: Vec<&'static str> = report
+        .tables
+        .iter()
+        .filter_map(|tag| match tag.as_str() {
+            "DSIG" => Some("signed"),
+            "fvar" => Some("variable"),
+            "CBDT" | "EBDT" | "sbix" | "SVG " => Some("bitmap"),
+            _ => None,
+        })
+        .collect();
+    for flag in flags {
+        report.flag(flag);
     }
 }
 
@@ -718,15 +754,16 @@ fn sfnt_version_label(v: &[u8]) -> String {
 /// A four-character tag, with non-printable bytes escaped so a hostile tag
 /// cannot inject control characters into the report.
 fn tag_label(raw: &[u8]) -> String {
-    raw.iter()
-        .map(|&b| {
-            if (0x20..0x7f).contains(&b) {
-                char::from(b).to_string()
-            } else {
-                format!("\\x{b:02x}")
-            }
-        })
-        .collect()
+    let mut label = String::with_capacity(raw.len());
+    for &b in raw {
+        if (0x20..0x7f).contains(&b) {
+            label.push(char::from(b));
+        } else {
+            label.push_str("\\x");
+            label.push_str(&hex_encode(&[b]));
+        }
+    }
+    label
 }
 
 /// Registered OpenType/TrueType table tags (OpenType 1.9 plus the Apple and
@@ -738,27 +775,27 @@ fn tag_label(raw: &[u8]) -> String {
 /// separates those from a carrier is size, which is why
 /// `font.unknown_table_bytes` is emitted alongside the count — a real private
 /// tag holds tens of bytes, a payload holds kilobytes.
-fn is_registered_tag(tag: &str) -> bool {
+fn is_registered_tag(tag: [u8; 4]) -> bool {
     matches!(
-        tag,
+        &tag,
         // Required / core
-        "cmap" | "head" | "hhea" | "hmtx" | "maxp" | "name" | "OS/2" | "post"
+        b"cmap" | b"head" | b"hhea" | b"hmtx" | b"maxp" | b"name" | b"OS/2" | b"post"
         // TrueType outlines
-        | "cvt " | "fpgm" | "glyf" | "loca" | "prep" | "gasp"
+        | b"cvt " | b"fpgm" | b"glyf" | b"loca" | b"prep" | b"gasp"
         // CFF outlines
-        | "CFF " | "CFF2" | "VORG"
+        | b"CFF " | b"CFF2" | b"VORG"
         // Bitmap / colour
-        | "EBDT" | "EBLC" | "EBSC" | "CBDT" | "CBLC" | "sbix" | "COLR" | "CPAL" | "SVG "
+        | b"EBDT" | b"EBLC" | b"EBSC" | b"CBDT" | b"CBLC" | b"sbix" | b"COLR" | b"CPAL" | b"SVG "
         // Advanced typography
-        | "BASE" | "GDEF" | "GPOS" | "GSUB" | "JSTF" | "MATH"
+        | b"BASE" | b"GDEF" | b"GPOS" | b"GSUB" | b"JSTF" | b"MATH"
         // Variable fonts
-        | "avar" | "cvar" | "fvar" | "gvar" | "HVAR" | "MVAR" | "STAT" | "VVAR"
+        | b"avar" | b"cvar" | b"fvar" | b"gvar" | b"HVAR" | b"MVAR" | b"STAT" | b"VVAR"
         // Other registered
-        | "DSIG" | "hdmx" | "kern" | "LTSH" | "PCLT" | "VDMX" | "vhea" | "vmtx"
+        | b"DSIG" | b"hdmx" | b"kern" | b"LTSH" | b"PCLT" | b"VDMX" | b"vhea" | b"vmtx"
         // Apple Advanced Typography
-        | "acnt" | "ankr" | "bdat" | "bloc" | "bsln" | "fdsc" | "feat" | "fmtx"
-        | "fond" | "just" | "lcar" | "ltag" | "meta" | "mort" | "morx" | "opbd"
-        | "prop" | "trak" | "xref" | "Zapf" | "kerx" | "bhed"
+        | b"acnt" | b"ankr" | b"bdat" | b"bloc" | b"bsln" | b"fdsc" | b"feat" | b"fmtx"
+        | b"fond" | b"just" | b"lcar" | b"ltag" | b"meta" | b"mort" | b"morx" | b"opbd"
+        | b"prop" | b"trak" | b"xref" | b"Zapf" | b"kerx" | b"bhed"
         // Not in the OpenType registry, but emitted by mainstream font
         // toolchains and shipped in fonts on every desktop. Treating these as
         // unknown would make `font.unknown_table_count` fire on Font Awesome,
@@ -774,15 +811,15 @@ fn is_registered_tag(tag: &str) -> bool {
         // distinguishable by tag alone. The coverage legs (`font.gap_bytes`,
         // `font.trailing_bytes`) do not depend on tag names and still apply.
         // FontForge toolchain:
-        | "FFTM" | "PfEd" | "TeX " | "BDF " | "FFTB"
+        | b"FFTM" | b"PfEd" | b"TeX " | b"BDF " | b"FFTB"
         // SIL Graphite smart fonts:
-        | "Feat" | "Glat" | "Gloc" | "Silf" | "Sill"
+        | b"Feat" | b"Glat" | b"Gloc" | b"Silf" | b"Sill"
         // Apple: Color Emoji layer tables, SF merge data, Skia classification,
         // and the AppleMyungjo pair.
-        | "cntr" | "bgcl" | "MERG" | "clas" | "CVTM" | "TPNM"
+        | b"cntr" | b"bgcl" | b"MERG" | b"clas" | b"CVTM" | b"TPNM"
         // Monotype / Agfa: sign-instruction and font-metadata tables shipped
         // in the Arial, Trebuchet and Futura families.
-        | "TSIV" | "MTfn" | "BUSG" | "SOPG"
+        | b"TSIV" | b"MTfn" | b"BUSG" | b"SOPG"
     )
 }
 
@@ -1054,6 +1091,58 @@ mod tests {
             v.get("font.valid").and_then(JsonValue::as_bool),
             Some(false)
         );
+    }
+
+    /// A directory past the table cap is refused outright rather than walked
+    /// record by record.
+    #[test]
+    fn table_count_over_cap_is_implausible() {
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+        out.extend_from_slice(&((MAX_TABLES + 1) as u16).to_be_bytes());
+        out.extend_from_slice(&[0; 6]);
+        // A complete directory, so only the count can be what rejects it.
+        out.resize(12 + (MAX_TABLES + 1) * SFNT_RECORD_LEN, 0);
+        let (v, m) = run(&out);
+        assert_eq!(
+            v.get("font.valid").and_then(JsonValue::as_bool),
+            Some(false)
+        );
+        let problems = v.get("font.problems").and_then(|x| x.as_array()).unwrap();
+        assert!(problems.contains(&JsonValue::from("implausible table count")));
+        assert_eq!(m.get("font.table_count"), Some(0.0));
+    }
+
+    /// Every member of a collection may point at one directory; it is walked
+    /// once, and a full-size directory of distinct tags stays distinct.
+    #[test]
+    fn collection_members_sharing_one_large_directory() {
+        let tags: Vec<[u8; 4]> = (0..MAX_TABLES as u32)
+            .map(|i| (i | 0x4141_0000).to_be_bytes())
+            .collect();
+        let tables: Vec<(&[u8; 4], &[u8])> = tags.iter().map(|t| (t, &[0u8; 4][..])).collect();
+        let members = 512usize;
+        let base = 12 + members * 4;
+        let dir = build_sfnt_at(base, [0x00, 0x01, 0x00, 0x00], &tables);
+        let mut out = Vec::new();
+        out.extend_from_slice(b"ttcf");
+        out.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+        out.extend_from_slice(&(members as u32).to_be_bytes());
+        for _ in 0..members {
+            out.extend_from_slice(&(base as u32).to_be_bytes());
+        }
+        out.extend_from_slice(&dir);
+        let (v, m) = run(&out);
+        assert_eq!(m.get("font.table_count"), Some(MAX_TABLES as f64));
+        assert_eq!(m.get("font.unknown_table_count"), Some(MAX_TABLES as f64));
+        assert_eq!(m.get("font.gap_bytes"), Some(0.0));
+        assert!(!features(&v).contains(&"overlapping_tables".to_string()));
+    }
+
+    #[test]
+    fn tag_labels_escape_non_printable_bytes() {
+        assert_eq!(tag_label(b"OS/2"), "OS/2");
+        assert_eq!(tag_label(&[b'a', 0x00, 0x7f, b'b']), "a\\x00\\x7fb");
     }
 
     #[test]

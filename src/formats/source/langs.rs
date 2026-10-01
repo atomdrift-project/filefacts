@@ -18,6 +18,10 @@
 //!
 //! Adding a language is a single entry here plus a Cargo dependency.
 
+use std::sync::OnceLock;
+
+use tree_sitter::Query;
+
 use crate::fileid::FileType;
 
 use super::comment_metrics::CommentStyle;
@@ -38,6 +42,8 @@ pub(super) struct LangConfig {
     pub(super) import_query: &'static str,
     pub(super) function_query: &'static str,
     pub(super) class_query: &'static str,
+    /// The three queries above, compiled on first use. See [`LangConfig::query`].
+    compiled: CompiledQueries,
 
     // ------------------------------------------------------------------
     // AST-walk node-kind sets and field names
@@ -86,7 +92,87 @@ pub(super) struct LangConfig {
     pub(super) binary_op_kinds: &'static [&'static str],
 }
 
+/// One of a language's surface-extraction queries.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum QueryKind {
+    Imports,
+    Functions,
+    Classes,
+}
+
+impl QueryKind {
+    #[cfg(test)]
+    const ALL: [Self; 3] = [Self::Imports, Self::Functions, Self::Classes];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Imports => "imports",
+            Self::Functions => "functions",
+            Self::Classes => "classes",
+        }
+    }
+}
+
+/// Compile-once slots for one language's queries. `Query::new` parses the
+/// S-expression and builds matcher state, so each query is compiled for the
+/// first file that needs it and shared by every later one. A slot holds `None`
+/// when its query failed to compile.
+struct CompiledQueries {
+    imports: OnceLock<Option<Query>>,
+    functions: OnceLock<Option<Query>>,
+    classes: OnceLock<Option<Query>>,
+}
+
+impl CompiledQueries {
+    const fn new() -> Self {
+        Self {
+            imports: OnceLock::new(),
+            functions: OnceLock::new(),
+            classes: OnceLock::new(),
+        }
+    }
+}
+
 impl LangConfig {
+    fn query_source(&self, kind: QueryKind) -> &'static str {
+        match kind {
+            QueryKind::Imports => self.import_query,
+            QueryKind::Functions => self.function_query,
+            QueryKind::Classes => self.class_query,
+        }
+    }
+
+    /// The compiled `kind` query, or `None` when the language has none.
+    ///
+    /// A query that fails to compile (typically after a grammar bump renamed
+    /// a node) is also `None`, so that language's imports, functions or
+    /// classes go missing. That is logged once here, and the
+    /// `every_language_query_compiles` test turns it into a build failure.
+    pub(super) fn query(&'static self, kind: QueryKind) -> Option<&'static Query> {
+        let slot = match kind {
+            QueryKind::Imports => &self.compiled.imports,
+            QueryKind::Functions => &self.compiled.functions,
+            QueryKind::Classes => &self.compiled.classes,
+        };
+        slot.get_or_init(|| {
+            let source = self.query_source(kind);
+            if source.is_empty() {
+                return None;
+            }
+            Query::new(&(self.language)(), source)
+                .inspect_err(|error| {
+                    tracing::error!(
+                        language = self.name,
+                        query = kind.label(),
+                        %error,
+                        "tree-sitter query failed to compile; its symbols will be missing"
+                    );
+                })
+                .ok()
+        })
+        .as_ref()
+    }
+
     /// Locate a call's argument list for both symbol and value-flow extraction.
     /// Elixir's `arguments` is an immediate named child, not a grammar field.
     /// Do not search descendants: a nested call or do-block owns its own args.
@@ -155,6 +241,7 @@ static JAVASCRIPT: LangConfig = LangConfig {
     class_query: r#"
         (class_declaration name: (identifier) @class)
     "#,
+    compiled: CompiledQueries::new(),
     call_kinds: &["call_expression", "new_expression"],
     callee_field: "function",
     arguments_field: "arguments",
@@ -200,6 +287,7 @@ static TYPESCRIPT: LangConfig = LangConfig {
         (class_declaration name: (type_identifier) @class)
         (interface_declaration name: (type_identifier) @class)
     "#,
+    compiled: CompiledQueries::new(),
     call_kinds: &["call_expression", "new_expression"],
     callee_field: "function",
     arguments_field: "arguments",
@@ -236,6 +324,7 @@ static PYTHON: LangConfig = LangConfig {
     class_query: r#"
         (class_definition name: (identifier) @class)
     "#,
+    compiled: CompiledQueries::new(),
     call_kinds: &["call"],
     callee_field: "function",
     arguments_field: "arguments",
@@ -269,6 +358,7 @@ static GO: LangConfig = LangConfig {
         (type_spec name: (type_identifier) @class type: (struct_type))
         (type_spec name: (type_identifier) @class type: (interface_type))
     "#,
+    compiled: CompiledQueries::new(),
     call_kinds: &["call_expression"],
     callee_field: "function",
     arguments_field: "arguments",
@@ -308,6 +398,7 @@ static RUST: LangConfig = LangConfig {
         (enum_item name: (type_identifier) @class)
         (trait_item name: (type_identifier) @class)
     "#,
+    compiled: CompiledQueries::new(),
     call_kinds: &["call_expression"],
     callee_field: "function",
     arguments_field: "arguments",
@@ -344,6 +435,7 @@ static JAVA: LangConfig = LangConfig {
         (enum_declaration name: (identifier) @class)
         (record_declaration name: (identifier) @class)
     "#,
+    compiled: CompiledQueries::new(),
     call_kinds: &["method_invocation", "object_creation_expression"],
     callee_field: "name",
     arguments_field: "arguments",
@@ -380,6 +472,7 @@ static BASH: LangConfig = LangConfig {
         (function_definition name: (word) @fn)
     "#,
     class_query: "",
+    compiled: CompiledQueries::new(),
     call_kinds: &["command"],
     callee_field: "name",
     arguments_field: "argument",
@@ -416,6 +509,7 @@ static RUBY: LangConfig = LangConfig {
         (class name: (constant) @class)
         (module name: (constant) @class)
     "#,
+    compiled: CompiledQueries::new(),
     call_kinds: &["call"],
     callee_field: "method",
     arguments_field: "arguments",
@@ -454,6 +548,7 @@ static LUA: LangConfig = LangConfig {
         (function_declaration name: (dot_index_expression field: (identifier) @fn))
     "#,
     class_query: "",
+    compiled: CompiledQueries::new(),
     call_kinds: &["function_call"],
     callee_field: "name",
     arguments_field: "arguments",
@@ -497,6 +592,7 @@ static CSHARP: LangConfig = LangConfig {
         (record_declaration name: (identifier) @class)
         (enum_declaration name: (identifier) @class)
     "#,
+    compiled: CompiledQueries::new(),
     call_kinds: &["invocation_expression", "object_creation_expression"],
     callee_field: "function",
     arguments_field: "arguments",
@@ -541,6 +637,7 @@ static C: LangConfig = LangConfig {
         (union_specifier name: (type_identifier) @class)
         (enum_specifier name: (type_identifier) @class)
     "#,
+    compiled: CompiledQueries::new(),
     call_kinds: &["call_expression"],
     callee_field: "function",
     arguments_field: "arguments",
@@ -577,6 +674,7 @@ static SCALA: LangConfig = LangConfig {
         (object_definition name: (identifier) @class)
         (trait_definition name: (identifier) @class)
     "#,
+    compiled: CompiledQueries::new(),
     call_kinds: &["call_expression"],
     callee_field: "function",
     arguments_field: "arguments",
@@ -612,6 +710,7 @@ static OBJC: LangConfig = LangConfig {
         (class_interface (identifier) @class)
         (class_implementation (identifier) @class)
     "#,
+    compiled: CompiledQueries::new(),
     call_kinds: &["call_expression", "message_expression"],
     callee_field: "function",
     arguments_field: "arguments",
@@ -644,6 +743,7 @@ static KOTLIN: LangConfig = LangConfig {
         (class_declaration name: (identifier) @class)
         (object_declaration name: (identifier) @class)
     "#,
+    compiled: CompiledQueries::new(),
     call_kinds: &["call_expression"],
     callee_field: "",
     arguments_field: "",
@@ -681,6 +781,7 @@ static SWIFT: LangConfig = LangConfig {
         (class_declaration name: (type_identifier) @class)
         (protocol_declaration name: (type_identifier) @class)
     "#,
+    compiled: CompiledQueries::new(),
     call_kinds: &["call_expression"],
     callee_field: "",
     arguments_field: "",
@@ -728,6 +829,7 @@ static POWERSHELL: LangConfig = LangConfig {
     class_query: r#"
         (class_statement (simple_name) @class)
     "#,
+    compiled: CompiledQueries::new(),
     call_kinds: &["command"],
     callee_field: "command_name",
     arguments_field: "command_elements",
@@ -771,6 +873,7 @@ static PHP: LangConfig = LangConfig {
         (interface_declaration name: (name) @class)
         (trait_declaration name: (name) @class)
     "#,
+    compiled: CompiledQueries::new(),
     call_kinds: &[
         "function_call_expression",
         "member_call_expression",
@@ -812,6 +915,7 @@ static PERL: LangConfig = LangConfig {
         (package_statement (package) @class)
         (class_statement (package) @class)
     "#,
+    compiled: CompiledQueries::new(),
     call_kinds: &[
         "function_call_expression",
         // The Perl grammar uses this for ordinary calls without parentheses.
@@ -856,6 +960,7 @@ static GROOVY: LangConfig = LangConfig {
     class_query: r#"
         (class_declaration name: (identifier) @class)
     "#,
+    compiled: CompiledQueries::new(),
     call_kinds: &["method_invocation", "juxt_function_call"],
     callee_field: "name",
     arguments_field: "arguments",
@@ -892,6 +997,7 @@ static ZIG: LangConfig = LangConfig {
         (function_declaration name: (identifier) @fn)
     "#,
     class_query: "",
+    compiled: CompiledQueries::new(),
     call_kinds: &["call_expression"],
     callee_field: "function",
     arguments_field: "arguments",
@@ -937,6 +1043,7 @@ static ELIXIR: LangConfig = LangConfig {
             (arguments (alias) @class)
             (#eq? @_fn "defmodule"))
     "#,
+    compiled: CompiledQueries::new(),
     call_kinds: &["call"],
     callee_field: "target",
     arguments_field: "arguments",
@@ -968,6 +1075,7 @@ static MAKEFILE: LangConfig = LangConfig {
         (rule (targets (word) @fn))
     "#,
     class_query: "",
+    compiled: CompiledQueries::new(),
     call_kinds: &["function_call", "shell_function"],
     callee_field: "function",
     arguments_field: "arguments",
@@ -998,6 +1106,7 @@ static CLOJURE: LangConfig = LangConfig {
     import_query: "",
     function_query: "",
     class_query: "",
+    compiled: CompiledQueries::new(),
     call_kinds: &["list_lit"],
     callee_field: "",
     arguments_field: "",
@@ -1026,6 +1135,7 @@ static BATCH: LangConfig = LangConfig {
     import_query: "",
     function_query: "",
     class_query: "",
+    compiled: CompiledQueries::new(),
     call_kinds: &["cmd", "call_stmt", "macro_invocation"],
     callee_field: "",
     arguments_field: "",
@@ -1042,3 +1152,67 @@ static BATCH: LangConfig = LangConfig {
     template_kinds: &[],
     binary_op_kinds: &[],
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static ALL: [&LangConfig; 24] = [
+        &JAVASCRIPT,
+        &TYPESCRIPT,
+        &PYTHON,
+        &GO,
+        &RUST,
+        &JAVA,
+        &BASH,
+        &RUBY,
+        &LUA,
+        &CSHARP,
+        &C,
+        &SCALA,
+        &OBJC,
+        &KOTLIN,
+        &SWIFT,
+        &POWERSHELL,
+        &PHP,
+        &PERL,
+        &GROOVY,
+        &ZIG,
+        &ELIXIR,
+        &MAKEFILE,
+        &CLOJURE,
+        &BATCH,
+    ];
+
+    /// A query that stops compiling after a grammar bump only logs at runtime
+    /// and drops that language's symbols, so compile every one here and name
+    /// each failure.
+    #[test]
+    fn every_language_query_compiles() {
+        let mut failures = Vec::new();
+        for config in &ALL {
+            for kind in QueryKind::ALL {
+                let source = config.query_source(kind);
+                if source.is_empty() {
+                    continue;
+                }
+                if let Err(error) = Query::new(&(config.language)(), source) {
+                    failures.push(format!("{} {} query: {error}", config.name, kind.label()));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn query_cache_compiles_once_and_skips_absent_queries() {
+        let first = PYTHON
+            .query(QueryKind::Imports)
+            .expect("python import query");
+        let again = PYTHON
+            .query(QueryKind::Imports)
+            .expect("python import query");
+        assert!(std::ptr::eq(first, again));
+        assert!(BASH.query(QueryKind::Classes).is_none());
+    }
+}

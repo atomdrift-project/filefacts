@@ -193,6 +193,12 @@ impl Registry {
     /// `metrics` (counted/measured) surfaces under the `registry.*` namespace,
     /// the same split every filefacts extractor follows. Empty optional fields
     /// are skipped, so a fact's presence is meaningful.
+    ///
+    /// Boolean facts become `0.0`/`1.0` metrics whenever the registry reported
+    /// them: `0.0` is a known false, and an absent metric means the registry
+    /// did not say. Flags that other extractors emit only when they hold
+    /// (presence as `1.0`) cannot make that distinction; a `>= 1` threshold
+    /// reads the same under both encodings.
     pub fn write_facts(&self, values: &mut Values, metrics: &mut Metrics) {
         let mut put = |key: &str, v: Option<&str>| {
             if let Some(v) = v.filter(|s| !s.is_empty()) {
@@ -251,7 +257,8 @@ impl Registry {
             self.maintainers.map(f64::from),
         );
         // A boolean deprecation flag as a 0/1 metric, so a trait can gate on
-        // `registry.is_deprecated >= 1` without parsing the reason text.
+        // `registry.is_deprecated >= 1` without parsing the reason text. Always
+        // written: a record without a deprecation notice is known not deprecated.
         num(
             metric!("registry.is_deprecated"),
             Some(f64::from(u8::from(self.deprecated.is_some()))),
@@ -307,7 +314,8 @@ impl Registry {
             metric!("registry.vulnerability_count"),
             self.vulnerability_count.map(f64::from),
         );
-        // 0/1 flags, mirroring `registry.is_deprecated`.
+        // 0/1 flags, mirroring `registry.is_deprecated`: `0.0` is a reported
+        // false, absence an unreported one (see `write_facts`).
         num(
             metric!("registry.has_install_script"),
             self.has_install_script.map(|b| f64::from(u8::from(b))),
@@ -329,7 +337,8 @@ impl Registry {
             metric!("registry.version_removed"),
             self.version_removed.map(|b| f64::from(u8::from(b))),
         );
-        // A name one keystroke from a popular package's, 0/1; see lookalike.
+        // A name one keystroke from a popular package's, 0/1, and absent for an
+        // ecosystem with no popularity list; see lookalike.
         num(
             metric!("registry.name_lookalike"),
             lookalike::name_lookalike(&self.ecosystem, &self.name),

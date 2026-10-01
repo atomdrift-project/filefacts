@@ -8,9 +8,8 @@
 //! source by offset, not by reference, so the `&str` lifetime is what
 //! ties this cache to the parent `ParsedFile<'a>`.
 
-use crate::error::Error;
 use crate::fileid::FileType;
-use crate::formats::source::langs;
+use crate::formats::source::langs::{self, LangConfig};
 use crate::metric;
 use std::cell::{Cell, RefCell};
 use std::io::Write;
@@ -47,11 +46,11 @@ const MAX_MODELED_AST_FILE_BYTES: usize = 4 * 1024 * 1024;
 /// shows up on samples that are merely large.
 const SOURCE_PARSE_WALL_BUDGET: Duration = Duration::from_secs(15);
 
+#[cfg(test)]
 thread_local! {
-    /// Test-only override in milliseconds; `0` means
-    /// [`SOURCE_PARSE_WALL_BUDGET`]. The timeout path is otherwise
-    /// unreachable in a unit test — provoking real GLR blowup would need a
-    /// fragile adversarial fixture.
+    /// Override in milliseconds; `0` means [`SOURCE_PARSE_WALL_BUDGET`]. The
+    /// timeout path is otherwise unreachable in a unit test — provoking real
+    /// GLR blowup would need a fragile adversarial fixture.
     ///
     /// Thread-local, not a global: parses run on the caller's thread, and a
     /// process-wide knob would let one test's shortened budget cancel a
@@ -60,10 +59,11 @@ thread_local! {
 }
 
 fn parse_wall_budget() -> Duration {
-    match PARSE_BUDGET_OVERRIDE_MS.get() {
-        0 => SOURCE_PARSE_WALL_BUDGET,
-        ms => Duration::from_millis(ms),
+    #[cfg(test)]
+    if let ms @ 1.. = PARSE_BUDGET_OVERRIDE_MS.get() {
+        return Duration::from_millis(ms);
     }
+    SOURCE_PARSE_WALL_BUDGET
 }
 
 /// Conservative cap for grammars whose scanner has not been audited
@@ -119,6 +119,7 @@ pub(crate) struct TreeCache<'a> {
     source: &'a str,
     tree: tree_sitter::Tree,
     file_type: FileType,
+    config: &'static LangConfig,
 }
 
 /// Source parsing outcome cached by [`crate::ParsedFile`].
@@ -160,7 +161,7 @@ impl TreeSitterDiagnostic {
         }
     }
 
-    pub(crate) fn parse_failed(message: impl Into<String>) -> Self {
+    fn parse_failed(message: impl Into<String>) -> Self {
         Self {
             metric: metric!("source.ast_unavailable.parse_failed"),
             message: message.into(),
@@ -197,16 +198,16 @@ impl<'a> TreeCache<'a> {
         bytes: &'a [u8],
         file_type: FileType,
         cancel: Option<&std::sync::atomic::AtomicBool>,
-    ) -> Result<TreeParse<'a>, Error> {
+    ) -> TreeParse<'a> {
         let Some(config) = langs::config_for(file_type) else {
-            return Ok(TreeParse::Unavailable(TreeSitterDiagnostic::parse_failed(
+            return TreeParse::Unavailable(TreeSitterDiagnostic::parse_failed(
                 "no tree-sitter grammar registered for source file type",
-            )));
+            ));
         };
         let Ok(source) = std::str::from_utf8(bytes) else {
-            return Ok(TreeParse::Unavailable(TreeSitterDiagnostic::parse_failed(
+            return TreeParse::Unavailable(TreeSitterDiagnostic::parse_failed(
                 "source bytes are not valid utf-8",
-            )));
+            ));
         };
         if would_overflow_scanner_state(file_type, source) {
             let diagnostic = TreeSitterDiagnostic::tree_sitter_guard(
@@ -220,14 +221,16 @@ impl<'a> TreeCache<'a> {
                 audit = ?scanner_audit(file_type),
                 "skipping tree-sitter parse due to source-size or scanner-state safety guard"
             );
-            return Ok(TreeParse::Unavailable(diagnostic));
+            return TreeParse::Unavailable(diagnostic);
         }
         let language = (config.language)();
         THREAD_PARSER.with(|cell| {
             let mut parser = cell.borrow_mut();
-            parser.set_language(&language).map_err(|e| {
-                Error::malformed("source", format!("tree-sitter language setup failed: {e}"))
-            })?;
+            if let Err(e) = parser.set_language(&language) {
+                return TreeParse::Unavailable(TreeSitterDiagnostic::parse_failed(format!(
+                    "malformed source: tree-sitter language setup failed: {e}"
+                )));
+            }
             // Breadcrumb for sources large enough to plausibly overflow
             // the scanner. Flushed before `parse` so the line survives
             // a C-level abort and names the offending grammar.
@@ -284,12 +287,12 @@ impl<'a> TreeCache<'a> {
             let Some(tree) = parsed else {
                 // An abandoned parse degrades like the scanner-risk guard
                 // above: generic/text facts still flow, with a diagnostic
-                // naming why the AST is missing. Only a genuine parser failure
-                // is an Err — cancelling must not turn into a caller-visible
-                // error, or a Ctrl-C would look like a corrupt sample.
+                // naming why the AST is missing. Cancelling gets its own
+                // metric, or a Ctrl-C would look like a corrupt sample.
                 if cancelled.get() {
-                    return Ok(TreeParse::Unavailable(
-                        TreeSitterDiagnostic::parse_cancelled(config.name, source.len()),
+                    return TreeParse::Unavailable(TreeSitterDiagnostic::parse_cancelled(
+                        config.name,
+                        source.len(),
                     ));
                 }
                 if timed_out.get() {
@@ -299,22 +302,22 @@ impl<'a> TreeCache<'a> {
                         budget_ms = budget.as_millis(),
                         "tree-sitter parse exceeded its wall budget; AST facts dropped"
                     );
-                    return Ok(TreeParse::Unavailable(TreeSitterDiagnostic::parse_timeout(
+                    return TreeParse::Unavailable(TreeSitterDiagnostic::parse_timeout(
                         config.name,
                         source.len(),
                         budget,
-                    )));
+                    ));
                 }
-                return Err(Error::malformed(
-                    "source",
-                    "tree-sitter parse returned None",
+                return TreeParse::Unavailable(TreeSitterDiagnostic::parse_failed(
+                    "malformed source: tree-sitter parse returned None",
                 ));
             };
-            Ok(TreeParse::Parsed(Self {
+            TreeParse::Parsed(Self {
                 source,
                 tree,
                 file_type,
-            }))
+                config,
+            })
         })
     }
 
@@ -328,6 +331,11 @@ impl<'a> TreeCache<'a> {
 
     pub(crate) fn file_type(&self) -> FileType {
         self.file_type
+    }
+
+    /// The language configuration the tree was parsed with.
+    pub(super) fn config(&self) -> &'static LangConfig {
+        self.config
     }
 }
 
@@ -659,8 +667,7 @@ mod tests {
     #[test]
     fn bash_53_case_modifications_parse_with_original_source_ranges() {
         let source = r#"printf '%s' "${value~}" "${@~~[[:lower:]]}""#;
-        let parsed = TreeCache::parse(source.as_bytes(), FileType::Shell, None)
-            .expect("Bash source should parse");
+        let parsed = TreeCache::parse(source.as_bytes(), FileType::Shell, None);
         let cache = parsed
             .cache()
             .expect("Bash 5.3 syntax should retain AST facts");
@@ -706,8 +713,7 @@ mod tests {
     fn bash_53_obfuscated_shell_regression_parses_without_losing_original_offsets() {
         let source =
             include_bytes!("../../../testdata/shell/bash53-case-inversion/4a5376aa6c33.sh");
-        let parsed = TreeCache::parse(source, FileType::Shell, None)
-            .expect("retained Bash obfuscation sample should parse");
+        let parsed = TreeCache::parse(source, FileType::Shell, None);
         let cache = parsed
             .cache()
             .expect("Bash 5.3 operator should not discard shell AST facts");
@@ -745,8 +751,7 @@ mod tests {
     fn parses_javascript_above_the_old_sixteen_mibibyte_cap() {
         let source = format!("/*{}*/\nconst value = 1;", "x".repeat(20 * 1024 * 1024));
         assert!(source.len() > 16 * 1024 * 1024);
-        let parsed = TreeCache::parse(source.as_bytes(), FileType::JavaScript, None)
-            .expect("bounded JavaScript source should parse");
+        let parsed = TreeCache::parse(source.as_bytes(), FileType::JavaScript, None);
         assert!(
             parsed.cache().is_some(),
             "audited JavaScript below 32 MiB should retain AST facts"
@@ -759,8 +764,8 @@ mod tests {
         assert!(would_overflow_scanner_state(FileType::JavaScript, &source));
     }
 
-    /// An exhausted budget must degrade to a diagnostic, not an `Err` and not a
-    /// panic: the caller still emits generic/text facts for the file.
+    /// An exhausted budget must degrade to a diagnostic, not a panic: the
+    /// caller still emits generic/text facts for the file.
     #[test]
     fn exhausted_wall_budget_degrades_to_a_diagnostic() {
         // A budget of 1ms is already spent by the first progress poll, so this
@@ -770,7 +775,6 @@ mod tests {
         let parsed = TreeCache::parse(source.as_bytes(), FileType::Python, None);
         PARSE_BUDGET_OVERRIDE_MS.set(0);
 
-        let parsed = parsed.expect("a timeout is a diagnostic, never an Err");
         let diagnostic = parsed
             .diagnostic()
             .expect("a cancelled parse yields no tree");
@@ -780,16 +784,15 @@ mod tests {
         );
     }
 
-    /// A raised cancellation flag abandons the parse without becoming an
-    /// `Err`, and reports separately from a timeout.
+    /// A raised cancellation flag abandons the parse and reports separately
+    /// from a timeout.
     #[test]
     fn a_raised_cancellation_flag_abandons_the_parse() {
         use std::sync::atomic::AtomicBool;
 
         let flag = AtomicBool::new(true);
         let source = "def f():\n    return 1\n".repeat(20_000);
-        let parsed = TreeCache::parse(source.as_bytes(), FileType::Python, Some(&flag))
-            .expect("cancelling is not an error");
+        let parsed = TreeCache::parse(source.as_bytes(), FileType::Python, Some(&flag));
         let diagnostic = parsed
             .diagnostic()
             .expect("a cancelled parse yields no tree");
@@ -807,8 +810,7 @@ mod tests {
 
         let flag = AtomicBool::new(false);
         let source = "def f():\n    return 1\n".repeat(20_000);
-        let parsed = TreeCache::parse(source.as_bytes(), FileType::Python, Some(&flag))
-            .expect("ordinary source parses");
+        let parsed = TreeCache::parse(source.as_bytes(), FileType::Python, Some(&flag));
         assert!(
             parsed.cache().is_some(),
             "an un-raised flag must not disturb the parse"
@@ -821,8 +823,7 @@ mod tests {
     #[test]
     fn default_budget_does_not_disturb_an_ordinary_parse() {
         let source = "def f():\n    return 1\n".repeat(20_000);
-        let parsed = TreeCache::parse(source.as_bytes(), FileType::Python, None)
-            .expect("ordinary source parses");
+        let parsed = TreeCache::parse(source.as_bytes(), FileType::Python, None);
         assert!(
             parsed.cache().is_some(),
             "a normal parse must not hit the wall budget"
@@ -912,8 +913,7 @@ def greet(name, count):
         let source = format!("#{}\nmy $value = 1;\n", "x".repeat(95_000));
         assert!(source.len() > UNAUDITED_GRAMMAR_CAP_BYTES);
         assert!(!would_overflow_scanner_state(FileType::Perl, &source));
-        let parsed = TreeCache::parse(source.as_bytes(), FileType::Perl, None)
-            .expect("self-guarded Perl scanner should parse large ordinary source");
+        let parsed = TreeCache::parse(source.as_bytes(), FileType::Perl, None);
         let cache = parsed
             .cache()
             .expect("large Perl source should retain AST facts");
@@ -933,8 +933,7 @@ def greet(name, count):
         source.push_str(";\n");
 
         assert!(!would_overflow_scanner_state(FileType::Perl, &source));
-        let parsed = TreeCache::parse(source.as_bytes(), FileType::Perl, None)
-            .expect("self-guarded scanner must not abort on deep quote stacks");
+        let parsed = TreeCache::parse(source.as_bytes(), FileType::Perl, None);
         assert!(parsed.cache().is_some());
     }
 

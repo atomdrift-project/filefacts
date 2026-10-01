@@ -53,8 +53,15 @@ impl Values {
     /// Insert a value at a dot-delimited path, creating intermediate
     /// objects as needed.
     ///
-    /// Existing values at intermediate keys that are not objects are
-    /// overwritten. Existing values at the leaf are replaced. Path
+    /// The last write wins at every level, without any report:
+    ///
+    /// - a value at an intermediate key that is not an object (a scalar or
+    ///   an array) is discarded and replaced by an object, so `pe` = `1`
+    ///   followed by `pe.coff` = `2` loses the `1`;
+    /// - a value at the leaf is replaced whole, so `pe` = `1` written after
+    ///   `pe.coff` = `2` discards the entire `pe` subtree.
+    ///
+    /// Callers must not give one key both a value and children. Path
     /// segments containing `[`, `]`, or `.` are not supported — those
     /// characters are reserved for the lookup grammar.
     pub fn insert(&mut self, path: &str, value: JsonValue) {

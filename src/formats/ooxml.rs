@@ -32,15 +32,27 @@ use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::put_str;
-use crate::output::{Metrics, Values};
+use crate::output::{ErrorKind, Errors, Metrics, Stage, Values};
+
+/// Read cap for the named parts the `office.*` layer is built from.
+/// `[Content_Types].xml` and the `.rels` parts grow with the part count, so
+/// an ordinary large package runs to hundreds of KiB, and a cut-off XML part
+/// only fails to parse, taking everything derived from it along. The cap
+/// sits with the crate's other manifest caps rather than at a typical size.
+const MAX_PART_BYTES: u64 = 4 << 20;
+
+/// Read cap for each `.xml` part in the DDE / customUI scan, which visits
+/// every part rather than a named few.
+const MAX_SCAN_PART_BYTES: u64 = 1 << 20;
 
 pub(super) fn extract_from_archive<R: Read + Seek>(
     zip: &mut ::zip::ZipArchive<R>,
     values: &mut Values,
     metrics: &mut Metrics,
+    errors: &mut Errors,
 ) -> Result<(), Error> {
     let names = zip_entry_names(zip);
-    let Some(index) = build_ooxml_index(zip, &names) else {
+    let Some(index) = build_ooxml_index(zip, &names, errors) else {
         return Ok(());
     };
 
@@ -50,14 +62,14 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         return Ok(());
     }
 
-    if let Some(core) = parse_core_props(zip) {
+    if let Some(core) = parse_core_props(zip, errors) {
         for (key, value) in core {
             let path = format!("office.{key}");
             values.insert(&path, value);
         }
     }
 
-    if let Some((app, company)) = parse_app_props(zip) {
+    if let Some((app, company)) = parse_app_props(zip, errors) {
         if let Some(app) = app {
             put_str(values, "office.application", app);
         }
@@ -208,15 +220,41 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
 
     let mut dde_links: Vec<JsonValue> = Vec::new();
     let mut custom_ui_onload: Vec<JsonValue> = Vec::new();
+    // Oversized parts are routine (a long document, a big sheet). They are a
+    // coverage limit, not a parse failure, so they land in `office.limits`
+    // like the other archive walkers' limits and stay out of `errors` (which
+    // traits read as "the parser failed").
+    let mut oversized_parts = 0usize;
     for name in &names {
         if !name.ends_with(".xml") || name.ends_with(".rels") {
             continue;
         }
-        let Some(text) = read_entry_text_limited(zip, name, 1024 * 1024) else {
-            continue;
+        let text = match read_part(zip, name, MAX_SCAN_PART_BYTES) {
+            Ok(Some(text)) => text,
+            Ok(None) => continue,
+            Err(PartError::TooLarge) => {
+                oversized_parts += 1;
+                continue;
+            }
+            Err(PartError::Unreadable(why)) => {
+                errors.record_malformed(Stage::OoxmlParse, format!("{name}: {why}"));
+                continue;
+            }
         };
         dde_links.extend(extract_dde_links(&text, name));
         custom_ui_onload.extend(extract_custom_ui_onload(&text, name));
+    }
+    if oversized_parts > 0 {
+        values.insert(
+            "office.limits",
+            serde_json::json!([{
+                "stage": "part-scan",
+                "reason": format!(
+                    "{oversized_parts} XML part(s) over the {MAX_SCAN_PART_BYTES}-byte scan cap \
+                     not searched for DDE links or customUI onLoad"
+                ),
+            }]),
+        );
     }
     if !dde_links.is_empty() {
         let count = dde_links.len() as f64;
@@ -278,38 +316,42 @@ impl OoxmlIndex {
     }
 }
 
-fn zip_entry_names<R: Read + std::io::Seek>(zip: &mut ::zip::ZipArchive<R>) -> Vec<String> {
-    // Cap the prealloc: `zip.len()` is the central-directory entry
-    // count, attacker-controlled on Zip64. See `zip::MAX_ZIP_MEMBERS`.
-    let mut names = Vec::with_capacity(zip.len().min(super::zip::MAX_ZIP_MEMBERS));
-    for i in 0..zip.len() {
-        if let Ok(entry) = zip.by_index(i) {
-            names.push(entry.name().to_string());
-        }
-    }
-    names
+/// Part names straight from the central directory. Opening each entry would
+/// set up a decompressor per member just to read its name, and silently drop
+/// the names of entries it cannot open (an encrypted `vbaProject.bin`).
+fn zip_entry_names<R: Read + std::io::Seek>(zip: &::zip::ZipArchive<R>) -> Vec<String> {
+    zip.file_names().map(str::to_string).collect()
 }
 
+/// Content types plus every relationship. `None` means no OOXML layer at all,
+/// so a `[Content_Types].xml` that is present but unusable is recorded first.
 fn build_ooxml_index<R: Read + std::io::Seek>(
     zip: &mut ::zip::ZipArchive<R>,
     names: &[String],
+    errors: &mut Errors,
 ) -> Option<OoxmlIndex> {
-    let content_types = read_entry_text(zip, "[Content_Types].xml")?;
-    let mut index = parse_content_types(&content_types)?;
+    const CONTENT_TYPES: &str = "[Content_Types].xml";
+    let content_types = read_named_part(zip, CONTENT_TYPES, errors)?;
+    let mut index = parse_content_types(&content_types)
+        .map_err(|e| errors.record_malformed(Stage::OoxmlParse, format!("{CONTENT_TYPES}: {e}")))
+        .ok()?;
     for name in names {
         if !name.ends_with(".rels") {
             continue;
         }
-        let Some(text) = read_entry_text_limited(zip, name, 64 * 1024) else {
+        let Some(text) = read_named_part(zip, name, errors) else {
             continue;
         };
-        index.relationships.extend(parse_relationships(&text, name));
+        match parse_relationships(&text, name) {
+            Ok(rels) => index.relationships.extend(rels),
+            Err(e) => errors.record_malformed(Stage::OoxmlParse, format!("{name}: {e}")),
+        }
     }
     Some(index)
 }
 
-fn parse_content_types(xml: &str) -> Option<OoxmlIndex> {
-    let doc = roxmltree::Document::parse(xml).ok()?;
+fn parse_content_types(xml: &str) -> Result<OoxmlIndex, roxmltree::Error> {
+    let doc = roxmltree::Document::parse(xml)?;
     let mut index = OoxmlIndex::default();
     for node in doc.descendants() {
         match node.tag_name().name() {
@@ -339,13 +381,14 @@ fn parse_content_types(xml: &str) -> Option<OoxmlIndex> {
             _ => {}
         }
     }
-    Some(index)
+    Ok(index)
 }
 
-fn parse_relationships(xml: &str, rels_source: &str) -> Vec<RelationshipInfo> {
-    let Ok(doc) = roxmltree::Document::parse(xml) else {
-        return Vec::new();
-    };
+fn parse_relationships(
+    xml: &str,
+    rels_source: &str,
+) -> Result<Vec<RelationshipInfo>, roxmltree::Error> {
+    let doc = roxmltree::Document::parse(xml)?;
     let source = relationship_source_part(rels_source);
     let mut out = Vec::new();
     for node in doc.descendants() {
@@ -377,7 +420,7 @@ fn parse_relationships(xml: &str, rels_source: &str) -> Vec<RelationshipInfo> {
             mode,
         });
     }
-    out
+    Ok(out)
 }
 
 fn relationship_source_part(rels_source: &str) -> String {
@@ -620,9 +663,13 @@ fn detect_kind(index: &OoxmlIndex) -> Option<&'static str> {
 /// meaningful.
 fn parse_core_props<R: Read + std::io::Seek>(
     zip: &mut ::zip::ZipArchive<R>,
+    errors: &mut Errors,
 ) -> Option<serde_json::Map<String, JsonValue>> {
-    let text = read_entry_text(zip, "docProps/core.xml")?;
-    let doc = roxmltree::Document::parse(&text).ok()?;
+    const CORE: &str = "docProps/core.xml";
+    let text = read_named_part(zip, CORE, errors)?;
+    let doc = roxmltree::Document::parse(&text)
+        .map_err(|e| errors.record_malformed(Stage::OoxmlParse, format!("{CORE}: {e}")))
+        .ok()?;
     let mut out = serde_json::Map::new();
     for node in doc.descendants() {
         let name = node.tag_name().name();
@@ -660,9 +707,13 @@ fn parse_core_props<R: Read + std::io::Seek>(
 /// generators, …) often skip `app.xml` entirely.
 fn parse_app_props<R: Read + std::io::Seek>(
     zip: &mut ::zip::ZipArchive<R>,
+    errors: &mut Errors,
 ) -> Option<(Option<String>, Option<String>)> {
-    let text = read_entry_text(zip, "docProps/app.xml")?;
-    let doc = roxmltree::Document::parse(&text).ok()?;
+    const APP: &str = "docProps/app.xml";
+    let text = read_named_part(zip, APP, errors)?;
+    let doc = roxmltree::Document::parse(&text)
+        .map_err(|e| errors.record_malformed(Stage::OoxmlParse, format!("{APP}: {e}")))
+        .ok()?;
     let mut application: Option<String> = None;
     let mut company: Option<String> = None;
     for node in doc.descendants() {
@@ -785,24 +836,63 @@ fn extract_custom_ui_onload(xml: &str, source: &str) -> Vec<JsonValue> {
     out
 }
 
-/// Read a named entry's content as text. Bounded by the zip crate's own
-/// per-entry size limits and a caller-provided cap.
-fn read_entry_text<R: Read + std::io::Seek>(
-    zip: &mut ::zip::ZipArchive<R>,
-    name: &str,
-) -> Option<String> {
-    read_entry_text_limited(zip, name, 16 * 1024)
+/// Why a part that is present could not be handed to the XML parser.
+enum PartError {
+    /// Over the read cap. A cut-off XML part only fails to parse, so an
+    /// oversized one is not read at all.
+    TooLarge,
+    /// Unreadable (a corrupt or encrypted entry) or not UTF-8/UTF-16 text.
+    Unreadable(String),
 }
 
-fn read_entry_text_limited<R: Read + std::io::Seek>(
+/// Read a part as text, up to `max_bytes`. `Ok(None)` is a part that is not
+/// in the package, which is normal: most parts are optional.
+fn read_part<R: Read + std::io::Seek>(
     zip: &mut ::zip::ZipArchive<R>,
     name: &str,
     max_bytes: u64,
-) -> Option<String> {
-    let entry = zip.by_name(name).ok()?;
+) -> Result<Option<String>, PartError> {
+    let entry = match zip.by_name(name) {
+        Ok(entry) => entry,
+        Err(::zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(e) => return Err(PartError::Unreadable(e.to_string())),
+    };
     let mut buf = Vec::with_capacity(entry.size().min(max_bytes) as usize);
-    let _ = entry.take(max_bytes).read_to_end(&mut buf).ok()?;
+    // One byte past the cap tells an oversized part from one exactly at it.
+    entry
+        .take(max_bytes + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| PartError::Unreadable(e.to_string()))?;
+    if buf.len() as u64 > max_bytes {
+        return Err(PartError::TooLarge);
+    }
     decode_xml_bytes(&buf)
+        .map(Some)
+        .ok_or_else(|| PartError::Unreadable("not UTF-8 or UTF-16 text".into()))
+}
+
+/// [`read_part`] for a named part whose loss empties part of the `office.*`
+/// layer, so a failure is recorded rather than dropped.
+fn read_named_part<R: Read + std::io::Seek>(
+    zip: &mut ::zip::ZipArchive<R>,
+    name: &str,
+    errors: &mut Errors,
+) -> Option<String> {
+    match read_part(zip, name, MAX_PART_BYTES) {
+        Ok(text) => text,
+        Err(PartError::TooLarge) => {
+            errors.record(
+                ErrorKind::Truncated,
+                Stage::OoxmlParse,
+                format!("{name}: over the {MAX_PART_BYTES}-byte read cap; not parsed"),
+            );
+            None
+        }
+        Err(PartError::Unreadable(why)) => {
+            errors.record_malformed(Stage::OoxmlParse, format!("{name}: {why}"));
+            None
+        }
+    }
 }
 
 fn decode_xml_bytes(buf: &[u8]) -> Option<String> {
@@ -852,12 +942,33 @@ mod tests {
     use zip::write::{SimpleFileOptions, ZipWriter};
 
     fn run(bytes: &[u8]) -> (Values, Metrics) {
+        let (v, m, _) = run_with_errors(bytes);
+        (v, m)
+    }
+
+    fn run_with_errors(bytes: &[u8]) -> (Values, Metrics, Errors) {
         let mut v = Values::new();
         let mut m = Metrics::new();
+        let mut e = Errors::new();
         if let Ok(mut zip) = crate::formats::zip::open_archive(bytes) {
-            let _ = extract_from_archive(&mut zip, &mut v, &mut m);
+            let _ = extract_from_archive(&mut zip, &mut v, &mut m, &mut e);
         }
-        (v, m)
+        (v, m, e)
+    }
+
+    /// `[Content_Types].xml` with `n` extra `Override` entries ahead of the
+    /// document-type one, the way a package with many parts lists them.
+    fn content_types_with_overrides(n: usize) -> String {
+        let mut xml = String::from(
+            r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">"#,
+        );
+        for i in 0..n {
+            xml.push_str(&format!(
+                r#"<Override PartName="/word/media/image{i}.png" ContentType="image/png"/>"#
+            ));
+        }
+        xml.push_str(r#"<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#);
+        xml
     }
 
     fn build_ooxml(members: &[(&str, &[u8])]) -> Vec<u8> {
@@ -1036,15 +1147,75 @@ mod tests {
     }
 
     #[test]
-    fn malformed_xml_in_core_is_swallowed() {
+    fn malformed_core_and_rels_are_recorded() {
         let z = build_ooxml(&[
             ("[Content_Types].xml", CONTENT_TYPES_DOCX.as_bytes()),
             ("docProps/core.xml", b"<not-actually-xml"),
+            ("word/_rels/document.xml.rels", b"<Relationships"),
         ]);
-        let (v, _) = run(&z);
-        // Kind still set; core properties simply missing.
+        let (v, _, e) = run_with_errors(&z);
+        // Kind still set; core properties missing, and the loss is reported.
         assert_eq!(v.get("office.kind").and_then(|x| x.as_str()), Some("docx"));
         assert!(v.get("office.title").is_none());
+        let messages: Vec<&str> = e.iter().map(|x| x.message.as_str()).collect();
+        assert!(e.iter().all(|x| x.stage == Stage::OoxmlParse), "{e:?}");
+        assert!(messages.iter().any(|m| m.starts_with("docProps/core.xml")));
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.starts_with("word/_rels/document.xml.rels"))
+        );
+    }
+
+    /// A package with many parts has a `[Content_Types].xml` well past 16 KiB.
+    /// Cut off at that size it failed to parse, and the whole `office.*` layer
+    /// -- kind, macros, relationships -- vanished without an error.
+    #[test]
+    fn large_content_types_keeps_the_office_layer() {
+        let ct = content_types_with_overrides(2_000);
+        assert!(ct.len() > 64 * 1024);
+        let z = build_ooxml(&[
+            ("[Content_Types].xml", ct.as_bytes()),
+            ("word/vbaProject.bin", b"\x01\x16\x03\x00fake-macro-blob"),
+        ]);
+        let (v, m, e) = run_with_errors(&z);
+        assert_eq!(v.get("office.kind").and_then(|x| x.as_str()), Some("docx"));
+        assert_eq!(m.get("office.macro_count"), Some(1.0));
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    /// A long document is routine: its unscanned part is a recorded limit,
+    /// not a parse error that error-count traits would read as a failure.
+    #[test]
+    fn oversized_body_part_is_a_limit_not_an_error() {
+        let ct = content_types_with_overrides(0);
+        let body = format!(
+            "<w:document>{}</w:document>",
+            " ".repeat(MAX_SCAN_PART_BYTES as usize)
+        );
+        let z = build_ooxml(&[
+            ("[Content_Types].xml", ct.as_bytes()),
+            ("word/document.xml", body.as_bytes()),
+        ]);
+        let (v, _, e) = run_with_errors(&z);
+        assert!(e.is_empty(), "{e:?}");
+        let limits = v.get("office.limits").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(limits[0]["stage"].as_str(), Some("part-scan"));
+    }
+
+    /// Past the read cap the layer is still lost, but no longer silently.
+    #[test]
+    fn oversized_content_types_is_recorded() {
+        let mut ct = content_types_with_overrides(0);
+        let padding = " ".repeat(MAX_PART_BYTES as usize);
+        ct.insert_str(ct.len() - "</Types>".len(), &padding);
+        let z = build_ooxml(&[("[Content_Types].xml", ct.as_bytes())]);
+        let (v, _, e) = run_with_errors(&z);
+        assert!(v.get("office.kind").is_none());
+        let entry = e.iter().next().expect("oversized part recorded");
+        assert_eq!(entry.kind, ErrorKind::Truncated);
+        assert_eq!(entry.stage, Stage::OoxmlParse);
+        assert!(entry.message.starts_with("[Content_Types].xml"));
     }
 
     #[test]

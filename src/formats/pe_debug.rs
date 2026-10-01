@@ -13,8 +13,10 @@ use goblin::pe::debug::{
 };
 use serde_json::Value as JsonValue;
 
-use crate::formats::common::{basename, hex_encode, put_i64, put_str, put_u64, stem};
-use crate::output::Values;
+use crate::Stage;
+use crate::formats::common::{basename, format_guid, put_i64, put_str, put_u64, stem};
+use crate::formats::goblin_safe;
+use crate::output::{Errors, Values};
 
 /// Emit the PDB path and its derived basename + stem. The path itself
 /// is the forensic anchor; basename and stem are the comparison
@@ -35,12 +37,18 @@ fn put_pdb_path(values: &mut Values, path: &str, path_offset: Option<u64>) {
     }
 }
 
-pub(super) fn extract(debug: &DebugData<'_>, values: &mut Values) {
+pub(super) fn extract(debug: &DebugData<'_>, values: &mut Values, errors_out: &mut Errors) {
+    // goblin reads each directory entry lazily; walk them once, guarded,
+    // for every reader below.
+    let directory = goblin_safe::drain_or_record(
+        debug.entries().filter_map(Result::ok),
+        errors_out,
+        Stage::PeParse,
+    );
     // Enumerate every directory entry so a consumer can see the full
     // set of debug-information shapes the binary carries.
-    let entries: Vec<JsonValue> = debug
-        .entries()
-        .filter_map(Result::ok)
+    let entries: Vec<JsonValue> = directory
+        .iter()
         .map(|e| {
             // Emit both a stable string label (forensic consumers) and
             // the raw IMAGE_DEBUG_TYPE_* numeric id so downstream
@@ -59,7 +67,7 @@ pub(super) fn extract(debug: &DebugData<'_>, values: &mut Values) {
     }
 
     if let Some(ref cv) = debug.codeview_pdb70_debug_info {
-        codeview_pdb70(cv, debug, values);
+        codeview_pdb70(cv, &directory, values);
     }
     // PDB 2.0 (NB10) is the older format — rare today; report when seen
     // without the GUID since it uses a 32-bit signature instead.
@@ -69,8 +77,8 @@ pub(super) fn extract(debug: &DebugData<'_>, values: &mut Values) {
             if !path.is_empty() {
                 // NB10 header: CvSignature + Offset + Signature + Age = 16 bytes
                 // before the filename.
-                let path_offset =
-                    find_codeview_entry(debug).map(|idd| u64::from(idd.pointer_to_raw_data) + 16);
+                let path_offset = find_codeview_entry(&directory)
+                    .map(|idd| u64::from(idd.pointer_to_raw_data) + 16);
                 put_pdb_path(values, path, path_offset);
             }
         }
@@ -78,7 +86,11 @@ pub(super) fn extract(debug: &DebugData<'_>, values: &mut Values) {
     }
 }
 
-fn codeview_pdb70(cv: &CodeviewPDB70DebugInfo<'_>, debug: &DebugData<'_>, values: &mut Values) {
+fn codeview_pdb70(
+    cv: &CodeviewPDB70DebugInfo<'_>,
+    directory: &[ImageDebugDirectory],
+    values: &mut Values,
+) {
     if let Ok(path) = std::str::from_utf8(cv.filename) {
         // The PDB filename is null-terminated inside the codeview blob;
         // trim the trailing NULs before exposing.
@@ -87,7 +99,7 @@ fn codeview_pdb70(cv: &CodeviewPDB70DebugInfo<'_>, debug: &DebugData<'_>, values
             // RSDS header: CvSignature(4) + Signature/GUID(16) + Age(4) = 24
             // bytes before the filename string.
             let path_offset =
-                find_codeview_entry(debug).map(|idd| u64::from(idd.pointer_to_raw_data) + 24);
+                find_codeview_entry(directory).map(|idd| u64::from(idd.pointer_to_raw_data) + 24);
             put_pdb_path(values, path, path_offset);
         }
     }
@@ -97,7 +109,7 @@ fn codeview_pdb70(cv: &CodeviewPDB70DebugInfo<'_>, debug: &DebugData<'_>, values
     // Pair the GUID with the originating debug-entry timestamp so
     // consumers can build the same `<GUID><age>` PE-debug fingerprint
     // tools like symchk/symbol-server use to look the PDB up.
-    if let Some(idd) = find_codeview_entry(debug) {
+    if let Some(idd) = find_codeview_entry(directory) {
         put_i64(
             values,
             "pe.debug.pdb.timestamp",
@@ -106,30 +118,10 @@ fn codeview_pdb70(cv: &CodeviewPDB70DebugInfo<'_>, debug: &DebugData<'_>, values
     }
 }
 
-fn find_codeview_entry(debug: &DebugData<'_>) -> Option<ImageDebugDirectory> {
-    debug
-        .entries()
-        .filter_map(Result::ok)
+fn find_codeview_entry(directory: &[ImageDebugDirectory]) -> Option<&ImageDebugDirectory> {
+    directory
+        .iter()
         .find(|e| e.data_type == IMAGE_DEBUG_TYPE_CODEVIEW)
-}
-
-/// Format the 16-byte CodeView signature as a Microsoft-style GUID:
-/// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`. The first three groups are
-/// stored little-endian inside the file; we re-byteswap them so the
-/// emitted string matches `dumpbin /headers`, symchk, and every other
-/// Windows tool.
-fn format_guid(b: &[u8; 16]) -> String {
-    let data1 = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-    let data2 = u16::from_le_bytes([b[4], b[5]]);
-    let data3 = u16::from_le_bytes([b[6], b[7]]);
-    format!(
-        "{:08x}-{:04x}-{:04x}-{}-{}",
-        data1,
-        data2,
-        data3,
-        hex_encode(&b[8..10]),
-        hex_encode(&b[10..16])
-    )
 }
 
 fn debug_type_label(t: u32) -> &'static str {
@@ -160,41 +152,8 @@ fn debug_type_label(t: u32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{debug_type_label, format_guid};
+    use super::debug_type_label;
     use crate::output::Values;
-
-    #[test]
-    fn guid_byteswaps_first_three_groups() {
-        // Microsoft GUIDs use little-endian for the first three groups
-        // when stored on disk. Bytes `01 02 03 04 05 06 07 08 09 0a …`
-        // should display as `04030201-0605-0807-090a-0b0c0d0e0f10`.
-        let bytes = [
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
-            0x0f, 0x10,
-        ];
-        assert_eq!(format_guid(&bytes), "04030201-0605-0807-090a-0b0c0d0e0f10");
-    }
-
-    #[test]
-    fn guid_zero_bytes() {
-        let bytes = [0u8; 16];
-        assert_eq!(format_guid(&bytes), "00000000-0000-0000-0000-000000000000");
-    }
-
-    #[test]
-    fn guid_canonical_microsoft_form() {
-        // Real-world example: a Visual Studio toolchain GUID.
-        // Source bytes in file order, output should match
-        // `dumpbin /headers`'s representation.
-        let bytes = [
-            0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf1, 0x23, 0x45, 0x67,
-            0x89, 0xab,
-        ];
-        assert_eq!(
-            format_guid(&bytes),
-            "12efcdab-5634-9a78-bcde-f1234567 89ab".replace(' ', "")
-        );
-    }
 
     #[test]
     fn debug_type_labels_cover_known_types() {

@@ -1,13 +1,23 @@
 //! Go execution contexts. These are potential entry points, not proof that a
 //! package is selected for a particular GOOS/GOARCH, build tag, or test run.
+use super::named_children;
 use crate::Values;
 use serde_json::json;
 use std::collections::HashMap;
 use tree_sitter::Node;
 
-fn children(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).collect()
+/// The name in the file's package clause, `""` without one. A later clause
+/// overrides an earlier one, as in [`execution_facts`].
+pub(super) fn package_name<'s>(root: Node<'_>, source: &'s str) -> &'s str {
+    let mut package = "";
+    for node in named_children(root) {
+        if node.kind() == "package_clause" {
+            if let Some(n) = node.named_child(0) {
+                package = &source[n.byte_range()];
+            }
+        }
+    }
+    package
 }
 
 pub(super) fn imports(root: Node<'_>, source: &str) -> HashMap<String, String> {
@@ -26,7 +36,7 @@ pub(super) fn imports(root: Node<'_>, source: &str) -> HashMap<String, String> {
                 }
             }
         } else if node.kind() != "function_declaration" {
-            stack.extend(children(node));
+            stack.extend(named_children(node));
         }
     }
     out
@@ -73,14 +83,8 @@ pub(super) fn execution_facts(root: Node<'_>, source: &str, values: &mut Values)
     let mut init_count = 0;
     let mut globals = 0;
     let mut tests = Vec::new();
-    let mut package = "";
-    for node in children(root) {
+    for node in named_children(root) {
         match node.kind() {
-            "package_clause" => {
-                if let Some(n) = node.named_child(0) {
-                    package = &source[n.byte_range()];
-                }
-            }
             "function_declaration" => {
                 if let Some(n) = node.child_by_field_name("name") {
                     let name = &source[n.byte_range()];
@@ -96,12 +100,12 @@ pub(super) fn execution_facts(root: Node<'_>, source: &str, values: &mut Values)
                 }
             }
             "var_declaration" => {
-                let mut stack = children(node);
+                let mut stack = named_children(node);
                 while let Some(n) = stack.pop() {
                     if n.kind() == "var_spec" && n.child_by_field_name("value").is_some() {
                         globals += 1;
                     } else {
-                        stack.extend(children(n));
+                        stack.extend(named_children(n));
                     }
                 }
             }
@@ -151,7 +155,7 @@ pub(super) fn execution_facts(root: Node<'_>, source: &str, values: &mut Values)
             break;
         }
     }
-    values.insert("source.go.package", json!(package));
+    values.insert("source.go.package", json!(package_name(root, source)));
     values.insert("source.go.init_count", json!(init_count));
     values.insert("source.go.global_initializer_count", json!(globals));
     values.insert("source.go.test_entry_candidates", json!(tests));

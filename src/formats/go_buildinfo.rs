@@ -41,6 +41,7 @@
 
 use serde_json::{Map, Value as JsonValue};
 
+use crate::formats::common::read_uleb128;
 use crate::output::Values;
 
 const MAGIC: &[u8] = b"\xff Go buildinf:";
@@ -512,19 +513,9 @@ fn read_uvarint_string(buf: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 fn decode_uvarint(buf: &[u8]) -> Option<(u64, &[u8])> {
-    let mut value: u64 = 0;
-    let mut shift: u32 = 0;
-    for (i, &b) in buf.iter().enumerate() {
-        if shift > 63 {
-            return None;
-        }
-        value |= u64::from(b & 0x7f) << shift;
-        if b & 0x80 == 0 {
-            return Some((value, &buf[i + 1..]));
-        }
-        shift += 7;
-    }
-    None
+    let mut end = 0;
+    let value = read_uleb128(buf, &mut end)?;
+    Some((value, buf.get(end..)?))
 }
 
 #[cfg(test)]

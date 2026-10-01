@@ -562,7 +562,6 @@ fn le_u64(b: &[u8], off: usize) -> Option<u64> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

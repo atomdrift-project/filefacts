@@ -17,15 +17,31 @@ fn text<'a>(member: &'a SourceMember<'_>, key: &str) -> Option<&'a str> {
     member.values.get(key).and_then(Value::as_str)
 }
 
-fn resolve(base_file: &str, spec: &str, boundary: &str) -> Option<String> {
+/// Directory of a logical member path, separator included: through its last
+/// `/`, or through its last `!!` archive delimiter when that comes later, so
+/// members of sibling archives (`x/a.zip!!main.go`, `x/b.zip!!main.go`) never
+/// share a directory.
+pub(crate) fn member_directory(path: &str) -> &str {
+    let slash = path.rfind('/').map_or(0, |i| i + 1);
+    let archive = path.rfind("!!").map_or(0, |i| i + 2);
+    &path[..slash.max(archive)]
+}
+
+/// The archive that owns a logical member path: everything through its last
+/// `!!` delimiter, or `""` outside any archive.
+pub(crate) fn archive_boundary(path: &str) -> &str {
+    &path[..path.rfind("!!").map_or(0, |i| i + 2)]
+}
+
+/// Apply the relative member reference `spec` to the `/`-separated directory
+/// `dir`, returning the normalized segments joined by `/`. `None` for a spec
+/// that is absolute, carries `\`, `:`, `!` or `#`, or climbs above `dir`'s
+/// root, so a reference can never leave the tree it was resolved in.
+pub(crate) fn join_relative(dir: &str, spec: &str) -> Option<String> {
     if spec.starts_with('/') || spec.contains(['\\', ':', '!', '#']) {
         return None;
     }
-    let base = base_file
-        .strip_prefix(boundary)?
-        .rsplit_once('/')
-        .map_or("", |(dir, _)| dir);
-    let mut parts: Vec<&str> = base.split('/').filter(|s| !s.is_empty()).collect();
+    let mut parts: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
     for part in spec.split('/') {
         match part {
             "" | "." => {}
@@ -35,7 +51,15 @@ fn resolve(base_file: &str, spec: &str, boundary: &str) -> Option<String> {
             _ => parts.push(part),
         }
     }
-    Some(format!("{boundary}{}", parts.join("/")))
+    Some(parts.join("/"))
+}
+
+fn resolve(base_file: &str, spec: &str, boundary: &str) -> Option<String> {
+    let base = base_file
+        .strip_prefix(boundary)?
+        .rsplit_once('/')
+        .map_or("", |(dir, _)| dir);
+    Some(format!("{boundary}{}", join_relative(base, spec)?))
 }
 
 /// Resolve Cargo entry points and declared modules inside the supplied members.
@@ -201,5 +225,20 @@ mod tests {
             resolve("a.zip!!pkg/src/lib.rs", "../helper.rs", "a.zip!!pkg/"),
             Some("a.zip!!pkg/helper.rs".into())
         );
+    }
+
+    #[test]
+    fn member_path_helpers_respect_archive_boundaries() {
+        assert_eq!(member_directory("pkg/a.go"), "pkg/");
+        assert_eq!(member_directory("main.go"), "");
+        assert_eq!(member_directory("x/a.zip!!main.go"), "x/a.zip!!");
+        assert_eq!(member_directory("x/a.zip!!sub/main.go"), "x/a.zip!!sub/");
+        assert_eq!(archive_boundary("x/a.zip!!sub/main.go"), "x/a.zip!!");
+        assert_eq!(archive_boundary("x/main.go"), "");
+        assert_eq!(join_relative("a/b", "../c/./d"), Some("a/c/d".into()));
+        assert_eq!(join_relative("", "c"), Some("c".into()));
+        for escaping in ["../../c", "/abs", "x!!y", "c:/d", "a\\b", "#frag"] {
+            assert_eq!(join_relative("a", escaping), None, "{escaping}");
+        }
     }
 }

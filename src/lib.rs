@@ -22,8 +22,8 @@
 //!   functions, calls, members, binds, identifiers) tagged by kind.
 //! - [`Errors`] — recoverable extractor diagnostics.
 //!
-//! Plus a fourth concern that's always available without computing the
-//! views: [`FileId`], the result of file-format identification.
+//! Alongside the views, [`FileId`] — the result of file-format
+//! identification — is always available without computing them.
 //!
 //! ## Quick start
 //!
@@ -54,13 +54,26 @@
 //! bytes and writes into every view in one walk. There is no
 //! parsing during view materialisation that wasn't requested.
 //!
+//! ## Side effects
+//!
+//! Opening a file only identifies it. The first view access runs the
+//! extraction, which may spawn an installed rizin: once per process to read
+//! its version, and per file to recover symbols from PE, ELF and Mach-O
+//! binaries (see [`rizin`]). Turn that off with [`rizin::disable`] or
+//! [`rizin::scoped_disable`].
+//!
+//! The disk cache in [`cache`] is off unless the host opts in, with
+//! [`cache::enable_by_default`] (which `FILEFACTS_CACHE=0` still overrides)
+//! or [`cache::set_caching_enabled`]. When on, the first view access reads a
+//! matching entry from the user cache directory, or writes one after
+//! computing the views. The `filefacts` CLI opts in. Diagnostics are written
+//! to stderr only when `FILEFACTS_DEBUG` is set.
+//!
 //! ## Stability
 //!
-//! The crate is pre-1.0. The output schema is versioned via
-//! [`SCHEMA_VERSION`]; field additions are non-breaking, field
-//! semantics or renames bump the version.
-
-#![doc(html_root_url = "https://docs.rs/filefacts/0.1.0")]
+//! The Rust API follows semantic versioning. The output schema is
+//! versioned separately via [`SCHEMA_VERSION`]; field additions are
+//! non-breaking, field semantics or renames bump the version.
 
 mod debug;
 mod embedded_sources;
@@ -144,10 +157,10 @@ pub fn known_metrics() -> (&'static [&'static str], &'static [&'static str]) {
 /// Schema version of the public output shape.
 ///
 /// Bumps on any field rename or semantic change. Field additions are
-/// non-breaking and do not bump this version. The on-disk cache
-/// (`filefacts::cache`) carries a distinct schema version that *is*
-/// bumped on every addition so cached bytes from old binaries are not
-/// silently reused.
+/// non-breaking and do not bump this version. The on-disk cache carries a
+/// distinct [`cache::CACHE_SCHEMA_VERSION`], bumped only for breaking
+/// changes to its format; entries from older builds are never reused
+/// because every cache key includes a hash of filefacts' source.
 ///
 /// **v5** — the `Imports`, `Exports`, `Functions`, and `Ast` peer
 /// types are collapsed into a single tagged [`Symbol`] enum. The
@@ -177,14 +190,18 @@ pub const SCHEMA_VERSION: &str = "8";
 
 /// A file with its bytes and lazily-computed metadata views.
 ///
-/// `ParsedFile` is the central type. Construct one with [`open`] (no
-/// filesystem access) or [`from_path`] (reads the file from disk).
+/// `ParsedFile` is the central type. Construct one with [`open`] or its
+/// path-aware variants; [`from_path`] reads the bytes from disk first.
 ///
 /// Views are computed on first access and cached for the lifetime of
-/// the `ParsedFile`. Typed fact families such as strings, sections,
-/// symbols, AST projections, and recoverable errors live in their own
-/// views; [`values`] is only for residual format structure that does
-/// not already have a typed home.
+/// the `ParsedFile`. That first access may spawn rizin, and reads and
+/// writes the disk cache when the host enabled it; see the crate-level
+/// "Side effects" section.
+///
+/// Typed fact families such as strings, sections, symbols, AST
+/// projections, and recoverable errors live in their own views;
+/// [`values`] is only for residual format structure that does not
+/// already have a typed home.
 ///
 /// [`values`]: ParsedFile::values
 #[must_use = "ParsedFile owns the extraction pipeline; dropping it discards every view"]
@@ -503,7 +520,7 @@ impl<'a> ParsedFile<'a> {
     /// not installed (the no-rizin result is correct for that
     /// environment, and keyed as such).
     pub fn rizin_recovery_incomplete(&self) -> bool {
-        self.metrics().get("binary.rizin_incomplete").is_some()
+        rizin_incomplete(self.metrics())
     }
 
     /// Iterate every symbol name across the declaration kinds
@@ -553,29 +570,23 @@ impl<'a> ParsedFile<'a> {
                 if !formats::source::supports(self.fileid.file_type()) {
                     return None;
                 }
-                Some(
-                    formats::source::TreeCache::parse(
-                        self.bytes,
-                        self.fileid.file_type(),
-                        self.cancellation,
-                    )
-                    .unwrap_or_else(|e| {
-                        formats::source::TreeParse::Unavailable(
-                            formats::source::TreeSitterDiagnostic::parse_failed(e.to_string()),
-                        )
-                    }),
-                )
+                Some(formats::source::TreeCache::parse(
+                    self.bytes,
+                    self.fileid.file_type(),
+                    self.cancellation,
+                ))
             })
             .as_ref()
     }
 
     /// Number of times this `ParsedFile` ran its extraction pipeline.
     ///
-    /// `0` before any view has been requested; `1` after any one of
-    /// `values()`, `strings()`, `metrics()`, `ast()` has been called.
-    /// A correctly-implemented `ParsedFile` never reports a higher
-    /// count, regardless of which combination of views the caller
-    /// reads.
+    /// `0` before any view has been requested, and stays `0` when the
+    /// views were served from the disk cache; otherwise `1` after the
+    /// first call to any extraction view (`values()`, `text()`,
+    /// `metrics()`, `symbols()`, …). A correctly-implemented `ParsedFile`
+    /// never reports a higher count, regardless of which combination of
+    /// views the caller reads.
     pub fn parse_count(&self) -> u32 {
         self.parse_count.load(Ordering::Acquire)
     }
@@ -616,7 +627,7 @@ impl<'a> ParsedFile<'a> {
             let snapshot: Option<ExtractedSnapshot> =
                 cache::open_with_cache(self.bytes, &variant, |_| {
                     let extracted = self.run_pipeline();
-                    let transient = extracted.metrics.get("binary.rizin_incomplete").is_some();
+                    let transient = rizin_incomplete(&extracted.metrics);
                     let snapshot = ExtractedSnapshot::from(extracted);
                     if transient {
                         Some(cache::Computed::Transient(snapshot))
@@ -641,14 +652,11 @@ impl<'a> ParsedFile<'a> {
         self.parse_count.fetch_add(1, Ordering::AcqRel);
         let mut extracted = run_extraction(
             self.bytes,
-            self.fileid.file_type(),
-            self.fileid.extension_mismatch(),
-            self.fileid.extension_mismatch_transition(),
+            &self.fileid,
             self.basename.as_deref(),
             self.tree_cache(),
             self.tree_parse()
                 .and_then(formats::source::TreeParse::diagnostic),
-            self.fileid.xor_pe_key(),
         );
         if let Some(parsed) = self.cfml_parse() {
             for symbol in parsed.symbols.iter() {
@@ -657,6 +665,15 @@ impl<'a> ParsedFile<'a> {
         }
         extracted
     }
+}
+
+/// Whether a rizin run that should have recovered symbols did not complete.
+/// Both the public predicate and the don't-persist decision read it here, so
+/// they cannot disagree; `metric!` checks the key against the catalog.
+fn rizin_incomplete(metrics: &Metrics) -> bool {
+    metrics
+        .get(metric!("binary.rizin_incomplete").as_str())
+        .is_some()
 }
 
 fn extraction_cache_variant(
@@ -692,14 +709,15 @@ fn extraction_cache_variant(
 
 fn run_extraction(
     bytes: &[u8],
-    file_type: FileType,
-    extension_mismatch: bool,
-    mismatch_transition: Option<(&'static str, &'static str)>,
+    fileid: &FileId,
     basename: Option<&str>,
     tree_cache: Option<&formats::source::TreeCache<'_>>,
     tree_diagnostic: Option<&formats::source::TreeSitterDiagnostic>,
-    xor_pe_key: Option<stng::RepeatingXorKey>,
 ) -> Extracted {
+    let file_type = fileid.file_type();
+    let extension_mismatch = fileid.extension_mismatch();
+    let mismatch_transition = fileid.extension_mismatch_transition();
+    let xor_pe_key = fileid.xor_pe_key();
     let mut values = Values::new();
     let mut strings = output::Strings::new();
     let mut metrics = Metrics::new();
@@ -708,6 +726,9 @@ fn run_extraction(
     let mut image_end: Option<u64> = None;
     let mut symbols = Symbols::new();
     let mut errors = Errors::new();
+    if fileid.source() == fileid::DetectionSource::Failed {
+        errors.record_panic(Stage::Identify, "file identification panicked");
+    }
     if let Some(name) = basename {
         values.insert("file.basename", serde_json::Value::String(name.to_string()));
         values.insert(
@@ -833,11 +854,6 @@ fn run_extraction(
     }
 }
 
-/// Emit `imports.count`, `exports.count`, `functions.count`,
-/// and `binds.count` (calls/members are covered by the byte-identical
-/// `ast.call_count`/`ast.member_count`; identifier occurrence counts come
-/// from `identifier_metrics` — `identifiers.count`/`identifiers.unique`)
-/// for whichever kinds have at least one entry.
 /// Whether an exported symbol represents a callable/public API rather than a
 /// compiler or loader artifact.
 ///
@@ -857,6 +873,12 @@ fn is_api_export(name: &str) -> bool {
         || bare.starts_with("ZTT"))
 }
 
+/// Emit `imports.count`, `exports.count`, `exports.api_count`,
+/// `functions.count`, and `binds.count` (calls/members are covered by the
+/// byte-identical `ast.call_count`/`ast.member_count`; identifier
+/// occurrence counts come from `identifier_metrics` —
+/// `identifiers.count`/`identifiers.unique`) for whichever kinds have at
+/// least one entry.
 fn emit_symbol_kind_counts(symbols: &Symbols, metrics: &mut Metrics) {
     let mut imports = 0u64;
     let mut exports = 0u64;
@@ -934,32 +956,12 @@ fn is_sentence_like(text: &str) -> bool {
 /// extractor returns `Err` and we have to synthesise a fallback
 /// error record. Stage values are stable across releases.
 fn stage_for(file_type: FileType) -> Stage {
+    // Every tree-sitter language, so a new grammar needs no entry here. JCL
+    // has no grammar but has always reported as source.
+    if formats::source::supports(file_type) || file_type == FileType::Jcl {
+        return Stage::SourceExtract;
+    }
     match file_type {
-        FileType::JavaScript
-        | FileType::TypeScript
-        | FileType::Python
-        | FileType::Go
-        | FileType::Rust
-        | FileType::Java
-        | FileType::Shell
-        | FileType::Php
-        | FileType::Ruby
-        | FileType::Lua
-        | FileType::CSharp
-        | FileType::C
-        | FileType::Scala
-        | FileType::ObjectiveC
-        | FileType::Kotlin
-        | FileType::Swift
-        | FileType::PowerShell
-        | FileType::Perl
-        | FileType::Groovy
-        | FileType::Zig
-        | FileType::Elixir
-        | FileType::Clojure
-        | FileType::Batch
-        | FileType::Jcl
-        | FileType::Makefile => Stage::SourceExtract,
         FileType::Pe => Stage::PeParse,
         FileType::Elf => Stage::ElfParse,
         FileType::MachO => Stage::MachoParse,
@@ -972,6 +974,8 @@ fn stage_for(file_type: FileType) -> Stage {
         FileType::JavaClass => Stage::ClassParse,
         FileType::Pdf => Stage::PdfParse,
         FileType::Rpm => Stage::RpmParse,
+        FileType::Wasm => Stage::WasmParse,
+        FileType::SevenZ => Stage::SevenZipParse,
         _ => Stage::FormatExtract,
     }
 }
@@ -1107,6 +1111,10 @@ fn is_well_known_section_name(name: &str) -> bool {
     )
 }
 
+/// Cap on located high-entropy string spans. The count metric is exact; the
+/// spans are a bounded sample for localisation.
+const MAX_STRING_SPANS: usize = 64;
+
 /// Cross-format `binary.*` aggregates derived from sections + strings +
 /// raw bytes. Keeps the keys cleave's trait engine has used historically
 /// without each format extractor re-deriving the same logic.
@@ -1120,19 +1128,8 @@ fn is_well_known_section_name(name: &str) -> bool {
 ///   binary spreads across `.text` (~6), `.rodata` (~5), `.data` (~3).
 /// - `binary.code_to_data_ratio`, `binary.largest_section_ratio` —
 ///   simple structural ratios over `Sections.file_size`.
-/// - `binary.has_overlay`, `binary.overlay_size`,
-///   `binary.overlay_ratio`, `binary.overlay_entropy` — bytes beyond
-///   the last on-disk section extent and beyond `image_end` (PE installer
-///   droppers, ELF self-extractors). `image_end` is the format's own end
-///   of image where that lies past the sections: Mach-O's section-less
-///   `__LINKEDIT` segment (symbols, dyld info, code signature) and the
-///   ELF section-header table would otherwise read as an overlay on
-///   every binary. PE passes `None`: its overlay stays "past the last
-///   section's raw data", Authenticode table included.
-/// Cap on located high-entropy string spans. The count metric is exact; the
-/// spans are a bounded sample for localisation.
-const MAX_STRING_SPANS: usize = 64;
-
+///
+/// The overlay keys come from [`emit_binary_overlay`].
 fn emit_binary_aggregates(
     sections: &Sections,
     strings: &output::Strings,
@@ -1274,6 +1271,14 @@ fn emit_binary_aggregates(
     }
 }
 
+/// `binary.has_overlay`, `binary.overlay_size`, `binary.overlay_ratio`,
+/// `binary.overlay_entropy` — bytes beyond the last on-disk section extent
+/// and beyond `image_end` (PE installer droppers, ELF self-extractors).
+/// `image_end` is the format's own end of image where that lies past the
+/// sections: Mach-O's section-less `__LINKEDIT` segment (symbols, dyld
+/// info, code signature) and the ELF section-header table would otherwise
+/// read as an overlay on every binary. PE passes `None`: its overlay stays
+/// "past the last section's raw data", Authenticode table included.
 fn emit_binary_overlay(
     sections: &Sections,
     bytes: &[u8],
@@ -1311,6 +1316,30 @@ fn emit_binary_overlay(
     }
 }
 
+impl<'a> ParsedFile<'a> {
+    fn new(bytes: &'a [u8], fileid: FileId, basename: Option<String>) -> Self {
+        Self {
+            bytes,
+            fileid,
+            basename,
+            tree_parse: OnceLock::new(),
+            flow: OnceLock::new(),
+            cfml_parse: OnceLock::new(),
+            cancellation: None,
+            extracted: OnceLock::new(),
+            parse_count: AtomicU32::new(0),
+        }
+    }
+}
+
+/// The basename surfaced as `file.basename`. Lossy rather than dropped: a
+/// name that is not valid UTF-8 is common among samples, and losing it would
+/// hide `file.basename` / `file.stem` from exactly those files.
+fn basename_of(path: &Path) -> Option<String> {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
 /// Open `bytes` for metadata extraction. The returned [`ParsedFile`]
 /// borrows the slice for its lifetime.
 ///
@@ -1318,24 +1347,15 @@ fn emit_binary_overlay(
 /// shebang, lightweight pattern matching). Use [`open_with_path`] when
 /// the file's path / extension should also inform the identification.
 ///
-/// Returns [`Error::UnknownFormat`] if no format could be identified.
-/// In rare practice this is informative — `open` succeeds for nearly
-/// every byte slice because the file-identifier falls back to
-/// "unknown" rather than failing — but the public contract is `Result`
-/// for future tightening.
+/// Currently always `Ok`: identification falls back to
+/// [`FileType::Unknown`] rather than failing. The `Result` leaves room
+/// for a stricter contract without a breaking change.
+///
+/// No filesystem access happens here; the first view access may use the
+/// disk cache (see the crate-level "Side effects" section).
 pub fn open(bytes: &[u8]) -> Result<ParsedFile<'_>, Error> {
     let fileid = FileId::from_bytes(bytes);
-    Ok(ParsedFile {
-        bytes,
-        fileid,
-        basename: None,
-        tree_parse: OnceLock::new(),
-        flow: OnceLock::new(),
-        cfml_parse: OnceLock::new(),
-        cancellation: None,
-        extracted: OnceLock::new(),
-        parse_count: AtomicU32::new(0),
-    })
+    Ok(ParsedFile::new(bytes, fileid, None))
 }
 
 /// Open `bytes` with the original path supplied for identification.
@@ -1346,21 +1366,7 @@ pub fn open(bytes: &[u8]) -> Result<ParsedFile<'_>, Error> {
 /// path when you have it.
 pub fn open_with_path<'a>(path: &Path, bytes: &'a [u8]) -> Result<ParsedFile<'a>, Error> {
     let fileid = FileId::from_path_and_bytes(path, bytes);
-    let basename = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(str::to_string);
-    Ok(ParsedFile {
-        bytes,
-        fileid,
-        basename,
-        tree_parse: OnceLock::new(),
-        flow: OnceLock::new(),
-        cfml_parse: OnceLock::new(),
-        cancellation: None,
-        extracted: OnceLock::new(),
-        parse_count: AtomicU32::new(0),
-    })
+    Ok(ParsedFile::new(bytes, fileid, basename_of(path)))
 }
 
 /// Open `bytes` with a [`FileId`] the caller already computed via
@@ -1373,21 +1379,7 @@ pub fn open_with_fileid<'a>(
     bytes: &'a [u8],
     fileid: FileId,
 ) -> Result<ParsedFile<'a>, Error> {
-    let basename = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(str::to_string);
-    Ok(ParsedFile {
-        bytes,
-        fileid,
-        basename,
-        tree_parse: OnceLock::new(),
-        flow: OnceLock::new(),
-        cfml_parse: OnceLock::new(),
-        cancellation: None,
-        extracted: OnceLock::new(),
-        parse_count: AtomicU32::new(0),
-    })
+    Ok(ParsedFile::new(bytes, fileid, basename_of(path)))
 }
 
 /// Open `bytes` forcing a caller-known [`FileType`], bypassing content
@@ -1410,21 +1402,11 @@ pub fn open_as<'a>(
     bytes: &'a [u8],
     file_type: FileType,
 ) -> Result<ParsedFile<'a>, Error> {
-    let basename = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(str::to_string);
-    Ok(ParsedFile {
+    Ok(ParsedFile::new(
         bytes,
-        fileid: FileId::forced(file_type),
-        basename,
-        tree_parse: OnceLock::new(),
-        flow: OnceLock::new(),
-        cfml_parse: OnceLock::new(),
-        cancellation: None,
-        extracted: OnceLock::new(),
-        parse_count: AtomicU32::new(0),
-    })
+        FileId::forced(file_type),
+        basename_of(path),
+    ))
 }
 
 /// Read a file from disk, identify it, and return its bytes paired
@@ -1503,6 +1485,34 @@ fn file_type_for_language(name: &str) -> Option<FileType> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_identification_is_recorded_as_an_error() {
+        let fileid = FileId {
+            source: fileid::DetectionSource::Failed,
+            ..FileId::forced(FileType::Unknown)
+        };
+        let parsed = ParsedFile::new(b"\x00\x01", fileid, None);
+        let entry = parsed.errors().iter().next().expect("recorded");
+        assert_eq!(entry.stage, Stage::Identify);
+        assert_eq!(entry.kind, ErrorKind::Panic);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_basename_is_kept_lossily() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"dropper-\xff.sh"));
+        let parsed = open_with_path(path, b"#!/bin/sh\necho hi\n").unwrap();
+        assert_eq!(
+            parsed
+                .values()
+                .get("file.basename")
+                .and_then(|v| v.as_str()),
+            Some("dropper-\u{fffd}.sh")
+        );
+    }
 
     #[test]
     fn validate_source_query_accepts_every_parser_language() {
@@ -1586,7 +1596,43 @@ mod tests {
         assert_ne!(key(Some("")), key(None));
         assert_eq!(key(Some("build.rs")), key(Some("build.rs")));
     }
-    use super::*;
+
+    /// `stage_for` derives its source branch from the grammar table; it must
+    /// still cover every language it listed by hand, JCL included.
+    #[test]
+    fn stage_for_tags_every_source_language() {
+        for file_type in [
+            FileType::JavaScript,
+            FileType::TypeScript,
+            FileType::Python,
+            FileType::Go,
+            FileType::Rust,
+            FileType::Java,
+            FileType::Shell,
+            FileType::Php,
+            FileType::Ruby,
+            FileType::Lua,
+            FileType::CSharp,
+            FileType::C,
+            FileType::Scala,
+            FileType::ObjectiveC,
+            FileType::Kotlin,
+            FileType::Swift,
+            FileType::PowerShell,
+            FileType::Perl,
+            FileType::Groovy,
+            FileType::Zig,
+            FileType::Elixir,
+            FileType::Clojure,
+            FileType::Batch,
+            FileType::Jcl,
+            FileType::Makefile,
+        ] {
+            assert_eq!(stage_for(file_type), Stage::SourceExtract, "{file_type:?}");
+        }
+        assert_eq!(stage_for(FileType::Vbs), Stage::FormatExtract);
+        assert_eq!(stage_for(FileType::Pe), Stage::PeParse);
+    }
 
     #[test]
     fn open_classifies_text() {

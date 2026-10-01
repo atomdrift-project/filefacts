@@ -56,6 +56,7 @@
 
 use crate::metric;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
+use std::collections::{HashSet, VecDeque};
 
 use crate::error::Error;
 use crate::formats::common::bytes_at::{u16_le, u32_be, u32_le};
@@ -1121,7 +1122,7 @@ impl Entry {
 
 struct Walk {
     entries: Vec<Entry>,
-    visited: Vec<(u32, u32)>,
+    visited: HashSet<(u32, u32)>,
     rock_ridge: bool,
     apple: bool,
     truncated: bool,
@@ -1132,7 +1133,7 @@ impl Walk {
     fn new() -> Self {
         Self {
             entries: Vec::new(),
-            visited: Vec::new(),
+            visited: HashSet::new(),
             rock_ridge: false,
             apple: false,
             truncated: false,
@@ -1144,11 +1145,8 @@ impl Walk {
         // Breadth-first with an explicit queue: an ISO directory tree is
         // untrusted input and can be cyclic, so recursion is not an option
         // and `visited` is keyed on the extent, not the path.
-        let mut queue = vec![(root_lba, root_len, String::new(), 0_u32)];
-        let mut head = 0;
-        while head < queue.len() {
-            let (lba, len, prefix, depth) = queue[head].clone();
-            head += 1;
+        let mut queue = VecDeque::from([(root_lba, root_len, String::new(), 0_u32)]);
+        while let Some((lba, len, prefix, depth)) = queue.pop_front() {
             if self.dirs_walked >= MAX_DIRS || self.entries.len() >= MAX_ENTRIES {
                 self.truncated = true;
                 return;
@@ -1157,10 +1155,9 @@ impl Walk {
                 self.truncated = true;
                 continue;
             }
-            if self.visited.contains(&(lba, len)) {
+            if !self.visited.insert((lba, len)) {
                 continue;
             }
-            self.visited.push((lba, len));
             self.dirs_walked += 1;
 
             let start = (lba as usize).saturating_mul(SECTOR);
@@ -1171,7 +1168,7 @@ impl Walk {
             };
             for e in self.parse_extent(bytes, extent, &prefix, depth, ns) {
                 if e.is_dir() {
-                    queue.push((e.lba, e.size, e.path.clone(), depth + 1));
+                    queue.push_back((e.lba, e.size, e.path.clone(), depth + 1));
                 }
                 self.entries.push(e);
             }
@@ -1966,7 +1963,6 @@ fn emit_members(files: &[File], archive_members: &mut Vec<ArchiveMember>) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -2143,6 +2139,30 @@ mod tests {
             ("joliet", "invoice.exe".to_string()),
         ];
         assert!(divergent_names(&different));
+    }
+
+    /// A directory record pointing back at its own extent makes the tree
+    /// cyclic. The walk visits each extent once and terminates.
+    #[test]
+    fn cyclic_directory_is_walked_once() {
+        let root_lba = 1_u32;
+        let mut rec = vec![0u8; 34];
+        rec[0] = 34; // record length
+        rec[2..6].copy_from_slice(&root_lba.to_le_bytes());
+        rec[10..14].copy_from_slice(&(SECTOR as u32).to_le_bytes());
+        rec[25] = 0x02; // directory
+        rec[32] = 1; // name length
+        rec[33] = b'D';
+        let mut bytes = vec![0u8; 2 * SECTOR];
+        bytes[SECTOR..SECTOR + rec.len()].copy_from_slice(&rec);
+
+        let mut walk = Walk::new();
+        walk.run(&bytes, root_lba, SECTOR as u32, Namespace::Iso9660);
+        assert_eq!(walk.dirs_walked, 1);
+        assert_eq!(walk.visited.len(), 1);
+        let paths: Vec<&str> = walk.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["/D"]);
+        assert!(!walk.truncated);
     }
 
     #[test]

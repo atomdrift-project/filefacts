@@ -55,19 +55,6 @@ pub(crate) fn detect_from_path(path: &Path) -> Option<FileType> {
     if ends_with_ci(p, b".xbps") {
         return Some(FileType::Xbps);
     }
-    // Checksum files are commonly named "<artifact>.tar.gz.sha256sum" and
-    // signatures "<artifact>.tar.gz.sig": the archive suffix is in the middle of
-    // the name, so these must be settled before the `.tar.*` fallbacks below.
-    if ends_with_ci(p, b".sha256sum")
-        || ends_with_ci(p, b".sha512sum")
-        || ends_with_ci(p, b".sha1sum")
-        || ends_with_ci(p, b".md5sum")
-    {
-        return Some(FileType::Text);
-    }
-    if ends_with_ci(p, b".sig") || ends_with_ci(p, b".asc") {
-        return Some(FileType::PgpSignature);
-    }
     if ends_with_ci(p, b".tar.zst") || ends_with_ci(p, b".tzst") {
         return Some(FileType::TarZst);
     }
@@ -183,8 +170,8 @@ pub(crate) fn is_filename_match(path: &Path) -> bool {
     detect_from_filename(path).is_some() || is_github_workflow(&path.to_string_lossy())
 }
 
-/// `true` for a GitHub Actions workflow file: a `.yml`/`.yaml` under a
-/// `.github/workflows/` directory (either path separator).
+/// `true` for a mysqltest script, include or result file under a
+/// `mysql-test/` directory (either path separator).
 fn is_mysqltest_file(path_str: &str) -> bool {
     let p = path_str.replace('\\', "/");
     (p.starts_with("mysql-test/") || p.contains("/mysql-test/"))
@@ -193,6 +180,8 @@ fn is_mysqltest_file(path_str: &str) -> bool {
             .any(|ext| ends_with_ci(p.as_bytes(), ext.as_bytes()))
 }
 
+/// `true` for a GitHub Actions workflow file: a `.yml`/`.yaml` under a
+/// `.github/workflows/` directory (either path separator).
 fn is_github_workflow(path_str: &str) -> bool {
     (path_str.contains(".github/workflows/") || path_str.contains(".github\\workflows\\"))
         && (ends_with_ci(path_str.as_bytes(), b".yml")
@@ -202,24 +191,12 @@ fn is_github_workflow(path_str: &str) -> bool {
 /// Returns true if the path has a data/config extension that should not be
 /// sent through content heuristics.
 pub(crate) fn is_data_format(path: &Path) -> bool {
-    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-        return false;
-    };
-
-    // Use a small stack buffer to lowercase without allocation
-    let mut buf = [0u8; 16];
-    if ext.len() >= buf.len() {
-        return false;
-    }
-    buf[..ext.len()].copy_from_slice(ext.as_bytes());
-    buf[..ext.len()].make_ascii_lowercase();
-    // Input was valid UTF-8; ASCII lowering preserves that invariant.
-    let Ok(ext_lower) = std::str::from_utf8(&buf[..ext.len()]) else {
+    let Some(ext) = lowercase_ext(path) else {
         return false;
     };
 
     matches!(
-        ext_lower,
+        &*ext,
         "yaml"
             | "yml"
             | "json"
@@ -374,21 +351,9 @@ fn detect_from_filename(path: &Path) -> Option<FileType> {
 
 /// Detect from single file extension.
 fn detect_from_extension(path: &Path) -> Option<FileType> {
-    let ext = path.extension()?.to_str()?;
+    let ext = lowercase_ext(path)?;
 
-    // Stack-allocated lowercase (no allocation for extensions < 16 chars)
-    let mut buf = [0u8; 16];
-    if ext.len() >= buf.len() {
-        return None;
-    }
-    buf[..ext.len()].copy_from_slice(ext.as_bytes());
-    buf[..ext.len()].make_ascii_lowercase();
-    // Input was valid UTF-8; ASCII lowering preserves that invariant.
-    let Ok(ext_lower) = std::str::from_utf8(&buf[..ext.len()]) else {
-        return None;
-    };
-
-    match ext_lower {
+    match &*ext {
         "sh" | "bash" | "ksh" | "zsh" | "csh" | "tcsh" | "dash" | "fish" | "command" | "ebuild"
         | "eclass" => Some(FileType::Shell),
         "py" | "pyw" | "pyi" | "pth" => Some(FileType::Python),
@@ -539,8 +504,7 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         | "xlam" | "ppam" | "potx" | "potm" | "ppsx" | "ppsm" | "sldx" | "sldm" => {
             Some(FileType::Ooxml)
         }
-        "odt" | "ods" | "odp" | "odg" | "odf" | "ott" | "ots" | "otp" | "odm" | "oth" | "otg"
-        | "odb" | "odc" | "odi" => Some(FileType::Odf),
+        ext if is_odf_extension(ext) => Some(FileType::Odf),
         "exe" | "dll" | "sys" | "scr" | "cpl" | "ocx" | "drv" | "efi" | "pyd" => Some(FileType::Pe),
         "so" | "elf" | "ko" => Some(FileType::Elf),
         "dylib" | "bundle" | "macho" => Some(FileType::MachO),
@@ -641,6 +605,57 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
     }
 }
 
+/// OpenDocument extensions: the document types, their templates, master
+/// documents, databases, charts and images.
+const ODF_EXTENSIONS: &[&str] = &[
+    "odt", "ods", "odp", "odg", "odf", "ott", "ots", "otp", "odm", "oth", "otg", "odb", "odc",
+    "odi",
+];
+
+/// Whether lowercase `ext` is an OpenDocument extension. Shared with the zip
+/// classifier, which trusts the name when no member says otherwise.
+pub(super) fn is_odf_extension(ext: &str) -> bool {
+    ODF_EXTENSIONS.contains(&ext)
+}
+
+/// A path's extension, ASCII-lowercased into a stack buffer so that matching
+/// it against the tables here does not allocate.
+pub(super) struct LowercaseExt {
+    buf: [u8; LowercaseExt::MAX_LEN],
+    len: usize,
+}
+
+impl LowercaseExt {
+    /// Longest extension kept. Every extension the tables name is shorter, so
+    /// a longer one is treated as absent.
+    const MAX_LEN: usize = 16;
+}
+
+impl std::ops::Deref for LowercaseExt {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        // Lowercasing ASCII bytes keeps valid UTF-8 valid.
+        std::str::from_utf8(&self.buf[..self.len]).unwrap_or_default()
+    }
+}
+
+/// `path`'s extension in lowercase. `None` when there is none, it is not
+/// UTF-8, or it is longer than [`LowercaseExt::MAX_LEN`].
+pub(super) fn lowercase_ext(path: &Path) -> Option<LowercaseExt> {
+    let ext = path.extension()?.to_str()?;
+    if ext.len() > LowercaseExt::MAX_LEN {
+        return None;
+    }
+    let mut buf = [0; LowercaseExt::MAX_LEN];
+    buf[..ext.len()].copy_from_slice(ext.as_bytes());
+    buf.make_ascii_lowercase();
+    Some(LowercaseExt {
+        buf,
+        len: ext.len(),
+    })
+}
+
 fn has_versioned_so_suffix(path: &str) -> bool {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let bytes = name.as_bytes();
@@ -665,7 +680,6 @@ fn ends_with_ci(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -1210,5 +1224,66 @@ mod tests {
             Some(FileType::JavaScript),
             "license-checker.js must stay JavaScript"
         );
+    }
+
+    /// Checksums and signatures published beside a release name the artifact
+    /// first. Every multi-part rule above matches a suffix, so the archive
+    /// or library name in the middle never wins over the sidecar's own
+    /// extension.
+    #[test]
+    fn release_sidecars_keep_their_own_type() {
+        for name in [
+            "jdk-21.tar.gz.sig",
+            "zlib-1.3.tar.zst.asc",
+            "rails-7.0.4.gem.sig",
+            "app.jar.asc",
+            "libssl.so.3.sig",
+            "SHA256SUMS.SIGN",
+        ] {
+            assert_eq!(
+                detect_from_path(Path::new(name)),
+                Some(FileType::PgpSignature),
+                "{name}"
+            );
+        }
+        for name in [
+            "jdk-21.tar.gz.sha256sum",
+            "zlib-1.3.tar.zst.SHA512SUM",
+            "src.tar.sha1sum",
+            "app.jar.md5sum",
+            "libssl.so.3.sha256",
+        ] {
+            assert_eq!(
+                detect_from_path(Path::new(name)),
+                Some(FileType::Text),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn odf_extensions_are_shared_with_the_zip_classifier() {
+        for ext in ["odt", "ODS", "otp", "odi"] {
+            let name = format!("report.{ext}");
+            assert_eq!(
+                detect_from_path(Path::new(&name)),
+                Some(FileType::Odf),
+                "{name}"
+            );
+        }
+        assert!(!is_odf_extension("docx"));
+    }
+
+    #[test]
+    fn lowercase_ext_fits_the_stack_buffer() {
+        let ext = |name: &str| lowercase_ext(Path::new(name)).map(|e| e.to_string());
+        assert_eq!(ext("Setup.EXE").as_deref(), Some("exe"));
+        assert_eq!(
+            ext("x.ABCDEFGHIJKLMNOP").as_deref(),
+            Some("abcdefghijklmnop")
+        );
+        assert_eq!(ext("x.abcdefghijklmnopq"), None);
+        assert_eq!(ext("Makefile"), None);
+        assert_eq!(ext(".npmrc"), None);
     }
 }

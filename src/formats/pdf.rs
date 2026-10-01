@@ -34,7 +34,7 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
 use crate::formats::common::{XorScan, extract_binary_strings, hex_nibble};
-use crate::output::{Metrics, Strings, Values};
+use crate::output::{ErrorKind, Errors, Metrics, Stage, Strings, Values};
 
 /// Cap on the snippet text we surface per action. Long JavaScript
 /// payloads exist in malicious PDFs but the *first* few hundred
@@ -49,6 +49,15 @@ const SNIPPET_BYTES: usize = 200;
 /// and surface a metric so trait rules can spot truncation.
 const MAX_DICT_REGIONS: usize = 50_000;
 
+/// Cap on one inflated FlateDecode stream.
+const MAX_INFLATED: usize = 1 << 20;
+
+/// Cap on the inflated bytes kept across every `/Type /ObjStm` stream. Each
+/// is already held to [`MAX_INFLATED`], but every one is kept for the
+/// type-count and action scans, so without a running total a file with
+/// thousands of object streams pins gigabytes.
+const MAX_OBJSTM_TOTAL: usize = 16 << 20;
+
 /// Upper bound on how many form-field rects we run the O(n²)
 /// overlap check across. Real PDFs hold a handful per page; with
 /// thousands of widgets the pairwise pass dominates parse time.
@@ -59,6 +68,7 @@ pub(super) fn extract(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
+    errors: &mut Errors,
 ) -> Result<(), Error> {
     extract_binary_strings(bytes, strings, XorScan::No);
 
@@ -179,7 +189,18 @@ pub(super) fn extract(
     // annotations, no pages and no actions in it. Decode them once here and
     // count against both views.
     let dict_regions = collect_dict_regions(bytes);
-    let objstm_text = decode_object_streams(bytes, &dict_regions);
+    let object_streams = decode_object_streams(bytes, &dict_regions, MAX_OBJSTM_TOTAL);
+    if object_streams.skipped > 0 {
+        errors.record(
+            ErrorKind::Truncated,
+            Stage::PdfParse,
+            format!(
+                "{} object stream(s) not decoded: the {MAX_OBJSTM_TOTAL}-byte budget was spent",
+                object_streams.skipped
+            ),
+        );
+    }
+    let objstm_text = object_streams.decoded;
 
     let counts: &[(&str, &str, crate::MetricKey)] = &[
         ("page_count", "/Page", metric!("pdf.page_count")),
@@ -459,7 +480,7 @@ pub(super) fn extract(
     // pdf::parser. Now reachable through the metric-fold adapter
     // (`merge_filefacts_metrics`) so trait rules using `field: pdf.X`
     // resolve against filefacts' flat metric map.
-    let leading_bytes = bytes.windows(5).position(|w| w == b"%PDF-").unwrap_or(0);
+    let leading_bytes = memchr::memmem::find(bytes, b"%PDF-").unwrap_or(0);
     metrics.insert(
         metric!("pdf.leading_bytes_before_header"),
         leading_bytes as f64,
@@ -496,7 +517,7 @@ pub(super) fn extract(
 /// document version. The full count is exposed as
 /// `pdf.header_count`.
 fn parse_first_header(bytes: &[u8]) -> Option<String> {
-    let pos = bytes.windows(5).position(|w| w == b"%PDF-")?;
+    let pos = memchr::memmem::find(bytes, b"%PDF-")?;
     let start = pos + 5;
     let end = (start + 8).min(bytes.len());
     let tail = &bytes[start..end];
@@ -554,7 +575,7 @@ fn info_dict(bytes: &[u8], values: &mut Values) {
 fn find_info_value(bytes: &[u8], key: &[u8]) -> Option<String> {
     let mut cursor = 0;
     while cursor + key.len() <= bytes.len() {
-        let rel = bytes[cursor..].windows(key.len()).position(|w| w == key)?;
+        let rel = memchr::memmem::find(&bytes[cursor..], key)?;
         let pos = cursor + rel;
         let after_key = pos + key.len();
         let next = *bytes.get(after_key)?;
@@ -967,10 +988,7 @@ fn scan_actions(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<JsonValue> {
         };
         for (needle, kind) in KINDS {
             let mut pos = 0;
-            while let Some(rel) = region[pos..]
-                .windows(needle.len())
-                .position(|w| w == *needle)
-            {
+            while let Some(rel) = memchr::memmem::find(&region[pos..], needle) {
                 let abs = pos + rel;
                 let next = abs + needle.len();
                 // Reject `/JS` matching `/JSON` or `/JavaScript`.
@@ -1027,10 +1045,25 @@ fn objstm_actions(decoded: &[(Option<u32>, Vec<u8>)]) -> Vec<JsonValue> {
     out
 }
 
-/// Inflate every `/Type /ObjStm` stream, returning each carrier's object id
-/// alongside the objects it holds.
-fn decode_object_streams(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<(Option<u32>, Vec<u8>)> {
-    let mut out = Vec::new();
+/// Inflated object streams, each carrier's object id alongside the objects it
+/// holds.
+struct ObjectStreams {
+    decoded: Vec<(Option<u32>, Vec<u8>)>,
+    /// Object streams left undecoded once the budget was spent.
+    skipped: usize,
+}
+
+/// Inflate every `/Type /ObjStm` stream, keeping at most `budget` inflated
+/// bytes across all of them ([`MAX_OBJSTM_TOTAL`] outside tests).
+fn decode_object_streams(
+    bytes: &[u8],
+    dict_regions: &[DictRegion],
+    mut budget: usize,
+) -> ObjectStreams {
+    let mut out = ObjectStreams {
+        decoded: Vec::new(),
+        skipped: 0,
+    };
     for region in dict_regions {
         let Some((s, e)) = region.stream_range else {
             continue;
@@ -1040,8 +1073,13 @@ fn decode_object_streams(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<(Opti
         {
             continue;
         }
-        if let Some(decoded) = inflate(&bytes[s..e]) {
-            out.push((region.obj_id, decoded));
+        if budget == 0 {
+            out.skipped += 1;
+            continue;
+        }
+        if let Some(decoded) = inflate_capped(&bytes[s..e], budget.min(MAX_INFLATED)) {
+            budget -= decoded.len();
+            out.decoded.push((region.obj_id, decoded));
         }
     }
     out
@@ -1083,7 +1121,7 @@ fn scan_javascript_payloads(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<Js
         }
         let dict = &bytes[start..end];
         let mut pos = 0;
-        while let Some(rel) = dict[pos..].windows(3).position(|w| w == b"/JS") {
+        while let Some(rel) = memchr::memmem::find(&dict[pos..], b"/JS") {
             let abs = pos + rel;
             let next = abs + 3;
             // Reject /JSON, /JavaScript (the *name*, not the key form).
@@ -1251,7 +1289,7 @@ fn resolve_indirect_js(
 fn read_object_filters(dict: &[u8]) -> Vec<String> {
     let mut p = 0;
     while p + 7 <= dict.len() {
-        let Some(rel) = dict[p..].windows(7).position(|w| w == b"/Filter") else {
+        let Some(rel) = memchr::memmem::find(&dict[p..], b"/Filter") else {
             return Vec::new();
         };
         let after = p + rel + 7;
@@ -1282,7 +1320,7 @@ fn scan_filter_chains(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<String> 
         }
         let region = &bytes[start..end];
         let mut pos = 0;
-        while let Some(rel) = region[pos..].windows(7).position(|w| w == b"/Filter") {
+        while let Some(rel) = memchr::memmem::find(&region[pos..], b"/Filter") {
             let after = pos + rel + 7;
             // Reject `/FilterDecodeParms` style suffix collisions.
             if region.get(after).is_some_and(|b| b.is_ascii_alphabetic()) {
@@ -1432,21 +1470,8 @@ fn action_count_by_kind(actions: &[JsonValue], kind: &str) -> u32 {
 /// surfaces the length of that tail so trait rules can flag it.
 fn trailing_bytes_after_last_eof(bytes: &[u8]) -> usize {
     let needle = b"%%EOF";
-    let mut last_end = None;
-    let mut cursor = 0;
-    while cursor + needle.len() <= bytes.len() {
-        let Some(rel) = bytes[cursor..]
-            .windows(needle.len())
-            .position(|w| w == needle)
-        else {
-            break;
-        };
-        let abs = cursor + rel;
-        last_end = Some(abs + needle.len());
-        cursor = abs + needle.len();
-    }
-    last_end
-        .map(|end| bytes.len().saturating_sub(end))
+    memchr::memmem::rfind(bytes, needle)
+        .map(|at| bytes.len() - (at + needle.len()))
         .unwrap_or(0)
 }
 
@@ -1553,7 +1578,7 @@ fn streams_with_unusual_filter_count(bytes: &[u8], dict_regions: &[DictRegion]) 
 fn find_filter_in_dict(dict: &[u8]) -> Option<String> {
     let mut p = 0;
     while p + 7 <= dict.len() {
-        let rel = dict[p..].windows(7).position(|w| w == b"/Filter")?;
+        let rel = memchr::memmem::find(&dict[p..], b"/Filter")?;
         let after = p + rel + 7;
         if dict.get(after).is_some_and(|b| b.is_ascii_alphabetic()) {
             p = after;
@@ -1602,14 +1627,11 @@ fn find_ef_stream_length(
 ) -> Option<u64> {
     // Locate `/EF` then the inner `/F <id> <gen> R` or
     // `/UF <id> <gen> R` reference.
-    let ef_pos = filespec_dict
-        .windows(3)
-        .position(|w| w == b"/EF")
-        .filter(|&p| {
-            filespec_dict
-                .get(p + 3)
-                .is_some_and(|b| !b.is_ascii_alphabetic())
-        })?;
+    let ef_pos = memchr::memmem::find(filespec_dict, b"/EF").filter(|&p| {
+        filespec_dict
+            .get(p + 3)
+            .is_some_and(|b| !b.is_ascii_alphabetic())
+    })?;
     let window_end = (ef_pos + 256).min(filespec_dict.len());
     let window = &filespec_dict[ef_pos..window_end];
     let target_id = parse_indirect_ref_value(window, b"/F")
@@ -1641,7 +1663,7 @@ fn find_ef_stream_length(
 fn parse_indirect_ref_value(bytes: &[u8], key: &[u8]) -> Option<u32> {
     let mut cursor = 0;
     while cursor + key.len() <= bytes.len() {
-        let rel = bytes[cursor..].windows(key.len()).position(|w| w == key)?;
+        let rel = memchr::memmem::find(&bytes[cursor..], key)?;
         let abs = cursor + rel;
         let after_idx = abs + key.len();
         let after = *bytes.get(after_idx)?;
@@ -1708,7 +1730,7 @@ fn scan_streams(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<JsonValue> {
                 // No `/Filter` at offset 0 — try locating it inside the dict.
                 let mut p = 0;
                 while p + 7 <= dict.len() {
-                    let rel = dict[p..].windows(7).position(|w| w == b"/Filter")?;
+                    let rel = memchr::memmem::find(&dict[p..], b"/Filter")?;
                     let after = p + rel + 7;
                     if dict.get(after).is_some_and(|b| b.is_ascii_alphabetic()) {
                         p = after;
@@ -1836,7 +1858,7 @@ fn scan_form_fields(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<JsonValue>
 /// Read a `/Rect [a b c d]` array as a single space-joined
 /// string. Numbers can be int or float; we don't reformat them.
 fn find_rect_value(bytes: &[u8], key: &[u8]) -> Option<String> {
-    let pos = bytes.windows(key.len()).position(|w| w == key)?;
+    let pos = memchr::memmem::find(bytes, key)?;
     let after_idx = pos + key.len();
     if bytes
         .get(after_idx)
@@ -1857,23 +1879,25 @@ fn find_rect_value(bytes: &[u8], key: &[u8]) -> Option<String> {
 }
 
 /// Decode a FlateDecode stream into a bounded buffer. Caps the
-/// inflated output at 1 MiB so adversarial zip-bombs can't blow
-/// memory. Returns `None` on decode failure.
+/// inflated output at [`MAX_INFLATED`] so adversarial zip-bombs can't
+/// blow memory. Returns `None` on decode failure.
 fn inflate(input: &[u8]) -> Option<Vec<u8>> {
+    inflate_capped(input, MAX_INFLATED)
+}
+
+fn inflate_capped(input: &[u8], max: usize) -> Option<Vec<u8>> {
     use flate2::read::ZlibDecoder;
     use std::io::Read;
-    const MAX_DECODED: usize = 1 << 20;
-    let mut decoder = ZlibDecoder::new(input).take(MAX_DECODED as u64);
+    let mut decoder = ZlibDecoder::new(input).take(max as u64);
     let mut out = Vec::new();
     decoder.read_to_end(&mut out).ok()?;
     Some(out)
 }
 
-/// Non-overlapping substring count via the `memchr` SIMD-accelerated
-/// `memmem` searcher. Roughly an order of magnitude faster than the
-/// hand-rolled sliding window we used previously, and the worst-case
-/// cost on adversarial inputs (long near-matches that repeatedly
-/// reset a naive scan) stays linear.
+/// Non-overlapping substring count. Every search in this module goes
+/// through the `memchr` SIMD-accelerated `memmem` searcher, which stays
+/// linear on adversarial inputs (long near-matches that repeatedly reset
+/// a naive sliding-window scan).
 #[must_use]
 fn count_substring(bytes: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() || bytes.len() < needle.len() {
@@ -1883,7 +1907,7 @@ fn count_substring(bytes: &[u8], needle: &[u8]) -> usize {
 }
 
 fn contains_substring(bytes: &[u8], needle: &[u8]) -> bool {
-    count_substring(bytes, needle) > 0
+    memchr::memmem::find(bytes, needle).is_some()
 }
 
 /// Count `/Type /<name>` dictionary tags. The PDF spec allows
@@ -1892,35 +1916,17 @@ fn contains_substring(bytes: &[u8], needle: &[u8]) -> bool {
 /// count. Also rejects partial-name false positives (`/Page` vs
 /// `/Pages`).
 fn count_type_occurrences(bytes: &[u8], name: &[u8]) -> usize {
-    let with_space = {
-        let mut v = Vec::with_capacity(7 + name.len());
-        v.extend_from_slice(b"/Type ");
-        v.extend_from_slice(name);
-        v
-    };
-    let joined = {
-        let mut v = Vec::with_capacity(5 + name.len());
-        v.extend_from_slice(b"/Type");
-        v.extend_from_slice(name);
-        v
-    };
-    [with_space.as_slice(), joined.as_slice()]
+    [&b"/Type "[..], b"/Type"]
         .iter()
-        .map(|needle| {
-            let mut count = 0;
-            let mut i = 0;
-            while i + needle.len() <= bytes.len() {
-                if &bytes[i..i + needle.len()] == *needle {
-                    let after = bytes.get(i + needle.len()).copied().unwrap_or(b' ');
-                    if !is_name_char(after) {
-                        count += 1;
-                    }
-                    i += needle.len();
-                } else {
-                    i += 1;
-                }
-            }
-            count
+        .map(|prefix| {
+            let needle = [*prefix, name].concat();
+            memchr::memmem::find_iter(bytes, &needle)
+                .filter(|&at| {
+                    !bytes
+                        .get(at + needle.len())
+                        .is_some_and(|&b| is_name_char(b))
+                })
+                .count()
         })
         .sum()
 }
@@ -1933,26 +1939,23 @@ fn count_token(bytes: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() || bytes.len() < needle.len() {
         return 0;
     }
-    let mut count = 0;
-    let mut i = 0;
-    while i + needle.len() <= bytes.len() {
-        if &bytes[i..i + needle.len()] == needle {
-            let after_idx = i + needle.len();
-            let after = bytes.get(after_idx).copied().unwrap_or(b' ');
-            let before = if i == 0 { b' ' } else { bytes[i - 1] };
-            if !is_name_char(after) && !is_name_char(before) {
-                count += 1;
-            }
-            i += needle.len();
-        } else {
-            i += 1;
-        }
-    }
-    count
+    memchr::memmem::find_iter(bytes, needle)
+        .filter(|&at| is_token_at(bytes, at, needle.len()))
+        .count()
 }
 
 fn contains_token(bytes: &[u8], needle: &[u8]) -> bool {
-    count_token(bytes, needle) > 0
+    if needle.is_empty() {
+        return false;
+    }
+    memchr::memmem::find_iter(bytes, needle).any(|at| is_token_at(bytes, at, needle.len()))
+}
+
+/// Whether the `len`-byte match at `at` has no name character on either side.
+fn is_token_at(bytes: &[u8], at: usize, len: usize) -> bool {
+    let before = at.checked_sub(1).map_or(b' ', |i| bytes[i]);
+    let after = bytes.get(at + len).copied().unwrap_or(b' ');
+    !is_name_char(after) && !is_name_char(before)
 }
 
 /// `/AA` is two letters; raw substring scan would hit `AAAa…`-style
@@ -1966,16 +1969,18 @@ fn contains_keyword(bytes: &[u8], needle: &[u8]) -> bool {
     fn is_delim(b: u8) -> bool {
         b.is_ascii_whitespace() || matches!(b, b'<' | b'>' | b'[' | b']' | b'(' | b')' | b'/')
     }
-    let mut i = 0;
-    while i + needle.len() <= bytes.len() {
-        if &bytes[i..i + needle.len()] == needle {
-            let before = if i == 0 { b' ' } else { bytes[i - 1] };
-            let after = bytes.get(i + needle.len()).copied().unwrap_or(b' ');
-            if is_delim(before) && (is_delim(after) || after.is_ascii_digit()) {
-                return true;
-            }
+    let finder = memchr::memmem::Finder::new(needle);
+    // Resume one byte past each rejected match, so overlapping candidates
+    // are still considered.
+    let mut from = 0;
+    while let Some(rel) = bytes.get(from..).and_then(|hay| finder.find(hay)) {
+        let at = from + rel;
+        let before = at.checked_sub(1).map_or(b' ', |i| bytes[i]);
+        let after = bytes.get(at + needle.len()).copied().unwrap_or(b' ');
+        if is_delim(before) && (is_delim(after) || after.is_ascii_digit()) {
+            return true;
         }
-        i += 1;
+        from = at + 1;
     }
     false
 }
@@ -2177,7 +2182,7 @@ fn derive_stream_metrics(bytes: &[u8], dict_regions: &[DictRegion], metrics: &mu
         let end_window = bytes
             .get(body_end..body_end.saturating_add(16))
             .unwrap_or(&[]);
-        if !end_window.windows(9).any(|w| w == b"endstream") {
+        if memchr::memmem::find(end_window, b"endstream").is_none() {
             missing_endstream = missing_endstream.saturating_add(1);
         }
         // Bad delimiter: the byte immediately after `stream` should
@@ -2234,7 +2239,7 @@ fn classify_stream_length(dict: &[u8]) -> LengthValue {
     let key = b"/Length";
     let mut cursor = 0;
     while cursor + key.len() <= dict.len() {
-        let Some(rel) = dict[cursor..].windows(key.len()).position(|w| w == key) else {
+        let Some(rel) = memchr::memmem::find(&dict[cursor..], key) else {
             return LengthValue::Missing;
         };
         let pos = cursor + rel;
@@ -2325,11 +2330,17 @@ mod tests {
     use super::*;
 
     fn extract_pdf(bytes: &[u8]) -> (Values, Metrics) {
+        let (v, m, _) = extract_pdf_with_errors(bytes);
+        (v, m)
+    }
+
+    fn extract_pdf_with_errors(bytes: &[u8]) -> (Values, Metrics, Errors) {
         let mut v = Values::new();
         let mut s = Strings::default();
         let mut m = Metrics::new();
-        extract(bytes, &mut v, &mut s, &mut m).unwrap();
-        (v, m)
+        let mut e = Errors::new();
+        extract(bytes, &mut v, &mut s, &mut m, &mut e).unwrap();
+        (v, m, e)
     }
 
     #[test]
@@ -2764,6 +2775,42 @@ mod tests {
         pdf.extend_from_slice(&body);
         pdf.extend_from_slice(b"\nendstream endobj\n");
         pdf
+    }
+
+    /// Object streams share one inflate budget: once it is spent the rest are
+    /// skipped and counted, rather than each keeping up to 1 MiB for as many
+    /// streams as the file holds.
+    #[test]
+    fn object_streams_share_one_inflate_budget() {
+        let mut pdf = Vec::new();
+        for _ in 0..4 {
+            pdf.extend(pdf_with_object_stream(&[b' '; 100]));
+        }
+        let regions = collect_dict_regions(&pdf);
+        let streams = decode_object_streams(&pdf, &regions, 250);
+        let sizes: Vec<usize> = streams.decoded.iter().map(|(_, t)| t.len()).collect();
+        assert_eq!(sizes, [100, 100, 50]);
+        assert_eq!(streams.skipped, 1);
+
+        // Under the budget nothing is skipped or reported.
+        let (_, _, errors) = extract_pdf_with_errors(&pdf);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// The memmem rewrites keep the scan semantics: non-overlapping counts,
+    /// name-character boundaries, and every candidate for `/AA`.
+    #[test]
+    fn token_and_type_searches_respect_boundaries() {
+        assert_eq!(count_token(b"obj objstm endobj 1 0 obj", b"obj"), 2);
+        assert!(!contains_token(b"objstm", b"obj"));
+        assert_eq!(
+            count_type_occurrences(b"/Type /Page /Type/Pages /Type/Page>>", b"/Page"),
+            2
+        );
+        assert!(contains_keyword(b"x/AA <</AA 3 0 R>>", b"/AA"));
+        assert!(!contains_keyword(b"/AAA", b"/AA"));
+        assert_eq!(trailing_bytes_after_last_eof(b"%%EOF\n%%EOFxyz"), 3);
+        assert_eq!(trailing_bytes_after_last_eof(b"no marker"), 0);
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! base64-like, sequential, keyboard, repeated-character).
 
 use crate::metric;
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use tree_sitter::Node;
 
@@ -52,7 +52,9 @@ pub(super) fn emit(identifiers: &[&str], metrics: &mut Metrics) {
     }
 
     let total = identifiers.len() as u32;
-    let unique: HashSet<&str> = identifiers.iter().copied().collect();
+    // Ordered, so the float sums below always add up in the same order and
+    // the metrics are bit-for-bit reproducible.
+    let unique: BTreeSet<&str> = identifiers.iter().copied().collect();
     let unique_count = unique.len() as u32;
 
     metrics.insert(metric!("identifiers.count"), f64::from(total));
@@ -344,5 +346,36 @@ mod tests {
         let mut m = Metrics::new();
         emit(&["deadbeef", "cafebabe", "normalName"], &mut m);
         assert_eq!(m.get("identifiers.hex_like_names"), Some(2.0));
+    }
+
+    /// Float sums must not follow hash iteration order: the disk cache and
+    /// output diffs rely on identical input giving bit-identical metrics.
+    #[test]
+    fn float_metrics_are_bit_for_bit_reproducible() {
+        let names: Vec<String> = (0..600u32)
+            .map(|i| {
+                format!(
+                    "{}_{:x}{}",
+                    ["v", "tmpName", "Q9z"][(i % 3) as usize],
+                    i * 7919,
+                    "k".repeat((i % 7) as usize)
+                )
+            })
+            .collect();
+        let identifiers: Vec<&str> = names.iter().map(String::as_str).collect();
+        let bits = || {
+            let mut m = Metrics::new();
+            emit(&identifiers, &mut m);
+            [
+                "identifiers.avg_entropy",
+                "identifiers.length_stddev",
+                "identifiers.avg_length",
+            ]
+            .map(|key| m.get(key).expect(key).to_bits())
+        };
+        let first = bits();
+        for _ in 0..32 {
+            assert_eq!(bits(), first);
+        }
     }
 }

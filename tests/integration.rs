@@ -1,10 +1,16 @@
 //! End-to-end tests against synthetic and real fixtures.
 //!
-//! Every test here asserts the no-duplicate-work guarantee
-//! (`parse_count() == 1` after exercising all views) so the contract
-//! holds for downstream embedders.
+//! Tests that read more than one view assert the no-duplicate-work
+//! guarantee (`parse_count() == 1` once those views have been read) so
+//! the contract holds for downstream embedders.
 
 use filefacts::{FileType, Symbol, SymbolKind};
+
+// Embedded rather than read at run time, so the tests do not depend on the
+// working directory.
+const PE_FIXTURE: &[u8] = include_bytes!("fixtures/test.exe");
+const ELF_FIXTURE: &[u8] = include_bytes!("fixtures/test.elf");
+const MACHO_FIXTURE: &[u8] = include_bytes!("fixtures/test.macho");
 
 /// Hermetic `open`: these tests assert `parse_count() == 1`, which only
 /// holds when this process actually runs the extraction pipeline. The
@@ -460,12 +466,12 @@ fn typed_fact_views_are_not_mirrored_in_values() {
             "{path} must live only in its typed filefacts view"
         );
     }
+    assert_eq!(parsed.parse_count(), 1);
 }
 
 #[test]
 fn binary_typed_fact_views_are_not_mirrored_in_values() {
-    let bytes = std::fs::read("tests/fixtures/test.exe").expect("PE fixture present");
-    let parsed = open(&bytes).unwrap();
+    let parsed = open(PE_FIXTURE).unwrap();
 
     assert!(
         !import_names(&parsed).is_empty(),
@@ -491,6 +497,7 @@ fn binary_typed_fact_views_are_not_mirrored_in_values() {
             "{path} must live only in its typed filefacts view"
         );
     }
+    assert_eq!(parsed.parse_count(), 1);
 }
 
 #[test]
@@ -1422,6 +1429,7 @@ fn iso_members_carry_sliceable_extents_and_joliet_names() {
     );
     assert_eq!(parsed.metrics().get("iso.file_count"), Some(2.0));
     assert_eq!(parsed.metrics().get("iso.executable_file_count"), Some(1.0));
+    assert_eq!(parsed.parse_count(), 1);
 }
 
 /// ISO 9660 and Joliet are independent directory trees over the same sectors.
@@ -1464,6 +1472,7 @@ fn iso_member_present_in_one_namespace_only_is_still_surfaced() {
         parsed.metrics().get("iso.blank_identifier_fields"),
         Some(5.0)
     );
+    assert_eq!(parsed.parse_count(), 1);
 }
 
 /// Bytes past the volume the descriptors declare belong to no file, so a walk
@@ -1500,6 +1509,7 @@ fn iso_trailing_data_is_reported_as_an_unclaimed_member() {
         a.iter().filter_map(|x| x.as_str()).collect()
     });
     assert!(anomalies.contains(&"trailing-data"), "{anomalies:?}");
+    assert_eq!(parsed.parse_count(), 1);
 }
 
 /// A well-formed image has no unclaimed interior space: the descriptors, path
@@ -1523,6 +1533,7 @@ fn iso_without_hidden_space_reports_no_slack() {
         parsed.values().get("iso.builder").and_then(|x| x.as_str()),
         Some("mkisofs")
     );
+    assert_eq!(parsed.parse_count(), 1);
 }
 
 /// Deterministic high-entropy filler standing in for an appended payload.
@@ -1558,14 +1569,13 @@ fn overlay_of(bytes: &[u8]) -> Option<(u64, u64)> {
 /// part of the image, not an overlay.
 #[test]
 fn macho_linkedit_is_not_an_overlay() {
-    let bytes = std::fs::read("tests/fixtures/test.macho").expect("Mach-O fixture present");
-    assert_eq!(overlay_of(&bytes), None);
+    assert_eq!(overlay_of(MACHO_FIXTURE), None);
 }
 
 /// Bytes appended past `__LINKEDIT` are still a real overlay.
 #[test]
 fn macho_bytes_past_linkedit_are_an_overlay() {
-    let mut bytes = std::fs::read("tests/fixtures/test.macho").expect("Mach-O fixture present");
+    let mut bytes = MACHO_FIXTURE.to_vec();
     let image_len = bytes.len() as u64;
     bytes.extend(pseudo_random(4096));
     assert_eq!(overlay_of(&bytes), Some((image_len, 4096)));
@@ -1577,7 +1587,7 @@ fn macho_bytes_past_linkedit_are_an_overlay() {
 /// the last slice's image, not against the slice-relative section offsets.
 #[test]
 fn fat_macho_overlay_is_past_the_last_slice() {
-    let slice = std::fs::read("tests/fixtures/test.macho").expect("Mach-O fixture present");
+    let slice = MACHO_FIXTURE;
     let slice_offset = 0x1000_u32;
     let mut bytes = Vec::new();
     bytes.extend(0xCAFE_BABE_u32.to_be_bytes());
@@ -1588,7 +1598,7 @@ fn fat_macho_overlay_is_past_the_last_slice() {
     bytes.extend((slice.len() as u32).to_be_bytes());
     bytes.extend(12_u32.to_be_bytes()); // align 2^12
     bytes.resize(slice_offset as usize, 0);
-    bytes.extend(&slice);
+    bytes.extend(slice);
     assert_eq!(open(&bytes).unwrap().fileid().file_type(), FileType::MachO);
     assert_eq!(overlay_of(&bytes), None);
 
@@ -1603,7 +1613,7 @@ fn fat_macho_overlay_is_past_the_last_slice() {
 /// those are the overlay, and further appended bytes extend it.
 #[test]
 fn elf_overlay_starts_after_section_header_table() {
-    let mut bytes = std::fs::read("tests/fixtures/test.elf").expect("ELF fixture present");
+    let mut bytes = ELF_FIXTURE.to_vec();
     assert_eq!(bytes.len(), 22928 + 220);
     assert_eq!(overlay_of(&bytes), Some((22928, 220)));
     bytes.extend(pseudo_random(2048));

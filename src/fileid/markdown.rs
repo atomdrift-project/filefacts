@@ -3,7 +3,7 @@
 const WINDOW: usize = 16 * 1024;
 
 pub(super) fn document_structure(data: &[u8]) -> bool {
-    let data = data.strip_prefix(b"\xef\xbb\xbf").unwrap_or(data);
+    let data = super::strip_utf8_bom(data);
     let head = &data[..data.len().min(WINDOW)];
     let mut lines = head.split(|b| *b == b'\n');
     let Some(first) = lines.find(|line| !line.trim_ascii().is_empty()) else {

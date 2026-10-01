@@ -1,6 +1,7 @@
 //! Go dependency ownership over supplied members, without filesystem access.
 //! This reconciles declarations, replacements and exact checksums. It does not
 //! compute MVS or assert that a declared minimum is the version actually built.
+use crate::package_context::{archive_boundary, join_relative, member_directory};
 use crate::{RefKind, RefLocator, Reference};
 use std::collections::BTreeMap;
 
@@ -17,37 +18,14 @@ fn named(path: &str, name: &str) -> bool {
     path == name || path.ends_with(&format!("/{name}")) || path.ends_with(&format!("!!{name}"))
 }
 
-fn directory(path: &str) -> &str {
-    let slash = path.rfind('/').map_or(0, |i| i + 1);
-    let archive = path.rfind("!!").map_or(0, |i| i + 2);
-    &path[..slash.max(archive)]
-}
-
-fn boundary(path: &str) -> &str {
-    &path[..path.rfind("!!").map_or(0, |i| i + 2)]
-}
-
 fn local(base: &str, spec: &str) -> Option<String> {
-    if spec.starts_with('/') || spec.contains(['\\', ':', '!', '#']) {
-        return None;
-    }
-    let boundary = boundary(base);
-    let relative = directory(base).strip_prefix(boundary)?;
+    let boundary = archive_boundary(base);
+    let relative = member_directory(base).strip_prefix(boundary)?;
     let absolute = relative.starts_with('/');
-    let mut parts: Vec<_> = relative.split('/').filter(|p| !p.is_empty()).collect();
-    for part in spec.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop()?;
-            }
-            _ => parts.push(part),
-        }
-    }
     Some(format!(
         "{boundary}{}{}",
         if absolute { "/" } else { "" },
-        parts.join("/")
+        join_relative(relative, spec)?
     ))
 }
 
@@ -66,7 +44,7 @@ fn unresolved(reference: &Reference, reason: &str) -> Reference {
 }
 
 fn owns(work: ReferenceMember<'_>, main: &str) -> bool {
-    boundary(work.path) == boundary(main)
+    archive_boundary(work.path) == archive_boundary(main)
         && work.references.iter().any(|r| {
             r.source == "go.work.use" && matches!(&r.locator,
                 RefLocator::Path(path) if local(work.path, path).is_some_and(|p| format!("{p}/go.mod") == main))
@@ -190,7 +168,7 @@ pub fn go_dependency_context(members: &[ReferenceMember<'_>]) -> BTreeMap<String
         let workspace = members
             .iter()
             .filter(|m| named(m.path, "go.work") && owns(**m, main.path))
-            .max_by_key(|m| directory(m.path).len());
+            .max_by_key(|m| member_directory(m.path).len());
         let mut context = vec![(*main, false)];
         if let Some(work) = workspace {
             let work_cost = members.len().saturating_mul(work.references.len());
@@ -219,14 +197,14 @@ pub fn go_dependency_context(members: &[ReferenceMember<'_>]) -> BTreeMap<String
         for (owner, work) in &context {
             let path = format!(
                 "{}{}",
-                directory(owner.path),
+                member_directory(owner.path),
                 if *work { "go.work.sum" } else { "go.sum" }
             );
             if let Some(sum) = members.iter().find(|m| m.path == path) {
                 sums.extend(sum.references);
             }
         }
-        let vendor_path = format!("{}vendor/modules.txt", directory(main.path));
+        let vendor_path = format!("{}vendor/modules.txt", member_directory(main.path));
         let vendor = members.iter().find(|m| m.path == vendor_path);
         let per_reference = context
             .iter()
@@ -270,7 +248,7 @@ pub fn go_dependency_context(members: &[ReferenceMember<'_>]) -> BTreeMap<String
                             let Some((module, _)) = coordinate(selected) else {
                                 return unresolved(r, "vendor-metadata");
                             };
-                            let path = format!("{}vendor/{module}/", directory(main.path));
+                            let path = format!("{}vendor/{module}/", member_directory(main.path));
                             if !members.iter().any(|m| m.path.starts_with(&path)) {
                                 return unresolved(r, "vendor-missing");
                             }

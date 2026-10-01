@@ -792,8 +792,8 @@ mod tests {
             assert!(library.is_none(), "java-class imports carry no library");
         }
         assert_eq!(m.get("class.external_class_count"), Some(1.0));
-        // No methods were declared by the builder.
-        assert_eq!(m.get("class.method_count"), None);
+        // No methods were declared by the builder. (Method counts surface as
+        // `functions.count`, derived from these symbols by the caller.)
         assert_eq!(symbols.iter_kind(crate::SymbolKind::Function).count(), 0);
     }
 

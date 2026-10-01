@@ -8,21 +8,23 @@ use thiserror::Error;
 ///
 /// Variants are stable; new variants are additive and gated by
 /// `#[non_exhaustive]`. Existing variants will not be renamed or removed
-/// in 0.x without a minor-version bump.
+/// without a major-version bump.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// I/O error while reading bytes (only emitted by helpers that touch the
-    /// filesystem; the core `open()` API takes a byte slice and never does
-    /// I/O).
+    /// I/O error while reading the input file, from [`crate::from_path`].
+    ///
+    /// The `open*` constructors take a byte slice and never return it. View
+    /// access may read and write the disk cache ([`crate::cache`]), but
+    /// cache I/O is best-effort and its failures are not reported here.
     #[error("io error: {0}")]
     Io(#[from] io::Error),
 
     /// File type could not be identified from the supplied bytes.
     ///
-    /// Returned by `open()` when neither magic-byte detection nor content
-    /// heuristics produce a result. The bytes themselves may be valid for
-    /// some format filefacts does not yet support.
+    /// Reserved and currently never returned: identification falls back to
+    /// [`crate::FileType::Unknown`] instead of failing, so `open()` succeeds
+    /// for any input.
     #[error("unrecognised file format")]
     UnknownFormat,
 

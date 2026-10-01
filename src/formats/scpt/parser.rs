@@ -40,7 +40,7 @@
 //!   1048576 vector edges, 256 pending vectors, and 32768 reference slots.
 //!   Parsing is iterative; neither parse nor drop recursively follows edges.
 //!
-//! Reference: https://github.com/Jinmo/applescript-disassembler
+//! Reference: <https://github.com/Jinmo/applescript-disassembler>
 //! `engine/fasparser.py`, `engine/fasobjects/*`, `engine/runtimeobjects.py`.
 //! Adapted from the reference's MIT-licensed format handling:
 //!
@@ -121,14 +121,30 @@ struct Reader<'a> {
     edges: usize,
 }
 
-/// Whether an error came from one of this parser's own ceilings rather than
-/// from the file being malformed. These are the four `*_limit exceeded`
-/// messages raised by `object`, `vector` and the arena guards.
-fn is_budget(reason: &str) -> bool {
-    reason.ends_with("limit exceeded")
+/// Why a FAS stream could not be read. Renders as `FAS at <offset>: <reason>`.
+#[derive(Debug)]
+pub(super) enum ParseError {
+    /// One of this parser's own ceilings, not a property of the file: the
+    /// `input`, `object`, `owned data`, `edge` or `nesting` limit, rendered
+    /// as `<limit> limit exceeded`.
+    Budget { offset: usize, limit: &'static str },
+    /// The stream is truncated or structurally invalid, or an allocation
+    /// failed.
+    Malformed { offset: usize, reason: String },
 }
 
-pub(super) fn parse(bytes: &[u8]) -> Result<Parsed, String> {
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Budget { offset, limit } => {
+                write!(f, "FAS at {offset:#x}: {limit} limit exceeded")
+            }
+            Self::Malformed { offset, reason } => write!(f, "FAS at {offset:#x}: {reason}"),
+        }
+    }
+}
+
+pub(super) fn parse(bytes: &[u8]) -> Result<Parsed, ParseError> {
     let mut reader = Reader::new(bytes)?;
     // A file that cannot produce a header or a root object is not a readable
     // FAS stream at all; there is nothing partial to hand back. Everything
@@ -162,11 +178,11 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Parsed, String> {
                 // truncated or malformed is the file lying about its own
                 // shape, and accepting an arbitrary prefix of one would make a
                 // successful parse meaningless.
-                Err(reason) if is_budget(&reason) => {
-                    truncated = Some(reason);
+                Err(error @ ParseError::Budget { .. }) => {
+                    truncated = Some(error.to_string());
                     break;
                 }
-                Err(reason) => return Err(reason),
+                Err(error) => return Err(error),
             },
         };
         if let Value::Vector { items, .. } = &mut reader.nodes[parent].value {
@@ -183,13 +199,19 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Parsed, String> {
 }
 
 impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Result<Self, String> {
+    fn new(bytes: &'a [u8]) -> Result<Self, ParseError> {
         if bytes.len() > MAX_INPUT {
-            return Err("FAS at 0x0: input limit exceeded".into());
+            return Err(ParseError::Budget {
+                offset: 0,
+                limit: "input",
+            });
         }
         let mut refs = Vec::new();
         refs.try_reserve_exact(REF_SLOTS)
-            .map_err(|_| "FAS at 0x0: reference table allocation failed".to_string())?;
+            .map_err(|_| ParseError::Malformed {
+                offset: 0,
+                reason: "reference table allocation failed".into(),
+            })?;
         refs.resize(REF_SLOTS, None);
         Ok(Self {
             bytes,
@@ -202,11 +224,21 @@ impl<'a> Reader<'a> {
         })
     }
 
-    fn error(&self, message: &str) -> String {
-        format!("FAS at {:#x}: {message}", self.pos)
+    fn error(&self, reason: &str) -> ParseError {
+        ParseError::Malformed {
+            offset: self.pos,
+            reason: reason.into(),
+        }
     }
 
-    fn take(&mut self, size: usize) -> Result<&'a [u8], String> {
+    fn over_budget(&self, limit: &'static str) -> ParseError {
+        ParseError::Budget {
+            offset: self.pos,
+            limit,
+        }
+    }
+
+    fn take(&mut self, size: usize) -> Result<&'a [u8], ParseError> {
         let end = self
             .pos
             .checked_add(size)
@@ -219,28 +251,28 @@ impl<'a> Reader<'a> {
         Ok(data)
     }
 
-    fn u8(&mut self) -> Result<u8, String> {
+    fn u8(&mut self) -> Result<u8, ParseError> {
         Ok(self.take(1)?[0])
     }
 
-    fn u16(&mut self) -> Result<u16, String> {
+    fn u16(&mut self) -> Result<u16, ParseError> {
         let b = self.take(2)?;
         Ok(u16::from_be_bytes([b[0], b[1]]))
     }
 
-    fn u32(&mut self) -> Result<u32, String> {
+    fn u32(&mut self) -> Result<u32, ParseError> {
         let b = self.take(4)?;
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
-    fn u64(&mut self) -> Result<u64, String> {
+    fn u64(&mut self) -> Result<u64, ParseError> {
         let b = self.take(8)?;
         Ok(u64::from_be_bytes([
             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
         ]))
     }
 
-    fn header(&mut self) -> Result<String, String> {
+    fn header(&mut self) -> Result<String, ParseError> {
         if self.bytes.starts_with(b"#!") {
             self.pos = self
                 .bytes
@@ -264,7 +296,7 @@ impl<'a> Reader<'a> {
         Ok(effective.iter().map(|&b| char::from(b)).collect())
     }
 
-    fn version_word(&mut self) -> Result<[u8; 4], String> {
+    fn version_word(&mut self) -> Result<[u8; 4], ParseError> {
         let b = self.take(4)?;
         if !b[0].is_ascii_digit()
             || b[1] != b'.'
@@ -276,9 +308,9 @@ impl<'a> Reader<'a> {
         Ok([b[0], b[1], b[2], b[3]])
     }
 
-    fn add(&mut self, offset: usize, value: Value) -> Result<usize, String> {
+    fn add(&mut self, offset: usize, value: Value) -> Result<usize, ParseError> {
         if self.nodes.len() >= MAX_NODES {
-            return Err(self.error("object limit exceeded"));
+            return Err(self.over_budget("object"));
         }
         self.nodes
             .try_reserve(1)
@@ -288,15 +320,15 @@ impl<'a> Reader<'a> {
         Ok(id)
     }
 
-    fn charge_data(&mut self, size: usize) -> Result<(), String> {
+    fn charge_data(&mut self, size: usize) -> Result<(), ParseError> {
         if size > MAX_DATA - self.data {
-            return Err(self.error("owned data limit exceeded"));
+            return Err(self.over_budget("owned data"));
         }
         self.data += size;
         Ok(())
     }
 
-    fn payload(&mut self, tag: Option<u8>, size: usize) -> Result<Node, String> {
+    fn payload(&mut self, tag: Option<u8>, size: usize) -> Result<Node, ParseError> {
         let offset = self.pos;
         let bytes = self.take(size)?;
         self.charge_data(size)?;
@@ -316,15 +348,15 @@ impl<'a> Reader<'a> {
         tag: Option<u8>,
         count: usize,
         metadata: &[u16],
-    ) -> Result<(), String> {
+    ) -> Result<(), ParseError> {
         let total = count
             .checked_add(metadata.len())
             .ok_or_else(|| self.error("edge overflow"))?;
         if total > MAX_EDGES - self.edges {
-            return Err(self.error("edge limit exceeded"));
+            return Err(self.over_budget("edge"));
         }
         if count != 0 && self.pending.len() >= MAX_DEPTH {
-            return Err(self.error("nesting limit exceeded"));
+            return Err(self.over_budget("nesting"));
         }
         let refs = self.pos;
         self.take(
@@ -355,7 +387,7 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
-    fn name(&mut self) -> Result<String, String> {
+    fn name(&mut self) -> Result<String, ParseError> {
         if self.u8()? != 48 {
             return Err(self.error("user identifier tag must be 48"));
         }
@@ -387,7 +419,7 @@ impl<'a> Reader<'a> {
         Ok(name)
     }
 
-    fn code_id(&mut self, size: usize) -> Result<Value, String> {
+    fn code_id(&mut self, size: usize) -> Result<Value, ParseError> {
         let tag = self.u8()?;
         match (tag, size) {
             (11, 8) => Ok(Value::Constant(self.u64()?)),
@@ -422,15 +454,16 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn object(&mut self, expected: i16) -> Result<usize, String> {
+    fn object(&mut self, expected: i16) -> Result<usize, ParseError> {
         let offset = self.pos;
         let kind = self.u8()?;
         let reference = self.u16()? as i16;
         let size = usize::from(self.u16()?);
         if reference != expected {
-            return Err(format!(
-                "FAS at {offset:#x}: reference mismatch: expected {expected}, found {reference}"
-            ));
+            return Err(ParseError::Malformed {
+                offset,
+                reason: format!("reference mismatch: expected {expected}, found {reference}"),
+            });
         }
         let node = self.add(offset, Value::Unknown)?;
         if reference >= 0 {
@@ -508,7 +541,12 @@ impl<'a> Reader<'a> {
                 self.nodes[node] = self.payload(tag, size)?;
                 return Ok(node);
             }
-            _ => return Err(format!("FAS at {offset:#x}: unknown record kind {kind}")),
+            _ => {
+                return Err(ParseError::Malformed {
+                    offset,
+                    reason: format!("unknown record kind {kind}"),
+                });
+            }
         };
         self.nodes[node].value = value;
         Ok(node)
@@ -600,7 +638,7 @@ mod tests {
     }
 
     fn assert_error(bytes: &[u8], message: &str) {
-        let error = parse(bytes).unwrap_err();
+        let error = parse(bytes).unwrap_err().to_string();
         assert!(
             error.contains(message),
             "expected {message:?}, got {error:?}"
@@ -939,6 +977,27 @@ mod tests {
             p.truncated
         );
         assert!(p.nodes.len() <= MAX_NODES);
+    }
+
+    /// Recovery keys on the variant, so a ceiling must be a `Budget` and
+    /// structural damage a `Malformed`, each keeping its message text.
+    #[test]
+    fn budget_and_malformed_errors_are_typed_and_keep_their_text() {
+        let error = parse(&vec![0; MAX_INPUT + 1]).unwrap_err();
+        assert!(matches!(error, ParseError::Budget { .. }), "{error:?}");
+        assert_eq!(error.to_string(), "FAS at 0x0: input limit exceeded");
+        for (limit, text) in [
+            ("object", "FAS at 0x2a: object limit exceeded"),
+            ("owned data", "FAS at 0x2a: owned data limit exceeded"),
+            ("edge", "FAS at 0x2a: edge limit exceeded"),
+            ("nesting", "FAS at 0x2a: nesting limit exceeded"),
+        ] {
+            let error = ParseError::Budget { offset: 42, limit };
+            assert_eq!(error.to_string(), text);
+        }
+        let error = parse(&stream(&header(5, 0, 0))).unwrap_err();
+        assert!(matches!(error, ParseError::Malformed { .. }), "{error:?}");
+        assert_eq!(error.to_string(), "FAS at 0x10: unknown record kind 5");
     }
 
     #[test]

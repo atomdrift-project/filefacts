@@ -24,12 +24,31 @@
 
 use crate::error::Error;
 use crate::metric;
-use crate::output::{Errors, Metrics, Section, Strings, Symbols, Values};
+use crate::output::{ErrorKind, Errors, Metrics, Section, Stage, Strings, Symbols, Values};
 use serde_json::Value as JsonValue;
 
 /// Defensive caps so a malformed module with inflated section/vector counts
 /// can't make us allocate unboundedly or spin. A real module stays far below.
 const MAX_ENTRIES: usize = 8192;
+
+/// Why a section body parse stopped short of its declared contents: the
+/// kind to record and a message saying where.
+type Bail = (ErrorKind, String);
+
+fn malformed(message: String) -> Bail {
+    (ErrorKind::Malformed, message)
+}
+
+/// Report a vector cut at [`MAX_ENTRIES`], once its kept entries are read.
+fn check_cap(count: u64, what: &str) -> Result<(), Bail> {
+    if count > MAX_ENTRIES as u64 {
+        return Err((
+            ErrorKind::Truncated,
+            format!("{count} {what} declared; read the first {MAX_ENTRIES}"),
+        ));
+    }
+    Ok(())
+}
 
 /// Cursor over the module bytes. Every read is bounds-checked and returns
 /// `None` past the end, so a truncated or hostile module degrades to partial
@@ -104,18 +123,16 @@ fn extract_imports(
     symbols_out: &mut Symbols,
     modules: &mut Vec<String>,
     import_names: &mut Vec<String>,
-) {
+) -> Result<(), Bail> {
     let mut r = Reader::new(body);
-    let Some(count) = r.uleb() else { return };
-    let count = (count as usize).min(MAX_ENTRIES);
-    for _ in 0..count {
-        let Some((module, _module_offset)) = r.name_with_offset() else {
-            return;
-        };
-        let Some((field, field_offset)) = r.name_with_offset() else {
-            return;
-        };
-        let Some(kind) = r.byte() else { return };
+    let declared = r
+        .uleb()
+        .ok_or_else(|| malformed("import count truncated".into()))?;
+    for i in 0..(declared as usize).min(MAX_ENTRIES) {
+        let truncated = || malformed(format!("import {i} truncated"));
+        let (module, _module_offset) = r.name_with_offset().ok_or_else(truncated)?;
+        let (field, field_offset) = r.name_with_offset().ok_or_else(truncated)?;
+        let kind = r.byte().ok_or_else(truncated)?;
         // Skip the kind-specific descriptor so the next import aligns.
         let ok = match kind {
             0x00 => r.uleb().map(|_| ()),    // func: typeidx
@@ -141,9 +158,12 @@ fn extract_imports(
             });
         }
         if ok.is_none() {
-            return;
+            return Err(malformed(format!(
+                "import {i} has a malformed or unknown descriptor (kind {kind:#04x})"
+            )));
         }
     }
+    check_cap(declared, "imports")
 }
 
 fn skip_limits(r: &mut Reader<'_>) -> Option<()> {
@@ -165,20 +185,16 @@ fn extract_exports(
     body_offset: u64,
     symbols_out: &mut Symbols,
     export_names: &mut Vec<String>,
-) {
+) -> Result<(), Bail> {
     let mut r = Reader::new(body);
-    let Some(count) = r.uleb() else { return };
-    let count = (count as usize).min(MAX_ENTRIES);
-    for _ in 0..count {
-        let Some((name, name_offset)) = r.name_with_offset() else {
-            return;
-        };
-        if r.byte().is_none() {
-            return;
-        } // export kind
-        if r.uleb().is_none() {
-            return;
-        } // index
+    let declared = r
+        .uleb()
+        .ok_or_else(|| malformed("export count truncated".into()))?;
+    for i in 0..(declared as usize).min(MAX_ENTRIES) {
+        let truncated = || malformed(format!("export {i} truncated"));
+        let (name, name_offset) = r.name_with_offset().ok_or_else(truncated)?;
+        r.byte().ok_or_else(truncated)?; // export kind
+        r.uleb().ok_or_else(truncated)?; // index
         export_names.push(name.clone());
         symbols_out.push(crate::Symbol::Export {
             name,
@@ -187,6 +203,7 @@ fn extract_exports(
             forward_to: None,
         });
     }
+    check_cap(declared, "exports")
 }
 
 /// Parse the first memory's declared page limits.
@@ -241,7 +258,7 @@ pub(super) fn extract(
     metrics: &mut Metrics,
     _sections_out: &mut Vec<Section>,
     symbols_out: &mut Symbols,
-    _errors_out: &mut Errors,
+    errors_out: &mut Errors,
 ) -> Result<(), Error> {
     // Header: `\0asm` + u32 version. Detection already vetted this, but guard
     // anyway so a forced/misrouted file can't index out of range.
@@ -259,28 +276,43 @@ pub(super) fn extract(
     let mut section_count: u64 = 0;
 
     while let Some(id) = r.byte() {
-        let Some(size) = r.uleb() else { break };
-        let size = size as usize;
+        let header_at = r.pos - 1;
+        // A section whose header or body runs past the end of the file ends
+        // the walk; everything after it is unread, so say so.
+        let Some(body) = r.uleb().and_then(|size| {
+            let start = r.pos;
+            bytes.get(start..start.checked_add(usize::try_from(size).ok()?)?)
+        }) else {
+            errors_out.record(
+                ErrorKind::Truncated,
+                Stage::WasmParse,
+                format!("wasm section {id} at offset {header_at} runs past the end of the file"),
+            );
+            break;
+        };
         let start = r.pos;
-        let Some(end) = start.checked_add(size) else {
-            break;
-        };
-        let Some(body) = bytes.get(start..end) else {
-            break;
-        };
+        let end = start + body.len();
         section_count += 1;
 
-        match id {
+        let parsed = match id {
             2 => extract_imports(
                 body,
                 start as u64,
                 symbols_out,
                 &mut modules,
                 &mut import_names,
-            ),
-            7 => extract_exports(body, start as u64, symbols_out, &mut export_names),
-            8 => has_start = true,
-            5 => extract_memory(body, values),
+            )
+            .map_err(|(kind, why)| (kind, format!("import section: {why}"))),
+            7 => extract_exports(body, start as u64, symbols_out, &mut export_names)
+                .map_err(|(kind, why)| (kind, format!("export section: {why}"))),
+            8 => {
+                has_start = true;
+                Ok(())
+            }
+            5 => {
+                extract_memory(body, values);
+                Ok(())
+            }
             0 => {
                 // Custom section: a name followed by payload. `producers`
                 // carries the toolchain; others are ignored here (strings
@@ -291,8 +323,12 @@ pub(super) fn extract(
                 {
                     extract_producers(&mut cr, values);
                 }
+                Ok(())
             }
-            _ => {}
+            _ => Ok(()),
+        };
+        if let Err((kind, message)) = parsed {
+            errors_out.record(kind, Stage::WasmParse, format!("wasm {message}"));
         }
 
         // Advance to the next section regardless of how far the body parse
@@ -318,6 +354,77 @@ pub(super) fn extract(
     metrics.insert(metric!("wasm.section_count"), section_count as f64);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn module(sections: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut out = b"\0asm\x01\0\0\0".to_vec();
+        for (id, body) in sections {
+            out.push(*id);
+            out.push(body.len() as u8); // single-byte LEB128 for test sizes
+            out.extend_from_slice(body);
+        }
+        out
+    }
+
+    fn run(bytes: &[u8]) -> (Values, Errors) {
+        let mut v = Values::new();
+        let mut errors = Errors::new();
+        extract(
+            bytes,
+            &mut v,
+            &mut Strings::default(),
+            &mut Metrics::new(),
+            &mut Vec::new(),
+            &mut Symbols::default(),
+            &mut errors,
+        )
+        .unwrap();
+        (v, errors)
+    }
+
+    /// `env.f`, a function import of type 0.
+    const IMPORT_ENV_F: &[u8] = b"\x03env\x01f\x00\x00";
+
+    #[test]
+    fn well_formed_module_records_no_errors() {
+        let mut imports = vec![1];
+        imports.extend_from_slice(IMPORT_ENV_F);
+        let exports = b"\x01\x04main\x00\x00";
+        let (v, errors) = run(&module(&[(2, &imports), (7, exports)]));
+        assert_eq!(v.get("wasm.imports"), Some(&serde_json::json!(["f"])));
+        assert_eq!(v.get("wasm.exports"), Some(&serde_json::json!(["main"])));
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// The import vector stops at a broken entry. What was read is kept, and
+    /// the stop is recorded instead of passing as a complete import list.
+    #[test]
+    fn malformed_import_is_recorded_and_earlier_imports_kept() {
+        let mut imports = vec![2];
+        imports.extend_from_slice(IMPORT_ENV_F);
+        imports.extend_from_slice(b"\x03env");
+        let (v, errors) = run(&module(&[(2, &imports)]));
+        assert_eq!(v.get("wasm.imports"), Some(&serde_json::json!(["f"])));
+        let entry = errors.iter().next().expect("bail recorded");
+        assert_eq!(entry.kind, ErrorKind::Malformed);
+        assert_eq!(entry.stage, Stage::WasmParse);
+        assert!(entry.message.contains("import 1 truncated"), "{entry:?}");
+    }
+
+    #[test]
+    fn section_past_end_of_file_is_recorded() {
+        let mut bytes = module(&[(7, b"\x00")]);
+        bytes.extend_from_slice(&[2, 100, 1, 2, 3]);
+        let (v, errors) = run(&bytes);
+        assert_eq!(v.get("wasm.has_start"), Some(&serde_json::json!(false)));
+        let entry = errors.iter().next().expect("truncation recorded");
+        assert_eq!(entry.kind, ErrorKind::Truncated);
+        assert!(entry.message.contains("section 2"), "{entry:?}");
+    }
 }
 
 // rebuild-marker

@@ -10,9 +10,9 @@
 //!
 //! Two distinct things land in this view:
 //!
-//! 1. **Hard failures** — `kind: "panic"` / `"malformed"` /
-//!    `"truncated"`. The data the failing stage would have produced
-//!    is missing.
+//! 1. **Hard failures** — `kind: "panic"` / `"malformed"` (and
+//!    `"truncated"`, which is reserved: no extractor records it yet).
+//!    The data the failing stage would have produced is missing.
 //! 2. **Soft fallbacks** — `kind: "fallback"`. The data IS present
 //!    but came from a less-strict parse path (PE permissive mode,
 //!    header-only retry). Consumers can decide whether the looser
@@ -28,10 +28,10 @@
 //!
 //! - `kind` — closed set of short tags (`"panic"`, `"malformed"`,
 //!   `"truncated"`, `"fallback"`).
-//! - `stage` — extractor / sub-extractor name (`"pe-parse"`,
-//!   `"pe-resource-walk"`, `"elf-parse"`, `"macho-parse"`,
-//!   `"ooxml-zip-walk"`, …). Used by the analyst to localise the
-//!   failure without re-reading the call stack.
+//! - `stage` — extractor / sub-extractor name, a [`Stage`] in
+//!   kebab-case (`"pe-parse"`, `"pe-resource-walk"`, `"elf-parse"`,
+//!   `"macho-parse"`, `"ooxml-parse"`, …). Used by the analyst to
+//!   localise the failure without re-reading the call stack.
 //! - `message` — verbatim diagnostic from the failing stage, when
 //!   one is available.
 
@@ -50,6 +50,10 @@ pub enum ErrorKind {
     /// The bytes claimed a format but failed strict validation.
     Malformed,
     /// The input was cut short of what the format requires.
+    ///
+    /// Reserved: no extractor records it yet (a short input currently
+    /// surfaces as [`Self::Malformed`] or [`Self::Panic`]), but consumers
+    /// should handle it.
     Truncated,
     /// The strict parse failed but a less-strict path succeeded; the
     /// data is present but came from a fallback interpretation.
@@ -64,6 +68,8 @@ pub enum ErrorKind {
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum Stage {
+    /// File-type identification, before any extractor runs.
+    Identify,
     /// Top-level PE/COFF header parse.
     PeParse,
     /// PE resource directory walk.
@@ -86,6 +92,10 @@ pub enum Stage {
     PdfParse,
     /// RPM header parse.
     RpmParse,
+    /// WebAssembly module section walk.
+    WasmParse,
+    /// 7-Zip header parse.
+    SevenZipParse,
     /// Tree-sitter parser setup or guarded source parse.
     SourceParse,
     /// Source-language extraction from an existing Tree-sitter parse.
@@ -124,9 +134,9 @@ impl Errors {
         Self::default()
     }
 
-    /// Record an extractor failure at the given stage. Replaces the
-    /// older `record_panic` / `record_malformed` / `record_fallback`
-    /// trio with a single entry point.
+    /// Record an extractor failure at the given stage. Extractors call it
+    /// through the `record_panic` / `record_malformed` /
+    /// `record_fallback` shorthands below.
     pub(crate) fn record(&mut self, kind: ErrorKind, stage: Stage, message: impl Into<String>) {
         self.0.push(ParseError {
             kind,

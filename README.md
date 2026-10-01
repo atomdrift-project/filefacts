@@ -50,7 +50,7 @@ brew install atomdrift-project/tap/filefacts
 
 ### Build the CLI from source
 
-Source builds require Git, Make, a C/C++ toolchain, and Rust 1.85 or newer.
+Source builds require Git, Make, a C/C++ toolchain, and Rust 1.94 or newer.
 
 ```bash
 git clone https://github.com/atomdrift-project/filefacts.git
@@ -90,13 +90,21 @@ without running the script.
 | `identity` | Normalized package, signing, and producer identity claims |
 | `values` | Format-specific structural fields |
 | `text` / `literals` | Byte-scan text and parser-extracted string literals |
+| `comments` | Comment bodies from recognized source languages |
 | `metrics` | Entropy, sizes, counts, and other numeric features |
 | `sections` | Executable sections and segments |
 | `symbols` | Imports, exports, functions, calls, members, and identifiers |
 | `flow` | Value relationships, producer, and limitations (opt-in) |
-| `archive_members` | Recursively discovered container entries |
-| `source_ast` | tree-sitter facts for recognized source languages |
+| `references` | Packages, URLs, and files the artifact points at (never fetched) |
+| `archive_members` | Typed index of an archive's members: names, sizes, offsets |
 | `errors` | Recoverable parser and extractor diagnostics |
+
+Library callers can also borrow the shared tree-sitter parse with
+`ParsedFile::source_ast()`; it is not a CLI view.
+
+On the command line a view is selected by name or with `--<view>`. When a
+positional name is also an existing file, the file wins; use the flag form to
+force the view.
 
 `ParsedFile::flow()` returns the shared `Flow` model. The view is lazy and
 opt-in, so the default CLI bundle does not construct it. Currently the source
@@ -104,14 +112,25 @@ parser produces flow; binary flow recovery is not implemented. Unsupported
 analysis returns `None` (`null` in CLI JSON), not an empty graph. Missing flow
 or missing relationships are not evidence that a file is safe.
 
-The schema is versioned with `SCHEMA_VERSION`. Views are cached as
-content-addressed, zstd-compressed records to make repeated corpus passes
-inexpensive.
+The schema is versioned with `SCHEMA_VERSION`. The CLI caches views on disk as
+content-addressed, zstd-compressed records under the user cache directory
+(for example `~/.cache/atomdrift/filefacts`) to make repeated corpus passes
+inexpensive. Library callers get the same cache only by opting in with
+`filefacts::cache::enable_by_default()` (or `set_caching_enabled(true)`);
+otherwise a `ParsedFile` never touches the disk. Entries are keyed by content
+and the filefacts source, so upgrading filefacts never serves stale results.
 
 Most parsing is in-process. For PE, ELF, and Mach-O files, filefacts can invoke
 an installed Rizin or radare2 subprocess to recover deeper control-flow and
 symbol information. Its presence and version are part of the cache key, so pin
 the analysis environment when producing reproducible training data.
+
+### Environment variables
+
+| Variable | Effect |
+| --- | --- |
+| `FILEFACTS_CACHE` | `0` or `false` disables the disk cache; any other value enables it, including for library callers that did not opt in. `filefacts::cache::set_caching_enabled` overrides it. |
+| `FILEFACTS_DEBUG` | Any value other than empty, `0`, or `false` prints extractor diagnostics to stderr. |
 
 ## Coverage
 

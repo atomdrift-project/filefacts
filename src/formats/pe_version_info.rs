@@ -46,8 +46,14 @@ pub(super) fn extract(
 
 /// Maximum VS_VERSIONINFO tree depth honoured while indexing value offsets.
 /// Real resources are 4 levels (root → StringFileInfo → StringTable → String);
-/// the cap bounds stack use on a hostile/looping blob.
+/// the cap bounds recursion (stack) depth only. Total work is bounded by
+/// clamping each child to its parent and by [`MAX_VERSION_NODES`].
 const MAX_VERSION_DEPTH: u8 = 8;
+
+/// Maximum blocks visited in one VS_VERSIONINFO walk. A real resource holds
+/// about a dozen strings per locale; this leaves room for many locales while
+/// capping the work a forged blob can demand.
+const MAX_VERSION_NODES: usize = 4096;
 
 /// Map a VS_VERSIONINFO `String` key to the `pe.version.*` leaf the value-tree
 /// uses (must match [`string_table`]), so the emitted `<leaf>_offset` companion
@@ -97,14 +103,26 @@ fn align4(n: usize) -> usize {
 /// Value, pad, Children}`. Records `pe.version.<leaf>_offset` for `String`
 /// blocks whose key is recognised, then recurses into children. Fully bounds-
 /// and depth-checked: this parses untrusted resource bytes.
-fn walk_version_block(bytes: &[u8], off: usize, depth: u8, values: &mut Values) {
-    if depth >= MAX_VERSION_DEPTH || off + 6 > bytes.len() {
+///
+/// `limit` is the parent's end: a block claiming to run past it is clamped
+/// there, so sibling subtrees cannot overlap and no byte is walked twice.
+/// `budget` counts down the blocks the whole walk may still visit.
+fn walk_version_block(
+    bytes: &[u8],
+    off: usize,
+    limit: usize,
+    depth: u8,
+    budget: &mut usize,
+    values: &mut Values,
+) {
+    if depth >= MAX_VERSION_DEPTH || *budget == 0 || off + 6 > limit {
         return;
     }
+    *budget -= 1;
     let w_length = u16::from_le_bytes([bytes[off], bytes[off + 1]]) as usize;
     let w_value_length = u16::from_le_bytes([bytes[off + 2], bytes[off + 3]]) as usize;
     let w_type = u16::from_le_bytes([bytes[off + 4], bytes[off + 5]]);
-    let block_end = off.saturating_add(w_length).min(bytes.len());
+    let block_end = off.saturating_add(w_length).min(limit);
     if w_length < 6 || block_end <= off {
         return; // zero/short length — stop rather than loop
     }
@@ -135,7 +153,7 @@ fn walk_version_block(bytes: &[u8], off: usize, depth: u8, values: &mut Values) 
         if child_len < 6 {
             break;
         }
-        walk_version_block(bytes, child, depth + 1, values);
+        walk_version_block(bytes, child, block_end, depth + 1, budget, values);
         child = align4(child.saturating_add(child_len));
     }
 }
@@ -151,7 +169,8 @@ fn emit_value_offsets(bytes: &[u8], values: &mut Values) {
         return;
     };
     let root = key_pos.saturating_sub(6);
-    walk_version_block(bytes, root, 0, values);
+    let mut budget = MAX_VERSION_NODES;
+    walk_version_block(bytes, root, bytes.len(), 0, &mut budget, values);
 }
 
 /// Emit randomness/non-linguisticness metrics over the human-readable identity
@@ -524,6 +543,46 @@ mod tests {
             .collect();
         sig.truncate(10); // cut mid-key
         emit_value_offsets(&sig, &mut v);
+    }
+
+    /// Blocks the walker visits for `blob`, rooted at offset 0.
+    fn blocks_visited(blob: &[u8]) -> usize {
+        let mut budget = MAX_VERSION_NODES;
+        walk_version_block(blob, 0, blob.len(), 0, &mut budget, &mut Values::new());
+        MAX_VERSION_NODES - budget
+    }
+
+    /// An empty-keyed, value-less block header claiming `w_length` bytes.
+    fn bare_header(w_length: u16) -> [u8; 8] {
+        let mut h = [0u8; 8];
+        h[0..2].copy_from_slice(&w_length.to_le_bytes());
+        h[4..6].copy_from_slice(&1u16.to_le_bytes()); // wType = text
+        h
+    }
+
+    #[test]
+    fn version_walker_clamps_children_to_their_parent() {
+        // Each unit is a 16-byte block A whose only child B claims 0xFFFF
+        // bytes, so B's "children" are every later unit. Unclamped, each A is
+        // re-walked under every earlier B -- work combinatorial in the unit
+        // count. Clamped to A, each B is a leaf: one root plus two per unit.
+        const UNITS: usize = 100;
+        let mut units = Vec::new();
+        for _ in 0..UNITS {
+            units.extend_from_slice(&bare_header(16));
+            units.extend_from_slice(&bare_header(0xFFFF));
+        }
+        let root = version_block("VS_VERSION_INFO", None, &units);
+        assert_eq!(blocks_visited(&root), 1 + 2 * UNITS);
+    }
+
+    #[test]
+    fn version_walker_stops_at_the_node_budget() {
+        // Well-nested but implausibly dense: the root's 64 KiB holds ~8k
+        // empty children, past the per-walk budget.
+        let children: Vec<u8> = (0..8000).flat_map(|_| bare_header(8)).collect();
+        let root = version_block("VS_VERSION_INFO", None, &children);
+        assert_eq!(blocks_visited(&root), MAX_VERSION_NODES);
     }
 
     #[test]

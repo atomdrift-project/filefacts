@@ -4,7 +4,7 @@ use crate::metric;
 use serde_json::Value as JsonValue;
 
 use crate::output::{Section, Strings, Text, Values};
-use crate::scan::ascii;
+use crate::scan::{ascii, entropy};
 
 /// Whether stng's XOR seed search runs for a member.
 ///
@@ -421,12 +421,14 @@ pub(super) fn rizin_decision(
             .filter(|symbol| symbol.kind() == crate::SymbolKind::Function)
             .count(),
         section_count: sections.len(),
-        stripped: metrics.get("binary.is_stripped").map(|value| value != 0.0),
+        stripped: metrics
+            .get_key(&metric!("binary.is_stripped"))
+            .map(|value| value != 0.0),
         go_function_metadata,
         string_count: strings.text.len(),
         string_bytes,
         code_entropy: weighted_code_entropy(sections),
-        overall_entropy: metrics.get("file.entropy").unwrap_or(0.0),
+        overall_entropy: metrics.get_key(&metric!("file.entropy")).unwrap_or(0.0),
     })
 }
 
@@ -631,13 +633,100 @@ pub(super) fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
+/// Shannon entropy of the file bytes a section header places at
+/// `offset..offset + size`, clamped to the end of the file. 0.0 for an empty
+/// section or one that starts past EOF.
+pub(super) fn section_entropy(bytes: &[u8], offset: u64, size: u64) -> f64 {
+    let Ok(start) = usize::try_from(offset) else {
+        return 0.0;
+    };
+    let len = usize::try_from(size).unwrap_or(usize::MAX);
+    let end = start.saturating_add(len).min(bytes.len());
+    bytes.get(start..end).map_or(0.0, entropy::shannon)
+}
+
+/// Format a 16-byte Microsoft GUID as `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
+/// The first three fields are stored little-endian and the last two
+/// byte-for-byte, so the result matches `dumpbin`, symchk and `ikdasm`.
+pub(super) fn format_guid(b: &[u8; 16]) -> String {
+    let data1 = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    let data2 = u16::from_le_bytes([b[4], b[5]]);
+    let data3 = u16::from_le_bytes([b[6], b[7]]);
+    format!(
+        "{data1:08x}-{data2:04x}-{data3:04x}-{}-{}",
+        hex_encode(&b[8..10]),
+        hex_encode(&b[10..16])
+    )
+}
+
+/// Read an unsigned LEB128 (Go's "uvarint") at `*offset`, advancing past it.
+/// Mirrors `scroll::Uleb128::read`: `None` when the encoding is truncated or
+/// runs past ten bytes.
+pub(super) fn read_uleb128(bytes: &[u8], offset: &mut usize) -> Option<u64> {
+    let mut value: u64 = 0;
+    let mut shift = 0u32;
+    loop {
+        let byte = *bytes.get(*offset)?;
+        *offset += 1;
+        if shift >= 64 {
+            return None;
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+        shift += 7;
+    }
+}
+
+/// Nesting honoured by [`plist_to_json`]. Bounds stack use on plists whose
+/// value graph nests arrays and dictionaries beyond what real Apple artifacts
+/// emit.
+const MAX_PLIST_DEPTH: u8 = 64;
+
+/// Project a parsed plist (an embedded `Info.plist`, code-signing
+/// entitlements) into JSON. Nodes deeper than [`MAX_PLIST_DEPTH`] and types
+/// with no JSON analogue (`Data`, `Uid`) become `null`.
+pub(super) fn plist_to_json(value: plist::Value, depth: u8) -> JsonValue {
+    use plist::Value as P;
+    if depth > MAX_PLIST_DEPTH {
+        return JsonValue::Null;
+    }
+    match value {
+        P::String(s) => JsonValue::String(s),
+        P::Integer(i) => i
+            .as_signed()
+            .map(|n| JsonValue::Number(n.into()))
+            .or_else(|| i.as_unsigned().map(|u| JsonValue::Number(u.into())))
+            .unwrap_or(JsonValue::Null),
+        P::Real(f) => serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number),
+        P::Boolean(b) => JsonValue::Bool(b),
+        P::Date(d) => JsonValue::String(format!("{d:?}")),
+        P::Array(arr) => JsonValue::Array(
+            arr.into_iter()
+                .map(|v| plist_to_json(v, depth + 1))
+                .collect(),
+        ),
+        P::Dictionary(dict) => {
+            let mut obj = serde_json::Map::new();
+            for (k, v) in dict {
+                obj.insert(k, plist_to_json(v, depth + 1));
+            }
+            JsonValue::Object(obj)
+        }
+        _ => JsonValue::Null,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        LARGE_RIZIN_INPUT, NativeFormat, RizinDecision, RizinProfile, XorScan, basename,
-        cfb_entry_path, decide_rizin, extract_text_strings, has_xor_intent, hex_encode, stem,
+        LARGE_RIZIN_INPUT, MAX_PLIST_DEPTH, NativeFormat, RizinDecision, RizinProfile, XorScan,
+        basename, cfb_entry_path, decide_rizin, extract_text_strings, format_guid, has_xor_intent,
+        hex_encode, plist_to_json, read_uleb128, section_entropy, stem,
     };
     use crate::output::Strings;
+    use serde_json::Value as JsonValue;
 
     fn transparent_profile(format: NativeFormat) -> RizinProfile {
         RizinProfile {
@@ -826,6 +915,68 @@ mod tests {
         assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
         assert_eq!(hex_encode(&[0x00, 0xff]), "00ff");
         assert_eq!(hex_encode(&[]), "");
+    }
+
+    #[test]
+    fn section_entropy_clamps_to_the_file() {
+        let bytes: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(section_entropy(&bytes, 0, 256), 8.0);
+        // A section running past EOF is measured over the bytes that exist.
+        assert_eq!(section_entropy(&bytes, 128, u64::MAX), 7.0);
+        assert_eq!(section_entropy(&bytes, 0, 0), 0.0);
+        assert_eq!(section_entropy(&bytes, 256, 16), 0.0);
+        assert_eq!(section_entropy(&bytes, u64::MAX, 16), 0.0);
+    }
+
+    #[test]
+    fn format_guid_byteswaps_the_first_three_fields() {
+        // On disk the first three fields are little-endian, the rest bytes.
+        let sequential: [u8; 16] = std::array::from_fn(|i| i as u8 + 1);
+        assert_eq!(
+            format_guid(&sequential),
+            "04030201-0605-0807-090a-0b0c0d0e0f10"
+        );
+        assert_eq!(
+            format_guid(&[0u8; 16]),
+            "00000000-0000-0000-0000-000000000000"
+        );
+        // A .NET MVID that ikdasm prints as {3C2F06E5-115F-41C1-9886-1F7748FBEF06}.
+        let mvid = [
+            0xe5, 0x06, 0x2f, 0x3c, 0x5f, 0x11, 0xc1, 0x41, 0x98, 0x86, 0x1f, 0x77, 0x48, 0xfb,
+            0xef, 0x06,
+        ];
+        assert_eq!(format_guid(&mvid), "3c2f06e5-115f-41c1-9886-1f7748fbef06");
+    }
+
+    #[test]
+    fn uleb128_advances_past_the_value() {
+        let bytes = [0xE5, 0x8E, 0x26, 0x05];
+        let mut off = 0;
+        assert_eq!(read_uleb128(&bytes, &mut off), Some(624_485));
+        assert_eq!(off, 3);
+        assert_eq!(read_uleb128(&bytes, &mut off), Some(5));
+        assert_eq!(read_uleb128(&bytes, &mut off), None);
+        // Ten bytes is the longest a 64-bit value can take.
+        let mut max = [0xff; 10];
+        max[9] = 0x01;
+        assert_eq!(read_uleb128(&max, &mut 0), Some(u64::MAX));
+        assert_eq!(read_uleb128(&[0xff; 11], &mut 0), None);
+    }
+
+    #[test]
+    fn plist_to_json_stops_at_the_depth_cap() {
+        let mut nested = plist::Value::String("leaf".into());
+        for _ in 0..=MAX_PLIST_DEPTH {
+            nested = plist::Value::Array(vec![nested]);
+        }
+        let mut json = &plist_to_json(nested, 0);
+        let mut levels = 0;
+        while let Some(inner) = json.as_array().and_then(|a| a.first()) {
+            json = inner;
+            levels += 1;
+        }
+        assert_eq!(levels, usize::from(MAX_PLIST_DEPTH) + 1);
+        assert_eq!(*json, JsonValue::Null);
     }
 
     #[test]

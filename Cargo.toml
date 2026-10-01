@@ -58,8 +58,10 @@ gimli = { version = "0.32", default-features = false, features = ["read", "std"]
 # packed runs, decodes XOR-obfuscated and base64-wrapped payloads.
 # Cleave used to call this directly; centralising in filefacts lets every
 # consumer get the same high-quality string set.
-# Track upstream HEAD until the next stng release is cut.
-stng = { git = "https://github.com/atomdrift-project/stng.git" }
+# Pinned to an exact rev until the next stng release is cut: stng types
+# (`ExtractedString`, `StringMethod`, ...) are part of filefacts' public API,
+# so `cargo update` must not move it. Bump the rev deliberately.
+stng = { git = "https://github.com/atomdrift-project/stng.git", rev = "98c580eaf8d6899b23d21f557dcfe27d03664514" }
 
 
 # Archive index readers. We use these for header/central-directory enumeration
@@ -136,6 +138,14 @@ tree-sitter-groovy = "0.1"
 tree-sitter-zig = "1.1"
 tree-sitter-elixir = "0.3"
 tree-sitter-make = "1.1.1"
+tree-sitter-batch = "0.11.1"
+# Vendored: the published 0.1.0 pins tree-sitter ^0.25.6, conflicting with this
+# crate's 0.28 (links = "tree-sitter" permits only one). The vendored copy bumps
+# that to 0.28 (the grammar binds via tree-sitter-language's decoupled
+# LanguageFn ABI, so the parser.c is forward-compatible). A path dependency
+# (not crates.io + [patch]) so it resolves transitively when filefacts is itself
+# consumed as a git dependency — [patch] only applies in the root crate.
+tree-sitter-clojure = { path = "vendor/tree-sitter-clojure" }
 
 # Authenticode signature parsing. `cms` parses the PKCS#7 SignedData
 # envelope; `x509-cert` decodes the embedded signer certificate;
@@ -160,18 +170,9 @@ zstd = "0.13"
 # (Windows).
 dirs = "6"
 
-# Temp file handling for rizin input materialisation. The existing rizin
-# integration was using std::env::temp_dir manually; `tempfile` cleans
-# up properly on Drop and avoids races.
+# Temp file handling for rizin input materialisation and atomic disk-cache
+# writes. `tempfile` cleans up properly on Drop and avoids races.
 tempfile = "3"
-# Vendored: the published 0.1.0 pins tree-sitter ^0.25.6, conflicting with this
-# crate's 0.26 (links = "tree-sitter" permits only one). The vendored copy bumps
-# that to 0.26 (the grammar binds via tree-sitter-language's decoupled
-# LanguageFn ABI, so the parser.c is forward-compatible). A path dependency
-# (not crates.io + [patch]) so it resolves transitively when filefacts is itself
-# consumed as a git dependency — [patch] only applies in the root crate.
-tree-sitter-batch = "0.11.1"
-tree-sitter-clojure = { path = "vendor/tree-sitter-clojure" }
 
 # Process group / RLIMIT / PR_SET_PDEATHSIG hooks for the hardened
 # rizin subprocess. Unix only — the gates in `rizin.rs` are
@@ -212,7 +213,6 @@ unused_must_use = "warn"
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 # Public-API friction without forensic benefit.
-module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 # Metrics are intentionally f64. The precision boundary at 2^53 is an
@@ -240,7 +240,6 @@ byte_char_slices = "allow"
 int_plus_one = "allow"
 cast_lossless = "allow"
 manual_let_else = "allow"
-redundant_pattern_matching = "allow"
 manual_contains = "allow"
 explicit_iter_loop = "allow"
 # Single-byte counts run over short, bounded format tokens; the SIMD bytecount
@@ -273,7 +272,6 @@ too_many_arguments = "allow"
 struct_field_names = "allow"
 struct_excessive_bools = "allow"
 needless_character_iteration = "allow"
-derivable_impls = "allow"
 single_match_else = "allow"
 borrow_as_ptr = "allow"
 float_cmp = "allow"

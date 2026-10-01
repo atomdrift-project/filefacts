@@ -1,5 +1,5 @@
 //! Source-language producer for the shared flow view.
-use super::{ast_walk, langs::LangConfig};
+use super::{MAX_FLOW_DEPTH, ast_walk, langs::LangConfig, named_children};
 use crate::{Arg, Flow, FlowFunction, FlowValue, Symbol, Symbols};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tree_sitter::Node;
@@ -14,11 +14,6 @@ struct Builder<'a> {
     flow: Flow,
     steps: usize,
     in_function: bool,
-}
-
-fn children(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).collect()
 }
 
 fn definition(node: Node<'_>) -> bool {
@@ -66,6 +61,14 @@ impl Builder<'_> {
     fn text(&self, n: Node<'_>) -> &str {
         &self.source[n.byte_range()]
     }
+    /// A Python f-string decodes as a string argument, but its `{…}`
+    /// interpolations carry values, so it is evaluated as an expression.
+    fn interpolates(&self, node: Node<'_>) -> bool {
+        self.config.name == "python"
+            && named_children(node)
+                .iter()
+                .any(|child| child.kind() == "interpolation")
+    }
     fn add(&mut self, kind: &str, node: Node<'_>, inputs: Vec<usize>) -> usize {
         if self.flow.values.len() >= NODE_LIMIT {
             self.flow.limitations.insert("node-budget".into());
@@ -90,7 +93,7 @@ impl Builder<'_> {
             node.kind(),
             "expression_list" | "pattern_list" | "tuple_pattern"
         ) {
-            for child in children(node) {
+            for child in named_children(node) {
                 self.bind(child, value, bindings);
             }
         } else if let Some(declarator) = node.child_by_field_name("declarator") {
@@ -104,7 +107,10 @@ impl Builder<'_> {
         returns: &mut Vec<usize>,
         depth: usize,
     ) -> usize {
-        if self.steps == STEP_LIMIT || depth > 96 || self.flow.values.len() >= NODE_LIMIT {
+        if self.steps == STEP_LIMIT
+            || depth > MAX_FLOW_DEPTH
+            || self.flow.values.len() >= NODE_LIMIT
+        {
             self.flow.limitations.insert("analysis-budget".into());
             return 0;
         }
@@ -138,7 +144,8 @@ impl Builder<'_> {
                 | Arg::Bool { .. }
                 | Arg::Null
                 | Arg::Template { .. }
-        ) {
+        ) && !self.interpolates(node)
+        {
             let id = self.add("literal", node, Vec::new());
             if id != 0 {
                 self.flow.values[id].literal = Some(literal);
@@ -225,7 +232,7 @@ impl Builder<'_> {
                 if self.config.name == "perl" && args.kind() != "list_expression" {
                     inputs.push(self.eval(args, bindings, returns, depth + 1));
                 } else {
-                    for arg in children(args) {
+                    for arg in named_children(args) {
                         inputs.push(self.eval(arg, bindings, returns, depth + 1));
                     }
                 }
@@ -258,7 +265,7 @@ impl Builder<'_> {
             let entries = if node.kind() == "keyword_argument" {
                 vec![node]
             } else {
-                children(node)
+                named_children(node)
             };
             for entry in entries {
                 let key = entry
@@ -361,7 +368,7 @@ impl Builder<'_> {
         };
         let mut declared = HashMap::new();
         if scoped {
-            for child in children(node) {
+            for child in named_children(node) {
                 let declarations = if matches!(
                     child.kind(),
                     "lexical_declaration"
@@ -369,7 +376,7 @@ impl Builder<'_> {
                         | "local_variable_declaration"
                         | "declaration"
                 ) {
-                    children(child)
+                    named_children(child)
                 } else {
                     vec![child]
                 };
@@ -395,7 +402,7 @@ impl Builder<'_> {
             }
         }
         let mut inputs = Vec::new();
-        for child in children(node) {
+        for child in named_children(node) {
             inputs.push(self.eval(child, bindings, returns, depth + 1));
         }
         for name in declared.keys() {
@@ -475,7 +482,7 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
                 let mut function = FlowFunction::default();
                 let mut bindings = globals.clone();
                 if let Some(params) = field_nested(node, "parameters") {
-                    for param in children(params) {
+                    for param in named_children(params) {
                         let pattern = param
                             .child_by_field_name("pattern")
                             .or_else(|| param.child_by_field_name("name"))
@@ -504,7 +511,7 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
                 }
                 continue;
             }
-            stack.extend(children(node));
+            stack.extend(named_children(node));
         }
         for name in duplicate_names {
             builder.flow.functions.remove(&name);
@@ -760,6 +767,27 @@ mod tests {
             );
         }
     }
+    /// A prefixed Python string is a constant, but an f-string's
+    /// interpolations still carry the values they embed.
+    #[test]
+    fn python_prefixed_strings_are_literals_but_interpolations_flow() {
+        let flow = graph("a.py", "def run():\n send(f\"{acquire()}\")\n");
+        assert!(reaches(&flow, "send", "acquire"), "{flow:?}");
+        let flow = graph("a.py", "def run():\n send(b\"\\x41\")\n");
+        let sink = flow
+            .values
+            .iter()
+            .find(|v| v.target.as_deref() == Some("send"))
+            .unwrap();
+        assert!(
+            matches!(
+                &flow.values[sink.inputs[0]].literal,
+                Some(Arg::String { value }) if value == "A"
+            ),
+            "{flow:?}"
+        );
+    }
+
     #[test]
     fn helper_calls_do_not_contaminate_each_other() {
         let flow = graph(

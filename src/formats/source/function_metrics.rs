@@ -29,13 +29,14 @@ struct FunctionInfo {
 }
 
 /// Walk the tree, collect function info, and emit `functions.*` metrics.
+/// Returns the number of functions found, for the caller's ratios.
 pub(super) fn emit(
     root: Node<'_>,
     source: &str,
     config: &LangConfig,
     total_lines: u32,
     metrics: &mut Metrics,
-) {
+) -> usize {
     let mut functions: Vec<FunctionInfo> = Vec::new();
     let mut capped = false;
     collect(root, source, config, 0, 0, &mut functions, &mut capped);
@@ -47,9 +48,10 @@ pub(super) fn emit(
         metrics.insert(metric!("ast.depth_capped"), 1.0);
     }
     if functions.is_empty() {
-        return;
+        return 0;
     }
     emit_metrics(&functions, total_lines, metrics);
+    functions.len()
 }
 
 /// Function-defining node kinds per language. Mirrors the
@@ -71,20 +73,6 @@ fn function_kinds_for(lang: &str) -> &'static [&'static str] {
         "bash" => &["function_definition"],
         "php" => &["function_definition", "method_declaration"],
         _ => &[],
-    }
-}
-
-/// Field name on the function-definition node holding the parameter list.
-fn function_params_field(lang: &str) -> &'static str {
-    match lang {
-        "rust" => "parameters",
-        "go" => "parameters",
-        "javascript" | "typescript" => "parameters",
-        "python" => "parameters",
-        "java" => "parameters",
-        "php" => "parameters",
-        "bash" => "body",
-        _ => "parameters",
     }
 }
 
@@ -140,8 +128,10 @@ fn build_info(node: Node<'_>, source: &str, config: &LangConfig, depth: u32) -> 
     let end_line = node.end_position().row as u32;
     let line_count = end_line.saturating_sub(start_line) + 1;
 
+    // Every grammar here names the list `parameters`. A shell function has
+    // none (it reads `$1`, `$@`), so it counts zero parameters.
     let (param_count, param_names) = node
-        .child_by_field_name(function_params_field(config.name))
+        .child_by_field_name("parameters")
         .map(|params| collect_param_names(params, source))
         .unwrap_or((0, Vec::new()));
 
@@ -406,4 +396,19 @@ fn has_numeric_suffix(name: &str) -> bool {
     let last = chars[chars.len() - 1];
     let second_last = chars[chars.len() - 2];
     last.is_ascii_digit() && second_last.is_ascii_alphabetic()
+}
+
+#[cfg(test)]
+mod tests {
+    /// A shell function has no parameter list; the statements in its body
+    /// must not be counted as parameters.
+    #[test]
+    fn shell_function_statements_are_not_parameters() {
+        let src = b"greet() {\n  echo a\n  echo b\n  echo c\n}\n";
+        let parsed = crate::open_with_path(std::path::Path::new("f.sh"), src).unwrap();
+        let metrics = parsed.metrics();
+        assert_eq!(metrics.get("functions.no_params_count"), Some(1.0));
+        assert_eq!(metrics.get("functions.max_params"), None);
+        assert_eq!(metrics.get("functions.avg_params"), None);
+    }
 }

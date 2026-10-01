@@ -115,6 +115,12 @@ impl<'de> Deserialize<'de> for Fact {
 /// that need integer precision can round at the boundary. Byte offsets are
 /// never the value — they live in a fact's [`Fact::spans`], which are `u64`
 /// and so exact for large files.
+///
+/// Boolean flags come in two encodings. Some are presence-only: `1.0` when
+/// the flag holds and absent otherwise (`binary.has_overlay`). Others are
+/// written as `0.0`/`1.0` whenever the fact is known (`binary.is_pie`,
+/// `rar.solid`, every `registry.*` flag), so absence means unknown. Test a
+/// flag with `>= 1`, which reads the same under both.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Metrics(BTreeMap<String, Fact>);
@@ -156,6 +162,13 @@ impl Metrics {
     /// Look up a metric's value.
     pub fn get(&self, key: &str) -> Option<f64> {
         self.0.get(key).map(|f| f.value)
+    }
+
+    /// [`Self::get`] for a catalog-checked key: `metrics.get_key(&metric!("…"))`
+    /// fails to build on a key no extractor emits, where `get` would just
+    /// return `None` forever.
+    pub fn get_key(&self, key: &MetricKey) -> Option<f64> {
+        self.get(key.as_str())
     }
 
     /// Look up a metric's full fact, including any spans.

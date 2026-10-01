@@ -29,21 +29,30 @@
 //! | Operation                                              | Helper                |
 //! |--------------------------------------------------------|------------------------|
 //! | `PE::parse(...)` / `parse_with_opts(...)`              | [`parse_pe`]           |
+//! | `pe::header::Header::parse(...)`                       | [`parse_pe_header`]    |
 //! | `Elf::parse(...)`                                      | [`parse_elf`]          |
 //! | `Mach::parse(...)`                                     | [`parse_mach`]         |
+//! | `MachO::parse(...)` on one fat-binary slice            | [`parse_macho_slice`]  |
 //! | A `Result<T, goblin::error::Error>` you call later     | [`catch`]              |
 //! | A non-`Result` lazy access (e.g. `resource_data.count()`) | [`catch_infallible`] |
+//! | A lazy iterator (notes, debug entries, symbol versions) | [`drain`] / [`drain_or_record`] |
 //!
 //! `parse_pe` already does the strict→permissive fallback internally;
 //! callers should not reach for `PE::parse_with_opts` directly.
 
 use goblin::elf::Elf;
 use goblin::error::Error as GoblinError;
-use goblin::mach::Mach;
+use goblin::mach::{Mach, MachO};
 use goblin::pe::PE;
+use goblin::pe::header::Header as PeHeader;
 use std::cell::Cell;
+use std::fmt;
 use std::panic;
 use std::sync::Once;
+
+use crate::Stage;
+use crate::formats::common::read_uleb128;
+use crate::output::Errors;
 
 /// Outcome of a goblin operation, distinguishing a normal `Err` from
 /// a caught panic so callers can log them differently.
@@ -66,6 +75,67 @@ impl<T> GoblinOutcome<T> {
         match self {
             Self::Ok(t) => Some(t),
             _ => None,
+        }
+    }
+}
+
+/// Why a pre-check refused to let goblin walk a structure. Callers render it
+/// with `Display` into `GoblinError::Malformed` or the structured errors view,
+/// so the text is part of the output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rejection {
+    /// COFF `NumberOfSections` far past what any loader accepts.
+    TooManySections(u16),
+    /// Optional-header `NumberOfRvaAndSizes` past the spec's 16.
+    TooManyDataDirectories(u32),
+    /// An import or resource directory `size` beyond the file or 10 MiB.
+    OversizedDirectory { table: &'static str, size: u32 },
+    /// An import descriptor array with no terminator within budget.
+    UnterminatedImportDirectory,
+    /// Import lookup tables too long to walk within budget.
+    OversizedImportLookupTables,
+    /// An export-trie edge back to a node already visited.
+    ExportTrieLoop {
+        node: usize,
+        start: usize,
+        end: usize,
+    },
+    /// An export-trie node claiming more branches than the trie can hold.
+    ExportTrieBranches {
+        node: usize,
+        branches: u64,
+        available: usize,
+    },
+}
+
+impl fmt::Display for Rejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::TooManySections(n) => write!(f, "too many sections ({n})"),
+            Self::TooManyDataDirectories(n) => write!(f, "too many data directories ({n})"),
+            Self::OversizedDirectory { table, size } => {
+                write!(f, "malformed {table} table size ({size} bytes)")
+            }
+            Self::UnterminatedImportDirectory => write!(
+                f,
+                "import directory exceeds {MAX_IMPORT_DESCRIPTORS} descriptors without terminating"
+            ),
+            Self::OversizedImportLookupTables => write!(
+                f,
+                "import lookup tables exceed {MAX_IMPORT_LOOKUP_ENTRIES} entries"
+            ),
+            Self::ExportTrieLoop { node, start, end } => write!(
+                f,
+                "export trie loops back to node {node:#x} (trie {start:#x}..{end:#x})"
+            ),
+            Self::ExportTrieBranches {
+                node,
+                branches,
+                available,
+            } => write!(
+                f,
+                "export trie node {node:#x} claims {branches} branches in {available} bytes"
+            ),
         }
     }
 }
@@ -150,7 +220,7 @@ pub(crate) struct PeParse<'a> {
     /// budget, so the returned PE was parsed with imports disabled. Callers
     /// should surface it: an unwalkable import table is a fact about the
     /// sample, not an internal detail.
-    pub(crate) imports_skipped: Option<String>,
+    pub(crate) imports_skipped: Option<Rejection>,
 }
 
 impl<'a> PeParse<'a> {
@@ -172,7 +242,7 @@ impl<'a> PeParse<'a> {
 /// strict error is the more actionable signal).
 pub(crate) fn parse_pe(data: &[u8]) -> PeParse<'_> {
     if let Err(e) = validate_pe_header(data) {
-        return PeParse::parsed(GoblinOutcome::Failed(GoblinError::Malformed(e)));
+        return PeParse::parsed(GoblinOutcome::Failed(GoblinError::Malformed(e.to_string())));
     }
 
     let strict = catch(|| PE::parse(data));
@@ -252,7 +322,7 @@ const MAX_IMPORT_LOOKUP_ENTRIES: usize = 256 * 1024;
 ///
 /// Fails open: anything it cannot resolve counts as within budget, so a PE
 /// shape this pre-walk does not model keeps exactly today's behaviour.
-fn import_walk_budget(data: &[u8], pe: &PE<'_>) -> Result<(), String> {
+fn import_walk_budget(data: &[u8], pe: &PE<'_>) -> Result<(), Rejection> {
     use goblin::pe::import::SIZEOF_IMPORT_DIRECTORY_ENTRY;
     use goblin::pe::options::ParseOptions;
 
@@ -296,9 +366,7 @@ fn import_walk_budget(data: &[u8], pe: &PE<'_>) -> Result<(), String> {
 
         descriptors += 1;
         if descriptors > MAX_IMPORT_DESCRIPTORS {
-            return Err(format!(
-                "import directory exceeds {MAX_IMPORT_DESCRIPTORS} descriptors without terminating"
-            ));
+            return Err(Rejection::UnterminatedImportDirectory);
         }
 
         // goblin prefers the lookup table and falls back to the address table.
@@ -309,9 +377,7 @@ fn import_walk_budget(data: &[u8], pe: &PE<'_>) -> Result<(), String> {
                 }
                 entries += 1;
                 if entries > MAX_IMPORT_LOOKUP_ENTRIES {
-                    return Err(format!(
-                        "import lookup tables exceed {MAX_IMPORT_LOOKUP_ENTRIES} entries"
-                    ));
+                    return Err(Rejection::OversizedImportLookupTables);
                 }
                 cursor += entry_size;
             }
@@ -388,7 +454,7 @@ pub(crate) fn neutralize_malformed_rich_header(data: &[u8]) -> Option<Vec<u8>> {
 /// - Import / resource data-directory `size > 10 MiB` or `> file
 ///   size` (forged sizes cause goblin to allocate gigabytes for the
 ///   import table).
-fn validate_pe_header(data: &[u8]) -> Result<(), String> {
+fn validate_pe_header(data: &[u8]) -> Result<(), Rejection> {
     if data.len() < 64 {
         return Ok(());
     }
@@ -415,7 +481,7 @@ fn validate_pe_header(data: &[u8]) -> Result<(), String> {
     let coff_offset = pe_offset + 4;
     let n_sections = u16::from_le_bytes([data[coff_offset + 2], data[coff_offset + 3]]);
     if n_sections > 192 {
-        return Err(format!("too many sections ({n_sections})"));
+        return Err(Rejection::TooManySections(n_sections));
     }
 
     let opt_offset = coff_offset + 20;
@@ -443,7 +509,7 @@ fn validate_pe_header(data: &[u8]) -> Result<(), String> {
     ]);
 
     if n_dirs > 16 {
-        return Err(format!("too many data directories ({n_dirs})"));
+        return Err(Rejection::TooManyDataDirectories(n_dirs));
     }
 
     // Check the Imports (idx 1) and Resources (idx 2) data
@@ -460,8 +526,8 @@ fn validate_pe_header(data: &[u8]) -> Result<(), String> {
                     data[dir_ptr + 7],
                 ]);
                 if size > 10 * 1024 * 1024 || size as usize > data.len() {
-                    let name = if i == 1 { "import" } else { "resource" };
-                    return Err(format!("malformed {name} table size ({size} bytes)"));
+                    let table = if i == 1 { "import" } else { "resource" };
+                    return Err(Rejection::OversizedDirectory { table, size });
                 }
             }
         }
@@ -470,9 +536,42 @@ fn validate_pe_header(data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Parse only the DOS, COFF and optional headers of a PE, panic-safe. The
+/// fallback for a PE [`parse_pe`] could not parse in full.
+pub(crate) fn parse_pe_header(data: &[u8]) -> GoblinOutcome<PeHeader<'_>> {
+    catch(|| PeHeader::parse(data))
+}
+
 /// Parse an ELF, panic-safe.
 pub(crate) fn parse_elf(data: &[u8]) -> GoblinOutcome<Elf<'_>> {
     catch(|| Elf::parse(data))
+}
+
+/// Run a lazy goblin walk to completion, panic-safe. goblin's iterators (ELF
+/// notes and symbol versions, PE debug entries, Mach-O symbols and fat
+/// arches) read file-controlled offsets only as they advance, long after the
+/// parse that produced them returned, so each walk needs its own guard.
+/// Callers get a finished `Vec`, never a live goblin iterator.
+pub(crate) fn drain<I: IntoIterator>(walk: I) -> GoblinOutcome<Vec<I::Item>> {
+    catch_infallible(|| walk.into_iter().collect())
+}
+
+/// [`drain`] for callers that surface failures: a walk that panics is
+/// recorded in `errors` at `stage` and yields no items.
+pub(crate) fn drain_or_record<I: IntoIterator>(
+    walk: I,
+    errors: &mut Errors,
+    stage: Stage,
+) -> Vec<I::Item> {
+    match drain(walk) {
+        GoblinOutcome::Ok(items) => items,
+        GoblinOutcome::Panicked(msg) => {
+            errors.record_panic(stage, msg);
+            Vec::new()
+        }
+        // A drain cannot fail; goblin's per-item errors are items themselves.
+        GoblinOutcome::Failed(_) => Vec::new(),
+    }
 }
 
 /// A copy of `data` with the section header table detached, when that table
@@ -530,6 +629,12 @@ pub(crate) fn parse_mach(data: &[u8]) -> GoblinOutcome<Mach<'_>> {
     catch(|| Mach::parse(data))
 }
 
+/// Parse one architecture slice of a fat Mach-O, panic-safe. [`parse_mach`]
+/// reads only the fat header; every slice is a full parse of its own.
+pub(crate) fn parse_macho_slice(data: &[u8]) -> GoblinOutcome<MachO<'_>> {
+    catch(|| MachO::parse(data, 0))
+}
+
 /// Pre-validate the dyld export trie before `macho.exports()` walks it.
 ///
 /// goblin's `ExportTrie::walk_trie` (mach/exports.rs, 0.10.7 and master)
@@ -549,10 +654,7 @@ pub(crate) fn parse_mach(data: &[u8]) -> GoblinOutcome<Mach<'_>> {
 ///
 /// Mirrors goblin's selection of the trie: the last `LC_DYLD_INFO`,
 /// `LC_DYLD_INFO_ONLY` or `LC_DYLD_EXPORTS_TRIE` command wins.
-pub(crate) fn validate_export_trie(
-    macho: &goblin::mach::MachO<'_>,
-    bytes: &[u8],
-) -> Result<(), String> {
+pub(crate) fn validate_export_trie(macho: &MachO<'_>, bytes: &[u8]) -> Result<(), Rejection> {
     use goblin::mach::load_command::CommandVariant;
     let mut location = None;
     for lc in &macho.load_commands {
@@ -573,7 +675,7 @@ pub(crate) fn validate_export_trie(
 }
 
 /// [`validate_export_trie`] on an explicit trie range; the walk itself.
-fn validate_export_trie_bytes(bytes: &[u8], start: usize, size: usize) -> Result<(), String> {
+fn validate_export_trie_bytes(bytes: &[u8], start: usize, size: usize) -> Result<(), Rejection> {
     // goblin's `new_impl` collapses an out-of-file range to an empty trie.
     let Some(end) = start.checked_add(size).filter(|end| *end <= bytes.len()) else {
         return Ok(());
@@ -588,10 +690,7 @@ fn validate_export_trie_bytes(bytes: &[u8], start: usize, size: usize) -> Result
             continue;
         }
         if std::mem::replace(&mut visited[node - start], true) {
-            return Err(format!(
-                "export trie loops back to node {:#x} (trie {:#x}..{:#x})",
-                node, start, end
-            ));
+            return Err(Rejection::ExportTrieLoop { node, start, end });
         }
         let mut offset = node;
         let Some(terminal_size) = read_uleb128(bytes, &mut offset) else {
@@ -612,13 +711,13 @@ fn validate_export_trie_bytes(bytes: &[u8], start: usize, size: usize) -> Result
         // Every edge takes at least one byte, so a count the remaining trie
         // cannot hold is forged; goblin would only stop walking it once a read
         // fell off the end of the file. This also bounds the loop below.
-        if nbranches > (end - offset.min(end)) as u64 {
-            return Err(format!(
-                "export trie node {:#x} claims {} branches in {} bytes",
+        let available = end - offset.min(end);
+        if nbranches > available as u64 {
+            return Err(Rejection::ExportTrieBranches {
                 node,
-                nbranches,
-                end - offset.min(end)
-            ));
+                branches: nbranches,
+                available,
+            });
         }
         for _ in 0..nbranches {
             let Some(label_len) = bytes[offset..].iter().position(|&b| b == 0) else {
@@ -639,25 +738,6 @@ fn validate_export_trie_bytes(bytes: &[u8], start: usize, size: usize) -> Result
         }
     }
     Ok(())
-}
-
-/// Read an unsigned LEB128 the way `scroll::Uleb128::read` does, returning
-/// `None` where goblin would return `Err` (truncated or over 64 bits).
-fn read_uleb128(bytes: &[u8], offset: &mut usize) -> Option<u64> {
-    let mut value: u64 = 0;
-    let mut shift = 0u32;
-    loop {
-        let byte = *bytes.get(*offset)?;
-        *offset += 1;
-        if shift >= 64 {
-            return None;
-        }
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Some(value);
-        }
-        shift += 7;
-    }
 }
 
 #[cfg(test)]
@@ -766,7 +846,7 @@ mod tests {
         let bytes = pe_with_forged_import_directory(MAX_IMPORT_DESCRIPTORS + 1, false);
         let pe = importless_parse(&bytes);
         let err = import_walk_budget(&bytes, &pe).expect_err("descriptor cap must trip");
-        assert!(err.contains("descriptors"), "unexpected reason: {err}");
+        assert_eq!(err, Rejection::UnterminatedImportDirectory);
     }
 
     /// The quadratic the bound exists for: a descriptor count a cap on
@@ -777,7 +857,7 @@ mod tests {
         let bytes = pe_with_forged_import_directory(8, true);
         let pe = importless_parse(&bytes);
         let err = import_walk_budget(&bytes, &pe).expect_err("entry budget must trip");
-        assert!(err.contains("entries"), "unexpected reason: {err}");
+        assert_eq!(err, Rejection::OversizedImportLookupTables);
     }
 
     /// The bound has to be wired into `parse_pe`, not merely available: a
@@ -786,11 +866,11 @@ mod tests {
     fn parse_pe_drops_a_forged_import_table_and_keeps_the_rest() {
         let bytes = pe_with_forged_import_directory(8, true);
         let parse = parse_pe(&bytes);
-        let reason = parse
-            .imports_skipped
-            .as_deref()
-            .expect("parse_pe must report the abandoned import table");
-        assert!(reason.contains("entries"), "unexpected reason: {reason}");
+        assert_eq!(
+            parse.imports_skipped,
+            Some(Rejection::OversizedImportLookupTables),
+            "parse_pe must report the abandoned import table"
+        );
         let pe = parse
             .outcome
             .ok()
@@ -819,7 +899,10 @@ mod tests {
         data[0x41] = b'E';
         // n_sections = 0x00FF = 255 (>192 threshold).
         data[0x46] = 0xFF;
-        assert!(validate_pe_header(&data).is_err());
+        assert_eq!(
+            validate_pe_header(&data),
+            Err(Rejection::TooManySections(255))
+        );
     }
 
     #[test]
@@ -836,7 +919,116 @@ mod tests {
         data[0x40 + 24 + 92] = 16; // n_dirs = 16
         let import_size_ptr = 0x40 + 24 + 96 + 8 + 4;
         data[import_size_ptr + 3] = 0x01; // size = 16 MiB (>10 MiB cap)
-        assert!(validate_pe_header(&data).is_err());
+        assert_eq!(
+            validate_pe_header(&data),
+            Err(Rejection::OversizedDirectory {
+                table: "import",
+                size: 16 << 20,
+            })
+        );
+    }
+
+    /// The reasons land verbatim in the structured errors view, so the typed
+    /// enum must render exactly the text the old `String` reasons carried.
+    #[test]
+    fn rejection_messages_are_unchanged() {
+        for (reason, text) in [
+            (Rejection::TooManySections(255), "too many sections (255)"),
+            (
+                Rejection::TooManyDataDirectories(17),
+                "too many data directories (17)",
+            ),
+            (
+                Rejection::OversizedDirectory {
+                    table: "resource",
+                    size: 16 << 20,
+                },
+                "malformed resource table size (16777216 bytes)",
+            ),
+            (
+                Rejection::UnterminatedImportDirectory,
+                "import directory exceeds 256 descriptors without terminating",
+            ),
+            (
+                Rejection::OversizedImportLookupTables,
+                "import lookup tables exceed 262144 entries",
+            ),
+            (
+                Rejection::ExportTrieLoop {
+                    node: 0x20,
+                    start: 0x10,
+                    end: 0x40,
+                },
+                "export trie loops back to node 0x20 (trie 0x10..0x40)",
+            ),
+            (
+                Rejection::ExportTrieBranches {
+                    node: 0,
+                    branches: 100,
+                    available: 4,
+                },
+                "export trie node 0x0 claims 100 branches in 4 bytes",
+            ),
+        ] {
+            assert_eq!(reason.to_string(), text);
+        }
+    }
+
+    #[test]
+    fn parse_pe_header_handles_garbage_and_real_headers() {
+        assert!(matches!(
+            parse_pe_header(b"not a PE file at all"),
+            GoblinOutcome::Failed(_)
+        ));
+        let bytes = read_fixture("test.exe");
+        let header = parse_pe_header(&bytes).ok().expect("fixture headers parse");
+        assert!(header.optional_header.is_some());
+    }
+
+    #[test]
+    fn parse_macho_slice_handles_garbage_and_real_slices() {
+        assert!(matches!(
+            parse_macho_slice(b"not a Mach-O"),
+            GoblinOutcome::Failed(_)
+        ));
+        let bytes = read_fixture("test.macho");
+        let macho = parse_macho_slice(&bytes).ok().expect("thin fixture parses");
+        assert!(!macho.load_commands.is_empty());
+    }
+
+    #[test]
+    fn drain_runs_a_lazy_walk_to_completion() {
+        let bytes = read_fixture("test.elf");
+        let elf = Elf::parse(&bytes).expect("fixture ELF");
+        let notes = drain(
+            elf.iter_note_headers(&bytes)
+                .into_iter()
+                .flatten()
+                .flatten(),
+        )
+        .ok()
+        .expect("note walk completes");
+        // The fixture's single PT_NOTE carries its GNU build-id.
+        assert_eq!(notes.len(), 1);
+        assert_eq!((notes[0].name, notes[0].n_type), ("GNU", 3));
+    }
+
+    #[test]
+    fn drain_or_record_reports_a_walk_that_panics() {
+        let walk = (0..4).map(|i| if i == 2 { panic!("walker tripped") } else { i });
+        let mut errors = Errors::new();
+        assert!(drain_or_record(walk, &mut errors, Stage::PeParse).is_empty());
+        let recorded = errors.as_slice();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].stage, Stage::PeParse);
+        assert!(recorded[0].message.contains("walker tripped"));
+
+        let mut errors = Errors::new();
+        assert_eq!(
+            drain_or_record(0..3, &mut errors, Stage::PeParse),
+            vec![0, 1, 2]
+        );
+        assert!(errors.as_slice().is_empty());
     }
 
     #[test]
@@ -952,7 +1144,10 @@ mod tests {
     fn export_trie_rejects_root_self_loop() {
         let trie = [0x00, 0x01, b'_', b'a', 0x00, 0x00];
         let err = validate_export_trie_bytes(&trie, 0, trie.len()).expect_err("loop must trip");
-        assert!(err.contains("loops back"), "unexpected reason: {err}");
+        assert!(
+            matches!(err, Rejection::ExportTrieLoop { node: 0, .. }),
+            "unexpected reason: {err}"
+        );
     }
 
     #[test]
@@ -970,7 +1165,10 @@ mod tests {
         // Root claims 100 branches in a 6-byte trie.
         let trie = [0x00, 0x64, b'_', b'a', 0x00, 0x06];
         let err = validate_export_trie_bytes(&trie, 0, trie.len()).expect_err("count must trip");
-        assert!(err.contains("branches"), "unexpected reason: {err}");
+        assert!(
+            matches!(err, Rejection::ExportTrieBranches { branches: 100, .. }),
+            "unexpected reason: {err}"
+        );
     }
 
     #[test]

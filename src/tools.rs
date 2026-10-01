@@ -1,7 +1,8 @@
 //! Cached external-tool resolution with platform fallbacks.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 static RESOLUTIONS: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
@@ -9,20 +10,26 @@ static RESOLUTIONS: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock
 /// Resolve an external executable once per process.
 ///
 /// PATH is checked before platform fallback locations, and the resulting
-/// absolute path—or a miss—is cached. Callers should pass the returned path to
-/// `Command::new` instead of relying on a child process to repeat resolution.
+/// absolute path—or a miss—is cached. Only absolute PATH entries are
+/// searched, and on unix only files with an execute bit match. Callers
+/// should pass the returned path to `Command::new` instead of relying on a
+/// child process to repeat resolution.
 #[must_use]
 pub fn resolve(name: &str) -> Option<PathBuf> {
     let cache = RESOLUTIONS.get_or_init(|| Mutex::new(HashMap::new()));
-    let Ok(mut cache) = cache.lock() else {
-        return resolve_uncached(name);
-    };
-    if let Some(resolution) = cache.get(name) {
+    if let Ok(cache) = cache.lock()
+        && let Some(resolution) = cache.get(name)
+    {
         return resolution.clone();
     }
+    // Probe without the lock, so one slow filesystem walk doesn't stall
+    // every other lookup. Racing callers may both probe; the first answer
+    // stored is the one everyone gets.
     let resolution = resolve_uncached(name);
-    cache.insert(name.to_string(), resolution.clone());
-    resolution
+    match cache.lock() {
+        Ok(mut cache) => cache.entry(name.to_string()).or_insert(resolution).clone(),
+        Err(_) => resolution,
+    }
 }
 
 fn resolve_uncached(name: &str) -> Option<PathBuf> {
@@ -30,13 +37,37 @@ fn resolve_uncached(name: &str) -> Option<PathBuf> {
 }
 
 fn binary_in_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|dir| {
-        candidate_names(name)
-            .iter()
-            .map(|candidate| dir.join(candidate))
-            .find(|candidate| candidate.is_file())
-    })
+    binary_in(&std::env::var_os("PATH")?, name)
+}
+
+/// Search the directories of a `PATH`-style list for `name`.
+fn binary_in(path_list: &OsStr, name: &str) -> Option<PathBuf> {
+    let names = candidate_names(name);
+    std::env::split_paths(path_list)
+        // An empty or relative entry resolves against the working
+        // directory, which for a scanner is often the sample tree itself:
+        // a planted `./rizin` must not be what runs.
+        .filter(|dir| dir.is_absolute())
+        .find_map(|dir| {
+            names
+                .iter()
+                .map(|candidate| dir.join(candidate))
+                .find(|candidate| is_executable(candidate))
+        })
+}
+
+/// A regular file with an execute bit set. Windows has no execute bit, so
+/// there it is any regular file.
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
 }
 
 fn fallback_binary(name: &str) -> Option<PathBuf> {
@@ -45,7 +76,7 @@ fn fallback_binary(name: &str) -> Option<PathBuf> {
         if let Some(binary) = names
             .iter()
             .map(|candidate| root.join(candidate))
-            .find(|candidate| candidate.is_file())
+            .find(|candidate| is_executable(candidate))
         {
             return Some(binary);
         }
@@ -141,7 +172,7 @@ fn find_in_tree(root: &std::path::Path, names: &[String], depth: usize) -> Optio
     let entries = std::fs::read_dir(root).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file()
+        if is_executable(&path)
             && path.file_name().is_some_and(|file_name| {
                 names
                     .iter()
@@ -157,4 +188,47 @@ fn find_in_tree(root: &std::path::Path, names: &[String], depth: usize) -> Optio
         }
     }
     None
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Component;
+
+    const TOOL: &str = "filefacts-test-tool";
+
+    fn tool_in(dir: &Path, mode: u32) -> PathBuf {
+        let tool = dir.join(TOOL);
+        std::fs::write(&tool, b"#!/bin/sh\n").expect("write tool");
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        tool
+    }
+
+    #[test]
+    fn relative_path_entries_are_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tool = tool_in(tmp.path(), 0o755);
+        // The same directory, spelled relative to the working directory.
+        let cwd = std::env::current_dir().expect("cwd");
+        let relative: PathBuf = cwd
+            .components()
+            .skip(1)
+            .map(|_| Component::ParentDir)
+            .chain(tmp.path().components().skip(1))
+            .collect();
+        assert!(relative.join(TOOL).is_file(), "{}", relative.display());
+        assert_eq!(binary_in(relative.as_os_str(), TOOL), None);
+        assert_eq!(binary_in(OsStr::new(""), TOOL), None);
+        assert_eq!(binary_in(tmp.path().as_os_str(), TOOL), Some(tool));
+    }
+
+    #[test]
+    fn non_executable_files_are_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tool = tool_in(tmp.path(), 0o644);
+        assert_eq!(binary_in(tmp.path().as_os_str(), TOOL), None);
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(binary_in(tmp.path().as_os_str(), TOOL), Some(tool));
+    }
 }

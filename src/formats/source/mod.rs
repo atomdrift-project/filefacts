@@ -43,15 +43,25 @@ use std::cell::Cell;
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
-use tree_sitter::{Node, QueryCursor, StreamingIterator};
+use tree_sitter::{Node, Query, QueryCursor, StreamingIterator};
 
 use crate::error::Error;
 use crate::fileid::FileType;
-use crate::output::{ExtractedString, Metrics, Strings, Values};
+use crate::output::{ExtractedString, MetricKey, Metrics, Strings, Values};
 
+use langs::QueryKind;
 use serde_json::Value as JsonValue;
 
 pub(crate) use parse::{TreeCache, TreeParse, TreeSitterDiagnostic};
+
+/// Recursion bound shared by the payload- and value-flow evaluators, which
+/// recurse once per syntax level they descend.
+const MAX_FLOW_DEPTH: usize = 96;
+
+fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).collect()
+}
 
 // Tree-sitter's query match limit bounds simultaneous in-progress matches,
 // protecting against recursive/ambiguous query triggers. Allow ordinary
@@ -80,7 +90,7 @@ fn source_query_wall_budget() -> Duration {
 // fail; uniformity is more valuable than removing one always-Ok arm.
 #[allow(clippy::unnecessary_wraps)]
 pub(super) fn extract(
-    _bytes: &[u8],
+    bytes: &[u8],
     _file_type: FileType,
     tree_cache: Option<&TreeCache<'_>>,
     values: &mut Values,
@@ -92,13 +102,12 @@ pub(super) fn extract(
         // Even without a parse, the byte stream still has language-agnostic
         // text features worth surfacing — emit `text.*` metrics from the
         // raw bytes when they decode as UTF-8.
-        if let Ok(content) = std::str::from_utf8(_bytes) {
+        if let Ok(content) = std::str::from_utf8(bytes) {
             text_metrics::emit(content, metrics);
         }
         return Ok(());
     };
-    let config =
-        langs::config_for(cache.file_type()).expect("tree_cache implies config_for is Some");
+    let config = cache.config();
     let source = cache.source();
     let root = cache.tree().root_node();
 
@@ -110,13 +119,21 @@ pub(super) fn extract(
     comment_metrics::emit(source, config.comment_style, metrics, &mut strings.comments);
 
     extract_strings(root, source, config, strings);
-    let (mut imports, import_libraries) =
-        collect_imports(config.language, source, root, config.import_query);
+    let (mut imports, import_libraries) = config
+        .query(QueryKind::Imports)
+        .map(|query| collect_imports(query, source, root))
+        .unwrap_or_default();
     if config.name == "rust" {
         imports.items = rust_syntax::imports(root, source);
     }
-    let functions = collect_query(config.language, source, root, config.function_query);
-    let classes = collect_query(config.language, source, root, config.class_query);
+    let functions = config
+        .query(QueryKind::Functions)
+        .map(|query| collect_query(query, source, root))
+        .unwrap_or_default();
+    let classes = config
+        .query(QueryKind::Classes)
+        .map(|query| collect_query(query, source, root))
+        .unwrap_or_default();
     emit_query_limit_metrics(metrics, "imports", &imports);
     emit_query_limit_metrics(metrics, "functions", &functions);
     emit_query_limit_metrics(metrics, "classes", &classes);
@@ -137,11 +154,11 @@ pub(super) fn extract(
 
     // Function metrics — single AST walk over function-definition nodes.
     let total_lines = source.lines().count() as u32;
-    function_metrics::emit(root, source, config, total_lines, metrics);
+    let functions_total = function_metrics::emit(root, source, config, total_lines, metrics);
 
     // Cross-component text ratios computed from the sub-metrics we just
     // emitted. Pure division — no extra parsing.
-    emit_text_ratios(metrics, total_lines);
+    emit_text_ratios(metrics, total_lines, functions_total, imports.items.len());
 
     // Push source-language imports / functions / classes into the
     // unified Symbols view. Python from-import members retain their owning
@@ -209,8 +226,7 @@ pub(crate) fn build_symbols(
     symbols_out: &mut crate::Symbols,
     metrics: &mut Metrics,
 ) {
-    let config =
-        langs::config_for(cache.file_type()).expect("tree_cache implies config_for is Some");
+    let config = cache.config();
     let source = cache.source();
     let root = cache.tree().root_node();
     ast_walk::walk(root, source, config, symbols_out, metrics);
@@ -220,9 +236,19 @@ pub(crate) fn build_symbols(
 }
 
 pub(crate) fn build_value_flow(cache: &TreeCache<'_>, symbols: &crate::Symbols) -> crate::Flow {
-    let config =
-        langs::config_for(cache.file_type()).expect("tree_cache implies language configuration");
-    value_flow::build(cache.tree().root_node(), cache.source(), config, symbols)
+    value_flow::build(
+        cache.tree().root_node(),
+        cache.source(),
+        cache.config(),
+        symbols,
+    )
+}
+
+/// The package clause of a parsed Go file, `""` when it has none, read from
+/// the syntax tree alone. `None` for any other language.
+pub(crate) fn go_package_name<'a>(ast: &crate::SourceAst<'a>) -> Option<&'a str> {
+    (ast.file_type == FileType::Go)
+        .then(|| go_syntax::package_name(ast.tree.root_node(), ast.source))
 }
 
 fn extract_strings(
@@ -232,10 +258,16 @@ fn extract_strings(
     strings: &mut Strings,
 ) {
     let mut cursor = root.walk();
-    let mut stack: Vec<Node<'_>> = vec![root];
-    while let Some(node) = stack.pop() {
+    // Each node travels with its parent's kind: `Node::parent` walks down
+    // from the root, which would make this loop quadratic in tree depth.
+    let mut stack: Vec<(Node<'_>, &str)> = vec![(root, "")];
+    while let Some((node, parent_kind)) = stack.pop() {
         if config.string_kinds.contains(&node.kind()) {
-            if let Some(text) = decode_string_literal(node, source, config) {
+            // Unquoted forms (heredoc bodies, Perl `q{…}`, Lua `[[…]]`) have
+            // no quotes to strip, so this tier keeps their source text.
+            if let Some(text) = decode_string_literal(node, source, config)
+                .or_else(|| unquoted_literal(node, source).map(str::to_string))
+            {
                 strings.literals.push(ExtractedString {
                     text,
                     offset: node.start_byte(),
@@ -250,7 +282,7 @@ fn extract_strings(
         // Promote only host/path-shaped tokens that are direct command
         // elements; ordinary identifiers and dotted member names stay out of
         // the precise literal tier.
-        if is_protocolless_url_argument(node, source, config) {
+        if is_protocolless_url_argument(node, parent_kind, source, config) {
             if let Ok(text) = node.utf8_text(source.as_bytes()) {
                 strings.literals.push(ExtractedString {
                     text: text.to_string(),
@@ -260,18 +292,20 @@ fn extract_strings(
             }
         }
         for child in node.children(&mut cursor) {
-            stack.push(child);
+            stack.push((child, node.kind()));
         }
     }
 }
 
-fn is_protocolless_url_argument(node: Node<'_>, source: &str, config: &langs::LangConfig) -> bool {
-    if config.name != "powershell" || node.kind() != "generic_token" {
-        return false;
-    }
-    if node
-        .parent()
-        .is_none_or(|parent| parent.kind() != "command_elements")
+fn is_protocolless_url_argument(
+    node: Node<'_>,
+    parent_kind: &str,
+    source: &str,
+    config: &langs::LangConfig,
+) -> bool {
+    if config.name != "powershell"
+        || node.kind() != "generic_token"
+        || parent_kind != "command_elements"
     {
         return false;
     }
@@ -308,6 +342,14 @@ pub(super) fn looks_like_protocolless_url(value: &str) -> bool {
     })
 }
 
+/// The value a quoted string literal denotes: any `b`/`r`/`f`/`u` prefix and
+/// the quotes stripped, escapes decoded unless the literal is raw. Shared by
+/// the literal tier, call arguments, subscript folding and value flow so all
+/// of them agree on what `f"…"` or `b'…'` holds.
+///
+/// `None` when the node is not a complete quoted literal: an unterminated
+/// one, or an unquoted form such as a heredoc body, Perl `q{…}` or Lua
+/// `[[…]]`, whose text callers treat as they see fit.
 fn decode_string_literal(
     node: Node<'_>,
     source: &str,
@@ -317,33 +359,16 @@ fn decode_string_literal(
     if config.name == "elixir" && (raw.starts_with("\"\"\"") || raw.starts_with("'''")) {
         return escapes::decode_elixir_heredoc(raw);
     }
-    if raw.is_empty() {
-        return None;
-    }
-    let bytes = raw.as_bytes();
-    let mut start = 0_usize;
-    let mut end = bytes.len();
-    while start < end && is_string_prefix(bytes[start]) {
-        start += 1;
-    }
-    if start >= end {
-        return None;
-    }
-    let open = bytes[start];
-    if !matches!(open, b'"' | b'\'' | b'`') {
-        return Some(raw.to_string());
-    }
-    if end > start + 1 && bytes[end - 1] == open {
-        start += 1;
-        end -= 1;
-    } else {
-        return None;
-    }
-    let body = std::str::from_utf8(&bytes[start..end]).ok()?;
+    let quoted = raw.trim_start_matches(is_string_prefix);
+    let prefix = &raw[..raw.len() - quoted.len()];
+    let open = quoted
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '"' | '\'' | '`'))?;
+    let body = quoted[1..].strip_suffix(open)?;
     // A raw literal (Python `r"..."`, Rust `r#"..."#`, Go backticks) carries
     // the backslash as data, so decoding it would corrupt the value.
-    let prefixes = &bytes[..start.saturating_sub(1)];
-    let raw_literal = prefixes.iter().any(|b| matches!(b, b'r' | b'R'))
+    let raw_literal = prefix.contains(['r', 'R'])
         || node.kind().contains("raw")
         || node.kind().contains("verbatim");
     if raw_literal {
@@ -352,37 +377,16 @@ fn decode_string_literal(
     Some(escapes::decode(body))
 }
 
-fn is_string_prefix(b: u8) -> bool {
-    matches!(b, b'b' | b'B' | b'r' | b'R' | b'f' | b'F' | b'u' | b'U')
+/// Source text of a string-kind node that has no opening quote at all, which
+/// [`decode_string_literal`] leaves to its caller.
+fn unquoted_literal<'s>(node: Node<'_>, source: &'s str) -> Option<&'s str> {
+    let raw = node.utf8_text(source.as_bytes()).ok()?;
+    let first = raw.trim_start_matches(is_string_prefix).chars().next()?;
+    (!matches!(first, '"' | '\'' | '`')).then_some(raw)
 }
 
-/// Compile-once cache for tree-sitter queries. `Query::new` is non-trivial
-/// (parses the S-expression and builds matcher state) and was re-run for all
-/// three queries on *every* source file; the compiled `Query` is immutable and
-/// reusable, so we build each (language, query) once and share it. Keyed by the
-/// language function pointer and the `&'static` query-source pointer — both are
-/// stable per query, so identical queries hit the cache without re-parsing.
-fn cached_query(
-    language_fn: fn() -> tree_sitter::Language,
-    query_src: &'static str,
-) -> Option<std::sync::Arc<tree_sitter::Query>> {
-    use std::collections::HashMap;
-    use std::sync::{Arc, LazyLock, RwLock};
-    static CACHE: LazyLock<RwLock<HashMap<(usize, usize), Option<Arc<tree_sitter::Query>>>>> =
-        LazyLock::new(|| RwLock::new(HashMap::new()));
-    let key = (language_fn as usize, query_src.as_ptr() as usize);
-    if let Ok(cache) = CACHE.read()
-        && let Some(entry) = cache.get(&key)
-    {
-        return entry.clone();
-    }
-    let compiled = tree_sitter::Query::new(&language_fn(), query_src)
-        .ok()
-        .map(Arc::new);
-    if let Ok(mut cache) = CACHE.write() {
-        return cache.entry(key).or_insert(compiled).clone();
-    }
-    compiled
+fn is_string_prefix(c: char) -> bool {
+    matches!(c, 'b' | 'B' | 'r' | 'R' | 'f' | 'F' | 'u' | 'U')
 }
 
 #[derive(Default)]
@@ -428,18 +432,7 @@ fn emit_query_limit_metrics(metrics: &mut Metrics, label: &str, result: &QueryCo
     }
 }
 
-fn collect_query(
-    language_fn: fn() -> tree_sitter::Language,
-    source: &str,
-    root: Node<'_>,
-    query_src: &'static str,
-) -> QueryCollection {
-    if query_src.is_empty() {
-        return QueryCollection::default();
-    }
-    let Some(query) = cached_query(language_fn, query_src) else {
-        return QueryCollection::default();
-    };
+fn collect_query(query: &Query, source: &str, root: Node<'_>) -> QueryCollection {
     let capture_names = query.capture_names();
     let mut cursor = source_query_cursor();
     cursor.set_byte_range(0..source.len().min(SOURCE_QUERY_BYTE_LIMIT));
@@ -461,7 +454,7 @@ fn collect_query(
     };
     let options = tree_sitter::QueryCursorOptions::default().progress_callback(&mut progress_cb);
     {
-        let mut matches = cursor.matches_with_options(&query, root, source.as_bytes(), options);
+        let mut matches = cursor.matches_with_options(query, root, source.as_bytes(), options);
         while let Some(m) = matches.next() {
             for cap in m.captures() {
                 let name = capture_names.get(cap.index as usize).copied().unwrap_or("");
@@ -506,17 +499,10 @@ fn collect_query(
 /// relative import and no library matcher anchored on `^name` matches a local
 /// submodule. Non-relative imports and other languages pass through unchanged.
 fn collect_imports(
-    language_fn: fn() -> tree_sitter::Language,
+    query: &Query,
     source: &str,
     root: Node<'_>,
-    query_src: &'static str,
 ) -> (QueryCollection, std::collections::HashMap<u64, String>) {
-    if query_src.is_empty() {
-        return Default::default();
-    }
-    let Some(query) = cached_query(language_fn, query_src) else {
-        return Default::default();
-    };
     let capture_names = query.capture_names();
     let mut cursor = source_query_cursor();
     cursor.set_byte_range(0..source.len().min(SOURCE_QUERY_BYTE_LIMIT));
@@ -536,7 +522,7 @@ fn collect_imports(
     };
     let options = tree_sitter::QueryCursorOptions::default().progress_callback(&mut progress_cb);
     {
-        let mut matches = cursor.matches_with_options(&query, root, source.as_bytes(), options);
+        let mut matches = cursor.matches_with_options(query, root, source.as_bytes(), options);
         while let Some(m) = matches.next() {
             for cap in m.captures() {
                 let name = capture_names.get(cap.index as usize).copied().unwrap_or("");
@@ -686,16 +672,23 @@ pub(crate) fn extract_text_only(bytes: &[u8], metrics: &mut Metrics) {
 /// Compute cross-component ratios on `text.*` from already-emitted
 /// sub-metrics (`identifiers.*` / `strings.*` / `comments.*` /
 /// `functions.*` / `imports.*`). Pure division — no parsing.
-fn emit_text_ratios(metrics: &mut Metrics, total_lines: u32) {
+fn emit_text_ratios(
+    metrics: &mut Metrics,
+    total_lines: u32,
+    functions_total: usize,
+    imports_total: usize,
+) {
     let m = metrics.clone();
-    let get = |k: &str| m.get(k).unwrap_or(0.0);
+    let get = |key: MetricKey| m.get_key(&key).unwrap_or(0.0);
 
-    let functions_total = get("functions.total");
-    let strings_total = get("strings.count");
-    let identifiers_total = get("identifiers.count");
-    let identifiers_unique = get("identifiers.unique");
-    let imports_total = get("imports.total");
-    let functions_anonymous = get("functions.anonymous");
+    // Counted by the caller: `functions.count` / `imports.count` are only
+    // emitted later, from the unified symbols view.
+    let functions_total = functions_total as f64;
+    let strings_total = get(metric!("strings.count"));
+    let identifiers_total = get(metric!("identifiers.count"));
+    let identifiers_unique = get(metric!("identifiers.unique"));
+    let imports_total = imports_total as f64;
+    let functions_anonymous = get(metric!("functions.anonymous"));
 
     if functions_total > 0.0 {
         metrics.insert(
@@ -769,11 +762,11 @@ fn emit_text_ratios(metrics: &mut Metrics, total_lines: u32) {
 
     // Obfuscation indicator ratios.
     if identifiers_unique > 0.0 {
-        let suspicious = get("identifiers.hex_like_names")
-            + get("identifiers.base64_like_names")
-            + get("identifiers.sequential_names")
-            + get("identifiers.keyboard_pattern_names")
-            + get("identifiers.repeated_char_names");
+        let suspicious = get(metric!("identifiers.hex_like_names"))
+            + get(metric!("identifiers.base64_like_names"))
+            + get(metric!("identifiers.sequential_names"))
+            + get(metric!("identifiers.keyboard_pattern_names"))
+            + get(metric!("identifiers.repeated_char_names"));
         if suspicious > 0.0 {
             metrics.insert(
                 metric!("text.suspicious_identifier_ratio"),
@@ -783,36 +776,29 @@ fn emit_text_ratios(metrics: &mut Metrics, total_lines: u32) {
     }
 
     if strings_total > 0.0 {
-        let encoded =
-            get("strings.base64_candidates") + get("strings.hex") + get("strings.url_encoded");
+        let encoded = get(metric!("strings.base64_candidates"))
+            + get(metric!("strings.hex"))
+            + get(metric!("strings.url_encoded"));
         if encoded > 0.0 {
             metrics.insert(
                 metric!("text.encoded_string_ratio"),
                 encoded / strings_total,
             );
         }
-        let suspicious =
-            get("strings.embedded_code_candidates") + get("strings.shell") + get("strings.sql");
+        let suspicious = get(metric!("strings.embedded_code_candidates"))
+            + get(metric!("strings.shell"))
+            + get(metric!("strings.sql"));
         if suspicious > 0.0 {
             metrics.insert(
                 metric!("text.suspicious_string_ratio"),
                 suspicious / strings_total,
             );
         }
-        let dynamic = get("strings.concat_operations")
-            + get("strings.char_construction")
-            + get("strings.array_join_construction");
-        if dynamic > 0.0 {
-            metrics.insert(
-                metric!("text.dynamic_string_ratio"),
-                dynamic / strings_total,
-            );
-        }
     }
 
-    let comments_total = get("comments.count");
+    let comments_total = get(metric!("comments.count"));
     if comments_total > 0.0 {
-        let suspicious = get("comments.high_entropy") + get("comments.base64");
+        let suspicious = get(metric!("comments.high_entropy")) + get(metric!("comments.base64"));
         if suspicious > 0.0 {
             metrics.insert(
                 metric!("text.suspicious_comment_ratio"),
@@ -822,7 +808,7 @@ fn emit_text_ratios(metrics: &mut Metrics, total_lines: u32) {
     }
 
     if imports_total > 0.0 {
-        let dynamic = get("imports.dynamic") + get("imports.conditional_imports");
+        let dynamic = get(metric!("imports.dynamic"));
         if dynamic > 0.0 {
             metrics.insert(
                 metric!("text.dynamic_import_ratio"),
@@ -835,6 +821,26 @@ fn emit_text_ratios(metrics: &mut Metrics, total_lines: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn function_ratios_use_the_extracted_counts() {
+        // These ratios read `functions.total` / `imports.total`, keys nothing
+        // emits, so they never fired.
+        let source =
+            "import os\nimport sys\n\ndef a():\n    return 'x'\n\ndef b():\n    return 'y'\n";
+        let parsed =
+            crate::open_with_path(std::path::Path::new("m.py"), source.as_bytes()).unwrap();
+        let metrics = parsed.metrics();
+        assert_eq!(
+            metrics.get_key(&metric!("text.imports_to_functions_ratio")),
+            Some(1.0)
+        );
+        assert!(
+            metrics
+                .get_key(&metric!("text.strings_to_functions_ratio"))
+                .is_some()
+        );
+    }
 
     #[test]
     fn source_query_match_limit_allows_more_headroom_for_recursive_queries() {
@@ -870,12 +876,9 @@ mod tests {
             .set_language(&javascript_language())
             .expect("javascript grammar");
         let tree = parser.parse(&src, None).expect("parse generated js");
-        let result = collect_query(
-            javascript_language,
-            &src,
-            tree.root_node(),
-            "(identifier) @name",
-        );
+        let query =
+            Query::new(&javascript_language(), "(identifier) @name").expect("identifier query");
+        let result = collect_query(&query, &src, tree.root_node());
 
         assert_eq!(result.items.len(), SOURCE_QUERY_OUTPUT_LIMIT);
         assert!(result.output_limited);
@@ -1052,6 +1055,119 @@ pub fn run() void {
             members.contains(&"ch.txtFields"),
             "expected Zig field chain, got {members:?}"
         );
+    }
+
+    /// Call arguments and the literal tier share one decoder, so a prefixed
+    /// literal decodes in both; unquoted forms stay out of call arguments.
+    #[test]
+    fn prefixed_literals_decode_in_call_arguments_like_literals() {
+        let src = br#"run(f"cmd {x}", b"\x41", r"\d", rb"\x42", u"plain")
+"#;
+        let parsed = crate::open_with_path(std::path::Path::new("call.py"), src).unwrap();
+        let args: Vec<String> = parsed
+            .symbols()
+            .iter_kind(crate::SymbolKind::Call)
+            .find_map(|s| match s {
+                crate::Symbol::Call {
+                    target: Some(target),
+                    args,
+                    ..
+                } if target == "run" => Some(args),
+                _ => None,
+            })
+            .expect("run call")
+            .iter()
+            .map(|arg| match arg {
+                crate::Arg::String { value } => value.clone(),
+                other => panic!("expected a string argument, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(args, ["cmd {x}", "A", "\\d", "\\x42", "plain"]);
+        let literals: Vec<&str> = parsed.literals().iter().map(|l| l.text.as_str()).collect();
+        for arg in &args {
+            assert!(
+                literals.contains(&arg.as_str()),
+                "{arg} not in {literals:?}"
+            );
+        }
+
+        let perl = b"system(q{rm -rf /tmp/x});\n";
+        let parsed = crate::open_with_path(std::path::Path::new("run.pl"), perl).unwrap();
+        assert!(
+            parsed
+                .literals()
+                .iter()
+                .any(|l| l.text == "q{rm -rf /tmp/x}"),
+            "unquoted literal keeps its source text in the literal tier"
+        );
+        assert!(
+            !parsed
+                .symbols()
+                .iter_kind(crate::SymbolKind::Call)
+                .any(|s| matches!(
+                    s,
+                    crate::Symbol::Call { args, .. }
+                        if args.iter().any(|a| matches!(a, crate::Arg::String { .. }))
+                )),
+            "an unquoted literal is not a decoded string argument"
+        );
+    }
+
+    /// The outermost node of a member chain records the whole path and every
+    /// static prefix, each at its first offset; nested links are not
+    /// re-resolved, and a dynamic link only hides the paths that depend on it.
+    #[test]
+    fn member_chains_record_every_static_prefix_once() {
+        let src = b"x.y;\na.b().c[\"d\"].e[k].f;\nx.y.z;\n";
+        let parsed = crate::open_with_path(std::path::Path::new("m.js"), src).unwrap();
+        let members: std::collections::BTreeMap<&str, u64> = parsed
+            .symbols()
+            .iter_kind(crate::SymbolKind::Member)
+            .filter_map(|s| match s {
+                crate::Symbol::Member { path, offset } => Some((path.as_str(), (*offset)?)),
+                _ => None,
+            })
+            .collect();
+        let expected = std::collections::BTreeMap::from([
+            ("x.y", 0),
+            ("x.y.z", 26),
+            ("a.b", 5),
+            ("a.b.c", 5),
+            ("a.b.c.d", 5),
+            ("a.b.c.d.e", 5),
+        ]);
+        assert_eq!(members, expected);
+        assert_eq!(parsed.metrics().get("ast.member_depth_max"), Some(5.0));
+    }
+
+    /// A `+` chain is measured once, at the node whose parent is not itself a
+    /// binary expression; a `+` nested under another operator is not a root.
+    #[test]
+    fn concat_chain_is_measured_at_its_outermost_node() {
+        let metric = |src: &str| {
+            crate::open_with_path(std::path::Path::new("c.js"), src.as_bytes())
+                .unwrap()
+                .metrics()
+                .get("ast.max_concat_chain")
+        };
+        assert_eq!(metric("y = a + b + c + (d + e);\n"), Some(4.0));
+        assert_eq!(metric("y = a + b - c;\n"), None);
+    }
+
+    #[test]
+    fn go_package_name_comes_from_the_syntax_tree() {
+        let package = |path: &str, src: &str| {
+            let parsed = crate::open_with_path(std::path::Path::new(path), src.as_bytes()).unwrap();
+            parsed
+                .source_ast()
+                .and_then(|ast| go_package_name(&ast).map(str::to_string))
+        };
+        assert_eq!(
+            package("a.go", "package demo\nfunc main(){}\n").as_deref(),
+            Some("demo")
+        );
+        assert_eq!(package("a.go", "func main(){}\n").as_deref(), Some(""));
+        assert_eq!(package("a.py", "package = 1\n"), None);
     }
 
     /// Helper: parse `src` as a source file with the given extension

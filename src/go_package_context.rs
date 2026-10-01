@@ -1,20 +1,15 @@
 //! Same-package Go context, independent of scanners and archive extractors.
+use crate::package_context::member_directory;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write;
 
-/// Parent of a logical member path: the text before its last `/`, or through
-/// its last `!!` archive delimiter when that comes later, so members of
-/// sibling archives (`x/a.zip!!main.go`, `x/b.zip!!main.go`) never share a
-/// package.
+/// Package directory of a logical member path: its [`member_directory`]
+/// without the trailing `/`. An archive delimiter stays (`x/a.zip!!`), so
+/// members of sibling archives never share a package.
 fn package_directory(path: &str) -> &str {
-    let slash = path.rfind('/');
-    let archive = path.rfind("!!").map(|i| i + 2);
-    match (slash, archive) {
-        (Some(slash), Some(archive)) if archive > slash => &path[..archive],
-        (Some(slash), _) => &path[..slash],
-        (None, Some(archive)) => &path[..archive],
-        (None, None) => "",
-    }
+    let directory = member_directory(path);
+    directory.strip_suffix('/').unwrap_or(directory)
 }
 
 /// Analyze supplied Go members without filesystem access or execution. Package
@@ -38,10 +33,11 @@ pub fn go_source_context(sources: &[(String, String)], incomplete: bool) -> Valu
             truncated = true;
             continue;
         };
+        // The package clause needs only the syntax tree, not the extraction
+        // pipeline behind `values()`.
         let Some(package) = parsed
-            .values()
-            .get("source.go.package")
-            .and_then(Value::as_str)
+            .source_ast()
+            .and_then(|ast| crate::formats::source::go_package_name(&ast))
         else {
             continue;
         };
@@ -51,8 +47,7 @@ pub fn go_source_context(sources: &[(String, String)], incomplete: bool) -> Valu
             .filter_map(|l| l.strip_prefix("//go:build "))
             .collect::<Vec<_>>()
             .join(" && ");
-        let stem = path[package_directory(path).len()..]
-            .trim_start_matches('/')
+        let stem = path[member_directory(path).len()..]
             .trim_end_matches(".go")
             .trim_end_matches("_test");
         for part in stem.split('_').skip(1) {
@@ -87,7 +82,7 @@ pub fn go_source_context(sources: &[(String, String)], incomplete: bool) -> Valu
                     | "mips64le"
                     | "loong64"
             ) {
-                variant.push_str(&format!(";{part}"));
+                let _ = write!(variant, ";{part}");
             }
         }
         groups
@@ -165,5 +160,40 @@ mod tests {
             .filter_map(|p| p["directory"].as_str())
             .collect();
         assert_eq!(directories, BTreeSet::from(["x/a.zip!!", "x/b.zip!!"]));
+    }
+
+    /// Members are grouped by the package clause read from each file's syntax
+    /// tree; a non-Go member is not grouped at all.
+    #[test]
+    fn members_group_by_package_clause() {
+        let context = go_source_context(
+            &[
+                ("p/a.go".into(), "package one\nfunc A(){}\n".into()),
+                ("p/b.go".into(), "package two\nfunc B(){}\n".into()),
+                ("p/c_linux.go".into(), "package one\nfunc C(){}\n".into()),
+                ("p/README.md".into(), "package one\n".into()),
+            ],
+            false,
+        );
+        let packages: BTreeSet<_> = context["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                (
+                    p["package"].as_str().unwrap(),
+                    p["variant"].as_str().unwrap(),
+                    p["members"].to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            packages,
+            BTreeSet::from([
+                ("one", "", r#"["p/a.go"]"#.to_string()),
+                ("one", ";linux", r#"["p/a.go","p/c_linux.go"]"#.to_string()),
+                ("two", "", r#"["p/b.go"]"#.to_string()),
+            ])
+        );
     }
 }

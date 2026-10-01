@@ -282,6 +282,24 @@ fn limit(ar: &mut Archive, stage: &str, reason: impl Into<String>) {
     }));
 }
 
+/// Step over a block's packed data. Data running past the end of the file is
+/// a truncated archive or a lying size: stop at the end and record it, rather
+/// than resume the header walk inside the payload.
+fn skip_data(inp: &mut In<'_>, ar: &mut Archive, size: u64) {
+    let remaining = inp.remaining() as u64;
+    if size > remaining {
+        limit(
+            ar,
+            "data",
+            format!(
+                "packed data runs {} bytes past end of file",
+                size - remaining
+            ),
+        );
+    }
+    inp.pos += size.min(remaining) as usize;
+}
+
 fn find_signature(bytes: &[u8]) -> Option<(usize, u8)> {
     let search = bytes.len().min(MAX_SFX.saturating_add(SIG5.len()));
     let hay = &bytes[..search];
@@ -777,7 +795,7 @@ fn walk_rar5(bytes: &[u8], mut inp: In<'_>, ar: &mut Archive) {
                     limit(ar, "name", "name longer than cap");
                     inp.pos = rest_end;
                     if let Some(ds) = data_size {
-                        let _ = inp.skip(ds as usize);
+                        skip_data(&mut inp, ar, ds);
                     }
                     continue;
                 }
@@ -846,12 +864,13 @@ fn walk_rar5(bytes: &[u8], mut inp: In<'_>, ar: &mut Archive) {
                 apply_attrs(&mut member, attrs, host == 1);
                 inp.pos = rest_end;
                 if let Some(ds) = data_size {
-                    if name == "CMT" && member.method.as_deref() == Some("stored") {
-                        if let Some(body) = inp.slice(ds as usize) {
-                            ar.comment = Some(utf8_name(body));
-                        }
+                    if name == "CMT"
+                        && member.method.as_deref() == Some("stored")
+                        && let Some(body) = inp.slice(ds as usize)
+                    {
+                        ar.comment = Some(utf8_name(body));
                     } else {
-                        let _ = inp.skip(ds.min(inp.remaining() as u64) as usize);
+                        skip_data(&mut inp, ar, ds);
                     }
                 }
                 finish_file(ar, member, extra, service, &name);
@@ -880,7 +899,7 @@ fn walk_rar5(bytes: &[u8], mut inp: In<'_>, ar: &mut Archive) {
         }
         inp.pos = rest_end;
         if let Some(ds) = data_size {
-            let _ = inp.skip(ds.min(inp.remaining() as u64) as usize);
+            skip_data(&mut inp, ar, ds);
         }
         ar.end_offset = inp.pos as u64;
     }
@@ -1032,7 +1051,7 @@ fn walk_rar4(bytes: &[u8], mut inp: In<'_>, ar: &mut Archive) {
                 if name_size > MAX_NAME {
                     limit(ar, "name", "RAR4 name longer than cap");
                     inp.pos = header_end;
-                    let _ = inp.skip(pack.min(inp.remaining() as u64) as usize);
+                    skip_data(&mut inp, ar, pack);
                     continue;
                 }
                 let name_end = (inp.pos + name_size).min(header_end);
@@ -1107,7 +1126,7 @@ fn walk_rar4(bytes: &[u8], mut inp: In<'_>, ar: &mut Archive) {
                         ar.comment = Some(utf8_name(body));
                     }
                 } else {
-                    let _ = inp.skip(pack.min(inp.remaining() as u64) as usize);
+                    skip_data(&mut inp, ar, pack);
                 }
                 finish_file(ar, member, Extra::default(), service, &name);
                 continue;
@@ -1840,6 +1859,40 @@ mod tests {
         let mut typed = Vec::new();
         extract(bytes, &mut values, &mut metrics, &mut typed).unwrap();
         (values, metrics, typed)
+    }
+
+    /// Packed data declared past the end of the file stops the walk there.
+    /// Before, a failed skip left the cursor at the header's end, so the
+    /// payload bytes were parsed as further headers -- here, a planted
+    /// `ghost.exe` member.
+    #[test]
+    fn data_past_end_of_file_is_not_parsed_as_headers() {
+        let mut specific = Vec::new();
+        specific.extend(vint(0)); // file flags
+        specific.extend(vint(0)); // unpacked size
+        specific.extend(vint(0)); // attributes
+        specific.extend(vint(0)); // compression info
+        specific.extend(vint(1)); // host OS
+        specific.extend(vint(MAX_NAME as u64 + 1)); // name over the cap
+        let ghost = [rar5_file("ghost.exe", b"x", &[]), rar5_end()].concat();
+        let declared = ghost.len() as u64 + 4096;
+        let long_name = rar5_block(
+            HEAD5_FILE,
+            HFL_DATA,
+            0,
+            Some(declared),
+            &specific,
+            &[],
+            &ghost,
+        );
+        let (values, _, typed) = run(&archive(&[&rar5_main(), &long_name]));
+
+        assert!(typed.iter().all(|m| m.path != "ghost.exe"), "{typed:?}");
+        let limits = values
+            .get("rar.limits")
+            .and_then(JsonValue::as_array)
+            .unwrap();
+        assert!(limits.iter().any(|l| l["stage"] == "data"), "{limits:?}");
     }
 
     #[test]

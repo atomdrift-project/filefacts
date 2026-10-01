@@ -6,17 +6,17 @@
 //! GNU build-id when present.
 
 use crate::metric;
+use goblin::elf::note::{Note, NoteIterator};
 use goblin::elf::{Elf, dynamic, header, program_header};
 use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::{
     NativeFormat, XorScan, extract_binary_strings, extract_binary_strings_from_object, hex_encode,
-    put_str, put_u64, rizin_fallback,
+    put_str, put_u64, rizin_fallback, section_entropy,
 };
 use crate::formats::goblin_safe;
 use crate::output::{Errors, Metrics, Section, Strings, Values};
-use crate::scan::entropy;
 
 /// Longest section name copied into the sections view, in chars.
 const MAX_SECTION_NAME: usize = 256;
@@ -76,17 +76,19 @@ pub(super) fn extract(
     let goblin::Object::Elf(elf) = object else {
         unreachable!("constructed as Object::Elf")
     };
+    // Every PT_NOTE reader below shares one guarded walk.
+    let segment_notes = drain_notes(elf.iter_note_headers(bytes), errors_out);
 
     elf_header(&elf, values);
     dynamic(&elf, values);
     sections(&elf, bytes, metrics, sections_out);
     *image_end = Some(image_end_of(&elf));
     symbols(&elf, values, metrics, symbols_out);
-    build_id(&elf, bytes, values, metrics);
+    build_id(&elf, bytes, &segment_notes, values, metrics, errors_out);
     interpreter(&elf, values);
     relro(&elf, values);
-    needed_versions(&elf, values);
-    super::elf_dynamic::verdef(&elf, values);
+    needed_versions(&elf, values, errors_out);
+    super::elf_dynamic::verdef(&elf, values, errors_out);
     super::elf_dynamic::init_arrays(&elf, bytes, values);
     super::elf_dynamic::dynsym_funcs(&elf, values);
     super::elf_syscalls::emit(&elf, bytes, values, metrics);
@@ -95,17 +97,17 @@ pub(super) fn extract(
     gcc_command_line(&elf, bytes, values);
     super::elf_dwarf::emit(&elf, bytes, values, metrics);
     dt_flags(&elf, values);
-    abi_tag(&elf, bytes, values);
-    package_note(&elf, bytes, values);
-    gnu_property(&elf, bytes, values, metrics);
+    abi_tag(&segment_notes, values);
+    package_note(&segment_notes, values);
+    gnu_property(&elf, &segment_notes, values, metrics);
     binary_flags(&elf, metrics);
-    elf_numeric_metrics(&elf, bytes, metrics, values);
+    elf_numeric_metrics(&elf, &segment_notes, metrics, values);
     dynamic_metrics(&elf, metrics);
     table_counts(&elf, metrics);
     relocation_kinds(&elf, values);
     segments(&elf, values);
     section_headers(&elf, values);
-    note_segment_coverage(&elf, bytes, metrics);
+    note_segment_coverage(&elf, bytes, metrics, errors_out);
     section_file_anomalies(&elf, bytes, metrics);
     rizin_fallback(
         NativeFormat::Elf,
@@ -116,7 +118,7 @@ pub(super) fn extract(
         metrics,
         has_go_pclntab(&elf, bytes),
     );
-    linker_family(&elf, bytes, values);
+    linker_family(&elf, values);
     comment_fingerprint(values);
     super::elf_hashes::emit(&elf, values, symbols_out);
     super::upx::detect(bytes, values);
@@ -161,7 +163,7 @@ pub(super) fn extract(
 /// dedicated `.note.*` sections (canonical, written by the linker
 /// itself); falls back to scanning `.comment[]` banners for the
 /// linker's name. Emits a single `elf.linker_family` string.
-fn linker_family(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
+fn linker_family(elf: &Elf<'_>, values: &mut Values) {
     let by_section = |name: &str| {
         elf.section_headers
             .iter()
@@ -187,7 +189,6 @@ fn linker_family(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
         .and_then(serde_json::Value::as_array)
         .cloned()
     else {
-        let _ = bytes;
         return;
     };
     for entry in entries {
@@ -480,11 +481,8 @@ fn decompose_df1(v: u64, out: &mut Vec<&'static str>) {
 /// Wolfi, Chainguard, Fedora 36+, recent systemd builds emit it.
 /// Surfaced as the `elf.package` subtree with the JSON keys verbatim
 /// (so trait authors write `elf.package.type == "apk"`).
-fn package_note(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
-    let Some(notes) = elf.iter_note_headers(bytes) else {
-        return;
-    };
-    for note in notes.flatten() {
+fn package_note(notes: &[Note<'_>], values: &mut Values) {
+    for note in notes {
         if note.n_type != 0xCAFE_1A7E {
             continue;
         }
@@ -509,11 +507,8 @@ fn package_note(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
 /// `.note.ABI-tag` (`NT_GNU_ABI_TAG = 1`) — declares the minimum
 /// kernel version the binary expects. The descriptor is four 32-bit
 /// words: ABI (0 = Linux), major, minor, patch.
-fn abi_tag(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
-    let Some(notes) = elf.iter_note_headers(bytes) else {
-        return;
-    };
-    for note in notes.flatten() {
+fn abi_tag(notes: &[Note<'_>], values: &mut Values) {
+    for note in notes {
         if note.name == "GNU" && note.n_type == 1 && note.desc.len() >= 16 {
             let words: [u32; 4] = [0, 1, 2, 3].map(|i| {
                 let start = i * 4;
@@ -547,12 +542,9 @@ fn abi_tag(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
 /// (`AARCH64_FEATURE_*`). When we see an AArch64 PAUTH property
 /// we also emit `elf.pauth_scheme` with the `platform:version`
 /// pair that identifies the key-generation scheme.
-fn gnu_property(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
-    let Some(notes) = elf.iter_note_headers(bytes) else {
-        return;
-    };
+fn gnu_property(elf: &Elf<'_>, notes: &[Note<'_>], values: &mut Values, metrics: &mut Metrics) {
     let is_aarch64 = elf.header.e_machine == header::EM_AARCH64;
-    for note in notes.flatten() {
+    for note in notes {
         if note.name != "GNU" || note.n_type != 5 {
             continue;
         }
@@ -724,7 +716,12 @@ fn read_section<'a>(elf: &Elf<'_>, bytes: &'a [u8], name: &str) -> Option<&'a [u
 /// `ElfMetrics` historically populated, so traits that key on
 /// `elf.section_count`, `elf.has_plt`, `elf.nx_enabled`, etc. keep
 /// working after cleave's typed metrics retire.
-fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, values: &mut Values) {
+fn elf_numeric_metrics(
+    elf: &Elf<'_>,
+    segment_notes: &[Note<'_>],
+    metrics: &mut Metrics,
+    values: &mut Values,
+) {
     // Header constants. `elf.machine` and `elf.type` already live on
     // the values tree as strings — the numeric forms add nothing.
     metrics.insert(
@@ -952,7 +949,6 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
     let mut has_gnu_hash_sect = false;
     let mut has_symtab = false;
     let mut has_debuglink = false;
-    let mut has_gnu_stack_section = false;
     let mut has_rustc_section = false;
     let mut text_writable = false;
     let mut rodata_writable = false;
@@ -977,7 +973,6 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
             ".gnu.hash" => has_gnu_hash_sect = true,
             ".symtab" => has_symtab = true,
             ".gnu_debuglink" => has_debuglink = true,
-            ".note.GNU-stack" => has_gnu_stack_section = true,
             ".rustc" => has_rustc_section = true,
             ".gnu.version" => versym_size = sh.sh_size,
             ".text" if sh.sh_flags & SHF_WRITE != 0 => text_writable = true,
@@ -1042,10 +1037,6 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
             compressed_count as f64,
         );
     }
-    // Override goblin's "stack section absent" decision with the actual
-    // `.note.GNU-stack` section presence; the program-header walk above
-    // already keys off PT_GNU_STACK, but having both signals is useful.
-    let _ = has_gnu_stack_section;
     // Each `.gnu.version` entry is a 16-bit half per dynamic symbol.
     if versym_size > 0 {
         metrics.insert(metric!("elf.dt_versym_count"), (versym_size / 2) as f64);
@@ -1058,14 +1049,10 @@ fn elf_numeric_metrics(elf: &Elf<'_>, _bytes: &[u8], metrics: &mut Metrics, valu
         );
     }
 
-    // Exact note count: walk note headers. Falls back to the
-    // section-level approximation above when `iter_note_headers`
-    // can't read the binary.
-    if let Some(notes) = elf.iter_note_headers(_bytes) {
-        let walked = notes.flatten().count() as u64;
-        if walked > 0 {
-            note_count = walked;
-        }
+    // Exact note count from the PT_NOTE walk. Falls back to the
+    // section-level approximation above when that walk found nothing.
+    if !segment_notes.is_empty() {
+        note_count = segment_notes.len() as u64;
     }
     metrics.insert(metric!("elf.note_count"), note_count as f64);
 
@@ -1611,14 +1598,16 @@ fn stripped_metadata(elf: &Elf<'_>, values: &mut Values, metrics: &mut Metrics) 
 /// string. Forensically the strongest fingerprint of a Linux binary's
 /// build environment: the highest `GLIBC_x.y` in this list is the
 /// floor glibc version the binary loads on.
-fn needed_versions(elf: &Elf<'_>, values: &mut Values) {
+fn needed_versions(elf: &Elf<'_>, values: &mut Values, errors_out: &mut Errors) {
     let Some(verneed) = elf.verneed.as_ref() else {
         return;
     };
     let mut out: Vec<JsonValue> = Vec::new();
-    for need in verneed.iter() {
+    // Both levels are lazy walks along file-controlled `vn_next` / `vna_next`
+    // links.
+    for need in goblin_safe::drain_or_record(verneed.iter(), errors_out, crate::Stage::ElfParse) {
         let lib = elf.dynstrtab.get_at(need.vn_file).unwrap_or("");
-        for aux in need.iter() {
+        for aux in goblin_safe::drain_or_record(need.iter(), errors_out, crate::Stage::ElfParse) {
             let ver = elf.dynstrtab.get_at(aux.vna_name).unwrap_or("");
             if !lib.is_empty() && !ver.is_empty() {
                 out.push(JsonValue::String(format!("{lib}@{ver}")));
@@ -1968,19 +1957,6 @@ fn image_end_of(elf: &Elf<'_>) -> u64 {
     end
 }
 
-fn section_entropy(bytes: &[u8], offset: u64, size: u64) -> f64 {
-    if size == 0 {
-        return 0.0;
-    }
-    let start = usize::try_from(offset).unwrap_or(usize::MAX);
-    let end = start.saturating_add(usize::try_from(size).unwrap_or(usize::MAX));
-    if start >= bytes.len() {
-        return 0.0;
-    }
-    let end = end.min(bytes.len());
-    entropy::shannon(&bytes[start..end])
-}
-
 /// Map a virtual address to a file offset through the `PT_LOAD` segments.
 ///
 /// This is the only VA→offset path that survives section-header stripping:
@@ -2227,7 +2203,14 @@ fn emit_symbol_kind_histograms(
     }
 }
 
-fn build_id(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
+fn build_id(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    segment_notes: &[Note<'_>],
+    values: &mut Values,
+    metrics: &mut Metrics,
+    errors_out: &mut Errors,
+) {
     // GNU build-id lives in a SHT_NOTE section named `.note.gnu.build-id`
     // (or `.gnu.build.attributes` in newer binutils), with a matching
     // PT_NOTE program header. Read it from the *section table* first: a
@@ -2237,8 +2220,8 @@ fn build_id(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metr
     // gone and destroys the "identity retained, execution redirected"
     // evidence. Sections survive the repurposing; fall back to segments
     // only for stripped binaries that carry no section headers.
-    let desc = gnu_build_id_desc(elf.iter_note_sections(bytes, None))
-        .or_else(|| gnu_build_id_desc(elf.iter_note_headers(bytes)));
+    let section_notes = drain_notes(elf.iter_note_sections(bytes, None), errors_out);
+    let desc = gnu_build_id_desc(&section_notes).or_else(|| gnu_build_id_desc(segment_notes));
     if let Some(desc) = desc {
         put_str(values, "elf.build_id", hex_encode(desc));
         metrics.insert(metric!("elf.has_build_id"), 1.0);
@@ -2246,13 +2229,21 @@ fn build_id(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metr
     }
 }
 
-/// First GNU build-id (`n_type == NT_GNU_BUILD_ID`, owner `GNU`) in a
-/// note iterator, or `None`.
-fn gnu_build_id_desc(notes: Option<goblin::elf::note::NoteIterator<'_>>) -> Option<&[u8]> {
-    notes?
-        .flatten()
+/// First GNU build-id (`n_type == NT_GNU_BUILD_ID`, owner `GNU`) among
+/// `notes`, or `None`.
+fn gnu_build_id_desc<'a>(notes: &[Note<'a>]) -> Option<&'a [u8]> {
+    notes
+        .iter()
         .find(|note| note.name == "GNU" && note.n_type == 3)
         .map(|note| note.desc)
+}
+
+/// Every note a lazy goblin note walk yields, drained through `goblin_safe`.
+/// Notes goblin rejects are skipped; `None` (no note segments or sections)
+/// yields none.
+fn drain_notes<'a>(notes: Option<NoteIterator<'a>>, errors_out: &mut Errors) -> Vec<Note<'a>> {
+    let walk = notes.into_iter().flatten().flatten();
+    goblin_safe::drain_or_record(walk, errors_out, crate::Stage::ElfParse)
 }
 
 /// Flag `SHT_NOTE` sections whose bytes are not covered by any note
@@ -2271,7 +2262,12 @@ fn gnu_build_id_desc(notes: Option<goblin::elf::note::NoteIterator<'_>>) -> Opti
 /// debuginfod path that reads it through the program headers. Only
 /// meaningful when the file has program headers (ET_EXEC / ET_DYN);
 /// relocatable objects legitimately have none.
-fn note_segment_coverage(elf: &Elf<'_>, bytes: &[u8], metrics: &mut Metrics) {
+fn note_segment_coverage(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    metrics: &mut Metrics,
+    errors_out: &mut Errors,
+) {
     use goblin::elf::program_header::{PT_GNU_PROPERTY, PT_NOTE};
     use goblin::elf::section_header::SHT_NOTE;
     if elf.program_headers.is_empty() {
@@ -2304,7 +2300,8 @@ fn note_segment_coverage(elf: &Elf<'_>, bytes: &[u8], metrics: &mut Metrics) {
         // Is the orphaned note the GNU build-id? Read it back through its
         // own section name so the check is independent of ordering.
         let name = elf.shdr_strtab.get_at(sh.sh_name);
-        if gnu_build_id_desc(elf.iter_note_sections(bytes, name)).is_some() {
+        let notes = drain_notes(elf.iter_note_sections(bytes, name), errors_out);
+        if gnu_build_id_desc(&notes).is_some() {
             build_id_orphaned = true;
         }
     }

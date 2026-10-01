@@ -296,19 +296,19 @@ impl Drop for PgidGuard {
 /// removed from the registry by the normal cleanup paths, so calling
 /// this after a clean shutdown is a no-op. No-op on non-Unix.
 pub fn kill_all_rizin_groups() {
-    let pgids: Vec<i32> = RIZIN_PGIDS.lock().map(|g| g.clone()).unwrap_or_default();
     #[cfg(unix)]
-    for pgid in &pgids {
-        // SAFETY: libc::kill with a negative pid sends the signal to
-        // the process group. Async-signal-safe; tolerates already-dead
-        // groups (ESRCH) silently.
-        #[allow(unsafe_code)]
-        unsafe {
-            libc::kill(-(*pgid as libc::pid_t), libc::SIGKILL);
+    {
+        let pgids: Vec<i32> = RIZIN_PGIDS.lock().map(|g| g.clone()).unwrap_or_default();
+        for pgid in &pgids {
+            // SAFETY: libc::kill with a negative pid sends the signal to
+            // the process group. Async-signal-safe; tolerates already-dead
+            // groups (ESRCH) silently.
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::kill(-(*pgid as libc::pid_t), libc::SIGKILL);
+            }
         }
     }
-    #[cfg(not(unix))]
-    let _ = pgids;
 }
 
 /// Disable rizin globally for the rest of the process. There is no
@@ -823,7 +823,6 @@ fn recover_with_script(
         RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    let _ = cap_hit;
     RIZIN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
     tracing::debug!(
         bytes = bytes.len(),
@@ -1022,6 +1021,7 @@ mod win_job {
     }
 }
 
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn kill_process_group(child_id: u32) {
     #[cfg(unix)]
     // SAFETY: libc::kill with negative pid targets the process group.
@@ -1030,8 +1030,6 @@ fn kill_process_group(child_id: u32) {
     unsafe {
         libc::kill(-(child_id as libc::pid_t), libc::SIGKILL);
     }
-    #[cfg(not(unix))]
-    let _ = child_id;
 }
 
 /// Terminate the complete Rizin process group and synchronously reap its
@@ -1533,7 +1531,6 @@ struct RawSection {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::output::Metrics;

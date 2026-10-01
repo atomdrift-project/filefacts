@@ -1,12 +1,20 @@
 //! Content-based detection: magic bytes, shebangs, and structural markers.
 //!
-//! Uses a first-byte jump table to avoid sequential if-chains. Most files are
-//! identified by examining only the first 4-20 bytes.
+//! A dozen checks run in sequence first: text-shaped headers that may sit
+//! behind whitespace or a BOM (HTML, Windows Script Host, lockfiles, `go.mod`),
+//! and signatures that are not at offset 0 (an `ftyp` box at 4, an ISO volume
+//! descriptor at 32 KiB, a DMG trailer at the end). The binary signatures then
+//! dispatch through a first-byte jump table, so each file is compared against
+//! only the formats that start with its first byte. Rarer structural checks
+//! (a `ustar` header, tampered PEs, ASAR, LZMA) run last.
 
 use std::{io::Read, path::Path};
 
+use super::ext::{is_odf_extension, lowercase_ext};
 use super::scripts::find_ci;
-use super::{ArchiveFormat, Compression, DetectionSource, FileType, container_of};
+use super::{
+    ArchiveFormat, Compression, DetectionSource, FileType, UTF8_BOM, container_of, strip_utf8_bom,
+};
 
 /// LNK shell link CLSID header (20 bytes).
 const LNK_MAGIC: &[u8] = &[
@@ -17,6 +25,22 @@ const LNK_MAGIC: &[u8] = &[
 /// Opening section of a Windows URL shortcut. Section names are matched
 /// case-insensitively, as Windows itself matches them.
 const URL_SHORTCUT_SECTION: &[u8] = b"[InternetShortcut]";
+
+/// The first line of a `.reg` file since Windows 2000, up to the version
+/// number. regedit writes it as UTF-16LE behind a byte-order mark; a copy
+/// re-saved in an editor may be UTF-8, with or without one.
+const REGISTRY_EDITOR_HEADER: &[u8] = b"Windows Registry Editor Version";
+
+/// Whether UTF-16LE `data` opens with the ASCII text `prefix`.
+fn utf16le_starts_with(data: &[u8], prefix: &[u8]) -> bool {
+    data.len() >= prefix.len() * 2
+        && data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(prefix)
+            .all(|(unit, &b)| *unit == [b, 0])
+}
 
 /// Compiled Android XML. The container chunk says how long the document is,
 /// and the next chunk is the string pool. Both have to agree; `03 00 08 00`
@@ -113,18 +137,6 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         return Some((ft, DetectionSource::Magic));
     }
 
-    // An HTML document, whatever it is called and however it is indented.
-    // Keyed off `head` rather than `data` because real pages are not flush
-    // left: four VirusShare samples open with four spaces before the doctype,
-    // which a `starts_with` on byte 0 misses, and they were then scored as
-    // JavaScript on the strength of the jQuery inside them.
-    //
-    // Both unambiguous openings are accepted. Nothing but a web page starts
-    // `<!DOCTYPE html`, and a file whose first bytes are `<html` is one too --
-    // that is narrower than the `<body`/`<div`/`<script` shapes, which also
-    // open templates and fragments that other arms own and which stay out of
-    // magic deliberately. `<!DOCTYPE svg` and an `<?xml` prolog are unaffected:
-    // neither begins with either of these.
     // PostScript and EPS. `%!PS` at the start is the format; a `.ps` extension
     // is only the fallback for a file that does not carry the header.
     if head.len() >= 4 && head.starts_with(b"%!PS") {
@@ -139,6 +151,18 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         return Some((FileType::Xml, DetectionSource::Magic));
     }
 
+    // An HTML document, whatever it is called and however it is indented.
+    // Keyed off `head` rather than `data` because real pages are not flush
+    // left: four VirusShare samples open with four spaces before the doctype,
+    // which a `starts_with` on byte 0 misses, and they were then scored as
+    // JavaScript on the strength of the jQuery inside them.
+    //
+    // Both unambiguous openings are accepted. Nothing but a web page starts
+    // `<!DOCTYPE html`, and a file whose first bytes are `<html` is one too --
+    // that is narrower than the `<body`/`<div`/`<script` shapes, which also
+    // open templates and fragments that other arms own and which stay out of
+    // magic deliberately. `<!DOCTYPE svg` and an `<?xml` prolog are unaffected:
+    // neither begins with either of these.
     if head.len() >= 5 {
         let doctype_html = head.len() >= 14 && head[..14].eq_ignore_ascii_case(b"<!DOCTYPE html");
         let html_root = head[..5].eq_ignore_ascii_case(b"<html")
@@ -328,6 +352,12 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // JPEG: FF D8 FF
             if data.len() >= 3 && data[1] == 0xD8 && data[2] == 0xFF {
                 Some((FileType::Jpeg, DetectionSource::Magic))
+            } else if data
+                .strip_prefix(b"\xFF\xFE")
+                .is_some_and(|rest| utf16le_starts_with(rest, REGISTRY_EDITOR_HEADER))
+            {
+                // What regedit exports: UTF-16LE behind a byte-order mark.
+                Some((FileType::Registry, DetectionSource::Magic))
             } else {
                 None
             }
@@ -389,8 +419,10 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             {
                 let installer = ole_root_clsid(data).map_or_else(
                     || {
-                        let ext = lowercase_ext(path);
-                        matches!(ext.as_deref(), Some("msi" | "msp" | "mst" | "msm"))
+                        matches!(
+                            lowercase_ext(path).as_deref(),
+                            Some("msi" | "msp" | "mst" | "msm")
+                        )
                     },
                     |clsid| MSI_CLSIDS.contains(&clsid),
                 );
@@ -678,8 +710,12 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // A UTF-8 BOM ahead of a shebang: Windows editors write it along
             // with CRLF. The kernel will not exec it, but `perl x`, `python x`
             // and `bash x` still run the body, so it is still that language.
-            match data.strip_prefix(b"\xEF\xBB\xBF") {
+            // A registry export re-saved as UTF-8 may keep a BOM too.
+            match data.strip_prefix(UTF8_BOM) {
                 Some(rest) if rest.starts_with(b"#!") => detect_shebang(rest),
+                Some(rest) if rest.starts_with(REGISTRY_EDITOR_HEADER) => {
+                    Some((FileType::Registry, DetectionSource::Magic))
+                }
                 _ => None,
             }
         }
@@ -705,11 +741,10 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             }
         }
         b'W' => {
-            // `Windows Registry Editor Version 5.00` — the modern .reg header,
-            // written as UTF-8 or (far more often) UTF-16LE with a BOM, which
-            // the BOM-stripping caller has already unwrapped by the time this
-            // runs. Same reasoning as the `REGEDIT4` arm above.
-            if data.starts_with(b"Windows Registry Editor Version") {
+            // The modern .reg header as UTF-8 without a BOM; the UTF-16LE and
+            // UTF-8 BOM spellings are claimed in the 0xFF and 0xEF arms. Same
+            // reasoning as the `REGEDIT4` arm above.
+            if data.starts_with(REGISTRY_EDITOR_HEADER) {
                 Some((FileType::Registry, DetectionSource::Magic))
             } else {
                 None
@@ -825,12 +860,6 @@ fn looks_like_ne_executable(data: &[u8]) -> bool {
     data.get(offset..offset.saturating_add(2)) == Some(b"NE")
 }
 
-/// Peek the first `ar` member's name and compare it to `want`.
-///
-/// An `ar` archive is `!<arch>\n` (8 bytes) followed by fixed 60-byte member
-/// headers; the name is the leading 16-byte field, space-padded and sometimes
-/// terminated with `/` (GNU). Used to tell a Debian package (first member
-/// `debian-binary`) from a static library (a symbol/string table or object).
 /// A SquashFS image is the wire format of a Snap package, so the superblock
 /// magic alone cannot tell the two apart — reading `meta/snap.yaml` would mean
 /// decompressing the filesystem. The `.snap` extension is the available signal,
@@ -843,6 +872,12 @@ fn squashfs_type(path: &Path) -> FileType {
     }
 }
 
+/// Peek the first `ar` member's name and compare it to `want`.
+///
+/// An `ar` archive is `!<arch>\n` (8 bytes) followed by fixed 60-byte member
+/// headers; the name is the leading 16-byte field, space-padded and sometimes
+/// terminated with `/` (GNU). Used to tell a Debian package (first member
+/// `debian-binary`) from a static library (a symbol/string table or object).
 fn ar_first_member_is(data: &[u8], want: &[u8]) -> bool {
     const AR_MAGIC_LEN: usize = 8; // "!<arch>\n"
     let Some(field) = data.get(AR_MAGIC_LEN..AR_MAGIC_LEN + 16) else {
@@ -913,13 +948,21 @@ fn path_ends_with_ci(path: &Path, suffix: &[u8]) -> bool {
     bytes[bytes.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
-/// How much of a file [`is_text`] reads. Binary headers put a NUL or a
-/// control byte well inside it: a PE's `e_lfanew`, a font's table count, a
+/// How much of a file [`content_is_text`] reads. Binary headers put a NUL or
+/// a control byte well inside it: a PE's `e_lfanew`, a font's table count, a
 /// RIFF or ISO-BMFF box size.
 const TEXT_PROBE: usize = 64;
 
-/// Whether `head` reads as plain text: UTF-8 with no control bytes other
-/// than whitespace. A character cut off by the end of the probe still counts.
+/// Whether the head of `data` reads as plain text: UTF-8 with no control
+/// bytes other than whitespace. A character cut off by the end of the probe
+/// still counts.
+///
+/// The strictest of the three binary/text tests in fileid, because it has the
+/// least to read: one control byte in the probe doubts a short signature, and
+/// form feed is the only control byte beyond tab and line breaks that plain
+/// text is allowed. `heuristics::looks_like_binary` and `scripts::is_binary`
+/// judge whole scoring windows by the share of control bytes instead, and the
+/// script grammars also allow the escapes that batch and IRC scripts print.
 pub(crate) fn content_is_text(data: &[u8]) -> bool {
     let head = &data[..data.len().min(TEXT_PROBE)];
     let control = |b: &u8| (*b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r' | 0x0C)) || *b == 0x7F;
@@ -956,8 +999,7 @@ fn has_text_header(ft: FileType) -> bool {
 /// A lockfile's tool-written header: pnpm's first line, or a line of the
 /// leading comment block that Yarn v1, Cargo or Poetry write.
 fn lockfile_header(data: &[u8]) -> Option<FileType> {
-    let head = &data[..data.len().min(512)];
-    let head = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
+    let head = strip_utf8_bom(&data[..data.len().min(512)]);
     let lines = head.split(|&b| b == b'\n').map(<[u8]>::trim_ascii_end);
     if lines.clone().next()?.starts_with(b"lockfileVersion:") {
         return Some(FileType::PnpmLock);
@@ -1512,8 +1554,7 @@ fn zip_name_claim(ext: &str) -> Option<FileType> {
         "nupkg" => FileType::Nupkg,
         "ipa" => FileType::Ipa,
         "vsix" => FileType::Vsix,
-        "odt" | "ods" | "odp" | "odg" | "odf" | "ott" | "ots" | "otp" | "odm" | "oth" | "otg"
-        | "odb" | "odc" | "odi" => FileType::Odf,
+        ext if is_odf_extension(ext) => FileType::Odf,
         _ => return None,
     })
 }
@@ -1577,22 +1618,6 @@ fn classify_pk(path: &Path, data: &[u8]) -> (FileType, DetectionSource) {
         FileType::Zip
     };
     (ft, DetectionSource::Magic)
-}
-
-/// Lowercase extension into a stack buffer. Returns None if no extension or too long.
-fn lowercase_ext(path: &Path) -> Option<String> {
-    let ext = path.extension()?.to_str()?;
-    if ext.len() > 16 {
-        return None;
-    }
-    let mut buf = [0u8; 16];
-    buf[..ext.len()].copy_from_slice(ext.as_bytes());
-    buf[..ext.len()].make_ascii_lowercase();
-    // Input was valid UTF-8 ASCII, lowering preserves that.
-    let Ok(ext) = std::str::from_utf8(&buf[..ext.len()]) else {
-        return None;
-    };
-    Some(ext.to_string())
 }
 
 /// A Windows bitmap: `BM`, then the info header that follows the 14-byte file
@@ -1731,8 +1756,7 @@ fn decode_char_refs(value: &[u8]) -> String {
 /// which language was encoded, so the one call the bytes cannot make falls to
 /// the name: `.jse` is JScript, anything else the far more common VBScript.
 fn encoded_script(path: &Path, head: &[u8]) -> Option<FileType> {
-    let head = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
-    let rest = head.strip_prefix(b"#@~^")?;
+    let rest = strip_utf8_bom(head).strip_prefix(b"#@~^")?;
     let length = rest.get(..6)?;
     if !length
         .iter()
@@ -1797,10 +1821,7 @@ struct XmlHead<'a> {
 /// doctype to the root element. `None` unless the document opens with `<`.
 fn xml_head(data: &[u8]) -> Option<XmlHead<'_>> {
     let text = &data[..data.len().min(XML_HEAD)];
-    let mut rest = text
-        .strip_prefix(b"\xEF\xBB\xBF")
-        .unwrap_or(text)
-        .trim_ascii_start();
+    let mut rest = strip_utf8_bom(text).trim_ascii_start();
     if !rest.starts_with(b"<") {
         return None;
     }
@@ -2057,7 +2078,6 @@ fn detect_manifest(path: &Path, data: &[u8]) -> Option<FileType> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
 
     fn is_svg(data: &[u8]) -> bool {
@@ -3567,11 +3587,41 @@ mod registry_script_magic_tests {
             detect_from_content(Path::new("notes.txt"), data).map(|(ft, _)| ft),
             Some(FileType::Registry)
         );
+        let mut utf16 = vec![0xFF, 0xFE];
+        utf16.extend(
+            "Windows compatibility notes\r\n"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        );
+        assert_ne!(
+            detect_from_content(Path::new("notes.txt"), &utf16).map(|(ft, _)| ft),
+            Some(FileType::Registry)
+        );
+    }
+
+    /// What regedit writes: UTF-16LE behind a byte-order mark. A copy
+    /// re-saved as UTF-8 may keep a mark of its own.
+    #[test]
+    fn bom_prefixed_registry_exports_are_registry_scripts() {
+        let header = "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\X]\r\n";
+        let mut utf16 = vec![0xFF, 0xFE];
+        utf16.extend(header.encode_utf16().flat_map(u16::to_le_bytes));
+        let mut utf8 = UTF8_BOM.to_vec();
+        utf8.extend_from_slice(header.as_bytes());
+        for data in [utf16, utf8] {
+            assert_eq!(
+                detect_from_content(Path::new("export.reg"), &data),
+                Some((FileType::Registry, DetectionSource::Magic))
+            );
+            assert_eq!(
+                super::super::detect(Path::new("export.reg"), &data).map(|d| d.file_type),
+                Some(FileType::Registry)
+            );
+        }
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod windows_script_host_tests {
     use super::*;
 

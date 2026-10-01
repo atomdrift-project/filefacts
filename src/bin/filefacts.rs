@@ -52,11 +52,16 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[unsafe(export_name = "_rjem_malloc_conf")]
 pub static malloc_conf: Option<&'static u8> = Some(&b"dirty_decay_ms:0\0"[0]);
 
+use std::borrow::Cow;
+use std::ffi::OsString;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use filefacts::{Arg, ParsedFile, Symbol, SymbolKind};
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde::ser::{SerializeMap, Serializer};
+use serde_json::Value;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 enum Format {
@@ -65,336 +70,367 @@ enum Format {
     Json,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Args {
     path: Option<PathBuf>,
     format: Format,
-    view: View,
+    /// The single view to emit; `None` emits the bundle.
+    view: Option<View>,
 }
 
-#[derive(Default, Copy, Clone, Debug, PartialEq, Eq)]
+/// One top-level view of a parsed file. Views are only ever constructed
+/// through [`VIEWS`], so a variant missing from it is flagged as dead code.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum View {
-    #[default]
-    All,
     Fileid,
+    Identity,
     Values,
     Text,
     Literals,
+    Comments,
     Metrics,
     Sections,
     Symbols,
+    /// One kind of symbol, filtered out of `Symbols`.
+    Kind(SymbolKind),
     Flow,
-    Identity,
-    Imports,
-    Exports,
-    Functions,
-    Calls,
-    Members,
-    Binds,
-    Identifiers,
+    References,
+    ArchiveMembers,
     Errors,
 }
 
+/// Every view as `(view, name, help)`, in output order. The name is the
+/// positional word, the `--<name>` flag and the bundle's JSON key; parsing,
+/// the usage text and the bundle are all derived from this table.
+#[rustfmt::skip]
+const VIEWS: &[(View, &str, &str)] = &[
+    (View::Fileid,         "fileid",          "File identification."),
+    (View::Identity,       "identity",        "Normalized identity claims."),
+    (View::Values,         "values",          "Structural values tree."),
+    (View::Text,           "text",            "Byte-scan text runs (ascii / utf16le)."),
+    (View::Literals,       "literals",        "Parser-extracted string literals."),
+    (View::Comments,       "comments",        "Source comment bodies."),
+    (View::Metrics,        "metrics",         "Derived metrics."),
+    (View::Sections,       "sections",        "Binary sections."),
+    (View::Symbols,        "symbols",         "Every symbol, all kinds."),
+    (View::Kind(SymbolKind::Import),     "imports",     "Import symbols."),
+    (View::Kind(SymbolKind::Export),     "exports",     "Export symbols."),
+    (View::Kind(SymbolKind::Function),   "functions",   "Function symbols."),
+    (View::Kind(SymbolKind::Call),       "calls",       "Call symbols."),
+    (View::Kind(SymbolKind::Member),     "members",     "Member symbols."),
+    (View::Kind(SymbolKind::Bind),       "binds",       "Bind symbols."),
+    (View::Kind(SymbolKind::Identifier), "identifiers", "Identifier symbols."),
+    (View::Flow,           "flow",            "Value relationships, or null when unavailable."),
+    (View::References,     "references",      "Packages, URLs and files the artifact references."),
+    (View::ArchiveMembers, "archive_members", "Typed archive member index."),
+    (View::Errors,         "errors",          "Recoverable parse errors."),
+];
+
+impl View {
+    fn from_name(name: &str) -> Option<Self> {
+        VIEWS
+            .iter()
+            .find(|(_, n, _)| *n == name)
+            .map(|(v, _, _)| *v)
+    }
+
+    fn name(self) -> &'static str {
+        VIEWS
+            .iter()
+            .find(|(v, _, _)| *v == self)
+            .map(|(_, n, _)| *n)
+            .expect("every view is listed in VIEWS")
+    }
+
+    /// Whether the bundle carries this view under its own key. A symbol
+    /// kind's rows are already in `symbols`; flow is opt-in because building
+    /// the graph is work no other view pays for (see the README).
+    fn bundled(self) -> bool {
+        !matches!(self, Self::Kind(_) | Self::Flow)
+    }
+}
+
+/// The views the bundle carries, in output order.
+fn bundled_views() -> impl Iterator<Item = (View, &'static str)> {
+    VIEWS
+        .iter()
+        .filter(|(view, _, _)| view.bundled())
+        .map(|(view, name, _)| (*view, *name))
+}
+
 fn main() -> ExitCode {
-    let args = match parse_args() {
+    let args = match parse_args(std::env::args_os().skip(1), |p| {
+        std::fs::symlink_metadata(p).is_ok()
+    }) {
         Ok(ParseOutcome::Run(a)) => a,
         Ok(ParseOutcome::Help) => {
-            print_usage(false);
-            return ExitCode::SUCCESS;
+            return exit_code(write!(io::stdout(), "{}", usage()).map(|()| true));
         }
         Ok(ParseOutcome::Version) => {
-            println!("filefacts {}", env!("CARGO_PKG_VERSION"));
-            return ExitCode::SUCCESS;
+            let version = writeln!(io::stdout(), "filefacts {}", env!("CARGO_PKG_VERSION"));
+            return exit_code(version.map(|()| true));
         }
         Err(msg) => {
             eprintln!("filefacts: {msg}");
-            print_usage(true);
+            eprint!("{}", usage());
             return ExitCode::from(2);
         }
     };
 
-    let Some(root) = args.path.clone() else {
+    let Some(root) = args.path.as_deref() else {
         eprintln!("filefacts: no path supplied");
-        print_usage(true);
+        eprint!("{}", usage());
         return ExitCode::from(2);
     };
 
-    // The extraction cache is on by default. Kick off cleanup on a
+    // The CLI rescans the same files, so it opts into the extraction cache
+    // (`FILEFACTS_CACHE=0` still turns it off). Kick off cleanup on a
     // background thread: it drops superseded schema versions and bounds the
     // cache to its item cap (evicting least-recently-used entries).
     // Non-blocking and self-throttling — a short one-file run may exit
     // before it finishes and the next run resumes, while a long directory
     // scan lets it complete.
+    filefacts::cache::enable_by_default();
     filefacts::cache::cleanup();
 
-    if root.is_dir() {
-        let mut had_error = false;
-        let mut stack = vec![root];
-        while let Some(dir) = stack.pop() {
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("filefacts: cannot read dir {}: {e}", dir.display());
-                    had_error = true;
-                    continue;
-                }
-            };
-            for entry in entries {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(e) => {
-                        eprintln!("filefacts: cannot read entry in {}: {e}", dir.display());
-                        had_error = true;
-                        continue;
-                    }
-                };
-                let p = entry.path();
-                match entry.file_type() {
-                    Ok(ft) if ft.is_dir() => stack.push(p),
-                    Ok(ft) if ft.is_file() => {
-                        if !analyze_one(&p, &args) {
-                            had_error = true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        return if had_error {
-            ExitCode::from(1)
-        } else {
-            ExitCode::SUCCESS
-        };
-    }
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    exit_code(run(&mut out, root, &args))
+}
 
-    if analyze_one(&root, &args) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(1)
+/// Exit status for a run: `Ok(false)` means some file failed and was
+/// reported; `Err` means stdout itself failed.
+fn exit_code(result: io::Result<bool>) -> ExitCode {
+    match result {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::from(1),
+        // The reader went away (`filefacts dir | head`): stop quietly and
+        // succeed, as other Unix filters do.
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("filefacts: cannot write output: {e}");
+            ExitCode::from(1)
+        }
     }
 }
 
-// analyze_one parses one file and prints its rendered bundle. Returns
-// false on read/parse/serialise failure so the caller can track whether
-// any file in a directory walk failed.
-fn analyze_one(path: &Path, args: &Args) -> bool {
+/// Analyze `root`, walking it recursively when it is a directory. Returns
+/// `Ok(false)` when any file failed; an `Err` from `out` ends the walk.
+fn run(out: &mut impl Write, root: &Path, args: &Args) -> io::Result<bool> {
+    if !root.is_dir() {
+        return analyze_one(out, root, args);
+    }
+    let mut ok = true;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("filefacts: cannot read dir {}: {e}", shown(&dir));
+                ok = false;
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("filefacts: cannot read entry in {}: {e}", shown(&dir));
+                    ok = false;
+                    continue;
+                }
+            };
+            let p = entry.path();
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => stack.push(p),
+                Ok(ft) if ft.is_file() => ok &= analyze_one(out, &p, args)?,
+                _ => {}
+            }
+        }
+    }
+    Ok(ok)
+}
+
+// analyze_one parses one file and writes its rendered output. A file that
+// cannot be read, parsed or serialised is reported on stderr and yields
+// `Ok(false)` so a directory walk carries on; an `Err` means `out` failed.
+fn analyze_one(out: &mut impl Write, path: &Path, args: &Args) -> io::Result<bool> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("filefacts: cannot read {}: {e}", path.display());
-            return false;
+            eprintln!("filefacts: cannot read {}: {e}", shown(path));
+            return Ok(false);
         }
     };
 
     let parsed = match filefacts::open_with_path(path, &bytes) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("filefacts: {}: {e}", path.display());
-            return false;
+            eprintln!("filefacts: {}: {e}", shown(path));
+            return Ok(false);
         }
     };
 
-    match args.format {
-        // Stream JSON straight to stdout. Building an intermediate
+    let written = match args.format {
+        // Stream JSON straight to `out`. Building an intermediate
         // `serde_json::Value` tree (and then one giant pretty string)
         // doubles peak memory on string-heavy files; serialising the
         // borrowed views directly keeps only one copy live.
-        Format::Json => {
-            if let Err(e) = write_json(&parsed, args.view) {
-                eprintln!(
-                    "filefacts: serialisation failed for {}: {e}",
-                    path.display()
-                );
-                return false;
-            }
-        }
-        Format::Terminal => {
-            let output = build_output(&parsed, args.view);
-            println!("{}", format_terminal(path, &parsed, args.view, &output));
-        }
+        Format::Json => write_json(out, &parsed, args.view),
+        Format::Terminal => format_terminal(path, &parsed, args.view)
+            .and_then(|text| writeln!(out, "{text}").map_err(serde_json::Error::io)),
+    };
+    if !report_serialisation(path, written)? {
+        return Ok(false);
     }
-    true
+    // Flush per file so a long walk shows progress.
+    out.flush()?;
+    Ok(true)
 }
 
-// write_json pretty-prints the selected view directly to stdout without
-// materialising a `serde_json::Value` tree or an intermediate String.
-fn write_json(parsed: &filefacts::ParsedFile<'_>, view: View) -> std::io::Result<()> {
-    use filefacts::SymbolKind;
-    use std::io::Write;
-    let stdout = std::io::stdout().lock();
-    let mut out = std::io::BufWriter::new(stdout);
+/// A path for a diagnostic on stderr, which is a terminal too: walked file
+/// names come from the analysed tree, so control characters are escaped.
+fn shown(path: &Path) -> String {
+    escape_controls(&path.to_string_lossy()).into_owned()
+}
+
+/// Split a write's failure into the output failing (`Err`, which ends the
+/// run) and the file's data failing to serialise (reported, `Ok(false)`).
+fn report_serialisation(path: &Path, written: serde_json::Result<()>) -> io::Result<bool> {
+    match written {
+        Ok(()) => Ok(true),
+        Err(e) if e.is_io() => Err(e.into()),
+        Err(e) => {
+            eprintln!("filefacts: serialisation failed for {}: {e}", shown(path));
+            Ok(false)
+        }
+    }
+}
+
+// write_json pretty-prints the selected view (or the bundle) to `out`
+// without materialising a `serde_json::Value` tree or an intermediate String.
+fn write_json(
+    out: &mut impl Write,
+    parsed: &ParsedFile<'_>,
+    view: Option<View>,
+) -> serde_json::Result<()> {
     match view {
-        View::All => serde_json::to_writer_pretty(
-            &mut out,
-            &Facts {
-                schema_version: filefacts::SCHEMA_VERSION,
-                fileid: parsed.fileid(),
-                values: parsed.values(),
-                text: parsed.text(),
-                literals: parsed.literals(),
-                metrics: parsed.metrics(),
-                sections: parsed.sections(),
-                symbols: parsed.symbols(),
-                identity: parsed.identity(),
-                errors: parsed.errors(),
-            },
-        )?,
-        View::Fileid => serde_json::to_writer_pretty(&mut out, parsed.fileid())?,
-        View::Values => serde_json::to_writer_pretty(&mut out, parsed.values())?,
-        View::Text => serde_json::to_writer_pretty(&mut out, parsed.text())?,
-        View::Literals => serde_json::to_writer_pretty(&mut out, parsed.literals())?,
-        View::Metrics => serde_json::to_writer_pretty(&mut out, parsed.metrics())?,
-        View::Sections => serde_json::to_writer_pretty(&mut out, parsed.sections())?,
-        View::Symbols => serde_json::to_writer_pretty(&mut out, parsed.symbols())?,
-        View::Flow => serde_json::to_writer_pretty(&mut out, &parsed.flow())?,
-        View::Identity => serde_json::to_writer_pretty(&mut out, parsed.identity())?,
-        View::Imports => {
-            serde_json::to_writer_pretty(&mut out, &symbols_of_kind(parsed, SymbolKind::Import))?
-        }
-        View::Exports => {
-            serde_json::to_writer_pretty(&mut out, &symbols_of_kind(parsed, SymbolKind::Export))?
-        }
-        View::Functions => {
-            serde_json::to_writer_pretty(&mut out, &symbols_of_kind(parsed, SymbolKind::Function))?
-        }
-        View::Calls => {
-            serde_json::to_writer_pretty(&mut out, &symbols_of_kind(parsed, SymbolKind::Call))?
-        }
-        View::Members => {
-            serde_json::to_writer_pretty(&mut out, &symbols_of_kind(parsed, SymbolKind::Member))?
-        }
-        View::Binds => {
-            serde_json::to_writer_pretty(&mut out, &symbols_of_kind(parsed, SymbolKind::Bind))?
-        }
-        View::Identifiers => serde_json::to_writer_pretty(
-            &mut out,
-            &symbols_of_kind(parsed, SymbolKind::Identifier),
-        )?,
-        View::Errors => serde_json::to_writer_pretty(&mut out, parsed.errors())?,
+        None => serde_json::to_writer_pretty(&mut *out, &Bundle(parsed))?,
+        Some(view) => serde_json::to_writer_pretty(&mut *out, &ViewData(parsed, view))?,
     }
-    out.write_all(b"\n")?;
-    out.flush()
+    out.write_all(b"\n").map_err(serde_json::Error::io)
 }
 
-#[derive(Serialize)]
-struct Facts<'a> {
-    schema_version: &'static str,
-    fileid: &'a filefacts::FileId,
-    values: &'a filefacts::Values,
-    text: &'a filefacts::Text,
-    literals: &'a filefacts::Literals,
-    metrics: &'a filefacts::Metrics,
-    sections: &'a filefacts::Sections,
-    symbols: &'a filefacts::Symbols,
-    identity: &'a filefacts::Identity,
-    errors: &'a filefacts::Errors,
-}
+/// The default output: the schema version, then every bundled view under
+/// its name.
+struct Bundle<'p, 'a>(&'p ParsedFile<'a>);
 
-fn symbols_of_kind<'a>(
-    parsed: &'a filefacts::ParsedFile<'_>,
-    kind: filefacts::SymbolKind,
-) -> Vec<&'a filefacts::Symbol> {
-    parsed.symbols().iter_kind(kind).collect()
-}
-
-fn build_output(parsed: &filefacts::ParsedFile<'_>, view: View) -> Value {
-    use filefacts::SymbolKind;
-    match view {
-        View::All => serde_json::to_value(Facts {
-            schema_version: filefacts::SCHEMA_VERSION,
-            fileid: parsed.fileid(),
-            values: parsed.values(),
-            text: parsed.text(),
-            literals: parsed.literals(),
-            metrics: parsed.metrics(),
-            sections: parsed.sections(),
-            symbols: parsed.symbols(),
-            identity: parsed.identity(),
-            errors: parsed.errors(),
-        }),
-        View::Fileid => serde_json::to_value(parsed.fileid()),
-        View::Values => serde_json::to_value(parsed.values()),
-        View::Text => serde_json::to_value(parsed.text()),
-        View::Literals => serde_json::to_value(parsed.literals()),
-        View::Metrics => serde_json::to_value(parsed.metrics()),
-        View::Sections => serde_json::to_value(parsed.sections()),
-        View::Symbols => serde_json::to_value(parsed.symbols()),
-        View::Flow => serde_json::to_value(parsed.flow()),
-        View::Identity => serde_json::to_value(parsed.identity()),
-        View::Imports => serde_json::to_value(symbols_of_kind(parsed, SymbolKind::Import)),
-        View::Exports => serde_json::to_value(symbols_of_kind(parsed, SymbolKind::Export)),
-        View::Functions => serde_json::to_value(symbols_of_kind(parsed, SymbolKind::Function)),
-        View::Calls => serde_json::to_value(symbols_of_kind(parsed, SymbolKind::Call)),
-        View::Members => serde_json::to_value(symbols_of_kind(parsed, SymbolKind::Member)),
-        View::Binds => serde_json::to_value(symbols_of_kind(parsed, SymbolKind::Bind)),
-        View::Identifiers => serde_json::to_value(symbols_of_kind(parsed, SymbolKind::Identifier)),
-        View::Errors => serde_json::to_value(parsed.errors()),
+impl Serialize for Bundle<'_, '_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("schema_version", filefacts::SCHEMA_VERSION)?;
+        for (view, name) in bundled_views() {
+            map.serialize_entry(name, &ViewData(self.0, view))?;
+        }
+        map.end()
     }
-    .unwrap_or_else(|_| json!({}))
 }
 
+/// One view of a parsed file, serialised straight from the borrowed data.
+struct ViewData<'p, 'a>(&'p ParsedFile<'a>, View);
+
+impl Serialize for ViewData<'_, '_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let parsed = self.0;
+        match self.1 {
+            View::Fileid => parsed.fileid().serialize(serializer),
+            View::Identity => parsed.identity().serialize(serializer),
+            View::Values => parsed.values().serialize(serializer),
+            View::Text => parsed.text().serialize(serializer),
+            View::Literals => parsed.literals().serialize(serializer),
+            View::Comments => parsed.comments().serialize(serializer),
+            View::Metrics => parsed.metrics().serialize(serializer),
+            View::Sections => parsed.sections().serialize(serializer),
+            View::Symbols => parsed.symbols().serialize(serializer),
+            View::Kind(kind) => serializer.collect_seq(parsed.symbols().iter_kind(kind)),
+            View::Flow => parsed.flow().serialize(serializer),
+            View::References => parsed.references().serialize(serializer),
+            View::ArchiveMembers => parsed.archive_members().serialize(serializer),
+            View::Errors => parsed.errors().serialize(serializer),
+        }
+    }
+}
+
+#[derive(Debug)]
 enum ParseOutcome {
     Run(Args),
     Help,
     Version,
 }
 
-fn parse_args() -> Result<ParseOutcome, String> {
-    let mut args = Args::default();
-    let mut iter = std::env::args().skip(1).peekable();
+/// Parse the command line (without the program name). `exists` reports
+/// whether a path names an existing file; a positional word that names both
+/// a view and an existing file is read as the file, so a path is never
+/// silently taken for a view.
+fn parse_args(
+    args: impl IntoIterator<Item = OsString>,
+    exists: impl Fn(&Path) -> bool,
+) -> Result<ParseOutcome, String> {
+    let mut parsed = Args::default();
+    // A view name read as a path because a file of that name exists; named
+    // in the error if a second path then turns up.
+    let mut shadowed_view: Option<&'static str> = None;
+    let mut iter = args.into_iter().peekable();
     while let Some(arg) = iter.next() {
-        match arg.as_str() {
+        // Flags and view names are ASCII, so an argument that is not UTF-8
+        // can only be a path; keep it as an OsString.
+        let Some(s) = arg.to_str() else {
+            set_path(&mut parsed.path, arg, shadowed_view)?;
+            continue;
+        };
+        match s {
             "-h" | "--help" => return Ok(ParseOutcome::Help),
             "-V" | "--version" => return Ok(ParseOutcome::Version),
             "-f" | "--format" => {
                 let Some(value) = iter.next() else {
                     return Err("--format requires terminal or json".into());
                 };
-                args.format = parse_format(&value)?;
+                parsed.format = parse_format(&value.to_string_lossy())?;
             }
-            s if s.starts_with("--format=") => {
-                args.format = parse_format(&s["--format=".len()..])?;
-            }
-            "-p" | "--pretty" => args.format = Format::Json,
-            "--fileid" => set_view(&mut args.view, View::Fileid)?,
-            "--values" => set_view(&mut args.view, View::Values)?,
-            "--text" => set_view(&mut args.view, View::Text)?,
-            "--literals" => set_view(&mut args.view, View::Literals)?,
-            "--metrics" => set_view(&mut args.view, View::Metrics)?,
-            "--sections" => set_view(&mut args.view, View::Sections)?,
-            "--symbols" => set_view(&mut args.view, View::Symbols)?,
-            "--flow" => set_view(&mut args.view, View::Flow)?,
-            "--identity" => set_view(&mut args.view, View::Identity)?,
-            "--imports" => set_view(&mut args.view, View::Imports)?,
-            "--exports" => set_view(&mut args.view, View::Exports)?,
-            "--functions" => set_view(&mut args.view, View::Functions)?,
-            "--calls" => set_view(&mut args.view, View::Calls)?,
-            "--members" => set_view(&mut args.view, View::Members)?,
-            "--binds" => set_view(&mut args.view, View::Binds)?,
-            "--identifiers" => set_view(&mut args.view, View::Identifiers)?,
-            "--errors" => set_view(&mut args.view, View::Errors)?,
+            "-p" | "--pretty" => parsed.format = Format::Json,
             "--" => {
                 let Some(rest) = iter.next() else {
                     return Err("-- must be followed by a path".into());
                 };
-                set_path(&mut args.path, rest)?;
+                set_path(&mut parsed.path, rest, shadowed_view)?;
                 if iter.peek().is_some() {
                     return Err("multiple paths supplied".into());
                 }
             }
-            s if s.starts_with('-') => return Err(format!("unknown flag: {s}")),
+            s if s.starts_with("--format=") => {
+                parsed.format = parse_format(&s["--format=".len()..])?;
+            }
+            s if s.starts_with('-') => {
+                let view = s.strip_prefix("--").and_then(View::from_name);
+                let Some(view) = view else {
+                    return Err(format!("unknown flag: {s}"));
+                };
+                set_view(&mut parsed.view, view)?;
+            }
             s => {
-                if args.view == View::All {
-                    if let Some(view) = parse_view(s) {
-                        args.view = view;
+                if let Some(view) = View::from_name(s)
+                    && parsed.view.is_none()
+                {
+                    if !exists(Path::new(s)) {
+                        parsed.view = Some(view);
                         continue;
                     }
+                    shadowed_view = Some(view.name());
                 }
-                set_path(&mut args.path, arg)?;
+                set_path(&mut parsed.path, arg, shadowed_view)?;
             }
         }
     }
-    Ok(ParseOutcome::Run(args))
+    Ok(ParseOutcome::Run(parsed))
 }
 
 fn parse_format(value: &str) -> Result<Format, String> {
@@ -405,40 +441,27 @@ fn parse_format(value: &str) -> Result<Format, String> {
     }
 }
 
-fn parse_view(value: &str) -> Option<View> {
-    Some(match value {
-        "fileid" => View::Fileid,
-        "values" => View::Values,
-        "text" => View::Text,
-        "literals" => View::Literals,
-        "metrics" => View::Metrics,
-        "sections" => View::Sections,
-        "symbols" => View::Symbols,
-        "flow" => View::Flow,
-        "identity" => View::Identity,
-        "imports" => View::Imports,
-        "exports" => View::Exports,
-        "functions" => View::Functions,
-        "calls" => View::Calls,
-        "members" => View::Members,
-        "binds" => View::Binds,
-        "identifiers" => View::Identifiers,
-        "errors" => View::Errors,
-        _ => return None,
-    })
-}
-
-fn set_view(slot: &mut View, view: View) -> Result<(), String> {
-    if *slot != View::All {
+fn set_view(slot: &mut Option<View>, view: View) -> Result<(), String> {
+    if slot.is_some() {
         return Err("multiple view selectors supplied; pick one".into());
     }
-    *slot = view;
+    *slot = Some(view);
     Ok(())
 }
 
-fn set_path(slot: &mut Option<PathBuf>, value: String) -> Result<(), String> {
+fn set_path(
+    slot: &mut Option<PathBuf>,
+    value: OsString,
+    shadowed_view: Option<&str>,
+) -> Result<(), String> {
     if slot.is_some() {
-        return Err("multiple paths supplied".into());
+        return Err(match shadowed_view {
+            Some(name) => format!(
+                "multiple paths supplied; `{name}` is an existing file, so it was read \
+                 as a path (use --{name} to select the view)"
+            ),
+            None => "multiple paths supplied".into(),
+        });
     }
     *slot = Some(PathBuf::from(value));
     Ok(())
@@ -448,6 +471,11 @@ fn set_path(slot: &mut Option<PathBuf>, value: String) -> Result<(), String> {
 //
 // Truecolor RGB escapes, no external dep. Honour NO_COLOR by emitting
 // raw text when the env var is set.
+//
+// Every string the renderers print passes through `fg`, `fg_bold` or
+// `pill_bg`, which escape control characters: names, strings and paths
+// come from the analysed file, and a raw ESC in one would let the file
+// drive the user's terminal.
 
 #[derive(Copy, Clone)]
 struct Rgb(u8, u8, u8);
@@ -490,16 +518,18 @@ fn no_color() -> bool {
 }
 
 fn fg(c: Rgb, text: &str) -> String {
+    let text = escape_controls(text);
     if no_color() {
-        return text.to_string();
+        return text.into_owned();
     }
     let Rgb(r, g, b) = c;
     format!("\x1b[38;2;{r};{g};{b}m{text}\x1b[0m")
 }
 
 fn fg_bold(c: Rgb, text: &str) -> String {
+    let text = escape_controls(text);
     if no_color() {
-        return text.to_string();
+        return text.into_owned();
     }
     let Rgb(r, g, b) = c;
     format!("\x1b[1;38;2;{r};{g};{b}m{text}\x1b[0m")
@@ -510,6 +540,7 @@ fn dim(text: &str) -> String {
 }
 
 fn pill_bg(label: &str, bg: Rgb) -> String {
+    let label = escape_controls(label);
     if no_color() {
         return format!(" {label} ");
     }
@@ -543,11 +574,10 @@ fn heading(view: &str, count: Option<usize>) -> String {
 // ─── top-level renderer ─────────────────────────────────────────────
 
 fn format_terminal(
-    path: &std::path::Path,
-    parsed: &filefacts::ParsedFile<'_>,
-    view: View,
-    output: &Value,
-) -> String {
+    path: &Path,
+    parsed: &ParsedFile<'_>,
+    view: Option<View>,
+) -> serde_json::Result<String> {
     let width = terminal_width();
     let mut out = String::new();
 
@@ -555,87 +585,97 @@ fn format_terminal(
     out.push('\n');
 
     match view {
-        View::All => {
-            render_section(&mut out, "fileid", output.get("fileid"), render_fileid);
-            render_section(
-                &mut out,
-                "identity",
-                output.get("identity"),
-                render_values_tree,
-            );
-            render_section(&mut out, "values", output.get("values"), render_values_tree);
-            render_section(&mut out, "text", output.get("text"), render_strings);
-            render_section(&mut out, "literals", output.get("literals"), render_strings);
-            let metrics = output.get("metrics");
-            render_section(&mut out, "metrics", metrics, render_metrics);
-            render_section(&mut out, "sections", output.get("sections"), |v| {
-                render_sections(v, None)
-            });
-            render_section(&mut out, "imports", output.get("imports"), render_imports);
-            render_section(&mut out, "exports", output.get("exports"), render_exports);
-            render_section(
-                &mut out,
-                "functions",
-                output.get("functions"),
-                render_functions,
-            );
-            render_section(&mut out, "symbols", output.get("symbols"), render_symbols);
-            render_section(&mut out, "errors", output.get("errors"), render_errors);
+        None => {
+            for (view, name) in bundled_views() {
+                render_section(&mut out, name, &render_view(parsed, view)?);
+            }
         }
-        view => {
-            let renderer: Box<dyn Fn(&Value) -> String> = match view {
-                View::Fileid => Box::new(render_fileid),
-                View::Values => Box::new(render_values_tree),
-                View::Text | View::Literals => Box::new(render_strings),
-                View::Metrics => Box::new(render_metrics),
-                View::Sections => Box::new(|v| render_sections(v, None)),
-                View::Symbols => Box::new(render_symbols),
-                View::Flow => Box::new(render_values_tree),
-                View::Identity => Box::new(render_values_tree),
-                View::Imports => Box::new(render_imports),
-                View::Exports => Box::new(render_exports),
-                View::Functions => Box::new(render_functions),
-                View::Calls | View::Members | View::Binds | View::Identifiers => {
-                    Box::new(render_symbols)
-                }
-                View::Errors => Box::new(render_errors),
-                View::All => unreachable!(),
-            };
-            let label = view.name();
-            let count = top_level_count(output);
-            out.push_str(&heading(label, count));
+        Some(view) => {
+            let rendered = render_view(parsed, view)?;
+            out.push_str(&heading(view.name(), rendered.count));
             out.push('\n');
-            let body = renderer(output);
-            if body.is_empty() {
+            if rendered.body.is_empty() {
                 out.push_str(&dim("  (empty)"));
                 out.push('\n');
             } else {
-                out.push_str(&body);
+                out.push_str(&rendered.body);
             }
         }
     }
-    out.trim_end().to_string()
+    Ok(out.trim_end().to_string())
 }
 
-fn render_section<F>(out: &mut String, name: &str, value: Option<&Value>, render: F)
-where
-    F: FnOnce(&Value) -> String,
-{
-    let Some(value) = value else {
-        return;
+/// One view rendered for the terminal.
+struct Rendered {
+    /// Item count shown in the heading.
+    count: Option<usize>,
+    /// Whether the bundle shows the view as `(empty)` instead of `body`.
+    empty: bool,
+    body: String,
+}
+
+fn render_view(parsed: &ParsedFile<'_>, view: View) -> serde_json::Result<Rendered> {
+    let render: fn(&Value) -> String = match view {
+        // Rendered from the typed views: a located metric serialises as a
+        // `{value, spans}` object, which the JSON path would print raw, and
+        // a symbol's fields depend on its kind.
+        View::Metrics => {
+            let metrics = parsed.metrics();
+            return Ok(Rendered {
+                count: (metrics.len() > 6).then_some(metrics.len()),
+                empty: metrics.is_empty(),
+                body: render_metrics(metrics),
+            });
+        }
+        View::ArchiveMembers => {
+            let members = parsed.archive_members();
+            return Ok(Rendered {
+                count: Some(members.len()),
+                empty: members.is_empty(),
+                body: render_archive_members(members),
+            });
+        }
+        View::Symbols | View::Kind(_) => {
+            let symbols: Vec<&Symbol> = match view {
+                View::Kind(kind) => parsed.symbols().iter_kind(kind).collect(),
+                _ => parsed.symbols().iter().collect(),
+            };
+            let body = match view {
+                View::Kind(SymbolKind::Import) => render_imports(&symbols),
+                View::Kind(SymbolKind::Export) => render_exports(&symbols),
+                View::Kind(SymbolKind::Function) => render_functions(&symbols),
+                _ => render_symbols(&symbols),
+            };
+            return Ok(Rendered {
+                count: Some(symbols.len()),
+                empty: symbols.is_empty(),
+                body,
+            });
+        }
+        View::Fileid => render_fileid,
+        View::Text | View::Literals | View::Comments => render_strings,
+        View::Sections => |v| render_sections(v, None),
+        View::Errors => render_errors,
+        View::Identity | View::Values | View::Flow | View::References => render_values_tree,
     };
-    let count = top_level_count(value);
-    if is_empty_value(value) {
-        out.push_str(&heading(name, count));
-        out.push('\n');
+    let value = serde_json::to_value(ViewData(parsed, view))?;
+    Ok(Rendered {
+        count: top_level_count(&value),
+        empty: is_empty_value(&value),
+        body: render(&value),
+    })
+}
+
+fn render_section(out: &mut String, name: &str, rendered: &Rendered) {
+    out.push_str(&heading(name, rendered.count));
+    out.push('\n');
+    if rendered.empty {
         out.push_str(&dim("  (empty)"));
         out.push_str("\n\n");
         return;
     }
-    out.push_str(&heading(name, count));
-    out.push('\n');
-    let body = render(value);
-    out.push_str(&body);
+    let body = &rendered.body;
+    out.push_str(body);
     if !body.ends_with("\n\n") {
         if body.ends_with('\n') {
             out.push('\n');
@@ -685,8 +725,13 @@ fn render_file_header(
     out.push_str(&pill_bg(&ft, ft_color));
 
     // Subtitle: size · entropy · mismatch
-    let size = parsed.metrics().get("file.size").unwrap_or(0.0) as u64;
-    let entropy = parsed.metrics().get("file.entropy");
+    let size = parsed
+        .metrics()
+        .get_key(&filefacts::metric!("file.size"))
+        .unwrap_or(0.0) as u64;
+    let entropy = parsed
+        .metrics()
+        .get_key(&filefacts::metric!("file.entropy"));
     let mut subtitle = Vec::<String>::new();
     subtitle.push(fg(FG_LABEL, &humanize_bytes(size)));
     if let Some(e) = entropy {
@@ -862,7 +907,7 @@ fn format_scalar(value: &Value) -> String {
         Value::Bool(false) => dim("false"),
         Value::String(s) => fg(FG_VALUE, s),
         Value::Number(n) => fg(FG_NUM, &n.to_string()),
-        _ => scalar_string(value),
+        _ => fg(FG_VALUE, &scalar_string(value)),
     }
 }
 
@@ -875,28 +920,24 @@ fn scalar_string(value: &Value) -> String {
 
 // ─── metrics view ───────────────────────────────────────────────────
 
-fn render_metrics(value: &Value) -> String {
-    let Value::Object(map) = value else {
-        return render_values_tree(value);
-    };
+fn render_metrics(metrics: &filefacts::Metrics) -> String {
     // Group by leading prefix (`binary.foo` → group `binary`). Per-section
     // entropies (`sections[N].entropy`) collapse into a single `sections[*]`
-    // bucket to keep the metric pane readable.
-    let mut groups: std::collections::BTreeMap<String, Vec<(&str, &Value)>> =
+    // bucket to keep the metric pane readable. `iter` yields keys sorted, so
+    // each group's rows are too.
+    let mut groups: std::collections::BTreeMap<&str, Vec<(&str, f64)>> =
         std::collections::BTreeMap::new();
-    for (k, v) in map {
-        let group = metric_group(k).to_string();
-        groups.entry(group).or_default().push((k, v));
+    for (k, v) in metrics.iter() {
+        groups.entry(metric_group(k)).or_default().push((k, v));
     }
     let mut out = String::new();
-    for (group, mut entries) in groups {
-        entries.sort_by_key(|(k, _)| *k);
-        out.push_str(&format!("  {}\n", fg_bold(FG_VALUE, &group)));
+    for (group, entries) in groups {
+        out.push_str(&format!("  {}\n", fg_bold(FG_VALUE, group)));
         // Drop the group prefix on each row.
         let strip_prefix = format!("{group}.");
         let rows: Vec<(String, String)> = entries
             .iter()
-            .map(|(k, v)| {
+            .map(|&(k, v)| {
                 let label = k.strip_prefix(&strip_prefix).unwrap_or(k).to_string();
                 let value = format_metric_value(k, v);
                 (label, value)
@@ -926,38 +967,28 @@ fn metric_group(key: &str) -> &str {
     key
 }
 
-fn format_metric_value(key: &str, value: &Value) -> String {
-    match value {
-        Value::Number(n) => {
-            let raw = n.as_f64().unwrap_or(0.0);
-            // Heuristics: booleans-as-numbers (0.0/1.0 for has_overlay etc.)
-            // render compactly; sizes get byte-humanised; ratios/entropies
-            // get fixed-precision; counts stay integer.
-            if key.ends_with("_size") || key.ends_with("size_bytes") || key.ends_with("_size_bytes")
-            {
-                fg(FG_NUM, &humanize_bytes(raw as u64))
-            } else if key.ends_with(".count")
-                || key.ends_with("_count")
-                || key.ends_with("error_count")
-            {
-                fg(FG_NUM, &(raw as u64).to_string())
-            } else if key.ends_with("_ratio")
-                || key.ends_with("_pct")
-                || key.ends_with("entropy")
-                || key.ends_with("_entropy")
-                || key.ends_with("entropy_mean")
-                || key.ends_with("entropy_max")
-                || key.ends_with("entropy_variance")
-                || key.ends_with("name_entropy")
-            {
-                fg(FG_NUM, &format!("{raw:.3}"))
-            } else if raw.fract() == 0.0 && raw.abs() < 1e15 {
-                fg(FG_NUM, &(raw as i64).to_string())
-            } else {
-                fg(FG_NUM, &format!("{raw:.3}"))
-            }
-        }
-        other => format_scalar(other),
+fn format_metric_value(key: &str, raw: f64) -> String {
+    // Heuristics: booleans-as-numbers (0.0/1.0 for has_overlay etc.)
+    // render compactly; sizes get byte-humanised; ratios/entropies
+    // get fixed-precision; counts stay integer.
+    if key.ends_with("_size") || key.ends_with("size_bytes") || key.ends_with("_size_bytes") {
+        fg(FG_NUM, &humanize_bytes(raw as u64))
+    } else if key.ends_with(".count") || key.ends_with("_count") || key.ends_with("error_count") {
+        fg(FG_NUM, &(raw as u64).to_string())
+    } else if key.ends_with("_ratio")
+        || key.ends_with("_pct")
+        || key.ends_with("entropy")
+        || key.ends_with("_entropy")
+        || key.ends_with("entropy_mean")
+        || key.ends_with("entropy_max")
+        || key.ends_with("entropy_variance")
+        || key.ends_with("name_entropy")
+    {
+        fg(FG_NUM, &format!("{raw:.3}"))
+    } else if raw.fract() == 0.0 && raw.abs() < 1e15 {
+        fg(FG_NUM, &(raw as i64).to_string())
+    } else {
+        fg(FG_NUM, &format!("{raw:.3}"))
     }
 }
 
@@ -1000,11 +1031,18 @@ fn render_strings(value: &Value) -> String {
         ));
         for s in items.iter().take(STRING_PREVIEW_LIMIT) {
             let Value::Object(obj) = s else { continue };
+            // Text rows are stng's (`value`, `data_offset`); literal and
+            // comment rows are filefacts' (`text`, `offset`).
             let offset = obj
                 .get("offset")
+                .or_else(|| obj.get("data_offset"))
                 .and_then(Value::as_u64)
                 .map_or_else(|| "        ".into(), |o| format!("0x{o:08x}"));
-            let text = obj.get("text").and_then(Value::as_str).unwrap_or("");
+            let text = obj
+                .get("text")
+                .or_else(|| obj.get("value"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
             let mut tags = Vec::<String>::new();
             if let Some(section) = obj.get("section").and_then(Value::as_str) {
                 tags.push(format!("{} {}", dim("§"), fg(FG_LABEL, section)));
@@ -1038,24 +1076,35 @@ fn render_strings(value: &Value) -> String {
 }
 
 fn string_excerpt(text: &str, max: usize) -> String {
-    let escaped: String = text
-        .chars()
-        .map(|c| match c {
-            '\n' => "\\n".into(),
-            '\r' => "\\r".into(),
-            '\t' => "\\t".into(),
-            c if c.is_control() => format!("\\x{:02x}", c as u32),
-            c => c.to_string(),
-        })
-        .collect();
+    let escaped = escape_controls(text);
     if escaped.chars().count() <= max {
-        escaped
+        escaped.into_owned()
     } else {
         let keep = max.saturating_sub(1);
         let mut s: String = escaped.chars().take(keep).collect();
         s.push('…');
         s
     }
+}
+
+/// `text` with control characters written as escapes (`\n`, `\t`,
+/// `\x1b`, `\x9b`, …), so file-derived text cannot drive the terminal.
+/// Idempotent: the output holds no control characters.
+fn escape_controls(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(char::is_control) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    Cow::Owned(out)
 }
 
 // ─── sections view ──────────────────────────────────────────────────
@@ -1241,71 +1290,57 @@ fn format_section_flags(flags: &[&str]) -> String {
 
 const IMPORTS_PREVIEW_PER_LIB: usize = 24;
 
-fn render_imports(value: &Value) -> String {
-    let Value::Array(items) = value else {
-        return render_values_tree(value);
-    };
+fn render_imports(symbols: &[&Symbol]) -> String {
     // Group by library.
-    let mut by_lib: std::collections::BTreeMap<String, Vec<&Map<String, Value>>> =
+    let mut by_lib: std::collections::BTreeMap<&str, Vec<(&str, Option<u64>, Option<u32>)>> =
         std::collections::BTreeMap::new();
-    for v in items {
-        let Some(obj) = v.as_object() else { continue };
-        let lib = obj
-            .get("library")
-            .and_then(Value::as_str)
-            .unwrap_or("(unknown)")
-            .to_string();
-        by_lib.entry(lib).or_default().push(obj);
+    for symbol in symbols {
+        let Symbol::Import {
+            name,
+            library,
+            offset,
+            ordinal,
+            ..
+        } = symbol
+        else {
+            continue;
+        };
+        let lib = library.as_deref().unwrap_or("(unknown)");
+        by_lib
+            .entry(lib)
+            .or_default()
+            .push((name, *offset, *ordinal));
     }
     let mut out = String::new();
     for (lib, entries) in by_lib {
         out.push_str(&format!(
             "  {} {}\n",
-            fg_bold(FG_VALUE, &lib),
+            fg_bold(FG_VALUE, lib),
             dim(&format!("({})", entries.len())),
         ));
-        let show: Vec<&&Map<String, Value>> =
-            entries.iter().take(IMPORTS_PREVIEW_PER_LIB).collect();
+        let show = &entries[..entries.len().min(IMPORTS_PREVIEW_PER_LIB)];
         let off_w = show
             .iter()
-            .filter_map(|e| e.get("offset").and_then(Value::as_u64))
+            .filter_map(|(_, offset, _)| *offset)
             .map(|n| format!("0x{n:x}").len())
             .max()
             .unwrap_or(0);
-        for e in &show {
-            let name = e.get("name").and_then(Value::as_str).unwrap_or("");
-            let offset = e
-                .get("offset")
-                .and_then(Value::as_u64)
-                .map(|n| format!("0x{n:x}"))
-                .unwrap_or_default();
-            let ordinal = e.get("ordinal").and_then(Value::as_u64);
-            let source = e.get("source").and_then(Value::as_str);
-            let mut tail = Vec::<String>::new();
-            if let Some(o) = ordinal {
-                tail.push(dim(&format!("#{o}")));
-            }
-            if let Some(s) = source {
-                tail.push(dim(s));
-            }
+        for (name, offset, ordinal) in show {
+            let offset = offset.map(|n| format!("0x{n:x}")).unwrap_or_default();
+            let tail = match ordinal {
+                Some(o) => format!("  {}", dim(&format!("#{o}"))),
+                None => String::new(),
+            };
             out.push_str(&format!(
                 "    {off}  {name}{tail}\n",
                 off = fg(FG_HEX, &rpad(&offset, off_w)),
                 name = fg(FG_VALUE, name),
-                tail = if tail.is_empty() {
-                    String::new()
-                } else {
-                    format!("  {}", tail.join(&dim(" ")))
-                },
             ));
         }
-        if entries.len() > IMPORTS_PREVIEW_PER_LIB {
+        if entries.len() > show.len() {
             out.push_str(&format!(
                 "    {}\n",
-                dim(&format!(
-                    "... {} more",
-                    entries.len() - IMPORTS_PREVIEW_PER_LIB
-                )),
+                dim(&format!("... {} more", entries.len() - show.len())),
             ));
         }
     }
@@ -1316,34 +1351,34 @@ fn render_imports(value: &Value) -> String {
 
 const EXPORTS_PREVIEW_LIMIT: usize = 80;
 
-fn render_exports(value: &Value) -> String {
-    let Value::Array(items) = value else {
-        return render_values_tree(value);
-    };
-    let mut out = String::new();
-    let off_w = items
+fn render_exports(symbols: &[&Symbol]) -> String {
+    let exports: Vec<(&str, Option<u64>, Option<u32>, Option<&str>)> = symbols
         .iter()
-        .filter_map(|v| v.as_object())
-        .filter_map(|o| o.get("offset").and_then(Value::as_u64))
+        .filter_map(|symbol| match symbol {
+            Symbol::Export {
+                name,
+                offset,
+                ordinal,
+                forward_to,
+            } => Some((name.as_str(), *offset, *ordinal, forward_to.as_deref())),
+            _ => None,
+        })
+        .collect();
+    let off_w = exports
+        .iter()
+        .filter_map(|(_, offset, _, _)| *offset)
         .map(|n| format!("0x{n:x}").len())
         .max()
         .unwrap_or(0);
-    for v in items.iter().take(EXPORTS_PREVIEW_LIMIT) {
-        let Some(obj) = v.as_object() else { continue };
-        let name = obj.get("name").and_then(Value::as_str).unwrap_or("");
-        let offset = obj
-            .get("offset")
-            .and_then(Value::as_u64)
-            .map_or_else(|| "·".into(), |n| format!("0x{n:x}"));
+    let mut out = String::new();
+    for (name, offset, ordinal, forward_to) in exports.iter().take(EXPORTS_PREVIEW_LIMIT) {
+        let offset = offset.map_or_else(|| "·".into(), |n| format!("0x{n:x}"));
         let mut tail = Vec::<String>::new();
-        if let Some(o) = obj.get("ordinal").and_then(Value::as_u64) {
+        if let Some(o) = ordinal {
             tail.push(dim(&format!("#{o}")));
         }
-        if let Some(f) = obj.get("forward_to").and_then(Value::as_str) {
+        if let Some(f) = forward_to {
             tail.push(format!("{} {}", dim("→"), fg(FG_VALUE, f)));
-        }
-        if let Some(s) = obj.get("source").and_then(Value::as_str) {
-            tail.push(dim(s));
         }
         out.push_str(&format!(
             "  {off}  {name}{tail}\n",
@@ -1356,10 +1391,13 @@ fn render_exports(value: &Value) -> String {
             },
         ));
     }
-    if items.len() > EXPORTS_PREVIEW_LIMIT {
+    if exports.len() > EXPORTS_PREVIEW_LIMIT {
         out.push_str(&format!(
             "  {}\n",
-            dim(&format!("... {} more", items.len() - EXPORTS_PREVIEW_LIMIT)),
+            dim(&format!(
+                "... {} more",
+                exports.len() - EXPORTS_PREVIEW_LIMIT
+            )),
         ));
     }
     out
@@ -1369,69 +1407,46 @@ fn render_exports(value: &Value) -> String {
 
 const FUNCTIONS_PREVIEW_LIMIT: usize = 60;
 
-fn render_functions(value: &Value) -> String {
-    let Value::Array(items) = value else {
-        return render_values_tree(value);
-    };
-    let mut out = String::new();
-    let off_w = items
+fn render_functions(symbols: &[&Symbol]) -> String {
+    let functions: Vec<(&str, Option<u64>, Option<u32>, &[String])> = symbols
         .iter()
-        .filter_map(|v| v.as_object())
-        .filter_map(|o| o.get("offset").and_then(Value::as_u64))
+        .filter_map(|symbol| match symbol {
+            Symbol::Function {
+                name,
+                offset,
+                complexity,
+                callees,
+            } => Some((name.as_str(), *offset, *complexity, callees.as_slice())),
+            _ => None,
+        })
+        .collect();
+    let off_w = functions
+        .iter()
+        .filter_map(|(_, offset, _, _)| *offset)
         .map(|n| format!("0x{n:x}").len())
         .max()
         .unwrap_or(0);
-    for v in items.iter().take(FUNCTIONS_PREVIEW_LIMIT) {
-        let Some(obj) = v.as_object() else { continue };
-        let name = obj.get("name").and_then(Value::as_str).unwrap_or("");
-        let offset = obj
-            .get("offset")
-            .and_then(Value::as_u64)
-            .map_or_else(|| "·".into(), |n| format!("0x{n:x}"));
-        let mut tail = Vec::<String>::new();
-        if let Some(k) = obj.get("kind").and_then(Value::as_str) {
-            tail.push(dim(k));
-        }
-        if let Some(c) = obj.get("complexity").and_then(Value::as_u64) {
-            tail.push(fg(FG_LABEL, &format!("cx={c}")));
-        }
-        if let Some(bb) = obj.get("basic_blocks").and_then(Value::as_u64) {
-            tail.push(fg(FG_LABEL, &format!("bb={bb}")));
-        }
-        if let Some(ins) = obj.get("instructions").and_then(Value::as_u64) {
-            tail.push(fg(FG_LABEL, &format!("ins={ins}")));
-        }
-        if let Some(true) = obj.get("recursive").and_then(Value::as_bool) {
-            tail.push(fg(FG_FLAG_WRITE, "recursive"));
-        }
-        if let Some(true) = obj.get("noreturn").and_then(Value::as_bool) {
-            tail.push(fg(FG_FLAG_EXEC, "noreturn"));
-        }
-        if let Some(true) = obj.get("is_linear").and_then(Value::as_bool) {
-            tail.push(dim("linear"));
-        }
-        if let Some(s) = obj.get("source").and_then(Value::as_str) {
-            tail.push(dim(s));
-        }
+    let mut out = String::new();
+    for (name, offset, complexity, callees) in functions.iter().take(FUNCTIONS_PREVIEW_LIMIT) {
+        let offset = offset.map_or_else(|| "·".into(), |n| format!("0x{n:x}"));
+        let tail = match complexity {
+            Some(c) => format!("  {}", fg(FG_LABEL, &format!("cx={c}"))),
+            None => String::new(),
+        };
         out.push_str(&format!(
             "  {off}  {name}{tail}\n",
             off = fg(FG_HEX, &rpad(&offset, off_w)),
             name = fg(FG_VALUE, name),
-            tail = if tail.is_empty() {
-                String::new()
-            } else {
-                format!("  {}", tail.join(&dim(" ")))
-            },
         ));
-        let calls = obj
-            .get("calls")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>())
-            .unwrap_or_default();
-        if !calls.is_empty() {
-            let inline = calls.iter().take(8).copied().collect::<Vec<_>>().join(", ");
-            let suffix = if calls.len() > 8 {
-                format!(", … +{}", calls.len() - 8)
+        if !callees.is_empty() {
+            let inline = callees
+                .iter()
+                .take(8)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let suffix = if callees.len() > 8 {
+                format!(", … +{}", callees.len() - 8)
             } else {
                 String::new()
             };
@@ -1443,12 +1458,12 @@ fn render_functions(value: &Value) -> String {
             ));
         }
     }
-    if items.len() > FUNCTIONS_PREVIEW_LIMIT {
+    if functions.len() > FUNCTIONS_PREVIEW_LIMIT {
         out.push_str(&format!(
             "  {}\n",
             dim(&format!(
                 "... {} more",
-                items.len() - FUNCTIONS_PREVIEW_LIMIT
+                functions.len() - FUNCTIONS_PREVIEW_LIMIT
             )),
         ));
     }
@@ -1460,65 +1475,107 @@ fn render_functions(value: &Value) -> String {
 const SYMBOL_PREVIEW_LIMIT: usize = 30;
 
 /// Terminal rendering of the unified `Symbols` view (or any per-kind
-/// filtered subset). Each row is one tagged `Symbol` JSON object;
-/// we surface kind, primary name/target/path, and a compact label
+/// filtered subset): kind, primary name/target/path, and a compact label
 /// for the optional fields most rule authors care about.
-fn render_symbols(value: &Value) -> String {
-    let Value::Array(items) = value else {
-        return render_values_tree(value);
-    };
-    if items.is_empty() {
-        return String::new();
-    }
+fn render_symbols(symbols: &[&Symbol]) -> String {
     let mut out = String::new();
-    for v in items.iter().take(SYMBOL_PREVIEW_LIMIT) {
-        let Some(obj) = v.as_object() else { continue };
-        let kind = obj.get("kind").and_then(Value::as_str).unwrap_or("?");
-        let name = obj
-            .get("name")
-            .or_else(|| obj.get("target"))
-            .or_else(|| obj.get("path"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| "·".into());
-        let source = obj.get("source").and_then(Value::as_str).unwrap_or("");
-        let extras = match kind {
-            "import" => obj
-                .get("library")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_default(),
-            "call" => obj
-                .get("args")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .map(|v| v.as_str().unwrap_or("?").to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .unwrap_or_default(),
-            "function" => obj
-                .get("decl")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_default(),
-            _ => String::new(),
+    for symbol in symbols.iter().take(SYMBOL_PREVIEW_LIMIT) {
+        let (kind, extras) = match symbol {
+            Symbol::Import { library, .. } => ("import", library.clone().unwrap_or_default()),
+            Symbol::Export { .. } => ("export", String::new()),
+            Symbol::Function { .. } => ("function", String::new()),
+            Symbol::Call { args, .. } => (
+                "call",
+                args.iter().map(format_arg).collect::<Vec<_>>().join(", "),
+            ),
+            Symbol::Member { .. } => ("member", String::new()),
+            Symbol::Bind { .. } => ("bind", String::new()),
+            Symbol::Identifier { .. } => ("identifier", String::new()),
         };
         out.push_str(&format!(
-            "  {k:>10} {name}{spacer}{extras}{spacer2}{src}\n",
-            k = dim(kind),
-            name = fg(FG_VALUE, &name),
+            "  {kind} {name}{spacer}{extras}\n",
+            kind = dim(&rpad(kind, 10)),
+            name = fg(FG_VALUE, symbol.name().unwrap_or("·")),
             spacer = if extras.is_empty() { "" } else { "  " },
             extras = dim(&extras),
-            spacer2 = if source.is_empty() { "" } else { "  " },
-            src = dim(source),
         ));
     }
-    if items.len() > SYMBOL_PREVIEW_LIMIT {
+    if symbols.len() > SYMBOL_PREVIEW_LIMIT {
         out.push_str(&format!(
             "    {}\n",
-            dim(&format!("... {} more", items.len() - SYMBOL_PREVIEW_LIMIT)),
+            dim(&format!(
+                "... {} more",
+                symbols.len() - SYMBOL_PREVIEW_LIMIT
+            )),
+        ));
+    }
+    out
+}
+
+/// A call argument as it would read in source: literals with their
+/// value, everything else by shape.
+fn format_arg(arg: &Arg) -> String {
+    match arg {
+        Arg::String { value } => format!("\"{}\"", string_excerpt(value, 40)),
+        Arg::Template { value } => format!("`{}`", string_excerpt(value, 40)),
+        Arg::Number { text, .. } => text.clone(),
+        Arg::Identifier { name } => name.clone(),
+        Arg::Bool { value } => value.to_string(),
+        Arg::Null => "null".into(),
+        Arg::Object => "{…}".into(),
+        Arg::Array => "[…]".into(),
+        Arg::Function => "<function>".into(),
+        Arg::Call => "<call>".into(),
+        // `Expression`, and any shape added later.
+        _ => "<expr>".into(),
+    }
+}
+
+// ─── archive members view ───────────────────────────────────────────
+
+const ARCHIVE_MEMBERS_PREVIEW_LIMIT: usize = 50;
+
+/// One line per member: size, path, then whatever sets it apart from a
+/// plain stored file. Paths come from the archive, so control characters
+/// are escaped.
+fn render_archive_members(members: &[filefacts::ArchiveMember]) -> String {
+    let shown = &members[..members.len().min(ARCHIVE_MEMBERS_PREVIEW_LIMIT)];
+    let sizes: Vec<String> = shown.iter().map(|m| humanize_bytes(m.size_bytes)).collect();
+    let size_w = sizes.iter().map(String::len).max().unwrap_or(0);
+    let mut out = String::new();
+    for (m, size) in shown.iter().zip(&sizes) {
+        let mut tail = Vec::<String>::new();
+        if let Some(kind) = m.entry_type.as_deref().filter(|k| *k != "regular") {
+            tail.push(dim(kind));
+        }
+        if let Some(method) = m.compression.as_ref().and_then(|c| c.method.as_deref()) {
+            tail.push(dim(method));
+        }
+        if m.encrypted {
+            tail.push(fg(FG_FLAG_WRITE, "encrypted"));
+        }
+        if let Some(link) = m.linkname.as_deref() {
+            tail.push(format!(
+                "{} {}",
+                dim("→"),
+                fg(FG_VALUE, &string_excerpt(link, 80))
+            ));
+        }
+        out.push_str(&format!(
+            "  {size}  {path}{tail}\n",
+            size = fg(FG_NUM, &rpad(size, size_w)),
+            path = fg(FG_VALUE, &string_excerpt(&m.path, 120)),
+            tail = if tail.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", tail.join(&dim(" ")))
+            },
+        ));
+    }
+    if members.len() > shown.len() {
+        out.push_str(&format!(
+            "  {}\n",
+            dim(&format!("... {} more", members.len() - shown.len()))
         ));
     }
     out
@@ -1597,96 +1654,215 @@ fn rpad(s: &str, width: usize) -> String {
     }
 }
 
-impl View {
-    fn name(self) -> &'static str {
-        match self {
-            Self::All => "facts",
-            Self::Fileid => "fileid",
-            Self::Values => "values",
-            Self::Text => "text",
-            Self::Literals => "literals",
-            Self::Metrics => "metrics",
-            Self::Sections => "sections",
-            Self::Symbols => "symbols",
-            Self::Flow => "flow",
-            Self::Identity => "identity",
-            Self::Imports => "imports",
-            Self::Exports => "exports",
-            Self::Functions => "functions",
-            Self::Calls => "calls",
-            Self::Members => "members",
-            Self::Binds => "binds",
-            Self::Identifiers => "identifiers",
-            Self::Errors => "errors",
-        }
-    }
-}
-
-fn print_usage(to_stderr: bool) {
-    let msg = "\
+fn usage() -> String {
+    let mut msg = String::from(
+        "\
 usage: filefacts [options] [view] <path>
 
-views:
-  fileid identity values text literals metrics sections symbols imports
-  exports functions calls members binds identifiers flow errors
+Emits the facts bundle for <path>, or one view of it. A directory is walked
+recursively, one result per regular file. The bundle holds every view but
+flow, which is opt-in; the symbol kinds (imports .. identifiers) are the
+matching rows of symbols.
 
+views (select one by name, or with the --<view> flag; a name that is also
+an existing file is read as that file):
+",
+    );
+    for (_, name, help) in VIEWS {
+        msg.push_str(&format!("  {name:<17}  {help}\n"));
+    }
+    msg.push_str(
+        "
 options:
   -f, --format <terminal|json>
                      Output format. Default: terminal.
-  --fileid           Emit only the fileid view.
-  --values           Emit only the structural values tree.
-  --text             Emit only byte-scan text runs (ascii / utf16le).
-  --literals         Emit only parser-extracted string literals.
-  --metrics          Emit only derived metrics.
-  --sections         Emit only binary sections.
-  --symbols          Emit the full Symbols view (all kinds).
-  --flow             Emit value relationships, or null when unavailable.
-  --identity         Emit only the normalized identity claims.
-  --imports          Emit only import symbols.
-  --exports          Emit only export symbols.
-  --functions        Emit only function symbols.
-  --calls            Emit only call symbols.
-  --members          Emit only member symbols.
-  --binds            Emit only bind symbols.
-  --identifiers      Emit only identifier symbols.
-  --errors           Emit only recoverable parse errors.
   -p, --pretty       Compatibility shorthand for --format json.
   -h, --help         Show this help and exit.
   -V, --version      Print version and exit.
-";
-    if to_stderr {
-        eprint!("{msg}");
-    } else {
-        print!("{msg}");
-    }
+",
+    );
+    msg
 }
 
 #[cfg(test)]
-mod flow_tests {
+mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
-    /// Hermetic `open_with_path`: `flow_is_a_format_neutral_view` asserts
-    /// `parse_count() == 1`, which only holds when this process actually runs
-    /// the extraction pipeline. The disk cache is off by default only inside
-    /// filefacts' own unit tests (`!cfg!(test)` in `cache`); that guard does
-    /// not reach this binary target, where the crate is linked as an ordinary
-    /// dependency, so a warm entry from a prior run would leave the count at
-    /// 0. Mirrors the wrapper in `tests/integration.rs`. Idempotent and safe
-    /// under parallel test execution.
+    /// Hermetic `open_with_path`: tests here assert `parse_count() == 1`,
+    /// which only holds when this process actually runs the extraction
+    /// pipeline. The disk cache is off by default only inside filefacts' own
+    /// unit tests (`!cfg!(test)` in `cache`); that guard does not reach this
+    /// binary target, where the crate is linked as an ordinary dependency,
+    /// so a warm entry from a prior run would leave the count at 0. Mirrors
+    /// the wrapper in `tests/integration.rs`. Idempotent and safe under
+    /// parallel test execution.
     fn open_with_path<'a>(
         path: &Path,
         bytes: &'a [u8],
-    ) -> Result<filefacts::ParsedFile<'a>, filefacts::Error> {
+    ) -> Result<ParsedFile<'a>, filefacts::Error> {
         filefacts::cache::set_caching_enabled(false);
         filefacts::open_with_path(path, bytes)
     }
 
+    /// Parse `words` as a command line on which only `existing` names files.
+    fn parse(words: &[&str], existing: &[&str]) -> Result<Args, String> {
+        let words = words.iter().map(OsString::from);
+        match parse_args(words, |p| existing.iter().any(|e| Path::new(e) == p))? {
+            ParseOutcome::Run(args) => Ok(args),
+            other => panic!("expected a run, got {other:?}"),
+        }
+    }
+
+    const SOURCE: &[u8] = b"import os  # fetch\nos.system('curl http://example.invalid/x')\n";
+
+    #[test]
+    fn every_view_is_reachable_by_name_and_flag() {
+        let help = usage();
+        let mut names = BTreeSet::new();
+        for &(view, name, _) in VIEWS {
+            assert!(names.insert(name), "{name} is listed twice");
+            assert_eq!(View::from_name(name), Some(view));
+            assert_eq!(view.name(), name);
+            assert!(
+                help.contains(&format!("\n  {name} ")),
+                "{name} not in usage"
+            );
+            let flag = format!("--{name}");
+            for words in [[name, "x"], ["x", name], [flag.as_str(), "x"]] {
+                let args = parse(&words, &[]).unwrap();
+                assert_eq!(args.view, Some(view), "{words:?}");
+                assert_eq!(args.path.as_deref(), Some(Path::new("x")), "{words:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn bundle_carries_every_view() {
+        let parsed = open_with_path(Path::new("example.py"), SOURCE).unwrap();
+        let bundle = serde_json::to_value(Bundle(&parsed)).unwrap();
+        let view_value = |view| serde_json::to_value(ViewData(&parsed, view)).unwrap();
+        for &(view, name, _) in VIEWS {
+            match view {
+                _ if view.bundled() => assert_eq!(bundle[name], view_value(view), "{name}"),
+                // A kind's rows are the matching rows of `symbols`.
+                View::Kind(_) => {
+                    let rows = view_value(view);
+                    let symbols = bundle["symbols"].as_array().unwrap();
+                    assert!(rows.as_array().unwrap().iter().all(|r| symbols.contains(r)));
+                }
+                // Opt-in: the README documents that the bundle skips it.
+                View::Flow => {}
+                _ => panic!("{name} is neither bundled nor covered"),
+            }
+        }
+        assert!(
+            !view_value(View::Kind(SymbolKind::Import))
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!bundle["comments"].as_array().unwrap().is_empty());
+
+        let keys: BTreeSet<&str> = bundle
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected: BTreeSet<&str> = std::iter::once("schema_version")
+            .chain(bundled_views().map(|(_, name)| name))
+            .collect();
+        assert_eq!(keys, expected);
+
+        let text = format_terminal(Path::new("example.py"), &parsed, None).unwrap();
+        for (_, name) in bundled_views() {
+            let label = fg_bold(heading_color(name), &name.to_uppercase());
+            assert!(
+                text.contains(&label),
+                "{name} missing from the terminal bundle"
+            );
+        }
+        assert_eq!(parsed.parse_count(), 1);
+    }
+
+    #[test]
+    fn existing_file_wins_over_a_positional_view_name() {
+        let args = parse(&["metrics", "x"], &[]).unwrap();
+        assert_eq!(args.view, Some(View::Metrics));
+        assert_eq!(args.path.as_deref(), Some(Path::new("x")));
+
+        let args = parse(&["metrics"], &["metrics"]).unwrap();
+        assert_eq!(args.view, None);
+        assert_eq!(args.path.as_deref(), Some(Path::new("metrics")));
+
+        let args = parse(&["--metrics", "metrics"], &["metrics"]).unwrap();
+        assert_eq!(args.view, Some(View::Metrics));
+        assert_eq!(args.path.as_deref(), Some(Path::new("metrics")));
+
+        let err = parse(&["metrics", "x"], &["metrics"]).unwrap_err();
+        assert!(err.contains("--metrics"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_argument_is_a_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::ffi::OsStr::from_bytes(b"sample-\xff.py").to_os_string();
+        let words = ["--format".into(), "json".into(), raw.clone()];
+        let Ok(ParseOutcome::Run(args)) = parse_args(words, |_| false) else {
+            panic!("non-UTF-8 path rejected");
+        };
+        assert_eq!(args.path, Some(PathBuf::from(raw)));
+        assert_eq!(args.format, Format::Json);
+    }
+
+    #[test]
+    fn serialisation_failure_is_reported_and_output_failure_ends_the_run() {
+        let path = Path::new("x");
+        let data = serde_json::to_value(std::collections::HashMap::from([((1, 2), 3)]));
+        assert!(!report_serialisation(path, data.map(drop)).unwrap());
+
+        let closed = serde_json::Error::io(io::ErrorKind::BrokenPipe.into());
+        let err = report_serialisation(path, Err(closed)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(exit_code(Err(err)), ExitCode::SUCCESS);
+        let full = io::Error::from(io::ErrorKind::StorageFull);
+        assert_eq!(exit_code(Err(full)), ExitCode::from(1));
+    }
+
+    /// Output that the reader has stopped consuming.
+    struct ClosedPipe;
+
+    impl Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn closed_output_ends_the_run_in_every_format() {
+        filefacts::cache::set_caching_enabled(false);
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/markdown"));
+        for format in [Format::Terminal, Format::Json] {
+            let args = Args {
+                format,
+                ..Args::default()
+            };
+            let err = run(&mut ClosedPipe, dir, &args).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "{format:?}");
+        }
+    }
+
     #[test]
     fn flow_is_a_format_neutral_view() {
-        assert_eq!(parse_view("flow"), Some(View::Flow));
+        assert_eq!(View::from_name("flow"), Some(View::Flow));
         assert_eq!(View::Flow.name(), "flow");
         let parsed = open_with_path(Path::new("example.py"), b"send(acquire())\n").unwrap();
-        let value = build_output(&parsed, View::Flow);
+        let value = serde_json::to_value(ViewData(&parsed, View::Flow)).unwrap();
         assert_eq!(value["producer"], "tree-sitter");
         assert_eq!(value["language"], "python");
         assert!(value["values"].as_array().is_some());
@@ -1698,6 +1874,139 @@ mod flow_tests {
         let bytes = include_bytes!("../../tests/fixtures/test.elf");
         let parsed = open_with_path(Path::new("example.elf"), bytes).unwrap();
         assert!(parsed.flow().is_none());
-        assert!(build_output(&parsed, View::Flow).is_null());
+        let value = serde_json::to_value(ViewData(&parsed, View::Flow)).unwrap();
+        assert!(value.is_null());
+    }
+
+    #[test]
+    fn archive_members_render_one_escaped_line_each() {
+        let mut bytes = Vec::new();
+        let mut zip = zip::ZipWriter::new(io::Cursor::new(&mut bytes));
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for name in ["a.txt", "evil\x1b[2J.txt"] {
+            zip.start_file(name, stored).unwrap();
+            zip.write_all(b"hello\n").unwrap();
+        }
+        zip.finish().unwrap();
+
+        let parsed = open_with_path(Path::new("x.zip"), &bytes).unwrap();
+        let view = Some(View::ArchiveMembers);
+        let text = format_terminal(Path::new("x.zip"), &parsed, view).unwrap();
+        let rows: Vec<&str> = text.lines().filter(|l| l.contains(".txt")).collect();
+        assert_eq!(rows.len(), 2, "{text}");
+        assert!(rows[1].contains("evil\\x1b[2J.txt"), "{text}");
+        assert!(!text.contains("evil\x1b"), "{text}");
+    }
+
+    #[test]
+    fn located_metric_renders_as_a_number() {
+        let parsed = open_with_path(Path::new("example.py"), SOURCE).unwrap();
+        let located = parsed
+            .metrics()
+            .iter_facts()
+            .find(|(_, f)| !f.spans.is_empty());
+        assert!(located.is_some(), "fixture has no located metric");
+        let text = format_terminal(Path::new("example.py"), &parsed, Some(View::Metrics)).unwrap();
+        assert!(!text.contains("spans"), "{text}");
+    }
+
+    /// Escape sequences in `text` other than the renderer's own colours.
+    fn foreign_escapes(text: &str) -> Vec<String> {
+        const OWN: [&str; 3] = ["\x1b[38;2;", "\x1b[1;38;2;", "\x1b[0m"];
+        text.match_indices('\x1b')
+            .map(|(i, _)| &text[i..])
+            .filter(|rest| !OWN.iter().any(|own| rest.starts_with(own)))
+            .map(|rest| rest.chars().take(12).collect())
+            .collect()
+    }
+
+    #[test]
+    fn control_characters_from_the_file_are_escaped_in_every_view() {
+        let files: [(&str, &[u8]); 2] = [
+            (
+                "evil\x1b[2J.py",
+                b"# \x1b]0;pwned\x07\nimport os\nos.system(\"\x1b[2J\", \"\xc2\x9b31m\")\n",
+            ),
+            ("evil.json", br#"{"k\u001b[2J": ["\u001b]0;pwned\u0007"]}"#),
+        ];
+        for (name, bytes) in files {
+            let parsed = open_with_path(Path::new(name), bytes).unwrap();
+            let views = VIEWS.iter().map(|(view, _, _)| Some(*view));
+            for view in std::iter::once(None).chain(views) {
+                let text = format_terminal(Path::new(name), &parsed, view).unwrap();
+                assert_eq!(
+                    foreign_escapes(&text),
+                    Vec::<String>::new(),
+                    "{name} {view:?}"
+                );
+                let stray = text
+                    .chars()
+                    .find(|c| c.is_control() && !"\n\x1b".contains(*c));
+                assert_eq!(stray, None, "{name} {view:?}: {text}");
+            }
+            let bundle = format_terminal(Path::new(name), &parsed, None).unwrap();
+            assert!(bundle.contains("\\x1b[2J"), "{bundle}");
+        }
+    }
+
+    #[test]
+    fn symbols_render_from_their_typed_fields() {
+        let call = Symbol::Call {
+            target: Some("os.system".into()),
+            args: vec![
+                Arg::String {
+                    value: "curl \x1b[2J".into(),
+                },
+                Arg::Number {
+                    text: "0x10".into(),
+                    value: 16,
+                    radix: 16,
+                },
+                Arg::Identifier { name: "url".into() },
+                Arg::Bool { value: true },
+                Arg::Call,
+                Arg::Expression,
+            ],
+            offset: None,
+        };
+        let text = render_symbols(&[&call]);
+        assert!(
+            text.contains(r#""curl \x1b[2J", 0x10, url, true, <call>, <expr>"#),
+            "{text}"
+        );
+
+        let function = Symbol::Function {
+            name: "_get_cpuid".into(),
+            offset: Some(0x4080),
+            complexity: Some(7),
+            callees: vec!["_resolve".into(), "_lzma_crc32".into()],
+        };
+        let text = render_functions(&[&function]);
+        assert!(text.contains("0x4080") && text.contains("cx=7"), "{text}");
+        assert!(text.contains("_resolve, _lzma_crc32"), "{text}");
+
+        let import = Symbol::Import {
+            name: "CreateFileW".into(),
+            alias: None,
+            library: Some("kernel32.dll".into()),
+            offset: None,
+            ordinal: Some(7),
+        };
+        let export = Symbol::Export {
+            name: "Run".into(),
+            offset: Some(0x1000),
+            ordinal: None,
+            forward_to: Some("NTDLL.RtlRun".into()),
+        };
+        let text = render_imports(&[&import, &export]);
+        assert!(
+            text.contains("kernel32.dll") && text.contains("#7"),
+            "{text}"
+        );
+        assert!(!text.contains("Run"), "{text}");
+        let text = render_exports(&[&import, &export]);
+        assert!(text.contains("NTDLL.RtlRun"), "{text}");
+        assert!(!text.contains("CreateFileW"), "{text}");
     }
 }
