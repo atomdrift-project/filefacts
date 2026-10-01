@@ -4,7 +4,7 @@ const WINDOW: usize = 16 * 1024;
 
 pub(super) fn document_structure(data: &[u8]) -> bool {
     let data = super::strip_utf8_bom(data);
-    let head = &data[..data.len().min(WINDOW)];
+    let head = data.get(..WINDOW).unwrap_or(data);
     let mut lines = head.split(|b| *b == b'\n');
     let Some(first) = lines.find(|line| !line.trim_ascii().is_empty()) else {
         return false;
@@ -17,10 +17,10 @@ pub(super) fn document_structure(data: &[u8]) -> bool {
             return false;
         };
         let underline = underline.trim_ascii();
-        if underline.len() < 3
-            || !matches!(underline[0], b'=' | b'-')
-            || !underline.iter().all(|b| *b == underline[0])
-        {
+        let Some(&rule) = underline.first().filter(|b| matches!(b, b'=' | b'-')) else {
+            return false;
+        };
+        if underline.len() < 3 || !underline.iter().all(|b| *b == rule) {
             return false;
         }
     }
@@ -34,8 +34,11 @@ pub(super) fn document_structure(data: &[u8]) -> bool {
         }
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         let spaces = line.iter().take_while(|b| **b == b' ').count();
+        let Some(line) = line.get(spaces..) else {
+            continue;
+        };
         if fence.is_none() && spaces <= 3 && !line.trim_ascii().is_empty() {
-            in_list = list_item(&line[spaces..]);
+            in_list = list_item(line);
         }
         // Four spaces is an indented code block at the top level, but inside
         // a list item it is the item's content indent, and a fence there is
@@ -45,22 +48,24 @@ pub(super) fn document_structure(data: &[u8]) -> bool {
         if spaces > max_indent {
             continue;
         }
-        let line = &line[spaces..];
         let Some(&marker) = line.first().filter(|b| matches!(b, b'`' | b'~')) else {
             continue;
         };
         let width = line.iter().take_while(|b| **b == marker).count();
+        let info = line.get(width..).unwrap_or_default();
         if let Some((open_marker, open_width)) = fence {
-            if marker == open_marker && width >= open_width && line[width..].trim_ascii().is_empty()
-            {
+            if marker == open_marker && width >= open_width && info.trim_ascii().is_empty() {
                 return true;
             }
-        } else if width >= 3 && (marker != b'`' || !line[width..].contains(&b'`')) {
+        } else if width >= 3 && (marker != b'`' || !info.contains(&b'`')) {
             // A Python comment can look like an ATX heading, followed by
             // executable source and a triple-quoted string with fence lines.
             // Source evidence before the examples must still win.
             let before = line.as_ptr() as usize - head.as_ptr() as usize;
-            if super::heuristics::detect_from_content(&head[..before]).is_some() {
+            if head
+                .get(..before)
+                .is_none_or(|prefix| super::heuristics::detect_from_content(prefix).is_some())
+            {
                 return false;
             }
             fence = Some((marker, width));

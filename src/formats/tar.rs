@@ -13,13 +13,43 @@
 //! walked then. Package identity for the gzipped ones is read by their own
 //! modules, not here.
 
-use crate::metric;
-
 use serde_json::Value as JsonValue;
 
+use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_value};
 use crate::error::Error;
 use crate::fileid::FileType;
-use crate::output::{ArchiveMember, Metrics, Values};
+use crate::output::{ArchiveMember, ArchiveOffsets, ArchiveOwnership, Metrics, Values};
+
+/// The shared aggregates a tar reports. Only regular entries are files, and
+/// only their sizes are summed. Tar has no per-entry compression, encryption
+/// or comment field, so those aggregates are not reported.
+const AGGS: &[Agg] = &[
+    Agg::MemberCount,
+    Agg::FileCount,
+    Agg::DirectoryCount,
+    Agg::UncompressedSize(Scope::Files),
+    Agg::EntryTypes,
+    Agg::BuilderNames,
+    Agg::ModeBits,
+    Agg::SymlinkCount,
+    Agg::MaxFilenameLength,
+    Agg::HiddenFiles,
+    Agg::PathTraversal(Scope::All),
+    Agg::SymlinkEscapes,
+    Agg::Executables,
+    Agg::Scripts,
+    Agg::NameTricks,
+    Agg::NestedArchives,
+    Agg::MisplacedExecutables,
+    Agg::MtimeRange,
+];
+
+/// A tar member's published value has never carried its byte offsets; they
+/// are on the typed member only.
+const SHAPE: Shape = Shape {
+    offsets: false,
+    ..Shape::FULL
+};
 
 pub(super) fn extract(
     bytes: &[u8],
@@ -44,34 +74,7 @@ pub(super) fn extract(
 
     let mut archive = tar::Archive::new(bytes);
     let mut members: Vec<JsonValue> = Vec::new();
-    let mut entry_type_counts: std::collections::BTreeMap<String, u64> =
-        std::collections::BTreeMap::new();
-    let mut unames: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut gnames: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut mtimes: Vec<i64> = Vec::new();
-    let mut setuid = 0u64;
-    let mut setgid = 0u64;
-    let mut sticky = 0u64;
-    let mut world_writable = 0u64;
-    let mut symlinks = 0u64;
-
-    // Aggregates ported from cleave's ArchiveMetrics. Tar has no per-entry
-    // compression, encryption, or comment field — those columns stay zero.
-    let mut file_count: u64 = 0;
-    let mut directory_count: u64 = 0;
-    let mut total_uncompressed: u64 = 0;
-    let mut max_filename_length: u64 = 0;
-    let mut hidden_file_count: u64 = 0;
-    let mut path_traversal_count: u64 = 0;
-    let mut symlink_escape_count: u64 = 0;
-    let mut executable_count: u64 = 0;
-    let mut script_count: u64 = 0;
-    let mut unicode_filename_count: u64 = 0;
-    let mut homoglyph_filename_count: u64 = 0;
-    let mut double_extension_count: u64 = 0;
-    let mut rtlo_filename_count: u64 = 0;
-    let mut nested_archive_count: u64 = 0;
-    let mut misplaced_executable_count: u64 = 0;
+    let mut stats = ArchiveStats::new(AGGS);
 
     for entry in archive
         .entries()
@@ -79,152 +82,37 @@ pub(super) fn extract(
     {
         let entry = entry.map_err(|e| Error::malformed("tar", e.to_string()))?;
         let header = entry.header();
-        let path = entry
-            .path()
-            .ok()
-            .map_or_else(String::new, |p| p.to_string_lossy().into_owned());
+        let kind = header.entry_type();
 
-        let entry_type_label = tar_entry_type(header.entry_type());
-        let size = header.size().unwrap_or(0);
-
-        let mut obj = serde_json::Map::new();
-        obj.insert("path".into(), JsonValue::String(path.clone()));
-        obj.insert("size_bytes".into(), JsonValue::Number(size.into()));
-        obj.insert(
-            "entry_type".into(),
-            JsonValue::String(entry_type_label.into()),
-        );
-
+        let named = |name: Option<&str>| name.filter(|n| !n.is_empty()).map(str::to_string);
         let mode_octal = header.mode().ok();
-        if let Some(mode) = mode_octal {
-            obj.insert(
-                "mode_octal".into(),
-                JsonValue::Number(u64::from(mode).into()),
-            );
-            if mode & 0o4000 != 0 {
-                setuid += 1;
-            }
-            if mode & 0o2000 != 0 {
-                setgid += 1;
-            }
-            if mode & 0o1000 != 0 {
-                sticky += 1;
-            }
-            if mode & 0o002 != 0 {
-                world_writable += 1;
-            }
-        }
         let uid = header.uid().ok();
-        if let Some(uid) = uid {
-            obj.insert("uid".into(), JsonValue::Number(uid.into()));
-        }
         let gid = header.gid().ok();
-        if let Some(gid) = gid {
-            obj.insert("gid".into(), JsonValue::Number(gid.into()));
-        }
-        let uname = header
-            .username()
-            .ok()
-            .flatten()
-            .and_then(|name| (!name.is_empty()).then(|| name.to_string()));
-        if let Some(name) = &uname {
-            obj.insert("uname".into(), JsonValue::String(name.clone()));
-            unames.insert(name.clone());
-        }
-        let gname = header
-            .groupname()
-            .ok()
-            .flatten()
-            .and_then(|name| (!name.is_empty()).then(|| name.to_string()));
-        if let Some(name) = &gname {
-            obj.insert("gname".into(), JsonValue::String(name.clone()));
-            gnames.insert(name.clone());
-        }
-        let mtime_unix = header.mtime().ok().map(|m| m as i64);
-        if let Some(m) = mtime_unix {
-            obj.insert("mtime_unix".into(), JsonValue::Number(m.into()));
-            mtimes.push(m);
-        }
-        let mut linkname_str: Option<String> = None;
-        if header.entry_type().is_symlink() || header.entry_type().is_hard_link() {
-            if let Ok(Some(linkname)) = header.link_name() {
-                let s = linkname.to_string_lossy().into_owned();
-                obj.insert("linkname".into(), JsonValue::String(s.clone()));
-                linkname_str = Some(s);
-            }
-            symlinks += u64::from(header.entry_type().is_symlink());
-        }
-
-        *entry_type_counts
-            .entry(entry_type_label.into())
-            .or_insert(0) += 1;
-
-        // Aggregate the same classification flags as the ZIP extractor.
-        let entry_path_str = obj
-            .get("path")
-            .and_then(|p| p.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        if entry_path_str.len() as u64 > max_filename_length {
-            max_filename_length = entry_path_str.len() as u64;
-        }
-
-        if header.entry_type().is_dir() {
-            directory_count += 1;
-        } else if header.entry_type() == tar::EntryType::Regular {
-            file_count += 1;
-            // Saturate so a tar built from many huge sparse headers can't
-            // wrap the u64 sum and report a misleadingly small total.
-            total_uncompressed = total_uncompressed.saturating_add(size);
-        }
-
-        let cls = super::zip::classify_filename(&entry_path_str);
-        if cls.is_hidden {
-            hidden_file_count += 1;
-        }
-        if cls.has_path_traversal {
-            path_traversal_count += 1;
-        }
-        if cls.is_unicode {
-            unicode_filename_count += 1;
-        }
-        if cls.has_homoglyph {
-            homoglyph_filename_count += 1;
-        }
-        if cls.has_double_extension {
-            double_extension_count += 1;
-        }
-        if cls.has_rtlo {
-            rtlo_filename_count += 1;
-        }
-        let is_regular = header.entry_type() == tar::EntryType::Regular;
-        if is_regular {
-            if cls.is_nested_archive {
-                nested_archive_count += 1;
-            }
-            if cls.is_script {
-                script_count += 1;
-            }
-            let exec_by_mode = header.mode().is_ok_and(|m| m & 0o111 != 0);
-            if cls.is_executable || exec_by_mode {
-                executable_count += 1;
-                if cls.is_misplaced_executable {
-                    misplaced_executable_count += 1;
-                }
-            }
-        }
-
-        // Tar exposes the linkname directly in the header — detect symlink
-        // escapes (target contains `..` or is absolute).
-        if header.entry_type().is_symlink() {
-            if let Some(target) = linkname_str.as_deref() {
-                if target.starts_with('/') || target.split('/').any(|p| p == "..") {
-                    symlink_escape_count += 1;
-                }
-            }
-        }
-
+        let uname = named(header.username().ok().flatten());
+        let gname = named(header.groupname().ok().flatten());
+        let ownership = (mode_octal.is_some()
+            || uid.is_some()
+            || gid.is_some()
+            || uname.is_some()
+            || gname.is_some())
+        .then_some(ArchiveOwnership {
+            mode_octal,
+            uid,
+            gid,
+            uname,
+            gname,
+        });
+        let linkname = if kind.is_symlink() || kind.is_hard_link() {
+            header
+                .link_name()
+                .ok()
+                .flatten()
+                .map(|target| target.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+        // Offsets index the bytes handed in, which is the tar itself only
+        // for a plain tar.
         let (header_offset, data_offset) = if file_type == FileType::Tar {
             (
                 Some(entry.raw_header_position()),
@@ -233,148 +121,37 @@ pub(super) fn extract(
         } else {
             (None, None)
         };
-        let ownership = if mode_octal.is_some()
-            || uid.is_some()
-            || gid.is_some()
-            || uname.is_some()
-            || gname.is_some()
-        {
-            Some(crate::output::ArchiveOwnership {
-                mode_octal,
-                uid,
-                gid,
-                uname,
-                gname,
-            })
-        } else {
-            None
-        };
-        archive_members.push(ArchiveMember {
-            path,
-            size_bytes: size,
-            entry_type: Some(entry_type_label.to_string()),
-            mtime_unix,
-            linkname: linkname_str,
+        let member = ArchiveMember {
+            path: entry
+                .path()
+                .ok()
+                .map_or_else(String::new, |p| p.to_string_lossy().into_owned()),
+            size_bytes: header.size().unwrap_or(0),
+            entry_type: Some(tar_entry_type(kind).into()),
+            mtime_unix: header.mtime().ok().map(|m| m as i64),
+            linkname,
             host_os: None,
             crc32: None,
             encrypted: false,
             compression: None,
             ownership,
-            offsets: crate::output::ArchiveOffsets {
+            offsets: ArchiveOffsets {
                 header: header_offset,
                 data: data_offset,
                 central_header: None,
             },
-        });
+        };
 
-        members.push(JsonValue::Object(obj));
+        let mut reading = Reading::of(&member);
+        reading.file = kind == tar::EntryType::Regular;
+        reading.exec_mode = mode_octal.is_some_and(|m| m & 0o111 != 0);
+        stats.observe(&member, &reading);
+        members.push(JsonValue::Object(member_value(&member, SHAPE)));
+        archive_members.push(member);
     }
 
-    let member_count = members.len();
     values.insert("archive.members", JsonValue::Array(members));
-
-    let entry_types: Vec<JsonValue> = entry_type_counts
-        .keys()
-        .map(|k| JsonValue::String(k.clone()))
-        .collect();
-    values.insert("archive.format.entry_types", JsonValue::Array(entry_types));
-
-    if !unames.is_empty() {
-        let u: Vec<JsonValue> = unames
-            .iter()
-            .map(|s| JsonValue::String(s.clone()))
-            .collect();
-        values.insert("archive.builder.unames", JsonValue::Array(u));
-    }
-    if !gnames.is_empty() {
-        let g: Vec<JsonValue> = gnames
-            .iter()
-            .map(|s| JsonValue::String(s.clone()))
-            .collect();
-        values.insert("archive.builder.gnames", JsonValue::Array(g));
-    }
-
-    metrics.insert(metric!("archive.member_count"), member_count as f64);
-    metrics.insert(metric!("archive.file_count"), file_count as f64);
-    metrics.insert(metric!("archive.directory_count"), directory_count as f64);
-    metrics.insert(
-        metric!("archive.uncompressed_size"),
-        total_uncompressed as f64,
-    );
-    for (t, c) in &entry_type_counts {
-        metrics.insert(
-            crate::archive_entry_type_count(&t.replace('-', "_")),
-            *c as f64,
-        );
-    }
-    metrics.insert(metric!("archive.security.setuid_count"), setuid as f64);
-    metrics.insert(metric!("archive.security.setgid_count"), setgid as f64);
-    metrics.insert(metric!("archive.security.sticky_count"), sticky as f64);
-    metrics.insert(
-        metric!("archive.security.world_writable_count"),
-        world_writable as f64,
-    );
-    metrics.insert(metric!("archive.security.symlink_count"), symlinks as f64);
-
-    metrics.insert(
-        metric!("archive.max_filename_length"),
-        max_filename_length as f64,
-    );
-    metrics.insert(
-        metric!("archive.hidden_file_count"),
-        hidden_file_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.path_traversal_count"),
-        path_traversal_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.symlink_escape_count"),
-        symlink_escape_count as f64,
-    );
-    metrics.insert(metric!("archive.executable_count"), executable_count as f64);
-    metrics.insert(metric!("archive.script_count"), script_count as f64);
-    metrics.insert(
-        metric!("archive.unicode_filename_count"),
-        unicode_filename_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.homoglyph_filename_count"),
-        homoglyph_filename_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.double_extension_count"),
-        double_extension_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.rtlo_filename_count"),
-        rtlo_filename_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.nested_archive_count"),
-        nested_archive_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.misplaced_executable_count"),
-        misplaced_executable_count as f64,
-    );
-
-    if !mtimes.is_empty() {
-        let min = *mtimes.iter().min().unwrap_or(&0);
-        let max = *mtimes.iter().max().unwrap_or(&0);
-        values.insert("archive.timing.mtime_min", JsonValue::Number(min.into()));
-        values.insert("archive.timing.mtime_max", JsonValue::Number(max.into()));
-        metrics.insert(
-            metric!("archive.timing.mtime_spread_seconds"),
-            (max - min) as f64,
-        );
-        let unique: std::collections::BTreeSet<i64> = mtimes.iter().copied().collect();
-        metrics.insert(
-            metric!("archive.timing.mtime_unique_count"),
-            unique.len() as f64,
-        );
-    }
-
+    stats.emit(values, metrics);
     Ok(())
 }
 
@@ -682,6 +459,36 @@ mod tests {
         }
         let (_, m) = run(&out);
         assert_eq!(m.get("archive.symlink_escape_count"), Some(1.0));
+    }
+
+    /// A GNU base-256 mtime of 2^63 reads back as `i64::MIN`. Its spread
+    /// against an ordinary mtime overflowed `max - min`, a panic in builds
+    /// with overflow checks and a wrapped, negative spread otherwise.
+    #[test]
+    fn base256_mtime_spread_does_not_overflow() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut b = Builder::new(&mut out);
+            for (name, mtime) in [("old", 1u64 << 63), ("new", 1_700_000_000)] {
+                let mut h = Header::new_gnu();
+                h.set_path(name).unwrap();
+                h.set_size(1);
+                h.set_mtime(mtime);
+                h.set_entry_type(tar::EntryType::Regular);
+                h.set_cksum();
+                b.append(&h, &b"x"[..]).unwrap();
+            }
+            b.finish().unwrap();
+        }
+        let (v, m) = run(&out);
+        assert_eq!(
+            v.get("archive.timing.mtime_min").and_then(|x| x.as_i64()),
+            Some(i64::MIN)
+        );
+        assert_eq!(
+            m.get("archive.timing.mtime_spread_seconds"),
+            Some((1_700_000_000u64 + (1u64 << 63)) as f64)
+        );
     }
 
     #[test]

@@ -169,8 +169,10 @@ fn literal(parsed: &Parsed, id: usize) -> Known {
             tag: Some(177),
             items,
         } if matches!(items.len(), 1 | 2) => {
-            if let Some(Value::Bytes { tag: None, data }) =
-                parsed.nodes.get(items[0]).map(|n| &n.value)
+            if let Some(Value::Bytes { tag: None, data }) = items
+                .first()
+                .and_then(|&item| parsed.nodes.get(item))
+                .map(|n| &n.value)
             {
                 return unicode(data);
             }
@@ -216,20 +218,20 @@ fn handlers(parsed: &Parsed) -> (Vec<Handler<'_>>, bool) {
         pending.extend(items.iter().rev().copied());
         // Runtime tag 16 denotes a handler. Offsets in the Python reference
         // include the tag at index zero; this parser stores it separately.
-        if *tag != Some(16) || items.len() != 7 {
+        let (Some(16), &[name, _, arity, _, _, literals, code]) = (*tag, items.as_slice()) else {
             continue;
-        }
+        };
         let (Some(name), Some(literals), Some(code_node)) = (
-            target(parsed, items[0]),
-            vector(parsed, items[5]),
-            parsed.nodes.get(items[6]),
+            target(parsed, name),
+            vector(parsed, literals),
+            parsed.nodes.get(code),
         ) else {
             continue;
         };
         let Value::Bytes { data: code, .. } = &code_node.value else {
             continue;
         };
-        let arity = vector(parsed, items[2])
+        let arity = vector(parsed, arity)
             .and_then(|v| v.first())
             .and_then(|id| match parsed.nodes.get(*id)?.value {
                 Value::Int(n) => Some(n),
@@ -306,7 +308,7 @@ fn decode(
 ) -> (Vec<Instruction>, BTreeSet<usize>) {
     let mut decoded = Vec::new();
     let mut pc = 0;
-    while pc < code.len() {
+    while let Some(&op) = code.get(pc) {
         if *remaining == 0 {
             limit(
                 out,
@@ -314,7 +316,6 @@ fn decode(
             );
             break;
         }
-        let op = code[pc];
         let Some(size) = width(op) else {
             limit(
                 out,
@@ -335,10 +336,9 @@ fn decode(
             );
             break;
         }
-        let operand = if size >= 3 {
-            u16::from_be_bytes([code[pc + 1], code[pc + 2]])
-        } else {
-            0
+        let operand = match code.get(pc + 1..pc + 3) {
+            Some(&[high, low]) if size >= 3 => u16::from_be_bytes([high, low]),
+            _ => 0,
         };
         decoded.push(Instruction { pc, op, operand });
         pc += size;
@@ -442,14 +442,17 @@ fn recognize(parsed: &Parsed, h: &Handler<'_>) -> Option<Decoder> {
         {
             continue;
         }
-        if literal(parsed, h.literals[0]) != Known::String(String::new(), false)
-            || !matches!(parsed.nodes.get(h.literals[1]).map(|n| &n.value),
+        let [empty, event, constant_literals @ ..] = h.literals else {
+            continue;
+        };
+        if literal(parsed, *empty) != Known::String(String::new(), false)
+            || !matches!(parsed.nodes.get(*event).map(|n| &n.value),
                 Some(Value::Event(s)) if s == "core.cnte")
         {
             continue;
         }
-        if constants.iter().enumerate().all(|(i, c)| {
-            literal(parsed, h.literals[i + 2])
+        if constants.iter().zip(constant_literals).all(|(c, &id)| {
+            literal(parsed, id)
                 == if *c == 9999 {
                     Known::Number(9999)
                 } else {
@@ -494,7 +497,7 @@ fn recover(decoder: Decoder, args: &[Known]) -> Option<String> {
     }
     let mut text = String::with_capacity(a.len());
     for (i, &x) in a.iter().enumerate() {
-        let y = b.map_or(0, |b| b[i]);
+        let y = b.and_then(|b| b.get(i)).copied().unwrap_or(0);
         // Bounds also prove that the unused checksum arithmetic in the fully
         // matched bodies cannot overflow or prevent the function from returning.
         if x.unsigned_abs() > 1_000_000 || y.unsigned_abs() > 1_000_000 {

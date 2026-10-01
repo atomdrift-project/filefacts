@@ -262,7 +262,7 @@ pub(super) fn extract(
 ) -> Result<(), Error> {
     // Header: `\0asm` + u32 version. Detection already vetted this, but guard
     // anyway so a forced/misrouted file can't index out of range.
-    if bytes.len() < 8 || &bytes[0..4] != b"\0asm" {
+    if bytes.len() < 8 || !bytes.starts_with(b"\0asm") {
         return Ok(());
     }
 

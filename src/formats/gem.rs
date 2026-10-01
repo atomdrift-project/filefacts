@@ -22,10 +22,11 @@ use crate::metric;
 use std::io::{Cursor, Read};
 
 use serde_json::Value as JsonValue;
-use serde_yaml::Value as Yaml;
 
 use crate::error::Error;
 use crate::output::{Metrics, Values};
+
+use super::structured::parse_yaml;
 
 /// Cap on the compressed `metadata.gz` we read from the outer tar. Real gem
 /// specifications are a few KiB; anything larger is malformed or hostile.
@@ -52,7 +53,7 @@ pub(super) fn extract(
         values.insert("gem.name", JsonValue::String(name.to_string()));
     }
     // `version` is a nested `!ruby/object:Gem::Version` mapping: { version: x }.
-    if let Some(version) = map_get(&spec, "version").and_then(|v| field_str(v, "version")) {
+    if let Some(version) = spec.get("version").and_then(|v| field_str(v, "version")) {
         values.insert("gem.version", JsonValue::String(version.to_string()));
     }
     if let Some(platform) = field_str(&spec, "platform") {
@@ -67,7 +68,7 @@ pub(super) fn extract(
 
     // `licenses` (plural, a sequence) is current; `license` (singular) is the
     // legacy single-value form. Prefer the sequence, fall back to the scalar.
-    let mut licenses = collect_strings(map_get(&spec, "licenses"));
+    let mut licenses = collect_strings(spec.get("licenses"));
     if licenses.is_empty() {
         if let Some(l) = field_str(&spec, "license") {
             licenses.push(l.to_string());
@@ -78,7 +79,7 @@ pub(super) fn extract(
     }
 
     // Same plural/singular split for authors (`authors` seq vs `author` scalar).
-    let mut authors = collect_strings(map_get(&spec, "authors"));
+    let mut authors = collect_strings(spec.get("authors"));
     if authors.is_empty() {
         if let Some(a) = field_str(&spec, "author") {
             authors.push(a.to_string());
@@ -93,9 +94,10 @@ pub(super) fn extract(
 }
 
 /// Walk the outer (uncompressed) tar, read `metadata.gz`, gunzip it, and parse
-/// the `Gem::Specification` YAML. Returns `None` on any malformed step — the
-/// caller treats that as "no gem identity available".
-fn read_metadata(bytes: &[u8]) -> Option<Yaml> {
+/// the `Gem::Specification` YAML. Its Ruby tags are dropped, leaving plain
+/// mappings. Returns `None` on any malformed step — the caller treats that as
+/// "no gem identity available".
+fn read_metadata(bytes: &[u8]) -> Option<JsonValue> {
     let mut archive = tar::Archive::new(Cursor::new(bytes));
     for entry in archive.entries().ok()? {
         let Ok(mut entry) = entry else { break };
@@ -116,7 +118,7 @@ fn read_metadata(bytes: &[u8]) -> Option<Yaml> {
             .take(MAX_METADATA_YAML)
             .read_to_string(&mut yaml)
             .ok()?;
-        return serde_yaml::from_str(&yaml).ok();
+        return parse_yaml(yaml.as_bytes()).ok();
     }
     None
 }
@@ -124,8 +126,8 @@ fn read_metadata(bytes: &[u8]) -> Option<Yaml> {
 /// Surface the dependency shape. Each dependency is a
 /// `!ruby/object:Gem::Dependency` mapping with a `name` and a `type` symbol
 /// (`:runtime` or `:development`).
-fn extract_dependencies(spec: &Yaml, values: &mut Values, metrics: &mut Metrics) {
-    let Some(deps) = map_get(spec, "dependencies").and_then(|v| untag(v).as_sequence()) else {
+fn extract_dependencies(spec: &JsonValue, values: &mut Values, metrics: &mut Metrics) {
+    let Some(deps) = spec.get("dependencies").and_then(JsonValue::as_array) else {
         return;
     };
     let mut runtime: Vec<String> = Vec::new();
@@ -162,42 +164,20 @@ fn extract_dependencies(spec: &Yaml, values: &mut Values, metrics: &mut Metrics)
     }
 }
 
-/// Strip a YAML tag (`!ruby/object:Gem::Specification`) to reach the underlying
-/// node. Untagged values pass through unchanged.
-fn untag(v: &Yaml) -> &Yaml {
-    match v {
-        Yaml::Tagged(t) => &t.value,
-        other => other,
-    }
-}
-
-/// Look up `key` in a (possibly tagged) mapping, returning the untagged value.
-fn map_get<'a>(v: &'a Yaml, key: &str) -> Option<&'a Yaml> {
-    let mapping = untag(v).as_mapping()?;
-    for (k, val) in mapping {
-        if k.as_str() == Some(key) {
-            return Some(untag(val));
-        }
-    }
-    None
-}
-
 /// Convenience: the string value of `key` within a mapping.
-fn field_str<'a>(v: &'a Yaml, key: &str) -> Option<&'a str> {
-    map_get(v, key).and_then(Yaml::as_str)
+fn field_str<'a>(v: &'a JsonValue, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(JsonValue::as_str)
 }
 
-/// Collect the string entries of a (possibly tagged) sequence, bounded.
-fn collect_strings(v: Option<&Yaml>) -> Vec<String> {
-    let mut out = Vec::new();
-    if let Some(seq) = v.and_then(|v| untag(v).as_sequence()) {
-        for item in seq.iter().take(MAX_LIST) {
-            if let Some(s) = untag(item).as_str() {
-                out.push(s.to_string());
-            }
-        }
-    }
-    out
+/// Collect the string entries of a sequence, bounded.
+fn collect_strings(v: Option<&JsonValue>) -> Vec<String> {
+    v.and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_LIST)
+        .filter_map(JsonValue::as_str)
+        .map(str::to_string)
+        .collect()
 }
 
 fn string_array(items: &[String]) -> JsonValue {
@@ -298,6 +278,47 @@ summary: Full-stack web application framework.
         assert_eq!(licenses[0].as_str(), Some("MIT"));
         let authors = v.get("gem.authors").and_then(|x| x.as_array()).unwrap();
         assert_eq!(authors[0].as_str(), Some("David Heinemeier Hansson"));
+    }
+
+    /// RubyGems writes a requirement shared by two fields as an anchor and an
+    /// alias, and quotes nothing that YAML 1.2 reads as a string: `yes` and
+    /// `on` stay names here.
+    #[test]
+    fn aliased_requirements_and_yaml_1_1_words_parse() {
+        let spec = r#"--- !ruby/object:Gem::Specification
+name: yes
+version: !ruby/object:Gem::Version
+  version: '1.0'
+platform: ruby
+authors: [on, off]
+dependencies:
+- !ruby/object:Gem::Dependency
+  name: rake
+  requirement: &1 !ruby/object:Gem::Requirement
+    requirements:
+    - - ">="
+      - !ruby/object:Gem::Version
+        version: '0'
+  type: :development
+  version_requirements: *1
+- !ruby/object:Gem::Dependency
+  name: no
+  type: :runtime
+"#;
+        let mut v = Values::new();
+        let mut m = Metrics::new();
+        extract(&build_gem(spec), &mut v, &mut m).unwrap();
+        assert_eq!(v.get("gem.name").and_then(|x| x.as_str()), Some("yes"));
+        assert_eq!(v.get("gem.version").and_then(|x| x.as_str()), Some("1.0"));
+        assert_eq!(
+            v.get("gem.authors"),
+            Some(&serde_json::json!(["on", "off"]))
+        );
+        assert_eq!(m.get("gem.development_dependency_count"), Some(1.0));
+        assert_eq!(
+            v.get("gem.runtime_dependencies"),
+            Some(&serde_json::json!(["no"]))
+        );
     }
 
     #[test]

@@ -192,7 +192,7 @@ pub(crate) fn evidence(text: &[u8]) -> Evidence {
 /// [`evidence`] over at most `window` bytes at each end.
 pub(crate) fn evidence_within(text: &[u8], window: usize) -> Evidence {
     let text = skip_padding(text);
-    let head = &text[..text.len().min(window)];
+    let head = text.get(..window).unwrap_or(text);
     let mut ev = Evidence::default();
     ev.read(head, true);
     // Droppers bury their code under a payload or thousands of junk lines;
@@ -204,9 +204,11 @@ pub(crate) fn evidence_within(text: &[u8], window: usize) -> Evidence {
     // read its `if v<x then` as a VBScript `If`, and one strong line decides
     // a file of three lines or fewer.
     if text.len() > 2 * window && ev.verdict().is_none() {
-        let tail = &text[text.len() - window..];
-        if let Some(at) = memchr::memchr2(b'\n', b'\r', tail) {
-            ev.read(&tail[at + 1..], false);
+        let tail = text
+            .get(text.len().saturating_sub(window)..)
+            .unwrap_or_default();
+        if let Some(after) = memchr::memchr2(b'\n', b'\r', tail).and_then(|at| tail.get(at + 1..)) {
+            ev.read(after, false);
         }
     }
     ev
@@ -216,18 +218,16 @@ pub(crate) fn evidence_within(text: &[u8], window: usize) -> Evidence {
 /// statements to VBScript, empty labels to cmd.exe, and a favourite padding
 /// of obfuscators, who emit them by the hundred thousand.
 fn skip_padding(text: &[u8]) -> &[u8] {
-    let mut at = 0;
-    while at < text.len() {
-        let end = memchr::memchr(b'\n', &text[at..]).map_or(text.len(), |n| at + n + 1);
-        if !text[at..end]
-            .iter()
-            .all(|&b| b == b':' || b.is_ascii_whitespace())
-        {
+    let mut rest = text;
+    while !rest.is_empty() {
+        let end = memchr::memchr(b'\n', rest).map_or(rest.len(), |n| n + 1);
+        let (line, after) = rest.split_at_checked(end).unwrap_or((rest, &[]));
+        if !line.iter().all(|&b| b == b':' || b.is_ascii_whitespace()) {
             break;
         }
-        at = end;
+        rest = after;
     }
-    &text[at..]
+    rest
 }
 
 impl Evidence {
@@ -594,7 +594,7 @@ fn skip_delimiters(line: &[u8]) -> &[u8] {
         .iter()
         .take_while(|b| matches!(b, b';' | b',' | b'=' | b' ' | b'\t'))
         .count();
-    &line[n..]
+    line.get(n..).unwrap_or_default()
 }
 
 fn batch_line(line: &[u8]) -> Grade {
@@ -607,7 +607,7 @@ fn batch_line(line: &[u8]) -> Grade {
         .or_else(|| line.strip_prefix(b"&"))
         .unwrap_or(line)
         .trim_ascii_start();
-    let Some(&first) = line.first() else {
+    let Some((&first, after_first)) = line.split_first() else {
         return Grade::None;
     };
     // `::` is a label no other language writes; batch files use it as a comment.
@@ -618,7 +618,7 @@ fn batch_line(line: &[u8]) -> Grade {
     // is also an EDN keyword (`:handles`) and a Vim Ex command (`:endfor`).
     // The `goto` that jumps to it is the batch-only half.
     if first == b':' {
-        return if is_batch_label(&line[1..]) {
+        return if is_batch_label(after_first) {
             Grade::Weak
         } else {
             Grade::None
@@ -626,17 +626,19 @@ fn batch_line(line: &[u8]) -> Grade {
     }
     // Parenthesised blocks: `) else (`, `(echo x`.
     if first == b')' {
-        let rest = line[1..].trim_ascii_start();
+        let rest = after_first.trim_ascii_start();
         return if rest.is_empty() {
             Grade::Weak
-        } else if starts_ci(rest, b"else") && rest[4..].trim_ascii() == b"(" {
+        } else if rest.split_at_checked(4).is_some_and(|(word, tail)| {
+            word.eq_ignore_ascii_case(b"else") && tail.trim_ascii() == b"("
+        }) {
             Grade::Strong
         } else {
             Grade::None
         };
     }
     if first == b'(' {
-        return batch_line(&line[1..]).min(Grade::Weak);
+        return batch_line(after_first).min(Grade::Weak);
     }
     let body = match line.strip_prefix(b"@") {
         Some(rest)
@@ -666,7 +668,7 @@ fn batch_line(line: &[u8]) -> Grade {
         return Grade::Strong;
     }
     // `C:\Users\Public\x\run.exe -c ...`: a program by its Windows path.
-    if body.len() > 3 && body[0].is_ascii_alphabetic() && body[1] == b':' && body[2] == b'\\' {
+    if matches!(body, [drive, b':', b'\\', _, ..] if drive.is_ascii_alphabetic()) {
         return if has_windows_program(body) {
             Grade::Strong
         } else {
@@ -708,8 +710,8 @@ fn batch_line(line: &[u8]) -> Grade {
     // `COMCOM\xFF\xFE&@cls&@set "_x=..."`: junk that fails as a command,
     // then the real ones chained behind `&`.
     if grade == Grade::None {
-        if let Some(amp) = unquoted_ampersand(body) {
-            return batch_line(&body[amp + 1..]);
+        if let Some(after) = unquoted_ampersand(body).and_then(|amp| body.get(amp + 1..)) {
+            return batch_line(after);
         }
     }
     grade
@@ -899,15 +901,20 @@ fn batch_set(rest: &[u8]) -> Grade {
         return Grade::Strong;
     }
     let quoted = arg.first() == Some(&b'"');
-    let name_start = usize::from(quoted);
-    let name_len = arg[name_start..]
+    let field = arg.get(usize::from(quoted)..).unwrap_or_default();
+    let name_len = field
         .iter()
         .take_while(|&&b| !matches!(b, b'=' | b' ' | b'\t' | b'"'))
         .count();
-    if name_len == 0 || arg[name_start].is_ascii_punctuation() && arg[name_start] != b'_' {
+    let Some((name, after)) = field.split_at_checked(name_len) else {
+        return Grade::None;
+    };
+    if name
+        .first()
+        .is_none_or(|&b| b.is_ascii_punctuation() && b != b'_')
+    {
         return Grade::None;
     }
-    let after = &arg[name_start + name_len..];
     if let Some(value) = after.strip_prefix(b"=") {
         if quoted || !vbs_object_expr(value.trim_ascii()) {
             return Grade::Strong;
@@ -938,7 +945,10 @@ fn batch_if(arg: &[u8]) -> Grade {
     let mut cond = arg;
     for prefix in [&b"/i "[..], b"not "] {
         if starts_ci(cond, prefix) {
-            cond = cond[prefix.len()..].trim_ascii_start();
+            cond = cond
+                .get(prefix.len()..)
+                .unwrap_or_default()
+                .trim_ascii_start();
         }
     }
     if [
@@ -976,14 +986,14 @@ fn has_delayed_ref(s: &[u8]) -> bool {
         if b != b'!' {
             return false;
         }
-        let name = &s[i + 1..];
+        let name = s.get(i + 1..).unwrap_or_default();
         let len = name
             .iter()
             .take_while(|b| {
                 b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'[' | b']')
             })
             .count();
-        len > 0 && name[0].is_ascii_alphabetic() && name.get(len) == Some(&b'!')
+        len > 0 && name.first().is_some_and(u8::is_ascii_alphabetic) && name.get(len) == Some(&b'!')
     })
 }
 
@@ -999,19 +1009,21 @@ fn has_batch_syntax(s: &[u8]) -> bool {
         return false;
     }
     s.windows(3)
-        .any(|w| w[0] == b'%' && w[1] == b'%' && (w[2].is_ascii_alphabetic() || w[2] == b'~'))
+        .any(|w| matches!(w, [b'%', b'%', c] if c.is_ascii_alphabetic() || *c == b'~'))
         || count_env_refs(s) > 0
         || s.windows(2).enumerate().any(|(i, w)| {
-            w[0] == b'%'
-                && (w[1].is_ascii_digit() || w[1] == b'*')
-                && (i == 0 || matches!(s[i - 1], b' ' | b'"' | b'\t' | b'='))
+            matches!(w, [b'%', c] if c.is_ascii_digit() || *c == b'*')
+                && i.checked_sub(1)
+                    .and_then(|p| s.get(p))
+                    .is_none_or(|b| matches!(b, b' ' | b'"' | b'\t' | b'='))
         })
 }
 
 /// `$name`, `${name}`, `$(cmd)`.
 fn has_shell_variable(s: &[u8]) -> bool {
-    s.windows(2)
-        .any(|w| w[0] == b'$' && (w[1].is_ascii_alphabetic() || matches!(w[1], b'_' | b'{' | b'(')))
+    s.windows(2).any(
+        |w| matches!(w, [b'$', c] if c.is_ascii_alphabetic() || matches!(c, b'_' | b'{' | b'(')),
+    )
 }
 
 /// `%name:~N,M%` references.
@@ -1019,28 +1031,24 @@ fn count_substring_refs(s: &[u8]) -> usize {
     if memchr::memchr(b'~', s).is_none() {
         return 0;
     }
-    let mut count = 0;
-    let mut from = 0;
-    while let Some(at) = memchr::memmem::find(&s[from..], b":~") {
-        let at = from + at;
-        let before = &s[..at];
-        let after = &s[at + 2..];
-        let digits = after
-            .iter()
-            .take_while(|b| b.is_ascii_digit() || matches!(b, b',' | b'-'))
-            .count();
-        let named = before
-            .iter()
-            .rev()
-            .take(64)
-            .position(|&b| b == b'%')
-            .is_some_and(|n| n > 0);
-        if named && digits > 0 && after.get(digits) == Some(&b'%') {
-            count += 1;
-        }
-        from = at + 2;
-    }
-    count
+    // `:~` cannot overlap itself, so the non-overlapping matches are all of them.
+    memchr::memmem::find_iter(s, b":~")
+        .filter(|&at| {
+            let before = s.get(..at).unwrap_or_default();
+            let after = s.get(at + 2..).unwrap_or_default();
+            let digits = after
+                .iter()
+                .take_while(|b| b.is_ascii_digit() || matches!(b, b',' | b'-'))
+                .count();
+            let named = before
+                .iter()
+                .rev()
+                .take(64)
+                .position(|&b| b == b'%')
+                .is_some_and(|n| n > 0);
+            named && digits > 0 && after.get(digits) == Some(&b'%')
+        })
+        .count()
 }
 
 /// A Windows program or script among the arguments: `x.exe`, `run.bat`.
@@ -1059,7 +1067,7 @@ fn has_windows_program(s: &[u8]) -> bool {
     .iter()
     .any(|ext| {
         let mut from = 0;
-        while let Some(at) = find_ci(&s[from..], ext) {
+        while let Some(at) = s.get(from..).and_then(|rest| find_ci(rest, ext)) {
             let end = from + at + ext.len();
             if s.get(end).is_none_or(|b| !b.is_ascii_alphanumeric()) {
                 return true;
@@ -1076,15 +1084,12 @@ fn has_windows_program(s: &[u8]) -> bool {
 pub(crate) fn find_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
     let (&first, _) = needle.split_first()?;
     let (lower, upper) = (first.to_ascii_lowercase(), first.to_ascii_uppercase());
-    let mut from = 0;
-    while from + needle.len() <= hay.len() {
-        let at = from + memchr::memchr2(lower, upper, &hay[from..=hay.len() - needle.len()])?;
-        if hay[at..at + needle.len()].eq_ignore_ascii_case(needle) {
-            return Some(at);
-        }
-        from = at + 1;
-    }
-    None
+    // Every offset a match could start at.
+    let starts = hay.get(..=hay.len().checked_sub(needle.len())?)?;
+    memchr::memchr2_iter(lower, upper, starts).find(|&at| {
+        hay.get(at..at + needle.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
+    })
 }
 
 /// `s` with its `%name%` references removed, and how many there were.
@@ -1095,24 +1100,25 @@ pub(crate) fn find_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
 fn strip_env_refs(s: &[u8]) -> (usize, Vec<u8>) {
     let mut out = Vec::with_capacity(s.len());
     let mut refs = 0;
-    let mut i = 0;
-    while i < s.len() {
-        if s[i] == b'%' {
-            let name = &s[i + 1..];
-            let len = name.iter().take(64).take_while(|&&b| b != b'%').count();
+    let mut rest = s;
+    while let Some((&b, after)) = rest.split_first() {
+        if b == b'%' {
+            let len = after.iter().take(64).take_while(|&&b| b != b'%').count();
+            let name = after.get(..len).unwrap_or_default();
             let named = len > 0
                 && len < 64
-                && name.get(len) == Some(&b'%')
-                && !name[0].is_ascii_digit()
-                && !name[..len].iter().any(|&b| b < 0x20);
+                && after.get(len) == Some(&b'%')
+                && !name.first().is_some_and(u8::is_ascii_digit)
+                && !name.iter().any(|&b| b < 0x20);
             if named {
                 refs += 1;
-                i += len + 2;
+                // Past the name and its closing `%`.
+                rest = after.get(len + 1..).unwrap_or_default();
                 continue;
             }
         }
-        out.push(s[i]);
-        i += 1;
+        out.push(b);
+        rest = after;
     }
     (refs, out)
 }
@@ -1121,13 +1127,12 @@ fn strip_env_refs(s: &[u8]) -> (usize, Vec<u8>) {
 /// `%` and a percentage has no name, so neither counts.
 fn count_env_refs(s: &[u8]) -> usize {
     let mut count = 0;
-    let mut i = 0;
-    while i < s.len() {
-        if s[i] != b'%' {
-            i += 1;
+    let mut rest = s;
+    while let Some((&b, name)) = rest.split_first() {
+        if b != b'%' {
+            rest = name;
             continue;
         }
-        let name = &s[i + 1..];
         let len = name
             .iter()
             .take_while(|&&b| {
@@ -1139,23 +1144,26 @@ fn count_env_refs(s: &[u8]) -> usize {
         let starts_alpha = name
             .first()
             .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_' || *b >= 0x80);
-        match name.get(len) {
+        // How far into `name` the reference reaches, closing `%` included.
+        let skip = match name.get(len) {
             Some(b'%') if len > 0 && starts_alpha => {
                 count += 1;
-                i += len + 2;
+                len + 1
             }
             Some(b':') if len > 0 && starts_alpha => {
                 // `%var:~0,1%` / `%var:a=b%`
-                match name[len..].iter().take(40).position(|&b| b == b'%') {
+                let tail = name.get(len..).unwrap_or_default();
+                match tail.iter().take(40).position(|&b| b == b'%') {
                     Some(end) => {
                         count += 1;
-                        i += len + end + 2;
+                        len + end + 1
                     }
-                    None => i += 1,
+                    None => 0,
                 }
             }
-            _ => i += 1,
-        }
+            _ => 0,
+        };
+        rest = name.get(skip..).unwrap_or_default();
     }
     count
 }
@@ -1165,17 +1173,24 @@ fn count_env_refs(s: &[u8]) -> usize {
 fn has_switch(s: &[u8], short_only: bool) -> bool {
     let max = if short_only { 2 } else { 16 };
     s.iter().enumerate().any(|(i, &b)| {
-        if b != b'/' || (i > 0 && !s[i - 1].is_ascii_whitespace()) {
+        let after_word = || {
+            i.checked_sub(1)
+                .and_then(|p| s.get(p))
+                .is_some_and(|b| !b.is_ascii_whitespace())
+        };
+        if b != b'/' || after_word() {
             return false;
         }
-        let rest = &s[i + 1..];
+        let rest = s.get(i + 1..).unwrap_or_default();
         let len = rest
             .iter()
             .take_while(|b| b.is_ascii_alphanumeric() || **b == b'?' || **b == b'-')
             .count();
         len > 0
             && len <= max
-            && (rest[0].is_ascii_alphabetic() || rest[0] == b'?')
+            && rest
+                .first()
+                .is_some_and(|&c| c.is_ascii_alphabetic() || c == b'?')
             && rest
                 .get(len)
                 .is_none_or(|b| b.is_ascii_whitespace() || matches!(b, b':' | b'=' | b'"'))
@@ -1186,7 +1201,7 @@ fn has_switch(s: &[u8], short_only: bool) -> bool {
 fn has_windows_path(s: &[u8]) -> bool {
     contains(s, b"\\\\")
         || s.windows(3)
-            .any(|w| w[0].is_ascii_alphabetic() && w[1] == b':' && w[2] == b'\\')
+            .any(|w| matches!(w, [drive, b':', b'\\'] if drive.is_ascii_alphabetic()))
 }
 
 /// A label after its `:`: a name, then the end of the line or a comment.
@@ -1347,7 +1362,8 @@ fn vbs_line(line: &[u8]) -> Grade {
         // `:::On Error Resume Next:::` is statements behind empty ones, but
         // `:loop` is a batch label, not an empty statement before `Loop`.
         Some(b':') if line.starts_with(b"::") => {
-            let rest = &line[line.iter().take_while(|&&b| b == b':').count()..];
+            let colons = line.iter().take_while(|&&b| b == b':').count();
+            let rest = line.get(colons..).unwrap_or_default();
             return if rest.is_empty() {
                 Grade::None
             } else {
@@ -1385,10 +1401,11 @@ impl<'a> Iterator for VbsStatements<'a> {
         for (i, &b) in line.iter().enumerate() {
             match b {
                 b'"' => quoted = !quoted,
-                b'\'' if !quoted => return Some(&line[..i]),
+                b'\'' if !quoted => return line.get(..i),
                 b':' if !quoted => {
-                    self.rest = Some(&line[i + 1..]);
-                    return Some(&line[..i]);
+                    let (stmt, colon) = line.split_at_checked(i)?;
+                    self.rest = colon.get(1..);
+                    return Some(stmt);
                 }
                 _ => {}
             }
@@ -1558,9 +1575,11 @@ fn vbs_statement(s: &[u8]) -> Grade {
     {
         return Grade::Strong;
     }
-    if is(b"wscript") && rest.first() == Some(&b'.') {
+    if is(b"wscript")
+        && let Some(after_dot) = rest.strip_prefix(b".")
+    {
         // JScript calls the same object, with parentheses and a semicolon.
-        let member = split_verb(&rest[1..]);
+        let member = split_verb(after_dot);
         return if member.1.first().is_none_or(u8::is_ascii_whitespace) {
             Grade::Strong
         } else {
@@ -1610,10 +1629,9 @@ const VB_NET_BLOCKS: &[&[u8]] = &[
 /// `Dim a, b(10), c As String`: names, each with optional bounds and type,
 /// separated by commas. "Dim the lights" is two bare words.
 fn is_dim_list(arg: &[u8]) -> bool {
-    let arg = if starts_ci(arg, b"preserve ") {
-        arg[9..].trim_ascii_start()
-    } else {
-        arg
+    let arg = match arg.split_at_checked(b"preserve ".len()) {
+        Some((word, tail)) if word.eq_ignore_ascii_case(b"preserve ") => tail.trim_ascii_start(),
+        _ => arg,
     };
     arg.split(|&b| b == b',').all(|item| {
         let item = item.trim_ascii();
@@ -1621,17 +1639,20 @@ fn is_dim_list(arg: &[u8]) -> bool {
             .iter()
             .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
             .count();
-        if name == 0 || !item[0].is_ascii_alphabetic() && item[0] != b'_' {
+        if name == 0 || !is_identifier_start(item) {
             return false;
         }
-        let mut rest = item[name..].trim_ascii_start();
+        let mut rest = item.get(name..).unwrap_or_default().trim_ascii_start();
         if rest.first() == Some(&b'(') {
             let Some(close) = memchr::memchr(b')', rest) else {
                 return false;
             };
-            rest = rest[close + 1..].trim_ascii_start();
+            rest = rest.get(close + 1..).unwrap_or_default().trim_ascii_start();
         }
-        rest.is_empty() || (starts_ci(rest, b"as ") && is_plain_identifier(rest[3..].trim_ascii()))
+        rest.is_empty()
+            || rest.split_at_checked(3).is_some_and(|(keyword, ty)| {
+                keyword.eq_ignore_ascii_case(b"as ") && is_plain_identifier(ty.trim_ascii())
+            })
     })
 }
 
@@ -1643,7 +1664,13 @@ fn is_procedure_header(arg: &[u8]) -> bool {
         .count();
     name > 0
         && is_identifier_start(arg)
-        && matches!(arg[name..].trim_ascii_start().first(), None | Some(b'('))
+        && matches!(
+            arg.get(name..)
+                .unwrap_or_default()
+                .trim_ascii_start()
+                .first(),
+            None | Some(b'(')
+        )
 }
 
 /// Built-in functions a VBScript assignment calls. `Space(86)` and `CStr(x)`
@@ -1700,7 +1727,7 @@ fn vbs_if(arg: &[u8]) -> Grade {
     let Some(at) = find_word_ci(arg, b"then") else {
         return Grade::None;
     };
-    let cond = &arg[..at];
+    let cond = arg.get(..at).unwrap_or_default();
     if [&b"=="[..], b"~=", b"!=", b"&&", b"||", b";", b"[", b":="]
         .iter()
         .any(|op| contains(cond, op))
@@ -1727,7 +1754,7 @@ fn vbs_for_to(arg: &[u8]) -> Grade {
     if name == 0 {
         return Grade::None;
     }
-    let rest = arg[name..].trim_ascii_start();
+    let rest = arg.get(name..).unwrap_or_default().trim_ascii_start();
     if !rest.starts_with(b"=") || rest.starts_with(b"==") || arg.ends_with(b"do") {
         return Grade::None;
     }
@@ -1746,10 +1773,10 @@ fn vbs_set(rest: &[u8]) -> Grade {
         .iter()
         .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'(' | b')'))
         .count();
-    if name == 0 || !arg[0].is_ascii_alphabetic() {
+    if name == 0 || !arg.first().is_some_and(u8::is_ascii_alphabetic) {
         return Grade::None;
     }
-    let after = &arg[name..];
+    let after = arg.get(name..).unwrap_or_default();
     let spaced = after.first().is_some_and(u8::is_ascii_whitespace);
     let Some(rhs) = after.trim_ascii_start().strip_prefix(b"=") else {
         return Grade::None;
@@ -1787,7 +1814,7 @@ fn vbs_object_expr(rhs: &[u8]) -> bool {
         .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
         .count();
     head > 0
-        && rhs[0].is_ascii_alphabetic()
+        && rhs.first().is_some_and(u8::is_ascii_alphabetic)
         && rhs.get(head) == Some(&b'.')
         && rhs.get(head + 1).is_some_and(u8::is_ascii_alphabetic)
 }
@@ -1806,7 +1833,7 @@ fn vbs_expression(s: &[u8]) -> Grade {
         return if js { Grade::None } else { Grade::Strong };
     }
     if let Some(at) = find_ci(s, b"vb") {
-        let rest = &s[at..];
+        let rest = s.get(at..).unwrap_or_default();
         if contains_ci(rest, b"vbcrlf")
             || contains_ci(rest, b"vbnewline")
             || contains_ci(rest, b"vbnullstring")
@@ -1827,7 +1854,10 @@ fn vbs_expression(s: &[u8]) -> Grade {
             return Grade::Weak;
         }
         // `list(3) = ...`: VB indexes with parentheses.
-        let target = &s[..s.len() - rhs.len()];
+        // `rhs` is the end of `s`.
+        let target = s
+            .get(..s.len().saturating_sub(rhs.len()))
+            .unwrap_or_default();
         if contains(target, b"(") {
             return Grade::Weak;
         }
@@ -1841,14 +1871,14 @@ fn vbs_expression(s: &[u8]) -> Grade {
         .iter()
         .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.'))
         .count();
-    let target = &s[..head];
+    let target = s.get(..head).unwrap_or_default();
     if head > 2
-        && s[0].is_ascii_alphabetic()
+        && s.first().is_some_and(u8::is_ascii_alphabetic)
         && memchr::memchr(b'.', target).is_some()
         && !target.ends_with(b".")
         && s.get(head) == Some(&b' ')
     {
-        let arg = s[head..].trim_ascii_start();
+        let arg = s.get(head..).unwrap_or_default().trim_ascii_start();
         if arg
             .first()
             .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'"' | b'('))
@@ -1866,13 +1896,13 @@ fn vbs_assignment(s: &[u8]) -> Option<&[u8]> {
         .iter()
         .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.'))
         .count();
-    if name == 0 || !s[0].is_ascii_alphabetic() {
+    if name == 0 || !s.first().is_some_and(u8::is_ascii_alphabetic) {
         return None;
     }
-    let mut rest = &s[name..];
+    let mut rest = s.get(name..)?;
     if rest.first() == Some(&b'(') {
         let close = memchr::memchr(b')', rest)?;
-        rest = &rest[close + 1..];
+        rest = rest.get(close + 1..)?;
     }
     let rest = rest.trim_ascii_start();
     let rhs = rest.strip_prefix(b"=")?;
@@ -1885,10 +1915,10 @@ fn has_hex_literal(s: &[u8]) -> bool {
         return false;
     }
     s.windows(3).enumerate().any(|(i, w)| {
-        w[0] == b'&'
-            && (w[1] == b'H' || w[1] == b'h')
-            && w[2].is_ascii_hexdigit()
-            && (i == 0 || !s[i - 1].is_ascii_alphanumeric())
+        matches!(w, [b'&', b'H' | b'h', digit] if digit.is_ascii_hexdigit())
+            && i.checked_sub(1)
+                .and_then(|p| s.get(p))
+                .is_none_or(|b| !b.is_ascii_alphanumeric())
     })
 }
 
@@ -2071,7 +2101,9 @@ fn mirc_line(line: &[u8]) -> Grade {
     if let Some(rest) = line.strip_prefix(b".") {
         let (verb, tail) = split_verb(rest);
         let command = MIRC_QUIET.iter().any(|q| verb.eq_ignore_ascii_case(q))
-            || (starts_ci(verb, b"timer") && verb[5..].iter().all(u8::is_ascii_alphanumeric));
+            || verb.split_at_checked(5).is_some_and(|(word, suffix)| {
+                word.eq_ignore_ascii_case(b"timer") && suffix.iter().all(u8::is_ascii_alphanumeric)
+            });
         if command && tail.first().is_none_or(u8::is_ascii_whitespace) {
             return Grade::Strong;
         }
@@ -2127,10 +2159,12 @@ fn mirc_line(line: &[u8]) -> Grade {
 
 /// `n12=` in front of every line of a saved script.
 fn strip_saved_prefix(line: &[u8]) -> &[u8] {
-    if line.first() == Some(&b'n') {
-        let digits = line[1..].iter().take_while(|b| b.is_ascii_digit()).count();
-        if digits > 0 && line.get(1 + digits) == Some(&b'=') {
-            return line[2 + digits..].trim_ascii_start();
+    if let Some(numbered) = line.strip_prefix(b"n") {
+        let digits = numbered.iter().take_while(|b| b.is_ascii_digit()).count();
+        if digits > 0
+            && let Some(body) = numbered.get(digits..).and_then(|r| r.strip_prefix(b"="))
+        {
+            return body.trim_ascii_start();
         }
     }
     line
@@ -2156,7 +2190,7 @@ fn is_mirc_handler(line: &[u8]) -> bool {
     if level_len == 0 || level_len > 12 || rest.get(level_len) != Some(&b':') {
         return false;
     }
-    let event = &rest[level_len + 1..];
+    let event = rest.get(level_len + 1..).unwrap_or_default();
     let word_len = event
         .iter()
         .take_while(|b| b.is_ascii_alphanumeric() || **b == b'*')
@@ -2164,9 +2198,8 @@ fn is_mirc_handler(line: &[u8]) -> bool {
     if word_len == 0 || event.get(word_len) != Some(&b':') {
         return false;
     }
-    !on || MIRC_EVENTS
-        .iter()
-        .any(|e| e.eq_ignore_ascii_case(&event[..word_len]))
+    let word = event.get(..word_len).unwrap_or_default();
+    !on || MIRC_EVENTS.iter().any(|e| e.eq_ignore_ascii_case(word))
 }
 
 /// `menu nicklist {`, `dialog name {`, `#group on`.
@@ -2189,10 +2222,9 @@ fn is_mirc_block(line: &[u8]) -> bool {
 
 /// What follows `alias`: an optional `-l`, a name, then a block or a command.
 fn is_alias_header(arg: &[u8]) -> bool {
-    let arg = if starts_ci(arg, b"-l ") {
-        arg[3..].trim_ascii_start()
-    } else {
-        arg
+    let arg = match arg.split_at_checked(b"-l ".len()) {
+        Some((flag, tail)) if flag.eq_ignore_ascii_case(b"-l ") => tail.trim_ascii_start(),
+        _ => arg,
     };
     let name = arg
         .iter()
@@ -2289,8 +2321,8 @@ const IRCII_EVENTS: &[&[u8]] = &[
 
 fn ircii_line(line: &[u8]) -> Grade {
     // `^cmd` runs a command silently; `/cmd` is how a command is typed.
-    let (prefixed, body) = match line.first() {
-        Some(b'^' | b'/') => (true, &line[1..]),
+    let (prefixed, body) = match line.split_first() {
+        Some((b'^' | b'/', body)) => (true, body),
         _ => (false, line),
     };
     if is_ircii_handler(body) {
@@ -2334,8 +2366,7 @@ fn ircii_line(line: &[u8]) -> Grade {
     if is(b"load") && !arg.is_empty() && !contains(arg, b" ") {
         return Grade::Weak;
     }
-    if prefixed
-        && line[0] == b'^'
+    if line.starts_with(b"^")
         && (is(b"local") || is(b"stack") || is(b"timer") || is(b"eval") || is(b"on"))
     {
         return Grade::Strong;
@@ -2352,7 +2383,7 @@ fn ircii_line(line: &[u8]) -> Grade {
     {
         return Grade::Weak;
     }
-    if (prefixed && line[0] == b'/' && variables) || line.starts_with(b"# ") || line == b"#" {
+    if (line.starts_with(b"/") && variables) || line.starts_with(b"# ") || line == b"#" {
         return Grade::Weak;
     }
     Grade::None
@@ -2371,7 +2402,7 @@ fn is_ircii_handler(body: &[u8]) -> bool {
         .iter()
         .take_while(|b| matches!(b, b'^' | b'-' | b'+' | b'#' | b'@' | b'&' | b'%' | b'!'))
         .count();
-    let event_part = &rest[modes..];
+    let event_part = rest.get(modes..).unwrap_or_default();
     let event_len = event_part
         .iter()
         .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
@@ -2383,13 +2414,15 @@ fn is_ircii_handler(body: &[u8]) -> bool {
     {
         return false;
     }
-    let event = &event_part[..event_len];
+    let Some((event, after_event)) = event_part.split_at_checked(event_len) else {
+        return false;
+    };
     let known = (event_len == 3 && event.iter().all(u8::is_ascii_digit))
         || IRCII_EVENTS.iter().any(|e| e.eq_ignore_ascii_case(event));
     if !known {
         return false;
     }
-    let mut pattern = event_part[event_len..].trim_ascii_start();
+    let mut pattern = after_event.trim_ascii_start();
     // A serial number orders hooks on the same event: `on #-msg 55 * ...`.
     let serial = pattern
         .iter()
@@ -2397,7 +2430,7 @@ fn is_ircii_handler(body: &[u8]) -> bool {
         .take_while(|(i, b)| b.is_ascii_digit() || (*i == 0 && **b == b'-'))
         .count();
     if serial > 0 && pattern.get(serial).is_some_and(u8::is_ascii_whitespace) {
-        pattern = pattern[serial..].trim_ascii_start();
+        pattern = pattern.get(serial..).unwrap_or_default().trim_ascii_start();
     }
     match pattern.first() {
         Some(b'"' | b'\'' | b'*' | b'%') => true,
@@ -2423,7 +2456,7 @@ fn is_ircii_assignment(line: &[u8]) -> bool {
     if name == 0 {
         return false;
     }
-    let op = rest[name..].trim_ascii_start();
+    let op = rest.get(name..).unwrap_or_default().trim_ascii_start();
     (op.starts_with(b"=") && !op.starts_with(b"=="))
         || op.starts_with(b"++")
         || op.starts_with(b"--")
@@ -2446,10 +2479,11 @@ fn has_ircii_identifier(line: &[u8]) -> bool {
         || line.ends_with(b"$,")
         || line.ends_with(b"$.")
         || line.windows(3).any(|w| {
-            w[0] == b'$'
-                && ((w[1] == b'0' && matches!(w[2], b'-' | b' ' | b']' | b')'))
-                    || (matches!(w[1], b'*' | b',' | b'.') && matches!(w[2], b' ' | b')' | b']'))
-                    || (matches!(w[1], b'N' | b'C' | b'T') && !w[2].is_ascii_alphanumeric()))
+            matches!(
+                w,
+                [b'$', b'0', b'-' | b' ' | b']' | b')']
+                    | [b'$', b'*' | b',' | b'.', b' ' | b')' | b']']
+            ) || matches!(w, [b'$', b'N' | b'C' | b'T', c] if !c.is_ascii_alphanumeric())
         })
 }
 
@@ -2471,14 +2505,14 @@ fn ascii_spaces(window: &[u8]) -> std::borrow::Cow<'_, [u8]> {
         return std::borrow::Cow::Borrowed(window);
     }
     let mut out = Vec::with_capacity(window.len());
-    let mut i = 0;
-    while i < window.len() {
-        if let Some(len) = unicode_space(&window[i..]) {
+    let mut rest = window;
+    while let Some((&b, after)) = rest.split_first() {
+        if let Some(len) = unicode_space(rest) {
             out.push(b' ');
-            i += len;
+            rest = rest.get(len..).unwrap_or_default();
         } else {
-            out.push(window[i]);
-            i += 1;
+            out.push(b);
+            rest = after;
         }
     }
     std::borrow::Cow::Owned(out)
@@ -2528,15 +2562,19 @@ fn is_plain_identifier(s: &[u8]) -> bool {
 /// Offset of `word` in `s` on word boundaries, ignoring case.
 fn find_word_ci(s: &[u8], word: &[u8]) -> Option<usize> {
     (0..=s.len().checked_sub(word.len())?).find(|&i| {
-        s[i..i + word.len()].eq_ignore_ascii_case(word)
-            && (i == 0 || !s[i - 1].is_ascii_alphanumeric())
+        s.get(i..i + word.len())
+            .is_some_and(|w| w.eq_ignore_ascii_case(word))
+            && i.checked_sub(1)
+                .and_then(|p| s.get(p))
+                .is_none_or(|b| !b.is_ascii_alphanumeric())
             && s.get(i + word.len())
                 .is_none_or(|b| !b.is_ascii_alphanumeric())
     })
 }
 
 fn starts_ci(s: &[u8], prefix: &[u8]) -> bool {
-    s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+    s.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
 /// Whether `needle` occurs in `hay`. The needles here are a few bytes long
@@ -2546,7 +2584,8 @@ pub(crate) fn contains(hay: &[u8], needle: &[u8]) -> bool {
     let Some((&first, rest)) = needle.split_first() else {
         return false;
     };
-    memchr::memchr_iter(first, hay).any(|at| hay[at + 1..].starts_with(rest))
+    memchr::memchr_iter(first, hay)
+        .any(|at| hay.get(at + 1..).is_some_and(|tail| tail.starts_with(rest)))
 }
 
 pub(crate) fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {

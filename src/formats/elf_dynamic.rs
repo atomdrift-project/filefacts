@@ -202,10 +202,7 @@ fn section_addr_and_bytes<'a>(
     let start = usize::try_from(sh.sh_offset).ok()?;
     let len = usize::try_from(sh.sh_size).ok()?;
     let end = start.checked_add(len)?;
-    if end > bytes.len() {
-        return None;
-    }
-    Some((sh.sh_addr, &bytes[start..end]))
+    Some((sh.sh_addr, bytes.get(start..end)?))
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -83,8 +83,10 @@ fn site_json((&offset, site): (&u64, &Site)) -> JsonValue {
         .iter()
         .rposition(Option::is_some)
         .map_or(0, |i| i + 1);
-    let vals: Vec<JsonValue> = site.args[..end]
+    let vals: Vec<JsonValue> = site
+        .args
         .iter()
+        .take(end)
         .map(|a| a.map_or(JsonValue::Null, JsonValue::from))
         .collect();
     serde_json::json!({
@@ -133,8 +135,9 @@ fn exec_regions<'a>(elf: &'a Elf<'_>, bytes: &'a [u8]) -> impl Iterator<Item = (
             return None;
         }
         let start = start.max(covered);
+        let region = bytes.get(start..end)?;
         covered = end;
-        Some((start, &bytes[start..end]))
+        Some((start, region))
     })
 }
 
@@ -191,7 +194,11 @@ fn register_slot(register: iced_x86::Register) -> Option<usize> {
 
 impl X86State {
     fn value(&self, register: iced_x86::Register) -> Option<u64> {
-        let value = self.registers[register_slot(register)?]?;
+        let value = self
+            .registers
+            .get(register_slot(register)?)
+            .copied()
+            .flatten()?;
         match register.size() {
             8 => Some(value),
             4 => Some(value & 0xffff_ffff),
@@ -232,14 +239,18 @@ impl X86State {
                     | OpAccess::ReadWrite
                     | OpAccess::ReadCondWrite
             ) {
-                if let Some(slot) = register_slot(used.register()) {
-                    self.registers[slot] = None;
+                if let Some(slot) =
+                    register_slot(used.register()).and_then(|slot| self.registers.get_mut(slot))
+                {
+                    *slot = None;
                 }
             }
         }
         if matches!(instruction.mnemonic(), Mnemonic::Mov | Mnemonic::Xor) {
-            if let Some(slot) = register_slot(destination) {
-                self.registers[slot] = match destination.size() {
+            if let Some(slot) =
+                register_slot(destination).and_then(|slot| self.registers.get_mut(slot))
+            {
+                *slot = match destination.size() {
                     8 => value,
                     4 => value.map(|v| v & 0xffff_ffff),
                     _ => None,
@@ -316,7 +327,11 @@ fn resolve_aarch64_syscall(region: &[u8], svc_pos: usize) -> Resolved {
         }
         let imm = (w >> 5) & 0xFFFF;
         match (w & 0x1F) as usize {
-            rd @ 0..=5 => res.args[rd] = Some(u64::from(imm)),
+            rd @ 0..=5 => {
+                if let Some(arg) = res.args.get_mut(rd) {
+                    *arg = Some(u64::from(imm));
+                }
+            }
             8 => res.number = Some(imm),
             _ => {}
         }

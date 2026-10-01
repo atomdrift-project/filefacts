@@ -24,6 +24,7 @@
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
+use crate::bytes::{self, Reader};
 use crate::formats::common::{hex_encode, plist_to_json, put_str, put_u64};
 use crate::output::Values;
 
@@ -53,14 +54,17 @@ const MAX_ENTITLEMENT_XML_BYTES: usize = 1 << 20;
 /// Parse the code-signature blob at offset `sig_off..sig_off+sig_size`
 /// in `bytes` and populate the `macho.code_signature.*` subtree.
 pub(super) fn parse(bytes: &[u8], sig_off: usize, sig_size: usize, values: &mut Values) {
-    let end = sig_off.saturating_add(sig_size);
-    if end > bytes.len() || sig_size < 12 {
+    if sig_size < 12 {
         return;
     }
-    let sig = &bytes[sig_off..end];
+    let Some(sig) = bytes.get(sig_off..sig_off.saturating_add(sig_size)) else {
+        return;
+    };
 
-    let magic = read_u32_be(sig, 0);
-    let total_len = read_u32_be(sig, 4) as usize;
+    let (Some(magic), Some(total_len)) = (bytes::u32_be(sig, 0), bytes::u32_be(sig, 4)) else {
+        return;
+    };
+    let total_len = total_len as usize;
     if total_len < 12 || total_len > sig.len() {
         return;
     }
@@ -68,7 +72,9 @@ pub(super) fn parse(bytes: &[u8], sig_off: usize, sig_size: usize, values: &mut 
         return;
     }
 
-    let count = read_u32_be(sig, 8) as usize;
+    let Some(count) = bytes::u32_be(sig, 8).map(|n| n as usize) else {
+        return;
+    };
     // Each BlobIndex: u32 type, u32 offset (12 bytes header + 8 * count
     // for the index table).
     let Some(index_end) = count.checked_mul(8).and_then(|n| n.checked_add(12)) else {
@@ -79,24 +85,34 @@ pub(super) fn parse(bytes: &[u8], sig_off: usize, sig_size: usize, values: &mut 
     }
 
     for i in 0..count {
-        let entry_off = 12 + i * 8;
-        let _slot_type = read_u32_be(sig, entry_off);
-        let blob_off = read_u32_be(sig, entry_off + 4) as usize;
+        // The index entry's slot type precedes its blob offset.
+        let Some(blob_off) = bytes::u32_be(sig, 12 + i * 8 + 4).map(|n| n as usize) else {
+            continue;
+        };
         if blob_off + 8 > total_len {
             continue;
         }
-        let blob_magic = read_u32_be(sig, blob_off);
-        let blob_len = read_u32_be(sig, blob_off + 4) as usize;
-        if blob_len < 8 || blob_off + blob_len > total_len {
+        let (Some(blob_magic), Some(blob_len)) = (
+            bytes::u32_be(sig, blob_off),
+            bytes::u32_be(sig, blob_off + 4),
+        ) else {
+            continue;
+        };
+        let blob_len = blob_len as usize;
+        if blob_len < 8 || blob_off.saturating_add(blob_len) > total_len {
             continue;
         }
-        let blob = &sig[blob_off..blob_off + blob_len];
+        let Some(blob) = sig.get(blob_off..blob_off + blob_len) else {
+            continue;
+        };
 
         match blob_magic {
             // `sig_off + blob_off` is the CodeDirectory's absolute offset in
             // `bytes`; pass it so interior fields (the identifier string) can
             // be reported in the same coordinate space as the signature blob.
-            CSMAGIC_CODEDIRECTORY => parse_code_directory(blob, sig_off + blob_off, values),
+            CSMAGIC_CODEDIRECTORY => {
+                parse_code_directory(blob, sig_off + blob_off, values);
+            }
             CSMAGIC_REQUIREMENTS => {
                 put_u64(
                     values,
@@ -125,7 +141,7 @@ pub(super) fn parse(bytes: &[u8], sig_off: usize, sig_size: usize, values: &mut 
 /// `cd_base` is the blob's absolute offset in the file, used to anchor
 /// interior strings (the identifier) at their true byte position rather
 /// than at the enclosing signature blob.
-fn parse_code_directory(blob: &[u8], cd_base: usize, values: &mut Values) {
+fn parse_code_directory(blob: &[u8], cd_base: usize, values: &mut Values) -> Option<()> {
     // Header layout (big-endian):
     //   u32 magic            (already validated)
     //   u32 length
@@ -153,18 +169,17 @@ fn parse_code_directory(blob: &[u8], cd_base: usize, values: &mut Values) {
     //   u64 execSegLimit
     //   u64 execSegFlags
     if blob.len() < 0x2c {
-        return;
+        return None;
     }
-    let version = read_u32_be(blob, 8);
-    let flags = read_u32_be(blob, 12);
-    let ident_offset = read_u32_be(blob, 20) as usize;
-    let n_special_slots = read_u32_be(blob, 24);
-    let n_code_slots = read_u32_be(blob, 28);
-    let code_limit = read_u32_be(blob, 32);
-    let hash_size = blob[36];
-    let hash_type = blob[37];
-    let platform = blob[38];
-    let page_size_log2 = blob[39];
+    let mut cd = Reader::at(blob, 8);
+    let version = cd.u32_be()?;
+    let flags = cd.u32_be()?;
+    cd.skip(4)?; // hashOffset
+    let ident_offset = cd.u32_be()? as usize;
+    let n_special_slots = cd.u32_be()?;
+    let n_code_slots = cd.u32_be()?;
+    let code_limit = cd.u32_be()?;
+    let [hash_size, hash_type, platform, page_size_log2] = cd.array()?;
 
     if let Some(ident) = read_cstr(blob, ident_offset) {
         put_str(values, "macho.code_signature.identifier", ident);
@@ -179,28 +194,26 @@ fn parse_code_directory(blob: &[u8], cd_base: usize, values: &mut Values) {
     }
 
     // The team_offset field landed in version 0x20200.
-    if version >= 0x0002_0200 && blob.len() >= 0x34 {
-        let team_offset = read_u32_be(blob, 48) as usize;
-        if team_offset != 0 {
-            if let Some(team) = read_cstr(blob, team_offset) {
-                if !team.is_empty() {
-                    put_str(values, "macho.code_signature.team_id", team);
-                }
-            }
-        }
+    if version >= 0x0002_0200
+        && let Some(team_offset) = bytes::u32_be(blob, 48)
+        && team_offset != 0
+        && let Some(team) = read_cstr(blob, team_offset as usize)
+        && !team.is_empty()
+    {
+        put_str(values, "macho.code_signature.team_id", team);
     }
 
     // Executable-segment descriptor — present from version 0x20400
     // onward. The three u64 fields sit at 0x40, 0x48, 0x50 inside the
     // CodeDirectory blob. Forensically meaningful as a per-binary
     // bound on which bytes the kernel will enforce as executable.
-    if version >= 0x0002_0400 && blob.len() >= 0x58 {
-        let exec_base =
-            u64::from(read_u32_be(blob, 0x40)) << 32 | u64::from(read_u32_be(blob, 0x44));
-        let exec_limit =
-            u64::from(read_u32_be(blob, 0x48)) << 32 | u64::from(read_u32_be(blob, 0x4c));
-        let exec_flags =
-            u64::from(read_u32_be(blob, 0x50)) << 32 | u64::from(read_u32_be(blob, 0x54));
+    if version >= 0x0002_0400
+        && let (Some(exec_base), Some(exec_limit), Some(exec_flags)) = (
+            bytes::u64_be(blob, 0x40),
+            bytes::u64_be(blob, 0x48),
+            bytes::u64_be(blob, 0x50),
+        )
+    {
         put_u64(values, "macho.code_signature.exec_segment_base", exec_base);
         put_u64(
             values,
@@ -264,6 +277,7 @@ fn parse_code_directory(blob: &[u8], cd_base: usize, values: &mut Values) {
     // used for notarisation lookups.
     let digest = Sha256::digest(blob);
     put_str(values, "macho.code_signature.cdhash", hex_encode(&digest));
+    Some(())
 }
 
 /// Walk a Requirements SuperBlob and decode each requirement's
@@ -278,10 +292,9 @@ fn parse_code_directory(blob: &[u8], cd_base: usize, values: &mut Values) {
 /// length-prefixed strings padded to 4-byte alignment.
 fn parse_requirements_set(blob: &[u8], values: &mut Values) {
     // SuperBlob header is already validated by the caller.
-    if blob.len() < 12 {
+    let Some(count) = bytes::u32_be(blob, 8).map(|n| n as usize) else {
         return;
-    }
-    let count = read_u32_be(blob, 8) as usize;
+    };
     let index_end = 12_usize.saturating_add(count.saturating_mul(8));
     if index_end > blob.len() {
         return;
@@ -289,25 +302,36 @@ fn parse_requirements_set(blob: &[u8], values: &mut Values) {
     let mut requirements = serde_json::Map::new();
     for i in 0..count {
         let entry_off = 12 + i * 8;
-        let slot_type = read_u32_be(blob, entry_off);
-        let req_off = read_u32_be(blob, entry_off + 4) as usize;
+        let (Some(slot_type), Some(req_off)) = (
+            bytes::u32_be(blob, entry_off),
+            bytes::u32_be(blob, entry_off + 4),
+        ) else {
+            continue;
+        };
+        let req_off = req_off as usize;
         if req_off + 12 > blob.len() {
             continue;
         }
-        let req_magic = read_u32_be(blob, req_off);
-        let req_len = read_u32_be(blob, req_off + 4) as usize;
+        let (Some(req_magic), Some(req_len)) = (
+            bytes::u32_be(blob, req_off),
+            bytes::u32_be(blob, req_off + 4),
+        ) else {
+            continue;
+        };
+        let req_len = req_len as usize;
         // CSMAGIC_REQUIREMENT = 0xfade_0c00.
-        if req_magic != 0xfade_0c00 || req_len < 12 || req_off + req_len > blob.len() {
+        if req_magic != 0xfade_0c00 || req_len < 12 || req_off.saturating_add(req_len) > blob.len()
+        {
             continue;
         }
         // Expression tree starts after the 12-byte requirement
         // header (magic + length + kind). The trailing kind isn't
         // forensically interesting (always 1 = expression in
         // practice); we ignore it and parse the expression tree.
-        let expr_start = req_off + 12;
-        let expr_end = req_off + req_len;
-        let mut cursor = expr_start;
-        let text = decode_expression(blob, &mut cursor, expr_end, 0).unwrap_or_else(|| "?".into());
+        let Some(expr) = blob.get(req_off + 12..req_off + req_len) else {
+            continue;
+        };
+        let text = decode_expression(&mut Reader::new(expr), 0).unwrap_or_else(|| "?".into());
         let key = requirement_slot_name(slot_type);
         requirements.insert(key.to_string(), JsonValue::String(text));
     }
@@ -342,15 +366,11 @@ fn requirement_slot_name(slot: u32) -> &'static str {
 /// `depth` is the recursion level (start at 0). Adversarial blobs can
 /// chain AND/OR/NOT operators to arbitrary depth — cap at
 /// [`MAX_REQUIREMENT_DEPTH`] to keep stack usage bounded.
-fn decode_expression(blob: &[u8], cursor: &mut usize, end: usize, depth: u8) -> Option<String> {
+fn decode_expression(r: &mut Reader<'_>, depth: u8) -> Option<String> {
     if depth > MAX_REQUIREMENT_DEPTH {
         return None;
     }
-    if *cursor + 4 > end {
-        return None;
-    }
-    let op = read_u32_be(blob, *cursor);
-    *cursor += 4;
+    let op = r.u32_be()?;
     // Match-flags live in the top byte of the opcode on certain
     // string-match instructions; the low 24 bits hold the actual
     // opcode. The match-flag handling matters only for `info`/
@@ -359,78 +379,72 @@ fn decode_expression(blob: &[u8], cursor: &mut usize, end: usize, depth: u8) -> 
     Some(match op_low {
         0 => "never".into(),
         1 => "always".into(),
-        2 => format!("identifier \"{}\"", read_expr_string(blob, cursor, end)?),
+        2 => format!("identifier \"{}\"", read_expr_string(r)?),
         3 => "anchor apple".into(),
         4 => {
-            let slot = read_u32_be_advance(blob, cursor, end)?;
-            let hash = read_expr_data(blob, cursor, end)?;
-            format!("certificate {slot} = H\"{}\"", hex_encode(&hash))
+            let slot = r.u32_be()?;
+            let hash = read_expr_data(r)?;
+            format!("certificate {slot} = H\"{}\"", hex_encode(hash))
         }
         5 => {
-            let key = read_expr_string(blob, cursor, end)?;
-            let val = read_expr_string(blob, cursor, end)?;
+            let key = read_expr_string(r)?;
+            let val = read_expr_string(r)?;
             format!("info[{key}] = \"{val}\"")
         }
         6 => {
-            let left = decode_expression(blob, cursor, end, depth + 1)?;
-            let right = decode_expression(blob, cursor, end, depth + 1)?;
+            let left = decode_expression(r, depth + 1)?;
+            let right = decode_expression(r, depth + 1)?;
             format!("({left} and {right})")
         }
         7 => {
-            let left = decode_expression(blob, cursor, end, depth + 1)?;
-            let right = decode_expression(blob, cursor, end, depth + 1)?;
+            let left = decode_expression(r, depth + 1)?;
+            let right = decode_expression(r, depth + 1)?;
             format!("({left} or {right})")
         }
-        8 => format!(
-            "cdhash H\"{}\"",
-            hex_encode(&read_expr_data(blob, cursor, end)?)
-        ),
+        8 => format!("cdhash H\"{}\"", hex_encode(read_expr_data(r)?)),
         9 => {
-            let inner = decode_expression(blob, cursor, end, depth + 1)?;
+            let inner = decode_expression(r, depth + 1)?;
             format!("!({inner})")
         }
         10 => {
-            let key = read_expr_string(blob, cursor, end)?;
-            let m = read_match(blob, cursor, end)?;
+            let key = read_expr_string(r)?;
+            let m = read_match(r)?;
             format!("info[{key}] {m}")
         }
         11 => {
-            let slot = read_u32_be_advance(blob, cursor, end)?;
-            let field = read_expr_string(blob, cursor, end)?;
-            let m = read_match(blob, cursor, end)?;
+            let slot = r.u32_be()?;
+            let field = read_expr_string(r)?;
+            let m = read_match(r)?;
             format!("certificate {slot}[{field}] {m}")
         }
-        12 => format!(
-            "certificate {} trusted",
-            read_u32_be_advance(blob, cursor, end)?
-        ),
+        12 => format!("certificate {} trusted", r.u32_be()?),
         13 => "anchor trusted".into(),
         14 => {
-            let slot = read_u32_be_advance(blob, cursor, end)?;
-            let oid = read_expr_data(blob, cursor, end)?;
-            let m = read_match(blob, cursor, end)?;
-            format!("certificate {slot}[field.{}] {m}", hex_encode(&oid))
+            let slot = r.u32_be()?;
+            let oid = read_expr_data(r)?;
+            let m = read_match(r)?;
+            format!("certificate {slot}[field.{}] {m}", hex_encode(oid))
         }
         15 => "anchor apple generic".into(),
         16 => {
-            let key = read_expr_string(blob, cursor, end)?;
-            let m = read_match(blob, cursor, end)?;
+            let key = read_expr_string(r)?;
+            let m = read_match(r)?;
             format!("entitlement[{key}] {m}")
         }
         17 => {
-            let slot = read_u32_be_advance(blob, cursor, end)?;
-            let oid = read_expr_data(blob, cursor, end)?;
-            let m = read_match(blob, cursor, end)?;
-            format!("certificate {slot}[policy.{}] {m}", hex_encode(&oid))
+            let slot = r.u32_be()?;
+            let oid = read_expr_data(r)?;
+            let m = read_match(r)?;
+            format!("certificate {slot}[policy.{}] {m}", hex_encode(oid))
         }
-        18 => format!("anchor apple {}", read_expr_string(blob, cursor, end)?),
-        19 => format!("anchor named \"{}\"", read_expr_string(blob, cursor, end)?),
-        20 => format!("platform = {}", read_u32_be_advance(blob, cursor, end)?),
+        18 => format!("anchor apple {}", read_expr_string(r)?),
+        19 => format!("anchor named \"{}\"", read_expr_string(r)?),
+        20 => format!("platform = {}", r.u32_be()?),
         21 => "notarized".into(),
         22 => {
-            let slot = read_u32_be_advance(blob, cursor, end)?;
-            let field = read_expr_string(blob, cursor, end)?;
-            let m = read_match(blob, cursor, end)?;
+            let slot = r.u32_be()?;
+            let field = read_expr_string(r)?;
+            let m = read_match(r)?;
             format!("certificate {slot}[{field}.date] {m}")
         }
         23 => "legacy".into(),
@@ -440,68 +454,46 @@ fn decode_expression(blob: &[u8], cursor: &mut usize, end: usize, depth: u8) -> 
 
 /// Match-suffix operator. The opcode tag advances the cursor; for
 /// every flavour except `exists` a string operand follows.
-fn read_match(blob: &[u8], cursor: &mut usize, end: usize) -> Option<String> {
-    let op = read_u32_be_advance(blob, cursor, end)?;
+fn read_match(r: &mut Reader<'_>) -> Option<String> {
+    let op = r.u32_be()?;
     Some(match op {
         0 => "exists".into(),
-        1 => format!("= \"{}\"", read_expr_string(blob, cursor, end)?),
-        2 => format!("~ \"*{}*\"", read_expr_string(blob, cursor, end)?),
-        3 => format!("~ \"{}*\"", read_expr_string(blob, cursor, end)?),
-        4 => format!("~ \"*{}\"", read_expr_string(blob, cursor, end)?),
-        5 => format!("< \"{}\"", read_expr_string(blob, cursor, end)?),
-        6 => format!("> \"{}\"", read_expr_string(blob, cursor, end)?),
-        7 => format!("<= \"{}\"", read_expr_string(blob, cursor, end)?),
-        8 => format!(">= \"{}\"", read_expr_string(blob, cursor, end)?),
+        1 => format!("= \"{}\"", read_expr_string(r)?),
+        2 => format!("~ \"*{}*\"", read_expr_string(r)?),
+        3 => format!("~ \"{}*\"", read_expr_string(r)?),
+        4 => format!("~ \"*{}\"", read_expr_string(r)?),
+        5 => format!("< \"{}\"", read_expr_string(r)?),
+        6 => format!("> \"{}\"", read_expr_string(r)?),
+        7 => format!("<= \"{}\"", read_expr_string(r)?),
+        8 => format!(">= \"{}\"", read_expr_string(r)?),
         _ => format!("match({op:#x})"),
     })
 }
 
-fn read_u32_be_advance(blob: &[u8], cursor: &mut usize, end: usize) -> Option<u32> {
-    if *cursor + 4 > end {
-        return None;
-    }
-    let v = read_u32_be(blob, *cursor);
-    *cursor += 4;
-    Some(v)
-}
-
 /// Length-prefixed UTF-8 string. Strings are padded with NULs to the
 /// next 4-byte boundary.
-fn read_expr_string(blob: &[u8], cursor: &mut usize, end: usize) -> Option<String> {
-    let len = read_u32_be_advance(blob, cursor, end)? as usize;
-    if *cursor + len > end {
-        return None;
-    }
-    let s = std::str::from_utf8(&blob[*cursor..*cursor + len])
-        .ok()?
-        .to_owned();
-    *cursor += len;
-    // 4-byte alignment padding.
-    let pad = (4 - (len & 3)) & 3;
-    *cursor += pad;
-    Some(s)
+fn read_expr_string(r: &mut Reader<'_>) -> Option<String> {
+    std::str::from_utf8(read_expr_data(r)?)
+        .ok()
+        .map(str::to_owned)
 }
 
 /// Length-prefixed binary blob (certificate hashes, OIDs). Padded to
 /// the next 4-byte boundary just like strings.
-fn read_expr_data(blob: &[u8], cursor: &mut usize, end: usize) -> Option<Vec<u8>> {
-    let len = read_u32_be_advance(blob, cursor, end)? as usize;
-    if *cursor + len > end {
-        return None;
-    }
-    let v = blob[*cursor..*cursor + len].to_vec();
-    *cursor += len;
-    let pad = (4 - (len & 3)) & 3;
-    *cursor += pad;
-    Some(v)
+fn read_expr_data<'a>(r: &mut Reader<'a>) -> Option<&'a [u8]> {
+    let len = r.u32_be()? as usize;
+    let data = r.bytes(len)?;
+    // A blob that ends inside the padding still yields this operand; the
+    // next read fails either way, as every operand opens with a `u32`.
+    let _ = r.skip((4 - (len & 3)) & 3);
+    Some(data)
 }
 
 fn parse_entitlements(blob: &[u8], values: &mut Values) {
     // 8-byte header (magic + length); the rest is XML plist.
-    if blob.len() <= 8 {
+    let Some(xml_bytes) = blob.get(8..).filter(|xml| !xml.is_empty()) else {
         return;
-    }
-    let xml_bytes = &blob[8..];
+    };
     if xml_bytes.len() > MAX_ENTITLEMENT_XML_BYTES {
         return;
     }
@@ -538,23 +530,23 @@ fn parse_cms(blob: &[u8], values: &mut Values) {
     // strict parse anyway — it succeeds for the small fraction of
     // Apple-signed binaries that happen to use definite-length form,
     // and for the rest we keep the presence flag above.
-    let der = &blob[8..];
+    let Some(der) = blob.get(8..) else {
+        return;
+    };
     if let Some(sig) = super::pe_authenticode::parse_cms_blob(der) {
         values.insert("macho.code_signature.cms", sig);
     }
-}
-
-fn read_u32_be(b: &[u8], off: usize) -> u32 {
-    crate::formats::common::bytes_at::u32_be(b, off).unwrap_or(0)
 }
 
 fn read_cstr(b: &[u8], off: usize) -> Option<String> {
     if off >= b.len() {
         return None;
     }
-    let slice = &b[off..];
+    let slice = b.get(off..)?;
     let end = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
-    std::str::from_utf8(&slice[..end]).ok().map(str::to_string)
+    std::str::from_utf8(slice.get(..end)?)
+        .ok()
+        .map(str::to_string)
 }
 
 fn hash_label(t: u8) -> &'static str {
@@ -699,10 +691,27 @@ mod tests {
         assert!(s.is_empty());
     }
 
+    fn words(ws: &[u32]) -> Vec<u8> {
+        ws.iter().flat_map(|w| w.to_be_bytes()).collect()
+    }
+
     #[test]
-    fn read_u32_be_reads_in_network_order() {
-        // Code-signature blobs are all big-endian.
-        let buf = [0x01, 0x02, 0x03, 0x04];
-        assert_eq!(read_u32_be(&buf, 0), 0x0102_0304);
+    fn requirement_expression_decodes_to_csreq_text() {
+        // `and`, then `identifier` with a 5-byte string padded to 8.
+        let mut expr = words(&[6, 2, 5]);
+        expr.extend(b"com.x\0\0\0");
+        expr.extend(words(&[15]));
+        let decode = |b: &[u8]| decode_expression(&mut Reader::new(b), 0);
+        assert_eq!(
+            decode(&expr).as_deref(),
+            Some("(identifier \"com.x\" and anchor apple generic)")
+        );
+        // A truncated operand fails the whole expression.
+        assert_eq!(decode(&expr[..14]), None);
+        assert_eq!(decode(&expr[..20]), None);
+        // An operand that ends inside its padding still decodes.
+        let mut tail = words(&[2, 1]);
+        tail.push(b'a');
+        assert_eq!(decode(&tail).as_deref(), Some("identifier \"a\""));
     }
 }

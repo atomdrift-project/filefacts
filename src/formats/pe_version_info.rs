@@ -22,6 +22,7 @@ use crate::metric;
 use goblin::pe::resource::{StringFileInfo, VersionInfo, VsFixedFileInfo};
 use serde_json::Value as JsonValue;
 
+use crate::formats::common::bytes_at::u16_le;
 use crate::formats::common::{put_str, put_u64};
 use crate::output::{Metrics, Values};
 
@@ -82,7 +83,9 @@ fn read_utf16_key(bytes: &[u8], pos: usize, end: usize) -> (String, usize) {
     let mut units = Vec::new();
     let mut i = pos;
     while i + 2 <= end {
-        let u = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+        let Some(u) = u16_le(bytes, i) else {
+            break;
+        };
         i += 2;
         if u == 0 {
             break;
@@ -119,9 +122,13 @@ fn walk_version_block(
         return;
     }
     *budget -= 1;
-    let w_length = u16::from_le_bytes([bytes[off], bytes[off + 1]]) as usize;
-    let w_value_length = u16::from_le_bytes([bytes[off + 2], bytes[off + 3]]) as usize;
-    let w_type = u16::from_le_bytes([bytes[off + 4], bytes[off + 5]]);
+    let Some(&[l0, l1, v0, v1, t0, t1]) = bytes.get(off..).and_then(<[u8]>::first_chunk::<6>)
+    else {
+        return;
+    };
+    let w_length = u16::from_le_bytes([l0, l1]) as usize;
+    let w_value_length = u16::from_le_bytes([v0, v1]) as usize;
+    let w_type = u16::from_le_bytes([t0, t1]);
     let block_end = off.saturating_add(w_length).min(limit);
     if w_length < 6 || block_end <= off {
         return; // zero/short length — stop rather than loop
@@ -149,7 +156,10 @@ fn walk_version_block(
     // Children follow the value, DWORD-aligned, up to this block's end.
     let mut child = align4(value_off.saturating_add(value_bytes));
     while child + 6 <= block_end {
-        let child_len = u16::from_le_bytes([bytes[child], bytes[child + 1]]) as usize;
+        let Some(child_len) = u16_le(bytes, child) else {
+            break;
+        };
+        let child_len = child_len as usize;
         if child_len < 6 {
             break;
         }
@@ -296,7 +306,9 @@ fn identity_scores(identity: &str) -> Option<(f64, f64)> {
     let mut freq = [0u32; 256];
     let byte_total = identity.len() as f64;
     for b in identity.bytes() {
-        freq[b as usize] += 1;
+        if let Some(slot) = freq.get_mut(usize::from(b)) {
+            *slot += 1;
+        }
     }
     let entropy = freq
         .iter()

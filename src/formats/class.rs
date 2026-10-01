@@ -28,8 +28,9 @@
 
 use crate::metric;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
+use crate::bytes::Reader;
 use crate::error::Error;
 use crate::formats::common::{XorScan, extract_binary_strings, put_str, put_u64};
 use crate::output::{Metrics, Strings, Values};
@@ -63,7 +64,7 @@ struct ConstantPool {
     /// Byte offset of each `CONSTANT_Utf8_info` entry's string data, so
     /// constant-pool-derived imports can anchor where the name physically sits.
     utf8_offset: HashMap<u16, u64>,
-    class: HashMap<u16, u16>,
+    class: BTreeMap<u16, u16>,
     /// `CONSTANT_NameAndType_info` -> (name_idx, descriptor_idx).
     /// Needed to resolve methodref / fieldref entries to readable
     /// names.
@@ -72,7 +73,7 @@ struct ConstantPool {
     /// name_and_type_idx). One map covers Methodref,
     /// InterfaceMethodref, and Fieldref — consumers can ignore the
     /// kind for forensic purposes.
-    methodref: HashMap<u16, (u16, u16)>,
+    methodref: BTreeMap<u16, (u16, u16)>,
 }
 
 impl ConstantPool {
@@ -116,44 +117,49 @@ pub(super) fn extract(
 ) -> Result<(), Error> {
     extract_binary_strings(bytes, strings, XorScan::No);
 
-    if bytes.len() < 10
-        || u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) != 0xCAFE_BABE
-    {
+    let Some(&[m0, m1, m2, m3, n0, n1, j0, j1, c0, c1]) = bytes.first_chunk::<10>() else {
+        return Ok(());
+    };
+    if u32::from_be_bytes([m0, m1, m2, m3]) != 0xCAFE_BABE {
         return Ok(());
     }
-    let minor_version = u16::from_be_bytes([bytes[4], bytes[5]]);
-    let major_version = u16::from_be_bytes([bytes[6], bytes[7]]);
-    let cp_count = u16::from_be_bytes([bytes[8], bytes[9]]) as usize;
+    let minor_version = u16::from_be_bytes([n0, n1]);
+    let major_version = u16::from_be_bytes([j0, j1]);
+    let cp_count = u16::from_be_bytes([c0, c1]) as usize;
 
-    let mut pos = 10usize;
-    let Some(cp) = parse_constant_pool(bytes, &mut pos, cp_count) else {
+    let mut r = Reader::at(bytes, 10);
+    let Some(cp) = parse_constant_pool(&mut r, cp_count) else {
         return Ok(());
     };
-    let Some(access_flags) = read_u16(bytes, &mut pos) else {
+    let Some(access_flags) = r.u16_be() else {
         return Ok(());
     };
-    let Some(this_idx) = read_u16(bytes, &mut pos) else {
+    let Some(this_idx) = r.u16_be() else {
         return Ok(());
     };
-    let Some(super_idx) = read_u16(bytes, &mut pos) else {
+    let Some(super_idx) = r.u16_be() else {
         return Ok(());
     };
-    let Some(interfaces_count) = read_u16(bytes, &mut pos) else {
+    let Some(interfaces_count) = r.u16_be() else {
         return Ok(());
     };
     let mut interface_idx: Vec<u16> = Vec::with_capacity(interfaces_count as usize);
     for _ in 0..interfaces_count {
-        let Some(idx) = read_u16(bytes, &mut pos) else {
+        let Some(idx) = r.u16_be() else {
             return Ok(());
         };
         interface_idx.push(idx);
     }
     // Skip fields[]; parse methods[] for the typed Functions view.
-    if skip_member_table(bytes, &mut pos).is_none() {
+    if skip_member_table(&mut r).is_none() {
         return Ok(());
     }
-    let _ = parse_methods(bytes, &mut pos, &cp, symbols_out).unwrap_or(0);
-    let attrs = parse_attributes(bytes, &mut pos, &cp);
+    // The class attributes follow methods[], so a truncated method table
+    // leaves them unreachable.
+    let attrs = match parse_methods(&mut r, &cp, symbols_out) {
+        Some(()) => parse_attributes(&mut r, &cp),
+        None => ClassAttributes::default(),
+    };
 
     // Surface external class references and methodref-resolved
     // imports. `this_class` is the class's own self-reference and
@@ -334,63 +340,58 @@ struct ClassAttributes {
     inner_classes: Vec<String>,
 }
 
-fn parse_attributes(bytes: &[u8], pos: &mut usize, cp: &ConstantPool) -> ClassAttributes {
+fn parse_attributes(r: &mut Reader<'_>, cp: &ConstantPool) -> ClassAttributes {
     let mut out = ClassAttributes::default();
-    let Some(count) = read_u16(bytes, pos) else {
+    let Some(count) = r.u16_be() else {
         return out;
     };
     for _ in 0..count {
-        let Some(name_idx) = read_u16(bytes, pos) else {
+        let Some(name_idx) = r.u16_be() else {
             return out;
         };
-        let Some(length) = read_u32(bytes, pos).map(|v| v as usize) else {
+        let Some(length) = r.u32_be().map(|v| v as usize) else {
             return out;
         };
-        let body_start = *pos;
-        let Some(body_end) = body_start.checked_add(length).filter(|&e| e <= bytes.len()) else {
+        let Some(body) = r.bytes(length) else {
             return out;
         };
-        let body = &bytes[body_start..body_end];
         let attr_name = cp.utf8.get(&name_idx).map(String::as_str).unwrap_or("");
-        match attr_name {
-            "SourceFile" if body.len() >= 2 => {
-                let idx = u16::from_be_bytes([body[0], body[1]]);
+        // Every class-level attribute read here opens with a u2; a body too
+        // short for it records nothing.
+        let lead = body
+            .split_first_chunk::<2>()
+            .map(|(&lead, rest)| (u16::from_be_bytes(lead), rest));
+        match (attr_name, lead) {
+            ("SourceFile", Some((idx, _))) => {
                 if let Some(s) = cp.utf8.get(&idx) {
                     out.source_file = Some(s.clone());
                 }
             }
-            "Signature" if body.len() >= 2 => {
-                let idx = u16::from_be_bytes([body[0], body[1]]);
+            ("Signature", Some((idx, _))) => {
                 if let Some(s) = cp.utf8.get(&idx) {
                     out.signature = Some(s.clone());
                 }
             }
-            "InnerClasses" if body.len() >= 2 => {
-                let n = u16::from_be_bytes([body[0], body[1]]) as usize;
-                let mut p = 2;
-                for _ in 0..n {
-                    if p + 8 > body.len() {
-                        break;
-                    }
-                    let inner_class_info_idx = u16::from_be_bytes([body[p], body[p + 1]]);
-                    if let Some(name) = cp.class_name(inner_class_info_idx) {
+            ("InnerClasses", Some((entry_count, entries))) => {
+                // Each entry is four u2s, the first inner_class_info_index.
+                let entries = entries.as_chunks::<8>().0;
+                for &[i0, i1, ..] in entries.iter().take(usize::from(entry_count)) {
+                    if let Some(name) = cp.class_name(u16::from_be_bytes([i0, i1])) {
                         let owned = name.to_string();
                         if !out.inner_classes.contains(&owned) {
                             out.inner_classes.push(owned);
                         }
                     }
-                    p += 8;
                 }
             }
             _ => {}
         }
-        *pos = body_end;
     }
     out
 }
 
-/// Walk the `methods[]` array, push each declared method into the
-/// typed `Functions` view, and return the count. Field structure
+/// Walk the `methods[]` array and push each declared method into the
+/// typed `Functions` view. Field structure
 /// per JVM Spec §4.6: `access_flags u2; name_index u2;
 /// descriptor_index u2; attributes_count u2; attributes[]`.
 ///
@@ -398,25 +399,16 @@ fn parse_attributes(bytes: &[u8], pos: &mut usize, cp: &ConstantPool) -> ClassAt
 /// declaration matters for the symbol surface. Attributes are
 /// length-skipped.
 fn parse_methods(
-    bytes: &[u8],
-    pos: &mut usize,
+    r: &mut Reader<'_>,
     cp: &ConstantPool,
     symbols_out: &mut crate::Symbols,
-) -> Option<u32> {
-    let count = read_u16(bytes, pos)?;
+) -> Option<()> {
+    let count = r.u16_be()?;
     for _ in 0..count {
-        let access_flags = read_u16(bytes, pos)?;
-        let name_idx = read_u16(bytes, pos)?;
-        let _descriptor_idx = read_u16(bytes, pos)?;
-        let attrs = read_u16(bytes, pos)?;
-        for _ in 0..attrs {
-            *pos = pos.checked_add(2)?;
-            let len = read_u32(bytes, pos)? as usize;
-            *pos = pos.checked_add(len)?;
-            if *pos > bytes.len() {
-                return None;
-            }
-        }
+        let access_flags = r.u16_be()?;
+        let name_idx = r.u16_be()?;
+        let _descriptor_idx = r.u16_be()?;
+        skip_attributes(r)?;
         let Some(name) = cp.utf8.get(&name_idx) else {
             continue;
         };
@@ -434,7 +426,7 @@ fn parse_methods(
             callees: Vec::new(),
         });
     }
-    Some(u32::from(count))
+    Some(())
 }
 
 /// Push two flavours of typed `Import` entries discovered through
@@ -505,53 +497,51 @@ fn populate_imports(
     );
 }
 
-fn skip_member_table(bytes: &[u8], pos: &mut usize) -> Option<()> {
-    let count = read_u16(bytes, pos)?;
+/// Step over a `fields[]` table: `access_flags u2; name_index u2;
+/// descriptor_index u2; attributes_count u2; attributes[]` per entry.
+fn skip_member_table(r: &mut Reader<'_>) -> Option<()> {
+    let count = r.u16_be()?;
     for _ in 0..count {
-        *pos = pos.checked_add(6)?;
-        if *pos > bytes.len() {
-            return None;
-        }
-        let attrs = read_u16(bytes, pos)?;
-        for _ in 0..attrs {
-            *pos = pos.checked_add(2)?;
-            let len = read_u32(bytes, pos)? as usize;
-            *pos = pos.checked_add(len)?;
-            if *pos > bytes.len() {
-                return None;
-            }
-        }
+        r.skip(6)?;
+        skip_attributes(r)?;
     }
     Some(())
 }
 
-fn parse_constant_pool(bytes: &[u8], pos: &mut usize, count: usize) -> Option<ConstantPool> {
+/// Step over `attributes_count u2; attributes[]`, each attribute a
+/// `name_index u2; length u4; info[length]`.
+fn skip_attributes(r: &mut Reader<'_>) -> Option<()> {
+    let count = r.u16_be()?;
+    for _ in 0..count {
+        r.skip(2)?;
+        let len = r.u32_be()? as usize;
+        r.skip(len)?;
+    }
+    Some(())
+}
+
+fn parse_constant_pool(r: &mut Reader<'_>, count: usize) -> Option<ConstantPool> {
     let mut cp = ConstantPool::default();
     let mut i = 1usize;
     while i < count {
-        let tag = *bytes.get(*pos)?;
-        *pos += 1;
+        let tag = r.u8()?;
         match tag {
             CP_UTF8 => {
-                let len = read_u16(bytes, pos)? as usize;
-                let end = pos.checked_add(len)?;
-                if end > bytes.len() {
-                    return None;
-                }
-                let s = String::from_utf8_lossy(&bytes[*pos..end]).into_owned();
+                let len = r.u16_be()? as usize;
+                let offset = r.pos();
+                let s = String::from_utf8_lossy(r.bytes(len)?).into_owned();
                 cp.utf8.insert(i as u16, s);
-                cp.utf8_offset.insert(i as u16, *pos as u64);
-                *pos = end;
+                cp.utf8_offset.insert(i as u16, offset as u64);
             }
             CP_CLASS => {
-                let idx = read_u16(bytes, pos)?;
+                let idx = r.u16_be()?;
                 cp.class.insert(i as u16, idx);
             }
             CP_STRING | CP_METHOD_TYPE | CP_MODULE | CP_PACKAGE => {
-                *pos = pos.checked_add(2)?;
+                r.skip(2)?;
             }
             CP_LONG | CP_DOUBLE => {
-                *pos = pos.checked_add(8)?;
+                r.skip(8)?;
                 i += 1; // longs/doubles take two CP slots
             }
             CP_FIELDREF | CP_METHODREF | CP_INTERFACE_METHODREF => {
@@ -559,38 +549,26 @@ fn parse_constant_pool(bytes: &[u8], pos: &mut usize, count: usize) -> Option<Co
                 // big-endian. Captured so we can resolve method
                 // references to (owning_class, name, descriptor)
                 // triples later.
-                let class_idx = read_u16(bytes, pos)?;
-                let nat_idx = read_u16(bytes, pos)?;
+                let class_idx = r.u16_be()?;
+                let nat_idx = r.u16_be()?;
                 cp.methodref.insert(i as u16, (class_idx, nat_idx));
             }
             CP_NAME_AND_TYPE => {
-                let name_idx = read_u16(bytes, pos)?;
-                let desc_idx = read_u16(bytes, pos)?;
+                let name_idx = r.u16_be()?;
+                let desc_idx = r.u16_be()?;
                 cp.name_and_type.insert(i as u16, (name_idx, desc_idx));
             }
             CP_INTEGER | CP_FLOAT | CP_DYNAMIC | CP_INVOKE_DYNAMIC => {
-                *pos = pos.checked_add(4)?;
+                r.skip(4)?;
             }
             CP_METHOD_HANDLE => {
-                *pos = pos.checked_add(3)?;
+                r.skip(3)?;
             }
             _ => return None,
         }
         i += 1;
     }
     Some(cp)
-}
-
-fn read_u16(bytes: &[u8], pos: &mut usize) -> Option<u16> {
-    let b = bytes.get(*pos..*pos + 2)?.try_into().ok()?;
-    *pos += 2;
-    Some(u16::from_be_bytes(b))
-}
-
-fn read_u32(bytes: &[u8], pos: &mut usize) -> Option<u32> {
-    let b = bytes.get(*pos..*pos + 4)?.try_into().ok()?;
-    *pos += 4;
-    Some(u32::from_be_bytes(b))
 }
 
 #[cfg(test)]
@@ -935,6 +913,24 @@ mod tests {
         // class-level attributes_count = 0
         out.extend_from_slice(&0u16.to_be_bytes());
         out
+    }
+
+    #[test]
+    fn imports_come_out_in_constant_pool_order() {
+        // The pool was walked through HashMaps, so import order changed from
+        // one parse to the next.
+        let bytes = build_class_with_methodref_and_method();
+        let imports = |symbols: &crate::Symbols| -> Vec<String> {
+            symbols
+                .iter_kind(crate::SymbolKind::Import)
+                .filter_map(|s| s.name().map(str::to_string))
+                .collect()
+        };
+        let first = imports(&run_full(&bytes).2);
+        assert!(first.len() > 1, "{first:?}");
+        for _ in 0..20 {
+            assert_eq!(imports(&run_full(&bytes).2), first);
+        }
     }
 
     #[test]

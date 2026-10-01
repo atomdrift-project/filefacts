@@ -37,7 +37,7 @@ pub(super) fn extract(
     extract_binary_strings(bytes, strings, XorScan::No);
 
     let mut coverage = Coverage::new("jpeg", 2);
-    if bytes.len() < 2 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+    if !bytes.starts_with(&[0xFF, 0xD8]) {
         carrier::emit(bytes, &Coverage::unrecognized(), values, metrics);
         return Ok(());
     }
@@ -47,17 +47,20 @@ pub(super) fn extract(
     let mut pos = 2usize;
     let mut eoi_pos: Option<usize> = None;
 
+    // The two bytes at `pos`, when both are present: a segment length, or
+    // the pair the entropy-coded scan is searched through.
+    let pair = |pos: usize| bytes.get(pos..).and_then(<[u8]>::first_chunk::<2>);
+
     loop {
-        while pos < bytes.len() && bytes[pos] != 0xFF {
+        while bytes.get(pos).is_some_and(|&b| b != 0xFF) {
             pos += 1;
         }
-        while pos < bytes.len() && bytes[pos] == 0xFF {
+        while bytes.get(pos) == Some(&0xFF) {
             pos += 1;
         }
-        if pos >= bytes.len() {
+        let Some(&marker) = bytes.get(pos) else {
             break;
-        }
-        let marker = bytes[pos];
+        };
         // The segment starts at its 0xFF prefix, one byte before the marker.
         let seg_start = pos.saturating_sub(1);
         pos += 1;
@@ -71,32 +74,30 @@ pub(super) fn extract(
             }
             0xD0..=0xD7 | 0x01 => continue,
             0xDA => {
-                if pos + 1 >= bytes.len() {
+                let Some(&len) = pair(pos) else {
                     break;
-                }
-                let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
-                pos += seg_len;
-                while pos + 1 < bytes.len() {
-                    if bytes[pos] == 0xFF && bytes[pos + 1] != 0x00 && bytes[pos + 1] != 0xFF {
+                };
+                pos += usize::from(u16::from_be_bytes(len));
+                while let Some(&[b0, b1]) = pair(pos) {
+                    if b0 == 0xFF && b1 != 0x00 && b1 != 0xFF {
                         break;
                     }
                     pos += 1;
                 }
             }
             _ => {
-                if pos + 1 >= bytes.len() {
+                let Some(&len) = pair(pos) else {
                     break;
-                }
-                let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+                };
+                let seg_len = usize::from(u16::from_be_bytes(len));
                 if seg_len < 2 {
                     break;
                 }
                 let body_start = pos + 2;
                 let body_end = pos + seg_len;
-                if body_end > bytes.len() {
+                let Some(body) = bytes.get(body_start..body_end) else {
                     break;
-                }
-                let body = &bytes[body_start..body_end];
+                };
 
                 let payload_len = seg_len - 2;
                 match marker {
@@ -316,19 +317,18 @@ fn handle_segment(marker: u8, body: &[u8], st: &mut JpegState) {
                 }
             }
         }
+        // Bytes 12 and 13 are the thumbnail width and height.
         0xE0 if body.starts_with(b"JFIF\0")
-            && body.len() >= 14
-            && body[12] != 0
-            && body[13] != 0 =>
+            && matches!(body.get(12..14), Some(&[w, h]) if w != 0 && h != 0) =>
         {
             if !st.features.contains(&"jfif_thumbnail") {
                 st.features.push("jfif_thumbnail");
             }
         }
         0xE1 => {
-            if body.starts_with(b"Exif\0\0") {
+            if let Some(tiff) = body.strip_prefix(b"Exif\0\0") {
                 st.exif_present = true;
-                parse_exif_app1(&body[6..], st);
+                parse_exif_app1(tiff, st);
             } else if body
                 .windows(b"http://ns.adobe.com/xap/1.0/".len())
                 .any(|w| w == b"http://ns.adobe.com/xap/1.0/")
@@ -351,8 +351,11 @@ fn handle_segment(marker: u8, body: &[u8], st: &mut JpegState) {
                 st.features.push("iptc");
             }
         }
-        0xEE if body.starts_with(b"Adobe\0") && body.len() >= 12 => {
-            st.adobe_color_transform = Some(body[11]);
+        // A short APP14 records nothing, exactly as the catch-all arm would.
+        0xEE if body.starts_with(b"Adobe\0") => {
+            if let Some(&transform) = body.get(11) {
+                st.adobe_color_transform = Some(transform);
+            }
         }
         _ => {}
     }
@@ -363,33 +366,33 @@ fn handle_segment(marker: u8, body: &[u8], st: &mut JpegState) {
 /// GPS-IFD sub-pointers — that covers Make/Model/Software/
 /// DateTime/Artist/Copyright/DateTimeOriginal/MakerNote.
 fn parse_exif_app1(tiff: &[u8], st: &mut JpegState) {
-    if tiff.len() < 8 {
+    let Some(&[o0, o1, m0, m1, i0, i1, i2, i3]) = tiff.first_chunk::<8>() else {
         return;
-    }
-    let little = match &tiff[..2] {
-        b"II" => true,
-        b"MM" => false,
+    };
+    let little = match [o0, o1] {
+        [b'I', b'I'] => true,
+        [b'M', b'M'] => false,
         _ => return,
     };
     let magic = if little {
-        u16::from_le_bytes([tiff[2], tiff[3]])
+        u16::from_le_bytes([m0, m1])
     } else {
-        u16::from_be_bytes([tiff[2], tiff[3]])
+        u16::from_be_bytes([m0, m1])
     };
     if magic != 0x002A {
         return;
     }
     let ifd0_off = if little {
-        u32::from_le_bytes(tiff[4..8].try_into().unwrap_or([0; 4]))
+        u32::from_le_bytes([i0, i1, i2, i3])
     } else {
-        u32::from_be_bytes(tiff[4..8].try_into().unwrap_or([0; 4]))
+        u32::from_be_bytes([i0, i1, i2, i3])
     } as usize;
     walk_ifd(tiff, ifd0_off, little, st, true);
 }
 
 fn walk_ifd(tiff: &[u8], off: usize, little: bool, st: &mut JpegState, is_root: bool) {
     let read_u16 = |o: usize| -> Option<u16> {
-        let b = tiff.get(o..o + 2)?.try_into().ok()?;
+        let b = *tiff.get(o..)?.first_chunk()?;
         Some(if little {
             u16::from_le_bytes(b)
         } else {
@@ -397,7 +400,7 @@ fn walk_ifd(tiff: &[u8], off: usize, little: bool, st: &mut JpegState, is_root: 
         })
     };
     let read_u32 = |o: usize| -> Option<u32> {
-        let b = tiff.get(o..o + 4)?.try_into().ok()?;
+        let b = *tiff.get(o..)?.first_chunk()?;
         Some(if little {
             u32::from_le_bytes(b)
         } else {
@@ -411,7 +414,11 @@ fn walk_ifd(tiff: &[u8], off: usize, little: bool, st: &mut JpegState, is_root: 
     let mut exif_ifd_off: Option<usize> = None;
     let mut gps_present = false;
     for i in 0..count {
-        let entry_off = off + 2 + i * 12;
+        // `off` is file-controlled; an entry past the address space is past
+        // the end of the block, like any other unreadable entry.
+        let Some(entry_off) = off.checked_add(2 + i * 12) else {
+            return;
+        };
         let Some(tag) = read_u16(entry_off) else {
             return;
         };
@@ -434,7 +441,8 @@ fn walk_ifd(tiff: &[u8], off: usize, little: bool, st: &mut JpegState, is_root: 
         let data_slice: Option<&[u8]> = if total_bytes <= 4 {
             tiff.get(value_off_field..value_off_field + total_bytes.min(4))
         } else if let Some(abs) = read_u32(value_off_field).map(|v| v as usize) {
-            tiff.get(abs..abs + total_bytes)
+            abs.checked_add(total_bytes)
+                .and_then(|end| tiff.get(abs..end))
         } else {
             None
         };

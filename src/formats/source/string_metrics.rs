@@ -223,11 +223,10 @@ fn is_hex_string(s: &str) -> bool {
     if s.len() < 8 || !s.len().is_multiple_of(2) {
         return false;
     }
-    let check = if s.starts_with("0x") || s.starts_with("0X") {
-        &s[2..]
-    } else {
-        s
-    };
+    let check = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     check.chars().all(|c| c.is_ascii_hexdigit())
 }
 
@@ -237,10 +236,9 @@ fn has_url_encoding(s: &str) -> bool {
     let mut count = 0;
     let mut i = 0;
     while i < len {
-        if bytes[i] == b'%'
-            && i + 2 < len
-            && bytes[i + 1].is_ascii_hexdigit()
-            && bytes[i + 2].is_ascii_hexdigit()
+        if let Some([b'%', high, low]) = bytes.get(i..i + 3)
+            && high.is_ascii_hexdigit()
+            && low.is_ascii_hexdigit()
         {
             count += 1;
             i += 3;
@@ -258,8 +256,8 @@ fn has_unicode_heavy(s: &str) -> bool {
     let b = s.as_bytes();
     let mut count = 0usize;
     let mut i = 0;
-    while i + 1 < b.len() {
-        match (b[i], b[i + 1]) {
+    while let Some(&[first, second]) = b.get(i..i + 2) {
+        match (first, second) {
             (b'\\', b'u' | b'x') => {
                 count += 1;
                 i += 2;
@@ -292,11 +290,10 @@ fn is_file_path(s: &str) -> bool {
     if s.starts_with('/') && s.len() > 1 && !s.starts_with("//") {
         return s.as_bytes().contains(&b'/');
     }
-    if s.len() >= 3 {
-        let b = s.as_bytes();
-        if b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') {
-            return true;
-        }
+    if let [drive, b':', b'\\' | b'/', ..] = s.as_bytes()
+        && drive.is_ascii_alphabetic()
+    {
+        return true;
     }
     s.starts_with("./")
         || s.starts_with("../")
@@ -329,11 +326,9 @@ fn is_email(s: &str) -> bool {
         return false;
     }
     let parts: Vec<&str> = s.split('@').collect();
-    if parts.len() != 2 {
+    let [local, domain] = parts.as_slice() else {
         return false;
-    }
-    let local = parts[0];
-    let domain = parts[1];
+    };
     !local.is_empty()
         && !domain.is_empty()
         && domain.contains('.')

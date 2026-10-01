@@ -55,18 +55,11 @@ fn string_opts_for(xor: XorScan, bytes: &[u8]) -> stng::ExtractOptions {
     }
 }
 
-/// Adopt stng's shared string rows as the `text` tier. stng owns the
-/// allocation (via its string cache); filefacts holds the `Arc` so the rows are
-/// never copied here, and downstream consumers borrow the same allocation. The
-/// ASCII / UTF-16 split is a view over these rows, derived from each row's
-/// `StringMethod`, rather than two separate buffers.
-fn push_stng_strings(
-    extracted: std::sync::Arc<[stng::ExtractedString]>,
-    text_key: Option<String>,
-    strings: &mut Strings,
-) {
-    strings.text = Text::from_rows(extracted);
-    strings.text_key = text_key;
+/// Adopt stng's rows as the `text` tier. The ASCII / UTF-16 split is a view
+/// over these rows, derived from each row's `StringMethod`, rather than two
+/// separate buffers.
+fn push_stng_strings(extracted: Vec<stng::ExtractedString>, strings: &mut Strings) {
+    strings.text = Text::from_rows(extracted.into());
 }
 
 /// Return the payload of a malformed UTF-16 wrapper.
@@ -84,7 +77,7 @@ fn malformed_utf16_bom_payload(bytes: &[u8]) -> Option<&[u8]> {
         .iter()
         .rposition(|&byte| byte != 0)
         .map_or(0, |i| i + 1);
-    let text = &payload[..text_end];
+    let text = payload.get(..text_end).unwrap_or_default();
     (!text.contains(&0) && std::str::from_utf8(text).is_ok()).then_some(payload)
 }
 
@@ -97,15 +90,11 @@ fn extract_malformed_utf16_bom_text_strings(
         return false;
     };
     let opts = string_opts_for(xor, payload);
-    let mut rows = stng::cached_strings_with_options(payload, &opts).to_vec();
+    let mut rows = stng::extract_strings_with_options(payload, &opts);
     for row in &mut rows {
         row.data_offset = row.data_offset.saturating_add(2);
     }
-    push_stng_strings(
-        std::sync::Arc::from(rows),
-        stng::cache_key_for(payload, &opts),
-        strings,
-    );
+    push_stng_strings(rows, strings);
     true
 }
 
@@ -115,11 +104,7 @@ fn extract_malformed_utf16_bom_text_strings(
 /// already-parsed object.
 pub(super) fn extract_binary_strings(bytes: &[u8], strings: &mut Strings, xor: XorScan) {
     let opts = string_opts_for(xor, bytes);
-    push_stng_strings(
-        stng::cached_strings_with_options(bytes, &opts),
-        stng::cache_key_for(bytes, &opts),
-        strings,
-    );
+    push_stng_strings(stng::extract_strings_with_options(bytes, &opts), strings);
 }
 
 /// Add the strings of a buffer the file does not literally contain.
@@ -127,22 +112,12 @@ pub(super) fn extract_binary_strings(bytes: &[u8], strings: &mut Strings, xor: X
 /// [`extract_binary_strings`] *replaces* `strings.text`, because for every
 /// ordinary format there is one buffer and one extraction. A carrier that
 /// hides text behind an encoding has two: its own bytes, and what decodes out
-/// of them. This appends the second set rather than substituting it, and drops
-/// the text cache key, because the rows no longer describe the raw bytes that
-/// key was computed from.
+/// of them. This appends the second set rather than substituting it.
 pub(super) fn append_decoded_strings(bytes: &[u8], strings: &mut Strings, xor: XorScan) {
     let opts = string_opts_for(xor, bytes);
-    let extracted = stng::cached_strings_with_options(bytes, &opts);
-    if extracted.is_empty() {
-        return;
-    }
-    strings.text.append_rows(&extracted);
-    // Record the key rather than clearing `text_key`. Clearing it reads as
-    // "no text tier ran", and the disk cache honours that literally: it drops
-    // the rows and rehydrates nothing, so the second scan of the same file
-    // sees no strings at all -- including the ones the file does contain.
-    if let Some(key) = stng::cache_key_for(bytes, &opts) {
-        strings.extra_text_keys.push(key);
+    let extracted = stng::extract_strings_with_options(bytes, &opts);
+    if !extracted.is_empty() {
+        strings.text.append_rows(&extracted);
     }
 }
 
@@ -158,8 +133,7 @@ pub(super) fn extract_binary_strings_from_object(
 ) {
     let opts = string_opts_for(xor, bytes);
     push_stng_strings(
-        stng::cached_strings_from_object(object, bytes, &opts),
-        stng::cache_key_for(bytes, &opts),
+        stng::extract_strings_from_object(object, bytes, &opts),
         strings,
     );
 }
@@ -200,11 +174,7 @@ pub(super) fn extract_text_strings(bytes: &[u8], strings: &mut Strings, xor: Xor
         return;
     }
     let opts = string_opts_for(xor, bytes);
-    push_stng_strings(
-        stng::cached_strings_with_options(bytes, &opts),
-        stng::cache_key_for(bytes, &opts),
-        strings,
-    );
+    push_stng_strings(stng::extract_strings_with_options(bytes, &opts), strings);
 }
 
 /// Convenience wrapper for emitting a string-typed value into `values`.
@@ -576,49 +546,19 @@ pub(super) fn rizin_fallback_with_sections(
 /// Per-format extractors that need a non-`Option` return type can
 /// wrap the call in `.unwrap_or(0)` to keep their existing signature;
 /// the panic surface is gone either way.
-pub(super) mod bytes_at {
-    /// Read a little-endian `u16` at `off`.
-    #[inline]
-    pub(crate) fn u16_le(b: &[u8], off: usize) -> Option<u16> {
-        b.get(off..off.checked_add(2)?)
-            .and_then(|s| s.try_into().ok())
-            .map(u16::from_le_bytes)
-    }
-
-    /// Read a little-endian `u32` at `off`.
-    #[inline]
-    pub(crate) fn u32_le(b: &[u8], off: usize) -> Option<u32> {
-        b.get(off..off.checked_add(4)?)
-            .and_then(|s| s.try_into().ok())
-            .map(u32::from_le_bytes)
-    }
-
-    /// Read a big-endian `u32` at `off`.
-    #[inline]
-    pub(crate) fn u32_be(b: &[u8], off: usize) -> Option<u32> {
-        b.get(off..off.checked_add(4)?)
-            .and_then(|s| s.try_into().ok())
-            .map(u32::from_be_bytes)
-    }
-
-    /// Read a little-endian `u64` at `off`.
-    #[inline]
-    pub(crate) fn u64_le(b: &[u8], off: usize) -> Option<u64> {
-        b.get(off..off.checked_add(8)?)
-            .and_then(|s| s.try_into().ok())
-            .map(u64::from_le_bytes)
-    }
-}
+pub(super) use crate::bytes as bytes_at;
 
 /// Lowercase hex encoding of arbitrary bytes. Used wherever a hash
 /// digest or serial number needs a stable, comparable representation.
 pub(super) fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
+    // Nibbles are always below the radix, so no digit is dropped.
+    out.extend(
+        bytes
+            .iter()
+            .flat_map(|&b| [b >> 4, b & 0x0f])
+            .filter_map(|nibble| char::from_digit(u32::from(nibble), 16)),
+    );
     out
 }
 

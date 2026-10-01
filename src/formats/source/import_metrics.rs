@@ -10,10 +10,11 @@ use std::collections::HashSet;
 
 use crate::output::Metrics;
 
-/// Emit `imports.*` metrics. `language` is the canonical name from
-/// [`super::langs::LangConfig::name`] — `"python"`, `"javascript"`,
-/// `"go"`, etc.
-pub(super) fn emit(imports: &[&str], language: &str, metrics: &mut Metrics) {
+use super::langs::Lang;
+
+/// Emit `imports.*` metrics. `language` selects the standard-library table
+/// for the stdlib/third-party split.
+pub(super) fn emit(imports: &[&str], language: Lang, metrics: &mut Metrics) {
     if imports.is_empty() {
         return;
     }
@@ -100,11 +101,13 @@ pub(super) fn emit(imports: &[&str], language: &str, metrics: &mut Metrics) {
     }
 }
 
-fn is_stdlib_module(module: &str, language: &str) -> bool {
+/// Languages without a standard-library table count every import as
+/// third-party.
+fn is_stdlib_module(module: &str, language: Lang) -> bool {
     match language {
-        "python" => is_python_stdlib(module),
-        "javascript" | "typescript" => is_node_stdlib(module),
-        "go" => is_go_stdlib(module),
+        Lang::Python => is_python_stdlib(module),
+        Lang::JavaScript | Lang::TypeScript => is_node_stdlib(module),
+        Lang::Go => is_go_stdlib(module),
         _ => false,
     }
 }

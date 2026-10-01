@@ -32,6 +32,7 @@ use std::io::{Cursor, Read};
 
 use serde_json::Value as JsonValue;
 
+use crate::bytes::{self, Reader};
 use crate::error::Error;
 use crate::formats::common::put_str;
 use crate::output::{Errors, Metrics, Stage, Values};
@@ -337,18 +338,7 @@ fn parse_summary_information(data: &[u8]) -> serde_json::Map<String, JsonValue> 
     let Some(section) = locate_first_section(data) else {
         return out;
     };
-    if section.len() < 8 {
-        return out;
-    }
-    let num_props = u32::from_le_bytes([section[4], section[5], section[6], section[7]]) as usize;
-    let num_props = num_props.min(MAX_PROPERTIES_PER_SECTION);
-    for i in 0..num_props {
-        let entry_off = 8 + i * 8;
-        if entry_off + 8 > section.len() {
-            break;
-        }
-        let pid = read_u32_le(section, entry_off);
-        let val_off = read_u32_le(section, entry_off + 4) as usize;
+    for (pid, val_off) in property_entries(section) {
         // PIDSI_* per MS-OLEPS §2.4.1. The mapping uses the same
         // canonical names as the OOXML core-properties schema so
         // traits don't have to special-case the format.
@@ -390,18 +380,7 @@ fn parse_document_summary_information(data: &[u8]) -> serde_json::Map<String, Js
     let Some(section) = locate_first_section(data) else {
         return out;
     };
-    if section.len() < 8 {
-        return out;
-    }
-    let num_props = u32::from_le_bytes([section[4], section[5], section[6], section[7]]) as usize;
-    let num_props = num_props.min(MAX_PROPERTIES_PER_SECTION);
-    for i in 0..num_props {
-        let entry_off = 8 + i * 8;
-        if entry_off + 8 > section.len() {
-            break;
-        }
-        let pid = read_u32_le(section, entry_off);
-        let val_off = read_u32_le(section, entry_off + 4) as usize;
+    for (pid, val_off) in property_entries(section) {
         // PIDDSI_* per MS-OLEPS §2.4.2. We only surface the fields
         // that have a matching OOXML core / app-properties slot.
         let key = match pid {
@@ -485,11 +464,15 @@ fn defined_names(data: &[u8]) -> Vec<String> {
             Some(&c) if body.len() > start && id == DEFINEDNAME => c as usize,
             _ => continue,
         };
-        let grbit = u16::from_le_bytes([body[0], body[1]]);
+        // `body.len() > start` above, so the header and the first name byte
+        // are present.
+        let grbit = bytes::u16_le(body, 0).unwrap_or(0);
         // A built-in name is stored as its index rather than its text, and is
         // always one character long.
         if grbit & BUILTIN != 0 && cch == 1 {
-            let idx = body[start];
+            let Some(&idx) = body.get(start) else {
+                continue;
+            };
             out.push(match BUILTIN_NAMES.get(idx as usize) {
                 Some(name) => (*name).to_string(),
                 None => format!("builtin_{idx}"),
@@ -498,7 +481,7 @@ fn defined_names(data: &[u8]) -> Vec<String> {
         }
         // Otherwise it is text: BIFF8 marks a wide string in the byte before
         // it, and the names that matter here are all ASCII either way.
-        let wide = biff8 && body[FIXED] & 1 != 0;
+        let wide = biff8 && body.get(FIXED).is_some_and(|b| b & 1 != 0);
         let step = if wide { 2 } else { 1 };
         let name: String = (0..cch)
             .filter_map(|i| body.get(start + i * step).map(|&b| b as char))
@@ -514,7 +497,10 @@ fn defined_names(data: &[u8]) -> Vec<String> {
 /// two-byte characters. Builders name sheets with random tokens, so the name
 /// is worth reading even though nothing else here needs it.
 fn sheet_name(rest: &[u8], biff8: bool) -> String {
-    let cch = rest[0] as usize;
+    let Some(&cch) = rest.first() else {
+        return String::new();
+    };
+    let cch = cch as usize;
     let (start, step) = match biff8 {
         true if rest.get(1).is_some_and(|f| f & 1 != 0) => (2, 2),
         true => (2, 1),
@@ -543,10 +529,7 @@ fn biff_encrypted(data: &[u8]) -> bool {
 /// The BIFF version from the leading `BOF` record: `0x0500` for BIFF5,
 /// `0x0600` for BIFF8. Record layouts differ between them.
 fn biff_version(data: &[u8]) -> u16 {
-    match data.get(4..6) {
-        Some(v) => u16::from_le_bytes([v[0], v[1]]),
-        None => 0,
-    }
+    bytes::u16_le(data, 4).unwrap_or(0)
 }
 
 /// Walk a BIFF stream, yielding each record's id and payload.
@@ -555,23 +538,17 @@ fn biff_version(data: &[u8]) -> u16 {
 /// it would produce records out of arbitrary bytes.
 fn biff_records(data: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
     const BOF: u16 = 0x0809;
-    let biff = data.len() >= 4 && u16::from_le_bytes([data[0], data[1]]) == BOF;
+    let biff = data.len() >= 4 && bytes::u16_le(data, 0) == Some(BOF);
     let mut pos = 0usize;
     std::iter::from_fn(move || {
         if !biff {
             return None;
         }
-        if pos + 4 > data.len() {
-            return None;
-        }
-        let id = u16::from_le_bytes([data[pos], data[pos + 1]]);
-        let len = u16::from_le_bytes([data[pos + 2], data[pos + 3]]) as usize;
-        let body = pos + 4;
-        if body + len > data.len() {
-            return None;
-        }
-        pos = body + len;
-        Some((id, &data[body..body + len]))
+        let id = bytes::u16_le(data, pos)?;
+        let len = bytes::u16_le(data, pos + 2)? as usize;
+        let body = data.get(pos + 4..pos + 4 + len)?;
+        pos += 4 + len;
+        Some((id, body))
     })
 }
 
@@ -581,14 +558,17 @@ fn boundsheets(data: &[u8]) -> Vec<BoundSheet> {
     let mut out = Vec::new();
     for (id, body) in biff_records(data) {
         // lbPlyPos(4) + grbit(2) + cch(1) is the shortest useful BOUNDSHEET.
-        if id == BOUNDSHEET && body.len() >= 7 {
-            let grbit = u16::from_le_bytes([body[4], body[5]]);
-            out.push(BoundSheet {
-                kind: (grbit >> 8) as u8,
-                visibility: (grbit & 0xFF) as u8,
-                name: sheet_name(&body[6..], biff8),
-            });
+        if id != BOUNDSHEET || body.len() < 7 {
+            continue;
         }
+        let (Some(grbit), Some(rest)) = (bytes::u16_le(body, 4), body.get(6..)) else {
+            continue;
+        };
+        out.push(BoundSheet {
+            kind: (grbit >> 8) as u8,
+            visibility: (grbit & 0xFF) as u8,
+            name: sheet_name(rest, biff8),
+        });
     }
     out
 }
@@ -726,8 +706,9 @@ fn msg_attachment_properties<T: Read + std::io::Seek>(
         .as_chunks::<ENTRY>()
         .0
     {
-        let tag = read_u32_le(entry, 0);
-        let value = read_u32_le(entry, 8);
+        let (Some(tag), Some(value)) = (bytes::u32_le(entry, 0), bytes::u32_le(entry, 8)) else {
+            continue;
+        };
         match tag {
             PID_TAG_ATTACH_METHOD => props.method = Some(value),
             PID_TAG_ATTACHMENT_HIDDEN => props.hidden = value & 0xFF != 0,
@@ -826,27 +807,21 @@ fn summary_document_security_encrypted(data: &[u8]) -> bool {
 }
 
 fn property_i32_by_pid(section: &[u8], wanted_pid: u32) -> Option<i32> {
-    if section.len() < 8 {
+    let (_, val_off) = property_entries(section).find(|&(pid, _)| pid == wanted_pid)?;
+    let Some(JsonValue::Number(value)) = read_property_i32(section, val_off) else {
         return None;
-    }
-    let num_props = u32::from_le_bytes([section[4], section[5], section[6], section[7]]) as usize;
-    let num_props = num_props.min(MAX_PROPERTIES_PER_SECTION);
-    for i in 0..num_props {
-        let entry_off = 8 + i * 8;
-        if entry_off + 8 > section.len() {
-            break;
-        }
-        let pid = read_u32_le(section, entry_off);
-        if pid != wanted_pid {
-            continue;
-        }
-        let val_off = read_u32_le(section, entry_off + 4) as usize;
-        let Some(JsonValue::Number(value)) = read_property_i32(section, val_off) else {
-            return None;
-        };
-        return value.as_i64().and_then(|v| i32::try_from(v).ok());
-    }
-    None
+    };
+    value.as_i64().and_then(|v| i32::try_from(v).ok())
+}
+
+/// The `(PID, value offset)` pairs of a property-set section, which follow
+/// its size and property-count words. At most [`MAX_PROPERTIES_PER_SECTION`]
+/// are read, and the walk stops at the first pair that runs past the section.
+fn property_entries(section: &[u8]) -> impl Iterator<Item = (u32, usize)> {
+    let count =
+        bytes::u32_le(section, 4).map_or(0, |n| (n as usize).min(MAX_PROPERTIES_PER_SECTION));
+    let mut entries = Reader::at(section, 8);
+    (0..count).map_while(move |_| Some((entries.u32_le()?, entries.u32_le()? as usize)))
 }
 
 fn word_document_encrypted<T: Read + std::io::Seek>(
@@ -856,10 +831,9 @@ fn word_document_encrypted<T: Read + std::io::Seek>(
     let Some(data) = read_stream_data(comp, "WordDocument", errors) else {
         return false;
     };
-    if data.len() < 12 {
+    let Some(flags) = bytes::u16_le(&data, 10) else {
         return false;
-    }
-    let flags = u16::from_le_bytes([data[10], data[11]]);
+    };
     flags & 0x0100 != 0
 }
 
@@ -869,20 +843,10 @@ fn word_document_encrypted<T: Read + std::io::Seek>(
 /// (strings + filetime); DSI counts like `slide_count` need integer
 /// decoding.
 fn read_property_i32(section: &[u8], offset: usize) -> Option<JsonValue> {
-    if offset + 8 > section.len() {
-        return None;
-    }
-    let vt = read_u32_le(section, offset);
-    if vt != 0x0003 {
-        return None;
-    }
-    let v = i32::from_le_bytes([
-        section[offset + 4],
-        section[offset + 5],
-        section[offset + 6],
-        section[offset + 7],
-    ]);
-    Some(JsonValue::Number(v.into()))
+    let mut property = Reader::at(section, offset);
+    let vt = property.u32_le()?;
+    let v = property.u32_le()? as i32;
+    (vt == 0x0003).then(|| JsonValue::Number(v.into()))
 }
 
 /// Locate the first section's byte slice within a property-set
@@ -896,19 +860,17 @@ fn locate_first_section(data: &[u8]) -> Option<&[u8]> {
     if data.len() < 48 {
         return None;
     }
-    let bom = u16::from_le_bytes([data[0], data[1]]);
-    if bom != 0xFFFE {
+    if bytes::u16_le(data, 0) != Some(0xFFFE) {
         return None;
     }
-    let num_sections = read_u32_le(data, 24) as usize;
-    if num_sections == 0 {
+    if bytes::u32_le(data, 24)? == 0 {
         return None;
     }
-    let section_off = read_u32_le(data, 44) as usize;
+    let section_off = bytes::u32_le(data, 44)? as usize;
     if section_off >= data.len() {
         return None;
     }
-    Some(&data[section_off..])
+    data.get(section_off..)
 }
 
 /// Read a property value at `(section + offset)` and decode it into
@@ -916,10 +878,7 @@ fn locate_first_section(data: &[u8]) -> Option<&[u8]> {
 /// (thumbnails, BLOBs, integer counts that aren't part of the
 /// `office.*` schema).
 fn read_property(section: &[u8], offset: usize) -> Option<JsonValue> {
-    if offset + 4 > section.len() {
-        return None;
-    }
-    let vt = read_u32_le(section, offset);
+    let vt = bytes::u32_le(section, offset)?;
     let body = section.get(offset + 4..)?;
     match vt {
         // VT_LPSTR (0x001E): u32 length + ANSI/CP1252-ish bytes.
@@ -937,14 +896,11 @@ fn read_property(section: &[u8], offset: usize) -> Option<JsonValue> {
 }
 
 fn read_lpstr(body: &[u8]) -> Option<JsonValue> {
-    if body.len() < 4 {
+    let len = bytes::u32_le(body, 0)? as usize;
+    if len == 0 {
         return None;
     }
-    let len = read_u32_le(body, 0) as usize;
-    if len == 0 || 4 + len > body.len() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&body[4..4 + len])
+    let s = String::from_utf8_lossy(body.get(4..4 + len)?)
         .trim_end_matches('\0')
         .to_string();
     if s.is_empty() {
@@ -955,19 +911,18 @@ fn read_lpstr(body: &[u8]) -> Option<JsonValue> {
 }
 
 fn read_lpwstr(body: &[u8]) -> Option<JsonValue> {
-    if body.len() < 4 {
-        return None;
-    }
-    let chars = read_u32_le(body, 0) as usize;
+    let chars = bytes::u32_le(body, 0)? as usize;
     let byte_len = chars.checked_mul(2)?;
-    if chars == 0 || 4 + byte_len > body.len() {
+    if chars == 0 {
         return None;
     }
-    let mut units = Vec::with_capacity(chars);
-    for i in 0..chars {
-        let off = 4 + i * 2;
-        units.push(u16::from_le_bytes([body[off], body[off + 1]]));
-    }
+    let units: Vec<u16> = body
+        .get(4..4 + byte_len)?
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect();
     let s = String::from_utf16_lossy(&units)
         .trim_end_matches('\0')
         .to_string();
@@ -979,10 +934,7 @@ fn read_lpwstr(body: &[u8]) -> Option<JsonValue> {
 }
 
 fn read_filetime(body: &[u8]) -> Option<JsonValue> {
-    if body.len() < 8 {
-        return None;
-    }
-    let ticks = u64::from_le_bytes(body[..8].try_into().ok()?);
+    let ticks = bytes::u64_le(body, 0)?;
     if ticks == 0 {
         return None;
     }
@@ -1027,10 +979,6 @@ fn format_iso8601_utc(unix: u64) -> String {
     )
 }
 
-fn read_u32_le(buf: &[u8], off: usize) -> u32 {
-    crate::formats::common::bytes_at::u32_le(buf, off).unwrap_or(0)
-}
-
 /// Parsed CompObj stream contents.
 #[derive(Debug, Default)]
 struct CompObjData {
@@ -1059,7 +1007,7 @@ fn parse_compobj(data: &[u8]) -> Option<CompObjData> {
     let mut pos = HEADER_SIZE;
     let mut out = CompObjData::default();
 
-    if let Some((s, advance)) = read_length_prefixed_ansi(&data[pos..]) {
+    if let Some((s, advance)) = data.get(pos..).and_then(read_length_prefixed_ansi) {
         out.user_type = s;
         pos += advance;
     } else {
@@ -1072,29 +1020,30 @@ fn parse_compobj(data: &[u8]) -> Option<CompObjData> {
     // (length 6 looks like an ID). Prefer the string interpretation
     // when the declared length fits and the bytes are printable
     // ASCII; otherwise treat as a 4-byte registered ID.
-    if data.len() < pos + 4 {
+    let Some(marker) = bytes::u32_le(data, pos) else {
         return Some(out);
-    }
-    let marker = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+    };
     if marker == 0 {
         pos += 4;
     } else {
         let len = marker as usize;
         let str_start = pos + 4;
-        let fits = data.len() >= str_start + len && len > 0 && len <= 256;
-        let printable = fits
-            && data[str_start..str_start + len]
-                .iter()
-                .all(|b| b.is_ascii_graphic() || *b == b' ' || *b == 0);
-        if fits && printable {
-            out.clipboard_format = sanitize_ansi(&data[str_start..str_start + len]);
+        let text = data
+            .get(str_start..str_start + len)
+            .filter(|_| len > 0 && len <= 256)
+            .filter(|t| {
+                t.iter()
+                    .all(|b| b.is_ascii_graphic() || *b == b' ' || *b == 0)
+            });
+        if let Some(text) = text {
+            out.clipboard_format = sanitize_ansi(text);
             pos = str_start + len;
         } else {
             pos += 4;
         }
     }
 
-    if let Some((s, _)) = read_length_prefixed_ansi(&data[pos..]) {
+    if let Some((s, _)) = data.get(pos..).and_then(read_length_prefixed_ansi) {
         out.prog_id = s;
     }
 
@@ -1102,17 +1051,11 @@ fn parse_compobj(data: &[u8]) -> Option<CompObjData> {
 }
 
 fn read_length_prefixed_ansi(buf: &[u8]) -> Option<(String, usize)> {
-    if buf.len() < 4 {
-        return None;
-    }
-    let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let len = bytes::u32_le(buf, 0)? as usize;
     if len == 0 {
         return Some((String::new(), 4));
     }
-    if buf.len() < 4 + len {
-        return None;
-    }
-    Some((sanitize_ansi(&buf[4..4 + len]), 4 + len))
+    Some((sanitize_ansi(buf.get(4..4 + len)?), 4 + len))
 }
 
 fn sanitize_ansi(bytes: &[u8]) -> String {

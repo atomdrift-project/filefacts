@@ -4,7 +4,7 @@ const WINDOW: usize = 16 * 1024;
 
 pub(super) fn document_structure(data: &[u8]) -> bool {
     let data = super::strip_utf8_bom(data);
-    let head = &data[..data.len().min(WINDOW)];
+    let head = data.get(..WINDOW).unwrap_or(data);
     let lines: Vec<&[u8]> = head.split(|b| *b == b'\n').collect();
     let mut headings = 0;
     let mut directive = false;
@@ -19,29 +19,34 @@ pub(super) fn document_structure(data: &[u8]) -> bool {
             directive = true;
         }
         if line.ends_with(b"::") {
-            literal_block |= lines[index + 1..]
+            literal_block |= lines
+                .get(index + 1..)
+                .unwrap_or_default()
                 .iter()
                 .take(4)
                 .map(|next| next.strip_suffix(b"\r").unwrap_or(next))
                 .find(|next| !next.trim_ascii().is_empty())
                 .is_some_and(|next| next.first().is_some_and(u8::is_ascii_whitespace));
         }
-        if index == 0 || line.is_empty() || line.len() < 3 {
+        if line.len() < 3 {
             continue;
         }
-        let previous = lines[index - 1]
+        let Some(previous) = index.checked_sub(1).and_then(|i| lines.get(i)) else {
+            continue;
+        };
+        let previous = previous
             .strip_suffix(b"\r")
-            .unwrap_or(lines[index - 1])
+            .unwrap_or(previous)
             .trim_ascii();
         if previous.is_empty() || previous.len() > 120 || !previous.is_ascii() {
             continue;
         }
-        if line.iter().all(|b| *b == line[0])
-            && matches!(
-                line[0],
+        if line.first().is_some_and(|&rule| {
+            matches!(
+                rule,
                 b'=' | b'-' | b'~' | b'^' | b'"' | b'`' | b':' | b'#' | b'*' | b'+' | b'_'
-            )
-        {
+            ) && line.iter().all(|b| *b == rule)
+        }) {
             headings += 1;
         }
     }

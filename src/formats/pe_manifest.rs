@@ -221,8 +221,8 @@ fn attr_value_in_tag_with_offset(tag: &str, attr: &str) -> Option<(String, usize
         // Otherwise we'd accept `Id=` matching the tail of `someId=`.
         let preceded_by_boundary = idx == 0
             || matches!(
-                tag.as_bytes()[idx - 1],
-                b' ' | b'\t' | b'\r' | b'\n' | b'<' | b'/'
+                tag.as_bytes().get(idx - 1),
+                Some(b' ' | b'\t' | b'\r' | b'\n' | b'<' | b'/')
             );
         if !preceded_by_boundary {
             search_from = idx + pattern.len();

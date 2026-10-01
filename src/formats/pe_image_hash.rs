@@ -82,12 +82,14 @@ struct Regions {
 }
 
 impl Regions {
-    fn digest(&self, bytes: &[u8], alg: PeHashAlg) -> String {
+    /// `None` when a range falls outside `bytes`; `derive_regions` only
+    /// builds in-bounds ranges, so that means a caller passed other bytes.
+    fn digest(&self, bytes: &[u8], alg: PeHashAlg) -> Option<String> {
         let mut hasher = alg.hasher();
         for range in &self.ranges {
-            hasher.update(&bytes[range.clone()]);
+            hasher.update(bytes.get(range.clone())?);
         }
-        hex_encode(&hasher.finalize())
+        Some(hex_encode(&hasher.finalize()))
     }
 }
 
@@ -105,11 +107,10 @@ pub(super) fn extract(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &
         PeHashAlg::Sha384,
         PeHashAlg::Sha512,
     ] {
-        put_str(
-            values,
-            &format!("pe.image_hash.{}", alg.name()),
-            regions.digest(bytes, alg),
-        );
+        let Some(digest) = regions.digest(bytes, alg) else {
+            return;
+        };
+        put_str(values, &format!("pe.image_hash.{}", alg.name()), digest);
     }
     if regions.overlay_padding > 0 {
         metrics.insert(
@@ -205,7 +206,7 @@ fn derive_regions(pe: &PE<'_>, bytes: &[u8]) -> Option<Regions> {
         .unwrap_or(0);
     let file_size = bytes.len() as u64;
     let mut overlay_padding = 0_u64;
-    if file_size > sum_hashed + cert_table_size {
+    if file_size > sum_hashed.saturating_add(cert_table_size) {
         let extra_start = sum_hashed as usize;
         let extra_end = (file_size - cert_table_size) as usize;
         if extra_start < extra_end && extra_end <= bytes.len() {

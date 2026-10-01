@@ -26,11 +26,14 @@ use tar::Archive;
 use crate::error::Error;
 use crate::fileid::FileType;
 use crate::metric;
-use crate::output::{ArchiveMember, Metrics, Values};
+use crate::output::{ArchiveMember, Errors, Metrics, Stage, Values};
 
 /// Manifests larger than this are almost certainly hostile padding; we
 /// stop reading rather than buffer them.
 const MAX_MANIFEST: u64 = 1 << 20;
+
+/// Where npm puts the manifest inside the tarball.
+const MANIFEST: &str = "package/package.json";
 
 pub(super) fn extract(
     bytes: &[u8],
@@ -38,31 +41,61 @@ pub(super) fn extract(
     values: &mut Values,
     metrics: &mut Metrics,
     archive_members: &mut Vec<ArchiveMember>,
+    errors: &mut Errors,
 ) -> Result<(), Error> {
-    if let Some(manifest) = package_json(bytes) {
+    if let Some(manifest) = package_json(bytes, values, errors) {
         emit(&manifest, values, metrics);
     }
     super::tar::extract(bytes, file_type, values, metrics, archive_members)
 }
 
 /// Read and parse `package/package.json` from a gzipped npm tarball.
-/// Best-effort: any malformed step yields `None`.
-fn package_json(bytes: &[u8]) -> Option<JsonValue> {
+/// `None` when the tarball has none (silently), when it is over the size
+/// cap (an `npm.limits` entry), or when the tarball or manifest is
+/// unreadable or not JSON (an error).
+fn package_json(bytes: &[u8], values: &mut Values, errors: &mut Errors) -> Option<JsonValue> {
+    let raw = match read_manifest(bytes) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return None,
+        Err(why) => {
+            errors.record_malformed(Stage::TarParse, why);
+            return None;
+        }
+    };
+    if raw.len() as u64 > MAX_MANIFEST {
+        values.insert(
+            "npm.limits",
+            serde_json::json!([{
+                "stage": "manifest",
+                "reason": format!("{MANIFEST} over the {MAX_MANIFEST}-byte cap; not parsed"),
+            }]),
+        );
+        return None;
+    }
+    serde_json::from_slice(&raw)
+        .map_err(|e| errors.record_malformed(Stage::FormatExtract, format!("{MANIFEST}: {e}")))
+        .ok()
+}
+
+/// The manifest's bytes, read to one past the cap so an oversized one is
+/// recognisable; `Ok(None)` when the tarball holds none. Decompression stops
+/// at the manifest.
+fn read_manifest(bytes: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    let walk = |e: std::io::Error| format!("tarball unreadable before {MANIFEST}: {e}");
     let mut archive = Archive::new(GzDecoder::new(bytes));
-    for entry in archive.entries().ok()? {
-        let Ok(entry) = entry else { break };
-        let is_manifest = entry
-            .path()
-            .map(|p| p.to_string_lossy() == "package/package.json")
-            .unwrap_or(false);
-        if !is_manifest {
+    for entry in archive.entries().map_err(walk)? {
+        let entry = entry.map_err(walk)?;
+        if !entry.path().is_ok_and(|p| p.to_string_lossy() == MANIFEST) {
             continue;
         }
         let mut buf = Vec::new();
-        entry.take(MAX_MANIFEST).read_to_end(&mut buf).ok()?;
-        return serde_json::from_slice(&buf).ok();
+        entry
+            .take(MAX_MANIFEST + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("{MANIFEST}: {e}"))?;
+        return Ok(Some(buf));
     }
-    None
+    Ok(None)
 }
 
 /// Emit `npm.*` identity values from a parsed `package.json`, plus the
@@ -402,6 +435,88 @@ fn between(s: &str, open: char, close: char) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    /// A gzipped tar holding the given members.
+    fn tgz(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        for (path, body) in members {
+            let mut h = tar::Header::new_ustar();
+            h.set_path(path).unwrap();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            tar.append(&h, *body).unwrap();
+        }
+        let tar = tar.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&tar).unwrap();
+        gz.finish().unwrap()
+    }
+
+    fn run_tgz(bytes: &[u8]) -> (Values, Errors) {
+        let mut v = Values::new();
+        let mut e = Errors::new();
+        extract(
+            bytes,
+            FileType::Npm,
+            &mut v,
+            &mut Metrics::new(),
+            &mut Vec::new(),
+            &mut e,
+        )
+        .unwrap();
+        (v, e)
+    }
+
+    /// The one recorded error's stage and kind.
+    fn only_error(errors: &Errors) -> (Stage, crate::ErrorKind) {
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        (errors.as_slice()[0].stage, errors.as_slice()[0].kind)
+    }
+
+    #[test]
+    fn tarball_manifest_is_read_and_records_nothing() {
+        let (v, e) = run_tgz(&tgz(&[(MANIFEST, br#"{"name": "demo"}"#)]));
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v.get("npm.name").and_then(JsonValue::as_str), Some("demo"));
+        // A tarball without the manifest is not a failure.
+        let (_, e) = run_tgz(&tgz(&[("package/index.js", b"//")]));
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn manifest_that_is_not_json_records_one_error() {
+        let (v, e) = run_tgz(&tgz(&[(MANIFEST, b"{\"name\": ")]));
+        assert_eq!(
+            only_error(&e),
+            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+        );
+        assert!(v.get("npm.name").is_none());
+    }
+
+    #[test]
+    fn corrupt_gzip_stream_records_one_tar_parse_error() {
+        let mut bytes = tgz(&[(MANIFEST, br#"{"name": "demo"}"#)]);
+        for b in &mut bytes[10..] {
+            *b ^= 0x5a;
+        }
+        let (v, e) = run_tgz(&bytes);
+        assert_eq!(
+            only_error(&e),
+            (Stage::TarParse, crate::ErrorKind::Malformed)
+        );
+        assert!(v.get("npm.name").is_none());
+    }
+
+    #[test]
+    fn oversized_manifest_is_a_limit_not_an_error() {
+        let big = vec![b' '; MAX_MANIFEST as usize + 1];
+        let (v, e) = run_tgz(&tgz(&[(MANIFEST, &big)]));
+        assert!(e.is_empty(), "{e:?}");
+        let limits = v.get("npm.limits").and_then(JsonValue::as_array).unwrap();
+        assert_eq!(limits[0]["stage"], "manifest");
+    }
 
     #[test]
     fn emits_name_version_and_author_email() {

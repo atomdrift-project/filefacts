@@ -4,6 +4,7 @@
 //! Track assignments and local helper summaries, keeping HTTP authentication
 //! separate from request bodies. Unknown code is not assumed to be an HTTP
 //! client. Analysis limits are surfaced rather than reported as clean scans.
+use super::langs::Lang;
 use super::{MAX_FLOW_DEPTH, named_children};
 use crate::Values;
 use serde_json::json;
@@ -44,7 +45,7 @@ struct Summary {
 
 struct Analysis<'s> {
     source: &'s str,
-    language: &'s str,
+    language: Lang,
     aliases: HashMap<String, String>,
     /// Node ids of test-only code, which is never evaluated.
     excluded: HashSet<usize>,
@@ -91,7 +92,7 @@ fn test_only(root: Node<'_>, source: &str) -> HashSet<usize> {
     excluded
 }
 
-pub(super) fn emit(root: Node<'_>, source: &str, language: &str, values: &mut Values) {
+pub(super) fn emit(root: Node<'_>, source: &str, language: Lang, values: &mut Values) {
     emit_seeded(
         root,
         source,
@@ -105,14 +106,14 @@ pub(super) fn emit(root: Node<'_>, source: &str, language: &str, values: &mut Va
 fn emit_seeded(
     root: Node<'_>,
     source: &str,
-    language: &str,
+    language: Lang,
     values: &mut Values,
     seeds: &BTreeMap<String, Summary>,
     global_seeds: &HashMap<String, Bits>,
 ) -> (BTreeMap<String, Summary>, HashMap<String, Bits>) {
     if !matches!(
         language,
-        "rust" | "python" | "javascript" | "typescript" | "go"
+        Lang::Rust | Lang::Python | Lang::JavaScript | Lang::TypeScript | Lang::Go
     ) {
         return (BTreeMap::new(), HashMap::new());
     }
@@ -125,7 +126,7 @@ fn emit_seeded(
         language,
         aliases: HashMap::new(),
         // Test attributes are Rust syntax; no other grammar has them.
-        excluded: if language == "rust" {
+        excluded: if language == Lang::Rust {
             test_only(root, source)
         } else {
             HashSet::new()
@@ -134,14 +135,14 @@ fn emit_seeded(
         budget: LIMIT,
         truncated: false,
     };
-    if language == "rust" {
+    if language == Lang::Rust {
         super::rust_syntax::execution_facts(root, source, values);
     }
-    if language == "go" {
+    if language == Lang::Go {
         super::go_syntax::execution_facts(root, source, values);
         a.aliases = super::go_syntax::imports(root, source);
     }
-    if language == "rust" {
+    if language == Lang::Rust {
         for (import, _) in super::rust_syntax::imports(root, source) {
             let (name, local) = import
                 .split_once(" as ")
@@ -166,7 +167,7 @@ fn emit_seeded(
         }
         if function(node) {
             if let Some(name) = node.child_by_field_name("name") {
-                let key = if language == "go" && a.text(name) == "init" {
+                let key = if language == Lang::Go && a.text(name) == "init" {
                     format!("init@{}", node.start_byte())
                 } else {
                     a.text(name).to_string()
@@ -208,7 +209,7 @@ fn emit_seeded(
     for iteration in 0..8 {
         let before = a.summaries.clone();
         let mut globals = global_seeds.clone();
-        if language == "go" {
+        if language == Lang::Go {
             a.eval(root, &mut globals, &mut Summary::default(), 0);
         }
         for (name, node) in &functions {
@@ -245,7 +246,7 @@ fn emit_seeded(
             let mut summary = Summary::default();
             if let Some(body) = node.child_by_field_name("body") {
                 let tail = a.eval(body, &mut bindings, &mut summary, 0);
-                if language == "rust" {
+                if language == Lang::Rust {
                     summary.returns |= tail;
                 }
             }
@@ -270,7 +271,7 @@ fn emit_seeded(
     let mut globals = global_seeds.clone();
     a.eval(root, &mut globals, &mut top, 0);
     events.extend(events_for(&top, "<module>", 0));
-    if language == "go" {
+    if language == Lang::Go {
         let mut startup = top.clone();
         for name in functions.keys() {
             let Some(summary) = a.summaries.get(name) else {
@@ -294,7 +295,7 @@ fn emit_seeded(
     values.insert("source.payload_flow.truncated", json!(a.truncated));
     // Top-level facts include direct calls and calls to resolved local helpers,
     // but not merely exported/uninvoked functions or constant-false branches.
-    if matches!(language, "javascript" | "typescript") {
+    if language.is_ecmascript() {
         values.insert("source.execution.module_http", json!(top.http));
     }
     (
@@ -341,7 +342,7 @@ pub fn go_package_payload_flow(sources: &[(&str, &str)]) -> serde_json::Value {
             let (summaries, bindings) = emit_seeded(
                 tree.root_node(),
                 source,
-                "go",
+                Lang::Go,
                 &mut values,
                 &seeds,
                 &globals,
@@ -414,7 +415,7 @@ impl<'s> Analysis<'s> {
         }
     }
     fn python_imports(&mut self, node: Node<'_>) {
-        if self.language != "python" {
+        if self.language != Lang::Python {
             return;
         }
         let module = node
@@ -502,21 +503,26 @@ impl<'s> Analysis<'s> {
                     let literal = self.text(child);
                     let bytes = literal.as_bytes();
                     let mut index = 0;
-                    while index < bytes.len() {
-                        if bytes[index] == b'{' {
+                    while let Some(&byte) = bytes.get(index) {
+                        if byte == b'{' {
                             if bytes.get(index + 1) == Some(&b'{') {
                                 index += 2;
                                 continue;
                             }
                             let start = index + 1;
                             let mut end = start;
-                            while end < bytes.len()
-                                && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+                            while bytes
+                                .get(end)
+                                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
                             {
                                 end += 1;
                             }
                             if end > start && matches!(bytes.get(end), Some(b'}' | b':')) {
-                                bits |= bindings.get(&literal[start..end]).copied().unwrap_or(0);
+                                bits |= literal
+                                    .get(start..end)
+                                    .and_then(|name| bindings.get(name))
+                                    .copied()
+                                    .unwrap_or(0);
                             }
                         }
                         index += 1;
@@ -594,7 +600,7 @@ impl<'s> Analysis<'s> {
                 .or_else(|| node.child_by_field_name("left"))
                 .or_else(|| node.child_by_field_name("name"));
             if let (Some(target), Some(value)) = (target, value) {
-                if self.language == "go" && target.kind() == "selector_expression" {
+                if self.language == Lang::Go && target.kind() == "selector_expression" {
                     if target
                         .child_by_field_name("field")
                         .is_some_and(|n| self.text(n) == "Body")
@@ -637,7 +643,7 @@ impl<'s> Analysis<'s> {
         if matches!(node.kind(), "if_statement" | "if_expression") {
             let condition = node.child_by_field_name("condition");
             // Reachability is enforced only for the module-execution fact.
-            if matches!(self.language, "javascript" | "typescript")
+            if self.language.is_ecmascript()
                 && condition.is_some_and(|n| self.text(n).trim_matches(['(', ')', ' ']) == "false")
             {
                 return 0;
@@ -676,16 +682,16 @@ impl<'s> Analysis<'s> {
                 | "selector_expression"
         ) {
             let canonical = self.canonical(text);
-            if self.language == "go" && canonical == "net/http.DefaultClient" {
+            if self.language == Lang::Go && canonical == "net/http.DefaultClient" {
                 return CLIENT;
             }
             if canonical == "os.environ" || canonical == "process.env" {
-                if self.language == "javascript" || self.language == "typescript" {
+                if self.language.is_ecmascript() {
                     return ENV_OBJECT;
                 }
                 return ENV | SECRET;
             }
-            if matches!(self.language, "javascript" | "typescript") {
+            if self.language.is_ecmascript() {
                 let object = node
                     .child_by_field_name("object")
                     .or_else(|| node.child_by_field_name("value"));
@@ -727,7 +733,7 @@ impl<'s> Analysis<'s> {
                 return env_bits(text);
             }
         }
-        if self.language == "go" && node.kind() == "composite_literal" {
+        if self.language == Lang::Go && node.kind() == "composite_literal" {
             if node
                 .child_by_field_name("type")
                 .is_some_and(|n| self.canonical(self.text(n)) == "net/http.Client")
@@ -740,8 +746,10 @@ impl<'s> Analysis<'s> {
             "block" | "statement_block" | "source_file" | "module" | "program"
         ) {
             let mut tail = 0;
-            let scoped = matches!(self.language, "rust" | "javascript" | "typescript")
-                && matches!(node.kind(), "block" | "statement_block");
+            let scoped = matches!(
+                self.language,
+                Lang::Rust | Lang::JavaScript | Lang::TypeScript
+            ) && matches!(node.kind(), "block" | "statement_block");
             let before = if scoped {
                 bindings.clone()
             } else {
@@ -828,7 +836,7 @@ impl<'s> Analysis<'s> {
             .map(|&n| self.eval(n, bindings, out, depth + 1))
             .collect();
         let all = bits.iter().fold(0, |a, b| a | b);
-        if self.language == "go" {
+        if self.language == Lang::Go {
             if name == "os.Environ" {
                 return ENV | SECRET;
             }
@@ -971,14 +979,16 @@ impl<'s> Analysis<'s> {
                 "post" | "put" | "patch" | "request"
             )
         {
-            for (index, arg) in args.iter().enumerate() {
+            for (index, (arg, arg_bits)) in args.iter().zip(&bits).enumerate() {
                 if arg.kind() == "keyword_argument"
                     && arg
                         .child_by_field_name("name")
                         .is_some_and(|n| matches!(self.text(n), "data" | "json" | "files"))
-                    || self.language == "python" && index == 1 && arg.kind() != "keyword_argument"
+                    || self.language == Lang::Python
+                        && index == 1
+                        && arg.kind() != "keyword_argument"
                 {
-                    out.body |= bits[index];
+                    out.body |= arg_bits;
                 }
             }
         }
@@ -1057,7 +1067,7 @@ impl<'s> Analysis<'s> {
             out.reads |= substitute(summary.reads, &bits);
             return substitute(summary.returns, &bits);
         }
-        if request && self.language == "rust" {
+        if request && self.language == Lang::Rust {
             return REQUEST;
         }
         // An immediately invoked closure executes its body; an uncalled or

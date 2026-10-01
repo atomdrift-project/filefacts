@@ -63,6 +63,7 @@ use crate::formats::common::bytes_at::{u16_le, u32_be, u32_le};
 use crate::output::{ArchiveMember, ArchiveOffsets, ArchiveOwnership, Metrics, Values};
 use crate::scan::days_from_civil;
 
+use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_value};
 use super::udf;
 
 /// ISO 9660 logical sector. Fixed by the standard for optical media;
@@ -94,7 +95,62 @@ const MAX_BOOT_ENTRIES: usize = 64;
 /// Cap on symlink component bytes reassembled from an `SL` entry.
 const MAX_SYMLINK_LEN: usize = 4096;
 
+/// The shared aggregates over an image's members. Boot images and unclaimed
+/// regions are members under synthetic names, so they are counted but read
+/// as opaque; only regular files are files, and only their sizes are summed.
+const AGGS: &[Agg] = &[
+    Agg::MemberCount,
+    Agg::FileCount,
+    Agg::DirectoryCount,
+    Agg::UncompressedSize(Scope::Files),
+    Agg::EntryTypes,
+    Agg::ModeBits,
+    Agg::SymlinkCount,
+    Agg::SymlinkEscapes,
+    Agg::MaxFilenameLength,
+    Agg::HiddenFiles,
+    Agg::PathTraversal(Scope::All),
+    Agg::NameTricks,
+    Agg::Executables,
+    Agg::Scripts,
+    Agg::NestedArchives,
+    Agg::MisplacedExecutables,
+    Agg::NoiseFiles,
+    Agg::DuplicateMembers,
+    Agg::MtimeRange,
+];
+
 pub(super) fn extract(
+    bytes: &[u8],
+    values: &mut Values,
+    metrics: &mut Metrics,
+    archive_members: &mut Vec<ArchiveMember>,
+) -> Result<(), Error> {
+    let first = archive_members.len();
+    let result = walk_image(bytes, values, metrics, archive_members);
+    let members = archive_members.get(first..).unwrap_or_default();
+    let mut stats = ArchiveStats::new(AGGS);
+    for member in members {
+        let reading = match member.entry_type.as_deref() {
+            Some("regular") => Reading::of(member),
+            Some("directory" | "symlink") => Reading {
+                file: false,
+                ..Reading::of(member)
+            },
+            _ => Reading::opaque(),
+        };
+        stats.observe(member, &reading);
+    }
+    let list = members
+        .iter()
+        .map(|m| JsonValue::Object(member_value(m, Shape::FULL)))
+        .collect();
+    values.insert("archive.members", JsonValue::Array(list));
+    stats.emit(values, metrics);
+    result
+}
+
+fn walk_image(
     bytes: &[u8],
     values: &mut Values,
     metrics: &mut Metrics,
@@ -782,7 +838,7 @@ impl IsoTime {
     /// 1900 and a quarter-hour GMT offset, seven bytes total.
     fn parse_bin(raw: Option<&[u8]>) -> Option<Self> {
         let raw = raw?;
-        let b = raw.get(..7)?;
+        let b = raw.first_chunk::<7>()?;
         if b.iter().all(|x| *x == 0) {
             return None;
         }
@@ -1257,11 +1313,10 @@ impl Walk {
     /// is followed up to `MAX_CE_HOPS` deep.
     fn parse_susp(&mut self, bytes: &[u8], su: &[u8], entry: &mut Entry, prefix: &str, hop: usize) {
         let mut pos = 0_usize;
-        while pos + 4 <= su.len() {
-            let Some(head) = su.get(pos..pos + 4) else {
-                break;
-            };
-            let len = head[2] as usize;
+        while let Some(&[sig0, sig1, len, _version]) =
+            su.get(pos..).and_then(|rest| rest.first_chunk::<4>())
+        {
+            let len = usize::from(len);
             if len < 4 {
                 break;
             }
@@ -1269,7 +1324,7 @@ impl Walk {
                 break;
             };
             pos += len;
-            let sig = [head[0], head[1]];
+            let sig = [sig0, sig1];
             // SUSP entries have a four-byte header: two-byte signature,
             // length, and version. Record-specific payload begins at byte 4.
             // NM and SL then carry their own flags byte at payload[0]; their
@@ -1340,9 +1395,10 @@ impl Walk {
 /// length-prefixed with flag bits for `.`, `..`, and `/`.
 fn decode_symlink(data: &[u8], out: &mut String) {
     let mut pos = 1_usize; // skip the entry flags byte
-    while pos + 2 <= data.len() && out.len() < MAX_SYMLINK_LEN {
-        let flags = data[pos];
-        let len = data[pos + 1] as usize;
+    while let Some(&[flags, len]) = data.get(pos..).and_then(|rest| rest.first_chunk::<2>())
+        && out.len() < MAX_SYMLINK_LEN
+    {
+        let len = usize::from(len);
         pos += 2;
         let component = data.get(pos..pos.saturating_add(len)).unwrap_or_default();
         pos = pos.saturating_add(len);
@@ -1428,14 +1484,13 @@ fn merge_namespaces(entries: Vec<Entry>, anomalies: &mut Vec<&'static str>) -> V
         // so distinct empty files don't collapse into one member.
         let key = (e.lba, e.size);
         let slot = if e.size == 0 {
-            files.iter().position(|f| f.path == e.path && f.size == 0)
+            files.iter_mut().find(|f| f.path == e.path && f.size == 0)
         } else {
-            index.get(&key).copied()
+            index.get(&key).and_then(|&i| files.get_mut(i))
         };
 
         match slot {
-            Some(i) => {
-                let f = &mut files[i];
+            Some(f) => {
                 if !f.namespaces.contains(&e.namespace.label()) {
                     f.namespaces.push(e.namespace.label());
                 }
@@ -1649,7 +1704,11 @@ fn emit_tree(
     // Overlapping extents mean two names resolve to the same bytes with
     // different declared lengths — a reader-dependent view of the payload.
     extents.sort_unstable();
-    if extents.windows(2).any(|w| w[1].0 < w[0].1) {
+    if extents
+        .iter()
+        .zip(extents.iter().skip(1))
+        .any(|(prev, next)| next.0 < prev.1)
+    {
         anomalies.push("overlapping-extents");
     }
 
@@ -1965,6 +2024,73 @@ fn emit_members(files: &[File], archive_members: &mut Vec<ArchiveMember>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One ISO 9660 directory record.
+    fn dir_record(name: &[u8], lba: u32, size: u32, flags: u8) -> Vec<u8> {
+        let len = 33 + name.len() + usize::from(name.len().is_multiple_of(2));
+        let mut rec = vec![0u8; len];
+        rec[0] = len as u8;
+        rec[2..6].copy_from_slice(&lba.to_le_bytes());
+        rec[6..10].copy_from_slice(&lba.to_be_bytes());
+        rec[10..14].copy_from_slice(&size.to_le_bytes());
+        rec[14..18].copy_from_slice(&size.to_be_bytes());
+        rec[25] = flags;
+        rec[32] = name.len() as u8;
+        rec[33..33 + name.len()].copy_from_slice(name);
+        rec
+    }
+
+    /// A 20-sector image whose root holds one file, `SETUP.EXE`, with
+    /// `trailing` appended past the declared volume.
+    fn one_file_image(trailing: &[u8]) -> Vec<u8> {
+        let mut image = vec![0u8; 20 * SECTOR];
+        let pvd = &mut image[16 * SECTOR..17 * SECTOR];
+        pvd[0] = 1;
+        pvd[1..6].copy_from_slice(b"CD001");
+        pvd[6] = 1;
+        pvd[80..84].copy_from_slice(&20u32.to_le_bytes());
+        pvd[128..130].copy_from_slice(&(SECTOR as u16).to_le_bytes());
+        pvd[156..190].copy_from_slice(&dir_record(&[0], 18, SECTOR as u32, 2));
+        pvd[881] = 1;
+        let terminator = &mut image[17 * SECTOR..18 * SECTOR];
+        terminator[0] = 255;
+        terminator[1..6].copy_from_slice(b"CD001");
+        let mut root = dir_record(&[0], 18, SECTOR as u32, 2);
+        root.extend(dir_record(&[1], 18, SECTOR as u32, 2));
+        root.extend(dir_record(b"SETUP.EXE;1", 19, 5, 0));
+        image[18 * SECTOR..18 * SECTOR + root.len()].copy_from_slice(&root);
+        image[19 * SECTOR..19 * SECTOR + 5].copy_from_slice(b"MZ...");
+        image.extend_from_slice(trailing);
+        image
+    }
+
+    /// The tree's files feed the shared `archive.*` aggregates; a carved
+    /// region is listed as a member but its synthetic name says nothing.
+    #[test]
+    fn archive_aggregates_cover_files_not_carved_regions() {
+        let image = one_file_image(&[0x41; 4096]);
+        let (mut values, mut metrics, mut members) = (Values::new(), Metrics::new(), Vec::new());
+        extract(&image, &mut values, &mut metrics, &mut members).unwrap();
+
+        let listed = values
+            .get("archive.members")
+            .and_then(JsonValue::as_array)
+            .unwrap();
+        let kinds: Vec<_> = listed.iter().map(|m| m["entry_type"].as_str()).collect();
+        assert_eq!(kinds, [Some("regular"), Some("trailing")]);
+        assert_eq!(listed[0]["path"], "SETUP.EXE");
+        assert_eq!(listed[0]["data_offset"], 19 * SECTOR as u64);
+        assert_eq!(listed.len(), members.len());
+
+        assert_eq!(metrics.get("archive.member_count"), Some(2.0));
+        assert_eq!(metrics.get("archive.file_count"), Some(1.0));
+        assert_eq!(metrics.get("archive.uncompressed_size"), Some(5.0));
+        // `.iso-unclaimed/trailing.bin` is neither hidden nor an executable.
+        assert_eq!(metrics.get("archive.executable_count"), Some(1.0));
+        assert_eq!(metrics.get("archive.misplaced_executable_count"), Some(1.0));
+        assert_eq!(metrics.get("archive.hidden_file_count"), Some(0.0));
+        assert_eq!(metrics.get("archive.format.trailing_count"), Some(1.0));
+    }
 
     /// Build a system area (16 * 2048 bytes) carrying an MBR whose single
     /// entry starts at `start_lba` and spans `sectors` 512-byte LBAs.

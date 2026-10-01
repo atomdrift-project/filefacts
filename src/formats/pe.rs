@@ -598,7 +598,7 @@ fn recover_api_hash_requests(
             continue;
         };
         let request = recover_x86_hash_argument(pe, bytes, *callsite_va);
-        let mut fact = serde_json::json!({
+        let JsonValue::Object(mut fact) = serde_json::json!({
             "kind": "hashed_pe_export_resolution",
             "architecture": "x86",
             "caller_va": caller_va,
@@ -606,15 +606,23 @@ fn recover_api_hash_requests(
             "resolver_va": resolver_va,
             "hash_profile_kind": profile.kind,
             "hash_profile_va": profile.va,
-        });
+        }) else {
+            continue;
+        };
         if let Some(callsite_file_offset) = va_to_file_offset(pe, *callsite_va) {
-            fact["callsite_file_offset"] = serde_json::json!(callsite_file_offset);
+            fact.insert(
+                "callsite_file_offset".into(),
+                serde_json::json!(callsite_file_offset),
+            );
         }
         match request {
             Some((hash, source)) => {
-                fact["hash"] = serde_json::json!(hash);
-                fact["hash_hex"] = JsonValue::String(format!("0x{hash:08x}"));
-                fact["hash_source"] = JsonValue::String(source.to_string());
+                fact.insert("hash".into(), serde_json::json!(hash));
+                fact.insert(
+                    "hash_hex".into(),
+                    JsonValue::String(format!("0x{hash:08x}")),
+                );
+                fact.insert("hash_source".into(), JsonValue::String(source.to_string()));
                 if source == "constant_folded_memory_xor_add" {
                     folded = folded.saturating_add(1);
                 }
@@ -622,19 +630,30 @@ fn recover_api_hash_requests(
                     .iter()
                     .filter(|candidate| hash_windows_name(profile, candidate.name) == hash)
                     .collect();
-                if matches.len() == 1 {
-                    let candidate = matches[0];
-                    fact["resolved_name"] = JsonValue::String(candidate.name.to_string());
-                    fact["resolved_library"] = JsonValue::String(candidate.library.to_string());
-                    fact["resolution"] = JsonValue::String("exact_hash_match".to_string());
+                if let [candidate] = matches.as_slice() {
+                    fact.insert(
+                        "resolved_name".into(),
+                        JsonValue::String(candidate.name.to_string()),
+                    );
+                    fact.insert(
+                        "resolved_library".into(),
+                        JsonValue::String(candidate.library.to_string()),
+                    );
+                    fact.insert(
+                        "resolution".into(),
+                        JsonValue::String("exact_hash_match".to_string()),
+                    );
                     name_matches = name_matches.saturating_add(1);
                 }
             }
             None => {
-                fact["hash_source"] = JsonValue::String("runtime_expression".to_string());
+                fact.insert(
+                    "hash_source".into(),
+                    JsonValue::String("runtime_expression".to_string()),
+                );
             }
         }
-        requests.push(fact);
+        requests.push(JsonValue::Object(fact));
     }
     if requests.is_empty() {
         return;
@@ -716,18 +735,20 @@ fn recover_x86_hash_argument(
     let prefix = bytes.get(start..callsite)?;
 
     // cdecl/stdcall two-argument call: `push hash_imm32; push module; call`.
-    if prefix.len() >= 6
-        && prefix[prefix.len() - 6] == 0x68
-        && (0x50..=0x57).contains(&prefix[prefix.len() - 1])
+    if let Some(&[0x68, b0, b1, b2, b3, module]) = prefix.last_chunk::<6>()
+        && (0x50..=0x57).contains(&module)
     {
-        let push = &prefix[prefix.len() - 6..prefix.len() - 1];
-        return Some((u32::from_le_bytes(push[1..5].try_into().ok()?), "immediate"));
+        return Some((u32::from_le_bytes([b0, b1, b2, b3]), "immediate"));
     }
 
     // Common opaque-constant form:
     // mov eax,[absolute]; mov ecx,imm32; xor eax,ecx; add eax,imm32;
     // push eax; push module; call resolver.
     for expression in prefix.windows(19) {
+        // A fixed-size view: constant indexes below are checked at compile time.
+        let Some(expression) = expression.first_chunk::<19>() else {
+            continue;
+        };
         if expression[0] != 0xa1
             || expression[5] != 0xb9
             || !matches!(expression[10..12], [0x31, 0xc8] | [0x33, 0xc1])
@@ -964,7 +985,7 @@ fn contains_after(
     predicate: impl Fn(&[u8]) -> bool,
 ) -> Option<usize> {
     let end = start.saturating_add(max).min(bytes.len());
-    (start..end).find(|&i| predicate(&bytes[i..]))
+    (start..end).find(|&i| bytes.get(i..).is_some_and(&predicate))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -983,33 +1004,27 @@ fn find_checked_export_walks_x86(bytes: &[u8]) -> Vec<CheckedExportWalk> {
         .filter(|(_, w)| {
             // `cmp word ptr [reg], 0x5a4d`: opcode 81 /7 with a memory
             // operand, not an arbitrary 81 instruction containing `MZ`.
-            w[0] == 0x66
-                && w[1] == 0x81
-                && w[2] & 0x38 == 0x38
-                && w[2] & 0xc0 != 0xc0
-                && w[3..] == [0x4d, 0x5a]
+            matches!(**w, [0x66, 0x81, modrm, 0x4d, 0x5a]
+                if modrm & 0x38 == 0x38 && modrm & 0xc0 != 0xc0)
         })
         .filter_map(|(start, _)| {
             let pe_offset = contains_after(bytes, start + 5, 64, |b| {
                 // `mov reg, [reg+0x3c]` (the PE e_lfanew field).
-                b.len() >= 3 && b[0] == 0x8b && b[1] & 0xc0 == 0x40 && b[2] == 0x3c
+                matches!(*b, [0x8b, modrm, 0x3c, ..] if modrm & 0xc0 == 0x40)
             })?;
             let signature = contains_after(bytes, pe_offset + 3, 64, |b| {
                 // `cmp dword ptr [base+e_lfanew], 0x4550`.
-                b.len() >= 7
-                    && b[0] == 0x81
-                    && b[1] & 0x38 == 0x38
-                    && b[1] & 0xc0 != 0xc0
-                    && b[3..7] == [0x50, 0x45, 0, 0]
+                matches!(*b, [0x81, modrm, _, 0x50, 0x45, 0, 0, ..]
+                    if modrm & 0x38 == 0x38 && modrm & 0xc0 != 0xc0)
             })?;
             let export_directory = contains_after(bytes, signature + 7, 64, |b| {
                 // `mov reg, [base+e_lfanew+0x78]`: PE32 export directory.
-                b.len() >= 4 && b[0] == 0x8b && b[1] & 0xc0 == 0x40 && b[3] == 0x78
+                matches!(*b, [0x8b, modrm, _, 0x78, ..] if modrm & 0xc0 == 0x40)
             })?;
             let export_size = contains_after(bytes, export_directory + 4, 32, |b| {
                 // A checked resolver also reads the paired export-directory
                 // size field at +0x7c before dereferencing the directory.
-                b.len() >= 4 && b[0] == 0x8b && b[1] & 0xc0 == 0x40 && b[3] == 0x7c
+                matches!(*b, [0x8b, modrm, _, 0x7c, ..] if modrm & 0xc0 == 0x40)
             })?;
             Some(CheckedExportWalk {
                 mz_check: start,
@@ -1044,23 +1059,22 @@ fn find_custom_byte_hash_profiles_x86(bytes: &[u8]) -> Vec<ApiHashProfile> {
         .enumerate()
         // Register-register IMUL with a trailing imm32. Requiring mod=3
         // makes bytes 2..6 unambiguously the multiplier.
-        .filter(|(_, w)| w[0] == 0x69 && w[1] & 0xc0 == 0xc0)
+        .filter(|(_, w)| matches!(**w, [0x69, modrm, ..] if modrm & 0xc0 == 0xc0))
         .filter_map(|(start, multiply)| {
-            let byte_load = contains_after(bytes, start + 6, 16, |b| {
-                b.len() >= 2 && b[..2] == [0x0f, 0xb6]
-            })?;
+            let byte_load = contains_after(bytes, start + 6, 16, |b| b.starts_with(&[0x0f, 0xb6]))?;
             let xor_register = contains_after(bytes, byte_load + 2, 16, |b| {
                 b.first().is_some_and(|op| matches!(*op, 0x31 | 0x33))
             })?;
             let xor_constant = contains_after(bytes, xor_register + 2, 16, |b| {
-                b.len() >= 5 && b[0] == 0x35
+                matches!(*b, [0x35, _, _, _, _, ..])
             })?;
             let rotate = contains_after(bytes, xor_constant + 5, 16, |b| {
                 // C1 /0 ib is ROL r32, imm8. Other C1 groups are shifts
                 // or ROR and must not satisfy the existing ROL trait.
-                b.len() >= 3 && b[0] == 0xc1 && b[1] & 0xc0 == 0xc0 && b[1] & 0x38 == 0 && b[2] < 32
+                matches!(*b, [0xc1, modrm, bits, ..]
+                    if modrm & 0xc0 == 0xc0 && modrm & 0x38 == 0 && bits < 32)
             })?;
-            let multiplier = u32::from_le_bytes(multiply[2..6].try_into().ok()?);
+            let multiplier = u32_le(multiply, 2)?;
             let xor_value = u32::from_le_bytes(
                 bytes
                     .get(xor_constant + 1..xor_constant + 5)?
@@ -1072,10 +1086,8 @@ fn find_custom_byte_hash_profiles_x86(bytes: &[u8]) -> Vec<ApiHashProfile> {
                 prefix
                     .windows(5)
                     .enumerate()
-                    .rfind(|(_, window)| window[0] == 0xb8)
-                    .and_then(|(_, window)| {
-                        u32::from_le_bytes(window[1..5].try_into().ok()?).into()
-                    })
+                    .rfind(|(_, window)| window.first() == Some(&0xb8))
+                    .and_then(|(_, window)| u32_le(window, 1))
             });
             let normalization_start = start.saturating_sub(32);
             let normalization = bytes.get(normalization_start..start).is_some_and(|prefix| {
@@ -1089,7 +1101,7 @@ fn find_custom_byte_hash_profiles_x86(bytes: &[u8]) -> Vec<ApiHashProfile> {
                 seed,
                 multiplier,
                 xor_constant: xor_value,
-                rotate_bits: bytes[rotate + 2],
+                rotate_bits: *bytes.get(rotate + 2)?,
                 ascii_lowercase: normalization,
             })
         })
@@ -1110,14 +1122,15 @@ fn find_custom_byte_hash_profiles_x86(bytes: &[u8]) -> Vec<ApiHashProfile> {
 fn find_xor_rotate_multiply_hash_profiles_x86(bytes: &[u8]) -> Vec<ApiHashProfile> {
     let mut profiles = Vec::new();
     for (multiply_offset, multiply) in bytes.windows(6).enumerate() {
-        if multiply[0] != 0x69 || multiply[1] & 0xc0 != 0xc0 {
+        if !matches!(*multiply, [0x69, modrm, ..] if modrm & 0xc0 == 0xc0) {
             continue;
         }
         let rotate_start = multiply_offset.saturating_sub(16);
         let Some((rotate_rel, rotate)) =
             bytes.get(rotate_start..multiply_offset).and_then(|prefix| {
                 prefix.windows(3).enumerate().rfind(|(_, op)| {
-                    op[0] == 0xc1 && op[1] & 0xc0 == 0xc0 && op[1] & 0x38 == 0 && op[2] < 32
+                    matches!(**op, [0xc1, modrm, bits]
+                        if modrm & 0xc0 == 0xc0 && modrm & 0x38 == 0 && bits < 32)
                 })
             })
         else {
@@ -1129,7 +1142,7 @@ fn find_xor_rotate_multiply_hash_profiles_x86(bytes: &[u8]) -> Vec<ApiHashProfil
             prefix
                 .windows(2)
                 .enumerate()
-                .rfind(|(_, op)| matches!(op[0], 0x31 | 0x33) && op[1] & 0xc0 == 0xc0)
+                .rfind(|(_, op)| matches!(**op, [0x31 | 0x33, modrm] if modrm & 0xc0 == 0xc0))
         }) else {
             continue;
         };
@@ -1139,12 +1152,12 @@ fn find_xor_rotate_multiply_hash_profiles_x86(bytes: &[u8]) -> Vec<ApiHashProfil
             prefix
                 .windows(5)
                 .enumerate()
-                .rfind(|(_, op)| (0xb8..=0xbf).contains(&op[0]))
+                .rfind(|(_, op)| matches!(**op, [0xb8..=0xbf, ..]))
         }) else {
             continue;
         };
         let Some(byte_load) = contains_after(bytes, multiply_offset + 6, 16, |op| {
-            op.len() >= 3 && op[..2] == [0x0f, 0xb6]
+            matches!(*op, [0x0f, 0xb6, _, ..])
         }) else {
             continue;
         };
@@ -1162,17 +1175,18 @@ fn find_xor_rotate_multiply_hash_profiles_x86(bytes: &[u8]) -> Vec<ApiHashProfil
                 memmem::find_iter(prefix, b"\x80\xca\x20").count()
                     + memmem::find_iter(prefix, b"\x80\xce\x20").count()
                     > 0
-                    && prefix
-                        .windows(3)
-                        .any(|op| op[..2] == [0x80, 0xfa] && op[2] == 0x1a)
+                    && prefix.windows(3).any(|op| op == [0x80, 0xfa, 0x1a])
             });
+        let Some(&rotate_bits) = rotate.get(2) else {
+            continue;
+        };
         profiles.push(ApiHashProfile {
             loop_offset: byte_load,
             kind: "xor_rotate_multiply_xor",
             seed,
-            multiplier: u32::from_le_bytes(multiply[2..6].try_into().unwrap_or([0; 4])),
-            xor_constant: u32::from_le_bytes(constant_load[1..5].try_into().unwrap_or([0; 4])),
-            rotate_bits: rotate[2],
+            multiplier: u32_le(multiply, 2).unwrap_or(0),
+            xor_constant: u32_le(constant_load, 1).unwrap_or(0),
+            rotate_bits,
             ascii_lowercase: normalization,
         });
     }
@@ -1184,25 +1198,25 @@ fn recover_flattened_stack_hash_seed(bytes: &[u8], loop_offset: usize) -> Option
     let prefix = bytes.get(search_start..loop_offset)?;
 
     // `mov accumulator, [esp+hash_slot]`
-    let hash_slot = prefix
-        .windows(4)
-        .rfind(|op| op[0] == 0x8b && op[2] == 0x24)
-        .map(|op| op[3])?;
+    let hash_slot = prefix.windows(4).rev().find_map(|op| match *op {
+        [0x8b, _, 0x24, slot] => Some(slot),
+        _ => None,
+    })?;
 
     // Dispatcher transfer:
     // `mov eax,[esp+source_slot]; mov [esp+hash_slot],eax`.
-    let source_slot = prefix
-        .windows(8)
-        .rfind(|op| {
-            op[0..3] == [0x8b, 0x44, 0x24] && op[4..7] == [0x89, 0x44, 0x24] && op[7] == hash_slot
-        })
-        .map(|op| op[3])?;
+    let source_slot = prefix.windows(8).rev().find_map(|op| match *op {
+        [0x8b, 0x44, 0x24, slot, 0x89, 0x44, 0x24, dst] if dst == hash_slot => Some(slot),
+        _ => None,
+    })?;
 
     // Concrete initialization of that source slot.
-    prefix
-        .windows(8)
-        .rfind(|op| op[0..3] == [0xc7, 0x44, 0x24] && op[3] == source_slot)
-        .and_then(|op| u32::from_le_bytes(op[4..8].try_into().ok()?).into())
+    prefix.windows(8).rev().find_map(|op| match *op {
+        [0xc7, 0x44, 0x24, slot, b0, b1, b2, b3] if slot == source_slot => {
+            Some(u32::from_le_bytes([b0, b1, b2, b3]))
+        }
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -1854,7 +1868,9 @@ fn bound_imports(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut M
         return;
     }
     let end = table_off.saturating_add(table_size).min(bytes.len());
-    let table = &bytes[table_off..end];
+    let Some(table) = bytes.get(table_off..end) else {
+        return;
+    };
 
     struct Desc {
         name: String,
@@ -1879,10 +1895,11 @@ fn bound_imports(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut M
         if time_date == 0 && name_off == 0 && forwarder_count == 0 {
             break;
         }
-        if name_off < table.len() {
-            let tail = &table[name_off..table.len().min(name_off + 256)];
-            let len = tail.iter().position(|b| *b == 0).unwrap_or(tail.len());
-            if let Ok(name) = std::str::from_utf8(&tail[..len]) {
+        if name_off < table.len()
+            && let Some(tail) = table.get(name_off..table.len().min(name_off + 256))
+        {
+            let name = tail.split(|b| *b == 0).next().unwrap_or_default();
+            if let Ok(name) = std::str::from_utf8(name) {
                 if !name.is_empty() {
                     out.push(Desc {
                         name: name.to_string(),
@@ -2271,7 +2288,7 @@ fn parse_clr_streams(md: &[u8]) -> Option<(Vec<String>, Option<(usize, usize)>)>
         while *md.get(p)? != 0 {
             p += 1;
         }
-        let name = std::str::from_utf8(&md[start..p]).ok()?.to_string();
+        let name = std::str::from_utf8(md.get(start..p)?).ok()?.to_string();
         if name == "#GUID" {
             guid_stream = Some((s_off, s_size));
         }
@@ -2303,12 +2320,11 @@ fn clr_resources(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
         return;
     };
     let end = base.saturating_add(dir.size as usize).min(bytes.len());
-    if base >= end {
+    let Some(blob) = bytes.get(base..end) else {
         return;
-    }
+    };
 
-    let (count, max_entropy, max_size, entropy_span, size_span) =
-        scan_resource_blob(&bytes[base..end]);
+    let (count, max_entropy, max_size, entropy_span, size_span) = scan_resource_blob(blob);
     if count == 0 {
         return;
     }
@@ -2351,12 +2367,18 @@ fn scan_resource_blob(
     let (mut count, mut max_entropy, mut max_size, mut entropy_span, mut size_span, mut p) =
         (0u64, 0.0f64, 0u64, None, None, 0usize);
     while p + 4 <= blob.len() {
-        let len = u32::from_le_bytes([blob[p], blob[p + 1], blob[p + 2], blob[p + 3]]) as usize;
+        let Some(len) = u32_le(blob, p) else {
+            break;
+        };
+        let len = len as usize;
         p += 4;
-        if len == 0 || p + len > blob.len() {
+        if len == 0 {
             break;
         }
-        let chunk_entropy = entropy::shannon(&blob[p..p + len]);
+        let Some(chunk) = blob.get(p..p + len) else {
+            break;
+        };
+        let chunk_entropy = entropy::shannon(chunk);
         if chunk_entropy > max_entropy {
             max_entropy = chunk_entropy;
             entropy_span = Some(crate::output::Span::new(p as u64, len as u64));
@@ -2592,9 +2614,12 @@ fn section_anomalies(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &m
         by_va.sort_by_key(|t| t.0);
         let mut overlap_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for w in by_va.windows(2) {
-            if w[0].1 > w[1].0 && w[1].0 >= w[0].0 {
-                overlap_names.insert(w[0].2);
-                overlap_names.insert(w[1].2);
+            if let [a, b] = w
+                && a.1 > b.0
+                && b.0 >= a.0
+            {
+                overlap_names.insert(a.2);
+                overlap_names.insert(b.2);
             }
         }
         if !overlap_names.is_empty() {
@@ -2649,10 +2674,9 @@ fn aliased_exports(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
         let Some(file_offset) = rva_to_file_offset(pe, rva as u32) else {
             continue;
         };
-        if file_offset + 16 > bytes.len() {
+        let Some(code) = bytes.get(file_offset..file_offset + 16) else {
             continue;
-        }
-        let code = &bytes[file_offset..file_offset + 16];
+        };
         let mut decoder = Decoder::with_ip(bitness, code, rva as u64, DecoderOptions::NONE);
         if let Some(instr) = decoder.iter().next() {
             let target = match instr.mnemonic() {
@@ -2754,12 +2778,15 @@ fn pe_checksum(data: &[u8], checksum_offset: usize) -> u32 {
             i += 4;
             continue;
         }
-        sum += u64::from(u16::from_le_bytes([data[i], data[i + 1]]));
+        let Some(word) = u16_le(data, i) else {
+            break;
+        };
+        sum += u64::from(word);
         sum = (sum & 0xffff) + (sum >> 16);
         i += 2;
     }
-    if i < data.len() {
-        sum += u64::from(data[i]);
+    if let Some(&byte) = data.get(i) {
+        sum += u64::from(byte);
         sum = (sum & 0xffff) + (sum >> 16);
     }
     sum = (sum & 0xffff) + (sum >> 16);
@@ -2773,10 +2800,12 @@ fn pe_checksum(data: &[u8], checksum_offset: usize) -> u32 {
 /// or hand-rolled-builder tells.
 fn dos_stub_anomalies(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
     let pe_offset = pe.header.dos_header.pe_pointer as usize;
-    if pe_offset <= 0x40 || pe_offset > bytes.len() {
+    if pe_offset <= 0x40 {
         return;
     }
-    let stub = &bytes[0x40..pe_offset];
+    let Some(stub) = bytes.get(0x40..pe_offset) else {
+        return;
+    };
     let canonical = b"This program cannot be run in DOS mode";
     let has_banner = stub.windows(canonical.len()).any(|w| w == canonical);
     if !has_banner {
@@ -3137,12 +3166,11 @@ fn read_hint_name(pe: &PE<'_>, bytes: &[u8], rva: u32) -> String {
 /// capped at 512 bytes. The shared core of both RVA-string readers.
 fn read_cstring_at_rva_inner(bytes: &[u8], off: usize) -> String {
     let cap = bytes.len().min(off.saturating_add(512));
-    if off >= cap {
+    let Some(tail) = bytes.get(off..cap) else {
         return String::new();
-    }
-    let tail = &bytes[off..cap];
-    let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
-    std::str::from_utf8(&tail[..end]).unwrap_or("").to_string()
+    };
+    let name = tail.split(|&b| b == 0).next().unwrap_or_default();
+    std::str::from_utf8(name).unwrap_or("").to_string()
 }
 
 /// Walk the base-relocation directory (data dir index 5) and count

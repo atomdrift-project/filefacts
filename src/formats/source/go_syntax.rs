@@ -128,9 +128,13 @@ pub(super) fn execution_facts(root: Node<'_>, source: &str, values: &mut Values)
             malformed = true;
             continue;
         };
-        if args.first().is_some_and(|s| s == "-command") {
-            if args.len() >= 3 {
-                aliases.insert(args[1].clone(), args[2..].to_vec());
+        if let [command, rest @ ..] = args.as_slice()
+            && command == "-command"
+        {
+            if let [name, expansion @ ..] = rest
+                && !expansion.is_empty()
+            {
+                aliases.insert(name.clone(), expansion.to_vec());
             } else {
                 malformed = true;
             }
@@ -139,10 +143,10 @@ pub(super) fn execution_facts(root: Node<'_>, source: &str, values: &mut Values)
         if let Some(expanded) = args.first().and_then(|s| aliases.get(s)).cloned() {
             args.splice(..1, expanded);
         }
-        if args.is_empty() {
+        let Some(program) = args.first() else {
             continue;
-        }
-        let command = args[0].rsplit('/').next().unwrap_or(&args[0]);
+        };
+        let command = program.rsplit('/').next().unwrap_or(program);
         let shell = matches!(command, "sh" | "bash" | "dash" | "zsh");
         let body = if shell && args.get(1).is_some_and(|s| s == "-c") {
             args.get(2)

@@ -41,6 +41,7 @@ use std::ops::Range;
 
 use serde_json::Value as JsonValue;
 
+use crate::bytes::Reader;
 use crate::error::Error;
 use crate::formats::common::{XorScan, extract_binary_strings};
 use crate::metric;
@@ -222,14 +223,12 @@ struct Archive {
 
 impl Archive {
     fn parse(data: &[u8]) -> Result<Self, Error> {
-        if data.len() < HEADER_LEN {
+        // Ten little-endian words follow the magic.
+        let Some(words) = data
+            .get(MAGIC.len()..HEADER_LEN)
+            .and_then(|header| <&[[u8; 4]; 10]>::try_from(header.as_chunks::<4>().0).ok())
+        else {
             return Err(Error::malformed("nib", "truncated NIBArchive header"));
-        }
-        // Ten little-endian words follow the magic; the length check above
-        // is what makes the fixed slicing below safe.
-        let word = |i: usize| {
-            let at = MAGIC.len() + 4 * i;
-            u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]])
         };
         let [
             constant,
@@ -242,7 +241,7 @@ impl Archive {
             value_offset,
             class_count,
             class_offset,
-        ] = std::array::from_fn(word);
+        ] = words.map(u32::from_le_bytes);
         if constant != 1 {
             tracing::debug!(
                 constant,
@@ -260,20 +259,20 @@ impl Archive {
         })?;
         let keys = parse_table(data, key_count, key_offset, "key", |c| {
             let len = c.varint()?;
-            Some(String::from_utf8_lossy(c.take(len)?).into_owned())
+            Some(String::from_utf8_lossy(c.bytes(len)?).into_owned())
         })?;
         let values = parse_table(data, value_count, value_offset, "value", |c| {
             let key = c.varint()?;
             let payload = match c.u8()? {
                 8 => {
                     let len = c.varint()?;
-                    let start = c.pos;
-                    c.take(len)?;
-                    Payload::Data(start..c.pos)
+                    let start = c.pos();
+                    c.skip(len)?;
+                    Payload::Data(start..c.pos())
                 }
-                10 => Payload::Ref(c.u32()? as usize),
+                10 => Payload::Ref(c.u32_le()? as usize),
                 kind @ (0..=7 | 9) => {
-                    c.take(SCALAR_LEN[usize::from(kind)])?;
+                    c.skip(*SCALAR_LEN.get(usize::from(kind))?)?;
                     Payload::Scalar
                 }
                 _ => return None,
@@ -283,8 +282,8 @@ impl Archive {
         let classes = parse_table(data, class_count, class_offset, "class name", |c| {
             let len = c.varint()?;
             let extras = c.varint()?;
-            c.take(extras.checked_mul(4)?)?;
-            let name = c.take(len)?;
+            c.skip(extras.checked_mul(4)?)?;
+            let name = c.bytes(len)?;
             let name = name.strip_suffix(b"\0").unwrap_or(name);
             Some(String::from_utf8_lossy(name).into_owned())
         })?;
@@ -302,7 +301,7 @@ impl Archive {
         let end = start
             .saturating_add(object.value_count)
             .min(self.values.len());
-        &self.values[start..end]
+        self.values.get(start..end).unwrap_or_default()
     }
 
     /// The value stored under `key` on `object`, if any.
@@ -366,7 +365,7 @@ fn parse_table<T>(
     count: u32,
     offset: u32,
     what: &'static str,
-    mut read: impl FnMut(&mut Cursor<'_>) -> Option<T>,
+    mut read: impl FnMut(&mut Reader<'_>) -> Option<T>,
 ) -> Result<Vec<T>, Error> {
     let (count, offset) = (count as usize, offset as usize);
     if offset > data.len() || count > data.len() - offset {
@@ -375,7 +374,7 @@ fn parse_table<T>(
             format!("{what} table does not fit: {count} entries at offset {offset}"),
         ));
     }
-    let mut cursor = Cursor { data, pos: offset };
+    let mut cursor = Reader::at(data, offset);
     let mut out = Vec::new();
     for index in 0..count {
         let Some(entry) = read(&mut cursor) else {
@@ -389,29 +388,14 @@ fn parse_table<T>(
     Ok(out)
 }
 
-struct Cursor<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
-        let end = self.pos.checked_add(len)?;
-        let slice = self.data.get(self.pos..end)?;
-        self.pos = end;
-        Some(slice)
-    }
-
-    fn u8(&mut self) -> Option<u8> {
-        Some(self.take(1)?[0])
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        self.take(4)?.try_into().ok().map(u32::from_le_bytes)
-    }
-
+/// The NIBArchive varint, read off the shared cursor.
+trait ReadVarint {
     /// NIBArchive varint: little-endian 7-bit groups, with the high bit set
     /// on the *last* byte rather than on the continuation bytes.
+    fn varint(&mut self) -> Option<usize>;
+}
+
+impl ReadVarint for Reader<'_> {
     fn varint(&mut self) -> Option<usize> {
         let mut value: u64 = 0;
         for shift in (0..64).step_by(7) {
@@ -684,10 +668,7 @@ mod tests {
     #[test]
     fn varint_spans_bytes() {
         // 300 = 0b10_0101100: low seven bits first, high bit marks the end.
-        let mut cursor = Cursor {
-            data: &[0x2c, 0x82, 0x81],
-            pos: 0,
-        };
+        let mut cursor = Reader::new(&[0x2c, 0x82, 0x81]);
         assert_eq!(cursor.varint(), Some(300));
         assert_eq!(cursor.varint(), Some(1));
         assert_eq!(cursor.varint(), None);

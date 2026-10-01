@@ -18,7 +18,7 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
 use crate::metric;
-use crate::output::{Metrics, Values};
+use crate::output::{Errors, Metrics, Stage, Values};
 
 /// Manifest bytes to read. Real manifests are tens of KB; this bounds a
 /// decompression bomb disguised as one.
@@ -30,28 +30,49 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     zip: &mut ::zip::ZipArchive<R>,
     values: &mut Values,
     metrics: &mut Metrics,
+    errors: &mut Errors,
 ) -> Result<(), Error> {
-    manifest(zip, values, metrics);
-    signer(zip, values, metrics);
+    manifest(zip, values, metrics, errors);
+    signer(zip, values, metrics, errors);
     Ok(())
+}
+
+/// Read a member that the central directory lists, capped at `max` bytes.
+/// `Ok(None)` when no member has that name.
+fn read_member<R: Read + Seek>(
+    zip: &mut ::zip::ZipArchive<R>,
+    name: &str,
+    max: u64,
+) -> Result<Option<Vec<u8>>, String> {
+    let entry = match zip.by_name(name) {
+        Ok(entry) => entry,
+        Err(::zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut bytes = Vec::new();
+    entry
+        .take(max)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    Ok(Some(bytes))
 }
 
 fn manifest<R: Read + Seek>(
     zip: &mut ::zip::ZipArchive<R>,
     values: &mut Values,
     metrics: &mut Metrics,
+    errors: &mut Errors,
 ) {
-    let Ok(entry) = zip.by_name("AndroidManifest.xml") else {
-        return;
+    // An APK without a manifest has nothing to report; one whose manifest
+    // will not decompress is a failure worth stating.
+    let bytes = match read_member(zip, "AndroidManifest.xml", MAX_MANIFEST_BYTES) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return,
+        Err(why) => {
+            errors.record_malformed(Stage::ZipParse, format!("AndroidManifest.xml: {why}"));
+            return;
+        }
     };
-    let mut bytes = Vec::new();
-    if entry
-        .take(MAX_MANIFEST_BYTES)
-        .read_to_end(&mut bytes)
-        .is_err()
-    {
-        return;
-    }
     let elements = super::axml::parse(&bytes);
     if elements.is_empty() {
         // Present but unreadable. Worth stating: a manifest `aapt` can compile
@@ -174,6 +195,7 @@ fn signer<R: Read + Seek>(
     zip: &mut ::zip::ZipArchive<R>,
     values: &mut Values,
     metrics: &mut Metrics,
+    errors: &mut Errors,
 ) {
     let names: Vec<String> = zip
         .file_names()
@@ -186,19 +208,22 @@ fn signer<R: Read + Seek>(
         .collect();
     metrics.insert(metric!("android.v1_signature_count"), names.len() as f64);
 
+    let total = names.len();
     let mut signatures = Vec::new();
+    // A hostile APK can list any number of signature members, so failures
+    // are reported once, in aggregate.
+    let mut unreadable = 0usize;
+    let mut first_failure = None;
     for name in names {
-        let Ok(entry) = zip.by_name(&name) else {
-            continue;
+        let der = match read_member(zip, &name, MAX_SIGNATURE_BYTES) {
+            Ok(Some(der)) => der,
+            Ok(None) => continue,
+            Err(why) => {
+                unreadable += 1;
+                first_failure.get_or_insert_with(|| format!("{name}: {why}"));
+                continue;
+            }
         };
-        let mut der = Vec::new();
-        if entry
-            .take(MAX_SIGNATURE_BYTES)
-            .read_to_end(&mut der)
-            .is_err()
-        {
-            continue;
-        }
         if let Some(mut sig) = super::pe_authenticode::parse_cms_blob(&der)
             && let Some(obj) = sig.as_object_mut()
         {
@@ -208,6 +233,12 @@ fn signer<R: Read + Seek>(
     }
     if !signatures.is_empty() {
         values.insert("android.signatures", JsonValue::Array(signatures));
+    }
+    if let Some(first) = first_failure {
+        errors.record_malformed(
+            Stage::ZipParse,
+            format!("{unreadable} of {total} v1 signature blocks unreadable; first: {first}"),
+        );
     }
 }
 
@@ -229,23 +260,99 @@ mod tests {
         w.finish().unwrap().into_inner()
     }
 
-    fn run(bytes: &[u8]) -> (Values, Metrics) {
+    fn run(bytes: &[u8]) -> (Values, Metrics, Errors) {
         let mut zip = ::zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
         let mut values = Values::default();
         let mut metrics = Metrics::default();
-        extract_from_archive(&mut zip, &mut values, &mut metrics).unwrap();
-        (values, metrics)
+        let mut errors = Errors::new();
+        extract_from_archive(&mut zip, &mut values, &mut metrics, &mut errors).unwrap();
+        (values, metrics, errors)
+    }
+
+    /// Deflate every member, then flip a byte inside the named member's
+    /// compressed data so it fails to inflate (or fails its CRC).
+    fn apk_with_corrupt(corrupt: &str, members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut w = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let opts =
+            SimpleFileOptions::default().compression_method(::zip::CompressionMethod::Deflated);
+        for (name, body) in members {
+            w.start_file(*name, opts).unwrap();
+            w.write_all(body).unwrap();
+        }
+        let mut bytes = w.finish().unwrap().into_inner();
+        let mut zip = ::zip::ZipArchive::new(Cursor::new(bytes.clone())).unwrap();
+        let entry = zip.by_name(corrupt).unwrap();
+        let start = entry.data_start() as usize;
+        let len = entry.compressed_size() as usize;
+        drop(entry);
+        for b in &mut bytes[start..start + len] {
+            *b ^= 0xa5;
+        }
+        bytes
+    }
+
+    fn only_error(errors: &Errors) -> &crate::ParseError {
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        &errors.as_slice()[0]
     }
 
     #[test]
     fn an_unreadable_manifest_is_reported_rather_than_passed_over() {
-        let (_, metrics) = run(&apk_with(b"not binary xml", &[]));
+        let (_, metrics, errors) = run(&apk_with(b"not binary xml", &[]));
         assert_eq!(metrics.get("android.manifest_unreadable"), Some(1.0));
+        // Present and readable, just not walkable: the metric says so, and
+        // no read failure is recorded.
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn a_manifest_that_fails_to_inflate_records_one_zip_parse_error() {
+        let body = vec![b'A'; 4096];
+        let (values, _, errors) = run(&apk_with_corrupt(
+            "AndroidManifest.xml",
+            &[("AndroidManifest.xml", &body)],
+        ));
+        let e = only_error(&errors);
+        assert_eq!(
+            (e.stage, e.kind),
+            (Stage::ZipParse, crate::ErrorKind::Malformed)
+        );
+        assert!(
+            e.message.starts_with("AndroidManifest.xml:"),
+            "{}",
+            e.message
+        );
+        assert!(values.get("android.package").is_none());
+    }
+
+    #[test]
+    fn unreadable_signature_blocks_record_one_aggregate_error() {
+        let body = vec![0x30; 4096];
+        let (_, metrics, errors) = run(&apk_with_corrupt(
+            "META-INF/CERT.RSA",
+            &[
+                ("AndroidManifest.xml", b"x"),
+                ("META-INF/CERT.RSA", &body),
+                ("META-INF/OTHER.RSA", b"not der"),
+            ],
+        ));
+        let e = only_error(&errors);
+        assert_eq!(
+            (e.stage, e.kind),
+            (Stage::ZipParse, crate::ErrorKind::Malformed)
+        );
+        assert!(
+            e.message
+                .starts_with("1 of 2 v1 signature blocks unreadable; first: META-INF/CERT.RSA:"),
+            "{}",
+            e.message
+        );
+        assert_eq!(metrics.get("android.v1_signature_count"), Some(2.0));
     }
 
     #[test]
     fn v1_signature_members_are_counted_by_extension_and_case() {
-        let (_, metrics) = run(&apk_with(
+        let (_, metrics, errors) = run(&apk_with(
             b"x",
             &[
                 ("META-INF/CERT.RSA", b"not der"),
@@ -255,6 +362,8 @@ mod tests {
             ],
         ));
         assert_eq!(metrics.get("android.v1_signature_count"), Some(2.0));
+        // Readable blocks that are not DER: no signer, and no read failure.
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]
@@ -264,8 +373,9 @@ mod tests {
             .unwrap();
         w.write_all(b"x").unwrap();
         let bytes = w.finish().unwrap().into_inner();
-        let (values, metrics) = run(&bytes);
+        let (values, metrics, errors) = run(&bytes);
         assert!(values.get("android.package").is_none());
         assert!(metrics.get("android.manifest_unreadable").is_none());
+        assert!(errors.is_empty(), "{errors:?}");
     }
 }

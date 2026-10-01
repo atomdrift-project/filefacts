@@ -354,15 +354,17 @@ fn one_edit(a: &str, b: &str) -> bool {
     // Past the common prefix, the rest must line up after one edit at i.
     let i = a.iter().zip(b).take_while(|(x, y)| x == y).count();
     match a.len().cmp(&b.len()) {
-        Ordering::Equal => {
-            a[i + 1..] == b[i + 1..]
-                || (i + 1 < a.len()
-                    && a[i] == b[i + 1]
-                    && a[i + 1] == b[i]
-                    && a[i + 2..] == b[i + 2..])
-        }
-        Ordering::Greater => a[i + 1..] == b[i..],
-        Ordering::Less => a[i..] == b[i + 1..],
+        Ordering::Equal => match (a.get(i..), b.get(i..)) {
+            // Substitution.
+            (Some([_, a_rest @ ..]), Some([_, b_rest @ ..])) if a_rest == b_rest => true,
+            // Swap of adjacent characters.
+            (Some([a0, a1, a_rest @ ..]), Some([b0, b1, b_rest @ ..])) => {
+                a0 == b1 && a1 == b0 && a_rest == b_rest
+            }
+            _ => false,
+        },
+        Ordering::Greater => a.get(i + 1..) == b.get(i..),
+        Ordering::Less => a.get(i..) == b.get(i + 1..),
     }
 }
 

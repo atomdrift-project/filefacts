@@ -38,7 +38,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
 use crate::error::Error;
-use crate::output::{Metrics, Values};
+use crate::output::{Errors, Metrics, Stage, Values};
 
 /// Cap on a single text entry we'll decompress for parsing
 /// (MANIFEST.MF / pom.properties). 1 MiB is generous; anything
@@ -123,6 +123,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     zip: &mut ::zip::ZipArchive<R>,
     values: &mut Values,
     metrics: &mut Metrics,
+    errors: &mut Errors,
 ) -> Result<(), Error> {
     let mut entry_count: u32 = 0;
     let mut class_count: u32 = 0;
@@ -139,9 +140,31 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     let mut pom_artifact: Option<String> = None;
     let mut pom_version: Option<String> = None;
 
-    let names: Vec<String> = (0..zip.len())
-        .filter_map(|i| zip.by_index(i).ok().map(|f| f.name().to_string()))
-        .collect();
+    // An entry that will not open (corrupt local header, unsupported
+    // compression or encryption) drops out of every count below. A hostile
+    // jar can hold any number of them, so they are reported once, in
+    // aggregate.
+    let mut names: Vec<String> = Vec::with_capacity(zip.len());
+    let mut unreadable = 0usize;
+    let mut first_failure = None;
+    for i in 0..zip.len() {
+        match zip.by_index(i) {
+            Ok(file) => names.push(file.name().to_string()),
+            Err(e) => {
+                unreadable += 1;
+                first_failure.get_or_insert_with(|| format!("entry {i}: {e}"));
+            }
+        }
+    }
+    if let Some(first) = first_failure {
+        errors.record_malformed(
+            Stage::ZipParse,
+            format!(
+                "{unreadable} of {} entries unreadable and left out of the jar counts; first: {first}",
+                zip.len()
+            ),
+        );
+    }
 
     for name in &names {
         if name.ends_with('/') {
@@ -484,14 +507,20 @@ fn parse_manifest(text: &str) -> Option<ManifestFacts> {
             if key.eq_ignore_ascii_case("Name") {
                 named = true;
             }
+            // The key is attacker-chosen UTF-8: split with a checked boundary,
+            // since `key.len() - 7` can land inside a multi-byte character.
             let digest_suffix = "-Digest";
-            if key.len() > digest_suffix.len()
-                && key[key.len() - digest_suffix.len()..].eq_ignore_ascii_case(digest_suffix)
+            if let Some(split) = key
+                .len()
+                .checked_sub(digest_suffix.len())
+                .filter(|&n| n > 0)
+                && let Some((algorithm, suffix)) = key.split_at_checked(split)
+                && suffix.eq_ignore_ascii_case(digest_suffix)
             {
                 facts.digest_count += 1;
                 facts
                     .digest_algorithms
-                    .insert(key[..key.len() - digest_suffix.len()].to_ascii_lowercase());
+                    .insert(algorithm.to_ascii_lowercase());
             }
             if let Some((_, snake)) = TRACKED_HEADERS
                 .iter()
@@ -531,12 +560,70 @@ mod tests {
     }
 
     fn run(bytes: &[u8]) -> (Values, Metrics) {
+        let (v, m, e) = run_with_errors(bytes);
+        assert!(e.is_empty(), "{e:?}");
+        (v, m)
+    }
+
+    fn run_with_errors(bytes: &[u8]) -> (Values, Metrics, Errors) {
         let mut v = Values::new();
         let mut m = Metrics::new();
+        let mut e = Errors::new();
         if let Ok(mut zip) = crate::formats::zip::open_archive(bytes) {
-            extract_from_archive(&mut zip, &mut v, &mut m).unwrap();
+            extract_from_archive(&mut zip, &mut v, &mut m, &mut e).unwrap();
         }
-        (v, m)
+        (v, m, e)
+    }
+
+    /// Rewrite the compression method of every entry named `name`, in both
+    /// its local and central-directory header, to PPMd (98), which the zip
+    /// crate cannot decompress.
+    fn with_unsupported_method(mut jar: Vec<u8>, name: &str) -> Vec<u8> {
+        let mut at = 0;
+        while let Some(off) = jar[at..]
+            .windows(4)
+            .position(|w| w == b"PK\x03\x04" || w == b"PK\x01\x02")
+        {
+            let hdr = at + off;
+            let (method_at, name_len_at, name_at) = if jar[hdr + 2] == 3 {
+                (hdr + 8, hdr + 26, hdr + 30)
+            } else {
+                (hdr + 10, hdr + 28, hdr + 46)
+            };
+            let name_len = u16::from_le_bytes([jar[name_len_at], jar[name_len_at + 1]]) as usize;
+            if &jar[name_at..name_at + name_len] == name.as_bytes() {
+                jar[method_at..method_at + 2].copy_from_slice(&98u16.to_le_bytes());
+            }
+            at = hdr + 4;
+        }
+        jar
+    }
+
+    #[test]
+    fn unreadable_entries_record_one_aggregate_error() {
+        let jar = build_jar(&[
+            ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n"),
+            ("a/One.class", b"\xca\xfe\xba\xbe"),
+            ("a/Two.class", b"\xca\xfe\xba\xbe"),
+            ("a/Three.class", b"\xca\xfe\xba\xbe"),
+        ]);
+        let jar = with_unsupported_method(jar, "a/One.class");
+        let jar = with_unsupported_method(jar, "a/Two.class");
+        let (v, m, e) = run_with_errors(&jar);
+        assert_eq!(e.len(), 1, "{e:?}");
+        let err = &e.as_slice()[0];
+        assert_eq!(
+            (err.stage, err.kind),
+            (Stage::ZipParse, crate::ErrorKind::Malformed)
+        );
+        assert!(
+            err.message.starts_with("2 of 4 entries unreadable"),
+            "{}",
+            err.message
+        );
+        // The readable entries are still counted.
+        assert_eq!(m.get("jar.class_count"), Some(1.0));
+        assert!(v.get("jar.manifest.manifest_version").is_some());
     }
 
     #[test]
@@ -705,6 +792,30 @@ mod tests {
         assert!(manifest.contains_key("manifest_version"));
         // Custom key is not in the allow-list → dropped.
         assert!(!manifest.contains_key("x_custom_key"));
+    }
+
+    /// A key whose `-Digest` suffix offset falls inside a multi-byte
+    /// character used to panic on the str slice and lose every `jar.*` fact.
+    #[test]
+    fn multibyte_manifest_key_does_not_panic() {
+        let jar = build_jar(&[(
+            "META-INF/MANIFEST.MF",
+            "Manifest-Version: 1.0\n\nName: x\n\u{20ac}abcdef: v\n\u{e9}-Digest: q\n".as_bytes(),
+        )]);
+        let (v, m) = run(&jar);
+        assert_eq!(
+            v.get("jar.manifest.manifest_version")
+                .and_then(|x| x.as_str()),
+            Some("1.0")
+        );
+        assert_eq!(m.get("jar.manifest.digest_count"), Some(1.0));
+        assert_eq!(
+            v.get("jar.manifest.digest_algorithms")
+                .and_then(|x| x.as_array())
+                .and_then(|x| x.first())
+                .and_then(|x| x.as_str()),
+            Some("\u{e9}")
+        );
     }
 
     #[test]

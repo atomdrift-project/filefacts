@@ -27,12 +27,13 @@ use serde_json::Value as JsonValue;
 use std::io::{Read, Seek};
 
 use crate::error::Error;
-use crate::output::{Metrics, Values};
+use crate::output::{Errors, Metrics, Stage, Values};
 
 pub(super) fn extract_from_archive<R: Read + Seek>(
     zip: &mut ::zip::ZipArchive<R>,
     values: &mut Values,
     _metrics: &mut Metrics,
+    errors: &mut Errors,
 ) -> Result<(), Error> {
     let mut has_manifest_json = false;
     let mut has_install_rdf = false;
@@ -90,7 +91,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     // The WebExtension manifest declares the add-on's author and name —
     // the human identity behind a (possibly self-signed) XPI.
     if has_manifest_json {
-        if let Some(manifest) = read_manifest(zip) {
+        if let Some(manifest) = read_manifest(zip, values, errors) {
             emit_manifest_identity(&manifest, values);
         }
     }
@@ -98,13 +99,38 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     Ok(())
 }
 
-/// Read and parse the root `manifest.json` of an opened XPI.
-fn read_manifest<R: Read + Seek>(zip: &mut ::zip::ZipArchive<R>) -> Option<JsonValue> {
+/// Read and parse the root `manifest.json` of an opened XPI, which the
+/// caller has seen listed. `None` when it is over the size cap (an
+/// `xpi.limits` entry) or unreadable or not JSON (an error).
+fn read_manifest<R: Read + Seek>(
+    zip: &mut ::zip::ZipArchive<R>,
+    values: &mut Values,
+    errors: &mut Errors,
+) -> Option<JsonValue> {
+    const NAME: &str = "manifest.json";
     const MAX: u64 = 512 * 1024;
-    let member = zip.by_name("manifest.json").ok()?;
     let mut buf = Vec::new();
-    member.take(MAX).read_to_end(&mut buf).ok()?;
-    serde_json::from_slice(&buf).ok()
+    if let Err(e) = zip
+        .by_name(NAME)
+        .map_err(std::io::Error::other)
+        .and_then(|member| member.take(MAX + 1).read_to_end(&mut buf))
+    {
+        errors.record_malformed(Stage::ZipParse, format!("{NAME}: {e}"));
+        return None;
+    }
+    if buf.len() as u64 > MAX {
+        values.insert(
+            "xpi.limits",
+            serde_json::json!([{
+                "stage": "manifest",
+                "reason": format!("{NAME} over the {MAX}-byte cap; not parsed"),
+            }]),
+        );
+        return None;
+    }
+    serde_json::from_slice(&super::crx::browser_manifest_json(&buf))
+        .map_err(|e| errors.record_malformed(Stage::FormatExtract, format!("{NAME}: {e}")))
+        .ok()
 }
 
 /// Emit `xpi.author` / `xpi.homepage_url` and a non-localized name and
@@ -163,12 +189,49 @@ mod tests {
     }
 
     fn run(bytes: &[u8]) -> Values {
+        let (v, e) = run_with_errors(bytes);
+        assert!(e.is_empty(), "{e:?}");
+        v
+    }
+
+    fn run_with_errors(bytes: &[u8]) -> (Values, Errors) {
         let mut v = Values::new();
         let mut m = Metrics::new();
+        let mut e = Errors::new();
         if let Ok(mut zip) = crate::formats::zip::open_archive(bytes) {
-            extract_from_archive(&mut zip, &mut v, &mut m).unwrap();
+            extract_from_archive(&mut zip, &mut v, &mut m, &mut e).unwrap();
         }
-        v
+        (v, e)
+    }
+
+    #[test]
+    fn manifest_that_is_not_json_records_one_error() {
+        let (v, e) = run_with_errors(&build_xpi(&[("manifest.json", b"{\"name\": ")]));
+        assert_eq!(e.len(), 1, "{e:?}");
+        let err = &e.as_slice()[0];
+        assert_eq!(
+            (err.stage, err.kind),
+            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+        );
+        assert!(err.message.starts_with("manifest.json:"), "{}", err.message);
+        // The filename-shape facts still stand.
+        assert_eq!(
+            v.get("xpi.has_web_extension_manifest")
+                .and_then(|x| x.as_bool()),
+            Some(true)
+        );
+        assert!(v.get("xpi.limits").is_none());
+    }
+
+    #[test]
+    fn oversized_manifest_is_a_limit_not_an_error() {
+        let mut big = b"{\"description\": \"".to_vec();
+        big.resize(600 * 1024, b'a');
+        big.extend_from_slice(b"\"}");
+        let (v, e) = run_with_errors(&build_xpi(&[("manifest.json", &big)]));
+        assert!(e.is_empty(), "{e:?}");
+        let limits = v.get("xpi.limits").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(limits[0]["stage"], "manifest");
     }
 
     #[test]

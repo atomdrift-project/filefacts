@@ -31,7 +31,7 @@ use std::io::{Read, Seek};
 use serde_json::Value as JsonValue;
 
 use crate::error::Error;
-use crate::formats::common::put_str;
+use crate::formats::common::{bytes_at, put_str};
 use crate::output::{ErrorKind, Errors, Metrics, Stage, Values};
 
 /// Read cap for the named parts the `office.*` layer is built from.
@@ -86,12 +86,38 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     let mut controls_seen = HashSet::new();
     let mut controls: Vec<JsonValue> = Vec::new();
 
+    // The package's own pointer to its VBA project is a `vbaProject`
+    // relationship, so those targets come first: VBA extraction reads the
+    // first entry. A content type that only comes from a `Default` extension
+    // mapping is weaker evidence. Word writes `bin` -> vbaProject in every
+    // macro-enabled document, and that mapping also covers any other `.bin`
+    // part without an override: an embedded OLE object, printer settings.
+    for rel in &index.relationships {
+        if is_macro_relationship(&rel.short_type) {
+            let target = rel.target_part.as_deref().unwrap_or(&rel.target);
+            push_unique_string(&mut macros_seen, &mut macros, target);
+        }
+    }
+    let has_macro_relationship = !macros.is_empty();
+    let other_targets: HashSet<&str> = index
+        .relationships
+        .iter()
+        .filter(|rel| !is_macro_relationship(&rel.short_type))
+        .filter_map(|rel| rel.target_part.as_deref())
+        .collect();
     for name in &names {
         let content_type = index.content_type_for(name).unwrap_or_default();
-        if is_macro_content_type(content_type)
-            || name.ends_with("/vbaProject.bin")
-            || name == "vbaProject.bin"
-        {
+        let declared_macro = match index.override_for(name) {
+            Some(content_type) => is_macro_content_type(content_type),
+            // Only by `Default`: trust it when nothing names the project
+            // and nothing says this part is something else.
+            None => {
+                !has_macro_relationship
+                    && !other_targets.contains(name.as_str())
+                    && is_macro_content_type(content_type)
+            }
+        };
+        if declared_macro || name.ends_with("/vbaProject.bin") || name == "vbaProject.bin" {
             push_unique_string(&mut macros_seen, &mut macros, name);
         }
         if is_control_content_type(content_type) {
@@ -108,13 +134,6 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
 
     for rel in &index.relationships {
         match rel.short_type.as_str() {
-            "vbaProject" | "xlIntlMacrosheet" => {
-                if let Some(target) = rel.target_part.as_deref() {
-                    push_unique_string(&mut macros_seen, &mut macros, target);
-                } else {
-                    push_unique_string(&mut macros_seen, &mut macros, &rel.target);
-                }
-            }
             "oleObject" => {
                 push_feature(&mut features, "ole_objects");
                 if let Some(target) = rel.target_part.as_deref() {
@@ -306,6 +325,13 @@ struct RelationshipInfo {
 }
 
 impl OoxmlIndex {
+    /// The content type an `Override` gives this part, if any.
+    fn override_for(&self, name: &str) -> Option<&str> {
+        self.overrides
+            .get(name.trim_start_matches('/'))
+            .map(String::as_str)
+    }
+
     fn content_type_for(&self, name: &str) -> Option<&str> {
         let normalized = name.trim_start_matches('/');
         if let Some(content_type) = self.overrides.get(normalized) {
@@ -548,11 +574,15 @@ fn push_embedded<R: Read + std::io::Seek>(
         obj.insert("size_bytes".into(), JsonValue::Number(entry.size().into()));
         let mut header = [0u8; 8];
         let n = entry.read(&mut header).unwrap_or(0);
-        if let Some(kind) = embedded_kind(&header[..n]) {
+        if let Some(kind) = embedded_kind(header.get(..n).unwrap_or_default()) {
             obj.insert("kind".into(), JsonValue::String(kind.into()));
         }
     }
     out.push(JsonValue::Object(obj));
+}
+
+fn is_macro_relationship(short_type: &str) -> bool {
+    matches!(short_type, "vbaProject" | "xlIntlMacrosheet")
 }
 
 fn is_macro_content_type(content_type: &str) -> bool {
@@ -588,14 +618,13 @@ fn external_relationship_value(rel: &RelationshipInfo) -> JsonValue {
 /// (`"pe"`, `"elf"`, `"macho"`, `"ole2"`, `"zip"`) or `None` when the
 /// bytes don't match any known executable / container shape.
 fn embedded_kind(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.len() >= 2 && &bytes[..2] == b"MZ" {
+    if bytes.starts_with(b"MZ") {
         return Some("pe");
     }
-    if bytes.len() >= 4 && &bytes[..4] == b"\x7fELF" {
+    if bytes.starts_with(b"\x7fELF") {
         return Some("elf");
     }
-    if bytes.len() >= 4 {
-        let m = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if let Some(m) = bytes_at::u32_le(bytes, 0) {
         // MH_MAGIC / MH_CIGAM / MH_MAGIC_64 / MH_CIGAM_64
         if matches!(m, 0xFEED_FACE | 0xCEFA_EDFE | 0xFEED_FACF | 0xCFFA_EDFE) {
             return Some("macho");
@@ -609,10 +638,10 @@ fn embedded_kind(bytes: &[u8]) -> Option<&'static str> {
             return Some("macho");
         }
     }
-    if bytes.len() >= 4 && &bytes[..4] == b"PK\x03\x04" {
+    if bytes.starts_with(b"PK\x03\x04") {
         return Some("zip");
     }
-    if bytes.len() >= 8 && &bytes[..8] == b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1" {
+    if bytes.starts_with(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1") {
         return Some("ole2");
     }
     None
@@ -741,7 +770,7 @@ fn is_external_target(target: &str) -> bool {
     let Some(colon) = t.find(':') else {
         return false;
     };
-    if colon == 1 && t.as_bytes()[0].is_ascii_alphabetic() {
+    if colon == 1 && t.as_bytes().first().is_some_and(u8::is_ascii_alphabetic) {
         return false;
     }
     t[..colon].bytes().enumerate().all(|(i, b)| {
@@ -896,11 +925,11 @@ fn read_named_part<R: Read + std::io::Seek>(
 }
 
 fn decode_xml_bytes(buf: &[u8]) -> Option<String> {
-    if buf.starts_with(&[0xFF, 0xFE]) {
-        return decode_utf16(&buf[2..], true);
+    if let Some(rest) = buf.strip_prefix(&[0xFF, 0xFE]) {
+        return decode_utf16(rest, true);
     }
-    if buf.starts_with(&[0xFE, 0xFF]) {
-        return decode_utf16(&buf[2..], false);
+    if let Some(rest) = buf.strip_prefix(&[0xFE, 0xFF]) {
+        return decode_utf16(rest, false);
     }
     if looks_utf16le(buf) {
         return decode_utf16(buf, true);
@@ -912,11 +941,11 @@ fn decode_xml_bytes(buf: &[u8]) -> Option<String> {
 }
 
 fn looks_utf16le(buf: &[u8]) -> bool {
-    buf.len() >= 8 && buf[0] == b'<' && buf[1] == 0 && buf[2] == b'?' && buf[3] == 0
+    buf.len() >= 8 && buf.starts_with(&[b'<', 0, b'?', 0])
 }
 
 fn looks_utf16be(buf: &[u8]) -> bool {
-    buf.len() >= 8 && buf[0] == 0 && buf[1] == b'<' && buf[2] == 0 && buf[3] == b'?'
+    buf.len() >= 8 && buf.starts_with(&[0, b'<', 0, b'?'])
 }
 
 fn decode_utf16(buf: &[u8], little_endian: bool) -> Option<String> {
@@ -941,6 +970,41 @@ mod tests {
     use zip::CompressionMethod;
     use zip::write::{SimpleFileOptions, ZipWriter};
 
+    /// Word maps `bin` to the VBA project type by `Default` in every
+    /// macro-enabled document, which also covers an embedded OLE object with
+    /// no override. The `vbaProject` relationship names the real project.
+    #[test]
+    fn default_bin_mapping_does_not_make_ole_objects_macros() {
+        let ct = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="bin" ContentType="application/vnd.ms-office.vbaProject"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.ms-word.document.macroEnabled.main+xml"/>
+</Types>"#;
+        let root_rels = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#;
+        let doc_rels = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId8" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="embeddings/oleObject1.bin"/>
+  <Relationship Id="rId7" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin"/>
+</Relationships>"#;
+        let z = build_ooxml(&[
+            ("[Content_Types].xml", ct.as_bytes()),
+            ("_rels/.rels", root_rels.as_bytes()),
+            ("word/document.xml", b"<w:document/>"),
+            ("word/_rels/document.xml.rels", doc_rels.as_bytes()),
+            ("word/embeddings/oleObject1.bin", b"not a project"),
+            ("word/vbaProject.bin", b"\x01\x16\x03\x00fake-macro-blob"),
+        ]);
+        let (v, m) = run(&z);
+        let macros = v.get("office.macros").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(macros.len(), 1, "{macros:?}");
+        assert_eq!(macros[0].as_str(), Some("word/vbaProject.bin"));
+        assert_eq!(m.get("office.macro_count"), Some(1.0));
+    }
     fn run(bytes: &[u8]) -> (Values, Metrics) {
         let (v, m, _) = run_with_errors(bytes);
         (v, m)

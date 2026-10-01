@@ -91,7 +91,7 @@ fn reconcile(
                 return unresolved(reference, "replacement");
             };
             if words.first().map(String::as_str) != Some(module)
-                || split == 2 && words[1] != version
+                || split == 2 && words.get(1).map(String::as_str) != Some(version)
             {
                 continue;
             }

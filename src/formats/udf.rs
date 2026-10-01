@@ -414,7 +414,7 @@ fn parse_file_entry(block: &[u8]) -> Option<FileEntry> {
 /// ECMA-167 timestamp: type/timezone u16, year i16, then byte fields.
 fn timestamp(raw: Option<&[u8]>) -> Option<i64> {
     let raw = raw?;
-    let b = raw.get(..12)?;
+    let b = raw.first_chunk::<12>()?;
     let year = i16::from_le_bytes([b[2], b[3]]);
     if !(1900..=2999).contains(&year) {
         return None;

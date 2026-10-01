@@ -41,6 +41,7 @@
 
 use serde_json::{Map, Value as JsonValue};
 
+use crate::formats::common::bytes_at::u32_le;
 use crate::formats::common::read_uleb128;
 use crate::output::Values;
 
@@ -109,18 +110,18 @@ pub(super) fn detect(
     let Some(start) = memchr::memmem::find(bytes, MAGIC) else {
         return;
     };
-    if start + 32 > bytes.len() {
+    let Some((header, payload)) = bytes.get(start..).and_then(<[u8]>::split_first_chunk::<32>)
+    else {
         return;
-    }
-    let ptr_size = bytes[start + 14] as usize;
-    let flags = bytes[start + 15];
+    };
+    let ptr_size = header[14] as usize;
+    let flags = header[15];
     let inline = flags & 0x2 != 0;
 
     let key = format!("{key_prefix}.go");
     let mut obj = Map::new();
     if inline {
         // Payload starts at a 32-byte alignment from the magic.
-        let payload = &bytes[start + 32..];
         let Some((version, rest)) = read_uvarint_string(payload) else {
             return;
         };
@@ -172,9 +173,9 @@ fn build_id(buildid_note: Option<&[u8]>, rodata: Option<&[u8]>, bytes: &[u8]) ->
     let needle = b"Go build ID: \"";
     let scan_in = |hay: &[u8]| -> Option<String> {
         let pos = memchr::memmem::find(hay, needle)?;
-        let after = &hay[pos + needle.len()..];
+        let after = hay.get(pos + needle.len()..)?;
         let end = after.iter().take(256).position(|&b| b == b'"')?;
-        let id = std::str::from_utf8(&after[..end]).ok()?;
+        let id = std::str::from_utf8(after.get(..end)?).ok()?;
         (!id.is_empty()).then(|| id.to_string())
     };
     if let Some(ro) = rodata
@@ -182,7 +183,7 @@ fn build_id(buildid_note: Option<&[u8]>, rodata: Option<&[u8]>, bytes: &[u8]) ->
     {
         return Some(id);
     }
-    scan_in(&bytes[..bytes.len().min(4 * 1024 * 1024)])
+    scan_in(bytes.get(..4 * 1024 * 1024).unwrap_or(bytes))
 }
 
 /// Parse an ELF `.note.go.buildid` note (namesz/descsz/type header,
@@ -191,8 +192,8 @@ fn parse_elf_buildid_note(note: &[u8]) -> Option<String> {
     if note.len() < 16 {
         return None;
     }
-    let namesz = u32::from_le_bytes(note[..4].try_into().ok()?) as usize;
-    let descsz = u32::from_le_bytes(note[4..8].try_into().ok()?) as usize;
+    let namesz = u32_le(note, 0)? as usize;
+    let descsz = u32_le(note, 4)? as usize;
     let desc_off = 12 + ((namesz + 3) & !3);
     let desc_end = desc_off.checked_add(descsz)?;
     let desc = note.get(desc_off..desc_end)?.split(|&b| b == 0).next()?;
@@ -206,13 +207,13 @@ fn scan_go_root(pclntab: &[u8]) -> Option<String> {
     let pos = memchr::memmem::find(pclntab, b"/src/runtime/")?;
     let mut start = pos;
     let lo = pos.saturating_sub(256);
-    while start > lo && is_path_byte(pclntab[start - 1]) {
+    while start > lo && pclntab.get(start - 1).copied().is_some_and(is_path_byte) {
         start -= 1;
     }
     if start == pos {
         return None;
     }
-    let s = std::str::from_utf8(&pclntab[start..pos]).ok()?;
+    let s = std::str::from_utf8(pclntab.get(start..pos)?).ok()?;
     (!s.is_empty()).then(|| s.to_string())
 }
 
@@ -230,7 +231,9 @@ fn scan_go_main_root(pclntab: &[u8], go_root: Option<&str>) -> Option<String> {
         let mut start = rel;
         let lo = rel.saturating_sub(512);
         while start > lo {
-            let b = pclntab[start - 1];
+            let Some(&b) = pclntab.get(start - 1) else {
+                break;
+            };
             if !is_path_byte(b) && b != b'/' {
                 break;
             }
@@ -238,10 +241,10 @@ fn scan_go_main_root(pclntab: &[u8], go_root: Option<&str>) -> Option<String> {
         }
         // Only absolute paths identify a developer tree; relative module
         // paths (emitted under -trimpath) don't.
-        if start == rel || pclntab[start] != b'/' {
+        if start == rel || pclntab.get(start) != Some(&b'/') {
             continue;
         }
-        let Ok(s) = std::str::from_utf8(&pclntab[start..rel + 3]) else {
+        let Some(Ok(s)) = pclntab.get(start..rel + 3).map(std::str::from_utf8) else {
             continue;
         };
         if go_root.is_some_and(|r| s.starts_with(r))
@@ -260,9 +263,9 @@ fn scan_go_main_root(pclntab: &[u8], go_root: Option<&str>) -> Option<String> {
 }
 
 fn longest_common_dir_prefix(paths: &[&str]) -> Option<String> {
-    let first = paths.first()?;
+    let (first, rest) = paths.split_first()?;
     let mut max = first.len();
-    for &p in &paths[1..] {
+    for &p in rest {
         let common = first
             .as_bytes()
             .iter()
@@ -328,7 +331,7 @@ fn read_go_string(
     resolve_va: &dyn Fn(u64) -> Option<usize>,
 ) -> Option<Vec<u8>> {
     let hdr_off = resolve_va(header_va)?;
-    if hdr_off + 2 * ptr_size > bytes.len() {
+    if hdr_off.checked_add(2 * ptr_size)? > bytes.len() {
         return None;
     }
     let data_va = read_uint_le(bytes, hdr_off, ptr_size);
@@ -342,10 +345,7 @@ fn read_go_string(
     }
     let data_off = resolve_va(data_va)?;
     let end = data_off.checked_add(len)?;
-    if end > bytes.len() {
-        return None;
-    }
-    Some(bytes[data_off..end].to_vec())
+    Some(bytes.get(data_off..end)?.to_vec())
 }
 
 /// Little-endian unsigned read of `width` bytes (4 or 8). Go
@@ -356,10 +356,10 @@ fn read_go_string(
 fn read_uint_le(bytes: &[u8], off: usize, width: usize) -> u64 {
     let mut v: u64 = 0;
     for i in 0..width {
-        if off + i >= bytes.len() {
+        let Some(&b) = bytes.get(off + i) else {
             return v;
-        }
-        v |= u64::from(bytes[off + i]) << (8 * i);
+        };
+        v |= u64::from(b) << (8 * i);
     }
     v
 }
@@ -602,6 +602,26 @@ mod tests {
         note.extend_from_slice(b"Go\0\0");
         note.extend_from_slice(b"id12345");
         assert_eq!(parse_elf_buildid_note(&note).as_deref(), Some("id12345"));
+    }
+
+    #[test]
+    fn old_format_pointer_resolving_near_usize_max_is_ignored() {
+        // A PT_LOAD whose `p_offset` sits near `u64::MAX` resolves the
+        // version pointer to an offset where `hdr_off + 2 * ptr_size`
+        // used to overflow (a panic under overflow checks).
+        let mut blob = MAGIC.to_vec();
+        blob.extend_from_slice(&[8, 0]); // ptr_size, pointer-format flags
+        blob.resize(32, 0);
+        let resolve = |_: u64| Some(usize::MAX - 4);
+        let mut values = Values::new();
+        detect(
+            &blob,
+            &mut values,
+            "elf",
+            Some(&resolve),
+            &GoSections::default(),
+        );
+        assert!(values.get("elf.go").is_none());
     }
 
     #[test]

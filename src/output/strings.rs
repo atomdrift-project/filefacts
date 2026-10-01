@@ -289,19 +289,6 @@ pub(crate) struct Strings {
     pub(crate) text: Text,
     pub(crate) literals: Literals,
     pub(crate) comments: Comments,
-    /// stng's cache key for the `text` rows, recorded so the disk cache can drop
-    /// the row bytes and rehydrate them from stng's cache (the single owner)
-    /// instead of persisting a second copy. `None` when no text tier ran.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) text_key: Option<String>,
-    /// Cache keys for row sets appended from buffers the file does not
-    /// literally contain -- text recovered by decoding something inside it.
-    /// Kept as keys for the same reason `text_key` is: the disk cache drops
-    /// the rows and rehydrates every set from stng, so a decoded payload's
-    /// strings survive a cache round-trip instead of vanishing on the second
-    /// scan of the same file.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) extra_text_keys: Vec<String>,
 }
 
 impl Strings {
@@ -404,8 +391,6 @@ mod tests {
             text: Text::from_rows(text_rows),
             literals,
             comments: Comments::new(),
-            text_key: None,
-            extra_text_keys: Vec::new(),
         };
         let spans: Vec<(Span, &str)> = strings.text_spans().collect();
         assert_eq!(

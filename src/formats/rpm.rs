@@ -20,13 +20,18 @@
 //! - `rpm.signature.algorithms[]` — Pike-style flag array. Each
 //!   entry is one of `rsa`, `dsa`, `pgp`, `gpg`; presence of the
 //!   array signals a signed package (no bool needed).
+//! - `rpm.limits[]` — `{stage, reason}` for a header left unread because it
+//!   exceeds the size cap: a coverage limit, not a parse failure. A header
+//!   that is malformed (bad magic, sizes running past the end of the file)
+//!   is recorded in `errors` instead.
 
 use crate::metric;
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
+use crate::formats::common::bytes_at::u32_be;
 use crate::formats::common::{XorScan, extract_binary_strings, put_str};
-use crate::output::{Metrics, Strings, Values};
+use crate::output::{Errors, Metrics, Stage, Strings, Values};
 
 const RPM_LEAD_MAGIC: [u8; 4] = [0xed, 0xab, 0xee, 0xdb];
 const RPM_HEADER_MAGIC: [u8; 3] = [0x8e, 0xad, 0xe8];
@@ -73,10 +78,11 @@ pub(super) fn extract(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
+    errors: &mut Errors,
 ) -> Result<(), Error> {
     extract_binary_strings(bytes, strings, XorScan::No);
 
-    if bytes.len() < LEAD_BYTES + 16 || bytes[..4] != RPM_LEAD_MAGIC {
+    if !bytes.starts_with(&RPM_LEAD_MAGIC) {
         return Ok(());
     }
     let mut pos = LEAD_BYTES;
@@ -84,9 +90,14 @@ pub(super) fn extract(
     // Signature header — record which cryptographic algorithms
     // signed the package. Presence of the array is the "signed"
     // signal.
-    let Some((sig_entries, _sig_data, sig_total)) = read_header(&bytes[pos..]) else {
-        return Ok(());
-    };
+    let (sig_entries, _sig_data, sig_total) =
+        match read_header(bytes.get(pos..).unwrap_or_default()) {
+            Ok(header) => header,
+            Err(e) => {
+                e.report("signature-header", values, errors);
+                return Ok(());
+            }
+        };
     let mut algos: Vec<&'static str> = Vec::new();
     for entry in &sig_entries {
         if entry.count == 0 {
@@ -118,23 +129,18 @@ pub(super) fn extract(
     }
     // Advance past the signature header and round up to the 8-byte
     // alignment boundary the main header is expected to sit at.
-    // `sig_total` is attacker-controlled — guard against arithmetic
-    // overflow and against landing past the end of the buffer.
-    let Some(after_sig) = pos.checked_add(sig_total) else {
-        return Ok(());
-    };
-    let padding = (8 - (after_sig % 8)) % 8;
-    let Some(aligned) = after_sig.checked_add(padding) else {
-        return Ok(());
-    };
-    if aligned >= bytes.len() {
-        return Ok(());
-    }
-    pos = aligned;
+    // `read_header` bounded `sig_total` by the buffer, so neither step
+    // can overflow.
+    let after_sig = pos + sig_total;
+    pos = after_sig + (8 - (after_sig % 8)) % 8;
 
     // Main header.
-    let Some((main_entries, main_data, _)) = read_header(&bytes[pos..]) else {
-        return Ok(());
+    let (main_entries, main_data, _) = match read_header(bytes.get(pos..).unwrap_or_default()) {
+        Ok(header) => header,
+        Err(e) => {
+            e.report("main-header", values, errors);
+            return Ok(());
+        }
     };
     for entry in &main_entries {
         apply_main_tag(entry, main_data, values, metrics);
@@ -186,7 +192,7 @@ fn script_body<'a>(entry: &IndexEntry, data: &'a [u8]) -> Option<&'a str> {
         .iter()
         .take(MAX_SCRIPT_BYTES + 1)
         .position(|&b| b == 0)?;
-    std::str::from_utf8(&bytes[..end]).ok()
+    std::str::from_utf8(bytes.get(..end)?).ok()
 }
 
 fn program_args(entry: &IndexEntry, data: &[u8]) -> Option<Vec<String>> {
@@ -200,12 +206,12 @@ fn program_args(entry: &IndexEntry, data: &[u8]) -> Option<Vec<String>> {
         return None;
     }
     let rest = data.get(entry.offset as usize..)?;
-    let mut rest = &rest[..rest.len().min(MAX_PROGRAM_BYTES)];
+    let mut rest = rest.get(..MAX_PROGRAM_BYTES).unwrap_or(rest);
     let mut result = Vec::with_capacity(entry.count as usize);
     for _ in 0..entry.count {
         let end = rest.iter().position(|&b| b == 0)?;
-        result.push(std::str::from_utf8(&rest[..end]).ok()?.to_owned());
-        rest = &rest[end + 1..];
+        result.push(std::str::from_utf8(rest.get(..end)?).ok()?.to_owned());
+        rest = rest.get(end + 1..)?;
     }
     Some(result)
 }
@@ -324,7 +330,7 @@ fn decode_string(entry: &IndexEntry, data: &[u8]) -> Option<String> {
     let off = entry.offset as usize;
     let rest = data.get(off..)?;
     let nul = rest.iter().position(|&b| b == 0)?;
-    let s = std::str::from_utf8(&rest[..nul]).ok()?;
+    let s = std::str::from_utf8(rest.get(..nul)?).ok()?;
     (!s.is_empty()).then(|| s.to_string())
 }
 
@@ -332,9 +338,7 @@ fn decode_u32(entry: &IndexEntry, data: &[u8]) -> Option<u32> {
     if entry.typ != 4 || entry.count != 1 {
         return None;
     }
-    let off = entry.offset as usize;
-    let bytes = data.get(off..off + 4)?.try_into().ok()?;
-    Some(u32::from_be_bytes(bytes))
+    u32_be(data, entry.offset as usize)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -345,39 +349,92 @@ struct IndexEntry {
     count: u32,
 }
 
-/// Parse one RPM header (magic + entries + data store). Returns
-/// `(entries, data_store, total_header_size)` or `None` on bounds
-/// failure.
-fn read_header(slice: &[u8]) -> Option<(Vec<IndexEntry>, &[u8], usize)> {
-    if slice.len() < 16 || slice[..3] != RPM_HEADER_MAGIC {
-        return None;
+/// Why an RPM header could not be read.
+#[derive(Debug)]
+enum HeaderError {
+    /// Bad magic, or a preamble, index or data store running past the end
+    /// of the file: the header is malformed or truncated.
+    Malformed(String),
+    /// The header fits in the file but exceeds [`MAX_HEADER_BYTES`]. It is
+    /// left unread as a coverage limit, not reported as a parse failure.
+    TooLarge(String),
+}
+
+impl HeaderError {
+    /// Record a malformed header in `errors`, or a size-capped one in
+    /// `rpm.limits`, attributed to `stage` (`signature-header` /
+    /// `main-header`).
+    fn report(self, stage: &str, values: &mut Values, errors: &mut Errors) {
+        match self {
+            Self::Malformed(why) => {
+                errors.record_malformed(Stage::RpmParse, format!("{stage}: {why}"))
+            }
+            Self::TooLarge(reason) => {
+                values.insert("rpm.limits", json!([{ "stage": stage, "reason": reason }]))
+            }
+        }
     }
-    let nindex = u32::from_be_bytes(slice[8..12].try_into().ok()?) as usize;
-    let hsize = u32::from_be_bytes(slice[12..16].try_into().ok()?) as usize;
-    let index_size = nindex.checked_mul(16)?;
-    if index_size > MAX_HEADER_BYTES || hsize > MAX_HEADER_BYTES {
-        return None;
+}
+
+/// One parsed RPM header: index entries, data store, and the header's
+/// total size in bytes (preamble + index + data store).
+type Header<'a> = (Vec<IndexEntry>, &'a [u8], usize);
+
+/// Parse one RPM header (magic + entries + data store).
+fn read_header(slice: &[u8]) -> Result<Header<'_>, HeaderError> {
+    if !slice.starts_with(&RPM_HEADER_MAGIC) {
+        let why = if slice.len() < RPM_HEADER_MAGIC.len() {
+            "file ends before the header"
+        } else {
+            "bad header magic"
+        };
+        return Err(HeaderError::Malformed(why.into()));
     }
-    let entries_end = 16usize.checked_add(index_size)?;
-    let data_end = entries_end.checked_add(hsize)?;
-    if data_end > slice.len() {
-        return None;
+    let (Some(nindex), Some(hsize)) = (u32_be(slice, 8), u32_be(slice, 12)) else {
+        return Err(HeaderError::Malformed("truncated 16-byte preamble".into()));
+    };
+    // Both sizes are attacker-controlled u32s; in u64 the sum cannot
+    // overflow. Bounds come first so a lying size reads as malformed, and
+    // only a header that really is this large reads as a capped limit.
+    let index_size = u64::from(nindex) * 16;
+    let total = 16 + index_size + u64::from(hsize);
+    if total > slice.len() as u64 {
+        return Err(HeaderError::Malformed(format!(
+            "{nindex} index entries and {hsize} data bytes run past the end of the file \
+             ({} bytes remain)",
+            slice.len()
+        )));
     }
-    let mut entries = Vec::with_capacity(nindex);
-    for i in 0..nindex {
-        let off = 16 + i * 16;
-        let tag = u32::from_be_bytes(slice[off..off + 4].try_into().ok()?);
-        let typ = u32::from_be_bytes(slice[off + 4..off + 8].try_into().ok()?);
-        let offset = u32::from_be_bytes(slice[off + 8..off + 12].try_into().ok()?);
-        let count = u32::from_be_bytes(slice[off + 12..off + 16].try_into().ok()?);
+    if index_size > MAX_HEADER_BYTES as u64 || u64::from(hsize) > MAX_HEADER_BYTES as u64 {
+        return Err(HeaderError::TooLarge(format!(
+            "{nindex} index entries and {hsize} data bytes exceed the {MAX_HEADER_BYTES}-byte \
+             header cap; not read"
+        )));
+    }
+    // Within the slice, so the conversions below are lossless.
+    let entries_end = 16 + index_size as usize;
+    let data_end = total as usize;
+    let mut entries = Vec::with_capacity(nindex as usize);
+    for raw in slice
+        .get(16..entries_end)
+        .unwrap_or_default()
+        .as_chunks::<16>()
+        .0
+    {
+        // `raw` is exactly 16 bytes, so every field read succeeds.
+        let field = |at| u32_be(raw, at).unwrap_or_default();
         entries.push(IndexEntry {
-            tag,
-            typ,
-            offset,
-            count,
+            tag: field(0),
+            typ: field(4),
+            offset: field(8),
+            count: field(12),
         });
     }
-    Some((entries, &slice[entries_end..data_end], data_end))
+    Ok((
+        entries,
+        slice.get(entries_end..data_end).unwrap_or_default(),
+        data_end,
+    ))
 }
 
 #[cfg(test)]
@@ -576,24 +633,35 @@ mod tests {
         out
     }
 
-    fn run(bytes: &[u8]) -> (Values, Metrics) {
+    fn run(bytes: &[u8]) -> (Values, Metrics, Errors) {
         let mut v = Values::new();
         let mut s = Strings::default();
         let mut m = Metrics::new();
-        extract(bytes, &mut v, &mut s, &mut m).unwrap();
-        (v, m)
+        let mut e = Errors::new();
+        extract(bytes, &mut v, &mut s, &mut m, &mut e).unwrap();
+        (v, m, e)
+    }
+
+    /// The one recorded error's stage, kind and message.
+    fn only_error(errors: &Errors) -> (Stage, crate::ErrorKind, &str) {
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let e = &errors.as_slice()[0];
+        (e.stage, e.kind, e.message.as_str())
     }
 
     #[test]
     fn rejects_non_rpm() {
-        let (v, _) = run(b"not an rpm");
+        let (v, _, e) = run(b"not an rpm");
         assert!(v.get("rpm.name").is_none());
+        assert!(e.is_empty());
     }
 
     #[test]
     fn surfaces_main_header() {
         let rpm = build_minimal_rpm();
-        let (v, m) = run(&rpm);
+        let (v, m, e) = run(&rpm);
+        assert!(e.is_empty(), "{e:?}");
+        assert!(v.get("rpm.limits").is_none());
         assert_eq!(v.get("rpm.name").and_then(|x| x.as_str()), Some("openssh"));
         assert_eq!(v.get("rpm.version").and_then(|x| x.as_str()), Some("9.9p1"));
         assert_eq!(
@@ -607,16 +675,78 @@ mod tests {
 
     #[test]
     fn truncated_lead_is_silent() {
-        let (v, _) = run(&[0u8; 10]);
+        let (v, _, e) = run(&[0u8; 10]);
         assert!(v.get("rpm.name").is_none());
+        assert!(e.is_empty());
     }
 
     #[test]
     fn wrong_lead_magic_is_silent() {
         let mut bad = vec![0u8; LEAD_BYTES + 16];
         bad[0..4].copy_from_slice(b"NOPE");
-        let (v, _) = run(&bad);
+        let (v, _, e) = run(&bad);
         assert!(v.get("rpm.name").is_none());
+        assert!(e.is_empty());
+    }
+
+    #[test]
+    fn rpm_cut_inside_the_lead_records_a_malformed_signature_header() {
+        let (v, _, e) = run(&build_minimal_rpm()[..LEAD_BYTES - 1]);
+        let (stage, kind, message) = only_error(&e);
+        assert_eq!(
+            (stage, kind),
+            (Stage::RpmParse, crate::ErrorKind::Malformed)
+        );
+        assert!(message.starts_with("signature-header:"), "{message}");
+        assert!(v.get("rpm.limits").is_none());
+    }
+
+    #[test]
+    fn bad_signature_header_magic_records_one_malformed_error() {
+        let mut rpm = build_minimal_rpm();
+        rpm[LEAD_BYTES] = 0;
+        let (v, _, e) = run(&rpm);
+        let (stage, kind, message) = only_error(&e);
+        assert_eq!(
+            (stage, kind),
+            (Stage::RpmParse, crate::ErrorKind::Malformed)
+        );
+        assert_eq!(message, "signature-header: bad header magic");
+        assert!(v.get("rpm.name").is_none());
+        assert!(v.get("rpm.limits").is_none());
+    }
+
+    /// A header that really is larger than the cap is a coverage limit, not
+    /// a parse failure: it lands in `rpm.limits` and leaves `errors` empty.
+    #[test]
+    fn oversized_signature_header_is_a_limit_not_an_error() {
+        let hsize = MAX_HEADER_BYTES + 1;
+        let mut rpm = build_minimal_rpm();
+        rpm[LEAD_BYTES + 12..LEAD_BYTES + 16].copy_from_slice(&(hsize as u32).to_be_bytes());
+        rpm.resize(LEAD_BYTES + 16 + hsize, 0);
+        let (v, _, e) = run(&rpm);
+        assert!(e.is_empty(), "{e:?}");
+        let limits = v.get("rpm.limits").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0]["stage"], "signature-header");
+        assert!(limits[0]["reason"].as_str().unwrap().contains("header cap"));
+    }
+
+    /// The same oversized claim in a file too short to hold it is a lying
+    /// size: malformed, not a limit.
+    #[test]
+    fn header_size_past_end_of_file_is_malformed_not_a_limit() {
+        let mut rpm = build_minimal_rpm();
+        rpm[LEAD_BYTES + 12..LEAD_BYTES + 16]
+            .copy_from_slice(&(MAX_HEADER_BYTES as u32 + 1).to_be_bytes());
+        let (v, _, e) = run(&rpm);
+        let (stage, kind, message) = only_error(&e);
+        assert_eq!(
+            (stage, kind),
+            (Stage::RpmParse, crate::ErrorKind::Malformed)
+        );
+        assert!(message.contains("past the end of the file"), "{message}");
+        assert!(v.get("rpm.limits").is_none());
     }
 
     #[test]
@@ -637,7 +767,28 @@ mod tests {
         out.extend_from_slice(&[0u8; 4]);
         out.extend_from_slice(&1u32.to_be_bytes());
         out.extend_from_slice(&100u32.to_be_bytes());
-        let (v, _) = run(&out);
+        let (v, _, e) = run(&out);
+        assert!(v.get("rpm.name").is_none());
+        let (stage, kind, message) = only_error(&e);
+        assert_eq!(
+            (stage, kind),
+            (Stage::RpmParse, crate::ErrorKind::Malformed)
+        );
+        assert!(message.starts_with("main-header:"), "{message}");
+    }
+
+    #[test]
+    fn rpm_ending_after_the_signature_header_records_a_missing_main_header() {
+        let rpm = build_minimal_rpm();
+        let (v, _, e) = run(&rpm[..LEAD_BYTES + 16]);
+        assert_eq!(
+            only_error(&e),
+            (
+                Stage::RpmParse,
+                crate::ErrorKind::Malformed,
+                "main-header: file ends before the header"
+            )
+        );
         assert!(v.get("rpm.name").is_none());
     }
 }

@@ -32,8 +32,8 @@ const BLOCK: usize = 512;
 
 /// Read a NUL-padded fixed-width tar header field.
 fn cstr_field(field: &[u8]) -> &str {
-    let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
-    std::str::from_utf8(&field[..end]).unwrap_or("").trim()
+    let text = field.split(|&b| b == 0).next().unwrap_or_default();
+    std::str::from_utf8(text).unwrap_or("").trim()
 }
 
 /// Read a tar octal size field. Malformed fields read as zero, which advances
@@ -70,8 +70,12 @@ pub(super) fn extract(
     let mut pkginfo: Option<String> = None;
     let mut signing_keys: Vec<String> = Vec::new();
     let mut off = 0usize;
-    while off + BLOCK < buf.len() {
-        let block = &buf[off..off + BLOCK];
+    // A header needs at least one byte after it to be worth reading.
+    while let Some((block, rest)) = buf
+        .get(off..)
+        .filter(|tail| tail.len() > BLOCK)
+        .and_then(<[u8]>::split_first_chunk::<BLOCK>)
+    {
         let name = cstr_field(&block[..100]);
         if name.is_empty() {
             // Terminator or padding between segments; step over it.
@@ -84,8 +88,8 @@ pub(super) fn extract(
         if name.starts_with(".SIGN.") {
             signing_keys.push(name.to_string());
         } else if name == ".PKGINFO" {
-            let end = body.saturating_add(size).min(buf.len());
-            pkginfo = Some(String::from_utf8_lossy(&buf[body..end]).into_owned());
+            let text = rest.get(..size).unwrap_or(rest);
+            pkginfo = Some(String::from_utf8_lossy(text).into_owned());
             // `.PKGINFO` is the last thing worth reading; the data segment
             // follows and must not be walked.
             break;

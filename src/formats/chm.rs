@@ -31,6 +31,7 @@
 use crate::metric;
 use serde_json::{Value as JsonValue, json};
 
+use crate::bytes::{self, Reader};
 use crate::error::Error;
 use crate::formats::common::{XorScan, extract_binary_strings};
 use crate::output::{Metrics, Strings, Values};
@@ -46,19 +47,25 @@ pub(super) fn extract(
 ) -> Result<(), Error> {
     extract_binary_strings(bytes, strings, XorScan::No);
 
-    if bytes.len() < 0x60 || &bytes[..4] != b"ITSF" {
+    let Some(header) = bytes
+        .first_chunk::<0x60>()
+        .filter(|h| h.starts_with(b"ITSF"))
+    else {
         return Ok(());
-    }
-    let version = u32_le(bytes, 0x04);
+    };
+    // Every field is read out of the 0x60-byte version-3 `header`, so none
+    // of the reads can come up short and the `unwrap_or(0)` defaults never
+    // apply.
+    let version = bytes::u32_le(header, 0x04).unwrap_or(0);
     if version != 3 {
         return Ok(());
     }
-    let timestamp_counter = u32_le(bytes, 0x10);
-    let lcid = u32_le(bytes, 0x14);
+    let timestamp_counter = bytes::u32_le(header, 0x10).unwrap_or(0);
+    let lcid = bytes::u32_le(header, 0x14).unwrap_or(0);
 
-    let section1_offset = u64_le(bytes, 0x48) as usize;
-    let section1_length = u64_le(bytes, 0x50) as usize;
-    let data_offset = u64_le(bytes, 0x58) as usize;
+    let section1_offset = bytes::u64_le(header, 0x48).unwrap_or(0) as usize;
+    let section1_length = bytes::u64_le(header, 0x50).unwrap_or(0) as usize;
+    let data_offset = bytes::u64_le(header, 0x58).unwrap_or(0) as usize;
 
     let mut itsf = serde_json::Map::new();
     itsf.insert("version".into(), json!(version));
@@ -337,11 +344,11 @@ struct ControlData {
 }
 
 fn parse_control_data(data: &[u8]) -> Option<ControlData> {
-    if data.len() < 0x1c || &data[4..8] != b"LZXC" {
+    if data.len() < 0x1c || data.get(4..8) != Some(b"LZXC") {
         return None;
     }
-    let reset_interval_chunks = u32_le(data, 0x0c);
-    let window_chunks = u32_le(data, 0x10);
+    let reset_interval_chunks = bytes::u32_le(data, 0x0c)?;
+    let window_chunks = bytes::u32_le(data, 0x10)?;
     Some(ControlData {
         reset_interval_chunks,
         window_bytes: u64::from(window_chunks) * 0x8000,
@@ -358,10 +365,10 @@ fn parse_reset_table(data: &[u8]) -> Option<ResetTable> {
     if data.len() < 0x28 {
         return None;
     }
-    let num_entries = u32_le(data, 0x04);
-    let entry_size = u32_le(data, 0x08);
-    let uncompressed_size = u64_le(data, 0x10);
-    let block_len = u64_le(data, 0x20);
+    let num_entries = bytes::u32_le(data, 0x04)?;
+    let entry_size = bytes::u32_le(data, 0x08)?;
+    let uncompressed_size = bytes::u64_le(data, 0x10)?;
+    let block_len = bytes::u64_le(data, 0x20)?;
     if entry_size != 8 || block_len == 0 {
         return None;
     }
@@ -391,12 +398,13 @@ fn read_uncompressed<'a>(bytes: &'a [u8], data_offset: usize, e: &DirEntry) -> O
 
 fn parse_directory(section: &[u8]) -> Vec<DirEntry> {
     let mut out = Vec::new();
-    if section.len() < 0x54 || &section[..4] != b"ITSP" {
+    if section.len() < 0x54 || !section.starts_with(b"ITSP") {
         return out;
     }
-    let header_len = u32_le(section, 0x08) as usize;
-    let chunk_size = u32_le(section, 0x10) as usize;
-    let chunk_count = u32_le(section, 0x2c) as usize;
+    // The length check above covers all three fields.
+    let header_len = bytes::u32_le(section, 0x08).unwrap_or(0) as usize;
+    let chunk_size = bytes::u32_le(section, 0x10).unwrap_or(0) as usize;
+    let chunk_count = bytes::u32_le(section, 0x2c).unwrap_or(0) as usize;
     if chunk_size < 0x14 {
         return out;
     }
@@ -410,21 +418,22 @@ fn parse_directory(section: &[u8]) -> Vec<DirEntry> {
         let Some(end) = off.checked_add(chunk_size) else {
             break;
         };
-        if end > section.len() {
+        let Some(chunk) = section.get(off..end) else {
             break;
-        }
-        let chunk = &section[off..end];
-        if &chunk[..4] != b"PMGL" {
+        };
+        if !chunk.starts_with(b"PMGL") {
             continue;
         }
-        let quickref = u32_le(chunk, 0x04) as usize;
+        let Some(quickref) = bytes::u32_le(chunk, 0x04).map(|n| n as usize) else {
+            continue;
+        };
         if quickref >= chunk_size {
             continue;
         }
         let entries_end = chunk_size - quickref;
         let mut pos = 0x14_usize;
         while pos < entries_end {
-            let Some((entry, consumed)) = parse_entry(&chunk[pos..entries_end]) else {
+            let Some((entry, consumed)) = chunk.get(pos..entries_end).and_then(parse_entry) else {
                 break;
             };
             pos += consumed;
@@ -434,21 +443,22 @@ fn parse_directory(section: &[u8]) -> Vec<DirEntry> {
     out
 }
 
+/// One PMGL directory entry: an ENCINT-prefixed name, then the section,
+/// offset and length ENCINTs. Returns the entry and the bytes it took.
 fn parse_entry(buf: &[u8]) -> Option<(DirEntry, usize)> {
-    let mut pos = 0_usize;
-    let (name_len, n) = read_encint(buf)?;
+    let (name_len, mut pos) = read_encint(buf)?;
+    // The length is attacker-controlled and an ENCINT reaches `u64::MAX`, so
+    // the end of the name is computed checked: `pos + name_len` used to
+    // overflow (a panic in debug builds, and a reversed slice range in
+    // release) before the bounds check could reject it.
+    let name_end = pos.checked_add(usize::try_from(name_len).ok()?)?;
+    let name = String::from_utf8_lossy(buf.get(pos..name_end)?).into_owned();
+    pos = name_end;
+    let (section, n) = read_encint(buf.get(pos..)?)?;
     pos += n;
-    let name_len = usize::try_from(name_len).ok()?;
-    if pos + name_len > buf.len() {
-        return None;
-    }
-    let name = String::from_utf8_lossy(&buf[pos..pos + name_len]).into_owned();
-    pos += name_len;
-    let (section, n) = read_encint(&buf[pos..])?;
+    let (offset, n) = read_encint(buf.get(pos..)?)?;
     pos += n;
-    let (offset, n) = read_encint(&buf[pos..])?;
-    pos += n;
-    let (length, n) = read_encint(&buf[pos..])?;
+    let (length, n) = read_encint(buf.get(pos..)?)?;
     pos += n;
     Some((
         DirEntry {
@@ -477,31 +487,24 @@ fn read_encint(buf: &[u8]) -> Option<(u64, usize)> {
 /// `::DataSpace/NameList` carries the content-section names (typically
 /// `Uncompressed` and `MSCompressed`). Layout: u16 length-in-words +
 /// u16 count + count × (u16 name_words + UTF-16LE name + u16 NUL).
-fn parse_namelist(bytes: &[u8]) -> Vec<String> {
-    if bytes.len() < 4 {
+fn parse_namelist(data: &[u8]) -> Vec<String> {
+    let Some(count) = bytes::u16_le(data, 2).map(usize::from) else {
         return Vec::new();
-    }
-    let count = u16_le(bytes, 2) as usize;
+    };
     let mut out = Vec::with_capacity(count);
-    let mut pos = 4_usize;
+    let mut names = Reader::at(data, 4);
     for _ in 0..count {
-        let Some(after_len) = pos.checked_add(2) else {
+        // A name counts only with its NUL terminator in the stream.
+        let Some(name_words) = names.u16_le() else {
             break;
         };
-        if after_len > bytes.len() {
-            break;
-        }
-        let name_words = u16_le(bytes, pos) as usize;
-        let nbytes = name_words.saturating_mul(2);
-        let Some(end) = after_len.checked_add(nbytes).and_then(|n| n.checked_add(2)) else {
+        let Some(raw) = names.bytes(usize::from(name_words) * 2) else {
             break;
         };
-        if end > bytes.len() {
+        if names.skip(2).is_none() {
             break;
         }
-        let name = utf16le_to_string(&bytes[after_len..after_len + nbytes]);
-        out.push(name);
-        pos = end;
+        out.push(utf16le_to_string(raw));
     }
     out
 }
@@ -523,25 +526,14 @@ struct SystemSummary {
 /// attribution-grade strings get surfaced as `chm.system.<field>`;
 /// the function also returns a small summary used by the
 /// consistency-check metrics in the caller.
-fn emit_system(bytes: &[u8], values: &mut Values) -> SystemSummary {
+fn emit_system(data: &[u8], values: &mut Values) -> SystemSummary {
     let mut summary = SystemSummary::default();
-    if bytes.len() < 4 {
-        return summary;
-    }
     let mut sys = serde_json::Map::new();
-    let mut pos = 4_usize;
-    while pos + 4 <= bytes.len() {
-        let code = u16_le(bytes, pos);
-        let len = u16_le(bytes, pos + 2) as usize;
-        pos += 4;
-        let Some(payload_end) = pos.checked_add(len) else {
-            break;
-        };
-        if payload_end > bytes.len() {
-            break;
-        }
-        let payload = &bytes[pos..payload_end];
-        pos = payload_end;
+    let mut records = Reader::at(data, 4);
+    while let Some(code) = records.u16_le()
+        && let Some(len) = records.u16_le()
+        && let Some(payload) = records.bytes(usize::from(len))
+    {
         match code {
             0 => {
                 if let Some(v) = insert_cstr(&mut sys, "default_topic", payload) {
@@ -556,13 +548,15 @@ fn emit_system(bytes: &[u8], values: &mut Values) -> SystemSummary {
                     summary.title = Some(v);
                 }
             }
-            3 if payload.len() >= 4 => {
-                let lcid = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                sys.insert("locale_id".into(), json!(lcid));
+            3 => {
+                if let Some(lcid) = bytes::u32_le(payload, 0) {
+                    sys.insert("locale_id".into(), json!(lcid));
+                }
             }
-            4 if payload.len() >= 8 => {
-                let ts = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-                sys.insert("timestamp".into(), json!(ts));
+            4 => {
+                if let Some(ts) = bytes::u32_le(payload, 4) {
+                    sys.insert("timestamp".into(), json!(ts));
+                }
             }
             5 => summary.infotype_count = summary.infotype_count.saturating_add(1),
             6 => {
@@ -590,11 +584,8 @@ fn insert_cstr(
     key: &str,
     payload: &[u8],
 ) -> Option<String> {
-    let nul = payload
-        .iter()
-        .position(|&c| c == 0)
-        .unwrap_or(payload.len());
-    let s = std::str::from_utf8(&payload[..nul]).ok()?;
+    let text = payload.split(|&c| c == 0).next().unwrap_or_default();
+    let s = std::str::from_utf8(text).ok()?;
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return None;
@@ -617,23 +608,13 @@ fn push_unique(features: &mut Vec<&'static str>, name: &'static str) {
 }
 
 fn utf16le_to_string(b: &[u8]) -> String {
-    let mut units = Vec::with_capacity(b.len() / 2);
-    let mut i = 0;
-    while i + 1 < b.len() {
-        units.push(u16::from_le_bytes([b[i], b[i + 1]]));
-        i += 2;
-    }
+    let units: Vec<u16> = b
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect();
     String::from_utf16_lossy(&units)
-}
-
-fn u16_le(buf: &[u8], off: usize) -> u16 {
-    crate::formats::common::bytes_at::u16_le(buf, off).unwrap_or(0)
-}
-fn u32_le(buf: &[u8], off: usize) -> u32 {
-    crate::formats::common::bytes_at::u32_le(buf, off).unwrap_or(0)
-}
-fn u64_le(buf: &[u8], off: usize) -> u64 {
-    crate::formats::common::bytes_at::u64_le(buf, off).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -765,5 +746,49 @@ mod tests {
         buf[0x08..0x0c].copy_from_slice(&4u32.to_le_bytes());
         buf[0x20..0x28].copy_from_slice(&100u64.to_le_bytes()); // block_len
         assert!(parse_reset_table(&buf).is_none());
+    }
+
+    /// An ENCINT that decodes to `u64::MAX`: nine continuation bytes and a
+    /// final `0x7F`.
+    const HUGE_ENCINT: [u8; 10] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F];
+
+    /// A directory entry whose name length is `u64::MAX` overflowed
+    /// `pos + name_len` and panicked (a reversed slice range in release
+    /// builds). It is a malformed entry: parsing stops there, and the
+    /// entries before it are kept.
+    #[test]
+    fn a_huge_entry_name_length_does_not_panic() {
+        assert_eq!(read_encint(&HUGE_ENCINT), Some((u64::MAX, 10)));
+        let mut entry = HUGE_ENCINT.to_vec();
+        entry.extend_from_slice(b"rest of the chunk");
+        assert!(parse_entry(&entry).is_none());
+
+        // The same entry reached through a whole file.
+        const CHUNK: usize = 0x200;
+        const ITSP_LEN: usize = 0x54;
+        let mut chunk = vec![0u8; CHUNK];
+        chunk[..4].copy_from_slice(b"PMGL");
+        let mut entries = vec![7u8];
+        entries.extend_from_slice(b"/a.html");
+        entries.extend_from_slice(&[0, 0, 1]); // section 0, offset 0, length 1
+        entries.extend_from_slice(&HUGE_ENCINT);
+        chunk[0x14..0x14 + entries.len()].copy_from_slice(&entries);
+        let mut itsp = vec![0u8; ITSP_LEN];
+        itsp[..4].copy_from_slice(b"ITSP");
+        itsp[0x08..0x0C].copy_from_slice(&(ITSP_LEN as u32).to_le_bytes());
+        itsp[0x10..0x14].copy_from_slice(&(CHUNK as u32).to_le_bytes());
+        itsp[0x2C..0x30].copy_from_slice(&1u32.to_le_bytes());
+        let mut buf = vec![0u8; 0x60];
+        buf[..4].copy_from_slice(b"ITSF");
+        buf[0x04..0x08].copy_from_slice(&3u32.to_le_bytes());
+        buf[0x48..0x50].copy_from_slice(&0x60u64.to_le_bytes());
+        buf[0x50..0x58].copy_from_slice(&((ITSP_LEN + CHUNK) as u64).to_le_bytes());
+        buf[0x58..0x60].copy_from_slice(&((0x60 + ITSP_LEN + CHUNK) as u64).to_le_bytes());
+        buf.extend_from_slice(&itsp);
+        buf.extend_from_slice(&chunk);
+        buf.push(b'x');
+        let (v, m) = run(&buf);
+        assert_eq!(v.get("chm.entries"), Some(&serde_json::json!(["/a.html"])));
+        assert_eq!(m.get("chm.user_entry_count"), Some(1.0));
     }
 }

@@ -11,6 +11,8 @@
 //! defeat parsers is a fact worth reporting, not a reason to return nothing,
 //! so a bad chunk stops the walk and keeps what came before it.
 
+use super::common::bytes_at::{u16_le, u32_le};
+
 /// One parsed element: its tag name and resolved attributes.
 pub(super) struct Element {
     pub name: String,
@@ -31,42 +33,29 @@ pub(super) fn looks_like_axml(data: &[u8]) -> bool {
     if data.len() < 12 || data.len() > 16 * 1024 * 1024 {
         return false;
     }
-    u16_at(data, 0) == Some(0x0003)
-        && u16_at(data, 2) == Some(8)
-        && u32_at(data, 4) == Some(data.len() as u32)
-        && u16_at(data, 8) == Some(TYPE_STRING_POOL)
-}
-
-fn u16_at(b: &[u8], off: usize) -> Option<u16> {
-    Some(u16::from_le_bytes([*b.get(off)?, *b.get(off + 1)?]))
-}
-
-fn u32_at(b: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_le_bytes([
-        *b.get(off)?,
-        *b.get(off + 1)?,
-        *b.get(off + 2)?,
-        *b.get(off + 3)?,
-    ]))
+    u16_le(data, 0) == Some(0x0003)
+        && u16_le(data, 2) == Some(8)
+        && u32_le(data, 4) == Some(data.len() as u32)
+        && u16_le(data, 8) == Some(TYPE_STRING_POOL)
 }
 
 /// Decode the string pool. Entries are UTF-16LE by default, UTF-8 when the
 /// pool sets `UTF8_FLAG`; both use a length prefix that extends to two units
 /// when the high bit is set.
 fn parse_string_pool(chunk: &[u8]) -> Vec<String> {
-    let Some(count) = u32_at(chunk, 8).map(|v| v as usize) else {
+    let Some(count) = u32_le(chunk, 8).map(|v| v as usize) else {
         return Vec::new();
     };
-    let Some(flags) = u32_at(chunk, 16) else {
+    let Some(flags) = u32_le(chunk, 16) else {
         return Vec::new();
     };
-    let Some(strings_start) = u32_at(chunk, 20).map(|v| v as usize) else {
+    let Some(strings_start) = u32_le(chunk, 20).map(|v| v as usize) else {
         return Vec::new();
     };
     let utf8 = flags & UTF8_FLAG != 0;
     let mut out = Vec::with_capacity(count.min(4096));
     for i in 0..count.min(65_536) {
-        let Some(offset) = u32_at(chunk, 28 + i * 4).map(|v| v as usize) else {
+        let Some(offset) = u32_le(chunk, 28 + i * 4).map(|v| v as usize) else {
             break;
         };
         let Some(at) = strings_start.checked_add(offset) else {
@@ -85,17 +74,20 @@ fn decode_string(chunk: &[u8], at: usize, utf8: bool) -> Option<String> {
         let end = after.checked_add(len)?;
         Some(String::from_utf8_lossy(chunk.get(after..end)?).into_owned())
     } else {
-        let first = u16_at(chunk, at)? as usize;
+        let first = u16_le(chunk, at)? as usize;
         let (len, start) = if first & 0x8000 != 0 {
             // High bit set: the length spans two units.
-            let low = u16_at(chunk, at + 2)? as usize;
-            ((((first & 0x7fff) << 16) | low), at + 4)
+            let low = u16_le(chunk, at.checked_add(2)?)? as usize;
+            ((((first & 0x7fff) << 16) | low), at.checked_add(4)?)
         } else {
-            (first, at + 2)
+            (first, at.checked_add(2)?)
         };
-        let units: Vec<u16> = (0..len)
-            .map(|i| u16_at(chunk, start + i * 2).unwrap_or(0))
-            .collect();
+        // A length running past the chunk is truncated, as in the UTF-8 arm.
+        // The declared length (up to 2^31 units) must not size an allocation
+        // the chunk cannot back.
+        let end = start.checked_add(len.checked_mul(2)?)?;
+        let (units, _) = chunk.get(start..end)?.as_chunks::<2>();
+        let units: Vec<u16> = units.iter().map(|&unit| u16::from_le_bytes(unit)).collect();
         Some(String::from_utf16_lossy(&units))
     }
 }
@@ -145,17 +137,20 @@ pub(super) fn parse(bytes: &[u8]) -> Vec<Element> {
     // Skip the 8-byte document header, then walk sibling chunks.
     let mut off = 8usize;
     while off + 8 <= bytes.len() && elements.len() < MAX_ELEMENTS {
-        let Some(chunk_type) = u16_at(bytes, off) else {
+        let Some(chunk_type) = u16_le(bytes, off) else {
             break;
         };
-        let Some(size) = u32_at(bytes, off + 4).map(|v| v as usize) else {
+        let Some(size) = u32_le(bytes, off + 4).map(|v| v as usize) else {
             break;
         };
         // A zero or out-of-range size would loop forever or read past the end.
-        if size < 8 || off + size > bytes.len() {
+        let Some(chunk) = off
+            .checked_add(size)
+            .filter(|_| size >= 8)
+            .and_then(|end| bytes.get(off..end))
+        else {
             break;
-        }
-        let chunk = &bytes[off..off + size];
+        };
         match chunk_type {
             TYPE_STRING_POOL => pool = parse_string_pool(chunk),
             TYPE_START_ELEMENT => {
@@ -199,10 +194,10 @@ pub(super) fn extract_values(bytes: &[u8], values: &mut crate::output::Values) {
 fn parse_start_element(chunk: &[u8], pool: &[String]) -> Option<Element> {
     // header: type/headerSize/size (8) + lineNumber (4) + comment (4)
     // body:   ns (4) + name (4) + attrStart (2) + attrSize (2) + attrCount (2)
-    let name = pool_str(pool, u32_at(chunk, 20)?);
-    let attr_start = u16_at(chunk, 24)? as usize;
-    let attr_size = u16_at(chunk, 26)? as usize;
-    let attr_count = u16_at(chunk, 28)? as usize;
+    let name = pool_str(pool, u32_le(chunk, 20)?);
+    let attr_start = u16_le(chunk, 24)? as usize;
+    let attr_size = u16_le(chunk, 26)? as usize;
+    let attr_count = u16_le(chunk, 28)? as usize;
     let mut attrs = Vec::new();
     // 20 bytes is the documented per-attribute record: ns(4) name(4)
     // rawValue(4) size(2) res0(1) dataType(1) data(4). Any other stride means
@@ -213,16 +208,16 @@ fn parse_start_element(chunk: &[u8], pool: &[String]) -> Option<Element> {
     }
     for i in 0..attr_count.min(512) {
         let at = 16 + attr_start + i * attr_size;
-        let Some(name_idx) = u32_at(chunk, at + 4) else {
+        let Some(name_idx) = u32_le(chunk, at + 4) else {
             break;
         };
-        let Some(raw_idx) = u32_at(chunk, at + 8) else {
+        let Some(raw_idx) = u32_le(chunk, at + 8) else {
             break;
         };
         let Some(data_type) = chunk.get(at + 15).copied() else {
             break;
         };
-        let Some(data) = u32_at(chunk, at + 16) else {
+        let Some(data) = u32_le(chunk, at + 16) else {
             break;
         };
         let attr_name = pool_str(pool, name_idx);
@@ -324,6 +319,20 @@ mod tests {
         let mut b = vec![0x03, 0x00, 0x08, 0x00, 0, 0, 0, 0];
         b.extend_from_slice(&[0x02, 0x01, 0x10, 0x00, 0, 0, 0, 0]);
         assert!(parse(&b).is_empty());
+    }
+
+    /// A UTF-16 string whose two-unit length claims 2^31 units used to size a
+    /// 4 GiB buffer of phantom zero units. It now reads as truncated, like a
+    /// UTF-8 string that runs past the pool.
+    #[test]
+    fn utf16_length_past_the_pool_is_truncated_not_allocated() {
+        let mut chunk = vec![0u8; 28];
+        chunk.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, b'a', 0]);
+        assert_eq!(decode_string(&chunk, 28, false), None);
+        // An in-bounds string still decodes.
+        let mut chunk = vec![0u8; 28];
+        chunk.extend_from_slice(&[2, 0, b'h', 0, b'i', 0, 0, 0]);
+        assert_eq!(decode_string(&chunk, 28, false).as_deref(), Some("hi"));
     }
 
     #[test]

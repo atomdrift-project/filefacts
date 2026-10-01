@@ -23,6 +23,7 @@ use serde_json::Value as JsonValue;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
+use crate::formats::common::bytes_at::{u16_le, u32_le};
 use crate::output::Values;
 
 /// Parse the Certificate Table contents `cert_table_bytes` (the bytes
@@ -42,21 +43,23 @@ pub(super) fn parse(cert_table_bytes: &[u8], values: &mut Values) {
     let mut pos = 0;
     let mut signatures: Vec<JsonValue> = Vec::new();
     while pos + 8 <= cert_table_bytes.len() {
-        let length = u32::from_le_bytes([
-            cert_table_bytes[pos],
-            cert_table_bytes[pos + 1],
-            cert_table_bytes[pos + 2],
-            cert_table_bytes[pos + 3],
-        ]) as usize;
+        let Some(length) = u32_le(cert_table_bytes, pos) else {
+            break;
+        };
+        let length = length as usize;
         if length < 8 || pos + length > cert_table_bytes.len() {
             break;
         }
-        let cert_type = u16::from_le_bytes([cert_table_bytes[pos + 6], cert_table_bytes[pos + 7]]);
+        let Some(cert_type) = u16_le(cert_table_bytes, pos + 6) else {
+            break;
+        };
         // 0x0002 = WIN_CERT_TYPE_PKCS_SIGNED_DATA. Other types
         // (x.509 cert wrapper, reserved, TS_STACK_SIGNED) are not
         // currently parsed.
         if cert_type == 0x0002 {
-            let blob = &cert_table_bytes[pos + 8..pos + length];
+            let Some(blob) = cert_table_bytes.get(pos + 8..pos + length) else {
+                break;
+            };
             // `dwLength` rounds the PKCS#7 blob up to an 8-byte
             // boundary with null padding; the DER decoder rejects that
             // padding as trailing garbage. Trim to the SEQUENCE's
@@ -356,11 +359,8 @@ fn is_ecdsa_oid(oid: &str) -> bool {
 fn encode_signed_attrs(signer: &cms::signed_data::SignerInfo) -> Option<Vec<u8>> {
     let attrs = signer.signed_attrs.as_ref()?;
     let mut der = attrs.to_der().ok()?;
-    if der.is_empty() {
-        return None;
-    }
     // Re-tag from [0] IMPLICIT (0xA0) to SET OF (0x31).
-    der[0] = 0x31;
+    *der.first_mut()? = 0x31;
     Some(der)
 }
 
@@ -639,7 +639,7 @@ fn gen_time_from_token(token_der: &[u8]) -> Option<(String, i64)> {
     let at = token_der
         .windows(TST_INFO_OID_DER.len())
         .position(|w| w == TST_INFO_OID_DER)?;
-    let after_oid = &token_der[at + TST_INFO_OID_DER.len()..];
+    let after_oid = token_der.get(at + TST_INFO_OID_DER.len()..)?;
 
     let (tag, explicit, _) = read_tlv(after_oid)?;
     // [0] EXPLICIT, constructed.
@@ -680,10 +680,7 @@ fn read_tlv(bytes: &[u8]) -> Option<(u8, &[u8], &[u8])> {
         (len, 2 + n)
     };
     let end = header.checked_add(len)?;
-    if end > bytes.len() {
-        return None;
-    }
-    Some((tag, &bytes[header..end], &bytes[end..]))
+    Some((tag, bytes.get(header..end)?, bytes.get(end..)?))
 }
 
 /// Pull `genTime` out of a TSTInfo body.
@@ -718,7 +715,9 @@ fn parse_generalized_time(text: &str) -> Option<(String, i64)> {
     if digits.len() < 14 {
         return None;
     }
-    let num = |a: usize, b: usize| digits[a..b].parse::<i64>().ok();
+    // `str::get`: the text is only known to be UTF-8, so a multi-byte char
+    // can put a field edge off a char boundary.
+    let num = |a: usize, b: usize| digits.get(a..b)?.parse::<i64>().ok();
     let (y, mo, d) = (num(0, 4)?, num(4, 6)?, num(6, 8)?);
     let (h, mi, sec) = (num(8, 10)?, num(10, 12)?, num(12, 14)?);
     // Days since epoch via the civil-from-days algorithm (Howard Hinnant).
@@ -951,30 +950,24 @@ fn parse_spc_indirect_inner(der: &[u8]) -> Option<(&'static str, String)> {
 ///   blobs never reach those scales and longer encodings are typically
 ///   malformed.
 fn trim_to_der_object(bytes: &[u8]) -> Option<&[u8]> {
-    if bytes.len() < 2 {
-        return None;
-    }
     // The leading tag byte: we don't constrain it (Authenticode wraps a
     // SEQUENCE `0x30`, but the helper is intentionally tag-agnostic).
-    let len_byte = bytes[1];
+    let len_byte = *bytes.get(1)?;
     let (header_size, content_len) = if len_byte & 0x80 == 0 {
         (2_usize, len_byte as usize)
     } else {
         let n = (len_byte & 0x7f) as usize;
-        if n == 0 || n > 8 || bytes.len() < 2 + n {
+        if n == 0 || n > 8 {
             return None;
         }
         let mut content_len = 0_usize;
-        for &b in &bytes[2..2 + n] {
+        for &b in bytes.get(2..2 + n)? {
             content_len = (content_len << 8) | (b as usize);
         }
         (2 + n, content_len)
     };
     let total = header_size.checked_add(content_len)?;
-    if total > bytes.len() {
-        return None;
-    }
-    Some(&bytes[..total])
+    bytes.get(..total)
 }
 
 /// Seconds since the Unix epoch for an X.509 validity instant.
@@ -1440,6 +1433,15 @@ mod tests {
     fn generalized_time_rejects_truncated_input() {
         assert!(parse_generalized_time("2023Z").is_none());
         assert!(parse_generalized_time("20230406164252").is_none());
+    }
+
+    /// genTime sits in the timestamp token, an unsigned attribute anyone can
+    /// rewrite. Valid UTF-8 with a two-byte char straddling a field edge used
+    /// to panic slicing the year off at a non-char boundary.
+    #[test]
+    fn generalized_time_rejects_multibyte_char_across_field_edge() {
+        assert!(parse_generalized_time("200\u{e9}0406164252Z").is_none());
+        assert!(parse_generalized_time("2023040616425\u{e9}Z").is_none());
     }
 
     /// genTime is the fifth TSTInfo element; the walk must skip exactly the

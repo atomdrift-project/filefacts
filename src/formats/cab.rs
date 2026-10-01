@@ -24,12 +24,38 @@
 
 use std::io::Cursor;
 
-use serde_json::{Map as JsonMap, Value as JsonValue};
+use serde_json::Value as JsonValue;
 
+use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_value};
+use crate::bytes;
 use crate::error::Error;
-use crate::formats::common::bytes_at;
 use crate::metric;
 use crate::output::{ArchiveCompression, ArchiveMember, ArchiveOffsets, Metrics, Values};
+
+/// The shared aggregates a cabinet reports. Every CFFILE is a file (paths
+/// carry their folders inline), and a hidden member is one with the DOS
+/// hidden attribute. CFFILE records no per-member compressed size, so
+/// `archive.compression.ratio` is taken against the declared cabinet size
+/// instead, below.
+const AGGS: &[Agg] = &[
+    Agg::MemberCount,
+    Agg::FileCount,
+    Agg::DirectoryCount,
+    Agg::UncompressedSize(Scope::All),
+    Agg::Executables,
+    Agg::Scripts,
+    Agg::NestedArchives,
+    Agg::PathTraversal(Scope::All),
+    Agg::HiddenFiles,
+    Agg::NameTricks,
+    Agg::MisplacedExecutables,
+    Agg::NoiseFiles,
+    Agg::MaxFilenameLength,
+    Agg::DuplicateMembers,
+    // An undated CFFILE is the same observation zip records as a sentinel
+    // mtime.
+    Agg::SentinelMtimes,
+];
 
 const FLAG_PREV_CABINET: u16 = 0x1;
 const FLAG_NEXT_CABINET: u16 = 0x2;
@@ -57,48 +83,50 @@ struct Header {
     nonzero_reserved: u8,
 }
 
-fn u16_at(b: &[u8], off: usize) -> u16 {
-    bytes_at::u16_le(b, off).unwrap_or(0)
-}
-
-fn u32_at(b: &[u8], off: usize) -> u32 {
-    bytes_at::u32_le(b, off).unwrap_or(0)
-}
-
 /// Read a NUL-terminated string, returning it and the offset just past it.
 fn cstr_at(bytes: &[u8], off: usize) -> Option<(String, usize)> {
+    let field = bytes.get(off..)?;
     // The spec caps these at 255 bytes including the terminator.
-    let end = bytes.iter().skip(off).take(256).position(|&b| b == 0)? + off;
-    let text = String::from_utf8_lossy(&bytes[off..end]).into_owned();
-    Some((text, end + 1))
+    let len = field.iter().take(256).position(|&b| b == 0)?;
+    let text = String::from_utf8_lossy(field.get(..len)?).into_owned();
+    Some((text, off + len + 1))
 }
 
 fn parse_header(bytes: &[u8]) -> Result<Header, Error> {
-    if bytes.len() < CFHEADER_FIXED_LEN || &bytes[..4] != b"MSCF" {
+    let Some(fixed) = bytes
+        .first_chunk::<CFHEADER_FIXED_LEN>()
+        .filter(|f| f.starts_with(b"MSCF"))
+    else {
         return Err(Error::malformed(
             "cab",
             "not a cabinet (bad CFHEADER magic)",
         ));
-    }
+    };
+    // Every fixed field below is read out of `fixed`, so none of the reads
+    // can come up short and the `unwrap_or(0)` defaults never apply.
+    //
     // reserved1/2/3 are defined as zero. A writer that puts bytes there is
     // either a non-conforming builder worth fingerprinting or using the field
     // to carry data past readers that skip it.
-    let nonzero_reserved = u8::from(u32_at(bytes, 0x04) != 0)
-        + u8::from(u32_at(bytes, 0x0c) != 0)
-        + u8::from(u32_at(bytes, 0x14) != 0);
+    let nonzero_reserved = u8::from(bytes::u32_le(fixed, 0x04).unwrap_or(0) != 0)
+        + u8::from(bytes::u32_le(fixed, 0x0c).unwrap_or(0) != 0)
+        + u8::from(bytes::u32_le(fixed, 0x14).unwrap_or(0) != 0);
 
-    let flags = u16_at(bytes, 0x1e);
+    let flags = bytes::u16_le(fixed, 0x1e).unwrap_or(0);
     let mut pos = CFHEADER_FIXED_LEN;
     let mut header_reserve = Vec::new();
     let mut folder_reserve_size = 0u8;
     let mut data_reserve_size = 0u8;
-    if flags & FLAG_RESERVE_PRESENT != 0 && bytes.len() >= pos + 4 {
-        let header_reserve_size = u16_at(bytes, pos) as usize;
-        folder_reserve_size = bytes[pos + 2];
-        data_reserve_size = bytes[pos + 3];
+    if flags & FLAG_RESERVE_PRESENT != 0
+        && let Some(&[size_lo, size_hi, folder_size, data_size]) =
+            bytes.get(pos..).and_then(|rest| rest.first_chunk::<4>())
+    {
+        let header_reserve_size = usize::from(u16::from_le_bytes([size_lo, size_hi]));
+        folder_reserve_size = folder_size;
+        data_reserve_size = data_size;
         pos += 4;
         let end = pos.saturating_add(header_reserve_size).min(bytes.len());
-        header_reserve = bytes[pos..end].to_vec();
+        header_reserve = bytes.get(pos..end).unwrap_or_default().to_vec();
         pos = end;
     }
     let prev_cabinet = if flags & FLAG_PREV_CABINET != 0 {
@@ -119,15 +147,15 @@ fn parse_header(bytes: &[u8]) -> Result<Header, Error> {
     };
 
     Ok(Header {
-        declared_total_size: u32_at(bytes, 0x08),
-        first_file_offset: u32_at(bytes, 0x10),
-        version_minor: bytes[0x18],
-        version_major: bytes[0x19],
-        declared_folder_count: u16_at(bytes, 0x1a),
-        declared_file_count: u16_at(bytes, 0x1c),
+        declared_total_size: bytes::u32_le(fixed, 0x08).unwrap_or(0),
+        first_file_offset: bytes::u32_le(fixed, 0x10).unwrap_or(0),
+        version_minor: fixed[0x18],
+        version_major: fixed[0x19],
+        declared_folder_count: bytes::u16_le(fixed, 0x1a).unwrap_or(0),
+        declared_file_count: bytes::u16_le(fixed, 0x1c).unwrap_or(0),
         flags,
-        set_id: u16_at(bytes, 0x20),
-        set_index: u16_at(bytes, 0x22),
+        set_id: bytes::u16_le(fixed, 0x20).unwrap_or(0),
+        set_index: bytes::u16_le(fixed, 0x22).unwrap_or(0),
         header_reserve,
         folder_reserve_size,
         data_reserve_size,
@@ -168,9 +196,10 @@ fn is_pkcs7_signed_data(der: &[u8]) -> bool {
     ];
     der.first() == Some(&0x30)
         && der.len() > 16
-        && der[..16]
-            .windows(SIGNED_DATA_OID.len())
-            .any(|w| w == SIGNED_DATA_OID)
+        && der.get(..16).is_some_and(|head| {
+            head.windows(SIGNED_DATA_OID.len())
+                .any(|w| w == SIGNED_DATA_OID)
+        })
 }
 
 /// Name the compression scheme including its parameters. `Debug` alone would
@@ -306,29 +335,13 @@ pub(super) fn extract(
     }
 
     let mut members = Vec::new();
-    let mut total_size = 0u64;
-    let mut file_count = 0u64;
-    let mut executable_count = 0u64;
-    let mut script_count = 0u64;
-    let mut nested_archive_count = 0u64;
-    let mut traversal_count = 0u64;
-    let mut hidden_count = 0u64;
+    let mut stats = ArchiveStats::new(AGGS);
     let mut system_count = 0u64;
     let mut exec_attr_count = 0u64;
     let mut readonly_count = 0u64;
     let mut utf8_name_count = 0u64;
-    let mut undated_count = 0u64;
     let mut folder_count = 0u64;
     let mut data_block_count = 0u64;
-    let mut unicode_count = 0u64;
-    let mut homoglyph_count = 0u64;
-    let mut rtlo_count = 0u64;
-    let mut double_extension_count = 0u64;
-    let mut misplaced_executable_count = 0u64;
-    let mut noise_count = 0u64;
-    let mut max_filename_length = 0u64;
-    let mut seen_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut duplicate_count = 0u64;
     let mut compressions: Vec<String> = Vec::new();
 
     match cab::Cabinet::new(Cursor::new(bytes)) {
@@ -342,78 +355,17 @@ pub(super) fn extract(
                 }
 
                 for file in folder.file_entries() {
-                    // CFFILE stores a backslash-separated path; normalize so
-                    // member rules written against `a/b/c` match a cabinet the
-                    // same way they match a zip.
-                    let path = file.name().replace('\\', "/");
-                    let size = u64::from(file.uncompressed_size());
-                    let mtime_unix = file.datetime().map(|dt| dt.assume_utc().unix_timestamp());
-                    if mtime_unix.is_none() {
+                    let member = ArchiveMember {
+                        // CFFILE stores a backslash-separated path; normalize
+                        // so member rules written against `a/b/c` match a
+                        // cabinet the same way they match a zip.
+                        path: file.name().replace('\\', "/"),
+                        size_bytes: u64::from(file.uncompressed_size()),
+                        entry_type: Some("regular".into()),
                         // The crate returns None for a DOS date/time that does
                         // not describe a real instant -- a builder artifact or
                         // a deliberate scrub.
-                        undated_count += 1;
-                    }
-
-                    let class = super::zip::classify_filename(&path);
-                    file_count += 1;
-                    total_size = total_size.saturating_add(size);
-                    executable_count += u64::from(class.is_executable);
-                    script_count += u64::from(class.is_script);
-                    nested_archive_count += u64::from(class.is_nested_archive);
-                    traversal_count += u64::from(class.has_path_traversal);
-                    // The DOS attribute bits are the cabinet's own claim about
-                    // the member, independent of its name -- a payload can be
-                    // marked hidden/system while carrying an innocuous
-                    // extension.
-                    unicode_count += u64::from(class.is_unicode);
-                    homoglyph_count += u64::from(class.has_homoglyph);
-                    rtlo_count += u64::from(class.has_rtlo);
-                    double_extension_count += u64::from(class.has_double_extension);
-                    misplaced_executable_count += u64::from(class.is_misplaced_executable);
-                    noise_count += u64::from(super::zip::is_noise_filename(&path));
-                    max_filename_length = max_filename_length.max(path.len() as u64);
-                    // Two members under one name: which one a reader gets
-                    // depends on whether it keeps the first or the last.
-                    if !seen_names.insert(path.clone()) {
-                        duplicate_count += 1;
-                    }
-                    hidden_count += u64::from(file.is_hidden());
-                    system_count += u64::from(file.is_system());
-                    exec_attr_count += u64::from(file.is_exec());
-                    readonly_count += u64::from(file.is_read_only());
-                    utf8_name_count += u64::from(file.is_name_utf());
-
-                    let mut member = JsonMap::new();
-                    member.insert("path".into(), JsonValue::String(path.clone()));
-                    member.insert("size_bytes".into(), JsonValue::Number(size.into()));
-                    member.insert("entry_type".into(), JsonValue::String("regular".into()));
-                    member.insert(
-                        "compression_method".into(),
-                        JsonValue::String(method.clone()),
-                    );
-                    if let Some(mtime) = mtime_unix {
-                        member.insert("mtime_unix".into(), JsonValue::Number(mtime.into()));
-                    }
-                    for (key, set) in [
-                        ("hidden", file.is_hidden()),
-                        ("system", file.is_system()),
-                        ("executable", file.is_exec()),
-                        ("read_only", file.is_read_only()),
-                        ("name_utf8", file.is_name_utf()),
-                        ("archive_attr", file.is_archive()),
-                    ] {
-                        if set {
-                            member.insert(key.into(), JsonValue::Bool(true));
-                        }
-                    }
-                    members.push(JsonValue::Object(member));
-
-                    archive_members.push(ArchiveMember {
-                        path,
-                        size_bytes: size,
-                        entry_type: Some("regular".into()),
-                        mtime_unix,
+                        mtime_unix: file.datetime().map(|dt| dt.assume_utc().unix_timestamp()),
                         linkname: None,
                         host_os: None,
                         crc32: None,
@@ -424,7 +376,34 @@ pub(super) fn extract(
                         }),
                         ownership: None,
                         offsets: ArchiveOffsets::default(),
-                    });
+                    };
+                    // The DOS attribute bits are the cabinet's own claim about
+                    // the member, independent of its name -- a payload can be
+                    // marked hidden/system while carrying an innocuous
+                    // extension.
+                    let mut reading = Reading::of(&member);
+                    reading.hidden = file.is_hidden();
+                    stats.observe(&member, &reading);
+                    system_count += u64::from(file.is_system());
+                    exec_attr_count += u64::from(file.is_exec());
+                    readonly_count += u64::from(file.is_read_only());
+                    utf8_name_count += u64::from(file.is_name_utf());
+
+                    let mut obj = member_value(&member, Shape::FULL);
+                    for (key, set) in [
+                        ("hidden", file.is_hidden()),
+                        ("system", file.is_system()),
+                        ("executable", file.is_exec()),
+                        ("read_only", file.is_read_only()),
+                        ("name_utf8", file.is_name_utf()),
+                        ("archive_attr", file.is_archive()),
+                    ] {
+                        if set {
+                            obj.insert(key.into(), JsonValue::Bool(true));
+                        }
+                    }
+                    members.push(JsonValue::Object(obj));
+                    archive_members.push(member);
                 }
             }
         }
@@ -454,55 +433,14 @@ pub(super) fn extract(
         values.insert("cab.limits", JsonValue::Array(limits));
     }
 
-    metrics.insert(metric!("archive.member_count"), file_count as f64);
-    metrics.insert(metric!("archive.file_count"), file_count as f64);
-    // CAB has no directory entries: paths carry their folders inline.
-    metrics.insert(metric!("archive.directory_count"), 0.0);
-    metrics.insert(metric!("archive.uncompressed_size"), total_size as f64);
-    metrics.insert(metric!("archive.executable_count"), executable_count as f64);
-    metrics.insert(metric!("archive.script_count"), script_count as f64);
-    metrics.insert(
-        metric!("archive.nested_archive_count"),
-        nested_archive_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.path_traversal_count"),
-        traversal_count as f64,
-    );
-    metrics.insert(metric!("archive.hidden_file_count"), hidden_count as f64);
-    metrics.insert(
-        metric!("archive.unicode_filename_count"),
-        unicode_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.homoglyph_filename_count"),
-        homoglyph_count as f64,
-    );
-    metrics.insert(metric!("archive.rtlo_filename_count"), rtlo_count as f64);
-    metrics.insert(
-        metric!("archive.double_extension_count"),
-        double_extension_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.misplaced_executable_count"),
-        misplaced_executable_count as f64,
-    );
-    metrics.insert(metric!("archive.noise_file_count"), noise_count as f64);
-    metrics.insert(
-        metric!("archive.max_filename_length"),
-        max_filename_length as f64,
-    );
-    metrics.insert(
-        metric!("archive.duplicate_member_count"),
-        duplicate_count as f64,
-    );
+    stats.emit(values, metrics);
     // Expansion against the cabinet's own declared size: the ratio a CAB bomb
     // shows up in, and the only compression figure CAB affords, since CFFILE
     // records no per-member compressed size.
     if header.declared_total_size > 0 {
         metrics.insert(
             metric!("archive.compression.ratio"),
-            total_size as f64 / f64::from(header.declared_total_size),
+            stats.uncompressed_size() as f64 / f64::from(header.declared_total_size),
         );
     }
     metrics.insert(metric!("cab.folder_count"), folder_count as f64);
@@ -511,12 +449,6 @@ pub(super) fn extract(
     metrics.insert(metric!("cab.exec_attribute_count"), exec_attr_count as f64);
     metrics.insert(metric!("cab.readonly_file_count"), readonly_count as f64);
     metrics.insert(metric!("cab.utf8_name_count"), utf8_name_count as f64);
-    // A DOS date/time that does not describe a real instant is the same
-    // observation zip records as a sentinel mtime.
-    metrics.insert(
-        metric!("archive.timing.sentinel_mtime_count"),
-        undated_count as f64,
-    );
     // The header says how many folders and files to expect. A table that does
     // not match it has been edited after the fact, or is being hidden from
     // readers that trust the count instead of walking.
@@ -531,7 +463,7 @@ pub(super) fn extract(
     metrics.insert(
         metric!("cab.file_count_mismatch"),
         f64::from(u8::from(
-            u64::from(header.declared_file_count) != file_count,
+            u64::from(header.declared_file_count) != stats.member_count(),
         )),
     );
     Ok(())
@@ -619,16 +551,6 @@ mod tests {
             Some("1.3")
         );
         assert!(metrics.get("cab.declared_total_size").unwrap() > 0.0);
-    }
-
-    /// The fixed-width readers bounds-check instead of indexing, so a read
-    /// past the end yields 0 rather than a panic.
-    #[test]
-    fn field_readers_do_not_panic_past_the_end() {
-        assert_eq!(u16_at(&[0x34, 0x12], 0), 0x1234);
-        assert_eq!(u16_at(&[0x34], 0), 0);
-        assert_eq!(u32_at(&[0; 6], 3), 0);
-        assert_eq!(u32_at(&[], usize::MAX), 0);
     }
 
     #[test]

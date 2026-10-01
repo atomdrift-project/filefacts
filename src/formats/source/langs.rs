@@ -13,10 +13,13 @@
 //!    function-definition names, and class-definition names. These
 //!    feed the typed imports/functions views.
 //! 3. **AST walk** — node-kind names and field names the
-//!    language-agnostic AST walker uses to project the tree into
+//!    AST walker uses to project the tree into
 //!    `ast.calls`, `ast.members`, and `ast.call_strings`.
 //!
-//! Adding a language is a single entry here plus a Cargo dependency.
+//! Adding a language is an entry here, a [`Lang`] variant, and a Cargo
+//! dependency. Per-language tables that match on [`Lang`] exhaustively (such
+//! as the function-definition kinds in `function_metrics`) then fail to
+//! compile until they say what the new language does.
 
 use std::sync::OnceLock;
 
@@ -26,10 +29,83 @@ use crate::fileid::FileType;
 
 use super::comment_metrics::CommentStyle;
 
+/// A source language with a tree-sitter grammar: one variant per
+/// [`LangConfig`]. Per-language behaviour and tables are keyed on this, never
+/// on the label string, so adding a language makes every exhaustive `match`
+/// on it a compile error until the new language is decided for.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) enum Lang {
+    JavaScript,
+    TypeScript,
+    Python,
+    Go,
+    Rust,
+    Java,
+    Bash,
+    Ruby,
+    Lua,
+    CSharp,
+    C,
+    Scala,
+    ObjC,
+    Kotlin,
+    Swift,
+    PowerShell,
+    Php,
+    Perl,
+    Groovy,
+    Zig,
+    Elixir,
+    Makefile,
+    Clojure,
+    Batch,
+}
+
+impl Lang {
+    /// Stable label exposed under `values.source.language` and as the flow
+    /// view's `language`. Rule authors match on these strings, so they must
+    /// never change.
+    pub(super) const fn name(self) -> &'static str {
+        match self {
+            Self::JavaScript => "javascript",
+            Self::TypeScript => "typescript",
+            Self::Python => "python",
+            Self::Go => "go",
+            Self::Rust => "rust",
+            Self::Java => "java",
+            Self::Bash => "bash",
+            Self::Ruby => "ruby",
+            Self::Lua => "lua",
+            Self::CSharp => "csharp",
+            Self::C => "c",
+            Self::Scala => "scala",
+            Self::ObjC => "objc",
+            Self::Kotlin => "kotlin",
+            Self::Swift => "swift",
+            Self::PowerShell => "powershell",
+            Self::Php => "php",
+            Self::Perl => "perl",
+            Self::Groovy => "groovy",
+            Self::Zig => "zig",
+            Self::Elixir => "elixir",
+            Self::Makefile => "makefile",
+            Self::Clojure => "clojure",
+            Self::Batch => "batch",
+        }
+    }
+
+    /// JavaScript or TypeScript, which share one runtime model (`process.env`,
+    /// `fetch`, module-level execution).
+    pub(super) const fn is_ecmascript(self) -> bool {
+        matches!(self, Self::JavaScript | Self::TypeScript)
+    }
+}
+
 /// Configuration for one source language.
 pub(super) struct LangConfig {
-    /// Stable label exposed under `values.source.language`.
-    pub(super) name: &'static str,
+    /// The language this entry configures; its [`Lang::name`] is the label
+    /// exposed under `values.source.language`.
+    pub(super) lang: Lang,
     /// Grammar constructor. Called once per parse.
     pub(super) language: fn() -> tree_sitter::Language,
     /// Comment-extraction style for `comments.*` metrics.
@@ -134,6 +210,11 @@ impl CompiledQueries {
 }
 
 impl LangConfig {
+    /// The language's stable label, [`Lang::name`].
+    pub(super) const fn name(&self) -> &'static str {
+        self.lang.name()
+    }
+
     fn query_source(&self, kind: QueryKind) -> &'static str {
         match kind {
             QueryKind::Imports => self.import_query,
@@ -162,7 +243,7 @@ impl LangConfig {
             Query::new(&(self.language)(), source)
                 .inspect_err(|error| {
                     tracing::error!(
-                        language = self.name,
+                        language = self.name(),
                         query = kind.label(),
                         %error,
                         "tree-sitter query failed to compile; its symbols will be missing"
@@ -173,6 +254,28 @@ impl LangConfig {
         .as_ref()
     }
 
+    /// The callee of `call`, for both symbol and value-flow extraction: its
+    /// `callee_field` child. Perl's `method_call_expression` keeps receiver
+    /// and method on the call node itself (its first child is only the
+    /// receiver), so there the call is its own callee.
+    pub(super) fn callee<'tree>(
+        &self,
+        call: tree_sitter::Node<'tree>,
+    ) -> Option<tree_sitter::Node<'tree>> {
+        if self.lang == Lang::Perl && call.kind() == "method_call_expression" {
+            return Some(call);
+        }
+        call.child_by_field_name(self.callee_field)
+    }
+
+    /// Whether the argument list [`Self::argument_list`] found is itself the
+    /// one argument rather than a wrapper with one named child per argument.
+    /// Perl's arguments field holds the expression; only a comma-separated
+    /// `list_expression` has children that are distinct arguments.
+    pub(super) fn is_single_argument(&self, args: tree_sitter::Node<'_>) -> bool {
+        self.lang == Lang::Perl && args.kind() != "list_expression"
+    }
+
     /// Locate a call's argument list for both symbol and value-flow extraction.
     /// Elixir's `arguments` is an immediate named child, not a grammar field.
     /// Do not search descendants: a nested call or do-block owns its own args.
@@ -181,7 +284,7 @@ impl LangConfig {
         node: tree_sitter::Node<'tree>,
     ) -> Option<tree_sitter::Node<'tree>> {
         node.child_by_field_name(self.arguments_field).or_else(|| {
-            if self.name != "elixir" {
+            if self.lang != Lang::Elixir {
                 return None;
             }
             let mut cursor = node.walk();
@@ -222,7 +325,7 @@ pub(super) fn config_for(file_type: FileType) -> Option<&'static LangConfig> {
 }
 
 static JAVASCRIPT: LangConfig = LangConfig {
-    name: "javascript",
+    lang: Lang::JavaScript,
     language: || tree_sitter_javascript::LANGUAGE.into(),
     comment_style: CommentStyle::CStyleTemplate,
     string_kinds: &["string", "template_string"],
@@ -268,7 +371,7 @@ static JAVASCRIPT: LangConfig = LangConfig {
 };
 
 static TYPESCRIPT: LangConfig = LangConfig {
-    name: "typescript",
+    lang: Lang::TypeScript,
     language: || tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
     comment_style: CommentStyle::CStyleTemplate,
     string_kinds: &["string", "template_string"],
@@ -306,7 +409,7 @@ static TYPESCRIPT: LangConfig = LangConfig {
 };
 
 static PYTHON: LangConfig = LangConfig {
-    name: "python",
+    lang: Lang::Python,
     language: || tree_sitter_python::LANGUAGE.into(),
     comment_style: CommentStyle::Hash,
     string_kinds: &["string"],
@@ -343,7 +446,7 @@ static PYTHON: LangConfig = LangConfig {
 };
 
 static GO: LangConfig = LangConfig {
-    name: "go",
+    lang: Lang::Go,
     language: || tree_sitter_go::LANGUAGE.into(),
     comment_style: CommentStyle::CStyleTemplate,
     string_kinds: &["interpreted_string_literal", "raw_string_literal"],
@@ -382,7 +485,7 @@ static GO: LangConfig = LangConfig {
 };
 
 static RUST: LangConfig = LangConfig {
-    name: "rust",
+    lang: Lang::Rust,
     language: || tree_sitter_rust::LANGUAGE.into(),
     comment_style: CommentStyle::CStyle,
     string_kinds: &["string_literal", "raw_string_literal"],
@@ -417,7 +520,7 @@ static RUST: LangConfig = LangConfig {
 };
 
 static JAVA: LangConfig = LangConfig {
-    name: "java",
+    lang: Lang::Java,
     language: || tree_sitter_java::LANGUAGE.into(),
     comment_style: CommentStyle::CStyle,
     string_kinds: &["string_literal"],
@@ -458,7 +561,7 @@ static JAVA: LangConfig = LangConfig {
 };
 
 static BASH: LangConfig = LangConfig {
-    name: "bash",
+    lang: Lang::Bash,
     language: || tree_sitter_bash::LANGUAGE.into(),
     comment_style: CommentStyle::Hash,
     string_kinds: &["string", "raw_string"],
@@ -491,7 +594,7 @@ static BASH: LangConfig = LangConfig {
 };
 
 static RUBY: LangConfig = LangConfig {
-    name: "ruby",
+    lang: Lang::Ruby,
     language: || tree_sitter_ruby::LANGUAGE.into(),
     comment_style: CommentStyle::Hash,
     string_kinds: &["string", "string_array", "symbol_array", "heredoc_body"],
@@ -533,7 +636,7 @@ static RUBY: LangConfig = LangConfig {
 };
 
 static LUA: LangConfig = LangConfig {
-    name: "lua",
+    lang: Lang::Lua,
     language: || tree_sitter_lua::LANGUAGE.into(),
     comment_style: CommentStyle::DoubleDash,
     string_kinds: &["string"],
@@ -567,7 +670,7 @@ static LUA: LangConfig = LangConfig {
 };
 
 static CSHARP: LangConfig = LangConfig {
-    name: "csharp",
+    lang: Lang::CSharp,
     language: || tree_sitter_c_sharp::LANGUAGE.into(),
     comment_style: CommentStyle::CStyle,
     string_kinds: &[
@@ -617,7 +720,7 @@ static CSHARP: LangConfig = LangConfig {
 };
 
 static C: LangConfig = LangConfig {
-    name: "c",
+    lang: Lang::C,
     language: || tree_sitter_c::LANGUAGE.into(),
     comment_style: CommentStyle::CStyle,
     string_kinds: &["string_literal"],
@@ -659,7 +762,7 @@ static C: LangConfig = LangConfig {
 };
 
 static SCALA: LangConfig = LangConfig {
-    name: "scala",
+    lang: Lang::Scala,
     language: || tree_sitter_scala::LANGUAGE.into(),
     comment_style: CommentStyle::CStyle,
     string_kinds: &["string", "interpolated_string_expression"],
@@ -693,7 +796,7 @@ static SCALA: LangConfig = LangConfig {
 };
 
 static OBJC: LangConfig = LangConfig {
-    name: "objc",
+    lang: Lang::ObjC,
     language: || tree_sitter_objc::LANGUAGE.into(),
     comment_style: CommentStyle::CStyle,
     string_kinds: &["string_literal"],
@@ -729,7 +832,7 @@ static OBJC: LangConfig = LangConfig {
 };
 
 static KOTLIN: LangConfig = LangConfig {
-    name: "kotlin",
+    lang: Lang::Kotlin,
     language: || tree_sitter_kotlin_ng::LANGUAGE.into(),
     comment_style: CommentStyle::CStyle,
     string_kinds: &["string_literal", "character_literal"],
@@ -762,7 +865,7 @@ static KOTLIN: LangConfig = LangConfig {
 };
 
 static SWIFT: LangConfig = LangConfig {
-    name: "swift",
+    lang: Lang::Swift,
     language: || tree_sitter_swift::LANGUAGE.into(),
     comment_style: CommentStyle::CStyle,
     string_kinds: &[
@@ -804,7 +907,7 @@ static SWIFT: LangConfig = LangConfig {
 };
 
 static POWERSHELL: LangConfig = LangConfig {
-    name: "powershell",
+    lang: Lang::PowerShell,
     language: || tree_sitter_powershell::LANGUAGE.into(),
     comment_style: CommentStyle::Hash,
     string_kinds: &[
@@ -852,7 +955,7 @@ static POWERSHELL: LangConfig = LangConfig {
 };
 
 static PHP: LangConfig = LangConfig {
-    name: "php",
+    lang: Lang::Php,
     language: || tree_sitter_php::LANGUAGE_PHP.into(),
     comment_style: CommentStyle::CStyle,
     string_kinds: &["string", "string_content", "heredoc_body"],
@@ -896,7 +999,7 @@ static PHP: LangConfig = LangConfig {
 };
 
 static PERL: LangConfig = LangConfig {
-    name: "perl",
+    lang: Lang::Perl,
     language: || ts_parser_perl::LANGUAGE.into(),
     comment_style: CommentStyle::Hash,
     string_kinds: &[
@@ -945,7 +1048,7 @@ static PERL: LangConfig = LangConfig {
 };
 
 static GROOVY: LangConfig = LangConfig {
-    name: "groovy",
+    lang: Lang::Groovy,
     language: || tree_sitter_groovy::LANGUAGE.into(),
     comment_style: CommentStyle::CStyle,
     string_kinds: &["string_literal"],
@@ -983,7 +1086,7 @@ static GROOVY: LangConfig = LangConfig {
 };
 
 static ZIG: LangConfig = LangConfig {
-    name: "zig",
+    lang: Lang::Zig,
     language: || tree_sitter_zig::LANGUAGE.into(),
     comment_style: CommentStyle::CStyle,
     string_kinds: &["string", "multiline_string"],
@@ -1021,7 +1124,7 @@ static ZIG: LangConfig = LangConfig {
 };
 
 static ELIXIR: LangConfig = LangConfig {
-    name: "elixir",
+    lang: Lang::Elixir,
     language: || tree_sitter_elixir::LANGUAGE.into(),
     comment_style: CommentStyle::Hash,
     string_kinds: &["string", "charlist"],
@@ -1062,7 +1165,7 @@ static ELIXIR: LangConfig = LangConfig {
 };
 
 static MAKEFILE: LangConfig = LangConfig {
-    name: "makefile",
+    lang: Lang::Makefile,
     language: || tree_sitter_make::LANGUAGE.into(),
     comment_style: CommentStyle::Hash,
     string_kinds: &["string"],
@@ -1099,7 +1202,7 @@ static MAKEFILE: LangConfig = LangConfig {
 // (`str_lit`), symbols (`sym_lit`), literals, and the AST shape are all
 // recovered — which is what trait matching needs. `;` line comments.
 static CLOJURE: LangConfig = LangConfig {
-    name: "clojure",
+    lang: Lang::Clojure,
     language: || tree_sitter_clojure::LANGUAGE.into(),
     comment_style: CommentStyle::Semicolon,
     string_kinds: &["str_lit", "regex_lit"],
@@ -1128,7 +1231,7 @@ static CLOJURE: LangConfig = LangConfig {
 // fields), but command names, variables, strings, and integers are recovered.
 // `REM` / `::` line comments.
 static BATCH: LangConfig = LangConfig {
-    name: "batch",
+    lang: Lang::Batch,
     language: || tree_sitter_batch::LANGUAGE.into(),
     comment_style: CommentStyle::Batch,
     string_kinds: &["string"],
@@ -1197,11 +1300,22 @@ mod tests {
                     continue;
                 }
                 if let Err(error) = Query::new(&(config.language)(), source) {
-                    failures.push(format!("{} {} query: {error}", config.name, kind.label()));
+                    failures.push(format!("{} {} query: {error}", config.name(), kind.label()));
                 }
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Per-language behaviour is keyed on `Lang`, and its label is the
+    /// published `source.language` value, so each must belong to exactly one
+    /// configuration.
+    #[test]
+    fn every_config_has_its_own_language_and_label() {
+        let langs: std::collections::HashSet<Lang> = ALL.iter().map(|c| c.lang).collect();
+        let names: std::collections::HashSet<&str> = ALL.iter().map(|c| c.name()).collect();
+        assert_eq!(langs.len(), ALL.len());
+        assert_eq!(names.len(), ALL.len());
     }
 
     #[test]

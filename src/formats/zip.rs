@@ -13,13 +13,18 @@
 #![allow(clippy::case_sensitive_file_extension_comparisons)]
 
 use crate::metric;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
 
-use serde_json::{Map as JsonMap, Value as JsonValue};
+use serde_json::Value as JsonValue;
 use zip::{CompressionMethod, ZipArchive};
 
+use super::archive_stats::{Agg, ArchiveStats, Dominance, Reading, Scope, Shape, member_value};
+use super::common::bytes_at;
 use crate::error::Error;
-use crate::output::{ArchiveMember, Metrics, Values};
+use crate::output::{
+    ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Metrics, Values,
+};
 
 /// Cap on how many central-directory entries are walked into
 /// `archive.members`. `ZipArchive::len()` counts the entries the `zip` crate
@@ -29,6 +34,38 @@ use crate::output::{ArchiveMember, Metrics, Values};
 /// entry costs a JSON member and an [`ArchiveMember`]. 65_536 fits a generous
 /// real-world archive (the JDK ships a few thousand classes per jar).
 pub(super) const MAX_ZIP_MEMBERS: usize = 65_536;
+
+/// The shared aggregates over the walked entries. The member count, the
+/// duplicate count and the sentinel-mtime count are ZIP's own: they also
+/// cover what the `zip` crate de-duplicated or the walk cap left out.
+///
+/// The central-directory walk never reads a symlink's target (it lives in
+/// the compressed body), so `archive.symlink_escape_count` is always 0 here.
+const AGGS: &[Agg] = &[
+    Agg::FileCount,
+    Agg::DirectoryCount,
+    Agg::UncompressedSize(Scope::All),
+    Agg::CompressedSize,
+    Agg::CompressionRatio,
+    Agg::Methods { always: true },
+    Agg::EntryTypes,
+    Agg::ModeBits,
+    Agg::SymlinkCount,
+    Agg::EncryptedCount,
+    Agg::MaxFilenameLength,
+    Agg::HiddenFiles,
+    Agg::PathTraversal(Scope::All),
+    Agg::SymlinkEscapes,
+    Agg::Executables,
+    Agg::Scripts,
+    Agg::NameTricks,
+    Agg::NestedArchives,
+    Agg::MisplacedExecutables,
+    Agg::ZipBombRatio(Scope::Files),
+    Agg::NoiseFiles,
+    Agg::MtimeRange,
+    Agg::MtimeAnomalies(Dominance::UntimedGroup),
+];
 
 pub(super) fn open_archive(bytes: &[u8]) -> Result<ZipArchive<Cursor<&[u8]>>, Error> {
     ZipArchive::new(Cursor::new(bytes)).map_err(|e| Error::malformed("zip", e.to_string()))
@@ -95,243 +132,76 @@ fn walk_archive<R: Read + Seek>(
         );
     }
     let mut members: Vec<JsonValue> = Vec::with_capacity(walked);
-    let mut compression_counts: std::collections::BTreeMap<String, u64> =
-        std::collections::BTreeMap::new();
-    let mut entry_type_counts: std::collections::BTreeMap<String, u64> =
-        std::collections::BTreeMap::new();
-    let mut total_compressed: u64 = 0;
-    let mut total_uncompressed: u64 = 0;
-    let mut mtimes: Vec<i64> = Vec::new();
-    let mut setuid = 0u64;
-    let mut setgid = 0u64;
-    let mut sticky = 0u64;
-    let mut world_writable = 0u64;
-    let mut symlinks = 0u64;
-    let mut encrypted_count = 0u64;
-
-    // Aggregates ported from cleave's ArchiveMetrics. Counted from the
-    // central-directory walk; never reads compressed entry bodies.
-    let mut file_count: u64 = 0;
-    let mut directory_count: u64 = 0;
-    let mut max_filename_length: u64 = 0;
-    let mut hidden_file_count: u64 = 0;
-    let mut path_traversal_count: u64 = 0;
-    // ZIP's central-directory walker doesn't read symlink targets
-    // (their content lives in the compressed body). `symlink_escape_count`
-    // for ZIPs always reports 0 here; tar.rs computes it from the
-    // header-resident linkname directly.
-    let symlink_escape_count: u64 = 0;
-    let mut executable_count: u64 = 0;
-    let mut script_count: u64 = 0;
-    let mut unicode_filename_count: u64 = 0;
-    let mut homoglyph_filename_count: u64 = 0;
-    let mut double_extension_count: u64 = 0;
-    let mut rtlo_filename_count: u64 = 0;
-    let mut nested_archive_count: u64 = 0;
-    let mut misplaced_executable_count: u64 = 0;
-    let mut zip_bomb_ratio: f64 = 0.0;
+    let mut stats = ArchiveStats::new(AGGS);
     let mut extra_field_size: u64 = 0;
     let mut uses_zip64 = false;
-    let mut noise_file_count: u64 = 0;
-    let mut sentinel_mtime_count: u64 = 0;
-    let mut future_mtime_count: u64 = 0;
     let mut entry_comment_count: u64 = 0;
     let mut entry_comment_size: u64 = 0;
     // Tag IDs encountered in any LFH/CDH extra field (union across members).
-    let mut extra_field_tags: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
-    // Member paths grouped by mtime bucket (None = sentinel/unrecorded).
-    // Used to compute the dominant-bucket / outlier supply-chain signal.
-    let mut mtime_buckets: std::collections::BTreeMap<Option<i64>, Vec<String>> =
-        std::collections::BTreeMap::new();
+    let mut extra_field_tags: BTreeSet<u16> = BTreeSet::new();
 
     for i in 0..walked {
         let entry = archive
             .by_index_raw(i)
             .map_err(|e| Error::malformed("zip", format!("entry {i}: {e}")))?;
 
-        let name = entry.name().to_string();
-        let mut obj = JsonMap::new();
-        obj.insert("path".into(), JsonValue::String(name.clone()));
-        obj.insert("size_bytes".into(), JsonValue::Number(entry.size().into()));
-        obj.insert(
-            "compressed_size".into(),
-            JsonValue::Number(entry.compressed_size().into()),
-        );
-        let method = compression_method_name(entry.compression());
-        obj.insert(
-            "compression_method".into(),
-            JsonValue::String(method.into()),
-        );
-        obj.insert(
-            "header_offset".into(),
-            JsonValue::Number(entry.header_start().into()),
-        );
-        obj.insert(
-            "data_offset".into(),
-            JsonValue::Number(entry.data_start().into()),
-        );
-        obj.insert(
-            "central_header_offset".into(),
-            JsonValue::Number(entry.central_header_start().into()),
-        );
-        obj.insert(
-            "crc32".into(),
-            JsonValue::Number(u64::from(entry.crc32()).into()),
-        );
-        let encrypted = entry.encrypted();
-        if encrypted {
-            obj.insert("encrypted".into(), JsonValue::Bool(true));
-            encrypted_count += 1;
-        }
-
-        let mtime_unix = entry
-            .last_modified()
-            .and_then(crate::scan::zip_datetime_to_unix);
-        if let Some(t) = mtime_unix {
-            obj.insert("mtime_unix".into(), JsonValue::Number(t.into()));
-            mtimes.push(t);
-            // Year-2100 is a safe "impossible" ceiling without needing a
-            // wall clock (works offline; survives system-clock skew).
-            // Seconds since epoch at 2100-01-01 00:00:00 UTC = 4_102_444_800.
-            if t > 4_102_444_800 {
-                future_mtime_count += 1;
-            }
-        } else {
-            // None means the MS-DOS date didn't parse — Mozilla's
-            // (1980, 0, 0) "no recorded timestamp" sentinel is the
-            // common case. Deterministic-build tooling (web-ext, bazel)
-            // produces these intentionally.
-            sentinel_mtime_count += 1;
-        }
-        mtime_buckets
-            .entry(mtime_unix)
-            .or_default()
-            .push(name.clone());
-
-        let mode_octal = entry.unix_mode();
-        if let Some(mode) = mode_octal {
-            obj.insert(
-                "mode_octal".into(),
-                JsonValue::Number(u64::from(mode).into()),
-            );
-            if mode & 0o4000 != 0 {
-                setuid += 1;
-            }
-            if mode & 0o2000 != 0 {
-                setgid += 1;
-            }
-            if mode & 0o1000 != 0 {
-                sticky += 1;
-            }
-            if mode & 0o002 != 0 {
-                world_writable += 1;
-            }
-        }
-
+        let mode = entry.unix_mode();
+        let is_symlink = |m: u32| m & 0o170_000 == 0o120_000;
         let entry_type = if entry.is_dir() {
             "directory"
-        } else if entry
-            .unix_mode()
-            .is_some_and(|m| m & 0o170_000 == 0o120_000)
-        {
-            symlinks += 1;
+        } else if mode.is_some_and(is_symlink) {
             "symlink"
         } else {
             "regular"
         };
-        obj.insert("entry_type".into(), JsonValue::String(entry_type.into()));
-
-        let uncompressed = entry.size();
         let compressed = entry.compressed_size();
-        total_compressed += compressed;
-        total_uncompressed += uncompressed;
-        *compression_counts.entry(method.into()).or_insert(0) += 1;
-        *entry_type_counts.entry(entry_type.into()).or_insert(0) += 1;
+        let member = ArchiveMember {
+            path: entry.name().to_string(),
+            size_bytes: entry.size(),
+            entry_type: Some(entry_type.into()),
+            // None means the MS-DOS date didn't parse — Mozilla's (1980, 0, 0)
+            // "no recorded timestamp" sentinel is the common case, and
+            // deterministic-build tooling (web-ext, bazel) produces it on
+            // purpose.
+            mtime_unix: entry
+                .last_modified()
+                .and_then(crate::scan::zip_datetime_to_unix),
+            linkname: None,
+            host_os: None,
+            crc32: Some(entry.crc32()),
+            encrypted: entry.encrypted(),
+            compression: Some(ArchiveCompression {
+                compressed_size: Some(compressed),
+                method: Some(compression_method_name(entry.compression()).into()),
+            }),
+            ownership: mode.map(|mode| ArchiveOwnership {
+                mode_octal: Some(mode),
+                ..Default::default()
+            }),
+            offsets: ArchiveOffsets {
+                header: Some(entry.header_start()),
+                data: Some(entry.data_start()),
+                central_header: Some(entry.central_header_start()),
+            },
+        };
+        let mut reading = Reading::of(&member);
+        // An exec bit on anything but a symlink makes it executable,
+        // whatever its name.
+        reading.exec_mode = mode.is_some_and(|m| !is_symlink(m) && m & 0o111 != 0);
+        stats.observe(&member, &reading);
 
-        if entry.is_dir() {
-            directory_count += 1;
-        } else {
-            file_count += 1;
-
-            // Per-file compression ratio worst case (zip bomb signal).
-            if uncompressed > 0 && compressed > 0 {
-                let r = uncompressed as f64 / compressed as f64;
-                if r > zip_bomb_ratio {
-                    zip_bomb_ratio = r;
-                }
-            }
-        }
-
-        if name.len() as u64 > max_filename_length {
-            max_filename_length = name.len() as u64;
-        }
-
-        // Filename classification — mirrors cleave's archive aggregates.
-        let classification = classify_filename(&name);
-        if classification.is_hidden {
-            hidden_file_count += 1;
-        }
-        if classification.has_path_traversal {
-            path_traversal_count += 1;
-        }
-        if classification.is_unicode {
-            unicode_filename_count += 1;
-        }
-        if classification.has_homoglyph {
-            homoglyph_filename_count += 1;
-        }
-        if classification.has_double_extension {
-            double_extension_count += 1;
-        }
-        if classification.has_rtlo {
-            rtlo_filename_count += 1;
-        }
-        if !entry.is_dir() {
-            if classification.is_nested_archive {
-                nested_archive_count += 1;
-            }
-            if classification.is_script {
-                script_count += 1;
-            }
-            // Executable: extension OR (unix mode with any exec bit set on a
-            // regular file). Symlinks and directories don't count.
-            let exec_by_mode = entry
-                .unix_mode()
-                .is_some_and(|m| m & 0o170_000 != 0o120_000 && m & 0o111 != 0);
-            if classification.is_executable || exec_by_mode {
-                executable_count += 1;
-                if classification.is_misplaced_executable {
-                    misplaced_executable_count += 1;
-                }
-            }
-        }
-
-        // Symlink target captured from the central-directory extra field is
-        // not exposed by the `zip` crate's high-level API; falling back to
-        // entry-name-side path-traversal detection covers the common case.
-        // (`tar.rs` has the linkname in the header and can detect escapes
-        // exactly.)
-
-        let mut entry_tags: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+        let mut obj = member_value(&member, Shape::FULL);
+        let mut entry_tags = BTreeSet::new();
         if let Some(extra) = entry.extra_data() {
             extra_field_size += extra.len() as u64;
-            for tag in enumerate_extra_tags(extra) {
-                entry_tags.insert(tag);
-                extra_field_tags.insert(tag);
-            }
-            if entry_tags.contains(&0x0001) {
-                uses_zip64 = true;
-            }
+            entry_tags = enumerate_extra_tags(extra);
+            extra_field_tags.extend(&entry_tags);
+            uses_zip64 |= entry_tags.contains(&0x0001);
         }
         // Sentinel sizes in the central directory also indicate Zip64 usage.
-        if compressed == 0xFFFF_FFFF || uncompressed == 0xFFFF_FFFF {
-            uses_zip64 = true;
-        }
+        uses_zip64 |= compressed == 0xFFFF_FFFF || member.size_bytes == 0xFFFF_FFFF;
         if !entry_tags.is_empty() {
-            let tags: Vec<JsonValue> = entry_tags
-                .iter()
-                .map(|t| JsonValue::Number(u64::from(*t).into()))
-                .collect();
+            let tags = entry_tags.iter().map(|t| JsonValue::from(*t)).collect();
             obj.insert("extra_tags".into(), JsonValue::Array(tags));
         }
 
@@ -344,145 +214,22 @@ fn walk_archive<R: Read + Seek>(
             entry_comment_size += entry_comment.len() as u64;
             obj.insert(
                 "comment_size".into(),
-                JsonValue::Number((entry_comment.len() as u64).into()),
+                JsonValue::from(entry_comment.len() as u64),
             );
         }
 
-        // Noise files: developer/OS detritus that often slips through
-        // into release builds.
-        if is_noise_filename(&name) {
-            noise_file_count += 1;
-        }
-
-        archive_members.push(ArchiveMember {
-            path: name,
-            size_bytes: uncompressed,
-            entry_type: Some(entry_type.to_string()),
-            mtime_unix,
-            linkname: None,
-            host_os: None,
-            crc32: Some(entry.crc32()),
-            encrypted,
-            compression: Some(crate::output::ArchiveCompression {
-                compressed_size: Some(compressed),
-                method: Some(method.to_string()),
-            }),
-            ownership: mode_octal.map(|mode| crate::output::ArchiveOwnership {
-                mode_octal: Some(mode),
-                ..Default::default()
-            }),
-            offsets: crate::output::ArchiveOffsets {
-                header: Some(entry.header_start()),
-                data: Some(entry.data_start()),
-                central_header: Some(entry.central_header_start()),
-            },
-        });
         members.push(JsonValue::Object(obj));
+        archive_members.push(member);
     }
 
     values.insert("archive.members", JsonValue::Array(members));
-
-    let methods: Vec<JsonValue> = compression_counts
-        .keys()
-        .map(|k| JsonValue::String(k.clone()))
-        .collect();
-    values.insert("archive.compression.methods", JsonValue::Array(methods));
-
-    let entry_types: Vec<JsonValue> = entry_type_counts
-        .keys()
-        .map(|k| JsonValue::String(k.clone()))
-        .collect();
-    values.insert("archive.format.entry_types", JsonValue::Array(entry_types));
-
-    // Aggregate metrics. Counts/ratios/spreads go here; verbatim values
-    // (the lists above) live in `values`.
+    stats.emit(values, metrics);
     metrics.insert(metric!("archive.member_count"), archive.len() as f64);
-    // `archive.file_count` and `archive.directory_count` mirror cleave's
-    // historical struct field names that traits still reference.
-    metrics.insert(metric!("archive.file_count"), file_count as f64);
-    metrics.insert(metric!("archive.directory_count"), directory_count as f64);
-    metrics.insert(
-        metric!("archive.uncompressed_size"),
-        total_uncompressed as f64,
-    );
-    metrics.insert(metric!("archive.compressed_size"), total_compressed as f64);
-    if total_uncompressed > 0 {
-        let ratio = total_compressed as f64 / total_uncompressed as f64;
-        metrics.insert(metric!("archive.compression.ratio"), ratio);
-    }
-    for (m, c) in &compression_counts {
-        metrics.insert(crate::archive_method_count(m), *c as f64);
-    }
-    for (t, c) in &entry_type_counts {
-        metrics.insert(
-            crate::archive_entry_type_count(&t.replace('-', "_")),
-            *c as f64,
-        );
-    }
-    metrics.insert(metric!("archive.security.setuid_count"), setuid as f64);
-    metrics.insert(metric!("archive.security.setgid_count"), setgid as f64);
-    metrics.insert(metric!("archive.security.sticky_count"), sticky as f64);
-    metrics.insert(
-        metric!("archive.security.world_writable_count"),
-        world_writable as f64,
-    );
-    metrics.insert(metric!("archive.security.symlink_count"), symlinks as f64);
-    metrics.insert(
-        metric!("archive.security.encrypted_count"),
-        encrypted_count as f64,
-    );
-
-    // Filename / content aggregates ported from cleave's ArchiveMetrics.
-    metrics.insert(
-        metric!("archive.max_filename_length"),
-        max_filename_length as f64,
-    );
-    metrics.insert(
-        metric!("archive.hidden_file_count"),
-        hidden_file_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.path_traversal_count"),
-        path_traversal_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.symlink_escape_count"),
-        symlink_escape_count as f64,
-    );
-    metrics.insert(metric!("archive.executable_count"), executable_count as f64);
-    metrics.insert(metric!("archive.script_count"), script_count as f64);
-    metrics.insert(
-        metric!("archive.unicode_filename_count"),
-        unicode_filename_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.homoglyph_filename_count"),
-        homoglyph_filename_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.double_extension_count"),
-        double_extension_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.rtlo_filename_count"),
-        rtlo_filename_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.nested_archive_count"),
-        nested_archive_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.misplaced_executable_count"),
-        misplaced_executable_count as f64,
-    );
-    if zip_bomb_ratio > 0.0 {
-        metrics.insert(metric!("archive.zip_bomb_ratio"), zip_bomb_ratio);
-    }
     metrics.insert(metric!("archive.extra_field_size"), extra_field_size as f64);
     if !extra_field_tags.is_empty() {
-        let tags: Vec<JsonValue> = extra_field_tags
+        let tags = extra_field_tags
             .iter()
-            .map(|t| JsonValue::Number(u64::from(*t).into()))
+            .map(|t| JsonValue::from(*t))
             .collect();
         values.insert("archive.extra_field_tags", JsonValue::Array(tags));
     }
@@ -492,7 +239,6 @@ fn walk_archive<R: Read + Seek>(
     if has_comment {
         metrics.insert(metric!("archive.has_comment"), 1.0);
     }
-    metrics.insert(metric!("archive.noise_file_count"), noise_file_count as f64);
     metrics.insert(
         metric!("archive.entry_comment_count"),
         entry_comment_count as f64,
@@ -511,8 +257,8 @@ fn walk_archive<R: Read + Seek>(
     let cd_start = archive.central_directory_start() as usize;
     let raw_entries = scan_central_directory(bytes, cd_start);
 
-    let mut name_counts: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
-    let mut crc_counts: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+    let mut name_counts: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut crc_counts: BTreeMap<u32, u64> = BTreeMap::new();
     for e in &raw_entries {
         *name_counts.entry(e.name.as_str()).or_insert(0) += 1;
         if e.uncompressed_size > 0 {
@@ -543,12 +289,7 @@ fn walk_archive<R: Read + Seek>(
 
     // CRC collisions: how many *extra* entries share a CRC32 with a
     // prior one (excluding zero-size entries, which all share CRC=0).
-    let mut crc_collision_count: u64 = 0;
-    for (_, count) in &crc_counts {
-        if *count > 1 {
-            crc_collision_count += count - 1;
-        }
-    }
+    let crc_collision_count: u64 = crc_counts.values().map(|c| c.saturating_sub(1)).sum();
     metrics.insert(
         metric!("archive.crc_collision_count"),
         crc_collision_count as f64,
@@ -562,83 +303,10 @@ fn walk_archive<R: Read + Seek>(
         .iter()
         .filter(|e| e.parsed_mtime.is_none())
         .count() as u64;
-    let final_sentinel_count = sentinel_mtime_count.max(raw_sentinel_count);
     metrics.insert(
         metric!("archive.timing.sentinel_mtime_count"),
-        final_sentinel_count as f64,
+        stats.untimed().max(raw_sentinel_count) as f64,
     );
-
-    if !mtimes.is_empty() {
-        let min = *mtimes.iter().min().unwrap_or(&0);
-        let max = *mtimes.iter().max().unwrap_or(&0);
-        values.insert("archive.timing.mtime_min", JsonValue::Number(min.into()));
-        values.insert("archive.timing.mtime_max", JsonValue::Number(max.into()));
-        metrics.insert(
-            metric!("archive.timing.mtime_spread_seconds"),
-            (max - min) as f64,
-        );
-        let unique: std::collections::BTreeSet<i64> = mtimes.iter().copied().collect();
-        metrics.insert(
-            metric!("archive.timing.mtime_unique_count"),
-            unique.len() as f64,
-        );
-        let ratio = unique.len() as f64 / mtimes.len() as f64;
-        metrics.insert(metric!("archive.timing.mtime_unique_ratio"), ratio);
-    }
-    if future_mtime_count > 0 {
-        metrics.insert(
-            metric!("archive.timing.future_mtime_count"),
-            future_mtime_count as f64,
-        );
-    }
-
-    // Dominant-bucket / outlier analysis. Buckets the entries by exact
-    // mtime (sentinel/None being its own bucket); when one bucket
-    // covers a strict majority (>50%) of members, every other member
-    // is reported as an "outlier" — the supply-chain "13 files at
-    // sentinel + 1 file with a real timestamp" signal.
-    let total_members = walked;
-    if total_members > 0 && !mtime_buckets.is_empty() {
-        let (dominant_count, dominant_key) = mtime_buckets
-            .iter()
-            .map(|(k, v)| (v.len() as u64, *k))
-            .max_by_key(|(count, _)| *count)
-            .unwrap_or((0, None));
-        let dominant_fraction = dominant_count as f64 / total_members as f64;
-        metrics.insert(
-            metric!("archive.timing.mtime_dominant_count"),
-            dominant_count as f64,
-        );
-        metrics.insert(
-            metric!("archive.timing.mtime_dominant_fraction"),
-            dominant_fraction,
-        );
-        if dominant_fraction > 0.5 && dominant_count < total_members as u64 {
-            let mut outliers: Vec<JsonValue> = Vec::new();
-            for (k, paths) in &mtime_buckets {
-                if *k == dominant_key {
-                    continue;
-                }
-                for p in paths {
-                    if outliers.len() >= 16 {
-                        break;
-                    }
-                    outliers.push(JsonValue::String(p.clone()));
-                }
-            }
-            let outlier_count = total_members as u64 - dominant_count;
-            metrics.insert(
-                metric!("archive.timing.mtime_outlier_count"),
-                outlier_count as f64,
-            );
-            if !outliers.is_empty() {
-                values.insert(
-                    "archive.timing.mtime_outlier_members",
-                    JsonValue::Array(outliers),
-                );
-            }
-        }
-    }
 
     // Mozilla / JAR signing-pipeline detection: existence of the
     // signature-chain files in `META-INF/` is a benign-build attestation
@@ -699,6 +367,9 @@ struct RawCdhEntry {
     parsed_mtime: Option<i64>,
 }
 
+/// Fixed part of a central-directory file header, before the name.
+const CDH_FIXED_LEN: usize = 46;
+
 /// Walk the raw central directory and return every entry — including
 /// duplicates that the `zip` crate's name-keyed map collapses. Starts
 /// at `cd_start` (the byte offset reported by `central_directory_start`)
@@ -706,31 +377,31 @@ struct RawCdhEntry {
 fn scan_central_directory(bytes: &[u8], cd_start: usize) -> Vec<RawCdhEntry> {
     let mut out = Vec::new();
     let mut i = cd_start;
-    while i + 46 <= bytes.len() {
-        if &bytes[i..i + 4] != b"PK\x01\x02" {
+    while let Some(header) = bytes
+        .get(i..)
+        .and_then(|rest| rest.first_chunk::<CDH_FIXED_LEN>())
+    {
+        if !header.starts_with(b"PK\x01\x02") {
             break;
         }
-        let crc = u32::from_le_bytes([bytes[i + 16], bytes[i + 17], bytes[i + 18], bytes[i + 19]]);
-        let usize_ =
-            u32::from_le_bytes([bytes[i + 24], bytes[i + 25], bytes[i + 26], bytes[i + 27]]);
-        let name_len = u16::from_le_bytes([bytes[i + 28], bytes[i + 29]]) as usize;
-        let extra_len = u16::from_le_bytes([bytes[i + 30], bytes[i + 31]]) as usize;
-        let comment_len = u16::from_le_bytes([bytes[i + 32], bytes[i + 33]]) as usize;
-        let mod_time = u16::from_le_bytes([bytes[i + 12], bytes[i + 13]]);
-        let mod_date = u16::from_le_bytes([bytes[i + 14], bytes[i + 15]]);
-        let name_start = i + 46;
+        // Every field sits inside the fixed header just read.
+        let u16_at = |off| bytes_at::u16_le(header, off).unwrap_or(0);
+        let u32_at = |off| bytes_at::u32_le(header, off).unwrap_or(0);
+        let name_len = usize::from(u16_at(28));
+        let extra_len = usize::from(u16_at(30));
+        let comment_len = usize::from(u16_at(32));
+        let name_start = i + CDH_FIXED_LEN;
         let name_end = name_start + name_len;
-        if name_end > bytes.len() {
+        let Some(name) = bytes.get(name_start..name_end) else {
             break;
-        }
-        let name = String::from_utf8_lossy(&bytes[name_start..name_end]).into_owned();
-        let parsed_mtime = ::zip::DateTime::try_from_msdos(mod_date, mod_time)
+        };
+        let parsed_mtime = ::zip::DateTime::try_from_msdos(u16_at(14), u16_at(12))
             .ok()
             .and_then(crate::scan::zip_datetime_to_unix);
         out.push(RawCdhEntry {
-            name,
-            crc32: crc,
-            uncompressed_size: u64::from(usize_),
+            name: String::from_utf8_lossy(name).into_owned(),
+            crc32: u32_at(16),
+            uncompressed_size: u64::from(u32_at(24)),
             parsed_mtime,
         });
         i = name_end + extra_len + comment_len;
@@ -741,13 +412,12 @@ fn scan_central_directory(bytes: &[u8], cd_start: usize) -> Vec<RawCdhEntry> {
 /// Walk an extra-field TLV blob and return the set of tag IDs present.
 /// Format: `[u16 tag][u16 size][size bytes]` repeating. Malformed input
 /// (a length that would overrun the buffer) stops the walk silently.
-pub(super) fn enumerate_extra_tags(extra: &[u8]) -> std::collections::BTreeSet<u16> {
-    let mut tags = std::collections::BTreeSet::new();
+pub(super) fn enumerate_extra_tags(extra: &[u8]) -> BTreeSet<u16> {
+    let mut tags = BTreeSet::new();
     let mut i = 0usize;
-    while i + 4 <= extra.len() {
-        let tag = u16::from_le_bytes([extra[i], extra[i + 1]]);
-        let size = u16::from_le_bytes([extra[i + 2], extra[i + 3]]) as usize;
-        tags.insert(tag);
+    while let Some(&[t0, t1, s0, s1]) = extra.get(i..).and_then(|rest| rest.first_chunk::<4>()) {
+        tags.insert(u16::from_le_bytes([t0, t1]));
+        let size = usize::from(u16::from_le_bytes([s0, s1]));
         let Some(next) = i.checked_add(4).and_then(|n| n.checked_add(size)) else {
             break;
         };
@@ -757,18 +427,6 @@ pub(super) fn enumerate_extra_tags(extra: &[u8]) -> std::collections::BTreeSet<u
         i = next;
     }
     tags
-}
-
-/// Names treated as developer/OS detritus: macOS resource forks and
-/// `.DS_Store`, Windows `Thumbs.db` / `desktop.ini`. Counted as
-/// `archive.noise_file_count`. Conservative — files matching these
-/// patterns indicate sloppy packaging, not malice on their own.
-pub(super) fn is_noise_filename(path: &str) -> bool {
-    if path.starts_with("__MACOSX/") {
-        return true;
-    }
-    let base = path.rsplit('/').next().unwrap_or(path);
-    matches!(base, ".DS_Store" | "Thumbs.db" | "desktop.ini")
 }
 
 /// Offset of the first ZIP local-file-header signature `PK\x03\x04`.
@@ -789,19 +447,19 @@ fn scan_trailing_bytes(bytes: &[u8]) -> usize {
     let Some(eocd_offset) = find_eocd(bytes) else {
         return 0;
     };
-    if eocd_offset + 22 > bytes.len() {
+    // The comment length is the record's last fixed field, at +20.
+    let Some(comment_len) = bytes_at::u16_le(bytes, eocd_offset + 20) else {
         return 0;
-    }
-    let comment_len =
-        u16::from_le_bytes([bytes[eocd_offset + 20], bytes[eocd_offset + 21]]) as usize;
-    let end = eocd_offset + 22 + comment_len;
+    };
+    let end = eocd_offset + 22 + usize::from(comment_len);
     bytes.len().saturating_sub(end)
 }
 
 /// Locate the End-of-Central-Directory signature `PK\x05\x06`. ZIP
 /// readers scan backward from EOF over at most 64 KiB + 22 because the
 /// EOCD itself is 22 bytes and the comment can be up to 65 535 bytes.
-/// Returns the offset of the EOCD signature, or `None` if not found.
+/// Returns the offset of the last EOCD signature in that window, or
+/// `None` if not found.
 fn find_eocd(bytes: &[u8]) -> Option<usize> {
     const MAX_COMMENT_LEN: usize = 65_535;
     const EOCD_LEN: usize = 22;
@@ -809,14 +467,8 @@ fn find_eocd(bytes: &[u8]) -> Option<usize> {
         return None;
     }
     let scan_start = bytes.len().saturating_sub(MAX_COMMENT_LEN + EOCD_LEN);
-    let window = &bytes[scan_start..];
-    let mut best: Option<usize> = None;
-    for (i, w) in window.windows(4).enumerate() {
-        if w == [0x50, 0x4b, 0x05, 0x06] {
-            best = Some(scan_start + i);
-        }
-    }
-    best
+    let window = bytes.get(scan_start..)?;
+    memchr::memmem::rfind(window, b"PK\x05\x06").map(|i| scan_start + i)
 }
 
 fn archive_names<R: std::io::Read + std::io::Seek>(
@@ -830,209 +482,6 @@ fn members_includes<R: std::io::Read + std::io::Seek>(
     needle: &str,
 ) -> bool {
     archive.file_names().any(|n| n == needle)
-}
-
-/// Classification flags for a single archive entry path, derived from
-/// the name alone. Cleave's `ArchiveMetrics` aggregates roll these up
-/// across the archive; filefacts computes them once per member.
-#[derive(Default)]
-pub(super) struct FilenameClass {
-    pub(super) is_hidden: bool,
-    pub(super) has_path_traversal: bool,
-    pub(super) is_unicode: bool,
-    pub(super) has_homoglyph: bool,
-    pub(super) has_double_extension: bool,
-    pub(super) has_rtlo: bool,
-    pub(super) is_executable: bool,
-    pub(super) is_script: bool,
-    pub(super) is_nested_archive: bool,
-    pub(super) is_misplaced_executable: bool,
-}
-
-/// Classify a member path. Read-only; the same rules apply to ZIP and
-/// TAR entries (both call this helper).
-pub(super) fn classify_filename(path: &str) -> FilenameClass {
-    let mut c = FilenameClass::default();
-
-    // Hidden: any path component starts with `.` (excluding `.`/`..`).
-    c.is_hidden = path
-        .split('/')
-        .any(|p| p.starts_with('.') && p != "." && p != "..");
-
-    // Path traversal: any `..` component, or absolute path (leading `/`
-    // or Windows drive letter).
-    c.has_path_traversal = path.split('/').any(|p| p == "..")
-        || path.starts_with('/')
-        || path
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_ascii_alphabetic())
-            && path[1..].starts_with(":\\");
-
-    // Non-ASCII content anywhere in the path.
-    c.is_unicode = path.chars().any(|ch| !ch.is_ascii());
-
-    // Homoglyphs: Cyrillic / Greek look-alikes for ASCII Latin letters.
-    // Small curated set — generic Unicode security is out of scope.
-    c.has_homoglyph = path.chars().any(is_homoglyph_char);
-
-    // Right-to-left override and related bidi-format control chars.
-    c.has_rtlo = path.chars().any(|ch| {
-        matches!(
-            ch as u32,
-            0x202A..=0x202E | 0x2066..=0x2069
-        )
-    });
-
-    // Filename basename for extension checks.
-    let basename = path.rsplit('/').next().unwrap_or(path);
-    let lower = basename.to_ascii_lowercase();
-
-    // Double extension: `something.<inner>.<outer>` where outer is
-    // executable and inner is a benign-looking document/text suffix.
-    if let Some((stem, outer)) = lower.rsplit_once('.') {
-        if is_executable_extension(outer) {
-            if let Some((_, inner)) = stem.rsplit_once('.') {
-                const SAFE_LOOKING: &[&str] = &[
-                    "txt", "pdf", "doc", "docx", "jpg", "jpeg", "png", "gif", "mp3", "mp4", "csv",
-                    "xls", "xlsx", "rtf",
-                ];
-                if SAFE_LOOKING.contains(&inner) {
-                    c.has_double_extension = true;
-                }
-            }
-        }
-    }
-
-    let extension = lower.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
-    c.is_executable = is_executable_extension(extension);
-    c.is_script = is_script_extension(extension);
-    c.is_nested_archive = is_archive_extension(extension);
-
-    if c.is_executable {
-        // Heuristic: PE executables should live in /bin or Windows
-        // system dirs; .so/.dylib in /lib*. Anything else is "misplaced".
-        let is_unix_lib = matches!(extension, "so" | "dylib");
-        let is_pe = matches!(extension, "exe" | "dll" | "sys" | "scr");
-        let in_bin = path.starts_with("bin/")
-            || path.starts_with("usr/bin/")
-            || path.starts_with("sbin/")
-            || path.starts_with("usr/sbin/")
-            || path.starts_with("usr/local/bin/");
-        let in_lib = path.starts_with("lib/")
-            || path.starts_with("lib64/")
-            || path.starts_with("usr/lib/")
-            || path.starts_with("usr/lib64/")
-            || path.starts_with("usr/local/lib/");
-        if is_unix_lib && !in_lib {
-            c.is_misplaced_executable = true;
-        } else if is_pe && !path.to_ascii_lowercase().contains("bin/") {
-            // PE binaries inside an archive that don't sit under any
-            // `bin/`-like prefix are the canonical lure shape.
-            c.is_misplaced_executable = true;
-        } else if matches!(extension, "bin" | "elf") && !in_bin {
-            c.is_misplaced_executable = true;
-        }
-    }
-
-    c
-}
-
-fn is_executable_extension(ext: &str) -> bool {
-    matches!(
-        ext,
-        "exe"
-            | "dll"
-            | "sys"
-            | "scr"
-            | "com"
-            | "cpl"
-            | "msi"
-            | "so"
-            | "dylib"
-            | "bin"
-            | "elf"
-            | "out"
-            | "app"
-    )
-}
-
-fn is_script_extension(ext: &str) -> bool {
-    matches!(
-        ext,
-        "sh" | "bash"
-            | "zsh"
-            | "ksh"
-            | "csh"
-            | "fish"
-            | "py"
-            | "pyc"
-            | "pyo"
-            | "pl"
-            | "pm"
-            | "rb"
-            | "js"
-            | "mjs"
-            | "cjs"
-            | "ps1"
-            | "psm1"
-            | "psd1"
-            | "bat"
-            | "cmd"
-            | "vbs"
-            | "vbe"
-            | "wsf"
-            | "wsh"
-            | "lua"
-            | "php"
-    )
-}
-
-fn is_archive_extension(ext: &str) -> bool {
-    matches!(
-        ext,
-        "zip"
-            | "jar"
-            | "war"
-            | "ear"
-            | "apk"
-            | "ipa"
-            | "xpi"
-            | "crx"
-            | "nupkg"
-            | "tar"
-            | "gz"
-            | "tgz"
-            | "bz2"
-            | "tbz2"
-            | "xz"
-            | "txz"
-            | "zst"
-            | "tzst"
-            | "7z"
-            | "rar"
-            | "cab"
-            | "iso"
-            | "deb"
-            | "rpm"
-            | "msi"
-            | "pkg"
-    )
-}
-
-/// Returns true for characters commonly used in homoglyph attacks
-/// (Cyrillic and Greek glyphs that visually mimic ASCII Latin letters).
-fn is_homoglyph_char(ch: char) -> bool {
-    matches!(
-        ch,
-        // Cyrillic look-alikes for a/c/e/o/p/x/у (and uppercase).
-        'а' | 'с' | 'е' | 'о' | 'р' | 'х' | 'у' | 'А' | 'В' | 'С' | 'Е' | 'Н'
-            | 'К' | 'М' | 'О' | 'Р' | 'Т' | 'Х'
-        // Greek look-alikes.
-            | 'Α' | 'Β' | 'Ε' | 'Ζ' | 'Η' | 'Ι' | 'Κ' | 'Μ' | 'Ν' | 'Ο'
-            | 'Ρ' | 'Τ' | 'Υ' | 'Χ'
-            | 'ο' | 'ν'
-    )
 }
 
 fn compression_method_name(method: CompressionMethod) -> &'static str {
@@ -1627,6 +1076,98 @@ mod tests {
         assert_eq!(m.get("archive.crc_collision_count"), Some(1.0));
     }
 
+    /// A Zip64 archive whose entries declare `sizes` (both compressed and
+    /// uncompressed). The sizes are never backed by data; the central
+    /// directory is all the extractor reads.
+    fn zip64_with_sizes(sizes: &[u64]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut cd = Vec::new();
+        for (i, &size) in sizes.iter().enumerate() {
+            let name = format!("f{i}.bin");
+            let lfh = out.len() as u64;
+            out.extend_from_slice(b"PK\x03\x04");
+            for v in [45u16, 0, 0, 0, 0x21] {
+                out.extend(v.to_le_bytes());
+            }
+            for v in [0u32, u32::MAX, u32::MAX] {
+                out.extend(v.to_le_bytes());
+            }
+            out.extend((name.len() as u16).to_le_bytes());
+            out.extend(20u16.to_le_bytes());
+            out.extend(name.as_bytes());
+            for v in [1u16, 16] {
+                out.extend(v.to_le_bytes());
+            }
+            out.extend(size.to_le_bytes());
+            out.extend(size.to_le_bytes());
+
+            cd.extend_from_slice(b"PK\x01\x02");
+            for v in [0x032Du16, 45, 0, 0, 0, 0x21] {
+                cd.extend(v.to_le_bytes());
+            }
+            for v in [0u32, u32::MAX, u32::MAX] {
+                cd.extend(v.to_le_bytes());
+            }
+            for v in [name.len() as u16, 28, 0, 0, 0] {
+                cd.extend(v.to_le_bytes());
+            }
+            for v in [0u32, u32::MAX] {
+                cd.extend(v.to_le_bytes());
+            }
+            cd.extend(name.as_bytes());
+            for v in [1u16, 24] {
+                cd.extend(v.to_le_bytes());
+            }
+            for v in [size, size, lfh] {
+                cd.extend(v.to_le_bytes());
+            }
+        }
+        let cd_offset = out.len() as u64;
+        out.extend(&cd);
+        let eocd64 = out.len() as u64;
+        out.extend_from_slice(b"PK\x06\x06");
+        out.extend(44u64.to_le_bytes());
+        for v in [45u16, 45] {
+            out.extend(v.to_le_bytes());
+        }
+        for v in [0u32, 0] {
+            out.extend(v.to_le_bytes());
+        }
+        for v in [
+            sizes.len() as u64,
+            sizes.len() as u64,
+            cd.len() as u64,
+            cd_offset,
+        ] {
+            out.extend(v.to_le_bytes());
+        }
+        out.extend_from_slice(b"PK\x06\x07");
+        out.extend(0u32.to_le_bytes());
+        out.extend(eocd64.to_le_bytes());
+        out.extend(1u32.to_le_bytes());
+        out.extend_from_slice(b"PK\x05\x06");
+        for v in [0u16, 0, u16::MAX, u16::MAX] {
+            out.extend(v.to_le_bytes());
+        }
+        for v in [u32::MAX, u32::MAX] {
+            out.extend(v.to_le_bytes());
+        }
+        out.extend(0u16.to_le_bytes());
+        out
+    }
+
+    /// Declared Zip64 sizes summing past `u64::MAX` overflowed the size
+    /// totals: a panic in builds with overflow checks, a wrapped total
+    /// otherwise.
+    #[test]
+    fn zip64_size_totals_saturate() {
+        let z = zip64_with_sizes(&[1 << 63, 1 << 63]);
+        let (_, m) = run(&z);
+        assert_eq!(m.get("archive.member_count"), Some(2.0));
+        assert_eq!(m.get("archive.uncompressed_size"), Some(u64::MAX as f64));
+        assert_eq!(m.get("archive.compressed_size"), Some(u64::MAX as f64));
+    }
+
     #[test]
     fn crc_collision_ignores_zero_size_entries() {
         // Two empty files share CRC32=0 but aren't a real collision.
@@ -1770,19 +1311,6 @@ mod tests {
         ]);
         let (_, m) = run(&z);
         assert_eq!(m.get("archive.noise_file_count"), Some(4.0));
-    }
-
-    #[test]
-    fn is_noise_filename_helper() {
-        assert!(is_noise_filename("__MACOSX/anything"));
-        assert!(is_noise_filename(".DS_Store"));
-        assert!(is_noise_filename("nested/path/.DS_Store"));
-        assert!(is_noise_filename("Thumbs.db"));
-        assert!(is_noise_filename("desktop.ini"));
-        assert!(!is_noise_filename("ok.txt"));
-        assert!(!is_noise_filename("a/b/c.txt"));
-        // Case-sensitive — exact Windows / macOS conventions only.
-        assert!(!is_noise_filename("THUMBS.DB"));
     }
 
     #[test]

@@ -22,7 +22,10 @@ impl Markup {
     }
 
     pub(super) fn cf_tag(&mut self, bytes: &[u8], tag: &Tag) {
-        if bytes[tag.name.clone()].eq_ignore_ascii_case(b"cfoutput") {
+        if bytes
+            .get(tag.name.clone())
+            .is_some_and(|name| name.eq_ignore_ascii_case(b"cfoutput"))
+        {
             if tag.closing {
                 self.output_depth = self.output_depth.saturating_sub(1);
             } else {
@@ -39,8 +42,9 @@ impl Markup {
             if starts(bytes, at, b"-->") || starts(bytes, at, b"--!>") {
                 self.comment = false;
                 self.until = at + if starts(bytes, at, b"--!>") { 4 } else { 3 };
-            } else if bytes[at] == b'>'
-                && (at == self.until || (at == self.until + 1 && bytes[self.until] == b'-'))
+            } else if bytes.get(at) == Some(&b'>')
+                && (at == self.until
+                    || (at == self.until + 1 && bytes.get(self.until) == Some(&b'-')))
             {
                 self.comment = false;
                 self.until = at + 1;
@@ -48,11 +52,12 @@ impl Markup {
             return None;
         }
         if let Some(raw) = &self.raw {
-            if bytes[raw.clone()].eq_ignore_ascii_case(b"plaintext") {
+            let raw = bytes.get(raw.clone()).unwrap_or_default();
+            if raw.eq_ignore_ascii_case(b"plaintext") {
                 return None;
             }
             if !starts(bytes, at, b"</")
-                || !starts(bytes, at + 2, &bytes[raw.clone()])
+                || !starts(bytes, at + 2, raw)
                 || !bytes
                     .get(at + 2 + raw.len())
                     .is_some_and(|b| b.is_ascii_whitespace() || matches!(b, b'>' | b'/'))
@@ -72,8 +77,7 @@ impl Markup {
             let doctype = starts(bytes, at, b"<!doctype");
             let mut end = at + 2;
             let mut quote = None;
-            while end < bytes.len() {
-                let b = bytes[end];
+            while let Some(&b) = bytes.get(end) {
                 if quote == Some(b) {
                     quote = None;
                 } else if quote.is_none() {
@@ -114,8 +118,7 @@ impl Markup {
         let mut prefix_end = None;
         let mut condition_depth = 0usize;
         let mut mixed_unknown = false;
-        while end < bytes.len() {
-            let b = bytes[end];
+        while let Some(&b) = bytes.get(end) {
             if quote.is_none() && (starts(bytes, end, b"<cf") || starts(bytes, end, b"</cf")) {
                 let cf_start = end;
                 let cf_closing = bytes.get(end + 1) == Some(&b'/');
@@ -124,7 +127,7 @@ impl Markup {
                 while bytes.get(end).is_some_and(u8::is_ascii_alphanumeric) {
                     end += 1;
                 }
-                let cf = &bytes[cf_name..end];
+                let cf = bytes.get(cf_name..end).unwrap_or_default();
                 if cf.eq_ignore_ascii_case(b"cfif") {
                     prefix_end.get_or_insert(cf_start);
                     if cf_closing {
@@ -147,8 +150,10 @@ impl Markup {
                 } else {
                     mixed_unknown = true;
                 }
-                while end < bytes.len() && bytes[end] != b'>' {
-                    if matches!(bytes[end], b'\'' | b'"') {
+                while let Some(&c) = bytes.get(end)
+                    && c != b'>'
+                {
+                    if matches!(c, b'\'' | b'"') {
                         if !super::quoted(bytes, &mut end) {
                             self.limited = true;
                             self.until = bytes.len();
@@ -192,7 +197,7 @@ impl Markup {
             self.limited = true;
             return None;
         }
-        let name = &bytes[start..body_start];
+        let name = bytes.get(start..body_start).unwrap_or_default();
         if !closing
             && [
                 b"script".as_slice(),
@@ -222,10 +227,12 @@ impl Markup {
         let known_end = prefix_end.unwrap_or(end);
         if mixed_unknown
             || condition_depth != 0
-            || bytes[body_start..known_end]
-                .windows(3)
-                .any(|w| w.eq_ignore_ascii_case(b"<cf"))
-            || bytes[body_start..end].windows(5).any(|w| w == b"<!---")
+            || bytes
+                .get(body_start..known_end)
+                .is_some_and(|body| body.windows(3).any(|w| w.eq_ignore_ascii_case(b"<cf")))
+            || bytes
+                .get(body_start..end)
+                .is_some_and(|body| body.windows(5).any(|w| w == b"<!---"))
         {
             self.limited = true;
             return None;
@@ -247,37 +254,40 @@ pub(super) fn attributes(bytes: &[u8], tag: &Tag, interpolate: bool) -> Option<V
     let mut out: Vec<Attribute> = Vec::new();
     let mut at = tag.body.start;
     let end = tag.body.end;
+    // Everything through the body; indexing it past `end` yields `None`.
+    let body = bytes.get(..end)?;
     while at < end {
-        while at < end && bytes[at].is_ascii_whitespace() {
+        while body.get(at).is_some_and(u8::is_ascii_whitespace) {
             at += 1;
         }
-        if at == end || (at + 1 == end && bytes[at] == b'/') {
+        if at == end || (at + 1 == end && body.get(at) == Some(&b'/')) {
             break;
         }
         if out.len() == 64 {
             return None;
         }
         let start = at;
-        while at < end
-            && !bytes[at].is_ascii_whitespace()
-            && !matches!(bytes[at], b'=' | b'/' | b'>' | b'\'' | b'"' | b'<' | b'`')
-        {
+        while body.get(at).is_some_and(|b| {
+            !b.is_ascii_whitespace()
+                && !matches!(b, b'=' | b'/' | b'>' | b'\'' | b'"' | b'<' | b'`')
+        }) {
             at += 1;
         }
         if at == start {
             return None;
         }
         let name = start..at;
-        if out
-            .iter()
-            .any(|a| bytes[a.name.clone()].eq_ignore_ascii_case(&bytes[name.clone()]))
-        {
+        let name_text = body.get(name.clone())?;
+        if out.iter().any(|a| {
+            body.get(a.name.clone())
+                .is_some_and(|n| n.eq_ignore_ascii_case(name_text))
+        }) {
             return None;
         }
-        while at < end && bytes[at].is_ascii_whitespace() {
+        while body.get(at).is_some_and(u8::is_ascii_whitespace) {
             at += 1;
         }
-        if at == end || bytes[at] != b'=' {
+        if body.get(at) != Some(&b'=') {
             out.push(Attribute {
                 name,
                 value: at..at,
@@ -286,32 +296,30 @@ pub(super) fn attributes(bytes: &[u8], tag: &Tag, interpolate: bool) -> Option<V
             continue;
         }
         at += 1;
-        while at < end && bytes[at].is_ascii_whitespace() {
+        while body.get(at).is_some_and(u8::is_ascii_whitespace) {
             at += 1;
         }
-        if at == end {
-            return None;
-        }
-        let quote = matches!(bytes[at], b'\'' | b'"').then_some(bytes[at]);
+        let &first = body.get(at)?;
+        let quote = matches!(first, b'\'' | b'"').then_some(first);
         if quote.is_some() {
             at += 1;
         }
         let start = at;
-        while at < end {
-            if quote == Some(bytes[at]) || (quote.is_none() && bytes[at].is_ascii_whitespace()) {
+        while let Some(&b) = body.get(at) {
+            if quote == Some(b) || (quote.is_none() && b.is_ascii_whitespace()) {
                 break;
             }
-            if interpolate && bytes[at] == b'#' {
+            if interpolate && b == b'#' {
                 if bytes.get(at + 1) == Some(&b'#') {
                     at += 2;
                     continue;
                 }
                 at += 1;
-                if !interpolation(&bytes[..end], &mut at) {
+                if !interpolation(body, &mut at) {
                     return None;
                 }
             } else {
-                if quote.is_none() && matches!(bytes[at], b'\'' | b'"' | b'<' | b'=' | b'`') {
+                if quote.is_none() && matches!(b, b'\'' | b'"' | b'<' | b'=' | b'`') {
                     return None;
                 }
                 at += 1;
@@ -319,11 +327,14 @@ pub(super) fn attributes(bytes: &[u8], tag: &Tag, interpolate: bool) -> Option<V
         }
         let value = start..at;
         if let Some(q) = quote {
-            if at == end || bytes[at] != q {
+            if body.get(at) != Some(&q) {
                 return None;
             }
             at += 1;
-            if at < end && !bytes[at].is_ascii_whitespace() && bytes[at] != b'/' {
+            if body
+                .get(at)
+                .is_some_and(|b| !b.is_ascii_whitespace() && *b != b'/')
+            {
                 return None;
             }
         }
@@ -343,9 +354,8 @@ pub(super) fn decode_references(text: &str) -> Result<Option<String>, ()> {
         return Ok(None);
     }
     let mut out = String::with_capacity(text.len());
-    let mut at = 0;
-    while at < text.len() {
-        let rest = &text[at..];
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
         let mut decoded = None;
         for (entity, value) in [
             ("&amp;", '&'),
@@ -386,8 +396,11 @@ pub(super) fn decode_references(text: &str) -> Result<Option<String>, ()> {
                 ];
                 let mut value = u32::from_str_radix(&rest[start..end], if hex { 16 } else { 10 })
                     .unwrap_or(0xfffd);
-                if (0x80..=0x9f).contains(&value) {
-                    value = C1[(value - 0x80) as usize];
+                if let Some(&windows_1252) = value
+                    .checked_sub(0x80)
+                    .and_then(|index| C1.get(usize::try_from(index).ok()?))
+                {
+                    value = windows_1252;
                 }
                 let value = char::from_u32(value)
                     .filter(|c| *c != '\0')
@@ -404,14 +417,14 @@ pub(super) fn decode_references(text: &str) -> Result<Option<String>, ()> {
         {
             return Err(());
         }
-        if let Some((len, value)) = decoded {
+        let len = if let Some((len, value)) = decoded {
             out.push(value);
-            at += len;
+            len
         } else {
-            let c = rest.chars().next().unwrap();
             out.push(c);
-            at += c.len_utf8();
-        }
+            c.len_utf8()
+        };
+        rest = rest.get(len..).unwrap_or_default();
     }
     Ok((out != text).then_some(out))
 }

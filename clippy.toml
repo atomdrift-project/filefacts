@@ -1,0 +1,2 @@
+# Test fixtures are trusted and small; indexing there is fine.
+allow-indexing-slicing-in-tests = true

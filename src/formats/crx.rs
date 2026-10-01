@@ -25,13 +25,16 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
 use crate::error::Error;
-use crate::output::{ArchiveMember, Metrics, Values};
+use crate::formats::common::bytes_at::u32_le;
+use crate::formats::common::hex_encode;
+use crate::output::{ArchiveMember, Errors, Metrics, Stage, Values};
 
 pub(super) fn extract(
     bytes: &[u8],
     values: &mut Values,
     metrics: &mut Metrics,
     archive_members: &mut Vec<ArchiveMember>,
+    errors: &mut Errors,
 ) -> Result<(), Error> {
     // Header decode is best-effort identity enrichment; a malformed
     // header must not stop the ZIP walk.
@@ -40,19 +43,100 @@ pub(super) fn extract(
     super::zip::extract_from_archive(&mut archive, bytes, values, metrics, archive_members)?;
     // The extension's `manifest.json` carries the developer-declared
     // author and homepage — the human identity behind the signing key.
-    if let Some(manifest) = read_manifest(&mut archive) {
+    if let Some(manifest) = read_manifest(&mut archive, values, errors) {
         emit_manifest_identity(&manifest, values);
     }
     Ok(())
 }
 
 /// Read and parse the root `manifest.json` of an opened CRX archive.
-fn read_manifest<R: Read + std::io::Seek>(zip: &mut ::zip::ZipArchive<R>) -> Option<JsonValue> {
+/// `None` when it is absent (silently), over the size cap (a `crx.limits`
+/// entry), or unreadable or not JSON (an error).
+fn read_manifest<R: Read + std::io::Seek>(
+    zip: &mut ::zip::ZipArchive<R>,
+    values: &mut Values,
+    errors: &mut Errors,
+) -> Option<JsonValue> {
+    const NAME: &str = "manifest.json";
     const MAX: u64 = 512 * 1024;
-    let member = zip.by_name("manifest.json").ok()?;
+    let member = match zip.by_name(NAME) {
+        Ok(member) => member,
+        Err(::zip::result::ZipError::FileNotFound) => return None,
+        Err(e) => {
+            errors.record_malformed(Stage::ZipParse, format!("{NAME}: {e}"));
+            return None;
+        }
+    };
     let mut buf = Vec::new();
-    member.take(MAX).read_to_end(&mut buf).ok()?;
-    serde_json::from_slice(&buf).ok()
+    if let Err(e) = member.take(MAX + 1).read_to_end(&mut buf) {
+        errors.record_malformed(Stage::ZipParse, format!("{NAME}: {e}"));
+        return None;
+    }
+    if buf.len() as u64 > MAX {
+        values.insert(
+            "crx.limits",
+            serde_json::json!([{
+                "stage": "manifest",
+                "reason": format!("{NAME} over the {MAX}-byte cap; not parsed"),
+            }]),
+        );
+        return None;
+    }
+    serde_json::from_slice(&browser_manifest_json(&buf))
+        .map_err(|e| errors.record_malformed(Stage::FormatExtract, format!("{NAME}: {e}")))
+        .ok()
+}
+
+/// `manifest.json` as strict JSON. Chrome and Firefox both accept a UTF-8 BOM
+/// and `//` / `/* */` comments in it, so a manifest using either is valid,
+/// not malformed; drop them (outside strings) before parsing.
+pub(super) fn browser_manifest_json(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let raw = raw.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(raw);
+    if !raw.contains(&b'/') {
+        return std::borrow::Cow::Borrowed(raw);
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    let mut rest = raw;
+    let mut in_string = false;
+    while let Some((&b, tail)) = rest.split_first() {
+        if in_string {
+            out.push(b);
+            match (b, tail.first()) {
+                (b'\\', Some(&next)) => {
+                    out.push(next);
+                    rest = tail.get(1..).unwrap_or_default();
+                    continue;
+                }
+                (b'"', _) => in_string = false,
+                _ => {}
+            }
+            rest = tail;
+            continue;
+        }
+        match (b, tail.first()) {
+            (b'"', _) => {
+                in_string = true;
+                out.push(b);
+                rest = tail;
+            }
+            (b'/', Some(b'/')) => {
+                let end = memchr::memchr(b'\n', tail).unwrap_or(tail.len());
+                rest = tail.get(end..).unwrap_or_default();
+            }
+            (b'/', Some(b'*')) => {
+                let body = tail.get(1..).unwrap_or_default();
+                rest = memchr::memmem::find(body, b"*/")
+                    .and_then(|end| body.get(end + 2..))
+                    .unwrap_or_default();
+                out.push(b' ');
+            }
+            _ => {
+                out.push(b);
+                rest = tail;
+            }
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Emit `crx.author` / `crx.author_email` / `crx.homepage_url` /
@@ -90,7 +174,9 @@ fn header(bytes: &[u8], values: &mut Values) {
     if !bytes.starts_with(b"Cr24") || bytes.len() < 12 {
         return;
     }
-    let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let Some(version) = u32_le(bytes, 4) else {
+        return;
+    };
     values.insert("crx.version", JsonValue::from(version));
 
     match version {
@@ -101,7 +187,7 @@ fn header(bytes: &[u8], values: &mut Values) {
             let digest = Sha256::digest(public_key);
             values.insert(
                 "crx.public_key_sha256",
-                JsonValue::String(hex_lower(&digest)),
+                JsonValue::String(hex_encode(&digest)),
             );
             values.insert("crx.extension_id", JsonValue::String(extension_id(&digest)));
         }
@@ -117,7 +203,7 @@ fn header(bytes: &[u8], values: &mut Values) {
                 let digest = Sha256::digest(public_key);
                 values.insert(
                     "crx.public_key_sha256",
-                    JsonValue::String(hex_lower(&digest)),
+                    JsonValue::String(hex_encode(&digest)),
                 );
             }
         }
@@ -126,33 +212,24 @@ fn header(bytes: &[u8], values: &mut Values) {
 }
 
 fn crx2_public_key(bytes: &[u8]) -> Option<&[u8]> {
-    let key_len = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?) as usize;
+    let key_len = u32_le(bytes, 8)? as usize;
     let start = 16usize;
     bytes.get(start..start.checked_add(key_len)?)
 }
 
 fn crx3_header(bytes: &[u8]) -> Option<&[u8]> {
-    let header_len = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?) as usize;
+    let header_len = u32_le(bytes, 8)? as usize;
     bytes.get(12..12usize.checked_add(header_len)?)
 }
 
 /// Map a SHA-256 digest to the 32-character `a..p` Chrome extension id.
 fn extension_id(digest: &[u8]) -> String {
-    digest[..16]
+    digest
         .iter()
+        .take(16)
         .flat_map(|&b| [b'a' + (b >> 4), b'a' + (b & 0x0f)])
         .map(char::from)
         .collect()
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(char::from(HEX[(b >> 4) as usize]));
-        out.push(char::from(HEX[(b & 0x0f) as usize]));
-    }
-    out
 }
 
 // --- Minimal protobuf reader for the CRX3 `CrxFileHeader` -------------
@@ -166,8 +243,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 fn varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
     let mut value: u64 = 0;
     let mut shift: u32 = 0;
-    while *pos < buf.len() {
-        let byte = buf[*pos];
+    while let Some(&byte) = buf.get(*pos) {
         *pos += 1;
         value |= u64::from(byte & 0x7f).checked_shl(shift)?;
         if byte & 0x80 == 0 {
@@ -254,6 +330,16 @@ fn matching_developer_public_key<'a>(header: &'a [u8], crx_id: &[u8]) -> Option<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn browser_manifest_bom_and_comments_are_accepted() {
+        let raw = "\u{feff}{\n  // the extension\n  \"name\": \"x\", /* block */\n  \"homepage_url\": \"https://example.invalid/a//b\",\n  \"q\": \"say \\\"//hi\\\"\"\n}";
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&super::browser_manifest_json(raw.as_bytes())).unwrap();
+        assert_eq!(parsed["name"], "x");
+        assert_eq!(parsed["homepage_url"], "https://example.invalid/a//b");
+        assert_eq!(parsed["q"], "say \"//hi\"");
+    }
+
     use super::*;
 
     #[test]
@@ -315,8 +401,73 @@ mod tests {
             values
                 .get("crx.public_key_sha256")
                 .and_then(JsonValue::as_str),
-            Some(hex_lower(&digest).as_str())
+            Some(hex_encode(&digest).as_str())
         );
+    }
+
+    /// A CRX3 shell around a stored-member zip.
+    fn crx_with(members: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut w = ::zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = ::zip::write::SimpleFileOptions::default()
+            .compression_method(::zip::CompressionMethod::Stored);
+        for (name, body) in members {
+            w.start_file(*name, opts).unwrap();
+            w.write_all(body).unwrap();
+        }
+        let mut bytes = b"Cr24".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&w.finish().unwrap().into_inner());
+        bytes
+    }
+
+    fn run(bytes: &[u8]) -> (Values, Errors) {
+        let mut values = Values::new();
+        let mut metrics = Metrics::new();
+        let mut members = Vec::new();
+        let mut errors = Errors::new();
+        extract(bytes, &mut values, &mut metrics, &mut members, &mut errors).unwrap();
+        (values, errors)
+    }
+
+    #[test]
+    fn manifest_that_is_not_json_records_one_error() {
+        let (values, errors) = run(&crx_with(&[("manifest.json", b"{\"author\": ")]));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let e = &errors.as_slice()[0];
+        assert_eq!(
+            (e.stage, e.kind),
+            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+        );
+        assert!(e.message.starts_with("manifest.json:"), "{}", e.message);
+        assert!(values.get("crx.limits").is_none());
+    }
+
+    #[test]
+    fn well_formed_or_absent_manifest_records_nothing() {
+        let (values, errors) = run(&crx_with(&[("manifest.json", br#"{"author": "Jo"}"#)]));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            values.get("crx.author").and_then(JsonValue::as_str),
+            Some("Jo")
+        );
+        let (_, errors) = run(&crx_with(&[("background.js", b"//")]));
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn oversized_manifest_is_a_limit_not_an_error() {
+        let mut big = b"{\"description\": \"".to_vec();
+        big.resize(600 * 1024, b'a');
+        big.extend_from_slice(b"\"}");
+        let (values, errors) = run(&crx_with(&[("manifest.json", &big)]));
+        assert!(errors.is_empty(), "{errors:?}");
+        let limits = values
+            .get("crx.limits")
+            .and_then(JsonValue::as_array)
+            .unwrap();
+        assert_eq!(limits[0]["stage"], "manifest");
     }
 
     #[test]

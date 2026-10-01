@@ -1,4 +1,8 @@
 //! Original executable-constants specimen and malformed/virtual section cases.
+#![allow(
+    clippy::indexing_slicing,
+    reason = "helpers index a fixed, trusted fixture at known offsets"
+)]
 use sha2::{Digest, Sha256};
 const FAT: &[u8] = include_bytes!("../testdata/macho/lcg_xor_executable_constants.macho");
 fn open(b: &[u8]) -> filefacts::ParsedFile<'_> {

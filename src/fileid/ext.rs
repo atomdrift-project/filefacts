@@ -636,7 +636,10 @@ impl std::ops::Deref for LowercaseExt {
 
     fn deref(&self) -> &str {
         // Lowercasing ASCII bytes keeps valid UTF-8 valid.
-        std::str::from_utf8(&self.buf[..self.len]).unwrap_or_default()
+        self.buf
+            .get(..self.len)
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .unwrap_or_default()
     }
 }
 
@@ -644,11 +647,9 @@ impl std::ops::Deref for LowercaseExt {
 /// UTF-8, or it is longer than [`LowercaseExt::MAX_LEN`].
 pub(super) fn lowercase_ext(path: &Path) -> Option<LowercaseExt> {
     let ext = path.extension()?.to_str()?;
-    if ext.len() > LowercaseExt::MAX_LEN {
-        return None;
-    }
     let mut buf = [0; LowercaseExt::MAX_LEN];
-    buf[..ext.len()].copy_from_slice(ext.as_bytes());
+    // An extension longer than the buffer has no slot, and so is absent.
+    buf.get_mut(..ext.len())?.copy_from_slice(ext.as_bytes());
     buf.make_ascii_lowercase();
     Some(LowercaseExt {
         buf,
@@ -659,24 +660,25 @@ pub(super) fn lowercase_ext(path: &Path) -> Option<LowercaseExt> {
 fn has_versioned_so_suffix(path: &str) -> bool {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let bytes = name.as_bytes();
-    let Some(pos) = bytes
+    let Some(suffix) = bytes
         .windows(4)
         .rposition(|window| window.eq_ignore_ascii_case(b".so."))
+        .and_then(|pos| bytes.get(pos + 4..))
     else {
         return false;
     };
-    let suffix = &bytes[pos + 4..];
     !suffix.is_empty()
         && suffix.iter().any(u8::is_ascii_digit)
         && suffix.iter().all(|b| b.is_ascii_digit() || *b == b'.')
 }
 
 /// Case-insensitive suffix check on raw bytes (no allocation).
-fn ends_with_ci(haystack: &[u8], needle: &[u8]) -> bool {
-    if haystack.len() < needle.len() {
-        return false;
-    }
-    haystack[haystack.len() - needle.len()..].eq_ignore_ascii_case(needle)
+pub(super) fn ends_with_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .len()
+        .checked_sub(needle.len())
+        .and_then(|start| haystack.get(start..))
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(needle))
 }
 
 #[cfg(test)]

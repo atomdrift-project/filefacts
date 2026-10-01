@@ -41,7 +41,7 @@ pub(super) struct Syntax {
 // Find the actual script closing tag. Apparent tags inside strings and
 // comments are opaque. Script semantics are handled separately from tag scan.
 fn script_end(bytes: &[u8], mut at: usize) -> Result<usize, Limit> {
-    while at < bytes.len() {
+    while let Some(&byte) = bytes.get(at) {
         if starts(bytes, at, b"</cfscript")
             && bytes
                 .get(at + 10)
@@ -49,12 +49,12 @@ fn script_end(bytes: &[u8], mut at: usize) -> Result<usize, Limit> {
         {
             return Ok(at);
         }
-        if matches!(bytes[at], b'\'' | b'"') {
+        if matches!(byte, b'\'' | b'"') {
             if !quoted(bytes, &mut at) {
                 return Err(Limit::Truncated);
             }
         } else if starts(bytes, at, b"//") {
-            while at < bytes.len() && !matches!(bytes[at], b'\n' | b'\r') {
+            while bytes.get(at).is_some_and(|b| !matches!(b, b'\n' | b'\r')) {
                 at += 1;
             }
         } else if starts(bytes, at, b"/*") {
@@ -102,10 +102,12 @@ fn starts(bytes: &[u8], at: usize, value: &[u8]) -> bool {
 // CFML doubles quotes inside strings. Hash expressions can themselves contain
 // quoted strings, including the outer attribute's quote character.
 fn quoted(bytes: &[u8], at: &mut usize) -> bool {
-    let quote = bytes[*at];
+    let Some(&quote) = bytes.get(*at) else {
+        return false;
+    };
     *at += 1;
-    while *at < bytes.len() {
-        match bytes[*at] {
+    while let Some(&byte) = bytes.get(*at) {
+        match byte {
             b'#' if bytes.get(*at + 1) == Some(&b'#') => *at += 2,
             b'#' => {
                 *at += 1;
@@ -128,8 +130,8 @@ fn quoted(bytes: &[u8], at: &mut usize) -> bool {
 }
 
 fn interpolation(bytes: &[u8], at: &mut usize) -> bool {
-    while *at < bytes.len() {
-        match bytes[*at] {
+    while let Some(&byte) = bytes.get(*at) {
+        match byte {
             b'#' => {
                 *at += 1;
                 return true;
@@ -170,7 +172,7 @@ pub(super) fn scan(bytes: &[u8]) -> Syntax {
     }
     let mut at = 0;
     let mut markup = markup::Markup::default();
-    while at < bytes.len() {
+    while let Some(&byte) = bytes.get(at) {
         if starts(bytes, at, b"<!---") {
             at += 5;
             let mut depth = 1;
@@ -195,7 +197,7 @@ pub(super) fn scan(bytes: &[u8]) -> Syntax {
             }
             continue;
         }
-        if markup.in_output() && bytes[at] == b'#' {
+        if markup.in_output() && byte == b'#' {
             if bytes.get(at + 1) == Some(&b'#') {
                 at += 2;
                 continue;
@@ -217,7 +219,7 @@ pub(super) fn scan(bytes: &[u8]) -> Syntax {
             }
             continue;
         }
-        if bytes[at] != b'<' {
+        if byte != b'<' {
             markup.step(bytes, at);
             out.markup_limited |= markup.limited;
             at += 1;
@@ -283,7 +285,11 @@ pub(super) fn scan(bytes: &[u8]) -> Syntax {
         });
         markup.cf_tag(bytes, out.tags.last().unwrap());
         at += 1;
-        if !closing && bytes[name_start..name_end].eq_ignore_ascii_case(b"cfscript") {
+        if !closing
+            && bytes
+                .get(name_start..name_end)
+                .is_some_and(|name| name.eq_ignore_ascii_case(b"cfscript"))
+        {
             match script_end(bytes, at) {
                 Ok(end) => {
                     out.scripts.push(at..end);
@@ -313,60 +319,66 @@ pub(super) fn attributes(bytes: &[u8], tag: &Tag) -> Option<Vec<Attribute>> {
     let mut out: Vec<Attribute> = Vec::new();
     let mut at = tag.body.start;
     let end = tag.body.end;
-    if end > bytes.len() || at > end {
+    // Everything through the body; indexing it past `end` yields `None`.
+    let body = bytes.get(..end)?;
+    if at > end {
         return None;
     }
     while at < end {
-        while at < end && bytes[at].is_ascii_whitespace() {
+        while body.get(at).is_some_and(u8::is_ascii_whitespace) {
             at += 1;
         }
-        if at == end || (at + 1 == end && bytes[at] == b'/') {
+        if at == end || (at + 1 == end && body.get(at) == Some(&b'/')) {
             break;
         }
         if out.len() == 64 {
             return None;
         }
         let begin = at;
-        while at < end && (bytes[at].is_ascii_alphanumeric() || matches!(bytes[at], b'_' | b'-')) {
+        while body
+            .get(at)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        {
             at += 1;
         }
         if at == begin {
             return None;
         }
         let name = begin..at;
-        if out
-            .iter()
-            .any(|a| bytes[a.name.clone()].eq_ignore_ascii_case(&bytes[name.clone()]))
-        {
+        let name_text = body.get(name.clone())?;
+        if out.iter().any(|a| {
+            body.get(a.name.clone())
+                .is_some_and(|n| n.eq_ignore_ascii_case(name_text))
+        }) {
             return None;
         }
-        while at < end && bytes[at].is_ascii_whitespace() {
+        while body.get(at).is_some_and(u8::is_ascii_whitespace) {
             at += 1;
         }
         if bytes.get(at) != Some(&b'=') {
             return None;
         }
         at += 1;
-        while at < end && bytes[at].is_ascii_whitespace() {
+        while body.get(at).is_some_and(u8::is_ascii_whitespace) {
             at += 1;
         }
-        if at == end {
-            return None;
-        }
-        let is_quoted = matches!(bytes[at], b'\'' | b'"');
+        let &first = body.get(at)?;
+        let is_quoted = matches!(first, b'\'' | b'"');
 
         let value = if is_quoted {
             let begin = at + 1;
-            if !quoted(&bytes[..end], &mut at) {
+            if !quoted(body, &mut at) {
                 return None;
             }
             begin..at - 1
         } else {
             let begin = at;
-            while at < end && !bytes[at].is_ascii_whitespace() {
-                if bytes[at] == b'#' {
+            while let Some(&b) = body.get(at)
+                && !b.is_ascii_whitespace()
+            {
+                if b == b'#' {
                     at += 1;
-                    if !interpolation(&bytes[..end], &mut at) {
+                    if !interpolation(body, &mut at) {
                         return None;
                     }
                 } else {
@@ -375,7 +387,10 @@ pub(super) fn attributes(bytes: &[u8], tag: &Tag) -> Option<Vec<Attribute>> {
             }
             begin..at
         };
-        if at < end && !bytes[at].is_ascii_whitespace() && bytes[at] != b'/' {
+        if body
+            .get(at)
+            .is_some_and(|b| !b.is_ascii_whitespace() && *b != b'/')
+        {
             return None;
         }
         out.push(Attribute {

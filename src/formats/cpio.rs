@@ -4,12 +4,39 @@
 //! is deliberately not exposed as a CRC-32. Binary and RPM stripped formats
 //! require different metadata and are not interpreted as ASCII CPIO.
 
+use serde_json::Value as JsonValue;
+
+use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_value};
 use crate::error::Error;
-use crate::output::{ArchiveMember, ArchiveOffsets, ArchiveOwnership, Values};
+use crate::output::{ArchiveMember, ArchiveOffsets, ArchiveOwnership, Metrics, Values};
 
 const MAX_ENTRIES: usize = 65_536;
 const MAX_NAME_BYTES: usize = 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 16 * 1024 * 1024;
+
+/// The shared aggregates a CPIO reports. Like tar, only regular entries are
+/// files and only their sizes are summed.
+const AGGS: &[Agg] = &[
+    Agg::MemberCount,
+    Agg::FileCount,
+    Agg::DirectoryCount,
+    Agg::UncompressedSize(Scope::Files),
+    Agg::EntryTypes,
+    Agg::ModeBits,
+    Agg::SymlinkCount,
+    Agg::SymlinkEscapes,
+    Agg::MaxFilenameLength,
+    Agg::HiddenFiles,
+    Agg::PathTraversal(Scope::All),
+    Agg::NameTricks,
+    Agg::Executables,
+    Agg::Scripts,
+    Agg::NestedArchives,
+    Agg::MisplacedExecutables,
+    Agg::NoiseFiles,
+    Agg::DuplicateMembers,
+    Agg::MtimeRange,
+];
 
 fn invalid(message: &str) -> Error {
     Error::malformed("cpio", message)
@@ -35,6 +62,14 @@ fn extent(bytes: &[u8], start: usize, len: usize) -> Result<&[u8], Error> {
         .ok_or_else(|| invalid("truncated entry"))
 }
 
+/// A fixed-size header at `start`, typed so its fields are read by constant
+/// offsets.
+fn header_at<const N: usize>(bytes: &[u8], start: usize) -> Result<&[u8; N], Error> {
+    extent(bytes, start, N)?
+        .first_chunk::<N>()
+        .ok_or_else(|| invalid("truncated entry"))
+}
+
 fn aligned(offset: usize, alignment: usize) -> Result<usize, Error> {
     offset
         .checked_add(alignment - 1)
@@ -45,13 +80,35 @@ fn aligned(offset: usize, alignment: usize) -> Result<usize, Error> {
 pub(super) fn extract(
     bytes: &[u8],
     values: &mut Values,
+    metrics: &mut Metrics,
     members: &mut Vec<ArchiveMember>,
 ) -> Result<(), Error> {
     values.insert("cpio.complete", serde_json::json!(false));
+    let first = members.len();
     let result = index(bytes, values, members, MAX_ENTRIES, MAX_METADATA_BYTES);
     if result.is_ok() {
         values.insert("cpio.complete", serde_json::json!(true));
     }
+    // An incomplete stream keeps the members indexed before the fault, so
+    // the aggregates cover those too.
+    let indexed = members.get(first..).unwrap_or_default();
+    let mut stats = ArchiveStats::new(AGGS);
+    for member in indexed {
+        let mut reading = Reading::of(member);
+        reading.file = member.entry_type.as_deref() == Some("regular");
+        reading.exec_mode = member
+            .ownership
+            .as_ref()
+            .and_then(|o| o.mode_octal)
+            .is_some_and(|mode| mode & 0o111 != 0);
+        stats.observe(member, &reading);
+    }
+    let list = indexed
+        .iter()
+        .map(|m| JsonValue::Object(member_value(m, Shape::FULL)))
+        .collect();
+    values.insert("archive.members", JsonValue::Array(list));
+    stats.emit(values, metrics);
     result
 }
 
@@ -83,7 +140,7 @@ fn index(
         let magic = extent(bytes, offset, 6)?;
         let header = match magic {
             b"070707" => {
-                let h = extent(bytes, offset, 76)?;
+                let h = header_at::<76>(bytes, offset)?;
                 // Validate even numeric fields not projected into ArchiveMember.
                 for field in h[6..48].as_chunks::<6>().0 {
                     number(field, 8)?;
@@ -101,7 +158,7 @@ fn index(
                 }
             }
             b"070701" | b"070702" => {
-                let h = extent(bytes, offset, 110)?;
+                let h = header_at::<110>(bytes, offset)?;
                 let mut fields = [0u64; 13];
                 for (value, field) in fields.iter_mut().zip(h[6..].as_chunks::<8>().0) {
                     *value = number(field, 16)?;
@@ -138,18 +195,25 @@ fn index(
             .checked_add(header.size)
             .ok_or_else(|| invalid("header overflow"))?;
         let name = extent(bytes, name_offset, name_size)?;
-        if name.last() != Some(&0) || name[..name.len() - 1].contains(&0) {
+        let Some((&0, name)) = name.split_last() else {
+            return Err(invalid("invalid NUL-terminated pathname"));
+        };
+        if name.contains(&0) {
             return Err(invalid("invalid NUL-terminated pathname"));
         }
         let data_offset = aligned(name_offset + name_size, header.alignment)?;
         let size = usize::try_from(header.file_size).map_err(|_| invalid("file size overflow"))?;
         let payload = extent(bytes, data_offset, size)?;
         let next = aligned(data_offset + size, header.alignment)?;
-        if &name[..name.len() - 1] == b"TRAILER!!!" {
+        if name == b"TRAILER!!!" {
             if size != 0 {
                 return Err(invalid("trailer claims file data"));
             }
-            if bytes[next..].iter().any(|b| *b != 0) {
+            // `next` is the already-aligned `data_offset`, inside the input.
+            if bytes
+                .get(next..)
+                .is_some_and(|rest| rest.iter().any(|b| *b != 0))
+            {
                 return Err(invalid("non-padding bytes follow CPIO trailer"));
             }
             return Ok(());
@@ -178,7 +242,7 @@ fn index(
             None
         };
         members.push(ArchiveMember {
-            path: String::from_utf8_lossy(&name[..name.len() - 1]).into_owned(),
+            path: String::from_utf8_lossy(name).into_owned(),
             size_bytes: header.file_size,
             entry_type: Some(kind.into()),
             mtime_unix: i64::try_from(header.mtime).ok(),
@@ -291,7 +355,7 @@ mod tests {
             );
             let mut values = Values::new();
             let mut members = Vec::new();
-            extract(&bytes, &mut values, &mut members).unwrap();
+            extract(&bytes, &mut values, &mut Metrics::new(), &mut members).unwrap();
             assert_eq!(members.len(), 2);
             assert_eq!(members[1].path, "./postinstall");
             assert_eq!(
@@ -334,7 +398,13 @@ mod tests {
             let bytes = fixture(magic);
             for end in 0..bytes.len() {
                 assert!(
-                    extract(&bytes[..end], &mut Values::new(), &mut Vec::new()).is_err(),
+                    extract(
+                        &bytes[..end],
+                        &mut Values::new(),
+                        &mut Metrics::new(),
+                        &mut Vec::new()
+                    )
+                    .is_err(),
                     "{magic}, {end}"
                 );
             }
@@ -359,7 +429,15 @@ mod tests {
         assert!(index(&bytes, &mut Values::new(), &mut Vec::new(), MAX_ENTRIES, 80).is_err());
         let mut bytes = fixture("070701");
         bytes[94..102].copy_from_slice(b"ffffffff");
-        assert!(extract(&bytes, &mut Values::new(), &mut Vec::new()).is_err());
+        assert!(
+            extract(
+                &bytes,
+                &mut Values::new(),
+                &mut Metrics::new(),
+                &mut Vec::new()
+            )
+            .is_err()
+        );
 
         let mut bytes = Vec::new();
         entry(&mut bytes, "070707", "link", &[b'x'; 4096], 0o120777);
@@ -396,6 +474,32 @@ mod tests {
         );
     }
 
+    /// Members get the shared `archive.*` aggregates and an `archive.members`
+    /// value, including the members indexed before a truncation.
+    #[test]
+    fn members_and_aggregates_are_published_even_when_incomplete() {
+        let mut bytes = fixture("070701");
+        for complete in [true, false] {
+            let (mut values, mut metrics, mut members) =
+                (Values::new(), Metrics::new(), Vec::new());
+            let result = extract(&bytes, &mut values, &mut metrics, &mut members);
+            assert_eq!(result.is_ok(), complete);
+            let listed = values
+                .get("archive.members")
+                .and_then(serde_json::Value::as_array)
+                .unwrap();
+            assert_eq!(listed.len(), 2);
+            assert_eq!(listed[1]["path"], "./postinstall");
+            assert_eq!(listed[1]["mode_octal"], 0o100755);
+            assert_eq!(metrics.get("archive.member_count"), Some(2.0));
+            assert_eq!(metrics.get("archive.file_count"), Some(2.0));
+            // `./postinstall` is executable by mode alone.
+            assert_eq!(metrics.get("archive.executable_count"), Some(1.0));
+            assert_eq!(metrics.get("archive.hidden_file_count"), Some(0.0));
+            bytes.pop();
+        }
+    }
+
     #[test]
     fn missing_body_padding_does_not_hide_the_complete_member() {
         let mut bytes = Vec::new();
@@ -422,7 +526,13 @@ mod tests {
         }
         entry(&mut bytes, "070707", "TRAILER!!!", b"", 0);
         let mut members = Vec::new();
-        extract(&bytes, &mut Values::new(), &mut members).unwrap();
+        extract(
+            &bytes,
+            &mut Values::new(),
+            &mut Metrics::new(),
+            &mut members,
+        )
+        .unwrap();
         assert_eq!(
             members.iter().map(|m| m.path.as_str()).collect::<Vec<_>>(),
             ["../outside", "/absolute", "same", "same"]
@@ -438,15 +548,47 @@ mod tests {
     fn invalid_fields_names_and_trailers_are_errors() {
         let mut bytes = fixture("070707");
         bytes[18] = b'8';
-        assert!(extract(&bytes, &mut Values::new(), &mut Vec::new()).is_err());
+        assert!(
+            extract(
+                &bytes,
+                &mut Values::new(),
+                &mut Metrics::new(),
+                &mut Vec::new()
+            )
+            .is_err()
+        );
         let mut bytes = fixture("070707");
         bytes[76] = 0;
-        assert!(extract(&bytes, &mut Values::new(), &mut Vec::new()).is_err());
+        assert!(
+            extract(
+                &bytes,
+                &mut Values::new(),
+                &mut Metrics::new(),
+                &mut Vec::new()
+            )
+            .is_err()
+        );
         let mut bytes = Vec::new();
         entry(&mut bytes, "070701", "TRAILER!!!", b"x", 0);
-        assert!(extract(&bytes, &mut Values::new(), &mut Vec::new()).is_err());
+        assert!(
+            extract(
+                &bytes,
+                &mut Values::new(),
+                &mut Metrics::new(),
+                &mut Vec::new()
+            )
+            .is_err()
+        );
         let mut bytes = fixture("070707");
         bytes.extend_from_slice(b"extra");
-        assert!(extract(&bytes, &mut Values::new(), &mut Vec::new()).is_err());
+        assert!(
+            extract(
+                &bytes,
+                &mut Values::new(),
+                &mut Metrics::new(),
+                &mut Vec::new()
+            )
+            .is_err()
+        );
     }
 }

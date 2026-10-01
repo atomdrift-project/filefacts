@@ -14,13 +14,35 @@
 
 use std::io::{Cursor, Read};
 
-use serde_json::{Map as JsonMap, Value as JsonValue};
+use serde_json::Value as JsonValue;
 use sevenz_rust::SevenZMethod as Method;
 
+use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_value};
 use crate::error::Error;
 use crate::formats::common::bytes_at::u64_le;
-use crate::metric;
 use crate::output::{ArchiveCompression, ArchiveMember, ArchiveOffsets, Metrics, Values};
+
+/// The shared aggregates a 7z reports. Path traversal is counted on files
+/// only.
+///
+/// 7z carries its encryption in the coder chain rather than a per-entry
+/// flag, so `archive.security.encrypted_count` had no ZIP-shaped
+/// counterpart and was once never emitted: every rule gated on it was
+/// unreachable for 7z, including the password-protected sideload bundles
+/// that are the format's most common malicious shape. It is reported even
+/// when zero, so absence is never mistaken for "not encrypted".
+const AGGS: &[Agg] = &[
+    Agg::MemberCount,
+    Agg::FileCount,
+    Agg::DirectoryCount,
+    Agg::UncompressedSize(Scope::All),
+    Agg::CompressedSize,
+    Agg::Executables,
+    Agg::Scripts,
+    Agg::NestedArchives,
+    Agg::PathTraversal(Scope::Files),
+    Agg::EncryptedCount,
+];
 
 const SIGNATURE: &[u8] = b"7z\xBC\xAF\x27\x1C";
 /// Signature, version, start-header CRC, then the next header's offset
@@ -83,18 +105,9 @@ pub(super) fn extract(
         .collect();
 
     let mut members = Vec::with_capacity(archive.files.len());
-    let mut total_size = 0u64;
-    let mut total_compressed = 0u64;
-    let mut file_count = 0u64;
-    let mut directory_count = 0u64;
-    let mut executable_count = 0u64;
-    let mut script_count = 0u64;
-    let mut nested_archive_count = 0u64;
-    let mut traversal_count = 0u64;
-    let mut encrypted_count = 0u64;
+    let mut stats = ArchiveStats::new(AGGS);
 
     for (index, entry) in archive.files.iter().enumerate() {
-        let path = entry.name().replace('\\', "/");
         let folder_index = archive
             .stream_map
             .file_folder_index
@@ -105,12 +118,8 @@ pub(super) fn extract(
             .and_then(|folder| folder_methods.get(folder))
             .cloned()
             .unwrap_or_default();
-        let encrypted = methods.contains(&"aes256sha256");
-        let method = (!methods.is_empty()).then(|| methods.join("+"));
         let compressed_size = entry.has_stream().then_some(entry.compressed_size);
-        let mtime_unix = entry
-            .has_last_modified_date
-            .then(|| entry.last_modified_date().to_unix_time());
+        let method = (!methods.is_empty()).then(|| methods.join("+"));
         let entry_type = if entry.is_directory() {
             "directory"
         } else if entry.is_anti_item() {
@@ -118,53 +127,18 @@ pub(super) fn extract(
         } else {
             "regular"
         };
-
-        let mut member = JsonMap::new();
-        member.insert("path".into(), JsonValue::String(path.clone()));
-        member.insert("size_bytes".into(), JsonValue::Number(entry.size.into()));
-        member.insert("entry_type".into(), JsonValue::String(entry_type.into()));
-        if let Some(size) = compressed_size {
-            member.insert("compressed_size".into(), JsonValue::Number(size.into()));
-        }
-        if let Some(method) = method.as_deref() {
-            member.insert(
-                "compression_method".into(),
-                JsonValue::String(method.into()),
-            );
-        }
-        if encrypted {
-            member.insert("encrypted".into(), JsonValue::Bool(true));
-            encrypted_count += 1;
-        }
-        if let Some(mtime) = mtime_unix {
-            member.insert("mtime_unix".into(), JsonValue::Number(mtime.into()));
-        }
-        if entry.has_crc {
-            member.insert("crc32".into(), JsonValue::Number(entry.crc.into()));
-        }
-
-        total_size = total_size.saturating_add(entry.size);
-        total_compressed = total_compressed.saturating_add(compressed_size.unwrap_or(0));
-        if entry.is_directory() {
-            directory_count += 1;
-        } else {
-            file_count += 1;
-            let class = super::zip::classify_filename(&path);
-            executable_count += u64::from(class.is_executable);
-            script_count += u64::from(class.is_script);
-            nested_archive_count += u64::from(class.is_nested_archive);
-            traversal_count += u64::from(class.has_path_traversal);
-        }
-
-        archive_members.push(ArchiveMember {
-            path,
+        let member = ArchiveMember {
+            path: entry.name().replace('\\', "/"),
             size_bytes: entry.size,
             entry_type: Some(entry_type.into()),
-            mtime_unix,
+            mtime_unix: entry
+                .has_last_modified_date
+                .then(|| entry.last_modified_date().to_unix_time()),
             linkname: None,
             host_os: None,
+            // The crate widens the stored CRC-32 to u64; it never exceeds u32.
             crc32: entry.has_crc.then_some(entry.crc as u32),
-            encrypted,
+            encrypted: methods.contains(&"aes256sha256"),
             compression: (compressed_size.is_some() || method.is_some()).then_some(
                 ArchiveCompression {
                     compressed_size,
@@ -173,35 +147,14 @@ pub(super) fn extract(
             ),
             ownership: None,
             offsets: ArchiveOffsets::default(),
-        });
-        members.push(JsonValue::Object(member));
+        };
+        stats.observe(&member, &Reading::of(&member));
+        members.push(JsonValue::Object(member_value(&member, Shape::FULL)));
+        archive_members.push(member);
     }
 
     values.insert("archive.members", JsonValue::Array(members));
-    metrics.insert(metric!("archive.member_count"), archive.files.len() as f64);
-    metrics.insert(metric!("archive.file_count"), file_count as f64);
-    metrics.insert(metric!("archive.directory_count"), directory_count as f64);
-    metrics.insert(metric!("archive.uncompressed_size"), total_size as f64);
-    metrics.insert(metric!("archive.compressed_size"), total_compressed as f64);
-    metrics.insert(metric!("archive.executable_count"), executable_count as f64);
-    metrics.insert(metric!("archive.script_count"), script_count as f64);
-    metrics.insert(
-        metric!("archive.nested_archive_count"),
-        nested_archive_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.path_traversal_count"),
-        traversal_count as f64,
-    );
-    // 7z carries its encryption in the coder chain rather than a per-entry
-    // flag, so this had no ZIP-shaped counterpart and was simply never
-    // emitted: every rule gated on `archive.security.encrypted_count` was
-    // unreachable for 7z, including the password-protected sideload bundles
-    // that are the format's most common malicious shape.
-    metrics.insert(
-        metric!("archive.security.encrypted_count"),
-        encrypted_count as f64,
-    );
+    stats.emit(values, metrics);
     Ok(())
 }
 
@@ -214,7 +167,7 @@ fn invalid(why: &str) -> Error {
 /// crate's reads, so each check lands on the same field the crate reads next.
 fn check_header(bytes: &[u8]) -> Result<(), Error> {
     let start = bytes
-        .get(..SIGNATURE_HEADER_LEN as usize)
+        .first_chunk::<{ SIGNATURE_HEADER_LEN as usize }>()
         .ok_or_else(|| invalid("signature header truncated"))?;
     if !start.starts_with(SIGNATURE) {
         return Err(invalid("bad signature"));
@@ -383,7 +336,7 @@ impl<'a> HeaderReader<'a> {
         }
         let bits = self.take(n.div_ceil(8))?;
         Ok((0..n)
-            .map(|i| bits[i / 8] & (0x80 >> (i % 8)) != 0)
+            .map(|i| bits.get(i / 8).is_some_and(|b| b & (0x80 >> (i % 8)) != 0))
             .collect())
     }
 

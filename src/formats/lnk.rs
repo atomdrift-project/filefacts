@@ -29,7 +29,9 @@ use crate::metric;
 use serde_json::{Value as JsonValue, json};
 
 use crate::error::Error;
-use crate::formats::common::{XorScan, extract_binary_strings, put_str, put_u64};
+use crate::formats::common::{
+    XorScan, bytes_at, extract_binary_strings, format_guid, put_str, put_u64,
+};
 use crate::output::{Metrics, Strings, Values};
 
 /// `{0001-4C00-0000-0000-AA00-3826B3713F}` — the canonical CLSID
@@ -73,19 +75,19 @@ pub(super) fn extract(
 
     // Header is exactly 76 bytes; first 4 bytes are its self-described
     // length.
-    if bytes.len() < 76 || &bytes[..4] != LNK_MAGIC {
+    if bytes.len() < 76 || !bytes.starts_with(LNK_MAGIC) {
         return Ok(());
     }
 
-    let link_flags = read_u32(bytes, 20).unwrap_or(0);
-    let file_attributes = read_u32(bytes, 24).unwrap_or(0);
-    let creation_time = read_u64(bytes, 28).unwrap_or(0);
-    let access_time = read_u64(bytes, 36).unwrap_or(0);
-    let write_time = read_u64(bytes, 44).unwrap_or(0);
-    let file_size = read_u32(bytes, 52).unwrap_or(0);
-    let icon_index = read_i32(bytes, 56).unwrap_or(0);
-    let show_command = read_u32(bytes, SHOW_COMMAND_OFFSET).unwrap_or(0);
-    let hotkey = read_u16(bytes, 64).unwrap_or(0);
+    let link_flags = bytes_at::u32_le(bytes, 20).unwrap_or(0);
+    let file_attributes = bytes_at::u32_le(bytes, 24).unwrap_or(0);
+    let creation_time = bytes_at::u64_le(bytes, 28).unwrap_or(0);
+    let access_time = bytes_at::u64_le(bytes, 36).unwrap_or(0);
+    let write_time = bytes_at::u64_le(bytes, 44).unwrap_or(0);
+    let file_size = bytes_at::u32_le(bytes, 52).unwrap_or(0);
+    let icon_index = bytes_at::u32_le(bytes, 56).map_or(0, |v| v as i32);
+    let show_command = bytes_at::u32_le(bytes, SHOW_COMMAND_OFFSET).unwrap_or(0);
+    let hotkey = bytes_at::u16_le(bytes, 64).unwrap_or(0);
 
     // Header object.
     let mut header = serde_json::Map::new();
@@ -142,23 +144,24 @@ pub(super) fn extract(
     // from, so `lnk.target_path` anchors like every other fact.
     let mut id_list_path: Option<(String, usize)> = None;
     if link_flags & FLAG_HAS_LINK_TARGET_ID_LIST != 0 {
-        if let Some(id_list_size) = read_u16(bytes, offset) {
+        if let Some(id_list_size) = bytes_at::u16_le(bytes, offset) {
             let id_list_end = offset.saturating_add(2 + id_list_size as usize);
-            if id_list_end <= bytes.len() {
-                let body = offset + 2;
-                id_list_path =
-                    walk_id_list(&bytes[body..id_list_end]).map(|(p, at)| (p, body + at));
+            let body = offset + 2;
+            if let Some(list) = bytes.get(body..id_list_end) {
+                id_list_path = walk_id_list(list).map(|(p, at)| (p, body + at));
             }
             offset = id_list_end;
         }
     }
     let mut link_info_path: Option<(String, usize)> = None;
     if link_flags & FLAG_HAS_LINK_INFO != 0 {
-        if let Some(link_info_size) = read_u32(bytes, offset) {
+        if let Some(link_info_size) = bytes_at::u32_le(bytes, offset) {
             let link_info_size = link_info_size as usize;
             let link_info_end = offset.saturating_add(link_info_size);
-            if link_info_size >= 0x1C && link_info_end <= bytes.len() {
-                link_info_path = parse_link_info(&bytes[offset..link_info_end], offset, values);
+            if link_info_size >= 0x1C {
+                if let Some(block) = bytes.get(offset..link_info_end) {
+                    link_info_path = parse_link_info(block, offset, values);
+                }
             }
             offset = link_info_end;
         }
@@ -210,14 +213,16 @@ pub(super) fn extract(
     // ExtraData blocks.
     let mut blocks: Vec<&'static str> = Vec::new();
     while offset + 8 <= bytes.len() {
-        let Some(block_size) = read_u32(bytes, offset).map(|n| n as usize) else {
+        let Some(block_size) = bytes_at::u32_le(bytes, offset).map(|n| n as usize) else {
             break;
         };
-        if block_size < 8 || offset + block_size > bytes.len() {
+        if block_size < 8 {
             break;
         }
-        let block = &bytes[offset..offset + block_size];
-        let Some(signature) = read_u32(block, 4) else {
+        let Some(block) = bytes.get(offset..offset + block_size) else {
+            break;
+        };
+        let Some(signature) = bytes_at::u32_le(block, 4) else {
             break;
         };
         match signature {
@@ -260,7 +265,7 @@ pub(super) fn extract(
             }
             EXTRA_SPECIAL_FOLDER_DATA => {
                 blocks.push("special_folder");
-                if let Some(id) = read_u32(block, 8) {
+                if let Some(id) = bytes_at::u32_le(block, 8) {
                     put_u64(values, "lnk.special_folder_id", u64::from(id));
                 }
             }
@@ -534,14 +539,11 @@ fn decode_file_attributes(v: u32) -> Vec<&'static str> {
 /// Returns `(decoded, next_offset)`. The length is in characters,
 /// not bytes — multiply by 2 for the unicode case.
 fn read_stringdata(bytes: &[u8], offset: usize, is_unicode: bool) -> Option<(String, usize)> {
-    let len_chars = read_u16(bytes, offset)? as usize;
+    let len_chars = bytes_at::u16_le(bytes, offset)? as usize;
     let body_start = offset + 2;
     let byte_len = if is_unicode { len_chars * 2 } else { len_chars };
     let body_end = body_start.checked_add(byte_len)?;
-    if body_end > bytes.len() {
-        return None;
-    }
-    let body = &bytes[body_start..body_end];
+    let body = bytes.get(body_start..body_end)?;
     // StringData is returned verbatim — trimming would hide
     // CVE-2025-9491-style argument-padding obfuscation, which the
     // whitespace metrics are specifically designed to catch.
@@ -578,8 +580,8 @@ fn read_utf16le_string(bytes: &[u8], offset: usize, len: usize) -> Option<String
 /// Read a fixed-length ANSI NUL-terminated string.
 fn read_fixed_ansi(bytes: &[u8], offset: usize, len: usize) -> Option<String> {
     let slice = bytes.get(offset..offset + len)?;
-    let end = slice.iter().position(|b| *b == 0).unwrap_or(slice.len());
-    let s = String::from_utf8_lossy(&slice[..end]).trim().to_string();
+    let text = slice.split(|b| *b == 0).next().unwrap_or_default();
+    let s = String::from_utf8_lossy(text).trim().to_string();
     (!s.is_empty()).then_some(s)
 }
 
@@ -601,21 +603,8 @@ fn read_ansi_or_unicode_pair(
 /// Decode a GUID stored as little-endian Data1/Data2/Data3 + raw
 /// Data4 (canonical Microsoft layout).
 fn read_guid(bytes: &[u8], offset: usize) -> Option<String> {
-    let b = bytes.get(offset..offset + 16)?;
-    Some(format!(
-        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-        u16::from_le_bytes([b[4], b[5]]),
-        u16::from_le_bytes([b[6], b[7]]),
-        b[8],
-        b[9],
-        b[10],
-        b[11],
-        b[12],
-        b[13],
-        b[14],
-        b[15],
-    ))
+    let b = bytes.get(offset..)?.first_chunk::<16>()?;
+    Some(format_guid(b))
 }
 
 /// Extract the MAC address from the trailing 12 hex chars of a
@@ -650,28 +639,28 @@ fn parse_link_info(
     if block.len() < 0x1C {
         return None;
     }
-    let header_size = read_u32(block, 4)? as usize;
-    let link_info_flags = read_u32(block, 8)?;
-    let volume_id_off = read_u32(block, 12)? as usize;
-    let local_base_off = read_u32(block, 16)? as usize;
-    let net_link_off = read_u32(block, 20)? as usize;
-    let common_suffix_off = read_u32(block, 24)? as usize;
+    let header_size = bytes_at::u32_le(block, 4)? as usize;
+    let link_info_flags = bytes_at::u32_le(block, 8)?;
+    let volume_id_off = bytes_at::u32_le(block, 12)? as usize;
+    let local_base_off = bytes_at::u32_le(block, 16)? as usize;
+    let net_link_off = bytes_at::u32_le(block, 20)? as usize;
+    let common_suffix_off = bytes_at::u32_le(block, 24)? as usize;
     let (local_base_off_u, common_suffix_off_u) = if header_size >= 0x24 {
         (
-            read_u32(block, 28).map(|n| n as usize).unwrap_or(0),
-            read_u32(block, 32).map(|n| n as usize).unwrap_or(0),
+            bytes_at::u32_le(block, 28).map(|n| n as usize).unwrap_or(0),
+            bytes_at::u32_le(block, 32).map(|n| n as usize).unwrap_or(0),
         )
     } else {
         (0, 0)
     };
 
     // VolumeIDAndLocalBasePath flag (bit 0).
-    if (link_info_flags & 0x1) != 0 && volume_id_off > 0 && volume_id_off < block.len() {
-        let vol = &block[volume_id_off..];
+    let vol = block.get(volume_id_off..).unwrap_or_default();
+    if (link_info_flags & 0x1) != 0 && volume_id_off > 0 && !vol.is_empty() {
         if vol.len() >= 16 {
-            let drive_type = read_u32(vol, 4).unwrap_or(0);
-            let serial = read_u32(vol, 8).unwrap_or(0);
-            let label_off = read_u32(vol, 12).unwrap_or(0) as usize;
+            let drive_type = bytes_at::u32_le(vol, 4).unwrap_or(0);
+            let serial = bytes_at::u32_le(vol, 8).unwrap_or(0);
+            let label_off = bytes_at::u32_le(vol, 12).unwrap_or(0) as usize;
             let mut volume = serde_json::Map::new();
             volume.insert(
                 "drive_type".into(),
@@ -681,7 +670,7 @@ fn parse_link_info(
             // When label_off == 0x14, a Unicode label offset follows
             // at +0x10 and the ASCII label is empty.
             let name = if label_off == 0x14 && vol.len() >= 20 {
-                let unicode_off = read_u32(vol, 16).unwrap_or(0) as usize;
+                let unicode_off = bytes_at::u32_le(vol, 16).unwrap_or(0) as usize;
                 read_utf16le_cstring(vol, unicode_off).map(|s| (s, unicode_off))
             } else {
                 read_ansi_cstring(vol, label_off).map(|s| (s, label_off))
@@ -695,13 +684,13 @@ fn parse_link_info(
     }
 
     // CommonNetworkRelativeLinkAndPathSuffix flag (bit 1).
-    if (link_info_flags & 0x2) != 0 && net_link_off > 0 && net_link_off < block.len() {
-        let net = &block[net_link_off..];
+    let net = block.get(net_link_off..).unwrap_or_default();
+    if (link_info_flags & 0x2) != 0 && net_link_off > 0 && !net.is_empty() {
         if net.len() >= 20 {
-            let net_flags = read_u32(net, 4).unwrap_or(0);
-            let net_name_off = read_u32(net, 8).unwrap_or(0) as usize;
-            let device_name_off = read_u32(net, 12).unwrap_or(0) as usize;
-            let provider = read_u32(net, 16).unwrap_or(0);
+            let net_flags = bytes_at::u32_le(net, 4).unwrap_or(0);
+            let net_name_off = bytes_at::u32_le(net, 8).unwrap_or(0) as usize;
+            let device_name_off = bytes_at::u32_le(net, 12).unwrap_or(0) as usize;
+            let provider = bytes_at::u32_le(net, 16).unwrap_or(0);
             let mut network = serde_json::Map::new();
             if let Some(name) = read_ansi_cstring(net, net_name_off) {
                 if !name.is_empty() {
@@ -769,30 +758,26 @@ fn drive_type_name(t: u32) -> &'static str {
 }
 
 fn read_ansi_cstring(buf: &[u8], offset: usize) -> Option<String> {
-    if offset == 0 || offset >= buf.len() {
+    if offset == 0 {
         return None;
     }
-    let end = buf[offset..]
-        .iter()
-        .position(|&b| b == 0)
-        .map_or(buf.len(), |p| offset + p);
-    Some(String::from_utf8_lossy(&buf[offset..end]).into_owned())
+    let rest = buf.get(offset..).filter(|r| !r.is_empty())?;
+    let text = rest.split(|&b| b == 0).next().unwrap_or_default();
+    Some(String::from_utf8_lossy(text).into_owned())
 }
 
 fn read_utf16le_cstring(buf: &[u8], offset: usize) -> Option<String> {
-    if offset == 0 || offset + 2 > buf.len() {
+    if offset == 0 {
         return None;
     }
-    let mut units = Vec::new();
-    let mut i = offset;
-    while i + 2 <= buf.len() {
-        let u = u16::from_le_bytes([buf[i], buf[i + 1]]);
-        if u == 0 {
-            break;
-        }
-        units.push(u);
-        i += 2;
-    }
+    let rest = buf.get(offset..).filter(|r| r.len() >= 2)?;
+    let units: Vec<u16> = rest
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .take_while(|&u| u != 0)
+        .collect();
     String::from_utf16(&units).ok()
 }
 
@@ -813,15 +798,15 @@ fn walk_id_list(buf: &[u8]) -> Option<(String, usize)> {
     let mut components: Vec<String> = Vec::new();
     let mut drive: Option<(String, usize)> = None;
     let mut anchor: Option<usize> = None;
-    while i + 2 <= buf.len() {
-        let size = u16::from_le_bytes([buf[i], buf[i + 1]]) as usize;
+    while let Some(size) = bytes_at::u16_le(buf, i) {
+        let size = size as usize;
         if size == 0 {
             break;
         }
-        if size < 2 || i + size > buf.len() {
+        if size < 2 {
             return None;
         }
-        let item = &buf[i + 2..i + size];
+        let item = buf.get(i + 2..i + size)?;
         if let Some((c, at)) = parse_id_item(item, i + 2, &mut drive) {
             if !c.is_empty() {
                 components.push(c);
@@ -848,10 +833,7 @@ fn parse_id_item(
     item_base: usize,
     drive: &mut Option<(String, usize)>,
 ) -> Option<(String, usize)> {
-    if item.is_empty() {
-        return None;
-    }
-    let class = item[0];
+    let &class = item.first()?;
     match class {
         // MyComputer / RootRegItem container — class 0x1F has an
         // embedded GUID at +2..+18; not interesting for path
@@ -861,11 +843,9 @@ fn parse_id_item(
         // like "C:\\\0".
         0x23..=0x25 | 0x2E..=0x2F => {
             if item.len() >= 4 {
-                let end = item[1..]
-                    .iter()
-                    .position(|&b| b == 0)
-                    .map_or(item.len(), |p| 1 + p);
-                let s = String::from_utf8_lossy(&item[1..end]).into_owned();
+                let root = item.get(1..).unwrap_or_default();
+                let root = root.split(|&b| b == 0).next().unwrap_or_default();
+                let s = String::from_utf8_lossy(root).into_owned();
                 if !s.is_empty() {
                     let s = s.trim_end_matches('\\').to_string();
                     *drive = Some((s, item_base + 1));
@@ -895,14 +875,10 @@ fn parse_filesystem_item(item: &[u8]) -> Option<(String, usize)> {
     // offset 14 from the start of the ItemID record — we strip the
     // 2-byte size header before passing the body in).
     let name_start = 12;
-    if name_start >= item.len() {
-        return None;
-    }
-    let ansi_end = item[name_start..]
-        .iter()
-        .position(|&b| b == 0)
-        .map(|p| name_start + p)?;
-    let short = String::from_utf8_lossy(&item[name_start..ansi_end]).into_owned();
+    let names = item.get(name_start..).filter(|n| !n.is_empty())?;
+    let ansi_len = names.iter().position(|&b| b == 0)?;
+    let ansi_end = name_start + ansi_len;
+    let short = String::from_utf8_lossy(names.get(..ansi_len)?).into_owned();
 
     // Walk past padding to a possible extension block containing the
     // Unicode LongName. The extension chain starts at the first
@@ -912,11 +888,19 @@ fn parse_filesystem_item(item: &[u8]) -> Option<(String, usize)> {
         probe += 1;
     }
     while probe + 6 <= item.len() {
-        let ext_size = u16::from_le_bytes([item[probe], item[probe + 1]]) as usize;
-        if ext_size < 6 || probe + ext_size > item.len() {
+        let (Some(ext_size), Some(ext_sig)) = (
+            bytes_at::u16_le(item, probe),
+            bytes_at::u16_le(item, probe + 4),
+        ) else {
+            break;
+        };
+        let ext_size = ext_size as usize;
+        if ext_size < 6 {
             break;
         }
-        let ext_sig = u16::from_le_bytes([item[probe + 4], item[probe + 5]]);
+        let Some(ext) = item.get(probe..probe + ext_size) else {
+            break;
+        };
         // BEEF0004 extension blocks (long-name + timestamps) sit at
         // signature 0xBEEF; only the low word survives this read,
         // so we accept 0xBEEF as the marker.
@@ -928,7 +912,7 @@ fn parse_filesystem_item(item: &[u8]) -> Option<(String, usize)> {
                 if probe + sub + 2 > probe + ext_size {
                     continue;
                 }
-                if let Some(name) = read_utf16le_cstring(&item[probe..probe + ext_size], sub) {
+                if let Some(name) = read_utf16le_cstring(ext, sub) {
                     if !name.is_empty() {
                         return Some((name, probe + sub));
                     }
@@ -942,27 +926,6 @@ fn parse_filesystem_item(item: &[u8]) -> Option<(String, usize)> {
     } else {
         Some((short, name_start))
     }
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
-    bytes
-        .get(offset..offset + 2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-}
-fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
-    bytes
-        .get(offset..offset + 4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-}
-fn read_i32(bytes: &[u8], offset: usize) -> Option<i32> {
-    bytes
-        .get(offset..offset + 4)
-        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-}
-fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
-    bytes
-        .get(offset..offset + 8)
-        .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
 }
 
 #[cfg(test)]

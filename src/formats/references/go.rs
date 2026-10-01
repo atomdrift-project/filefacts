@@ -135,7 +135,7 @@ pub(super) fn manifest(out: &mut Refs<'_>, source: &str) {
                     incomplete(out, source, line);
                     continue;
                 }
-                let target = &fields[split + 1..];
+                let target = fields.get(split + 1..).unwrap_or_default();
                 let locator = match target {
                     [path] => RefLocator::Path((*path).into()),
                     [module, version] => RefLocator::Purl(purl(module, version)),

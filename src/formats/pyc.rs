@@ -41,16 +41,16 @@ pub(super) fn extract(
 ) -> Result<(), Error> {
     extract_binary_strings(bytes, strings, XorScan::No);
 
-    if bytes.len() < 16 {
+    let Some((header, rest)) = bytes.split_first_chunk::<16>() else {
         return Ok(());
-    }
+    };
     // PEP 3147+ magic ends in `0x0d 0x0a`.
-    if bytes[2] != 0x0D || bytes[3] != 0x0A {
+    if header[2] != 0x0D || header[3] != 0x0A {
         return Ok(());
     }
 
-    let magic_word = u16::from_le_bytes([bytes[0], bytes[1]]);
-    let flags = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let magic_word = u16::from_le_bytes([header[0], header[1]]);
+    let flags = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
     let is_hash_based = (flags & 1) != 0;
 
     put_str(
@@ -58,7 +58,7 @@ pub(super) fn extract(
         "pyc.magic",
         format!(
             "{:08x}",
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            u32::from_le_bytes([header[0], header[1], header[2], header[3]])
         ),
     );
     if let Some(ver) = python_version_for_magic(magic_word) {
@@ -68,11 +68,11 @@ pub(super) fn extract(
         // Per the convention, omit the `is_hash_based: true` bool
         // and use a presence-only key instead — `exists:
         // pyc.hash` flags the variant for traits without a bool.
-        let hash_hex: String = bytes[8..16].iter().map(|b| format!("{b:02x}")).collect();
+        let hash_hex: String = header[8..16].iter().map(|b| format!("{b:02x}")).collect();
         put_str(values, "pyc.hash", hash_hex);
     } else {
-        let ts = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        let sz = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+        let ts = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+        let sz = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
         if ts != 0 {
             metrics.insert(metric!("pyc.timestamp"), f64::from(ts));
             put_str(values, "pyc.timestamp", ts.to_string());
@@ -83,8 +83,7 @@ pub(super) fn extract(
         }
     }
 
-    let body_end = 16 + (bytes.len() - 16).min(MAX_BODY_SCAN);
-    let body = &bytes[16..body_end];
+    let body = rest.get(..MAX_BODY_SCAN).unwrap_or(rest);
     let source_files = scan_source_files(body);
     if !source_files.is_empty() {
         metrics.insert(metric!("pyc.source_file_count"), source_files.len() as f64);
@@ -122,8 +121,8 @@ fn python_version_for_magic(magic: u16) -> Option<&'static str> {
 fn scan_source_files(body: &[u8]) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     let mut i = 0;
-    while i < body.len() {
-        if body[i] != b'.' {
+    while let Some(&byte) = body.get(i) {
+        if byte != b'.' {
             i += 1;
             continue;
         }
@@ -140,15 +139,17 @@ fn scan_source_files(body: &[u8]) -> Vec<String> {
         };
         let after = i + 3 + extra;
         // Walk backwards over path bytes to the start of the run.
-        let mut start = i;
-        while start > 0 && is_path_byte(body[start - 1]) {
-            start -= 1;
-        }
+        let start = body.get(..i).map_or(i, |before| {
+            before
+                .iter()
+                .rposition(|&b| !is_path_byte(b))
+                .map_or(0, |p| p + 1)
+        });
         if start == i {
             i += 1;
             continue;
         }
-        if let Ok(s) = std::str::from_utf8(&body[start..after]) {
+        if let Some(Ok(s)) = body.get(start..after).map(std::str::from_utf8) {
             if !s.is_empty() && !found.iter().any(|x| x == s) {
                 found.push(s.to_string());
                 if found.len() >= MAX_SOURCE_FILES {

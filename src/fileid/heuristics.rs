@@ -112,6 +112,12 @@ impl Lang {
         self as usize
     }
 
+    /// This language's entry in a score table. Every `Lang` has one, since
+    /// the table is [`LANG_COUNT`] long.
+    fn score(self, scores: &[u16; LANG_COUNT]) -> u16 {
+        scores.get(self.idx()).copied().unwrap_or(0)
+    }
+
     /// The scored language a file type names, if the table scores it.
     fn from_file_type(ft: FileType) -> Option<Self> {
         LANGS.iter().copied().find(|l| l.to_file_type() == ft)
@@ -411,7 +417,7 @@ static SCANNER: LazyLock<AcScanner> = LazyLock::new(|| AcScanner {
 
 /// Check if the first `limit` bytes are mostly whitespace.
 fn is_mostly_whitespace(data: &[u8], limit: usize) -> bool {
-    let head = &data[..data.len().min(limit)];
+    let head = data.get(..limit).unwrap_or(data);
     let non_ws = head.iter().filter(|&&b| !b.is_ascii_whitespace()).count();
     non_ws < MIN_CONTENT_BYTES
 }
@@ -422,16 +428,21 @@ fn scan_scores(data: &[u8]) -> [u16; LANG_COUNT] {
     let mut scores = [0u16; LANG_COUNT];
 
     for mat in s.ac.find_overlapping_iter(data) {
+        // The match, the byte before it and everything after it. The
+        // automaton only reports spans inside `data`.
+        let Some((before, from)) = data.split_at_checked(mat.start()) else {
+            continue;
+        };
+        let Some((m, rest)) = from.split_at_checked(mat.len()) else {
+            continue;
+        };
+        let prev = before.last().copied();
         // `===` (JS strict-equality) must not score when it is part of a
         // longer run of '=' — e.g. "=========" separator lines or reST/
         // Markdown header rules. Overlapping matches across such a run would
         // otherwise inflate the JavaScript score and mis-type plain text.
-        if &data[mat.start()..mat.end()] == b"===" {
-            let prev_eq = mat.start() > 0 && data[mat.start() - 1] == b'=';
-            let next_eq = mat.end() < data.len() && data[mat.end()] == b'=';
-            if prev_eq || next_eq {
-                continue;
-            }
+        if m == b"===" && (prev == Some(b'=') || rest.first() == Some(&b'=')) {
+            continue;
         }
         // `document.`/`window.` are JS DOM-global accesses only when a member
         // name follows (document.getElementById, window.location). English
@@ -439,9 +450,8 @@ fn scan_scores(data: &[u8]) -> [u16; LANG_COUNT] {
         // the dot is followed by whitespace/EOL/an uppercase next sentence —
         // never a lowercase member. Require a lowercase member char so a
         // license, README, or changelog does not score as JavaScript.
-        let m = &data[mat.start()..mat.end()];
         if (m == b"document." || m == b"window.")
-            && !data.get(mat.end()).is_some_and(u8::is_ascii_lowercase)
+            && !rest.first().is_some_and(u8::is_ascii_lowercase)
         {
             continue;
         }
@@ -449,14 +459,14 @@ fn scan_scores(data: &[u8]) -> [u16; LANG_COUNT] {
         // VBScript calling it; the object model is `WScript.Echo`,
         // `WScript.CreateObject`, never `.exe`.
         if m == b"WScript."
-            && data
-                .get(mat.end()..mat.end() + 3)
+            && rest
+                .get(..3)
                 .is_some_and(|x| x.eq_ignore_ascii_case(b"exe"))
         {
             continue;
         }
         // `var $name` is a PHP 4 property, not a JavaScript binding.
-        if m == b"var " && data.get(mat.end()) == Some(&b'$') {
+        if m == b"var " && rest.first() == Some(&b'$') {
             continue;
         }
         // "itself." contains `self.`, "Applet " contains `let `, and
@@ -465,13 +475,11 @@ fn scan_scores(data: &[u8]) -> [u16; LANG_COUNT] {
         if matches!(
             m,
             b"let " | b"var " | b"const " | b"def " | b"except " | b"self." | b"val "
-        ) && mat.start() > 0
-            && data[mat.start() - 1].is_ascii_alphanumeric()
+        ) && prev.is_some_and(|b| b.is_ascii_alphanumeric())
         {
             continue;
         }
         if m == b"let " {
-            let rest = &data[mat.end()..];
             const PROSE: &[&[u8]] = &[
                 b"the ", b"the\n", b"a ", b"an ", b"us ", b"me ", b"it ", b"you ", b"them ",
                 b"this ", b"that ", b"your ", b"there ", b"him ", b"her ",
@@ -480,9 +488,12 @@ fn scan_scores(data: &[u8]) -> [u16; LANG_COUNT] {
                 continue;
             }
         }
-        let entry = &s.entries[mat.pattern().as_usize()];
-        let idx = entry.lang.idx();
-        scores[idx] = scores[idx].saturating_add(u16::from(entry.weight));
+        let Some(entry) = s.entries.get(mat.pattern().as_usize()) else {
+            continue;
+        };
+        if let Some(score) = scores.get_mut(entry.lang.idx()) {
+            *score = score.saturating_add(u16::from(entry.weight));
+        }
     }
 
     scores
@@ -520,12 +531,8 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
     // to drop the file below THRESHOLD, and an unidentified file is skipped
     // entirely by consumers. Skipping the run costs one `position` call and
     // makes the window measure content rather than indentation.
-    let content_start = data
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .unwrap_or(data.len());
-    let body = &data[content_start..];
-    let head = &body[..body.len().min(SCAN_LIMIT)];
+    let body = data.trim_ascii_start();
+    let head = body.get(..SCAN_LIMIT).unwrap_or(body);
     // Batch, VBScript, mIRC and ircII are read line by line, verb first. That
     // runs ahead of the binary and prose guards on purpose: batch files carry
     // ANSI escapes and `echo` whole paragraphs, and the line grammar is what
@@ -566,12 +573,10 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
     // If the head is mostly whitespace, also scan the tail
     let scores = if is_mostly_whitespace(body, SCAN_LIMIT) && body.len() > SCAN_LIMIT {
         let tail_start = body.len().saturating_sub(TAIL_SIZE);
-        let tail = &body[tail_start..];
-        let head_scores = scan_scores(head);
-        let tail_scores = scan_scores(tail);
-        let mut merged = [0u16; LANG_COUNT];
-        for i in 0..LANG_COUNT {
-            merged[i] = head_scores[i].max(tail_scores[i]);
+        let tail = body.get(tail_start..).unwrap_or(body);
+        let mut merged = scan_scores(head);
+        for (score, tail_score) in merged.iter_mut().zip(scan_scores(tail)) {
+            *score = (*score).max(tail_score);
         }
         merged
     } else {
@@ -586,7 +591,9 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
         // hundred bytes later. A head that already looks like a real unit
         // stays as it is.
         if head_best < SETTLED_HEAD_SCORE {
-            let next = &body[SCAN_LIMIT..body.len().min(SCAN_LIMIT * 2)];
+            let next = body
+                .get(SCAN_LIMIT..body.len().min(SCAN_LIMIT * 2))
+                .unwrap_or_default();
             let next_scores = scan_scores(next);
             let next_best = next_scores.iter().copied().max().unwrap_or(0);
             if next_best >= THRESHOLD
@@ -610,8 +617,11 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
     // score only stands when some line is actually written in the language.
     let mut scores = scores;
     for (lang, ft) in [(Lang::Batch, FileType::Batch), (Lang::Vbs, FileType::Vbs)] {
-        if script.has_lines() && (!script.supports(ft) || script.rules_out(ft)) {
-            scores[lang.idx()] = 0;
+        if script.has_lines()
+            && (!script.supports(ft) || script.rules_out(ft))
+            && let Some(score) = scores.get_mut(lang.idx())
+        {
+            *score = 0;
         }
     }
 
@@ -620,11 +630,11 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
     let mut best_score: u16 = 0;
     let mut second_score: u16 = 0;
 
-    for (i, &score) in scores.iter().enumerate() {
+    for (&lang, &score) in LANGS.iter().zip(&scores) {
         if score > best_score {
             second_score = best_score;
             best_score = score;
-            best_lang = Some(LANGS[i]);
+            best_lang = Some(lang);
         } else if score > second_score {
             second_score = score;
         }
@@ -640,7 +650,7 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
     // Objective-C is C plus directives C never has, so every `#include` in a
     // `.m` scores for C and a large file drowns the handful of `@interface`
     // lines. Any conclusive Objective-C directive settles it.
-    let objc = scores[Lang::ObjectiveC.idx()];
+    let objc = Lang::ObjectiveC.score(&scores);
     if lang == Lang::C && objc >= THRESHOLD {
         lang = Lang::ObjectiveC;
         best_score = objc;
@@ -648,7 +658,7 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
         second_score = LANGS
             .iter()
             .filter(|l| !matches!(l, Lang::C | Lang::ObjectiveC))
-            .map(|l| scores[l.idx()])
+            .map(|l| l.score(&scores))
             .max()
             .unwrap_or(0);
     }
@@ -668,10 +678,11 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
     // earlier by extension and never reach here.)
     if lang == Lang::JavaScript {
         let has_structure = |b: &[u8]| b.iter().any(|&c| matches!(c, b';' | b'{' | b'}'));
-        let structured = has_structure(&data[..data.len().min(SCAN_LIMIT)])
+        let tail = data.get(data.len().saturating_sub(TAIL_SIZE)..);
+        let structured = has_structure(data.get(..SCAN_LIMIT).unwrap_or(data))
             || (is_mostly_whitespace(data, SCAN_LIMIT)
                 && data.len() > SCAN_LIMIT
-                && has_structure(&data[data.len().saturating_sub(TAIL_SIZE)..]));
+                && tail.is_some_and(has_structure));
         if !structured {
             return None;
         }
@@ -694,10 +705,11 @@ pub(crate) fn detect_from_content(data: &[u8]) -> Option<FileType> {
     // targets: a fragment cut from a larger file loses its opening tag but keeps
     // the closing one.
     if lang == Lang::Php {
-        let tagged = has_php_tag(&data[..data.len().min(SCAN_LIMIT * 2)])
+        let tail = data.get(data.len().saturating_sub(TAIL_SIZE)..);
+        let tagged = has_php_tag(data.get(..SCAN_LIMIT * 2).unwrap_or(data))
             || (is_mostly_whitespace(data, SCAN_LIMIT)
                 && data.len() > SCAN_LIMIT
-                && has_php_tag(&data[data.len().saturating_sub(TAIL_SIZE)..]));
+                && tail.is_some_and(has_php_tag));
         if !tagged {
             return None;
         }
@@ -719,12 +731,12 @@ fn too_close(runner_up: u16, best: u16) -> bool {
 /// enough to disambiguate an otherwise ambiguous `.ps` suffix when no PostScript
 /// header is present.
 pub(crate) fn has_powershell_char_code_array(data: &[u8]) -> bool {
-    let head = &data[..data.len().min(SCAN_LIMIT)];
+    let head = data.get(..SCAN_LIMIT).unwrap_or(data);
     let Some(start) = head.windows(2).position(|w| w == b"@(") else {
         return false;
     };
     // Require an assignment immediately before the array, allowing whitespace.
-    let prefix = &head[..start];
+    let prefix = head.get(..start).unwrap_or_default();
     if prefix.iter().rev().find(|b| !b.is_ascii_whitespace()) != Some(&b'=') {
         return false;
     }
@@ -771,19 +783,22 @@ const PROSE_GUARD_MIN_BYTES: usize = 1024;
 const CODE_PUNCT: &[u8] = b"{}[]();=<>$#@\\|&*";
 
 fn is_code_punct(b: u8) -> bool {
-    CODE_PUNCT_TABLE[usize::from(b)]
+    1u128
+        .checked_shl(u32::from(b))
+        .is_some_and(|bit| CODE_PUNCT_MASK & bit != 0)
 }
 
-/// [`CODE_PUNCT`] as a lookup table: prose screening reads every byte of the
-/// head, and a table is one load where a slice search is a call.
-const CODE_PUNCT_TABLE: [bool; 256] = {
-    let mut table = [false; 256];
-    let mut i = 0;
-    while i < CODE_PUNCT.len() {
-        table[CODE_PUNCT[i] as usize] = true;
-        i += 1;
+/// [`CODE_PUNCT`] as a bitmask over ASCII: prose screening reads every byte of
+/// the head, and a mask test is a shift where a slice search is a call. Every
+/// mark is ASCII, so a byte above 0x7F shifts out and is never punctuation.
+const CODE_PUNCT_MASK: u128 = {
+    let mut mask = 0u128;
+    let mut rest = CODE_PUNCT;
+    while let [b, tail @ ..] = rest {
+        mask |= 1 << *b;
+        rest = tail;
     }
-    table
+    mask
 };
 
 /// `true` when the window carries enough control bytes that it cannot be one
@@ -824,14 +839,14 @@ fn looks_like_binary(head: &[u8]) -> bool {
 /// same; a BOM or a lane of NULs keeps that as text for the extension fallback.
 pub(crate) fn binary_not_source(data: &[u8]) -> bool {
     let body = strip_utf8_bom(data);
-    let head = &body[..body.len().min(SCAN_LIMIT)];
+    let head = body.get(..SCAN_LIMIT).unwrap_or(body);
     looks_like_binary(head) && !looks_like_utf16_text(head)
 }
 
 /// UTF-16 text, which the byte-oriented scorer cannot read. Content cannot
 /// judge it, so the extension stays the word on it.
 pub(crate) fn is_utf16_text(data: &[u8]) -> bool {
-    looks_like_utf16_text(&data[..data.len().min(SCAN_LIMIT)])
+    looks_like_utf16_text(data.get(..SCAN_LIMIT).unwrap_or(data))
 }
 
 fn looks_like_utf16_text(head: &[u8]) -> bool {
@@ -871,7 +886,7 @@ pub(crate) fn decoded_text(data: &[u8]) -> Option<Cow<'_, [u8]>> {
     // UTF-16 spells a line of ASCII with a NUL in every other byte; text
     // without a byte-order mark or an early NUL is not UTF-16.
     if !matches!(data, [0xFF, 0xFE, ..] | [0xFE, 0xFF, ..])
-        && memchr::memchr(0, &data[..data.len().min(64)]).is_none()
+        && memchr::memchr(0, data.get(..64).unwrap_or(data)).is_none()
     {
         return None;
     }
@@ -880,7 +895,7 @@ pub(crate) fn decoded_text(data: &[u8]) -> Option<Cow<'_, [u8]>> {
         [0xFE, 0xFF, rest @ ..] => (Some(false), rest),
         _ => (None, data),
     };
-    let probe = &body[..body.len().min(SCAN_LIMIT)];
+    let probe = body.get(..SCAN_LIMIT).unwrap_or(body);
     // UTF-16 spells ASCII with every other byte NUL. 8-bit text behind the
     // mark has next to none -- a stray one at the end is not an encoding.
     let nuls = probe.iter().filter(|&&b| b == 0).count();
@@ -890,7 +905,7 @@ pub(crate) fn decoded_text(data: &[u8]) -> Option<Cow<'_, [u8]>> {
         (Some(le), None) => le,
         (None, None) => return None,
     };
-    let body = &body[..body.len().min(DECODE_LIMIT)];
+    let body = body.get(..DECODE_LIMIT).unwrap_or(body);
     let units = body.as_chunks::<2>().0.iter().map(|pair| {
         if little_endian {
             u16::from_le_bytes([pair[0], pair[1]])
@@ -911,7 +926,7 @@ pub(crate) fn has_language_evidence(ft: FileType, data: &[u8]) -> bool {
         return false;
     };
     let body = data.trim_ascii_start();
-    scan_scores(&body[..body.len().min(SCAN_LIMIT)])[lang.idx()] > 0
+    lang.score(&scan_scores(body.get(..SCAN_LIMIT).unwrap_or(body))) > 0
 }
 
 /// C statement structure: statements ended with `;` alongside braces, a C
@@ -919,7 +934,7 @@ pub(crate) fn has_language_evidence(ft: FileType, data: &[u8]) -> bool {
 /// holding plain C (`int main(...) { GoFunc(); }`) is still what its name says;
 /// a MATLAB script, a hosts file, or a batch file under the same letter is not.
 pub(crate) fn looks_like_c_family(data: &[u8]) -> bool {
-    let head = &data[..data.len().min(SCAN_LIMIT)];
+    let head = data.get(..SCAN_LIMIT).unwrap_or(data);
     let statement_end = head
         .split(|&b| b == b'\n')
         .any(|line| line.trim_ascii_end().ends_with(b";"));
@@ -969,9 +984,9 @@ pub(crate) fn contradicts_extension(ext: FileType, data: &[u8]) -> Option<FileTy
     // with a name, so it reads less than a nameless file gets.
     let script = scripts::evidence_within(body, CONTRADICTION_WINDOW);
     if let Some(found) = script.verdict() {
-        let scores = scan_scores(&body[..body.len().min(SCAN_LIMIT)]);
+        let scores = scan_scores(body.get(..SCAN_LIMIT).unwrap_or(body));
         let claimed = Lang::from_file_type(ext);
-        if found == ext || script.supports(ext) || claimed.is_some_and(|l| scores[l.idx()] > 0) {
+        if found == ext || script.supports(ext) || claimed.is_some_and(|l| l.score(&scores) > 0) {
             return None;
         }
         // The name stands unless the body outweighs it. One command line does
@@ -980,7 +995,7 @@ pub(crate) fn contradicts_extension(ext: FileType, data: &[u8]) -> Option<FileTy
         // only a run of lines overrides it -- `@echo off` alone is also an
         // Elixir module attribute.
         let tokens_agree = claimed.is_some()
-            && Lang::from_file_type(found).is_some_and(|l| scores[l.idx()] >= THRESHOLD);
+            && Lang::from_file_type(found).is_some_and(|l| l.score(&scores) >= THRESHOLD);
         return (script.conclusive(found) || tokens_agree).then_some(found);
     }
     if body.first() == Some(&b'<') && looks_like_html(&text) {
@@ -990,16 +1005,16 @@ pub(crate) fn contradicts_extension(ext: FileType, data: &[u8]) -> Option<FileTy
     // Only batch or VBScript can contradict a name this way, and the scorer
     // names neither without its tokens in the head. Most source files stop
     // here instead of being scored in full.
-    let head = &body[..body.len().min(SCAN_LIMIT)];
+    let head = body.get(..SCAN_LIMIT).unwrap_or(body);
     let scores = scan_scores(head);
-    if scores[Lang::Batch.idx()] < THRESHOLD && scores[Lang::Vbs.idx()] < THRESHOLD {
+    if Lang::Batch.score(&scores) < THRESHOLD && Lang::Vbs.score(&scores) < THRESHOLD {
         return None;
     }
     let found = detect_from_content(data)?;
     if found == ext || !matches!(found, FileType::Batch | FileType::Vbs) {
         return None;
     }
-    (scores[claimed.idx()] == 0).then_some(found)
+    (claimed.score(&scores) == 0).then_some(found)
 }
 
 /// True when `head` reads like natural-language text rather than source.
@@ -1037,7 +1052,7 @@ fn looks_like_prose(head: &[u8]) -> bool {
 /// words they contain, so a rule file is data no matter which language's tokens
 /// it quotes.
 fn looks_like_structured_data(data: &[u8]) -> bool {
-    let head = &data[..data.len().min(SCAN_LIMIT)];
+    let head = data.get(..SCAN_LIMIT).unwrap_or(data);
     // A shebang names an interpreter: that is a script, whatever follows.
     if head.starts_with(b"#!") {
         return false;
@@ -1132,17 +1147,22 @@ fn looks_like_rfc822_stanzas(head: &[u8]) -> bool {
 /// without spaces or a colon. Rejects a Kotlin `package a.b` (no colon), a C
 /// label (no value) and a prose line containing a mid-sentence colon.
 fn is_rfc822_field_line(line: &[u8]) -> bool {
-    let end = match line.iter().position(|&b| b == b':') {
-        Some(0) | None => return false,
-        Some(i) => i,
-    };
-    if !line[..end]
+    let Some((name, value)) = line
         .iter()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        .position(|&b| b == b':')
+        .and_then(|end| line.split_at_checked(end))
+    else {
+        return false;
+    };
+    if name.is_empty()
+        || !name
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
     {
         return false;
     }
-    matches!(line.get(end + 1), None | Some(b' ') | Some(b'\r'))
+    // `value` opens with the colon itself.
+    matches!(value.get(1), None | Some(b' ') | Some(b'\r'))
 }
 
 /// `true` for a line that opens a YAML sequence entry, a block mapping key, or
@@ -1168,17 +1188,17 @@ fn is_yaml_node_line(line: &[u8]) -> bool {
 /// only two a Dockerfile may open with. Comments, blank lines, and a leading
 /// parser directive are skipped, matching what the builder accepts.
 fn starts_with_dockerfile_instruction(data: &[u8]) -> bool {
-    for line in data[..data.len().min(SCAN_LIMIT)].split(|&b| b == b'\n') {
+    for line in data
+        .get(..SCAN_LIMIT)
+        .unwrap_or(data)
+        .split(|&b| b == b'\n')
+    {
         let line = line.trim_ascii();
         if line.is_empty() || line.starts_with(b"#") {
             continue;
         }
-        let word_end = line
-            .iter()
-            .position(u8::is_ascii_whitespace)
-            .unwrap_or(line.len());
-        return line[..word_end].eq_ignore_ascii_case(b"FROM")
-            || line[..word_end].eq_ignore_ascii_case(b"ARG");
+        let word = line.split(u8::is_ascii_whitespace).next().unwrap_or(line);
+        return word.eq_ignore_ascii_case(b"FROM") || word.eq_ignore_ascii_case(b"ARG");
     }
     false
 }
@@ -1188,15 +1208,20 @@ fn starts_with_dockerfile_instruction(data: &[u8]) -> bool {
 /// `<?xml …?>` is an XML processing instruction and never counts on its own.
 fn has_php_tag(data: &[u8]) -> bool {
     let mut saw_xml_pi = false;
-    let mut offset = 0;
-    while let Some(pos) = memchr::memmem::find(&data[offset..], b"<?") {
-        let after = offset + pos + 2;
-        if data[after..].len() >= 3 && data[after..after + 3].eq_ignore_ascii_case(b"xml") {
+    let mut rest = data;
+    while let Some(pos) = memchr::memmem::find(rest, b"<?") {
+        let Some(after) = rest.get(pos + 2..) else {
+            break;
+        };
+        if after
+            .get(..3)
+            .is_some_and(|pi| pi.eq_ignore_ascii_case(b"xml"))
+        {
             saw_xml_pi = true;
         } else {
             return true;
         }
-        offset = after;
+        rest = after;
     }
     !saw_xml_pi && memchr::memmem::find(data, b"?>").is_some()
 }
@@ -1237,7 +1262,7 @@ static HTML_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
 
 /// Check if content looks like HTML (has actual markup tags).
 pub(crate) fn looks_like_html(data: &[u8]) -> bool {
-    HTML_AC.is_match(&data[..data.len().min(HTML_SCAN_WINDOW)])
+    HTML_AC.is_match(data.get(..HTML_SCAN_WINDOW).unwrap_or(data))
 }
 
 /// A mark that belongs to one format and almost nothing else.
@@ -1247,7 +1272,7 @@ pub(crate) fn looks_like_html(data: &[u8]) -> bool {
 /// a JSP page became Python and a mIRC script became Lua. One needle, one type.
 pub(crate) fn unmistakable(data: &[u8]) -> Option<FileType> {
     let data = strip_utf8_bom(data);
-    let head = &data[..data.len().min(2048)];
+    let head = data.get(..2048).unwrap_or(data);
     if looks_like_git_config(head) {
         return Some(FileType::Text);
     }
@@ -1293,7 +1318,7 @@ pub(crate) fn unmistakable(data: &[u8]) -> Option<FileType> {
     {
         return Some(FileType::Cfml);
     }
-    if let Some(irc) = scripts::irc_mark(&data[..data.len().min(4096)]) {
+    if let Some(irc) = scripts::irc_mark(data.get(..4096).unwrap_or(data)) {
         return Some(irc);
     }
     if contains(head, b"\\documentclass")
@@ -1324,7 +1349,7 @@ pub(crate) fn looks_like_git_config(data: &[u8]) -> bool {
     }
 
     let data = strip_utf8_bom(data);
-    let head = &data[..data.len().min(SCAN_LIMIT)];
+    let head = data.get(..SCAN_LIMIT).unwrap_or(data);
     if head.is_empty() || looks_like_binary(head) {
         return false;
     }
@@ -1342,8 +1367,7 @@ pub(crate) fn looks_like_git_config(data: &[u8]) -> bool {
         }
         meaningful_lines += 1;
 
-        if line.starts_with(b"[") && line.ends_with(b"]") {
-            let name = &line[1..line.len() - 1];
+        if let Some(name) = line.strip_prefix(b"[").and_then(|l| l.strip_suffix(b"]")) {
             section = if name.eq_ignore_ascii_case(b"core") {
                 recognized_section = true;
                 Section::Core
@@ -1366,10 +1390,14 @@ pub(crate) fn looks_like_git_config(data: &[u8]) -> bool {
             continue;
         }
 
-        let Some(equal) = line.iter().position(|&byte| byte == b'=') else {
+        let Some(key) = line
+            .iter()
+            .position(|&byte| byte == b'=')
+            .and_then(|equal| line.get(..equal))
+        else {
             continue;
         };
-        let key = line[..equal].trim_ascii();
+        let key = key.trim_ascii();
         if key.is_empty()
             || !key
                 .iter()
@@ -1424,10 +1452,10 @@ pub(crate) fn looks_like_git_config(data: &[u8]) -> bool {
 }
 
 fn git_config_subsection(header: &[u8], name: &[u8]) -> bool {
-    let Some(rest) = header.get(name.len()..) else {
+    let Some((prefix, rest)) = header.split_at_checked(name.len()) else {
         return false;
     };
-    header[..name.len()].eq_ignore_ascii_case(name)
+    prefix.eq_ignore_ascii_case(name)
         && rest.starts_with(b" \"")
         && rest.len() > 3
         && rest.ends_with(b"\"")
@@ -1454,19 +1482,16 @@ fn looks_like_roff_man_page(head: &[u8]) -> bool {
         if control != b'.' && control != b'\'' {
             continue;
         }
-        let end = rest
-            .iter()
-            .position(u8::is_ascii_whitespace)
-            .unwrap_or(rest.len());
-        let request = &rest[..end];
+        let request = rest.split(u8::is_ascii_whitespace).next().unwrap_or(rest);
         if request == b"TH" {
             has_title = true;
         }
-        if let Some(index) = REQUESTS.iter().position(|known| *known == request) {
-            if !seen[index] {
-                seen[index] = true;
-                distinct += 1;
-            }
+        if let Some(index) = REQUESTS.iter().position(|known| *known == request)
+            && let Some(seen) = seen.get_mut(index)
+            && !*seen
+        {
+            *seen = true;
+            distinct += 1;
         }
     }
 
@@ -1509,7 +1534,7 @@ fn looks_like_makefile(head: &[u8]) -> bool {
             .iter()
             .find_map(|operator| trimmed.windows(operator.len()).position(|w| w == *operator))
         {
-            let name = trimmed[..index].trim_ascii_end();
+            let name = trimmed.get(..index).unwrap_or_default().trim_ascii_end();
             if !name.is_empty()
                 && name
                     .iter()
@@ -1521,10 +1546,13 @@ fn looks_like_makefile(head: &[u8]) -> bool {
             // Make target definitions start in column zero. Requiring that
             // also prevents indented source comments such as `//post:` from
             // combining with unrelated tab-indented code into a false match.
-            let Some(colon) = trimmed.iter().position(|&byte| byte == b':') else {
+            let Some(target) = trimmed
+                .iter()
+                .position(|&byte| byte == b':')
+                .and_then(|colon| trimmed.get(..colon))
+            else {
                 continue;
             };
-            let target = &trimmed[..colon];
             if !target.is_empty() && !target.iter().any(u8::is_ascii_whitespace) {
                 has_target = true;
             }
@@ -1540,7 +1568,7 @@ pub(crate) fn looks_like_dos_com(data: &[u8]) -> bool {
     if data.len() > DOS_COM_MAX_SIZE {
         return false;
     }
-    let head = &data[..data.len().min(4096)];
+    let head = data.get(..4096).unwrap_or(data);
     head.windows(2).any(|w| w == [0xCD, 0x21])
 }
 
@@ -1548,25 +1576,27 @@ pub(crate) fn looks_like_dos_com(data: &[u8]) -> bool {
 /// jump, 0x55AA boot signature, and mutually plausible BPB fields; the final
 /// two bytes alone are common in unrelated 512-byte data and are not enough.
 pub(crate) fn looks_like_fat_boot_sector(data: &[u8]) -> bool {
-    if data.len() < 512
-        || data[510..512] != [0x55, 0xAA]
-        || !matches!(data[0], 0xE9 | 0xEB)
-        || (data[0] == 0xEB && data[2] != 0x90)
+    let Some(sector) = data.first_chunk::<512>() else {
+        return false;
+    };
+    if !sector.ends_with(&[0x55, 0xAA])
+        || !matches!(sector[0], 0xE9 | 0xEB)
+        || (sector[0] == 0xEB && sector[2] != 0x90)
     {
         return false;
     }
 
-    let bytes_per_sector = u16::from_le_bytes([data[11], data[12]]);
-    let sectors_per_cluster = data[13];
-    let reserved_sectors = u16::from_le_bytes([data[14], data[15]]);
-    let fat_count = data[16];
-    let total_sectors_16 = u16::from_le_bytes([data[19], data[20]]);
-    let media = data[21];
-    let fat_size_16 = u16::from_le_bytes([data[22], data[23]]);
-    let sectors_per_track = u16::from_le_bytes([data[24], data[25]]);
-    let heads = u16::from_le_bytes([data[26], data[27]]);
-    let total_sectors_32 = u32::from_le_bytes([data[32], data[33], data[34], data[35]]);
-    let fat_size_32 = u32::from_le_bytes([data[36], data[37], data[38], data[39]]);
+    let bytes_per_sector = u16::from_le_bytes([sector[11], sector[12]]);
+    let sectors_per_cluster = sector[13];
+    let reserved_sectors = u16::from_le_bytes([sector[14], sector[15]]);
+    let fat_count = sector[16];
+    let total_sectors_16 = u16::from_le_bytes([sector[19], sector[20]]);
+    let media = sector[21];
+    let fat_size_16 = u16::from_le_bytes([sector[22], sector[23]]);
+    let sectors_per_track = u16::from_le_bytes([sector[24], sector[25]]);
+    let heads = u16::from_le_bytes([sector[26], sector[27]]);
+    let total_sectors_32 = u32::from_le_bytes([sector[32], sector[33], sector[34], sector[35]]);
+    let fat_size_32 = u32::from_le_bytes([sector[36], sector[37], sector[38], sector[39]]);
 
     let valid_sector_size = matches!(bytes_per_sector, 512 | 1024 | 2048 | 4096);
     let valid_cluster_size = sectors_per_cluster.is_power_of_two() && sectors_per_cluster <= 128;
@@ -1604,7 +1634,7 @@ fn looks_like_dos_com_overwriter(data: &[u8]) -> bool {
     if !(64..=DOS_COM_MAX_SIZE).contains(&data.len()) {
         return false;
     }
-    let prefix = &data[..data.len().min(256)];
+    let prefix = data.get(..256).unwrap_or(data);
     let dos_calls = prefix.windows(2).filter(|w| *w == [0xCD, 0x21]).count();
     dos_calls >= 2
         && prefix.windows(2).any(|w| w == [0xCD, 0x20])
@@ -1612,19 +1642,21 @@ fn looks_like_dos_com_overwriter(data: &[u8]) -> bool {
 }
 
 fn has_dos_service_call(data: &[u8]) -> bool {
-    data.windows(4)
-        .any(|w| w[0] == 0xB4 && w[2..] == [0xCD, 0x21])
+    data.windows(4).any(|w| matches!(w, [0xB4, _, 0xCD, 0x21]))
         || data
             .windows(5)
-            .any(|w| w[0] == 0xB8 && w[3..] == [0xCD, 0x21])
+            .any(|w| matches!(w, [0xB8, _, _, 0xCD, 0x21]))
 }
 
 fn looks_like_asp_directive(head: &[u8]) -> bool {
     // Classic ASP's own directives. `<%@codepage=936%>` opens a good share of
     // the Chinese-language webshells.
-    let mut from = 0;
-    while let Some(at) = find_ci(&head[from..], b"<%@") {
-        let rest = head[from + at + 3..].trim_ascii_start();
+    let mut rest = head;
+    while let Some(at) = find_ci(rest, b"<%@") {
+        let Some(after) = rest.get(at + 3..) else {
+            break;
+        };
+        let name = after.trim_ascii_start();
         let directive = [
             &b"language"[..],
             b"codepage",
@@ -1633,11 +1665,14 @@ fn looks_like_asp_directive(head: &[u8]) -> bool {
             b"transaction",
         ]
         .iter()
-        .any(|d| rest.len() >= d.len() && rest[..d.len()].eq_ignore_ascii_case(d));
+        .any(|d| {
+            name.get(..d.len())
+                .is_some_and(|n| n.eq_ignore_ascii_case(d))
+        });
         if directive {
             return true;
         }
-        from += at + 3;
+        rest = after;
     }
     let page = contains_ci(head, b"<%@page") || contains_ci(head, b"<%@ page");
     page && (contains_ci(head, b"language=\"c#\"")
@@ -1843,6 +1878,14 @@ mod tests {
         let tiny = b"var x = require('foo');\nmodule.exports = x;\n";
         assert!(tiny.len() < PROSE_GUARD_MIN_BYTES);
         assert_eq!(detect_from_content(tiny), Some(FileType::JavaScript));
+    }
+
+    /// The bitmask is exactly [`CODE_PUNCT`], over every byte value.
+    #[test]
+    fn code_punct_mask_matches_list() {
+        for b in 0..=u8::MAX {
+            assert_eq!(is_code_punct(b), CODE_PUNCT.contains(&b), "byte {b:#04x}");
+        }
     }
 
     #[test]

@@ -395,7 +395,7 @@ const SHARD_COUNT: usize = 256;
 /// Default ceiling on retained cache entries. On reaching it, the oldest
 /// (least-recently-used) entries are evicted; see [`enforce_limits`].
 ///
-/// Shared with stng's and fletch's `cache_sweep`, so every atomdrift cache
+/// Shared with [`crate::cache_sweep`] and fletch's copy of it, so every atomdrift cache
 /// quotes one ceiling.
 pub const DEFAULT_MAX_ITEMS: usize = 16_384;
 
@@ -447,11 +447,12 @@ static SWEEP_RUNNING: AtomicBool = AtomicBool::new(false);
 /// runs at a time, so repeated calls are cheap no-ops while one is in flight.
 pub fn cleanup() {
     spawn_sweep(max_items());
-    // Also reclaim stng's on-disk caches. filefacts fills stng's string cache
-    // during extraction, and — unlike filefacts' own cache — nothing else prunes
-    // it in a filefacts- or cleave-only process (cleave routes its startup
-    // cleanup through here). Best-effort, self-gated to once a day, non-blocking.
-    stng::cache_sweep::spawn(vec![stng::cache_sweep::stng_budget()]);
+    // Age out stng's on-disk string cache. filefacts no longer writes it (the
+    // rows live in this cache's snapshots), but earlier builds filled it and
+    // nothing else prunes it in a filefacts- or cleave-only process. Drop this
+    // once the leftovers have aged out. Best-effort, self-gated to once a day,
+    // non-blocking.
+    crate::cache_sweep::spawn(vec![crate::cache_sweep::legacy_stng_budget()]);
 }
 
 /// Claim the sweep guard and run the cleanup passes on a detached thread.
@@ -957,6 +958,23 @@ mod tests {
         );
         assert_eq!(stored, Some(2));
         assert_eq!(load_from_path::<u32>(&path), Some(2));
+    }
+
+    #[test]
+    fn stng_is_pinned_so_its_commit_keys_the_cache() {
+        // Cached snapshots hold stng's output, and the key covers Cargo.toml
+        // (see build.rs) but not stng's source. Pinning stng to an exact commit
+        // or version is what retires entries when stng changes; a branch or a
+        // version range would let a stng update serve stale strings.
+        let manifest = include_str!("../Cargo.toml");
+        let stng = manifest
+            .lines()
+            .find(|line| line.trim_start().starts_with("stng "))
+            .expect("stng dependency in Cargo.toml");
+        assert!(
+            stng.contains("rev = \"") || stng.contains("version = \"="),
+            "stng must be pinned by rev or exact version: {stng}"
+        );
     }
 
     #[test]

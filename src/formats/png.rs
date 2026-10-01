@@ -56,7 +56,7 @@ pub(super) fn extract(
 ) -> Result<(), Error> {
     extract_binary_strings(bytes, strings, XorScan::No);
 
-    if bytes.len() < 8 || &bytes[..8] != SIGNATURE {
+    if bytes.first_chunk::<8>() != Some(SIGNATURE) {
         // Named `.png` but not a PNG. Report what the bytes actually are so
         // the masquerade is visible even though no chunk walk is possible.
         carrier::emit(bytes, &Coverage::unrecognized(), values, metrics);
@@ -85,10 +85,9 @@ pub(super) fn extract(
     let mut icc_name: Option<String> = None;
 
     let mut i = 8usize;
-    while i + 8 <= bytes.len() {
-        let length =
-            u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
-        let ctype_bytes = &bytes[i + 4..i + 8];
+    while let Some(head) = bytes.get(i..).and_then(<[u8]>::first_chunk::<8>) {
+        let length = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+        let ctype_bytes = &head[4..];
         let body_start = i + 8;
         let Some(chunk_end) = body_start
             .checked_add(length)
@@ -96,10 +95,14 @@ pub(super) fn extract(
         else {
             break;
         };
-        if chunk_end > bytes.len() {
-            // Truncated — stop walking; keep counts so far.
+        // Truncated — stop walking; keep counts so far. The chunk fits, so
+        // the split into body and 4-byte CRC always succeeds.
+        let Some((body, crc)) = bytes
+            .get(body_start..chunk_end)
+            .and_then(|rest| rest.split_at_checked(length))
+        else {
             break;
-        }
+        };
         last_chunk_end = chunk_end;
 
         let ctype = std::str::from_utf8(ctype_bytes).unwrap_or("");
@@ -111,24 +114,26 @@ pub(super) fn extract(
             chunks.push(JsonValue::String(ctype.to_string()));
         }
 
-        let body = &bytes[body_start..body_start + length];
         match ctype {
-            "IHDR" if body.len() >= 13 => {
-                let width = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
-                let height = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
-                dim_obj.insert("width".into(), json!(width));
-                dim_obj.insert("height".into(), json!(height));
-                dim_obj.insert("bit_depth".into(), json!(body[8]));
-                dim_obj.insert(
-                    "color_type".into(),
-                    JsonValue::String(color_type_name(body[9]).to_string()),
-                );
-                dim_obj.insert("compression".into(), json!(body[10]));
-                dim_obj.insert("filter".into(), json!(body[11]));
-                dim_obj.insert(
-                    "interlace".into(),
-                    JsonValue::String(if body[12] == 1 { "adam7" } else { "none" }.to_string()),
-                );
+            // A short IHDR records nothing, exactly as the catch-all arm would.
+            "IHDR" => {
+                if let Some(ihdr) = body.first_chunk::<13>() {
+                    let width = u32::from_be_bytes([ihdr[0], ihdr[1], ihdr[2], ihdr[3]]);
+                    let height = u32::from_be_bytes([ihdr[4], ihdr[5], ihdr[6], ihdr[7]]);
+                    dim_obj.insert("width".into(), json!(width));
+                    dim_obj.insert("height".into(), json!(height));
+                    dim_obj.insert("bit_depth".into(), json!(ihdr[8]));
+                    dim_obj.insert(
+                        "color_type".into(),
+                        JsonValue::String(color_type_name(ihdr[9]).to_string()),
+                    );
+                    dim_obj.insert("compression".into(), json!(ihdr[10]));
+                    dim_obj.insert("filter".into(), json!(ihdr[11]));
+                    dim_obj.insert(
+                        "interlace".into(),
+                        JsonValue::String(if ihdr[12] == 1 { "adam7" } else { "none" }.to_string()),
+                    );
+                }
             }
             "IDAT" => {
                 chunks_idat += 1;
@@ -146,16 +151,23 @@ pub(super) fn extract(
                     text_kv.insert(snake_case(&key), JsonValue::String(value));
                 }
             }
-            "tIME" if body.len() >= 7 => {
-                let year = u16::from_be_bytes([body[0], body[1]]);
-                time_value = Some(format!(
-                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-                    year, body[2], body[3], body[4], body[5], body[6]
-                ));
+            // A short tIME records nothing, exactly as the catch-all arm would.
+            "tIME" => {
+                if let Some(&[y0, y1, month, day, hour, minute, second]) = body.first_chunk::<7>() {
+                    let year = u16::from_be_bytes([y0, y1]);
+                    time_value = Some(format!(
+                        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+                        year, month, day, hour, minute, second
+                    ));
+                }
             }
             "iCCP" => {
-                if let Some(end) = body.iter().position(|&b| b == 0) {
-                    if let Ok(name) = std::str::from_utf8(&body[..end]) {
+                if let Some(name) = body
+                    .iter()
+                    .position(|&b| b == 0)
+                    .and_then(|end| body.get(..end))
+                {
+                    if let Ok(name) = std::str::from_utf8(name) {
                         if !name.is_empty() {
                             icc_name = Some(name.to_string());
                         }
@@ -194,9 +206,7 @@ pub(super) fn extract(
             coverage.claim_freeform(i as u64, chunk_end as u64);
         } else if ctype == "IDAT" {
             // Deferred until all IDAT bodies can be treated as one zlib stream.
-        } else if is_standard_chunk(ctype)
-            || is_well_formed_aapt_chunk(ctype, body, &bytes[body_start + length..chunk_end])
-        {
+        } else if is_standard_chunk(ctype) || is_well_formed_aapt_chunk(ctype, body, crc) {
             coverage.claim(i as u64, chunk_end as u64);
         }
 
@@ -304,7 +314,12 @@ fn claim_idat_stream(
 
     let mut input = Vec::with_capacity(total);
     for extent in extents {
-        input.extend_from_slice(&bytes[extent.body_start..extent.body_end]);
+        // Extents come from chunks that fit the file, so the body is present.
+        let Some(body) = bytes.get(extent.body_start..extent.body_end) else {
+            claim_all_idat(extents, coverage);
+            return None;
+        };
+        input.extend_from_slice(body);
     }
 
     let mut decoder = flate2::bufread::ZlibDecoder::new(input.as_slice());
@@ -391,7 +406,9 @@ fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
     let Ok(output_info) = reader.next_frame(&mut pixels) else {
         return;
     };
-    let pixels = &pixels[..output_info.buffer_size()];
+    let Some(pixels) = pixels.get(..output_info.buffer_size()) else {
+        return;
+    };
 
     let raw_size = (width as usize)
         .saturating_mul(height as usize)
@@ -493,22 +510,28 @@ fn is_standard_chunk(t: &str) -> bool {
 /// records (six and four 32-bit fields).
 fn is_well_formed_aapt_chunk(ctype: &str, body: &[u8], crc: &[u8]) -> bool {
     let shape_ok = match ctype {
-        "npTc" => {
-            body.len() >= 32
-                && body.len()
-                    == 32 + 4 * (usize::from(body[1]) + usize::from(body[2]) + usize::from(body[3]))
-        }
+        "npTc" => body
+            .first_chunk::<4>()
+            .is_some_and(|&[_, x_divs, y_divs, colors]| {
+                body.len() >= 32
+                    && body.len()
+                        == 32
+                            + 4 * (usize::from(x_divs) + usize::from(y_divs) + usize::from(colors))
+            }),
         "npOl" => body.len() == 24,
         "npLb" => body.len() == 16,
         _ => false,
     };
-    if !shape_ok || crc.len() != 4 {
+    if !shape_ok {
         return false;
     }
+    let Ok(crc) = <[u8; 4]>::try_from(crc) else {
+        return false;
+    };
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(ctype.as_bytes());
     hasher.update(body);
-    hasher.finalize() == u32::from_be_bytes([crc[0], crc[1], crc[2], crc[3]])
+    hasher.finalize() == u32::from_be_bytes(crc)
 }
 
 /// Parse the keyword + value out of any PNG text chunk variant.
@@ -517,7 +540,7 @@ fn is_well_formed_aapt_chunk(ctype: &str, body: &[u8], crc: &[u8]) -> bool {
 /// the text value only when it's uncompressed UTF-8.
 fn parse_text_chunk(ctype: &str, body: &[u8]) -> Option<(String, String)> {
     let kw_end = body.iter().position(|&b| b == 0)?;
-    let key = std::str::from_utf8(&body[..kw_end]).ok()?.to_string();
+    let key = std::str::from_utf8(body.get(..kw_end)?).ok()?.to_string();
     let value = match ctype {
         "tEXt" => std::str::from_utf8(body.get(kw_end + 1..)?)
             .ok()?

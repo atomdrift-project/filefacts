@@ -51,6 +51,7 @@ use std::panic;
 use std::sync::Once;
 
 use crate::Stage;
+use crate::formats::common::bytes_at::{u16_le, u32_le};
 use crate::formats::common::read_uleb128;
 use crate::output::Errors;
 
@@ -352,10 +353,9 @@ fn import_walk_budget(data: &[u8], pe: &PE<'_>) -> Result<(), Rejection> {
     while offset + SIZEOF_IMPORT_DIRECTORY_ENTRY <= data.len() {
         // Field layout of `ImportDirectoryEntry`, little-endian: lookup-table
         // RVA, timestamp, forwarder chain, name RVA, address-table RVA.
-        let word = |i: usize| -> u32 {
-            let at = offset + i * 4;
-            u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]])
-        };
+        // In bounds by the loop guard; a short read would yield the all-zero
+        // terminator, ending the walk as running out of bytes does.
+        let word = |i: usize| -> u32 { u32_le(data, offset + i * 4).unwrap_or(0) };
         let (lookup_rva, name_rva, address_rva) = (word(0), word(3), word(4));
         let is_null = (0..5).all(|i| word(i) == 0);
         // Mirrors `ImportDirectoryEntry::is_possibly_valid`.
@@ -371,8 +371,8 @@ fn import_walk_budget(data: &[u8], pe: &PE<'_>) -> Result<(), Rejection> {
 
         // goblin prefers the lookup table and falls back to the address table.
         if let Some(mut cursor) = resolve(lookup_rva).or_else(|| resolve(address_rva)) {
-            while cursor + entry_size <= data.len() {
-                if data[cursor..cursor + entry_size].iter().all(|&b| b == 0) {
+            while let Some(entry) = data.get(cursor..cursor + entry_size) {
+                if entry.iter().all(|&b| b == 0) {
                     break;
                 }
                 entries += 1;
@@ -412,27 +412,22 @@ pub(crate) fn neutralize_malformed_rich_header(data: &[u8]) -> Option<Vec<u8>> {
     if data.len() < 0x40 {
         return None;
     }
-    let e_lfanew = u32::from_le_bytes([data[0x3c], data[0x3d], data[0x3e], data[0x3f]]) as usize;
+    let e_lfanew = u32_le(data, 0x3c)? as usize;
     let scan_end = e_lfanew.min(data.len());
     if scan_end < 8 {
         return None;
     }
-    let rich_pos = data[..scan_end].windows(4).rposition(|w| w == RICH_MAGIC)?;
-    if rich_pos + 8 > data.len() {
-        return None;
-    }
-    let key = u32::from_le_bytes([
-        data[rich_pos + 4],
-        data[rich_pos + 5],
-        data[rich_pos + 6],
-        data[rich_pos + 7],
-    ]);
+    let rich_pos = data
+        .get(..scan_end)?
+        .windows(4)
+        .rposition(|w| w == RICH_MAGIC)?;
+    let key = u32_le(data, rich_pos + 4)?;
     // Walk backwards in 4-byte words: a decodable DanS marker means the
     // header is well-formed and goblin will parse it without complaint.
     let mut pos = rich_pos;
     while pos >= 4 {
         pos -= 4;
-        let word = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        let word = u32_le(data, pos)?;
         if word ^ key == DANS_MARKER {
             return None;
         }
@@ -440,7 +435,7 @@ pub(crate) fn neutralize_malformed_rich_header(data: &[u8]) -> Option<Vec<u8>> {
     // No DanS table reachable — goblin would abort. Hand back a copy with
     // the `Rich` magic cleared so its marker scan finds nothing.
     let mut patched = data.to_vec();
-    patched[rich_pos..rich_pos + 4].fill(0);
+    patched.get_mut(rich_pos..rich_pos + 4)?.fill(0);
     Some(patched)
 }
 
@@ -459,27 +454,27 @@ fn validate_pe_header(data: &[u8]) -> Result<(), Rejection> {
         return Ok(());
     }
 
-    if data[0] != b'M' || data[1] != b'Z' {
+    if !data.starts_with(b"MZ") {
         return Ok(());
     }
 
     let pe_ptr_offset = 0x3C;
-    let pe_offset = u32::from_le_bytes([
-        data[pe_ptr_offset],
-        data[pe_ptr_offset + 1],
-        data[pe_ptr_offset + 2],
-        data[pe_ptr_offset + 3],
-    ]) as usize;
+    let Some(pe_offset) = u32_le(data, pe_ptr_offset) else {
+        return Ok(());
+    };
+    let pe_offset = pe_offset as usize;
 
     if pe_offset + 24 > data.len() {
         return Ok(());
     }
-    if &data[pe_offset..pe_offset + 4] != b"PE\0\0" {
+    if data.get(pe_offset..pe_offset + 4) != Some(b"PE\0\0".as_slice()) {
         return Ok(());
     }
 
     let coff_offset = pe_offset + 4;
-    let n_sections = u16::from_le_bytes([data[coff_offset + 2], data[coff_offset + 3]]);
+    let Some(n_sections) = u16_le(data, coff_offset + 2) else {
+        return Ok(());
+    };
     if n_sections > 192 {
         return Err(Rejection::TooManySections(n_sections));
     }
@@ -489,7 +484,9 @@ fn validate_pe_header(data: &[u8]) -> Result<(), Rejection> {
         return Ok(());
     }
 
-    let magic = u16::from_le_bytes([data[opt_offset], data[opt_offset + 1]]);
+    let Some(magic) = u16_le(data, opt_offset) else {
+        return Ok(());
+    };
     let (data_dir_count_offset, data_dir_offset) = match magic {
         0x010b => (92, 96),   // PE32
         0x020b => (108, 112), // PE32+
@@ -501,12 +498,9 @@ fn validate_pe_header(data: &[u8]) -> Result<(), Rejection> {
         return Ok(());
     }
 
-    let n_dirs = u32::from_le_bytes([
-        data[dir_count_ptr],
-        data[dir_count_ptr + 1],
-        data[dir_count_ptr + 2],
-        data[dir_count_ptr + 3],
-    ]);
+    let Some(n_dirs) = u32_le(data, dir_count_ptr) else {
+        return Ok(());
+    };
 
     if n_dirs > 16 {
         return Err(Rejection::TooManyDataDirectories(n_dirs));
@@ -518,17 +512,11 @@ fn validate_pe_header(data: &[u8]) -> Result<(), Rejection> {
     for i in 1..=2 {
         if n_dirs > i as u32 {
             let dir_ptr = opt_offset + data_dir_offset + (i * 8);
-            if dir_ptr + 8 <= data.len() {
-                let size = u32::from_le_bytes([
-                    data[dir_ptr + 4],
-                    data[dir_ptr + 5],
-                    data[dir_ptr + 6],
-                    data[dir_ptr + 7],
-                ]);
-                if size > 10 * 1024 * 1024 || size as usize > data.len() {
-                    let table = if i == 1 { "import" } else { "resource" };
-                    return Err(Rejection::OversizedDirectory { table, size });
-                }
+            if let Some(size) = u32_le(data, dir_ptr + 4)
+                && (size > 10 * 1024 * 1024 || size as usize > data.len())
+            {
+                let table = if i == 1 { "import" } else { "resource" };
+                return Err(Rejection::OversizedDirectory { table, size });
             }
         }
     }
@@ -618,9 +606,11 @@ pub(crate) fn elf_without_truncated_section_headers(data: &[u8]) -> Option<Vec<u
         return None;
     }
     let mut patched = data.to_vec();
-    patched[shoff_at..shoff_at + shoff_len].fill(0);
-    patched[shnum_at..shnum_at + 2].fill(0);
-    patched[shstrndx_at..shstrndx_at + 2].fill(0);
+    patched.get_mut(shoff_at..shoff_at + shoff_len)?.fill(0);
+    patched.get_mut(shnum_at..shnum_at + 2)?.fill(0);
+    // `e_shstrndx` sits past every field read above, so a header cut off
+    // inside it gets here; that is the "header itself is truncated" case.
+    patched.get_mut(shstrndx_at..shstrndx_at + 2)?.fill(0);
     Some(patched)
 }
 
@@ -689,7 +679,11 @@ fn validate_export_trie_bytes(bytes: &[u8], start: usize, size: usize) -> Result
         if node >= end {
             continue;
         }
-        if std::mem::replace(&mut visited[node - start], true) {
+        // `node >= start`: it is `start` or a child offset added to it.
+        let Some(seen) = visited.get_mut(node - start) else {
+            continue;
+        };
+        if std::mem::replace(seen, true) {
             return Err(Rejection::ExportTrieLoop { node, start, end });
         }
         let mut offset = node;
@@ -720,7 +714,10 @@ fn validate_export_trie_bytes(bytes: &[u8], start: usize, size: usize) -> Result
             });
         }
         for _ in 0..nbranches {
-            let Some(label_len) = bytes[offset..].iter().position(|&b| b == 0) else {
+            let Some(label_len) = bytes
+                .get(offset..)
+                .and_then(|rest| rest.iter().position(|&b| b == 0))
+            else {
                 return Ok(());
             };
             offset += label_len + 1;
@@ -1179,6 +1176,36 @@ mod tests {
         // Truncated ULEB / label: goblin's own Err is the report.
         assert!(validate_export_trie_bytes(&[0x00, 0x01, b'_'], 0, 3).is_ok());
         assert!(validate_export_trie_bytes(&[0x80], 0, 1).is_ok());
+    }
+
+    /// A header cut off inside `e_shstrndx`, the last field zeroed, used to
+    /// panic slicing the patched copy: every field the helper reads is in
+    /// bounds, but the one it then writes is not.
+    #[test]
+    fn elf_detach_rejects_header_truncated_in_shstrndx() {
+        // (EI_CLASS, e_shoff, e_shentsize, e_shnum, e_shstrndx) offsets.
+        for (class, shoff_at, shentsize_at, shnum_at, shstrndx_at) in
+            [(2u8, 0x28, 0x3A, 0x3C, 0x3E), (1, 0x20, 0x2E, 0x30, 0x32)]
+        {
+            let mut header = vec![0u8; shstrndx_at + 2];
+            header[..4].copy_from_slice(b"\x7fELF");
+            header[4] = class;
+            header[5] = 1; // little-endian
+            header[shoff_at] = 0x10;
+            header[shentsize_at] = 0x40;
+            header[shnum_at] = 5;
+            header[shstrndx_at] = 3;
+            // Section table at 0x10 + 5 * 0x40 ends past EOF: detach it.
+            let patched = elf_without_truncated_section_headers(&header).expect("detached");
+            assert_eq!(
+                [patched[shoff_at], patched[shnum_at], patched[shstrndx_at]],
+                [0, 0, 0]
+            );
+            assert_eq!(patched[shentsize_at], 0x40);
+            for len in [shstrndx_at, shstrndx_at + 1] {
+                assert_eq!(elf_without_truncated_section_headers(&header[..len]), None);
+            }
+        }
     }
 
     #[test]

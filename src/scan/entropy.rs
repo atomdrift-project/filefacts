@@ -9,7 +9,9 @@
 pub(crate) fn histogram(bytes: &[u8]) -> [u64; 256] {
     let mut h = [0u64; 256];
     for &b in bytes {
-        h[b as usize] += 1;
+        if let Some(count) = h.get_mut(usize::from(b)) {
+            *count += 1;
+        }
     }
     h
 }
@@ -114,9 +116,11 @@ pub(crate) fn windowed(bytes: &[u8]) -> WindowedEntropy {
     for window in bytes.chunks(WINDOW_BYTES) {
         let mut hist = [0u64; 256];
         for &b in window {
-            let bi = b as usize;
-            hist[bi] += 1;
-            global[bi] += 1;
+            let bi = usize::from(b);
+            if let (Some(local), Some(total)) = (hist.get_mut(bi), global.get_mut(bi)) {
+                *local += 1;
+                *total += 1;
+            }
         }
         windows.push(shannon_from_histogram(&hist, window.len()));
     }

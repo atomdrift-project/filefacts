@@ -1086,21 +1086,20 @@ fn home_finder() -> &'static AhoCorasick {
 fn home_path_scan(bytes: &[u8]) -> Option<String> {
     let m = home_finder().find(bytes)?;
     let windows = m.pattern().as_usize() == 2;
-    let tail = &bytes[m.start()..];
     let is_path_byte = if windows {
         is_win_path_byte
     } else {
         is_unix_path_byte
     };
-    let end = tail
-        .iter()
-        .position(|&b| !is_path_byte(b))
-        .unwrap_or(tail.len());
+    let path = bytes
+        .get(m.start()..)?
+        .split(|&b| !is_path_byte(b))
+        .next()?;
     // Require at least one path byte past the prefix (a real username).
-    if end <= m.end() - m.start() {
+    if path.len() <= m.len() {
         return None;
     }
-    std::str::from_utf8(&tail[..end]).ok().map(str::to_string)
+    std::str::from_utf8(path).ok().map(str::to_string)
 }
 
 fn is_unix_path_byte(b: u8) -> bool {
@@ -1295,14 +1294,12 @@ fn split_contact(name: Option<&str>, email: Option<&str>) -> (Option<String>, Op
 /// value up to the next whitespace / control byte.
 fn scan_token(bytes: &[u8], needle: &[u8]) -> Option<String> {
     let pos = memchr::memmem::find(bytes, needle)?;
-    let after = &bytes[pos + needle.len()..];
+    let after = bytes.get(pos + needle.len()..)?;
     let start = after.iter().position(|&b| b != b' ' && b != b'\t')?;
-    let value = &after[start..];
-    let end = value
-        .iter()
-        .position(|&b| b <= b' ' || b == 0x7f)
-        .unwrap_or(value.len());
-    let token = &value[..end];
+    let token = after
+        .get(start..)?
+        .split(|&b| b <= b' ' || b == 0x7f)
+        .next()?;
     if token.is_empty() {
         return None;
     }
@@ -1437,18 +1434,24 @@ fn split_name_version(base: &str) -> Option<(&str, &str)> {
 /// Strip a leading `YYYY-MM-DD-` date stamp, digit-bounded so version-like
 /// names ("2020-vision") survive intact.
 fn strip_date_prefix(stem: &str) -> &str {
-    let b = stem.as_bytes();
+    let Some((date, rest)) = stem.as_bytes().split_first_chunk::<11>() else {
+        return stem;
+    };
     // Shape first — digits where digits belong, dashes at 4, 7 and 10 — then
     // the cheap plausibility bounds: a 1000s/2000s year, month < 20, day < 40.
-    let stamped = b.len() > 11
-        && b[..11].iter().enumerate().all(|(i, &c)| match i {
+    let stamped = !rest.is_empty()
+        && date.iter().enumerate().all(|(i, &c)| match i {
             4 | 7 | 10 => c == b'-',
             _ => c.is_ascii_digit(),
         })
-        && matches!(b[0], b'1' | b'2')
-        && b[5] <= b'1'
-        && b[8] <= b'3';
-    if stamped { &stem[11..] } else { stem }
+        && matches!(date[0], b'1' | b'2')
+        && date[5] <= b'1'
+        && date[8] <= b'3';
+    if stamped {
+        stem.get(11..).unwrap_or(stem)
+    } else {
+        stem
+    }
 }
 
 fn get_str<'a>(values: &'a Values, key: &str) -> Option<&'a str> {

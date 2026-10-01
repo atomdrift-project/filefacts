@@ -8,15 +8,30 @@
 use crate::metric;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
+use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_value};
+use crate::bytes;
 use crate::error::Error;
-use crate::output::{ArchiveMember, Metrics, Values};
+use crate::output::{ArchiveCompression, ArchiveMember, ArchiveOffsets, Metrics, Values};
 
-fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32, Error> {
-    let chunk = bytes
-        .get(offset..offset + 4)
-        .ok_or_else(|| Error::malformed("asar", "truncated header"))?;
-    Ok(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-}
+/// The shared aggregates an ASAR reports, over its file entries. Directories
+/// are implicit nodes of the header tree rather than members, so their count
+/// is kept by the walk.
+const AGGS: &[Agg] = &[
+    Agg::MemberCount,
+    Agg::FileCount,
+    Agg::UncompressedSize(Scope::All),
+    Agg::CompressedSize,
+    Agg::MaxFilenameLength,
+    Agg::Scripts,
+    Agg::NestedArchives,
+];
+
+/// An ASAR member's published value has never carried the (always
+/// `stored`) compression fields; they are on the typed member only.
+const SHAPE: Shape = Shape {
+    compression: false,
+    ..Shape::FULL
+};
 
 fn parse_offset(value: &JsonValue) -> Option<u64> {
     match value {
@@ -64,13 +79,15 @@ struct AsarIndex {
 }
 
 fn parse_index(bytes: &[u8]) -> Result<AsarIndex, Error> {
-    if bytes.len() < 16 {
+    // Pickle size, header size, pickle payload size, JSON string length.
+    let (Some(pickle_field_size), Some(header_size), Some(json_size)) = (
+        bytes::u32_le(bytes, 0),
+        bytes::u32_le(bytes, 4),
+        bytes::u32_le(bytes, 12),
+    ) else {
         return Err(Error::malformed("asar", "truncated header"));
-    }
-
-    let pickle_field_size = read_u32_le(bytes, 0)?;
-    let header_size = read_u32_le(bytes, 4)? as usize;
-    let json_size = read_u32_le(bytes, 12)? as usize;
+    };
+    let (header_size, json_size) = (header_size as usize, json_size as usize);
     if pickle_field_size != 4 {
         return Err(Error::malformed("asar", "unexpected pickle header"));
     }
@@ -81,11 +98,12 @@ fn parse_index(bytes: &[u8]) -> Result<AsarIndex, Error> {
     let data_offset = 8usize
         .checked_add(header_size)
         .ok_or_else(|| Error::malformed("asar", "data offset overflow"))?;
-    if header_end > bytes.len() || data_offset > bytes.len() || data_offset < header_end {
-        return Err(Error::malformed("asar", "header extends past end of file"));
-    }
+    let json = bytes
+        .get(16..header_end)
+        .filter(|_| data_offset <= bytes.len() && data_offset >= header_end)
+        .ok_or_else(|| Error::malformed("asar", "header extends past end of file"))?;
 
-    let header: JsonValue = serde_json::from_slice(&bytes[16..header_end])
+    let header: JsonValue = serde_json::from_slice(json)
         .map_err(|e| Error::malformed("asar", format!("invalid header json: {e}")))?;
     let files = header
         .get("files")
@@ -100,20 +118,20 @@ fn parse_index(bytes: &[u8]) -> Result<AsarIndex, Error> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// What the header-tree walk accumulates.
+struct Walk {
+    data_offset: u64,
+    members: Vec<JsonValue>,
+    stats: ArchiveStats,
+    directory_count: u64,
+}
+
 fn walk_files(
     prefix: &str,
     files: &JsonMap<String, JsonValue>,
-    data_offset: u64,
-    members: &mut Vec<JsonValue>,
+    walk: &mut Walk,
     archive_members: &mut Vec<ArchiveMember>,
-    file_count: &mut u64,
-    directory_count: &mut u64,
-    total_uncompressed: &mut u64,
-    max_filename_length: &mut u64,
-    script_count: &mut u64,
-    nested_archive_count: &mut u64,
-) -> Result<(), Error> {
+) {
     for (name, node) in files {
         let path = path_join(prefix, name);
         let Some(obj) = node.as_object() else {
@@ -121,20 +139,8 @@ fn walk_files(
         };
 
         if let Some(children) = obj.get("files").and_then(JsonValue::as_object) {
-            *directory_count += 1;
-            walk_files(
-                &path,
-                children,
-                data_offset,
-                members,
-                archive_members,
-                file_count,
-                directory_count,
-                total_uncompressed,
-                max_filename_length,
-                script_count,
-                nested_archive_count,
-            )?;
+            walk.directory_count += 1;
+            walk_files(&path, children, walk, archive_members);
             continue;
         }
 
@@ -145,58 +151,49 @@ fn walk_files(
             .get("unpacked")
             .and_then(JsonValue::as_bool)
             .unwrap_or(false);
-        let offset = obj.get("offset").and_then(parse_offset);
-        let data_start = offset.and_then(|o| data_offset.checked_add(o));
+        let data_start = obj
+            .get("offset")
+            .and_then(parse_offset)
+            .and_then(|o| walk.data_offset.checked_add(o));
 
-        *file_count += 1;
-        *total_uncompressed = total_uncompressed.saturating_add(size);
-        *max_filename_length = (*max_filename_length).max(path.len() as u64);
-        if looks_script(&path) {
-            *script_count += 1;
-        }
-        if looks_nested_archive(&path) {
-            *nested_archive_count += 1;
-        }
+        let member = ArchiveMember {
+            path,
+            size_bytes: size,
+            entry_type: Some("regular".to_string()),
+            mtime_unix: None,
+            linkname: None,
+            host_os: None,
+            crc32: None,
+            encrypted: false,
+            compression: Some(ArchiveCompression {
+                compressed_size: Some(size),
+                method: Some("stored".to_string()),
+            }),
+            ownership: None,
+            offsets: ArchiveOffsets {
+                header: None,
+                data: data_start,
+                central_header: None,
+            },
+        };
+        // ASAR keeps its own Electron-oriented script and archive suffixes.
+        let mut reading = Reading::of(&member);
+        reading.class.is_script = looks_script(&member.path);
+        reading.class.is_nested_archive = looks_nested_archive(&member.path);
+        walk.stats.observe(&member, &reading);
 
-        let mut member = JsonMap::new();
-        member.insert("path".into(), JsonValue::String(path.clone()));
-        member.insert("size_bytes".into(), JsonValue::Number(size.into()));
-        member.insert("entry_type".into(), JsonValue::String("regular".into()));
+        let mut value = member_value(&member, SHAPE);
         if unpacked {
-            member.insert("unpacked".into(), JsonValue::Bool(true));
+            value.insert("unpacked".into(), JsonValue::Bool(true));
         }
-        if let Some(start) = data_start {
-            member.insert("data_offset".into(), JsonValue::Number(start.into()));
-        }
-        members.push(JsonValue::Object(member));
+        walk.members.push(JsonValue::Object(value));
 
-        if unpacked {
-            continue;
-        }
-        if let Some(start) = data_start {
-            archive_members.push(ArchiveMember {
-                path,
-                size_bytes: size,
-                entry_type: Some("regular".to_string()),
-                mtime_unix: None,
-                linkname: None,
-                host_os: None,
-                crc32: None,
-                encrypted: false,
-                compression: Some(crate::output::ArchiveCompression {
-                    compressed_size: Some(size),
-                    method: Some("stored".to_string()),
-                }),
-                ownership: None,
-                offsets: crate::output::ArchiveOffsets {
-                    header: None,
-                    data: Some(start),
-                    central_header: None,
-                },
-            });
+        // An unpacked member lives beside the archive, and one without an
+        // offset has no bytes here: neither is a slice of the input.
+        if !unpacked && data_start.is_some() {
+            archive_members.push(member);
         }
     }
-    Ok(())
 }
 
 pub(super) fn extract(
@@ -209,29 +206,18 @@ pub(super) fn extract(
     values.insert("archive.format.kind", JsonValue::String("asar".into()));
     metrics.insert(metric!("archive.header_size"), index.header_size as f64);
 
-    let mut members = Vec::new();
-    let mut file_count = 0u64;
-    let mut directory_count = 0u64;
-    let mut total_uncompressed = 0u64;
-    let mut max_filename_length = 0u64;
-    let mut script_count = 0u64;
-    let mut nested_archive_count = 0u64;
+    let mut walk = Walk {
+        data_offset: index.data_offset,
+        members: Vec::new(),
+        stats: ArchiveStats::new(AGGS),
+        directory_count: 0,
+    };
+    walk_files("", &index.files, &mut walk, archive_members);
 
-    walk_files(
-        "",
-        &index.files,
-        index.data_offset,
-        &mut members,
-        archive_members,
-        &mut file_count,
-        &mut directory_count,
-        &mut total_uncompressed,
-        &mut max_filename_length,
-        &mut script_count,
-        &mut nested_archive_count,
-    )?;
-
-    values.insert("archive.members", JsonValue::Array(members));
+    values.insert("archive.members", JsonValue::Array(walk.members));
+    walk.stats.emit(values, metrics);
+    // One entry type and one method by construction, declared even for an
+    // archive with no files.
     values.insert(
         "archive.format.entry_types",
         JsonValue::Array(vec![JsonValue::String("regular".into())]),
@@ -240,27 +226,13 @@ pub(super) fn extract(
         "archive.compression.methods",
         JsonValue::Array(vec![JsonValue::String("stored".into())]),
     );
-
-    metrics.insert(metric!("archive.member_count"), file_count as f64);
-    metrics.insert(metric!("archive.file_count"), file_count as f64);
-    metrics.insert(metric!("archive.directory_count"), directory_count as f64);
     metrics.insert(
-        metric!("archive.uncompressed_size"),
-        total_uncompressed as f64,
+        metric!("archive.directory_count"),
+        walk.directory_count as f64,
     );
     metrics.insert(
-        metric!("archive.compressed_size"),
-        total_uncompressed as f64,
-    );
-    metrics.insert(metric!("archive.format.regular_count"), file_count as f64);
-    metrics.insert(
-        metric!("archive.max_filename_length"),
-        max_filename_length as f64,
-    );
-    metrics.insert(metric!("archive.script_count"), script_count as f64);
-    metrics.insert(
-        metric!("archive.nested_archive_count"),
-        nested_archive_count as f64,
+        metric!("archive.format.regular_count"),
+        walk.stats.member_count() as f64,
     );
 
     Ok(())

@@ -109,7 +109,8 @@ pub fn go_source_context(sources: &[(String, String)], incomplete: bool) -> Valu
                 let inputs: Vec<_> = selected.iter().map(|(p, s, _, _)| (*p, *s)).collect();
                 let facts = crate::go_package_payload_flow(&inputs);
                 let mut behaviors = BTreeSet::new();
-                for file in facts["files"].as_array().into_iter().flatten() {
+                let files = facts.get("files").and_then(Value::as_array);
+                for file in files.into_iter().flatten() {
                     for (pointer, prefix) in [
                         ("/facts/source/go/initialization_events", "initialization"),
                         ("/facts/source/payload_flow/events", "runtime"),
@@ -120,14 +121,15 @@ pub fn go_source_context(sources: &[(String, String)], incomplete: bool) -> Valu
                             .into_iter()
                             .flatten()
                         {
-                            if let Some(kind) = event["kind"].as_str() {
+                            if let Some(kind) = event.get("kind").and_then(Value::as_str) {
                                 behaviors.insert(format!("{prefix}-{kind}"));
                             }
                         }
                     }
                 }
-                truncated |= facts["truncated"] == true;
-                packages.push(json!({"directory":directory,"package":package,"phase":if test {"test"} else {"runtime"},"variant":variant,"members":inputs.iter().map(|(p,_)|p).collect::<Vec<_>>(),"behaviors":behaviors,"truncated":facts["truncated"]}));
+                let facts_truncated = facts.get("truncated");
+                truncated |= facts_truncated.and_then(Value::as_bool) == Some(true);
+                packages.push(json!({"directory":directory,"package":package,"phase":if test {"test"} else {"runtime"},"variant":variant,"members":inputs.iter().map(|(p,_)|p).collect::<Vec<_>>(),"behaviors":behaviors,"truncated":facts_truncated}));
             }
         }
     }

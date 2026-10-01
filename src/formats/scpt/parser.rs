@@ -65,6 +65,10 @@
 //! OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //! SOFTWARE.
 
+use std::fmt::Write as _;
+
+use crate::bytes;
+
 #[derive(Debug)]
 pub(super) struct Node {
     pub offset: usize,
@@ -111,9 +115,11 @@ struct Pending {
     next: usize,
 }
 
-struct Reader<'a> {
+/// Parse state over the stream. `input` is the read cursor; `bytes` is kept
+/// only so the header can find the end of a shebang line.
+struct Parser<'a> {
     bytes: &'a [u8],
-    pos: usize,
+    input: bytes::Reader<'a>,
     nodes: Vec<Node>,
     refs: Vec<Option<usize>>,
     pending: Vec<Pending>,
@@ -145,26 +151,32 @@ impl std::fmt::Display for ParseError {
 }
 
 pub(super) fn parse(bytes: &[u8]) -> Result<Parsed, ParseError> {
-    let mut reader = Reader::new(bytes)?;
+    let mut parser = Parser::new(bytes)?;
     // A file that cannot produce a header or a root object is not a readable
     // FAS stream at all; there is nothing partial to hand back. Everything
     // after this point is recoverable.
-    let version = reader.header()?;
-    let root = reader.object(0)?;
+    let version = parser.header()?;
+    let root = parser.object(0)?;
     let mut truncated = None;
-    while let Some(frame) = reader.pending.last_mut() {
+    while let Some(frame) = parser.pending.last_mut() {
         if frame.next == frame.count {
-            reader.pending.pop();
+            parser.pending.pop();
             continue;
         }
         let parent = frame.node;
         let pos = frame.refs + frame.next * 2;
         frame.next += 1;
         // The entire reference slice was bounds-checked before queuing it.
-        let id = i16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
-        let child = match usize::try_from(id).ok().and_then(|id| reader.refs[id]) {
+        let Some(&id) = bytes.get(pos..).and_then(<[u8]>::first_chunk) else {
+            return Err(parser.error("truncated reference"));
+        };
+        let id = i16::from_be_bytes(id);
+        let child = match usize::try_from(id)
+            .ok()
+            .and_then(|id| parser.refs.get(id).copied().flatten())
+        {
             Some(node) => node,
-            None => match reader.object(id) {
+            None => match parser.object(id) {
                 Ok(node) => node,
                 // A budget we imposed is not the file's fault, and failing the
                 // whole extraction over one handed an attacker a way to erase
@@ -185,20 +197,24 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Parsed, ParseError> {
                 Err(error) => return Err(error),
             },
         };
-        if let Value::Vector { items, .. } = &mut reader.nodes[parent].value {
+        if let Some(Node {
+            value: Value::Vector { items, .. },
+            ..
+        }) = parser.nodes.get_mut(parent)
+        {
             // Capacity for every edge, including metadata, was reserved once.
             items.push(child);
         }
     }
     Ok(Parsed {
-        nodes: reader.nodes,
+        nodes: parser.nodes,
         root,
         version,
         truncated,
     })
 }
 
-impl<'a> Reader<'a> {
+impl<'a> Parser<'a> {
     fn new(bytes: &'a [u8]) -> Result<Self, ParseError> {
         if bytes.len() > MAX_INPUT {
             return Err(ParseError::Budget {
@@ -215,7 +231,7 @@ impl<'a> Reader<'a> {
         refs.resize(REF_SLOTS, None);
         Ok(Self {
             bytes,
-            pos: 0,
+            input: bytes::Reader::new(bytes),
             nodes: Vec::new(),
             refs,
             pending: Vec::new(),
@@ -226,62 +242,69 @@ impl<'a> Reader<'a> {
 
     fn error(&self, reason: &str) -> ParseError {
         ParseError::Malformed {
-            offset: self.pos,
+            offset: self.input.pos(),
             reason: reason.into(),
         }
     }
 
     fn over_budget(&self, limit: &'static str) -> ParseError {
         ParseError::Budget {
-            offset: self.pos,
+            offset: self.input.pos(),
             limit,
         }
     }
 
+    // A failed read leaves the cursor where it was, so every error below
+    // reports the offset of the field that could not be read.
     fn take(&mut self, size: usize) -> Result<&'a [u8], ParseError> {
-        let end = self
-            .pos
-            .checked_add(size)
-            .ok_or_else(|| self.error("size overflow"))?;
-        let data = self
-            .bytes
-            .get(self.pos..end)
-            .ok_or_else(|| self.error("truncated input"))?;
-        self.pos = end;
-        Ok(data)
+        if self.input.pos().checked_add(size).is_none() {
+            return Err(self.error("size overflow"));
+        }
+        self.input
+            .bytes(size)
+            .ok_or_else(|| self.error("truncated input"))
+    }
+
+    // The position never passes the 64 MiB input cap, so a fixed-width read
+    // cannot overflow it and running short is the only failure.
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], ParseError> {
+        self.input
+            .array()
+            .ok_or_else(|| self.error("truncated input"))
     }
 
     fn u8(&mut self) -> Result<u8, ParseError> {
-        Ok(self.take(1)?[0])
+        self.input.u8().ok_or_else(|| self.error("truncated input"))
     }
 
     fn u16(&mut self) -> Result<u16, ParseError> {
-        let b = self.take(2)?;
-        Ok(u16::from_be_bytes([b[0], b[1]]))
+        self.input
+            .u16_be()
+            .ok_or_else(|| self.error("truncated input"))
     }
 
     fn u32(&mut self) -> Result<u32, ParseError> {
-        let b = self.take(4)?;
-        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+        self.input
+            .u32_be()
+            .ok_or_else(|| self.error("truncated input"))
     }
 
     fn u64(&mut self) -> Result<u64, ParseError> {
-        let b = self.take(8)?;
-        Ok(u64::from_be_bytes([
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        ]))
+        self.input
+            .u64_be()
+            .ok_or_else(|| self.error("truncated input"))
     }
 
     fn header(&mut self) -> Result<String, ParseError> {
         if self.bytes.starts_with(b"#!") {
-            self.pos = self
+            let newline = self
                 .bytes
                 .iter()
                 .position(|&b| b == b'\n')
-                .ok_or_else(|| self.error("unterminated shebang"))?
-                + 1;
+                .ok_or_else(|| self.error("unterminated shebang"))?;
+            self.input = bytes::Reader::at(self.bytes, newline + 1);
         }
-        if self.take(8)? != b"FasdUAS " {
+        if self.array()? != *b"FasdUAS " {
             return Err(self.error("expected FasdUAS magic"));
         }
         let outer = self.version_word()?;
@@ -297,15 +320,14 @@ impl<'a> Reader<'a> {
     }
 
     fn version_word(&mut self) -> Result<[u8; 4], ParseError> {
-        let b = self.take(4)?;
-        if !b[0].is_ascii_digit()
-            || b[1] != b'.'
-            || !b[2].is_ascii_digit()
-            || !b[3].is_ascii_digit()
-        {
-            return Err(self.error("malformed version word"));
+        match self.array()? {
+            [major, b'.', minor, patch]
+                if major.is_ascii_digit() && minor.is_ascii_digit() && patch.is_ascii_digit() =>
+            {
+                Ok([major, b'.', minor, patch])
+            }
+            _ => Err(self.error("malformed version word")),
         }
-        Ok([b[0], b[1], b[2], b[3]])
     }
 
     fn add(&mut self, offset: usize, value: Value) -> Result<usize, ParseError> {
@@ -329,7 +351,7 @@ impl<'a> Reader<'a> {
     }
 
     fn payload(&mut self, tag: Option<u8>, size: usize) -> Result<Node, ParseError> {
-        let offset = self.pos;
+        let offset = self.input.pos();
         let bytes = self.take(size)?;
         self.charge_data(size)?;
         let mut data = Vec::new();
@@ -358,7 +380,7 @@ impl<'a> Reader<'a> {
         if count != 0 && self.pending.len() >= MAX_DEPTH {
             return Err(self.over_budget("nesting"));
         }
-        let refs = self.pos;
+        let refs = self.input.pos();
         self.take(
             count
                 .checked_mul(2)
@@ -369,10 +391,15 @@ impl<'a> Reader<'a> {
             .try_reserve_exact(total)
             .map_err(|_| self.error("vector allocation failed"))?;
         self.edges += total;
+        let Some(offset) = self.nodes.get(node).map(|n| n.offset) else {
+            return Err(self.error("vector node out of range"));
+        };
         for &value in metadata {
-            items.push(self.add(self.nodes[node].offset, Value::Int(i64::from(value)))?);
+            items.push(self.add(offset, Value::Int(i64::from(value)))?);
         }
-        self.nodes[node].value = Value::Vector { tag, items };
+        if let Some(entry) = self.nodes.get_mut(node) {
+            entry.value = Value::Vector { tag, items };
+        }
         if count != 0 {
             self.pending
                 .try_reserve(1)
@@ -425,25 +452,24 @@ impl<'a> Reader<'a> {
             (11, 8) => Ok(Value::Constant(self.u64()?)),
             (10 | 47, 4) => Ok(Value::Constant(u64::from(self.u32()?))),
             (46, 24) => {
-                let bytes = self.take(24)?;
+                let bytes: [u8; 24] = self.array()?;
                 const CAPACITY: usize = 8 * 4 + 1;
                 self.charge_data(CAPACITY)?;
                 let mut event = String::new();
                 event
                     .try_reserve_exact(CAPACITY)
                     .map_err(|_| self.error("event allocation failed"))?;
-                for field in [0, 1] {
+                // The class and event FourCCs; the four remaining words are
+                // not exposed.
+                for fourcc in bytes.as_chunks::<4>().0.iter().take(2) {
                     if !event.is_empty() {
                         event.push('.');
                     }
-                    for &b in &bytes[field * 4..field * 4 + 4] {
+                    for &b in fourcc {
                         if (b' '..=b'~').contains(&b) && b != b'.' && b != b'\\' {
                             event.push(char::from(b));
                         } else {
-                            const HEX: &[u8; 16] = b"0123456789abcdef";
-                            event.push_str("\\x");
-                            event.push(char::from(HEX[usize::from(b >> 4)]));
-                            event.push(char::from(HEX[usize::from(b & 15)]));
+                            let _ = write!(event, "\\x{b:02x}");
                         }
                     }
                 }
@@ -455,7 +481,7 @@ impl<'a> Reader<'a> {
     }
 
     fn object(&mut self, expected: i16) -> Result<usize, ParseError> {
-        let offset = self.pos;
+        let offset = self.input.pos();
         let kind = self.u8()?;
         let reference = self.u16()? as i16;
         let size = usize::from(self.u16()?);
@@ -466,9 +492,12 @@ impl<'a> Reader<'a> {
             });
         }
         let node = self.add(offset, Value::Unknown)?;
-        if reference >= 0 {
-            // Pre-register even an unfinished vector so back edges resolve.
-            self.refs[reference as usize] = Some(node);
+        // Pre-register even an unfinished vector so back edges resolve. A
+        // nonnegative 16-bit ID always has a slot.
+        if let Ok(reference) = usize::try_from(reference)
+            && let Some(slot) = self.refs.get_mut(reference)
+        {
+            *slot = Some(node);
         }
         let value = match kind {
             1 if size == 0 => Value::Unknown, // NIL, not an unresolved edge.
@@ -492,7 +521,10 @@ impl<'a> Reader<'a> {
             }
             7 if size == 4 => Value::Int(i64::from(self.u32()? as i32)),
             8 if size == 8 => {
-                self.nodes[node] = self.payload(None, size)?;
+                let payload = self.payload(None, size)?;
+                if let Some(entry) = self.nodes.get_mut(node) {
+                    *entry = payload;
+                }
                 return Ok(node);
             }
             7 | 8 => return Err(self.error("invalid integer or float size")),
@@ -507,10 +539,18 @@ impl<'a> Reader<'a> {
                 let text = self.payload(Some(0xb1), len)?;
                 let len = usize::from(self.u16()?);
                 let style = self.payload(None, len)?;
-                if let Value::Vector { items, .. } = &self.nodes[node].value {
-                    let (a, b) = (items[0], items[1]);
-                    self.nodes[a] = text;
-                    self.nodes[b] = style;
+                if let Some(Node {
+                    value: Value::Vector { items, .. },
+                    ..
+                }) = self.nodes.get(node)
+                    && let &[a, b] = items.as_slice()
+                {
+                    if let Some(entry) = self.nodes.get_mut(a) {
+                        *entry = text;
+                    }
+                    if let Some(entry) = self.nodes.get_mut(b) {
+                        *entry = style;
+                    }
                 }
                 return Ok(node);
             }
@@ -538,7 +578,10 @@ impl<'a> Reader<'a> {
                 if kind == 15 && tag == Some(8) && size < 94 {
                     return Err(self.error("application descriptor shorter than 94 bytes"));
                 }
-                self.nodes[node] = self.payload(tag, size)?;
+                let payload = self.payload(tag, size)?;
+                if let Some(entry) = self.nodes.get_mut(node) {
+                    *entry = payload;
+                }
                 return Ok(node);
             }
             _ => {
@@ -548,7 +591,9 @@ impl<'a> Reader<'a> {
                 });
             }
         };
-        self.nodes[node].value = value;
+        if let Some(entry) = self.nodes.get_mut(node) {
+            entry.value = value;
+        }
         Ok(node)
     }
 }

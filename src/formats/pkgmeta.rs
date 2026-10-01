@@ -17,6 +17,7 @@
 use serde_json::{Map, Value as JsonValue};
 
 use crate::Values;
+use crate::output::{Errors, Stage};
 
 /// Fields that are conventionally arrays in a PKGBUILD/.SRCINFO, so we always
 /// emit them as arrays (even with a single element) for stable comparison.
@@ -178,12 +179,10 @@ fn github_owner(s: &str) -> Option<String> {
 /// Strip surrounding single/double quotes from a bash word.
 fn unquote(s: &str) -> &str {
     let s = s.trim();
-    let b = s.as_bytes();
-    if b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {
-        &s[1..s.len() - 1]
-    } else {
-        s
-    }
+    ['"', '\'']
+        .into_iter()
+        .find_map(|q| s.strip_prefix(q)?.strip_suffix(q))
+        .unwrap_or(s)
 }
 
 /// Split a bash array body (`'a' "b" c`) into elements, honoring simple quoting.
@@ -246,9 +245,20 @@ pub(super) fn extract_srcinfo(bytes: &[u8], values: &mut Values) -> Result<(), c
 /// multi-line array body. It does not evaluate the shell (no `$pkgver`
 /// expansion); raw tokens are recorded, which is what a field-vs-field
 /// comparison against `.SRCINFO` needs.
-pub(super) fn extract_pkgbuild(bytes: &[u8], values: &mut Values) -> Result<(), crate::Error> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|e| crate::Error::malformed("pkgbuild", format!("input is not utf-8: {e}")))?;
+///
+/// This layers on the shell source extraction, so a failure here is
+/// recorded in `errors` rather than returned: the source facts stand.
+pub(super) fn extract_pkgbuild(bytes: &[u8], values: &mut Values, errors: &mut Errors) {
+    let text = match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(e) => {
+            errors.record_malformed(
+                Stage::FormatExtract,
+                format!("PKGBUILD is not UTF-8; pkg.* fields not read: {e}"),
+            );
+            return;
+        }
+    };
     let mut root: Map<String, JsonValue> = Map::new();
     let mut lines = text.lines().peekable();
     while let Some(line) = lines.next() {
@@ -294,12 +304,32 @@ pub(super) fn extract_pkgbuild(bytes: &[u8], values: &mut Values) -> Result<(), 
         }
     }
     finalize(root, values);
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run [`extract_pkgbuild`], asserting it records nothing.
+    fn pkgbuild(src: &[u8], values: &mut Values) {
+        let mut errors = Errors::new();
+        extract_pkgbuild(src, values, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn non_utf8_pkgbuild_records_one_error() {
+        let mut v = Values::new();
+        let mut errors = Errors::new();
+        extract_pkgbuild(b"pkgname=foo\npkgdesc=\"caf\xe9\"\n", &mut v, &mut errors);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let e = &errors.as_slice()[0];
+        assert_eq!(
+            (e.stage, e.kind),
+            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+        );
+        assert!(v.get("pkg.pkgname").is_none());
+    }
 
     fn pkg(values: &Values, path: &str) -> String {
         values
@@ -313,7 +343,7 @@ mod tests {
     fn pkgbuild_fields_and_checksum_digest() {
         let src = b"pkgname=foo\npkgver=1.2.3\npkgrel=1\nsource=('a.tar.gz::https://x/v$pkgver.tar.gz')\nsha256sums=('SKIP' 'deadbeef')\n";
         let mut v = Values::new();
-        extract_pkgbuild(src, &mut v).unwrap();
+        pkgbuild(src, &mut v);
         assert_eq!(pkg(&v, "pkgver"), "1.2.3");
         assert_eq!(pkg(&v, "pkgname"), "foo");
         // SKIP excluded; only the real hash drives the digest.
@@ -346,7 +376,7 @@ mod tests {
         // does the compare. Here url=foo but the source repo is attacker/payload.
         let src = b"pkgname=tool-bin\nurl=https://github.com/foo/tool\nsource=('https://github.com/attacker/payload/releases/download/v1/t.tar.gz')\nsha256sums=('SKIP')\n";
         let mut v = Values::new();
-        extract_pkgbuild(src, &mut v).unwrap();
+        pkgbuild(src, &mut v);
         assert_eq!(pkg(&v, "url_github_owner"), "foo");
         assert_eq!(
             v.get("pkg.source_github_owners"),
@@ -362,7 +392,7 @@ mod tests {
         let si = b"pkgbase = x\n\tpkgver = 1.0\n\tsha256sums = bb\n\tsha256sums = aa\n";
         let mut vp = Values::new();
         let mut vs = Values::new();
-        extract_pkgbuild(pb, &mut vp).unwrap();
+        pkgbuild(pb, &mut vp);
         extract_srcinfo(si, &mut vs).unwrap();
         // Sorted+deduped digest is order-independent → equal across both forms.
         assert_eq!(pkg(&vp, "checksums"), pkg(&vs, "checksums"));

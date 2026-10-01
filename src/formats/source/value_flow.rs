@@ -1,5 +1,6 @@
 //! Source-language producer for the shared flow view.
-use super::{MAX_FLOW_DEPTH, ast_walk, langs::LangConfig, named_children};
+use super::langs::{Lang, LangConfig};
+use super::{MAX_FLOW_DEPTH, ast_walk, named_children};
 use crate::{Arg, Flow, FlowFunction, FlowValue, Symbol, Symbols};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tree_sitter::Node;
@@ -64,7 +65,7 @@ impl Builder<'_> {
     /// A Python f-string decodes as a string argument, but its `{…}`
     /// interpolations carry values, so it is evaluated as an expression.
     fn interpolates(&self, node: Node<'_>) -> bool {
-        self.config.name == "python"
+        self.config.lang == Lang::Python
             && named_children(node)
                 .iter()
                 .any(|child| child.kind() == "interpolation")
@@ -147,8 +148,10 @@ impl Builder<'_> {
         ) && !self.interpolates(node)
         {
             let id = self.add("literal", node, Vec::new());
-            if id != 0 {
-                self.flow.values[id].literal = Some(literal);
+            if id != 0
+                && let Some(value) = self.flow.values.get_mut(id)
+            {
+                value.literal = Some(literal);
             }
             return id;
         }
@@ -217,11 +220,7 @@ impl Builder<'_> {
             }
         }
         if self.config.call_kinds.contains(&node.kind()) {
-            let callee = if self.config.name == "perl" && node.kind() == "method_call_expression" {
-                Some(node)
-            } else {
-                node.child_by_field_name(self.config.callee_field)
-            };
+            let callee = self.config.callee(node);
             let mut inputs = Vec::new();
             if self.config.arguments_field == "argument" {
                 let mut cursor = node.walk();
@@ -229,7 +228,7 @@ impl Builder<'_> {
                     inputs.push(self.eval(arg, bindings, returns, depth + 1));
                 }
             } else if let Some(args) = self.config.argument_list(node) {
-                if self.config.name == "perl" && args.kind() != "list_expression" {
+                if self.config.is_single_argument(args) {
                     inputs.push(self.eval(args, bindings, returns, depth + 1));
                 } else {
                     for arg in named_children(args) {
@@ -254,9 +253,11 @@ impl Builder<'_> {
                     }
                 }
             }
-            if id != 0 {
-                self.flow.values[id].target = target;
-                self.flow.values[id].receiver = receiver;
+            if id != 0
+                && let Some(value) = self.flow.values.get_mut(id)
+            {
+                value.target = target;
+                value.receiver = receiver;
             }
             return id;
         }
@@ -291,8 +292,10 @@ impl Builder<'_> {
                 "object"
             };
             let id = self.add(kind, node, Vec::new());
-            if id != 0 {
-                self.flow.values[id].fields = fields;
+            if id != 0
+                && let Some(value) = self.flow.values.get_mut(id)
+            {
+                value.fields = fields;
             }
             return id;
         }
@@ -301,7 +304,7 @@ impl Builder<'_> {
             // in both branches. Short declarations belong to the implicit if
             // scope; ordinary assignments still update the surrounding scope.
             let mut shadowed = HashMap::new();
-            if self.config.name == "go" {
+            if self.config.lang == Lang::Go {
                 if let Some(initializer) = node.child_by_field_name("initializer") {
                     if initializer.kind() == "short_var_declaration" {
                         if let Some(pattern) = initializer.child_by_field_name("left") {
@@ -358,8 +361,14 @@ impl Builder<'_> {
         let scoped = sequential
             && !matches!(node.kind(), "source_file" | "program" | "module")
             && matches!(
-                self.config.name,
-                "rust" | "go" | "javascript" | "typescript" | "c" | "java" | "csharp"
+                self.config.lang,
+                Lang::Rust
+                    | Lang::Go
+                    | Lang::JavaScript
+                    | Lang::TypeScript
+                    | Lang::C
+                    | Lang::Java
+                    | Lang::CSharp
             );
         let before = if scoped {
             bindings.clone()
@@ -418,13 +427,11 @@ impl Builder<'_> {
         if sequential {
             return inputs.last().copied().unwrap_or(0);
         }
-        if inputs.len() == 1 {
-            return inputs[0];
+        match inputs.as_slice() {
+            [] => 0,
+            [only] => *only,
+            _ => self.add("merge", node, inputs),
         }
-        if inputs.is_empty() {
-            return 0;
-        }
-        self.add("merge", node, inputs)
     }
 }
 
@@ -436,7 +443,7 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
         flow: Flow {
             version: 1,
             producer: "tree-sitter".into(),
-            language: config.name.into(),
+            language: config.name().into(),
             ..Default::default()
         },
         steps: 0,
@@ -446,13 +453,13 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
         .flow
         .limitations
         .insert("source-local-may-flow-not-reachability".into());
-    if config.name == "go" {
+    if config.lang == Lang::Go {
         builder.aliases = super::go_syntax::imports(root, source);
     }
     for symbol in symbols {
         if let Symbol::Import { name, alias, .. } = symbol {
             let alias = alias.clone().or_else(|| {
-                (config.name == "rust")
+                (config.lang == Lang::Rust)
                     .then(|| name.rsplit("::").next().unwrap_or(name).to_string())
             });
             if let Some(alias) = alias.filter(|alias| alias != "*") {
@@ -497,7 +504,7 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
                     builder.in_function = true;
                     let tail = builder.eval(body, &mut bindings, &mut function.returns, 0);
                     builder.in_function = false;
-                    if config.name == "rust" {
+                    if config.lang == Lang::Rust {
                         function.returns.push(tail);
                     }
                 }

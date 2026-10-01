@@ -44,6 +44,7 @@ pub(crate) struct ExtractCtx<'a> {
 
 mod apk_alpine;
 mod apk_android;
+mod archive_stats;
 mod asar;
 mod axml;
 mod binary_attribution;
@@ -210,7 +211,7 @@ pub(crate) fn extract(
         FileType::ApkAndroid => {
             let mut archive = zip::open_archive(bytes)?;
             zip::extract_from_archive(&mut archive, bytes, values, metrics, archive_members)?;
-            apk_android::extract_from_archive(&mut archive, values, metrics)
+            apk_android::extract_from_archive(&mut archive, values, metrics, errors)
         }
         FileType::Zip | FileType::Odf | FileType::Conda | FileType::Egg | FileType::Ipa => {
             // Zip-based packages (Android apk, conda, egg, ipa): the generic
@@ -227,7 +228,7 @@ pub(crate) fn extract(
             // `.nuspec` for the nupkg.* NuGet publisher identity.
             let mut archive = zip::open_archive(bytes)?;
             zip::extract_from_archive(&mut archive, bytes, values, metrics, archive_members)?;
-            nupkg::extract_from_archive(&mut archive, values, metrics)
+            nupkg::extract_from_archive(&mut archive, values, metrics, errors)
         }
         FileType::Vsix => {
             // Open the ZIP container once: generic archive facts first,
@@ -235,13 +236,13 @@ pub(crate) fn extract(
             // vsix.identity.* publisher/id/version triple.
             let mut archive = zip::open_archive(bytes)?;
             zip::extract_from_archive(&mut archive, bytes, values, metrics, archive_members)?;
-            vsix::extract_from_archive(&mut archive, values, strings, metrics)
+            vsix::extract_from_archive(&mut archive, values, strings, metrics, errors)
         }
         // CRX is a ZIP with a signed header prepended: walk the ZIP, then
         // decode the header for the public key and derived extension id.
-        FileType::Crx => crx::extract(bytes, values, metrics, archive_members),
+        FileType::Crx => crx::extract(bytes, values, metrics, archive_members, errors),
         FileType::Asar => asar::extract(bytes, values, metrics, archive_members),
-        FileType::Cpio => cpio::extract(bytes, values, archive_members),
+        FileType::Cpio => cpio::extract(bytes, values, metrics, archive_members),
         FileType::Ooxml => {
             // Open the ZIP container once: generic archive facts first,
             // then the OOXML-specific `office.*` layer from the same handle.
@@ -250,18 +251,18 @@ pub(crate) fn extract(
             ooxml::extract_from_archive(&mut archive, values, metrics, errors)?;
             // Decompress macros from any `vbaProject.bin` member so
             // `office.vba.modules[]` is populated for OOXML, mirroring the
-            // OleDoc arm. Best-effort: a macro-free doc leaves it unset.
-            vba::extract_from_zip(&mut archive, values, metrics, symbols);
+            // OleDoc arm. A macro-free doc leaves it unset; a project that
+            // is present but broken is recorded in `errors`.
+            vba::extract_from_zip(&mut archive, values, metrics, symbols, errors);
             Ok(())
         }
         FileType::OleDoc | FileType::Msi => {
             ole2::extract(bytes, values, metrics, errors)?;
-            // VBA module source-text extraction (best-effort).
-            // `vba::extract` is silent on failure — a doc without
-            // macros just leaves `office.vba.*` unpopulated. MSI rarely
-            // carries VBA; the call is still cheap and keeps the OLE2
-            // extract path uniform.
-            vba::extract(bytes, values, metrics, symbols);
+            // VBA module source-text extraction. A doc without macros just
+            // leaves `office.vba.*` unpopulated; a broken project is
+            // recorded in `errors`. MSI rarely carries VBA; the call is
+            // still cheap and keeps the OLE2 extract path uniform.
+            vba::extract(bytes, values, metrics, symbols, errors);
             Ok(())
         }
         FileType::Jar => {
@@ -269,21 +270,21 @@ pub(crate) fn extract(
             // then the JAR-specific surface from the same handle.
             let mut archive = zip::open_archive(bytes)?;
             zip::extract_from_archive(&mut archive, bytes, values, metrics, archive_members)?;
-            jar::extract_from_archive(&mut archive, values, metrics)
+            jar::extract_from_archive(&mut archive, values, metrics, errors)
         }
         FileType::Xpi => {
             // Open the ZIP container once: generic archive facts first,
             // then the XPI-specific signing-shape layer.
             let mut archive = zip::open_archive(bytes)?;
             zip::extract_from_archive(&mut archive, bytes, values, metrics, archive_members)?;
-            xpi::extract_from_archive(&mut archive, values, metrics)
+            xpi::extract_from_archive(&mut archive, values, metrics, errors)
         }
         FileType::Whl => {
             // Open the ZIP container once: generic archive facts first,
             // then the wheel-specific dist-info / RECORD layer.
             let mut archive = zip::open_archive(bytes)?;
             zip::extract_from_archive(&mut archive, bytes, values, metrics, archive_members)?;
-            whl::extract_from_archive(&mut archive, values, metrics)
+            whl::extract_from_archive(&mut archive, values, metrics, errors)
         }
         // Plain and Gentoo binpkg tars are uncompressed — walked in full.
         // Gentoo's nested `metadata.tar.*`/`image.tar.*` identity isn't cheap
@@ -315,20 +316,22 @@ pub(crate) fn extract(
         // A Python sdist is a gzip tar: read `<root>/PKG-INFO` for the
         // python.* publisher identity, then list members (format label only).
         FileType::PythonSdist => {
-            python_sdist::extract(bytes, file_type, values, metrics, archive_members)
+            python_sdist::extract(bytes, file_type, values, metrics, archive_members, errors)
         }
         // An OCI/Docker image is an uncompressed tar: walk it for the member
         // listing, then read the image manifest for the oci.* identity facts.
         FileType::OciImage => {
             tar::extract(bytes, file_type, values, metrics, archive_members)?;
-            oci::extract(bytes, values, metrics)
+            oci::extract(bytes, values, metrics, errors)
         }
         // A Rust `.crate` is a gzipped tar: walk it, then read the embedded
         // `Cargo.toml` for the crate.* publisher identity.
-        FileType::Crate => rust_crate::extract(bytes, file_type, values, metrics, archive_members),
+        FileType::Crate => {
+            rust_crate::extract(bytes, file_type, values, metrics, archive_members, errors)
+        }
         // An npm package is a gzipped tar: walk it for the member listing,
         // then read `package/package.json` for the npm.* publisher identity.
-        FileType::Npm => npm::extract(bytes, file_type, values, metrics, archive_members),
+        FileType::Npm => npm::extract(bytes, file_type, values, metrics, archive_members, errors),
         // A gem is an uncompressed `ustar` tar. Walk it for the generic
         // archive.* surface, then read the gzipped metadata member for the
         // gem.* identity facts (name/version/deps live only in `metadata.gz`).
@@ -361,7 +364,7 @@ pub(crate) fn extract(
         // paths like targets[*].sources[*] and a byte-escaped target `type`
         // still resolve instead of vanishing into a text/raw scan.
         FileType::Gyp => structured::extract_gyp(bytes, values, metrics),
-        FileType::VsixManifest => vsix::extract(bytes, values, strings, metrics),
+        FileType::VsixManifest => vsix::extract(bytes, values, strings, metrics, errors),
         FileType::CargoToml => {
             structured::extract_toml(bytes, values)?;
             let mode = match values.get("package.build") {
@@ -390,7 +393,7 @@ pub(crate) fn extract(
             shellcode::extract(bytes, values, metrics);
             Ok(())
         }
-        FileType::Pdf => pdf::extract(bytes, values, strings, metrics, errors),
+        FileType::Pdf => pdf::extract(bytes, values, strings, metrics),
         FileType::Pickle => pickle::extract(bytes, values, strings, metrics),
         FileType::Font => font::extract(bytes, values, strings, metrics),
         // Media containers: walk the structure, then let carrier::emit turn
@@ -415,8 +418,8 @@ pub(crate) fn extract(
         }
         FileType::Png => png::extract(bytes, values, strings, metrics),
         FileType::PythonBytecode => pyc::extract(bytes, values, strings, metrics),
-        FileType::Rpm => rpm::extract(bytes, values, strings, metrics),
-        FileType::Deb => deb::extract(bytes, values, metrics),
+        FileType::Rpm => rpm::extract(bytes, values, strings, metrics, errors),
+        FileType::Deb => deb::extract(bytes, values, metrics, errors),
         FileType::Dmg => dmg::extract(bytes, values, metrics, archive_members),
         FileType::Iso => iso::extract(bytes, values, metrics, archive_members),
         FileType::Rtf => rtf::extract(bytes, values, strings, metrics),
@@ -459,7 +462,7 @@ pub(crate) fn extract(
                 bytes, file_type, tree_cache, values, strings, metrics, symbols,
             );
             if basename == Some("PKGBUILD") {
-                let _ = pkgmeta::extract_pkgbuild(bytes, values);
+                pkgmeta::extract_pkgbuild(bytes, values, errors);
             }
             r
         }
@@ -539,15 +542,15 @@ pub(crate) fn extract(
     /// cannot expand without bound.
     fn inflate_cws(bytes: &[u8]) -> Option<Vec<u8>> {
         use std::io::Read;
-        if bytes.len() < 8 || !bytes.starts_with(b"CWS") {
+        if !bytes.starts_with(b"CWS") {
             return None;
         }
-        let declared = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
+        let declared = crate::bytes::u32_le(bytes, 4)? as usize;
         if !(8..=1 << 20).contains(&declared) {
             return None;
         }
         let mut out = Vec::new();
-        let mut dec = flate2::read::ZlibDecoder::new(&bytes[8..]).take(declared as u64);
+        let mut dec = flate2::read::ZlibDecoder::new(bytes.get(8..)?).take(declared as u64);
         dec.read_to_end(&mut out).ok()?;
         if out.is_empty() { None } else { Some(out) }
     }

@@ -49,15 +49,15 @@ pub(super) fn extract(
 ) -> Result<(), Error> {
     extract_binary_strings(bytes, strings, XorScan::No);
 
-    // Every RTF starts with `{\rtf<version>`. Bail (parsable as
-    // generic) if the magic is missing.
-    if !bytes.starts_with(b"{\\rtf") {
+    // Canonical RTF starts with a versioned header. A tightly gated malformed
+    // object form is accepted below; other inputs remain generic.
+    if !bytes.starts_with(b"{\\rtf") && !crate::fileid::looks_like_obfuscated_rtf(bytes) {
         return Ok(());
     }
 
     // Header control words sit at the top of the document, before
     // the first group. Scan the first 128 bytes which is plenty.
-    let head = &bytes[..bytes.len().min(128)];
+    let head = bytes.get(..128).unwrap_or(bytes);
     if let Some(version) = parse_numeric_control(head, b"\\rtf") {
         put_str(values, "rtf.version", version);
     }
@@ -84,20 +84,35 @@ pub(super) fn extract(
 /// `\ansicpg1252` → `"1252"`). Negative numbers (`-1`) supported.
 fn parse_numeric_control(bytes: &[u8], cw: &[u8]) -> Option<String> {
     let pos = bytes.windows(cw.len()).position(|w| w == cw)?;
-    let start = pos + cw.len();
-    let mut end = start;
-    if bytes.get(end) == Some(&b'-') {
-        end += 1;
-    }
-    while end < bytes.len() && bytes[end].is_ascii_digit() {
-        end += 1;
-    }
-    if end == start || (end == start + 1 && bytes[start] == b'-') {
+    let tail = bytes.get(pos + cw.len()..)?;
+    let number = tail.get(..param_len(tail))?;
+    // A bare `-` is not a number.
+    if !number.last().is_some_and(u8::is_ascii_digit) {
         return None;
     }
-    std::str::from_utf8(&bytes[start..end])
-        .ok()
-        .map(str::to_string)
+    std::str::from_utf8(number).ok().map(str::to_string)
+}
+
+/// Length of the optional signed numeric parameter at the front of
+/// `bytes`: a `-`, then digits. A bare `-` counts, so callers that need
+/// digits check for them.
+fn param_len(bytes: &[u8]) -> usize {
+    let sign = usize::from(bytes.first() == Some(&b'-'));
+    let digits = bytes
+        .iter()
+        .skip(sign)
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    sign + digits
+}
+
+/// Split the control word at the front of `bytes` (just past its
+/// backslash) into its letters and what follows its optional numeric
+/// parameter.
+fn split_control_word(bytes: &[u8]) -> (&[u8], &[u8]) {
+    let letters = bytes.iter().take_while(|b| b.is_ascii_alphabetic()).count();
+    let (word, rest) = bytes.split_at_checked(letters).unwrap_or((bytes, &[]));
+    (word, rest.get(param_len(rest)..).unwrap_or_default())
 }
 
 /// Pick the first of `\ansi` / `\mac` / `\pc` / `\pca` charset
@@ -135,43 +150,27 @@ fn info_group(bytes: &[u8], values: &mut Values) {
         return;
     };
     let group_end = match_group_end(bytes, info_start);
-    let inner = &bytes[info_start + 1..group_end];
+    let Some(inner) = bytes.get(info_start + 1..group_end) else {
+        return;
+    };
 
     let mut info = serde_json::Map::new();
     // Iterate nested groups inside `\info`.
     let mut i = 0;
-    while i < inner.len() {
-        if inner[i] != b'{' {
-            i += 1;
-            continue;
-        }
-        let child_start = i;
+    while let Some(rel) = inner
+        .get(i..)
+        .and_then(|rest| rest.iter().position(|&b| b == b'{'))
+    {
+        let child_start = i + rel;
         let child_end = match_group_end(inner, child_start);
-        let child = &inner[child_start + 1..child_end];
+        let child = inner.get(child_start + 1..child_end).unwrap_or_default();
         // First control word is the key.
-        if child.first() == Some(&b'\\') {
-            let key_end = child
-                .iter()
-                .skip(1)
-                .position(|b| !b.is_ascii_alphabetic())
-                .map_or(child.len(), |n| 1 + n);
-            let key = std::str::from_utf8(&child[1..key_end])
-                .ok()
-                .map(str::to_lowercase);
+        if let Some(word) = child.strip_prefix(b"\\") {
+            let (key, after) = split_control_word(word);
+            let key = std::str::from_utf8(key).ok().map(str::to_lowercase);
             if let Some(k) = key {
-                // Skip past the control word and its optional
-                // numeric parameter and trailing delimiter.
-                let mut value_start = key_end;
-                if value_start < child.len() && child[value_start] == b'-' {
-                    value_start += 1;
-                }
-                while value_start < child.len() && child[value_start].is_ascii_digit() {
-                    value_start += 1;
-                }
-                if child.get(value_start) == Some(&b' ') {
-                    value_start += 1;
-                }
-                let raw = &child[value_start..];
+                // Skip past the control word's trailing delimiter.
+                let raw = after.strip_prefix(b" ").unwrap_or(after);
                 let value = if matches!(k.as_str(), "creatim" | "revtim" | "printim" | "buptim") {
                     // Date fields are nested control words; return
                     // the raw token sequence (`\yr2024\mo1\dy1`) so
@@ -198,60 +197,41 @@ fn info_group(bytes: &[u8], values: &mut Values) {
 /// control word.
 fn decode_text(bytes: &[u8]) -> String {
     let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => {
-                let next = bytes.get(i + 1).copied().unwrap_or(b' ');
-                match next {
-                    b'\\' | b'{' | b'}' => {
-                        out.push(next);
-                        i += 2;
-                    }
-                    b'\'' => {
-                        // Hex escape `\'XX`.
-                        if i + 3 < bytes.len() {
-                            let hi = hex_nibble(bytes[i + 2]);
-                            let lo = hex_nibble(bytes[i + 3]);
-                            if let (Some(h), Some(l)) = (hi, lo) {
-                                out.push((h << 4) | l);
-                                i += 4;
-                                continue;
-                            }
-                        }
-                        i += 2;
-                    }
-                    b'~' | b'-' | b'_' => {
-                        out.push(b' ');
-                        i += 2;
-                    }
-                    _ if next.is_ascii_alphabetic() => {
-                        // Generic control word — skip the letters
-                        // and its optional numeric parameter.
-                        let mut j = i + 1;
-                        while j < bytes.len() && bytes[j].is_ascii_alphabetic() {
-                            j += 1;
-                        }
-                        if j < bytes.len() && bytes[j] == b'-' {
-                            j += 1;
-                        }
-                        while j < bytes.len() && bytes[j].is_ascii_digit() {
-                            j += 1;
-                        }
-                        if j < bytes.len() && bytes[j] == b' ' {
-                            j += 1;
-                        }
-                        i = j;
-                    }
-                    _ => i += 2,
+    let mut rest = bytes;
+    while let Some((&b, after)) = rest.split_first() {
+        rest = match (b, after) {
+            (b'\\', [next @ (b'\\' | b'{' | b'}'), tail @ ..]) => {
+                out.push(*next);
+                tail
+            }
+            (b'\\', [b'\'', tail @ ..]) => {
+                // Hex escape `\'XX`.
+                if let [hi, lo, hex_tail @ ..] = tail
+                    && let (Some(h), Some(l)) = (hex_nibble(*hi), hex_nibble(*lo))
+                {
+                    out.push((h << 4) | l);
+                    hex_tail
+                } else {
+                    tail
                 }
             }
-            b'{' | b'}' => i += 1,
-            _ => {
-                out.push(bytes[i]);
-                i += 1;
+            (b'\\', [b'~' | b'-' | b'_', tail @ ..]) => {
+                out.push(b' ');
+                tail
             }
-        }
+            (b'\\', [next, ..]) if next.is_ascii_alphabetic() => {
+                // Generic control word — skip the letters
+                // and its optional numeric parameter.
+                let (_, tail) = split_control_word(after);
+                tail.strip_prefix(b" ").unwrap_or(tail)
+            }
+            (b'\\', _) => after.get(1..).unwrap_or_default(),
+            (b'{' | b'}', _) => after,
+            _ => {
+                out.push(b);
+                after
+            }
+        };
     }
     String::from_utf8_lossy(&out).trim().to_string()
 }
@@ -264,10 +244,7 @@ fn decode_text(bytes: &[u8]) -> String {
 fn fields(bytes: &[u8], values: &mut Values) {
     let mut entries: Vec<JsonValue> = Vec::new();
     let mut pos = 0;
-    while pos < bytes.len() {
-        let Some(rel) = bytes[pos..].windows(8).position(|w| w == b"\\fldinst") else {
-            break;
-        };
+    while let Some(rel) = find_from(bytes, pos, b"\\fldinst") {
         let abs = pos + rel;
         // Require a word boundary after the control word so
         // `\fldinstFoo` (a different control word) doesn't false-match
@@ -287,8 +264,8 @@ fn fields(bytes: &[u8], values: &mut Values) {
         // which already drops nested control words.
         let mut end = cursor;
         let mut depth = 1_i32;
-        while end < bytes.len() {
-            match bytes[end] {
+        while let Some(&b) = bytes.get(end) {
+            match b {
                 b'\\' if matches!(bytes.get(end + 1), Some(b'{') | Some(b'}') | Some(b'\\')) => {
                     end += 2;
                 }
@@ -306,7 +283,7 @@ fn fields(bytes: &[u8], values: &mut Values) {
                 _ => end += 1,
             }
         }
-        let body = decode_text(&bytes[cursor..end]);
+        let body = decode_text(bytes.get(cursor..end).unwrap_or_default());
         let mut parts = body.splitn(2, char::is_whitespace);
         let kind = parts.next().unwrap_or("").trim().to_string();
         let target = parts
@@ -338,28 +315,25 @@ fn fields(bytes: &[u8], values: &mut Values) {
 fn objects(bytes: &[u8], values: &mut Values, strings: &mut Strings, metrics: &mut Metrics) {
     let mut entries: Vec<JsonValue> = Vec::new();
     let mut pos = 0;
-    while pos + 9 <= bytes.len() {
-        let Some(rel) = bytes[pos..].windows(9).position(|w| w == b"\\objclass") else {
-            break;
-        };
+    while let Some(rel) = find_from(bytes, pos, b"\\objclass") {
         let abs = pos + rel;
         let mut cursor = abs + 9;
         if bytes.get(cursor) == Some(&b' ') {
             cursor += 1;
         }
-        let mut end = cursor;
-        while end < bytes.len() && bytes[end] != b'}' && bytes[end] != b'{' && bytes[end] != b'\\' {
-            end += 1;
-        }
-        if end > cursor {
-            if let Ok(class) = std::str::from_utf8(&bytes[cursor..end]) {
-                let trimmed = class.trim();
-                if !trimmed.is_empty() {
-                    entries.push(json!({"class": trimmed}));
-                }
+        let name = bytes
+            .get(cursor..)
+            .unwrap_or_default()
+            .split(|b| matches!(b, b'}' | b'{' | b'\\'))
+            .next()
+            .unwrap_or_default();
+        if let Ok(class) = std::str::from_utf8(name) {
+            let trimmed = class.trim();
+            if !trimmed.is_empty() {
+                entries.push(json!({"class": trimmed}));
             }
         }
-        pos = end.max(abs + 9);
+        pos = (cursor + name.len()).max(abs + 9);
     }
     entries.extend(objdata_objects(bytes, strings, metrics));
     if !entries.is_empty() {
@@ -397,12 +371,11 @@ fn objdata_objects(bytes: &[u8], strings: &mut Strings, metrics: &mut Metrics) -
     let mut count = 0u64;
     let mut decoded_total = 0u64;
     let mut pos = 0usize;
-    while pos + 8 <= bytes.len() && count < MAX_BLOBS as u64 {
-        let Some(rel) = bytes[pos..].windows(8).position(|w| w == b"\\objdata") else {
-            break;
-        };
+    while count < MAX_BLOBS as u64
+        && let Some(rel) = find_from(bytes, pos, b"\\objdata")
+    {
         let start = pos + rel + 8;
-        let decoded = decode_hex_run(&bytes[start..], MAX_HEX, MAX_DECODED);
+        let decoded = decode_hex_run(bytes.get(start..).unwrap_or_default(), MAX_HEX, MAX_DECODED);
         pos = start;
         if decoded.is_empty() {
             continue;
@@ -465,10 +438,7 @@ fn ole1_header(data: &[u8]) -> Option<JsonValue> {
     /// read out of something that is not a header.
     const MAX_NAME: usize = 256;
 
-    let u32_at = |off: usize| -> Option<usize> {
-        let b = data.get(off..off + 4)?;
-        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
-    };
+    let u32_at = |off: usize| crate::bytes::u32_le(data, off).map(|v| v as usize);
     // version(4) format(4) then the length-prefixed class string.
     let format = u32_at(4)?;
     let mut off = 8;
@@ -518,13 +488,10 @@ fn native_kind(native: &[u8]) -> Option<&'static str> {
     if native.starts_with(b"MZ") {
         // A PE offset that lands inside the buffer distinguishes a real
         // executable from two bytes that happen to read `MZ`.
-        let lfanew = native
-            .get(0x3c..0x40)
-            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
-        return match lfanew {
-            Some(off) if native.get(off..off + 4) == Some(b"PE\0\0") => Some("pe"),
-            _ => Some("mz-dos"),
-        };
+        let is_pe = crate::bytes::u32_le(native, 0x3c)
+            .and_then(|off| native.get(off as usize..))
+            .is_some_and(|nt| nt.starts_with(b"PE\0\0"));
+        return Some(if is_pe { "pe" } else { "mz-dos" });
     }
     if native.starts_with(b"{\\rtf") {
         return Some("rtf");
@@ -577,19 +544,24 @@ fn features(bytes: &[u8], values: &mut Values) {
 /// be a non-letter so `\object` doesn't false-match `\objupdate`.
 fn has_control_word(bytes: &[u8], cw: &[u8]) -> bool {
     let mut pos = 0;
-    while pos + cw.len() <= bytes.len() {
-        if let Some(rel) = bytes[pos..].windows(cw.len()).position(|w| w == cw) {
-            let abs = pos + rel;
-            let after = bytes.get(abs + cw.len()).copied().unwrap_or(b' ');
-            if !after.is_ascii_alphabetic() {
-                return true;
-            }
-            pos = abs + cw.len();
-        } else {
-            return false;
+    while let Some(rel) = find_from(bytes, pos, cw) {
+        let abs = pos + rel;
+        let after = bytes.get(abs + cw.len()).copied().unwrap_or(b' ');
+        if !after.is_ascii_alphabetic() {
+            return true;
         }
+        pos = abs + cw.len();
     }
     false
+}
+
+/// Position of the first `needle` in `bytes` at or after `pos`, relative
+/// to `pos`.
+fn find_from(bytes: &[u8], pos: usize, needle: &[u8]) -> Option<usize> {
+    bytes
+        .get(pos..)?
+        .windows(needle.len())
+        .position(|w| w == needle)
 }
 
 /// Structural fingerprint counts. Cheap byte-level scans the
@@ -600,33 +572,22 @@ fn shape(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     let mut braces_close = 0_usize;
     let mut depth = 0_i32;
     let mut max_depth = 0_i32;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' if bytes.get(i + 1).is_some_and(|b| b.is_ascii_alphabetic()) => {
+    let mut rest = bytes;
+    while let Some((&b, after)) = rest.split_first() {
+        rest = match b {
+            b'\\' if after.first().is_some_and(u8::is_ascii_alphabetic) => {
                 // A control word is letters, an optional parameter, then a
                 // delimiter. Encrypted bytes after a stub header are full of
                 // `\` + letter pairs; counting those made a payload look as
                 // dense as a document and the sparse-body check never fired.
-                let mut j = i + 1;
-                while j < bytes.len() && bytes[j].is_ascii_alphabetic() {
-                    j += 1;
-                }
-                if bytes.get(j) == Some(&b'-') {
-                    j += 1;
-                }
-                while j < bytes.len() && bytes[j].is_ascii_digit() {
-                    j += 1;
-                }
-                let delimited = j == bytes.len()
-                    || matches!(
-                        bytes[j],
-                        b' ' | b'\\' | b'{' | b'}' | b'\n' | b'\r' | b'\t' | b';'
-                    );
+                let (_, tail) = split_control_word(after);
+                let delimited = tail.first().is_none_or(|b| {
+                    matches!(b, b' ' | b'\\' | b'{' | b'}' | b'\n' | b'\r' | b'\t' | b';')
+                });
                 if delimited {
                     control_words += 1;
                 }
-                i = j;
+                tail
             }
             b'{' => {
                 braces_open += 1;
@@ -634,15 +595,15 @@ fn shape(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
                 if depth > max_depth {
                     max_depth = depth;
                 }
-                i += 1;
+                after
             }
             b'}' => {
                 braces_close += 1;
                 depth -= 1;
-                i += 1;
+                after
             }
-            _ => i += 1,
-        }
+            _ => after,
+        };
     }
     let mut obj = serde_json::Map::new();
     obj.insert("control_word_count".into(), json!(control_words));
@@ -670,15 +631,14 @@ fn shape(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
 /// `\fonttbl`, `\colortbl`).
 fn find_group(bytes: &[u8], control_word: &[u8]) -> Option<usize> {
     let mut pos = 0;
-    while pos + control_word.len() + 1 <= bytes.len() {
-        let rel = bytes[pos..]
-            .windows(control_word.len())
-            .position(|w| w == control_word)?;
-        let abs = pos + rel;
-        if abs > 0 && bytes[abs - 1] == b'{' {
+    while pos + control_word.len() < bytes.len() {
+        let abs = pos + find_from(bytes, pos, control_word)?;
+        if let Some(open) = abs.checked_sub(1)
+            && bytes.get(open) == Some(&b'{')
+        {
             let after = bytes.get(abs + control_word.len()).copied().unwrap_or(b' ');
             if !after.is_ascii_alphabetic() {
-                return Some(abs - 1);
+                return Some(open);
             }
         }
         pos = abs + control_word.len();
@@ -698,8 +658,8 @@ const MAX_GROUP_DEPTH: i32 = 256;
 fn match_group_end(bytes: &[u8], start: usize) -> usize {
     let mut depth = 0_i32;
     let mut i = start;
-    while i < bytes.len() {
-        match bytes[i] {
+    while let Some(&b) = bytes.get(i) {
+        match b {
             b'\\' => {
                 // Skip escaped brace.
                 if matches!(bytes.get(i + 1), Some(b'{') | Some(b'}') | Some(b'\\')) {
@@ -832,6 +792,19 @@ mod tests {
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0]["kind"].as_str(), Some("HYPERLINK"));
         assert_eq!(fields[0]["target"].as_str(), Some("https://evil.example/"));
+    }
+
+    #[test]
+    fn parses_obfuscated_rtf_object_structure_after_malformed_header() {
+        let sample = include_bytes!("../../tests/fixtures/rtf/obfuscated-object.sample");
+        let (values, metrics) = extract_rtf(sample);
+        let features = values
+            .get("rtf.features")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert!(features.iter().any(|v| v.as_str() == Some("object")));
+        assert!(features.iter().any(|v| v.as_str() == Some("objdata")));
+        assert_eq!(metrics.get("rtf.objdata_count"), Some(2.0));
     }
 
     #[test]

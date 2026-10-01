@@ -27,6 +27,7 @@
 use md5::{Digest, Md5};
 use serde_json::{Value as JsonValue, json};
 
+use crate::formats::common::bytes_at::u32_le;
 use crate::formats::common::{hex_encode, put_str, put_u64};
 use crate::output::Values;
 
@@ -44,26 +45,22 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values) {
     if bytes.len() < 0x40 {
         return;
     }
-    let e_lfanew =
-        u32::from_le_bytes([bytes[0x3c], bytes[0x3d], bytes[0x3e], bytes[0x3f]]) as usize;
+    let Some(e_lfanew) = u32_le(bytes, 0x3c) else {
+        return;
+    };
+    let e_lfanew = e_lfanew as usize;
     let scan_end = e_lfanew.min(bytes.len());
     if scan_end < 8 {
         return;
     }
 
-    let Some(rich_pos) = find_rich_marker(&bytes[..scan_end]) else {
+    let Some(rich_pos) = bytes.get(..scan_end).and_then(find_rich_marker) else {
         return;
     };
     // Need at least 4 bytes after the marker for the XOR key.
-    if rich_pos + 8 > bytes.len() {
+    let Some(key) = u32_le(bytes, rich_pos + 4) else {
         return;
-    }
-    let key = u32::from_le_bytes([
-        bytes[rich_pos + 4],
-        bytes[rich_pos + 5],
-        bytes[rich_pos + 6],
-        bytes[rich_pos + 7],
-    ]);
+    };
 
     // Walk backwards in 4-byte words until we find the XOR-encoded
     // DanS marker.
@@ -71,11 +68,16 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values) {
     let mut pos = rich_pos;
     while pos >= 4 {
         pos -= 4;
-        let raw = u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]);
+        let Some(raw) = u32_le(bytes, pos) else {
+            return;
+        };
         let decoded = raw ^ key;
         if decoded == DANS_MARKER {
             words.reverse();
-            return emit(&words, key, &bytes[pos..rich_pos], values);
+            let Some(raw_table) = bytes.get(pos..rich_pos) else {
+                return;
+            };
+            return emit(&words, key, raw_table, values);
         }
         words.push(decoded);
     }
@@ -87,10 +89,9 @@ fn emit(words: &[u32], key: u32, raw_table: &[u8], values: &mut Values) {
     // After DanS the table has three padding zeros, then (comp_id,
     // count) pairs. We popped DanS off when we found it, so `words`
     // starts with the three pad words followed by the entries.
-    if words.len() < 3 {
+    let Some(entries_words) = words.get(3..) else {
         return;
-    }
-    let entries_words = &words[3..];
+    };
     if !entries_words.len().is_multiple_of(2) {
         return;
     }
@@ -121,8 +122,8 @@ fn emit(words: &[u32], key: u32, raw_table: &[u8], values: &mut Values) {
 fn rich_md5(encrypted: &[u8], key: u32) -> String {
     let key_bytes = key.to_le_bytes();
     let mut decrypted = Vec::with_capacity(encrypted.len());
-    for (i, &b) in encrypted.iter().enumerate() {
-        decrypted.push(b ^ key_bytes[i % 4]);
+    for (&b, &k) in encrypted.iter().zip(key_bytes.iter().cycle()) {
+        decrypted.push(b ^ k);
     }
     hex_encode(&Md5::digest(&decrypted))
 }

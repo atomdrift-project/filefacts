@@ -16,7 +16,7 @@ use tar::Archive;
 
 use crate::error::Error;
 use crate::fileid::FileType;
-use crate::output::{ArchiveMember, Metrics, Values};
+use crate::output::{ArchiveMember, Errors, Metrics, Stage, Values};
 
 /// Manifests above this are not legitimate — stop rather than buffer them.
 const MAX_MANIFEST: u64 = 1 << 20;
@@ -27,33 +27,78 @@ pub(super) fn extract(
     values: &mut Values,
     metrics: &mut Metrics,
     archive_members: &mut Vec<ArchiveMember>,
+    errors: &mut Errors,
 ) -> Result<(), Error> {
-    if let Some(manifest) = cargo_toml(bytes) {
+    if let Some(manifest) = cargo_toml(bytes, values, errors) {
         emit(&manifest, values);
     }
     super::tar::extract(bytes, file_type, values, metrics, archive_members)
 }
 
 /// Read and parse `{name}-{version}/Cargo.toml` from the gzipped crate.
-fn cargo_toml(bytes: &[u8]) -> Option<toml::Value> {
-    let mut archive = Archive::new(GzDecoder::new(bytes));
-    for entry in archive.entries().ok()? {
-        let Ok(entry) = entry else { break };
-        // Exactly `…/Cargo.toml` — not the vendored `Cargo.toml.orig`.
-        let is_manifest = entry
-            .path()
-            .map(|p| p.to_string_lossy().ends_with("/Cargo.toml"))
-            .unwrap_or(false);
-        if !is_manifest {
-            continue;
-        }
-        let mut text = String::new();
-        if entry.take(MAX_MANIFEST).read_to_string(&mut text).is_err() {
+/// `None` when the crate has none (silently), when it is over the size cap
+/// (a `crate.limits` entry), or when the crate or manifest is unreadable or
+/// not TOML (an error).
+fn cargo_toml(bytes: &[u8], values: &mut Values, errors: &mut Errors) -> Option<toml::Value> {
+    let (path, raw) = match read_manifest(bytes) {
+        Ok(Some(found)) => found,
+        Ok(None) => return None,
+        Err(why) => {
+            errors.record_malformed(Stage::TarParse, why);
             return None;
         }
-        return toml::from_str(&text).ok();
+    };
+    if raw.len() as u64 > MAX_MANIFEST {
+        values.insert(
+            "crate.limits",
+            serde_json::json!([{
+                "stage": "manifest",
+                "reason": format!("{path} over the {MAX_MANIFEST}-byte cap; not parsed"),
+            }]),
+        );
+        return None;
     }
-    None
+    let parsed = String::from_utf8(raw)
+        .map_err(|e| format!("not UTF-8: {e}"))
+        .and_then(|text| {
+            toml::from_str::<toml::Value>(&text).map_err(|e| {
+                // toml's message can span lines; keep the record on one.
+                let message = e.message().lines().collect::<Vec<_>>().join("; ");
+                match e.span() {
+                    Some(span) => format!("{message} at byte {}", span.start),
+                    None => message,
+                }
+            })
+        });
+    parsed
+        .map_err(|why| errors.record_malformed(Stage::FormatExtract, format!("{path}: {why}")))
+        .ok()
+}
+
+/// The root `Cargo.toml`'s path and bytes, read to one past the cap so an
+/// oversized one is recognisable; `Ok(None)` when the crate holds none.
+/// Decompression stops at the manifest.
+fn read_manifest(bytes: &[u8]) -> Result<Option<(String, Vec<u8>)>, String> {
+    let walk = |e: std::io::Error| format!("crate unreadable before <root>/Cargo.toml: {e}");
+    let mut archive = Archive::new(GzDecoder::new(bytes));
+    for entry in archive.entries().map_err(walk)? {
+        let entry = entry.map_err(walk)?;
+        let Some(path) = entry.path().ok().map(|p| p.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        // Exactly `<root>/Cargo.toml` — not the vendored `Cargo.toml.orig`,
+        // nor a nested workspace member or test fixture.
+        if !(path.ends_with("/Cargo.toml") && path.split('/').count() == 2) {
+            continue;
+        }
+        let mut buf = Vec::new();
+        entry
+            .take(MAX_MANIFEST + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("{path}: {e}"))?;
+        return Ok(Some((path, buf)));
+    }
+    Ok(None)
 }
 
 /// Emit `crate.*` identity from a parsed `Cargo.toml`'s `[package]`.
@@ -89,6 +134,93 @@ fn emit(manifest: &toml::Value, values: &mut Values) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    /// A gzipped tar holding the given members.
+    fn crate_with(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        for (path, body) in members {
+            let mut h = tar::Header::new_ustar();
+            h.set_path(path).unwrap();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            tar.append(&h, *body).unwrap();
+        }
+        let tar = tar.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&tar).unwrap();
+        gz.finish().unwrap()
+    }
+
+    fn run(bytes: &[u8]) -> (Values, Errors) {
+        let mut v = Values::new();
+        let mut e = Errors::new();
+        extract(
+            bytes,
+            FileType::Crate,
+            &mut v,
+            &mut Metrics::new(),
+            &mut Vec::new(),
+            &mut e,
+        )
+        .unwrap();
+        (v, e)
+    }
+
+    /// The one recorded error's stage and kind.
+    fn only_error(errors: &Errors) -> (Stage, crate::ErrorKind) {
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        (errors.as_slice()[0].stage, errors.as_slice()[0].kind)
+    }
+
+    #[test]
+    fn root_manifest_is_read_and_records_nothing() {
+        // A nested fixture manifest that does not parse is not the crate's.
+        let (v, e) = run(&crate_with(&[
+            ("w-0.1.0/Cargo.toml", b"[package]\nname = \"w\"\n"),
+            ("w-0.1.0/tests/bad/Cargo.toml", b"[package"),
+        ]));
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v.get("crate.name").and_then(|x| x.as_str()), Some("w"));
+        let (_, e) = run(&crate_with(&[("w-0.1.0/src/lib.rs", b"")]));
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn manifest_that_is_not_toml_records_one_error() {
+        let (v, e) = run(&crate_with(&[("w-0.1.0/Cargo.toml", b"[package")]));
+        assert_eq!(
+            only_error(&e),
+            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+        );
+        let message = &e.as_slice()[0].message;
+        assert!(message.starts_with("w-0.1.0/Cargo.toml:"), "{message}");
+        assert!(!message.contains('\n'), "{message}");
+        assert!(v.get("crate.name").is_none());
+    }
+
+    #[test]
+    fn corrupt_gzip_stream_records_one_tar_parse_error() {
+        let mut bytes = crate_with(&[("w-0.1.0/Cargo.toml", b"[package]\nname = \"w\"\n")]);
+        for b in &mut bytes[10..] {
+            *b ^= 0x5a;
+        }
+        let (_, e) = run(&bytes);
+        assert_eq!(
+            only_error(&e),
+            (Stage::TarParse, crate::ErrorKind::Malformed)
+        );
+    }
+
+    #[test]
+    fn oversized_manifest_is_a_limit_not_an_error() {
+        let big = vec![b'#'; MAX_MANIFEST as usize + 1];
+        let (v, e) = run(&crate_with(&[("w-0.1.0/Cargo.toml", &big)]));
+        assert!(e.is_empty(), "{e:?}");
+        let limits = v.get("crate.limits").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(limits[0]["stage"], "manifest");
+    }
 
     #[test]
     fn cargo_toml_package_identity_extracted() {

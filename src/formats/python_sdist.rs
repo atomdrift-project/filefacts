@@ -18,7 +18,7 @@ use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::fileid::FileType;
-use crate::output::{ArchiveMember, Metrics, Values};
+use crate::output::{ArchiveMember, Errors, Metrics, Stage, Values};
 
 /// `PKG-INFO` headers larger than this are almost certainly hostile padding;
 /// we stop reading rather than buffer them.
@@ -30,35 +30,60 @@ pub(super) fn extract(
     values: &mut Values,
     metrics: &mut Metrics,
     archive_members: &mut Vec<ArchiveMember>,
+    errors: &mut Errors,
 ) -> Result<(), Error> {
-    if let Some(text) = pkg_info(bytes) {
-        emit(&text, values);
+    match pkg_info(bytes) {
+        Ok(Some(text)) => emit(&text, values),
+        // No root `PKG-INFO`: nothing to read, nothing failed.
+        Ok(None) => {}
+        Err((stage, why)) => errors.record_malformed(stage, why),
     }
     super::tar::extract(bytes, file_type, values, metrics, archive_members)
 }
 
-/// Read the `<root>/PKG-INFO` metadata from a gzipped sdist tarball.
-/// Best-effort: any malformed step yields `None`.
-fn pkg_info(bytes: &[u8]) -> Option<String> {
+/// Read the `<root>/PKG-INFO` metadata from a gzipped sdist tarball;
+/// `Ok(None)` when it has none. Only the leading header block is used, so a
+/// `PKG-INFO` past the cap is read as its first `MAX_MANIFEST` bytes (to the
+/// last whole character) rather than refused. On failure, the stage it
+/// failed in and why: the tarball would not decompress, or `PKG-INFO` is
+/// not UTF-8.
+fn pkg_info(bytes: &[u8]) -> Result<Option<String>, (Stage, String)> {
+    let walk = |e: std::io::Error| {
+        (
+            Stage::TarParse,
+            format!("tarball unreadable before <root>/PKG-INFO: {e}"),
+        )
+    };
     let mut archive = tar::Archive::new(GzDecoder::new(bytes));
-    for entry in archive.entries().ok()? {
-        let Ok(mut entry) = entry else { break };
-        let is_manifest = entry
-            .path()
-            .map(|p| {
-                let p = p.to_string_lossy();
-                let trimmed = p.trim_end_matches('/');
-                trimmed.ends_with("/PKG-INFO") && trimmed.split('/').count() == 2
-            })
-            .unwrap_or(false);
-        if !is_manifest {
+    for entry in archive.entries().map_err(walk)? {
+        let mut entry = entry.map_err(walk)?;
+        let Some(path) = entry.path().ok().map(|p| p.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        let trimmed = path.trim_end_matches('/');
+        if !(trimmed.ends_with("/PKG-INFO") && trimmed.split('/').count() == 2) {
             continue;
         }
         let mut buf = Vec::new();
-        (&mut entry).take(MAX_MANIFEST).read_to_end(&mut buf).ok()?;
-        return String::from_utf8(buf).ok();
+        (&mut entry)
+            .take(MAX_MANIFEST + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| (Stage::TarParse, format!("{path}: {e}")))?;
+        let capped = buf.len() as u64 > MAX_MANIFEST;
+        buf.truncate(MAX_MANIFEST as usize);
+        return match String::from_utf8(buf) {
+            Ok(text) => Ok(Some(text)),
+            // The cap cut a multi-byte character in two: not the file's fault.
+            Err(e) if capped && e.utf8_error().error_len().is_none() => {
+                let valid = e.utf8_error().valid_up_to();
+                let mut bytes = e.into_bytes();
+                bytes.truncate(valid);
+                Ok(String::from_utf8(bytes).ok())
+            }
+            Err(e) => Err((Stage::FormatExtract, format!("{path}: not UTF-8: {e}"))),
+        };
     }
-    None
+    Ok(None)
 }
 
 /// Emit `python.*` identity values from a parsed `PKG-INFO` header block.
@@ -159,6 +184,99 @@ impl Headers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    /// A gzipped tar holding the given members.
+    fn tgz(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        for (path, body) in members {
+            let mut h = tar::Header::new_ustar();
+            h.set_path(path).unwrap();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            tar.append(&h, *body).unwrap();
+        }
+        let tar = tar.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&tar).unwrap();
+        gz.finish().unwrap()
+    }
+
+    fn run(bytes: &[u8]) -> (Values, Errors) {
+        let mut v = Values::new();
+        let mut e = Errors::new();
+        extract(
+            bytes,
+            FileType::PythonSdist,
+            &mut v,
+            &mut Metrics::new(),
+            &mut Vec::new(),
+            &mut e,
+        )
+        .unwrap();
+        (v, e)
+    }
+
+    /// The one recorded error's stage and kind.
+    fn only_error(errors: &Errors) -> (Stage, crate::ErrorKind) {
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        (errors.as_slice()[0].stage, errors.as_slice()[0].kind)
+    }
+
+    #[test]
+    fn tarball_pkg_info_is_read_and_records_nothing() {
+        let (v, e) = run(&tgz(&[("demo-1.0/PKG-INFO", b"Name: demo\n")]));
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(
+            v.get("python.name").and_then(JsonValue::as_str),
+            Some("demo")
+        );
+        // An sdist without a root PKG-INFO is not a failure.
+        let (_, e) = run(&tgz(&[("demo-1.0/setup.py", b"#")]));
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn pkg_info_that_is_not_utf8_records_one_error() {
+        let (v, e) = run(&tgz(&[("demo-1.0/PKG-INFO", b"Name: d\xe9mo\n")]));
+        assert_eq!(
+            only_error(&e),
+            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+        );
+        assert!(v.get("python.name").is_none());
+    }
+
+    #[test]
+    fn corrupt_gzip_stream_records_one_tar_parse_error() {
+        let mut bytes = tgz(&[("demo-1.0/PKG-INFO", b"Name: demo\n")]);
+        for b in &mut bytes[10..] {
+            *b ^= 0x5a;
+        }
+        let (_, e) = run(&bytes);
+        assert_eq!(
+            only_error(&e),
+            (Stage::TarParse, crate::ErrorKind::Malformed)
+        );
+    }
+
+    /// Past the cap, the header block is still read, even when the cut lands
+    /// inside a multi-byte character.
+    #[test]
+    fn oversized_pkg_info_is_read_up_to_the_cap() {
+        for body_start in ["", "x"] {
+            let mut meta = format!("Name: demo\nVersion: 1\n\n{body_start}").into_bytes();
+            while meta.len() as u64 <= MAX_MANIFEST {
+                meta.extend_from_slice("\u{e9}".as_bytes());
+            }
+            let (v, e) = run(&tgz(&[("demo-1.0/PKG-INFO", &meta)]));
+            assert!(e.is_empty(), "{e:?}");
+            assert_eq!(
+                v.get("python.name").and_then(JsonValue::as_str),
+                Some("demo")
+            );
+        }
+    }
 
     #[test]
     fn emits_name_version_and_author_email() {

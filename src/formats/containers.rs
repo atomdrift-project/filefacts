@@ -25,7 +25,7 @@ const MAX_REGIONS: usize = 4096;
 /// RIFF: `RIFF` + u32 little-endian payload length + a 4-byte form type,
 /// then `id`/`size` chunks. Used by `.wav`, `.webp` and `.avi`.
 pub(crate) fn riff(bytes: &[u8]) -> Coverage {
-    let Some(head) = bytes.get(..12) else {
+    let Some(head) = bytes.first_chunk::<12>() else {
         let mut c = Coverage::unrecognized();
         c.problem("header truncated");
         return c;
@@ -56,10 +56,12 @@ pub(crate) fn riff(bytes: &[u8]) -> Coverage {
         .min(bytes.len());
     let mut at = 12usize;
     let mut seen = 0usize;
-    while at + 8 <= limit && seen < MAX_REGIONS {
-        let id = &bytes[at..at + 4];
-        let size = u32::from_le_bytes([bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]])
-            as usize;
+    while let Some(&[i0, i1, i2, i3, s0, s1, s2, s3]) =
+        bytes.get(at..limit).and_then(<[u8]>::first_chunk::<8>)
+        && seen < MAX_REGIONS
+    {
+        let id = [i0, i1, i2, i3];
+        let size = u32::from_le_bytes([s0, s1, s2, s3]) as usize;
         let body = at + 8;
         let Some(end) = body.checked_add(size) else {
             cov.problem("chunk size overflows");
@@ -70,7 +72,7 @@ pub(crate) fn riff(bytes: &[u8]) -> Coverage {
             break;
         }
         // `LIST`/`INFO` metadata and WebP's `XMP `/`EXIF` hold author text.
-        if matches!(id, b"LIST" | b"INFO" | b"XMP " | b"EXIF" | b"ID3 ") {
+        if matches!(&id, b"LIST" | b"INFO" | b"XMP " | b"EXIF" | b"ID3 ") {
             cov.claim_freeform(at as u64, end as u64);
         } else {
             cov.claim(at as u64, end as u64);
@@ -88,7 +90,7 @@ pub(crate) fn riff(bytes: &[u8]) -> Coverage {
 /// IFF: `FORM` + u32 big-endian length + form type, then `id`/`size` chunks.
 /// Used by `.aiff` and `.aifc`.
 pub(crate) fn iff(bytes: &[u8]) -> Coverage {
-    let Some(head) = bytes.get(..12) else {
+    let Some(head) = bytes.first_chunk::<12>() else {
         let mut c = Coverage::unrecognized();
         c.problem("header truncated");
         return c;
@@ -113,10 +115,12 @@ pub(crate) fn iff(bytes: &[u8]) -> Coverage {
         .min(bytes.len());
     let mut at = 12usize;
     let mut seen = 0usize;
-    while at + 8 <= limit && seen < MAX_REGIONS {
-        let id = &bytes[at..at + 4];
-        let size = u32::from_be_bytes([bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]])
-            as usize;
+    while let Some(&[i0, i1, i2, i3, s0, s1, s2, s3]) =
+        bytes.get(at..limit).and_then(<[u8]>::first_chunk::<8>)
+        && seen < MAX_REGIONS
+    {
+        let id = [i0, i1, i2, i3];
+        let size = u32::from_be_bytes([s0, s1, s2, s3]) as usize;
         let body = at + 8;
         let Some(end) = body.checked_add(size) else {
             cov.problem("chunk size overflows");
@@ -127,7 +131,7 @@ pub(crate) fn iff(bytes: &[u8]) -> Coverage {
             break;
         }
         // `NAME`/`AUTH`/`ANNO`/`(c) ` are AIFF's free-text chunks.
-        if matches!(id, b"NAME" | b"AUTH" | b"ANNO" | b"(c) ") {
+        if matches!(&id, b"NAME" | b"AUTH" | b"ANNO" | b"(c) ") {
             cov.claim_freeform(at as u64, end as u64);
         } else {
             cov.claim(at as u64, end as u64);
@@ -145,29 +149,29 @@ pub(crate) fn iff(bytes: &[u8]) -> Coverage {
 /// per image, each naming an offset and size. The directory is the whole of
 /// the format's structure, so any byte it does not point at is unread.
 pub(crate) fn ico(bytes: &[u8]) -> Coverage {
-    let Some(head) = bytes.get(..6) else {
+    let Some(&[r0, r1, k0, k1, c0, c1]) = bytes.first_chunk::<6>() else {
         return Coverage::unrecognized();
     };
     // reserved must be 0; type is 1 (icon) or 2 (cursor).
-    let kind = u16::from_le_bytes([head[2], head[3]]);
-    if head[0] != 0 || head[1] != 0 || !matches!(kind, 1 | 2) {
+    let kind = u16::from_le_bytes([k0, k1]);
+    if r0 != 0 || r1 != 0 || !matches!(kind, 1 | 2) {
         return Coverage::unrecognized();
     }
-    let count = u16::from_le_bytes([head[4], head[5]]) as usize;
+    let count = u16::from_le_bytes([c0, c1]) as usize;
     if count == 0 || count > 512 {
         return Coverage::unrecognized();
     }
     let dir_end = 6 + count * 16;
-    if dir_end > bytes.len() {
+    let Some(dir) = bytes.get(6..dir_end) else {
         let mut c = Coverage::new(if kind == 1 { "ico" } else { "cur" }, 6);
         c.problem("icon directory truncated");
         return c;
-    }
+    };
     let mut cov = Coverage::new(if kind == 1 { "ico" } else { "cur" }, dir_end as u64);
-    for i in 0..count {
-        let e = &bytes[6 + i * 16..6 + (i + 1) * 16];
-        let size = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as u64;
-        let off = u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as u64;
+    for entry in dir.as_chunks::<16>().0 {
+        let [.., z0, z1, z2, z3, o0, o1, o2, o3] = *entry;
+        let size = u32::from_le_bytes([z0, z1, z2, z3]) as u64;
+        let off = u32::from_le_bytes([o0, o1, o2, o3]) as u64;
         let Some(end) = off.checked_add(size) else {
             cov.problem("image extent overflows");
             continue;
@@ -185,11 +189,14 @@ pub(crate) fn ico(bytes: &[u8]) -> Coverage {
 /// then a stream of blocks terminated by `0x3B`. Everything after the
 /// trailer is unread by every decoder.
 pub(crate) fn gif(bytes: &[u8]) -> Coverage {
-    if bytes.len() < 13 || (!bytes.starts_with(b"GIF87a") && !bytes.starts_with(b"GIF89a")) {
+    let Some(header) = bytes
+        .first_chunk::<13>()
+        .filter(|h| h.starts_with(b"GIF87a") || h.starts_with(b"GIF89a"))
+    else {
         return Coverage::unrecognized();
-    }
+    };
     let mut at = 13usize;
-    let flags = bytes[10];
+    let flags = header[10];
     if flags & 0x80 != 0 {
         // Global colour table: 3 * 2^(N+1) bytes.
         at += 3 * (1usize << ((flags & 0x07) + 1));
@@ -203,8 +210,10 @@ pub(crate) fn gif(bytes: &[u8]) -> Coverage {
     let start = at;
     let mut seen = 0usize;
     let mut terminated = false;
-    while at < bytes.len() && seen < MAX_REGIONS {
-        match bytes[at] {
+    while let Some(&marker) = bytes.get(at)
+        && seen < MAX_REGIONS
+    {
+        match marker {
             0x3B => {
                 at += 1;
                 terminated = true;
@@ -222,11 +231,10 @@ pub(crate) fn gif(bytes: &[u8]) -> Coverage {
             0x2C => {
                 // Image descriptor: 9 bytes, optional local colour table,
                 // an LZW code-size byte, then sub-blocks.
-                let Some(desc) = bytes.get(at..at + 10) else {
+                let Some(&[.., local]) = bytes.get(at..).and_then(<[u8]>::first_chunk::<10>) else {
                     cov.problem("image descriptor truncated");
                     break;
                 };
-                let local = desc[9];
                 at += 10;
                 if local & 0x80 != 0 {
                     at += 3 * (1usize << ((local & 0x07) + 1));
@@ -271,7 +279,7 @@ fn skip_subblocks(bytes: &[u8], mut at: usize) -> Option<usize> {
 /// BMP: `BM`, then a u32 declared file size and the offset of pixel data.
 /// The declared size is what every reader trusts.
 pub(crate) fn bmp(bytes: &[u8]) -> Coverage {
-    let Some(head) = bytes.get(..14) else {
+    let Some(head) = bytes.first_chunk::<14>() else {
         return Coverage::unrecognized();
     };
     if &head[..2] != b"BM" {
@@ -294,14 +302,14 @@ pub(crate) fn bmp(bytes: &[u8]) -> Coverage {
 /// structural question is whether anything sits outside the tags and frames.
 pub(crate) fn mp3(bytes: &[u8]) -> Coverage {
     let has_id3 = bytes.starts_with(b"ID3");
-    let framed = bytes.len() >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0;
+    let framed = matches!(bytes, [0xFF, second, ..] if second & 0xE0 == 0xE0);
     if !has_id3 && !framed {
         return Coverage::unrecognized();
     }
     let mut start = 0u64;
     let mut cov = Coverage::new("mp3", 0);
     if has_id3 {
-        let Some(head) = bytes.get(..10) else {
+        let Some(head) = bytes.first_chunk::<10>() else {
             cov.problem("ID3 header truncated");
             return cov;
         };
@@ -320,7 +328,10 @@ pub(crate) fn mp3(bytes: &[u8]) -> Coverage {
         start = end;
     }
     let mut end = bytes.len() as u64;
-    if bytes.len() >= 128 && bytes[bytes.len() - 128..].starts_with(b"TAG") {
+    if bytes
+        .last_chunk::<128>()
+        .is_some_and(|trailer| trailer.starts_with(b"TAG"))
+    {
         let tag = end - 128;
         cov.claim_freeform(tag, end);
         end = tag;
@@ -337,7 +348,7 @@ pub(crate) fn mp3(bytes: &[u8]) -> Coverage {
 /// one appended past the last box is not.
 pub(crate) fn iso_bmff(bytes: &[u8]) -> Coverage {
     // A `ftyp` box at the start is the reliable marker.
-    let Some(head) = bytes.get(..8) else {
+    let Some(head) = bytes.first_chunk::<8>() else {
         return Coverage::unrecognized();
     };
     if &head[4..8] != b"ftyp" {
@@ -346,22 +357,22 @@ pub(crate) fn iso_bmff(bytes: &[u8]) -> Coverage {
     let mut cov = Coverage::new("iso-bmff", 0);
     let mut at = 0usize;
     let mut seen = 0usize;
-    while at + 8 <= bytes.len() && seen < MAX_REGIONS {
-        let size32 =
-            u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as u64;
-        let btype = &bytes[at + 4..at + 8];
+    while let Some(&[s0, s1, s2, s3, t0, t1, t2, t3]) =
+        bytes.get(at..).and_then(<[u8]>::first_chunk::<8>)
+        && seen < MAX_REGIONS
+    {
+        let size32 = u32::from_be_bytes([s0, s1, s2, s3]) as u64;
+        let btype = [t0, t1, t2, t3];
         let size = match size32 {
             // 0 means "extends to end of file".
             0 => bytes.len() as u64 - at as u64,
             // 1 means a 64-bit size follows the type.
             1 => {
-                let Some(ext) = bytes.get(at + 8..at + 16) else {
+                let Some(ext) = bytes.get(at + 8..).and_then(<[u8]>::first_chunk::<8>) else {
                     cov.problem("64-bit box size truncated");
                     break;
                 };
-                u64::from_be_bytes([
-                    ext[0], ext[1], ext[2], ext[3], ext[4], ext[5], ext[6], ext[7],
-                ])
+                u64::from_be_bytes(*ext)
             }
             n => n,
         };
@@ -378,7 +389,7 @@ pub(crate) fn iso_bmff(bytes: &[u8]) -> Coverage {
             break;
         }
         // `udta`/`meta`/`free`/`skip` hold author metadata or explicit filler.
-        if matches!(btype, b"udta" | b"meta" | b"free" | b"skip") {
+        if matches!(&btype, b"udta" | b"meta" | b"free" | b"skip") {
             cov.claim_freeform(at as u64, end);
         } else {
             cov.claim(at as u64, end);

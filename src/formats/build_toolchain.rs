@@ -105,19 +105,22 @@ fn scan_rust_rodata(sections: &[crate::output::Section], bytes: &[u8]) -> Option
         }
         let mut pos = start;
         while pos + NEEDLE.len() < end {
-            if let Some(rel) = bytes[pos..end]
-                .windows(NEEDLE.len())
-                .position(|w| w == NEEDLE)
+            if let Some(rel) = bytes
+                .get(pos..end)
+                .and_then(|w| w.windows(NEEDLE.len()).position(|w| w == NEEDLE))
             {
                 let after = pos + rel + NEEDLE.len();
                 // Require a digit immediately after `rustc ` to
                 // reject "rustcracker"-style false positives.
                 if bytes.get(after).is_some_and(|b| b.is_ascii_digit()) {
-                    let token_end = bytes[after..end]
-                        .iter()
-                        .position(|b| matches!(*b, b' ' | b'\n' | b'\0' | b'-' | b'('))
+                    let token_end = bytes
+                        .get(after..end)
+                        .and_then(|t| {
+                            t.iter()
+                                .position(|b| matches!(*b, b' ' | b'\n' | b'\0' | b'-' | b'('))
+                        })
                         .map_or(end, |n| after + n);
-                    if let Ok(v) = std::str::from_utf8(&bytes[after..token_end]) {
+                    if let Some(Ok(v)) = bytes.get(after..token_end).map(std::str::from_utf8) {
                         return Some(v.to_string());
                     }
                 }
@@ -148,10 +151,10 @@ fn read_go_buildinfo(bytes: &[u8], offset: u64, size: u64) -> Option<String> {
     let start = usize::try_from(offset).ok()?;
     let len = usize::try_from(size).ok()?;
     let end = start.checked_add(len)?;
-    if end > bytes.len() || len < 32 {
+    if len < 32 {
         return None;
     }
-    let buf = &bytes[start..end];
+    let buf = bytes.get(start..end)?;
     if !buf.starts_with(MAGIC) {
         return None;
     }
@@ -167,10 +170,7 @@ fn read_go_buildinfo(bytes: &[u8], offset: u64, size: u64) -> Option<String> {
     let mut version_start = 32;
     let version_len = usize::try_from(read_uleb128(buf, &mut version_start)?).ok()?;
     let version_end = version_start.checked_add(version_len)?;
-    if version_end > buf.len() {
-        return None;
-    }
-    let version = std::str::from_utf8(&buf[version_start..version_end]).ok()?;
+    let version = std::str::from_utf8(buf.get(version_start..version_end)?).ok()?;
     Some(version.trim_start_matches("go").to_string())
 }
 

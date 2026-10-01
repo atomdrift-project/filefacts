@@ -10,8 +10,21 @@
 //! map as `ast.*` keys. Counts and depths live there, not on the
 //! symbol records.
 //!
-//! The walker is language-driven by the [`LangConfig`] passed in; it
-//! contains no language-specific code itself.
+//! The walker is driven by the [`LangConfig`] passed in: its node-kind and
+//! field tables decide what is a call, a member access, a literal or an
+//! argument, and its methods resolve each call's callee and argument list. A
+//! few grammar quirks the tables cannot express are handled here, keyed on
+//! [`Lang`]:
+//!
+//! - Bash: a command whose name starts with `-` records no call.
+//! - Perl: a leaf `function` node and a plain `$scalar` receiver are static
+//!   names; a method chosen at run time (`$obj->$m()`) is not.
+//! - Rust: a `scoped_identifier` (`a::b`) is already a static path, and a
+//!   `&x` argument is shaped as `x`.
+//! - Zig: positional arguments are the call's named children after the callee.
+//!
+//! The node kinds the shape detectors below look for (function definitions,
+//! loops, assignments, subscripts) are matched across all grammars at once.
 
 use crate::metric;
 use std::collections::{BTreeMap, HashSet};
@@ -21,7 +34,7 @@ use tree_sitter::Node;
 use crate::output::{Arg, ArgShape, Metrics, Symbol, Symbols};
 
 use super::decode_string_literal;
-use super::langs::LangConfig;
+use super::langs::{Lang, LangConfig};
 
 /// Hard cap on AST recursion depth.
 ///
@@ -50,7 +63,7 @@ pub(super) fn walk(
     let member_count = state.members.len() as u64;
     // Classify each call's command-name target (obfuscated vs dynamic) before
     // the buffer is drained into `symbols_out`.
-    super::call_target_metrics::emit(&state.calls, config.name, metrics);
+    super::call_target_metrics::emit(&state.calls, config.lang, metrics);
     for c in state.calls {
         symbols_out.push(c);
     }
@@ -81,7 +94,7 @@ pub(super) fn walk(
     if state.max_depth >= MAX_AST_DEPTH {
         metrics.insert(metric!("ast.depth_capped"), 1.0);
         tracing::warn!(
-            lang = config.name,
+            lang = config.name(),
             node_count = state.node_count,
             max_depth = state.max_depth,
             cap = MAX_AST_DEPTH,
@@ -808,23 +821,18 @@ impl State {
     }
 
     fn record_call(&mut self, node: Node<'_>, source: &str, config: &LangConfig) {
-        // Perl stores the receiver and method on the call itself, not under
-        // a `function` child. Its first child is only the receiver.
-        let callee = if config.name == "perl" && node.kind() == "method_call_expression" {
-            Some(node)
-        } else {
-            node.child_by_field_name(config.callee_field)
-                .or_else(|| first_named_child(node))
-        };
+        let callee = config.callee(node).or_else(|| first_named_child(node));
         let args_node = config.argument_list(node);
 
         let target = callee.and_then(|c| static_dotted_chain(c, source, config, 0));
-        if config.name == "bash" && target.as_deref().is_some_and(|t| t.starts_with('-')) {
+        // A Bash "command" whose name starts with `-` is an option word, not a
+        // program, so it records no call.
+        if config.lang == Lang::Bash && target.as_deref().is_some_and(|t| t.starts_with('-')) {
             return;
         }
 
         let mut args: Vec<Arg> = Vec::new();
-        if config.name == "zig" {
+        if config.lang == Lang::Zig {
             // Zig's call_expression grammar exposes the callee as a named
             // `function` field, but positional arguments are anonymous
             // expression children (there is no named `arguments` wrapper).
@@ -844,9 +852,7 @@ impl State {
                 args.push(build_arg(arg, source, config));
             }
         } else if let Some(args_root) = args_node {
-            // Perl's arguments field is an expression, not a wrapper. Only
-            // a comma-separated list has children representing distinct args.
-            if config.name == "perl" && args_root.kind() != "list_expression" {
+            if config.is_single_argument(args_root) {
                 args.push(build_arg(args_root, source, config));
             } else {
                 let mut cursor = args_root.walk();
@@ -927,7 +933,7 @@ pub(super) fn build_arg(node: Node<'_>, source: &str, config: &LangConfig) -> Ar
     // Descend through these wrappers to the inner value before shaping.
     let mut node = node;
     while node.kind() == "argument"
-        || (config.name == "rust" && node.kind() == "reference_expression")
+        || (config.lang == Lang::Rust && node.kind() == "reference_expression")
     {
         match first_named_child(node) {
             Some(inner) => node = inner,
@@ -1062,20 +1068,20 @@ fn chain_into(
         return None;
     }
     let text = || node.utf8_text(source.as_bytes()).ok();
-    if config.name == "rust" && node.kind() == "scoped_identifier" {
+    if config.lang == Lang::Rust && node.kind() == "scoped_identifier" {
         path.push_str(text()?);
         return Some(());
     }
     // Perl aliases both bareword callees and builtin names to `function`.
     // A leaf is a static name; non-leaf forms can dereference a code variable
     // (`&$callback`) and must remain unresolved rather than becoming symbols.
-    if config.name == "perl" && node.kind() == "function" && node.named_child_count() == 0 {
+    if config.lang == Lang::Perl && node.kind() == "function" && node.named_child_count() == 0 {
         path.push_str(text()?);
         return Some(());
     }
     // A simple Perl scalar is a lexical receiver spelling, not a resolved
     // runtime type. Dereferences and computed variable names stay unknown.
-    if config.name == "perl" && node.kind() == "scalar" {
+    if config.lang == Lang::Perl && node.kind() == "scalar" {
         let name = node.named_child(0)?;
         if name.kind() == "varname" && name.named_child_count() == 0 {
             let value = name.utf8_text(source.as_bytes()).ok()?;
@@ -1099,7 +1105,7 @@ fn chain_into(
         let prop = node.child_by_field_name(config.member_property_field)?;
         // `$receiver->$method(...)` has a scalar child inside `method`;
         // unlike a bareword method, its name is chosen at runtime.
-        if config.name == "perl" && prop.named_child_count() != 0 {
+        if config.lang == Lang::Perl && prop.named_child_count() != 0 {
             return None;
         }
         chain_into(

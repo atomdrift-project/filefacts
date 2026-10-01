@@ -32,6 +32,7 @@
 
 use serde_json::Value as JsonValue;
 
+use crate::formats::common::bytes_at::u32_le;
 use crate::metric;
 use crate::output::{Metrics, Values};
 use crate::scan::entropy;
@@ -334,20 +335,20 @@ pub(crate) fn classify_region(region: &[u8]) -> Option<&'static str> {
 /// real embedded image from the `MZ` byte pair occurring in media data.
 fn find_pe(region: &[u8]) -> bool {
     let mut from = 0usize;
-    while let Some(rel) = memchr::memmem::find(&region[from..], b"MZ") {
+    while let Some(rel) = region
+        .get(from..)
+        .and_then(|rest| memchr::memmem::find(rest, b"MZ"))
+    {
         let mz = from + rel;
-        if let Some(field) = region.get(mz + 0x3c..mz + 0x40) {
-            let off = u32::from_le_bytes([field[0], field[1], field[2], field[3]]) as usize;
-            if let Some(sig) = mz.checked_add(off).and_then(|at| region.get(at..at + 4))
-                && sig == b"PE\0\0"
-            {
-                return true;
-            }
+        if let Some(off) = u32_le(region, mz + 0x3c)
+            && let Some(sig) = mz
+                .checked_add(off as usize)
+                .and_then(|at| region.get(at..at + 4))
+            && sig == b"PE\0\0"
+        {
+            return true;
         }
         from = mz + 2;
-        if from >= region.len() {
-            break;
-        }
     }
     false
 }
@@ -356,19 +357,19 @@ fn find_pe(region: &[u8]) -> bool {
 /// `1AY&SY` compressed-block magic that follows it.
 fn find_bzip2(region: &[u8]) -> bool {
     let mut from = 0usize;
-    while let Some(rel) = memchr::memmem::find(&region[from..], b"BZh") {
+    while let Some(rel) = region
+        .get(from..)
+        .and_then(|rest| memchr::memmem::find(rest, b"BZh"))
+    {
         let at = from + rel;
-        if let Some(rest) = region.get(at + 3..at + 10)
-            && rest[0].is_ascii_digit()
-            && rest[0] != b'0'
-            && &rest[1..7] == b"\x31\x41\x59\x26\x53\x59"
+        if let Some([level, magic @ ..]) = region.get(at + 3..).and_then(<[u8]>::first_chunk::<7>)
+            && level.is_ascii_digit()
+            && *level != b'0'
+            && magic == b"\x31\x41\x59\x26\x53\x59"
         {
             return true;
         }
         from = at + 3;
-        if from >= region.len() {
-            break;
-        }
     }
     false
 }
@@ -380,22 +381,26 @@ fn starts_line_with(region: &[u8], needle: &[u8]) -> bool {
         return true;
     }
     let mut from = 0usize;
-    while let Some(rel) = memchr::memmem::find(&region[from..], needle) {
+    while let Some(rel) = region
+        .get(from..)
+        .and_then(|rest| memchr::memmem::find(rest, needle))
+    {
         let at = from + rel;
-        if at > 0 && matches!(region[at - 1], b'\n' | b'\r') {
+        if at
+            .checked_sub(1)
+            .and_then(|prev| region.get(prev))
+            .is_some_and(|b| matches!(b, b'\n' | b'\r'))
+        {
             return true;
         }
         from = at + 1;
-        if from >= region.len() {
-            break;
-        }
     }
     false
 }
 
 /// Base64 rather than prose: a long run drawn only from the base64 alphabet.
 fn looks_base64(region: &[u8]) -> bool {
-    let sample = &region[..region.len().min(4096)];
+    let sample = region.get(..4096).unwrap_or(region);
     let coded = sample
         .iter()
         .filter(|&&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'\n' | b'\r'))

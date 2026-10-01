@@ -216,6 +216,29 @@ fn control_sequences_from_the_file_are_escaped() {
     assert!(text.contains("\\x9b31m"), "{text}");
 }
 
+/// JSON escapes C0 controls itself; DEL and the C1 controls (the 8-bit CSI
+/// among them) must not reach a terminal raw either, yet still round-trip.
+#[test]
+fn json_output_escapes_del_and_c1_controls() {
+    let dir = scratch("json-c1");
+    let file = dir.join("c1.json");
+    fs::write(&file, "{\"k\": [\"\u{9b}31m\u{7f}\"]}").unwrap();
+    let out = filefacts()
+        .args(["--format", "json", "values"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?}", out.status);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !text.chars().any(|c| c.is_control() && c != '\n'),
+        "{text:?}"
+    );
+    assert!(text.contains("\\u009b31m\\u007f"), "{text}");
+    let value: Value = serde_json::from_str(&text).unwrap();
+    assert!(value.to_string().contains("\u{9b}31m\u{7f}"), "{value}");
+}
+
 /// A call's arguments are typed values, not strings; they print as they
 /// read in source.
 #[test]

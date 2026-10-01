@@ -313,11 +313,48 @@ fn write_json(
     parsed: &ParsedFile<'_>,
     view: Option<View>,
 ) -> serde_json::Result<()> {
+    let mut escaped = EscapeC1(&mut *out);
     match view {
-        None => serde_json::to_writer_pretty(&mut *out, &Bundle(parsed))?,
-        Some(view) => serde_json::to_writer_pretty(&mut *out, &ViewData(parsed, view))?,
+        None => serde_json::to_writer_pretty(&mut escaped, &Bundle(parsed))?,
+        Some(view) => serde_json::to_writer_pretty(&mut escaped, &ViewData(parsed, view))?,
     }
     out.write_all(b"\n").map_err(serde_json::Error::io)
+}
+
+/// Rewrites DEL and the C1 controls (U+0080..=U+009F, including the 8-bit
+/// CSI) as `\u00XX` escapes. JSON allows them raw and serde_json leaves them
+/// so, but a terminal may act on them, and these strings come from the file
+/// under analysis. Every such byte sequence in JSON output lies inside a
+/// string, and serde_json writes whole UTF-8 fragments, so the rewrite is
+/// safe per write.
+struct EscapeC1<W>(W);
+
+impl<W: Write> Write for EscapeC1<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut start = 0;
+        let mut i = 0;
+        while let Some(&b) = buf.get(i) {
+            let escape = match (b, buf.get(i + 1)) {
+                (0x7f, _) => Some((0x7f, 1)),
+                (0xc2, Some(&c1 @ 0x80..=0x9f)) => Some((c1, 2)),
+                _ => None,
+            };
+            if let Some((code, len)) = escape {
+                self.0.write_all(buf.get(start..i).unwrap_or_default())?;
+                write!(self.0, "\\u{code:04x}")?;
+                i += len;
+                start = i;
+            } else {
+                i += 1;
+            }
+        }
+        self.0.write_all(buf.get(start..).unwrap_or_default())?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
 }
 
 /// The default output: the schema version, then every bundled view under
@@ -1318,7 +1355,7 @@ fn render_imports(symbols: &[&Symbol]) -> String {
             fg_bold(FG_VALUE, lib),
             dim(&format!("({})", entries.len())),
         ));
-        let show = &entries[..entries.len().min(IMPORTS_PREVIEW_PER_LIB)];
+        let show = entries.get(..IMPORTS_PREVIEW_PER_LIB).unwrap_or(&entries);
         let off_w = show
             .iter()
             .filter_map(|(_, offset, _)| *offset)
@@ -1539,7 +1576,9 @@ const ARCHIVE_MEMBERS_PREVIEW_LIMIT: usize = 50;
 /// plain stored file. Paths come from the archive, so control characters
 /// are escaped.
 fn render_archive_members(members: &[filefacts::ArchiveMember]) -> String {
-    let shown = &members[..members.len().min(ARCHIVE_MEMBERS_PREVIEW_LIMIT)];
+    let shown = members
+        .get(..ARCHIVE_MEMBERS_PREVIEW_LIMIT)
+        .unwrap_or(members);
     let sizes: Vec<String> = shown.iter().map(|m| humanize_bytes(m.size_bytes)).collect();
     let size_w = sizes.iter().map(String::len).max().unwrap_or(0);
     let mut out = String::new();

@@ -61,7 +61,8 @@ gimli = { version = "0.32", default-features = false, features = ["read", "std"]
 # Pinned to an exact rev until the next stng release is cut: stng types
 # (`ExtractedString`, `StringMethod`, ...) are part of filefacts' public API,
 # so `cargo update` must not move it. Bump the rev deliberately.
-stng = { git = "https://github.com/atomdrift-project/stng.git", rev = "98c580eaf8d6899b23d21f557dcfe27d03664514" }
+# No default features: those build the `stng` command, not the library.
+stng = { git = "https://github.com/atomdrift-project/stng.git", rev = "3c2f434ef9b97c0c144ba3d0add8f7ccb2ef7188", default-features = false }
 
 
 # Archive index readers. We use these for header/central-directory enumeration
@@ -90,7 +91,7 @@ jpeg-decoder = "0.3"
 png = "0.17"
 
 # Structured-format parsers.
-serde_yaml = "0.9"
+serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }
 toml = "0.8"
 plist = "1"
 
@@ -212,6 +213,10 @@ unused_must_use = "warn"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+# Parsers read untrusted bytes: index with `get`/`first_chunk`/`crate::bytes`,
+# never `buf[i]`, so a malformed file degrades instead of panicking. Test code
+# is exempt (see clippy.toml).
+indexing_slicing = "warn"
 # Public-API friction without forensic benefit.
 must_use_candidate = "allow"
 missing_errors_doc = "allow"

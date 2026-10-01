@@ -14,7 +14,7 @@ use crate::output::Metrics;
 
 use super::ast_walk::MAX_AST_DEPTH;
 use super::identifier_metrics::string_entropy;
-use super::langs::LangConfig;
+use super::langs::{Lang, LangConfig};
 
 /// Per-function info collected during the AST walk.
 #[derive(Default)]
@@ -55,24 +55,40 @@ pub(super) fn emit(
 }
 
 /// Function-defining node kinds per language. Mirrors the
-/// `function_node_types` used by cleave's UnifiedSourceAnalyzer for the
-/// subset of languages that filefacts currently parses.
-fn function_kinds_for(lang: &str) -> &'static [&'static str] {
+/// `function_node_types` used by cleave's UnifiedSourceAnalyzer; a language
+/// with no entry there has none here, so its files emit no `functions.*`
+/// metrics.
+fn function_kinds_for(lang: Lang) -> &'static [&'static str] {
     match lang {
-        "python" => &["function_definition", "async_function_definition"],
-        "javascript" | "typescript" => &[
+        Lang::Python => &["function_definition", "async_function_definition"],
+        Lang::JavaScript | Lang::TypeScript => &[
             "function_declaration",
             "function_expression",
             "arrow_function",
             "method_definition",
             "generator_function_declaration",
         ],
-        "go" => &["function_declaration", "method_declaration"],
-        "rust" => &["function_item"],
-        "java" => &["method_declaration", "constructor_declaration"],
-        "bash" => &["function_definition"],
-        "php" => &["function_definition", "method_declaration"],
-        _ => &[],
+        Lang::Go => &["function_declaration", "method_declaration"],
+        Lang::Rust => &["function_item"],
+        Lang::Java => &["method_declaration", "constructor_declaration"],
+        Lang::Bash => &["function_definition"],
+        Lang::Php => &["function_definition", "method_declaration"],
+        Lang::Ruby
+        | Lang::Lua
+        | Lang::CSharp
+        | Lang::C
+        | Lang::Scala
+        | Lang::ObjC
+        | Lang::Kotlin
+        | Lang::Swift
+        | Lang::PowerShell
+        | Lang::Perl
+        | Lang::Groovy
+        | Lang::Zig
+        | Lang::Elixir
+        | Lang::Makefile
+        | Lang::Clojure
+        | Lang::Batch => &[],
     }
 }
 
@@ -95,7 +111,7 @@ fn collect(
         *capped = true;
         return;
     }
-    let is_fn = function_kinds_for(config.name).contains(&node.kind());
+    let is_fn = function_kinds_for(config.lang).contains(&node.kind());
     if is_fn {
         let info = build_info(node, source, config, depth);
         out.push(info);
@@ -183,7 +199,7 @@ fn first_identifier<'a>(node: Node<'a>) -> Option<Node<'a>> {
 }
 
 fn has_nested_function(node: Node<'_>, config: &LangConfig) -> bool {
-    let kinds = function_kinds_for(config.name);
+    let kinds = function_kinds_for(config.lang);
     let mut cursor = node.walk();
     let mut stack: Vec<Node<'_>> = node.children(&mut cursor).collect();
     while let Some(n) = stack.pop() {
@@ -389,13 +405,12 @@ fn emit_metrics(functions: &[FunctionInfo], total_lines: u32, metrics: &mut Metr
 }
 
 fn has_numeric_suffix(name: &str) -> bool {
-    let chars: Vec<char> = name.chars().collect();
-    if chars.len() < 2 {
-        return false;
-    }
-    let last = chars[chars.len() - 1];
-    let second_last = chars[chars.len() - 2];
-    last.is_ascii_digit() && second_last.is_ascii_alphabetic()
+    let mut chars = name.chars().rev();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some(last), Some(second_last))
+            if last.is_ascii_digit() && second_last.is_ascii_alphabetic()
+    )
 }
 
 #[cfg(test)]

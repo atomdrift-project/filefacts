@@ -9,6 +9,7 @@
 //! and surfaces the first slice's metadata at the top level so simple
 //! consumers don't have to enumerate the array.
 
+use crate::bytes;
 use crate::metric;
 use goblin::mach::{self, Mach, MachO};
 use serde_json::Value as JsonValue;
@@ -53,10 +54,22 @@ pub(super) fn extract(
             return Ok(());
         }
     };
+    // A fat header claiming more entries than the file can hold is not a
+    // universal binary anything downstream can use, and walks that trust the
+    // count (rizin; stng's walk of a parsed object) visit every claimed entry,
+    // up to `u32::MAX` of them.
+    let fat_table_fits = match &parsed {
+        Mach::Fat(fat) => fat_table_fits(fat.narches, bytes.len()),
+        Mach::Binary(_) => true,
+    };
     // Reuse this parse for string extraction instead of having stng parse the
     // binary a second time.
     let object = goblin::Object::Mach(parsed);
-    extract_binary_strings_from_object(&object, bytes, strings, XorScan::Yes);
+    if fat_table_fits {
+        extract_binary_strings_from_object(&object, bytes, strings, XorScan::Yes);
+    } else {
+        extract_binary_strings(bytes, strings, XorScan::Yes);
+    }
     let goblin::Object::Mach(parsed) = object else {
         unreachable!("constructed as Object::Mach")
     };
@@ -70,7 +83,6 @@ pub(super) fn extract(
     // of the per-binary cost. Falls back to the whole input for thin binaries
     // or when no native slice is found.
     let mut native_rizin_range: Option<(usize, usize)> = None;
-    let mut run_rizin = true;
     let (go_pclntab, go_rodata) = match parsed {
         Mach::Binary(macho) => {
             single_arch(&macho, bytes, values, metrics, sections_out, symbols_out);
@@ -94,14 +106,6 @@ pub(super) fn extract(
                 symbols_out,
                 errors_out,
             );
-            // A header claiming more entries than the file can hold is not a
-            // universal binary rizin can use, and rizin spends its whole
-            // timeout walking the claimed entries.
-            run_rizin = fat.narches
-                <= bytes
-                    .len()
-                    .saturating_sub(goblin::mach::fat::SIZEOF_FAT_HEADER)
-                    / goblin::mach::fat::SIZEOF_FAT_ARCH;
             if crate::rizin::native_arch_only() {
                 native_rizin_range = native_slice_range(bytes, &arches);
             }
@@ -109,11 +113,11 @@ pub(super) fn extract(
         }
     };
     let rizin_bytes = match native_rizin_range {
-        Some((start, end)) => &bytes[start..end],
+        Some((start, end)) => bytes.get(start..end).unwrap_or(bytes),
         None => bytes,
     };
     let has_go_pclntab = go_pclntab.is_some_and(super::go_buildinfo::has_pclntab_magic);
-    if run_rizin {
+    if fat_table_fits {
         rizin_fallback(
             NativeFormat::MachO,
             rizin_bytes,
@@ -164,6 +168,13 @@ fn macho_go_sections<'a>(macho: &MachO<'a>) -> (Option<&'a [u8]>, Option<&'a [u8
         }
     }
     (pclntab, const_data.or(rodata))
+}
+
+/// Whether a fat header's declared arch count fits in a file of `len` bytes.
+fn fat_table_fits(narches: usize, len: usize) -> bool {
+    narches
+        <= len.saturating_sub(goblin::mach::fat::SIZEOF_FAT_HEADER)
+            / goblin::mach::fat::SIZEOF_FAT_ARCH
 }
 
 /// Most fat-header entries examined. `iter_arches` runs to the header's
@@ -231,7 +242,9 @@ fn fat_binary(
             continue;
         }
         let end = start.saturating_add(arch.size as usize).min(bytes.len());
-        let slice_bytes = &bytes[start..end];
+        let Some(slice_bytes) = bytes.get(start..end) else {
+            continue;
+        };
         // An unparseable slice is skipped; a panicking one is also recorded,
         // as a panic on the container itself would be.
         let macho = match goblin_safe::parse_macho_slice(slice_bytes) {
@@ -269,7 +282,7 @@ fn fat_binary(
             );
             // Unified sections address the whole input; load-command offsets
             // address the slice. Entropy was already computed on slice bytes.
-            for section in &mut sections_out[first_section..] {
+            for section in sections_out.iter_mut().skip(first_section) {
                 if section.file_size > 0 {
                     section.file_offset = section.file_offset.saturating_add(start as u64);
                 }
@@ -1158,7 +1171,9 @@ fn function_starts(macho: &MachO<'_>, bytes: &[u8], values: &mut Values, metrics
     if start >= bytes.len() || start >= end {
         return;
     }
-    let data = &bytes[start..end];
+    let Some(data) = bytes.get(start..end) else {
+        return;
+    };
     let mut count: u64 = 0;
     let mut i = 0usize;
     while i < data.len() {
@@ -1168,11 +1183,7 @@ fn function_starts(macho: &MachO<'_>, bytes: &[u8], values: &mut Values, metrics
         let mut value: u64 = 0;
         let mut shift = 0u32;
         let mut consumed = 0usize;
-        loop {
-            if i + consumed >= data.len() {
-                break;
-            }
-            let b = data[i + consumed];
+        while let Some(&b) = data.get(i + consumed) {
             consumed += 1;
             value |= u64::from(b & 0x7f) << shift;
             if b & 0x80 == 0 {
@@ -1218,11 +1229,11 @@ fn data_in_code_kinds(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
     }
     let little_endian = macho.little_endian;
     let mut kinds = serde_json::Map::new();
-    for chunk in bytes[start..end].as_chunks::<8>().0 {
+    for &[.., k0, k1] in bytes.get(start..end).unwrap_or_default().as_chunks::<8>().0 {
         let kind = if little_endian {
-            u16::from_le_bytes([chunk[6], chunk[7]])
+            u16::from_le_bytes([k0, k1])
         } else {
-            u16::from_be_bytes([chunk[6], chunk[7]])
+            u16::from_be_bytes([k0, k1])
         };
         let name = data_in_code_kind_name(kind);
         let entry = kinds
@@ -1256,7 +1267,7 @@ fn data_in_code_kind_name(kind: u16) -> &'static str {
 /// 8-byte alignment. Surfaces each string as an element of
 /// `macho.linker_options[]`.
 fn linker_options(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
-    let little_endian = macho.little_endian;
+    let read_u32 = u32_reader(macho);
     let mut all: Vec<JsonValue> = Vec::new();
     for lc in &macho.load_commands {
         let mach::load_command::CommandVariant::LinkerOption(c) = lc.command else {
@@ -1270,13 +1281,13 @@ fn linker_options(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
         if body_start + 4 > body_end {
             continue;
         }
-        let count_field_start = cmd_offset.saturating_add(8);
-        let count = read_u32(
-            &bytes[count_field_start..count_field_start + 4],
-            0,
-            little_endian,
-        ) as usize;
-        let body = &bytes[body_start..body_end];
+        let Some(count) = read_u32(bytes, cmd_offset.saturating_add(8)) else {
+            continue;
+        };
+        let count = count as usize;
+        let Some(body) = bytes.get(body_start..body_end) else {
+            continue;
+        };
         let mut taken = 0;
         for chunk in body.split(|&b| b == 0) {
             if taken >= count {
@@ -1316,9 +1327,11 @@ fn objc_image_info(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
             if end < off + 8 {
                 return;
             }
-            let little_endian = macho.little_endian;
-            let _version = read_u32(&bytes[off..off + 4], 0, little_endian);
-            let flags = read_u32(&bytes[off + 4..off + 8], 0, little_endian);
+            let read_u32 = u32_reader(macho);
+            // `flags` follows the unused `version` word.
+            let Some(flags) = read_u32(bytes, off + 4) else {
+                return;
+            };
             let swift_version = (flags >> 8) & 0xff;
             let mut obj = serde_json::Map::new();
             obj.insert(
@@ -1512,14 +1525,16 @@ fn build_version(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
         let entries_bytes = (bv.ntools as usize).saturating_mul(8);
         let tools_end = tools_start.saturating_add(entries_bytes).min(bytes.len());
         if tools_start + 8 <= tools_end {
-            let little_endian = macho.little_endian;
-            let tools: Vec<JsonValue> = bytes[tools_start..tools_end]
+            let read_u32 = u32_reader(macho);
+            let tools: Vec<JsonValue> = bytes
+                .get(tools_start..tools_end)
+                .unwrap_or_default()
                 .as_chunks::<8>()
                 .0
                 .iter()
-                .map(|c| {
-                    let tool = read_u32(c, 0, little_endian);
-                    let version = read_u32(c, 4, little_endian);
+                .filter_map(|c| {
+                    let tool = read_u32(c, 0)?;
+                    let version = read_u32(c, 4)?;
                     let mut entry = serde_json::Map::new();
                     entry.insert(
                         "tool".into(),
@@ -1529,7 +1544,7 @@ fn build_version(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
                         "version".into(),
                         JsonValue::String(decode_version_nibbles(version)),
                     );
-                    JsonValue::Object(entry)
+                    Some(JsonValue::Object(entry))
                 })
                 .collect();
             if !tools.is_empty() {
@@ -1540,12 +1555,12 @@ fn build_version(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
     values.insert("macho.build_version", JsonValue::Object(obj));
 }
 
-fn read_u32(bytes: &[u8], offset: usize, little_endian: bool) -> u32 {
-    use crate::formats::common::bytes_at;
-    if little_endian {
-        bytes_at::u32_le(bytes, offset).unwrap_or(0)
+/// The `crate::bytes` reader for a `u32` in `macho`'s byte order.
+fn u32_reader(macho: &MachO<'_>) -> fn(&[u8], usize) -> Option<u32> {
+    if macho.little_endian {
+        bytes::u32_le
     } else {
-        bytes_at::u32_be(bytes, offset).unwrap_or(0)
+        bytes::u32_be
     }
 }
 
@@ -1653,9 +1668,9 @@ fn load_dylinker(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
     if start >= bytes.len() {
         return;
     }
-    let tail = &bytes[start..];
-    let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
-    if let Ok(s) = std::str::from_utf8(&tail[..end]) {
+    let tail = bytes.get(start..).unwrap_or_default();
+    let name = tail.split(|&b| b == 0).next().unwrap_or(tail);
+    if let Ok(s) = std::str::from_utf8(name) {
         if !s.is_empty() {
             put_str(values, "macho.dyld_path", s);
         }
@@ -1763,7 +1778,9 @@ fn emit_embedded_plist(
             if len > MAX_EMBEDDED_PLIST_BYTES {
                 return;
             }
-            let plist_bytes = &bytes[off..end];
+            let Some(plist_bytes) = bytes.get(off..end) else {
+                return;
+            };
             if let Ok(parsed) = plist::Value::from_reader(std::io::Cursor::new(plist_bytes)) {
                 values.insert(value_key, plist_to_json(parsed, 0));
             }
@@ -2166,10 +2183,22 @@ mod tests {
     }
 
     #[test]
+    fn fat_table_must_fit_the_file() {
+        // 50 entries of 20 bytes after the 8-byte header fill 1008 bytes.
+        assert!(fat_table_fits(50, 1008));
+        assert!(!fat_table_fits(51, 1008));
+        assert!(!fat_table_fits(u32::MAX as usize, 1024));
+        assert!(fat_table_fits(0, 0));
+    }
+
+    #[test]
     fn fat_header_arch_count_is_bounded_by_the_buffer() {
         // nfat_arch = u32::MAX over a 1 KiB file. goblin's `iter_arches`
         // does not check the count against the buffer, so the walk must.
-        // Rizin stays enabled: handed this header, it runs to its timeout.
+        // Rizin and stng's object walk both trust the count and would run for
+        // minutes; `fat_table_fits` keeps this input away from them. (stng
+        // caches strings on disk, so a warm cache can hide a regression here;
+        // `fat_table_must_fit_the_file` pins the guard itself.)
         let mut bytes = vec![0xCA, 0xFE, 0xBA, 0xBE, 0xFF, 0xFF, 0xFF, 0xFF];
         bytes.resize(1024, 0);
         let (_, _, metrics) = run(&bytes);

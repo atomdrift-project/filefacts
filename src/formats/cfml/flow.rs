@@ -85,7 +85,7 @@ impl Builder<'_> {
     // Keep identifier spelling separate from values: a quoted name is not a read.
     fn condition_comparison(&mut self, tag: &Tag, target: &str) {
         let r = self.trim(tag.body.clone());
-        let text = String::from_utf8_lossy(&self.bytes[r.clone()]);
+        let text = String::from_utf8_lossy(self.bytes.get(r.clone()).unwrap_or_default());
         let mut parts = text.split_ascii_whitespace();
         let words = (parts.next(), parts.next(), parts.next(), parts.next());
         let operands = if let (Some(left), Some(op), Some(right), None) = words
@@ -117,9 +117,10 @@ impl Builder<'_> {
         let left_range = r.start..r.start + left.len();
         let right_range = r.end - right.len()..r.end;
         let operator_offset = left_range.end
-            + self.bytes[left_range.end..right_range.start]
-                .iter()
-                .position(|b| !b.is_ascii_whitespace())
+            + self
+                .bytes
+                .get(left_range.end..right_range.start)
+                .and_then(|between| between.iter().position(|b| !b.is_ascii_whitespace()))
                 .unwrap_or(0);
         let left_value = self.expr(left_range, 0);
         let right_value = self.expr(right_range, 0);
@@ -127,9 +128,11 @@ impl Builder<'_> {
         if operator == 0 {
             return;
         }
-        self.result.flow.values[operator].literal = Some(Arg::String {
-            value: "neq".into(),
-        });
+        if let Some(value) = self.result.flow.values.get_mut(operator) {
+            value.literal = Some(Arg::String {
+                value: "neq".into(),
+            });
+        }
         let call = self.add(
             "call",
             tag.span.start,
@@ -138,7 +141,9 @@ impl Builder<'_> {
         if call == 0 {
             return;
         }
-        self.result.flow.values[call].target = Some(target.into());
+        if let Some(value) = self.result.flow.values.get_mut(call) {
+            value.target = Some(target.into());
+        }
         self.result.symbols.push(Symbol::Call {
             target: Some(target.into()),
             args: vec![
@@ -152,12 +157,15 @@ impl Builder<'_> {
         });
     }
     fn indexed_member(&mut self, r: Range<usize>) -> usize {
+        let bytes = self.bytes;
+        // Input through the range end; a range past the input stops with it.
+        let text = bytes.get(..r.end).unwrap_or(bytes);
         let mut at = r.start;
         let mut path = String::new();
-        while at < r.end
-            && (self.bytes[at].is_ascii_alphanumeric() || matches!(self.bytes[at], b'_' | b'.'))
+        while let Some(&byte) = text.get(at)
+            && (byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
         {
-            path.push((self.bytes[at] as char).to_ascii_lowercase());
+            path.push((byte as char).to_ascii_lowercase());
             at += 1;
         }
         if path.is_empty()
@@ -174,48 +182,54 @@ impl Builder<'_> {
         }
         let mut parts = 0;
         while at < r.end {
-            while at < r.end && self.bytes[at].is_ascii_whitespace() {
+            while text.get(at).is_some_and(u8::is_ascii_whitespace) {
                 at += 1;
             }
-            if at == r.end {
+            let Some(&byte) = text.get(at) else {
                 break;
-            }
+            };
             parts += 1;
             if parts > MAX_EXPR_PARTS {
                 self.gap("expression-parts");
                 return 0;
             }
-            if self.bytes[at] == b'.' {
+            if byte == b'.' {
                 at += 1;
                 let start = at;
-                while at < r.end
-                    && (self.bytes[at].is_ascii_alphanumeric() || self.bytes[at] == b'_')
+                while text
+                    .get(at)
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
                 {
                     at += 1;
                 }
                 if start == at
-                    || !(self.bytes[start].is_ascii_alphabetic() || self.bytes[start] == b'_')
+                    || !text
+                        .get(start)
+                        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
                 {
                     self.gap("unsupported-indexed-member");
                     return 0;
                 }
                 path.push('.');
                 path.push_str(
-                    &String::from_utf8_lossy(&self.bytes[start..at]).to_ascii_lowercase(),
+                    &String::from_utf8_lossy(text.get(start..at).unwrap_or_default())
+                        .to_ascii_lowercase(),
                 );
                 continue;
             }
-            if self.bytes[at] != b'[' {
+            if byte != b'[' {
                 self.gap("unsupported-indexed-member");
                 return 0;
             }
             let start = at + 1;
             let mut depth = 1;
             at += 1;
-            while at < r.end && depth > 0 {
-                match self.bytes[at] {
+            while depth > 0
+                && let Some(&byte) = text.get(at)
+            {
+                match byte {
                     b'\'' | b'"' => {
-                        if !super::quoted(&self.bytes[..r.end], &mut at) {
+                        if !super::quoted(text, &mut at) {
                             self.gap("malformed-expression");
                             return 0;
                         }
@@ -243,18 +257,16 @@ impl Builder<'_> {
                 return 0;
             }
             let key = self.trim(start..at);
-            let raw = &self.bytes[key];
-            if raw.len() >= 3
-                && matches!(raw[0], b'\'' | b'"')
-                && raw.last() == Some(&raw[0])
-                && raw[1..raw.len() - 1]
+            let raw = bytes.get(key).unwrap_or_default();
+            if let [quote @ (b'\'' | b'"'), inner @ .., last] = raw
+                && last == quote
+                && !inner.is_empty()
+                && inner
                     .iter()
                     .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
             {
                 path.push('.');
-                path.push_str(
-                    &String::from_utf8_lossy(&raw[1..raw.len() - 1]).to_ascii_lowercase(),
-                );
+                path.push_str(&String::from_utf8_lossy(inner).to_ascii_lowercase());
             } else if raw.is_empty() {
                 self.gap("malformed-expression");
                 return 0;
@@ -268,21 +280,24 @@ impl Builder<'_> {
             return *id;
         }
         let id = self.add("member", r.start, Vec::new());
-        if id != 0 {
-            self.result.flow.values[id].target = Some(path);
+        if id != 0
+            && let Some(value) = self.result.flow.values.get_mut(id)
+        {
+            value.target = Some(path);
         }
         id
     }
     // Locate syntax only at the current nesting level. Strings and their
     // interpolation are opaque here; recursive expression parsing is bounded.
     fn separators(&mut self, r: Range<usize>, delimiter: u8) -> Option<Vec<usize>> {
+        let bytes = self.bytes;
+        let text = bytes.get(..r.end).unwrap_or(bytes);
         let mut positions = Vec::new();
         let mut nesting = 0usize;
         let mut at = r.start;
-        while at < r.end {
-            let byte = self.bytes[at];
+        while let Some(&byte) = text.get(at) {
             if matches!(byte, b'\'' | b'"') {
-                if !super::quoted(&self.bytes[..r.end], &mut at) {
+                if !super::quoted(text, &mut at) {
                     self.gap("malformed-expression");
                     return None;
                 }
@@ -341,20 +356,31 @@ impl Builder<'_> {
         self.result.flow.limitations.insert(name.into());
     }
     fn trim(&self, mut r: Range<usize>) -> Range<usize> {
-        while r.start < r.end && self.bytes[r.start].is_ascii_whitespace() {
+        while r.start < r.end && self.bytes.get(r.start).is_some_and(u8::is_ascii_whitespace) {
             r.start += 1;
         }
-        while r.start < r.end && self.bytes[r.end - 1].is_ascii_whitespace() {
+        while r.start < r.end
+            && self
+                .bytes
+                .get(r.end - 1)
+                .is_some_and(u8::is_ascii_whitespace)
+        {
             r.end -= 1;
         }
         r
     }
     fn concat(&mut self, offset: usize, inputs: Vec<usize>) -> usize {
-        if inputs.len() == 1 {
-            return inputs[0];
+        if let [only] = inputs.as_slice() {
+            return *only;
         }
         let total = inputs.iter().try_fold(0usize, |total, id| {
-            match &self.result.flow.values[*id].literal {
+            match self
+                .result
+                .flow
+                .values
+                .get(*id)
+                .and_then(|v| v.literal.as_ref())
+            {
                 Some(Arg::String { value }) => total.checked_add(value.len()),
                 _ => None,
             }
@@ -369,40 +395,53 @@ impl Builder<'_> {
                 return id;
             }
             let mut value = String::with_capacity(total);
-            for input in &self.result.flow.values[id].inputs {
-                if let Some(Arg::String { value: part }) = &self.result.flow.values[*input].literal
+            let values = &self.result.flow.values;
+            let inputs = values
+                .get(id)
+                .map(|v| v.inputs.as_slice())
+                .unwrap_or_default();
+            for input in inputs {
+                if let Some(Arg::String { value: part }) =
+                    values.get(*input).and_then(|v| v.literal.as_ref())
                 {
                     value.push_str(part);
                 }
             }
             self.folded_bytes += total;
-            self.result.flow.values[id].literal = Some(Arg::String { value });
+            if let Some(concat) = self.result.flow.values.get_mut(id) {
+                concat.literal = Some(Arg::String { value });
+            }
         }
         id
     }
     fn string_literal(&mut self, r: Range<usize>, quote: Option<u8>) -> usize {
         let id = self.add("literal", r.start, Vec::new());
-        if id != 0 {
-            let raw = String::from_utf8_lossy(&self.bytes[r]).replace("##", "#");
+        if id != 0
+            && let Some(entry) = self.result.flow.values.get_mut(id)
+        {
+            let raw =
+                String::from_utf8_lossy(self.bytes.get(r).unwrap_or_default()).replace("##", "#");
             let value = match quote {
                 Some(b'\'') => raw.replace("''", "'"),
                 Some(b'"') => raw.replace("\"\"", "\""),
                 _ => raw,
             };
-            self.result.flow.values[id].literal = Some(Arg::String { value });
+            entry.literal = Some(Arg::String { value });
         }
         id
     }
     fn string(&mut self, r: Range<usize>, depth: usize, quote: Option<u8>) -> usize {
+        let bytes = self.bytes;
+        let text = bytes.get(..r.end).unwrap_or(bytes);
         let mut inputs = Vec::new();
         let mut at = r.start;
         let mut text_start = r.start;
-        while at < r.end {
-            if self.bytes[at] != b'#' {
+        while let Some(&byte) = text.get(at) {
+            if byte != b'#' {
                 at += 1;
                 continue;
             }
-            if self.bytes.get(at + 1) == Some(&b'#') {
+            if bytes.get(at + 1) == Some(&b'#') {
                 at += 2;
                 continue;
             }
@@ -415,7 +454,7 @@ impl Builder<'_> {
                 inputs.push(self.string_literal(text_start..at, quote));
             }
             at += 1;
-            if !super::interpolation(&self.bytes[..r.end], &mut at) {
+            if !super::interpolation(text, &mut at) {
                 self.gap("malformed-interpolation");
                 return 0;
             }
@@ -437,11 +476,12 @@ impl Builder<'_> {
             return 0;
         }
         let r = self.trim(r);
-        if r.is_empty() {
+        let bytes = self.bytes;
+        let Some(raw @ [first, ..]) = bytes.get(r.clone()) else {
             return 0;
-        }
-        let raw = &self.bytes[r.clone()];
-        if raw[0] == b'#' && raw.last() == Some(&b'#') {
+        };
+        let first = *first;
+        if first == b'#' && raw.last() == Some(&b'#') {
             return self.expr(r.start + 1..r.end - 1, depth + 1);
         }
         let Some(parts) = self.separators(r.clone(), b'&') else {
@@ -460,14 +500,17 @@ impl Builder<'_> {
             }
             return self.concat(r.start, inputs);
         }
-        let raw = &self.bytes[r.clone()];
-        if matches!(raw[0], b'\'' | b'"') {
+        if matches!(first, b'\'' | b'"') {
             let mut end = r.start;
-            if !super::quoted(&self.bytes[..r.end], &mut end) || end != r.end {
+            if !bytes
+                .get(..r.end)
+                .is_some_and(|text| super::quoted(text, &mut end))
+                || end != r.end
+            {
                 self.gap("unsupported-expression");
                 return 0;
             }
-            return self.string(r.start + 1..r.end - 1, depth, Some(raw[0]));
+            return self.string(r.start + 1..r.end - 1, depth, Some(first));
         }
         if raw.last() == Some(&b')') {
             let Some(opens) = self.separators(r.clone(), b'(') else {
@@ -478,7 +521,8 @@ impl Builder<'_> {
                     return self.expr(open + 1..r.end - 1, depth + 1);
                 }
                 let prefix = self.trim(r.start..open);
-                let prefix_text = String::from_utf8_lossy(&self.bytes[prefix.clone()]);
+                let prefix_bytes = bytes.get(prefix.clone()).unwrap_or_default();
+                let prefix_text = String::from_utf8_lossy(prefix_bytes);
                 let valid_name = |s: &str| {
                     !s.is_empty()
                         && s.split('.').all(|part| {
@@ -506,15 +550,28 @@ impl Builder<'_> {
                 };
                 let (target, receiver) = if let Some(target) = static_name {
                     (target, None)
-                } else if let Some(dot) = prefix_text.rfind('.') {
-                    let method = prefix_text[dot + 1..].trim();
+                } else if let Some((_, method)) = prefix_text.rsplit_once('.') {
+                    let method = method.trim();
                     if !valid_name(method) || method.contains('.') {
                         self.gap("unsupported-call-target");
                         return 0;
                     }
                     let method = method.to_ascii_lowercase();
+                    // Offset of the `.` in the source bytes. Its offset in
+                    // `prefix_text` differs once lossy decoding has widened an
+                    // invalid byte to U+FFFD, and could overrun the input.
+                    let dot = prefix_bytes
+                        .iter()
+                        .rposition(|&b| b == b'.')
+                        .unwrap_or_default();
                     let receiver = self.expr(prefix.start..prefix.start + dot, depth + 1);
-                    let Some(parent) = self.result.flow.values[receiver].target.clone() else {
+                    let Some(parent) = self
+                        .result
+                        .flow
+                        .values
+                        .get(receiver)
+                        .and_then(|v| v.target.clone())
+                    else {
                         self.gap("unsupported-call-target");
                         return 0;
                     };
@@ -542,11 +599,14 @@ impl Builder<'_> {
                 let id = self.add("call", r.start, inputs);
                 if id != 0 {
                     let mut truncated = false;
-                    let args = self.result.flow.values[id]
-                        .inputs
+                    let values = &self.result.flow.values;
+                    let args = values
+                        .get(id)
+                        .map(|v| v.inputs.as_slice())
+                        .unwrap_or_default()
                         .iter()
-                        .map(|input| {
-                            let value = &self.result.flow.values[*input];
+                        .filter_map(|input| values.get(*input))
+                        .map(|value| {
                             if let Some(Arg::String { value: text }) = &value.literal {
                                 if text.len() > super::MAX_BYTES - self.symbol_literal_bytes {
                                     truncated = true;
@@ -571,13 +631,15 @@ impl Builder<'_> {
                         args,
                         offset: Some(r.start as u64),
                     });
-                    self.result.flow.values[id].target = Some(target);
-                    self.result.flow.values[id].receiver = receiver;
+                    if let Some(value) = self.result.flow.values.get_mut(id) {
+                        value.target = Some(target);
+                        value.receiver = receiver;
+                    }
                 }
                 return id;
             }
         }
-        if !raw[0].is_ascii_alphabetic() && raw[0] != b'_' {
+        if !first.is_ascii_alphabetic() && first != b'_' {
             self.gap("unsupported-expression");
             return 0;
         }
@@ -595,7 +657,10 @@ impl Builder<'_> {
         if let Some(id) = self.bindings.get(&name) {
             return *id;
         }
-        if raw.len() >= 10 && raw[..10].eq_ignore_ascii_case(b"variables.") {
+        if raw
+            .get(..10)
+            .is_some_and(|scope| scope.eq_ignore_ascii_case(b"variables."))
+        {
             self.gap("unresolved-explicit-variable");
             return 0;
         }
@@ -605,8 +670,10 @@ impl Builder<'_> {
         }
         if name.contains('.') {
             let id = self.add("member", r.start, Vec::new());
-            if id != 0 {
-                self.result.flow.values[id].target = Some(name);
+            if id != 0
+                && let Some(value) = self.result.flow.values.get_mut(id)
+            {
+                value.target = Some(name);
             }
             id
         } else {
@@ -626,8 +693,10 @@ impl Builder<'_> {
                         return *id;
                     }
                     let id = self.add("member", r.start, Vec::new());
-                    if id != 0 {
-                        self.result.flow.values[id].target = Some(path);
+                    if id != 0
+                        && let Some(value) = self.result.flow.values.get_mut(id)
+                    {
+                        value.target = Some(path);
                     }
                     return id;
                 }
@@ -645,7 +714,7 @@ impl Builder<'_> {
             if let Some(equals) = self.separators(range.clone(), b'=') {
                 if let Some(&eq) = equals.first() {
                     let lhs = self.trim(range.start..eq);
-                    let text = &self.bytes[lhs.clone()];
+                    let text = self.bytes.get(lhs.clone()).unwrap_or_default();
                     let simple = !text.is_empty()
                         && text.split(|b| *b == b'.').all(|part| {
                             part.first()
@@ -689,7 +758,7 @@ impl Builder<'_> {
         let (calls, limited) = super::script::calls(self.bytes, range.clone());
         // A complete standalone call does not itself define a local variable.
         // Unsupported statements/control headers cannot preserve stale aliases.
-        if !assignments || calls.len() != 1 || calls[0] != range {
+        if !assignments || !matches!(calls.as_slice(), [only] if *only == range) {
             self.bindings.clear();
             self.gap("script-statement-flow-unavailable");
         }
@@ -702,13 +771,19 @@ impl Builder<'_> {
     }
     fn assignment(&mut self, tag: &Tag) {
         let r = self.trim(tag.body.clone());
-        let Some(eq) = self.bytes[r.clone()].iter().position(|b| *b == b'=') else {
+        let Some(eq) = self
+            .bytes
+            .get(r.clone())
+            .and_then(|body| body.iter().position(|b| *b == b'='))
+        else {
             self.gap("unsupported-assignment");
             self.bindings.clear();
             return;
         };
         let lhs = self.trim(r.start..r.start + eq);
-        let name = normalize_binding(&String::from_utf8_lossy(&self.bytes[lhs.clone()]));
+        let name = normalize_binding(&String::from_utf8_lossy(
+            self.bytes.get(lhs.clone()).unwrap_or_default(),
+        ));
         if name.is_empty()
             || name.split('.').any(|part| {
                 !part
@@ -726,15 +801,20 @@ impl Builder<'_> {
         }
         let rhs = self.trim(r.start + eq + 1..r.end);
         let value = self.expr(rhs.clone(), 0);
-        let raw = &self.bytes[rhs.clone()];
+        let raw = self.bytes.get(rhs.clone()).unwrap_or_default();
         let mut shape = ArgShape::Expression;
         if raw.first().is_some_and(|b| matches!(b, b'\'' | b'"')) {
             let mut end = rhs.start;
-            if super::quoted(&self.bytes[..rhs.end], &mut end) && end == rhs.end {
+            if self
+                .bytes
+                .get(..rhs.end)
+                .is_some_and(|text| super::quoted(text, &mut end))
+                && end == rhs.end
+            {
                 shape = ArgShape::String;
                 let mut at = rhs.start + 1;
                 while at + 1 < rhs.end {
-                    if self.bytes[at] == b'#' {
+                    if self.bytes.get(at) == Some(&b'#') {
                         if self.bytes.get(at + 1) == Some(&b'#') {
                             at += 2;
                             continue;
@@ -764,8 +844,12 @@ impl Builder<'_> {
             })
         {
             shape = ArgShape::Identifier;
-        } else if self.result.flow.values[value].kind == "call"
-            && self.result.flow.values[value].offset == rhs.start
+        } else if self
+            .result
+            .flow
+            .values
+            .get(value)
+            .is_some_and(|v| v.kind == "call" && v.offset == rhs.start)
         {
             shape = ArgShape::Call;
         }
@@ -791,15 +875,24 @@ impl Builder<'_> {
             return None;
         }
         let value = values.values.iter().next()?;
-        match &self.result.flow.values[value.value].literal {
+        match self
+            .result
+            .flow
+            .values
+            .get(value.value)
+            .and_then(|v| v.literal.as_ref())
+        {
             Some(Arg::String { value }) if value.len() <= 256 => Some(value.clone()),
             _ => None,
         }
     }
     fn file_result(&mut self, object: usize, call: usize) {
-        if self.result.flow.values[object]
-            .fields
-            .contains_key("attributecollection")
+        if self
+            .result
+            .flow
+            .values
+            .get(object)
+            .is_some_and(|v| v.fields.contains_key("attributecollection"))
         {
             self.bindings.clear();
             self.gap("dynamic-file-result-attributes");
@@ -814,9 +907,12 @@ impl Builder<'_> {
         {
             return;
         }
-        if !self.result.flow.values[object]
-            .fields
-            .contains_key("variable")
+        if !self
+            .result
+            .flow
+            .values
+            .get(object)
+            .is_some_and(|v| v.fields.contains_key("variable"))
         {
             return;
         }
@@ -845,7 +941,9 @@ impl Builder<'_> {
             self.gap("binding-budget");
             return;
         }
-        let offset = self.result.flow.values[call].offset;
+        let Some(offset) = self.result.flow.values.get(call).map(|v| v.offset) else {
+            return;
+        };
         let result = self.add("call", offset, vec![object]);
         if result == 0 {
             self.bindings.remove(&name);
@@ -853,7 +951,9 @@ impl Builder<'_> {
         }
         // Dedicated result identity prevents ordinary calls named cffile from
         // masquerading as a proven tag read operation in downstream selectors.
-        self.result.flow.values[result].target = Some("cffile:read-result".into());
+        if let Some(value) = self.result.flow.values.get_mut(result) {
+            value.target = Some("cffile:read-result".into());
+        }
         self.result.symbols.push(Symbol::Bind {
             target: name.clone(),
             shape: ArgShape::Call,
@@ -872,7 +972,9 @@ impl Builder<'_> {
             return;
         }
         let target = "cfoutput:expression".to_string();
-        self.result.flow.values[call].target = Some(target.clone());
+        if let Some(value) = self.result.flow.values.get_mut(call) {
+            value.target = Some(target.clone());
+        }
         self.result.symbols.push(Symbol::Call {
             target: Some(target),
             args: vec![Arg::Expression],
@@ -897,17 +999,27 @@ impl Builder<'_> {
         };
         let mut fields = BTreeMap::new();
         for attr in attrs {
-            let key = String::from_utf8_lossy(&self.bytes[attr.name]).to_ascii_lowercase();
+            let key = String::from_utf8_lossy(self.bytes.get(attr.name).unwrap_or_default())
+                .to_ascii_lowercase();
             // Ordinary tag attributes are text, with #...# interpolation,
             // whether or not their outer quotes are present. Bare names are
             // not variable reads (unlike CFSET expression RHS syntax).
-            let quote = (!html && attr.quoted).then(|| self.bytes[attr.value.start - 1]);
+            let quote = if !html && attr.quoted {
+                let open = attr.value.start.checked_sub(1);
+                open.and_then(|open| self.bytes.get(open)).copied()
+            } else {
+                None
+            };
             let mut value = if html && !interpolate {
                 let id = self.add("literal", attr.value.start, Vec::new());
-                if id != 0 {
-                    self.result.flow.values[id].literal = Some(Arg::String {
-                        value: String::from_utf8_lossy(&self.bytes[attr.value.clone()])
-                            .into_owned(),
+                if id != 0
+                    && let Some(entry) = self.result.flow.values.get_mut(id)
+                {
+                    entry.literal = Some(Arg::String {
+                        value: String::from_utf8_lossy(
+                            self.bytes.get(attr.value.clone()).unwrap_or_default(),
+                        )
+                        .into_owned(),
                     });
                 }
                 id
@@ -915,7 +1027,12 @@ impl Builder<'_> {
                 self.string(attr.value.clone(), 0, quote)
             };
             if html {
-                let literal = self.result.flow.values[value].literal.as_ref();
+                let literal = self
+                    .result
+                    .flow
+                    .values
+                    .get(value)
+                    .and_then(|v| v.literal.as_ref());
                 if let Some(Arg::String { value: text }) = literal {
                     if text.contains('&')
                         && text.len().saturating_add(self.folded_bytes) > super::MAX_BYTES
@@ -927,9 +1044,10 @@ impl Builder<'_> {
                             Ok(Some(decoded)) => {
                                 self.folded_bytes += decoded.len();
                                 let id = self.add("concat", attr.value.start, vec![value]);
-                                if id != 0 {
-                                    self.result.flow.values[id].literal =
-                                        Some(Arg::String { value: decoded });
+                                if id != 0
+                                    && let Some(entry) = self.result.flow.values.get_mut(id)
+                                {
+                                    entry.literal = Some(Arg::String { value: decoded });
                                 }
                                 value = id;
                             }
@@ -948,12 +1066,16 @@ impl Builder<'_> {
         if object == 0 {
             return;
         }
-        self.result.flow.values[object].fields = fields;
+        if let Some(value) = self.result.flow.values.get_mut(object) {
+            value.fields = fields;
+        }
         let call = self.add("call", tag.span.start, vec![object]);
         if call == 0 {
             return;
         }
-        self.result.flow.values[call].target = Some(name.clone());
+        if let Some(value) = self.result.flow.values.get_mut(call) {
+            value.target = Some(name.clone());
+        }
         if name == "cffile" {
             self.file_result(object, call);
         }
@@ -1051,7 +1173,8 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
                 b.output(range, unknown_output_scopes == 0);
             }
         }
-        let name = String::from_utf8_lossy(&bytes[tag.name.clone()]).to_ascii_lowercase();
+        let name = String::from_utf8_lossy(bytes.get(tag.name.clone()).unwrap_or_default())
+            .to_ascii_lowercase();
         let script_range = if name == "cfscript" && !tag.closing {
             script_ranges.next()
         } else {
@@ -1140,9 +1263,13 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
             ("cfapplication", false) => {
                 if let Some(attrs) = attributes(bytes, &tag) {
                     for attr in attrs {
-                        if bytes[attr.name].eq_ignore_ascii_case(b"searchimplicitscopes") {
+                        if bytes
+                            .get(attr.name)
+                            .is_some_and(|name| name.eq_ignore_ascii_case(b"searchimplicitscopes"))
+                        {
                             let value =
-                                String::from_utf8_lossy(&bytes[attr.value]).to_ascii_lowercase();
+                                String::from_utf8_lossy(bytes.get(attr.value).unwrap_or_default())
+                                    .to_ascii_lowercase();
                             b.implicit_scope = b.branches.is_empty()
                                 && matches!(value.as_str(), "true" | "yes" | "1");
                             if !matches!(
@@ -1164,7 +1291,11 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
                     attrs.iter().any(|a| {
                         [b"query".as_slice(), b"group", b"attributecollection"]
                             .iter()
-                            .any(|name| bytes[a.name.clone()].eq_ignore_ascii_case(name))
+                            .any(|name| {
+                                bytes
+                                    .get(a.name.clone())
+                                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                            })
                     })
                 });
                 output_scopes.push(unknown);
@@ -1206,6 +1337,31 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A call receiver ends at the `.` byte in the source. Lossy decoding
+    /// widens each invalid byte to three, so the `.` offset in the decoded
+    /// prefix used to address past the end of the input and panic.
+    #[test]
+    fn invalid_utf8_call_receiver_stays_within_the_source() {
+        let invalid = [0xff; 100];
+        for (open, close) in [
+            (b"<cfset a = ".as_slice(), b".foo()>".as_slice()),
+            (b"<cfoutput>#", b".foo()#</cfoutput>"),
+        ] {
+            let source = [open, &invalid, close].concat();
+            let p = parse(&source);
+            assert!(
+                p.flow.limitations.contains("unsupported-call-target"),
+                "{:?}",
+                p.flow.limitations
+            );
+            assert!(
+                p.flow
+                    .values
+                    .iter()
+                    .all(|v| !v.target.as_deref().is_some_and(|t| t.ends_with("foo")))
+            );
+        }
+    }
     #[test]
     fn ordinary_tag_attribute_text_is_consistent_across_call_kinds() {
         for (tag, field, expected) in [

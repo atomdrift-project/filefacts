@@ -57,15 +57,14 @@ fn has_upx_signature(bytes: &[u8]) -> bool {
     // for both PE and ELF and at the tail-marker for ELF. Restricting
     // the search avoids false positives from random `UPX!` triples
     // inside arbitrary file content.
-    let head_window = bytes.len().min(16 * 1024);
-    if memmem::find(&bytes[..head_window], b"UPX!").is_some() {
+    let head_window = bytes.get(..16 * 1024).unwrap_or(bytes);
+    if memmem::find(head_window, b"UPX!").is_some() {
         return true;
     }
-    if bytes.len() >= 64 {
-        let tail_start = bytes.len().saturating_sub(64);
-        if memmem::find(&bytes[tail_start..], b"UPX!").is_some() {
-            return true;
-        }
+    if let Some(tail) = bytes.last_chunk::<64>()
+        && memmem::find(tail, b"UPX!").is_some()
+    {
+        return true;
     }
     false
 }
@@ -79,7 +78,7 @@ fn extract_version(bytes: &[u8]) -> Option<String> {
     let rest = bytes.get(start..)?;
     // Version runs up to the next whitespace.
     let end = rest.iter().position(|&b| b == b' ' || b == b'\t')?;
-    let v = &rest[..end];
+    let v = rest.get(..end)?;
     std::str::from_utf8(v).ok().map(str::to_string)
 }
 

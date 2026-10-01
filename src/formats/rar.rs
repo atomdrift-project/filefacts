@@ -19,10 +19,12 @@
 //! that displaying names from QO and extracting from the real headers
 //! can be made to disagree. We only walk the real headers.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
+use super::archive_stats::{Agg, ArchiveStats, Dominance, Reading, Scope, Shape, member_value};
+use crate::bytes::Reader;
 use crate::error::Error;
 use crate::formats::common::hex_encode;
 use crate::metric;
@@ -35,7 +37,6 @@ const MAX_HEADER: usize = 2 * 1024 * 1024;
 const MAX_NAME: usize = 65_536;
 const MAX_MEMBERS: usize = 100_000;
 const MAX_BLOCKS: usize = 200_000;
-const FUTURE_UNIX: i64 = 4_102_444_800;
 const FILETIME_UNIX_DIFF: u64 = 116_444_736_000_000_000;
 
 const SIG4: &[u8] = b"Rar!\x1a\x07\x00";
@@ -97,49 +98,15 @@ const R4_LHD_SALT: u16 = 0x0400;
 const R4_LHD_VERSION: u16 = 0x0800;
 const R4_LHD_EXTTIME: u16 = 0x1000;
 
-struct In<'a> {
-    bytes: &'a [u8],
-    pos: usize,
+/// RAR5's variable-length integer: seven bits per byte, low group first,
+/// with the high bit set on every byte but the last.
+trait ReadVint {
+    /// Read one vint. One that runs off the end, or past ten bytes, fails
+    /// having consumed the bytes it read.
+    fn vint(&mut self) -> Option<u64>;
 }
 
-impl<'a> In<'a> {
-    fn new(bytes: &'a [u8], pos: usize) -> Self {
-        Self { bytes, pos }
-    }
-
-    fn remaining(&self) -> usize {
-        self.bytes.len().saturating_sub(self.pos)
-    }
-
-    fn at_end(&self) -> bool {
-        self.pos >= self.bytes.len()
-    }
-
-    fn slice(&mut self, n: usize) -> Option<&'a [u8]> {
-        let end = self.pos.checked_add(n)?;
-        let s = self.bytes.get(self.pos..end)?;
-        self.pos = end;
-        Some(s)
-    }
-
-    fn u8(&mut self) -> Option<u8> {
-        self.slice(1).map(|s| s[0])
-    }
-
-    fn u16(&mut self) -> Option<u16> {
-        self.slice(2).map(|s| u16::from_le_bytes([s[0], s[1]]))
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        self.slice(4)
-            .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-    }
-
-    fn u64(&mut self) -> Option<u64> {
-        self.slice(8)
-            .map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
-    }
-
+impl ReadVint for Reader<'_> {
     fn vint(&mut self) -> Option<u64> {
         let mut n = 0u64;
         let mut shift = 0u32;
@@ -152,15 +119,6 @@ impl<'a> In<'a> {
             shift = shift.saturating_add(7);
         }
         None
-    }
-
-    fn skip(&mut self, n: usize) -> Option<()> {
-        let end = self.pos.checked_add(n)?;
-        if end > self.bytes.len() {
-            return None;
-        }
-        self.pos = end;
-        Some(())
     }
 }
 
@@ -249,7 +207,6 @@ struct Archive {
     members: Vec<Member>,
     services: Vec<String>,
     streams: Vec<JsonValue>,
-    methods: BTreeMap<String, u64>,
     extra_types: BTreeSet<u64>,
     limits: Vec<JsonValue>,
     end_present: bool,
@@ -285,7 +242,7 @@ fn limit(ar: &mut Archive, stage: &str, reason: impl Into<String>) {
 /// Step over a block's packed data. Data running past the end of the file is
 /// a truncated archive or a lying size: stop at the end and record it, rather
 /// than resume the header walk inside the payload.
-fn skip_data(inp: &mut In<'_>, ar: &mut Archive, size: u64) {
+fn skip_data(inp: &mut Reader<'_>, ar: &mut Archive, size: u64) {
     let remaining = inp.remaining() as u64;
     if size > remaining {
         limit(
@@ -297,16 +254,18 @@ fn skip_data(inp: &mut In<'_>, ar: &mut Archive, size: u64) {
             ),
         );
     }
-    inp.pos += size.min(remaining) as usize;
+    // Clamped to what is left, so the skip cannot fail.
+    let _ = inp.skip(size.min(remaining) as usize);
 }
 
 fn find_signature(bytes: &[u8]) -> Option<(usize, u8)> {
     let search = bytes.len().min(MAX_SFX.saturating_add(SIG5.len()));
-    let hay = &bytes[..search];
+    let hay = bytes.get(..search)?;
     (0..hay.len().saturating_sub(SIG4.len() - 1)).find_map(|i| {
-        if hay[i..].starts_with(SIG5) {
+        let rest = hay.get(i..)?;
+        if rest.starts_with(SIG5) {
             Some((i, 5))
-        } else if hay[i..].starts_with(SIG4) {
+        } else if rest.starts_with(SIG4) {
             Some((i, 4))
         } else {
             None
@@ -315,8 +274,8 @@ fn find_signature(bytes: &[u8]) -> Option<(usize, u8)> {
 }
 
 fn utf8_name(bytes: &[u8]) -> String {
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end]).replace('\\', "/")
+    let name = bytes.split(|&b| b == 0).next().unwrap_or(bytes);
+    String::from_utf8_lossy(name).replace('\\', "/")
 }
 
 fn host5(n: u64) -> String {
@@ -382,20 +341,20 @@ fn dos_to_unix(ft: u32) -> Option<i64> {
     Some(days * 86_400 + hour * 3600 + min * 60 + sec)
 }
 
-fn unix_time(flags: u64, inp: &mut In<'_>) -> Option<i64> {
+fn unix_time(flags: u64, inp: &mut Reader<'_>) -> Option<i64> {
     if flags & 0x0001 != 0 {
-        Some(i64::from(inp.u32()?))
+        Some(i64::from(inp.u32_le()?))
     } else {
-        filetime_to_unix(inp.u64()?)
+        filetime_to_unix(inp.u64_le()?)
     }
 }
 
 fn parse_extra(bytes: &[u8], extra: &mut Extra) {
     extra.bytes = extra.bytes.saturating_add(bytes.len() as u64);
-    let mut inp = In::new(bytes, 0);
-    while !inp.at_end() {
+    let mut inp = Reader::new(bytes);
+    while inp.remaining() > 0 {
         let Some(size) = inp.vint() else { break };
-        let start = inp.pos;
+        let start = inp.pos();
         let Some(end) = start.checked_add(size as usize) else {
             break;
         };
@@ -405,14 +364,12 @@ fn parse_extra(bytes: &[u8], extra: &mut Extra) {
         }
         let Some(typ) = inp.vint() else { break };
         extra.types.push(typ);
-        let data_off = inp.pos;
-        if data_off > end {
+        let Some(data) = bytes.get(inp.pos()..end) else {
             extra.unknown += 1;
             break;
-        }
-        let data = &bytes[data_off..end];
-        inp.pos = end;
-        let mut d = In::new(data, 0);
+        };
+        inp = Reader::at(bytes, end);
+        let mut d = Reader::new(data);
         match typ {
             0x01 => {
                 extra.encrypted = true;
@@ -425,7 +382,7 @@ fn parse_extra(bytes: &[u8], extra: &mut Extra) {
             }
             0x02 => {
                 if d.vint() == Some(0) && d.remaining() >= 32 {
-                    if let Some(h) = d.slice(32) {
+                    if let Some(h) = d.bytes(32) {
                         extra.blake2 = Some(hex_encode(h));
                     }
                 }
@@ -448,13 +405,13 @@ fn parse_extra(bytes: &[u8], extra: &mut Extra) {
                 // only to keep the cursor aligned for any record after.
                 if flags & (0x0001 | 0x0010) == (0x0001 | 0x0010) {
                     if flags & 0x0002 != 0 {
-                        let _ = d.u32();
+                        let _ = d.u32_le();
                     }
                     if flags & 0x0004 != 0 {
-                        let _ = d.u32();
+                        let _ = d.u32_le();
                     }
                     if flags & 0x0008 != 0 {
-                        let _ = d.u32();
+                        let _ = d.u32_le();
                     }
                 }
             }
@@ -469,7 +426,7 @@ fn parse_extra(bytes: &[u8], extra: &mut Extra) {
                 extra.link_is_dir = flags & 0x0001 != 0;
                 if let Some(nlen) = d.vint() {
                     let n = nlen.min(MAX_NAME as u64) as usize;
-                    if let Some(name) = d.slice(n) {
+                    if let Some(name) = d.bytes(n) {
                         extra.linkname = Some(utf8_name(name));
                     }
                 }
@@ -495,19 +452,19 @@ fn parse_extra(bytes: &[u8], extra: &mut Extra) {
     }
 }
 
-fn read_counted_str(inp: &mut In<'_>) -> Option<String> {
+fn read_counted_str(inp: &mut Reader<'_>) -> Option<String> {
     let n = inp.vint()? as usize;
     if n > MAX_NAME {
         return None;
     }
-    inp.slice(n).map(utf8_name)
+    inp.bytes(n).map(utf8_name)
 }
 
 fn parse_main_extra(bytes: &[u8], ar: &mut Archive) {
-    let mut inp = In::new(bytes, 0);
-    while !inp.at_end() {
+    let mut inp = Reader::new(bytes);
+    while inp.remaining() > 0 {
         let Some(size) = inp.vint() else { break };
-        let start = inp.pos;
+        let start = inp.pos();
         let Some(end) = start.checked_add(size as usize) else {
             break;
         };
@@ -515,11 +472,11 @@ fn parse_main_extra(bytes: &[u8], ar: &mut Archive) {
             break;
         }
         let Some(typ) = inp.vint() else { break };
-        let data = &bytes[inp.pos.min(end)..end];
-        inp.pos = end;
+        let data = bytes.get(inp.pos().min(end)..end).unwrap_or_default();
+        inp = Reader::at(bytes, end);
         ar.extra_field_size = ar.extra_field_size.saturating_add(size);
         ar.extra_types.insert(typ);
-        let mut d = In::new(data, 0);
+        let mut d = Reader::new(data);
         match typ {
             0x01 => {
                 let flags = d.vint().unwrap_or(0);
@@ -535,7 +492,7 @@ fn parse_main_extra(bytes: &[u8], ar: &mut Archive) {
                 if flags & 0x0001 != 0 {
                     if let Some(nlen) = d.vint() {
                         let n = nlen.min(MAX_NAME as u64) as usize;
-                        if let Some(name) = d.slice(n) {
+                        if let Some(name) = d.bytes(n) {
                             if name.first() != Some(&0) {
                                 ar.original_name = Some(utf8_name(name));
                             }
@@ -549,9 +506,9 @@ fn parse_main_extra(bytes: &[u8], ar: &mut Archive) {
                     // shared `unix_time` helper assumes the 0x03 layout and
                     // would misread this field, so decode it directly.
                     ar.created_unix = if flags & 0x0004 != 0 {
-                        d.u32().map(i64::from)
+                        d.u32_le().map(i64::from)
                     } else {
-                        d.u64().and_then(filetime_to_unix)
+                        d.u64_le().and_then(filetime_to_unix)
                     };
                 }
             }
@@ -691,26 +648,24 @@ fn push_member(ar: &mut Archive, member: Member) {
         }
         return;
     }
-    if let Some(m) = member.method.as_deref() {
-        *ar.methods.entry(m.to_string()).or_insert(0) += 1;
-    }
     if member.split_before || member.split_after {
         ar.split += 1;
     }
     ar.members.push(member);
 }
 
-fn walk_rar5(bytes: &[u8], mut inp: In<'_>, ar: &mut Archive) {
+fn walk_rar5(bytes: &[u8], start: usize, ar: &mut Archive) {
+    let mut inp = Reader::at(bytes, start);
     for _ in 0..MAX_BLOCKS {
-        if inp.at_end() {
+        if inp.remaining() == 0 {
             break;
         }
-        let header_off = inp.pos as u64;
-        let Some(stored_crc) = inp.u32() else {
+        let header_off = inp.pos() as u64;
+        let Some(stored_crc) = inp.u32_le() else {
             limit(ar, "header", "truncated CRC");
             break;
         };
-        let size_at = inp.pos;
+        let size_at = inp.pos();
         let Some(header_size) = inp.vint() else {
             limit(ar, "header", "truncated header size");
             break;
@@ -719,16 +674,15 @@ fn walk_rar5(bytes: &[u8], mut inp: In<'_>, ar: &mut Archive) {
             limit(ar, "header", "header size out of range");
             break;
         }
-        let type_at = inp.pos;
+        let type_at = inp.pos();
         let Some(rest_end) = type_at.checked_add(header_size as usize) else {
             limit(ar, "header", "header size overflow");
             break;
         };
-        if rest_end > bytes.len() {
+        let Some(crc_slice) = bytes.get(size_at..rest_end) else {
             limit(ar, "header", "header overruns file");
             break;
-        }
-        let crc_slice = &bytes[size_at..rest_end];
+        };
         if crc32fast::hash(crc_slice) != stored_crc {
             ar.header_crc_mismatch += 1;
         }
@@ -769,8 +723,10 @@ fn walk_rar5(bytes: &[u8], mut inp: In<'_>, ar: &mut Archive) {
                 }
                 if extra_size > 0 {
                     let extra_at = rest_end.saturating_sub(extra_size as usize);
-                    if extra_at >= inp.pos && extra_at <= bytes.len() {
-                        parse_main_extra(&bytes[extra_at..rest_end.min(bytes.len())], ar);
+                    if extra_at >= inp.pos()
+                        && let Some(extra) = bytes.get(extra_at..rest_end.min(bytes.len()))
+                    {
+                        parse_main_extra(extra, ar);
                     }
                 }
             }
@@ -781,10 +737,10 @@ fn walk_rar5(bytes: &[u8], mut inp: In<'_>, ar: &mut Archive) {
                 let attrs = inp.vint().unwrap_or(0) as u32;
                 let mut mtime = None;
                 if file_flags & LHFL_UTIME != 0 {
-                    mtime = inp.u32().map(i64::from);
+                    mtime = inp.u32_le().map(i64::from);
                 }
                 let crc = if file_flags & LHFL_CRC32 != 0 {
-                    inp.u32()
+                    inp.u32_le()
                 } else {
                     None
                 };
@@ -793,19 +749,21 @@ fn walk_rar5(bytes: &[u8], mut inp: In<'_>, ar: &mut Archive) {
                 let nlen = inp.vint().unwrap_or(0) as usize;
                 if nlen > MAX_NAME {
                     limit(ar, "name", "name longer than cap");
-                    inp.pos = rest_end;
+                    inp = Reader::at(bytes, rest_end);
                     if let Some(ds) = data_size {
                         skip_data(&mut inp, ar, ds);
                     }
                     continue;
                 }
-                let name_bytes = inp.slice(nlen).unwrap_or(&[]);
+                let name_bytes = inp.bytes(nlen).unwrap_or(&[]);
                 let name = utf8_name(name_bytes);
                 let mut extra = Extra::default();
                 if extra_size > 0 {
                     let extra_at = rest_end.saturating_sub(extra_size as usize);
-                    if extra_at < rest_end && extra_at <= bytes.len() {
-                        parse_extra(&bytes[extra_at..rest_end.min(bytes.len())], &mut extra);
+                    if extra_at < rest_end
+                        && let Some(record) = bytes.get(extra_at..rest_end.min(bytes.len()))
+                    {
+                        parse_extra(record, &mut extra);
                     }
                 }
                 let unpack_ver = comp & 0x3f;
@@ -862,11 +820,11 @@ fn walk_rar5(bytes: &[u8], mut inp: In<'_>, ar: &mut Archive) {
                     size_unknown: file_flags & LHFL_UNPUNKNOWN != 0,
                 };
                 apply_attrs(&mut member, attrs, host == 1);
-                inp.pos = rest_end;
+                inp = Reader::at(bytes, rest_end);
                 if let Some(ds) = data_size {
                     if name == "CMT"
                         && member.method.as_deref() == Some("stored")
-                        && let Some(body) = inp.slice(ds as usize)
+                        && let Some(body) = inp.bytes(ds as usize)
                     {
                         ar.comment = Some(utf8_name(body));
                     } else {
@@ -881,10 +839,10 @@ fn walk_rar5(bytes: &[u8], mut inp: In<'_>, ar: &mut Archive) {
                 let eflags = inp.vint().unwrap_or(0);
                 ar.not_last_volume = eflags & 0x0001 != 0;
                 ar.end_offset = rest_end as u64;
-                inp.pos = rest_end;
+                inp = Reader::at(bytes, rest_end);
                 if let Some(ds) = data_size {
                     let _ = inp.skip(ds as usize);
-                    ar.end_offset = inp.pos as u64;
+                    ar.end_offset = inp.pos() as u64;
                 }
                 return;
             }
@@ -897,11 +855,11 @@ fn walk_rar5(bytes: &[u8], mut inp: In<'_>, ar: &mut Archive) {
                 }
             }
         }
-        inp.pos = rest_end;
+        inp = Reader::at(bytes, rest_end);
         if let Some(ds) = data_size {
             skip_data(&mut inp, ar, ds);
         }
-        ar.end_offset = inp.pos as u64;
+        ar.end_offset = inp.pos() as u64;
     }
 }
 
@@ -966,9 +924,9 @@ fn decode_rar4_unicode(ascii: &[u8], enc: &[u8]) -> Option<String> {
 
 fn rar4_name(raw: &[u8], unicode: bool) -> String {
     if unicode {
-        if let Some(nul) = raw.iter().position(|&b| b == 0) {
-            let ascii = &raw[..nul];
-            let enc = &raw[nul + 1..];
+        // An ASCII name, a NUL, then the encoded Unicode form.
+        let mut parts = raw.splitn(2, |&b| b == 0);
+        if let (Some(ascii), Some(enc)) = (parts.next(), parts.next()) {
             if let Some(decoded) = decode_rar4_unicode(ascii, enc) {
                 if !decoded.is_empty() {
                     return decoded;
@@ -980,16 +938,19 @@ fn rar4_name(raw: &[u8], unicode: bool) -> String {
     utf8_name(raw)
 }
 
-fn walk_rar4(bytes: &[u8], mut inp: In<'_>, ar: &mut Archive) {
+fn walk_rar4(bytes: &[u8], start: usize, ar: &mut Archive) {
+    let mut inp = Reader::at(bytes, start);
     for _ in 0..MAX_BLOCKS {
         if inp.remaining() < 7 {
             break;
         }
-        let header_off = inp.pos as u64;
-        let Some(stored_crc) = inp.u16() else { break };
+        let header_off = inp.pos() as u64;
+        let Some(stored_crc) = inp.u16_le() else {
+            break;
+        };
         let Some(htype) = inp.u8() else { break };
-        let Some(hflags) = inp.u16() else { break };
-        let Some(head_size) = inp.u16() else { break };
+        let Some(hflags) = inp.u16_le() else { break };
+        let Some(head_size) = inp.u16_le() else { break };
         if head_size < 7 {
             limit(ar, "header", "RAR4 header smaller than 7");
             break;
@@ -998,19 +959,19 @@ fn walk_rar4(bytes: &[u8], mut inp: In<'_>, ar: &mut Archive) {
         let Some(header_end) = block_start.checked_add(head_size as usize) else {
             break;
         };
-        if header_end > bytes.len() {
+        // The CRC covers the header after its own two bytes.
+        let Some(crc_of) = bytes.get(block_start + 2..header_end) else {
             limit(ar, "header", "RAR4 header overruns file");
             break;
-        }
-        let crc_of = &bytes[block_start + 2..header_end];
+        };
         if (crc32fast::hash(crc_of) as u16) != stored_crc {
             ar.header_crc_mismatch += 1;
         }
-        inp.pos = block_start + 7;
+        inp = Reader::at(bytes, block_start + 7);
         match htype {
             R4_MAIN => {
-                let _hi_posav = inp.u16();
-                let _posav = inp.u32();
+                let _hi_posav = inp.u16_le();
+                let _posav = inp.u32_le();
                 ar.volume = hflags & R4_MHD_VOLUME != 0;
                 ar.locked = hflags & R4_MHD_LOCK != 0;
                 ar.solid = hflags & R4_MHD_SOLID != 0;
@@ -1033,35 +994,35 @@ fn walk_rar4(bytes: &[u8], mut inp: In<'_>, ar: &mut Archive) {
             }
             R4_FILE | R4_NEWSUB => {
                 let service = htype == R4_NEWSUB;
-                let Some(pack_lo) = inp.u32() else { break };
-                let Some(unp_lo) = inp.u32() else { break };
+                let Some(pack_lo) = inp.u32_le() else { break };
+                let Some(unp_lo) = inp.u32_le() else { break };
                 let host = inp.u8().unwrap_or(0);
-                let crc = inp.u32();
-                let ftime = inp.u32();
+                let crc = inp.u32_le();
+                let ftime = inp.u32_le();
                 let unp_ver = inp.u8().unwrap_or(0);
                 let method = inp.u8().unwrap_or(0x30);
-                let name_size = inp.u16().unwrap_or(0) as usize;
-                let attrs = inp.u32().unwrap_or(0);
+                let name_size = inp.u16_le().unwrap_or(0) as usize;
+                let attrs = inp.u32_le().unwrap_or(0);
                 let mut pack = u64::from(pack_lo);
                 let mut unp = u64::from(unp_lo);
                 if hflags & R4_LHD_LARGE != 0 {
-                    pack |= u64::from(inp.u32().unwrap_or(0)) << 32;
-                    unp |= u64::from(inp.u32().unwrap_or(0)) << 32;
+                    pack |= u64::from(inp.u32_le().unwrap_or(0)) << 32;
+                    unp |= u64::from(inp.u32_le().unwrap_or(0)) << 32;
                 }
                 if name_size > MAX_NAME {
                     limit(ar, "name", "RAR4 name longer than cap");
-                    inp.pos = header_end;
+                    inp = Reader::at(bytes, header_end);
                     skip_data(&mut inp, ar, pack);
                     continue;
                 }
-                let name_end = (inp.pos + name_size).min(header_end);
-                let raw_name = bytes.get(inp.pos..name_end).unwrap_or(&[]);
-                inp.pos = name_end;
+                let name_end = (inp.pos() + name_size).min(header_end);
+                let raw_name = bytes.get(inp.pos()..name_end).unwrap_or(&[]);
+                inp = Reader::at(bytes, name_end);
                 let name = rar4_name(raw_name, hflags & R4_LHD_UNICODE != 0);
                 if hflags & R4_LHD_SALT != 0 {
                     let _ = inp.skip(8);
                 }
-                if hflags & R4_LHD_EXTTIME != 0 && inp.pos + 2 <= header_end {
+                if hflags & R4_LHD_EXTTIME != 0 && inp.pos() + 2 <= header_end {
                     skip_rar4_exttime(&mut inp, header_end);
                 }
                 ar.unpack_min = Some(
@@ -1120,9 +1081,9 @@ fn walk_rar4(bytes: &[u8], mut inp: In<'_>, ar: &mut Archive) {
                     size_unknown: false,
                 };
                 apply_attrs(&mut member, attrs, host == 3);
-                inp.pos = header_end;
+                inp = Reader::at(bytes, header_end);
                 if service && name == "CMT" && method == 0x30 {
-                    if let Some(body) = inp.slice(pack.min(inp.remaining() as u64) as usize) {
+                    if let Some(body) = inp.bytes(pack.min(inp.remaining() as u64) as usize) {
                         ar.comment = Some(utf8_name(body));
                     }
                 } else {
@@ -1146,28 +1107,28 @@ fn walk_rar4(bytes: &[u8], mut inp: In<'_>, ar: &mut Archive) {
                 }
             }
         }
-        inp.pos = header_end;
+        inp = Reader::at(bytes, header_end);
         if hflags & R4_LONG_BLOCK != 0 {
             // ADD_SIZE was already consumed as part of HEAD_SIZE for MAIN;
             // file headers skip packed data in their own arm.
         }
-        ar.end_offset = inp.pos as u64;
+        ar.end_offset = inp.pos() as u64;
     }
 }
 
-fn skip_rar4_exttime(inp: &mut In<'_>, header_end: usize) {
-    let Some(flags) = inp.u16() else { return };
+fn skip_rar4_exttime(inp: &mut Reader<'_>, header_end: usize) {
+    let Some(flags) = inp.u16_le() else { return };
     for i in 0..4 {
         let rmode = flags >> ((3 - i) * 4);
         if rmode & 8 == 0 {
             continue;
         }
-        if i != 0 && inp.pos + 4 <= header_end {
-            let _ = inp.u32();
+        if i != 0 && inp.pos() + 4 <= header_end {
+            let _ = inp.u32_le();
         }
         let count = usize::from(rmode & 3);
         for _ in 0..count {
-            if inp.pos < header_end {
+            if inp.pos() < header_end {
                 let _ = inp.u8();
             }
         }
@@ -1178,192 +1139,121 @@ fn insert_num(map: &mut JsonMap<String, JsonValue>, key: &str, n: u64) {
     map.insert(key.into(), JsonValue::Number(n.into()));
 }
 
-fn insert_i64(map: &mut JsonMap<String, JsonValue>, key: &str, n: i64) {
-    map.insert(key.into(), JsonValue::Number(n.into()));
-}
-
-fn member_json(m: &Member) -> JsonValue {
-    let mut obj = JsonMap::new();
-    obj.insert("path".into(), JsonValue::String(m.path.clone()));
-    insert_num(&mut obj, "size_bytes", m.size_bytes);
-    obj.insert("entry_type".into(), JsonValue::String(m.entry_type.into()));
-    if let Some(p) = m.packed {
-        insert_num(&mut obj, "compressed_size", p);
-    }
-    if let Some(ref method) = m.method {
-        obj.insert(
-            "compression_method".into(),
-            JsonValue::String(method.clone()),
-        );
-    }
-    if let Some(t) = m.mtime {
-        insert_i64(&mut obj, "mtime_unix", t);
-    }
-    if let Some(t) = m.ctime {
-        insert_i64(&mut obj, "ctime_unix", t);
-    }
-    if let Some(t) = m.atime {
-        insert_i64(&mut obj, "atime_unix", t);
-    }
-    if m.encrypted {
-        obj.insert("encrypted".into(), JsonValue::Bool(true));
-    }
-    if let Some(ref os) = m.host_os {
-        obj.insert("host_os".into(), JsonValue::String(os.clone()));
-    }
-    if let Some(crc) = m.crc32 {
-        insert_num(&mut obj, "crc32", u64::from(crc));
-    }
-    if let Some(ref h) = m.blake2 {
-        obj.insert("blake2sp".into(), JsonValue::String(h.clone()));
-    }
-    if let Some(d) = m.dict_size {
-        insert_num(&mut obj, "dictionary_size", d);
-    }
-    if m.solid {
-        obj.insert("solid".into(), JsonValue::Bool(true));
-    }
-    if m.split_before {
-        obj.insert("split_before".into(), JsonValue::Bool(true));
-    }
-    if m.split_after {
-        obj.insert("split_after".into(), JsonValue::Bool(true));
-    }
-    if m.hidden {
-        obj.insert("hidden".into(), JsonValue::Bool(true));
-    }
-    if m.system {
-        obj.insert("system".into(), JsonValue::Bool(true));
-    }
-    if m.read_only {
-        obj.insert("read_only".into(), JsonValue::Bool(true));
-    }
-    if let Some(ref t) = m.linkname {
-        obj.insert("linkname".into(), JsonValue::String(t.clone()));
-    }
-    if let Some(t) = m.redir_type {
-        obj.insert("redir_type".into(), JsonValue::String(t.into()));
-    }
-    if let Some(v) = m.file_version {
-        insert_num(&mut obj, "file_version", v);
-    }
-    if !m.extra_types.is_empty() {
-        obj.insert(
-            "extra_types".into(),
-            JsonValue::Array(
-                m.extra_types
-                    .iter()
-                    .map(|t| JsonValue::Number((*t).into()))
-                    .collect(),
-            ),
-        );
-    }
-    insert_num(&mut obj, "header_offset", m.header_off);
-    if let Some(d) = m.data_off {
-        insert_num(&mut obj, "data_offset", d);
-    }
-    if let Some(mode) = m.mode_octal {
-        insert_num(&mut obj, "mode_octal", u64::from(mode));
-    }
-    if let Some(uid) = m.uid {
-        insert_num(&mut obj, "uid", uid);
-    }
-    if let Some(gid) = m.gid {
-        insert_num(&mut obj, "gid", gid);
-    }
-    if let Some(ref u) = m.uname {
-        obj.insert("uname".into(), JsonValue::String(u.clone()));
-    }
-    if let Some(ref g) = m.gname {
-        obj.insert("gname".into(), JsonValue::String(g.clone()));
-    }
-    if let Some(a) = m.windows_attrs {
-        insert_num(&mut obj, "windows_attrs", u64::from(a));
-    }
-    if let Some(k) = m.kdf_count {
-        insert_num(&mut obj, "kdf_count", u64::from(k));
-    }
-    if m.tweaked_checksums {
-        obj.insert("tweaked_checksums".into(), JsonValue::Bool(true));
-    }
-    if let Some(v) = m.unpack_version {
-        insert_num(&mut obj, "unpack_version", v);
-    }
-    if m.size_unknown {
-        obj.insert("size_unknown".into(), JsonValue::Bool(true));
-    }
-    JsonValue::Object(obj)
-}
-
-fn emit_timing(
-    values: &mut Values,
-    metrics: &mut Metrics,
-    timed: &[(String, i64)],
-    member_count: usize,
-) {
-    let sentinel = member_count.saturating_sub(timed.len()) as u64;
-    metrics.insert(
-        metric!("archive.timing.sentinel_mtime_count"),
-        sentinel as f64,
-    );
-    if timed.is_empty() {
-        return;
-    }
-    let min = timed.iter().map(|(_, t)| *t).min().unwrap_or(0);
-    let max = timed.iter().map(|(_, t)| *t).max().unwrap_or(0);
-    values.insert("archive.timing.mtime_min", JsonValue::Number(min.into()));
-    values.insert("archive.timing.mtime_max", JsonValue::Number(max.into()));
-    metrics.insert(
-        metric!("archive.timing.mtime_spread_seconds"),
-        (max - min) as f64,
-    );
-    let unique: BTreeSet<i64> = timed.iter().map(|(_, t)| *t).collect();
-    metrics.insert(
-        metric!("archive.timing.mtime_unique_count"),
-        unique.len() as f64,
-    );
-    metrics.insert(
-        metric!("archive.timing.mtime_unique_ratio"),
-        unique.len() as f64 / timed.len() as f64,
-    );
-    let future = timed.iter().filter(|(_, t)| *t > FUTURE_UNIX).count() as u64;
-    if future > 0 {
-        metrics.insert(metric!("archive.timing.future_mtime_count"), future as f64);
-    }
-    let mut buckets: BTreeMap<i64, Vec<&str>> = BTreeMap::new();
-    for (path, t) in timed {
-        buckets.entry(*t).or_default().push(path.as_str());
-    }
-    if let Some((&dominant, paths)) = buckets.iter().max_by_key(|(_, p)| p.len()) {
-        let count = paths.len() as u64;
-        metrics.insert(metric!("archive.timing.mtime_dominant_count"), count as f64);
-        metrics.insert(
-            metric!("archive.timing.mtime_dominant_fraction"),
-            count as f64 / member_count.max(1) as f64,
-        );
-        if count * 2 > member_count as u64 && count < member_count as u64 {
-            metrics.insert(
-                metric!("archive.timing.mtime_outlier_count"),
-                (member_count as u64).saturating_sub(count) as f64,
-            );
-            let outliers: Vec<JsonValue> = timed
-                .iter()
-                .filter(|(_, t)| *t != dominant)
-                .take(16)
-                .map(|(p, _)| JsonValue::String(p.clone()))
-                .collect();
-            if !outliers.is_empty() {
-                values.insert(
-                    "archive.timing.mtime_outlier_members",
-                    JsonValue::Array(outliers),
-                );
-            }
+/// Split a walked member into its typed form and the RAR-only keys its
+/// published `archive.members[]` value carries beyond the typed fields.
+fn split_member(m: Member) -> (ArchiveMember, JsonMap<String, JsonValue>) {
+    let mut rar_keys = JsonMap::new();
+    for (key, time) in [("ctime_unix", m.ctime), ("atime_unix", m.atime)] {
+        if let Some(t) = time {
+            rar_keys.insert(key.into(), JsonValue::Number(t.into()));
         }
     }
+    if let Some(h) = m.blake2 {
+        rar_keys.insert("blake2sp".into(), JsonValue::String(h));
+    }
+    if let Some(d) = m.dict_size {
+        insert_num(&mut rar_keys, "dictionary_size", d);
+    }
+    for (key, set) in [
+        ("solid", m.solid),
+        ("split_before", m.split_before),
+        ("split_after", m.split_after),
+        ("hidden", m.hidden),
+        ("system", m.system),
+        ("read_only", m.read_only),
+        ("tweaked_checksums", m.tweaked_checksums),
+        ("size_unknown", m.size_unknown),
+    ] {
+        if set {
+            rar_keys.insert(key.into(), JsonValue::Bool(true));
+        }
+    }
+    if let Some(t) = m.redir_type {
+        rar_keys.insert("redir_type".into(), JsonValue::String(t.into()));
+    }
+    if let Some(v) = m.file_version {
+        insert_num(&mut rar_keys, "file_version", v);
+    }
+    if !m.extra_types.is_empty() {
+        let types = m.extra_types.iter().map(|t| JsonValue::from(*t)).collect();
+        rar_keys.insert("extra_types".into(), JsonValue::Array(types));
+    }
+    if let Some(a) = m.windows_attrs {
+        insert_num(&mut rar_keys, "windows_attrs", u64::from(a));
+    }
+    if let Some(k) = m.kdf_count {
+        insert_num(&mut rar_keys, "kdf_count", u64::from(k));
+    }
+    if let Some(v) = m.unpack_version {
+        insert_num(&mut rar_keys, "unpack_version", v);
+    }
+
+    let ownership = (m.mode_octal.is_some()
+        || m.uid.is_some()
+        || m.gid.is_some()
+        || m.uname.is_some()
+        || m.gname.is_some())
+    .then_some(ArchiveOwnership {
+        mode_octal: m.mode_octal,
+        uid: m.uid,
+        gid: m.gid,
+        uname: m.uname,
+        gname: m.gname,
+    });
+    let member = ArchiveMember {
+        path: m.path,
+        size_bytes: m.size_bytes,
+        entry_type: Some(m.entry_type.into()),
+        mtime_unix: m.mtime,
+        linkname: m.linkname,
+        host_os: m.host_os,
+        crc32: m.crc32,
+        encrypted: m.encrypted,
+        compression: (m.packed.is_some() || m.method.is_some()).then_some(ArchiveCompression {
+            compressed_size: m.packed,
+            method: m.method,
+        }),
+        ownership,
+        offsets: ArchiveOffsets {
+            header: Some(m.header_off),
+            data: m.data_off,
+            central_header: None,
+        },
+    };
+    (member, rar_keys)
 }
 
+/// The shared aggregates a RAR reports. Symlinks and NTFS streams count as
+/// files, and a hidden member is one with the Windows hidden attribute.
+const AGGS: &[Agg] = &[
+    Agg::MemberCount,
+    Agg::FileCount,
+    Agg::DirectoryCount,
+    Agg::UncompressedSize(Scope::All),
+    Agg::CompressedSize,
+    Agg::CompressionRatio,
+    Agg::ZipBombRatio(Scope::All),
+    Agg::Methods { always: false },
+    Agg::EncryptedCount,
+    Agg::SymlinkCount,
+    Agg::ModeBits,
+    Agg::Executables,
+    Agg::Scripts,
+    Agg::NestedArchives,
+    Agg::PathTraversal(Scope::All),
+    Agg::NameTricks,
+    Agg::MisplacedExecutables,
+    Agg::NoiseFiles,
+    Agg::HiddenFiles,
+    Agg::MaxFilenameLength,
+    Agg::DuplicateMembers,
+    Agg::SentinelMtimes,
+    Agg::MtimeRange,
+    Agg::MtimeAnomalies(Dominance::TimedOnly),
+];
+
 fn emit(
-    ar: &Archive,
+    mut ar: Archive,
     bytes_len: u64,
     values: &mut Values,
     metrics: &mut Metrics,
@@ -1469,208 +1359,23 @@ fn emit(
         values.insert("rar.unpack_version.max", JsonValue::Number(max.into()));
     }
 
-    let mut file_count = 0u64;
-    let mut directory_count = 0u64;
-    let mut symlink_count = 0u64;
-    let mut total_size = 0u64;
-    let mut total_packed = 0u64;
-    let mut encrypted_count = 0u64;
-    let mut executable_count = 0u64;
-    let mut script_count = 0u64;
-    let mut nested_archive_count = 0u64;
-    let mut traversal_count = 0u64;
-    let mut unicode_count = 0u64;
-    let mut homoglyph_count = 0u64;
-    let mut rtlo_count = 0u64;
-    let mut double_ext = 0u64;
-    let mut misplaced = 0u64;
-    let mut noise = 0u64;
-    let mut hidden_count = 0u64;
-    let mut max_name = 0u64;
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut dup = 0u64;
-    let mut timed: Vec<(String, i64)> = Vec::new();
-    let mut zip_bomb = 0.0f64;
-    let mut setuid = 0u64;
-    let mut setgid = 0u64;
-    let mut sticky = 0u64;
-    let mut world_writable = 0u64;
+    let mut stats = ArchiveStats::new(AGGS);
     let mut members_json = Vec::with_capacity(ar.members.len());
-
-    for m in &ar.members {
-        match m.entry_type {
-            "directory" => directory_count += 1,
-            "symlink" => {
-                symlink_count += 1;
-                file_count += 1;
-            }
-            _ => file_count += 1,
-        }
-        total_size = total_size.saturating_add(m.size_bytes);
-        total_packed = total_packed.saturating_add(m.packed.unwrap_or(0));
-        if m.encrypted {
-            encrypted_count += 1;
-        }
-        if m.hidden {
-            hidden_count += 1;
-        }
-        max_name = max_name.max(m.path.len() as u64);
-        if !seen.insert(m.path.clone()) {
-            dup += 1;
-        }
-        if let Some(p) = m.packed
-            && p > 0
-            && m.size_bytes > 0
-        {
-            let r = m.size_bytes as f64 / p as f64;
-            if r > zip_bomb {
-                zip_bomb = r;
-            }
-        }
-        if let Some(mode) = m.mode_octal {
-            if mode & 0o4000 != 0 {
-                setuid += 1;
-            }
-            if mode & 0o2000 != 0 {
-                setgid += 1;
-            }
-            if mode & 0o1000 != 0 {
-                sticky += 1;
-            }
-            if mode & 0o002 != 0 {
-                world_writable += 1;
-            }
-        }
-        let class = super::zip::classify_filename(&m.path);
-        if m.entry_type != "directory" {
-            executable_count += u64::from(class.is_executable);
-            script_count += u64::from(class.is_script);
-            nested_archive_count += u64::from(class.is_nested_archive);
-            misplaced += u64::from(class.is_misplaced_executable);
-        }
-        traversal_count += u64::from(class.has_path_traversal);
-        unicode_count += u64::from(class.is_unicode);
-        homoglyph_count += u64::from(class.has_homoglyph);
-        rtlo_count += u64::from(class.has_rtlo);
-        double_ext += u64::from(class.has_double_extension);
-        noise += u64::from(super::zip::is_noise_filename(&m.path));
-        if let Some(t) = m.mtime {
-            timed.push((m.path.clone(), t));
-        }
-
-        let ownership = if m.mode_octal.is_some()
-            || m.uid.is_some()
-            || m.gid.is_some()
-            || m.uname.is_some()
-            || m.gname.is_some()
-        {
-            Some(ArchiveOwnership {
-                mode_octal: m.mode_octal,
-                uid: m.uid,
-                gid: m.gid,
-                uname: m.uname.clone(),
-                gname: m.gname.clone(),
-            })
-        } else {
-            None
-        };
-        archive_members.push(ArchiveMember {
-            path: m.path.clone(),
-            size_bytes: m.size_bytes,
-            entry_type: Some(m.entry_type.into()),
-            mtime_unix: m.mtime,
-            linkname: m.linkname.clone(),
-            host_os: m.host_os.clone(),
-            crc32: m.crc32,
-            encrypted: m.encrypted,
-            compression: (m.packed.is_some() || m.method.is_some()).then_some(ArchiveCompression {
-                compressed_size: m.packed,
-                method: m.method.clone(),
-            }),
-            ownership,
-            offsets: ArchiveOffsets {
-                header: Some(m.header_off),
-                data: m.data_off,
-                central_header: None,
-            },
-        });
-        members_json.push(member_json(m));
+    for m in std::mem::take(&mut ar.members) {
+        let hidden = m.hidden;
+        let (member, rar_keys) = split_member(m);
+        let mut reading = Reading::of(&member);
+        reading.hidden = hidden;
+        stats.observe(&member, &reading);
+        let mut obj = member_value(&member, Shape::FULL);
+        obj.extend(rar_keys);
+        members_json.push(JsonValue::Object(obj));
+        archive_members.push(member);
     }
-
     values.insert("rar.members", JsonValue::Array(members_json.clone()));
     values.insert("archive.members", JsonValue::Array(members_json));
-    if !ar.methods.is_empty() {
-        values.insert(
-            "archive.compression.methods",
-            JsonValue::Array(
-                ar.methods
-                    .keys()
-                    .map(|k| JsonValue::String(k.clone()))
-                    .collect(),
-            ),
-        );
-        for (method, count) in &ar.methods {
-            metrics.insert(crate::archive_method_count(method), *count as f64);
-        }
-    }
+    stats.emit(values, metrics);
 
-    metrics.insert(metric!("archive.member_count"), ar.members.len() as f64);
-    metrics.insert(metric!("archive.file_count"), file_count as f64);
-    metrics.insert(metric!("archive.directory_count"), directory_count as f64);
-    metrics.insert(metric!("archive.uncompressed_size"), total_size as f64);
-    metrics.insert(metric!("archive.compressed_size"), total_packed as f64);
-    if total_size > 0 {
-        metrics.insert(
-            metric!("archive.compression.ratio"),
-            total_packed as f64 / total_size as f64,
-        );
-    }
-    if zip_bomb > 0.0 {
-        metrics.insert(metric!("archive.zip_bomb_ratio"), zip_bomb);
-    }
-    metrics.insert(
-        metric!("archive.security.encrypted_count"),
-        encrypted_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.security.symlink_count"),
-        symlink_count as f64,
-    );
-    metrics.insert(metric!("archive.security.setuid_count"), setuid as f64);
-    metrics.insert(metric!("archive.security.setgid_count"), setgid as f64);
-    metrics.insert(metric!("archive.security.sticky_count"), sticky as f64);
-    metrics.insert(
-        metric!("archive.security.world_writable_count"),
-        world_writable as f64,
-    );
-    metrics.insert(metric!("archive.executable_count"), executable_count as f64);
-    metrics.insert(metric!("archive.script_count"), script_count as f64);
-    metrics.insert(
-        metric!("archive.nested_archive_count"),
-        nested_archive_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.path_traversal_count"),
-        traversal_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.unicode_filename_count"),
-        unicode_count as f64,
-    );
-    metrics.insert(
-        metric!("archive.homoglyph_filename_count"),
-        homoglyph_count as f64,
-    );
-    metrics.insert(metric!("archive.rtlo_filename_count"), rtlo_count as f64);
-    metrics.insert(metric!("archive.double_extension_count"), double_ext as f64);
-    metrics.insert(
-        metric!("archive.misplaced_executable_count"),
-        misplaced as f64,
-    );
-    metrics.insert(metric!("archive.noise_file_count"), noise as f64);
-    metrics.insert(metric!("archive.hidden_file_count"), hidden_count as f64);
-    metrics.insert(metric!("archive.max_filename_length"), max_name as f64);
-    metrics.insert(metric!("archive.duplicate_member_count"), dup as f64);
     metrics.insert(
         metric!("archive.extra_field_size"),
         ar.extra_field_size as f64,
@@ -1724,7 +1429,6 @@ fn emit(
     if ar.recovery_size > 0 {
         metrics.insert(metric!("rar.recovery_size"), ar.recovery_size as f64);
     }
-    emit_timing(values, metrics, &timed, ar.members.len());
 }
 
 pub(super) fn extract(
@@ -1743,16 +1447,15 @@ pub(super) fn extract(
         ..Archive::default()
     };
     let after_sig = sig_at + if version == 5 { 8 } else { 7 };
-    let inp = In::new(bytes, after_sig);
     if version == 5 {
-        walk_rar5(bytes, inp, &mut ar);
+        walk_rar5(bytes, after_sig, &mut ar);
     } else {
-        walk_rar4(bytes, inp, &mut ar);
+        walk_rar4(bytes, after_sig, &mut ar);
     }
     if ar.end_offset < after_sig as u64 {
         ar.end_offset = after_sig as u64;
     }
-    emit(&ar, bytes.len() as u64, values, metrics, archive_members);
+    emit(ar, bytes.len() as u64, values, metrics, archive_members);
     Ok(())
 }
 

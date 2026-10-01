@@ -82,11 +82,11 @@ struct Prepared {
 
 impl Prepared {
     fn original_offset(&self, idx: usize) -> usize {
-        if idx < self.map.len() {
-            self.map[idx]
-        } else {
-            *self.map.last().unwrap_or(&0)
-        }
+        self.map
+            .get(idx)
+            .or_else(|| self.map.last())
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -98,70 +98,66 @@ fn preprocess(source: &str) -> Prepared {
     let mut text = String::with_capacity(source.len());
     let mut map = Vec::with_capacity(source.len());
 
+    // The `\n` that ends the line holding `from`, or the end of the source.
+    let line_end = |from: usize| {
+        bytes
+            .get(from..)
+            .and_then(|rest| memchr::memchr(b'\n', rest))
+            .map_or(bytes.len(), |n| from + n)
+    };
+
     let mut i = 0;
-    while i < bytes.len() {
+    while let Some(&byte) = bytes.get(i) {
         // VBA line continuation: `_` followed (after optional
         // whitespace) by a line terminator. Replace the joined break
         // with a single space so adjacent tokens don't merge.
-        if bytes[i] == b'_' && {
+        if byte == b'_' {
             let mut j = i + 1;
-            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+            while matches!(bytes.get(j), Some(b' ' | b'\t')) {
                 j += 1;
             }
-            j < bytes.len() && (bytes[j] == b'\n' || bytes[j] == b'\r')
-        } {
-            let mut j = i + 1;
-            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
-                j += 1;
+            if matches!(bytes.get(j), Some(b'\n' | b'\r')) {
+                if bytes.get(j) == Some(&b'\r') {
+                    j += 1;
+                }
+                if bytes.get(j) == Some(&b'\n') {
+                    j += 1;
+                }
+                while text.ends_with(' ') || text.ends_with('\t') {
+                    text.pop();
+                    map.pop();
+                }
+                text.push(' ');
+                map.push(i);
+                i = j;
+                continue;
             }
-            if j < bytes.len() && bytes[j] == b'\r' {
-                j += 1;
-            }
-            if j < bytes.len() && bytes[j] == b'\n' {
-                j += 1;
-            }
-            while text.ends_with(' ') || text.ends_with('\t') {
-                text.pop();
-                map.pop();
-            }
-            text.push(' ');
-            map.push(i);
-            i = j;
-            continue;
         }
 
         // Strip line-leading `Rem` comments (case-insensitive).
         let at_line_start = text.is_empty() || text.ends_with('\n');
-        if at_line_start && i + 3 <= bytes.len() {
-            let head = &bytes[i..(i + 3).min(bytes.len())];
-            let is_rem = head.eq_ignore_ascii_case(b"Rem");
-            let next = bytes.get(i + 3).copied().unwrap_or(b'\n');
-            if is_rem && (next == b' ' || next == b'\t' || next == b'\r' || next == b'\n') {
-                let mut j = i;
-                while j < bytes.len() && bytes[j] != b'\n' {
-                    j += 1;
+        if at_line_start {
+            if let Some(head) = bytes.get(i..i + 3) {
+                let is_rem = head.eq_ignore_ascii_case(b"Rem");
+                let next = bytes.get(i + 3).copied().unwrap_or(b'\n');
+                if is_rem && (next == b' ' || next == b'\t' || next == b'\r' || next == b'\n') {
+                    i = line_end(i);
+                    continue;
                 }
-                i = j;
-                continue;
             }
         }
 
         // Strip apostrophe comments outside of string literals.
-        if bytes[i] == b'\'' {
+        if byte == b'\'' {
             let line_start = text.rfind('\n').map(|n| n + 1).unwrap_or(0);
             let line_so_far = &text[line_start..];
             let in_string = line_so_far.chars().filter(|c| *c == '"').count() % 2 == 1;
             if !in_string {
-                let mut j = i;
-                while j < bytes.len() && bytes[j] != b'\n' {
-                    j += 1;
-                }
-                i = j;
+                i = line_end(i);
                 continue;
             }
         }
 
-        let byte = bytes[i];
         if byte.is_ascii() {
             text.push(byte as char);
             map.push(i);
@@ -172,7 +168,10 @@ fn preprocess(source: &str) -> Prepared {
             // identifiers and would also misalign the per-byte offset
             // map, since one source byte would expand into two UTF-8
             // bytes in `text` while `map` only recorded one entry.
-            let ch = source[i..].chars().next().unwrap_or('\u{FFFD}');
+            let ch = source
+                .get(i..)
+                .and_then(|rest| rest.chars().next())
+                .unwrap_or('\u{FFFD}');
             let ch_len = ch.len_utf8();
             text.push(ch);
             for _ in 0..ch_len {

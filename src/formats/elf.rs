@@ -11,6 +11,7 @@ use goblin::elf::{Elf, dynamic, header, program_header};
 use serde_json::Value as JsonValue;
 
 use crate::error::Error;
+use crate::formats::common::bytes_at::{u32_le, u64_le};
 use crate::formats::common::{
     NativeFormat, XorScan, extract_binary_strings, extract_binary_strings_from_object, hex_encode,
     put_str, put_u64, rizin_fallback, section_entropy,
@@ -510,10 +511,7 @@ fn package_note(notes: &[Note<'_>], values: &mut Values) {
 fn abi_tag(notes: &[Note<'_>], values: &mut Values) {
     for note in notes {
         if note.name == "GNU" && note.n_type == 1 && note.desc.len() >= 16 {
-            let words: [u32; 4] = [0, 1, 2, 3].map(|i| {
-                let start = i * 4;
-                u32::from_le_bytes(note.desc[start..start + 4].try_into().unwrap_or([0; 4]))
-            });
+            let words: [u32; 4] = [0, 1, 2, 3].map(|i| u32_le(note.desc, i * 4).unwrap_or(0));
             let os = match words[0] {
                 0 => "linux",
                 1 => "hurd",
@@ -553,10 +551,8 @@ fn gnu_property(elf: &Elf<'_>, notes: &[Note<'_>], values: &mut Values, metrics:
         let mut props = Vec::new();
         let mut off = 0;
         while off + 8 <= note.desc.len() {
-            let pr_type = u32::from_le_bytes(note.desc[off..off + 4].try_into().unwrap_or([0; 4]));
-            let pr_datasz =
-                u32::from_le_bytes(note.desc[off + 4..off + 8].try_into().unwrap_or([0; 4]))
-                    as usize;
+            let pr_type = u32_le(note.desc, off).unwrap_or(0);
+            let pr_datasz = u32_le(note.desc, off + 4).unwrap_or(0) as usize;
             let data_start = off + 8;
             let data_end = data_start.saturating_add(pr_datasz);
             if data_end > note.desc.len() {
@@ -566,9 +562,7 @@ fn gnu_property(elf: &Elf<'_>, notes: &[Note<'_>], values: &mut Values, metrics:
                 let mut entry = serde_json::Map::new();
                 entry.insert("type".into(), JsonValue::String(name.to_string()));
                 if pr_datasz == 4 {
-                    let v = u32::from_le_bytes(
-                        note.desc[data_start..data_end].try_into().unwrap_or([0; 4]),
-                    );
+                    let v = u32_le(note.desc, data_start).unwrap_or(0);
                     entry.insert("value".into(), JsonValue::String(format!("0x{v:x}")));
                     if is_aarch64 && pr_type == 0xC000_0000 {
                         // AARCH64_FEATURE_1_AND — bit-decomposed
@@ -626,16 +620,8 @@ fn gnu_property(elf: &Elf<'_>, notes: &[Note<'_>], values: &mut Values, metrics:
                 } else if is_aarch64 && pr_type == 0xC000_0001 && pr_datasz == 16 {
                     // AARCH64_FEATURE_PAUTH — 16 bytes, two u64
                     // words identifying the key-generation scheme.
-                    let platform = u64::from_le_bytes(
-                        note.desc[data_start..data_start + 8]
-                            .try_into()
-                            .unwrap_or([0; 8]),
-                    );
-                    let version = u64::from_le_bytes(
-                        note.desc[data_start + 8..data_start + 16]
-                            .try_into()
-                            .unwrap_or([0; 8]),
-                    );
+                    let platform = u64_le(note.desc, data_start).unwrap_or(0);
+                    let version = u64_le(note.desc, data_start + 8).unwrap_or(0);
                     let scheme = format!("{}:{}", pauth_platform_name(platform), version);
                     entry.insert(
                         "platform".into(),
@@ -703,10 +689,7 @@ fn read_section<'a>(elf: &Elf<'_>, bytes: &'a [u8], name: &str) -> Option<&'a [u
     let start = usize::try_from(sh.sh_offset).ok()?;
     let len = usize::try_from(sh.sh_size).ok()?;
     let end = start.checked_add(len)?;
-    if end > bytes.len() {
-        return None;
-    }
-    Some(&bytes[start..end])
+    bytes.get(start..end)
 }
 
 /// Flat `elf.*` numeric metrics — the integer-valued counterparts to
@@ -861,8 +844,9 @@ fn elf_numeric_metrics(
         sorted.sort_by_key(|t| t.0);
         let mut overlap_idxs: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for w in sorted.windows(2) {
-            let (a_start, a_end, a_idx) = w[0];
-            let (b_start, _, b_idx) = w[1];
+            let &[(a_start, a_end, a_idx), (b_start, _, b_idx)] = w else {
+                continue;
+            };
             if a_end > b_start && b_start >= a_start {
                 overlap_idxs.insert(a_idx);
                 overlap_idxs.insert(b_idx);
@@ -2130,11 +2114,17 @@ fn tally_symbol_kinds(
     visibility: &mut [u64; 4],
 ) {
     let stt = (sym.st_info & 0xf) as usize;
-    types[stt] += 1;
+    if let Some(count) = types.get_mut(stt) {
+        *count += 1;
+    }
     let stb = ((sym.st_info >> 4) & 0xf) as usize;
-    bindings[stb.min(3)] += 1;
+    if let Some(count) = bindings.get_mut(stb.min(3)) {
+        *count += 1;
+    }
     let vis = (sym.st_other & 0x3) as usize;
-    visibility[vis] += 1;
+    if let Some(count) = visibility.get_mut(vis) {
+        *count += 1;
+    }
 }
 
 /// Project the three tally arrays into `elf.symbol_kinds.*` under
@@ -2169,33 +2159,27 @@ fn emit_symbol_kind_histograms(
     const VIS_NAMES: [&str; 4] = ["default", "internal", "hidden", "protected"];
 
     let mut by_type = serde_json::Map::new();
-    for (i, count) in types.iter().enumerate() {
+    for (name, count) in TYPE_NAMES.iter().zip(types) {
         if *count > 0 {
-            by_type.insert(
-                TYPE_NAMES[i].to_string(),
-                JsonValue::Number((*count).into()),
-            );
+            by_type.insert((*name).to_string(), JsonValue::Number((*count).into()));
         }
     }
     if !by_type.is_empty() {
         values.insert("elf.symbol_kinds.types", JsonValue::Object(by_type));
     }
     let mut by_bind = serde_json::Map::new();
-    for (i, count) in bindings.iter().enumerate() {
+    for (name, count) in BIND_NAMES.iter().zip(bindings) {
         if *count > 0 {
-            by_bind.insert(
-                BIND_NAMES[i].to_string(),
-                JsonValue::Number((*count).into()),
-            );
+            by_bind.insert((*name).to_string(), JsonValue::Number((*count).into()));
         }
     }
     if !by_bind.is_empty() {
         values.insert("elf.symbol_kinds.bindings", JsonValue::Object(by_bind));
     }
     let mut by_vis = serde_json::Map::new();
-    for (i, count) in visibility.iter().enumerate() {
+    for (name, count) in VIS_NAMES.iter().zip(visibility) {
         if *count > 0 {
-            by_vis.insert(VIS_NAMES[i].to_string(), JsonValue::Number((*count).into()));
+            by_vis.insert((*name).to_string(), JsonValue::Number((*count).into()));
         }
     }
     if !by_vis.is_empty() {
@@ -2360,9 +2344,12 @@ fn section_file_anomalies(elf: &Elf<'_>, bytes: &[u8], metrics: &mut Metrics) {
     ranges.sort_unstable();
     let mut overlap: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for w in ranges.windows(2) {
-        if w[0].1 > w[1].0 {
-            overlap.insert(w[0].2);
-            overlap.insert(w[1].2);
+        let &[(_, a_end, a_idx), (b_start, _, b_idx)] = w else {
+            continue;
+        };
+        if a_end > b_start {
+            overlap.insert(a_idx);
+            overlap.insert(b_idx);
         }
     }
 

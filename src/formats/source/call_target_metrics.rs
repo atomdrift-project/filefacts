@@ -29,6 +29,8 @@
 use crate::metric;
 use crate::output::{Metrics, Symbol};
 
+use super::langs::Lang;
+
 /// How a call's command-name target was expressed.
 #[derive(Debug, PartialEq, Eq)]
 enum TargetKind {
@@ -44,9 +46,9 @@ enum TargetKind {
 
 /// Emit the call-target obfuscation counts for the given calls.
 ///
-/// `calls` is the in-order slice of [`Symbol::Call`] records; `lang` is the
-/// canonical language name from the active `LangConfig`.
-pub(super) fn emit(calls: &[Symbol], lang: &str, metrics: &mut Metrics) {
+/// `calls` is the in-order slice of [`Symbol::Call`] records; `lang` picks the
+/// classifier for the language they were parsed from.
+pub(super) fn emit(calls: &[Symbol], lang: Lang, metrics: &mut Metrics) {
     let mut obfuscated = 0u64;
     let mut dynamic = 0u64;
     for call in calls {
@@ -71,9 +73,9 @@ pub(super) fn emit(calls: &[Symbol], lang: &str, metrics: &mut Metrics) {
     }
 }
 
-fn classify(target: &str, lang: &str) -> TargetKind {
+fn classify(target: &str, lang: Lang) -> TargetKind {
     match lang {
-        "bash" => classify_shell(target),
+        Lang::Bash => classify_shell(target),
         // python / ruby / javascript arms land here next: computed member
         // access, getattr/send reconstruction, Function()/eval indirection.
         _ => TargetKind::Clean,
@@ -168,10 +170,10 @@ fn is_decoding_substitution(target: &str) -> bool {
 /// escape (backslash followed by an octal digit), the byte-reconstruction
 /// shapes — not letter escapes like `\n`/`\t`.
 fn has_byte_escape(target: &str) -> bool {
-    let bytes = target.as_bytes();
-    bytes.windows(2).any(|w| {
-        w[0] == b'\\' && (w[1] == b'x' || w[1] == b'X' || w[1].is_ascii_digit() && w[1] <= b'7')
-    })
+    target
+        .as_bytes()
+        .windows(2)
+        .any(|w| matches!(w, [b'\\', b'x' | b'X' | b'0'..=b'7']))
 }
 
 /// True when an expansion is welded into a word rather than standing alone.
@@ -182,10 +184,8 @@ fn has_byte_escape(target: &str) -> bool {
 fn has_welded_expansion(target: &str) -> bool {
     let bytes = target.as_bytes();
     let alnum_before_dollar = bytes
-        .iter()
-        .enumerate()
-        .skip(1)
-        .any(|(i, &b)| b == b'$' && bytes[i - 1].is_ascii_alphanumeric());
+        .windows(2)
+        .any(|w| matches!(w, [before, b'$'] if before.is_ascii_alphanumeric()));
     if !alnum_before_dollar {
         return false;
     }
@@ -198,7 +198,7 @@ mod tests {
     use super::*;
 
     fn shell(target: &str) -> TargetKind {
-        classify(target, "bash")
+        classify(target, Lang::Bash)
     }
 
     #[test]
@@ -288,8 +288,8 @@ mod tests {
 
     #[test]
     fn non_shell_languages_emit_nothing_yet() {
-        assert_eq!(classify("$A$B", "javascript"), TargetKind::Clean);
-        assert_eq!(classify("foo.bar", "python"), TargetKind::Clean);
+        assert_eq!(classify("$A$B", Lang::JavaScript), TargetKind::Clean);
+        assert_eq!(classify("foo.bar", Lang::Python), TargetKind::Clean);
     }
 
     #[test]
@@ -312,7 +312,7 @@ mod tests {
             },
         ];
         let mut metrics = Metrics::default();
-        emit(&calls, "bash", &mut metrics);
+        emit(&calls, Lang::Bash, &mut metrics);
         assert_eq!(metrics.get("calls.obfuscated_target_count"), Some(1.0));
         assert_eq!(metrics.get("calls.dynamic_target_count"), Some(1.0));
     }

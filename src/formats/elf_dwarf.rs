@@ -47,7 +47,7 @@ pub(super) fn emit(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &m
     let debug_line_str_data = read_section(elf, bytes, ".debug_line_str").unwrap_or(&[]);
 
     // ELF e_ident[EI_DATA]: 1 = little, 2 = big.
-    if bytes.len() < 6 || bytes[5] != 1 {
+    if bytes.get(5) != Some(&1) {
         return;
     }
     let endian = LittleEndian;
@@ -153,10 +153,7 @@ fn read_section<'a>(elf: &Elf<'_>, bytes: &'a [u8], name: &str) -> Option<&'a [u
     let start = usize::try_from(sh.sh_offset).ok()?;
     let len = usize::try_from(sh.sh_size).ok()?;
     let end = start.checked_add(len)?;
-    if end > bytes.len() {
-        return None;
-    }
-    Some(&bytes[start..end])
+    bytes.get(start..end)
 }
 
 fn attr_string<R: Reader>(

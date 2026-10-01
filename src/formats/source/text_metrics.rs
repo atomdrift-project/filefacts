@@ -46,7 +46,9 @@ fn emit_byte_metrics(bytes: &[u8], metrics: &mut Metrics) {
     let mut null_count = 0u32;
 
     for &b in bytes {
-        freq[b as usize] += 1;
+        if let Some(count) = freq.get_mut(usize::from(b)) {
+            *count += 1;
+        }
         if b == 0 {
             null_count += 1;
         }
@@ -61,16 +63,16 @@ fn emit_byte_metrics(bytes: &[u8], metrics: &mut Metrics) {
     let unique_chars = freq.iter().filter(|&&c| c > 0).count() as u32;
     let entropy = crate::scan::entropy::shannon_from_histogram(&freq, total);
 
-    // Most common non-whitespace byte
+    // Most common non-whitespace byte, with its count
     let most_common = freq
         .iter()
         .enumerate()
         .filter(|&(b, &count)| count > 0 && !matches!(b as u8, b' ' | b'\t' | b'\n' | b'\r'))
         .max_by_key(|&(_, &count)| count)
-        .map(|(b, _)| b as u8);
+        .map(|(b, &count)| (b as u8, count));
 
     let most_common_ratio = most_common
-        .map(|c| freq[c as usize] as f64 / total as f64)
+        .map(|(_, count)| count as f64 / total as f64)
         .unwrap_or(0.0);
 
     if entropy > 0.0 {
@@ -79,7 +81,7 @@ fn emit_byte_metrics(bytes: &[u8], metrics: &mut Metrics) {
     if unique_chars > 0 {
         metrics.insert(metric!("text.unique_chars"), f64::from(unique_chars));
     }
-    if let Some(c) = most_common {
+    if let Some((c, _)) = most_common {
         metrics.insert(metric!("text.top_char"), f64::from(c));
         metrics.insert(
             metric!("text.top_char_null"),
@@ -368,22 +370,21 @@ fn emit_escape_metrics(content: &str, metrics: &mut Metrics) {
     let mut i = 0;
 
     while i < len {
-        if bytes[i] == b'\\' && i + 1 < len {
-            match bytes[i + 1] {
-                b'x' if i + 3 < len
-                    && bytes[i + 2].is_ascii_hexdigit()
-                    && bytes[i + 3].is_ascii_hexdigit() =>
+        if let Some([b'\\', escape, tail @ ..]) = bytes.get(i..) {
+            match escape {
+                b'x' if matches!(tail, [high, low, ..]
+                    if high.is_ascii_hexdigit() && low.is_ascii_hexdigit()) =>
                 {
                     hex_count += 1;
                     i += 4;
                     continue;
                 }
-                b'u' if i + 5 < len => {
+                b'u' if tail.len() >= 4 => {
                     unicode_count += 1;
                     i += 2;
                     continue;
                 }
-                b'U' if i + 9 < len => {
+                b'U' if tail.len() >= 8 => {
                     unicode_count += 1;
                     i += 2;
                     continue;

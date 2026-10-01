@@ -161,7 +161,7 @@ impl TreeSitterDiagnostic {
         }
     }
 
-    fn parse_failed(message: impl Into<String>) -> Self {
+    pub(crate) fn parse_failed(message: impl Into<String>) -> Self {
         Self {
             metric: metric!("source.ast_unavailable.parse_failed"),
             message: message.into(),
@@ -211,12 +211,12 @@ impl<'a> TreeCache<'a> {
         };
         if would_overflow_scanner_state(file_type, source) {
             let diagnostic = TreeSitterDiagnostic::tree_sitter_guard(
-                config.name,
+                config.name(),
                 source.len(),
                 scanner_audit(file_type),
             );
             tracing::warn!(
-                language = config.name,
+                language = config.name(),
                 bytes = source.len(),
                 audit = ?scanner_audit(file_type),
                 "skipping tree-sitter parse due to source-size or scanner-state safety guard"
@@ -236,7 +236,7 @@ impl<'a> TreeCache<'a> {
             // a C-level abort and names the offending grammar.
             if source.len() >= PARSE_BREADCRUMB_THRESHOLD_BYTES {
                 tracing::info!(
-                    language = config.name,
+                    language = config.name(),
                     bytes = source.len(),
                     "tree-sitter parse begin"
                 );
@@ -291,19 +291,19 @@ impl<'a> TreeCache<'a> {
                 // metric, or a Ctrl-C would look like a corrupt sample.
                 if cancelled.get() {
                     return TreeParse::Unavailable(TreeSitterDiagnostic::parse_cancelled(
-                        config.name,
+                        config.name(),
                         source.len(),
                     ));
                 }
                 if timed_out.get() {
                     tracing::warn!(
-                        language = config.name,
+                        language = config.name(),
                         bytes = source.len(),
                         budget_ms = budget.as_millis(),
                         "tree-sitter parse exceeded its wall budget; AST facts dropped"
                     );
                     return TreeParse::Unavailable(TreeSitterDiagnostic::parse_timeout(
-                        config.name,
+                        config.name(),
                         source.len(),
                         budget,
                     ));
@@ -365,11 +365,9 @@ fn normalize_bash_case_modification(source: &str) -> Option<String> {
             continue;
         };
         let output = normalized.get_or_insert_with(|| bytes.to_vec());
-        output[operator..operator + operator_len].copy_from_slice(if operator_len == 2 {
-            b"^^"
-        } else {
-            b"^"
-        });
+        if let Some(spelling) = output.get_mut(operator..operator + operator_len) {
+            spelling.copy_from_slice(if operator_len == 2 { b"^^" } else { b"^" });
+        }
         search_from = operator + operator_len;
     }
     let normalized = normalized?;
@@ -409,10 +407,9 @@ fn bash_case_modification_operator(
                 index += 1;
             }
             if bytes.get(index) == Some(&b'[') {
-                let subscript = &bytes[index..];
-                let subscript = &subscript[..subscript.len().min(MAX_BASH_SUBSCRIPT)];
+                let mut subscript = bytes.get(index..)?.iter().take(MAX_BASH_SUBSCRIPT);
                 let mut depth = 0usize;
-                let close = subscript.iter().position(|&byte| {
+                let close = subscript.position(|&byte| {
                     match byte {
                         b'[' => depth += 1,
                         b']' => {
@@ -610,13 +607,12 @@ fn estimated_python_delimiter_depth(source: &str) -> usize {
     let mut max_depth: usize = 0;
     let mut depth: usize = 0;
     let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
+    while let Some(&b) = bytes.get(i) {
         match b {
             // Skip past a hash-line comment — `f"` inside a comment is
             // not a delimiter push.
             b'#' => {
-                while i < bytes.len() && bytes[i] != b'\n' {
+                while bytes.get(i).is_some_and(|&b| b != b'\n') {
                     i += 1;
                 }
             }

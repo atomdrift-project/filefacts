@@ -182,19 +182,14 @@ fn extract_batch_comments(content: &str) -> Vec<String> {
         let t = line.trim_start();
         if let Some(rest) = t.strip_prefix("::") {
             comments.push(rest.to_string());
-        } else if t
-            .as_bytes()
-            .get(..3)
-            .is_some_and(|p| p.eq_ignore_ascii_case(b"rem"))
+        } else if let Some((keyword, after)) = t.split_at_checked(3)
+            && keyword.eq_ignore_ascii_case("rem")
+            && (after.is_empty() || after.starts_with([' ', '\t']))
         {
-            // Byte-compare, not `t[..3]`: a trimmed line can begin with a
-            // multi-byte char (e.g. CJK source comments), and slicing a str at
-            // byte 3 would panic mid-char. On a match bytes 0..2 are ASCII
-            // r/e/m, so byte 3 is a valid boundary and `&t[3..]` is safe.
-            let after = &t[3..];
-            if after.is_empty() || after.starts_with([' ', '\t']) {
-                comments.push(after.trim_start().to_string());
-            }
+            // `split_at_checked`, not `t[..3]`: a trimmed line can begin with
+            // a multi-byte char (e.g. CJK source comments), and slicing a str
+            // at byte 3 would panic mid-char.
+            comments.push(after.trim_start().to_string());
         }
     }
     comments
@@ -207,11 +202,13 @@ fn extract_semicolon_comments(content: &str) -> Vec<String> {
     let len = chars.len();
     let mut comments = Vec::new();
     let mut i = 0;
-    while i < len {
-        if chars[i] == '"' {
+    while let Some(&c) = chars.get(i) {
+        if c == '"' {
             i += 1;
-            while i < len && chars[i] != '"' {
-                if chars[i] == '\\' && i + 1 < len {
+            while let Some(&c) = chars.get(i)
+                && c != '"'
+            {
+                if c == '\\' && i + 1 < len {
                     i += 1;
                 }
                 i += 1;
@@ -219,12 +216,12 @@ fn extract_semicolon_comments(content: &str) -> Vec<String> {
             i += 1;
             continue;
         }
-        if chars[i] == ';' {
+        if c == ';' {
             let start = i + 1;
-            while i < len && chars[i] != '\n' {
+            while chars.get(i).is_some_and(|&c| c != '\n') {
                 i += 1;
             }
-            comments.push(chars[start..i].iter().collect());
+            comments.push(chars.get(start..i).unwrap_or_default().iter().collect());
             continue;
         }
         i += 1;
@@ -237,12 +234,14 @@ fn extract_double_dash_comments(content: &str) -> Vec<String> {
     let len = chars.len();
     let mut comments = Vec::new();
     let mut i = 0;
-    while i < len {
-        if chars[i] == '"' || chars[i] == '\'' {
-            let quote = chars[i];
+    while let Some(&c) = chars.get(i) {
+        if c == '"' || c == '\'' {
+            let quote = c;
             i += 1;
-            while i < len && chars[i] != quote {
-                if chars[i] == '\\' && i + 1 < len {
+            while let Some(&c) = chars.get(i)
+                && c != quote
+            {
+                if c == '\\' && i + 1 < len {
                     i += 1;
                 }
                 i += 1;
@@ -250,13 +249,13 @@ fn extract_double_dash_comments(content: &str) -> Vec<String> {
             i += 1;
             continue;
         }
-        if i + 1 < len && chars[i] == '-' && chars[i + 1] == '-' {
+        if matches!(chars.get(i..i + 2), Some(['-', '-'])) {
             let start = i + 2;
             i += 2;
-            while i < len && chars[i] != '\n' {
+            while chars.get(i).is_some_and(|&c| c != '\n') {
                 i += 1;
             }
-            comments.push(chars[start..i].iter().collect());
+            comments.push(chars.get(start..i).unwrap_or_default().iter().collect());
             continue;
         }
         i += 1;
@@ -269,12 +268,14 @@ fn extract_c_style_comments(content: &str, template_strings: bool) -> Vec<String
     let len = chars.len();
     let mut comments = Vec::new();
     let mut i = 0;
-    while i < len {
-        if chars[i] == '"' || chars[i] == '\'' {
-            let quote = chars[i];
+    while let Some(&c) = chars.get(i) {
+        if c == '"' || c == '\'' {
+            let quote = c;
             i += 1;
-            while i < len && chars[i] != quote {
-                if chars[i] == '\\' && i + 1 < len {
+            while let Some(&c) = chars.get(i)
+                && c != quote
+            {
+                if c == '\\' && i + 1 < len {
                     i += 1;
                 }
                 i += 1;
@@ -287,10 +288,12 @@ fn extract_c_style_comments(content: &str, template_strings: bool) -> Vec<String
         // whole backtick span so those bytes aren't misread as comments.
         // `${…}` interpolation is treated as opaque string content, matching
         // how the `"`/`'` branches above ignore their contents.
-        if template_strings && chars[i] == '`' {
+        if template_strings && c == '`' {
             i += 1;
-            while i < len && chars[i] != '`' {
-                if chars[i] == '\\' && i + 1 < len {
+            while let Some(&c) = chars.get(i)
+                && c != '`'
+            {
+                if c == '\\' && i + 1 < len {
                     i += 1;
                 }
                 i += 1;
@@ -298,22 +301,22 @@ fn extract_c_style_comments(content: &str, template_strings: bool) -> Vec<String
             i += 1;
             continue;
         }
-        if i + 1 < len && chars[i] == '/' && chars[i + 1] == '/' {
+        if matches!(chars.get(i..i + 2), Some(['/', '/'])) {
             let start = i + 2;
             i += 2;
-            while i < len && chars[i] != '\n' {
+            while chars.get(i).is_some_and(|&c| c != '\n') {
                 i += 1;
             }
-            comments.push(chars[start..i].iter().collect());
+            comments.push(chars.get(start..i).unwrap_or_default().iter().collect());
             continue;
         }
-        if i + 1 < len && chars[i] == '/' && chars[i + 1] == '*' {
+        if matches!(chars.get(i..i + 2), Some(['/', '*'])) {
             let start = i + 2;
             i += 2;
-            while i + 1 < len && !(chars[i] == '*' && chars[i + 1] == '/') {
+            while chars.get(i..i + 2).is_some_and(|pair| pair != ['*', '/']) {
                 i += 1;
             }
-            comments.push(chars[start..i].iter().collect());
+            comments.push(chars.get(start..i).unwrap_or_default().iter().collect());
             i += 2;
             continue;
         }
@@ -327,13 +330,14 @@ fn extract_hash_comments(content: &str) -> Vec<String> {
     let len = chars.len();
     let mut comments = Vec::new();
     let mut i = 0;
-    while i < len {
-        if chars[i] == '"' || chars[i] == '\'' {
-            let quote = chars[i];
-            if i + 2 < len && chars[i + 1] == quote && chars[i + 2] == quote {
+    while let Some(&c) = chars.get(i) {
+        if c == '"' || c == '\'' {
+            let quote = c;
+            if chars.get(i + 1..i + 3) == Some(&[quote, quote]) {
                 i += 3;
-                while i + 2 < len
-                    && !(chars[i] == quote && chars[i + 1] == quote && chars[i + 2] == quote)
+                while chars
+                    .get(i..i + 3)
+                    .is_some_and(|run| run != [quote, quote, quote])
                 {
                     i += 1;
                 }
@@ -341,8 +345,10 @@ fn extract_hash_comments(content: &str) -> Vec<String> {
                 continue;
             }
             i += 1;
-            while i < len && chars[i] != quote {
-                if chars[i] == '\\' && i + 1 < len {
+            while let Some(&c) = chars.get(i)
+                && c != quote
+            {
+                if c == '\\' && i + 1 < len {
                     i += 1;
                 }
                 i += 1;
@@ -350,13 +356,13 @@ fn extract_hash_comments(content: &str) -> Vec<String> {
             i += 1;
             continue;
         }
-        if chars[i] == '#' {
+        if c == '#' {
             let start = i + 1;
             i += 1;
-            while i < len && chars[i] != '\n' {
+            while chars.get(i).is_some_and(|&c| c != '\n') {
                 i += 1;
             }
-            comments.push(chars[start..i].iter().collect());
+            comments.push(chars.get(start..i).unwrap_or_default().iter().collect());
             continue;
         }
         i += 1;

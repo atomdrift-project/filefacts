@@ -59,18 +59,14 @@ impl std::fmt::Display for MetricKey {
 
 /// `str` equality usable from a `const` context.
 const fn str_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i < a.len() {
-        if a[i] != b[i] {
-            return false;
+    let (mut a, mut b) = (a.as_bytes(), b.as_bytes());
+    loop {
+        match (a, b) {
+            ([], []) => return true,
+            ([x, a_rest @ ..], [y, b_rest @ ..]) if *x == *y => (a, b) = (a_rest, b_rest),
+            _ => return false,
         }
-        i += 1;
     }
-    true
 }
 
 /// Resolve a literal against [`CATALOG`], or fail the build.
@@ -89,12 +85,12 @@ const fn str_eq(a: &str, b: &str) -> bool {
 #[doc(hidden)]
 #[must_use]
 pub const fn declared(name: &'static str) -> MetricKey {
-    let mut i = 0;
-    while i < CATALOG.len() {
-        if str_eq(CATALOG[i], name) {
+    let mut rest = CATALOG;
+    while let [key, tail @ ..] = rest {
+        if str_eq(key, name) {
             return MetricKey(Cow::Borrowed(name));
         }
-        i += 1;
+        rest = tail;
     }
     panic!("undeclared metric key: add it to CATALOG in src/output/metric_keys.rs");
 }

@@ -75,6 +75,7 @@
 //! versioned separately via [`SCHEMA_VERSION`]; field additions are
 //! non-breaking, field semantics or renames bump the version.
 
+mod bytes;
 mod debug;
 mod embedded_sources;
 mod error;
@@ -89,6 +90,7 @@ mod registry;
 mod scan;
 
 pub mod cache;
+pub mod cache_sweep;
 pub mod fileid;
 pub mod tools;
 
@@ -219,7 +221,8 @@ pub struct ParsedFile<'a> {
     // that fills `extracted`.
     tree_parse: OnceLock<Option<formats::source::TreeParse<'a>>>,
     flow: OnceLock<Option<Flow>>,
-    cfml_parse: OnceLock<Option<formats::cfml::Parsed>>,
+    /// `Err` holds the message of a panic the CFML parse raised.
+    cfml_parse: OnceLock<Option<Result<formats::cfml::Parsed, String>>>,
     // Caller's cancellation flag, polled by long-running leaf work (currently
     // the tree-sitter parse). Borrowed rather than `Arc`-shared, and never
     // written here: filefacts only ever reads it.
@@ -275,19 +278,17 @@ struct Extracted {
     errors: Errors,
 }
 
-/// On-disk cache form of [`Extracted`]: identical except the byte-scan `text`
-/// rows are dropped and replaced by stng's cache key. stng owns those rows in
-/// its own cache, so persisting them again here would store a second copy;
-/// instead [`ExtractedSnapshot::into_extracted`] rehydrates them from stng.
+/// On-disk cache form of [`Extracted`]. The byte-scan `text` rows are stored
+/// as one list in extraction order: `Text`'s own serialized form groups them
+/// by encoding, which would hand a second `open` the rows in another order.
+///
+/// They are cached under filefacts' key like everything else here, and that
+/// key covers `Cargo.toml` (see `build.rs`), which pins stng to an exact
+/// commit: bumping stng retires every entry, with no version to maintain.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ExtractedSnapshot {
     values: Values,
-    /// stng cache key for the dropped `text` rows (`None` when no text tier ran).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    text_key: Option<String>,
-    /// Keys for row sets appended from decoded buffers (see `Strings`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    extra_text_keys: Vec<String>,
+    text: Vec<stng::ExtractedString>,
     literals: output::Literals,
     comments: output::Comments,
     metrics: Metrics,
@@ -301,12 +302,9 @@ struct ExtractedSnapshot {
 
 impl From<Extracted> for ExtractedSnapshot {
     fn from(e: Extracted) -> Self {
-        // The `text` rows are intentionally dropped here — stng's cache holds
-        // them, keyed by `text_key`.
         Self {
             values: e.values,
-            text_key: e.strings.text_key,
-            extra_text_keys: e.strings.extra_text_keys,
+            text: e.strings.text.rows().to_vec(),
             literals: e.strings.literals,
             comments: e.strings.comments,
             metrics: e.metrics,
@@ -320,40 +318,23 @@ impl From<Extracted> for ExtractedSnapshot {
     }
 }
 
-impl ExtractedSnapshot {
-    /// Rebuild a full [`Extracted`], rehydrating the `text` rows from stng's
-    /// cache. Returns `None` when a key was recorded but stng no longer has the
-    /// entry (evicted) — the caller then recomputes the pipeline so the strings
-    /// are never silently lost.
-    fn into_extracted(self) -> Option<Extracted> {
-        let mut text = match &self.text_key {
-            Some(key) => output::Text::from_rows(stng::cached_strings_by_key(key)?),
-            None => output::Text::new(),
-        };
-        // Decoded-payload rows, rehydrated the same way. `?` on a miss for
-        // the same reason the primary key uses it: recomputing the pipeline
-        // is right, and silently returning a file with half its strings is
-        // not.
-        for key in &self.extra_text_keys {
-            text.append_rows(&stng::cached_strings_by_key(key)?);
-        }
-        Some(Extracted {
-            values: self.values,
+impl From<ExtractedSnapshot> for Extracted {
+    fn from(s: ExtractedSnapshot) -> Self {
+        Self {
+            values: s.values,
             strings: output::Strings {
-                text,
-                literals: self.literals,
-                comments: self.comments,
-                text_key: self.text_key,
-                extra_text_keys: self.extra_text_keys,
+                text: output::Text::from_rows(s.text.into()),
+                literals: s.literals,
+                comments: s.comments,
             },
-            metrics: self.metrics,
-            archive_members: self.archive_members,
-            sections: self.sections,
-            symbols: self.symbols,
-            identity: self.identity,
-            references: self.references,
-            errors: self.errors,
-        })
+            metrics: s.metrics,
+            archive_members: s.archive_members,
+            sections: s.sections,
+            symbols: s.symbols,
+            identity: s.identity,
+            references: s.references,
+            errors: s.errors,
+        }
     }
 }
 
@@ -470,7 +451,9 @@ impl<'a> ParsedFile<'a> {
         self.flow
             .get_or_init(|| {
                 let cache = self.tree_cache()?;
-                Some(formats::source::build_value_flow(cache, self.symbols()))
+                // A panic leaves flow unavailable rather than taking the
+                // caller down; the other views are unaffected.
+                guarded(|| formats::source::build_value_flow(cache, self.symbols())).ok()
             })
             .as_ref()
     }
@@ -570,11 +553,18 @@ impl<'a> ParsedFile<'a> {
                 if !formats::source::supports(self.fileid.file_type()) {
                     return None;
                 }
-                Some(formats::source::TreeCache::parse(
-                    self.bytes,
-                    self.fileid.file_type(),
-                    self.cancellation,
-                ))
+                let parsed = guarded(|| {
+                    formats::source::TreeCache::parse(
+                        self.bytes,
+                        self.fileid.file_type(),
+                        self.cancellation,
+                    )
+                });
+                Some(parsed.unwrap_or_else(|message| {
+                    formats::source::TreeParse::Unavailable(
+                        formats::source::TreeSitterDiagnostic::parse_failed(message),
+                    )
+                }))
             })
             .as_ref()
     }
@@ -592,11 +582,15 @@ impl<'a> ParsedFile<'a> {
     }
 
     fn cfml_parse(&self) -> Option<&formats::cfml::Parsed> {
+        self.cfml_outcome()?.as_ref().ok()
+    }
+
+    fn cfml_outcome(&self) -> Option<&Result<formats::cfml::Parsed, String>> {
         if self.fileid.file_type() != FileType::Cfml {
             return None;
         }
         self.cfml_parse
-            .get_or_init(|| Some(formats::cfml::parse(self.bytes)))
+            .get_or_init(|| Some(guarded(|| formats::cfml::parse(self.bytes))))
             .as_ref()
     }
 
@@ -621,9 +615,6 @@ impl<'a> ParsedFile<'a> {
                 self.fileid.extension_mismatch_transition(),
                 self.basename.as_deref(),
             );
-            // The cached form drops the byte-scan `text` rows (stng owns them);
-            // they are rehydrated below. `open_with_cache` stores/loads the
-            // lean snapshot, not the full `Extracted`.
             let snapshot: Option<ExtractedSnapshot> =
                 cache::open_with_cache(self.bytes, &variant, |_| {
                     let extracted = self.run_pipeline();
@@ -635,13 +626,8 @@ impl<'a> ParsedFile<'a> {
                         Some(cache::Computed::Cacheable(snapshot))
                     }
                 });
-            // Rehydrate `text` from stng. A `None` here means either the
-            // closure declined (it never does) or stng evicted the entry the
-            // snapshot referenced; recompute the pipeline so strings are never
-            // silently dropped.
-            snapshot
-                .and_then(ExtractedSnapshot::into_extracted)
-                .unwrap_or_else(|| self.run_pipeline())
+            // `None` only when the closure declines, which it never does.
+            snapshot.map_or_else(|| self.run_pipeline(), Extracted::from)
         })
     }
 
@@ -658,12 +644,35 @@ impl<'a> ParsedFile<'a> {
             self.tree_parse()
                 .and_then(formats::source::TreeParse::diagnostic),
         );
-        if let Some(parsed) = self.cfml_parse() {
-            for symbol in parsed.symbols.iter() {
-                extracted.symbols.push(symbol.clone());
+        match self.cfml_outcome() {
+            Some(Ok(parsed)) => {
+                for symbol in parsed.symbols.iter() {
+                    extracted.symbols.push(symbol.clone());
+                }
             }
+            Some(Err(message)) => {
+                extracted
+                    .errors
+                    .record_panic(Stage::SourceParse, message.clone());
+                extracted
+                    .metrics
+                    .insert(metric!("parse.error_count"), extracted.errors.len() as f64);
+            }
+            None => {}
         }
         extracted
+    }
+}
+
+/// Run parse work that sits outside the extraction pipeline's own
+/// `catch_unwind` (the source parse, the CFML parse, the flow graph), turning
+/// a panic into its message. Without this, one malformed file takes down the
+/// whole host process.
+fn guarded<T>(work: impl FnOnce() -> T) -> Result<T, String> {
+    match formats::goblin_safe::catch_infallible(work) {
+        formats::goblin_safe::GoblinOutcome::Ok(value) => Ok(value),
+        formats::goblin_safe::GoblinOutcome::Panicked(message) => Err(message),
+        formats::goblin_safe::GoblinOutcome::Failed(error) => Err(error.to_string()),
     }
 }
 
@@ -1302,14 +1311,15 @@ fn emit_binary_overlay(
             metric!("binary.overlay_ratio"),
             overlay_size as f64 / file_size as f64,
         );
-        let start = last_extent as usize;
-        let end = bytes.len();
-        if start < end {
+        if let Some(overlay) = bytes
+            .get(last_extent as usize..)
+            .filter(|overlay| !overlay.is_empty())
+        {
             // The overlay is appended payload (installer stub, SFX); carry its
             // extent so a finding points past the last section.
             metrics.insert_located(
                 metric!("binary.overlay_entropy"),
-                scan::entropy::shannon(&bytes[start..end]),
+                scan::entropy::shannon(overlay),
                 [Span::new(last_extent, overlay_size)],
             );
         }
@@ -1486,6 +1496,25 @@ fn file_type_for_language(name: &str) -> Option<FileType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guarded_turns_a_panic_into_its_message() {
+        assert_eq!(guarded(|| 7), Ok(7));
+        let caught: Result<(), String> = guarded(|| panic!("boom"));
+        assert_eq!(caught, Err("boom".to_string()));
+    }
+
+    #[test]
+    fn invalid_utf8_cfml_does_not_take_down_the_caller() {
+        // Used to panic in the CFML flow parse, which sat outside every
+        // `catch_unwind` and so aborted the whole process.
+        let mut source = b"<cfset a = ".to_vec();
+        source.extend(std::iter::repeat_n(0xFF, 100));
+        source.extend_from_slice(b".foo()>");
+        let parsed = open_as(Path::new("x.cfm"), &source, FileType::Cfml).unwrap();
+        let _ = parsed.flow();
+        let _ = parsed.symbols();
+    }
 
     #[test]
     fn failed_identification_is_recorded_as_an_error() {
@@ -1736,21 +1765,14 @@ mod tests {
         let snapshot = ExtractedSnapshot::from(extracted);
         let json = serde_json::to_vec(&snapshot).unwrap();
         let restored: ExtractedSnapshot = serde_json::from_slice(&json).unwrap();
-        check(
-            &restored
-                .into_extracted()
-                .expect("stng cache must preserve decoded rows"),
-        );
+        check(&Extracted::from(restored));
     }
 
     #[test]
-    fn snapshot_rehydrates_strings_decoded_out_of_the_file() {
-        // The regression this guards: an RTF's `\objdata` hex decodes to a
-        // command that appears nowhere in the file's bytes. Those rows are
-        // appended to the text tier, and the disk cache stores only keys --
-        // so if the appended set has no key of its own, the second scan of the
-        // same file loses not just the decoded command but every string the
-        // file did contain, because the whole tier rehydrates as empty.
+    fn snapshot_keeps_strings_decoded_out_of_the_file() {
+        // An RTF's `\objdata` hex decodes to a command that appears nowhere
+        // in the file's bytes. Those rows are appended to the text tier and
+        // must survive the cache round-trip with the rest.
         let mut blob = Vec::new();
         blob.extend_from_slice(&0x0105_u32.to_le_bytes());
         blob.extend_from_slice(&2u32.to_le_bytes());
@@ -1769,17 +1791,11 @@ mod tests {
         let has_command =
             |e: &Extracted| e.strings.text.iter().any(|s| s.value.contains("certutil"));
         assert!(has_command(&extracted), "decoded command should be present");
-        assert!(
-            !extracted.strings.extra_text_keys.is_empty(),
-            "appended rows must record their own rehydration key"
-        );
 
         let snapshot = ExtractedSnapshot::from(extracted);
         let json = serde_json::to_vec(&snapshot).expect("serialize snapshot");
         let restored: ExtractedSnapshot = serde_json::from_slice(&json).unwrap();
-        let rehydrated = restored
-            .into_extracted()
-            .expect("snapshot should rehydrate from stng");
+        let rehydrated = Extracted::from(restored);
         assert!(
             has_command(&rehydrated),
             "decoded command must survive the cache round-trip"
@@ -1787,53 +1803,24 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_drops_text_rows_and_rehydrates_from_stng() {
-        // The disk cache stores an `ExtractedSnapshot`, which carries no
-        // byte-scan row data — only stng's cache key. Rehydration must
-        // reconstruct the exact `text` rows from stng's cache (the single
-        // owner), so strings are stored once across the layers.
+    fn snapshot_round_trips_text_rows_in_order() {
+        // The disk cache stores the byte-scan rows itself, as one list in
+        // extraction order, so a cached `open` returns exactly the rows (and
+        // order) a fresh one does.
         let bytes =
             std::fs::read("tests/fixtures/test.exe").expect("test.exe fixture should exist");
-        let parsed = open(&bytes).unwrap();
-        // Owned extraction; this also populates stng's in-process memo.
-        let extracted = parsed.run_pipeline();
-        let want: Vec<String> = extracted
-            .strings
-            .text
-            .iter()
-            .map(|s| s.value.clone())
-            .collect();
+        let extracted = open(&bytes).unwrap().run_pipeline();
+        let want: Vec<stng::ExtractedString> = extracted.strings.text.rows().to_vec();
         assert!(!want.is_empty(), "fixture should yield byte-scan strings");
-        assert!(
-            extracted.strings.text_key.is_some(),
-            "cacheable opts must record a rehydration key"
-        );
 
         let snapshot = ExtractedSnapshot::from(extracted);
         let json = serde_json::to_vec(&snapshot).expect("serialize snapshot");
-        let as_value: serde_json::Value = serde_json::from_slice(&json).unwrap();
-        assert!(
-            as_value.get("text_key").is_some(),
-            "snapshot must carry the rehydration key"
-        );
-        assert!(
-            as_value.get("text").is_none() && as_value.get("ascii").is_none(),
-            "snapshot must not carry the byte-scan row data"
-        );
-
         let restored: ExtractedSnapshot = serde_json::from_slice(&json).expect("deserialize");
-        let rehydrated = restored
-            .into_extracted()
-            .expect("stng cache still holds the rows from the extraction above");
-        let got: Vec<String> = rehydrated
-            .strings
-            .text
-            .iter()
-            .map(|s| s.value.clone())
-            .collect();
+        let got = Extracted::from(restored);
         assert_eq!(
-            want, got,
-            "text rehydrated from stng must match the original rows exactly"
+            got.strings.text.rows().to_vec(),
+            want,
+            "cached text rows must match the fresh extraction exactly"
         );
     }
 

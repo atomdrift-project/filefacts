@@ -36,8 +36,22 @@ use std::io::Read;
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
+use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_value};
+use crate::bytes::{u32_be, u64_be, u64_le};
 use crate::error::Error;
 use crate::output::{ArchiveCompression, ArchiveMember, ArchiveOffsets, Metrics, Values};
+
+/// The shared aggregates over a disk image's partitions. A partition name
+/// (`disk image (Apple_HFS : 4)`) is a label, not a file name, so none of the
+/// name-based counts apply.
+const AGGS: &[Agg] = &[
+    Agg::MemberCount,
+    Agg::UncompressedSize(Scope::All),
+    Agg::CompressedSize,
+    Agg::CompressionRatio,
+    Agg::Methods { always: true },
+    Agg::EntryTypes,
+];
 
 /// The `koly` trailer is a fixed 512 bytes at the end of the file.
 const KOLY_LEN: usize = 512;
@@ -118,13 +132,13 @@ impl Koly {
             return None;
         }
         Some(Self {
-            version: be_u32(t, 4)?,
-            data_fork_offset: be_u64(t, 24)?,
-            data_fork_length: be_u64(t, 32)?,
-            xml_offset: be_u64(t, 216)?,
-            xml_length: be_u64(t, 224)?,
-            image_variant: be_u32(t, 488)?,
-            sector_count: be_u64(t, 492)?,
+            version: u32_be(t, 4)?,
+            data_fork_offset: u64_be(t, 24)?,
+            data_fork_length: u64_be(t, 32)?,
+            xml_offset: u64_be(t, 216)?,
+            xml_length: u64_be(t, 224)?,
+            image_variant: u32_be(t, 488)?,
+            sector_count: u64_be(t, 492)?,
         })
     }
 }
@@ -198,9 +212,9 @@ fn parse_mish(name: String, data: &[u8]) -> Option<Partition> {
     if !data.starts_with(b"mish") {
         return None;
     }
-    let sector_count = be_u64(data, 16)?;
-    let data_offset = be_u64(data, 24)?;
-    let declared = be_u32(data, 200)? as usize;
+    let sector_count = u64_be(data, 16)?;
+    let data_offset = u64_be(data, 24)?;
+    let declared = u32_be(data, 200)? as usize;
     // The chunk count is attacker-controlled; clamp to what the blob holds.
     let available = data.len().saturating_sub(204) / 40;
     let count = declared.min(available);
@@ -208,12 +222,12 @@ fn parse_mish(name: String, data: &[u8]) -> Option<Partition> {
     let mut chunks = Vec::with_capacity(count);
     for i in 0..count {
         let off = 204 + i * 40;
-        let entry_type = be_u32(data, off)?;
+        let entry_type = u32_be(data, off)?;
         chunks.push(Chunk {
             entry_type,
-            sector_number: be_u64(data, off + 8)?,
-            comp_offset: be_u64(data, off + 24)?,
-            comp_length: be_u64(data, off + 32)?,
+            sector_number: u64_be(data, off + 8)?,
+            comp_offset: u64_be(data, off + 24)?,
+            comp_length: u64_be(data, off + 32)?,
         });
     }
     Some(Partition {
@@ -241,6 +255,8 @@ fn emit_partitions(
         std::collections::BTreeSet::new();
 
     let mut members = Vec::with_capacity(partitions.len());
+    let mut archive_values = Vec::with_capacity(partitions.len());
+    let mut stats = ArchiveStats::new(AGGS);
     for p in partitions {
         let mut part_codecs: std::collections::BTreeMap<&'static str, u64> =
             std::collections::BTreeMap::new();
@@ -278,7 +294,7 @@ fn emit_partitions(
         }
         members.push(JsonValue::Object(obj));
 
-        archive_members.push(ArchiveMember {
+        let member = ArchiveMember {
             path: p.name.clone(),
             size_bytes,
             entry_type: Some("partition".into()),
@@ -293,10 +309,15 @@ fn emit_partitions(
             }),
             ownership: None,
             offsets: ArchiveOffsets::default(),
-        });
+        };
+        stats.observe(&member, &Reading::opaque());
+        archive_values.push(JsonValue::Object(member_value(&member, Shape::FULL)));
+        archive_members.push(member);
     }
 
     values.insert("dmg.partitions", JsonValue::Array(members));
+    values.insert("archive.members", JsonValue::Array(archive_values));
+    stats.emit(values, metrics);
 
     let codecs: Vec<JsonValue> = codec_counts
         .keys()
@@ -369,8 +390,7 @@ fn reconstruct_prefix(bytes: &[u8], koly: &Koly, part: &Partition, max: usize) -
                     .saturating_add(part.data_offset)
                     .saturating_add(c.comp_offset) as usize;
                 let src = bytes.get(src_off..src_off.checked_add(c.comp_length as usize)?)?;
-                let end = (out_off + src.len()).min(max);
-                buf[out_off..end].copy_from_slice(&src[..end - out_off]);
+                fill(&mut buf, out_off, src);
             }
             "zlib" => {
                 let src_off = koly
@@ -383,8 +403,7 @@ fn reconstruct_prefix(bytes: &[u8], koly: &Koly, part: &Partition, max: usize) -
                     .take((max - out_off) as u64)
                     .read_to_end(&mut out)
                     .ok()?;
-                let end = (out_off + out.len()).min(max);
-                buf[out_off..end].copy_from_slice(&out[..end - out_off]);
+                fill(&mut buf, out_off, &out);
             }
             _ => return None, // adc / bzip2 / lzfse / lzma
         }
@@ -392,10 +411,18 @@ fn reconstruct_prefix(bytes: &[u8], koly: &Koly, part: &Partition, max: usize) -
     Some(buf)
 }
 
+/// Copy as much of `src` as fits into `buf` starting at `at`.
+fn fill(buf: &mut [u8], at: usize, src: &[u8]) {
+    let n = buf.len().saturating_sub(at).min(src.len());
+    if let (Some(dst), Some(src)) = (buf.get_mut(at..at + n), src.get(..n)) {
+        dst.copy_from_slice(src);
+    }
+}
+
 /// Parse an HFS+/HFSX volume header (at partition offset 1024). Returns
 /// `Some(())` when the signature matches so the caller stops.
 fn hfs_volume_facts(prefix: &[u8], values: &mut Values, metrics: &mut Metrics) -> Option<()> {
-    let vh = prefix.get(1024..1024 + 64)?;
+    let vh = prefix.get(1024..)?.first_chunk::<64>()?;
     let fs = match &vh[0..2] {
         b"H+" => "HFS+",
         b"HX" => "HFSX",
@@ -417,8 +444,8 @@ fn hfs_volume_facts(prefix: &[u8], values: &mut Values, metrics: &mut Metrics) -
     // Dates are seconds since 1904. Per the HFS+ spec `createDate` is local
     // time while `modifyDate` is GMT, so their delta is the build machine's
     // timezone offset — surfaced separately rather than normalized away.
-    let create = be_u32(vh, 16)?;
-    let modify = be_u32(vh, 20)?;
+    let create = u32_be(vh, 16)?;
+    let modify = u32_be(vh, 20)?;
     if let Some(t) = hfs_to_unix(create) {
         values.insert("dmg.volume.created_unix", JsonValue::Number(t.into()));
     }
@@ -429,9 +456,9 @@ fn hfs_volume_facts(prefix: &[u8], values: &mut Values, metrics: &mut Metrics) -
         metrics.insert(metric!("dmg.volume.timezone_skew_seconds"), (c - m) as f64);
     }
 
-    metrics.insert(metric!("dmg.volume.file_count"), be_u32(vh, 32)? as f64);
-    metrics.insert(metric!("dmg.volume.folder_count"), be_u32(vh, 36)? as f64);
-    metrics.insert(metric!("dmg.volume.block_size"), be_u32(vh, 40)? as f64);
+    metrics.insert(metric!("dmg.volume.file_count"), u32_be(vh, 32)? as f64);
+    metrics.insert(metric!("dmg.volume.folder_count"), u32_be(vh, 36)? as f64);
+    metrics.insert(metric!("dmg.volume.block_size"), u32_be(vh, 40)? as f64);
     Some(())
 }
 
@@ -456,13 +483,13 @@ fn apfs_volume_facts(prefix: &[u8], values: &mut Values, metrics: &mut Metrics) 
         (metric!("dmg.volume.folder_count"), 192),
         (metric!("dmg.volume.symlink_count"), 200),
     ] {
-        let n = le_u64(sb, off)?;
+        let n = u64_le(sb, off)?;
         if n > 0 {
             metrics.insert(key, n as f64);
         }
     }
 
-    if let Some(t) = apfs_ns_to_unix(le_u64(sb, 256)?) {
+    if let Some(t) = apfs_ns_to_unix(u64_le(sb, 256)?) {
         values.insert("dmg.volume.modified_unix", JsonValue::Number(t.into()));
     }
     // `apfs_formatted_by`: a 32-byte id (`newfs_apfs (NNNN.NN.N)`) and the
@@ -471,7 +498,7 @@ fn apfs_volume_facts(prefix: &[u8], values: &mut Values, metrics: &mut Metrics) 
     if let Some(id) = c_string(sb, 272, 32) {
         values.insert("dmg.volume.formatted_by", JsonValue::String(id));
     }
-    if let Some(t) = apfs_ns_to_unix(le_u64(sb, 304)?) {
+    if let Some(t) = apfs_ns_to_unix(u64_le(sb, 304)?) {
         values.insert("dmg.volume.created_unix", JsonValue::Number(t.into()));
     }
     if let Some(name) = c_string(sb, 704, 256) {
@@ -536,29 +563,10 @@ fn apfs_ns_to_unix(ns: u64) -> Option<i64> {
 /// Read a NUL-terminated UTF-8 string from a fixed-width field, returning
 /// `None` when empty or not valid UTF-8.
 fn c_string(b: &[u8], off: usize, len: usize) -> Option<String> {
-    let field = b.get(off..off + len)?;
-    let end = field.iter().position(|&c| c == 0).unwrap_or(field.len());
-    let s = std::str::from_utf8(&field[..end]).ok()?.trim();
+    let field = b.get(off..off.checked_add(len)?)?;
+    let text = field.split(|&c| c == 0).next().unwrap_or(field);
+    let s = std::str::from_utf8(text).ok()?.trim();
     (!s.is_empty()).then(|| s.to_string())
-}
-
-fn be_u32(b: &[u8], off: usize) -> Option<u32> {
-    let s = b.get(off..off + 4)?;
-    Some(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
-}
-
-fn be_u64(b: &[u8], off: usize) -> Option<u64> {
-    let s = b.get(off..off + 8)?;
-    Some(u64::from_be_bytes([
-        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-    ]))
-}
-
-fn le_u64(b: &[u8], off: usize) -> Option<u64> {
-    let s = b.get(off..off + 8)?;
-    Some(u64::from_le_bytes([
-        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-    ]))
 }
 
 #[cfg(test)]
@@ -746,6 +754,24 @@ mod tests {
             Some("UDZO")
         );
         assert_eq!(m.get("dmg.volume.file_count"), Some(3.0));
+    }
+
+    /// Partitions are archive members: listed under `archive.members` and
+    /// summed by the shared aggregates.
+    #[test]
+    fn partitions_are_published_as_archive_members() {
+        let dmg = build_dmg("disk image (Apple_HFS : 4)", &hfs_fork(1, 1, 0, 0));
+        let (v, m, members) = run(&dmg);
+        let listed = v.get("archive.members").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(listed.len(), members.len());
+        assert_eq!(listed[0]["entry_type"], "partition");
+        assert_eq!(listed[0]["compression_method"], "raw");
+        assert_eq!(listed[0]["host_os"], "macintosh");
+        assert_eq!(m.get("archive.member_count"), Some(1.0));
+        assert_eq!(m.get("archive.uncompressed_size"), Some(2048.0));
+        assert_eq!(m.get("archive.compression.method_counts.raw"), Some(1.0));
+        // A partition label is not a file name.
+        assert!(m.get("archive.executable_count").is_none());
     }
 
     #[test]

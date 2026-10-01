@@ -20,6 +20,7 @@ use serde_json::Value as JsonValue;
 use std::collections::{BTreeSet, VecDeque};
 
 use crate::error::Error;
+use crate::formats::common::bytes_at::{u32_le, u64_le};
 use crate::formats::common::{XorScan, extract_binary_strings, put_str};
 use crate::output::{Metrics, Strings, Values};
 
@@ -39,7 +40,7 @@ pub(super) fn extract(
     if bytes.is_empty() {
         return Ok(());
     }
-    let scan = &bytes[..bytes.len().min(MAX_BYTES_SCANNED)];
+    let scan = bytes.get(..MAX_BYTES_SCANNED).unwrap_or(bytes);
 
     let mut protocol: i32 = -1;
     let mut modules: BTreeSet<String> = BTreeSet::new();
@@ -51,9 +52,8 @@ pub(super) fn extract(
     let mut recent: VecDeque<&str> = VecDeque::with_capacity(RECENT_STRING_CAP);
 
     let mut i = 0_usize;
-    while i < scan.len() {
-        let op = scan[i];
-        if let Some(name) = OPCODE_NAMES[op as usize] {
+    while let Some(&op) = scan.get(i) {
+        if let Some(name) = opcode_name(op) {
             opcodes.insert(name);
         }
         apply_side_effects(
@@ -169,13 +169,11 @@ fn payload_size(op: u8, i: usize, scan: &[u8]) -> Option<usize> {
             read_len_prefixed(1, len)
         }
         0x8B | b'X' | b'T' => {
-            let bytes = scan.get(i + 1..i + 5)?.try_into().ok()?;
-            let len = u32::from_le_bytes(bytes) as usize;
+            let len = u32_le(scan, i + 1)? as usize;
             read_len_prefixed(4, len)
         }
         0x8D | 0x96 => {
-            let bytes = scan.get(i + 1..i + 9)?.try_into().ok()?;
-            let len = usize::try_from(u64::from_le_bytes(bytes)).ok()?;
+            let len = usize::try_from(u64_le(scan, i + 1)?).ok()?;
             read_len_prefixed(8, len)
         }
         _ => Some(1),
@@ -222,7 +220,7 @@ fn apply_side_effects<'a>(
                 .and_then(|s| s.iter().position(|&b| b == b'\n'))
             {
                 let module_end = i + 1 + m_nl;
-                if let Ok(module) = std::str::from_utf8(&scan[i + 1..module_end]) {
+                if let Some(Ok(module)) = scan.get(i + 1..module_end).map(std::str::from_utf8) {
                     if !module.is_empty() {
                         modules.insert(module.to_string());
                     }
@@ -231,7 +229,8 @@ fn apply_side_effects<'a>(
                         .and_then(|s| s.iter().position(|&b| b == b'\n'))
                     {
                         let attr_end = module_end + 1 + a_nl;
-                        if let Ok(attr) = std::str::from_utf8(&scan[module_end + 1..attr_end])
+                        if let Some(Ok(attr)) =
+                            scan.get(module_end + 1..attr_end).map(std::str::from_utf8)
                             && is_pickle_ident(module)
                             && is_pickle_ident(attr)
                         {
@@ -253,15 +252,16 @@ fn apply_side_effects<'a>(
             }
         }
         b'X' => {
-            if let Some(bytes) = scan.get(i + 1..i + 5) {
-                if let Ok(arr) = bytes.try_into() {
-                    let len = u32::from_le_bytes(arr) as usize;
-                    let start = i + 5;
-                    let end = start + len;
-                    if let Some(slice) = scan.get(start..end) {
-                        if let Ok(s) = std::str::from_utf8(slice) {
-                            push_recent(recent, s);
-                        }
+            if let Some(len) = u32_le(scan, i + 1) {
+                let start = i + 5;
+                // `len` is file-controlled; a string past the address space
+                // is past the end of the scan, like any truncated one.
+                if let Some(slice) = start
+                    .checked_add(len as usize)
+                    .and_then(|end| scan.get(start..end))
+                {
+                    if let Ok(s) = std::str::from_utf8(slice) {
+                        push_recent(recent, s);
                     }
                 }
             }
@@ -286,76 +286,78 @@ fn apply_side_effects<'a>(
     }
 }
 
-const OPCODE_NAMES: [Option<&'static str>; 256] = {
-    let mut t: [Option<&'static str>; 256] = [None; 256];
-    t[b'(' as usize] = Some("MARK");
-    t[b'.' as usize] = Some("STOP");
-    t[b'0' as usize] = Some("POP");
-    t[b'1' as usize] = Some("POP_MARK");
-    t[b'2' as usize] = Some("DUP");
-    t[b'F' as usize] = Some("FLOAT");
-    t[b'I' as usize] = Some("INT");
-    t[b'J' as usize] = Some("BININT");
-    t[b'K' as usize] = Some("BININT1");
-    t[b'L' as usize] = Some("LONG");
-    t[b'M' as usize] = Some("BININT2");
-    t[b'N' as usize] = Some("NONE");
-    t[b'P' as usize] = Some("PERSID");
-    t[b'Q' as usize] = Some("BINPERSID");
-    t[b'R' as usize] = Some("REDUCE");
-    t[b'S' as usize] = Some("STRING");
-    t[b'T' as usize] = Some("BINSTRING");
-    t[b'U' as usize] = Some("SHORT_BINSTRING");
-    t[b'V' as usize] = Some("UNICODE");
-    t[b'X' as usize] = Some("BINUNICODE");
-    t[b'a' as usize] = Some("APPEND");
-    t[b'b' as usize] = Some("BUILD");
-    t[b'c' as usize] = Some("GLOBAL");
-    t[b'd' as usize] = Some("DICT");
-    t[b'}' as usize] = Some("EMPTY_DICT");
-    t[b'e' as usize] = Some("APPENDS");
-    t[b'g' as usize] = Some("GET");
-    t[b'h' as usize] = Some("BINGET");
-    t[b'i' as usize] = Some("INST");
-    t[b'j' as usize] = Some("LONG_BINGET");
-    t[b'l' as usize] = Some("LIST");
-    t[b']' as usize] = Some("EMPTY_LIST");
-    t[b'o' as usize] = Some("OBJ");
-    t[b'p' as usize] = Some("PUT");
-    t[b'q' as usize] = Some("BINPUT");
-    t[b'r' as usize] = Some("LONG_BINPUT");
-    t[b's' as usize] = Some("SETITEM");
-    t[b't' as usize] = Some("TUPLE");
-    t[b')' as usize] = Some("EMPTY_TUPLE");
-    t[b'u' as usize] = Some("SETITEMS");
-    t[b'G' as usize] = Some("BINFLOAT");
-    t[0x80] = Some("PROTO");
-    t[0x81] = Some("NEWOBJ");
-    t[0x82] = Some("EXT1");
-    t[0x83] = Some("EXT2");
-    t[0x84] = Some("EXT4");
-    t[0x85] = Some("TUPLE1");
-    t[0x86] = Some("TUPLE2");
-    t[0x87] = Some("TUPLE3");
-    t[0x88] = Some("NEWTRUE");
-    t[0x89] = Some("NEWFALSE");
-    t[0x8A] = Some("LONG1");
-    t[0x8B] = Some("LONG4");
-    t[0x8C] = Some("SHORT_BINUNICODE");
-    t[0x8D] = Some("BINUNICODE8");
-    t[0x8E] = Some("BINBYTES8");
-    t[0x8F] = Some("EMPTY_SET");
-    t[0x90] = Some("ADDITEMS");
-    t[0x91] = Some("FROZENSET");
-    t[0x92] = Some("NEWOBJ_EX");
-    t[0x93] = Some("STACK_GLOBAL");
-    t[0x94] = Some("MEMOIZE");
-    t[0x95] = Some("FRAME");
-    t[0x96] = Some("BYTEARRAY8");
-    t[0x97] = Some("NEXT_BUFFER");
-    t[0x98] = Some("READONLY_BUFFER");
-    t
-};
+/// Name of a pickle opcode, or `None` for a byte no protocol assigns.
+const fn opcode_name(op: u8) -> Option<&'static str> {
+    Some(match op {
+        b'(' => "MARK",
+        b'.' => "STOP",
+        b'0' => "POP",
+        b'1' => "POP_MARK",
+        b'2' => "DUP",
+        b'F' => "FLOAT",
+        b'I' => "INT",
+        b'J' => "BININT",
+        b'K' => "BININT1",
+        b'L' => "LONG",
+        b'M' => "BININT2",
+        b'N' => "NONE",
+        b'P' => "PERSID",
+        b'Q' => "BINPERSID",
+        b'R' => "REDUCE",
+        b'S' => "STRING",
+        b'T' => "BINSTRING",
+        b'U' => "SHORT_BINSTRING",
+        b'V' => "UNICODE",
+        b'X' => "BINUNICODE",
+        b'a' => "APPEND",
+        b'b' => "BUILD",
+        b'c' => "GLOBAL",
+        b'd' => "DICT",
+        b'}' => "EMPTY_DICT",
+        b'e' => "APPENDS",
+        b'g' => "GET",
+        b'h' => "BINGET",
+        b'i' => "INST",
+        b'j' => "LONG_BINGET",
+        b'l' => "LIST",
+        b']' => "EMPTY_LIST",
+        b'o' => "OBJ",
+        b'p' => "PUT",
+        b'q' => "BINPUT",
+        b'r' => "LONG_BINPUT",
+        b's' => "SETITEM",
+        b't' => "TUPLE",
+        b')' => "EMPTY_TUPLE",
+        b'u' => "SETITEMS",
+        b'G' => "BINFLOAT",
+        0x80 => "PROTO",
+        0x81 => "NEWOBJ",
+        0x82 => "EXT1",
+        0x83 => "EXT2",
+        0x84 => "EXT4",
+        0x85 => "TUPLE1",
+        0x86 => "TUPLE2",
+        0x87 => "TUPLE3",
+        0x88 => "NEWTRUE",
+        0x89 => "NEWFALSE",
+        0x8A => "LONG1",
+        0x8B => "LONG4",
+        0x8C => "SHORT_BINUNICODE",
+        0x8D => "BINUNICODE8",
+        0x8E => "BINBYTES8",
+        0x8F => "EMPTY_SET",
+        0x90 => "ADDITEMS",
+        0x91 => "FROZENSET",
+        0x92 => "NEWOBJ_EX",
+        0x93 => "STACK_GLOBAL",
+        0x94 => "MEMOIZE",
+        0x95 => "FRAME",
+        0x96 => "BYTEARRAY8",
+        0x97 => "NEXT_BUFFER",
+        0x98 => "READONLY_BUFFER",
+        _ => return None,
+    })
+}
 
 #[cfg(test)]
 mod tests {

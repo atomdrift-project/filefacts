@@ -4,33 +4,36 @@ use std::ops::Range;
 pub(super) fn mask_comments(bytes: &[u8], ranges: &[Range<usize>]) -> Vec<u8> {
     let mut masked = bytes.to_vec();
     for range in ranges {
+        // Input through the range end; a range past the input stops with it.
+        // The delimiters have no letters, so `starts` matches them exactly.
+        let text = bytes.get(..range.end).unwrap_or(bytes);
         let mut at = range.start;
-        while at < range.end {
-            if matches!(bytes[at], b'\'' | b'"') {
-                if !super::quoted(&bytes[..range.end], &mut at) {
+        while let Some(&byte) = text.get(at) {
+            if matches!(byte, b'\'' | b'"') {
+                if !super::quoted(text, &mut at) {
                     break;
                 }
                 continue;
             }
             let start = at;
-            if bytes[at..range.end].starts_with(b"//") {
-                while at < range.end && !matches!(bytes[at], b'\n' | b'\r') {
+            if super::starts(text, at, b"//") {
+                while text.get(at).is_some_and(|b| !matches!(b, b'\n' | b'\r')) {
                     at += 1;
                 }
-            } else if bytes[at..range.end].starts_with(b"/*") {
+            } else if super::starts(text, at, b"/*") {
                 at += 2;
-                while at < range.end && !bytes[at..range.end].starts_with(b"*/") {
+                while at < range.end && !super::starts(text, at, b"*/") {
                     at += 1;
                 }
                 at = (at + 2).min(range.end);
-            } else if bytes[at..range.end].starts_with(b"<!---") {
+            } else if super::starts(text, at, b"<!---") {
                 let mut depth = 1;
                 at += 5;
                 while at < range.end && depth > 0 {
-                    if bytes[at..range.end].starts_with(b"<!---") {
+                    if super::starts(text, at, b"<!---") {
                         depth += 1;
                         at += 5;
-                    } else if bytes[at..range.end].starts_with(b"--->") {
+                    } else if super::starts(text, at, b"--->") {
                         depth -= 1;
                         at += 4;
                     } else {
@@ -41,7 +44,7 @@ pub(super) fn mask_comments(bytes: &[u8], ranges: &[Range<usize>]) -> Vec<u8> {
                 at += 1;
                 continue;
             }
-            for byte in &mut masked[start..at] {
+            for byte in masked.get_mut(start..at).into_iter().flatten() {
                 if !matches!(*byte, b'\n' | b'\r') {
                     *byte = b' ';
                 }
@@ -52,27 +55,36 @@ pub(super) fn mask_comments(bytes: &[u8], ranges: &[Range<usize>]) -> Vec<u8> {
 }
 
 fn whitespace(bytes: &[u8], mut at: usize, end: usize) -> usize {
-    while at < end && bytes[at].is_ascii_whitespace() {
+    while at < end && bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
         at += 1;
     }
     at
 }
 fn identifier(bytes: &[u8], mut at: usize, end: usize) -> usize {
-    if at == end || !(bytes[at].is_ascii_alphabetic() || bytes[at] == b'_') {
+    if at == end
+        || !bytes
+            .get(at)
+            .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+    {
         return at;
     }
     at += 1;
-    while at < end && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_') {
+    while at < end
+        && bytes
+            .get(at)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+    {
         at += 1;
     }
     at
 }
 fn parentheses(bytes: &[u8], mut at: usize, end: usize) -> Option<usize> {
+    let text = bytes.get(..end).unwrap_or(bytes);
     let mut depth = 0usize;
-    while at < end {
-        match bytes[at] {
+    while let Some(&byte) = text.get(at) {
+        match byte {
             b'\'' | b'"' => {
-                if !super::quoted(&bytes[..end], &mut at) {
+                if !super::quoted(text, &mut at) {
                     return None;
                 }
                 continue;
@@ -98,11 +110,12 @@ fn parentheses(bytes: &[u8], mut at: usize, end: usize) -> Option<usize> {
 
 pub(super) fn calls(bytes: &[u8], range: Range<usize>) -> (Vec<Range<usize>>, bool) {
     let mut out = Vec::new();
+    let text = bytes.get(..range.end).unwrap_or(bytes);
     let mut at = range.start;
     let mut declaration = false;
-    while at < range.end {
-        if matches!(bytes[at], b'\'' | b'"') {
-            if !super::quoted(&bytes[..range.end], &mut at) {
+    while let Some(&byte) = text.get(at) {
+        if matches!(byte, b'\'' | b'"') {
+            if !super::quoted(text, &mut at) {
                 return (out, true);
             }
             continue;
@@ -113,7 +126,8 @@ pub(super) fn calls(bytes: &[u8], range: Range<usize>) -> (Vec<Range<usize>>, bo
             at += 1;
             continue;
         }
-        let name = String::from_utf8_lossy(&bytes[start..name_end]).to_ascii_lowercase();
+        let name = String::from_utf8_lossy(bytes.get(start..name_end).unwrap_or_default())
+            .to_ascii_lowercase();
         at = name_end;
         if name == "function" {
             declaration = true;
@@ -218,7 +232,7 @@ pub(super) enum Event {
 }
 pub(super) fn statements(bytes: &[u8], range: Range<usize>) -> (Vec<Event>, bool) {
     fn block_header(bytes: &[u8], range: Range<usize>) -> bool {
-        let Ok(text) = std::str::from_utf8(&bytes[range.clone()]) else {
+        let Some(Ok(text)) = bytes.get(range.clone()).map(std::str::from_utf8) else {
             return false;
         };
         let text = text.trim();
@@ -231,14 +245,16 @@ pub(super) fn statements(bytes: &[u8], range: Range<usize>) -> (Vec<Event>, bool
         }
         let mut at = whitespace(bytes, range.start, range.end);
         let mut end = identifier(bytes, at, range.end);
-        if bytes[at..end].eq_ignore_ascii_case(b"else") {
+        let mut keyword = bytes.get(at..end).unwrap_or_default();
+        if keyword.eq_ignore_ascii_case(b"else") {
             at = whitespace(bytes, end, range.end);
             end = identifier(bytes, at, range.end);
+            keyword = bytes.get(at..end).unwrap_or_default();
         }
         let control = [b"if".as_slice(), b"for", b"while", b"catch", b"switch"]
             .iter()
-            .any(|name| bytes[at..end].eq_ignore_ascii_case(name));
-        let function = bytes[at..end].eq_ignore_ascii_case(b"function");
+            .any(|name| keyword.eq_ignore_ascii_case(name));
+        let function = keyword.eq_ignore_ascii_case(b"function");
         if !control && !function {
             return false;
         }
@@ -257,17 +273,18 @@ pub(super) fn statements(bytes: &[u8], range: Range<usize>) -> (Vec<Event>, bool
             .is_some_and(|end| whitespace(bytes, end, range.end) == range.end)
     }
     let mut out = Vec::new();
+    let text = bytes.get(..range.end).unwrap_or(bytes);
     let mut start = range.start;
     let mut at = start;
     let mut delimiters = Vec::new();
     let mut blocks = vec![true];
-    while at < range.end {
+    while let Some(&byte) = text.get(at) {
         if out.len() >= super::MAX_TAGS - 2 {
             return (out, true);
         }
-        match bytes[at] {
+        match byte {
             b'\'' | b'"' => {
-                if !super::quoted(&bytes[..range.end], &mut at) {
+                if !super::quoted(text, &mut at) {
                     return (out, true);
                 }
                 continue;
@@ -276,10 +293,10 @@ pub(super) fn statements(bytes: &[u8], range: Range<usize>) -> (Vec<Event>, bool
                 if delimiters.len() == 32 {
                     return (out, true);
                 }
-                delimiters.push(bytes[at]);
+                delimiters.push(byte);
             }
             b')' | b']' => {
-                let expected = if bytes[at] == b')' { b'(' } else { b'[' };
+                let expected = if byte == b')' { b'(' } else { b'[' };
                 if delimiters.pop() != Some(expected) {
                     return (out, true);
                 }
@@ -289,13 +306,13 @@ pub(super) fn statements(bytes: &[u8], range: Range<usize>) -> (Vec<Event>, bool
                 if start < at {
                     out.push(Event::Statement(start..at, allowed));
                 }
-                if bytes[at] == b'{' {
+                if byte == b'{' {
                     if blocks.len() == 33 {
                         return (out, true);
                     }
                     blocks.push(allowed && block_header(bytes, start..at));
                     out.push(Event::Barrier);
-                } else if bytes[at] == b'}' {
+                } else if byte == b'}' {
                     if blocks.len() == 1 {
                         return (out, true);
                     }

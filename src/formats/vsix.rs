@@ -26,7 +26,7 @@ use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::{XorScan, extract_binary_strings, put_str};
-use crate::output::{Metrics, Strings, Values};
+use crate::output::{Errors, Metrics, Stage, Strings, Values};
 
 /// Manifests above this are not legitimate — stop reading rather than
 /// buffer a zip-bomb member.
@@ -40,15 +40,33 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
+    errors: &mut Errors,
 ) -> Result<(), Error> {
-    let Ok(member) = zip.by_name("extension.vsixmanifest") else {
-        return Ok(());
+    const NAME: &str = "extension.vsixmanifest";
+    let member = match zip.by_name(NAME) {
+        Ok(member) => member,
+        Err(::zip::result::ZipError::FileNotFound) => return Ok(()),
+        Err(e) => {
+            errors.record_malformed(Stage::ZipParse, format!("{NAME}: {e}"));
+            return Ok(());
+        }
     };
     let mut buf = Vec::new();
-    if member.take(MAX_MANIFEST).read_to_end(&mut buf).is_err() {
+    if let Err(e) = member.take(MAX_MANIFEST + 1).read_to_end(&mut buf) {
+        errors.record_malformed(Stage::ZipParse, format!("{NAME}: {e}"));
         return Ok(());
     }
-    extract(&buf, values, strings, metrics)
+    if buf.len() as u64 > MAX_MANIFEST {
+        values.insert(
+            "vsix.limits",
+            serde_json::json!([{
+                "stage": "manifest",
+                "reason": format!("{NAME} over the {MAX_MANIFEST}-byte cap; not parsed"),
+            }]),
+        );
+        return Ok(());
+    }
+    extract(&buf, values, strings, metrics, errors)
 }
 
 pub(super) fn extract(
@@ -56,17 +74,29 @@ pub(super) fn extract(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
+    errors: &mut Errors,
 ) -> Result<(), Error> {
     extract_binary_strings(bytes, strings, XorScan::No);
 
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return Ok(());
+    let text = match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(e) => {
+            errors.record_malformed(
+                Stage::FormatExtract,
+                format!("extension.vsixmanifest: not UTF-8: {e}"),
+            );
+            return Ok(());
+        }
     };
     // Strip a UTF-8 BOM if present — `<PackageManifest>` won't parse
     // when the document starts with one.
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
-    let Ok(doc) = roxmltree::Document::parse(text) else {
-        return Ok(());
+    let doc = match roxmltree::Document::parse(text) {
+        Ok(doc) => doc,
+        Err(e) => {
+            errors.record_malformed(Stage::FormatExtract, format!("extension.vsixmanifest: {e}"));
+            return Ok(());
+        }
     };
 
     // <Identity Id="…" Publisher="…" Version="…" />
@@ -204,11 +234,98 @@ mod tests {
     use super::*;
 
     fn run(text: &[u8]) -> (Values, Metrics) {
+        let (v, m, e) = run_with_errors(text);
+        assert!(e.is_empty(), "{e:?}");
+        (v, m)
+    }
+
+    fn run_with_errors(text: &[u8]) -> (Values, Metrics, Errors) {
         let mut v = Values::new();
         let mut s = Strings::default();
         let mut m = Metrics::new();
-        extract(text, &mut v, &mut s, &mut m).unwrap();
-        (v, m)
+        let mut e = Errors::new();
+        extract(text, &mut v, &mut s, &mut m, &mut e).unwrap();
+        (v, m, e)
+    }
+
+    fn vsix_with(members: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::{Cursor, Write};
+        let mut w = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = ::zip::write::SimpleFileOptions::default()
+            .compression_method(::zip::CompressionMethod::Stored);
+        for (name, body) in members {
+            w.start_file(*name, opts).unwrap();
+            w.write_all(body).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    fn run_archive(bytes: &[u8]) -> (Values, Errors) {
+        let mut zip = ::zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut v = Values::new();
+        let mut e = Errors::new();
+        extract_from_archive(
+            &mut zip,
+            &mut v,
+            &mut Strings::default(),
+            &mut Metrics::new(),
+            &mut e,
+        )
+        .unwrap();
+        (v, e)
+    }
+
+    /// The one recorded error's stage and kind.
+    fn only_error(errors: &Errors) -> (Stage, crate::ErrorKind) {
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        (errors.as_slice()[0].stage, errors.as_slice()[0].kind)
+    }
+
+    #[test]
+    fn archive_manifest_that_is_not_xml_records_one_error() {
+        let (v, e) = run_archive(&vsix_with(&[(
+            "extension.vsixmanifest",
+            b"<PackageManifest><Identity Id=\"x\"",
+        )]));
+        assert_eq!(
+            only_error(&e),
+            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+        );
+        assert!(v.get("vsix.identity").is_none());
+        assert!(v.get("vsix.limits").is_none());
+    }
+
+    #[test]
+    fn archive_with_well_formed_or_absent_manifest_records_nothing() {
+        let (v, e) = run_archive(&vsix_with(&[(
+            "extension.vsixmanifest",
+            b"<PackageManifest><Identity Id=\"x\" Publisher=\"p\" Version=\"1\"/></PackageManifest>",
+        )]));
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(
+            v.get("vsix.identity.id").and_then(|x| x.as_str()),
+            Some("x")
+        );
+        let (_, e) = run_archive(&vsix_with(&[("extension/package.json", b"{}")]));
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn archive_manifest_over_the_cap_is_a_limit_not_an_error() {
+        let big = vec![b' '; MAX_MANIFEST as usize + 1];
+        let (v, e) = run_archive(&vsix_with(&[("extension.vsixmanifest", &big)]));
+        assert!(e.is_empty(), "{e:?}");
+        let limits = v.get("vsix.limits").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(limits[0]["stage"], "manifest");
+    }
+
+    #[test]
+    fn standalone_manifest_that_is_not_utf8_records_one_error() {
+        let (_, _, e) = run_with_errors(b"<PackageManifest>\xff</PackageManifest>");
+        assert_eq!(
+            only_error(&e),
+            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+        );
     }
 
     #[test]
@@ -273,9 +390,13 @@ mod tests {
     }
 
     #[test]
-    fn non_xml_is_silent() {
-        let (v, _) = run(b"not xml at all");
+    fn non_xml_records_one_error() {
+        let (v, _, e) = run_with_errors(b"not xml at all");
         assert!(v.get("vsix.identity").is_none());
+        assert_eq!(
+            only_error(&e),
+            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+        );
     }
 
     #[test]
@@ -348,16 +469,25 @@ mod tests {
     }
 
     #[test]
-    fn empty_input_is_silent() {
-        let (v, m) = run(b"");
+    fn empty_input_records_one_error() {
+        // A manifest that is present but empty does not parse.
+        let (v, m, e) = run_with_errors(b"");
         assert!(v.get("vsix.identity").is_none());
         assert!(m.get("vsix.property_count").is_none());
+        assert_eq!(
+            only_error(&e),
+            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+        );
     }
 
     #[test]
-    fn malformed_xml_is_silent() {
+    fn malformed_xml_records_one_error() {
         // Unterminated tag — parser must reject without panicking.
-        let (v, _) = run(b"<PackageManifest><Identity Id=\"x\"");
+        let (v, _, e) = run_with_errors(b"<PackageManifest><Identity Id=\"x\"");
         assert!(v.get("vsix.identity").is_none());
+        assert_eq!(
+            only_error(&e),
+            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+        );
     }
 }

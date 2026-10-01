@@ -101,9 +101,9 @@ pub(crate) fn detect(data: &[u8]) -> Option<Shellcode> {
 
 /// `E8 rel32` at 0 onto an in-file `pop reg` with code after it.
 fn call_pop(data: &[u8]) -> Option<Shellcode> {
-    if data[0] != 0xE8 {
+    let [0xE8, ..] = data else {
         return None;
-    }
+    };
     let rel = usize::try_from(rel32(data, 1)?).ok()?;
     let target = rel.checked_add(5)?;
     let rex = pop_at(data, target)?;
@@ -117,10 +117,10 @@ fn call_pop(data: &[u8]) -> Option<Shellcode> {
 /// `EB rel8` forward onto `E8 rel32` that calls back between the two, where
 /// `pop reg` sits.
 fn jmp_call_pop(data: &[u8]) -> Option<Shellcode> {
-    if data[0] != 0xEB {
+    let &[0xEB, rel8, ..] = data else {
         return None;
-    }
-    let call = 2 + usize::try_from(data[1] as i8).ok()?;
+    };
+    let call = 2 + usize::try_from(rel8 as i8).ok()?;
     if *data.get(call)? != 0xE8 {
         return None;
     }
@@ -140,20 +140,23 @@ fn jmp_call_pop(data: &[u8]) -> Option<Shellcode> {
 /// An x87 instruction, `fnstenv [esp-0Ch]`, then `pop reg`, all near the head.
 /// The idiom is 32-bit: the saved instruction pointer is four bytes wide.
 fn fpu_env(data: &[u8]) -> Option<Shellcode> {
-    let head = &data[..FPU_WINDOW];
+    let head = data.get(..FPU_WINDOW)?;
     let env = head.windows(4).position(|w| w == FNSTENV_ESP_M12)?;
     // Register-form x87 op (escape D8–DF, ModRM ≥ C0) before the store, so
     // the FPU instruction pointer it saves is set.
-    let fpu_set = head[..env]
+    let fpu_set = head
+        .get(..env)?
         .windows(2)
-        .any(|w| (0xD8..=0xDF).contains(&w[0]) && w[1] >= 0xC0);
+        .any(|w| matches!(w, &[0xD8..=0xDF, 0xC0..=0xFF]));
     if !fpu_set {
         return None;
     }
     let after = env + FNSTENV_ESP_M12.len();
     let pop = after
-        + data[after..data.len().min(after + FPU_POP_REACH)]
+        + data
+            .get(after..)?
             .iter()
+            .take(FPU_POP_REACH)
             .position(|b| (0x58..=0x5F).contains(b))?;
     Some(Shellcode {
         getpc: GetPc::FpuEnv,
@@ -190,7 +193,8 @@ fn arch(data: &[u8], pop_rex: bool, starts: &[usize]) -> Arch {
     const INSTRUCTIONS: usize = 8;
     const REACH: usize = 64;
     let rex_w = |start: usize| {
-        let code = &data[start.min(data.len())..data.len().min(start + REACH)];
+        let code = data.get(start..).unwrap_or_default();
+        let code = code.get(..REACH).unwrap_or(code);
         Decoder::new(64, code, DecoderOptions::NONE)
             .iter()
             .take(INSTRUCTIONS)

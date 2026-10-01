@@ -123,11 +123,10 @@ fn rpm_interpreter(script: &Value) -> Option<FileType> {
     let executable = match script.get("program") {
         None => "/bin/sh",
         Some(program) => {
-            let argv = program.as_array()?;
-            if argv.len() != 1 {
+            let [argv0] = program.as_array()?.as_slice() else {
                 return None;
-            }
-            argv[0].as_str()?
+            };
+            argv0.as_str()?
         }
     };
     match executable {

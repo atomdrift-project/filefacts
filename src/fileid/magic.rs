@@ -10,11 +10,12 @@
 
 use std::{io::Read, path::Path};
 
-use super::ext::{is_odf_extension, lowercase_ext};
+use super::ext::{ends_with_ci, is_odf_extension, lowercase_ext};
 use super::scripts::find_ci;
 use super::{
     ArchiveFormat, Compression, DetectionSource, FileType, UTF8_BOM, container_of, strip_utf8_bom,
 };
+use crate::bytes;
 
 /// LNK shell link CLSID header (20 bytes).
 const LNK_MAGIC: &[u8] = &[
@@ -25,6 +26,19 @@ const LNK_MAGIC: &[u8] = &[
 /// Opening section of a Windows URL shortcut. Section names are matched
 /// case-insensitively, as Windows itself matches them.
 const URL_SHORTCUT_SECTION: &[u8] = b"[InternetShortcut]";
+
+/// Recognize the narrow RTF junkfuscation shape seen in weaponized documents:
+/// the `\\rt` prefix followed by junk, plus both an object group and objdata
+/// in the bounded head. Those controls alone are common in text, so they only
+/// count with the RTF-like opening.
+pub(crate) fn looks_like_obfuscated_rtf(data: &[u8]) -> bool {
+    if !data.starts_with(b"{\\rt") {
+        return false;
+    }
+    let head = data.get(..64 * 1024).unwrap_or(data);
+    memchr::memmem::find(head, b"\\object").is_some()
+        && memchr::memmem::find(head, b"\\objdata").is_some()
+}
 
 /// The first line of a `.reg` file since Windows 2000, up to the version
 /// number. regedit writes it as UTF-16LE behind a byte-order mark; a copy
@@ -46,24 +60,22 @@ fn utf16le_starts_with(data: &[u8], prefix: &[u8]) -> bool {
 /// and the next chunk is the string pool. Both have to agree; `03 00 08 00`
 /// by itself is four bytes and shows up in unrelated binaries.
 fn looks_like_axml(data: &[u8]) -> bool {
-    if data.len() < 12 || data.len() > 16 * 1024 * 1024 {
+    if data.len() > 16 * 1024 * 1024 {
         return false;
     }
-    let chunk_type = u16::from_le_bytes([data[0], data[1]]);
-    let header_size = u16::from_le_bytes([data[2], data[3]]);
-    let file_size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
-    chunk_type == 0x0003
-        && header_size == 8
-        && file_size == data.len()
-        && data[8] == 0x01
-        && data[9] == 0x00
+    // Chunk type 0x0003 and header size 8 (u16 LE each), the u32 file size,
+    // then the string pool's chunk type, 0x0001, in a header of 12 bytes.
+    let &[0x03, 0x00, 0x08, 0x00, s0, s1, s2, s3, 0x01, 0x00, _, _, ..] = data else {
+        return false;
+    };
+    u32::from_le_bytes([s0, s1, s2, s3]) as usize == data.len()
 }
 
 /// Detect file type from content. Returns the type and how it was detected.
 pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType, DetectionSource)> {
-    if data.len() < 2 {
+    let &[first, second, ..] = data else {
         return None;
-    }
+    };
     // Compiled ColdFusion templates retain a clear-text Allaire header while
     // the template body is encrypted. Treat it as content identity so a
     // renamed `.cfm` file still reaches the CFML static decoder.
@@ -97,7 +109,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
 
     // ISO base media (`.mp4`/`.m4a`/`.mov`): the size-prefixed `ftyp` box.
     // Keyed at offset 4, so it cannot live in the first-byte jump table.
-    if !text && data.len() >= 12 && &data[4..8] == b"ftyp" {
+    if !text && data.len() >= 12 && data.get(4..8) == Some(b"ftyp") {
         return Some((FileType::Mp4, DetectionSource::Magic));
     }
 
@@ -108,8 +120,9 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
     // entire payload of a delivery zip: `URL=file:\\<ip>@80\...\scan.pdf.lnk`,
     // a WebDAV fetch of a second shortcut, padded to 346 KB with NULs.
     let head = data.trim_ascii_start();
-    if head.len() >= URL_SHORTCUT_SECTION.len()
-        && head[..URL_SHORTCUT_SECTION.len()].eq_ignore_ascii_case(URL_SHORTCUT_SECTION)
+    if head
+        .get(..URL_SHORTCUT_SECTION.len())
+        .is_some_and(|section| section.eq_ignore_ascii_case(URL_SHORTCUT_SECTION))
     {
         return Some((FileType::Text, DetectionSource::Magic));
     }
@@ -163,9 +176,11 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
     // open templates and fragments that other arms own and which stay out of
     // magic deliberately. `<!DOCTYPE svg` and an `<?xml` prolog are unaffected:
     // neither begins with either of these.
-    if head.len() >= 5 {
-        let doctype_html = head.len() >= 14 && head[..14].eq_ignore_ascii_case(b"<!DOCTYPE html");
-        let html_root = head[..5].eq_ignore_ascii_case(b"<html")
+    if let Some(open) = head.get(..5) {
+        let doctype_html = head
+            .get(..14)
+            .is_some_and(|tag| tag.eq_ignore_ascii_case(b"<!DOCTYPE html"));
+        let html_root = open.eq_ignore_ascii_case(b"<html")
             && head.get(5).is_none_or(|c| !c.is_ascii_alphanumeric());
         // Some compromised pages prepend a short external-script loader before
         // the doctype. The complete document root still provides stronger type
@@ -173,7 +188,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         // and require the doctype and root together so ordinary JavaScript
         // fragments containing one HTML token do not become documents.
         let prefixed_html_document = {
-            let prefix = &head[..head.len().min(512)];
+            let prefix = head.get(..512).unwrap_or(head);
             let doctype = prefix
                 .windows(14)
                 .position(|w| w.eq_ignore_ascii_case(b"<!DOCTYPE html"));
@@ -207,7 +222,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
     // ── First-byte jump table ────────────────────────────────────────
     // Dispatch on data[0] to avoid evaluating 30+ conditions sequentially.
     // Each arm only checks formats that start with that byte.
-    let result = match data[0] {
+    let result = match first {
         0x00 => {
             // AppleDouble (`._<name>`) resource forks: 00 05 16 07.
             // macOS routinely smuggles these into tarballs alongside real
@@ -217,23 +232,19 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // in — otherwise `._foo.php` gets analyzed as PHP, the binary
             // body trips entropy/obfuscation traits, and a benign Composer
             // tarball lights up at suspicious.
-            if data.len() >= 4 && data[1] == 0x05 && data[2] == 0x16 && data[3] == 0x07 {
+            if data.starts_with(&[0x00, 0x05, 0x16, 0x07]) {
                 Some((FileType::Unknown, DetectionSource::Magic))
-            } else if data.len() >= 6
-                && data[1] == 0x00
-                && matches!(data[2], 0x01 | 0x02)
-                && data[3] == 0x00
-                && u16::from_le_bytes([data[4], data[5]]) > 0
-                && u16::from_le_bytes([data[4], data[5]]) <= 512
+            } else if let &[_, 0x00, 0x01 | 0x02, 0x00, lo, hi, ..] = data
+                && (1..=512).contains(&u16::from_le_bytes([lo, hi]))
             {
                 // Windows icon/cursor: reserved=0, type=1|2, then a plausible
                 // image count. Checked before the sfnt arm because sfnt 1.0 is
                 // `00 01 00 00`, which an icon header can never be (its type
                 // field would have to be 0x0100).
                 Some((FileType::Ico, DetectionSource::Magic))
-            } else if data.starts_with(&[0x00, 0x01, 0x00, 0x00])
-                && !data[4..].starts_with(b"Standard Jet DB")
-                && !data[4..].starts_with(b"Standard ACE DB")
+            } else if let Some(rest) = data.strip_prefix(&[0x00, 0x01, 0x00, 0x00])
+                && !rest.starts_with(b"Standard Jet DB")
+                && !rest.starts_with(b"Standard ACE DB")
             {
                 // sfnt version 1.0 — the TrueType flavor every `.ttf` uses.
                 // A Microsoft Access database opens with the same four bytes
@@ -245,7 +256,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
                 // after the AppleDouble check above and is confirmed
                 // downstream by formats/font.rs walking the table directory.
                 Some((FileType::Font, DetectionSource::Magic))
-            } else if data.len() >= 8 && &data[1..4] == b"asm" && data[4..8] == [0x01, 0, 0, 0] {
+            } else if data.starts_with(b"\0asm\x01\0\0\0") {
                 // WebAssembly binary module: `\0asm` magic followed by the
                 // little-endian u32 version (`01 00 00 00`). The version guard
                 // keeps `\0asm`-prefixed binary noise from misclassifying.
@@ -256,7 +267,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         }
         0x7F => {
             // ELF: 7F 45 4C 46
-            if data.len() >= 4 && data[1] == b'E' && data[2] == b'L' && data[3] == b'F' {
+            if data.starts_with(b"\x7FELF") {
                 Some((FileType::Elf, DetectionSource::Magic))
             } else {
                 None
@@ -266,14 +277,14 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // MZ-prefixed Windows programs include both PE and the older NE
             // format. Route NE to its own generic-binary file type instead of
             // calling it PE (which the PE analyzer correctly rejects).
-            if data[1] == b'Z' {
+            if second == b'Z' {
                 let file_type = if looks_like_ne_executable(data) {
                     FileType::Ne
                 } else {
                     FileType::Pe
                 };
                 Some((file_type, DetectionSource::Magic))
-            } else if data.len() >= 4 && data[1] == b'S' && data[2] == b'C' && data[3] == b'F' {
+            } else if data.starts_with(b"MSCF") {
                 Some((FileType::Cab, DetectionSource::Magic))
             } else {
                 None
@@ -281,7 +292,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         }
         b'P' => {
             // ZIP/JAR/OOXML: PK
-            if data[1] == b'K' {
+            if second == b'K' {
                 Some(classify_pk(path, data))
             } else {
                 None
@@ -300,9 +311,9 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // Mach-O parser tries to slice with a several-billion
             // offset. Combine both checks so we only call it Mach-O
             // when nfat_arch is plausible AND the Java major isn't.
-            if data.len() >= 8 && data[1] == 0xFE && data[2] == 0xBA && data[3] == 0xBE {
-                let major = u16::from_be_bytes([data[6], data[7]]);
-                let nfat_arch = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+            if let &[_, 0xFE, 0xBA, 0xBE, n0, n1, m0, m1, ..] = data {
+                let major = u16::from_be_bytes([m0, m1]);
+                let nfat_arch = u32::from_be_bytes([n0, n1, m0, m1]);
                 if (45..=70).contains(&major) || nfat_arch > 16 {
                     Some((FileType::JavaClass, DetectionSource::Magic))
                 } else {
@@ -314,11 +325,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         }
         0xFE => {
             // Mach-O: FEEDFACE (32-bit) or FEEDFACF (64-bit)
-            if data.len() >= 4
-                && data[1] == 0xED
-                && data[2] == 0xFA
-                && (data[3] == 0xCE || data[3] == 0xCF)
-            {
+            if matches!(data, [_, 0xED, 0xFA, 0xCE | 0xCF, ..]) {
                 Some((FileType::MachO, DetectionSource::Magic))
             } else {
                 None
@@ -326,7 +333,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         }
         0xCE => {
             // Mach-O 32-bit swapped: CEFAEDFE
-            if data.len() >= 4 && data[1] == 0xFA && data[2] == 0xED && data[3] == 0xFE {
+            if data.starts_with(&[0xCE, 0xFA, 0xED, 0xFE]) {
                 Some((FileType::MachO, DetectionSource::Magic))
             } else {
                 None
@@ -334,7 +341,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         }
         0xCF => {
             // Mach-O 64-bit swapped: CFFAEDFE
-            if data.len() >= 4 && data[1] == 0xFA && data[2] == 0xED && data[3] == 0xFE {
+            if data.starts_with(&[0xCF, 0xFA, 0xED, 0xFE]) {
                 Some((FileType::MachO, DetectionSource::Magic))
             } else {
                 None
@@ -342,7 +349,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         }
         0xBE => {
             // Mach-O fat swapped: BEBAFECA
-            if data.len() >= 4 && data[1] == 0xBA && data[2] == 0xFE && data[3] == 0xCA {
+            if data.starts_with(&[0xBE, 0xBA, 0xFE, 0xCA]) {
                 Some((FileType::MachO, DetectionSource::Magic))
             } else {
                 None
@@ -350,7 +357,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         }
         0xFF => {
             // JPEG: FF D8 FF
-            if data.len() >= 3 && data[1] == 0xD8 && data[2] == 0xFF {
+            if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
                 Some((FileType::Jpeg, DetectionSource::Magic))
             } else if data
                 .strip_prefix(b"\xFF\xFE")
@@ -408,15 +415,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // (.doc/.xls/.ppt/.msg) and Windows Installer packages (.msi/.msp);
             // the root storage's CLSID says which. The name decides only when
             // the root directory sector lies outside the bytes at hand.
-            if data.len() >= 8
-                && data[1] == 0xCF
-                && data[2] == 0x11
-                && data[3] == 0xE0
-                && data[4] == 0xA1
-                && data[5] == 0xB1
-                && data[6] == 0x1A
-                && data[7] == 0xE1
-            {
+            if data.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) {
                 let installer = ole_root_clsid(data).map_or_else(
                     || {
                         matches!(
@@ -462,9 +461,9 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
                 // RIFF container: `RIFF` + u32 length + form type. WAVE, WEBP
                 // and AVI share the wrapper, so the form type at offset 8
                 // decides. An animated cursor (`ACON`) is not audio.
-                let kind = match &data[8..12] {
-                    b"WEBP" => Some(FileType::Webp),
-                    b"WAVE" => Some(FileType::Wav),
+                let kind = match data.get(8..12) {
+                    Some(b"WEBP") => Some(FileType::Webp),
+                    Some(b"WAVE") => Some(FileType::Wav),
                     _ => None,
                 };
                 kind.map(|file_type| (file_type, DetectionSource::Magic))
@@ -476,12 +475,11 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // Compiled AppleScript: Fasd
             if data.starts_with(b"Fasd") {
                 Some((FileType::AppleScript, DetectionSource::Magic))
-            } else if data.len() >= 12 && data.starts_with(b"FOR1") && &data[8..12] == b"BEAM" {
+            } else if data.starts_with(b"FOR1") && data.get(8..12) == Some(b"BEAM") {
                 // Erlang/Elixir BEAM bytecode: IFF container `FOR1` <u32 size> `BEAM`.
                 Some((FileType::Beam, DetectionSource::Magic))
-            } else if data.len() >= 12
-                && data.starts_with(b"FORM")
-                && matches!(&data[8..12], b"AIFF" | b"AIFC")
+            } else if data.starts_with(b"FORM")
+                && matches!(data.get(8..12), Some(b"AIFF" | b"AIFC"))
             {
                 // IFF audio shares the container family with BEAM above; the
                 // form type at offset 8 is what separates them.
@@ -492,14 +490,8 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         }
         b'd' => {
             // Dalvik executable bytecode: dex\n035\0, dex\n038\0, etc.
-            if data.len() >= 8
-                && data[1] == b'e'
-                && data[2] == b'x'
-                && data[3] == b'\n'
-                && data[4].is_ascii_digit()
-                && data[5].is_ascii_digit()
-                && data[6].is_ascii_digit()
-                && data[7] == 0
+            if let &[_, b'e', b'x', b'\n', v0, v1, v2, 0, ..] = data
+                && [v0, v1, v2].iter().all(u8::is_ascii_digit)
             {
                 Some((FileType::Dex, DetectionSource::Magic))
             } else {
@@ -521,6 +513,8 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // RTF: {\rtf
             if data.starts_with(b"{\\rtf") {
                 Some((FileType::Rtf, DetectionSource::Magic))
+            } else if looks_like_obfuscated_rtf(data) {
+                Some((FileType::Rtf, DetectionSource::Heuristic))
             } else {
                 None
             }
@@ -616,7 +610,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         }
         0xED => {
             // RPM: ED AB EE DB
-            if data.len() >= 4 && data[1] == 0xAB && data[2] == 0xEE && data[3] == 0xDB {
+            if data.starts_with(&[0xED, 0xAB, 0xEE, 0xDB]) {
                 Some((FileType::Rpm, DetectionSource::Magic))
             } else {
                 None
@@ -627,7 +621,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
             // What it wraps is read, not guessed from the name: npm packages,
             // sdists and crates arrive as `<hash>.sample` in content-addressed
             // stores.
-            if data[1] == 0x8B && data.get(2) == Some(&8) {
+            if second == 0x8B && data.get(2) == Some(&8) {
                 let inside = tar_layout(
                     flate2::read::GzDecoder::new(data).take(TAR_PEEK_LIMIT),
                     false,
@@ -651,10 +645,11 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         b'B' => {
             if looks_like_bmp(data) {
                 Some((FileType::Bmp, DetectionSource::Magic))
-            } else if data.len() >= 10
-                && data.starts_with(b"BZh")
-                && (b'1'..=b'9').contains(&data[3])
-                && matches!(&data[4..10], b"1AY&SY" | b"\x17\x72\x45\x38\x50\x90")
+            } else if matches!(data, [b'B', b'Z', b'h', b'1'..=b'9', ..])
+                && matches!(
+                    data.get(4..10),
+                    Some(b"1AY&SY" | b"\x17\x72\x45\x38\x50\x90")
+                )
             {
                 // Bzip2: `BZh`, the block-size digit, then the first block's
                 // magic (BCD pi) or, for an empty stream, the end-of-stream
@@ -685,7 +680,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         }
         0x28 => {
             // Zstandard: 28 B5 2F FD
-            if data.len() >= 4 && data[1] == 0xB5 && data[2] == 0x2F && data[3] == 0xFD {
+            if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
                 // FreeBSD, Arch and Void packages are all zstd tars; their
                 // leading members say which.
                 let inside = zstd::stream::read::Decoder::new(data)
@@ -700,7 +695,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
         }
         b'#' => {
             // Shebang: #!
-            if data[1] == b'!' {
+            if second == b'!' {
                 detect_shebang(data)
             } else {
                 None
@@ -782,7 +777,7 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
     // unanalyzed. That is a detection gap an attacker gets for free by renaming
     // a file — an XMRig 6.24.0 release tarball named `<sha256>.bin` scored one
     // finding as an opaque blob and six once renamed to `.tar`.
-    if data.len() > 262 && &data[257..262] == b"ustar" {
+    if data.len() > 262 && data.get(257..262) == Some(b"ustar") {
         let ft = classify_tar(path, data, Compression::None, tar_layout(data, true));
         return Some((ft.unwrap_or(FileType::Tar), DetectionSource::Magic));
     }
@@ -790,15 +785,15 @@ pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType,
     // Python bytecode: a supported little-endian magic number ending in CRLF,
     // then flags or a timestamp. Match known CPython releases so unrelated
     // binary formats cannot claim a pyc type by coincidence.
-    if !text && data.len() >= 8 && &data[2..4] == b"\r\n" {
-        let magic = u16::from_le_bytes([data[0], data[1]]);
+    if !text && data.len() >= 8 && data.get(2..4) == Some(b"\r\n") {
+        let magic = u16::from_le_bytes([first, second]);
         if is_supported_python_bytecode_magic(magic) {
             return Some((FileType::PythonBytecode, DetectionSource::Magic));
         }
     }
 
     // Tampered PE: only scan if there's an 'M' in the first 64 bytes
-    if memchr::memchr(b'M', &data[1..data.len().min(64)]).is_some() {
+    if data.iter().take(64).skip(1).any(|&b| b == b'M') {
         if let Some(ft) = detect_tampered_pe(data) {
             return Some((ft, DetectionSource::Magic));
         }
@@ -853,10 +848,14 @@ fn is_supported_python_bytecode_magic(magic: u16) -> bool {
 /// Check the DOS MZ header's `e_lfanew` pointer for a Windows NE signature.
 /// NE is a 16-bit executable format; it must not be routed to the PE parser.
 fn looks_like_ne_executable(data: &[u8]) -> bool {
-    if data.len() < 0x40 || &data[..2] != b"MZ" {
+    if !data.starts_with(b"MZ") {
         return false;
     }
-    let offset = u32::from_le_bytes([data[0x3c], data[0x3d], data[0x3e], data[0x3f]]) as usize;
+    // `e_lfanew` closes the 64-byte DOS header.
+    let Some(offset) = bytes::u32_le(data, 0x3c) else {
+        return false;
+    };
+    let offset = offset as usize;
     data.get(offset..offset.saturating_add(2)) == Some(b"NE")
 }
 
@@ -883,8 +882,10 @@ fn ar_first_member_is(data: &[u8], want: &[u8]) -> bool {
     let Some(field) = data.get(AR_MAGIC_LEN..AR_MAGIC_LEN + 16) else {
         return false;
     };
-    let end = field.iter().rposition(|&b| b != b' ').map_or(0, |p| p + 1);
-    let name = &field[..end];
+    let mut name = field;
+    while let [head @ .., b' '] = name {
+        name = head;
+    }
     let name = name.strip_suffix(b"/").unwrap_or(name);
     name == want
 }
@@ -907,17 +908,12 @@ fn looks_like_ascii_cpio(data: &[u8]) -> bool {
 }
 
 fn looks_like_udif_dmg(data: &[u8]) -> bool {
-    if data.len() < 512 {
+    let Some(trailer) = data.last_chunk::<512>() else {
         return false;
-    }
-    let trailer = &data[data.len() - 512..];
-    if !trailer.starts_with(b"koly") {
-        return false;
-    }
-
-    let version = u32::from_be_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]);
-    let header_size = u32::from_be_bytes([trailer[8], trailer[9], trailer[10], trailer[11]]);
-    version >= 4 && header_size == 512
+    };
+    trailer.starts_with(b"koly")
+        && bytes::u32_be(trailer, 4).is_some_and(|version| version >= 4)
+        && bytes::u32_be(trailer, 8) == Some(512)
 }
 
 /// Optical-disc image (`.iso`): ISO 9660 and/or UDF.
@@ -930,22 +926,16 @@ fn looks_like_udif_dmg(data: &[u8]) -> bool {
 fn looks_like_iso_or_udf(data: &[u8]) -> bool {
     (16..=22usize).any(|sector| {
         let off = sector * 2048 + 1;
-        data.len() >= off + 5
-            && matches!(
-                &data[off..off + 5],
-                b"CD001" | b"BEA01" | b"NSR02" | b"NSR03" | b"TEA01"
-            )
+        matches!(
+            data.get(off..off + 5),
+            Some(b"CD001" | b"BEA01" | b"NSR02" | b"NSR03" | b"TEA01")
+        )
     })
 }
 
 /// Case-insensitive suffix match on path bytes (no allocation).
 fn path_ends_with_ci(path: &Path, suffix: &[u8]) -> bool {
-    let s = path.to_string_lossy();
-    let bytes = s.as_bytes();
-    if bytes.len() < suffix.len() {
-        return false;
-    }
-    bytes[bytes.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    ends_with_ci(path.to_string_lossy().as_bytes(), suffix)
 }
 
 /// How much of a file [`content_is_text`] reads. Binary headers put a NUL or
@@ -964,7 +954,7 @@ const TEXT_PROBE: usize = 64;
 /// judge whole scoring windows by the share of control bytes instead, and the
 /// script grammars also allow the escapes that batch and IRC scripts print.
 pub(crate) fn content_is_text(data: &[u8]) -> bool {
-    let head = &data[..data.len().min(TEXT_PROBE)];
+    let head = data.get(..TEXT_PROBE).unwrap_or(data);
     let control = |b: &u8| (*b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r' | 0x0C)) || *b == 0x7F;
     if head.iter().any(control) {
         return false;
@@ -999,7 +989,7 @@ fn has_text_header(ft: FileType) -> bool {
 /// A lockfile's tool-written header: pnpm's first line, or a line of the
 /// leading comment block that Yarn v1, Cargo or Poetry write.
 fn lockfile_header(data: &[u8]) -> Option<FileType> {
-    let head = strip_utf8_bom(&data[..data.len().min(512)]);
+    let head = strip_utf8_bom(data.get(..512).unwrap_or(data));
     let lines = head.split(|&b| b == b'\n').map(<[u8]>::trim_ascii_end);
     if lines.clone().next()?.starts_with(b"lockfileVersion:") {
         return Some(FileType::PnpmLock);
@@ -1053,7 +1043,7 @@ const TORCH_LEGACY_MAGIC: &[u8] = b"\x80\x02\x8a\x0a\x6c\xfc\x9c\x46\xf9\x20\x6a
 /// binary formats share, so there the name has to agree.
 fn looks_like_pickle(path: &Path, data: &[u8]) -> bool {
     match data {
-        [0x80, 4 | 5, 0x95, frame @ ..] if frame.len() >= 8 => frame[5..8] == [0, 0, 0],
+        [0x80, 4 | 5, 0x95, frame @ ..] => bytes::u64_le(frame, 0).is_some_and(|len| len < 1 << 40),
         _ if data.starts_with(TORCH_LEGACY_MAGIC) => true,
         [0x80, 2 | 3, ..] => matches!(
             lowercase_ext(path).as_deref(),
@@ -1067,10 +1057,7 @@ fn looks_like_pickle(path: &Path, data: &[u8]) -> bool {
 /// then the size), a second pickle whose payload is 4 bytes shorter, and the
 /// JSON file table as its string.
 fn looks_like_asar(data: &[u8]) -> bool {
-    let u32_at = |off: usize| {
-        data.get(off..off + 4)
-            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-    };
+    let u32_at = |off| bytes::u32_le(data, off);
     u32_at(0) == Some(4)
         && u32_at(4).is_some_and(|size| u32_at(8) == size.checked_sub(4))
         && data
@@ -1085,13 +1072,12 @@ fn looks_like_asar(data: &[u8]) -> bool {
 /// header has no magic, so all three must hold; Chromium's `.pak` resources
 /// satisfy the last two.
 fn looks_like_lzma_alone(data: &[u8]) -> bool {
-    if data.len() < 14 || data[0] != 0x5D {
+    if data.len() < 14 || data.first() != Some(&0x5D) {
         return false;
     }
-    let dict = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
-    let size = u64::from_le_bytes([
-        data[5], data[6], data[7], data[8], data[9], data[10], data[11], data[12],
-    ]);
+    let (Some(dict), Some(size)) = (bytes::u32_le(data, 1), bytes::u64_le(data, 5)) else {
+        return false;
+    };
     let n = dict.trailing_zeros();
     let dict_ok = (12..=30).contains(&n) && (dict == 1 << n || dict == 3 << (n - 1));
     dict_ok && (size == u64::MAX || size < 1 << 40)
@@ -1144,8 +1130,8 @@ fn tar_layout(mut reader: impl Read, deep: bool) -> Inside {
     // decode is told apart from one that decodes to something else.
     let mut block = [0u8; 512];
     let mut filled = 0;
-    while filled < block.len() {
-        match reader.read(&mut block[filled..]) {
+    while let Some(unfilled @ [_, ..]) = block.get_mut(filled..) {
+        match reader.read(unfilled) {
             Ok(0) => return Inside::NotTar,
             Ok(n) => filled += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -1306,7 +1292,7 @@ fn looks_like_github_actions_workflow(path: &Path, data: &[u8]) -> bool {
         return false;
     }
 
-    let Ok(text) = std::str::from_utf8(&data[..data.len().min(16 * 1024)]) else {
+    let Ok(text) = std::str::from_utf8(data.get(..16 * 1024).unwrap_or(data)) else {
         return false;
     };
 
@@ -1389,14 +1375,8 @@ impl<'a> Iterator for ZipNames<'a> {
             return None;
         }
         self.left -= 1;
-        let u16_at = |at: usize| {
-            data.get(at..at + 2)
-                .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
-        };
-        let u32_at = |at: usize| {
-            data.get(at..at + 4)
-                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
-        };
+        let u16_at = |at| bytes::u16_le(data, at).map(usize::from);
+        let u32_at = |at| bytes::u32_le(data, at).map(|v| v as usize);
         let sig = data.get(off..off + 4)?;
         if sig != b"PK\x03\x04" {
             // Only a real end-of-chain marker completes the walk. Anything else
@@ -1627,17 +1607,14 @@ fn classify_pk(path: &Path, data: &[u8]) -> (FileType, DetectionSource) {
 /// header versions Windows and OS/2 defined, it has one colour plane, and its
 /// pixel depth is one a decoder accepts.
 fn looks_like_bmp(data: &[u8]) -> bool {
-    data.starts_with(b"BM") && data.len() > 14 && looks_like_dib_header(&data[14..])
+    data.starts_with(b"BM") && data.get(14..).is_some_and(looks_like_dib_header)
 }
 
 /// A bitmap info header (`BITMAPCOREHEADER` through `BITMAPV5HEADER`, and
 /// OS/2's variants). This is also the whole start of a headerless `.dib`.
 pub(crate) fn looks_like_dib_header(dib: &[u8]) -> bool {
-    let u16_at = |i: usize| dib.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
-    let Some(size) = dib
-        .get(..4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-    else {
+    let u16_at = |i| bytes::u16_le(dib, i);
+    let Some(size) = bytes::u32_le(dib, 0) else {
         return false;
     };
     // The 12-byte core header has 16-bit dimensions; every later one 32-bit.
@@ -1669,7 +1646,10 @@ fn windows_script_host(data: &[u8]) -> Option<FileType> {
     // `<!-- :` is cmd.exe's half of a batch/WSF hybrid: the batch lines hide
     // in that comment, and cmd.exe runs them first. The batch grammar decides.
     let opening = data.trim_ascii_start();
-    if opening.len() >= 6 && opening[..6].eq_ignore_ascii_case(b"<!-- :") {
+    if opening
+        .get(..6)
+        .is_some_and(|open| open.eq_ignore_ascii_case(b"<!-- :"))
+    {
         return None;
     }
     let head = xml_head(data)?;
@@ -1680,12 +1660,14 @@ fn windows_script_host(data: &[u8]) -> Option<FileType> {
     {
         return None;
     }
-    let window = &data[..data.len().min(WSH_SCRIPT_WINDOW)];
-    let mut from = 0;
-    while let Some(at) = find_ci(&window[from..], b"<script") {
-        let tag_start = from + at + b"<script".len();
-        let tag = &window[tag_start..];
-        let tag = &tag[..memchr::memchr(b'>', tag).unwrap_or(tag.len())];
+    let mut rest = data.get(..WSH_SCRIPT_WINDOW).unwrap_or(data);
+    while let Some(at) = find_ci(rest, b"<script") {
+        let Some(after) = rest.get(at + b"<script".len()..) else {
+            break;
+        };
+        let tag = memchr::memchr(b'>', after)
+            .and_then(|end| after.get(..end))
+            .unwrap_or(after);
         if let Some(language) = attribute_value(tag, b"language") {
             let language = decode_char_refs(language).to_ascii_lowercase();
             if language.starts_with("vbs") {
@@ -1695,7 +1677,7 @@ fn windows_script_host(data: &[u8]) -> Option<FileType> {
                 return Some(FileType::JavaScript);
             }
         }
-        from = tag_start;
+        rest = after;
     }
     None
 }
@@ -1704,22 +1686,20 @@ fn windows_script_host(data: &[u8]) -> Option<FileType> {
 /// around the `=` allowed.
 fn attribute_value<'a>(tag: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     let mut from = 0;
-    while let Some(at) = find_ci(&tag[from..], name) {
+    while let Some(at) = find_ci(tag.get(from..)?, name) {
         let start = from + at;
-        let rest = tag[start + name.len()..].trim_ascii_start();
-        let boundary = start == 0 || tag[start - 1].is_ascii_whitespace();
+        let (before, found) = tag.split_at_checked(start)?;
+        let rest = found.get(name.len()..)?.trim_ascii_start();
+        let boundary = before.last().is_none_or(u8::is_ascii_whitespace);
         if let (true, Some(value)) = (boundary, rest.strip_prefix(b"=")) {
             let value = value.trim_ascii_start();
-            let quote = *value.first()?;
+            let (&quote, inner) = value.split_first()?;
             if quote == b'"' || quote == b'\'' {
-                let inner = &value[1..];
-                return Some(&inner[..memchr::memchr(quote, inner).unwrap_or(inner.len())]);
+                return inner.split(|&b| b == quote).next();
             }
-            let end = value
-                .iter()
-                .position(|b| b.is_ascii_whitespace() || *b == b'/')
-                .unwrap_or(value.len());
-            return Some(&value[..end]);
+            return value
+                .split(|b| b.is_ascii_whitespace() || *b == b'/')
+                .next();
         }
         from = start + name.len();
     }
@@ -1734,14 +1714,17 @@ fn decode_char_refs(value: &[u8]) -> String {
     while let Some((&b, tail)) = rest.split_first() {
         if b == b'&' && tail.first() == Some(&b'#') {
             if let Some(end) = tail.iter().position(|&c| c == b';') {
-                let digits = std::str::from_utf8(&tail[1..end]).unwrap_or("");
+                let digits = tail
+                    .get(1..end)
+                    .and_then(|d| std::str::from_utf8(d).ok())
+                    .unwrap_or("");
                 let code = match digits.strip_prefix(['x', 'X']) {
                     Some(hex) => u32::from_str_radix(hex, 16).ok(),
                     None => digits.parse().ok(),
                 };
                 if let Some(c) = code.and_then(char::from_u32) {
                     out.push(c);
-                    rest = &tail[end + 1..];
+                    rest = tail.get(end + 1..).unwrap_or_default();
                     continue;
                 }
             }
@@ -1820,7 +1803,7 @@ struct XmlHead<'a> {
 /// Read past a BOM, whitespace, processing instructions, comments and the
 /// doctype to the root element. `None` unless the document opens with `<`.
 fn xml_head(data: &[u8]) -> Option<XmlHead<'_>> {
-    let text = &data[..data.len().min(XML_HEAD)];
+    let text = data.get(..XML_HEAD).unwrap_or(data);
     let mut rest = strip_utf8_bom(text).trim_ascii_start();
     if !rest.starts_with(b"<") {
         return None;
@@ -1833,18 +1816,20 @@ fn xml_head(data: &[u8]) -> Option<XmlHead<'_>> {
             b"?>"
         } else if rest.starts_with(b"<!--") {
             b"-->"
-        } else if rest.len() >= 9 && rest[..9].eq_ignore_ascii_case(b"<!DOCTYPE") {
-            doctype = Some(markup_name(rest[9..].trim_ascii_start()));
+        } else if let Some((open, after)) = rest.split_at_checked(9)
+            && open.eq_ignore_ascii_case(b"<!DOCTYPE")
+        {
+            doctype = Some(markup_name(after.trim_ascii_start()));
             b">"
         } else if rest.starts_with(b"<!") {
             b">"
-        } else if rest.starts_with(b"<") {
-            break Some(markup_name(&rest[1..]));
+        } else if let Some(name) = rest.strip_prefix(b"<") {
+            break Some(markup_name(name));
         } else {
             break None;
         };
-        match memchr::memmem::find(rest, close) {
-            Some(end) => rest = &rest[end + close.len()..],
+        match memchr::memmem::find(rest, close).and_then(|end| rest.get(end + close.len()..)) {
+            Some(after) => rest = after,
             None => break None,
         }
     };
@@ -1861,11 +1846,10 @@ fn xml_head(data: &[u8]) -> Option<XmlHead<'_>> {
 
 /// The name that opens `bytes`, up to whitespace, `>`, `/` or `[`.
 fn markup_name(bytes: &[u8]) -> &[u8] {
-    let end = bytes
-        .iter()
-        .position(|&b| b.is_ascii_whitespace() || matches!(b, b'>' | b'/' | b'['))
-        .unwrap_or(bytes.len());
-    &bytes[..end]
+    bytes
+        .split(|&b| b.is_ascii_whitespace() || matches!(b, b'>' | b'/' | b'['))
+        .next()
+        .unwrap_or(bytes)
 }
 
 /// Detect shebang-based file types.
@@ -1875,11 +1859,12 @@ fn markup_name(bytes: &[u8]) -> &[u8] {
 /// to the first word after its own options.
 fn detect_shebang(data: &[u8]) -> Option<(FileType, DetectionSource)> {
     // The kernel reads a shebang line through BINPRM_BUF_SIZE (256 bytes).
-    let limit = data.len().min(256);
-    let line_end = memchr::memchr(b'\n', &data[..limit]).unwrap_or(limit);
+    let buf = data.get(..256).unwrap_or(data);
+    let line = buf.split(|&b| b == b'\n').next().unwrap_or(buf);
     // Any whitespace ends a word, not just space and tab: a CRLF script's
     // `#!/usr/bin/perl\r` names perl, whatever the kernel makes of the `\r`.
-    let mut words = data[2..line_end]
+    let mut words = line
+        .strip_prefix(b"#!")?
         .split(|&b| b.is_ascii_whitespace() || b == 0)
         .filter(|w| !w.is_empty());
     let mut name = basename(words.next()?);
@@ -1887,12 +1872,10 @@ fn detect_shebang(data: &[u8]) -> Option<(FileType, DetectionSource)> {
         name = basename(launched_interpreter(&mut words)?);
     }
     // `python3.11`, `perl5.36`, `ruby3.2` and `ksh93` are the same languages.
-    let versioned = name
-        .iter()
-        .rev()
-        .take_while(|&&b| b.is_ascii_digit() || b == b'.')
-        .count();
-    let file_type = match &name[..name.len() - versioned] {
+    while let [stem @ .., b'0'..=b'9' | b'.'] = name {
+        name = stem;
+    }
+    let file_type = match name {
         b"sh" | b"bash" | b"rbash" | b"zsh" | b"dash" | b"ash" | b"ksh" | b"mksh" | b"yash"
         | b"fish" | b"tcsh" | b"csh" | b"atf-sh" => FileType::Shell,
         // debian/rules and friends: `#!/usr/bin/make -f`. Without this the
@@ -1926,7 +1909,7 @@ fn detect_shebang(data: &[u8]) -> Option<(FileType, DetectionSource)> {
 
 /// The path segment after the last `/`.
 fn basename(path: &[u8]) -> &[u8] {
-    memchr::memrchr(b'/', path).map_or(path, |p| &path[p + 1..])
+    path.rsplit(|&b| b == b'/').next().unwrap_or(path)
 }
 
 /// The interpreter a launcher runs: the first word that is neither an option
@@ -1947,31 +1930,21 @@ fn launched_interpreter<'a>(words: &mut impl Iterator<Item = &'a [u8]>) -> Optio
 
 /// Detect tampered PE: MZ within first 64 bytes with valid PE\0\0 signature.
 fn detect_tampered_pe(data: &[u8]) -> Option<FileType> {
-    let search_limit = data.len().min(64);
-    if search_limit < 3 {
-        return None;
-    }
-    // Use memchr to find 'M' bytes instead of scanning byte-by-byte
-    let mut pos = 1; // skip position 0 (already checked by MZ branch)
-    while let Some(offset) = memchr::memchr(b'M', &data[pos..search_limit.saturating_sub(1)]) {
-        let i = pos + offset;
-        if data.get(i + 1) == Some(&b'Z') {
-            let pe_data = &data[i..];
-            if pe_data.len() >= 0x40 {
-                let e_lfanew = u32::from_le_bytes([
-                    pe_data[0x3C],
-                    pe_data[0x3D],
-                    pe_data[0x3E],
-                    pe_data[0x3F],
-                ]) as usize;
-                if e_lfanew + 4 <= pe_data.len() && pe_data[e_lfanew..e_lfanew + 4] == *b"PE\0\0" {
-                    return Some(FileType::Pe);
-                }
-            }
-        }
-        pos = i + 1;
-    }
-    None
+    let window = data.get(..64).unwrap_or(data);
+    window
+        .windows(2)
+        .enumerate()
+        // Offset 0 was already checked by the MZ arm.
+        .skip(1)
+        .filter(|&(_, pair)| pair == b"MZ")
+        .any(|(i, _)| {
+            data.get(i..).is_some_and(|pe| {
+                bytes::u32_le(pe, 0x3C)
+                    .and_then(|e_lfanew| pe.get(e_lfanew as usize..))
+                    .is_some_and(|nt| nt.starts_with(b"PE\0\0"))
+            })
+        })
+        .then_some(FileType::Pe)
 }
 
 /// Maximum prefix examined when identifying a Go module manifest by content.
@@ -1981,7 +1954,7 @@ const GO_MOD_HEAD_LIMIT: usize = 4096;
 /// Checking that narrow grammar is constant-space and avoids assigning module
 /// semantics to ordinary prose or Go source declarations such as `export module`.
 fn looks_like_go_mod(data: &[u8]) -> bool {
-    let head = &data[..data.len().min(GO_MOD_HEAD_LIMIT)];
+    let head = data.get(..GO_MOD_HEAD_LIMIT).unwrap_or(data);
     let Ok(text) = std::str::from_utf8(head) else {
         return false;
     };
@@ -1999,22 +1972,20 @@ fn looks_like_go_mod(data: &[u8]) -> bool {
         return false;
     }
     let rest = rest.trim_start();
-    let comment = rest
+    let rest = rest
         .find("//")
-        .filter(|&offset| offset > 0 && rest.as_bytes()[offset - 1].is_ascii_whitespace());
-    let rest = comment.map_or(rest, |offset| &rest[..offset]).trim();
+        .and_then(|offset| rest.get(..offset))
+        .filter(|before| before.ends_with(|c: char| c.is_ascii_whitespace()))
+        .unwrap_or(rest)
+        .trim();
     if rest.is_empty() || rest.split_whitespace().count() != 1 {
         return false;
     }
 
-    let path = if rest.len() >= 2
-        && ((rest.starts_with('"') && rest.ends_with('"'))
-            || (rest.starts_with('`') && rest.ends_with('`')))
-    {
-        &rest[1..rest.len() - 1]
-    } else {
-        rest
-    };
+    let path = ['"', '`']
+        .into_iter()
+        .find_map(|quote| rest.strip_prefix(quote)?.strip_suffix(quote))
+        .unwrap_or(rest);
     !path.is_empty()
         && path.bytes().any(|b| b.is_ascii_alphanumeric())
         && path
@@ -2029,12 +2000,15 @@ fn looks_like_go_mod(data: &[u8]) -> bool {
 fn detect_manifest(path: &Path, data: &[u8]) -> Option<FileType> {
     let file_name = path.file_name()?.to_str()?;
 
-    // Stack-allocated lowercase (manifest names are short)
+    // Stack-allocated lowercase (manifest names are short). A longer name is
+    // cut to the buffer.
     let mut buf = [0u8; 32];
-    let len = file_name.len().min(buf.len());
-    buf[..len].copy_from_slice(&file_name.as_bytes()[..len]);
-    buf[..len].make_ascii_lowercase();
-    let name = std::str::from_utf8(&buf[..len]).unwrap_or("");
+    let file_name = file_name.as_bytes();
+    let file_name = file_name.get(..buf.len()).unwrap_or(file_name);
+    let lower = buf.get_mut(..file_name.len())?;
+    lower.copy_from_slice(file_name);
+    lower.make_ascii_lowercase();
+    let name = std::str::from_utf8(lower).unwrap_or("");
 
     match name {
         "package.json" => Some(FileType::PackageJson),

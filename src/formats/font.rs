@@ -52,6 +52,7 @@ use std::collections::HashSet;
 
 use crate::error::Error;
 use crate::formats::carrier::{classify_region, leading_whitespace, printable_ratio};
+use crate::formats::common::bytes_at::u32_be;
 use crate::formats::common::{XorScan, extract_binary_strings, hex_encode};
 use crate::output::{Metrics, Strings, Values};
 use crate::scan::entropy;
@@ -130,7 +131,8 @@ struct Report {
     /// trailing data, and tables under an unregistered tag. The `name`/`post`
     /// string tables are searched for payload signatures too but are *not*
     /// counted here — they are legitimately claimed content, and counting
-    /// them reported 4 KB of "stowaway" on every ordinary font.
+    /// them reported 4 KB of "stowaway" on every ordinary font. WOFF metadata
+    /// and private blocks are treated the same way.
     stowaway_bytes: u64,
     /// Shannon entropy over those same regions. Near 8.0 means compressed or
     /// encrypted content, which no font format leaves lying between tables.
@@ -314,8 +316,8 @@ pub(super) fn extract(
 
 /// Identify the container from its signature alone.
 fn classify(bytes: &[u8]) -> Format {
-    if bytes.len() >= 4 {
-        match &bytes[..4] {
+    if let Some(magic) = bytes.first_chunk::<4>() {
+        match magic {
             b"OTTO" => return Format::OpenType,
             b"ttcf" => return Format::Collection,
             b"wOFF" => return Format::Woff,
@@ -328,10 +330,7 @@ fn classify(bytes: &[u8]) -> Format {
     }
     // EOT has no leading signature — it opens with two little-endian sizes.
     // The `MagicNumber` field at byte 34 is what identifies it.
-    if bytes.len() > EOT_MAGIC_OFFSET + 1
-        && bytes[EOT_MAGIC_OFFSET] == 0x4C
-        && bytes[EOT_MAGIC_OFFSET + 1] == 0x50
-    {
+    if bytes.get(EOT_MAGIC_OFFSET..EOT_MAGIC_OFFSET + 2) == Some(&[0x4C, 0x50][..]) {
         return Format::Eot;
     }
     Format::None
@@ -341,7 +340,7 @@ fn classify(bytes: &[u8]) -> Format {
 /// the offset where the directory ends. Coverage is folded in by the caller so
 /// a collection can account for every member against one shared picture.
 fn read_sfnt_dir(bytes: &[u8], base: usize, report: &mut Report) -> (Vec<TableEntry>, u64) {
-    let Some(header) = bytes.get(base..base + 12) else {
+    let Some(header) = bytes.get(base..).and_then(<[u8]>::first_chunk::<12>) else {
         report.problem("header truncated");
         report.flag("truncated");
         return (Vec::new(), 0);
@@ -393,7 +392,7 @@ fn walk_sfnt(bytes: &[u8], report: &mut Report) {
 /// reports the bytes claimed by earlier members as unaccounted-for, which
 /// marked every shipped macOS `.ttc` invalid.
 fn walk_collection(bytes: &[u8], report: &mut Report) {
-    let Some(header) = bytes.get(..16) else {
+    let Some(header) = bytes.first_chunk::<16>() else {
         report.problem("collection header truncated");
         report.flag("truncated");
         return;
@@ -414,13 +413,12 @@ fn walk_collection(bytes: &[u8], report: &mut Report) {
     // header pointing all 512 members at one large directory costs one walk.
     let mut walked = HashSet::new();
     for i in 0..num_fonts {
-        let at = 12 + i * 4;
-        let Some(rec) = bytes.get(at..at + 4) else {
+        let Some(off) = u32_be(bytes, 12 + i * 4) else {
             report.problem("collection offset table truncated");
             report.flag("truncated");
             return;
         };
-        let off = u32::from_be_bytes([rec[0], rec[1], rec[2], rec[3]]) as usize;
+        let off = off as usize;
         if !walked.insert(off) {
             continue;
         }
@@ -443,7 +441,7 @@ fn walk_collection(bytes: &[u8], report: &mut Report) {
 /// WOFF wraps an sfnt in a per-table-compressed container. The directory is
 /// uncompressed, so table extents are readable without inflating anything.
 fn walk_woff(bytes: &[u8], report: &mut Report) {
-    let Some(header) = bytes.get(..44) else {
+    let Some(header) = bytes.first_chunk::<44>() else {
         report.problem("header truncated");
         report.flag("truncated");
         return;
@@ -486,20 +484,14 @@ fn walk_woff(bytes: &[u8], report: &mut Report) {
         .collect();
     // The metadata and private blocks are legitimate parts of the container,
     // so count them as covered rather than reporting them as stowaways.
+    // `record_tables` still searches them for payload signatures, as it does
+    // the string tables: their contents are free-form.
     let mut extra = Vec::new();
-    for (off_at, len_at) in [(24usize, 28usize), (36usize, 40usize)] {
-        let off = u64::from(u32::from_be_bytes([
-            header[off_at],
-            header[off_at + 1],
-            header[off_at + 2],
-            header[off_at + 3],
-        ]));
-        let len = u64::from(u32::from_be_bytes([
-            header[len_at],
-            header[len_at + 1],
-            header[len_at + 2],
-            header[len_at + 3],
-        ]));
+    // metaOffset/metaLength sit at 24/28, privOffset/privLength at 36/40. The
+    // header is 44 bytes, so every read lands; an unreadable field would mean
+    // an undeclared block.
+    let field = |at: usize| u32_be(header, at).map_or(0, u64::from);
+    for (off, len) in [(field(24), field(28)), (field(36), field(40))] {
         if off > 0 && len > 0 {
             extra.push(TableEntry {
                 tag: None,
@@ -517,7 +509,7 @@ fn walk_woff(bytes: &[u8], report: &mut Report) {
 /// decompressing. Record what the fixed header declares and check it against
 /// the file — enough to catch truncation, size lies, and appended data.
 fn walk_woff2(bytes: &[u8], report: &mut Report) {
-    let Some(header) = bytes.get(..48) else {
+    let Some(header) = bytes.first_chunk::<48>() else {
         report.problem("header truncated");
         report.flag("truncated");
         return;
@@ -554,7 +546,7 @@ fn walk_woff2(bytes: &[u8], report: &mut Report) {
 /// Embedded OpenType: a little-endian header wrapping an sfnt (optionally
 /// MTX-compressed). Validate the two size fields against the file.
 fn walk_eot(bytes: &[u8], report: &mut Report) {
-    let Some(header) = bytes.get(..EOT_MAGIC_OFFSET + 2) else {
+    let Some(header) = bytes.first_chunk::<{ EOT_MAGIC_OFFSET + 2 }>() else {
         report.problem("header truncated");
         report.flag("truncated");
         return;
@@ -605,7 +597,8 @@ fn record_tables(bytes: &[u8], dir_end: u64, entries: &[TableEntry], report: &mu
 
     let mut extents: Vec<(u64, u64)> = Vec::with_capacity(entries.len());
     for e in entries {
-        // Untagged entries are WOFF container regions, not tables.
+        // Untagged entries are WOFF container regions, not tables: covered,
+        // and neither registered nor unknown.
         let registered = e.tag.is_some_and(is_registered_tag);
         if let Some(tag) = e.tag {
             if report.seen_tables.insert(tag) {
@@ -636,15 +629,16 @@ fn record_tables(bytes: &[u8], dir_end: u64, entries: &[TableEntry], report: &mu
         // directory where a payload can sit and still render, because nothing
         // reads it. `name`/`post` are scanned too: they are the format's
         // string tables, so an executable or archive signature in them is
-        // unambiguous even though readable text there is expected.
-        if !registered {
-            note_region(bytes, e.offset, end, report, RegionKind::Unclaimed);
-        } else if e
-            .tag
-            .as_ref()
-            .is_some_and(|t| matches!(t, b"name" | b"post"))
-        {
-            note_region(bytes, e.offset, end, report, RegionKind::StringTable);
+        // unambiguous even though readable text there is expected. WOFF
+        // metadata and private blocks are declared by the header, so they are
+        // covered the same way: scanned for signatures, never counted.
+        let kind = match e.tag {
+            Some(_) if !registered => Some(RegionKind::Unclaimed),
+            Some(tag) => matches!(&tag, b"name" | b"post").then_some(RegionKind::Claimed),
+            None => Some(RegionKind::Claimed),
+        };
+        if let Some(kind) = kind {
+            note_region(bytes, e.offset, end, report, kind);
         }
     }
     if extents.is_empty() {
@@ -712,11 +706,13 @@ enum RegionKind {
     /// an unregistered tag. These are the stowaway surface, so their size and
     /// entropy are the reported totals and every classification counts.
     Unclaimed,
-    /// A registered string table (`name`, `post`). The format puts readable
-    /// text here on purpose, so text is expected and the bytes are legitimate
-    /// content — they must not inflate `font.stowaway_bytes`. Only a payload
-    /// signature is worth reporting.
-    StringTable,
+    /// Claimed content whose bytes are free-form: a registered string table
+    /// (`name`, `post`), where the format puts readable text on purpose, or a
+    /// WOFF metadata/private block, which the header declares and which holds
+    /// compressed XML or vendor data. The bytes are legitimate content — they
+    /// must not inflate `font.stowaway_bytes`. Only a payload signature is
+    /// worth reporting.
+    Claimed,
 }
 
 /// Examine one region and fold what it contains into the stowaway verdict.
@@ -1364,6 +1360,110 @@ mod tests {
         assert!(stowaway(&v).is_empty());
         assert_eq!(m.get("font.stowaway_bytes"), Some(0.0));
         assert_eq!(m.get("font.stowaway_entropy"), Some(0.0));
+    }
+
+    /// Deterministic pseudo-random bytes: high entropy, no signature.
+    fn noise(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut x: u32 = 0x9e37_79b9;
+        while out.len() < len {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// Build a WOFF laid out as the spec orders it: header, table directory,
+    /// table data (stored uncompressed, which WOFF permits), then the optional
+    /// metadata and private-data blocks, each starting on a 4-byte boundary.
+    /// An empty `meta` or `private` leaves that block undeclared.
+    fn build_woff(tables: &[(&[u8; 4], &[u8])], meta: &[u8], private: &[u8]) -> Vec<u8> {
+        let dir_end = 44 + tables.len() * WOFF_RECORD_LEN;
+        let mut dir = Vec::new();
+        let mut body = Vec::new();
+        for (tag, data) in tables {
+            let len = (data.len() as u32).to_be_bytes();
+            dir.extend_from_slice(*tag);
+            dir.extend_from_slice(&((dir_end + body.len()) as u32).to_be_bytes());
+            dir.extend_from_slice(&len); // compLength
+            dir.extend_from_slice(&len); // origLength
+            dir.extend_from_slice(&[0; 4]); // checksum (unchecked)
+            body.extend_from_slice(data);
+            body.resize(body.len().next_multiple_of(4), 0);
+        }
+        let mut block = |data: &[u8]| -> [u8; 8] {
+            if data.is_empty() {
+                return [0; 8];
+            }
+            let at = (dir_end + body.len()) as u32;
+            body.extend_from_slice(data);
+            body.resize(body.len().next_multiple_of(4), 0);
+            let mut field = [0; 8];
+            field[..4].copy_from_slice(&at.to_be_bytes());
+            field[4..].copy_from_slice(&(data.len() as u32).to_be_bytes());
+            field
+        };
+        let meta_field = block(meta);
+        let private_field = block(private);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"wOFF");
+        out.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]); // flavor
+        out.extend_from_slice(&((dir_end + body.len()) as u32).to_be_bytes()); // length
+        out.extend_from_slice(&(tables.len() as u16).to_be_bytes()); // numTables
+        out.extend_from_slice(&[0; 2]); // reserved
+        out.extend_from_slice(&[0; 4]); // totalSfntSize
+        out.extend_from_slice(&[0; 4]); // majorVersion, minorVersion
+        out.extend_from_slice(&meta_field); // metaOffset, metaLength
+        out.extend_from_slice(&(meta.len() as u32).to_be_bytes()); // metaOrigLength
+        out.extend_from_slice(&private_field); // privOffset, privLength
+        out.extend_from_slice(&dir);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// The metadata block is declared by the WOFF header, so its bytes are
+    /// covered. Compressed metadata reads as high-entropy noise; that must not
+    /// make an ordinary WOFF report a stowaway or unaccounted-for bytes.
+    #[test]
+    fn woff_metadata_block_is_covered_not_stowaway() {
+        let meta = noise(1024);
+        let woff = build_woff(&[(b"head", &[0u8; 54]), (b"cmap", &[0u8; 32])], &meta, &[]);
+        let (v, m) = run(&woff);
+        assert_eq!(format_of(&v), "woff");
+        assert_eq!(v.get("font.valid").and_then(JsonValue::as_bool), Some(true));
+        assert!(stowaway(&v).is_empty(), "{:?}", stowaway(&v));
+        assert!(!features(&v).contains(&"stowaway".to_string()));
+        assert_eq!(m.get("font.stowaway_bytes"), Some(0.0));
+        assert_eq!(m.get("font.stowaway_entropy"), Some(0.0));
+        assert_eq!(m.get("font.gap_bytes"), Some(0.0));
+        assert_eq!(m.get("font.trailing_bytes"), Some(0.0));
+    }
+
+    /// Covered is not unexamined. The private block is free-form vendor data,
+    /// so an executable parked there is still named, as one in `name` is,
+    /// while its bytes stay out of `font.stowaway_bytes`.
+    #[test]
+    fn woff_private_block_is_covered_but_still_scanned() {
+        let woff = build_woff(&[(b"head", &[0u8; 54])], &noise(64), &fake_pe(1024));
+        let (v, m) = run(&woff);
+        assert_eq!(v.get("font.valid").and_then(JsonValue::as_bool), Some(true));
+        assert_eq!(stowaway(&v), vec!["pe"]);
+        assert_eq!(m.get("font.stowaway_bytes"), Some(0.0));
+    }
+
+    /// A block declared past the end of the file is not covered ground.
+    #[test]
+    fn woff_metadata_past_end_of_file_is_out_of_bounds() {
+        let mut woff = build_woff(&[(b"head", &[0u8; 54])], &noise(64), &[]);
+        woff[28..32].copy_from_slice(&0x00FF_FFFFu32.to_be_bytes()); // metaLength
+        let (v, _) = run(&woff);
+        assert!(features(&v).contains(&"table_out_of_bounds".to_string()));
+        assert_eq!(
+            v.get("font.valid").and_then(JsonValue::as_bool),
+            Some(false)
+        );
     }
 
     #[test]

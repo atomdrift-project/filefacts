@@ -30,12 +30,13 @@ use serde_json::Value as JsonValue;
 use std::io::{Read, Seek};
 
 use crate::error::Error;
-use crate::output::{Metrics, Values};
+use crate::output::{Errors, Metrics, Stage, Values};
 
 pub(super) fn extract_from_archive<R: Read + Seek>(
     zip: &mut ::zip::ZipArchive<R>,
     values: &mut Values,
     metrics: &mut Metrics,
+    errors: &mut Errors,
 ) -> Result<(), Error> {
     // Parse the outer wheel filename (set by lib.rs from open_with_path)
     // for PEP 427 components. The name_prefix here is the *outer*
@@ -140,8 +141,13 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         // The dist-info `METADATA` is an RFC 822 header block (PEP 566).
         // Pull the authorship fields — the publisher identity a wheel
         // carries that the filename and dir name don't.
-        if let Some(meta) = read_text_member(zip, &format!("{dist_info}/METADATA")) {
-            emit_metadata_identity(&meta, values);
+        let name = format!("{dist_info}/METADATA");
+        match read_text_member(zip, &name) {
+            Ok(Some(meta)) => emit_metadata_identity(&meta, values),
+            // `has_metadata` can come from a second dist-info directory;
+            // the chosen one having none is an absence, not a failure.
+            Ok(None) => {}
+            Err((stage, why)) => errors.record_malformed(stage, format!("{name}: {why}")),
         }
     }
     if has_wheel {
@@ -197,16 +203,11 @@ fn parse_wheel_filename(basename: &str, values: &mut Values) {
     let parts: Vec<&str> = stem.split('-').collect();
     // 5 fields: name, version, python, abi, platform.
     // 6 fields: name, version, build, python, abi, platform.
-    let (name, version, build, python, abi, platform) = match parts.len() {
-        5 => (parts[0], parts[1], None, parts[2], parts[3], parts[4]),
-        6 => (
-            parts[0],
-            parts[1],
-            Some(parts[2]),
-            parts[3],
-            parts[4],
-            parts[5],
-        ),
+    let (name, version, build, python, abi, platform) = match *parts.as_slice() {
+        [name, version, python, abi, platform] => (name, version, None, python, abi, platform),
+        [name, version, build, python, abi, platform] => {
+            (name, version, Some(build), python, abi, platform)
+        }
         _ => return,
     };
     if name.is_empty() || version.is_empty() {
@@ -251,13 +252,39 @@ fn ends_with_so_versioned(basename: &str) -> bool {
 }
 
 /// Read a zip member as UTF-8 text, capped so a hostile member can't
-/// balloon memory. Returns `None` on any failure.
-fn read_text_member<R: Read + Seek>(zip: &mut ::zip::ZipArchive<R>, name: &str) -> Option<String> {
+/// balloon memory; `Ok(None)` when there is no such member. Only the
+/// leading header block is used, so a member past the cap is read as its
+/// first `MAX` bytes (to the last whole character) rather than refused. On
+/// failure, the stage it failed in and why: the member would not
+/// decompress, or is not UTF-8.
+fn read_text_member<R: Read + Seek>(
+    zip: &mut ::zip::ZipArchive<R>,
+    name: &str,
+) -> Result<Option<String>, (Stage, String)> {
     const MAX: u64 = 256 * 1024;
-    let member = zip.by_name(name).ok()?;
+    let member = match zip.by_name(name) {
+        Ok(member) => member,
+        Err(::zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(e) => return Err((Stage::ZipParse, e.to_string())),
+    };
     let mut buf = Vec::new();
-    member.take(MAX).read_to_end(&mut buf).ok()?;
-    String::from_utf8(buf).ok()
+    member
+        .take(MAX + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| (Stage::ZipParse, e.to_string()))?;
+    let capped = buf.len() as u64 > MAX;
+    buf.truncate(MAX as usize);
+    match String::from_utf8(buf) {
+        Ok(text) => Ok(Some(text)),
+        // The cap cut a multi-byte character in two: not the member's fault.
+        Err(e) if capped && e.utf8_error().error_len().is_none() => {
+            let valid = e.utf8_error().valid_up_to();
+            let mut bytes = e.into_bytes();
+            bytes.truncate(valid);
+            Ok(String::from_utf8(bytes).ok())
+        }
+        Err(e) => Err((Stage::FormatExtract, format!("not UTF-8: {e}"))),
+    }
 }
 
 /// Emit `whl.author` / `whl.maintainer` (+ `_email`), `whl.home_page` and
@@ -312,12 +339,82 @@ mod tests {
     }
 
     fn run(bytes: &[u8]) -> (Values, Metrics) {
+        let (v, m, e) = run_with_errors(bytes);
+        assert!(e.is_empty(), "{e:?}");
+        (v, m)
+    }
+
+    fn run_with_errors(bytes: &[u8]) -> (Values, Metrics, Errors) {
         let mut v = Values::new();
         let mut m = Metrics::new();
+        let mut e = Errors::new();
         if let Ok(mut zip) = crate::formats::zip::open_archive(bytes) {
-            extract_from_archive(&mut zip, &mut v, &mut m).unwrap();
+            extract_from_archive(&mut zip, &mut v, &mut m, &mut e).unwrap();
         }
-        (v, m)
+        (v, m, e)
+    }
+
+    #[test]
+    fn metadata_that_is_not_utf8_records_one_error() {
+        let whl = build_whl(&[
+            ("mypkg/__init__.py", b""),
+            (
+                "mypkg-1.0.0.dist-info/METADATA",
+                b"Name: mypkg\nAuthor: Jos\xe9\n",
+            ),
+        ]);
+        let (v, _, e) = run_with_errors(&whl);
+        assert_eq!(e.len(), 1, "{e:?}");
+        let err = &e.as_slice()[0];
+        assert_eq!(
+            (err.stage, err.kind),
+            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+        );
+        assert!(
+            err.message
+                .starts_with("mypkg-1.0.0.dist-info/METADATA: not UTF-8"),
+            "{}",
+            err.message
+        );
+        assert!(v.get("whl.author").is_none());
+        // The central-directory facts are unaffected.
+        assert_eq!(
+            v.get("whl.has_metadata").and_then(|x| x.as_bool()),
+            Some(true)
+        );
+    }
+
+    /// `METADATA` under a second dist-info directory only: the chosen one
+    /// has none, which is an absence, not a read failure.
+    #[test]
+    fn metadata_absent_from_the_chosen_dist_info_records_nothing() {
+        let whl = build_whl(&[
+            ("a-1.0.dist-info/RECORD", b""),
+            ("b-1.0.dist-info/METADATA", b"Name: b\n"),
+        ]);
+        let (v, _) = run(&whl);
+        assert_eq!(
+            v.get("whl.dist_info_dir").and_then(|x| x.as_str()),
+            Some("a-1.0.dist-info")
+        );
+        assert!(v.get("whl.author").is_none());
+    }
+
+    /// Past the cap, the header block is still read, even when the cut lands
+    /// inside a multi-byte character.
+    #[test]
+    fn oversized_metadata_is_read_up_to_the_cap() {
+        // An even-length header block puts the cap between two-byte
+        // characters; one more body byte puts it inside one.
+        for body_start in ["", "x"] {
+            let mut meta = format!("Name: mypkg\nAuthor: Jane\n\n{body_start}").into_bytes();
+            while meta.len() <= 256 * 1024 {
+                meta.extend_from_slice("\u{e9}".as_bytes());
+            }
+            let whl = build_whl(&[("mypkg-1.0.0.dist-info/METADATA", &meta)]);
+            let (v, _) = run(&whl);
+            assert_eq!(v.get("whl.author").and_then(|x| x.as_str()), Some("Jane"));
+        }
     }
 
     #[test]

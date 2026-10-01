@@ -30,6 +30,7 @@ pub mod container;
 mod ext;
 mod heuristics;
 mod magic;
+pub(crate) use magic::looks_like_obfuscated_rtf;
 mod markdown;
 mod restructuredtext;
 mod scripts;
@@ -193,566 +194,556 @@ impl FileId {
 
 /// Coarse content category for a [`FileType`], used to describe an
 /// extension/content mismatch as a `content_group → extension_group`
-/// transition. Kept exhaustive so a new [`FileType`] forces a category choice.
-fn file_group(ft: FileType) -> &'static str {
-    match ft {
-        FileType::MachO
-        | FileType::Elf
-        | FileType::Pe
-        | FileType::Ne
-        | FileType::JavaClass
-        | FileType::PythonBytecode
-        | FileType::Beam
-        | FileType::Wasm
-        | FileType::Dex
-        | FileType::StaticLib
-        | FileType::Lnk
-        | FileType::DosCom
-        | FileType::Shellcode => "binary",
-        // Interpreted scripting languages (cleave's `scripts` for-group).
-        FileType::Shell
-        | FileType::Batch
-        | FileType::Jcl
-        | FileType::Vbs
-        | FileType::Python
-        | FileType::JavaScript
-        | FileType::Ruby
-        | FileType::Php
-        | FileType::Perl
-        | FileType::Lua
-        | FileType::PowerShell
-        | FileType::AppleScript
-        | FileType::Jsp
-        | FileType::Asp
-        | FileType::Cfml
-        | FileType::Mirc
-        | FileType::IrcII => "script",
-        // Compiled / typed source languages (cleave's `source` for-group).
-        FileType::TypeScript
-        | FileType::Go
-        | FileType::Rust
-        | FileType::Java
-        | FileType::C
-        | FileType::CSharp
-        | FileType::Swift
-        | FileType::ObjectiveC
-        | FileType::Groovy
-        | FileType::Scala
-        | FileType::Kotlin
-        | FileType::Zig
-        | FileType::Elixir
-        | FileType::Clojure => "source",
-        FileType::PackageJson
-        | FileType::PackageLockJson
-        | FileType::VsixManifest
-        | FileType::ChromeManifest
-        | FileType::CargoToml
-        | FileType::PyProjectToml
-        | FileType::ComposerJson
-        | FileType::Json
-        | FileType::Gyp
-        | FileType::GithubActions
-        | FileType::SystemdService
-        | FileType::DesktopEntry
-        | FileType::Xml
-        | FileType::Yaml
-        | FileType::PkgInfo
-        | FileType::SrcInfo
-        | FileType::Registry
-        | FileType::GoMod
-        | FileType::GoSum
-        | FileType::CargoLock
-        | FileType::RequirementsTxt
-        | FileType::PoetryLock
-        | FileType::PipfileLock
-        | FileType::GemfileLock
-        | FileType::ComposerLock
-        | FileType::YarnLock
-        | FileType::PnpmLock
-        | FileType::Plist
-        | FileType::Nib
-        | FileType::Pbxproj
-        | FileType::Cmake
-        | FileType::Makefile
-        | FileType::Dockerfile
-        // A detection ruleset, not prose. A `.yar` renamed `.txt` is
-        // config→text; it is not the same kind of file as a note.
-        | FileType::Yara => "config",
-        FileType::Jar
-        | FileType::Zip
-        | FileType::Tar
-        | FileType::Cpio
-        | FileType::TarGz
-        | FileType::TarBz2
-        | FileType::TarXz
-        | FileType::TarZst
-        | FileType::Gz
-        | FileType::Bz2
-        | FileType::Xz
-        | FileType::Lzma
-        | FileType::Zst
-        | FileType::SevenZ
-        | FileType::Rar
-        | FileType::Deb
-        | FileType::Rpm
-        | FileType::PkgMacos
-        | FileType::Dmg
-        | FileType::Iso
-        | FileType::Cab
-        | FileType::Chm
-        | FileType::Crx
-        | FileType::Xpi
-        | FileType::Whl
-        | FileType::Gem
-        | FileType::ApkAndroid
-        | FileType::ApkAlpine
-        | FileType::Npm
-        | FileType::Crate
-        | FileType::Conda
-        | FileType::Egg
-        | FileType::Nupkg
-        | FileType::Ipa
-        | FileType::Vsix
-        | FileType::PkgFreebsd
-        | FileType::PkgArch
-        | FileType::PythonSdist
-        | FileType::OciImage
-        | FileType::Xbps
-        | FileType::Snap
-        | FileType::Flatpak
-        | FileType::SquashFs
-        | FileType::GentooBinpkg
-        | FileType::Asar => "archive",
-        FileType::Rtf
-        | FileType::OleDoc
-        | FileType::Ooxml
-        | FileType::Pdf
-        | FileType::Odf
-        | FileType::PostScript => "document",
-        // Installer packages share the OLE2/CFBF wire format with OleDoc but
-        // are not documents — treat them as archive-class for mismatch
-        // transitions (e.g. an MSI renamed `.doc` is archive→document).
-        FileType::Msi => "archive",
-        FileType::Jpeg
-        | FileType::Png
-        | FileType::Svg
-        | FileType::Ico
-        | FileType::Gif
-        | FileType::Bmp
-        | FileType::Webp => "image",
-        // Audio and video are their own classes: a payload renamed from
-        // `.wav` to `.png` is a real transition, not a benign refinement.
-        FileType::Wav | FileType::Aiff | FileType::Mp3 => "audio",
-        FileType::Mp4 => "video",
-        // Fonts are their own class, not images: a font renamed to `.png`
-        // is a format transition worth reporting, not a benign refinement.
-        FileType::Font => "font",
-        FileType::Html | FileType::Markdown | FileType::Text | FileType::Tex => "text",
-        FileType::Pickle | FileType::PgpSignature | FileType::Data | FileType::Unknown => "data",
+/// transition. Every row of the [`FileType`] table names one, so a new
+/// variant forces a category choice.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Group {
+    Binary,
+    /// Interpreted scripting languages (cleave's `scripts` for-group).
+    Script,
+    /// Compiled / typed source languages (cleave's `source` for-group).
+    Source,
+    Config,
+    Archive,
+    Document,
+    Image,
+    /// Audio and video are their own classes: a payload renamed from
+    /// `.wav` to `.png` is a real transition, not a benign refinement.
+    Audio,
+    Video,
+    /// Fonts are their own class, not images: a font renamed to `.png`
+    /// is a format transition worth reporting, not a benign refinement.
+    Font,
+    Text,
+    Data,
+}
+
+impl Group {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Binary => "binary",
+            Self::Script => "script",
+            Self::Source => "source",
+            Self::Config => "config",
+            Self::Archive => "archive",
+            Self::Document => "document",
+            Self::Image => "image",
+            Self::Audio => "audio",
+            Self::Video => "video",
+            Self::Font => "font",
+            Self::Text => "text",
+            Self::Data => "data",
+        }
     }
 }
 
-/// File format identified by fileid.
+/// The name of `ft`'s [`Group`] in a mismatch transition.
+fn file_group(ft: FileType) -> &'static str {
+    ft.group().label()
+}
+
+/// The predicate flags a row of the [`FileType`] table can set; a row names
+/// the ones that hold for it.
+#[derive(Clone, Copy)]
+struct Flags(u8);
+
+impl Flags {
+    /// A compiled native binary or bytecode: [`FileType::is_binary`].
+    const BINARY: Self = Self(1);
+    /// Source code with AST support: [`FileType::is_source_code`].
+    const SOURCE_CODE: Self = Self(1 << 1);
+    /// A manifest parsed whole into the `values` tree:
+    /// [`FileType::is_structured_data`].
+    const STRUCTURED_DATA: Self = Self(1 << 2);
+    /// Not analyzed, so [`FileType::is_program`] is false.
+    const UNSUPPORTED: Self = Self(1 << 3);
+
+    const fn contains(self, flag: Self) -> bool {
+        self.0 & flag.0 != 0
+    }
+}
+
+/// Declares [`FileType`] from one table, so the enum, its labels, groups and
+/// predicate flags cannot drift apart. A row is a variant's documentation,
+/// then `Variant => "label", Group, FLAGS...;`.
 ///
-/// Variants cover binary formats, source languages, package manifests, archives,
-/// and document types. Manifest types (e.g. `PackageJson`, `CargoToml`) are included
-/// because they require format-specific analysis despite being syntactically JSON/TOML.
-// Serialization goes through the canonical [`FileType::label`] /
-// [`FileType::from_label`] pair (see the `impl serde::*` below), not a derived
-// `rename_all`. That label is the single nomenclature filefacts, cleave, and
-// scan all share — keeping the serialized form and the report/routing label
-// the same string instead of two near-identical vocabularies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum FileType {
-    /// Mach-O binary (macOS/iOS executable or library)
-    MachO,
-    /// ELF binary (Linux/Unix executable or shared library)
-    Elf,
-    /// PE binary (Windows executable, DLL)
-    Pe,
-    /// Windows New Executable (16-bit NE) binary
-    Ne,
-    /// Unix shell script (bash, sh, zsh, etc.)
-    Shell,
-    /// Windows batch file (.bat, .cmd)
-    Batch,
-    /// IBM z/OS Job Control Language batch script (.jcl)
-    Jcl,
-    /// VBScript source file (.vbs, .vbe, .wsf, .wsc)
-    Vbs,
-    /// Python source file (.py)
-    Python,
-    /// JavaScript source file (.js, .mjs, .cjs)
-    JavaScript,
-    /// TypeScript source file (.ts, .tsx)
-    TypeScript,
-    /// Go source file (.go)
-    Go,
-    /// Rust source file (.rs)
-    Rust,
-    /// Java source file (.java)
-    Java,
-    /// Compiled Java bytecode (.class)
-    JavaClass,
-    /// Python compiled bytecode (.pyc)
-    PythonBytecode,
-    /// Erlang/Elixir compiled BEAM bytecode (.beam; `FOR1`…`BEAM` IFF container)
-    Beam,
-    /// WebAssembly binary module (.wasm; `\0asm` magic + version). A portable
-    /// bytecode payload — frequently a Go/TinyGo/Rust/Emscripten compile target
-    /// loaded by a JS host. Routed through the generic analyzer so string
-    /// extraction, entropy, and symbol-name traits fire on the embedded
-    /// `syscall/js` imports, struct tags, and rodata.
-    Wasm,
-    /// Dalvik/ART executable bytecode (`dex\n035\0` and later versions).
-    /// APKs carry this as `classes.dex`; a standalone `.dex` is the same
-    /// format, not an APK. There is no competing popular "DEX" file type —
-    /// the name is the format, not a platform qualifier.
-    Dex,
-    /// Java archive (.jar, .war, .ear)
-    Jar,
-    /// Ruby source file (.rb)
-    Ruby,
-    /// PHP source file (.php)
-    Php,
-    /// Perl source file (.pl, .pm)
-    Perl,
-    /// Lua source file (.lua)
-    Lua,
-    /// C# source file (.cs)
-    CSharp,
-    /// PowerShell script (.ps1, .psm1)
-    PowerShell,
-    /// Swift source file (.swift)
-    Swift,
-    /// Objective-C source file (.m, .mm)
-    ObjectiveC,
-    /// Groovy source file (.groovy)
-    Groovy,
-    /// Scala source file (.scala)
-    Scala,
-    /// Kotlin source file (.kt, .kts)
-    Kotlin,
-    /// Zig source file (.zig)
-    Zig,
-    /// Elixir source file (.ex, .exs)
-    Elixir,
-    /// Clojure / ClojureScript / EDN source (.clj, .cljs, .cljc, .cljr, .edn, .bb)
-    Clojure,
-    /// C source file (.c, .h)
-    C,
-    /// npm package.json manifest
-    PackageJson,
-    /// npm package-lock.json lockfile
-    PackageLockJson,
-    /// VSCode extension manifest (.vsixmanifest)
-    VsixManifest,
-    /// Chrome extension manifest.json
-    ChromeManifest,
-    /// Rust Cargo.toml manifest
-    CargoToml,
-    /// Rust Cargo.lock lockfile — pins every crate to an exact version + sha256.
-    CargoLock,
-    /// Python pip requirements file (requirements.txt) — `name==version` pins.
-    RequirementsTxt,
-    /// Python Poetry lockfile (poetry.lock) — resolved package set.
-    PoetryLock,
-    /// Python Pipenv lockfile (Pipfile.lock) — resolved package set with hashes.
-    PipfileLock,
-    /// Ruby Bundler lockfile (Gemfile.lock) — resolved gem set with versions.
-    GemfileLock,
-    /// PHP Composer lockfile (composer.lock) — resolved package set with dists.
-    ComposerLock,
-    /// Yarn lockfile (yarn.lock) — resolved npm package set with integrity.
-    YarnLock,
-    /// pnpm lockfile (pnpm-lock.yaml) — resolved npm package set with integrity.
-    PnpmLock,
-    /// Python pyproject.toml manifest
-    PyProjectToml,
-    /// PHP composer.json manifest
-    ComposerJson,
-    /// Generic JSON document (.json)
-    Json,
-    /// node-gyp build manifest (binding.gyp, .gyp, .gypi). JSON-shaped build
-    /// config; its `<!(...)`/`<!@(...)` command-expansion runs arbitrary shell
-    /// during `node-gyp configure` (npm runs this automatically on install of a
-    /// package containing binding.gyp), a known supply-chain execution vector.
-    Gyp,
-    /// GitHub Actions workflow YAML
-    GithubActions,
-    /// systemd service unit file (.service, .service.d/*.conf)
-    SystemdService,
-    /// freedesktop.org Desktop Entry (.desktop) - XDG application launcher / autostart
-    DesktopEntry,
-    /// Generic XML document (.xml, MSBuild .csproj, SVG, XML config files, etc.)
-    Xml,
-    /// Generic YAML document (.yaml, .yml) that is not one of the specific
-    /// manifests above (a GitHub Actions workflow, a pnpm lockfile). YAML is the
-    /// default configuration language for CI, Kubernetes and model cards, so an
-    /// unrecognized one is worth naming rather than leaving as `unknown`.
-    Yaml,
-    /// Python package metadata (PKG-INFO, METADATA)
-    PkgInfo,
-    /// Arch/AUR generated package metadata (.SRCINFO) — normalized mirror of PKGBUILD
-    SrcInfo,
-    /// Normalized package-registry metadata (`*.registry.json`) — an upstream
-    /// provider's account of a release (publish date, author, downloads,
-    /// rating, deprecation), the serialized form of [`crate::Registry`].
-    Registry,
-    /// Go module manifest (go.mod) — `require` directives are declared dependencies.
-    GoMod,
-    /// Go module checksum database (go.sum) — pins every module to an `h1:` hash.
-    GoSum,
-    /// ZIP archive (zip, apk, ipa, nupkg, etc.)
-    Zip,
-    /// TAR archive (plain, no compression)
-    Tar,
-    /// ASCII CPIO archive (odc, newc, or newc checksum layout).
-    Cpio,
-    /// Gzip-compressed TAR (.tar.gz, .tgz, .crate)
-    TarGz,
-    /// Bzip2-compressed TAR (.tar.bz2, .tbz2)
-    TarBz2,
-    /// XZ-compressed TAR (.tar.xz, .txz)
-    TarXz,
-    /// Zstandard-compressed TAR (.tar.zst, .xbps)
-    TarZst,
-    /// Gzip-compressed single file (.gz, not a tar)
-    Gz,
-    /// Bzip2-compressed single file (.bz2, not a tar)
-    Bz2,
-    /// XZ-compressed single file (.xz, not a tar)
-    Xz,
-    /// LZMA-alone compressed single file (.lzma)
-    Lzma,
-    /// Zstandard-compressed single file (.zst, not a tar)
-    Zst,
-    /// 7-Zip archive (.7z)
-    SevenZ,
-    /// RAR archive (.rar)
-    Rar,
-    /// Debian package (.deb)
-    Deb,
-    /// Unix static library (.a) — an `ar` archive of relocatable object files.
-    /// Shares the `!<arch>` magic with `.deb`; distinguished by the first `ar`
-    /// member (`.deb` leads with `debian-binary`, a static library does not).
-    StaticLib,
-    /// RPM package (.rpm)
-    Rpm,
-    /// macOS installer package (.pkg, XAR format). Named `PkgMacos` (not bare
-    /// `Pkg`) because the `.pkg` extension is ambiguous: FreeBSD and Arch also
-    /// use it for compressed-tar packages, disambiguated by container magic.
-    PkgMacos,
-    /// Apple Disk Image (.dmg, UDIF container).
-    Dmg,
-    /// Optical-disc image (.iso): ISO 9660 and/or UDF filesystem — full OS
-    /// install media. Identified by the volume-descriptor magic at sector 16;
-    /// unpacked downstream by 7-Zip (ISO 9660, Joliet, Rock Ridge, and UDF).
-    Iso,
-    /// SquashFS read-only filesystem image — `hsqs` (little-endian) or `sqsh`
-    /// (big-endian) superblock magic. Ships inside firmware images and appliance
-    /// builds, and is the wire format of a Snap package (see [`FileType::Snap`]).
-    SquashFs,
-    /// Cabinet archive (.cab)
-    Cab,
-    /// Compiled HTML Help (.chm) — Microsoft ITSF/ITOL container with
-    /// LZX-compressed HTML topics. Common malware delivery vector.
-    Chm,
-    /// Chrome extension (.crx)
-    Crx,
-    /// Mozilla Firefox extension (.xpi) — ZIP container with WebExtension or
-    /// legacy XUL layout. Disambiguated from generic ZIP so the XPI-specific
-    /// signing-scheme shape (`META-INF/mozilla.*`, `META-INF/cose.*`) can be
-    /// surfaced.
-    Xpi,
-    /// Python wheel (.whl) — ZIP container with PEP 427 layout. Distinct
-    /// from generic ZIP so the wheel-specific surface (dist-info, RECORD,
-    /// native-extension count, top-level packages) can be extracted.
-    Whl,
-    /// RubyGems package (.gem) — uncompressed `ustar` tar holding
-    /// `metadata.gz` (gzipped `Gem::Specification` YAML), `data.tar.gz`, and
-    /// `checksums.yaml.gz`. Distinct from generic tar so the gem's external
-    /// identity metadata can be surfaced as `gem.*`.
-    Gem,
-    /// Android application package (.apk) — ZIP container (`AndroidManifest.xml`,
-    /// `classes.dex`). Disambiguated from the Alpine `.apk` by container magic
-    /// (`PK` zip vs gzip tar) so each ecosystem gets its own model.
-    ApkAndroid,
-    /// Alpine Linux package (.apk) — gzip-concatenated tar (signature ‖ control
-    /// ‖ data) carrying `.PKGINFO`. Disambiguated from the Android `.apk` by
-    /// container magic (gzip vs `PK` zip).
-    ApkAlpine,
-    /// npm package (.tgz) — gzip tar with everything under a `package/` prefix
-    /// (`package/package.json`). Disambiguated from a generic gzip tar by that
-    /// marker, so npm supply-chain signal (install scripts, bin shims) routes
-    /// to its own model.
-    Npm,
-    /// Rust crate (.crate) — gzip tar laid out as `<name>-<version>/` with a
-    /// `Cargo.toml` at its root. The `.crate` extension is cargo-specific.
-    Crate,
-    /// conda package (.conda) — ZIP holding `metadata.json` plus zstd-compressed
-    /// `info-*`/`pkg-*` tars. Distinct from generic ZIP so conda identity
-    /// (`info/index.json`) routes to its own model.
-    Conda,
-    /// Python egg (.egg) — ZIP with an `EGG-INFO/` directory (`PKG-INFO`).
-    Egg,
-    /// NuGet package (.nupkg) — ZIP carrying a `*.nuspec` manifest.
-    Nupkg,
-    /// iOS application archive (.ipa) — ZIP with `Payload/*.app/Info.plist`.
-    Ipa,
-    /// VS Code / Open VSX extension (.vsix) — ZIP carrying
-    /// `extension.vsixmanifest`. Distinct from the manifest file type
-    /// [`FileType::VsixManifest`], which is that inner XML alone.
-    Vsix,
-    /// FreeBSD package (.pkg) — zstd-compressed tar whose first member is the
-    /// `+COMPACT_MANIFEST` / `+MANIFEST` metadata. Disambiguated from the macOS
-    /// `.pkg` by container magic (zstd-tar vs `xar!`) and from Arch by the
-    /// `+MANIFEST` marker.
-    PkgFreebsd,
-    /// Arch Linux package (.pkg.tar.{zst,xz,gz}) — compressed tar whose first
-    /// member is `.PKGINFO`. Disambiguated from FreeBSD by that marker; the
-    /// `.pkg.tar.*` extension is Arch-specific where the body can't be read.
-    PkgArch,
-    /// Python source distribution (sdist) — gzip tar laid out as
-    /// `<name>-<version>/` with a `PKG-INFO` metadata file at its root.
-    /// Disambiguated from a generic gzip tar by that marker, so the PyPI
-    /// publisher identity (`python.*`) routes to its own model.
-    PythonSdist,
-    /// OCI / Docker container image archive — an (uncompressed) tar carrying
-    /// either an OCI `oci-layout` + `index.json` or a `docker save`
-    /// `manifest.json`. Distinct from a generic tar so image refs and content
-    /// digests can be surfaced as `oci.*`.
-    OciImage,
-    /// Void Linux package (.xbps) — zstd-compressed tar carrying `props.plist`
-    /// metadata. Distinguished from a generic `.tar.zst` by its extension.
-    Xbps,
-    /// Ubuntu Snap package (.snap) — a SquashFS image carrying `meta/snap.yaml`.
-    /// Distinguished from a bare [`FileType::SquashFs`] image by its extension,
-    /// which is the only signal available without reading the filesystem.
-    Snap,
-    /// Flatpak single-file bundle (.flatpak) — an OSTree static delta in GVariant
-    /// framing. Unlike every other package format here it carries no magic at a
-    /// fixed offset and none is registered with `file(1)`, so the extension is
-    /// the identification.
-    Flatpak,
-    /// Gentoo binary package (GLEP 78 `.gpkg.tar`) — an uncompressed tar
-    /// bundling `metadata.tar.*`, `image.tar.*`, and a `Manifest`. Distinct
-    /// from a generic tar by its `.gpkg.tar` extension.
-    GentooBinpkg,
-    /// Electron ASAR application archive (.asar)
-    Asar,
-    /// AppleScript source file (.applescript, .scpt)
-    AppleScript,
-    /// Apple Property List (.plist)
-    Plist,
-    /// Compiled Interface Builder archive (.nib): the object graph AppKit or
-    /// UIKit instantiates for a window or view, in either the `NIBArchive`
-    /// layout or an `NSKeyedArchiver` binary plist. Distinct from `Plist`
-    /// because the graph names the app's own classes, action selectors,
-    /// and Swift modules, which is attribution a plain plist never carries.
-    Nib,
-    /// Xcode project file (`project.pbxproj`) — an OpenStep-style property
-    /// list describing targets, build phases, and build settings. Kept
-    /// distinct from `Plist` because it is the only plist dialect that carries
-    /// executable build scripts, which is what makes it a supply-chain target.
-    Pbxproj,
-    /// CMake build script (`CMakeLists.txt`, `*.cmake`). Its own type rather
-    /// than generic text because it is executable build logic — `execute_process`
-    /// and `add_custom_command` run at configure and build time — so rules that
-    /// target build systems must be able to name it.
-    Cmake,
-    /// Rich Text Format document (.rtf)
-    Rtf,
-    /// Legacy Microsoft Office document (OLE2/CFBF: .doc, .xls, .ppt, .msg)
-    OleDoc,
-    /// Windows Installer package / patch (OLE2/CFBF: .msi, .msp). Same compound
-    /// container as [`OleDoc`](Self::OleDoc), but a distinct product surface (installer tables,
-    /// custom-action binaries, SummaryInformation) — not a document.
-    Msi,
-    /// Modern Microsoft Office document (OOXML: .docx, .xlsx, .pptx)
-    Ooxml,
-    /// Windows Shell Link file (.lnk)
-    Lnk,
-    /// JPEG image
-    Jpeg,
-    /// PNG image
-    Png,
-    /// RIFF audio (`.wav`). Chunked container; see formats/containers.rs.
-    Wav,
-    /// IFF audio (`.aiff`, `.aifc`).
-    Aiff,
-    /// MPEG audio with optional ID3 tags (`.mp3`).
-    Mp3,
-    /// ISO base media (`.mp4`, `.m4a`, `.mov`) — a flat box sequence.
-    Mp4,
-    /// Windows icon or cursor (`.ico`, `.cur`). The favicon every web package
-    /// ships and nobody opens, which is what makes it a carrier.
-    Ico,
-    /// GIF image (`.gif`).
-    Gif,
-    /// Windows bitmap (`.bmp`).
-    Bmp,
-    /// RIFF image (`.webp`).
-    Webp,
-    /// Font container: sfnt (`.ttf`/`.otf`/`.ttc`), WOFF, WOFF2, or EOT.
-    /// One variant for the family because the abuse patterns are shared —
-    /// a payload wearing a font name, or a stowaway in the table gaps —
-    /// and the concrete container is reported as `font.format`.
-    Font,
-    /// SVG image (.svg) — XML-based vector graphic. Unlike raster images it
-    /// is text and can embed `<script>` / event handlers, making it a common
-    /// phishing/HTML-smuggling carrier; classified as media but scanned as XML.
-    Svg,
-    /// Python pickle serialized data (.pkl, .pickle, .joblib)
-    Pickle,
-    /// PDF document
-    Pdf,
-    /// HTML document (.html, .htm)
-    Html,
-    /// JavaServer Pages (`.jsp`, `.jspx`). The page directive is unique to JSP.
-    Jsp,
-    /// Classic ASP and ASP.NET (`.asp`, `.aspx`, and the related suffixes).
-    Asp,
-    /// ColdFusion Markup Language (`.cfm`, `.cfc`, `.cfml`).
-    Cfml,
-    /// TeX or LaTeX source (`.tex`, `.sty`, `.ltx`, `.dtx`). `.cls` is shared
-    /// with Visual Basic, so a class file is TeX only when its body says so.
-    Tex,
-    /// YARA rule source (`.yar`, `.yara`).
-    Yara,
-    /// PostScript or EPS (`.ps`, `.eps`).
-    PostScript,
-    /// DOS COM executable. No header of its own; `INT 21h` (`CD 21`) is the syscall.
-    DosCom,
-    /// Headerless x86 / x86-64 position-independent code, recognised by the
-    /// GetPC idiom it opens with (see `fileid::shellcode`).
-    Shellcode,
-    /// mIRC script (`.mrc`).
-    Mirc,
-    /// ircII or EPIC script. The `^on` / `^alias` hook syntax is the mark.
-    IrcII,
-    /// Markdown document (.md, .markdown)
-    Markdown,
-    /// Makefile / GNU Make build file
-    Makefile,
-    /// Dockerfile — container image build definition
-    Dockerfile,
-    /// OpenDocument Format (.odt, .ods, .odp, .odg) — ZIP-based office documents
-    Odf,
-    /// OpenPGP signature (.sig, .asc) — the detached signature published beside
-    /// a release artifact. Both the ASCII-armored and binary packet forms.
-    /// Provenance evidence rather than payload, and named so a release directory
-    /// does not read as a pile of unknowns.
-    PgpSignature,
-    /// Plain text data (.txt, .text, or printable text with no stronger type)
-    Text,
-    /// Opaque or sidecar data (.dat, .bin, .payload, .raw, and .map) — commonly carries
-    /// encrypted/XOR-d payloads or source-map embedded code. Routed through the generic analyzer
-    /// so string extraction, entropy, and encoded-payload detection still fire.
-    Data,
-    /// File type could not be determined
-    Unknown,
+/// The table generates the enum, [`FileType::label`], [`FileType::from_label`]
+/// (a repeated label is an unreachable-pattern warning), the `group` and
+/// `flags` lookups the predicates read, and, for tests, `FileType::ALL` in
+/// declaration order.
+macro_rules! file_types {
+    (
+        $(#[$meta:meta])*
+        pub enum FileType {
+            $(
+                $(#[doc = $doc:literal])*
+                $variant:ident => $label:literal, $group:ident $(, $flag:ident)*;
+            )+
+        }
+    ) => {
+        $(#[$meta])*
+        pub enum FileType {
+            $(
+                $(#[doc = $doc])*
+                $variant,
+            )+
+        }
+
+        impl FileType {
+            /// Every variant, in declaration order.
+            #[cfg(test)]
+            pub(crate) const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            /// The canonical, stable label for this type — the single nomenclature
+            /// shared by filefacts, cleave (its report `type` field), and scan (its
+            /// routing keys). It is also the serialized form (see the `serde` impls).
+            ///
+            /// The scheme: lowercase throughout; multi-word descriptive types use
+            /// `snake_case`; archive container+compression pairs use the real dotted
+            /// suffix (`tar.gz`); types that *are* a fixed filename use that filename
+            /// (`go.mod`, `package-lock.json`); and universally known short names stay
+            /// short (`elf`, `pe`, `macho`). [`FileType::from_label`] is the inverse.
+            #[must_use]
+            pub const fn label(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $label,)+
+                }
+            }
+
+            /// Parse a [`FileType`] from its canonical [`label`](FileType::label).
+            /// Returns `None` for any string that is not a label — the exact inverse
+            /// of `label`, verified exhaustively by the `label_round_trips` test.
+            #[must_use]
+            pub fn from_label(label: &str) -> Option<Self> {
+                Some(match label {
+                    $($label => Self::$variant,)+
+                    _ => return None,
+                })
+            }
+
+            const fn group(self) -> Group {
+                match self {
+                    $(Self::$variant => Group::$group,)+
+                }
+            }
+
+            const fn flags(self) -> Flags {
+                match self {
+                    $(Self::$variant => Flags(0 $(| Flags::$flag.0)*),)+
+                }
+            }
+        }
+    };
+}
+
+file_types! {
+    /// File format identified by fileid.
+    ///
+    /// Variants cover binary formats, source languages, package manifests, archives,
+    /// and document types. Manifest types (e.g. `PackageJson`, `CargoToml`) are included
+    /// because they require format-specific analysis despite being syntactically JSON/TOML.
+    // Serialization goes through the canonical [`FileType::label`] /
+    // [`FileType::from_label`] pair (see the `impl serde::*` below), not a derived
+    // `rename_all`. That label is the single nomenclature filefacts, cleave, and
+    // scan all share — keeping the serialized form and the report/routing label
+    // the same string instead of two near-identical vocabularies.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[non_exhaustive]
+    pub enum FileType {
+        /// Mach-O binary (macOS/iOS executable or library)
+        MachO => "macho", Binary, BINARY;
+        /// ELF binary (Linux/Unix executable or shared library)
+        Elf => "elf", Binary, BINARY;
+        /// PE binary (Windows executable, DLL)
+        Pe => "pe", Binary, BINARY;
+        /// Windows New Executable (16-bit NE) binary
+        Ne => "ne", Binary, BINARY;
+        /// Unix shell script (bash, sh, zsh, etc.)
+        Shell => "shell", Script, SOURCE_CODE;
+        /// Windows batch file (.bat, .cmd)
+        Batch => "batch", Script;
+        /// IBM z/OS Job Control Language batch script (.jcl)
+        Jcl => "jcl", Script;
+        /// VBScript source file (.vbs, .vbe, .wsf, .wsc)
+        Vbs => "vbs", Script;
+        /// Python source file (.py)
+        Python => "python", Script, SOURCE_CODE;
+        /// JavaScript source file (.js, .mjs, .cjs)
+        JavaScript => "javascript", Script, SOURCE_CODE;
+        /// TypeScript source file (.ts, .tsx)
+        TypeScript => "typescript", Source, SOURCE_CODE;
+        /// Go source file (.go)
+        Go => "go", Source, SOURCE_CODE;
+        /// Rust source file (.rs)
+        Rust => "rust", Source, SOURCE_CODE;
+        /// Java source file (.java)
+        Java => "java", Source, SOURCE_CODE;
+        /// Compiled Java bytecode (.class)
+        JavaClass => "java_class", Binary, BINARY;
+        /// Python compiled bytecode (.pyc)
+        PythonBytecode => "python_bytecode", Binary, BINARY;
+        /// Erlang/Elixir compiled BEAM bytecode (.beam; `FOR1`…`BEAM` IFF container)
+        Beam => "beam", Binary, BINARY;
+        /// WebAssembly binary module (.wasm; `\0asm` magic + version). A portable
+        /// bytecode payload — frequently a Go/TinyGo/Rust/Emscripten compile target
+        /// loaded by a JS host. Routed through the generic analyzer so string
+        /// extraction, entropy, and symbol-name traits fire on the embedded
+        /// `syscall/js` imports, struct tags, and rodata.
+        Wasm => "wasm", Binary, BINARY;
+        /// Dalvik/ART executable bytecode (`dex\n035\0` and later versions).
+        /// APKs carry this as `classes.dex`; a standalone `.dex` is the same
+        /// format, not an APK. There is no competing popular "DEX" file type —
+        /// the name is the format, not a platform qualifier.
+        Dex => "dex", Binary, BINARY;
+        /// Java archive (.jar, .war, .ear)
+        Jar => "jar", Archive;
+        /// Ruby source file (.rb)
+        Ruby => "ruby", Script, SOURCE_CODE;
+        /// PHP source file (.php)
+        Php => "php", Script, SOURCE_CODE;
+        /// Perl source file (.pl, .pm)
+        Perl => "perl", Script, SOURCE_CODE;
+        /// Lua source file (.lua)
+        Lua => "lua", Script, SOURCE_CODE;
+        /// C# source file (.cs)
+        CSharp => "csharp", Source, SOURCE_CODE;
+        /// PowerShell script (.ps1, .psm1)
+        PowerShell => "powershell", Script, SOURCE_CODE;
+        /// Swift source file (.swift)
+        Swift => "swift", Source, SOURCE_CODE;
+        /// Objective-C source file (.m, .mm)
+        ObjectiveC => "objective_c", Source, SOURCE_CODE;
+        /// Groovy source file (.groovy)
+        Groovy => "groovy", Source, SOURCE_CODE;
+        /// Scala source file (.scala)
+        Scala => "scala", Source, SOURCE_CODE;
+        /// Kotlin source file (.kt, .kts)
+        Kotlin => "kotlin", Source, SOURCE_CODE;
+        /// Zig source file (.zig)
+        Zig => "zig", Source, SOURCE_CODE;
+        /// Elixir source file (.ex, .exs)
+        Elixir => "elixir", Source, SOURCE_CODE;
+        /// Clojure / ClojureScript / EDN source (.clj, .cljs, .cljc, .cljr, .edn, .bb)
+        Clojure => "clojure", Source;
+        /// C source file (.c, .h)
+        C => "c", Source, SOURCE_CODE;
+        /// npm package.json manifest
+        PackageJson => "package.json", Config, STRUCTURED_DATA;
+        /// npm package-lock.json lockfile
+        PackageLockJson => "package-lock.json", Config, STRUCTURED_DATA;
+        /// VSCode extension manifest (.vsixmanifest)
+        VsixManifest => "vsix_manifest", Config;
+        /// Chrome extension manifest.json
+        ChromeManifest => "chrome_manifest", Config, STRUCTURED_DATA;
+        /// Rust Cargo.toml manifest
+        CargoToml => "cargo.toml", Config, STRUCTURED_DATA;
+        /// Rust Cargo.lock lockfile — pins every crate to an exact version + sha256.
+        CargoLock => "cargo.lock", Config, STRUCTURED_DATA;
+        /// Python pip requirements file (requirements.txt) — `name==version` pins.
+        RequirementsTxt => "requirements.txt", Config;
+        /// Python Poetry lockfile (poetry.lock) — resolved package set.
+        PoetryLock => "poetry.lock", Config, STRUCTURED_DATA;
+        /// Python Pipenv lockfile (Pipfile.lock) — resolved package set with hashes.
+        PipfileLock => "pipfile.lock", Config, STRUCTURED_DATA;
+        /// Ruby Bundler lockfile (Gemfile.lock) — resolved gem set with versions.
+        GemfileLock => "gemfile.lock", Config;
+        /// PHP Composer lockfile (composer.lock) — resolved package set with dists.
+        ComposerLock => "composer.lock", Config, STRUCTURED_DATA;
+        /// Yarn lockfile (yarn.lock) — resolved npm package set with integrity.
+        YarnLock => "yarn.lock", Config;
+        /// pnpm lockfile (pnpm-lock.yaml) — resolved npm package set with integrity.
+        PnpmLock => "pnpm-lock.yaml", Config, STRUCTURED_DATA;
+        /// Python pyproject.toml manifest
+        PyProjectToml => "pyproject.toml", Config, STRUCTURED_DATA;
+        /// PHP composer.json manifest
+        ComposerJson => "composer.json", Config, STRUCTURED_DATA;
+        /// Generic JSON document (.json)
+        Json => "json", Config;
+        /// node-gyp build manifest (binding.gyp, .gyp, .gypi). JSON-shaped build
+        /// config; its `<!(...)`/`<!@(...)` command-expansion runs arbitrary shell
+        /// during `node-gyp configure` (npm runs this automatically on install of a
+        /// package containing binding.gyp), a known supply-chain execution vector.
+        Gyp => "gyp", Config;
+        /// GitHub Actions workflow YAML
+        GithubActions => "github_actions", Config, STRUCTURED_DATA;
+        /// systemd service unit file (.service, .service.d/*.conf)
+        SystemdService => "systemd_service", Config;
+        /// freedesktop.org Desktop Entry (.desktop) - XDG application launcher / autostart
+        DesktopEntry => "desktop_entry", Config;
+        /// Generic XML document (.xml, MSBuild .csproj, SVG, XML config files, etc.)
+        Xml => "xml", Config;
+        /// Generic YAML document (.yaml, .yml) that is not one of the specific
+        /// manifests above (a GitHub Actions workflow, a pnpm lockfile). YAML is the
+        /// default configuration language for CI, Kubernetes and model cards, so an
+        /// unrecognized one is worth naming rather than leaving as `unknown`.
+        Yaml => "yaml", Config;
+        /// Python package metadata (PKG-INFO, METADATA)
+        PkgInfo => "pkg_info", Config, STRUCTURED_DATA;
+        /// Arch/AUR generated package metadata (.SRCINFO) — normalized mirror of PKGBUILD
+        SrcInfo => "src_info", Config, STRUCTURED_DATA;
+        /// Normalized package-registry metadata (`*.registry.json`) — an upstream
+        /// provider's account of a release (publish date, author, downloads,
+        /// rating, deprecation), the serialized form of [`crate::Registry`].
+        Registry => "registry", Config, STRUCTURED_DATA;
+        /// Go module manifest (go.mod) — `require` directives are declared dependencies.
+        GoMod => "go.mod", Config;
+        /// Go module checksum database (go.sum) — pins every module to an `h1:` hash.
+        GoSum => "go.sum", Config;
+        /// ZIP archive (zip, apk, ipa, nupkg, etc.)
+        Zip => "zip", Archive;
+        /// TAR archive (plain, no compression)
+        Tar => "tar", Archive;
+        /// ASCII CPIO archive (odc, newc, or newc checksum layout).
+        Cpio => "cpio", Archive;
+        /// Gzip-compressed TAR (.tar.gz, .tgz, .crate)
+        TarGz => "tar.gz", Archive;
+        /// Bzip2-compressed TAR (.tar.bz2, .tbz2)
+        TarBz2 => "tar.bz2", Archive;
+        /// XZ-compressed TAR (.tar.xz, .txz)
+        TarXz => "tar.xz", Archive;
+        /// Zstandard-compressed TAR (.tar.zst, .xbps)
+        TarZst => "tar.zst", Archive;
+        /// Gzip-compressed single file (.gz, not a tar)
+        Gz => "gz", Archive;
+        /// Bzip2-compressed single file (.bz2, not a tar)
+        Bz2 => "bz2", Archive;
+        /// XZ-compressed single file (.xz, not a tar)
+        Xz => "xz", Archive;
+        /// LZMA-alone compressed single file (.lzma)
+        Lzma => "lzma", Archive;
+        /// Zstandard-compressed single file (.zst, not a tar)
+        Zst => "zst", Archive;
+        /// 7-Zip archive (.7z)
+        SevenZ => "7z", Archive;
+        /// RAR archive (.rar)
+        Rar => "rar", Archive;
+        /// Debian package (.deb)
+        Deb => "deb", Archive;
+        /// Unix static library (.a) — an `ar` archive of relocatable object files.
+        /// Shares the `!<arch>` magic with `.deb`; distinguished by the first `ar`
+        /// member (`.deb` leads with `debian-binary`, a static library does not).
+        StaticLib => "static-lib", Binary;
+        /// RPM package (.rpm)
+        Rpm => "rpm", Archive;
+        /// macOS installer package (.pkg, XAR format). Named `PkgMacos` (not bare
+        /// `Pkg`) because the `.pkg` extension is ambiguous: FreeBSD and Arch also
+        /// use it for compressed-tar packages, disambiguated by container magic.
+        PkgMacos => "pkg_macos", Archive;
+        /// Apple Disk Image (.dmg, UDIF container).
+        Dmg => "dmg", Archive;
+        /// Optical-disc image (.iso): ISO 9660 and/or UDF filesystem — full OS
+        /// install media. Identified by the volume-descriptor magic at sector 16;
+        /// unpacked downstream by 7-Zip (ISO 9660, Joliet, Rock Ridge, and UDF).
+        Iso => "iso", Archive;
+        /// SquashFS read-only filesystem image — `hsqs` (little-endian) or `sqsh`
+        /// (big-endian) superblock magic. Ships inside firmware images and appliance
+        /// builds, and is the wire format of a Snap package (see [`FileType::Snap`]).
+        SquashFs => "squashfs", Archive;
+        /// Cabinet archive (.cab)
+        Cab => "cab", Archive;
+        /// Compiled HTML Help (.chm) — Microsoft ITSF/ITOL container with
+        /// LZX-compressed HTML topics. Common malware delivery vector.
+        Chm => "chm", Archive;
+        /// Chrome extension (.crx)
+        Crx => "crx", Archive;
+        /// Mozilla Firefox extension (.xpi) — ZIP container with WebExtension or
+        /// legacy XUL layout. Disambiguated from generic ZIP so the XPI-specific
+        /// signing-scheme shape (`META-INF/mozilla.*`, `META-INF/cose.*`) can be
+        /// surfaced.
+        Xpi => "xpi", Archive;
+        /// Python wheel (.whl) — ZIP container with PEP 427 layout. Distinct
+        /// from generic ZIP so the wheel-specific surface (dist-info, RECORD,
+        /// native-extension count, top-level packages) can be extracted.
+        Whl => "whl", Archive;
+        /// RubyGems package (.gem) — uncompressed `ustar` tar holding
+        /// `metadata.gz` (gzipped `Gem::Specification` YAML), `data.tar.gz`, and
+        /// `checksums.yaml.gz`. Distinct from generic tar so the gem's external
+        /// identity metadata can be surfaced as `gem.*`.
+        Gem => "gem", Archive;
+        /// Android application package (.apk) — ZIP container (`AndroidManifest.xml`,
+        /// `classes.dex`). Disambiguated from the Alpine `.apk` by container magic
+        /// (`PK` zip vs gzip tar) so each ecosystem gets its own model.
+        ApkAndroid => "apk_android", Archive;
+        /// Alpine Linux package (.apk) — gzip-concatenated tar (signature ‖ control
+        /// ‖ data) carrying `.PKGINFO`. Disambiguated from the Android `.apk` by
+        /// container magic (gzip vs `PK` zip).
+        ApkAlpine => "apk_alpine", Archive;
+        /// npm package (.tgz) — gzip tar with everything under a `package/` prefix
+        /// (`package/package.json`). Disambiguated from a generic gzip tar by that
+        /// marker, so npm supply-chain signal (install scripts, bin shims) routes
+        /// to its own model.
+        Npm => "npm", Archive;
+        /// Rust crate (.crate) — gzip tar laid out as `<name>-<version>/` with a
+        /// `Cargo.toml` at its root. The `.crate` extension is cargo-specific.
+        Crate => "crate", Archive;
+        /// conda package (.conda) — ZIP holding `metadata.json` plus zstd-compressed
+        /// `info-*`/`pkg-*` tars. Distinct from generic ZIP so conda identity
+        /// (`info/index.json`) routes to its own model.
+        Conda => "conda", Archive;
+        /// Python egg (.egg) — ZIP with an `EGG-INFO/` directory (`PKG-INFO`).
+        Egg => "egg", Archive;
+        /// NuGet package (.nupkg) — ZIP carrying a `*.nuspec` manifest.
+        Nupkg => "nupkg", Archive;
+        /// iOS application archive (.ipa) — ZIP with `Payload/*.app/Info.plist`.
+        Ipa => "ipa", Archive;
+        /// VS Code / Open VSX extension (.vsix) — ZIP carrying
+        /// `extension.vsixmanifest`. Distinct from the manifest file type
+        /// [`FileType::VsixManifest`], which is that inner XML alone.
+        Vsix => "vsix", Archive;
+        /// FreeBSD package (.pkg) — zstd-compressed tar whose first member is the
+        /// `+COMPACT_MANIFEST` / `+MANIFEST` metadata. Disambiguated from the macOS
+        /// `.pkg` by container magic (zstd-tar vs `xar!`) and from Arch by the
+        /// `+MANIFEST` marker.
+        PkgFreebsd => "pkg_freebsd", Archive;
+        /// Arch Linux package (.pkg.tar.{zst,xz,gz}) — compressed tar whose first
+        /// member is `.PKGINFO`. Disambiguated from FreeBSD by that marker; the
+        /// `.pkg.tar.*` extension is Arch-specific where the body can't be read.
+        PkgArch => "pkg_arch", Archive;
+        /// Python source distribution (sdist) — gzip tar laid out as
+        /// `<name>-<version>/` with a `PKG-INFO` metadata file at its root.
+        /// Disambiguated from a generic gzip tar by that marker, so the PyPI
+        /// publisher identity (`python.*`) routes to its own model.
+        PythonSdist => "python_sdist", Archive;
+        /// OCI / Docker container image archive — an (uncompressed) tar carrying
+        /// either an OCI `oci-layout` + `index.json` or a `docker save`
+        /// `manifest.json`. Distinct from a generic tar so image refs and content
+        /// digests can be surfaced as `oci.*`.
+        OciImage => "oci_image", Archive;
+        /// Void Linux package (.xbps) — zstd-compressed tar carrying `props.plist`
+        /// metadata. Distinguished from a generic `.tar.zst` by its extension.
+        Xbps => "xbps", Archive;
+        /// Ubuntu Snap package (.snap) — a SquashFS image carrying `meta/snap.yaml`.
+        /// Distinguished from a bare [`FileType::SquashFs`] image by its extension,
+        /// which is the only signal available without reading the filesystem.
+        Snap => "snap", Archive;
+        /// Flatpak single-file bundle (.flatpak) — an OSTree static delta in GVariant
+        /// framing. Unlike every other package format here it carries no magic at a
+        /// fixed offset and none is registered with `file(1)`, so the extension is
+        /// the identification.
+        Flatpak => "flatpak", Archive;
+        /// Gentoo binary package (GLEP 78 `.gpkg.tar`) — an uncompressed tar
+        /// bundling `metadata.tar.*`, `image.tar.*`, and a `Manifest`. Distinct
+        /// from a generic tar by its `.gpkg.tar` extension.
+        GentooBinpkg => "gentoo_binpkg", Archive;
+        /// Electron ASAR application archive (.asar)
+        Asar => "asar", Archive;
+        /// AppleScript source file (.applescript, .scpt)
+        AppleScript => "applescript", Script;
+        /// Apple Property List (.plist)
+        Plist => "plist", Config, STRUCTURED_DATA;
+        /// Compiled Interface Builder archive (.nib): the object graph AppKit or
+        /// UIKit instantiates for a window or view, in either the `NIBArchive`
+        /// layout or an `NSKeyedArchiver` binary plist. Distinct from `Plist`
+        /// because the graph names the app's own classes, action selectors,
+        /// and Swift modules, which is attribution a plain plist never carries.
+        Nib => "nib", Config, STRUCTURED_DATA;
+        /// Xcode project file (`project.pbxproj`) — an OpenStep-style property
+        /// list describing targets, build phases, and build settings. Kept
+        /// distinct from `Plist` because it is the only plist dialect that carries
+        /// executable build scripts, which is what makes it a supply-chain target.
+        Pbxproj => "pbxproj", Config, STRUCTURED_DATA;
+        /// CMake build script (`CMakeLists.txt`, `*.cmake`). Its own type rather
+        /// than generic text because it is executable build logic — `execute_process`
+        /// and `add_custom_command` run at configure and build time — so rules that
+        /// target build systems must be able to name it.
+        Cmake => "cmake", Config;
+        /// Rich Text Format document (.rtf)
+        Rtf => "rtf", Document;
+        /// Legacy Microsoft Office document (OLE2/CFBF: .doc, .xls, .ppt, .msg)
+        OleDoc => "ole_doc", Document;
+        /// Windows Installer package / patch (OLE2/CFBF: .msi, .msp). Same compound
+        /// container as [`OleDoc`](Self::OleDoc), but a distinct product surface (installer tables,
+        /// custom-action binaries, SummaryInformation) — not a document.
+        // Installer packages share the OLE2/CFBF wire format with OleDoc but
+        // are not documents — treat them as archive-class for mismatch
+        // transitions (e.g. an MSI renamed `.doc` is archive→document).
+        Msi => "msi", Archive;
+        /// Modern Microsoft Office document (OOXML: .docx, .xlsx, .pptx)
+        Ooxml => "ooxml", Document;
+        /// Windows Shell Link file (.lnk)
+        Lnk => "lnk", Binary;
+        /// JPEG image
+        Jpeg => "jpeg", Image;
+        /// PNG image
+        Png => "png", Image;
+        /// RIFF audio (`.wav`). Chunked container; see formats/containers.rs.
+        Wav => "wav", Audio;
+        /// IFF audio (`.aiff`, `.aifc`).
+        Aiff => "aiff", Audio;
+        /// MPEG audio with optional ID3 tags (`.mp3`).
+        Mp3 => "mp3", Audio;
+        /// ISO base media (`.mp4`, `.m4a`, `.mov`) — a flat box sequence.
+        Mp4 => "mp4", Video;
+        /// Windows icon or cursor (`.ico`, `.cur`). The favicon every web package
+        /// ships and nobody opens, which is what makes it a carrier.
+        Ico => "ico", Image;
+        /// GIF image (`.gif`).
+        Gif => "gif", Image;
+        /// Windows bitmap (`.bmp`).
+        Bmp => "bmp", Image;
+        /// RIFF image (`.webp`).
+        Webp => "webp", Image;
+        /// Font container: sfnt (`.ttf`/`.otf`/`.ttc`), WOFF, WOFF2, or EOT.
+        /// One variant for the family because the abuse patterns are shared —
+        /// a payload wearing a font name, or a stowaway in the table gaps —
+        /// and the concrete container is reported as `font.format`.
+        Font => "font", Font;
+        /// SVG image (.svg) — XML-based vector graphic. Unlike raster images it
+        /// is text and can embed `<script>` / event handlers, making it a common
+        /// phishing/HTML-smuggling carrier; classified as media but scanned as XML.
+        Svg => "svg", Image;
+        /// Python pickle serialized data (.pkl, .pickle, .joblib)
+        Pickle => "pickle", Data;
+        /// PDF document
+        Pdf => "pdf", Document;
+        /// HTML document (.html, .htm)
+        Html => "html", Text, UNSUPPORTED;
+        /// JavaServer Pages (`.jsp`, `.jspx`). The page directive is unique to JSP.
+        Jsp => "jsp", Script;
+        /// Classic ASP and ASP.NET (`.asp`, `.aspx`, and the related suffixes).
+        Asp => "asp", Script;
+        /// ColdFusion Markup Language (`.cfm`, `.cfc`, `.cfml`).
+        Cfml => "cfml", Script;
+        /// TeX or LaTeX source (`.tex`, `.sty`, `.ltx`, `.dtx`). `.cls` is shared
+        /// with Visual Basic, so a class file is TeX only when its body says so.
+        Tex => "tex", Text;
+        /// YARA rule source (`.yar`, `.yara`).
+        // A detection ruleset, not prose. A `.yar` renamed `.txt` is
+        // config→text; it is not the same kind of file as a note.
+        Yara => "yara", Config;
+        /// PostScript or EPS (`.ps`, `.eps`).
+        PostScript => "postscript", Document;
+        /// DOS COM executable. No header of its own; `INT 21h` (`CD 21`) is the syscall.
+        DosCom => "dos_com", Binary, BINARY;
+        /// Headerless x86 / x86-64 position-independent code, recognised by the
+        /// GetPC idiom it opens with (see `fileid::shellcode`).
+        Shellcode => "shellcode", Binary, BINARY;
+        /// mIRC script (`.mrc`).
+        Mirc => "mirc", Script;
+        /// ircII or EPIC script. The `^on` / `^alias` hook syntax is the mark.
+        IrcII => "ircii", Script;
+        /// Markdown document (.md, .markdown)
+        Markdown => "markdown", Text, UNSUPPORTED;
+        /// Makefile / GNU Make build file
+        Makefile => "makefile", Config;
+        /// Dockerfile — container image build definition
+        Dockerfile => "dockerfile", Config;
+        /// OpenDocument Format (.odt, .ods, .odp, .odg) — ZIP-based office documents
+        Odf => "odf", Document, UNSUPPORTED;
+        /// OpenPGP signature (.sig, .asc) — the detached signature published beside
+        /// a release artifact. Both the ASCII-armored and binary packet forms.
+        /// Provenance evidence rather than payload, and named so a release directory
+        /// does not read as a pile of unknowns.
+        PgpSignature => "pgp_signature", Data;
+        /// Plain text data (.txt, .text, or printable text with no stronger type)
+        Text => "text", Text;
+        /// Opaque or sidecar data (.dat, .bin, .payload, .raw, and .map) — commonly carries
+        /// encrypted/XOR-d payloads or source-map embedded code. Routed through the generic analyzer
+        /// so string extraction, entropy, and encoded-payload detection still fire.
+        Data => "data", Data;
+        /// File type could not be determined
+        Unknown => "unknown", Data, UNSUPPORTED;
+    }
 }
 
 impl FileType {
@@ -764,10 +755,7 @@ impl FileType {
     /// plain text and opaque data.
     #[must_use]
     pub fn is_program(&self) -> bool {
-        !matches!(
-            self,
-            Self::Unknown | Self::Html | Self::Markdown | Self::Odf
-        )
+        !self.flags().contains(Flags::UNSUPPORTED)
     }
 
     /// Returns true if this file type is an archive or compressed container
@@ -775,75 +763,17 @@ impl FileType {
     ///
     /// This is narrower than the `"archive"` group: Flatpak bundles group as
     /// archives for extension-mismatch purposes but stay opaque, because no
-    /// walker reads their OSTree delta framing yet.
+    /// walker reads their OSTree delta framing yet. Windows Installer packages
+    /// group there too, and are read as OLE2 storage rather than walked.
     #[must_use]
     pub fn is_archive(&self) -> bool {
-        matches!(
-            self,
-            Self::Zip
-                | Self::Tar
-                | Self::Cpio
-                | Self::TarGz
-                | Self::TarBz2
-                | Self::TarXz
-                | Self::TarZst
-                | Self::Gz
-                | Self::Bz2
-                | Self::Xz
-                | Self::Lzma
-                | Self::Zst
-                | Self::SevenZ
-                | Self::Rar
-                | Self::Deb
-                | Self::Rpm
-                | Self::PkgMacos
-                | Self::Dmg
-                | Self::Iso
-                | Self::Cab
-                | Self::Chm
-                | Self::Crx
-                | Self::Xpi
-                | Self::Whl
-                | Self::Gem
-                | Self::ApkAndroid
-                | Self::ApkAlpine
-                | Self::Npm
-                | Self::Crate
-                | Self::Conda
-                | Self::Egg
-                | Self::Nupkg
-                | Self::Ipa
-                | Self::Vsix
-                | Self::PkgFreebsd
-                | Self::PkgArch
-                | Self::PythonSdist
-                | Self::OciImage
-                | Self::Xbps
-                | Self::GentooBinpkg
-                | Self::Asar
-                | Self::Jar
-                | Self::Snap
-                | Self::SquashFs
-        )
+        self.group() == Group::Archive && !matches!(self, Self::Flatpak | Self::Msi)
     }
 
     /// Returns true if this file type is a compiled native binary.
     #[must_use]
     pub fn is_binary(&self) -> bool {
-        matches!(
-            self,
-            Self::Elf
-                | Self::Pe
-                | Self::Ne
-                | Self::MachO
-                | Self::JavaClass
-                | Self::PythonBytecode
-                | Self::Beam
-                | Self::Wasm
-                | Self::Dex
-                | Self::DosCom
-                | Self::Shellcode
-        )
+        self.flags().contains(Flags::BINARY)
     }
 
     /// Returns true if cleave supports analysis of this file type. Currently
@@ -857,30 +787,7 @@ impl FileType {
     /// Returns true if this file type represents source code with AST support.
     #[must_use]
     pub fn is_source_code(&self) -> bool {
-        matches!(
-            self,
-            Self::Python
-                | Self::Ruby
-                | Self::JavaScript
-                | Self::TypeScript
-                | Self::Php
-                | Self::Perl
-                | Self::Lua
-                | Self::CSharp
-                | Self::C
-                | Self::Rust
-                | Self::Shell
-                | Self::PowerShell
-                | Self::Kotlin
-                | Self::Java
-                | Self::Go
-                | Self::Swift
-                | Self::ObjectiveC
-                | Self::Groovy
-                | Self::Scala
-                | Self::Zig
-                | Self::Elixir
-        )
+        self.flags().contains(Flags::SOURCE_CODE)
     }
 
     /// Returns true for structured-manifest formats whose entire content is
@@ -893,359 +800,7 @@ impl FileType {
     /// size-limited and intentionally fall back to a text scan when skipped.
     #[must_use]
     pub fn is_structured_data(&self) -> bool {
-        matches!(
-            self,
-            Self::PackageJson
-                | Self::PackageLockJson
-                | Self::ComposerJson
-                | Self::ChromeManifest
-                | Self::CargoToml
-                | Self::CargoLock
-                | Self::PoetryLock
-                | Self::PipfileLock
-                | Self::ComposerLock
-                | Self::PnpmLock
-                | Self::PyProjectToml
-                | Self::GithubActions
-                | Self::Plist
-                | Self::Nib
-                | Self::Pbxproj
-                | Self::PkgInfo
-                | Self::SrcInfo
-                | Self::Registry
-        )
-    }
-
-    /// The canonical, stable label for this type — the single nomenclature
-    /// shared by filefacts, cleave (its report `type` field), and scan (its
-    /// routing keys). It is also the serialized form (see the `serde` impls).
-    ///
-    /// The scheme: lowercase throughout; multi-word descriptive types use
-    /// `snake_case`; archive container+compression pairs use the real dotted
-    /// suffix (`tar.gz`); types that *are* a fixed filename use that filename
-    /// (`go.mod`, `package-lock.json`); and universally known short names stay
-    /// short (`elf`, `pe`, `macho`). [`FileType::from_label`] is the inverse.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            // Native binaries / bytecode.
-            Self::MachO => "macho",
-            Self::Elf => "elf",
-            Self::Pe => "pe",
-            Self::Ne => "ne",
-            Self::JavaClass => "java_class",
-            Self::PythonBytecode => "python_bytecode",
-            Self::Beam => "beam",
-            Self::Wasm => "wasm",
-            Self::Dex => "dex",
-            // Source / scripts.
-            Self::Shell => "shell",
-            Self::Batch => "batch",
-            Self::Jcl => "jcl",
-            Self::Vbs => "vbs",
-            Self::Python => "python",
-            Self::JavaScript => "javascript",
-            Self::TypeScript => "typescript",
-            Self::Go => "go",
-            Self::Rust => "rust",
-            Self::Java => "java",
-            Self::Ruby => "ruby",
-            Self::Php => "php",
-            Self::Perl => "perl",
-            Self::Lua => "lua",
-            Self::CSharp => "csharp",
-            Self::PowerShell => "powershell",
-            Self::Swift => "swift",
-            Self::ObjectiveC => "objective_c",
-            Self::Groovy => "groovy",
-            Self::Scala => "scala",
-            Self::Kotlin => "kotlin",
-            Self::Zig => "zig",
-            Self::Elixir => "elixir",
-            Self::Clojure => "clojure",
-            Self::C => "c",
-            Self::AppleScript => "applescript",
-            Self::Makefile => "makefile",
-            Self::Dockerfile => "dockerfile",
-            // Manifests / lockfiles — fixed filenames keep their filename;
-            // descriptive ones are snake_case.
-            Self::PackageJson => "package.json",
-            Self::PackageLockJson => "package-lock.json",
-            Self::ComposerJson => "composer.json",
-            Self::ComposerLock => "composer.lock",
-            Self::CargoToml => "cargo.toml",
-            Self::CargoLock => "cargo.lock",
-            Self::PyProjectToml => "pyproject.toml",
-            Self::RequirementsTxt => "requirements.txt",
-            Self::PoetryLock => "poetry.lock",
-            Self::PipfileLock => "pipfile.lock",
-            Self::GemfileLock => "gemfile.lock",
-            Self::YarnLock => "yarn.lock",
-            Self::PnpmLock => "pnpm-lock.yaml",
-            Self::GoMod => "go.mod",
-            Self::GoSum => "go.sum",
-            Self::Gyp => "gyp",
-            Self::GithubActions => "github_actions",
-            Self::SystemdService => "systemd_service",
-            Self::DesktopEntry => "desktop_entry",
-            Self::PkgInfo => "pkg_info",
-            Self::SrcInfo => "src_info",
-            Self::VsixManifest => "vsix_manifest",
-            Self::ChromeManifest => "chrome_manifest",
-            Self::Registry => "registry",
-            Self::Json => "json",
-            Self::Xml => "xml",
-            Self::Yaml => "yaml",
-            Self::Plist => "plist",
-            Self::Nib => "nib",
-            Self::Pbxproj => "pbxproj",
-            Self::Cmake => "cmake",
-            Self::Svg => "svg",
-            Self::Html => "html",
-            Self::Jsp => "jsp",
-            Self::Asp => "asp",
-            Self::Cfml => "cfml",
-            Self::Tex => "tex",
-            Self::Yara => "yara",
-            Self::PostScript => "postscript",
-            Self::DosCom => "dos_com",
-            Self::Shellcode => "shellcode",
-            Self::Mirc => "mirc",
-            Self::IrcII => "ircii",
-            Self::Markdown => "markdown",
-            Self::PgpSignature => "pgp_signature",
-            Self::Text => "text",
-            Self::Data => "data",
-            Self::Unknown => "unknown",
-            // Archive containers and compression.
-            Self::Zip => "zip",
-            Self::Tar => "tar",
-            Self::Cpio => "cpio",
-            Self::TarGz => "tar.gz",
-            Self::TarBz2 => "tar.bz2",
-            Self::TarXz => "tar.xz",
-            Self::TarZst => "tar.zst",
-            Self::Gz => "gz",
-            Self::Bz2 => "bz2",
-            Self::Xz => "xz",
-            Self::Lzma => "lzma",
-            Self::Zst => "zst",
-            Self::SevenZ => "7z",
-            Self::Rar => "rar",
-            Self::Cab => "cab",
-            Self::SquashFs => "squashfs",
-            Self::Asar => "asar",
-            Self::Jar => "jar",
-            // Packages.
-            Self::Deb => "deb",
-            Self::StaticLib => "static-lib",
-            Self::Rpm => "rpm",
-            Self::Dmg => "dmg",
-            Self::Iso => "iso",
-            Self::Chm => "chm",
-            Self::Crx => "crx",
-            Self::Xpi => "xpi",
-            Self::Whl => "whl",
-            Self::Gem => "gem",
-            Self::Npm => "npm",
-            Self::Crate => "crate",
-            Self::Conda => "conda",
-            Self::Egg => "egg",
-            Self::Nupkg => "nupkg",
-            Self::Ipa => "ipa",
-            Self::Vsix => "vsix",
-            Self::Xbps => "xbps",
-            Self::Snap => "snap",
-            Self::Flatpak => "flatpak",
-            Self::ApkAndroid => "apk_android",
-            Self::ApkAlpine => "apk_alpine",
-            Self::PkgMacos => "pkg_macos",
-            Self::PkgFreebsd => "pkg_freebsd",
-            Self::PkgArch => "pkg_arch",
-            Self::PythonSdist => "python_sdist",
-            Self::OciImage => "oci_image",
-            Self::GentooBinpkg => "gentoo_binpkg",
-            // Documents / media.
-            Self::Rtf => "rtf",
-            Self::OleDoc => "ole_doc",
-            Self::Msi => "msi",
-            Self::Ooxml => "ooxml",
-            Self::Lnk => "lnk",
-            Self::Jpeg => "jpeg",
-            Self::Png => "png",
-            Self::Font => "font",
-            Self::Wav => "wav",
-            Self::Aiff => "aiff",
-            Self::Mp3 => "mp3",
-            Self::Mp4 => "mp4",
-            Self::Ico => "ico",
-            Self::Gif => "gif",
-            Self::Bmp => "bmp",
-            Self::Webp => "webp",
-            Self::Pdf => "pdf",
-            Self::Pickle => "pickle",
-            Self::Odf => "odf",
-        }
-    }
-
-    /// Parse a [`FileType`] from its canonical [`label`](FileType::label).
-    /// Returns `None` for any string that is not a label — the exact inverse
-    /// of `label`, verified exhaustively by the `label_round_trips` test.
-    #[must_use]
-    pub fn from_label(label: &str) -> Option<Self> {
-        Some(match label {
-            "macho" => Self::MachO,
-            "elf" => Self::Elf,
-            "pe" => Self::Pe,
-            "ne" => Self::Ne,
-            "java_class" => Self::JavaClass,
-            "python_bytecode" => Self::PythonBytecode,
-            "beam" => Self::Beam,
-            "wasm" => Self::Wasm,
-            "dex" => Self::Dex,
-            "shell" => Self::Shell,
-            "batch" => Self::Batch,
-            "jcl" => Self::Jcl,
-            "vbs" => Self::Vbs,
-            "python" => Self::Python,
-            "javascript" => Self::JavaScript,
-            "typescript" => Self::TypeScript,
-            "go" => Self::Go,
-            "rust" => Self::Rust,
-            "java" => Self::Java,
-            "ruby" => Self::Ruby,
-            "php" => Self::Php,
-            "perl" => Self::Perl,
-            "lua" => Self::Lua,
-            "csharp" => Self::CSharp,
-            "powershell" => Self::PowerShell,
-            "swift" => Self::Swift,
-            "objective_c" => Self::ObjectiveC,
-            "groovy" => Self::Groovy,
-            "scala" => Self::Scala,
-            "kotlin" => Self::Kotlin,
-            "zig" => Self::Zig,
-            "elixir" => Self::Elixir,
-            "clojure" => Self::Clojure,
-            "c" => Self::C,
-            "applescript" => Self::AppleScript,
-            "makefile" => Self::Makefile,
-            "dockerfile" => Self::Dockerfile,
-            "package.json" => Self::PackageJson,
-            "package-lock.json" => Self::PackageLockJson,
-            "composer.json" => Self::ComposerJson,
-            "composer.lock" => Self::ComposerLock,
-            "cargo.toml" => Self::CargoToml,
-            "cargo.lock" => Self::CargoLock,
-            "pyproject.toml" => Self::PyProjectToml,
-            "requirements.txt" => Self::RequirementsTxt,
-            "poetry.lock" => Self::PoetryLock,
-            "pipfile.lock" => Self::PipfileLock,
-            "gemfile.lock" => Self::GemfileLock,
-            "yarn.lock" => Self::YarnLock,
-            "pnpm-lock.yaml" => Self::PnpmLock,
-            "go.mod" => Self::GoMod,
-            "go.sum" => Self::GoSum,
-            "gyp" => Self::Gyp,
-            "github_actions" => Self::GithubActions,
-            "systemd_service" => Self::SystemdService,
-            "desktop_entry" => Self::DesktopEntry,
-            "pkg_info" => Self::PkgInfo,
-            "src_info" => Self::SrcInfo,
-            "vsix_manifest" => Self::VsixManifest,
-            "chrome_manifest" => Self::ChromeManifest,
-            "registry" => Self::Registry,
-            "json" => Self::Json,
-            "xml" => Self::Xml,
-            "yaml" => Self::Yaml,
-            "plist" => Self::Plist,
-            "nib" => Self::Nib,
-            "pbxproj" => Self::Pbxproj,
-            "cmake" => Self::Cmake,
-            "svg" => Self::Svg,
-            "html" => Self::Html,
-            "jsp" => Self::Jsp,
-            "asp" => Self::Asp,
-            "cfml" => Self::Cfml,
-            "tex" => Self::Tex,
-            "yara" => Self::Yara,
-            "postscript" => Self::PostScript,
-            "dos_com" => Self::DosCom,
-            "shellcode" => Self::Shellcode,
-            "mirc" => Self::Mirc,
-            "ircii" => Self::IrcII,
-            "markdown" => Self::Markdown,
-            "pgp_signature" => Self::PgpSignature,
-            "text" => Self::Text,
-            "data" => Self::Data,
-            "unknown" => Self::Unknown,
-            "zip" => Self::Zip,
-            "tar" => Self::Tar,
-            "cpio" => Self::Cpio,
-            "tar.gz" => Self::TarGz,
-            "tar.bz2" => Self::TarBz2,
-            "tar.xz" => Self::TarXz,
-            "tar.zst" => Self::TarZst,
-            "gz" => Self::Gz,
-            "bz2" => Self::Bz2,
-            "xz" => Self::Xz,
-            "lzma" => Self::Lzma,
-            "zst" => Self::Zst,
-            "7z" => Self::SevenZ,
-            "rar" => Self::Rar,
-            "cab" => Self::Cab,
-            "squashfs" => Self::SquashFs,
-            "asar" => Self::Asar,
-            "jar" => Self::Jar,
-            "deb" => Self::Deb,
-            "static-lib" => Self::StaticLib,
-            "rpm" => Self::Rpm,
-            "dmg" => Self::Dmg,
-            "iso" => Self::Iso,
-            "chm" => Self::Chm,
-            "crx" => Self::Crx,
-            "xpi" => Self::Xpi,
-            "whl" => Self::Whl,
-            "gem" => Self::Gem,
-            "npm" => Self::Npm,
-            "crate" => Self::Crate,
-            "conda" => Self::Conda,
-            "egg" => Self::Egg,
-            "nupkg" => Self::Nupkg,
-            "ipa" => Self::Ipa,
-            "vsix" => Self::Vsix,
-            "xbps" => Self::Xbps,
-            "snap" => Self::Snap,
-            "flatpak" => Self::Flatpak,
-            "apk_android" => Self::ApkAndroid,
-            "apk_alpine" => Self::ApkAlpine,
-            "pkg_macos" => Self::PkgMacos,
-            "pkg_freebsd" => Self::PkgFreebsd,
-            "pkg_arch" => Self::PkgArch,
-            "python_sdist" => Self::PythonSdist,
-            "oci_image" => Self::OciImage,
-            "gentoo_binpkg" => Self::GentooBinpkg,
-            "rtf" => Self::Rtf,
-            "ole_doc" => Self::OleDoc,
-            "msi" => Self::Msi,
-            "ooxml" => Self::Ooxml,
-            "lnk" => Self::Lnk,
-            "jpeg" => Self::Jpeg,
-            "png" => Self::Png,
-            "font" => Self::Font,
-            "wav" => Self::Wav,
-            "aiff" => Self::Aiff,
-            "mp3" => Self::Mp3,
-            "mp4" => Self::Mp4,
-            "ico" => Self::Ico,
-            "gif" => Self::Gif,
-            "bmp" => Self::Bmp,
-            "webp" => Self::Webp,
-            "pdf" => Self::Pdf,
-            "pickle" => Self::Pickle,
-            "odf" => Self::Odf,
-            _ => return None,
-        })
+        self.flags().contains(Flags::STRUCTURED_DATA)
     }
 }
 
@@ -1510,10 +1065,10 @@ fn strip_utf8_bom(data: &[u8]) -> &[u8] {
 /// A leading tag. Used when the extension is a variant letter (`.sc`, `.ex`)
 /// rather than a claim that the body is that language.
 fn leading_markup(data: &[u8]) -> bool {
-    let n = data.len().min(32);
-    let rest = data[..n].trim_ascii_start();
+    let rest = data.get(..32).unwrap_or(data).trim_ascii_start();
     let starts = |prefix: &[u8]| {
-        rest.len() >= prefix.len() && rest[..prefix.len()].eq_ignore_ascii_case(prefix)
+        rest.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
     };
     starts(b"<script")
         || starts(b"<html")
@@ -1550,36 +1105,35 @@ fn ex_variant_override(path: &Path, data: &[u8]) -> Option<FileType> {
 }
 
 fn leading_batch(data: &[u8]) -> bool {
-    let n = data.len().min(80);
-    let rest = data[..n].trim_ascii_start();
-    if rest.len() < 5 || !rest[..5].eq_ignore_ascii_case(b"@echo") {
+    let rest = data.get(..80).unwrap_or(data).trim_ascii_start();
+    if !rest
+        .get(..5)
+        .is_some_and(|head| head.eq_ignore_ascii_case(b"@echo"))
+    {
         return false;
     }
-    let line_end = rest
-        .iter()
-        .position(|b| *b == b'\n' || *b == b'\r')
-        .unwrap_or(rest.len());
-    rest[..line_end]
-        .windows(3)
-        .any(|w| w.eq_ignore_ascii_case(b"off"))
+    let line = rest
+        .split(|b| *b == b'\n' || *b == b'\r')
+        .next()
+        .unwrap_or(rest);
+    line.windows(3).any(|w| w.eq_ignore_ascii_case(b"off"))
 }
 
 fn utf16le_markup(data: &[u8]) -> bool {
     let Some(rest) = data.strip_prefix(b"\xff\xfe") else {
         return false;
     };
+    let (units, _) = rest.as_chunks::<2>();
     let mut text = [0u8; 16];
     let mut n = 0;
-    let mut i = 0;
-    while i + 1 < rest.len() && n < text.len() {
-        if rest[i + 1] != 0 {
+    for (slot, &[lo, hi]) in text.iter_mut().zip(units) {
+        if hi != 0 {
             return false;
         }
-        text[n] = rest[i];
+        *slot = lo;
         n += 1;
-        i += 2;
     }
-    leading_markup(&text[..n])
+    leading_markup(text.get(..n).unwrap_or_default())
 }
 
 /// `.txt` / `.text` claim prose. They are listed as data formats so a note
@@ -1665,10 +1219,9 @@ fn is_benign_extension_mismatch(path: &Path, data: &[u8], det: Detection) -> boo
     };
     let content = det.file_type;
     let name_ends_ci = |suffix: &str| {
-        path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-            n.len() >= suffix.len()
-                && n.as_bytes()[n.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
-        })
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| ext::ends_with_ci(n.as_bytes(), suffix.as_bytes()))
     };
     // `.exe` is shared by the older 16-bit Windows NE format and PE. The
     // extension database resolves it to PE, but NE content is a valid `.exe`.
@@ -1711,8 +1264,8 @@ fn is_benign_extension_mismatch(path: &Path, data: &[u8], det: Detection) -> boo
     }
     // XHTML served with a `.html` extension but parsed as XML.
     if ext_type == FileType::Html && content == FileType::Xml {
-        let n = data.len().min(4096);
-        let prefix = String::from_utf8_lossy(&data[..n]).to_ascii_lowercase();
+        let head = data.get(..4096).unwrap_or(data);
+        let prefix = String::from_utf8_lossy(head).to_ascii_lowercase();
         return prefix.contains("<!doctype html") || prefix.contains("<html");
     }
     false
@@ -3691,6 +3244,21 @@ Coordinate with the Applet Maintainer before sweeping changes.\n";
     }
 
     #[test]
+    fn recognizes_obfuscated_rtf_object_with_malformed_header() {
+        let sample = include_bytes!("../../tests/fixtures/rtf/obfuscated-object.sample");
+        assert_detect("document.unknown", sample, FileType::Rtf);
+        assert_eq!(
+            magic::detect_from_content(Path::new("document.unknown"), sample),
+            Some((FileType::Rtf, DetectionSource::Heuristic))
+        );
+        assert_eq!(
+            magic::detect_from_content(Path::new("document.unknown"), b"{\\rt some text \\object"),
+            None,
+            "a lone object marker must not make arbitrary text an RTF document"
+        );
+    }
+
+    #[test]
     fn ole_doc_magic() {
         let mut data = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
         data.extend_from_slice(&[0; 100]);
@@ -4617,183 +4185,14 @@ function wpcf7_special_mail_tag( $output, $name, $html ) {
         assert_eq!(det.file_type, FileType::Json);
     }
 
-    /// Expands a list of [`FileType`] variants to an array of them, and to a
-    /// wildcard-free `match` over the same list, so leaving a variant out is a
-    /// compile error rather than a gap in what the tests cover.
-    macro_rules! every_file_type {
-        ($($variant:ident),+ $(,)?) => {{
-            const fn _exhaustive(ft: FileType) {
-                match ft {
-                    $(FileType::$variant)|+ => {}
-                }
-            }
-            [$(FileType::$variant),+]
-        }};
-    }
-
-    /// Every [`FileType`] variant, in declaration order.
-    const ALL_FILE_TYPES: &[FileType] = &every_file_type![
-        MachO,
-        Elf,
-        Pe,
-        Ne,
-        Shell,
-        Batch,
-        Jcl,
-        Vbs,
-        Python,
-        JavaScript,
-        TypeScript,
-        Go,
-        Rust,
-        Java,
-        JavaClass,
-        PythonBytecode,
-        Beam,
-        Wasm,
-        Dex,
-        Jar,
-        Ruby,
-        Php,
-        Perl,
-        Lua,
-        CSharp,
-        PowerShell,
-        Swift,
-        ObjectiveC,
-        Groovy,
-        Scala,
-        Kotlin,
-        Zig,
-        Elixir,
-        Clojure,
-        C,
-        PackageJson,
-        PackageLockJson,
-        VsixManifest,
-        ChromeManifest,
-        CargoToml,
-        CargoLock,
-        RequirementsTxt,
-        PoetryLock,
-        PipfileLock,
-        GemfileLock,
-        ComposerLock,
-        YarnLock,
-        PnpmLock,
-        PyProjectToml,
-        ComposerJson,
-        Json,
-        Gyp,
-        GithubActions,
-        SystemdService,
-        DesktopEntry,
-        Xml,
-        Yaml,
-        PkgInfo,
-        SrcInfo,
-        Registry,
-        GoMod,
-        GoSum,
-        Zip,
-        Tar,
-        Cpio,
-        TarGz,
-        TarBz2,
-        TarXz,
-        TarZst,
-        Gz,
-        Bz2,
-        Xz,
-        Lzma,
-        Zst,
-        SevenZ,
-        Rar,
-        Deb,
-        StaticLib,
-        Rpm,
-        PkgMacos,
-        Dmg,
-        Iso,
-        SquashFs,
-        Cab,
-        Chm,
-        Crx,
-        Xpi,
-        Whl,
-        Gem,
-        ApkAndroid,
-        ApkAlpine,
-        Npm,
-        Crate,
-        Conda,
-        Egg,
-        Nupkg,
-        Ipa,
-        Vsix,
-        PkgFreebsd,
-        PkgArch,
-        PythonSdist,
-        OciImage,
-        Xbps,
-        Snap,
-        Flatpak,
-        GentooBinpkg,
-        Asar,
-        AppleScript,
-        Plist,
-        Nib,
-        Pbxproj,
-        Cmake,
-        Rtf,
-        OleDoc,
-        Msi,
-        Ooxml,
-        Lnk,
-        Jpeg,
-        Png,
-        Wav,
-        Aiff,
-        Mp3,
-        Mp4,
-        Ico,
-        Gif,
-        Bmp,
-        Webp,
-        Font,
-        Svg,
-        Pickle,
-        Pdf,
-        Html,
-        Jsp,
-        Asp,
-        Cfml,
-        Tex,
-        Yara,
-        PostScript,
-        DosCom,
-        Shellcode,
-        Mirc,
-        IrcII,
-        Markdown,
-        Makefile,
-        Dockerfile,
-        Odf,
-        PgpSignature,
-        Text,
-        Data,
-        Unknown,
-    ];
-
-    /// Every variant's label is unique and round-trips through `from_label`,
-    /// so the two hand-written matches can never silently drift apart.
-    /// [`ALL_FILE_TYPES`] cannot miss a variant, and `label` itself is a
-    /// wildcard-free match, so every variant is checked.
+    /// Every variant's label is unique and round-trips through `from_label`.
+    /// Both come from the one `file_types!` table, and [`FileType::ALL`] is
+    /// generated from it too, so every variant is checked.
     #[test]
     fn label_round_trips() {
         use std::collections::HashSet;
         let mut seen = HashSet::new();
-        for &ft in ALL_FILE_TYPES {
+        for &ft in FileType::ALL {
             let label = ft.label();
             assert!(seen.insert(label), "duplicate label {label:?}");
             assert_eq!(

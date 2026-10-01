@@ -161,18 +161,15 @@ fn analysis_script(
 
 /// A PE image whose COFF machine field is i386 (0x14c) or x86-64 (0x8664).
 fn is_pe_x86(bytes: &[u8]) -> bool {
-    if bytes.len() < 0x40 || &bytes[..2] != b"MZ" {
+    if !bytes.starts_with(b"MZ") {
         return false;
     }
-    let e_lfanew =
-        u32::from_le_bytes([bytes[0x3c], bytes[0x3d], bytes[0x3e], bytes[0x3f]]) as usize;
-    let Some(pe) = bytes.get(e_lfanew..e_lfanew + 6) else {
-        return false;
-    };
-    if &pe[..4] != b"PE\0\0" {
-        return false;
-    }
-    matches!(u16::from_le_bytes([pe[4], pe[5]]), 0x014c | 0x8664)
+    crate::bytes::u32_le(bytes, 0x3c)
+        .and_then(|e_lfanew| bytes.get(e_lfanew as usize..))
+        .is_some_and(|nt| {
+            nt.starts_with(b"PE\0\0")
+                && matches!(crate::bytes::u16_le(nt, 4), Some(0x014c | 0x8664))
+        })
 }
 
 // ---------------------------------------------------------------------------

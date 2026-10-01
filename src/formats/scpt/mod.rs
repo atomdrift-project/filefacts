@@ -77,7 +77,9 @@ pub(super) fn extract(
     // script may carry a `#!/usr/bin/osascript` line ahead of its magic; the
     // parser skips it, so only the gate needs to look past it.
     let body = match bytes.strip_prefix(b"#!") {
-        Some(rest) => memchr::memchr(b'\n', rest).map_or(&[][..], |nl| &rest[nl + 1..]),
+        Some(rest) => memchr::memchr(b'\n', rest)
+            .and_then(|nl| rest.get(nl + 1..))
+            .unwrap_or_default(),
         None => bytes,
     };
     if !body.starts_with(b"Fasd") {

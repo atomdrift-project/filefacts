@@ -49,7 +49,7 @@ use crate::error::Error;
 use crate::fileid::FileType;
 use crate::output::{ExtractedString, MetricKey, Metrics, Strings, Values};
 
-use langs::QueryKind;
+use langs::{Lang, QueryKind};
 use serde_json::Value as JsonValue;
 
 pub(crate) use parse::{TreeCache, TreeParse, TreeSitterDiagnostic};
@@ -123,7 +123,7 @@ pub(super) fn extract(
         .query(QueryKind::Imports)
         .map(|query| collect_imports(query, source, root))
         .unwrap_or_default();
-    if config.name == "rust" {
+    if config.lang == Lang::Rust {
         imports.items = rust_syntax::imports(root, source);
     }
     let functions = config
@@ -150,7 +150,7 @@ pub(super) fn extract(
     // Import metrics — feed the canonical language name so stdlib
     // classification works.
     let import_refs: Vec<&str> = imports.items.iter().map(|(n, _)| n.as_str()).collect();
-    import_metrics::emit(&import_refs, config.name, metrics);
+    import_metrics::emit(&import_refs, config.lang, metrics);
 
     // Function metrics — single AST walk over function-definition nodes.
     let total_lines = source.lines().count() as u32;
@@ -211,9 +211,9 @@ pub(super) fn extract(
 
     values.insert(
         "source.language",
-        JsonValue::String(config.name.to_string()),
+        JsonValue::String(config.name().to_string()),
     );
-    payload_flow::emit(root, source, config.name, values);
+    payload_flow::emit(root, source, config.lang, values);
 
     Ok(())
 }
@@ -230,7 +230,7 @@ pub(crate) fn build_symbols(
     let source = cache.source();
     let root = cache.tree().root_node();
     ast_walk::walk(root, source, config, symbols_out, metrics);
-    if config.name == "rust" {
+    if config.lang == Lang::Rust {
         rust_syntax::resolve_calls(symbols_out);
     }
 }
@@ -303,7 +303,7 @@ fn is_protocolless_url_argument(
     source: &str,
     config: &langs::LangConfig,
 ) -> bool {
-    if config.name != "powershell"
+    if config.lang != Lang::PowerShell
         || node.kind() != "generic_token"
         || parent_kind != "command_elements"
     {
@@ -356,7 +356,7 @@ fn decode_string_literal(
     config: &langs::LangConfig,
 ) -> Option<String> {
     let raw = node.utf8_text(source.as_bytes()).ok()?;
-    if config.name == "elixir" && (raw.starts_with("\"\"\"") || raw.starts_with("'''")) {
+    if config.lang == Lang::Elixir && (raw.starts_with("\"\"\"") || raw.starts_with("'''")) {
         return escapes::decode_elixir_heredoc(raw);
     }
     let quoted = raw.trim_start_matches(is_string_prefix);
@@ -632,15 +632,11 @@ fn qualify_relative_member(node: Node<'_>, cleaned: String, source: &str) -> Str
 }
 
 fn strip_quotes(s: &str) -> String {
-    let bytes = s.as_bytes();
-    if bytes.len() >= 2 {
-        let first = bytes[0];
-        let last = bytes[bytes.len() - 1];
-        if first == last && matches!(first, b'"' | b'\'' | b'`') {
-            return std::str::from_utf8(&bytes[1..bytes.len() - 1])
-                .unwrap_or(s)
-                .to_string();
-        }
+    if let [first, inner @ .., last] = s.as_bytes()
+        && first == last
+        && matches!(first, b'"' | b'\'' | b'`')
+    {
+        return std::str::from_utf8(inner).unwrap_or(s).to_string();
     }
     s.to_string()
 }
