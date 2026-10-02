@@ -8,10 +8,12 @@
 //! layout (heading pills, grouped metrics, columnar section / symbol
 //! tables) inspired by sibling tools cleave and litmus.
 
-// Use jemalloc on unix systems where it isn't the OS default (see Cargo.toml).
-// Built-in `--features jemalloc-prof` activates jemalloc's heap-profiling support
+// Use jemalloc on unix systems where it isn't the OS default (see Cargo.toml),
+// unless built without the default `jemalloc` feature. Built-in
+// `--features jemalloc-prof` activates jemalloc's heap-profiling support
 // (`_RJEM_MALLOC_CONF=prof:true,...`) which cleave-tuna's memory-mode benches consume.
 #[cfg(all(
+    feature = "jemalloc",
     unix,
     not(any(
         target_os = "freebsd",
@@ -34,10 +36,16 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// the `_RJEM_MALLOC_CONF` environment variable still takes precedence, so
 /// heap-profiling builds keep working unchanged.
 ///
-/// `unsafe(export_name)` carries no runtime unsafety — it only places the
-/// symbol where jemalloc's option parser looks for it. Scoped allow per the
-/// Cargo.toml `unsafe_code = "deny"` rationale.
+/// SAFETY: jemalloc declares the symbol `const char *_rjem_malloc_conf` and
+/// reads it as a NUL-terminated C string. `Option<&'static [u8; N]>` has the
+/// layout of a nullable pointer (the null-pointer optimisation guarantees
+/// it), and the reference's provenance covers every byte jemalloc reads, up
+/// to and including the terminator. `export_name` is unsafe only because a
+/// symbol of the wrong type would be undefined behaviour; these two are the
+/// invariants that make it the right one. Scoped allow per the Cargo.toml
+/// `unsafe_code = "deny"` rationale.
 #[cfg(all(
+    feature = "jemalloc",
     unix,
     not(any(
         target_os = "freebsd",
@@ -50,7 +58,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 ))]
 #[allow(unsafe_code, non_upper_case_globals)]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-pub static malloc_conf: Option<&'static u8> = Some(&b"dirty_decay_ms:0\0"[0]);
+pub static malloc_conf: Option<&'static [u8; 17]> = Some(b"dirty_decay_ms:0\0");
 
 use std::borrow::Cow;
 use std::ffi::OsString;
@@ -159,6 +167,8 @@ fn bundled_views() -> impl Iterator<Item = (View, &'static str)> {
 }
 
 fn main() -> ExitCode {
+    install_debug_logging();
+    install_signal_cleanup();
     let args = match parse_args(std::env::args_os().skip(1), |p| {
         std::fs::symlink_metadata(p).is_ok()
     }) {
@@ -196,6 +206,52 @@ fn main() -> ExitCode {
     let mut out = io::BufWriter::new(io::stdout().lock());
     exit_code(run(&mut out, root, &args, &options))
 }
+
+/// Print the library's `tracing` diagnostics to stderr when `FILEFACTS_DEBUG`
+/// is set (any value except empty, `0` or `false`). The generic `DEBUG` is
+/// deliberately not honoured: other tools read it, and it must not make this
+/// one chatty.
+fn install_debug_logging() {
+    if debug_requested(std::env::var_os("FILEFACTS_DEBUG").as_deref()) {
+        let _ = tracing_subscriber::fmt()
+            .with_writer(io::stderr)
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .try_init();
+    }
+}
+
+/// Whether a `FILEFACTS_DEBUG` value turns debug output on.
+fn debug_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false")))
+}
+
+/// On SIGINT, SIGTERM or SIGHUP, kill in-flight rizin process groups and
+/// delete their temp inputs, then exit `128 + signal` like a shell would.
+/// rizin runs in its own process group, so the terminal's SIGINT never
+/// reaches it, and on macOS — which has no parent-death signal — it would
+/// otherwise outlive this process. A dedicated thread does the work, since
+/// the reaper locks and allocates (see `kill_all_rizin_groups`).
+#[cfg(unix)]
+fn install_signal_cleanup() {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let Ok(mut signals) = signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP]) else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("filefacts-signals".into())
+        .spawn(move || {
+            if let Some(signal) = signals.forever().next() {
+                filefacts::rizin::kill_all_rizin_groups();
+                std::process::exit(128 + signal);
+            }
+        });
+}
+
+/// Windows: rizin's job object is closed, killing it, when this process
+/// exits, so the default Ctrl-C handling already cleans up.
+#[cfg(not(unix))]
+fn install_signal_cleanup() {}
 
 /// Exit status for a run: `Ok(false)` means some file failed and was
 /// reported; `Err` means stdout itself failed.
@@ -264,8 +320,15 @@ fn analyze_one(
     args: &Args,
     options: &OpenOptions<'_>,
 ) -> io::Result<bool> {
-    let bytes = match std::fs::read(path) {
+    // A FIFO or device given as the path is refused rather than read
+    // forever, and an input past the cap is refused rather than read into an
+    // out-of-memory abort.
+    let bytes = match filefacts::read_input(path, filefacts::MAX_INPUT_BYTES) {
         Ok(b) => b,
+        Err(filefacts::Error::Io { source, .. }) => {
+            eprintln!("filefacts: cannot read {}: {source}", shown(path));
+            return Ok(false);
+        }
         Err(e) => {
             eprintln!("filefacts: cannot read {}: {e}", shown(path));
             return Ok(false);
@@ -752,6 +815,10 @@ fn is_empty_value(value: &Value) -> bool {
 
 // ─── file header ────────────────────────────────────────────────────
 
+/// Metrics the header reads; a test pins both to the catalog.
+const FILE_SIZE: &str = "file.size";
+const FILE_ENTROPY: &str = "file.entropy";
+
 fn render_file_header(
     path: &std::path::Path,
     parsed: &filefacts::ParsedFile<'_>,
@@ -766,13 +833,13 @@ fn render_file_header(
     out.push_str(&pill_bg(&ft, ft_color));
 
     // Subtitle: size · entropy · mismatch
-    let size = parsed
-        .metrics()
-        .get_key(&filefacts::metric!("file.size"))
-        .unwrap_or(0.0) as u64;
-    let entropy = parsed
-        .metrics()
-        .get_key(&filefacts::metric!("file.entropy"));
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "float-to-int `as` saturates (NaN is 0); file.size is a non-negative count"
+    )]
+    let size = parsed.metrics().get(FILE_SIZE).unwrap_or(0.0) as u64;
+    let entropy = parsed.metrics().get(FILE_ENTROPY);
     let mut subtitle = Vec::<String>::new();
     subtitle.push(fg(FG_LABEL, &humanize_bytes(size)));
     if let Some(e) = entropy {
@@ -1008,6 +1075,13 @@ fn metric_group(key: &str) -> &str {
     key
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "float-to-int `as` saturates (NaN is 0) and this only formats a metric for \
+              display; the suffixes matched are metric-key segments, not file extensions"
+)]
 fn format_metric_value(key: &str, raw: f64) -> String {
     // Heuristics: booleans-as-numbers (0.0/1.0 for has_overlay etc.)
     // render compactly; sizes get byte-humanised; ratios/entropies
@@ -1296,11 +1370,9 @@ fn format_hex(n: u64) -> String {
 }
 
 fn format_section_flags(flags: &[&str]) -> String {
-    let r = flags.iter().any(|f| *f == "readable" || *f == "read");
-    let w = flags.iter().any(|f| *f == "writable" || *f == "write");
-    let x = flags
-        .iter()
-        .any(|f| *f == "executable" || *f == "execinstr");
+    let r = flags.contains(&"readable");
+    let w = flags.contains(&"writable");
+    let x = flags.contains(&"executable");
     let perms = format!(
         "{}{}{}",
         if r { fg(FG_FLAG_READ, "r") } else { dim("-") },
@@ -1311,12 +1383,7 @@ fn format_section_flags(flags: &[&str]) -> String {
     let extras: Vec<&str> = flags
         .iter()
         .copied()
-        .filter(|f| {
-            !matches!(
-                *f,
-                "readable" | "read" | "writable" | "write" | "executable" | "execinstr"
-            )
-        })
+        .filter(|f| !matches!(*f, "readable" | "writable" | "executable"))
         .collect();
     if extras.is_empty() {
         perms
@@ -1329,9 +1396,16 @@ fn format_section_flags(flags: &[&str]) -> String {
 
 const IMPORTS_PREVIEW_PER_LIB: usize = 24;
 
+/// An import row: name, file offset, ordinal.
+type ImportRow<'a> = (&'a str, Option<u64>, Option<u32>);
+/// An export row: name, file offset, ordinal, forwarder.
+type ExportRow<'a> = (&'a str, Option<u64>, Option<u32>, Option<&'a str>);
+/// A function row: name, file offset, complexity, callees.
+type FunctionRow<'a> = (&'a str, Option<u64>, Option<u32>, &'a [String]);
+
 fn render_imports(symbols: &[&Symbol]) -> String {
     // Group by library.
-    let mut by_lib: std::collections::BTreeMap<&str, Vec<(&str, Option<u64>, Option<u32>)>> =
+    let mut by_lib: std::collections::BTreeMap<&str, Vec<ImportRow<'_>>> =
         std::collections::BTreeMap::new();
     for symbol in symbols {
         let Symbol::Import {
@@ -1391,7 +1465,7 @@ fn render_imports(symbols: &[&Symbol]) -> String {
 const EXPORTS_PREVIEW_LIMIT: usize = 80;
 
 fn render_exports(symbols: &[&Symbol]) -> String {
-    let exports: Vec<(&str, Option<u64>, Option<u32>, Option<&str>)> = symbols
+    let exports: Vec<ExportRow<'_>> = symbols
         .iter()
         .filter_map(|symbol| match symbol {
             Symbol::Export {
@@ -1447,7 +1521,7 @@ fn render_exports(symbols: &[&Symbol]) -> String {
 const FUNCTIONS_PREVIEW_LIMIT: usize = 60;
 
 fn render_functions(symbols: &[&Symbol]) -> String {
-    let functions: Vec<(&str, Option<u64>, Option<u32>, &[String])> = symbols
+    let functions: Vec<FunctionRow<'_>> = symbols
         .iter()
         .filter_map(|symbol| match symbol {
             Symbol::Function {
@@ -1751,6 +1825,16 @@ mod tests {
 
     const SOURCE: &[u8] = b"import os  # fetch\nos.system('curl http://example.invalid/x')\n";
 
+    /// The header's metric names must be ones the library can emit, or the
+    /// header silently shows nothing after a rename.
+    #[test]
+    fn header_metrics_are_in_the_catalog() {
+        let (catalog, _) = filefacts::known_metrics();
+        for key in [FILE_SIZE, FILE_ENTROPY] {
+            assert!(catalog.contains(&key), "{key} is not a cataloged metric");
+        }
+    }
+
     #[test]
     fn every_view_is_reachable_by_name_and_flag() {
         let help = usage();
@@ -1770,6 +1854,17 @@ mod tests {
                 assert_eq!(args.path.as_deref(), Some(Path::new("x")), "{words:?}");
             }
         }
+    }
+
+    #[test]
+    fn only_explicit_on_values_enable_debug_output() {
+        use std::ffi::OsStr;
+        assert!(debug_requested(Some(OsStr::new("1"))));
+        assert!(debug_requested(Some(OsStr::new("yes"))));
+        for off in ["", "0", "false", "FALSE"] {
+            assert!(!debug_requested(Some(OsStr::new(off))), "{off:?}");
+        }
+        assert!(!debug_requested(None));
     }
 
     #[test]

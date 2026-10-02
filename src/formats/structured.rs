@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Map, Value as JsonValue};
 use serde_saphyr::budget::{Budget, EnforcingPolicy, check_yaml_budget};
 use serde_saphyr::granit_parser::{
-    Event, Options as ParserOptions, Parser, ScalarStyle, Span, Tag,
+    Event, Options as ParserOptions, Parser, ScalarStyle, ScanError, Span, Tag,
 };
 
 use crate::error::Error;
@@ -28,8 +28,8 @@ pub(crate) const GENERIC_JSON_PARSE_LIMIT_BYTES: usize = 75 * 1024;
 /// content's top-level keys (when the root is an object) or wrap the
 /// non-object root under `value` (when it isn't).
 pub(super) fn extract_json(bytes: &[u8], values: &mut Values) -> Result<(), Error> {
-    let parsed: JsonValue = serde_json::from_slice(bytes)
-        .map_err(|e| Error::malformed_with_source("json", e.to_string(), e))?;
+    let parsed: JsonValue =
+        serde_json::from_slice(bytes).map_err(|e| Error::malformed_caused_by("json", e))?;
     promote_root(parsed, values);
     Ok(())
 }
@@ -151,7 +151,7 @@ pub(super) fn extract_gyp(
 /// several documents is malformed here, since the single-tree `Values` view
 /// has no place for the others.
 pub(super) fn extract_yaml(bytes: &[u8], values: &mut Values) -> Result<(), Error> {
-    let json = parse_yaml(bytes).map_err(|e| Error::malformed("yaml", e))?;
+    let json = parse_yaml(bytes)?;
     promote_root(json, values);
     Ok(())
 }
@@ -159,10 +159,10 @@ pub(super) fn extract_yaml(bytes: &[u8], values: &mut Values) -> Result<(), Erro
 /// Parse the bytes as TOML.
 pub(super) fn extract_toml(bytes: &[u8], values: &mut Values) -> Result<(), Error> {
     let text = std::str::from_utf8(bytes)
-        .map_err(|e| Error::malformed_with_source("toml", format!("input is not utf-8: {e}"), e))?;
+        .map_err(|e| Error::malformed_with_source("toml", "input is not utf-8", e))?;
     let parsed: toml::Value = text
         .parse()
-        .map_err(|e: toml::de::Error| Error::malformed_with_source("toml", e.to_string(), e))?;
+        .map_err(|e: toml::de::Error| Error::malformed_caused_by("toml", e))?;
     let json = toml_to_json(parsed);
     promote_root(json, values);
     Ok(())
@@ -170,12 +170,57 @@ pub(super) fn extract_toml(bytes: &[u8], values: &mut Values) -> Result<(), Erro
 
 /// Parse the bytes as an Apple Property List (XML or binary form).
 pub(super) fn extract_plist(bytes: &[u8], values: &mut Values) -> Result<(), Error> {
-    let cursor = std::io::Cursor::new(bytes);
-    let parsed: plist::Value = plist::Value::from_reader(cursor)
-        .map_err(|e| Error::malformed_with_source("plist", e.to_string(), e))?;
-    let json = plist_to_json(parsed);
+    let json = parse_plist(bytes)?;
     promote_root(json, values);
     Ok(())
+}
+
+/// Nesting cap for plists; see [`plist_guard`](super::plist_guard).
+#[cfg(test)]
+const PLIST_MAX_DEPTH: usize = super::plist_guard::MAX_DEPTH;
+
+/// Parse a plist (XML, binary or ASCII) into the JSON tree `values` holds,
+/// through [`plist_guard::parse`](super::plist_guard::parse), which refuses
+/// reference expansion and nesting the conversion below could not survive.
+pub(super) fn parse_plist(bytes: &[u8]) -> Result<JsonValue, Error> {
+    let parsed = super::plist_guard::parse(bytes).map_err(|e| e.into_error("plist"))?;
+    Ok(plist_to_json(parsed))
+}
+
+/// Convert a plist tree already checked by `plist_guard::parse`.
+fn plist_to_json(value: plist::Value) -> JsonValue {
+    use plist::Value as P;
+    match value {
+        P::String(s) => JsonValue::String(s),
+        P::Integer(i) => i
+            .as_signed()
+            .map(|n| JsonValue::Number(n.into()))
+            .or_else(|| i.as_unsigned().map(|u| JsonValue::Number(u.into())))
+            .unwrap_or(JsonValue::Null),
+        P::Real(f) => serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number),
+        P::Boolean(b) => JsonValue::Bool(b),
+        P::Date(d) => JsonValue::String(d.to_xml_format()),
+        P::Data(bytes) => JsonValue::String(base64_encode(&bytes)),
+        // A keyed-archive object reference, which only the binary form can
+        // encode. Spelled the way `plutil -convert xml1` spells it so a rule
+        // written against either form of the same archive matches both.
+        P::Uid(uid) => {
+            let mut obj = Map::new();
+            obj.insert("CF$UID".to_string(), JsonValue::Number(uid.get().into()));
+            JsonValue::Object(obj)
+        }
+        P::Array(arr) => JsonValue::Array(arr.into_iter().map(plist_to_json).collect()),
+        P::Dictionary(dict) => {
+            let mut obj = Map::new();
+            for (k, v) in dict {
+                obj.insert(k, plist_to_json(v));
+            }
+            JsonValue::Object(obj)
+        }
+        // `plist::Value` is `#[non_exhaustive]`. Round-trip unknown
+        // variants as null rather than panic.
+        _ => JsonValue::Null,
+    }
 }
 
 /// Parse PKG-INFO / METADATA format (RFC 822-style headers).
@@ -184,9 +229,8 @@ pub(super) fn extract_plist(bytes: &[u8], values: &mut Values) -> Result<(), Err
 /// array. Continuation lines (starting with whitespace) append to the
 /// previous header's value.
 pub(super) fn extract_pkginfo(bytes: &[u8], values: &mut Values) -> Result<(), Error> {
-    let text = std::str::from_utf8(bytes).map_err(|e| {
-        Error::malformed_with_source("pkginfo", format!("input is not utf-8: {e}"), e)
-    })?;
+    let text = std::str::from_utf8(bytes)
+        .map_err(|e| Error::malformed_with_source("pkginfo", "input is not utf-8", e))?;
     let mut root: Map<String, JsonValue> = Map::new();
     let mut last_key: Option<String> = None;
 
@@ -306,13 +350,13 @@ enum Yaml {
 /// The input is untrusted. serde-saphyr's budget check bounds depth and the
 /// counts of events, nodes, anchors and aliases before anything is built,
 /// and errors name a line and column without quoting the input.
-pub(super) fn parse_yaml(bytes: &[u8]) -> Result<JsonValue, String> {
-    let text = std::str::from_utf8(bytes).map_err(|e| format!("input is not UTF-8: {e}"))?;
+pub(super) fn parse_yaml(bytes: &[u8]) -> Result<JsonValue, YamlError> {
+    let text = std::str::from_utf8(bytes).map_err(YamlError::NotUtf8)?;
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let report = check_yaml_budget(text, yaml_budget(text.len()), EnforcingPolicy::AllContent)
-        .map_err(|e| e.to_string())?;
+        .map_err(YamlError::Scan)?;
     if let Some(breach) = report.breached {
-        return Err(format!("YAML budget exceeded: {breach:?}"));
+        return Err(format!("YAML budget exceeded: {breach:?}").into());
     }
     let events = first_document(text)?;
     if events.is_empty() {
@@ -351,15 +395,65 @@ fn yaml_budget(input_len: usize) -> Budget {
     budget
 }
 
+/// Why [`parse_yaml`] rejected a document.
+#[derive(Debug)]
+pub(super) enum YamlError {
+    /// The input is not UTF-8.
+    NotUtf8(std::str::Utf8Error),
+    /// The scanner, or the budget check running it, rejected the input.
+    Scan(ScanError),
+    /// A filefacts limit or resolution rule rejected the document; the text
+    /// says which and where.
+    Rejected(String),
+}
+
+impl From<String> for YamlError {
+    fn from(message: String) -> Self {
+        Self::Rejected(message)
+    }
+}
+
+impl std::fmt::Display for YamlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotUtf8(e) => write!(f, "input is not UTF-8: {e}"),
+            Self::Scan(e) => e.fmt(f),
+            Self::Rejected(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for YamlError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotUtf8(e) => Some(e),
+            Self::Scan(e) => Some(e),
+            Self::Rejected(_) => None,
+        }
+    }
+}
+
+impl From<YamlError> for Error {
+    /// The scanner's error, when there is one, is kept as the source so a
+    /// caller can inspect it rather than parse the message.
+    fn from(e: YamlError) -> Self {
+        match e {
+            YamlError::NotUtf8(source) => Error::malformed_caused_by("yaml", source),
+            YamlError::Scan(source) => Error::malformed_caused_by("yaml", source),
+            YamlError::Rejected(_) => Error::malformed("yaml", e.to_string()),
+        }
+    }
+}
+
 /// The node events of the stream's only document. A second document is an
 /// error, as it was for serde_yaml.
-fn first_document(text: &str) -> Result<Vec<(Event<'_>, Span)>, String> {
+fn first_document(text: &str) -> Result<Vec<(Event<'_>, Span)>, YamlError> {
     let mut options = ParserOptions::default();
     options.emit_comments = false;
     let mut events = Vec::new();
     let mut documents = 0;
     for item in Parser::new_from_str_with_options(text, options) {
-        let (event, span) = item.map_err(|e| e.to_string())?;
+        let (event, span) = item.map_err(YamlError::Scan)?;
         match event {
             Event::DocumentStart(..) => {
                 documents += 1;
@@ -367,7 +461,8 @@ fn first_document(text: &str) -> Result<Vec<(Event<'_>, Span)>, String> {
                     return Err(format!(
                         "more than one YAML document at line {}",
                         span.start.line()
-                    ));
+                    )
+                    .into());
                 }
             }
             Event::StreamStart | Event::StreamEnd | Event::DocumentEnd | Event::Comment(..) => {}
@@ -997,41 +1092,6 @@ fn toml_to_json(value: toml::Value) -> JsonValue {
             }
             JsonValue::Object(obj)
         }
-    }
-}
-
-fn plist_to_json(value: plist::Value) -> JsonValue {
-    use plist::Value as P;
-    match value {
-        P::String(s) => JsonValue::String(s),
-        P::Integer(i) => i
-            .as_signed()
-            .map(|n| JsonValue::Number(n.into()))
-            .or_else(|| i.as_unsigned().map(|u| JsonValue::Number(u.into())))
-            .unwrap_or(JsonValue::Null),
-        P::Real(f) => serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number),
-        P::Boolean(b) => JsonValue::Bool(b),
-        P::Date(d) => JsonValue::String(d.to_xml_format()),
-        P::Data(bytes) => JsonValue::String(base64_encode(&bytes)),
-        // A keyed-archive object reference, which only the binary form can
-        // encode. Spelled the way `plutil -convert xml1` spells it so a rule
-        // written against either form of the same archive matches both.
-        P::Uid(uid) => {
-            let mut obj = Map::new();
-            obj.insert("CF$UID".to_string(), JsonValue::Number(uid.get().into()));
-            JsonValue::Object(obj)
-        }
-        P::Array(arr) => JsonValue::Array(arr.into_iter().map(plist_to_json).collect()),
-        P::Dictionary(dict) => {
-            let mut obj = Map::new();
-            for (k, v) in dict {
-                obj.insert(k, plist_to_json(v));
-            }
-            JsonValue::Object(obj)
-        }
-        // `plist::Value` is `#[non_exhaustive]`. Round-trip unknown
-        // variants as null rather than panic.
-        _ => JsonValue::Null,
     }
 }
 

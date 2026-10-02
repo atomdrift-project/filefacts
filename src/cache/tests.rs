@@ -455,3 +455,39 @@ fn touch_lru_leaves_a_recent_entry() {
         "an entry used within the window is not rewritten"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn enforce_limits_does_not_descend_into_a_symlinked_shard() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let outside = tempfile::tempdir().expect("outside");
+    // An old `.bin` file outside the cache, reachable only through a link
+    // that sits where a shard would.
+    let victim = entry_with_mtime(
+        outside.path(),
+        "not-ours.bin",
+        SystemTime::now() - MAX_AGE - Duration::from_secs(3600),
+    );
+    std::os::unix::fs::symlink(outside.path(), tmp.path().join("ab")).expect("symlink");
+    enforce_limits_in(tmp.path(), 0, 0);
+    assert!(
+        victim.exists(),
+        "a file behind a symlinked shard is not evicted"
+    );
+}
+
+#[test]
+fn load_refuses_an_entry_that_decodes_past_the_cap() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("bomb.bin");
+    // A few hundred bytes of zstd that expand to 1 MiB of JSON.
+    let json = serde_json::to_vec(&"a".repeat(1 << 20)).expect("json");
+    fs::write(&path, zstd::encode_all(&json[..], 19).expect("zstd")).expect("write");
+    assert!(fs::metadata(&path).expect("meta").len() < 64 * 1024);
+    assert_eq!(load_capped::<String>(&path, 64 * 1024), None);
+    // The same entry decodes when the cap allows it.
+    assert_eq!(
+        load_capped::<String>(&path, 2 << 20).map(|s| s.len()),
+        Some(1 << 20)
+    );
+}

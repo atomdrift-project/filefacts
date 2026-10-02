@@ -18,8 +18,9 @@
 //! a size cap and native-arch slicing travel with each
 //! [`crate::ParsedFile`]. What stays process-wide here is what has to: the
 //! live process-group registry [`kill_all_rizin_groups`](crate::rizin::kill_all_rizin_groups)
-//! reaps from a signal handler, the [`stats`](crate::rizin::stats) counters, the binary discovery, and the latch that
-//! turns rizin off for good after too many abandoned output readers.
+//! reaps from a signal-handling thread, the [`stats`](crate::rizin::stats)
+//! counters, the binary discovery, and the latch that turns rizin off for good
+//! after too many abandoned output readers.
 //!
 //! # Subprocess discipline
 //!
@@ -30,15 +31,16 @@
 //! `radare2/mod.rs` and ports across as #75c.
 
 use crate::metric;
-use std::path::Path;
-use std::process::Command;
+use std::io::{self, Read as _, Write as _};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::output::Metrics;
+use crate::output::{Metrics, SectionFlag};
 
 /// Default hard cap on a single Rizin run. `aaa` analysis on a heavily
 /// stripped ~14 MB Linux binary needed ~85 s in real measurement, while large
@@ -247,8 +249,16 @@ impl Settings {
 /// Live rizin process-group IDs. Populated on spawn, drained in every
 /// cleanup path. `kill_all_rizin_groups` reads this list and SIGKILLs
 /// every entry so host CLI signal handlers can reap in-flight rizin
-/// subprocesses before a forced `process::exit`.
+/// subprocesses before a forced `process::exit`. An entry is removed before
+/// its leader is reaped, so the registry never names a group whose id the
+/// kernel could already have handed to an unrelated process.
 static RIZIN_PGIDS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+/// Temp copies of the inputs live rizin runs are reading. Each is deleted by
+/// its run's [`tempfile::TempPath`]; the registry exists for
+/// [`kill_all_rizin_groups`], whose caller is about to `process::exit` and so
+/// never runs those destructors.
+static RIZIN_TEMP_INPUTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// Drain threads abandoned after [`DRAIN_GRACE`] (see `join_drain`). Non-zero
 /// means some process outside our reach held a copy of a rizin stdout pipe.
@@ -256,8 +266,12 @@ static RIZIN_DRAINS_ABANDONED: AtomicU64 = AtomicU64::new(0);
 
 /// Latched by `join_drain` once [`RIZIN_MAX_ABANDONED_DRAINS`] readers have
 /// been abandoned: rizin then stays off for the rest of the process, whatever
-/// a file's [`Settings`] ask for. Process-wide because the leak it stops is:
-/// every abandoned reader is a parked thread of this process. Never cleared.
+/// a file's [`Settings`] ask for.
+///
+/// A deliberate process-wide circuit breaker, not configuration: the leak it
+/// stops belongs to the process — every abandoned reader is a parked thread
+/// of this process, whichever file's settings spawned it — so no per-open
+/// setting could bound it. Never cleared.
 static RIZIN_SELF_DISABLED: AtomicBool = AtomicBool::new(false);
 
 /// Abandoned drains after which rizin disables itself for the rest of the
@@ -282,66 +296,92 @@ const RIZIN_MAX_ABANDONED_DRAINS: u64 = 8;
 /// price of a wait loop that cannot be suspended.
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Statistics (total, successes, timeouts, failures, memory_exceeded).
+/// Cumulative counters behind [`stats`].
 static RIZIN_TOTAL: AtomicU64 = AtomicU64::new(0);
 static RIZIN_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 static RIZIN_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static RIZIN_FAILURES: AtomicU64 = AtomicU64::new(0);
-static RIZIN_MEMORY_EXCEEDED: AtomicU64 = AtomicU64::new(0);
+static RIZIN_OUTPUT_CAP_EXCEEDED: AtomicU64 = AtomicU64::new(0);
+
+/// Lock a registry, recovering it from a poisoned lock: the registries are
+/// plain lists that no panic can leave half-updated, and the reaper must
+/// still find every live group after some unrelated thread panicked.
+fn registry<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 fn register_pgid(pgid: i32) {
-    if let Ok(mut g) = RIZIN_PGIDS.lock() {
-        g.push(pgid);
-    }
+    registry(&RIZIN_PGIDS).push(pgid);
 }
 
 fn unregister_pgid(pgid: i32) {
-    if let Ok(mut g) = RIZIN_PGIDS.lock() {
-        if let Some(idx) = g.iter().position(|&p| p == pgid) {
-            g.swap_remove(idx);
-        }
+    let mut g = registry(&RIZIN_PGIDS);
+    if let Some(idx) = g.iter().position(|&p| p == pgid) {
+        g.swap_remove(idx);
     }
 }
 
-struct PgidGuard(i32);
-impl Drop for PgidGuard {
-    fn drop(&mut self) {
-        unregister_pgid(self.0);
-    }
-}
-
-/// SIGKILL the process group of every currently-live rizin subprocess.
+/// SIGKILL the process group of every currently-live rizin subprocess, and
+/// delete the temp copies of their inputs.
 ///
-/// Intended for host CLI signal handlers (e.g. `ctrlc`) that need to
-/// reap rizin workers before `process::exit`. Idempotent: entries are
-/// removed from the registry by the normal cleanup paths, so calling
-/// this after a clean shutdown is a no-op. No-op on non-Unix.
+/// For a host's shutdown path before `process::exit`, which skips the
+/// destructors that would otherwise do both. Call it from a signal-handling
+/// *thread* — the `ctrlc` crate's handler, a `signal-hook` iterator — not
+/// from an async signal handler: it takes a lock and allocates.
+///
+/// Idempotent: entries are removed from the registries by the normal cleanup
+/// paths, so calling this after a clean shutdown is a no-op. On non-Unix
+/// only the temp files are removed; rizin's job object dies with the
+/// process.
 pub fn kill_all_rizin_groups() {
     #[cfg(unix)]
     {
-        let pgids: Vec<i32> = RIZIN_PGIDS.lock().map(|g| g.clone()).unwrap_or_default();
-        for pgid in &pgids {
-            // SAFETY: libc::kill with a negative pid sends the signal to
-            // the process group. Async-signal-safe; tolerates already-dead
-            // groups (ESRCH) silently.
+        let pgids: Vec<i32> = registry(&RIZIN_PGIDS).clone();
+        for pgid in pgids {
+            // SAFETY: libc::kill with a negative pid sends the signal to the
+            // process group; an already-dead group is ESRCH, ignored. The
+            // registry drops a group before its leader is reaped, so the id
+            // cannot have been recycled.
             #[allow(unsafe_code)]
             unsafe {
-                libc::kill(-(*pgid as libc::pid_t), libc::SIGKILL);
+                libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
             }
         }
     }
+    let inputs: Vec<PathBuf> = registry(&RIZIN_TEMP_INPUTS).clone();
+    for path in inputs {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
-/// Cumulative rizin subprocess counters as
-/// `(total, successes, timeouts, failures, memory_exceeded)`.
-pub fn stats() -> (u64, u64, u64, u64, u64) {
-    (
-        RIZIN_TOTAL.load(Ordering::Relaxed),
-        RIZIN_SUCCESSES.load(Ordering::Relaxed),
-        RIZIN_TIMEOUTS.load(Ordering::Relaxed),
-        RIZIN_FAILURES.load(Ordering::Relaxed),
-        RIZIN_MEMORY_EXCEEDED.load(Ordering::Relaxed),
-    )
+/// Cumulative rizin subprocess counters for this process; see [`stats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Stats {
+    /// Recovery runs attempted.
+    pub total: u64,
+    /// Runs that exited cleanly with output.
+    pub successes: u64,
+    /// Runs killed at their wall-clock budget.
+    pub timeouts: u64,
+    /// Runs that could not be started, crashed, or produced nothing.
+    pub failures: u64,
+    /// Runs killed for writing more than the output cap.
+    pub output_cap_exceeded: u64,
+    /// Stdout readers abandoned; same as [`abandoned_drains`].
+    pub abandoned_drains: u64,
+}
+
+/// Cumulative rizin subprocess counters for this process.
+pub fn stats() -> Stats {
+    Stats {
+        total: RIZIN_TOTAL.load(Ordering::Relaxed),
+        successes: RIZIN_SUCCESSES.load(Ordering::Relaxed),
+        timeouts: RIZIN_TIMEOUTS.load(Ordering::Relaxed),
+        failures: RIZIN_FAILURES.load(Ordering::Relaxed),
+        output_cap_exceeded: RIZIN_OUTPUT_CAP_EXCEEDED.load(Ordering::Relaxed),
+        abandoned_drains: abandoned_drains(),
+    }
 }
 
 /// Stdout reader threads abandoned so far (see `join_drain`). Each one is a
@@ -356,7 +396,14 @@ pub fn abandoned_drains() -> u64 {
 /// Host CLIs call this at shutdown for telemetry. No-op when no rizin
 /// invocations have happened.
 pub fn log_stats() {
-    let (total, successes, timeouts, failures, memory_exceeded) = stats();
+    let Stats {
+        total,
+        successes,
+        timeouts,
+        failures,
+        output_cap_exceeded,
+        abandoned_drains,
+    } = stats();
     if total == 0 {
         return;
     }
@@ -366,8 +413,8 @@ pub fn log_stats() {
         successes,
         timeouts,
         failures,
-        memory_exceeded,
-        abandoned_drains = abandoned_drains(),
+        output_cap_exceeded,
+        abandoned_drains,
         timeout_rate_pct = (timeouts as f64 / total_f) * 100.0,
         failure_rate_pct = (failures as f64 / total_f) * 100.0,
         "filefacts rizin subprocess statistics"
@@ -403,25 +450,39 @@ pub fn available() -> bool {
 /// exact text is opaque — any change that alters analysis output also
 /// changes this line. `None` when rizin isn't installed or the probe
 /// fails. Spawns `rizin -v` a single time per process.
+///
+/// Every thread that needs the fingerprint waits on this probe, so it runs
+/// under the same containment as an analysis, with a short deadline and a
+/// small output cap: a wedged or chatty binary on `PATH` costs one bounded
+/// wait and then reads as "version unknown", never a hung scan.
 fn rizin_version() -> Option<&'static str> {
     static VERSION: OnceLock<Option<String>> = OnceLock::new();
     VERSION
-        .get_or_init(|| {
-            let bin = rizin_binary()?;
-            let output = Command::new(bin)
-                .arg("-v")
-                .stdin(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .ok()?;
-            if !output.status.success() {
-                return None;
-            }
-            let text = String::from_utf8_lossy(&output.stdout);
-            let first = text.lines().next().unwrap_or("").trim();
-            (!first.is_empty()).then(|| first.to_string())
-        })
+        .get_or_init(|| version_of(rizin_binary()?, VERSION_PROBE_TIMEOUT))
         .as_deref()
+}
+
+/// Deadline for the `rizin -v` probe. Measured in milliseconds normally.
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// More than any version banner; the probe keeps its first line.
+const VERSION_PROBE_MAX_OUTPUT: usize = 64 * 1024;
+
+/// The first line `bin -v` prints, run hardened and bounded.
+fn version_of(bin: &Path, timeout: Duration) -> Option<String> {
+    let mut cmd = Command::new(bin);
+    cmd.arg("-v");
+    let RunOutcome::Exited { status, stdout, .. } =
+        run_hardened(cmd, timeout, VERSION_PROBE_MAX_OUTPUT)
+    else {
+        return None;
+    };
+    if !status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&stdout);
+    let first = text.lines().next().unwrap_or("").trim();
+    (!first.is_empty()).then(|| first.to_string())
 }
 
 /// Cache discriminator for the rizin side of an extraction: everything about
@@ -491,48 +552,128 @@ pub(crate) fn recover_with_symbols(
     // vsix. The recovery is a pure function of the bytes and the script, so
     // replaying the parsed tables is exactly the work the second spawn would
     // redo. This is not the persistent analysis cache (which CLEAVE_SKIP_CACHE
-    // governs): it lives and dies with the process. Failures are memoized
-    // too — a timeout on these bytes would time out again under the same
-    // budget, which is why the budget is part of the key: a file opened with
-    // a longer timeout must get its own attempt. Bounded by entry count; on
-    // overflow the map resets (duplicates cluster in time, so recency is all
-    // we need).
-    const RIZIN_MEMO_MAX: usize = 512;
-    static MEMO: std::sync::Mutex<
-        Option<std::collections::HashMap<[u8; 32], Option<RizinRecovery>>>,
-    > = std::sync::Mutex::new(None);
+    // governs): it lives and dies with the process.
+    //
+    // Only outcomes the bytes decide are memoized (see `Attempt`): a
+    // recovery, an empty or crashed run, an output-cap kill, and a timeout —
+    // the last because these bytes would time out again under the same
+    // budget, which is why the budget is part of the key. A run that failed
+    // for reasons of its own (no temp space, spawn refused, reader
+    // abandoned, killed from outside) is not, so the next copy gets a fresh
+    // attempt.
     let key: [u8; 32] = {
         use sha2::Digest as _;
         let mut hasher = sha2::Sha256::new();
         hasher.update(bytes);
         // The Go path selects a different Rizin script, so it must not share
         // an in-process recovery memo entry with the generic PE path.
-        hasher.update([go_function_metadata as u8]);
+        hasher.update([u8::from(go_function_metadata)]);
         hasher.update(settings.timeout.as_nanos().to_le_bytes());
         hasher.finalize().into()
     };
-    if let Ok(guard) = MEMO.lock()
-        && let Some(map) = guard.as_ref()
-        && let Some(hit) = map.get(&key)
-    {
+    if let Some(hit) = registry(&RIZIN_MEMO).get(&key) {
         tracing::debug!(bytes = bytes.len(), "rizin recover: in-run memo hit");
         return hit.clone();
     }
-    let result = recover_with_bin(
+    let attempt = attempt_with_bin(
         bin,
         bytes,
         symbol_count,
         go_function_metadata,
         settings.timeout,
     );
-    if let Ok(mut guard) = MEMO.lock() {
-        let map = guard.get_or_insert_with(std::collections::HashMap::default);
-        if map.len() >= RIZIN_MEMO_MAX {
-            map.clear();
-        }
-        map.insert(key, result.clone());
+    if attempt.deterministic {
+        registry(&RIZIN_MEMO).insert(key, attempt.recovery.clone(), attempt.weight);
     }
-    result
+    attempt.recovery
+}
+
+/// The in-run recovery memo; see [`recover_with_symbols`].
+static RIZIN_MEMO: Mutex<Memo> = Mutex::new(Memo::new());
+
+/// Most entries the memo holds before it resets.
+const RIZIN_MEMO_MAX_ENTRIES: usize = 512;
+
+/// Most rizin output, in bytes, the memo's entries may stand for before it
+/// resets. A recovery parsed from up to [`MAX_SUBPROCESS_OUTPUT`] of JSON is
+/// itself that order of size, so a count bound alone let 512 large entries
+/// reach many gigabytes.
+const RIZIN_MEMO_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Accounting weight of a memoized failure, which holds no tables.
+const RIZIN_MEMO_FAILURE_WEIGHT: usize = 64;
+
+/// Recoveries by content key, bounded by entry count and by the rizin output
+/// they were parsed from. On overflow the map resets: duplicates cluster in
+/// time, so recency is all it needs.
+struct Memo {
+    map: Option<std::collections::HashMap<[u8; 32], Option<RizinRecovery>>>,
+    bytes: usize,
+}
+
+impl Memo {
+    const fn new() -> Self {
+        Self {
+            map: None,
+            bytes: 0,
+        }
+    }
+
+    /// The remembered outcome for `key`: a recovery, or `None` for a run
+    /// that recovered nothing.
+    fn get(&self, key: &[u8; 32]) -> Option<&Option<RizinRecovery>> {
+        self.map.as_ref()?.get(key)
+    }
+
+    /// Remember `recovery`, which was parsed from `weight` bytes of output.
+    /// One entry too large to share the budget is not remembered at all.
+    fn insert(&mut self, key: [u8; 32], recovery: Option<RizinRecovery>, weight: usize) {
+        let weight = weight.max(RIZIN_MEMO_FAILURE_WEIGHT);
+        if weight > RIZIN_MEMO_MAX_BYTES / 4 {
+            return;
+        }
+        let map = self
+            .map
+            .get_or_insert_with(std::collections::HashMap::default);
+        if map.len() >= RIZIN_MEMO_MAX_ENTRIES || self.bytes + weight > RIZIN_MEMO_MAX_BYTES {
+            map.clear();
+            self.bytes = 0;
+        }
+        if map.insert(key, recovery).is_none() {
+            self.bytes += weight;
+        }
+    }
+}
+
+/// One recovery attempt, and whether the bytes alone decided its outcome.
+struct Attempt {
+    recovery: Option<RizinRecovery>,
+    /// The same bytes under the same budget would end the same way, so the
+    /// outcome may be memoized. False for a run that failed for reasons of
+    /// its own: no temp space, spawn refused, reader abandoned, killed from
+    /// outside.
+    deterministic: bool,
+    /// Bytes of rizin output the recovery was parsed from: the memo's
+    /// estimate of its size.
+    weight: usize,
+}
+
+impl Attempt {
+    fn decided(recovery: Option<RizinRecovery>, weight: usize) -> Self {
+        Self {
+            recovery,
+            deterministic: true,
+            weight,
+        }
+    }
+
+    fn transient() -> Self {
+        Self {
+            recovery: None,
+            deterministic: false,
+            weight: 0,
+        }
+    }
 }
 
 /// `recover()` with the rizin binary path passed in. Production path
@@ -544,6 +685,7 @@ fn recover_with_bin_for_test(bin: &Path, bytes: &[u8]) -> Option<RizinRecovery> 
     recover_with_bin(bin, bytes, 0, false, RIZIN_TIMEOUT)
 }
 
+#[cfg(test)]
 fn recover_with_bin(
     bin: &Path,
     bytes: &[u8],
@@ -551,48 +693,76 @@ fn recover_with_bin(
     go_function_metadata: bool,
     timeout: Duration,
 ) -> Option<RizinRecovery> {
-    let (script, label) = analysis_script(bytes, symbol_count, go_function_metadata);
-    recover_with_script(bin, bytes, script, label, timeout)
+    attempt_with_bin(bin, bytes, symbol_count, go_function_metadata, timeout).recovery
 }
 
-fn recover_with_script(
+fn attempt_with_bin(
+    bin: &Path,
+    bytes: &[u8],
+    symbol_count: usize,
+    go_function_metadata: bool,
+    timeout: Duration,
+) -> Attempt {
+    let (script, label) = analysis_script(bytes, symbol_count, go_function_metadata);
+    attempt_with_script(bin, bytes, script, label, timeout)
+}
+
+/// Prefix of the temp copies rizin reads its input from.
+const TEMP_INPUT_PREFIX: &str = "filefacts-rizin-";
+
+/// A temp copy of an input, deleted on drop, and listed in
+/// [`RIZIN_TEMP_INPUTS`] while it lives.
+struct TempInput(tempfile::TempPath);
+
+impl TempInput {
+    /// Copy `bytes` to a fresh temp file. `tempfile` creates it with
+    /// `O_EXCL`, mode 0600 and a random name, so another local user can
+    /// neither predict, pre-create, read nor replace it.
+    fn write(bytes: &[u8]) -> io::Result<Self> {
+        let mut file = tempfile::Builder::new()
+            .prefix(TEMP_INPUT_PREFIX)
+            .suffix(".bin")
+            .tempfile()?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        let path = file.into_temp_path();
+        registry(&RIZIN_TEMP_INPUTS).push(path.to_path_buf());
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempInput {
+    fn drop(&mut self) {
+        let mut inputs = registry(&RIZIN_TEMP_INPUTS);
+        if let Some(idx) = inputs.iter().position(|p| p.as_path() == self.path()) {
+            inputs.swap_remove(idx);
+        }
+        // The `TempPath` field deletes the file once this returns.
+    }
+}
+
+fn attempt_with_script(
     bin: &Path,
     bytes: &[u8],
     script: &'static str,
     script_label: &'static str,
     timeout: Duration,
-) -> Option<RizinRecovery> {
+) -> Attempt {
     // The self-disable latch is checked only in `recover_with_symbols`, not
     // here — tests inject a shim via `recover_with_bin_for_test` and need a
     // deterministic spawn path.
     RIZIN_TOTAL.fetch_add(1, Ordering::Relaxed);
 
     // Materialise the bytes as a temp file. Rizin requires a path —
-    // there's no stdin mode for binary analysis. Concurrent callers
-    // need distinct files: include a process-wide atomic counter
-    // alongside the PID so two threads running `recover()` at once
-    // don't trample each other's temp file (the second call's write
-    // would race the first's read-and-spawn).
-    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut temp = std::env::temp_dir();
-    temp.push(format!(
-        "filefacts-rizin-{}-{}.bin",
-        std::process::id(),
-        seq
-    ));
-    if std::fs::write(&temp, bytes).is_err() {
+    // there's no stdin mode for binary analysis.
+    let Ok(input) = TempInput::write(bytes) else {
         RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    // Auto-cleanup guard — fires whether we return Some/None below.
-    struct Cleanup<'a>(&'a Path);
-    impl Drop for Cleanup<'_> {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(self.0);
-        }
-    }
-    let _cleanup = Cleanup(&temp);
+        return Attempt::transient();
+    };
 
     // `-NN` disables plugin auto-loading (faster startup, fewer surprises).
     // `-T` skips Rizin's file hashes and `-z` skips its duplicate string-table
@@ -602,25 +772,20 @@ fn recover_with_script(
     // basic blocks, and call edges remain part of the full `aaa` pass. Three-run
     // ELF/Mach-O/PE benchmarks found equality in every field consumed below.
     // `-q` quits after the `-c` script and `scr.color=0` strips ANSI escapes.
-    let path_str = temp.to_string_lossy();
     // The `aaa` pass is deliberately fixed for admitted binaries; the
     // surrounding `iij`/`iEj`/`aflj`/`iSj` are table reads. The `===SEP===`
-    // sentinels must stay 1:1 with the parser's `split` below.
+    // sentinels must stay 1:1 with the parser's `split` below. The path goes
+    // over as an `OsStr`, so a non-UTF-8 temp dir still names the file.
     let mut cmd = Command::new(bin);
     cmd.args(RIZIN_METRICS_ARGS)
         .arg("-c")
         .arg(script)
-        .arg(&*path_str);
+        .arg(input.path());
     tracing::debug!(
         bytes = bytes.len(),
         script = script_label,
         "rizin recover: script"
     );
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::null());
-
-    apply_unix_hardening(&mut cmd);
 
     // Per-run timing so binary-heavy archives can be diagnosed at the
     // file granularity (the cumulative `log_stats` line hides which input
@@ -629,146 +794,44 @@ fn recover_with_script(
     let started = std::time::Instant::now();
     tracing::debug!(bytes = bytes.len(), "rizin recover: begin");
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(_) => {
-            RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-    };
-    let child_id = child.id();
-    // Contain descendants on Windows the way `process_group(0)` does on Unix.
-    // Created immediately after spawn; a helper started in the window before
-    // the assignment lands would escape the job, which is what the bounded
-    // drain join below exists to survive.
-    #[cfg(windows)]
-    let job = {
-        use std::os::windows::io::AsRawHandle;
-        win_job::Job::containing(child.as_raw_handle().cast())
-    };
-    register_pgid(child_id as i32);
-    let _pgid_guard = PgidGuard(child_id as i32);
-    let output_cap_hit = Arc::new(AtomicBool::new(false));
-
-    // Drain stdout in a background thread while we wait for exit.
-    // Without this, `aflj` output on a binary with thousands of
-    // discovered functions overflows the pipe buffer (~64 KB on
-    // macOS), the child blocks on write, and `wait_with_output()`
-    // deadlocks waiting for exit. Capped at MAX_SUBPROCESS_OUTPUT to
-    // bound the worst-case adversarial blob. On
-    // overflow the reader thread SIGKILLs the rizin process group so
-    // both pipes close promptly.
-    let mut stdout_handle = match child.stdout.take() {
-        Some(h) => h,
-        None => {
-            RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
-            terminate_child(&mut child, child_id);
-            return None;
-        }
-    };
-    let cap_flag = output_cap_hit.clone();
-    // The drain thread owns the read-end and reads to EOF. Once the
-    // child exits, its write-end closes and `read_to_end` returns
-    // promptly. Returning the buffer via `JoinHandle` (rather than a
-    // channel with a wall-clock timeout) is what keeps this robust
-    // under heavy parallel load — when the OS scheduler starves the
-    // drain thread for several seconds, a channel-recv_timeout would
-    // give up and treat the (still-pending) output as empty. The
-    // join can't deadlock because the child is already known to have
-    // exited by the time we join.
-    // The buffer comes back over a channel rather than a `JoinHandle` so the
-    // wait can be bounded (see `join_drain`); the handle itself is dropped,
-    // detaching the thread.
-    let (drain_tx, drain_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
-    std::thread::spawn(move || {
-        use std::io::Read;
-        let mut buf = Vec::new();
-        let n = (&mut stdout_handle)
-            .take(MAX_SUBPROCESS_OUTPUT as u64)
-            .read_to_end(&mut buf)
-            .unwrap_or(0);
-        if n >= MAX_SUBPROCESS_OUTPUT {
-            mark_output_cap_hit(&cap_flag, child_id);
-        }
-        let _ = drain_tx.send(buf);
-    });
-
-    // Poll until the configured duration has elapsed. Comparing elapsed time
-    // avoids overflowing `Instant` if a caller supplies an intentionally
-    // enormous timeout override. Once the child exits, the reader thread's
-    // `read_to_end` returns naturally.
-    let mut exit_status = None;
-    while started.elapsed() < timeout {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                exit_status = Some(status);
-                break;
-            }
-            Ok(None) => std::thread::sleep(WAIT_POLL_INTERVAL),
-            Err(_) => {
-                RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
-                terminate_child(&mut child, child_id);
-                #[cfg(windows)]
-                if let Some(job) = &job {
-                    job.terminate();
-                }
-                let _ = join_drain(&drain_rx, child_id);
-                return None;
-            }
-        }
-    }
-    let status = match exit_status {
-        Some(s) => s,
-        None => {
+    let (status, stdout_bytes, cap_hit) = match run_hardened(cmd, timeout, MAX_SUBPROCESS_OUTPUT) {
+        RunOutcome::Exited {
+            status,
+            stdout,
+            cap_hit,
+        } => (status, stdout, cap_hit),
+        RunOutcome::TimedOut => {
             RIZIN_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 bytes = bytes.len(),
                 elapsed_ms = started.elapsed().as_millis(),
                 "rizin recover: end (timed out)"
             );
-            terminate_child(&mut child, child_id);
-            // Killing the whole group (Unix) / job (Windows) closes every
-            // inherited copy of stdout. Wait — bounded — before returning so a
-            // timed-out analysis does not leave a reader behind holding output
-            // its Rayon caller has already been released from.
-            #[cfg(windows)]
-            if let Some(job) = &job {
-                job.terminate();
-            }
-            let _ = join_drain(&drain_rx, child_id);
-            return None;
+            return Attempt::decided(None, 0);
+        }
+        RunOutcome::Failed => {
+            RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return Attempt::transient();
         }
     };
-    // The leader has exited, but a helper process could still hold an inherited
-    // stdout descriptor open. Terminate any remaining members of Rizin's private
-    // process group before joining, so neither a descendant nor the reader can
-    // retain this Rayon caller indefinitely. This is harmless when the group is
-    // already empty.
-    kill_process_group(child_id);
-    // Same on Windows, where `kill_process_group` is a no-op: the job outlives
-    // the reaped leader and is addressed by handle, so terminating it here is
-    // both safe (no pid to recycle) and necessary (this is the path a shim that
-    // backgrounds a helper and exits takes).
-    #[cfg(windows)]
-    if let Some(job) = &job {
-        job.terminate();
-    }
-    // Wait on every exit-status path—not only success—so a crashing Rizin
-    // cannot leave a reader holding a pipe after its caller moves on.
-    let stdout_bytes = join_drain(&drain_rx, child_id);
-    let cap_hit = output_cap_hit.load(Ordering::Acquire);
+    drop(input);
     if cap_hit {
-        RIZIN_MEMORY_EXCEEDED.fetch_add(1, Ordering::Relaxed);
+        RIZIN_OUTPUT_CAP_EXCEEDED.fetch_add(1, Ordering::Relaxed);
     }
     // Rizin crashed / aborted — partial stdout is unreliable on a
     // failed run, so we drop it rather than emit phantom data.
     if !status.success() {
         RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
-        return None;
+        // A SIGKILL we did not send for the output cap came from outside —
+        // the reaper, the OOM killer — and says nothing about these bytes.
+        if killed_from_outside(status, cap_hit) {
+            return Attempt::transient();
+        }
+        return Attempt::decided(None, 0);
     }
     if stdout_bytes.is_empty() {
         RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
-        return None;
+        return Attempt::decided(None, 0);
     }
     RIZIN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
     tracing::debug!(
@@ -777,8 +840,298 @@ fn recover_with_script(
         stdout_bytes = stdout_bytes.len(),
         "rizin recover: end (ok)"
     );
+    let weight = stdout_bytes.len();
     let stdout = String::from_utf8_lossy(&stdout_bytes);
-    Some(parse_recovery_output(&stdout))
+    Attempt::decided(Some(parse_recovery_output(&stdout)), weight)
+}
+
+/// Whether `status` is a SIGKILL that the output cap does not explain.
+#[cfg(unix)]
+fn killed_from_outside(status: ExitStatus, cap_hit: bool) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    !cap_hit && status.signal() == Some(libc::SIGKILL)
+}
+
+#[cfg(not(unix))]
+fn killed_from_outside(_: ExitStatus, _: bool) -> bool {
+    false
+}
+
+/// How a [`run_hardened`] child ended.
+enum RunOutcome {
+    /// It exited — on its own, or killed for exceeding the output cap — and
+    /// its stdout was read to the end (up to the cap).
+    Exited {
+        status: ExitStatus,
+        stdout: Vec<u8>,
+        /// Stdout passed the cap, so the process group was killed and
+        /// `stdout` is truncated.
+        cap_hit: bool,
+    },
+    /// Still running at the deadline: its process group was killed.
+    TimedOut,
+    /// The run could not be carried out or supervised — spawn refused, no
+    /// pipe, no reader thread, a wait error, or a reader that had to be
+    /// abandoned. Says nothing about the input.
+    Failed,
+}
+
+/// Run `cmd` contained — its own process group with memory and death limits
+/// on Unix, a kill-on-close job on Windows — reading at most `cap` bytes of
+/// stdout and waiting at most `timeout`. stdin and stderr are null.
+///
+/// Whatever happens, including a panic unwinding through here, the child's
+/// process group is killed and its leader reaped before this returns (see
+/// [`ChildGuard`]).
+fn run_hardened(mut cmd: Command, timeout: Duration, cap: usize) -> RunOutcome {
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+    apply_unix_hardening(&mut cmd);
+
+    let started = std::time::Instant::now();
+    let Ok(child) = cmd.spawn() else {
+        return RunOutcome::Failed;
+    };
+    let mut guard = ChildGuard::new(child);
+    let pid = guard.pid;
+
+    // Drain stdout in a background thread while we wait for exit.
+    // Without this, `aflj` output on a binary with thousands of
+    // discovered functions overflows the pipe buffer (~64 KB on
+    // macOS), the child blocks on write, and the wait deadlocks.
+    let Some(mut stdout) = guard.child.stdout.take() else {
+        return RunOutcome::Failed;
+    };
+    let output_cap_hit = Arc::new(AtomicBool::new(false));
+    let cap_flag = Arc::clone(&output_cap_hit);
+    // The reader keeps at most `cap` bytes, then flags the overflow and keeps
+    // reading into the void: the child must never block on a full pipe, and
+    // the kill that ends it is sent from the supervising loop below, which
+    // holds the unreaped leader and so knows the group id is still its own.
+    // The buffer comes back over a channel rather than a `JoinHandle` so the
+    // wait for it can be bounded (see `join_drain`); the handle itself is
+    // dropped, detaching the thread.
+    let (drain_tx, drain_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+    let spawned = std::thread::Builder::new()
+        .name("filefacts-rizin-drain".into())
+        .spawn(move || {
+            let mut buf = Vec::new();
+            let n = (&mut stdout)
+                .take(cap as u64)
+                .read_to_end(&mut buf)
+                .unwrap_or(0);
+            if n >= cap {
+                cap_flag.store(true, Ordering::Release);
+                let _ = io::copy(&mut stdout, &mut io::sink());
+            }
+            let _ = drain_tx.send(buf);
+        });
+    if spawned.is_err() {
+        // The closure, and with it the read end, is gone; the guard kills
+        // and reaps the child.
+        return RunOutcome::Failed;
+    }
+
+    // Poll until the configured duration has elapsed. Comparing elapsed time
+    // avoids overflowing `Instant` if a caller supplies an intentionally
+    // enormous timeout override.
+    let mut cap_reported = false;
+    loop {
+        if !cap_reported && output_cap_hit.load(Ordering::Acquire) {
+            cap_reported = true;
+            tracing::warn!(
+                pid,
+                cap_bytes = cap,
+                "rizin output cap exceeded; killing process group"
+            );
+            guard.kill_group();
+        }
+        match guard.has_exited() {
+            Ok(true) => break,
+            Ok(false) if started.elapsed() >= timeout => {
+                // Killing the whole group (Unix) / job (Windows) closes every
+                // inherited copy of stdout. Wait — bounded — before returning
+                // so a timed-out analysis does not leave a reader behind
+                // holding output its caller has already been released from.
+                guard.finish();
+                let _ = join_drain(&drain_rx, pid);
+                return RunOutcome::TimedOut;
+            }
+            Ok(false) => std::thread::sleep(WAIT_POLL_INTERVAL),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                guard.finish();
+                let _ = join_drain(&drain_rx, pid);
+                return RunOutcome::Failed;
+            }
+        }
+    }
+    // The leader has exited, but a helper process could still hold an
+    // inherited stdout descriptor open. Kill what remains of the group — and,
+    // on Windows, the job — before joining, so neither a descendant nor the
+    // reader can retain this caller indefinitely. Where `has_exited` leaves
+    // the leader unreaped, its zombie still pins the group id, so the kill
+    // cannot reach a recycled group.
+    let Some(status) = guard.finish() else {
+        let _ = join_drain(&drain_rx, pid);
+        return RunOutcome::Failed;
+    };
+    // Wait on every exit-status path—not only success—so a crashing child
+    // cannot leave a reader holding a pipe after its caller moves on.
+    let Some(stdout) = join_drain(&drain_rx, pid) else {
+        return RunOutcome::Failed;
+    };
+    RunOutcome::Exited {
+        status,
+        stdout,
+        cap_hit: output_cap_hit.load(Ordering::Acquire),
+    }
+}
+
+/// Owns a contained child from spawn to reap. Registered in [`RIZIN_PGIDS`]
+/// while its group may be live; dropping it unreaped — an early return, a
+/// panic unwinding through [`run_hardened`] — kills the group and reaps the
+/// leader, so no path leaves rizin running unsupervised or as a zombie.
+struct ChildGuard {
+    child: Child,
+    pid: u32,
+    /// The leader's exit status, once reaped.
+    status: Option<ExitStatus>,
+    /// [`Self::finish`] has run: the group is dead and out of the registry.
+    finished: bool,
+    /// Contains descendants on Windows the way `process_group(0)` does on
+    /// Unix. Created immediately after spawn; a helper started in the window
+    /// before the assignment lands would escape the job, which is what the
+    /// bounded drain join exists to survive.
+    #[cfg(windows)]
+    job: Option<win_job::Job>,
+}
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        let pid = child.id();
+        #[cfg(windows)]
+        let job = {
+            use std::os::windows::io::AsRawHandle;
+            win_job::Job::containing(child.as_raw_handle().cast())
+        };
+        register_pgid(pid.cast_signed());
+        Self {
+            child,
+            pid,
+            status: None,
+            finished: false,
+            #[cfg(windows)]
+            job,
+        }
+    }
+
+    /// Whether the leader has exited. Where the platform has
+    /// `waitid(WNOWAIT)` the leader is left unreaped, so its pid — the group
+    /// id — stays reserved until [`Self::finish`] reaps it.
+    fn has_exited(&mut self) -> io::Result<bool> {
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
+        {
+            exited_unreaped(self.pid)
+        }
+        // Elsewhere `try_wait` reaps, leaving a narrow window in which the
+        // group kill in `finish` could reach a recycled id.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        )))]
+        {
+            let status = self.child.try_wait()?;
+            if status.is_some() {
+                self.status = status;
+            }
+            Ok(status.is_some())
+        }
+    }
+
+    /// SIGKILL the leader's process group (Unix) or terminate its job
+    /// (Windows), without reaping.
+    fn kill_group(&self) {
+        kill_process_group(self.pid);
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            job.terminate();
+        }
+    }
+
+    /// Kill what is left of the group, drop it from the registry, then reap
+    /// the leader. Idempotent; `None` only when the wait itself fails.
+    fn finish(&mut self) -> Option<ExitStatus> {
+        if self.finished {
+            return self.status;
+        }
+        self.finished = true;
+        self.kill_group();
+        // Out of the registry before the reap: once reaped, the id is free
+        // for the kernel to reuse and the reaper must no longer signal it.
+        unregister_pgid(self.pid.cast_signed());
+        // Fallback for platforms without process groups, and for the narrow
+        // race where group creation failed before `exec`. A no-op on a child
+        // `std` has already reaped.
+        let _ = self.child.kill();
+        let status = self.child.wait().ok();
+        self.status = self.status.or(status);
+        self.status
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// Whether child `pid` has exited, leaving it unreaped (`WNOWAIT`).
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+#[allow(unsafe_code)]
+fn exited_unreaped(pid: u32) -> io::Result<bool> {
+    // SAFETY: `siginfo_t` is plain old data, valid all-zero. With `WNOHANG`
+    // and no state change the kernel leaves `si_pid` as the zero we wrote
+    // (Linux documents relying on that); otherwise it fills the struct.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a valid, writable `siginfo_t`; `pid` is our own
+    // unreaped child, so the call cannot touch another process's state.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &raw mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: after a successful `waitid` the `si_pid` member is initialised
+    // (to the child's pid, or still zero when it has not exited).
+    Ok(unsafe { info.si_pid() } != 0)
 }
 
 /// Apply Unix subprocess hardening: own process group everywhere, plus the
@@ -794,13 +1147,19 @@ fn recover_with_script(
 fn apply_unix_hardening(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
     cmd.process_group(0);
-    // SAFETY: pre_exec runs in the forked child between fork() and
-    // exec(). Only async-signal-safe calls are allowed; setrlimit and
-    // prctl are both on the POSIX list. No allocation, no locks.
+    // Read before the fork: the child compares it with `getppid()`.
+    #[cfg(target_os = "linux")]
+    let parent = std::process::id() as libc::pid_t;
+    // SAFETY: the hook runs in the forked child between `fork()` and
+    // `exec()`, where only async-signal-safe work is sound — no allocation,
+    // no locks. `getppid` and `_exit` are on POSIX's async-signal-safe list.
+    // `setrlimit` and `prctl` are not listed, but glibc, musl and libSystem
+    // implement both as bare system calls that neither allocate nor lock.
+    // `io::Error::last_os_error` wraps the raw errno without allocating.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[allow(unsafe_code)]
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             let limit = libc::rlimit {
                 rlim_cur: RIZIN_MEMORY_LIMIT_BYTES as libc::rlim_t,
                 rlim_max: RIZIN_MEMORY_LIMIT_BYTES as libc::rlim_t,
@@ -812,13 +1171,24 @@ fn apply_unix_hardening(cmd: &mut Command) {
             // EINVAL is expected and the caller's tighter limit wins.
             #[cfg(target_os = "linux")]
             {
-                libc::setrlimit(libc::RLIMIT_AS, &limit);
-                // Ask the kernel to SIGKILL this subprocess if the
-                // parent dies without running our own cleanup —
-                // covers panic/abort/SIGKILL/OOM paths where the
-                // ctrlc handler never gets to run
-                // `kill_all_rizin_groups`.
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                libc::setrlimit(libc::RLIMIT_AS, &raw const limit);
+                // Ask the kernel to SIGKILL this subprocess if the parent
+                // dies without running our own cleanup — covers
+                // panic/abort/SIGKILL/OOM paths where no signal handler gets
+                // to run `kill_all_rizin_groups`. "Parent" is the forking
+                // *thread*; it blocks supervising this child until it is
+                // reaped, so it cannot exit first. Refuse to run unguarded
+                // if the kernel will not arm it.
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // A parent that died between `fork` and the `prctl` above
+                // never delivers the signal; the child has already been
+                // reparented, which `getppid` shows. Exit rather than run
+                // orphaned.
+                if libc::getppid() != parent {
+                    libc::_exit(1);
+                }
             }
             libc::setrlimit(libc::RLIMIT_DATA, &raw const limit);
             Ok(())
@@ -829,8 +1199,6 @@ fn apply_unix_hardening(cmd: &mut Command) {
 #[cfg(not(unix))]
 fn apply_unix_hardening(_: &mut Command) {}
 
-/// SIGKILL a process group. Used by the reader thread on output-cap
-/// overflow and by the timeout cleanup path. No-op on non-Unix.
 /// Windows analogue of the Unix private process group: a Job Object holding
 /// the rizin leader and everything it spawns.
 ///
@@ -968,43 +1336,22 @@ mod win_job {
     }
 }
 
+/// SIGKILL the process group led by `child_id`. Only [`ChildGuard`] calls
+/// this, while the leader is still unreaped, so the id is still its own.
+/// No-op on non-Unix.
 #[cfg_attr(not(unix), allow(unused_variables))]
 fn kill_process_group(child_id: u32) {
     #[cfg(unix)]
     // SAFETY: libc::kill with negative pid targets the process group.
-    // Async-signal-safe; tolerates already-dead groups silently.
+    // Tolerates already-dead groups (ESRCH) silently.
     #[allow(unsafe_code)]
     unsafe {
         libc::kill(-(child_id as libc::pid_t), libc::SIGKILL);
     }
 }
 
-/// Terminate the complete Rizin process group and synchronously reap its
-/// leader. The direct `Child::kill` is an idempotent fallback for platforms
-/// without Unix process groups and for the narrow race where group creation
-/// failed before `exec`.
-fn terminate_child(child: &mut std::process::Child, child_id: u32) {
-    kill_process_group(child_id);
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-/// Mark the output-cap flag and SIGKILL the rizin process group so
-/// both pipes close promptly. First call sets the flag and kills;
-/// subsequent calls are no-ops.
-fn mark_output_cap_hit(flag: &Arc<AtomicBool>, child_id: u32) {
-    if flag.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    tracing::warn!(
-        pid = child_id,
-        cap_bytes = MAX_SUBPROCESS_OUTPUT,
-        "rizin output cap exceeded; killing process group"
-    );
-    kill_process_group(child_id);
-}
-
-/// Wait for the stdout drain thread, bounded by [`DRAIN_GRACE`].
+/// Wait for the stdout drain thread, bounded by [`DRAIN_GRACE`]. `None` when
+/// the reader had to be abandoned.
 ///
 /// The reader returns as soon as the last copy of the pipe's write end closes.
 /// Containment (Unix process group / Windows job) closes the copies we know
@@ -1014,9 +1361,9 @@ fn mark_output_cap_hit(flag: &Arc<AtomicBool>, child_id: u32) {
 /// reader thread, never a wedged scan. The thread is deliberately detached
 /// rather than joined on expiry: it owns the blocked read, and there is no
 /// portable way to cancel it.
-fn join_drain(rx: &std::sync::mpsc::Receiver<Vec<u8>>, child_id: u32) -> Vec<u8> {
+fn join_drain(rx: &std::sync::mpsc::Receiver<Vec<u8>>, child_id: u32) -> Option<Vec<u8>> {
     match rx.recv_timeout(DRAIN_GRACE) {
-        Ok(buf) => buf,
+        Ok(buf) => Some(buf),
         Err(_) => {
             let abandoned = RIZIN_DRAINS_ABANDONED.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::error!(
@@ -1036,7 +1383,7 @@ fn join_drain(rx: &std::sync::mpsc::Receiver<Vec<u8>>, child_id: u32) -> Vec<u8>
                      abandoned stdout readers, each a leaked thread and buffer"
                 );
             }
-            Vec::new()
+            None
         }
     }
 }
@@ -1368,21 +1715,18 @@ impl RizinRecovery {
 /// flag vocabulary used by every other filefacts section view. Order is
 /// `readable, writable, executable` so callers iterating the
 /// resulting Vec in order get a stable shape.
-fn perm_to_flags(perm: Option<&str>) -> Vec<String> {
+fn perm_to_flags(perm: Option<&str>) -> Vec<SectionFlag> {
     let Some(p) = perm else {
         return Vec::new();
     };
-    let mut flags = Vec::new();
-    if p.contains('r') {
-        flags.push("readable".to_string());
-    }
-    if p.contains('w') {
-        flags.push("writable".to_string());
-    }
-    if p.contains('x') {
-        flags.push("executable".to_string());
-    }
-    flags
+    [
+        ('r', SectionFlag::Readable),
+        ('w', SectionFlag::Writable),
+        ('x', SectionFlag::Executable),
+    ]
+    .into_iter()
+    .filter_map(|(c, flag)| p.contains(c).then_some(flag))
+    .collect()
 }
 
 // =============================================================================

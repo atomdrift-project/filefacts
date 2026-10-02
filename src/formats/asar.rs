@@ -10,6 +10,7 @@ use crate::value_key;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_value};
+use super::bounded::{MAX_ARCHIVE_MEMBERS, push_limit};
 use crate::bytes;
 use crate::error::Error;
 use crate::output::{ArchiveCompression, ArchiveMember, ArchiveOffsets, Metrics, Values};
@@ -51,26 +52,15 @@ fn path_join(prefix: &str, name: &str) -> String {
 }
 
 fn looks_nested_archive(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.ends_with(".zip")
-        || lower.ends_with(".jar")
-        || lower.ends_with(".asar")
-        || lower.ends_with(".tar")
-        || lower.ends_with(".tar.gz")
-        || lower.ends_with(".tgz")
-        || lower.ends_with(".7z")
-        || lower.ends_with(".rar")
+    [".zip", ".jar", ".asar", ".tar", ".tgz", ".7z", ".rar"]
+        .iter()
+        .any(|ext| super::common::ends_with_ci(path, ext))
 }
 
 fn looks_script(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.ends_with(".js")
-        || lower.ends_with(".mjs")
-        || lower.ends_with(".cjs")
-        || lower.ends_with(".ts")
-        || lower.ends_with(".sh")
-        || lower.ends_with(".ps1")
-        || lower.ends_with(".py")
+    [".js", ".mjs", ".cjs", ".ts", ".sh", ".ps1", ".py"]
+        .iter()
+        .any(|ext| super::common::ends_with_ci(path, ext))
 }
 
 struct AsarIndex {
@@ -104,14 +94,14 @@ fn parse_index(bytes: &[u8]) -> Result<AsarIndex, Error> {
         .filter(|_| data_offset <= bytes.len() && data_offset >= header_end)
         .ok_or_else(|| Error::malformed("asar", "header extends past end of file"))?;
 
-    let header: JsonValue = serde_json::from_slice(json).map_err(|e| {
-        Error::malformed_with_source("asar", format!("invalid header json: {e}"), e)
-    })?;
-    let files = header
-        .get("files")
-        .and_then(JsonValue::as_object)
-        .cloned()
-        .ok_or_else(|| Error::malformed("asar", "missing files table"))?;
+    let mut header: JsonValue = serde_json::from_slice(json)
+        .map_err(|e| Error::malformed_with_source("asar", "invalid header json", e))?;
+    // Moved out of the parsed header, not cloned: the table is the whole
+    // header, and can run to megabytes.
+    let files = match header.get_mut("files").map(JsonValue::take) {
+        Some(JsonValue::Object(files)) => files,
+        _ => return Err(Error::malformed("asar", "missing files table")),
+    };
 
     Ok(AsarIndex {
         data_offset: data_offset as u64,
@@ -126,6 +116,8 @@ struct Walk {
     members: Vec<JsonValue>,
     stats: ArchiveStats,
     directory_count: u64,
+    /// File entries past [`MAX_ARCHIVE_MEMBERS`], counted but not listed.
+    unlisted: u64,
 }
 
 fn walk_files(
@@ -149,6 +141,10 @@ fn walk_files(
         let Some(size) = obj.get("size").and_then(JsonValue::as_u64) else {
             continue;
         };
+        if walk.members.len() >= MAX_ARCHIVE_MEMBERS {
+            walk.unlisted += 1;
+            continue;
+        }
         let unpacked = obj
             .get("unpacked")
             .and_then(JsonValue::as_bool)
@@ -216,8 +212,20 @@ pub(super) fn extract(
         members: Vec::new(),
         stats: ArchiveStats::new(AGGS),
         directory_count: 0,
+        unlisted: 0,
     };
     walk_files("", &index.files, &mut walk, archive_members);
+    if walk.unlisted > 0 {
+        push_limit(
+            values,
+            value_key!("asar.limits"),
+            "member-cap",
+            format!(
+                "listed {MAX_ARCHIVE_MEMBERS} of {} members",
+                MAX_ARCHIVE_MEMBERS as u64 + walk.unlisted
+            ),
+        );
+    }
 
     values.insert_key(
         value_key!("archive.members"),
@@ -281,6 +289,37 @@ mod tests {
         assert_eq!(members.len(), 3);
         let main = members.iter().find(|m| m.path == "main.js").unwrap();
         assert_eq!(main.offsets.data, Some(header_len_for_test()));
+    }
+
+    /// Past the shared member cap, files are counted, not listed.
+    #[test]
+    fn members_past_the_cap_are_not_listed() {
+        let total = MAX_ARCHIVE_MEMBERS + 3;
+        let mut header = String::from(r#"{"files":{"#);
+        for i in 0..total {
+            if i > 0 {
+                header.push(',');
+            }
+            header.push_str(&format!(r#""f{i}":{{"size":0,"offset":"0"}}"#));
+        }
+        header.push_str("}}");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&((header.len() + 8) as u32).to_le_bytes());
+        bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+
+        let mut values = Values::new();
+        let mut metrics = Metrics::new();
+        let mut members = Vec::new();
+        extract(&bytes, &mut values, &mut metrics, &mut members).unwrap();
+        assert_eq!(members.len(), MAX_ARCHIVE_MEMBERS);
+        let limits = values
+            .get("asar.limits")
+            .and_then(JsonValue::as_array)
+            .unwrap();
+        assert_eq!(limits[0]["stage"].as_str(), Some("member-cap"));
     }
 
     fn header_len_for_test() -> u64 {

@@ -1,0 +1,109 @@
+[package]
+name = "filefacts-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+filefacts = { path = ".." }
+
+# Its own workspace, so the fuzz crate never joins the main build.
+[workspace]
+members = ["."]
+
+# Same fork as the root manifest: [patch] applies only in the root crate of a
+# build, and this crate is one. Keep it in step with ../Cargo.toml.
+[patch.crates-io]
+tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
+tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "open_all_views"
+path = "fuzz_targets/open_all_views.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fileid"
+path = "fuzz_targets/fileid.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pe"
+path = "fuzz_targets/pe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "elf"
+path = "fuzz_targets/elf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "macho"
+path = "fuzz_targets/macho.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zip"
+path = "fuzz_targets/zip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pdf"
+path = "fuzz_targets/pdf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "iso"
+path = "fuzz_targets/iso.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "plist"
+path = "fuzz_targets/plist.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "source_js"
+path = "fuzz_targets/source_js.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "source_c"
+path = "fuzz_targets/source_c.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "source_python"
+path = "fuzz_targets/source_python.rs"
+test = false
+doc = false
+bench = false

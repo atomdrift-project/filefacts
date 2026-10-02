@@ -58,7 +58,6 @@ use crate::metric;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::collections::{HashSet, VecDeque};
 
-use crate::error::Error;
 use crate::formats::common::bytes_at::{u16_le, u32_be, u32_le};
 use crate::output::{ArchiveMember, ArchiveOffsets, ArchiveOwnership, Metrics, Values};
 use crate::scan::days_from_civil;
@@ -78,7 +77,7 @@ const SYSTEM_AREA_SECTORS: usize = 16;
 /// more. Anything past this is a malformed or padded set.
 const MAX_VOLUME_DESCRIPTORS: usize = 64;
 /// Cap on directory records walked across all trees.
-const MAX_ENTRIES: usize = 65_536;
+const MAX_ENTRIES: usize = super::bounded::MAX_ARCHIVE_MEMBERS;
 /// Cap on directory extents visited, bounding a cyclic tree.
 const MAX_DIRS: usize = 16_384;
 /// Cap on tree depth. ISO 9660 level 1 permits 8; Joliet and Rock Ridge
@@ -91,6 +90,15 @@ const MAX_SURFACED_FILES: usize = 512;
 const MAX_DIR_EXTENT: usize = 32 << 20;
 /// Cap on SUSP continuation-area hops per record.
 const MAX_CE_HOPS: usize = 8;
+/// Continuation-area bytes read for one directory record, across its `CE`
+/// chain.
+const MAX_SUSP_BYTES_PER_ENTRY: usize = 64 << 10;
+/// Continuation-area bytes read across the whole walk. Every record can
+/// point its `CE` at the same areas, so the per-entry budget alone would
+/// still allow `MAX_ENTRIES` times it.
+const MAX_SUSP_BYTES_TOTAL: usize = 64 << 20;
+/// Bytes kept from a Rock Ridge `NM` name, across its continuation entries.
+const MAX_ALT_NAME_LEN: usize = 4096;
 /// Cap on El Torito catalog entries.
 const MAX_BOOT_ENTRIES: usize = 64;
 /// Cap on symlink component bytes reassembled from an `SL` entry.
@@ -126,9 +134,9 @@ pub(super) fn extract(
     values: &mut Values,
     metrics: &mut Metrics,
     archive_members: &mut Vec<ArchiveMember>,
-) -> Result<(), Error> {
+) {
     let first = archive_members.len();
-    let result = walk_image(bytes, values, metrics, archive_members);
+    walk_image(bytes, values, metrics, archive_members);
     let members = archive_members.get(first..).unwrap_or_default();
     let mut stats = ArchiveStats::new(AGGS);
     for member in members {
@@ -148,7 +156,6 @@ pub(super) fn extract(
         .collect();
     values.insert_key(value_key!("archive.members"), JsonValue::Array(list));
     stats.emit(values, metrics);
-    result
 }
 
 fn walk_image(
@@ -156,7 +163,7 @@ fn walk_image(
     values: &mut Values,
     metrics: &mut Metrics,
     archive_members: &mut Vec<ArchiveMember>,
-) -> Result<(), Error> {
+) {
     let descriptors = scan_descriptors(bytes);
     let mut anomalies: Vec<&'static str> = Vec::new();
     if descriptors.is_empty() {
@@ -167,7 +174,7 @@ fn walk_image(
         emit_system_area(bytes, values, metrics, &mut anomalies);
         anomalies.push("no-volume-descriptor");
         finish(values, metrics, &mut anomalies, &[], bytes, None);
-        return Ok(());
+        return;
     }
     if descriptors
         .first()
@@ -234,7 +241,7 @@ fn walk_image(
         anomalies.push("no-iso9660-primary");
         archive_members.append(&mut udf_facts.members);
         finish(values, metrics, &mut anomalies, &extensions, bytes, None);
-        return Ok(());
+        return;
     };
 
     emit_pvd(&pvd, values, metrics, &mut anomalies);
@@ -243,16 +250,10 @@ fn walk_image(
         .iter()
         .find(|d| d.ident == *b"CD001" && d.kind == 0)
     {
-        if emit_boot(
-            bytes,
-            boot.body,
-            &pvd,
-            values,
-            metrics,
-            &mut anomalies,
-            &mut claimed,
-            archive_members,
-        ) {
+        let boot = emit_boot(bytes, boot.body, &pvd, values, metrics, archive_members);
+        anomalies.extend(boot.anomalies);
+        claimed.extend(boot.claimed);
+        if boot.el_torito {
             extensions.push("el-torito");
         }
     }
@@ -322,7 +323,9 @@ fn walk_image(
             .count() as u64;
         if udf_facts.file_count > iso_files {
             anomalies.push("udf-tree-has-extra-files");
-            let known: Vec<String> = archive_members.iter().map(|m| m.path.clone()).collect();
+            // A set, not a Vec: both trees can hold MAX_ARCHIVE_MEMBERS entries.
+            let known: std::collections::HashSet<String> =
+                archive_members.iter().map(|m| m.path.clone()).collect();
             for m in udf_facts.members.drain(..) {
                 if !known.contains(&m.path) {
                     archive_members.push(m);
@@ -339,7 +342,6 @@ fn walk_image(
         bytes,
         Some(&pvd),
     );
-    Ok(())
 }
 
 /// Emit the facts that don't depend on a successful tree walk, so a
@@ -612,13 +614,7 @@ fn decode_field(raw: &[u8], ucs2: bool) -> String {
 }
 
 fn decode_ucs2be(raw: &[u8]) -> String {
-    let units: Vec<u16> = raw
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|c| u16::from_be_bytes([c[0], c[1]]))
-        .collect();
-    String::from_utf16_lossy(&units)
+    crate::bytes::utf16_lossy(raw, crate::bytes::Endian::Big)
         .trim_end_matches(['\u{0}', ' '])
         .to_string()
 }
@@ -742,7 +738,7 @@ fn emit_pvd(
     .count();
     metrics.insert(metric!("iso.blank_identifier_count"), blank as f64);
 
-    if pvd.logical_block_size != SECTOR as u16 {
+    if usize::from(pvd.logical_block_size) != SECTOR {
         anomalies.push("nonstandard-block-size");
     }
     if pvd.file_structure_version != 1 {
@@ -840,8 +836,8 @@ impl IsoTime {
         let hour = num(8, 2)?;
         let minute = num(10, 2)?;
         let second = num(12, 2)?;
-        let offset = raw.get(16).map_or(0, |b| i16::from(*b as i8));
-        Self::assemble(year, month, day, hour, minute, second, offset)
+        let offset = raw.get(16).map_or(0, |b| i16::from(b.cast_signed()));
+        Self::assemble([year, month, day, hour, minute, second], offset)
     }
 
     /// ECMA-119 §9.1.5 "binary" form used by directory records: years since
@@ -853,26 +849,21 @@ impl IsoTime {
             return None;
         }
         Self::assemble(
-            1900 + i64::from(b[0]),
-            i64::from(b[1]),
-            i64::from(b[2]),
-            i64::from(b[3]),
-            i64::from(b[4]),
-            i64::from(b[5]),
-            i16::from(b[6] as i8),
+            [
+                1900 + i64::from(b[0]),
+                i64::from(b[1]),
+                i64::from(b[2]),
+                i64::from(b[3]),
+                i64::from(b[4]),
+                i64::from(b[5]),
+            ],
+            i16::from(b[6].cast_signed()),
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn assemble(
-        year: i64,
-        month: i64,
-        day: i64,
-        hour: i64,
-        minute: i64,
-        second: i64,
-        quarter_hours: i16,
-    ) -> Option<Self> {
+    /// `civil` is year, month, day, hour, minute, second, in that order.
+    fn assemble(civil: [i64; 6], quarter_hours: i16) -> Option<Self> {
+        let [year, month, day, hour, minute, second] = civil;
         // Writers that don't fill the optional expiration/effective fields
         // leave them as 1900-01-01 rather than as the standard's all-`'0'`
         // sentinel. Neither is a date; both would otherwise surface as a
@@ -969,17 +960,25 @@ fn emit_system_area(
 // El Torito boot catalog
 // ---------------------------------------------------------------------------
 
-/// Returns true when a well-formed El Torito catalog was found.
+/// What a boot record adds to the image-wide accounting.
+#[derive(Default)]
+struct BootTally {
+    /// A well-formed El Torito catalog was found.
+    el_torito: bool,
+    anomalies: Vec<&'static str>,
+    /// Byte ranges the catalog and its boot images occupy.
+    claimed: Vec<(u64, u64)>,
+}
+
 fn emit_boot(
     bytes: &[u8],
     body: &[u8],
     pvd: &Pvd,
     values: &mut Values,
     metrics: &mut Metrics,
-    anomalies: &mut Vec<&'static str>,
-    claimed: &mut Vec<(u64, u64)>,
     archive_members: &mut Vec<ArchiveMember>,
-) -> bool {
+) -> BootTally {
+    let mut tally = BootTally::default();
     let boot_system = decode_field(&field(body, 7, 32), false);
     values.insert_key(
         value_key!("iso.boot.system_id"),
@@ -989,25 +988,27 @@ fn emit_boot(
         // A boot record that isn't El Torito still means "this image
         // claims to boot"; record the claim without inventing a catalog.
         values.insert_key(value_key!("iso.boot.bootable"), JsonValue::Bool(true));
-        return false;
+        return tally;
     }
 
     let catalog_lba = u32_le(body, 71).unwrap_or(0);
     metrics.insert(metric!("iso.boot.catalog_lba"), f64::from(catalog_lba));
     if catalog_lba >= pvd.volume_space_sectors {
-        anomalies.push("boot-catalog-out-of-range");
+        tally.anomalies.push("boot-catalog-out-of-range");
     }
     let Some(catalog) = sector_at(bytes, catalog_lba as usize) else {
-        anomalies.push("boot-catalog-unreadable");
-        return false;
+        tally.anomalies.push("boot-catalog-unreadable");
+        return tally;
     };
     let catalog_start = u64::from(catalog_lba) * SECTOR as u64;
-    claimed.push((catalog_start, catalog_start + SECTOR as u64));
+    tally
+        .claimed
+        .push((catalog_start, catalog_start + SECTOR as u64));
 
     // Validation entry: header 0x01, a platform id, and a 0x55AA key.
     let valid = catalog.first() == Some(&0x01) && catalog.get(30..32) == Some(&[0x55, 0xAA]);
     if !valid {
-        anomalies.push("boot-catalog-invalid");
+        tally.anomalies.push("boot-catalog-invalid");
     }
     let manufacturer = decode_field(&field(catalog, 4, 24), false);
     if !manufacturer.is_empty() {
@@ -1073,13 +1074,15 @@ fn emit_boot(
             "offset": u64::from(load_rba) * SECTOR as u64,
         }));
         if load_rba >= pvd.volume_space_sectors {
-            anomalies.push("boot-image-out-of-range");
+            tally.anomalies.push("boot-image-out-of-range");
         }
         // El Torito counts a boot image in 512-byte virtual sectors even
         // though it is placed on a 2048-byte boundary.
         let image_start = u64::from(load_rba) * SECTOR as u64;
         let image_len = u64::from(sectors).saturating_mul(512).max(SECTOR as u64);
-        claimed.push((image_start, image_start.saturating_add(image_len)));
+        tally
+            .claimed
+            .push((image_start, image_start.saturating_add(image_len)));
         // The boot image is executable content that no directory entry
         // names — a bootkit lives here, not in the file tree — so it is
         // surfaced as a member and analysed like any other payload.
@@ -1120,7 +1123,8 @@ fn emit_boot(
         JsonValue::Bool(platforms.contains(&"efi")),
     );
     values.insert_key(value_key!("iso.boot.entries"), JsonValue::Array(entries));
-    true
+    tally.el_torito = true;
+    tally
 }
 
 fn platform_name(id: u8) -> &'static str {
@@ -1211,6 +1215,11 @@ struct Walk {
     apple: bool,
     truncated: bool,
     dirs_walked: usize,
+    /// SUSP areas parsed, continuations included: the work the CE budget
+    /// bounds.
+    susp_areas_parsed: usize,
+    /// Continuation bytes the rest of the walk may still read.
+    susp_budget: usize,
 }
 
 impl Walk {
@@ -1222,6 +1231,8 @@ impl Walk {
             apple: false,
             truncated: false,
             dirs_walked: 0,
+            susp_areas_parsed: 0,
+            susp_budget: MAX_SUSP_BYTES_TOTAL,
         }
     }
 
@@ -1325,7 +1336,7 @@ impl Walk {
             // System-use area: everything after the name, padded to even.
             let su_start = 33 + name_len + usize::from(name_len.is_multiple_of(2));
             if let Some(su) = rec.get(su_start..) {
-                self.parse_susp(bytes, su, &mut entry, prefix, 0);
+                self.parse_susp(bytes, su, &mut entry, prefix);
             }
             out.push(entry);
             if self.entries.len() + out.len() >= MAX_ENTRIES {
@@ -1337,9 +1348,54 @@ impl Walk {
     }
 
     /// System Use Sharing Protocol entries — the carrier for Rock Ridge.
-    /// `CE` chains into a continuation area elsewhere in the image, which
-    /// is followed up to `MAX_CE_HOPS` deep.
-    fn parse_susp(&mut self, bytes: &[u8], su: &[u8], entry: &mut Entry, prefix: &str, hop: usize) {
+    ///
+    /// A `CE` entry chains into a continuation area elsewhere in the image.
+    /// SUSP allows one per area, but a hostile area can list hundreds, each
+    /// pointing back at itself; following every one as it is met multiplies
+    /// the work per hop. So an area is finished first and only then is its
+    /// first continuation followed: a chain, never a tree. The chain stops at
+    /// `MAX_CE_HOPS`, at an area already read for this entry, and when the
+    /// entry or the whole walk runs out of SUSP bytes.
+    fn parse_susp(&mut self, bytes: &[u8], su: &[u8], entry: &mut Entry, prefix: &str) {
+        let mut area = su;
+        let mut followed: Vec<(usize, usize)> = Vec::new();
+        let mut entry_budget = MAX_SUSP_BYTES_PER_ENTRY;
+        loop {
+            self.susp_areas_parsed += 1;
+            let continuation = self.parse_susp_area(area, entry);
+            let Some((start, end)) = continuation else {
+                break;
+            };
+            if followed.len() >= MAX_CE_HOPS || followed.contains(&(start, end)) {
+                break;
+            }
+            let take = (end - start).min(entry_budget).min(self.susp_budget);
+            let Some(next) = bytes.get(start..start.saturating_add(take)) else {
+                break;
+            };
+            if take < end - start {
+                // A continuation cut short by a budget, not by the image.
+                self.truncated = true;
+            }
+            if next.is_empty() {
+                break;
+            }
+            entry_budget -= next.len();
+            self.susp_budget -= next.len();
+            followed.push((start, end));
+            area = next;
+        }
+        if let Some(alt) = entry.alt_name.as_ref()
+            && !alt.is_empty()
+        {
+            entry.path = format!("{prefix}/{alt}");
+        }
+    }
+
+    /// Parse one SUSP area into `entry`. Returns the byte range of the first
+    /// `CE` continuation it names, for [`Self::parse_susp`] to follow.
+    fn parse_susp_area(&mut self, su: &[u8], entry: &mut Entry) -> Option<(usize, usize)> {
+        let mut continuation = None;
         let mut pos = 0_usize;
         while let Some(&[sig0, sig1, len, _version]) =
             su.get(pos..).and_then(|rest| rest.first_chunk::<4>())
@@ -1376,10 +1432,8 @@ impl Walk {
                     self.rock_ridge = true;
                     // Flag bit 0 = continues in the next NM entry.
                     let part = String::from_utf8_lossy(data.get(1..).unwrap_or_default());
-                    match &mut entry.alt_name {
-                        Some(existing) => existing.push_str(&part),
-                        None => entry.alt_name = Some(part.into_owned()),
-                    }
+                    let name = entry.alt_name.get_or_insert_with(String::new);
+                    push_capped(name, &part, MAX_ALT_NAME_LEN);
                 }
                 b"SL" => {
                     self.rock_ridge = true;
@@ -1387,10 +1441,7 @@ impl Walk {
                     decode_symlink(data, target);
                 }
                 b"AA" | b"AB" | b"AS" => self.apple = true,
-                b"CE" => {
-                    if hop >= MAX_CE_HOPS {
-                        continue;
-                    }
+                b"CE" if continuation.is_none() => {
                     let (Some(block), Some(off), Some(len)) =
                         (u32_le(data, 0), u32_le(data, 8), u32_le(data, 16))
                     else {
@@ -1400,23 +1451,25 @@ impl Walk {
                         .saturating_mul(SECTOR)
                         .saturating_add(off as usize);
                     let end = start.saturating_add((len as usize).min(SECTOR * 4));
-                    if let Some(cont) = bytes.get(start..end) {
-                        // Copy out: `bytes` is borrowed immutably while
-                        // `entry` is borrowed mutably by the recursion.
-                        let cont = cont.to_vec();
-                        self.parse_susp(bytes, &cont, entry, prefix, hop + 1);
-                    }
+                    continuation = Some((start, end));
                 }
                 b"ST" => break,
                 _ => {}
             }
         }
-        if let Some(alt) = entry.alt_name.as_ref()
-            && !alt.is_empty()
-        {
-            entry.path = format!("{prefix}/{alt}");
-        }
+        continuation
     }
+}
+
+/// Append `part` to `out` without growing it past `cap` bytes, cutting at a
+/// character boundary.
+fn push_capped(out: &mut String, part: &str, cap: usize) {
+    let room = cap.saturating_sub(out.len());
+    let mut take = part.len().min(room);
+    while !part.is_char_boundary(take) {
+        take -= 1;
+    }
+    out.push_str(part.get(..take).unwrap_or_default());
 }
 
 /// Reassemble an `SL` (symlink) entry's component list. Components are

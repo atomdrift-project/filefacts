@@ -140,22 +140,26 @@ fn macho(values: &Values, bytes: &[u8], id: &mut Identity) {
             .get_key(value_key!("macho.code_signature.flags"))
             .is_some();
     let cms = values.get_key(value_key!("macho.code_signature.cms"));
-    let cms_present = cms.is_some();
+    // A verified CMS signature binds the CodeDirectory (its messageDigest is
+    // the CodeDirectory's hash), so the fields inside it are proven to be the
+    // signer's. A CMS that is merely present proves nothing.
+    let cms_verified = cms
+        .and_then(|c| c.get("verified"))
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
 
     if let Some(ident) = get_str(values, value_key!("macho.code_signature.identifier")) {
-        // The identifier lives in the CodeDirectory, which the signature
-        // covers — but only a real CMS chain *proves* who set it.
         id.identifier = Some(Claim {
             value: ident.to_string(),
             source: "macho.code_signature.identifier".into(),
-            verified: cms_present,
+            verified: cms_verified,
         });
     }
     if let Some(team) = get_str(values, value_key!("macho.code_signature.team_id")) {
         id.team_id = Some(Claim {
             value: team.to_string(),
             source: "macho.code_signature.team_id".into(),
-            verified: cms_present,
+            verified: cms_verified,
         });
     }
     if let Some(cdhash) = get_str(values, value_key!("macho.code_signature.cdhash")) {
@@ -181,15 +185,18 @@ fn macho(values: &Values, bytes: &[u8], id: &mut Identity) {
         .unwrap_or(0);
     let ad_hoc = flag_set(values, value_key!("macho.code_signature.flags"), "ad_hoc");
     if id.trust == Trust::Unsigned && signed {
+        // A code signature with no certificate behind it: ad hoc when it
+        // says so, and otherwise a structure nothing here could verify.
         id.trust = if ad_hoc {
             Trust::AdHoc
         } else {
-            Trust::CaSigned
+            Trust::Unverified
         };
     }
-    if platform > 0 {
-        // A platform binary is trusted by the OS via the system trust
-        // cache — the strongest first-party signal, even when ad-hoc.
+    // The CodeDirectory's platform byte marks an OS component, but any
+    // binary can set it; only Apple's own verified signature over that
+    // CodeDirectory makes the claim stick.
+    if platform > 0 && id.trust == Trust::Platform {
         id.trust = Trust::System;
     }
 
@@ -1167,6 +1174,8 @@ struct CertInfo {
     issuer: Option<String>,
     self_issued: bool,
     verified: bool,
+    /// The platform root the verified chain ends at (`chain_anchor`).
+    anchor: Option<String>,
     signed_at: Option<String>,
 }
 
@@ -1192,6 +1201,10 @@ fn cert_from_obj(obj: &JsonValue) -> Option<CertInfo> {
         .get("verified")
         .and_then(JsonValue::as_bool)
         .unwrap_or(false);
+    let anchor = obj
+        .get("chain_anchor")
+        .and_then(JsonValue::as_str)
+        .map(str::to_string);
     let signed_at = obj
         .get("signing_time")
         .and_then(JsonValue::as_str)
@@ -1203,6 +1216,7 @@ fn cert_from_obj(obj: &JsonValue) -> Option<CertInfo> {
         issuer,
         self_issued,
         verified,
+        anchor,
         signed_at,
     })
 }
@@ -1218,28 +1232,40 @@ fn signer_struct(ci: &CertInfo, source: &str) -> Signer {
     }
 }
 
+/// Trust tier of one signature object.
+///
+/// Only cryptography lifts a signature above `Unverified`: `verified` must be
+/// true, which means the signer's key signed the attributes and those bind
+/// the signed content. A certificate's names decide nothing on their own,
+/// since anyone minting a certificate chooses them, so the vendor tiers also
+/// require `chain_anchor`: a verified chain ending at the vendor's own root.
+/// Within an anchored chain the leaf's names then pick the tier, by exact
+/// match: Apple's `Developer ID ` certificates are `DeveloperId`, and a leaf
+/// whose organization is the vendor itself is `Platform`. Every other
+/// verified signature, including one under a vendor root issued to a third
+/// party, is `CaSigned` — a CA signed it, and which CAs to trust is left to
+/// consumers pinning `chain_sha256`.
 fn cert_trust(ci: &CertInfo) -> Trust {
+    if !ci.verified {
+        return Trust::Unverified;
+    }
     if ci.self_issued {
         return Trust::SelfSigned;
     }
-    if ci
-        .cn
-        .as_deref()
-        .is_some_and(|cn| cn.starts_with("Developer ID"))
-    {
-        return Trust::DeveloperId;
+    let organization = ci.o.as_deref();
+    match ci.anchor.as_deref() {
+        Some("apple")
+            if ci
+                .cn
+                .as_deref()
+                .is_some_and(|cn| cn.starts_with("Developer ID ")) =>
+        {
+            Trust::DeveloperId
+        }
+        Some("apple") if organization == Some("Apple Inc.") => Trust::Platform,
+        Some("microsoft") if organization == Some("Microsoft Corporation") => Trust::Platform,
+        _ => Trust::CaSigned,
     }
-    let hay = format!(
-        "{} {} {}",
-        ci.o.as_deref().unwrap_or(""),
-        ci.subject.as_deref().unwrap_or(""),
-        ci.issuer.as_deref().unwrap_or("")
-    )
-    .to_ascii_lowercase();
-    if hay.contains("apple") || hay.contains("microsoft") {
-        return Trust::Platform;
-    }
-    Trust::CaSigned
 }
 
 /// Pull one attribute value out of an RFC 4514 distinguished name.
@@ -1957,5 +1983,138 @@ mod lnk_identity_tests {
         );
         assert_eq!(ids["machine_id"], "build-host-01");
         assert_eq!(ids["lnk_volume_serial"], "3405691582");
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::{FileType, Trust, Values, derive};
+    use serde_json::{Value as JsonValue, json};
+
+    fn pe_trust(signature: JsonValue) -> Trust {
+        let mut values = Values::default();
+        values.insert("pe.signatures", JsonValue::Array(vec![signature]));
+        derive(FileType::Pe, &[], &values).trust
+    }
+
+    fn signature(o: &str, cn: &str, verified: bool, anchor: Option<&str>) -> JsonValue {
+        let mut sig = json!({
+            "subject": format!("CN={cn},O={o}"),
+            "issuer": "CN=Some CA",
+            "verified": verified,
+        });
+        if let Some(anchor) = anchor {
+            sig["chain_anchor"] = json!(anchor);
+        }
+        sig
+    }
+
+    /// Names in a certificate are the signer's to choose; without a
+    /// verified signature they establish nothing.
+    #[test]
+    fn unverified_signature_is_unverified_whatever_it_names() {
+        for o in ["Applebee's", "Microsoft Corporation", "Apple Inc."] {
+            assert_eq!(pe_trust(signature(o, "x", false, None)), Trust::Unverified);
+        }
+        let mut unsupported = signature("Microsoft Corporation", "x", true, Some("microsoft"));
+        unsupported["verified"] = JsonValue::Null;
+        assert_eq!(pe_trust(unsupported), Trust::Unverified);
+    }
+
+    /// A verified signature naming a vendor, by a chain that does not end
+    /// at that vendor's root, is just CA-signed.
+    #[test]
+    fn vendor_names_need_the_vendor_anchor() {
+        assert_eq!(
+            pe_trust(signature("Microsoft Corporation", "x", true, None)),
+            Trust::CaSigned
+        );
+        assert_eq!(
+            pe_trust(signature("Microsoft Corporation", "x", true, Some("apple"))),
+            Trust::CaSigned
+        );
+        assert_eq!(
+            pe_trust(signature("Applebee's", "x", true, Some("apple"))),
+            Trust::CaSigned
+        );
+        assert_eq!(
+            pe_trust(signature(
+                "Microsoft Corporation",
+                "x",
+                true,
+                Some("microsoft")
+            )),
+            Trust::Platform
+        );
+        assert_eq!(
+            pe_trust(signature(
+                "Apple Inc.",
+                "Software Signing",
+                true,
+                Some("apple")
+            )),
+            Trust::Platform
+        );
+    }
+
+    #[test]
+    fn developer_id_needs_the_apple_anchor() {
+        let cn = "Developer ID Application: Example (TEAM123)";
+        assert_eq!(
+            pe_trust(signature("Example", cn, true, Some("apple"))),
+            Trust::DeveloperId
+        );
+        assert_eq!(
+            pe_trust(signature("Example", cn, true, None)),
+            Trust::CaSigned
+        );
+    }
+
+    fn macho_trust(platform: u64, cms: Option<JsonValue>) -> Trust {
+        let mut values = Values::default();
+        values.insert("macho.code_signature.cdhash", json!("00"));
+        values.insert("macho.code_signature.platform", json!(platform));
+        if let Some(cms) = cms {
+            values.insert("macho.code_signature.cms", cms);
+        }
+        derive(FileType::MachO, &[], &values).trust
+    }
+
+    /// Any binary can set the CodeDirectory's platform byte; only Apple's
+    /// verified signature over that CodeDirectory makes it a system binary.
+    #[test]
+    fn platform_byte_alone_is_not_system() {
+        let apple =
+            |verified, anchor| signature("Apple Inc.", "Software Signing", verified, anchor);
+        assert_eq!(macho_trust(0xe, None), Trust::Unverified);
+        assert_eq!(
+            macho_trust(0xe, Some(apple(false, Some("apple")))),
+            Trust::Unverified
+        );
+        assert_eq!(macho_trust(0xe, Some(apple(true, None))), Trust::CaSigned);
+        assert_eq!(
+            macho_trust(0xe, Some(apple(true, Some("apple")))),
+            Trust::System
+        );
+        assert_eq!(
+            macho_trust(0, Some(apple(true, Some("apple")))),
+            Trust::Platform
+        );
+    }
+
+    /// The CodeDirectory's identifier is proven only by a CMS signature that
+    /// verified over it, not by one merely being present.
+    #[test]
+    fn code_directory_claims_are_verified_only_by_a_verified_cms() {
+        for verified in [false, true] {
+            let mut values = Values::default();
+            values.insert("macho.code_signature.identifier", json!("com.example.tool"));
+            values.insert(
+                "macho.code_signature.cms",
+                signature("Example", "x", verified, None),
+            );
+            let id = derive(FileType::MachO, &[], &values);
+            assert_eq!(id.identifier.unwrap().verified, verified);
+        }
     }
 }

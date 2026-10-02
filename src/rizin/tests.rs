@@ -732,12 +732,191 @@ fn log_stats_is_no_op_when_total_zero() {
 }
 
 #[test]
-fn stats_tuple_shape_is_stable() {
-    let (total, successes, timeouts, failures, mem) = stats();
-    // Tautological — purpose is to pin the (5,) tuple shape so a
-    // future API change trips a compile error here. The cleave
-    // host CLI destructures the tuple positionally.
-    let _ = (total, successes, timeouts, failures, mem);
+fn stats_are_monotonic_named_counters() {
+    let before = stats();
+    let after = stats();
+    // Parallel tests may bump counters between the two reads, never lower
+    // them.
+    assert!(after.total >= before.total);
+    assert!(after.failures >= before.failures);
+    assert!(after.abandoned_drains >= before.abandoned_drains);
+}
+
+// ------------------------------------------------------------------
+// Temp input: unpredictable, private, never left behind
+// ------------------------------------------------------------------
+
+#[test]
+fn temp_input_is_private_registered_and_removed_on_drop() {
+    let input = TempInput::write(b"sample bytes").expect("temp dir is writable");
+    let path = input.path().to_path_buf();
+    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.starts_with(TEMP_INPUT_PREFIX), "{name}");
+    assert!(
+        !name.contains(&format!("-{}-", std::process::id())),
+        "name must not be derivable from the pid: {name}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"sample bytes");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "other users must not read the sample");
+    }
+    assert!(registry(&RIZIN_TEMP_INPUTS).contains(&path));
+    drop(input);
+    assert!(!path.exists(), "temp input deleted on drop");
+    assert!(!registry(&RIZIN_TEMP_INPUTS).contains(&path));
+}
+
+#[test]
+#[cfg(unix)]
+fn temp_input_refuses_a_planted_path() {
+    // The old name was `filefacts-rizin-{pid}-{seq}.bin`: plant a symlink at
+    // every name it could have chosen next and check none is written through.
+    let target = unique_shim_dir("filefacts-rizin-planted-target");
+    let victim = target.with_extension("victim");
+    std::fs::write(&victim, b"untouched").unwrap();
+    let mut planted = Vec::new();
+    for seq in 0..64 {
+        let p =
+            std::env::temp_dir().join(format!("filefacts-rizin-{}-{seq}.bin", std::process::id()));
+        if std::os::unix::fs::symlink(&victim, &p).is_ok() {
+            planted.push(p);
+        }
+    }
+    let input = TempInput::write(b"sample").unwrap();
+    assert!(!planted.contains(&input.path().to_path_buf()));
+    drop(input);
+    assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+    for p in planted {
+        let _ = std::fs::remove_file(p);
+    }
+    let _ = std::fs::remove_file(victim);
+}
+
+#[test]
+fn kill_all_rizin_groups_removes_registered_temp_inputs() {
+    let _lock = rizin_test_lock();
+    let input = TempInput::write(b"in flight").unwrap();
+    let path = input.path().to_path_buf();
+    kill_all_rizin_groups();
+    assert!(
+        !path.exists(),
+        "the reaper deletes inputs process::exit would leak"
+    );
+    // The run's own cleanup still tolerates the file being gone.
+    drop(input);
+    assert!(!registry(&RIZIN_TEMP_INPUTS).contains(&path));
+}
+
+// ------------------------------------------------------------------
+// In-run memo: byte-bounded
+// ------------------------------------------------------------------
+
+#[test]
+fn memo_is_bounded_by_bytes_as_well_as_entries() {
+    let mut memo = Memo::new();
+    let empty = || Some(make_recovery("{}"));
+    memo.insert([1; 32], empty(), RIZIN_MEMO_MAX_BYTES / 8);
+    assert!(memo.get(&[1; 32]).is_some());
+    // Too large to share the budget: not remembered, and nothing evicted.
+    memo.insert([2; 32], empty(), RIZIN_MEMO_MAX_BYTES / 2);
+    assert!(memo.get(&[2; 32]).is_none());
+    assert!(memo.get(&[1; 32]).is_some());
+    // Filling past the byte budget resets the map instead of growing it.
+    for k in 3..20u8 {
+        memo.insert([k; 32], empty(), RIZIN_MEMO_MAX_BYTES / 5);
+        assert!(memo.bytes <= RIZIN_MEMO_MAX_BYTES, "{} bytes", memo.bytes);
+    }
+    // A memoized failure is remembered as such.
+    memo.insert([99; 32], None, 0);
+    assert_eq!(memo.get(&[99; 32]).map(Option::is_none), Some(true));
+}
+
+#[test]
+#[cfg(unix)]
+fn outside_sigkill_is_transient_but_a_crash_is_decided() {
+    let _lock = rizin_test_lock();
+    let killed = stage_script("filefacts-rizin-killedshim", "kill -9 $$\n");
+    let attempt = attempt_with_bin(&killed.join("rizin"), b"x", 0, false, RIZIN_TIMEOUT);
+    assert!(attempt.recovery.is_none());
+    assert!(
+        !attempt.deterministic,
+        "a SIGKILL we did not send must not be memoized"
+    );
+    let crashed = stage_script("filefacts-rizin-crashshim", "exit 3\n");
+    let attempt = attempt_with_bin(&crashed.join("rizin"), b"x", 0, false, RIZIN_TIMEOUT);
+    assert!(attempt.recovery.is_none());
+    assert!(attempt.deterministic, "a crash on these bytes is theirs");
+    let _ = std::fs::remove_dir_all(killed);
+    let _ = std::fs::remove_dir_all(crashed);
+}
+
+// ------------------------------------------------------------------
+// Hardened runner: output cap, version probe
+// ------------------------------------------------------------------
+
+/// Stage `body` as an executable `rizin` shell script in a fresh directory.
+#[cfg(unix)]
+fn stage_script(prefix: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = unique_shim_dir(prefix);
+    std::fs::create_dir_all(&dir).unwrap();
+    let shim = dir.join("rizin");
+    std::fs::write(&shim, format!("#!/bin/sh\n{body}")).unwrap();
+    let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&shim, perms).unwrap();
+    dir
+}
+
+#[test]
+#[cfg(unix)]
+fn output_cap_kills_the_group_from_the_supervisor_and_keeps_the_prefix() {
+    let _lock = rizin_test_lock();
+    // Writes forever; only the cap can end it before the deadline.
+    let dir = stage_script("filefacts-rizin-floodshim", "yes rizin-output\n");
+    let started = std::time::Instant::now();
+    let outcome = run_hardened(
+        Command::new(dir.join("rizin")),
+        Duration::from_secs(30),
+        64 * 1024,
+    );
+    let RunOutcome::Exited {
+        status,
+        stdout,
+        cap_hit,
+    } = outcome
+    else {
+        panic!("a capped run still exits");
+    };
+    assert!(cap_hit);
+    assert!(!status.success());
+    assert_eq!(stdout.len(), 64 * 1024, "the prefix up to the cap is kept");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the cap, not the deadline, ended the run"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(unix)]
+fn version_probe_is_bounded_by_its_deadline() {
+    let _lock = rizin_test_lock();
+    let dir = stage_script("filefacts-rizin-hangshim", "exec sleep 300\n");
+    let started = std::time::Instant::now();
+    assert_eq!(version_of(&dir.join("rizin"), Duration::from_secs(1)), None);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let dir = stage_script("filefacts-rizin-versionshim", "echo 'rizin 9.9.9 @ test'\n");
+    assert_eq!(
+        version_of(&dir.join("rizin"), Duration::from_secs(30)).as_deref(),
+        Some("rizin 9.9.9 @ test")
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 // ------------------------------------------------------------------

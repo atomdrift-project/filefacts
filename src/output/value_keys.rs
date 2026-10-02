@@ -44,9 +44,9 @@ use super::metric_keys::str_eq;
 /// A [`Values`](super::Values) path that is known to be declared in
 /// [`VALUE_CATALOG`].
 ///
-/// The inner string is private, and outside this module the only constructor
-/// is [`value_key!`](crate::value_key), so holding a `ValueKey` means the path
-/// was checked at compile time. It wraps a `&'static str`, so it is `Copy` and
+/// The inner string is private, and the only constructor is filefacts' own
+/// `value_key!` macro, so holding a `ValueKey` means the path was checked at
+/// compile time. It wraps a `&'static str`, so it is `Copy` and
 /// APIs take it by value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ValueKey(&'static str);
@@ -84,21 +84,17 @@ impl std::fmt::Display for ValueKey {
 
 /// Resolve a literal against [`VALUE_CATALOG`], or fail the build.
 ///
-/// This is an implementation detail of [`value_key!`](crate::value_key). It is
-/// public only because an exported macro can only call public items, and it
-/// is not part of the supported API. `value_key!` evaluates it in a `const`
-/// context, which turns an undeclared key into a compile error. Calling it
-/// directly from runtime code would move that panic to runtime and lose the
-/// check.
+/// The implementation of `value_key!`, which evaluates it in a `const`
+/// context so an undeclared key is a compile error. Calling it directly from
+/// runtime code would move that panic to runtime and lose the check.
 ///
 /// # Panics
 ///
 /// If `name` is not in [`VALUE_CATALOG`]. Through `value_key!` this is a
 /// `const` evaluation failure, reported as a build error at the offending call
 /// site. That is the only way this panic is expected to happen.
-#[doc(hidden)]
 #[must_use]
-pub const fn declared_value_key(name: &'static str) -> ValueKey {
+pub(crate) const fn declared_value_key(name: &'static str) -> ValueKey {
     let mut rest = VALUE_CATALOG;
     while let [key, tail @ ..] = rest {
         if str_eq(key, name) {
@@ -118,19 +114,19 @@ pub const fn declared_value_key(name: &'static str) -> ValueKey {
 ///
 /// The literal must appear in [`VALUE_CATALOG`]. If it does not, the call
 /// site fails to compile.
-#[macro_export]
 macro_rules! value_key {
     ($name:literal) => {{
-        const KEY: $crate::ValueKey = $crate::declared_value_key($name);
+        const KEY: $crate::ValueKey = $crate::output::declared_value_key($name);
         KEY
     }};
 }
+pub(crate) use value_key;
 
 /// Every fixed value key filefacts writes, sorted.
 ///
 /// Keep it sorted, with one key per line: this list is read as a diff far more
 /// often than it is read as a list. Each key must be written through
-/// [`value_key!`](crate::value_key) somewhere outside a test; a unit test
+/// `value_key!` somewhere outside a test; a unit test
 /// enforces that, so a key whose last writer goes away cannot stay here and
 /// keep its readers compiling against nothing.
 pub const VALUE_CATALOG: &[&str] = &[
@@ -142,6 +138,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "android.components",
     "android.debuggable",
     "android.install_location",
+    "android.limits",
     "android.min_sdk",
     "android.network_security_config",
     "android.package",
@@ -185,6 +182,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "archive.timing.mtime_max",
     "archive.timing.mtime_min",
     "archive.timing.mtime_outlier_members",
+    "asar.limits",
     "binary.fortify",
     "binary.packer",
     "binary.packer_version",
@@ -717,6 +715,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "png.features",
     "png.icc_profile_name",
     "png.last_modified",
+    "png.limits",
     "png.text",
     "png.unknown_chunks",
     "pyc.hash",
@@ -728,6 +727,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "python.author",
     "python.homepage",
     "python.license",
+    "python.limits",
     "python.maintainer",
     "python.name",
     "python.requires_python",
@@ -836,6 +836,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "source.wordpress.text_domain",
     "source.wordpress.theme_name",
     "source.wordpress.version",
+    "tar.limits",
     "vsix.assets",
     "vsix.categories",
     "vsix.dependencies",

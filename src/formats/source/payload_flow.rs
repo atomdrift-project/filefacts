@@ -4,10 +4,12 @@
 //! Track assignments and local helper summaries, keeping HTTP authentication
 //! separate from request bodies. Unknown code is not assumed to be an HTTP
 //! client. Analysis limits are surfaced rather than reported as clean scans.
-use super::langs::Lang;
+use super::langs::{self, Lang};
+use super::visit::{self, NodeIds, Visit};
 use super::{MAX_FLOW_DEPTH, named_children};
-use crate::Values;
+use crate::package_context::{ContextLimits, SourceFile};
 use crate::value_key;
+use crate::{GoFileFlow, GoPackageFlow, Values};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use tree_sitter::Node;
@@ -55,45 +57,213 @@ struct Analysis<'s> {
     truncated: bool,
 }
 
-fn function(node: Node<'_>) -> bool {
+/// Definitions the analysis indexes by name as local helpers.
+pub(super) const FUNCTION_KINDS: &[&str] = &[
+    "function_item",
+    "function_definition",
+    "function_declaration",
+    "generator_function_declaration",
+];
+
+/// Bound on the nodes the function-index walk keeps pending, past which it
+/// stops and the analysis is reported truncated.
+const INDEX_STACK_LIMIT: usize = 10_000;
+
+/// Whether [`emit`] analyses `source` in `language` at all, and so needs a
+/// [`Collector`] from the walk.
+fn analysed(language: Lang, source: &str) -> bool {
     matches!(
-        node.kind(),
-        "function_item"
-            | "function_definition"
-            | "function_declaration"
-            | "generator_function_declaration"
+        language,
+        Lang::Rust | Lang::Python | Lang::JavaScript | Lang::TypeScript | Lang::Go
+    ) && source.len() <= 2 * 1024 * 1024
+}
+
+/// What the analysis needs from the shared walk ([`super::visit`]): the index
+/// of named helper functions, Python import aliases, and for Rust the
+/// test-only nodes it never evaluates.
+///
+/// The index came from a walk of its own, which popped an explicit stack of
+/// named children: right to left, skipping test-only nodes, not descending
+/// into definitions, and stopping once more than [`INDEX_STACK_LIMIT`] nodes
+/// were pending. The collector records what that walk did, on exit from each
+/// node, as events; reversed, they replay in that walk's order and stop where
+/// it stopped.
+pub(super) struct Collector<'t> {
+    source: &'t str,
+    language: Lang,
+    /// Rust nodes after a run of attributes that includes `#[cfg(test)]` or
+    /// `#[test]`.
+    excluded: HashSet<usize>,
+    /// One per open node of the walk.
+    frames: Vec<Frame>,
+    events: Vec<Event<'t>>,
+}
+
+#[derive(Clone, Copy)]
+struct Frame {
+    /// The index walk pushed this node's named children.
+    expanded: bool,
+    /// Nodes the index walk had pushed but not yet popped when it reached
+    /// this one: the named siblings left of it and of each ancestor.
+    pending: usize,
+    /// Reached by the test-attribute scan, which follows named children.
+    scanned: bool,
+    /// The named children entered so far end in a run of attributes that
+    /// includes a test attribute.
+    after_test_attribute: bool,
+}
+
+enum Event<'t> {
+    /// A named definition: the index key and the function node.
+    Function(String, Node<'t>),
+    PythonImport(Node<'t>),
+    /// The index walk's stack outgrew [`INDEX_STACK_LIMIT`] here.
+    Overflow,
+}
+
+/// A finished [`Collector`].
+pub(super) struct Collected<'t> {
+    excluded: HashSet<usize>,
+    /// In the index walk's order.
+    events: Vec<Event<'t>>,
+}
+
+impl<'t> Collector<'t> {
+    /// A collector for `source`, or `None` when [`emit`] will not analyse it.
+    pub(super) fn new(source: &'t str, language: Lang) -> Option<Self> {
+        analysed(language, source).then(|| Self {
+            source,
+            language,
+            excluded: HashSet::new(),
+            frames: Vec::new(),
+            events: Vec::new(),
+        })
+    }
+
+    pub(super) fn enter(&mut self, visit: &Visit<'t>, ids: &NodeIds) {
+        let node = visit.node;
+        let (reached, scanned, pending) = match self.frames.last_mut() {
+            None => (true, true, 0),
+            Some(parent) => {
+                let scanned = parent.scanned && visit.named;
+                // Test attributes are Rust syntax; no other grammar has them.
+                // The run is tracked across siblings, as asking
+                // `Node::prev_named_sibling` per node would walk down from
+                // the root every time.
+                if scanned && self.language == Lang::Rust {
+                    if parent.after_test_attribute {
+                        self.excluded.insert(node.id());
+                    }
+                    if ids.attribute_item.contains(visit.kind_id) {
+                        let text = self.source[node.byte_range()]
+                            .split_whitespace()
+                            .collect::<String>();
+                        parent.after_test_attribute |= text == "#[cfg(test)]" || text == "#[test]";
+                    } else {
+                        parent.after_test_attribute = false;
+                    }
+                }
+                (
+                    parent.expanded && visit.named,
+                    scanned,
+                    parent.pending + visit.named_index,
+                )
+            }
+        };
+        let mut expanded = false;
+        if reached && !self.excluded.contains(&node.id()) {
+            if ids.payload_function.contains(visit.kind_id) {
+                // Nested definitions have separate lexical scopes, not global
+                // names, so a definition is never expanded.
+                if let Some(name) = node.child_by_field_name("name") {
+                    let name = &self.source[name.byte_range()];
+                    let key = if self.language == Lang::Go && name == "init" {
+                        format!("init@{}", node.start_byte())
+                    } else {
+                        name.to_string()
+                    };
+                    self.events.push(Event::Function(key, node));
+                }
+            } else if let Some((name, value)) = ids
+                .variable_declarator
+                .contains(visit.kind_id)
+                .then(|| {
+                    node.child_by_field_name("name")
+                        .zip(node.child_by_field_name("value"))
+                })
+                .flatten()
+                .filter(|(_, value)| {
+                    matches!(value.kind(), "arrow_function" | "function_expression")
+                })
+            {
+                let key = self.source[name.byte_range()].to_string();
+                self.events.push(Event::Function(key, value));
+            } else {
+                expanded = true;
+            }
+        }
+        self.frames.push(Frame {
+            expanded,
+            pending,
+            scanned,
+            after_test_attribute: false,
+        });
+    }
+
+    pub(super) fn exit(&mut self, visit: &Visit<'t>, ids: &NodeIds) {
+        let Some(frame) = self.frames.pop() else {
+            return;
+        };
+        if frame.expanded {
+            // Recorded in reverse: the index walk handled the node's Python
+            // import, then pushed its named children and checked the stack.
+            if frame.pending + visit.node.named_child_count() > INDEX_STACK_LIMIT {
+                self.events.push(Event::Overflow);
+            }
+            if self.language == Lang::Python && ids.python_import.contains(visit.kind_id) {
+                self.events.push(Event::PythonImport(visit.node));
+            }
+        }
+    }
+
+    pub(super) fn finish(&mut self) {
+        self.events.reverse();
+    }
+
+    pub(super) fn into_collected(self) -> Collected<'t> {
+        Collected {
+            excluded: self.excluded,
+            events: self.events,
+        }
+    }
+}
+
+/// Walk `root` for the analysis alone, when no shared walk collected for it.
+fn collect<'t>(root: Node<'t>, source: &'t str, language: Lang) -> Collected<'t> {
+    let config = langs::config_for(language.file_type()).expect("every Lang has a LangConfig");
+    let mut collectors = visit::Collectors {
+        payload: Collector::new(source, language),
+        ..visit::Collectors::default()
+    };
+    visit::walk(root, source, config, &mut collectors);
+    collectors.payload.map_or_else(
+        || Collected {
+            excluded: HashSet::new(),
+            events: Vec::new(),
+        },
+        Collector::into_collected,
     )
 }
 
-/// Ids of Rust nodes preceded by a run of attributes that includes
-/// `#[cfg(test)]` or `#[test]`. The run is tracked while iterating each node's
-/// children: asking `Node::prev_named_sibling` per evaluated node instead
-/// costs a walk down from the root every time.
-fn test_only(root: Node<'_>, source: &str) -> HashSet<usize> {
-    let mut excluded = HashSet::new();
-    let mut stack = vec![root];
-    let mut cursor = root.walk();
-    while let Some(node) = stack.pop() {
-        let mut after_test_attribute = false;
-        for child in node.named_children(&mut cursor) {
-            if after_test_attribute {
-                excluded.insert(child.id());
-            }
-            if child.kind() == "attribute_item" {
-                let text = source[child.byte_range()]
-                    .split_whitespace()
-                    .collect::<String>();
-                after_test_attribute |= text == "#[cfg(test)]" || text == "#[test]";
-            } else {
-                after_test_attribute = false;
-            }
-            stack.push(child);
-        }
-    }
-    excluded
-}
-
-pub(super) fn emit(root: Node<'_>, source: &str, language: Lang, values: &mut Values) {
+/// Analyse `root`, using what the shared walk collected when it ran a
+/// [`Collector`].
+pub(super) fn emit<'t>(
+    root: Node<'t>,
+    source: &'t str,
+    language: Lang,
+    values: &mut Values,
+    collected: Option<Collected<'t>>,
+) {
     emit_seeded(
         root,
         source,
@@ -101,16 +271,18 @@ pub(super) fn emit(root: Node<'_>, source: &str, language: Lang, values: &mut Va
         values,
         &BTreeMap::new(),
         &HashMap::new(),
+        collected,
     );
 }
 
-fn emit_seeded(
-    root: Node<'_>,
-    source: &str,
+fn emit_seeded<'t>(
+    root: Node<'t>,
+    source: &'t str,
     language: Lang,
     values: &mut Values,
     seeds: &BTreeMap<String, Summary>,
     global_seeds: &HashMap<String, Bits>,
+    collected: Option<Collected<'t>>,
 ) -> (BTreeMap<String, Summary>, HashMap<String, Bits>) {
     if !matches!(
         language,
@@ -118,20 +290,17 @@ fn emit_seeded(
     ) {
         return (BTreeMap::new(), HashMap::new());
     }
-    if source.len() > 2 * 1024 * 1024 {
+    if !analysed(language, source) {
         values.insert_key(value_key!("source.payload_flow.truncated"), json!(true));
         return (BTreeMap::new(), HashMap::new());
     }
+    let Collected { excluded, events } =
+        collected.unwrap_or_else(|| collect(root, source, language));
     let mut a = Analysis {
         source,
         language,
         aliases: HashMap::new(),
-        // Test attributes are Rust syntax; no other grammar has them.
-        excluded: if language == Lang::Rust {
-            test_only(root, source)
-        } else {
-            HashSet::new()
-        },
+        excluded,
         summaries: seeds.clone(),
         budget: LIMIT,
         truncated: false,
@@ -159,48 +328,20 @@ fn emit_seeded(
                 .or_insert_with(|| name.to_string());
         }
     }
-    let mut stack = vec![root];
     let mut functions = BTreeMap::new();
     let mut ambiguous = Vec::new();
-    while let Some(node) = stack.pop() {
-        if a.excluded.contains(&node.id()) {
-            continue;
-        }
-        if function(node) {
-            if let Some(name) = node.child_by_field_name("name") {
-                let key = if language == Lang::Go && a.text(name) == "init" {
-                    format!("init@{}", node.start_byte())
-                } else {
-                    a.text(name).to_string()
-                };
+    for event in events {
+        match event {
+            Event::Function(key, node) => {
                 if functions.insert(key.clone(), node).is_some() {
                     ambiguous.push(key);
                 }
             }
-            // Nested definitions have separate lexical scopes, not global names.
-            continue;
-        }
-        if node.kind() == "variable_declarator" {
-            if let (Some(name), Some(value)) = (
-                node.child_by_field_name("name"),
-                node.child_by_field_name("value"),
-            ) {
-                if matches!(value.kind(), "arrow_function" | "function_expression") {
-                    let key = a.text(name).to_string();
-                    if functions.insert(key.clone(), value).is_some() {
-                        ambiguous.push(key);
-                    }
-                    continue;
-                }
+            Event::PythonImport(node) => a.python_imports(node),
+            Event::Overflow => {
+                a.truncated = true;
+                break;
             }
-        }
-        if node.kind() == "import_statement" || node.kind() == "import_from_statement" {
-            a.python_imports(node);
-        }
-        stack.extend(named_children(node));
-        if stack.len() > 10_000 {
-            a.truncated = true;
-            break;
         }
     }
     for name in ambiguous {
@@ -216,11 +357,7 @@ fn emit_seeded(
         for (name, node) in &functions {
             let mut bindings = globals.clone();
             if let Some(params) = node.child_by_field_name("parameters") {
-                for (index, param) in named_children(params)
-                    .into_iter()
-                    .enumerate()
-                    .take(PARAM_COUNT)
-                {
+                for (index, param) in named_children(params).enumerate().take(PARAM_COUNT) {
                     let pat = param
                         .child_by_field_name("pattern")
                         .or_else(|| param.child_by_field_name("name"))
@@ -317,20 +454,34 @@ fn emit_seeded(
 /// Reanalyze same-package Go files with source-local import scopes and shared
 /// package function/global summaries. The caller supplies only one directory
 /// and package variant. No imports are fetched and no source is executed.
-/// Results are bounded; `truncated` means coverage is incomplete, not clean.
-pub fn go_package_payload_flow(sources: &[(&str, &str)]) -> serde_json::Value {
-    if sources.len() > 128 || sources.iter().map(|(_, s)| s.len()).sum::<usize>() > 2 * 1024 * 1024
+/// Results are bounded by [`ContextLimits::max_flow_members`] and
+/// [`ContextLimits::max_flow_bytes`]; `truncated` means coverage is
+/// incomplete, not clean.
+#[must_use]
+pub fn go_package_payload_flow(
+    sources: &[SourceFile<'_>],
+    limits: &ContextLimits,
+) -> GoPackageFlow {
+    let incomplete = GoPackageFlow {
+        files: Vec::new(),
+        truncated: true,
+    };
+    if sources.len() > limits.max_flow_members
+        || sources.iter().map(|f| f.source.len()).sum::<usize>() > limits.max_flow_bytes
     {
-        return json!({"files":[], "truncated":true});
+        return incomplete;
     }
     let mut parser = tree_sitter::Parser::new();
     if parser
         .set_language(&tree_sitter_go::LANGUAGE.into())
         .is_err()
     {
-        return json!({"files":[], "truncated":true});
+        return incomplete;
     }
-    let trees: Vec<_> = sources.iter().map(|(_, s)| parser.parse(s, None)).collect();
+    let trees: Vec<_> = sources
+        .iter()
+        .map(|f| parser.parse(f.source, None))
+        .collect();
     let mut seeds = BTreeMap::new();
     let mut globals = HashMap::new();
     let mut result = Vec::new();
@@ -340,7 +491,7 @@ pub fn go_package_payload_flow(sources: &[(&str, &str)]) -> serde_json::Value {
         let mut next_globals = globals.clone();
         let mut duplicates = Vec::new();
         result.clear();
-        for ((path, source), tree) in sources.iter().zip(&trees) {
+        for (file, tree) in sources.iter().zip(&trees) {
             let Some(tree) = tree else {
                 truncated = true;
                 continue;
@@ -348,11 +499,12 @@ pub fn go_package_payload_flow(sources: &[(&str, &str)]) -> serde_json::Value {
             let mut values = Values::new();
             let (summaries, bindings) = emit_seeded(
                 tree.root_node(),
-                source,
+                file.source,
                 Lang::Go,
                 &mut values,
                 &seeds,
                 &globals,
+                None,
             );
             truncated |= values
                 .get("source.payload_flow.truncated")
@@ -364,7 +516,10 @@ pub fn go_package_payload_flow(sources: &[(&str, &str)]) -> serde_json::Value {
                 }
             }
             next_globals.extend(bindings);
-            result.push(json!({"path":path,"facts":values.as_json()}));
+            result.push(GoFileFlow {
+                path: file.path.to_string(),
+                facts: values,
+            });
         }
         for name in duplicates {
             next.remove(&name);
@@ -379,7 +534,10 @@ pub fn go_package_payload_flow(sources: &[(&str, &str)]) -> serde_json::Value {
             truncated = true;
         }
     }
-    json!({"files":result,"truncated":truncated})
+    GoPackageFlow {
+        files: result,
+        truncated,
+    }
 }
 
 fn events_for(summary: &Summary, name: &str, offset: usize) -> Vec<serde_json::Value> {
@@ -475,10 +633,12 @@ impl<'s> Analysis<'s> {
             return 0;
         }
         self.budget -= 1;
+        // Measured once: `Node::kind` measures and validates a C string.
+        let kind = node.kind();
         if self.excluded.contains(&node.id())
-            || function(node)
+            || FUNCTION_KINDS.contains(&kind)
             || matches!(
-                node.kind(),
+                kind,
                 "arrow_function"
                     | "function_expression"
                     | "closure_expression"
@@ -493,18 +653,18 @@ impl<'s> Analysis<'s> {
         }
         let text = self.text(node);
         if matches!(
-            node.kind(),
+            kind,
             "identifier" | "shorthand_field_identifier" | "shorthand_property_identifier"
         ) {
             return bindings.get(text).copied().unwrap_or(0);
         }
-        if node.kind() == "macro_invocation"
+        if kind == "macro_invocation"
             && node
                 .child_by_field_name("macro")
                 .is_some_and(|n| matches!(self.text(n), "format" | "format_args" | "std::format"))
         {
             let mut bits = self.all(node, bindings, out, depth + 1);
-            let mut stack = named_children(node);
+            let mut stack: Vec<_> = named_children(node).collect();
             while let Some(child) = stack.pop() {
                 if child.kind() == "string_literal" {
                     let literal = self.text(child);
@@ -541,7 +701,7 @@ impl<'s> Analysis<'s> {
             return bits;
         }
         if matches!(
-            node.kind(),
+            kind,
             "string"
                 | "string_literal"
                 | "raw_string_literal"
@@ -582,12 +742,12 @@ impl<'s> Analysis<'s> {
             }
             return bits;
         }
-        if matches!(node.kind(), "import_statement" | "import_from_statement") {
+        if matches!(kind, "import_statement" | "import_from_statement") {
             self.python_imports(node);
             return 0;
         }
         if matches!(
-            node.kind(),
+            kind,
             "let_declaration"
                 | "let_condition"
                 | "assignment"
@@ -629,7 +789,7 @@ impl<'s> Analysis<'s> {
             }
         }
         if matches!(
-            node.kind(),
+            kind,
             "for_expression" | "for_statement" | "for_in_statement" | "range_clause"
         ) {
             let iterable = node
@@ -647,7 +807,7 @@ impl<'s> Analysis<'s> {
                 return 0;
             }
         }
-        if matches!(node.kind(), "if_statement" | "if_expression") {
+        if matches!(kind, "if_statement" | "if_expression") {
             let condition = node.child_by_field_name("condition");
             // Reachability is enforced only for the module-execution fact.
             if self.language.is_ecmascript()
@@ -672,16 +832,16 @@ impl<'s> Analysis<'s> {
             *bindings = merged;
             return result;
         }
-        if matches!(node.kind(), "call_expression" | "call") {
+        if matches!(kind, "call_expression" | "call") {
             return self.call(node, bindings, out, depth + 1);
         }
-        if node.kind() == "return_statement" || node.kind() == "return_expression" {
+        if kind == "return_statement" || kind == "return_expression" {
             let bits = self.all(node, bindings, out, depth + 1);
             out.returns |= bits;
             return bits;
         }
         if matches!(
-            node.kind(),
+            kind,
             "attribute"
                 | "member_expression"
                 | "subscript"
@@ -730,7 +890,6 @@ impl<'s> Analysis<'s> {
                 // evaluate it again would double the work at every link of a
                 // member chain.
                 return named_children(node)
-                    .into_iter()
                     .filter(|child| Some(*child) != object)
                     .fold(object_bits.unwrap_or(0), |bits, child| {
                         bits | self.eval(child, bindings, out, depth + 1)
@@ -740,7 +899,7 @@ impl<'s> Analysis<'s> {
                 return env_bits(text);
             }
         }
-        if self.language == Lang::Go && node.kind() == "composite_literal" {
+        if self.language == Lang::Go && kind == "composite_literal" {
             if node
                 .child_by_field_name("type")
                 .is_some_and(|n| self.canonical(self.text(n)) == "net/http.Client")
@@ -749,14 +908,14 @@ impl<'s> Analysis<'s> {
             }
         }
         if matches!(
-            node.kind(),
+            kind,
             "block" | "statement_block" | "source_file" | "module" | "program"
         ) {
             let mut tail = 0;
             let scoped = matches!(
                 self.language,
                 Lang::Rust | Lang::JavaScript | Lang::TypeScript
-            ) && matches!(node.kind(), "block" | "statement_block");
+            ) && matches!(kind, "block" | "statement_block");
             let before = if scoped {
                 bindings.clone()
             } else {
@@ -796,9 +955,7 @@ impl<'s> Analysis<'s> {
         out: &mut Summary,
         depth: usize,
     ) -> Bits {
-        named_children(node)
-            .into_iter()
-            .fold(0, |bits, n| bits | self.eval(n, bindings, out, depth + 1))
+        named_children(node).fold(0, |bits, n| bits | self.eval(n, bindings, out, depth + 1))
     }
     fn call(
         &mut self,
@@ -836,7 +993,7 @@ impl<'s> Analysis<'s> {
             .unwrap_or_else(|| name.rsplit("::").next().unwrap_or(&name));
         let args = node
             .child_by_field_name("arguments")
-            .map(named_children)
+            .map(|args| named_children(args).collect::<Vec<_>>())
             .unwrap_or_default();
         let bits: Vec<Bits> = args
             .iter()
@@ -900,7 +1057,7 @@ impl<'s> Analysis<'s> {
                             let Some(child) = n.named_child(0) else { break };
                             n = child;
                         }
-                        named_children(n)
+                        named_children(n).collect()
                     })
                     .unwrap_or_default()
             } else {
@@ -1161,24 +1318,29 @@ mod tests {
     use std::path::Path;
     #[test]
     fn go_package_helpers_keep_file_import_scopes_and_initialization() {
-        let values = super::go_package_payload_flow(&[
-            (
-                "p/a.go",
-                "package p\nimport h \"net/http\"\nfunc send(data string){h.Post(endpoint,\"text/plain\",data)}",
-            ),
-            (
-                "p/b.go",
-                "package p\nimport h \"os\"\nfunc secret()string{return h.Getenv(\"GITHUB_TOKEN\")}",
-            ),
-            ("p/c.go", "package p\nfunc init(){send(secret())}"),
-        ]);
-        assert_eq!(values["truncated"], false);
-        assert!(
-            values["files"][2]["facts"]["source"]["go"]["initialization_events"]
-                .to_string()
-                .contains("secret-http-body"),
-            "{values}"
+        let file = |path, source| crate::package_context::SourceFile { path, source };
+        let flow = super::go_package_payload_flow(
+            &[
+                file(
+                    "p/a.go",
+                    "package p\nimport h \"net/http\"\nfunc send(data string){h.Post(endpoint,\"text/plain\",data)}",
+                ),
+                file(
+                    "p/b.go",
+                    "package p\nimport h \"os\"\nfunc secret()string{return h.Getenv(\"GITHUB_TOKEN\")}",
+                ),
+                file("p/c.go", "package p\nfunc init(){send(secret())}"),
+            ],
+            &crate::package_context::ContextLimits::default(),
         );
+        assert!(!flow.truncated);
+        let events = flow
+            .files
+            .get(2)
+            .and_then(|f| f.facts.get("source.go.initialization_events"))
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert!(events.contains("secret-http-body"), "{flow:?}");
     }
     #[test]
     fn go_body_flow_alias_helpers_builders_and_initializers() {

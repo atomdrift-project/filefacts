@@ -485,7 +485,7 @@ impl<'a> Parser<'a> {
     fn object(&mut self, expected: i16) -> Result<usize, ParseError> {
         let offset = self.input.pos();
         let kind = self.u8()?;
-        let reference = self.u16()? as i16;
+        let reference = self.u16()?.cast_signed();
         let size = usize::from(self.u16()?);
         if reference != expected {
             return Err(ParseError::Malformed {
@@ -515,13 +515,15 @@ impl<'a> Parser<'a> {
             }
             // osacompile emits -123 as FAS 3 / ff85, but 32768 and 65535 as
             // FAS 7 / signed i32. The reference Python loader misses this sign.
-            3 => Value::Int(i64::from(size as i16)),
+            3 => Value::Int(i64::from(
+                u16::try_from(size).unwrap_or_default().cast_signed(),
+            )),
             4 | 14 => {
                 let tag = self.u8()?;
                 self.vector(node, Some(tag), size, &[])?;
                 return Ok(node);
             }
-            7 if size == 4 => Value::Int(i64::from(self.u32()? as i32)),
+            7 if size == 4 => Value::Int(i64::from(self.u32()?.cast_signed())),
             8 if size == 8 => {
                 let payload = self.payload(None, size)?;
                 if let Some(entry) = self.nodes.get_mut(node) {

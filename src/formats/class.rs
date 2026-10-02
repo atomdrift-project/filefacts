@@ -32,7 +32,6 @@ use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::bytes::Reader;
-use crate::error::Error;
 use crate::formats::common::{XorScan, extract_binary_strings, put_str, put_u64};
 use crate::output::{Metrics, Strings, Values};
 
@@ -115,14 +114,14 @@ pub(super) fn extract(
     strings: &mut Strings,
     metrics: &mut Metrics,
     symbols_out: &mut crate::Symbols,
-) -> Result<(), Error> {
+) {
     extract_binary_strings(bytes, strings, XorScan::No);
 
     let Some(&[m0, m1, m2, m3, n0, n1, j0, j1, c0, c1]) = bytes.first_chunk::<10>() else {
-        return Ok(());
+        return;
     };
     if u32::from_be_bytes([m0, m1, m2, m3]) != 0xCAFE_BABE {
-        return Ok(());
+        return;
     }
     let minor_version = u16::from_be_bytes([n0, n1]);
     let major_version = u16::from_be_bytes([j0, j1]);
@@ -130,30 +129,30 @@ pub(super) fn extract(
 
     let mut r = Reader::at(bytes, 10);
     let Some(cp) = parse_constant_pool(&mut r, cp_count) else {
-        return Ok(());
+        return;
     };
     let Some(access_flags) = r.u16_be() else {
-        return Ok(());
+        return;
     };
     let Some(this_idx) = r.u16_be() else {
-        return Ok(());
+        return;
     };
     let Some(super_idx) = r.u16_be() else {
-        return Ok(());
+        return;
     };
     let Some(interfaces_count) = r.u16_be() else {
-        return Ok(());
+        return;
     };
     let mut interface_idx: Vec<u16> = Vec::with_capacity(interfaces_count as usize);
     for _ in 0..interfaces_count {
         let Some(idx) = r.u16_be() else {
-            return Ok(());
+            return;
         };
         interface_idx.push(idx);
     }
     // Skip fields[]; parse methods[] for the typed Functions view.
     if skip_member_table(&mut r).is_none() {
-        return Ok(());
+        return;
     }
     // The class attributes follow methods[], so a truncated method table
     // leaves them unreachable.
@@ -274,8 +273,6 @@ pub(super) fn extract(
         f64::from(interfaces_count),
     );
     metrics.insert(metric!("class.major_version"), f64::from(major_version));
-
-    Ok(())
 }
 
 /// Map a JVM class-file `major_version` to its Java release name.
@@ -355,6 +352,10 @@ struct ClassAttributes {
 
 fn parse_attributes(r: &mut Reader<'_>, cp: &ConstantPool) -> ClassAttributes {
     let mut out = ClassAttributes::default();
+    // Inner class names already listed, borrowed from the constant pool. Up
+    // to 65535 attributes may each repeat a long InnerClasses table, so the
+    // dedup must not be a scan of everything listed so far.
+    let mut seen_inner = std::collections::HashSet::new();
     let Some(count) = r.u16_be() else {
         return out;
     };
@@ -389,11 +390,10 @@ fn parse_attributes(r: &mut Reader<'_>, cp: &ConstantPool) -> ClassAttributes {
                 // Each entry is four u2s, the first inner_class_info_index.
                 let entries = entries.as_chunks::<8>().0;
                 for &[i0, i1, ..] in entries.iter().take(usize::from(entry_count)) {
-                    if let Some(name) = cp.class_name(u16::from_be_bytes([i0, i1])) {
-                        let owned = name.to_string();
-                        if !out.inner_classes.contains(&owned) {
-                            out.inner_classes.push(owned);
-                        }
+                    if let Some(name) = cp.class_name(u16::from_be_bytes([i0, i1]))
+                        && seen_inner.insert(name)
+                    {
+                        out.inner_classes.push(name.to_string());
                     }
                 }
             }
@@ -537,18 +537,20 @@ fn parse_constant_pool(r: &mut Reader<'_>, count: usize) -> Option<ConstantPool>
     let mut cp = ConstantPool::default();
     let mut i = 1usize;
     while i < count {
+        // `count` comes from a u16, so every index below it fits one.
+        let slot = u16::try_from(i).ok()?;
         let tag = r.u8()?;
         match tag {
             CP_UTF8 => {
                 let len = r.u16_be()? as usize;
                 let offset = r.pos();
                 let s = String::from_utf8_lossy(r.bytes(len)?).into_owned();
-                cp.utf8.insert(i as u16, s);
-                cp.utf8_offset.insert(i as u16, offset as u64);
+                cp.utf8.insert(slot, s);
+                cp.utf8_offset.insert(slot, offset as u64);
             }
             CP_CLASS => {
                 let idx = r.u16_be()?;
-                cp.class.insert(i as u16, idx);
+                cp.class.insert(slot, idx);
             }
             CP_STRING | CP_METHOD_TYPE | CP_MODULE | CP_PACKAGE => {
                 r.skip(2)?;
@@ -564,12 +566,12 @@ fn parse_constant_pool(r: &mut Reader<'_>, count: usize) -> Option<ConstantPool>
                 // triples later.
                 let class_idx = r.u16_be()?;
                 let nat_idx = r.u16_be()?;
-                cp.methodref.insert(i as u16, (class_idx, nat_idx));
+                cp.methodref.insert(slot, (class_idx, nat_idx));
             }
             CP_NAME_AND_TYPE => {
                 let name_idx = r.u16_be()?;
                 let desc_idx = r.u16_be()?;
-                cp.name_and_type.insert(i as u16, (name_idx, desc_idx));
+                cp.name_and_type.insert(slot, (name_idx, desc_idx));
             }
             CP_INTEGER | CP_FLOAT | CP_DYNAMIC | CP_INVOKE_DYNAMIC => {
                 r.skip(4)?;

@@ -202,7 +202,7 @@ fn run(bytes: &[u8]) -> (Values, Metrics, Errors) {
 }
 
 /// The one recorded error's stage, kind and message.
-fn only_error(errors: &Errors) -> (Stage, crate::ErrorKind, &str) {
+fn only_error(errors: &Errors) -> (Stage, crate::DiagnosticKind, &str) {
     assert_eq!(errors.len(), 1, "{errors:?}");
     let e = &errors.as_slice()[0];
     (e.stage, e.kind, e.message.as_str())
@@ -254,7 +254,7 @@ fn rpm_cut_inside_the_lead_records_a_malformed_signature_header() {
     let (stage, kind, message) = only_error(&e);
     assert_eq!(
         (stage, kind),
-        (Stage::RpmParse, crate::ErrorKind::Malformed)
+        (Stage::RpmParse, crate::DiagnosticKind::Malformed)
     );
     assert!(message.starts_with("signature-header:"), "{message}");
     assert!(v.get("rpm.limits").is_none());
@@ -268,7 +268,7 @@ fn bad_signature_header_magic_records_one_malformed_error() {
     let (stage, kind, message) = only_error(&e);
     assert_eq!(
         (stage, kind),
-        (Stage::RpmParse, crate::ErrorKind::Malformed)
+        (Stage::RpmParse, crate::DiagnosticKind::Malformed)
     );
     assert_eq!(message, "signature-header: bad header magic");
     assert!(v.get("rpm.name").is_none());
@@ -302,7 +302,7 @@ fn header_size_past_end_of_file_is_malformed_not_a_limit() {
     let (stage, kind, message) = only_error(&e);
     assert_eq!(
         (stage, kind),
-        (Stage::RpmParse, crate::ErrorKind::Malformed)
+        (Stage::RpmParse, crate::DiagnosticKind::Malformed)
     );
     assert!(message.contains("past the end of the file"), "{message}");
     assert!(v.get("rpm.limits").is_none());
@@ -331,7 +331,7 @@ fn truncated_main_header_doesnt_crash() {
     let (stage, kind, message) = only_error(&e);
     assert_eq!(
         (stage, kind),
-        (Stage::RpmParse, crate::ErrorKind::Malformed)
+        (Stage::RpmParse, crate::DiagnosticKind::Malformed)
     );
     assert!(message.starts_with("main-header:"), "{message}");
 }
@@ -344,7 +344,7 @@ fn rpm_ending_after_the_signature_header_records_a_missing_main_header() {
         only_error(&e),
         (
             Stage::RpmParse,
-            crate::ErrorKind::Malformed,
+            crate::DiagnosticKind::Malformed,
             "main-header: file ends before the header"
         )
     );

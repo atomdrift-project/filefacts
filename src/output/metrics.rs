@@ -20,6 +20,7 @@ use super::metric_keys::MetricKey;
 /// parallel map keyed by metric name. The value and its provenance are one
 /// fact, not two facts joined by a string.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Fact {
     /// The measured value (count, ratio, entropy, …).
     pub value: f64,
@@ -28,6 +29,12 @@ pub struct Fact {
 }
 
 impl Fact {
+    /// A fact measured from `spans`; empty for a file-global fact.
+    #[must_use]
+    pub fn new(value: f64, spans: Vec<Span>) -> Self {
+        Self { value, spans }
+    }
+
     /// A file-global fact with no associated location.
     fn unlocated(value: f64) -> Self {
         Self {
@@ -123,7 +130,7 @@ impl<'de> Deserialize<'de> for Fact {
 /// flag with `>= 1`, which reads the same under both.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Metrics(BTreeMap<String, Fact>);
+pub struct Metrics(BTreeMap<MetricKey, Fact>);
 
 impl Metrics {
     /// Empty metrics map.
@@ -137,21 +144,21 @@ impl Metrics {
     /// [`metric!`](crate::metric) — checked against the catalog at compile
     /// time — or by one of the family constructors. An emitter cannot
     /// invent a name that downstream rules have no way to know about.
-    pub fn insert(&mut self, key: MetricKey, value: f64) {
-        self.0.insert(key.into(), Fact::unlocated(value));
+    pub(crate) fn insert(&mut self, key: MetricKey, value: f64) {
+        self.0.insert(key, Fact::unlocated(value));
     }
 
     /// Record a *located* metric: a value plus the byte spans it was measured
     /// from. The spans travel with the value through every downstream
     /// consumer (facts JSON, disk cache, the trait engine, prism).
-    pub fn insert_located(
+    pub(crate) fn insert_located(
         &mut self,
         key: MetricKey,
         value: f64,
         spans: impl IntoIterator<Item = Span>,
     ) {
         self.0.insert(
-            key.into(),
+            key,
             Fact {
                 value,
                 spans: spans.into_iter().collect(),
@@ -195,11 +202,6 @@ impl Metrics {
     /// True when no metrics have been recorded.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
-    }
-
-    /// Borrow the underlying `BTreeMap` of facts.
-    pub fn as_map(&self) -> &BTreeMap<String, Fact> {
-        &self.0
     }
 }
 
@@ -282,6 +284,16 @@ mod tests {
         let m: Metrics = serde_json::from_str(r#"{"file.entropy":7.0}"#).unwrap();
         assert_eq!(m.get("file.entropy"), Some(7.0));
         assert!(m.fact("file.entropy").unwrap().spans.is_empty());
+    }
+
+    /// A catalog key is stored without copying its text.
+    #[test]
+    fn static_keys_are_stored_borrowed() {
+        let name: &'static str = "file.size";
+        let mut m = Metrics::new();
+        m.insert(MetricKey::unchecked(name), 1.0);
+        let (key, _) = m.0.first_key_value().unwrap();
+        assert!(std::ptr::eq(key.as_str(), name));
     }
 
     #[test]

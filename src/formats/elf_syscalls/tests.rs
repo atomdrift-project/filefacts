@@ -441,3 +441,19 @@ fn aarch64_file_io_names_use_the_correct_abi_table() {
         assert_eq!(site["name"], name);
     }
 }
+
+/// The name tables are indexed by number: the first and last slots resolve,
+/// and gaps, the reserved range between the classic and the shared
+/// 424+ numbers, and anything past the end are unnamed.
+#[test]
+fn syscall_tables_resolve_by_index_and_leave_gaps_unnamed() {
+    assert_eq!(x86_64_syscall_name(0), Some("read"));
+    assert_eq!(aarch64_syscall_name(0), Some("io_setup"));
+    assert_eq!(x86_64_syscall_name(462), Some("mseal"));
+    assert_eq!(x86_64_syscall_name(424), Some("pidfd_send_signal"));
+    assert_eq!(aarch64_syscall_name(424), Some("pidfd_send_signal"));
+    assert_eq!(x86_64_syscall_name(400), None);
+    assert_eq!(aarch64_syscall_name(400), None);
+    assert_eq!(x86_64_syscall_name(463), None);
+    assert_eq!(x86_64_syscall_name(u32::MAX), None);
+}

@@ -3,6 +3,14 @@
 //! Tests that read more than one view assert the no-duplicate-work
 //! guarantee (`parse_count() == 1` once those views have been read) so
 //! the contract holds for downstream embedders.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::float_cmp,
+    reason = "fixtures build binary layouts from literals and compare exact expected values"
+)]
 
 // These tests assert `parse_count() == 1`, which holds only when this process
 // runs the extraction itself. The disk cache that could serve a warm entry
@@ -956,7 +964,7 @@ my $documentation = '$client->quoted_only("hello")';
             unreachable!()
         };
         assert!(flow.values.iter().any(|value| value.kind == FlowKind::Call
-            && value.offset == *offset as usize
+            && value.offset == *offset
             && value.target.as_ref() == target.as_ref()));
     }
     assert_eq!(parsed.parse_count(), 1);
@@ -1050,7 +1058,7 @@ my $example = "counterfeit 'quoted'";
         let value = flow
             .values
             .iter()
-            .find(|value| value.kind == FlowKind::Call && value.offset == *offset as usize)
+            .find(|value| value.kind == FlowKind::Call && value.offset == *offset)
             .unwrap();
         assert_eq!(value.target.as_ref(), target.as_ref());
         assert_eq!(value.inputs.len(), bare.len());

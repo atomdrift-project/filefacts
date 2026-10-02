@@ -44,16 +44,11 @@ use std::collections::BTreeSet;
 
 use serde_json::Value as JsonValue;
 
-use crate::error::Error;
 use crate::formats::common::put_str;
 use crate::output::{Metrics, Values};
 use crate::value_key;
 
-pub(super) fn extract(
-    bytes: &[u8],
-    values: &mut Values,
-    _metrics: &mut Metrics,
-) -> Result<(), Error> {
+pub(super) fn extract(bytes: &[u8], values: &mut Values, _metrics: &mut Metrics) {
     // Markdown is UTF-8 by spec; fall back to lossy decode for safety.
     let text = match std::str::from_utf8(bytes) {
         Ok(s) => std::borrow::Cow::Borrowed(s),
@@ -97,8 +92,6 @@ pub(super) fn extract(
             JsonValue::Array(arr),
         );
     }
-
-    Ok(())
 }
 
 /// Find the first ATX heading (`#` ... `######`) outside of fenced
@@ -195,10 +188,8 @@ fn github_repos(text: &str) -> Vec<String> {
     while let Some(rel) = text[cursor..].find(NEEDLE) {
         let start = cursor + rel + NEEDLE.len();
         cursor = start;
-        let owner = take_path_segment(&text[start..]);
-        let owner = match owner {
-            Some(s) if !s.is_empty() => s,
-            _ => continue,
+        let Some(owner) = take_path_segment(&text[start..]) else {
+            continue;
         };
         let after_owner = start + owner.len();
         // Require an explicit '/' between owner and repo (anchors,
@@ -207,14 +198,12 @@ fn github_repos(text: &str) -> Vec<String> {
             continue;
         }
         let repo_start = after_owner + 1;
-        let repo = take_path_segment(&text[repo_start..]);
-        let repo = match repo {
-            Some(s) if !s.is_empty() => s,
-            _ => continue,
+        let Some(repo) = take_path_segment(&text[repo_start..]) else {
+            continue;
         };
         // Trim a trailing `.git` so `github.com/foo/bar.git` and
         // `github.com/foo/bar` collapse to the same value.
-        let repo_clean = repo.strip_suffix(".git").unwrap_or(repo.as_str());
+        let repo_clean = repo.strip_suffix(".git").unwrap_or(repo);
         let joined = format!("github.com/{}/{}", owner, repo_clean);
         if !seen.contains(joined.as_str()) {
             seen.insert(joined.clone());
@@ -227,19 +216,11 @@ fn github_repos(text: &str) -> Vec<String> {
 /// Consume the longest prefix of a path segment from `s`. Stops at
 /// `/`, whitespace, or any character not allowed in GitHub owner/repo
 /// names. Returns `None` if `s` starts with a disallowed character.
-fn take_path_segment(s: &str) -> Option<String> {
-    let mut out = String::new();
-    for ch in s.chars() {
-        if ch == '/' || ch.is_whitespace() {
-            break;
-        }
-        if is_path_segment_char(ch) {
-            out.push(ch);
-        } else {
-            break;
-        }
-    }
-    Some(out)
+fn take_path_segment(s: &str) -> Option<&str> {
+    let end = s
+        .find(|ch: char| ch == '/' || ch.is_whitespace() || !is_path_segment_char(ch))
+        .unwrap_or(s.len());
+    s.get(..end).filter(|seg| !seg.is_empty())
 }
 
 /// GitHub permits ASCII alphanumerics plus `-`, `_`, and `.` in owner
@@ -501,39 +482,26 @@ fn install_argument_name(arg: &str) -> Option<String> {
 fn take_npm_name(s: &str) -> Option<String> {
     if let Some(rest) = s.strip_prefix('@') {
         let scope = take_path_segment(rest)?;
-        if scope.is_empty() {
-            return None;
-        }
         let after_scope = 1 + scope.len();
         if s.as_bytes().get(after_scope) != Some(&b'/') {
             return None;
         }
         let name = take_path_segment(&s[after_scope + 1..])?;
-        if name.is_empty() {
-            return None;
-        }
         Some(format!("@{}/{}", scope, name))
     } else {
-        let name = take_npm_segment(s)?;
-        if name.is_empty() { None } else { Some(name) }
+        take_npm_segment(s).map(str::to_owned)
     }
 }
 
 /// Like `take_path_segment`, but stops at a URL fragment/query as well so a
 /// shields badge such as `/npm/v/foo?style=flat` yields `foo`.
-fn take_npm_segment(s: &str) -> Option<String> {
-    let mut out = String::new();
-    for ch in s.chars() {
-        if ch == '/' || ch == '?' || ch == '#' || ch.is_whitespace() {
-            break;
-        }
-        if is_path_segment_char(ch) {
-            out.push(ch);
-        } else {
-            break;
-        }
-    }
-    Some(out)
+fn take_npm_segment(s: &str) -> Option<&str> {
+    let end = s
+        .find(|ch: char| {
+            ch == '/' || ch == '?' || ch == '#' || ch.is_whitespace() || !is_path_segment_char(ch)
+        })
+        .unwrap_or(s.len());
+    s.get(..end).filter(|seg| !seg.is_empty())
 }
 
 #[cfg(test)]

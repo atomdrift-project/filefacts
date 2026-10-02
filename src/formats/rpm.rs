@@ -434,8 +434,8 @@ fn read_header(slice: &[u8]) -> Result<Header<'_>, HeaderError> {
         )));
     }
     // Within the slice, so the conversions below are lossless.
-    let entries_end = 16 + index_size as usize;
-    let data_end = total as usize;
+    let entries_end = 16 + crate::bytes::sat_usize(index_size);
+    let data_end = crate::bytes::sat_usize(total);
     let mut entries = Vec::with_capacity(nindex as usize);
     for raw in slice
         .get(16..entries_end)

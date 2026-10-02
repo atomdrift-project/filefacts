@@ -4,7 +4,7 @@ use crate::output::{Metrics, Values};
 fn run(input: &str) -> Values {
     let mut values = Values::default();
     let mut metrics = Metrics::default();
-    extract(input.as_bytes(), &mut values, &mut metrics).unwrap();
+    extract(input.as_bytes(), &mut values, &mut metrics);
     values
 }
 
@@ -359,7 +359,7 @@ fn handles_invalid_utf8_gracefully() {
     bytes.push(0xff);
     let mut values = Values::default();
     let mut metrics = Metrics::default();
-    extract(&bytes, &mut values, &mut metrics).unwrap();
+    extract(&bytes, &mut values, &mut metrics);
     assert_eq!(
         get_str(&values, "markdown.first_heading").as_deref(),
         Some("Heading")

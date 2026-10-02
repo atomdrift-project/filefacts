@@ -23,7 +23,6 @@ use crate::metric;
 use crate::value_key;
 use serde_json::Value as JsonValue;
 
-use crate::error::Error;
 use crate::formats::common::{XorScan, extract_binary_strings, put_str};
 use crate::output::{Metrics, Strings, Values};
 
@@ -39,15 +38,15 @@ pub(super) fn extract(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
-) -> Result<(), Error> {
+) {
     extract_binary_strings(bytes, strings, XorScan::No);
 
     let Some((header, rest)) = bytes.split_first_chunk::<16>() else {
-        return Ok(());
+        return;
     };
     // PEP 3147+ magic ends in `0x0d 0x0a`.
     if header[2] != 0x0D || header[3] != 0x0A {
-        return Ok(());
+        return;
     }
 
     let magic_word = u16::from_le_bytes([header[0], header[1]]);
@@ -93,8 +92,6 @@ pub(super) fn extract(
             JsonValue::Array(source_files.into_iter().map(JsonValue::String).collect()),
         );
     }
-
-    Ok(())
 }
 
 /// Map a Python bytecode magic word to its release name. Values
@@ -186,7 +183,7 @@ mod tests {
         let mut v = Values::new();
         let mut s = Strings::default();
         let mut m = Metrics::new();
-        extract(bytes, &mut v, &mut s, &mut m).unwrap();
+        extract(bytes, &mut v, &mut s, &mut m);
         (v, m)
     }
 

@@ -480,3 +480,75 @@ fn flow_is_lazy_cached_and_uses_the_existing_parse() {
         "typed facts must not be duplicated into values"
     );
 }
+
+/// Run `f` on a thread with a 2 MiB stack, the size of a rayon worker's, so a
+/// recursion that only fits the 8 MiB main stack fails here.
+fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn deep_declarator_chains_bind_without_recursing() {
+    // `int ****…p` nests one pointer_declarator per `*`; binding the
+    // parameter walked the chain recursively and overflowed the stack.
+    let flow = on_small_stack(|| {
+        let source = format!("void f(int {}p){{ send(p); }}\n", "*".repeat(60_000));
+        graph("a.c", &source)
+    });
+    assert!(flow.limitations.contains("analysis-budget"));
+}
+
+#[test]
+fn shallow_declarator_chains_still_bind_their_name() {
+    let flow = graph("a.c", "void f(int ***p){ send(p); }\n");
+    let send = flow
+        .values
+        .iter()
+        .find(|v| v.target.as_deref() == Some("send"))
+        .unwrap();
+    let param = flow.functions["f"].parameters[0];
+    assert_eq!(send.inputs, vec![param]);
+}
+
+#[test]
+fn functions_read_globals_without_leaking_their_own_bindings() {
+    // Function bodies layer over the module bindings instead of copying
+    // them; a function's rebinding must stay inside that function. Functions
+    // are evaluated last-defined first, so `rebind` runs before `read` and a
+    // leak would hand `read` the value of `other()`.
+    let source = "token = acquire()\ndef read():\n    send(token)\ndef rebind():\n    token = other()\n    send(token)\n";
+    let flow = graph("m.py", source);
+    let mut targets: Vec<_> = flow
+        .values
+        .iter()
+        .filter(|v| v.target.as_deref() == Some("send"))
+        .map(|send| flow.values[send.inputs[0]].target.as_deref())
+        .collect();
+    targets.sort_unstable();
+    assert_eq!(targets, vec![Some("acquire"), Some("other")]);
+}
+
+#[test]
+fn block_scoped_shadows_restore_the_global_binding() {
+    let flow = graph(
+        "a.js",
+        "var x = acquire();\nfunction f(){ { let x = other(); } send(x); }\n",
+    );
+    assert!(reaches(&flow, "send", "acquire"));
+    assert!(!reaches(&flow, "send", "other"));
+}
+
+#[test]
+fn branch_merges_see_globals_changed_in_one_branch() {
+    // A global rebound in one branch merges with the untouched value from
+    // the other, though only the branch's layer records the name.
+    let source = "x = acquire()\ndef f(c):\n    if c:\n        x = other()\n    else:\n        pass\n    send(x)\n";
+    let flow = graph("m.py", source);
+    assert!(reaches(&flow, "send", "acquire"));
+    assert!(reaches(&flow, "send", "other"));
+}

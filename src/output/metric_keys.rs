@@ -22,9 +22,11 @@ use std::borrow::Cow;
 
 /// A metric name that is known to be declared.
 ///
-/// The inner string is private: outside this module the only constructors are
-/// [`metric!`](crate::metric) and the family functions below, which is what
-/// makes "emitted but undeclared" unrepresentable rather than merely unlikely.
+/// The inner string is private: the only constructors are filefacts' own
+/// compile-time-checked `metric!` and the public family functions below,
+/// which is what makes "emitted but undeclared" unrepresentable rather than
+/// merely unlikely. A key read back from serialized metrics is taken as
+/// written.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MetricKey(Cow<'static, str>);
 
@@ -51,6 +53,30 @@ impl From<MetricKey> for String {
     }
 }
 
+// Lets the metrics map, keyed by `MetricKey` so a catalog key is stored
+// without allocating, be looked up by `&str`. Sound because the derived
+// `Eq`/`Ord`/`Hash` on the inner `Cow<str>` are the `str` ones.
+impl std::borrow::Borrow<str> for MetricKey {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl serde::Serialize for MetricKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+/// A key read back from serialized metrics (the disk cache, a consumer's
+/// stored facts) is taken as written: the catalog check guards emitters, and
+/// these were checked when they were emitted.
+impl<'de> serde::Deserialize<'de> for MetricKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|key| Self(Cow::Owned(key)))
+    }
+}
+
 impl std::fmt::Display for MetricKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -71,20 +97,18 @@ pub(super) const fn str_eq(a: &str, b: &str) -> bool {
 
 /// Resolve a literal against [`CATALOG`], or fail the build.
 ///
-/// An implementation detail of [`metric!`](crate::metric), public only
-/// because an exported macro can only call public items; it is not part of
-/// the supported API. `metric!` forces the `const` context that turns an
-/// undeclared key into a compile error. Calling this directly from runtime
-/// code would defer the panic to runtime and defeat the whole arrangement.
+/// The implementation of `metric!`, which forces the `const` context that
+/// turns an undeclared key into a compile error. Calling this directly from
+/// runtime code would defer the panic to runtime and defeat the whole
+/// arrangement.
 ///
 /// # Panics
 ///
 /// If `name` is not in [`CATALOG`]. Through `metric!` this is a `const`
 /// evaluation failure — a build error pointing at the offending call site —
 /// which is the intended and only expected way to hit it.
-#[doc(hidden)]
 #[must_use]
-pub const fn declared(name: &'static str) -> MetricKey {
+pub(crate) const fn declared(name: &'static str) -> MetricKey {
     let mut rest = CATALOG;
     while let [key, tail @ ..] = rest {
         if str_eq(key, name) {
@@ -103,13 +127,13 @@ pub const fn declared(name: &'static str) -> MetricKey {
 ///
 /// The literal must appear in [`CATALOG`]; if it does not, this fails to
 /// compile at the call site.
-#[macro_export]
 macro_rules! metric {
     ($name:literal) => {{
-        const KEY: $crate::MetricKey = $crate::declared($name);
+        const KEY: $crate::MetricKey = $crate::output::declared($name);
         KEY
     }};
 }
+pub(crate) use metric;
 
 /// Every fixed metric key filefacts emits, sorted.
 ///
@@ -146,6 +170,7 @@ pub const CATALOG: &[&str] = &[
     "archive.hidden_file_count",
     "archive.homoglyph_filename_count",
     "archive.leading_bytes",
+    "archive.local_header_mismatch_count",
     "archive.max_filename_length",
     "archive.member_count",
     "archive.misplaced_executable_count",
@@ -348,6 +373,7 @@ pub const CATALOG: &[&str] = &[
     "elf.hidden_symbol_count",
     "elf.ident_pad_nonzero",
     "elf.init_array_count",
+    "elf.init_array_slots_capped",
     "elf.little_endian",
     "elf.load_segment_max_file_size",
     "elf.load_segment_max_memory_size",
@@ -702,9 +728,11 @@ pub const CATALOG: &[&str] = &[
     "pe.has_safe_seh",
     "pe.has_version_info",
     "pe.icon_count",
+    "pe.image_hash_skipped",
     "pe.image_size",
     "pe.import_table_unwalkable",
     "pe.misaligned_section_count",
+    "pe.native_resolver_sites_capped",
     "pe.overlay_end",
     "pe.overlay_offset",
     "pe.overlay_padding",
@@ -971,6 +999,7 @@ pub fn dmg_codec_count(codec: &str) -> MetricKey {
 
 /// Which tree-sitter query budget a `source.query_limited.<query>` hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum QueryLimit {
     /// The query ran, but was cut off by one of the budgets below.
     Any,

@@ -35,7 +35,6 @@
 use crate::metric;
 use serde_json::{Value as JsonValue, json};
 
-use crate::error::Error;
 use crate::formats::common::{
     XorScan, append_decoded_strings, extract_binary_strings, hex_nibble, put_str,
 };
@@ -47,13 +46,13 @@ pub(super) fn extract(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
-) -> Result<(), Error> {
+) {
     extract_binary_strings(bytes, strings, XorScan::No);
 
     // Canonical RTF starts with a versioned header. A tightly gated malformed
     // object form is accepted below; other inputs remain generic.
     if !bytes.starts_with(b"{\\rtf") && !crate::fileid::looks_like_obfuscated_rtf(bytes) {
-        return Ok(());
+        return;
     }
 
     // Header control words sit at the top of the document, before
@@ -77,8 +76,6 @@ pub(super) fn extract(
     objects(bytes, values, strings, metrics);
     features(bytes, values);
     shape(bytes, values, metrics);
-
-    Ok(())
 }
 
 /// Return the numeric tail of a control word (`\rtf1` → `"1"`,
@@ -697,7 +694,7 @@ mod tests {
         let mut v = Values::new();
         let mut s = Strings::default();
         let mut m = Metrics::new();
-        extract(bytes, &mut v, &mut s, &mut m).unwrap();
+        extract(bytes, &mut v, &mut s, &mut m);
         (v, m)
     }
 
@@ -906,7 +903,7 @@ mod tests {
         let mut values = Values::default();
         let mut strings = Strings::default();
         let mut metrics = Metrics::default();
-        extract(&rtf, &mut values, &mut strings, &mut metrics).unwrap();
+        extract(&rtf, &mut values, &mut strings, &mut metrics);
         let all: Vec<&str> = strings
             .text
             .rows()

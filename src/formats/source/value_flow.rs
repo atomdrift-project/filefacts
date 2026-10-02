@@ -8,6 +8,59 @@ use tree_sitter::Node;
 const NODE_LIMIT: usize = 20_000;
 const STEP_LIMIT: usize = 100_000;
 
+/// Name → value bindings, layered over an optional read-only base.
+///
+/// Every function body starts from the module-level bindings. Copying that
+/// map per function made the walk functions × globals; layering keeps the
+/// globals borrowed and records only what the function binds or unbinds.
+/// A `None` in `local` hides a base binding the function removed.
+#[derive(Clone, Default)]
+struct Bindings<'g> {
+    base: Option<&'g BTreeMap<String, usize>>,
+    local: BTreeMap<String, Option<usize>>,
+}
+
+impl<'g> Bindings<'g> {
+    fn over(base: &'g BTreeMap<String, usize>) -> Self {
+        Self {
+            base: Some(base),
+            local: BTreeMap::new(),
+        }
+    }
+    fn get(&self, name: &str) -> Option<usize> {
+        match self.local.get(name) {
+            Some(value) => *value,
+            None => self.base.and_then(|base| base.get(name).copied()),
+        }
+    }
+    fn insert(&mut self, name: String, value: usize) {
+        self.local.insert(name, Some(value));
+    }
+    fn remove(&mut self, name: &str) {
+        if self.base.is_some_and(|base| base.contains_key(name)) {
+            self.local.insert(name.to_string(), None);
+        } else {
+            self.local.remove(name);
+        }
+    }
+    /// Names this layer binds or unbinds, which are the only names whose
+    /// value can differ from the shared base.
+    fn layered_names(&self) -> impl Iterator<Item = &String> {
+        self.local.keys()
+    }
+    /// The flattened bindings, for a top-level layer with no base.
+    fn into_map(self) -> BTreeMap<String, usize> {
+        let mut map = self.base.cloned().unwrap_or_default();
+        for (name, value) in self.local {
+            match value {
+                Some(value) => map.insert(name, value),
+                None => map.remove(&name),
+            };
+        }
+        map
+    }
+}
+
 struct Builder<'a> {
     source: &'a str,
     config: &'a LangConfig,
@@ -66,9 +119,7 @@ impl Builder<'_> {
     /// interpolations carry values, so it is evaluated as an expression.
     fn interpolates(&self, node: Node<'_>) -> bool {
         self.config.lang == Lang::Python
-            && named_children(node)
-                .iter()
-                .any(|child| child.kind() == "interpolation")
+            && named_children(node).any(|child| child.kind() == "interpolation")
     }
     fn add(&mut self, kind: FlowKind, node: Node<'_>, inputs: Vec<usize>) -> usize {
         if self.flow.values.len() >= NODE_LIMIT {
@@ -78,7 +129,7 @@ impl Builder<'_> {
         let id = self.flow.values.len();
         self.flow.values.push(FlowValue {
             kind,
-            offset: node.start_byte(),
+            offset: node.start_byte() as u64,
             literal: None,
             target: None,
             inputs,
@@ -87,24 +138,42 @@ impl Builder<'_> {
         });
         id
     }
-    fn bind(&self, node: Node<'_>, value: usize, bindings: &mut BTreeMap<String, usize>) {
-        if self.config.identifier_kinds.contains(&node.kind()) {
-            bindings.insert(self.text(node).to_string(), value);
-        } else if matches!(
-            node.kind(),
-            "expression_list" | "pattern_list" | "tuple_pattern"
-        ) {
-            for child in named_children(node) {
-                self.bind(child, value, bindings);
+    /// Bind every name `node` declares to `value`.
+    ///
+    /// Iterative: a C declarator chain nests one node per `*` or `[]`, so a
+    /// recursive walk overflowed the stack on `int ****…p`. Deeper than
+    /// [`MAX_FLOW_DEPTH`] is reported as a budget limitation, as in `eval`.
+    fn bind(&mut self, node: Node<'_>, value: usize, bindings: &mut Bindings<'_>) {
+        let mut stack = vec![(node, 0usize)];
+        while let Some((node, depth)) = stack.pop() {
+            if depth > MAX_FLOW_DEPTH {
+                self.flow.limitations.insert("analysis-budget".into());
+                continue;
             }
-        } else if let Some(declarator) = node.child_by_field_name("declarator") {
-            self.bind(declarator, value, bindings);
+            if self.config.identifier_kinds.contains(&node.kind()) {
+                bindings.insert(self.text(node).to_string(), value);
+            } else if matches!(
+                node.kind(),
+                "expression_list" | "pattern_list" | "tuple_pattern"
+            ) {
+                // Reversed so names bind left to right, as the recursive
+                // walk did: a repeated name keeps its last binding.
+                // `named_children` only walks forward: push, then reverse
+                // the pushed run in place.
+                let start = stack.len();
+                stack.extend(named_children(node).map(|child| (child, depth + 1)));
+                if let Some(pushed) = stack.get_mut(start..) {
+                    pushed.reverse();
+                }
+            } else if let Some(declarator) = node.child_by_field_name("declarator") {
+                stack.push((declarator, depth + 1));
+            }
         }
     }
     fn eval(
         &mut self,
         node: Node<'_>,
-        bindings: &mut BTreeMap<String, usize>,
+        bindings: &mut Bindings<'_>,
         returns: &mut Vec<usize>,
         depth: usize,
     ) -> usize {
@@ -135,7 +204,7 @@ impl Builder<'_> {
             return 0;
         }
         if self.config.identifier_kinds.contains(&node.kind()) {
-            return bindings.get(self.text(node)).copied().unwrap_or(0);
+            return bindings.get(self.text(node)).unwrap_or(0);
         }
         let literal = ast_walk::build_arg(node, self.source, self.config);
         if matches!(
@@ -199,7 +268,7 @@ impl Builder<'_> {
                             target
                         };
                     if self.config.identifier_kinds.contains(&place.kind()) {
-                        bindings.get(self.text(place)).copied().unwrap_or(0)
+                        bindings.get(self.text(place)).unwrap_or(0)
                     } else {
                         self.flow
                             .limitations
@@ -247,7 +316,7 @@ impl Builder<'_> {
                 callee.and_then(|n| ast_walk::static_dotted_chain(n, self.source, self.config, 0));
             if let Some(raw) = target.as_ref() {
                 let end = raw.find(['.', ':', '(']).unwrap_or(raw.len());
-                if !bindings.contains_key(&raw[..end]) {
+                if bindings.get(&raw[..end]).is_none() {
                     if let Some(prefix) = self.aliases.get(&raw[..end]) {
                         target = Some(format!("{prefix}{}", &raw[end..]));
                     }
@@ -266,7 +335,7 @@ impl Builder<'_> {
             let entries = if node.kind() == "keyword_argument" {
                 vec![node]
             } else {
-                named_children(node)
+                named_children(node).collect()
             };
             for entry in entries {
                 let key = entry
@@ -278,7 +347,7 @@ impl Builder<'_> {
                 } else if entry.kind() == "shorthand_property_identifier" {
                     fields.insert(
                         self.text(entry).into(),
-                        bindings.get(self.text(entry)).copied().unwrap_or(0),
+                        bindings.get(self.text(entry)).unwrap_or(0),
                     );
                 } else {
                     self.flow
@@ -308,10 +377,10 @@ impl Builder<'_> {
                 if let Some(initializer) = node.child_by_field_name("initializer") {
                     if initializer.kind() == "short_var_declaration" {
                         if let Some(pattern) = initializer.child_by_field_name("left") {
-                            let mut declared = BTreeMap::new();
+                            let mut declared = Bindings::default();
                             self.bind(pattern, 0, &mut declared);
-                            for name in declared.into_keys() {
-                                let previous = bindings.get(&name).copied();
+                            for name in declared.local.into_keys() {
+                                let previous = bindings.get(&name);
                                 shadowed.insert(name, previous);
                             }
                         }
@@ -328,13 +397,22 @@ impl Builder<'_> {
                 if let Some(branch) = node.child_by_field_name(field) {
                     let mut local = bindings.clone();
                     values.push(self.eval(branch, &mut local, returns, depth + 1));
-                    for (name, id) in local {
-                        if let Some(previous) = merged.get(&name).copied() {
+                    // A name outside both layers resolves to the shared base
+                    // in `local` and `merged` alike, so only layered names can
+                    // need a merge. Sorted, so value ids are stable.
+                    let names: BTreeSet<String> = local
+                        .layered_names()
+                        .chain(merged.layered_names())
+                        .cloned()
+                        .collect();
+                    for name in names {
+                        let Some(id) = local.get(&name) else {
+                            continue;
+                        };
+                        if let Some(previous) = merged.get(&name) {
                             if previous != id {
-                                merged.insert(
-                                    name,
-                                    self.add(FlowKind::Merge, branch, vec![previous, id]),
-                                );
+                                let merge = self.add(FlowKind::Merge, branch, vec![previous, id]);
+                                merged.insert(name, merge);
                             }
                         } else {
                             merged.insert(name, id);
@@ -376,9 +454,9 @@ impl Builder<'_> {
         let before = if scoped {
             bindings.clone()
         } else {
-            BTreeMap::new()
+            Bindings::default()
         };
-        let mut declared = BTreeMap::new();
+        let mut declared = Bindings::default();
         if scoped {
             for child in named_children(node) {
                 let declarations = if matches!(
@@ -388,7 +466,7 @@ impl Builder<'_> {
                         | "local_variable_declaration"
                         | "declaration"
                 ) {
-                    named_children(child)
+                    named_children(child).collect()
                 } else {
                     vec![child]
                 };
@@ -417,9 +495,9 @@ impl Builder<'_> {
         for child in named_children(node) {
             inputs.push(self.eval(child, bindings, returns, depth + 1));
         }
-        for name in declared.keys() {
+        for name in declared.local.keys() {
             if let Some(previous) = before.get(name) {
-                bindings.insert(name.clone(), *previous);
+                bindings.insert(name.clone(), previous);
             } else {
                 bindings.remove(name);
             }
@@ -476,8 +554,9 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
         builder.flow.limitations.insert("source-byte-budget".into());
     } else {
         builder.add(FlowKind::Unknown, root, Vec::new());
-        let mut globals = BTreeMap::new();
-        builder.eval(root, &mut globals, &mut Vec::new(), 0);
+        let mut module = Bindings::default();
+        builder.eval(root, &mut module, &mut Vec::new(), 0);
+        let globals = module.into_map();
         let mut stack = vec![root];
         let mut duplicate_names = BTreeSet::new();
         while let Some(node) = stack.pop() {
@@ -492,7 +571,7 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
                 };
                 let name = builder.text(name).to_string();
                 let mut function = FlowFunction::default();
-                let mut bindings = globals.clone();
+                let mut bindings = Bindings::over(&globals);
                 if let Some(params) = field_nested(node, "parameters") {
                     for param in named_children(params) {
                         let pattern = param

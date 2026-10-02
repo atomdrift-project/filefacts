@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use super::archive_stats::{Agg, ArchiveStats, Dominance, Reading, Scope, Shape, member_value};
-use crate::bytes::Reader;
+use crate::bytes::{Reader, sat_usize};
 use crate::error::Error;
 use crate::formats::common::hex_encode;
 use crate::metric;
@@ -105,6 +105,12 @@ trait ReadVint {
     /// Read one vint. One that runs off the end, or past ten bytes, fails
     /// having consumed the bytes it read.
     fn vint(&mut self) -> Option<u64>;
+
+    /// Read one vint as a size or count, saturating past `usize::MAX` so
+    /// the bounds check that follows rejects it on 32-bit hosts.
+    fn vsize(&mut self) -> Option<usize> {
+        self.vint().map(sat_usize)
+    }
 }
 
 impl ReadVint for Reader<'_> {
@@ -244,19 +250,19 @@ fn limit(ar: &mut Archive, stage: &str, reason: impl Into<String>) {
 /// a truncated archive or a lying size: stop at the end and record it, rather
 /// than resume the header walk inside the payload.
 fn skip_data(inp: &mut Reader<'_>, ar: &mut Archive, size: u64) {
-    let remaining = inp.remaining() as u64;
-    if size > remaining {
+    let remaining = inp.remaining();
+    if size > remaining as u64 {
         limit(
             ar,
             "data",
             format!(
                 "packed data runs {} bytes past end of file",
-                size - remaining
+                size - remaining as u64
             ),
         );
     }
     // Clamped to what is left, so the skip cannot fail.
-    let _ = inp.skip(size.min(remaining) as usize);
+    let _ = inp.skip(sat_usize(size).min(remaining));
 }
 
 fn find_signature(bytes: &[u8]) -> Option<(usize, u8)> {
@@ -331,7 +337,7 @@ fn filetime_to_unix(ft: u64) -> Option<i64> {
 
 fn dos_to_unix(ft: u32) -> Option<i64> {
     let date = (ft >> 16) as u16;
-    let time = ft as u16;
+    let time = (ft & 0xffff) as u16;
     let year = i32::from((date >> 9) & 0x7f) + 1980;
     let month = u32::from((date >> 5) & 0xf);
     let day = u32::from(date & 0x1f);
@@ -354,9 +360,9 @@ fn parse_extra(bytes: &[u8], extra: &mut Extra) {
     extra.bytes = extra.bytes.saturating_add(bytes.len() as u64);
     let mut inp = Reader::new(bytes);
     while inp.remaining() > 0 {
-        let Some(size) = inp.vint() else { break };
+        let Some(size) = inp.vsize() else { break };
         let start = inp.pos();
-        let Some(end) = start.checked_add(size as usize) else {
+        let Some(end) = start.checked_add(size) else {
             break;
         };
         if end > bytes.len() {
@@ -426,7 +432,7 @@ fn parse_extra(bytes: &[u8], extra: &mut Extra) {
                 let flags = d.vint().unwrap_or(0);
                 extra.link_is_dir = flags & 0x0001 != 0;
                 if let Some(nlen) = d.vint() {
-                    let n = nlen.min(MAX_NAME as u64) as usize;
+                    let n = sat_usize(nlen).min(MAX_NAME);
                     if let Some(name) = d.bytes(n) {
                         extra.linkname = Some(utf8_name(name));
                     }
@@ -454,7 +460,7 @@ fn parse_extra(bytes: &[u8], extra: &mut Extra) {
 }
 
 fn read_counted_str(inp: &mut Reader<'_>) -> Option<String> {
-    let n = inp.vint()? as usize;
+    let n = inp.vsize()?;
     if n > MAX_NAME {
         return None;
     }
@@ -464,9 +470,9 @@ fn read_counted_str(inp: &mut Reader<'_>) -> Option<String> {
 fn parse_main_extra(bytes: &[u8], ar: &mut Archive) {
     let mut inp = Reader::new(bytes);
     while inp.remaining() > 0 {
-        let Some(size) = inp.vint() else { break };
+        let Some(size) = inp.vsize() else { break };
         let start = inp.pos();
-        let Some(end) = start.checked_add(size as usize) else {
+        let Some(end) = start.checked_add(size) else {
             break;
         };
         if end > bytes.len() {
@@ -475,7 +481,7 @@ fn parse_main_extra(bytes: &[u8], ar: &mut Archive) {
         let Some(typ) = inp.vint() else { break };
         let data = bytes.get(inp.pos().min(end)..end).unwrap_or_default();
         inp = Reader::at(bytes, end);
-        ar.extra_field_size = ar.extra_field_size.saturating_add(size);
+        ar.extra_field_size = ar.extra_field_size.saturating_add(size as u64);
         ar.extra_types.insert(typ);
         let mut d = Reader::new(data);
         match typ {
@@ -492,7 +498,7 @@ fn parse_main_extra(bytes: &[u8], ar: &mut Archive) {
                 let flags = d.vint().unwrap_or(0);
                 if flags & 0x0001 != 0 {
                     if let Some(nlen) = d.vint() {
-                        let n = nlen.min(MAX_NAME as u64) as usize;
+                        let n = sat_usize(nlen).min(MAX_NAME);
                         if let Some(name) = d.bytes(n) {
                             if name.first() != Some(&0) {
                                 ar.original_name = Some(utf8_name(name));
@@ -667,16 +673,16 @@ fn walk_rar5(bytes: &[u8], start: usize, ar: &mut Archive) {
             break;
         };
         let size_at = inp.pos();
-        let Some(header_size) = inp.vint() else {
+        let Some(header_size) = inp.vsize() else {
             limit(ar, "header", "truncated header size");
             break;
         };
-        if header_size == 0 || header_size as usize > MAX_HEADER {
+        if header_size == 0 || header_size > MAX_HEADER {
             limit(ar, "header", "header size out of range");
             break;
         }
         let type_at = inp.pos();
-        let Some(rest_end) = type_at.checked_add(header_size as usize) else {
+        let Some(rest_end) = type_at.checked_add(header_size) else {
             limit(ar, "header", "header size overflow");
             break;
         };
@@ -690,7 +696,7 @@ fn walk_rar5(bytes: &[u8], start: usize, ar: &mut Archive) {
         let Some(htype) = inp.vint() else { break };
         let Some(hflags) = inp.vint() else { break };
         let extra_size = if hflags & HFL_EXTRA != 0 {
-            inp.vint().unwrap_or(0)
+            inp.vsize().unwrap_or(0)
         } else {
             0
         };
@@ -723,7 +729,7 @@ fn walk_rar5(bytes: &[u8], start: usize, ar: &mut Archive) {
                     ar.volume_number = inp.vint();
                 }
                 if extra_size > 0 {
-                    let extra_at = rest_end.saturating_sub(extra_size as usize);
+                    let extra_at = rest_end.saturating_sub(extra_size);
                     if extra_at >= inp.pos()
                         && let Some(extra) = bytes.get(extra_at..rest_end.min(bytes.len()))
                     {
@@ -735,7 +741,7 @@ fn walk_rar5(bytes: &[u8], start: usize, ar: &mut Archive) {
                 let service = htype == HEAD5_SERVICE;
                 let file_flags = inp.vint().unwrap_or(0);
                 let unpacked = inp.vint().unwrap_or(0);
-                let attrs = inp.vint().unwrap_or(0) as u32;
+                let attrs = (inp.vint().unwrap_or(0) & 0xffff_ffff) as u32;
                 let mut mtime = None;
                 if file_flags & LHFL_UTIME != 0 {
                     mtime = inp.u32_le().map(i64::from);
@@ -747,7 +753,7 @@ fn walk_rar5(bytes: &[u8], start: usize, ar: &mut Archive) {
                 };
                 let comp = inp.vint().unwrap_or(0);
                 let host = inp.vint().unwrap_or(0);
-                let nlen = inp.vint().unwrap_or(0) as usize;
+                let nlen = inp.vsize().unwrap_or(0);
                 if nlen > MAX_NAME {
                     limit(ar, "name", "name longer than cap");
                     inp = Reader::at(bytes, rest_end);
@@ -760,7 +766,7 @@ fn walk_rar5(bytes: &[u8], start: usize, ar: &mut Archive) {
                 let name = utf8_name(name_bytes);
                 let mut extra = Extra::default();
                 if extra_size > 0 {
-                    let extra_at = rest_end.saturating_sub(extra_size as usize);
+                    let extra_at = rest_end.saturating_sub(extra_size);
                     if extra_at < rest_end
                         && let Some(record) = bytes.get(extra_at..rest_end.min(bytes.len()))
                     {
@@ -825,7 +831,7 @@ fn walk_rar5(bytes: &[u8], start: usize, ar: &mut Archive) {
                 if let Some(ds) = data_size {
                     if name == "CMT"
                         && member.method.as_deref() == Some("stored")
-                        && let Some(body) = inp.bytes(ds as usize)
+                        && let Some(body) = inp.bytes(sat_usize(ds))
                     {
                         ar.comment = Some(utf8_name(body));
                     } else {
@@ -842,7 +848,7 @@ fn walk_rar5(bytes: &[u8], start: usize, ar: &mut Archive) {
                 ar.end_offset = rest_end as u64;
                 inp = Reader::at(bytes, rest_end);
                 if let Some(ds) = data_size {
-                    let _ = inp.skip(ds as usize);
+                    let _ = inp.skip(sat_usize(ds));
                     ar.end_offset = inp.pos() as u64;
                 }
                 return;
@@ -869,7 +875,7 @@ fn decode_rar4_unicode(ascii: &[u8], enc: &[u8]) -> Option<String> {
         return None;
     }
     let mut enc_pos = 0usize;
-    let high = *enc.get(enc_pos)? as u16;
+    let high = u16::from(*enc.get(enc_pos)?);
     enc_pos += 1;
     let mut flags = 0u8;
     let mut flag_bits = 0i32;
@@ -890,8 +896,8 @@ fn decode_rar4_unicode(ascii: &[u8], enc: &[u8]) -> Option<String> {
                 enc_pos += 1;
             }
             2 => {
-                let lo = *enc.get(enc_pos)? as u16;
-                let hi = *enc.get(enc_pos + 1)? as u16;
+                let lo = u16::from(*enc.get(enc_pos)?);
+                let hi = u16::from(*enc.get(enc_pos + 1)?);
                 out.push(lo + (hi << 8));
                 enc_pos += 2;
             }
@@ -901,9 +907,9 @@ fn decode_rar4_unicode(ascii: &[u8], enc: &[u8]) -> Option<String> {
                 let length = usize::from(b & 0x7f) + 2;
                 if b & 0x80 != 0 {
                     for _ in 0..length {
-                        let add = *enc.get(enc_pos)? as u16;
+                        let add = u16::from(*enc.get(enc_pos)?);
                         enc_pos += 1;
-                        let src = ascii.get(out.len()).copied().unwrap_or(0) as u16;
+                        let src = u16::from(ascii.get(out.len()).copied().unwrap_or(0));
                         out.push(((src + high) << 8) + add);
                     }
                 } else {
@@ -945,7 +951,8 @@ fn walk_rar4(bytes: &[u8], start: usize, ar: &mut Archive) {
         if inp.remaining() < 7 {
             break;
         }
-        let header_off = inp.pos() as u64;
+        let block_start = inp.pos();
+        let header_off = block_start as u64;
         let Some(stored_crc) = inp.u16_le() else {
             break;
         };
@@ -956,8 +963,7 @@ fn walk_rar4(bytes: &[u8], start: usize, ar: &mut Archive) {
             limit(ar, "header", "RAR4 header smaller than 7");
             break;
         }
-        let block_start = header_off as usize;
-        let Some(header_end) = block_start.checked_add(head_size as usize) else {
+        let Some(header_end) = block_start.checked_add(usize::from(head_size)) else {
             break;
         };
         // The CRC covers the header after its own two bytes.
@@ -965,7 +971,7 @@ fn walk_rar4(bytes: &[u8], start: usize, ar: &mut Archive) {
             limit(ar, "header", "RAR4 header overruns file");
             break;
         };
-        if (crc32fast::hash(crc_of) as u16) != stored_crc {
+        if (crc32fast::hash(crc_of) & 0xffff) as u16 != stored_crc {
             ar.header_crc_mismatch += 1;
         }
         inp = Reader::at(bytes, block_start + 7);
@@ -1084,7 +1090,7 @@ fn walk_rar4(bytes: &[u8], start: usize, ar: &mut Archive) {
                 apply_attrs(&mut member, attrs, host == 3);
                 inp = Reader::at(bytes, header_end);
                 if service && name == "CMT" && method == 0x30 {
-                    if let Some(body) = inp.bytes(pack.min(inp.remaining() as u64) as usize) {
+                    if let Some(body) = inp.bytes(sat_usize(pack).min(inp.remaining())) {
                         ar.comment = Some(utf8_name(body));
                     }
                 } else {

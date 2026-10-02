@@ -152,26 +152,32 @@ pub enum Trust {
     /// No signature present.
     #[default]
     Unsigned,
-    /// A signature structure is present, but its cryptographic proof has not
-    /// been verified. This records signed packaging without overstating trust.
+    /// A signature structure is present, but filefacts did not verify it:
+    /// the signature failed, used an algorithm it cannot check, was detached
+    /// from content it could not find, or carried no certificate to check it
+    /// against. Records signed packaging without overstating trust.
     Unverified,
     /// Ad-hoc signed: a code signature with no identifying certificate
     /// chain (Mach-O `CS_ADHOC`). Integrity without identity.
     AdHoc,
-    /// Signed by a certificate that is its own issuer — asserts an
-    /// identity nothing else vouches for.
+    /// A verified signature by a certificate that is its own issuer —
+    /// asserts an identity nothing else vouches for.
     SelfSigned,
-    /// Signed by a certificate chaining to a public CA, signer not
-    /// otherwise recognized.
+    /// A verified signature whose certificate was issued by another, but
+    /// whose chain does not end at a pinned vendor root (or does, for a
+    /// third-party leaf). Which issuing CAs to trust is left to consumers
+    /// pinning `chain_sha256`; nothing here checks a public CA store.
     CaSigned,
-    /// Apple Developer ID — distributed outside the App Store by an
-    /// enrolled developer.
+    /// Apple Developer ID: a verified signature chaining to a pinned Apple
+    /// root, by a leaf whose common name starts `Developer ID `.
     DeveloperId,
-    /// Signed by the platform vendor (Microsoft, Apple software
-    /// signing) but not a first-party OS component.
+    /// The platform vendor's own signature: verified, chaining to a pinned
+    /// Microsoft or Apple root, by a leaf whose organization is exactly
+    /// `Microsoft Corporation` or `Apple Inc.`.
     Platform,
-    /// A first-party operating-system component (Apple platform binary,
-    /// system-bundled tool).
+    /// A first-party operating-system component: a Mach-O `Platform`
+    /// signature over a CodeDirectory whose platform byte is set. The byte
+    /// alone, which any binary can set, is not enough.
     System,
 }
 
@@ -180,6 +186,7 @@ pub enum Trust {
 /// Empty fields are omitted from the JSON. [`Identity::is_empty`]
 /// reports whether anything was found at all.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Identity {
     /// Short program / package / product name (`ls`, the npm package
     /// name, the VSIX display name).

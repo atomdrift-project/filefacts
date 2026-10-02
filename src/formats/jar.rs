@@ -32,12 +32,12 @@
 //! `archive.compression.*`) runs on the same ZIP handle before this
 //! extractor layers JAR-specific facts on top.
 
+use crate::formats::common::{ends_with_ci, starts_with_ci};
 use crate::metric;
 use serde_json::{Value as JsonValue, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
-use crate::error::Error;
 use crate::output::{Errors, Metrics, Stage, Values};
 use crate::value_key;
 
@@ -125,7 +125,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     values: &mut Values,
     metrics: &mut Metrics,
     errors: &mut Errors,
-) -> Result<(), Error> {
+) {
     let mut entry_count: u32 = 0;
     let mut class_count: u32 = 0;
     let mut signature_count: u32 = 0;
@@ -185,10 +185,12 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             }
             _ => {}
         }
-        if name.starts_with("META-INF/") && name.ends_with(".SF") {
+        // The JDK upper-cases entry names before looking for signature files,
+        // so `meta-inf/cert.sf` signs a JAR exactly as `META-INF/CERT.SF` does.
+        if starts_with_ci(name, "META-INF/") && ends_with_ci(name, ".SF") {
             signature_count += 1;
         }
-        if name.starts_with("META-INF/")
+        if starts_with_ci(name, "META-INF/")
             && name.rsplit('.').next().is_some_and(|ext| {
                 ["RSA", "DSA", "EC", "SIG"]
                     .iter()
@@ -203,18 +205,21 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         if name.starts_with("META-INF/services/") {
             service_count += 1;
         }
-        if name.starts_with("META-INF/versions/") && name.ends_with(".class") {
+        // Class lookup is by exact name: `Foo.CLASS` is not a class file.
+        if name.starts_with("META-INF/versions/")
+            && name.rsplit_once('.').is_some_and(|(_, ext)| ext == "class")
+        {
             versioned_class_count += 1;
         }
         if name == "META-INF/INDEX.LIST" {
             index_count += 1;
         }
         if name == "META-INF/MANIFEST.MF" {
-            if let Some(text) = read_text(zip, name) {
+            if let Some(text) = read_text(zip, name, errors) {
                 manifest = parse_manifest(&text);
             }
         } else if pom_group.is_none() && name.ends_with("/pom.properties") {
-            if let Some(text) = read_text(zip, name) {
+            if let Some(text) = read_text(zip, name, errors) {
                 for line in text.lines() {
                     let line = line.trim();
                     if let Some(v) = line.strip_prefix("groupId=") {
@@ -230,18 +235,18 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     }
 
     if entry_count == 0 && manifest.as_ref().is_none_or(ManifestFacts::is_empty) {
-        return Ok(());
+        return;
     }
 
     let class_path_count = manifest
         .as_ref()
         .and_then(|m| m.headers.get("class_path"))
-        .map(|v| v.split_whitespace().count() as u32)
+        .map(|v| crate::bytes::sat_u32(v.split_whitespace().count()))
         .unwrap_or(0);
     let boot_class_path_count = manifest
         .as_ref()
         .and_then(|m| m.headers.get("boot_class_path"))
-        .map(|v| v.split_whitespace().count() as u32)
+        .map(|v| crate::bytes::sat_u32(v.split_whitespace().count()))
         .unwrap_or(0);
     let has_java_agents = manifest_has_agent(manifest.as_ref());
     let has_osgi_activator = manifest
@@ -408,8 +413,6 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             f64::from(boot_class_path_count),
         );
     }
-
-    Ok(())
 }
 
 /// Decompress an entry into a `String`, capped at `MAX_TEXT_BYTES`
@@ -421,14 +424,22 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
 fn read_text<R: std::io::Read + std::io::Seek>(
     zip: &mut ::zip::ZipArchive<R>,
     name: &str,
+    errors: &mut Errors,
 ) -> Option<String> {
-    let entry = zip.by_name(name).ok()?;
-    let mut buf = Vec::new();
-    entry.take(MAX_TEXT_BYTES + 1).read_to_end(&mut buf).ok()?;
-    if buf.len() as u64 > MAX_TEXT_BYTES {
-        return None;
-    }
-    String::from_utf8(buf).ok()
+    // Absent is normal; anything else stopped a member the JAR lists from
+    // being read, and is worth stating.
+    let buf = match super::zip::read_member(zip, name, MAX_TEXT_BYTES) {
+        Ok(buf) => buf?,
+        Err(e) => {
+            errors.record_malformed(Stage::ZipParse, format!("{name}: {e}"));
+            return None;
+        }
+    };
+    String::from_utf8(buf)
+        .map_err(|e| {
+            errors.record_malformed(Stage::FormatExtract, format!("{name}: not UTF-8: {e}"))
+        })
+        .ok()
 }
 
 /// Facts parsed from a `MANIFEST.MF` text body. The JAR manifest format wraps
@@ -502,7 +513,7 @@ fn parse_manifest(text: &str) -> Option<ManifestFacts> {
     }
 
     let mut facts = ManifestFacts::default();
-    facts.section_count = sections.len().saturating_sub(1) as u32;
+    facts.section_count = crate::bytes::sat_u32(sections.len().saturating_sub(1));
     for (section_index, section) in sections.into_iter().enumerate() {
         let mut named = false;
         for line in section {
@@ -580,7 +591,7 @@ mod tests {
         let mut m = Metrics::new();
         let mut e = Errors::new();
         if let Ok(mut zip) = crate::formats::zip::open_archive(bytes) {
-            extract_from_archive(&mut zip, &mut v, &mut m, &mut e).unwrap();
+            extract_from_archive(&mut zip, &mut v, &mut m, &mut e);
         }
         (v, m, e)
     }
@@ -624,7 +635,7 @@ mod tests {
         let err = &e.as_slice()[0];
         assert_eq!(
             (err.stage, err.kind),
-            (Stage::ZipParse, crate::ErrorKind::Malformed)
+            (Stage::ZipParse, crate::DiagnosticKind::Malformed)
         );
         assert!(
             err.message.starts_with("2 of 4 entries unreadable"),

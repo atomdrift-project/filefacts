@@ -36,7 +36,7 @@ pub(super) fn looks_like_axml(data: &[u8]) -> bool {
     }
     u16_le(data, 0) == Some(0x0003)
         && u16_le(data, 2) == Some(8)
-        && u32_le(data, 4) == Some(data.len() as u32)
+        && u32_le(data, 4).map(|n| n as usize) == Some(data.len())
         && u16_le(data, 8) == Some(TYPE_STRING_POOL)
 }
 
@@ -87,9 +87,11 @@ fn decode_string(chunk: &[u8], at: usize, utf8: bool) -> Option<String> {
         // The declared length (up to 2^31 units) must not size an allocation
         // the chunk cannot back.
         let end = start.checked_add(len.checked_mul(2)?)?;
-        let (units, _) = chunk.get(start..end)?.as_chunks::<2>();
-        let units: Vec<u16> = units.iter().map(|&unit| u16::from_le_bytes(unit)).collect();
-        Some(String::from_utf16_lossy(&units))
+        let units = chunk.get(start..end)?;
+        Some(crate::bytes::utf16_lossy(
+            units,
+            crate::bytes::Endian::Little,
+        ))
     }
 }
 
@@ -126,7 +128,7 @@ fn typed_value(pool: &[String], data_type: u8, data: u32) -> String {
         // TYPE_REFERENCE / TYPE_ATTRIBUTE — a resource id, not a value.
         0x01 | 0x02 => format!("@0x{data:x}"),
         // TYPE_INT_DEC and the remaining integer types.
-        _ => (data as i32).to_string(),
+        _ => data.cast_signed().to_string(),
     }
 }
 

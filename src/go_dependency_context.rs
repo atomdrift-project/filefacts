@@ -14,8 +14,11 @@ pub struct ReferenceMember<'a> {
     pub references: &'a [Reference],
 }
 
+/// Whether `path`'s final component is `name`: the whole path, or `name`
+/// after a `/` or an `!!` archive delimiter.
 fn named(path: &str, name: &str) -> bool {
-    path == name || path.ends_with(&format!("/{name}")) || path.ends_with(&format!("!!{name}"))
+    path.strip_suffix(name)
+        .is_some_and(|rest| rest.is_empty() || rest.ends_with('/') || rest.ends_with("!!"))
 }
 
 fn local(base: &str, spec: &str) -> Option<String> {
@@ -292,6 +295,20 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
         )
+    }
+
+    #[test]
+    fn named_matches_only_the_final_component() {
+        for (path, expected) in [
+            ("go.mod", true),
+            ("pkg/go.mod", true),
+            ("x/a.zip!!go.mod", true),
+            ("pkg/notgo.mod", false),
+            ("go.mod.bak", false),
+            ("x/a.zip!go.mod", false),
+        ] {
+            assert_eq!(named(path, "go.mod"), expected, "{path}");
+        }
     }
 
     #[test]

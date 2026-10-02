@@ -80,28 +80,27 @@ fn pe_with_forged_import_directory(descriptors: usize, long_lookup_tables: bool)
     bytes
 }
 
-fn importless_parse(bytes: &[u8]) -> PE<'_> {
-    let opts = goblin::pe::options::ParseOptions::default()
-        .with_parse_mode(goblin::options::ParseMode::Permissive)
-        .with_parse_imports(false);
-    PE::parse_with_opts(bytes, &opts).expect("import-less permissive parse")
-}
-
 #[test]
 fn import_walk_budget_accepts_a_real_pe() {
     let bytes = read_fixture("test.exe");
     let pe = PE::parse(&bytes).expect("fixture PE");
+    assert!(!pe.imports.is_empty());
     assert!(
-        import_walk_budget(&bytes, &pe).is_ok(),
+        import_walk_budget_from_headers(&bytes).is_ok(),
         "a linker-produced import table must stay within budget"
+    );
+    let parse = parse_pe(&bytes);
+    assert_eq!(parse.imports_skipped, None);
+    assert_eq!(
+        parse.outcome.ok().expect("fixture parses").imports.len(),
+        pe.imports.len()
     );
 }
 
 #[test]
 fn import_walk_budget_rejects_too_many_descriptors() {
     let bytes = pe_with_forged_import_directory(MAX_IMPORT_DESCRIPTORS + 1, false);
-    let pe = importless_parse(&bytes);
-    let err = import_walk_budget(&bytes, &pe).expect_err("descriptor cap must trip");
+    let err = import_walk_budget_from_headers(&bytes).expect_err("descriptor cap must trip");
     assert_eq!(err, Rejection::UnterminatedImportDirectory);
 }
 
@@ -111,9 +110,70 @@ fn import_walk_budget_rejects_too_many_descriptors() {
 #[test]
 fn import_walk_budget_rejects_oversized_lookup_tables() {
     let bytes = pe_with_forged_import_directory(8, true);
-    let pe = importless_parse(&bytes);
-    let err = import_walk_budget(&bytes, &pe).expect_err("entry budget must trip");
+    let err = import_walk_budget_from_headers(&bytes).expect_err("entry budget must trip");
     assert_eq!(err, Rejection::OversizedImportLookupTables);
+}
+
+/// A PE whose import directory is well formed enough for *strict* mode:
+/// `descriptors` valid descriptors (a real name string, a resolvable
+/// lookup table) that all share one lookup table of `entries` ordinal
+/// imports. goblin's strict parse accepts it and materialises
+/// `descriptors * entries` imports, so the budget has to run first.
+fn pe_with_shared_ordinal_lookup_table(descriptors: usize, entries: usize) -> Vec<u8> {
+    let mut bytes = read_fixture("test.exe");
+    let (section_table, count, import_dir) = pe_layout(&bytes);
+    let last = section_table + (count - 1) * 40;
+    let virtual_address = u32::from_le_bytes(bytes[last + 12..last + 16].try_into().unwrap());
+    let pointer = u32::from_le_bytes(bytes[last + 20..last + 24].try_into().unwrap()) as usize;
+    let name_at = (descriptors + 1) * 20;
+    let table_at = name_at + 16;
+    let size = table_at + (entries + 1) * 8;
+    bytes.resize(pointer + size, 0);
+    bytes[pointer..pointer + size].fill(0);
+    put_u32(&mut bytes, last + 8, size as u32); // virtual_size
+    put_u32(&mut bytes, last + 16, size as u32); // size_of_raw_data
+    bytes[pointer + name_at..pointer + name_at + 6].copy_from_slice(b"a.dll\0");
+    for i in 0..entries {
+        // PE32+ ordinal import: top bit set, ordinal in the low 16 bits.
+        let at = pointer + table_at + i * 8;
+        bytes[at..at + 8].copy_from_slice(&(0x8000_0000_0000_0001_u64).to_le_bytes());
+    }
+    let table_rva = virtual_address + table_at as u32;
+    for i in 0..descriptors {
+        let at = pointer + i * 20;
+        put_u32(&mut bytes, at, table_rva); // import_lookup_table_rva
+        put_u32(&mut bytes, at + 12, virtual_address + name_at as u32); // name_rva
+        put_u32(&mut bytes, at + 16, table_rva); // import_address_table_rva
+    }
+    put_u32(&mut bytes, import_dir, virtual_address);
+    put_u32(&mut bytes, import_dir + 4, ((descriptors + 1) * 20) as u32);
+    bytes
+}
+
+#[test]
+fn parse_pe_budgets_imports_before_the_strict_parse() {
+    // Within budget, the shared-table shape still reaches strict goblin.
+    let small = pe_with_shared_ordinal_lookup_table(4, 8);
+    let parse = parse_pe(&small);
+    assert_eq!(parse.imports_skipped, None);
+    let pe = parse
+        .outcome
+        .ok()
+        .expect("strict parse of the small fixture");
+    assert_eq!(pe.imports.len(), 32, "4 descriptors x 8 entries");
+
+    // 200 x 2000 = 400k imports from 16 KiB of table: refused up front.
+    let big = pe_with_shared_ordinal_lookup_table(200, 2000);
+    let parse = parse_pe(&big);
+    assert_eq!(
+        parse.imports_skipped,
+        Some(Rejection::OversizedImportLookupTables)
+    );
+    let pe = parse
+        .outcome
+        .ok()
+        .expect("headers and sections still parse");
+    assert!(pe.imports.is_empty());
 }
 
 /// The bound has to be wired into `parse_pe`, not merely available: a
@@ -224,6 +284,20 @@ fn rejection_messages_are_unchanged() {
                 available: 4,
             },
             "export trie node 0x0 claims 100 branches in 4 bytes",
+        ),
+        (
+            Rejection::ExportTrieTooDeep {
+                node: 0x380,
+                depth: 129,
+            },
+            "export trie reaches node 0x380 at depth 129, past 128",
+        ),
+        (
+            Rejection::OversizedBindStream {
+                stream: "lazy",
+                imports: 262_145,
+            },
+            "lazy bind opcodes declare at least 262145 imports, past 262144",
         ),
     ] {
         assert_eq!(reason.to_string(), text);
@@ -339,6 +413,22 @@ fn catch_infallible_catches_lazy_walker_panic() {
     }
 }
 
+/// A guard nested inside another must hand suppression back to the outer
+/// one: resetting the flag to `false` used to let the outer closure's later
+/// panics reach the user's hook.
+#[test]
+fn nested_guards_restore_the_outer_suppression() {
+    let flag = || SUPPRESS_PANIC_OUTPUT.with(Cell::get);
+    assert!(!flag());
+    let outer = catch_infallible(|| {
+        let inner: GoblinOutcome<()> = catch_infallible(|| panic!("inner"));
+        assert!(matches!(inner, GoblinOutcome::Panicked(_)));
+        flag()
+    });
+    assert!(matches!(outer, GoblinOutcome::Ok(true)));
+    assert!(!flag(), "the outermost guard clears it again");
+}
+
 #[test]
 fn parse_pe_rejects_garbage() {
     let result = parse_pe(b"not a PE file at all").outcome;
@@ -435,6 +525,148 @@ fn export_trie_waves_through_what_goblin_rejects() {
     // Truncated ULEB / label: goblin's own Err is the report.
     assert!(validate_export_trie_bytes(&[0x00, 0x01, b'_'], 0, 3).is_ok());
     assert!(validate_export_trie_bytes(&[0x80], 0, 1).is_ok());
+}
+
+/// A straight chain of `depth` non-terminal nodes, each with one edge `a`, and
+/// a terminal leaf at the bottom. Acyclic, so only a depth bound catches it.
+pub(crate) fn chain_trie(depth: usize) -> Vec<u8> {
+    let mut trie = Vec::new();
+    for _ in 0..depth {
+        // Three-byte child ULEB so every node is the same seven bytes.
+        let child = trie.len() + 7;
+        assert!(child < 1 << 21);
+        trie.extend_from_slice(&[0x00, 0x01, b'a', 0x00]);
+        trie.extend_from_slice(&[
+            (child as u8 & 0x7f) | 0x80,
+            ((child >> 7) as u8 & 0x7f) | 0x80,
+            (child >> 14) as u8,
+        ]);
+    }
+    trie.extend_from_slice(&[0x02, 0x00, 0x10, 0x00]);
+    trie
+}
+
+/// A minimal 64-bit Mach-O executable whose only load command is an
+/// `LC_DYLD_INFO_ONLY` pointing at `bind` and `export` in the file.
+pub(crate) fn macho_with_dyld_info(bind: &[u8], export: &[u8]) -> Vec<u8> {
+    const HEADER: usize = 32;
+    const DYLD_INFO: usize = 48;
+    let bind_off = HEADER + DYLD_INFO;
+    let export_off = bind_off + bind.len();
+    let mut file = Vec::new();
+    for word in [
+        0xfeed_facf_u32,
+        0x0100_0007,
+        3,
+        2,
+        1,
+        DYLD_INFO as u32,
+        0,
+        0,
+    ] {
+        file.extend_from_slice(&word.to_le_bytes());
+    }
+    let fields = [
+        0x8000_0022_u32, // LC_DYLD_INFO_ONLY
+        DYLD_INFO as u32,
+        0,
+        0, // rebase
+        bind_off as u32,
+        bind.len() as u32,
+        0,
+        0, // weak bind
+        0,
+        0, // lazy bind
+        export_off as u32,
+        export.len() as u32,
+    ];
+    for word in fields {
+        file.extend_from_slice(&word.to_le_bytes());
+    }
+    file.extend_from_slice(bind);
+    file.extend_from_slice(export);
+    file
+}
+
+/// Run `f` on a thread with a 2 MiB stack, the size of a Rayon worker's.
+fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(f)
+        .expect("spawn")
+        .join()
+        .expect("join")
+}
+
+#[test]
+fn export_trie_rejects_a_chain_past_the_depth_limit() {
+    let trie = chain_trie(MAX_EXPORT_TRIE_DEPTH);
+    let err = validate_export_trie_bytes(&trie, 0, trie.len()).expect_err("depth must trip");
+    assert!(
+        matches!(err, Rejection::ExportTrieTooDeep { depth, .. } if depth == MAX_EXPORT_TRIE_DEPTH + 1),
+        "unexpected reason: {err}"
+    );
+    // A chain 5000 deep overflows goblin's recursive walk on a 2 MiB stack;
+    // the validator refuses it before goblin ever sees it.
+    let deep = macho_with_dyld_info(&[], &chain_trie(5000));
+    on_small_stack(move || {
+        let GoblinOutcome::Ok(Mach::Binary(macho)) = parse_mach(&deep) else {
+            panic!("fixture must parse");
+        };
+        assert!(matches!(
+            validate_export_trie(&macho, &deep),
+            Err(Rejection::ExportTrieTooDeep { .. })
+        ));
+    });
+}
+
+#[test]
+fn export_trie_at_the_depth_limit_is_walkable_on_a_worker_stack() {
+    let file = macho_with_dyld_info(&[], &chain_trie(MAX_EXPORT_TRIE_DEPTH - 1));
+    let exports = on_small_stack(move || {
+        let GoblinOutcome::Ok(Mach::Binary(macho)) = parse_mach(&file) else {
+            panic!("fixture must parse");
+        };
+        validate_export_trie(&macho, &file).expect("within the limit");
+        match catch(|| macho.exports()) {
+            GoblinOutcome::Ok(exports) => exports.len(),
+            other => panic!("goblin walk failed: {:?}", other.ok().map(|e| e.len())),
+        }
+    });
+    assert_eq!(exports, 1);
+}
+
+#[test]
+fn bind_opcodes_with_a_forged_repeat_count_are_refused() {
+    // BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB, count 2^32 - 1, skip 0.
+    let bind = [0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, 0x00];
+    let file = macho_with_dyld_info(&bind, &[]);
+    let GoblinOutcome::Ok(Mach::Binary(macho)) = parse_mach(&file) else {
+        panic!("fixture must parse");
+    };
+    let err = validate_bind_opcodes(&macho, &file).expect_err("count must trip");
+    assert!(
+        matches!(err, Rejection::OversizedBindStream { stream: "bind", imports } if imports == u64::from(u32::MAX)),
+        "unexpected reason: {err}"
+    );
+}
+
+#[test]
+fn bind_opcodes_within_budget_reach_goblin_unchanged() {
+    // Set symbol `_a`, ordinal 1, segment 0 offset 0, then bind it three
+    // times: DO_BIND, DO_BIND_ADD_ADDR_IMM_SCALED, and a ULEB repeat of 1.
+    let bind = [
+        0x11, 0x40, b'_', b'a', 0x00, 0x70, 0x00, 0x90, 0xB1, 0xC0, 0x01, 0x00, 0x00,
+    ];
+    let file = macho_with_dyld_info(&bind, &[]);
+    let GoblinOutcome::Ok(Mach::Binary(macho)) = parse_mach(&file) else {
+        panic!("fixture must parse");
+    };
+    assert_eq!(count_bind_imports(&file, 80, 80 + bind.len(), 0), 3);
+    assert!(validate_bind_opcodes(&macho, &file).is_ok());
+    // Truncated operands are goblin's to reject: the count stops there.
+    assert_eq!(count_bind_imports(&[0x90, 0xA0, 0x80], 0, 3, 0), 2);
+    assert_eq!(count_bind_imports(&[0xC0, 0x05], 0, 2, 0), 0);
 }
 
 /// A header cut off inside `e_shstrndx`, the last field zeroed, used to

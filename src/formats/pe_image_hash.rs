@@ -14,14 +14,22 @@
 //! two holes), then each section in `PointerToRawData` order, then
 //! any trailing overlay bytes that sit between the sections and the
 //! cert table. The same byte layout works for SHA-1, SHA-256,
-//! SHA-384, and SHA-512 — only the hash function changes.
+//! SHA-384, and SHA-512 — only the hash function changes, so every
+//! wanted digest is fed from one walk over the regions.
 //!
 //! Emits:
-//! - `pe.image_hash.sha1` / `.sha256` / `.sha384` / `.sha512` — hex digests
+//! - `pe.image_hash.sha256` — hex digest, always: it is the Authentihash
+//!   catalogues and threat intelligence key on.
+//! - `pe.image_hash.sha1` / `.sha384` / `.sha512` — only when a signature
+//!   on the image (nested ones included) commits to that algorithm, which
+//!   is what `pe_signature_trust` compares against. Nothing else reads them.
 //! - `pe.overlay_padding` (metric) — bytes between sections-end and
 //!   the cert table that the signature also covers. Non-zero implies
 //!   data was appended to the binary post-signing-time but inside the
 //!   region the signature authenticates.
+//! - `pe.image_hash_skipped` (metric) — the section table makes the image
+//!   hash cover more than [`MAX_HASHED_FILE_MULTIPLE`] times the file, which
+//!   only overlapping raw ranges can do; no digest is emitted.
 
 use crate::metric;
 use serde_json::Value as JsonValue;
@@ -52,6 +60,8 @@ enum PeHashAlg {
 }
 
 impl PeHashAlg {
+    const ALL: [Self; 4] = [Self::Sha1, Self::Sha256, Self::Sha384, Self::Sha512];
+
     /// Lowercase short name used in emitted key paths and OID labels.
     fn name(self) -> &'static str {
         match self {
@@ -60,6 +70,10 @@ impl PeHashAlg {
             PeHashAlg::Sha384 => "sha384",
             PeHashAlg::Sha512 => "sha512",
         }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|alg| alg.name() == name)
     }
 
     fn hasher(self) -> Box<dyn DynDigest> {
@@ -84,46 +98,107 @@ struct Regions {
 }
 
 impl Regions {
+    /// Bytes the image hash covers, counting overlapping ranges each time.
+    fn hashed_len(&self) -> u64 {
+        self.ranges.iter().map(|r| r.len() as u64).sum()
+    }
+
+    /// Hex digests for `algs`, all fed from one walk over the ranges.
     /// `None` when a range falls outside `bytes`; `derive_regions` only
     /// builds in-bounds ranges, so that means a caller passed other bytes.
-    fn digest(&self, bytes: &[u8], alg: PeHashAlg) -> Option<String> {
-        let mut hasher = alg.hasher();
+    fn digests(&self, bytes: &[u8], algs: &[PeHashAlg]) -> Option<Vec<(PeHashAlg, String)>> {
+        let mut hashers: Vec<_> = algs.iter().map(|&alg| (alg, alg.hasher())).collect();
         for range in &self.ranges {
-            hasher.update(bytes.get(range.clone())?);
+            let chunk = bytes.get(range.clone())?;
+            for (_, hasher) in &mut hashers {
+                hasher.update(chunk);
+            }
         }
-        Some(hex_encode(&hasher.finalize()))
+        Some(
+            hashers
+                .into_iter()
+                .map(|(alg, hasher)| (alg, hex_encode(&hasher.finalize())))
+                .collect(),
+        )
     }
 }
+
+/// Most bytes the image hash may cover, as a multiple of the file size.
+/// A canonical layout covers each byte at most once; only section headers
+/// whose raw ranges overlap can exceed this, and a crafted table of
+/// 96 sections over one region would otherwise hash the file 96 times per
+/// algorithm. A capped digest would be a wrong digest, so past the cap none
+/// is emitted.
+const MAX_HASHED_FILE_MULTIPLE: u64 = 4;
 
 /// Emit `pe.image_hash.*` digests and `pe.overlay_padding` for a
 /// parsed PE. No-op when the optional header is missing or any of
 /// the hashed regions overflow the file — Authenticode strictly
 /// requires the canonical layout.
+///
+/// Runs after the Authenticode parse, so the algorithms the image's
+/// signatures commit to are already in `values`.
 pub(super) fn extract(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
-    let Some(regions) = derive_regions(pe, bytes) else {
-        return;
-    };
-    for alg in [
-        PeHashAlg::Sha1,
-        PeHashAlg::Sha256,
-        PeHashAlg::Sha384,
-        PeHashAlg::Sha512,
-    ] {
-        let Some(digest) = regions.digest(bytes, alg) else {
-            return;
-        };
-        values.insert_key_at(
-            value_key!("pe.image_hash"),
-            alg.name(),
-            JsonValue::String(digest),
-        );
+    if let Some(regions) = derive_regions(pe, bytes) {
+        emit(&regions, bytes, values, metrics);
     }
+}
+
+fn emit(regions: &Regions, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     if regions.overlay_padding > 0 {
         metrics.insert(
             metric!("pe.overlay_padding"),
             regions.overlay_padding as f64,
         );
     }
+    if regions.hashed_len() > (bytes.len() as u64).saturating_mul(MAX_HASHED_FILE_MULTIPLE) {
+        metrics.insert(metric!("pe.image_hash_skipped"), 1.0);
+        return;
+    }
+    let algs = wanted_algorithms(values);
+    let Some(digests) = regions.digests(bytes, &algs) else {
+        return;
+    };
+    for (alg, digest) in digests {
+        values.insert_key_at(
+            value_key!("pe.image_hash"),
+            alg.name(),
+            JsonValue::String(digest),
+        );
+    }
+}
+
+/// SHA-256 always, plus every algorithm a signature on the image commits
+/// to (`signature_digest_algorithm`, nested signatures included).
+fn wanted_algorithms(values: &Values) -> Vec<PeHashAlg> {
+    fn claimed(sig: &JsonValue, out: &mut Vec<PeHashAlg>) {
+        if let Some(alg) = sig
+            .get("signature_digest_algorithm")
+            .and_then(JsonValue::as_str)
+            .and_then(PeHashAlg::from_name)
+            && !out.contains(&alg)
+        {
+            out.push(alg);
+        }
+        for nested in sig
+            .get("nested")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+        {
+            claimed(nested, out);
+        }
+    }
+    let mut algs = vec![PeHashAlg::Sha256];
+    for sig in values
+        .get_key(value_key!("pe.signatures"))
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+    {
+        claimed(sig, &mut algs);
+    }
+    algs
 }
 
 /// Locate the holes in the header (checksum field, cert-table entry)
@@ -197,7 +272,7 @@ fn derive_regions(pe: &PE<'_>, bytes: &[u8]) -> Option<Regions> {
             return None;
         }
         ranges.push(start..end);
-        sum_hashed = sum_hashed.saturating_add(s.size_of_raw_data as u64);
+        sum_hashed = sum_hashed.saturating_add(u64::from(s.size_of_raw_data));
     }
 
     // Trailing overlay between `sum_hashed` and the cert table at
@@ -213,8 +288,8 @@ fn derive_regions(pe: &PE<'_>, bytes: &[u8]) -> Option<Regions> {
     let file_size = bytes.len() as u64;
     let mut overlay_padding = 0_u64;
     if file_size > sum_hashed.saturating_add(cert_table_size) {
-        let extra_start = sum_hashed as usize;
-        let extra_end = (file_size - cert_table_size) as usize;
+        let extra_start = crate::bytes::sat_usize(sum_hashed);
+        let extra_end = crate::bytes::sat_usize(file_size - cert_table_size);
         if extra_start < extra_end && extra_end <= bytes.len() {
             ranges.push(extra_start..extra_end);
             overlay_padding = (extra_end - extra_start) as u64;
@@ -234,7 +309,6 @@ const CERT_TABLE_SLOT_BYTES: usize = 4 * 8;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output::{Errors, Strings};
 
     fn fixture(name: &str) -> Vec<u8> {
         let path = format!("tests/fixtures/{name}");
@@ -242,66 +316,99 @@ mod tests {
     }
 
     fn extract_values(bytes: &[u8]) -> (Values, Metrics) {
-        let mut v = Values::new();
-        let mut s = Strings::default();
-        let mut m = Metrics::new();
-        let mut sections = Vec::new();
-        let mut symbols = crate::Symbols::new();
-        let mut errors = Errors::new();
-        crate::formats::pe::extract(
-            bytes,
-            &mut v,
-            &mut s,
-            &mut m,
-            &mut sections,
-            &mut symbols,
-            &mut errors,
-            &crate::rizin::Settings::default(),
-        )
-        .unwrap();
+        let mut out = crate::formats::Sinks::default();
+        crate::formats::pe::extract(bytes, out.ctx()).unwrap();
+        let crate::formats::Sinks {
+            values: v,
+            metrics: m,
+            ..
+        } = out;
         (v, m)
     }
 
-    /// All four hashes should land for a parseable PE — the fixture
-    /// is a 64-bit MSVC build that uses the canonical PE layout.
+    /// SHA-256 always lands for a parseable PE — the fixture is an unsigned
+    /// 64-bit MSVC build that uses the canonical PE layout — and the other
+    /// algorithms only when a signature commits to them.
     #[test]
     fn image_hashes_emitted_for_well_formed_pe() {
         let bytes = fixture("test.exe");
         let (v, _) = extract_values(&bytes);
-        for alg in ["sha1", "sha256", "sha384", "sha512"] {
-            let key = format!("pe.image_hash.{alg}");
-            let h = v
-                .get(&key)
-                .and_then(|x| x.as_str())
-                .unwrap_or_else(|| panic!("{key} missing"));
-            assert_eq!(
-                h.len(),
-                hex_len(alg),
-                "{key} wrong length: got {} expected {}",
-                h.len(),
-                hex_len(alg),
-            );
+        let h = v
+            .get("pe.image_hash.sha256")
+            .and_then(|x| x.as_str())
+            .expect("pe.image_hash.sha256 missing");
+        assert_eq!(h.len(), hex_len("sha256"));
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()), "not hex: {h}");
+        for alg in ["sha1", "sha384", "sha512"] {
             assert!(
-                h.chars().all(|c| c.is_ascii_hexdigit()),
-                "{key} not lowercase hex: {h}",
+                v.get(&format!("pe.image_hash.{alg}")).is_none(),
+                "{alg} computed for an unsigned image"
             );
         }
     }
 
-    /// Pin the SHA-1 and SHA-256 image hashes of `test.exe` to their
-    /// known values. Any unintended change in the region walker — the
-    /// number of bytes hashed, the order, the holes punched in the
-    /// header — will produce a different digest and trip this test.
-    /// Regenerate by running `cargo run --bin filefacts -- tests/fixtures/test.exe`
-    /// if the fixture itself is ever replaced.
+    /// Every algorithm a signature names, nested ones included, is computed
+    /// alongside SHA-256 in the same walk.
     #[test]
-    fn image_hashes_test_exe_pinned_values() {
+    fn claimed_algorithms_are_hashed() {
         let bytes = fixture("test.exe");
-        let (v, _) = extract_values(&bytes);
+        let pe = goblin::pe::PE::parse(&bytes).expect("parse");
+        let mut v = Values::new();
+        v.insert(
+            "pe.signatures",
+            serde_json::json!([{
+                "signature_digest_algorithm": "sha1",
+                "nested": [{"signature_digest_algorithm": "sha512"}],
+            }]),
+        );
+        let mut m = Metrics::new();
+        super::extract(&pe, &bytes, &mut v, &mut m);
+        for alg in ["sha1", "sha256", "sha512"] {
+            let h = v
+                .get(&format!("pe.image_hash.{alg}"))
+                .and_then(|x| x.as_str())
+                .unwrap_or_else(|| panic!("{alg} missing"));
+            assert_eq!(h.len(), hex_len(alg));
+        }
+        assert!(v.get("pe.image_hash.sha384").is_none());
+        // The SHA-1 digest is the one the region walker has always produced.
         assert_eq!(
             v.get("pe.image_hash.sha1").and_then(|x| x.as_str()),
             Some("444ac776b5ecd5c48d9c6254f10b5f6d5aae5567"),
         );
+    }
+
+    /// Section headers whose raw ranges all cover the same bytes would make
+    /// the hash walk the file once per section. Past the cap no digest is
+    /// emitted and the skip is recorded.
+    #[test]
+    fn overlapping_sections_past_the_cap_are_not_hashed() {
+        let bytes = fixture("test.exe");
+        let pe = goblin::pe::PE::parse(&bytes).expect("parse");
+        let mut regions = derive_regions(&pe, &bytes).expect("regions");
+        // What `derive_regions` yields for a table of sections whose raw
+        // ranges all cover the whole file.
+        regions
+            .ranges
+            .extend(std::iter::repeat_n(0..bytes.len(), 8));
+        assert!(regions.hashed_len() > bytes.len() as u64 * MAX_HASHED_FILE_MULTIPLE);
+        let mut v = Values::new();
+        let mut m = Metrics::new();
+        emit(&regions, &bytes, &mut v, &mut m);
+        assert!(v.get("pe.image_hash.sha256").is_none());
+        assert_eq!(m.get("pe.image_hash_skipped"), Some(1.0));
+    }
+
+    /// Pin the SHA-256 image hash of `test.exe` to its known value. Any
+    /// unintended change in the region walker — the number of bytes
+    /// hashed, the order, the holes punched in the header — will produce
+    /// a different digest and trip this test. Regenerate by running
+    /// `cargo run --bin filefacts -- tests/fixtures/test.exe` if the
+    /// fixture itself is ever replaced.
+    #[test]
+    fn image_hashes_test_exe_pinned_values() {
+        let bytes = fixture("test.exe");
+        let (v, _) = extract_values(&bytes);
         assert_eq!(
             v.get("pe.image_hash.sha256").and_then(|x| x.as_str()),
             Some("218103c5f4caf14299d61dab1cced6f6d6b6cd47ee6cfba204856fb1ea205120"),

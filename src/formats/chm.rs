@@ -33,8 +33,7 @@ use crate::value_key;
 use serde_json::{Value as JsonValue, json};
 
 use crate::bytes::{self, Reader};
-use crate::error::Error;
-use crate::formats::common::{XorScan, extract_binary_strings};
+use crate::formats::common::{XorScan, ends_with_ci, extract_binary_strings};
 use crate::output::{Metrics, Strings, Values};
 
 const MAX_ENTRIES_SURFACED: usize = 256;
@@ -45,28 +44,28 @@ pub(super) fn extract(
     strings: &mut Strings,
     metrics: &mut Metrics,
     image_end: &mut Option<u64>,
-) -> Result<(), Error> {
+) {
     extract_binary_strings(bytes, strings, XorScan::No);
 
     let Some(header) = bytes
         .first_chunk::<0x60>()
         .filter(|h| h.starts_with(b"ITSF"))
     else {
-        return Ok(());
+        return;
     };
     // Every field is read out of the 0x60-byte version-3 `header`, so none
     // of the reads can come up short and the `unwrap_or(0)` defaults never
     // apply.
     let version = bytes::u32_le(header, 0x04).unwrap_or(0);
     if version != 3 {
-        return Ok(());
+        return;
     }
     let timestamp_counter = bytes::u32_le(header, 0x10).unwrap_or(0);
     let lcid = bytes::u32_le(header, 0x14).unwrap_or(0);
 
-    let section1_offset = bytes::u64_le(header, 0x48).unwrap_or(0) as usize;
-    let section1_length = bytes::u64_le(header, 0x50).unwrap_or(0) as usize;
-    let data_offset = bytes::u64_le(header, 0x58).unwrap_or(0) as usize;
+    let section1_offset = bytes::sat_usize(bytes::u64_le(header, 0x48).unwrap_or(0));
+    let section1_length = bytes::sat_usize(bytes::u64_le(header, 0x50).unwrap_or(0));
+    let data_offset = bytes::sat_usize(bytes::u64_le(header, 0x58).unwrap_or(0));
 
     let mut itsf = serde_json::Map::new();
     itsf.insert("version".into(), json!(version));
@@ -78,11 +77,11 @@ pub(super) fn extract(
 
     let Some(dir) = bytes.get(section1_offset..section1_offset.saturating_add(section1_length))
     else {
-        return Ok(());
+        return;
     };
     let entries = parse_directory(dir);
     if entries.is_empty() {
-        return Ok(());
+        return;
     }
 
     // The archive consists of the ITSF directory and the physical data
@@ -92,7 +91,7 @@ pub(super) fn extract(
     // the end of the file. Ignore invalid entry extents rather than letting
     // malformed offsets hide an appended payload.
     let Some(directory_end) = section1_offset.checked_add(section1_length) else {
-        return Ok(());
+        return;
     };
     let mut logical_end = directory_end as u64;
     for entry in entries.iter().filter(|entry| entry.section == 0) {
@@ -146,25 +145,20 @@ pub(super) fn extract(
         if e.length > user_max {
             user_max = e.length;
         }
-        let lower = e.name.to_ascii_lowercase();
-        if lower.ends_with(".html") || lower.ends_with(".htm") {
+        let has_ext = |exts: &[&str]| exts.iter().any(|ext| ends_with_ci(&e.name, ext));
+        if has_ext(&[".html", ".htm"]) {
             html_count += 1;
         }
-        if lower.ends_with(".js") || lower.ends_with(".vbs") || lower.ends_with(".wsf") {
+        if has_ext(&[".js", ".vbs", ".wsf"]) {
             script_count += 1;
         }
-        if lower.ends_with(".png")
-            || lower.ends_with(".jpg")
-            || lower.ends_with(".jpeg")
-            || lower.ends_with(".gif")
-            || lower.ends_with(".bmp")
-        {
+        if has_ext(&[".png", ".jpg", ".jpeg", ".gif", ".bmp"]) {
             image_count += 1;
         }
-        if lower.ends_with(".hhc") {
+        if has_ext(&[".hhc"]) {
             push_unique(&mut features, "toc");
         }
-        if lower.ends_with(".hhk") {
+        if has_ext(&[".hhk"]) {
             push_unique(&mut features, "index");
         }
         user_names_lower.push(stripped.to_ascii_lowercase());
@@ -265,8 +259,6 @@ pub(super) fn extract(
     // in the Uncompressed section. No LZX decoder needed for the
     // framing kv; the actual help-topic decompression would.
     emit_lzx_framing(bytes, data_offset, &entries, values, metrics);
-
-    Ok(())
 }
 
 /// Surface `chm.lzx.{window_bytes, reset_interval_bytes, block_len,
@@ -325,7 +317,7 @@ fn emit_lzx_framing(
     lzx.insert("compressed_size".into(), json!(content.length));
     values.insert_key(value_key!("chm.lzx"), JsonValue::Object(lzx));
 
-    metrics.insert(metric!("chm.lzx_reset_count"), rt.reset_count as f64);
+    metrics.insert(metric!("chm.lzx_reset_count"), f64::from(rt.reset_count));
     // Compression ratio is a classic forensic signal — values
     // significantly off from typical (~3-5×) suggest a hand-rolled
     // or tampered build.
@@ -505,7 +497,7 @@ fn parse_namelist(data: &[u8]) -> Vec<String> {
         if names.skip(2).is_none() {
             break;
         }
-        out.push(utf16le_to_string(raw));
+        out.push(bytes::utf16_lossy(raw, bytes::Endian::Little));
     }
     out
 }
@@ -608,16 +600,6 @@ fn push_unique(features: &mut Vec<&'static str>, name: &'static str) {
     }
 }
 
-fn utf16le_to_string(b: &[u8]) -> String {
-    let units: Vec<u16> = b
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u16::from_le_bytes(*pair))
-        .collect();
-    String::from_utf16_lossy(&units)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,7 +609,7 @@ mod tests {
         let mut s = Strings::default();
         let mut m = Metrics::new();
         let mut image_end = None;
-        extract(bytes, &mut v, &mut s, &mut m, &mut image_end).unwrap();
+        extract(bytes, &mut v, &mut s, &mut m, &mut image_end);
         (v, m)
     }
 

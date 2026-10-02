@@ -222,7 +222,7 @@ fn probe_members(members: &[(String, Vec<u8>)], values: &mut Values) {
     for (path, content) in members {
         let text = String::from_utf8_lossy(content);
         let base = path.rsplit('/').next().unwrap_or(path);
-        if !wp_done && (base.ends_with(".php") || base == "style.css") {
+        if !wp_done && (super::common::ends_with_ci(base, ".php") || base == "style.css") {
             wp_done = wordpress_header(&text, values);
             // The archive's top-level directory is the WordPress.org
             // distribution slug (`apex-notification-bar-lite/`) — the
@@ -311,7 +311,7 @@ fn identity_candidate(path: &str) -> bool {
         return false;
     }
     let base = path.rsplit('/').next().unwrap_or(path);
-    base.ends_with(".php")
+    super::common::ends_with_ci(base, ".php")
         || base == "style.css"
         || base == "configure.ac"
         || base == "configure.in"

@@ -6,6 +6,7 @@
 //! the `.rdata` section for PE, the full file for opaque blobs).
 
 pub(crate) mod ascii;
+pub(crate) mod classify;
 pub(crate) mod entropy;
 
 /// Convert a ZIP `DateTime` (interpreted as UTC) to Unix seconds.
@@ -35,7 +36,7 @@ pub(crate) fn days_from_civil(y: i32, m: u32, d: u32) -> Option<i64> {
     }
     let y_adj = if m <= 2 { y - 1 } else { y };
     let era = y_adj.div_euclid(400);
-    let yoe = (y_adj - era * 400) as u32;
+    let yoe = y_adj.rem_euclid(400).cast_unsigned();
     let mp = if m > 2 { m - 3 } else { m + 9 };
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;

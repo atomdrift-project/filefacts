@@ -28,7 +28,7 @@ fn run_with_errors(bytes: &[u8]) -> (Values, Metrics, Errors) {
     let mut m = Metrics::new();
     let mut e = Errors::new();
     if let Ok(mut zip) = crate::formats::zip::open_archive(bytes) {
-        extract_from_archive(&mut zip, &mut v, &mut m, &mut e).unwrap();
+        extract_from_archive(&mut zip, &mut v, &mut m, &mut e);
     }
     (v, m, e)
 }
@@ -47,7 +47,7 @@ fn metadata_that_is_not_utf8_records_one_error() {
     let err = &e.as_slice()[0];
     assert_eq!(
         (err.stage, err.kind),
-        (Stage::FormatExtract, crate::ErrorKind::Malformed)
+        (Stage::FormatExtract, crate::DiagnosticKind::Malformed)
     );
     assert!(
         err.message

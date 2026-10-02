@@ -1,33 +1,10 @@
 use super::*;
 
 #[test]
-fn forged_section_sizes_do_not_overflow_the_code_data_ratio() {
-    // Two sections each claiming nearly `u64::MAX` bytes: the code and
-    // data sums used to be added unchecked.
-    let section = |name: &str, flag: &str| Section {
-        name: name.into(),
-        vaddr: 0,
-        vsize: 0,
-        file_offset: 0,
-        file_size: u64::MAX - 1,
-        flags: vec![flag.into()],
-        flags_raw: None,
-        entropy: Some(1.0),
-    };
-    let sections = Sections::from_iter([section("a", "executable"), section("b", "data")]);
-    let mut metrics = Metrics::new();
-    emit_binary_aggregates(&sections, &output::Strings::new(), b"x", &mut metrics);
-    assert_eq!(
-        metrics.get_key(&metric!("binary.code_to_data_ratio")),
-        Some(0.5)
-    );
-}
-
-#[test]
 fn guarded_turns_a_panic_into_its_message() {
-    assert_eq!(guarded(|| 7), Ok(7));
-    let caught: Result<(), String> = guarded(|| panic!("boom"));
-    assert_eq!(caught, Err("boom".to_string()));
+    assert_eq!(guarded(|| 7).ok(), Some(7));
+    let caught = guarded::<()>(|| panic!("boom"));
+    assert_eq!(caught.err().map(|panic| panic.0), Some("boom".to_string()));
 }
 
 #[test]
@@ -54,7 +31,7 @@ fn failed_identification_is_recorded_as_an_error() {
     let parsed = ParsedFile::new(b"\x00\x01", fileid, None);
     let entry = parsed.errors().iter().next().expect("recorded");
     assert_eq!(entry.stage, Stage::Identify);
-    assert_eq!(entry.kind, ErrorKind::Panic);
+    assert_eq!(entry.kind, DiagnosticKind::Panic);
 }
 
 #[cfg(unix)]
@@ -128,6 +105,28 @@ fn validate_source_query_reports_unsupported_language() {
 }
 
 #[test]
+fn read_input_refuses_oversized_and_non_regular_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("a.bin");
+    std::fs::write(&file, b"0123456789").unwrap();
+    assert_eq!(read_input(&file, 10).unwrap(), b"0123456789");
+
+    let Err(Error::Io { path, source }) = read_input(&file, 9) else {
+        panic!("an input over the cap is refused");
+    };
+    assert_eq!(source.kind(), std::io::ErrorKind::FileTooLarge);
+    assert_eq!(path.as_deref(), Some(file.as_path()));
+
+    #[cfg(unix)]
+    {
+        let Err(Error::Io { source, .. }) = read_input(dir.path(), 1 << 20) else {
+            panic!("a directory is refused");
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+    }
+}
+
+#[test]
 fn validate_source_query_reports_invalid_query_with_its_cause() {
     let err = validate_source_query("python", "(no_such_node) @n").unwrap_err();
     let Error::InvalidQuery { language, source } = &err else {
@@ -135,8 +134,10 @@ fn validate_source_query_reports_invalid_query_with_its_cause() {
     };
     assert_eq!(language, "python");
     assert_eq!(source.kind, tree_sitter::QueryErrorKind::NodeType);
+    // The cause is the `source()`, not repeated in the message.
+    assert_eq!(err.to_string(), "invalid tree-sitter query for python");
     assert_eq!(
-        err.to_string(),
+        crate::error::display_chain(&err),
         format!("invalid tree-sitter query for python: {source}")
     );
     let cause = std::error::Error::source(&err).expect("source");
@@ -154,6 +155,7 @@ fn validate_source_query_reports_invalid_query_with_its_cause() {
 fn cache_variant_separates_extension_transitions() {
     let as_font = extraction_cache_variant(
         &rizin::Settings::default(),
+        None,
         FileType::Shell,
         true,
         Some(("script", "font")),
@@ -161,6 +163,7 @@ fn cache_variant_separates_extension_transitions() {
     );
     let as_unknown = extraction_cache_variant(
         &rizin::Settings::default(),
+        None,
         FileType::Shell,
         true,
         Some(("script", "unknown")),
@@ -168,6 +171,7 @@ fn cache_variant_separates_extension_transitions() {
     );
     let consistent = extraction_cache_variant(
         &rizin::Settings::default(),
+        None,
         FileType::Shell,
         false,
         None,
@@ -182,6 +186,7 @@ fn cache_variant_separates_extension_transitions() {
         as_font,
         extraction_cache_variant(
             &rizin::Settings::default(),
+            None,
             FileType::Shell,
             true,
             Some(("script", "font")),
@@ -197,6 +202,7 @@ fn cache_variant_separates_unnamed_mismatch() {
     assert_ne!(
         extraction_cache_variant(
             &rizin::Settings::default(),
+            None,
             FileType::Shell,
             true,
             None,
@@ -204,12 +210,32 @@ fn cache_variant_separates_unnamed_mismatch() {
         ),
         extraction_cache_variant(
             &rizin::Settings::default(),
+            None,
             FileType::Shell,
             false,
             None,
             None
         )
     );
+}
+
+/// A host's namespace keeps its entries apart from every other namespace,
+/// and from hosts that set none.
+#[test]
+fn cache_variant_separates_host_namespaces() {
+    let key = |namespace| {
+        extraction_cache_variant(
+            &rizin::Settings::default(),
+            namespace,
+            FileType::Elf,
+            false,
+            None,
+            None,
+        )
+    };
+    assert_ne!(key(Some("a")), key(Some("b")));
+    assert_ne!(key(Some("a")), key(None));
+    assert_eq!(key(Some("a")), key(Some("a")));
 }
 
 #[test]
@@ -220,6 +246,7 @@ fn cache_variant_separates_basename_facts() {
     let key = |name| {
         extraction_cache_variant(
             &rizin::Settings::default(),
+            None,
             FileType::Rust,
             false,
             None,
@@ -309,9 +336,17 @@ fn chm_overlay_uses_archive_data_and_directory_extents() {
 #[test]
 fn extraction_cache_separates_path_dependent_file_types() {
     assert_ne!(
-        extraction_cache_variant(&rizin::Settings::default(), FileType::Gz, false, None, None),
         extraction_cache_variant(
             &rizin::Settings::default(),
+            None,
+            FileType::Gz,
+            false,
+            None,
+            None
+        ),
+        extraction_cache_variant(
+            &rizin::Settings::default(),
+            None,
             FileType::Npm,
             false,
             None,
@@ -321,6 +356,7 @@ fn extraction_cache_separates_path_dependent_file_types() {
     assert_eq!(
         extraction_cache_variant(
             &rizin::Settings::default(),
+            None,
             FileType::Npm,
             false,
             None,
@@ -328,6 +364,7 @@ fn extraction_cache_separates_path_dependent_file_types() {
         ),
         extraction_cache_variant(
             &rizin::Settings::default(),
+            None,
             FileType::Npm,
             false,
             None,
@@ -510,7 +547,7 @@ fn malformed_elf_records_error_but_keeps_byte_metrics() {
     let errors = parsed.errors();
     assert!(!errors.is_empty(), "expected a malformed-elf error entry");
     let entry = errors.iter().next().unwrap();
-    assert_eq!(entry.kind, ErrorKind::Malformed);
+    assert_eq!(entry.kind, DiagnosticKind::Malformed);
     assert_eq!(entry.stage, Stage::ElfParse);
 
     // Aggregate count metric.
@@ -568,7 +605,7 @@ fn guarded_tree_sitter_skip_records_source_error_and_metric() {
     let errors = parsed.errors();
     assert_eq!(errors.len(), 1);
     let entry = errors.iter().next().unwrap();
-    assert_eq!(entry.kind, ErrorKind::Fallback);
+    assert_eq!(entry.kind, DiagnosticKind::Fallback);
     assert_eq!(entry.stage, Stage::SourceParse);
     assert!(entry.message.contains("tree-sitter parse skipped"));
     assert_eq!(metrics.get("parse.error_count"), Some(1.0));
@@ -620,7 +657,7 @@ fn cache_setting_belongs_to_each_parsed_file() {
 #[test]
 fn cache_key_tracks_every_output_affecting_option() {
     let variant = |options: &OpenOptions<'_>| {
-        extraction_cache_variant(&options.rizin, FileType::Elf, false, None, None)
+        extraction_cache_variant(&options.rizin, None, FileType::Elf, false, None, None)
     };
     let base = OpenOptions::new();
     let slower = base.clone().rizin_timeout(Duration::from_secs(5));

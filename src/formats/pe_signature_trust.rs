@@ -162,8 +162,18 @@ fn digest_matches(obj: &Map<String, JsonValue>, values: &Values) -> Option<bool>
 
 /// Was the signing timestamp inside the certificate's validity window?
 /// `None` when the signature carries no signing time — plenty do not, and
-/// their absence is not evidence either way.
+/// their absence is not evidence either way — and when the time came from a
+/// timestamp that did not verify (`signing_time_source` `unverified_*`):
+/// such a time is whatever the file says, so judging the window by it would
+/// let the file choose the answer.
 fn signed_within_validity(obj: &Map<String, JsonValue>) -> Option<bool> {
+    if obj
+        .get("signing_time_source")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|source| source.starts_with("unverified_"))
+    {
+        return None;
+    }
     let signed = obj.get("signing_time_unix")?.as_i64()?;
     let not_before = obj.get("not_before_unix")?.as_i64()?;
     let not_after = obj.get("not_after_unix")?.as_i64()?;
@@ -315,6 +325,27 @@ mod tests {
             v.get("pe.signature_integrity").unwrap().as_str(),
             Some(INTACT)
         );
+    }
+
+    /// A timestamp whose signature or imprint did not verify supplies a time
+    /// the file chose; it must not decide whether the signature was made
+    /// inside the certificate's window.
+    #[test]
+    fn unverified_timestamp_does_not_judge_the_validity_window() {
+        let mut v = values_with(
+            json!({"sha256": HASH}),
+            json!([{
+                "verified": true,
+                "signature_digest_algorithm": "sha256",
+                "signature_digest": HASH,
+                "signing_time_unix": 1_300_000_000,
+                "signing_time_source": "unverified_rfc3161",
+                "not_before_unix": 1_400_000_000,
+                "not_after_unix": 1_600_000_000,
+            }]),
+        );
+        run(&mut v);
+        assert!(v.get("pe.signatures[0].signed_within_validity").is_none());
     }
 
     /// Dual-signed images are routine; the summary takes the worst state.

@@ -131,14 +131,14 @@ enum ControlError {
 /// Decompress `control.tar*` (by suffix) and return the `control` member's
 /// bytes, `Ok(None)` when the archive holds no `control` file.
 fn read_control_file(name: &str, member: &[u8]) -> Result<Option<Vec<u8>>, ControlError> {
-    let reader: Box<dyn Read> = if name.ends_with(".gz") {
+    let reader: Box<dyn Read> = if super::common::ends_with_ci(name, ".gz") {
         Box::new(flate2::read::GzDecoder::new(member))
-    } else if name.ends_with(".zst") {
+    } else if super::common::ends_with_ci(name, ".zst") {
         Box::new(
             zstd::stream::read::Decoder::new(member)
                 .map_err(|e| ControlError::Malformed(e.to_string()))?,
         )
-    } else if name.ends_with(".tar") {
+    } else if super::common::ends_with_ci(name, ".tar") {
         Box::new(Cursor::new(member))
     } else {
         // .xz / unknown compression: no decompressor available.
@@ -304,7 +304,7 @@ mod tests {
     }
 
     /// The one recorded error's stage and kind.
-    fn only_error(errors: &Errors) -> (Stage, crate::ErrorKind) {
+    fn only_error(errors: &Errors) -> (Stage, crate::DiagnosticKind) {
         assert_eq!(errors.len(), 1, "{errors:?}");
         (errors.as_slice()[0].stage, errors.as_slice()[0].kind)
     }
@@ -387,7 +387,7 @@ Description: A demo package\n\
         let (v, _, e) = run(&deb_with_control_member("control.tar.gz", &gz));
         assert_eq!(
             only_error(&e),
-            (Stage::TarParse, crate::ErrorKind::Malformed)
+            (Stage::TarParse, crate::DiagnosticKind::Malformed)
         );
         assert!(e.as_slice()[0].message.starts_with("control.tar.gz:"));
         assert!(v.get("deb.name").is_none());
@@ -402,7 +402,7 @@ Description: A demo package\n\
         ));
         assert_eq!(
             only_error(&e),
-            (Stage::TarParse, crate::ErrorKind::Malformed)
+            (Stage::TarParse, crate::DiagnosticKind::Malformed)
         );
         assert!(v.get("deb.limits").is_none());
     }
@@ -468,7 +468,7 @@ Description: A demo package\n\
         let (v, _, e) = run(&deb[..cut]);
         assert_eq!(
             only_error(&e),
-            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+            (Stage::FormatExtract, crate::DiagnosticKind::Malformed)
         );
         assert!(e.as_slice()[0].message.contains("past the end of the file"));
         assert!(v.get("deb.name").is_none());

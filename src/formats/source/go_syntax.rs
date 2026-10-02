@@ -101,7 +101,7 @@ pub(super) fn execution_facts(root: Node<'_>, source: &str, values: &mut Values)
                 }
             }
             "var_declaration" => {
-                let mut stack = named_children(node);
+                let mut stack: Vec<_> = named_children(node).collect();
                 while let Some(n) = stack.pop() {
                     if n.kind() == "var_spec" && n.child_by_field_name("value").is_some() {
                         globals += 1;

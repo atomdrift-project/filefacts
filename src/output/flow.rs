@@ -69,11 +69,12 @@ impl std::fmt::Display for FlowKind {
 
 /// One value in a file-local graph. IDs are indexes, local to this graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct FlowValue {
     /// What this value is; see [`FlowKind`].
     pub kind: FlowKind,
     /// File byte offset, never a trait ID or virtual address.
-    pub offset: usize,
+    pub offset: u64,
     /// Original argument shape/value, using the existing symbol vocabulary.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub literal: Option<Arg>,
@@ -92,6 +93,7 @@ pub struct FlowValue {
 
 /// A local helper's parameter and return relationships.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct FlowFunction {
     /// Parameter value IDs in declaration order.
     pub parameters: Vec<usize>,
@@ -101,6 +103,7 @@ pub struct FlowFunction {
 
 /// Versioned value relationships, independent of the producing file format.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Flow {
     /// Schema version, independent of local trait names.
     pub version: u32,
@@ -119,6 +122,7 @@ pub struct Flow {
 /// A declarative library model: which inputs may contribute to a return value.
 /// The caller compiles selectors once, outside the per-value walk.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct FlowTransfer {
     /// Canonical target selected by the caller. No regex engine or rule schema
     /// is required by the traversal itself.
@@ -129,8 +133,22 @@ pub struct FlowTransfer {
     pub receiver: bool,
 }
 
+impl FlowTransfer {
+    /// A model for `call`: the argument positions and whether the receiver
+    /// contribute to its return value.
+    #[must_use]
+    pub fn new(call: impl Into<String>, arguments: Vec<usize>, receiver: bool) -> Self {
+        Self {
+            call: call.into(),
+            arguments,
+            receiver,
+        }
+    }
+}
+
 /// A value observation in a particular local-helper invocation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub struct FlowOrigin {
     /// Index into the graph's values.
     pub value: usize,
@@ -140,6 +158,7 @@ pub struct FlowOrigin {
 
 /// Origin observations and whether traversal exhausted its budget.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct FlowOrigins {
     /// Values encountered, including intermediate calls and caller context.
     pub values: BTreeSet<FlowOrigin>,

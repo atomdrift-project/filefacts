@@ -22,7 +22,7 @@ pub(super) fn emit(imports: &[&str], language: Lang, metrics: &mut Metrics) {
     // `imports.count` is emitted by `lib.rs::extract_all` once
     // (cross-format). We compute the local total here only for
     // the ratio metrics below.
-    let total = imports.len() as u32;
+    let total = crate::bytes::sat_u32(imports.len());
 
     let mut unique_modules: HashSet<&str> = HashSet::new();
     let mut stdlib_count = 0u32;

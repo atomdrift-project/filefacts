@@ -1,6 +1,7 @@
-//! Single-pass tree-sitter walker that emits unified [`Symbol`] facts.
+//! Tree-sitter symbol collection that emits unified [`Symbol`] facts.
 //!
-//! Walks the entire tree once and pushes, in source order:
+//! [`State`] collects during the shared walk ([`super::visit`]); [`finish`]
+//! then pushes, in source order:
 //!
 //! - one [`Symbol::Call`] per call site,
 //! - one [`Symbol::Bind`] per static assignment,
@@ -29,35 +30,55 @@
 use crate::metric;
 use std::collections::{BTreeMap, HashSet};
 
-use tree_sitter::Node;
+use tree_sitter::{Node, TreeCursor};
 
 use crate::output::{Arg, ArgShape, Metrics, Symbol, Symbols};
 
 use super::decode_string_literal;
 use super::langs::{Lang, LangConfig};
+use super::visit::{self, NodeIds, Visit};
 
 /// Hard cap on AST recursion depth.
 ///
 /// tree-sitter trees can be arbitrarily deep on generated or adversarial
-/// source (thousands of nested brackets, binary expressions, etc.).
-/// `walk_node` recurses one stack frame per level, so an unbounded walk
-/// overflows the worker thread's stack and aborts the whole process. We
-/// stop descending here instead. Real source is rarely more than a few
-/// dozen levels deep; anything past this is machine-generated and yields no
-/// useful symbols. `ast.max_depth` saturates at this value, which is itself
+/// source (thousands of nested brackets, binary expressions, etc.). The
+/// symbol walk once recursed one stack frame per level, and the chain helpers
+/// below still recurse per link, so an unbounded walk would overflow the
+/// worker thread's stack and abort the whole process. The walk passes no
+/// node below this depth to [`State::visit`]. Real source is rarely more
+/// than a few dozen levels deep; anything past this is machine-generated and
+/// yields no useful symbols. `ast.max_depth` saturates at this value, which is itself
 /// a usable "pathologically nested" signal.
 pub(super) const MAX_AST_DEPTH: u32 = 1000;
 
+/// Walk `root` for this module alone and emit its symbols and metrics. The
+/// extraction walk in `super::extract` normally collects the [`State`] along
+/// with everything else; this is the path when it did not.
 pub(super) fn walk(
     root: Node<'_>,
     source: &str,
+    config: &'static LangConfig,
+    symbols_out: &mut Symbols,
+    metrics: &mut Metrics,
+) {
+    let mut collectors = visit::Collectors {
+        ast: Some(State::default()),
+        ..visit::Collectors::default()
+    };
+    visit::walk(root, source, config, &mut collectors);
+    if let Some(state) = collectors.ast {
+        finish(state, config, symbols_out, metrics);
+    }
+}
+
+/// Emit what a walk collected into `state`: its symbols, then the `ast.*`
+/// metrics.
+pub(super) fn finish(
+    state: State,
     config: &LangConfig,
     symbols_out: &mut Symbols,
     metrics: &mut Metrics,
 ) {
-    let mut state = State::default();
-    state.walk_node(root, source, config, 0, "");
-
     // Drain the per-symbol-kind buffers into the unified Symbols view.
     let call_count = state.calls.len() as u64;
     let member_count = state.members.len() as u64;
@@ -300,18 +321,28 @@ fn subtree_has_mod(node: Node<'_>, source: &str, depth: u32) -> bool {
 /// Named nodes only: Python's `lambda` keyword token shares its kind name
 /// with the expression it starts.
 fn is_function_definition(node: Node<'_>) -> bool {
-    node.is_named()
-        && matches!(
-            node.kind(),
-            "function_declaration"
-                | "function_expression"
-                | "arrow_function"
-                | "function_definition"
-                | "lambda"
-                | "method_definition"
-                | "function_item"
-        )
+    node.is_named() && FUNCTION_DEFINITION_KINDS.contains(&node.kind())
 }
+
+/// The kinds [`is_function_definition`] accepts, when named.
+pub(super) const FUNCTION_DEFINITION_KINDS: &[&str] = &[
+    "function_declaration",
+    "function_expression",
+    "arrow_function",
+    "function_definition",
+    "lambda",
+    "method_definition",
+    "function_item",
+];
+
+/// The only kinds [`is_infinite_loop`] can accept.
+pub(super) const INFINITE_LOOP_KINDS: &[&str] = &[
+    "for_statement",
+    "while_statement",
+    "while",
+    "while_modifier",
+    "do_statement",
+];
 
 /// True when `node` is a function whose entire body is `return <ident>` and
 /// `<ident>` names one of the function's own parameters — the identity-proxy
@@ -519,8 +550,9 @@ fn is_infinite_loop(node: Node<'_>, source: &str) -> bool {
     matches!(t, "true" | "True" | "1" | "!![]" | "!0" | "1==1" | "1===1")
 }
 
+/// What one walk collects for [`finish`].
 #[derive(Default)]
-struct State {
+pub(super) struct State {
     calls: Vec<Symbol>,
     binds: Vec<Symbol>,
     members: BTreeMap<String, u64>,
@@ -587,14 +619,20 @@ struct State {
 }
 
 impl State {
-    fn walk_node(
+    /// Record `visit`'s node. The walk passes every node down to
+    /// [`MAX_AST_DEPTH`] in pre-order, left to right; a node at the cap only
+    /// counts, and nothing below it is passed.
+    pub(super) fn visit<'t>(
         &mut self,
-        node: Node<'_>,
+        visit: &Visit<'t>,
         source: &str,
         config: &LangConfig,
-        depth: u32,
-        parent_kind: &str,
+        ids: &NodeIds,
+        scratch: &mut TreeCursor<'t>,
     ) {
+        let node = visit.node;
+        let kind = visit.kind_id;
+        let depth = visit.depth;
         self.node_count += 1;
         if depth > self.max_depth {
             self.max_depth = depth;
@@ -612,21 +650,19 @@ impl State {
         // same path, so a JS sandbox-escape pattern like
         // `obj["constructor"]["constructor"]("...")` lands as a member chain
         // instead of dropping out as a dynamic access.
-        if (config.member_kinds.contains(&node.kind()) || is_subscript_kind(node.kind()))
-            && !self.resolved_links.remove(&node.id())
-        {
+        if ids.member_or_subscript.contains(kind) && !self.resolved_links.remove(&node.id()) {
             self.record_member_chain(node, source, config, depth);
         }
 
-        if config.call_kinds.contains(&node.kind()) {
-            self.record_call(node, source, config);
+        if ids.call.contains(kind) {
+            self.record_call(node, source, config, scratch);
         }
 
-        if is_assignment_kind(node.kind()) {
+        if ids.assignment.contains(kind) {
             self.record_assignment(node, source, config);
         }
 
-        if config.array_kinds.contains(&node.kind()) {
+        if ids.array.contains(kind) {
             let len = u32::try_from(node.named_child_count()).unwrap_or(u32::MAX);
             if len > self.max_array_literal_length {
                 self.max_array_literal_length = len;
@@ -637,10 +673,9 @@ impl State {
             // `ast.max_numeric_array` keeps that specificity that a plain
             // array-length metric would lose.
             if len >= 2 {
-                let mut cur = node.walk();
                 let all_numeric = node
-                    .named_children(&mut cur)
-                    .all(|c| config.number_kinds.contains(&c.kind()));
+                    .named_children(scratch)
+                    .all(|c| ids.number.contains(c.kind_id()));
                 if all_numeric && len > self.max_numeric_array_length {
                     self.max_numeric_array_length = len;
                 }
@@ -654,7 +689,7 @@ impl State {
         // identifier wrappers — we want `os` and `path`, not the
         // combined `os.path` node which member-chain extraction
         // handles separately.
-        if config.identifier_kinds.contains(&node.kind()) && node.named_child_count() == 0 {
+        if ids.identifier.contains(kind) && node.named_child_count() == 0 {
             if let Ok(text) = node.utf8_text(source.as_bytes()) {
                 if !text.is_empty() {
                     self.identifiers
@@ -670,7 +705,10 @@ impl State {
         // PowerShell `-bxor` → `xor`, …). Counted inline in this single walk
         // and emitted as `ast.op.<name>` metrics — language-agnostic, key-safe,
         // O(1) to match, no per-occurrence facts.
-        if let Some(op_node) = node.child_by_field_name("operator") {
+        let op_node = ids
+            .operator_field
+            .and_then(|field| node.child_by_field_id(field));
+        if let Some(op_node) = op_node {
             if let Ok(op) = op_node.utf8_text(source.as_bytes()) {
                 if let Some(name) = canonical_op(op) {
                     *self.op_counts.entry(name).or_insert(0) += 1;
@@ -686,10 +724,8 @@ impl State {
                 // `x === x`) — useless arithmetic / opaque predicate. Skip the
                 // NaN idiom `x !== x` (`ne` maps inequality ops to one name).
                 if !matches!(op, "!=" | "!==" | "<>") {
-                    if let (Some(l), Some(r)) = (
-                        node.child_by_field_name("left"),
-                        node.child_by_field_name("right"),
-                    ) {
+                    let field = |id: Option<u16>| id.and_then(|id| node.child_by_field_id(id));
+                    if let (Some(l), Some(r)) = (field(ids.left_field), field(ids.right_field)) {
                         if let (Ok(lt), Ok(rt)) = (
                             l.utf8_text(source.as_bytes()),
                             r.utf8_text(source.as_bytes()),
@@ -705,58 +741,58 @@ impl State {
 
         // Statement-level comma sequences (`a, b, c;`) — density signal for
         // comma-sequence obfuscation.
-        if node.kind() == "sequence_expression" {
+        if ids.sequence.contains(kind) {
             self.sequence_expr_count += 1;
             // All-numeric comma sequence (`(1, 2, 3, …)`) — comma-constant
             // obfuscation. Mirror the numeric-array shape: count the numeric
             // members when every member is a numeric literal.
-            let mut cur = node.walk();
-            let members: Vec<Node<'_>> = node.named_children(&mut cur).collect();
-            if members.len() >= 2
-                && members
-                    .iter()
-                    .all(|c| config.number_kinds.contains(&c.kind()))
-            {
-                let len = u32::try_from(members.len()).unwrap_or(u32::MAX);
+            let mut members = 0usize;
+            let mut all_numeric = true;
+            for member in node.named_children(scratch) {
+                members += 1;
+                all_numeric &= ids.number.contains(member.kind_id());
+            }
+            if members >= 2 && all_numeric {
+                let len = u32::try_from(members).unwrap_or(u32::MAX);
                 if len > self.max_numeric_sequence_length {
                     self.max_numeric_sequence_length = len;
                 }
             }
         }
 
-        // Tally every function-definition node so the const/string-return
-        // shapes can be reported as a fraction of all functions, not a raw
-        // count that simply grows with the file.
-        if is_function_definition(node) {
+        if visit.named && ids.function_definition.contains(kind) {
+            // Tally every function-definition node so the const/string-return
+            // shapes can be reported as a fraction of all functions, not a raw
+            // count that simply grows with the file.
             self.function_count += 1;
-        }
 
-        // Identity-proxy functions (`function(x){ return x }`): the return
-        // must reference the *same* identifier as a parameter — a
-        // backreference no regex can express, so check it here.
-        if is_identity_function(node, source) {
-            self.identity_fn_count += 1;
-        }
+            // Identity-proxy functions (`function(x){ return x }`): the return
+            // must reference the *same* identifier as a parameter — a
+            // backreference no regex can express, so check it here.
+            if is_identity_function(node, source) {
+                self.identity_fn_count += 1;
+            }
 
-        // String-return functions (`function(){ return "..." }`): a function
-        // whose entire body is a single `return <string-literal>`. Many of
-        // these in one file is the substitution-table obfuscation shape
-        // (decoder functions that just hand back a fixed string).
-        if is_string_return_function(node) {
-            self.string_return_fn_count += 1;
-        }
+            // String-return functions (`function(){ return "..." }`): a
+            // function whose entire body is a single `return <string-literal>`.
+            // Many of these in one file is the substitution-table obfuscation
+            // shape (decoder functions that just hand back a fixed string).
+            if is_string_return_function(node) {
+                self.string_return_fn_count += 1;
+            }
 
-        // Constant-return padding functions (`function(){ return 0 }` /
-        // `function(){ return "x" }` with no parameters): dead-code/opaque
-        // padding. Parameterless distinguishes it from an identity proxy.
-        if is_const_return_function(node) {
-            self.const_return_fn_count += 1;
+            // Constant-return padding functions (`function(){ return 0 }` /
+            // `function(){ return "x" }` with no parameters): dead-code/opaque
+            // padding. Parameterless distinguishes it from an identity proxy.
+            if is_const_return_function(node) {
+                self.const_return_fn_count += 1;
+            }
         }
 
         // Infinite loops with a literally-true condition (`while true`,
         // `while (1)`, `for (;;)`). Node-scoped so a bare `while true` in prose
         // or a comment never matches.
-        if is_infinite_loop(node, source) {
+        if ids.infinite_loop_candidate.contains(kind) && is_infinite_loop(node, source) {
             self.infinite_loop_count += 1;
         }
 
@@ -764,17 +800,17 @@ impl State {
         // left-leaning nested binary expressions in every grammar we
         // support. Measure the chain length once, at the *outermost* node
         // (the one whose parent isn't also a binary expression); the walk
-        // below still visits the inner links, which are not roots.
-        if is_string_concat_root(node, parent_kind, config) {
+        // still visits the inner links, which are not roots.
+        if ids.binary_op.contains(kind)
+            && op_node.is_some_and(|op| op.kind() == "+")
+            && !visit
+                .parent_kind_id
+                .is_some_and(|parent| ids.binary_op.contains(parent))
+        {
             let len = string_concat_chain_length(node, config);
             if len > self.max_string_concat_chain {
                 self.max_string_concat_chain = len;
             }
-        }
-
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            self.walk_node(child, source, config, depth + 1, node.kind());
         }
     }
 
@@ -818,7 +854,14 @@ impl State {
         }
     }
 
-    fn record_call(&mut self, node: Node<'_>, source: &str, config: &LangConfig) {
+    /// `scratch` iterates the arguments, so no cursor is allocated per call.
+    fn record_call<'t>(
+        &mut self,
+        node: Node<'t>,
+        source: &str,
+        config: &LangConfig,
+        scratch: &mut TreeCursor<'t>,
+    ) {
         let callee = config.callee(node).or_else(|| first_named_child(node));
         let args_node = config.argument_list(node);
 
@@ -837,24 +880,21 @@ impl State {
             // The first named child is the callee; the remaining named
             // children are the arguments in source order.
             let callee_start = callee.map(|c| c.start_byte());
-            let mut cursor = node.walk();
-            for arg in node.named_children(&mut cursor) {
+            for arg in node.named_children(scratch) {
                 if Some(arg.start_byte()) == callee_start {
                     continue;
                 }
                 args.push(build_arg(arg, source, config));
             }
         } else if config.arguments_field == "argument" {
-            let mut cursor = node.walk();
-            for arg in node.children_by_field_name(config.arguments_field, &mut cursor) {
+            for arg in node.children_by_field_name(config.arguments_field, scratch) {
                 args.push(build_arg(arg, source, config));
             }
         } else if let Some(args_root) = args_node {
             if config.is_single_argument(args_root) {
                 args.push(build_arg(args_root, source, config));
             } else {
-                let mut cursor = args_root.walk();
-                for arg in args_root.named_children(&mut cursor) {
+                for arg in args_root.named_children(scratch) {
                     if arg.kind() == "command_argument_sep" {
                         continue;
                     }
@@ -1059,7 +1099,7 @@ fn chain_into(
     // A member/subscript/call chain (`a.b.c…`, `obj["x"]["y"]…`, `f()()…`) is
     // a left-leaning tree as deep as it is long, and this function recurses
     // one frame per link. An adversarial chain thousands deep would overflow
-    // the stack before `walk_node`'s own guard ever returns. Bail at the
+    // the stack before the walk's own depth guard applies. Bail at the
     // shared cap and treat the chain as non-static (dynamic access) — the
     // conservative, no-symbol outcome.
     if depth >= MAX_AST_DEPTH {
@@ -1196,11 +1236,16 @@ fn push_link(links: Option<&mut Vec<ChainLink>>, node: Node<'_>, level: u32, pat
 /// `obj[idx]`-style access.
 #[inline]
 fn is_subscript_kind(kind: &str) -> bool {
-    kind == "subscript_expression"
-        || kind == "subscript"
-        || kind == "index_expression"
-        || kind == "element_access_expression"
+    SUBSCRIPT_KINDS.contains(&kind)
 }
+
+/// The kinds [`is_subscript_kind`] accepts.
+pub(super) const SUBSCRIPT_KINDS: &[&str] = &[
+    "subscript_expression",
+    "subscript",
+    "index_expression",
+    "element_access_expression",
+];
 
 /// Fold `obj["constructor"]` → `obj.constructor` when the subscript
 /// index is a string literal. The canonical JS sandbox-escape pattern
@@ -1252,20 +1297,18 @@ fn fold_string_subscript_into(
     Some(())
 }
 
-fn is_assignment_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "assignment"
-            | "let_declaration"
-            | "assignment_expression"
-            | "augmented_assignment"
-            | "assignment_statement"
-            | "variable_declarator"
-            | "variable_assignment"
-            | "operator_assignment"
-            | "global_variable"
-    )
-}
+/// Node kinds that bind a value to a target, recorded as `Symbol::Bind`.
+pub(super) const ASSIGNMENT_KINDS: &[&str] = &[
+    "assignment",
+    "let_declaration",
+    "assignment_expression",
+    "augmented_assignment",
+    "assignment_statement",
+    "variable_declarator",
+    "variable_assignment",
+    "operator_assignment",
+    "global_variable",
+];
 
 fn assignment_target(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("left")
@@ -1280,26 +1323,7 @@ fn assignment_value(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).next()
-}
-
-/// `parent_kind` comes down from the walk: `Node::parent` walks down from the
-/// root, which would make checking every node quadratic in tree depth.
-fn is_string_concat_root(node: Node<'_>, parent_kind: &str, config: &LangConfig) -> bool {
-    if !config.binary_op_kinds.contains(&node.kind()) {
-        return false;
-    }
-    let op_text = node
-        .child_by_field_name("operator")
-        .and_then(NodeOpExt::utf8_text_lossy)
-        .unwrap_or("");
-    if op_text != "+" {
-        return false;
-    }
-    // Root only if the parent isn't also a binary expression (otherwise
-    // we'd record the chain at every level).
-    !config.binary_op_kinds.contains(&parent_kind)
+    node.named_child(0)
 }
 
 fn string_concat_chain_length(node: Node<'_>, config: &LangConfig) -> u32 {
@@ -1308,7 +1332,7 @@ fn string_concat_chain_length(node: Node<'_>, config: &LangConfig) -> u32 {
     fn descend(node: Node<'_>, config: &LangConfig, acc: &mut u32, depth: u32) {
         // A `+` chain of N terms nests N deep; stop at the shared cap so a
         // pathological `a+b+c+…` (thousands of terms) can't overflow the stack
-        // before `walk_node`'s guard returns. The length saturates, which is
+        // before the walk's depth guard applies. The length saturates, which is
         // all `ast.max_concat_chain` needs.
         if depth >= MAX_AST_DEPTH {
             return;
@@ -1327,22 +1351,6 @@ fn string_concat_chain_length(node: Node<'_>, config: &LangConfig) -> u32 {
     acc
 }
 
-/// Helper trait for nodes that lets us pull the operator text without
-/// importing tree-sitter throughout this module.
-trait NodeOpExt<'tree> {
-    fn utf8_text_lossy(self) -> Option<&'tree str>;
-}
-
-impl<'tree> NodeOpExt<'tree> for Node<'tree> {
-    fn utf8_text_lossy(self) -> Option<&'tree str> {
-        // The `operator` field on binary-expression nodes is an
-        // anonymous node whose kind name *is* the operator string in
-        // every grammar we use. `kind()` returns text borrowed from the
-        // node, so preserve that lifetime instead of claiming it is static.
-        Some(self.kind())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1353,9 +1361,12 @@ mod tests {
             .open(src.as_bytes());
         let ast = parsed.source_ast().expect("parsed source");
         let config = super::super::langs::config_for(ast.file_type).expect("language config");
-        let mut state = State::default();
-        state.walk_node(ast.tree.root_node(), ast.source, config, 0, "");
-        state
+        let mut collectors = visit::Collectors {
+            ast: Some(State::default()),
+            ..visit::Collectors::default()
+        };
+        visit::walk(ast.tree.root_node(), ast.source, config, &mut collectors);
+        collectors.ast.expect("ast collector")
     }
 
     /// `function_count` is the denominator of the const/string-return ratios,

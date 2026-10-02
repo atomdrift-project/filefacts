@@ -23,25 +23,77 @@ use crate::formats::carrier::Coverage;
 const MAX_REGIONS: usize = 4096;
 
 /// RIFF: `RIFF` + u32 little-endian payload length + a 4-byte form type,
-/// then `id`/`size` chunks. Used by `.wav`, `.webp` and `.avi`.
+/// then `id`/`size` chunks. Used by `.wav`, `.webp` and `.avi`. `RIFX` is
+/// the same layout with every size big-endian.
 pub(crate) fn riff(bytes: &[u8]) -> Coverage {
     let Some(head) = bytes.first_chunk::<12>() else {
-        let mut c = Coverage::unrecognized();
-        c.problem("header truncated");
-        return c;
+        return header_truncated();
     };
-    if &head[..4] != b"RIFF" && &head[..4] != b"RIFX" {
-        return Coverage::unrecognized();
-    }
+    let read_size: fn([u8; 4]) -> u32 = match &head[..4] {
+        b"RIFF" => u32::from_le_bytes,
+        b"RIFX" => u32::from_be_bytes,
+        _ => return Coverage::unrecognized(),
+    };
     let form = match &head[8..12] {
         b"WAVE" => "wav",
         b"WEBP" => "webp",
         b"AVI " => "avi",
         _ => "riff",
     };
+    // `LIST`/`INFO` metadata and WebP's `XMP `/`EXIF` hold author text.
+    walk_chunks(
+        bytes,
+        head,
+        form,
+        read_size,
+        &[b"LIST", b"INFO", b"XMP ", b"EXIF", b"ID3 "],
+    )
+}
+
+/// IFF: `FORM` + u32 big-endian length + form type, then `id`/`size` chunks.
+/// Used by `.aiff` and `.aifc`.
+pub(crate) fn iff(bytes: &[u8]) -> Coverage {
+    let Some(head) = bytes.first_chunk::<12>() else {
+        return header_truncated();
+    };
+    if &head[..4] != b"FORM" {
+        return Coverage::unrecognized();
+    }
+    let form = match &head[8..12] {
+        b"AIFF" => "aiff",
+        b"AIFC" => "aifc",
+        _ => "iff",
+    };
+    // `NAME`/`AUTH`/`ANNO`/`(c) ` are AIFF's free-text chunks.
+    walk_chunks(
+        bytes,
+        head,
+        form,
+        u32::from_be_bytes,
+        &[b"NAME", b"AUTH", b"ANNO", b"(c) "],
+    )
+}
+
+fn header_truncated() -> Coverage {
+    let mut c = Coverage::unrecognized();
+    c.problem("header truncated");
+    c
+}
+
+/// The chunk walk RIFF and IFF share: a 12-byte header whose bytes 4..8 give
+/// the length of everything after the first 8, then `id`/`size` chunks padded
+/// to an even length. The two differ only in the byte order of the size
+/// fields (`read_size`) and in which chunk ids hold free text (`freeform`).
+fn walk_chunks(
+    bytes: &[u8],
+    head: &[u8; 12],
+    form: &'static str,
+    read_size: fn([u8; 4]) -> u32,
+    freeform: &[&[u8; 4]],
+) -> Coverage {
     let mut cov = Coverage::new(form, 12);
-    // The declared length covers everything after the 8-byte RIFF header.
-    let declared = u64::from(u32::from_le_bytes([head[4], head[5], head[6], head[7]]));
+    // The declared length covers everything after the 8-byte header.
+    let declared = u64::from(read_size([head[4], head[5], head[6], head[7]]));
     cov.declared_len = Some(declared.saturating_add(8));
     if declared.saturating_add(8) > bytes.len() as u64 {
         cov.problem("declared size exceeds file");
@@ -61,7 +113,7 @@ pub(crate) fn riff(bytes: &[u8]) -> Coverage {
         && seen < MAX_REGIONS
     {
         let id = [i0, i1, i2, i3];
-        let size = u32::from_le_bytes([s0, s1, s2, s3]) as usize;
+        let size = read_size([s0, s1, s2, s3]) as usize;
         let body = at + 8;
         let Some(end) = body.checked_add(size) else {
             cov.problem("chunk size overflows");
@@ -71,71 +123,12 @@ pub(crate) fn riff(bytes: &[u8]) -> Coverage {
             cov.problem("chunk extends past declared end");
             break;
         }
-        // `LIST`/`INFO` metadata and WebP's `XMP `/`EXIF` hold author text.
-        if matches!(&id, b"LIST" | b"INFO" | b"XMP " | b"EXIF" | b"ID3 ") {
+        if freeform.contains(&&id) {
             cov.claim_freeform(at as u64, end as u64);
         } else {
             cov.claim(at as u64, end as u64);
         }
         // Chunks are word-aligned: an odd size is followed by one pad byte.
-        at = end + (size & 1);
-        seen += 1;
-    }
-    if seen == 0 {
-        cov.problem("no chunks declared");
-    }
-    cov
-}
-
-/// IFF: `FORM` + u32 big-endian length + form type, then `id`/`size` chunks.
-/// Used by `.aiff` and `.aifc`.
-pub(crate) fn iff(bytes: &[u8]) -> Coverage {
-    let Some(head) = bytes.first_chunk::<12>() else {
-        let mut c = Coverage::unrecognized();
-        c.problem("header truncated");
-        return c;
-    };
-    if &head[..4] != b"FORM" {
-        return Coverage::unrecognized();
-    }
-    let form = match &head[8..12] {
-        b"AIFF" => "aiff",
-        b"AIFC" => "aifc",
-        _ => "iff",
-    };
-    let mut cov = Coverage::new(form, 12);
-    let declared = u64::from(u32::from_be_bytes([head[4], head[5], head[6], head[7]]));
-    cov.declared_len = Some(declared.saturating_add(8));
-    if declared.saturating_add(8) > bytes.len() as u64 {
-        cov.problem("declared size exceeds file");
-    }
-
-    let limit = usize::try_from(declared.saturating_add(8))
-        .unwrap_or(usize::MAX)
-        .min(bytes.len());
-    let mut at = 12usize;
-    let mut seen = 0usize;
-    while let Some(&[i0, i1, i2, i3, s0, s1, s2, s3]) =
-        bytes.get(at..limit).and_then(<[u8]>::first_chunk::<8>)
-        && seen < MAX_REGIONS
-    {
-        let id = [i0, i1, i2, i3];
-        let size = u32::from_be_bytes([s0, s1, s2, s3]) as usize;
-        let body = at + 8;
-        let Some(end) = body.checked_add(size) else {
-            cov.problem("chunk size overflows");
-            break;
-        };
-        if end > limit {
-            cov.problem("chunk extends past declared end");
-            break;
-        }
-        // `NAME`/`AUTH`/`ANNO`/`(c) ` are AIFF's free-text chunks.
-        if matches!(&id, b"NAME" | b"AUTH" | b"ANNO" | b"(c) ") {
-            cov.claim_freeform(at as u64, end as u64);
-        } else {
-            cov.claim(at as u64, end as u64);
-        }
         at = end + (size & 1);
         seen += 1;
     }
@@ -170,8 +163,8 @@ pub(crate) fn ico(bytes: &[u8]) -> Coverage {
     let mut cov = Coverage::new(if kind == 1 { "ico" } else { "cur" }, dir_end as u64);
     for entry in dir.as_chunks::<16>().0 {
         let [.., z0, z1, z2, z3, o0, o1, o2, o3] = *entry;
-        let size = u32::from_le_bytes([z0, z1, z2, z3]) as u64;
-        let off = u32::from_le_bytes([o0, o1, o2, o3]) as u64;
+        let size = u64::from(u32::from_le_bytes([z0, z1, z2, z3]));
+        let off = u64::from(u32::from_le_bytes([o0, o1, o2, o3]));
         let Some(end) = off.checked_add(size) else {
             cov.problem("image extent overflows");
             continue;
@@ -361,7 +354,7 @@ pub(crate) fn iso_bmff(bytes: &[u8]) -> Coverage {
         bytes.get(at..).and_then(<[u8]>::first_chunk::<8>)
         && seen < MAX_REGIONS
     {
-        let size32 = u32::from_be_bytes([s0, s1, s2, s3]) as u64;
+        let size32 = u64::from(u32::from_be_bytes([s0, s1, s2, s3]));
         let btype = [t0, t1, t2, t3];
         let size = match size32 {
             // 0 means "extends to end of file".
@@ -394,7 +387,7 @@ pub(crate) fn iso_bmff(bytes: &[u8]) -> Coverage {
         } else {
             cov.claim(at as u64, end);
         }
-        at = end as usize;
+        at = crate::bytes::sat_usize(end);
         seen += 1;
     }
     if seen == 0 {
@@ -409,9 +402,14 @@ pub(crate) fn iso_bmff(bytes: &[u8]) -> Coverage {
 /// is text, so only what follows it is examined.
 pub(crate) fn svg(bytes: &[u8]) -> Coverage {
     let mut cov = Coverage::new("svg", 0);
-    // Case-insensitive search for the final closing tag.
-    let lower: Vec<u8> = bytes.iter().map(|b| b.to_ascii_lowercase()).collect();
-    match memchr::memmem::rfind(&lower, b"</svg>") {
+    // Case-insensitive search for the final closing tag, walking back over
+    // each `<` rather than lowercasing a copy of the whole file.
+    let close = memchr::memrchr_iter(b'<', bytes).find(|&at| {
+        bytes
+            .get(at..at + 6)
+            .is_some_and(|tag| tag.eq_ignore_ascii_case(b"</svg>"))
+    });
+    match close {
         Some(at) => cov.claim(0, (at + 6) as u64),
         None => {
             // No closing tag: an SVG fragment, or a file that is not really
@@ -496,6 +494,39 @@ mod tests {
         assert_eq!(stow(&v), vec!["pe"]);
         assert!(m.get("media.trailing_bytes").unwrap() > 4000.0);
         assert_eq!(v.get("media.valid").and_then(|x| x.as_bool()), Some(false));
+    }
+
+    /// `build_wav` in RIFX form: the same chunks with big-endian sizes.
+    fn build_rifx(extra: &[u8]) -> Vec<u8> {
+        let fmt = [0u8, 1, 0, 1, 0, 0, 0x1f, 0x40, 0, 0, 0x1f, 0x40, 0, 1, 0, 8];
+        let data = vec![0x80u8; 512];
+        let mut body = Vec::from(*b"WAVE");
+        body.extend_from_slice(b"fmt ");
+        body.extend_from_slice(&(fmt.len() as u32).to_be_bytes());
+        body.extend_from_slice(&fmt);
+        body.extend_from_slice(b"data");
+        body.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        body.extend_from_slice(&data);
+        let mut out = Vec::from(*b"RIFX");
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(&body);
+        out.extend_from_slice(extra);
+        out
+    }
+
+    /// RIFX sizes are big-endian. Read little-endian, a clean file's declared
+    /// length overran the input and its appended payload went unseen.
+    #[test]
+    fn rifx_sizes_are_big_endian() {
+        let clean = build_rifx(&[]);
+        let (v, m) = facts(&riff(&clean), &clean);
+        assert_eq!(v.get("media.valid").and_then(|x| x.as_bool()), Some(true));
+        assert_eq!(m.get("media.trailing_bytes"), Some(0.0));
+
+        let stuffed = build_rifx(&fake_pe(4096));
+        let (v, m) = facts(&riff(&stuffed), &stuffed);
+        assert_eq!(stow(&v), vec!["pe"]);
+        assert!(m.get("media.trailing_bytes").unwrap() > 4000.0);
     }
 
     fn build_ico(extra: &[u8]) -> Vec<u8> {
@@ -700,5 +731,15 @@ mod tests {
         let frag = b"<svg xmlns=\"http://www.w3.org/2000/svg\"><rect/>";
         let (_, m) = facts(&svg(frag), frag);
         assert_eq!(m.get("media.trailing_bytes"), Some(0.0));
+    }
+
+    /// The closing tag matches in any case, and the last one wins even when
+    /// the trailing bytes hold other `<` bytes or a truncated tag.
+    #[test]
+    fn svg_closing_tag_is_case_insensitive_and_last_wins() {
+        let doc = b"<SVG><g></g></Svg><x></sVg>tail<</sv";
+        let end = doc.windows(6).rposition(|w| w == b"</sVg>").unwrap() + 6;
+        let claims: Vec<_> = svg(doc).claims.iter().map(|c| (c.start, c.end)).collect();
+        assert_eq!(claims, vec![(0, end as u64)]);
     }
 }

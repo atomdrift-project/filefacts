@@ -1,8 +1,65 @@
 //! Same-package Go context, independent of scanners and archive extractors.
-use crate::package_context::member_directory;
-use serde_json::{Value, json};
+use crate::Values;
+use crate::package_context::{ContextLimits, Coverage, Phase, SourceFile, member_directory};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
+
+/// What [`crate::go_package_payload_flow`] found for one package variant.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct GoPackageFlow {
+    /// One entry per member that parsed, in input order.
+    pub files: Vec<GoFileFlow>,
+    /// A budget was exhausted, a member failed to parse, or helper summaries
+    /// did not settle, so coverage is incomplete — not clean.
+    pub truncated: bool,
+}
+
+/// Payload-flow facts for one Go member.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct GoFileFlow {
+    /// The member's logical path.
+    pub path: String,
+    /// Its `source.payload_flow.*` and `source.go.*` values.
+    pub facts: Values,
+}
+
+/// What [`go_source_context`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct GoSourceContext {
+    /// One entry per package directory, build variant and phase.
+    pub packages: Vec<GoPackage>,
+    /// The input was incomplete or a budget was exhausted, so coverage is
+    /// incomplete — not clean.
+    pub truncated: bool,
+}
+
+/// One Go package variant: the members compiled together under one set of
+/// build constraints, for one phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct GoPackage {
+    /// The package directory, as a logical member path.
+    pub directory: String,
+    /// The package clause's name.
+    pub package: String,
+    /// [`Phase::Runtime`], or [`Phase::Test`] when `_test.go` members join.
+    pub phase: Phase,
+    /// The build constraints that select this variant: `//go:build`
+    /// expressions joined with ` && `, then `;<os-or-arch>` filename tags.
+    /// Empty for unconstrained members.
+    pub variant: String,
+    /// The members compiled together.
+    pub members: Vec<String>,
+    /// `<initialization|runtime>-<event>` payload-flow labels.
+    pub behaviors: BTreeSet<String>,
+    /// The payload-flow analysis of this variant hit a budget.
+    pub truncated: bool,
+}
 
 /// Package directory of a logical member path: its [`member_directory`]
 /// without the trailing `/`. An archive delimiter stays (`x/a.zip!!`), so
@@ -16,15 +73,23 @@ fn package_directory(path: &str) -> &str {
 /// directories, test variants, and build constraints bound helper resolution.
 /// An incomplete input or analysis budget remains explicit in the result.
 #[must_use]
-pub fn go_source_context(sources: &[(String, String)], incomplete: bool) -> Value {
-    if sources.len() > 512 || sources.iter().map(|(_, s)| s.len()).sum::<usize>() > 8 * 1024 * 1024
+pub fn go_source_context(
+    sources: &[SourceFile<'_>],
+    coverage: Coverage,
+    limits: &ContextLimits,
+) -> GoSourceContext {
+    if sources.len() > limits.max_go_members
+        || sources.iter().map(|s| s.source.len()).sum::<usize>() > limits.max_go_bytes
     {
-        return json!({"packages":[],"truncated":true});
+        return GoSourceContext {
+            packages: Vec::new(),
+            truncated: true,
+        };
     }
-    let mut groups: BTreeMap<(String, String), Vec<(&str, &str, String, bool)>> = BTreeMap::new();
-    let mut truncated = incomplete;
-    for (path, source) in sources {
-        if source.len() > 2 * 1024 * 1024 {
+    let mut groups: BTreeMap<(String, String), Vec<Member<'_>>> = BTreeMap::new();
+    let mut truncated = coverage == Coverage::Incomplete;
+    for &SourceFile { path, source } in sources {
+        if source.len() > limits.max_go_member_bytes {
             truncated = true;
             continue;
         }
@@ -86,29 +151,39 @@ pub fn go_source_context(sources: &[(String, String)], incomplete: bool) -> Valu
         groups
             .entry((directory.to_string(), package.to_string()))
             .or_default()
-            .push((path, source, variant, path.ends_with("_test.go")));
+            .push(Member {
+                path,
+                source,
+                variant,
+                test: path.ends_with("_test.go"),
+            });
     }
     let mut packages = Vec::new();
     for ((directory, package), files) in groups {
-        let variants: BTreeSet<_> = files.iter().map(|(_, _, v, _)| v.clone()).collect();
+        let variants: BTreeSet<_> = files.iter().map(|m| m.variant.clone()).collect();
         for variant in variants {
             for test in [false, true] {
-                if packages.len() >= 128 {
+                if packages.len() >= limits.max_go_packages {
                     truncated = true;
                     break;
                 }
                 let selected: Vec<_> = files
                     .iter()
-                    .filter(|(_, _, v, t)| (!*t || test) && (v.is_empty() || *v == variant))
+                    .filter(|m| (!m.test || test) && (m.variant.is_empty() || m.variant == variant))
                     .collect();
-                if selected.is_empty() || test && !selected.iter().any(|(_, _, _, t)| *t) {
+                if selected.is_empty() || test && !selected.iter().any(|m| m.test) {
                     continue;
                 }
-                let inputs: Vec<_> = selected.iter().map(|(p, s, _, _)| (*p, *s)).collect();
-                let facts = crate::go_package_payload_flow(&inputs);
+                let inputs: Vec<_> = selected
+                    .iter()
+                    .map(|m| SourceFile {
+                        path: m.path,
+                        source: m.source,
+                    })
+                    .collect();
+                let flow = crate::go_package_payload_flow(&inputs, limits);
                 let mut behaviors = BTreeSet::new();
-                let files = facts.get("files").and_then(Value::as_array);
-                for file in files.into_iter().flatten() {
+                for file in &flow.files {
                     for (key, prefix) in [
                         (
                             crate::value_key!("source.go.initialization_events"),
@@ -117,8 +192,8 @@ pub fn go_source_context(sources: &[(String, String)], incomplete: bool) -> Valu
                         (crate::value_key!("source.payload_flow.events"), "runtime"),
                     ] {
                         for event in file
-                            .get("facts")
-                            .and_then(|facts| key.get_in(facts))
+                            .facts
+                            .get_key(key)
                             .and_then(Value::as_array)
                             .into_iter()
                             .flatten()
@@ -129,13 +204,32 @@ pub fn go_source_context(sources: &[(String, String)], incomplete: bool) -> Valu
                         }
                     }
                 }
-                let facts_truncated = facts.get("truncated");
-                truncated |= facts_truncated.and_then(Value::as_bool) == Some(true);
-                packages.push(json!({"directory":directory,"package":package,"phase":if test {"test"} else {"runtime"},"variant":variant,"members":inputs.iter().map(|(p,_)|p).collect::<Vec<_>>(),"behaviors":behaviors,"truncated":facts_truncated}));
+                truncated |= flow.truncated;
+                packages.push(GoPackage {
+                    directory: directory.clone(),
+                    package: package.clone(),
+                    phase: if test { Phase::Test } else { Phase::Runtime },
+                    variant: variant.clone(),
+                    members: inputs.iter().map(|f| f.path.to_string()).collect(),
+                    behaviors,
+                    truncated: flow.truncated,
+                });
             }
         }
     }
-    json!({"packages":packages,"truncated":truncated})
+    GoSourceContext {
+        packages,
+        truncated,
+    }
+}
+
+/// One Go member grouped under its package.
+struct Member<'a> {
+    path: &'a str,
+    source: &'a str,
+    /// Build constraints: see [`GoPackage::variant`].
+    variant: String,
+    test: bool,
 }
 
 #[cfg(test)]
@@ -149,21 +243,42 @@ mod tests {
         assert_eq!(package_directory("x/a.zip!!main.go"), "x/a.zip!!");
         assert_eq!(package_directory("x/a.zip!!sub/main.go"), "x/a.zip!!sub");
 
-        let source = "package main\nfunc main(){}\n".to_string();
+        let source = "package main\nfunc main(){}\n";
         let context = go_source_context(
             &[
-                ("x/a.zip!!main.go".into(), source.clone()),
-                ("x/b.zip!!main.go".into(), source),
+                file("x/a.zip!!main.go", source),
+                file("x/b.zip!!main.go", source),
             ],
-            false,
+            Coverage::Complete,
+            &ContextLimits::default(),
         );
-        let directories: BTreeSet<_> = context["packages"]
-            .as_array()
-            .unwrap()
+        let directories: BTreeSet<_> = context
+            .packages
             .iter()
-            .filter_map(|p| p["directory"].as_str())
+            .map(|p| p.directory.as_str())
             .collect();
         assert_eq!(directories, BTreeSet::from(["x/a.zip!!", "x/b.zip!!"]));
+        assert!(!context.truncated);
+    }
+
+    fn file<'a>(path: &'a str, source: &'a str) -> SourceFile<'a> {
+        SourceFile { path, source }
+    }
+
+    /// Incomplete input and exhausted budgets both mark the result truncated.
+    #[test]
+    fn incomplete_input_and_budgets_truncate() {
+        let members = [file("p/a.go", "package one\nfunc A(){}\n")];
+        let limits = ContextLimits::default();
+        assert!(!go_source_context(&members, Coverage::Complete, &limits).truncated);
+        assert!(go_source_context(&members, Coverage::Incomplete, &limits).truncated);
+        let mut tight = limits;
+        tight.max_go_members = 0;
+        let context = go_source_context(&members, Coverage::Complete, &tight);
+        assert!(context.truncated && context.packages.is_empty());
+        let mut tight = limits;
+        tight.max_go_packages = 0;
+        assert!(go_source_context(&members, Coverage::Complete, &tight).truncated);
     }
 
     /// Members are grouped by the package clause read from each file's syntax
@@ -172,32 +287,35 @@ mod tests {
     fn members_group_by_package_clause() {
         let context = go_source_context(
             &[
-                ("p/a.go".into(), "package one\nfunc A(){}\n".into()),
-                ("p/b.go".into(), "package two\nfunc B(){}\n".into()),
-                ("p/c_linux.go".into(), "package one\nfunc C(){}\n".into()),
-                ("p/README.md".into(), "package one\n".into()),
+                file("p/a.go", "package one\nfunc A(){}\n"),
+                file("p/b.go", "package two\nfunc B(){}\n"),
+                file("p/c_linux.go", "package one\nfunc C(){}\n"),
+                file("p/README.md", "package one\n"),
             ],
-            false,
+            Coverage::Complete,
+            &ContextLimits::default(),
         );
-        let packages: BTreeSet<_> = context["packages"]
-            .as_array()
-            .unwrap()
+        let packages: BTreeSet<_> = context
+            .packages
             .iter()
             .map(|p| {
-                (
-                    p["package"].as_str().unwrap(),
-                    p["variant"].as_str().unwrap(),
-                    p["members"].to_string(),
-                )
+                assert_eq!(p.phase, Phase::Runtime);
+                (p.package.as_str(), p.variant.as_str(), p.members.join(","))
             })
             .collect();
         assert_eq!(
             packages,
             BTreeSet::from([
-                ("one", "", r#"["p/a.go"]"#.to_string()),
-                ("one", ";linux", r#"["p/a.go","p/c_linux.go"]"#.to_string()),
-                ("two", "", r#"["p/b.go"]"#.to_string()),
+                ("one", "", "p/a.go".to_string()),
+                ("one", ";linux", "p/a.go,p/c_linux.go".to_string()),
+                ("two", "", "p/b.go".to_string()),
             ])
+        );
+        let json = serde_json::to_value(&context).unwrap();
+        assert_eq!(json["packages"][0]["phase"], "runtime");
+        assert_eq!(
+            json["packages"][0]["members"],
+            serde_json::json!(["p/a.go"])
         );
     }
 }

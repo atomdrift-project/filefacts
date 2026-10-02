@@ -20,7 +20,6 @@ use crate::value_key;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeSet, VecDeque};
 
-use crate::error::Error;
 use crate::formats::common::bytes_at::{u32_le, u64_le};
 use crate::formats::common::{XorScan, extract_binary_strings, put_str};
 use crate::output::{Metrics, Strings, Values};
@@ -36,10 +35,10 @@ pub(super) fn extract(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
-) -> Result<(), Error> {
+) {
     extract_binary_strings(bytes, strings, XorScan::No);
     if bytes.is_empty() {
-        return Ok(());
+        return;
     }
     let scan = bytes.get(..MAX_BYTES_SCANNED).unwrap_or(bytes);
 
@@ -73,7 +72,7 @@ pub(super) fn extract(
     }
 
     if opcodes.is_empty() && modules.is_empty() && protocol < 0 {
-        return Ok(());
+        return;
     }
 
     if protocol >= 0 {
@@ -114,8 +113,6 @@ pub(super) fn extract(
             ),
         );
     }
-
-    Ok(())
 }
 
 /// Opcode names that grant attacker-controlled code execution
@@ -371,7 +368,7 @@ mod tests {
         let mut v = Values::new();
         let mut s = Strings::default();
         let mut m = Metrics::new();
-        extract(bytes, &mut v, &mut s, &mut m).unwrap();
+        extract(bytes, &mut v, &mut s, &mut m);
         (v, m)
     }
 

@@ -1,2 +1,4 @@
 * text=auto
 testdata/** -text
+# Signed fixtures: line-ending normalization would invalidate the signatures.
+tests/fixtures/apk/** -text

@@ -20,24 +20,25 @@ use serde_json::Value as JsonValue;
 use crate::error::Error;
 use crate::formats::common::bytes_at::{u16_le, u32_le, u64_le};
 use crate::formats::common::{
-    XorScan, extract_binary_strings, extract_binary_strings_from_object, format_guid, hex_encode,
-    put_i64, put_str, put_u64, rizin_decision, rizin_fallback_with_sections, section_entropy,
+    NativeFormat, RizinTarget, XorScan, extract_binary_strings, extract_binary_strings_from_object,
+    format_guid, hex_encode, put_i64, put_str, put_u64, rizin_decision,
+    rizin_fallback_with_sections, section_entropy,
 };
 use crate::formats::goblin_safe;
-use crate::output::{Errors, Metrics, Section, Strings, Values};
+use crate::output::{Metrics, Section, SectionFlag, Values};
 use crate::scan::entropy;
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn extract(
-    bytes: &[u8],
-    values: &mut Values,
-    strings: &mut Strings,
-    metrics: &mut Metrics,
-    sections_out: &mut Vec<Section>,
-    symbols_out: &mut crate::Symbols,
-    errors_out: &mut Errors,
-    rizin: &crate::rizin::Settings,
-) -> Result<(), Error> {
+pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) -> Result<(), Error> {
+    let super::ExtractCtx {
+        values,
+        strings,
+        metrics,
+        sections: sections_out,
+        symbols: symbols_out,
+        errors: errors_out,
+        ref rizin,
+        ..
+    } = ctx;
     // All strings — ASCII, section names, and UTF-16 (resource / version-info)
     // runs — come from the single stng pass below: it scans the whole buffer
     // for wide strings at absolute file offsets, including the unparseable
@@ -115,56 +116,55 @@ pub(super) fn extract(
         if let Some(rd) = pe.resource_data.as_ref() {
             // The resource walker is lazy and slices with unchecked
             // header offsets — packed Windows malware regularly
-            // panics inside `entries()` / `count()`. Wrap the walk
-            // in catch_infallible so a malformed resource directory
-            // leaves resource metrics at their defaults instead of
-            // aborting the whole extraction.
+            // panics inside `entries()`. Only that walk runs under the
+            // guard: it is drained into plain ids, and everything filefacts
+            // derives from them runs outside, so a panic in our own code is
+            // never blamed on goblin and a goblin panic cannot leave the
+            // resource facts half-written.
             let walk = goblin_safe::catch_infallible(|| {
-                resource_types(rd, values, metrics);
-                // Resource-directory TimeDateStamp, set by the resource
-                // compiler at link time. Often stable across rebuilds, so a
-                // change between releases of an otherwise-stable binary is a
-                // tampering signal.
-                let ts = rd.image_resource_directory.time_date_stamp;
-                if ts != 0 {
-                    put_u64(values, value_key!("pe.resource_timestamp"), u64::from(ts));
-                }
-                // Presence flags emitted authoritatively from the
-                // resource directory walker — distinct from whether
-                // the version/manifest extraction populated any
-                // downstream keys (which can be empty on malformed
-                // structures).
-                if rd.version_info.is_some() {
-                    metrics.insert(metric!("pe.has_version_info"), 1.0);
-                }
-                if rd.manifest_data.is_some() {
-                    metrics.insert(metric!("pe.has_manifest"), 1.0);
-                }
-                // Count icon entries — IMAGE_RESOURCE RT_ICON (3) +
-                // RT_GROUP_ICON (14) — separately so consumers can
-                // distinguish "icon presence" from total resource count.
-                let icon_count = rd
-                    .entries()
+                rd.entries()
                     .flatten()
-                    .filter(|e| matches!(e.id(), Some(3 | 14)))
-                    .count() as f64;
-                if icon_count > 0.0 {
-                    metrics.insert(metric!("pe.icon_count"), icon_count);
-                }
-                if let Some(ref vi) = rd.version_info {
-                    super::pe_version_info::extract(vi, bytes, values, metrics);
-                }
-                if let Some(ref md) = rd.manifest_data {
-                    // Goblin exposes the manifest bytes as a slice into the
-                    // original PE. Recover that slice's exact file offset so
-                    // value facts can carry real locations into cleave.
-                    let manifest_offset = slice_file_offset(bytes, md.data);
-                    super::pe_manifest::extract_at(md.data, manifest_offset, values);
-                }
+                    .map(|e| e.id())
+                    .collect::<Vec<Option<u16>>>()
             });
-            if let goblin_safe::GoblinOutcome::Panicked(msg) = walk {
-                errors_out.record_panic(crate::Stage::PeResourceWalk, msg);
-                metrics.insert(metric!("pe.resource_walk_panicked"), 1.0);
+            match walk {
+                goblin_safe::GoblinOutcome::Ok(ids) => resource_types(&ids, values, metrics),
+                goblin_safe::GoblinOutcome::Panicked(msg) => {
+                    errors_out.record_panic(crate::Stage::PeResourceWalk, msg);
+                    metrics.insert(metric!("pe.resource_walk_panicked"), 1.0);
+                }
+                goblin_safe::GoblinOutcome::Failed(_) => {}
+            }
+            // The rest reads fields goblin parsed eagerly, so it survives a
+            // walker panic.
+            // Resource-directory TimeDateStamp, set by the resource
+            // compiler at link time. Often stable across rebuilds, so a
+            // change between releases of an otherwise-stable binary is a
+            // tampering signal.
+            let ts = rd.image_resource_directory.time_date_stamp;
+            if ts != 0 {
+                put_u64(values, value_key!("pe.resource_timestamp"), u64::from(ts));
+            }
+            // Presence flags emitted authoritatively from the
+            // resource directory walker — distinct from whether
+            // the version/manifest extraction populated any
+            // downstream keys (which can be empty on malformed
+            // structures).
+            if rd.version_info.is_some() {
+                metrics.insert(metric!("pe.has_version_info"), 1.0);
+            }
+            if rd.manifest_data.is_some() {
+                metrics.insert(metric!("pe.has_manifest"), 1.0);
+            }
+            if let Some(ref vi) = rd.version_info {
+                super::pe_version_info::extract(vi, bytes, values, metrics);
+            }
+            if let Some(ref md) = rd.manifest_data {
+                // Goblin exposes the manifest bytes as a slice into the
+                // original PE. Recover that slice's exact file offset so
+                // value facts can carry real locations into cleave.
+                let manifest_offset = slice_file_offset(bytes, md.data);
+                super::pe_manifest::extract_at(md.data, manifest_offset, values);
             }
         }
         if let Some(ref dbg) = pe.debug_data {
@@ -190,7 +190,7 @@ pub(super) fn extract(
         // why expiry is kept out of the content-derived facts.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
         super::pe_signature_trust::derive(values, metrics, now);
         super::pe_rich::extract(bytes, values);
         super::upx::detect(bytes, values);
@@ -213,26 +213,20 @@ pub(super) fn extract(
         // Importless PEs are the narrow parsed-PE class where function
         // recovery can correlate API-hash callsites. It shares the same
         // cross-platform admission facts, including Go metadata detection.
-        rizin_importless_analysis(
-            &pe,
+        let target = RizinTarget {
+            format: NativeFormat::Pe,
             bytes,
-            values,
             strings,
-            sections_out,
-            symbols_out,
-            metrics,
-            has_go_function_metadata,
-            rizin,
-        );
+            go_function_metadata: has_go_function_metadata,
+            settings: rizin,
+        };
+        rizin_importless_analysis(&pe, target, values, sections_out, symbols_out, metrics);
         rizin_fallback_with_sections(
-            bytes,
-            strings,
+            target,
+            declares_export_directory(pe.header.optional_header.as_ref()),
             symbols_out,
             sections_out,
             metrics,
-            has_go_function_metadata,
-            declares_export_directory(pe.header.optional_header.as_ref()),
-            rizin,
         );
         return Ok(());
     }
@@ -248,7 +242,7 @@ pub(super) fn extract(
     let header = match goblin_safe::parse_pe_header(pe_bytes) {
         goblin_safe::GoblinOutcome::Ok(header) => header,
         goblin_safe::GoblinOutcome::Failed(e) => {
-            return Err(Error::malformed_with_source("pe", e.to_string(), e));
+            return Err(Error::malformed_caused_by("pe", e));
         }
         goblin_safe::GoblinOutcome::Panicked(msg) => {
             errors_out.record_panic(crate::Stage::PeParse, msg);
@@ -281,14 +275,17 @@ pub(super) fn extract(
     // already calls this; the header-only branch must too. The helper no-ops
     // when goblin did supply something, so it's safe to call unconditionally.
     rizin_fallback_with_sections(
-        bytes,
-        strings,
+        RizinTarget {
+            format: NativeFormat::Pe,
+            bytes,
+            strings,
+            go_function_metadata: false,
+            settings: rizin,
+        },
+        declares_export_directory(header.optional_header.as_ref()),
         symbols_out,
         sections_out,
         metrics,
-        false,
-        declares_export_directory(header.optional_header.as_ref()),
-        rizin,
     );
     Ok(())
 }
@@ -315,6 +312,11 @@ fn slice_file_offset(bytes: &[u8], slice: &[u8]) -> Option<u64> {
     (start >= base && end <= bytes_end).then_some((start - base) as u64)
 }
 
+/// Cap on the site records [`native_resolver_signals`] emits per kind. One
+/// six-byte `fs:[0x30]` needle per match would otherwise let a file of
+/// repeated opcodes emit a JSON object for every six bytes it holds.
+const MAX_NATIVE_SITES: usize = 4096;
+
 /// Cheap native-code indicators for manual Windows API resolution.
 ///
 /// These are deliberately mechanics, not a claim that a binary communicates
@@ -331,20 +333,33 @@ fn native_resolver_signals(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metri
     let mut peb_sites = Vec::new();
     let mut export_walk_sites = Vec::new();
     let mut hash_profiles = Vec::new();
-    for section in pe
+    // Section headers may all claim the same raw bytes (up to 192 of them),
+    // so clip overlaps first: every file byte is scanned once and every site
+    // reported once, attributed to the first section that covers it.
+    let ranges = pe
         .sections
         .iter()
         .filter(|section| section.characteristics & 0x2000_0000 != 0)
-    {
-        let start = section.pointer_to_raw_data as usize;
-        let end = start.saturating_add(section.size_of_raw_data as usize);
-        let Some(code) = bytes.get(start..end) else {
+        .map(|section| {
+            (
+                section.pointer_to_raw_data as usize,
+                section.size_of_raw_data as usize,
+                section,
+            )
+        })
+        .collect();
+    for (range, section) in super::common::disjoint_file_ranges(ranges, bytes.len()) {
+        let start = range.start;
+        let Some(code) = bytes.get(range) else {
             continue;
         };
         // memmem reports non-overlapping matches; no opcode needle searched
         // for in this file can overlap itself, so that is every match.
         for local_offset in memmem::find_iter(code, b"\x64\xa1\x30\x00\x00\x00") {
             peb_x86 += 1;
+            if peb_sites.len() >= MAX_NATIVE_SITES {
+                continue;
+            }
             peb_sites.push(native_site(
                 pe,
                 section,
@@ -357,6 +372,9 @@ fn native_resolver_signals(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metri
         }
         for local_offset in memmem::find_iter(code, b"\x65\x48\x8b\x04\x25\x60\x00\x00\x00") {
             peb_x64 += 1;
+            if peb_sites.len() >= MAX_NATIVE_SITES {
+                continue;
+            }
             peb_sites.push(native_site(
                 pe,
                 section,
@@ -369,6 +387,9 @@ fn native_resolver_signals(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metri
         }
         for walk in find_checked_export_walks_x86(code) {
             export_walks += 1;
+            if export_walk_sites.len() >= MAX_NATIVE_SITES {
+                continue;
+            }
             let mut fact = native_site(
                 pe,
                 section,
@@ -395,6 +416,9 @@ fn native_resolver_signals(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metri
         }
         for profile in find_custom_byte_hash_profiles_x86(code) {
             hash_loops += 1;
+            if hash_profiles.len() >= MAX_NATIVE_SITES {
+                continue;
+            }
             let mut fact = native_site(
                 pe,
                 section,
@@ -423,6 +447,13 @@ fn native_resolver_signals(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metri
             }
             hash_profiles.push(fact);
         }
+    }
+    // The counts above are exact; only the per-site records are capped.
+    if peb_x86 + peb_x64 > peb_sites.len()
+        || export_walks > export_walk_sites.len()
+        || hash_loops > hash_profiles.len()
+    {
+        metrics.insert(metric!("pe.native_resolver_sites_capped"), 1.0);
     }
     if peb_x86 > 0 {
         metrics.insert(metric!("pe.peb_access_x86_count"), peb_x86 as f64);
@@ -490,15 +521,18 @@ fn native_site(
 /// hash, which exactly matches this known API under the recovered profile".
 fn rizin_importless_analysis(
     pe: &PE<'_>,
-    bytes: &[u8],
+    target: RizinTarget<'_>,
     values: &mut Values,
-    strings: &Strings,
     sections: &[Section],
     symbols: &mut crate::Symbols,
     metrics: &mut Metrics,
-    go_function_metadata: bool,
-    rizin: &crate::rizin::Settings,
 ) {
+    let RizinTarget {
+        bytes,
+        go_function_metadata,
+        settings: rizin,
+        ..
+    } = target;
     const MAX_IMPORTLESS_ANALYSIS_BYTES: usize = 5 * 1024 * 1024;
     if bytes.len() > MAX_IMPORTLESS_ANALYSIS_BYTES
         || symbols
@@ -507,18 +541,7 @@ fn rizin_importless_analysis(
     {
         return;
     }
-    if !rizin_decision(
-        crate::formats::common::NativeFormat::Pe,
-        bytes,
-        strings,
-        sections,
-        symbols,
-        metrics,
-        go_function_metadata,
-    )
-    .runs()
-        || !rizin.admits(bytes)
-    {
+    if !rizin_decision(&target, sections, symbols, metrics).runs() || !rizin.admits(bytes) {
         return;
     }
     let Some(recovery) =
@@ -795,19 +818,10 @@ fn recover_x86_hash_argument(
     None
 }
 
+/// [`rva_to_file_offset`] for a virtual address in the PE's preferred image.
 fn va_to_file_offset(pe: &PE<'_>, va: u64) -> Option<usize> {
-    let rva = va.checked_sub(pe.image_base)?;
-    pe.sections.iter().find_map(|section| {
-        let start = u64::from(section.virtual_address);
-        let size = u64::from(section.size_of_raw_data);
-        if rva < start || rva >= start.saturating_add(size) {
-            return None;
-        }
-        usize::try_from(
-            u64::from(section.pointer_to_raw_data).saturating_add(rva.saturating_sub(start)),
-        )
-        .ok()
-    })
+    let rva = u32::try_from(va.checked_sub(pe.image_base)?).ok()?;
+    rva_to_file_offset(pe, rva)
 }
 
 struct WindowsApiHashCandidate {
@@ -1433,10 +1447,7 @@ fn sections(pe: &PE<'_>, bytes: &[u8], _metrics: &mut Metrics, sections_out: &mu
             vsize: u64::from(section.virtual_size),
             file_offset,
             file_size,
-            flags: section_characteristics(section.characteristics)
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
+            flags: section_characteristics(section.characteristics),
             flags_raw: Some(u64::from(section.characteristics)),
             entropy,
         });
@@ -1791,27 +1802,18 @@ fn subsystem_string(subsystem: u16) -> &'static str {
     }
 }
 
-fn section_characteristics(flags: u32) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if flags & 0x0000_0020 != 0 {
-        out.push("code");
-    }
-    if flags & 0x0000_0040 != 0 {
-        out.push("initialized_data");
-    }
-    if flags & 0x0000_0080 != 0 {
-        out.push("uninitialized_data");
-    }
-    if flags & 0x2000_0000 != 0 {
-        out.push("executable");
-    }
-    if flags & 0x4000_0000 != 0 {
-        out.push("readable");
-    }
-    if flags & 0x8000_0000 != 0 {
-        out.push("writable");
-    }
-    out
+fn section_characteristics(flags: u32) -> Vec<SectionFlag> {
+    [
+        (0x0000_0020, SectionFlag::Code),
+        (0x0000_0040, SectionFlag::InitializedData),
+        (0x0000_0080, SectionFlag::UninitializedData),
+        (0x2000_0000, SectionFlag::Executable),
+        (0x4000_0000, SectionFlag::Readable),
+        (0x8000_0000, SectionFlag::Writable),
+    ]
+    .into_iter()
+    .filter_map(|(bit, flag)| (flags & bit != 0).then_some(flag))
+    .collect()
 }
 
 /// Walk the resource directory's top-level entries and surface the
@@ -1819,25 +1821,25 @@ fn section_characteristics(flags: u32) -> Vec<&'static str> {
 /// top-level type ordered by the linker, which `pe.resource_types[0]`
 /// traits can match exactly (forensically meaningful: stub binaries
 /// often emit only RT_VERSION + RT_MANIFEST and nothing else).
-fn resource_types(
-    rd: &goblin::pe::resource::ResourceData<'_>,
-    values: &mut Values,
-    metrics: &mut Metrics,
-) {
+/// Resource-directory facts from the top-level entry ids (`None` for a
+/// named entry), as drained from goblin's walker.
+fn resource_types(ids: &[Option<u16>], values: &mut Values, metrics: &mut Metrics) {
     // Resource count is the raw entry total — duplicates allowed.
-    let total = rd.entries().flatten().count() as f64;
-    metrics.insert(metric!("pe.resource_count"), total);
+    metrics.insert(metric!("pe.resource_count"), ids.len() as f64);
+
+    // Count icon entries — IMAGE_RESOURCE RT_ICON (3) +
+    // RT_GROUP_ICON (14) — separately so consumers can
+    // distinguish "icon presence" from total resource count.
+    let icon_count = ids.iter().filter(|id| matches!(id, Some(3 | 14))).count();
+    if icon_count > 0 {
+        metrics.insert(metric!("pe.icon_count"), icon_count as f64);
+    }
 
     // `pe.resource_types[]` is a *deduplicated, sorted by numeric id*
     // list of canonical `RT_*` names. Sorting on the numeric id (not
     // the string) keeps the ordering stable across rt_name's
     // unknown-id fallback, which collapses many ids to "RT_UNKNOWN".
-    let mut type_ids: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
-    for entry in rd.entries().flatten() {
-        if let Some(id) = entry.id() {
-            type_ids.insert(id);
-        }
-    }
+    let type_ids: std::collections::BTreeSet<u16> = ids.iter().flatten().copied().collect();
     if !type_ids.is_empty() {
         let names: Vec<JsonValue> = type_ids
             .iter()
@@ -2318,11 +2320,14 @@ fn clr_metadata(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Me
     }
 }
 
+/// `(offset, size)` of a metadata heap, relative to the metadata blob.
+type HeapRange = (usize, usize);
+
 /// Parse the .NET metadata-root stream directory (ECMA-335 II.24.2.1) from the
 /// blob beginning at the `BSJB` signature. Returns the stream names in order
 /// and the `(offset, size)` of the `#GUID` heap (offsets relative to the blob
 /// start). Returns `None` when the signature or layout is malformed.
-fn parse_clr_streams(md: &[u8]) -> Option<(Vec<String>, Option<(usize, usize)>)> {
+fn parse_clr_streams(md: &[u8]) -> Option<(Vec<String>, Option<HeapRange>)> {
     let rd_u32 = |p: usize| u32_le(md, p).map(|v| v as usize);
     if md.get(0..4)? != b"BSJB" {
         return None;
@@ -2726,7 +2731,10 @@ fn aliased_exports(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
     let mut targets: HashMap<u64, u32> = HashMap::new();
     for export in &pe.exports {
         let rva = export.rva;
-        let Some(file_offset) = rva_to_file_offset(pe, rva as u32) else {
+        let Ok(rva32) = u32::try_from(rva) else {
+            continue;
+        };
+        let Some(file_offset) = rva_to_file_offset(pe, rva32) else {
             continue;
         };
         let Some(code) = bytes.get(file_offset..file_offset + 16) else {
@@ -2750,21 +2758,66 @@ fn aliased_exports(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
     }
 }
 
-/// Map a PE RVA to its on-disk file offset by walking the section
-/// table. Returns `None` for RVAs outside any section's virtual extent.
+/// Map a PE RVA to the file offset the Windows loader reads it from: the
+/// one RVA resolver for every PE extractor, so delay imports, relocations,
+/// CLR metadata and resolver call sites all read the bytes the loader maps.
+/// `None` for an RVA in no section, or in a section's zero-filled tail past
+/// its file-backed bytes (memory there has no file offset).
 fn rva_to_file_offset(pe: &PE<'_>, rva: u32) -> Option<usize> {
-    for section in &pe.sections {
-        let start = section.virtual_address;
-        let span = section.virtual_size.max(section.size_of_raw_data);
-        if rva >= start && rva < start.saturating_add(span) {
-            let delta = rva - start;
-            return section
-                .pointer_to_raw_data
-                .checked_add(delta)
-                .map(|v| v as usize);
+    let file_alignment = pe
+        .header
+        .optional_header
+        .map(|opt| opt.windows_fields.file_alignment);
+    section_rva_to_file_offset(&pe.sections, file_alignment, rva)
+}
+
+/// [`rva_to_file_offset`] over an explicit section table: the first section
+/// whose file-backed extent holds `rva` wins, as in goblin's `find_offset`.
+fn section_rva_to_file_offset(
+    sections: &[goblin::pe::section_table::SectionTable],
+    file_alignment: Option<u32>,
+    rva: u32,
+) -> Option<usize> {
+    sections.iter().find_map(|section| {
+        let delta = rva.checked_sub(section.virtual_address)?;
+        if u64::from(delta) >= file_backed_size(section, file_alignment) {
+            return None;
         }
+        usize::try_from(aligned_raw_pointer(section) + u64::from(delta)).ok()
+    })
+}
+
+/// `PointerToRawData` as the loader uses it: rounded down to 512 bytes
+/// whatever the header claims (Peter Ferrie, "Reliable algorithm to extract
+/// overlay of a PE"; goblin's `aligned_pointer_to_raw_data`).
+fn aligned_raw_pointer(section: &goblin::pe::section_table::SectionTable) -> u64 {
+    u64::from(section.pointer_to_raw_data) & !0x1ff
+}
+
+/// How many bytes of `section`, from its RVA, the loader reads from the file:
+/// the raw extent rounded up to the file alignment, capped by the raw and
+/// virtual sizes rounded up to a page. goblin's `section_read_size`, in
+/// overflow-free arithmetic; an invalid alignment leaves the raw extent
+/// unrounded instead of resolving nothing.
+fn file_backed_size(
+    section: &goblin::pe::section_table::SectionTable,
+    file_alignment: Option<u32>,
+) -> u64 {
+    let raw = u64::from(section.size_of_raw_data);
+    if raw == 0 {
+        return 0;
     }
-    None
+    let page = |size: u64| size.next_multiple_of(0x1000);
+    let raw_end = u64::from(section.pointer_to_raw_data) + raw;
+    let raw_end = match file_alignment.filter(|a| a.is_power_of_two()) {
+        Some(alignment) => raw_end.next_multiple_of(u64::from(alignment)),
+        None => raw_end,
+    };
+    let read = (raw_end - aligned_raw_pointer(section)).min(page(raw));
+    match section.virtual_size {
+        0 => read,
+        virtual_size => read.min(page(u64::from(virtual_size))),
+    }
 }
 
 /// PE optional-header checksum. The header carries a stored value; the
@@ -2846,7 +2899,8 @@ fn pe_checksum(data: &[u8], checksum_offset: usize) -> u32 {
     }
     sum = (sum & 0xffff) + (sum >> 16);
     sum += data.len() as u64;
-    sum as u32
+    // The PE checksum is 32 bits wide: the length is added modulo 2^32.
+    (sum & 0xffff_ffff) as u32
 }
 
 /// DOS stub anomalies — the bytes between the MZ header and the PE
@@ -3152,7 +3206,7 @@ fn delay_imports(
                         ordinal: Some(ordinal),
                     });
                 } else {
-                    let name = read_hint_name(pe, bytes, entry as u32);
+                    let name = read_hint_name(pe, bytes, (entry & 0xffff_ffff) as u32);
                     if !name.is_empty() {
                         symbols_out.push(crate::Symbol::Import {
                             name,

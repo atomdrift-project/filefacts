@@ -163,6 +163,8 @@ struct Partition {
 struct Chunk {
     entry_type: u32,
     sector_number: u64,
+    /// Output sectors this chunk decodes to.
+    sector_count: u64,
     comp_offset: u64,
     comp_length: u64,
 }
@@ -171,12 +173,16 @@ struct Chunk {
 /// block table. Returns the partitions in plist order; malformed entries
 /// are skipped rather than failing the whole image.
 fn parse_blkx(bytes: &[u8], koly: &Koly) -> Vec<Partition> {
-    let start = koly.xml_offset as usize;
-    let len = (koly.xml_length as usize).min(MAX_XML);
+    // Compare in u64 before narrowing: on a 32-bit target `as usize` would
+    // wrap a hostile 64-bit offset into a valid one.
+    let Ok(start) = usize::try_from(koly.xml_offset) else {
+        return Vec::new();
+    };
+    let len = usize::try_from(koly.xml_length.min(MAX_XML as u64)).unwrap_or(MAX_XML);
     let Some(xml) = bytes.get(start..start.saturating_add(len)) else {
         return Vec::new();
     };
-    let Ok(plist) = plist::Value::from_reader(std::io::Cursor::new(xml)) else {
+    let Ok(plist) = super::plist_guard::parse(xml) else {
         return Vec::new();
     };
     let Some(blkx) = plist
@@ -230,6 +236,7 @@ fn parse_mish(name: String, data: &[u8]) -> Option<Partition> {
         chunks.push(Chunk {
             entry_type,
             sector_number: u64_be(data, off + 8)?,
+            sector_count: u64_be(data, off + 16)?,
             comp_offset: u64_be(data, off + 24)?,
             comp_length: u64_be(data, off + 32)?,
         });
@@ -384,44 +391,105 @@ fn volume_facts(
     apfs_volume_facts(&prefix, values, metrics);
 }
 
+/// Inflated bytes [`reconstruct_prefix`] decodes across every chunk. The
+/// window is [`MAX_VOL_PREFIX`]; a few times that allows for overlapping
+/// chunks without letting 300,000 descriptors that all name one zlib blob
+/// inflate it 300,000 times.
+const MAX_PREFIX_INFLATE: usize = 4 * MAX_VOL_PREFIX;
+
 /// Decompress the leading `max` bytes of a partition using only the codecs
 /// filefacts carries (`raw`, `zero`, `zlib`). Returns `None` the moment a
 /// chunk inside the window needs a codec we don't have — the volume header
 /// would be unreadable anyway.
+///
+/// Each chunk writes at most its own sector run, the walk stops once every
+/// sector of the window has been written, and zlib output across all chunks
+/// shares [`MAX_PREFIX_INFLATE`]. A chunk that points outside the image or
+/// whose stream is damaged loses only its own sectors.
 fn reconstruct_prefix(bytes: &[u8], koly: &Koly, part: &Partition, max: usize) -> Option<Vec<u8>> {
+    reconstruct_prefix_counted(bytes, koly, part, max).map(|(buf, _)| buf)
+}
+
+/// [`reconstruct_prefix`], also returning how many bytes it inflated.
+fn reconstruct_prefix_counted(
+    bytes: &[u8],
+    koly: &Koly,
+    part: &Partition,
+    max: usize,
+) -> Option<(Vec<u8>, usize)> {
+    let sector = crate::bytes::sat_usize(SECTOR);
     let mut buf = vec![0u8; max];
+    let mut written = vec![false; max.div_ceil(sector)];
+    let mut pending = written.len();
+    let mut inflate_budget = MAX_PREFIX_INFLATE;
+    let fork_base = koly.data_fork_offset.saturating_add(part.data_offset);
     for c in &part.chunks {
-        let out_off = c.sector_number.saturating_mul(SECTOR) as usize;
-        if out_off >= max {
-            continue; // beyond the window — irrelevant to the superblock.
+        if pending == 0 {
+            break;
         }
-        match codec_name(c.entry_type) {
-            "zero" | "ignore" | "comment" | "last" => continue, // already zero-filled
+        let Some(out_off) = c
+            .sector_number
+            .checked_mul(SECTOR)
+            .and_then(|off| usize::try_from(off).ok())
+            .filter(|&off| off < max)
+        else {
+            continue; // beyond the window — irrelevant to the superblock.
+        };
+        let want = usize::try_from(c.sector_count.saturating_mul(SECTOR))
+            .unwrap_or(usize::MAX)
+            .min(max - out_off);
+        let codec = codec_name(c.entry_type);
+        let n = match codec {
+            "zero" | "ignore" => want, // already zero-filled
+            "comment" | "last" => continue,
             "raw" => {
-                let src_off = koly
-                    .data_fork_offset
-                    .saturating_add(part.data_offset)
-                    .saturating_add(c.comp_offset) as usize;
-                let src = bytes.get(src_off..src_off.checked_add(c.comp_length as usize)?)?;
+                let Some(src) = chunk_source(bytes, fork_base, c) else {
+                    continue;
+                };
+                let src = src.get(..want).unwrap_or(src);
                 fill(&mut buf, out_off, src);
+                src.len()
             }
             "zlib" => {
-                let src_off = koly
-                    .data_fork_offset
-                    .saturating_add(part.data_offset)
-                    .saturating_add(c.comp_offset) as usize;
-                let src = bytes.get(src_off..src_off.checked_add(c.comp_length as usize)?)?;
+                if inflate_budget == 0 {
+                    break;
+                }
+                let Some(src) = chunk_source(bytes, fork_base, c) else {
+                    continue;
+                };
                 let mut out = Vec::new();
-                flate2::read::ZlibDecoder::new(src)
-                    .take((max - out_off) as u64)
-                    .read_to_end(&mut out)
-                    .ok()?;
+                // A truncated or corrupt stream keeps what decoded before
+                // the damage; `read_to_end` leaves it in `out`.
+                let _ = flate2::read::ZlibDecoder::new(src)
+                    .take(want.min(inflate_budget) as u64)
+                    .read_to_end(&mut out);
+                inflate_budget -= out.len();
                 fill(&mut buf, out_off, &out);
+                out.len()
             }
             _ => return None, // adc / bzip2 / lzfse / lzma
+        };
+        let first = out_off / sector;
+        let last = out_off
+            .saturating_add(n)
+            .div_ceil(sector)
+            .min(written.len());
+        for done in written.get_mut(first..last).into_iter().flatten() {
+            if !*done {
+                *done = true;
+                pending -= 1;
+            }
         }
     }
-    Some(buf)
+    Some((buf, MAX_PREFIX_INFLATE - inflate_budget))
+}
+
+/// The compressed bytes chunk `c` decodes from, or `None` when they lie
+/// outside the image.
+fn chunk_source<'b>(bytes: &'b [u8], fork_base: u64, c: &Chunk) -> Option<&'b [u8]> {
+    let start = usize::try_from(fork_base.checked_add(c.comp_offset)?).ok()?;
+    let len = usize::try_from(c.comp_length).ok()?;
+    bytes.get(start..start.checked_add(len)?)
 }
 
 /// Copy as much of `src` as fits into `buf` starting at `at`.
@@ -481,9 +549,12 @@ fn hfs_volume_facts(prefix: &[u8], values: &mut Values, metrics: &mut Metrics) -
         metrics.insert(metric!("dmg.volume.timezone_skew_seconds"), (c - m) as f64);
     }
 
-    metrics.insert(metric!("dmg.volume.file_count"), u32_be(vh, 32)? as f64);
-    metrics.insert(metric!("dmg.volume.folder_count"), u32_be(vh, 36)? as f64);
-    metrics.insert(metric!("dmg.volume.block_size"), u32_be(vh, 40)? as f64);
+    metrics.insert(metric!("dmg.volume.file_count"), f64::from(u32_be(vh, 32)?));
+    metrics.insert(
+        metric!("dmg.volume.folder_count"),
+        f64::from(u32_be(vh, 36)?),
+    );
+    metrics.insert(metric!("dmg.volume.block_size"), f64::from(u32_be(vh, 40)?));
     Some(())
 }
 
@@ -591,7 +662,7 @@ fn hfs_to_unix(secs: u32) -> Option<i64> {
 }
 
 fn apfs_ns_to_unix(ns: u64) -> Option<i64> {
-    (ns != 0).then_some((ns / 1_000_000_000) as i64)
+    (ns != 0).then(|| (ns / 1_000_000_000).cast_signed())
 }
 
 /// Read a NUL-terminated UTF-8 string from a fixed-width field, returning
@@ -808,11 +879,108 @@ mod tests {
         assert!(m.get("archive.executable_count").is_none());
     }
 
+    fn zlib(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn zlib_chunk(sector_number: u64, sector_count: u64, comp_length: u64) -> Chunk {
+        Chunk {
+            entry_type: 0x8000_0005,
+            sector_number,
+            sector_count,
+            comp_offset: 0,
+            comp_length,
+        }
+    }
+
+    fn koly_at_zero() -> Koly {
+        Koly {
+            version: 4,
+            data_fork_offset: 0,
+            data_fork_length: 0,
+            xml_offset: 0,
+            xml_length: 0,
+            image_variant: 1,
+            sector_count: 0,
+        }
+    }
+
+    /// Thousands of descriptors naming one zlib blob used to inflate it once
+    /// each, up to the whole window every time. Overlapping chunks now share
+    /// one inflate budget, and each decodes at most its own sector run.
+    #[test]
+    fn overlapping_zlib_chunks_share_one_inflate_budget() {
+        let blob = zlib(&vec![0_u8; MAX_VOL_PREFIX]);
+        let half = (MAX_VOL_PREFIX as u64 / SECTOR) / 2;
+        let part = Partition {
+            name: String::new(),
+            sector_count: half * 2,
+            data_offset: 0,
+            chunks: (0..10_000)
+                .map(|_| zlib_chunk(0, half, blob.len() as u64))
+                .collect(),
+        };
+        let (_, inflated) =
+            reconstruct_prefix_counted(&blob, &koly_at_zero(), &part, MAX_VOL_PREFIX).unwrap();
+        assert_eq!(inflated, MAX_PREFIX_INFLATE);
+    }
+
+    /// A chunk writes no more than its declared sector run.
+    #[test]
+    fn zlib_chunk_output_is_capped_at_its_sector_count() {
+        let blob = zlib(&vec![0xAB_u8; 8 * SECTOR as usize]);
+        let part = Partition {
+            name: String::new(),
+            sector_count: 8,
+            data_offset: 0,
+            chunks: vec![zlib_chunk(0, 1, blob.len() as u64)],
+        };
+        let (buf, inflated) =
+            reconstruct_prefix_counted(&blob, &koly_at_zero(), &part, 8 * SECTOR as usize).unwrap();
+        assert_eq!(inflated, SECTOR as usize);
+        assert!(buf[..SECTOR as usize].iter().all(|&b| b == 0xAB));
+        assert!(buf[SECTOR as usize..].iter().all(|&b| b == 0));
+    }
+
+    /// One chunk pointing outside the image no longer discards the others.
+    #[test]
+    fn bad_chunk_loses_only_its_own_sectors() {
+        let blob = zlib(&[0xCD_u8; SECTOR as usize]);
+        let mut bad = zlib_chunk(1, 1, 64);
+        bad.comp_offset = u64::MAX - 8;
+        let part = Partition {
+            name: String::new(),
+            sector_count: 2,
+            data_offset: 0,
+            chunks: vec![zlib_chunk(0, 1, blob.len() as u64), bad],
+        };
+        let (buf, _) =
+            reconstruct_prefix_counted(&blob, &koly_at_zero(), &part, 2 * SECTOR as usize).unwrap();
+        assert!(buf[..SECTOR as usize].iter().all(|&b| b == 0xCD));
+    }
+
     #[test]
     fn non_dmg_bytes_error() {
         let mut v = Values::new();
         let mut m = Metrics::new();
         let mut members = Vec::new();
         assert!(extract(b"not a dmg at all", &mut v, &mut m, &mut members).is_err());
+    }
+
+    /// The resource-fork plist is attacker bytes: a binary plist whose shared
+    /// references expand exponentially is refused instead of expanded.
+    #[test]
+    fn blkx_plist_reference_expansion_is_refused() {
+        let xml = crate::formats::plist_guard::reference_dag(8);
+        let koly = Koly {
+            xml_length: xml.len() as u64,
+            ..koly_at_zero()
+        };
+        let start = std::time::Instant::now();
+        assert!(parse_blkx(&xml, &koly).is_empty());
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 }

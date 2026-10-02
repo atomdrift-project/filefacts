@@ -11,11 +11,11 @@
 //! Decompression stops as soon as `<root>/PKG-INFO` is reached, so a
 //! multi-megabyte sdist is rarely fully inflated just to read one manifest.
 
-use std::io::Read;
-
-use flate2::read::GzDecoder;
 use serde_json::Value as JsonValue;
 
+use super::bounded::{
+    MAX_TARGZ_SEARCH, MemberFailure, TarGzSearch, find_targz_member, push_limit, utf8_prefix,
+};
 use crate::error::Error;
 use crate::fileid::FileType;
 use crate::output::{ArchiveMember, Errors, Metrics, Stage, ValueKey, Values};
@@ -33,58 +33,44 @@ pub(super) fn extract(
     archive_members: &mut Vec<ArchiveMember>,
     errors: &mut Errors,
 ) -> Result<(), Error> {
-    match pkg_info(bytes) {
+    match pkg_info(bytes, values) {
         Ok(Some(text)) => emit(&text, values),
         // No root `PKG-INFO`: nothing to read, nothing failed.
         Ok(None) => {}
-        Err((stage, why)) => errors.record_malformed(stage, why),
+        Err(failure) => failure.record(errors),
     }
     super::tar::extract(bytes, file_type, values, metrics, archive_members)
 }
 
 /// Read the `<root>/PKG-INFO` metadata from a gzipped sdist tarball;
-/// `Ok(None)` when it has none. Only the leading header block is used, so a
+/// `Ok(None)` when it has none, or when the inflate budget ran out first (a
+/// `python.limits` entry). Only the leading header block is used, so a
 /// `PKG-INFO` past the cap is read as its first `MAX_MANIFEST` bytes (to the
-/// last whole character) rather than refused. On failure, the stage it
-/// failed in and why: the tarball would not decompress, or `PKG-INFO` is
-/// not UTF-8.
-fn pkg_info(bytes: &[u8]) -> Result<Option<String>, (Stage, String)> {
-    let walk = |e: std::io::Error| {
-        (
-            Stage::TarParse,
-            format!("tarball unreadable before <root>/PKG-INFO: {e}"),
-        )
-    };
-    let mut archive = tar::Archive::new(GzDecoder::new(bytes));
-    for entry in archive.entries().map_err(walk)? {
-        let mut entry = entry.map_err(walk)?;
-        let Some(path) = entry.path().ok().map(|p| p.to_string_lossy().into_owned()) else {
-            continue;
-        };
+/// last whole character) rather than refused. Fails when the tarball would
+/// not decompress, or `PKG-INFO` is not UTF-8.
+fn pkg_info(bytes: &[u8], values: &mut Values) -> Result<Option<String>, MemberFailure> {
+    const SOUGHT: &str = "<root>/PKG-INFO";
+    let is_pkg_info = |path: &str| {
         let trimmed = path.trim_end_matches('/');
-        if !(trimmed.ends_with("/PKG-INFO") && trimmed.split('/').count() == 2) {
-            continue;
+        trimmed.ends_with("/PKG-INFO") && trimmed.split('/').count() == 2
+    };
+    let (path, prefix) = match find_targz_member(bytes, is_pkg_info, MAX_MANIFEST) {
+        Ok(TarGzSearch::Found { path, prefix }) => (path, prefix),
+        Ok(TarGzSearch::Absent) => return Ok(None),
+        Ok(TarGzSearch::InflateCapped) => {
+            push_limit(
+                values,
+                value_key!("python.limits"),
+                "pkg-info-search",
+                format!("no {SOUGHT} in the first {MAX_TARGZ_SEARCH} inflated bytes"),
+            );
+            return Ok(None);
         }
-        let mut buf = Vec::new();
-        (&mut entry)
-            .take(MAX_MANIFEST + 1)
-            .read_to_end(&mut buf)
-            .map_err(|e| (Stage::TarParse, format!("{path}: {e}")))?;
-        let capped = buf.len() as u64 > MAX_MANIFEST;
-        buf.truncate(MAX_MANIFEST as usize);
-        return match String::from_utf8(buf) {
-            Ok(text) => Ok(Some(text)),
-            // The cap cut a multi-byte character in two: not the file's fault.
-            Err(e) if capped && e.utf8_error().error_len().is_none() => {
-                let valid = e.utf8_error().valid_up_to();
-                let mut bytes = e.into_bytes();
-                bytes.truncate(valid);
-                Ok(String::from_utf8(bytes).ok())
-            }
-            Err(e) => Err((Stage::FormatExtract, format!("{path}: not UTF-8: {e}"))),
-        };
-    }
-    Ok(None)
+        Err(e) => return Err(e.into_failure(Stage::TarParse, SOUGHT)),
+    };
+    utf8_prefix(prefix)
+        .map(Some)
+        .map_err(|e| MemberFailure::new(Stage::FormatExtract, format!("{path}: not UTF-8"), e))
 }
 
 /// Emit `python.*` identity values from a parsed `PKG-INFO` header block.
@@ -229,7 +215,7 @@ mod tests {
     }
 
     /// The one recorded error's stage and kind.
-    fn only_error(errors: &Errors) -> (Stage, crate::ErrorKind) {
+    fn only_error(errors: &Errors) -> (Stage, crate::DiagnosticKind) {
         assert_eq!(errors.len(), 1, "{errors:?}");
         (errors.as_slice()[0].stage, errors.as_slice()[0].kind)
     }
@@ -252,7 +238,7 @@ mod tests {
         let (v, e) = run(&tgz(&[("demo-1.0/PKG-INFO", b"Name: d\xe9mo\n")]));
         assert_eq!(
             only_error(&e),
-            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+            (Stage::FormatExtract, crate::DiagnosticKind::Malformed)
         );
         assert!(v.get("python.name").is_none());
     }
@@ -266,7 +252,7 @@ mod tests {
         let (_, e) = run(&bytes);
         assert_eq!(
             only_error(&e),
-            (Stage::TarParse, crate::ErrorKind::Malformed)
+            (Stage::TarParse, crate::DiagnosticKind::Malformed)
         );
     }
 

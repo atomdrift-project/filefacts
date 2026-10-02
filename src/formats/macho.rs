@@ -15,26 +15,25 @@ use crate::value_key;
 use goblin::mach::{self, Mach, MachO};
 use serde_json::Value as JsonValue;
 
-use crate::error::Error;
 use crate::formats::common::{
-    NativeFormat, XorScan, extract_binary_strings, extract_binary_strings_from_object,
+    NativeFormat, RizinTarget, XorScan, extract_binary_strings, extract_binary_strings_from_object,
     plist_to_json, put_str, put_u64, rizin_fallback, section_entropy,
 };
 use crate::formats::goblin_safe;
-use crate::output::{Errors, Metrics, Section, Strings, ValueKey, Values};
+use crate::output::{Errors, Metrics, Section, SectionFlag, ValueKey, Values};
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn extract(
-    bytes: &[u8],
-    values: &mut Values,
-    strings: &mut Strings,
-    metrics: &mut Metrics,
-    sections_out: &mut Vec<Section>,
-    symbols_out: &mut crate::Symbols,
-    errors_out: &mut Errors,
-    image_end: &mut Option<u64>,
-    rizin: &crate::rizin::Settings,
-) -> Result<(), Error> {
+pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
+    let super::ExtractCtx {
+        values,
+        strings,
+        metrics,
+        sections: sections_out,
+        symbols: symbols_out,
+        errors: errors_out,
+        image_end,
+        ref rizin,
+        ..
+    } = ctx;
     // Wrap goblin parse in catch_unwind. Fat-header arithmetic
     // overflow on malformed Mach-O has historically panicked
     // goblin; record the failure and return Ok so byte-level
@@ -47,13 +46,13 @@ pub(super) fn extract(
             extract_binary_strings(bytes, strings, XorScan::Yes);
             errors_out.record_malformed(crate::Stage::MachoParse, e.to_string());
             metrics.insert(metric!("macho.parse_failed"), 1.0);
-            return Ok(());
+            return;
         }
         goblin_safe::GoblinOutcome::Panicked(msg) => {
             extract_binary_strings(bytes, strings, XorScan::Yes);
             errors_out.record_panic(crate::Stage::MachoParse, msg);
             metrics.insert(metric!("macho.parse_panicked"), 1.0);
-            return Ok(());
+            return;
         }
     };
     // A fat header claiming more entries than the file can hold is not a
@@ -87,7 +86,15 @@ pub(super) fn extract(
     let mut native_rizin_range: Option<(usize, usize)> = None;
     let (go_pclntab, go_rodata) = match parsed {
         Mach::Binary(macho) => {
-            single_arch(&macho, bytes, values, metrics, sections_out, symbols_out);
+            single_arch(
+                &macho,
+                bytes,
+                values,
+                metrics,
+                sections_out,
+                symbols_out,
+                errors_out,
+            );
             *image_end = Some(image_end_of(&macho));
             macho_go_sections(&macho)
         }
@@ -121,14 +128,16 @@ pub(super) fn extract(
     let has_go_pclntab = go_pclntab.is_some_and(super::go_buildinfo::has_pclntab_magic);
     if fat_table_fits {
         rizin_fallback(
-            NativeFormat::MachO,
-            rizin_bytes,
-            strings,
+            RizinTarget {
+                format: NativeFormat::MachO,
+                bytes: rizin_bytes,
+                strings,
+                go_function_metadata: has_go_pclntab,
+                settings: rizin,
+            },
             sections_out,
             symbols_out,
             metrics,
-            has_go_pclntab,
-            rizin,
         );
     }
     super::upx::detect(bytes, values);
@@ -138,7 +147,6 @@ pub(super) fn extract(
         rodata: go_rodata,
     };
     super::go_buildinfo::detect(bytes, values, value_key!("macho.go"), None, &go_sections);
-    Ok(())
 }
 
 /// A segment's sections, which goblin reads lazily from the load command on
@@ -282,6 +290,7 @@ fn fat_binary(
                 metrics,
                 sections_out,
                 symbols_out,
+                errors_out,
             );
             // Unified sections address the whole input; load-command offsets
             // address the slice. Entropy was already computed on slice bytes.
@@ -390,7 +399,12 @@ fn analyze_slice(macho: &MachO<'_>, slice_bytes: &[u8]) -> JsonValue {
         &mut slice_values,
         &mut throwaway_metrics,
     );
-    extract_symbols(macho, slice_bytes, &mut throwaway_symbols);
+    extract_symbols(
+        macho,
+        slice_bytes,
+        &mut throwaway_symbols,
+        &mut Errors::new(),
+    );
     super::macho_hashes::emit(macho, &mut slice_values, &throwaway_symbols);
 
     let import_count = throwaway_symbols.iter_kind(SymbolKind::Import).count() as u64;
@@ -434,10 +448,11 @@ fn single_arch(
     metrics: &mut Metrics,
     sections_out: &mut Vec<Section>,
     symbols_out: &mut crate::Symbols,
+    errors_out: &mut Errors,
 ) {
     extract_sections(macho, bytes, metrics, sections_out);
     extract_header_and_loads(macho, bytes, values, metrics);
-    extract_symbols(macho, bytes, symbols_out);
+    extract_symbols(macho, bytes, symbols_out, errors_out);
     super::macho_hashes::emit(macho, values, symbols_out);
     super::build_toolchain::from_macho(values, sections_out);
 }
@@ -448,8 +463,14 @@ fn single_arch(
 /// Two source tags distinguish how the entry was discovered:
 /// `macho-bind` for two-level-namespace bind imports (carrying the
 /// resolving dylib stem), `macho-trie` for exports recovered from
-/// the dyld export trie.
-fn extract_symbols(macho: &MachO<'_>, bytes: &[u8], symbols_out: &mut crate::Symbols) {
+/// the dyld export trie. A bind stream or export trie refused as hostile
+/// yields no entries and is recorded in `errors`.
+fn extract_symbols(
+    macho: &MachO<'_>,
+    bytes: &[u8],
+    symbols_out: &mut crate::Symbols,
+    errors: &mut Errors,
+) {
     // Map each undefined external symbol to the file offset of its name in
     // the `LC_SYMTAB` string table. goblin's `Import::offset` is the dyld
     // *bind* slot (a pointer in `__got`/`__DATA`, binary data), but every
@@ -470,10 +491,21 @@ fn extract_symbols(macho: &MachO<'_>, bytes: &[u8], symbols_out: &mut crate::Sym
     // (mach/imports.rs:103) and panics on a malformed one. LLVM's test corpus
     // is full of deliberately malformed Mach-O, and a panic on a rayon worker
     // took down the whole scan of llvm-toolchain-17 (142MB) with SIGSEGV.
-    // `extract_symbols` has no error sink, so a panic here is contained by
-    // yielding no imports rather than being recorded; the parse-level
-    // `macho.parse_panicked` path already covers reporting.
-    if let goblin_safe::GoblinOutcome::Ok(imports) = goblin_safe::catch(|| macho.imports()) {
+    // A panic here yields no imports and is recorded in `errors`.
+    // The opcodes are counted first: a forged repeat count makes goblin
+    // allocate billions of imports, and `catch` cannot stop an out-of-memory
+    // abort (see `validate_bind_opcodes`).
+    let imports = match goblin_safe::validate_bind_opcodes(macho, bytes) {
+        Ok(()) => goblin_safe::catch(|| macho.imports()),
+        Err(reason) => {
+            errors.record_malformed(crate::Stage::MachoParse, reason.to_string());
+            goblin_safe::GoblinOutcome::Failed(goblin::error::Error::Malformed(reason.to_string()))
+        }
+    };
+    if let goblin_safe::GoblinOutcome::Panicked(msg) = &imports {
+        errors.record_panic(crate::Stage::MachoParse, msg.clone());
+    }
+    if let goblin_safe::GoblinOutcome::Ok(imports) = imports {
         for imp in &imports {
             let library = normalize_dylib_path(imp.dylib);
             // Prefer the name-string offset; fall back to the bind slot
@@ -538,10 +570,13 @@ fn extract_symbols(macho: &MachO<'_>, bytes: &[u8], symbols_out: &mut crate::Sym
     let exports = match goblin_safe::validate_export_trie(macho, bytes) {
         Ok(()) => goblin_safe::catch(|| macho.exports()),
         Err(reason) => {
-            tracing::debug!(%reason, "skipping Mach-O exports: malformed export trie");
+            errors.record_malformed(crate::Stage::MachoParse, reason.to_string());
             goblin_safe::GoblinOutcome::Failed(goblin::error::Error::Malformed(reason.to_string()))
         }
     };
+    if let goblin_safe::GoblinOutcome::Panicked(msg) = &exports {
+        errors.record_panic(crate::Stage::MachoParse, msg.clone());
+    }
     if let goblin_safe::GoblinOutcome::Ok(exports) = exports {
         for exp in &exports {
             symbols_out.push(crate::Symbol::Export {
@@ -703,11 +738,10 @@ fn extract_sections(
                 .iter()
                 .copied()
                 .chain(std::iter::once(if contains_instructions {
-                    "code"
+                    SectionFlag::Code
                 } else {
-                    "data"
+                    SectionFlag::Data
                 }))
-                .map(str::to_string)
                 .collect();
             sections_out.push(Section {
                 name: display,
@@ -723,19 +757,16 @@ fn extract_sections(
     }
 }
 
-fn macho_segment_flags(initprot: u32) -> Vec<&'static str> {
+fn macho_segment_flags(initprot: u32) -> Vec<SectionFlag> {
     // VM_PROT_READ = 1, VM_PROT_WRITE = 2, VM_PROT_EXECUTE = 4.
-    let mut out = Vec::new();
-    if initprot & 1 != 0 {
-        out.push("readable");
-    }
-    if initprot & 2 != 0 {
-        out.push("writable");
-    }
-    if initprot & 4 != 0 {
-        out.push("executable");
-    }
-    out
+    [
+        (1, SectionFlag::Readable),
+        (2, SectionFlag::Writable),
+        (4, SectionFlag::Executable),
+    ]
+    .into_iter()
+    .filter_map(|(bit, flag)| (initprot & bit != 0).then_some(flag))
+    .collect()
 }
 
 fn extract_header_and_loads(
@@ -1196,30 +1227,12 @@ fn function_starts(macho: &MachO<'_>, bytes: &[u8], values: &mut Values, metrics
     let Some(data) = bytes.get(start..end) else {
         return;
     };
+    // One ULEB128 delta per function. Zero is the stream terminator and
+    // signals end-of-table (any padding bytes after it are ignored); a
+    // truncated or over-long delta ends the table too.
     let mut count: u64 = 0;
     let mut i = 0usize;
-    while i < data.len() {
-        // Read one ULEB128. Zero is the stream terminator and
-        // signals end-of-table (any padding bytes after it are
-        // ignored).
-        let mut value: u64 = 0;
-        let mut shift = 0u32;
-        let mut consumed = 0usize;
-        while let Some(&b) = data.get(i + consumed) {
-            consumed += 1;
-            value |= u64::from(b & 0x7f) << shift;
-            if b & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-            if shift > 63 {
-                break;
-            }
-        }
-        i += consumed;
-        if value == 0 {
-            break;
-        }
+    while super::common::read_uleb128(data, &mut i).is_some_and(|delta| delta != 0) {
         count += 1;
     }
     metrics.insert(metric!("macho.function_starts_count"), count as f64);
@@ -1773,7 +1786,7 @@ fn info_plist_section(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
     }
 }
 
-/// Upper bound on the bytes we hand to `plist::Value::from_reader` for
+/// Upper bound on the bytes we hand to `plist_guard::parse` for
 /// `__info_plist` / `__launchd_plist` sections. Real binaries carry at
 /// most a few hundred KiB; capping prevents an oversized embedded
 /// plist from forcing megabytes of attacker XML through the parser.
@@ -1810,7 +1823,7 @@ fn emit_embedded_plist(
             let Some(plist_bytes) = bytes.get(off..end) else {
                 return;
             };
-            if let Ok(parsed) = plist::Value::from_reader(std::io::Cursor::new(plist_bytes)) {
+            if let Ok(parsed) = super::plist_guard::parse(plist_bytes) {
                 values.insert_key(key, plist_to_json(parsed, 0));
             }
             return;
@@ -1951,7 +1964,9 @@ fn cpu_type_string(cpu_type: u32) -> &'static str {
 /// carries the family value; the high byte holds capability flags
 /// (`CPU_SUBTYPE_MASK`) we strip before matching.
 fn cpu_kind_string(cpu_type: u32, cpu_subtype: u32) -> &'static str {
-    let sub = (cpu_subtype & 0x00ff_ffff) as u8;
+    // Match the masked 24-bit value: narrowing it to a byte would alias a
+    // subtype like 0x102 onto 2 (arm64e).
+    let sub = cpu_subtype & 0x00ff_ffff;
     match (cpu_type, sub) {
         (0x0100_000c, 0) => "arm64",
         (0x0100_000c, 1) => "arm64v8",

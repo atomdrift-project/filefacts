@@ -22,17 +22,18 @@
 //! corresponding field rather than emitting an MD5 of empty string.
 
 use goblin::mach::MachO;
-use md5::{Digest, Md5};
 use serde_json::Value as JsonValue;
 
-use crate::formats::common::{hex_encode, put_str};
-use crate::output::{Symbol, SymbolKind, Symbols, Values};
+use super::symbol_hashes::{export_hash, imphash, md5_of_set};
+use crate::formats::common::put_str;
+use crate::output::{Symbols, Values};
 use crate::value_key;
 
 /// Populate `macho.hashes.*` from the parsed Mach-O plus the unified
 /// symbols view (which the imports/exports extractor has already
 /// filled in).
 pub(super) fn emit(macho: &MachO<'_>, values: &mut Values, symbols: &Symbols) {
+    // imphash: imported function names; export_hash: export-trie names.
     if let Some(h) = imphash(symbols) {
         put_str(values, value_key!("macho.hashes.imphash"), h);
     }
@@ -50,57 +51,18 @@ pub(super) fn emit(macho: &MachO<'_>, values: &mut Values, symbols: &Symbols) {
     }
 }
 
-/// MD5 of the sorted, lowercased, dedup'd imported-function names,
-/// comma-joined. `None` when no imports were recovered.
-fn imphash(symbols: &Symbols) -> Option<String> {
-    let mut names: Vec<String> = symbols
-        .iter_kind(SymbolKind::Import)
-        .filter_map(|s| match s {
-            Symbol::Import { name, .. } => Some(name.to_ascii_lowercase()),
-            _ => None,
-        })
-        .collect();
-    if names.is_empty() {
-        return None;
-    }
-    names.sort();
-    names.dedup();
-    Some(md5_of_csv(&names))
-}
-
 /// MD5 of the sorted, lowercased dylib paths (every `LC_LOAD_*_DYLIB`
 /// kind), comma-joined. Excludes goblin's `"self"` pseudo-entry and
 /// any empty slot. `None` when no dylibs are referenced.
 fn dylib_hash(macho: &MachO<'_>) -> Option<String> {
-    let mut names: Vec<String> = macho
-        .libs
-        .iter()
-        .filter(|s| !s.is_empty() && **s != "self")
-        .map(|s| s.to_ascii_lowercase())
-        .collect();
-    if names.is_empty() {
-        return None;
-    }
-    names.sort();
-    names.dedup();
-    Some(md5_of_csv(&names))
-}
-
-/// MD5 of the sorted, lowercased, dedup'd export-trie names.
-fn export_hash(symbols: &Symbols) -> Option<String> {
-    let mut names: Vec<String> = symbols
-        .iter_kind(SymbolKind::Export)
-        .filter_map(|s| match s {
-            Symbol::Export { name, .. } => Some(name.to_ascii_lowercase()),
-            _ => None,
-        })
-        .collect();
-    if names.is_empty() {
-        return None;
-    }
-    names.sort();
-    names.dedup();
-    Some(md5_of_csv(&names))
+    md5_of_set(
+        macho
+            .libs
+            .iter()
+            .filter(|s| !s.is_empty() && **s != "self")
+            .map(|s| s.to_ascii_lowercase())
+            .collect(),
+    )
 }
 
 /// Anomali Labs' Mach-O symhash. Reads the static `LC_SYMTAB` and
@@ -132,12 +94,7 @@ fn symhash(macho: &MachO<'_>) -> Option<String> {
         }
         names.push(name.to_string());
     }
-    if names.is_empty() {
-        return None;
-    }
-    names.sort();
-    names.dedup();
-    Some(md5_of_csv(&names))
+    md5_of_set(names)
 }
 
 /// MD5 of the sorted, lowercased entitlement keys plus any string
@@ -160,39 +117,5 @@ fn entitlement_hash(values: &Values) -> Option<String> {
             }
         }
     }
-    if tokens.is_empty() {
-        return None;
-    }
-    tokens.sort();
-    tokens.dedup();
-    Some(md5_of_csv(&tokens))
-}
-
-fn md5_of_csv(parts: &[String]) -> String {
-    let joined = parts.join(",");
-    let digest = Md5::digest(joined.as_bytes());
-    hex_encode(&digest)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::md5_of_csv;
-
-    #[test]
-    fn known_md5_vector() {
-        // MD5("a,b,c") = a44c56c8177e32d3613988f4dba7962e — the
-        // construction is "sort, dedup, lowercase, comma-join, md5";
-        // here we exercise the comma-join + md5 step alone.
-        assert_eq!(
-            md5_of_csv(&["a".into(), "b".into(), "c".into()]),
-            "a44c56c8177e32d3613988f4dba7962e"
-        );
-    }
-
-    #[test]
-    fn empty_input_hashes_empty_string() {
-        // MD5("") = d41d8cd98f00b204e9800998ecf8427e — sanity check
-        // that the helper itself doesn't synthesise input.
-        assert_eq!(md5_of_csv(&[]), "d41d8cd98f00b204e9800998ecf8427e");
-    }
+    md5_of_set(tokens)
 }

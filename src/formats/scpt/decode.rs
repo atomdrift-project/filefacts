@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::output::{ExtractedString, Literals};
+use crate::output::{Literal, LiteralEncoding, LiteralMethod, Literals};
 
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STRING: usize = 256 * 1024;
@@ -11,7 +11,7 @@ const MAX_STRINGS: usize = 4096;
 struct Origin {
     start: u64,
     end: u64,
-    anchor: usize,
+    anchor: u64,
 }
 
 fn inputs(literals: &Literals, budget: usize) -> (Vec<stng::ExtractedString>, Vec<Origin>, bool) {
@@ -23,8 +23,8 @@ fn inputs(literals: &Literals, budget: usize) -> (Vec<stng::ExtractedString>, Ve
     let mut seen = BTreeSet::new();
     for literal in literals.iter() {
         if !matches!(
-            literal.method.as_deref(),
-            Some("scpt-literal" | "scpt-constant")
+            literal.method,
+            Some(LiteralMethod::ScptLiteral | LiteralMethod::ScptConstant)
         ) || literal.text.is_empty()
             || !seen.insert((literal.offset, literal.text.as_str()))
         {
@@ -55,17 +55,17 @@ fn inputs(literals: &Literals, budget: usize) -> (Vec<stng::ExtractedString>, Ve
     (rows, origins, limited)
 }
 
-fn method(method: stng::StringMethod) -> Option<&'static str> {
+fn method(method: stng::StringMethod) -> Option<LiteralMethod> {
     use stng::StringMethod as M;
     Some(match method {
-        M::Base64Decode => "scpt-base64",
-        M::Base64ObfuscatedDecode => "scpt-base64-obf",
-        M::HexDecode => "scpt-hex",
-        M::UrlDecode => "scpt-url",
-        M::UnicodeEscapeDecode => "scpt-unicode-escape",
-        M::Base32Decode => "scpt-base32",
-        M::Base85Decode => "scpt-base85",
-        M::Rot13Base64Decode => "scpt-rot13-base64",
+        M::Base64Decode => LiteralMethod::ScptBase64,
+        M::Base64ObfuscatedDecode => LiteralMethod::ScptBase64Obf,
+        M::HexDecode => LiteralMethod::ScptHex,
+        M::UrlDecode => LiteralMethod::ScptUrl,
+        M::UnicodeEscapeDecode => LiteralMethod::ScptUnicodeEscape,
+        M::Base32Decode => LiteralMethod::ScptBase32,
+        M::Base85Decode => LiteralMethod::ScptBase85,
+        M::Rot13Base64Decode => LiteralMethod::ScptRot13Base64,
         _ => return None,
     })
 }
@@ -102,13 +102,11 @@ pub(super) fn recover(literals: &mut Literals) -> (usize, bool) {
         }
         remaining -= decoded.value.len();
         count += 1;
-        literals.push(ExtractedString {
-            text: decoded.value,
-            offset: origin.anchor,
-            method: Some(method.into()),
-            encoding: Some("utf8".into()),
-            ..Default::default()
-        });
+        literals.push(
+            Literal::new(decoded.value, origin.anchor)
+                .with_method(method)
+                .with_encoding(LiteralEncoding::Utf8),
+        );
     }
     (count, limited)
 }
@@ -120,29 +118,24 @@ mod tests {
     const ENCODED: &str = "cHJpbnRmICclc1xuJyAnU0NQVF9CQVNFNjRfT0sn";
     const COMMAND: &str = "printf '%s\\n' 'SCPT_BASE64_OK'";
 
-    fn literal(text: &str, offset: usize, method: &str) -> ExtractedString {
-        ExtractedString {
-            text: text.into(),
-            offset,
-            method: Some(method.into()),
-            ..Default::default()
-        }
+    fn literal(text: &str, offset: u64, method: LiteralMethod) -> Literal {
+        Literal::new(text, offset).with_method(method)
     }
 
     #[test]
     fn stored_and_reconstructed_base64_keep_their_anchor() {
-        for source in ["scpt-literal", "scpt-constant"] {
+        for source in [LiteralMethod::ScptLiteral, LiteralMethod::ScptConstant] {
             let mut literals = Literals::new();
             literals.push(literal(ENCODED, 100, source));
             assert_eq!(recover(&mut literals), (1, false));
             assert!(
                 literals
                     .iter()
-                    .any(|s| s.text == ENCODED && s.method.as_deref() == Some(source))
+                    .any(|s| s.text == ENCODED && s.method == Some(source))
             );
             assert!(literals.iter().any(|s| s.text == COMMAND
                 && s.offset == 100
-                && s.method.as_deref() == Some("scpt-base64")));
+                && s.method == Some(LiteralMethod::ScptBase64)));
             assert_eq!(
                 recover(&mut literals),
                 (0, false),
@@ -158,7 +151,7 @@ mod tests {
             literals.push(literal(
                 &format!("echo {ENCODED} | base64 -D"),
                 anchor,
-                "scpt-literal",
+                LiteralMethod::ScptLiteral,
             ));
         }
         recover(&mut literals);
@@ -173,8 +166,12 @@ mod tests {
     #[test]
     fn ordinary_and_invalid_literals_do_not_become_commands() {
         let mut ordinary = Literals::new();
-        ordinary.push(literal("Hello World", 100, "scpt-literal"));
-        ordinary.push(literal("!!!!!not base64!!!!!", 200, "scpt-literal"));
+        ordinary.push(literal("Hello World", 100, LiteralMethod::ScptLiteral));
+        ordinary.push(literal(
+            "!!!!!not base64!!!!!",
+            200,
+            LiteralMethod::ScptLiteral,
+        ));
         assert_eq!(recover(&mut ordinary), (0, false));
         assert_eq!(ordinary.len(), 2);
     }
@@ -183,20 +180,24 @@ mod tests {
     fn decoder_inputs_are_bounded_and_deduplicated() {
         let mut literals = Literals::new();
         for _ in 0..100 {
-            literals.push(literal(ENCODED, 100, "scpt-literal"));
+            literals.push(literal(ENCODED, 100, LiteralMethod::ScptLiteral));
         }
         let (rows, _, limited) = inputs(&literals, ENCODED.len());
         assert_eq!(rows.len(), 1);
         assert!(!limited);
-        literals.push(literal(ENCODED, 200, "scpt-literal"));
+        literals.push(literal(ENCODED, 200, LiteralMethod::ScptLiteral));
         assert!(inputs(&literals, ENCODED.len()).2);
         let mut large = Literals::new();
-        large.push(literal(&"A".repeat(MAX_STRING + 1), 300, "scpt-literal"));
+        large.push(literal(
+            &"A".repeat(MAX_STRING + 1),
+            300,
+            LiteralMethod::ScptLiteral,
+        ));
         assert!(inputs(&large, MAX_BYTES).0.is_empty());
         assert!(inputs(&large, MAX_BYTES).2);
         let mut many = Literals::new();
         for anchor in 0..=MAX_STRINGS {
-            many.push(literal(ENCODED, anchor, "scpt-literal"));
+            many.push(literal(ENCODED, anchor as u64, LiteralMethod::ScptLiteral));
         }
         let (rows, _, limited) = inputs(&many, MAX_BYTES);
         assert_eq!(rows.len(), MAX_STRINGS);

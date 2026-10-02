@@ -19,7 +19,7 @@ fn run(bytes: &[u8]) -> (Values, Metrics) {
     let mut v = Values::new();
     let mut s = Strings::default();
     let mut m = Metrics::new();
-    extract(bytes, &mut v, &mut s, &mut m).unwrap();
+    extract(bytes, &mut v, &mut s, &mut m);
     (v, m)
 }
 
@@ -181,6 +181,47 @@ fn detects_unknown_chunks() {
         .unwrap();
     assert_eq!(unk.len(), 1);
     assert_eq!(unk[0].as_str(), Some("sTeG"));
+}
+
+/// A file of many distinct non-standard chunk types used to dedup each one
+/// against every earlier type: 100,000 of them took seven seconds. The
+/// types are still counted; the listings are capped and say so.
+#[test]
+fn many_distinct_unknown_chunks_are_listed_up_to_caps() {
+    let types: Vec<[u8; 4]> = (0..20_000_u32)
+        .map(|n| {
+            let letter = |k: u32| b'a' + (k % 26) as u8;
+            [b'q', letter(n / 676), letter(n / 26), letter(n)]
+        })
+        .collect();
+    let chunks: Vec<(&[u8; 4], &[u8])> = types.iter().map(|t| (t, &[][..])).collect();
+    let png = build_png(&chunks);
+    let (v, m) = run(&png);
+    assert_eq!(m.get("png.chunk_count"), Some(20_000.0));
+    assert_eq!(m.get("png.unknown_chunk_count"), Some(20_000.0));
+    let unknown = v
+        .get("png.unknown_chunks")
+        .and_then(|x| x.as_array())
+        .unwrap();
+    assert_eq!(unknown.len(), MAX_LISTED_UNKNOWN);
+    let listed = v.get("png.chunks").and_then(|x| x.as_array()).unwrap();
+    assert_eq!(listed.len(), MAX_LISTED_CHUNKS);
+    let limits = v.get("png.limits").and_then(|x| x.as_array()).unwrap();
+    assert_eq!(limits[0]["stage"].as_str(), Some("chunk-list"));
+}
+
+/// Repeats of one unknown type list it once.
+#[test]
+fn repeated_unknown_chunk_type_is_listed_once() {
+    let chunks: Vec<(&[u8; 4], &[u8])> = (0..1000).map(|_| (b"sTeG", &[][..])).collect();
+    let (v, m) = run(&build_png(&chunks));
+    let unknown = v
+        .get("png.unknown_chunks")
+        .and_then(|x| x.as_array())
+        .unwrap();
+    assert_eq!(unknown.len(), 1);
+    assert_eq!(m.get("png.unknown_chunk_count"), Some(1000.0));
+    assert!(v.get("png.limits").is_none());
 }
 
 #[test]

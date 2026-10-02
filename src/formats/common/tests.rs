@@ -378,3 +378,15 @@ fn malformed_utf16_bom_batch_reaches_the_public_text_view() {
         "source fallback must retain malformed BOM-wrapped batch text"
     );
 }
+
+#[test]
+fn affix_checks_ignore_ascii_case() {
+    assert!(super::ends_with_ci("word/document.XML", ".xml"));
+    assert!(super::ends_with_ci(".xml", ".xml"));
+    assert!(!super::ends_with_ci("xml", ".xml"));
+    assert!(!super::ends_with_ci("doc.xmlx", ".xml"));
+    // A multi-byte character just before the suffix is not split.
+    assert!(super::ends_with_ci("é.SF", ".sf"));
+    assert!(super::starts_with_ci("meta-inf/CERT.SF", "META-INF/"));
+    assert!(!super::starts_with_ci("META", "META-INF/"));
+}

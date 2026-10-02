@@ -41,7 +41,7 @@ impl From<(u64, u64)> for Span {
 /// One place for the adjacency arithmetic that every located metric needs, so
 /// the off-by-one lives (or doesn't) in exactly one tested spot.
 #[derive(Debug, Clone)]
-pub struct SpanBuilder {
+pub(crate) struct SpanBuilder {
     spans: Vec<Span>,
     cap: usize,
 }
@@ -49,7 +49,7 @@ pub struct SpanBuilder {
 impl SpanBuilder {
     /// A builder that keeps at most `cap` coalesced runs.
     #[must_use]
-    pub fn with_cap(cap: usize) -> Self {
+    pub(crate) fn with_cap(cap: usize) -> Self {
         Self {
             spans: Vec::new(),
             cap,
@@ -59,7 +59,7 @@ impl SpanBuilder {
     /// Add a `[offset, offset+len)` span. Zero-length spans are ignored.
     /// Adjacent to the previous run → extends it; otherwise a new run (subject
     /// to the cap).
-    pub fn push(&mut self, offset: u64, len: u64) {
+    pub(crate) fn push(&mut self, offset: u64, len: u64) {
         if len == 0 {
             return;
         }
@@ -74,15 +74,9 @@ impl SpanBuilder {
         }
     }
 
-    /// True when no spans have been recorded.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.spans.is_empty()
-    }
-
     /// Consume the builder, yielding the coalesced runs.
     #[must_use]
-    pub fn into_spans(self) -> Vec<Span> {
+    pub(crate) fn into_spans(self) -> Vec<Span> {
         self.spans
     }
 }
@@ -123,6 +117,6 @@ mod tests {
     fn zero_length_is_ignored() {
         let mut b = SpanBuilder::with_cap(4);
         b.push(5, 0);
-        assert!(b.is_empty());
+        assert!(b.into_spans().is_empty());
     }
 }

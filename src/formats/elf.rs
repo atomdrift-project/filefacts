@@ -11,30 +11,29 @@ use goblin::elf::note::{Note, NoteIterator};
 use goblin::elf::{Elf, dynamic, header, program_header};
 use serde_json::Value as JsonValue;
 
-use crate::error::Error;
 use crate::formats::common::bytes_at::{u32_le, u64_le};
 use crate::formats::common::{
-    NativeFormat, XorScan, extract_binary_strings, extract_binary_strings_from_object, hex_encode,
-    put_str, put_u64, rizin_fallback, section_entropy,
+    NativeFormat, RizinTarget, XorScan, extract_binary_strings, extract_binary_strings_from_object,
+    hex_encode, put_str, put_u64, rizin_fallback, section_entropy,
 };
 use crate::formats::goblin_safe;
-use crate::output::{Errors, Metrics, Section, Strings, Values};
+use crate::output::{Errors, Metrics, Section, SectionFlag, Values};
 
 /// Longest section name copied into the sections view, in chars.
 const MAX_SECTION_NAME: usize = 256;
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn extract(
-    bytes: &[u8],
-    values: &mut Values,
-    strings: &mut Strings,
-    metrics: &mut Metrics,
-    sections_out: &mut Vec<Section>,
-    symbols_out: &mut crate::Symbols,
-    errors_out: &mut Errors,
-    image_end: &mut Option<u64>,
-    rizin: &crate::rizin::Settings,
-) -> Result<(), Error> {
+pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
+    let super::ExtractCtx {
+        values,
+        strings,
+        metrics,
+        sections: sections_out,
+        symbols: symbols_out,
+        errors: errors_out,
+        image_end,
+        ref rizin,
+        ..
+    } = ctx;
     // Wrap goblin parse in catch_unwind. ELF's dynamic-section
     // walker has panicked on malformed `DT_*` tables; `parse_elf`
     // turns a panic into a normal failure here. We record the
@@ -61,14 +60,14 @@ pub(super) fn extract(
                 extract_binary_strings(bytes, strings, XorScan::Yes);
                 errors_out.record_malformed(crate::Stage::ElfParse, e.to_string());
                 metrics.insert(metric!("elf.parse_failed"), 1.0);
-                return Ok(());
+                return;
             }
         }
         goblin_safe::GoblinOutcome::Panicked(msg) => {
             extract_binary_strings(bytes, strings, XorScan::Yes);
             errors_out.record_panic(crate::Stage::ElfParse, msg);
             metrics.insert(metric!("elf.parse_panicked"), 1.0);
-            return Ok(());
+            return;
         }
     };
 
@@ -92,7 +91,7 @@ pub(super) fn extract(
     relro(&elf, values);
     needed_versions(&elf, values, errors_out);
     super::elf_dynamic::verdef(&elf, values, errors_out);
-    super::elf_dynamic::init_arrays(&elf, bytes, values);
+    super::elf_dynamic::init_arrays(&elf, bytes, values, metrics);
     super::elf_dynamic::dynsym_funcs(&elf, values);
     super::elf_syscalls::emit(&elf, bytes, values, metrics);
     stripped_metadata(&elf, values, metrics);
@@ -113,14 +112,16 @@ pub(super) fn extract(
     note_segment_coverage(&elf, bytes, metrics, errors_out);
     section_file_anomalies(&elf, bytes, metrics);
     rizin_fallback(
-        NativeFormat::Elf,
-        bytes,
-        strings,
+        RizinTarget {
+            format: NativeFormat::Elf,
+            bytes,
+            strings,
+            go_function_metadata: has_go_pclntab(&elf, bytes),
+            settings: rizin,
+        },
         sections_out,
         symbols_out,
         metrics,
-        has_go_pclntab(&elf, bytes),
-        rizin,
     );
     linker_family(&elf, values);
     comment_fingerprint(values);
@@ -165,8 +166,6 @@ pub(super) fn extract(
         );
     }
     super::build_toolchain::from_elf(values, sections_out, bytes);
-
-    Ok(())
 }
 
 /// Identify the linker family that produced this binary. Prefers the
@@ -693,7 +692,10 @@ fn has_go_pclntab(elf: &Elf<'_>, bytes: &[u8]) -> bool {
     read_section(elf, bytes, ".gopclntab").is_some_and(super::go_buildinfo::has_pclntab_magic)
 }
 
-fn read_section<'a>(elf: &Elf<'_>, bytes: &'a [u8], name: &str) -> Option<&'a [u8]> {
+/// The file bytes of the first section named `name`; `None` when there is no
+/// such section or its header points past the file. Shared by the ELF
+/// extractors (`elf_dwarf` reads its `.debug_*` sections through it).
+pub(super) fn read_section<'a>(elf: &Elf<'_>, bytes: &'a [u8], name: &str) -> Option<&'a [u8]> {
     let sh = elf
         .section_headers
         .iter()
@@ -1947,10 +1949,7 @@ fn sections(elf: &Elf<'_>, bytes: &[u8], _metrics: &mut Metrics, sections_out: &
             vsize: sh.sh_size,
             file_offset,
             file_size,
-            flags: section_flags(sh.sh_flags)
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
+            flags: section_flags(sh.sh_flags),
             flags_raw: Some(sh.sh_flags),
             entropy,
         });
@@ -2039,7 +2038,7 @@ fn symbols(
             hidden_count += 1;
         }
         tally_symbol_kinds(
-            sym.clone(),
+            sym,
             &mut sym_type_counts,
             &mut sym_bind_counts,
             &mut sym_vis_counts,
@@ -2073,7 +2072,7 @@ fn symbols(
             hidden_count += 1;
         }
         tally_symbol_kinds(
-            sym.clone(),
+            sym,
             &mut sym_type_counts,
             &mut sym_bind_counts,
             &mut sym_vis_counts,
@@ -2465,30 +2464,19 @@ fn elf_type_string(t: u16) -> &'static str {
     }
 }
 
-fn section_flags(flags: u64) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if flags & 0x1 != 0 {
-        out.push("write");
-    }
-    if flags & 0x2 != 0 {
-        out.push("alloc");
-    }
-    if flags & 0x4 != 0 {
-        out.push("executable");
-    }
-    if flags & 0x10 != 0 {
-        out.push("merge");
-    }
-    if flags & 0x20 != 0 {
-        out.push("strings");
-    }
-    if flags & 0x40 != 0 {
-        out.push("info_link");
-    }
-    if flags & 0x100 != 0 {
-        out.push("tls");
-    }
-    out
+fn section_flags(flags: u64) -> Vec<SectionFlag> {
+    [
+        (0x1, SectionFlag::Writable),
+        (0x2, SectionFlag::Alloc),
+        (0x4, SectionFlag::Executable),
+        (0x10, SectionFlag::Merge),
+        (0x20, SectionFlag::Strings),
+        (0x40, SectionFlag::InfoLink),
+        (0x100, SectionFlag::Tls),
+    ]
+    .into_iter()
+    .filter_map(|(bit, flag)| (flags & bit != 0).then_some(flag))
+    .collect()
 }
 
 #[cfg(test)]

@@ -8,7 +8,8 @@ fn run(bytes: &[u8]) -> (Values, Metrics) {
     let mut v = Values::new();
     let mut m = Metrics::new();
     let mut archive_members = Vec::new();
-    let _ = extract(bytes, &mut v, &mut m, &mut archive_members);
+    let mut errors = Errors::new();
+    let _ = extract(bytes, &mut v, &mut m, &mut archive_members, &mut errors);
     (v, m)
 }
 
@@ -856,10 +857,104 @@ fn unreadable_archive_keeps_its_text_and_exposes_the_zip_error() {
     let Err(err) = open_archive(b"PK\x03\x04garbage-not-a-zip-at-all") else {
         panic!("garbage opened as a zip");
     };
+    assert_eq!(err.to_string(), "malformed zip");
     assert_eq!(
-        err.to_string(),
+        crate::error::display_chain(&err),
         "malformed zip: invalid Zip archive: Could not find EOCD"
     );
     let source = err.source().expect("zip source");
     assert!(source.downcast_ref::<zip::result::ZipError>().is_some());
+}
+
+/// Offsets of every local file header, in member order.
+fn local_header_offsets(z: &[u8]) -> Vec<usize> {
+    memchr::memmem::find_iter(z, b"PK\x03\x04").collect()
+}
+
+/// One corrupted local-header signature made the `zip` crate refuse the
+/// whole archive, so an APK hid every member (and its manifest) while
+/// Android, which reads the central directory, installed it. The header is
+/// repaired, the members are listed and readable, and the mismatch is a
+/// recorded fact.
+#[test]
+fn corrupted_local_header_signature_still_lists_and_reads_members() {
+    let mut z = build_zip(&[
+        (
+            "AndroidManifest.xml",
+            b"manifest",
+            CompressionMethod::Stored,
+        ),
+        ("classes.dex", b"dex\n035", CompressionMethod::Deflated),
+    ]);
+    let second = local_header_offsets(&z)[1];
+    z[second..second + 4].copy_from_slice(b"XX\x03\x04");
+    assert!(ZipArchive::new(Cursor::new(&z[..])).is_err());
+
+    let mut v = Values::new();
+    let mut m = Metrics::new();
+    let mut members = Vec::new();
+    let mut errors = Errors::new();
+    let mut archive = open_and_walk(&z, &mut v, &mut m, &mut members, &mut errors)
+        .unwrap()
+        .expect("repaired archive");
+    assert_eq!(members.len(), 2);
+    assert_eq!(m.get("archive.local_header_mismatch_count"), Some(1.0));
+    assert_eq!(errors.len(), 1);
+    assert_eq!(
+        read_member(&mut archive, "classes.dex", 64)
+            .unwrap()
+            .as_deref(),
+        Some(&b"dex\n035"[..])
+    );
+}
+
+/// When even a repaired copy will not open, the member listing still comes
+/// from the raw central directory.
+#[test]
+fn unopenable_archive_lists_members_from_the_raw_central_directory() {
+    let mut z = build_zip(&[
+        ("a.txt", b"a", CompressionMethod::Stored),
+        ("b.txt", b"b", CompressionMethod::Stored),
+    ]);
+    // An extra-field length that runs the data start past the central
+    // directory: the `zip` crate refuses it with or without a signature.
+    let first = local_header_offsets(&z)[0];
+    z[first + 28..first + 30].copy_from_slice(&u16::MAX.to_le_bytes());
+    assert!(ZipArchive::new(Cursor::new(&z[..])).is_err());
+
+    let mut v = Values::new();
+    let mut m = Metrics::new();
+    let mut members = Vec::new();
+    let mut errors = Errors::new();
+    let archive = open_and_walk(&z, &mut v, &mut m, &mut members, &mut errors).unwrap();
+    assert!(archive.is_none());
+    let listed = v.get("archive.members").and_then(|x| x.as_array()).unwrap();
+    let paths: Vec<&str> = listed.iter().filter_map(|e| e["path"].as_str()).collect();
+    assert_eq!(paths, ["a.txt", "b.txt"]);
+    assert_eq!(m.get("archive.member_count"), Some(2.0));
+    assert_eq!(errors.len(), 1);
+}
+
+/// A member past the read cap is refused rather than returned truncated.
+#[test]
+fn read_member_refuses_a_member_past_the_cap() {
+    let z = build_zip(&[("big", &[b'x'; 100], CompressionMethod::Deflated)]);
+    let mut archive = open_archive(&z).unwrap();
+    assert!(matches!(
+        read_member(&mut archive, "big", 99),
+        Err(MemberError::TooLarge { max: 99 })
+    ));
+    assert_eq!(
+        read_member(&mut archive, "big", 100)
+            .unwrap()
+            .unwrap()
+            .len(),
+        100
+    );
+    assert!(read_member(&mut archive, "absent", 100).unwrap().is_none());
+    let prefix = read_member_prefix(&mut archive, "big", 10)
+        .unwrap()
+        .unwrap();
+    assert_eq!(prefix.bytes.len(), 10);
+    assert!(prefix.truncated);
 }

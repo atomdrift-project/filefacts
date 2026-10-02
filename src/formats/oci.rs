@@ -22,7 +22,6 @@ use std::io::{Cursor, Read};
 
 use serde_json::Value as JsonValue;
 
-use crate::error::Error;
 use crate::output::{Errors, Metrics, Stage, ValueKey, Values};
 use crate::value_key;
 
@@ -35,7 +34,7 @@ pub(super) fn extract(
     values: &mut Values,
     metrics: &mut Metrics,
     errors: &mut Errors,
-) -> Result<(), Error> {
+) {
     // `index.json` (OCI) takes precedence over `manifest.json` (docker save)
     // when a bundle carries both, since the OCI index is the authoritative
     // top-level descriptor. One that does not parse still falls through to
@@ -49,7 +48,6 @@ pub(super) fn extract(
     if !limits.is_empty() {
         values.insert_key(value_key!("oci.limits"), JsonValue::Array(limits));
     }
-    Ok(())
 }
 
 /// Read and parse a top-level JSON manifest. `None` when the bundle has no
@@ -206,7 +204,7 @@ mod tests {
     fn run(bytes: &[u8]) -> (Values, Errors) {
         let mut v = Values::new();
         let mut e = Errors::new();
-        extract(bytes, &mut v, &mut Metrics::new(), &mut e).unwrap();
+        extract(bytes, &mut v, &mut Metrics::new(), &mut e);
         (v, e)
     }
 
@@ -230,7 +228,7 @@ mod tests {
         let err = &e.as_slice()[0];
         assert_eq!(
             (err.stage, err.kind),
-            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+            (Stage::FormatExtract, crate::DiagnosticKind::Malformed)
         );
         assert!(err.message.starts_with("index.json:"), "{}", err.message);
         assert_eq!(

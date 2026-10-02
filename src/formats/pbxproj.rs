@@ -60,9 +60,7 @@ pub(super) fn extract(
     // parsed.
     extract_binary_strings(bytes, strings, XorScan::No);
 
-    let cursor = std::io::Cursor::new(bytes);
-    let parsed = plist::Value::from_reader(cursor)
-        .map_err(|e| Error::malformed_with_source("pbxproj", e.to_string(), e))?;
+    let parsed = super::plist_guard::parse(bytes).map_err(|e| e.into_error("pbxproj"))?;
     let json = plist_value_to_json(parsed);
 
     let JsonValue::Object(root) = json else {

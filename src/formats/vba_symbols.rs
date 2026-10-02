@@ -19,24 +19,18 @@
 //! tokens doesn't break a Declare match. Offsets reported in the
 //! resulting symbols are relative to the *original* source bytes.
 //!
-//! Non-literal `Lib`/`CreateObject` arguments emit the sentinel
-//! library value [`NON_LITERAL_SENTINEL`] — they are the strongest
-//! single obfuscation signal and feed
+//! A non-literal `Lib` clause leaves the import's `library` as `None`, and a
+//! non-literal `CreateObject`/`GetObject` ProgID emits no import at all: the
+//! value is built at run time, so there is no name to record. Both are the
+//! strongest single obfuscation signal and feed the
 //! `office.vba.declare_non_literal_count` /
-//! `office.vba.createobject_non_literal_count` metrics.
+//! `office.vba.createobject_non_literal_count` /
+//! `office.vba.getobject_non_literal_count` metrics.
 
 use regex::Regex;
 use std::sync::OnceLock;
 
 use crate::output::Symbol;
-
-/// Sentinel library/argument value emitted when a Declare's `Lib`
-/// clause or a CreateObject/GetObject argument is not a string
-/// literal — i.e., the import target is built at runtime.
-///
-/// Re-exported as `filefacts::VBA_NON_LITERAL_SENTINEL` for consumers
-/// that need to recognise it.
-pub const NON_LITERAL_SENTINEL: &str = "<non-literal>";
 
 /// Aggregate counters from one module's symbol extraction. Folded
 /// into the per-document `office.vba.*_count` metric keys by
@@ -210,8 +204,8 @@ fn extract_declares(
         stats.declare_count = stats.declare_count.saturating_add(1);
 
         let lib_raw = cap.get(3).map(|m| m.as_str()).unwrap_or("");
-        let (lib_label, is_literal) = classify_lib(lib_raw);
-        if !is_literal {
+        let library = classify_lib(lib_raw);
+        if library.is_none() {
             stats.declare_non_literal_count = stats.declare_non_literal_count.saturating_add(1);
         }
 
@@ -236,28 +230,29 @@ fn extract_declares(
         symbols_out.push(Symbol::Import {
             name: import_name,
             alias: None,
-            library: Some(lib_label),
+            library,
             offset: Some(offset),
             ordinal: None,
         });
     }
 }
 
-/// Classify a `Lib` expression. Returns (label, is_literal). Literal
-/// libs are lowercased and any `.dll` suffix is stripped.
-fn classify_lib(raw: &str) -> (String, bool) {
-    let t = raw.trim();
-    if t.starts_with('"') && t.ends_with('"') && t.len() >= 2 {
-        let inner = &t[1..t.len() - 1];
-        let stem = inner
-            .strip_suffix(".dll")
-            .or_else(|| inner.strip_suffix(".DLL"))
-            .or_else(|| inner.strip_suffix(".Dll"))
-            .unwrap_or(inner);
-        (stem.to_ascii_lowercase(), true)
-    } else {
-        (NON_LITERAL_SENTINEL.to_string(), false)
-    }
+/// The library a `Lib` expression names, lowercased and without a `.dll`
+/// suffix; `None` when it is not a string literal (built at run time).
+fn classify_lib(raw: &str) -> Option<String> {
+    let inner = string_literal(raw)?;
+    let stem = inner
+        .strip_suffix(".dll")
+        .or_else(|| inner.strip_suffix(".DLL"))
+        .or_else(|| inner.strip_suffix(".Dll"))
+        .unwrap_or(inner);
+    Some(stem.to_ascii_lowercase())
+}
+
+/// The contents of a double-quoted string literal, or `None` for any other
+/// expression.
+fn string_literal(raw: &str) -> Option<&str> {
+    raw.trim().strip_prefix('"')?.strip_suffix('"')
 }
 
 fn createobject_re() -> &'static Regex {
@@ -308,8 +303,8 @@ fn extract_createobject(
             stats.createobject_count = stats.createobject_count.saturating_add(1);
         }
 
-        let (label, is_literal) = classify_arg(raw);
-        if !is_literal {
+        let literal = string_literal(raw);
+        if literal.is_none() {
             if is_get {
                 stats.getobject_non_literal_count =
                     stats.getobject_non_literal_count.saturating_add(1);
@@ -321,35 +316,24 @@ fn extract_createobject(
 
         // Only emit Imports for ProgID-style data: literal
         // CreateObject args, or literal *second* args of GetObject.
-        // A bare GetObject moniker (`"file:..."`) is not a ProgID.
-        let emit = !is_get || second_present;
-        if !emit {
+        // A bare GetObject moniker (`"file:..."`) is not a ProgID, and a
+        // non-literal argument has no name to record (the counts above
+        // carry it).
+        let Some(name) = literal.filter(|_| !is_get || second_present) else {
             continue;
-        }
+        };
 
         let offset = cap
             .get(0)
             .map(|m| prep.original_offset(m.start()))
             .unwrap_or(0) as u64;
         symbols_out.push(Symbol::Import {
-            name: label,
+            name: name.to_string(),
             alias: None,
             library: Some(lib_label.to_string()),
             offset: Some(offset),
             ordinal: None,
         });
-    }
-}
-
-/// Classify a CreateObject/GetObject argument. Returns (label,
-/// is_literal).
-fn classify_arg(raw: &str) -> (String, bool) {
-    let t = raw.trim();
-    if t.starts_with('"') && t.ends_with('"') && t.len() >= 2 {
-        let inner = &t[1..t.len() - 1];
-        (inner.to_string(), true)
-    } else {
-        (NON_LITERAL_SENTINEL.to_string(), false)
     }
 }
 
@@ -521,13 +505,11 @@ mod tests {
     }
 
     #[test]
-    fn declare_with_non_literal_lib_emits_sentinel() {
+    fn declare_with_non_literal_lib_has_no_library() {
         let src = r#"Declare Function f Lib dllName Alias "VirtualProtect" () As Long"#;
         let (syms, stats) = run(src);
         let imps = imports(&syms);
-        assert_eq!(imps.len(), 1);
-        assert_eq!(imps[0].0, "VirtualProtect");
-        assert_eq!(imps[0].1, Some(NON_LITERAL_SENTINEL));
+        assert_eq!(imps, [("VirtualProtect", None)]);
         assert_eq!(stats.declare_non_literal_count, 1);
     }
 
@@ -555,9 +537,8 @@ mod tests {
     fn createobject_non_literal_arg() {
         let src = r#"Set x = CreateObject(progName & ".Sh" & "ell")"#;
         let (syms, stats) = run(src);
-        let imps = imports(&syms);
-        assert_eq!(imps.len(), 1);
-        assert_eq!(imps[0].0, NON_LITERAL_SENTINEL);
+        assert!(imports(&syms).is_empty(), "no name to record");
+        assert_eq!(stats.createobject_count, 1);
         assert_eq!(stats.createobject_non_literal_count, 1);
     }
 

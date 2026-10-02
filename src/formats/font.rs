@@ -51,7 +51,6 @@ use crate::value_key;
 use serde_json::Value as JsonValue;
 use std::collections::HashSet;
 
-use crate::error::Error;
 use crate::formats::carrier::{classify_region, leading_whitespace, printable_ratio};
 use crate::formats::common::bytes_at::u32_be;
 use crate::formats::common::{XorScan, extract_binary_strings, hex_encode};
@@ -173,7 +172,7 @@ pub(super) fn extract(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
-) -> Result<(), Error> {
+) {
     // A font that is really a script still deserves a string view: the
     // masquerade case is exactly the one where the strings are the evidence.
     extract_binary_strings(bytes, strings, XorScan::No);
@@ -320,8 +319,6 @@ pub(super) fn extract(
         metric!("font.leading_whitespace_bytes"),
         leading_whitespace(bytes) as f64,
     );
-
-    Ok(())
 }
 
 /// Identify the container from its signature alone.
@@ -582,7 +579,10 @@ fn note_declared_size(declared: u64, actual: usize, report: &mut Report) {
     if declared == 0 || declared == actual {
         return;
     }
-    report.declared_size_delta = declared as i64 - actual as i64;
+    // In i128: a declared size at or past 2^63 would overflow an i64 subtraction.
+    let delta = i128::from(declared) - i128::from(actual);
+    report.declared_size_delta =
+        i64::try_from(delta).unwrap_or(if delta < 0 { i64::MIN } else { i64::MAX });
     report.flag("size_mismatch");
     if declared > actual {
         report.problem("declared size exceeds file");

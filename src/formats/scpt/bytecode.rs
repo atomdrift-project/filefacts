@@ -131,13 +131,7 @@ fn target(parsed: &Parsed, id: usize) -> Option<String> {
 
 fn unicode(data: &[u8]) -> Known {
     if data.len() <= MAX_TEXT && data.len().is_multiple_of(2) {
-        let units: Vec<_> = data
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| u16::from_be_bytes([c[0], c[1]]))
-            .collect();
-        if let Ok(s) = String::from_utf16(&units) {
+        if let Some(s) = crate::bytes::utf16_strict(data, crate::bytes::Endian::Big) {
             if s.len() <= MAX_TEXT {
                 return Known::String(s, false);
             }
@@ -291,7 +285,7 @@ fn branch_target(i: Instruction) -> Option<usize> {
     // In particular LinkRepeat must land on the instruction after the backedge,
     // not two bytes into that instruction as in the reference printer.
     let base = i.pc.checked_add(1)?;
-    base.checked_add_signed(i.operand as i16 as isize)
+    base.checked_add_signed(isize::from(i.operand.cast_signed()))
 }
 
 fn limit(out: &mut Function, text: &str) {
@@ -511,10 +505,10 @@ fn recover(decoder: Decoder, args: &[Known]) -> Option<String> {
         };
         // ASCII is unambiguous across AppleScript character-ID encodings.
         // Wider Unicode/legacy encodings are deliberately not guessed.
-        if !(0..=127).contains(&n) {
-            return None;
+        match u8::try_from(n) {
+            Ok(b) if b.is_ascii() => text.push(char::from(b)),
+            _ => return None,
         }
-        text.push(n as u8 as char);
     }
     Some(text)
 }
@@ -535,7 +529,7 @@ impl State {
     }
     fn count(&mut self, maximum: usize) -> Option<usize> {
         match self.pop() {
-            Known::Number(n) if n >= 0 && (n as u64) <= maximum as u64 => Some(n as usize),
+            Known::Number(n) => usize::try_from(n).ok().filter(|&n| n <= maximum),
             _ => None,
         }
     }
@@ -679,7 +673,7 @@ pub(super) fn analyze(parsed: &Parsed) -> Analysis {
                 102 => pushed = Some(Known::Bool(false)),
                 103 => pushed = Some(Known::Unknown),
                 104 => pushed = Some(Known::Unknown),
-                105..=109 => pushed = Some(Known::Number(i.op as i64 - 106)),
+                105..=109 => pushed = Some(Known::Number(i64::from(i.op) - 106)),
                 41 => pushed = Some(Known::Receiver),
                 42 => {
                     pushed = Some(if tell_depth == 0 {

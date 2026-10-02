@@ -110,11 +110,17 @@ mod tests {
     }
 
     /// `file.entropy` is emitted universally (not just by png/jpeg),
-    /// so entropy rules apply to every file type.
+    /// so entropy rules apply to every file type. It is the one whole-file
+    /// entropy: the retired `binary.overall_entropy` twin stays retired.
     #[test]
-    fn binary_overall_entropy_mirrors_file_entropy() {
-        let m = run(&[0x00, 0xff]);
-        assert_eq!(m.get("file.entropy"), m.get("file.entropy"));
+    fn file_entropy_is_universal_and_has_no_twin() {
+        let bytes = b"#!/bin/sh\necho hello\n";
+        let m = run(bytes);
+        assert_eq!(
+            m.get("file.entropy"),
+            Some(entropy::windowed(bytes).overall)
+        );
+        assert!(m.get("binary.overall_entropy").is_none());
     }
 
     /// Uniform random over the full byte alphabet → entropy ≈ 8.0

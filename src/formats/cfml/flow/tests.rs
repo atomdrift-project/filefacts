@@ -111,7 +111,7 @@ fn unquoted_attribute_offsets_and_all_prefixes_remain_valid() {
         let p = parse(&source[..end]);
         assert!(p.flow.values.len() <= MAX_VALUES);
         for value in &p.flow.values {
-            assert!(value.offset <= end);
+            assert!(value.offset <= end as u64);
             assert!(value.inputs.iter().all(|id| *id < p.flow.values.len()));
             assert!(value.fields.values().all(|id| *id < p.flow.values.len()));
         }
@@ -234,9 +234,9 @@ fn simple_condition_comparisons_keep_names_values_and_offsets_separate() {
         assert_eq!(call.inputs.len(), 3);
         let operator = &p.flow.values[call.inputs[1]];
         assert!(
-            source[operator.offset..].starts_with("neq")
-                || source[operator.offset..].starts_with("NEQ")
-                || source[operator.offset..].starts_with("!=")
+            source[operator.offset as usize..].starts_with("neq")
+                || source[operator.offset as usize..].starts_with("NEQ")
+                || source[operator.offset as usize..].starts_with("!=")
         );
     }
 }
@@ -292,7 +292,10 @@ fn conditional_calls_are_observed_outside_comments_and_strings() {
         .collect();
     assert_eq!(calls.len(), 2);
     for (call, expected) in calls.iter().zip(["session.actual", "session.other"]) {
-        assert_eq!(&source[call.offset..call.offset + 9], b"IsDefined");
+        assert_eq!(
+            &source[call.offset as usize..call.offset as usize + 9],
+            b"IsDefined"
+        );
         assert!(
             matches!(&p.flow.values[call.inputs[0]].literal, Some(Arg::String { value }) if value == expected)
         );
@@ -345,7 +348,10 @@ fn retained_script_calls_and_password_origin_have_original_offsets() {
         .iter()
         .find(|v| v.target.as_deref() == Some("decrypt"))
         .unwrap();
-    assert_eq!(&bytes[decrypt.offset..decrypt.offset + 7], b"Decrypt");
+    assert_eq!(
+        &bytes[decrypt.offset as usize..decrypt.offset as usize + 7],
+        b"Decrypt"
+    );
     let origins = p.flow.origins(decrypt.inputs[0], &[], 1000);
     assert!(
         origins
@@ -713,7 +719,7 @@ fn expression_symbols_agree_with_flow_and_ignore_quoted_code() {
         };
         assert!(p.flow.values.iter().any(|v| v.kind == FlowKind::Call
             && &v.target == target
-            && Some(v.offset as u64) == *offset
+            && Some(v.offset) == *offset
             && v.inputs.len() == args.len()));
         assert_ne!(target.as_deref(), Some("fake"));
         if target.as_deref() == Some("encrypt") {
@@ -744,7 +750,7 @@ fn retained_devshell_exposes_encrypt_argument_provenance() {
     let call = flow
         .values
         .iter()
-        .find(|v| v.target.as_deref() == Some("encrypt") && Some(v.offset as u64) == *offset)
+        .find(|v| v.target.as_deref() == Some("encrypt") && Some(v.offset) == *offset)
         .unwrap();
     let origins = flow.origins(call.inputs[0], &[], 1000);
     assert!(
@@ -1017,7 +1023,7 @@ fn public_views_share_parse_and_original_calls() {
                 }
                 count += 1;
                 assert!(flow.values.iter().any(|v| v.kind == FlowKind::Call
-                    && Some(v.offset as u64) == *offset
+                    && Some(v.offset) == *offset
                     && &v.target == target
                     && v.inputs.len() == args.len()));
             }

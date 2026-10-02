@@ -1,8 +1,10 @@
 //! Original executable-constants specimen and malformed/virtual section cases.
 #![allow(
     clippy::indexing_slicing,
-    reason = "helpers index a fixed, trusted fixture at known offsets"
+    clippy::cast_possible_truncation,
+    reason = "helpers index and offset into a fixed, trusted fixture at known positions"
 )]
+use filefacts::SectionFlag;
 use sha2::{Digest, Sha256};
 const FAT: &[u8] = include_bytes!("../testdata/macho/lcg_xor_executable_constants.macho");
 /// The section views under test come from the static parse alone; rizin is
@@ -57,7 +59,7 @@ fn code_entropy_excludes_executable_constants_and_uses_real_file_spans() {
         let constants = secs.iter().find(|s| s.name == "__TEXT,__const").unwrap();
         assert!(constants.is_executable());
         assert!(!constants.is_code());
-        assert!(constants.flags.iter().any(|f| f == "data"));
+        assert!(constants.has_flag(SectionFlag::Data));
         assert!(constants.entropy.unwrap() > 7.5);
         let code: Vec<_> = secs
             .iter()
@@ -141,7 +143,7 @@ fn instruction_attributes_do_not_override_non_executable_segment_permissions() {
         .iter()
         .find(|s| s.name == "__TEXT,__text")
         .unwrap();
-    assert!(s.flags.iter().any(|f| f == "code"));
+    assert!(s.has_flag(SectionFlag::Code));
     assert!(!s.is_executable());
     assert!(!s.is_code());
 }
@@ -181,15 +183,15 @@ fn pe_and_elf_execute_flags_keep_their_existing_meaning() {
     let p = open(thin());
     let mut s = p.sections().iter().next().unwrap().clone();
     for flags in [
-        vec!["executable"],
-        vec!["executable", "code"],
-        vec!["execinstr", "alloc"],
+        vec![SectionFlag::Executable],
+        vec![SectionFlag::Executable, SectionFlag::Code],
+        vec![SectionFlag::Executable, SectionFlag::Alloc],
     ] {
-        s.flags = flags.iter().map(|s| s.to_string()).collect();
+        s.flags = flags;
         assert!(s.is_executable());
         assert!(s.is_code());
     }
-    s.flags = vec!["executable".into(), "data".into()];
+    s.flags = vec![SectionFlag::Executable, SectionFlag::Data];
     assert!(s.is_executable());
     assert!(!s.is_code());
 }

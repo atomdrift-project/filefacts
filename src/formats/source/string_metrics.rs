@@ -6,8 +6,15 @@
 //! categories (URL/path/IP/email/domain), and suspicious payloads
 //! (embedded code, shell commands, SQL).
 
+use std::sync::LazyLock;
+
+use aho_corasick::AhoCorasick;
+
+use crate::bytes::sat_u32;
+use crate::formats::common::{ends_with_ci, starts_with_ci};
 use crate::metric;
 use crate::output::Metrics;
+use crate::scan::classify::{is_base64_literal, is_hex_literal};
 
 use super::identifier_metrics::string_entropy;
 
@@ -17,7 +24,7 @@ pub(super) fn emit(strings: &[&str], metrics: &mut Metrics) {
         return;
     }
 
-    let total = strings.len() as u32;
+    let total = sat_u32(strings.len());
     metrics.insert(metric!("strings.count"), f64::from(total));
 
     let mut total_bytes: u64 = 0;
@@ -50,9 +57,7 @@ pub(super) fn emit(strings: &[&str], metrics: &mut Metrics) {
             empty_count += 1;
             continue;
         }
-        if len > max_length as usize {
-            max_length = len as u32;
-        }
+        max_length = max_length.max(sat_u32(len));
 
         let entropy = string_entropy(s);
         entropy_values.push(entropy);
@@ -63,10 +68,10 @@ pub(super) fn emit(strings: &[&str], metrics: &mut Metrics) {
             very_high_entropy_count += 1;
         }
 
-        if is_likely_base64(s) {
+        if is_base64_literal(s) {
             base64_count += 1;
         }
-        if is_hex_string(s) {
+        if is_hex_literal(s) {
             hex_count += 1;
         }
         if has_url_encoding(s) {
@@ -95,15 +100,10 @@ pub(super) fn emit(strings: &[&str], metrics: &mut Metrics) {
         if len > 1000 {
             very_long_count += 1;
         }
-        if has_embedded_code(s) {
-            embedded_code_count += 1;
-        }
-        if has_shell_command(s) {
-            shell_command_count += 1;
-        }
-        if has_sql_pattern(s) {
-            sql_count += 1;
-        }
+        let markers = Markers::of(s);
+        embedded_code_count += u32::from(markers.code);
+        shell_command_count += u32::from(markers.shell);
+        sql_count += u32::from(markers.sql);
     }
 
     if total_bytes > 0 {
@@ -200,36 +200,6 @@ pub(super) fn emit(strings: &[&str], metrics: &mut Metrics) {
     }
 }
 
-fn is_likely_base64(s: &str) -> bool {
-    if s.len() < 16 || !s.len().is_multiple_of(4) {
-        return false;
-    }
-    // One pass: every char must be in the base64 alphabet, and a real payload
-    // mixes upper and lower case. (All-base64 implies all-ASCII, so a clean
-    // char count equals the byte length the early guard already vetted.)
-    let mut all_base64 = true;
-    let mut has_upper = false;
-    let mut has_lower = false;
-    for c in s.chars() {
-        all_base64 &= c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=';
-        has_upper |= c.is_ascii_uppercase();
-        has_lower |= c.is_ascii_lowercase();
-    }
-    let valid_padding = !s.contains('=') || s.ends_with('=') || s.ends_with("==");
-    all_base64 && has_upper && has_lower && valid_padding
-}
-
-fn is_hex_string(s: &str) -> bool {
-    if s.len() < 8 || !s.len().is_multiple_of(2) {
-        return false;
-    }
-    let check = s
-        .strip_prefix("0x")
-        .or_else(|| s.strip_prefix("0X"))
-        .unwrap_or(s);
-    check.chars().all(|c| c.is_ascii_hexdigit())
-}
-
 fn has_url_encoding(s: &str) -> bool {
     let bytes = s.as_bytes();
     let len = bytes.len();
@@ -276,13 +246,11 @@ fn has_unicode_heavy(s: &str) -> bool {
 }
 
 fn is_url(s: &str) -> bool {
-    let lower = s.to_lowercase();
-    lower.starts_with("http://")
-        || lower.starts_with("https://")
-        || lower.starts_with("ftp://")
-        || lower.starts_with("file://")
-        || lower.starts_with("ws://")
-        || lower.starts_with("wss://")
+    [
+        "http://", "https://", "ftp://", "file://", "ws://", "wss://",
+    ]
+    .iter()
+    .any(|scheme| starts_with_ci(s, scheme))
         || super::looks_like_protocolless_url(s)
 }
 
@@ -347,8 +315,9 @@ fn is_domain(s: &str) -> bool {
         ".com", ".net", ".org", ".io", ".dev", ".co", ".xyz", ".ru", ".cn", ".de", ".uk", ".info",
         ".biz", ".cc", ".top", ".online", ".site", ".tk", ".ml", ".ga",
     ];
-    let lower = s.to_lowercase();
-    if tlds.iter().any(|tld| lower.ends_with(tld)) {
+    // Only an all-ASCII name passes the check below, so ASCII case folding
+    // agrees with the full Unicode lowercase here.
+    if tlds.iter().any(|tld| ends_with_ci(s, tld)) {
         return s
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
@@ -356,64 +325,114 @@ fn is_domain(s: &str) -> bool {
     false
 }
 
-fn has_embedded_code(s: &str) -> bool {
-    let patterns = [
-        "function(",
-        "function ",
-        "eval(",
-        "exec(",
-        "import ",
-        "require(",
-        "<script",
-        "<?php",
-        "def ",
-        "class ",
-        "system.",
-        "runtime.",
-        "process.",
-    ];
-    // Patterns are lowercase literals, so match against the lowercased
-    // input directly without re-lowercasing each one.
-    let lower = s.to_lowercase();
-    patterns.iter().any(|p| lower.contains(*p))
+/// Code fragments a literal may embed, matched case-insensitively.
+const CODE_PATTERNS: &[&str] = &[
+    "function(",
+    "function ",
+    "eval(",
+    "exec(",
+    "import ",
+    "require(",
+    "<script",
+    "<?php",
+    "def ",
+    "class ",
+    "system.",
+    "runtime.",
+    "process.",
+];
+
+/// Shell-command fragments, matched case-insensitively.
+const SHELL_PATTERNS: &[&str] = &[
+    "/bin/sh",
+    "/bin/bash",
+    "cmd.exe",
+    "powershell",
+    "curl ",
+    "wget ",
+    "chmod ",
+    "chown ",
+    "rm -",
+    "dd if=",
+    "nc -",
+    "netcat",
+    "python -c",
+    "perl -e",
+    "ruby -e",
+    "nohup ",
+    "| sh",
+    "| bash",
+    "2>&1",
+    ">/dev/null",
+    "$(",
+    "`",
+];
+
+/// SQL fragments, matched case-insensitively; a literal needs two distinct
+/// ones to count.
+const SQL_PATTERNS: &[&str] = &[
+    "SELECT ", "INSERT ", "UPDATE ", "DELETE ", "DROP ", "CREATE ", "ALTER ", "UNION ", " FROM ",
+    " WHERE ", " AND ", " OR ", "--", "';", "1=1", "1 = 1",
+];
+
+/// Every marker pattern, code then shell then SQL, so a pattern id maps back
+/// to its group by range.
+static MARKERS: LazyLock<AhoCorasick> = LazyLock::new(|| {
+    AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build(
+            CODE_PATTERNS
+                .iter()
+                .chain(SHELL_PATTERNS)
+                .chain(SQL_PATTERNS),
+        )
+        .expect("marker patterns are valid literals")
+});
+
+/// Which suspicious-payload groups a literal hits.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Markers {
+    code: bool,
+    shell: bool,
+    sql: bool,
 }
 
-fn has_shell_command(s: &str) -> bool {
-    let patterns = [
-        "/bin/sh",
-        "/bin/bash",
-        "cmd.exe",
-        "powershell",
-        "curl ",
-        "wget ",
-        "chmod ",
-        "chown ",
-        "rm -",
-        "dd if=",
-        "nc -",
-        "netcat",
-        "python -c",
-        "perl -e",
-        "ruby -e",
-        "nohup ",
-        "| sh",
-        "| bash",
-        "2>&1",
-        ">/dev/null",
-        "$(",
-        "`",
-    ];
-    let lower = s.to_lowercase();
-    patterns.iter().any(|p| lower.contains(&p.to_lowercase()))
-}
+impl Markers {
+    /// One overlapping scan over an ASCII literal. Overlapping, so a pattern
+    /// inside another's match is still seen: SQL counts distinct patterns.
+    /// A non-ASCII literal takes the Unicode case-folding path instead, since
+    /// its full lowercase and uppercase forms can differ from ASCII folding.
+    fn of(s: &str) -> Self {
+        if !s.is_ascii() {
+            return Self::of_unicode(s);
+        }
+        let shell_start = CODE_PATTERNS.len();
+        let sql_start = shell_start + SHELL_PATTERNS.len();
+        let mut markers = Self::default();
+        let mut sql_seen: u32 = 0;
+        for m in MARKERS.find_overlapping_iter(s) {
+            let id = m.pattern().as_usize();
+            if id < shell_start {
+                markers.code = true;
+            } else if id < sql_start {
+                markers.shell = true;
+            } else {
+                sql_seen |= 1 << (id - sql_start);
+            }
+        }
+        markers.sql = sql_seen.count_ones() >= 2;
+        markers
+    }
 
-fn has_sql_pattern(s: &str) -> bool {
-    let patterns = [
-        "SELECT ", "INSERT ", "UPDATE ", "DELETE ", "DROP ", "CREATE ", "ALTER ", "UNION ",
-        " FROM ", " WHERE ", " AND ", " OR ", "--", "';", "1=1", "1 = 1",
-    ];
-    let upper = s.to_uppercase();
-    patterns.iter().filter(|p| upper.contains(*p)).count() >= 2
+    fn of_unicode(s: &str) -> Self {
+        let lower = s.to_lowercase();
+        let upper = s.to_uppercase();
+        Self {
+            code: CODE_PATTERNS.iter().any(|p| lower.contains(p)),
+            shell: SHELL_PATTERNS.iter().any(|p| lower.contains(p)),
+            sql: SQL_PATTERNS.iter().filter(|p| upper.contains(*p)).count() >= 2,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -445,18 +464,18 @@ mod tests {
     #[test]
     fn base64_requires_length_multiple_of_four() {
         // 17 chars (len % 4 == 1) and 18 chars (len % 4 == 2): not valid
-        // base64 framing, must be rejected by `is_likely_base64`.
-        assert!(!is_likely_base64("SGVsbG8gV29ybGQhX")); // 17 chars
-        assert!(!is_likely_base64("SGVsbG8gV29ybGQhXY")); // 18 chars
-        assert!(!is_likely_base64("SGVsbG8gV29ybGQhXYZ")); // 19 chars
-        assert!(is_likely_base64("SGVsbG8gV29ybGQh")); // 16 chars
+        // base64 framing, must be rejected by `is_base64_literal`.
+        assert!(!is_base64_literal("SGVsbG8gV29ybGQhX")); // 17 chars
+        assert!(!is_base64_literal("SGVsbG8gV29ybGQhXY")); // 18 chars
+        assert!(!is_base64_literal("SGVsbG8gV29ybGQhXYZ")); // 19 chars
+        assert!(is_base64_literal("SGVsbG8gV29ybGQh")); // 16 chars
     }
 
     #[test]
     fn hex_requires_length_multiple_of_two() {
-        assert!(!is_hex_string("deadbeefa")); // 9 chars
-        assert!(is_hex_string("deadbeef")); // 8 chars
-        assert!(is_hex_string("0xdeadbeef")); // prefixed, 8 hex chars
+        assert!(!is_hex_literal("deadbeefa")); // 9 chars
+        assert!(is_hex_literal("deadbeef")); // 8 chars
+        assert!(is_hex_literal("0xdeadbeef")); // prefixed, 8 hex chars
     }
 
     #[test]
@@ -478,5 +497,32 @@ mod tests {
         let mut m = Metrics::new();
         emit(&["cdn.jsdelivr.net/gh/123456/repo/stage"], &mut m);
         assert_eq!(m.get("strings.url_count"), Some(1.0));
+    }
+
+    #[test]
+    fn single_scan_markers_match_the_case_folding_rules() {
+        let corpus = [
+            "",
+            "plain text",
+            "PowerShell -enc AAAA",
+            "CURL http://x | SH",
+            "Select * From users",
+            "select 1",
+            "' OR 1=1 --",
+            "x UNION SELECT y",
+            "eval(atob(s))",
+            "<SCRIPT>alert(1)</script>",
+            "$(id)",
+            "`whoami`",
+            "rm -rf /",
+            "class Foo",
+            "1 = 1 and 2",
+            "ftp://Host",
+            "ſelect ſomething FROM x",
+            "ünïcode chmod 777 Ünïcode",
+        ];
+        for s in corpus {
+            assert_eq!(Markers::of(s), Markers::of_unicode(s), "{s:?}");
+        }
     }
 }

@@ -258,7 +258,10 @@ fn package_json_entry_points_are_local_file_refs() {
         .find(|r| matches!(&r.locator, RefLocator::Path(p) if p == "./lib/index.js"))
         .expect("main ref");
     let text = std::str::from_utf8(manifest).unwrap();
-    assert_eq!(main.offset as usize, text.find("./lib/index.js").unwrap());
+    assert_eq!(
+        main.offset.unwrap() as usize,
+        text.find("./lib/index.js").unwrap()
+    );
 }
 
 #[test]
@@ -929,8 +932,8 @@ fn locate_cites_a_real_occurrence_of_every_evidence() {
 
     for r in &refs {
         assert!(
-            yaml[r.offset as usize..].starts_with(&r.evidence),
-            "offset {} must cite {:?}",
+            yaml[r.offset.unwrap() as usize..].starts_with(&r.evidence),
+            "offset {:?} must cite {:?}",
             r.offset,
             r.evidence
         );
@@ -938,7 +941,7 @@ fn locate_cites_a_real_occurrence_of_every_evidence() {
     // Distinct evidence in document order lands exactly where a whole-file
     // search would.
     for r in &refs[..64] {
-        assert_eq!(r.offset as usize, yaml.find(&r.evidence).unwrap());
+        assert_eq!(r.offset.unwrap() as usize, yaml.find(&r.evidence).unwrap());
     }
     // The duplicate cites its own later line, which a whole-file search
     // could not distinguish from the first.

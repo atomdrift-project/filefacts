@@ -1,7 +1,7 @@
 //! Function metrics ported from cleave.
 //!
-//! Walks the tree once collecting every function-definition node and
-//! emits `functions.*` keys describing count, size distribution, name
+//! Collects every function-definition node during the shared walk
+//! ([`super::visit`]) and emits `functions.*` keys describing count, size distribution, name
 //! shape, anonymous/async/generator counts, parameter shape, and
 //! nesting depth. Recursion counts stay zero — cleave's original
 //! analyzer left those for language-specific extractors that never
@@ -14,7 +14,8 @@ use crate::output::Metrics;
 
 use super::ast_walk::MAX_AST_DEPTH;
 use super::identifier_metrics::string_entropy;
-use super::langs::{Lang, LangConfig};
+use super::langs::Lang;
+use super::visit::{NodeIds, Visit};
 
 /// Per-function info collected during the AST walk.
 #[derive(Default)]
@@ -28,18 +29,63 @@ struct FunctionInfo {
     contains_nested_functions: bool,
 }
 
-/// Walk the tree, collect function info, and emit `functions.*` metrics.
-/// Returns the number of functions found, for the caller's ratios.
-pub(super) fn emit(
-    root: Node<'_>,
-    source: &str,
-    config: &LangConfig,
-    total_lines: u32,
-    metrics: &mut Metrics,
-) -> usize {
-    let mut functions: Vec<FunctionInfo> = Vec::new();
-    let mut capped = false;
-    collect(root, source, config, 0, 0, &mut functions, &mut capped);
+/// The function-definition nodes of one walk, in source order.
+#[derive(Default)]
+pub(super) struct Collector {
+    functions: Vec<FunctionInfo>,
+    /// The collected functions enclosing the walk's current node, innermost
+    /// last: index into `functions`, and tree depth.
+    open: Vec<(usize, u32)>,
+    /// The tree reached [`MAX_AST_DEPTH`], below which no function is
+    /// collected.
+    capped: bool,
+}
+
+impl Collector {
+    pub(super) fn enter(&mut self, visit: &Visit<'_>, source: &str, ids: &NodeIds) {
+        // Nothing useful lives past the AST walk's depth cap, and a tree this
+        // deep is itself an anti-analysis signal — record that we truncated.
+        if visit.depth >= MAX_AST_DEPTH {
+            self.capped = true;
+        }
+        if !ids.metric_function.contains(visit.kind_id) {
+            return;
+        }
+        // A function anywhere inside another, however deep, makes the
+        // enclosing one nested. Marking the innermost enclosing function is
+        // enough: it marks its own enclosing function in turn.
+        if let Some(outer) = self
+            .open
+            .last()
+            .and_then(|&(outer, _)| self.functions.get_mut(outer))
+        {
+            outer.contains_nested_functions = true;
+        }
+        if visit.depth < MAX_AST_DEPTH {
+            let nesting_depth = u32::try_from(self.open.len()).unwrap_or(u32::MAX);
+            self.open.push((self.functions.len(), visit.depth));
+            self.functions
+                .push(build_info(visit.node, source, nesting_depth));
+        }
+    }
+
+    pub(super) fn exit(&mut self, visit: &Visit<'_>) {
+        if self
+            .open
+            .last()
+            .is_some_and(|&(_, depth)| depth == visit.depth)
+        {
+            self.open.pop();
+        }
+    }
+}
+
+/// Emit `functions.*` metrics for what `collector` gathered. Returns the
+/// number of functions found, for the caller's ratios.
+pub(super) fn emit(collector: Collector, total_lines: u32, metrics: &mut Metrics) -> usize {
+    let Collector {
+        functions, capped, ..
+    } = collector;
     // Surface the truncation as the shared anti-analysis signal *before* the
     // empty-functions early return: a function-free but pathologically deep
     // tree (a giant `a+b+c+…` chain) caps here while producing no functions, so
@@ -58,7 +104,7 @@ pub(super) fn emit(
 /// `function_node_types` used by cleave's UnifiedSourceAnalyzer; a language
 /// with no entry there has none here, so its files emit no `functions.*`
 /// metrics.
-fn function_kinds_for(lang: Lang) -> &'static [&'static str] {
+pub(super) fn function_kinds_for(lang: Lang) -> &'static [&'static str] {
     match lang {
         Lang::Python => &["function_definition", "async_function_definition"],
         Lang::JavaScript | Lang::TypeScript => &[
@@ -92,46 +138,9 @@ fn function_kinds_for(lang: Lang) -> &'static [&'static str] {
     }
 }
 
-fn collect(
-    node: Node<'_>,
-    source: &str,
-    config: &LangConfig,
-    depth: u32,
-    tree_depth: u32,
-    out: &mut Vec<FunctionInfo>,
-    capped: &mut bool,
-) {
-    // This recurses one frame per *tree* level (every child), while `depth`
-    // only tracks function nesting — so a function-free but deeply nested tree
-    // (e.g. a `a+b+c+…` chain thousands long) would recurse unbounded and
-    // overflow the worker stack with `depth` stuck at 0. Stop at the same cap
-    // the AST walk uses; nothing useful lives past it, and a tree this deep is
-    // itself an anti-analysis signal — record that we truncated.
-    if tree_depth >= MAX_AST_DEPTH {
-        *capped = true;
-        return;
-    }
-    let is_fn = function_kinds_for(config.lang).contains(&node.kind());
-    if is_fn {
-        let info = build_info(node, source, config, depth);
-        out.push(info);
-    }
-    let new_depth = if is_fn { depth + 1 } else { depth };
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect(
-            child,
-            source,
-            config,
-            new_depth,
-            tree_depth + 1,
-            out,
-            capped,
-        );
-    }
-}
-
-fn build_info(node: Node<'_>, source: &str, config: &LangConfig, depth: u32) -> FunctionInfo {
+/// A function's info, without [`FunctionInfo::contains_nested_functions`],
+/// which the walk sets when it meets a nested function.
+fn build_info(node: Node<'_>, source: &str, depth: u32) -> FunctionInfo {
     let bytes = source.as_bytes();
     let name = node
         .child_by_field_name("name")
@@ -140,8 +149,8 @@ fn build_info(node: Node<'_>, source: &str, config: &LangConfig, depth: u32) -> 
         .unwrap_or_default();
     let is_anonymous = name.is_empty();
 
-    let start_line = node.start_position().row as u32;
-    let end_line = node.end_position().row as u32;
+    let start_line = crate::bytes::sat_u32(node.start_position().row);
+    let end_line = crate::bytes::sat_u32(node.end_position().row);
     let line_count = end_line.saturating_sub(start_line) + 1;
 
     // Every grammar here names the list `parameters`. A shell function has
@@ -151,8 +160,6 @@ fn build_info(node: Node<'_>, source: &str, config: &LangConfig, depth: u32) -> 
         .map(|params| collect_param_names(params, source))
         .unwrap_or((0, Vec::new()));
 
-    let contains_nested = has_nested_function(node, config);
-
     FunctionInfo {
         name,
         line_count,
@@ -160,7 +167,7 @@ fn build_info(node: Node<'_>, source: &str, config: &LangConfig, depth: u32) -> 
         param_names,
         is_anonymous,
         nesting_depth: depth,
-        contains_nested_functions: contains_nested,
+        contains_nested_functions: false,
     }
 }
 
@@ -198,26 +205,12 @@ fn first_identifier<'a>(node: Node<'a>) -> Option<Node<'a>> {
     None
 }
 
-fn has_nested_function(node: Node<'_>, config: &LangConfig) -> bool {
-    let kinds = function_kinds_for(config.lang);
-    let mut cursor = node.walk();
-    let mut stack: Vec<Node<'_>> = node.children(&mut cursor).collect();
-    while let Some(n) = stack.pop() {
-        if kinds.contains(&n.kind()) {
-            return true;
-        }
-        let mut c = n.walk();
-        stack.extend(n.children(&mut c));
-    }
-    false
-}
-
 fn emit_metrics(functions: &[FunctionInfo], total_lines: u32, metrics: &mut Metrics) {
     // `functions.count` is emitted by `lib.rs::extract_all` once
     // (cross-format: source-language counts and binary-disassembled
     // counts share the same canonical path). We compute the local
     // total here only for the ratio metrics below.
-    let total = functions.len() as u32;
+    let total = crate::bytes::sat_u32(functions.len());
 
     let mut anonymous = 0u32;
     let mut nested_functions = 0u32;

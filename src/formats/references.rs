@@ -697,14 +697,14 @@ impl Refs<'_> {
     /// their own lines instead of both citing the first. The cursor never
     /// advances *past* a match, so a producer emitting two references for one
     /// span still gets that span twice.
-    fn locate(&mut self, evidence: &str, locator: &RefLocator) -> u64 {
-        let Some(text) = self.text else { return 0 };
+    fn locate(&mut self, evidence: &str, locator: &RefLocator) -> Option<u64> {
+        let text = self.text?;
         if let Some(at) = text.get(self.cursor..).and_then(|tail| tail.find(evidence)) {
             self.cursor += at;
-            return self.cursor as u64;
+            return Some(self.cursor as u64);
         }
         if self.budget == 0 {
-            return 0;
+            return None;
         }
         // A miss already cost a scan to end-of-file, and the fallback costs up
         // to two more; charge the pair.
@@ -715,7 +715,7 @@ impl Refs<'_> {
         if let Some(at) = found {
             self.cursor = at;
         }
-        found.unwrap_or(0) as u64
+        found.map(|at| at as u64)
     }
 
     /// Push one reference, deriving its `offset`, and `content_sha256` from a
@@ -723,9 +723,9 @@ impl Refs<'_> {
     /// hopper key). Every producer goes through here so these rules live in
     /// one place.
     ///
-    /// The offset always resolves to something citable: the start of
-    /// `evidence`, else the start of the package name / URL (so a joined
-    /// multi-line command still points at its package), else `0`.
+    /// The offset is the start of `evidence`, else the start of the package
+    /// name / URL (so a joined multi-line command still points at its
+    /// package), else `None`.
     fn push(
         &mut self,
         locator: RefLocator,

@@ -1,4 +1,5 @@
 use super::*;
+use crate::output::Strings;
 
 #[test]
 fn cpu_type_string_known() {
@@ -157,24 +158,8 @@ fn fat_header_with_out_of_range_arch_offset_does_not_panic() {
     // still operates against bounded input.
     bytes.resize(1024, 0);
 
-    let mut values = Values::new();
-    let mut strings = crate::output::Strings::default();
-    let mut metrics = Metrics::new();
-    let mut sections: Vec<Section> = Vec::new();
-    let mut symbols = crate::Symbols::new();
-    let mut errors = crate::output::Errors::new();
     // The point of the test is non-panicking completion.
-    let _ = extract(
-        &bytes,
-        &mut values,
-        &mut strings,
-        &mut metrics,
-        &mut sections,
-        &mut symbols,
-        &mut errors,
-        &mut None,
-        &crate::rizin::Settings::default(),
-    );
+    extract(&bytes, crate::formats::Sinks::default().ctx());
 }
 
 #[test]
@@ -210,23 +195,15 @@ fn run(bytes: &[u8]) -> (Values, Strings, Metrics) {
 }
 
 fn run_with_symbols(bytes: &[u8]) -> (Values, Strings, Metrics, crate::Symbols) {
-    let mut v = Values::new();
-    let mut s = Strings::default();
-    let mut m = Metrics::new();
-    let mut sections = Vec::new();
-    let mut symbols = crate::Symbols::new();
-    let mut errors = Errors::new();
-    let _ = extract(
-        bytes,
-        &mut v,
-        &mut s,
-        &mut m,
-        &mut sections,
-        &mut symbols,
-        &mut errors,
-        &mut None,
-        &crate::rizin::Settings::default(),
-    );
+    let mut out = crate::formats::Sinks::default();
+    extract(bytes, out.ctx());
+    let crate::formats::Sinks {
+        values: v,
+        strings: s,
+        metrics: m,
+        symbols,
+        ..
+    } = out;
     (v, s, m, symbols)
 }
 
@@ -419,24 +396,9 @@ fn normalize_dylib_path_strips_dir_and_suffix() {
 #[test]
 fn typed_imports_and_exports_populated_for_macho() {
     let bytes = read_fixture("test.macho");
-    let mut v = Values::new();
-    let mut s = Strings::default();
-    let mut m = Metrics::new();
-    let mut sections = Vec::new();
-    let mut symbols = crate::Symbols::new();
-    let mut errors = Errors::new();
-    extract(
-        &bytes,
-        &mut v,
-        &mut s,
-        &mut m,
-        &mut sections,
-        &mut symbols,
-        &mut errors,
-        &mut None,
-        &crate::rizin::Settings::default(),
-    )
-    .unwrap();
+    let mut out = crate::formats::Sinks::default();
+    extract(&bytes, out.ctx());
+    let symbols = out.symbols;
     // The trivial test.macho fixture might have no exports but
     // any real binary has bind imports for libSystem.
     for sym in symbols.iter_kind(crate::SymbolKind::Import) {
@@ -513,4 +475,82 @@ fn bind_imports_are_not_duplicated_by_the_symtab_fallback() {
     assert!(total > 0, "fixture should have imports");
     let dupes: Vec<_> = counts.iter().filter(|(_, n)| **n > 1).collect();
     assert!(dupes.is_empty(), "duplicated imports: {dupes:?}");
+}
+
+/// `LC_FUNCTION_STARTS` deltas are read with the shared ULEB128 decoder: the
+/// zero terminator ends the table, and so does a truncated delta.
+#[test]
+fn function_starts_count_stops_at_the_terminator_or_a_truncated_delta() {
+    fn count(data: &[u8]) -> Option<f64> {
+        let mut file = Vec::new();
+        for word in [0xfeed_facf_u32, 0x0100_0007, 3, 2, 1, 16, 0, 0] {
+            file.extend_from_slice(&word.to_le_bytes());
+        }
+        // LC_FUNCTION_STARTS, cmdsize 16, data right after the command.
+        for word in [0x26_u32, 16, 48, data.len() as u32] {
+            file.extend_from_slice(&word.to_le_bytes());
+        }
+        file.extend_from_slice(data);
+        let macho = MachO::parse(&file, 0).expect("minimal Mach-O");
+        let mut values = Values::new();
+        let mut metrics = Metrics::new();
+        function_starts(&macho, &file, &mut values, &mut metrics);
+        metrics.get("macho.function_starts_count")
+    }
+    // Deltas 0x10, 0x80, 0x4, then the terminator and padding.
+    assert_eq!(count(&[0x10, 0x80, 0x01, 0x04, 0x00, 0x05]), Some(3.0));
+    // A delta cut off mid-encoding is not a function start.
+    assert_eq!(count(&[0x10, 0x80]), Some(1.0));
+}
+
+/// Run [`extract`] on a 2 MiB thread — a Rayon worker's stack — and return
+/// what it recorded in the errors view.
+fn errors_on_worker_stack(bytes: Vec<u8>) -> Errors {
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            let mut out = crate::formats::Sinks::default();
+            extract(&bytes, out.ctx());
+            out.errors
+        })
+        .expect("spawn")
+        .join()
+        .expect("join")
+}
+
+/// A forged bind repeat count is refused before goblin allocates for it, and
+/// the refusal is visible in the errors view rather than only in debug logs.
+#[test]
+fn oversized_bind_stream_is_recorded_as_malformed() {
+    // BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB, count 2^32 - 1, skip 0.
+    let bind = [0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, 0x00];
+    let file = crate::formats::goblin_safe::tests::macho_with_dyld_info(&bind, &[]);
+    let errors = errors_on_worker_stack(file);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == crate::output::DiagnosticKind::Malformed
+                && e.stage == crate::Stage::MachoParse
+                && e.message.contains("bind opcodes declare")),
+        "{errors:?}"
+    );
+}
+
+/// An export trie too deep for goblin's recursive walk is refused, and the
+/// refusal is recorded.
+#[test]
+fn deep_export_trie_is_recorded_as_malformed() {
+    let file = crate::formats::goblin_safe::tests::macho_with_dyld_info(
+        &[],
+        &crate::formats::goblin_safe::tests::chain_trie(5000),
+    );
+    let errors = errors_on_worker_stack(file);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == crate::output::DiagnosticKind::Malformed
+                && e.stage == crate::Stage::MachoParse
+                && e.message.contains("export trie")),
+        "{errors:?}"
+    );
 }

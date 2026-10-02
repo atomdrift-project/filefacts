@@ -343,7 +343,7 @@ impl Builder<'_> {
         let id = self.result.flow.values.len();
         self.result.flow.values.push(FlowValue {
             kind,
-            offset,
+            offset: offset as u64,
             inputs,
             literal: None,
             target: None,
@@ -849,7 +849,7 @@ impl Builder<'_> {
             .flow
             .values
             .get(value)
-            .is_some_and(|v| v.kind == FlowKind::Call && v.offset == rhs.start)
+            .is_some_and(|v| v.kind == FlowKind::Call && v.offset == rhs.start as u64)
         {
             shape = ArgShape::Call;
         }
@@ -941,7 +941,13 @@ impl Builder<'_> {
             self.gap("binding-budget");
             return;
         }
-        let Some(offset) = self.result.flow.values.get(call).map(|v| v.offset) else {
+        let Some(offset) = self
+            .result
+            .flow
+            .values
+            .get(call)
+            .and_then(|v| usize::try_from(v.offset).ok())
+        else {
             return;
         };
         let result = self.add(FlowKind::Call, offset, vec![object]);
@@ -1355,7 +1361,7 @@ mod response_tests {
                         p.flow.values[origin.value].target.as_deref() == Some("cffile:read-result")
                     })
             })
-            .map(|v| v.offset)
+            .map(|v| v.offset as usize)
             .collect()
     }
     #[test]
@@ -1374,7 +1380,7 @@ mod response_tests {
                 .iter()
                 .find(|v| v.target.as_deref() == Some(name))
                 .unwrap();
-            assert!(source[call.offset..].starts_with(format!("<{name}").as_bytes()));
+            assert!(source[call.offset as usize..].starts_with(format!("<{name}").as_bytes()));
             assert_eq!(p.flow.values[call.inputs[0]].kind, FlowKind::Keyword);
         }
     }
@@ -1469,7 +1475,7 @@ fn response_result_identity_and_truncations() {
     for end in 0..=source.len() {
         let p = parse(&source[..end]);
         for value in &p.flow.values {
-            assert!(value.offset <= end);
+            assert!(value.offset <= end as u64);
             assert!(value.inputs.iter().all(|&v| v < p.flow.values.len()));
         }
     }

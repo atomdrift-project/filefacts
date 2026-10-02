@@ -23,7 +23,6 @@ use crate::metric;
 use crate::value_key;
 use serde_json::{Value as JsonValue, json};
 
-use crate::error::Error;
 use crate::formats::common::{XorScan, extract_binary_strings, put_str};
 use crate::formats::image_stats;
 use crate::output::{Metrics, Strings, Values};
@@ -34,13 +33,13 @@ pub(super) fn extract(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
-) -> Result<(), Error> {
+) {
     extract_binary_strings(bytes, strings, XorScan::No);
 
     let mut coverage = Coverage::new("jpeg", 2);
     if !bytes.starts_with(&[0xFF, 0xD8]) {
         carrier::emit(bytes, &Coverage::unrecognized(), values, metrics);
-        return Ok(());
+        return;
     }
 
     let mut state = JpegState::default();
@@ -226,8 +225,6 @@ pub(super) fn extract(
     // a JPEG with a weird color space or a truncated bitstream still
     // gets the structural metrics above.
     extract_pixel_stats(bytes, metrics);
-
-    Ok(())
 }
 
 /// Decode the JPEG (cap-protected) and emit pixel-statistic metrics:
@@ -459,7 +456,7 @@ fn walk_ifd(tiff: &[u8], off: usize, little: bool, st: &mut JpegState, is_root: 
             0x927C if !is_root => {
                 st.maker_note_bytes = st
                     .maker_note_bytes
-                    .saturating_add(total_bytes.min(u32::MAX as usize) as u32);
+                    .saturating_add(crate::bytes::sat_u32(total_bytes));
             }
             0x8769 if is_root => {
                 exif_ifd_off = Some(read_u32(value_off_field).unwrap_or(0) as usize)
@@ -505,7 +502,7 @@ mod tests {
         let mut v = Values::new();
         let mut s = Strings::default();
         let mut m = Metrics::new();
-        extract(bytes, &mut v, &mut s, &mut m).unwrap();
+        extract(bytes, &mut v, &mut s, &mut m);
         (v, m)
     }
 

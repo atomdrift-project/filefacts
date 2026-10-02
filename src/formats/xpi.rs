@@ -26,8 +26,7 @@
 use serde_json::Value as JsonValue;
 use std::io::{Read, Seek};
 
-use crate::error::Error;
-use crate::output::{Errors, Metrics, Stage, Values};
+use crate::output::{Errors, Metrics, Values};
 use crate::value_key;
 
 pub(super) fn extract_from_archive<R: Read + Seek>(
@@ -35,7 +34,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     values: &mut Values,
     _metrics: &mut Metrics,
     errors: &mut Errors,
-) -> Result<(), Error> {
+) {
     let mut has_manifest_json = false;
     let mut has_install_rdf = false;
     let mut has_chrome_manifest = false;
@@ -99,8 +98,6 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             emit_manifest_identity(&manifest, values);
         }
     }
-
-    Ok(())
 }
 
 /// Read and parse the root `manifest.json` of an opened XPI, which the
@@ -111,30 +108,7 @@ fn read_manifest<R: Read + Seek>(
     values: &mut Values,
     errors: &mut Errors,
 ) -> Option<JsonValue> {
-    const NAME: &str = "manifest.json";
-    const MAX: u64 = 512 * 1024;
-    let mut buf = Vec::new();
-    if let Err(e) = zip
-        .by_name(NAME)
-        .map_err(std::io::Error::other)
-        .and_then(|member| member.take(MAX + 1).read_to_end(&mut buf))
-    {
-        errors.record_malformed(Stage::ZipParse, format!("{NAME}: {e}"));
-        return None;
-    }
-    if buf.len() as u64 > MAX {
-        values.insert_key(
-            value_key!("xpi.limits"),
-            serde_json::json!([{
-                "stage": "manifest",
-                "reason": format!("{NAME} over the {MAX}-byte cap; not parsed"),
-            }]),
-        );
-        return None;
-    }
-    serde_json::from_slice(&super::crx::browser_manifest_json(&buf))
-        .map_err(|e| errors.record_malformed(Stage::FormatExtract, format!("{NAME}: {e}")))
-        .ok()
+    super::crx::read_browser_manifest(zip, values, errors, value_key!("xpi.limits"))
 }
 
 /// Emit `xpi.author` / `xpi.homepage` and a non-localized name and
@@ -183,6 +157,7 @@ fn emit_manifest_identity(manifest: &JsonValue, values: &mut Values) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::Stage;
     use std::io::{Cursor, Write};
     use zip::CompressionMethod;
     use zip::write::SimpleFileOptions;
@@ -212,7 +187,7 @@ mod tests {
         let mut m = Metrics::new();
         let mut e = Errors::new();
         if let Ok(mut zip) = crate::formats::zip::open_archive(bytes) {
-            extract_from_archive(&mut zip, &mut v, &mut m, &mut e).unwrap();
+            extract_from_archive(&mut zip, &mut v, &mut m, &mut e);
         }
         (v, e)
     }
@@ -224,7 +199,7 @@ mod tests {
         let err = &e.as_slice()[0];
         assert_eq!(
             (err.stage, err.kind),
-            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+            (Stage::FormatExtract, crate::DiagnosticKind::Malformed)
         );
         assert!(err.message.starts_with("manifest.json:"), "{}", err.message);
         // The filename-shape facts still stand.

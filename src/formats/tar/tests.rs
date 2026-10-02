@@ -346,3 +346,27 @@ fn builder_unames_collected_when_present() {
         .unwrap();
     assert!(gnames.iter().any(|s| s.as_str() == Some("dev")));
 }
+
+/// A tar of empty files holds a member per 512 bytes. Past the shared
+/// member cap they are counted, not listed, and the cap is recorded.
+#[test]
+fn members_past_the_cap_are_counted_not_listed() {
+    let one = build_tar(&[("f", 0o644, 0, 0, 0, b"")]);
+    let header = &one[..512];
+    let total = MAX_ARCHIVE_MEMBERS + 2;
+    let mut bytes = Vec::with_capacity(total * 512 + 1024);
+    for _ in 0..total {
+        bytes.extend_from_slice(header);
+    }
+    bytes.extend_from_slice(&[0_u8; 1024]);
+    let mut v = Values::new();
+    let mut m = Metrics::new();
+    let mut typed = Vec::new();
+    extract(&bytes, FileType::Tar, &mut v, &mut m, &mut typed).unwrap();
+    assert_eq!(typed.len(), MAX_ARCHIVE_MEMBERS);
+    let listed = v.get("archive.members").and_then(|x| x.as_array()).unwrap();
+    assert_eq!(listed.len(), MAX_ARCHIVE_MEMBERS);
+    assert_eq!(m.get("archive.member_count"), Some(total as f64));
+    let limits = v.get("tar.limits").and_then(|x| x.as_array()).unwrap();
+    assert_eq!(limits[0]["stage"].as_str(), Some("member-cap"));
+}

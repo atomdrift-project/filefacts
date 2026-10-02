@@ -9,7 +9,6 @@ use std::io::{Read, Seek};
 
 use serde_json::Value as JsonValue;
 
-use crate::error::Error;
 use crate::output::{Errors, Metrics, Stage, ValueKey, Values};
 use crate::value_key;
 
@@ -21,41 +20,43 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     values: &mut Values,
     _metrics: &mut Metrics,
     errors: &mut Errors,
-) -> Result<(), Error> {
+) {
     // The manifest is a single root-level `{id}.nuspec`.
     let Some(name) = zip
         .file_names()
         .find(|n| n.ends_with(".nuspec") && !n.contains('/'))
         .map(str::to_string)
     else {
-        return Ok(());
+        return;
     };
-    let mut buf = Vec::new();
-    if let Err(e) = zip
-        .by_name(&name)
-        .map_err(std::io::Error::other)
-        .and_then(|member| member.take(MAX_NUSPEC + 1).read_to_end(&mut buf))
-    {
-        errors.record_malformed(Stage::ZipParse, format!("{name}: {e}"));
-        return Ok(());
-    }
-    if buf.len() as u64 > MAX_NUSPEC {
-        values.insert_key(
-            value_key!("nupkg.limits"),
-            serde_json::json!([{
-                "stage": "nuspec",
-                "reason": format!("{name} over the {MAX_NUSPEC}-byte cap; not parsed"),
-            }]),
-        );
-        return Ok(());
-    }
+    // The name came from the listing, so an absent member is as much a
+    // failure as an unreadable one.
+    let buf = match super::zip::read_member(zip, &name, MAX_NUSPEC) {
+        Ok(Some(buf)) => buf,
+        Ok(None) => {
+            errors.record_malformed(Stage::ZipParse, format!("{name}: listed but not found"));
+            return;
+        }
+        Err(super::zip::MemberError::TooLarge { max }) => {
+            super::bounded::push_limit(
+                values,
+                value_key!("nupkg.limits"),
+                "nuspec",
+                format!("{name} over the {max}-byte cap; not parsed"),
+            );
+            return;
+        }
+        Err(e) => {
+            errors.record_malformed(Stage::ZipParse, format!("{name}: {e}"));
+            return;
+        }
+    };
     let parsed = String::from_utf8(buf)
         .map_err(|e| format!("not UTF-8: {e}"))
         .and_then(|text| parse_nuspec(&text, values).map_err(|e| e.to_string()));
     if let Err(why) = parsed {
         errors.record_malformed(Stage::FormatExtract, format!("{name}: {why}"));
     }
-    Ok(())
 }
 
 /// Emit `nupkg.*` from a `.nuspec`. `authors` / `owners` are
@@ -109,7 +110,7 @@ mod tests {
         let mut zip = ::zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
         let mut v = Values::new();
         let mut e = Errors::new();
-        extract_from_archive(&mut zip, &mut v, &mut Metrics::new(), &mut e).unwrap();
+        extract_from_archive(&mut zip, &mut v, &mut Metrics::new(), &mut e);
         (v, e)
     }
 
@@ -120,7 +121,7 @@ mod tests {
         let err = &e.as_slice()[0];
         assert_eq!(
             (err.stage, err.kind),
-            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+            (Stage::FormatExtract, crate::DiagnosticKind::Malformed)
         );
         assert!(err.message.starts_with("Acme.nuspec:"), "{}", err.message);
         assert!(v.get("nupkg.limits").is_none());

@@ -10,60 +10,154 @@
 //!   JSON / YAML / TOML / etc.). The precise tier — no comment /
 //!   code false positives.
 //!
-//! Both collections carry the same row shape ([`ExtractedString`]);
-//! the *container* identifies which tier produced the row.
+//! The two tiers have two row types, because they record different things:
+//!
+//! - [`Text`] rows are [`stng::ExtractedString`] (re-exported as
+//!   `filefacts::stng`): the scanner's own record, with its typed
+//!   [`stng::StringMethod`] and [`stng::StringKind`], and its exact source
+//!   extent (`data_offset`, `data_len`, stack-string fragments).
+//! - [`Literals`] and [`Comments`] rows are [`Literal`]: a parser-recovered
+//!   value, its file offset, and how it was recovered when a parser did more
+//!   than read a quoted string.
+//!
+//! Both carry `u64` file offsets. The *container* identifies the tier.
 
 use serde::{Deserialize, Serialize};
 
 use super::Span;
 
-/// One extracted string with its offset and optional metadata.
+/// How a [`Literal`] was recovered, when more than reading a quoted string
+/// out of a parse tree was involved.
 ///
-/// `offset` is the byte position of the first character within the
-/// source bytes given to `filefacts::open`. For UTF-16 strings, this
-/// is the byte offset of the first code unit, not a character index.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Serialized as the kebab-case label (`"scpt-literal"`, `"nib-string"`,
+/// `"scpt-base64"`, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
-pub struct ExtractedString {
-    /// Decoded text. UTF-16LE runs are decoded to UTF-8 here; invalid
-    /// surrogates are replaced with `U+FFFD`.
+pub enum LiteralMethod {
+    /// A string literal read from compiled AppleScript.
+    ScptLiteral,
+    /// A constant recovered from compiled AppleScript bytecode.
+    ScptConstant,
+    /// A base64 payload decoded out of an AppleScript literal.
+    ScptBase64,
+    /// An obfuscated base64 payload decoded out of an AppleScript literal.
+    ScptBase64Obf,
+    /// A hex payload decoded out of an AppleScript literal.
+    ScptHex,
+    /// A URL-encoded payload decoded out of an AppleScript literal.
+    ScptUrl,
+    /// A `\uXXXX`-escaped payload decoded out of an AppleScript literal.
+    ScptUnicodeEscape,
+    /// A base32 payload decoded out of an AppleScript literal.
+    ScptBase32,
+    /// A base85 payload decoded out of an AppleScript literal.
+    ScptBase85,
+    /// A ROT13-then-base64 payload decoded out of an AppleScript literal.
+    ScptRot13Base64,
+    /// A string from a compiled Interface Builder (`.nib`) archive.
+    NibString,
+}
+
+impl LiteralMethod {
+    /// The serialized label, e.g. `"scpt-literal"`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ScptLiteral => "scpt-literal",
+            Self::ScptConstant => "scpt-constant",
+            Self::ScptBase64 => "scpt-base64",
+            Self::ScptBase64Obf => "scpt-base64-obf",
+            Self::ScptHex => "scpt-hex",
+            Self::ScptUrl => "scpt-url",
+            Self::ScptUnicodeEscape => "scpt-unicode-escape",
+            Self::ScptBase32 => "scpt-base32",
+            Self::ScptBase85 => "scpt-base85",
+            Self::ScptRot13Base64 => "scpt-rot13-base64",
+            Self::NibString => "nib-string",
+        }
+    }
+}
+
+/// The encoding a [`Literal`]'s source bytes were stored in, when it is not
+/// the file's own text encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum LiteralEncoding {
+    /// UTF-8.
+    Utf8,
+    /// UTF-16, big-endian.
+    Utf16be,
+}
+
+/// One parser-recovered string: a [`Literals`] or [`Comments`] row.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct Literal {
+    /// The value, decoded to UTF-8.
     pub text: String,
-    /// Byte offset of the first character in the source bytes.
-    pub offset: usize,
-    /// Recovery method when something more specific than the byte-level
-    /// tier applies — e.g. `"go-string"` for a fat-pointer Go string,
-    /// `"rust-string"` for `&str`/`String`, `"xor"` for an
-    /// XOR-deobfuscated run, `"base64"` for a base64-decoded payload.
-    /// `None` for plain ASCII / UTF-16 runs that need no annotation.
+    /// Byte offset in the analysed file where the value's source starts.
+    /// `0` for a comment body, whose position is not tracked.
+    pub offset: u64,
+    /// How the value was recovered; `None` for a literal read straight out
+    /// of a parse tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub method: Option<String>,
-    /// Classifier kind when the recovered string fits a recognised
-    /// shape (e.g. `"url"`, `"path"`, `"sql"`). Used by trait engines
-    /// that want to filter by intent rather than substring.
+    pub method: Option<LiteralMethod>,
+    /// How the value's source bytes were encoded; `None` when they are in
+    /// the file's own text encoding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-    /// Section the string was recovered from when the format had
-    /// addressable sections (PE/ELF/Mach-O); `None` for bare byte
-    /// scans.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub section: Option<String>,
-    /// Virtual address — set when the extractor knew the loaded
-    /// image's layout (rizin's `izj` output). `None` for byte-level
-    /// scans that only know the file offset.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vaddr: Option<u64>,
-    /// Physical / file offset reported by the extractor. Distinct
-    /// from `offset` only when an extractor labels positions in a
-    /// layout the slice itself doesn't expose — e.g. rizin's `paddr`
-    /// for a string discovered inside a packed section the byte-level
-    /// scan didn't reach.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub paddr: Option<u64>,
-    /// Encoding label as the extractor reports it (`"ascii"`, `"utf8"`,
-    /// `"utf16le"`, `"utf32le"`, …). `None` when the container's
-    /// tier already implies it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encoding: Option<String>,
+    pub encoding: Option<LiteralEncoding>,
+}
+
+impl Literal {
+    /// A literal recovered at `offset` with no further annotation.
+    #[must_use]
+    pub fn new(text: impl Into<String>, offset: u64) -> Self {
+        Self {
+            text: text.into(),
+            offset,
+            method: None,
+            encoding: None,
+        }
+    }
+
+    /// Annotate how the value was recovered.
+    #[must_use]
+    pub fn with_method(mut self, method: LiteralMethod) -> Self {
+        self.method = Some(method);
+        self
+    }
+
+    /// Annotate how the value's source bytes were encoded.
+    #[must_use]
+    pub fn with_encoding(mut self, encoding: LiteralEncoding) -> Self {
+        self.encoding = Some(encoding);
+        self
+    }
+}
+
+/// Producer-side row for the tree-sitter extractors, which locate nodes by
+/// `usize` byte offset. Converted to a [`Literal`] on push; new producers
+/// build a [`Literal`] directly.
+#[derive(Debug, Default)]
+pub(crate) struct ExtractedString {
+    pub(crate) text: String,
+    pub(crate) offset: usize,
+    /// Never set by the source extractors; present so their
+    /// `..Default::default()` row literals stay meaningful.
+    pub(crate) method: Option<LiteralMethod>,
+}
+
+impl From<ExtractedString> for Literal {
+    fn from(row: ExtractedString) -> Self {
+        Self {
+            text: row.text,
+            offset: row.offset as u64,
+            method: row.method,
+            encoding: None,
+        }
+    }
 }
 
 /// Byte-scan extracted strings — the Unix `strings(1)` tier.
@@ -190,22 +284,22 @@ impl<'de> Deserialize<'de> for Text {
 /// runs — no comment or code false positives.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Literals(Vec<ExtractedString>);
+pub struct Literals(Vec<Literal>);
 
 impl Literals {
     /// Empty collection.
     pub fn new() -> Self {
         Self::default()
     }
-    pub(crate) fn push(&mut self, lit: ExtractedString) {
-        self.0.push(lit);
+    pub(crate) fn push(&mut self, lit: impl Into<Literal>) {
+        self.0.push(lit.into());
     }
     /// Borrow the underlying slice.
-    pub fn as_slice(&self) -> &[ExtractedString] {
+    pub fn as_slice(&self) -> &[Literal] {
         &self.0
     }
     /// Iterate every recorded literal.
-    pub fn iter(&self) -> std::slice::Iter<'_, ExtractedString> {
+    pub fn iter(&self) -> std::slice::Iter<'_, Literal> {
         self.0.iter()
     }
     /// Number of literals recorded.
@@ -219,8 +313,8 @@ impl Literals {
 }
 
 impl<'a> IntoIterator for &'a Literals {
-    type Item = &'a ExtractedString;
-    type IntoIter = std::slice::Iter<'a, ExtractedString>;
+    type Item = &'a Literal;
+    type IntoIter = std::slice::Iter<'a, Literal>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
@@ -237,22 +331,22 @@ impl<'a> IntoIterator for &'a Literals {
 /// is mentioned in a comment" rules.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Comments(Vec<ExtractedString>);
+pub struct Comments(Vec<Literal>);
 
 impl Comments {
     /// Empty collection.
     pub fn new() -> Self {
         Self::default()
     }
-    pub(crate) fn push(&mut self, c: ExtractedString) {
-        self.0.push(c);
+    pub(crate) fn push(&mut self, c: impl Into<Literal>) {
+        self.0.push(c.into());
     }
     /// Borrow the underlying slice.
-    pub fn as_slice(&self) -> &[ExtractedString] {
+    pub fn as_slice(&self) -> &[Literal] {
         &self.0
     }
     /// Iterate every recorded comment.
-    pub fn iter(&self) -> std::slice::Iter<'_, ExtractedString> {
+    pub fn iter(&self) -> std::slice::Iter<'_, Literal> {
         self.0.iter()
     }
     /// Number of comments recorded.
@@ -266,8 +360,8 @@ impl Comments {
 }
 
 impl<'a> IntoIterator for &'a Comments {
-    type Item = &'a ExtractedString;
-    type IntoIter = std::slice::Iter<'a, ExtractedString>;
+    type Item = &'a Literal;
+    type IntoIter = std::slice::Iter<'a, Literal>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
@@ -301,12 +395,10 @@ impl Strings {
     /// Each string paired with the source [`Span`] it was recovered from, in
     /// (text.ascii, text.utf16le, literals) order.
     ///
-    /// The span's *offset* is correct for locating the string in the file:
-    /// - a `StackString` is synthesised from scattered instructions, so its
-    ///   bytes are not contiguous at `data_offset` — anchor at the first source
-    ///   fragment instead of claiming a bogus run;
-    /// - a literal recovered by rizin inside a packed section reports its file
-    ///   offset in `paddr`, not the (slice-relative) `offset` — prefer `paddr`.
+    /// The span's *offset* is correct for locating the string in the file: a
+    /// `StackString` is synthesised from scattered instructions, so its bytes
+    /// are not contiguous at `data_offset` — anchor at the first source
+    /// fragment instead of claiming a bogus run.
     ///
     /// The span's *length* is the decoded value's byte length: exact for byte
     /// strings, an under-count for UTF-16LE / base64 (their encoded source is
@@ -325,14 +417,12 @@ impl Strings {
                 .unwrap_or((s.data_offset, s.value.len() as u64));
             (Span::new(off, len), s.value.as_str())
         });
-        // The literals tier is filefacts-native (rizin-recovered, already
-        // decoded); its source length isn't tracked, so use the value length and
-        // the physical file offset (`paddr`) when the slice-relative `offset`
-        // doesn't address the file.
-        let literals = self.literals.iter().map(|s| {
-            let offset = s.paddr.unwrap_or(s.offset as u64);
-            (Span::new(offset, s.text.len() as u64), s.text.as_str())
-        });
+        // The literals tier is already decoded and its source length isn't
+        // tracked, so use the value length.
+        let literals = self
+            .literals
+            .iter()
+            .map(|s| (Span::new(s.offset, s.text.len() as u64), s.text.as_str()));
         text.chain(literals)
     }
 }
@@ -372,20 +462,8 @@ mod tests {
         ]
         .into();
         let literals = Literals(vec![
-            // rizin-recovered inside a packed section: prefer the physical
-            // file offset (paddr) over the slice-relative offset.
-            ExtractedString {
-                text: "packed".into(),
-                offset: 7,
-                paddr: Some(0x500),
-                ..Default::default()
-            },
-            // ordinary literal with no paddr: use offset.
-            ExtractedString {
-                text: "lit".into(),
-                offset: 0x40,
-                ..Default::default()
-            },
+            Literal::new("decoded", 0x500).with_method(LiteralMethod::ScptBase64),
+            Literal::new("lit", 0x40),
         ]);
         let strings = Strings {
             text: Text::from_rows(text_rows),
@@ -398,7 +476,7 @@ mod tests {
             vec![
                 (Span::new(0x100, 4), "STACKSTR"), // first fragment, not (9999, 8)
                 (Span::new(0x10, 5), "plain"),
-                (Span::new(0x500, 6), "packed"), // paddr, not offset 7
+                (Span::new(0x500, 7), "decoded"),
                 (Span::new(0x40, 3), "lit"),
             ]
         );
@@ -432,15 +510,54 @@ mod tests {
     #[test]
     fn literals_is_flat_serde_array() {
         let mut lits = Literals::new();
-        lits.push(ExtractedString {
-            text: "https://example/".into(),
-            offset: 1024,
-            ..Default::default()
-        });
+        lits.push(Literal::new("https://example/", 1024));
+        lits.push(
+            Literal::new("Hello", 7)
+                .with_method(LiteralMethod::ScptLiteral)
+                .with_encoding(LiteralEncoding::Utf16be),
+        );
         let json = serde_json::to_string(&lits).unwrap();
         assert!(json.starts_with('['), "literals serialises as bare array");
+        assert!(
+            json.contains(r#""method":"scpt-literal","encoding":"utf16be""#),
+            "{json}"
+        );
         let back: Literals = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.len(), 1);
-        assert_eq!(back.iter().next().unwrap().text, "https://example/");
+        assert_eq!(back.as_slice(), lits.as_slice());
+    }
+
+    /// The serialized label and `as_str` agree for every method.
+    #[test]
+    fn literal_method_labels_match_serde() {
+        for method in [
+            LiteralMethod::ScptLiteral,
+            LiteralMethod::ScptConstant,
+            LiteralMethod::ScptBase64,
+            LiteralMethod::ScptBase64Obf,
+            LiteralMethod::ScptHex,
+            LiteralMethod::ScptUrl,
+            LiteralMethod::ScptUnicodeEscape,
+            LiteralMethod::ScptBase32,
+            LiteralMethod::ScptBase85,
+            LiteralMethod::ScptRot13Base64,
+            LiteralMethod::NibString,
+        ] {
+            assert_eq!(
+                serde_json::to_value(method).unwrap(),
+                serde_json::Value::from(method.as_str())
+            );
+        }
+    }
+
+    /// A source-extractor row keeps its text and offset through the push.
+    #[test]
+    fn producer_rows_convert_on_push() {
+        let mut lits = Literals::new();
+        lits.push(ExtractedString {
+            text: "x".into(),
+            offset: 9,
+            ..ExtractedString::default()
+        });
+        assert_eq!(lits.as_slice(), &[Literal::new("x", 9)]);
     }
 }

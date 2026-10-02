@@ -28,6 +28,7 @@ use goblin::elf::Elf;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
 
+use super::elf::read_section;
 use crate::output::{Metrics, Values};
 use crate::value_key;
 
@@ -144,17 +145,6 @@ pub(super) fn emit(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &m
     if cu_count > 0 {
         metrics.insert(metric!("elf.dwarf.cu_count"), f64::from(cu_count));
     }
-}
-
-fn read_section<'a>(elf: &Elf<'_>, bytes: &'a [u8], name: &str) -> Option<&'a [u8]> {
-    let sh = elf
-        .section_headers
-        .iter()
-        .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(name))?;
-    let start = usize::try_from(sh.sh_offset).ok()?;
-    let len = usize::try_from(sh.sh_size).ok()?;
-    let end = start.checked_add(len)?;
-    bytes.get(start..end)
 }
 
 fn attr_string<R: Reader>(

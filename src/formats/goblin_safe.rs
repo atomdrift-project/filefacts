@@ -107,6 +107,11 @@ pub(crate) enum Rejection {
         branches: u64,
         available: usize,
     },
+    /// An export-trie path deeper than [`MAX_EXPORT_TRIE_DEPTH`] nodes.
+    ExportTrieTooDeep { node: usize, depth: usize },
+    /// Mach-O bind opcodes that would make goblin synthesize more imports
+    /// than [`MAX_MACHO_BIND_IMPORTS`].
+    OversizedBindStream { stream: &'static str, imports: u64 },
 }
 
 impl fmt::Display for Rejection {
@@ -137,6 +142,14 @@ impl fmt::Display for Rejection {
                 f,
                 "export trie node {node:#x} claims {branches} branches in {available} bytes"
             ),
+            Self::ExportTrieTooDeep { node, depth } => write!(
+                f,
+                "export trie reaches node {node:#x} at depth {depth}, past {MAX_EXPORT_TRIE_DEPTH}"
+            ),
+            Self::OversizedBindStream { stream, imports } => write!(
+                f,
+                "{stream} bind opcodes declare at least {imports} imports, past {MAX_MACHO_BIND_IMPORTS}"
+            ),
         }
     }
 }
@@ -151,6 +164,18 @@ pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+// Every guard in this module, and the per-stage guards in `lib.rs`, turn a
+// parser panic into a recorded error by unwinding. Under `panic = "abort"`
+// `catch_unwind` catches nothing and one malformed file kills the host
+// process, so refuse to build that way rather than silently lose the
+// guarantee.
+#[cfg(panic = "abort")]
+compile_error!(
+    "filefacts requires `panic = \"unwind\"`: hostile inputs make its parsers panic, and \
+     those panics are caught with `catch_unwind` and reported as errors. With \
+     `panic = \"abort\"` a single malformed file would abort the whole process."
+);
+
 thread_local! {
     static SUPPRESS_PANIC_OUTPUT: Cell<bool> = const { Cell::new(false) };
 }
@@ -159,6 +184,14 @@ thread_local! {
 /// messages from threads that opted into suppression. Replaces the
 /// older `take_hook` / `set_hook` swap pattern (which required a
 /// global Mutex to serialize swaps) with a single, race-free install.
+///
+/// This is deliberately process-global — a panic hook cannot be anything
+/// else — but it is installed at most once and only filters: it chains to
+/// whatever hook was installed before it (the host's, or std's default), and
+/// silences a panic only while the panicking thread is inside one of this
+/// module's guards. Panics anywhere else reach the previous hook untouched.
+/// A host that installs its own hook *after* filefacts' first parse replaces
+/// this one, which costs only the suppression of expected parser panics.
 fn install_suppression_hook() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -178,15 +211,16 @@ where
 {
     install_suppression_hook();
 
-    struct Restore;
+    /// Puts back the flag as the guard found it, so a guard nested inside
+    /// another leaves the outer one still suppressing when it returns.
+    struct Restore(bool);
     impl Drop for Restore {
         fn drop(&mut self) {
-            SUPPRESS_PANIC_OUTPUT.with(|flag| flag.set(false));
+            SUPPRESS_PANIC_OUTPUT.with(|flag| flag.set(self.0));
         }
     }
 
-    SUPPRESS_PANIC_OUTPUT.with(|flag| flag.set(true));
-    let _restore = Restore;
+    let _restore = Restore(SUPPRESS_PANIC_OUTPUT.with(|flag| flag.replace(true)));
     panic::catch_unwind(panic::AssertUnwindSafe(f))
 }
 
@@ -237,47 +271,41 @@ impl<'a> PeParse<'a> {
 /// Parse a PE file, panic-safe and with built-in permissive
 /// fallback.
 ///
-/// Strict mode is tried first; if it fails OR panics, the call is
-/// retried with `ParseMode::Permissive`. Returns the strict failure
-/// only when the permissive retry itself panicked (in which case the
-/// strict error is the more actionable signal).
+/// The import directory is budgeted first (see [`import_walk_budget`]); an
+/// over-budget one is dropped and everything else parsed. Otherwise strict
+/// mode is tried; if it fails OR panics, the call is retried with
+/// `ParseMode::Permissive`. Returns the strict failure only when the
+/// permissive retry itself panicked (in which case the strict error is the
+/// more actionable signal).
 pub(crate) fn parse_pe(data: &[u8]) -> PeParse<'_> {
     if let Err(e) = validate_pe_header(data) {
         return PeParse::parsed(GoblinOutcome::Failed(GoblinError::Malformed(e.to_string())));
     }
 
-    let strict = catch(|| PE::parse(data));
-    if matches!(strict, GoblinOutcome::Ok(_)) {
-        return PeParse::parsed(strict);
-    }
-
-    // Strict failed, so the permissive retry is next — but permissive is
-    // exactly the mode whose import walker can run away (see
-    // `import_walk_budget`). Parse once with imports off: that is bounded by
-    // construction, and it yields the section table and file alignment the
-    // budget check needs to resolve the import directory the way goblin will.
     let base_opts = goblin::pe::options::ParseOptions::default()
         .with_parse_mode(goblin::options::ParseMode::Permissive);
-    let importless_opts = base_opts.with_parse_imports(false);
-    let importless = catch(|| PE::parse_with_opts(data, &importless_opts));
 
-    // Fail open: if the import-less parse did not survive either, there is
-    // nothing to budget against, so let the original permissive path run and
-    // report whatever it finds.
-    let over_budget = match &importless {
-        GoblinOutcome::Ok(pe) => import_walk_budget(data, pe).err(),
-        _ => None,
-    };
-
-    if let Some(reason) = over_budget {
+    // Budget the import walk before any full parse. Strict mode is not safe
+    // from it either: a few hundred well-formed descriptors that all share one
+    // long table of ordinal entries make goblin synthesize descriptors x
+    // entries imports, each with its own `format!("ORDINAL n")`, which is
+    // billions from a megabyte. Only the headers and section table are needed
+    // to resolve the directory the way goblin will, and those are cheap.
+    if let Err(reason) = import_walk_budget_from_headers(data) {
         // A forged import directory. Keep every other fact (headers, sections,
         // exports, resources, Authenticode) rather than failing the whole PE:
         // an unwalkable import table is itself a signal, not a reason to go
-        // blind on the sample.
+        // blind on the sample. With imports off the parse is bounded.
+        let importless_opts = base_opts.with_parse_imports(false);
         return PeParse {
-            outcome: importless,
+            outcome: catch(|| PE::parse_with_opts(data, &importless_opts)),
             imports_skipped: Some(reason),
         };
+    }
+
+    let strict = catch(|| PE::parse(data));
+    if matches!(strict, GoblinOutcome::Ok(_)) {
+        return PeParse::parsed(strict);
     }
 
     let permissive = catch(|| PE::parse_with_opts(data, &base_opts));
@@ -301,7 +329,8 @@ const MAX_IMPORT_DESCRIPTORS: usize = 256;
 /// the descriptor cap alone does not bound the product.
 const MAX_IMPORT_LOOKUP_ENTRIES: usize = 256 * 1024;
 
-/// Decide whether goblin's permissive import walk over `data` is bounded.
+/// Decide whether goblin's import walk over `data` is bounded, in either
+/// parse mode.
 ///
 /// `ImportData::parse_with_opts` walks 20-byte descriptors from the import
 /// data directory until one is null or "not possibly valid", and walks each
@@ -312,7 +341,9 @@ const MAX_IMPORT_LOOKUP_ENTRIES: usize = 256 * 1024;
 /// product is quadratic in the file size and, measured on a wedged production
 /// worker 2026-09-04, does not finish: one Rayon thread spent hours inside
 /// `ImportData::parse_with_opts` while every other worker in the shared pool
-/// parked on a join latch behind it, taking the whole process down.
+/// parked on a join latch behind it, taking the whole process down. Strict
+/// mode is exposed too: well-formed descriptors may all share one long lookup
+/// table, and goblin materialises an `Import` per descriptor per entry.
 ///
 /// goblin offers no cap of its own (`ParseOptions::parse_imports` is
 /// all-or-nothing), so this walks the same structure first, using goblin's own
@@ -323,26 +354,31 @@ const MAX_IMPORT_LOOKUP_ENTRIES: usize = 256 * 1024;
 ///
 /// Fails open: anything it cannot resolve counts as within budget, so a PE
 /// shape this pre-walk does not model keeps exactly today's behaviour.
-fn import_walk_budget(data: &[u8], pe: &PE<'_>) -> Result<(), Rejection> {
+fn import_walk_budget(
+    data: &[u8],
+    sections: &[goblin::pe::section_table::SectionTable],
+    optional_header: &goblin::pe::optional_header::OptionalHeader,
+) -> Result<(), Rejection> {
     use goblin::pe::import::SIZEOF_IMPORT_DIRECTORY_ENTRY;
     use goblin::pe::options::ParseOptions;
 
-    let Some(optional_header) = pe.header.optional_header else {
-        return Ok(());
-    };
     let Some(import_table) = optional_header.data_directories.get_import_table() else {
         return Ok(());
     };
     let file_alignment = optional_header.windows_fields.file_alignment;
-    // PE32 lookup entries are 4 bytes, PE32+ are 8. `is_64` is goblin's own
-    // reading of the optional-header magic, the same bit that picks the
-    // `Bitfield` width it walks the table with.
-    let entry_size = if pe.is_64 { 8 } else { 4 };
+    // PE32 lookup entries are 4 bytes, PE32+ are 8: the optional-header magic
+    // is the same bit goblin's `is_64` reads to pick the `Bitfield` width it
+    // walks the table with.
+    let entry_size =
+        if optional_header.standard_fields.magic == goblin::pe::optional_header::MAGIC_64 {
+            8
+        } else {
+            4
+        };
     let opts = ParseOptions::default().with_parse_mode(goblin::options::ParseMode::Permissive);
 
-    let resolve = |rva: u32| {
-        goblin::pe::utils::find_offset(rva as usize, &pe.sections, file_alignment, &opts)
-    };
+    let resolve =
+        |rva: u32| goblin::pe::utils::find_offset(rva as usize, sections, file_alignment, &opts);
 
     let Some(mut offset) = resolve(import_table.virtual_address) else {
         return Ok(());
@@ -389,6 +425,27 @@ fn import_walk_budget(data: &[u8], pe: &PE<'_>) -> Result<(), Rejection> {
     Ok(())
 }
 
+/// [`import_walk_budget`] over the headers and section table alone, read the
+/// way `PE::parse` reads them. Fails open when those do not parse: the full
+/// parse will then fail on the same bytes before it reaches the imports.
+fn import_walk_budget_from_headers(data: &[u8]) -> Result<(), Rejection> {
+    use goblin::pe::header::{SIZEOF_COFF_HEADER, SIZEOF_PE_MAGIC};
+    let GoblinOutcome::Ok(header) = parse_pe_header(data) else {
+        return Ok(());
+    };
+    let Some(optional_header) = header.optional_header else {
+        return Ok(());
+    };
+    let mut offset = (header.dos_header.pe_pointer as usize)
+        .saturating_add(SIZEOF_PE_MAGIC + SIZEOF_COFF_HEADER)
+        .saturating_add(usize::from(header.coff_header.size_of_optional_header));
+    let GoblinOutcome::Ok(sections) = catch(|| header.coff_header.sections(data, &mut offset))
+    else {
+        return Ok(());
+    };
+    import_walk_budget(data, &sections, &optional_header)
+}
+
 /// Detect a Rich header that goblin's parser would treat as a fatal
 /// `Malformed` error — the `Rich` marker is present in the DOS stub but
 /// no XOR-decodable `DanS` table precedes it — and return an owned copy
@@ -405,37 +462,16 @@ fn import_walk_budget(data: &[u8], pe: &PE<'_>) -> Result<(), Rejection> {
 /// absent (`Ok(None)`); filefacts' own `pe_rich` extractor still reads
 /// the untouched bytes, so a genuine Rich hash is unaffected.
 pub(crate) fn neutralize_malformed_rich_header(data: &[u8]) -> Option<Vec<u8>> {
-    const RICH_MAGIC: &[u8; 4] = b"Rich";
-    // "DanS" little-endian as u32.
-    const DANS_MARKER: u32 = 0x536e_6144;
-
-    if data.len() < 0x40 {
+    let rich = super::pe_rich::locate(data)?;
+    // A decodable DanS marker means the header is well-formed and goblin
+    // will parse it without complaint.
+    if rich.dans_pos.is_some() {
         return None;
-    }
-    let e_lfanew = u32_le(data, 0x3c)? as usize;
-    let scan_end = e_lfanew.min(data.len());
-    if scan_end < 8 {
-        return None;
-    }
-    let rich_pos = data
-        .get(..scan_end)?
-        .windows(4)
-        .rposition(|w| w == RICH_MAGIC)?;
-    let key = u32_le(data, rich_pos + 4)?;
-    // Walk backwards in 4-byte words: a decodable DanS marker means the
-    // header is well-formed and goblin will parse it without complaint.
-    let mut pos = rich_pos;
-    while pos >= 4 {
-        pos -= 4;
-        let word = u32_le(data, pos)?;
-        if word ^ key == DANS_MARKER {
-            return None;
-        }
     }
     // No DanS table reachable — goblin would abort. Hand back a copy with
     // the `Rich` magic cleared so its marker scan finds nothing.
     let mut patched = data.to_vec();
-    patched.get_mut(rich_pos..rich_pos + 4)?.fill(0);
+    patched.get_mut(rich.rich_pos..rich.rich_pos + 4)?.fill(0);
     Some(patched)
 }
 
@@ -510,7 +546,7 @@ fn validate_pe_header(data: &[u8]) -> Result<(), Rejection> {
     // directories specifically — they're the two whose forged
     // `size` field most reliably blows up goblin.
     for i in 1..=2 {
-        if n_dirs > i as u32 {
+        if n_dirs as usize > i {
             let dir_ptr = opt_offset + data_dir_offset + (i * 8);
             if let Some(size) = u32_le(data, dir_ptr + 4)
                 && (size > 10 * 1024 * 1024 || size as usize > data.len())
@@ -637,8 +673,14 @@ pub(crate) fn parse_macho_slice(data: &[u8]) -> GoblinOutcome<MachO<'_>> {
 /// file with "loop in children in export trie data"). Neither `catch` nor a
 /// panic hook can stop a walk that never faults.
 ///
+/// The walk is also recursive, so an acyclic but deep trie — a straight chain
+/// of five-byte nodes with empty edge labels — exhausts the stack instead: a
+/// 25 KiB trie is enough on a 2 MiB worker thread, and a stack overflow aborts
+/// the process just as surely as the out-of-memory case.
+///
 /// This walks the same nodes goblin will, iteratively, and refuses the trie on
-/// the first revisited node or branch count the trie cannot hold. Anything
+/// the first revisited node, branch count the trie cannot hold, or path
+/// deeper than [`MAX_EXPORT_TRIE_DEPTH`]. Anything
 /// goblin would itself reject (a truncated ULEB, an edge past the file) is
 /// waved through: goblin's own `Err` is the more precise report for those.
 ///
@@ -664,6 +706,12 @@ pub(crate) fn validate_export_trie(macho: &MachO<'_>, bytes: &[u8]) -> Result<()
     }
 }
 
+/// Deepest export-trie path [`validate_export_trie`] lets goblin recurse
+/// into. dyld's own trie lookup gives up at 128 nodes, so no binary the loader
+/// accepts needs more, and goblin's three frames per level stay far inside a
+/// 2 MiB worker stack at this depth.
+pub(crate) const MAX_EXPORT_TRIE_DEPTH: usize = 128;
+
 /// [`validate_export_trie`] on an explicit trie range; the walk itself.
 fn validate_export_trie_bytes(bytes: &[u8], start: usize, size: usize) -> Result<(), Rejection> {
     // goblin's `new_impl` collapses an out-of-file range to an empty trie.
@@ -673,11 +721,14 @@ fn validate_export_trie_bytes(bytes: &[u8], start: usize, size: usize) -> Result
     // One flag per byte of the trie: a node is at least one byte, so the
     // visited set is bounded by the trie's own size.
     let mut visited = vec![false; size];
-    let mut pending = vec![start];
-    while let Some(node) = pending.pop() {
+    let mut pending = vec![(start, 1usize)];
+    while let Some((node, depth)) = pending.pop() {
         // goblin's `walk_trie` returns Ok for a node at or past the end.
         if node >= end {
             continue;
+        }
+        if depth > MAX_EXPORT_TRIE_DEPTH {
+            return Err(Rejection::ExportTrieTooDeep { node, depth });
         }
         // `node >= start`: it is `start` or a child offset added to it.
         let Some(seen) = visited.get_mut(node - start) else {
@@ -693,7 +744,7 @@ fn validate_export_trie_bytes(bytes: &[u8], start: usize, size: usize) -> Result
         let children_start = if terminal_size == 0 {
             offset
         } else {
-            let Some(next) = offset.checked_add(terminal_size as usize) else {
+            let Some(next) = offset.checked_add(crate::bytes::sat_usize(terminal_size)) else {
                 return Ok(());
             };
             next
@@ -731,11 +782,102 @@ fn validate_export_trie_bytes(bytes: &[u8], start: usize, size: usize) -> Result
             else {
                 return Ok(());
             };
-            pending.push(child);
+            pending.push((child, depth + 1));
         }
     }
     Ok(())
 }
 
+/// Imports goblin's bind interpreter may synthesize across a Mach-O's bind
+/// and lazy-bind streams. Each costs an `Import` (about 100 bytes) plus a
+/// symbol downstream; the largest frameworks bind tens of thousands of slots,
+/// so this is generous for real binaries and still bounds the allocation.
+pub(crate) const MAX_MACHO_BIND_IMPORTS: u64 = 256 * 1024;
+
+/// Pre-validate the dyld bind opcodes before `macho.imports()` runs them.
+///
+/// goblin's `BindInterpreter::run` (mach/imports.rs, 0.10.7) executes
+/// `BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB` as `for _ in 0..count {
+/// imports.push(..) }` with `count` read straight from a ULEB, so the seven
+/// bytes `C0 FF FF FF FF 0F 00` ask for four billion imports. The process runs out of
+/// memory long before anything panics, and an allocation failure aborts rather
+/// than unwinding, so [`catch`] cannot contain it.
+///
+/// This replays the same opcode streams goblin will (the last `LC_DYLD_INFO`
+/// or `LC_DYLD_INFO_ONLY` wins, bind stream then lazy-bind stream) and counts
+/// the imports they would produce without materialising any. A stream goblin
+/// would itself reject (a truncated ULEB or symbol name) is waved through:
+/// goblin stops there with its own `Err`.
+pub(crate) fn validate_bind_opcodes(macho: &MachO<'_>, bytes: &[u8]) -> Result<(), Rejection> {
+    use goblin::mach::load_command::CommandVariant;
+    let mut streams = None;
+    for lc in &macho.load_commands {
+        if let CommandVariant::DyldInfo(c) | CommandVariant::DyldInfoOnly(c) = &lc.command {
+            streams = Some([
+                ("bind", c.bind_off as usize, c.bind_size as usize),
+                ("lazy", c.lazy_bind_off as usize, c.lazy_bind_size as usize),
+            ]);
+        }
+    }
+    let mut imports = 0u64;
+    for (stream, off, size) in streams.into_iter().flatten() {
+        imports = count_bind_imports(bytes, off, off.saturating_add(size), imports);
+        if imports > MAX_MACHO_BIND_IMPORTS {
+            return Err(Rejection::OversizedBindStream { stream, imports });
+        }
+    }
+    Ok(())
+}
+
+/// Add the imports one bind-opcode stream at `start..end` would produce to
+/// `imports`, stopping as soon as the total passes the budget.
+fn count_bind_imports(bytes: &[u8], start: usize, end: usize, mut imports: u64) -> u64 {
+    use goblin::mach::bind_opcodes::{
+        BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DO_BIND, BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED,
+        BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB, BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB,
+        BIND_OPCODE_MASK, BIND_OPCODE_SET_ADDEND_SLEB, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
+        BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM,
+    };
+    let mut offset = start;
+    while offset < end && imports <= MAX_MACHO_BIND_IMPORTS {
+        let Some(&opcode) = bytes.get(offset) else {
+            break;
+        };
+        offset += 1;
+        let operand = match opcode & BIND_OPCODE_MASK {
+            BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB
+            | BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB
+            | BIND_OPCODE_ADD_ADDR_ULEB => read_uleb128(bytes, &mut offset).map(|_| ()),
+            // SLEB and ULEB share the continuation-bit framing.
+            BIND_OPCODE_SET_ADDEND_SLEB => read_uleb128(bytes, &mut offset).map(|_| ()),
+            BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM => bytes
+                .get(offset..)
+                .and_then(|rest| rest.iter().position(|&b| b == 0))
+                .map(|len| offset += len + 1),
+            BIND_OPCODE_DO_BIND | BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED => {
+                imports += 1;
+                Some(())
+            }
+            BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB => {
+                imports += 1;
+                read_uleb128(bytes, &mut offset).map(|_| ())
+            }
+            BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB => read_uleb128(bytes, &mut offset)
+                .and_then(|count| {
+                    // goblin reads the skip before pushing anything.
+                    read_uleb128(bytes, &mut offset)?;
+                    imports = imports.saturating_add(count);
+                    Some(())
+                }),
+            _ => Some(()),
+        };
+        if operand.is_none() {
+            // goblin's own read fails here and ends the walk with `Err`.
+            break;
+        }
+    }
+    imports
+}
+
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

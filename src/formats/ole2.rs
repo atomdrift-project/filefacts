@@ -62,8 +62,8 @@ pub(super) fn extract(
     // whole `office.*` view, and a malformed compound file is itself an
     // evasion shape, so the failure is reported rather than passed as an
     // empty document.
-    let mut comp = cfb::CompoundFile::open(cursor)
-        .map_err(|e| Error::malformed_with_source("ole2", e.to_string(), e))?;
+    let mut comp =
+        cfb::CompoundFile::open(cursor).map_err(|e| Error::malformed_caused_by("ole2", e))?;
 
     let mut streams: Vec<String> = Vec::new();
     let mut macro_count: u64 = 0;
@@ -745,13 +745,7 @@ fn read_msg_string<T: Read + std::io::Seek>(
             continue;
         }
         let text = if wide {
-            let units: Vec<u16> = data
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|c| u16::from_le_bytes(*c))
-                .collect();
-            String::from_utf16_lossy(&units)
+            bytes::utf16_lossy(&data, bytes::Endian::Little)
         } else {
             String::from_utf8_lossy(&data).into_owned()
         };
@@ -788,16 +782,20 @@ fn read_stream_data<T: Read + std::io::Seek>(
     let mut stream = comp.open_stream(path).ok()?;
     let mut data = Vec::new();
     if let Err(e) = stream.read_to_end(&mut data) {
-        errors.record_malformed(
-            Stage::Ole2Parse,
-            format!(
-                "stream {:?} unreadable: {e}",
-                path.trim_start_matches(['\x01', '\x05'])
-            ),
-        );
+        record_unreadable_stream(errors, path, &e);
         return None;
     }
     Some(data)
+}
+
+fn record_unreadable_stream(errors: &mut Errors, path: &str, e: &std::io::Error) {
+    errors.record_malformed(
+        Stage::Ole2Parse,
+        format!(
+            "stream {:?} unreadable: {e}",
+            path.trim_start_matches(['\x01', '\x05'])
+        ),
+    );
 }
 
 fn summary_document_security_encrypted(data: &[u8]) -> bool {
@@ -832,13 +830,23 @@ fn word_document_encrypted<T: Read + std::io::Seek>(
     comp: &mut cfb::CompoundFile<T>,
     errors: &mut Errors,
 ) -> bool {
-    let Some(data) = read_stream_data(comp, "WordDocument", errors) else {
+    const PATH: &str = "WordDocument";
+    let Ok(mut stream) = comp.open_stream(PATH) else {
         return false;
     };
-    let Some(flags) = bytes::u16_le(&data, 10) else {
+    // Only the FIB flag word at offset 10 is needed. The rest of the stream
+    // is still read through, into a sink rather than a buffer, so a sector
+    // chain that ends early is recorded like any other unreadable stream.
+    let mut fib = Vec::with_capacity(12);
+    let read = (&mut stream)
+        .take(12)
+        .read_to_end(&mut fib)
+        .and_then(|_| std::io::copy(&mut stream, &mut std::io::sink()));
+    if let Err(e) = read {
+        record_unreadable_stream(errors, PATH, &e);
         return false;
-    };
-    flags & 0x0100 != 0
+    }
+    bytes::u16_le(&fib, 10).is_some_and(|flags| flags & 0x0100 != 0)
 }
 
 /// Read a VT_I4 (signed 32-bit integer) at `(section + offset)`.
@@ -849,7 +857,7 @@ fn word_document_encrypted<T: Read + std::io::Seek>(
 fn read_property_i32(section: &[u8], offset: usize) -> Option<JsonValue> {
     let mut property = Reader::at(section, offset);
     let vt = property.u32_le()?;
-    let v = property.u32_le()? as i32;
+    let v = property.u32_le()?.cast_signed();
     (vt == 0x0003).then(|| JsonValue::Number(v.into()))
 }
 
@@ -920,14 +928,8 @@ fn read_lpwstr(body: &[u8]) -> Option<JsonValue> {
     if chars == 0 {
         return None;
     }
-    let units: Vec<u16> = body
-        .get(4..4 + byte_len)?
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u16::from_le_bytes(*pair))
-        .collect();
-    let s = String::from_utf16_lossy(&units)
+    let units = body.get(4..byte_len.checked_add(4)?)?;
+    let s = bytes::utf16_lossy(units, bytes::Endian::Little)
         .trim_end_matches('\0')
         .to_string();
     if s.is_empty() {
@@ -959,6 +961,12 @@ fn read_filetime(body: &[u8]) -> Option<JsonValue> {
 /// Format a Unix timestamp as ISO-8601 in UTC without pulling in a
 /// date crate. The math is the textbook proleptic-Gregorian
 /// algorithm — Howard Hinnant's `civil_from_days` formula.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "civil_from_days: every intermediate is bounded by the day count of a u64 second value"
+)]
 fn format_iso8601_utc(unix: u64) -> String {
     let seconds_per_day: u64 = 86_400;
     let days = (unix / seconds_per_day) as i64;

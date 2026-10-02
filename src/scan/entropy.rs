@@ -101,8 +101,9 @@ pub(crate) struct WindowedEntropy {
 
 /// Scan `bytes` in fixed [`WINDOW_BYTES`] windows, returning the whole-file
 /// entropy alongside the peak concentrated region. Single `O(n)` byte pass
-/// (each byte counted once into a per-window and a shared global histogram),
-/// then `O(windows)` to locate and bound the peak region. The transient
+/// (each byte counted once into its window's histogram, which is then folded
+/// into the whole-file one), then `O(windows)` to locate and bound the peak
+/// region. The transient
 /// per-window vector is the natural structure for the relative region
 /// search and is dropped on return — it is never part of the result.
 #[must_use]
@@ -114,13 +115,11 @@ pub(crate) fn windowed(bytes: &[u8]) -> WindowedEntropy {
     let mut global = [0u64; 256];
     let mut windows: Vec<f64> = Vec::with_capacity(bytes.len() / WINDOW_BYTES + 1);
     for window in bytes.chunks(WINDOW_BYTES) {
-        let mut hist = [0u64; 256];
-        for &b in window {
-            let bi = usize::from(b);
-            if let (Some(local), Some(total)) = (hist.get_mut(bi), global.get_mut(bi)) {
-                *local += 1;
-                *total += 1;
-            }
+        let hist = histogram(window);
+        // Fold each window into the whole-file histogram once, 256 adds per
+        // window, rather than counting every byte into both.
+        for (total, local) in global.iter_mut().zip(hist) {
+            *total += local;
         }
         windows.push(shannon_from_histogram(&hist, window.len()));
     }
@@ -237,6 +236,35 @@ mod tests {
     #[test]
     fn windowed_empty_is_default() {
         assert_eq!(windowed(&[]), super::WindowedEntropy::default());
+    }
+
+    /// The folded whole-file histogram is exact, so `overall` is bit-for-bit
+    /// a direct `shannon` pass, and each window matches its own direct pass,
+    /// on pseudo-random data whose length is not a window multiple.
+    #[test]
+    fn windowed_matches_a_naive_reference_on_random_data() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let bytes: Vec<u8> = (0..10 * WINDOW_BYTES + 333)
+            .map(|i| {
+                // xorshift64*, with low-entropy stretches mixed in.
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                let r = (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8;
+                if (i / WINDOW_BYTES) % 3 == 1 {
+                    r & 0x0F
+                } else {
+                    r
+                }
+            })
+            .collect();
+        let w = windowed(&bytes);
+        assert_eq!(w.overall.to_bits(), shannon(&bytes).to_bits());
+        let peak = bytes
+            .chunks(WINDOW_BYTES)
+            .map(shannon)
+            .fold(0.0f64, f64::max);
+        assert_eq!(w.peak_entropy.to_bits(), peak.to_bits());
     }
 
     #[test]

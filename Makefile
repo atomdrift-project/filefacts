@@ -14,7 +14,7 @@ CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 # cache across worktrees). Falls back to the cargo default `target` otherwise.
 CARGO_TARGET ?= $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 
-.PHONY: all build release install install-hooks test lint fix fmt clean help bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once
+.PHONY: all build release install install-hooks test lint fix fmt clean help bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once fuzz
 
 all: build
 
@@ -37,6 +37,7 @@ help: ## Show this help
 	@echo "  heap-benchmark     - Run the heap-prof binary writing jeprof dumps"
 	@echo "  tuna               - LLM autoresearch loop (alternates mem/cpu)"
 	@echo "  tuna-once          - One tuna cycle, then cherry-picks accepted commits"
+	@echo "  fuzz               - Run a cargo-fuzz target (FUZZ_TARGET=open_all_views; needs nightly)"
 	@echo "  clean              - Remove build artifacts"
 
 build:
@@ -91,6 +92,10 @@ lint:
 clean:
 	$(CARGO) clean
 	rm -rf $(OUT_DIR)
+
+FUZZ_TARGET ?= open_all_views
+fuzz: ## Run a cargo-fuzz target with RSS and time limits (see fuzz/README.md)
+	cd fuzz && env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo +nightly fuzz run $(FUZZ_TARGET) -- -rss_limit_mb=2048 -timeout=10 -max_len=1048576
 
 $(OUT_DIR):
 	mkdir -p $(OUT_DIR)

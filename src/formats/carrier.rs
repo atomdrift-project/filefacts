@@ -35,7 +35,7 @@ use serde_json::Value as JsonValue;
 use crate::formats::common::bytes_at::u32_le;
 use crate::metric;
 use crate::output::{Metrics, Values};
-use crate::scan::entropy;
+use crate::scan::{classify, entropy};
 use crate::value_key;
 
 /// Bytes of alignment padding tolerated between two adjacent regions before
@@ -325,7 +325,7 @@ pub(crate) fn classify_region(region: &[u8]) -> Option<&'static str> {
     // No signature: fall back to what the byte distribution says. A container
     // never parks readable text or a compressed blob outside its structure.
     if printable_ratio(region) > 0.90 {
-        return Some(if looks_base64(region) {
+        return Some(if classify::is_base64_region(region) {
             "base64"
         } else {
             "text"
@@ -403,16 +403,6 @@ fn starts_line_with(region: &[u8], needle: &[u8]) -> bool {
         from = at + 1;
     }
     false
-}
-
-/// Base64 rather than prose: a long run drawn only from the base64 alphabet.
-fn looks_base64(region: &[u8]) -> bool {
-    let sample = region.get(..4096).unwrap_or(region);
-    let coded = sample
-        .iter()
-        .filter(|&&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'\n' | b'\r'))
-        .count();
-    sample.len() >= 64 && coded * 100 / sample.len() >= 98
 }
 
 /// Fraction of bytes that are printable ASCII or ordinary whitespace.

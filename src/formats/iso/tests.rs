@@ -45,7 +45,7 @@ fn one_file_image(trailing: &[u8]) -> Vec<u8> {
 fn archive_aggregates_cover_files_not_carved_regions() {
     let image = one_file_image(&[0x41; 4096]);
     let (mut values, mut metrics, mut members) = (Values::new(), Metrics::new(), Vec::new());
-    extract(&image, &mut values, &mut metrics, &mut members).unwrap();
+    extract(&image, &mut values, &mut metrics, &mut members);
 
     let listed = values
         .get("archive.members")
@@ -326,7 +326,7 @@ fn susp_payload_starts_after_four_byte_header() {
 
     let mut walk = Walk::new();
     let mut entry = test_entry();
-    walk.parse_susp(&[], &system_use, &mut entry, "/lib", 0);
+    walk.parse_susp(&[], &system_use, &mut entry, "/lib");
 
     assert_eq!(entry.path, "/lib/libsys.so.7");
     assert_eq!(entry.alt_name.as_deref(), Some("libsys.so.7"));
@@ -348,9 +348,73 @@ fn susp_ce_continuation_uses_unshifted_payload() {
 
     let mut walk = Walk::new();
     let mut entry = test_entry();
-    walk.parse_susp(&image, &susp_record(*b"CE", &ce), &mut entry, "", 0);
+    walk.parse_susp(&image, &susp_record(*b"CE", &ce), &mut entry, "");
 
     assert_eq!(entry.path, "/continued-name");
+}
+
+/// A `CE` payload naming `len` bytes at `block`, offset 0.
+fn ce_payload(block: u32, len: u32) -> Vec<u8> {
+    let mut ce = both32(block);
+    ce.extend(both32(0));
+    ce.extend(both32(len));
+    ce
+}
+
+/// A continuation area packed with `CE` entries that all point back at the
+/// area itself. Following each one as it was met made the work grow as
+/// (CEs per area)^hops: 20 per area took most of a minute. The area is now
+/// read once.
+#[test]
+fn self_referencing_ce_area_is_read_once() {
+    let record_len = susp_record(*b"CE", &ce_payload(1, 0)).len();
+    let per_area = SECTOR / record_len;
+    let area_len = (per_area * record_len) as u32;
+    let area: Vec<u8> = (0..per_area)
+        .flat_map(|_| susp_record(*b"CE", &ce_payload(1, area_len)))
+        .collect();
+    let mut image = vec![0_u8; 2 * SECTOR];
+    image[SECTOR..SECTOR + area.len()].copy_from_slice(&area);
+
+    let mut walk = Walk::new();
+    let mut entry = test_entry();
+    let su = susp_record(*b"CE", &ce_payload(1, area_len));
+    walk.parse_susp(&image, &su, &mut entry, "");
+    // The record's own area, then the continuation once.
+    assert_eq!(walk.susp_areas_parsed, 2);
+}
+
+/// Distinct continuation areas chained end to end stop at `MAX_CE_HOPS`.
+#[test]
+fn ce_chain_stops_at_hop_cap() {
+    let hops = MAX_CE_HOPS + 4;
+    let mut image = vec![0_u8; (hops + 2) * SECTOR];
+    for i in 1..=hops {
+        let next = susp_record(*b"CE", &ce_payload((i + 1) as u32, 64));
+        let at = i * SECTOR;
+        image[at..at + next.len()].copy_from_slice(&next);
+    }
+    let mut walk = Walk::new();
+    let mut entry = test_entry();
+    let su = susp_record(*b"CE", &ce_payload(1, 64));
+    walk.parse_susp(&image, &su, &mut entry, "");
+    assert_eq!(walk.susp_areas_parsed, MAX_CE_HOPS + 1);
+}
+
+/// `NM` continuations append to the name, up to a cap.
+#[test]
+fn rock_ridge_name_growth_is_capped() {
+    let mut payload = vec![1_u8]; // flags: continues
+    payload.extend([b'n'; 200]);
+    let part = susp_record(*b"NM", &payload);
+    let su: Vec<u8> = (0..64).flat_map(|_| part.clone()).collect();
+    let mut walk = Walk::new();
+    let mut entry = test_entry();
+    walk.parse_susp(&[], &su, &mut entry, "");
+    assert_eq!(
+        entry.alt_name.as_ref().map(String::len),
+        Some(MAX_ALT_NAME_LEN)
+    );
 }
 
 fn empty_pvd() -> Pvd {

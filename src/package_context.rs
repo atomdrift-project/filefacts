@@ -1,6 +1,7 @@
 //! Bounded, filesystem-independent package relationships. The caller owns
 //! archive traversal; filefacts owns language and manifest semantics.
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One analyzed member, with flattened parser values. Paths are logical archive
@@ -11,6 +12,112 @@ pub struct SourceMember<'a> {
     pub path: &'a str,
     /// Parsed, flattened facts from this member.
     pub values: &'a BTreeMap<String, Value>,
+}
+
+/// One source member's text. Paths are logical archive paths, never read
+/// from the host filesystem.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceFile<'a> {
+    /// Logical member path, including its archive ownership boundary.
+    pub path: &'a str,
+    /// The member's source text.
+    pub source: &'a str,
+}
+
+/// Whether the caller supplied every member of the artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Coverage {
+    /// Every member the artifact holds was supplied.
+    Complete,
+    /// Some members were left out (an archive walk stopped at a limit, a
+    /// member could not be read), so the result is marked truncated.
+    Incomplete,
+}
+
+/// When code in a package context runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum Phase {
+    /// At build time: a Cargo build script.
+    Build,
+    /// Inside the compiler: a Cargo proc-macro crate.
+    ProcMacro,
+    /// When the program runs.
+    Runtime,
+    /// When the package's tests run (a Go `_test.go` variant).
+    Test,
+}
+
+/// Budgets for [`cargo_source_context`] and [`crate::go_source_context`].
+/// A result that hits one is marked `truncated`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ContextLimits {
+    /// Most Go members analysed at all; more leaves the result empty.
+    pub max_go_members: usize,
+    /// Most Go source bytes, summed over members; more leaves the result
+    /// empty.
+    pub max_go_bytes: usize,
+    /// Largest single Go member analysed; a larger one is skipped.
+    pub max_go_member_bytes: usize,
+    /// Most Go package variants reported.
+    pub max_go_packages: usize,
+    /// Most Rust module files visited across every Cargo target.
+    pub max_cargo_visits: usize,
+    /// Most members one Go package variant's payload flow analyses; more
+    /// leaves that variant empty and truncated.
+    pub max_flow_members: usize,
+    /// Most Go source bytes, summed, one package variant's payload flow
+    /// analyses; more leaves that variant empty and truncated.
+    pub max_flow_bytes: usize,
+}
+
+impl Default for ContextLimits {
+    fn default() -> Self {
+        Self {
+            max_go_members: 512,
+            max_go_bytes: 8 * 1024 * 1024,
+            max_go_member_bytes: 2 * 1024 * 1024,
+            max_go_packages: 128,
+            max_cargo_visits: 20_000,
+            max_flow_members: 128,
+            max_flow_bytes: 2 * 1024 * 1024,
+        }
+    }
+}
+
+/// What [`cargo_source_context`] resolved.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct CargoSourceContext {
+    /// One entry per resolved target entry point.
+    pub targets: Vec<CargoTarget>,
+    /// A budget was exhausted, so coverage is incomplete — not clean.
+    pub truncated: bool,
+}
+
+/// One Cargo target entry point and the module files it reaches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct CargoTarget {
+    /// The `Cargo.toml` member that declares the target.
+    pub manifest: String,
+    /// The entry-point member (`build.rs`, `src/lib.rs`, `src/main.rs`, or
+    /// the manifest's override).
+    pub entry: String,
+    /// When the target's code runs.
+    pub phase: Phase,
+    /// Members reached from the entry point through declared modules.
+    pub members: BTreeSet<String>,
+    /// Payload-flow event kinds found in those members.
+    pub events: BTreeSet<String>,
+    /// `<phase>-<event>` labels, kept for existing rules; prefer `phase`
+    /// and `events`.
+    pub behaviors: Vec<String>,
+    /// `<member>:mod <name>` declarations that matched no member, or more
+    /// than one.
+    pub unresolved_modules: BTreeSet<String>,
 }
 
 fn text<'a>(member: &'a SourceMember<'_>, key: &str) -> Option<&'a str> {
@@ -75,11 +182,14 @@ fn resolve(base_file: &str, spec: &str, boundary: &str) -> Option<String> {
 /// Missing/ambiguous modules and exhausted budgets remain explicit. No globbed
 /// source pooling and no filesystem access outside the supplied artifact.
 #[must_use]
-pub fn cargo_source_context(members: &[SourceMember<'_>]) -> Value {
+pub fn cargo_source_context(
+    members: &[SourceMember<'_>],
+    limits: &ContextLimits,
+) -> CargoSourceContext {
     let files: BTreeMap<_, _> = members.iter().map(|m| (m.path, m)).collect();
     let mut targets = Vec::new();
     let mut truncated = false;
-    let mut remaining = 20_000usize;
+    let mut remaining = limits.max_cargo_visits;
     for manifest in members
         .iter()
         .filter(|m| m.path.ends_with("/Cargo.toml") || m.path.ends_with("!!Cargo.toml"))
@@ -89,7 +199,7 @@ pub fn cargo_source_context(members: &[SourceMember<'_>]) -> Value {
         if text(manifest, crate::value_key!("cargo.build_mode").as_str()) != Some("disabled") {
             entries.push((
                 text(manifest, "package.build").unwrap_or("build.rs"),
-                "build",
+                Phase::Build,
             ));
         }
         let phase = if manifest
@@ -98,12 +208,12 @@ pub fn cargo_source_context(members: &[SourceMember<'_>]) -> Value {
             .and_then(Value::as_bool)
             == Some(true)
         {
-            "proc-macro"
+            Phase::ProcMacro
         } else {
-            "runtime"
+            Phase::Runtime
         };
         entries.push((text(manifest, "lib.path").unwrap_or("src/lib.rs"), phase));
-        entries.push(("src/main.rs", "runtime"));
+        entries.push(("src/main.rs", Phase::Runtime));
         for (entry, phase) in entries {
             let Some(entry) =
                 resolve(manifest.path, entry, boundary).filter(|p| files.contains_key(p.as_str()))
@@ -169,19 +279,43 @@ pub fn cargo_source_context(members: &[SourceMember<'_>]) -> Value {
             }
             // Compatibility projection for existing rules. New callers should
             // consume phase/members/events rather than a policy-bearing label.
-            let mut behaviors: Vec<_> = kinds.iter().map(|k| format!("{phase}-{k}")).collect();
+            let label = phase.as_str();
+            let mut behaviors: Vec<_> = kinds.iter().map(|k| format!("{label}-{k}")).collect();
             if kinds.contains("file-http-body") && kinds.contains("ssh-authorized-keys-write") {
                 behaviors.push("connected-file-upload-and-ssh-write".into());
             }
-            targets.push(json!({"manifest":manifest.path,"entry":entry,"phase":phase,"members":visited,"events":kinds,"behaviors":behaviors,"unresolved_modules":missing}));
+            targets.push(CargoTarget {
+                manifest: manifest.path.to_string(),
+                entry,
+                phase,
+                members: visited,
+                events: kinds,
+                behaviors,
+                unresolved_modules: missing,
+            });
         }
     }
-    json!({"targets":targets,"truncated":truncated})
+    CargoSourceContext { targets, truncated }
+}
+
+impl Phase {
+    /// The serialized label, e.g. `"proc-macro"`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::ProcMacro => "proc-macro",
+            Self::Runtime => "runtime",
+            Self::Test => "test",
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
     #[test]
     fn cargo_context_respects_declared_graph_and_disabled_build() {
         let mut manifest = BTreeMap::from([("package.build".into(), json!("bootstrap.rs"))]);
@@ -195,30 +329,62 @@ mod tests {
             json!("ssh-authorized-keys-write"),
         )]);
         let run = |manifest: &BTreeMap<String, Value>| {
-            cargo_source_context(&[
-                SourceMember {
-                    path: "p.zip!!pkg/Cargo.toml",
-                    values: manifest,
-                },
-                SourceMember {
-                    path: "p.zip!!pkg/bootstrap.rs",
-                    values: &root,
-                },
-                SourceMember {
-                    path: "p.zip!!pkg/helper.rs",
-                    values: &helper,
-                },
-                SourceMember {
-                    path: "p.zip!!pkg/unrelated.rs",
-                    values: &unrelated,
-                },
-            ])
+            cargo_source_context(
+                &[
+                    SourceMember {
+                        path: "p.zip!!pkg/Cargo.toml",
+                        values: manifest,
+                    },
+                    SourceMember {
+                        path: "p.zip!!pkg/bootstrap.rs",
+                        values: &root,
+                    },
+                    SourceMember {
+                        path: "p.zip!!pkg/helper.rs",
+                        values: &helper,
+                    },
+                    SourceMember {
+                        path: "p.zip!!pkg/unrelated.rs",
+                        values: &unrelated,
+                    },
+                ],
+                &ContextLimits::default(),
+            )
         };
-        let facts = run(&manifest).to_string();
-        assert!(facts.contains("build-file-http-body"));
-        assert!(!facts.contains("ssh-authorized-keys-write"));
+        let facts = run(&manifest);
+        assert!(!facts.truncated);
+        let [target] = facts.targets.as_slice() else {
+            panic!("one target: {facts:?}");
+        };
+        assert_eq!(target.phase, Phase::Build);
+        assert_eq!(target.behaviors, ["build-file-http-body"]);
+        assert!(!target.events.contains("ssh-authorized-keys-write"));
+        let json = serde_json::to_value(&facts).unwrap();
+        assert_eq!(json["targets"][0]["phase"], "build");
+        assert_eq!(json["targets"][0]["entry"], "p.zip!!pkg/bootstrap.rs");
         manifest.insert("cargo.build_mode".into(), json!("disabled"));
-        assert_eq!(run(&manifest)["targets"], json!([]));
+        assert!(run(&manifest).targets.is_empty());
+    }
+
+    /// An exhausted visit budget is reported, not silently clean.
+    #[test]
+    fn cargo_context_reports_an_exhausted_budget() {
+        let manifest = BTreeMap::new();
+        let lib = BTreeMap::new();
+        let members = [
+            SourceMember {
+                path: "pkg/Cargo.toml",
+                values: &manifest,
+            },
+            SourceMember {
+                path: "pkg/src/lib.rs",
+                values: &lib,
+            },
+        ];
+        let mut limits = ContextLimits::default();
+        assert!(!cargo_source_context(&members, &limits).truncated);
+        limits.max_cargo_visits = 0;
+        assert!(cargo_source_context(&members, &limits).truncated);
     }
     #[test]
     fn element_field_matches_only_array_element_fields() {

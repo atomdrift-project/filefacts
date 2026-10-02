@@ -17,7 +17,6 @@ use std::io::Read;
 use flate2::read::MultiGzDecoder;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::error::Error;
 use crate::metric;
 use crate::output::{Metrics, Values};
 use crate::value_key;
@@ -44,11 +43,7 @@ fn octal_field(field: &[u8]) -> usize {
     usize::from_str_radix(text.trim(), 8).unwrap_or(0)
 }
 
-pub(super) fn extract(
-    bytes: &[u8],
-    values: &mut Values,
-    metrics: &mut Metrics,
-) -> Result<(), Error> {
+pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     values.insert_key(
         value_key!("archive.format.kind"),
         JsonValue::String("apk".into()),
@@ -68,7 +63,7 @@ pub(super) fn extract(
         .is_err()
         && buf.is_empty()
     {
-        return Ok(());
+        return;
     }
 
     let mut pkginfo: Option<String> = None;
@@ -113,7 +108,7 @@ pub(super) fn extract(
     );
 
     let Some(text) = pkginfo else {
-        return Ok(());
+        return;
     };
 
     // `.PKGINFO` is `key = value` lines. `depend` and `provides` repeat, so
@@ -193,7 +188,6 @@ pub(super) fn extract(
             f64::from(u8::from(name != origin)),
         );
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -237,7 +231,7 @@ mod tests {
         );
         let mut values = Values::default();
         let mut metrics = Metrics::default();
-        extract(&bytes, &mut values, &mut metrics).unwrap();
+        extract(&bytes, &mut values, &mut metrics);
 
         assert_eq!(
             values.get("apk.name").and_then(JsonValue::as_str),
@@ -263,7 +257,7 @@ mod tests {
         );
         let mut values = Values::default();
         let mut metrics = Metrics::default();
-        extract(&bytes, &mut values, &mut metrics).unwrap();
+        extract(&bytes, &mut values, &mut metrics);
 
         assert_eq!(
             values.get("apk.name").and_then(JsonValue::as_str),
@@ -285,7 +279,7 @@ mod tests {
     fn a_non_package_yields_no_fields() {
         let mut values = Values::default();
         let mut metrics = Metrics::default();
-        extract(b"not gzip at all", &mut values, &mut metrics).unwrap();
+        extract(b"not gzip at all", &mut values, &mut metrics);
         assert!(values.get("apk.name").is_none());
     }
 }

@@ -48,7 +48,7 @@ const AGGS: &[Agg] = &[
 const SIGNATURE: &[u8] = b"7z\xBC\xAF\x27\x1C";
 /// Signature, version, start-header CRC, then the next header's offset
 /// (relative to the end of this block), size and CRC.
-const SIGNATURE_HEADER_LEN: u64 = 32;
+const SIGNATURE_HEADER_LEN: usize = 32;
 /// Largest next header, raw or decoded, handed to the crate. Real headers run
 /// from a few hundred bytes to a few MiB for archives with very many members.
 const MAX_HEADER_BYTES: u64 = 32 << 20;
@@ -89,7 +89,7 @@ pub(super) fn extract(
         bytes.len() as u64,
         password.as_ref(),
     )
-    .map_err(|err| Error::malformed_with_source("7z", err.to_string(), err))?;
+    .map_err(|err| Error::malformed_caused_by("7z", err))?;
 
     values.insert_key(
         value_key!("archive.format.kind"),
@@ -141,7 +141,10 @@ pub(super) fn extract(
             linkname: None,
             host_os: None,
             // The crate widens the stored CRC-32 to u64; it never exceeds u32.
-            crc32: entry.has_crc.then_some(entry.crc as u32),
+            crc32: entry
+                .has_crc
+                .then(|| u32::try_from(entry.crc).ok())
+                .flatten(),
             encrypted: methods.contains(&"aes256sha256"),
             compression: (compressed_size.is_some() || method.is_some()).then_some(
                 ArchiveCompression {
@@ -171,7 +174,7 @@ fn invalid(why: &str) -> Error {
 /// crate's reads, so each check lands on the same field the crate reads next.
 fn check_header(bytes: &[u8]) -> Result<(), Error> {
     let start = bytes
-        .first_chunk::<{ SIGNATURE_HEADER_LEN as usize }>()
+        .first_chunk::<SIGNATURE_HEADER_LEN>()
         .ok_or_else(|| invalid("signature header truncated"))?;
     if !start.starts_with(SIGNATURE) {
         return Err(invalid("bad signature"));
@@ -187,7 +190,7 @@ fn check_header(bytes: &[u8]) -> Result<(), Error> {
     if size > MAX_HEADER_BYTES {
         return Err(invalid("next header larger than cap"));
     }
-    let header = SIGNATURE_HEADER_LEN
+    let header = (SIGNATURE_HEADER_LEN as u64)
         .checked_add(offset)
         .and_then(|from| file_range(bytes, from, size))
         .ok_or_else(|| invalid("next header overruns file"))?;
@@ -241,7 +244,7 @@ fn decode_header(bytes: &[u8], r: &mut HeaderReader<'_>) -> Result<Option<Vec<u8
         .pack_sizes
         .first()
         .ok_or_else(|| invalid("encoded header has no packed stream"))?;
-    let packed = SIGNATURE_HEADER_LEN
+    let packed = (SIGNATURE_HEADER_LEN as u64)
         .checked_add(info.pack_pos)
         .and_then(|from| file_range(bytes, from, pack_size))
         .ok_or_else(|| invalid("encoded header overruns file"))?;
@@ -250,7 +253,11 @@ fn decode_header(bytes: &[u8], r: &mut HeaderReader<'_>) -> Result<Option<Vec<u8
     let mut out = Vec::new();
     match folder.coders.as_slice() {
         [(id, _)] if *id == Method::ID_COPY => {
-            out.extend_from_slice(packed.get(..unpack_size as usize).unwrap_or(packed));
+            out.extend_from_slice(
+                packed
+                    .get(..crate::bytes::sat_usize(unpack_size))
+                    .unwrap_or(packed),
+            );
         }
         [(id, props)] if *id == Method::ID_LZMA => {
             let Some(&[lc_lp_pb, d0, d1, d2, d3]) = props.get(..5) else {
@@ -265,7 +272,7 @@ fn decode_header(bytes: &[u8], r: &mut HeaderReader<'_>) -> Result<Option<Vec<u8
                 None,
             )
             .and_then(|lzma| lzma.take(unpack_size).read_to_end(&mut out))
-            .map_err(|e| Error::malformed_with_source("7z", format!("encoded header: {e}"), e))?;
+            .map_err(|e| Error::malformed_with_source("7z", "encoded header", e))?;
         }
         // 7-Zip and the crate's own writer use LZMA; anything else cannot be
         // checked here.

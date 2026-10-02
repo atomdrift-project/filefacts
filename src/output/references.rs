@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 /// the bundle's other files rather than fetched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum RefLocator {
     /// A package URL, e.g. `pkg:npm/%40scope/name@1.2.3` or
     /// `pkg:github/owner/repo`.
@@ -99,6 +100,7 @@ pub struct PinnedHash {
 /// for fetching and cross-repo lookup) or an intra-artifact file path
 /// (resolved against the bundle's other files).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Reference {
     /// Normalized, fetchable identity. PURL where possible, else URL.
     pub locator: RefLocator,
@@ -114,9 +116,10 @@ pub struct Reference {
     /// Byte offset into the analysed file, for highlighting and citation —
     /// the start of `evidence`, falling back to the start of the package
     /// name / URL when the full text isn't verbatim (a joined multi-line
-    /// command). `0` only when the source is binary/compressed and nothing
-    /// is locatable.
-    pub offset: u64,
+    /// command). `None` when nothing is locatable (a binary or compressed
+    /// source, or the text was not found).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub offset: Option<u64>,
     /// The content hash the manifest pins this reference to, if any
     /// (go.sum, Cargo.lock, npm `integrity`). A pinned reference is
     /// immutable, which the fetcher uses to cache it longer and to verify
@@ -133,6 +136,25 @@ pub struct Reference {
 }
 
 impl Reference {
+    /// A reference with no located offset, pin or content hash.
+    #[must_use]
+    pub fn new(
+        locator: RefLocator,
+        kind: RefKind,
+        source: impl Into<String>,
+        evidence: impl Into<String>,
+    ) -> Self {
+        Self {
+            locator,
+            kind,
+            source: source.into(),
+            evidence: evidence.into(),
+            offset: None,
+            pinned_hash: None,
+            content_sha256: None,
+        }
+    }
+
     /// Whether this reference is a fetch target. A source repository is
     /// identity and an unclassified reference is not actioned, so neither
     /// is fetched; dependencies, commands, and URL fetches are.

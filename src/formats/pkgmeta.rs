@@ -49,16 +49,32 @@ const SCALAR_FIELDS: &[&str] = &[
     "pkgbase", "pkgname", "pkgver", "pkgrel", "epoch", "url", "pkgdesc",
 ];
 
+/// Keys [`finalize`] derives under `pkg.`. A field of the same name in the
+/// file would replace or feed the derived fact (`url_github_owner = victim`
+/// passes as an architecture-suffixed `url`), so it is never read.
+const DERIVED_FIELDS: &[&str] = &["checksums", "source_github_owners", "url_github_owner"];
+
+/// The field an architecture-suffixed key extends (`source_x86_64` → `source`).
+fn base_field(key: &str) -> &str {
+    key.split_once('_').map_or(key, |(b, _)| b)
+}
+
 fn is_known_field(key: &str) -> bool {
-    // architecture-suffixed sums/sources (e.g. `source_x86_64`, `sha256sums_x86_64`)
-    // share the base field's semantics.
-    let base = key.split_once('_').map_or(key, |(b, _)| b);
-    ARRAY_FIELDS.contains(&base) || SCALAR_FIELDS.contains(&key) || SCALAR_FIELDS.contains(&base)
+    // The key becomes a `pkg.<key>` path segment, so it is held to what a bash
+    // variable name allows: a dot would otherwise nest the value elsewhere.
+    if key.is_empty()
+        || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        || DERIVED_FIELDS.contains(&key)
+    {
+        return false;
+    }
+    // Scalars match exactly; architecture-suffixed sums/sources/depends share
+    // the base array field's semantics.
+    SCALAR_FIELDS.contains(&key) || ARRAY_FIELDS.contains(&base_field(key))
 }
 
 fn is_array_field(key: &str) -> bool {
-    let base = key.split_once('_').map_or(key, |(b, _)| b);
-    ARRAY_FIELDS.contains(&base)
+    ARRAY_FIELDS.contains(&base_field(key))
     // `pkgname` is scalar in a PKGBUILD but may repeat in a split-package
     // .SRCINFO; the caller decides via `force_array`.
 }
@@ -99,8 +115,7 @@ fn finalize(root: Map<String, JsonValue>, values: &mut Values) {
     // Sorted + deduped so ordering or algorithm-list differences don't matter.
     let mut sums: Vec<String> = Vec::new();
     for (key, value) in &root {
-        let base = key.split_once('_').map_or(key.as_str(), |(b, _)| b);
-        if base.ends_with("sums") {
+        if base_field(key).ends_with("sums") {
             if let JsonValue::Array(arr) = value {
                 for e in arr {
                     if let JsonValue::String(s) = e {
@@ -117,12 +132,6 @@ fn finalize(root: Map<String, JsonValue>, values: &mut Values) {
     }
     sums.sort();
     sums.dedup();
-    if !sums.is_empty() {
-        values.insert_key(
-            value_key!("pkg.checksums"),
-            JsonValue::String(sums.join(",")),
-        );
-    }
     // Normalized GitHub-owner projections for provenance comparison in traits.
     // The upstream `url`'s owner and every github.com source's owner are emitted
     // as neutral facts; a trait compares the url owner against the source owners
@@ -132,14 +141,13 @@ fn finalize(root: Map<String, JsonValue>, values: &mut Values) {
     // difference (project site vs CDN vs GitHub releases) is normal and is
     // deliberately NOT projected, so only same-host owner divergence is
     // comparable. Parsing lives here; the comparison is pure YAML.
-    if let Some(JsonValue::String(url)) = root.get("url") {
-        if let Some(owner) = github_owner(url) {
-            values.insert_key(value_key!("pkg.url_github_owner"), JsonValue::String(owner));
-        }
-    }
+    let url_owner = match root.get("url") {
+        Some(JsonValue::String(url)) => github_owner(url),
+        _ => None,
+    };
     let mut source_owners: Vec<JsonValue> = Vec::new();
     for (key, value) in &root {
-        if key.split_once('_').map_or(key.as_str(), |(b, _)| b) != "source" {
+        if base_field(key) != "source" {
             continue;
         }
         let JsonValue::Array(arr) = value else {
@@ -157,16 +165,27 @@ fn finalize(root: Map<String, JsonValue>, values: &mut Values) {
             }
         }
     }
+    // Insert each field under `pkg.<field>` so the subtree merges alongside the
+    // generic file.* values rather than replacing the whole values object.
+    // Fields go in before the derived facts, so a derived key always holds
+    // what was derived even if a field name ever reached it.
+    for (key, value) in root {
+        values.insert_key_at(value_key!("pkg"), &key, value);
+    }
+    if !sums.is_empty() {
+        values.insert_key(
+            value_key!("pkg.checksums"),
+            JsonValue::String(sums.join(",")),
+        );
+    }
+    if let Some(owner) = url_owner {
+        values.insert_key(value_key!("pkg.url_github_owner"), JsonValue::String(owner));
+    }
     if !source_owners.is_empty() {
         values.insert_key(
             value_key!("pkg.source_github_owners"),
             JsonValue::Array(source_owners),
         );
-    }
-    // Insert each field under `pkg.<field>` so the subtree merges alongside the
-    // generic file.* values rather than replacing the whole values object.
-    for (key, value) in root {
-        values.insert_key_at(value_key!("pkg"), &key, value);
     }
 }
 
@@ -225,9 +244,8 @@ fn split_array(body: &str) -> Vec<String> {
 
 /// Parse a `.SRCINFO`: `key = value` lines, leading tabs, repeated keys.
 pub(super) fn extract_srcinfo(bytes: &[u8], values: &mut Values) -> Result<(), crate::Error> {
-    let text = std::str::from_utf8(bytes).map_err(|e| {
-        crate::Error::malformed_with_source("srcinfo", format!("input is not utf-8: {e}"), e)
-    })?;
+    let text = std::str::from_utf8(bytes)
+        .map_err(|e| crate::Error::malformed_with_source("srcinfo", "input is not utf-8", e))?;
     let mut root: Map<String, JsonValue> = Map::new();
     for line in text.lines() {
         let line = line.trim();
@@ -278,7 +296,7 @@ pub(super) fn extract_pkgbuild(bytes: &[u8], values: &mut Values, errors: &mut E
             continue;
         };
         let key = key.trim();
-        if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || !is_known_field(key) {
+        if !is_known_field(key) {
             continue;
         }
         let rest = rest.trim_start();
@@ -334,7 +352,7 @@ mod tests {
         let e = &errors.as_slice()[0];
         assert_eq!(
             (e.stage, e.kind),
-            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+            (Stage::FormatExtract, crate::DiagnosticKind::Malformed)
         );
         assert!(v.get("pkg.pkgname").is_none());
     }
@@ -405,6 +423,52 @@ mod tests {
         // Sorted+deduped digest is order-independent → equal across both forms.
         assert_eq!(pkg(&vp, "checksums"), pkg(&vs, "checksums"));
         assert_eq!(pkg(&vp, "checksums"), "aa,bb");
+    }
+
+    /// A file naming a derived key, or a key that only shares a known field's
+    /// prefix, must not overwrite or feed the derived provenance facts.
+    #[test]
+    fn file_fields_cannot_overwrite_derived_facts() {
+        let srcinfo = b"pkgbase = tool-bin\n\turl = https://github.com/foo/tool\n\turl_github_owner = attacker\n\tsource_github_owners = foo\n\tchecksums = forged\n\tsource = https://github.com/attacker/payload/t.tar.gz\n\tsha256sums = aa\n";
+        let pkgbuild_src = b"pkgname=tool-bin\nurl=https://github.com/foo/tool\nurl_github_owner=attacker\nsource_github_owners=(foo)\nchecksums=forged\nsource=('https://github.com/attacker/payload/t.tar.gz')\nsha256sums=('aa')\n";
+        let mut from_srcinfo = Values::new();
+        extract_srcinfo(srcinfo, &mut from_srcinfo).unwrap();
+        let mut from_pkgbuild = Values::new();
+        pkgbuild(pkgbuild_src, &mut from_pkgbuild);
+        for v in [&from_srcinfo, &from_pkgbuild] {
+            assert_eq!(pkg(v, "url_github_owner"), "foo");
+            assert_eq!(
+                v.get("pkg.source_github_owners"),
+                Some(&JsonValue::Array(vec![JsonValue::String(
+                    "attacker".into()
+                )]))
+            );
+            assert_eq!(pkg(v, "checksums"), "aa");
+        }
+    }
+
+    /// A key becomes a path segment; a dot in it must not nest the value.
+    #[test]
+    fn dotted_keys_are_not_fields() {
+        let si = b"pkgbase = foo\n\tsource_x.y = https://example.com/a\n\tpkgver.x = 1\n";
+        let mut v = Values::new();
+        extract_srcinfo(si, &mut v).unwrap();
+        assert!(v.get("pkg.source_x").is_none());
+        assert!(v.get("pkg.pkgver").is_none());
+        assert_eq!(pkg(&v, "pkgbase"), "foo");
+    }
+
+    #[test]
+    fn architecture_suffixed_arrays_are_still_fields() {
+        let si =
+            b"pkgbase = foo\n\tsource_x86_64 = https://example.com/a\n\tsha256sums_x86_64 = bb\n";
+        let mut v = Values::new();
+        extract_srcinfo(si, &mut v).unwrap();
+        assert!(matches!(
+            v.get("pkg.source_x86_64"),
+            Some(JsonValue::Array(_))
+        ));
+        assert_eq!(pkg(&v, "checksums"), "bb");
     }
 
     #[test]

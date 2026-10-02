@@ -18,8 +18,8 @@ pub(super) fn extract(
     values: &mut Values,
     metrics: &mut Metrics,
 ) -> Result<(), Error> {
-    let record: Registry = serde_json::from_slice(bytes)
-        .map_err(|e| Error::malformed_with_source("registry", e.to_string(), e))?;
+    let record: Registry =
+        serde_json::from_slice(bytes).map_err(|e| Error::malformed_caused_by("registry", e))?;
     record.write_facts(values, metrics);
     Ok(())
 }

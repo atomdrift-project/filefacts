@@ -16,8 +16,10 @@
 use serde_json::Value as JsonValue;
 
 use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_value};
+use super::bounded::{MAX_ARCHIVE_MEMBERS, push_limit};
 use crate::error::Error;
 use crate::fileid::FileType;
+use crate::metric;
 use crate::output::{ArchiveMember, ArchiveOffsets, ArchiveOwnership, Metrics, Values};
 use crate::value_key;
 
@@ -76,12 +78,20 @@ pub(super) fn extract(
     let mut archive = tar::Archive::new(bytes);
     let mut members: Vec<JsonValue> = Vec::new();
     let mut stats = ArchiveStats::new(AGGS);
+    // Entries past the cap are counted, not listed: each listed one costs a
+    // JSON member and an `ArchiveMember`, and a tar of empty files holds one
+    // per 512 bytes.
+    let mut unlisted: u64 = 0;
 
     for entry in archive
         .entries()
-        .map_err(|e| Error::malformed_with_source("tar", e.to_string(), e))?
+        .map_err(|e| Error::malformed_caused_by("tar", e))?
     {
-        let entry = entry.map_err(|e| Error::malformed_with_source("tar", e.to_string(), e))?;
+        let entry = entry.map_err(|e| Error::malformed_caused_by("tar", e))?;
+        if members.len() >= MAX_ARCHIVE_MEMBERS {
+            unlisted += 1;
+            continue;
+        }
         let header = entry.header();
         let kind = header.entry_type();
 
@@ -129,7 +139,7 @@ pub(super) fn extract(
                 .map_or_else(String::new, |p| p.to_string_lossy().into_owned()),
             size_bytes: header.size().unwrap_or(0),
             entry_type: Some(tar_entry_type(kind).into()),
-            mtime_unix: header.mtime().ok().map(|m| m as i64),
+            mtime_unix: header.mtime().ok().map(u64::cast_signed),
             linkname,
             host_os: None,
             crc32: None,
@@ -151,8 +161,19 @@ pub(super) fn extract(
         archive_members.push(member);
     }
 
+    let listed = members.len();
     values.insert_key(value_key!("archive.members"), JsonValue::Array(members));
     stats.emit(values, metrics);
+    if unlisted > 0 {
+        let total = listed as u64 + unlisted;
+        metrics.insert(metric!("archive.member_count"), total as f64);
+        push_limit(
+            values,
+            value_key!("tar.limits"),
+            "member-cap",
+            format!("listed {listed} of {total} members"),
+        );
+    }
     Ok(())
 }
 

@@ -34,7 +34,7 @@ fn run_tgz(bytes: &[u8]) -> (Values, Errors) {
 }
 
 /// The one recorded error's stage and kind.
-fn only_error(errors: &Errors) -> (Stage, crate::ErrorKind) {
+fn only_error(errors: &Errors) -> (Stage, crate::DiagnosticKind) {
     assert_eq!(errors.len(), 1, "{errors:?}");
     (errors.as_slice()[0].stage, errors.as_slice()[0].kind)
 }
@@ -54,7 +54,7 @@ fn manifest_that_is_not_json_records_one_error() {
     let (v, e) = run_tgz(&tgz(&[(MANIFEST, b"{\"name\": ")]));
     assert_eq!(
         only_error(&e),
-        (Stage::FormatExtract, crate::ErrorKind::Malformed)
+        (Stage::FormatExtract, crate::DiagnosticKind::Malformed)
     );
     assert!(v.get("npm.name").is_none());
 }
@@ -68,7 +68,7 @@ fn corrupt_gzip_stream_records_one_tar_parse_error() {
     let (v, e) = run_tgz(&bytes);
     assert_eq!(
         only_error(&e),
-        (Stage::TarParse, crate::ErrorKind::Malformed)
+        (Stage::TarParse, crate::DiagnosticKind::Malformed)
     );
     assert!(v.get("npm.name").is_none());
 }

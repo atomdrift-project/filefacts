@@ -18,6 +18,12 @@ path = "src/lib.rs"
 [[bin]]
 name = "filefacts"
 path = "src/bin/filefacts.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+required-features = ["cli"]
 
 [dependencies]
 # Serialization — required for output schema.
@@ -62,7 +68,7 @@ gimli = { version = "0.32", default-features = false, features = ["read", "std"]
 # (`ExtractedString`, `StringMethod`, ...) are part of filefacts' public API,
 # so `cargo update` must not move it. Bump the rev deliberately.
 # No default features: those build the `stng` command, not the library.
-stng = { git = "https://github.com/atomdrift-project/stng.git", rev = "3c2f434ef9b97c0c144ba3d0add8f7ccb2ef7188", default-features = false }
+stng = { git = "https://github.com/atomdrift-project/stng.git", rev = "78f439bbb96b8c15686a63f2631edf6b62269391", default-features = false }
 
 
 # Archive index readers. We use these for header/central-directory enumeration
@@ -160,6 +166,8 @@ md-5 = "0.10"
 
 # Structured logging — used by rizin subprocess statistics emission.
 tracing = "0.1"
+# The CLI's stderr subscriber for `FILEFACTS_DEBUG` (binary only, `cli`).
+tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = ["fmt", "std", "ansi"] }
 
 # Disk cache — zstd-compressed JSON blobs keyed by sha256. JSON (not a
 # positional format) round-trips the `skip_serializing_if` fields the
@@ -180,24 +188,34 @@ tempfile = "3"
 # `#[cfg(unix)]`.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# The CLI's SIGINT/SIGTERM cleanup thread (binary only, `cli`).
+signal-hook = { version = "0.3", optional = true }
 
 # Use jemalloc on unix systems where it isn't the OS default.
 # FreeBSD/DragonFlyBSD/NetBSD ship jemalloc as the default (NetBSD's libc malloc
 # is jemalloc-derived); bundling a second copy causes TSD assertion failures in
 # jails, and on NetBSD tikv-jemalloc-sys's configure script fails outright. OpenBSD's jemalloc version string
 # format is incompatible with tikv-jemalloc-sys's configure script. illumos
-# and Solaris ship libumem.
+# and Solaris ship libumem. Only the binary installs it, so it is optional:
+# a library consumer opts out with `default-features = false`.
 [target.'cfg(all(unix, not(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd", target_os = "illumos", target_os = "solaris"))))'.dependencies]
-tikv-jemallocator = "0.7"
+tikv-jemallocator = { version = "0.7", optional = true }
 
 [features]
-default = []
+# Both features serve only the `filefacts` binary. A crate depending on the
+# library sets `default-features = false` to skip compiling jemalloc, the
+# signal handler and the log subscriber.
+default = ["cli", "jemalloc"]
+# The `filefacts` binary and its signal/log plumbing.
+cli = ["dep:signal-hook", "dep:tracing-subscriber"]
+# jemalloc as the binary's global allocator, where it is not the OS default.
+jemalloc = ["dep:tikv-jemallocator"]
 # Enables jemalloc heap profiling. Build with:
 #   cargo build --profile profiling --features jemalloc-prof --bin filefacts
 # Run with (note the `_RJEM_` prefix — tikv-jemalloc renames MALLOC_CONF):
 #   _RJEM_MALLOC_CONF="prof:true,prof_active:true,prof_final:true,lg_prof_interval:28,prof_prefix:out/heap/jeprof" \
 #     out/filefacts.heap <path>
-jemalloc-prof = ["tikv-jemallocator/profiling"]
+jemalloc-prof = ["jemalloc", "tikv-jemallocator?/profiling"]
 
 [lints.rust]
 # rizin subprocess hardening (libc::setrlimit pre_exec, libc::kill on the
@@ -217,78 +235,73 @@ pedantic = { level = "warn", priority = -1 }
 # never `buf[i]`, so a malformed file degrades instead of panicking. Test code
 # is exempt (see clippy.toml).
 indexing_slicing = "warn"
-# Public-API friction without forensic benefit.
-must_use_candidate = "allow"
-missing_errors_doc = "allow"
+#
+# Everything else in `pedantic` is on, including the cast lints: an `as` that
+# can truncate, wrap, or drop a sign on a file-supplied offset is how a
+# 64-bit length becomes a small, valid-looking one on a 32-bit host. Use
+# `crate::bytes::{sat_usize, sat_u32}`, `try_from`, `cast_signed`/
+# `cast_unsigned`, or a local `#[expect(.., reason = "..")]` where a cast is
+# provably in range. Test fixtures are exempt from the cast lints (see the
+# `cfg_attr(test, ..)` in lib.rs) since they build layouts from literals.
+#
+# The allows below are deliberate exceptions, each with its reason.
+#
+# --- Domain decisions ---
 # Metrics are intentionally f64. The precision boundary at 2^53 is an
 # accepted limit for forensic counts and sizes; values beyond that are
 # either pathological inputs or already-fatal earlier in the pipeline.
 cast_precision_loss = "allow"
-# Tar mtime is stored as unsigned seconds; promoting to signed for the
-# i64 metric range is intentional and harmless for all real timestamps.
-cast_sign_loss = "allow"
-cast_possible_wrap = "allow"
-# These lints are intentionally noisy for this codebase: extractors share a
-# uniform Result-returning dispatch signature, test fixtures use compact binary
-# literals and tuple builders, and format parsers frequently manipulate bounded
-# offsets after prior size checks. Keep correctness/safety lints active, but do
-# not require churn for style-only rewrites that obscure format logic.
-unnecessary_wraps = "allow"
-cast_possible_truncation = "allow"
-case_sensitive_file_extension_comparisons = "allow"
-redundant_closure_for_method_calls = "allow"
-unreadable_literal = "allow"
-many_single_char_names = "allow"
-unnested_or_patterns = "allow"
-needless_raw_string_hashes = "allow"
-byte_char_slices = "allow"
-int_plus_one = "allow"
-cast_lossless = "allow"
-manual_let_else = "allow"
-manual_contains = "allow"
-explicit_iter_loop = "allow"
+# Public-API friction without forensic benefit: every accessor would carry it.
+must_use_candidate = "allow"
+# Format parsers mirror on-disk flag sets field for field; packing them into
+# bitflags would obscure the spec mapping.
+struct_excessive_bools = "allow"
 # Single-byte counts run over short, bounded format tokens; the SIMD bytecount
 # crate is an unwarranted dependency for these tiny scans.
 naive_bytecount = "allow"
-type_complexity = "allow"
-map_unwrap_or = "allow"
-format_push_string = "allow"
-items_after_statements = "allow"
-uninlined_format_args = "allow"
-
-for_kv_map = "allow"
+# Lookup tables (opcode, machine, and tag maps) list each value even when two
+# map to the same arm; merging them would hide the spec's enumeration.
 match_same_arms = "allow"
-used_underscore_binding = "allow"
-clone_on_copy = "allow"
-field_reassign_with_default = "allow"
-needless_continue = "allow"
-collapsible_match = "allow"
-collapsible_if = "allow"
-semicolon_if_nothing_returned = "allow"
-doc_lazy_continuation = "allow"
-bool_to_int_with_if = "allow"
-manual_range_contains = "allow"
-manual_abs_diff = "allow"
-format_collect = "allow"
-doc_overindented_list_items = "allow"
-elidable_lifetime_names = "allow"
-manual_find = "allow"
-too_many_arguments = "allow"
-struct_field_names = "allow"
-struct_excessive_bools = "allow"
-needless_character_iteration = "allow"
-single_match_else = "allow"
-borrow_as_ptr = "allow"
-float_cmp = "allow"
-unnecessary_trailing_comma = "allow"
-match_wildcard_for_single_variants = "allow"
-
+#
+# --- Stylistic: no defect class behind them ---
 # Format-conventional names (PE, ELF, DLL, etc.) get backticked when
 # they shouldn't have to be.
 doc_markdown = "allow"
+doc_overindented_list_items = "allow"
 # Extraction routines are linear walks; their line count tracks the
 # format's complexity, not architectural depth.
 too_many_lines = "allow"
+# Spec constants are written as the spec prints them.
+unreadable_literal = "allow"
+byte_char_slices = "allow"
+needless_raw_string_hashes = "allow"
+# Parsers bind fields in on-disk order next to where they are used.
+items_after_statements = "allow"
+many_single_char_names = "allow"
+struct_field_names = "allow"
+# Rewrites that read no better in format code.
+collapsible_if = "allow"
+single_match_else = "allow"
+manual_let_else = "allow"
+map_unwrap_or = "allow"
+redundant_closure_for_method_calls = "allow"
+semicolon_if_nothing_returned = "allow"
+uninlined_format_args = "allow"
+unnested_or_patterns = "allow"
+explicit_iter_loop = "allow"
+for_kv_map = "allow"
+field_reassign_with_default = "allow"
+needless_continue = "allow"
+bool_to_int_with_if = "allow"
+manual_range_contains = "allow"
+manual_abs_diff = "allow"
+manual_contains = "allow"
+manual_find = "allow"
+elidable_lifetime_names = "allow"
+unnecessary_trailing_comma = "allow"
+# Report builders format into one String; the allocation is not hot.
+format_push_string = "allow"
+format_collect = "allow"
 
 [profile.release]
 lto = "thin"

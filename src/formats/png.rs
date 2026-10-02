@@ -23,9 +23,9 @@
 
 use crate::metric;
 use serde_json::{Value as JsonValue, json};
+use std::collections::HashSet;
 use std::io::{Read, sink};
 
-use crate::error::Error;
 use crate::formats::carrier::{self, Coverage};
 use crate::formats::common::{XorScan, extract_binary_strings};
 use crate::formats::image_stats;
@@ -41,6 +41,16 @@ const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 const MAX_IDAT_ANALYSIS_BYTES: usize = 64 * 1024 * 1024;
 const MAX_IDAT_DECODE_BYTES: u64 = image_stats::MAX_DECODE_BYTES as u64;
 
+/// Chunks walked before the walk stops. A chunk is 12 bytes at least, so a
+/// file of tiny chunks would otherwise grow the coverage claims (and
+/// everything listed per chunk) with its size. Real images run to the tens
+/// of thousands, mostly IDAT.
+const MAX_CHUNKS: usize = 1 << 20;
+/// Chunk types listed in `png.chunks`; past this they are still counted.
+const MAX_LISTED_CHUNKS: usize = 4096;
+/// Distinct non-standard chunk types listed in `png.unknown_chunks`.
+const MAX_LISTED_UNKNOWN: usize = 256;
+
 #[derive(Clone, Copy)]
 struct IdatExtent {
     chunk_start: usize,
@@ -54,14 +64,14 @@ pub(super) fn extract(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
-) -> Result<(), Error> {
+) {
     extract_binary_strings(bytes, strings, XorScan::No);
 
     if bytes.first_chunk::<8>() != Some(SIGNATURE) {
         // Named `.png` but not a PNG. Report what the bytes actually are so
         // the masquerade is visible even though no chunk walk is possible.
         carrier::emit(bytes, &Coverage::unrecognized(), values, metrics);
-        return Ok(());
+        return;
     }
     // Shared carrier coverage, accumulated alongside the PNG-specific facts:
     // an appended payload or a stowaway chunk is the same finding here as in
@@ -79,6 +89,10 @@ pub(super) fn extract(
 
     let mut chunks: Vec<JsonValue> = Vec::new();
     let mut unknown_chunks: Vec<String> = Vec::new();
+    // Every distinct unknown type, for the dedup: a `Vec` scan per chunk
+    // made a file of distinct types quadratic.
+    let mut unknown_seen: HashSet<[u8; 4]> = HashSet::new();
+    let mut limits: Vec<JsonValue> = Vec::new();
     let mut text_kv = serde_json::Map::new();
     let mut features: Vec<&'static str> = Vec::new();
     let mut dim_obj = serde_json::Map::new();
@@ -87,8 +101,17 @@ pub(super) fn extract(
 
     let mut i = 8usize;
     while let Some(head) = bytes.get(i..).and_then(<[u8]>::first_chunk::<8>) {
+        if chunks_total >= MAX_CHUNKS {
+            limits.push(json!({
+                "stage": "chunk-cap",
+                "reason": format!("chunk walk stopped after {MAX_CHUNKS} chunks"),
+            }));
+            coverage.problem("chunk walk stopped at its cap");
+            break;
+        }
         let length = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
         let ctype_bytes = &head[4..];
+        let ctype_raw = [head[4], head[5], head[6], head[7]];
         let body_start = i + 8;
         let Some(chunk_end) = body_start
             .checked_add(length)
@@ -111,7 +134,7 @@ pub(super) fn extract(
         if iend_seen {
             chunks_after_iend += 1;
         }
-        if !ctype.is_empty() {
+        if !ctype.is_empty() && chunks.len() < MAX_LISTED_CHUNKS {
             chunks.push(JsonValue::String(ctype.to_string()));
         }
 
@@ -189,7 +212,10 @@ pub(super) fn extract(
                 }
             }
             _ if !is_standard_chunk(ctype) => {
-                if !ctype.is_empty() && !unknown_chunks.iter().any(|u| u == ctype) {
+                if !ctype.is_empty()
+                    && unknown_chunks.len() < MAX_LISTED_UNKNOWN
+                    && unknown_seen.insert(ctype_raw)
+                {
                     unknown_chunks.push(ctype.to_string());
                 }
                 unknown_count += 1;
@@ -214,6 +240,7 @@ pub(super) fn extract(
         i = chunk_end;
     }
 
+    let listed_chunks = chunks.len();
     let trailing_bytes = bytes.len().saturating_sub(last_chunk_end);
     if trailing_bytes > 0 {
         features.push("trailing_data");
@@ -270,6 +297,16 @@ pub(super) fn extract(
         );
     }
 
+    if listed_chunks == MAX_LISTED_CHUNKS && chunks_total > listed_chunks {
+        limits.push(json!({
+            "stage": "chunk-list",
+            "reason": format!("png.chunks lists the first {MAX_LISTED_CHUNKS} of {chunks_total} chunks"),
+        }));
+    }
+    if !limits.is_empty() {
+        values.insert_key(value_key!("png.limits"), JsonValue::Array(limits));
+    }
+
     metrics.insert(metric!("png.chunk_count"), chunks_total as f64);
     metrics.insert(metric!("png.idat_chunk_count"), chunks_idat as f64);
     metrics.insert(
@@ -292,8 +329,6 @@ pub(super) fn extract(
     // a PNG with a corrupted IDAT chunk or unsupported color depth
     // still gets the structural metrics above.
     extract_pixel_stats(bytes, metrics);
-
-    Ok(())
 }
 
 /// Claim the portion of concatenated IDAT data consumed by the first zlib

@@ -137,6 +137,7 @@ fn exhausted_work_budget_degrades_to_a_diagnostic() {
         "source.ast_unavailable.parse_timeout"
     );
     assert!(diagnostic.message.contains("work budget"));
+    assert!(!diagnostic.is_transient(), "the bytes alone decide it");
 }
 
 /// The point of a work budget: the same input stops at the same place no
@@ -186,6 +187,7 @@ fn a_raised_cancellation_flag_abandons_the_parse() {
         diagnostic.metric.as_str(),
         "source.ast_unavailable.parse_cancelled"
     );
+    assert!(diagnostic.is_transient(), "another run could parse");
 }
 
 /// A flag that stays false must be invisible — the guard against a poll
@@ -399,4 +401,179 @@ fn scanner_bytes_estimator_tracks_both_stacks() {
     let n_nested = estimated_python_scanner_bytes(nested);
     // 2 header + 2 delimiters + 0 indent.
     assert_eq!(n_nested, 4);
+}
+
+/// Parse with the lexer fetch budget overridden to `bytes`.
+fn parse_with_fetch_budget(source: &[u8], file_type: FileType, bytes: u64) -> TreeParse<'_> {
+    LEXER_FETCH_OVERRIDE.set(bytes);
+    let parsed = TreeCache::parse(source, file_type, None);
+    LEXER_FETCH_OVERRIDE.set(0);
+    parsed
+}
+
+/// Perl statements on one line of about `bytes` bytes. The scanner asks for
+/// the column at every statement, rescanning the line from its start.
+fn one_line_perl(bytes: usize) -> String {
+    let mut line = String::new();
+    let mut i = 0;
+    while line.len() < bytes {
+        line.push_str(&format!("my $v{i} = $h{{'k{i}'}} + {i}; "));
+        i += 1;
+    }
+    line
+}
+
+/// Rescans are what the fetch budget counts: the same statements on one
+/// line exhaust a budget they fit in easily one per line. The stop is a
+/// deterministic `parse_timeout` at the same byte every time.
+#[test]
+fn rescanning_one_long_line_exhausts_the_lexer_budget() {
+    let line = one_line_perl(16 * 1024);
+    let budget = 2 << 20;
+    let stop = || {
+        let parsed = parse_with_fetch_budget(line.as_bytes(), FileType::Perl, budget);
+        let diagnostic = parsed.diagnostic().expect("the rescans stop the parse");
+        assert_eq!(
+            diagnostic.metric.as_str(),
+            "source.ast_unavailable.parse_timeout"
+        );
+        assert!(!diagnostic.is_transient());
+        diagnostic.message.clone()
+    };
+    let first = stop();
+    assert!(
+        first.contains("exhausted its lexer budget of 2097152 fetched bytes at byte "),
+        "{first}"
+    );
+    assert_eq!(first, stop());
+    let lines = line.replace("; ", ";\n");
+    assert!(
+        parse_with_fetch_budget(lines.as_bytes(), FileType::Perl, budget)
+            .cache()
+            .is_some()
+    );
+}
+
+/// The lexer is handed bounded chunks that end on character boundaries.
+#[test]
+fn lexer_chunks_are_bounded_and_end_on_character_boundaries() {
+    let source = format!("{}é{}", "a".repeat(LEXER_CHUNK_BYTES - 1), "b".repeat(10));
+    assert_eq!(lexer_chunk(&source, 0).len(), LEXER_CHUNK_BYTES + 1);
+    assert_eq!(lexer_chunk(&source, LEXER_CHUNK_BYTES + 1), b"bbbbbbbbbb");
+    assert!(lexer_chunk(&source, source.len()).is_empty());
+}
+
+/// Chunked reading must not change the tree: the same source parsed from
+/// one contiguous slice gives the same nodes, multi-byte characters
+/// straddling chunk boundaries included.
+#[test]
+fn chunked_reading_parses_the_same_tree() {
+    let source =
+        "const s = \"żółw → 🐢\"; // ünïcödé\nfunction f(a) { return a + `${s}…`; }\n".repeat(200);
+    let parsed = TreeCache::parse(source.as_bytes(), FileType::JavaScript, None);
+    let cache = parsed.cache().expect("ordinary source parses");
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_javascript::LANGUAGE.into())
+        .expect("javascript grammar");
+    let whole = parser.parse(&source, None).expect("whole-slice parse");
+    assert_eq!(
+        cache.tree().root_node().to_sexp(),
+        whole.root_node().to_sexp()
+    );
+}
+
+/// `n` bytes of deterministic token soup: tokens in no grammatical order.
+fn token_soup(n: usize) -> String {
+    const TOKENS: [&str; 40] = [
+        "(", ")", "{", "}", "[", "]", ";", ",", ".", "+", "=", "<", ">", "if", "else", "while",
+        "return", "function", "class", "x", "foo", "1", "=>", "\n", "->", "::", "$a", "@b", "%h",
+        "do", "end", "def", "fn", "for", "y", "bar", "42", "-", "*", "/",
+    ];
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut soup = String::new();
+    while soup.len() < n {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        soup.push_str(TOKENS[(state % TOKENS.len() as u64) as usize]);
+        soup.push(' ');
+    }
+    soup
+}
+
+/// Error recovery that never finds its way back is cut off after a fixed
+/// number of polls, at the same byte every time.
+#[test]
+fn unrecovered_error_recovery_stops_the_parse() {
+    let soup = token_soup(200 * 1024);
+    let stop = || {
+        let parsed = TreeCache::parse(soup.as_bytes(), FileType::TypeScript, None);
+        let diagnostic = parsed.diagnostic().expect("the soup never recovers");
+        assert_eq!(
+            diagnostic.metric.as_str(),
+            "source.ast_unavailable.parse_timeout"
+        );
+        assert!(!diagnostic.is_transient());
+        diagnostic.message.clone()
+    };
+    let first = stop();
+    assert!(
+        first.contains(&format!(
+            "error recovery ran {} consecutive progress polls",
+            ERROR_RECOVERY_POLL_CAP + 1
+        )),
+        "{first}"
+    );
+    assert_eq!(first, stop());
+}
+
+/// C keeps its tree however long recovery runs: C++ headers parse as C.
+#[test]
+fn c_is_exempt_from_the_error_recovery_cap() {
+    assert_eq!(error_recovery_cap(FileType::C), None);
+    assert_eq!(error_recovery_cap(FileType::ObjectiveC), None);
+    assert_eq!(
+        error_recovery_cap(FileType::TypeScript),
+        Some(ERROR_RECOVERY_POLL_CAP)
+    );
+}
+
+/// Perl hangs nested parentheses off one visible node, so a deep nest is one
+/// long run of anonymous `(` tokens, quadratic for every query. Past the cap
+/// the tree is refused; a nest just under it is kept.
+#[test]
+fn long_anonymous_token_runs_refuse_the_tree() {
+    let nest = |depth: usize| format!("my $x = {}1{};\n", "(\n".repeat(depth), ")\n".repeat(depth));
+    let deep = nest(3_000);
+    let parsed = TreeCache::parse(deep.as_bytes(), FileType::Perl, None);
+    let diagnostic = parsed
+        .diagnostic()
+        .expect("3,000 nested parentheses are refused");
+    assert_eq!(
+        diagnostic.metric.as_str(),
+        "source.ast_unavailable.tree_sitter_guard"
+    );
+    assert!(
+        diagnostic.message.contains("anonymous tokens"),
+        "{}",
+        diagnostic.message
+    );
+    assert!(!diagnostic.is_transient());
+    let shallow = nest(2_000);
+    assert!(
+        TreeCache::parse(shallow.as_bytes(), FileType::Perl, None)
+            .cache()
+            .is_some()
+    );
+}
+
+/// Only runs of [`ANONYMOUS_RUN_MIN`] or more count, so ordinary punctuation
+/// costs nothing however much of it there is.
+#[test]
+fn short_anonymous_runs_cost_nothing() {
+    let source = "f(a, b, c); g[1][2];\n".repeat(5_000);
+    let parsed = TreeCache::parse(source.as_bytes(), FileType::JavaScript, None);
+    let cache = parsed.cache().expect("ordinary source parses");
+    assert_eq!(anonymous_run_cost(cache.tree().root_node(), u64::MAX), 0);
 }

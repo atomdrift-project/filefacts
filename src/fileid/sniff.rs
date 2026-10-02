@@ -78,31 +78,14 @@ impl<'a> Sniff<'a> {
     pub(super) fn scored_type(&self) -> Option<FileType> {
         *self
             .scored
-            .get_or_init(|| heuristics::detect_from_decoded(self.data, || self.decoded()))
+            .get_or_init(|| heuristics::detect_from_decoded(self.data, self.decoded()))
     }
 
     /// A mark that belongs to one format and almost nothing else.
     pub(super) fn unmistakable(&self) -> Option<FileType> {
-        *self.marked.get_or_init(|| {
-            let head = self
-                .body
-                .get(..heuristics::MARK_WINDOW)
-                .unwrap_or(self.body);
-            // The mark window is narrower than the git config check's own, so
-            // the two agree only when the whole body fits in the mark window.
-            // A body that opens with a second mark is stripped once more there.
-            let git_config = if head.len() == self.body.len() && !head.starts_with(super::UTF8_BOM)
-            {
-                self.looks_like_git_config()
-            } else {
-                heuristics::looks_like_git_config(head)
-            };
-            if git_config {
-                Some(FileType::Text)
-            } else {
-                heuristics::unmistakable_beyond_git_config(self.body)
-            }
-        })
+        *self
+            .marked
+            .get_or_init(|| heuristics::unmistakable(self.body, || self.looks_like_git_config()))
     }
 
     /// Git's config syntax in the head.

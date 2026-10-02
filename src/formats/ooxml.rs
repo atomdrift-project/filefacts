@@ -27,12 +27,14 @@
 use crate::metric;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek};
+use std::sync::LazyLock;
+
+use aho_corasick::AhoCorasick;
 
 use serde_json::Value as JsonValue;
 
-use crate::error::Error;
-use crate::formats::common::{bytes_at, put_str};
-use crate::output::{ErrorKind, Errors, Metrics, Stage, ValueKey, Values};
+use crate::formats::common::{bytes_at, ends_with_ci, put_str};
+use crate::output::{DiagnosticKind, Errors, Metrics, Stage, ValueKey, Values};
 use crate::value_key;
 
 /// Read cap for the named parts the `office.*` layer is built from.
@@ -46,21 +48,31 @@ const MAX_PART_BYTES: u64 = 4 << 20;
 /// every part rather than a named few.
 const MAX_SCAN_PART_BYTES: u64 = 1 << 20;
 
+/// Inflated bytes the DDE / customUI scan reads across every part.
+const MAX_SCAN_TOTAL_BYTES: u64 = 32 << 20;
+
+/// Element names the DDE and customUI scans match on. A part naming none of
+/// them has nothing for either, and is not parsed.
+static SCAN_MARKERS: LazyLock<AhoCorasick> = LazyLock::new(|| {
+    AhoCorasick::new(["fldSimple", "instrText", "ddeLink", "customUI"])
+        .expect("fixed literal patterns build")
+});
+
 pub(super) fn extract_from_archive<R: Read + Seek>(
     zip: &mut ::zip::ZipArchive<R>,
     values: &mut Values,
     metrics: &mut Metrics,
     errors: &mut Errors,
-) -> Result<(), Error> {
+) {
     let names = zip_entry_names(zip);
     let Some(index) = build_ooxml_index(zip, &names, errors) else {
-        return Ok(());
+        return;
     };
 
     if let Some(kind) = detect_kind(&index) {
         put_str(values, value_key!("office.kind"), kind);
     } else {
-        return Ok(());
+        return;
     }
 
     if let Some(core) = parse_core_props(zip, errors) {
@@ -244,8 +256,18 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     // like the other archive walkers' limits and stay out of `errors` (which
     // traits read as "the parser failed").
     let mut oversized_parts = 0usize;
+    // Every `.xml` part is a candidate, so the scan as a whole needs a bound
+    // too: thousands of 1 MiB parts would each be inflated and parsed.
+    let mut scan_budget = MAX_SCAN_TOTAL_BYTES;
+    let mut unscanned_parts = 0usize;
     for name in &names {
-        if !name.ends_with(".xml") || name.ends_with(".rels") {
+        // OPC part names compare case-insensitively (ECMA-376 Part 2 §9.1.1.1):
+        // Office opens `word/document.XML` like `word/document.xml`.
+        if !ends_with_ci(name, ".xml") || ends_with_ci(name, ".rels") {
+            continue;
+        }
+        if scan_budget == 0 {
+            unscanned_parts += 1;
             continue;
         }
         let text = match read_part(zip, name, MAX_SCAN_PART_BYTES) {
@@ -260,20 +282,40 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
                 continue;
             }
         };
-        dde_links.extend(extract_dde_links(&text, name));
-        custom_ui_onload.extend(extract_custom_ui_onload(&text, name));
+        scan_budget = scan_budget.saturating_sub(text.len() as u64);
+        // Most parts carry neither: skip the parse unless an element either
+        // scan looks for is named. Element names cannot be written as
+        // character references, so a plain search finds every candidate.
+        if !SCAN_MARKERS.is_match(&text) {
+            continue;
+        }
+        let Ok(doc) = roxmltree::Document::parse(&text) else {
+            continue;
+        };
+        dde_links.extend(extract_dde_links(&doc, name));
+        custom_ui_onload.extend(extract_custom_ui_onload(&doc, name));
     }
+    let mut limits = Vec::new();
     if oversized_parts > 0 {
-        values.insert_key(
-            value_key!("office.limits"),
-            serde_json::json!([{
-                "stage": "part-scan",
-                "reason": format!(
-                    "{oversized_parts} XML part(s) over the {MAX_SCAN_PART_BYTES}-byte scan cap \
-                     not searched for DDE links or customUI onLoad"
-                ),
-            }]),
-        );
+        limits.push(serde_json::json!({
+            "stage": "part-scan",
+            "reason": format!(
+                "{oversized_parts} XML part(s) over the {MAX_SCAN_PART_BYTES}-byte scan cap \
+                 not searched for DDE links or customUI onLoad"
+            ),
+        }));
+    }
+    if unscanned_parts > 0 {
+        limits.push(serde_json::json!({
+            "stage": "part-scan-budget",
+            "reason": format!(
+                "{unscanned_parts} XML part(s) past the {MAX_SCAN_TOTAL_BYTES}-byte scan budget \
+                 not searched for DDE links or customUI onLoad"
+            ),
+        }));
+    }
+    if !limits.is_empty() {
+        values.insert_key(value_key!("office.limits"), JsonValue::Array(limits));
     }
     if !dde_links.is_empty() {
         let count = dde_links.len() as f64;
@@ -302,8 +344,6 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             ),
         );
     }
-
-    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -345,8 +385,13 @@ impl OoxmlIndex {
 /// Part names straight from the central directory. Opening each entry would
 /// set up a decompressor per member just to read its name, and silently drop
 /// the names of entries it cannot open (an encrypted `vbaProject.bin`).
+/// Capped like the archive walk's member listing: every later pass is per
+/// name.
 fn zip_entry_names<R: Read + std::io::Seek>(zip: &::zip::ZipArchive<R>) -> Vec<String> {
-    zip.file_names().map(str::to_string).collect()
+    zip.file_names()
+        .take(super::bounded::MAX_ARCHIVE_MEMBERS)
+        .map(str::to_string)
+        .collect()
 }
 
 /// Content types plus every relationship. `None` means no OOXML layer at all,
@@ -362,7 +407,7 @@ fn build_ooxml_index<R: Read + std::io::Seek>(
         .map_err(|e| errors.record_malformed(Stage::OoxmlParse, format!("{CONTENT_TYPES}: {e}")))
         .ok()?;
     for name in names {
-        if !name.ends_with(".rels") {
+        if !ends_with_ci(name, ".rels") {
             continue;
         }
         let Some(text) = read_named_part(zip, name, errors) else {
@@ -779,10 +824,7 @@ fn is_external_target(target: &str) -> bool {
     })
 }
 
-fn extract_dde_links(xml: &str, source: &str) -> Vec<JsonValue> {
-    let Ok(doc) = roxmltree::Document::parse(xml) else {
-        return Vec::new();
-    };
+fn extract_dde_links(doc: &roxmltree::Document<'_>, source: &str) -> Vec<JsonValue> {
     let mut out = Vec::new();
     for node in doc.descendants() {
         match node.tag_name().name() {
@@ -841,10 +883,7 @@ fn push_dde_field(out: &mut Vec<JsonValue>, source: &str, kind: &str, text: &str
     out.push(JsonValue::Object(obj));
 }
 
-fn extract_custom_ui_onload(xml: &str, source: &str) -> Vec<JsonValue> {
-    let Ok(doc) = roxmltree::Document::parse(xml) else {
-        return Vec::new();
-    };
+fn extract_custom_ui_onload(doc: &roxmltree::Document<'_>, source: &str) -> Vec<JsonValue> {
     let mut out = Vec::new();
     for node in doc.descendants() {
         if node.tag_name().name() != "customUI" {
@@ -881,20 +920,12 @@ fn read_part<R: Read + std::io::Seek>(
     name: &str,
     max_bytes: u64,
 ) -> Result<Option<String>, PartError> {
-    let entry = match zip.by_name(name) {
-        Ok(entry) => entry,
-        Err(::zip::result::ZipError::FileNotFound) => return Ok(None),
+    let buf = match super::zip::read_member(zip, name, max_bytes) {
+        Ok(Some(buf)) => buf,
+        Ok(None) => return Ok(None),
+        Err(super::zip::MemberError::TooLarge { .. }) => return Err(PartError::TooLarge),
         Err(e) => return Err(PartError::Unreadable(e.to_string())),
     };
-    let mut buf = Vec::with_capacity(entry.size().min(max_bytes) as usize);
-    // One byte past the cap tells an oversized part from one exactly at it.
-    entry
-        .take(max_bytes + 1)
-        .read_to_end(&mut buf)
-        .map_err(|e| PartError::Unreadable(e.to_string()))?;
-    if buf.len() as u64 > max_bytes {
-        return Err(PartError::TooLarge);
-    }
     decode_xml_bytes(&buf)
         .map(Some)
         .ok_or_else(|| PartError::Unreadable("not UTF-8 or UTF-16 text".into()))
@@ -911,7 +942,7 @@ fn read_named_part<R: Read + std::io::Seek>(
         Ok(text) => text,
         Err(PartError::TooLarge) => {
             errors.record(
-                ErrorKind::Truncated,
+                DiagnosticKind::Truncated,
                 Stage::OoxmlParse,
                 format!("{name}: over the {MAX_PART_BYTES}-byte read cap; not parsed"),
             );
@@ -926,16 +957,16 @@ fn read_named_part<R: Read + std::io::Seek>(
 
 fn decode_xml_bytes(buf: &[u8]) -> Option<String> {
     if let Some(rest) = buf.strip_prefix(&[0xFF, 0xFE]) {
-        return decode_utf16(rest, true);
+        return bytes_at::utf16_strict(rest, bytes_at::Endian::Little);
     }
     if let Some(rest) = buf.strip_prefix(&[0xFE, 0xFF]) {
-        return decode_utf16(rest, false);
+        return bytes_at::utf16_strict(rest, bytes_at::Endian::Big);
     }
     if looks_utf16le(buf) {
-        return decode_utf16(buf, true);
+        return bytes_at::utf16_strict(buf, bytes_at::Endian::Little);
     }
     if looks_utf16be(buf) {
-        return decode_utf16(buf, false);
+        return bytes_at::utf16_strict(buf, bytes_at::Endian::Big);
     }
     String::from_utf8(buf.to_vec()).ok()
 }
@@ -946,19 +977,6 @@ fn looks_utf16le(buf: &[u8]) -> bool {
 
 fn looks_utf16be(buf: &[u8]) -> bool {
     buf.len() >= 8 && buf.starts_with(&[0, b'<', 0, b'?'])
-}
-
-fn decode_utf16(buf: &[u8], little_endian: bool) -> Option<String> {
-    let mut units = Vec::with_capacity(buf.len() / 2);
-    for pair in buf.as_chunks::<2>().0 {
-        let unit = if little_endian {
-            u16::from_le_bytes([pair[0], pair[1]])
-        } else {
-            u16::from_be_bytes([pair[0], pair[1]])
-        };
-        units.push(unit);
-    }
-    String::from_utf16(&units).ok()
 }
 
 #[cfg(test)]

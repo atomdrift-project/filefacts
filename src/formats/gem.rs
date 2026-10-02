@@ -19,16 +19,18 @@
 //!   `gem.development_dependency_count` — dependency-shape metrics.
 
 use crate::metric;
-use std::io::{Cursor, Read};
+use std::io::Read;
 
 use serde_json::Value as JsonValue;
 
-use crate::error::Error;
-use crate::output::{Metrics, Values};
+use crate::output::{Errors, Metrics, Stage, Values};
 use crate::value_key;
 
+use super::bounded::MemberFailure;
 use super::structured::parse_yaml;
 
+/// The outer-tar member holding the gzipped `Gem::Specification`.
+const METADATA: &str = "metadata.gz";
 /// Cap on the compressed `metadata.gz` we read from the outer tar. Real gem
 /// specifications are a few KiB; anything larger is malformed or hostile.
 const MAX_METADATA_GZ: u64 = 1 << 20; // 1 MiB
@@ -42,12 +44,18 @@ pub(super) fn extract(
     bytes: &[u8],
     values: &mut Values,
     metrics: &mut Metrics,
-) -> Result<(), Error> {
+    errors: &mut Errors,
+) {
     // A gem whose `metadata.gz` is absent or unparseable still gets the generic
-    // archive.* surface from the tar walker — just no gem.* identity. Degrade
-    // quietly rather than failing the whole extraction.
-    let Some(spec) = read_metadata(bytes) else {
-        return Ok(());
+    // archive.* surface from the tar walker — just no gem.* identity. An
+    // unreadable one is recorded rather than failing the whole extraction.
+    let spec = match read_metadata(bytes) {
+        Ok(Some(spec)) => spec,
+        Ok(None) => return,
+        Err(failure) => {
+            failure.record(errors);
+            return;
+        }
     };
 
     if let Some(name) = field_str(&spec, "name") {
@@ -103,37 +111,45 @@ pub(super) fn extract(
     }
 
     extract_dependencies(&spec, values, metrics);
-    Ok(())
 }
 
-/// Walk the outer (uncompressed) tar, read `metadata.gz`, gunzip it, and parse
-/// the `Gem::Specification` YAML. Its Ruby tags are dropped, leaving plain
-/// mappings. Returns `None` on any malformed step — the caller treats that as
-/// "no gem identity available".
-fn read_metadata(bytes: &[u8]) -> Option<JsonValue> {
-    let mut archive = tar::Archive::new(Cursor::new(bytes));
-    for entry in archive.entries().ok()? {
-        let Ok(mut entry) = entry else { break };
-        // Take an owned copy of the member name so the immutable borrow of
-        // `entry` ends before we read its body.
-        let name = entry.path().ok().map(|p| p.to_string_lossy().into_owned());
-        if name.as_deref() != Some("metadata.gz") {
+/// Walk the outer (uncompressed) tar, gunzip `metadata.gz` straight from the
+/// member, and parse the `Gem::Specification` YAML. Its Ruby tags are
+/// dropped, leaving plain mappings. `Ok(None)` when the gem has no
+/// `metadata.gz`; `Err` names the stage and step that failed.
+fn read_metadata(bytes: &[u8]) -> Result<Option<JsonValue>, MemberFailure> {
+    let walk = |e: std::io::Error| {
+        MemberFailure::new(
+            Stage::TarParse,
+            format!("gem unreadable before {METADATA}"),
+            e,
+        )
+    };
+    let mut archive = tar::Archive::new(bytes);
+    for entry in archive.entries().map_err(walk)? {
+        let mut entry = entry.map_err(walk)?;
+        if *entry.path_bytes() != *METADATA.as_bytes() {
             continue;
         }
-        let mut gz = Vec::new();
-        entry
-            .by_ref()
-            .take(MAX_METADATA_GZ)
-            .read_to_end(&mut gz)
-            .ok()?;
-        let mut yaml = String::new();
-        flate2::read::GzDecoder::new(&gz[..])
+        // Both caps truncate rather than fail: an over-cap `metadata.gz`
+        // then ends mid-stream and an over-cap YAML fails to parse, and
+        // either lands below as an error naming the step.
+        let mut yaml = Vec::new();
+        flate2::read::GzDecoder::new(entry.by_ref().take(MAX_METADATA_GZ))
             .take(MAX_METADATA_YAML)
-            .read_to_string(&mut yaml)
-            .ok()?;
-        return parse_yaml(yaml.as_bytes()).ok();
+            .read_to_end(&mut yaml)
+            .map_err(|e| {
+                MemberFailure::new(
+                    Stage::FormatExtract,
+                    format!("{METADATA}: gunzip failed"),
+                    e,
+                )
+            })?;
+        return parse_yaml(&yaml)
+            .map(Some)
+            .map_err(|e| MemberFailure::new(Stage::FormatExtract, METADATA, e));
     }
-    None
+    Ok(None)
 }
 
 /// Surface the dependency shape. Each dependency is a
@@ -254,7 +270,7 @@ summary: Full-stack web application framework.
         let gem = build_gem(RAILS_SPEC);
         let mut v = Values::new();
         let mut m = Metrics::new();
-        extract(&gem, &mut v, &mut m).unwrap();
+        extract(&gem, &mut v, &mut m, &mut Errors::new());
 
         assert_eq!(v.get("gem.name").and_then(|x| x.as_str()), Some("rails"));
         assert_eq!(v.get("gem.version").and_then(|x| x.as_str()), Some("7.0.4"));
@@ -270,7 +286,7 @@ summary: Full-stack web application framework.
         let gem = build_gem(RAILS_SPEC);
         let mut v = Values::new();
         let mut m = Metrics::new();
-        extract(&gem, &mut v, &mut m).unwrap();
+        extract(&gem, &mut v, &mut m, &mut Errors::new());
 
         assert_eq!(m.get("gem.dependency_count"), Some(2.0));
         assert_eq!(m.get("gem.runtime_dependency_count"), Some(1.0));
@@ -288,7 +304,7 @@ summary: Full-stack web application framework.
         let gem = build_gem(RAILS_SPEC);
         let mut v = Values::new();
         let mut m = Metrics::new();
-        extract(&gem, &mut v, &mut m).unwrap();
+        extract(&gem, &mut v, &mut m, &mut Errors::new());
 
         let licenses = v.get("gem.licenses").and_then(|x| x.as_array()).unwrap();
         assert_eq!(licenses[0].as_str(), Some("MIT"));
@@ -323,7 +339,7 @@ dependencies:
 "#;
         let mut v = Values::new();
         let mut m = Metrics::new();
-        extract(&build_gem(spec), &mut v, &mut m).unwrap();
+        extract(&build_gem(spec), &mut v, &mut m, &mut Errors::new());
         assert_eq!(v.get("gem.name").and_then(|x| x.as_str()), Some("yes"));
         assert_eq!(v.get("gem.version").and_then(|x| x.as_str()), Some("1.0"));
         assert_eq!(
@@ -352,7 +368,42 @@ dependencies:
         }
         let mut v = Values::new();
         let mut m = Metrics::new();
-        extract(&out, &mut v, &mut m).unwrap();
+        let mut errors = Errors::new();
+        extract(&out, &mut v, &mut m, &mut errors);
         assert!(v.get("gem.name").is_none());
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// A gem with the metadata member but no gzip stream inside it, or with
+    /// a spec that is not YAML, degrades to no gem.* facts with the failed
+    /// step recorded rather than silently swallowed.
+    #[test]
+    fn unreadable_metadata_is_recorded() {
+        let mut not_gzip = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut not_gzip);
+            let mut h = tar::Header::new_ustar();
+            h.set_path("metadata.gz").unwrap();
+            h.set_size(8);
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_cksum();
+            b.append(&h, &b"not gzip"[..]).unwrap();
+            b.finish().unwrap();
+        }
+        for (gem, step) in [
+            (not_gzip, "gunzip failed"),
+            (build_gem("name: [unclosed"), "metadata.gz: "),
+        ] {
+            let mut v = Values::new();
+            let mut errors = Errors::new();
+            extract(&gem, &mut v, &mut Metrics::new(), &mut errors);
+            assert!(v.get("gem.name").is_none());
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.stage == Stage::FormatExtract && e.message.contains(step)),
+                "{step}: {errors:?}"
+            );
+        }
     }
 }

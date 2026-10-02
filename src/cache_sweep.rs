@@ -141,20 +141,23 @@ pub fn spawn_periodic(mut budgets: Vec<Budget>, interval: Duration) {
 }
 
 /// The caches older stng releases filled for their callers: the string cache
-/// (`<cache>/stng/strings`, or `STNG_STRING_CACHE_DIR`) and the rizin cache
-/// (`<cache>/stng/r2`), sharing one ceiling. filefacts now keeps extracted
-/// strings in its own cache, so nothing refills the first; sweeping it lets the
-/// leftovers age out. The stng CLI still uses the second.
+/// (`<cache>/stng/strings`) and the rizin cache (`<cache>/stng/r2`), sharing
+/// one ceiling. filefacts now keeps extracted strings in its own cache, so
+/// nothing refills the first; sweeping it lets the leftovers age out. The
+/// stng CLI still uses the second.
+///
+/// Only those two stng-owned directories are swept. Older stng honoured
+/// `STNG_STRING_CACHE_DIR` as an override, but this sweep deletes every
+/// stale child of its roots, so it must not trust a variable that may be
+/// stale, mis-set, or pointed at a directory of the user's own files.
 #[must_use]
 pub fn legacy_stng_budget() -> Budget {
     let base = dirs::cache_dir()
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")));
-    let strings = std::env::var_os("STNG_STRING_CACHE_DIR")
-        .map(PathBuf::from)
-        .or_else(|| base.as_ref().map(|b| b.join("stng").join("strings")));
-    let roots = strings
+    let roots = base
+        .map(|b| b.join("stng"))
         .into_iter()
-        .chain(base.map(|b| b.join("stng").join("r2")))
+        .flat_map(|stng| [stng.join("strings"), stng.join("r2")])
         .map(|path| Root { path, depth: 1 })
         .collect();
     Budget {
@@ -225,17 +228,19 @@ fn run(b: &Budget) {
     let Some(primary) = b.roots.first() else {
         return;
     };
-    if !due(&primary.path) {
+    // A root that is itself a symlink points somewhere this budget does not
+    // own; sweeping through it would delete whatever the link reaches.
+    if !is_real_dir(&primary.path) || !due(&primary.path) {
         return;
     }
     // Mark the start (mtime = now) so a racing process sees a fresh marker and
     // skips. Best-effort; if the directory doesn't exist yet, there's nothing
     // to sweep anyway.
     let marker = primary.path.join(MARKER);
-    let _ = fs::write(&marker, MARK_STARTED);
+    write_marker(&marker, MARK_STARTED);
 
     let mut entries = Vec::new();
-    for r in &b.roots {
+    for r in b.roots.iter().filter(|r| is_real_dir(&r.path)) {
         collect(&r.path, r.depth, &mut entries);
     }
 
@@ -280,7 +285,7 @@ fn run(b: &Budget) {
 
     // Record completion, so the next run waits a full interval rather than
     // retrying. Not reached if this thread dies with its process mid-sweep.
-    let _ = fs::write(&marker, MARK_DONE);
+    write_marker(&marker, MARK_DONE);
 
     if removed > 0 {
         tracing::debug!(
@@ -293,13 +298,38 @@ fn run(b: &Budget) {
     }
 }
 
+/// Whether `path` is a directory itself, not a symlink to one.
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
+/// Write the sweep marker without following a symlink planted in its place:
+/// the write would otherwise truncate whatever the link names. Best-effort.
+fn write_marker(path: &Path, contents: &[u8]) {
+    use std::io::Write as _;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return;
+    }
+    if let Ok(mut file) = options.open(path) {
+        let _ = file.write_all(contents);
+    }
+}
+
 /// True unless this root was swept recently: within [`SWEEP_INTERVAL`] for a
 /// sweep that finished, or [`RETRY_INTERVAL`] for one that died with its
 /// process. A missing or unreadable marker counts as due, so a never-swept
 /// cache is handled on the first run.
 fn due(root: &Path) -> bool {
     let marker = root.join(MARKER);
-    let Ok(started) = fs::metadata(&marker).and_then(|m| m.modified()) else {
+    let Ok(started) = fs::symlink_metadata(&marker).and_then(|m| m.modified()) else {
         return true;
     };
     let Ok(elapsed) = started.elapsed() else {
@@ -337,7 +367,8 @@ fn collect(root: &Path, depth: u8, out: &mut Vec<Entry>) {
 }
 
 fn stat_entry(path: PathBuf, is_dir: bool) -> Option<Entry> {
-    let meta = fs::metadata(&path).ok()?;
+    // The entry itself, not a symlink's target: a link is evicted as a link.
+    let meta = fs::symlink_metadata(&path).ok()?;
     let modified = meta.modified().ok()?;
     let bytes = if is_dir { dir_size(&path) } else { meta.len() };
     Some(Entry {
@@ -556,6 +587,61 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_stng_budget_sweeps_only_stng_owned_dirs() {
+        let budget = legacy_stng_budget();
+        for root in &budget.roots {
+            let parent = root.path.parent().and_then(|p| p.file_name());
+            assert_eq!(parent.and_then(|n| n.to_str()), Some("stng"), "{root:?}");
+            assert!(
+                root.path.ends_with("strings") || root.path.ends_with("r2"),
+                "{root:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_root_is_not_swept() {
+        let target = scratch("symroot-target");
+        write_aged(&target.join("precious.txt"), 10, day(400));
+        let link = scratch("symroot-link").join("cache");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        run(&Budget {
+            label: "test",
+            roots: vec![Root {
+                path: link.clone(),
+                depth: 1,
+            }],
+            max_age: day(30),
+            max_bytes: 0,
+            max_entries: 0,
+        });
+        assert!(
+            target.join("precious.txt").exists(),
+            "nothing behind the link"
+        );
+        assert!(
+            !target.join(MARKER).exists(),
+            "no marker written through it"
+        );
+        let _ = fs::remove_dir_all(link.parent().unwrap());
+        let _ = fs::remove_dir_all(&target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_write_does_not_follow_a_planted_symlink() {
+        let dir = scratch("marker-link");
+        let victim = scratch("marker-victim").join("victim.txt");
+        fs::write(&victim, b"keep me").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join(MARKER)).unwrap();
+        write_marker(&dir.join(MARKER), MARK_DONE);
+        assert_eq!(fs::read(&victim).unwrap(), b"keep me");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(victim.parent().unwrap());
     }
 
     #[test]

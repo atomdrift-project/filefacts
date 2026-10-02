@@ -40,23 +40,25 @@ mod value_keys;
 mod values;
 
 pub use archive::{ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership};
-pub use errors::{ErrorKind, Errors, ParseError, Stage};
+pub use errors::{Diagnostic, DiagnosticKind, Errors, Stage};
 pub use flow::{Flow, FlowFunction, FlowKind, FlowOrigin, FlowOrigins, FlowTransfer, FlowValue};
 pub use identity::{Claim, Identity, Party, Signer, Trust, Url, UrlKind};
 pub use metric_keys::{
     CATALOG, FAMILIES, MetricKey, QueryLimit, archive_entry_type_count, archive_method_count,
-    ast_op, ast_op_density, declared, dmg_codec_count, extension_content_mismatch,
-    source_query_limited,
+    ast_op, ast_op_density, dmg_codec_count, extension_content_mismatch, source_query_limited,
 };
+pub(crate) use metric_keys::{declared, metric};
 pub use metrics::{Fact, Metrics};
 pub use references::{HashAlgo, PinnedHash, RefKind, RefLocator, Reference};
-pub use sections::{Section, Sections};
-pub use spans::{Span, SpanBuilder};
-pub use strings::{Comments, ExtractedString, Literals, Text};
+pub use sections::{Section, SectionFlag, Sections};
+pub use spans::Span;
+pub(crate) use spans::SpanBuilder;
+pub use strings::{Comments, Literal, LiteralEncoding, LiteralMethod, Literals, Text};
 // Crate-internal bundle of Text + Literals — used by format extractors
 // so they can push to either tier without juggling two parameters.
 // Not part of the public schema.
-pub(crate) use strings::Strings;
+pub(crate) use strings::{ExtractedString, Strings};
 pub use symbols::{Arg, ArgShape, Symbol, SymbolKind, Symbols};
-pub use value_keys::{VALUE_CATALOG, VALUE_FAMILIES, ValueKey, declared_value_key};
+pub use value_keys::{VALUE_CATALOG, VALUE_FAMILIES, ValueKey};
+pub(crate) use value_keys::{declared_value_key, value_key};
 pub use values::Values;

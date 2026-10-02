@@ -17,12 +17,9 @@
 //! claims the same manifest makes, so they are measurements of one file's
 //! bytes and belong here beside the parse that reads them.
 
-use std::io::Read;
-
-use flate2::read::GzDecoder;
 use serde_json::Value as JsonValue;
-use tar::Archive;
 
+use super::bounded::{MAX_TARGZ_SEARCH, TarGzSearch, find_targz_member, push_limit};
 use crate::error::Error;
 use crate::fileid::FileType;
 use crate::metric;
@@ -52,51 +49,39 @@ pub(super) fn extract(
 
 /// Read and parse `package/package.json` from a gzipped npm tarball.
 /// `None` when the tarball has none (silently), when it is over the size
-/// cap (an `npm.limits` entry), or when the tarball or manifest is
-/// unreadable or not JSON (an error).
+/// cap or past the inflate budget (an `npm.limits` entry), or when the
+/// tarball or manifest is unreadable or not JSON (an error). Decompression
+/// stops at the manifest.
 fn package_json(bytes: &[u8], values: &mut Values, errors: &mut Errors) -> Option<JsonValue> {
-    let raw = match read_manifest(bytes) {
-        Ok(Some(raw)) => raw,
-        Ok(None) => return None,
-        Err(why) => {
-            errors.record_malformed(Stage::TarParse, why);
+    let prefix = match find_targz_member(bytes, |p| p == MANIFEST, MAX_MANIFEST) {
+        Ok(TarGzSearch::Found { prefix, .. }) => prefix,
+        Ok(TarGzSearch::Absent) => return None,
+        Ok(TarGzSearch::InflateCapped) => {
+            push_limit(
+                values,
+                value_key!("npm.limits"),
+                "manifest-search",
+                format!("no {MANIFEST} in the first {MAX_TARGZ_SEARCH} inflated bytes"),
+            );
+            return None;
+        }
+        Err(e) => {
+            e.into_failure(Stage::TarParse, MANIFEST).record(errors);
             return None;
         }
     };
-    if raw.len() as u64 > MAX_MANIFEST {
-        values.insert_key(
+    if prefix.truncated {
+        push_limit(
+            values,
             value_key!("npm.limits"),
-            serde_json::json!([{
-                "stage": "manifest",
-                "reason": format!("{MANIFEST} over the {MAX_MANIFEST}-byte cap; not parsed"),
-            }]),
+            "manifest",
+            format!("{MANIFEST} over the {MAX_MANIFEST}-byte cap; not parsed"),
         );
         return None;
     }
-    serde_json::from_slice(&raw)
+    serde_json::from_slice(&prefix.bytes)
         .map_err(|e| errors.record_malformed(Stage::FormatExtract, format!("{MANIFEST}: {e}")))
         .ok()
-}
-
-/// The manifest's bytes, read to one past the cap so an oversized one is
-/// recognisable; `Ok(None)` when the tarball holds none. Decompression stops
-/// at the manifest.
-fn read_manifest(bytes: &[u8]) -> Result<Option<Vec<u8>>, String> {
-    let walk = |e: std::io::Error| format!("tarball unreadable before {MANIFEST}: {e}");
-    let mut archive = Archive::new(GzDecoder::new(bytes));
-    for entry in archive.entries().map_err(walk)? {
-        let entry = entry.map_err(walk)?;
-        if !entry.path().is_ok_and(|p| p.to_string_lossy() == MANIFEST) {
-            continue;
-        }
-        let mut buf = Vec::new();
-        entry
-            .take(MAX_MANIFEST + 1)
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("{MANIFEST}: {e}"))?;
-        return Ok(Some(buf));
-    }
-    Ok(None)
 }
 
 /// Emit `npm.*` identity values from a parsed `package.json`, plus the

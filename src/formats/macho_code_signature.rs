@@ -39,6 +39,13 @@ const CSMAGIC_REQUIREMENTS: u32 = 0xfade_0c01;
 const CSMAGIC_EMBEDDED_ENTITLEMENTS: u32 = 0xfade_7171;
 const CSMAGIC_DER_ENTITLEMENTS: u32 = 0xfade_7172;
 const CSMAGIC_BLOBWRAPPER: u32 = 0xfade_0b01;
+/// Slot type of the primary CodeDirectory, the one the CMS signature covers.
+const CSSLOT_CODEDIRECTORY: u32 = 0;
+
+/// SuperBlob index entries read. Real signatures carry fewer than a dozen
+/// (CodeDirectory, up to five alternates, requirements, entitlements,
+/// launch constraints, CMS); the cap bounds the index walk.
+const MAX_BLOB_INDEX: usize = 64;
 
 /// Maximum recursion depth honoured when decoding Apple Requirement
 /// expressions. Real-world expressions are shallow (a handful of
@@ -46,7 +53,7 @@ const CSMAGIC_BLOBWRAPPER: u32 = 0xfade_0b01;
 /// blobs that chain operators arbitrarily deep.
 const MAX_REQUIREMENT_DEPTH: u8 = 32;
 
-/// Upper bound on the XML plist payload we hand to `plist::from_bytes`
+/// Upper bound on the XML plist payload we hand to `plist_guard::parse`
 /// in `parse_entitlements`. Real entitlements blobs are at most a few
 /// KiB; capping prevents an oversized payload from forcing the plist
 /// parser through megabytes of attacker XML.
@@ -73,40 +80,24 @@ pub(super) fn parse(bytes: &[u8], sig_off: usize, sig_size: usize, values: &mut 
         return;
     }
 
-    let Some(count) = bytes::u32_be(sig, 8).map(|n| n as usize) else {
+    let Some(entries) = super_blob_entries(sig, total_len) else {
         return;
     };
-    // Each BlobIndex: u32 type, u32 offset (12 bytes header + 8 * count
-    // for the index table).
-    let Some(index_end) = count.checked_mul(8).and_then(|n| n.checked_add(12)) else {
-        return;
-    };
-    if index_end > total_len {
-        return;
-    }
+    // The CMS signature covers the primary CodeDirectory (slot 0); the
+    // alternate CodeDirectories are bound through its cdhashes attribute.
+    let primary_cd = entries
+        .iter()
+        .find(|e| e.slot == CSSLOT_CODEDIRECTORY && e.magic == CSMAGIC_CODEDIRECTORY)
+        .or_else(|| entries.iter().find(|e| e.magic == CSMAGIC_CODEDIRECTORY))
+        .map(|e| e.blob);
 
-    for i in 0..count {
-        // The index entry's slot type precedes its blob offset.
-        let Some(blob_off) = bytes::u32_be(sig, 12 + i * 8 + 4).map(|n| n as usize) else {
-            continue;
-        };
-        if blob_off + 8 > total_len {
-            continue;
-        }
-        let (Some(blob_magic), Some(blob_len)) = (
-            bytes::u32_be(sig, blob_off),
-            bytes::u32_be(sig, blob_off + 4),
-        ) else {
-            continue;
-        };
-        let blob_len = blob_len as usize;
-        if blob_len < 8 || blob_off.saturating_add(blob_len) > total_len {
-            continue;
-        }
-        let Some(blob) = sig.get(blob_off..blob_off + blob_len) else {
-            continue;
-        };
-
+    for &BlobEntry {
+        offset: blob_off,
+        magic: blob_magic,
+        blob,
+        ..
+    } in &entries
+    {
         match blob_magic {
             // `sig_off + blob_off` is the CodeDirectory's absolute offset in
             // `bytes`; pass it so interior fields (the identifier string) can
@@ -132,10 +123,73 @@ pub(super) fn parse(bytes: &[u8], sig_off: usize, sig_size: usize, values: &mut 
                     (blob.len() - 8) as u64,
                 );
             }
-            CSMAGIC_BLOBWRAPPER => parse_cms(blob, values),
+            CSMAGIC_BLOBWRAPPER => parse_cms(blob, primary_cd, values),
             _ => {}
         }
     }
+}
+
+/// One SuperBlob index entry and the blob it points at.
+struct BlobEntry<'a> {
+    slot: u32,
+    offset: usize,
+    magic: u32,
+    blob: &'a [u8],
+}
+
+/// The SuperBlob's index entries, each pointing inside the signature.
+///
+/// The index count is attacker-chosen and every entry may name the same
+/// multi-megabyte blob, so walking it naively hashes or CMS-parses that blob
+/// once per entry. Like xnu's `csblob_find_blob`, only the first entry per
+/// slot type counts, an offset already claimed by an earlier entry is
+/// skipped, and at most [`MAX_BLOB_INDEX`] entries are read.
+fn super_blob_entries(sig: &[u8], total_len: usize) -> Option<Vec<BlobEntry<'_>>> {
+    let count = bytes::u32_be(sig, 8)? as usize;
+    // Each BlobIndex: u32 type, u32 offset (12 bytes header + 8 * count
+    // for the index table).
+    let index_end = count.checked_mul(8)?.checked_add(12)?;
+    if index_end > total_len {
+        return None;
+    }
+    let mut entries: Vec<BlobEntry<'_>> = Vec::new();
+    for i in 0..count.min(MAX_BLOB_INDEX) {
+        let (Some(slot), Some(blob_off)) = (
+            bytes::u32_be(sig, 12 + i * 8),
+            bytes::u32_be(sig, 12 + i * 8 + 4).map(|n| n as usize),
+        ) else {
+            continue;
+        };
+        if entries
+            .iter()
+            .any(|e| e.slot == slot || e.offset == blob_off)
+        {
+            continue;
+        }
+        if blob_off + 8 > total_len {
+            continue;
+        }
+        let (Some(magic), Some(blob_len)) = (
+            bytes::u32_be(sig, blob_off),
+            bytes::u32_be(sig, blob_off + 4),
+        ) else {
+            continue;
+        };
+        let blob_len = blob_len as usize;
+        if blob_len < 8 || blob_off.saturating_add(blob_len) > total_len {
+            continue;
+        }
+        let Some(blob) = sig.get(blob_off..blob_off + blob_len) else {
+            continue;
+        };
+        entries.push(BlobEntry {
+            slot,
+            offset: blob_off,
+            magic,
+            blob,
+        });
+    }
+    Some(entries)
 }
 
 /// CodeDirectory layout (excerpt — fields through v20400 are stable).
@@ -321,7 +375,11 @@ fn parse_requirements_set(blob: &[u8], values: &mut Values) {
         return;
     }
     let mut requirements = serde_json::Map::new();
-    for i in 0..count {
+    // Same rule as the outer SuperBlob: the first entry per slot type, each
+    // offset decoded once, so a count of thousands pointing at one deep
+    // expression costs one decode.
+    let mut seen: Vec<(u32, u32)> = Vec::new();
+    for i in 0..count.min(MAX_BLOB_INDEX) {
         let entry_off = 12 + i * 8;
         let (Some(slot_type), Some(req_off)) = (
             bytes::u32_be(blob, entry_off),
@@ -329,6 +387,13 @@ fn parse_requirements_set(blob: &[u8], values: &mut Values) {
         ) else {
             continue;
         };
+        if seen
+            .iter()
+            .any(|&(slot, off)| slot == slot_type || off == req_off)
+        {
+            continue;
+        }
+        seen.push((slot_type, req_off));
         let req_off = req_off as usize;
         if req_off + 12 > blob.len() {
             continue;
@@ -518,7 +583,7 @@ fn parse_entitlements(blob: &[u8], values: &mut Values) {
     if xml_bytes.len() > MAX_ENTITLEMENT_XML_BYTES {
         return;
     }
-    let Ok(parsed) = plist::from_bytes::<plist::Value>(xml_bytes) else {
+    let Ok(parsed) = super::plist_guard::parse(xml_bytes) else {
         // Surface raw text as a fallback so the consumer at least sees
         // what was claimed.
         if let Ok(s) = std::str::from_utf8(xml_bytes) {
@@ -534,7 +599,9 @@ fn parse_entitlements(blob: &[u8], values: &mut Values) {
     values.insert_key(value_key!("macho.code_signature.entitlements"), json);
 }
 
-fn parse_cms(blob: &[u8], values: &mut Values) {
+/// `code_directory` is the blob the signature covers; without one the
+/// signature binds nothing and reads as unverifiable.
+fn parse_cms(blob: &[u8], code_directory: Option<&[u8]>, values: &mut Values) {
     if blob.len() <= 8 {
         return;
     }
@@ -550,15 +617,17 @@ fn parse_cms(blob: &[u8], values: &mut Values) {
         (blob.len() - 8) as u64,
     );
     // Apple emits the inner SignedData with BER indefinite-length
-    // encoding; the strict-DER cms/x509-cert crates we use for
-    // Authenticode reject it on the first length byte. We try the
-    // strict parse anyway — it succeeds for the small fraction of
-    // Apple-signed binaries that happen to use definite-length form,
-    // and for the rest we keep the presence flag above.
+    // encoding; the CMS parser normalizes it to DER before decoding.
+    // The signature is detached: it covers the CodeDirectory, which
+    // `verified` checks it against.
     let Some(der) = blob.get(8..) else {
         return;
     };
-    if let Some(sig) = super::pe_authenticode::parse_cms_blob(der) {
+    let sig = match code_directory {
+        Some(cd) => super::pe_authenticode::parse_detached_cms_blob(der, cd),
+        None => super::pe_authenticode::parse_cms_blob(der),
+    };
+    if let Some(sig) = sig {
         values.insert_key(value_key!("macho.code_signature.cms"), sig);
     }
 }
@@ -720,6 +789,127 @@ mod tests {
         ws.iter().flat_map(|w| w.to_be_bytes()).collect()
     }
 
+    /// A SuperBlob holding `blobs` at the given slot types, plus `extra`
+    /// index entries that all point at the first blob.
+    fn super_blob(blobs: &[(u32, &[u8])], extra: usize) -> Vec<u8> {
+        let count = blobs.len() + extra;
+        let mut offset = 12 + 8 * count;
+        let mut index = Vec::new();
+        let mut body = Vec::new();
+        let first = offset;
+        for (slot, blob) in blobs {
+            index.extend(words(&[*slot, offset as u32]));
+            body.extend_from_slice(blob);
+            offset += blob.len();
+        }
+        for i in 0..extra {
+            index.extend(words(&[0x2000 + i as u32, first as u32]));
+        }
+        let mut sig = words(&[CSMAGIC_EMBEDDED_SIGNATURE, offset as u32, count as u32]);
+        sig.extend(index);
+        sig.extend(body);
+        sig
+    }
+
+    fn wrapper(cms: &[u8]) -> Vec<u8> {
+        let mut blob = words(&[CSMAGIC_BLOBWRAPPER, (cms.len() + 8) as u32]);
+        blob.extend_from_slice(cms);
+        blob
+    }
+
+    fn signature_values(sig: &[u8]) -> Values {
+        let mut values = Values::new();
+        parse(sig, 0, sig.len(), &mut values);
+        values
+    }
+
+    const BER_DETACHED: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/chains/ber-detached.der"
+    ));
+    const BER_CONTENT: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/chains/ber-content.bin"
+    ));
+
+    /// Apple's CMS is BER and detached: it signs the primary CodeDirectory
+    /// beside it. Verified means the signature binds that CodeDirectory.
+    #[test]
+    fn cms_signature_is_verified_against_the_code_directory() {
+        let sig = super_blob(
+            &[
+                (CSSLOT_CODEDIRECTORY, BER_CONTENT),
+                (0x1_0000, &wrapper(BER_DETACHED)),
+            ],
+            0,
+        );
+        let values = signature_values(&sig);
+        assert_eq!(
+            values.get("macho.code_signature.cms.verified"),
+            Some(&JsonValue::Bool(true))
+        );
+    }
+
+    /// The same signature beside a different CodeDirectory — a genuine CMS
+    /// blob transplanted onto another binary — must not verify.
+    #[test]
+    fn cms_signature_transplanted_onto_another_code_directory_fails() {
+        let mut other = BER_CONTENT.to_vec();
+        *other.last_mut().unwrap() ^= 0x01;
+        let sig = super_blob(
+            &[
+                (CSSLOT_CODEDIRECTORY, &other),
+                (0x1_0000, &wrapper(BER_DETACHED)),
+            ],
+            0,
+        );
+        let values = signature_values(&sig);
+        assert_eq!(
+            values.get("macho.code_signature.cms.verified"),
+            Some(&JsonValue::Bool(false))
+        );
+        assert_eq!(
+            values
+                .get("macho.code_signature.cms.verification_failure")
+                .and_then(JsonValue::as_str),
+            Some("message_digest_mismatch")
+        );
+    }
+
+    /// Thousands of index entries naming one blob read it once; the walk
+    /// is capped and de-duplicated by offset.
+    #[test]
+    fn repeated_index_entries_are_read_once() {
+        let sig = super_blob(&[(CSSLOT_CODEDIRECTORY, BER_CONTENT)], 10_000);
+        let entries = super_blob_entries(&sig, sig.len()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            signature_values(&sig)
+                .get("macho.code_signature.cdhash")
+                .is_some()
+        );
+    }
+
+    /// The Requirements set gets the same treatment.
+    #[test]
+    fn repeated_requirement_entries_are_decoded_once() {
+        // One requirement (`always`), then 5,000 index entries naming it.
+        let expr = words(&[1]);
+        let mut req = words(&[0xfade_0c00, (12 + expr.len()) as u32, 1]);
+        req.extend(expr);
+        let count = 5_000_u32;
+        let req_off = 12 + 8 * count;
+        let mut set = words(&[0xfade_0c01, req_off + req.len() as u32, count]);
+        for slot in 0..count {
+            set.extend(words(&[slot, req_off]));
+        }
+        set.extend(req);
+        let mut values = Values::new();
+        parse_requirements_set(&set, &mut values);
+        let requirements = values.get("macho.code_signature.requirements").unwrap();
+        assert_eq!(requirements.as_object().unwrap().len(), 1);
+    }
+
     #[test]
     fn requirement_expression_decodes_to_csreq_text() {
         // `and`, then `identifier` with a 5-byte string padded to 8.
@@ -738,5 +928,19 @@ mod tests {
         let mut tail = words(&[2, 1]);
         tail.push(b'a');
         assert_eq!(decode(&tail).as_deref(), Some("identifier \"a\""));
+    }
+
+    /// Entitlements are an XML plist from the binary; a deep nest is
+    /// dropped without walking it on a worker-sized stack.
+    #[test]
+    fn deep_entitlements_plist_is_refused() {
+        let values = crate::formats::plist_guard::on_small_stack(|| {
+            let mut blob = vec![0u8; 8];
+            blob.extend(crate::formats::plist_guard::nested_xml(20_000));
+            let mut values = Values::new();
+            parse_entitlements(&blob, &mut values);
+            values
+        });
+        assert!(values.get("macho.code_signature.entitlements").is_none());
     }
 }

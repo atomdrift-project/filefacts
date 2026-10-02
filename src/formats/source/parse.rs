@@ -9,11 +9,13 @@
 //! ties this cache to the parent `ParsedFile<'a>`.
 
 use crate::fileid::FileType;
+use crate::formats::source::ast_walk;
 use crate::formats::source::langs::{self, LangConfig};
 use crate::metric;
 use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::ops::ControlFlow;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// Tree-sitter's external scanners serialize their state into a fixed
@@ -85,6 +87,98 @@ fn parse_work_budget(bytes: usize) -> u64 {
     PARSE_WORK_BASE.saturating_add(bytes as u64 / PARSE_BYTES_PER_POLL)
 }
 
+/// Bytes handed to the lexer per read. The parser reads its input through
+/// a callback and fetches again whenever the lexer moves outside the bytes it
+/// last received, so bounded chunks make the bytes fetched measure how far
+/// the lexer travels, re-scans included. Small, so a backward jump that
+/// re-lexes one token costs little; sequential reading still needs only one
+/// call per chunk. Chunking never changes the tree: tree-sitter lexes across
+/// chunk boundaries the way it does across the pieces of an editor's rope.
+const LEXER_CHUNK_BYTES: usize = 64;
+
+/// Lexer fetch budget: [`LEXER_FETCH_BASE`] bytes plus [`LEXER_FETCH_FACTOR`]
+/// per input byte. Like the work budget it counts work, not time, so the same
+/// bytes stop at the same point however loaded the machine is.
+///
+/// It stops what the work budget cannot see: scanners that re-read a line on
+/// every token, each read one cheap operation. The Perl scanner asks for the
+/// column at each statement start, which rescans the line from its start: a
+/// 200 KB one-line Perl file fetched 4.2 GB and took 53 s on 8k polls. The
+/// Bash scanner looks ahead to the end of the line while recovering inside
+/// `$((…))`, and the Lua scanner looks for the end of a long bracket from
+/// every `[[`.
+///
+/// Calibrated on about 49k real source files: the most any of them fetched
+/// was 25.8 bytes per input byte (a 28 KB Python file; Perl assembler
+/// generators reach 23), no file over 3 MB fetched more than 2.1, and the
+/// largest total was 57 MB, for a 28 MB C file. A pathological input stops
+/// within half a second of re-scanning.
+const LEXER_FETCH_BASE: u64 = 64 << 20;
+const LEXER_FETCH_FACTOR: u64 = 16;
+
+#[cfg(test)]
+thread_local! {
+    /// Lexer fetch budget override in bytes; `0` means
+    /// [`lexer_fetch_budget`]. Thread-local for the same reason as
+    /// [`PARSE_WORK_OVERRIDE`].
+    static LEXER_FETCH_OVERRIDE: Cell<u64> = const { Cell::new(0) };
+}
+
+fn lexer_fetch_budget(bytes: usize) -> u64 {
+    #[cfg(test)]
+    if let budget @ 1.. = LEXER_FETCH_OVERRIDE.get() {
+        return budget;
+    }
+    LEXER_FETCH_BASE.saturating_add((bytes as u64).saturating_mul(LEXER_FETCH_FACTOR))
+}
+
+/// Consecutive progress polls the parser may spend with every stack version
+/// in error recovery before the parse is abandoned. Recovery work is not all
+/// counted as operations, and when recovery cannot get back to a healthy
+/// state each poll gets dearer: 2 MB of TypeScript token soup took 43 s on
+/// 22.7k polls, nearly all in one run, and 10 MB of malformed TypeScript more
+/// than five minutes on 52k. At this cap the soup stops after 1.4 s.
+///
+/// Real source recovers within a few polls. Across about 49k real files the
+/// longest run outside C was 32 polls (Batch), and at most 12 in JavaScript,
+/// TypeScript, Go, Rust, Python and Perl; JSX saved as `.ts`, Flow-typed
+/// JavaScript, JSON saved as `.js` and Python 2 stayed under 4. Files
+/// concatenated without regard for syntax can stay in recovery for good, and
+/// are cut off here too. C and Objective-C are exempt; see
+/// [`error_recovery_cap`].
+const ERROR_RECOVERY_POLL_CAP: u64 = 256;
+
+/// The consecutive error-recovery polls allowed for `file_type`, or `None`
+/// for no cap. C and Objective-C share `.h` headers with C++, which their
+/// grammars cannot parse: C++ headers spend long stretches in recovery
+/// (simdjson's single header, 29.8k polls in one run) while staying cheap per
+/// poll, so a cap there would drop ordinary headers.
+fn error_recovery_cap(file_type: FileType) -> Option<u64> {
+    match file_type {
+        FileType::C | FileType::ObjectiveC => None,
+        _ => Some(ERROR_RECOVERY_POLL_CAP),
+    }
+}
+
+/// Anonymous-token runs shorter than this are not counted by
+/// [`anonymous_run_cost`]: what they cost a query is linear in the file.
+const ANONYMOUS_RUN_MIN: u64 = 16;
+
+/// Largest [`anonymous_run_cost`] a tree may have before its AST is refused.
+/// A query cursor step asks whether the current node has a later *named*
+/// sibling, scanning the siblings after it until one is, so a run of `n`
+/// anonymous tokens costs about `n²/2` sibling checks per query. Error
+/// recovery over unclosed brackets leaves such runs (100k `(` took 5–8 s per
+/// query, in every grammar), and the Perl grammar hangs every nested
+/// parenthesis of an expression off one visible node (10k nested took 2.6 s
+/// per query, 41 nests 2,400 deep 3.9 s).
+///
+/// The most any of about 49k real source files reached was 164k (simdjson's
+/// single header; the longest run anywhere was 135 tokens), a hundredth of
+/// the cap. At the cap a Perl query takes about 0.3 s, other grammars far
+/// less.
+const ANONYMOUS_RUN_COST_CAP: u64 = 1 << 24;
+
 /// Why the progress callback abandoned a parse.
 #[derive(Clone, Copy)]
 enum ParseStop {
@@ -92,6 +186,11 @@ enum ParseStop {
     Cancelled,
     /// The work budget ran out with the parser at byte `at`.
     Budget { budget: u64, at: usize },
+    /// The lexer fetched more than its budget of input bytes.
+    LexerBudget { budget: u64, at: usize },
+    /// Every stack version stayed in error recovery for `polls` consecutive
+    /// polls, the parser having reached byte `at`.
+    ErrorRecovery { polls: u64, at: usize },
     /// [`SOURCE_PARSE_WALL_BACKSTOP`] elapsed first.
     Backstop,
 }
@@ -150,6 +249,9 @@ pub(crate) struct TreeCache<'a> {
     tree: tree_sitter::Tree,
     file_type: FileType,
     config: &'static LangConfig,
+    /// The symbol walk's state, collected by the extraction walk and taken
+    /// by `build_symbols`, which runs after it.
+    ast_walk: Mutex<Option<Box<ast_walk::State>>>,
 }
 
 /// Source parsing outcome cached by [`crate::ParsedFile`].
@@ -179,15 +281,41 @@ impl<'a> TreeParse<'a> {
 pub(crate) struct TreeSitterDiagnostic {
     pub(crate) metric: crate::MetricKey,
     pub(crate) message: String,
+    /// The outcome depends on the run rather than on the input bytes: see
+    /// [`Self::is_transient`].
+    transient: bool,
 }
 
 impl TreeSitterDiagnostic {
+    /// Whether another run over the same bytes could parse: true for the
+    /// wall-clock backstop, which depends on load, and for cancellation. A
+    /// caller that caches facts by content must not keep a transient
+    /// outcome. Every other diagnostic follows from the bytes alone.
+    pub(crate) fn is_transient(&self) -> bool {
+        self.transient
+    }
+
     fn tree_sitter_guard(language: &'static str, bytes: usize, audit: ScannerAudit) -> Self {
         Self {
             metric: metric!("source.ast_unavailable.tree_sitter_guard"),
             message: format!(
                 "tree-sitter parse skipped for {language}: {bytes} bytes exceeds source-size or scanner-state safety guard ({audit:?})"
             ),
+            transient: false,
+        }
+    }
+
+    /// The tree parsed, but [`anonymous_run_cost`] puts it past
+    /// [`ANONYMOUS_RUN_COST_CAP`]: queries over it would take quadratic time.
+    /// Same metric as the up-front guards, which also refuse an AST that
+    /// would be unsafe to work with.
+    fn anonymous_run_guard(language: &'static str, bytes: usize, cost: u64) -> Self {
+        Self {
+            metric: metric!("source.ast_unavailable.tree_sitter_guard"),
+            message: format!(
+                "tree-sitter tree for {language} discarded: runs of anonymous tokens in {bytes} bytes cost over {cost} sibling checks per query (cap {ANONYMOUS_RUN_COST_CAP})"
+            ),
+            transient: false,
         }
     }
 
@@ -195,6 +323,7 @@ impl TreeSitterDiagnostic {
         Self {
             metric: metric!("source.ast_unavailable.parse_failed"),
             message: message.into(),
+            transient: false,
         }
     }
 
@@ -209,6 +338,36 @@ impl TreeSitterDiagnostic {
             message: format!(
                 "tree-sitter parse for {language} exhausted its work budget of {budget} progress polls at byte {at} of {bytes}"
             ),
+            transient: false,
+        }
+    }
+
+    /// Same metric as [`Self::parse_work_exhausted`]: the lexer exhausted its
+    /// fetch budget ([`lexer_fetch_budget`]), which is just as deterministic.
+    fn lexer_work_exhausted(language: &'static str, bytes: usize, budget: u64, at: usize) -> Self {
+        Self {
+            metric: metric!("source.ast_unavailable.parse_timeout"),
+            message: format!(
+                "tree-sitter parse for {language} exhausted its lexer budget of {budget} fetched bytes at byte {at} of {bytes}; a scanner kept re-reading the input"
+            ),
+            transient: false,
+        }
+    }
+
+    /// Same metric as [`Self::parse_work_exhausted`]: error recovery ran for
+    /// [`ERROR_RECOVERY_POLL_CAP`] polls without a healthy stack version.
+    fn error_recovery_exhausted(
+        language: &'static str,
+        bytes: usize,
+        polls: u64,
+        at: usize,
+    ) -> Self {
+        Self {
+            metric: metric!("source.ast_unavailable.parse_timeout"),
+            message: format!(
+                "tree-sitter parse for {language} abandoned at byte {at} of {bytes}: error recovery ran {polls} consecutive progress polls without recovering"
+            ),
+            transient: false,
         }
     }
 
@@ -220,6 +379,7 @@ impl TreeSitterDiagnostic {
             message: format!(
                 "tree-sitter parse for {language} hit the {SOURCE_PARSE_WALL_BACKSTOP:?} wall-clock backstop on {bytes} bytes"
             ),
+            transient: true,
         }
     }
 
@@ -231,6 +391,7 @@ impl TreeSitterDiagnostic {
         Self {
             metric: metric!("source.ast_unavailable.parse_cancelled"),
             message: format!("tree-sitter parse for {language} cancelled at {bytes} bytes"),
+            transient: true,
         }
     }
 }
@@ -296,7 +457,15 @@ impl<'a> TreeCache<'a> {
             let deadline = Instant::now() + SOURCE_PARSE_WALL_BACKSTOP;
             let polls = Cell::new(0u64);
             let stop = Cell::new(None);
+            let recovery_cap = error_recovery_cap(file_type);
+            let recovery_run = Cell::new(0u64);
+            let fetch_budget = lexer_fetch_budget(source.len());
+            let fetched = Cell::new(0u64);
             let mut progress = |state: &tree_sitter::ParseState| -> ControlFlow<()> {
+                // The read callback below already gave up on the input.
+                if matches!(stop.get(), Some(ParseStop::LexerBudget { .. })) {
+                    return ControlFlow::Break(());
+                }
                 // Cancellation first: it is a plain atomic load, and when the
                 // caller is shutting down there is no point counting work.
                 // `Relaxed` is right for a poll — the flag is a hint, and the
@@ -309,6 +478,21 @@ impl<'a> TreeCache<'a> {
                 if polls.get() > budget {
                     let at = state.current_byte_offset();
                     stop.set(Some(ParseStop::Budget { budget, at }));
+                    return ControlFlow::Break(());
+                }
+                // `has_error` is set only while every stack version is
+                // recovering; any healthy version resets the run.
+                recovery_run.set(if state.has_error() {
+                    recovery_run.get() + 1
+                } else {
+                    0
+                });
+                if recovery_cap.is_some_and(|cap| recovery_run.get() > cap) {
+                    let at = state.current_byte_offset();
+                    stop.set(Some(ParseStop::ErrorRecovery {
+                        polls: recovery_run.get(),
+                        at,
+                    }));
                     return ControlFlow::Break(());
                 }
                 if Instant::now() >= deadline {
@@ -329,23 +513,33 @@ impl<'a> TreeCache<'a> {
                 .flatten();
             let parser_source = normalized_shell.as_deref().unwrap_or(source);
             let mut read = |offset: usize, _: tree_sitter::Point| -> &[u8] {
-                parser_source.as_bytes().get(offset..).unwrap_or_default()
+                // Past the budget the lexer sees end of input, so a scanner
+                // mid-way through a long scan stops at once, and the next
+                // poll abandons the parse.
+                if fetched.get() > fetch_budget {
+                    return &[];
+                }
+                let chunk = lexer_chunk(parser_source, offset);
+                fetched.set(fetched.get() + chunk.len() as u64);
+                if fetched.get() > fetch_budget {
+                    stop.set(Some(ParseStop::LexerBudget {
+                        budget: fetch_budget,
+                        at: offset,
+                    }));
+                    return &[];
+                }
+                chunk
             };
-            let s4_start = Instant::now(); // S4INSTR
             let parsed = parser.parse_with_options(
                 &mut read,
                 None,
                 Some(tree_sitter::ParseOptions::default().progress_callback(&mut progress)),
             );
-            super::s4i(format_args!(
-                "parse {} bytes={} polls={} secs={:.3} ok={} maxline={}",
-                config.name(),
-                source.len(),
-                polls.get(),
-                s4_start.elapsed().as_secs_f64(),
-                parsed.is_some(),
-                source.split('\n').map(str::len).max().unwrap_or(0)
-            )); // S4INSTR
+            // A parse that hit the lexer budget may still have finished
+            // before the next poll, on a tree cut short at the false end of
+            // input. Such a tree must not be used.
+            let parsed =
+                parsed.filter(|_| !matches!(stop.get(), Some(ParseStop::LexerBudget { .. })));
             let Some(tree) = parsed else {
                 // An abandoned parse degrades like the scanner-risk guard
                 // above: generic/text facts still flow, with a diagnostic
@@ -366,6 +560,26 @@ impl<'a> TreeCache<'a> {
                         );
                         TreeSitterDiagnostic::parse_work_exhausted(language, bytes, budget, at)
                     }
+                    Some(ParseStop::LexerBudget { budget, at }) => {
+                        tracing::warn!(
+                            language,
+                            bytes,
+                            budget,
+                            at,
+                            "tree-sitter parse exhausted its lexer budget; AST facts dropped"
+                        );
+                        TreeSitterDiagnostic::lexer_work_exhausted(language, bytes, budget, at)
+                    }
+                    Some(ParseStop::ErrorRecovery { polls, at }) => {
+                        tracing::warn!(
+                            language,
+                            bytes,
+                            polls,
+                            at,
+                            "tree-sitter error recovery did not recover; AST facts dropped"
+                        );
+                        TreeSitterDiagnostic::error_recovery_exhausted(language, bytes, polls, at)
+                    }
                     Some(ParseStop::Backstop) => {
                         tracing::warn!(
                             language,
@@ -380,11 +594,25 @@ impl<'a> TreeCache<'a> {
                     ),
                 });
             };
+            let cost = anonymous_run_cost(tree.root_node(), ANONYMOUS_RUN_COST_CAP);
+            if cost > ANONYMOUS_RUN_COST_CAP {
+                let (language, bytes) = (config.name(), source.len());
+                tracing::warn!(
+                    language,
+                    bytes,
+                    cost,
+                    "tree-sitter tree has anonymous-token runs too costly to query; AST facts dropped"
+                );
+                return TreeParse::Unavailable(TreeSitterDiagnostic::anonymous_run_guard(
+                    language, bytes, cost,
+                ));
+            }
             TreeParse::Parsed(Self {
                 source,
                 tree,
                 file_type,
                 config,
+                ast_walk: Mutex::new(None),
             })
         })
     }
@@ -404,6 +632,80 @@ impl<'a> TreeCache<'a> {
     /// The language configuration the tree was parsed with.
     pub(super) fn config(&self) -> &'static LangConfig {
         self.config
+    }
+
+    /// Keep the symbol walk's state for [`Self::take_ast_walk`].
+    pub(super) fn stash_ast_walk(&self, state: ast_walk::State) {
+        *self.ast_walk.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(state));
+    }
+
+    /// The symbol walk's state, if extraction collected it and nothing took
+    /// it yet.
+    pub(super) fn take_ast_walk(&self) -> Option<ast_walk::State> {
+        self.ast_walk
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .map(|state| *state)
+    }
+}
+
+/// The next chunk of `source` for the lexer, starting at `offset`: at most
+/// [`LEXER_CHUNK_BYTES`], extended to the end of a UTF-8 character so the
+/// lexer never has to stitch one together across reads.
+fn lexer_chunk(source: &str, offset: usize) -> &[u8] {
+    if offset >= source.len() {
+        return &[];
+    }
+    let mut end = (offset + LEXER_CHUNK_BYTES).min(source.len());
+    while !source.is_char_boundary(end) {
+        end += 1;
+    }
+    source.as_bytes().get(offset..end).unwrap_or_default()
+}
+
+/// Sum of `n²` over every run of `n` ≥ [`ANONYMOUS_RUN_MIN`] consecutive
+/// anonymous children of one node, the quadratic part of what a query pays to
+/// look for later named siblings ([`ANONYMOUS_RUN_COST_CAP`]). Stops counting
+/// once past `cap`.
+///
+/// Queries only visit nodes that start within their byte range
+/// ([`super::SOURCE_QUERY_BYTE_LIMIT`]), though they check the later
+/// siblings of those wherever they lie, so this counts the children of every
+/// node that starts in range and descends no further. One cursor pass over at
+/// most that much of the tree, no allocation per node.
+fn anonymous_run_cost(root: tree_sitter::Node<'_>, cap: u64) -> u64 {
+    fn close(run: u64, cost: &mut u64) {
+        if run >= ANONYMOUS_RUN_MIN {
+            *cost = cost.saturating_add(run.saturating_mul(run));
+        }
+    }
+    let mut cost = 0u64;
+    let mut cursor = root.walk();
+    // `runs[i]`: the current run among the children of the cursor's
+    // ancestor at depth `i`.
+    let mut runs: Vec<u64> = vec![0];
+    if !cursor.goto_first_child() {
+        return 0;
+    }
+    loop {
+        let run = runs.last_mut().expect("one run per open level");
+        if cursor.node().is_named() {
+            close(std::mem::take(run), &mut cost);
+        } else {
+            *run += 1;
+        }
+        if cursor.node().start_byte() < super::SOURCE_QUERY_BYTE_LIMIT && cursor.goto_first_child()
+        {
+            runs.push(0);
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            close(runs.pop().unwrap_or(0), &mut cost);
+            if cost > cap || !cursor.goto_parent() || runs.is_empty() {
+                return cost;
+            }
+        }
     }
 }
 

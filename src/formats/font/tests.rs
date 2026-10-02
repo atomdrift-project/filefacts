@@ -4,7 +4,7 @@ fn run(bytes: &[u8]) -> (Values, Metrics) {
     let mut v = Values::new();
     let mut s = Strings::default();
     let mut m = Metrics::new();
-    extract(bytes, &mut v, &mut s, &mut m).unwrap();
+    extract(bytes, &mut v, &mut s, &mut m);
     (v, m)
 }
 

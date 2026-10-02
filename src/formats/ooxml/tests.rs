@@ -50,7 +50,7 @@ fn run_with_errors(bytes: &[u8]) -> (Values, Metrics, Errors) {
     let mut m = Metrics::new();
     let mut e = Errors::new();
     if let Ok(mut zip) = crate::formats::zip::open_archive(bytes) {
-        let _ = extract_from_archive(&mut zip, &mut v, &mut m, &mut e);
+        extract_from_archive(&mut zip, &mut v, &mut m, &mut e);
     }
     (v, m, e)
 }
@@ -302,6 +302,50 @@ fn oversized_body_part_is_a_limit_not_an_error() {
     assert_eq!(limits[0]["stage"].as_str(), Some("part-scan"));
 }
 
+/// The DDE and customUI scans share one parse per part.
+#[test]
+fn dde_field_and_custom_ui_onload_are_found() {
+    let ct = content_types_with_overrides(0);
+    let doc = r#"<w:document xmlns:w="w"><w:body><w:fldSimple w:instr="DDEAUTO c:\\windows\\system32\\cmd.exe &quot;/k calc&quot;"/></w:body></w:document>"#;
+    let ui =
+        r#"<customUI xmlns="http://schemas.microsoft.com/office/2006/01/customui" onLoad="Boom"/>"#;
+    let z = build_ooxml(&[
+        ("[Content_Types].xml", ct.as_bytes()),
+        ("word/document.xml", doc.as_bytes()),
+        ("customUI/customUI.xml", ui.as_bytes()),
+    ]);
+    let (v, m) = run(&z);
+    let dde = v
+        .get("office.dde_links")
+        .and_then(|x| x.as_array())
+        .unwrap();
+    assert_eq!(dde.len(), 1);
+    assert_eq!(dde[0]["source"].as_str(), Some("word/document.xml"));
+    assert_eq!(m.get("office.custom_ui_onload_count"), Some(1.0));
+}
+
+/// Thousands of parts used to be inflated and parsed twice each. The scan
+/// reads a bounded total; the parts past it are a recorded limit.
+#[test]
+fn xml_part_scan_shares_one_byte_budget() {
+    let ct = content_types_with_overrides(0);
+    let part = format!("<a>{}</a>", " ".repeat(1_000_000));
+    let count = (MAX_SCAN_TOTAL_BYTES as usize / part.len()) + 3;
+    let names: Vec<String> = (0..count).map(|i| format!("word/part{i}.xml")).collect();
+    let mut members: Vec<(&str, &[u8])> = vec![("[Content_Types].xml", ct.as_bytes())];
+    members.extend(names.iter().map(|n| (n.as_str(), part.as_bytes())));
+    let z = build_ooxml(&members);
+    let (v, _, e) = run_with_errors(&z);
+    assert!(e.is_empty(), "{e:?}");
+    let limits = v.get("office.limits").and_then(|x| x.as_array()).unwrap();
+    assert!(
+        limits
+            .iter()
+            .any(|l| l["stage"].as_str() == Some("part-scan-budget")),
+        "{limits:?}"
+    );
+}
+
 /// Past the read cap the layer is still lost, but no longer silently.
 #[test]
 fn oversized_content_types_is_recorded() {
@@ -312,7 +356,7 @@ fn oversized_content_types_is_recorded() {
     let (v, _, e) = run_with_errors(&z);
     assert!(v.get("office.kind").is_none());
     let entry = e.iter().next().expect("oversized part recorded");
-    assert_eq!(entry.kind, ErrorKind::Truncated);
+    assert_eq!(entry.kind, DiagnosticKind::Truncated);
     assert_eq!(entry.stage, Stage::OoxmlParse);
     assert!(entry.message.starts_with("[Content_Types].xml"));
 }

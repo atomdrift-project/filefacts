@@ -22,9 +22,8 @@
 //! filesystem, `gojs` ⇒ JS host bridge) is left to traits — this module only
 //! records neutral structure.
 
-use crate::error::Error;
 use crate::metric;
-use crate::output::{ErrorKind, Errors, Metrics, Section, Stage, Strings, Symbols, Values};
+use crate::output::{DiagnosticKind, Stage, Symbols, Values};
 use crate::value_key;
 use serde_json::Value as JsonValue;
 
@@ -34,17 +33,17 @@ const MAX_ENTRIES: usize = 8192;
 
 /// Why a section body parse stopped short of its declared contents: the
 /// kind to record and a message saying where.
-type Bail = (ErrorKind, String);
+type Bail = (DiagnosticKind, String);
 
 fn malformed(message: String) -> Bail {
-    (ErrorKind::Malformed, message)
+    (DiagnosticKind::Malformed, message)
 }
 
 /// Report a vector cut at [`MAX_ENTRIES`], once its kept entries are read.
 fn check_cap(count: u64, what: &str) -> Result<(), Bail> {
     if count > MAX_ENTRIES as u64 {
         return Err((
-            ErrorKind::Truncated,
+            DiagnosticKind::Truncated,
             format!("{count} {what} declared; read the first {MAX_ENTRIES}"),
         ));
     }
@@ -73,19 +72,7 @@ impl<'a> Reader<'a> {
     /// Unsigned LEB128. Returns `None` on truncation or on a value wider than
     /// 64 bits (a malformed over-long encoding).
     fn uleb(&mut self) -> Option<u64> {
-        let mut result: u64 = 0;
-        let mut shift = 0u32;
-        loop {
-            let b = self.byte()?;
-            if shift >= 64 {
-                return None;
-            }
-            result |= u64::from(b & 0x7f).checked_shl(shift)?;
-            if b & 0x80 == 0 {
-                return Some(result);
-            }
-            shift += 7;
-        }
+        super::common::read_uleb128(self.data, &mut self.pos)
     }
 
     /// A length-prefixed UTF-8 name (WASM `name` = `vec(byte)`). Lossily
@@ -98,7 +85,7 @@ impl<'a> Reader<'a> {
     /// this reader's input. The length prefix is intentionally excluded so
     /// symbol evidence points at the name itself.
     fn name_with_offset(&mut self) -> Option<(String, usize)> {
-        let len = self.uleb()? as usize;
+        let len = crate::bytes::sat_usize(self.uleb()?);
         let offset = self.pos;
         let end = self.pos.checked_add(len)?;
         let slice = self.data.get(self.pos..end)?;
@@ -116,20 +103,36 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// The distinct import module names, in first-seen order.
+#[derive(Default)]
+struct ImportModules {
+    order: Vec<String>,
+    seen: std::collections::HashSet<String>,
+}
+
+impl ImportModules {
+    fn insert(&mut self, module: &str) {
+        if !self.seen.contains(module) {
+            self.seen.insert(module.to_owned());
+            self.order.push(module.to_owned());
+        }
+    }
+}
+
 /// External-kind byte → (kind label, has_extra_index/limits descriptor).
 /// 0 func, 1 table, 2 memory, 3 global.
 fn extract_imports(
     body: &[u8],
     body_offset: u64,
     symbols_out: &mut Symbols,
-    modules: &mut Vec<String>,
+    modules: &mut ImportModules,
     import_names: &mut Vec<String>,
 ) -> Result<(), Bail> {
     let mut r = Reader::new(body);
     let declared = r
         .uleb()
         .ok_or_else(|| malformed("import count truncated".into()))?;
-    for i in 0..(declared as usize).min(MAX_ENTRIES) {
+    for i in 0..crate::bytes::sat_usize(declared).min(MAX_ENTRIES) {
         let truncated = || malformed(format!("import {i} truncated"));
         let (module, _module_offset) = r.name_with_offset().ok_or_else(truncated)?;
         let (field, field_offset) = r.name_with_offset().ok_or_else(truncated)?;
@@ -142,9 +145,7 @@ fn extract_imports(
             0x03 => r.skip(2),               // global: valtype + mut
             _ => None,
         };
-        if !modules.contains(&module) {
-            modules.push(module.clone());
-        }
+        modules.insert(&module);
         // Only function imports are callable host capabilities; record those
         // as Import symbols. Table/memory/global imports still count toward
         // the module list above.
@@ -191,7 +192,7 @@ fn extract_exports(
     let declared = r
         .uleb()
         .ok_or_else(|| malformed("export count truncated".into()))?;
-    for i in 0..(declared as usize).min(MAX_ENTRIES) {
+    for i in 0..crate::bytes::sat_usize(declared).min(MAX_ENTRIES) {
         let truncated = || malformed(format!("export {i} truncated"));
         let (name, name_offset) = r.name_with_offset().ok_or_else(truncated)?;
         r.byte().ok_or_else(truncated)?; // export kind
@@ -228,11 +229,11 @@ fn extract_memory(body: &[u8], values: &mut Values) {
 /// Records the first value of each field under `wasm.producers.<field>`.
 fn extract_producers(r: &mut Reader<'_>, values: &mut Values) {
     let Some(field_count) = r.uleb() else { return };
-    let field_count = (field_count as usize).min(64);
+    let field_count = crate::bytes::sat_usize(field_count).min(64);
     for _ in 0..field_count {
         let Some(field) = r.name() else { return };
         let Some(vcount) = r.uleb() else { return };
-        let vcount = (vcount as usize).min(64);
+        let vcount = crate::bytes::sat_usize(vcount).min(64);
         let mut first: Option<String> = None;
         for _ in 0..vcount {
             let Some(name) = r.name() else { return };
@@ -255,29 +256,32 @@ fn extract_producers(r: &mut Reader<'_>, values: &mut Values) {
     }
 }
 
-pub(super) fn extract(
-    bytes: &[u8],
-    values: &mut Values,
-    _strings: &mut Strings,
-    metrics: &mut Metrics,
-    _sections_out: &mut Vec<Section>,
-    symbols_out: &mut Symbols,
-    errors_out: &mut Errors,
-) -> Result<(), Error> {
+pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
+    let super::ExtractCtx {
+        values,
+        metrics,
+        symbols: symbols_out,
+        errors: errors_out,
+        ..
+    } = ctx;
     // Header: `\0asm` + u32 version. Detection already vetted this, but guard
     // anyway so a forced/misrouted file can't index out of range.
     if bytes.len() < 8 || !bytes.starts_with(b"\0asm") {
-        return Ok(());
+        return;
     }
 
     let mut r = Reader::new(bytes);
     r.pos = 8;
 
-    let mut modules: Vec<String> = Vec::new();
+    let mut modules = ImportModules::default();
     let mut import_names: Vec<String> = Vec::new();
     let mut export_names: Vec<String> = Vec::new();
     let mut has_start = false;
     let mut section_count: u64 = 0;
+    // Known section ids already read. The spec allows each non-custom section
+    // at most once, and honouring that is what makes MAX_ENTRIES a bound on
+    // the whole module rather than on each of any number of import sections.
+    let mut seen_ids: u64 = 0;
 
     while let Some(id) = r.byte() {
         let header_at = r.pos - 1;
@@ -288,7 +292,7 @@ pub(super) fn extract(
             bytes.get(start..start.checked_add(usize::try_from(size).ok()?)?)
         }) else {
             errors_out.record(
-                ErrorKind::Truncated,
+                DiagnosticKind::Truncated,
                 Stage::WasmParse,
                 format!("wasm section {id} at offset {header_at} runs past the end of the file"),
             );
@@ -297,6 +301,18 @@ pub(super) fn extract(
         let start = r.pos;
         let end = start + body.len();
         section_count += 1;
+
+        let id_bit = 1u64.checked_shl(u32::from(id)).unwrap_or(0);
+        if id != 0 && seen_ids & id_bit != 0 {
+            errors_out.record(
+                DiagnosticKind::Malformed,
+                Stage::WasmParse,
+                format!("wasm section {id} at offset {header_at} repeats; only the first is read"),
+            );
+            r.pos = end;
+            continue;
+        }
+        seen_ids |= id_bit;
 
         let parsed = match id {
             2 => extract_imports(
@@ -341,8 +357,11 @@ pub(super) fn extract(
     }
 
     values.insert_key(value_key!("wasm.has_start"), JsonValue::Bool(has_start));
-    if !modules.is_empty() {
-        values.insert_key(value_key!("wasm.import_modules"), JsonValue::from(modules));
+    if !modules.order.is_empty() {
+        values.insert_key(
+            value_key!("wasm.import_modules"),
+            JsonValue::from(modules.order),
+        );
     }
     if !import_names.is_empty() {
         import_names.truncate(MAX_ENTRIES);
@@ -362,13 +381,12 @@ pub(super) fn extract(
     metrics.insert(metric!("wasm.import_count"), import_names.len() as f64);
     metrics.insert(metric!("wasm.export_count"), export_names.len() as f64);
     metrics.insert(metric!("wasm.section_count"), section_count as f64);
-
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::Errors;
 
     fn module(sections: &[(u8, &[u8])]) -> Vec<u8> {
         let mut out = b"\0asm\x01\0\0\0".to_vec();
@@ -381,19 +399,9 @@ mod tests {
     }
 
     fn run(bytes: &[u8]) -> (Values, Errors) {
-        let mut v = Values::new();
-        let mut errors = Errors::new();
-        extract(
-            bytes,
-            &mut v,
-            &mut Strings::default(),
-            &mut Metrics::new(),
-            &mut Vec::new(),
-            &mut Symbols::default(),
-            &mut errors,
-        )
-        .unwrap();
-        (v, errors)
+        let mut out = crate::formats::Sinks::default();
+        extract(bytes, out.ctx());
+        (out.values, out.errors)
     }
 
     /// `env.f`, a function import of type 0.
@@ -420,7 +428,7 @@ mod tests {
         let (v, errors) = run(&module(&[(2, &imports)]));
         assert_eq!(v.get("wasm.imports"), Some(&serde_json::json!(["f"])));
         let entry = errors.iter().next().expect("bail recorded");
-        assert_eq!(entry.kind, ErrorKind::Malformed);
+        assert_eq!(entry.kind, DiagnosticKind::Malformed);
         assert_eq!(entry.stage, Stage::WasmParse);
         assert!(entry.message.contains("import 1 truncated"), "{entry:?}");
     }
@@ -432,8 +440,34 @@ mod tests {
         let (v, errors) = run(&bytes);
         assert_eq!(v.get("wasm.has_start"), Some(&serde_json::json!(false)));
         let entry = errors.iter().next().expect("truncation recorded");
-        assert_eq!(entry.kind, ErrorKind::Truncated);
+        assert_eq!(entry.kind, DiagnosticKind::Truncated);
         assert!(entry.message.contains("section 2"), "{entry:?}");
+    }
+
+    /// A repeated import section is reported and skipped, so `MAX_ENTRIES`
+    /// bounds the module's imports however many import sections it repeats;
+    /// module names stay deduplicated in first-seen order.
+    #[test]
+    fn repeated_import_section_is_recorded_and_not_reread() {
+        let mut imports = vec![3];
+        imports.extend_from_slice(IMPORT_ENV_F);
+        imports.extend_from_slice(b"\x04wasi\x01g\x00\x00");
+        imports.extend_from_slice(IMPORT_ENV_F);
+        let second = b"\x01\x05other\x01h\x00\x00";
+        let (v, errors) = run(&module(&[(2, &imports), (2, second), (2, second)]));
+        assert_eq!(
+            v.get("wasm.import_modules"),
+            Some(&serde_json::json!(["env", "wasi"]))
+        );
+        assert_eq!(
+            v.get("wasm.imports"),
+            Some(&serde_json::json!(["f", "g", "f"]))
+        );
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        let entry = errors.iter().next().expect("repeat recorded");
+        assert_eq!(entry.kind, DiagnosticKind::Malformed);
+        assert!(entry.message.contains("section 2"), "{entry:?}");
+        assert!(entry.message.contains("repeats"), "{entry:?}");
     }
 }
 

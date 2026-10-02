@@ -1,6 +1,6 @@
 use super::{
-    gen_time_from_tst_info, is_ecdsa_oid, is_rsa_oid, oid_to_label, parse_generalized_time,
-    read_tlv, signature_algorithm_name, trim_to_der_object,
+    Budget, DigestAlg, Scheme, gen_time_from_tst_info, oid_to_label, parse_generalized_time,
+    read_tlv, signature_algorithm, signature_algorithm_name, trim_to_der_object,
 };
 use der::oid::ObjectIdentifier;
 
@@ -15,7 +15,7 @@ const DIGICERT_CODE_SIGNING_CA: &str =
     "51044706bd237b91b89b781337e6d62656c69f0fcffbe8e43741367948127862";
 
 fn parse(blob: &[u8]) -> serde_json::Value {
-    super::parse_pkcs7(trim_to_der_object(blob).unwrap()).unwrap()
+    super::parse_pkcs7(trim_to_der_object(blob).unwrap(), None, &mut Budget::new()).unwrap()
 }
 
 fn chain(sig: &serde_json::Value) -> Vec<&str> {
@@ -76,7 +76,8 @@ mod bags {
 
         /// `verified_chain` from `signer`, as subject names.
         pub(super) fn walk(&self, signer: &x509_cert::Certificate) -> Vec<String> {
-            super::super::verified_chain(&self.sd, signer)
+            super::super::verified_chain(&self.certs(), signer)
+                .thumbprints
                 .iter()
                 .map(|t| self.name_of(t))
                 .collect()
@@ -145,7 +146,7 @@ fn chain_rejects_an_impostor_with_the_issuers_name() {
     let both = bags::Bag::load(BAG_IMPOSTOR_AND_REAL);
     let leaf = both.cert("Chain Leaf", "Chain CA");
     assert_eq!(both.walk(leaf), ["Chain Leaf", "Chain CA", "Chain Root"]);
-    let chain = super::verified_chain(&both.sd, leaf);
+    let chain = super::verified_chain(&both.certs(), leaf).thumbprints;
     assert_eq!(
         chain[1],
         bags::Bag::thumbprint(both.cert("Chain CA", "Chain Root"))
@@ -168,7 +169,10 @@ fn chain_stops_when_the_issuer_is_not_in_the_bag() {
     let other = bags::Bag::load(BAG_ECDSA);
     // An EC leaf walked against a bag that does not hold its issuer.
     let leaf = other.cert("EC Leaf", "EC CA");
-    assert_eq!(super::verified_chain(&bag.sd, leaf).len(), 1);
+    assert_eq!(
+        super::verified_chain(&bag.certs(), leaf).thumbprints.len(),
+        1
+    );
 }
 
 /// Legacy SHA-1 links (VC++ 2010-era Microsoft chains) must verify.
@@ -322,13 +326,16 @@ fn trim_rejects_oversized_length() {
     assert!(trim_to_der_object(&bytes).is_none());
 }
 
-/// `is_rsa_oid` must accept every RSA OID Authenticode emitters
-/// have been observed to put on PE signatures — the bare
-/// `rsaEncryption` plus the hash-specific composites. Unknown
-/// OIDs must NOT match, otherwise `verify_signer_signature`
-/// would dispatch RSA verification on an ECDSA cert (or worse).
+fn scheme(oid: &str) -> Option<Scheme> {
+    signature_algorithm(&ObjectIdentifier::new(oid).unwrap()).map(|alg| alg.scheme)
+}
+
+/// Every RSA OID Authenticode emitters have been observed to put on PE
+/// signatures — the bare `rsaEncryption` plus the hash-specific
+/// composites — must dispatch to RSA. Unknown OIDs must not, otherwise
+/// verification would run RSA on an ECDSA cert (or worse).
 #[test]
-fn is_rsa_oid_covers_known_authenticode_oids() {
+fn rsa_oids_cover_known_authenticode_oids() {
     // Bare rsaEncryption + every hash-specific composite shipped
     // in Windows Authenticode signatures.
     for oid in [
@@ -339,31 +346,40 @@ fn is_rsa_oid_covers_known_authenticode_oids() {
         "1.2.840.113549.1.1.12", // sha384WithRSA
         "1.2.840.113549.1.1.13", // sha512WithRSA
     ] {
-        assert!(is_rsa_oid(oid), "should classify {oid} as RSA");
+        assert_eq!(scheme(oid), Some(Scheme::Rsa), "{oid} should be RSA");
     }
-    // ECDSA OIDs must NOT match — they go through verify_ecdsa.
-    assert!(!is_rsa_oid("1.2.840.10045.4.3.2"));
-    // Garbage / Ed25519 / dsa-with-sha256 OIDs are unsupported.
-    assert!(!is_rsa_oid("1.3.101.112"));
-    assert!(!is_rsa_oid(""));
+    // ECDSA OIDs go through verify_ecdsa.
+    assert_eq!(scheme("1.2.840.10045.4.3.2"), Some(Scheme::Ecdsa));
+    // Ed25519 / RSASSA-PSS are unsupported.
+    assert_eq!(scheme("1.3.101.112"), None);
+    assert_eq!(scheme("1.2.840.113549.1.1.10"), None);
 }
 
 #[test]
-fn is_ecdsa_oid_covers_known_authenticode_oids() {
+fn ecdsa_oids_cover_known_authenticode_oids() {
     for oid in [
         "1.2.840.10045.4.1",   // ecdsa-with-SHA1
         "1.2.840.10045.4.3.2", // ecdsa-with-SHA256
         "1.2.840.10045.4.3.3", // ecdsa-with-SHA384
         "1.2.840.10045.4.3.4", // ecdsa-with-SHA512
     ] {
-        assert!(is_ecdsa_oid(oid), "should classify {oid} as ECDSA");
+        assert_eq!(scheme(oid), Some(Scheme::Ecdsa), "{oid} should be ECDSA");
     }
-    // RSA OIDs must NOT match.
-    assert!(!is_ecdsa_oid("1.2.840.113549.1.1.11"));
-    // Curve OIDs (subject_public_key_info parameters) must NOT
-    // be mistaken for signature algorithms.
-    assert!(!is_ecdsa_oid("1.2.840.10045.3.1.7")); // P-256
-    assert!(!is_ecdsa_oid(""));
+    // Curve OIDs (subject_public_key_info parameters) must not be
+    // mistaken for signature algorithms.
+    assert_eq!(scheme("1.2.840.10045.3.1.7"), None); // P-256
+}
+
+/// Hash-specific signature OIDs fix the digest a certificate signature is
+/// checked with; generic `rsaEncryption` leaves it to the SignerInfo.
+#[test]
+fn signature_oids_fix_their_digest() {
+    let digest = |oid: &str| {
+        signature_algorithm(&ObjectIdentifier::new(oid).unwrap()).and_then(|alg| alg.digest)
+    };
+    assert_eq!(digest("1.2.840.113549.1.1.11"), Some(DigestAlg::Sha256));
+    assert_eq!(digest("1.2.840.10045.4.3.3"), Some(DigestAlg::Sha384));
+    assert_eq!(digest("1.2.840.113549.1.1.1"), None);
 }
 
 /// `signature_algorithm_name` returns the canonical RFC label for
@@ -484,4 +500,464 @@ fn tst_info_walk_stops_when_truncated() {
     let mut seq = vec![0x30, body.len() as u8];
     seq.extend(body);
     assert!(gen_time_from_tst_info(&seq).is_none());
+}
+
+// ---------------------------------------------------------------------
+// Content binding (messageDigest / contentType).
+// ---------------------------------------------------------------------
+
+fn signed_data(der: &[u8]) -> cms::signed_data::SignedData {
+    use der::Decode;
+    cms::content_info::ContentInfo::from_der(der)
+        .unwrap()
+        .content
+        .decode_as()
+        .unwrap()
+}
+
+/// Flip the last byte of the first occurrence of `needle` in `blob`.
+fn flip(blob: &[u8], needle: &[u8]) -> Vec<u8> {
+    let at = blob
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("needle present");
+    let mut out = blob.to_vec();
+    out[at + needle.len() - 1] ^= 0x01;
+    out
+}
+
+/// The bytes of a signature's `signature_digest`.
+fn claimed_digest(sig: &serde_json::Value) -> Vec<u8> {
+    let text = sig["signature_digest"].as_str().unwrap();
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// The real Authenticode blob verifies, and its `messageDigest` binds the
+/// SpcIndirectDataContent it carries.
+#[test]
+fn genuine_signature_binds_its_content() {
+    let sig = parse(DIGICERT_TENCENT);
+    assert_eq!(sig["verified"], true);
+    assert!(sig.get("verification_failure").is_none());
+}
+
+/// The graft: a genuine SignerInfo and certificate bag around content of
+/// the attacker's choosing (here, the same structure claiming a different
+/// Authentihash). The signer's signature over its attributes still
+/// verifies, because nothing in them changed — only the binding catches it.
+#[test]
+fn grafted_signer_info_does_not_verify_new_content() {
+    let genuine = parse(DIGICERT_TENCENT);
+    let sig = parse(&flip(DIGICERT_TENCENT, &claimed_digest(&genuine)));
+    assert_ne!(sig["signature_digest"], genuine["signature_digest"]);
+    assert_eq!(sig["verified"], false);
+    assert_eq!(sig["verification_failure"], "message_digest_mismatch");
+}
+
+/// A grafted signature must not read as intact once the integrity summary
+/// runs, even when the forged Authentihash matches the file.
+#[test]
+fn grafted_signature_is_not_intact() {
+    use serde_json::json;
+    let genuine = parse(DIGICERT_TENCENT);
+    let forged = parse(&flip(DIGICERT_TENCENT, &claimed_digest(&genuine)));
+    let mut values = crate::output::Values::new();
+    values.insert(
+        "pe.image_hash",
+        json!({"sha256": forged["signature_digest"].clone()}),
+    );
+    values.insert("pe.signatures", json!([forged]));
+    let mut metrics = crate::output::Metrics::new();
+    crate::formats::pe_signature_trust::derive(&mut values, &mut metrics, 0);
+    assert_eq!(
+        values
+            .get("pe.signature_integrity")
+            .and_then(|v| v.as_str()),
+        Some("invalid")
+    );
+}
+
+fn attr(oid: ObjectIdentifier, values: Vec<der::Any>) -> x509_cert::attr::Attribute {
+    x509_cert::attr::Attribute {
+        oid,
+        values: der::asn1::SetOfVec::try_from(values).unwrap(),
+    }
+}
+
+fn octets(bytes: &[u8]) -> der::Any {
+    der::Any::encode_from(&der::asn1::OctetString::new(bytes).unwrap()).unwrap()
+}
+
+/// Each way the binding can be missing or ambiguous is its own failure.
+#[test]
+fn binding_requires_exactly_one_matching_digest_and_content_type() {
+    use super::{CONTENT_TYPE_OID, Failure, MESSAGE_DIGEST_OID, check_binding};
+    let content = b"signed content";
+    let data_oid = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
+    let other_oid = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
+    let content_type = |oid| attr(CONTENT_TYPE_OID, vec![der::Any::encode_from(&oid).unwrap()]);
+    let digest_of = |bytes: &[u8]| octets(&DigestAlg::Sha256.digest(bytes));
+    let good_digest = || attr(MESSAGE_DIGEST_OID, vec![digest_of(content)]);
+    let check = |attrs: &[x509_cert::attr::Attribute]| {
+        check_binding(attrs, DigestAlg::Sha256, Some(data_oid), content)
+    };
+
+    assert_eq!(check(&[content_type(data_oid), good_digest()]), Ok(()));
+    assert_eq!(
+        check(&[content_type(data_oid)]),
+        Err(Failure::MessageDigestMissing)
+    );
+    assert_eq!(
+        check(&[
+            content_type(data_oid),
+            attr(MESSAGE_DIGEST_OID, vec![digest_of(b"other content")])
+        ]),
+        Err(Failure::MessageDigestMismatch)
+    );
+    assert_eq!(
+        check(&[content_type(data_oid), good_digest(), good_digest()]),
+        Err(Failure::MessageDigestMalformed)
+    );
+    assert_eq!(
+        check(&[
+            content_type(data_oid),
+            attr(
+                MESSAGE_DIGEST_OID,
+                vec![digest_of(content), digest_of(b"other content")]
+            )
+        ]),
+        Err(Failure::MessageDigestMalformed)
+    );
+    assert_eq!(
+        check(&[content_type(other_oid), good_digest()]),
+        Err(Failure::ContentTypeMismatch)
+    );
+    assert_eq!(check(&[good_digest()]), Err(Failure::ContentTypeMismatch));
+    // A countersignature names no content type and needs none.
+    assert_eq!(
+        check_binding(&[good_digest()], DigestAlg::Sha256, None, content),
+        Ok(())
+    );
+}
+
+// ---------------------------------------------------------------------
+// Timestamps.
+// ---------------------------------------------------------------------
+
+/// The Tencent blob's RFC 3161 token verifies over this signature, so its
+/// time is attested and the authority's chain is reported for pinning.
+#[test]
+fn rfc3161_token_verifies() {
+    let sig = parse(DIGICERT_TENCENT);
+    assert_eq!(sig["signing_time_source"], "rfc3161");
+    assert!(!sig["timestamp_chain_sha256"].as_array().unwrap().is_empty());
+}
+
+/// A token stamped over some other signature — here, its imprint no longer
+/// matches — keeps its time but loses the attestation.
+#[test]
+fn rfc3161_token_over_another_signature_is_unverified() {
+    use sha2::{Digest, Sha256};
+    let blob = trim_to_der_object(DIGICERT_TENCENT).unwrap();
+    let outer = signed_data(blob);
+    let imprint = Sha256::digest(outer.signer_infos.0.as_slice()[0].signature.as_bytes());
+    let sig = parse(&flip(DIGICERT_TENCENT, &imprint));
+    assert_eq!(sig["signing_time_source"], "unverified_rfc3161");
+    assert_eq!(sig["signing_time"], parse(DIGICERT_TENCENT)["signing_time"]);
+    assert!(sig.get("timestamp_chain_sha256").is_none());
+    // The signature itself is untouched.
+    assert_eq!(sig["verified"], true);
+}
+
+const COUNTERSIG_OUTER: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/chains/countersig-outer.der"
+));
+const COUNTERSIG_COUNTER: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/chains/countersig-counter.der"
+));
+
+/// `generate.sh` signs content, then signs that signature's value as
+/// detached content with a second key. Grafting the second SignerInfo (and
+/// its certificate) onto the first as a PKCS#9 counterSignature gives the
+/// legacy Authenticode timestamp shape. `tamper` alters the
+/// countersignature's signature value before grafting.
+fn countersigned(tamper: bool) -> cms::signed_data::SignedData {
+    use cms::signed_data::{CertificateSet, SignerInfos};
+    let mut outer = signed_data(COUNTERSIG_OUTER);
+    let counter_sd = signed_data(COUNTERSIG_COUNTER);
+    let mut counter = counter_sd.signer_infos.0.as_slice()[0].clone();
+    if tamper {
+        let mut bytes = counter.signature.as_bytes().to_vec();
+        bytes[0] ^= 0x01;
+        counter.signature = der::asn1::OctetString::new(bytes).unwrap();
+    }
+    let mut signers = outer.signer_infos.0.into_vec();
+    signers[0].unsigned_attrs = Some(
+        der::asn1::SetOfVec::try_from(vec![attr(
+            super::COUNTERSIGNATURE_OID,
+            vec![der::Any::encode_from(&counter).unwrap()],
+        )])
+        .unwrap(),
+    );
+    outer.signer_infos = SignerInfos(der::asn1::SetOfVec::try_from(signers).unwrap());
+    let mut certs = outer.certificates.take().unwrap().0.into_vec();
+    certs.extend(counter_sd.certificates.unwrap().0.into_vec());
+    outer.certificates = Some(CertificateSet(
+        der::asn1::SetOfVec::try_from(certs).unwrap(),
+    ));
+    outer
+}
+
+fn countersignature_sources(sd: &cms::signed_data::SignedData) -> Vec<(&'static str, bool)> {
+    let bag = super::cert_bag(sd);
+    super::countersignature_times(&sd.signer_infos.0.as_slice()[0], &bag)
+        .map(|t| (t.source, t.chain.is_empty()))
+        .collect()
+}
+
+#[test]
+fn countersignature_over_this_signature_is_attested() {
+    let sd = countersigned(false);
+    assert_eq!(countersignature_sources(&sd), [("countersignature", false)]);
+}
+
+#[test]
+fn countersignature_that_does_not_verify_is_labelled_unverified() {
+    let sd = countersigned(true);
+    assert_eq!(
+        countersignature_sources(&sd),
+        [("unverified_countersignature", true)]
+    );
+}
+
+// ---------------------------------------------------------------------
+// Chain constraints and anchors.
+// ---------------------------------------------------------------------
+
+const BAG_NOCA: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/chains/noca.p7b"
+));
+const BAG_KEYUSAGE: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/chains/keyusage.p7b"
+));
+const BAG_PATHLEN: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/chains/pathlen.p7b"
+));
+
+/// An issuer whose own certificate says `CA:FALSE` is a leaf: its key
+/// verifying the child proves nothing about the child.
+#[test]
+fn chain_stops_at_an_issuer_that_is_not_a_ca() {
+    let bag = bags::Bag::load(BAG_NOCA);
+    assert_eq!(bag.walk(bag.cert("NC Leaf", "NC Issuer")), ["NC Leaf"]);
+}
+
+#[test]
+fn chain_stops_at_an_issuer_without_key_cert_sign() {
+    let bag = bags::Bag::load(BAG_KEYUSAGE);
+    assert_eq!(bag.walk(bag.cert("KU Leaf", "KU Issuer")), ["KU Leaf"]);
+}
+
+/// CA0 allows no intermediates below it; CA1 is one, so CA0 cannot close
+/// the path even though its key signed CA1.
+#[test]
+fn chain_stops_where_a_path_length_is_exceeded() {
+    let bag = bags::Bag::load(BAG_PATHLEN);
+    assert_eq!(
+        bag.walk(bag.cert("PL Leaf", "PL CA1")),
+        ["PL Leaf", "PL CA1"]
+    );
+    // Walked from CA1, nothing sits between CA0 and the signer.
+    assert_eq!(
+        bag.walk(bag.cert("PL CA1", "PL CA0")),
+        ["PL CA1", "PL CA0", "PL Root"]
+    );
+}
+
+/// A chain closes at a pinned root, whether the bag carries the root or
+/// only certificates below it, and names that root's vendor.
+#[test]
+fn chain_anchors_at_a_pinned_root() {
+    let bag = bags::Bag::load(BAG_ECDSA);
+    let root = bag.cert("EC Root", "EC Root").clone();
+    let pinned = [super::PinnedRoot {
+        vendor: super::Vendor::Apple,
+        thumbprint: bags::Bag::thumbprint(&root),
+        cert: root,
+    }];
+    let leaf = bag.cert("EC Leaf", "EC CA");
+    let without_root: Vec<_> = bag
+        .certs()
+        .into_iter()
+        .filter(|c| c.tbs_certificate.subject != c.tbs_certificate.issuer)
+        .collect();
+    for certs in [bag.certs(), without_root] {
+        let chain = super::walk_chain(&certs, leaf, &pinned);
+        assert_eq!(chain.anchor, Some(super::Vendor::Apple));
+        assert_eq!(chain.thumbprints.len(), 3);
+        assert_eq!(chain.thumbprints[2], pinned[0].thumbprint);
+    }
+    // Unpinned, the same chain names no anchor.
+    assert_eq!(super::walk_chain(&bag.certs(), leaf, &[]).anchor, None);
+}
+
+/// The roots shipped in the binary parse, and are the certificates their
+/// vendors publish (SHA-256 thumbprints as Microsoft and Apple list them).
+#[test]
+fn pinned_roots_are_the_published_certificates() {
+    use super::Vendor::{Apple, Microsoft};
+    let thumbprints: Vec<_> = super::PINNED_ROOTS
+        .iter()
+        .map(|r| (r.vendor, r.thumbprint.as_str()))
+        .collect();
+    assert_eq!(
+        thumbprints,
+        [
+            (
+                Microsoft,
+                "885de64c340e3ea70658f01e1145f957fcda27aabeea1ab9faa9fdb0102d4077"
+            ),
+            (
+                Microsoft,
+                "df545bf919a2439c36983b54cdfc903dfa4f37d3996d8d84b4c31eec6f3c163e"
+            ),
+            (
+                Microsoft,
+                "847df6a78497943f27fc72eb93f9a637320a02b561d0a91b09e87a7807ed7c61"
+            ),
+            (
+                Apple,
+                "b0b1730ecbc7ff4505142c49f1295e6eda6bcaed7e2c68c5be91b5a11001f024"
+            ),
+            (
+                Apple,
+                "63343abfb89a6a03ebb57e9b3f5fa7be7c4f5c756f3017b3a8c488c3653e9179"
+            ),
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------
+// Nested signatures.
+// ---------------------------------------------------------------------
+
+/// `blob` with `extra` added to its signer's unsigned attributes, which the
+/// signature does not cover, so it still verifies.
+fn with_unsigned(blob: &[u8], extra: x509_cert::attr::Attribute) -> Vec<u8> {
+    use cms::signed_data::SignerInfos;
+    use der::{Decode, Encode};
+    let content_type = cms::content_info::ContentInfo::from_der(blob)
+        .unwrap()
+        .content_type;
+    let mut sd = signed_data(blob);
+    let mut signers = sd.signer_infos.0.into_vec();
+    let mut attrs = signers[0].unsigned_attrs.take().unwrap().into_vec();
+    attrs.push(extra);
+    signers[0].unsigned_attrs = Some(der::asn1::SetOfVec::try_from(attrs).unwrap());
+    sd.signer_infos = SignerInfos(der::asn1::SetOfVec::try_from(signers).unwrap());
+    cms::content_info::ContentInfo {
+        content_type,
+        content: der::Any::encode_from(&sd).unwrap(),
+    }
+    .to_der()
+    .unwrap()
+}
+
+/// The Tencent blob nested `levels` deep inside itself, with `width`
+/// values in the nested-signature attribute at each level. A SET OF
+/// rejects duplicates, so each copy carries a distinct unsigned marker.
+fn nested(levels: usize, width: usize) -> Vec<u8> {
+    use der::Decode;
+    let base = trim_to_der_object(DIGICERT_TENCENT).unwrap().to_vec();
+    let marker = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1");
+    let mut blob = base.clone();
+    for _ in 0..levels {
+        let copies = (0..width)
+            .map(|i| {
+                let tag = der::Any::encode_from(&(i as u32)).unwrap();
+                der::Any::from_der(&with_unsigned(&blob, attr(marker, vec![tag]))).unwrap()
+            })
+            .collect();
+        blob = with_unsigned(&base, attr(super::MS_NESTED_SIGNATURE_OID, copies));
+    }
+    blob
+}
+
+fn nesting_depth(sig: &serde_json::Value) -> usize {
+    sig.get("nested")
+        .and_then(|n| n.as_array())
+        .and_then(|n| n.first())
+        .map_or(0, |n| 1 + nesting_depth(n))
+}
+
+/// Every value of the nested-signature attribute is read, not just the
+/// first: a triple-signed binary carries two.
+#[test]
+fn every_nested_signature_value_is_read() {
+    let sig = parse(&nested(1, 2));
+    let nested = sig["nested"].as_array().unwrap();
+    assert_eq!(nested.len(), 2);
+    assert!(nested.iter().all(|n| n["verified"] == true));
+}
+
+/// Nesting is followed to a fixed depth, so a blob of signatures inside
+/// signatures cannot recurse without bound.
+#[test]
+fn nested_signatures_stop_at_the_depth_cap() {
+    let sig = parse(&nested(6, 1));
+    assert_eq!(nesting_depth(&sig), usize::from(super::MAX_NESTING) - 1);
+}
+
+/// The signature budget is shared across levels and siblings.
+#[test]
+fn nested_signatures_share_one_budget() {
+    fn count(sig: &serde_json::Value) -> usize {
+        1 + sig
+            .get("nested")
+            .and_then(|n| n.as_array())
+            .map_or(0, |n| n.iter().map(count).sum())
+    }
+    let sig = parse(&nested(2, 6));
+    assert_eq!(count(&sig), usize::from(super::MAX_SIGNATURES));
+}
+
+// ---------------------------------------------------------------------
+// BER (Mach-O) signatures.
+// ---------------------------------------------------------------------
+
+const BER_DETACHED: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/chains/ber-detached.der"
+));
+const BER_CONTENT: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/chains/ber-content.bin"
+));
+
+/// A detached BER signature decodes after normalization and verifies
+/// against the content it covers — and only that content.
+#[test]
+fn detached_ber_signature_verifies_against_its_content() {
+    use der::Decode;
+    assert!(cms::content_info::ContentInfo::from_der(BER_DETACHED).is_err());
+    let sig = super::parse_detached_cms_blob(BER_DETACHED, BER_CONTENT).unwrap();
+    assert_eq!(sig["verified"], true);
+
+    let mut other = BER_CONTENT.to_vec();
+    *other.last_mut().unwrap() ^= 0x01;
+    let sig = super::parse_detached_cms_blob(BER_DETACHED, &other).unwrap();
+    assert_eq!(sig["verified"], false);
+    assert_eq!(sig["verification_failure"], "message_digest_mismatch");
+
+    // With nothing to bind it to, a detached signature proves nothing.
+    let sig = super::parse_cms_blob(BER_DETACHED).unwrap();
+    assert_eq!(sig["verified"], serde_json::Value::Null);
 }

@@ -37,6 +37,7 @@ mod langs;
 pub(crate) mod parse;
 mod string_metrics;
 mod text_metrics;
+mod visit;
 
 use crate::metric;
 use crate::value_key;
@@ -48,7 +49,7 @@ use tree_sitter::{Node, Query, QueryCursor, StreamingIterator};
 
 use crate::error::Error;
 use crate::fileid::FileType;
-use crate::output::{ExtractedString, MetricKey, Metrics, Strings, Values};
+use crate::output::{MetricKey, Metrics, Strings, Values};
 
 use langs::{Lang, QueryKind};
 use serde_json::Value as JsonValue;
@@ -59,9 +60,41 @@ pub(crate) use parse::{TreeCache, TreeParse, TreeSitterDiagnostic};
 /// recurse once per syntax level they descend.
 const MAX_FLOW_DEPTH: usize = 96;
 
-fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).collect()
+/// The named children of `node`, in order, read through one cursor rather
+/// than collected.
+fn named_children(node: Node<'_>) -> NamedChildren<'_> {
+    NamedChildren {
+        cursor: node.walk(),
+        started: false,
+    }
+}
+
+struct NamedChildren<'t> {
+    cursor: tree_sitter::TreeCursor<'t>,
+    started: bool,
+}
+
+impl<'t> Iterator for NamedChildren<'t> {
+    type Item = Node<'t>;
+
+    fn next(&mut self) -> Option<Node<'t>> {
+        loop {
+            let moved = if self.started {
+                self.cursor.goto_next_sibling()
+            } else {
+                self.started = true;
+                self.cursor.goto_first_child()
+            };
+            if !moved {
+                // Parked on the last child, the next call fails again.
+                return None;
+            }
+            let node = self.cursor.node();
+            if node.is_named() {
+                return Some(node);
+            }
+        }
+    }
 }
 
 // Tree-sitter's query match limit bounds simultaneous in-progress matches,
@@ -112,38 +145,6 @@ const SOURCE_QUERY_MAX_START_DEPTH: u32 = 2_500;
 /// nested Perl parentheses ran for minutes per query). Whether those stop
 /// can depend on load.
 const SOURCE_QUERY_WALL_BACKSTOP: Duration = Duration::from_secs(60);
-
-// S4INSTR
-pub(crate) fn s4i(args: std::fmt::Arguments<'_>) {
-    if std::env::var_os("FF_INSTR").is_some() {
-        eprintln!("S4I {args}");
-    }
-}
-// S4INSTR
-pub(crate) fn s4t<T>(label: &str, f: impl FnOnce() -> T) -> T {
-    let start = Instant::now();
-    let out = f();
-    s4i(format_args!(
-        "walk {label} secs={:.4}",
-        start.elapsed().as_secs_f64()
-    ));
-    out
-}
-// S4INSTR
-impl Drop for QueryBudget {
-    fn drop(&mut self) {
-        let start = self
-            .deadline
-            .checked_sub(SOURCE_QUERY_WALL_BACKSTOP)
-            .unwrap();
-        s4i(format_args!(
-            "query polls={} secs={:.3} exhausted={}",
-            self.polls.get(),
-            start.elapsed().as_secs_f64(),
-            self.exhausted.get()
-        ));
-    }
-}
 
 fn source_query_cursor() -> QueryCursor {
     let mut cursor = QueryCursor::new();
@@ -230,7 +231,22 @@ pub(super) fn extract(
     // collects comment bodies into the comment-scoped string tier.
     comment_metrics::emit(source, config.comment_style, metrics, &mut strings.comments);
 
-    s4t("strings", || extract_strings(root, source, config, strings)); // S4INSTR
+    // One walk for every collector that only reads each node once.
+    let mut walked = visit::Collectors {
+        literals: Some(visit::Literals::default()),
+        identifiers: Some(visit::Identifiers::default()),
+        functions: Some(function_metrics::Collector::default()),
+        ast: Some(ast_walk::State::default()),
+        payload: payload_flow::Collector::new(source, config.lang),
+    };
+    visit::walk(root, source, config, &mut walked);
+    for literal in walked.literals.take().unwrap_or_default().found {
+        strings.literals.push(literal);
+    }
+    // `build_symbols` emits the symbol walk's facts after extraction.
+    if let Some(ast) = walked.ast.take() {
+        cache.stash_ast_walk(ast);
+    }
     let (mut imports, import_libraries) = config
         .query(QueryKind::Imports)
         .map(|query| collect_imports(query, source, root))
@@ -250,10 +266,8 @@ pub(super) fn extract(
     emit_query_limit_metrics(metrics, "functions", &functions);
     emit_query_limit_metrics(metrics, "classes", &classes);
 
-    // Identifier metrics — walk the tree once, emit `identifiers.*`.
-    let identifiers = s4t("identifiers", || {
-        identifier_metrics::collect_identifiers(root, source, config)
-    }); // S4INSTR
+    // Identifier metrics — emit `identifiers.*`.
+    let identifiers = walked.identifiers.take().unwrap_or_default().found;
     identifier_metrics::emit(&identifiers, metrics);
 
     // String-literal metrics — operate on the literals we already
@@ -266,11 +280,13 @@ pub(super) fn extract(
     let import_refs: Vec<&str> = imports.items.iter().map(|(n, _)| n.as_str()).collect();
     import_metrics::emit(&import_refs, config.lang, metrics);
 
-    // Function metrics — single AST walk over function-definition nodes.
-    let total_lines = source.lines().count() as u32;
-    let functions_total = s4t("functions", || {
-        function_metrics::emit(root, source, config, total_lines, metrics)
-    }); // S4INSTR
+    // Function metrics over the function-definition nodes the walk found.
+    let total_lines = crate::bytes::sat_u32(source.lines().count());
+    let functions_total = function_metrics::emit(
+        walked.functions.take().unwrap_or_default(),
+        total_lines,
+        metrics,
+    );
 
     // Cross-component text ratios computed from the sub-metrics we just
     // emitted. Pure division — no extra parsing.
@@ -329,9 +345,13 @@ pub(super) fn extract(
         value_key!("source.language"),
         JsonValue::String(config.name().to_string()),
     );
-    s4t("payload", || {
-        payload_flow::emit(root, source, config.lang, values)
-    }); // S4INSTR
+    payload_flow::emit(
+        root,
+        source,
+        config.lang,
+        values,
+        walked.payload.map(payload_flow::Collector::into_collected),
+    );
 
     Ok(())
 }
@@ -347,24 +367,23 @@ pub(crate) fn build_symbols(
     let config = cache.config();
     let source = cache.source();
     let root = cache.tree().root_node();
-    s4t("ast_walk", || {
-        ast_walk::walk(root, source, config, symbols_out, metrics)
-    }); // S4INSTR
+    // Extraction normally collected the walk already.
+    match cache.take_ast_walk() {
+        Some(state) => ast_walk::finish(state, config, symbols_out, metrics),
+        None => ast_walk::walk(root, source, config, symbols_out, metrics),
+    }
     if config.lang == Lang::Rust {
         rust_syntax::resolve_calls(symbols_out);
     }
 }
 
 pub(crate) fn build_value_flow(cache: &TreeCache<'_>, symbols: &crate::Symbols) -> crate::Flow {
-    s4t("value_flow", || {
-        value_flow::build(
-            // S4INSTR
-            cache.tree().root_node(),
-            cache.source(),
-            cache.config(),
-            symbols,
-        )
-    })
+    value_flow::build(
+        cache.tree().root_node(),
+        cache.source(),
+        cache.config(),
+        symbols,
+    )
 }
 
 /// The package clause of a parsed Go file, `""` when it has none, read from
@@ -372,70 +391,6 @@ pub(crate) fn build_value_flow(cache: &TreeCache<'_>, symbols: &crate::Symbols) 
 pub(crate) fn go_package_name<'a>(ast: &crate::SourceAst<'a>) -> Option<&'a str> {
     (ast.file_type == FileType::Go)
         .then(|| go_syntax::package_name(ast.tree.root_node(), ast.source))
-}
-
-fn extract_strings(
-    root: Node<'_>,
-    source: &str,
-    config: &langs::LangConfig,
-    strings: &mut Strings,
-) {
-    let mut cursor = root.walk();
-    // Each node travels with its parent's kind: `Node::parent` walks down
-    // from the root, which would make this loop quadratic in tree depth.
-    let mut stack: Vec<(Node<'_>, &str)> = vec![(root, "")];
-    while let Some((node, parent_kind)) = stack.pop() {
-        if config.string_kinds.contains(&node.kind()) {
-            // Unquoted forms (heredoc bodies, Perl `q{…}`, Lua `[[…]]`) have
-            // no quotes to strip, so this tier keeps their source text.
-            if let Some(text) = decode_string_literal(node, source, config)
-                .or_else(|| unquoted_literal(node, source).map(str::to_string))
-            {
-                strings.literals.push(ExtractedString {
-                    text,
-                    offset: node.start_byte(),
-                    ..ExtractedString::default()
-                });
-            }
-            continue;
-        }
-        // PowerShell command arguments are often unquoted barewords. The
-        // grammar exposes `cdn.example/path` as a generic token rather than a
-        // string literal, even though the command receives it as a string.
-        // Promote only host/path-shaped tokens that are direct command
-        // elements; ordinary identifiers and dotted member names stay out of
-        // the precise literal tier.
-        if is_protocolless_url_argument(node, parent_kind, source, config) {
-            if let Ok(text) = node.utf8_text(source.as_bytes()) {
-                strings.literals.push(ExtractedString {
-                    text: text.to_string(),
-                    offset: node.start_byte(),
-                    ..ExtractedString::default()
-                });
-            }
-        }
-        for child in node.children(&mut cursor) {
-            stack.push((child, node.kind()));
-        }
-    }
-}
-
-fn is_protocolless_url_argument(
-    node: Node<'_>,
-    parent_kind: &str,
-    source: &str,
-    config: &langs::LangConfig,
-) -> bool {
-    if config.lang != Lang::PowerShell
-        || node.kind() != "generic_token"
-        || parent_kind != "command_elements"
-    {
-        return false;
-    }
-    let Ok(value) = node.utf8_text(source.as_bytes()) else {
-        return false;
-    };
-    looks_like_protocolless_url(value)
 }
 
 pub(super) fn looks_like_protocolless_url(value: &str) -> bool {

@@ -149,6 +149,8 @@ pub(super) fn extract_binary_strings_from_object(
 ///
 /// Binaries are never gated this way — their decode logic is machine code, not
 /// greppable text — so this is only consulted for [`crate::FileType::is_source_code`].
+/// stng scans only input it judges binary, so the gate matters for a script
+/// with binary content appended, not for plain source.
 pub(super) fn has_xor_intent(bytes: &[u8]) -> bool {
     if memchr::memchr(b'^', bytes).is_some() {
         return true;
@@ -205,6 +207,26 @@ pub(crate) fn basename(path: &str) -> &str {
         Some(idx) => &path[idx + 1..],
         None => path,
     }
+}
+
+/// Whether `name` ends with `suffix`, ignoring ASCII case. Member names from
+/// a hostile archive arrive in any case, and the readers that matter match
+/// them case-insensitively: Windows (`.PYD`), OPC part names (`.XML`,
+/// `.RELS`), and the JDK's `META-INF/*.SF` lookup.
+#[must_use]
+pub(crate) fn ends_with_ci(name: &str, suffix: &str) -> bool {
+    name.len()
+        .checked_sub(suffix.len())
+        .and_then(|start| name.as_bytes().get(start..))
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix.as_bytes()))
+}
+
+/// Whether `name` starts with `prefix`, ignoring ASCII case.
+#[must_use]
+pub(crate) fn starts_with_ci(name: &str, prefix: &str) -> bool {
+    name.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
 /// Return `name` with its trailing `.<ext>` removed, where `<ext>`
@@ -372,15 +394,32 @@ fn weighted_code_entropy(sections: &[Section]) -> Option<f64> {
     (bytes > 0).then_some(weighted / bytes as f64)
 }
 
+/// What a rizin recovery would look at: the bytes, the static facts that
+/// decide whether it is worth running, and this open's settings.
+#[derive(Clone, Copy)]
+pub(super) struct RizinTarget<'a> {
+    pub(super) format: NativeFormat,
+    pub(super) bytes: &'a [u8],
+    pub(super) strings: &'a Strings,
+    /// Go function metadata (a pclntab) is present, so a native parse that
+    /// found no typed functions still has an inventory worth recovering.
+    pub(super) go_function_metadata: bool,
+    pub(super) settings: &'a crate::rizin::Settings,
+}
+
 pub(super) fn rizin_decision(
-    format: NativeFormat,
-    bytes: &[u8],
-    strings: &Strings,
+    target: &RizinTarget<'_>,
     sections: &[Section],
     symbols: &crate::Symbols,
     metrics: &crate::output::Metrics,
-    go_function_metadata: bool,
 ) -> RizinDecision {
+    let RizinTarget {
+        format,
+        bytes,
+        strings,
+        go_function_metadata,
+        ..
+    } = *target;
     let string_bytes = strings.text.iter().fold(0_usize, |total, string| {
         total.saturating_add(string.value.len())
     });
@@ -404,28 +443,23 @@ pub(super) fn rizin_decision(
 }
 
 /// Run full Rizin recovery only when the static facts say it is likely to add
-/// useful function metrics and this open's `settings` admit `bytes`. Shared by
-/// ELF and Mach-O; PE uses the extended helper below so malformed images can
-/// recover sections too.
+/// useful function metrics and the target's settings admit its bytes. Shared
+/// by ELF and Mach-O; PE uses the extended helper below so malformed images
+/// can recover sections too.
 pub(super) fn rizin_fallback(
-    format: NativeFormat,
-    bytes: &[u8],
-    strings: &Strings,
+    target: RizinTarget<'_>,
     sections: &[Section],
     symbols: &mut crate::Symbols,
     metrics: &mut crate::output::Metrics,
-    go_function_metadata: bool,
-    settings: &crate::rizin::Settings,
 ) {
-    let decision = rizin_decision(
+    let decision = rizin_decision(&target, sections, symbols, metrics);
+    let RizinTarget {
         format,
         bytes,
-        strings,
-        sections,
-        symbols,
-        metrics,
         go_function_metadata,
-    );
+        settings,
+        ..
+    } = target;
     tracing::debug!(
         ?format,
         bytes = bytes.len(),
@@ -473,15 +507,18 @@ fn note_incomplete_recovery(metrics: &mut crate::output::Metrics) {
 /// path stays tool-agnostic — if the disassembler ever swaps from
 /// rizin to radare2 / Ghidra the schema doesn't ripple.
 pub(super) fn rizin_fallback_with_sections(
-    bytes: &[u8],
-    strings: &Strings,
+    target: RizinTarget<'_>,
+    declares_exports: bool,
     symbols: &mut crate::Symbols,
     sections: &mut Vec<crate::output::Section>,
     metrics: &mut crate::output::Metrics,
-    go_function_metadata: bool,
-    declares_exports: bool,
-    settings: &crate::rizin::Settings,
 ) {
+    let RizinTarget {
+        bytes,
+        go_function_metadata,
+        settings,
+        ..
+    } = target;
     // Normally goblin's native symbols or sections are enough to avoid an
     // expensive disassembly. Go is the exception: its native parser can
     // expose sections and imports while still having no typed functions;
@@ -494,17 +531,9 @@ pub(super) fn rizin_fallback_with_sections(
     if has_native_inventory && !needs_go_function_recovery {
         return;
     }
-    let decision = rizin_decision(
-        NativeFormat::Pe,
-        bytes,
-        strings,
-        sections,
-        symbols,
-        metrics,
-        go_function_metadata,
-    );
+    let decision = rizin_decision(&target, sections, symbols, metrics);
     tracing::debug!(
-        format = ?NativeFormat::Pe,
+        format = ?target.format,
         bytes = bytes.len(),
         run = decision.runs(),
         reason = decision.reason(),
@@ -616,6 +645,32 @@ pub(super) fn format_guid(b: &[u8; 16]) -> String {
         hex_encode(&b[8..10]),
         hex_encode(&b[10..16])
     )
+}
+
+/// Sort `(file_offset, size, tag)` ranges and clip each against the ones
+/// before it, so no file byte is visited twice however the headers overlap
+/// their sections. A range running past `file_len` keeps its in-file head (a
+/// truncated binary still holds the start of its code); empty, overflowing,
+/// and fully covered ranges are dropped. The tag rides along with the part of
+/// its range that survives.
+pub(super) fn disjoint_file_ranges<T>(
+    mut ranges: Vec<(usize, usize, T)>,
+    file_len: usize,
+) -> Vec<(std::ops::Range<usize>, T)> {
+    ranges.sort_unstable_by_key(|&(start, size, _)| (start, size));
+    let mut covered = 0;
+    ranges
+        .into_iter()
+        .filter_map(|(start, size, tag)| {
+            let end = start.checked_add(size)?.min(file_len);
+            if end <= start || end <= covered {
+                return None;
+            }
+            let start = start.max(covered);
+            covered = end;
+            Some((start..end, tag))
+        })
+        .collect()
 }
 
 /// Read an unsigned LEB128 (Go's "uvarint") at `*offset`, advancing past it.

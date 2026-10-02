@@ -62,6 +62,9 @@ pub(super) enum Lang {
 }
 
 impl Lang {
+    /// Number of variants, for tables indexed by `lang as usize`.
+    pub(super) const COUNT: usize = 24;
+
     /// Stable label exposed under `values.source.language` and as the flow
     /// view's `language`. Rule authors match on these strings, so they must
     /// never change.
@@ -131,6 +134,9 @@ impl Lang {
         matches!(self, Self::JavaScript | Self::TypeScript)
     }
 }
+
+// `Lang::COUNT` sizes tables indexed by `lang as usize`; `Batch` is last.
+const _: () = assert!(Lang::Batch as usize + 1 == Lang::COUNT);
 
 /// Configuration for one source language.
 pub(super) struct LangConfig {
@@ -326,7 +332,7 @@ impl LangConfig {
 }
 
 /// Every language configuration, one per [`Lang`].
-static ALL: [&LangConfig; 24] = [
+static ALL: [&LangConfig; Lang::COUNT] = [
     &JAVASCRIPT,
     &TYPESCRIPT,
     &PYTHON,
@@ -529,7 +535,7 @@ static GO: LangConfig = LangConfig {
 static RUST: LangConfig = LangConfig {
     lang: Lang::Rust,
     language: || tree_sitter_rust::LANGUAGE.into(),
-    comment_style: CommentStyle::CStyle,
+    comment_style: CommentStyle::Rust,
     string_kinds: &["string_literal", "raw_string_literal"],
     import_query: r#"
         (use_declaration argument: (scoped_identifier path: (identifier) @import))

@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use crate::error::Error;
 use crate::formats::common::bytes_at::u32_le;
 use crate::formats::common::hex_encode;
-use crate::output::{ArchiveMember, Errors, Metrics, Stage, Values};
+use crate::output::{ArchiveMember, Errors, Metrics, Stage, ValueKey, Values};
 use crate::value_key;
 
 pub(super) fn extract(
@@ -40,8 +40,11 @@ pub(super) fn extract(
     // Header decode is best-effort identity enrichment; a malformed
     // header must not stop the ZIP walk.
     header(bytes, values);
-    let mut archive = super::zip::open_archive(bytes)?;
-    super::zip::extract_from_archive(&mut archive, bytes, values, metrics, archive_members)?;
+    let Some(mut archive) =
+        super::zip::open_and_walk(bytes, values, metrics, archive_members, errors)?
+    else {
+        return Ok(());
+    };
     // The extension's `manifest.json` carries the developer-declared
     // author and homepage — the human identity behind the signing key.
     if let Some(manifest) = read_manifest(&mut archive, values, errors) {
@@ -51,38 +54,41 @@ pub(super) fn extract(
 }
 
 /// Read and parse the root `manifest.json` of an opened CRX archive.
-/// `None` when it is absent (silently), over the size cap (a `crx.limits`
-/// entry), or unreadable or not JSON (an error).
 fn read_manifest<R: Read + std::io::Seek>(
     zip: &mut ::zip::ZipArchive<R>,
     values: &mut Values,
     errors: &mut Errors,
 ) -> Option<JsonValue> {
+    read_browser_manifest(zip, values, errors, value_key!("crx.limits"))
+}
+
+/// Read and parse the root `manifest.json` of an opened browser-extension
+/// archive (CRX or XPI). `None` when it is absent (silently), over the size
+/// cap (a `limits` entry), or unreadable or not JSON (an error).
+pub(super) fn read_browser_manifest<R: Read + std::io::Seek>(
+    zip: &mut ::zip::ZipArchive<R>,
+    values: &mut Values,
+    errors: &mut Errors,
+    limits: ValueKey,
+) -> Option<JsonValue> {
     const NAME: &str = "manifest.json";
     const MAX: u64 = 512 * 1024;
-    let member = match zip.by_name(NAME) {
-        Ok(member) => member,
-        Err(::zip::result::ZipError::FileNotFound) => return None,
+    let buf = match super::zip::read_member(zip, NAME, MAX) {
+        Ok(buf) => buf?,
+        Err(super::zip::MemberError::TooLarge { max }) => {
+            super::bounded::push_limit(
+                values,
+                limits,
+                "manifest",
+                format!("{NAME} over the {max}-byte cap; not parsed"),
+            );
+            return None;
+        }
         Err(e) => {
             errors.record_malformed(Stage::ZipParse, format!("{NAME}: {e}"));
             return None;
         }
     };
-    let mut buf = Vec::new();
-    if let Err(e) = member.take(MAX + 1).read_to_end(&mut buf) {
-        errors.record_malformed(Stage::ZipParse, format!("{NAME}: {e}"));
-        return None;
-    }
-    if buf.len() as u64 > MAX {
-        values.insert_key(
-            value_key!("crx.limits"),
-            serde_json::json!([{
-                "stage": "manifest",
-                "reason": format!("{NAME} over the {MAX}-byte cap; not parsed"),
-            }]),
-        );
-        return None;
-    }
     serde_json::from_slice(&browser_manifest_json(&buf))
         .map_err(|e| errors.record_malformed(Stage::FormatExtract, format!("{NAME}: {e}")))
         .ok()
@@ -451,7 +457,7 @@ mod tests {
         let e = &errors.as_slice()[0];
         assert_eq!(
             (e.stage, e.kind),
-            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+            (Stage::FormatExtract, crate::DiagnosticKind::Malformed)
         );
         assert!(e.message.starts_with("manifest.json:"), "{}", e.message);
         assert!(values.get("crx.limits").is_none());

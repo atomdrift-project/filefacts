@@ -195,23 +195,9 @@ mod tests {
     #[test]
     fn debug_directory_decodes_test_exe_to_known_values() {
         let bytes = std::fs::read("tests/fixtures/test.exe").expect("test.exe fixture is required");
-        let mut v = crate::output::Values::new();
-        let mut s = crate::output::Strings::default();
-        let mut m = crate::output::Metrics::new();
-        let mut sections = Vec::new();
-        let mut symbols = crate::Symbols::new();
-        let mut errors = crate::output::Errors::new();
-        crate::formats::pe::extract(
-            &bytes,
-            &mut v,
-            &mut s,
-            &mut m,
-            &mut sections,
-            &mut symbols,
-            &mut errors,
-            &crate::rizin::Settings::default(),
-        )
-        .unwrap();
+        let mut out = crate::formats::Sinks::default();
+        crate::formats::pe::extract(&bytes, out.ctx()).unwrap();
+        let v = out.values;
 
         // PDB metadata — the high-signal CodeView fields.
         assert_eq!(

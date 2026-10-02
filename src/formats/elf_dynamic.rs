@@ -17,13 +17,21 @@
 //! All three are 64-bit-LE only — that's the xz-class target. 32-bit
 //! and big-endian ELFs still get the count metrics from `elf.rs`.
 
+use std::collections::HashMap;
+
 use goblin::elf::Elf;
 use serde_json::Value as JsonValue;
 
 use crate::Stage;
 use crate::formats::goblin_safe;
-use crate::output::{Errors, Values};
+use crate::metric;
+use crate::output::{Errors, Metrics, Values};
 use crate::value_key;
+
+/// Slots emitted per `.init_array` / `.fini_array`. A real binary has a
+/// handful of constructors; the section size is file-controlled, and every
+/// slot becomes a JSON object.
+const MAX_INIT_ARRAY_SLOTS: usize = 4096;
 
 /// Emit `elf.verdef[]` records. Replaces the older flat
 /// `elf.provided_versions[]` projection.
@@ -72,8 +80,9 @@ pub(super) fn verdef(elf: &Elf<'_>, values: &mut Values, errors_out: &mut Errors
 ///
 /// Only emitted for 64-bit LE ELF — the slot resolution table is
 /// arch-specific (x86-64 / aarch64 reloc IDs) and 32-bit ELFs are
-/// rare enough to punt.
-pub(super) fn init_arrays(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
+/// rare enough to punt. At most [`MAX_INIT_ARRAY_SLOTS`] slots per array
+/// are emitted; `elf.init_array_slots_capped` says when more were declared.
+pub(super) fn init_arrays(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     if !elf.is_64 || !elf.little_endian {
         return;
     }
@@ -87,34 +96,41 @@ pub(super) fn init_arrays(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
         let Some((sh_addr, slot_bytes)) = section_addr_and_bytes(elf, bytes, section) else {
             continue;
         };
-        let slots = slot_bytes.len() / 8;
-        if slots == 0 {
-            continue;
+        if slot_bytes.len() / 8 > MAX_INIT_ARRAY_SLOTS {
+            metrics.insert(metric!("elf.init_array_slots_capped"), 1.0);
         }
-        let mut out = Vec::with_capacity(slots);
-        for i in 0..slots {
-            let off = i * 8;
-            let Some(slot) = slot_bytes.get(off..off + 8) else {
-                break;
-            };
-            let direct = u64::from_le_bytes(slot.try_into().unwrap_or([0; 8]));
-            let slot_va = sh_addr.wrapping_add(off as u64);
-            let (addr, reloc) = resolve_init_slot(direct, slot_va, &relocs, &dynsym_index);
-            let symbol = dynsym_index.lookup(addr);
-            let mut node = serde_json::Map::new();
-            node.insert("addr".into(), JsonValue::String(format!("0x{addr:x}")));
-            if let Some(s) = symbol {
-                node.insert("symbol".into(), JsonValue::String(s));
-            }
-            if let Some(r) = reloc {
-                node.insert("reloc".into(), JsonValue::String(r.to_string()));
-            }
-            out.push(JsonValue::Object(node));
-        }
+        let out = init_array_entries(sh_addr, slot_bytes, &relocs, &dynsym_index);
         if !out.is_empty() {
             values.insert_key(key, JsonValue::Array(out));
         }
     }
+}
+
+/// One JSON entry per 8-byte slot of an init/fini array mapped at
+/// `sh_addr`, up to [`MAX_INIT_ARRAY_SLOTS`].
+fn init_array_entries(
+    sh_addr: u64,
+    slot_bytes: &[u8],
+    relocs: &HashMap<u64, InitReloc>,
+    dynsym_index: &DynsymAddressIndex<'_>,
+) -> Vec<JsonValue> {
+    let slots = slot_bytes.as_chunks::<8>().0;
+    let mut out = Vec::with_capacity(slots.len().min(MAX_INIT_ARRAY_SLOTS));
+    for (i, slot) in slots.iter().take(MAX_INIT_ARRAY_SLOTS).enumerate() {
+        let direct = u64::from_le_bytes(*slot);
+        let slot_va = sh_addr.wrapping_add((i * 8) as u64);
+        let (addr, reloc) = resolve_init_slot(direct, slot_va, relocs, dynsym_index);
+        let mut node = serde_json::Map::new();
+        node.insert("addr".into(), JsonValue::String(format!("0x{addr:x}")));
+        if let Some(s) = dynsym_index.lookup(addr) {
+            node.insert("symbol".into(), JsonValue::String(s.to_string()));
+        }
+        if let Some(r) = reloc {
+            node.insert("reloc".into(), JsonValue::String(r.to_string()));
+        }
+        out.push(JsonValue::Object(node));
+    }
+    out
 }
 
 /// Emit `elf.dynsym_functions[]` — focused subset of FUNC / IFUNC dynsym
@@ -227,14 +243,16 @@ impl RelocKind {
 
 #[derive(Debug, Clone, Copy)]
 struct InitReloc {
-    offset: u64,
     addend: u64,
     sym_idx: u32,
     kind: RelocKind,
 }
 
-fn collect_init_relocations(elf: &Elf<'_>) -> Vec<InitReloc> {
-    let mut out = Vec::new();
+/// The relocations that can fill an init/fini slot, keyed by the address
+/// they patch. When several patch one address the first wins, as a linear
+/// scan would have it.
+fn collect_init_relocations(elf: &Elf<'_>) -> HashMap<u64, InitReloc> {
+    let mut out = HashMap::new();
     for r in elf.dynrelas.iter().chain(elf.pltrelocs.iter()) {
         // x86-64 and aarch64 IDs collapsed into the same arms.
         let kind = match r.r_type {
@@ -244,10 +262,9 @@ fn collect_init_relocations(elf: &Elf<'_>) -> Vec<InitReloc> {
             6 | 1025 => RelocKind::GlobDat,
             _ => continue,
         };
-        out.push(InitReloc {
-            offset: r.r_offset,
-            addend: r.r_addend.unwrap_or(0) as u64,
-            sym_idx: r.r_sym as u32,
+        out.entry(r.r_offset).or_insert(InitReloc {
+            addend: r.r_addend.unwrap_or(0).cast_unsigned(),
+            sym_idx: crate::bytes::sat_u32(r.r_sym),
             kind,
         });
     }
@@ -257,13 +274,13 @@ fn collect_init_relocations(elf: &Elf<'_>) -> Vec<InitReloc> {
 fn resolve_init_slot(
     direct: u64,
     slot_va: u64,
-    relocs: &[InitReloc],
-    dynsym: &DynsymAddressIndex,
+    relocs: &HashMap<u64, InitReloc>,
+    dynsym: &DynsymAddressIndex<'_>,
 ) -> (u64, Option<&'static str>) {
     if direct != 0 {
         return (direct, None);
     }
-    let Some(r) = relocs.iter().find(|r| r.offset == slot_va) else {
+    let Some(r) = relocs.get(&slot_va) else {
         return (0, None);
     };
     match r.kind {
@@ -276,18 +293,19 @@ fn resolve_init_slot(
 }
 
 /// Address-keyed view over `.dynsym` for resolving function pointers
-/// to symbol names. Two parallel vectors so we can answer both
-/// `address → name` (direct/relative slots) and `index → address`
-/// (abs64/glob_dat slots referencing a symbol by index).
-struct DynsymAddressIndex {
-    by_addr: Vec<(u64, String)>,
-    by_index: Vec<(u32, u64)>,
+/// to symbol names. Two maps so we can answer both `address → name`
+/// (direct/relative slots) and `index → address` (abs64/glob_dat slots
+/// referencing a symbol by index), each in constant time per slot.
+struct DynsymAddressIndex<'a> {
+    /// First symbol at each address, as a linear scan would find it.
+    by_addr: HashMap<u64, &'a str>,
+    by_index: HashMap<u32, u64>,
 }
 
-impl DynsymAddressIndex {
-    fn build(elf: &Elf<'_>) -> Self {
-        let mut by_addr = Vec::new();
-        let mut by_index = Vec::new();
+impl<'a> DynsymAddressIndex<'a> {
+    fn build(elf: &Elf<'a>) -> Self {
+        let mut by_addr = HashMap::new();
+        let mut by_index = HashMap::new();
         for (i, sym) in elf.dynsyms.iter().enumerate() {
             if i == 0 {
                 continue;
@@ -302,29 +320,63 @@ impl DynsymAddressIndex {
             if name.is_empty() {
                 continue;
             }
-            by_addr.push((sym.st_value, name.to_string()));
-            by_index.push((i as u32, sym.st_value));
+            by_addr.entry(sym.st_value).or_insert(name);
+            let Ok(index) = u32::try_from(i) else { break };
+            by_index.insert(index, sym.st_value);
         }
         Self { by_addr, by_index }
     }
 
-    fn lookup(&self, addr: u64) -> Option<String> {
+    fn lookup(&self, addr: u64) -> Option<&'a str> {
         if addr == 0 {
             return None;
         }
-        self.by_addr
-            .iter()
-            .find(|(a, _)| *a == addr)
-            .map(|(_, n)| n.clone())
+        self.by_addr.get(&addr).copied()
     }
 
     fn address_of_index(&self, idx: u32) -> Option<u64> {
         if idx == 0 {
             return None;
         }
-        self.by_index
-            .iter()
-            .find(|(i, _)| *i == idx)
-            .map(|(_, a)| *a)
+        self.by_index.get(&idx).copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Slots resolve through keyed lookups — a direct pointer, a relative
+    /// relocation, and a GLOB_DAT through the symbol index — and the output
+    /// stops at the cap however many slots the section declares.
+    #[test]
+    fn init_array_slots_resolve_by_key_and_stop_at_the_cap() {
+        let mut relocs = HashMap::new();
+        let reloc = |kind, addend, sym_idx| InitReloc {
+            addend,
+            sym_idx,
+            kind,
+        };
+        relocs.insert(0x1008, reloc(RelocKind::Relative, 0x500, 0));
+        relocs.insert(0x1010, reloc(RelocKind::GlobDat, 0, 7));
+        let index = DynsymAddressIndex {
+            by_addr: HashMap::from([(0x400, "ctor"), (0x500, "reloc_ctor"), (0x600, "glob")]),
+            by_index: HashMap::from([(7, 0x600)]),
+        };
+        let mut slots = 0x400_u64.to_le_bytes().to_vec();
+        slots.extend([0; 16]);
+        let entries = init_array_entries(0x1000, &slots, &relocs, &index);
+        assert_eq!(
+            entries,
+            [
+                serde_json::json!({"addr": "0x400", "symbol": "ctor"}),
+                serde_json::json!({"addr": "0x500", "symbol": "reloc_ctor", "reloc": "relative"}),
+                serde_json::json!({"addr": "0x600", "symbol": "glob", "reloc": "glob_dat"}),
+            ]
+        );
+
+        let many = vec![0u8; (MAX_INIT_ARRAY_SLOTS + 100) * 8];
+        let entries = init_array_entries(0x1000, &many, &relocs, &index);
+        assert_eq!(entries.len(), MAX_INIT_ARRAY_SLOTS);
     }
 }

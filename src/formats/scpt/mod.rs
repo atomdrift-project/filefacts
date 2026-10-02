@@ -13,7 +13,9 @@ use std::collections::BTreeSet;
 
 use crate::Error;
 use crate::metric;
-use crate::output::{Arg, ExtractedString, Metrics, Strings, Symbol, Symbols, Values};
+use crate::output::{
+    Arg, Literal, LiteralEncoding, LiteralMethod, Metrics, Strings, Symbol, Symbols, Values,
+};
 use crate::value_key;
 use parser::Value;
 use serde_json::json;
@@ -55,15 +57,7 @@ impl TextReader {
             return None;
         }
         self.remaining -= data.len();
-        let units: Vec<_> = data
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| u16::from_be_bytes(*c))
-            .collect();
-        String::from_utf16(&units)
-            .ok()
-            .map(|text| (node.offset, text))
+        crate::bytes::utf16_strict(data, crate::bytes::Endian::Big).map(|text| (node.offset, text))
     }
 }
 
@@ -86,8 +80,7 @@ pub(super) fn extract(
     if !body.starts_with(b"Fasd") {
         return Ok(());
     }
-    let parsed =
-        parser::parse(bytes).map_err(|e| Error::malformed_with_source("scpt", e.to_string(), e))?;
+    let parsed = parser::parse(bytes).map_err(|e| Error::malformed_caused_by("scpt", e))?;
     values.insert_key(value_key!("scpt.version"), json!(parsed.version));
     let mut seen_literals = BTreeSet::new();
     let mut text_reader = TextReader::new(MAX_LITERAL_BYTES);
@@ -110,13 +103,11 @@ pub(super) fn extract(
                 if let Some((offset, text)) = text_reader.read(&parsed, items)
                     && seen_literals.insert((offset, text.clone()))
                 {
-                    strings.literals.push(ExtractedString {
-                        text,
-                        offset,
-                        method: Some("scpt-literal".into()),
-                        encoding: Some("utf16be".into()),
-                        ..Default::default()
-                    });
+                    strings.literals.push(
+                        Literal::new(text, offset as u64)
+                            .with_method(LiteralMethod::ScptLiteral)
+                            .with_encoding(LiteralEncoding::Utf16be),
+                    );
                 }
             }
             _ => {}
@@ -173,12 +164,10 @@ pub(super) fn extract(
         for decoded in function.decoded {
             if seen_literals.insert((decoded.offset, decoded.text.clone())) {
                 decoded_count += 1;
-                strings.literals.push(ExtractedString {
-                    text: decoded.text,
-                    offset: decoded.offset,
-                    method: Some("scpt-constant".into()),
-                    ..Default::default()
-                });
+                strings.literals.push(
+                    Literal::new(decoded.text, decoded.offset as u64)
+                        .with_method(LiteralMethod::ScptConstant),
+                );
             }
         }
         for reason in function.limitations {
@@ -192,7 +181,7 @@ pub(super) fn extract(
     }
     values.insert_key(value_key!("scpt.limits"), json!(limitations));
     metrics.insert(metric!("scpt.handler_count"), handler_count as f64);
-    metrics.insert(metric!("scpt.call_count"), call_count as f64);
+    metrics.insert(metric!("scpt.call_count"), f64::from(call_count));
     metrics.insert(metric!("scpt.decoded_count"), decoded_count as f64);
     // Distinct Apple Events the script reaches for. The individual events are
     // already imports, but the count is what separates a one-shot dialog from
@@ -228,8 +217,8 @@ mod tests {
             .find(|s| s.text == "printf '%s\\n' 'SCPT_BASE64_OK'")
             .unwrap();
         assert_eq!(decoded.offset, encoded.offset);
-        assert_eq!(encoded.encoding.as_deref(), Some("utf16be"));
-        assert_eq!(decoded.method.as_deref(), Some("scpt-base64"));
+        assert_eq!(encoded.encoding, Some(LiteralEncoding::Utf16be));
+        assert_eq!(decoded.method, Some(LiteralMethod::ScptBase64));
         assert!(parsed.symbols().iter().any(|s| matches!(s,
             Symbol::Call { target: Some(name), args, .. }
             if name == "syso.exec" && matches!(args.as_slice(), [Arg::Expression]))));
@@ -238,7 +227,7 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(literals).unwrap()).unwrap();
         assert!(restored.iter().any(|s| s.text == decoded.text
             && s.offset == encoded.offset
-            && s.method.as_deref() == Some("scpt-base64")));
+            && s.method == Some(LiteralMethod::ScptBase64)));
     }
 
     #[test]
@@ -250,13 +239,13 @@ mod tests {
             !parsed
                 .literals()
                 .iter()
-                .any(|s| s.method.as_deref() == Some("scpt-literal"))
+                .any(|s| s.method == Some(LiteralMethod::ScptLiteral))
         );
         let bytes = parser::test_fixture();
         let parsed = crate::open(&bytes);
         assert!(parsed.literals().iter().any(|s| s.text == "Hello World"
-            && s.method.as_deref() == Some("scpt-literal")
-            && s.encoding.as_deref() == Some("utf16be")));
+            && s.method == Some(LiteralMethod::ScptLiteral)
+            && s.encoding == Some(LiteralEncoding::Utf16be)));
     }
 
     #[test]
@@ -341,7 +330,7 @@ mod tests {
             parsed
                 .literals()
                 .iter()
-                .any(|s| s.text == "Hello World" && s.method.as_deref() == Some("scpt-literal"))
+                .any(|s| s.text == "Hello World" && s.method == Some(LiteralMethod::ScptLiteral))
         );
     }
 
@@ -386,11 +375,11 @@ mod tests {
         assert!(
             literals
                 .iter()
-                .filter(|s| s.method.as_deref() == Some("scpt-constant"))
+                .filter(|s| s.method == Some(LiteralMethod::ScptConstant))
                 .count()
                 >= 839
         );
-        assert!(literals.iter().all(|s| s.offset < bytes.len()));
+        assert!(literals.iter().all(|s| s.offset < bytes.len() as u64));
         assert!(parsed.symbols().iter().any(|s| matches!(s,
             Symbol::Call { target: Some(name), args, offset: Some(offset) }
             if name == "syso.exec" && *offset < bytes.len() as u64 && matches!(args.first(),

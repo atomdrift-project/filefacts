@@ -23,7 +23,7 @@ use crate::metric;
 use goblin::pe::resource::{StringFileInfo, VersionInfo, VsFixedFileInfo};
 use serde_json::Value as JsonValue;
 
-use crate::formats::common::bytes_at::u16_le;
+use crate::formats::common::bytes_at::{self, u16_le};
 use crate::formats::common::{put_str, put_u64};
 use crate::output::{Metrics, ValueKey, Values};
 use crate::value_key;
@@ -82,19 +82,14 @@ fn version_offset_key(key: &str) -> Option<ValueKey> {
 /// Read a UTF-16LE NUL-terminated key at `pos`, returning `(key, offset just
 /// past the terminator)`. Bounded by `end`.
 fn read_utf16_key(bytes: &[u8], pos: usize, end: usize) -> (String, usize) {
-    let mut units = Vec::new();
-    let mut i = pos;
-    while i + 2 <= end {
-        let Some(u) = u16_le(bytes, i) else {
-            break;
-        };
-        i += 2;
-        if u == 0 {
-            break;
-        }
-        units.push(u);
-    }
-    (String::from_utf16_lossy(&units), i)
+    let window = bytes.get(pos..end.min(bytes.len())).unwrap_or_default();
+    let key = bytes_at::utf16_until_nul(window);
+    // Step over the terminator when the window holds one.
+    let consumed = (key.len() + 2).min(window.len() & !1);
+    (
+        bytes_at::utf16_lossy(key, bytes_at::Endian::Little),
+        pos + consumed,
+    )
 }
 
 /// Round `n` up to the next 4-byte boundary (VS_VERSIONINFO blocks are
@@ -312,7 +307,7 @@ fn identity_scores(identity: &str) -> Option<(f64, f64)> {
         .iter()
         .filter(|&&c| c > 0)
         .map(|&c| {
-            let p = c as f64 / byte_total;
+            let p = f64::from(c) / byte_total;
             -p * p.log2()
         })
         .sum();

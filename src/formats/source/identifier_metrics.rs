@@ -1,18 +1,19 @@
 //! Identifier metrics ported from cleave.
 //!
-//! Walks the tree once collecting identifier nodes for the configured
-//! language, then emits `identifiers.*` keys describing length, entropy,
-//! naming patterns, and obfuscation indicators (single-char, hex-like,
-//! base64-like, sequential, keyboard, repeated-character).
+//! The shared walk ([`super::visit`]) collects the identifier nodes for the
+//! configured language; this module emits `identifiers.*` keys describing
+//! length, entropy, naming patterns, and obfuscation indicators (single-char,
+//! hex-like, base64-like, sequential, keyboard, repeated-character).
 
-use crate::metric;
 use std::collections::BTreeSet;
+use std::sync::LazyLock;
 
-use tree_sitter::Node;
+use aho_corasick::AhoCorasick;
 
+use crate::bytes::sat_u32;
+use crate::metric;
 use crate::output::Metrics;
-
-use super::langs::LangConfig;
+use crate::scan::classify::{is_base64_identifier, is_hex_identifier};
 
 /// Keyboard row patterns for detecting keyboard-walk names.
 const KEYBOARD_PATTERNS: &[&str] = &[
@@ -20,30 +21,14 @@ const KEYBOARD_PATTERNS: &[&str] = &[
     "ytrewq", "fdsa", "gfdsa", "vcxz",
 ];
 
-/// Collect identifier strings from the tree for the configured grammar.
-pub(super) fn collect_identifiers<'a>(
-    root: Node<'a>,
-    source: &'a str,
-    config: &LangConfig,
-) -> Vec<&'a str> {
-    let mut idents = Vec::new();
-    let bytes = source.as_bytes();
-    let mut stack: Vec<Node<'a>> = vec![root];
-    while let Some(node) = stack.pop() {
-        if config.identifier_kinds.contains(&node.kind()) {
-            if let Ok(text) = node.utf8_text(bytes) {
-                if !text.is_empty() {
-                    idents.push(text);
-                }
-            }
-        }
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            stack.push(child);
-        }
-    }
-    idents
-}
+/// [`KEYBOARD_PATTERNS`] as one ASCII-case-insensitive automaton, so a name
+/// is scanned once without lowercasing a copy of it.
+static KEYBOARD: LazyLock<AhoCorasick> = LazyLock::new(|| {
+    AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build(KEYBOARD_PATTERNS)
+        .expect("keyboard patterns are valid literals")
+});
 
 /// Emit `identifiers.*` metrics for the collected list.
 pub(super) fn emit(identifiers: &[&str], metrics: &mut Metrics) {
@@ -51,11 +36,11 @@ pub(super) fn emit(identifiers: &[&str], metrics: &mut Metrics) {
         return;
     }
 
-    let total = identifiers.len() as u32;
+    let total = sat_u32(identifiers.len());
     // Ordered, so the float sums below always add up in the same order and
     // the metrics are bit-for-bit reproducible.
     let unique: BTreeSet<&str> = identifiers.iter().copied().collect();
-    let unique_count = unique.len() as u32;
+    let unique_count = sat_u32(unique.len());
 
     metrics.insert(metric!("identifiers.count"), f64::from(total));
     metrics.insert(metric!("identifiers.unique"), f64::from(unique_count));
@@ -138,17 +123,16 @@ pub(super) fn emit(identifiers: &[&str], metrics: &mut Metrics) {
         {
             numeric_suffix += 1;
         }
-        if is_hex_like(s) {
+        if is_hex_identifier(s) {
             hex_like += 1;
         }
-        if is_base64_like(s) {
+        if is_base64_identifier(s) {
             base64_like += 1;
         }
         if is_sequential(s) {
             sequential += 1;
         }
-        let lower = s.to_ascii_lowercase();
-        if KEYBOARD_PATTERNS.iter().any(|p| lower.contains(p)) {
+        if KEYBOARD.is_match(s) {
             keyboard_pattern += 1;
         }
         if len >= 3 {
@@ -261,30 +245,6 @@ pub(super) fn emit(identifiers: &[&str], metrics: &mut Metrics) {
 /// histogram construction) lands once.
 pub(super) fn string_entropy(s: &str) -> f64 {
     crate::scan::entropy::shannon(s.as_bytes())
-}
-
-fn is_hex_like(s: &str) -> bool {
-    if s.len() < 6 {
-        return false;
-    }
-    let hex_chars = s.bytes().filter(u8::is_ascii_hexdigit).count();
-    let ratio = hex_chars as f64 / s.len() as f64;
-    ratio > 0.9 && s.len().is_multiple_of(2)
-}
-
-fn is_base64_like(s: &str) -> bool {
-    if s.len() < 8 {
-        return false;
-    }
-    let base64_chars = s
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '+' || *c == '/' || *c == '=')
-        .count();
-    let ratio = base64_chars as f64 / s.len() as f64;
-    let has_upper = s.chars().any(|c| c.is_ascii_uppercase());
-    let has_lower = s.chars().any(|c| c.is_ascii_lowercase());
-    let has_digit = s.chars().any(|c| c.is_ascii_digit());
-    ratio > 0.95 && has_upper && has_lower && has_digit
 }
 
 fn is_sequential(s: &str) -> bool {

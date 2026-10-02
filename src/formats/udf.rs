@@ -121,7 +121,7 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
             tag::LOGICAL_VOLUME => {
                 lvd = Some(LogicalVolume {
                     identifier: dstring(sector.get(84..212)).unwrap_or_default(),
-                    block_size: u32_le(sector, 212).unwrap_or(SECTOR as u32),
+                    block_size: u32_le(sector, 212).unwrap_or(crate::bytes::sat_u32(SECTOR)),
                     domain: entity_id(sector.get(216..248)).unwrap_or_default(),
                     revision: domain_revision(sector.get(216..248)),
                     // logical_volume_contents_use is a long_ad pointing at
@@ -186,7 +186,7 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
         bytes,
         partition_start: part.start,
         block_size: if lv.block_size == 0 {
-            SECTOR as u32
+            crate::bytes::sat_u32(SECTOR)
         } else {
             lv.block_size
         },
@@ -231,7 +231,9 @@ fn find_anchor(bytes: &[u8]) -> Option<&[u8]> {
         let Some(block) = sector_at(bytes, sector) else {
             continue;
         };
-        if u16_le(block, 0) == Some(tag::ANCHOR) && u32_le(block, 12) == Some(sector as u32) {
+        if u16_le(block, 0) == Some(tag::ANCHOR)
+            && u32_le(block, 12).map(|v| v as usize) == Some(sector)
+        {
             return Some(block);
         }
     }
@@ -299,15 +301,7 @@ fn dstring(raw: Option<&[u8]>) -> Option<String> {
     }
     let body = raw.get(1..used)?;
     let text = match raw.first() {
-        Some(16) => {
-            let units: Vec<u16> = body
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                .collect();
-            String::from_utf16_lossy(&units)
-        }
+        Some(16) => crate::bytes::utf16_lossy(body, crate::bytes::Endian::Big),
         _ => body.iter().map(|b| char::from(*b)).collect(),
     };
     let text = text.trim_end_matches('\u{0}').trim().to_string();
@@ -439,6 +433,8 @@ struct TreeWalk<'a, 'v> {
     visited: HashSet<u32>,
     file_count: u64,
     dir_count: u64,
+    /// Child directories queued: the work the dedup-at-queue bounds.
+    dirs_queued: usize,
     truncated: bool,
 }
 
@@ -450,19 +446,23 @@ impl<'a, 'v> TreeWalk<'a, 'v> {
             visited: HashSet::new(),
             file_count: 0,
             dir_count: 0,
+            dirs_queued: 0,
             truncated: false,
         }
     }
 
     fn run(&mut self, root_icb: u32) {
+        // A child directory is checked against `visited` and the caps when
+        // it is queued, not when it is popped. Checked late, one directory
+        // whose identifiers all name directories queued every one of them,
+        // and so did each of up to `MAX_DIRS` directories: hundreds of
+        // millions of queued paths. Now the queue never outgrows `MAX_DIRS`.
+        self.visited.insert(root_icb);
         let mut queue = VecDeque::from([(root_icb, String::new(), 0_u32)]);
         while let Some((icb, prefix, depth)) = queue.pop_front() {
-            if self.visited.len() >= MAX_DIRS || self.members.len() >= MAX_ENTRIES {
+            if self.members.len() >= MAX_ENTRIES {
                 self.truncated = true;
                 return;
-            }
-            if depth > MAX_DEPTH || !self.visited.insert(icb) {
-                continue;
             }
             self.dir_count += 1;
 
@@ -473,19 +473,29 @@ impl<'a, 'v> TreeWalk<'a, 'v> {
                 continue;
             };
             // Directory contents live either inline in the entry (AD type 3)
-            // or in the entry's first extent.
+            // or in the entry's first extent. Both borrow the image, not
+            // the walk, so neither needs copying out.
             let data = if entry.embedded {
                 let l_ea = u32_le(block, 168).unwrap_or(0) as usize;
-                block.get(176 + l_ea..).map(<[u8]>::to_vec)
+                block.get(176 + l_ea..)
             } else {
                 entry
                     .first_extent
-                    .and_then(|(len, blk)| self.vol.range(blk, len as usize).map(<[u8]>::to_vec))
+                    .and_then(|(len, blk)| self.vol.range(blk, len as usize))
             };
             let Some(data) = data else { continue };
-            for (name, child_icb, is_dir) in parse_fids(&data) {
+            for (name, child_icb, is_dir) in parse_fids(data) {
                 let path = format!("{prefix}/{name}");
                 if is_dir {
+                    if self.visited.contains(&child_icb) {
+                        continue;
+                    }
+                    if depth >= MAX_DEPTH || self.visited.len() >= MAX_DIRS {
+                        self.truncated = true;
+                        continue;
+                    }
+                    self.visited.insert(child_icb);
+                    self.dirs_queued += 1;
                     queue.push_back((child_icb, path, depth + 1));
                     continue;
                 }
@@ -597,15 +607,7 @@ fn parse_fids(data: &[u8]) -> Vec<(String, u32, bool)> {
 fn decode_d_characters(raw: &[u8]) -> String {
     match raw.first() {
         Some(16) => {
-            let units: Vec<u16> = raw
-                .get(1..)
-                .unwrap_or_default()
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                .collect();
-            String::from_utf16_lossy(&units)
+            crate::bytes::utf16_lossy(raw.get(1..).unwrap_or_default(), crate::bytes::Endian::Big)
         }
         Some(8) => raw
             .get(1..)
@@ -659,6 +661,54 @@ mod tests {
     #[test]
     fn file_identifiers_reject_a_non_fid_run() {
         assert!(parse_fids(&[0_u8; 64]).is_empty());
+    }
+
+    /// Write a directory File Entry at `block` whose contents are the
+    /// `len`-byte extent at `data_block`.
+    fn directory_entry(bytes: &mut [u8], block: usize, data_block: u32, len: u32) {
+        let fe = &mut bytes[block * SECTOR..(block + 1) * SECTOR];
+        fe[0..2].copy_from_slice(&tag::FILE_ENTRY.to_le_bytes());
+        fe[27] = 4; // directory
+        fe[56..64].copy_from_slice(&u64::from(len).to_le_bytes());
+        fe[172..176].copy_from_slice(&8_u32.to_le_bytes()); // one short_ad
+        fe[176..180].copy_from_slice(&len.to_le_bytes());
+        fe[180..184].copy_from_slice(&data_block.to_le_bytes());
+    }
+
+    /// Every directory lists every other: `k` directories of `k`
+    /// subdirectory identifiers each. Dedup at pop queued all `k * k` of
+    /// them (with 65,536 identifiers per directory and 8,192 directories,
+    /// hundreds of millions); dedup at queue time queues each once.
+    #[test]
+    fn directories_naming_each_other_are_queued_once() {
+        let k = 400_usize;
+        let record_len = 40_usize; // 38 + a 2-byte name, padded to 4
+        let data_block = k + 1;
+        let data_len = k * record_len;
+        let mut bytes = vec![0_u8; (data_block + data_len.div_ceil(SECTOR) + 1) * SECTOR];
+        for block in 0..=k {
+            directory_entry(&mut bytes, block, data_block as u32, data_len as u32);
+        }
+        for i in 0..k {
+            let at = data_block * SECTOR + i * record_len;
+            let fid = &mut bytes[at..at + record_len];
+            fid[0..2].copy_from_slice(&tag::FILE_IDENTIFIER.to_le_bytes());
+            fid[18] = 0x02; // directory
+            fid[19] = 2;
+            fid[24..28].copy_from_slice(&((i + 1) as u32).to_le_bytes());
+            fid[38] = 8;
+            fid[39] = b'd';
+        }
+        let vol = Volume {
+            bytes: &bytes,
+            partition_start: 0,
+            block_size: SECTOR as u32,
+        };
+        let mut walk = TreeWalk::new(&vol);
+        walk.run(0);
+        assert_eq!(walk.dirs_queued, k);
+        assert_eq!(walk.dir_count, k as u64 + 1);
+        assert!(!walk.truncated);
     }
 
     #[test]

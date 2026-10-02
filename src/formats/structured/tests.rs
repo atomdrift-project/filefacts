@@ -158,9 +158,9 @@ fn yaml_alias_bombs_are_rejected_quickly() {
         vec!["*big"; 2_000].join(", ")
     );
     let start = std::time::Instant::now();
-    let err = parse_yaml(laughs.as_bytes()).unwrap_err();
+    let err = parse_yaml(laughs.as_bytes()).unwrap_err().to_string();
     assert!(err.contains("alias repetition limit"), "{err}");
-    let err = parse_yaml(reuse.as_bytes()).unwrap_err();
+    let err = parse_yaml(reuse.as_bytes()).unwrap_err().to_string();
     assert!(err.contains("aliases expand past"), "{err}");
     assert!(start.elapsed() < std::time::Duration::from_secs(10));
     let small: String = laughs.lines().take(4).map(|l| format!("{l}\n")).collect();
@@ -297,6 +297,107 @@ fn binary_plist_keyed_archive_uids_are_preserved() {
         values.get("$objects[2].$classname").unwrap(),
         "NSMutableDictionary"
     );
+}
+
+/// Run `f` on a thread with a 2 MiB stack, the size of a rayon worker's, so a
+/// recursion that only fits the 8 MiB main stack fails here.
+fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+fn nested_xml_plist(levels: usize) -> Vec<u8> {
+    format!(
+        "<?xml version=\"1.0\"?><plist version=\"1.0\">{}<string>x</string>{}</plist>",
+        "<array>".repeat(levels),
+        "</array>".repeat(levels)
+    )
+    .into_bytes()
+}
+
+/// A 20k-deep `<array>` nest built the whole `plist::Value` and then recursed
+/// through it, overflowing the stack. The cap now applies as events stream in.
+#[test]
+fn plist_nesting_depth_is_bounded() {
+    let (deep, at_cap, past_cap) = on_small_stack(|| {
+        let mut values = Values::new();
+        let deep = extract_plist(&nested_xml_plist(20_000), &mut values);
+        let at_cap = extract_plist(&nested_xml_plist(PLIST_MAX_DEPTH), &mut values);
+        let past_cap = extract_plist(&nested_xml_plist(PLIST_MAX_DEPTH + 1), &mut values);
+        (
+            deep.map_err(|e| e.to_string()),
+            at_cap.map_err(|e| e.to_string()),
+            past_cap.map_err(|e| e.to_string()),
+        )
+    });
+    assert!(deep.unwrap_err().contains("deeper than"));
+    assert!(at_cap.is_ok());
+    assert!(past_cap.is_err());
+}
+
+/// A binary plist may reference one collection from many places, so a few
+/// hundred bytes can describe billions of values. Each level here is an
+/// array of 14 references to the next level.
+#[test]
+fn binary_plist_reference_reuse_is_bounded() {
+    const LEVELS: usize = 8;
+    let mut bytes = b"bplist00".to_vec();
+    let mut offsets = Vec::new();
+    for level in 0..LEVELS {
+        offsets.push(bytes.len() as u8);
+        // An array marker with its count, 14, in the low nibble.
+        bytes.push(0xA0 | 0x0E);
+        bytes.extend(std::iter::repeat_n(level as u8 + 1, 14));
+    }
+    offsets.push(bytes.len() as u8);
+    bytes.extend([0x10, 0x00]);
+    let table = bytes.len() as u64;
+    bytes.extend(&offsets);
+    bytes.extend([0u8; 6]);
+    bytes.extend([1, 1]);
+    bytes.extend((offsets.len() as u64).to_be_bytes());
+    bytes.extend(0u64.to_be_bytes());
+    bytes.extend(table.to_be_bytes());
+
+    let start = std::time::Instant::now();
+    let err = extract_plist(&bytes, &mut Values::new()).unwrap_err();
+    assert!(err.to_string().contains("expand past"), "{err}");
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn plist_structure_errors_are_malformed() {
+    for bad in [
+        // A dictionary key that is not a string.
+        "<plist><dict><integer>1</integer><string>v</string></dict></plist>",
+        // Unterminated.
+        "<plist><array><string>v</string></plist>",
+    ] {
+        let err = extract_plist(bad.as_bytes(), &mut Values::new()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Malformed {
+                    format: "plist",
+                    ..
+                }
+            ),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn yaml_scanner_errors_keep_their_source() {
+    use std::error::Error as _;
+    let err = extract_yaml(b"a: [1, 2\n", &mut Values::new()).unwrap_err();
+    assert!(err.source().is_some(), "{err}");
+    let err = extract_yaml(b"a: 1\n---\nb: 2\n", &mut Values::new()).unwrap_err();
+    assert!(matches!(err, Error::Malformed { format: "yaml", .. }));
 }
 
 #[test]
@@ -514,32 +615,36 @@ fn gyp_garbage_fails_cleanly() {
     assert!(extract_gyp(b"\x00\x01 not a manifest", &mut v, &mut m).is_err());
 }
 
-/// The parser error behind a `Malformed` is its `source()`, while the
-/// rendered text, which lands in the errors view, keeps its exact wording.
+/// The parser error behind a `Malformed` is its `source()`, not repeated in
+/// its `Display`; the rendered chain, which lands in the errors view, keeps
+/// the exact wording.
 #[test]
 fn malformed_errors_keep_their_text_and_expose_the_parser_error() {
     use std::error::Error as _;
     let mut v = Values::new();
 
     let err = extract_toml(b"name = \"x\"\nversion = \n", &mut v).unwrap_err();
+    assert_eq!(err.to_string(), "malformed toml");
     assert_eq!(
-        err.to_string(),
+        crate::error::display_chain(&err),
         "malformed toml: TOML parse error at line 2, column 11\n  |\n2 | version = \n  |           ^\ninvalid string\nexpected `\"`, `'`\n"
     );
     let source = err.source().expect("toml source");
     assert!(source.downcast_ref::<toml::de::Error>().is_some());
 
     let err = extract_toml(b"\xff\xfe = 1\n", &mut v).unwrap_err();
+    assert_eq!(err.to_string(), "malformed toml: input is not utf-8");
     assert_eq!(
-        err.to_string(),
+        crate::error::display_chain(&err),
         "malformed toml: input is not utf-8: invalid utf-8 sequence of 1 bytes from index 0"
     );
     let source = err.source().expect("utf-8 source");
     assert!(source.downcast_ref::<std::str::Utf8Error>().is_some());
 
     let err = extract_json(br#"{"a":"#, &mut v).unwrap_err();
+    assert_eq!(err.to_string(), "malformed json");
     assert_eq!(
-        err.to_string(),
+        crate::error::display_chain(&err),
         "malformed json: EOF while parsing a value at line 1 column 5"
     );
     let source = err.source().expect("json source");

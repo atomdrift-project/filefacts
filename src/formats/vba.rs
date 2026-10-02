@@ -470,14 +470,15 @@ fn read_project_part<R: Read + Seek>(
     name: &str,
     report: &mut Report<'_>,
 ) -> Option<Vec<u8>> {
-    let mut entry = match zip.by_name(name) {
-        Ok(entry) => entry,
+    // The header's claim refuses an honestly huge part before inflating
+    // any of it; `read_member` caps what the inflater actually produces.
+    let declared = match zip.by_name(name) {
+        Ok(entry) => entry.size(),
         Err(e) => {
             report.failure(format!("VBA project part unreadable: {e}"));
             return None;
         }
     };
-    let declared = entry.size();
     if declared > MAX_STREAM_SIZE {
         report.limit(
             "vba-project-cap",
@@ -485,27 +486,23 @@ fn read_project_part<R: Read + Seek>(
         );
         return None;
     }
-    // `size()` is the header's claim; the zip reader does not stop the
-    // inflater there, so cap the actual output as well.
-    let mut bytes = Vec::with_capacity(declared as usize);
-    if let Err(e) = (&mut entry)
-        .take(MAX_STREAM_SIZE + 1)
-        .read_to_end(&mut bytes)
-    {
-        report.failure(format!("VBA project part unreadable: {e}"));
-        return None;
+    match super::zip::read_member(zip, name, MAX_STREAM_SIZE) {
+        Ok(bytes) => bytes,
+        Err(super::zip::MemberError::TooLarge { .. }) => {
+            report.limit(
+                "vba-project-cap",
+                format!(
+                    "inflates past the {MAX_STREAM_SIZE}-byte cap (header claims {declared}); \
+                     VBA project not read"
+                ),
+            );
+            None
+        }
+        Err(e) => {
+            report.failure(format!("VBA project part unreadable: {e}"));
+            None
+        }
     }
-    if bytes.len() as u64 > MAX_STREAM_SIZE {
-        report.limit(
-            "vba-project-cap",
-            format!(
-                "inflates past the {MAX_STREAM_SIZE}-byte cap (header claims {declared}); \
-                 VBA project not read"
-            ),
-        );
-        return None;
-    }
-    Some(bytes)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -584,7 +581,7 @@ fn read_stream<R: Read + std::io::Seek>(
     if size > MAX_STREAM_SIZE {
         return Err(StreamError::TooLarge(size));
     }
-    let mut buf = Vec::with_capacity(size as usize);
+    let mut buf = Vec::with_capacity(crate::bytes::sat_usize(size));
     stream
         .read_to_end(&mut buf)
         .map_err(StreamError::Unreadable)?;
@@ -848,13 +845,7 @@ fn read_utf16_string(data: &[u8], pos: usize, len: usize) -> Option<String> {
     if bytes.len() % 2 != 0 {
         return None;
     }
-    let units = bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .copied()
-        .map(u16::from_le_bytes);
-    let mut s: String = char::decode_utf16(units).collect::<Result<_, _>>().ok()?;
+    let mut s = bytes_at::utf16_strict(bytes, bytes_at::Endian::Little)?;
     s.truncate(s.trim_end_matches('\0').len());
     (!s.is_empty()).then_some(s)
 }

@@ -45,7 +45,7 @@ use crate::bytes::Reader;
 use crate::error::Error;
 use crate::formats::common::{XorScan, extract_binary_strings};
 use crate::metric;
-use crate::output::{ExtractedString, Metrics, Strings, Values};
+use crate::output::{Literal, LiteralEncoding, LiteralMethod, Metrics, Strings, Values};
 use crate::value_key;
 
 const MAGIC: &[u8] = b"NIBArchive";
@@ -172,13 +172,11 @@ pub(super) fn extract(
 }
 
 fn push_literal(strings: &mut Strings, text: &str, offset: usize) {
-    strings.literals.push(ExtractedString {
-        text: text.to_string(),
-        offset,
-        method: Some("nib-string".into()),
-        encoding: Some("utf8".into()),
-        ..Default::default()
-    });
+    strings.literals.push(
+        Literal::new(text, offset as u64)
+            .with_method(LiteralMethod::NibString)
+            .with_encoding(LiteralEncoding::Utf8),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -418,8 +416,7 @@ impl ReadVarint for Reader<'_> {
 fn collect_keyed(bytes: &[u8], facts: &mut Facts, strings: &mut Strings) -> Result<String, Error> {
     use plist::Value as P;
 
-    let root = plist::Value::from_reader(std::io::Cursor::new(bytes))
-        .map_err(|e| Error::malformed_with_source("nib", e.to_string(), e))?;
+    let root = super::plist_guard::parse(bytes).map_err(|e| e.into_error("nib"))?;
     let P::Dictionary(root) = root else {
         return Err(Error::malformed(
             "nib",
@@ -513,6 +510,10 @@ fn locate(bytes: &[u8], text: &str) -> usize {
         let count = body.len() / 2;
         (0x60, body, count)
     };
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "each arm's range bounds `count` to the width it is cast to"
+    )]
     let mut needle = match count {
         0..=14 => vec![marker | count as u8],
         15..=0xff => vec![marker | 0xf, 0x10, count as u8],
@@ -616,7 +617,7 @@ mod tests {
             .find(|s| s.text == "Run Payload")
             .unwrap();
         assert_eq!(
-            &NIBARCHIVE[run_payload.offset..run_payload.offset + 11],
+            &NIBARCHIVE[run_payload.offset as usize..run_payload.offset as usize + 11],
             b"Run Payload"
         );
     }
@@ -633,9 +634,10 @@ mod tests {
         // Each literal's offset lands on its own bytes, so the short module
         // name is not confused with the front of the longer class name.
         for literal in &strings.literals {
-            let end = literal.offset + literal.text.len();
+            let start = literal.offset as usize;
+            let end = start + literal.text.len();
             assert_eq!(
-                &KEYED[literal.offset..end],
+                &KEYED[start..end],
                 literal.text.as_bytes(),
                 "offset of {:?}",
                 literal.text
@@ -704,5 +706,17 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// A keyed-archive nib nested past the plist depth cap is a malformed
+    /// error, not a stack overflow on a worker-sized stack.
+    #[test]
+    fn deep_keyed_archive_is_refused() {
+        let result = crate::formats::plist_guard::on_small_stack(|| {
+            let deep = crate::formats::plist_guard::nested_xml(20_000);
+            collect_keyed(&deep, &mut Facts::default(), &mut Strings::default())
+                .map_err(|e| e.to_string())
+        });
+        assert!(result.unwrap_err().contains("deeper than"));
     }
 }

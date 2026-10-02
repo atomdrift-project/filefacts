@@ -346,7 +346,7 @@ pub(super) fn extract(
         // cabinet ended at `cbCabinet` and the signature ended here.
         metrics.insert(
             metric!("cab.post_signature_bytes"),
-            (trailing as usize).saturating_sub(der_len) as f64,
+            crate::bytes::sat_usize(trailing).saturating_sub(der_len) as f64,
         );
     }
 

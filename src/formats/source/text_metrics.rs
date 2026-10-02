@@ -60,16 +60,16 @@ fn emit_byte_metrics(bytes: &[u8], metrics: &mut Metrics) {
         }
     }
 
-    let unique_chars = freq.iter().filter(|&&c| c > 0).count() as u32;
+    let unique_chars = crate::bytes::sat_u32(freq.iter().filter(|&&c| c > 0).count());
     let entropy = crate::scan::entropy::shannon_from_histogram(&freq, total);
 
     // Most common non-whitespace byte, with its count
     let most_common = freq
         .iter()
-        .enumerate()
-        .filter(|&(b, &count)| count > 0 && !matches!(b as u8, b' ' | b'\t' | b'\n' | b'\r'))
-        .max_by_key(|&(_, &count)| count)
-        .map(|(b, &count)| (b as u8, count));
+        .zip(0u8..=255)
+        .filter(|&(&count, b)| count > 0 && !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        .max_by_key(|&(&count, _)| count)
+        .map(|(&count, b)| (b, count));
 
     let most_common_ratio = most_common
         .map(|(_, count)| count as f64 / total as f64)
@@ -127,7 +127,7 @@ fn emit_line_metrics(content: &str, metrics: &mut Metrics) {
     for line in content.lines() {
         total_lines += 1;
 
-        let len = line.len() as u32;
+        let len = crate::bytes::sat_u32(line.len());
         max_line_length = max_line_length.max(len);
 
         // Welford's online algorithm for variance.
@@ -434,7 +434,7 @@ fn longest_line_span(content: &str, max_len: u32) -> Option<Span> {
     for raw in content.split_inclusive('\n') {
         let line = raw.strip_suffix('\n').unwrap_or(raw);
         let line = line.strip_suffix('\r').unwrap_or(line);
-        if line.len() as u32 == max_len {
+        if crate::bytes::sat_u32(line.len()) == max_len {
             return Some(Span::new(off as u64, line.len() as u64));
         }
         off += raw.len();

@@ -4,7 +4,7 @@ fn extract_pdf(bytes: &[u8]) -> (Values, Metrics) {
     let mut v = Values::new();
     let mut s = Strings::default();
     let mut m = Metrics::new();
-    extract(bytes, &mut v, &mut s, &mut m).unwrap();
+    extract(bytes, &mut v, &mut s, &mut m);
     (v, m)
 }
 
@@ -855,4 +855,101 @@ fn extracts_info_title_utf16_bom() {
         v.get("pdf.info.title").and_then(|x| x.as_str()),
         Some("Hi!")
     );
+}
+
+/// One Flate stream object `id` holding `content`.
+fn flate_stream_object(id: u32, content: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    enc.write_all(content).unwrap();
+    let body = enc.finish().unwrap();
+    let mut out = format!(
+        "{id} 0 obj << /Filter /FlateDecode /Length {} >> stream\n",
+        body.len()
+    )
+    .into_bytes();
+    out.extend_from_slice(&body);
+    out.extend_from_slice(b"\nendstream endobj\n");
+    out
+}
+
+/// A dict repeating `/JS 2 0 R` used to inflate the same 1 MiB stream once
+/// per repeat, so a few KB of input reached hundreds of MB. The target is
+/// decoded once; the repeats are listed without its content.
+#[test]
+fn repeated_js_reference_is_decoded_once() {
+    let mut pdf = b"%PDF-1.5\n1 0 obj << /S /JavaScript ".to_vec();
+    for _ in 0..400 {
+        pdf.extend_from_slice(b"/JS 2 0 R ");
+    }
+    pdf.extend_from_slice(b">> endobj\n");
+    pdf.extend(flate_stream_object(2, &vec![b'a'; 1 << 20]));
+    pdf.extend_from_slice(b"%%EOF\n");
+
+    let (v, m) = extract_pdf(&pdf);
+    let js = v.get("pdf.javascript").and_then(|x| x.as_array()).unwrap();
+    assert_eq!(js.len(), 400);
+    let with_content = js.iter().filter(|e| e.get("content").is_some()).count();
+    assert_eq!(with_content, 1);
+    assert!(js.iter().all(|e| e["target_object_id"].as_u64() == Some(2)));
+    assert!(
+        js.iter()
+            .all(|e| e["content_bytes"].as_u64() == Some(1 << 20))
+    );
+    assert_eq!(m.get("pdf.javascript_count"), Some(400.0));
+    assert_eq!(m.get("pdf.javascript_total_bytes"), Some((1 << 20) as f64));
+}
+
+/// Distinct targets share one decode budget; past it the scan stops and
+/// says so in `pdf.limits`.
+#[test]
+fn js_payloads_share_one_decode_budget() {
+    let targets = (MAX_JS_TOTAL / MAX_INFLATED) as u32 + 2;
+    let mut pdf = b"%PDF-1.5\n1 0 obj << /S /JavaScript ".to_vec();
+    for id in 0..targets {
+        pdf.extend_from_slice(format!("/JS {} 0 R ", id + 10).as_bytes());
+    }
+    pdf.extend_from_slice(b">> endobj\n");
+    for id in 0..targets {
+        pdf.extend(flate_stream_object(id + 10, &vec![b'b'; MAX_INFLATED]));
+    }
+    pdf.extend_from_slice(b"%%EOF\n");
+
+    let (v, m) = extract_pdf(&pdf);
+    let total = m.get("pdf.javascript_total_bytes").unwrap();
+    assert!(total <= MAX_JS_TOTAL as f64, "{total}");
+    let limits = v.get("pdf.limits").and_then(|l| l.as_array()).unwrap();
+    assert!(
+        limits
+            .iter()
+            .any(|l| l["stage"].as_str() == Some("javascript-budget"))
+    );
+}
+
+/// An unfiltered stream is read through the same cap as an inflated one,
+/// rather than copied whole.
+#[test]
+fn unfiltered_js_stream_is_capped() {
+    let body = vec![b'c'; MAX_INFLATED + 100];
+    let mut pdf = b"%PDF-1.5\n1 0 obj << /S /JavaScript /JS 2 0 R >> endobj\n".to_vec();
+    pdf.extend_from_slice(format!("2 0 obj << /Length {} >> stream\n", body.len()).as_bytes());
+    pdf.extend_from_slice(&body);
+    pdf.extend_from_slice(b"\nendstream endobj\n%%EOF\n");
+    let (v, _) = extract_pdf(&pdf);
+    let js = v.get("pdf.javascript").and_then(|x| x.as_array()).unwrap();
+    assert_eq!(js[0]["content_bytes"].as_u64(), Some(MAX_INFLATED as u64));
+}
+
+/// A zlib stream cut short still yields what decoded before the cut.
+#[test]
+fn truncated_flate_stream_keeps_its_prefix() {
+    use std::io::Write;
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    enc.write_all(&vec![b'x'; 64 << 10]).unwrap();
+    let full = enc.finish().unwrap();
+    let cut = &full[..full.len() - 8];
+    let partial = inflate_capped(cut, MAX_INFLATED).unwrap();
+    assert!(!partial.is_empty());
+    assert!(partial.iter().all(|&b| b == b'x'));
+    assert!(inflate_capped(b"not zlib at all", MAX_INFLATED).is_none());
 }

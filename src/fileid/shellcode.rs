@@ -120,7 +120,7 @@ fn jmp_call_pop(data: &[u8]) -> Option<Shellcode> {
     let &[0xEB, rel8, ..] = data else {
         return None;
     };
-    let call = 2 + usize::try_from(rel8 as i8).ok()?;
+    let call = 2 + usize::try_from(rel8.cast_signed()).ok()?;
     if *data.get(call)? != 0xE8 {
         return None;
     }
@@ -200,7 +200,7 @@ fn arch(data: &[u8], pop_rex: bool, starts: &[usize]) -> Arch {
             .take(INSTRUCTIONS)
             .take_while(|ins| !ins.is_invalid())
             .any(|ins| {
-                code.get(ins.ip() as usize)
+                code.get(crate::bytes::sat_usize(ins.ip()))
                     .is_some_and(|b| (0x48..=0x4F).contains(b))
             })
     };

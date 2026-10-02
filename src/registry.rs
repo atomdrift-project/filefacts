@@ -179,10 +179,12 @@ impl Registry {
             .map(|p| now.saturating_sub(p) / 86_400);
         if !self.release_times.is_empty() {
             let within = |window: u64| {
-                self.release_times
+                let count = self
+                    .release_times
                     .iter()
                     .filter(|&&t| now.saturating_sub(t) <= window)
-                    .count() as u32
+                    .count();
+                crate::bytes::sat_u32(count)
             };
             self.releases_24h = Some(within(86_400));
             self.releases_48h = Some(within(172_800));

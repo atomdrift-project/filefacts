@@ -30,7 +30,7 @@ use crate::value_key;
 use serde_json::Value as JsonValue;
 use std::io::{Read, Seek};
 
-use crate::error::Error;
+use super::bounded::MemberFailure;
 use crate::output::{Errors, Metrics, Stage, ValueKey, Values};
 
 pub(super) fn extract_from_archive<R: Read + Seek>(
@@ -38,7 +38,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     values: &mut Values,
     metrics: &mut Metrics,
     errors: &mut Errors,
-) -> Result<(), Error> {
+) {
     // Parse the outer wheel filename (set by lib.rs from `OpenOptions::path`)
     // for PEP 427 components. The name_prefix here is the *outer*
     // claim of identity, distinct from `whl.distribution` parsed from
@@ -66,19 +66,22 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         // Identify the dist-info / data directories from the first
         // component of any path under them. Multiple matches are
         // permitted in a malformed wheel; we keep the lexically first
-        // (BTreeSet ordering keeps that deterministic).
+        // (BTreeSet ordering keeps that deterministic). Layout names
+        // match exactly, as installers match them.
         if let Some(first) = name.split('/').next() {
             if first.ends_with(".dist-info") && dist_info_dir.as_deref() != Some(first) {
                 if dist_info_dir.is_none() {
                     dist_info_dir = Some(first.to_string());
                 }
-            } else if first.ends_with(".data") && data_dir.as_deref() != Some(first) {
+            } else if first.rsplit_once('.').is_some_and(|(_, ext)| ext == "data")
+                && data_dir.as_deref() != Some(first)
+            {
                 if data_dir.is_none() {
                     data_dir = Some(first.to_string());
                 }
             } else if !first.is_empty()
                 && !first.ends_with(".dist-info")
-                && !first.ends_with(".data")
+                && first.rsplit_once('.').is_none_or(|(_, ext)| ext != "data")
             {
                 // Only record root-level *directories* — bare files at
                 // the archive root are unusual in wheels but not signal.
@@ -109,10 +112,11 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         // Wheels that ship native code carry these under the package
         // tree; pure-python wheels never do.
         let basename = name.rsplit('/').next().unwrap_or(name);
-        if basename.ends_with(".pyd")
-            || basename.ends_with(".so")
+        // Case-insensitive: Windows loads `FOO.PYD` as readily as `foo.pyd`.
+        if super::common::ends_with_ci(basename, ".pyd")
+            || super::common::ends_with_ci(basename, ".so")
             || ends_with_so_versioned(basename)
-            || basename.ends_with(".dylib")
+            || super::common::ends_with_ci(basename, ".dylib")
         {
             native_extension_count += 1;
         }
@@ -121,7 +125,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     // Wheels without a dist-info directory aren't really wheels — bail
     // silently rather than emit empty `whl.*` keys.
     let Some(ref dist_info) = dist_info_dir else {
-        return Ok(());
+        return;
     };
     values.insert_key(
         value_key!("whl.dist_info_dir"),
@@ -157,7 +161,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             // `has_metadata` can come from a second dist-info directory;
             // the chosen one having none is an absence, not a failure.
             Ok(None) => {}
-            Err((stage, why)) => errors.record_malformed(stage, format!("{name}: {why}")),
+            Err(failure) => failure.record(errors),
         }
     }
     if has_wheel {
@@ -198,8 +202,6 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             JsonValue::Array(packages),
         );
     }
-
-    Ok(())
 }
 
 /// Parse a PEP 427 wheel filename and emit `whl.filename.*` facts.
@@ -279,37 +281,21 @@ fn ends_with_so_versioned(basename: &str) -> bool {
 /// Read a zip member as UTF-8 text, capped so a hostile member can't
 /// balloon memory; `Ok(None)` when there is no such member. Only the
 /// leading header block is used, so a member past the cap is read as its
-/// first `MAX` bytes (to the last whole character) rather than refused. On
-/// failure, the stage it failed in and why: the member would not
-/// decompress, or is not UTF-8.
+/// first `MAX` bytes (to the last whole character) rather than refused. Fails
+/// when the member would not decompress, or is not UTF-8.
 fn read_text_member<R: Read + Seek>(
     zip: &mut ::zip::ZipArchive<R>,
     name: &str,
-) -> Result<Option<String>, (Stage, String)> {
+) -> Result<Option<String>, MemberFailure> {
     const MAX: u64 = 256 * 1024;
-    let member = match zip.by_name(name) {
-        Ok(member) => member,
-        Err(::zip::result::ZipError::FileNotFound) => return Ok(None),
-        Err(e) => return Err((Stage::ZipParse, e.to_string())),
+    let prefix = match super::zip::read_member_prefix(zip, name, MAX) {
+        Ok(Some(prefix)) => prefix,
+        Ok(None) => return Ok(None),
+        Err(e) => return Err(MemberFailure::new(Stage::ZipParse, name, e)),
     };
-    let mut buf = Vec::new();
-    member
-        .take(MAX + 1)
-        .read_to_end(&mut buf)
-        .map_err(|e| (Stage::ZipParse, e.to_string()))?;
-    let capped = buf.len() as u64 > MAX;
-    buf.truncate(MAX as usize);
-    match String::from_utf8(buf) {
-        Ok(text) => Ok(Some(text)),
-        // The cap cut a multi-byte character in two: not the member's fault.
-        Err(e) if capped && e.utf8_error().error_len().is_none() => {
-            let valid = e.utf8_error().valid_up_to();
-            let mut bytes = e.into_bytes();
-            bytes.truncate(valid);
-            Ok(String::from_utf8(bytes).ok())
-        }
-        Err(e) => Err((Stage::FormatExtract, format!("not UTF-8: {e}"))),
-    }
+    super::bounded::utf8_prefix(prefix)
+        .map(Some)
+        .map_err(|e| MemberFailure::new(Stage::FormatExtract, format!("{name}: not UTF-8"), e))
 }
 
 /// Emit `whl.author` / `whl.maintainer` (+ `_email`), `whl.homepage` and

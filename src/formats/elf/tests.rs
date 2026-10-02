@@ -2,26 +2,11 @@ use super::*;
 use crate::output::{Metrics, Strings, Values};
 
 fn run(bytes: &[u8]) -> (Values, Strings, Metrics) {
-    let mut v = Values::new();
-    let mut s = Strings::default();
-    let mut m = Metrics::new();
-    let mut sections = Vec::new();
-    let mut symbols = crate::Symbols::new();
-    let mut errors = Errors::new();
+    let mut out = crate::formats::Sinks::default();
     // Ignore the Result — most negative-path tests pass malformed
     // bytes and we only care that extract returns without panic.
-    let _ = extract(
-        bytes,
-        &mut v,
-        &mut s,
-        &mut m,
-        &mut sections,
-        &mut symbols,
-        &mut errors,
-        &mut None,
-        &crate::rizin::Settings::default(),
-    );
-    (v, s, m)
+    extract(bytes, out.ctx());
+    (out.values, out.strings, out.metrics)
 }
 
 /// Build a minimal, goblin-parseable ELF64 (little-endian) carrying a
@@ -172,20 +157,27 @@ fn elf_type_string_covers_canonical_set() {
 fn section_flags_decompose_each_bit() {
     // SHF_WRITE | SHF_ALLOC | SHF_EXECINSTR
     let f = section_flags(0x1 | 0x2 | 0x4);
-    assert_eq!(f, vec!["write", "alloc", "executable"]);
+    assert_eq!(
+        f,
+        vec![
+            SectionFlag::Writable,
+            SectionFlag::Alloc,
+            SectionFlag::Executable
+        ]
+    );
 }
 
 #[test]
 fn section_flags_picks_up_strings_and_merge() {
     // SHF_MERGE | SHF_STRINGS — `.rodata.str` section uses these.
     let f = section_flags(0x10 | 0x20);
-    assert_eq!(f, vec!["merge", "strings"]);
+    assert_eq!(f, vec![SectionFlag::Merge, SectionFlag::Strings]);
 }
 
 #[test]
 fn section_flags_tls_bit() {
     let f = section_flags(0x100);
-    assert_eq!(f, vec!["tls"]);
+    assert_eq!(f, vec![SectionFlag::Tls]);
 }
 
 #[test]
@@ -246,24 +238,9 @@ fn read_fixture(name: &str) -> Vec<u8> {
 
 /// Extract and return the typed symbols (the `run` helper drops them).
 fn run_symbols(bytes: &[u8]) -> crate::Symbols {
-    let mut v = Values::new();
-    let mut s = Strings::default();
-    let mut m = Metrics::new();
-    let mut sections = Vec::new();
-    let mut symbols = crate::Symbols::new();
-    let mut errors = Errors::new();
-    let _ = extract(
-        bytes,
-        &mut v,
-        &mut s,
-        &mut m,
-        &mut sections,
-        &mut symbols,
-        &mut errors,
-        &mut None,
-        &crate::rizin::Settings::default(),
-    );
-    symbols
+    let mut out = crate::formats::Sinks::default();
+    extract(bytes, out.ctx());
+    out.symbols
 }
 
 /// Zero the section-header table in an ELF64 image, simulating a

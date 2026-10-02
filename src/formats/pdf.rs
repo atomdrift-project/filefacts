@@ -32,9 +32,9 @@
 use crate::metric;
 use aho_corasick::{AhoCorasick, AhoCorasickKind, MatchKind};
 use serde_json::{Value as JsonValue, json};
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use crate::error::Error;
 use crate::formats::common::{XorScan, extract_binary_strings, hex_nibble};
 use crate::output::{Metrics, Strings, Values};
 use crate::value_key;
@@ -71,7 +71,7 @@ pub(super) fn extract(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
-) -> Result<(), Error> {
+) {
     extract_binary_strings(bytes, strings, XorScan::No);
 
     // Every fixed token and feature key below comes out of this one pass.
@@ -84,7 +84,7 @@ pub(super) fn extract(
     let header_hits = scan.get(Tok::Header);
     let header_count = header_hits.all;
     let Some(header_at) = header_hits.first else {
-        return Ok(());
+        return;
     };
     metrics.insert(metric!("pdf.header_count"), header_count as f64);
     let mut header = serde_json::Map::new();
@@ -203,15 +203,13 @@ pub(super) fn extract(
     // `pdf.limits` like the archive walkers' limits, and stays out of
     // `errors` (which traits read as "the parser failed").
     if object_streams.skipped > 0 {
-        values.insert_key(
-            value_key!("pdf.limits"),
-            serde_json::json!([{
-                "stage": "object-stream-budget",
-                "reason": format!(
-                    "{} object stream(s) not decoded: the {MAX_OBJSTM_TOTAL}-byte budget was spent",
-                    object_streams.skipped
-                ),
-            }]),
+        push_pdf_limit(
+            values,
+            "object-stream-budget",
+            format!(
+                "{} object stream(s) not decoded: the {MAX_OBJSTM_TOTAL}-byte budget was spent",
+                object_streams.skipped
+            ),
         );
     }
     let objstm_text = object_streams.decoded;
@@ -267,10 +265,10 @@ pub(super) fn extract(
             metrics.insert(metric_key.clone(), c as f64);
         }
         if *kv_key == "page_count" {
-            page_count_value = c as u32;
+            page_count_value = crate::bytes::sat_u32(c);
         }
         if *kv_key == "annotation_count" {
-            annotation_count_value = c as u32;
+            annotation_count_value = crate::bytes::sat_u32(c);
         }
     }
     let byte_range_count = scan.get(Tok::ByteRange).all;
@@ -377,11 +375,21 @@ pub(super) fn extract(
     // sub-file analyzer) re-extract each entry as a virtual JS
     // sub-file at depth 1 so JavaScript-specific traits match
     // against the actual code rather than just the metadata count.
-    let js_payloads = scan_javascript_payloads(bytes, &dict_regions);
+    let objects = index_objects(&dict_regions);
+    let JsScan {
+        payloads: js_payloads,
+        limit: js_limit,
+    } = scan_javascript_payloads(bytes, &dict_regions, &objects);
+    if let Some(reason) = js_limit {
+        push_pdf_limit(values, "javascript-budget", reason);
+    }
     if !js_payloads.is_empty() {
+        // A repeat of an already-decoded target carries no content of its
+        // own, so this totals distinct payload bytes.
         let total_bytes: u64 = js_payloads
             .iter()
             .filter_map(|v| v.as_object())
+            .filter(|o| o.contains_key("content"))
             .filter_map(|o| o.get("content_bytes").and_then(JsonValue::as_u64))
             .sum();
         metrics.insert(metric!("pdf.javascript_count"), js_payloads.len() as f64);
@@ -393,7 +401,7 @@ pub(super) fn extract(
     // record. `size` is recovered by following the `/EF /F <ref>`
     // reference to the embedded-stream object and reading the
     // (possibly indirect) `/Length` value from its dict.
-    let embedded = scan_embedded_files(bytes, &dict_regions);
+    let embedded = scan_embedded_files(bytes, &dict_regions, &objects);
     if !embedded.is_empty() {
         metrics.insert(metric!("pdf.embedded_file_count"), embedded.len() as f64);
         values.insert_key(
@@ -532,8 +540,6 @@ pub(super) fn extract(
     }
     derive_stream_metrics(bytes, &dict_regions, metrics);
     derive_risky_feature_score(values, metrics);
-
-    Ok(())
 }
 
 /// The version after the first `%PDF-` (at `header_at`). Multiple headers
@@ -694,13 +700,9 @@ fn read_literal_string(bytes: &[u8], start: usize) -> Option<String> {
 /// with the `FE FF` BOM: decode those; fall back to lossy UTF-8 otherwise.
 fn decode_text_string(raw: &[u8]) -> String {
     if let Some(be) = raw.strip_prefix(&[0xFE, 0xFF]) {
-        let units: Vec<u16> = be
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| u16::from_be_bytes(*c))
-            .collect();
-        return String::from_utf16_lossy(&units).trim().to_string();
+        return crate::bytes::utf16_lossy(be, crate::bytes::Endian::Big)
+            .trim()
+            .to_string();
     }
     String::from_utf8_lossy(raw).trim().to_string()
 }
@@ -1135,21 +1137,22 @@ fn decode_object_streams(
 /// the site referenced another object (so consumers can map the JS
 /// payload back to a specific object id); `filters` records the
 /// stream's filter chain when the payload was decoded from a stream.
-fn scan_javascript_payloads(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<JsonValue> {
-    // Lookup table for indirect-ref resolution. PDFs with multiple
-    // generations of the same object id are rare in malicious samples
-    // and we accept the last-wins behavior here (matches how the rest
-    // of the extractor handles incremental updates).
-    let mut by_id: std::collections::HashMap<u32, &DictRegion> =
-        std::collections::HashMap::with_capacity(dict_regions.len());
-    for r in dict_regions {
-        if let Some(id) = r.obj_id {
-            by_id.insert(id, r);
-        }
-    }
-
+fn scan_javascript_payloads(
+    bytes: &[u8],
+    dict_regions: &[DictRegion],
+    objects: &ObjectIndex<'_>,
+) -> JsScan {
     let mut out = Vec::new();
-    for region in dict_regions {
+    // Decoded bytes left for the document. Sites can repeat one target
+    // (`/JS 2 0 R` a thousand times over); each target is decoded once,
+    // and the budget bounds what distinct targets and inline strings add.
+    let mut budget = MAX_JS_TOTAL;
+    let mut sites = 0_usize;
+    // Every target resolved so far, with its decoded length (`None`: it
+    // did not resolve), so a repeat is answered without decoding again.
+    let mut seen: HashMap<u32, Option<u64>> = HashMap::new();
+    let mut limit = None;
+    'regions: for region in dict_regions {
         let DictRegion {
             start, end, obj_id, ..
         } = *region;
@@ -1164,45 +1167,109 @@ fn scan_javascript_payloads(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<Js
         {
             let abs = pos + rel;
             let next = abs + 3;
+            pos = next;
             // Reject /JSON, /JavaScript (the *name*, not the key form).
             if dict.get(next).is_some_and(u8::is_ascii_alphabetic) {
-                pos = next;
                 continue;
             }
-            if let Some(payload) = resolve_js_value(bytes, dict, next, &by_id) {
-                let mut entry = serde_json::Map::new();
-                entry.insert(
-                    "source".into(),
-                    JsonValue::String(match obj_id {
-                        Some(id) => format!("object:{id}"),
-                        None => "object:unknown".to_string(),
-                    }),
-                );
-                if let Some(target) = payload.target_object_id {
-                    entry.insert(
-                        "target_object_id".into(),
-                        JsonValue::Number(u64::from(target).into()),
-                    );
-                }
-                if !payload.filters.is_empty() {
-                    entry.insert(
-                        "filters".into(),
-                        JsonValue::Array(
-                            payload.filters.into_iter().map(JsonValue::String).collect(),
-                        ),
-                    );
-                }
-                entry.insert(
-                    "content_bytes".into(),
-                    JsonValue::Number((payload.content.len() as u64).into()),
-                );
-                entry.insert("content".into(), JsonValue::String(payload.content));
-                out.push(JsonValue::Object(entry));
+            if sites >= MAX_JS_SITES {
+                limit = Some(format!("stopped after {MAX_JS_SITES} /JS sites"));
+                break 'regions;
             }
-            pos = next;
+            sites += 1;
+            let source = JsonValue::String(match obj_id {
+                Some(id) => format!("object:{id}"),
+                None => "object:unknown".to_string(),
+            });
+            let cursor = skip_while(dict, next, u8::is_ascii_whitespace);
+            let target = js_reference(dict, cursor);
+            if let Some(&known) = target.and_then(|id| seen.get(&id)) {
+                // The payload is the earlier entry's with the same
+                // `target_object_id`; repeating its content would only
+                // multiply the output.
+                if let (Some(id), Some(len)) = (target, known) {
+                    out.push(json!({
+                        "source": source,
+                        "target_object_id": id,
+                        "content_bytes": len,
+                    }));
+                }
+                continue;
+            }
+            if budget == 0 {
+                limit = Some(format!(
+                    "/JS payloads past the {MAX_JS_TOTAL}-byte decode budget not read"
+                ));
+                break 'regions;
+            }
+            let payload = match target {
+                Some(id) => resolve_indirect_js(bytes, id, objects, budget.min(MAX_INFLATED)),
+                None => resolve_inline_js(dict, cursor),
+            };
+            if let Some(id) = target {
+                seen.insert(id, payload.as_ref().map(|p| p.content.len() as u64));
+            }
+            let Some(payload) = payload else {
+                continue;
+            };
+            budget = budget.saturating_sub(payload.content.len());
+            let mut entry = serde_json::Map::new();
+            entry.insert("source".into(), source);
+            if let Some(target) = payload.target_object_id {
+                entry.insert(
+                    "target_object_id".into(),
+                    JsonValue::Number(u64::from(target).into()),
+                );
+            }
+            if !payload.filters.is_empty() {
+                entry.insert(
+                    "filters".into(),
+                    JsonValue::Array(payload.filters.into_iter().map(JsonValue::String).collect()),
+                );
+            }
+            entry.insert(
+                "content_bytes".into(),
+                JsonValue::Number((payload.content.len() as u64).into()),
+            );
+            entry.insert("content".into(), JsonValue::String(payload.content));
+            out.push(JsonValue::Object(entry));
         }
     }
-    out
+    JsScan {
+        payloads: out,
+        limit,
+    }
+}
+
+/// Decoded `/JS` content kept per document, across every site.
+const MAX_JS_TOTAL: usize = 16 << 20;
+/// `/JS` sites resolved per document.
+const MAX_JS_SITES: usize = 4096;
+
+/// The `pdf.javascript` entries, and why the scan stopped early if it did.
+struct JsScan {
+    payloads: Vec<JsonValue>,
+    limit: Option<String>,
+}
+
+/// Every object with an id, for following indirect references. PDFs with
+/// multiple generations of one object id are rare in malicious samples, and
+/// the last one wins here, as it does in the rest of the extractor's
+/// handling of incremental updates.
+type ObjectIndex<'r> = HashMap<u32, &'r DictRegion>;
+
+fn index_objects(dict_regions: &[DictRegion]) -> ObjectIndex<'_> {
+    let mut by_id = HashMap::with_capacity(dict_regions.len());
+    for r in dict_regions {
+        if let Some(id) = r.obj_id {
+            by_id.insert(id, r);
+        }
+    }
+    by_id
+}
+
+fn push_pdf_limit(values: &mut Values, stage: &str, reason: impl Into<String>) {
+    super::bounded::push_limit(values, value_key!("pdf.limits"), stage, reason);
 }
 
 struct JsPayload {
@@ -1211,50 +1278,26 @@ struct JsPayload {
     content: String,
 }
 
-/// Resolve the value sitting after a `/JS` key in `dict` (slice
-/// relative to the object's dict region). Walks across object
-/// boundaries for indirect references — string objects come back
-/// inline; stream objects come back inflated (FlateDecode) or raw
-/// (no filter).
-fn resolve_js_value(
-    bytes: &[u8],
-    dict: &[u8],
-    after_js_key: usize,
-    by_id: &std::collections::HashMap<u32, &DictRegion>,
-) -> Option<JsPayload> {
-    let cursor = skip_while(dict, after_js_key, u8::is_ascii_whitespace);
-    let first = *dict.get(cursor)?;
-    match first {
-        b'(' => {
-            let content = read_literal_string(dict, cursor + 1)?;
-            Some(JsPayload {
-                target_object_id: None,
-                filters: Vec::new(),
-                content,
-            })
-        }
-        b'<' if dict.get(cursor + 1) != Some(&b'<') => {
-            let content = read_hex_string(dict, cursor + 1)?;
-            Some(JsPayload {
-                target_object_id: None,
-                filters: Vec::new(),
-                content,
-            })
-        }
-        b'0'..=b'9' => resolve_indirect_js(bytes, dict, cursor, by_id),
-        _ => None,
-    }
+/// An inline `/JS` value at `dict[cursor..]`: a `(literal)` or a `<hex>`
+/// string.
+fn resolve_inline_js(dict: &[u8], cursor: usize) -> Option<JsPayload> {
+    let content = match dict.get(cursor)? {
+        b'(' => read_literal_string(dict, cursor + 1)?,
+        b'<' if dict.get(cursor + 1) != Some(&b'<') => read_hex_string(dict, cursor + 1)?,
+        _ => return None,
+    };
+    Some(JsPayload {
+        target_object_id: None,
+        filters: Vec::new(),
+        content,
+    })
 }
 
-/// Parse an `N G R` indirect reference at `dict[cursor..]` and dereference
-/// it through `by_id` to recover the underlying string- or stream-object's
-/// content.
-fn resolve_indirect_js(
-    bytes: &[u8],
-    dict: &[u8],
-    cursor: usize,
-    by_id: &std::collections::HashMap<u32, &DictRegion>,
-) -> Option<JsPayload> {
+/// The object id of an `N G R` indirect reference at `dict[cursor..]`.
+fn js_reference(dict: &[u8], cursor: usize) -> Option<u32> {
+    if !dict.get(cursor)?.is_ascii_digit() {
+        return None;
+    }
     let end = (cursor + 32).min(dict.len());
     let token: String = dict
         .get(cursor..end)?
@@ -1266,7 +1309,18 @@ fn resolve_indirect_js(
     let mut parts = reference.split_whitespace();
     let target_id: u32 = parts.next()?.parse().ok()?;
     let _gen: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let target = by_id.get(&target_id).copied()?;
+    Some(target_id)
+}
+
+/// Dereference object `target_id` to recover the underlying string- or
+/// stream-object's content, decoding at most `cap` bytes of a stream.
+fn resolve_indirect_js(
+    bytes: &[u8],
+    target_id: u32,
+    objects: &ObjectIndex<'_>,
+    cap: usize,
+) -> Option<JsPayload> {
+    let target = objects.get(&target_id).copied()?;
 
     // Two shapes — a stream object (most common for /JS, since JS
     // blobs are bigger than a string-literal-friendly size) or a
@@ -1274,9 +1328,9 @@ fn resolve_indirect_js(
     if let Some((s, e)) = target.stream_range {
         if let Some(raw) = bytes.get(s..e).filter(|raw| !raw.is_empty()) {
             let filters = read_object_filters(target.dict(bytes));
-            let decoded: Option<Vec<u8>> = match filters.as_slice() {
-                [] => Some(raw.to_vec()),
-                [single] if single == "FlateDecode" => inflate(raw),
+            let decoded: Option<std::borrow::Cow<'_, [u8]>> = match filters.as_slice() {
+                [] => Some(raw.get(..cap).unwrap_or(raw).into()),
+                [single] if single == "FlateDecode" => inflate_capped(raw, cap).map(Into::into),
                 _ => None, // skip unusual filter chains; out of scope for now
             };
             if let Some(decoded) = decoded {
@@ -1465,7 +1519,7 @@ fn count_upload_directory_uris(actions: &[JsonValue]) -> u32 {
 /// `pdf.uri_action_count` from the same action table the kv view
 /// emits — single source of truth, no separate substring scan.
 fn action_count_by_kind(actions: &[JsonValue], kind: &str) -> u32 {
-    actions
+    let count = actions
         .iter()
         .filter(|a| {
             a.as_object()
@@ -1473,7 +1527,8 @@ fn action_count_by_kind(actions: &[JsonValue], kind: &str) -> u32 {
                 .and_then(JsonValue::as_str)
                 == Some(kind)
         })
-        .count() as u32
+        .count();
+    crate::bytes::sat_u32(count)
 }
 
 /// Sum the declared `/N` count across every `/Type /ObjStm` object
@@ -1520,7 +1575,7 @@ fn unreferenced_object_count(bytes: &[u8], dict_regions: &[DictRegion]) -> u32 {
     if ids.is_empty() {
         return 0;
     }
-    ids.difference(&refs).count() as u32
+    crate::bytes::sat_u32(ids.difference(&refs).count())
 }
 
 /// Scan an arbitrary byte slice for `<id> <gen> R` indirect-ref
@@ -1594,7 +1649,11 @@ fn find_filter_in_dict(dict: &[u8]) -> Option<String> {
 /// `/Length` of the embedded-file stream referenced by `/EF /F
 /// <id> <gen> R` — recovered by walking the dict-region index back
 /// to the target object.
-fn scan_embedded_files(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<(String, Option<u64>)> {
+fn scan_embedded_files(
+    bytes: &[u8],
+    dict_regions: &[DictRegion],
+    objects: &ObjectIndex<'_>,
+) -> Vec<(String, Option<u64>)> {
     let mut out = Vec::new();
     for region in dict_regions {
         let dict = region.dict(bytes);
@@ -1609,7 +1668,7 @@ fn scan_embedded_files(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<(String
         };
         // `/EF` is an embedded-files dict: `<< /F <ref> /UF <ref> >>`.
         // Find the indirect reference and chase it.
-        let size = find_ef_stream_length(dict, dict_regions, bytes);
+        let size = find_ef_stream_length(dict, objects, bytes);
         out.push((filename, size));
     }
     out
@@ -1621,7 +1680,7 @@ fn scan_embedded_files(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<(String
 /// `/Length` itself if it's also an indirect ref (rare but legal).
 fn find_ef_stream_length(
     filespec_dict: &[u8],
-    dict_regions: &[DictRegion],
+    objects: &ObjectIndex<'_>,
     bytes: &[u8],
 ) -> Option<u64> {
     // Locate `/EF` then the inner `/F <id> <gen> R` or
@@ -1635,7 +1694,7 @@ fn find_ef_stream_length(
     let window = filespec_dict.get(ef_pos..window_end)?;
     let target_id = parse_indirect_ref_value(window, b"/F")
         .or_else(|| parse_indirect_ref_value(window, b"/UF"))?;
-    let target = dict_regions.iter().find(|r| r.obj_id == Some(target_id))?;
+    let target = objects.get(&target_id)?;
     let target_dict = target.dict(bytes);
     let length_text = find_info_value(target_dict, b"/Length")?;
     if let Ok(direct) = length_text.parse::<u64>() {
@@ -1643,7 +1702,7 @@ fn find_ef_stream_length(
     }
     // Indirect length — try `<id> <gen> R` form.
     let length_ref = parse_indirect_ref_value(target_dict, b"/Length")?;
-    let length_obj = dict_regions.iter().find(|r| r.obj_id == Some(length_ref))?;
+    let length_obj = objects.get(&length_ref)?;
     // The raw_value of a length-only object is the literal number;
     // strip leading whitespace and parse.
     let digits: String = length_obj
@@ -1729,8 +1788,10 @@ fn scan_streams(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<JsonValue> {
         entry.insert("magic_hex".into(), JsonValue::String(magic_hex));
 
         if matches!(filters.as_slice(), [only] if only == "FlateDecode") {
-            if let Some(decoded) = inflate(raw) {
-                let sample = decoded.get(..MAX_DECODED_TEXT).unwrap_or(&decoded);
+            // Only the first `MAX_DECODED_TEXT` bytes are kept, so inflating
+            // more would only burn time on every stream in the file.
+            if let Some(decoded) = inflate_capped(raw, MAX_DECODED_TEXT) {
+                let sample = decoded.as_slice();
                 // PDF Flate streams are split roughly into two
                 // kinds: text-shaped (content streams, JavaScript,
                 // metadata XML — `>= 50%` printable ASCII) and
@@ -1845,20 +1906,21 @@ fn find_rect_value(bytes: &[u8], key: &[u8]) -> Option<String> {
     Some(inner.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
-/// Decode a FlateDecode stream into a bounded buffer. Caps the
-/// inflated output at [`MAX_INFLATED`] so adversarial zip-bombs can't
-/// blow memory. Returns `None` on decode failure.
-fn inflate(input: &[u8]) -> Option<Vec<u8>> {
-    inflate_capped(input, MAX_INFLATED)
-}
-
+/// Decode a FlateDecode stream into a buffer of at most `max` bytes, so an
+/// adversarial deflate bomb can't blow memory.
+///
+/// A truncated stream or one with a bad checksum still yields what decoded
+/// before the damage: viewers render that prefix, and malicious PDFs ship
+/// such streams on purpose to trip strict parsers. `None` only when nothing
+/// decoded at all.
 fn inflate_capped(input: &[u8], max: usize) -> Option<Vec<u8>> {
     use flate2::read::ZlibDecoder;
     use std::io::Read;
     let mut decoder = ZlibDecoder::new(input).take(max as u64);
     let mut out = Vec::new();
-    decoder.read_to_end(&mut out).ok()?;
-    Some(out)
+    // `read_to_end` keeps what it read before an error.
+    let complete = decoder.read_to_end(&mut out).is_ok();
+    (complete || !out.is_empty()).then_some(out)
 }
 
 fn contains_substring(bytes: &[u8], needle: &[u8]) -> bool {
@@ -2320,14 +2382,14 @@ fn derive_form_field_metrics(fields: &[JsonValue], metrics: &mut Metrics) {
     let dup = |map: &HashMap<String, usize>| -> u32 {
         map.values()
             .filter(|&&c| c > 1)
-            .map(|&c| (c - 1) as u32)
-            .sum()
+            .map(|&c| crate::bytes::sat_u32(c - 1))
+            .fold(0, u32::saturating_add)
     };
     let dup_pair = |map: &HashMap<(String, String), usize>| -> u32 {
         map.values()
             .filter(|&&c| c > 1)
-            .map(|&c| (c - 1) as u32)
-            .sum()
+            .map(|&c| crate::bytes::sat_u32(c - 1))
+            .fold(0, u32::saturating_add)
     };
     metrics.insert(
         metric!("pdf.duplicate_form_name_count"),
@@ -2561,6 +2623,11 @@ fn classify_stream_length(dict: &[u8]) -> LengthValue {
 /// count, embedded files, and JavaScript-style stream content.
 /// Calibrated against cleave's prior implementation so existing
 /// trait thresholds (`min: 70`) still mean roughly the same thing.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "float-to-int `as` saturates (NaN is 0); the metrics read here are non-negative counts"
+)]
 fn derive_risky_feature_score(values: &Values, metrics: &mut Metrics) {
     let mut score: u32 = 0;
     let features = values

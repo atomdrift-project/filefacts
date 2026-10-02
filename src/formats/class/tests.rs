@@ -60,7 +60,7 @@ fn run(bytes: &[u8]) -> (Values, Metrics) {
     let mut s = Strings::default();
     let mut m = Metrics::new();
     let mut symbols = crate::Symbols::new();
-    extract(bytes, &mut v, &mut s, &mut m, &mut symbols).unwrap();
+    extract(bytes, &mut v, &mut s, &mut m, &mut symbols);
     (v, m)
 }
 
@@ -69,7 +69,7 @@ fn run_full(bytes: &[u8]) -> (Values, Metrics, crate::Symbols) {
     let mut s = Strings::default();
     let mut m = Metrics::new();
     let mut symbols = crate::Symbols::new();
-    extract(bytes, &mut v, &mut s, &mut m, &mut symbols).unwrap();
+    extract(bytes, &mut v, &mut s, &mut m, &mut symbols);
     (v, m, symbols)
 }
 
@@ -426,4 +426,33 @@ fn build_class_with_flags(major: u16, flags: u16) -> Vec<u8> {
         out[pos..pos + 2].copy_from_slice(&flags.to_be_bytes());
     }
     out
+}
+
+/// InnerClasses entries repeated within and across attributes list each
+/// inner class once, in first-seen order.
+#[test]
+fn inner_classes_are_deduplicated_across_attributes() {
+    let mut cp = ConstantPool::default();
+    for (idx, name) in [(1, "InnerClasses"), (2, "Outer$A"), (3, "Outer$B")] {
+        cp.utf8.insert(idx, name.to_string());
+    }
+    cp.class.insert(10, 2);
+    cp.class.insert(11, 3);
+    let entry = |class: u16| [class.to_be_bytes().as_slice(), &[0; 6]].concat();
+    let attribute = |classes: &[u16]| {
+        let mut body = (classes.len() as u16).to_be_bytes().to_vec();
+        for &class in classes {
+            body.extend(entry(class));
+        }
+        let mut out = 1u16.to_be_bytes().to_vec();
+        out.extend((body.len() as u32).to_be_bytes());
+        out.extend(body);
+        out
+    };
+    let mut bytes = 3u16.to_be_bytes().to_vec();
+    bytes.extend(attribute(&[10, 11, 10]));
+    bytes.extend(attribute(&[11, 10]));
+    bytes.extend(attribute(&[10]));
+    let attrs = parse_attributes(&mut Reader::at(&bytes, 0), &cp);
+    assert_eq!(attrs.inner_classes, ["Outer$A", "Outer$B"]);
 }

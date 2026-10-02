@@ -21,13 +21,24 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 /// The binary, kept away from the user's caches: the extraction cache is
-/// off and the cache sweep runs against a private directory.
+/// off, and every directory a cache path is derived from — `HOME` (macOS
+/// puts caches in `~/Library/Caches`, ignoring `XDG_CACHE_HOME`) and
+/// `XDG_CACHE_HOME` — points into a private directory. Variables that steer
+/// stng's old caches or the debug output are cleared, whatever the
+/// developer's shell has set.
 fn filefacts() -> Command {
-    let cache = Path::new(env!("CARGO_TARGET_TMPDIR")).join("cli-cache");
+    let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join("cli-home");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_filefacts"));
     cmd.env("FILEFACTS_CACHE", "0")
-        .env("XDG_CACHE_HOME", cache)
+        .env("HOME", &home)
+        .env("XDG_CACHE_HOME", home.join(".cache"))
         .env("NO_COLOR", "1");
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(|n| n.starts_with("STNG_")) {
+            cmd.env_remove(&name);
+        }
+    }
+    cmd.env_remove("FILEFACTS_DEBUG");
     cmd
 }
 
@@ -237,6 +248,45 @@ fn json_output_escapes_del_and_c1_controls() {
     assert!(text.contains("\\u009b31m\\u007f"), "{text}");
     let value: Value = serde_json::from_str(&text).unwrap();
     assert!(value.to_string().contains("\u{9b}31m\u{7f}"), "{value}");
+}
+
+/// A FIFO named on the command line is refused at once: reading it would
+/// block until a writer appears, then stream without bound.
+#[cfg(unix)]
+#[test]
+fn fifo_argument_is_refused_not_read() {
+    let dir = scratch("fifo");
+    let fifo = dir.join("pipe");
+    let made = Command::new("mkfifo").arg(&fifo).status();
+    if !made.is_ok_and(|s| s.success()) {
+        return; // no mkfifo on this host
+    }
+    let mut child = filefacts()
+        .arg(&fifo)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(20) {
+            let _ = child.kill();
+            panic!("filefacts blocked reading a FIFO");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("not a regular file"), "{stderr}");
 }
 
 /// A call's arguments are typed values, not strings; they print as they

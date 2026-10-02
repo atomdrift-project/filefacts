@@ -1,6 +1,7 @@
 //! ELF similarity hashes used for malware-family clustering.
 //!
-//! Four MD5-based fingerprints mirroring [`super::macho_hashes`]:
+//! Four MD5-based fingerprints mirroring [`super::macho_hashes`], built with
+//! the shared construction in [`super::symbol_hashes`]:
 //!
 //! - **`imphash`** — sorted, lowercased, dedup'd list of imported
 //!   function names (dyld bind imports). Greg Lesnewich's `telfhash`
@@ -21,13 +22,15 @@
 //! field rather than emit an MD5 of the empty string.
 
 use goblin::elf::Elf;
-use md5::{Digest, Md5};
 
-use crate::formats::common::{hex_encode, put_str};
-use crate::output::{Symbol, SymbolKind, Symbols, Values};
+use super::symbol_hashes::{export_hash, imphash, md5_of_set};
+use crate::formats::common::put_str;
+use crate::output::{Symbols, Values};
 use crate::value_key;
 
 pub(super) fn emit(elf: &Elf<'_>, values: &mut Values, symbols: &Symbols) {
+    // imphash: imported function names (`STB_GLOBAL`/`STB_WEAK` with
+    // `SHN_UNDEF`); export_hash: defined dynsym names.
     if let Some(h) = imphash(symbols) {
         put_str(values, value_key!("elf.hashes.imphash"), h);
     }
@@ -42,55 +45,16 @@ pub(super) fn emit(elf: &Elf<'_>, values: &mut Values, symbols: &Symbols) {
     }
 }
 
-/// MD5 of the sorted, lowercased, dedup'd imported-symbol names
-/// (`STB_GLOBAL`/`STB_WEAK` symbols with `SHN_UNDEF`).
-fn imphash(symbols: &Symbols) -> Option<String> {
-    let mut names: Vec<String> = symbols
-        .iter_kind(SymbolKind::Import)
-        .filter_map(|s| match s {
-            Symbol::Import { name, .. } => Some(name.to_ascii_lowercase()),
-            _ => None,
-        })
-        .collect();
-    if names.is_empty() {
-        return None;
-    }
-    names.sort();
-    names.dedup();
-    Some(md5_of_csv(&names))
-}
-
-fn export_hash(symbols: &Symbols) -> Option<String> {
-    let mut names: Vec<String> = symbols
-        .iter_kind(SymbolKind::Export)
-        .filter_map(|s| match s {
-            Symbol::Export { name, .. } => Some(name.to_ascii_lowercase()),
-            _ => None,
-        })
-        .collect();
-    if names.is_empty() {
-        return None;
-    }
-    names.sort();
-    names.dedup();
-    Some(md5_of_csv(&names))
-}
-
 /// MD5 of the sorted, lowercased `DT_NEEDED` library list. Stable
 /// across compiler versions and a useful first-cut dependency
 /// fingerprint.
 fn dyn_hash(elf: &Elf<'_>) -> Option<String> {
-    let mut names: Vec<String> = elf
-        .libraries
-        .iter()
-        .map(|s| s.to_ascii_lowercase())
-        .collect();
-    if names.is_empty() {
-        return None;
-    }
-    names.sort();
-    names.dedup();
-    Some(md5_of_csv(&names))
+    md5_of_set(
+        elf.libraries
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect(),
+    )
 }
 
 /// Anomali Labs' symhash, applied to ELF's static symbol table.
@@ -113,33 +77,5 @@ fn symhash(elf: &Elf<'_>) -> Option<String> {
             }
         }
     }
-    if names.is_empty() {
-        return None;
-    }
-    names.sort();
-    names.dedup();
-    Some(md5_of_csv(&names))
-}
-
-fn md5_of_csv(parts: &[String]) -> String {
-    let joined = parts.join(",");
-    let digest = Md5::digest(joined.as_bytes());
-    hex_encode(&digest)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::md5_of_csv;
-
-    #[test]
-    fn matches_macho_hash_construction() {
-        // The construction must be byte-identical to the Mach-O
-        // hashes module (`md5("a,b,c")`) so a binary that exposes
-        // the same import set under both formats fingerprints
-        // identically.
-        assert_eq!(
-            md5_of_csv(&["a".into(), "b".into(), "c".into()]),
-            "a44c56c8177e32d3613988f4dba7962e"
-        );
-    }
+    md5_of_set(names)
 }

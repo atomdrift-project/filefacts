@@ -326,7 +326,7 @@ fn markup_limits_and_every_prefix_are_bounded() {
         let p = super::super::parse(&source[..end]);
         assert!(p.flow.values.len() <= 20_000);
         for v in &p.flow.values {
-            assert!(v.offset <= end);
+            assert!(v.offset <= end as u64);
             assert!(v.inputs.iter().all(|id| *id < p.flow.values.len()));
             assert!(v.fields.values().all(|id| *id < p.flow.values.len()));
         }

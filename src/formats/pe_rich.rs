@@ -36,54 +36,72 @@ const RICH_MAGIC: &[u8; 4] = b"Rich";
 // "DanS" little-endian read as u32: 'D'=0x44, 'a'=0x61, 'n'=0x6e, 'S'=0x53.
 const DANS_MARKER: u32 = 0x536e_6144;
 
-/// Find and decode the Rich header in `bytes`, populating
-/// `pe.rich.*` keys. No-op when the binary has no Rich header (Go,
-/// Rust, MinGW, packed/stripped binaries, …).
-pub(super) fn extract(bytes: &[u8], values: &mut Values) {
+/// Where a Rich header sits in a PE's DOS stub.
+pub(super) struct RichLocation {
+    /// Offset of the last `Rich` marker before `e_lfanew`.
+    pub(super) rich_pos: usize,
+    /// The XOR key following the marker.
+    pub(super) key: u32,
+    /// Offset of the XOR-encoded `DanS` marker that opens the table, or
+    /// `None` when the `Rich` magic has no decodable table behind it.
+    pub(super) dans_pos: Option<usize>,
+}
+
+/// Locate the Rich header: the `Rich` marker in the DOS stub, its key, and
+/// the `DanS` marker found by walking back from it in 4-byte words. `None`
+/// when there is no marker (Go, Rust, MinGW, packed/stripped binaries, …)
+/// or no room for its key. Shared with `goblin_safe`, which neutralises a
+/// marker with no table so goblin does not reject the whole PE.
+pub(super) fn locate(bytes: &[u8]) -> Option<RichLocation> {
     // The Rich header lives entirely inside the DOS stub region; PE
     // signature offset is at 0x3c (e_lfanew). Anything past that is
     // PE proper.
     if bytes.len() < 0x40 {
-        return;
+        return None;
     }
-    let Some(e_lfanew) = u32_le(bytes, 0x3c) else {
-        return;
-    };
-    let e_lfanew = e_lfanew as usize;
-    let scan_end = e_lfanew.min(bytes.len());
+    let scan_end = (u32_le(bytes, 0x3c)? as usize).min(bytes.len());
     if scan_end < 8 {
-        return;
+        return None;
     }
-
-    let Some(rich_pos) = bytes.get(..scan_end).and_then(find_rich_marker) else {
-        return;
-    };
+    let rich_pos = find_rich_marker(bytes.get(..scan_end)?)?;
     // Need at least 4 bytes after the marker for the XOR key.
-    let Some(key) = u32_le(bytes, rich_pos + 4) else {
+    let key = u32_le(bytes, rich_pos + 4)?;
+    let dans_pos = (1..=rich_pos / 4)
+        .map(|words_back| rich_pos - 4 * words_back)
+        .find(|&pos| u32_le(bytes, pos).is_some_and(|raw| raw ^ key == DANS_MARKER));
+    Some(RichLocation {
+        rich_pos,
+        key,
+        dans_pos,
+    })
+}
+
+/// Find and decode the Rich header in `bytes`, populating
+/// `pe.rich.*` keys. No-op when the binary has no Rich header, or the
+/// `Rich` magic is present without a decodable table.
+pub(super) fn extract(bytes: &[u8], values: &mut Values) {
+    let Some(RichLocation {
+        rich_pos,
+        key,
+        dans_pos: Some(dans_pos),
+    }) = locate(bytes)
+    else {
         return;
     };
-
-    // Walk backwards in 4-byte words until we find the XOR-encoded
-    // DanS marker.
-    let mut words = Vec::new();
-    let mut pos = rich_pos;
-    while pos >= 4 {
-        pos -= 4;
-        let Some(raw) = u32_le(bytes, pos) else {
-            return;
-        };
-        let decoded = raw ^ key;
-        if decoded == DANS_MARKER {
-            words.reverse();
-            let Some(raw_table) = bytes.get(pos..rich_pos) else {
-                return;
-            };
-            return emit(&words, key, raw_table, values);
-        }
-        words.push(decoded);
-    }
-    // No DanS marker found — silently skip; this isn't a valid Rich
-    // header even though the `Rich` magic was present.
+    let (Some(raw_table), Some(encoded)) = (
+        bytes.get(dans_pos..rich_pos),
+        bytes.get(dans_pos + 4..rich_pos),
+    ) else {
+        return;
+    };
+    // The decoded words after DanS, in file order.
+    let words: Vec<u32> = encoded
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_le_bytes(*word) ^ key)
+        .collect();
+    emit(&words, key, raw_table, values);
 }
 
 fn emit(words: &[u32], key: u32, raw_table: &[u8], values: &mut Values) {
@@ -160,6 +178,30 @@ mod tests {
         // Different key changes the digest.
         let h3 = rich_md5(bytes, 0xcafe_babe);
         assert_ne!(h1, h3);
+    }
+
+    /// `locate` is the one Rich scan: `extract` decodes a located table and
+    /// `goblin_safe` neutralises a marker that has none.
+    #[test]
+    fn locate_drives_extract_and_the_goblin_neutraliser() {
+        let bytes = std::fs::read("tests/fixtures/test.exe").expect("test.exe fixture");
+        let rich = locate(&bytes).expect("MSVC fixture has a Rich header");
+        let dans = rich.dans_pos.expect("and a decodable table");
+        assert_eq!(rich.key, 110_128_735);
+        assert!(crate::formats::goblin_safe::neutralize_malformed_rich_header(&bytes).is_none());
+
+        // Break the DanS marker: the magic stays, the table is gone.
+        let mut broken = bytes.clone();
+        broken[dans] ^= 0xff;
+        let rich = locate(&broken).expect("marker still present");
+        assert_eq!(rich.dans_pos, None);
+        let mut v = Values::new();
+        extract(&broken, &mut v);
+        assert!(v.is_empty(), "no table, no facts");
+        let patched = crate::formats::goblin_safe::neutralize_malformed_rich_header(&broken)
+            .expect("goblin would reject it");
+        assert_eq!(&patched[rich.rich_pos..rich.rich_pos + 4], &[0, 0, 0, 0]);
+        assert!(locate(&patched).is_none_or(|r| r.rich_pos != rich.rich_pos));
     }
 
     #[test]

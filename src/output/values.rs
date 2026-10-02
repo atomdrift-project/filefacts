@@ -25,21 +25,20 @@ use super::value_keys::ValueKey;
 /// which manifest format they're looking at.
 ///
 /// Every key filefacts writes is declared in
-/// [`VALUE_CATALOG`](crate::VALUE_CATALOG) and written through
-/// [`Self::insert_key`] with [`value_key!`](crate::value_key). A reader in
-/// another module goes through [`Self::get_key`], so a rename on either side
-/// fails the build instead of silently emptying the reader.
+/// [`VALUE_CATALOG`](crate::VALUE_CATALOG) and written through a key checked
+/// against it at compile time, so a rename fails filefacts' build instead of
+/// silently emptying a reader. The view is read-only outside filefacts.
 ///
 /// # Example
 ///
 /// ```
-/// # use serde_json::json;
-/// # use filefacts::Values;
-/// let mut v = Values::new();
-/// v.insert("pe.coff.machine", json!("x86_64"));
-/// v.insert("pe.coff.timestamp_unix", json!(1_700_000_000_i64));
-///
-/// assert_eq!(v.get("pe.coff.machine").and_then(|x| x.as_str()), Some("x86_64"));
+/// let bytes = br#"{"scripts": {"postinstall": "node setup.js"}}"#;
+/// let parsed = filefacts::OpenOptions::new()
+///     .path(std::path::Path::new("config.json"))
+///     .rizin(false)
+///     .open(bytes);
+/// let script = parsed.values().get("scripts.postinstall");
+/// assert_eq!(script.and_then(|x| x.as_str()), Some("node setup.js"));
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -76,7 +75,7 @@ impl Values {
     /// The path is unchecked, so filefacts' own extractors use
     /// [`Self::insert_key`] instead, and a unit test rejects calls to this
     /// method outside tests.
-    pub fn insert(&mut self, path: &str, value: JsonValue) {
+    pub(crate) fn insert(&mut self, path: &str, value: JsonValue) {
         let JsonValue::Object(ref mut root) = self.0 else {
             self.0 = JsonValue::Object(Map::new());
             return self.insert(path, value);
@@ -94,7 +93,7 @@ impl Values {
     /// [`Self::insert`] for a catalog-checked key:
     /// `values.insert_key(value_key!("…"), v)` fails to build on a key that
     /// is not declared, where `insert` would write it unchecked.
-    pub fn insert_key(&mut self, key: ValueKey, value: JsonValue) {
+    pub(crate) fn insert_key(&mut self, key: ValueKey, value: JsonValue) {
         self.insert(key.as_str(), value);
     }
 
@@ -102,7 +101,7 @@ impl Values {
     /// `<key>.<rest>`, for a key whose tail is data (a field name read from
     /// the file). `rest` follows the same rules as a path given to
     /// [`Self::insert`].
-    pub fn insert_key_at(&mut self, key: ValueKey, rest: &str, value: JsonValue) {
+    pub(crate) fn insert_key_at(&mut self, key: ValueKey, rest: &str, value: JsonValue) {
         self.insert(&format!("{key}.{rest}"), value);
     }
 

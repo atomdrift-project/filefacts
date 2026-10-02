@@ -6,6 +6,25 @@
 //! [`Reader`] is the sequential form for a structure laid out field after
 //! field.
 
+/// A file-supplied size or offset as a `usize`, saturating at `usize::MAX`.
+///
+/// On 64-bit hosts this is the identity for `u32`/`u64`. On 32-bit hosts a
+/// value past the address space becomes `usize::MAX`, so the bounds check or
+/// `checked_add` that follows fails, instead of a truncating `as` cast
+/// wrapping a hostile 64-bit offset into a small, valid-looking one. A
+/// negative signed value also saturates: it is never a valid size.
+#[inline]
+pub(crate) fn sat_usize<T: TryInto<usize>>(v: T) -> usize {
+    v.try_into().unwrap_or(usize::MAX)
+}
+
+/// A length or count as a `u32` metric field, saturating at `u32::MAX`
+/// rather than wrapping.
+#[inline]
+pub(crate) fn sat_u32<T: TryInto<u32>>(v: T) -> u32 {
+    v.try_into().unwrap_or(u32::MAX)
+}
+
 /// Read the `N` bytes at `off`.
 #[inline]
 fn array_at<const N: usize>(b: &[u8], off: usize) -> Option<[u8; N]> {
@@ -40,6 +59,52 @@ pub(crate) fn u64_le(b: &[u8], off: usize) -> Option<u64> {
 #[inline]
 pub(crate) fn u64_be(b: &[u8], off: usize) -> Option<u64> {
     array_at(b, off).map(u64::from_be_bytes)
+}
+
+/// Byte order of the code units in a UTF-16 run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Endian {
+    Little,
+    Big,
+}
+
+/// The UTF-16 code units of `buf` in `endian` order. A trailing odd byte is
+/// not a whole unit and is ignored.
+pub(crate) fn utf16_units(buf: &[u8], endian: Endian) -> impl Iterator<Item = u16> + '_ {
+    buf.as_chunks::<2>()
+        .0
+        .iter()
+        .map(move |&pair| match endian {
+            Endian::Little => u16::from_le_bytes(pair),
+            Endian::Big => u16::from_be_bytes(pair),
+        })
+}
+
+/// Decode `buf` as UTF-16, replacing each unpaired surrogate with U+FFFD.
+/// A trailing odd byte is ignored.
+pub(crate) fn utf16_lossy(buf: &[u8], endian: Endian) -> String {
+    char::decode_utf16(utf16_units(buf, endian))
+        .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect()
+}
+
+/// Decode `buf` as UTF-16, or `None` if it holds an unpaired surrogate.
+/// A trailing odd byte is ignored.
+pub(crate) fn utf16_strict(buf: &[u8], endian: Endian) -> Option<String> {
+    char::decode_utf16(utf16_units(buf, endian))
+        .collect::<Result<_, _>>()
+        .ok()
+}
+
+/// The whole UTF-16 units of `buf` before the first NUL unit; all of them
+/// when there is none. A NUL unit is two zero bytes in either byte order.
+pub(crate) fn utf16_until_nul(buf: &[u8]) -> &[u8] {
+    let units = buf.as_chunks::<2>().0;
+    let len = units
+        .iter()
+        .position(|u| *u == [0, 0])
+        .unwrap_or(units.len());
+    buf.get(..len * 2).unwrap_or_default()
 }
 
 /// A forward cursor over untrusted bytes.
@@ -145,6 +210,44 @@ mod tests {
     use super::*;
 
     const BUF: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+
+    #[test]
+    fn utf16_decodes_both_byte_orders_and_ignores_an_odd_tail() {
+        assert_eq!(utf16_lossy(b"h\0i\0!", Endian::Little), "hi");
+        assert_eq!(utf16_lossy(b"\0h\0i", Endian::Big), "hi");
+        assert_eq!(
+            utf16_strict(b"h\0i\0", Endian::Little).as_deref(),
+            Some("hi")
+        );
+        assert_eq!(utf16_lossy(b"", Endian::Big), "");
+        // U+1F600 as a surrogate pair.
+        assert_eq!(
+            utf16_lossy(&[0x3d, 0xd8, 0x00, 0xde], Endian::Little),
+            "\u{1F600}"
+        );
+    }
+
+    #[test]
+    fn utf16_lossy_replaces_unpaired_surrogates_and_strict_rejects_them() {
+        let lone = [b'a', 0, 0x00, 0xd8, b'b', 0];
+        assert_eq!(utf16_lossy(&lone, Endian::Little), "a\u{FFFD}b");
+        assert_eq!(utf16_strict(&lone, Endian::Little), None);
+        // Identical to the std decoders they replace.
+        let units: Vec<u16> = utf16_units(&lone, Endian::Little).collect();
+        assert_eq!(
+            utf16_lossy(&lone, Endian::Little),
+            String::from_utf16_lossy(&units)
+        );
+    }
+
+    #[test]
+    fn utf16_until_nul_stops_at_a_whole_zero_unit() {
+        assert_eq!(utf16_until_nul(b"a\0b\0\0\0c\0"), b"a\0b\0");
+        // The zero bytes straddling two units are not a NUL unit.
+        assert_eq!(utf16_until_nul(b"a\0\0b"), b"a\0\0b");
+        assert_eq!(utf16_until_nul(b"a\0b"), b"a\0");
+        assert_eq!(utf16_until_nul(b"\0\0a\0"), b"");
+    }
 
     #[test]
     fn offset_reads_decode_both_byte_orders() {
@@ -274,5 +377,16 @@ mod tests {
         assert_eq!(r.pos(), 1);
         // The failed reads left the cursor on the bytes they could not take.
         assert_eq!(r.u8(), Some(0x02));
+    }
+
+    #[test]
+    fn sat_usize_saturates_instead_of_truncating() {
+        assert_eq!(sat_usize(0), 0);
+        assert_eq!(sat_usize(4096), 4096);
+        assert_eq!(sat_usize(u64::MAX), usize::MAX);
+        assert_eq!(sat_usize(7_u32), 7);
+        assert_eq!(sat_usize(-1_i64), usize::MAX);
+        assert_eq!(sat_u32(12_usize), 12);
+        assert_eq!(sat_u32(u64::MAX), u32::MAX);
     }
 }

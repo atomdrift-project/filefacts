@@ -1,4 +1,5 @@
 use super::*;
+use crate::output::Strings;
 
 #[test]
 fn rt_name_known() {
@@ -102,22 +103,14 @@ fn subsystem_string_known_values() {
 }
 
 fn run(bytes: &[u8]) -> (Values, Strings, Metrics) {
-    let mut v = Values::new();
-    let mut s = Strings::default();
-    let mut m = Metrics::new();
-    let mut sections = Vec::new();
-    let mut symbols = crate::Symbols::new();
-    let mut errors = Errors::new();
-    let _ = extract(
-        bytes,
-        &mut v,
-        &mut s,
-        &mut m,
-        &mut sections,
-        &mut symbols,
-        &mut errors,
-        &crate::rizin::Settings::default(),
-    );
+    let mut out = crate::formats::Sinks::default();
+    let _ = extract(bytes, out.ctx());
+    let crate::formats::Sinks {
+        values: v,
+        strings: s,
+        metrics: m,
+        ..
+    } = out;
     (v, s, m)
 }
 
@@ -357,6 +350,144 @@ fn rt_name_covers_canonical_resource_types() {
     assert_eq!(rt_name(14), "RT_GROUP_ICON");
 }
 
+/// Every section header pointed at one executable run of `fs:[0x30]` loads:
+/// the bytes are scanned once (not once per header), the count is exact, and
+/// the per-site records stop at the cap with the cap reported.
+#[test]
+fn native_resolver_scan_clips_overlapping_sections_and_caps_sites() {
+    const NEEDLE: &[u8] = b"\x64\xa1\x30\x00\x00\x00";
+    const MATCHES: usize = MAX_NATIVE_SITES + 904;
+    let mut bytes = read_fixture("test.exe");
+    let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    let coff = pe_offset + 4;
+    let count = u16::from_le_bytes(bytes[coff + 2..coff + 4].try_into().unwrap()) as usize;
+    let size_of_optional = u16::from_le_bytes(bytes[coff + 16..coff + 18].try_into().unwrap());
+    let table = coff + 20 + size_of_optional as usize;
+    let region = bytes.len().next_multiple_of(0x200);
+    let len = NEEDLE.len() * MATCHES;
+    bytes.resize(region, 0);
+    bytes.extend(NEEDLE.iter().copied().cycle().take(len));
+    for i in 0..count {
+        let header = table + i * 40;
+        bytes[header + 16..header + 20].copy_from_slice(&(len as u32).to_le_bytes());
+        bytes[header + 20..header + 24].copy_from_slice(&(region as u32).to_le_bytes());
+        bytes[header + 36..header + 40].copy_from_slice(&0x6000_0020_u32.to_le_bytes());
+    }
+    assert!(
+        count > 1,
+        "the fixture must have overlapping headers to clip"
+    );
+
+    let pe = PE::parse_with_opts(
+        &bytes,
+        &goblin::pe::options::ParseOptions::default()
+            .with_parse_mode(goblin::options::ParseMode::Permissive)
+            .with_parse_imports(false),
+    )
+    .expect("forged fixture parses");
+    let mut values = Values::new();
+    let mut metrics = Metrics::new();
+    native_resolver_signals(&pe, &bytes, &mut values, &mut metrics);
+    assert_eq!(
+        metrics.get("pe.peb_access_x86_count"),
+        Some(MATCHES as f64),
+        "each byte scanned once despite {count} overlapping headers"
+    );
+    let sites = values
+        .get("pe.peb_access_sites")
+        .and_then(serde_json::Value::as_array)
+        .expect("sites");
+    assert_eq!(sites.len(), MAX_NATIVE_SITES);
+    assert_eq!(metrics.get("pe.native_resolver_sites_capped"), Some(1.0));
+    assert_eq!(
+        sites[1]["file_offset"],
+        serde_json::json!(region + NEEDLE.len())
+    );
+}
+
+/// The single RVA resolver follows the loader: a misaligned
+/// `PointerToRawData` is rounded down to 512, the file-backed extent is the
+/// raw size rounded to the file alignment, and the zero-filled virtual tail
+/// past it has no file offset.
+#[test]
+fn rva_resolution_follows_the_loader() {
+    use goblin::pe::section_table::SectionTable;
+    let text = SectionTable {
+        virtual_address: 0x1000,
+        virtual_size: 0x2000,
+        pointer_to_raw_data: 0x401,
+        size_of_raw_data: 0x100,
+        ..SectionTable::default()
+    };
+    let data = SectionTable {
+        virtual_address: 0x4000,
+        virtual_size: 0,
+        pointer_to_raw_data: 0x800,
+        size_of_raw_data: 0x200,
+        ..SectionTable::default()
+    };
+    let sections = [text, data];
+    let resolve = |rva| section_rva_to_file_offset(&sections, Some(0x200), rva);
+    assert_eq!(resolve(0x1000), Some(0x400), "pointer rounded down to 512");
+    // (0x401 + 0x100) rounded up to 0x200 is 0x600: 0x200 file-backed bytes.
+    assert_eq!(resolve(0x11ff), Some(0x5ff));
+    assert_eq!(resolve(0x1200), None, "virtual-only tail has no file bytes");
+    assert_eq!(resolve(0x2fff), None);
+    // Zero virtual size: the raw extent alone bounds it.
+    assert_eq!(resolve(0x41ff), Some(0x9ff));
+    assert_eq!(resolve(0x4200), None);
+    assert_eq!(resolve(0x0fff), None, "before every section");
+    // An invalid alignment keeps the unrounded raw extent.
+    assert_eq!(
+        section_rva_to_file_offset(&sections, Some(0x300), 0x1100),
+        Some(0x500)
+    );
+    assert_eq!(
+        section_rva_to_file_offset(&sections, Some(0x300), 0x1101),
+        None
+    );
+    // Header values at the top of the range must not overflow.
+    let edge = SectionTable {
+        virtual_address: u32::MAX - 0x10,
+        virtual_size: u32::MAX,
+        pointer_to_raw_data: u32::MAX,
+        size_of_raw_data: u32::MAX,
+        ..SectionTable::default()
+    };
+    assert!(section_rva_to_file_offset(&[edge], Some(0x200), u32::MAX).is_some());
+}
+
+/// The resource facts are derived from ids drained out of goblin's walker,
+/// outside its panic guard: counts, icons, and the deduplicated type list.
+#[test]
+fn resource_types_derive_from_drained_ids() {
+    let mut values = Values::new();
+    let mut metrics = Metrics::new();
+    resource_types(
+        &[Some(16), Some(3), None, Some(14), Some(3), Some(999)],
+        &mut values,
+        &mut metrics,
+    );
+    assert_eq!(metrics.get("pe.resource_count"), Some(6.0));
+    assert_eq!(metrics.get("pe.icon_count"), Some(3.0));
+    assert_eq!(
+        values.get("pe.resource_types"),
+        Some(&serde_json::json!([
+            "RT_ICON",
+            "RT_GROUP_ICON",
+            "RT_VERSION",
+            "RT_UNKNOWN"
+        ]))
+    );
+
+    let mut values = Values::new();
+    let mut metrics = Metrics::new();
+    resource_types(&[], &mut values, &mut metrics);
+    assert_eq!(metrics.get("pe.resource_count"), Some(0.0));
+    assert!(metrics.get("pe.icon_count").is_none());
+    assert!(values.get("pe.resource_types").is_none());
+}
+
 #[test]
 fn empty_input_doesnt_crash() {
     let (_, _, _) = run(&[]);
@@ -430,23 +561,13 @@ fn clr_signed_fixture_reports_strong_name() {
 #[test]
 fn normal_exports_emit_no_forward_to() {
     let bytes = read_fixture("test.exe");
-    let mut v = Values::new();
-    let mut s = Strings::default();
-    let mut m = Metrics::new();
-    let mut sections = Vec::new();
-    let mut symbols = crate::Symbols::new();
-    let mut errors = Errors::new();
-    extract(
-        &bytes,
-        &mut v,
-        &mut s,
-        &mut m,
-        &mut sections,
-        &mut symbols,
-        &mut errors,
-        &crate::rizin::Settings::default(),
-    )
-    .unwrap();
+    let mut out = crate::formats::Sinks::default();
+    extract(&bytes, out.ctx()).unwrap();
+    let crate::formats::Sinks {
+        metrics: m,
+        symbols,
+        ..
+    } = out;
     for sym in symbols.iter_kind(crate::SymbolKind::Export) {
         if let crate::Symbol::Export { forward_to, .. } = sym {
             assert!(
@@ -463,23 +584,9 @@ fn normal_exports_emit_no_forward_to() {
 #[test]
 fn typed_imports_and_exports_populated() {
     let bytes = read_fixture("test.exe");
-    let mut v = Values::new();
-    let mut s = Strings::default();
-    let mut m = Metrics::new();
-    let mut sections = Vec::new();
-    let mut symbols = crate::Symbols::new();
-    let mut errors = Errors::new();
-    extract(
-        &bytes,
-        &mut v,
-        &mut s,
-        &mut m,
-        &mut sections,
-        &mut symbols,
-        &mut errors,
-        &crate::rizin::Settings::default(),
-    )
-    .unwrap();
+    let mut out = crate::formats::Sinks::default();
+    extract(&bytes, out.ctx()).unwrap();
+    let symbols = out.symbols;
     let imports: Vec<&crate::Symbol> = symbols.iter_kind(crate::SymbolKind::Import).collect();
     assert!(!imports.is_empty(), "expected at least one PE import");
     for sym in imports {

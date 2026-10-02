@@ -28,7 +28,6 @@
 use crate::metric;
 use serde_json::{Value as JsonValue, json};
 
-use crate::error::Error;
 use crate::formats::common::{
     XorScan, bytes_at, extract_binary_strings, format_guid, put_str, put_u64,
 };
@@ -71,13 +70,13 @@ pub(super) fn extract(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
-) -> Result<(), Error> {
+) {
     extract_binary_strings(bytes, strings, XorScan::No);
 
     // Header is exactly 76 bytes; first 4 bytes are its self-described
     // length.
     if bytes.len() < 76 || !bytes.starts_with(LNK_MAGIC) {
-        return Ok(());
+        return;
     }
 
     let link_flags = bytes_at::u32_le(bytes, 20).unwrap_or(0);
@@ -86,7 +85,7 @@ pub(super) fn extract(
     let access_time = bytes_at::u64_le(bytes, 36).unwrap_or(0);
     let write_time = bytes_at::u64_le(bytes, 44).unwrap_or(0);
     let file_size = bytes_at::u32_le(bytes, 52).unwrap_or(0);
-    let icon_index = bytes_at::u32_le(bytes, 56).map_or(0, |v| v as i32);
+    let icon_index = bytes_at::u32_le(bytes, 56).map_or(0, u32::cast_signed);
     let show_command = bytes_at::u32_le(bytes, SHOW_COMMAND_OFFSET).unwrap_or(0);
     let hotkey = bytes_at::u16_le(bytes, 64).unwrap_or(0);
 
@@ -348,16 +347,14 @@ pub(super) fn extract(
         );
     }
     metrics.insert(metric!("lnk.file_size"), f64::from(file_size));
-
-    Ok(())
 }
 
 /// Compute whitespace-obfuscation counts over an LNK argument
 /// string and emit them under `lnk.arguments_*`. Trait rules read these
 /// raw counts and pick their own thresholds (e.g. the CVE-2025-9491
-/// "interpreter padding" composite uses `arguments_max_whitespace_run
-/// >= 50` plus `arguments_whitespace_count >= 100`). No derived
-/// decisions live here.
+/// "interpreter padding" composite uses
+/// `arguments_max_whitespace_run >= 50` plus
+/// `arguments_whitespace_count >= 100`). No derived decisions live here.
 fn emit_argument_whitespace_metrics(metrics: &mut Metrics, args: &str) {
     let mut leading_spaces = 0usize;
     let mut leading_tabs = 0usize;
@@ -581,13 +578,7 @@ fn read_stringdata(bytes: &[u8], offset: usize, is_unicode: bool) -> Option<(Str
     // CVE-2025-9491-style argument-padding obfuscation, which the
     // whitespace metrics are specifically designed to catch.
     let decoded = if is_unicode {
-        let words: Vec<u16> = body
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        String::from_utf16_lossy(&words)
+        bytes_at::utf16_lossy(body, bytes_at::Endian::Little)
     } else {
         String::from_utf8_lossy(body).into_owned()
     };
@@ -597,16 +588,10 @@ fn read_stringdata(bytes: &[u8], offset: usize, is_unicode: bool) -> Option<(Str
 /// Read a fixed-length UTF-16LE NUL-terminated string starting
 /// at `offset`. Stops at the first 0-word.
 fn read_utf16le_string(bytes: &[u8], offset: usize, len: usize) -> Option<String> {
-    let slice = bytes.get(offset..offset + len)?;
-    let mut words = Vec::new();
-    for c in slice.as_chunks::<2>().0 {
-        let w = u16::from_le_bytes([c[0], c[1]]);
-        if w == 0 {
-            break;
-        }
-        words.push(w);
-    }
-    let s = String::from_utf16_lossy(&words).trim().to_string();
+    let slice = bytes.get(offset..offset.checked_add(len)?)?;
+    let s = bytes_at::utf16_lossy(bytes_at::utf16_until_nul(slice), bytes_at::Endian::Little)
+        .trim()
+        .to_string();
     (!s.is_empty()).then_some(s)
 }
 
@@ -804,14 +789,7 @@ fn read_utf16le_cstring(buf: &[u8], offset: usize) -> Option<String> {
         return None;
     }
     let rest = buf.get(offset..).filter(|r| r.len() >= 2)?;
-    let units: Vec<u16> = rest
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u16::from_le_bytes(*pair))
-        .take_while(|&u| u != 0)
-        .collect();
-    String::from_utf16(&units).ok()
+    bytes_at::utf16_strict(bytes_at::utf16_until_nul(rest), bytes_at::Endian::Little)
 }
 
 /// Minimal IDList walker (MS-SHLLINK §2.2 + MS-SHLLINK Item ID Lists).

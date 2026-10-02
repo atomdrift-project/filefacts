@@ -24,7 +24,6 @@ use std::io::{Read, Seek};
 
 use serde_json::Value as JsonValue;
 
-use crate::error::Error;
 use crate::formats::common::{XorScan, extract_binary_strings, put_str};
 use crate::output::{Errors, Metrics, Stage, Strings, Values};
 use crate::value_key;
@@ -42,32 +41,26 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     strings: &mut Strings,
     metrics: &mut Metrics,
     errors: &mut Errors,
-) -> Result<(), Error> {
+) {
     const NAME: &str = "extension.vsixmanifest";
-    let member = match zip.by_name(NAME) {
-        Ok(member) => member,
-        Err(::zip::result::ZipError::FileNotFound) => return Ok(()),
+    let buf = match super::zip::read_member(zip, NAME, MAX_MANIFEST) {
+        Ok(Some(buf)) => buf,
+        Ok(None) => return,
+        Err(super::zip::MemberError::TooLarge { max }) => {
+            super::bounded::push_limit(
+                values,
+                value_key!("vsix.limits"),
+                "manifest",
+                format!("{NAME} over the {max}-byte cap; not parsed"),
+            );
+            return;
+        }
         Err(e) => {
             errors.record_malformed(Stage::ZipParse, format!("{NAME}: {e}"));
-            return Ok(());
+            return;
         }
     };
-    let mut buf = Vec::new();
-    if let Err(e) = member.take(MAX_MANIFEST + 1).read_to_end(&mut buf) {
-        errors.record_malformed(Stage::ZipParse, format!("{NAME}: {e}"));
-        return Ok(());
-    }
-    if buf.len() as u64 > MAX_MANIFEST {
-        values.insert_key(
-            value_key!("vsix.limits"),
-            serde_json::json!([{
-                "stage": "manifest",
-                "reason": format!("{NAME} over the {MAX_MANIFEST}-byte cap; not parsed"),
-            }]),
-        );
-        return Ok(());
-    }
-    extract(&buf, values, strings, metrics, errors)
+    extract(&buf, values, strings, metrics, errors);
 }
 
 pub(super) fn extract(
@@ -76,7 +69,7 @@ pub(super) fn extract(
     strings: &mut Strings,
     metrics: &mut Metrics,
     errors: &mut Errors,
-) -> Result<(), Error> {
+) {
     extract_binary_strings(bytes, strings, XorScan::No);
 
     let text = match std::str::from_utf8(bytes) {
@@ -86,7 +79,7 @@ pub(super) fn extract(
                 Stage::FormatExtract,
                 format!("extension.vsixmanifest: not UTF-8: {e}"),
             );
-            return Ok(());
+            return;
         }
     };
     // Strip a UTF-8 BOM if present — `<PackageManifest>` won't parse
@@ -96,7 +89,7 @@ pub(super) fn extract(
         Ok(doc) => doc,
         Err(e) => {
             errors.record_malformed(Stage::FormatExtract, format!("extension.vsixmanifest: {e}"));
-            return Ok(());
+            return;
         }
     };
 
@@ -221,8 +214,6 @@ pub(super) fn extract(
         metrics.insert(metric!("vsix.asset_count"), assets.len() as f64);
         values.insert_key(value_key!("vsix.assets"), JsonValue::Array(assets));
     }
-
-    Ok(())
 }
 
 /// Shorten the verbose `Microsoft.VisualStudio.<area>.<name>` property
@@ -248,7 +239,7 @@ mod tests {
         let mut s = Strings::default();
         let mut m = Metrics::new();
         let mut e = Errors::new();
-        extract(text, &mut v, &mut s, &mut m, &mut e).unwrap();
+        extract(text, &mut v, &mut s, &mut m, &mut e);
         (v, m, e)
     }
 
@@ -274,13 +265,12 @@ mod tests {
             &mut Strings::default(),
             &mut Metrics::new(),
             &mut e,
-        )
-        .unwrap();
+        );
         (v, e)
     }
 
     /// The one recorded error's stage and kind.
-    fn only_error(errors: &Errors) -> (Stage, crate::ErrorKind) {
+    fn only_error(errors: &Errors) -> (Stage, crate::DiagnosticKind) {
         assert_eq!(errors.len(), 1, "{errors:?}");
         (errors.as_slice()[0].stage, errors.as_slice()[0].kind)
     }
@@ -293,7 +283,7 @@ mod tests {
         )]));
         assert_eq!(
             only_error(&e),
-            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+            (Stage::FormatExtract, crate::DiagnosticKind::Malformed)
         );
         assert!(v.get("vsix.identity").is_none());
         assert!(v.get("vsix.limits").is_none());
@@ -328,7 +318,7 @@ mod tests {
         let (_, _, e) = run_with_errors(b"<PackageManifest>\xff</PackageManifest>");
         assert_eq!(
             only_error(&e),
-            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+            (Stage::FormatExtract, crate::DiagnosticKind::Malformed)
         );
     }
 
@@ -399,7 +389,7 @@ mod tests {
         assert!(v.get("vsix.identity").is_none());
         assert_eq!(
             only_error(&e),
-            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+            (Stage::FormatExtract, crate::DiagnosticKind::Malformed)
         );
     }
 
@@ -480,7 +470,7 @@ mod tests {
         assert!(m.get("vsix.property_count").is_none());
         assert_eq!(
             only_error(&e),
-            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+            (Stage::FormatExtract, crate::DiagnosticKind::Malformed)
         );
     }
 
@@ -491,7 +481,7 @@ mod tests {
         assert!(v.get("vsix.identity").is_none());
         assert_eq!(
             only_error(&e),
-            (Stage::FormatExtract, crate::ErrorKind::Malformed)
+            (Stage::FormatExtract, crate::DiagnosticKind::Malformed)
         );
     }
 }
