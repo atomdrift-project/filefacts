@@ -146,7 +146,24 @@ fn lexer_fetch_budget(bytes: usize) -> u64 {
 /// concatenated without regard for syntax can stay in recovery for good, and
 /// are cut off here too. C and Objective-C are exempt; see
 /// [`error_recovery_cap`].
+///
+/// Polls at the end of the input are not counted against this cap but against
+/// [`EOF_RECOVERY_FLOOR`]: see [`RecoveryWatch`].
 const ERROR_RECOVERY_POLL_CAP: u64 = 256;
+
+/// The fewest error-recovery polls the parser may spend at the end of the
+/// input, wrapping up a tree with constructs it never recovered.
+///
+/// That wrap-up is one long run of error polls even for valid source: a
+/// 550 KB TypeScript declaration file that the grammar half-understands spends
+/// 1,968 polls there after 4,946 reaching the end, and the run cap would throw
+/// its whole tree away. So the wrap-up is bounded by the work that came before
+/// it instead — at most as many recovery polls as the polls taken to reach the
+/// end, and at least this many — which keeps the parse to roughly twice the cost
+/// of reading its input. Token soup that recovers nowhere spends several times
+/// its reading cost there (about 9,700 polls after 680 for 2 MB of random
+/// TypeScript tokens) and is still cut off.
+const EOF_RECOVERY_FLOOR: u64 = 1024;
 
 /// The consecutive error-recovery polls allowed for `file_type`, or `None`
 /// for no cap. C and Objective-C share `.h` headers with C++, which their
@@ -179,8 +196,59 @@ const ANONYMOUS_RUN_MIN: u64 = 16;
 /// less.
 const ANONYMOUS_RUN_COST_CAP: u64 = 1 << 24;
 
+/// Tracks error recovery across a parse's progress polls and says when it has
+/// gone on too long: [`ERROR_RECOVERY_POLL_CAP`] consecutive polls before the
+/// end of the input, or [`EOF_RECOVERY_FLOOR`]-or-more polls at it. Every input
+/// is a poll count, so the same bytes always stop at the same poll.
+#[derive(Debug)]
+struct RecoveryWatch {
+    /// The consecutive-poll cap, or `None` when recovery is not limited.
+    cap: Option<u64>,
+    /// Consecutive polls with every stack version recovering, before the end.
+    run: u64,
+    /// Polls it took to reach the end of the input, once it has.
+    reached_end: Option<u64>,
+    /// Polls in error recovery since reaching the end.
+    end_run: u64,
+}
+
+impl RecoveryWatch {
+    fn new(cap: Option<u64>) -> Self {
+        Self {
+            cap,
+            run: 0,
+            reached_end: None,
+            end_run: 0,
+        }
+    }
+
+    /// Record poll number `poll` (counted from 1), and return why the parse
+    /// must stop, if it must. `recovering` is whether every stack version is in
+    /// error recovery; `at_end` whether the parser has reached the end of the
+    /// input.
+    fn poll(&mut self, poll: u64, recovering: bool, at_end: bool, at: usize) -> Option<ParseStop> {
+        let cap = self.cap?;
+        if at_end && self.reached_end.is_none() {
+            self.reached_end = Some(poll.saturating_sub(1));
+        }
+        if let Some(reached) = self.reached_end {
+            self.end_run += u64::from(recovering);
+            let allowed = reached.max(EOF_RECOVERY_FLOOR);
+            return (self.end_run > allowed).then_some(ParseStop::EofRecovery {
+                polls: self.end_run,
+                allowed,
+            });
+        }
+        self.run = if recovering { self.run + 1 } else { 0 };
+        (self.run > cap).then_some(ParseStop::ErrorRecovery {
+            polls: self.run,
+            at,
+        })
+    }
+}
+
 /// Why the progress callback abandoned a parse.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ParseStop {
     /// The caller raised its cancellation flag.
     Cancelled,
@@ -191,6 +259,9 @@ enum ParseStop {
     /// Every stack version stayed in error recovery for `polls` consecutive
     /// polls, the parser having reached byte `at`.
     ErrorRecovery { polls: u64, at: usize },
+    /// Wrapping up at the end of the input took more than `allowed`
+    /// error-recovery polls.
+    EofRecovery { polls: u64, allowed: u64 },
     /// [`SOURCE_PARSE_WALL_BACKSTOP`] elapsed first.
     Backstop,
 }
@@ -371,6 +442,21 @@ impl TreeSitterDiagnostic {
         }
     }
 
+    fn eof_recovery_exhausted(
+        language: &'static str,
+        bytes: usize,
+        polls: u64,
+        allowed: u64,
+    ) -> Self {
+        Self {
+            metric: metric!("source.ast_unavailable.parse_timeout"),
+            message: format!(
+                "tree-sitter parse for {language} abandoned at the end of its {bytes} bytes: error recovery there ran {polls} progress polls, more than the {allowed} allowed"
+            ),
+            transient: false,
+        }
+    }
+
     /// Same metric as [`Self::parse_work_exhausted`], for the
     /// [`SOURCE_PARSE_WALL_BACKSTOP`]; whether this fires can depend on load.
     fn parse_backstop(language: &'static str, bytes: usize) -> Self {
@@ -457,8 +543,7 @@ impl<'a> TreeCache<'a> {
             let deadline = Instant::now() + SOURCE_PARSE_WALL_BACKSTOP;
             let polls = Cell::new(0u64);
             let stop = Cell::new(None);
-            let recovery_cap = error_recovery_cap(file_type);
-            let recovery_run = Cell::new(0u64);
+            let mut recovery = RecoveryWatch::new(error_recovery_cap(file_type));
             let fetch_budget = lexer_fetch_budget(source.len());
             let fetched = Cell::new(0u64);
             let mut progress = |state: &tree_sitter::ParseState| -> ControlFlow<()> {
@@ -482,17 +567,11 @@ impl<'a> TreeCache<'a> {
                 }
                 // `has_error` is set only while every stack version is
                 // recovering; any healthy version resets the run.
-                recovery_run.set(if state.has_error() {
-                    recovery_run.get() + 1
-                } else {
-                    0
-                });
-                if recovery_cap.is_some_and(|cap| recovery_run.get() > cap) {
-                    let at = state.current_byte_offset();
-                    stop.set(Some(ParseStop::ErrorRecovery {
-                        polls: recovery_run.get(),
-                        at,
-                    }));
+                let at = state.current_byte_offset();
+                if let Some(why) =
+                    recovery.poll(polls.get(), state.has_error(), at >= source.len(), at)
+                {
+                    stop.set(Some(why));
                     return ControlFlow::Break(());
                 }
                 if Instant::now() >= deadline {
@@ -579,6 +658,16 @@ impl<'a> TreeCache<'a> {
                             "tree-sitter error recovery did not recover; AST facts dropped"
                         );
                         TreeSitterDiagnostic::error_recovery_exhausted(language, bytes, polls, at)
+                    }
+                    Some(ParseStop::EofRecovery { polls, allowed }) => {
+                        tracing::warn!(
+                            language,
+                            bytes,
+                            polls,
+                            allowed,
+                            "tree-sitter error recovery at end of input ran too long; AST facts dropped"
+                        );
+                        TreeSitterDiagnostic::eof_recovery_exhausted(language, bytes, polls, allowed)
                     }
                     Some(ParseStop::Backstop) => {
                         tracing::warn!(

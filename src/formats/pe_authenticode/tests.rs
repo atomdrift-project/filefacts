@@ -809,6 +809,74 @@ fn chain_anchors_at_a_pinned_root() {
     assert_eq!(super::walk_chain(&bag.certs(), leaf, &[]).anchor, None);
 }
 
+/// A real SHA-1-era Microsoft signature (mfc100.dll 10.00.30319.01): the
+/// leaf under "Microsoft Code Signing PCA", which the 1997 "Microsoft Root
+/// Authority" issued. The root is not in the bag.
+const MICROSOFT_1997: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/authenticode-microsoft-root-authority-1997.p7b"
+));
+const MICROSOFT_ROOT_AUTHORITY_1997: &str =
+    "f38406e540d7a9d90cb4a9479299640ffb6df9e224ecc7a01c0d9558d8dad77d";
+
+/// The 1997 root has no extensions at all, so no BasicConstraints. Pinned,
+/// it still closes the chain, and the countersignature's chain, as an anchor.
+#[test]
+fn sha1_era_microsoft_chains_anchor_at_the_1997_root() {
+    let sig = parse(MICROSOFT_1997);
+    assert_eq!(sig["verified"], true);
+    assert_eq!(sig["chain_anchor"], "microsoft");
+    let chain = chain(&sig);
+    assert_eq!(chain.len(), 3);
+    assert_eq!(chain.last(), Some(&MICROSOFT_ROOT_AUTHORITY_1997));
+    let timestamp_chain: Vec<_> = sig["timestamp_chain_sha256"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap())
+        .collect();
+    assert_eq!(timestamp_chain.last(), Some(&MICROSOFT_ROOT_AUTHORITY_1997));
+}
+
+/// Only a pinned anchor is exempt from the issuing constraints: the same
+/// extension-less root carried in the bag, unpinned, cannot issue.
+#[test]
+fn an_unpinned_certificate_without_basic_constraints_cannot_issue() {
+    use der::Decode;
+    let root = super::PINNED_ROOTS
+        .iter()
+        .find(|r| r.thumbprint == MICROSOFT_ROOT_AUTHORITY_1997)
+        .map(|r| r.cert.clone())
+        .unwrap();
+    let blob = trim_to_der_object(MICROSOFT_1997).unwrap();
+    let content = cms::content_info::ContentInfo::from_der(blob).unwrap();
+    let signed: cms::signed_data::SignedData = content.content.decode_as().unwrap();
+    let mut certs: Vec<x509_cert::Certificate> = signed
+        .certificates
+        .iter()
+        .flat_map(|set| set.0.iter())
+        .filter_map(|choice| match choice {
+            cms::cert::CertificateChoices::Certificate(c) => Some(c.clone()),
+            _ => None,
+        })
+        .collect();
+    let leaf = certs
+        .iter()
+        .find(|c| {
+            c.tbs_certificate
+                .subject
+                .to_string()
+                .starts_with("CN=Microsoft Corporation,OU=MOPR")
+        })
+        .cloned()
+        .unwrap();
+    certs.push(root);
+    let bag: Vec<_> = certs.iter().collect();
+    let chain = super::walk_chain(&bag, &leaf, &[]);
+    assert_eq!(chain.anchor, None);
+    assert_eq!(chain.thumbprints.len(), 2, "stops at the PCA");
+}
+
 /// The roots shipped in the binary parse, and are the certificates their
 /// vendors publish (SHA-256 thumbprints as Microsoft and Apple list them).
 #[test]
@@ -821,6 +889,10 @@ fn pinned_roots_are_the_published_certificates() {
     assert_eq!(
         thumbprints,
         [
+            (
+                Microsoft,
+                "f38406e540d7a9d90cb4a9479299640ffb6df9e224ecc7a01c0d9558d8dad77d"
+            ),
             (
                 Microsoft,
                 "885de64c340e3ea70658f01e1145f957fcda27aabeea1ab9faa9fdb0102d4077"

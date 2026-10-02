@@ -269,10 +269,17 @@ fn pe(values: &Values, id: &mut Identity) {
         id.version = Some(Claim::claimed(version, "pe.version.file_version"));
     }
 
-    if let Some(ci) = values
-        .get_key_at(value_key!("pe.signatures"), "[0]")
-        .and_then(cert_from_obj)
-    {
+    let signature = values.get_key_at(value_key!("pe.signatures"), "[0]");
+    if let Some(mut ci) = signature.and_then(cert_from_obj) {
+        // A signature says nothing about this file unless the image hash it
+        // signed is this file's own: one grafted from another binary verifies
+        // perfectly while covering that binary. An absent comparison is not a
+        // match either, since the Authentihash can be skipped
+        // (`pe.image_hash_skipped`).
+        ci.verified &= signature
+            .and_then(|s| s.get("digest_matches"))
+            .and_then(JsonValue::as_bool)
+            == Some(true);
         // A verified signer certificate outranks the self-asserted
         // CompanyName for the organization field.
         if let Some(o) = &ci.o {
@@ -295,10 +302,14 @@ fn pe(values: &Values, id: &mut Identity) {
 /// CFHEADER carries no publisher, product or version field. The signature blob
 /// is published in the PE `signatures[0]` shape, so the mapping is the PE one.
 fn cab(values: &Values, id: &mut Identity) {
-    if let Some(ci) = values
+    if let Some(mut ci) = values
         .get_key_at(value_key!("cab.signatures"), "[0]")
         .and_then(cert_from_obj)
     {
+        // Nothing hashes the cabinet to compare with the digest the
+        // signature carries, so however well the signature verifies, nothing
+        // shows it was made over this cabinet.
+        ci.verified = false;
         if let Some(o) = &ci.o {
             id.organization = Some(Claim {
                 value: o.clone(),
@@ -2002,6 +2013,7 @@ mod trust_tests {
             "subject": format!("CN={cn},O={o}"),
             "issuer": "CN=Some CA",
             "verified": verified,
+            "digest_matches": true,
         });
         if let Some(anchor) = anchor {
             sig["chain_anchor"] = json!(anchor);
@@ -2068,6 +2080,42 @@ mod trust_tests {
             pe_trust(signature("Example", cn, true, None)),
             Trust::CaSigned
         );
+    }
+
+    /// A Microsoft signature grafted from another binary verifies, but its
+    /// image hash is not this file's. Neither a mismatch nor a missing
+    /// comparison lets it vouch for the file.
+    #[test]
+    fn grafted_signature_does_not_vouch_for_the_file() {
+        let microsoft = || signature("Microsoft Corporation", "x", true, Some("microsoft"));
+        let mut grafted = microsoft();
+        grafted["digest_matches"] = json!(false);
+        assert_eq!(pe_trust(grafted.clone()), Trust::Unverified);
+        let mut unchecked = microsoft();
+        unchecked.as_object_mut().unwrap().remove("digest_matches");
+        assert_eq!(pe_trust(unchecked), Trust::Unverified);
+        assert_eq!(pe_trust(microsoft()), Trust::Platform);
+
+        let mut values = Values::default();
+        values.insert("pe.signatures", JsonValue::Array(vec![grafted]));
+        let id = derive(FileType::Pe, &[], &values);
+        assert_eq!(id.organization.map(|o| o.verified), Some(false));
+    }
+
+    /// Nothing checks a cabinet's content against its signature's digest.
+    #[test]
+    fn cabinet_signatures_stay_unverified() {
+        let mut values = Values::default();
+        values.insert(
+            "cab.signatures",
+            JsonValue::Array(vec![signature(
+                "Microsoft Corporation",
+                "x",
+                true,
+                Some("microsoft"),
+            )]),
+        );
+        assert_eq!(derive(FileType::Cab, &[], &values).trust, Trust::Unverified);
     }
 
     fn macho_trust(platform: u64, cms: Option<JsonValue>) -> Trust {

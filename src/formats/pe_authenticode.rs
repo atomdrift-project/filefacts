@@ -497,6 +497,14 @@ const SIGNATURE_ALGORITHMS: &[SignatureAlgorithm] = &[
         scheme: Scheme::Rsa,
         digest: Some(DigestAlg::Sha1),
     },
+    // The OIW arc's SHA-1 with RSA, older than PKCS #1's: the 1997 Microsoft
+    // Root Authority signed its Code Signing and Timestamping PCAs with it.
+    SignatureAlgorithm {
+        oid: ObjectIdentifier::new_unwrap("1.3.14.3.2.29"),
+        name: "sha1WithRSASignature",
+        scheme: Scheme::Rsa,
+        digest: Some(DigestAlg::Sha1),
+    },
     SignatureAlgorithm {
         oid: ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11"),
         name: "sha256WithRSAEncryption",
@@ -891,6 +899,15 @@ struct PinnedRoot {
 /// that some CA signed it, and pinning is left to the consumer.
 static PINNED_ROOTS: LazyLock<Vec<PinnedRoot>> = LazyLock::new(|| {
     const ROOTS: &[(Vendor, &[u8])] = &[
+        // The 1997 "Microsoft Root Authority": the SHA-1-era root above the
+        // original Code Signing and Timestamping PCAs, so the VC++ 2005–2010
+        // runtimes and other pre-2011 Microsoft binaries anchor here. A v3
+        // certificate with no extensions, which is why anchors skip
+        // `may_issue` in `walk_chain`.
+        (
+            Vendor::Microsoft,
+            include_bytes!("pe_authenticode/roots/microsoft-root-authority-1997.cer"),
+        ),
         (
             Vendor::Microsoft,
             include_bytes!("pe_authenticode/roots/microsoft-root-2001.cer"),
@@ -946,8 +963,12 @@ struct Chain {
 /// certificate cannot pose as a CA by signing another leaf.
 ///
 /// When the walk reaches a [`PINNED_ROOTS`] key — in the bag or not — that
-/// root closes the chain and names `anchor`. Which other CAs to trust is
-/// policy and stays with the consumer, which pins thumbprints.
+/// root closes the chain and names `anchor`. A pinned root is a trust
+/// anchor, so its own certificate is not held to the issuing constraints
+/// (RFC 5280 §6.1.1): its authority comes from being pinned, and the 1997
+/// Microsoft root predates BasicConstraints. Its key must still verify the
+/// child. Which other CAs to trust is policy and stays with the consumer,
+/// which pins thumbprints.
 ///
 /// The walk stops at a self-issued certificate, at the first link that does
 /// not verify, is not permitted, or uses an algorithm we cannot check, or at
@@ -981,13 +1002,13 @@ fn walk_chain(bag: &[&Certificate], signer: &Certificate, roots: &[PinnedRoot]) 
         // CA certificates between the next issuer and the leaf.
         let intermediates_below = chain.thumbprints.len() - 1;
         let child = cert;
-        let Some(issuer) = bag
+        let Some((issuer, _)) = bag
             .iter()
-            .copied()
-            .chain(roots.iter().map(|r| &r.cert))
-            .find(|c| {
+            .map(|&c| (c, false))
+            .chain(roots.iter().map(|r| (&r.cert, true)))
+            .find(|&(c, anchor)| {
                 c.tbs_certificate.subject == tbs.issuer
-                    && may_issue(c, intermediates_below)
+                    && (anchor || may_issue(c, intermediates_below))
                     && signs(c, child)
             })
         else {

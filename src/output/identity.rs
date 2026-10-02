@@ -155,7 +155,10 @@ pub enum Trust {
     /// A signature structure is present, but filefacts did not verify it:
     /// the signature failed, used an algorithm it cannot check, was detached
     /// from content it could not find, or carried no certificate to check it
-    /// against. Records signed packaging without overstating trust.
+    /// against. Also a signature that verifies but is not shown to cover this
+    /// file: a PE whose image hash differs from the signed one (or was not
+    /// computed), and any cabinet, whose content nothing hashes. Records signed
+    /// packaging without overstating trust.
     Unverified,
     /// Ad-hoc signed: a code signature with no identifying certificate
     /// chain (Mach-O `CS_ADHOC`). Integrity without identity.

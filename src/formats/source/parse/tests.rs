@@ -528,6 +528,92 @@ fn unrecovered_error_recovery_stops_the_parse() {
     assert_eq!(first, stop());
 }
 
+/// Feed `watch` `polls` polls, returning the first stop.
+fn run_watch(
+    watch: &mut RecoveryWatch,
+    first: u64,
+    polls: u64,
+    recovering: bool,
+    at_end: bool,
+) -> Option<(u64, ParseStop)> {
+    (first..first + polls).find_map(|poll| {
+        watch
+            .poll(poll, recovering, at_end, 0)
+            .map(|why| (poll, why))
+    })
+}
+
+/// A run of recovery before the end of the input stops after the cap; a
+/// healthy poll in between starts the count again.
+#[test]
+fn recovery_before_the_end_stops_after_the_cap() {
+    let mut watch = RecoveryWatch::new(Some(ERROR_RECOVERY_POLL_CAP));
+    assert_eq!(
+        run_watch(&mut watch, 1, ERROR_RECOVERY_POLL_CAP, true, false),
+        None
+    );
+    assert_eq!(
+        watch.poll(ERROR_RECOVERY_POLL_CAP + 1, false, false, 0),
+        None
+    );
+    assert_eq!(
+        run_watch(&mut watch, ERROR_RECOVERY_POLL_CAP + 2, 1000, true, false),
+        Some((
+            2 * ERROR_RECOVERY_POLL_CAP + 2,
+            ParseStop::ErrorRecovery {
+                polls: ERROR_RECOVERY_POLL_CAP + 1,
+                at: 0
+            }
+        ))
+    );
+}
+
+/// Wrapping up at the end of the input is one long recovery run even for
+/// valid source the grammar half-understands; it may take as many polls as
+/// reaching the end did, and at least [`EOF_RECOVERY_FLOOR`].
+#[test]
+fn recovery_at_the_end_is_bounded_by_the_work_before_it() {
+    // A 550 KB declaration file: 4,946 polls to the end, 1,968 there. Kept.
+    let mut watch = RecoveryWatch::new(Some(ERROR_RECOVERY_POLL_CAP));
+    assert_eq!(run_watch(&mut watch, 1, 4946, false, false), None);
+    assert_eq!(run_watch(&mut watch, 4947, 1968, true, true), None);
+
+    // Token soup: 680 polls to the end, then recovery that would run for
+    // thousands more. Cut off at the floor.
+    let mut watch = RecoveryWatch::new(Some(ERROR_RECOVERY_POLL_CAP));
+    assert_eq!(run_watch(&mut watch, 1, 680, false, false), None);
+    assert_eq!(
+        run_watch(&mut watch, 681, 9700, true, true),
+        Some((
+            681 + EOF_RECOVERY_FLOOR,
+            ParseStop::EofRecovery {
+                polls: EOF_RECOVERY_FLOOR + 1,
+                allowed: EOF_RECOVERY_FLOOR
+            }
+        ))
+    );
+
+    // A long read earns a long wrap-up, but no longer.
+    let mut watch = RecoveryWatch::new(Some(ERROR_RECOVERY_POLL_CAP));
+    assert_eq!(run_watch(&mut watch, 1, 5000, false, false), None);
+    assert_eq!(
+        run_watch(&mut watch, 5001, 10_000, true, true).map(|(_, why)| why),
+        Some(ParseStop::EofRecovery {
+            polls: 5001,
+            allowed: 5000
+        })
+    );
+}
+
+/// With no cap (C, Objective-C), recovery never stops a parse, before or at
+/// the end of the input.
+#[test]
+fn an_uncapped_watch_never_stops() {
+    let mut watch = RecoveryWatch::new(None);
+    assert_eq!(run_watch(&mut watch, 1, 100_000, true, false), None);
+    assert_eq!(run_watch(&mut watch, 100_001, 100_000, true, true), None);
+}
+
 /// C keeps its tree however long recovery runs: C++ headers parse as C.
 #[test]
 fn c_is_exempt_from_the_error_recovery_cap() {
