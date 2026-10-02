@@ -33,8 +33,9 @@
 //! compares values that live inside the file and is stable forever; expiry is
 //! offered alongside as one opt-in metric:
 //!
-//! - `pe.signature_expired_days` — days between the certificate's `not_after`
-//!   and now. Negative while the certificate is still current.
+//! - `pe.signature_expired_days` — whole days between the certificate's
+//!   `not_after` and now. Negative while the certificate is still current.
+//!   Whole days, so the value changes once a day rather than with every run.
 //!
 //! A count rather than a flag, because that is what makes the skew tolerable: a
 //! boolean flips on a one-second disagreement, whereas an author writing
@@ -120,7 +121,7 @@ fn expired_days(signatures: &[JsonValue], now: i64) -> Option<f64> {
         .iter()
         .filter_map(|s| s.get("not_after_unix")?.as_i64())
         .max()?;
-    Some((now - latest) as f64 / 86_400.0)
+    Some(((now - latest) as f64 / 86_400.0).floor())
 }
 
 /// Annotate one signature object in place; returns its integrity state.
@@ -368,6 +369,18 @@ mod tests {
             Some(INTACT)
         );
         assert_eq!(m.get("pe.signature_expired_days").unwrap().round(), 400.0);
+    }
+
+    /// Whole days: two analyses of the same file a few minutes apart report
+    /// the same value.
+    #[test]
+    fn expiry_is_whole_days() {
+        let mut v = values_with(
+            json!({}),
+            json!([{"verified": true, "not_after_unix": NOW - 400 * 86_400 - 3_600}]),
+        );
+        let m = run(&mut v);
+        assert_eq!(m.get("pe.signature_expired_days"), Some(400.0));
     }
 
     /// Negative while current, so an author thresholding on `min:` never

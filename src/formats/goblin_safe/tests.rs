@@ -1,0 +1,479 @@
+use super::*;
+
+fn read_fixture(name: &str) -> Vec<u8> {
+    let path = format!("tests/fixtures/{name}");
+    std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"))
+}
+
+/// Offsets into `test.exe` (PE32+): the section table and the import
+/// data directory. Returned rather than hardcoded so the helpers below
+/// keep working if the fixture is regenerated.
+fn pe_layout(bytes: &[u8]) -> (usize, usize, usize) {
+    let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    let coff = pe_offset + 4;
+    let sections = u16::from_le_bytes(bytes[coff + 2..coff + 4].try_into().unwrap()) as usize;
+    let size_of_optional = u16::from_le_bytes(bytes[coff + 16..coff + 18].try_into().unwrap());
+    let optional = coff + 20;
+    assert_eq!(
+        u16::from_le_bytes(bytes[optional..optional + 2].try_into().unwrap()),
+        0x20b,
+        "fixture is expected to be PE32+"
+    );
+    let section_table = optional + size_of_optional as usize;
+    // Data directory 1 is the import table; PE32+ puts the array at +112.
+    let import_dir = optional + 112 + 8;
+    (section_table, sections, import_dir)
+}
+
+fn put_u32(bytes: &mut [u8], at: usize, value: u32) {
+    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Build a PE whose import directory is a forgery.
+///
+/// The last section is grown to 3 MiB and filled with `0x11` bytes, which
+/// is exactly the shape that drives goblin's permissive lookup-table walk:
+/// non-zero (so the walk does not terminate), top bit clear (so the entry
+/// is a name RVA rather than a cheap ordinal), and pointing at an RVA that
+/// resolves to nothing (so each iteration takes the "bad RVA, skip entry"
+/// branch — a `warn!` and a `continue`, with no allocation). That is the
+/// loop the production worker was found spinning in.
+///
+/// `descriptors` 20-byte import descriptors are written at the section
+/// start, followed by a null terminator. Each points its lookup table at
+/// the `0x11` region when `long_lookup_tables`, giving the descriptor
+/// count times ~390k entries of work; otherwise the lookup RVAs resolve to
+/// nothing and each descriptor is individually cheap.
+fn pe_with_forged_import_directory(descriptors: usize, long_lookup_tables: bool) -> Vec<u8> {
+    const SECTION_SIZE: usize = 3 * 1024 * 1024;
+    let mut bytes = read_fixture("test.exe");
+    let (section_table, count, import_dir) = pe_layout(&bytes);
+    let last = section_table + (count - 1) * 40;
+    let virtual_address = u32::from_le_bytes(bytes[last + 12..last + 16].try_into().unwrap());
+    let pointer = u32::from_le_bytes(bytes[last + 20..last + 24].try_into().unwrap()) as usize;
+
+    bytes.resize(pointer + SECTION_SIZE, 0x11);
+    bytes[pointer..pointer + SECTION_SIZE].fill(0x11);
+    put_u32(&mut bytes, last + 8, SECTION_SIZE as u32); // virtual_size
+    put_u32(&mut bytes, last + 16, SECTION_SIZE as u32); // size_of_raw_data
+
+    // Lookup tables live past the descriptor array, in the 0x11 fill.
+    let lookup_offset = (descriptors + 1) * 20;
+    let lookup_rva = if long_lookup_tables {
+        virtual_address + lookup_offset as u32
+    } else {
+        // Resolves to nothing, so goblin abandons this descriptor at once.
+        0x1111_1111
+    };
+    for i in 0..descriptors {
+        let at = pointer + i * 20;
+        put_u32(&mut bytes, at, lookup_rva); // import_lookup_table_rva
+        put_u32(&mut bytes, at + 4, 0); // time_date_stamp
+        put_u32(&mut bytes, at + 8, 0); // forwarder_chain
+        put_u32(&mut bytes, at + 12, 1); // name_rva: non-zero, unresolvable
+        put_u32(&mut bytes, at + 16, 1); // import_address_table_rva
+    }
+    bytes[pointer + descriptors * 20..pointer + (descriptors + 1) * 20].fill(0);
+
+    put_u32(&mut bytes, import_dir, virtual_address);
+    put_u32(&mut bytes, import_dir + 4, 20); // declared size stays sane
+    bytes
+}
+
+fn importless_parse(bytes: &[u8]) -> PE<'_> {
+    let opts = goblin::pe::options::ParseOptions::default()
+        .with_parse_mode(goblin::options::ParseMode::Permissive)
+        .with_parse_imports(false);
+    PE::parse_with_opts(bytes, &opts).expect("import-less permissive parse")
+}
+
+#[test]
+fn import_walk_budget_accepts_a_real_pe() {
+    let bytes = read_fixture("test.exe");
+    let pe = PE::parse(&bytes).expect("fixture PE");
+    assert!(
+        import_walk_budget(&bytes, &pe).is_ok(),
+        "a linker-produced import table must stay within budget"
+    );
+}
+
+#[test]
+fn import_walk_budget_rejects_too_many_descriptors() {
+    let bytes = pe_with_forged_import_directory(MAX_IMPORT_DESCRIPTORS + 1, false);
+    let pe = importless_parse(&bytes);
+    let err = import_walk_budget(&bytes, &pe).expect_err("descriptor cap must trip");
+    assert_eq!(err, Rejection::UnterminatedImportDirectory);
+}
+
+/// The quadratic the bound exists for: a descriptor count a cap on
+/// descriptors alone would wave through, each re-walking a lookup table
+/// hundreds of thousands of entries long.
+#[test]
+fn import_walk_budget_rejects_oversized_lookup_tables() {
+    let bytes = pe_with_forged_import_directory(8, true);
+    let pe = importless_parse(&bytes);
+    let err = import_walk_budget(&bytes, &pe).expect_err("entry budget must trip");
+    assert_eq!(err, Rejection::OversizedImportLookupTables);
+}
+
+/// The bound has to be wired into `parse_pe`, not merely available: a
+/// forged table must cost the imports and nothing else.
+#[test]
+fn parse_pe_drops_a_forged_import_table_and_keeps_the_rest() {
+    let bytes = pe_with_forged_import_directory(8, true);
+    let parse = parse_pe(&bytes);
+    assert_eq!(
+        parse.imports_skipped,
+        Some(Rejection::OversizedImportLookupTables),
+        "parse_pe must report the abandoned import table"
+    );
+    let pe = parse
+        .outcome
+        .ok()
+        .expect("headers and sections still parse");
+    assert!(
+        pe.imports.is_empty(),
+        "the forged import table must not be synthesized"
+    );
+    assert!(
+        !pe.sections.is_empty(),
+        "dropping imports must not cost us the section table"
+    );
+    assert!(
+        pe.header.optional_header.is_some(),
+        "dropping imports must not cost us the optional header"
+    );
+}
+
+#[test]
+fn validate_rejects_oversized_section_count() {
+    let mut data = vec![0u8; 1024];
+    data[0] = b'M';
+    data[1] = b'Z';
+    data[0x3C] = 0x40;
+    data[0x40] = b'P';
+    data[0x41] = b'E';
+    // n_sections = 0x00FF = 255 (>192 threshold).
+    data[0x46] = 0xFF;
+    assert_eq!(
+        validate_pe_header(&data),
+        Err(Rejection::TooManySections(255))
+    );
+}
+
+#[test]
+fn validate_rejects_oversized_import_table() {
+    let mut data = vec![0u8; 1024];
+    data[0] = b'M';
+    data[1] = b'Z';
+    data[0x3C] = 0x40;
+    data[0x40] = b'P';
+    data[0x41] = b'E';
+    data[0x46] = 1; // n_sections = 1
+    data[0x58] = 0x0B;
+    data[0x59] = 0x01; // PE32 magic
+    data[0x40 + 24 + 92] = 16; // n_dirs = 16
+    let import_size_ptr = 0x40 + 24 + 96 + 8 + 4;
+    data[import_size_ptr + 3] = 0x01; // size = 16 MiB (>10 MiB cap)
+    assert_eq!(
+        validate_pe_header(&data),
+        Err(Rejection::OversizedDirectory {
+            table: "import",
+            size: 16 << 20,
+        })
+    );
+}
+
+/// The reasons land verbatim in the structured errors view, so the typed
+/// enum must render exactly the text the old `String` reasons carried.
+#[test]
+fn rejection_messages_are_unchanged() {
+    for (reason, text) in [
+        (Rejection::TooManySections(255), "too many sections (255)"),
+        (
+            Rejection::TooManyDataDirectories(17),
+            "too many data directories (17)",
+        ),
+        (
+            Rejection::OversizedDirectory {
+                table: "resource",
+                size: 16 << 20,
+            },
+            "malformed resource table size (16777216 bytes)",
+        ),
+        (
+            Rejection::UnterminatedImportDirectory,
+            "import directory exceeds 256 descriptors without terminating",
+        ),
+        (
+            Rejection::OversizedImportLookupTables,
+            "import lookup tables exceed 262144 entries",
+        ),
+        (
+            Rejection::ExportTrieLoop {
+                node: 0x20,
+                start: 0x10,
+                end: 0x40,
+            },
+            "export trie loops back to node 0x20 (trie 0x10..0x40)",
+        ),
+        (
+            Rejection::ExportTrieBranches {
+                node: 0,
+                branches: 100,
+                available: 4,
+            },
+            "export trie node 0x0 claims 100 branches in 4 bytes",
+        ),
+    ] {
+        assert_eq!(reason.to_string(), text);
+    }
+}
+
+#[test]
+fn parse_pe_header_handles_garbage_and_real_headers() {
+    assert!(matches!(
+        parse_pe_header(b"not a PE file at all"),
+        GoblinOutcome::Failed(_)
+    ));
+    let bytes = read_fixture("test.exe");
+    let header = parse_pe_header(&bytes).ok().expect("fixture headers parse");
+    assert!(header.optional_header.is_some());
+}
+
+#[test]
+fn parse_macho_slice_handles_garbage_and_real_slices() {
+    assert!(matches!(
+        parse_macho_slice(b"not a Mach-O"),
+        GoblinOutcome::Failed(_)
+    ));
+    let bytes = read_fixture("test.macho");
+    let macho = parse_macho_slice(&bytes).ok().expect("thin fixture parses");
+    assert!(!macho.load_commands.is_empty());
+}
+
+#[test]
+fn drain_runs_a_lazy_walk_to_completion() {
+    let bytes = read_fixture("test.elf");
+    let elf = Elf::parse(&bytes).expect("fixture ELF");
+    let notes = drain(
+        elf.iter_note_headers(&bytes)
+            .into_iter()
+            .flatten()
+            .flatten(),
+    )
+    .ok()
+    .expect("note walk completes");
+    // The fixture's single PT_NOTE carries its GNU build-id.
+    assert_eq!(notes.len(), 1);
+    assert_eq!((notes[0].name, notes[0].n_type), ("GNU", 3));
+}
+
+#[test]
+fn drain_or_record_reports_a_walk_that_panics() {
+    let walk = (0..4).map(|i| if i == 2 { panic!("walker tripped") } else { i });
+    let mut errors = Errors::new();
+    assert!(drain_or_record(walk, &mut errors, Stage::PeParse).is_empty());
+    let recorded = errors.as_slice();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].stage, Stage::PeParse);
+    assert!(recorded[0].message.contains("walker tripped"));
+
+    let mut errors = Errors::new();
+    assert_eq!(
+        drain_or_record(0..3, &mut errors, Stage::PeParse),
+        vec![0, 1, 2]
+    );
+    assert!(errors.as_slice().is_empty());
+}
+
+#[test]
+fn validate_accepts_too_short_to_be_pe() {
+    // Anything below 64 bytes can't possibly be a parseable PE;
+    // hand the bytes to goblin without flagging.
+    assert!(validate_pe_header(&[]).is_ok());
+    assert!(validate_pe_header(&[0u8; 16]).is_ok());
+}
+
+#[test]
+fn validate_accepts_non_pe_bytes() {
+    // Bytes that don't start with MZ get through — the caller's
+    // strict parse will report a clean error.
+    let data = vec![0u8; 256];
+    assert!(validate_pe_header(&data).is_ok());
+}
+
+#[test]
+fn catch_returns_ok_for_passing_call() {
+    let result: GoblinOutcome<i32> = catch(|| Ok(42));
+    assert!(matches!(result, GoblinOutcome::Ok(42)));
+}
+
+#[test]
+fn catch_returns_failed_on_error() {
+    let result: GoblinOutcome<i32> = catch(|| Err(GoblinError::Malformed("nope".into())));
+    assert!(matches!(result, GoblinOutcome::Failed(_)));
+}
+
+#[test]
+fn catch_converts_panic_to_outcome() {
+    let result: GoblinOutcome<i32> = catch(|| -> Result<i32, GoblinError> { panic!("boom") });
+    match result {
+        GoblinOutcome::Panicked(msg) => assert!(msg.contains("boom")),
+        other => panic!("expected Panicked, got {other:?}"),
+    }
+}
+
+#[test]
+fn catch_infallible_handles_clean_value() {
+    let result: GoblinOutcome<&str> = catch_infallible(|| "ok");
+    assert!(matches!(result, GoblinOutcome::Ok("ok")));
+}
+
+#[test]
+fn catch_infallible_catches_lazy_walker_panic() {
+    let result: GoblinOutcome<()> = catch_infallible(|| panic!("walker tripped"));
+    match result {
+        GoblinOutcome::Panicked(msg) => assert!(msg.contains("walker tripped")),
+        other => panic!("expected Panicked, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_pe_rejects_garbage() {
+    let result = parse_pe(b"not a PE file at all").outcome;
+    match result {
+        GoblinOutcome::Failed(_) | GoblinOutcome::Panicked(_) => {}
+        other => panic!("expected failure, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_pe_short_input_falls_through_to_goblin() {
+    // Below the 64-byte gate, validate_pe_header returns Ok and
+    // we hand the bytes straight to goblin, which fails cleanly.
+    let result = parse_pe(&[0u8; 16]).outcome;
+    assert!(matches!(
+        result,
+        GoblinOutcome::Failed(_) | GoblinOutcome::Panicked(_)
+    ));
+}
+
+#[test]
+fn parse_elf_handles_garbage() {
+    let result = parse_elf(b"not an ELF");
+    assert!(matches!(
+        result,
+        GoblinOutcome::Failed(_) | GoblinOutcome::Panicked(_)
+    ));
+}
+
+#[test]
+fn parse_mach_handles_garbage() {
+    let result = parse_mach(b"not a Mach-O");
+    assert!(matches!(
+        result,
+        GoblinOutcome::Failed(_) | GoblinOutcome::Panicked(_)
+    ));
+}
+
+/// A two-node trie as a linker emits it: a non-terminal root with one
+/// edge `_a` to a terminal leaf (flags 0, address 0x10, no children).
+const WELL_FORMED_TRIE: &[u8] = &[
+    0x00, 0x01, b'_', b'a', 0x00, 0x06, // root @0: 1 branch, child @6
+    0x02, 0x00, 0x10, 0x00, // leaf @6: terminal, no children
+];
+
+#[test]
+fn export_trie_accepts_well_formed() {
+    assert!(validate_export_trie_bytes(WELL_FORMED_TRIE, 0, WELL_FORMED_TRIE.len()).is_ok());
+    // Embedded past a header, as in a real file.
+    let mut file = vec![0xAAu8; 64];
+    file.extend_from_slice(WELL_FORMED_TRIE);
+    assert!(validate_export_trie_bytes(&file, 64, WELL_FORMED_TRIE.len()).is_ok());
+}
+
+/// The leptris shape: the root's only edge points back at the root, so
+/// goblin's walk never ends. llvm-objdump: "loop in children in export
+/// trie data at node: 0x0 back to node: 0x0".
+#[test]
+fn export_trie_rejects_root_self_loop() {
+    let trie = [0x00, 0x01, b'_', b'a', 0x00, 0x00];
+    let err = validate_export_trie_bytes(&trie, 0, trie.len()).expect_err("loop must trip");
+    assert!(
+        matches!(err, Rejection::ExportTrieLoop { node: 0, .. }),
+        "unexpected reason: {err}"
+    );
+}
+
+#[test]
+fn export_trie_rejects_deep_cycle() {
+    // root -> leaf, and the leaf (terminal with one child) points at root.
+    let trie = [
+        0x00, 0x01, b'_', b'a', 0x00, 0x06, // root @0 -> @6
+        0x02, 0x00, 0x10, 0x01, b'b', 0x00, 0x00, // leaf @6, 1 child -> @0
+    ];
+    assert!(validate_export_trie_bytes(&trie, 0, trie.len()).is_err());
+}
+
+#[test]
+fn export_trie_rejects_forged_branch_count() {
+    // Root claims 100 branches in a 6-byte trie.
+    let trie = [0x00, 0x64, b'_', b'a', 0x00, 0x06];
+    let err = validate_export_trie_bytes(&trie, 0, trie.len()).expect_err("count must trip");
+    assert!(
+        matches!(err, Rejection::ExportTrieBranches { branches: 100, .. }),
+        "unexpected reason: {err}"
+    );
+}
+
+#[test]
+fn export_trie_waves_through_what_goblin_rejects() {
+    // Range past the file: goblin treats it as an empty trie.
+    assert!(validate_export_trie_bytes(WELL_FORMED_TRIE, 4, 100).is_ok());
+    assert!(validate_export_trie_bytes(&[], 0, 0).is_ok());
+    // Truncated ULEB / label: goblin's own Err is the report.
+    assert!(validate_export_trie_bytes(&[0x00, 0x01, b'_'], 0, 3).is_ok());
+    assert!(validate_export_trie_bytes(&[0x80], 0, 1).is_ok());
+}
+
+/// A header cut off inside `e_shstrndx`, the last field zeroed, used to
+/// panic slicing the patched copy: every field the helper reads is in
+/// bounds, but the one it then writes is not.
+#[test]
+fn elf_detach_rejects_header_truncated_in_shstrndx() {
+    // (EI_CLASS, e_shoff, e_shentsize, e_shnum, e_shstrndx) offsets.
+    for (class, shoff_at, shentsize_at, shnum_at, shstrndx_at) in
+        [(2u8, 0x28, 0x3A, 0x3C, 0x3E), (1, 0x20, 0x2E, 0x30, 0x32)]
+    {
+        let mut header = vec![0u8; shstrndx_at + 2];
+        header[..4].copy_from_slice(b"\x7fELF");
+        header[4] = class;
+        header[5] = 1; // little-endian
+        header[shoff_at] = 0x10;
+        header[shentsize_at] = 0x40;
+        header[shnum_at] = 5;
+        header[shstrndx_at] = 3;
+        // Section table at 0x10 + 5 * 0x40 ends past EOF: detach it.
+        let patched = elf_without_truncated_section_headers(&header).expect("detached");
+        assert_eq!(
+            [patched[shoff_at], patched[shnum_at], patched[shstrndx_at]],
+            [0, 0, 0]
+        );
+        assert_eq!(patched[shentsize_at], 0x40);
+        for len in [shstrndx_at, shstrndx_at + 1] {
+            assert_eq!(elf_without_truncated_section_headers(&header[..len]), None);
+        }
+    }
+}
+
+#[test]
+fn uleb128_matches_scroll() {
+    let mut off = 0;
+    assert_eq!(read_uleb128(&[0xE5, 0x8E, 0x26], &mut off), Some(624_485));
+    assert_eq!(off, 3);
+    let mut off = 0;
+    assert_eq!(read_uleb128(&[0x80], &mut off), None);
+    let mut off = 0;
+    assert_eq!(read_uleb128(&[0xff; 11], &mut off), None);
+}
