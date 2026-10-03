@@ -210,11 +210,11 @@ mod tests {
         let literals = parsed.literals();
         let encoded = literals
             .iter()
-            .find(|s| s.text == "cHJpbnRmICclc1xuJyAnU0NQVF9CQVNFNjRfT0sn")
+            .find(|s| s.value == "cHJpbnRmICclc1xuJyAnU0NQVF9CQVNFNjRfT0sn")
             .unwrap();
         let decoded = literals
             .iter()
-            .find(|s| s.text == "printf '%s\\n' 'SCPT_BASE64_OK'")
+            .find(|s| s.value == "printf '%s\\n' 'SCPT_BASE64_OK'")
             .unwrap();
         assert_eq!(decoded.offset, encoded.offset);
         assert_eq!(encoded.encoding, Some(LiteralEncoding::Utf16be));
@@ -225,7 +225,7 @@ mod tests {
         assert!(parsed.errors().is_empty());
         let restored: crate::output::Literals =
             serde_json::from_str(&serde_json::to_string(literals).unwrap()).unwrap();
-        assert!(restored.iter().any(|s| s.text == decoded.text
+        assert!(restored.iter().any(|s| s.value == decoded.value
             && s.offset == encoded.offset
             && s.method == Some(LiteralMethod::ScptBase64)));
     }
@@ -243,7 +243,7 @@ mod tests {
         );
         let bytes = parser::test_fixture();
         let parsed = crate::open(&bytes);
-        assert!(parsed.literals().iter().any(|s| s.text == "Hello World"
+        assert!(parsed.literals().iter().any(|s| s.value == "Hello World"
             && s.method == Some(LiteralMethod::ScptLiteral)
             && s.encoding == Some(LiteralEncoding::Utf16be)));
     }
@@ -330,7 +330,7 @@ mod tests {
             parsed
                 .literals()
                 .iter()
-                .any(|s| s.text == "Hello World" && s.method == Some(LiteralMethod::ScptLiteral))
+                .any(|s| s.value == "Hello World" && s.method == Some(LiteralMethod::ScptLiteral))
         );
     }
 
@@ -346,7 +346,7 @@ mod tests {
     fn compiler_fixture_exposes_literals_calls_and_no_variable_imports() {
         let bytes = parser::test_fixture();
         let parsed = crate::open(&bytes);
-        assert!(parsed.literals().iter().any(|s| s.text == "Hello World"));
+        assert!(parsed.literals().iter().any(|s| s.value == "Hello World"));
         assert!(parsed.symbols().iter().any(|s| matches!(s,
             Symbol::Call { target: Some(name), args, .. }
             if name == "greet" && matches!(args.as_slice(), [Arg::Number { value: 1, .. }]))));
@@ -360,17 +360,17 @@ mod tests {
         let bytes = include_bytes!("../../../tests/fixtures/stage4.scpt");
         let parsed = crate::open(bytes);
         let literals = parsed.literals();
-        assert!(literals.iter().any(|s| s.text == "Cookies.binarycookies"));
-        assert!(literals.iter().any(|s| s.text == "NoteStore.sqlite"));
+        assert!(literals.iter().any(|s| s.value == "Cookies.binarycookies"));
+        assert!(literals.iter().any(|s| s.value == "NoteStore.sqlite"));
         assert!(
             literals
                 .iter()
-                .any(|s| s.text.contains("ditto -c -k --sequesterRsrc"))
+                .any(|s| s.value.contains("ditto -c -k --sequesterRsrc"))
         );
         assert!(
             literals
                 .iter()
-                .any(|s| s.text.contains("com.apple.quarantine"))
+                .any(|s| s.value.contains("com.apple.quarantine"))
         );
         assert!(
             literals

@@ -1,10 +1,11 @@
 //! Comment metrics ported from cleave.
 //!
-//! Extracts comments from the source text using a language-specific
-//! comment style, then emits `comments.*` keys describing comment
-//! count/size, annotation patterns (TODO/FIXME/HACK/XXX), and
-//! suspicious payloads (high-entropy text, embedded code, URLs,
-//! base64 blobs).
+//! Takes the comment nodes the source walk found, strips their delimiters,
+//! then emits `comments.*` keys describing comment count/size, annotation
+//! patterns (TODO/FIXME/HACK/XXX), and suspicious payloads (high-entropy
+//! text, embedded code, URLs, base64 blobs). The grammar decides what is a
+//! comment, so a `#` inside `${#x}`, a `//` inside a regex or template, or a
+//! heredoc line is never mistaken for one.
 
 use std::sync::LazyLock;
 
@@ -15,34 +16,6 @@ use crate::output::Metrics;
 use crate::scan::classify;
 
 use super::identifier_metrics::string_entropy;
-
-/// Per-language comment delimiter style.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CommentStyle {
-    /// `//` and `/* */`, with `'` delimiting a char or string literal (C,
-    /// Java, PHP, C#, …).
-    CStyle,
-    /// `//` and `/* */` plus backtick-delimited string literals — template
-    /// literals (JavaScript, TypeScript) and raw strings (Go). Backtick
-    /// contents are skipped so a `//` or `/*` inside a template/raw string
-    /// (e.g. a URL like `https://…` in an error-message template) is not
-    /// misread as a comment.
-    CStyleTemplate,
-    /// Rust: `//` and nesting `/* */`. A `'` opens a char literal only when
-    /// one follows; otherwise it marks a lifetime or label (`&'static str`),
-    /// which `CStyle` misread as a string swallowing the comments after it.
-    /// Raw strings (`r#"…"#`) are skipped whole, backslashes included.
-    Rust,
-    /// `#` (Python, Shell, …).
-    Hash,
-    /// `--` line comments (Lua, SQL, Haskell, …).
-    DoubleDash,
-    /// `;` line comments (Clojure / Lisp family). `#` is a reader macro in
-    /// Clojure, not a comment, so Hash would mis-scan it.
-    Semicolon,
-    /// `REM` and `::` line comments (Windows Batch / CMD).
-    Batch,
-}
 
 /// A comment's body, without its delimiters, and the byte offset in the
 /// source where the body starts.
@@ -118,14 +91,68 @@ fn pattern_hits(text: &str) -> u32 {
         .fold(0, |hits, (i, hit)| hits | u32::from(hit) << i)
 }
 
-/// Emit `comments.*` metrics for `content` parsed with `style`.
+/// The body of a comment node's `text`, its delimiters stripped, and the
+/// body's byte offset within `text`. The grammar has already decided `text`
+/// is a comment, so its opening delimiter says which closing one to strip:
+/// block forms lose both ends (an unterminated one only its opener), line
+/// forms their marker. Anything else (Ruby's `=begin`, Perl POD) is kept
+/// whole.
+fn comment_body(text: &str) -> (usize, &str) {
+    for (open, close) in [("/*", "*/"), ("<#", "#>"), ("<!--", "-->")] {
+        if let Some(rest) = text.strip_prefix(open) {
+            return (open.len(), rest.strip_suffix(close).unwrap_or(rest));
+        }
+    }
+    // Lua long comments: `--[[ … ]]`, `--[==[ … ]==]`.
+    if let Some(level) = text
+        .strip_prefix("--[")
+        .map(|rest| rest.bytes().take_while(|&b| b == b'=').count())
+        .filter(|&level| text.as_bytes().get(3 + level) == Some(&b'['))
+    {
+        let open = 4 + level;
+        let close = format!("]{}]", "=".repeat(level));
+        let rest = text.get(open..).unwrap_or_default();
+        return (open, rest.strip_suffix(close.as_str()).unwrap_or(rest));
+    }
+    // Line forms end at the newline, which some grammars (Rust's) include in
+    // the node.
+    for marker in ["//", "--", "#", ";", "::"] {
+        if let Some(rest) = text.strip_prefix(marker) {
+            return (marker.len(), rest.strip_suffix('\n').unwrap_or(rest));
+        }
+    }
+    // Batch `REM`, or `@REM` with echo suppressed, then the whitespace after
+    // it.
+    let rem = text.strip_prefix('@').unwrap_or(text);
+    if let Some((keyword, after)) = rem.split_at_checked(3)
+        && keyword.eq_ignore_ascii_case("rem")
+        && (after.is_empty() || after.starts_with([' ', '\t']))
+    {
+        let body = after.trim_start();
+        let body = body.strip_suffix('\n').unwrap_or(body);
+        return (text.len() - after.trim_start().len(), body);
+    }
+    (0, text)
+}
+
+/// Emit `comments.*` metrics for the comment nodes `found` (each its start
+/// offset in `content` and its text, delimiters included).
 pub(super) fn emit(
+    found: &[(usize, &str)],
     content: &str,
-    style: CommentStyle,
     metrics: &mut Metrics,
     comments_out: &mut crate::output::Comments,
 ) {
-    let comments = extract_comments(content, style);
+    let comments: Vec<Comment<'_>> = found
+        .iter()
+        .map(|&(start, text)| {
+            let (skip, body) = comment_body(text);
+            Comment {
+                offset: start + skip,
+                body,
+            }
+        })
+        .collect();
     if comments.is_empty() {
         return;
     }
@@ -157,7 +184,7 @@ pub(super) fn emit(
         // can match keywords scoped to comments (lowest false positives —
         // a keyword in code or a string never reaches this tier).
         comments_out.push(crate::output::ExtractedString {
-            text: trimmed.to_string(),
+            value: trimmed.to_string(),
             offset: comment.offset + (body.len() - body.trim_start().len()),
             ..Default::default()
         });
@@ -232,429 +259,136 @@ pub(super) fn emit(
     }
 }
 
-fn extract_comments(content: &str, style: CommentStyle) -> Vec<Comment<'_>> {
-    let mut scanner = Scanner::new(content);
-    match style {
-        CommentStyle::CStyle => scanner.c_style(false),
-        CommentStyle::CStyleTemplate => scanner.c_style(true),
-        CommentStyle::Rust => scanner.rust(),
-        CommentStyle::Hash => scanner.hash(),
-        CommentStyle::DoubleDash => scanner.double_dash(),
-        CommentStyle::Semicolon => scanner.semicolon(),
-        CommentStyle::Batch => return extract_batch_comments(content),
-    }
-    scanner.comments
-}
-
-/// Extract Windows Batch line comments: a line whose first non-space token is
-/// `::` or `rem` (case-insensitive). Whole-line constructs, so no string-state
-/// tracking is needed.
-fn extract_batch_comments(content: &str) -> Vec<Comment<'_>> {
-    let mut comments = Vec::new();
-    let mut line_start = 0;
-    for raw in content.split_inclusive('\n') {
-        // The lines `str::lines` yields: without `\n` or `\r\n`.
-        let line = raw
-            .strip_suffix('\n')
-            .map_or(raw, |l| l.strip_suffix('\r').unwrap_or(l));
-        let t = line.trim_start();
-        let t_start = line_start + (line.len() - t.len());
-        if let Some(rest) = t.strip_prefix("::") {
-            comments.push(Comment {
-                offset: t_start + 2,
-                body: rest,
-            });
-        } else if let Some((keyword, after)) = t.split_at_checked(3)
-            && keyword.eq_ignore_ascii_case("rem")
-            && (after.is_empty() || after.starts_with([' ', '\t']))
-        {
-            // `split_at_checked`, not `t[..3]`: a trimmed line can begin with
-            // a multi-byte char (e.g. CJK source comments), and slicing a str
-            // at byte 3 would panic mid-char.
-            let body = after.trim_start();
-            comments.push(Comment {
-                offset: t_start + 3 + (after.len() - body.len()),
-                body,
-            });
-        }
-        line_start += raw.len();
-    }
-    comments
-}
-
-/// A comment scanner over the source's bytes. Every delimiter is ASCII, and
-/// UTF-8 never uses an ASCII byte inside a multi-byte character, so a byte
-/// scan finds exactly the delimiters a char scan does and every cut it makes
-/// is a char boundary — without first copying the source into a `Vec<char>`.
-struct Scanner<'a> {
-    text: &'a str,
-    at: usize,
-    comments: Vec<Comment<'a>>,
-}
-
-impl<'a> Scanner<'a> {
-    fn new(text: &'a str) -> Self {
-        Self {
-            text,
-            at: 0,
-            comments: Vec::new(),
-        }
-    }
-
-    fn byte(&self, ahead: usize) -> Option<u8> {
-        self.text.as_bytes().get(self.at + ahead).copied()
-    }
-
-    fn at_str(&self, s: &str) -> bool {
-        self.text
-            .as_bytes()
-            .get(self.at..)
-            .is_some_and(|rest| rest.starts_with(s.as_bytes()))
-    }
-
-    /// Record `start..end` as a comment body; `end` is clamped to the text.
-    fn push(&mut self, start: usize, end: usize) {
-        let end = end.min(self.text.len());
-        if let Some(body) = self.text.get(start..end) {
-            self.comments.push(Comment {
-                offset: start,
-                body,
-            });
-        }
-    }
-
-    /// Skip a string opened by the `quote` under the cursor, through its
-    /// closing quote. A backslash escapes the byte after it; an unterminated
-    /// string runs to the end.
-    fn skip_string(&mut self, quote: u8) {
-        self.at += 1;
-        while let Some(b) = self.byte(0) {
-            self.at += 1;
-            if b == quote {
-                return;
-            }
-            if b == b'\\' && self.byte(0).is_some() {
-                self.at += 1;
-            }
-        }
-    }
-
-    /// Skip a string opened by three `quote`s under the cursor through the
-    /// next three. No escapes, as in Python's triple-quoted strings.
-    fn skip_triple_string(&mut self, quote: u8) {
-        let close = [quote; 3];
-        self.at += 3;
-        let rest = self.text.as_bytes().get(self.at..).unwrap_or_default();
-        self.at += memchr::memmem::find(rest, &close).map_or(rest.len(), |at| at + 3);
-    }
-
-    /// A comment from after the `delimiter_len`-byte delimiter under the
-    /// cursor to the end of the line; the cursor stops on the newline.
-    fn line_comment(&mut self, delimiter_len: usize) {
-        let start = self.at + delimiter_len;
-        let rest = self.text.as_bytes().get(start..).unwrap_or_default();
-        let end = start + memchr::memchr(b'\n', rest).unwrap_or(rest.len());
-        self.push(start, end);
-        self.at = end;
-    }
-
-    /// A `/* */` comment from the `/*` under the cursor. With `nested`, as in
-    /// Rust, each inner `/*` needs its own `*/`. Unterminated, it runs to the
-    /// end.
-    fn block_comment(&mut self, nested: bool) {
-        let start = self.at + 2;
-        self.at = start;
-        let mut depth = 1usize;
-        while self.byte(0).is_some() {
-            if self.at_str("*/") {
-                depth -= 1;
-                if depth == 0 {
-                    self.push(start, self.at);
-                    self.at += 2;
-                    return;
-                }
-                self.at += 2;
-            } else if nested && self.at_str("/*") {
-                depth += 1;
-                self.at += 2;
-            } else {
-                self.at += 1;
-            }
-        }
-        self.push(start, self.at);
-    }
-
-    fn c_style(&mut self, template_strings: bool) {
-        while let Some(b) = self.byte(0) {
-            match b {
-                b'"' | b'\'' => self.skip_string(b),
-                // Backtick template literals (JS/TS) and raw strings (Go)
-                // routinely embed `//` and `/*` inside their text (URLs,
-                // escapes). Skip the whole backtick span so those bytes
-                // aren't misread as comments. `${…}` interpolation is treated
-                // as opaque string content, matching how the `"`/`'` strings
-                // ignore their contents.
-                b'`' if template_strings => self.skip_string(b'`'),
-                b'/' if self.at_str("//") => self.line_comment(2),
-                b'/' if self.at_str("/*") => self.block_comment(false),
-                _ => self.at += 1,
-            }
-        }
-    }
-
-    fn rust(&mut self) {
-        while let Some(b) = self.byte(0) {
-            match b {
-                b'"' => self.skip_string(b'"'),
-                b'\'' => self.skip_rust_quote(),
-                b'r' if !self.follows_identifier_char() && self.skip_rust_raw_string() => {}
-                b'/' if self.at_str("//") => self.line_comment(2),
-                b'/' if self.at_str("/*") => self.block_comment(true),
-                _ => self.at += 1,
-            }
-        }
-    }
-
-    /// Whether the byte before the cursor continues an identifier, so an `r`
-    /// under the cursor is part of a name rather than a raw-string prefix.
-    /// A `b` before it is the byte-string prefix of `br"…"`, not a name.
-    fn follows_identifier_char(&self) -> bool {
-        let Some(before) = self.at.checked_sub(1) else {
-            return false;
-        };
-        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
-        match self.text.as_bytes().get(before) {
-            Some(b'b') => before
-                .checked_sub(1)
-                .and_then(|i| self.text.as_bytes().get(i))
-                .is_some_and(|&b| is_ident(b)),
-            Some(&b) => is_ident(b),
-            None => false,
-        }
-    }
-
-    /// Skip a raw string (`r"…"`, `r#"…"#`) whose `r` is under the cursor.
-    /// Returns false, moving nothing, when no raw string starts here.
-    fn skip_rust_raw_string(&mut self) -> bool {
-        let bytes = self.text.as_bytes();
-        let hashes = bytes
-            .get(self.at + 1..)
-            .unwrap_or_default()
-            .iter()
-            .take_while(|&&b| b == b'#')
-            .count();
-        let open = self.at + 1 + hashes;
-        if bytes.get(open) != Some(&b'"') {
-            return false;
-        }
-        let close: Vec<u8> = std::iter::once(b'"')
-            .chain(std::iter::repeat_n(b'#', hashes))
-            .collect();
-        let body = bytes.get(open + 1..).unwrap_or_default();
-        self.at =
-            open + 1 + memchr::memmem::find(body, &close).map_or(body.len(), |at| at + close.len());
-        true
-    }
-
-    /// Skip the `'` under the cursor. It opens a char or byte literal only
-    /// when an escape, or one char and a closing quote, follows; otherwise it
-    /// marks a lifetime or loop label and opens nothing.
-    fn skip_rust_quote(&mut self) {
-        let rest = self.text.get(self.at + 1..).unwrap_or_default();
-        let literal_len = if let Some(escape) = rest.strip_prefix('\\') {
-            // The longest escape body, `u{10FFFF}`, is 9 bytes.
-            escape
-                .bytes()
-                .skip(1)
-                .take(9)
-                .position(|b| b == b'\'')
-                .map(|close| 1 + 1 + 1 + close + 1)
-        } else {
-            rest.chars()
-                .next()
-                .filter(|&c| c != '\'' && c != '\n')
-                .filter(|c| rest.as_bytes().get(c.len_utf8()) == Some(&b'\''))
-                .map(|c| 1 + c.len_utf8() + 1)
-        };
-        self.at += literal_len.unwrap_or(1);
-    }
-
-    fn hash(&mut self) {
-        while let Some(b) = self.byte(0) {
-            match b {
-                b'"' | b'\'' if self.byte(1) == Some(b) && self.byte(2) == Some(b) => {
-                    self.skip_triple_string(b);
-                }
-                b'"' | b'\'' => self.skip_string(b),
-                b'#' => self.line_comment(1),
-                _ => self.at += 1,
-            }
-        }
-    }
-
-    fn double_dash(&mut self) {
-        while let Some(b) = self.byte(0) {
-            match b {
-                b'"' | b'\'' => self.skip_string(b),
-                b'-' if self.at_str("--") => self.line_comment(2),
-                _ => self.at += 1,
-            }
-        }
-    }
-
-    /// `;`-to-end-of-line comments (Clojure / Lisp). Skips `"..."` string
-    /// literals so a `;` inside a string isn't read as a comment.
-    fn semicolon(&mut self) {
-        while let Some(b) = self.byte(0) {
-            match b {
-                b'"' => self.skip_string(b'"'),
-                b';' => self.line_comment(1),
-                _ => self.at += 1,
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn bodies(content: &str, style: CommentStyle) -> Vec<&str> {
-        extract_comments(content, style)
-            .into_iter()
-            .map(|c| c.body)
+    /// The comment-tier texts filefacts reports for `source` named `path`.
+    fn comments(path: &str, source: &str) -> Vec<String> {
+        crate::OpenOptions::new()
+            .path(std::path::Path::new(path))
+            .open(source.as_bytes())
+            .comments()
+            .iter()
+            .map(|c| c.value.clone())
             .collect()
     }
 
+    fn metrics(path: &str, source: &str) -> crate::Metrics {
+        crate::OpenOptions::new()
+            .path(std::path::Path::new(path))
+            .open(source.as_bytes())
+            .metrics()
+            .clone()
+    }
+
     #[test]
-    fn c_style_comments_are_extracted() {
-        let comments = bodies(
-            "// foo\n/* bar */\nx = 1; // inline\n",
-            CommentStyle::CStyle,
+    fn delimiters_are_stripped() {
+        assert_eq!(comment_body("// a"), (2, " a"));
+        assert_eq!(comment_body("/* b */"), (2, " b "));
+        assert_eq!(comment_body("/* open"), (2, " open"));
+        assert_eq!(comment_body("# c"), (1, " c"));
+        assert_eq!(comment_body("-- d"), (2, " d"));
+        assert_eq!(comment_body("--[==[ e ]==]"), (6, " e "));
+        assert_eq!(comment_body("--[[ f ]]"), (4, " f "));
+        assert_eq!(comment_body("; g"), (1, " g"));
+        assert_eq!(comment_body(":: h"), (2, " h"));
+        assert_eq!(comment_body("REM   i"), (6, "i"));
+        assert_eq!(comment_body("@rem i"), (5, "i"));
+        assert_eq!(comment_body("// line\n"), (2, " line"));
+        assert_eq!(comment_body("<# j #>"), (2, " j "));
+        assert_eq!(comment_body("<!-- k -->"), (4, " k "));
+        assert_eq!(comment_body("=begin\nl\n=end"), (0, "=begin\nl\n=end"));
+    }
+
+    #[test]
+    fn c_style_comments_are_found() {
+        assert_eq!(
+            comments("a.c", "int x = 1; // line\n/* block */ int y;\n"),
+            ["line", "block"]
         );
-        assert_eq!(comments, vec![" foo", " bar ", " inline"]);
     }
 
     #[test]
     fn comment_offsets_point_at_their_bodies() {
-        let src = "x = 1; // inline\n/* block */\n";
-        for comment in extract_comments(src, CommentStyle::CStyle) {
-            assert_eq!(&src[comment.offset..][..comment.body.len()], comment.body);
+        let src = "int x; //   spaced\n/* b */\n";
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new("a.c"))
+            .open(src.as_bytes());
+        for comment in parsed.comments() {
+            let at = usize::try_from(comment.offset).unwrap();
+            assert!(src[at..].starts_with(&comment.value), "{comment:?}");
         }
-        let mut metrics = Metrics::new();
-        let mut out = crate::output::Comments::new();
-        emit(src, CommentStyle::CStyle, &mut metrics, &mut out);
-        let offsets: Vec<_> = out.iter().map(|c| (c.offset, c.text.as_str())).collect();
-        assert_eq!(offsets, vec![(10, "inline"), (20, "block")]);
+    }
+
+    /// The grammar, not a scanner, decides: `//` and `/*` inside template
+    /// literals, strings and regexes are not comments.
+    #[test]
+    fn javascript_strings_templates_and_regexes_hide_their_contents() {
+        let src = "const u = `see https://x.test/* not */`; const r = /\\/\\//; const s = \"// no\"; // yes\n";
+        assert_eq!(comments("a.js", src), ["yes"]);
     }
 
     #[test]
-    fn template_literal_contents_are_not_comments() {
-        // A `//` inside a JS template literal (here a URL) must not be read as
-        // a line comment that swallows the rest of the line.
-        let src = "const e=`see https://react.dev/errors/ for details`;\n// real\n";
-        // Without template awareness the old scanner treated `//react.dev/...`
-        // as a comment running to the newline.
-        let with_templates = bodies(src, CommentStyle::CStyleTemplate);
+    fn rust_lifetimes_chars_raw_strings_and_nested_blocks() {
         assert_eq!(
-            with_templates,
-            vec![" real"],
-            "only the genuine `// real` comment"
-        );
-
-        // The plain C-style mode (no backtick strings) still sees both.
-        assert_eq!(bodies(src, CommentStyle::CStyle).len(), 2);
-    }
-
-    #[test]
-    fn template_literal_block_comment_marker_ignored() {
-        // `/*` inside a template literal must not open a block comment.
-        let src = "const g=`glob /* not a comment */ pattern`;\nx=1;\n";
-        let comments = bodies(src, CommentStyle::CStyleTemplate);
-        assert!(
-            comments.is_empty(),
-            "no comments expected, got {comments:?}"
-        );
-    }
-
-    #[test]
-    fn unterminated_block_comment_runs_to_the_end() {
-        assert_eq!(bodies("x /* abc", CommentStyle::CStyle), vec![" abc"]);
-    }
-
-    /// A lifetime's `'` was read as an opening quote, so everything up to the
-    /// next `'` — often the rest of the file — vanished from the comment view.
-    #[test]
-    fn rust_lifetimes_do_not_hide_comments() {
-        let src = "fn f(s: &'static str) { // SECRET\n}\n";
-        assert_eq!(bodies(src, CommentStyle::Rust), vec![" SECRET"]);
-        let src = "fn g<'a, 'b>(x: &'a str) -> &'b str { 'outer: loop {} } /* note */\n";
-        assert_eq!(bodies(src, CommentStyle::Rust), vec![" note "]);
-    }
-
-    #[test]
-    fn rust_char_literals_still_hide_their_contents() {
-        let src = "let a = '/'; let b = '\\''; let c = b'\"'; let d = '\\u{1F600}'; // real\n";
-        assert_eq!(bodies(src, CommentStyle::Rust), vec![" real"]);
-        assert_eq!(
-            bodies("let s = '語'; // x\n", CommentStyle::Rust),
-            vec![" x"]
-        );
-    }
-
-    #[test]
-    fn rust_raw_strings_and_nested_blocks() {
-        let src = "let p = r\"C:\\dir\\\"; // after\nlet q = r#\"say \"// no\"\"#;\n";
-        assert_eq!(bodies(src, CommentStyle::Rust), vec![" after"]);
-        let src = "/* outer /* inner */ still outer */ x // tail\n";
-        assert_eq!(
-            bodies(src, CommentStyle::Rust),
-            vec![" outer /* inner */ still outer ", " tail"]
-        );
-        // An identifier ending in `r` is not a raw-string prefix.
-        let src = "let ptr = bar\"x\"; // c\n";
-        assert_eq!(bodies(src, CommentStyle::Rust), vec![" c"]);
-    }
-
-    #[test]
-    fn hash_comments_are_extracted() {
-        let comments = bodies(
-            "# foo\nx = 1  # inline\n\"# not a comment\"\n'''# nor\nthis'''\n",
-            CommentStyle::Hash,
-        );
-        assert_eq!(comments, vec![" foo", " inline"]);
-    }
-
-    #[test]
-    fn double_dash_and_semicolon_comments() {
-        assert_eq!(
-            bodies("x = '--no' -- yes\n", CommentStyle::DoubleDash),
-            vec![" yes"]
+            comments("a.rs", "fn f(s: &'static str) { // SECRET\n}\n"),
+            ["SECRET"]
         );
         assert_eq!(
-            bodies("(def s \";no\") ; yes\n", CommentStyle::Semicolon),
-            vec![" yes"]
+            comments(
+                "a.rs",
+                "fn g() { let c = '\"'; let r = r#\"// no\"#; } // real\n"
+            ),
+            ["real"]
         );
+        assert_eq!(
+            comments("a.rs", "/* outer /* inner */ still */ fn h() {}\n"),
+            ["outer /* inner */ still"]
+        );
+    }
+
+    /// `#` in a parameter expansion or a heredoc is not a comment.
+    #[test]
+    fn shell_comments_only() {
+        let src = "n=${#x} # length\ncat <<EOF\n# not a comment\nEOF\n";
+        assert_eq!(comments("a.sh", src), ["length"]);
+    }
+
+    #[test]
+    fn hash_double_dash_and_semicolon_comments() {
+        assert_eq!(comments("a.py", "x = '#no' # yes\n"), ["yes"]);
+        assert_eq!(
+            comments("a.lua", "x = '--no' -- yes\n--[[ block ]]\n"),
+            ["yes", "block"]
+        );
+        assert_eq!(comments("a.clj", "(def s \";no\") ; yes\n"), ["yes"]);
+    }
+
+    #[test]
+    fn batch_comments_are_found() {
+        let found = comments(
+            "a.bat",
+            "@echo off\nREM first\n:: second\n@rem third\necho rem not\n",
+        );
+        assert_eq!(found, ["first", "second", "third"]);
+        // A multi-byte character right after the marker does not split a char.
+        assert_eq!(comments("a.bat", "REM 語\n"), ["語"]);
     }
 
     #[test]
     fn todo_fixme_detection() {
-        let mut m = Metrics::new();
-        let mut comments = crate::output::Comments::new();
-        emit(
-            "// TODO fix\n// fixme broken\n",
-            CommentStyle::CStyle,
-            &mut m,
-            &mut comments,
+        let m = metrics(
+            "a.c",
+            "// TODO: fix\n// FIXME later\n/* HACK */\n// xxx\nint x;\n",
         );
+        assert_eq!(m.get("comments.count"), Some(4.0));
         assert_eq!(m.get("comments.todo_count"), Some(1.0));
         assert_eq!(m.get("comments.fixme_count"), Some(1.0));
-        assert_eq!(comments.len(), 2, "both comment bodies exposed as facts");
+        assert_eq!(m.get("comments.hack_count"), Some(1.0));
+        assert_eq!(m.get("comments.xxx_count"), Some(1.0));
     }
 
-    /// The automaton must find what per-pattern case-folded `contains` found,
-    /// including overlapping patterns, and non-ASCII comments keep the full
-    /// Unicode case mapping.
     #[test]
     fn pattern_hits_match_case_folded_contains() {
         let corpus = [
@@ -682,32 +416,5 @@ mod tests {
         // `= function(` holds two overlapping patterns.
         let hits = pattern_hits("x = function(a)");
         assert_eq!((hits & CODE_PATTERN_BITS).count_ones(), 2);
-    }
-
-    #[test]
-    fn batch_comments_are_extracted() {
-        // `::` keeps text verbatim (leading space preserved); `rem` trims.
-        let src = ":: colon comment\nREM upper\n  rem indented\r\ncode\n";
-        let comments = extract_batch_comments(src);
-        let found: Vec<_> = comments.iter().map(|c| c.body).collect();
-        assert_eq!(found, vec![" colon comment", "upper", "indented"]);
-        for comment in comments {
-            assert_eq!(&src[comment.offset..][..comment.body.len()], comment.body);
-        }
-        // `rem` must be a whole token: `remove` is code, not a comment.
-        assert!(extract_batch_comments("remove x\n").is_empty());
-    }
-
-    #[test]
-    fn batch_comment_multibyte_line_does_not_panic() {
-        // A trimmed line can begin with a multi-byte char (CJK source comments
-        // are common in real packages). The `rem` check must not byte-slice at
-        // index 3 — `语言` splits mid-char there and used to panic. Regression
-        // for the matrixone scan crash (filefacts comment_metrics:181).
-        let got: Vec<_> = extract_batch_comments("语言 test\nREM ok\n")
-            .into_iter()
-            .map(|c| c.body)
-            .collect();
-        assert_eq!(got, vec!["ok"], "multibyte line ignored, real REM kept");
     }
 }

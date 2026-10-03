@@ -95,10 +95,13 @@ pub enum LiteralEncoding {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Literal {
-    /// The value, decoded to UTF-8.
-    pub text: String,
-    /// Byte offset in the analysed file where the value's source starts.
-    /// `0` for a comment body, whose position is not tracked.
+    /// The value, decoded to UTF-8. Named as stng's
+    /// [`ExtractedString::value`](stng::ExtractedString) is, so every string
+    /// view reads the same field; `text` is still accepted when reading.
+    #[serde(alias = "text")]
+    pub value: String,
+    /// Byte offset in the analysed file where the value's source starts: a
+    /// literal's opening quote, or a comment body's first character.
     pub offset: u64,
     /// How the value was recovered; `None` for a literal read straight out
     /// of a parse tree.
@@ -113,9 +116,9 @@ pub struct Literal {
 impl Literal {
     /// A literal recovered at `offset` with no further annotation.
     #[must_use]
-    pub fn new(text: impl Into<String>, offset: u64) -> Self {
+    pub fn new(value: impl Into<String>, offset: u64) -> Self {
         Self {
-            text: text.into(),
+            value: value.into(),
             offset,
             method: None,
             encoding: None,
@@ -142,7 +145,7 @@ impl Literal {
 /// build a [`Literal`] directly.
 #[derive(Debug, Default)]
 pub(crate) struct ExtractedString {
-    pub(crate) text: String,
+    pub(crate) value: String,
     pub(crate) offset: usize,
     /// Never set by the source extractors; present so their
     /// `..Default::default()` row literals stay meaningful.
@@ -152,7 +155,7 @@ pub(crate) struct ExtractedString {
 impl From<ExtractedString> for Literal {
     fn from(row: ExtractedString) -> Self {
         Self {
-            text: row.text,
+            value: row.value,
             offset: row.offset as u64,
             method: row.method,
             encoding: None,
@@ -422,7 +425,7 @@ impl Strings {
         let literals = self
             .literals
             .iter()
-            .map(|s| (Span::new(s.offset, s.text.len() as u64), s.text.as_str()));
+            .map(|s| (Span::new(s.offset, s.value.len() as u64), s.value.as_str()));
         text.chain(literals)
     }
 }
@@ -554,10 +557,23 @@ mod tests {
     fn producer_rows_convert_on_push() {
         let mut lits = Literals::new();
         lits.push(ExtractedString {
-            text: "x".into(),
+            value: "x".into(),
             offset: 9,
             ..ExtractedString::default()
         });
         assert_eq!(lits.as_slice(), &[Literal::new("x", 9)]);
+    }
+
+    /// Rows serialize their string as `value`, like stng's text rows, and
+    /// still read the `text` they were written with before.
+    #[test]
+    fn literal_rows_name_their_string_value() {
+        let row = Literal::new("x", 9);
+        assert_eq!(
+            serde_json::to_value(&row).unwrap(),
+            serde_json::json!({"value": "x", "offset": 9})
+        );
+        let old: Literal = serde_json::from_str(r#"{"text":"x","offset":9}"#).unwrap();
+        assert_eq!(old, row);
     }
 }

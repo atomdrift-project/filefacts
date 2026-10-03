@@ -227,12 +227,9 @@ pub(super) fn extract(
     // Byte-level / line-level / whitespace text metrics — language-agnostic.
     text_metrics::emit(source, metrics);
 
-    // Comment metrics use the language's comment style; no AST. Also
-    // collects comment bodies into the comment-scoped string tier.
-    comment_metrics::emit(source, config.comment_style, metrics, &mut strings.comments);
-
     // One walk for every collector that only reads each node once.
     let mut walked = visit::Collectors {
+        comments: Some(visit::Comments::default()),
         literals: Some(visit::Literals::default()),
         identifiers: Some(visit::Identifiers::default()),
         functions: Some(function_metrics::Collector::default()),
@@ -240,6 +237,14 @@ pub(super) fn extract(
         payload: payload_flow::Collector::new(source, config.lang),
     };
     visit::walk(root, source, config, &mut walked);
+    // Comment metrics over the comment nodes the walk found; also fills the
+    // comment-scoped string tier with their bodies.
+    comment_metrics::emit(
+        &walked.comments.take().unwrap_or_default().found,
+        source,
+        metrics,
+        &mut strings.comments,
+    );
     for literal in walked.literals.take().unwrap_or_default().found {
         strings.literals.push(literal);
     }
@@ -272,7 +277,7 @@ pub(super) fn extract(
 
     // String-literal metrics — operate on the literals we already
     // extracted into the `strings` view.
-    let literal_refs: Vec<&str> = strings.literals.iter().map(|s| s.text.as_str()).collect();
+    let literal_refs: Vec<&str> = strings.literals.iter().map(|s| s.value.as_str()).collect();
     string_metrics::emit(&literal_refs, metrics);
 
     // Import metrics — feed the canonical language name so stdlib

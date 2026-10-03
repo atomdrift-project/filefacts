@@ -373,7 +373,7 @@ fn prefixed_literals_decode_in_call_arguments_like_literals() {
         })
         .collect();
     assert_eq!(args, ["cmd {x}", "A", "\\d", "\\x42", "plain"]);
-    let literals: Vec<&str> = parsed.literals().iter().map(|l| l.text.as_str()).collect();
+    let literals: Vec<&str> = parsed.literals().iter().map(|l| l.value.as_str()).collect();
     for arg in &args {
         assert!(
             literals.contains(&arg.as_str()),
@@ -389,7 +389,7 @@ fn prefixed_literals_decode_in_call_arguments_like_literals() {
         parsed
             .literals()
             .iter()
-            .any(|l| l.text == "q{rm -rf /tmp/x}"),
+            .any(|l| l.value == "q{rm -rf /tmp/x}"),
         "unquoted literal keeps its source text in the literal tier"
     );
     assert!(
@@ -659,7 +659,7 @@ fn powershell_protocolless_url_argument_is_extracted_as_literal() {
         parsed
             .literals()
             .iter()
-            .any(|literal| literal.text == "cdn.jsdelivr.net/gh/19875567137/repo/80-7314"),
+            .any(|literal| literal.value == "cdn.jsdelivr.net/gh/19875567137/repo/80-7314"),
         "protocol-less PowerShell URL argument was not promoted to literals"
     );
 }

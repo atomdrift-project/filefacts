@@ -61,6 +61,21 @@ impl KindSet {
         Self(bits.into_boxed_slice())
     }
 
+    /// Every named kind whose name `keep` accepts.
+    fn named_where(language: &Language, keep: impl Fn(&str) -> bool) -> Self {
+        let count = language.node_kind_count();
+        let mut bits = vec![0u64; count.div_ceil(64)];
+        for id in 0..count {
+            let Ok(id) = u16::try_from(id) else { break };
+            if language.node_kind_is_named(id) && language.node_kind_for_id(id).is_some_and(&keep) {
+                if let Some(word) = bits.get_mut(usize::from(id) / 64) {
+                    *word |= 1 << (id % 64);
+                }
+            }
+        }
+        Self(bits.into_boxed_slice())
+    }
+
     #[inline]
     pub(super) fn contains(&self, id: u16) -> bool {
         self.0
@@ -88,6 +103,11 @@ pub(super) struct NodeIds {
     pub(super) variable_declarator: KindSet,
     pub(super) python_import: KindSet,
     pub(super) attribute_item: KindSet,
+    /// Comment nodes: every named kind with `comment` in its name
+    /// (`comment`, `line_comment`, `block_comment`, `multiline_comment`,
+    /// `html_comment`, …). The grammar has already told comments from the
+    /// strings, regexes and heredocs around them.
+    comment: KindSet,
     generic_token: KindSet,
     command_elements: KindSet,
     pub(super) operator_field: Option<u16>,
@@ -123,6 +143,7 @@ impl NodeIds {
             variable_declarator: set(&["variable_declarator"]),
             python_import: set(&["import_statement", "import_from_statement"]),
             attribute_item: set(&["attribute_item"]),
+            comment: KindSet::named_where(&language, |name| name.contains("comment")),
             generic_token: set(&["generic_token"]),
             command_elements: set(&["command_elements"]),
             operator_field: field("operator"),
@@ -159,6 +180,7 @@ pub(super) struct Visit<'t> {
 /// `None` costs nothing.
 #[derive(Default)]
 pub(super) struct Collectors<'t> {
+    pub(super) comments: Option<Comments<'t>>,
     pub(super) literals: Option<Literals>,
     pub(super) identifiers: Option<Identifiers<'t>>,
     pub(super) functions: Option<function_metrics::Collector>,
@@ -257,6 +279,9 @@ impl<'t> Collectors<'t> {
         ids: &NodeIds,
         scratch: &mut TreeCursor<'t>,
     ) {
+        if let Some(comments) = &mut self.comments {
+            comments.enter(visit, source, ids);
+        }
         if let Some(literals) = &mut self.literals {
             literals.enter(visit, ids);
         }
@@ -274,6 +299,9 @@ impl<'t> Collectors<'t> {
     }
 
     fn exit(&mut self, visit: &Visit<'t>, source: &'t str, config: &LangConfig, ids: &NodeIds) {
+        if let Some(comments) = &mut self.comments {
+            comments.exit(visit);
+        }
         if let Some(literals) = &mut self.literals {
             literals.exit(visit, source, config, ids);
         }
@@ -328,7 +356,7 @@ impl Literals {
                     .or_else(|| super::unquoted_literal(visit.node, source).map(str::to_string))
                 {
                     self.found.push(ExtractedString {
-                        text,
+                        value: text,
                         offset: visit.node.start_byte(),
                         ..ExtractedString::default()
                     });
@@ -352,7 +380,7 @@ impl Literals {
                     if let Ok(text) = visit.node.utf8_text(source.as_bytes()) {
                         if super::looks_like_protocolless_url(text) {
                             self.found.push(ExtractedString {
-                                text: text.to_string(),
+                                value: text.to_string(),
                                 offset: visit.node.start_byte(),
                                 ..ExtractedString::default()
                             });
@@ -360,6 +388,33 @@ impl Literals {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Every outermost comment node's text and start offset, in source order,
+/// for [`super::comment_metrics`]. A comment's own children (Rust's doc
+/// markers, a grammar's `comment_content`) are not comments of their own.
+#[derive(Default)]
+pub(super) struct Comments<'t> {
+    pub(super) found: Vec<(usize, &'t str)>,
+    /// Depth of the comment node being skipped through.
+    inside: Option<u32>,
+}
+
+impl<'t> Comments<'t> {
+    fn enter(&mut self, visit: &Visit<'t>, source: &'t str, ids: &NodeIds) {
+        if self.inside.is_none() && ids.comment.contains(visit.kind_id) {
+            self.inside = Some(visit.depth);
+            if let Ok(text) = visit.node.utf8_text(source.as_bytes()) {
+                self.found.push((visit.node.start_byte(), text));
+            }
+        }
+    }
+
+    fn exit(&mut self, visit: &Visit<'t>) {
+        if self.inside == Some(visit.depth) {
+            self.inside = None;
         }
     }
 }
@@ -412,7 +467,7 @@ mod tests {
     #[test]
     fn literals_keep_the_original_walk_order() {
         let parsed = open("a.py", "x = 'a'\ny = ['b', 'c']\n");
-        let texts: Vec<&str> = parsed.literals().iter().map(|l| l.text.as_str()).collect();
+        let texts: Vec<&str> = parsed.literals().iter().map(|l| l.value.as_str()).collect();
         assert_eq!(texts, ["c", "b", "a"]);
     }
 

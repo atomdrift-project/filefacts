@@ -25,12 +25,12 @@ fn inputs(literals: &Literals, budget: usize) -> (Vec<stng::ExtractedString>, Ve
         if !matches!(
             literal.method,
             Some(LiteralMethod::ScptLiteral | LiteralMethod::ScptConstant)
-        ) || literal.text.is_empty()
-            || !seen.insert((literal.offset, literal.text.as_str()))
+        ) || literal.value.is_empty()
+            || !seen.insert((literal.offset, literal.value.as_str()))
         {
             continue;
         }
-        let len = literal.text.len();
+        let len = literal.value.len();
         if len > MAX_STRING || len > remaining || rows.len() >= MAX_STRINGS {
             limited = true;
             continue;
@@ -45,9 +45,9 @@ fn inputs(literals: &Literals, budget: usize) -> (Vec<stng::ExtractedString>, Ve
             anchor: literal.offset,
         });
         rows.push(stng::ExtractedString {
-            value: literal.text.clone(),
+            value: literal.value.clone(),
             data_offset: cursor,
-            kind: stng::classify_string(&literal.text),
+            kind: stng::classify_string(&literal.value),
             ..Default::default()
         });
         cursor += len as u64 + 1;
@@ -78,7 +78,7 @@ pub(super) fn recover(literals: &mut Literals) -> (usize, bool) {
     }
     let mut seen: BTreeSet<_> = literals
         .iter()
-        .map(|s| (s.offset, s.text.clone()))
+        .map(|s| (s.offset, s.value.clone()))
         .collect();
     let mut remaining = MAX_BYTES;
     let mut count = 0;
@@ -131,9 +131,9 @@ mod tests {
             assert!(
                 literals
                     .iter()
-                    .any(|s| s.text == ENCODED && s.method == Some(source))
+                    .any(|s| s.value == ENCODED && s.method == Some(source))
             );
-            assert!(literals.iter().any(|s| s.text == COMMAND
+            assert!(literals.iter().any(|s| s.value == COMMAND
                 && s.offset == 100
                 && s.method == Some(LiteralMethod::ScptBase64)));
             assert_eq!(
@@ -157,7 +157,7 @@ mod tests {
         recover(&mut literals);
         let anchors: BTreeSet<_> = literals
             .iter()
-            .filter(|s| s.text == COMMAND)
+            .filter(|s| s.value == COMMAND)
             .map(|s| s.offset)
             .collect();
         assert_eq!(anchors, BTreeSet::from([10, 500]));

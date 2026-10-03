@@ -18,6 +18,19 @@ Every target opens with the disk cache and rizin off, and touches every view:
 strings, values, metrics, symbols, sections, archive members, flow, identity,
 references and errors.
 
+filefacts catches extractor panics and records them as `panic` diagnostics,
+so on their own they never reach libFuzzer. The driver re-raises any it finds
+as a crash. Set `FUZZ_ALLOW_CAUGHT_PANICS=1` to skip that and look only for
+what the catch cannot stop.
+
+Without rustup's `+nightly`, the stable compiler can build the targets when
+it is allowed unstable flags and no sanitizer is requested:
+
+```sh
+RUSTC_BOOTSTRAP=1 cargo fuzz build -O -s none
+RUSTC_BOOTSTRAP=1 cargo fuzz run -O -s none pdf -- -rss_limit_mb=2048 -timeout=10
+```
+
 ## Running
 
 You need a nightly toolchain and `cargo install cargo-fuzz`. Run from the

@@ -675,7 +675,7 @@ int legit_function(void) { return 0; }
     let comments = parsed.comments();
     let joined: String = comments
         .iter()
-        .map(|c| c.text.as_str())
+        .map(|c| c.value.as_str())
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
@@ -1121,7 +1121,7 @@ fn elixir_heredoc_literals_strip_delimiters_and_indentation() {
             .path(std::path::Path::new("heredoc.ex"))
             .open(source.as_bytes());
         assert!(
-            p.literals().iter().any(|s| s.text == expected),
+            p.literals().iter().any(|s| s.value == expected),
             "{literal}: {:?}",
             p.literals()
         );

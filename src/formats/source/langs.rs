@@ -27,8 +27,6 @@ use tree_sitter::Query;
 
 use crate::fileid::FileType;
 
-use super::comment_metrics::CommentStyle;
-
 /// A source language with a tree-sitter grammar: one variant per
 /// [`LangConfig`]. Per-language behaviour and tables are keyed on this, never
 /// on the label string, so adding a language makes every exhaustive `match`
@@ -145,8 +143,6 @@ pub(super) struct LangConfig {
     pub(super) lang: Lang,
     /// Grammar constructor. Called once per parse.
     pub(super) language: fn() -> tree_sitter::Language,
-    /// Comment-extraction style for `comments.*` metrics.
-    pub(super) comment_style: CommentStyle,
 
     // ------------------------------------------------------------------
     // Surface-extraction queries
@@ -375,7 +371,6 @@ pub(super) fn file_type_named(name: &str) -> Option<FileType> {
 static JAVASCRIPT: LangConfig = LangConfig {
     lang: Lang::JavaScript,
     language: || tree_sitter_javascript::LANGUAGE.into(),
-    comment_style: CommentStyle::CStyleTemplate,
     string_kinds: &["string", "template_string"],
     import_query: r#"
         (import_statement source: (string) @import)
@@ -421,7 +416,6 @@ static JAVASCRIPT: LangConfig = LangConfig {
 static TYPESCRIPT: LangConfig = LangConfig {
     lang: Lang::TypeScript,
     language: || tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-    comment_style: CommentStyle::CStyleTemplate,
     string_kinds: &["string", "template_string"],
     import_query: r#"
         (import_statement source: (string) @import)
@@ -459,7 +453,6 @@ static TYPESCRIPT: LangConfig = LangConfig {
 static PYTHON: LangConfig = LangConfig {
     lang: Lang::Python,
     language: || tree_sitter_python::LANGUAGE.into(),
-    comment_style: CommentStyle::Hash,
     string_kinds: &["string"],
     import_query: r#"
         (import_statement name: (aliased_import) @import)
@@ -496,7 +489,6 @@ static PYTHON: LangConfig = LangConfig {
 static GO: LangConfig = LangConfig {
     lang: Lang::Go,
     language: || tree_sitter_go::LANGUAGE.into(),
-    comment_style: CommentStyle::CStyleTemplate,
     string_kinds: &["interpreted_string_literal", "raw_string_literal"],
     import_query: r#"
         (import_spec path: (interpreted_string_literal) @import)
@@ -535,7 +527,6 @@ static GO: LangConfig = LangConfig {
 static RUST: LangConfig = LangConfig {
     lang: Lang::Rust,
     language: || tree_sitter_rust::LANGUAGE.into(),
-    comment_style: CommentStyle::Rust,
     string_kinds: &["string_literal", "raw_string_literal"],
     import_query: r#"
         (use_declaration argument: (scoped_identifier path: (identifier) @import))
@@ -570,7 +561,6 @@ static RUST: LangConfig = LangConfig {
 static JAVA: LangConfig = LangConfig {
     lang: Lang::Java,
     language: || tree_sitter_java::LANGUAGE.into(),
-    comment_style: CommentStyle::CStyle,
     string_kinds: &["string_literal"],
     import_query: r#"
         (import_declaration (scoped_identifier) @import)
@@ -611,7 +601,6 @@ static JAVA: LangConfig = LangConfig {
 static BASH: LangConfig = LangConfig {
     lang: Lang::Bash,
     language: || tree_sitter_bash::LANGUAGE.into(),
-    comment_style: CommentStyle::Hash,
     string_kinds: &["string", "raw_string"],
     import_query: r#"
         (command
@@ -644,7 +633,6 @@ static BASH: LangConfig = LangConfig {
 static RUBY: LangConfig = LangConfig {
     lang: Lang::Ruby,
     language: || tree_sitter_ruby::LANGUAGE.into(),
-    comment_style: CommentStyle::Hash,
     string_kinds: &["string", "string_array", "symbol_array", "heredoc_body"],
     import_query: r#"
         (call
@@ -686,7 +674,6 @@ static RUBY: LangConfig = LangConfig {
 static LUA: LangConfig = LangConfig {
     lang: Lang::Lua,
     language: || tree_sitter_lua::LANGUAGE.into(),
-    comment_style: CommentStyle::DoubleDash,
     string_kinds: &["string"],
     import_query: r#"
         (function_call
@@ -720,7 +707,6 @@ static LUA: LangConfig = LangConfig {
 static CSHARP: LangConfig = LangConfig {
     lang: Lang::CSharp,
     language: || tree_sitter_c_sharp::LANGUAGE.into(),
-    comment_style: CommentStyle::CStyle,
     string_kinds: &[
         "string_literal",
         "verbatim_string_literal",
@@ -770,7 +756,6 @@ static CSHARP: LangConfig = LangConfig {
 static C: LangConfig = LangConfig {
     lang: Lang::C,
     language: || tree_sitter_c::LANGUAGE.into(),
-    comment_style: CommentStyle::CStyle,
     string_kinds: &["string_literal"],
     import_query: r#"
         (preproc_include path: (system_lib_string) @import)
@@ -812,7 +797,6 @@ static C: LangConfig = LangConfig {
 static SCALA: LangConfig = LangConfig {
     lang: Lang::Scala,
     language: || tree_sitter_scala::LANGUAGE.into(),
-    comment_style: CommentStyle::CStyle,
     string_kinds: &["string", "interpolated_string_expression"],
     import_query: r#"
         (import_declaration (identifier) @import)
@@ -846,7 +830,6 @@ static SCALA: LangConfig = LangConfig {
 static OBJC: LangConfig = LangConfig {
     lang: Lang::ObjC,
     language: || tree_sitter_objc::LANGUAGE.into(),
-    comment_style: CommentStyle::CStyle,
     string_kinds: &["string_literal"],
     import_query: r#"
         (preproc_include path: (system_lib_string) @import)
@@ -882,7 +865,6 @@ static OBJC: LangConfig = LangConfig {
 static KOTLIN: LangConfig = LangConfig {
     lang: Lang::Kotlin,
     language: || tree_sitter_kotlin_ng::LANGUAGE.into(),
-    comment_style: CommentStyle::CStyle,
     string_kinds: &["string_literal", "character_literal"],
     import_query: r#"
         (import (qualified_identifier) @import)
@@ -915,7 +897,6 @@ static KOTLIN: LangConfig = LangConfig {
 static SWIFT: LangConfig = LangConfig {
     lang: Lang::Swift,
     language: || tree_sitter_swift::LANGUAGE.into(),
-    comment_style: CommentStyle::CStyle,
     string_kinds: &[
         "line_string_literal",
         "multi_line_string_literal",
@@ -957,7 +938,6 @@ static SWIFT: LangConfig = LangConfig {
 static POWERSHELL: LangConfig = LangConfig {
     lang: Lang::PowerShell,
     language: || tree_sitter_powershell::LANGUAGE.into(),
-    comment_style: CommentStyle::Hash,
     string_kinds: &[
         "string_literal",
         "expandable_string_literal",
@@ -1005,7 +985,6 @@ static POWERSHELL: LangConfig = LangConfig {
 static PHP: LangConfig = LangConfig {
     lang: Lang::Php,
     language: || tree_sitter_php::LANGUAGE_PHP.into(),
-    comment_style: CommentStyle::CStyle,
     string_kinds: &["string", "string_content", "heredoc_body"],
     import_query: r#"
         (namespace_use_clause (qualified_name) @import)
@@ -1049,7 +1028,6 @@ static PHP: LangConfig = LangConfig {
 static PERL: LangConfig = LangConfig {
     lang: Lang::Perl,
     language: || ts_parser_perl::LANGUAGE.into(),
-    comment_style: CommentStyle::Hash,
     string_kinds: &[
         "string_literal",
         "interpolated_string_literal",
@@ -1098,7 +1076,6 @@ static PERL: LangConfig = LangConfig {
 static GROOVY: LangConfig = LangConfig {
     lang: Lang::Groovy,
     language: || tree_sitter_groovy::LANGUAGE.into(),
-    comment_style: CommentStyle::CStyle,
     string_kinds: &["string_literal"],
     import_query: r#"
         (import_declaration (scoped_identifier) @import)
@@ -1136,7 +1113,6 @@ static GROOVY: LangConfig = LangConfig {
 static ZIG: LangConfig = LangConfig {
     lang: Lang::Zig,
     language: || tree_sitter_zig::LANGUAGE.into(),
-    comment_style: CommentStyle::CStyle,
     string_kinds: &["string", "multiline_string"],
     import_query: r#"
         (builtin_function
@@ -1174,7 +1150,6 @@ static ZIG: LangConfig = LangConfig {
 static ELIXIR: LangConfig = LangConfig {
     lang: Lang::Elixir,
     language: || tree_sitter_elixir::LANGUAGE.into(),
-    comment_style: CommentStyle::Hash,
     string_kinds: &["string", "charlist"],
     import_query: r#"
         (call
@@ -1215,7 +1190,6 @@ static ELIXIR: LangConfig = LangConfig {
 static MAKEFILE: LangConfig = LangConfig {
     lang: Lang::Makefile,
     language: || tree_sitter_make::LANGUAGE.into(),
-    comment_style: CommentStyle::Hash,
     string_kinds: &["string"],
     import_query: r#"
         (include_directive (list (word) @import))
@@ -1252,7 +1226,6 @@ static MAKEFILE: LangConfig = LangConfig {
 static CLOJURE: LangConfig = LangConfig {
     lang: Lang::Clojure,
     language: || tree_sitter_clojure::LANGUAGE.into(),
-    comment_style: CommentStyle::Semicolon,
     string_kinds: &["str_lit", "regex_lit"],
     import_query: "",
     function_query: "",
@@ -1281,7 +1254,6 @@ static CLOJURE: LangConfig = LangConfig {
 static BATCH: LangConfig = LangConfig {
     lang: Lang::Batch,
     language: || tree_sitter_batch::LANGUAGE.into(),
-    comment_style: CommentStyle::Batch,
     string_kinds: &["string"],
     import_query: "",
     function_query: "",

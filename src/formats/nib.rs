@@ -583,7 +583,7 @@ mod tests {
         ] {
             assert!(classes.contains(&class.to_string()), "missing {class}");
         }
-        let literals: Vec<&str> = strings.literals.iter().map(|s| s.text.as_str()).collect();
+        let literals: Vec<&str> = strings.literals.iter().map(|s| s.value.as_str()).collect();
         for text in [
             "Run Payload",
             "Installer",
@@ -614,7 +614,7 @@ mod tests {
         let run_payload = strings
             .literals
             .iter()
-            .find(|s| s.text == "Run Payload")
+            .find(|s| s.value == "Run Payload")
             .unwrap();
         assert_eq!(
             &NIBARCHIVE[run_payload.offset as usize..run_payload.offset as usize + 11],
@@ -630,17 +630,17 @@ mod tests {
         assert_dropper_facts(&values, &strings);
         assert_eq!(metrics.get("nib.connection_count").unwrap(), 2.0);
         // Archiver bookkeeping is not a string the nib carries.
-        assert!(strings.literals.iter().all(|s| s.text != "NSCustomObject"));
+        assert!(strings.literals.iter().all(|s| s.value != "NSCustomObject"));
         // Each literal's offset lands on its own bytes, so the short module
         // name is not confused with the front of the longer class name.
         for literal in &strings.literals {
             let start = literal.offset as usize;
-            let end = start + literal.text.len();
+            let end = start + literal.value.len();
             assert_eq!(
                 &KEYED[start..end],
-                literal.text.as_bytes(),
+                literal.value.as_bytes(),
                 "offset of {:?}",
-                literal.text
+                literal.value
             );
         }
     }

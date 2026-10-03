@@ -1144,18 +1144,14 @@ fn render_strings(value: &Value) -> String {
         ));
         for s in items.iter().take(STRING_PREVIEW_LIMIT) {
             let Value::Object(obj) = s else { continue };
-            // Text rows are stng's (`value`, `data_offset`); literal and
-            // comment rows are filefacts' (`text`, `offset`).
+            // Every row carries `value`; text rows are stng's (`data_offset`),
+            // literal and comment rows filefacts' (`offset`).
             let offset = obj
                 .get("offset")
                 .or_else(|| obj.get("data_offset"))
                 .and_then(Value::as_u64)
                 .map_or_else(|| "        ".into(), |o| format!("0x{o:08x}"));
-            let text = obj
-                .get("text")
-                .or_else(|| obj.get("value"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let text = obj.get("value").and_then(Value::as_str).unwrap_or("");
             let mut tags = Vec::<String>::new();
             if let Some(section) = obj.get("section").and_then(Value::as_str) {
                 tags.push(format!("{} {}", dim("§"), fg(FG_LABEL, section)));
