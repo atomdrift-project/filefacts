@@ -640,7 +640,7 @@ fn export_trie_at_the_depth_limit_is_walkable_on_a_worker_stack() {
 fn bind_opcodes_with_a_forged_repeat_count_are_refused() {
     // BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB, count 2^32 - 1, skip 0.
     let bind = [0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, 0x00];
-    let file = macho_with_dyld_info(&bind, &[]);
+    let file = macho_with_bind_tables(&bind);
     let GoblinOutcome::Ok(Mach::Binary(macho)) = parse_mach(&file) else {
         panic!("fixture must parse");
     };
@@ -658,15 +658,129 @@ fn bind_opcodes_within_budget_reach_goblin_unchanged() {
     let bind = [
         0x11, 0x40, b'_', b'a', 0x00, 0x70, 0x00, 0x90, 0xB1, 0xC0, 0x01, 0x00, 0x00,
     ];
-    let file = macho_with_dyld_info(&bind, &[]);
+    let file = macho_with_bind_tables(&bind);
     let GoblinOutcome::Ok(Mach::Binary(macho)) = parse_mach(&file) else {
         panic!("fixture must parse");
     };
-    assert_eq!(count_bind_imports(&file, 80, 80 + bind.len(), 0), 3);
+    assert_eq!(count_bind_imports(&file, 192, 192 + bind.len(), 0), 3);
     assert!(validate_bind_opcodes(&macho, &file).is_ok());
+    assert_eq!(macho.imports().expect("goblin binds them").len(), 3);
     // Truncated operands are goblin's to reject: the count stops there.
     assert_eq!(count_bind_imports(&[0x90, 0xA0, 0x80], 0, 3, 0), 2);
     assert_eq!(count_bind_imports(&[0xC0, 0x05], 0, 2, 0), 0);
+}
+
+/// goblin indexes `libs[ordinal]` and `segments[segment]` for every import
+/// it builds, unchecked: a bind through a dylib ordinal or segment past the
+/// binary's tables panicked inside it (found by fuzzing). The walk refuses
+/// such a stream before goblin runs it.
+#[test]
+fn bind_opcodes_past_the_dylib_or_segment_tables_are_refused() {
+    // Symbol `_a`, then ordinal 2 (only `self` and one dylib exist).
+    let ordinal = [0x12, 0x40, b'_', b'a', 0x00, 0x70, 0x00, 0x90, 0x00];
+    // Ordinal 1, but segment 3 of the one segment.
+    let segment = [0x11, 0x40, b'_', b'a', 0x00, 0x73, 0x00, 0x90, 0x00];
+    // A ULEB ordinal goblin truncates to its low byte: 0x102 is ordinal 2.
+    let wrapped = [
+        0x20, 0x82, 0x02, 0x40, b'_', b'a', 0x00, 0x70, 0x00, 0x90, 0x00,
+    ];
+    for (bind, table, index, len) in [
+        (&ordinal[..], "dylib ordinal", 2, 2),
+        (&segment[..], "segment", 3, 1),
+        (&wrapped[..], "dylib ordinal", 2, 2),
+    ] {
+        let file = macho_with_bind_tables(bind);
+        let GoblinOutcome::Ok(Mach::Binary(macho)) = parse_mach(&file) else {
+            panic!("fixture must parse");
+        };
+        let err = validate_bind_opcodes(&macho, &file).expect_err("index must trip");
+        assert!(
+            matches!(err, Rejection::BindIndexOutOfRange { stream: "bind", table: t, index: i, len: l }
+                if t == table && i == index && l == len),
+            "unexpected reason: {err}"
+        );
+        // goblin itself panics on it.
+        assert!(matches!(
+            catch(|| macho.imports()),
+            GoblinOutcome::Panicked(_)
+        ));
+    }
+    // A `DONE` resets the ordinal; a zero repeat count binds nothing.
+    let reset = [0x12, 0x00, 0x40, b'_', b'a', 0x00, 0x70, 0x00, 0x90, 0x00];
+    let empty_repeat = [
+        0x12, 0x40, b'_', b'a', 0x00, 0x70, 0x00, 0xC0, 0x00, 0x00, 0x00,
+    ];
+    for bind in [&reset[..], &empty_repeat[..]] {
+        let file = macho_with_bind_tables(bind);
+        let GoblinOutcome::Ok(Mach::Binary(macho)) = parse_mach(&file) else {
+            panic!("fixture must parse");
+        };
+        assert!(validate_bind_opcodes(&macho, &file).is_ok(), "{bind:x?}");
+    }
+    // The table-less fixture has no segment at all.
+    let file = macho_with_dyld_info(&ordinal, &[]);
+    let GoblinOutcome::Ok(Mach::Binary(macho)) = parse_mach(&file) else {
+        panic!("fixture must parse");
+    };
+    assert!(validate_bind_opcodes(&macho, &file).is_err());
+}
+
+/// A 64-bit Mach-O with one `__DATA` segment, one `LC_LOAD_DYLIB`
+/// (`libx.dylib`, ordinal 1 after goblin's `self`), and `bind` as its bind
+/// stream at file offset 192.
+pub(crate) fn macho_with_bind_tables(bind: &[u8]) -> Vec<u8> {
+    const SEGMENT: u32 = 72;
+    const DYLIB: u32 = 40;
+    const DYLD_INFO: u32 = 48;
+    let bind_off = 32 + SEGMENT + DYLIB + DYLD_INFO;
+    let mut file = Vec::new();
+    let words = |file: &mut Vec<u8>, ws: &[u32]| {
+        for w in ws {
+            file.extend_from_slice(&w.to_le_bytes());
+        }
+    };
+    words(
+        &mut file,
+        &[
+            0xfeed_facf,
+            0x0100_0007,
+            3,
+            2,
+            3,
+            SEGMENT + DYLIB + DYLD_INFO,
+            0,
+            0,
+        ],
+    );
+    words(&mut file, &[0x19, SEGMENT]);
+    file.extend_from_slice(b"__DATA\0\0\0\0\0\0\0\0\0\0");
+    // vmaddr, vmsize, fileoff, filesize: no file bytes, so any file fits.
+    for q in [0x1000_u64, 0x1000, 0, 0] {
+        file.extend_from_slice(&q.to_le_bytes());
+    }
+    words(&mut file, &[3, 3, 0, 0]);
+    words(&mut file, &[0x0c, DYLIB, 24, 0, 0, 0]);
+    file.extend_from_slice(b"libx.dylib\0\0\0\0\0\0");
+    words(
+        &mut file,
+        &[
+            0x8000_0022,
+            DYLD_INFO,
+            0,
+            0,
+            bind_off,
+            bind.len() as u32,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(file.len(), bind_off as usize);
+    file.extend_from_slice(bind);
+    file
 }
 
 /// A header cut off inside `e_shstrndx`, the last field zeroed, used to

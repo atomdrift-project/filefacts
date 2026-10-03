@@ -63,13 +63,21 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
         Mach::Fat(fat) => fat_table_fits(fat.narches, bytes.len()),
         Mach::Binary(_) => true,
     };
-    // Reuse this parse for string extraction instead of having stng parse the
-    // binary a second time.
+    // stng's ARM64 stack-XOR scan calls goblin's `imports()` itself, outside
+    // the bind budget `extract_symbols` enforces, and a forged repeat count
+    // has goblin push billions of imports there. Where a slice's bind
+    // streams fail that budget, stng gets a copy with them emptied; every
+    // other byte, and so every string offset, is the file's own.
+    let defused = bind_defused_copy(&parsed, bytes);
+    // Otherwise reuse this parse for string extraction instead of having stng
+    // parse the binary a second time.
     let object = goblin::Object::Mach(parsed);
-    if fat_table_fits {
-        extract_binary_strings_from_object(&object, bytes, strings, XorScan::Yes);
-    } else {
-        extract_binary_strings(bytes, strings, XorScan::Yes);
+    match &defused {
+        Some(copy) => extract_binary_strings(copy, strings, XorScan::Yes),
+        None if fat_table_fits => {
+            extract_binary_strings_from_object(&object, bytes, strings, XorScan::Yes);
+        }
+        None => extract_binary_strings(bytes, strings, XorScan::Yes),
     }
     let goblin::Object::Mach(parsed) = object else {
         unreachable!("constructed as Object::Mach")
@@ -182,6 +190,61 @@ fn macho_go_sections<'a>(macho: &MachO<'a>) -> (Option<&'a [u8]>, Option<&'a [u8
 }
 
 /// Whether a fat header's declared arch count fits in a file of `len` bytes.
+/// A copy of `bytes` in which every slice whose bind streams
+/// [`goblin_safe::validate_bind_opcodes`] rejects has its `LC_DYLD_INFO`
+/// bind and lazy-bind sizes zeroed, so goblin's `imports()` finds nothing to
+/// interpret there. Zero reads the same in either byte order. `None` when no
+/// slice needs it.
+fn bind_defused_copy(parsed: &Mach<'_>, bytes: &[u8]) -> Option<Vec<u8>> {
+    use mach::load_command::CommandVariant;
+    // `bind_size` and `lazy_bind_size` within a `dyld_info_command`.
+    const SIZE_FIELDS: [usize; 2] = [20, 36];
+    let mut patches: Vec<usize> = Vec::new();
+    let mut defuse = |macho: &MachO<'_>, slice: &[u8], base: usize| {
+        if goblin_safe::validate_bind_opcodes(macho, slice).is_ok() {
+            return;
+        }
+        for lc in &macho.load_commands {
+            if let CommandVariant::DyldInfo(_) | CommandVariant::DyldInfoOnly(_) = lc.command {
+                patches.extend(SIZE_FIELDS.iter().map(|field| base + lc.offset + field));
+            }
+        }
+    };
+    match parsed {
+        Mach::Binary(macho) => defuse(macho, bytes, 0),
+        Mach::Fat(fat) => {
+            let arches = goblin_safe::catch_infallible(|| {
+                fat.iter_arches()
+                    .take(MAX_FAT_ARCHES)
+                    .map_while(Result::ok)
+                    .collect::<Vec<_>>()
+            })
+            .ok()
+            .unwrap_or_default();
+            for arch in arches {
+                let start = arch.offset as usize;
+                let end = start.saturating_add(arch.size as usize).min(bytes.len());
+                if let Some(slice) = bytes.get(start..end)
+                    && let goblin_safe::GoblinOutcome::Ok(macho) =
+                        goblin_safe::parse_macho_slice(slice)
+                {
+                    defuse(&macho, slice, start);
+                }
+            }
+        }
+    }
+    if patches.is_empty() {
+        return None;
+    }
+    let mut copy = bytes.to_vec();
+    for at in patches {
+        if let Some(field) = copy.get_mut(at..at.saturating_add(4)) {
+            field.fill(0);
+        }
+    }
+    Some(copy)
+}
+
 fn fat_table_fits(narches: usize, len: usize) -> bool {
     narches
         <= len.saturating_sub(goblin::mach::fat::SIZEOF_FAT_HEADER)

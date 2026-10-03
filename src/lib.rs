@@ -623,6 +623,27 @@ impl<'a> ParsedFile<'a> {
         rizin_incomplete(self.metrics())
     }
 
+    /// Whether the source parse was cut short by something other than the
+    /// bytes: the wall-clock backstop, which depends on how loaded the
+    /// machine was, or cancellation.
+    ///
+    /// The AST facts are then missing for this run only. As with
+    /// [`Self::rizin_recovery_incomplete`], a caller caching analysis output
+    /// keyed by content **must not persist a payload while this is `true`**.
+    /// Every other reason a source file has no AST — its size, a scanner
+    /// guard, a work budget — follows from the bytes and is safe to cache.
+    /// Always `false` for views served from filefacts' own disk cache, which
+    /// never stores such a result.
+    pub fn source_parse_incomplete(&self) -> bool {
+        // Extraction is what parses; a cache hit never does.
+        let _ = self.extracted();
+        self.tree_parse
+            .get()
+            .and_then(Option::as_ref)
+            .and_then(formats::source::TreeParse::diagnostic)
+            .is_some_and(formats::source::TreeSitterDiagnostic::is_transient)
+    }
+
     /// Iterate every symbol name across the declaration kinds
     /// (`Import`, `Export`, `Function`) for cross-cutting matchers
     /// that ask "any declared name of this value regardless of role."
@@ -880,6 +901,14 @@ fn run_extraction(
         metrics.insert(metric!("source.ast_unavailable"), 1.0);
         metrics.insert(diagnostic.metric.clone(), 1.0);
         errors.record_fallback(crate::Stage::SourceParse, diagnostic.message.clone());
+    }
+    // Source that is not quite UTF-8 is still parsed (each stray byte as
+    // `_`); how much of it there was is a fact of its own.
+    if let Some(invalid) = tree_cache
+        .map(formats::source::TreeCache::invalid_utf8_bytes)
+        .filter(|&n| n > 0)
+    {
+        metrics.insert(metric!("source.invalid_utf8_bytes"), invalid as f64);
     }
     // Format extractors return `Result` so they can report a hard
     // "this file is not in the format I expect" failure. Any

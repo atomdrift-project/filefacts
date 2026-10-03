@@ -663,3 +663,54 @@ fn short_anonymous_runs_cost_nothing() {
     let cache = parsed.cache().expect("ordinary source parses");
     assert_eq!(anonymous_run_cost(cache.tree().root_node(), u64::MAX), 0);
 }
+
+/// Stray non-UTF-8 bytes are parsed as `_`, one for one, so every offset in
+/// the tree still points at the same byte of the input.
+#[test]
+fn invalid_utf8_is_repaired_byte_for_byte() {
+    let bytes = b"<?php // Caf\xe9 \xff\xfe\nsystem($x);\n";
+    let (text, invalid) = utf8_source(bytes);
+    assert_eq!(invalid, 3);
+    assert_eq!(text.len(), bytes.len());
+    assert_eq!(&text[..12], "<?php // Caf");
+    assert_eq!(&text[12..16], "_ __");
+
+    let (text, invalid) = utf8_source("<?php echo 'é';".as_bytes());
+    assert!(matches!(text, Cow::Borrowed(_)));
+    assert_eq!(invalid, 0);
+}
+
+/// One Latin-1 byte in a comment once cost a script its whole tree, and with
+/// it every call a rule could see.
+#[test]
+fn a_latin1_byte_no_longer_hides_the_tree() {
+    let bytes = b"<?php\n// Caf\xe9\nfunction f() { system($_GET['c']); }\n";
+    let parsed = TreeCache::parse(bytes, FileType::Php, None);
+    let cache = parsed.cache().expect("parsed despite the stray byte");
+    assert_eq!(cache.invalid_utf8_bytes(), 1);
+    assert_eq!(cache.source().len(), bytes.len());
+    assert!(!cache.tree().root_node().has_error());
+}
+
+/// Tree-sitter frees an ambiguous parse stack recursively. A long run of
+/// `(a)*` -- cast or multiplication -- used to overflow the stack and abort
+/// the process; a large input now parses on a thread sized for it. If this
+/// regresses, the whole test binary aborts.
+#[test]
+fn a_long_ambiguous_cast_chain_does_not_overflow_the_stack() {
+    let source = format!("int x = {}a;\n", "(a)*".repeat(100_000));
+    assert!(source.len() > INLINE_PARSE_MAX_BYTES);
+    let parsed = TreeCache::parse(source.as_bytes(), FileType::C, None);
+    assert!(
+        parsed.cache().is_some(),
+        "{:?}",
+        parsed.diagnostic().map(|d| &d.message)
+    );
+}
+
+#[test]
+fn parse_stacks_grow_with_the_input() {
+    assert_eq!(parse_stack_bytes(0), MIN_PARSE_STACK_BYTES);
+    assert_eq!(parse_stack_bytes(1 << 20), 128 << 20);
+    assert_eq!(parse_stack_bytes(usize::MAX), usize::MAX);
+}

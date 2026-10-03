@@ -112,6 +112,14 @@ pub(crate) enum Rejection {
     /// Mach-O bind opcodes that would make goblin synthesize more imports
     /// than [`MAX_MACHO_BIND_IMPORTS`].
     OversizedBindStream { stream: &'static str, imports: u64 },
+    /// Mach-O bind opcodes that bind through a dylib ordinal or segment index
+    /// past the binary's own tables, which goblin indexes without a check.
+    BindIndexOutOfRange {
+        stream: &'static str,
+        table: &'static str,
+        index: u64,
+        len: usize,
+    },
 }
 
 impl fmt::Display for Rejection {
@@ -149,6 +157,15 @@ impl fmt::Display for Rejection {
             Self::OversizedBindStream { stream, imports } => write!(
                 f,
                 "{stream} bind opcodes declare at least {imports} imports, past {MAX_MACHO_BIND_IMPORTS}"
+            ),
+            Self::BindIndexOutOfRange {
+                stream,
+                table,
+                index,
+                len,
+            } => write!(
+                f,
+                "{stream} bind opcodes bind through {table} {index} of {len}"
             ),
         }
     }
@@ -819,9 +836,20 @@ pub(crate) fn validate_bind_opcodes(macho: &MachO<'_>, bytes: &[u8]) -> Result<(
             ]);
         }
     }
+    let tables = BindTables {
+        libs: macho.libs.len(),
+        segments: macho.segments.len(),
+    };
     let mut imports = 0u64;
     for (stream, off, size) in streams.into_iter().flatten() {
-        imports = count_bind_imports(bytes, off, off.saturating_add(size), imports);
+        imports = walk_bind_stream(bytes, off, off.saturating_add(size), imports, tables).map_err(
+            |(table, index, len)| Rejection::BindIndexOutOfRange {
+                stream,
+                table,
+                index,
+                len,
+            },
+        )?;
         if imports > MAX_MACHO_BIND_IMPORTS {
             return Err(Rejection::OversizedBindStream { stream, imports });
         }
@@ -829,14 +857,66 @@ pub(crate) fn validate_bind_opcodes(macho: &MachO<'_>, bytes: &[u8]) -> Result<(
     Ok(())
 }
 
+/// A ULEB dylib ordinal as goblin's interpreter stores it: its low byte.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "goblin truncates the ordinal to u8; the walk must index what goblin will"
+)]
+fn goblin_ordinal(value: u64) -> u8 {
+    value as u8
+}
+
+/// The table sizes a bind stream's indices must stay within.
+#[derive(Clone, Copy)]
+struct BindTables {
+    libs: usize,
+    segments: usize,
+}
+
 /// Add the imports one bind-opcode stream at `start..end` would produce to
-/// `imports`, stopping as soon as the total passes the budget.
-fn count_bind_imports(bytes: &[u8], start: usize, end: usize, mut imports: u64) -> u64 {
+/// `imports`, stopping as soon as the total passes the budget. Unbounded
+/// tables: only the count matters.
+#[cfg(test)]
+fn count_bind_imports(bytes: &[u8], start: usize, end: usize, imports: u64) -> u64 {
+    let unbounded = BindTables {
+        libs: usize::MAX,
+        segments: usize::MAX,
+    };
+    walk_bind_stream(bytes, start, end, imports, unbounded).unwrap_or(imports)
+}
+
+/// Replay one bind-opcode stream at `start..end` as goblin's interpreter
+/// does, adding the imports it would produce to `imports`. Each import
+/// goblin builds indexes `libs[ordinal]` and `segments[segment]` unchecked,
+/// so a bind through either past `tables` is returned as
+/// `(table, index, len)` instead.
+fn walk_bind_stream(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    mut imports: u64,
+    tables: BindTables,
+) -> Result<u64, (&'static str, u64, usize)> {
     use goblin::mach::bind_opcodes::{
-        BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DO_BIND, BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED,
-        BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB, BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB,
-        BIND_OPCODE_MASK, BIND_OPCODE_SET_ADDEND_SLEB, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
-        BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM,
+        BIND_IMMEDIATE_MASK, BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DO_BIND,
+        BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED, BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB,
+        BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB, BIND_OPCODE_DONE, BIND_OPCODE_MASK,
+        BIND_OPCODE_SET_ADDEND_SLEB, BIND_OPCODE_SET_DYLIB_ORDINAL_IMM,
+        BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
+        BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM,
+    };
+    // goblin's `BindInformation` state: both start at 0, and `DONE` resets
+    // them. The ULEB ordinal is truncated to `u8`, as goblin stores it.
+    let mut ordinal: u8 = 0;
+    let mut segment: u8 = 0;
+    let bind = |imports: u64, ordinal: u8, segment: u8| {
+        if usize::from(ordinal) >= tables.libs {
+            return Err(("dylib ordinal", u64::from(ordinal), tables.libs));
+        }
+        if usize::from(segment) >= tables.segments {
+            return Err(("segment", u64::from(segment), tables.segments));
+        }
+        Ok(imports)
     };
     let mut offset = start;
     while offset < end && imports <= MAX_MACHO_BIND_IMPORTS {
@@ -844,10 +924,25 @@ fn count_bind_imports(bytes: &[u8], start: usize, end: usize, mut imports: u64) 
             break;
         };
         offset += 1;
+        let immediate = opcode & BIND_IMMEDIATE_MASK;
         let operand = match opcode & BIND_OPCODE_MASK {
-            BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB
-            | BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB
-            | BIND_OPCODE_ADD_ADDR_ULEB => read_uleb128(bytes, &mut offset).map(|_| ()),
+            BIND_OPCODE_DONE => {
+                ordinal = 0;
+                segment = 0;
+                Some(())
+            }
+            BIND_OPCODE_SET_DYLIB_ORDINAL_IMM => {
+                ordinal = immediate;
+                Some(())
+            }
+            BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB => read_uleb128(bytes, &mut offset).map(|value| {
+                ordinal = goblin_ordinal(value);
+            }),
+            BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB => {
+                segment = immediate;
+                read_uleb128(bytes, &mut offset).map(|_| ())
+            }
+            BIND_OPCODE_ADD_ADDR_ULEB => read_uleb128(bytes, &mut offset).map(|_| ()),
             // SLEB and ULEB share the continuation-bit framing.
             BIND_OPCODE_SET_ADDEND_SLEB => read_uleb128(bytes, &mut offset).map(|_| ()),
             BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM => bytes
@@ -855,20 +950,28 @@ fn count_bind_imports(bytes: &[u8], start: usize, end: usize, mut imports: u64) 
                 .and_then(|rest| rest.iter().position(|&b| b == 0))
                 .map(|len| offset += len + 1),
             BIND_OPCODE_DO_BIND | BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED => {
-                imports += 1;
+                imports = bind(imports, ordinal, segment)? + 1;
                 Some(())
             }
             BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB => {
-                imports += 1;
+                imports = bind(imports, ordinal, segment)? + 1;
                 read_uleb128(bytes, &mut offset).map(|_| ())
             }
-            BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB => read_uleb128(bytes, &mut offset)
-                .and_then(|count| {
-                    // goblin reads the skip before pushing anything.
-                    read_uleb128(bytes, &mut offset)?;
-                    imports = imports.saturating_add(count);
-                    Some(())
-                }),
+            BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB => {
+                let Some(count) = read_uleb128(bytes, &mut offset) else {
+                    break;
+                };
+                // goblin reads the skip before pushing anything, and pushes
+                // nothing, so indexes nothing, for a count of 0.
+                if read_uleb128(bytes, &mut offset).is_none() {
+                    break;
+                }
+                if count > 0 {
+                    imports = bind(imports, ordinal, segment)?;
+                }
+                imports = imports.saturating_add(count);
+                Some(())
+            }
             _ => Some(()),
         };
         if operand.is_none() {
@@ -876,7 +979,7 @@ fn count_bind_imports(bytes: &[u8], start: usize, end: usize, mut imports: u64) 
             break;
         }
     }
-    imports
+    Ok(imports)
 }
 
 #[cfg(test)]

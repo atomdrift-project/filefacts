@@ -522,9 +522,11 @@ fn errors_on_worker_stack(bytes: Vec<u8>) -> Errors {
 /// the refusal is visible in the errors view rather than only in debug logs.
 #[test]
 fn oversized_bind_stream_is_recorded_as_malformed() {
-    // BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB, count 2^32 - 1, skip 0.
+    // BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB, count 2^32 - 1, skip 0,
+    // through the fixture's real dylib ordinal and segment so the count is
+    // what trips.
     let bind = [0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, 0x00];
-    let file = crate::formats::goblin_safe::tests::macho_with_dyld_info(&bind, &[]);
+    let file = crate::formats::goblin_safe::tests::macho_with_bind_tables(&bind);
     let errors = errors_on_worker_stack(file);
     assert!(
         errors

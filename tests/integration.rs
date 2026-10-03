@@ -1694,3 +1694,34 @@ fn elf_overlay_starts_after_section_header_table() {
     bytes.extend(pseudo_random(2048));
     assert_eq!(overlay_of(&bytes), Some((22928, 220 + 2048)));
 }
+
+/// A parse cut short by the caller is not a fact about the bytes, and says so
+/// for callers that cache by content; an ordinary parse does not.
+#[test]
+fn a_cancelled_source_parse_is_reported_incomplete() {
+    use std::sync::atomic::AtomicBool;
+
+    let source = "def f():\n    return 1\n".repeat(20_000);
+    let ordinary = OpenOptions::new()
+        .path(std::path::Path::new("x.py"))
+        .open(source.as_bytes());
+    assert!(!ordinary.source_parse_incomplete());
+
+    let flag = AtomicBool::new(true);
+    let cancelled = OpenOptions::new()
+        .path(std::path::Path::new("x.py"))
+        .cancellation(&flag)
+        .open(source.as_bytes());
+    assert!(cancelled.source_parse_incomplete());
+}
+
+/// One stray Latin-1 byte must not hide a script's calls.
+#[test]
+fn a_latin1_byte_keeps_source_calls_visible() {
+    let bytes = b"<?php\n// Caf\xe9\nfunction f() { system($_GET['c']); }\n";
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("x.php"))
+        .open(bytes);
+    assert!(call_targets(&parsed).iter().any(|t| t == "system"));
+    assert_eq!(parsed.metrics().get("source.invalid_utf8_bytes"), Some(1.0));
+}

@@ -858,6 +858,7 @@ pub const CATALOG: &[&str] = &[
     "source.class_count",
     "source.extract_panicked",
     "source.function_count",
+    "source.invalid_utf8_bytes",
     "source.query_limited",
     "strings.avg_entropy",
     "strings.avg_length",
