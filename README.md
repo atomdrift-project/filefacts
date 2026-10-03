@@ -166,9 +166,9 @@ per file with `OpenOptions::rizin(false)`, or bound it with `rizin_timeout`,
 
 Representative formats include PE, ELF, Mach-O, WebAssembly, Android DEX, Java
 class files, Python bytecode, ZIP/TAR/7-Zip/RAR, deb/rpm/APK packages, OCI
-images, npm/wheel/gem/crate/NuGet packages, PDF, Office/OLE2, OOXML, RTF, LNK,
-plist, nib, JPEG/PNG, JSON/YAML/TOML/XML, package manifests, lockfiles, and more than
-20 source languages.
+images, npm/wheel/gem/crate/NuGet packages, PHP phar archives, PDF, Office/OLE2,
+OOXML, RTF, LNK, plist, nib, JPEG/PNG, JSON/YAML/TOML/XML, package manifests,
+lockfiles, and more than 20 source languages.
 
 Issues and pull requests are welcome in the
 [GitHub repository](https://github.com/atomdrift-project/filefacts).

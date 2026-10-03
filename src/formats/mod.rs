@@ -157,6 +157,7 @@ mod pe_manifest;
 mod pe_rich;
 mod pe_signature_trust;
 mod pe_version_info;
+pub(crate) mod phar;
 mod pickle;
 mod pkgmeta;
 mod plist_guard;
@@ -346,6 +347,7 @@ pub(crate) fn extract(
             ctx.errors,
         ),
         FileType::Asar => asar::extract(bytes, ctx.values, ctx.metrics, ctx.archive_members),
+        FileType::Phar => phar::extract(bytes, ctx.values, ctx.metrics, ctx.archive_members),
         FileType::Cpio => cpio::extract(bytes, ctx.values, ctx.metrics, ctx.archive_members),
         // The OOXML-specific `office.*` layer, then macros decompressed from
         // any `vbaProject.bin` member so `office.vba.modules[]` is populated

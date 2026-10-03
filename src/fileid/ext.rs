@@ -549,8 +549,8 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "vsix" => Some(FileType::Vsix),
         "egg" => Some(FileType::Egg),
         "conda" => Some(FileType::Conda),
-        "zip" | "apk" | "epub" | "aar" | "phar" | "pyz" | "msix" | "appx" | "msixbundle"
-        | "appxbundle" | "aab" | "apks" | "xapk" | "cbz" => Some(FileType::Zip),
+        "zip" | "apk" | "epub" | "aar" | "pyz" | "msix" | "appx" | "msixbundle" | "appxbundle"
+        | "aab" | "apks" | "xapk" | "cbz" => Some(FileType::Zip),
         "xpi" => Some(FileType::Xpi),
         "whl" => Some(FileType::Whl),
         "7z" | "cb7" => Some(FileType::SevenZ),
@@ -574,6 +574,7 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "cab" | "msu" => Some(FileType::Cab),
         "chm" => Some(FileType::Chm),
         "asar" => Some(FileType::Asar),
+        "phar" => Some(FileType::Phar),
         "cpio" => Some(FileType::Cpio),
         "gz" => Some(FileType::Gz),
         "bz2" => Some(FileType::Bz2),

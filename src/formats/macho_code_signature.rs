@@ -127,6 +127,315 @@ pub(super) fn parse(bytes: &[u8], sig_off: usize, sig_size: usize, values: &mut 
             _ => {}
         }
     }
+    check_code_directories(bytes, &entries, primary_cd, values);
+}
+
+/// CodeDirectory hash types (`CS_HASHTYPE_*`).
+const CS_HASHTYPE_SHA1: u8 = 1;
+const CS_HASHTYPE_SHA256: u8 = 2;
+const CS_HASHTYPE_SHA256_TRUNCATED: u8 = 3;
+const CS_HASHTYPE_SHA384: u8 = 4;
+
+/// First slot type of the alternate CodeDirectories; special slots number
+/// below it.
+const CSSLOT_ALTERNATE_CODEDIRECTORIES: u32 = 0x1000;
+/// Alternate CodeDirectory slots the kernel honours (`CSSLOT_ALTERNATE_
+/// CODEDIRECTORY_MAX`). A CodeDirectory elsewhere is never used to validate
+/// pages, so its pages are not hashed: that caps the image hashing at six
+/// passes however many CodeDirectories a signature lists.
+const CSSLOT_ALTERNATE_CODEDIRECTORY_MAX: u32 = 5;
+
+/// The digest a CodeDirectory of `hash_type` stores for `data`, and the slot
+/// length such a CodeDirectory must declare. `None` for a hash type this
+/// cannot compute.
+fn slot_digest(hash_type: u8, data: &[u8]) -> Option<(Vec<u8>, usize)> {
+    use sha1::Sha1;
+    use sha2::Sha384;
+    Some(match hash_type {
+        CS_HASHTYPE_SHA1 => (Sha1::digest(data).to_vec(), 20),
+        CS_HASHTYPE_SHA256 => (Sha256::digest(data).to_vec(), 32),
+        CS_HASHTYPE_SHA256_TRUNCATED => (Sha256::digest(data).to_vec(), 20),
+        CS_HASHTYPE_SHA384 => (Sha384::digest(data).to_vec(), 48),
+        _ => return None,
+    })
+}
+
+/// The parts of a CodeDirectory that bind code to it: where its hash slots
+/// sit, how many there are, and what they cover.
+struct CdSlots<'a> {
+    blob: &'a [u8],
+    hash_offset: usize,
+    n_special_slots: usize,
+    n_code_slots: usize,
+    code_limit: usize,
+    hash_size: usize,
+    hash_type: u8,
+    page_size_log2: u8,
+}
+
+impl<'a> CdSlots<'a> {
+    /// `None` for a header too short to read, or one using scatter vectors,
+    /// which split the image into ranges this does not walk.
+    fn read(blob: &'a [u8]) -> Option<Self> {
+        let version = bytes::u32_be(blob, 0x08)?;
+        if version >= 0x0002_0100 && bytes::u32_be(blob, 0x2c).is_some_and(|scatter| scatter != 0) {
+            return None;
+        }
+        let mut code_limit = u64::from(bytes::u32_be(blob, 0x20)?);
+        // `codeLimit64` replaces the 32-bit limit when set (v20300+).
+        if version >= 0x0002_0300
+            && let Some(limit64) = bytes::u64_be(blob, 0x38)
+            && limit64 != 0
+        {
+            code_limit = limit64;
+        }
+        let [hash_size, hash_type, _platform, page_size_log2] =
+            *blob.get(0x24..0x28)?.first_chunk::<4>()?;
+        Some(Self {
+            blob,
+            hash_offset: bytes::u32_be(blob, 0x10)? as usize,
+            n_special_slots: bytes::u32_be(blob, 0x18)? as usize,
+            n_code_slots: bytes::u32_be(blob, 0x1c)? as usize,
+            code_limit: usize::try_from(code_limit).ok()?,
+            hash_size: usize::from(hash_size),
+            hash_type,
+            page_size_log2,
+        })
+    }
+
+    /// The stored hash in slot `index`: a code slot from 0 up, a special
+    /// slot (counted from 1) below `hash_offset`.
+    fn slot(&self, index: isize) -> Option<&'a [u8]> {
+        let start = if index >= 0 {
+            self.hash_offset
+                .checked_add(index.unsigned_abs().checked_mul(self.hash_size)?)?
+        } else {
+            self.hash_offset
+                .checked_sub(index.unsigned_abs().checked_mul(self.hash_size)?)?
+        };
+        self.blob.get(start..start.checked_add(self.hash_size)?)
+    }
+
+    /// Fields that must agree across a signature's CodeDirectories: only
+    /// the primary is under the CMS signature, and Apple writes the same
+    /// identity into each alternate.
+    fn identity(&self) -> Option<CdIdentity> {
+        let version = bytes::u32_be(self.blob, 0x08)?;
+        let team = (version >= 0x0002_0200)
+            .then(|| bytes::u32_be(self.blob, 0x30))
+            .flatten()
+            .filter(|&off| off != 0)
+            .and_then(|off| read_cstr(self.blob, off as usize));
+        Some(CdIdentity {
+            identifier: read_cstr(self.blob, bytes::u32_be(self.blob, 0x14)? as usize),
+            team,
+            flags: bytes::u32_be(self.blob, 0x0c)?,
+            platform: *self.blob.get(0x26)?,
+            exec_segment: (version >= 0x0002_0400)
+                .then(|| self.blob.get(0x40..0x58)?.first_chunk::<24>().copied())
+                .flatten(),
+        })
+    }
+}
+
+/// The identity a CodeDirectory asserts, compared across alternates.
+#[derive(PartialEq, Eq)]
+struct CdIdentity {
+    identifier: Option<String>,
+    team: Option<String>,
+    flags: u32,
+    platform: u8,
+    exec_segment: Option<[u8; 24]>,
+}
+
+/// What one CodeDirectory's hash slots say about the image beside them.
+struct CdCheck {
+    /// Every code page hashes to its slot, and the slot count covers
+    /// exactly `codeLimit`.
+    pages_ok: bool,
+    mismatched_pages: u64,
+    first_mismatch: Option<u64>,
+    /// Every embedded blob in a special slot hashes to that slot. `None`
+    /// when no embedded blob falls in one.
+    special_ok: Option<bool>,
+}
+
+/// Page digests already computed, keyed by what determines them, so a
+/// signature listing the same CodeDirectory shape many times hashes the
+/// image once per shape.
+type PageDigests = Vec<((u8, u8, usize), Vec<Vec<u8>>)>;
+
+fn check_code_directory(
+    cd: &CdSlots<'_>,
+    image: &[u8],
+    entries: &[BlobEntry<'_>],
+    memo: &mut PageDigests,
+) -> Option<CdCheck> {
+    let (_, digest_len) = slot_digest(cd.hash_type, &[])?;
+    if cd.hash_size != digest_len {
+        return None;
+    }
+    let page_size = match cd.page_size_log2 {
+        0 => None,
+        log2 if log2 < 32 => Some(1usize << log2),
+        _ => return None,
+    };
+    let expected_slots = match page_size {
+        // Page size 0: one slot covers the whole of `codeLimit`.
+        None => usize::from(cd.code_limit > 0),
+        Some(page) => cd.code_limit.div_ceil(page),
+    };
+    let covered = cd.code_limit <= image.len()
+        && cd.n_code_slots == expected_slots
+        && cd
+            .n_special_slots
+            .checked_mul(cd.hash_size)
+            .is_some_and(|below| below <= cd.hash_offset)
+        && cd
+            .n_code_slots
+            .checked_mul(cd.hash_size)
+            .and_then(|above| above.checked_add(cd.hash_offset))
+            .is_some_and(|end| end <= cd.blob.len());
+    let mut check = CdCheck {
+        pages_ok: covered,
+        mismatched_pages: 0,
+        first_mismatch: None,
+        special_ok: None,
+    };
+    if covered {
+        let key = (cd.hash_type, cd.page_size_log2, cd.code_limit);
+        let digests = match memo.iter().position(|(k, _)| *k == key) {
+            Some(i) => &memo.get(i)?.1,
+            None => {
+                let code = image.get(..cd.code_limit)?;
+                // Page size 0 makes the whole of `codeLimit` one page.
+                let page = page_size.unwrap_or(code.len()).max(1);
+                let pages = code
+                    .chunks(page)
+                    .map(|page| slot_digest(cd.hash_type, page).map(|(d, _)| d))
+                    .collect::<Option<Vec<_>>>()?;
+                memo.push((key, pages));
+                &memo.last()?.1
+            }
+        };
+        let page = page_size.unwrap_or(cd.code_limit);
+        for (i, digest) in digests.iter().enumerate() {
+            let stored = cd.slot(isize::try_from(i).ok()?)?;
+            if digest.get(..cd.hash_size) != Some(stored) {
+                check.pages_ok = false;
+                check.mismatched_pages += 1;
+                check
+                    .first_mismatch
+                    .get_or_insert(u64::try_from(i.saturating_mul(page)).ok()?);
+            }
+        }
+    }
+    for entry in entries {
+        let Ok(slot) = usize::try_from(entry.slot) else {
+            continue;
+        };
+        if entry.slot == CSSLOT_CODEDIRECTORY
+            || entry.slot >= CSSLOT_ALTERNATE_CODEDIRECTORIES
+            || slot > cd.n_special_slots
+        {
+            continue;
+        }
+        let (digest, _) = slot_digest(cd.hash_type, entry.blob)?;
+        let bound = cd
+            .slot(-isize::try_from(slot).ok()?)
+            .is_some_and(|stored| digest.get(..cd.hash_size) == Some(stored));
+        check.special_ok = Some(check.special_ok.unwrap_or(true) && bound);
+    }
+    Some(check)
+}
+
+/// Recompute every CodeDirectory's hash slots from the image they sign.
+///
+/// A CMS signature covers the primary CodeDirectory, and a CodeDirectory
+/// covers the code only through its hash slots: one digest per page of the
+/// image up to `codeLimit`, and one per embedded blob (requirements,
+/// entitlements) in the special slots. Unless those are recomputed here, a
+/// genuine CodeDirectory and signature lifted from another binary vouch for
+/// whatever code sits beside them. The kernel checks pages against the
+/// strongest CodeDirectory, so each one present must hold, and since only the
+/// primary is under the signature, each alternate must repeat its identity.
+///
+/// A CodeDirectory this cannot check (unknown hash type, scatter vectors, a
+/// malformed header) reads as unverified: `code_pages_verified` is `false`.
+fn check_code_directories(
+    image: &[u8],
+    entries: &[BlobEntry<'_>],
+    primary: Option<&[u8]>,
+    values: &mut Values,
+) {
+    let directories: Vec<&BlobEntry<'_>> = entries
+        .iter()
+        .filter(|e| e.magic == CSMAGIC_CODEDIRECTORY)
+        .collect();
+    if directories.is_empty() {
+        return;
+    }
+    let alternates = CSSLOT_ALTERNATE_CODEDIRECTORIES
+        ..CSSLOT_ALTERNATE_CODEDIRECTORIES + CSSLOT_ALTERNATE_CODEDIRECTORY_MAX;
+    let mut memo = PageDigests::new();
+    let mut pages_ok = true;
+    let mut special: Option<bool> = None;
+    let mut mismatch: Option<(u64, Option<u64>)> = None;
+    for blob in directories
+        .iter()
+        .filter(|e| e.slot == CSSLOT_CODEDIRECTORY || alternates.contains(&e.slot))
+        .map(|e| e.blob)
+    {
+        let check =
+            CdSlots::read(blob).and_then(|cd| check_code_directory(&cd, image, entries, &mut memo));
+        let Some(check) = check else {
+            pages_ok = false;
+            continue;
+        };
+        pages_ok &= check.pages_ok;
+        if check.mismatched_pages > 0 && mismatch.is_none() {
+            mismatch = Some((check.mismatched_pages, check.first_mismatch));
+        }
+        if let Some(ok) = check.special_ok {
+            special = Some(special.unwrap_or(true) && ok);
+        }
+    }
+    values.insert_key(
+        value_key!("macho.code_signature.code_pages_verified"),
+        JsonValue::Bool(pages_ok),
+    );
+    if let Some((pages, first)) = mismatch {
+        put_u64(
+            values,
+            value_key!("macho.code_signature.code_page_mismatches"),
+            pages,
+        );
+        if let Some(first) = first {
+            put_u64(
+                values,
+                value_key!("macho.code_signature.code_page_first_mismatch_offset"),
+                first,
+            );
+        }
+    }
+    if let Some(ok) = special {
+        values.insert_key(
+            value_key!("macho.code_signature.special_slots_verified"),
+            JsonValue::Bool(ok),
+        );
+    }
+    if directories.len() > 1 {
+        let identity = |blob: &[u8]| CdSlots::read(blob).and_then(|cd| cd.identity());
+        let primary = primary.and_then(identity);
+        // Every CodeDirectory blob, honoured slot or not: any of them can
+        // supply the fields reported above.
+        let consistent =
+            primary.is_some() && directories.iter().all(|e| identity(e.blob) == primary);
+        values.insert_key(
+            value_key!("macho.code_signature.code_directories_consistent"),
+            JsonValue::Bool(consistent),
+        );
+    }
 }
 
 /// One SuperBlob index entry and the blob it points at.
@@ -874,6 +1183,181 @@ mod tests {
                 .and_then(JsonValue::as_str),
             Some("message_digest_mismatch")
         );
+    }
+
+    /// A CodeDirectory (v20200) over `code` with SHA-256 slots, `page_log2`
+    /// pages, and `specials` bound in the slots below the code slots.
+    fn code_directory(
+        code: &[u8],
+        page_log2: u8,
+        ident: &str,
+        specials: &[(u32, &[u8])],
+    ) -> Vec<u8> {
+        let page = if page_log2 == 0 {
+            code.len().max(1)
+        } else {
+            1 << page_log2
+        };
+        let code_slots: Vec<[u8; 32]> = code
+            .chunks(page)
+            .map(|p| Sha256::digest(p).into())
+            .collect();
+        let n_special = specials.iter().map(|&(slot, _)| slot).max().unwrap_or(0) as usize;
+        let mut special = vec![[0u8; 32]; n_special];
+        for &(slot, blob) in specials {
+            special[n_special - slot as usize] = Sha256::digest(blob).into();
+        }
+        let mut ident_bytes = ident.as_bytes().to_vec();
+        ident_bytes.push(0);
+        let ident_offset = 0x34;
+        let hash_offset = ident_offset + ident_bytes.len() + 32 * n_special;
+        let length = hash_offset + 32 * code_slots.len();
+        let mut cd = words(&[
+            CSMAGIC_CODEDIRECTORY,
+            length as u32,
+            0x0002_0200,
+            0,
+            hash_offset as u32,
+            ident_offset as u32,
+            n_special as u32,
+            code_slots.len() as u32,
+            code.len() as u32,
+        ]);
+        cd.extend([32, CS_HASHTYPE_SHA256, 0, page_log2]);
+        cd.extend(words(&[0, 0, 0]));
+        cd.extend(ident_bytes);
+        for hash in special.iter().chain(&code_slots) {
+            cd.extend(hash);
+        }
+        cd
+    }
+
+    /// `code` followed by a signature holding `blobs`, as parsed.
+    fn signed(code: &[u8], blobs: &[(u32, &[u8])]) -> Values {
+        let mut file = code.to_vec();
+        file.extend(super_blob(blobs, 0));
+        let mut values = Values::new();
+        parse(&file, code.len(), file.len() - code.len(), &mut values);
+        values
+    }
+
+    fn page_values(values: &Values) -> (Option<bool>, Option<u64>, Option<u64>) {
+        (
+            values
+                .get("macho.code_signature.code_pages_verified")
+                .and_then(JsonValue::as_bool),
+            values
+                .get("macho.code_signature.code_page_mismatches")
+                .and_then(JsonValue::as_u64),
+            values
+                .get("macho.code_signature.code_page_first_mismatch_offset")
+                .and_then(JsonValue::as_u64),
+        )
+    }
+
+    fn sample_code() -> Vec<u8> {
+        (0..10_000u32).map(|i| (i * 7 % 251) as u8).collect()
+    }
+
+    /// The CodeDirectory's slots hold the hash of each page of the code
+    /// before the signature, and are recomputed from those bytes.
+    #[test]
+    fn code_pages_hash_to_their_slots() {
+        let code = sample_code();
+        let cd = code_directory(&code, 12, "com.example.tool", &[]);
+        let values = signed(&code, &[(CSSLOT_CODEDIRECTORY, &cd)]);
+        assert_eq!(page_values(&values), (Some(true), None, None));
+        // Page size 0: one slot for the whole image.
+        let whole = code_directory(&code, 0, "com.example.tool", &[]);
+        assert_eq!(page_values(&signed(&code, &[(0, &whole)])).0, Some(true));
+    }
+
+    /// Code changed after signing no longer hashes to its slot, and the page
+    /// is named.
+    #[test]
+    fn modified_code_page_is_reported() {
+        let code = sample_code();
+        let cd = code_directory(&code, 12, "com.example.tool", &[]);
+        let mut tampered = code.clone();
+        tampered[2 * 4096 + 17] ^= 0x80;
+        let values = signed(&tampered, &[(CSSLOT_CODEDIRECTORY, &cd)]);
+        assert_eq!(page_values(&values), (Some(false), Some(1), Some(2 * 4096)));
+    }
+
+    /// A CodeDirectory that does not cover exactly the code it claims, or
+    /// that uses a hash this cannot compute, verifies nothing.
+    #[test]
+    fn code_directories_that_cannot_be_checked_are_unverified() {
+        let code = sample_code();
+        let mut cases = Vec::new();
+        // codeLimit past the end of the file.
+        let mut long = code_directory(&code, 12, "x", &[]);
+        long[0x20..0x24].copy_from_slice(&(code.len() as u32 * 2).to_be_bytes());
+        cases.push(long);
+        // One code slot fewer than the pages under codeLimit.
+        let mut short = code_directory(&code, 12, "x", &[]);
+        short[0x1c..0x20].copy_from_slice(&2u32.to_be_bytes());
+        cases.push(short);
+        // An unknown hash type.
+        let mut unknown = code_directory(&code, 12, "x", &[]);
+        unknown[0x25] = 9;
+        cases.push(unknown);
+        for cd in cases {
+            assert_eq!(page_values(&signed(&code, &[(0, &cd)])).0, Some(false));
+        }
+    }
+
+    /// An embedded blob is bound by its special slot: entitlements edited
+    /// after signing, or never hashed in, do not verify.
+    #[test]
+    fn embedded_blobs_must_hash_to_their_special_slots() {
+        let code = sample_code();
+        let mut entitlements = words(&[CSMAGIC_EMBEDDED_ENTITLEMENTS, 16]);
+        entitlements.extend(b"<plist/>");
+        let special = |cd: &[u8], blob: &[u8]| {
+            signed(&code, &[(0, cd), (5, blob)])
+                .get("macho.code_signature.special_slots_verified")
+                .and_then(JsonValue::as_bool)
+        };
+        let bound = code_directory(&code, 12, "x", &[(5, &entitlements)]);
+        assert_eq!(special(&bound, &entitlements), Some(true));
+        let mut edited = entitlements.clone();
+        *edited.last_mut().unwrap() ^= 1;
+        assert_eq!(special(&bound, &edited), Some(false));
+        // A slot left zero does not bind the blob beside it.
+        let unbound = code_directory(&code, 12, "x", &[(5, &[])]);
+        let unbound = {
+            let mut cd = unbound;
+            let hash_offset = u32::from_be_bytes(cd[0x10..0x14].try_into().unwrap()) as usize;
+            cd[hash_offset - 5 * 32..hash_offset - 4 * 32].fill(0);
+            cd
+        };
+        assert_eq!(special(&unbound, &entitlements), Some(false));
+    }
+
+    /// Only the primary CodeDirectory is under the signature; an alternate
+    /// must assert the same identity, and its pages must hold too.
+    #[test]
+    fn alternate_code_directories_must_match_the_primary() {
+        let code = sample_code();
+        let primary = code_directory(&code, 12, "com.example.tool", &[]);
+        let consistent = |alternate: &[u8]| {
+            let values = signed(&code, &[(0, &primary), (0x1000, alternate)]);
+            (
+                values
+                    .get("macho.code_signature.code_directories_consistent")
+                    .and_then(JsonValue::as_bool),
+                page_values(&values).0,
+            )
+        };
+        let same = code_directory(&code, 14, "com.example.tool", &[]);
+        assert_eq!(consistent(&same), (Some(true), Some(true)));
+        let other = code_directory(&code, 12, "com.apple.security", &[]);
+        assert_eq!(consistent(&other).0, Some(false));
+        let mut stale = same.clone();
+        let last = stale.len() - 1;
+        stale[last] ^= 1;
+        assert_eq!(consistent(&stale), (Some(true), Some(false)));
     }
 
     /// Thousands of index entries naming one blob read it once; the walk

@@ -157,11 +157,13 @@ pub enum Trust {
     /// from content it could not find, or carried no certificate to check it
     /// against. Also a signature that verifies but is not shown to cover this
     /// file: a PE whose image hash differs from the signed one (or was not
-    /// computed), and any cabinet, whose content nothing hashes. Records signed
-    /// packaging without overstating trust.
+    /// computed), a Mach-O whose code pages or embedded blobs do not hash to
+    /// its CodeDirectory's slots, and any cabinet, whose content nothing
+    /// hashes. Records signed packaging without overstating trust.
     Unverified,
     /// Ad-hoc signed: a code signature with no identifying certificate
-    /// chain (Mach-O `CS_ADHOC`). Integrity without identity.
+    /// chain (Mach-O `CS_ADHOC`), whose page hashes match the code.
+    /// Integrity without identity.
     AdHoc,
     /// A verified signature by a certificate that is its own issuer —
     /// asserts an identity nothing else vouches for.

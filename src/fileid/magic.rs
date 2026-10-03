@@ -103,6 +103,7 @@ struct Probe<'s, 'a> {
 /// jump table, then the rarer structural checks.
 const RULES: &[fn(&Probe<'_, '_>) -> Option<Found>] = &[
     cold_fusion_template,
+    phar,
     go_module,
     iso_base_media,
     url_shortcut,
@@ -880,6 +881,14 @@ fn tampered_pe(p: &Probe<'_, '_>) -> Option<Found> {
 /// Markup after a BOM or leading whitespace.
 fn markup(p: &Probe<'_, '_>) -> Option<Found> {
     detect_xml(p.data)
+}
+
+/// A native PHP archive: a stub ending in `__HALT_COMPILER();` and a manifest
+/// that parses. Tried ahead of the script and image rules, because the stub is
+/// PHP, a shebang, or anything at all (a JPEG header makes a polyglot), and
+/// the archive is what `phar://` opens.
+fn phar(p: &Probe<'_, '_>) -> Option<Found> {
+    crate::formats::phar::is_phar(p.data).then_some((FileType::Phar, DetectionSource::Magic))
 }
 
 fn asar(p: &Probe<'_, '_>) -> Option<Found> {

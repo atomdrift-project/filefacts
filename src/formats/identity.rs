@@ -143,10 +143,21 @@ fn macho(values: &Values, bytes: &[u8], id: &mut Identity) {
     // A verified CMS signature binds the CodeDirectory (its messageDigest is
     // the CodeDirectory's hash), so the fields inside it are proven to be the
     // signer's. A CMS that is merely present proves nothing.
-    let cms_verified = cms
-        .and_then(|c| c.get("verified"))
-        .and_then(JsonValue::as_bool)
-        .unwrap_or(false);
+    // The CodeDirectory in turn covers the code only through its hash slots,
+    // recomputed from this file into `code_pages_verified`; without them a
+    // CodeDirectory and signature lifted from another binary vouch for this
+    // one. Alternates must also repeat the signed primary's identity.
+    let flag = |key| values.get_key(key).and_then(JsonValue::as_bool);
+    let code_bound = flag(value_key!("macho.code_signature.code_pages_verified")) == Some(true)
+        && flag(value_key!("macho.code_signature.special_slots_verified")) != Some(false)
+        && flag(value_key!(
+            "macho.code_signature.code_directories_consistent"
+        )) != Some(false);
+    let cms_verified = code_bound
+        && cms
+            .and_then(|c| c.get("verified"))
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
 
     if let Some(ident) = get_str(values, value_key!("macho.code_signature.identifier")) {
         id.identifier = Some(Claim {
@@ -166,7 +177,8 @@ fn macho(values: &Values, bytes: &[u8], id: &mut Identity) {
         id.unique_ids.insert("cdhash".into(), cdhash.to_string());
     }
 
-    if let Some(ci) = cms.and_then(cert_from_obj) {
+    if let Some(mut ci) = cms.and_then(cert_from_obj) {
+        ci.verified &= code_bound;
         if let Some(o) = &ci.o {
             id.organization = Some(Claim {
                 value: o.clone(),
@@ -186,8 +198,9 @@ fn macho(values: &Values, bytes: &[u8], id: &mut Identity) {
     let ad_hoc = flag_set(values, value_key!("macho.code_signature.flags"), "ad_hoc");
     if id.trust == Trust::Unsigned && signed {
         // A code signature with no certificate behind it: ad hoc when it
-        // says so, and otherwise a structure nothing here could verify.
-        id.trust = if ad_hoc {
+        // says so and its hashes match the code, and otherwise a structure
+        // nothing here could verify.
+        id.trust = if ad_hoc && code_bound {
             Trust::AdHoc
         } else {
             Trust::Unverified
@@ -2121,6 +2134,7 @@ mod trust_tests {
     fn macho_trust(platform: u64, cms: Option<JsonValue>) -> Trust {
         let mut values = Values::default();
         values.insert("macho.code_signature.cdhash", json!("00"));
+        values.insert("macho.code_signature.code_pages_verified", json!(true));
         values.insert("macho.code_signature.platform", json!(platform));
         if let Some(cms) = cms {
             values.insert("macho.code_signature.cms", cms);
@@ -2156,6 +2170,7 @@ mod trust_tests {
     fn code_directory_claims_are_verified_only_by_a_verified_cms() {
         for verified in [false, true] {
             let mut values = Values::default();
+            values.insert("macho.code_signature.code_pages_verified", json!(true));
             values.insert("macho.code_signature.identifier", json!("com.example.tool"));
             values.insert(
                 "macho.code_signature.cms",
@@ -2163,6 +2178,58 @@ mod trust_tests {
             );
             let id = derive(FileType::MachO, &[], &values);
             assert_eq!(id.identifier.unwrap().verified, verified);
+        }
+    }
+
+    /// Apple's genuine CodeDirectory and signature, lifted onto other code:
+    /// the CMS verifies over the CodeDirectory, but the pages it hashes are
+    /// not this file's. Nor does a missing page check, an unbound
+    /// entitlements blob, or an alternate CodeDirectory asserting another
+    /// identity let the signature vouch for the file.
+    #[test]
+    fn code_directory_must_hash_to_this_files_code() {
+        let apple = signature("Apple Inc.", "Software Signing", true, Some("apple"));
+        let trust = |edit: &dyn Fn(&mut Values)| {
+            let mut values = Values::default();
+            values.insert("macho.code_signature.cdhash", json!("00"));
+            values.insert("macho.code_signature.identifier", json!("com.apple.ls"));
+            values.insert("macho.code_signature.platform", json!(0xe));
+            values.insert("macho.code_signature.cms", apple.clone());
+            values.insert("macho.code_signature.code_pages_verified", json!(true));
+            edit(&mut values);
+            let id = derive(FileType::MachO, &[], &values);
+            (id.trust, id.identifier.map(|c| c.verified))
+        };
+        assert_eq!(trust(&|_| {}), (Trust::System, Some(true)));
+        let unbound = [
+            ("macho.code_signature.code_pages_verified", json!(false)),
+            ("macho.code_signature.special_slots_verified", json!(false)),
+            (
+                "macho.code_signature.code_directories_consistent",
+                json!(false),
+            ),
+        ];
+        for (key, value) in unbound {
+            let got = trust(&|v: &mut Values| v.insert(key, value.clone()));
+            assert_eq!(got, (Trust::Unverified, Some(false)), "{key}");
+        }
+        let unchecked = trust(&|v: &mut Values| {
+            *v = Values::from_json(json!({"macho": {"code_signature": {
+                "cdhash": "00", "platform": 14, "cms": apple.clone(),
+            }}}));
+        });
+        assert_eq!(unchecked.0, Trust::Unverified);
+    }
+
+    /// Ad hoc claims integrity, so it needs the page hashes to match too.
+    #[test]
+    fn ad_hoc_needs_matching_pages() {
+        for (pages, want) in [(true, Trust::AdHoc), (false, Trust::Unverified)] {
+            let mut values = Values::default();
+            values.insert("macho.code_signature.cdhash", json!("00"));
+            values.insert("macho.code_signature.flags", json!(["ad_hoc"]));
+            values.insert("macho.code_signature.code_pages_verified", json!(pages));
+            assert_eq!(derive(FileType::MachO, &[], &values).trust, want);
         }
     }
 }

@@ -653,6 +653,9 @@ file_types! {
         GentooBinpkg => "gentoo_binpkg", Archive;
         /// Electron ASAR application archive (.asar)
         Asar => "asar", Archive;
+        /// PHP archive in the native phar format: a PHP stub, a manifest, and
+        /// the packaged files. Tar- and zip-based phars are `tar` and `zip`.
+        Phar => "phar", Archive;
         /// AppleScript source file (.applescript, .scpt)
         AppleScript => "applescript", Script;
         /// Apple Property List (.plist)
@@ -908,6 +911,10 @@ impl ExtensionMatch {
     fn of(path: &Path, ext: Option<FileType>, detected: FileType) -> Self {
         match ext {
             Some(FileType::Yaml) if is_yaml_dialect(detected) => Self::Consistent,
+            // A phar is also written as a plain tar or zip archive.
+            Some(FileType::Phar) if matches!(detected, FileType::Tar | FileType::Zip) => {
+                Self::Consistent
+            }
             Some(e) if e != detected => Self::Different(e),
             None if has_named_extension(path) => Self::Unknown,
             Some(_) | None => Self::Consistent,
