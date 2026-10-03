@@ -1865,7 +1865,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -2068,7 +2068,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter"
 version = "0.28.0"
-source = "git+https://github.com/tstromberg/tree-sitter?branch=master#a88e37f7c2202fa9dd2869ccf9c40d022460e73b"
+source = "git+https://github.com/tstromberg/tree-sitter?branch=master#8dbeeeccea5d7bf7685ca07b7d6d9753b849f225"
 dependencies = [
  "cc",
  "regex",
@@ -2189,7 +2189,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-language"
 version = "0.1.8"
-source = "git+https://github.com/tstromberg/tree-sitter?branch=master#a88e37f7c2202fa9dd2869ccf9c40d022460e73b"
+source = "git+https://github.com/tstromberg/tree-sitter?branch=master#8dbeeeccea5d7bf7685ca07b7d6d9753b849f225"
 
 [[package]]
 name = "tree-sitter-lua"
