@@ -44,15 +44,24 @@ const MAX_MODELED_AST_FILE_BYTES: usize = 4 * 1024 * 1024;
 /// shallower facts.
 ///
 /// The budget is [`PARSE_WORK_BASE`] polls plus one per
-/// [`PARSE_BYTES_PER_POLL`] bytes of input. Calibrated on about 68k real
-/// source files and generated 1–30 MiB sources: the densest used 0.057 polls
-/// per byte and the largest total was 585k polls (a 30 MiB minified bundle),
-/// so every ordinary file stays under a tenth of its budget. The densest input
-/// we could build on purpose (100k nested parentheses in PowerShell) used 0.14
-/// polls per byte, so in practice the budget only stops input that is both
-/// huge and op-dense.
-const PARSE_WORK_BASE: u64 = 100_000;
-const PARSE_BYTES_PER_POLL: u64 = 2;
+/// [`PARSE_BYTES_PER_POLL`] bytes of input. Since the tree-sitter fork counts
+/// the work of walking and freeing ambiguous parse stacks as operations, a poll
+/// stands for roughly the same CPU time whatever the input; before, a grammar
+/// ambiguity could make each poll a hundred times dearer than usual, and a
+/// 249 KB mutated C header spent 13 s inside a budget of 224k polls while
+/// using only 2,335.
+///
+/// Calibrated on about 68k real source files and generated 1–30 MiB sources
+/// (densest 0.057 polls per byte; largest total 585k polls, a 30 MiB minified
+/// bundle), then rechecked with stack work counted on 40k real parses
+/// (registry crates, `/usr/include`): the densest large file used 0.022 polls
+/// per byte, counting stack work raised poll counts by at most 1.35× at the
+/// 99th percentile, and no file used more than an eighth of its budget (a
+/// 4 MiB minified bundle, about 0.02 polls per byte, uses 84k of 1.07M).
+/// Input that keeps the parser ambiguous, like that C header, now stops after
+/// about 82k polls, in about 5 s.
+const PARSE_WORK_BASE: u64 = 20_000;
+const PARSE_BYTES_PER_POLL: u64 = 4;
 
 /// Wall-clock backstop for one parse, separate from the work budget.
 /// Ordinary files never reach it — the slowest ordinary corpus parse took
