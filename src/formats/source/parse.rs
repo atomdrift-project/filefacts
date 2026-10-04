@@ -316,33 +316,6 @@ const PYTHON_DELIMITER_BYTES: usize = 1;
 /// state.
 const PYTHON_INDENT_BYTES_PER_LEVEL: usize = 2;
 
-/// Sources up to this size parse on the calling thread. Larger ones parse on a
-/// thread of their own whose stack grows with the input
-/// ([`parse_stack_bytes`]).
-///
-/// Tree-sitter frees an ambiguous parse stack recursively, one C frame per
-/// node it still links, so input that keeps several readings alive at once
-/// needs stack in proportion to its length. A C, C# or Java run of
-/// `(a)*(a)*…` (cast or multiplication?) 100,000 long overflows an 8 MB
-/// stack and aborts the process, which no panic guard can catch. Measured
-/// across those grammars, the cost stays under 40 bytes of stack per input
-/// byte, so this much fits the smallest worker stack in use.
-const INLINE_PARSE_MAX_BYTES: usize = 16 * 1024;
-
-/// Stack reserved per input byte for a parse on its own thread: three times
-/// the worst cost measured (see [`INLINE_PARSE_MAX_BYTES`]). The reservation
-/// is virtual; only the pages a parse actually touches are committed.
-const PARSE_STACK_BYTES_PER_INPUT_BYTE: usize = 128;
-
-/// The smallest stack a parse thread gets.
-const MIN_PARSE_STACK_BYTES: usize = 16 << 20;
-
-/// The stack for parsing `len` bytes on a thread of their own.
-fn parse_stack_bytes(len: usize) -> usize {
-    len.saturating_mul(PARSE_STACK_BYTES_PER_INPUT_BYTE)
-        .max(MIN_PARSE_STACK_BYTES)
-}
-
 /// `bytes` as UTF-8 text for the parser, with the number of bytes that were
 /// not UTF-8. Each invalid byte becomes one `_`, so every byte offset in the
 /// tree still addresses the same byte of the input.
@@ -464,22 +437,6 @@ impl TreeSitterDiagnostic {
         }
     }
 
-    /// The thread a large parse runs on could not be started. Depends on the
-    /// machine's memory, not the input, so it is transient.
-    fn parse_thread_unavailable(
-        language: &'static str,
-        bytes: usize,
-        error: &std::io::Error,
-    ) -> Self {
-        Self {
-            metric: metric!("source.ast_unavailable.parse_failed"),
-            message: format!(
-                "tree-sitter parse for {language} ({bytes} bytes) not run: its parse thread could not start: {error}"
-            ),
-            transient: true,
-        }
-    }
-
     /// `source.ast_unavailable.parse_timeout` means the parse exhausted its
     /// work budget or, for input that makes single operations expensive, hit
     /// the wall-clock backstop. The metric keeps its historical name because
@@ -598,10 +555,7 @@ impl<'a> TreeCache<'a> {
         let language = (config.language)();
         // Breadcrumb for sources large enough to plausibly overflow the
         // scanner. Flushed before `parse` so the line survives a C-level
-        // abort and names the offending grammar. Written here, on the calling
-        // thread: a parse thread must not touch stdio, whose locks the caller
-        // may hold while it waits for the parse (the CLI holds stdout's for
-        // its whole run).
+        // abort and names the offending grammar.
         if source.len() >= PARSE_BREADCRUMB_THRESHOLD_BYTES {
             tracing::info!(
                 language = config.name(),
@@ -611,114 +565,105 @@ impl<'a> TreeCache<'a> {
             let _ = std::io::stderr().flush();
             let _ = std::io::stdout().flush();
         }
-        // Read here too, not on a parse thread: tests shorten the budgets
-        // through thread-locals.
         let budget = parse_work_budget(source.len());
         let fetch_budget = lexer_fetch_budget(source.len());
-        // Does nothing but parse: whatever it has to report comes back as a
-        // [`ParseFailure`] and is logged by the caller.
-        let run = || -> Result<tree_sitter::Tree, ParseFailure> {
-            THREAD_PARSER.with(|cell| {
-                let mut parser = cell.borrow_mut();
-                if let Err(e) = parser.set_language(&language) {
-                    return Err(ParseFailure::LanguageSetup(e.to_string()));
+        // Whatever the parse has to report comes back as a [`ParseFailure`],
+        // turned into a diagnostic (and logged) below.
+        let parsed: Result<tree_sitter::Tree, ParseFailure> = THREAD_PARSER.with(|cell| {
+            let mut parser = cell.borrow_mut();
+            if let Err(e) = parser.set_language(&language) {
+                return Err(ParseFailure::LanguageSetup(e.to_string()));
+            }
+            // The C core polls this once per 100 parse operations; `Break`
+            // unwinds it cleanly and yields `None`, so neither limit needs a
+            // thread kill.
+            let deadline = Instant::now() + SOURCE_PARSE_WALL_BACKSTOP;
+            let polls = Cell::new(0u64);
+            let stop = Cell::new(None);
+            let mut recovery = RecoveryWatch::new(error_recovery_cap(file_type));
+            let fetched = Cell::new(0u64);
+            let mut progress = |state: &tree_sitter::ParseState| -> ControlFlow<()> {
+                // The read callback below already gave up on the input.
+                if matches!(stop.get(), Some(ParseStop::LexerBudget { .. })) {
+                    return ControlFlow::Break(());
                 }
-                // The C core polls this once per 100 parse operations; `Break`
-                // unwinds it cleanly and yields `None`, so neither limit needs a
-                // thread kill.
-                let deadline = Instant::now() + SOURCE_PARSE_WALL_BACKSTOP;
-                let polls = Cell::new(0u64);
-                let stop = Cell::new(None);
-                let mut recovery = RecoveryWatch::new(error_recovery_cap(file_type));
-                let fetched = Cell::new(0u64);
-                let mut progress = |state: &tree_sitter::ParseState| -> ControlFlow<()> {
-                    // The read callback below already gave up on the input.
-                    if matches!(stop.get(), Some(ParseStop::LexerBudget { .. })) {
-                        return ControlFlow::Break(());
-                    }
-                    // Cancellation first: it is a plain atomic load, and when the
-                    // caller is shutting down there is no point counting work.
-                    // `Relaxed` is right for a poll — the flag is a hint, and the
-                    // worst a stale read costs is one more progress interval.
-                    if cancel.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
-                        stop.set(Some(ParseStop::Cancelled));
-                        return ControlFlow::Break(());
-                    }
-                    polls.set(polls.get() + 1);
-                    if polls.get() > budget {
-                        let at = state.current_byte_offset();
-                        stop.set(Some(ParseStop::Budget { budget, at }));
-                        return ControlFlow::Break(());
-                    }
-                    // `has_error` is set only while every stack version is
-                    // recovering; any healthy version resets the run.
+                // Cancellation first: it is a plain atomic load, and when the
+                // caller is shutting down there is no point counting work.
+                // `Relaxed` is right for a poll — the flag is a hint, and the
+                // worst a stale read costs is one more progress interval.
+                if cancel.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
+                    stop.set(Some(ParseStop::Cancelled));
+                    return ControlFlow::Break(());
+                }
+                polls.set(polls.get() + 1);
+                if polls.get() > budget {
                     let at = state.current_byte_offset();
-                    if let Some(why) =
-                        recovery.poll(polls.get(), state.has_error(), at >= source.len(), at)
-                    {
-                        stop.set(Some(why));
-                        return ControlFlow::Break(());
-                    }
-                    if Instant::now() >= deadline {
-                        stop.set(Some(ParseStop::Backstop));
-                        return ControlFlow::Break(());
-                    }
-                    ControlFlow::Continue(())
-                };
-                // tree-sitter-bash 0.25 does not know Bash 5.3's `~`/`~~` case
-                // inversion operators. Normalize their spelling to the grammar's
-                // existing `^`/`^^` case-modification productions. Replacements
-                // are length-preserving, so AST ranges still address the original
-                // source retained by TreeCache. This is syntax-only: FileFacts
-                // does not evaluate the expansion, and source-backed facts keep
-                // seeing the exact original operator bytes.
-                let normalized_shell = (file_type == FileType::Shell)
-                    .then(|| normalize_bash_case_modification(source))
-                    .flatten();
-                let parser_source = normalized_shell.as_deref().unwrap_or(source);
-                let mut read = |offset: usize, _: tree_sitter::Point| -> &[u8] {
-                    // Past the budget the lexer sees end of input, so a scanner
-                    // mid-way through a long scan stops at once, and the next
-                    // poll abandons the parse.
-                    if fetched.get() > fetch_budget {
-                        return &[];
-                    }
-                    let chunk = lexer_chunk(parser_source, offset);
-                    fetched.set(fetched.get() + chunk.len() as u64);
-                    if fetched.get() > fetch_budget {
-                        stop.set(Some(ParseStop::LexerBudget {
-                            budget: fetch_budget,
-                            at: offset,
-                        }));
-                        return &[];
-                    }
-                    chunk
-                };
-                let parsed = parser.parse_with_options(
-                    &mut read,
-                    None,
-                    Some(tree_sitter::ParseOptions::default().progress_callback(&mut progress)),
-                );
-                // A parse that hit the lexer budget may still have finished
-                // before the next poll, on a tree cut short at the false end of
-                // input. Such a tree must not be used.
-                let parsed =
-                    parsed.filter(|_| !matches!(stop.get(), Some(ParseStop::LexerBudget { .. })));
-                let Some(tree) = parsed else {
-                    return Err(ParseFailure::Stopped(stop.get()));
-                };
-                let cost = anonymous_run_cost(tree.root_node(), ANONYMOUS_RUN_COST_CAP);
-                if cost > ANONYMOUS_RUN_COST_CAP {
-                    return Err(ParseFailure::AnonymousRuns(cost));
+                    stop.set(Some(ParseStop::Budget { budget, at }));
+                    return ControlFlow::Break(());
                 }
-                Ok(tree)
-            })
-        };
-        let parsed = if source.len() <= INLINE_PARSE_MAX_BYTES {
-            run()
-        } else {
-            parse_on_sized_thread(source.len(), run)
-        };
+                // `has_error` is set only while every stack version is
+                // recovering; any healthy version resets the run.
+                let at = state.current_byte_offset();
+                if let Some(why) =
+                    recovery.poll(polls.get(), state.has_error(), at >= source.len(), at)
+                {
+                    stop.set(Some(why));
+                    return ControlFlow::Break(());
+                }
+                if Instant::now() >= deadline {
+                    stop.set(Some(ParseStop::Backstop));
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            };
+            // tree-sitter-bash 0.25 does not know Bash 5.3's `~`/`~~` case
+            // inversion operators. Normalize their spelling to the grammar's
+            // existing `^`/`^^` case-modification productions. Replacements
+            // are length-preserving, so AST ranges still address the original
+            // source retained by TreeCache. This is syntax-only: FileFacts
+            // does not evaluate the expansion, and source-backed facts keep
+            // seeing the exact original operator bytes.
+            let normalized_shell = (file_type == FileType::Shell)
+                .then(|| normalize_bash_case_modification(source))
+                .flatten();
+            let parser_source = normalized_shell.as_deref().unwrap_or(source);
+            let mut read = |offset: usize, _: tree_sitter::Point| -> &[u8] {
+                // Past the budget the lexer sees end of input, so a scanner
+                // mid-way through a long scan stops at once, and the next
+                // poll abandons the parse.
+                if fetched.get() > fetch_budget {
+                    return &[];
+                }
+                let chunk = lexer_chunk(parser_source, offset);
+                fetched.set(fetched.get() + chunk.len() as u64);
+                if fetched.get() > fetch_budget {
+                    stop.set(Some(ParseStop::LexerBudget {
+                        budget: fetch_budget,
+                        at: offset,
+                    }));
+                    return &[];
+                }
+                chunk
+            };
+            let parsed = parser.parse_with_options(
+                &mut read,
+                None,
+                Some(tree_sitter::ParseOptions::default().progress_callback(&mut progress)),
+            );
+            // A parse that hit the lexer budget may still have finished
+            // before the next poll, on a tree cut short at the false end of
+            // input. Such a tree must not be used.
+            let parsed =
+                parsed.filter(|_| !matches!(stop.get(), Some(ParseStop::LexerBudget { .. })));
+            let Some(tree) = parsed else {
+                return Err(ParseFailure::Stopped(stop.get()));
+            };
+            let cost = anonymous_run_cost(tree.root_node(), ANONYMOUS_RUN_COST_CAP);
+            if cost > ANONYMOUS_RUN_COST_CAP {
+                return Err(ParseFailure::AnonymousRuns(cost));
+            }
+            Ok(tree)
+        });
         match parsed.map_err(|failure| failure.diagnostic(config.name(), source.len())) {
             Ok(tree) => TreeParse::Parsed(Self {
                 source: text,
@@ -1034,8 +979,6 @@ enum ParseFailure {
     Stopped(Option<ParseStop>),
     /// The tree is too costly to query; see [`ANONYMOUS_RUN_COST_CAP`].
     AnonymousRuns(u64),
-    /// The thread a large parse runs on could not be started.
-    NoThread(std::io::Error),
 }
 
 impl ParseFailure {
@@ -1113,34 +1056,8 @@ impl ParseFailure {
                 );
                 TreeSitterDiagnostic::anonymous_run_guard(language, bytes, cost)
             }
-            Self::NoThread(e) => {
-                TreeSitterDiagnostic::parse_thread_unavailable(language, bytes, &e)
-            }
         }
     }
-}
-
-/// Run `parse` on a thread with a stack sized for `bytes` of input (see
-/// [`INLINE_PARSE_MAX_BYTES`]). A panic in it resumes on the caller, where the
-/// parse's own guard reports it. A thread that cannot be started -- the
-/// machine would not reserve the stack -- leaves the file without an AST,
-/// as a transient outcome: another run may have the memory.
-fn parse_on_sized_thread<T: Send>(
-    bytes: usize,
-    parse: impl FnOnce() -> Result<T, ParseFailure> + Send,
-) -> Result<T, ParseFailure> {
-    std::thread::scope(|scope| {
-        let spawned = std::thread::Builder::new()
-            .name("filefacts-parse".into())
-            .stack_size(parse_stack_bytes(bytes))
-            .spawn_scoped(scope, parse);
-        match spawned {
-            Ok(handle) => handle
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-            Err(e) => Err(ParseFailure::NoThread(e)),
-        }
-    })
 }
 
 fn parse_cap_bytes(audit: ScannerAudit) -> usize {

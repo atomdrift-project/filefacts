@@ -692,25 +692,18 @@ fn a_latin1_byte_no_longer_hides_the_tree() {
     assert!(!cache.tree().root_node().has_error());
 }
 
-/// Tree-sitter frees an ambiguous parse stack recursively. A long run of
-/// `(a)*` -- cast or multiplication -- used to overflow the stack and abort
-/// the process; a large input now parses on a thread sized for it. If this
-/// regresses, the whole test binary aborts.
+/// A long run of `(a)*` -- cast or multiplication? -- keeps the parser's
+/// stack ambiguous all the way through. Tree-sitter freed such a stack
+/// recursively and overflowed the C stack, aborting the process; the fork it
+/// is pinned to frees it iteratively. If this regresses, the whole test binary
+/// aborts.
 #[test]
 fn a_long_ambiguous_cast_chain_does_not_overflow_the_stack() {
     let source = format!("int x = {}a;\n", "(a)*".repeat(100_000));
-    assert!(source.len() > INLINE_PARSE_MAX_BYTES);
     let parsed = TreeCache::parse(source.as_bytes(), FileType::C, None);
     assert!(
         parsed.cache().is_some(),
         "{:?}",
         parsed.diagnostic().map(|d| &d.message)
     );
-}
-
-#[test]
-fn parse_stacks_grow_with_the_input() {
-    assert_eq!(parse_stack_bytes(0), MIN_PARSE_STACK_BYTES);
-    assert_eq!(parse_stack_bytes(1 << 20), 128 << 20);
-    assert_eq!(parse_stack_bytes(usize::MAX), usize::MAX);
 }

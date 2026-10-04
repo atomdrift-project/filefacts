@@ -1783,7 +1783,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "2.0.1"
-source = "git+https://github.com/atomdrift-project/stng.git?rev=78f439bbb96b8c15686a63f2631edf6b62269391#78f439bbb96b8c15686a63f2631edf6b62269391"
+source = "git+https://github.com/atomdrift-project/stng.git?rev=60c96257262bfeb9bcc0c399a529631e354f6681#60c96257262bfeb9bcc0c399a529631e354f6681"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -1865,7 +1865,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -2068,7 +2068,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter"
 version = "0.28.0"
-source = "git+https://github.com/tstromberg/tree-sitter?branch=master#8dbeeeccea5d7bf7685ca07b7d6d9753b849f225"
+source = "git+https://github.com/tstromberg/tree-sitter?branch=master#3c432e1a6ec5d0c1e792bb7efa1fe53ed45d631a"
 dependencies = [
  "cc",
  "regex",
@@ -2189,7 +2189,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-language"
 version = "0.1.8"
-source = "git+https://github.com/tstromberg/tree-sitter?branch=master#8dbeeeccea5d7bf7685ca07b7d6d9753b849f225"
+source = "git+https://github.com/tstromberg/tree-sitter?branch=master#3c432e1a6ec5d0c1e792bb7efa1fe53ed45d631a"
 
 [[package]]
 name = "tree-sitter-lua"

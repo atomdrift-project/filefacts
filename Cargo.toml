@@ -68,7 +68,7 @@ gimli = { version = "0.32", default-features = false, features = ["read", "std"]
 # (`ExtractedString`, `StringMethod`, ...) are part of filefacts' public API,
 # so `cargo update` must not move it. Bump the rev deliberately.
 # No default features: those build the `stng` command, not the library.
-stng = { git = "https://github.com/atomdrift-project/stng.git", rev = "78f439bbb96b8c15686a63f2631edf6b62269391", default-features = false }
+stng = { git = "https://github.com/atomdrift-project/stng.git", rev = "60c96257262bfeb9bcc0c399a529631e354f6681", default-features = false }
 
 
 # Archive index readers. We use these for header/central-directory enumeration
