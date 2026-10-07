@@ -248,7 +248,7 @@ fn android_binary_xml(p: &Probe<'_, '_>) -> Option<Found> {
 /// magic deliberately. `<!DOCTYPE svg` and an `<?xml` prolog are unaffected:
 /// neither begins with either of these.
 fn html_document(p: &Probe<'_, '_>) -> Option<Found> {
-    let head = p.head;
+    let head = strip_utf8_bom(p.head).trim_ascii_start();
     let open = head.get(..5)?;
     let doctype_html = head
         .get(..14)
@@ -2219,6 +2219,20 @@ mod jet_db_sfnt_collision_tests {
 mod html_doctype_magic_tests {
     use super::*;
     use crate::FileId;
+
+    #[test]
+    fn utf8_bom_html_is_detected_under_misleading_names() {
+        for body in [
+            "<!DOCTYPE html><html><body>page</body></html>",
+            "  <HTML><body><script>document.write('x')</script></body></HTML>",
+            "<script src='https://example.invalid/a.js'></script>\n<!doctype html><html>",
+        ] {
+            let mut data = UTF8_BOM.to_vec();
+            data.extend_from_slice(body.as_bytes());
+            let file = FileId::from_path_and_bytes(Path::new("sample.vir"), &data);
+            assert_eq!(file.file_type(), FileType::Html, "{body}");
+        }
+    }
 
     /// A page under a name that claims another language is still a page.
     #[test]

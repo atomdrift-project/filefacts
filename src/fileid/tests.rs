@@ -1747,7 +1747,7 @@ fn front_padded_html_is_still_html() {
     // -- it matches no trait at all -- so the extension-corroborated check
     // has to see through the padding.
     let mut data = b"try {\n".to_vec();
-    data.resize(300 * 1024, b';');
+    data.resize(3 * 1024 * 1024, b';');
     data.extend_from_slice(b"\n<html><head><title>x</title></head></html>\n} catch(e) {}");
     assert_detect("padded.hta", &data, FileType::Html);
 }

@@ -726,7 +726,7 @@ file_types! {
         /// PDF document
         Pdf => "pdf", Document;
         /// HTML document (.html, .htm)
-        Html => "html", Text, UNSUPPORTED;
+        Html => "html", Text;
         /// JavaServer Pages (`.jsp`, `.jspx`). The page directive is unique to JSP.
         Jsp => "jsp", Script;
         /// Classic ASP and ASP.NET (`.asp`, `.aspx`, and the related suffixes).

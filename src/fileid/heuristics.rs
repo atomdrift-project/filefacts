@@ -1236,21 +1236,6 @@ fn has_php_tag(data: &[u8]) -> bool {
     !saw_xml_pi && memchr::memmem::find(data, b"?>").is_some()
 }
 
-/// How far into a file [`looks_like_html`] will look for markup.
-///
-/// The only caller reaches this after the *extension* has already claimed an
-/// HTML type, so the question is "does the content corroborate the name", not
-/// "what is this file". A short prefix answers that badly: padding the front of
-/// the file is then all it takes to be classified Unknown, and an Unknown file
-/// matches no trait at all, since every trait declares the types it targets.
-///
-/// That is a real evasion, not a hypothetical. An `.hta` dropper was observed
-/// opening with `try {` and roughly 275 KB of `;` before its first `<html>` --
-/// well past any reasonable sniffing prefix, and classified Unknown because of
-/// it. One megabyte is far enough to see through that while still bounding the
-/// scan on a large file.
-const HTML_SCAN_WINDOW: usize = 1 << 20;
-
 /// Tags that only markup carries. Static like [`SCANNER`]'s patterns, so a
 /// build failure is a bug here: it panics rather than calling nothing HTML.
 static HTML_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
@@ -1271,8 +1256,11 @@ static HTML_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
 });
 
 /// Check if content looks like HTML (has actual markup tags).
+/// Extension corroboration must inspect the entire body: HTML applications
+/// can put arbitrarily long script or padding before their first markup tag.
+/// The matcher stops at the first tag, so ordinary documents remain cheap.
 pub(crate) fn looks_like_html(data: &[u8]) -> bool {
-    HTML_AC.is_match(data.get(..HTML_SCAN_WINDOW).unwrap_or(data))
+    HTML_AC.is_match(data)
 }
 
 /// How much of a body [`unmistakable`] reads for most marks.
