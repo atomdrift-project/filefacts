@@ -175,12 +175,13 @@ pub use error::Error;
 pub use fileid::{ArchiveFormat, Compression, Container, FileId, FileType, container_of};
 pub use output::{
     ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Arg, ArgShape, CATALOG,
-    Claim, Comments, Diagnostic, DiagnosticKind, Errors, FAMILIES, Fact, HashAlgo, Identity,
-    Literal, LiteralEncoding, LiteralMethod, Literals, MetricKey, Metrics, Party, PinnedHash,
-    QueryLimit, RefKind, RefLocator, Reference, Section, SectionFlag, Sections, Signer, Span,
-    Stage, Symbol, SymbolKind, Symbols, Text, Trust, Url, UrlKind, VALUE_CATALOG, VALUE_FAMILIES,
-    ValueKey, Values, archive_entry_type_count, archive_method_count, ast_op, ast_op_density,
-    dmg_codec_count, extension_content_mismatch, source_query_limited,
+    Claim, Comments, DependencyContext, DependencyScope, Diagnostic, DiagnosticKind, Errors,
+    FAMILIES, Fact, HashAlgo, Identity, Literal, LiteralEncoding, LiteralMethod, Literals,
+    MetricKey, Metrics, Party, PinnedHash, QueryLimit, RefKind, RefLocator, Reference, Section,
+    SectionFlag, Sections, Signer, Span, Stage, Symbol, SymbolKind, Symbols, Text, Trust, Url,
+    UrlKind, VALUE_CATALOG, VALUE_FAMILIES, ValueKey, Values, archive_entry_type_count,
+    archive_method_count, ast_op, ast_op_density, dmg_codec_count, extension_content_mismatch,
+    source_query_limited,
 };
 pub use registry::Registry;
 
@@ -1258,6 +1259,13 @@ impl<'a> OpenOptions<'a> {
     /// hosts lower it.
     pub fn rizin_timeout(mut self, timeout: Duration) -> Self {
         self.rizin.timeout = timeout;
+        self
+    }
+
+    /// Retry a timed-out native file once with this larger deadline. Other
+    /// recovery failures keep their static facts and incomplete diagnostics.
+    pub fn rizin_retry_timeout(mut self, timeout: Duration) -> Self {
+        self.rizin.retry_timeout = Some(timeout);
         self
     }
 

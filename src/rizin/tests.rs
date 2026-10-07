@@ -1391,3 +1391,83 @@ fn timeout_kills_process_group_joins_reader_and_returns_worker() {
 // Rust and was verified end-to-end on the malware sample run
 // (8,325 functions recovered, no `filefacts-rizin-*` files left in
 // `/tmp` across sessions).
+
+#[test]
+fn deadline_retry_targets_only_timeouts_and_runs_at_most_once() {
+    let mut budgets = Vec::new();
+    let first = Duration::from_millis(5);
+    let second = Duration::from_millis(20);
+    let result = attempt_with_retry(first, Some(second), |budget| {
+        budgets.push(budget);
+        Attempt::timed_out()
+    });
+    assert!(result.timed_out);
+    assert_eq!(budgets, vec![first, second]);
+    for attempt in [
+        Attempt::transient(),
+        Attempt::decided(None, 0),
+        Attempt::decided(Some(make_recovery("{}")), 1),
+    ] {
+        let mut calls = 0;
+        let result = attempt_with_retry(first, Some(second), |_| {
+            calls += 1;
+            attempt.clone()
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(result.timed_out, attempt.timed_out);
+    }
+}
+
+#[test]
+fn smaller_equal_or_disabled_retry_deadline_is_not_used() {
+    for retry in [
+        None,
+        Some(Duration::from_millis(5)),
+        Some(Duration::from_millis(1)),
+    ] {
+        let mut calls = 0;
+        let result = attempt_with_retry(Duration::from_millis(5), retry, |_| {
+            calls += 1;
+            Attempt::timed_out()
+        });
+        assert!(result.timed_out);
+        assert_eq!(calls, 1);
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn timed_out_shim_retries_and_recovers_but_crash_does_not_retry() {
+    let _lock = rizin_test_lock();
+    let dir = stage_script(
+        "filefacts-native-retry",
+        "flag=\"${0}.first\"\nif [ ! -f \"$flag\" ]; then : > \"$flag\"; exec sleep 300; fi\nprintf '[]\\n===SEP===\\n[]\\n===SEP===\\n[]\\n===SEP===\\n[]\\n'\n",
+    );
+    let mut runs = 0;
+    let result = attempt_with_retry(
+        Duration::from_millis(100),
+        Some(Duration::from_secs(2)),
+        |timeout| {
+            runs += 1;
+            attempt_with_bin(&dir.join("rizin"), b"fixture", 0, false, timeout)
+        },
+    );
+    assert_eq!(runs, 2);
+    assert!(result.recovery.is_some());
+    assert!(!result.timed_out);
+    let crash = stage_script("filefacts-native-retry-crash", "exit 3\n");
+    let mut runs = 0;
+    let result = attempt_with_retry(
+        Duration::from_millis(100),
+        Some(Duration::from_secs(2)),
+        |timeout| {
+            runs += 1;
+            attempt_with_bin(&crash.join("rizin"), b"fixture", 0, false, timeout)
+        },
+    );
+    assert_eq!(runs, 1);
+    assert!(result.recovery.is_none());
+    assert!(!result.timed_out);
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(crash);
+}

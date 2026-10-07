@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 /// genuine non-package fetch — a bare script on an arbitrary host. A
 /// [`RefLocator::Path`] is an intra-artifact file reference, resolved against
 /// the bundle's other files rather than fetched.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum RefLocator {
@@ -43,7 +43,7 @@ pub enum RefLocator {
 /// groups by, and it gates fetch selection: a [`Repository`](RefKind::Repository)
 /// is identity and an [`Undefined`](RefKind::Undefined) is unclassified, so
 /// neither is fetched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum RefKind {
@@ -68,7 +68,7 @@ pub enum RefKind {
 }
 
 /// A digest algorithm a manifest pins a reference to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum HashAlgo {
@@ -87,7 +87,7 @@ pub enum HashAlgo {
 /// A content hash a manifest pins a reference to. Drives cache lifetime —
 /// a pinned reference is immutable, so it caches long — and lets a fetcher
 /// verify retrieved bytes against what was declared.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PinnedHash {
     /// The digest algorithm.
     pub algo: HashAlgo,
@@ -96,10 +96,40 @@ pub struct PinnedHash {
     pub value: String,
 }
 
+/// Execution environment in which a declared dependency is used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyScope {
+    /// Installed application code.
+    Runtime,
+    /// Code executed to build an artifact.
+    Build,
+    /// Tooling used only in development or tests.
+    Development,
+    /// Code executed by a CI workflow.
+    Ci,
+}
+
+/// Dependency context, independent of its locator and integrity constraint.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DependencyContext {
+    /// The environment in which the dependency is needed.
+    pub scope: DependencyScope,
+    /// Installation may omit this dependency on some platforms.
+    #[serde(default)]
+    pub optional: bool,
+    /// The lockfile reports executable installation hooks.
+    #[serde(default)]
+    pub has_install_script: bool,
+    /// The installed path in an npm v2/v3 lockfile, including alias names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_path: Option<String>,
+}
+
 /// One reference an artifact points at — an external package/URL (normalized
 /// for fetching and cross-repo lookup) or an intra-artifact file path
 /// (resolved against the bundle's other files).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Reference {
     /// Normalized, fetchable identity. PURL where possible, else URL.
@@ -133,6 +163,9 @@ pub struct Reference {
     /// be filled at extraction (the pin *is* the content hash).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub content_sha256: Option<String>,
+    /// Retained dependency scope and installation metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<DependencyContext>,
 }
 
 impl Reference {
@@ -152,6 +185,7 @@ impl Reference {
             offset: None,
             pinned_hash: None,
             content_sha256: None,
+            context: None,
         }
     }
 
@@ -163,5 +197,20 @@ impl Reference {
             self.kind,
             RefKind::Dependency | RefKind::Command | RefKind::UrlFetch
         )
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+    #[test]
+    fn old_references_without_context_still_deserialize() {
+        let reference: Reference = serde_json::from_str(r#"{"locator":{"purl":"pkg:npm/a@1.0.0"},"kind":"dependency","source":"package.json","evidence":"a"}"#).unwrap();
+        assert!(reference.context.is_none());
+        assert!(
+            !serde_json::to_string(&reference)
+                .unwrap()
+                .contains("context")
+        );
     }
 }

@@ -49,7 +49,9 @@ pub use metric_keys::{
 };
 pub(crate) use metric_keys::{declared, metric};
 pub use metrics::{Fact, Metrics};
-pub use references::{HashAlgo, PinnedHash, RefKind, RefLocator, Reference};
+pub use references::{
+    DependencyContext, DependencyScope, HashAlgo, PinnedHash, RefKind, RefLocator, Reference,
+};
 pub use sections::{Section, SectionFlag, Sections};
 pub use spans::Span;
 pub(crate) use spans::SpanBuilder;

@@ -196,6 +196,8 @@ pub(crate) struct Settings {
     pub(crate) enabled: bool,
     /// Wall-clock budget for one rizin run.
     pub(crate) timeout: Duration,
+    /// Optional larger deadline for one retry of a timed-out file.
+    pub(crate) retry_timeout: Option<Duration>,
     /// Skip rizin for inputs larger than this many bytes. `None` = no cap.
     /// A full `aaa` on a 100 MB+ stripped binary costs minutes; a cap keeps a
     /// directory of giant signed apps from dominating a latency-sensitive
@@ -212,6 +214,7 @@ impl Default for Settings {
         Self {
             enabled: true,
             timeout: RIZIN_TIMEOUT,
+            retry_timeout: None,
             max_bytes: None,
             native_arch_only: false,
         }
@@ -569,19 +572,22 @@ pub(crate) fn recover_with_symbols(
         // an in-process recovery memo entry with the generic PE path.
         hasher.update([u8::from(go_function_metadata)]);
         hasher.update(settings.timeout.as_nanos().to_le_bytes());
+        hasher.update(
+            settings
+                .retry_timeout
+                .map(|t| t.as_nanos())
+                .unwrap_or(0)
+                .to_le_bytes(),
+        );
         hasher.finalize().into()
     };
     if let Some(hit) = registry(&RIZIN_MEMO).get(&key) {
         tracing::debug!(bytes = bytes.len(), "rizin recover: in-run memo hit");
         return hit.clone();
     }
-    let attempt = attempt_with_bin(
-        bin,
-        bytes,
-        symbol_count,
-        go_function_metadata,
-        settings.timeout,
-    );
+    let attempt = attempt_with_retry(settings.timeout, settings.retry_timeout, |timeout| {
+        attempt_with_bin(bin, bytes, symbol_count, go_function_metadata, timeout)
+    });
     if attempt.deterministic {
         registry(&RIZIN_MEMO).insert(key, attempt.recovery.clone(), attempt.weight);
     }
@@ -646,6 +652,7 @@ impl Memo {
 }
 
 /// One recovery attempt, and whether the bytes alone decided its outcome.
+#[derive(Clone)]
 struct Attempt {
     recovery: Option<RizinRecovery>,
     /// The same bytes under the same budget would end the same way, so the
@@ -656,6 +663,28 @@ struct Attempt {
     /// Bytes of rizin output the recovery was parsed from: the memo's
     /// estimate of its size.
     weight: usize,
+    timed_out: bool,
+}
+
+/// A timeout is the only reason to increase the deadline. Crashes, unsupported
+/// formats, output caps and supervision failures do not become long retries.
+fn attempt_with_retry(
+    timeout: Duration,
+    retry_timeout: Option<Duration>,
+    mut run: impl FnMut(Duration) -> Attempt,
+) -> Attempt {
+    let first = run(timeout);
+    if first.timed_out
+        && let Some(retry) = retry_timeout.filter(|retry| *retry > timeout)
+    {
+        tracing::info!(
+            timeout_secs = retry.as_secs(),
+            "retrying timed-out native disassembly"
+        );
+        run(retry)
+    } else {
+        first
+    }
 }
 
 impl Attempt {
@@ -664,6 +693,14 @@ impl Attempt {
             recovery,
             deterministic: true,
             weight,
+            timed_out: false,
+        }
+    }
+
+    fn timed_out() -> Self {
+        Self {
+            timed_out: true,
+            ..Self::decided(None, 0)
         }
     }
 
@@ -672,6 +709,7 @@ impl Attempt {
             recovery: None,
             deterministic: false,
             weight: 0,
+            timed_out: false,
         }
     }
 }
@@ -807,7 +845,7 @@ fn attempt_with_script(
                 elapsed_ms = started.elapsed().as_millis(),
                 "rizin recover: end (timed out)"
             );
-            return Attempt::decided(None, 0);
+            return Attempt::timed_out();
         }
         RunOutcome::Failed => {
             RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);

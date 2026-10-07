@@ -740,14 +740,43 @@ impl Refs<'_> {
             .as_ref()
             .filter(|p| p.algo == HashAlgo::Sha256)
             .map(|p| p.value.clone());
+        let source = source.into();
+        // Classify the declaration table, never a publisher-controlled package
+        // name containing words such as `dev-dependencies`.
+        let cargo_table = source.strip_prefix("Cargo.toml:").map(|field| {
+            field
+                .strip_suffix(":workspace-unresolved")
+                .unwrap_or_else(|| field.rsplit_once('.').map_or("", |(table, _)| table))
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+        });
+        let scope = if cargo_table == Some("build-dependencies")
+            || source == "pyproject.toml:build-system.requires"
+        {
+            Some(crate::DependencyScope::Build)
+        } else if cargo_table == Some("dev-dependencies") {
+            Some(crate::DependencyScope::Development)
+        } else if source.starts_with("github.actions.") {
+            Some(crate::DependencyScope::Ci)
+        } else {
+            None
+        };
+        let context = scope.map(|scope| crate::DependencyContext {
+            scope,
+            optional: false,
+            has_install_script: false,
+            installed_path: None,
+        });
         self.refs.push(Reference {
             locator,
             kind,
-            source: source.into(),
+            source,
             evidence,
             offset,
             pinned_hash,
             content_sha256,
+            context,
         });
     }
 }
@@ -966,6 +995,14 @@ fn npm_manifest_deps(out: &mut Refs<'_>) {
                 format!("{name}@{spec}"),
                 None,
             );
+            if let Some(reference) = out.refs.last_mut() {
+                reference.context = Some(crate::DependencyContext {
+                    scope: crate::DependencyScope::Runtime,
+                    optional: field == "optionalDependencies",
+                    has_install_script: false,
+                    installed_path: None,
+                });
+            }
         }
     }
 }
@@ -1149,8 +1186,40 @@ fn npm_lock(values: &Values, out: &mut Refs<'_>) {
         }
     }
     if let Some(deps) = root.get("dependencies").and_then(JsonValue::as_object) {
-        for (name, entry) in deps {
-            push_locked_dep(out, name, entry, &format!("dependencies.{name}"), name);
+        let mut stack: Vec<_> = deps
+            .iter()
+            .map(|(name, entry)| (name, entry, format!("dependencies.{name}"), false, false))
+            .collect();
+        let mut remaining = 100_000usize;
+        while let Some((name, entry, source, parent_dev, parent_optional)) = stack.pop() {
+            if remaining == 0 {
+                break;
+            }
+            remaining -= 1;
+            let before = out.refs.len();
+            push_locked_dep(out, name, entry, &source, name);
+            let dev = parent_dev || entry.get("dev").and_then(JsonValue::as_bool) == Some(true);
+            let optional =
+                parent_optional || entry.get("optional").and_then(JsonValue::as_bool) == Some(true);
+            if out.refs.len() > before
+                && let Some(context) = out.refs.last_mut().and_then(|r| r.context.as_mut())
+            {
+                if dev {
+                    context.scope = crate::DependencyScope::Development;
+                }
+                context.optional |= optional;
+            }
+            if let Some(children) = entry.get("dependencies").and_then(JsonValue::as_object) {
+                stack.extend(children.iter().take(remaining).map(|(name, entry)| {
+                    (
+                        name,
+                        entry,
+                        format!("{source}.dependencies.{name}"),
+                        dev,
+                        optional,
+                    )
+                }));
+            }
         }
     }
 }
@@ -1202,6 +1271,22 @@ fn push_locked_dep(
         evidence,
         pinned_hash,
     );
+    if let Some(reference) = out.refs.last_mut() {
+        // devOptional can also be reached by a production optional edge. It
+        // is not evidence that this entry is exclusively development tooling.
+        reference.context = Some(crate::DependencyContext {
+            scope: if entry.get("dev").and_then(JsonValue::as_bool) == Some(true) {
+                crate::DependencyScope::Development
+            } else {
+                crate::DependencyScope::Runtime
+            },
+            optional: entry.get("optional").and_then(JsonValue::as_bool) == Some(true)
+                || entry.get("devOptional").and_then(JsonValue::as_bool) == Some(true),
+            has_install_script: entry.get("hasInstallScript").and_then(JsonValue::as_bool)
+                == Some(true),
+            installed_path: source.strip_prefix("packages.").map(str::to_owned),
+        });
+    }
 }
 
 /// `pkg:npm/name@version`, scope `@s/n` encoded as the PURL namespace
@@ -1394,3 +1479,98 @@ fn document_str<'a>(values: &'a Values, path: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod dependency_context_tests {
+    use crate::{DependencyScope, OpenOptions};
+    #[test]
+    fn dependency_scope_comes_from_the_table_not_words_in_the_package_name() {
+        let data = br#"[package]
+name = "fixture"
+version = "1.0.0"
+[dependencies]
+dev-dependencies-helper = "=1.0.0"
+build-dependencies-helper = "=2.0.0"
+[build-dependencies]
+cc = "=1.0.0"
+[dev-dependencies]
+tempfile = "=3.0.0"
+"#;
+        let parsed = OpenOptions::new()
+            .path(std::path::Path::new("Cargo.toml"))
+            .open(data);
+        let by_name = |name: &str| {
+            parsed
+                .references()
+                .iter()
+                .find(|r| matches!(&r.locator, crate::RefLocator::Purl(p) if p.contains(name)))
+                .unwrap()
+        };
+        assert!(by_name("dev-dependencies-helper").context.is_none());
+        assert!(by_name("build-dependencies-helper").context.is_none());
+        assert_eq!(
+            by_name("pkg:cargo/cc@").context.as_ref().unwrap().scope,
+            DependencyScope::Build
+        );
+        assert_eq!(
+            by_name("tempfile").context.as_ref().unwrap().scope,
+            DependencyScope::Development
+        );
+    }
+    #[test]
+    fn npm_lock_scopes_flags_aliases_and_integrity_survive() {
+        let data = br#"{"lockfileVersion":3,"packages":{
+          "node_modules/runtime":{"version":"1.0.0"},
+          "node_modules/dev":{"version":"2.0.0","dev":true},
+          "node_modules/optional":{"version":"3.0.0","optional":true},
+          "node_modules/both":{"version":"4.0.0","devOptional":true},
+          "node_modules/alias":{"name":"real","version":"5.0.0","dev":true,"hasInstallScript":true,"integrity":"sha512-PIN"}
+        }}"#;
+        let parsed = OpenOptions::new()
+            .path(std::path::Path::new("package-lock.json"))
+            .open(data);
+        let refs = parsed.references();
+        let by_name = |name: &str| {
+            refs.iter()
+                .find(|r| matches!(&r.locator, crate::RefLocator::Purl(p) if p.contains(name)))
+                .unwrap()
+        };
+        assert_eq!(
+            by_name("runtime").context.as_ref().unwrap().scope,
+            DependencyScope::Runtime
+        );
+        assert_eq!(
+            by_name("dev@").context.as_ref().unwrap().scope,
+            DependencyScope::Development
+        );
+        assert!(by_name("optional").context.as_ref().unwrap().optional);
+        let both = by_name("both").context.as_ref().unwrap();
+        assert!(both.optional);
+        assert_eq!(both.scope, DependencyScope::Runtime);
+        let alias = by_name("real");
+        let ctx = alias.context.as_ref().unwrap();
+        assert_eq!(ctx.installed_path.as_deref(), Some("node_modules/alias"));
+        assert!(ctx.has_install_script);
+        assert_eq!(ctx.scope, DependencyScope::Development);
+        assert_eq!(alias.pinned_hash.as_ref().unwrap().value, "PIN");
+    }
+}
+
+#[cfg(test)]
+mod nested_lock_context_tests {
+    use crate::{DependencyScope, OpenOptions, RefLocator};
+    #[test]
+    fn v1_nested_development_and_optional_context_is_inherited() {
+        let parsed = OpenOptions::new().path(std::path::Path::new("package-lock.json")).open(br#"{"lockfileVersion":1,"dependencies":{"parent":{"version":"1.0.0","dev":true,"optional":true,"dependencies":{"child":{"version":"npm:real-child@2.0.0","integrity":"sha512-PIN"}}}}}"#);
+        let child = parsed
+            .references()
+            .iter()
+            .find(|r| r.locator == RefLocator::Purl("pkg:npm/real-child@2.0.0".into()))
+            .unwrap();
+        let context = child.context.as_ref().unwrap();
+        assert_eq!(context.scope, DependencyScope::Development);
+        assert!(context.optional);
+        assert!(context.installed_path.is_none());
+        assert_eq!(child.pinned_hash.as_ref().unwrap().value, "PIN");
+    }
+}
