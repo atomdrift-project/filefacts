@@ -659,3 +659,51 @@ fn malformed_errors_keep_their_text_and_expose_the_parser_error() {
     );
     assert!(err.source().is_none());
 }
+
+#[test]
+fn native_entitlement_requests_require_top_level_boolean_true() {
+    for value in [
+        plist::Value::Boolean(true),
+        plist::Value::Boolean(false),
+        plist::Value::String("true".into()),
+        plist::Value::Integer(1.into()),
+    ] {
+        let expected = if value == plist::Value::Boolean(true) {
+            1.0
+        } else {
+            0.0
+        };
+        let mut dict = plist::Dictionary::new();
+        dict.insert("com.apple.security.cs.allow-jit".into(), value.clone());
+        dict.insert(
+            "com.apple.security.cs.allow-unsigned-executable-memory".into(),
+            value,
+        );
+        let root = plist::Value::Dictionary(dict);
+        for binary in [false, true] {
+            let mut bytes = Vec::new();
+            if binary {
+                root.to_writer_binary(&mut bytes).unwrap();
+            } else {
+                root.to_writer_xml(&mut bytes).unwrap();
+            }
+            let mut values = Values::new();
+            extract_plist(&bytes, &mut values).unwrap();
+            let mut metrics = Metrics::new();
+            plist_entitlement_metrics(&values, &mut metrics);
+            assert_eq!(
+                metrics.get("plist.jit_entitlement_requested"),
+                Some(expected)
+            );
+            assert_eq!(
+                metrics.get("plist.unsigned_executable_memory_entitlement_requested"),
+                Some(expected)
+            );
+        }
+    }
+    let mut values = Values::new();
+    extract_plist(br#"<?xml version="1.0"?><plist><dict><key>nested</key><dict><key>com.apple.security.cs.allow-jit</key><true/></dict></dict></plist>"#, &mut values).unwrap();
+    let mut metrics = Metrics::new();
+    plist_entitlement_metrics(&values, &mut metrics);
+    assert_eq!(metrics.get("plist.jit_entitlement_requested"), Some(0.0));
+}

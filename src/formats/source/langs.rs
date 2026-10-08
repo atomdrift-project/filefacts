@@ -1076,7 +1076,9 @@ static PERL: LangConfig = LangConfig {
 static GROOVY: LangConfig = LangConfig {
     lang: Lang::Groovy,
     language: || tree_sitter_groovy::LANGUAGE.into(),
-    string_kinds: &["string_literal"],
+    // This grammar retains Java's node name for Groovy single-quoted
+    // strings. Their contents are string values, including multi-byte text.
+    string_kinds: &["string_literal", "character_literal"],
     import_query: r#"
         (import_declaration (scoped_identifier) @import)
         (import_declaration (identifier) @import)

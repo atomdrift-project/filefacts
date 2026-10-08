@@ -328,6 +328,16 @@ pub struct ParsedFile<'a> {
     parse_count: AtomicU32,
 }
 
+/// Return the UTF-8 source view used by the source parser.
+///
+/// Valid UTF-8 is borrowed. Each invalid byte is replaced by one ASCII `_`,
+/// preserving all byte offsets and valid sequences. This is syntax recovery,
+/// not character-set decoding; callers must not treat masked text as original
+/// literal content. Use this view with a cached source AST from the same bytes.
+pub fn source_text_for_ast(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+    formats::source::utf8_source(bytes).0
+}
+
 /// Borrowed source parse owned by a [`ParsedFile`].
 ///
 /// This exposes the shared tree-sitter tree to host tools that need

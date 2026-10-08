@@ -184,6 +184,52 @@ impl Evidence {
     }
 }
 
+/// Binary batch polyglots must keep their command prologue at source entry.
+/// The same content evidence applies even when a registered extension would
+/// otherwise bypass the script scorer and fall back to DOS object code.
+pub(super) fn binary_batch_prologue(data: &[u8]) -> bool {
+    let first = data
+        .split(|b| *b == b'\r' || *b == b'\n')
+        .find(|line| !line.trim_ascii().is_empty())
+        .unwrap_or_default();
+    batch_opener(first) && evidence(data).verdict() == Some(FileType::Batch)
+}
+
+/// A bare HTML opener followed by REM and a batch body is a DOS-script
+/// prologue, not a page containing a script example. Keep actual markup
+/// documents in the HTML parser. This does not assert browser activation.
+pub(super) fn html_prefixed_batch(data: &[u8]) -> bool {
+    let data = data.trim_ascii_start();
+    let mut lines = data.splitn(2, |b| *b == b'\n');
+    let first = lines.next().unwrap_or_default();
+    let Some(rest) = lines.next() else {
+        return false;
+    };
+    let Some((tag, after_html)) = first.split_at_checked(6) else {
+        return false;
+    };
+    if !tag.eq_ignore_ascii_case(b"<html>") {
+        return false;
+    }
+    let after_html = after_html.trim_ascii_start();
+    if !after_html
+        .get(..3)
+        .is_some_and(|word| word.eq_ignore_ascii_case(b"rem"))
+        || !after_html.get(3).is_some_and(u8::is_ascii_whitespace)
+    {
+        return false;
+    }
+    let body = rest.get(..WINDOW).unwrap_or(rest);
+    if body.split(|b| *b == b'\n').any(|line| {
+        let line = line.trim_ascii_start();
+        line.starts_with(b"<") && line.contains(&b'>')
+    }) {
+        return false;
+    }
+    let ev = evidence(body);
+    ev.conclusive(FileType::Batch) && ev.verdict() == Some(FileType::Batch)
+}
+
 /// Grade the lines of `text` for all four languages.
 pub(crate) fn evidence(text: &[u8]) -> Evidence {
     evidence_within(text, WINDOW)

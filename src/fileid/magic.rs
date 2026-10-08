@@ -115,6 +115,9 @@ const RULES: &[fn(&Probe<'_, '_>) -> Option<Found>] = &[
     html_document,
     udif_dmg,
     iso_image,
+    certificate_signature,
+    image4_trustcache,
+    tiff_header,
     leading_signature,
     ustar,
     python_bytecode,
@@ -155,6 +158,88 @@ fn cold_fusion_template(p: &Probe<'_, '_>) -> Option<Found> {
     .then_some((FileType::Cfml, DetectionSource::Magic))
 }
 
+/// The detached signature sidecars shipped with several CDM clients use a
+/// single framed certificate, signature material, and a flags field. Require
+/// every boundary to agree; neither a `.sig` name nor an embedded DER prefix
+/// alone establishes this format. No authenticity or trust is inferred.
+fn certificate_signature(p: &Probe<'_, '_>) -> Option<Found> {
+    certificate_signature_data(p.data).then_some((FileType::Data, DetectionSource::Magic))
+}
+
+fn image4_trustcache(p: &Probe<'_, '_>) -> Option<Found> {
+    super::image4_trustcache::parse(p.data).map(|_| (FileType::Data, DetectionSource::Magic))
+}
+
+pub(super) fn certificate_signature_data(data: &[u8]) -> bool {
+    certificate_signature_body(data).is_some()
+}
+
+fn certificate_signature_body(data: &[u8]) -> Option<()> {
+    let mut rest = data.strip_prefix(&[0, 1])?;
+    let cert_len = signature_varint(&mut rest)?;
+    let cert = rest.get(..cert_len)?;
+    rest = rest.get(cert_len..)?;
+    let &[0x30, 0x82, hi, lo, ref body @ ..] = cert else {
+        return None;
+    };
+    if usize::from(u16::from_be_bytes([hi, lo])) + 4 != cert.len() {
+        return None;
+    }
+    // An X.509 Certificate has a TBS sequence, an algorithm sequence,
+    // and a BIT STRING signature, with no additional top-level fields.
+    let mut der = body;
+    for tag in [0x30, 0x30, 0x03] {
+        if *der.first()? != tag {
+            return None;
+        }
+        der = der.get(1..)?;
+        let len = signature_der_length(&mut der)?;
+        if len == 0 {
+            return None;
+        }
+        der = der.get(len..)?;
+    }
+    if !der.is_empty() {
+        return None;
+    }
+    rest = rest.strip_prefix(&[2])?;
+    let signature_len = signature_varint(&mut rest)?;
+    if !(128..=4096).contains(&signature_len) {
+        return None;
+    }
+    rest = rest.get(signature_len..)?.strip_prefix(&[3])?;
+    let flags_len = signature_varint(&mut rest)?;
+    (flags_len == 1 && matches!(rest, [0 | 1])).then_some(())
+}
+
+fn signature_varint(rest: &mut &[u8]) -> Option<usize> {
+    let mut value = 0usize;
+    for shift in (0..28).step_by(7) {
+        let (&byte, tail) = rest.split_first()?;
+        *rest = tail;
+        value |= usize::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn signature_der_length(rest: &mut &[u8]) -> Option<usize> {
+    let (&byte, tail) = rest.split_first()?;
+    *rest = tail;
+    if byte < 0x80 {
+        return Some(usize::from(byte));
+    }
+    let count = usize::from(byte & 0x7f);
+    if !(1..=2).contains(&count) {
+        return None;
+    }
+    let bytes = rest.get(..count)?;
+    *rest = rest.get(count..)?;
+    Some(bytes.iter().fold(0usize, |n, b| (n << 8) | usize::from(*b)))
+}
+
 /// A Go module manifest has no magic bytes, but its first non-comment
 /// directive is unambiguous. Detect it from content so renamed `go.mod`
 /// files still reach module-aware facts and rules before extension fallback.
@@ -180,8 +265,32 @@ fn go_module(p: &Probe<'_, '_>) -> Option<Found> {
 /// ISO base media (`.mp4`/`.m4a`/`.mov`): the size-prefixed `ftyp` box.
 /// Keyed at offset 4, so it cannot live in the first-byte jump table.
 fn iso_base_media(p: &Probe<'_, '_>) -> Option<Found> {
-    (!p.text && p.data.len() >= 12 && p.data.get(4..8) == Some(b"ftyp"))
-        .then_some((FileType::Mp4, DetectionSource::Magic))
+    if p.text || p.data.len() < 12 || p.data.get(4..8) != Some(b"ftyp") {
+        return None;
+    }
+    // AVIF uses the same box framing as MP4, but is an image carrier.
+    // Read brands only inside the declared, bounded FileTypeBox; a word
+    // in media payload bytes or the minor-version field is not a brand.
+    let short_size = bytes::u32_be(p.data, 0)?;
+    let (size, header) = match short_size {
+        0 => (p.data.len(), 8),
+        1 => (usize::try_from(bytes::u64_be(p.data, 8)?).ok()?, 16),
+        n => (n as usize, 8),
+    };
+    let avif = p.data.get(header..size).is_some_and(|brands| {
+        brands.len() >= 8
+            && brands.len().is_multiple_of(4)
+            && brands
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .enumerate()
+                .any(|(i, brand)| i != 1 && (brand == b"avif" || brand == b"avis"))
+    });
+    Some((
+        if avif { FileType::Avif } else { FileType::Mp4 },
+        DetectionSource::Magic,
+    ))
 }
 
 /// A Windows URL shortcut: an INI whose first section is
@@ -217,7 +326,43 @@ fn script_encoder(p: &Probe<'_, '_>) -> Option<Found> {
 /// often renamed `yarn.<sha>.lock`, so the header, not the name, has to
 /// carry them to the lockfile traits.
 fn lockfile(p: &Probe<'_, '_>) -> Option<Found> {
-    lockfile_header(p.data).map(|ft| (ft, DetectionSource::Magic))
+    lockfile_header(p.data)
+        .or_else(|| npm_json_lockfile(p.data))
+        .map(|ft| (ft, DetectionSource::Magic))
+}
+
+/// npm's JSON lockfile family, independent of a collector-chosen filename.
+/// A bounded, complete JSON parse is required: quoted markers or trailing code
+/// are not format identity. This is declaration framing, not dependency trust.
+fn npm_json_lockfile(data: &[u8]) -> Option<FileType> {
+    if data.len() > 16 * 1024 * 1024 {
+        return None;
+    }
+    let data = strip_utf8_bom(data).trim_ascii();
+    if !data.starts_with(b"{") || memchr::memmem::find(data, b"\"lockfileVersion\"").is_none() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(data).ok()?;
+    let root = value.as_object()?;
+    let version = root.get("lockfileVersion")?.as_u64()?;
+    if !matches!(version, 1..=3)
+        || root.get("name").is_some_and(|v| !v.is_string())
+        || root.get("version").is_some_and(|v| !v.is_string())
+        || root.get("requires").is_some_and(|v| !v.is_boolean())
+    {
+        return None;
+    }
+    let records = if version == 1 {
+        root.get("name")?.as_str()?;
+        root.get("version")?.as_str()?;
+        root.get("dependencies")?.as_object()?
+    } else {
+        root.get("packages")?.as_object()?
+    };
+    if !records.values().all(serde_json::Value::is_object) {
+        return None;
+    }
+    Some(FileType::PackageLockJson)
 }
 
 /// PostScript and EPS. `%!PS` at the start is the format; a `.ps` extension
@@ -290,6 +435,16 @@ fn iso_image(p: &Probe<'_, '_>) -> Option<Found> {
     looks_like_iso_or_udf(p.data).then_some((FileType::Iso, DetectionSource::Magic))
 }
 
+/// TIFF's byte-order/version header identifies the container, not a valid IFD.
+fn tiff_header(p: &Probe<'_, '_>) -> Option<Found> {
+    let data = p.data;
+    let classic =
+        data.len() >= 8 && (data.starts_with(b"II\x2a\0") || data.starts_with(b"MM\0\x2a"));
+    let big = data.len() >= 16
+        && (data.starts_with(b"II\x2b\0\x08\0\0\0") || data.starts_with(b"MM\0\x2b\0\x08\0\0"));
+    (classic || big).then_some((FileType::Tiff, DetectionSource::Magic))
+}
+
 /// A short signature proves nothing when only text follows it. Formats
 /// whose header is text by design keep their claim; any other claim falls
 /// through to the rules after this one.
@@ -323,6 +478,14 @@ fn first_byte_signature(p: &Probe<'_, '_>) -> Option<Found> {
                 // `00 01 00 00`, which an icon header can never be (its type
                 // field would have to be 0x0100).
                 Some((FileType::Ico, DetectionSource::Magic))
+            } else if let &[_, a, b, c, d, _, _, _, _, 1, 0, 0, 0, 0, 0, 0, 0, ..] = data
+                && [a, b, c, d] != [0; 4]
+            {
+                // NRBF SerializedStreamHeader: record kind 0, nonzero root
+                // ID, ignored header ID, and little-endian version 1.0.
+                // Root ID 1 collides with the first four SFNT bytes. Route
+                // serialized records to opaque-byte analysis, not font parsing.
+                Some((FileType::Data, DetectionSource::Magic))
             } else if let Some(rest) = data.strip_prefix(&[0x00, 0x01, 0x00, 0x00])
                 && !rest.starts_with(b"Standard Jet DB")
                 && !rest.starts_with(b"Standard ACE DB")
@@ -372,8 +535,13 @@ fn first_byte_signature(p: &Probe<'_, '_>) -> Option<Found> {
             }
         }
         b'P' => {
-            // ZIP/JAR/OOXML: PK
-            if second == b'K' {
+            // ZIP record signatures are four bytes. A Tar member named
+            // PKGBUILD also begins with PK; those letters alone are not ZIP.
+            if second == b'K'
+                && data.get(2..4).is_some_and(|signature| {
+                    matches!(signature, [3, 4] | [5, 6] | [7, 8] | [6, 6] | [6, 7])
+                })
+            {
                 Some(classify_pk(path, data))
             } else {
                 None
@@ -541,10 +709,13 @@ fn first_byte_signature(p: &Probe<'_, '_>) -> Option<Found> {
             } else if (data.starts_with(b"RIFF") || data.starts_with(b"RIFX")) && data.len() >= 12 {
                 // RIFF container: `RIFF` + u32 length + form type. WAVE, WEBP
                 // and AVI share the wrapper, so the form type at offset 8
-                // decides. An animated cursor (`ACON`) is not audio.
+                // decides. Animated cursors (`ACON`) are opaque binary data
+                // until there is a dedicated cursor analyzer. Recognize them
+                // so even a renamed cursor reaches generic static analysis.
                 let kind = match data.get(8..12) {
                     Some(b"WEBP") => Some(FileType::Webp),
                     Some(b"WAVE") => Some(FileType::Wav),
+                    Some(b"ACON") => Some(FileType::Data),
                     _ => None,
                 };
                 kind.map(|file_type| (file_type, DetectionSource::Magic))
@@ -1131,7 +1302,7 @@ fn looks_like_pickle(path: &Path, data: &[u8]) -> bool {
         _ if data.starts_with(TORCH_LEGACY_MAGIC) => true,
         [0x80, 2 | 3, ..] => matches!(
             lowercase_ext(path).as_deref(),
-            Some("pkl" | "pickle" | "joblib" | "pt" | "pth")
+            Some("pkl" | "pickle" | "joblib" | "debug_pkl" | "pt" | "pth")
         ),
         _ => false,
     }
@@ -2176,6 +2347,31 @@ mod odf_confirmation_tests {
 #[cfg(test)]
 mod jet_db_sfnt_collision_tests {
     use super::*;
+
+    #[test]
+    fn nrbf_stream_header_routes_to_data_without_a_filename_gate() {
+        let data = [
+            0, 1, 0, 0, 0, 255, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0, 0, 11,
+        ];
+        for path in ["reference.cache", "renamed.ttf", "sample"] {
+            assert_eq!(
+                detect_from_content(Path::new(path), &data).map(|(ft, _)| ft),
+                Some(FileType::Data)
+            );
+        }
+        for end in 0..17 {
+            assert_ne!(
+                detect_from_content(Path::new("sample"), &data[..end]).map(|(ft, _)| ft),
+                Some(FileType::Data)
+            );
+        }
+        let mut wrong_version = data;
+        wrong_version[9] = 2;
+        assert_ne!(
+            detect_from_content(Path::new("sample"), &wrong_version).map(|(ft, _)| ft),
+            Some(FileType::Data)
+        );
+    }
 
     /// A real TrueType font still identifies as a font.
     #[test]

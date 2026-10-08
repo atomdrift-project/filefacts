@@ -326,7 +326,7 @@ const PYTHON_INDENT_BYTES_PER_LEVEL: usize = 2;
 /// with Latin-1 letters in one piece (PHP accepts bytes 0x80-0xff in names)
 /// and is inert in strings and comments; those keep the substitute, not the
 /// original byte.
-fn utf8_source(bytes: &[u8]) -> (Cow<'_, str>, usize) {
+pub(crate) fn utf8_source(bytes: &[u8]) -> (Cow<'_, str>, usize) {
     if let Ok(text) = std::str::from_utf8(bytes) {
         return (Cow::Borrowed(text), 0);
     }

@@ -10,6 +10,9 @@ const MAX_BRANCHES: usize = 32;
 const MAX_EXPR_DEPTH: usize = 32;
 const MAX_EXPR_PARTS: usize = 64;
 type Bindings = BTreeMap<String, usize>;
+/// An open `<cfhttp>`'s object, when one was recorded, and the
+/// `(offset, object)` of each `<cfhttpparam>` seen inside it.
+type HttpParent = (Option<usize>, Vec<(usize, usize)>);
 
 // Variables is the default template assignment scope. Functions are not
 // analyzed here, so local/arguments aliases must not be guessed.
@@ -770,7 +773,12 @@ impl Builder<'_> {
         }
     }
     fn assignment(&mut self, tag: &Tag) {
-        let r = self.trim(tag.body.clone());
+        let mut r = self.trim(tag.body.clone());
+        // XML-style CFSET closes with />. The slash is tag syntax, not
+        // part of its RHS expression; preserve every expression offset.
+        if r.end > r.start && self.bytes.get(r.end - 1) == Some(&b'/') {
+            r = self.trim(r.start..r.end - 1);
+        }
         let Some(eq) = self
             .bytes
             .get(r.clone())
@@ -990,7 +998,7 @@ impl Builder<'_> {
     fn call(&mut self, tag: &Tag, name: String) {
         self.tag_call(tag, name, false, true);
     }
-    fn tag_call(&mut self, tag: &Tag, name: String, html: bool, interpolate: bool) {
+    fn tag_call(&mut self, tag: &Tag, name: String, html: bool, interpolate: bool) -> usize {
         let attrs = if html {
             super::markup::attributes(self.bytes, tag, interpolate)
         } else {
@@ -1001,7 +1009,7 @@ impl Builder<'_> {
                 self.bindings.clear();
             }
             self.gap("malformed-attributes");
-            return;
+            return 0;
         };
         let mut fields = BTreeMap::new();
         for attr in attrs {
@@ -1070,14 +1078,14 @@ impl Builder<'_> {
         }
         let object = self.add(FlowKind::Keyword, tag.span.start, Vec::new());
         if object == 0 {
-            return;
+            return 0;
         }
         if let Some(value) = self.result.flow.values.get_mut(object) {
             value.fields = fields;
         }
         let call = self.add(FlowKind::Call, tag.span.start, vec![object]);
         if call == 0 {
-            return;
+            return 0;
         }
         if let Some(value) = self.result.flow.values.get_mut(call) {
             value.target = Some(name.clone());
@@ -1090,6 +1098,7 @@ impl Builder<'_> {
             args: vec![Arg::Object],
             offset: Some(tag.span.start as u64),
         });
+        object
     }
     fn end_branch(&mut self, offset: usize) {
         let Some(mut branch) = self.branches.pop() else {
@@ -1166,6 +1175,8 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
     let mut output_expressions = syntax.output_expressions.into_iter().peekable();
     let mut script_ranges = syntax.scripts.into_iter();
     let mut function_depth = 0usize;
+    let mut http_parents: Vec<HttpParent> = Vec::new();
+    let mut opaque_http_depth = 0usize;
     let mut output_depth = 0usize;
     let mut output_scopes = Vec::new();
     let mut unknown_output_scopes = 0usize;
@@ -1220,6 +1231,57 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
                     b.implicit_scope = implicit;
                 }
             }
+            ("cfhttp", false) => {
+                let object = b.tag_call(&tag, name, false, true);
+                let self_closed = bytes.get(tag.span.clone()).is_some_and(|raw| {
+                    raw.get(..raw.len().saturating_sub(1))
+                        .is_some_and(|prefix| {
+                            prefix.iter().rev().find(|c| !c.is_ascii_whitespace()) == Some(&b'/')
+                        })
+                });
+                if !self_closed {
+                    if http_parents.len() >= MAX_BRANCHES || opaque_http_depth > 0 {
+                        opaque_http_depth = opaque_http_depth.saturating_add(1);
+                        b.gap("http-parent-depth");
+                    } else {
+                        http_parents.push(((object != 0).then_some(object), Vec::new()));
+                    }
+                }
+            }
+            ("cfhttp", true) => {
+                if opaque_http_depth > 0 {
+                    opaque_http_depth -= 1;
+                } else if let Some((parent, parameters)) = http_parents.pop() {
+                    if let Some(parent) = parent {
+                        for (offset, object) in parameters {
+                            let call = b.add(FlowKind::Call, offset, vec![object, parent]);
+                            if call != 0
+                                && let Some(value) = b.result.flow.values.get_mut(call)
+                            {
+                                value.target = Some("cfhttp:param".into());
+                                b.result.symbols.push(Symbol::Call {
+                                    target: Some("cfhttp:param".into()),
+                                    args: vec![Arg::Object, Arg::Object],
+                                    offset: Some(offset as u64),
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    b.gap("unbalanced-http-parent");
+                }
+            }
+            ("cfhttpparam", false) => {
+                let object = b.tag_call(&tag, name, false, true);
+                if object != 0
+                    && opaque_http_depth == 0
+                    && let Some((Some(_), parameters)) = http_parents.last_mut()
+                {
+                    // Keep the child's source-time attributes. Emit containment
+                    // only when the nearest owner's closing tag is observed.
+                    parameters.push((tag.span.start, object));
+                }
+            }
             ("cfset", false) => b.assignment(&tag),
             ("cfif", false) => {
                 if b.branches.len() == MAX_BRANCHES {
@@ -1259,8 +1321,8 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
             }
             ("cfif", true) => b.end_branch(tag.span.start),
             (
-                "cfexecute" | "cffile" | "cfdirectory" | "cfhttp" | "cfinput" | "cftextarea"
-                | "cfselect" | "cfheader" | "cfcontent",
+                "cfexecute" | "cffile" | "cfdirectory" | "cfinput" | "cftextarea" | "cfselect"
+                | "cfheader" | "cfcontent",
                 false,
             ) => b.call(&tag, name),
             ("input" | "textarea" | "select" | "button", false) => {
@@ -1318,8 +1380,8 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
             }
             ("cfapplication", true)
             | (
-                "cfexecute" | "cffile" | "cfdirectory" | "cfhttp" | "cfinput" | "cftextarea"
-                | "cfselect" | "cfheader" | "cfcontent",
+                "cfexecute" | "cffile" | "cfdirectory" | "cfinput" | "cftextarea" | "cfselect"
+                | "cfheader" | "cfcontent",
                 true,
             ) => {}
             // Do not let unknown control flow or calls preserve stale aliases.
@@ -1333,6 +1395,9 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
         if function_depth == 0 {
             b.output(range, unknown_output_scopes == 0);
         }
+    }
+    if !http_parents.is_empty() || opaque_http_depth > 0 {
+        b.gap("unclosed-http-parent");
     }
     if !b.branches.is_empty() {
         b.gap("unclosed-branch");

@@ -51,11 +51,25 @@ pub(super) fn extract(
     let mut opcodes: BTreeSet<&'static str> = BTreeSet::new();
     let mut recent: VecDeque<&str> = VecDeque::with_capacity(RECENT_STRING_CAP);
 
+    // The legacy torch container begins with a fixed magic integer and
+    // serialization version, then carries three more pickles before raw
+    // storage bytes. Ordinary pickle readers stop at the first STOP.
+    let torch_legacy = crate::fileid::torch_protocol2_legacy_header(scan);
+    let mut streams_left = if torch_legacy { 5 } else { 1 };
     let mut i = 0_usize;
     while let Some(&op) = scan.get(i) {
-        if let Some(name) = opcode_name(op) {
-            opcodes.insert(name);
+        let Some(name) = opcode_name(op) else { break };
+        // Unsupported/truncated PROTO operands are not protocol declarations.
+        if op == 0x80 && scan.get(i + 1).is_none_or(|p| *p > 5) {
+            break;
         }
+        let Some(frame) = payload_size(op, i, scan) else {
+            break;
+        };
+        if i.checked_add(frame).is_none_or(|end| end > scan.len()) {
+            break;
+        }
+        opcodes.insert(name);
         apply_side_effects(
             op,
             i,
@@ -65,10 +79,19 @@ pub(super) fn extract(
             &mut globals,
             &mut recent,
         );
-        let Some(frame) = payload_size(op, i, scan) else {
-            break;
-        };
         i += frame;
+        if op == b'.' {
+            streams_left -= 1;
+            if streams_left == 0 {
+                break;
+            }
+            recent.clear();
+            // This bounded legacy variant uses protocol-2 headers for every
+            // pickle; a corrupt next frame is not a raw-storage opcode scan.
+            if scan.get(i..i + 2) != Some(&[0x80, 2]) {
+                break;
+            }
+        }
     }
 
     if opcodes.is_empty() && modules.is_empty() && protocol < 0 {
@@ -165,15 +188,15 @@ fn payload_size(op: u8, i: usize, scan: &[u8]) -> Option<usize> {
             let a_nl = scan.get(attr_start..)?.iter().position(|&b| b == b'\n')?;
             Some((attr_start + a_nl + 1) - i)
         }
-        0x8A | 0x8C | b'U' => {
+        0x8A | 0x8C | b'U' | b'C' => {
             let len = *scan.get(i + 1)? as usize;
             read_len_prefixed(1, len)
         }
-        0x8B | b'X' | b'T' => {
+        0x8B | b'X' | b'T' | b'B' => {
             let len = u32_le(scan, i + 1)? as usize;
             read_len_prefixed(4, len)
         }
-        0x8D | 0x96 => {
+        0x8D | 0x8E | 0x96 => {
             let len = usize::try_from(u64_le(scan, i + 1)?).ok()?;
             read_len_prefixed(8, len)
         }
@@ -307,6 +330,8 @@ const fn opcode_name(op: u8) -> Option<&'static str> {
         b'R' => "REDUCE",
         b'S' => "STRING",
         b'T' => "BINSTRING",
+        b'B' => "BINBYTES",
+        b'C' => "SHORT_BINBYTES",
         b'U' => "SHORT_BINSTRING",
         b'V' => "UNICODE",
         b'X' => "BINUNICODE",
@@ -428,6 +453,64 @@ mod tests {
                 .any(|g| g.as_str() == Some("subprocess.Popen")),
             "STACK_GLOBAL should resolve module.attr: {globals:?}"
         );
+    }
+
+    #[test]
+    fn torch_legacy_storage_is_not_an_opcode_stream() {
+        let bytes = include_bytes!("../testdata/pickle/torch-protocol2-float-tensor.pt");
+        let (values, metrics) = run(bytes);
+        assert_eq!(metrics.get("pickle.protocol"), Some(2.0));
+        assert_eq!(
+            values.get("pickle.globals"),
+            Some(&serde_json::json!([
+                "collections.OrderedDict",
+                "torch.FloatStorage",
+                "torch._utils._rebuild_tensor_v2"
+            ]))
+        );
+        let ops = values.get("pickle.opcodes").unwrap().as_array().unwrap();
+        assert!(!ops.contains(&serde_json::json!("POP")));
+        let mut extended = bytes.to_vec();
+        extended.extend_from_slice(b"\x80\x29cos\nsystem\nR.");
+        assert_eq!(
+            serde_json::to_value(run(&extended).0).unwrap(),
+            serde_json::to_value(values).unwrap()
+        );
+    }
+
+    #[test]
+    fn raw_bytes_operands_and_trailing_bytes_do_not_declare_globals() {
+        let payload = b"\x80\x29cos\nsystem\nR";
+        for op in [b'B', b'C', 0x8e] {
+            let mut bytes = vec![0x80, 4, op];
+            match op {
+                b'B' => bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes()),
+                b'C' => bytes.push(payload.len() as u8),
+                _ => bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes()),
+            }
+            bytes.extend_from_slice(payload);
+            bytes.push(b'.');
+            bytes.extend_from_slice(b"cos\nsystem\nR");
+            let (values, metrics) = run(&bytes);
+            assert_eq!(metrics.get("pickle.protocol"), Some(4.0));
+            assert!(values.get("pickle.globals").is_none());
+            assert!(values.get("pickle.dangerous_opcodes").is_none());
+        }
+    }
+
+    #[test]
+    fn invalid_proto_and_corrupt_legacy_headers_do_not_scan_storage() {
+        let (values, metrics) = run(b"\x80\x29cos\nsystem\nR.");
+        assert!(values.get("pickle.globals").is_none());
+        assert!(metrics.get("pickle.protocol").is_none());
+        let mut bytes =
+            include_bytes!("../testdata/pickle/torch-protocol2-float-tensor.pt").to_vec();
+        bytes[4] ^= 1;
+        assert!(run(&bytes).0.get("pickle.globals").is_none());
+        let mut short = vec![0x80, 4, b'B'];
+        short.extend_from_slice(&u32::MAX.to_le_bytes());
+        short.extend_from_slice(b"cos\nsystem\nR.");
+        assert!(run(&short).0.get("pickle.globals").is_none());
     }
 
     #[test]

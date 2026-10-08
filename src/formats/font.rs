@@ -511,10 +511,9 @@ fn walk_woff(bytes: &[u8], report: &mut Report) {
     record_tables(bytes, dir_end as u64, &entries, report);
 }
 
-/// WOFF2's directory uses a variable-length integer encoding and its table
-/// data is one Brotli stream, so per-table extents are not addressable without
-/// decompressing. Record what the fixed header declares and check it against
-/// the file — enough to catch truncation, size lies, and appended data.
+/// WOFF2 has an uncompressed variable-length table directory followed by one
+/// Brotli stream. Recover tags and check physical block bounds without claiming
+/// to validate the compressed font tables themselves.
 fn walk_woff2(bytes: &[u8], report: &mut Report) {
     let Some(header) = bytes.first_chunk::<48>() else {
         report.problem("header truncated");
@@ -530,6 +529,7 @@ fn walk_woff2(bytes: &[u8], report: &mut Report) {
     let num_tables = u16::from_be_bytes([header[12], header[13]]) as usize;
     if num_tables == 0 {
         report.problem("no tables declared");
+        return;
     }
     if num_tables > MAX_TABLES {
         report.problem("implausible table count");
@@ -538,16 +538,198 @@ fn walk_woff2(bytes: &[u8], report: &mut Report) {
     let compressed = u64::from(u32::from_be_bytes([
         header[20], header[21], header[22], header[23],
     ]));
-    if compressed > bytes.len() as u64 {
-        report.problem("compressed data larger than file");
-        report.flag("table_out_of_bounds");
-    }
     report.largest_table_bytes = compressed;
-    // The directory is variable-length, so tag names are not recoverable here.
-    // Record the count so `font.table_count` stays comparable across formats.
+    let collection = header.get(4..8) == Some(b"ttcf".as_slice());
+    let mut cursor = 48;
     for _ in 0..num_tables {
-        report.tables.push(String::from("?"));
+        let Some((tag, _length)) = read_woff2_entry(bytes, &mut cursor) else {
+            report.problem("invalid or truncated WOFF2 table directory");
+            report.flag("truncated");
+            return;
+        };
+        if report.seen_tables.insert(tag) {
+            let label = tag_label(&tag);
+            if !is_registered_tag(tag) {
+                report.unknown_tables.push(label.clone());
+            }
+            report.tables.push(label);
+        } else if !collection {
+            report.problem("duplicate WOFF2 table tag");
+        }
+        match &tag {
+            b"fvar" => report.flag("variable"),
+            b"CBDT" | b"EBDT" | b"sbix" | b"SVG " => report.flag("bitmap"),
+            b"DSIG" => report.flag("signed"),
+            _ => {}
+        }
     }
+    if collection && !skip_woff2_collection(bytes, &mut cursor, num_tables) {
+        report.problem("invalid or truncated WOFF2 collection directory");
+        report.flag("truncated");
+        return;
+    }
+    let stream_end = (cursor as u64).saturating_add(compressed);
+    if stream_end > bytes.len() as u64 || compressed == 0 {
+        report.problem("WOFF2 compressed stream missing or out of bounds");
+        report.flag("table_out_of_bounds");
+        return;
+    }
+    // Metadata and private blocks are physically addressable. The shared
+    // compressed stream has no addressable per-table byte ranges: do not
+    // classify its ordinary compressed bytes as unclaimed table payloads.
+    let mut blocks = vec![(cursor as u64, stream_end)];
+    for (offset_at, length_at) in [(28, 32), (40, 44)] {
+        let offset = u32_be(header, offset_at).map_or(0, u64::from);
+        let length = u32_be(header, length_at).map_or(0, u64::from);
+        if offset == 0 && length == 0 {
+            continue;
+        }
+        let end = offset.saturating_add(length);
+        if offset == 0 || length == 0 || end > bytes.len() as u64 {
+            report.problem("WOFF2 auxiliary block out of bounds");
+            report.flag("table_out_of_bounds");
+            continue;
+        }
+        blocks.push((offset, end));
+        note_region(bytes, offset, end, report, RegionKind::Claimed);
+    }
+    blocks.sort_unstable();
+    let mut covered = cursor as u64;
+    for (start, end) in blocks {
+        if start < covered {
+            report.problem("WOFF2 data blocks overlap");
+            report.flag("overlapping_tables");
+        } else if start - covered > 3
+            || bytes
+                .get(crate::bytes::sat_usize(covered)..crate::bytes::sat_usize(start))
+                .is_some_and(|gap| gap.iter().any(|&b| b != 0))
+        {
+            report.gap_bytes += start - covered;
+            report.problem("bytes not claimed by WOFF2 blocks");
+            report.flag("interior_gaps");
+            note_region(bytes, covered, start, report, RegionKind::Unclaimed);
+        }
+        covered = covered.max(end);
+    }
+    let Some(trailing) = bytes.get(crate::bytes::sat_usize(covered)..) else {
+        report.problem("WOFF2 covered extent out of bounds");
+        return;
+    };
+    if trailing.len() > 3 || trailing.iter().any(|&b| b != 0) {
+        report.trailing_bytes = report.trailing_bytes.max(trailing.len() as u64);
+        report.problem("data appended after WOFF2 blocks");
+        report.flag("trailing_data");
+        note_region(
+            bytes,
+            covered,
+            bytes.len() as u64,
+            report,
+            RegionKind::Unclaimed,
+        );
+    }
+}
+
+const WOFF2_TAGS: [[u8; 4]; 63] = [
+    *b"cmap", *b"head", *b"hhea", *b"hmtx", *b"maxp", *b"name", *b"OS/2", *b"post", *b"cvt ",
+    *b"fpgm", *b"glyf", *b"loca", *b"prep", *b"CFF ", *b"VORG", *b"EBDT", *b"EBLC", *b"gasp",
+    *b"hdmx", *b"kern", *b"LTSH", *b"PCLT", *b"VDMX", *b"vhea", *b"vmtx", *b"BASE", *b"GDEF",
+    *b"GPOS", *b"GSUB", *b"EBSC", *b"JSTF", *b"MATH", *b"CBDT", *b"CBLC", *b"COLR", *b"CPAL",
+    *b"SVG ", *b"sbix", *b"acnt", *b"avar", *b"bdat", *b"bloc", *b"bsln", *b"cvar", *b"fdsc",
+    *b"feat", *b"fmtx", *b"fvar", *b"gvar", *b"hsty", *b"just", *b"lcar", *b"mort", *b"morx",
+    *b"opbd", *b"prop", *b"trak", *b"Zapf", *b"Silf", *b"Glat", *b"Gloc", *b"Feat", *b"Sill",
+];
+
+fn font_byte(bytes: &[u8], cursor: &mut usize) -> Option<u8> {
+    let byte = *bytes.get(*cursor)?;
+    *cursor += 1;
+    Some(byte)
+}
+
+/// WOFF2 UIntBase128 rejects leading zero groups, overflow and >5 bytes.
+fn woff2_base128(bytes: &[u8], cursor: &mut usize) -> Option<u32> {
+    let mut value = 0u32;
+    for i in 0..5 {
+        let byte = font_byte(bytes, cursor)?;
+        if (i == 0 && byte == 0x80) || value & 0xfe00_0000 != 0 {
+            return None;
+        }
+        value = (value << 7) | u32::from(byte & 0x7f);
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn read_woff2_entry(bytes: &[u8], cursor: &mut usize) -> Option<([u8; 4], u32)> {
+    let flags = font_byte(bytes, cursor)?;
+    let tag = if flags & 63 == 63 {
+        let tag = bytes.get(*cursor..*cursor + 4)?.try_into().ok()?;
+        *cursor += 4;
+        tag
+    } else {
+        *WOFF2_TAGS.get(usize::from(flags & 63))?
+    };
+    let original = woff2_base128(bytes, cursor)?;
+    let version = flags >> 6;
+    let outlines = matches!(&tag, b"glyf" | b"loca");
+    if (outlines && !matches!(version, 0 | 3))
+        || (!outlines && version != 0 && !(&tag == b"hmtx" && version == 1))
+    {
+        return None;
+    }
+    let transformed = if outlines { version != 3 } else { version != 0 };
+    let length = if transformed {
+        woff2_base128(bytes, cursor)?
+    } else {
+        original
+    };
+    if transformed && &tag == b"loca" && length != 0 {
+        return None;
+    }
+    Some((tag, length))
+}
+
+fn woff2_255u16(bytes: &[u8], cursor: &mut usize) -> Option<u16> {
+    match font_byte(bytes, cursor)? {
+        253 => {
+            Some(u16::from(font_byte(bytes, cursor)?) * 256 + u16::from(font_byte(bytes, cursor)?))
+        }
+        254 => Some(506 + u16::from(font_byte(bytes, cursor)?)),
+        255 => Some(253 + u16::from(font_byte(bytes, cursor)?)),
+        byte => Some(u16::from(byte)),
+    }
+}
+
+fn skip_woff2_collection(bytes: &[u8], cursor: &mut usize, tables: usize) -> bool {
+    let Some(version) = u32_be(bytes, *cursor) else {
+        return false;
+    };
+    *cursor += 4;
+    if !matches!(version, 0x0001_0000 | 0x0002_0000) {
+        return false;
+    }
+    let Some(fonts) = woff2_255u16(bytes, cursor) else {
+        return false;
+    };
+    if fonts == 0 || fonts > 512 {
+        return false;
+    }
+    for _ in 0..fonts {
+        let Some(count) = woff2_255u16(bytes, cursor) else {
+            return false;
+        };
+        if count == 0 || usize::from(count) > tables || bytes.get(*cursor..*cursor + 4).is_none() {
+            return false;
+        }
+        *cursor += 4;
+        for _ in 0..count {
+            if woff2_255u16(bytes, cursor).is_none_or(|index| usize::from(index) >= tables) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Embedded OpenType: a little-endian header wrapping an sfnt (optionally

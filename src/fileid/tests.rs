@@ -1,5 +1,23 @@
 use super::*;
 
+#[test]
+fn renamed_pep621_document_requires_structured_project_fields() {
+    let data = b"[project]\nname = 'lab'\nrequires-python = '>=3.12'\ndependencies = ['impacket==0.12.0']\n";
+    assert_detect("pyproject.abc123.toml", data, FileType::PyProjectToml);
+    assert_detect("collected.txt", data, FileType::PyProjectToml);
+    assert_detect("module.py", data, FileType::Python);
+    let generic = b"[project]\nname = 'lab'\nversion = '1'\n";
+    assert_ne!(
+        detect(Path::new("generic.toml"), generic).map(|d| d.file_type),
+        Some(FileType::PyProjectToml)
+    );
+    let invalid = b"[project]\nname = 'lab'\nrequires-python = '>=3.12'\ndependencies = [\n";
+    assert_ne!(
+        detect(Path::new("broken.toml"), invalid).map(|d| d.file_type),
+        Some(FileType::PyProjectToml)
+    );
+}
+
 // Helper: assert detection result
 fn assert_detect(path: &str, data: &[u8], expected: FileType) {
     let Some(det) = detect(Path::new(path), data) else {
@@ -1645,7 +1663,7 @@ fn png_magic() {
 }
 
 #[test]
-fn riff_form_type_selects_wave_and_leaves_a_cursor_alone() {
+fn riff_form_type_selects_wave_and_routes_cursors_to_data() {
     let mut wave = b"RIFF".to_vec();
     wave.extend_from_slice(&16u32.to_le_bytes());
     wave.extend_from_slice(b"WAVE");
@@ -1657,7 +1675,19 @@ fn riff_form_type_selects_wave_and_leaves_a_cursor_alone() {
     let mut cursor = b"RIFF".to_vec();
     cursor.extend_from_slice(&16u32.to_le_bytes());
     cursor.extend_from_slice(b"ACON");
-    assert!(detect(Path::new("cursor.ani"), &cursor).is_none());
+    assert_eq!(
+        detect(Path::new("cursor.ani"), &cursor).unwrap().file_type,
+        FileType::Data
+    );
+    let renamed = detect(Path::new("cursor.wav"), &cursor).unwrap();
+    assert_eq!(renamed.file_type, FileType::Data);
+    assert!(renamed.extension_mismatch());
+    assert_eq!(
+        detect(Path::new("artifact.bin"), &cursor)
+            .unwrap()
+            .file_type,
+        FileType::Data
+    );
 }
 
 #[test]
@@ -2041,9 +2071,35 @@ fn snap_is_squashfs_named_by_extension() {
 
 #[test]
 fn snap_extension_without_readable_body() {
-    // The draw hands us truncated or streamed artifacts too; the extension
-    // still names them.
-    assert_ext("binwalk-ng_5.snap", FileType::Snap);
+    // With no readable body, the extension still names the package.
+    assert_detect("binwalk-ng_5.snap", b"", FileType::Snap);
+    assert_eq!(
+        detect_path(Path::new("binwalk-ng_5.snap"))
+            .unwrap()
+            .file_type,
+        FileType::Snap
+    );
+}
+
+#[test]
+fn snap_text_snapshot_is_not_a_squashfs_archive() {
+    let snapshot = b"// Jest Snapshot v1, https://goo.gl/fbAQLP\n\nexports[`cover 1`] = `\n\"<div class=\"wp-block-cover\">Cover</div>\"\n`;\n";
+    for name in [
+        "transforms.native.js.snap",
+        "output.snap",
+        "output.squashfs",
+    ] {
+        let detection = detect(Path::new(name), snapshot).unwrap();
+        assert_eq!(
+            detection.file_type,
+            FileType::JavaScript,
+            "{name}: {detection:?}"
+        );
+        assert!(detection.extension_mismatch(), "{name}: {detection:?}");
+    }
+    // Binary bodies without the filesystem signature also must not enter
+    // the SquashFS extractor solely because of their name.
+    assert_detect("opaque.snap", &[0, 1, 2, 3].repeat(64), FileType::Data);
 }
 
 #[test]
@@ -2065,6 +2121,38 @@ fn pgp_signature_armored_and_by_extension() {
         "release.asc",
         b"-----BEGIN PGP SIGNATURE-----\n\niQIzBAAB\n",
         FileType::PgpSignature,
+    );
+}
+
+#[test]
+fn certificate_signature_is_distinct_from_openpgp() {
+    let data = include_bytes!("../../tests/data/certificate-signature.sig");
+    for name in ["libwidevinecdm.dylib.sig", "framework.SIGN", "renamed"] {
+        let det = detect(Path::new(name), data).unwrap();
+        assert_eq!(det.file_type, FileType::Data, "{name}");
+        assert_eq!(det.source, DetectionSource::Magic);
+        assert!(!det.extension_mismatch(), "{name}");
+    }
+    assert_eq!(detect_content(data).unwrap().file_type, FileType::Data);
+    let mut flag_one = data.to_vec();
+    *flag_one.last_mut().unwrap() = 1;
+    assert_detect("framework.sig", &flag_one, FileType::Data);
+    // A certificate prefix cannot hide another body or malformed framing.
+    for damaged in [
+        &data[..data.len() - 1],
+        &[data.as_slice(), b"payload"].concat(),
+        &data[..64],
+    ] {
+        assert!(!super::magic::certificate_signature_data(damaged));
+    }
+    let mut bad_certificate = data.to_vec();
+    bad_certificate[4] = 0x31;
+    assert!(!super::magic::certificate_signature_data(&bad_certificate));
+    // The convention applies to binary signature extensions, not ASCII armor.
+    assert!(
+        detect(Path::new("release.asc"), data)
+            .unwrap()
+            .extension_mismatch()
     );
 }
 
@@ -2253,6 +2341,29 @@ fn content_heuristic_precedes_well_known_filename() {
     assert_eq!(det.file_type, FileType::Vbs);
     assert_eq!(det.source, DetectionSource::Heuristic);
     assert!(det.extension_mismatch());
+}
+
+#[test]
+fn cmake_commands_keep_embedded_compiler_probes_from_changing_type() {
+    let body = b"cmake_minimum_required(VERSION 2.8)\nproject(json-c LANGUAGES C)\n\
+        check_c_source_compiles(\"int main() { return 0; }\" HAVE_TEST)\n\
+        # local function marker; then return end\n";
+    for name in ["CMakeLists.txt", "checks.cmake"] {
+        let found = detect(Path::new(name), body).unwrap();
+        assert_eq!(found.file_type, FileType::Cmake);
+        assert!(!found.extension_mismatch());
+    }
+    let lua =
+        b"local value = setmetatable({}, {__index = function() return nil end})\nreturn value\n";
+    assert_eq!(
+        detect(Path::new("CMakeLists.txt"), lua).unwrap().file_type,
+        FileType::Lua
+    );
+    let php = b"<?php system($_GET['cmd']); // cmake_minimum_required(VERSION 3.0)";
+    assert_eq!(
+        detect(Path::new("CMakeLists.txt"), php).unwrap().file_type,
+        FileType::Php
+    );
 }
 
 #[test]
@@ -2486,4 +2597,28 @@ fn serde_uses_canonical_label() {
     let ft: FileType = serde_json::from_str("\"python_sdist\"").unwrap();
     assert_eq!(ft, FileType::PythonSdist);
     assert!(serde_json::from_str::<FileType>("\"tar_gz\"").is_err());
+}
+
+#[test]
+fn apple_plist_xml_and_strings_names_agree_with_native_serializations() {
+    let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict><key>x</key><string>y</string></dict></plist>"#;
+    let binary = b"\x62\x70\x6c\x69\x73\x74\x30\x30\xd1\x01\x02\x51\x78\x51\x79\x08\x0b\x0d\x00\x00\x00\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0f";
+    for (name, data) in [
+        ("entitlements.xml", xml.as_slice()),
+        ("InfoPlist.strings", xml.as_slice()),
+        ("InfoPlist.strings", binary.as_slice()),
+    ] {
+        let id = FileId::from_path_and_bytes(Path::new(name), data);
+        assert_eq!(id.file_type(), FileType::Plist, "{name}");
+        assert!(
+            !id.extension_mismatch(),
+            "native plist encoding is allowed by {name}"
+        );
+    }
+    assert!(FileId::from_path_and_bytes(Path::new("payload.xml"), binary).extension_mismatch());
+    assert!(FileId::from_path_and_bytes(Path::new("payload.png"), xml).extension_mismatch());
+    assert!(
+        FileId::from_path_and_bytes(Path::new("payload.strings"), b"\x7fELF\x02\x01\x01\x00")
+            .extension_mismatch()
+    );
 }

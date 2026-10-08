@@ -1,12 +1,81 @@
 use super::*;
 use crate::output::{Metrics, Strings, Values};
 
+#[test]
+fn header_only_and_memory_only_segments_do_not_admit_code_recovery() {
+    let mut bytes = note_cavity_elf(false);
+    let parsed = goblin::elf::Elf::parse(&bytes).unwrap();
+    assert!(has_present_load_or_code_bytes(&parsed, bytes.len()));
+    // A complete program table remains, while both payload and section table
+    // have been split away. The load segment starts beyond this member.
+    bytes[40..48].copy_from_slice(&0_u64.to_le_bytes());
+    bytes[60..64].fill(0);
+    bytes[72..80].copy_from_slice(&0x200_u64.to_le_bytes());
+    bytes.truncate(0x200);
+    let mut elf = goblin::elf::Elf::parse(&bytes).unwrap();
+    assert!(!has_present_load_or_code_bytes(&elf, bytes.len()));
+    let load = elf
+        .program_headers
+        .iter_mut()
+        .find(|p| p.p_type == goblin::elf::program_header::PT_LOAD)
+        .unwrap();
+    load.p_offset = 0x100;
+    load.p_filesz = 0; // BSS reserves memory without supplying instruction bytes.
+    assert!(!has_present_load_or_code_bytes(&elf, bytes.len()));
+    let load = elf
+        .program_headers
+        .iter_mut()
+        .find(|p| p.p_type == goblin::elf::program_header::PT_LOAD)
+        .unwrap();
+    load.p_filesz = 1; // A present prefix is still worth recovering.
+    assert!(has_present_load_or_code_bytes(&elf, bytes.len()));
+}
+
 fn run(bytes: &[u8]) -> (Values, Strings, Metrics) {
     let mut out = crate::formats::Sinks::default();
     // Ignore the Result — most negative-path tests pass malformed
     // bytes and we only care that extract returns without panic.
     extract(bytes, out.ctx());
     (out.values, out.strings, out.metrics)
+}
+
+#[test]
+fn split_mdt_header_contract_requires_private_segments_and_absent_load_bytes() {
+    let mut b = vec![0_u8; 148];
+    b[..7].copy_from_slice(b"\x7fELF\x01\x01\x01");
+    b[16..18].copy_from_slice(&2_u16.to_le_bytes());
+    b[18..20].copy_from_slice(&3_u16.to_le_bytes());
+    b[20..24].copy_from_slice(&1_u32.to_le_bytes());
+    b[28..32].copy_from_slice(&52_u32.to_le_bytes());
+    b[40..42].copy_from_slice(&52_u16.to_le_bytes());
+    b[42..44].copy_from_slice(&32_u16.to_le_bytes());
+    b[44..46].copy_from_slice(&3_u16.to_le_bytes());
+    b[46..48].copy_from_slice(&40_u16.to_le_bytes());
+    // First NULL segment contains the complete ELF/program header pair.
+    b[68..72].copy_from_slice(&148_u32.to_le_bytes());
+    b[76..80].copy_from_slice(&(7_u32 << 24).to_le_bytes());
+    // The hash NULL segment and the actual LOAD live in sibling members.
+    b[88..92].copy_from_slice(&4096_u32.to_le_bytes());
+    b[100..104].copy_from_slice(&136_u32.to_le_bytes());
+    b[108..112].copy_from_slice(&(2_u32 << 24).to_le_bytes());
+    b[116..120].copy_from_slice(&1_u32.to_le_bytes());
+    b[120..124].copy_from_slice(&8192_u32.to_le_bytes());
+    b[132..136].copy_from_slice(&16_u32.to_le_bytes());
+    b[136..140].copy_from_slice(&16_u32.to_le_bytes());
+    b[140..144].copy_from_slice(&5_u32.to_le_bytes());
+    let (_, _, m) = run(&b);
+    assert_eq!(m.get("elf.qcom_mdt_header_layout"), Some(1.0));
+    assert_eq!(m.get("elf.load_segments_without_member_bytes"), Some(1.0));
+    b[108..112].copy_from_slice(&0_u32.to_le_bytes());
+    assert_eq!(run(&b).2.get("elf.qcom_mdt_header_layout"), Some(0.0));
+    b[108..112].copy_from_slice(&(2_u32 << 24).to_le_bytes());
+    b[68..72].copy_from_slice(&147_u32.to_le_bytes());
+    assert_eq!(run(&b).2.get("elf.qcom_mdt_header_layout"), Some(0.0));
+    b[68..72].copy_from_slice(&148_u32.to_le_bytes());
+    b.resize(8193, 0);
+    let (_, _, m) = run(&b);
+    assert_eq!(m.get("elf.qcom_mdt_header_layout"), Some(1.0));
+    assert_eq!(m.get("elf.load_segments_without_member_bytes"), Some(0.0));
 }
 
 /// Build a minimal, goblin-parseable ELF64 (little-endian) carrying a
@@ -606,4 +675,46 @@ fn header_and_layout_anomalies_fire_on_patched_bytes() {
     assert_eq!(m.get("elf.ident_pad_nonzero"), Some(1.0));
     assert!(v.get("elf.ident_pad").is_some());
     assert!(m.get("elf.section_past_eof_count").is_some());
+}
+
+#[test]
+fn absence_fields_distinguish_section_presence_and_empty_full_tables() {
+    let absent = elf_with_section(".data", &[0]);
+    let (v, _, m) = run(&absent);
+    assert_eq!(m.get("binary.full_symbol_table_absent_or_empty"), Some(1.0));
+    assert!(
+        v.get("elf.absent_metadata_sections")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(".comment"))
+    );
+    let comment = elf_with_section(".comment", b"compiler\0");
+    let (v, _, _) = run(&comment);
+    assert!(
+        !v.get("elf.absent_metadata_sections")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(".comment"))
+    );
+
+    // A declared zero-entry SHT_SYMTAB is empty, not evidence of a prior
+    // stripping operation. A table containing an entry is not empty.
+    for (entries, expected) in [(0, 1.0), (1, 0.0)] {
+        let mut bytes = elf_with_section(".symtab", &vec![0; entries * 24]);
+        let base = u64::from_le_bytes(bytes[40..48].try_into().unwrap()) as usize + 64;
+        bytes[base + 4..base + 8].copy_from_slice(&2_u32.to_le_bytes());
+        bytes[base + 40..base + 44].copy_from_slice(&2_u32.to_le_bytes());
+        bytes[base + 56..base + 64].copy_from_slice(&24_u64.to_le_bytes());
+        let elf = Elf::parse(&bytes).unwrap();
+        assert_eq!(elf.syms.len(), entries);
+        let (_, _, m) = run(&bytes);
+        assert_eq!(
+            m.get("binary.full_symbol_table_absent_or_empty"),
+            Some(expected)
+        );
+        // The legacy absence-only flag keeps its established API contract.
+        assert_eq!(m.get("binary.is_stripped"), Some(0.0));
+    }
 }

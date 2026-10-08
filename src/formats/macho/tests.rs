@@ -305,6 +305,10 @@ fn end_to_end_parses_real_macho_fixture() {
     // PIE / stripped metrics emitted for every Mach-O.
     assert!(m.get("binary.is_pie").is_some());
     assert!(m.get("binary.is_stripped").is_some());
+    assert_eq!(
+        m.get("binary.full_symbol_table_absent_or_empty"),
+        m.get("binary.is_stripped")
+    );
 }
 
 /// Pin the `_raw` header fields and class_bits / entry / load

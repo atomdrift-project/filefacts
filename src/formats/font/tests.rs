@@ -182,17 +182,125 @@ fn woff_header_size_lie_is_reported() {
 
 #[test]
 fn woff2_records_declared_size() {
-    let mut out = Vec::new();
-    out.extend_from_slice(b"wOF2");
-    out.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
-    out.extend_from_slice(&200u32.to_be_bytes()); // declared length
-    out.extend_from_slice(&3u16.to_be_bytes()); // numTables
-    out.extend_from_slice(&[0; 34]);
-    out.resize(200, 0x00);
+    let out = build_woff2(&[0, 10, 47, 20, 63, b'T', b'E', b'S', b'T', 5], 3);
     let (v, m) = run(&out);
     assert_eq!(format_of(&v), "woff2");
     assert_eq!(m.get("font.table_count"), Some(3.0));
     assert_eq!(v.get("font.valid").and_then(JsonValue::as_bool), Some(true));
+    assert_eq!(
+        v.get("font.tables"),
+        Some(&serde_json::json!(["cmap", "fvar", "TEST"]))
+    );
+    assert!(features(&v).contains(&"variable".to_string()));
+    assert_eq!(
+        v.get("font.unknown_tables"),
+        Some(&serde_json::json!(["TEST"]))
+    );
+}
+
+// Structural fixtures deliberately do not represent decoded Brotli fonts:
+// this extractor validates the directory and physical regions, not outlines.
+fn build_woff2(directory: &[u8], count: u16) -> Vec<u8> {
+    let mut out = vec![0; 48];
+    out[..4].copy_from_slice(b"wOF2");
+    out[4..8].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    out[12..14].copy_from_slice(&count.to_be_bytes());
+    out[20..24].copy_from_slice(&1u32.to_be_bytes());
+    out.extend_from_slice(directory);
+    out.push(0); // physically present compressed stream, not decompressed here
+    let length = out.len() as u32;
+    out[8..12].copy_from_slice(&length.to_be_bytes());
+    out
+}
+
+#[test]
+fn woff2_transformed_glyf_loca_and_hmtx_directory() {
+    let out = build_woff2(&[10, 20, 15, 11, 12, 0, 67, 10, 5], 3);
+    let (v, _) = run(&out);
+    assert_eq!(v.get("font.valid").and_then(JsonValue::as_bool), Some(true));
+    assert_eq!(
+        v.get("font.tables"),
+        Some(&serde_json::json!(["glyf", "loca", "hmtx"]))
+    );
+}
+
+#[test]
+fn woff2_rejects_bad_directory_encodings_and_transforms() {
+    for directory in [
+        &[0, 0x80, 1][..],
+        &[0, 0xff, 0xff, 0xff, 0xff, 0x7f],
+        &[0, 0x81, 0x81, 0x81, 0x81, 0x81, 0],
+        &[63, b'A', b'B'],
+        &[74, 10, 5],
+        &[11, 10, 1],
+        &[64, 10, 5],
+    ] {
+        let (v, _) = run(&build_woff2(directory, 1));
+        assert_eq!(
+            v.get("font.valid").and_then(JsonValue::as_bool),
+            Some(false),
+            "{directory:?}"
+        );
+    }
+}
+
+#[test]
+fn woff2_rejects_duplicate_tags_and_missing_compressed_stream() {
+    let (v, _) = run(&build_woff2(&[0, 1, 0, 1], 2));
+    assert_eq!(
+        v.get("font.valid").and_then(JsonValue::as_bool),
+        Some(false)
+    );
+    let mut out = build_woff2(&[0, 10], 1);
+    out[20..24].copy_from_slice(&100u32.to_be_bytes());
+    let (v, _) = run(&out);
+    assert!(features(&v).contains(&"table_out_of_bounds".to_string()));
+}
+
+#[test]
+fn woff2_catches_payload_even_when_declared_length_is_updated() {
+    let mut out = build_woff2(&[0, 10], 1);
+    out.extend_from_slice(b"#!/bin/sh\necho appended\n");
+    let length = out.len() as u32;
+    out[8..12].copy_from_slice(&length.to_be_bytes());
+    let (v, m) = run(&out);
+    assert_eq!(
+        v.get("font.valid").and_then(JsonValue::as_bool),
+        Some(false)
+    );
+    assert!(features(&v).contains(&"trailing_data".to_string()));
+    assert!(m.get("font.trailing_bytes").unwrap() > 20.0);
+    assert_eq!(
+        v.get("font.stowaway"),
+        Some(&serde_json::json!(["shebang"]))
+    );
+}
+
+#[test]
+fn woff2_metadata_overlap_and_bounds_are_reported() {
+    let mut out = build_woff2(&[0, 10], 1);
+    out[28..32].copy_from_slice(&48u32.to_be_bytes());
+    out[32..36].copy_from_slice(&2u32.to_be_bytes());
+    let (v, _) = run(&out);
+    assert!(features(&v).contains(&"overlapping_tables".to_string()));
+    out[32..36].copy_from_slice(&100u32.to_be_bytes());
+    let (v, _) = run(&out);
+    assert!(features(&v).contains(&"table_out_of_bounds".to_string()));
+}
+
+#[test]
+fn woff2_collection_directory_is_accounted_for() {
+    let mut out = build_woff2(&[0, 10, 0, 1, 0, 0, 1, 1, 0, 1, 0, 0, 0], 1);
+    // One table, collection v1, one font with one table and index zero.
+    out[4..8].copy_from_slice(b"ttcf");
+    let (v, _) = run(&out);
+    assert_eq!(v.get("font.valid").and_then(JsonValue::as_bool), Some(true));
+    out[60] = 1; // invalid table index
+    let (v, _) = run(&out);
+    assert_eq!(
+        v.get("font.valid").and_then(JsonValue::as_bool),
+        Some(false)
+    );
 }
 
 #[test]

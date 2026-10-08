@@ -523,6 +523,8 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "pdf" => Some(FileType::Pdf),
         "jpg" | "jpeg" | "jpe" | "jfif" => Some(FileType::Jpeg),
         "png" => Some(FileType::Png),
+        "tif" | "tiff" => Some(FileType::Tiff),
+        "avif" | "avifs" => Some(FileType::Avif),
         // Font containers. `.woff2`/`.woff`/`.eot` are web-delivery
         // wrappers, `.ttf`/`.otf` bare sfnt, `.ttc`/`.otc` collections.
         // Mapping them buys structural validation (see formats/font.rs)
@@ -540,7 +542,8 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "gif" => Some(FileType::Gif),
         "bmp" | "dib" => Some(FileType::Bmp),
         "webp" => Some(FileType::Webp),
-        "pkl" | "pickle" | "joblib" => Some(FileType::Pickle),
+        "pkl" | "pickle" | "joblib" | "debug_pkl" => Some(FileType::Pickle),
+        "trustcache" | "im4p" => Some(FileType::Data),
         // Zip-based package ecosystems with unambiguous extensions get their
         // own type (the magic branch agrees when `PK` is present; this keeps
         // the extension fallback consistent so it isn't flagged a mismatch).

@@ -32,6 +32,7 @@ mod heuristics;
 mod magic;
 pub(crate) use magic::looks_like_obfuscated_rtf;
 mod markdown;
+mod perl_shell_shim;
 mod restructuredtext;
 mod scripts;
 pub(crate) mod shellcode;
@@ -695,6 +696,10 @@ file_types! {
         Jpeg => "jpeg", Image;
         /// PNG image
         Png => "png", Image;
+        /// Tagged Image File Format (classic TIFF or BigTIFF).
+        Tiff => "tiff", Image;
+        /// AV1 Image File Format, identified by its ISO-BMFF brands.
+        Avif => "avif", Image;
         /// RIFF audio (`.wav`). Chunked container; see formats/containers.rs.
         Wav => "wav", Audio;
         /// IFF audio (`.aiff`, `.aifc`).
@@ -911,6 +916,8 @@ impl ExtensionMatch {
     fn of(path: &Path, ext: Option<FileType>, detected: FileType) -> Self {
         match ext {
             Some(FileType::Yaml) if is_yaml_dialect(detected) => Self::Consistent,
+            // A content-recognized npm lockfile remains a JSON document.
+            Some(FileType::Json) if detected == FileType::PackageLockJson => Self::Consistent,
             // A phar is also written as a plain tar or zip archive.
             Some(FileType::Phar) if matches!(detected, FileType::Tar | FileType::Zip) => {
                 Self::Consistent
@@ -1051,6 +1058,8 @@ fn allows_heuristic_extension_override(file_type: FileType) -> bool {
             // real JPEG/PNG magic has already returned in stage 1.
             | FileType::Jpeg
             | FileType::Png
+            | FileType::Tiff
+            | FileType::Avif
             | FileType::Wav
             | FileType::Aiff
             | FileType::Mp3
@@ -1110,6 +1119,8 @@ fn mark_replaces(file_type: FileType) -> bool {
             // should not overrule unmistakable text/source content.
             | FileType::Jpeg
             | FileType::Png
+            | FileType::Tiff
+            | FileType::Avif
             | FileType::JavaScript
             | FileType::Python
             | FileType::Vbs
@@ -1265,6 +1276,16 @@ const fn is_yaml_dialect(ft: FileType) -> bool {
     matches!(ft, FileType::GithubActions | FileType::PnpmLock)
 }
 
+/// Canonical protocol-2 legacy torch serialization magic and version framing.
+/// This identifies the bounded multi-pickle carrier convention, not trust or
+/// whole-file validity. Other torch serialization protocols are not covered.
+pub(crate) fn torch_protocol2_legacy_header(data: &[u8]) -> bool {
+    data.starts_with(&[
+        0x80, 2, 0x8a, 10, 0x6c, 0xfc, 0x9c, 0x46, 0xf9, 0x20, 0x6a, 0xa8, 0x50, 0x19, b'.', 0x80,
+        2, b'M', 0xe9, 3, b'.',
+    ])
+}
+
 /// True when an extension/content disagreement is a known benign format
 /// convention rather than an evasion signal. Mirrors the carve-outs cleave
 /// previously applied before emitting `metadata/file-extension-mismatch`.
@@ -1278,6 +1299,34 @@ fn is_benign_extension_mismatch(path: &Path, data: &[u8], det: Detection) -> boo
     {
         return true;
     }
+    // Apple localized .strings files use either binary or XML property lists.
+    // This convention says nothing about code disguised under that suffix.
+    let strings_suffix = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("strings"));
+    if strings_suffix && det.file_type == FileType::Plist {
+        return true;
+    }
+    // Legacy PyTorch uses pickle plus raw storage under these model suffixes.
+    // Require its native magic/version framing; the suffix grants no trust.
+    let torch_model_suffix = path.extension().and_then(|s| s.to_str()).is_some_and(|s| {
+        ["pt", "pth", "ckpt"]
+            .iter()
+            .any(|ext| s.eq_ignore_ascii_case(ext))
+    });
+    if torch_model_suffix
+        && det.file_type == FileType::Pickle
+        && torch_protocol2_legacy_header(data)
+    {
+        return true;
+    }
+    // Modern torch.save and TorchScript keep their .pt/.pth/.ckpt suffixes
+    // around a ZIP carrier. Require central-directory and serialization-role
+    // framing; an arbitrary ZIP renamed .pt still disagrees with its suffix.
+    if torch_model_suffix && det.file_type == FileType::Zip && torch_zip::recognized(data) {
+        return true;
+    }
     let Some(ext_type) = det.extension_type() else {
         return false;
     };
@@ -1287,6 +1336,25 @@ fn is_benign_extension_mismatch(path: &Path, data: &[u8], det: Detection) -> boo
             .and_then(|n| n.to_str())
             .is_some_and(|n| ext::ends_with_ci(n.as_bytes(), suffix.as_bytes()))
     };
+    // An XML plist is an XML document. A binary plist named .xml still
+    // disagrees with that serialization and is deliberately not exempted.
+    if ext_type == FileType::Xml
+        && content == FileType::Plist
+        && (data.trim_ascii_start().starts_with(b"<?xml")
+            || data.trim_ascii_start().starts_with(b"<plist"))
+    {
+        return true;
+    }
+    // `.sig` is shared by OpenPGP and certificate-bearing signature
+    // containers. Refining the latter from its complete framing is a format
+    // distinction, not a misleading extension.
+    if ext_type == FileType::PgpSignature
+        && content == FileType::Data
+        && (name_ends_ci(".sig") || name_ends_ci(".sign"))
+        && magic::certificate_signature_data(data)
+    {
+        return true;
+    }
     // `.exe` is shared by the older 16-bit Windows NE format and PE. The
     // extension database resolves it to PE, but NE content is a valid `.exe`.
     if name_ends_ci(".exe") && ext_type == FileType::Pe && content == FileType::Ne {
@@ -1389,6 +1457,13 @@ fn detect_known(sniff: &Sniff<'_>) -> Option<Detection> {
         // That prologue is magic for HTML, but the extension is what the
         // server executes. Prefer it; the prologue is not a different type.
         if file_type == FileType::Html {
+            if scripts::html_prefixed_batch(data) {
+                return Some(Detection {
+                    file_type: FileType::Batch,
+                    source: DetectionSource::Heuristic,
+                    ext_match: ExtensionMatch::of(path, ext_ft, FileType::Batch),
+                });
+            }
             if let Some(ext_type) = ext_ft {
                 if matches!(ext_type, FileType::Jsp | FileType::Asp | FileType::Cfml) {
                     return Some(Detection {
@@ -1419,6 +1494,17 @@ fn detect_known(sniff: &Sniff<'_>) -> Option<Detection> {
         // is what the user/loader treats the file as. JavaScript ".js" carrying
         // a "#!/bin/bash" shebang is a textbook static-analysis evasion seen
         // in the npm xmlrpc supply-chain compromise (2024) and similar.
+        if source == DetectionSource::Shebang
+            && file_type == FileType::Shell
+            && ext_ft == Some(FileType::Perl)
+            && perl_shell_shim::recognized(data)
+        {
+            return Some(Detection {
+                file_type: FileType::Perl,
+                source: DetectionSource::Heuristic,
+                ext_match: ExtensionMatch::Consistent,
+            });
+        }
         if source == DetectionSource::Shebang {
             if let Some(ext_type) = ext_ft {
                 if ext_type != file_type && is_shebang_juke(file_type, ext_type) {
@@ -1462,6 +1548,26 @@ fn detect_known(sniff: &Sniff<'_>) -> Option<Detection> {
         });
     }
 
+    // Jest's `.snap` files are CommonJS exports of template strings. The
+    // strings often contain HTML, which should not make the wrapper a page
+    // or send a text snapshot to the SquashFS extractor. Real filesystem
+    // signatures have already won in stage 1.
+    if matches!(ext_ft, Some(FileType::Snap | FileType::SquashFs))
+        && data.trim_ascii_start().starts_with(b"// Jest Snapshot v")
+        && data
+            .trim_ascii_start()
+            .split(|b| *b == b'\n')
+            .skip(1)
+            .find(|line| !line.trim_ascii().is_empty())
+            .is_some_and(|line| line.trim_ascii_start().starts_with(b"exports["))
+    {
+        return Some(Detection {
+            file_type: FileType::JavaScript,
+            source: DetectionSource::Heuristic,
+            ext_match: ExtensionMatch::of(path, ext_ft, FileType::JavaScript),
+        });
+    }
+
     // `.git/config` is normally extensionless. Its section/key structure is
     // a strong content signature, and may correct even a misleading filename
     // before source-language or exact-name fallbacks get a chance to win.
@@ -1470,6 +1576,19 @@ fn detect_known(sniff: &Sniff<'_>) -> Option<Detection> {
             file_type: FileType::Text,
             source: DetectionSource::Heuristic,
             ext_match: ExtensionMatch::of(path, ext_ft, FileType::Text),
+        });
+    }
+    // A real batch prologue precedes the binary body in BAT/COM hybrids.
+    // Registered suffixes must not discard the same content evidence that
+    // identifies the hybrid under an unknown or prose suffix.
+    if (sniff.binary_not_source()
+        || (heuristics::looks_like_dos_com(data) && std::str::from_utf8(data).is_err()))
+        && scripts::binary_batch_prologue(data)
+    {
+        return Some(Detection {
+            file_type: FileType::Batch,
+            source: DetectionSource::Heuristic,
+            ext_match: ExtensionMatch::of(path, ext_ft, FileType::Batch),
         });
     }
     let heuristic_may_override_ext = ext_ft.is_none_or(allows_heuristic_extension_override);
@@ -1544,6 +1663,41 @@ fn detect_known(sniff: &Sniff<'_>) -> Option<Detection> {
             file_type: FileType::Markdown,
             source: DetectionSource::Heuristic,
             ext_match: ExtensionMatch::Consistent,
+        });
+    }
+
+    // CMake embeds compiler probes and arbitrary quoted strings, which can
+    // outscore its command syntax as Lua or C. When its mandated entry point
+    // or module extension carries recognizable CMake commands, retain the
+    // interpreter's type. Strong magic and content marks above still win.
+    if ext_ft == Some(FileType::Cmake) && has_cmake_commands(data) {
+        return Some(Detection {
+            file_type: FileType::Cmake,
+            source: DetectionSource::Heuristic,
+            ext_match: ExtensionMatch::Consistent,
+        });
+    }
+
+    // Re-collected Python project declarations may lose the mandated basename.
+    // Parse the document and require PEP 621-specific fields before claiming
+    // this type; a generic [project] table or quoted example is insufficient.
+    if ext_ft.is_none_or(|ft| matches!(ft, FileType::Text | FileType::PyProjectToml))
+        && data.len() <= 1024 * 1024
+        && data.windows(9).any(|w| w == b"[project]")
+        && std::str::from_utf8(data)
+            .ok()
+            .and_then(|s| s.parse::<toml::Table>().ok())
+            .and_then(|t| t.get("project").and_then(toml::Value::as_table).cloned())
+            .is_some_and(|p| {
+                p.get("name").is_some_and(toml::Value::is_str)
+                    && p.get("requires-python").is_some_and(toml::Value::is_str)
+                    && p.get("dependencies").is_some_and(toml::Value::is_array)
+            })
+    {
+        return Some(Detection {
+            file_type: FileType::PyProjectToml,
+            source: DetectionSource::Heuristic,
+            ext_match: ExtensionMatch::of(path, ext_ft, FileType::PyProjectToml),
         });
     }
 
@@ -1710,6 +1864,37 @@ fn detect_known(sniff: &Sniff<'_>) -> Option<Detection> {
     None
 }
 
+fn has_cmake_commands(data: &[u8]) -> bool {
+    let commands: [&[u8]; 9] = [
+        b"cmake_minimum_required",
+        b"cmake_policy",
+        b"project",
+        b"add_library",
+        b"add_executable",
+        b"target_link_libraries",
+        b"find_package",
+        b"configure_file",
+        b"add_custom_command",
+    ];
+    data.get(..16384)
+        .unwrap_or(data)
+        .split(|b| *b == b'\n')
+        .any(|line| {
+            let line = line.trim_ascii_start();
+            let Some(name) = line
+                .iter()
+                .position(|b| *b == b'(')
+                .and_then(|open| line.get(..open))
+            else {
+                return false;
+            };
+            let name = name.trim_ascii_end();
+            commands
+                .iter()
+                .any(|command| name.eq_ignore_ascii_case(command))
+        })
+}
+
 /// Nothing recognised the file. Corpora name samples by hash, so a DOS COM
 /// there has no `.com` to go on, and carved shellcode has no name at all;
 /// without this they were Unknown, which no trait walks.
@@ -1766,6 +1951,8 @@ fn is_magic_defined(ft: FileType) -> bool {
             | FileType::JavaClass
             | FileType::Dex
             | FileType::Wasm
+            | FileType::SquashFs
+            | FileType::Snap
     )
 }
 
@@ -1883,3 +2070,13 @@ mod static_lib_extension_override_tests {
 /// name, under a name that lies, and under a name that is right.
 #[cfg(test)]
 mod script_and_bitmap_content_tests;
+
+#[cfg(test)]
+mod tiff_avif_tests;
+
+#[cfg(test)]
+mod npm_lock_content_tests;
+
+mod torch_zip;
+
+pub(crate) mod image4_trustcache;

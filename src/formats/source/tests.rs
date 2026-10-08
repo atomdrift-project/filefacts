@@ -606,6 +606,47 @@ fn groovy_imports_and_definitions() {
 }
 
 #[test]
+fn groovy_single_quoted_strings_project_literals_calls_and_binds() {
+    let source = br#"String cmd = 'id; uname -a; hostname -f; whoami; lastlog'
+run('hostname -f', "whoami", '$HOME', 'line\nnext')
+// run('comment-only')
+"#;
+    let parsed = crate::OpenOptions::new()
+        .path(std::path::Path::new("survey.groovy"))
+        .open(source);
+    let literals: Vec<&str> = parsed.literals().iter().map(|l| l.value.as_str()).collect();
+    assert!(literals.contains(&"id; uname -a; hostname -f; whoami; lastlog"));
+    assert!(!literals.contains(&"comment-only"));
+    let arguments = parsed
+        .symbols()
+        .iter_kind(crate::SymbolKind::Call)
+        .find_map(|s| match s {
+            crate::Symbol::Call {
+                target: Some(target),
+                args,
+                ..
+            } if target == "run" => Some(args),
+            _ => None,
+        })
+        .expect("run call");
+    let strings: Vec<&str> = arguments
+        .iter()
+        .map(|argument| match argument {
+            crate::Arg::String { value } => value.as_str(),
+            other => panic!("expected decoded Groovy string argument, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(strings, ["hostname -f", "whoami", "$HOME", "line\nnext"]);
+    for value in strings {
+        assert!(literals.contains(&value));
+    }
+    assert!(parsed.symbols().iter_kind(crate::SymbolKind::Bind).any(|symbol| matches!(
+        symbol,
+        crate::Symbol::Bind { target, shape: crate::ArgShape::String, .. } if target == "cmd"
+    )));
+}
+
+#[test]
 fn zig_imports_and_definitions() {
     let src = b"const std = @import(\"std\");\nfn main() void {\n  std.debug.print(\"hi\\n\", .{});\n}\ntest \"smoke\" { try std.testing.expect(true); }\n";
     let (imports, functions) = parse_source("main.zig", src);

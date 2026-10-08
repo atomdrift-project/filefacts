@@ -19,6 +19,10 @@ use crate::fileid::FileType;
 use crate::output::{ArchiveMember, Errors, Metrics, Section, Strings, Symbols, Values};
 use crate::value_key;
 
+mod ani;
+mod desktop_entry;
+mod systemd;
+
 /// Mutable output collectors that every format extractor writes into.
 /// Bundled to keep the [`extract`] dispatch signature manageable and
 /// to give future extractors a single place to grow new views.
@@ -499,10 +503,10 @@ pub(crate) fn extract(
         // with the format-native key shape (the parsed JSON/YAML/TOML
         // tree, verbatim).
         FileType::PackageLockJson
-        | FileType::ComposerJson
         | FileType::ChromeManifest
         | FileType::PipfileLock
         | FileType::ComposerLock => structured::extract_json(bytes, ctx.values),
+        FileType::ComposerJson => structured::extract_composer_json(bytes, ctx.values),
         // A bare package.json: the verbatim JSON tree, plus the same
         // npm.* identity layer the tarball path emits.
         FileType::PackageJson => {
@@ -538,8 +542,14 @@ pub(crate) fn extract(
         FileType::CargoLock | FileType::PoetryLock | FileType::PyProjectToml => {
             structured::extract_toml(bytes, ctx.values)
         }
-        FileType::GithubActions | FileType::PnpmLock => structured::extract_yaml(bytes, ctx.values),
-        FileType::Plist => structured::extract_plist(bytes, ctx.values),
+        FileType::GithubActions | FileType::PnpmLock | FileType::Yaml => {
+            structured::extract_yaml(bytes, ctx.values)
+        }
+        FileType::Plist => {
+            structured::extract_plist(bytes, ctx.values)?;
+            structured::plist_entitlement_metrics(ctx.values, ctx.metrics);
+            Ok(())
+        }
         FileType::Nib => nib::extract(bytes, ctx.values, ctx.strings, ctx.metrics),
         FileType::Pbxproj => pbxproj::extract(bytes, ctx.values, ctx.strings, ctx.metrics),
         FileType::PkgInfo => structured::extract_pkginfo(bytes, ctx.values),
@@ -606,7 +616,7 @@ pub(crate) fn extract(
             media_container(bytes, ctx.values, ctx.strings, ctx.metrics, containers::mp3);
             Ok(())
         }
-        FileType::Mp4 => {
+        FileType::Mp4 | FileType::Avif => {
             media_container(
                 bytes,
                 ctx.values,
@@ -727,6 +737,41 @@ pub(crate) fn extract(
             Ok(())
         }
 
+        FileType::Data => {
+            ani::extract(bytes, ctx.values, ctx.metrics);
+            if let Some(table) = crate::fileid::image4_trustcache::parse(bytes) {
+                let entries: Vec<_> = table
+                    .entries
+                    .as_chunks::<24>()
+                    .0
+                    .iter()
+                    .map(|entry| {
+                        serde_json::json!({
+                            "cdhash": common::hex_encode(&entry[..20]),
+                            "hash_type": entry[20], "flags": entry[21],
+                            "constraint_category": entry[22], "reserved": entry[23]
+                        })
+                    })
+                    .collect();
+                ctx.values.insert_key(
+                    value_key!("image4.trustcache"),
+                    serde_json::json!({
+                        "payload_type": "trca", "description": table.description,
+                        "version": 2, "uuid": common::hex_encode(table.uuid),
+                        "entry_count": entries.len(), "entries": entries
+                    }),
+                );
+            }
+            Ok(())
+        }
+        FileType::DesktopEntry => {
+            desktop_entry::extract(bytes, ctx.values);
+            Ok(())
+        }
+        FileType::SystemdService => {
+            systemd::extract(bytes, ctx.values);
+            Ok(())
+        }
         _ => Ok(()),
     };
 
@@ -815,6 +860,27 @@ pub(crate) fn extract(
     source_meta::extract(bytes, file_type, ctx.values);
 
     result
+}
+
+#[cfg(test)]
+mod generic_yaml_routing_tests {
+    #[test]
+    fn yaml_type_populates_mapping_and_sequence_values() {
+        let mapping = crate::OpenOptions::new()
+            .file_type(crate::FileType::Yaml)
+            .open(b"tasks:\n  lint:\n    cmds: [go test]\n");
+        assert_eq!(
+            mapping.values().get("tasks.lint.cmds[0]"),
+            Some(&serde_json::json!("go test"))
+        );
+        let sequence = crate::OpenOptions::new()
+            .file_type(crate::FileType::Yaml)
+            .open(b"- title: Guide\n  url: guide\n");
+        assert_eq!(
+            sequence.values().get("root[0].title"),
+            Some(&serde_json::json!("Guide"))
+        );
+    }
 }
 
 #[cfg(test)]

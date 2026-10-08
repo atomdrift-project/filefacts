@@ -34,6 +34,55 @@ pub(super) fn extract_json(bytes: &[u8], values: &mut Values) -> Result<(), Erro
     Ok(())
 }
 
+/// Composer shell bodies are executable script fields, unlike descriptive
+/// JSON text or setuptools class-import declarations. Keep flows within one
+/// command string; do not correlate independent handlers or events.
+pub(super) fn extract_composer_json(bytes: &[u8], values: &mut Values) -> Result<(), Error> {
+    extract_json(bytes, values)?;
+    let mut flows = Vec::new();
+    let scripts = values.get("scripts").cloned();
+    if let Some(JsonValue::Object(scripts)) = scripts {
+        for (event, handlers) in scripts {
+            // Lifecycle hooks applicable to install/update/autoload/create-project.
+            if !matches!(
+                event.as_str(),
+                "pre-install-cmd"
+                    | "post-install-cmd"
+                    | "pre-update-cmd"
+                    | "post-update-cmd"
+                    | "pre-autoload-dump"
+                    | "post-autoload-dump"
+                    | "post-root-package-install"
+                    | "post-create-project-cmd"
+            ) {
+                continue;
+            }
+            let handlers = match handlers {
+                JsonValue::String(s) => vec![JsonValue::String(s)],
+                JsonValue::Array(a) => a,
+                _ => continue,
+            };
+            for (index, handler) in handlers.iter().enumerate() {
+                let Some(body) = handler.as_str() else {
+                    continue;
+                };
+                for mut flow in super::systemd::literal_shell_body_flows(body) {
+                    if let Some(fields) = flow.as_object_mut() {
+                        fields.insert("event".to_owned(), JsonValue::String(event.clone()));
+                        fields.insert("handler_index".to_owned(), JsonValue::from(index));
+                    }
+                    flows.push(flow);
+                }
+            }
+        }
+    }
+    values.insert_key(
+        value_key!("composer.install_hook_flows"),
+        JsonValue::Array(flows),
+    );
+    Ok(())
+}
+
 /// Parse a generic `.json` document if it is below the default parse cap.
 /// Oversized files stay analyzable as text/raw content, but we avoid building
 /// a potentially huge `serde_json::Value` tree.
@@ -173,6 +222,24 @@ pub(super) fn extract_plist(bytes: &[u8], values: &mut Values) -> Result<(), Err
     let json = parse_plist(bytes)?;
     promote_root(json, values);
     Ok(())
+}
+
+/// Typed native entitlement requests. A declaration is not proof of a valid
+/// signature, permission grant, bundle identity or an executed memory action.
+pub(super) fn plist_entitlement_metrics(values: &Values, metrics: &mut Metrics) {
+    for (key, field) in [
+        (
+            "com.apple.security.cs.allow-jit",
+            metric!("plist.jit_entitlement_requested"),
+        ),
+        (
+            "com.apple.security.cs.allow-unsigned-executable-memory",
+            metric!("plist.unsigned_executable_memory_entitlement_requested"),
+        ),
+    ] {
+        let requested = values.as_json().get(key).and_then(JsonValue::as_bool) == Some(true);
+        metrics.insert(field, f64::from(u8::from(requested)));
+    }
 }
 
 /// Nesting cap for plists; see [`plist_guard`](super::plist_guard).

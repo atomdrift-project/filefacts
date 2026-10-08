@@ -266,3 +266,47 @@ fn headerless_dib() {
     let packed = bmp(40, 1, 24)[14..].to_vec();
     assert_eq!(file_type("clipboard.dib", &packed), Some(FileType::Bmp));
 }
+
+#[test]
+fn html_rem_prologue_with_batch_body() {
+    let data = b"<html>rem prologue\r\nrem notes\r\n@echo off\r\nset i=buffer\r\n:1\r\necho 0000>>data\r\ncopy /b data %i%\r\ncopy /b data+%i%\r\ngoto 1\r\n";
+    for name in ["sample", "source.bat", "source.html"] {
+        assert_eq!(file_type(name, data), Some(FileType::Batch));
+    }
+    let page = b"<html>rem tutorial\r\n<pre>\r\n@echo off\r\nset i=buffer\r\ncopy /b data %i%\r\ngoto 1\r\n</pre></html>";
+    assert_eq!(file_type("source.html", page), Some(FileType::Html));
+    assert_eq!(
+        file_type(
+            "sample",
+            b"<html>remember this text\n@echo off\nset i=buffer\ncopy /b data %i%"
+        ),
+        Some(FileType::Html)
+    );
+}
+
+#[test]
+fn binary_batch_prologue_survives_registered_suffixes() {
+    let mut bytes = b"@GOTO \xcc\r\nREM ".to_vec();
+    bytes.extend_from_slice(&[0x90; 100]);
+    bytes.extend_from_slice(b"\0\xb4\x4e\xcd\x21\xb4\x40\xcd\x21\r\n:\xcc\r\n@COPY %0 tmp.exe>NUL\r\n@tmp\r\n@DEL tmp.exe\r\n");
+    for name in [
+        "sample.bat",
+        "sample.cmd",
+        "sample.exe",
+        "sample.com",
+        "sample.txt",
+        "sample.300",
+    ] {
+        assert_eq!(file_type(name, &bytes), Some(FileType::Batch), "{name}");
+    }
+}
+
+#[test]
+fn dos_binary_with_embedded_batch_text_keeps_binary_type() {
+    let mut bytes = [0x90, 0, 1, 2].repeat(25);
+    bytes.extend_from_slice(b"\xb4\x4e\xcd\x21\xb4\x40\xcd\x21");
+    bytes.extend_from_slice(b"@echo off\r\ncopy %0 tmp.bat\r\nexit\r\n");
+    for name in ["sample.bat", "sample.300"] {
+        assert_eq!(file_type(name, &bytes), Some(FileType::DosCom), "{name}");
+    }
+}

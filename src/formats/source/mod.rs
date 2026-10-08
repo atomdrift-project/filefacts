@@ -9,11 +9,13 @@
 //! [`ParsedFile`]: crate::ParsedFile
 
 mod ast_walk;
+mod batch_concat;
 mod call_target_metrics;
 mod comment_metrics;
 mod escapes;
 mod go_syntax;
 mod payload_flow;
+mod python_module_calls;
 mod value_flow;
 pub use payload_flow::go_package_payload_flow;
 mod rust_syntax;
@@ -226,6 +228,9 @@ pub(super) fn extract(
 
     // Byte-level / line-level / whitespace text metrics — language-agnostic.
     text_metrics::emit(source, metrics);
+    if config.lang == Lang::Batch {
+        batch_concat::emit(source, metrics);
+    }
 
     // One walk for every collector that only reads each node once.
     let mut walked = visit::Collectors {
@@ -350,6 +355,9 @@ pub(super) fn extract(
         value_key!("source.language"),
         JsonValue::String(config.name().to_string()),
     );
+    if config.lang == Lang::Python {
+        python_module_calls::emit(root, source, values);
+    }
     payload_flow::emit(
         root,
         source,
@@ -891,3 +899,6 @@ fn emit_text_ratios(
 
 #[cfg(test)]
 mod tests;
+
+// Shared byte-preserving AST source view for downstream query engines.
+pub(crate) use parse::utf8_source;

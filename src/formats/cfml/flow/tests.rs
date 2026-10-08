@@ -1254,3 +1254,113 @@ fn original_devshell_has_three_read_result_bindings() {
         assert!(source[at..].starts_with(b"<cffile"));
     }
 }
+
+#[test]
+fn http_parameters_bind_only_to_their_closed_nearest_owner() {
+    let source = br##"<cfset data=encrypt(getPageContext().getRequest().getRequestURL(), 'key')><cfhttp method='POST' url='outer'><cfhttpparam type='formfield' value='#data#'><cfhttp method='GET' url='inner'><cfhttpparam type='formfield' value='inner-data'></cfhttp></cfhttp><cfhttpparam type='formfield' value='#data#'>"##;
+    let p = parse(source);
+    let calls: Vec<_> = p
+        .flow
+        .values
+        .iter()
+        .filter(|v| v.target.as_deref() == Some("cfhttp:param"))
+        .collect();
+    assert_eq!(calls.len(), 2);
+    let mut pairs = BTreeSet::new();
+    for call in calls {
+        assert_eq!(call.inputs.len(), 2);
+        let parent = &p.flow.values[call.inputs[1]];
+        let url = *parent.fields.get("url").unwrap();
+        let Some(Arg::String { value: url }) = &p.flow.values[url].literal else {
+            panic!("URL literal missing")
+        };
+        let child = &p.flow.values[call.inputs[0]];
+        assert!(child.fields.contains_key("type") && child.fields.contains_key("value"));
+        pairs.insert(url.as_str());
+    }
+    assert_eq!(pairs, BTreeSet::from(["inner", "outer"]));
+}
+
+#[test]
+fn malformed_open_or_self_closed_http_does_not_own_later_parameters() {
+    for source in [
+        "<cfhttp method='POST' url='x'/><cfhttpparam type='formfield' value='#form.x#'>",
+        "<cfhttp method='POST' url='x'><cfhttpparam type='formfield' value='#form.x#'>",
+        "<cfhttp method='POST' METHOD='GET'><cfhttpparam type='formfield' value='#form.x#'></cfhttp>",
+        "<!--- <cfhttp method='POST'><cfhttpparam type='formfield' value='#form.x#'></cfhttp> --->",
+        r##"<cfset text="<cfhttp method='POST'><cfhttpparam type='formfield' value='#form.x#'></cfhttp>">"##,
+    ] {
+        let p = parse(source.as_bytes());
+        assert!(
+            !p.flow
+                .values
+                .iter()
+                .any(|v| v.target.as_deref() == Some("cfhttp:param")),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn http_parameter_attribute_origins_are_captured_before_reassignment() {
+    let p = parse(br##"<cfset data=form.input><cfhttp method='POST'><cfhttpparam value='#data#'><cfset data='fixed'></cfhttp>"##);
+    let call = p
+        .flow
+        .values
+        .iter()
+        .find(|v| v.target.as_deref() == Some("cfhttp:param"))
+        .unwrap();
+    let origins = p.flow.field_origins(call.inputs[0], "value", &[], 1000);
+    assert!(
+        origins
+            .values
+            .iter()
+            .any(|v| p.flow.values[v.value].target.as_deref() == Some("form.input"))
+    );
+}
+
+#[test]
+fn self_closed_set_keeps_call_and_alias_provenance() {
+    for ending in [">", "/>", " / >"] {
+        let source = format!(
+            r##"<cfset tool=form.program{ending}<cfset cls=CreateObject("java","java.nio.ByteBuffer"){ending}<cfexecute name="#tool#">"##
+        );
+        let p = parse(source.as_bytes());
+        assert!(
+            p.symbols.iter().any(
+                |s| matches!(s, Symbol::Call {target,..} if target.as_deref()==Some("createobject"))
+            ),
+            "{source}"
+        );
+        let call = p
+            .flow
+            .values
+            .iter()
+            .find(|v| v.target.as_deref() == Some("cfexecute"))
+            .unwrap();
+        let origins = p.flow.field_origins(call.inputs[0], "name", &[], 1000);
+        assert!(
+            origins
+                .values
+                .iter()
+                .any(|v| p.flow.values[v.value].target.as_deref() == Some("form.program")),
+            "{source}"
+        );
+    }
+}
+#[test]
+fn self_closed_set_does_not_reinterpret_quoted_calls_or_division() {
+    for source in [
+        r##"<cfset a='CreateObject("java","java.nio.ByteBuffer")' />"##,
+        r##"<cfset a=4/2 />"##,
+        r##"<cfset a='/srv/path/' />"##,
+    ] {
+        let p = parse(source.as_bytes());
+        assert!(
+            !p.symbols.iter().any(
+                |s| matches!(s,Symbol::Call {target,..} if target.as_deref()==Some("createobject"))
+            ),
+            "{source}"
+        );
+    }
+}

@@ -111,18 +111,24 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     section_headers(&elf, values);
     note_segment_coverage(&elf, bytes, metrics, errors_out);
     section_file_anomalies(&elf, bytes, metrics);
-    rizin_fallback(
-        RizinTarget {
-            format: NativeFormat::Elf,
-            bytes,
-            strings,
-            go_function_metadata: has_go_pclntab(&elf, bytes),
-            settings: rizin,
-        },
-        sections_out,
-        symbols_out,
-        metrics,
-    );
+    member_layout_metrics(&elf, bytes.len(), metrics);
+    // Split firmware header members declare segments stored in sibling files.
+    // Disassembling such a member invents an entry function in an unmapped
+    // range. Keep its header facts, but recover code only from present bytes.
+    if has_present_load_or_code_bytes(&elf, bytes.len()) {
+        rizin_fallback(
+            RizinTarget {
+                format: NativeFormat::Elf,
+                bytes,
+                strings,
+                go_function_metadata: has_go_pclntab(&elf, bytes),
+                settings: rizin,
+            },
+            sections_out,
+            symbols_out,
+            metrics,
+        );
+    }
     linker_family(&elf, values);
     comment_fingerprint(values);
     super::elf_hashes::emit(&elf, values, symbols_out);
@@ -1521,6 +1527,71 @@ fn is_dynamic_loader_soname(name: &str) -> bool {
     base.starts_with("ld-linux") || base.starts_with("ld-musl") || base == "ld.so"
 }
 
+/// Whether a load segment or executable section contains any collected bytes.
+fn has_present_load_or_code_bytes(elf: &Elf<'_>, file_len: usize) -> bool {
+    let present = |offset: u64, size: u64| {
+        size != 0 && usize::try_from(offset).is_ok_and(|offset| offset < file_len)
+    };
+    elf.program_headers.iter().any(|p| {
+        p.p_type == goblin::elf::program_header::PT_LOAD && present(p.p_offset, p.p_filesz)
+    }) || elf.section_headers.iter().any(|s| {
+        s.sh_flags & u64::from(goblin::elf::section_header::SHF_EXECINSTR) != 0
+            && s.sh_type != goblin::elf::section_header::SHT_NOBITS
+            && present(s.sh_offset, s.sh_size)
+    })
+}
+
+/// Content contracts for split native-image members, independent of filenames.
+fn member_layout_metrics(elf: &Elf<'_>, file_len: usize, metrics: &mut Metrics) {
+    use goblin::elf::program_header::{PT_LOAD, PT_NULL};
+    let loads: Vec<_> = elf
+        .program_headers
+        .iter()
+        .filter(|p| p.p_type == PT_LOAD && p.p_filesz != 0)
+        .collect();
+    let missing_load_bytes = !loads.is_empty()
+        && loads
+            .iter()
+            .all(|p| !usize::try_from(p.p_offset).is_ok_and(|offset| offset < file_len));
+    metrics.insert(
+        metric!("elf.load_segments_without_member_bytes"),
+        f64::from(u8::from(missing_load_bytes)),
+    );
+
+    // The Linux Qualcomm MDT loader reads header/hash metadata separately
+    // from PT_LOAD bytes in sibling bNN members. This observed variant has
+    // private PHDR/HASH types and a header span covering the program table.
+    // https://github.com/torvalds/linux/blob/master/drivers/soc/qcom/mdt_loader.c
+    const TYPE_MASK: u32 = 7 << 24;
+    const TYPE_PHDR: u32 = 7 << 24;
+    const TYPE_HASH: u32 = 2 << 24;
+    let table_end = u64::from(elf.header.e_phentsize)
+        .checked_mul(u64::from(elf.header.e_phnum))
+        .and_then(|size| elf.header.e_phoff.checked_add(size));
+    let contract =
+        !elf.is_64
+            && elf.header.e_phentsize == 32
+            && elf.program_headers.len() >= 3
+            && !loads.is_empty()
+            && table_end.is_some_and(|end| {
+                elf.header.e_phoff >= u64::from(elf.header.e_ehsize)
+                    && usize::try_from(end).is_ok_and(|end| end <= file_len)
+            })
+            && elf.program_headers.first().is_some_and(|p| {
+                p.p_type == PT_NULL
+                    && p.p_offset == 0
+                    && p.p_flags & TYPE_MASK == TYPE_PHDR
+                    && Some(p.p_filesz) == table_end
+            })
+            && elf.program_headers.iter().skip(1).any(|p| {
+                p.p_type == PT_NULL && p.p_filesz != 0 && p.p_flags & TYPE_MASK == TYPE_HASH
+            });
+    metrics.insert(
+        metric!("elf.qcom_mdt_header_layout"),
+        f64::from(u8::from(contract)),
+    );
+}
+
 /// Cross-format `binary.*` metrics derivable from ELF header state.
 fn binary_flags(elf: &Elf<'_>, metrics: &mut Metrics) {
     // PIE: dynamically-linked executable (`ET_DYN` + `PT_INTERP`).
@@ -1528,29 +1599,29 @@ fn binary_flags(elf: &Elf<'_>, metrics: &mut Metrics) {
     let is_pie = elf.header.e_type == header::ET_DYN && elf.interpreter.is_some();
     metrics.insert(metric!("binary.is_pie"), f64::from(u8::from(is_pie)));
 
-    // Stripped: `.symtab` section absent. Imports stay in `.dynsym`
-    // and survive `strip`, so they're not a reliable signal.
+    // Observe absence of the full .symtab. A header member may never have
+    // contained one; this does not establish prior execution of strip.
     let has_symtab = elf
         .section_headers
         .iter()
         .any(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".symtab"));
+    metrics.insert(
+        metric!("binary.full_symbol_table_absent_or_empty"),
+        f64::from(u8::from(!has_symtab || elf.syms.is_empty())),
+    );
+    // Legacy field: same table-absence observation, not removal history.
     metrics.insert(
         metric!("binary.is_stripped"),
         f64::from(u8::from(!has_symtab)),
     );
 }
 
-/// Emit the names of canonical metadata sections that a normal
-/// `gcc`/`clang` build produces but are *absent* from this ELF. The
-/// list is the positive signal — every entry is a section the strip
-/// tool removed. Forensically this separates "developer build" from
-/// "release/strip" from "stripped harder than usual" (e.g., binaries
-/// missing `.comment` are particularly suspicious — toolchain banners
-/// rarely fall to standard `strip` invocations).
+/// Names of common toolchain metadata sections absent from this collected ELF.
+/// Absence alone does not prove a compiler produced them, a stripping tool
+/// removed them, or load bytes outside the collected member lack those records.
 fn stripped_metadata(elf: &Elf<'_>, values: &mut Values, metrics: &mut Metrics) {
-    // Canonical sections an unstripped Linux toolchain emits. We don't
-    // list every `.debug_*` variant individually — `.debug_info` is the
-    // load-bearing one; if it's gone, the rest are gone.
+    // This bounded catalog reports each section independently. Debug builds,
+    // release builds and firmware members may have different original sets.
     const EXPECTED: &[&str] = &[
         ".symtab",
         ".strtab",
@@ -1575,18 +1646,27 @@ fn stripped_metadata(elf: &Elf<'_>, values: &mut Values, metrics: &mut Metrics) 
         .collect();
 
     metrics.insert(
+        metric!("elf.absent_metadata_section_count"),
+        stripped.len() as f64,
+    );
+    // Legacy names are retained for API compatibility with the same bounded
+    // absence semantics. They do not identify a stripping operation.
+    metrics.insert(
         metric!("elf.stripped_metadata_section_count"),
         stripped.len() as f64,
     );
     if !stripped.is_empty() {
         values.insert_key(
+            value_key!("elf.absent_metadata_sections"),
+            JsonValue::Array(stripped.clone()),
+        );
+        values.insert_key(
             value_key!("elf.stripped_metadata_sections"),
             JsonValue::Array(stripped),
         );
     }
-    // Dedicated `stripped_but_symtab_present` flag: `.comment` and
-    // `.debug_*` removed but `.symtab` retained. Distinctive shape:
-    // a `strip --strip-debug` build that left symbol names intact.
+    // A present .symtab with an absent .comment or .debug_info is a shape
+    // observation. The legacy flag does not establish that any tool ran.
     let symtab_present = present.contains(".symtab");
     let debug_or_comment_gone = !present.contains(".comment") || !present.contains(".debug_info");
     metrics.insert(

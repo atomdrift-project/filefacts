@@ -1821,13 +1821,18 @@ fn binary_flags(macho: &MachO<'_>, metrics: &mut Metrics) {
     let is_pie = macho.header.flags & MH_PIE != 0;
     metrics.insert(metric!("binary.is_pie"), f64::from(u8::from(is_pie)));
 
-    // Stripped: `LC_SYMTAB.nsyms == 0`. The `nlist` table is the
-    // Mach-O equivalent of ELF's `.symtab`; `strip` zeroes it out.
+    // A declared empty LC_SYMTAB supplies no full-table symbols. This
+    // observes table state and does not establish a removal operation.
     let nsyms = macho.load_commands.iter().find_map(|lc| match lc.command {
         mach::load_command::CommandVariant::Symtab(st) => Some(st.nsyms),
         _ => None,
     });
     let is_stripped = nsyms.is_some_and(|n| n == 0);
+    metrics.insert(
+        metric!("binary.full_symbol_table_absent_or_empty"),
+        f64::from(u8::from(is_stripped)),
+    );
+    // Legacy field retains its existing zero-table semantics.
     metrics.insert(
         metric!("binary.is_stripped"),
         f64::from(u8::from(is_stripped)),
