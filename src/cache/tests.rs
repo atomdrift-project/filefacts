@@ -241,19 +241,24 @@ fn lookups_do_not_create_directories() {
 }
 
 #[test]
-fn stng_is_pinned_so_its_commit_keys_the_cache() {
-    // Cached snapshots hold stng's output, and the key covers Cargo.toml
-    // (see build.rs) but not stng's source. Pinning stng to an exact commit
-    // or version is what retires entries when stng changes; a branch or a
-    // version range would let a stng update serve stale strings.
-    let manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
-    let stng = manifest
-        .lines()
-        .find(|line| line.trim_start().starts_with("stng "))
-        .expect("stng dependency in Cargo.toml");
+fn stng_is_locked_so_its_commit_keys_the_cache() {
+    // Cached snapshots hold stng's output, and the key covers Cargo.lock
+    // (see build.rs) but not stng's source. stng is a bare git dependency,
+    // so the lock's `#<commit>` is what retires entries when stng changes;
+    // a path override would record no commit and serve stale strings.
+    let lock = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.lock"));
+    let source = lock
+        .split("[[package]]")
+        .find(|entry| entry.contains("\nname = \"stng\"\n"))
+        .and_then(|entry| entry.lines().find(|line| line.starts_with("source = ")))
+        .expect("stng source in Cargo.lock");
+    let commit = source
+        .trim_end_matches('"')
+        .rsplit_once('#')
+        .map_or("", |(_, commit)| commit);
     assert!(
-        stng.contains("rev = \"") || stng.contains("version = \"="),
-        "stng must be pinned by rev or exact version: {stng}"
+        commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()),
+        "stng must be locked to a git commit: {source}"
     );
 }
 

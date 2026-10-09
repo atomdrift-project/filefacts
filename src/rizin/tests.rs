@@ -1439,10 +1439,12 @@ fn smaller_equal_or_disabled_retry_deadline_is_not_used() {
 #[cfg(unix)]
 fn timed_out_shim_retries_and_recovers_but_crash_does_not_retry() {
     let _lock = rizin_test_lock();
+    // See `warm_shim_exec`: a held first exec would outlast the 100 ms budget.
     let dir = stage_script(
         "filefacts-native-retry",
-        "flag=\"${0}.first\"\nif [ ! -f \"$flag\" ]; then : > \"$flag\"; exec sleep 300; fi\nprintf '[]\\n===SEP===\\n[]\\n===SEP===\\n[]\\n===SEP===\\n[]\\n'\n",
+        "[ \"$1\" = warmup ] && exit 0\nflag=\"${0}.first\"\nif [ ! -f \"$flag\" ]; then : > \"$flag\"; exec sleep 300; fi\nprintf '[]\\n===SEP===\\n[]\\n===SEP===\\n[]\\n===SEP===\\n[]\\n'\n",
     );
+    warm_shim_exec(&dir.join("rizin"));
     let mut runs = 0;
     let result = attempt_with_retry(
         Duration::from_millis(100),
@@ -1455,7 +1457,11 @@ fn timed_out_shim_retries_and_recovers_but_crash_does_not_retry() {
     assert_eq!(runs, 2);
     assert!(result.recovery.is_some());
     assert!(!result.timed_out);
-    let crash = stage_script("filefacts-native-retry-crash", "exit 3\n");
+    let crash = stage_script(
+        "filefacts-native-retry-crash",
+        "[ \"$1\" = warmup ] && exit 0\nexit 3\n",
+    );
+    warm_shim_exec(&crash.join("rizin"));
     let mut runs = 0;
     let result = attempt_with_retry(
         Duration::from_millis(100),

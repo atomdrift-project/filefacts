@@ -53,8 +53,9 @@ fn json(out: &Output) -> Value {
 }
 
 /// Malware samples often carry names that are not valid UTF-8; they are
-/// analysed like any other path, given directly or found by a walk.
-#[cfg(unix)]
+/// analysed like any other path, given directly or found by a walk. Not on
+/// macOS: APFS refuses to create such a name (EILSEQ).
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn non_utf8_path_is_analysed() {
     use std::os::unix::ffi::OsStrExt;

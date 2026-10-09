@@ -23,7 +23,8 @@ fn main() {
     let mut files = Vec::new();
     collect_files(&root.join("src"), &mut files);
     files.sort();
-    // The manifest pins `stng` by rev, so it records that bump everywhere.
+    // The lock, not the manifest, records which commit of the bare git `stng`
+    // dependency is built, so both are hashed.
     files.push(root.join("Cargo.toml"));
     println!("cargo:rerun-if-changed=Cargo.toml");
     let own_lock = root.join("Cargo.lock");

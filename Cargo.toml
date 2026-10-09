@@ -64,11 +64,12 @@ gimli = { version = "0.32", default-features = false, features = ["read", "std"]
 # packed runs, decodes XOR-obfuscated and base64-wrapped payloads.
 # Cleave used to call this directly; centralising in filefacts lets every
 # consumer get the same high-quality string set.
-# Pinned to an exact rev until the next stng release is cut: stng types
-# (`ExtractedString`, `StringMethod`, ...) are part of filefacts' public API,
-# so `cargo update` must not move it. Bump the rev deliberately.
+# stng types (`ExtractedString`, `StringMethod`, ...) are part of filefacts'
+# public API, so consumers (cleave) must name this exact source: a bare git
+# URL with no rev/branch/tag. Cargo treats `git = URL` and `git = URL, rev = R`
+# as different sources, which yields two copies of stng whose types don't unify.
 # No default features: those build the `stng` command, not the library.
-stng = { git = "https://github.com/atomdrift-project/stng.git", rev = "60c96257262bfeb9bcc0c399a529631e354f6681", default-features = false }
+stng = { git = "https://github.com/atomdrift-project/stng.git", default-features = false }
 
 
 # Archive index readers. We use these for header/central-directory enumeration
@@ -302,6 +303,9 @@ unnecessary_trailing_comma = "allow"
 # Report builders format into one String; the allocation is not hot.
 format_push_string = "allow"
 format_collect = "allow"
+# Its suggested `assert_eq!(v, [] as [T; 0])` is noisier than the
+# `is_empty()` it replaces, and does not type-check against `&[Value]`.
+assert_is_empty = "allow"
 
 [profile.release]
 lto = "thin"
