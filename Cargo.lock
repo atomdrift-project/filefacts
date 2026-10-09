@@ -1783,7 +1783,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "2.1.0"
-source = "git+https://github.com/atomdrift-project/stng.git#3ed38f251ba169a27e6f943e06d19100f05517f4"
+source = "git+https://github.com/atomdrift-project/stng.git#9144ecd514404471bd1c33b91ff94195c1a13cdf"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -2754,9 +2754,9 @@ dependencies = [
 
 [[package]]
 name = "zstd-sys"
-version = "2.1.0+zstd.1.5.7"
+version = "2.1.1+zstd.1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ef0a8027ec3ee71300ab3bcbcd0393f434aa72b91ca6d635a39941deae8eea0"
+checksum = "aeec9eaf2dffbbd09201e23bd0ffcbaa33bb8e9266a10734fd7ed90a85eca078"
 dependencies = [
  "cc",
  "pkg-config",
