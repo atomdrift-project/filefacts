@@ -2,7 +2,7 @@
 name = "filefacts"
 version = "2.0.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.97"
 authors = ["The Atomdrift Project"]
 description = "Extracts file facts: identification, structural values, strings, metrics, symbols, sections, AST, and recoverable parse errors."
 license = "Apache-2.0"
