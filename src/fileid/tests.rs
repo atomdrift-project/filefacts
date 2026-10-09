@@ -1857,6 +1857,12 @@ fn pickle_magic() {
 fn pickle_by_ext() {
     assert_ext("model.pkl", FileType::Pickle);
     assert_ext("data.pickle", FileType::Pickle);
+    assert_ext("page.doctree", FileType::Pickle);
+
+    let data = [0x80, 0x04, 0x95, 0x00, 0, 0, 0, 0, 0, 0, 0, b'.'];
+    let detected = FileId::from_path_and_bytes(Path::new("page.doctree"), &data);
+    assert_eq!(detected.file_type(), FileType::Pickle);
+    assert!(!detected.extension_mismatch());
 }
 
 #[test]

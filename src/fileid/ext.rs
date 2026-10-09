@@ -542,7 +542,9 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "gif" => Some(FileType::Gif),
         "bmp" | "dib" => Some(FileType::Bmp),
         "webp" => Some(FileType::Webp),
-        "pkl" | "pickle" | "joblib" | "debug_pkl" => Some(FileType::Pickle),
+        // Sphinx caches parsed document trees as protocol pickle streams with
+        // the canonical `.doctree` suffix under its build directory.
+        "pkl" | "pickle" | "joblib" | "debug_pkl" | "doctree" => Some(FileType::Pickle),
         "trustcache" | "im4p" => Some(FileType::Data),
         // Zip-based package ecosystems with unambiguous extensions get their
         // own type (the magic branch agrees when `PK` is present; this keeps

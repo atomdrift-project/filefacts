@@ -8,7 +8,7 @@
 //!
 //! - `pickle.protocol` — PROTO byte (0..5).
 //! - `pickle.modules[]` — distinct `(module)` names from GLOBAL and
-//!   from the recent-strings ring buffer for STACK_GLOBAL.
+//!   statically resolved STACK_GLOBAL operands.
 //! - `pickle.opcodes[]` — sorted set of opcode names seen.
 //! - `pickle.dangerous_opcodes[]` — Pike-style flag array of
 //!   the canonical-RCE opcode family (`reduce`, `build`, `inst`,
@@ -18,7 +18,7 @@
 use crate::metric;
 use crate::value_key;
 use serde_json::Value as JsonValue;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap};
 
 use crate::formats::common::bytes_at::{u32_le, u64_le};
 use crate::formats::common::{XorScan, extract_binary_strings, put_str};
@@ -28,7 +28,60 @@ use crate::output::{Metrics, Strings, Values};
 /// tiny; the cap guards against pathological model files
 /// (multi-GB joblib/pytorch).
 const MAX_BYTES_SCANNED: usize = 8 * 1024 * 1024;
-const RECENT_STRING_CAP: usize = 16;
+
+#[derive(Clone)]
+enum StackValue {
+    Text(String),
+    Other,
+    Mark,
+}
+
+/// Minimal inert pickle VM used only to resolve STACK_GLOBAL operands.
+///
+/// A rolling string window is incorrect here: STACK_GLOBAL consumes the two
+/// values on the pickle stack, and either value may have arrived through a
+/// memo GET long after it was declared.  We model stack depth, marks and memo
+/// traffic without importing a global or constructing an object.
+#[derive(Default)]
+struct PickleStack {
+    values: Vec<StackValue>,
+    memo: HashMap<usize, StackValue>,
+}
+
+impl PickleStack {
+    fn push(&mut self, value: StackValue) {
+        self.values.push(value);
+    }
+
+    fn pop(&mut self) -> StackValue {
+        self.values.pop().unwrap_or(StackValue::Other)
+    }
+
+    fn pop_n(&mut self, count: usize) {
+        for _ in 0..count {
+            self.pop();
+        }
+    }
+
+    fn pop_through_mark(&mut self) {
+        while let Some(value) = self.values.pop() {
+            if matches!(value, StackValue::Mark) {
+                return;
+            }
+        }
+    }
+
+    fn memo_put(&mut self, index: usize) {
+        if let Some(value) = self.values.last() {
+            self.memo.insert(index, value.clone());
+        }
+    }
+
+    fn memo_get(&mut self, index: usize) {
+        self.values
+            .push(self.memo.get(&index).cloned().unwrap_or(StackValue::Other));
+    }
+}
 
 pub(super) fn extract(
     bytes: &[u8],
@@ -49,7 +102,7 @@ pub(super) fn extract(
     // shape so trait rules can match on e.g. `os.system` / `builtins.exec`.
     let mut globals: BTreeSet<String> = BTreeSet::new();
     let mut opcodes: BTreeSet<&'static str> = BTreeSet::new();
-    let mut recent: VecDeque<&str> = VecDeque::with_capacity(RECENT_STRING_CAP);
+    let mut stack = PickleStack::default();
 
     // The legacy torch container begins with a fixed magic integer and
     // serialization version, then carries three more pickles before raw
@@ -77,7 +130,7 @@ pub(super) fn extract(
             &mut protocol,
             &mut modules,
             &mut globals,
-            &mut recent,
+            &mut stack,
         );
         i += frame;
         if op == b'.' {
@@ -85,7 +138,7 @@ pub(super) fn extract(
             if streams_left == 0 {
                 break;
             }
-            recent.clear();
+            stack = PickleStack::default();
             // This bounded legacy variant uses protocol-2 headers for every
             // pickle; a corrupt next frame is not a raw-storage opcode scan.
             if scan.get(i..i + 2) != Some(&[0x80, 2]) {
@@ -179,7 +232,7 @@ fn payload_size(op: u8, i: usize, scan: &[u8]) -> Option<usize> {
     match op {
         0x80 | b'K' | 0x82 | b'h' | b'q' => Some(2),
         0x83 | b'M' => Some(3),
-        0x84 | b'J' | b'r' => Some(5),
+        0x84 | b'J' | b'j' | b'r' => Some(5),
         b'G' | 0x95 => Some(9),
         b'I' | b'L' | b'F' | b'V' | b'S' | b'g' | b'p' => read_until_newline(),
         b'c' | b'i' => {
@@ -214,21 +267,74 @@ fn is_pickle_ident(s: &str) -> bool {
         && s.starts_with(|c: char| c.is_alphabetic() || c == '_')
 }
 
-fn apply_side_effects<'a>(
+fn line_usize(scan: &[u8], start: usize) -> Option<usize> {
+    let end = scan.get(start..)?.iter().position(|&byte| byte == b'\n')? + start;
+    std::str::from_utf8(scan.get(start..end)?)
+        .ok()?
+        .parse()
+        .ok()
+}
+
+fn inline_global(scan: &[u8], i: usize) -> Option<(&str, &str)> {
+    let module_end = scan.get(i + 1..)?.iter().position(|&byte| byte == b'\n')? + i + 1;
+    let attr_start = module_end + 1;
+    let attr_end = scan
+        .get(attr_start..)?
+        .iter()
+        .position(|&byte| byte == b'\n')?
+        + attr_start;
+    Some((
+        std::str::from_utf8(scan.get(i + 1..module_end)?).ok()?,
+        std::str::from_utf8(scan.get(attr_start..attr_end)?).ok()?,
+    ))
+}
+
+fn unicode_operand(op: u8, scan: &[u8], i: usize) -> Option<String> {
+    let slice = match op {
+        0x8C => {
+            let len = usize::from(*scan.get(i + 1)?);
+            scan.get(i + 2..i + 2 + len)?
+        }
+        b'X' => {
+            let len = usize::try_from(u32_le(scan, i + 1)?).ok()?;
+            scan.get(i + 5..i + 5 + len)?
+        }
+        0x8D => {
+            let len = usize::try_from(u64_le(scan, i + 1)?).ok()?;
+            scan.get(i + 9..i + 9 + len)?
+        }
+        b'V' => {
+            let end = scan.get(i + 1..)?.iter().position(|&byte| byte == b'\n')? + i + 1;
+            scan.get(i + 1..end)?
+        }
+        _ => return None,
+    };
+    std::str::from_utf8(slice).ok().map(str::to_owned)
+}
+
+fn record_global(
+    module: &str,
+    attr: &str,
+    modules: &mut BTreeSet<String>,
+    globals: &mut BTreeSet<String>,
+) {
+    if !module.is_empty() {
+        modules.insert(module.to_owned());
+    }
+    if is_pickle_ident(module) && is_pickle_ident(attr) {
+        globals.insert(format!("{module}.{attr}"));
+    }
+}
+
+fn apply_side_effects(
     op: u8,
     i: usize,
-    scan: &'a [u8],
+    scan: &[u8],
     protocol: &mut i32,
     modules: &mut BTreeSet<String>,
     globals: &mut BTreeSet<String>,
-    recent: &mut VecDeque<&'a str>,
+    stack: &mut PickleStack,
 ) {
-    let push_recent = |rs: &mut VecDeque<&'a str>, s: &'a str| {
-        if rs.len() == RECENT_STRING_CAP {
-            rs.pop_front();
-        }
-        rs.push_back(s);
-    };
     match op {
         0x80 => {
             if let Some(&p) = scan.get(i + 1) {
@@ -236,76 +342,129 @@ fn apply_side_effects<'a>(
             }
         }
         b'c' => {
-            // GLOBAL: "module\nattr\n". Record the module and, when both the
-            // module and the following attr are identifier-shaped, the
-            // fully-qualified `module.attr` callable reference.
-            if let Some(m_nl) = scan
-                .get(i + 1..)
-                .and_then(|s| s.iter().position(|&b| b == b'\n'))
-            {
-                let module_end = i + 1 + m_nl;
-                if let Some(Ok(module)) = scan.get(i + 1..module_end).map(std::str::from_utf8) {
-                    if !module.is_empty() {
-                        modules.insert(module.to_string());
-                    }
-                    if let Some(a_nl) = scan
-                        .get(module_end + 1..)
-                        .and_then(|s| s.iter().position(|&b| b == b'\n'))
-                    {
-                        let attr_end = module_end + 1 + a_nl;
-                        if let Some(Ok(attr)) =
-                            scan.get(module_end + 1..attr_end).map(std::str::from_utf8)
-                            && is_pickle_ident(module)
-                            && is_pickle_ident(attr)
-                        {
-                            globals.insert(format!("{module}.{attr}"));
-                        }
-                    }
-                }
+            if let Some((module, attr)) = inline_global(scan, i) {
+                record_global(module, attr, modules, globals);
+            }
+            stack.push(StackValue::Other);
+        }
+        0x8C | b'X' | 0x8D | b'V' => {
+            stack.push(
+                unicode_operand(op, scan, i)
+                    .map(StackValue::Text)
+                    .unwrap_or(StackValue::Other),
+            );
+        }
+        b'(' => stack.push(StackValue::Mark),
+        b'0' => {
+            stack.pop();
+        }
+        b'1' => stack.pop_through_mark(),
+        b'2' => {
+            if let Some(value) = stack.values.last().cloned() {
+                stack.push(value);
             }
         }
-        0x8C => {
-            if let Some(&len) = scan.get(i + 1) {
-                let start = i + 2;
-                let end = start + len as usize;
-                if let Some(slice) = scan.get(start..end) {
-                    if let Ok(s) = std::str::from_utf8(slice) {
-                        push_recent(recent, s);
-                    }
-                }
+        b'q' => {
+            if let Some(&index) = scan.get(i + 1) {
+                stack.memo_put(usize::from(index));
             }
         }
-        b'X' => {
-            if let Some(len) = u32_le(scan, i + 1) {
-                let start = i + 5;
-                // `len` is file-controlled; a string past the address space
-                // is past the end of the scan, like any truncated one.
-                if let Some(slice) = start
-                    .checked_add(len as usize)
-                    .and_then(|end| scan.get(start..end))
-                {
-                    if let Ok(s) = std::str::from_utf8(slice) {
-                        push_recent(recent, s);
-                    }
-                }
+        b'r' => {
+            if let Some(index) = u32_le(scan, i + 1).and_then(|value| usize::try_from(value).ok()) {
+                stack.memo_put(index);
+            }
+        }
+        b'p' => {
+            if let Some(index) = line_usize(scan, i + 1) {
+                stack.memo_put(index);
+            }
+        }
+        0x94 => stack.memo_put(stack.memo.len()),
+        b'h' => {
+            if let Some(&index) = scan.get(i + 1) {
+                stack.memo_get(usize::from(index));
+            } else {
+                stack.push(StackValue::Other);
+            }
+        }
+        b'j' => {
+            if let Some(index) = u32_le(scan, i + 1).and_then(|value| usize::try_from(value).ok()) {
+                stack.memo_get(index);
+            } else {
+                stack.push(StackValue::Other);
+            }
+        }
+        b'g' => {
+            if let Some(index) = line_usize(scan, i + 1) {
+                stack.memo_get(index);
+            } else {
+                stack.push(StackValue::Other);
             }
         }
         0x93 => {
-            // STACK_GLOBAL: the most recent two recorded strings
-            // are typically (module, attr) for protocol 4+.
-            let n = recent.len();
-            if let Some(&module) = n.checked_sub(2).and_then(|j| recent.get(j)) {
-                if !module.is_empty() {
-                    modules.insert(module.to_string());
-                }
-                if let Some(&attr) = n.checked_sub(1).and_then(|j| recent.get(j))
-                    && is_pickle_ident(module)
-                    && is_pickle_ident(attr)
-                {
-                    globals.insert(format!("{module}.{attr}"));
-                }
+            let attr = stack.pop();
+            let module = stack.pop();
+            if let (StackValue::Text(module), StackValue::Text(attr)) = (module, attr) {
+                record_global(&module, &attr, modules, globals);
             }
+            stack.push(StackValue::Other);
         }
+        // Scalars, bytes, extension-registry results and out-of-band buffers.
+        b'F' | b'I' | b'J' | b'K' | b'L' | b'M' | b'N' | b'S' | b'T' | b'U' | b'G' | b'B'
+        | b'C' | 0x82 | 0x83 | 0x84 | 0x88 | 0x89 | 0x8A | 0x8B | 0x8E | 0x96 | 0x97 | b'P' => {
+            stack.push(StackValue::Other)
+        }
+        // Empty containers.
+        b')' | b']' | b'}' | 0x8F => stack.push(StackValue::Other),
+        // MARK-delimited container constructors.
+        b'd' | b'l' | b't' | 0x91 => {
+            stack.pop_through_mark();
+            stack.push(StackValue::Other);
+        }
+        // Batch mutations consume through MARK but retain their container.
+        b'e' | b'u' | 0x90 => stack.pop_through_mark(),
+        // Single mutations consume their arguments and retain the container.
+        b'a' => stack.pop_n(1),
+        b's' => stack.pop_n(2),
+        // Fixed-arity tuples.
+        0x85 => {
+            stack.pop_n(1);
+            stack.push(StackValue::Other);
+        }
+        0x86 => {
+            stack.pop_n(2);
+            stack.push(StackValue::Other);
+        }
+        0x87 => {
+            stack.pop_n(3);
+            stack.push(StackValue::Other);
+        }
+        // Construction never executes here; only stack effects are modeled.
+        b'R' | 0x81 => {
+            stack.pop_n(2);
+            stack.push(StackValue::Other);
+        }
+        0x92 => {
+            stack.pop_n(3);
+            stack.push(StackValue::Other);
+        }
+        b'b' => stack.pop_n(1),
+        b'i' => {
+            if let Some((module, attr)) = inline_global(scan, i) {
+                record_global(module, attr, modules, globals);
+            }
+            stack.pop_through_mark();
+            stack.push(StackValue::Other);
+        }
+        b'o' => {
+            stack.pop_through_mark();
+            stack.push(StackValue::Other);
+        }
+        b'Q' => {
+            stack.pop_n(1);
+            stack.push(StackValue::Other);
+        }
+        // PROTO, FRAME, STOP and READONLY_BUFFER have no modeled stack effect.
         _ => {}
     }
 }
@@ -452,6 +611,46 @@ mod tests {
                 .iter()
                 .any(|g| g.as_str() == Some("subprocess.Popen")),
             "STACK_GLOBAL should resolve module.attr: {globals:?}"
+        );
+    }
+
+    #[test]
+    fn stack_global_uses_pickle_stack_and_memo_not_recent_strings() {
+        let mut data = vec![0x80, 4];
+        let short_unicode = |data: &mut Vec<u8>, value: &[u8]| {
+            data.extend_from_slice(&[0x8C, value.len() as u8]);
+            data.extend_from_slice(value);
+        };
+
+        // Memo 0 holds the module. Resolve one class, then discard it.
+        short_unicode(&mut data, b"docutils.nodes");
+        data.push(0x94);
+        short_unicode(&mut data, b"section");
+        data.extend_from_slice(&[0x94, 0x93, b'0']);
+
+        // These identifier-shaped document strings used to pollute the
+        // rolling string window and produce `section.title`.
+        short_unicode(&mut data, b"arbitrary.document.text");
+        data.push(b'0');
+
+        // Reload the real module through a LONG_BINGET and resolve the second
+        // class. The opcode walker must consume all four index bytes.
+        data.extend_from_slice(&[b'j', 0, 0, 0, 0]);
+        short_unicode(&mut data, b"title");
+        data.extend_from_slice(&[0x93, b'.']);
+
+        let (values, metrics) = run(&data);
+        assert_eq!(metrics.get("pickle.protocol"), Some(4.0));
+        assert_eq!(
+            values.get("pickle.modules"),
+            Some(&serde_json::json!(["docutils.nodes"]))
+        );
+        assert_eq!(
+            values.get("pickle.globals"),
+            Some(&serde_json::json!([
+                "docutils.nodes.section",
+                "docutils.nodes.title"
+            ]))
         );
     }
 
