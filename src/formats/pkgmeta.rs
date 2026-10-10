@@ -146,6 +146,9 @@ fn finalize(root: Map<String, JsonValue>, values: &mut Values) {
         _ => None,
     };
     let mut source_owners: Vec<JsonValue> = Vec::new();
+    // First-seen order for the output; the set keeps a PKGBUILD listing
+    // thousands of sources from deduplicating quadratically.
+    let mut seen_owners = std::collections::HashSet::new();
     for (key, value) in &root {
         if base_field(key) != "source" {
             continue;
@@ -157,11 +160,10 @@ fn finalize(root: Map<String, JsonValue>, values: &mut Values) {
             let JsonValue::String(s) = e else { continue };
             // Honor `filename::url` rename syntax — read the URL half.
             let u = s.rsplit_once("::").map_or(s.as_str(), |(_, u)| u);
-            if let Some(owner) = github_owner(u) {
-                let owner = JsonValue::String(owner);
-                if !source_owners.contains(&owner) {
-                    source_owners.push(owner);
-                }
+            if let Some(owner) = github_owner(u)
+                && seen_owners.insert(owner.clone())
+            {
+                source_owners.push(JsonValue::String(owner));
             }
         }
     }

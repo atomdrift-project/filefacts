@@ -18,7 +18,7 @@
 use crate::metric;
 use crate::value_key;
 use serde_json::Value as JsonValue;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::formats::common::bytes_at::{u32_le, u64_le};
 use crate::formats::common::{XorScan, extract_binary_strings, put_str};
@@ -29,9 +29,11 @@ use crate::output::{Metrics, Strings, Values};
 /// (multi-GB joblib/pytorch).
 const MAX_BYTES_SCANNED: usize = 8 * 1024 * 1024;
 
-#[derive(Clone)]
-enum StackValue {
-    Text(String),
+/// A pickle stack entry. Text borrows from the scan, so DUP and memo GET of
+/// a multi-megabyte string copy a pointer, not the string.
+#[derive(Clone, Copy)]
+enum StackValue<'a> {
+    Text(&'a str),
     Other,
     Mark,
 }
@@ -43,17 +45,22 @@ enum StackValue {
 /// memo GET long after it was declared.  We model stack depth, marks and memo
 /// traffic without importing a global or constructing an object.
 #[derive(Default)]
-struct PickleStack {
-    values: Vec<StackValue>,
-    memo: HashMap<usize, StackValue>,
+struct PickleStack<'a> {
+    values: Vec<StackValue<'a>>,
+    memo: HashMap<usize, StackValue<'a>>,
+    /// STACK_GLOBAL operand pairs already admitted, keyed by address: each
+    /// operand is a slice of the scan at its own opcode's offset.
+    resolved: HashSet<(*const u8, *const u8)>,
+    /// Bytes of STACK_GLOBAL operands admitted so far.
+    resolved_bytes: usize,
 }
 
-impl PickleStack {
-    fn push(&mut self, value: StackValue) {
+impl<'a> PickleStack<'a> {
+    fn push(&mut self, value: StackValue<'a>) {
         self.values.push(value);
     }
 
-    fn pop(&mut self) -> StackValue {
+    fn pop(&mut self) -> StackValue<'a> {
         self.values.pop().unwrap_or(StackValue::Other)
     }
 
@@ -73,13 +80,28 @@ impl PickleStack {
 
     fn memo_put(&mut self, index: usize) {
         if let Some(value) = self.values.last() {
-            self.memo.insert(index, value.clone());
+            self.memo.insert(index, *value);
         }
     }
 
     fn memo_get(&mut self, index: usize) {
         self.values
-            .push(self.memo.get(&index).cloned().unwrap_or(StackValue::Other));
+            .push(self.memo.get(&index).copied().unwrap_or(StackValue::Other));
+    }
+
+    /// Whether STACK_GLOBAL operands `module` and `attr` should be recorded.
+    /// Memo GETs let a few bytes of input name the same multi-megabyte
+    /// strings again, or pair many of them up. Recording a pair once, and
+    /// no more operand bytes than an honest pickle of the scanned size could
+    /// hold, keeps the scan linear and its output bounded.
+    fn admit_global(&mut self, module: &str, attr: &str) -> bool {
+        if !self.resolved.insert((module.as_ptr(), attr.as_ptr())) {
+            return false;
+        }
+        self.resolved_bytes = self
+            .resolved_bytes
+            .saturating_add(module.len() + attr.len());
+        self.resolved_bytes <= MAX_BYTES_SCANNED
     }
 }
 
@@ -289,7 +311,7 @@ fn inline_global(scan: &[u8], i: usize) -> Option<(&str, &str)> {
     ))
 }
 
-fn unicode_operand(op: u8, scan: &[u8], i: usize) -> Option<String> {
+fn unicode_operand(op: u8, scan: &[u8], i: usize) -> Option<&str> {
     let slice = match op {
         0x8C => {
             let len = usize::from(*scan.get(i + 1)?);
@@ -309,7 +331,7 @@ fn unicode_operand(op: u8, scan: &[u8], i: usize) -> Option<String> {
         }
         _ => return None,
     };
-    std::str::from_utf8(slice).ok().map(str::to_owned)
+    std::str::from_utf8(slice).ok()
 }
 
 fn record_global(
@@ -326,14 +348,14 @@ fn record_global(
     }
 }
 
-fn apply_side_effects(
+fn apply_side_effects<'a>(
     op: u8,
     i: usize,
-    scan: &[u8],
+    scan: &'a [u8],
     protocol: &mut i32,
     modules: &mut BTreeSet<String>,
     globals: &mut BTreeSet<String>,
-    stack: &mut PickleStack,
+    stack: &mut PickleStack<'a>,
 ) {
     match op {
         0x80 => {
@@ -360,7 +382,7 @@ fn apply_side_effects(
         }
         b'1' => stack.pop_through_mark(),
         b'2' => {
-            if let Some(value) = stack.values.last().cloned() {
+            if let Some(&value) = stack.values.last() {
                 stack.push(value);
             }
         }
@@ -404,8 +426,10 @@ fn apply_side_effects(
         0x93 => {
             let attr = stack.pop();
             let module = stack.pop();
-            if let (StackValue::Text(module), StackValue::Text(attr)) = (module, attr) {
-                record_global(&module, &attr, modules, globals);
+            if let (StackValue::Text(module), StackValue::Text(attr)) = (module, attr)
+                && stack.admit_global(module, attr)
+            {
+                record_global(module, attr, modules, globals);
             }
             stack.push(StackValue::Other);
         }
@@ -731,6 +755,38 @@ mod tests {
         let globals = v.get("pickle.globals").and_then(|x| x.as_array()).unwrap();
         assert_eq!(globals.len(), 1);
         assert_eq!(globals[0].as_str(), Some(format!("{module}.f").as_str()));
+    }
+
+    /// Memo GETs can pair every one of a few large strings with every other;
+    /// the recorded names must stay bounded by the scan size, not grow with
+    /// the square of the string count.
+    #[test]
+    fn memo_paired_stack_globals_are_bounded() {
+        const STRINGS: u8 = 64;
+        let mut data = vec![0x80, 4];
+        for k in 0..STRINGS {
+            let name = format!("m{k}{}", "a".repeat(64 << 10));
+            data.push(b'X');
+            data.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            data.extend_from_slice(name.as_bytes());
+            data.extend_from_slice(&[b'q', k, b'0']);
+        }
+        // Unbounded, these 4 Ki pairs record about 512 MB of names.
+        for module in 0..STRINGS {
+            for attr in 0..STRINGS {
+                data.extend_from_slice(&[b'h', module, b'h', attr, 0x93, b'0']);
+            }
+        }
+        data.push(b'.');
+        let (v, _) = run(&data);
+        let globals = v.get("pickle.globals").and_then(|x| x.as_array()).unwrap();
+        let bytes: usize = globals
+            .iter()
+            .filter_map(|g| g.as_str())
+            .map(str::len)
+            .sum();
+        assert!(!globals.is_empty());
+        assert!(bytes <= MAX_BYTES_SCANNED, "{bytes} bytes of globals");
     }
 
     #[test]
