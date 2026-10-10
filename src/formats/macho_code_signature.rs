@@ -41,6 +41,14 @@ const CSMAGIC_DER_ENTITLEMENTS: u32 = 0xfade_7172;
 const CSMAGIC_BLOBWRAPPER: u32 = 0xfade_0b01;
 /// Slot type of the primary CodeDirectory, the one the CMS signature covers.
 const CSSLOT_CODEDIRECTORY: u32 = 0;
+/// Slot types the kernel reads each embedded blob from (`CSSLOT_*` in xnu's
+/// `cs_blobs.h`). A blob with the right magic in any other slot is never
+/// consulted, so reporting it would describe a signature the OS does not
+/// see: a decoy entitlements dict in slot `0x2000` would hide the real one.
+const CSSLOT_REQUIREMENTS: u32 = 2;
+const CSSLOT_ENTITLEMENTS: u32 = 5;
+const CSSLOT_DER_ENTITLEMENTS: u32 = 7;
+const CSSLOT_SIGNATURESLOT: u32 = 0x1_0000;
 
 /// SuperBlob index entries read. Real signatures carry fewer than a dozen
 /// (CodeDirectory, up to five alternates, requirements, entitlements,
@@ -83,29 +91,32 @@ pub(super) fn parse(bytes: &[u8], sig_off: usize, sig_size: usize, values: &mut 
     let Some(entries) = super_blob_entries(sig, total_len) else {
         return;
     };
-    // The CMS signature covers the primary CodeDirectory (slot 0); the
-    // alternate CodeDirectories are bound through its cdhashes attribute.
+    // The CMS signature covers the primary CodeDirectory (slot 0) and
+    // nothing else; the alternate CodeDirectories are bound through its
+    // cdhashes attribute. A CodeDirectory in any other slot is not what the
+    // signature vouches for, so without a slot-0 one the CMS binds nothing.
     let primary_cd = entries
         .iter()
         .find(|e| e.slot == CSSLOT_CODEDIRECTORY && e.magic == CSMAGIC_CODEDIRECTORY)
-        .or_else(|| entries.iter().find(|e| e.magic == CSMAGIC_CODEDIRECTORY))
         .map(|e| e.blob);
 
     for &BlobEntry {
+        slot,
         offset: blob_off,
         magic: blob_magic,
         blob,
-        ..
     } in &entries
     {
-        match blob_magic {
+        match (slot, blob_magic) {
             // `sig_off + blob_off` is the CodeDirectory's absolute offset in
             // `bytes`; pass it so interior fields (the identifier string) can
             // be reported in the same coordinate space as the signature blob.
-            CSMAGIC_CODEDIRECTORY => {
+            // A CodeDirectory the kernel never reads is not reported: its
+            // cdhash and identifier would describe a signature nothing uses.
+            (slot, CSMAGIC_CODEDIRECTORY) if honoured_code_directory_slot(slot) => {
                 parse_code_directory(blob, sig_off + blob_off, values);
             }
-            CSMAGIC_REQUIREMENTS => {
+            (CSSLOT_REQUIREMENTS, CSMAGIC_REQUIREMENTS) => {
                 put_u64(
                     values,
                     value_key!("macho.code_signature.requirements_size"),
@@ -113,8 +124,10 @@ pub(super) fn parse(bytes: &[u8], sig_off: usize, sig_size: usize, values: &mut 
                 );
                 parse_requirements_set(blob, values);
             }
-            CSMAGIC_EMBEDDED_ENTITLEMENTS => parse_entitlements(blob, values),
-            CSMAGIC_DER_ENTITLEMENTS => {
+            (CSSLOT_ENTITLEMENTS, CSMAGIC_EMBEDDED_ENTITLEMENTS) => {
+                parse_entitlements(blob, values);
+            }
+            (CSSLOT_DER_ENTITLEMENTS, CSMAGIC_DER_ENTITLEMENTS) => {
                 // Same pattern: presence of `der_entitlements_size`
                 // signals a DER-encoded entitlements blob was found.
                 put_u64(
@@ -123,7 +136,7 @@ pub(super) fn parse(bytes: &[u8], sig_off: usize, sig_size: usize, values: &mut 
                     (blob.len() - 8) as u64,
                 );
             }
-            CSMAGIC_BLOBWRAPPER => parse_cms(blob, primary_cd, values),
+            (CSSLOT_SIGNATURESLOT, CSMAGIC_BLOBWRAPPER) => parse_cms(blob, primary_cd, values),
             _ => {}
         }
     }
@@ -144,6 +157,15 @@ const CSSLOT_ALTERNATE_CODEDIRECTORIES: u32 = 0x1000;
 /// pages, so its pages are not hashed: that caps the image hashing at six
 /// passes however many CodeDirectories a signature lists.
 const CSSLOT_ALTERNATE_CODEDIRECTORY_MAX: u32 = 5;
+
+/// Whether the kernel reads a CodeDirectory from `slot`: the primary, or one
+/// of the alternates.
+fn honoured_code_directory_slot(slot: u32) -> bool {
+    slot == CSSLOT_CODEDIRECTORY
+        || (CSSLOT_ALTERNATE_CODEDIRECTORIES
+            ..CSSLOT_ALTERNATE_CODEDIRECTORIES + CSSLOT_ALTERNATE_CODEDIRECTORY_MAX)
+            .contains(&slot)
+}
 
 /// The digest a CodeDirectory of `hash_type` stores for `data`, and the slot
 /// length such a CodeDirectory must declare. `None` for a hash type this
@@ -331,19 +353,20 @@ fn check_code_directory(
         }
     }
     for entry in entries {
-        let Ok(slot) = usize::try_from(entry.slot) else {
-            continue;
-        };
-        if entry.slot == CSSLOT_CODEDIRECTORY
-            || entry.slot >= CSSLOT_ALTERNATE_CODEDIRECTORIES
-            || slot > cd.n_special_slots
-        {
+        if entry.slot == CSSLOT_CODEDIRECTORY || entry.slot >= CSSLOT_ALTERNATE_CODEDIRECTORIES {
             continue;
         }
-        let (digest, _) = slot_digest(cd.hash_type, entry.blob)?;
-        let bound = cd
-            .slot(-isize::try_from(slot).ok()?)
-            .is_some_and(|stored| digest.get(..cd.hash_size) == Some(stored));
+        // A blob in a special slot the CodeDirectory has no hash for is bound
+        // by nothing; xnu refuses such a signature (`EBADEXEC`) rather than
+        // ignore the blob, so it is unbound here rather than skipped.
+        let slot = usize::try_from(entry.slot).ok()?;
+        let bound = if slot > cd.n_special_slots {
+            false
+        } else {
+            let (digest, _) = slot_digest(cd.hash_type, entry.blob)?;
+            cd.slot(-isize::try_from(slot).ok()?)
+                .is_some_and(|stored| digest.get(..cd.hash_size) == Some(stored))
+        };
         check.special_ok = Some(check.special_ok.unwrap_or(true) && bound);
     }
     Some(check)
@@ -375,15 +398,17 @@ fn check_code_directories(
     if directories.is_empty() {
         return;
     }
-    let alternates = CSSLOT_ALTERNATE_CODEDIRECTORIES
-        ..CSSLOT_ALTERNATE_CODEDIRECTORIES + CSSLOT_ALTERNATE_CODEDIRECTORY_MAX;
     let mut memo = PageDigests::new();
-    let mut pages_ok = true;
+    // Only a CodeDirectory in a slot the kernel honours checks any pages;
+    // one parked elsewhere must not leave this vacuously true.
+    let mut pages_ok = directories
+        .iter()
+        .any(|e| honoured_code_directory_slot(e.slot));
     let mut special: Option<bool> = None;
     let mut mismatch: Option<(u64, Option<u64>)> = None;
     for blob in directories
         .iter()
-        .filter(|e| e.slot == CSSLOT_CODEDIRECTORY || alternates.contains(&e.slot))
+        .filter(|e| honoured_code_directory_slot(e.slot))
         .map(|e| e.blob)
     {
         let check =
@@ -475,7 +500,7 @@ fn super_blob_entries(sig: &[u8], total_len: usize) -> Option<Vec<BlobEntry<'_>>
         {
             continue;
         }
-        if blob_off + 8 > total_len {
+        if blob_off.saturating_add(8) > total_len {
             continue;
         }
         let (Some(magic), Some(blob_len)) = (
@@ -704,7 +729,7 @@ fn parse_requirements_set(blob: &[u8], values: &mut Values) {
         }
         seen.push((slot_type, req_off));
         let req_off = req_off as usize;
-        if req_off + 12 > blob.len() {
+        if req_off.saturating_add(12) > blob.len() {
             continue;
         }
         let (Some(req_magic), Some(req_len)) = (
@@ -1358,6 +1383,55 @@ mod tests {
         let last = stale.len() - 1;
         stale[last] ^= 1;
         assert_eq!(consistent(&stale), (Some(true), Some(false)));
+    }
+
+    /// A genuine CodeDirectory and its CMS signature moved out of slot 0
+    /// into a slot the kernel never reads vouch for nothing: no pages were
+    /// checked, and the signature binds no CodeDirectory the OS would use.
+    #[test]
+    fn code_directory_outside_honoured_slots_verifies_nothing() {
+        let code = sample_code();
+        let cd = code_directory(&code, 12, "com.apple.ls", &[]);
+        let cms = wrapper(BER_DETACHED);
+        let values = signed(&code, &[(0x2000, &cd), (CSSLOT_SIGNATURESLOT, &cms)]);
+        assert_eq!(page_values(&values).0, Some(false));
+        let sig = super_blob(&[(0x2000, BER_CONTENT), (CSSLOT_SIGNATURESLOT, &cms)], 0);
+        let values = signature_values(&sig);
+        assert_ne!(
+            values.get("macho.code_signature.cms.verified"),
+            Some(&JsonValue::Bool(true))
+        );
+        // Nor does that CodeDirectory lend the file its cdhash.
+        assert!(values.get("macho.code_signature.cdhash").is_none());
+    }
+
+    /// Entitlements are read from their own slot, as the kernel reads them:
+    /// a decoy in another slot neither hides nor replaces the real ones, and
+    /// a blob in a special slot the CodeDirectory does not hash is unbound.
+    #[test]
+    fn entitlements_come_from_their_slot_and_must_be_hashed() {
+        let code = sample_code();
+        let plist = |key: &str| {
+            let xml = format!("<plist><dict><key>{key}</key><true/></dict></plist>");
+            let mut blob = words(&[CSMAGIC_EMBEDDED_ENTITLEMENTS, (xml.len() + 8) as u32]);
+            blob.extend(xml.as_bytes());
+            blob
+        };
+        let (real, decoy) = (plist("com.apple.private.tcc"), plist("benign"));
+        let cd = code_directory(&code, 12, "x", &[(5, &real)]);
+        let values = signed(&code, &[(0, &cd), (5, &real), (0x2000, &decoy)]);
+        let entitlements = values.get("macho.code_signature.entitlements").unwrap();
+        assert!(entitlements.get("com.apple.private.tcc").is_some());
+        assert!(entitlements.get("benign").is_none());
+        // No special slots at all: the entitlements beside it are unbound.
+        let unhashed = code_directory(&code, 12, "x", &[]);
+        let values = signed(&code, &[(0, &unhashed), (5, &real)]);
+        assert_eq!(
+            values
+                .get("macho.code_signature.special_slots_verified")
+                .and_then(JsonValue::as_bool),
+            Some(false)
+        );
     }
 
     /// Thousands of index entries naming one blob read it once; the walk

@@ -51,6 +51,16 @@ const MAX_SCAN_PART_BYTES: u64 = 1 << 20;
 /// Inflated bytes the DDE / customUI scan reads across every part.
 const MAX_SCAN_TOTAL_BYTES: u64 = 32 << 20;
 
+/// Inflated `.rels` bytes read across the package. Every relationship part
+/// is read, and each may be a 4 MiB deflate bomb: thousands of them took
+/// minutes to inflate and parse.
+const MAX_RELS_TOTAL_BYTES: u64 = 16 << 20;
+
+/// Relationships kept per package. A 4 MiB part holds 150,000 of them, each
+/// a few hundred bytes once parsed, so a package of such parts built tens of
+/// gigabytes. Real packages carry a few thousand.
+const MAX_RELATIONSHIPS: usize = 65_536;
+
 /// Element names the DDE and customUI scans match on. A part naming none of
 /// them has nothing for either, and is not parsed.
 static SCAN_MARKERS: LazyLock<AhoCorasick> = LazyLock::new(|| {
@@ -93,7 +103,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     let mut features: Vec<&'static str> = Vec::new();
     let mut macros_seen = BTreeSet::new();
     let mut macros: Vec<JsonValue> = Vec::new();
-    let mut embedded_seen = HashSet::new();
+    let mut embedded_seen = HashMap::new();
     let mut embedded: Vec<JsonValue> = Vec::new();
     let mut controls_seen = HashSet::new();
     let mut controls: Vec<JsonValue> = Vec::new();
@@ -296,6 +306,16 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         custom_ui_onload.extend(extract_custom_ui_onload(&doc, name));
     }
     let mut limits = Vec::new();
+    if index.unread_rels > 0 {
+        limits.push(serde_json::json!({
+            "stage": "rels-budget",
+            "reason": format!(
+                "{} relationship part(s) not read in full: past the {MAX_RELS_TOTAL_BYTES}-byte \
+                 or {MAX_RELATIONSHIPS}-relationship budget",
+                index.unread_rels
+            ),
+        }));
+    }
     if oversized_parts > 0 {
         limits.push(serde_json::json!({
             "stage": "part-scan",
@@ -351,6 +371,8 @@ struct OoxmlIndex {
     defaults: HashMap<String, String>,
     overrides: HashMap<String, String>,
     relationships: Vec<RelationshipInfo>,
+    /// `.rels` parts skipped or cut short by the relationship budgets.
+    unread_rels: usize,
 }
 
 #[derive(Debug)]
@@ -406,15 +428,27 @@ fn build_ooxml_index<R: Read + std::io::Seek>(
     let mut index = parse_content_types(&content_types)
         .map_err(|e| errors.record_malformed(Stage::OoxmlParse, format!("{CONTENT_TYPES}: {e}")))
         .ok()?;
+    let mut budget = MAX_RELS_TOTAL_BYTES;
     for name in names {
         if !ends_with_ci(name, ".rels") {
+            continue;
+        }
+        if budget == 0 || index.relationships.len() >= MAX_RELATIONSHIPS {
+            index.unread_rels += 1;
             continue;
         }
         let Some(text) = read_named_part(zip, name, errors) else {
             continue;
         };
+        budget = budget.saturating_sub(text.len() as u64);
         match parse_relationships(&text, name) {
-            Ok(rels) => index.relationships.extend(rels),
+            Ok(rels) => {
+                let room = MAX_RELATIONSHIPS - index.relationships.len();
+                if rels.len() > room {
+                    index.unread_rels += 1;
+                }
+                index.relationships.extend(rels.into_iter().take(room));
+            }
             Err(e) => errors.record_malformed(Stage::OoxmlParse, format!("{name}: {e}")),
         }
     }
@@ -573,37 +607,33 @@ fn push_control(
     out.push(JsonValue::Object(obj));
 }
 
+/// Record an embedded part once, keyed in `seen` by filename to its entry
+/// in `out`; a later relationship naming the same part updates that entry.
+/// The lookup is by key: a scan of `out` per repeated relationship made a
+/// package of them quadratic.
 fn push_embedded<R: Read + std::io::Seek>(
     zip: &mut ::zip::ZipArchive<R>,
-    seen: &mut HashSet<String>,
+    seen: &mut HashMap<String, usize>,
     out: &mut Vec<JsonValue>,
     filename: &str,
     relationship_type: Option<&str>,
     source: Option<&str>,
 ) {
-    if !seen.insert(filename.to_string()) {
-        if relationship_type.is_some() || source.is_some() {
-            for item in out.iter_mut() {
-                let Some(obj) = item.as_object_mut() else {
-                    continue;
-                };
-                if obj.get("filename").and_then(|v| v.as_str()) != Some(filename) {
-                    continue;
-                }
-                if let Some(relationship_type) = relationship_type {
-                    obj.insert(
-                        "relationship_type".into(),
-                        JsonValue::String(relationship_type.to_string()),
-                    );
-                }
-                if let Some(source) = source {
-                    obj.insert("source".into(), JsonValue::String(source.to_string()));
-                }
-                break;
+    if let Some(&at) = seen.get(filename) {
+        if let Some(obj) = out.get_mut(at).and_then(JsonValue::as_object_mut) {
+            if let Some(relationship_type) = relationship_type {
+                obj.insert(
+                    "relationship_type".into(),
+                    JsonValue::String(relationship_type.to_string()),
+                );
+            }
+            if let Some(source) = source {
+                obj.insert("source".into(), JsonValue::String(source.to_string()));
             }
         }
         return;
     }
+    seen.insert(filename.to_string(), out.len());
     let mut obj = serde_json::Map::new();
     obj.insert("filename".into(), JsonValue::String(filename.to_string()));
     if let Some(relationship_type) = relationship_type {

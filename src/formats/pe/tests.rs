@@ -737,3 +737,203 @@ fn pe_entry_parity_metrics_clean_on_fixture() {
     assert!(v.get("pe.entry_section").is_some());
     assert!(m.get("pe.entry_in_nonstandard_section").is_none());
 }
+
+/// `IMAGE_GUARD_*` bits as winnt.h defines them: the delay-load and
+/// export-suppression flags sit in the 0x1000..0x8000 nibble, below the
+/// longjmp and return-flow bits they once shadowed.
+#[test]
+fn guard_flag_names_follow_winnt() {
+    assert_eq!(
+        guard_flag_names(0x0000_F000),
+        [
+            "protect_delayload_iat",
+            "delayload_iat_in_its_own_section",
+            "export_suppression_info_present",
+            "enable_export_suppression",
+        ]
+    );
+    assert_eq!(
+        guard_flag_names(0x000F_0000),
+        [
+            "longjump_table_present",
+            "rf_instrumented",
+            "rf_enable",
+            "rf_strict"
+        ]
+    );
+}
+
+/// `test.exe` (PE32+) with `descriptors` delay-load descriptors that all
+/// share one name table of `entries` ordinal imports.
+fn pe_with_shared_delay_imports(descriptors: usize, entries: usize) -> Vec<u8> {
+    let put = |bytes: &mut Vec<u8>, at: usize, value: u32| {
+        bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    };
+    let mut bytes = read_fixture("test.exe");
+    let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    let coff = pe_offset + 4;
+    let sections = u16::from_le_bytes(bytes[coff + 2..coff + 4].try_into().unwrap()) as usize;
+    let size_of_optional = u16::from_le_bytes(bytes[coff + 16..coff + 18].try_into().unwrap());
+    let optional = coff + 20;
+    let last = optional + size_of_optional as usize + (sections - 1) * 40;
+    let va = u32::from_le_bytes(bytes[last + 12..last + 16].try_into().unwrap());
+    let pointer = u32::from_le_bytes(bytes[last + 20..last + 24].try_into().unwrap()) as usize;
+
+    let dll_at = (descriptors + 1) * 32;
+    let int_at = dll_at + 8;
+    let size = int_at + (entries + 1) * 8;
+    bytes.resize(pointer + size, 0);
+    bytes[pointer..pointer + size].fill(0);
+    put(&mut bytes, last + 8, size as u32); // virtual_size
+    put(&mut bytes, last + 16, size as u32); // size_of_raw_data
+    bytes[pointer + dll_at..pointer + dll_at + 6].copy_from_slice(b"a.dll\0");
+    for i in 0..entries {
+        let at = pointer + int_at + i * 8;
+        bytes[at..at + 8].copy_from_slice(&0x8000_0000_0000_0001_u64.to_le_bytes());
+    }
+    for i in 0..descriptors {
+        let at = pointer + i * 32;
+        put(&mut bytes, at, 1); // RvaBased
+        put(&mut bytes, at + 4, va + dll_at as u32);
+        put(&mut bytes, at + 16, va + int_at as u32);
+    }
+    // Data directory 13 is the delay-import table; PE32+ puts the array at +112.
+    let slot = optional + 112 + 13 * 8;
+    put(&mut bytes, slot, va);
+    put(&mut bytes, slot + 4, ((descriptors + 1) * 32) as u32);
+    bytes
+}
+
+/// Descriptors sharing one name table multiply into symbols; the total is
+/// capped, not just each table.
+#[test]
+fn delay_imports_are_capped_across_descriptors() {
+    let small = pe_with_shared_delay_imports(3, 5);
+    let pe = goblin_safe::parse_pe(&small).outcome.ok().expect("parses");
+    let (mut values, mut metrics, mut symbols) =
+        (Values::new(), Metrics::new(), crate::Symbols::new());
+    delay_imports(&pe, &small, &mut values, &mut metrics, &mut symbols);
+    assert_eq!(symbols.len(), 15);
+    assert_eq!(metrics.get("pe.delay_import_count"), Some(15.0));
+
+    // 128 descriptors x 4096 entries would be half a million symbols.
+    let big = pe_with_shared_delay_imports(128, 4096);
+    let pe = goblin_safe::parse_pe(&big).outcome.ok().expect("parses");
+    let (mut values, mut metrics, mut symbols) =
+        (Values::new(), Metrics::new(), crate::Symbols::new());
+    delay_imports(&pe, &big, &mut values, &mut metrics, &mut symbols);
+    assert_eq!(symbols.len(), 16 * 1024);
+    assert_eq!(metrics.get("pe.delay_import_count"), Some(16.0 * 1024.0));
+}
+
+fn located_profile(va: u64) -> LocatedHashProfile {
+    LocatedHashProfile {
+        va,
+        kind: "multiply_xor_rotate".to_string(),
+        seed: 0,
+        multiplier: 0,
+        xor_constant: 0,
+        rotate_bits: 0,
+        ascii_lowercase: false,
+    }
+}
+
+/// A call into a resolver takes the resolver's own hash profile, or that of
+/// the first helper it calls; calls into anything else are not requests.
+#[test]
+fn resolver_calls_pair_each_call_with_its_resolvers_profile() {
+    // 0x1000 resolves with its own loop; 0x2000 delegates to helper 0x3000;
+    // 0x4000 is an ordinary caller.
+    let ranges = [
+        (0x1000, 0x100),
+        (0x2000, 0x100),
+        (0x3000, 0x100),
+        (0x4000, 0x100),
+    ];
+    let profiles = [located_profile(0x3020), located_profile(0x1020)];
+    let edges = [
+        (0x4000, 0x4005, 0x1000),
+        (0x2000, 0x2030, 0x3000),
+        (0x4000, 0x400a, 0x2000),
+        (0x4000, 0x400f, 0x3000),
+    ];
+    let calls: Vec<_> = resolver_calls(&ranges, &edges, vec![0x2010, 0x1010], &profiles)
+        .into_iter()
+        .map(|(caller, callsite, resolver, profile)| (caller, callsite, resolver, profile.va))
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            (0x4000, 0x4005, 0x1000, 0x1020),
+            (0x4000, 0x400a, 0x2000, 0x3020)
+        ]
+    );
+}
+
+/// Rizin can report a million call edges for a few megabytes of `call`
+/// instructions. Every edge into a resolver with no hash loop used to rescan
+/// all edges for a helper, so this many calls did not finish.
+#[test]
+fn resolver_calls_scale_with_the_edge_count() {
+    let calls = 200_000;
+    let ranges = [(0x1000, 0x100), (0x10_0000, 0x1000_0000)];
+    let edges: Vec<_> = (0..calls)
+        .map(|i| (0x10_0000, 0x10_0000 + 5 * i, 0x1000))
+        .collect();
+    assert!(resolver_calls(&ranges, &edges, vec![0x1010], &[]).is_empty());
+    let profiles = [located_profile(0x1020)];
+    assert_eq!(
+        resolver_calls(&ranges, &edges, vec![0x1010], &profiles).len(),
+        calls as usize
+    );
+}
+
+/// `test.exe` (PE32+) with a TLS directory registering `callbacks` callbacks.
+fn pe_with_tls_callbacks(callbacks: usize) -> Vec<u8> {
+    let put = |bytes: &mut Vec<u8>, at: usize, value: u64, width: usize| {
+        bytes[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
+    };
+    let mut bytes = read_fixture("test.exe");
+    let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    let coff = pe_offset + 4;
+    let sections = u16::from_le_bytes(bytes[coff + 2..coff + 4].try_into().unwrap()) as usize;
+    let size_of_optional = u16::from_le_bytes(bytes[coff + 16..coff + 18].try_into().unwrap());
+    let optional = coff + 20;
+    let image_base = u64::from_le_bytes(bytes[optional + 24..optional + 32].try_into().unwrap());
+    let last = optional + size_of_optional as usize + (sections - 1) * 40;
+    let va = u64::from(u32::from_le_bytes(
+        bytes[last + 12..last + 16].try_into().unwrap(),
+    ));
+    let pointer = u32::from_le_bytes(bytes[last + 20..last + 24].try_into().unwrap()) as usize;
+
+    let size = 40 + (callbacks + 1) * 8;
+    bytes.resize(pointer + size, 0);
+    bytes[pointer..pointer + size].fill(0);
+    put(&mut bytes, last + 8, size as u64, 4); // virtual_size
+    put(&mut bytes, last + 16, size as u64, 4); // size_of_raw_data
+    // IMAGE_TLS_DIRECTORY64.AddressOfCallBacks, then the array itself, every
+    // callback pointing back into this section.
+    put(&mut bytes, pointer + 24, image_base + va + 40, 8);
+    for i in 0..callbacks {
+        put(&mut bytes, pointer + 40 + i * 8, image_base + va, 8);
+    }
+    // Data directory 9 is the TLS table; PE32+ puts the array at +112.
+    put(&mut bytes, optional + 112 + 9 * 8, va, 4);
+    put(&mut bytes, optional + 112 + 9 * 8 + 4, 40, 4);
+    bytes
+}
+
+/// A callback array runs to its first null entry, so a forged one is as long
+/// as the file allows; the records are capped and the count stays exact.
+#[test]
+fn tls_callback_records_are_capped() {
+    for (callbacks, records) in [(3, 3), (100_000, MAX_TLS_CALLBACK_RECORDS)] {
+        let bytes = pe_with_tls_callbacks(callbacks);
+        let pe = goblin_safe::parse_pe(&bytes).outcome.ok().expect("parses");
+        let (mut values, mut metrics) = (Values::new(), Metrics::new());
+        tls_callbacks(&pe, &mut values, &mut metrics);
+        assert_eq!(metrics.get("pe.tls_callback_count"), Some(callbacks as f64));
+        let recorded = values.get("pe.tls_callbacks").and_then(JsonValue::as_array);
+        assert_eq!(recorded.map(Vec::len), Some(records));
+    }
+}

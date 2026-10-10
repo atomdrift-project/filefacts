@@ -95,6 +95,11 @@ pub(crate) enum Rejection {
     UnterminatedImportDirectory,
     /// Import lookup tables too long to walk within budget.
     OversizedImportLookupTables,
+    /// Import names, summed over every lookup entry, past budget.
+    OversizedImportNames,
+    /// Export and forwarder names, summed over every name pointer, past
+    /// budget.
+    OversizedExportNames,
     /// An export-trie edge back to a node already visited.
     ExportTrieLoop {
         node: usize,
@@ -138,6 +143,12 @@ impl fmt::Display for Rejection {
                 f,
                 "import lookup tables exceed {MAX_IMPORT_LOOKUP_ENTRIES} entries"
             ),
+            Self::OversizedImportNames => {
+                write!(f, "import names exceed {MAX_SYMBOL_NAME_BYTES} bytes")
+            }
+            Self::OversizedExportNames => {
+                write!(f, "export names exceed {MAX_SYMBOL_NAME_BYTES} bytes")
+            }
             Self::ExportTrieLoop { node, start, end } => write!(
                 f,
                 "export trie loops back to node {node:#x} (trie {start:#x}..{end:#x})"
@@ -346,6 +357,25 @@ const MAX_IMPORT_DESCRIPTORS: usize = 256;
 /// the descriptor cap alone does not bound the product.
 const MAX_IMPORT_LOOKUP_ENTRIES: usize = 256 * 1024;
 
+/// Name bytes goblin may be asked to read across one import or export table.
+///
+/// goblin reads each lookup entry's or name pointer's string afresh, scanning
+/// to its NUL, and filefacts then copies each into its symbol view. Neither
+/// the entry budget nor the file size bounds that product: a quarter-million
+/// entries may all point at one name a megabyte long, a quarter of a terabyte
+/// to scan and to copy from a file of a few megabytes. Real tables total well
+/// under a megabyte of names, the largest C++ export tables a few.
+const MAX_SYMBOL_NAME_BYTES: usize = 32 * 1024 * 1024;
+
+/// Bytes before the NUL ending the string at `offset`, or `None` once they
+/// pass `budget`. A string running to the end of `data` counts to its end.
+fn name_len(data: &[u8], offset: usize, budget: usize) -> Option<usize> {
+    let tail = data.get(offset..).unwrap_or_default();
+    let window = tail.get(..budget.saturating_add(1)).unwrap_or(tail);
+    let len = memchr::memchr(0, window).unwrap_or(window.len());
+    (len <= budget).then_some(len)
+}
+
 /// Decide whether goblin's import walk over `data` is bounded, in either
 /// parse mode.
 ///
@@ -367,7 +397,8 @@ const MAX_IMPORT_LOOKUP_ENTRIES: usize = 256 * 1024;
 /// `find_offset` so the traversal agrees with the one being budgeted, but
 /// without the allocation, name parsing, or logging that makes goblin's
 /// version orders of magnitude more expensive per entry. It reads at most
-/// `MAX_IMPORT_LOOKUP_ENTRIES` entries before giving its answer.
+/// `MAX_IMPORT_LOOKUP_ENTRIES` entries, and [`MAX_SYMBOL_NAME_BYTES`] of the
+/// hint/name strings they point at, before giving its answer.
 ///
 /// Fails open: anything it cannot resolve counts as within budget, so a PE
 /// shape this pre-walk does not model keeps exactly today's behaviour.
@@ -403,6 +434,7 @@ fn import_walk_budget(
 
     let mut descriptors = 0usize;
     let mut entries = 0usize;
+    let mut name_bytes = 0usize;
     while offset + SIZEOF_IMPORT_DIRECTORY_ENTRY <= data.len() {
         // Field layout of `ImportDirectoryEntry`, little-endian: lookup-table
         // RVA, timestamp, forwarder chain, name RVA, address-table RVA.
@@ -431,6 +463,21 @@ fn import_walk_budget(
                 entries += 1;
                 if entries > MAX_IMPORT_LOOKUP_ENTRIES {
                     return Err(Rejection::OversizedImportLookupTables);
+                }
+                // A clear top bit names a hint/name entry, whose string goblin
+                // reads past the two-byte hint (`Bitfield::to_rva`).
+                let value = entry
+                    .iter()
+                    .rev()
+                    .fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
+                let by_ordinal = value >> (entry_size * 8 - 1) != 0;
+                if !by_ordinal && let Some(at) = resolve(crate::bytes::sat_u32(value & 0x7fff_ffff))
+                {
+                    let left = MAX_SYMBOL_NAME_BYTES - name_bytes;
+                    let Some(len) = name_len(data, at.saturating_add(2), left) else {
+                        return Err(Rejection::OversizedImportNames);
+                    };
+                    name_bytes += len;
                 }
                 cursor += entry_size;
             }
@@ -461,6 +508,125 @@ fn import_walk_budget_from_headers(data: &[u8]) -> Result<(), Rejection> {
         return Ok(());
     };
     import_walk_budget(data, &sections, &optional_header)
+}
+
+/// Decide whether goblin's export walk over `data` reads a bounded number of
+/// name bytes.
+///
+/// `Export::parse_with_opts` reads, for every entry of the export name
+/// pointer table, the name it points at and, when the entry's address falls
+/// inside the export directory, the forwarder string there — each scanned to
+/// its NUL from scratch. The table may hold a quarter of the file's size in
+/// entries and every one may point at the same long string, which makes the
+/// walk quadratic in the file size and the symbols filefacts copies out of it
+/// quadratic in memory. goblin offers no switch for exports, so this replays
+/// the walk with goblin's own `find_offset`, summing the string lengths, and
+/// stops once they pass [`MAX_SYMBOL_NAME_BYTES`].
+///
+/// Fails open like [`import_walk_budget`]: a table goblin would itself reject
+/// or cannot resolve counts as within budget.
+fn export_walk_budget(
+    data: &[u8],
+    sections: &[goblin::pe::section_table::SectionTable],
+    optional_header: &goblin::pe::optional_header::OptionalHeader,
+) -> Result<(), Rejection> {
+    use goblin::pe::options::ParseOptions;
+
+    let Some(export_table) = optional_header.data_directories.get_export_table() else {
+        return Ok(());
+    };
+    let file_alignment = optional_header.windows_fields.file_alignment;
+    let opts = ParseOptions::default().with_parse_mode(goblin::options::ParseMode::Permissive);
+    let resolve =
+        |rva: u32| goblin::pe::utils::find_offset(rva as usize, sections, file_alignment, &opts);
+
+    // IMAGE_EXPORT_DIRECTORY: AddressTableEntries at 20, NumberOfNamePointers
+    // at 24, then the address, name-pointer and ordinal table RVAs.
+    let Some(directory) = resolve(export_table.virtual_address) else {
+        return Ok(());
+    };
+    let field = |at: usize| u32_le(data, directory.saturating_add(at));
+    let (Some(address_entries), Some(name_pointers), Some(eat), Some(names), Some(ordinals)) =
+        (field(20), field(24), field(28), field(32), field(36))
+    else {
+        return Ok(());
+    };
+    // goblin refuses either count past the file length outright.
+    let (address_entries, name_pointers) = (
+        crate::bytes::sat_usize(address_entries),
+        crate::bytes::sat_usize(name_pointers),
+    );
+    if address_entries > data.len() || name_pointers > data.len() {
+        return Ok(());
+    }
+    // Without a name-pointer table goblin synthesizes no exports at all.
+    let Some(names) = resolve(names) else {
+        return Ok(());
+    };
+    let (eat, ordinals) = (resolve(eat), resolve(ordinals));
+    let forwarders = u64::from(export_table.virtual_address)
+        ..u64::from(export_table.virtual_address) + u64::from(export_table.size);
+
+    let mut name_bytes = 0usize;
+    let mut count = |at: Option<usize>| -> Result<(), Rejection> {
+        let Some(at) = at else {
+            return Ok(());
+        };
+        let left = MAX_SYMBOL_NAME_BYTES - name_bytes;
+        name_bytes += name_len(data, at, left).ok_or(Rejection::OversizedExportNames)?;
+        Ok(())
+    };
+    for idx in 0..name_pointers {
+        // goblin stops reading each table at the first entry past the file.
+        let Some(pointer) = u32_le(data, names.saturating_add(idx.saturating_mul(4))) else {
+            break;
+        };
+        count(resolve(pointer))?;
+        let forwarder = ordinals
+            .and_then(|table| u16_le(data, table.saturating_add(idx.saturating_mul(2))))
+            .map(usize::from)
+            .filter(|&ordinal| ordinal < address_entries)
+            .zip(eat)
+            .and_then(|(ordinal, table)| u32_le(data, table.saturating_add(ordinal * 4)))
+            .filter(|&rva| forwarders.contains(&u64::from(rva)));
+        count(forwarder.and_then(resolve))?;
+    }
+    Ok(())
+}
+
+/// A copy of `data` with the export data directory cleared, when goblin's
+/// export walk would exceed [`export_walk_budget`]; `None` otherwise, so the
+/// common path never copies. Clearing the slot is the only way to keep goblin
+/// off the table while it parses everything else: the caller then reports the
+/// rejection, and keeps reading the untouched bytes for everything goblin
+/// does not parse.
+pub(crate) fn neutralize_oversized_export_directory(data: &[u8]) -> Option<(Vec<u8>, Rejection)> {
+    use goblin::pe::header::{SIZEOF_COFF_HEADER, SIZEOF_PE_MAGIC};
+    let GoblinOutcome::Ok(header) = parse_pe_header(data) else {
+        return None;
+    };
+    let optional_header = header.optional_header?;
+    let optional_offset = (header.dos_header.pe_pointer as usize)
+        .saturating_add(SIZEOF_PE_MAGIC + SIZEOF_COFF_HEADER);
+    let mut offset =
+        optional_offset.saturating_add(usize::from(header.coff_header.size_of_optional_header));
+    let GoblinOutcome::Ok(sections) = catch(|| header.coff_header.sections(data, &mut offset))
+    else {
+        return None;
+    };
+    let reason = export_walk_budget(data, &sections, &optional_header).err()?;
+    // The data-directory array opens the optional header's tail; the export
+    // directory is its first slot.
+    let slot = optional_offset.saturating_add(
+        if optional_header.standard_fields.magic == goblin::pe::optional_header::MAGIC_64 {
+            112
+        } else {
+            96
+        },
+    );
+    let mut patched = data.to_vec();
+    patched.get_mut(slot..slot.saturating_add(8))?.fill(0);
+    Some((patched, reason))
 }
 
 /// Detect a Rich header that goblin's parser would treat as a fatal

@@ -143,8 +143,14 @@ pub(super) fn extract(
             return Ok(());
         }
     };
-    for entry in &main_entries {
-        apply_main_tag(entry, main_data, values, metrics);
+    // RPM permits one entry per tag. A header that repeats one is read once,
+    // from its last entry: up to a million repeats of a tag pointing into a
+    // 16 MiB data store with no terminator otherwise each rescanned it.
+    let mut applied = std::collections::HashSet::new();
+    for entry in main_entries.iter().rev() {
+        if applied.insert(entry.tag) {
+            apply_main_tag(entry, main_data, values, metrics);
+        }
     }
     extract_scriptlets(&main_entries, main_data, values)
 }

@@ -611,3 +611,45 @@ fn an_ooxml_project_that_does_not_open_is_recorded() {
     );
     assert!(values.get("office.vba").is_none());
 }
+
+/// Every module may name the same small stream of copy tokens, each
+/// decompressing it to just under the per-module cap: 256 of them made
+/// 2.5 GiB of source. The modules share one project budget, and those past
+/// it are a coverage limit.
+#[test]
+fn modules_share_one_decompression_budget() {
+    let chunks = MAX_DECOMPRESSED_SIZE / 4098;
+    let mut source = vec![0x01u8];
+    for _ in 0..chunks {
+        source.extend_from_slice(&(0x8000u16 | 0x3000 | 2).to_le_bytes());
+        source.push(0x01);
+        source.extend_from_slice(&0x0FFFu16.to_le_bytes());
+    }
+    let rec = |d: &mut Vec<u8>, id: u16, body: &[u8]| {
+        d.extend_from_slice(&id.to_le_bytes());
+        d.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        d.extend_from_slice(body);
+    };
+    let modules = 8;
+    let mut dir = Vec::new();
+    dir.extend_from_slice(&0x000Fu16.to_le_bytes());
+    dir.extend_from_slice(&2u32.to_le_bytes());
+    dir.extend_from_slice(&(modules as u16).to_le_bytes());
+    for i in 0..modules {
+        rec(&mut dir, 0x0019, format!("M{i}").as_bytes());
+        rec(&mut dir, 0x001A, b"Big");
+        rec(&mut dir, 0x0031, &0u32.to_le_bytes());
+        rec(&mut dir, 0x002B, &[]);
+    }
+    let bytes = compound_file(&[("/VBA/dir", ovba_store(&dir)), ("/VBA/Big", source)]);
+    let (values, errors) = run_ole(&bytes);
+    assert!(errors.is_empty(), "{errors:?}");
+    let read = MAX_PROJECT_SOURCE / (chunks * 4098);
+    assert_eq!(module_names(&values).len(), read);
+    let limits = values
+        .get("office.limits")
+        .and_then(JsonValue::as_array)
+        .unwrap();
+    assert_eq!(limits.len(), modules - read, "{limits:?}");
+    assert!(limits.iter().all(|l| l["stage"] == "vba-decompress-cap"));
+}

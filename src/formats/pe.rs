@@ -54,6 +54,16 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) -> Result<(), Er
     // extractor) keep reading the untouched `bytes`.
     let rich_sanitized = goblin_safe::neutralize_malformed_rich_header(bytes);
     let pe_bytes: &[u8] = rich_sanitized.as_deref().unwrap_or(bytes);
+    // goblin cannot be told to skip exports, so an export table whose names
+    // would cost it a quadratic walk (and filefacts a quadratic copy) is kept
+    // from it the same way: on a copy with the export directory cleared. The
+    // rejection lands in the errors view, so an empty export view reads as a
+    // forged table rather than as a binary that exports nothing.
+    let exportless = goblin_safe::neutralize_oversized_export_directory(pe_bytes);
+    let pe_bytes: &[u8] = exportless.as_ref().map_or(pe_bytes, |(patched, _)| patched);
+    if let Some((_, reason)) = &exportless {
+        errors_out.record_malformed(crate::Stage::PeParse, reason.to_string());
+    }
 
     // Try the full goblin parse first — it gives us imports, exports,
     // resources, and the section table in one go. If it fails
@@ -594,50 +604,19 @@ fn recover_api_hash_requests(
         return;
     }
     let ranges = recovery.function_ranges();
-    let resolver_targets: Vec<u64> = ranges
-        .iter()
-        .filter(|(start, size)| {
-            walk_sites
-                .iter()
-                .any(|site| va_in_function(*site, *start, *size))
-        })
-        .map(|(start, _)| *start)
-        .collect();
-    if resolver_targets.is_empty() {
+    let profiles = located_hash_profiles(values);
+    let call_edges = recovery.direct_call_edges();
+    let resolved = resolver_calls(&ranges, &call_edges, walk_sites, &profiles);
+    if resolved.is_empty() {
         return;
     }
 
-    let profiles = located_hash_profiles(values);
-    let call_edges = recovery.direct_call_edges();
     let mut requests = Vec::new();
+    let mut request_count = 0_usize;
     let mut name_matches = 0_u32;
     let mut folded = 0_u32;
-    for (caller_va, callsite_va, resolver_va) in &call_edges {
-        if !resolver_targets.contains(resolver_va) {
-            continue;
-        }
-        let resolver_range = ranges.iter().find(|(start, _)| start == resolver_va);
-        let profile = resolver_range
-            .and_then(|(start, size)| {
-                profiles
-                    .iter()
-                    .find(|profile| va_in_function(profile.va, *start, *size))
-            })
-            .or_else(|| {
-                call_edges
-                    .iter()
-                    .filter(|(caller, _, _)| caller == resolver_va)
-                    .find_map(|(_, _, target)| {
-                        let (start, size) = ranges.iter().find(|(start, _)| start == target)?;
-                        profiles
-                            .iter()
-                            .find(|profile| va_in_function(profile.va, *start, *size))
-                    })
-            });
-        let Some(profile) = profile else {
-            continue;
-        };
-        let request = recover_x86_hash_argument(pe, bytes, *callsite_va);
+    for (caller_va, callsite_va, resolver_va, profile) in resolved {
+        let request = recover_x86_hash_argument(pe, bytes, callsite_va);
         let JsonValue::Object(mut fact) = serde_json::json!({
             "kind": "hashed_pe_export_resolution",
             "architecture": "x86",
@@ -649,7 +628,7 @@ fn recover_api_hash_requests(
         }) else {
             continue;
         };
-        if let Some(callsite_file_offset) = va_to_file_offset(pe, *callsite_va) {
+        if let Some(callsite_file_offset) = va_to_file_offset(pe, callsite_va) {
             fact.insert(
                 "callsite_file_offset".into(),
                 serde_json::json!(callsite_file_offset),
@@ -693,14 +672,21 @@ fn recover_api_hash_requests(
                 );
             }
         }
-        requests.push(JsonValue::Object(fact));
+        // As for the native sites: the counts are exact, the records capped.
+        request_count += 1;
+        if requests.len() < MAX_NATIVE_SITES {
+            requests.push(JsonValue::Object(fact));
+        }
     }
-    if requests.is_empty() {
+    if request_count == 0 {
         return;
+    }
+    if request_count > requests.len() {
+        metrics.insert(metric!("pe.native_resolver_sites_capped"), 1.0);
     }
     metrics.insert(
         metric!("pe.api_hash_resolver_request_count"),
-        requests.len() as f64,
+        request_count as f64,
     );
     if folded > 0 {
         metrics.insert(
@@ -718,6 +704,69 @@ fn recover_api_hash_requests(
         value_key!("pe.api_hash_resolver_requests"),
         JsonValue::Array(requests),
     );
+}
+
+/// The direct calls into a resolver, `(caller, callsite, resolver)` in edge
+/// order, each paired with the hash profile the resolver uses.
+///
+/// A resolver is a function holding a checked export walk (`walk_sites`). Its
+/// profile is the lowest-addressed one inside it or, failing that, inside the
+/// first function it calls that holds one. Everything is indexed up front, so
+/// the cost is the edge count times a logarithm: rizin may report a million
+/// call edges for a few megabytes of `call` instructions, and searching the
+/// edges again for every edge into a profile-less resolver did not finish.
+fn resolver_calls<'p>(
+    ranges: &[(u64, u64)],
+    call_edges: &[(u64, u64, u64)],
+    mut walk_sites: Vec<u64>,
+    profiles: &'p [LocatedHashProfile],
+) -> Vec<(u64, u64, u64, &'p LocatedHashProfile)> {
+    use std::collections::HashMap;
+
+    // The first range reported for each entry address, as a linear `find`
+    // over `ranges` would pick.
+    let mut size_of: HashMap<u64, u64> = HashMap::with_capacity(ranges.len());
+    for &(start, size) in ranges {
+        size_of.entry(start).or_insert(size);
+    }
+    walk_sites.sort_unstable();
+    let mut by_va: Vec<&LocatedHashProfile> = profiles.iter().collect();
+    by_va.sort_by_key(|profile| profile.va);
+    // Sorted addresses put the lowest one at or past `start` first; if it is
+    // not inside the function, none after it is.
+    let first_in = |start: u64| -> Option<&'p LocatedHashProfile> {
+        let size = *size_of.get(&start)?;
+        let at = by_va.partition_point(|profile| profile.va < start);
+        by_va
+            .get(at)
+            .copied()
+            .filter(|profile| va_in_function(profile.va, start, size))
+    };
+
+    let mut resolvers: HashMap<u64, Option<&'p LocatedHashProfile>> = ranges
+        .iter()
+        .filter(|&&(start, size)| {
+            let at = walk_sites.partition_point(|&site| site < start);
+            walk_sites
+                .get(at)
+                .is_some_and(|&site| va_in_function(site, start, size))
+        })
+        .map(|&(start, _)| (start, first_in(start)))
+        .collect();
+    // A resolver without a hash loop of its own delegates to a helper: the
+    // first callee, in edge order, that has one.
+    for &(caller, _, target) in call_edges {
+        if let Some(slot @ None) = resolvers.get_mut(&caller) {
+            *slot = first_in(target);
+        }
+    }
+    call_edges
+        .iter()
+        .filter_map(|&(caller, callsite, resolver)| {
+            let profile = (*resolvers.get(&resolver)?)?;
+            Some((caller, callsite, resolver, profile))
+        })
+        .collect()
 }
 
 fn va_in_function(va: u64, start: u64, size: u64) -> bool {
@@ -2334,7 +2383,7 @@ fn parse_clr_streams(md: &[u8]) -> Option<(Vec<String>, Option<HeapRange>)> {
     }
     let version_len = rd_u32(12)?;
     // Flags (u16) + Streams (u16) follow the 4-byte-padded version string.
-    let mut p = 16usize.checked_add((version_len + 3) & !3)?;
+    let mut p = 16usize.checked_add(version_len.checked_add(3)? & !3)?;
     let n_streams = u16_le(md, p + 2)?;
     p += 4;
     let mut names = Vec::new();
@@ -2453,6 +2502,13 @@ fn scan_resource_blob(
     (count, max_entropy, max_size, entropy_span, size_span)
 }
 
+/// Most TLS callbacks [`tls_callbacks`] records. goblin reads the callback
+/// array to its first null entry, so a forged array runs to the end of the
+/// file: a quarter of its size in callbacks, each a JSON object some fifty
+/// times larger than the four bytes it came from. Real images register one or
+/// two. `pe.tls_callback_count` stays exact.
+const MAX_TLS_CALLBACK_RECORDS: usize = 1024;
+
 fn tls_callbacks(pe: &PE<'_>, values: &mut Values, metrics: &mut Metrics) {
     let Some(tls) = pe.tls_data.as_ref() else {
         return;
@@ -2481,6 +2537,7 @@ fn tls_callbacks(pe: &PE<'_>, values: &mut Values, metrics: &mut Metrics) {
     let entries: Vec<JsonValue> = tls
         .callbacks
         .iter()
+        .take(MAX_TLS_CALLBACK_RECORDS)
         .map(|addr| {
             let mut node = serde_json::Map::new();
             node.insert("addr".into(), JsonValue::String(format!("0x{addr:x}")));
@@ -3133,12 +3190,18 @@ fn delay_imports(
     const DESC_SIZE: usize = 32; // IMAGE_DELAYLOAD_DESCRIPTOR is 8 DWORDs
     const MAX_DESCRIPTORS: usize = 128;
     const MAX_FUNCTIONS_PER_DLL: usize = 4096;
+    // Symbols recovered across every descriptor. The per-table caps alone
+    // multiply out to half a million symbols, each with up to 512-byte name
+    // and library strings, from descriptors that may all share one name
+    // table: half a gigabyte from a few kilobytes. Real binaries delay-load
+    // tens to hundreds of functions.
+    const MAX_DELAY_IMPORTS: u64 = 16 * 1024;
 
     let mut entries_out: Vec<JsonValue> = Vec::new();
     let mut total_imports = 0_u64;
     let mut cursor = table_off;
     let mut desc_idx = 0;
-    while desc_idx < MAX_DESCRIPTORS {
+    while desc_idx < MAX_DESCRIPTORS && total_imports < MAX_DELAY_IMPORTS {
         let Some(desc) = bytes.get(cursor..cursor.saturating_add(DESC_SIZE)) else {
             break;
         };
@@ -3178,7 +3241,8 @@ fn delay_imports(
             } else {
                 0x8000_0000
             };
-            for _ in 0..MAX_FUNCTIONS_PER_DLL {
+            let budget = MAX_DELAY_IMPORTS - total_imports;
+            for _ in 0..MAX_FUNCTIONS_PER_DLL.min(crate::bytes::sat_usize(budget)) {
                 // Keep the file offset of the INT entry before advancing.
                 // Delay imports are real symbol evidence too; dropping this
                 // offset leaves symbol matches with only the semantic
@@ -3402,16 +3466,16 @@ fn guard_flag_names(flags: u32) -> Vec<&'static str> {
     if flags & 0x0000_0800 != 0 {
         out.push("security_cookie_unused");
     }
-    if flags & 0x0001_0000 != 0 {
+    if flags & 0x0000_1000 != 0 {
         out.push("protect_delayload_iat");
     }
-    if flags & 0x0002_0000 != 0 {
+    if flags & 0x0000_2000 != 0 {
         out.push("delayload_iat_in_its_own_section");
     }
-    if flags & 0x0004_0000 != 0 {
+    if flags & 0x0000_4000 != 0 {
         out.push("export_suppression_info_present");
     }
-    if flags & 0x0008_0000 != 0 {
+    if flags & 0x0000_8000 != 0 {
         out.push("enable_export_suppression");
     }
     if flags & 0x0001_0000 != 0 {

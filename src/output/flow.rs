@@ -89,6 +89,12 @@ pub struct FlowValue {
     /// Named object fields, kept separate to prevent headers/body confusion.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub fields: BTreeMap<String, usize>,
+    /// Evaluated in module-level code — outside every function body, so it
+    /// runs when the file loads (Node's `require`, Python's `import`). `false`
+    /// means inside a function *or* not tracked: only the tree-sitter producer
+    /// records it, so a rule may require it but never infer its absence.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub module_level: bool,
 }
 
 /// A local helper's parameter and return relationships.
@@ -447,6 +453,7 @@ mod tests {
             inputs: vec![1, 2],
             receiver: None,
             fields: BTreeMap::new(),
+            module_level: false,
         };
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
@@ -471,6 +478,7 @@ mod tests {
             inputs: Vec::new(),
             receiver: None,
             fields: BTreeMap::new(),
+            module_level: false,
         };
         let node = |kind, inputs: Vec<usize>, fields: &[(&str, usize)]| FlowValue {
             kind,
@@ -480,6 +488,7 @@ mod tests {
             inputs,
             receiver: None,
             fields: fields.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+            module_level: false,
         };
         let flow = Flow {
             values: vec![

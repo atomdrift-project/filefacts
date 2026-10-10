@@ -130,6 +130,7 @@ pub(crate) use value_key;
 /// enforces that, so a key whose last writer goes away cannot stay here and
 /// keep its readers compiling against nothing.
 pub const VALUE_CATALOG: &[&str] = &[
+    "7z.limits",
     "android.allow_backup",
     "android.app_class",
     "android.app_label",
@@ -206,6 +207,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "chm.entries",
     "chm.features",
     "chm.itsf",
+    "chm.limits",
     "chm.lzx",
     "chm.system",
     "class.access_flags",
@@ -238,6 +240,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "crx.homepage",
     "crx.limits",
     "crx.public_key_sha256",
+    "crx.signature_verified",
     "crx.version",
     "deb.arch",
     "deb.dependencies",

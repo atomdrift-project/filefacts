@@ -23,7 +23,8 @@
 //! - `pe.signatures[].signed_within_validity` — the signing timestamp fell
 //!   inside the certificate's validity window. False means backdating or a
 //!   certificate issued after the fact.
-//! - `pe.signature_integrity` — the worst state across the signatures present.
+//! - `pe.signature_integrity` — the worst state across the signatures present,
+//!   nested ones included.
 //!
 //! Expiry is handled separately and deliberately does **not** feed
 //! `signature_integrity`. An expired certificate is the normal condition of old
@@ -124,7 +125,12 @@ fn expired_days(signatures: &[JsonValue], now: i64) -> Option<f64> {
     Some(((now - latest) as f64 / 86_400.0).floor())
 }
 
-/// Annotate one signature object in place; returns its integrity state.
+/// Annotate one signature object, and the signatures nested in it, in place;
+/// returns the worst integrity state among them.
+///
+/// Nested signatures are judged like the outer one. Each claims to cover the
+/// same image, so a nested signature lifted from another file is tampering
+/// even under an outer signature that matches.
 fn annotate(obj: &mut Map<String, JsonValue>, values: &Values) -> &'static str {
     if let Some(within) = signed_within_validity(obj) {
         obj.insert("signed_within_validity".into(), JsonValue::Bool(within));
@@ -138,14 +144,31 @@ fn annotate(obj: &mut Map<String, JsonValue>, values: &Values) -> &'static str {
         obj.insert("digest_matches".into(), JsonValue::Bool(m));
     }
 
-    match (obj.get("verified"), matches) {
+    let mut state = match (obj.get("verified"), matches) {
         // A digest mismatch is reported even when the blob itself verifies —
         // that combination *is* the post-signing tamper case.
         (_, Some(false)) => TAMPERED,
         (Some(JsonValue::Bool(false)), _) => INVALID,
         (Some(JsonValue::Null) | None, _) => UNVERIFIABLE,
+        // The signature names an image digest that could not be recomputed
+        // (an algorithm not hashed, or a layout `pe_image_hash` refuses). A
+        // verified blob says nothing about this file until that comparison
+        // is made, and a genuine blob grafted onto a file whose sections run
+        // past its end would otherwise read as intact.
+        (_, None) if obj.contains_key("signature_digest") => UNVERIFIABLE,
         _ => INTACT,
+    };
+    if let Some(JsonValue::Array(nested)) = obj.get_mut("nested") {
+        for sig in nested {
+            if let JsonValue::Object(inner) = sig {
+                let inner_state = annotate(inner, values);
+                if severity(inner_state) > severity(state) {
+                    state = inner_state;
+                }
+            }
+        }
     }
+    state
 }
 
 /// Compare the signature's claimed image digest with the recomputed
@@ -400,6 +423,58 @@ mod tests {
             Some(INTACT)
         );
         assert_eq!(m.get("pe.signature_expired_days").unwrap().round(), 400.0);
+    }
+
+    /// A verified blob whose claimed image digest has nothing to be compared
+    /// against — the image hash was refused, as for a genuine signature
+    /// grafted onto a file with a section running past its end — is not
+    /// intact.
+    #[test]
+    fn claimed_digest_without_a_recomputed_hash_is_unverifiable() {
+        let mut v = values_with(
+            json!({}),
+            json!([{
+                "verified": true,
+                "signature_digest_algorithm": "sha256",
+                "signature_digest": HASH,
+            }]),
+        );
+        run(&mut v);
+        assert!(v.get("pe.signatures[0].digest_matches").is_none());
+        assert_eq!(
+            v.get("pe.signature_integrity").unwrap().as_str(),
+            Some(UNVERIFIABLE)
+        );
+    }
+
+    /// A nested signature claims the same image as the outer one; one lifted
+    /// from another file is tampering even when the outer signature matches.
+    #[test]
+    fn nested_signatures_are_judged_too() {
+        let mut v = values_with(
+            json!({"sha1": "aa", "sha256": HASH}),
+            json!([{
+                "verified": true,
+                "signature_digest_algorithm": "sha256",
+                "signature_digest": HASH,
+                "nested": [{
+                    "verified": true,
+                    "signature_digest_algorithm": "sha1",
+                    "signature_digest": "bb",
+                }],
+            }]),
+        );
+        run(&mut v);
+        assert_eq!(
+            v.get("pe.signatures[0].nested[0].digest_matches")
+                .unwrap()
+                .as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            v.get("pe.signature_integrity").unwrap().as_str(),
+            Some(TAMPERED)
+        );
     }
 
     /// Whole days: two analyses of the same file a few minutes apart report

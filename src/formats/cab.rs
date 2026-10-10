@@ -183,7 +183,8 @@ fn der_total_len(der: &[u8]) -> Option<usize> {
     for i in 0..count {
         len = (len << 8) | *der.get(2 + i)? as usize;
     }
-    Some(2 + count + len)
+    // Checked: four length bytes plus the header overflow a 32-bit usize.
+    len.checked_add(2 + count)
 }
 
 /// Whether a DER blob is a PKCS#7 ContentInfo wrapping SignedData -- the
@@ -576,6 +577,12 @@ mod tests {
         // Microsoft-signed cabinet.
         assert_eq!(der_total_len(&[0x30, 0x82, 0x3d, 0x4b]), Some(0x3d4b + 4));
         assert_eq!(der_total_len(&[0x30, 0x85, 1, 1, 1, 1, 1]), None);
+        // The largest four-byte length overflows a 32-bit usize once the
+        // header is added; it reads as absent there, not as a wrapped length.
+        assert_eq!(
+            der_total_len(&[0x30, 0x84, 0xff, 0xff, 0xff, 0xff]),
+            0xffff_ffff_usize.checked_add(6)
+        );
     }
 
     #[test]

@@ -167,6 +167,25 @@ fn yaml_alias_bombs_are_rejected_quickly() {
     assert!(parse_yaml(small.as_bytes()).is_ok());
 }
 
+/// Aliases of one large scalar replay a single event each, so the event
+/// budget let a megabyte string aliased from four bytes apiece build
+/// gigabytes. Replayed scalar bytes have their own budget.
+#[test]
+fn yaml_alias_scalar_bytes_are_bounded() {
+    let big = "x".repeat(64 << 10);
+    let bomb = format!(
+        "big: &big {big}\nuses: [{}]\n",
+        vec!["*big"; 1_000].join(", ")
+    );
+    let err = parse_yaml(bomb.as_bytes()).unwrap_err().to_string();
+    assert!(err.contains("scalar bytes"), "{err}");
+    let ok = format!(
+        "big: &big {big}\nuses: [{}]\n",
+        vec!["*big"; 100].join(", ")
+    );
+    assert_eq!(yaml(&ok)["uses"].as_array().map(Vec::len), Some(100));
+}
+
 /// Nesting is capped at serde_yaml's 128 levels, in flow and block style,
 /// through aliases too, and an absurdly deep document fails fast.
 #[test]

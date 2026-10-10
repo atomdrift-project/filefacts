@@ -93,7 +93,9 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
             // follows and must not be walked.
             break;
         }
-        off = body.saturating_add(size.div_ceil(BLOCK) * BLOCK);
+        // Saturating: an eleven-digit octal size rounds up past `usize::MAX`
+        // on 32-bit targets.
+        off = body.saturating_add(size.div_ceil(BLOCK).saturating_mul(BLOCK));
     }
 
     if !signing_keys.is_empty() {
@@ -273,6 +275,23 @@ mod tests {
         );
         // pkgname != origin, so this is a subpackage of another build.
         assert_eq!(metrics.get("apk.subpackage"), Some(1.0));
+    }
+
+    /// The largest size a tar header can spell ends the walk instead of
+    /// overflowing the block rounding.
+    #[test]
+    fn a_maximal_member_size_ends_the_walk() {
+        let mut block = vec![0_u8; BLOCK];
+        block[..9].copy_from_slice(b".SIGN.key");
+        block[124..136].copy_from_slice(b"77777777777\0");
+        block.extend_from_slice(&[0_u8; 2 * BLOCK]);
+        let mut e = GzEncoder::new(Vec::new(), Compression::fast());
+        e.write_all(&block).unwrap();
+        let mut values = Values::default();
+        let mut metrics = Metrics::default();
+        extract(&e.finish().unwrap(), &mut values, &mut metrics);
+        assert_eq!(metrics.get("apk.signed"), Some(1.0));
+        assert!(values.get("apk.name").is_none());
     }
 
     #[test]

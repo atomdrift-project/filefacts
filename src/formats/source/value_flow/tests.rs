@@ -552,3 +552,48 @@ fn branch_merges_see_globals_changed_in_one_branch() {
     assert!(reaches(&flow, "send", "acquire"));
     assert!(reaches(&flow, "send", "other"));
 }
+
+#[test]
+fn branches_and_blocks_do_not_copy_every_binding() {
+    // Each `if` branch started from a copy of every binding in scope, and
+    // each block saved one to restore its declarations: 5k module bindings
+    // then 5k `if`s took 90 s.
+    let bindings: String = (0..2_000)
+        .map(|i| format!("var v{i} = acquire();\n"))
+        .collect();
+    let source = format!(
+        "{bindings}{}if (c) {{ x = other(); }} else {{ if (d) {{ x = third(); }} }}\nsend(v0);\nsink(x);\n",
+        "if (c) { let v0 = shadow(); }\n".repeat(2_000)
+    );
+    let file = crate::OpenOptions::new()
+        .path(std::path::Path::new("a.js"))
+        .open(source.as_bytes());
+    file.metrics();
+    let started = std::time::Instant::now();
+    let flow = file.flow().unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert!(!flow.limitations.contains("analysis-budget"));
+    assert!(reaches(flow, "send", "acquire"));
+    assert!(!reaches(flow, "send", "shadow"));
+    assert!(reaches(flow, "sink", "other"));
+    assert!(reaches(flow, "sink", "third"));
+}
+#[test]
+fn calls_record_whether_they_run_at_load_time() {
+    let flow = graph(
+        "a.js",
+        "const cp = require('child_process');\n\
+         if (ready) { cp.execSync('id'); }\n\
+         function later() { cp.spawnSync('ls'); }\n",
+    );
+    let module_level = |target: &str| {
+        flow.values
+            .iter()
+            .find(|v| v.target.as_deref() == Some(target))
+            .map(|v| v.module_level)
+    };
+    assert_eq!(module_level("require"), Some(true));
+    // Inside a block, but still load-time code.
+    assert_eq!(module_level("cp.execSync"), Some(true));
+    assert_eq!(module_level("cp.spawnSync"), Some(false));
+}

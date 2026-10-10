@@ -304,6 +304,12 @@ fn fat_binary(
 ) -> Option<u64> {
     let mut slices: Vec<JsonValue> = Vec::new();
     let mut image_end: Option<u64> = None;
+    // Slices of a real universal binary are disjoint. Each slice gets a full
+    // analysis (code-page hashing, plists, symbols), and nothing else stops
+    // every arch entry naming the same whole-file slice, multiplying that
+    // work by `MAX_FAT_ARCHES`; a slice overlapping one already analysed is
+    // skipped, so together they cost one pass over the file.
+    let mut analysed: Vec<std::ops::Range<usize>> = Vec::new();
     for (idx, arch) in arches.iter().enumerate() {
         // `arch.offset` and `arch.size` come from the fat header — on
         // a misclassified CAFEBABE input (Java `.class` mistaken for
@@ -319,6 +325,14 @@ fn fat_binary(
         let Some(slice_bytes) = bytes.get(start..end) else {
             continue;
         };
+        if analysed.iter().any(|r| r.start < end && start < r.end) {
+            errors_out.record_malformed(
+                crate::Stage::MachoParse,
+                format!("fat slice {idx} overlaps the slices before it"),
+            );
+            continue;
+        }
+        analysed.push(start..end);
         // An unparseable slice is skipped; a panicking one is also recorded,
         // as a panic on the container itself would be.
         let macho = match goblin_safe::parse_macho_slice(slice_bytes) {
@@ -468,7 +482,7 @@ fn analyze_slice(macho: &MachO<'_>, slice_bytes: &[u8]) -> JsonValue {
         &mut throwaway_symbols,
         &mut Errors::new(),
     );
-    super::macho_hashes::emit(macho, &mut slice_values, &throwaway_symbols);
+    super::macho_hashes::emit(macho, slice_bytes, &mut slice_values, &throwaway_symbols);
 
     let import_count = throwaway_symbols.iter_kind(SymbolKind::Import).count() as u64;
     let export_count = throwaway_symbols.iter_kind(SymbolKind::Export).count() as u64;
@@ -516,7 +530,7 @@ fn single_arch(
     extract_sections(macho, bytes, metrics, sections_out);
     extract_header_and_loads(macho, bytes, values, metrics);
     extract_symbols(macho, bytes, symbols_out, errors_out);
-    super::macho_hashes::emit(macho, values, symbols_out);
+    super::macho_hashes::emit(macho, bytes, values, symbols_out);
     super::build_toolchain::from_macho(values, sections_out);
 }
 
@@ -541,7 +555,7 @@ fn extract_symbols(
     // imports point into `.dynstr`, and the hex/context view expects to
     // render the name's ASCII. Anchoring imports at the name string keeps
     // Mach-O consistent with ELF and makes the annotated bytes readable.
-    let name_offsets = import_name_offsets(macho);
+    let name_offsets = import_name_offsets(macho, bytes);
 
     // Imports — dylib stems are normalised to the bare library name
     // (lowercased, basename only, `.dylib`/`.tbd` suffix stripped) so
@@ -669,7 +683,10 @@ fn extract_symbols(
 /// we only need the absolute `stroff` from the symtab load command to turn
 /// the relative `n_strx` into a file offset. Returns an empty map when the
 /// binary is stripped (no `LC_SYMTAB`) — callers fall back to the bind slot.
-fn import_name_offsets<'a>(macho: &MachO<'a>) -> std::collections::HashMap<&'a str, u64> {
+fn import_name_offsets<'a>(
+    macho: &MachO<'a>,
+    bytes: &[u8],
+) -> std::collections::HashMap<&'a str, u64> {
     const N_EXT: u8 = 0x01;
     const N_TYPE_MASK: u8 = 0x0e;
     const N_UNDF: u8 = 0x00;
@@ -684,7 +701,9 @@ fn import_name_offsets<'a>(macho: &MachO<'a>) -> std::collections::HashMap<&'a s
 
     // goblin resolves each name through a file-controlled `n_strx` as the
     // walk advances; an unwalkable table leaves only the bind-slot offsets.
-    let symbols = goblin_safe::drain(macho.symbols()).ok().unwrap_or_default();
+    let symbols = goblin_safe::drain(symtab_symbols(macho, bytes))
+        .ok()
+        .unwrap_or_default();
     for sym in symbols {
         let Ok((name, nlist)) = sym else { continue };
         // External + undefined == imported symbol; `n_strx == 0` has no name.
@@ -701,6 +720,32 @@ fn import_name_offsets<'a>(macho: &MachO<'a>) -> std::collections::HashMap<&'a s
             .or_insert_with(|| stroff + nlist.n_strx as u64);
     }
     offsets
+}
+
+/// The `LC_SYMTAB` entries whose `nlist` lies inside `bytes`, the buffer
+/// `macho` was parsed from.
+///
+/// goblin walks the header's `nsyms` (up to `u32::MAX`) without checking it
+/// against the file and yields an error for every entry past the end, so a
+/// forged count costs four billion steps, and collecting the walk aborts on
+/// the allocation. No entry past the end can parse, so stopping there loses
+/// nothing.
+pub(super) fn symtab_symbols<'a>(
+    macho: &MachO<'a>,
+    bytes: &[u8],
+) -> std::iter::Take<mach::symbols::SymbolIterator<'a>> {
+    let nlist_size = if macho.is_64 { 16 } else { 12 };
+    let fitting = macho
+        .load_commands
+        .iter()
+        .find_map(|lc| match lc.command {
+            mach::load_command::CommandVariant::Symtab(st) => {
+                Some(bytes.len().saturating_sub(bytes::sat_usize(st.symoff)) / nlist_size)
+            }
+            _ => None,
+        })
+        .unwrap_or(0);
+    macho.symbols().take(fitting)
 }
 
 /// Symbol-variant markers Darwin appends to a libc name after a `$`. Each
@@ -763,6 +808,11 @@ fn extract_sections(
     _metrics: &mut Metrics,
     sections_out: &mut Vec<Section>,
 ) {
+    // Bytes left to measure entropy over. A real image's sections are
+    // disjoint, so measuring each costs one pass over the file; section
+    // headers are 80 bytes apiece and may all claim the whole file, which
+    // would cost sections × file size. Sections past the budget go unmeasured.
+    let mut unmeasured = bytes.len();
     for segment in &macho.segments {
         let segment_name = segment.name().unwrap_or("").to_owned();
         let flags = macho_segment_flags(segment.initprot);
@@ -789,7 +839,17 @@ fn extract_sections(
                 u64::from(section.offset)
             };
             let file_size = if zero_filled { 0 } else { section.size };
-            let entropy = (file_size > 0).then(|| section_entropy(bytes, file_offset, file_size));
+            let in_file = bytes
+                .len()
+                .saturating_sub(bytes::sat_usize(file_offset))
+                .min(bytes::sat_usize(file_size));
+            let entropy = match unmeasured.checked_sub(in_file) {
+                Some(left) if file_size > 0 => {
+                    unmeasured = left;
+                    Some(section_entropy(bytes, file_offset, file_size))
+                }
+                _ => None,
+            };
             // __TEXT also holds constants and unwind metadata. Segment execute
             // permission must not make those bytes count as instruction code.
             let contains_instructions = section.flags
@@ -1391,7 +1451,7 @@ fn linker_options(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
         };
         let mut taken = 0;
         for chunk in body.split(|&b| b == 0) {
-            if taken >= count {
+            if taken >= count || all.len() >= MAX_LINKER_OPTIONS {
                 break;
             }
             if chunk.is_empty() {
@@ -1407,6 +1467,12 @@ fn linker_options(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
         values.insert_key(value_key!("macho.linker_options"), JsonValue::Array(all));
     }
 }
+
+/// Strings kept across every `LC_LINKER_OPTION`. Real binaries carry a few
+/// dozen (`-framework`, `-l`); each one-byte string becomes a JSON value
+/// dozens of times its size, so the load-command area alone could
+/// otherwise expand to gigabytes.
+const MAX_LINKER_OPTIONS: usize = 4096;
 
 /// `__OBJC,__image_info` / `__DATA,__objc_imageinfo` — 8-byte
 /// section: `(version: u32, flags: u32)`. The Swift ABI version
@@ -1623,8 +1689,13 @@ fn build_version(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
     if bv.ntools > 0 {
         let header_size = 24_usize;
         let tools_start = lc_offset.saturating_add(header_size);
-        let entries_bytes = (bv.ntools as usize).saturating_mul(8);
-        let tools_end = tools_start.saturating_add(entries_bytes).min(bytes.len());
+        // The tools array lives inside the command; `ntools` is the file's
+        // claim and must not walk past `cmdsize` into the rest of the image.
+        let entries_bytes = bytes::sat_usize(bv.ntools.min(MAX_BUILD_TOOLS)).saturating_mul(8);
+        let tools_end = tools_start
+            .saturating_add(entries_bytes)
+            .min(lc_offset.saturating_add(bytes::sat_usize(bv.cmdsize)))
+            .min(bytes.len());
         if tools_start + 8 <= tools_end {
             let read_u32 = u32_reader(macho);
             let tools: Vec<JsonValue> = bytes
@@ -1655,6 +1726,12 @@ fn build_version(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
     }
     values.insert_key(value_key!("macho.build_version"), JsonValue::Object(obj));
 }
+
+/// `BuildToolVersion` entries read from `LC_BUILD_VERSION`. Real binaries
+/// name a handful of tools (clang, ld, swift); each entry becomes a JSON
+/// object many times its 8 bytes, so a forged `ntools` over a huge command
+/// would otherwise turn the file into gigabytes of output.
+const MAX_BUILD_TOOLS: u32 = 64;
 
 /// The `crate::bytes` reader for a `u32` in `macho`'s byte order.
 fn u32_reader(macho: &MachO<'_>) -> fn(&[u8], usize) -> Option<u32> {

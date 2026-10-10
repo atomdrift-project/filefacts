@@ -397,6 +397,15 @@ fn volume_facts(
 /// inflate it 300,000 times.
 const MAX_PREFIX_INFLATE: usize = 4 * MAX_VOL_PREFIX;
 
+/// Bytes [`reconstruct_prefix`] handles across every chunk: what `raw`
+/// chunks copy, what `zero` chunks fill and what `zlib` chunks consume. The
+/// inflate budget alone does not bound the work: a chunk whose stream
+/// inflates to nothing (a run of empty deflate blocks) still consumes its
+/// whole source, and chunks that rewrite the same sectors while one stays
+/// unwritten each handle up to the window. Hundreds of thousands of such
+/// descriptors multiplied the image size by the descriptor count.
+const MAX_PREFIX_WORK: usize = 4 * MAX_VOL_PREFIX;
+
 /// Decompress the leading `max` bytes of a partition using only the codecs
 /// filefacts carries (`raw`, `zero`, `zlib`). Returns `None` the moment a
 /// chunk inside the window needs a codec we don't have — the volume header
@@ -422,9 +431,10 @@ fn reconstruct_prefix_counted(
     let mut written = vec![false; max.div_ceil(sector)];
     let mut pending = written.len();
     let mut inflate_budget = MAX_PREFIX_INFLATE;
+    let mut work_budget = MAX_PREFIX_WORK;
     let fork_base = koly.data_fork_offset.saturating_add(part.data_offset);
     for c in &part.chunks {
-        if pending == 0 {
+        if pending == 0 || work_budget == 0 {
             break;
         }
         let Some(out_off) = c
@@ -440,13 +450,19 @@ fn reconstruct_prefix_counted(
             .min(max - out_off);
         let codec = codec_name(c.entry_type);
         let n = match codec {
-            "zero" | "ignore" => want, // already zero-filled
+            "zero" | "ignore" => {
+                // Already zero-filled; only the sectors are marked.
+                let n = want.min(work_budget);
+                work_budget -= n;
+                n
+            }
             "comment" | "last" => continue,
             "raw" => {
                 let Some(src) = chunk_source(bytes, fork_base, c) else {
                     continue;
                 };
-                let src = src.get(..want).unwrap_or(src);
+                let src = src.get(..want.min(work_budget)).unwrap_or(src);
+                work_budget -= src.len();
                 fill(&mut buf, out_off, src);
                 src.len()
             }
@@ -457,12 +473,18 @@ fn reconstruct_prefix_counted(
                 let Some(src) = chunk_source(bytes, fork_base, c) else {
                     continue;
                 };
+                let src = src.get(..work_budget).unwrap_or(src);
                 let mut out = Vec::new();
                 // A truncated or corrupt stream keeps what decoded before
                 // the damage; `read_to_end` leaves it in `out`.
-                let _ = flate2::read::ZlibDecoder::new(src)
+                let mut zlib = flate2::read::ZlibDecoder::new(src);
+                let _ = (&mut zlib)
                     .take(want.min(inflate_budget) as u64)
                     .read_to_end(&mut out);
+                // Charged at least a sector: setting up an inflater costs
+                // that much even for a stream that consumes nothing.
+                let consumed = usize::try_from(zlib.total_in()).unwrap_or(usize::MAX);
+                work_budget = work_budget.saturating_sub(consumed.max(sector));
                 inflate_budget -= out.len();
                 fill(&mut buf, out_off, &out);
                 out.len()
@@ -960,6 +982,63 @@ mod tests {
         let (buf, _) =
             reconstruct_prefix_counted(&blob, &koly_at_zero(), &part, 2 * SECTOR as usize).unwrap();
         assert!(buf[..SECTOR as usize].iter().all(|&b| b == 0xCD));
+    }
+
+    /// Descriptors that each re-handle the window while one sector stays
+    /// unwritten no longer multiply the work by the descriptor count: zlib
+    /// streams that inflate to nothing still consume their source, and raw
+    /// or zero runs rewrite sectors already written. The walk stops at the
+    /// work budget, before a last chunk that would finish the window.
+    #[test]
+    fn chunks_that_never_finish_the_window_share_one_work_budget() {
+        // A zlib stream of empty stored blocks: 64 KiB consumed, nothing out.
+        let mut bytes = vec![0x78, 0x01];
+        for _ in 0..(64 << 10) / 5 {
+            bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0xff, 0xff]);
+        }
+        let stalled = bytes.len() as u64;
+        let finisher = zlib(&[0xAB; SECTOR as usize]);
+        let finisher_at = bytes.len() as u64;
+        bytes.extend_from_slice(&finisher);
+        let raw_at = bytes.len() as u64;
+        bytes.extend_from_slice(&[0xAB; SECTOR as usize]);
+
+        let window = MAX_VOL_PREFIX as u64 / SECTOR;
+        let rounds = MAX_PREFIX_WORK / (64 << 10) + 8;
+        for (entry_type, finish_type, finish_at, finish_len) in [
+            (0x8000_0005, 0x8000_0005, finisher_at, finisher.len() as u64),
+            (0x0000_0001, 0x0000_0001, raw_at, SECTOR),
+            (0x0000_0000, 0x0000_0001, raw_at, SECTOR),
+        ] {
+            let mut chunks: Vec<Chunk> = (0..rounds)
+                .map(|_| Chunk {
+                    entry_type,
+                    sector_number: 0,
+                    sector_count: window - 1,
+                    comp_offset: 0,
+                    comp_length: stalled,
+                })
+                .collect();
+            chunks.push(Chunk {
+                entry_type: finish_type,
+                sector_number: window - 1,
+                sector_count: 1,
+                comp_offset: finish_at,
+                comp_length: finish_len,
+            });
+            let part = Partition {
+                name: String::new(),
+                sector_count: window,
+                data_offset: 0,
+                chunks,
+            };
+            let buf = reconstruct_prefix(&bytes, &koly_at_zero(), &part, MAX_VOL_PREFIX).unwrap();
+            let last = &buf[MAX_VOL_PREFIX - SECTOR as usize..];
+            assert!(
+                last.iter().all(|&b| b == 0),
+                "entry type {entry_type:#x}: the walk ran past its work budget"
+            );
+        }
     }
 
     #[test]

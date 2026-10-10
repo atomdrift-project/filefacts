@@ -974,6 +974,63 @@ fn parse_recovery_output_recovers_from_malformed_block() {
     assert_eq!(rec.functions.len(), 1);
 }
 
+/// A name inside a JSON block is attacker-chosen. One spelling the separator
+/// must not split its block, or every later block shifts and the binary's
+/// imports, exports and functions all vanish from the recovery.
+#[test]
+fn parse_recovery_output_ignores_separator_inside_names() {
+    let stdout = synthesize_stdout(
+        r#"[{"name":"===SEP===","libname":"libc.so"},{"name":"open"}]"#,
+        r#"[{"name":"start","vaddr":4096}]"#,
+        "",
+        r#"[{"name":"main","offset":4096}]"#,
+    );
+    let rec = parse_recovery_output(&stdout);
+    assert_eq!(rec.imports.len(), 2);
+    assert_eq!(rec.imports[0].name, "===SEP===");
+    assert_eq!(rec.exports.len(), 1);
+    assert_eq!(rec.functions.len(), 1);
+    assert_eq!(rec.functions[0].name, "main");
+}
+
+/// Call sites resolved by address each copy the callee's binary-chosen name;
+/// the copies stay within `MAX_RESOLVED_NAME_BYTES` however many sites call
+/// one long name, and every call site is still recorded.
+#[test]
+fn resolved_call_names_are_bounded() {
+    const SITES: usize = 80;
+    let long = "f".repeat(1 << 20);
+    let callrefs = vec![r#"{"to":1,"type":"CALL"}"#; SITES].join(",");
+    let stdout = synthesize_stdout(
+        "[]",
+        "[]",
+        "",
+        &format!(
+            r#"[{{"name":"{long}","offset":1}},{{"name":"g","offset":2,"callrefs":[{callrefs}]}}]"#
+        ),
+    );
+    let mut symbols = Symbols::new();
+    let mut metrics = Metrics::new();
+    parse_recovery_output(&stdout).apply(&mut symbols, &mut metrics);
+    let mut copied = 0;
+    let mut calls = 0;
+    for symbol in symbols.iter() {
+        match symbol {
+            Symbol::Function { name, callees, .. } if name == "g" => {
+                copied += callees.iter().map(String::len).sum::<usize>();
+            }
+            Symbol::Call { target, .. } => {
+                calls += 1;
+                copied += target.as_ref().map_or(0, String::len);
+            }
+            _ => {}
+        }
+    }
+    assert!(copied <= MAX_RESOLVED_NAME_BYTES, "{copied} bytes copied");
+    assert!(copied > 0);
+    assert_eq!(calls, SITES);
+}
+
 #[test]
 fn parse_recovery_output_handles_empty_stdout() {
     let rec = parse_recovery_output("");

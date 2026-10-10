@@ -180,8 +180,10 @@ fn main() -> ExitCode {
             let version = writeln!(io::stdout(), "filefacts {}", env!("CARGO_PKG_VERSION"));
             return exit_code(version.map(|()| true));
         }
+        // The message can quote an argument, and `filefacts *` in a sample
+        // directory makes a file name an argument.
         Err(msg) => {
-            eprintln!("filefacts: {msg}");
+            eprintln!("filefacts: {}", escape_controls(&msg));
             eprint!("{}", usage());
             return ExitCode::from(2);
         }
@@ -756,8 +758,39 @@ fn render_view(parsed: &ParsedFile<'_>, view: View) -> serde_json::Result<Render
                 body,
             });
         }
+        // Serialised only as far as the preview reaches: these hold a row
+        // per string in the file, and making every row a `Value` costs
+        // several times the rows' own memory to show the first few dozen.
+        View::Text => {
+            let text = parsed.text();
+            let categories = [
+                ("ascii", preview(text.ascii(), STRING_PREVIEW_LIMIT)?),
+                ("utf16le", preview(text.utf16le(), STRING_PREVIEW_LIMIT)?),
+            ];
+            return Ok(Rendered {
+                count: None,
+                empty: categories.iter().all(|(_, (total, _))| *total == 0),
+                body: render_strings(&categories),
+            });
+        }
+        View::Literals | View::Comments => {
+            let rows = match view {
+                View::Literals => parsed.literals().as_slice(),
+                _ => parsed.comments().as_slice(),
+            };
+            let (total, shown) = preview(rows.iter(), ARRAY_PREVIEW_LIMIT)?;
+            let mut body = render_values_tree(&Value::Array(shown));
+            if total > ARRAY_PREVIEW_LIMIT {
+                let more = format!("... {} more", total - ARRAY_PREVIEW_LIMIT);
+                body.push_str(&format!("  {}\n", dim(&more)));
+            }
+            return Ok(Rendered {
+                count: Some(total),
+                empty: total == 0,
+                body,
+            });
+        }
         View::Fileid => render_fileid,
-        View::Text | View::Literals | View::Comments => render_strings,
         View::Sections => |v| render_sections(v, None),
         View::Errors => render_errors,
         View::Identity | View::Values | View::Flow | View::References => render_values_tree,
@@ -1109,40 +1142,45 @@ fn format_metric_value(key: &str, raw: f64) -> String {
 
 const STRING_PREVIEW_LIMIT: usize = 40;
 
-fn render_strings(value: &Value) -> String {
-    let Value::Object(map) = value else {
-        return render_values_tree(value);
-    };
-    let mut categories: Vec<(&String, &Value)> = map.iter().collect();
-    categories.sort_by_key(|(k, _)| k.as_str());
+/// The first `limit` of `rows` as JSON values, and how many rows there are.
+fn preview<'r, T: Serialize + 'r>(
+    rows: impl Iterator<Item = &'r T>,
+    limit: usize,
+) -> serde_json::Result<(usize, Vec<Value>)> {
+    let mut shown = Vec::new();
+    let mut total = 0;
+    for row in rows {
+        if total < limit {
+            shown.push(serde_json::to_value(row)?);
+        }
+        total += 1;
+    }
+    Ok((total, shown))
+}
 
+/// The text view: per category, its row count and the first rows.
+fn render_strings(categories: &[(&str, (usize, Vec<Value>))]) -> String {
     let mut out = String::new();
-    // Summary line: ascii N · literals N · utf16le N
+    // Summary line: ascii N · utf16le N
     let counts: Vec<String> = categories
         .iter()
-        .map(|(k, v)| {
-            let n = v.as_array().map_or(0, Vec::len);
-            format!("{} {}", fg(FG_LABEL, k), fg(FG_NUM, &n.to_string()))
-        })
+        .map(|(k, (n, _))| format!("{} {}", fg(FG_LABEL, k), fg(FG_NUM, &n.to_string())))
         .collect();
     if !counts.is_empty() {
         out.push_str(&format!("  {}\n", counts.join(&dim("  ·  "))));
     }
 
-    for (cat, items) in categories {
-        let Value::Array(items) = items else {
-            continue;
-        };
-        if items.is_empty() {
+    for (cat, (total, items)) in categories {
+        if *total == 0 {
             continue;
         }
         out.push('\n');
         out.push_str(&format!(
             "  {} {}\n",
             fg_bold(FG_VALUE, cat),
-            dim(&format!("({})", items.len())),
+            dim(&format!("({total})")),
         ));
-        for s in items.iter().take(STRING_PREVIEW_LIMIT) {
+        for s in items {
             let Value::Object(obj) = s else { continue };
             // Every row carries `value`; text rows are stng's (`data_offset`),
             // literal and comment rows filefacts' (`offset`).
@@ -1174,10 +1212,10 @@ fn render_strings(value: &Value) -> String {
                 tagged,
             ));
         }
-        if items.len() > STRING_PREVIEW_LIMIT {
+        if *total > STRING_PREVIEW_LIMIT {
             out.push_str(&format!(
                 "    {}\n",
-                dim(&format!("... {} more", items.len() - STRING_PREVIEW_LIMIT)),
+                dim(&format!("... {} more", total - STRING_PREVIEW_LIMIT)),
             ));
         }
     }
@@ -2023,6 +2061,32 @@ mod tests {
         assert_eq!(rows.len(), 2, "{text}");
         assert!(rows[1].contains("evil\\x1b[2J.txt"), "{text}");
         assert!(!text.contains("evil\x1b"), "{text}");
+    }
+
+    /// The string views serialise only the rows they show, yet count and
+    /// report every row.
+    #[test]
+    fn string_views_count_every_row_beyond_the_preview() {
+        let source: String = (0..120)
+            .map(|i| format!("var v{i} = \"literal-{i}\"; // note {i}\n"))
+            .collect();
+        let parsed = open(Path::new("many.js"), source.as_bytes());
+        for (view, total) in [
+            (View::Literals, parsed.literals().len()),
+            (View::Comments, parsed.comments().len()),
+        ] {
+            assert!(total > ARRAY_PREVIEW_LIMIT, "{view:?} {total}");
+            let rendered = render_view(&parsed, view).unwrap();
+            assert_eq!(rendered.count, Some(total), "{view:?}");
+            let more = format!("... {} more", total - ARRAY_PREVIEW_LIMIT);
+            assert!(rendered.body.contains(&more), "{view:?}: {}", rendered.body);
+        }
+        let ascii = parsed.text().ascii().count();
+        assert!(ascii > STRING_PREVIEW_LIMIT, "{ascii}");
+        let body = render_view(&parsed, View::Text).unwrap().body;
+        assert!(body.contains(&format!("({ascii})")), "{body}");
+        let more = format!("... {} more", ascii - STRING_PREVIEW_LIMIT);
+        assert!(body.contains(&more), "{body}");
     }
 
     #[test]

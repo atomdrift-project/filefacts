@@ -980,21 +980,26 @@ fn run_extraction(
         }
     }
     let sections = Sections::from_iter(sections);
-    // Aggregate metrics derived from sections — mirrors the
-    // `sections.*` path convention.
-    if !sections.is_empty() {
-        derived_metrics::emit_section_metrics(&sections, &mut metrics);
-        derived_metrics::emit_binary_aggregates(&sections, &strings, bytes, &mut metrics);
-    }
-    if image_end.is_some() || !sections.is_empty() {
-        derived_metrics::emit_binary_overlay(&sections, bytes, image_end, &mut metrics);
-    }
+    // The derivations below read the input bytes and every extractor's
+    // output, so they get the same panic containment as the extractors: a
+    // panic costs that derivation's facts, never the host process.
+    let derived_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Aggregate metrics derived from sections — mirrors the
+        // `sections.*` path convention.
+        if !sections.is_empty() {
+            derived_metrics::emit_section_metrics(&sections, &mut metrics);
+            derived_metrics::emit_binary_aggregates(&sections, &strings, bytes, &mut metrics);
+        }
+        if image_end.is_some() || !sections.is_empty() {
+            derived_metrics::emit_binary_overlay(&sections, bytes, image_end, &mut metrics);
+        }
 
-    // Per-kind counts for ergonomic rule filtering. Derived from the
-    // unified `symbols` view.
-    derived_metrics::emit_symbol_kind_counts(&symbols, &mut metrics);
-    if !errors.is_empty() {
-        metrics.insert(metric!("parse.error_count"), errors.len() as f64);
+        // Per-kind counts for ergonomic rule filtering. Derived from the
+        // unified `symbols` view.
+        derived_metrics::emit_symbol_kind_counts(&symbols, &mut metrics);
+    }));
+    if let Err(payload) = derived_result {
+        errors.record_panic(Stage::FormatExtract, panic_payload_message(payload));
     }
 
     // Fold the per-format structural values into the normalized,
@@ -1002,12 +1007,26 @@ fn run_extraction(
     // every extractor wrote (signature fields, manifest claims,
     // document properties). Never fails — absent inputs yield an empty
     // identity.
-    let identity = formats::identity::derive(file_type, bytes, &values);
+    let identity =
+        std::panic::catch_unwind(|| formats::identity::derive(file_type, bytes, &values))
+            .unwrap_or_else(|payload| {
+                errors.record_panic(Stage::FormatExtract, panic_payload_message(payload));
+                Identity::default()
+            });
 
     // External references this file points at (declared packages, install
     // hooks, staged URLs), normalized to PURL/URL. Reads the same `values`
     // the format extractors wrote; never fetches.
-    let references = formats::references::derive(file_type, bytes, &values);
+    let references =
+        std::panic::catch_unwind(|| formats::references::derive(file_type, bytes, &values))
+            .unwrap_or_else(|payload| {
+                errors.record_panic(Stage::FormatExtract, panic_payload_message(payload));
+                Vec::new()
+            });
+
+    if !errors.is_empty() {
+        metrics.insert(metric!("parse.error_count"), errors.len() as f64);
+    }
 
     Extracted {
         values,

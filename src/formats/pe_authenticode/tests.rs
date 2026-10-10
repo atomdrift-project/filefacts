@@ -1033,3 +1033,173 @@ fn detached_ber_signature_verifies_against_its_content() {
     let sig = super::parse_cms_blob(BER_DETACHED).unwrap();
     assert_eq!(sig["verified"], serde_json::Value::Null);
 }
+
+// ---------------------------------------------------------------------
+// Grafted content and planted timestamps.
+// ---------------------------------------------------------------------
+
+/// `blob` as the one record of a PE certificate table.
+fn win_certificate(blob: &[u8]) -> Vec<u8> {
+    let length = u32::try_from(blob.len() + 8).unwrap();
+    let mut table = length.to_le_bytes().to_vec();
+    table.extend(0x0200_u16.to_le_bytes());
+    table.extend(0x0002_u16.to_le_bytes());
+    table.extend(blob);
+    table.resize(table.len().next_multiple_of(8), 0);
+    table
+}
+
+/// A genuine signature over something other than an `SpcIndirectDataContent`
+/// (a vendor-signed catalog, say) verifies as CMS, but lifted into a PE's
+/// certificate table it names no image digest and so authenticates nothing
+/// about that PE — at the top level or nested.
+#[test]
+fn pe_signature_without_an_image_digest_does_not_verify() {
+    let sig = super::parse_cms_blob(COUNTERSIG_OUTER).unwrap();
+    assert_eq!(sig["verified"], true, "the graft is a genuine signature");
+    assert!(sig.get("signature_digest").is_none());
+
+    let mut values = crate::output::Values::new();
+    super::parse(&win_certificate(COUNTERSIG_OUTER), &mut values);
+    let sig = values.get("pe.signatures[0]").unwrap();
+    assert_eq!(sig["verified"], false);
+    assert_eq!(sig["verification_failure"], "image_digest_missing");
+
+    use der::Decode;
+    let base = trim_to_der_object(DIGICERT_TENCENT).unwrap();
+    let carrier = with_unsigned(
+        base,
+        attr(
+            super::MS_NESTED_SIGNATURE_OID,
+            vec![der::Any::from_der(COUNTERSIG_OUTER).unwrap()],
+        ),
+    );
+    let mut values = crate::output::Values::new();
+    super::parse(&win_certificate(&carrier), &mut values);
+    assert_eq!(values.get("pe.signatures[0].verified"), Some(&true.into()));
+    let nested = values.get("pe.signatures[0].nested[0]").unwrap();
+    assert_eq!(nested["verified"], false);
+    assert_eq!(nested["verification_failure"], "image_digest_missing");
+}
+
+/// A TSTInfo-shaped forgery planted in a timestamp token ahead of the real
+/// TSTInfo — here as the parameters of an unsigned `digestAlgorithms` entry —
+/// must not borrow the authority's signature for its time. The verified time
+/// is the one the authority signed.
+#[test]
+fn rfc3161_time_comes_from_the_signed_tst_info() {
+    use super::{
+        ContentInfo, MS_TIMESTAMP_TOKEN_OID, TST_INFO_OID_DER, cert_bag,
+        decode_signed_data_lenient, gen_time_from_token, signing_time,
+    };
+    use der::{Decode, Encode};
+
+    let outer = signed_data(trim_to_der_object(DIGICERT_TENCENT).unwrap());
+    let bag = cert_bag(&outer);
+    let mut signer = outer.signer_infos.0.as_slice()[0].clone();
+    let genuine = signing_time(&signer, &bag).unwrap();
+    assert_eq!(genuine.source, "rfc3161");
+
+    // TSTInfo { version, policy, messageImprint, serialNumber, genTime }
+    // claiming 2000-01-01, wrapped the way gen_time_from_token looks for it:
+    // id-ct-TSTInfo, [0] { OCTET STRING { TSTInfo } }.
+    let mut tst = vec![0x30, 0x1D, 0x02, 0x01, 0x01, 0x06, 0x02, 0x2A, 0x03];
+    tst.extend([0x30, 0x00, 0x02, 0x01, 0x01, 0x18, 0x0F]);
+    tst.extend(b"20000101000000Z");
+    let mut octets = vec![0x04, 0x1F];
+    octets.extend(&tst);
+    let mut explicit = vec![0xA0, 0x21];
+    explicit.extend(&octets);
+    let mut bait = TST_INFO_OID_DER.to_vec();
+    bait.extend(&explicit);
+    let mut params = vec![0x30, u8::try_from(bait.len()).unwrap()];
+    params.extend(&bait);
+
+    let mut attrs = signer.unsigned_attrs.take().unwrap().into_vec();
+    let mut planted = Vec::new();
+    for attr in attrs.iter_mut().filter(|a| a.oid == MS_TIMESTAMP_TOKEN_OID) {
+        let tokens: Vec<der::Any> = attr
+            .values
+            .iter()
+            .map(|any| {
+                let ci = ContentInfo::from_der(&any.to_der().unwrap()).unwrap();
+                let mut sd = decode_signed_data_lenient(&ci.content).unwrap();
+                let mut algs = sd.digest_algorithms.into_vec();
+                algs[0].parameters = Some(der::Any::from_der(&params).unwrap());
+                sd.digest_algorithms = der::asn1::SetOfVec::try_from(algs).unwrap();
+                let token = ContentInfo {
+                    content_type: ci.content_type,
+                    content: der::Any::encode_from(&sd).unwrap(),
+                }
+                .to_der()
+                .unwrap();
+                planted.push(token.clone());
+                der::Any::from_der(&token).unwrap()
+            })
+            .collect();
+        attr.values = der::asn1::SetOfVec::try_from(tokens).unwrap();
+    }
+    signer.unsigned_attrs = Some(der::asn1::SetOfVec::try_from(attrs).unwrap());
+
+    // The bait is what a byte search for the TSTInfo finds first.
+    assert_eq!(
+        gen_time_from_token(&planted[0]).map(|(_, unix)| unix),
+        Some(946_684_800)
+    );
+    let time = signing_time(&signer, &bag).unwrap();
+    assert_eq!(time.source, "rfc3161", "the token itself still verifies");
+    assert_eq!(time.unix, genuine.unix);
+    assert_eq!(time.text, genuine.text);
+}
+
+/// Bytes stretched into the certificate table past a signature — inside its
+/// WIN_CERTIFICATE or after the last one — are covered by neither the image
+/// hash nor the signature, and nothing else in the output would show them.
+#[test]
+fn unsigned_bytes_in_the_certificate_table_are_counted() {
+    let blob = trim_to_der_object(DIGICERT_TENCENT).unwrap();
+    let unsigned = |table: &[u8]| {
+        let mut values = crate::output::Values::new();
+        super::parse(table, &mut values);
+        assert_eq!(values.get("pe.signatures[0].verified"), Some(&true.into()));
+        values
+            .get("pe.signatures[0].unsigned_trailing_bytes")
+            .and_then(serde_json::Value::as_u64)
+    };
+    // Alignment padding is the signature's own.
+    assert_eq!(unsigned(&win_certificate(blob)), None);
+
+    // A payload inside the record, dwLength stretched over it.
+    let mut stretched = blob.to_vec();
+    stretched.resize(stretched.len().next_multiple_of(8) + 64, 0x90);
+    let mut table = win_certificate(&stretched);
+    assert_eq!(unsigned(&table), Some(64));
+
+    // And another after the last record, the directory stretched over it.
+    table.extend([0xCC; 16]);
+    assert_eq!(unsigned(&table), Some(80));
+}
+
+/// Each same-named candidate issuer costs a signature check, so a walk tries
+/// a bounded number of them: decoys past the budget hide the real issuer
+/// rather than buying the attacker unbounded public-key work.
+#[test]
+fn chain_walk_tries_a_bounded_number_of_issuers() {
+    let bag = bags::Bag::load(BAG_IMPOSTOR_AND_REAL);
+    let leaf = bag.cert("Chain Leaf", "Chain CA");
+    let impostor = bag.cert("Chain CA", "Chain CA");
+    let real = [
+        bag.cert("Chain CA", "Chain Root"),
+        bag.cert("Chain Root", "Chain Root"),
+    ];
+    let walk = |decoys: usize| {
+        let mut certs = vec![impostor; decoys];
+        certs.extend(real);
+        super::walk_chain(&certs, leaf, &[]).thumbprints.len()
+    };
+    // The budget covers the whole walk: the CA and the root take one try
+    // each after the decoys.
+    assert_eq!(walk(super::MAX_LINK_ATTEMPTS - 2), 3);
+    assert_eq!(walk(super::MAX_LINK_ATTEMPTS - 1), 2);
+    assert_eq!(walk(super::MAX_LINK_ATTEMPTS), 1);
+}

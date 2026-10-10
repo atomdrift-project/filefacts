@@ -958,3 +958,36 @@ fn read_member_refuses_a_member_past_the_cap() {
     assert_eq!(prefix.bytes.len(), 10);
     assert!(prefix.truncated);
 }
+
+/// An input packed with end-of-central-directory records that each point at
+/// a directory that is not there. The `zip` crate tries every one and rescans
+/// toward the start of the file for each, which took quadratic time (24 s for
+/// 1 MiB); its reads are now budgeted, so the open fails promptly.
+#[test]
+fn failing_end_record_candidates_exhaust_the_open_budget() {
+    let mut record = [0_u8; 22];
+    record[..4].copy_from_slice(b"PK\x05\x06");
+    record[8..10].copy_from_slice(&1_u16.to_le_bytes());
+    record[10..12].copy_from_slice(&1_u16.to_le_bytes());
+    let bytes = record.repeat((512 << 10) / record.len());
+
+    let start = std::time::Instant::now();
+    let Err(ZipError::Io(e)) = open_crate(Cow::Borrowed(&bytes)) else {
+        panic!("the open read budget was not what stopped the open");
+    };
+    assert!(e.to_string().contains("budget"), "{e}");
+    assert!(open_archive(&bytes).is_err());
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+
+    // A well-formed archive opens, and its members read past the open
+    // budget, which is lifted once the archive is open.
+    let body = vec![b'x'; 3 << 20];
+    let z = build_zip(&[("big.bin", &body, CompressionMethod::Stored)]);
+    let mut archive = open_archive(&z).unwrap();
+    assert_eq!(
+        read_member(&mut archive, "big.bin", 4 << 20)
+            .unwrap()
+            .unwrap(),
+        body
+    );
+}

@@ -46,6 +46,12 @@ use crate::value_key;
 /// larger is hostile zip-bomb input.
 const MAX_TEXT_BYTES: u64 = 1024 * 1024;
 
+/// `pom.properties` members read while looking for one with a `groupId`.
+/// A jar shades a handful of Maven modules at most; each read costs up to
+/// [`MAX_TEXT_BYTES`] of inflation, and a hostile jar can list any number
+/// of them that never name a group.
+const MAX_POM_READS: usize = 16;
+
 const TRACKED_HEADERS: &[(&str, &str)] = &[
     ("Manifest-Version", "manifest_version"),
     ("Main-Class", "main_class"),
@@ -140,6 +146,10 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     let mut pom_group: Option<String> = None;
     let mut pom_artifact: Option<String> = None;
     let mut pom_version: Option<String> = None;
+    let mut pom_reads = 0_usize;
+    // Duplicate central-directory entries all name the one member a by-name
+    // read finds, so the manifest is read once however often it is listed.
+    let mut manifest_read = false;
 
     // An entry that will not open (corrupt local header, unsupported
     // compression or encryption) drops out of every count below. A hostile
@@ -215,10 +225,17 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             index_count += 1;
         }
         if name == "META-INF/MANIFEST.MF" {
-            if let Some(text) = read_text(zip, name, errors) {
-                manifest = parse_manifest(&text);
+            if !manifest_read {
+                manifest_read = true;
+                if let Some(text) = read_text(zip, name, errors) {
+                    manifest = parse_manifest(&text);
+                }
             }
-        } else if pom_group.is_none() && name.ends_with("/pom.properties") {
+        } else if pom_group.is_none()
+            && pom_reads < MAX_POM_READS
+            && name.ends_with("/pom.properties")
+        {
+            pom_reads += 1;
             if let Some(text) = read_text(zip, name, errors) {
                 for line in text.lines() {
                     let line = line.trim();
@@ -783,6 +800,30 @@ mod tests {
         assert_eq!(
             v.get("jar.pom.version").and_then(|x| x.as_str()),
             Some("1.2.3")
+        );
+    }
+
+    /// Only the first `MAX_POM_READS` pom.properties are read: a group named
+    /// past them is not found.
+    #[test]
+    fn pom_properties_reads_are_capped() {
+        let names: Vec<String> = (0..=MAX_POM_READS)
+            .map(|i| format!("META-INF/maven/g/a{i}/pom.properties"))
+            .collect();
+        let mut entries: Vec<(&str, &[u8])> = names[..MAX_POM_READS]
+            .iter()
+            .map(|n| (n.as_str(), b"version=1\n".as_slice()))
+            .collect();
+        entries.push((&names[MAX_POM_READS], b"groupId=late\n"));
+        let (v, _) = run(&build_jar(&entries));
+        assert!(v.get("jar.pom.group_id").is_none());
+
+        // The same group inside the cap is found.
+        entries.swap(0, MAX_POM_READS);
+        let (v, _) = run(&build_jar(&entries));
+        assert_eq!(
+            v.get("jar.pom.group_id").and_then(|x| x.as_str()),
+            Some("late")
         );
     }
 

@@ -218,6 +218,9 @@ struct Archive {
     keys: Vec<String>,
     values: Vec<Value>,
     classes: Vec<String>,
+    /// Each object's `NS.bytes` data, found once so following a reference
+    /// into an `NSString` does not rescan its values per reference.
+    ns_bytes: Vec<Option<Range<usize>>>,
 }
 
 impl Archive {
@@ -286,21 +289,52 @@ impl Archive {
             let name = name.strip_suffix(b"\0").unwrap_or(name);
             Some(String::from_utf8_lossy(name).into_owned())
         })?;
-        Ok(Self {
+        let mut archive = Self {
             format_version,
             objects,
             keys,
             values,
             classes,
-        })
+            ns_bytes: Vec::new(),
+        };
+        // Every key lookup scans the object's run of values. ibtool gives each
+        // object a run of its own; runs that overlap would let every object
+        // claim the whole value table, and lookups cost objects × values.
+        let mut runs: Vec<Range<usize>> = archive
+            .objects
+            .iter()
+            .map(|o| archive.run(o))
+            .filter(|r| !r.is_empty())
+            .collect();
+        runs.sort_unstable_by_key(|r| r.start);
+        if runs
+            .array_windows::<2>()
+            .any(|[left, right]| left.end > right.start)
+        {
+            return Err(Error::malformed("nib", "objects share value table entries"));
+        }
+        archive.ns_bytes = archive
+            .objects
+            .iter()
+            .map(|o| match &archive.field(o, "NS.bytes")?.payload {
+                Payload::Data(range) => Some(range.clone()),
+                _ => None,
+            })
+            .collect();
+        Ok(archive)
     }
 
-    fn values_of(&self, object: &Object) -> &[Value] {
+    /// The span of the value table `object` claims, clamped to the table.
+    fn run(&self, object: &Object) -> Range<usize> {
         let start = object.first_value.min(self.values.len());
         let end = start
             .saturating_add(object.value_count)
             .min(self.values.len());
-        self.values.get(start..end).unwrap_or_default()
+        start..end
+    }
+
+    fn values_of(&self, object: &Object) -> &[Value] {
+        self.values.get(self.run(object)).unwrap_or_default()
     }
 
     /// The value stored under `key` on `object`, if any.
@@ -317,13 +351,7 @@ impl Archive {
     fn string<'a>(&'a self, data: &'a [u8], value: &Value) -> Option<(&'a str, usize)> {
         let range = match &value.payload {
             Payload::Data(range) => range,
-            Payload::Ref(index) => {
-                let target = self.objects.get(*index)?;
-                match &self.field(target, "NS.bytes")?.payload {
-                    Payload::Data(range) => range,
-                    _ => return None,
-                }
-            }
+            Payload::Ref(index) => self.ns_bytes.get(*index)?.as_ref()?,
             Payload::Scalar => return None,
         };
         let text = std::str::from_utf8(data.get(range.clone())?).ok()?;
@@ -448,9 +476,13 @@ fn collect_keyed(bytes: &[u8], facts: &mut Facts, strings: &mut Strings) -> Resu
 
     // Literals are deduplicated by text borrowed from the parsed archive.
     let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut search = Search {
+        bytes,
+        budget: MAX_LOCATE_SCAN_BYTES,
+    };
     for object in objects {
         match object {
-            P::String(text) => note_string(&mut seen, strings, bytes, text),
+            P::String(text) => note_string(&mut seen, strings, &mut search, text),
             P::Dictionary(dict) => {
                 // `$classname` and friends are archiver bookkeeping, not
                 // strings the nib carries; the class names have their own fact.
@@ -458,7 +490,7 @@ fn collect_keyed(bytes: &[u8], facts: &mut Facts, strings: &mut Strings) -> Resu
                     if let P::String(text) = value
                         && !key.starts_with('$')
                     {
-                        note_string(&mut seen, strings, bytes, text);
+                        note_string(&mut seen, strings, &mut search, text);
                     }
                 }
                 if let Some(class) = class_name(objects, dict) {
@@ -476,11 +508,38 @@ fn collect_keyed(bytes: &[u8], facts: &mut Facts, strings: &mut Strings) -> Resu
 fn note_string<'a>(
     seen: &mut BTreeSet<&'a str>,
     strings: &mut Strings,
-    bytes: &[u8],
+    search: &mut Search<'_>,
     text: &'a str,
 ) {
     if !text.is_empty() && text != "$null" && seen.insert(text) {
-        push_literal(strings, text, locate(bytes, text));
+        push_literal(strings, text, search.locate(text));
+    }
+}
+
+/// Bytes [`Search::locate`] may scan across every string of one archive.
+/// Each search reads the file from the start, and a crafted archive packs
+/// a distinct string into every few bytes, so without a bound locating them
+/// all costs strings × file size. A real nib's few hundred strings scan a
+/// small fraction of this; past it, literals report offset zero.
+const MAX_LOCATE_SCAN_BYTES: usize = 256 << 20;
+
+/// [`locate`] over one file under a shared scan budget.
+struct Search<'a> {
+    bytes: &'a [u8],
+    budget: usize,
+}
+
+impl Search<'_> {
+    fn locate(&mut self, text: &str) -> usize {
+        let window = self
+            .bytes
+            .get(..self.budget.min(self.bytes.len()))
+            .unwrap_or_default();
+        // A match is never at zero: the marker precedes the body.
+        let at = locate(window, text);
+        let scanned = if at == 0 { window.len() } else { at };
+        self.budget = self.budget.saturating_sub(scanned);
+        at
     }
 }
 
@@ -684,6 +743,70 @@ mod tests {
         data[18..22].copy_from_slice(&u32::MAX.to_le_bytes());
         let err = Archive::parse(&data).unwrap_err();
         assert!(err.to_string().contains("object table"), "{err}");
+    }
+
+    /// A NIBArchive of `objects` (class, first value, value count), each
+    /// value an int8 under key 0 (`NS.bytes`), and one class name.
+    fn archive(objects: &[[u8; 3]], values: usize) -> Vec<u8> {
+        let objects_at = HEADER_LEN;
+        let keys_at = objects_at + 3 * objects.len();
+        let values_at = keys_at + 9;
+        let classes_at = values_at + 3 * values;
+        let mut data = MAGIC.to_vec();
+        for word in [
+            1,
+            10,
+            objects.len(),
+            objects_at,
+            1,
+            keys_at,
+            values,
+            values_at,
+            1,
+            classes_at,
+        ] {
+            data.extend((word as u32).to_le_bytes());
+        }
+        for object in objects {
+            data.extend(object.map(|n| n | 0x80));
+        }
+        data.extend(b"\x88NS.bytes");
+        for _ in 0..values {
+            data.extend([0x80, 0, 7]);
+        }
+        data.extend(b"\x89\x80NSString\0");
+        data
+    }
+
+    /// Objects own disjoint runs of the value table; a crafted archive in
+    /// which every object claims the whole table would make each lookup
+    /// scan it, and is refused.
+    #[test]
+    fn objects_sharing_values_are_refused() {
+        assert!(Archive::parse(&archive(&[[0, 0, 1], [0, 1, 1]], 2)).is_ok());
+        let err = Archive::parse(&archive(&[[0, 0, 2], [0, 1, 1]], 2)).unwrap_err();
+        assert!(err.to_string().contains("share value table"), "{err}");
+    }
+
+    /// Locating keyed-archive strings shares one scan budget, so a file
+    /// packed with distinct strings cannot make each one search the whole
+    /// file; once it is spent, literals report offset zero.
+    #[test]
+    fn string_search_is_budgeted() {
+        let mut bytes = vec![0u8; 100];
+        bytes.extend(b"\x57Dropper");
+        let mut search = Search {
+            bytes: &bytes,
+            budget: 1 << 10,
+        };
+        assert_eq!(search.locate("Dropper"), 101);
+        assert_eq!(search.budget, (1 << 10) - 101);
+        let mut spent = Search {
+            bytes: &bytes,
+            budget: 100,
+        };
+        assert_eq!(spent.locate("Dropper"), 0);
+        assert_eq!(spent.budget, 0);
     }
 
     #[test]

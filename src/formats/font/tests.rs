@@ -761,3 +761,39 @@ fn non_printable_tag_is_escaped() {
     let tables = v.get("font.tables").and_then(|x| x.as_array()).unwrap();
     assert_eq!(tables[0].as_str(), Some("\\x01\\x02ab"));
 }
+
+/// Table records may overlap, and a directory holds up to 1024 of them.
+/// Each naming the whole file had every one entropy-scanned and classified
+/// in full; the regions examined now share a budget of twice the file.
+#[test]
+fn overlapping_tables_share_one_scan_budget() {
+    const TABLES: usize = 1024;
+    let len = 1usize << 20;
+    let mut font = vec![0x00, 0x01, 0x00, 0x00];
+    font.extend_from_slice(&(TABLES as u16).to_be_bytes());
+    font.extend_from_slice(&[0; 6]);
+    for i in 0..TABLES {
+        font.extend_from_slice(b"zz");
+        font.extend_from_slice(&(i as u16).to_be_bytes());
+        font.extend_from_slice(&[0; 4]);
+        font.extend_from_slice(&0u32.to_be_bytes());
+        font.extend_from_slice(&((len - i) as u32).to_be_bytes());
+    }
+    font.extend_from_slice(&fake_pe(64));
+    font.resize(len, 0);
+    let started = std::time::Instant::now();
+    let (v, m) = run(&font);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "region scan is quadratic: {elapsed:?}"
+    );
+    assert_eq!(stowaway(&v), vec!["pe"]);
+    assert!(m.get("font.stowaway_bytes").unwrap() > (len * 2) as f64);
+    let problems = v.get("font.problems").and_then(|x| x.as_array()).unwrap();
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.as_str().is_some_and(|p| p.contains("scan budget")))
+    );
+}

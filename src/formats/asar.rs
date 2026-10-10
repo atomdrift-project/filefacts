@@ -10,7 +10,7 @@ use crate::value_key;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_value};
-use super::bounded::{MAX_ARCHIVE_MEMBERS, push_limit};
+use super::bounded::{MAX_ARCHIVE_MEMBERS, MAX_PATH_BYTES, push_limit};
 use crate::bytes;
 use crate::error::Error;
 use crate::output::{ArchiveCompression, ArchiveMember, ArchiveOffsets, Metrics, Values};
@@ -40,14 +40,6 @@ fn parse_offset(value: &JsonValue) -> Option<u64> {
         JsonValue::String(s) => s.parse::<u64>().ok(),
         JsonValue::Number(n) => n.as_u64(),
         _ => None,
-    }
-}
-
-fn path_join(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}/{name}")
     }
 }
 
@@ -118,6 +110,31 @@ struct Walk {
     directory_count: u64,
     /// File entries past [`MAX_ARCHIVE_MEMBERS`], counted but not listed.
     unlisted: u64,
+    /// Path bytes the rest of the walk may still build. Every member's
+    /// path repeats its ancestors' names, so a deep chain of long directory
+    /// names multiplies into gigabytes of paths without it.
+    path_budget: usize,
+    /// The path budget ran out and the walk stopped.
+    path_capped: bool,
+}
+
+impl Walk {
+    /// `prefix/name`, charged against the path budget; `None` once it is
+    /// spent.
+    fn join(&mut self, prefix: &str, name: &str) -> Option<String> {
+        let len = prefix.len() + usize::from(!prefix.is_empty()) + name.len();
+        let Some(left) = self.path_budget.checked_sub(len) else {
+            self.path_budget = 0;
+            self.path_capped = true;
+            return None;
+        };
+        self.path_budget = left;
+        Some(if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
+        })
+    }
 }
 
 fn walk_files(
@@ -127,13 +144,18 @@ fn walk_files(
     archive_members: &mut Vec<ArchiveMember>,
 ) {
     for (name, node) in files {
-        let path = path_join(prefix, name);
+        if walk.path_capped {
+            return;
+        }
         let Some(obj) = node.as_object() else {
             continue;
         };
 
         if let Some(children) = obj.get("files").and_then(JsonValue::as_object) {
             walk.directory_count += 1;
+            let Some(path) = walk.join(prefix, name) else {
+                return;
+            };
             walk_files(&path, children, walk, archive_members);
             continue;
         }
@@ -145,6 +167,9 @@ fn walk_files(
             walk.unlisted += 1;
             continue;
         }
+        let Some(path) = walk.join(prefix, name) else {
+            return;
+        };
         let unpacked = obj
             .get("unpacked")
             .and_then(JsonValue::as_bool)
@@ -213,8 +238,18 @@ pub(super) fn extract(
         stats: ArchiveStats::new(AGGS),
         directory_count: 0,
         unlisted: 0,
+        path_budget: MAX_PATH_BYTES,
+        path_capped: false,
     };
     walk_files("", &index.files, &mut walk, archive_members);
+    if walk.path_capped {
+        push_limit(
+            values,
+            value_key!("asar.limits"),
+            "path-budget",
+            format!("member paths exceeded {MAX_PATH_BYTES} bytes"),
+        );
+    }
     if walk.unlisted > 0 {
         push_limit(
             values,
@@ -320,6 +355,42 @@ mod tests {
             .and_then(JsonValue::as_array)
             .unwrap();
         assert_eq!(limits[0]["stage"].as_str(), Some("member-cap"));
+    }
+
+    /// Every file below a deep chain of long directory names repeats the
+    /// chain in its path; the walk stops when the paths outgrow the budget.
+    #[test]
+    fn walk_stops_at_the_path_budget() {
+        let long = "d".repeat(200);
+        let mut header = String::new();
+        for _ in 0..20 {
+            header.push_str(&format!(r#"{{"files":{{"{long}":"#));
+        }
+        header.push_str(r#"{"files":{"a":{"size":1,"offset":"0"},"b":{"size":1,"offset":"0"}}}"#);
+        for _ in 0..20 {
+            header.push_str("}}");
+        }
+        let JsonValue::Object(root) = serde_json::from_str::<JsonValue>(&header).unwrap() else {
+            panic!("header is an object");
+        };
+        let files = root["files"].as_object().unwrap();
+        // Room for the 20 directory paths and one of the two files.
+        let dir_paths: usize = (1..=20).map(|depth| 201 * depth - 1).sum();
+        let file_path = 20 * 201 + 1;
+        let mut walk = Walk {
+            data_offset: 0,
+            members: Vec::new(),
+            stats: ArchiveStats::new(AGGS),
+            directory_count: 0,
+            unlisted: 0,
+            path_budget: dir_paths + file_path + file_path / 2,
+            path_capped: false,
+        };
+        let mut members = Vec::new();
+        walk_files("", files, &mut walk, &mut members);
+        assert!(walk.path_capped);
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].path.len(), file_path);
     }
 
     fn header_len_for_test() -> u64 {

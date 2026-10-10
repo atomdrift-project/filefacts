@@ -925,6 +925,7 @@ fn run_hardened(mut cmd: Command, timeout: Duration, cap: usize) -> RunOutcome {
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::null());
+    crate::tools::scrub_env(&mut cmd);
     apply_unix_hardening(&mut cmd);
 
     let started = std::time::Instant::now();
@@ -1442,7 +1443,7 @@ fn join_drain(rx: &std::sync::mpsc::Receiver<Vec<u8>>, child_id: u32) -> Option<
 /// degrade to empty `Vec`s rather than failing — partial data is more
 /// useful than no data on adversarial input.
 fn parse_recovery_output(stdout: &str) -> RizinRecovery {
-    let mut parts = stdout.split("===SEP===");
+    let mut parts = output_blocks(stdout).into_iter();
     let imports = parts
         .next()
         .and_then(|p| parse_json_array::<RawImport>(p).ok())
@@ -1470,6 +1471,33 @@ fn parse_recovery_output(stdout: &str) -> RizinRecovery {
         sections,
     }
 }
+
+/// Split rizin's stdout at the lines `echo ===SEP===` printed. Only a whole
+/// line is a separator: names in the JSON blocks come from the analysed
+/// binary, so an import named `===SEP===` must not split its block and shift
+/// every later one out of place. JSON escapes newlines inside strings, so no
+/// name can make up a line of its own.
+fn output_blocks(stdout: &str) -> Vec<&str> {
+    let mut blocks = Vec::new();
+    let mut start = 0;
+    let mut end = 0;
+    for line in stdout.split_inclusive('\n') {
+        end += line.len();
+        if line.trim_end_matches(['\n', '\r']) == "===SEP===" {
+            blocks.push(stdout.get(start..end - line.len()).unwrap_or_default());
+            start = end;
+        }
+    }
+    blocks.push(stdout.get(start..).unwrap_or_default());
+    blocks
+}
+
+/// Upper bound on the function-name bytes [`RizinRecovery::apply`] copies to
+/// resolve call targets by address. Every call site naming one function
+/// copies that function's name, which the analysed binary chooses, so a long
+/// symbol called from a million sites would otherwise copy gigabytes out of
+/// a few megabytes of output. Call targets past the budget stay unresolved.
+const MAX_RESOLVED_NAME_BYTES: usize = 64 * 1024 * 1024;
 
 /// Extract a JSON array out of `text`. Rizin sometimes prefixes
 /// arrays with log lines; we tolerate that by scanning for `[`.
@@ -1584,6 +1612,15 @@ impl RizinRecovery {
             .filter(|function| !function.name.is_empty())
             .map(|function| (function.offset, function.name.clone()))
             .collect();
+        let mut name_budget = MAX_RESOLVED_NAME_BYTES;
+        let mut resolve = |callref: &RawCallref| -> Option<String> {
+            if let Some(name) = &callref.name {
+                return Some(name.clone());
+            }
+            let name = function_names.get(&callref.to?)?;
+            name_budget = name_budget.checked_sub(name.len())?;
+            Some(name.clone())
+        };
         if !had_imports {
             for imp in self.imports {
                 if imp.name.is_empty() {
@@ -1626,12 +1663,7 @@ impl RizinRecovery {
                     .callrefs
                     .iter()
                     .filter(|callref| callref.is_call())
-                    .filter_map(|callref| {
-                        callref
-                            .name
-                            .clone()
-                            .or_else(|| function_names.get(&callref.to?).cloned())
-                    })
+                    .filter_map(&mut resolve)
                     .filter(|n| !n.is_empty())
                     .collect();
                 symbols_out.push(Symbol::Function {
@@ -1707,12 +1739,8 @@ impl RizinRecovery {
                     if !callref.is_call() {
                         continue;
                     }
-                    let target = callref
-                        .name
-                        .clone()
-                        .or_else(|| function_names.get(&callref.to?).cloned());
                     symbols_out.push(Symbol::Call {
-                        target,
+                        target: resolve(callref),
                         args: Vec::new(),
                         offset: callref.from,
                     });

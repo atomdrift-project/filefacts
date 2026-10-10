@@ -7,6 +7,7 @@
 //! a raw URL wherever the ecosystem is identifiable, for disambiguation; an
 //! intra-artifact target is a [`RefLocator::Path`].
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -222,15 +223,16 @@ fn purl_safe(s: &str, extra: &[u8]) -> bool {
 /// over-broad match that names no real file simply draws no edge.
 fn js_local_refs(out: &mut Refs<'_>) {
     let Some(text) = out.text else { return };
-    let mut seen: Vec<&str> = Vec::new();
+    // A set: scanning a list for each specifier was quadratic, and 100k
+    // distinct `require("./mN")` lines took 15 s.
+    let mut seen: HashSet<&str> = HashSet::new();
     for caps in js_relative_import_re().captures_iter(text) {
         let Some(spec) = caps.get(1).map(|m| m.as_str()) else {
             continue;
         };
-        if spec.is_empty() || seen.contains(&spec) {
+        if spec.is_empty() || !seen.insert(spec) {
             continue;
         }
-        seen.push(spec);
         push_local_ref(out, spec, "import");
     }
 }
@@ -666,15 +668,19 @@ fn cargo_lock(values: &Values, out: &mut Refs<'_>) {
     }
 }
 
-/// Budget for whole-file evidence searches, in bytes scanned.
+/// Budget for evidence searches, in bytes scanned.
 ///
 /// [`Refs::locate`] resumes from the previous match, which is linear while a
 /// producer emits in document order. A producer that doesn't falls back to
 /// searching the whole file per reference — O(N × file), quadratic in a
 /// manifest that declares thousands. Measured before this budget existed: 40k
 /// `uses:` steps in 1.5 MB cost 10.5 s, rising 4× per doubling, so a crafted
-/// input scales to hours of CPU on one file. Once the budget is spent the
-/// remaining offsets report 0, already the value for evidence we can't locate.
+/// input scales to hours of CPU on one file. The resumed search counts too: a
+/// miss scans to end-of-file without moving the cursor, and a v1
+/// `package-lock.json` (walked last entry first) with 20k dependencies before
+/// a 4 MiB entry spent 35 s on those misses alone. Once the budget is spent
+/// the remaining offsets report 0, already the value for evidence we can't
+/// locate.
 const MAX_LOCATE_SCAN: usize = 64 << 20;
 
 /// Reference accumulator that also carries the raw file text for offsets.
@@ -699,16 +705,24 @@ impl Refs<'_> {
     /// span still gets that span twice.
     fn locate(&mut self, evidence: &str, locator: &RefLocator) -> Option<u64> {
         let text = self.text?;
-        if let Some(at) = text.get(self.cursor..).and_then(|tail| tail.find(evidence)) {
-            self.cursor += at;
-            return Some(self.cursor as u64);
-        }
         if self.budget == 0 {
             return None;
         }
-        // A miss already cost a scan to end-of-file, and the fallback costs up
-        // to two more; charge the pair.
-        self.budget = self.budget.saturating_sub(text.len().saturating_mul(2));
+        let tail = text.get(self.cursor..).unwrap_or_default();
+        if let Some(at) = tail.find(evidence) {
+            // The scan stopped at the match and the cursor moves there, so
+            // evidence in document order costs one pass over the file.
+            self.budget = self
+                .budget
+                .saturating_sub(at.saturating_add(evidence.len()));
+            self.cursor += at;
+            return Some(self.cursor as u64);
+        }
+        // The miss scanned to end-of-file, and the fallback costs up to two
+        // whole-file scans more; charge all three.
+        self.budget = self
+            .budget
+            .saturating_sub(tail.len().saturating_add(text.len().saturating_mul(2)));
         let found = text
             .find(evidence)
             .or_else(|| text.find(&anchor_from_locator(locator)));
@@ -887,15 +901,14 @@ fn npm_local_refs(out: &mut Refs<'_>) {
     };
     // Dedup identical targets — `exports` routinely repeats `main` and lists one
     // file under several conditions (`require`/`import`/`default`).
-    let mut seen: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut emit = |out: &mut Refs<'_>, path: &str, source: &str| {
         if path.is_empty() || path.contains('*') {
             return; // empty, or a subpath pattern (`./*`) that names no one file
         }
-        if seen.iter().any(|p| p == path) {
+        if !seen.insert(path.to_string()) {
             return;
         }
-        seen.push(path.to_string());
         push_local_ref(out, path, source);
     };
 

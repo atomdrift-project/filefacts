@@ -64,6 +64,7 @@ use crate::scan::days_from_civil;
 use crate::value_key;
 
 use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_value};
+use super::bounded::MAX_PATH_BYTES;
 use super::udf;
 
 /// ISO 9660 logical sector. Fixed by the standard for optical media;
@@ -88,6 +89,12 @@ const MAX_DEPTH: u32 = 64;
 const MAX_SURFACED_FILES: usize = 512;
 /// Cap on a single directory extent read.
 const MAX_DIR_EXTENT: usize = 32 << 20;
+/// Directory-extent bytes read across the whole walk. `visited` keys an
+/// extent on its start and declared length, so records naming one extent
+/// with ever-different lengths, or extents overlapping a sector apart, each
+/// re-read up to `MAX_DIR_EXTENT`: `MAX_DIRS` times the image. Real trees
+/// spend a few hundred bytes per record, far below this for `MAX_ENTRIES`.
+const MAX_DIR_BYTES_TOTAL: usize = 128 << 20;
 /// Cap on SUSP continuation-area hops per record.
 const MAX_CE_HOPS: usize = 8;
 /// Continuation-area bytes read for one directory record, across its `CE`
@@ -1220,6 +1227,10 @@ struct Walk {
     susp_areas_parsed: usize,
     /// Continuation bytes the rest of the walk may still read.
     susp_budget: usize,
+    /// Directory-extent bytes the rest of the walk may still read.
+    dir_budget: usize,
+    /// Path bytes the rest of the walk may still build.
+    path_budget: usize,
 }
 
 impl Walk {
@@ -1233,6 +1244,8 @@ impl Walk {
             dirs_walked: 0,
             susp_areas_parsed: 0,
             susp_budget: MAX_SUSP_BYTES_TOTAL,
+            dir_budget: MAX_DIR_BYTES_TOTAL,
+            path_budget: MAX_PATH_BYTES,
         }
     }
 
@@ -1242,7 +1255,10 @@ impl Walk {
         // and `visited` is keyed on the extent, not the path.
         let mut queue = VecDeque::from([(root_lba, root_len, String::new(), 0_u32)]);
         while let Some((lba, len, prefix, depth)) = queue.pop_front() {
-            if self.dirs_walked >= MAX_DIRS || self.entries.len() >= MAX_ENTRIES {
+            if self.dirs_walked >= MAX_DIRS
+                || self.entries.len() >= MAX_ENTRIES
+                || self.path_budget == 0
+            {
                 self.truncated = true;
                 return;
             }
@@ -1257,10 +1273,15 @@ impl Walk {
 
             let start = (lba as usize).saturating_mul(SECTOR);
             let want = (len as usize).min(MAX_DIR_EXTENT);
+            if want > self.dir_budget {
+                self.truncated = true;
+                return;
+            }
             let Some(extent) = bytes.get(start..start.saturating_add(want)) else {
                 self.truncated = true;
                 continue;
             };
+            self.dir_budget -= extent.len();
             for e in self.parse_extent(bytes, extent, &prefix, depth, ns) {
                 if e.is_dir() {
                     queue.push_back((e.lba, e.size, e.path.clone(), depth + 1));
@@ -1338,6 +1359,12 @@ impl Walk {
             if let Some(su) = rec.get(su_start..) {
                 self.parse_susp(bytes, su, &mut entry, prefix);
             }
+            let Some(left) = self.path_budget.checked_sub(entry.path.len()) else {
+                self.path_budget = 0;
+                self.truncated = true;
+                break;
+            };
+            self.path_budget = left;
             out.push(entry);
             if self.entries.len() + out.len() >= MAX_ENTRIES {
                 self.truncated = true;
@@ -1554,6 +1581,9 @@ struct File {
 fn merge_namespaces(entries: Vec<Entry>, anomalies: &mut Vec<&'static str>) -> Vec<File> {
     let mut files: Vec<File> = Vec::new();
     let mut index: std::collections::HashMap<(u32, u32), usize> = std::collections::HashMap::new();
+    // Zero-length files by path. A linear search per file made a tree of
+    // tens of thousands of empty files quadratic.
+    let mut empty: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for e in entries {
         let name = e
@@ -1565,10 +1595,11 @@ fn merge_namespaces(entries: Vec<Entry>, anomalies: &mut Vec<&'static str>) -> V
         // so distinct empty files don't collapse into one member.
         let key = (e.lba, e.size);
         let slot = if e.size == 0 {
-            files.iter_mut().find(|f| f.path == e.path && f.size == 0)
+            empty.get(&e.path)
         } else {
-            index.get(&key).and_then(|&i| files.get_mut(i))
-        };
+            index.get(&key)
+        }
+        .and_then(|&i| files.get_mut(i));
 
         match slot {
             Some(f) => {
@@ -1598,7 +1629,9 @@ fn merge_namespaces(entries: Vec<Entry>, anomalies: &mut Vec<&'static str>) -> V
                 }
             }
             None => {
-                if e.size != 0 {
+                if e.size == 0 {
+                    empty.insert(e.path.clone(), files.len());
+                } else {
                     index.insert(key, files.len());
                 }
                 files.push(File {

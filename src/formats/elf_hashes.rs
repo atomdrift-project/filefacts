@@ -23,12 +23,13 @@
 
 use goblin::elf::Elf;
 
+use super::elf::NameBudget;
 use super::symbol_hashes::{export_hash, imphash, md5_of_set};
 use crate::formats::common::put_str;
 use crate::output::{Symbols, Values};
 use crate::value_key;
 
-pub(super) fn emit(elf: &Elf<'_>, values: &mut Values, symbols: &Symbols) {
+pub(super) fn emit(elf: &Elf<'_>, file_len: usize, values: &mut Values, symbols: &Symbols) {
     // imphash: imported function names (`STB_GLOBAL`/`STB_WEAK` with
     // `SHN_UNDEF`); export_hash: defined dynsym names.
     if let Some(h) = imphash(symbols) {
@@ -37,33 +38,41 @@ pub(super) fn emit(elf: &Elf<'_>, values: &mut Values, symbols: &Symbols) {
     if let Some(h) = export_hash(symbols) {
         put_str(values, value_key!("elf.hashes.export_hash"), h);
     }
-    if let Some(h) = dyn_hash(elf) {
+    if let Some(h) = dyn_hash(elf, file_len) {
         put_str(values, value_key!("elf.hashes.dyn_hash"), h);
     }
-    if let Some(h) = symhash(elf) {
+    if let Some(h) = symhash(elf, file_len) {
         put_str(values, value_key!("elf.hashes.symhash"), h);
     }
 }
 
 /// MD5 of the sorted, lowercased `DT_NEEDED` library list. Stable
 /// across compiler versions and a useful first-cut dependency
-/// fingerprint.
-fn dyn_hash(elf: &Elf<'_>) -> Option<String> {
-    md5_of_set(
-        elf.libraries
-            .iter()
-            .map(|s| s.to_ascii_lowercase())
-            .collect(),
-    )
+/// fingerprint. `None` when the names overrun their [`NameBudget`]: a hash
+/// of part of the list would pass for the hash of all of it.
+fn dyn_hash(elf: &Elf<'_>, file_len: usize) -> Option<String> {
+    let mut names = NameBudget::new(file_len);
+    let libs = elf
+        .libraries
+        .iter()
+        .take_while(|s| names.take(s.len()))
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+    if names.refused() {
+        return None;
+    }
+    md5_of_set(libs)
 }
 
 /// Anomali Labs' symhash, applied to ELF's static symbol table.
 /// External (`STB_GLOBAL`/`STB_WEAK`) + undefined (`SHN_UNDEF`)
 /// entries' names are sorted, comma-joined, MD5'd. Returns `None`
-/// when the symtab has been stripped or contains no matching entries.
-fn symhash(elf: &Elf<'_>) -> Option<String> {
+/// when the symtab has been stripped, contains no matching entries, or its
+/// names overrun their [`NameBudget`].
+fn symhash(elf: &Elf<'_>, file_len: usize) -> Option<String> {
     // STB_LOCAL = 0, STB_GLOBAL = 1, STB_WEAK = 2.
     let mut names: Vec<String> = Vec::new();
+    let mut budget = NameBudget::new(file_len);
     for sym in elf.syms.iter() {
         if sym.st_bind() == 0 {
             continue;
@@ -73,6 +82,9 @@ fn symhash(elf: &Elf<'_>) -> Option<String> {
         }
         if let Some(name) = elf.strtab.get_at(sym.st_name) {
             if !name.is_empty() {
+                if !budget.take(name.len()) {
+                    return None;
+                }
                 names.push(name.to_ascii_lowercase());
             }
         }

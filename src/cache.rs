@@ -162,8 +162,15 @@ pub(crate) fn cache_key(bytes: &[u8], variant: &str) -> String {
     hex(&hasher.finalize())
 }
 
-/// `{cache_dir}/atomdrift/filefacts`, resolved once per process. Pure path
-/// computation: nothing is created or probed.
+/// `{cache_dir}/atomdrift/filefacts`, resolved once per process. Creates
+/// nothing below the OS cache directory.
+///
+/// The cache directory must pass [`crate::cache_sweep::trusted_dir`]: an
+/// absolute path no other user can change. Entries read from the cache are
+/// served as analysis results and its sweep deletes by path, so a root
+/// another user could redirect or write into — a relative `HOME`, a cache
+/// under a shared directory — would let them plant verdicts or aim deletes
+/// at this user's files. Such a root leaves the cache off.
 fn root_location() -> Option<&'static Path> {
     static ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
     ROOT.get_or_init(|| {
@@ -172,10 +179,19 @@ fn root_location() -> Option<&'static Path> {
         // a private root, removed by nothing but the OS's temp cleanup.
         if cfg!(test) {
             return Some(
-                std::env::temp_dir().join(format!("filefacts-unit-cache-{}", std::process::id())),
+                crate::cache_sweep::trusted_dir(&std::env::temp_dir())?
+                    .join(format!("filefacts-unit-cache-{}", std::process::id())),
             );
         }
-        Some(dirs::cache_dir()?.join("atomdrift").join("filefacts"))
+        // The OS cache directory itself (`~/.cache`) may not exist yet on a
+        // fresh account; it has to before its ownership can be checked.
+        let base = dirs::cache_dir()?;
+        if !base.is_absolute() {
+            return None;
+        }
+        let _ = fs::create_dir_all(&base);
+        let base = crate::cache_sweep::trusted_dir(&base)?;
+        Some(base.join("atomdrift").join("filefacts"))
     })
     .as_deref()
 }
@@ -720,7 +736,7 @@ where
 
 /// Best-effort cache-entry path predicate. Returns `true` when a cached
 /// entry for the given bytes under `variant` already exists on disk.
-/// Read-only: creates nothing.
+/// Creates no cache entry or shard.
 pub fn is_cached(bytes: &[u8], variant: &str) -> bool {
     root_location()
         .and_then(|root| entry_location(root, &cache_key(bytes, variant)))

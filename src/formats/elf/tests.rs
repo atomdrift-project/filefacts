@@ -718,3 +718,326 @@ fn absence_fields_distinguish_section_presence_and_empty_full_tables() {
         assert_eq!(m.get("binary.is_stripped"), Some(0.0));
     }
 }
+
+/// One section header for [`elf_over_payload`], over the file range
+/// `off..off + size`.
+#[derive(Clone, Copy, Default)]
+struct Sec<'a> {
+    name: &'a str,
+    ty: u32,
+    flags: u64,
+    off: u64,
+    size: u64,
+    link: u32,
+    info: u32,
+    entsize: u64,
+}
+
+/// File offset of the `payload` argument in [`elf_over_payload`].
+const PAYLOAD: u64 = 64;
+
+/// A little-endian ELF64 `ET_DYN` with `payload` at [`PAYLOAD`], then a
+/// `.shstrtab`, the program headers `phdrs` (`(p_type, p_offset, p_filesz)`,
+/// vaddr equal to offset) and the section headers `secs` (indices from 1,
+/// `.shstrtab` last). Equal names share one string.
+fn elf_over_payload(payload: &[u8], phdrs: &[(u32, u64, u64)], secs: &[Sec<'_>]) -> Vec<u8> {
+    let mut b = vec![0u8; PAYLOAD as usize];
+    b.extend_from_slice(payload);
+    let shstr_off = b.len();
+    let mut shstr = vec![0u8];
+    let mut name_off = std::collections::HashMap::new();
+    for name in secs.iter().map(|s| s.name).chain([".shstrtab"]) {
+        name_off.entry(name).or_insert_with(|| {
+            let off = shstr.len() as u32;
+            shstr.extend_from_slice(name.as_bytes());
+            shstr.push(0);
+            off
+        });
+    }
+    b.extend_from_slice(&shstr);
+    b.resize(b.len().next_multiple_of(8), 0);
+    let phoff = b.len();
+    for &(ty, off, size) in phdrs {
+        let mut ph = [0u8; 56];
+        ph[0..4].copy_from_slice(&ty.to_le_bytes());
+        ph[4..8].copy_from_slice(&4u32.to_le_bytes()); // PF_R
+        ph[8..16].copy_from_slice(&off.to_le_bytes());
+        ph[16..24].copy_from_slice(&off.to_le_bytes());
+        ph[24..32].copy_from_slice(&off.to_le_bytes());
+        ph[32..40].copy_from_slice(&size.to_le_bytes());
+        ph[40..48].copy_from_slice(&size.to_le_bytes());
+        ph[48..56].copy_from_slice(&4u64.to_le_bytes());
+        b.extend_from_slice(&ph);
+    }
+    let shoff = b.len();
+    b.extend_from_slice(&[0u8; 64]); // SHN_UNDEF
+    let shstrtab = Sec {
+        name: ".shstrtab",
+        ty: 3,
+        off: shstr_off as u64,
+        size: shstr.len() as u64,
+        ..Sec::default()
+    };
+    for s in secs.iter().chain([&shstrtab]) {
+        let mut sh = [0u8; 64];
+        sh[0..4].copy_from_slice(&name_off[s.name].to_le_bytes());
+        sh[4..8].copy_from_slice(&s.ty.to_le_bytes());
+        sh[8..16].copy_from_slice(&s.flags.to_le_bytes());
+        sh[24..32].copy_from_slice(&s.off.to_le_bytes());
+        sh[32..40].copy_from_slice(&s.size.to_le_bytes());
+        sh[40..44].copy_from_slice(&s.link.to_le_bytes());
+        sh[44..48].copy_from_slice(&s.info.to_le_bytes());
+        sh[48..56].copy_from_slice(&8u64.to_le_bytes());
+        sh[56..64].copy_from_slice(&s.entsize.to_le_bytes());
+        b.extend_from_slice(&sh);
+    }
+    b[0..4].copy_from_slice(b"\x7fELF");
+    b[4] = 2; // ELFCLASS64
+    b[5] = 1; // ELFDATA2LSB
+    b[6] = 1; // EV_CURRENT
+    b[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    b[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+    b[20..24].copy_from_slice(&1u32.to_le_bytes());
+    b[32..40].copy_from_slice(&(phoff as u64).to_le_bytes());
+    b[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
+    b[52..54].copy_from_slice(&64u16.to_le_bytes());
+    b[54..56].copy_from_slice(&56u16.to_le_bytes());
+    b[56..58].copy_from_slice(&(phdrs.len() as u16).to_le_bytes());
+    b[58..60].copy_from_slice(&64u16.to_le_bytes());
+    b[60..62].copy_from_slice(&(secs.len() as u16 + 2).to_le_bytes());
+    b[62..64].copy_from_slice(&(secs.len() as u16 + 1).to_le_bytes());
+    b
+}
+
+/// A `.dynamic` image: each `(d_tag, d_val)` then `DT_NULL`.
+fn dynamic_entries(entries: &[(u64, u64)]) -> Vec<u8> {
+    entries
+        .iter()
+        .chain([&(0, 0)])
+        .flat_map(|&(tag, val)| [tag.to_le_bytes(), val.to_le_bytes()])
+        .flatten()
+        .collect()
+}
+
+/// Total bytes of the strings in the JSON array at `key`.
+fn string_bytes(v: &Values, key: &str) -> usize {
+    v.get(key).and_then(JsonValue::as_array).map_or(0, |a| {
+        a.iter().filter_map(JsonValue::as_str).map(str::len).sum()
+    })
+}
+
+#[test]
+fn name_budget_refuses_everything_after_the_first_overrun() {
+    let mut names = NameBudget::new(5);
+    assert!(names.take(6));
+    assert!(names.take(4));
+    assert!(!names.refused());
+    assert!(!names.take(1));
+    assert!(!names.take(0), "a spent view stays spent");
+    assert!(names.refused());
+}
+
+#[test]
+fn range_cover_matches_a_pairwise_scan() {
+    let ranges = [(0, 10), (5, 7), (20, 30), (25, 40), (100, 100)];
+    let cover = RangeCover::new(ranges.to_vec());
+    for start in 0..45 {
+        for end in start..45 {
+            let pairwise = ranges.iter().any(|&(s, e)| start >= s && end <= e);
+            assert_eq!(cover.contains(start, end), pairwise, "{start}..{end}");
+        }
+    }
+    assert!(!cover.is_empty());
+    assert!(RangeCover::new(Vec::new()).is_empty());
+    assert!(!RangeCover::new(Vec::new()).contains(0, 0));
+}
+
+/// Every `DT_NEEDED` entry may name the same NUL-less run: 2048 entries over
+/// a 64 KiB run was 128 MiB of library names, and twice that again in
+/// `dyn_hash`. The copies now stop at twice the file length.
+#[test]
+fn shared_long_library_name_is_not_copied_per_entry() {
+    const RUN: usize = 64 * 1024;
+    const NEEDED: u64 = 2048;
+    let mut payload = vec![0u8]; // dynstr: "" then a run with no NUL
+    payload.extend(std::iter::repeat_n(b'a', RUN));
+    let dyn_off = PAYLOAD + payload.len() as u64;
+    let mut entries = vec![(5, PAYLOAD), (10, payload.len() as u64)]; // DT_STRTAB, DT_STRSZ
+    entries.extend((0..NEEDED).map(|_| (1, 1))); // DT_NEEDED "aaa…"
+    let dynamic = dynamic_entries(&entries);
+    payload.extend_from_slice(&dynamic);
+    let file_end = PAYLOAD + payload.len() as u64;
+    let bytes = elf_over_payload(
+        &payload,
+        &[(1, 0, file_end), (2, dyn_off, dynamic.len() as u64)], // PT_LOAD, PT_DYNAMIC
+        &[],
+    );
+    let elf = Elf::parse(&bytes).unwrap();
+    assert_eq!(
+        elf.libraries.len(),
+        NEEDED as usize,
+        "goblin keeps every entry"
+    );
+
+    let (v, _, _) = run(&bytes);
+    let copied = string_bytes(&v, "elf.needed");
+    assert!(
+        copied > 0 && copied <= 2 * bytes.len(),
+        "{copied} bytes copied"
+    );
+    assert!(
+        v.get("elf.hashes.dyn_hash").is_none(),
+        "no hash of a partial list"
+    );
+}
+
+/// `.symtab` entries may all name one NUL-less run: symhash lowercased a copy
+/// per entry (4096 × 64 KiB = 256 MiB). An overrun now yields no hash, while
+/// an ordinary table still hashes.
+#[test]
+fn shared_long_symbol_name_does_not_amplify_symhash() {
+    fn symtab_elf(strtab: &[u8], count: usize) -> Vec<u8> {
+        let mut payload = strtab.to_vec();
+        payload.resize(payload.len().next_multiple_of(8), 0);
+        let symtab_off = PAYLOAD + payload.len() as u64;
+        for _ in 0..count {
+            let mut sym = [0u8; 24];
+            sym[0..4].copy_from_slice(&1u32.to_le_bytes()); // st_name
+            sym[4] = 0x10; // STB_GLOBAL, SHN_UNDEF
+            payload.extend_from_slice(&sym);
+        }
+        elf_over_payload(
+            &payload,
+            &[],
+            &[
+                Sec {
+                    name: ".strtab",
+                    ty: 3,
+                    off: PAYLOAD,
+                    size: strtab.len() as u64,
+                    ..Sec::default()
+                },
+                Sec {
+                    name: ".symtab",
+                    ty: 2,
+                    off: symtab_off,
+                    size: (count * 24) as u64,
+                    link: 1,
+                    entsize: 24,
+                    ..Sec::default()
+                },
+            ],
+        )
+    }
+    let mut run_strtab = vec![0u8];
+    run_strtab.extend(std::iter::repeat_n(b'A', 64 * 1024));
+    let bytes = symtab_elf(&run_strtab, 4096);
+    assert_eq!(Elf::parse(&bytes).unwrap().syms.len(), 4096);
+    assert!(run(&bytes).0.get("elf.hashes.symhash").is_none());
+
+    let bytes = symtab_elf(b"\0printf\0", 2);
+    assert!(run(&bytes).0.get("elf.hashes.symhash").is_some());
+}
+
+/// Version-need walks follow file-controlled links with a 16-bit aux count
+/// per need, so 1024 needs sharing one 1024-entry aux chain was a million
+/// `lib@ver` strings from 32 KiB. The walk now stops at the record cap.
+#[test]
+fn shared_verneed_aux_chain_is_walked_once_per_cap() {
+    const NEEDS: u32 = 1024;
+    const AUX: u32 = 1024;
+    let mut payload = b"\0a\0b\0".to_vec(); // dynstr
+    payload.resize(8, 0);
+    let verneed_off = PAYLOAD + payload.len() as u64;
+    let aux_start = 16 * NEEDS;
+    for i in 0..NEEDS {
+        payload.extend_from_slice(&1u16.to_le_bytes()); // vn_version
+        payload.extend_from_slice(&(AUX as u16).to_le_bytes()); // vn_cnt
+        payload.extend_from_slice(&1u32.to_le_bytes()); // vn_file "a"
+        payload.extend_from_slice(&(aux_start - 16 * i).to_le_bytes()); // vn_aux
+        payload.extend_from_slice(&16u32.to_le_bytes()); // vn_next
+    }
+    for _ in 0..AUX {
+        payload.extend_from_slice(&[0; 8]); // vna_hash, vna_flags, vna_other
+        payload.extend_from_slice(&3u32.to_le_bytes()); // vna_name "b"
+        payload.extend_from_slice(&16u32.to_le_bytes()); // vna_next
+    }
+    let verneed_len = PAYLOAD + payload.len() as u64 - verneed_off;
+    let dyn_off = PAYLOAD + payload.len() as u64;
+    let dynamic = dynamic_entries(&[(5, PAYLOAD), (10, 5)]); // DT_STRTAB, DT_STRSZ
+    payload.extend_from_slice(&dynamic);
+    let file_end = PAYLOAD + payload.len() as u64;
+    let bytes = elf_over_payload(
+        &payload,
+        &[(1, 0, file_end), (2, dyn_off, dynamic.len() as u64)],
+        &[Sec {
+            name: ".gnu.version_r",
+            ty: 0x6fff_fffe, // SHT_GNU_VERNEED
+            off: verneed_off,
+            size: verneed_len,
+            info: NEEDS, // need count
+            ..Sec::default()
+        }],
+    );
+    let (v, _, _) = run(&bytes);
+    let versions = v.get("elf.needed_versions").unwrap().as_array().unwrap();
+    assert_eq!(versions.len(), MAX_VERSION_RECORDS);
+    assert_eq!(versions[0], "a@b");
+}
+
+/// Note program headers may all cover one run of notes: 2000 `PT_NOTE`
+/// headers over 4096 empty notes was 8 million drained notes. The walk is now
+/// charged against the file length.
+#[test]
+fn overlapping_note_segments_are_walked_within_the_file_budget() {
+    let mut payload = Vec::new();
+    for _ in 0..4096 {
+        payload.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]); // empty note, type 1
+    }
+    let len = payload.len() as u64;
+    let phdrs = vec![(4, PAYLOAD, len); 2000]; // PT_NOTE
+    let bytes = elf_over_payload(&payload, &phdrs, &[]);
+    let (_, _, m) = run(&bytes);
+    let notes = m.get("elf.note_count").unwrap();
+    assert!(
+        notes >= 4096.0 && notes <= (bytes.len() / 12) as f64,
+        "{notes}"
+    );
+}
+
+/// Section names are cut before they are hashed or copied: every header may
+/// name a distinct suffix of one NUL-less run, which `name_seen` used to copy
+/// whole (1000 headers over 64 KiB is 64 MiB of keys).
+#[test]
+fn distinct_long_section_names_are_cut() {
+    let mut payload = vec![b'.'];
+    payload.extend(std::iter::repeat_n(b'x', 64 * 1024));
+    let mut bytes = elf_over_payload(&payload, &[], &[]);
+    let elf = Elf::parse(&bytes).unwrap();
+    let shstrtab = elf.section_headers.last().unwrap().clone();
+    drop(elf);
+    // Point `.shstrtab` at the run plus its own table, then grow the header
+    // count by repeating the last header with names walking the run.
+    let shoff = u64::from_le_bytes(bytes[40..48].try_into().unwrap()) as usize;
+    let run_size = shstrtab.sh_offset + shstrtab.sh_size - PAYLOAD;
+    bytes[shoff + 64 + 24..shoff + 64 + 32].copy_from_slice(&PAYLOAD.to_le_bytes());
+    bytes[shoff + 64 + 32..shoff + 64 + 40].copy_from_slice(&run_size.to_le_bytes());
+    let template: [u8; 64] = bytes[shoff + 64..shoff + 128].try_into().unwrap();
+    for i in 0..1000u32 {
+        let mut sh = template;
+        sh[0..4].copy_from_slice(&i.to_le_bytes());
+        sh[4..8].copy_from_slice(&1u32.to_le_bytes()); // SHT_PROGBITS
+        bytes.extend_from_slice(&sh);
+    }
+    bytes[60..62].copy_from_slice(&1002u16.to_le_bytes());
+    let elf = Elf::parse(&bytes).unwrap();
+    let names: Vec<&str> = elf
+        .section_headers
+        .iter()
+        .map(|sh| section_name(&elf, sh))
+        .collect();
+    assert!(names.iter().all(|n| n.chars().count() <= MAX_SECTION_NAME));
+    assert!(names.iter().any(|n| n.chars().count() == MAX_SECTION_NAME));
+    let (_, _, m) = run(&bytes);
+    assert!(m.get("elf.duplicate_section_name_count").is_some());
+}

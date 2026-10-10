@@ -31,6 +31,7 @@ use crate::formats::common::bytes_at::{u16_le, u32_le, u64_le};
 use crate::output::{ArchiveMember, ArchiveOffsets, Metrics, Values};
 use crate::value_key;
 
+use super::bounded::MAX_PATH_BYTES;
 use super::iso::SECTOR;
 
 /// The Anchor Volume Descriptor Pointer sits at a fixed sector; ECMA-167
@@ -46,6 +47,11 @@ const MAX_ENTRIES: usize = 65_536;
 const MAX_DEPTH: u32 = 32;
 /// Cap on a single directory extent read.
 const MAX_DIR_EXTENT: usize = 32 << 20;
+/// Directory-extent bytes parsed across the whole walk. `visited` keys a
+/// directory on its ICB, so `MAX_DIRS` distinct ICBs can all point at one
+/// `MAX_DIR_EXTENT` run of identifiers: a quarter-terabyte of parsing from a
+/// 32 MiB image. Real trees spend well under 100 bytes per identifier.
+const MAX_DIR_BYTES_TOTAL: usize = 128 << 20;
 
 /// Descriptor tag identifiers used here (ECMA-167 §3/4).
 mod tag {
@@ -435,6 +441,10 @@ struct TreeWalk<'a, 'v> {
     dir_count: u64,
     /// Child directories queued: the work the dedup-at-queue bounds.
     dirs_queued: usize,
+    /// Directory-extent bytes the rest of the walk may still parse.
+    dir_budget: usize,
+    /// Path bytes the rest of the walk may still build.
+    path_budget: usize,
     truncated: bool,
 }
 
@@ -447,8 +457,28 @@ impl<'a, 'v> TreeWalk<'a, 'v> {
             file_count: 0,
             dir_count: 0,
             dirs_queued: 0,
+            dir_budget: MAX_DIR_BYTES_TOTAL,
+            path_budget: MAX_PATH_BYTES,
             truncated: false,
         }
+    }
+
+    /// `prefix/name`, charged against the path budget. `None` once the
+    /// budget is spent: every member below a deep chain repeats its
+    /// ancestors' names, so the paths, not the names, are what grow.
+    fn path(&mut self, prefix: &str, name: &str) -> Option<String> {
+        let len = prefix.len() + usize::from(!prefix.is_empty()) + name.len();
+        let Some(left) = self.path_budget.checked_sub(len) else {
+            self.path_budget = 0;
+            self.truncated = true;
+            return None;
+        };
+        self.path_budget = left;
+        Some(if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
+        })
     }
 
     fn run(&mut self, root_icb: u32) {
@@ -484,8 +514,12 @@ impl<'a, 'v> TreeWalk<'a, 'v> {
                     .and_then(|(len, blk)| self.vol.range(blk, len as usize))
             };
             let Some(data) = data else { continue };
+            let Some(left) = self.dir_budget.checked_sub(data.len()) else {
+                self.truncated = true;
+                return;
+            };
+            self.dir_budget = left;
             for (name, child_icb, is_dir) in parse_fids(data) {
-                let path = format!("{prefix}/{name}");
                 if is_dir {
                     if self.visited.contains(&child_icb) {
                         continue;
@@ -494,12 +528,18 @@ impl<'a, 'v> TreeWalk<'a, 'v> {
                         self.truncated = true;
                         continue;
                     }
+                    let Some(path) = self.path(&prefix, &name) else {
+                        return;
+                    };
                     self.visited.insert(child_icb);
                     self.dirs_queued += 1;
                     queue.push_back((child_icb, path, depth + 1));
                     continue;
                 }
-                self.emit_file(&path, child_icb);
+                let Some(path) = self.path(&prefix, &name) else {
+                    return;
+                };
+                self.emit_file(path, child_icb);
                 if self.members.len() >= MAX_ENTRIES {
                     self.truncated = true;
                     return;
@@ -508,7 +548,7 @@ impl<'a, 'v> TreeWalk<'a, 'v> {
         }
     }
 
-    fn emit_file(&mut self, path: &str, icb: u32) {
+    fn emit_file(&mut self, path: String, icb: u32) {
         let Some(block) = self.vol.block(icb) else {
             return;
         };
@@ -521,7 +561,7 @@ impl<'a, 'v> TreeWalk<'a, 'v> {
             .filter(|_| !entry.embedded)
             .map(|(_, blk)| self.vol.byte_offset(blk));
         self.members.push(ArchiveMember {
-            path: path.trim_start_matches('/').to_string(),
+            path,
             size_bytes: entry.info_length,
             entry_type: Some(
                 match entry.file_type {
@@ -709,6 +749,52 @@ mod tests {
         assert_eq!(walk.dirs_queued, k);
         assert_eq!(walk.dir_count, k as u64 + 1);
         assert!(!walk.truncated);
+        // Only the root's `k` one-byte names became paths: identifiers
+        // naming an already-visited directory build none.
+        assert_eq!(MAX_PATH_BYTES - walk.path_budget, k);
+    }
+
+    /// The same directories, walked under spent budgets: the directory-byte
+    /// budget stops the walk before every ICB re-parses the shared extent,
+    /// and the path budget stops it before its paths outgrow the cap.
+    #[test]
+    fn walk_stops_at_dir_and_path_budgets() {
+        let k = 64_usize;
+        let record_len = 40_usize;
+        let data_block = k + 1;
+        let data_len = k * record_len;
+        let mut bytes = vec![0_u8; (data_block + data_len.div_ceil(SECTOR) + 1) * SECTOR];
+        for block in 0..=k {
+            directory_entry(&mut bytes, block, data_block as u32, data_len as u32);
+        }
+        for i in 0..k {
+            let at = data_block * SECTOR + i * record_len;
+            let fid = &mut bytes[at..at + record_len];
+            fid[0..2].copy_from_slice(&tag::FILE_IDENTIFIER.to_le_bytes());
+            fid[18] = 0x02;
+            fid[19] = 2;
+            fid[24..28].copy_from_slice(&((i + 1) as u32).to_le_bytes());
+            fid[38] = 8;
+            fid[39] = b'd';
+        }
+        let vol = Volume {
+            bytes: &bytes,
+            partition_start: 0,
+            block_size: SECTOR as u32,
+        };
+
+        let mut walk = TreeWalk::new(&vol);
+        walk.dir_budget = 3 * data_len;
+        walk.run(0);
+        assert!(walk.truncated);
+        assert_eq!(walk.dir_count, 4);
+
+        let mut walk = TreeWalk::new(&vol);
+        walk.path_budget = 10;
+        walk.run(0);
+        assert!(walk.truncated);
+        assert_eq!(walk.dirs_queued, 10);
+        assert_eq!(walk.path_budget, 0);
     }
 
     #[test]

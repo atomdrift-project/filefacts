@@ -330,6 +330,52 @@ fn ntfs_stream_is_tied_to_the_preceding_file() {
     );
 }
 
+/// Every `STM` block copies the last file's name. A 60 KiB name followed
+/// by thousands of tiny stream blocks stops at the stream path budget.
+#[test]
+fn ntfs_streams_stop_at_the_path_budget() {
+    let mut stm_specific = Vec::new();
+    stm_specific.extend(vint(0));
+    stm_specific.extend(vint(0));
+    stm_specific.extend(vint(0));
+    stm_specific.extend(vint(0));
+    stm_specific.extend(vint(1));
+    stm_specific.extend(vint(3));
+    stm_specific.extend(b"STM");
+    let stm = rar5_block(
+        HEAD5_SERVICE,
+        HFL_DATA | HFL_CHILD,
+        0,
+        Some(0),
+        &stm_specific,
+        &[],
+        &[],
+    );
+    let host = "h".repeat(60_000);
+    let blocks = 1_000;
+    let mut bytes = archive(&[&rar5_main(), &rar5_file(&host, b"x", &[])]);
+    for _ in 0..blocks {
+        bytes.extend_from_slice(&stm);
+    }
+    bytes.extend(rar5_end());
+    let (values, metrics, _) = run(&bytes);
+    let streams = metrics.get("rar.ntfs_stream_count").unwrap() as usize;
+    let per_stream = 2 * (host.len() + "$DATA".len()) + 1;
+    assert_eq!(streams, MAX_PATH_BYTES / per_stream);
+    assert!(streams < blocks);
+    let limits = values
+        .get("rar.limits")
+        .and_then(JsonValue::as_array)
+        .unwrap();
+    assert_eq!(
+        limits
+            .iter()
+            .filter(|l| l["stage"] == "stream-path-budget")
+            .count(),
+        1
+    );
+}
+
 #[test]
 fn symlink_and_unix_owner_land_on_the_member() {
     let mut recs = Vec::new();

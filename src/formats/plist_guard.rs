@@ -179,17 +179,28 @@ fn bplist_expanded_len(bytes: &[u8], cap: u64) -> Option<u64> {
 
     // Post-order walk with memoized sizes: a collection is its start and end
     // plus everything its references expand to.
+    //
+    // Each reference read is an edge the expansion repeats at least once, so
+    // reading more than `cap` of them already shows the expansion passes it.
+    // Without that count, many objects sharing one large collection's bytes
+    // made the walk itself quadratic before any size reached the cap.
     const OPEN: u64 = u64::MAX;
     let mut size = vec![0u64; objects];
-    let mut stack = vec![(top, children(top)?, 0usize)];
+    let top_kids = children(top)?;
+    let mut refs_read = top_kids.len() as u64;
+    let mut stack = vec![(top, top_kids, 0usize)];
     *size.get_mut(top)? = OPEN;
     while let Some((object, kids, next)) = stack.last_mut() {
+        if refs_read > cap {
+            return Some(refs_read);
+        }
         if let Some(&kid) = kids.get(*next) {
             *next += 1;
             match *size.get(kid)? {
                 OPEN => return None,
                 0 => {
                     let grandkids = children(kid)?;
+                    refs_read = refs_read.saturating_add(grandkids.len() as u64);
                     if grandkids.is_empty() {
                         *size.get_mut(kid)? = 1;
                     } else {
@@ -247,6 +258,36 @@ pub(super) fn reference_dag(levels: u8) -> Vec<u8> {
     bytes.extend([0u8; 6]);
     bytes.extend([1, 1]);
     bytes.extend((offsets.len() as u64).to_be_bytes());
+    bytes.extend(0u64.to_be_bytes());
+    bytes.extend(table.to_be_bytes());
+    bytes
+}
+
+/// A binary plist whose top array references `shared` objects that all sit at
+/// one offset: an array of `shared` references to a single integer. A few
+/// bytes per reference, and `shared`² references to walk.
+#[cfg(test)]
+pub(super) fn shared_collection(shared: u32) -> Vec<u8> {
+    let array = |refs: &mut dyn Iterator<Item = u32>| {
+        let mut out = vec![0xAF, 0x12];
+        out.extend(shared.to_be_bytes());
+        refs.for_each(|r| out.extend(r.to_be_bytes()));
+        out
+    };
+    let mut bytes = b"bplist00".to_vec();
+    let top_at = bytes.len() as u32;
+    bytes.extend(array(&mut (1..=shared)));
+    let shared_at = bytes.len() as u32;
+    bytes.extend(array(&mut std::iter::repeat_n(shared + 1, shared as usize)));
+    let int_at = bytes.len() as u32;
+    bytes.extend([0x10, 0x00]);
+    let table = bytes.len() as u64;
+    bytes.extend(top_at.to_be_bytes());
+    (0..shared).for_each(|_| bytes.extend(shared_at.to_be_bytes()));
+    bytes.extend(int_at.to_be_bytes());
+    bytes.extend([0u8; 6]);
+    bytes.extend([4, 4]);
+    bytes.extend((u64::from(shared) + 2).to_be_bytes());
     bytes.extend(0u64.to_be_bytes());
     bytes.extend(table.to_be_bytes());
     bytes

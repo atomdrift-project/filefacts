@@ -61,6 +61,17 @@ const MAX_INFLATED: usize = 1 << 20;
 /// thousands of object streams pins gigabytes.
 const MAX_OBJSTM_TOTAL: usize = 16 << 20;
 
+/// Input bytes one literal string may span. Four per output byte covers
+/// a string of 1 KiB written entirely in `\ddd` escapes, the densest
+/// spelling there is.
+const MAX_LITERAL_SPAN: usize = 4 * 1024;
+
+/// Action sites recorded per document. Each becomes a JSON entry of up to
+/// a kilobyte from as little as six input bytes; a dictionary packed with
+/// `/URI(` otherwise grew the values tree a hundredfold. Link-heavy real
+/// documents carry a few thousand.
+const MAX_ACTIONS: usize = 65_536;
+
 /// Upper bound on how many form-field rects we run the O(n²)
 /// overlap check across. Real PDFs hold a handful per page; with
 /// thousands of widgets the pairwise pass dominates parse time.
@@ -342,8 +353,21 @@ pub(super) fn extract(
         // anything that hits it is well outside the real-world range.
         metrics.insert(metric!("pdf.dict_region_truncated"), 1.0);
     }
-    let mut actions = scan_actions(bytes, &dict_regions);
-    actions.extend(objstm_actions(&objstm_text));
+    // One site past the cap is read to tell a document that reaches it
+    // from one that runs over.
+    let mut actions = scan_actions(bytes, &dict_regions, MAX_ACTIONS + 1);
+    actions.extend(objstm_actions(
+        &objstm_text,
+        (MAX_ACTIONS + 1).saturating_sub(actions.len()),
+    ));
+    if actions.len() > MAX_ACTIONS {
+        actions.truncate(MAX_ACTIONS);
+        push_pdf_limit(
+            values,
+            "action-cap",
+            format!("action sites past the first {MAX_ACTIONS} not recorded"),
+        );
+    }
     let uri_action_count = action_count_by_kind(&actions, "uri");
     let javascript_action_count = action_count_by_kind(&actions, "javascript");
     let upload_directory_uri_count = count_upload_directory_uris(&actions);
@@ -633,12 +657,17 @@ fn value_after_key(bytes: &[u8], after_key: usize) -> Option<String> {
 
 /// PDF literal strings are `(text)` with balanced parens and `\)`
 /// escapes. We cap at 1024 bytes and decode lossily to UTF-8.
+///
+/// The input read is capped too, at [`MAX_LITERAL_SPAN`]: a line
+/// continuation produces no output, so the output cap alone let every site
+/// in a dictionary of continuations read to its end.
 fn read_literal_string(bytes: &[u8], start: usize) -> Option<String> {
     const CAP: usize = 1024;
     let mut depth = 1_i32;
     let mut out = Vec::new();
     let mut i = start;
-    while out.len() < CAP {
+    let span_end = start.saturating_add(MAX_LITERAL_SPAN);
+    while out.len() < CAP && i < span_end {
         let Some(&b) = bytes.get(i) else {
             break;
         };
@@ -708,30 +737,33 @@ fn decode_text_string(raw: &[u8]) -> String {
 }
 
 /// PDF hex strings are `<HH HH …>`. Decode pairs to bytes, then to
-/// UTF-8 / UTF-16BE the same way as literal strings.
+/// UTF-8 / UTF-16BE the same way as literal strings. A final odd digit
+/// is the high nibble of a last byte.
+///
+/// The read stops at the first byte that is neither a hex digit nor
+/// whitespace, so it never runs past the value: finding the closing `>`
+/// first made each of many `/URI <` sites in one dictionary scan the rest
+/// of it.
 fn read_hex_string(bytes: &[u8], start: usize) -> Option<String> {
-    let rest = bytes.get(start..)?;
-    let end = rest.iter().position(|&b| b == b'>')?;
-    let hex_only: Vec<u8> = rest
-        .get(..end)?
-        .iter()
-        .filter(|b| !b.is_ascii_whitespace())
-        .copied()
-        .collect();
-    let mut out = Vec::with_capacity(hex_only.len() / 2);
-    for chunk in hex_only.chunks(2) {
-        let (&hi, lo) = chunk.split_first()?;
-        let hi = hex_nibble(hi)?;
-        let lo = match lo.first() {
-            Some(&lo) => hex_nibble(lo)?,
-            None => 0,
-        };
-        out.push((hi << 4) | lo);
+    let mut out = Vec::new();
+    let mut high = None;
+    for &b in bytes.get(start..)? {
+        if b == b'>' {
+            if let Some(h) = high {
+                out.push(h << 4);
+            }
+            return (!out.is_empty()).then(|| decode_text_string(&out));
+        }
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        let nibble = hex_nibble(b)?;
+        match high.take() {
+            None => high = Some(nibble),
+            Some(h) => out.push((h << 4) | nibble),
+        }
     }
-    if out.is_empty() {
-        return None;
-    }
-    Some(decode_text_string(&out))
+    None
 }
 
 /// PDF names start with `/` and continue with regular characters
@@ -812,6 +844,8 @@ fn split_trailing(bytes: &[u8], pred: impl Fn(&u8) -> bool) -> (&[u8], &[u8]) {
 fn collect_dict_regions(bytes: &[u8]) -> Vec<DictRegion> {
     let mut out = Vec::new();
     let mut pos = 0;
+    let mut next_endobj = NextToken::new(b"endobj");
+    let mut next_endstream = NextToken::new(b"endstream");
     while pos < bytes.len() {
         if out.len() >= MAX_DICT_REGIONS {
             break;
@@ -842,7 +876,7 @@ fn collect_dict_regions(bytes: &[u8]) -> Vec<DictRegion> {
         // in the file, and a tagged PDF ends with thousands of
         // stream-less structure objects, so each of them scanned to
         // end-of-file — minutes for a 5 MB manual (fleet, 2026-09-06).
-        let endobj_end = find_token_after(bytes, dict_start, b"endobj");
+        let endobj_end = next_endobj.find(bytes, dict_start);
         let stream_end_marker = find_token_between(
             bytes,
             dict_start,
@@ -869,11 +903,14 @@ fn collect_dict_regions(bytes: &[u8]) -> Vec<DictRegion> {
                     body_start += 1;
                 }
                 let dict = bytes.get(dict_start..dict_end).unwrap_or_default();
-                let body_end = match classify_stream_length(dict) {
-                    LengthValue::Direct(n) => declared_stream_end(bytes, body_start, n)
-                        .unwrap_or_else(|| fallback_stream_end(bytes, body_start, e)),
-                    _ => fallback_stream_end(bytes, body_start, e),
+                let declared = match classify_stream_length(dict) {
+                    LengthValue::Direct(n) => declared_stream_end(bytes, body_start, n),
+                    _ => None,
                 };
+                let body_end = declared.unwrap_or_else(|| {
+                    let endstream = next_endstream.find(bytes, body_start).unwrap_or(e);
+                    fallback_stream_end(bytes, body_start, endstream)
+                });
                 Some((body_start, body_end))
             } else {
                 None
@@ -941,6 +978,45 @@ fn find_token_between(bytes: &[u8], from: usize, to: usize, needle: &[u8]) -> Op
         })
 }
 
+/// The first whole-token occurrence of a needle at or after a position, for
+/// a walk whose positions only grow.
+///
+/// The answer for one position holds for every later one up to the token
+/// itself, and "none left" holds for good, so a search runs again only once
+/// the walk has passed the token it found. Searching afresh for each object
+/// made a file of objects missing their `endobj` or `endstream` quadratic:
+/// every one scanned to end-of-file for the token that was not there.
+struct NextToken {
+    needle: &'static [u8],
+    /// Whether `found` holds a search result yet.
+    searched: bool,
+    /// The last search's result; `None` once none is left.
+    found: Option<usize>,
+}
+
+impl NextToken {
+    fn new(needle: &'static [u8]) -> Self {
+        Self {
+            needle,
+            searched: false,
+            found: None,
+        }
+    }
+
+    fn find(&mut self, bytes: &[u8], from: usize) -> Option<usize> {
+        if self.searched {
+            match self.found {
+                Some(at) if at >= from => return Some(at),
+                None => return None,
+                Some(_) => {}
+            }
+        }
+        self.searched = true;
+        self.found = find_token_after(bytes, from, self.needle);
+        self.found
+    }
+}
+
 /// Return the stream body end implied by a direct `/Length`, but only
 /// when `endstream` sits exactly at that boundary. PDF writers
 /// normally put an EOL before `endstream`, but real generated PDFs may
@@ -967,8 +1043,9 @@ fn declared_stream_end(bytes: &[u8], body_start: usize, declared: u64) -> Option
         .map(|_| body_end)
 }
 
-fn fallback_stream_end(bytes: &[u8], body_start: usize, object_end: usize) -> usize {
-    let endstream = find_token_after(bytes, body_start, b"endstream").unwrap_or(object_end);
+/// The end of a stream body that runs from `body_start` to `endstream`
+/// (the `endstream` token, or the object's end when there is none).
+fn fallback_stream_end(bytes: &[u8], body_start: usize, endstream: usize) -> usize {
     // Trim a single trailing CR/LF before `endstream`.
     let mut body_end = endstream;
     if body_end > body_start && byte_before(bytes, body_end) == b'\n' {
@@ -990,7 +1067,9 @@ fn fallback_stream_end(bytes: &[u8], body_start: usize, object_end: usize) -> us
 /// When a containing object is also the catalog (i.e. carries
 /// `/Type /Catalog`) the source is recorded as `"openaction"`
 /// instead — that's the canonical name cleave's parser used.
-fn scan_actions(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<JsonValue> {
+///
+/// At most `cap` sites are recorded.
+fn scan_actions(bytes: &[u8], dict_regions: &[DictRegion], cap: usize) -> Vec<JsonValue> {
     const KINDS: &[(&[u8], &str)] = &[
         (b"/JS", "javascript"),
         (b"/Launch", "launch"),
@@ -1007,7 +1086,7 @@ fn scan_actions(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<JsonValue> {
         let DictRegion {
             start, end, obj_id, ..
         } = *region_info;
-        if end <= start {
+        if end <= start || out.len() >= cap {
             continue;
         }
         let region = region_info.dict(bytes);
@@ -1038,6 +1117,9 @@ fn scan_actions(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<JsonValue> {
                 // — filters out `/S /URI` action-type declarations
                 // (where `/URI` is a *name value*, not a key).
                 if let Some(snip) = action_snippet(region, next) {
+                    if out.len() >= cap {
+                        return out;
+                    }
                     let mut entry = serde_json::Map::new();
                     entry.insert("kind".into(), JsonValue::String((*kind).to_string()));
                     entry.insert("source".into(), JsonValue::String(source.clone()));
@@ -1061,8 +1143,9 @@ fn scan_actions(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<JsonValue> {
 ///
 /// Objects inside an ObjStm have no `obj` framing -- the stream is a table of
 /// offsets followed by the dictionaries end to end -- so the decoded buffer is
-/// handed to [`scan_actions`] as a single region.
-fn objstm_actions(decoded: &[(Option<u32>, Vec<u8>)]) -> Vec<JsonValue> {
+/// handed to [`scan_actions`] as a single region. At most `cap` sites are
+/// recorded.
+fn objstm_actions(decoded: &[(Option<u32>, Vec<u8>)], cap: usize) -> Vec<JsonValue> {
     let mut out = Vec::new();
     for (obj_id, text) in decoded {
         let whole = DictRegion {
@@ -1071,7 +1154,8 @@ fn objstm_actions(decoded: &[(Option<u32>, Vec<u8>)]) -> Vec<JsonValue> {
             obj_id: *obj_id,
             stream_range: None,
         };
-        for mut action in scan_actions(text, std::slice::from_ref(&whole)) {
+        let left = cap.saturating_sub(out.len());
+        for mut action in scan_actions(text, std::slice::from_ref(&whole), left) {
             // Say where it really came from: inside object stream <id>, not
             // object <id> itself.
             if let (Some(map), Some(id)) = (action.as_object_mut(), *obj_id) {

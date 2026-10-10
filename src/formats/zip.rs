@@ -23,9 +23,11 @@
 use crate::metric;
 use crate::value_key;
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::io::{Cursor, Read, Seek};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::rc::Rc;
 
 use serde_json::Value as JsonValue;
 use zip::result::ZipError;
@@ -80,9 +82,66 @@ const AGGS: &[Agg] = &[
     Agg::MtimeAnomalies(Dominance::UntimedGroup),
 ];
 
+/// Bytes the `zip` crate may read while opening an archive, per input byte,
+/// on top of [`OPEN_READ_SLACK`]. Opening a well-formed archive reads its
+/// end-of-central-directory search window, the central directory, and a
+/// local header per member (smaller than the member's directory record):
+/// under two passes over the input. But the crate tries every `PK\x05\x06`
+/// in the file as an end record and, for each one that fails, rescans the
+/// directory it names, so an input packed with failing candidates took
+/// quadratic time to refuse (24 s for 1 MiB, minutes for a few MiB). The
+/// budget turns that into a prompt open failure.
+const OPEN_READS_PER_BYTE: u64 = 4;
+
+/// Fixed part of the open read budget, so a small archive's search window
+/// never counts against it.
+const OPEN_READ_SLACK: u64 = 1 << 20;
+
 /// A ZIP the `zip` crate opened: over the input itself, or over a copy whose
 /// local-header signatures [`open`] restored.
-pub(super) type Archive<'a> = ZipArchive<Cursor<Cow<'a, [u8]>>>;
+pub(super) type Archive<'a> = ZipArchive<Budgeted<Cursor<Cow<'a, [u8]>>>>;
+
+/// A reader that fails once its shared byte budget is spent. [`open_crate`]
+/// bounds the `zip` crate's open with it and then lifts the budget: member
+/// reads after the open are bounded by their own caps.
+pub(super) struct Budgeted<R> {
+    inner: R,
+    left: Rc<Cell<u64>>,
+}
+
+impl<R: Read> Read for Budgeted<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.left.get();
+        if left == 0 && !buf.is_empty() {
+            return Err(io::Error::other("zip open read budget exhausted"));
+        }
+        let max = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        let n = self.inner.read(buf.get_mut(..max).unwrap_or_default())?;
+        self.left.set(left.saturating_sub(n as u64));
+        Ok(n)
+    }
+}
+
+impl<R: Seek> Seek for Budgeted<R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+/// Open `bytes` with the `zip` crate, its reads bounded by
+/// [`OPEN_READS_PER_BYTE`] until the archive is open.
+fn open_crate(bytes: Cow<'_, [u8]>) -> Result<Archive<'_>, ZipError> {
+    let budget = (bytes.len() as u64)
+        .saturating_mul(OPEN_READS_PER_BYTE)
+        .saturating_add(OPEN_READ_SLACK);
+    let left = Rc::new(Cell::new(budget));
+    let archive = ZipArchive::new(Budgeted {
+        inner: Cursor::new(bytes),
+        left: Rc::clone(&left),
+    })?;
+    left.set(u64::MAX);
+    Ok(archive)
+}
 
 /// What [`open`] could make of a ZIP.
 enum Opened<'a> {
@@ -103,7 +162,7 @@ enum Opened<'a> {
 /// Open `bytes` as a ZIP. `Err` only when there is no central directory to
 /// read at all — the input is not a ZIP.
 fn open(bytes: &[u8]) -> Result<Opened<'_>, Error> {
-    let error = match ZipArchive::new(Cursor::new(Cow::Borrowed(bytes))) {
+    let error = match open_crate(Cow::Borrowed(bytes)) {
         Ok(archive) => {
             return Ok(Opened::Archive {
                 archive,
@@ -116,7 +175,7 @@ fn open(bytes: &[u8]) -> Result<Opened<'_>, Error> {
         return Err(Error::malformed_caused_by("zip", error));
     };
     if let Some((repaired_bytes, repaired)) = repair_local_headers(bytes, &directory)
-        && let Ok(archive) = ZipArchive::new(Cursor::new(Cow::Owned(repaired_bytes)))
+        && let Ok(archive) = open_crate(Cow::Owned(repaired_bytes))
     {
         return Ok(Opened::Archive { archive, repaired });
     }

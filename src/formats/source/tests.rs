@@ -878,3 +878,43 @@ fn subtraction_density_reflects_concentration() {
         "a packed subtraction array is dense, got {density}"
     );
 }
+
+/// Each call and member of a chain resolved its path by walking the rest of
+/// the chain again, quadratic in its length: 500 chains of 900 calls took ten
+/// minutes, and members of chains past the depth cap each failed at the cap
+/// again. Each chain is now walked once, every call keeping its own path.
+#[test]
+fn long_chains_resolve_in_linear_time() {
+    let calls: String = (0..80)
+        .map(|i| format!("x = a{i}{};\n", ".b()".repeat(450)))
+        .collect();
+    let members: String = (0..40)
+        .map(|i| format!("y = c{i}{};\n", ".d".repeat(3_000)))
+        .collect();
+    let source = calls + &members;
+    let started = std::time::Instant::now();
+    let parsed = crate::OpenOptions::new()
+        .path(std::path::Path::new("chain.js"))
+        .open(source.as_bytes());
+    let targets: Vec<Option<&str>> = parsed
+        .symbols()
+        .iter_kind(crate::SymbolKind::Call)
+        .filter_map(|s| match s {
+            crate::Symbol::Call { target, .. } => Some(target.as_deref()),
+            _ => None,
+        })
+        .collect();
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    // Every call keeps its own path.
+    assert_eq!(targets.len(), 80 * 450);
+    assert!(targets.iter().all(Option::is_some));
+    let longest = format!("a0{}", ".b".repeat(450));
+    assert!(targets.contains(&Some(longest.as_str())));
+    assert!(targets.contains(&Some("a0.b")));
+    assert!(targets.contains(&Some("a79.b.b")));
+    // A member chain past the cap has no static path; the call chains'
+    // members do.
+    let metrics = parsed.metrics();
+    assert_eq!(metrics.get("ast.depth_capped"), Some(1.0));
+    assert_eq!(metrics.get("ast.max_member_depth"), Some(451.0));
+}

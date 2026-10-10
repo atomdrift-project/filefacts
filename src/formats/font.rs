@@ -68,6 +68,12 @@ const EOT_MAGIC_OFFSET: usize = 34;
 /// hundred tags and a font carries each at most once; real fonts hold 10-40.
 const MAX_TABLES: usize = 1024;
 
+/// Region bytes examined per file byte. The regions of a well-formed font
+/// are disjoint, so together they read the file at most once; table records
+/// may overlap, though, and up to 1024 per directory -- or half a million
+/// across a collection -- each naming the whole file made the scan quadratic.
+const SCAN_PASSES: u64 = 2;
+
 /// A table directory entry reduced to what structural analysis needs.
 struct TableEntry {
     /// `None` for a WOFF container region (metadata or private block),
@@ -143,6 +149,8 @@ struct Report {
     /// the file disagree about how many bytes the font occupies.
     declared_size_delta: i64,
     structure_ok: bool,
+    /// Bytes [`note_region`] may still read; see [`SCAN_PASSES`].
+    scan_budget: u64,
 }
 
 impl Report {
@@ -180,6 +188,7 @@ pub(super) fn extract(
     let format = classify(bytes);
     let mut report = Report {
         structure_ok: format != Format::None,
+        scan_budget: (bytes.len() as u64).saturating_mul(SCAN_PASSES),
         ..Report::default()
     };
 
@@ -920,8 +929,16 @@ fn note_region(bytes: &[u8], start: u64, end: u64, report: &mut Report, kind: Re
     if region.is_empty() {
         return;
     }
+    let len = region.len() as u64;
     if kind == RegionKind::Unclaimed {
-        report.stowaway_bytes = report.stowaway_bytes.saturating_add(region.len() as u64);
+        report.stowaway_bytes = report.stowaway_bytes.saturating_add(len);
+    }
+    let Some(left) = report.scan_budget.checked_sub(len) else {
+        report.problem("overlapping regions past the scan budget not examined");
+        return;
+    };
+    report.scan_budget = left;
+    if kind == RegionKind::Unclaimed {
         report.stowaway_entropy = report.stowaway_entropy.max(entropy::shannon(region));
     }
     if let Some(found) = classify_region(region)

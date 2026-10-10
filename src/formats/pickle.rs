@@ -712,6 +712,27 @@ mod tests {
         assert!(run(&short).0.get("pickle.globals").is_none());
     }
 
+    /// STACK_GLOBALs whose operands are reloaded from the memo name the same
+    /// strings; each must not copy and compare a multi-megabyte module name
+    /// again, or a few megabytes of input take hours to scan.
+    #[test]
+    fn repeated_stack_global_is_linear() {
+        let module = "m".repeat(1 << 20);
+        let mut data = vec![0x80, 4, b'X'];
+        data.extend_from_slice(&(module.len() as u32).to_le_bytes());
+        data.extend_from_slice(module.as_bytes());
+        data.extend_from_slice(&[b'q', 0, 0x8C, 1, b'f', b'q', 1, 0x93]);
+        // Unfixed, these 64 Ki operations copy about 200 GB.
+        for _ in 0..64 << 10 {
+            data.extend_from_slice(&[b'h', 0, b'h', 1, 0x93]);
+        }
+        data.push(b'.');
+        let (v, _) = run(&data);
+        let globals = v.get("pickle.globals").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(globals.len(), 1);
+        assert_eq!(globals[0].as_str(), Some(format!("{module}.f").as_str()));
+    }
+
     #[test]
     fn empty_is_silent() {
         let (v, _) = run(&[]);

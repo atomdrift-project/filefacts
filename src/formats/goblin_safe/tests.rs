@@ -270,6 +270,14 @@ fn rejection_messages_are_unchanged() {
             "import lookup tables exceed 262144 entries",
         ),
         (
+            Rejection::OversizedImportNames,
+            "import names exceed 33554432 bytes",
+        ),
+        (
+            Rejection::OversizedExportNames,
+            "export names exceed 33554432 bytes",
+        ),
+        (
             Rejection::ExportTrieLoop {
                 node: 0x20,
                 start: 0x10,
@@ -302,6 +310,132 @@ fn rejection_messages_are_unchanged() {
     ] {
         assert_eq!(reason.to_string(), text);
     }
+}
+
+/// The last section of `test.exe` grown to `size` zeroed bytes. Returns the
+/// bytes with the section's RVA and file offset.
+fn pe_with_last_section(size: usize) -> (Vec<u8>, u32, usize) {
+    let mut bytes = read_fixture("test.exe");
+    let (section_table, count, _) = pe_layout(&bytes);
+    let last = section_table + (count - 1) * 40;
+    let virtual_address = u32::from_le_bytes(bytes[last + 12..last + 16].try_into().unwrap());
+    let pointer = u32::from_le_bytes(bytes[last + 20..last + 24].try_into().unwrap()) as usize;
+    bytes.resize(pointer + size, 0);
+    bytes[pointer..pointer + size].fill(0);
+    put_u32(&mut bytes, last + 8, size as u32); // virtual_size
+    put_u32(&mut bytes, last + 16, size as u32); // size_of_raw_data
+    (bytes, virtual_address, pointer)
+}
+
+/// One import descriptor whose `entries` lookup entries all name the same
+/// hint/name entry, a name `name_len` bytes long. Every entry is well formed,
+/// so the entry budget alone waves it through.
+fn pe_with_long_import_names(entries: usize, name_len: usize) -> Vec<u8> {
+    let dll_at = 2 * 20;
+    let table_at = dll_at + 8;
+    let hint_at = table_at + (entries + 1) * 8;
+    let (mut bytes, va, pointer) = pe_with_last_section(hint_at + 2 + name_len + 1);
+    let (_, _, import_dir) = pe_layout(&bytes);
+    bytes[pointer + dll_at..pointer + dll_at + 6].copy_from_slice(b"a.dll\0");
+    for i in 0..entries {
+        let at = pointer + table_at + i * 8;
+        bytes[at..at + 8].copy_from_slice(&u64::from(va + hint_at as u32).to_le_bytes());
+    }
+    bytes[pointer + hint_at + 2..pointer + hint_at + 2 + name_len].fill(b'x');
+    let table_rva = va + table_at as u32;
+    put_u32(&mut bytes, pointer, table_rva); // import_lookup_table_rva
+    put_u32(&mut bytes, pointer + 12, va + dll_at as u32); // name_rva
+    put_u32(&mut bytes, pointer + 16, table_rva); // import_address_table_rva
+    put_u32(&mut bytes, import_dir, va);
+    put_u32(&mut bytes, import_dir + 4, 40);
+    bytes
+}
+
+/// A quarter-million lookup entries are within the entry budget, but each
+/// makes goblin scan its name afresh and filefacts copy it: entries times
+/// name length, quadratic in the file size. The names are budgeted too.
+#[test]
+fn import_walk_budget_rejects_oversized_names() {
+    let small = pe_with_long_import_names(4, 1 << 20);
+    assert_eq!(import_walk_budget_from_headers(&small), Ok(()));
+    let parse = parse_pe(&small);
+    assert_eq!(parse.imports_skipped, None);
+    assert_eq!(parse.outcome.ok().expect("parses").imports.len(), 4);
+
+    // 64 entries x 1 MiB of name: 64 MiB to scan and copy from a 1 MiB file.
+    let big = pe_with_long_import_names(64, 1 << 20);
+    assert_eq!(
+        import_walk_budget_from_headers(&big),
+        Err(Rejection::OversizedImportNames)
+    );
+    let parse = parse_pe(&big);
+    assert_eq!(parse.imports_skipped, Some(Rejection::OversizedImportNames));
+    assert!(parse.outcome.ok().expect("parses").imports.is_empty());
+}
+
+/// An export table of `pointers` name pointers. With `forwarded`, every
+/// name is short and every entry forwards through one `long`-byte string
+/// inside the export directory; otherwise every pointer names that string.
+fn pe_with_export_table(pointers: usize, long: usize, forwarded: bool) -> Vec<u8> {
+    let eat_at = 40;
+    let names_at = eat_at + 4;
+    let ordinals_at = names_at + 4 * pointers;
+    let short_at = ordinals_at + 2 * pointers;
+    let long_at = short_at + 4;
+    let size = long_at + long + 1;
+    let (mut bytes, va, pointer) = pe_with_last_section(size);
+    let (_, _, import_dir) = pe_layout(&bytes);
+    let export_dir = import_dir - 8;
+    let rva = |at: usize| va + at as u32;
+    put_u32(&mut bytes, pointer + 20, 1); // address_table_entries
+    put_u32(&mut bytes, pointer + 24, pointers as u32); // number_of_name_pointers
+    put_u32(&mut bytes, pointer + 28, rva(eat_at));
+    put_u32(&mut bytes, pointer + 32, rva(names_at));
+    put_u32(&mut bytes, pointer + 36, rva(ordinals_at));
+    let (target, name) = if forwarded {
+        (rva(long_at), rva(short_at))
+    } else {
+        (rva(short_at), rva(long_at))
+    };
+    put_u32(&mut bytes, pointer + eat_at, target);
+    for i in 0..pointers {
+        put_u32(&mut bytes, pointer + names_at + 4 * i, name);
+    }
+    bytes[pointer + short_at..pointer + short_at + 2].copy_from_slice(b"f\0");
+    bytes[pointer + long_at..pointer + long_at + long].fill(b'x');
+    bytes[pointer + long_at + 1] = b'.';
+    put_u32(&mut bytes, export_dir, va);
+    put_u32(
+        &mut bytes,
+        export_dir + 4,
+        if forwarded { size as u32 } else { 40 },
+    );
+    bytes
+}
+
+/// goblin reads every export's name and forwarder string from scratch and
+/// cannot be told to skip exports, so a table whose strings sum past the
+/// budget is kept from it on a copy with the export directory cleared.
+#[test]
+fn oversized_export_names_are_kept_from_goblin() {
+    for forwarded in [false, true] {
+        let small = pe_with_export_table(4, 1 << 20, forwarded);
+        assert!(neutralize_oversized_export_directory(&small).is_none());
+        let pe = parse_pe(&small).outcome.ok().expect("parses");
+        assert_eq!(pe.exports.len(), 4);
+
+        // 64 pointers x 1 MiB: 64 MiB of strings from a 1 MiB file.
+        let big = pe_with_export_table(64, 1 << 20, forwarded);
+        let (patched, reason) =
+            neutralize_oversized_export_directory(&big).expect("export budget must trip");
+        assert_eq!(reason, Rejection::OversizedExportNames);
+        assert_eq!(patched.len(), big.len());
+        let pe = parse_pe(&patched).outcome.ok().expect("parses");
+        assert!(pe.exports.is_empty());
+        assert!(!pe.sections.is_empty(), "everything else still parses");
+    }
+    assert!(neutralize_oversized_export_directory(&read_fixture("test.exe")).is_none());
+    assert!(neutralize_oversized_export_directory(b"not a PE").is_none());
 }
 
 #[test]

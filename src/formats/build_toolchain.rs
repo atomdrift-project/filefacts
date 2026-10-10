@@ -92,8 +92,14 @@ pub(super) fn from_elf(values: &mut Values, sections: &[crate::output::Section],
 /// build-info marker. Modern Rust embeds this string verbatim in
 /// the binary even when `.comment` is stripped, so it's the
 /// reliable identification path for release builds.
+///
+/// Section ranges are file-controlled and need not be disjoint, so every
+/// `.rodata*` header may cover the same megabytes: the scan is charged
+/// against the file length, as `elf::sections` charges entropy. Honest
+/// sections are disjoint slices of the file and never run out.
 fn scan_rust_rodata(sections: &[crate::output::Section], bytes: &[u8]) -> Option<String> {
     const NEEDLE: &[u8] = b"rustc ";
+    let mut budget = bytes.len();
     for s in sections {
         if !s.name.starts_with(".rodata") {
             continue;
@@ -104,6 +110,7 @@ fn scan_rust_rodata(sections: &[crate::output::Section], bytes: &[u8]) -> Option
         if end > bytes.len() {
             continue;
         }
+        budget = budget.checked_sub(len)?;
         let mut pos = start;
         while pos + NEEDLE.len() < end {
             if let Some(rel) = bytes
@@ -323,6 +330,33 @@ mod tests {
         let (fam, ver) = recognize_comment("rustc version 1.78.0 (9b00956e5 2024-04-29)").unwrap();
         assert!(matches!(fam, Family::Rustc));
         assert_eq!(ver, "1.78.0");
+    }
+
+    /// Every `.rodata*` header may cover the same bytes; the scan stops once
+    /// the sections it read add up to the file, instead of re-reading them
+    /// per header. Disjoint sections are all read.
+    #[test]
+    fn rodata_scan_is_charged_against_the_file_length() {
+        let section = |off: u64, size: u64| crate::output::Section {
+            name: ".rodata".into(),
+            vaddr: 0,
+            vsize: size,
+            file_offset: off,
+            file_size: size,
+            flags: Vec::new(),
+            flags_raw: None,
+            entropy: None,
+        };
+        let mut bytes = vec![b'x'; 1000];
+        bytes[600..613].copy_from_slice(b"rustc 1.80.0 ");
+        let mut sections: Vec<_> = (0..5000).map(|_| section(0, 500)).collect();
+        sections.push(section(500, 500));
+        assert_eq!(scan_rust_rodata(&sections, &bytes), None);
+        let disjoint = [section(0, 500), section(500, 500)];
+        assert_eq!(
+            scan_rust_rodata(&disjoint, &bytes).as_deref(),
+            Some("1.80.0")
+        );
     }
 
     #[test]

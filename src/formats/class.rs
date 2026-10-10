@@ -58,6 +58,12 @@ const CP_PACKAGE: u8 = 20;
 /// Real classes carry far fewer distinct entries than this.
 const MAX_CP_FACTS: usize = 8192;
 
+/// Upper bound on the method and methodref name bytes copied out of the
+/// constant pool into symbols. Both name their strings by index, so without
+/// it one 64 KiB `CONSTANT_Utf8` entry named by 65535 methods or methodrefs
+/// copies 4 GiB out of a file under 600 KiB. Real classes copy a few KiB.
+const MAX_SYMBOL_NAME_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Default)]
 struct ConstantPool {
     utf8: HashMap<u16, String>,
@@ -156,7 +162,8 @@ pub(super) fn extract(
     }
     // The class attributes follow methods[], so a truncated method table
     // leaves them unreachable.
-    let attrs = match parse_methods(&mut r, &cp, symbols_out) {
+    let mut name_budget = MAX_SYMBOL_NAME_BYTES;
+    let attrs = match parse_methods(&mut r, &cp, symbols_out, &mut name_budget) {
         Some(()) => parse_attributes(&mut r, &cp),
         None => ClassAttributes::default(),
     };
@@ -164,7 +171,7 @@ pub(super) fn extract(
     // Surface external class references and methodref-resolved
     // imports. `this_class` is the class's own self-reference and
     // must not show up as an import.
-    populate_imports(&cp, this_idx, symbols_out, metrics);
+    populate_imports(&cp, this_idx, symbols_out, metrics, &mut name_budget);
     // (`class.method_count` was a byte-identical alias of `functions.count`,
     // which carries 60 rule references. Dropped 2026-08-22.)
 
@@ -410,11 +417,12 @@ fn parse_attributes(r: &mut Reader<'_>, cp: &ConstantPool) -> ClassAttributes {
 ///
 /// We don't parse the per-method `Code` attribute — only the
 /// declaration matters for the symbol surface. Attributes are
-/// length-skipped.
+/// length-skipped. Methods past the name budget are walked but not emitted.
 fn parse_methods(
     r: &mut Reader<'_>,
     cp: &ConstantPool,
     symbols_out: &mut crate::Symbols,
+    name_budget: &mut usize,
 ) -> Option<()> {
     let count = r.u16_be()?;
     for _ in 0..count {
@@ -425,6 +433,9 @@ fn parse_methods(
         let Some(name) = cp.utf8.get(&name_idx) else {
             continue;
         };
+        if !charge(name_budget, name.len()) {
+            continue;
+        }
         // Static methods are interesting for entry-point detection
         // (`public static void main(String[])`). We don't yet emit
         // the access-flag decomposition per function — that lives
@@ -442,15 +453,26 @@ fn parse_methods(
     Some(())
 }
 
+/// Take `len` bytes from a symbol-name budget, or report it spent.
+fn charge(budget: &mut usize, len: usize) -> bool {
+    let Some(rest) = budget.checked_sub(len) else {
+        return false;
+    };
+    *budget = rest;
+    true
+}
+
 /// Push two flavours of typed `Import` entries discovered through
 /// the constant pool: external-class references (the JVM's import
 /// system at compile time) and methodref-resolved foreign-method
-/// references.
+/// references. Methodref imports past the name budget are counted but
+/// not emitted.
 fn populate_imports(
     cp: &ConstantPool,
     this_idx: u16,
     symbols_out: &mut crate::Symbols,
     metrics: &mut Metrics,
+    name_budget: &mut usize,
 ) {
     // Distinct external class references — every CONSTANT_Class_info
     // entry except the class's own `this_class`. The class's
@@ -495,6 +517,10 @@ fn populate_imports(
         let Some((owner, name, _desc)) = cp.methodref_resolve(idx) else {
             continue;
         };
+        method_ref_count = method_ref_count.saturating_add(1);
+        if !charge(name_budget, name.len().saturating_add(owner.len())) {
+            continue;
+        }
         symbols_out.push(crate::Symbol::Import {
             name: name.to_string(),
             alias: None,
@@ -502,7 +528,6 @@ fn populate_imports(
             offset: cp.methodref_name_offset(idx),
             ordinal: None,
         });
-        method_ref_count = method_ref_count.saturating_add(1);
     }
     metrics.insert(
         metric!("class.method_ref_count"),

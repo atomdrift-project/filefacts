@@ -8,15 +8,19 @@ use tree_sitter::Node;
 const NODE_LIMIT: usize = 20_000;
 const STEP_LIMIT: usize = 100_000;
 
-/// Name → value bindings, layered over an optional read-only base.
+/// Name → value bindings, layered over an optional read-only base, itself
+/// either a flat map or an enclosing layer.
 ///
-/// Every function body starts from the module-level bindings. Copying that
-/// map per function made the walk functions × globals; layering keeps the
-/// globals borrowed and records only what the function binds or unbinds.
-/// A `None` in `local` hides a base binding the function removed.
-#[derive(Clone, Default)]
+/// Every function body starts from the module-level bindings, and every `if`
+/// branch from the bindings before it. Copying those per function or per
+/// branch made the walk quadratic (functions × globals, or `if` statements ×
+/// names bound before them: 5k of each took 90 s); layering keeps the base
+/// borrowed and records only what the layer binds or unbinds. A `None` in
+/// `local` hides a base binding the layer removed.
+#[derive(Default)]
 struct Bindings<'g> {
     base: Option<&'g BTreeMap<String, usize>>,
+    parent: Option<&'g Bindings<'g>>,
     local: BTreeMap<String, Option<usize>>,
 }
 
@@ -24,20 +28,34 @@ impl<'g> Bindings<'g> {
     fn over(base: &'g BTreeMap<String, usize>) -> Self {
         Self {
             base: Some(base),
-            local: BTreeMap::new(),
+            ..Self::default()
+        }
+    }
+    /// An empty layer over `parent`, which it reads through but never changes.
+    fn under(parent: &'g Bindings<'g>) -> Self {
+        Self {
+            parent: Some(parent),
+            ..Self::default()
+        }
+    }
+    /// The binding below this layer.
+    fn inherited(&self, name: &str) -> Option<usize> {
+        match self.parent {
+            Some(parent) => parent.get(name),
+            None => self.base.and_then(|base| base.get(name).copied()),
         }
     }
     fn get(&self, name: &str) -> Option<usize> {
         match self.local.get(name) {
             Some(value) => *value,
-            None => self.base.and_then(|base| base.get(name).copied()),
+            None => self.inherited(name),
         }
     }
     fn insert(&mut self, name: String, value: usize) {
         self.local.insert(name, Some(value));
     }
     fn remove(&mut self, name: &str) {
-        if self.base.is_some_and(|base| base.contains_key(name)) {
+        if self.inherited(name).is_some() {
             self.local.insert(name.to_string(), None);
         } else {
             self.local.remove(name);
@@ -48,7 +66,7 @@ impl<'g> Bindings<'g> {
     fn layered_names(&self) -> impl Iterator<Item = &String> {
         self.local.keys()
     }
-    /// The flattened bindings, for a top-level layer with no base.
+    /// The flattened bindings, for a top-level layer with no parent.
     fn into_map(self) -> BTreeMap<String, usize> {
         let mut map = self.base.cloned().unwrap_or_default();
         for (name, value) in self.local {
@@ -135,6 +153,9 @@ impl Builder<'_> {
             inputs,
             receiver: None,
             fields: BTreeMap::new(),
+            // `eval` never enters a definition, so outside a helper body every
+            // value is load-time code.
+            module_level: !self.in_function,
         });
         id
     }
@@ -313,7 +334,7 @@ impl Builder<'_> {
             // this callee with the symbol extractor's shared syntax helper;
             // an offset-to-single-target map would conflate the calls.
             let mut target =
-                callee.and_then(|n| ast_walk::static_dotted_chain(n, self.source, self.config, 0));
+                callee.and_then(|n| ast_walk::static_dotted_chain(n, self.source, self.config));
             if let Some(raw) = target.as_ref() {
                 let end = raw.find(['.', ':', '(']).unwrap_or(raw.len());
                 if bindings.get(&raw[..end]).is_none() {
@@ -391,43 +412,47 @@ impl Builder<'_> {
             if let Some(condition) = node.child_by_field_name("condition") {
                 self.eval(condition, bindings, returns, depth + 1);
             }
-            let mut merged = bindings.clone();
+            // What the branches change, over the bindings before the `if`.
+            let mut merged: BTreeMap<String, usize> = BTreeMap::new();
             let mut values = Vec::new();
             for field in ["consequence", "alternative"] {
                 if let Some(branch) = node.child_by_field_name(field) {
-                    let mut local = bindings.clone();
+                    let mut local = Bindings::under(bindings);
                     values.push(self.eval(branch, &mut local, returns, depth + 1));
-                    // A name outside both layers resolves to the shared base
-                    // in `local` and `merged` alike, so only layered names can
-                    // need a merge. Sorted, so value ids are stable.
-                    let names: BTreeSet<String> = local
-                        .layered_names()
-                        .chain(merged.layered_names())
-                        .cloned()
-                        .collect();
+                    // A name neither this branch nor an earlier one changed
+                    // resolves to the bindings before the `if` in `local` and
+                    // `merged` alike, so only changed names can need a merge.
+                    // Sorted, so value ids are stable.
+                    let names: BTreeSet<&String> =
+                        local.layered_names().chain(merged.keys()).collect();
+                    let mut changes = Vec::new();
                     for name in names {
-                        let Some(id) = local.get(&name) else {
+                        let Some(id) = local.get(name) else {
                             continue;
                         };
-                        if let Some(previous) = merged.get(&name) {
+                        let previous = merged.get(name).copied().or_else(|| bindings.get(name));
+                        if let Some(previous) = previous {
                             if previous != id {
                                 let merge = self.add(FlowKind::Merge, branch, vec![previous, id]);
-                                merged.insert(name, merge);
+                                changes.push((name.clone(), merge));
                             }
                         } else {
-                            merged.insert(name, id);
+                            changes.push((name.clone(), id));
                         }
                     }
+                    merged.extend(changes);
                 }
+            }
+            for (name, id) in merged {
+                bindings.insert(name, id);
             }
             for (name, previous) in shadowed {
                 if let Some(id) = previous {
-                    merged.insert(name, id);
+                    bindings.insert(name, id);
                 } else {
-                    merged.remove(&name);
+                    bindings.remove(&name);
                 }
             }
-            *bindings = merged;
             return self.add(FlowKind::Merge, node, values);
         }
         let sequential = matches!(
@@ -451,11 +476,6 @@ impl Builder<'_> {
                     | Lang::Java
                     | Lang::CSharp
             );
-        let before = if scoped {
-            bindings.clone()
-        } else {
-            Bindings::default()
-        };
         let mut declared = Bindings::default();
         if scoped {
             for child in named_children(node) {
@@ -491,15 +511,25 @@ impl Builder<'_> {
                 }
             }
         }
+        // Only the names the block declares are restored after it, so only
+        // theirs are saved: copying every binding per block was quadratic.
+        let before: Vec<(String, Option<usize>)> = declared
+            .local
+            .into_keys()
+            .map(|name| {
+                let previous = bindings.get(&name);
+                (name, previous)
+            })
+            .collect();
         let mut inputs = Vec::new();
         for child in named_children(node) {
             inputs.push(self.eval(child, bindings, returns, depth + 1));
         }
-        for name in declared.local.keys() {
-            if let Some(previous) = before.get(name) {
-                bindings.insert(name.clone(), previous);
+        for (name, previous) in before {
+            if let Some(previous) = previous {
+                bindings.insert(name, previous);
             } else {
-                bindings.remove(name);
+                bindings.remove(&name);
             }
         }
         if node.kind().starts_with("return") {

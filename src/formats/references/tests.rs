@@ -990,3 +990,74 @@ fn github_action_rejects_purl_injection() {
         ))
     );
 }
+
+#[test]
+fn many_distinct_relative_imports_dedup_in_linear_time() {
+    // Each specifier was checked against a list of every earlier one: 100k
+    // distinct `require("./mN")` lines took 15 s.
+    let mut src: String = (0..50_000)
+        .map(|i| format!("require(\"./m{i}\")\n"))
+        .collect();
+    src.push_str("require(\"./m0\")\n");
+    let started = std::time::Instant::now();
+    let refs = derive(FileType::JavaScript, src.as_bytes(), &Values::new());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(refs.len(), 50_000);
+    assert_eq!(refs[0].locator, RefLocator::Path("./m0".into()));
+}
+
+#[test]
+fn locate_misses_are_charged_to_the_scan_budget() {
+    // A v1 lockfile is walked last entry first, so every earlier dependency
+    // misses the search resumed past the large last entry, and each miss
+    // scanned that entry again: 20k dependencies before a 4 MiB entry took
+    // 35 s.
+    let mut deps = serde_json::Map::new();
+    let mut text = String::from("{\"lockfileVersion\":1,\"dependencies\":{");
+    for i in 0..5_000 {
+        let name = format!("b{i:07}");
+        text.push_str(&format!("\"{name}\":{{\"version\":\"1.0.0\"}},"));
+        deps.insert(name, serde_json::json!({ "version": "1.0.0" }));
+    }
+    let pad = "x".repeat(8 << 20);
+    text.push_str(&format!(
+        "\"zzzz\":{{\"version\":\"1.0.0\",\"pad\":\"{pad}\"}}}}}}"
+    ));
+    deps.insert(
+        "zzzz".into(),
+        serde_json::json!({ "version": "1.0.0", "pad": pad }),
+    );
+    let values = Values::from_json(serde_json::json!({
+        "lockfileVersion": 1,
+        "dependencies": deps,
+    }));
+    let started = std::time::Instant::now();
+    let refs = derive(FileType::PackageLockJson, text.as_bytes(), &values);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(refs.len(), 5_001);
+    // An offset, where one is still reported, cites its evidence.
+    for r in &refs {
+        if let Some(offset) = r.offset {
+            assert!(text[offset as usize..].starts_with(&r.evidence), "{r:?}");
+        }
+    }
+}
+
+#[test]
+fn many_package_json_bin_targets_dedup_in_linear_time() {
+    // Each target was checked against a list of every earlier one, which
+    // made a `bin` map with 100k entries quadratic.
+    let bins: serde_json::Map<String, JsonValue> = (0..50_000)
+        .map(|i| (format!("b{i}"), JsonValue::String(format!("bin/{i}.js"))))
+        .chain(std::iter::once(("again".into(), "bin/0.js".into())))
+        .collect();
+    let manifest = serde_json::json!({ "name": "app", "bin": bins }).to_string();
+    let started = std::time::Instant::now();
+    let refs = derive(FileType::PackageJson, manifest.as_bytes(), &Values::new());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let paths = refs
+        .iter()
+        .filter(|r| matches!(r.locator, RefLocator::Path(_)))
+        .count();
+    assert_eq!(paths, 50_000);
+}

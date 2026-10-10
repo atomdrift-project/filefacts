@@ -18,6 +18,7 @@ use serde_json::Value as JsonValue;
 use sevenz_rust::SevenZMethod as Method;
 
 use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_value};
+use super::bounded::{MAX_ARCHIVE_MEMBERS, push_limit};
 use crate::error::Error;
 use crate::formats::common::bytes_at::u64_le;
 use crate::output::{ArchiveCompression, ArchiveMember, ArchiveOffsets, Metrics, Values};
@@ -53,7 +54,9 @@ const SIGNATURE_HEADER_LEN: usize = 32;
 /// from a few hundred bytes to a few MiB for archives with very many members.
 const MAX_HEADER_BYTES: u64 = 32 << 20;
 /// Most files (and non-empty streams) a header may declare. The crate builds
-/// a full entry for each before reading any of their properties.
+/// a full entry for each before reading any of their properties. Of those,
+/// only the first [`MAX_ARCHIVE_MEMBERS`] are listed: a few bytes of
+/// LZMA-packed header can declare a million names.
 const MAX_FILES: usize = 1 << 20;
 /// Per-folder coder and coder-stream limits, the same ones 7-Zip's own reader
 /// enforces.
@@ -108,10 +111,11 @@ pub(super) fn extract(
         })
         .collect();
 
-    let mut members = Vec::with_capacity(archive.files.len());
+    let listed = archive.files.len().min(MAX_ARCHIVE_MEMBERS);
+    let mut members = Vec::with_capacity(listed);
     let mut stats = ArchiveStats::new(AGGS);
 
-    for (index, entry) in archive.files.iter().enumerate() {
+    for (index, entry) in archive.files.iter().enumerate().take(listed) {
         let folder_index = archive
             .stream_map
             .file_folder_index
@@ -158,6 +162,15 @@ pub(super) fn extract(
         stats.observe(&member, &Reading::of(&member));
         members.push(JsonValue::Object(member_value(&member, Shape::FULL)));
         archive_members.push(member);
+    }
+
+    if archive.files.len() > listed {
+        push_limit(
+            values,
+            value_key!("7z.limits"),
+            "member-cap",
+            format!("listed {listed} of {} members", archive.files.len()),
+        );
     }
 
     values.insert_key(value_key!("archive.members"), JsonValue::Array(members));
@@ -717,6 +730,35 @@ mod tests {
         // than a missing key.
         assert_eq!(metrics.get("archive.security.encrypted_count"), Some(0.0));
         assert_eq!(typed_members.len(), members.len());
+    }
+
+    /// Past the shared member cap, files are counted in the limit, not
+    /// listed.
+    #[test]
+    fn members_past_the_cap_are_not_listed() {
+        let total = MAX_ARCHIVE_MEMBERS + 3;
+        let mut writer = sevenz_rust::SevenZWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+        for i in 0..total {
+            let mut entry = sevenz_rust::SevenZArchiveEntry::new();
+            entry.name = format!("f{i}");
+            writer.push_archive_entry::<&[u8]>(entry, None).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+
+        let mut values = Values::default();
+        let mut metrics = Metrics::default();
+        let mut typed_members = Vec::new();
+        extract(&bytes, &mut values, &mut metrics, &mut typed_members).unwrap();
+        assert_eq!(typed_members.len(), MAX_ARCHIVE_MEMBERS);
+        let limits = values
+            .get("7z.limits")
+            .and_then(JsonValue::as_array)
+            .unwrap();
+        assert_eq!(limits[0]["stage"].as_str(), Some("member-cap"));
+        assert_eq!(
+            limits[0]["reason"].as_str(),
+            Some(format!("listed {MAX_ARCHIVE_MEMBERS} of {total} members").as_str())
+        );
     }
 
     /// The shape the malicious bundles use: AES-encrypted payload streams with

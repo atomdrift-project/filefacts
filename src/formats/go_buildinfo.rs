@@ -47,6 +47,12 @@ use crate::output::{ValueKey, Values};
 
 const MAGIC: &[u8] = b"\xff Go buildinf:";
 
+/// `dep` / `=>` records kept from one modinfo blob. Real binaries list a
+/// few hundred (Kubernetes about a thousand); each six-byte `dep\tA` line
+/// becomes a JSON object of several hundred bytes, so an unbounded list
+/// turns a modinfo blob into a hundredfold allocation.
+const MAX_DEPS: usize = 16_384;
+
 /// Scan the file for Go's build-info magic and, when present,
 /// populate `<key_prefix>.go.*` with the decoded metadata. The
 /// key prefix is the format's namespace (`"elf"`, `"macho"`,
@@ -193,9 +199,9 @@ fn parse_elf_buildid_note(note: &[u8]) -> Option<String> {
     if note.len() < 16 {
         return None;
     }
-    let namesz = u32_le(note, 0)? as usize;
-    let descsz = u32_le(note, 4)? as usize;
-    let desc_off = 12 + ((namesz + 3) & !3);
+    let namesz = crate::bytes::sat_usize(u32_le(note, 0)?);
+    let descsz = crate::bytes::sat_usize(u32_le(note, 4)?);
+    let desc_off = namesz.checked_add(3)?.checked_add(12)? & !3;
     let desc_end = desc_off.checked_add(descsz)?;
     let desc = note.get(desc_off..desc_end)?.split(|&b| b == 0).next()?;
     let s = std::str::from_utf8(desc).ok()?;
@@ -410,7 +416,7 @@ fn parse_modinfo(blob: &[u8], out: &mut Map<String, JsonValue>) {
                 }
                 out.insert("module".into(), JsonValue::Object(m));
             }
-            "dep" | "=>" => {
+            "dep" | "=>" if deps.len() < MAX_DEPS => {
                 // Both `dep\t…` and `=>\t…` (replace directive
                 // target) flow into the same dependency list.
                 let mut d = Map::new();
@@ -623,6 +629,26 @@ mod tests {
             &GoSections::default(),
         );
         assert!(values.get("elf.go").is_none());
+    }
+
+    #[test]
+    fn build_id_note_with_overflowing_name_size_is_ignored() {
+        let mut note = Vec::new();
+        note.extend_from_slice(&u32::MAX.to_le_bytes()); // namesz
+        note.extend_from_slice(&4u32.to_le_bytes());
+        note.extend_from_slice(&4u32.to_le_bytes());
+        note.extend_from_slice(b"Go\0\0abcd");
+        assert_eq!(parse_elf_buildid_note(&note), None);
+    }
+
+    /// Each `dep` line becomes a JSON object hundreds of times its size, so
+    /// the list stops at [`MAX_DEPS`].
+    #[test]
+    fn modinfo_dependency_list_is_capped() {
+        let blob = "dep\tA\n".repeat(MAX_DEPS + 10);
+        let mut out = Map::new();
+        parse_modinfo(blob.as_bytes(), &mut out);
+        assert_eq!(out["deps"].as_array().unwrap().len(), MAX_DEPS);
     }
 
     #[test]

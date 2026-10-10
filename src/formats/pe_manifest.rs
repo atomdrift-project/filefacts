@@ -265,10 +265,12 @@ fn find_open_tag(text: &str, elem: &str) -> Option<usize> {
             return None;
         }
         let after = &text[abs..];
-        // Skip namespace prefix if present.
-        let rest = match after.find(':') {
-            Some(colon) if colon < after.len() && colon < 16 => &after[colon + 1..],
-            _ => after,
+        // Skip a namespace prefix if present. Only the first 16 bytes can
+        // hold one: searching the whole tail for a `:` per `<` made a
+        // manifest of nothing but `<` quadratic.
+        let rest = match after.bytes().take(16).position(|b| b == b':') {
+            Some(colon) => &after[colon + 1..],
+            None => after,
         };
         if rest.starts_with(elem) {
             // Confirm the next character is whitespace, `>`, or `/`.
@@ -512,6 +514,22 @@ mod tests {
             Some("Microsoft.Windows.Common-Controls@6.0.0.0")
         );
         assert_eq!(deps[1].as_str(), Some("Microsoft.VC90.CRT@9.0.21022.8"));
+    }
+
+    /// Every lookup scans the manifest once. A resource of nothing but `<`
+    /// with no `:` anywhere used to rescan the whole tail per `<`: twenty
+    /// seconds per lookup at this size in a release build, a dozen lookups
+    /// per manifest, and quadratic beyond.
+    #[test]
+    fn tag_search_is_linear_in_the_manifest() {
+        let mut text = "<".repeat(256 * 1024);
+        text.push_str("<asmv3:dpiAware>true</dpiAware>");
+        let mut v = crate::Values::new();
+        extract(text.as_bytes(), &mut v);
+        assert_eq!(
+            v.get("pe.manifest.dpi_aware").and_then(|x| x.as_str()),
+            Some("true")
+        );
     }
 
     #[test]

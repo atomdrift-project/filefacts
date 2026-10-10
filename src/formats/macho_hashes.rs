@@ -29,10 +29,10 @@ use crate::formats::common::put_str;
 use crate::output::{Symbols, Values};
 use crate::value_key;
 
-/// Populate `macho.hashes.*` from the parsed Mach-O plus the unified
-/// symbols view (which the imports/exports extractor has already
-/// filled in).
-pub(super) fn emit(macho: &MachO<'_>, values: &mut Values, symbols: &Symbols) {
+/// Populate `macho.hashes.*` from the parsed Mach-O (and `bytes`, the
+/// buffer it was parsed from) plus the unified symbols view (which the
+/// imports/exports extractor has already filled in).
+pub(super) fn emit(macho: &MachO<'_>, bytes: &[u8], values: &mut Values, symbols: &Symbols) {
     // imphash: imported function names; export_hash: export-trie names.
     if let Some(h) = imphash(symbols) {
         put_str(values, value_key!("macho.hashes.imphash"), h);
@@ -43,7 +43,7 @@ pub(super) fn emit(macho: &MachO<'_>, values: &mut Values, symbols: &Symbols) {
     if let Some(h) = export_hash(symbols) {
         put_str(values, value_key!("macho.hashes.export_hash"), h);
     }
-    if let Some(h) = symhash(macho) {
+    if let Some(h) = symhash(macho, bytes) {
         put_str(values, value_key!("macho.hashes.symhash"), h);
     }
     if let Some(h) = entitlement_hash(values) {
@@ -75,13 +75,12 @@ fn dylib_hash(macho: &MachO<'_>) -> Option<String> {
 /// (`_Foo` and `_foo` are distinct symbols), and the canonical
 /// Anomali / YARA-X implementations preserve case — lowercasing here
 /// would diverge from those reference outputs.
-fn symhash(macho: &MachO<'_>) -> Option<String> {
+fn symhash(macho: &MachO<'_>, bytes: &[u8]) -> Option<String> {
     const N_EXT: u8 = 0x01;
     const N_TYPE_MASK: u8 = 0x0e;
     const N_UNDF: u8 = 0x00;
-    let symbols = macho.symbols.as_ref()?;
     let mut names = Vec::new();
-    for sym in symbols.iter() {
+    for sym in super::macho::symtab_symbols(macho, bytes) {
         let Ok((name, nlist)) = sym else { continue };
         if nlist.n_type & N_EXT == 0 {
             continue;

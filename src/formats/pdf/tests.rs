@@ -953,3 +953,101 @@ fn truncated_flate_stream_keeps_its_prefix() {
     assert!(partial.iter().all(|&b| b == b'x'));
     assert!(inflate_capped(b"not zlib at all", MAX_INFLATED).is_none());
 }
+
+/// Objects that open a `stream` but never close with `endobj` (or never
+/// write `endstream`) made every object search to end-of-file for the
+/// missing token: thousands of them ahead of a megabyte of padding took
+/// minutes. Each search now resumes where the last one left off.
+#[test]
+fn dict_regions_are_linear_without_closing_tokens() {
+    for object in [
+        "{id} 0 obj\n<< >>\nstream\n",
+        "{id} 0 obj\n<< >>\nstream\nendobj\n",
+    ] {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        for id in 1..=5_000 {
+            pdf.extend_from_slice(object.replace("{id}", &id.to_string()).as_bytes());
+        }
+        pdf.extend(vec![b' '; 4 << 20]);
+        let started = std::time::Instant::now();
+        let regions = collect_dict_regions(&pdf);
+        let elapsed = started.elapsed();
+        assert_eq!(regions.len(), 5_000);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "region walk is quadratic: {elapsed:?}"
+        );
+    }
+}
+
+/// A token found ahead is reused only while it still lies ahead, so the
+/// cached searches find exactly what fresh ones would.
+#[test]
+fn closing_token_search_matches_a_fresh_search() {
+    let pdf = b"%PDF-1.7\n1 0 obj << >> stream\nab\nendstream endobj\n\
+                2 0 obj << >> stream\ncd\nendstream\nendobj\n\
+                3 0 obj << /Length 2 >> stream\nef\nendstream endobj\n%%EOF\n";
+    let regions = collect_dict_regions(pdf);
+    let bodies: Vec<&[u8]> = regions
+        .iter()
+        .filter_map(|r| r.stream_range)
+        .map(|(s, e)| &pdf[s..e])
+        .collect();
+    assert_eq!(bodies, [b"ab", b"cd", b"ef"]);
+}
+
+/// A hex string is read only as far as its hex digits go. Reading to the
+/// next `>` regardless made every `/URI <` in a dictionary scan the rest
+/// of it: quadratic in the number of sites.
+#[test]
+fn hex_value_scan_is_linear_in_sites() {
+    let mut pdf = b"%PDF-1.7\n1 0 obj\n<< ".to_vec();
+    pdf.extend(b"/URI <".repeat(50_000));
+    pdf.extend_from_slice(b"/URI <68 74 74 70> >>\nendobj\n%%EOF\n");
+    let started = std::time::Instant::now();
+    let (v, _) = extract_pdf(&pdf);
+    let elapsed = started.elapsed();
+    let actions = v.get("pdf.actions").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0]["snippet"].as_str(), Some("http"));
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "hex scan is quadratic: {elapsed:?}"
+    );
+    assert_eq!(read_hex_string(b"<4 1 4>", 1).as_deref(), Some("A@"));
+    assert_eq!(read_hex_string(b"<41", 1), None);
+    assert_eq!(read_hex_string(b"<4x>", 1), None);
+    assert_eq!(read_hex_string(b"<>", 1), None);
+}
+
+/// Every action site became a ~1 KB JSON entry from as little as six
+/// input bytes, so a dictionary packed with `/URI(` grew the values tree
+/// a hundredfold. Sites past the cap are not recorded, and that is said.
+#[test]
+fn action_sites_are_capped() {
+    let mut pdf = b"%PDF-1.7\n1 0 obj\n<< ".to_vec();
+    pdf.extend(b"/URI (a) ".repeat(MAX_ACTIONS + 10));
+    pdf.extend_from_slice(b">>\nendobj\n%%EOF\n");
+    let (v, m) = extract_pdf(&pdf);
+    let actions = v.get("pdf.actions").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(actions.len(), MAX_ACTIONS);
+    assert_eq!(m.get("pdf.action_count"), Some(MAX_ACTIONS as f64));
+    let limits = v.get("pdf.limits").and_then(|l| l.as_array()).unwrap();
+    assert!(
+        limits
+            .iter()
+            .any(|l| l["stage"].as_str() == Some("action-cap"))
+    );
+}
+
+/// A literal string reads a bounded span of input: line continuations
+/// produce no output, so the 1 KB output cap alone let one site walk the
+/// whole dictionary.
+#[test]
+fn literal_string_span_is_bounded() {
+    let mut text = b"(".to_vec();
+    text.extend(b"\\\n".repeat(100_000));
+    text.extend_from_slice(b"tail)");
+    assert_eq!(read_literal_string(&text, 1), None);
+    assert_eq!(read_literal_string(b"(a\\\nb)", 1).as_deref(), Some("ab"));
+}

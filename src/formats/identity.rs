@@ -417,6 +417,10 @@ fn dmg(values: &Values, id: &mut Identity) {
 /// path. Recorded as parties rather than as an organization: these name a
 /// person or a service account, not a publisher.
 fn tar(values: &Values, id: &mut Identity) {
+    // Names already recorded, as a set: an archive carries one entry per
+    // distinct owner, and scanning `authors` for each made 100k owners
+    // quadratic.
+    let mut recorded: BTreeSet<String> = id.authors.iter().filter_map(|p| p.name.clone()).collect();
     for key in [
         value_key!("archive.builder.unames"),
         value_key!("archive.builder.gnames"),
@@ -429,7 +433,7 @@ fn tar(values: &Values, id: &mut Identity) {
             if matches!(name, "root" | "wheel" | "staff" | "users" | "nobody" | "") {
                 continue;
             }
-            if !id.authors.iter().any(|p| p.name.as_deref() == Some(name)) {
+            if recorded.insert(name.to_string()) {
                 id.authors.push(Party {
                     name: Some(name.to_string()),
                     email: None,
@@ -579,22 +583,29 @@ fn apk_android(values: &Values, id: &mut Identity) {
 }
 
 fn crx(values: &Values, id: &mut Identity) {
+    // The id and key are header claims until the developer key's signature
+    // over the header and archive checks out. A verified key is still
+    // self-asserted: no certificate vouches for who holds it.
+    let verified = values
+        .get_key(value_key!("crx.signature_verified"))
+        .and_then(JsonValue::as_bool)
+        == Some(true);
     if let Some(ext_id) = get_str(values, value_key!("crx.extension_id")) {
-        // CRX3 carries the canonical extension id in SignedData. The parser
-        // identifies a matching developer proof key when present, but does not
-        // cryptographically verify that proof, so this remains an unverified
-        // structural claim.
         id.identifier = Some(Claim {
             value: ext_id.to_string(),
             source: "crx.extension_id".into(),
-            verified: false,
+            verified,
         });
         id.unique_ids.insert("crx_id".into(), ext_id.to_string());
     }
     if let Some(pk) = get_str(values, value_key!("crx.public_key_sha256")) {
         id.unique_ids
             .insert("public_key_sha256".into(), pk.to_string());
-        id.trust = Trust::Unverified;
+        id.trust = if verified {
+            Trust::SelfSigned
+        } else {
+            Trust::Unverified
+        };
     }
     // Developer-declared author from the extension manifest.
     push_author(
@@ -1814,6 +1825,23 @@ mod container_identity_tests {
             .collect();
         assert_eq!(names, vec!["jenkins", "devs"]);
         assert!(id.authors.iter().all(|p| p.role == "builder"));
+    }
+
+    #[test]
+    fn many_tar_owner_names_are_deduplicated_in_linear_time() {
+        // Each name was checked against every party already recorded, which
+        // made an archive with 100k distinct owners quadratic.
+        let names: Vec<String> = (0..50_000).map(|i| format!("user{i}")).collect();
+        let values = values_from(&[
+            ("archive.builder.unames", serde_json::json!(names)),
+            ("archive.builder.gnames", serde_json::json!(names)),
+        ]);
+        let mut id = Identity::default();
+        let started = std::time::Instant::now();
+        tar(&values, &mut id);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(id.authors.len(), 50_000);
+        assert_eq!(id.authors[0].source, "archive.builder.unames");
     }
 }
 

@@ -32,6 +32,12 @@ const MAX_SIGNATURE_BYTES: u64 = 4 * 1024 * 1024;
 /// A `.SF` signature file holds a digest line per member, so it grows with
 /// the archive; this is well past what the member cap allows for.
 const MAX_SIGNATURE_FILE_BYTES: u64 = 32 * 1024 * 1024;
+/// v1 signature blocks read and verified. A real APK carries one to three
+/// signers; each block costs a read of up to [`MAX_SIGNATURE_BYTES`], one
+/// of its `.SF` of up to [`MAX_SIGNATURE_FILE_BYTES`], and a CMS parse, and
+/// overlapping central-directory entries let the block count grow with the
+/// file. Blocks past this are counted, not read.
+const MAX_SIGNATURE_BLOCKS: usize = 8;
 
 pub(super) fn extract_from_archive<R: Read + Seek>(
     zip: &mut ::zip::ZipArchive<R>,
@@ -231,6 +237,18 @@ fn signer<R: Read + Seek>(
         }
     }
     metrics.insert(metric!("android.v1_signature_count"), names.len() as f64);
+    if names.len() > MAX_SIGNATURE_BLOCKS {
+        push_limit(
+            values,
+            value_key!("android.limits"),
+            "signature-blocks",
+            format!(
+                "read {MAX_SIGNATURE_BLOCKS} of {} v1 signature blocks",
+                names.len()
+            ),
+        );
+        names.truncate(MAX_SIGNATURE_BLOCKS);
+    }
 
     let total = names.len();
     let mut signatures = Vec::new();
@@ -465,6 +483,29 @@ mod tests {
             metrics.get("archive.local_header_mismatch_count"),
             Some(1.0)
         );
+    }
+
+    /// Signature blocks past the cap are counted but not read: each would
+    /// otherwise cost a member read and a CMS parse.
+    #[test]
+    fn signature_blocks_past_the_cap_are_counted_not_read() {
+        let names: Vec<String> = (0..MAX_SIGNATURE_BLOCKS + 4)
+            .map(|i| format!("META-INF/S{i}.RSA"))
+            .collect();
+        let members: Vec<(&str, &[u8])> = names
+            .iter()
+            .map(|n| (n.as_str(), b"\x30\x00".as_slice()))
+            .collect();
+        let (values, metrics, _) = run(&apk_with(b"x", &members));
+        assert_eq!(
+            metrics.get("android.v1_signature_count"),
+            Some((MAX_SIGNATURE_BLOCKS + 4) as f64)
+        );
+        let limits = values
+            .get("android.limits")
+            .and_then(JsonValue::as_array)
+            .unwrap();
+        assert_eq!(limits[0]["stage"].as_str(), Some("signature-blocks"));
     }
 
     /// A manifest past the cap is refused and recorded, not parsed from its

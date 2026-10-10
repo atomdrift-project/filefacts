@@ -24,6 +24,7 @@ use std::collections::BTreeSet;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use super::archive_stats::{Agg, ArchiveStats, Dominance, Reading, Scope, Shape, member_value};
+use super::bounded::MAX_PATH_BYTES;
 use crate::bytes::{Reader, sat_usize};
 use crate::error::Error;
 use crate::formats::common::hex_encode;
@@ -236,6 +237,14 @@ struct Archive {
     extra_field_size: u64,
     end_offset: u64,
     last_file: Option<String>,
+    /// Bytes of NTFS-stream names and paths built so far. Each `STM`
+    /// service block names its host by copying the last file's name (up to
+    /// [`MAX_NAME`]) into both the stream list and a member, so a tiny block
+    /// repeated [`MAX_BLOCKS`] times would cost gigabytes. Capped at
+    /// [`MAX_PATH_BYTES`].
+    stream_path_bytes: usize,
+    /// The stream budget ran out; later streams are not recorded.
+    streams_capped: bool,
     r4_encrypt_ver: Option<u8>,
 }
 
@@ -616,6 +625,22 @@ fn finish_file(ar: &mut Archive, mut member: Member, extra: Extra, service: bool
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "$DATA".into());
                 let stream = stream.trim_start_matches(':');
+                // Host and stream are each copied twice: the stream list
+                // and the member path.
+                let host_len = ar.last_file.as_ref().map_or(0, String::len);
+                let cost = 2 * (host_len + stream.len()) + 1;
+                if ar.streams_capped || cost > MAX_PATH_BYTES - ar.stream_path_bytes {
+                    if !ar.streams_capped {
+                        ar.streams_capped = true;
+                        limit(
+                            ar,
+                            "stream-path-budget",
+                            format!("NTFS stream paths exceeded {MAX_PATH_BYTES} bytes"),
+                        );
+                    }
+                    return;
+                }
+                ar.stream_path_bytes += cost;
                 let host = ar.last_file.clone().unwrap_or_default();
                 let path = if host.is_empty() {
                     format!(":{stream}")

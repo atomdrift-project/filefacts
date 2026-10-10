@@ -28,6 +28,27 @@ const UTF8_FLAG: u32 = 1 << 8;
 /// this bounds a crafted file without truncating a real one.
 const MAX_ELEMENTS: usize = 4096;
 
+/// Decoded string-pool text kept across the document. Pool offsets are not
+/// required to be distinct, so every one of 65,536 entries can name the same
+/// multi-MiB string; real manifests decode a few tens of KiB. Entries past
+/// the budget are dropped and resolve as empty.
+const MAX_POOL_TEXT: usize = 16 << 20;
+
+/// Element and attribute text resolved out of the pool. Every name and value
+/// is a copy of a pool entry, and `MAX_ELEMENTS` elements of 512 attributes
+/// can each name the largest one. The walk stops when this is spent.
+const MAX_ELEMENT_TEXT: usize = 16 << 20;
+
+/// Take `len` bytes from `budget`, or spend it entirely and fail.
+fn charge(budget: &mut usize, len: usize) -> Option<()> {
+    let Some(left) = budget.checked_sub(len) else {
+        *budget = 0;
+        return None;
+    };
+    *budget = left;
+    Some(())
+}
+
 /// Identify a compiled Android XML document before passing arbitrary XML or
 /// binary data through the tolerant chunk walker.
 pub(super) fn looks_like_axml(data: &[u8]) -> bool {
@@ -42,8 +63,8 @@ pub(super) fn looks_like_axml(data: &[u8]) -> bool {
 
 /// Decode the string pool. Entries are UTF-16LE by default, UTF-8 when the
 /// pool sets `UTF8_FLAG`; both use a length prefix that extends to two units
-/// when the high bit is set.
-fn parse_string_pool(chunk: &[u8]) -> Vec<String> {
+/// when the high bit is set. Decoding stops once `budget` is spent.
+fn parse_string_pool(chunk: &[u8], budget: &mut usize) -> Vec<String> {
     let Some(count) = u32_le(chunk, 8).map(|v| v as usize) else {
         return Vec::new();
     };
@@ -62,7 +83,11 @@ fn parse_string_pool(chunk: &[u8]) -> Vec<String> {
         let Some(at) = strings_start.checked_add(offset) else {
             break;
         };
-        out.push(decode_string(chunk, at, utf8).unwrap_or_default());
+        let text = decode_string(chunk, at, utf8).unwrap_or_default();
+        if charge(budget, text.len()).is_none() {
+            break;
+        }
+        out.push(text);
     }
     out
 }
@@ -106,21 +131,25 @@ fn varint8(chunk: &[u8], at: usize) -> Option<(usize, usize)> {
     }
 }
 
-fn pool_str(pool: &[String], index: u32) -> String {
+/// A copy of pool entry `index`, charged to `budget`; `None` once the budget
+/// is spent.
+fn pool_str(pool: &[String], index: u32, budget: &mut usize) -> Option<String> {
     // 0xFFFFFFFF is the "no string" sentinel.
     if index == u32::MAX {
-        return String::new();
+        return Some(String::new());
     }
-    pool.get(index as usize).cloned().unwrap_or_default()
+    let text = pool.get(index as usize).map_or("", String::as_str);
+    charge(budget, text.len())?;
+    Some(text.to_owned())
 }
 
 /// Render a typed attribute value. Only the types a manifest actually uses are
 /// spelled out; anything else is reported as its raw integer rather than
 /// guessed at, so a reader can tell a real value from an unrecognized one.
-fn typed_value(pool: &[String], data_type: u8, data: u32) -> String {
-    match data_type {
+fn typed_value(pool: &[String], data_type: u8, data: u32, budget: &mut usize) -> Option<String> {
+    Some(match data_type {
         // TYPE_STRING
-        0x03 => pool_str(pool, data),
+        0x03 => pool_str(pool, data, budget)?,
         // TYPE_INT_BOOLEAN
         0x12 => (data != 0).to_string(),
         // TYPE_INT_HEX
@@ -129,17 +158,19 @@ fn typed_value(pool: &[String], data_type: u8, data: u32) -> String {
         0x01 | 0x02 => format!("@0x{data:x}"),
         // TYPE_INT_DEC and the remaining integer types.
         _ => data.cast_signed().to_string(),
-    }
+    })
 }
 
 /// Walk the document and return its start elements in order.
 pub(super) fn parse(bytes: &[u8]) -> Vec<Element> {
     let mut pool: Vec<String> = Vec::new();
     let mut elements = Vec::new();
+    let mut pool_budget = MAX_POOL_TEXT;
+    let mut text_budget = MAX_ELEMENT_TEXT;
 
     // Skip the 8-byte document header, then walk sibling chunks.
     let mut off = 8usize;
-    while off + 8 <= bytes.len() && elements.len() < MAX_ELEMENTS {
+    while off + 8 <= bytes.len() && elements.len() < MAX_ELEMENTS && text_budget > 0 {
         let Some(chunk_type) = u16_le(bytes, off) else {
             break;
         };
@@ -155,9 +186,9 @@ pub(super) fn parse(bytes: &[u8]) -> Vec<Element> {
             break;
         };
         match chunk_type {
-            TYPE_STRING_POOL => pool = parse_string_pool(chunk),
+            TYPE_STRING_POOL => pool = parse_string_pool(chunk, &mut pool_budget),
             TYPE_START_ELEMENT => {
-                if let Some(el) = parse_start_element(chunk, &pool) {
+                if let Some(el) = parse_start_element(chunk, &pool, &mut text_budget) {
                     elements.push(el);
                 }
             }
@@ -197,10 +228,12 @@ pub(super) fn extract_values(bytes: &[u8], values: &mut crate::output::Values) {
     }
 }
 
-fn parse_start_element(chunk: &[u8], pool: &[String]) -> Option<Element> {
+/// Resolve one start element, charging its names and values to `budget`.
+/// An element the budget cannot cover is dropped whole.
+fn parse_start_element(chunk: &[u8], pool: &[String], budget: &mut usize) -> Option<Element> {
     // header: type/headerSize/size (8) + lineNumber (4) + comment (4)
     // body:   ns (4) + name (4) + attrStart (2) + attrSize (2) + attrCount (2)
-    let name = pool_str(pool, u32_le(chunk, 20)?);
+    let name = pool_str(pool, u32_le(chunk, 20)?, budget)?;
     let attr_start = u16_le(chunk, 24)? as usize;
     let attr_size = u16_le(chunk, 26)? as usize;
     let attr_count = u16_le(chunk, 28)? as usize;
@@ -226,13 +259,13 @@ fn parse_start_element(chunk: &[u8], pool: &[String]) -> Option<Element> {
         let Some(data) = u32_le(chunk, at + 16) else {
             break;
         };
-        let attr_name = pool_str(pool, name_idx);
+        let attr_name = pool_str(pool, name_idx, budget)?;
         // The raw string is authoritative when present; otherwise fall back to
         // the typed value.
         let value = if raw_idx == u32::MAX {
-            typed_value(pool, data_type, data)
+            typed_value(pool, data_type, data, budget)?
         } else {
-            pool_str(pool, raw_idx)
+            pool_str(pool, raw_idx, budget)?
         };
         attrs.push((attr_name, value));
     }
@@ -339,6 +372,55 @@ mod tests {
         let mut chunk = vec![0u8; 28];
         chunk.extend_from_slice(&[2, 0, b'h', 0, b'i', 0, 0, 0]);
         assert_eq!(decode_string(&chunk, 28, false).as_deref(), Some("hi"));
+    }
+
+    /// A UTF-8 pool chunk with `count` offsets that all name one string of
+    /// `len` bytes.
+    fn pool_of_one_string(count: usize, len: usize) -> Vec<u8> {
+        let strings_start = 28 + count * 4;
+        let mut chunk = vec![0u8; 28];
+        chunk[8..12].copy_from_slice(&(count as u32).to_le_bytes());
+        chunk[16..20].copy_from_slice(&UTF8_FLAG.to_le_bytes());
+        chunk[20..24].copy_from_slice(&(strings_start as u32).to_le_bytes());
+        chunk.resize(strings_start, 0);
+        let varint = [0x80 | (len >> 8) as u8, len as u8];
+        chunk.extend_from_slice(&varint);
+        chunk.extend_from_slice(&varint);
+        chunk.resize(chunk.len() + len, b'x');
+        chunk
+    }
+
+    /// 65,536 offsets naming one 32 KiB string decoded 2 GiB of copies; the
+    /// pool budget keeps the first `MAX_POOL_TEXT` of them.
+    #[test]
+    fn repeated_pool_offsets_stop_at_the_text_budget() {
+        let len = 0x7fff;
+        let chunk = pool_of_one_string(65_536, len);
+        let mut budget = MAX_POOL_TEXT;
+        let pool = parse_string_pool(&chunk, &mut budget);
+        assert_eq!(pool.len(), MAX_POOL_TEXT / len);
+        assert!(pool.iter().map(String::len).sum::<usize>() <= MAX_POOL_TEXT);
+    }
+
+    /// Attributes all naming the largest pool entry stop resolving once the
+    /// element-text budget is spent, and the element is dropped.
+    #[test]
+    fn element_text_stops_at_the_budget() {
+        let pool = vec!["x".repeat(1000)];
+        let attrs = 512_usize;
+        let mut el = vec![0u8; 36 + attrs * 20];
+        el[24..26].copy_from_slice(&20u16.to_le_bytes());
+        el[26..28].copy_from_slice(&20u16.to_le_bytes());
+        el[28..30].copy_from_slice(&(attrs as u16).to_le_bytes());
+        // Element name, attribute names and raw values are all index 0.
+        let mut budget = usize::MAX;
+        let full = parse_start_element(&el, &pool, &mut budget).unwrap();
+        assert_eq!(full.attrs.len(), attrs);
+        assert_eq!(usize::MAX - budget, 1000 * (1 + 2 * attrs));
+
+        let mut budget = 100_000;
+        assert!(parse_start_element(&el, &pool, &mut budget).is_none());
+        assert_eq!(budget, 0);
     }
 
     #[test]

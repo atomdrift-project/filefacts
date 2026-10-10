@@ -560,3 +560,146 @@ fn deep_export_trie_is_recorded_as_malformed() {
         "{errors:?}"
     );
 }
+
+/// A minimal little-endian 64-bit Mach-O executable holding `commands`, with
+/// `tail` after them.
+fn thin_macho(commands: &[&[u32]], tail: &[u8]) -> Vec<u8> {
+    let sizeofcmds: usize = commands.iter().map(|c| c.len() * 4).sum();
+    let mut file = Vec::new();
+    for word in [
+        0xfeed_facf_u32,
+        0x0100_0007,
+        3,
+        2,
+        commands.len() as u32,
+        sizeofcmds as u32,
+        0,
+        0,
+    ] {
+        file.extend_from_slice(&word.to_le_bytes());
+    }
+    for word in commands.iter().flat_map(|c| c.iter()) {
+        file.extend_from_slice(&word.to_le_bytes());
+    }
+    file.extend_from_slice(tail);
+    file
+}
+
+/// goblin walks `LC_SYMTAB`'s `nsyms` without checking it against the file;
+/// a forged count of four billion stops at the entries that fit rather than
+/// being collected into a four-billion-entry vector.
+#[test]
+fn forged_symbol_count_walks_only_the_entries_in_the_file() {
+    // LC_SYMTAB: symoff/stroff just past the command, nsyms = u32::MAX, and
+    // room for two `nlist_64` entries.
+    let file = thin_macho(&[&[0x2, 24, 56, u32::MAX, 56, 0]], &[0; 32]);
+    let macho = MachO::parse(&file, 0).expect("minimal Mach-O");
+    assert_eq!(symtab_symbols(&macho, &file).count(), 2);
+    assert!(import_name_offsets(&macho, &file).is_empty());
+    let mut values = Values::new();
+    super::super::macho_hashes::emit(&macho, &file, &mut values, &crate::Symbols::new());
+    assert!(values.get("macho.hashes.symhash").is_none());
+}
+
+/// `LC_BUILD_VERSION`'s tool list ends with its command, whatever `ntools`
+/// claims; the bytes after it are not more tools.
+#[test]
+fn build_version_tools_stay_inside_the_command() {
+    // cmd, cmdsize (header + one tool), platform, minos, sdk, ntools, tool.
+    let command = [
+        0x32,
+        32,
+        1,
+        0x000e_0000,
+        0x000e_0000,
+        u32::MAX,
+        3,
+        0x0001_0000,
+    ];
+    let file = thin_macho(&[&command], &[0x41; 8192]);
+    let macho = MachO::parse(&file, 0).expect("minimal Mach-O");
+    let mut values = Values::new();
+    build_version(&macho, &file, &mut values);
+    let tools = values.get("macho.build_version.tools").unwrap();
+    assert_eq!(tools.as_array().map(Vec::len), Some(1));
+}
+
+/// One-byte `LC_LINKER_OPTION` strings are capped, not each turned into a
+/// JSON value.
+#[test]
+fn linker_options_are_capped() {
+    let mut command = vec![0x2d_u32, 0, u32::MAX];
+    command.extend(std::iter::repeat_n(u32::from_le_bytes(*b"a\0b\0"), 10_000));
+    command[1] = (command.len() * 4) as u32;
+    let file = thin_macho(&[&command], &[]);
+    let macho = MachO::parse(&file, 0).expect("minimal Mach-O");
+    let mut values = Values::new();
+    linker_options(&macho, &file, &mut values);
+    let options = values.get("macho.linker_options").unwrap();
+    assert_eq!(options.as_array().map(Vec::len), Some(MAX_LINKER_OPTIONS));
+}
+
+/// Fat entries that all name the same slice analyse it once: real universal
+/// binaries have disjoint slices, and each analysis hashes the whole slice.
+#[test]
+fn overlapping_fat_slices_are_analysed_once() {
+    let slice = thin_macho(&[], &[]);
+    let mut file = vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 3];
+    for _ in 0..3 {
+        for word in [0x0100_0007_u32, 3, 4096, slice.len() as u32, 12] {
+            file.extend_from_slice(&word.to_be_bytes());
+        }
+    }
+    file.resize(4096, 0);
+    file.extend_from_slice(&slice);
+    let mut out = crate::formats::Sinks::default();
+    extract(&file, out.ctx());
+    assert_eq!(out.metrics.get("macho.slice_count"), Some(1.0));
+    assert!(
+        out.errors
+            .iter()
+            .any(|e| e.message.contains("overlaps the slices before it")),
+        "{:?}",
+        out.errors
+    );
+}
+
+/// Section headers that all claim the whole file are measured for entropy
+/// only until one file's worth of bytes has been read.
+#[test]
+fn overlapping_sections_share_one_entropy_pass() {
+    // LC_SEGMENT_64 "__TEXT" with 200 sections, each covering the whole file.
+    let nsects = 200_u32;
+    let cmdsize = 72 + 80 * nsects;
+    let mut command = vec![0x19_u32, cmdsize];
+    command.extend(u32s(b"__TEXT\0\0\0\0\0\0\0\0\0\0"));
+    // vmaddr, vmsize, fileoff, filesize (u64 each), maxprot, initprot,
+    // nsects, flags.
+    command.extend([0, 0, 0x1000, 0, 0, 0, 0x1000, 0, 5, 5, nsects, 0]);
+    for _ in 0..nsects {
+        command.extend(u32s(
+            b"__text\0\0\0\0\0\0\0\0\0\0__TEXT\0\0\0\0\0\0\0\0\0\0",
+        ));
+        // addr, size (u64), offset, align, reloff, nreloc, flags, reserved1-3.
+        command.extend([0, 0, 0x1000, 0, 0, 0, 0, 0, 0x8000_0400, 0, 0, 0]);
+    }
+    let file = thin_macho(&[&command], &[0x90; 0x1000]);
+    let macho = MachO::parse(&file, 0).expect("Mach-O with sections");
+    let mut sections = Vec::new();
+    extract_sections(&macho, &file, &mut Metrics::new(), &mut sections);
+    assert_eq!(sections.len(), nsects as usize);
+    let measured = sections.iter().filter(|s| s.entropy.is_some()).count();
+    assert!(
+        measured * 0x1000 <= file.len(),
+        "{measured} sections measured"
+    );
+    assert!(measured >= 1);
+}
+
+fn u32s(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
+}

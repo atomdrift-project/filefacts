@@ -277,7 +277,17 @@ pub(super) fn extract(
     emit_query_limit_metrics(metrics, "classes", &classes);
 
     // Identifier metrics — emit `identifiers.*`.
-    let identifiers = walked.identifiers.take().unwrap_or_default().found;
+    let identifiers = walked.identifiers.take().unwrap_or_default();
+    if identifiers.truncated {
+        tracing::warn!(
+            lang = config.name(),
+            kept = identifiers.found.len(),
+            source_bytes = source.len(),
+            "identifier text exceeded its budget; the longest nested names were \
+             left out of identifier metrics (generated or adversarial source)",
+        );
+    }
+    let identifiers = identifiers.found;
     identifier_metrics::emit(&identifiers, metrics);
 
     // String-literal metrics — operate on the literals we already

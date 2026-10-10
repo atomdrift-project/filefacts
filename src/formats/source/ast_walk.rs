@@ -28,7 +28,8 @@
 //! loops, assignments, subscripts) are matched across all grammars at once.
 
 use crate::metric;
-use std::collections::{BTreeMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use tree_sitter::{Node, TreeCursor};
 
@@ -42,9 +43,8 @@ use super::visit::{self, NodeIds, Visit};
 ///
 /// tree-sitter trees can be arbitrarily deep on generated or adversarial
 /// source (thousands of nested brackets, binary expressions, etc.). The
-/// symbol walk once recursed one stack frame per level, and the chain helpers
-/// below still recurse per link, so an unbounded walk would overflow the
-/// worker thread's stack and abort the whole process. The walk passes no
+/// symbol walk once recursed one stack frame per level, so an unbounded walk
+/// would overflow the worker thread's stack and abort the whole process. The walk passes no
 /// node below this depth to [`State::visit`]. Real source is rarely more
 /// than a few dozen levels deep; anything past this is machine-generated and
 /// yields no useful symbols. `ast.max_depth` saturates at this value, which is itself
@@ -559,6 +559,12 @@ pub(super) struct State {
     /// Ids of member/subscript nodes inside a chain whose outermost node
     /// already recorded their paths; the walk skips each as it passes.
     resolved_links: HashSet<usize>,
+    /// Every chain resolved so far, so the calls and members inside one are
+    /// resolved from it rather than by walking the chain again.
+    spines: Vec<Spine>,
+    /// Node id → its spine in `spines` and joint index, for every joint
+    /// whose [`Fate`] is known.
+    joints: HashMap<usize, (usize, usize)>,
     /// Dedup'd bare-identifier names with first-seen byte offset.
     /// Captures every identifier-kind token across the file — variable
     /// references, parameter names, type names, function-call targets,
@@ -814,6 +820,29 @@ impl State {
         }
     }
 
+    /// The spine holding `node` and its joint index there, resolving the
+    /// chain rooted at `node` unless an earlier chain already settled it.
+    fn spine(&mut self, node: Node<'_>, source: &str, config: &LangConfig) -> (usize, usize) {
+        if let Some(&(spine, joint)) = self.joints.get(&node.id()) {
+            return (spine, joint);
+        }
+        let spine = Spine::new(node, source, config, SPINE_DEPTH);
+        let index = self.spines.len();
+        for (joint, j) in spine.joints.iter().enumerate() {
+            if !matches!(j.fate, Fate::Unknown) {
+                self.joints.insert(j.id, (index, joint));
+            }
+        }
+        self.spines.push(spine);
+        (index, 0)
+    }
+
+    /// [`static_dotted_chain`] through the spines already resolved.
+    fn static_path(&mut self, node: Node<'_>, source: &str, config: &LangConfig) -> Option<String> {
+        let (spine, joint) = self.spine(node, source, config);
+        self.spines.get(spine)?.path(joint).map(str::to_string)
+    }
+
     /// Record the static path of the chain rooted at `node`, at walk depth
     /// `depth`, and of each member/subscript prefix inside it.
     fn record_member_chain(
@@ -823,28 +852,36 @@ impl State {
         config: &LangConfig,
         depth: u32,
     ) {
-        let mut path = String::new();
-        let mut links = Vec::new();
-        if chain_into(node, source, config, 0, 0, &mut path, Some(&mut links)).is_none() {
+        let (spine, first) = self.spine(node, source, config);
+        let Some(spine) = self.spines.get(spine) else {
             return;
-        }
+        };
+        let Some(path) = spine.path(first) else {
+            return;
+        };
         // Every prefix has fewer links than the full path.
         let depth_n = u32::try_from(path.matches('.').count()).unwrap_or(u32::MAX) + 1;
         if depth_n > self.max_member_chain_depth {
             self.max_member_chain_depth = depth_n;
         }
-        for link in links {
+        for (level, link) in spine.joints.iter().skip(first).enumerate() {
+            let (true, Some(len)) = (link.link, link.len) else {
+                continue;
+            };
+            let level = u32::try_from(level).unwrap_or(u32::MAX);
             // The walk never reaches a link past the depth cap, so it gets no
             // member of its own.
-            if depth + link.level >= MAX_AST_DEPTH {
+            if depth.saturating_add(level) >= MAX_AST_DEPTH {
                 continue;
             }
-            if link.level > 0 {
+            if level > 0 {
                 self.resolved_links.insert(link.id);
             }
             // A path seen more than once keeps its first offset in source
             // order, whichever chain reached it first.
-            let prefix = &path[..link.path_len];
+            let Some(prefix) = spine.path.get(..len) else {
+                continue;
+            };
             match self.members.get_mut(prefix) {
                 Some(offset) => *offset = (*offset).min(link.offset),
                 None => {
@@ -865,7 +902,7 @@ impl State {
         let callee = config.callee(node).or_else(|| first_named_child(node));
         let args_node = config.argument_list(node);
 
-        let target = callee.and_then(|c| static_dotted_chain(c, source, config, 0));
+        let target = callee.and_then(|c| self.static_path(c, source, config));
         // A Bash "command" whose name starts with `-` is an option word, not a
         // program, so it records no call.
         if config.lang == Lang::Bash && target.as_deref().is_some_and(|t| t.starts_with('-')) {
@@ -917,7 +954,7 @@ impl State {
         let Some(value_node) = assignment_value(node) else {
             return;
         };
-        let Some(target) = static_dotted_chain(target_node, source, config, 0) else {
+        let Some(target) = self.static_path(target_node, source, config) else {
             return;
         };
         self.binds.push(Symbol::Bind {
@@ -1055,7 +1092,8 @@ fn parse_numeric_literal_node(node: Node<'_>, source: &str) -> Option<(String, i
 /// Resolve a callee or member-access node into its static dotted path,
 /// `a.b.c`. Returns `None` for any chain that contains a non-static
 /// element (computed property, call result, parenthesised expression
-/// other than the leftmost root, …).
+/// other than the leftmost root, …), or that reaches [`MAX_AST_DEPTH`]
+/// below `node`.
 ///
 /// **String-subscript normalisation:** `obj["constructor"]` and
 /// `obj['constructor']` (computed access with a string-literal index)
@@ -1067,141 +1105,130 @@ pub(super) fn static_dotted_chain(
     node: Node<'_>,
     source: &str,
     config: &LangConfig,
-    depth: u32,
 ) -> Option<String> {
-    let mut path = String::new();
-    chain_into(node, source, config, depth, 0, &mut path, None)?;
-    Some(path)
+    // Only `node`'s own path is wanted, which no joint past the cap changes.
+    let spine = Spine::new(node, source, config, MAX_AST_DEPTH);
+    spine.path(0).map(str::to_string)
 }
 
-/// A member or subscript node on the receiver side of a chain resolved by
-/// [`chain_into`], `level` tree levels below the chain's root. Its own path
-/// is the first `path_len` bytes of the root's.
-struct ChainLink {
-    id: usize,
-    offset: u64,
-    level: u32,
-    path_len: usize,
+/// Depth units [`State`] has [`Spine::new`] descend before it stops. Twice
+/// the cap, so a descent that stops settles the first [`MAX_AST_DEPTH`] units
+/// of its joints as past the cap, and a joint below them is resolved by its
+/// own descent.
+const SPINE_DEPTH: u32 = 2 * MAX_AST_DEPTH;
+
+/// What one node of a chain adds to the path of the receiver below it.
+enum Part<'s> {
+    /// The chain's static root name.
+    Root(&'s str),
+    /// `.name` after the receiver: a member's property, or the key of a
+    /// string subscript.
+    Field(Cow<'s, str>),
+    /// A call in receiver position contributes the name of what it called,
+    /// and nothing else: `open(p).read()` is `open.read`.
+    ///
+    /// This used to append `()`, which read as "a call happened here" but
+    /// was really positional — the outermost call is named by `record_call`
+    /// from its callee and never got parens, so `platform.system()` was
+    /// `platform.system` while `open(p).read()` was `open().read`. One call,
+    /// two spellings, depending on where it sat. Rule authors reasonably
+    /// wrote `.system()` and matched nothing.
+    ///
+    /// Without the parens a symbol is one thing everywhere: a dotted path of
+    /// identifiers, the same shape a stripped binary's symbol table yields.
+    Call,
+    /// Not static: a computed key, an empty or runtime-chosen name, an
+    /// unknown node kind.
+    Dynamic,
 }
 
-/// [`static_dotted_chain`], appending the path to `path` and, when `links` is
-/// given, reporting every member/subscript node it resolved on the way. On
-/// `None`, `path` and `links` hold partial output.
-fn chain_into(
-    node: Node<'_>,
-    source: &str,
+/// What `node` adds to its receiver's path ([`Part`]), the receiver to
+/// continue down to, and the depth units that step costs.
+fn part<'t>(
+    node: Node<'t>,
+    source: &'t str,
     config: &LangConfig,
-    depth: u32,
-    level: u32,
-    path: &mut String,
-    mut links: Option<&mut Vec<ChainLink>>,
-) -> Option<()> {
-    // A member/subscript/call chain (`a.b.c…`, `obj["x"]["y"]…`, `f()()…`) is
-    // a left-leaning tree as deep as it is long, and this function recurses
-    // one frame per link. An adversarial chain thousands deep would overflow
-    // the stack before the walk's own depth guard applies. Bail at the
-    // shared cap and treat the chain as non-static (dynamic access) — the
-    // conservative, no-symbol outcome.
-    if depth >= MAX_AST_DEPTH {
-        return None;
-    }
+) -> (Part<'t>, Option<Node<'t>>, u32) {
+    const DYNAMIC: (Part<'static>, Option<Node<'static>>, u32) = (Part::Dynamic, None, 0);
+    let root = |name: Option<&'t str>| (name.map_or(Part::Dynamic, Part::Root), None, 0);
     let text = || node.utf8_text(source.as_bytes()).ok();
-    if config.lang == Lang::Rust && node.kind() == "scoped_identifier" {
-        path.push_str(text()?);
-        return Some(());
+    let kind = node.kind();
+    if config.lang == Lang::Rust && kind == "scoped_identifier" {
+        return root(text());
     }
     // Perl aliases both bareword callees and builtin names to `function`.
     // A leaf is a static name; non-leaf forms can dereference a code variable
     // (`&$callback`) and must remain unresolved rather than becoming symbols.
-    if config.lang == Lang::Perl && node.kind() == "function" && node.named_child_count() == 0 {
-        path.push_str(text()?);
-        return Some(());
+    if config.lang == Lang::Perl && kind == "function" && node.named_child_count() == 0 {
+        return root(text());
     }
     // A simple Perl scalar is a lexical receiver spelling, not a resolved
     // runtime type. Dereferences and computed variable names stay unknown.
-    if config.lang == Lang::Perl && node.kind() == "scalar" {
-        let name = node.named_child(0)?;
-        if name.kind() == "varname" && name.named_child_count() == 0 {
-            let value = name.utf8_text(source.as_bytes()).ok()?;
-            if !value.is_empty()
-                && value
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_' || c == ':')
-            {
-                path.push_str(text()?);
-                return Some(());
-            }
-        }
-        return None;
+    if config.lang == Lang::Perl && kind == "scalar" {
+        let plain = node.named_child(0).is_some_and(|name| {
+            name.kind() == "varname"
+                && name.named_child_count() == 0
+                && name.utf8_text(source.as_bytes()).is_ok_and(|value| {
+                    !value.is_empty()
+                        && value
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || c == '_' || c == ':')
+                })
+        });
+        return root(if plain { text() } else { None });
     }
-    if config.identifier_kinds.contains(&node.kind()) {
-        path.push_str(text()?);
-        return Some(());
+    if config.identifier_kinds.contains(&kind) {
+        return root(text());
     }
-    if config.member_kinds.contains(&node.kind()) {
-        let object = node.child_by_field_name(config.member_object_field)?;
-        let prop = node.child_by_field_name(config.member_property_field)?;
+    if config.member_kinds.contains(&kind) {
+        let (Some(object), Some(prop)) = (
+            node.child_by_field_name(config.member_object_field),
+            node.child_by_field_name(config.member_property_field),
+        ) else {
+            return DYNAMIC;
+        };
         // `$receiver->$method(...)` has a scalar child inside `method`;
         // unlike a bareword method, its name is chosen at runtime.
         if config.lang == Lang::Perl && prop.named_child_count() != 0 {
-            return None;
+            return DYNAMIC;
         }
-        chain_into(
-            object,
-            source,
-            config,
-            depth + 1,
-            level + 1,
-            path,
-            links.as_deref_mut(),
-        )?;
-        let prop_text = prop.utf8_text(source.as_bytes()).ok()?;
-        if prop_text.is_empty() {
-            return None;
-        }
-        path.push('.');
-        path.push_str(prop_text);
-        push_link(links, node, level, path);
-        return Some(());
+        let name = prop
+            .utf8_text(source.as_bytes())
+            .ok()
+            .filter(|name| !name.is_empty());
+        let part = name.map_or(Part::Dynamic, |name| Part::Field(Cow::Borrowed(name)));
+        return (part, Some(object), 1);
     }
-    if is_subscript_kind(node.kind()) {
-        let (path_len, links_len) = (path.len(), links.as_ref().map_or(0, |l| l.len()));
-        if fold_string_subscript_into(
-            node,
-            source,
-            config,
-            depth + 1,
-            level,
-            path,
-            links.as_deref_mut(),
-        )
-        .is_some()
-        {
-            push_link(links, node, level, path);
-            return Some(());
+    if is_subscript_kind(kind) {
+        // First named child is the object; second is the index expression.
+        let (Some(object), Some(index)) = (node.named_child(0), node.named_child(1)) else {
+            return DYNAMIC;
+        };
+        if !config.string_kinds.contains(&index.kind()) {
+            return DYNAMIC;
         }
-        path.truncate(path_len);
-        if let Some(links) = links.as_deref_mut() {
-            links.truncate(links_len);
-        }
+        // Conservative: only fold string indices whose content looks like an
+        // identifier (alphanumeric + underscore, no leading digit). Skips
+        // `"foo bar"` or `"123"` that wouldn't be valid as dotted property
+        // access in any language we care about.
+        let key = decode_string_literal(index, source, config).filter(|key| {
+            let mut chars = key.chars();
+            chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+                && chars.all(|c| c.is_alphanumeric() || c == '_')
+        });
+        let part = key.map_or(Part::Dynamic, |key| Part::Field(Cow::Owned(key)));
+        // The recursive resolver this replaced spent a level on the fold
+        // itself; keep its depth accounting.
+        return (part, Some(object), 2);
     }
-    // A call in receiver position contributes the name of what it called, and
-    // nothing else: `open(p).read()` is `open.read`.
-    //
-    // This used to append `()`, which read as "a call happened here" but was
-    // really positional — the outermost call is named by `record_call` from
-    // its callee and never got parens, so `platform.system()` was
-    // `platform.system` while `open(p).read()` was `open().read`. One call,
-    // two spellings, depending on where it sat. Rule authors reasonably wrote
-    // `.system()` and matched nothing.
-    //
-    // Without the parens a symbol is one thing everywhere: a dotted path of
-    // identifiers, the same shape a stripped binary's symbol table yields.
-    if config.call_kinds.contains(&node.kind()) {
+    if config.call_kinds.contains(&kind) {
         let callee = node
             .child_by_field_name(config.callee_field)
-            .or_else(|| first_named_child(node))?;
-        return chain_into(callee, source, config, depth + 1, level + 1, path, links);
+            .or_else(|| first_named_child(node));
+        return match callee {
+            Some(callee) => (Part::Call, Some(callee), 1),
+            None => DYNAMIC,
+        };
     }
     // Constructor type names: Java `type_identifier` / `scoped_type_identifier`
     // (`new ProcessBuilder()`, `new java.io.File()`) and similar type-name
@@ -1209,24 +1236,122 @@ fn chain_into(
     // would otherwise drop to `None`. The node text is already the
     // (possibly dotted) type name, so emit it directly — this is what makes
     // `new ProcessBuilder(...)` a `kind: call` fact with target `ProcessBuilder`.
-    if node.kind().ends_with("type_identifier") || node.kind() == "qualified_name" {
-        // `qualified_name` covers C# `new System.Random()` — its text is the
-        // already-dotted type name. Together with the `type_identifier` arm
-        // this resolves constructor callees that aren't bare identifiers.
-        path.push_str(text().filter(|s| !s.is_empty())?);
-        return Some(());
+    // `qualified_name` covers C# `new System.Random()` — its text is the
+    // already-dotted type name.
+    if kind.ends_with("type_identifier") || kind == "qualified_name" {
+        return root(text().filter(|name| !name.is_empty()));
     }
-    None
+    DYNAMIC
 }
 
-fn push_link(links: Option<&mut Vec<ChainLink>>, node: Node<'_>, level: u32, path: &str) {
-    if let Some(links) = links {
-        links.push(ChainLink {
-            id: node.id(),
-            offset: node.start_byte() as u64,
-            level,
-            path_len: path.len(),
-        });
+/// Whether resolving a [`Joint`]'s own chain yields a static path.
+#[derive(Clone, Copy)]
+enum Fate {
+    /// Static, with a path of this length.
+    Static(usize),
+    /// Not static: a dynamic part at or below the joint, or a chain reaching
+    /// [`MAX_AST_DEPTH`] below it.
+    Dynamic,
+    /// Below where the descent stopped; the joint needs its own descent.
+    Unknown,
+}
+
+/// One node on a chain's receiver spine.
+struct Joint {
+    id: usize,
+    offset: u64,
+    /// A member access or folded subscript, whose path is a member prefix.
+    link: bool,
+    /// The path length once this joint's part is appended, when every part
+    /// from the root up to it is static: a prefix of [`Spine::path`].
+    len: Option<usize>,
+    fate: Fate,
+}
+
+/// The receiver spine of a chain (`a.b().c` → `.c`, `b()`, `.b`, `a`),
+/// outermost first, resolved once from its root up, so every joint's own path
+/// is known without walking the chain again. Resolving each call and member
+/// of a chain on its own walked the rest of the chain each time, quadratic in
+/// its length: 500 chains of 900 calls took ten minutes. Iterative, so a
+/// chain of any length costs no stack.
+struct Spine {
+    /// The path of the outermost static joint; each joint's path is a prefix.
+    path: String,
+    joints: Vec<Joint>,
+}
+
+impl Spine {
+    /// Resolve the chain rooted at `top`, descending at most `limit` depth
+    /// units, which must be at least [`MAX_AST_DEPTH`].
+    fn new(top: Node<'_>, source: &str, config: &LangConfig, limit: u32) -> Self {
+        // Each joint with its depth units below `top`, down to the root, the
+        // first part with nothing below it, or `limit`.
+        let mut parts = Vec::new();
+        let mut depth = 0u32;
+        let mut next = Some(top);
+        while let Some(node) = next {
+            if depth > limit {
+                break;
+            }
+            let (part, receiver, cost) = part(node, source, config);
+            parts.push((node, depth, part));
+            next = receiver;
+            depth = depth.saturating_add(cost);
+        }
+        // A stopped descent has no root to build a path from, and its last
+        // part lies at least `depth` units below `top`.
+        let stopped = next.is_some();
+        let bottom = parts.last().map_or(0, |&(_, depth, _)| depth);
+        let mut path = String::new();
+        let mut joints = Vec::with_capacity(parts.len());
+        let mut ok = !stopped;
+        let mut dynamic = false;
+        for (node, at, part) in parts.into_iter().rev() {
+            let link = matches!(part, Part::Field(_));
+            dynamic |= matches!(part, Part::Dynamic);
+            ok = ok
+                && match part {
+                    Part::Root(name) => {
+                        path.push_str(name);
+                        true
+                    }
+                    Part::Field(name) => {
+                        path.push('.');
+                        path.push_str(&name);
+                        true
+                    }
+                    Part::Call => true,
+                    Part::Dynamic => false,
+                };
+            let fate = if stopped {
+                if dynamic || depth - at >= MAX_AST_DEPTH {
+                    Fate::Dynamic
+                } else {
+                    Fate::Unknown
+                }
+            } else if ok && bottom - at < MAX_AST_DEPTH {
+                Fate::Static(path.len())
+            } else {
+                Fate::Dynamic
+            };
+            joints.push(Joint {
+                id: node.id(),
+                offset: node.start_byte() as u64,
+                link,
+                len: ok.then_some(path.len()),
+                fate,
+            });
+        }
+        joints.reverse();
+        Self { path, joints }
+    }
+
+    /// The static path of joint `index`'s own chain.
+    fn path(&self, index: usize) -> Option<&str> {
+        match self.joints.get(index)?.fate {
+            Fate::Static(len) => self.path.get(..len),
+            Fate::Dynamic | Fate::Unknown => None,
+        }
     }
 }
 
@@ -1246,56 +1371,6 @@ pub(super) const SUBSCRIPT_KINDS: &[&str] = &[
     "index_expression",
     "element_access_expression",
 ];
-
-/// Fold `obj["constructor"]` → `obj.constructor` when the subscript
-/// index is a string literal. The canonical JS sandbox-escape pattern
-/// (`obj["constructor"]["constructor"]("...")()`) becomes a normal
-/// member chain so trait authors can match it with `type: member,
-/// path: …` rules instead of reaching for a tree-sitter escape hatch.
-///
-/// Returns `None` for non-literal indices (variable, expression,
-/// numeric) — those genuinely are dynamic accesses.
-fn fold_string_subscript_into(
-    node: Node<'_>,
-    source: &str,
-    config: &LangConfig,
-    depth: u32,
-    level: u32,
-    path: &mut String,
-    links: Option<&mut Vec<ChainLink>>,
-) -> Option<()> {
-    // Mutually recursive with `chain_into` for nested subscripts
-    // (`obj["x"]["y"]…`); share its depth budget so the pair can't outrun the
-    // cap between them.
-    if depth >= MAX_AST_DEPTH {
-        return None;
-    }
-    // First named child is the object; second is the index expression.
-    let mut cursor = node.walk();
-    let mut children = node.named_children(&mut cursor);
-    let object = children.next()?;
-    let index = children.next()?;
-    if !config.string_kinds.contains(&index.kind()) {
-        return None;
-    }
-    chain_into(object, source, config, depth + 1, level + 1, path, links)?;
-    let prop = decode_string_literal(index, source, config)?;
-    // Conservative: only fold string indices whose content looks like
-    // an identifier (alphanumeric + underscore, no leading digit).
-    // Skips `"foo bar"` or `"123"` that wouldn't be valid as dotted
-    // property access in any language we care about.
-    let mut chars = prop.chars();
-    match chars.next() {
-        Some(c) if c.is_alphabetic() || c == '_' => {}
-        _ => return None,
-    }
-    if !chars.all(|c| c.is_alphanumeric() || c == '_') {
-        return None;
-    }
-    path.push('.');
-    path.push_str(&prop);
-    Some(())
-}
 
 /// Node kinds that bind a value to a target, recorded as `Symbol::Bind`.
 pub(super) const ASSIGNMENT_KINDS: &[&str] = &[

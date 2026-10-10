@@ -37,6 +37,11 @@ use crate::formats::common::{XorScan, ends_with_ci, extract_binary_strings};
 use crate::output::{Metrics, Strings, Values};
 
 const MAX_ENTRIES_SURFACED: usize = 256;
+/// Directory entries parsed. An entry takes as little as four bytes of
+/// directory and becomes an owned name, a lowercased copy and a `DirEntry`,
+/// so an uncapped directory multiplies its size several times over. The
+/// largest real help files carry tens of thousands of entries.
+const MAX_DIR_ENTRIES: usize = 1 << 18;
 
 pub(super) fn extract(
     bytes: &[u8],
@@ -79,7 +84,15 @@ pub(super) fn extract(
     else {
         return;
     };
-    let entries = parse_directory(dir);
+    let (entries, truncated) = parse_directory(dir);
+    if truncated {
+        super::bounded::push_limit(
+            values,
+            value_key!("chm.limits"),
+            "directory-entries",
+            format!("stopped at {MAX_DIR_ENTRIES} directory entries"),
+        );
+    }
     if entries.is_empty() {
         return;
     }
@@ -389,17 +402,19 @@ fn read_uncompressed<'a>(bytes: &'a [u8], data_offset: usize, e: &DirEntry) -> O
     bytes.get(start..end)
 }
 
-fn parse_directory(section: &[u8]) -> Vec<DirEntry> {
+/// The PMGL entries of an `ITSP` directory, and whether the walk stopped at
+/// [`MAX_DIR_ENTRIES`] with more to read.
+fn parse_directory(section: &[u8]) -> (Vec<DirEntry>, bool) {
     let mut out = Vec::new();
     if section.len() < 0x54 || !section.starts_with(b"ITSP") {
-        return out;
+        return (out, false);
     }
     // The length check above covers all three fields.
     let header_len = bytes::u32_le(section, 0x08).unwrap_or(0) as usize;
     let chunk_size = bytes::u32_le(section, 0x10).unwrap_or(0) as usize;
     let chunk_count = bytes::u32_le(section, 0x2c).unwrap_or(0) as usize;
     if chunk_size < 0x14 {
-        return out;
+        return (out, false);
     }
     for i in 0..chunk_count {
         let Some(off) = i
@@ -430,10 +445,13 @@ fn parse_directory(section: &[u8]) -> Vec<DirEntry> {
                 break;
             };
             pos += consumed;
+            if out.len() == MAX_DIR_ENTRIES {
+                return (out, true);
+            }
             out.push(entry);
         }
     }
-    out
+    (out, false)
 }
 
 /// One PMGL directory entry: an ENCINT-prefixed name, then the section,
@@ -729,6 +747,28 @@ mod tests {
         buf[0x08..0x0c].copy_from_slice(&4u32.to_le_bytes());
         buf[0x20..0x28].copy_from_slice(&100u64.to_le_bytes()); // block_len
         assert!(parse_reset_table(&buf).is_none());
+    }
+
+    /// A directory of minimal four-byte entries stops at the entry cap and
+    /// says so.
+    #[test]
+    fn directory_entries_stop_at_the_cap() {
+        const ITSP_LEN: usize = 0x54;
+        for (count, truncated) in [(MAX_DIR_ENTRIES, false), (MAX_DIR_ENTRIES + 1, true)] {
+            let chunk_size = 0x14 + count * 4;
+            let mut section = vec![0u8; ITSP_LEN];
+            section[..4].copy_from_slice(b"ITSP");
+            section[0x08..0x0C].copy_from_slice(&(ITSP_LEN as u32).to_le_bytes());
+            section[0x10..0x14].copy_from_slice(&(chunk_size as u32).to_le_bytes());
+            section[0x2C..0x30].copy_from_slice(&1u32.to_le_bytes());
+            // Empty name, section 0, offset 0, length 0: four zero bytes each.
+            let mut chunk = vec![0u8; chunk_size];
+            chunk[..4].copy_from_slice(b"PMGL");
+            section.extend_from_slice(&chunk);
+            let (entries, capped) = parse_directory(&section);
+            assert_eq!(entries.len(), MAX_DIR_ENTRIES);
+            assert_eq!(capped, truncated);
+        }
     }
 
     /// An ENCINT that decodes to `u64::MAX`: nine continuation bytes and a

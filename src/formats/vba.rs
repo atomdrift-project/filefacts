@@ -44,6 +44,11 @@ const MAX_STREAM_SIZE: u64 = 20 * 1024 * 1024;
 /// around 50; the cap keeps a hostile doc with thousands of empty
 /// module records from blowing past the allocator.
 const MAX_MODULES: usize = 256;
+/// Cap on the decompressed source kept across every module of a project.
+/// A few kilobytes of copy tokens decompress to [`MAX_DECOMPRESSED_SIZE`],
+/// and the dir stream may point all [`MAX_MODULES`] modules at that one
+/// stream: 2.5 GiB of source from one small document.
+const MAX_PROJECT_SOURCE: usize = 32 * 1024 * 1024;
 
 /// Walk the CFB and surface VBA modules under `office.vba.*`. The
 /// dispatcher is expected to have already opened the file via
@@ -214,6 +219,7 @@ fn extract_project(
     // Mark where this document's VBA symbols start so the identifier-shape
     // metrics below are computed over exactly the symbols emitted here.
     let sym_start = symbols_out.len();
+    let mut source_left = MAX_PROJECT_SOURCE;
     for info in dir.modules.iter().take(MAX_MODULES) {
         if info.stream_name.is_empty() {
             // Only a corrupt dir stream leaves a module without a stream
@@ -257,7 +263,8 @@ fn extract_project(
             ));
             continue;
         };
-        let source_bytes = match decompress_vba(container) {
+        let cap = source_left.min(MAX_DECOMPRESSED_SIZE);
+        let source_bytes = match decompress_vba_within(container, cap) {
             Ok(source) => source,
             Err(DecompressError::BadSignature) => {
                 report.failure(format!(
@@ -270,14 +277,16 @@ fn extract_project(
                 report.limit(
                     "vba-decompress-cap",
                     format!(
-                        "{stream_path}: source decompresses past the \
-                         {MAX_DECOMPRESSED_SIZE}-byte cap; module {:?} not read",
+                        "{stream_path}: source decompresses past the {cap} bytes left of the \
+                         {MAX_DECOMPRESSED_SIZE}-byte module and {MAX_PROJECT_SOURCE}-byte \
+                         project caps; module {:?} not read",
                         info.name
                     ),
                 );
                 continue;
             }
         };
+        source_left -= source_bytes.len();
         // VBA source is documented as Windows-1252 on disk but most
         // real-world macros are ASCII; `from_utf8_lossy` handles
         // non-ASCII gracefully by substituting U+FFFD without
@@ -593,23 +602,27 @@ fn read_stream<R: Read + std::io::Seek>(
 enum DecompressError {
     /// The container does not start with the `0x01` signature byte.
     BadSignature,
-    /// The output would pass [`MAX_DECOMPRESSED_SIZE`].
+    /// The output would pass the cap.
     TooLarge,
 }
 
-/// Decompress an MS-OVBA RLE stream. The format starts with a `0x01`
-/// signature byte; each subsequent chunk has a 12-bit length plus an
-/// "is compressed" bit. Compressed chunks alternate 1-byte flag fields
-/// with eight tokens (literal byte or LZ-style back-reference).
+/// [`decompress_vba_within`] the per-module cap, [`MAX_DECOMPRESSED_SIZE`].
 fn decompress_vba(data: &[u8]) -> Result<Vec<u8>, DecompressError> {
+    decompress_vba_within(data, MAX_DECOMPRESSED_SIZE)
+}
+
+/// Decompress an MS-OVBA RLE stream into at most `cap` bytes. The format
+/// starts with a `0x01` signature byte; each subsequent chunk has a 12-bit
+/// length plus an "is compressed" bit. Compressed chunks alternate 1-byte
+/// flag fields with eight tokens (literal byte or LZ-style back-reference).
+fn decompress_vba_within(data: &[u8], cap: usize) -> Result<Vec<u8>, DecompressError> {
     let Some(&signature) = data.first() else {
         return Ok(Vec::new());
     };
     if signature != 0x01 {
         return Err(DecompressError::BadSignature);
     }
-    let mut output: Vec<u8> =
-        Vec::with_capacity(data.len().saturating_mul(2).min(MAX_DECOMPRESSED_SIZE));
+    let mut output: Vec<u8> = Vec::with_capacity(data.len().saturating_mul(2).min(cap));
     let mut pos = 1usize;
     while pos < data.len() {
         let Some(header) = bytes_at::u16_le(data, pos) else {
@@ -621,7 +634,7 @@ fn decompress_vba(data: &[u8]) -> Result<Vec<u8>, DecompressError> {
         if !is_compressed {
             let end = (pos + 4096).min(data.len());
             let chunk = data.get(pos..end).unwrap_or_default();
-            if output.len() + chunk.len() > MAX_DECOMPRESSED_SIZE {
+            if output.len() + chunk.len() > cap {
                 return Err(DecompressError::TooLarge);
             }
             output.extend_from_slice(chunk);
@@ -644,7 +657,7 @@ fn decompress_vba(data: &[u8]) -> Result<Vec<u8>, DecompressError> {
                 }
                 if (flag >> bit) & 1 == 0 {
                     if let Some(&literal) = data.get(pos) {
-                        if output.len() >= MAX_DECOMPRESSED_SIZE {
+                        if output.len() >= cap {
                             return Err(DecompressError::TooLarge);
                         }
                         output.push(literal);
@@ -662,7 +675,7 @@ fn decompress_vba(data: &[u8]) -> Result<Vec<u8>, DecompressError> {
                     let off_mask = !len_mask;
                     let length = ((token & len_mask) + 3) as usize;
                     let offset = ((token & off_mask) >> (16 - bits)) as usize + 1;
-                    if output.len().saturating_add(length) > MAX_DECOMPRESSED_SIZE {
+                    if output.len().saturating_add(length) > cap {
                         return Err(DecompressError::TooLarge);
                     }
                     for _ in 0..length {
@@ -722,7 +735,9 @@ fn find_project_modules(data: &[u8]) -> Option<usize> {
 fn record_header(data: &[u8], pos: usize) -> Option<(u16, usize)> {
     let id = bytes_at::u16_le(data, pos)?;
     let size = bytes_at::u32_le(data, pos.checked_add(2)?)?;
-    Some((id, size as usize))
+    // A size past the stream's end reads nothing either way; clamping it keeps
+    // the walk's `pos += 6 + size` steps from wrapping on 32-bit targets.
+    Some((id, crate::bytes::sat_usize(size).min(data.len())))
 }
 
 /// Parse the decompressed dir stream into per-module metadata

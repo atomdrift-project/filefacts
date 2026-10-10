@@ -20,6 +20,13 @@ use crate::output::{Errors, Stage, ValueKey, Values};
 /// JDK ships a few thousand classes per jar).
 pub(super) const MAX_ARCHIVE_MEMBERS: usize = 65_536;
 
+/// Bytes of member paths one directory-tree walk builds. ISO 9660, UDF and
+/// ASAR spell each member's path out from its ancestors' names, so a deep
+/// chain of long directory names is repeated in every member beneath it: a
+/// few MiB of names expanded into gigabytes of paths. Real archives need a
+/// small fraction of this for [`MAX_ARCHIVE_MEMBERS`] paths.
+pub(super) const MAX_PATH_BYTES: usize = 64 << 20;
+
 /// Inflated bytes a gzipped-tar manifest search reads before giving up.
 /// Package manifests sit near the front of the tarball, so this only
 /// bounds the walk past them: a small `.tgz` can inflate a thousandfold.

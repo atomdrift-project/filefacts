@@ -717,3 +717,76 @@ fn decodes_utf16_xml_entries() {
     let (v, _) = run(&z);
     assert_eq!(v.get("office.kind").and_then(|x| x.as_str()), Some("docx"));
 }
+
+/// Relationship parts are each read in full, so a package of many large
+/// ones inflated and kept everything. Past the relationship cap, and past
+/// the byte budget across parts, the rest is a recorded limit.
+#[test]
+fn relationship_parts_share_one_budget() {
+    // An external target, about as short as one can be written.
+    let rel = r#"<Relationship Target="hh:x"/>"#;
+    let many = format!(
+        "<Relationships>{}</Relationships>",
+        rel.repeat(MAX_RELATIONSHIPS + 10)
+    );
+    let z = build_ooxml(&[
+        ("[Content_Types].xml", CONTENT_TYPES_DOCX.as_bytes()),
+        ("word/_rels/document.xml.rels", many.as_bytes()),
+    ]);
+    let (v, m, e) = run_with_errors(&z);
+    assert!(e.is_empty(), "{e:?}");
+    assert_eq!(
+        m.get("office.external_relationship_count"),
+        Some(MAX_RELATIONSHIPS as f64)
+    );
+    let limits = v.get("office.limits").and_then(|x| x.as_array()).unwrap();
+    assert!(
+        limits
+            .iter()
+            .any(|l| l["stage"].as_str() == Some("rels-budget")),
+        "{limits:?}"
+    );
+
+    let part = format!("<Relationships>{}</Relationships>", " ".repeat(3 << 20));
+    let count = (MAX_RELS_TOTAL_BYTES as usize / part.len()) + 3;
+    let names: Vec<String> = (0..count).map(|i| format!("p{i}/_rels/x.rels")).collect();
+    let mut members: Vec<(&str, &[u8])> =
+        vec![("[Content_Types].xml", CONTENT_TYPES_DOCX.as_bytes())];
+    members.extend(names.iter().map(|n| (n.as_str(), part.as_bytes())));
+    let (v, _, e) = run_with_errors(&build_ooxml(&members));
+    assert!(e.is_empty(), "{e:?}");
+    let limits = v.get("office.limits").and_then(|x| x.as_array()).unwrap();
+    let reason = limits
+        .iter()
+        .find(|l| l["stage"].as_str() == Some("rels-budget"))
+        .and_then(|l| l["reason"].as_str())
+        .unwrap();
+    assert!(reason.starts_with("2 relationship part(s)"), "{reason}");
+}
+
+/// Relationships naming one embedded part again and again update its one
+/// entry, found by key rather than by a scan of every entry.
+#[test]
+fn repeated_embedding_relationships_update_one_entry() {
+    let mut rels = String::from("<Relationships>");
+    for i in 0..20_000 {
+        rels.push_str(&format!(
+            r#"<Relationship Id="e{i}" Type="t/oleObject" Target="embeddings/o{}.bin"/>"#,
+            i % 10_000
+        ));
+    }
+    rels.push_str("</Relationships>");
+    let z = build_ooxml(&[
+        ("[Content_Types].xml", CONTENT_TYPES_DOCX.as_bytes()),
+        ("word/document.xml", b"<w:document/>"),
+        ("word/_rels/document.xml.rels", rels.as_bytes()),
+    ]);
+    let started = std::time::Instant::now();
+    let (v, m) = run(&z);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(m.get("office.embedded_count"), Some(10_000.0));
+    let embedded = v.get("office.embedded").and_then(|x| x.as_array()).unwrap();
+    assert_eq!(embedded[0]["filename"], "word/embeddings/o0.bin");
+    assert_eq!(embedded[0]["relationship_type"], "oleObject");
+    assert_eq!(embedded[0]["source"], "word/document.xml");
+}

@@ -61,6 +61,16 @@ const MAX_COUNTERSIGNATURES: usize = 4;
 /// On parse failure, leaves the values untouched and returns silently —
 /// `pe.signed` (set by the caller) is the only marker
 /// consumers should rely on to know whether a signature *exists*.
+///
+/// The image hash skips the whole table, so whatever it holds besides the
+/// signatures rides along unsigned: data appended inside a WIN_CERTIFICATE
+/// past its signature, or past the last record, with the lengths stretched to
+/// cover it (the MS13-098 / CVE-2013-3900 padding, which Windows still
+/// accepts by default). A signature records those bytes, beyond its own
+/// 8-byte alignment, as `unsigned_trailing_bytes` — the last one also counts
+/// the table's tail. Installers tag themselves this way too (Omaha), so it is
+/// a fact rather than a verdict; without it the payload would be invisible,
+/// since the overlay view stops where the table starts.
 pub(super) fn parse(cert_table_bytes: &[u8], values: &mut Values) {
     // The certificate table is a sequence of WIN_CERTIFICATE records:
     //   DWORD dwLength      (total length, including this header)
@@ -76,7 +86,9 @@ pub(super) fn parse(cert_table_bytes: &[u8], values: &mut Values) {
             break;
         };
         let length = length as usize;
-        if length < 8 || pos + length > cert_table_bytes.len() {
+        // `pos + 8 <= len` above, so the subtraction cannot underflow; the
+        // sum `pos + length` could wrap on a 32-bit target.
+        if length < 8 || length > cert_table_bytes.len() - pos {
             break;
         }
         let Some(cert_type) = u16_le(cert_table_bytes, pos + 6) else {
@@ -94,16 +106,40 @@ pub(super) fn parse(cert_table_bytes: &[u8], values: &mut Values) {
             // padding as trailing garbage. Trim to the SEQUENCE's
             // own declared length.
             let trimmed = trim_to_der_object(blob).unwrap_or(blob);
-            if let Some(sig) = parse_pkcs7(trimmed, None, &mut budget) {
+            if let Some(mut sig) = decode_content_info(trimmed)
+                .and_then(|ci| parse_content_info(&ci, Signs::PeImage, &mut budget, 0))
+            {
+                let signed = (8 + trimmed.len()).next_multiple_of(8);
+                add_unsigned_bytes(&mut sig, length.next_multiple_of(8) - signed);
                 signatures.push(sig);
             }
         }
         // Align to 8 bytes.
         pos += (length + 7) & !7;
     }
+    if let Some(last) = signatures.last_mut() {
+        add_unsigned_bytes(last, cert_table_bytes.len().saturating_sub(pos));
+    }
     if !signatures.is_empty() {
         values.insert_key(value_key!("pe.signatures"), JsonValue::Array(signatures));
     }
+}
+
+/// Add `bytes` to a signature's `unsigned_trailing_bytes`, which is present
+/// only when non-zero.
+fn add_unsigned_bytes(sig: &mut JsonValue, bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    let JsonValue::Object(obj) = sig else {
+        return;
+    };
+    let before = obj
+        .get("unsigned_trailing_bytes")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0);
+    let total = before.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    obj.insert("unsigned_trailing_bytes".into(), JsonValue::from(total));
 }
 
 /// Parse a CMS / PKCS#7 SignedData blob and return the same signer-cert
@@ -144,13 +180,28 @@ impl Budget {
     }
 }
 
+/// What the signatures in one parse must sign.
+#[derive(Clone, Copy)]
+enum Signs<'a> {
+    /// Their own encapsulated content, whatever its type.
+    Encapsulated,
+    /// Content carried beside the signature rather than inside it.
+    Detached(&'a [u8]),
+    /// A PE image. Authenticode reaches the image only through the digest an
+    /// `SpcIndirectDataContent` names, so any other content type proves
+    /// nothing about the file it was found in: a Microsoft-signed catalog
+    /// lifted into a PE verifies, with a Microsoft chain, all the same.
+    PeImage,
+}
+
 fn parse_pkcs7(
     der_bytes: &[u8],
     detached: Option<&[u8]>,
     budget: &mut Budget,
 ) -> Option<JsonValue> {
     let ci = decode_content_info(der_bytes)?;
-    parse_content_info(&ci, detached, budget, 0)
+    let signs = detached.map_or(Signs::Encapsulated, Signs::Detached);
+    parse_content_info(&ci, signs, budget, 0)
 }
 
 /// Decode a ContentInfo, normalizing BER to DER first when the strict decode
@@ -173,7 +224,7 @@ fn decode_content_info(der_bytes: &[u8]) -> Option<ContentInfo> {
 
 fn parse_content_info(
     ci: &ContentInfo,
-    detached: Option<&[u8]>,
+    signs: Signs<'_>,
     budget: &mut Budget,
     depth: u8,
 ) -> Option<JsonValue> {
@@ -322,12 +373,16 @@ fn parse_content_info(
     // encapContentInfo carrying the algorithm + digest the signature
     // was made over. The digest is what consumers compare against the
     // recomputed Authentihash to detect post-signing tampering.
-    if let Some((alg, digest_hex)) = extract_spc_indirect_data(&signed_data) {
+    let image_digest = extract_spc_indirect_data(&signed_data);
+    if let Some((alg, digest_hex)) = &image_digest {
         obj.insert(
             "signature_digest_algorithm".into(),
-            JsonValue::String(alg.into()),
+            JsonValue::String((*alg).into()),
         );
-        obj.insert("signature_digest".into(), JsonValue::String(digest_hex));
+        obj.insert(
+            "signature_digest".into(),
+            JsonValue::String(digest_hex.clone()),
+        );
     }
 
     // Cryptographic verification: the signer's key over the signed
@@ -358,9 +413,21 @@ fn parse_content_info(
                 .econtent
                 .as_ref()
                 .map(der::Any::value)
-                .or(detached),
+                .or(match signs {
+                    Signs::Detached(bytes) => Some(bytes),
+                    Signs::Encapsulated | Signs::PeImage => None,
+                }),
         };
-        match verify_signer(signer, cert, &content) {
+        let outcome = match verify_signer(signer, cert, &content) {
+            // Whatever the key signed, it was not this image.
+            VerifyOutcome::Verified | VerifyOutcome::Unsupported
+                if matches!(signs, Signs::PeImage) && image_digest.is_none() =>
+            {
+                VerifyOutcome::Failed(Failure::ImageDigestMissing)
+            }
+            outcome => outcome,
+        };
+        match outcome {
             VerifyOutcome::Verified => {
                 obj.insert("verified".into(), JsonValue::Bool(true));
             }
@@ -385,7 +452,7 @@ fn parse_content_info(
     // own SignerInfo and certificate chain and covers the same image. Every
     // value is parsed through the same pipeline, so consumers see the same
     // shape at each level.
-    let nested = extract_nested_signatures(signer, budget, depth);
+    let nested = extract_nested_signatures(signer, signs, budget, depth);
     if !nested.is_empty() {
         obj.insert("nested".into(), JsonValue::Array(nested));
     }
@@ -606,6 +673,9 @@ enum Failure {
     MessageDigestMismatch,
     /// `contentType` absent, repeated, or naming a different content type.
     ContentTypeMismatch,
+    /// A PE signature whose content is not an `SpcIndirectDataContent`
+    /// naming an image digest, so it authenticates no PE image.
+    ImageDigestMissing,
 }
 
 impl Failure {
@@ -616,6 +686,7 @@ impl Failure {
             Self::MessageDigestMalformed => "message_digest_malformed",
             Self::MessageDigestMismatch => "message_digest_mismatch",
             Self::ContentTypeMismatch => "content_type_mismatch",
+            Self::ImageDigestMissing => "image_digest_missing",
         }
     }
 }
@@ -971,12 +1042,20 @@ struct Chain {
 /// which pins thumbprints.
 ///
 /// The walk stops at a self-issued certificate, at the first link that does
-/// not verify, is not permitted, or uses an algorithm we cannot check, or at
-/// `MAX_CHAIN`. Every failure shortens the chain; none can add a certificate
-/// to it.
+/// not verify, is not permitted, or uses an algorithm we cannot check, at
+/// `MAX_CHAIN`, or once it has tried [`MAX_LINK_ATTEMPTS`] candidate issuers.
+/// Every failure shortens the chain; none can add a certificate to it.
 fn verified_chain(bag: &[&Certificate], signer: &Certificate) -> Chain {
     walk_chain(bag, signer, &PINNED_ROOTS)
 }
+
+/// Candidate issuers one chain walk checks a signature against. Every
+/// candidate carrying the right name costs a public-key verification, and a
+/// signature walks its bag once for the signer and again for each
+/// countersigner. A bag of thousands of same-named decoys, each taking up to
+/// eight tries along an alternating-name chain, would otherwise cost minutes
+/// per megabyte. A real chain tries one or two candidates per link.
+const MAX_LINK_ATTEMPTS: usize = 32;
 
 fn walk_chain(bag: &[&Certificate], signer: &Certificate, roots: &[PinnedRoot]) -> Chain {
     const MAX_CHAIN: usize = 8;
@@ -984,6 +1063,7 @@ fn walk_chain(bag: &[&Certificate], signer: &Certificate, roots: &[PinnedRoot]) 
         thumbprints: Vec::new(),
         anchor: None,
     };
+    let mut attempts = 0;
     let mut cert = signer;
     while let Some(thumbprint) = thumbprint_sha256(cert) {
         if chain.thumbprints.contains(&thumbprint) {
@@ -1009,7 +1089,10 @@ fn walk_chain(bag: &[&Certificate], signer: &Certificate, roots: &[PinnedRoot]) 
             .find(|&(c, anchor)| {
                 c.tbs_certificate.subject == tbs.issuer
                     && (anchor || may_issue(c, intermediates_below))
-                    && signs(c, child)
+                    && {
+                        attempts += 1;
+                        attempts <= MAX_LINK_ATTEMPTS && signs(c, child)
+                    }
             })
         else {
             break;
@@ -1217,7 +1300,11 @@ const TST_INFO_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113
 /// Verified means the token's own SignerInfo verifies over the TSTInfo (with
 /// the content binding [`verify_signer`] checks) and the TSTInfo's
 /// `messageImprint` is the hash of the outer signer's signature value — the
-/// authority stamped this signature, not some other one.
+/// authority stamped this signature, not some other one. A verified time is
+/// read from that same TSTInfo: the byte search [`gen_time_from_token`] does
+/// would find a TSTInfo-shaped forgery planted in front of the real one (in an
+/// unsigned `digestAlgorithms` parameter, say) and pass its time off under the
+/// authority's signature.
 fn rfc3161_times(signer: &SignerInfo) -> impl Iterator<Item = SigningTime> + '_ {
     signer
         .unsigned_attrs
@@ -1228,18 +1315,26 @@ fn rfc3161_times(signer: &SignerInfo) -> impl Iterator<Item = SigningTime> + '_ 
         .take(MAX_COUNTERSIGNATURES)
         .filter_map(|any| {
             let token_der = any.to_der().ok()?;
-            let time = gen_time_from_token(&token_der)?;
-            Some(SigningTime::timestamp(
-                time,
-                ("rfc3161", "unverified_rfc3161"),
-                verify_token(&token_der, signer.signature.as_bytes()),
-            ))
+            let labels = ("rfc3161", "unverified_rfc3161");
+            Some(
+                match verify_token(&token_der, signer.signature.as_bytes()) {
+                    Some(token) => SigningTime::timestamp(token.time, labels, Some(token.chain)),
+                    None => SigningTime::timestamp(gen_time_from_token(&token_der)?, labels, None),
+                },
+            )
         })
 }
 
+/// A timestamp token that verified: the time its signed TSTInfo attests and
+/// the authority's verified chain.
+struct VerifiedToken {
+    time: (String, i64),
+    chain: Vec<String>,
+}
+
 /// Verify a timestamp token over `stamped` (the outer signature value).
-/// Returns the authority's verified chain, or `None` when anything fails.
-fn verify_token(token_der: &[u8], stamped: &[u8]) -> Option<Vec<String>> {
+/// `None` when anything fails, the signed TSTInfo's `genTime` included.
+fn verify_token(token_der: &[u8], stamped: &[u8]) -> Option<VerifiedToken> {
     let ci = ContentInfo::from_der(token_der).ok()?;
     let signed_data = decode_signed_data_lenient(&ci.content)?;
     let encap = &signed_data.encap_content_info;
@@ -1259,8 +1354,13 @@ fn verify_token(token_der: &[u8], stamped: &[u8]) -> Option<Vec<String>> {
         content_type: Some(TST_INFO_OID),
         bytes: Some(tst_info.as_bytes()),
     };
-    (verify_signer(token_signer, cert, &content) == VerifyOutcome::Verified)
-        .then(|| verified_chain(&bag, cert).thumbprints)
+    if verify_signer(token_signer, cert, &content) != VerifyOutcome::Verified {
+        return None;
+    }
+    Some(VerifiedToken {
+        time: gen_time_from_tst_info(tst_info.as_bytes())?,
+        chain: verified_chain(&bag, cert).thumbprints,
+    })
 }
 
 /// Decode a SignedData, dropping its `crls [1]` field first if the strict
@@ -1474,15 +1574,21 @@ const MS_NESTED_SIGNATURE_OID: ObjectIdentifier =
 /// Every value of the SignerInfo's nested-signature attributes, each a
 /// PKCS#7 SignedData parsed through the same pipeline. Bounded by
 /// [`MAX_NESTING`] levels and the shared signature budget. Each value is
-/// decoded straight from its attribute rather than re-encoded first.
+/// decoded straight from its attribute rather than re-encoded first. A nested
+/// signature signs its own content, which for a PE is the same image.
 fn extract_nested_signatures(
     signer: &SignerInfo,
+    signs: Signs<'_>,
     budget: &mut Budget,
     depth: u8,
 ) -> Vec<JsonValue> {
     if depth + 1 >= MAX_NESTING {
         return Vec::new();
     }
+    let signs = match signs {
+        Signs::PeImage => Signs::PeImage,
+        Signs::Encapsulated | Signs::Detached(_) => Signs::Encapsulated,
+    };
     let mut nested = Vec::new();
     let values = signer
         .unsigned_attrs
@@ -1494,7 +1600,7 @@ fn extract_nested_signatures(
         let Ok(ci) = any.decode_as::<ContentInfo>() else {
             continue;
         };
-        if let Some(sig) = parse_content_info(&ci, None, budget, depth + 1) {
+        if let Some(sig) = parse_content_info(&ci, signs, budget, depth + 1) {
             nested.push(sig);
         }
     }

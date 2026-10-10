@@ -74,6 +74,7 @@ pub(super) fn extract(
             }
             0xD0..=0xD7 | 0x01 => continue,
             0xDA => {
+                state.scan_count = state.scan_count.saturating_add(1);
                 let Some(&len) = pair(pos) else {
                     break;
                 };
@@ -224,14 +225,22 @@ pub(super) fn extract(
     // Best-effort pixel-statistic pass. Decoder errors are swallowed —
     // a JPEG with a weird color space or a truncated bitstream still
     // gets the structural metrics above.
-    extract_pixel_stats(bytes, metrics);
+    extract_pixel_stats(bytes, state.scan_count, metrics);
 }
+
+/// Scans past which the pixel pass is skipped. The decoder walks every
+/// block of the image once per scan, and a progressive scan can cover all of
+/// them with a few bytes of end-of-band runs, so a small file of thousands of
+/// scans over a large image took minutes. Encoders write about a dozen.
+const MAX_DECODE_SCANS: u32 = 100;
 
 /// Decode the JPEG (cap-protected) and emit pixel-statistic metrics:
 /// dimensions, per-channel entropy, edge density, histogram flatness.
 /// Whole-file `file.entropy` is not repeated here: the generic pass emits it
-/// for every file before this extractor runs.
-fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
+/// for every file before this extractor runs. `scans` is the segment walk's
+/// count of start-of-scan markers; past [`MAX_DECODE_SCANS`] only the header
+/// facts are emitted.
+fn extract_pixel_stats(bytes: &[u8], scans: u32, metrics: &mut Metrics) {
     use jpeg_decoder::Decoder;
     use std::io::Cursor;
 
@@ -257,7 +266,7 @@ fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
     let predicted = (width as usize)
         .saturating_mul(height as usize)
         .saturating_mul(channels as usize);
-    if predicted > image_stats::MAX_DECODE_BYTES {
+    if predicted > image_stats::MAX_DECODE_BYTES || scans > MAX_DECODE_SCANS {
         return;
     }
     let Ok(pixels) = decoder.decode() else {
@@ -284,6 +293,8 @@ fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
 #[derive(Default)]
 struct JpegState {
     segment_count: u32,
+    /// Start-of-scan markers seen by the segment walk.
+    scan_count: u32,
     app_segment_count: u32,
     com_count: u32,
     dqt_count: u32,
@@ -504,6 +515,69 @@ mod tests {
         let mut m = Metrics::new();
         extract(bytes, &mut v, &mut s, &mut m);
         (v, m)
+    }
+
+    /// A progressive JPEG of a 4096x4096 image whose AC scans each cover
+    /// every block with two 32767-block end-of-band runs: 25 bytes per scan
+    /// that the decoder walks 262,144 blocks for.
+    fn eob_run_scans(scans: usize) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xD8];
+        let mut segment = |marker: u8, body: &[u8]| {
+            out.extend_from_slice(&[0xFF, marker]);
+            out.extend_from_slice(&((body.len() + 2) as u16).to_be_bytes());
+            out.extend_from_slice(body);
+        };
+        let mut dqt = vec![0x00];
+        dqt.extend([1u8; 64]);
+        segment(0xDB, &dqt);
+        segment(0xC2, &[8, 0x10, 0x00, 0x10, 0x00, 1, 1, 0x11, 0]);
+        // One-symbol Huffman tables: DC category 0, AC EOBRUN of 2^14 + 14 bits.
+        let mut dc = vec![0x00, 1];
+        dc.extend([0u8; 15]);
+        dc.push(0x00);
+        segment(0xC4, &dc);
+        let mut ac = vec![0x10, 1];
+        ac.extend([0u8; 15]);
+        ac.push(0xE0);
+        segment(0xC4, &ac);
+        segment(0xDA, &[1, 1, 0x00, 0, 0, 0x00]);
+        out.extend(std::iter::repeat_n(0x00, 262_144 / 8));
+        for _ in 0..scans {
+            out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 1, 1, 0x00, 1, 63, 0x00]);
+            // `0` then fourteen `1`s is a run of 32767 blocks; eight cover
+            // the image. Stuff each 0xFF with a zero byte.
+            let bits = "011111111111111".repeat(8);
+            let mut bits = bits.into_bytes();
+            bits.resize(bits.len().div_ceil(8) * 8, b'1');
+            for byte in bits.chunks(8) {
+                let b = byte
+                    .iter()
+                    .fold(0u8, |acc, &c| (acc << 1) | u8::from(c == b'1'));
+                out.push(b);
+                if b == 0xFF {
+                    out.push(0x00);
+                }
+            }
+        }
+        out.extend_from_slice(&[0xFF, 0xD9]);
+        out
+    }
+
+    /// Thousands of cheap scans over a large image made the pixel decode
+    /// walk billions of blocks. Past the scan cap only header facts remain.
+    #[test]
+    fn many_scans_skip_the_pixel_decode() {
+        let started = std::time::Instant::now();
+        let (_, m) = run(&eob_run_scans(5_000));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(m.get("image.width"), Some(4096.0));
+        assert!(m.get("image.pixel_entropy").is_none());
+        let (_, m) = run(&eob_run_scans(3));
+        assert!(m.get("image.pixel_entropy").is_some());
     }
 
     #[test]

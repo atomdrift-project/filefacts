@@ -113,6 +113,10 @@ pub(super) fn calls(bytes: &[u8], range: Range<usize>) -> (Vec<Range<usize>>, bo
     let text = bytes.get(..range.end).unwrap_or(bytes);
     let mut at = range.start;
     let mut declaration = false;
+    // End of the last dotted receiver chain scanned. Every name inside a
+    // chain reaches that same end, so it is reused rather than rescanned:
+    // walking `a.b.c…` again from each of its n names was O(n²).
+    let mut chain_end = range.start;
     while let Some(&byte) = text.get(at) {
         if matches!(byte, b'\'' | b'"') {
             if !super::quoted(text, &mut at) {
@@ -136,16 +140,22 @@ pub(super) fn calls(bytes: &[u8], range: Range<usize>) -> (Vec<Range<usize>>, bo
         if matches!(name.as_str(), "if" | "for" | "while" | "switch" | "catch") {
             continue;
         }
-        let mut end = whitespace(bytes, at, range.end);
-        // Static dotted receivers are part of the call target.
-        while bytes.get(end) == Some(&b'.') {
-            let next = whitespace(bytes, end + 1, range.end);
-            let next_end = identifier(bytes, next, range.end);
-            if next_end == next {
-                break;
+        let end = if at < chain_end {
+            chain_end
+        } else {
+            let mut end = whitespace(bytes, at, range.end);
+            // Static dotted receivers are part of the call target.
+            while bytes.get(end) == Some(&b'.') {
+                let next = whitespace(bytes, end + 1, range.end);
+                let next_end = identifier(bytes, next, range.end);
+                if next_end == next {
+                    break;
+                }
+                end = whitespace(bytes, next_end, range.end);
             }
-            end = whitespace(bytes, next_end, range.end);
-        }
+            chain_end = end;
+            end
+        };
         if bytes.get(end) != Some(&b'(') {
             declaration = false;
             continue;
@@ -221,6 +231,23 @@ mod tests {
         assert_eq!(ranges.len(), super::super::MAX_TAGS);
         let source = format!("f({}x{})", "(".repeat(40), ")".repeat(40));
         assert!(calls(source.as_bytes(), 0..source.len()).1);
+    }
+    #[test]
+    fn long_member_chain_is_scanned_once() {
+        // Rescanning the chain from each of its names took minutes on a
+        // 600 KB `b.c.c…` assignment.
+        let source = format!("a = b{}; g(); x.y . z();", ".c".repeat(200_000));
+        let started = std::time::Instant::now();
+        let (ranges, limited) = calls(source.as_bytes(), 0..source.len());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(!limited);
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|r| &source.as_bytes()[r.clone()])
+                .collect::<Vec<_>>(),
+            vec![b"g()".as_slice(), b"x.y . z()"]
+        );
     }
 }
 

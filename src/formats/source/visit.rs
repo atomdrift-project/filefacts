@@ -419,20 +419,46 @@ impl<'t> Comments<'t> {
     }
 }
 
+/// Identifier text [`Identifiers`] keeps, in bytes per source byte, on top of
+/// [`IDENTIFIER_TEXT_FLOOR`]. Identifier kinds can nest (bash `command_name`
+/// around `$( … )`), so the summed text of every identifier grows with the
+/// square of the nesting depth: 20k nested `"$(` spent 26 s in
+/// [`super::identifier_metrics`]. Real source sums to about its own size.
+const IDENTIFIER_TEXT_PER_SOURCE_BYTE: usize = 4;
+
+/// Identifier text kept regardless of source size, in bytes.
+const IDENTIFIER_TEXT_FLOOR: usize = 64 * 1024;
+
 /// Every identifier-kind node's text, repeats included, for
-/// [`super::identifier_metrics`].
+/// [`super::identifier_metrics`], up to [`IDENTIFIER_TEXT_PER_SOURCE_BYTE`].
+/// Nodes exit innermost first, so a nest drops its longest, outer names.
 #[derive(Default)]
 pub(super) struct Identifiers<'t> {
     pub(super) found: Vec<&'t str>,
+    /// Summed length of `found`.
+    bytes: usize,
+    /// An identifier was dropped for the text budget.
+    pub(super) truncated: bool,
 }
 
 impl<'t> Identifiers<'t> {
     fn exit(&mut self, visit: &Visit<'t>, source: &'t str, ids: &NodeIds) {
         if ids.identifier.contains(visit.kind_id) {
             if let Ok(text) = visit.node.utf8_text(source.as_bytes()) {
-                if !text.is_empty() {
-                    self.found.push(text);
+                if text.is_empty() {
+                    return;
                 }
+                let budget = source
+                    .len()
+                    .saturating_mul(IDENTIFIER_TEXT_PER_SOURCE_BYTE)
+                    .saturating_add(IDENTIFIER_TEXT_FLOOR);
+                let bytes = self.bytes.saturating_add(text.len());
+                if bytes > budget {
+                    self.truncated = true;
+                    return;
+                }
+                self.bytes = bytes;
+                self.found.push(text);
             }
         }
     }
@@ -501,5 +527,24 @@ mod tests {
         // last one's assignment, which adds its two named children.
         assert_eq!(truncated(9_999), Some(false));
         assert_eq!(truncated(10_000), Some(true));
+    }
+
+    /// Nested identifier nodes cannot make identifier metrics read more text
+    /// than the budget allows: each `"$(` level is a `command_name` spanning
+    /// every level inside it.
+    #[test]
+    fn nested_identifier_text_is_budgeted() {
+        let depth = 4_000;
+        let source = format!("x={}echo{}\n", "\"$(".repeat(depth), ")\"".repeat(depth));
+        let parsed = open("a.sh", &source);
+        let metrics = parsed.metrics();
+        let unique = metrics.get("identifiers.unique").expect("identifiers");
+        let avg = metrics.get("identifiers.avg_length").expect("identifiers");
+        let budget = source.len() * IDENTIFIER_TEXT_PER_SOURCE_BYTE + IDENTIFIER_TEXT_FLOOR;
+        assert!(unique * avg <= budget as f64, "{unique} × {avg} > {budget}");
+
+        // Ordinary source keeps every identifier.
+        let parsed = open("a.sh", "echo hi\nls -l\n");
+        assert_eq!(parsed.metrics().get("identifiers.count"), Some(6.0));
     }
 }

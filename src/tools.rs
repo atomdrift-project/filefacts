@@ -1,11 +1,45 @@
-//! Cached external-tool resolution with platform fallbacks.
+//! Cached external-tool resolution with platform fallbacks, and the
+//! environment such a tool may inherit.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 static RESOLUTIONS: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
+
+/// The environment variables a tool parsing untrusted input may inherit: what
+/// it needs to find helpers, temp space, and a locale, plus the variables a
+/// Windows process needs to start.
+const ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+];
+
+/// Replace `cmd`'s environment with the allowlisted subset of this process's.
+///
+/// A tool that parses sample bytes can be taken over by them, so it must not
+/// inherit secrets such as API tokens and service keys from its caller. Apply
+/// this to every such tool before spawning it.
+pub fn scrub_env(cmd: &mut Command) {
+    cmd.env_clear();
+    for key in ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+}
 
 /// Resolve an external executable once per process.
 ///
@@ -221,6 +255,23 @@ mod tests {
         assert_eq!(binary_in(relative.as_os_str(), TOOL), None);
         assert_eq!(binary_in(OsStr::new(""), TOOL), None);
         assert_eq!(binary_in(tmp.path().as_os_str(), TOOL), Some(tool));
+    }
+
+    #[test]
+    fn scrubbed_tool_sees_only_allowlisted_env() {
+        let mut cmd = Command::new("env");
+        cmd.env("FILEFACTS_TEST_SECRET", "hunter2");
+        scrub_env(&mut cmd);
+        let output = cmd.output().expect("run env");
+        let stdout = String::from_utf8(output.stdout).expect("utf-8 env");
+        assert!(!stdout.contains("FILEFACTS_TEST_SECRET"), "{stdout}");
+        for line in stdout.lines() {
+            let key = line.split('=').next().unwrap_or_default();
+            assert!(ENV_ALLOWLIST.contains(&key), "unexpected variable {key}");
+        }
+        if std::env::var_os("PATH").is_some() {
+            assert!(stdout.lines().any(|line| line.starts_with("PATH=")));
+        }
     }
 
     #[test]

@@ -225,23 +225,23 @@ struct Entry {
 }
 
 fn run(b: &Budget) {
-    let Some(primary) = b.roots.first() else {
+    let Some(primary) = b.roots.first().and_then(|r| trusted_dir(&r.path)) else {
         return;
     };
-    // A root that is itself a symlink points somewhere this budget does not
-    // own; sweeping through it would delete whatever the link reaches.
-    if !is_real_dir(&primary.path) || !due(&primary.path) {
+    if !due(&primary) {
         return;
     }
     // Mark the start (mtime = now) so a racing process sees a fresh marker and
     // skips. Best-effort; if the directory doesn't exist yet, there's nothing
     // to sweep anyway.
-    let marker = primary.path.join(MARKER);
+    let marker = primary.join(MARKER);
     write_marker(&marker, MARK_STARTED);
 
     let mut entries = Vec::new();
-    for r in b.roots.iter().filter(|r| is_real_dir(&r.path)) {
-        collect(&r.path, r.depth, &mut entries);
+    for r in &b.roots {
+        if let Some(path) = trusted_dir(&r.path) {
+            collect(&path, r.depth, &mut entries);
+        }
     }
 
     let now = SystemTime::now();
@@ -301,6 +301,95 @@ fn run(b: &Budget) {
 /// Whether `path` is a directory itself, not a symlink to one.
 fn is_real_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
+/// Symlinks followed resolving a root before it is refused, as the kernel's
+/// own `ELOOP` limit does.
+#[cfg(unix)]
+const MAX_LINKS: u32 = 40;
+
+/// `dir`, with any symlinks on the way to it resolved, when the sweep may
+/// delete from it. Entries are deleted by path, so whoever can change a
+/// directory on that path can swap in a symlink between the walk and the
+/// delete and aim it at any file this process may remove. Refused: a
+/// relative path, which names different files from each working directory
+/// (`HOME=.`); a `dir` that is itself a symlink, pointing somewhere this
+/// budget does not own; and on unix, a path through a directory or link that
+/// another user can change — a cache under a shared directory (`HOME=/tmp`,
+/// or `XDG_CACHE_HOME` pointed there) whose `.cache` someone else created.
+pub(crate) fn trusted_dir(dir: &Path) -> Option<PathBuf> {
+    if !dir.is_absolute() || !is_real_dir(dir) {
+        return None;
+    }
+    #[cfg(unix)]
+    let dir = {
+        // SAFETY: neither call has preconditions; each only returns an id.
+        #[allow(unsafe_code)]
+        let ids = unsafe { (libc::geteuid(), libc::getegid()) };
+        let mut resolved = PathBuf::new();
+        resolve_trusted(dir, ids, &mut resolved, &mut 0)?;
+        resolved
+    };
+    #[cfg(not(unix))]
+    let dir = dir.to_path_buf();
+    Some(dir)
+}
+
+/// Resolve `path` onto `resolved` one component at a time, following
+/// symlinks, and fail on the first step someone other than this user (`ids`
+/// is the effective uid and gid) or the superuser could change. A directory
+/// passes only if no other user can write it: group-writable just for this
+/// user's own group, or world-writable only with the sticky bit (`/tmp`),
+/// where no one may rename what they do not own. `resolved` never holds a
+/// symlink, so `..` is its lexical parent.
+#[cfg(unix)]
+fn resolve_trusted(
+    path: &Path,
+    (uid, gid): (u32, u32),
+    resolved: &mut PathBuf,
+    links: &mut u32,
+) -> Option<()> {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+    let trusted = |m: &fs::Metadata| {
+        let mode = m.mode();
+        (m.uid() == uid || m.uid() == 0)
+            && (m.is_symlink()
+                || mode & 0o1000 != 0
+                || (mode & 0o002 == 0 && (mode & 0o020 == 0 || m.gid() == gid)))
+    };
+    for component in path.components() {
+        match component {
+            Component::RootDir => {
+                *resolved = PathBuf::from("/");
+                if !fs::symlink_metadata(&*resolved).is_ok_and(|m| trusted(&m)) {
+                    return None;
+                }
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(name) => {
+                let next = resolved.join(name);
+                let meta = fs::symlink_metadata(&next).ok()?;
+                if !trusted(&meta) {
+                    return None;
+                }
+                if meta.is_symlink() {
+                    *links += 1;
+                    if *links > MAX_LINKS {
+                        return None;
+                    }
+                    resolve_trusted(&fs::read_link(&next).ok()?, (uid, gid), resolved, links)?;
+                } else {
+                    *resolved = next;
+                }
+            }
+            Component::Prefix(_) => return None,
+        }
+    }
+    Some(())
 }
 
 /// Write the sweep marker without following a symlink planted in its place:
@@ -629,6 +718,68 @@ mod tests {
         );
         let _ = fs::remove_dir_all(link.parent().unwrap());
         let _ = fs::remove_dir_all(&target);
+    }
+
+    /// A one-root budget over `path` that evicts everything it may.
+    fn evict_all(path: PathBuf) -> Budget {
+        Budget {
+            label: "test",
+            roots: vec![Root { path, depth: 1 }],
+            max_age: day(30),
+            max_bytes: 0,
+            max_entries: 0,
+        }
+    }
+
+    #[test]
+    fn relative_root_is_not_swept() {
+        // `HOME=.` makes the stng roots relative: they would name whatever
+        // tree the process runs in, such as the samples under analysis.
+        let dir = scratch("relative");
+        write_aged(&dir.join("precious.txt"), 10, day(400));
+        let cwd = std::env::current_dir().unwrap();
+        let relative: PathBuf = cwd
+            .components()
+            .skip(1)
+            .map(|_| std::path::Component::ParentDir)
+            .chain(dir.components().skip(1))
+            .collect();
+        assert!(relative.join("precious.txt").exists());
+        run(&evict_all(relative));
+        assert!(dir.join("precious.txt").exists());
+        assert!(!dir.join(MARKER).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Another user could rename `shared`'s children, so it could aim a
+    /// delete through any root below it at the sweeping user's own files: a
+    /// root reached through a symlink planted there is the attack itself.
+    #[cfg(unix)]
+    #[test]
+    fn root_another_user_can_redirect_is_not_swept() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch("shared");
+        let shared = base.join("shared");
+        let victim = base.join("victim");
+        let cache = shared.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(victim.join("strings")).unwrap();
+        write_aged(&cache.join("old.json"), 10, day(400));
+        write_aged(&victim.join("strings").join("precious.go"), 10, day(400));
+        std::os::unix::fs::symlink(&victim, shared.join("stng")).unwrap();
+
+        let mode = |m| fs::set_permissions(&shared, fs::Permissions::from_mode(m)).unwrap();
+        mode(0o777);
+        run(&evict_all(cache.clone()));
+        run(&evict_all(shared.join("stng").join("strings")));
+        assert!(cache.join("old.json").exists(), "world-writable parent");
+        assert!(victim.join("strings").join("precious.go").exists());
+
+        // Sticky, like /tmp: others can no longer rename what they don't own.
+        mode(0o1777);
+        run(&evict_all(cache.clone()));
+        assert!(!cache.join("old.json").exists(), "sticky parent is swept");
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[cfg(unix)]

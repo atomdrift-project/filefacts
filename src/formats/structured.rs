@@ -379,6 +379,11 @@ const YAML_ALIAS_JUMPS_PER_EVENT: usize = 100;
 /// metadata's shared `Gem::Requirement`s included.
 const YAML_MAX_REPLAYED_EVENTS: usize = 100_000;
 
+/// Scalar bytes aliases may replay in total. The event budget alone let one
+/// anchored megabyte scalar, aliased a hundred thousand times from four bytes
+/// each, build a hundred gigabytes of strings.
+const YAML_MAX_REPLAYED_BYTES: usize = 16 << 20;
+
 /// A YAML node as serde_yaml 0.9 resolved it into its `Value`, so documents
 /// read exactly as they always have: what a rule matches as `"0755"` stays a
 /// string.
@@ -435,6 +440,7 @@ pub(super) fn parse_yaml(bytes: &[u8]) -> Result<JsonValue, YamlError> {
         jumps: 0,
         replaying: 0,
         replayed: 0,
+        replayed_bytes: 0,
     };
     let root = composer.node(&mut 0, 0)?;
     Ok(yaml_to_json(root))
@@ -549,6 +555,8 @@ struct Composer<'a, 'i> {
     /// Aliases being replayed right now; events read meanwhile are replays.
     replaying: usize,
     replayed: usize,
+    /// Scalar bytes read while replaying.
+    replayed_bytes: usize,
 }
 
 impl<'a, 'i> Composer<'a, 'i> {
@@ -567,6 +575,15 @@ impl<'a, 'i> Composer<'a, 'i> {
                     "YAML aliases expand past {YAML_MAX_REPLAYED_EVENTS} events{}",
                     location(&entry.1)
                 ));
+            }
+            if let Event::Scalar(value, ..) = &entry.0 {
+                self.replayed_bytes = self.replayed_bytes.saturating_add(value.len());
+                if self.replayed_bytes > YAML_MAX_REPLAYED_BYTES {
+                    return Err(format!(
+                        "YAML aliases expand past {YAML_MAX_REPLAYED_BYTES} scalar bytes{}",
+                        location(&entry.1)
+                    ));
+                }
             }
         }
         Ok((at, entry))

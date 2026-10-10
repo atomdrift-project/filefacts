@@ -23,6 +23,7 @@ use goblin::elf::Elf;
 use serde_json::Value as JsonValue;
 
 use crate::Stage;
+use crate::formats::elf::{MAX_VERSION_RECORDS, NameBudget};
 use crate::formats::goblin_safe;
 use crate::metric;
 use crate::output::{Errors, Metrics, Values};
@@ -35,15 +36,17 @@ const MAX_INIT_ARRAY_SLOTS: usize = 4096;
 
 /// Emit `elf.verdef[]` records. Replaces the older flat
 /// `elf.provided_versions[]` projection.
-pub(super) fn verdef(elf: &Elf<'_>, values: &mut Values, errors_out: &mut Errors) {
+pub(super) fn verdef(elf: &Elf<'_>, file_len: usize, values: &mut Values, errors_out: &mut Errors) {
     let Some(verdef) = elf.verdef.as_ref() else {
         return;
     };
     let mut out: Vec<JsonValue> = Vec::new();
+    let mut names = NameBudget::new(file_len);
     // Both levels are lazy walks along file-controlled `vd_next` / `vda_next`
-    // links.
-    for def in goblin_safe::drain_or_record(verdef.iter(), errors_out, Stage::ElfParse) {
-        let aux = goblin_safe::drain_or_record(def.iter(), errors_out, Stage::ElfParse);
+    // links. Only the first two aux entries (name, parent) are read.
+    let defs = verdef.iter().take(MAX_VERSION_RECORDS);
+    for def in goblin_safe::drain_or_record(defs, errors_out, Stage::ElfParse) {
+        let aux = goblin_safe::drain_or_record(def.iter().take(2), errors_out, Stage::ElfParse);
         let Some(first) = aux.first() else {
             continue;
         };
@@ -57,6 +60,9 @@ pub(super) fn verdef(elf: &Elf<'_>, values: &mut Values, errors_out: &mut Errors
             .get(1)
             .and_then(|a| elf.dynstrtab.get_at(a.vda_name))
             .filter(|s| !s.is_empty());
+        if !names.take(name.len() + parent.map_or(0, str::len)) {
+            break;
+        }
         let is_base = def.vd_flags & 0x1 != 0;
         let mut obj = serde_json::Map::new();
         obj.insert("name".into(), JsonValue::String(name.to_string()));
@@ -87,6 +93,8 @@ pub(super) fn init_arrays(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metr
         return;
     }
     let dynsym_index = DynsymAddressIndex::build(elf);
+    // Every slot may resolve to the same long symbol name.
+    let mut names = NameBudget::new(bytes.len());
     let relocs = collect_init_relocations(elf);
 
     for (section, key) in [
@@ -99,7 +107,7 @@ pub(super) fn init_arrays(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metr
         if slot_bytes.len() / 8 > MAX_INIT_ARRAY_SLOTS {
             metrics.insert(metric!("elf.init_array_slots_capped"), 1.0);
         }
-        let out = init_array_entries(sh_addr, slot_bytes, &relocs, &dynsym_index);
+        let out = init_array_entries(sh_addr, slot_bytes, &relocs, &dynsym_index, &mut names);
         if !out.is_empty() {
             values.insert_key(key, JsonValue::Array(out));
         }
@@ -113,6 +121,7 @@ fn init_array_entries(
     slot_bytes: &[u8],
     relocs: &HashMap<u64, InitReloc>,
     dynsym_index: &DynsymAddressIndex<'_>,
+    names: &mut NameBudget,
 ) -> Vec<JsonValue> {
     let slots = slot_bytes.as_chunks::<8>().0;
     let mut out = Vec::with_capacity(slots.len().min(MAX_INIT_ARRAY_SLOTS));
@@ -122,7 +131,7 @@ fn init_array_entries(
         let (addr, reloc) = resolve_init_slot(direct, slot_va, relocs, dynsym_index);
         let mut node = serde_json::Map::new();
         node.insert("addr".into(), JsonValue::String(format!("0x{addr:x}")));
-        if let Some(s) = dynsym_index.lookup(addr) {
+        if let Some(s) = dynsym_index.lookup(addr).filter(|s| names.take(s.len())) {
             node.insert("symbol".into(), JsonValue::String(s.to_string()));
         }
         if let Some(r) = reloc {
@@ -137,8 +146,9 @@ fn init_array_entries(
 /// entries. Skips ordinary global-default-defined entries (those are
 /// already in the import/export panes); keeps IFUNC, weak, hidden /
 /// protected, and undefined ones.
-pub(super) fn dynsym_funcs(elf: &Elf<'_>, values: &mut Values) {
+pub(super) fn dynsym_funcs(elf: &Elf<'_>, file_len: usize, values: &mut Values) {
     let mut out: Vec<JsonValue> = Vec::new();
+    let mut names = NameBudget::new(file_len);
     for sym in elf.dynsyms.iter() {
         let st_type = sym.st_info & 0x0f;
         // STT_FUNC = 2, STT_GNU_IFUNC = 10.
@@ -157,6 +167,9 @@ pub(super) fn dynsym_funcs(elf: &Elf<'_>, values: &mut Values) {
         };
         if name.is_empty() {
             continue;
+        }
+        if !names.take(name.len()) {
+            break;
         }
         let mut node = serde_json::Map::new();
         node.insert("name".into(), JsonValue::String(name.to_string()));
@@ -365,7 +378,8 @@ mod tests {
         };
         let mut slots = 0x400_u64.to_le_bytes().to_vec();
         slots.extend([0; 16]);
-        let entries = init_array_entries(0x1000, &slots, &relocs, &index);
+        let mut names = NameBudget::new(1 << 20);
+        let entries = init_array_entries(0x1000, &slots, &relocs, &index, &mut names);
         assert_eq!(
             entries,
             [
@@ -376,7 +390,7 @@ mod tests {
         );
 
         let many = vec![0u8; (MAX_INIT_ARRAY_SLOTS + 100) * 8];
-        let entries = init_array_entries(0x1000, &many, &relocs, &index);
+        let entries = init_array_entries(0x1000, &many, &relocs, &index, &mut names);
         assert_eq!(entries.len(), MAX_INIT_ARRAY_SLOTS);
     }
 }

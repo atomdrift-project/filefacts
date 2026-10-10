@@ -350,3 +350,25 @@ fn rpm_ending_after_the_signature_header_records_a_missing_main_header() {
     );
     assert!(v.get("rpm.name").is_none());
 }
+
+/// A main header repeating one string tag, every copy pointing at the same
+/// unterminated 1 MiB run, is read once rather than once per copy.
+#[test]
+fn repeated_string_tag_is_read_once() {
+    let mut tags = vec![(main_tag::NAME, 6, 1, Vec::new()); 20_000];
+    // Not printable, so the binary string scan of the file stays cheap.
+    tags.push((main_tag::NAME, 6, 1, vec![0x01; 1 << 20]));
+    let start = std::time::Instant::now();
+    let (v, _, e) = run(&script_rpm(tags));
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    assert!(v.get("rpm.name").is_none());
+    assert!(e.is_empty(), "{e:?}");
+
+    // The last of several decodable copies is the one reported.
+    let tags = vec![
+        (main_tag::NAME, 6, 1, b"first\0".to_vec()),
+        (main_tag::NAME, 6, 1, b"last\0".to_vec()),
+    ];
+    let (v, _, _) = run(&script_rpm(tags));
+    assert_eq!(v.get("rpm.name").and_then(|x| x.as_str()), Some("last"));
+}

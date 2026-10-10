@@ -22,6 +22,98 @@ use crate::output::{Errors, Metrics, Section, SectionFlag, Values};
 /// Longest section name copied into the sections view, in chars.
 const MAX_SECTION_NAME: usize = 256;
 
+/// Version records (`Elf_Verdef` / `Elf_Verneed` and their aux entries) walked
+/// per table. A real binary declares a few dozen. The walks follow
+/// file-controlled `*_next` links with a 16-bit aux count per record, so every
+/// need can share one long aux chain: `needs × aux` records from a few MB.
+pub(super) const MAX_VERSION_RECORDS: usize = 4096;
+
+/// Bytes of string-table text one output view copies out of the file:
+/// symbol, library and version names.
+///
+/// Those names are borrowed slices of a string table, and nothing stops every
+/// record from naming the same NUL-less run, or each a suffix of it, so
+/// copying them all costs `records × run length`, quadratic in the file
+/// (64 KiB of dynsym over a 1 MiB run is 2.7 GiB of names). An honest table's
+/// names are, but for a few repeats, disjoint slices of the file, so twice its
+/// length never truncates one. Once a name does not fit, the view is spent:
+/// every later name is refused too.
+pub(super) struct NameBudget {
+    left: usize,
+    refused: bool,
+}
+
+impl NameBudget {
+    pub(super) fn new(file_len: usize) -> Self {
+        Self {
+            left: file_len.saturating_mul(2),
+            refused: false,
+        }
+    }
+
+    /// Charge `len` bytes of name text; `false` once the view is spent.
+    pub(super) fn take(&mut self, len: usize) -> bool {
+        match self.left.checked_sub(len) {
+            Some(left) if !self.refused => {
+                self.left = left;
+                true
+            }
+            _ => {
+                self.refused = true;
+                false
+            }
+        }
+    }
+
+    /// Whether any name was refused.
+    pub(super) fn refused(&self) -> bool {
+        self.refused
+    }
+}
+
+/// File ranges `[start, end)` answering "does one of them contain this
+/// range?" in `O(log n)`. Sections and program headers are both
+/// file-controlled and up to `file length / 64` of each, so a pairwise test of
+/// every section against every segment is quadratic in the file.
+struct RangeCover {
+    starts: Vec<u64>,
+    /// `max_end[i]`: the furthest end among the ranges sorted at or before `i`.
+    max_end: Vec<u64>,
+}
+
+impl RangeCover {
+    fn new(mut ranges: Vec<(u64, u64)>) -> Self {
+        ranges.sort_unstable();
+        let mut furthest = 0;
+        let max_end = ranges
+            .iter()
+            .map(|&(_, end)| {
+                furthest = furthest.max(end);
+                furthest
+            })
+            .collect();
+        Self {
+            starts: ranges.into_iter().map(|(start, _)| start).collect(),
+            max_end,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.starts.is_empty()
+    }
+
+    /// Whether a single range holds all of `[start, end)`: among the ranges
+    /// starting at or before `start`, the one reaching furthest must reach
+    /// `end`.
+    fn contains(&self, start: u64, end: u64) -> bool {
+        let before = self.starts.partition_point(|&s| s <= start);
+        before
+            .checked_sub(1)
+            .and_then(|i| self.max_end.get(i))
+            .is_some_and(|&furthest| furthest >= end)
+    }
+}
+
 pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     let super::ExtractCtx {
         values,
@@ -79,20 +171,20 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
         unreachable!("constructed as Object::Elf")
     };
     // Every PT_NOTE reader below shares one guarded walk.
-    let segment_notes = drain_notes(elf.iter_note_headers(bytes), errors_out);
+    let segment_notes = drain_notes(elf.iter_note_headers(bytes), &mut bytes.len(), errors_out);
 
     elf_header(&elf, values);
-    dynamic(&elf, values);
+    dynamic(&elf, bytes.len(), values);
     sections(&elf, bytes, metrics, sections_out);
     *image_end = Some(image_end_of(&elf));
-    symbols(&elf, values, metrics, symbols_out);
+    symbols(&elf, bytes.len(), values, metrics, symbols_out);
     build_id(&elf, bytes, &segment_notes, values, metrics, errors_out);
     interpreter(&elf, values);
     relro(&elf, values);
-    needed_versions(&elf, values, errors_out);
-    super::elf_dynamic::verdef(&elf, values, errors_out);
+    needed_versions(&elf, bytes.len(), values, errors_out);
+    super::elf_dynamic::verdef(&elf, bytes.len(), values, errors_out);
     super::elf_dynamic::init_arrays(&elf, bytes, values, metrics);
-    super::elf_dynamic::dynsym_funcs(&elf, values);
+    super::elf_dynamic::dynsym_funcs(&elf, bytes.len(), values);
     super::elf_syscalls::emit(&elf, bytes, values, metrics);
     stripped_metadata(&elf, values, metrics);
     comment(&elf, bytes, values, metrics);
@@ -104,7 +196,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     gnu_property(&elf, &segment_notes, values, metrics);
     binary_flags(&elf, metrics);
     elf_numeric_metrics(&elf, &segment_notes, metrics, values);
-    dynamic_metrics(&elf, metrics);
+    dynamic_metrics(&elf, bytes.len(), metrics);
     table_counts(&elf, metrics);
     relocation_kinds(&elf, values);
     segments(&elf, values);
@@ -131,7 +223,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     }
     linker_family(&elf, values);
     comment_fingerprint(values);
-    super::elf_hashes::emit(&elf, values, symbols_out);
+    super::elf_hashes::emit(&elf, bytes.len(), values, symbols_out);
     super::upx::detect(bytes, values);
     {
         // VA→file-offset resolver: walk `PT_LOAD` program headers and
@@ -698,6 +790,19 @@ fn has_go_pclntab(elf: &Elf<'_>, bytes: &[u8]) -> bool {
     read_section(elf, bytes, ".gopclntab").is_some_and(super::go_buildinfo::has_pclntab_magic)
 }
 
+/// The name of section `sh`, cut to [`MAX_SECTION_NAME`] chars; empty when it
+/// has none. The string table is attacker-supplied: `sh_name` may point into a
+/// run holding no NUL, making a section's "name" the rest of the file, and
+/// distinct headers may name every suffix of that run. Cutting by chars always
+/// lands on a boundary; real names are a handful of bytes.
+fn section_name<'a>(elf: &Elf<'a>, sh: &goblin::elf::SectionHeader) -> &'a str {
+    let full = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
+    match full.char_indices().nth(MAX_SECTION_NAME) {
+        Some((end, _)) => full.get(..end).unwrap_or(full),
+        None => full,
+    }
+}
+
 /// The file bytes of the first section named `name`; `None` when there is no
 /// such section or its header points past the file. Shared by the ELF
 /// extractors (`elf_dwarf` reads its `.debug_*` sections through it).
@@ -962,7 +1067,7 @@ fn elf_numeric_metrics(
     let mut name_seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let entry = elf.header.e_entry;
     for sh in elf.section_headers.iter() {
-        let name = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
+        let name = section_name(elf, sh);
         if !name.is_empty() {
             *name_seen.entry(name.to_string()).or_default() += 1;
         }
@@ -1227,7 +1332,7 @@ fn relocation_kind_name(machine: u16, r_type: u32) -> String {
 ///   dynamic loader (`ld-linux-*.so.*`/`ld-musl-*.so.*`); legit libs
 ///   pick up the loader transitively via libc, so direct dependency
 ///   is a strong tampering tell.
-fn dynamic_metrics(elf: &Elf<'_>, metrics: &mut Metrics) {
+fn dynamic_metrics(elf: &Elf<'_>, file_len: usize, metrics: &mut Metrics) {
     use goblin::elf::dynamic::{
         DT_AUDIT, DT_DEBUG, DT_DEPAUDIT, DT_FINI_ARRAYSZ, DT_FLAGS_1, DT_GNU_HASH, DT_INIT_ARRAYSZ,
         DT_PREINIT_ARRAYSZ, DT_RELACOUNT, DT_RPATH, DT_RUNPATH, DT_TEXTREL, DT_VERSYM,
@@ -1321,10 +1426,13 @@ fn dynamic_metrics(elf: &Elf<'_>, metrics: &mut Metrics) {
 
     // DT_NEEDED anomaly walk. Each `elf.libraries` entry is the
     // string already resolved from DT_NEEDED via the dynstr table.
+    // Each walk below reads the whole name; entries may all name one long
+    // string, so the walks share the budget a copy of them would get.
+    let mut scanned = NameBudget::new(file_len);
     let mut abs_path_count: u64 = 0;
     let mut traversal_count: u64 = 0;
     let mut direct_loader_dep = false;
-    for needed in &elf.libraries {
+    for needed in elf.libraries.iter().take_while(|s| scanned.take(s.len())) {
         if needed.starts_with('/') {
             abs_path_count += 1;
         }
@@ -1357,6 +1465,7 @@ fn dynamic_metrics(elf: &Elf<'_>, metrics: &mut Metrics) {
     if elf
         .runpaths
         .iter()
+        .take_while(|s| scanned.take(s.len()))
         .any(|p| p.split(':').any(|seg| seg.contains("$ORIGIN")))
     {
         metrics.insert(metric!("elf.dt_runpath_uses_origin"), 1.0);
@@ -1423,11 +1532,7 @@ fn section_headers(elf: &Elf<'_>, values: &mut Values) {
         .section_headers
         .iter()
         .map(|sh| {
-            let full = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
-            let name = match full.char_indices().nth(MAX_SECTION_NAME) {
-                Some((end, _)) => &full[..end],
-                None => full,
-            };
+            let name = section_name(elf, sh);
             let mut entry = serde_json::Map::new();
             entry.insert("name".into(), JsonValue::String(name.to_string()));
             entry.insert("name_offset".into(), JsonValue::Number(sh.sh_name.into()));
@@ -1636,7 +1741,7 @@ fn stripped_metadata(elf: &Elf<'_>, values: &mut Values, metrics: &mut Metrics) 
     let present: std::collections::HashSet<&str> = elf
         .section_headers
         .iter()
-        .filter_map(|sh| elf.shdr_strtab.get_at(sh.sh_name))
+        .map(|sh| section_name(elf, sh))
         .collect();
 
     let stripped: Vec<JsonValue> = EXPECTED
@@ -1679,20 +1784,29 @@ fn stripped_metadata(elf: &Elf<'_>, values: &mut Values, metrics: &mut Metrics) 
 /// string. Forensically the strongest fingerprint of a Linux binary's
 /// build environment: the highest `GLIBC_x.y` in this list is the
 /// floor glibc version the binary loads on.
-fn needed_versions(elf: &Elf<'_>, values: &mut Values, errors_out: &mut Errors) {
+fn needed_versions(elf: &Elf<'_>, file_len: usize, values: &mut Values, errors_out: &mut Errors) {
     let Some(verneed) = elf.verneed.as_ref() else {
         return;
     };
     let mut out: Vec<JsonValue> = Vec::new();
+    let mut names = NameBudget::new(file_len);
     // Both levels are lazy walks along file-controlled `vn_next` / `vna_next`
-    // links.
-    for need in goblin_safe::drain_or_record(verneed.iter(), errors_out, crate::Stage::ElfParse) {
+    // links; one record budget spans them.
+    let mut left = MAX_VERSION_RECORDS;
+    let needs = verneed.iter().take(MAX_VERSION_RECORDS);
+    for need in goblin_safe::drain_or_record(needs, errors_out, crate::Stage::ElfParse) {
         let lib = elf.dynstrtab.get_at(need.vn_file).unwrap_or("");
-        for aux in goblin_safe::drain_or_record(need.iter(), errors_out, crate::Stage::ElfParse) {
+        let auxes = need.iter().take(left);
+        let auxes = goblin_safe::drain_or_record(auxes, errors_out, crate::Stage::ElfParse);
+        left = left.saturating_sub(auxes.len());
+        for aux in auxes {
             let ver = elf.dynstrtab.get_at(aux.vna_name).unwrap_or("");
-            if !lib.is_empty() && !ver.is_empty() {
+            if !lib.is_empty() && !ver.is_empty() && names.take(lib.len() + ver.len()) {
                 out.push(JsonValue::String(format!("{lib}@{ver}")));
             }
+        }
+        if left == 0 {
+            break;
         }
     }
     if !out.is_empty() {
@@ -1959,30 +2073,27 @@ fn decompose_riscv_eflags(v: u32, out: &mut Vec<&'static str>) {
     }
 }
 
-fn dynamic(elf: &Elf<'_>, values: &mut Values) {
-    let needed: Vec<JsonValue> = elf
-        .libraries
-        .iter()
-        .map(|lib| JsonValue::String((*lib).to_string()))
-        .collect();
+fn dynamic(elf: &Elf<'_>, file_len: usize, values: &mut Values) {
+    // Every DT_NEEDED / DT_RPATH / DT_RUNPATH entry is a 16-byte record
+    // naming a string; they may all name the same long one.
+    let mut names = NameBudget::new(file_len);
+    let mut copy = |list: &[&str]| -> Vec<JsonValue> {
+        list.iter()
+            .take_while(|s| names.take(s.len()))
+            .map(|s| JsonValue::String((*s).to_string()))
+            .collect()
+    };
+    let needed = copy(&elf.libraries);
     values.insert_key(value_key!("elf.needed"), JsonValue::Array(needed));
 
     if let Some(soname) = elf.soname {
         put_str(values, value_key!("elf.soname"), soname);
     }
-    let rpaths: Vec<JsonValue> = elf
-        .rpaths
-        .iter()
-        .map(|r| JsonValue::String((*r).to_string()))
-        .collect();
+    let rpaths = copy(&elf.rpaths);
     if !rpaths.is_empty() {
         values.insert_key(value_key!("elf.rpath"), JsonValue::Array(rpaths));
     }
-    let runpaths: Vec<JsonValue> = elf
-        .runpaths
-        .iter()
-        .map(|r| JsonValue::String((*r).to_string()))
-        .collect();
+    let runpaths = copy(&elf.runpaths);
     if !runpaths.is_empty() {
         values.insert_key(value_key!("elf.runpath"), JsonValue::Array(runpaths));
     }
@@ -1997,19 +2108,11 @@ fn sections(elf: &Elf<'_>, bytes: &[u8], _metrics: &mut Metrics, sections_out: &
     // need and this never bites a real binary.
     let mut entropy_budget = bytes.len() as u64;
     for sh in &elf.section_headers {
-        // Truncate by chars so the cut always lands on a boundary. The string
-        // table is attacker-supplied: `sh_name` may point into a run holding no
-        // NUL, making a section's "name" the rest of the file. Measured without
-        // this cap, an 8.5 MB ELF whose four section names each ran to EOF
-        // emitted 201 MB of JSON (control bytes escape to ``, 6x), and
+        // `section_name` cuts the name. Measured without that cap, an 8.5 MB
+        // ELF whose four section names each ran to EOF emitted 201 MB of JSON (control bytes escape to ``, 6x), and
         // the 2000-section version did not finish. Real names are a handful of
         // bytes, so nothing legitimate reaches this.
-        let full = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
-        let name = match full.char_indices().nth(MAX_SECTION_NAME) {
-            Some((end, _)) => &full[..end],
-            None => full,
-        };
-        let name = name.to_owned();
+        let name = section_name(elf, sh).to_owned();
         // SHT_NOBITS (8) sections have no file bytes. Other types
         // occupy `sh_offset..sh_offset + sh_size` in the file.
         let (file_offset, file_size) = if sh.sh_type == 8 {
@@ -2090,10 +2193,13 @@ fn load_segment_va_to_offset(elf: &Elf<'_>, va: u64) -> Option<u64> {
 
 fn symbols(
     elf: &Elf<'_>,
+    file_len: usize,
     values: &mut Values,
     metrics: &mut Metrics,
     symbols_out: &mut crate::Symbols,
 ) {
+    // Names copied into the typed symbol view and `elf.ifuncs`.
+    let mut names = NameBudget::new(file_len);
     // Dynamic-symbol table: imports are undefined (`SHN_UNDEF`, section
     // index 0); exports are defined globals/weaks. STT_GNU_IFUNC entries
     // stay in `values` as a derived ELF-specific list; ordinary imports and
@@ -2166,16 +2272,19 @@ fn symbols(
         if name.is_empty() {
             continue;
         }
-        let stt = sym.st_info & 0xf;
-        if stt == goblin::elf::sym::STT_GNU_IFUNC {
-            ifuncs.push(JsonValue::String(name.to_string()));
-        }
         // FORTIFY_SOURCE imports the `__*_chk` runtime variants of
         // memcpy / strcpy / sprintf / etc. Count them so a single
         // metric tells the trait engine whether the binary was
         // compiled with -D_FORTIFY_SOURCE.
         if name.starts_with("__") && name.ends_with("_chk") {
             fortify_count += 1;
+        }
+        if !names.take(name.len()) {
+            continue;
+        }
+        let stt = sym.st_info & 0xf;
+        if stt == goblin::elf::sym::STT_GNU_IFUNC {
+            ifuncs.push(JsonValue::String(name.to_string()));
         }
         // The symbol name's byte offset in the file (via `.dynstr`): a real,
         // file-backed location every consumer can render. Imports and exports
@@ -2343,7 +2452,11 @@ fn build_id(
     // gone and destroys the "identity retained, execution redirected"
     // evidence. Sections survive the repurposing; fall back to segments
     // only for stripped binaries that carry no section headers.
-    let section_notes = drain_notes(elf.iter_note_sections(bytes, None), errors_out);
+    let section_notes = drain_notes(
+        elf.iter_note_sections(bytes, None),
+        &mut bytes.len(),
+        errors_out,
+    );
     let desc = gnu_build_id_desc(&section_notes).or_else(|| gnu_build_id_desc(segment_notes));
     if let Some(desc) = desc {
         put_str(values, value_key!("elf.build_id"), hex_encode(desc));
@@ -2364,8 +2477,29 @@ fn gnu_build_id_desc<'a>(notes: &[Note<'a>]) -> Option<&'a [u8]> {
 /// Every note a lazy goblin note walk yields, drained through `goblin_safe`.
 /// Notes goblin rejects are skipped; `None` (no note segments or sections)
 /// yields none.
-fn drain_notes<'a>(notes: Option<NoteIterator<'a>>, errors_out: &mut Errors) -> Vec<Note<'a>> {
-    let walk = notes.into_iter().flatten().flatten();
+///
+/// Each note is charged its header, name and descriptor against `budget`
+/// bytes, and the walk stops once one no longer fits. Note segments and
+/// sections are file-controlled ranges that may all cover the same bytes:
+/// 65535 `PT_NOTE` headers over one 1 MiB run of 12-byte notes is 5.7 billion
+/// notes, and one long-named note re-read per header is `headers × run`
+/// bytes. Honest note ranges are disjoint, so the file length is budget
+/// enough for all of them.
+fn drain_notes<'a>(
+    notes: Option<NoteIterator<'a>>,
+    budget: &mut usize,
+    errors_out: &mut Errors,
+) -> Vec<Note<'a>> {
+    let walk = notes.into_iter().flatten().flatten().take_while(|note| {
+        let size = 12usize
+            .saturating_add(note.name.len())
+            .saturating_add(note.desc.len());
+        let Some(left) = budget.checked_sub(size) else {
+            return false;
+        };
+        *budget = left;
+        true
+    });
     goblin_safe::drain_or_record(walk, errors_out, crate::Stage::ElfParse)
 }
 
@@ -2396,12 +2530,27 @@ fn note_segment_coverage(
     if elf.program_headers.is_empty() {
         return;
     }
-    let note_ranges: Vec<(u64, u64)> = elf
-        .program_headers
-        .iter()
-        .filter(|ph| ph.p_type == PT_NOTE || ph.p_type == PT_GNU_PROPERTY)
-        .map(|ph| (ph.p_offset, ph.p_offset.saturating_add(ph.p_filesz)))
-        .collect();
+    let note_ranges = RangeCover::new(
+        elf.program_headers
+            .iter()
+            .filter(|ph| ph.p_type == PT_NOTE || ph.p_type == PT_GNU_PROPERTY)
+            .map(|ph| (ph.p_offset, ph.p_offset.saturating_add(ph.p_filesz)))
+            .collect(),
+    );
+    let ctx = goblin::container::Ctx::new(
+        if elf.is_64 {
+            goblin::container::Container::Big
+        } else {
+            goblin::container::Container::Little
+        },
+        if elf.little_endian {
+            goblin::container::Endian::Little
+        } else {
+            goblin::container::Endian::Big
+        },
+    );
+    // One note budget across every section re-read below.
+    let mut note_budget = bytes.len();
     // SHF_ALLOC = 0x2. Only *loaded* notes are expected to have a note
     // program header — the loader reads them from memory. Non-allocated
     // notes (`.note.stapsdt` SystemTap probes, `.note.gnu.gold-version`,
@@ -2416,17 +2565,27 @@ fn note_segment_coverage(
         }
         let start = sh.sh_offset;
         let end = sh.sh_offset.saturating_add(sh.sh_size);
-        if note_ranges.iter().any(|(s, e)| start >= *s && end <= *e) {
+        if note_ranges.contains(start, end) {
             continue;
         }
         uncovered += 1;
-        // Is the orphaned note the GNU build-id? Read it back through its
-        // own section name so the check is independent of ordering.
-        let name = elf.shdr_strtab.get_at(sh.sh_name);
-        let notes = drain_notes(elf.iter_note_sections(bytes, name), errors_out);
-        if gnu_build_id_desc(&notes).is_some() {
-            build_id_orphaned = true;
+        if build_id_orphaned {
+            continue;
         }
+        // Is the orphaned note the GNU build-id? Read back this section's
+        // own notes, so the check is independent of ordering and names.
+        let offset = crate::bytes::sat_usize(start);
+        let walk = goblin::elf::note::NoteIterator {
+            iters: vec![goblin::elf::note::NoteDataIterator {
+                data: bytes,
+                offset,
+                size: offset.saturating_add(crate::bytes::sat_usize(sh.sh_size)),
+                ctx: (crate::bytes::sat_usize(sh.sh_addralign), ctx),
+            }],
+            index: 0,
+        };
+        let notes = drain_notes(Some(walk), &mut note_budget, errors_out);
+        build_id_orphaned = gnu_build_id_desc(&notes).is_some();
     }
     if uncovered > 0 {
         metrics.insert(metric!("elf.uncovered_note_count"), uncovered as f64);
@@ -2449,12 +2608,13 @@ fn section_file_anomalies(elf: &Elf<'_>, bytes: &[u8], metrics: &mut Metrics) {
     const SHF_ALLOC: u64 = 0x2;
     let file_len = bytes.len() as u64;
 
-    let load_ranges: Vec<(u64, u64)> = elf
-        .program_headers
-        .iter()
-        .filter(|ph| ph.p_type == PT_LOAD)
-        .map(|ph| (ph.p_offset, ph.p_offset.saturating_add(ph.p_filesz)))
-        .collect();
+    let load_ranges = RangeCover::new(
+        elf.program_headers
+            .iter()
+            .filter(|ph| ph.p_type == PT_LOAD)
+            .map(|ph| (ph.p_offset, ph.p_offset.saturating_add(ph.p_filesz)))
+            .collect(),
+    );
 
     let mut past_eof = 0u64;
     let mut uncovered_alloc = 0u64;
@@ -2470,7 +2630,7 @@ fn section_file_anomalies(elf: &Elf<'_>, bytes: &[u8], metrics: &mut Metrics) {
         }
         if sh.sh_flags & SHF_ALLOC != 0
             && !load_ranges.is_empty()
-            && !load_ranges.iter().any(|(s, e)| start >= *s && end <= *e)
+            && !load_ranges.contains(start, end)
         {
             uncovered_alloc += 1;
         }

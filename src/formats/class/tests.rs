@@ -456,3 +456,69 @@ fn inner_classes_are_deduplicated_across_attributes() {
     let attrs = parse_attributes(&mut Reader::at(&bytes, 0), &cp);
     assert_eq!(attrs.inner_classes, ["Outer$A", "Outer$B"]);
 }
+
+/// One 64 KiB name referenced by every method and methodref slot the format
+/// allows must not be copied once per reference: the symbol names stay
+/// within `MAX_SYMBOL_NAME_BYTES` while the methodref count stays exact.
+#[test]
+fn shared_constant_pool_name_is_not_amplified() {
+    const REFS: u16 = 65_530;
+    let long = "m".repeat(usize::from(u16::MAX));
+    let mut out = Vec::new();
+    out.extend_from_slice(&0xCAFE_BABE_u32.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&52u16.to_be_bytes());
+    // 1 Utf8 long, 2 Utf8 "C", 3 Class -> 2, 4 NameAndType -> (1, 2),
+    // 5.. Methodref -> (3, 4).
+    out.extend_from_slice(&(5 + REFS).to_be_bytes());
+    out.push(CP_UTF8);
+    out.extend_from_slice(&u16::MAX.to_be_bytes());
+    out.extend_from_slice(long.as_bytes());
+    out.push(CP_UTF8);
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.push(b'C');
+    out.push(CP_CLASS);
+    out.extend_from_slice(&2u16.to_be_bytes());
+    out.push(CP_NAME_AND_TYPE);
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&2u16.to_be_bytes());
+    for _ in 0..REFS {
+        out.push(CP_METHODREF);
+        out.extend_from_slice(&3u16.to_be_bytes());
+        out.extend_from_slice(&4u16.to_be_bytes());
+    }
+    out.extend_from_slice(&0x0021u16.to_be_bytes()); // access flags
+    out.extend_from_slice(&3u16.to_be_bytes()); // this_class
+    out.extend_from_slice(&0u16.to_be_bytes()); // super_class
+    out.extend_from_slice(&0u16.to_be_bytes()); // interfaces_count
+    out.extend_from_slice(&0u16.to_be_bytes()); // fields_count
+    out.extend_from_slice(&u16::MAX.to_be_bytes()); // methods_count
+    for _ in 0..u16::MAX {
+        out.extend_from_slice(&0x0001u16.to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes()); // name -> long
+        out.extend_from_slice(&2u16.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+    }
+    out.extend_from_slice(&0u16.to_be_bytes());
+    assert!(out.len() < 1024 * 1024);
+
+    let (_, m, symbols) = run_full(&out);
+    let copied: usize = symbols
+        .iter()
+        .map(|s| match s {
+            crate::Symbol::Function { name, .. } => name.len(),
+            crate::Symbol::Import { name, library, .. } => {
+                name.len() + library.as_ref().map_or(0, String::len)
+            }
+            _ => 0,
+        })
+        .sum();
+    assert!(copied <= MAX_SYMBOL_NAME_BYTES, "{copied} bytes copied");
+    assert!(
+        symbols
+            .iter_kind(crate::SymbolKind::Function)
+            .next()
+            .is_some()
+    );
+    assert_eq!(m.get("class.method_ref_count"), Some(f64::from(REFS)));
+}

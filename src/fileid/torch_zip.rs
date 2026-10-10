@@ -1,8 +1,47 @@
 //! PyTorch ZIP carrier convention, without loading a model or trusting code.
-use std::io::{Cursor, Read};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
+
+/// Bytes the `zip` crate may read while recognizing a carrier, per input
+/// byte, on top of a fixed 1 MiB. Opening a well-formed archive and reading
+/// the two small members reads well under two passes over it, but the crate
+/// rescans the file for every failing end-of-central-directory candidate, so
+/// one packed with them would otherwise take quadratic time to refuse.
+const READS_PER_BYTE: u64 = 4;
+
+/// A reader that fails once `left` bytes have been read.
+struct Budgeted<R> {
+    inner: R,
+    left: u64,
+}
+
+impl<R: Read> Read for Budgeted<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.left == 0 && !buf.is_empty() {
+            return Err(io::Error::other("read budget exhausted"));
+        }
+        let max = buf
+            .len()
+            .min(usize::try_from(self.left).unwrap_or(usize::MAX));
+        let n = self.inner.read(buf.get_mut(..max).unwrap_or_default())?;
+        self.left = self.left.saturating_sub(n as u64);
+        Ok(n)
+    }
+}
+
+impl<R: Seek> Seek for Budgeted<R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
 
 pub(super) fn recognized(data: &[u8]) -> bool {
-    let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(data)) else {
+    let reader = Budgeted {
+        inner: Cursor::new(data),
+        left: (data.len() as u64)
+            .saturating_mul(READS_PER_BYTE)
+            .saturating_add(1 << 20),
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(reader) else {
         return false;
     };
     if archive.is_empty() || archive.len() > 100_000 {
@@ -28,14 +67,16 @@ pub(super) fn recognized(data: &[u8]) -> bool {
     let version_name = format!("{prefix}version");
     let data_name = format!("{prefix}data.pkl");
     let version = {
-        let Ok(mut entry) = archive.by_name(&version_name) else {
+        let Ok(entry) = archive.by_name(&version_name) else {
             return false;
         };
         if entry.is_dir() || entry.size() > 16 {
             return false;
         }
+        // The declared size is the archive's claim; a deflated member that
+        // declares 16 bytes can inflate to gigabytes. Read one byte past it.
         let mut bytes = Vec::new();
-        if entry.read_to_end(&mut bytes).is_err() {
+        if entry.take(17).read_to_end(&mut bytes).is_err() || bytes.len() > 16 {
             return false;
         }
         bytes
@@ -170,5 +211,45 @@ mod tests {
         let detected = fileid::detect(Path::new("code.debug_pkl"), executable).unwrap();
         assert_eq!(detected.file_type, FileType::Zip);
         assert!(detected.extension_mismatch());
+    }
+
+    /// A `version` member that declares two bytes but inflates to megabytes
+    /// is refused rather than read whole: the declared size is only the
+    /// archive's claim.
+    #[test]
+    fn version_member_inflating_past_its_declared_size_is_refused() {
+        let mut version = b"3".to_vec();
+        version.resize(1 << 20, b' ');
+        let mut data = archive(&[
+            ("model/version", &version),
+            ("model/data.pkl", b"\x80\x02}."),
+        ]);
+        // Rewrite the declared uncompressed size in the local header (+22)
+        // and the central-directory record (+24) of `model/version`.
+        let declared = (1_u32 << 20).to_le_bytes();
+        let mut at = 0;
+        let mut patched = 0;
+        while let Some(off) = data[at..].windows(4).position(|w| w == declared) {
+            let pos = at + off;
+            data[pos..pos + 4].copy_from_slice(&2_u32.to_le_bytes());
+            patched += 1;
+            at = pos + 4;
+        }
+        assert_eq!(patched, 2);
+        assert!(!recognized(&data));
+    }
+
+    /// End-of-central-directory candidates that each fail made the `zip`
+    /// crate rescan the file once per candidate; recognition is now bounded.
+    #[test]
+    fn failing_end_record_candidates_are_refused_promptly() {
+        let mut record = [0_u8; 22];
+        record[..4].copy_from_slice(b"PK\x05\x06");
+        record[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        record[10..12].copy_from_slice(&1_u16.to_le_bytes());
+        let data = record.repeat((512 << 10) / record.len());
+        let start = std::time::Instant::now();
+        assert!(!recognized(&data));
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 }

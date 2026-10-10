@@ -352,6 +352,8 @@ impl Builder<'_> {
             target: None,
             receiver: None,
             fields: BTreeMap::new(),
+            // Not tracked for CFML; `false` claims nothing.
+            module_level: false,
         });
         id
     }

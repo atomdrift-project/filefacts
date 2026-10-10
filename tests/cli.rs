@@ -228,6 +228,22 @@ fn control_sequences_from_the_file_are_escaped() {
     assert!(text.contains("\\x9b31m"), "{text}");
 }
 
+/// `filefacts *` in a sample directory passes file names as arguments, and
+/// a name starting with `-` is then an unknown flag, quoted in the error.
+#[test]
+fn rejected_argument_is_escaped_in_the_error() {
+    for args in [["-\x1b]0;pwned\x07\x1b[2J", "x"], ["--format", "\x1b[2J"]] {
+        let out = filefacts().args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let text = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        assert!(text.contains("\\x1b[2J"), "{text}");
+    }
+}
+
 /// JSON escapes C0 controls itself; DEL and the C1 controls (the 8-bit CSI
 /// among them) must not reach a terminal raw either, yet still round-trip.
 #[test]
