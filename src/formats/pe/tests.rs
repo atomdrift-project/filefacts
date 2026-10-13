@@ -692,6 +692,7 @@ fn resource_blob(chunks: &[&[u8]]) -> Vec<u8> {
     for c in chunks {
         b.extend_from_slice(&(c.len() as u32).to_le_bytes());
         b.extend_from_slice(c);
+        b.resize((b.len() + 7) & !7, 0);
     }
     b
 }
@@ -705,8 +706,8 @@ fn scan_resource_blob_counts_and_measures() {
     assert_eq!(count, 2);
     assert_eq!(max_size, 4096);
     assert!(max_entropy > 7.0, "max_entropy {max_entropy}");
-    assert_eq!(entropy_span.map(|s| s.offset), Some(264));
-    assert_eq!(size_span.map(|s| s.offset), Some(264));
+    assert_eq!(entropy_span.map(|s| s.offset), Some(268));
+    assert_eq!(size_span.map(|s| s.offset), Some(268));
 }
 
 #[test]

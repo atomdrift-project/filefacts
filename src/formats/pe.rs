@@ -2410,6 +2410,7 @@ fn parse_clr_streams(md: &[u8]) -> Option<(Vec<String>, Option<HeapRange>)> {
 /// Measure the embedded managed (CLR) resources that the Win32 resource walk
 /// never sees. The cor20 header's `Resources` directory points at a blob of
 /// `[u32 little-endian length][bytes]` chunks (ECMA-335 II.25.3.3); each
+/// chunk starts at an 8-byte-aligned offset in the managed resource blob.
 /// embedded resource is one chunk. We don't need the `ManifestResource`
 /// metadata table — names aside, the bytes are all here — so we skip the whole
 /// table/heap machinery and just walk the blob. The forensic point is entropy:
@@ -2497,7 +2498,10 @@ fn scan_resource_blob(
             size_span = Some(crate::output::Span::new(p as u64, len as u64));
         }
         count += 1;
-        p += len;
+        // Managed resource offsets are aligned to eight bytes. Reading the
+        // padding as the next length terminates early (zero padding) or
+        // invents a malformed length, hiding subsequent resource streams.
+        p = (p + len + 7) & !7;
     }
     (count, max_entropy, max_size, entropy_span, size_span)
 }
