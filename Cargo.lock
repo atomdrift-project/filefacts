@@ -383,9 +383,9 @@ dependencies = [
 
 [[package]]
 name = "deranged"
-version = "0.5.8"
+version = "0.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
+checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
 
 [[package]]
 name = "derive_arbitrary"
@@ -1790,7 +1790,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "2.1.1"
-source = "git+https://github.com/atomdrift-project/stng.git#6e21883f647086053b3d4194021091b1d3a63dfd"
+source = "git+https://github.com/atomdrift-project/stng.git#e0257f074af444feebfdc1963fffa2e541d2f82a"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -2077,7 +2077,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter"
 version = "0.28.0"
-source = "git+https://github.com/tstromberg/tree-sitter?branch=master#6e41dd9075712903c5a7dc3c5198aab73463e81b"
+source = "git+https://github.com/tstromberg/tree-sitter?branch=master#68fddc3ea84b2b4445aba7e0f85847e79e342725"
 dependencies = [
  "cc",
  "regex",
@@ -2198,7 +2198,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-language"
 version = "0.1.8"
-source = "git+https://github.com/tstromberg/tree-sitter?branch=master#6e41dd9075712903c5a7dc3c5198aab73463e81b"
+source = "git+https://github.com/tstromberg/tree-sitter?branch=master#68fddc3ea84b2b4445aba7e0f85847e79e342725"
 
 [[package]]
 name = "tree-sitter-lua"
