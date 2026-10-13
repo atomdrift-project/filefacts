@@ -382,7 +382,7 @@ fn write_json(
     parsed: &ParsedFile<'_>,
     view: Option<View>,
 ) -> serde_json::Result<()> {
-    let mut escaped = EscapeC1(&mut *out);
+    let mut escaped = EscapeJsonTerminalControls(&mut *out);
     match view {
         None => serde_json::to_writer_pretty(&mut escaped, &Bundle(parsed))?,
         Some(view) => serde_json::to_writer_pretty(&mut escaped, &ViewData(parsed, view))?,
@@ -390,22 +390,32 @@ fn write_json(
     out.write_all(b"\n").map_err(serde_json::Error::io)
 }
 
-/// Rewrites DEL and the C1 controls (U+0080..=U+009F, including the 8-bit
-/// CSI) as `\u00XX` escapes. JSON allows them raw and serde_json leaves them
-/// so, but a terminal may act on them, and these strings come from the file
-/// under analysis. Every such byte sequence in JSON output lies inside a
-/// string, and serde_json writes whole UTF-8 fragments, so the rewrite is
-/// safe per write.
-struct EscapeC1<W>(W);
+/// Rewrites DEL, C1 controls and Unicode bidirectional formatting characters
+/// as JSON escapes. JSON permits them raw and serde_json leaves them so, but a
+/// terminal may act on them, and these strings come from the file under
+/// analysis. Every matched byte sequence in JSON output lies inside a string,
+/// and serde_json writes whole UTF-8 fragments, so the rewrite is safe per
+/// write.
+struct EscapeJsonTerminalControls<W>(W);
 
-impl<W: Write> Write for EscapeC1<W> {
+impl<W: Write> Write for EscapeJsonTerminalControls<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut start = 0;
         let mut i = 0;
         while let Some(&b) = buf.get(i) {
-            let escape = match (b, buf.get(i + 1)) {
-                (0x7f, _) => Some((0x7f, 1)),
-                (0xc2, Some(&c1 @ 0x80..=0x9f)) => Some((c1, 2)),
+            let escape = match (b, buf.get(i + 1), buf.get(i + 2)) {
+                (0x7f, _, _) => Some((0x7f_u32, 1)),
+                (0xc2, Some(&c1 @ 0x80..=0x9f), _) => Some((u32::from(c1), 2)),
+                // U+061C ARABIC LETTER MARK.
+                (0xd8, Some(0x9c), _) => Some((0x061c, 2)),
+                // U+200E/U+200F and U+202A..U+202E.
+                (0xe2, Some(0x80), Some(&tail @ (0x8e..=0x8f | 0xaa..=0xae))) => {
+                    Some((0x2000 + u32::from(tail - 0x80), 3))
+                }
+                // U+2066..U+2069.
+                (0xe2, Some(0x81), Some(&tail @ 0xa6..=0xa9)) => {
+                    Some((0x2040 + u32::from(tail - 0x80), 3))
+                }
                 _ => None,
             };
             if let Some((code, len)) = escape {
@@ -1234,11 +1244,22 @@ fn string_excerpt(text: &str, max: usize) -> String {
     }
 }
 
-/// `text` with control characters written as escapes (`\n`, `\t`,
-/// `\x1b`, `\x9b`, …), so file-derived text cannot drive the terminal.
-/// Idempotent: the output holds no control characters.
+/// `text` with terminal control and bidirectional formatting characters
+/// written as escapes, so file-derived text cannot drive or visually reorder
+/// terminal output. Idempotent: the output holds no unsafe characters.
 fn escape_controls(text: &str) -> Cow<'_, str> {
-    if !text.chars().any(char::is_control) {
+    let unsafe_char = |c: char| {
+        c.is_control()
+            || matches!(
+                c,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            )
+    };
+    if !text.chars().any(unsafe_char) {
         return Cow::Borrowed(text);
     }
     let mut out = String::with_capacity(text.len() + 8);
@@ -1248,6 +1269,7 @@ fn escape_controls(text: &str) -> Cow<'_, str> {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c if unsafe_char(c) => out.push_str(&format!("\\u{{{:04x}}}", c as u32)),
             c => out.push(c),
         }
     }

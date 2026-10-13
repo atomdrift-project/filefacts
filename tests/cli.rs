@@ -193,17 +193,32 @@ fn terminal_text(args: &[&str], target: &Path) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
-/// Names, strings and paths from the file are printed with control
-/// characters escaped, so a sample cannot drive the analyst's terminal.
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Names, strings and paths from the file are printed with terminal controls
+/// escaped, so a sample cannot drive or visually reorder the analyst's output.
 #[test]
 fn control_sequences_from_the_file_are_escaped() {
     let dir = scratch("control-sequences");
     fs::write(
-        dir.join("evil\x1b[2J.py"),
-        b"# \x1b]0;pwned\x07\nimport os\nos.system(\"\x1b[2J\")\n",
+        dir.join("evil\x1b[2J\u{202e}.py"),
+        "# \x1b]0;pwned\x07\nimport os\nos.system(\"\x1b[2J\u{2066}\")\n",
     )
     .unwrap();
-    fs::write(dir.join("evil.json"), br#"{"k\u001b[2J": ["\u009b31m"]}"#).unwrap();
+    fs::write(
+        dir.join("evil.json"),
+        br#"{"k\u001b[2J": ["\u009b31m", "\u202e"]}"#,
+    )
+    .unwrap();
     for view in [
         "--fileid",
         "--values",
@@ -213,19 +228,24 @@ fn control_sequences_from_the_file_are_escaped() {
         "--symbols",
         "--calls",
     ] {
-        let text = terminal_text(&[view], &dir.join("evil\x1b[2J.py"));
+        let text = terminal_text(&[view], &dir.join("evil\x1b[2J\u{202e}.py"));
         assert!(
-            !text.chars().any(|c| c.is_control() && c != '\n'),
+            !text
+                .chars()
+                .any(|c| (c.is_control() && c != '\n') || is_bidi_control(c)),
             "{view}: {text:?}"
         );
     }
     let text = terminal_text(&[], &dir);
     assert!(
-        !text.chars().any(|c| c.is_control() && c != '\n'),
+        !text
+            .chars()
+            .any(|c| (c.is_control() && c != '\n') || is_bidi_control(c)),
         "{text:?}"
     );
-    assert!(text.contains("evil\\x1b[2J.py"), "{text}");
+    assert!(text.contains("evil\\x1b[2J\\u{202e}.py"), "{text}");
     assert!(text.contains("\\x9b31m"), "{text}");
+    assert!(text.contains("\\u{202e}"), "{text}");
 }
 
 /// `filefacts *` in a sample directory passes file names as arguments, and
@@ -244,13 +264,13 @@ fn rejected_argument_is_escaped_in_the_error() {
     }
 }
 
-/// JSON escapes C0 controls itself; DEL and the C1 controls (the 8-bit CSI
-/// among them) must not reach a terminal raw either, yet still round-trip.
+/// JSON escapes C0 controls itself; DEL, C1 controls and bidirectional
+/// formatting characters must not reach a terminal raw, yet still round-trip.
 #[test]
-fn json_output_escapes_del_and_c1_controls() {
+fn json_output_escapes_terminal_controls() {
     let dir = scratch("json-c1");
     let file = dir.join("c1.json");
-    fs::write(&file, "{\"k\": [\"\u{9b}31m\u{7f}\"]}").unwrap();
+    fs::write(&file, "{\"k\": [\"\u{9b}31m\u{7f}\u{202e}\"]}").unwrap();
     let out = filefacts()
         .args(["--format", "json", "values"])
         .arg(&file)
@@ -259,12 +279,17 @@ fn json_output_escapes_del_and_c1_controls() {
     assert!(out.status.success(), "{:?}", out.status);
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(
-        !text.chars().any(|c| c.is_control() && c != '\n'),
+        !text
+            .chars()
+            .any(|c| (c.is_control() && c != '\n') || is_bidi_control(c)),
         "{text:?}"
     );
-    assert!(text.contains("\\u009b31m\\u007f"), "{text}");
+    assert!(text.contains("\\u009b31m\\u007f\\u202e"), "{text}");
     let value: Value = serde_json::from_str(&text).unwrap();
-    assert!(value.to_string().contains("\u{9b}31m\u{7f}"), "{value}");
+    assert!(
+        value.to_string().contains("\u{9b}31m\u{7f}\u{202e}"),
+        "{value}"
+    );
 }
 
 /// A FIFO named on the command line is refused at once: reading it would
