@@ -871,11 +871,8 @@ fn local_header_offsets(z: &[u8]) -> Vec<usize> {
     memchr::memmem::find_iter(z, b"PK\x03\x04").collect()
 }
 
-/// One corrupted local-header signature made the `zip` crate refuse the
-/// whole archive, so an APK hid every member (and its manifest) while
-/// Android, which reads the central directory, installed it. The header is
-/// repaired, the members are listed and readable, and the mismatch is a
-/// recorded fact.
+/// A corrupted local-header signature must be repaired whether the `zip`
+/// crate rejects it during open or defers validation until a member read.
 #[test]
 fn corrupted_local_header_signature_still_lists_and_reads_members() {
     let mut z = build_zip(&[
@@ -888,8 +885,6 @@ fn corrupted_local_header_signature_still_lists_and_reads_members() {
     ]);
     let second = local_header_offsets(&z)[1];
     z[second..second + 4].copy_from_slice(b"XX\x03\x04");
-    assert!(ZipArchive::new(Cursor::new(&z[..])).is_err());
-
     let mut v = Values::new();
     let mut m = Metrics::new();
     let mut members = Vec::new();
@@ -916,10 +911,13 @@ fn unopenable_archive_lists_members_from_the_raw_central_directory() {
         ("a.txt", b"a", CompressionMethod::Stored),
         ("b.txt", b"b", CompressionMethod::Stored),
     ]);
-    // An extra-field length that runs the data start past the central
-    // directory: the `zip` crate refuses it with or without a signature.
-    let first = local_header_offsets(&z)[0];
-    z[first + 28..first + 30].copy_from_slice(&u16::MAX.to_le_bytes());
+    // Point the first central-directory entry at the central directory
+    // itself. `zip` rejects this while parsing the directory, but the raw
+    // walker can still list both names and report the bad local pointer.
+    let eocd = find_eocd(&z).unwrap();
+    let cd_size = bytes_at::u32_le(&z, eocd + 12).unwrap() as usize;
+    let cd_start = eocd - cd_size;
+    z[cd_start + 42..cd_start + 46].copy_from_slice(&(cd_start as u32).to_le_bytes());
     assert!(ZipArchive::new(Cursor::new(&z[..])).is_err());
 
     let mut v = Values::new();

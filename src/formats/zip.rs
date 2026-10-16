@@ -164,6 +164,25 @@ enum Opened<'a> {
 fn open(bytes: &[u8]) -> Result<Opened<'_>, Error> {
     let error = match open_crate(Cow::Borrowed(bytes)) {
         Ok(archive) => {
+            // Recent `zip` releases defer local-header validation until a
+            // member is read. Older releases rejected the archive during
+            // `new`, which sent us through the repair path below. Check the
+            // central directory here too, so a successful open cannot hide
+            // a damaged local signature until a package layer reads it.
+            if let Some(directory) = read_raw_directory(bytes) {
+                let mismatches = directory
+                    .entries
+                    .iter()
+                    .filter(|entry| !local_header_intact(bytes, &directory, entry))
+                    .count();
+                if mismatches > 0
+                    && let Some((repaired_bytes, repaired)) =
+                        repair_local_headers(bytes, &directory)
+                    && let Ok(archive) = open_crate(Cow::Owned(repaired_bytes))
+                {
+                    return Ok(Opened::Archive { archive, repaired });
+                }
+            }
             return Ok(Opened::Archive {
                 archive,
                 repaired: 0,
