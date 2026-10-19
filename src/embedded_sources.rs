@@ -155,6 +155,23 @@ pub(crate) fn rpm(values: Option<&Values>) -> impl Iterator<Item = EmbeddedSourc
         })
 }
 
+pub(crate) fn rpyc(values: Option<&Values>) -> impl Iterator<Item = EmbeddedSource<'_>> {
+    values
+        .and_then(|v| v.get_key(crate::value_key!("rpyc")))
+        .and_then(|v| v.get("python_sources"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            Some(EmbeddedSource {
+                pointer: format!("/rpyc/python_sources/{index}/source"),
+                source: item.get("source")?.as_str()?,
+                file_type: Some(FileType::Python),
+            })
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

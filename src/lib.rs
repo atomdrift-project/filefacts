@@ -492,7 +492,10 @@ impl<'a> ParsedFile<'a> {
         let file_type = self.fileid.file_type();
         let actions = (file_type == FileType::GithubActions).then(|| self.values());
         let rpm = (file_type == FileType::Rpm).then(|| self.values());
-        embedded_sources::github_actions(actions).chain(embedded_sources::rpm(rpm))
+        let rpyc = (file_type == FileType::Rpyc).then(|| self.values());
+        embedded_sources::github_actions(actions)
+            .chain(embedded_sources::rpm(rpm))
+            .chain(embedded_sources::rpyc(rpyc))
     }
 
     /// Byte-scan extracted strings (printable ASCII / UTF-16LE runs).

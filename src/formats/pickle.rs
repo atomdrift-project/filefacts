@@ -34,6 +34,7 @@ const MAX_BYTES_SCANNED: usize = 8 * 1024 * 1024;
 #[derive(Clone, Copy)]
 enum StackValue<'a> {
     Text(&'a str),
+    RenpyPyCodeClass,
     Other,
     Mark,
 }
@@ -334,6 +335,110 @@ fn unicode_operand(op: u8, scan: &[u8], i: usize) -> Option<&str> {
     std::str::from_utf8(slice).ok()
 }
 
+/// Recover source stored by Ren'Py's `renpy.ast.PyCode.__getstate__` without
+/// constructing the pickled object. The supported shape is a GLOBAL PyCode,
+/// NEWOBJ, then a state tuple beginning `(1, source, ...)`, applied by BUILD.
+/// Ordinary dialogue strings elsewhere in the pickle are never promoted to
+/// executable Python source. Unsupported object layouts simply yield nothing.
+pub(crate) fn renpy_pycode_sources(bytes: &[u8]) -> Vec<String> {
+    const MAX_SOURCE_BYTES: usize = 1024 * 1024;
+    const MAX_SOURCE_COUNT: usize = 100;
+    const MAX_WALK_OPCODES: usize = 128;
+    let scan = bytes.get(..MAX_BYTES_SCANNED).unwrap_or(bytes);
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    let mut stage = 0u8;
+    let mut age = 0usize;
+    let mut candidate: Option<&str> = None;
+    let mut stack = PickleStack::default();
+    let mut protocol = -1;
+    let mut modules = BTreeSet::new();
+    let mut globals = BTreeSet::new();
+    while let Some(&op) = scan.get(pos) {
+        if opcode_name(op).is_none() {
+            break;
+        }
+        let Some(width) = payload_size(op, pos, scan) else {
+            break;
+        };
+        if pos.checked_add(width).is_none_or(|end| end > scan.len()) {
+            break;
+        }
+        if stage != 0 {
+            age += 1;
+            if age > MAX_WALK_OPCODES {
+                stage = 0;
+                candidate = None;
+            }
+        }
+        let pycode_global = (op == b'c'
+            && inline_global(scan, pos) == Some(("renpy.ast", "PyCode")))
+            || (op == 0x93
+                && matches!(
+                    stack.values.as_slice(),
+                    [
+                        ..,
+                        StackValue::Text("renpy.ast"),
+                        StackValue::Text("PyCode")
+                    ]
+                ))
+            || match op {
+                b'h' => scan
+                    .get(pos + 1)
+                    .and_then(|index| stack.memo.get(&usize::from(*index)))
+                    .is_some_and(|value| matches!(value, StackValue::RenpyPyCodeClass)),
+                b'j' => u32_le(scan, pos + 1)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .and_then(|index| stack.memo.get(&index))
+                    .is_some_and(|value| matches!(value, StackValue::RenpyPyCodeClass)),
+                _ => false,
+            };
+        match stage {
+            0 if pycode_global => {
+                stage = 1;
+                age = 0;
+            }
+            1 if matches!(op, 0x81 | 0x92) => stage = 2, // NEWOBJ / NEWOBJ_EX
+            1 if !matches!(op, b'q' | b'r' | 0x94 | b')') => stage = 0,
+            2 if op == b'(' => stage = 3, // state tuple MARK
+            2 if !matches!(op, b'q' | b'r' | 0x94) => stage = 0,
+            3 if op == b'K' && scan.get(pos + 1) == Some(&1) => stage = 4,
+            3 if op == b'J' && scan.get(pos + 1..pos + 5) == Some(&[1, 0, 0, 0]) => stage = 4,
+            4 => {
+                candidate = unicode_operand(op, scan, pos)
+                    .filter(|source| !source.is_empty() && source.len() <= MAX_SOURCE_BYTES);
+                stage = if candidate.is_some() { 5 } else { 0 };
+            }
+            5 if op == b'b' => {
+                if let Some(source) = candidate.take()
+                    && !out.iter().any(|existing| existing == source)
+                {
+                    out.push(source.to_owned());
+                    if out.len() >= MAX_SOURCE_COUNT {
+                        break;
+                    }
+                }
+                stage = 0;
+            }
+            _ => {}
+        }
+        apply_side_effects(
+            op,
+            pos,
+            scan,
+            &mut protocol,
+            &mut modules,
+            &mut globals,
+            &mut stack,
+        );
+        pos += width;
+        if op == b'.' {
+            break;
+        }
+    }
+    out
+}
+
 fn record_global(
     module: &str,
     attr: &str,
@@ -364,10 +469,15 @@ fn apply_side_effects<'a>(
             }
         }
         b'c' => {
-            if let Some((module, attr)) = inline_global(scan, i) {
+            let global = inline_global(scan, i);
+            if let Some((module, attr)) = global {
                 record_global(module, attr, modules, globals);
             }
-            stack.push(StackValue::Other);
+            stack.push(if global == Some(("renpy.ast", "PyCode")) {
+                StackValue::RenpyPyCodeClass
+            } else {
+                StackValue::Other
+            });
         }
         0x8C | b'X' | 0x8D | b'V' => {
             stack.push(
@@ -426,12 +536,20 @@ fn apply_side_effects<'a>(
         0x93 => {
             let attr = stack.pop();
             let module = stack.pop();
+            let pycode = matches!(
+                (module, attr),
+                (StackValue::Text("renpy.ast"), StackValue::Text("PyCode"))
+            );
             if let (StackValue::Text(module), StackValue::Text(attr)) = (module, attr)
                 && stack.admit_global(module, attr)
             {
                 record_global(module, attr, modules, globals);
             }
-            stack.push(StackValue::Other);
+            stack.push(if pycode {
+                StackValue::RenpyPyCodeClass
+            } else {
+                StackValue::Other
+            });
         }
         // Scalars, bytes, extension-registry results and out-of-band buffers.
         b'F' | b'I' | b'J' | b'K' | b'L' | b'M' | b'N' | b'S' | b'T' | b'U' | b'G' | b'B'

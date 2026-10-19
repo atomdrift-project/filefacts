@@ -819,6 +819,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "rpm.summary",
     "rpm.vendor",
     "rpm.version",
+    "rpyc",
     "rtf.charset",
     "rtf.codepage",
     "rtf.deflang",

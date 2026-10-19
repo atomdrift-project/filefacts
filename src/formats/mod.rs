@@ -173,6 +173,7 @@ pub(crate) mod references;
 mod registry;
 mod rpa;
 mod rpm;
+mod rpyc;
 mod rtf;
 mod rust_crate;
 mod scpt;
@@ -355,6 +356,7 @@ pub(crate) fn extract(
         FileType::Phar => phar::extract(bytes, ctx.values, ctx.metrics, ctx.archive_members),
         FileType::Cpio => cpio::extract(bytes, ctx.values, ctx.metrics, ctx.archive_members),
         FileType::Rpa => rpa::extract(bytes, ctx.values, ctx.metrics, ctx.archive_members),
+        FileType::Rpyc => rpyc::extract(bytes, ctx.values, ctx.metrics),
         // The OOXML-specific `office.*` layer, then macros decompressed from
         // any `vbaProject.bin` member so `office.vba.modules[]` is populated
         // for OOXML, mirroring the OleDoc arm. A macro-free doc leaves it

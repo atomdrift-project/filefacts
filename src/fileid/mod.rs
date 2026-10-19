@@ -404,6 +404,8 @@ file_types! {
         JavaClass => "java_class", Binary, BINARY;
         /// Python compiled bytecode (.pyc)
         PythonBytecode => "python_bytecode", Binary, BINARY;
+        /// Ren'Py compiled script (RPC2 slots holding pickled AST data)
+        Rpyc => "rpyc", Script, BINARY;
         /// Erlang/Elixir compiled BEAM bytecode (.beam; `FOR1`…`BEAM` IFF container)
         Beam => "beam", Binary, BINARY;
         /// WebAssembly binary module (.wasm; `\0asm` magic + version). A portable

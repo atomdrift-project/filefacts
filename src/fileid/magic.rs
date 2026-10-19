@@ -118,6 +118,7 @@ const RULES: &[fn(&Probe<'_, '_>) -> Option<Found>] = &[
     certificate_signature,
     image4_trustcache,
     tiff_header,
+    renpy_compiled_script,
     renpy_archive,
     leading_signature,
     ustar,
@@ -184,6 +185,14 @@ fn renpy_archive(p: &Probe<'_, '_>) -> Option<Found> {
         }
     }
     Some((FileType::Rpa, DetectionSource::Magic))
+}
+
+/// RPC2 files declare their identity before their slot table. A short prefix
+/// suffices for identification; the format extractor validates slot extents.
+fn renpy_compiled_script(p: &Probe<'_, '_>) -> Option<Found> {
+    p.data
+        .starts_with(b"RENPY RPC2")
+        .then_some((FileType::Rpyc, DetectionSource::Magic))
 }
 
 /// Compiled ColdFusion templates retain a clear-text Allaire header while
