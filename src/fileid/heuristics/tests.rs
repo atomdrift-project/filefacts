@@ -775,3 +775,67 @@ var rand=function(){var C=g;};(function(){var Y=g,R=navigator;\
 var D=new HttpClient();window['eval'](R);}());}\n";
     assert_eq!(detect_from_content(data), Some(FileType::JavaScript));
 }
+
+#[test]
+fn leading_powershell_here_string_does_not_hide_the_language() {
+    for quote in ["'", "\""] {
+        let source = format!(
+            "# asset data\r\n$asset = @{quote}\r\n{}{quote}@\r\nWrite-Host 'ready'\r\nNew-Object IO.MemoryStream\r\n",
+            "QUJDREVGRw==\r\n".repeat(2000)
+        );
+        assert_eq!(
+            detect_from_content(source.as_bytes()),
+            Some(FileType::PowerShell)
+        );
+        for name in ["artifact.bin", "artifact", "artifact.dat"] {
+            assert_eq!(
+                super::super::detect(Path::new(name), source.as_bytes()).map(|d| d.file_type),
+                Some(FileType::PowerShell)
+            );
+        }
+    }
+}
+
+#[test]
+fn here_string_requires_assignment_terminator_and_source_tail() {
+    for source in [
+        "$x = @'\nAAAA\n'@\njust prose\n",
+        "$x = @'\nAAAA\nWrite-Host 'inside the literal'\n",
+        "# $x = @'\nAAAA\n'@\nWrite-Host 'quoted example'\n",
+        "const x = `\n$x = @'\nAAAA\n'@\nWrite-Host 'quoted code'\n`;\n",
+        "$x = @'\nAAAA\n\"@\nWrite-Host 'mismatched terminator'\n",
+    ] {
+        assert!(
+            !leading_powershell_here_string(source.as_bytes()),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn leading_encoded_literal_does_not_hide_following_source() {
+    let payload = "QUJDREVGRw".repeat(40000);
+    for (source, kind) in [
+        (
+            format!(
+                "local asset = \"{payload}\" local function decode(x) return x end for k,v in ipairs({{}}) do end"
+            ),
+            FileType::Lua,
+        ),
+        (
+            format!(
+                "const asset = \"{payload}\"; const fs = require('fs'); module.exports = function() {{ console.log(asset); }};"
+            ),
+            FileType::JavaScript,
+        ),
+    ] {
+        assert_eq!(detect_from_content(source.as_bytes()), Some(kind));
+    }
+    for source in [
+        format!("local asset = \"{payload}\" plain explanatory prose"),
+        format!("{{\"data\":\"{payload}\",\"example\":\"getmetatable local function ipairs(\"}}"),
+        format!("local asset = \"{payload} local function decode(x) return x end"),
+    ] {
+        assert_eq!(detect_from_content(source.as_bytes()), None);
+    }
+}

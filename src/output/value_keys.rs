@@ -793,6 +793,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "registry.title",
     "registry.version",
     "root",
+    "rpa",
     "rpm.arch",
     "rpm.buildhost",
     "rpm.buildtime",

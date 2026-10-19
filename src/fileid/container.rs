@@ -49,6 +49,8 @@ pub enum ArchiveFormat {
     SevenZip,
     /// RAR container.
     Rar,
+    /// Ren'Py RPA container, with a compressed pickle index and stored members.
+    Rpa,
     /// Microsoft Cabinet container.
     Cab,
     /// Electron ASAR application archive.
@@ -72,6 +74,7 @@ impl ArchiveFormat {
             Self::Xar => "xar",
             Self::SevenZip => "7z",
             Self::Rar => "rar",
+            Self::Rpa => "rpa",
             Self::Cab => "cab",
             Self::Asar => "asar",
             Self::Iso9660 => "iso9660",
@@ -179,7 +182,7 @@ impl FileType {
     /// container format (ignoring compression) when none exists.
     #[must_use]
     pub const fn archive_format(self) -> Option<ArchiveFormat> {
-        use ArchiveFormat::{Ar, Asar, Cab, Iso9660, Rar, SevenZip, Tar, Xar, Zip};
+        use ArchiveFormat::{Ar, Asar, Cab, Iso9660, Rar, Rpa, SevenZip, Tar, Xar, Zip};
         Some(match self {
             // Tar containers: plain, the compressed `.tar.*` variants, and the
             // ecosystem packages that are a tar at heart (uncompressed gem /
@@ -218,6 +221,7 @@ impl FileType {
             Self::PkgMacos => Xar,
             Self::SevenZ => SevenZip,
             Self::Rar => Rar,
+            Self::Rpa => Rpa,
             Self::Cab => Cab,
             Self::Asar => Asar,
             Self::Iso => Iso9660,

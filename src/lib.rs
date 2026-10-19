@@ -138,6 +138,7 @@ pub(crate) use output::{metric, value_key};
 pub mod cache;
 pub mod cache_sweep;
 pub mod fileid;
+pub mod rpa;
 pub mod tools;
 
 /// Optional rizin/radare2 integration with hardened subprocess
@@ -149,8 +150,8 @@ pub mod tools;
 /// `tracing` telemetry (`stats`, `log_stats`).
 pub mod rizin;
 
-pub use formats::source::decode_source_escapes;
 pub use formats::source::go_package_payload_flow;
+pub use formats::source::{decode_source_escapes, decode_source_escapes_for_type};
 
 /// Additional reference metadata selected by filename, independently of the
 /// detected file type. Archive walkers must retain these even when detection

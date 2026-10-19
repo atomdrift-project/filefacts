@@ -32,6 +32,17 @@
 /// Windows path and regex in the corpus. Sharing one implementation would mean
 /// a mode flag whose only purpose is to switch between the two behaviours.
 pub(super) fn decode(s: &str) -> String {
+    decode_language(s, false)
+}
+
+/// Lua short strings use up to three decimal digits, including leading zeros.
+/// Keep this out of the shared decoder: Python/C octal and JavaScript escapes
+/// have different values. A doubled backslash remains literal in either mode.
+pub(super) fn decode_lua(s: &str) -> String {
+    decode_language(s, true)
+}
+
+fn decode_language(s: &str, lua: bool) -> String {
     if !s.contains('\\') {
         return s.to_string();
     }
@@ -47,6 +58,29 @@ pub(super) fn decode(s: &str) -> String {
             break;
         };
         match esc {
+            '0'..='9' if lua => {
+                let mut probe = chars.clone();
+                let mut number = esc.to_digit(10).unwrap_or(0);
+                for _ in 0..2 {
+                    let Some(digit) = probe.peek().and_then(|c| c.to_digit(10)) else {
+                        break;
+                    };
+                    number = number * 10 + digit;
+                    probe.next();
+                }
+                if let Ok(byte) = u8::try_from(number) {
+                    chars = probe;
+                    out.push(char::from(byte));
+                } else {
+                    out.push('\\');
+                    out.push(esc);
+                }
+            }
+            'z' if lua => {
+                while chars.peek().is_some_and(|c| c.is_ascii_whitespace()) {
+                    chars.next();
+                }
+            }
             'n' => out.push('\n'),
             'r' => out.push('\r'),
             't' => out.push('\t'),
@@ -190,7 +224,7 @@ fn decode_unicode_escape_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::decode;
+    use super::{decode, decode_lua};
 
     #[test]
     fn elixir_heredoc_requires_complete_delimiters_and_margin() {
@@ -246,5 +280,15 @@ mod tests {
     #[test]
     fn strings_without_backslashes_are_untouched() {
         assert_eq!(decode("plain text"), "plain text");
+    }
+    #[test]
+    fn lua_decimal_escapes_are_language_specific() {
+        assert_eq!(decode_lua(r"\102\102\105"), "ffi");
+        assert_eq!(decode_lua(r"\065\066\067"), "ABC");
+        assert_eq!(decode_lua(r"\0\09\1234\255"), "\0\t{4ÿ");
+        assert_eq!(decode_lua(r"\\102"), r"\102");
+        assert_eq!(decode_lua(r"\999"), r"\999");
+        assert_eq!(decode_lua("a\\z \n\tb"), "ab");
+        assert_eq!(decode(r"\102"), r"\102");
     }
 }

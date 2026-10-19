@@ -118,6 +118,7 @@ const RULES: &[fn(&Probe<'_, '_>) -> Option<Found>] = &[
     certificate_signature,
     image4_trustcache,
     tiff_header,
+    renpy_archive,
     leading_signature,
     ustar,
     python_bytecode,
@@ -145,6 +146,44 @@ pub(super) fn detect_from_sniff(sniff: &Sniff<'_>) -> Option<Found> {
         head: data.trim_ascii_start(),
     };
     RULES.iter().find_map(|rule| rule(&probe))
+}
+
+/// RPA v2/v3 puts a zlib-compressed pickle index at the offset named in this
+/// fixed-width header. Identifying the container needs no pickle decoding.
+/// Accept a header-only prefix because file identification can receive less
+/// than the whole archive; check the zlib header when the index is available.
+fn renpy_archive(p: &Probe<'_, '_>) -> Option<Found> {
+    let (header_len, offset_bytes) = if p.data.starts_with(b"RPA-3.0 ") {
+        let header = p.data.get(..34)?;
+        if header.get(24) != Some(&b' ')
+            || header.get(33) != Some(&b'\n')
+            || !header.get(25..33)?.iter().all(|b| b.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        (34, header.get(8..24)?)
+    } else if p.data.starts_with(b"RPA-2.0 ") {
+        let header = p.data.get(..25)?;
+        if header.get(24) != Some(&b'\n') {
+            return None;
+        }
+        (25, header.get(8..24)?)
+    } else {
+        return None;
+    };
+    if !offset_bytes.iter().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let offset = usize::from_str_radix(std::str::from_utf8(offset_bytes).ok()?, 16).ok()?;
+    if offset < header_len {
+        return None;
+    }
+    if let Some(&[cmf, flg]) = p.data.get(offset..offset.checked_add(2)?) {
+        if cmf & 0x0f != 8 || cmf >> 4 > 7 || u16::from_be_bytes([cmf, flg]) % 31 != 0 {
+            return None;
+        }
+    }
+    Some((FileType::Rpa, DetectionSource::Magic))
 }
 
 /// Compiled ColdFusion templates retain a clear-text Allaire header while

@@ -560,6 +560,7 @@ fn detect_from_extension(path: &Path) -> Option<FileType> {
         "whl" => Some(FileType::Whl),
         "7z" | "cb7" => Some(FileType::SevenZ),
         "rar" | "cbr" => Some(FileType::Rar),
+        "rpa" => Some(FileType::Rpa),
         "deb" | "udeb" => Some(FileType::Deb),
         // Static library: an `ar` archive of object files. Magic-based
         // detection also handles extensionless `.a`; this keeps the extension

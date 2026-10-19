@@ -500,6 +500,63 @@ fn scan_scores(data: &[u8]) -> [u16; LANG_COUNT] {
     scores
 }
 
+/// Recognize a leading PowerShell here-string assignment even when a large
+/// literal hides all command tokens from the usual 4 KiB scoring window.
+/// Only blank/comment lines may precede it; require the matching terminator
+/// and conclusive PowerShell evidence in the following bounded source window.
+fn leading_powershell_here_string(data: &[u8]) -> bool {
+    let head = data.get(..SCAN_LIMIT).unwrap_or(data);
+    let mut offset = 0;
+    for line in head.split_inclusive(|&b| b == b'\n') {
+        offset += line.len();
+        let line = line.trim_ascii();
+        if line.is_empty() || line.starts_with(b"#") {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix(b"$") else {
+            return false;
+        };
+        let name_len = rest
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+            .count();
+        if name_len == 0 || rest.first().is_some_and(u8::is_ascii_digit) {
+            return false;
+        }
+        let Some(value) = rest
+            .get(name_len..)
+            .unwrap_or_default()
+            .trim_ascii_start()
+            .strip_prefix(b"=")
+        else {
+            return false;
+        };
+        let value = value.trim_ascii();
+        if !matches!(value, b"@'" | b"@\"") {
+            return false;
+        }
+        let Some(&quote) = value.get(1) else {
+            return false;
+        };
+        let body = data
+            .get(offset..data.len().min(32 * 1024 * 1024))
+            .unwrap_or_default();
+        let mut consumed = offset;
+        for literal_line in body.split_inclusive(|&b| b == b'\n') {
+            consumed += literal_line.len();
+            // PowerShell closing delimiters begin in column zero.
+            if literal_line.trim_ascii_end() == [quote, b'@'] {
+                let after = data
+                    .get(consumed..data.len().min(consumed + SCAN_LIMIT))
+                    .unwrap_or_default();
+                return Lang::PowerShell.score(&scan_scores(after)) >= THRESHOLD;
+            }
+        }
+        return false;
+    }
+    false
+}
+
 /// Try to identify a file type from content patterns.
 /// Called after magic detection when the filename does not provide a strong content type.
 ///
@@ -570,6 +627,10 @@ pub(super) fn detect_from_decoded(data: &[u8], decoded: Option<&[u8]>) -> Option
         return None;
     }
 
+    if leading_powershell_here_string(body) {
+        return Some(FileType::PowerShell);
+    }
+
     // Natural-language prose is never one of the scored languages either, but
     // it does quote their keywords: a novel has `const`, `let `, `var ` and
     // `new ` in every chapter, and 1 MB of it typed as JavaScript sends
@@ -616,6 +677,25 @@ pub(super) fn detect_from_decoded(data: &[u8], decoded: Option<&[u8]>) -> Option
             }
         } else {
             scores
+        }
+    } else {
+        scores
+    };
+
+    // A long leading string assignment can cover both prefix windows. Read
+    // the following source after its lexical closing quote, then use the same
+    // language scorer; never infer a language from encoded payload contents.
+    let scores = if scores.iter().copied().max().unwrap_or(0) < SETTLED_HEAD_SCORE {
+        match after_leading_string_assignment(body) {
+            Some(tail) if tail.len() >= MIN_CONTENT_BYTES => {
+                let candidate = scan_scores(tail.get(..SCAN_LIMIT).unwrap_or(tail));
+                if candidate.iter().copied().max().unwrap_or(0) >= THRESHOLD {
+                    candidate
+                } else {
+                    scores
+                }
+            }
+            _ => scores,
         }
     } else {
         scores
@@ -692,7 +772,9 @@ pub(super) fn detect_from_decoded(data: &[u8], decoded: Option<&[u8]>) -> Option
         let structured = has_structure(data.get(..SCAN_LIMIT).unwrap_or(data))
             || (is_mostly_whitespace(data, SCAN_LIMIT)
                 && data.len() > SCAN_LIMIT
-                && tail.is_some_and(has_structure));
+                && tail.is_some_and(has_structure))
+            || after_leading_string_assignment(data)
+                .is_some_and(|tail| has_structure(tail.get(..SCAN_LIMIT).unwrap_or(tail)));
         if !structured {
             return None;
         }
@@ -810,6 +892,46 @@ const CODE_PUNCT_MASK: u128 = {
     }
     mask
 };
+
+/// Return the source following a long, leading quoted assignment. The prefix
+/// must be an identifier assignment, optionally introduced by a declaration.
+/// Work is bounded and escaped quotes are skipped without decoding the string.
+fn after_leading_string_assignment(body: &[u8]) -> Option<&[u8]> {
+    let quote = body
+        .iter()
+        .take(256)
+        .position(|b| matches!(b, b'\'' | b'"'))?;
+    let prefix = std::str::from_utf8(body.get(..quote)?).ok()?.trim();
+    let prefix = prefix.strip_suffix('=')?.trim_end();
+    let fields: Vec<&str> = prefix.split_whitespace().collect();
+    let name = match fields.as_slice() {
+        [name] => *name,
+        ["local" | "const" | "let" | "var", name] => *name,
+        _ => return None,
+    };
+    if !name
+        .bytes()
+        .enumerate()
+        .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()))
+        || name.is_empty()
+    {
+        return None;
+    }
+    let delimiter = *body.get(quote)?;
+    let mut cursor = quote + 1;
+    while cursor < body.len().min(DECODE_LIMIT) {
+        match *body.get(cursor)? {
+            b'\\' => cursor += 2,
+            b if b == delimiter => {
+                return (cursor > SCAN_LIMIT * 2)
+                    .then(|| body.get(cursor + 1..))
+                    .flatten();
+            }
+            _ => cursor += 1,
+        }
+    }
+    None
+}
 
 /// `true` when the window carries enough control bytes that it cannot be one
 /// of the scored languages.

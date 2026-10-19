@@ -32,6 +32,17 @@ mod rust_syntax;
 pub fn decode_source_escapes(literal: &str) -> String {
     escapes::decode(literal)
 }
+
+/// Decode a parsed short-string body with the source language's escape rules.
+/// Consumers rebuilding literal corpora must use the same language as the
+/// producer; notably Lua decimal byte escapes differ from C/Python forms.
+pub fn decode_source_escapes_for_type(literal: &str, file_type: crate::FileType) -> String {
+    if file_type == crate::FileType::Lua {
+        escapes::decode_lua(literal)
+    } else {
+        escapes::decode(literal)
+    }
+}
 mod function_metrics;
 mod identifier_metrics;
 mod import_metrics;
@@ -264,6 +275,11 @@ pub(super) fn extract(
     if config.lang == Lang::Rust {
         imports.items = rust_syntax::imports(root, source);
     }
+    if config.lang == Lang::Lua {
+        for (name, _) in &mut imports.items {
+            *name = escapes::decode_lua(name);
+        }
+    }
     let functions = config
         .query(QueryKind::Functions)
         .map(|query| collect_query(query, source, root))
@@ -475,7 +491,11 @@ fn decode_string_literal(
     if raw_literal {
         return Some(body.to_string());
     }
-    Some(escapes::decode(body))
+    Some(if config.lang == Lang::Lua {
+        escapes::decode_lua(body)
+    } else {
+        escapes::decode(body)
+    })
 }
 
 /// Source text of a string-kind node that has no opening quote at all, which

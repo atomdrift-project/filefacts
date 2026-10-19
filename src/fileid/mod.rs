@@ -544,6 +544,8 @@ file_types! {
         SevenZ => "7z", Archive;
         /// RAR archive (.rar)
         Rar => "rar", Archive;
+        /// Ren'Py archive (.rpa), with an RPA-2.0 or RPA-3.0 index header.
+        Rpa => "rpa", Archive;
         /// Debian package (.deb)
         Deb => "deb", Archive;
         /// Unix static library (.a) — an `ar` archive of relocatable object files.
@@ -798,7 +800,7 @@ impl FileType {
     /// This is narrower than the `"archive"` group: Flatpak bundles group as
     /// archives for extension-mismatch purposes but stay opaque, because no
     /// walker reads their OSTree delta framing yet. Windows Installer packages
-    /// group there too, and are read as OLE2 storage rather than walked.
+    /// group here too, and are read as OLE2 storage rather than walked.
     #[must_use]
     pub fn is_archive(&self) -> bool {
         self.group() == Group::Archive && !matches!(self, Self::Flatpak | Self::Msi)
@@ -1052,7 +1054,8 @@ fn allows_heuristic_extension_override(file_type: FileType) -> bool {
         // `favicon.ico` is that nothing looks inside. When the sniffer
         // recognises real source in there, the source wins and
         // `extension_mismatch` records the lie.
-        FileType::Font
+        FileType::Data
+            | FileType::Font
             // A signatureless image extension cannot establish that the
             // bytes are an image. Let strong source-language heuristics win;
             // real JPEG/PNG magic has already returned in stage 1.
@@ -1107,7 +1110,8 @@ fn allows_heuristic_extension_override(file_type: FileType) -> bool {
 fn mark_replaces(file_type: FileType) -> bool {
     matches!(
         file_type,
-        FileType::Text
+        FileType::Data
+            | FileType::Text
             | FileType::Html
             // An `.a` that reaches here has no `!<arch>` magic, so it claims
             // nothing a mark could contradict.

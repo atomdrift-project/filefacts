@@ -918,3 +918,26 @@ fn long_chains_resolve_in_linear_time() {
     assert_eq!(metrics.get("ast.depth_capped"), Some(1.0));
     assert_eq!(metrics.get("ast.max_member_depth"), Some(451.0));
 }
+
+#[test]
+fn lua_decimal_literals_imports_and_arguments_agree() {
+    let src = br#"local ffi = require("\102\102\105")
+ffi.load("\097\109\115\105")
+"#;
+    let parsed = crate::OpenOptions::new()
+        .path(std::path::Path::new("loader.lua"))
+        .open(src);
+    let literals: Vec<&str> = parsed.literals().iter().map(|l| l.value.as_str()).collect();
+    assert!(literals.contains(&"ffi"));
+    assert!(literals.contains(&"amsi"));
+    assert!(
+        parsed
+            .symbols()
+            .iter_kind(crate::SymbolKind::Import)
+            .any(|s| { matches!(s, crate::Symbol::Import { name, .. } if name == "ffi") })
+    );
+    assert!(parsed.symbols().iter_kind(crate::SymbolKind::Call).any(|s| {
+        matches!(s, crate::Symbol::Call { target: Some(t), args, .. }
+            if t == "ffi.load" && args.iter().any(|a| matches!(a, crate::Arg::String { value } if value == "amsi")))
+    }));
+}
