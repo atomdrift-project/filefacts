@@ -80,8 +80,19 @@ pub(super) fn extract(
                 };
                 pos += usize::from(u16::from_be_bytes(len));
                 while let Some(&[b0, b1]) = pair(pos) {
-                    if b0 == 0xFF && b1 != 0x00 && b1 != 0xFF {
-                        break;
+                    if b0 == 0xFF {
+                        match b1 {
+                            // Stuffed bytes and restart markers remain inside
+                            // the entropy-coded scan. Returning to segment
+                            // parsing at a restart loses that context and can
+                            // misread a later FF 00 as a segment header.
+                            0x00 | 0xD0..=0xD7 => {
+                                pos += 2;
+                                continue;
+                            }
+                            0xFF => {}
+                            _ => break,
+                        }
                     }
                     pos += 1;
                 }
@@ -696,6 +707,42 @@ mod tests {
         jpeg.extend_from_slice(b"hidden payload");
         let (_, m) = run(&jpeg);
         assert_eq!(m.get("jpeg.trailing_bytes"), Some(14.0));
+    }
+
+    #[test]
+    fn restart_markers_keep_stuffed_bytes_inside_the_scan() {
+        for restart in 0xD0..=0xD7 {
+            let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xDA, 0, 8, 1, 1, 0, 0, 63, 0];
+            jpeg.extend_from_slice(&[
+                0x11, 0xFF, restart, 0x22, 0xFF, 0x00, 0xD9, 0x33, 0xFF, 0xD9,
+            ]);
+            jpeg.extend_from_slice(b"appended bytes");
+            let (_, m) = run(&jpeg);
+            assert_eq!(m.get("jpeg.trailing_bytes"), Some(14.0));
+        }
+    }
+
+    #[test]
+    fn restarted_scan_without_eoi_does_not_invent_a_trailer() {
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xDA, 0, 8, 1, 1, 0, 0, 63, 0, 0x11, 0xFF, 0xD3, 0x22, 0xFF, 0x00,
+            0xD9, 0x33,
+        ];
+        let (_, m) = run(&jpeg);
+        assert_eq!(m.get("jpeg.trailing_bytes"), Some(0.0));
+    }
+
+    #[test]
+    fn restarted_scan_can_continue_into_another_scan() {
+        let mut jpeg = vec![0xFF, 0xD8];
+        for restart in [0xD0, 0xD7] {
+            jpeg.extend_from_slice(&[0xFF, 0xDA, 0, 8, 1, 1, 0, 0, 63, 0]);
+            jpeg.extend_from_slice(&[0x11, 0xFF, restart, 0xFF, 0x00, 0x22]);
+        }
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+        let (_, m) = run(&jpeg);
+        assert_eq!(m.get("jpeg.trailing_bytes"), Some(0.0));
+        assert_eq!(m.get("jpeg.segment_count"), Some(3.0));
     }
 
     #[test]
