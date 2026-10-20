@@ -1750,12 +1750,15 @@ pub(crate) fn looks_like_fat_boot_sector(data: &[u8]) -> bool {
 
 /// A headerless binary with no telling name that is still shaped like a DOS
 /// COM program. A single `CD 21` is too common in arbitrary binary metadata,
-/// so unnamed files need an adjacent DOS service selector or a complete
-/// overwriter shape before we assign an executable type.
+/// so unnamed files need a DOS service selector (adjacent or established by
+/// bounded entry-point decoding), or a complete overwriter shape.
 pub(crate) fn looks_like_unnamed_dos_com(data: &[u8]) -> bool {
     data.len() >= 16
         && data.len() <= DOS_COM_MAX_SIZE
-        && ((binary_not_source(data) && has_dos_service_call(data))
+        && ((binary_not_source(data)
+            && (has_dos_service_call(data)
+                || has_entry_dos_service_call(data)
+                || has_dos_vector_relocation(data)))
             || looks_like_dos_com_overwriter(data))
 }
 
@@ -1772,6 +1775,184 @@ fn looks_like_dos_com_overwriter(data: &[u8]) -> bool {
     dos_calls >= 2
         && prefix.windows(2).any(|w| w == [0xCD, 0x20])
         && contains_ci(prefix, b"*.com\0")
+}
+
+/// Follow a bounded 16-bit entry path rather than searching for unrelated
+/// selector/interrupt bytes. Track AH across argument setup and segment prefixes;
+/// invalidate it on writes, other interrupts and the continuation of a call.
+fn has_entry_dos_service_call(data: &[u8]) -> bool {
+    use iced_x86::{
+        Decoder, DecoderOptions, FlowControl, InstructionInfoFactory, Mnemonic, OpAccess, OpKind,
+        Register,
+    };
+    use std::collections::{HashSet, VecDeque};
+
+    let prefix = data.get(..512).unwrap_or(data);
+    let mut pending = VecDeque::from([(0usize, None::<u8>, 0u8)]);
+    let mut seen = HashSet::new();
+    let mut info = InstructionInfoFactory::new();
+    for _ in 0..256 {
+        let Some((pc, mut ah, age)) = pending.pop_front() else {
+            break;
+        };
+        if pc >= prefix.len() || !seen.insert((pc, ah, age.min(16))) {
+            continue;
+        }
+        if age >= 16 {
+            ah = None;
+        }
+        let Some(code) = prefix.get(pc..) else {
+            continue;
+        };
+        let mut decoder = Decoder::with_ip(16, code, pc as u64 + 0x100, DecoderOptions::NONE);
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            continue;
+        }
+        let next = pc + instruction.len();
+        if instruction.mnemonic() == Mnemonic::Int {
+            if instruction.immediate8() == 0x21 && ah.is_some_and(|n| (1..=0x6c).contains(&n)) {
+                return true;
+            }
+            pending.push_back((next, None, 0));
+            continue;
+        }
+        let mut selected = None;
+        if instruction.mnemonic() == Mnemonic::Mov && instruction.op0_kind() == OpKind::Register {
+            let immediate = instruction.try_immediate(1).ok();
+            selected = match instruction.op0_register() {
+                Register::AH => immediate.map(|n| n.to_le_bytes()[0]),
+                Register::AX => immediate.map(|n| n.to_le_bytes()[1]),
+                _ => None,
+            };
+        }
+        for used in info.info(&instruction).used_registers() {
+            if matches!(
+                used.register(),
+                Register::AH | Register::AX | Register::EAX | Register::RAX
+            ) && matches!(
+                used.access(),
+                OpAccess::Write
+                    | OpAccess::CondWrite
+                    | OpAccess::ReadWrite
+                    | OpAccess::ReadCondWrite
+            ) {
+                ah = None;
+            }
+        }
+        let next_age = if let Some(value) = selected {
+            ah = Some(value);
+            0
+        } else {
+            age.saturating_add(1)
+        };
+        let target = || {
+            usize::try_from(instruction.near_branch_target())
+                .ok()
+                .and_then(|n| n.checked_sub(0x100))
+                .filter(|n| *n < prefix.len())
+        };
+        match instruction.flow_control() {
+            FlowControl::Next => pending.push_back((next, ah, next_age)),
+            FlowControl::ConditionalBranch => {
+                pending.push_back((next, ah, next_age));
+                if let Some(to) = target() {
+                    pending.push_back((to, ah, next_age));
+                }
+            }
+            FlowControl::UnconditionalBranch => {
+                if let Some(to) = target() {
+                    pending.push_back((to, ah, next_age));
+                }
+            }
+            FlowControl::Call => {
+                if let Some(to) = target() {
+                    pending.push_back((to, ah, next_age));
+                }
+                pending.push_back((next, None, 0));
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// A real-mode relocation prologue that swaps the INT 21h vector directly.
+/// The copy length plus BX must address IVT offset 0x84; paired XCHG/STOSW
+/// operations replace its offset/segment and save the old far address.
+/// This identifies the container, not whether the installed handler works.
+/// In particular, padded or damaged COM bodies may retain this prologue.
+fn has_dos_vector_relocation(data: &[u8]) -> bool {
+    use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
+    if !data.starts_with(&[0xfa, 0xaf, 0x60]) {
+        return false;
+    }
+    let instructions: Vec<_> =
+        Decoder::new(16, data.get(..128).unwrap_or(data), DecoderOptions::NONE)
+            .into_iter()
+            .take(48)
+            .filter(|i| i.mnemonic() != Mnemonic::Nop)
+            .collect();
+    let Some(i) = instructions.first_chunk::<16>() else {
+        return false;
+    };
+    let immediate = |ins: &Instruction, reg| {
+        (ins.mnemonic() == Mnemonic::Mov
+            && ins.op0_kind() == OpKind::Register
+            && ins.op0_register() == reg
+            && ins.op1_kind() == OpKind::Immediate8)
+            .then(|| ins.immediate8())
+    };
+    let registers = |ins: &Instruction, mnemonic, left, right| {
+        ins.mnemonic() == mnemonic
+            && ins.op0_kind() == OpKind::Register
+            && ins.op1_kind() == OpKind::Register
+            && ins.op0_register() == left
+            && ins.op1_register() == right
+    };
+    let swap = |ins: &Instruction| {
+        ins.mnemonic() == Mnemonic::Xchg
+            && ins.op0_kind() == OpKind::Memory
+            && ins.op1_kind() == OpKind::Register
+            && ins.op1_register() == Register::AX
+            && ins.memory_base() == Register::BX
+            && ins.memory_index() == Register::DI
+            && ins.memory_displacement64() == 0
+            && ins.segment_prefix() == Register::None
+    };
+    let (Some(segment), Some(vector_base), Some(length)) = (
+        immediate(&i[3], Register::AL),
+        immediate(&i[4], Register::BL),
+        immediate(&i[6], Register::CL),
+    ) else {
+        return false;
+    };
+    if segment == 0
+        || segment > 0x40
+        || length < 16
+        || usize::from(length) > data.len()
+        || u16::from(vector_base) + u16::from(length) != 0x84
+    {
+        return false;
+    }
+    registers(&i[5], Mnemonic::Mov, Register::ES, Register::AX)
+        && i[7].mnemonic() == Mnemonic::Movsb
+        && i[7].has_rep_prefix()
+        && i[8].mnemonic() == Mnemonic::Pop
+        && i[8].op0_register() == Register::DS
+        && swap(&i[9])
+        && i[10].mnemonic() == Mnemonic::Cmp
+        && i[10].op0_register() == Register::AL
+        && i[11].mnemonic() == Mnemonic::Je
+        && i[12].mnemonic() == Mnemonic::Stosw
+        && registers(&i[13], Mnemonic::Mov, Register::AX, Register::ES)
+        && swap(&i[14])
+        && i[15].mnemonic() == Mnemonic::Stosw
+        && data
+            .get(..512)
+            .unwrap_or(data)
+            .windows(2)
+            .any(|w| w == [0xcd, 0x21])
 }
 
 fn has_dos_service_call(data: &[u8]) -> bool {

@@ -562,6 +562,8 @@ file_types! {
         PkgMacos => "pkg_macos", Archive;
         /// Apple Disk Image (.dmg, UDIF container).
         Dmg => "dmg", Archive;
+        /// Virtual Hard Disk, fixed or sparse, with a validated footer.
+        Vhd => "vhd", Archive;
         /// Optical-disc image (.iso): ISO 9660 and/or UDF filesystem — full OS
         /// install media. Identified by the volume-descriptor magic at sector 16;
         /// unpacked downstream by 7-Zip (ISO 9660, Joliet, Rock Ridge, and UDF).

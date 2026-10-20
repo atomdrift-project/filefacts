@@ -114,6 +114,7 @@ const RULES: &[fn(&Probe<'_, '_>) -> Option<Found>] = &[
     android_binary_xml,
     html_document,
     udif_dmg,
+    vhd_image,
     iso_image,
     certificate_signature,
     image4_trustcache,
@@ -1208,6 +1209,46 @@ fn looks_like_ascii_cpio(data: &[u8]) -> bool {
             _ => b.is_ascii_hexdigit(),
         })
     })
+}
+
+// Legacy VHD v1 footer; this does not identify the different VHDX format.
+// https://www.microsoft.com/en-us/download/details.aspx?id=23850
+fn vhd_image(p: &Probe<'_, '_>) -> Option<Found> {
+    let footer = p.data.last_chunk::<512>()?;
+    if &footer[..8] != b"conectix" || bytes::u32_be(footer, 12) != Some(0x0001_0000) {
+        return None;
+    }
+    let checksum = !footer
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !(64..68).contains(i))
+        .map(|(_, b)| u32::from(*b))
+        .sum::<u32>();
+    if bytes::u32_be(footer, 64) != Some(checksum) {
+        return None;
+    }
+    let size = bytes::u64_be(footer, 48)?;
+    if size == 0 || size % 512 != 0 {
+        return None;
+    }
+    match bytes::u32_be(footer, 60)? {
+        2 => {
+            if bytes::u64_be(footer, 16) != Some(u64::MAX)
+                || size.checked_add(512)? != p.data.len() as u64
+            {
+                return None;
+            }
+        }
+        3 | 4 => {
+            let offset = usize::try_from(bytes::u64_be(footer, 16)?).ok()?;
+            let header = p.data.get(offset..offset.checked_add(1024)?)?;
+            if !header.starts_with(b"cxsparse") || bytes::u32_be(header, 24) != Some(0x0001_0000) {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some((FileType::Vhd, DetectionSource::Magic))
 }
 
 fn looks_like_udif_dmg(data: &[u8]) -> bool {

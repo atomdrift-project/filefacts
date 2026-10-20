@@ -2628,3 +2628,95 @@ fn apple_plist_xml_and_strings_names_agree_with_native_serializations() {
             .extension_mismatch()
     );
 }
+
+#[test]
+fn dos_com_entry_tracks_service_across_argument_setup() {
+    for code in [
+        &b"\xb4\x4c\xb0\x00\xcd\x21"[..],
+        &b"\xb4\x4e\xb9\x07\x00\xba\x20\x01\x2e\xcd\x21"[..],
+        &b"\xb8\x02\x3d\xba\x9e\x00\xcd\x21"[..],
+        &b"\xb4\x4e\xe8\x03\x00\xc3\x90\x90\xb9\x08\x00\x90\xcd\x21\xc3"[..],
+    ] {
+        let mut bytes = code.to_vec();
+        bytes.resize(64, 0);
+        assert_detect("opaque.sample", &bytes, FileType::DosCom);
+    }
+}
+
+#[test]
+fn dos_com_entry_rejects_stale_or_unreachable_selectors() {
+    for code in [
+        &b"\xb4\x4e\x31\xc0\xba\x20\x01\xcd\x21"[..],
+        &b"\xb4\x4e\xc3\xba\x20\x01\xcd\x21"[..],
+        &b"\xb4\x4e\xeb\x06\xba\x20\x01\xcd\x21\x90\xc3"[..],
+        &b"\xb0\x4e\xba\x20\x01\xcd\x21"[..],
+    ] {
+        let mut bytes = code.to_vec();
+        bytes.resize(64, 0);
+        assert!(
+            detect(Path::new("opaque.sample"), &bytes)
+                .is_none_or(|d| d.file_type != FileType::DosCom)
+        );
+    }
+}
+
+#[test]
+fn vhd_footer_recognition_is_structural() {
+    fn footer(data: &mut [u8], kind: u32, size: u64) {
+        let n = data.len();
+        let f = &mut data[n - 512..];
+        f[..8].copy_from_slice(b"conectix");
+        f[12..16].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+        f[16..24].copy_from_slice(&(if kind == 2 { u64::MAX } else { 512 }).to_be_bytes());
+        f[48..56].copy_from_slice(&size.to_be_bytes());
+        f[60..64].copy_from_slice(&kind.to_be_bytes());
+        f[64..68].fill(0);
+        let sum = !f.iter().map(|b| u32::from(*b)).sum::<u32>();
+        f[64..68].copy_from_slice(&sum.to_be_bytes());
+    }
+    let mut fixed = vec![0u8; 1024];
+    footer(&mut fixed, 2, 512);
+    assert_detect("opaque", &fixed, FileType::Vhd);
+    let mut sparse = vec![0u8; 2048];
+    sparse[512..520].copy_from_slice(b"cxsparse");
+    sparse[536..540].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    footer(&mut sparse, 3, 4096);
+    assert_detect("opaque.bin", &sparse, FileType::Vhd);
+    for at in [0usize, 64, 100] {
+        let mut broken = fixed.clone();
+        broken[512 + at] ^= 1;
+        assert!(detect(Path::new("opaque"), &broken).is_none_or(|d| d.file_type != FileType::Vhd));
+    }
+    footer(&mut fixed, 2, 4096);
+    assert!(detect(Path::new("opaque"), &fixed).is_none_or(|d| d.file_type != FileType::Vhd));
+    sparse[512] ^= 1;
+    assert!(detect(Path::new("opaque"), &sparse).is_none_or(|d| d.file_type != FileType::Vhd));
+}
+
+#[test]
+fn dos_direct_vector_relocation_without_ah_selector() {
+    // A harmless synthetic instruction profile: relocate 64 bytes, then
+    // address IVT 0x84 as BX=0x44 plus DI=0x40. The handler is not executed.
+    let mut code = vec![
+        0xfa, 0xaf, 0x60, 0xb0, 0x20, 0xb3, 0x44, 0x8e, 0xc0, 0xb1, 0x40, 0xf3, 0xa4, 0x1f, 0x87,
+        0x01, 0x3c, 0x20, 0x74, 0x06, 0xab, 0x8c, 0xc0, 0x87, 0x01, 0xab, 0xcd, 0x21,
+    ];
+    code.resize(64, 0x90);
+    assert_detect("opaque", &code, FileType::DosCom);
+    let mut padded = code.clone();
+    padded.splice(11..11, [0x90, 0x90]);
+    assert_detect("opaque.d", &padded, FileType::DosCom);
+    for at in [6usize, 14, 23, 25] {
+        let mut broken = code.clone();
+        broken[at] ^= 1;
+        assert!(
+            detect(Path::new("opaque"), &broken).is_none_or(|d| d.file_type != FileType::DosCom),
+            "mutation at {at}"
+        );
+    }
+    let mut unreachable = vec![0xc3];
+    unreachable.extend_from_slice(&code);
+    assert!(
+        detect(Path::new("opaque"), &unreachable).is_none_or(|d| d.file_type != FileType::DosCom)
+    );
+}
