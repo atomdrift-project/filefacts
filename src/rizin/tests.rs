@@ -1,6 +1,40 @@
 use super::*;
 use crate::output::Metrics;
 
+#[test]
+fn rizin_gate_caps_live_children_and_releases_on_unwind() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let gate = RizinGate {
+        limit: 2,
+        active: Mutex::new(0),
+        changed: Condvar::new(),
+    };
+    let live = AtomicUsize::new(0);
+    let peak = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..12 {
+            let gate = &gate;
+            let live = &live;
+            let peak = &peak;
+            scope.spawn(move || {
+                let _permit = gate.acquire();
+                let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(5));
+                live.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    });
+    assert_eq!(peak.load(Ordering::SeqCst), 2);
+    assert_eq!(*gate.active.lock().unwrap(), 0);
+    let _ = std::panic::catch_unwind(|| {
+        let _permit = gate.acquire();
+        panic!("release a permit on unwind");
+    });
+    assert_eq!(*gate.active.lock().unwrap(), 0);
+}
+
 /// Tests that spawn rizin (or a shim) or reap process groups must hold
 /// this mutex for the duration of their run: `RIZIN_PGIDS` is
 /// process-wide, and without the lock the reaper test SIGKILLs shims
@@ -882,6 +916,7 @@ fn output_cap_kills_the_group_from_the_supervisor_and_keeps_the_prefix() {
         Command::new(dir.join("rizin")),
         Duration::from_secs(30),
         64 * 1024,
+        ChildSetup::Native,
     );
     let RunOutcome::Exited {
         status,
@@ -1533,4 +1568,266 @@ fn timed_out_shim_retries_and_recovers_but_crash_does_not_retry() {
     assert!(!result.timed_out);
     let _ = std::fs::remove_dir_all(dir);
     let _ = std::fs::remove_dir_all(crash);
+}
+
+#[cfg(target_os = "linux")]
+fn launch_probe_command(wait: bool, setup: ChildSetup) -> Command {
+    let exe = std::env::current_exe().unwrap();
+    let mut cmd = match setup {
+        ChildSetup::Native => Command::new(&exe),
+        ChildSetup::ExternalLinux => linux_launcher().unwrap().command(&exe).unwrap(),
+    };
+    cmd.args([
+        "--exact",
+        if wait {
+            "rizin::tests::linux_waiting_child_probe"
+        } else {
+            "rizin::tests::linux_child_limits_probe"
+        },
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    cmd
+}
+
+#[test]
+#[ignore = "subprocess fixture for Linux launch tests"]
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn linux_child_limits_probe() {
+    let mut a = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let mut d = a;
+    let mut signal: libc::c_int = 0;
+    // SAFETY: live writable storage for these resource/signal queries.
+    let (pid, parent, group) = unsafe {
+        assert_eq!(libc::getrlimit(libc::RLIMIT_AS, &raw mut a), 0);
+        assert_eq!(libc::getrlimit(libc::RLIMIT_DATA, &raw mut d), 0);
+        assert_eq!(libc::prctl(libc::PR_GET_PDEATHSIG, &raw mut signal), 0);
+        (libc::getpid(), libc::getppid(), libc::getpgrp())
+    };
+    println!(
+        "FILEFACTS_LIMITS {pid} {parent} {group} {signal} {} {} {} {}",
+        a.rlim_cur, a.rlim_max, d.rlim_cur, d.rlim_max
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn linux_launch_modes_keep_limits_and_parent_death_signal() {
+    let _lock = rizin_test_lock();
+    let mut setups = vec![ChildSetup::Native];
+    if linux_launcher().is_some() {
+        setups.push(ChildSetup::ExternalLinux);
+    }
+    let limited = |resource| {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: live writable rlimit storage, for a supported resource.
+        assert_eq!(unsafe { libc::getrlimit(resource, &raw mut lim) }, 0);
+        [
+            lim.rlim_cur.min(RIZIN_MEMORY_LIMIT_BYTES),
+            lim.rlim_max.min(RIZIN_MEMORY_LIMIT_BYTES),
+        ]
+    };
+    let expected = [limited(libc::RLIMIT_AS), limited(libc::RLIMIT_DATA)].concat();
+    for setup in setups {
+        let result = run_hardened(
+            launch_probe_command(false, setup),
+            Duration::from_secs(10),
+            64 * 1024,
+            setup,
+        );
+        let RunOutcome::Exited {
+            status,
+            stdout,
+            cap_hit: false,
+        } = result
+        else {
+            panic!("probe did not exit");
+        };
+        assert!(status.success(), "{}", String::from_utf8_lossy(&stdout));
+        let output = String::from_utf8(stdout).unwrap();
+        let values: Vec<u64> = output
+            .lines()
+            .find_map(|line| line.split_once("FILEFACTS_LIMITS "))
+            .expect("probe limits")
+            .1
+            .split_whitespace()
+            .map(|v| v.parse().unwrap())
+            .collect();
+        assert_eq!(values.len(), 8);
+        assert_eq!(values[0], values[2]);
+        assert_eq!(values[1], u64::from(std::process::id()));
+        assert_eq!(values[4..], expected);
+        // libtest runs the probe on a new thread, where PDEATHSIG is reset.
+        // Query the exec'd leader itself with setpriv instead.
+        if let Some(setpriv) = crate::tools::resolve("setpriv") {
+            let mut cmd = match setup {
+                ChildSetup::Native => Command::new(&setpriv),
+                ChildSetup::ExternalLinux => linux_launcher().unwrap().command(&setpriv).unwrap(),
+            };
+            cmd.arg("--dump");
+            let RunOutcome::Exited {
+                status,
+                stdout,
+                cap_hit: false,
+            } = run_hardened(cmd, Duration::from_secs(5), 64 * 1024, setup)
+            else {
+                panic!("leader signal probe failed");
+            };
+            assert!(status.success());
+            assert!(
+                String::from_utf8(stdout)
+                    .unwrap()
+                    .lines()
+                    .any(|line| line.split_whitespace().last() == Some("KILL"))
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn linux_launch_modes_keep_tighter_inherited_limits() {
+    let _lock = rizin_test_lock();
+    let Some(prlimit) = crate::tools::resolve("prlimit") else {
+        return;
+    };
+    let output = Command::new(prlimit)
+        .args([
+            "--as=1073741824:2147483648",
+            "--data=536870912:1073741824",
+            "--",
+        ])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "rizin::tests::linux_launch_modes_keep_limits_and_parent_death_signal",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+#[ignore = "subprocess fixture for parent-death test"]
+#[cfg(target_os = "linux")]
+fn linux_waiting_child_probe() {
+    use std::io::Write;
+    println!("FILEFACTS_CHILD {}", std::process::id());
+    std::io::stdout().flush().unwrap();
+    std::thread::sleep(Duration::from_secs(30));
+}
+
+#[test]
+#[ignore = "subprocess fixture that exits without cleanup"]
+#[cfg(target_os = "linux")]
+fn linux_parent_death_driver() {
+    use std::io::{BufRead, Write};
+    let mut cmd = launch_probe_command(true, ChildSetup::ExternalLinux);
+    crate::tools::scrub_env(&mut cmd);
+    apply_unix_hardening(&mut cmd, ChildSetup::ExternalLinux);
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    for line in std::io::BufReader::new(child.stdout.take().unwrap()).lines() {
+        let line = line.unwrap();
+        if let Some((_, pid)) = line.split_once("FILEFACTS_CHILD ") {
+            println!("FILEFACTS_ORPHAN {pid}");
+            std::io::stdout().flush().unwrap();
+            std::process::exit(0);
+        }
+    }
+    let _ = child.wait();
+    panic!("child never became ready");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn linux_launcher_kills_child_after_parent_exit() {
+    let _lock = rizin_test_lock();
+    if linux_launcher().is_none() {
+        return;
+    }
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "rizin::tests::linux_parent_death_driver",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let output = String::from_utf8(output.stdout).unwrap();
+    let pid: i32 = output
+        .lines()
+        .find_map(|line| line.split_once("FILEFACTS_ORPHAN "))
+        .expect("orphan pid")
+        .1
+        .trim()
+        .parse()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let dead = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat.rsplit(')').next().unwrap().trim().starts_with('Z'),
+            Err(_) => true,
+        };
+        if dead {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            // SAFETY: private process group of this fixture.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+            panic!("child survived parent exit");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn linux_launcher_keeps_arguments_literal() {
+    let _lock = rizin_test_lock();
+    let Some(launcher) = linux_launcher() else {
+        return;
+    };
+    let value = "quotes '\" $() ; spaces";
+    let mut cmd = launcher.command(&launcher.shell).unwrap();
+    cmd.args(["-c", "printf '%s' \"$1\"", "fixture", value]);
+    let RunOutcome::Exited {
+        status,
+        stdout,
+        cap_hit: false,
+    } = run_hardened(cmd, Duration::from_secs(5), 1024, ChildSetup::ExternalLinux)
+    else {
+        panic!("literal-argument probe failed");
+    };
+    assert!(status.success());
+    assert_eq!(stdout, value.as_bytes());
 }

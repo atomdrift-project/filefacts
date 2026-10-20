@@ -6,9 +6,49 @@ pub(super) fn document_structure(data: &[u8]) -> bool {
     let data = super::strip_utf8_bom(data);
     let head = data.get(..WINDOW).unwrap_or(data);
     let mut lines = head.split(|b| *b == b'\n');
-    let Some(first) = lines.find(|line| !line.trim_ascii().is_empty()) else {
+    let Some(mut first) = lines.find(|line| !line.trim_ascii().is_empty()) else {
         return false;
     };
+    // YAML front matter precedes the document heading in agent policies and
+    // static-site pages. Its quoted examples are data, not source-language
+    // evidence. Require mapping-shaped fields and a complete closing marker.
+    if first.trim_ascii() == b"---" {
+        let mut fields = 0;
+        let mut closed = false;
+        for line in lines.by_ref() {
+            let trimmed = line.trim_ascii();
+            if trimmed == b"---" || trimmed == b"..." {
+                closed = fields > 0;
+                break;
+            }
+            if trimmed.is_empty() || trimmed.starts_with(b"#") {
+                continue;
+            }
+            if line.first().is_some_and(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let Some(colon) = trimmed.iter().position(|b| *b == b':') else {
+                return false;
+            };
+            if colon == 0
+                || !trimmed
+                    .iter()
+                    .take(colon)
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+            {
+                return false;
+            }
+            fields += 1;
+        }
+        if !closed {
+            return false;
+        }
+        let Some(heading) = lines.find(|line| !line.trim_ascii().is_empty()) else {
+            return false;
+        };
+        first = heading;
+    }
+    let document_start = first.as_ptr() as usize - head.as_ptr() as usize;
     let first = first.trim_ascii();
     let hashes = first.iter().take_while(|b| **b == b'#').count();
     let atx = (1..=6).contains(&hashes) && first.get(hashes).is_some_and(u8::is_ascii_whitespace);
@@ -63,7 +103,7 @@ pub(super) fn document_structure(data: &[u8]) -> bool {
             // Source evidence before the examples must still win.
             let before = line.as_ptr() as usize - head.as_ptr() as usize;
             if head
-                .get(..before)
+                .get(document_start..before)
                 .is_none_or(|prefix| super::heuristics::detect_from_content(prefix).is_some())
             {
                 return false;
@@ -118,6 +158,7 @@ mod tests {
             include_bytes!("../../testdata/markdown/https-proxy-agent-readme.md").as_slice(),
             include_bytes!("../../testdata/markdown/debug-readme.md").as_slice(),
             include_bytes!("../../testdata/markdown/proxy-agent-readme.md").as_slice(),
+            include_bytes!("../../testdata/markdown/appsec-front-matter-policy.md").as_slice(),
         ] {
             let id = FileId::from_path_and_bytes(Path::new("README.md"), bytes);
             assert_eq!(id.file_type(), FileType::Markdown);
@@ -141,6 +182,23 @@ mod tests {
             b"# Guide\n```js\nx\n``` trailing\n",
             b"# Guide\n    ```js\nx\n    ```\n",
             b"# Guide\n```js`bad\nx\n```\n",
+        ] {
+            assert!(!document_structure(bytes));
+        }
+    }
+
+    #[test]
+    fn front_matter_precedes_fenced_document_not_disguised_source() {
+        let doc = b"---\ninclusion: always\npriority: 0\napplies_to:\n  - all_languages\n---\n\n# Security policy\n\nDo not generate insecure code.\n\n```javascript\nconst x = require('fs');\n```\n";
+        assert!(document_structure(doc));
+        let id = FileId::from_path_and_bytes(Path::new("appsec-rules.md"), doc);
+        assert_eq!(id.file_type(), FileType::Markdown);
+        assert!(!id.extension_mismatch());
+        for bytes in [
+            b"---\ninclusion: always\n# Guide\n```js\nx\n```\n".as_slice(),
+            b"---\nconst x = require('fs');\n---\n# Guide\n```js\nx\n```\n",
+            b"---\ntitle: Guide\n---\nconst x = require('fs');\n```js\nx\n```\n",
+            b"---\ntitle: Guide\n---\n# Guide\nconst x = require('fs');\n```js\nx\n```\n",
         ] {
             assert!(!document_structure(bytes));
         }

@@ -35,7 +35,7 @@ use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -50,9 +50,64 @@ use crate::output::{Metrics, SectionFlag};
 pub const DEFAULT_RIZIN_TIMEOUT_SECS: u64 = 600;
 const RIZIN_TIMEOUT: Duration = Duration::from_secs(DEFAULT_RIZIN_TIMEOUT_SECS);
 
+/// Optional process-wide cap for the memory-heavy native analyzers. A permit
+/// stays held until the child and its output drain have both been reaped.
+struct RizinGate {
+    limit: usize,
+    active: Mutex<usize>,
+    changed: Condvar,
+}
+
+impl RizinGate {
+    fn acquire(&self) -> RizinPermit<'_> {
+        let mut active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
+        while *active >= self.limit {
+            active = self
+                .changed
+                .wait(active)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *active += 1;
+        RizinPermit { gate: self }
+    }
+}
+
+struct RizinPermit<'a> {
+    gate: &'a RizinGate,
+}
+
+impl Drop for RizinPermit<'_> {
+    fn drop(&mut self) {
+        let mut active = self
+            .gate
+            .active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *active -= 1;
+        self.gate.changed.notify_one();
+    }
+}
+
+fn rizin_gate() -> Option<&'static RizinGate> {
+    static GATE: OnceLock<Option<RizinGate>> = OnceLock::new();
+    GATE.get_or_init(|| {
+        std::env::var("FILEFACTS_RIZIN_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&limit| limit > 0)
+            .map(|limit| RizinGate {
+                limit,
+                active: Mutex::new(0),
+                changed: Condvar::new(),
+            })
+    })
+    .as_ref()
+}
+
 /// Soft memory cap on a single rizin subprocess (4 GiB). Enforced via
 /// `setrlimit(RLIMIT_AS, ...)` (Linux) / `setrlimit(RLIMIT_DATA, ...)`
-/// (macOS) in a `pre_exec` hook. Legitimate rizin analysis never
+/// (macOS). A child hook enforces it on the native launch path; large
+/// Linux callers use the preflighted exec launcher below. Legitimate rizin analysis never
 /// approaches this size — exceeding it indicates pathological input
 /// and the kernel will abort the subprocess instead of letting it
 /// drag the whole scan into OOM.
@@ -473,10 +528,10 @@ const VERSION_PROBE_MAX_OUTPUT: usize = 64 * 1024;
 
 /// The first line `bin -v` prints, run hardened and bounded.
 fn version_of(bin: &Path, timeout: Duration) -> Option<String> {
-    let mut cmd = Command::new(bin);
+    let (mut cmd, setup) = rizin_command(bin);
     cmd.arg("-v");
     let RunOutcome::Exited { status, stdout, .. } =
-        run_hardened(cmd, timeout, VERSION_PROBE_MAX_OUTPUT)
+        run_hardened(cmd, timeout, VERSION_PROBE_MAX_OUTPUT, setup)
     else {
         return None;
     };
@@ -814,7 +869,7 @@ fn attempt_with_script(
     // surrounding `iij`/`iEj`/`aflj`/`iSj` are table reads. The `===SEP===`
     // sentinels must stay 1:1 with the parser's `split` below. The path goes
     // over as an `OsStr`, so a non-UTF-8 temp dir still names the file.
-    let mut cmd = Command::new(bin);
+    let (mut cmd, setup) = rizin_command(bin);
     cmd.args(RIZIN_METRICS_ARGS)
         .arg("-c")
         .arg(script)
@@ -832,26 +887,27 @@ fn attempt_with_script(
     let started = std::time::Instant::now();
     tracing::debug!(bytes = bytes.len(), "rizin recover: begin");
 
-    let (status, stdout_bytes, cap_hit) = match run_hardened(cmd, timeout, MAX_SUBPROCESS_OUTPUT) {
-        RunOutcome::Exited {
-            status,
-            stdout,
-            cap_hit,
-        } => (status, stdout, cap_hit),
-        RunOutcome::TimedOut => {
-            RIZIN_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                bytes = bytes.len(),
-                elapsed_ms = started.elapsed().as_millis(),
-                "rizin recover: end (timed out)"
-            );
-            return Attempt::timed_out();
-        }
-        RunOutcome::Failed => {
-            RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
-            return Attempt::transient();
-        }
-    };
+    let (status, stdout_bytes, cap_hit) =
+        match run_hardened(cmd, timeout, MAX_SUBPROCESS_OUTPUT, setup) {
+            RunOutcome::Exited {
+                status,
+                stdout,
+                cap_hit,
+            } => (status, stdout, cap_hit),
+            RunOutcome::TimedOut => {
+                RIZIN_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    bytes = bytes.len(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "rizin recover: end (timed out)"
+                );
+                return Attempt::timed_out();
+            }
+            RunOutcome::Failed => {
+                RIZIN_FAILURES.fetch_add(1, Ordering::Relaxed);
+                return Attempt::transient();
+            }
+        };
     drop(input);
     if cap_hit {
         RIZIN_OUTPUT_CAP_EXCEEDED.fetch_add(1, Ordering::Relaxed);
@@ -921,12 +977,13 @@ enum RunOutcome {
 /// Whatever happens, including a panic unwinding through here, the child's
 /// process group is killed and its leader reaped before this returns (see
 /// [`ChildGuard`]).
-fn run_hardened(mut cmd: Command, timeout: Duration, cap: usize) -> RunOutcome {
+fn run_hardened(mut cmd: Command, timeout: Duration, cap: usize, setup: ChildSetup) -> RunOutcome {
+    let _permit = rizin_gate().map(RizinGate::acquire);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::null());
     crate::tools::scrub_env(&mut cmd);
-    apply_unix_hardening(&mut cmd);
+    apply_unix_hardening(&mut cmd, setup);
 
     let started = std::time::Instant::now();
     let Ok(child) = cmd.spawn() else {
@@ -1173,6 +1230,124 @@ fn exited_unreaped(pid: u32) -> io::Result<bool> {
     Ok(unsafe { info.si_pid() } != 0)
 }
 
+#[derive(Clone, Copy)]
+enum ChildSetup {
+    Native,
+    #[cfg(target_os = "linux")]
+    ExternalLinux,
+}
+
+/// Avoid copying a large scanner's page tables just to exec a small helper.
+/// Small callers retain the native launch path: extra execs cost more than
+/// they save there. Missing or incompatible utilities also retain that path.
+fn rizin_command(bin: &Path) -> (Command, ChildSetup) {
+    #[cfg(target_os = "linux")]
+    if large_linux_parent()
+        && let Some(launcher) = linux_launcher()
+        && let Some(cmd) = launcher.command(bin)
+    {
+        return (cmd, ChildSetup::ExternalLinux);
+    }
+    (Command::new(bin), ChildSetup::Native)
+}
+
+#[cfg(target_os = "linux")]
+fn large_linux_parent() -> bool {
+    std::fs::read_to_string("/proc/self/status").is_ok_and(|status| {
+        status.lines().any(|line| {
+            line.strip_prefix("VmRSS:")
+                .and_then(|v| v.split_whitespace().next())
+                .and_then(|v| v.parse::<u64>().ok())
+                .is_some_and(|kib| kib >= 512 * 1024)
+        })
+    })
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxLauncher {
+    setpriv: PathBuf,
+    prlimit: PathBuf,
+    shell: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxLauncher {
+    fn command(&self, bin: &Path) -> Option<Command> {
+        // Preserve tighter inherited limits. Reading them in the parent also
+        // keeps all allocation and formatting out of a pre-exec hook.
+        let limited = |resource| {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: `limit` is writable storage for the requested resource.
+            #[allow(unsafe_code)]
+            if unsafe { libc::getrlimit(resource, &raw mut limit) } != 0 {
+                return None;
+            }
+            Some(format!(
+                "{}:{}",
+                limit.rlim_cur.min(RIZIN_MEMORY_LIMIT_BYTES as libc::rlim_t),
+                limit.rlim_max.min(RIZIN_MEMORY_LIMIT_BYTES as libc::rlim_t),
+            ))
+        };
+        let mut cmd = Command::new(&self.setpriv);
+        cmd.args(["--pdeathsig", "KILL", "--"])
+            .arg(&self.shell)
+            .args([
+                "-c",
+                // setpriv arms PDEATHSIG before this check. A parent that
+                // died before it was armed has already changed PPID; after
+                // arming, the kernel kills us. Every stage execs in place,
+                // retaining the child PID and private process group.
+                "[ \"$PPID\" -eq \"$1\" ] || exit 1; shift; exec \"$@\"",
+                "filefacts-rizin",
+            ])
+            .arg(std::process::id().to_string())
+            .arg(&self.prlimit)
+            .arg(format!("--as={}", limited(libc::RLIMIT_AS)?))
+            .arg(format!("--data={}", limited(libc::RLIMIT_DATA)?))
+            .arg("--")
+            .arg(bin);
+        Some(cmd)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_launcher() -> Option<&'static LinuxLauncher> {
+    static LAUNCHER: OnceLock<Option<LinuxLauncher>> = OnceLock::new();
+    LAUNCHER
+        .get_or_init(|| {
+            let launcher = LinuxLauncher {
+                setpriv: crate::tools::resolve("setpriv")?,
+                prlimit: crate::tools::resolve("prlimit")?,
+                shell: crate::tools::resolve("sh")?,
+            };
+            // Check the complete utility chain once, with a bounded trusted
+            // no-op. Older setpriv versions lack --pdeathsig. A refusal falls
+            // back to the original hook, never to an uncontained Rizin process.
+            let mut probe = launcher.command(&launcher.shell)?;
+            probe.args(["-c", "exit 0"]);
+            match run_hardened(
+                probe,
+                Duration::from_secs(2),
+                64 * 1024,
+                ChildSetup::ExternalLinux,
+            ) {
+                RunOutcome::Exited {
+                    status,
+                    cap_hit: false,
+                    ..
+                } if status.success() => {
+                    tracing::info!("Rizin exec launcher available for large Linux callers");
+                    Some(launcher)
+                }
+                _ => None,
+            }
+        })
+        .as_ref()
+}
+
 /// Apply Unix subprocess hardening: own process group everywhere, plus the
 /// platform-specific memory/death limits Linux and macOS support here.
 ///
@@ -1183,9 +1358,15 @@ fn exited_unreaped(pid: u32) -> io::Result<bool> {
 /// contention in live DTrace stacks; `process_group(0)` remains available via
 /// `posix_spawn` there.
 #[cfg(unix)]
-fn apply_unix_hardening(cmd: &mut Command) {
+fn apply_unix_hardening(cmd: &mut Command, setup: ChildSetup) {
     use std::os::unix::process::CommandExt;
     cmd.process_group(0);
+    #[cfg(target_os = "linux")]
+    if matches!(setup, ChildSetup::ExternalLinux) {
+        return;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = setup;
     // Read before the fork: the child compares it with `getppid()`.
     #[cfg(target_os = "linux")]
     let parent = std::process::id() as libc::pid_t;
@@ -1236,7 +1417,7 @@ fn apply_unix_hardening(cmd: &mut Command) {
 }
 
 #[cfg(not(unix))]
-fn apply_unix_hardening(_: &mut Command) {}
+fn apply_unix_hardening(_: &mut Command, _: ChildSetup) {}
 
 /// Windows analogue of the Unix private process group: a Job Object holding
 /// the rizin leader and everything it spawns.
