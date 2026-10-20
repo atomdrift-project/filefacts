@@ -276,6 +276,35 @@ fn python_prefixed_strings_are_literals_but_interpolations_flow() {
 }
 
 #[test]
+fn javascript_template_substitutions_preserve_input_origins() {
+    for path in ["a.js", "a.ts"] {
+        for source in [
+            "function main(){const key=acquire();send(`Key: ${key}`);}",
+            "function collect(){return acquire()} async function main(){const key=await collect();send(`Key: ${key}`);}",
+            "function main(){send(`first ${acquire()} last`);}",
+        ] {
+            let flow = graph(path, source);
+            assert!(
+                reaches(&flow, "send", "acquire"),
+                "{path}: {source}: {flow:?}"
+            );
+        }
+        for source in [
+            "function main(){send('${acquire()}');}",
+            r"function main(){send(`\${acquire()}`);}",
+            "function main(){let key=acquire();key='public';send(`Key: ${key}`);}",
+            "function main(){send(`constant`);}",
+        ] {
+            let flow = graph(path, source);
+            assert!(
+                !reaches(&flow, "send", "acquire"),
+                "{path}: {source}: {flow:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn helper_calls_do_not_contaminate_each_other() {
     let flow = graph(
         "a.js",

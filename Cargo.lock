@@ -1790,7 +1790,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "2.1.1"
-source = "git+https://github.com/atomdrift-project/stng.git#806a1443b564d0b1c09cc935b4de3d4cf0e16b90"
+source = "git+https://github.com/atomdrift-project/stng.git#fcc43bb43dcb75fd2264adf62fa47d163f3f3fc0"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -2089,8 +2089,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-bash"
 version = "0.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e5ec769279cc91b561d3df0d8a5deb26b0ad40d183127f409494d6d8fc53062"
+source = "git+https://github.com/tstromberg/tree-sitter-bash#b672c98bad245e1cc41ff698782afe12b9a2718c"
 dependencies = [
  "cc",
  "tree-sitter-language",

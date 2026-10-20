@@ -133,11 +133,17 @@ impl Builder<'_> {
     fn text(&self, n: Node<'_>) -> &str {
         &self.source[n.byte_range()]
     }
-    /// A Python f-string decodes as a string argument, but its `{…}`
-    /// interpolations carry values, so it is evaluated as an expression.
+    /// Interpolated strings carry expression values rather than being opaque
+    /// constants. Escaped interpolation markers have no substitution node.
     fn interpolates(&self, node: Node<'_>) -> bool {
-        self.config.lang == Lang::Python
-            && named_children(node).any(|child| child.kind() == "interpolation")
+        match self.config.lang {
+            Lang::Python => named_children(node).any(|child| child.kind() == "interpolation"),
+            Lang::JavaScript | Lang::TypeScript => {
+                node.kind() == "template_string"
+                    && named_children(node).any(|child| child.kind() == "template_substitution")
+            }
+            _ => false,
+        }
     }
     fn add(&mut self, kind: FlowKind, node: Node<'_>, inputs: Vec<usize>) -> usize {
         if self.flow.values.len() >= NODE_LIMIT {

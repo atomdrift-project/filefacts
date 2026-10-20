@@ -328,6 +328,8 @@ debug = 2
 # or cleave as the root need this same block in their own manifest. Delete it
 # everywhere once the upstream PR lands and a release carries the fix.
 [patch.crates-io]
+# Unicode-safe brace-range scanner; shared across consumers by update-deps.
+tree-sitter-bash = { git = "https://github.com/tstromberg/tree-sitter-bash" }
 tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
 tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
 
