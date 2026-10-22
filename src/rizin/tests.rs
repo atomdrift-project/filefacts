@@ -81,6 +81,12 @@ fn metrics_command_skips_unused_work_but_keeps_full_cfg_analysis() {
     assert!(
         RIZIN_METRICS_ARGS
             .windows(2)
+            .any(|w| w == ["-e", "log.level=3"]),
+        "keep warnings/errors without per-function debug/info logging"
+    );
+    assert!(
+        RIZIN_METRICS_ARGS
+            .windows(2)
             .any(|w| w == ["-e", "analysis.vars=false"]),
         "variable recovery is excluded"
     );

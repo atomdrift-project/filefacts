@@ -167,7 +167,9 @@ const RIZIN_METRICS_ARGS: &[&str] = &[
     "-e",
     "scr.color=0",
     "-e",
-    "log.level=0",
+    // Rizin's level 0 is DEBUG, not silence. Keep warnings and errors without
+    // formatting a recovered-symbol message for every function in large Go images.
+    "log.level=3",
     "-e",
     "analysis.vars=false",
 ];
