@@ -312,6 +312,10 @@ impl Settings {
 /// kernel could already have handed to an unrelated process.
 static RIZIN_PGIDS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
+// Serializes launch + registration with terminal shutdown. Once closed, no
+// new child may start, including work already queued behind the rizin gate.
+static RIZIN_SHUTDOWN: Mutex<bool> = Mutex::new(false);
+
 /// Temp copies of the inputs live rizin runs are reading. Each is deleted by
 /// its run's [`tempfile::TempPath`]; the registry exists for
 /// [`kill_all_rizin_groups`], whose caller is about to `process::exit` and so
@@ -387,27 +391,24 @@ fn unregister_pgid(pgid: i32) {
 /// *thread* — the `ctrlc` crate's handler, a `signal-hook` iterator — not
 /// from an async signal handler: it takes a lock and allocates.
 ///
-/// Idempotent: entries are removed from the registries by the normal cleanup
+/// Terminal operation: future launches are refused. Idempotent: entries are
+/// removed from the registries by the normal cleanup
 /// paths, so calling this after a clean shutdown is a no-op. On non-Unix
 /// only the temp files are removed; rizin's job object dies with the
 /// process.
 pub fn kill_all_rizin_groups() {
+    let mut shutdown = registry(&RIZIN_SHUTDOWN);
+    *shutdown = true;
     #[cfg(unix)]
     {
-        let pgids: Vec<i32> = registry(&RIZIN_PGIDS).clone();
-        for pgid in pgids {
-            // SAFETY: libc::kill with a negative pid sends the signal to the
-            // process group; an already-dead group is ESRCH, ignored. The
-            // registry drops a group before its leader is reaped, so the id
-            // cannot have been recycled.
-            #[allow(unsafe_code)]
-            unsafe {
-                libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
-            }
+        // Keep the registry locked through signalling. A worker cannot
+        // unregister and reap a leader while its group is being addressed.
+        let pgids = registry(&RIZIN_PGIDS);
+        for &pgid in pgids.iter() {
+            kill_process_group(pgid.cast_unsigned());
         }
     }
-    let inputs: Vec<PathBuf> = registry(&RIZIN_TEMP_INPUTS).clone();
-    for path in inputs {
+    for path in registry(&RIZIN_TEMP_INPUTS).iter() {
         let _ = std::fs::remove_file(path);
     }
 }
@@ -819,6 +820,13 @@ impl TempInput {
         file.write_all(bytes)?;
         file.flush()?;
         let path = file.into_temp_path();
+        let shutdown = registry(&RIZIN_SHUTDOWN);
+        if *shutdown {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "rizin is shutting down",
+            ));
+        }
         registry(&RIZIN_TEMP_INPUTS).push(path.to_path_buf());
         Ok(Self(path))
     }
@@ -986,10 +994,38 @@ fn run_hardened(mut cmd: Command, timeout: Duration, cap: usize, setup: ChildSet
     apply_unix_hardening(&mut cmd, setup);
 
     let started = std::time::Instant::now();
+    let shutdown = registry(&RIZIN_SHUTDOWN);
+    if *shutdown {
+        return RunOutcome::Failed;
+    }
+    // The watchdog shares the child's private group and survives the scanner.
+    // Its lifeline stays held by ChildGuard through group cleanup and reap.
+    #[cfg(any(target_os = "macos", all(test, unix)))]
+    let watchdog = {
+        #[cfg(test)]
+        let enabled = cfg!(target_os = "macos") || matches!(setup, ChildSetup::Watchdog);
+        #[cfg(not(test))]
+        let enabled = true;
+        if enabled {
+            match stng::subprocess::Watchdog::arm(&mut cmd, timeout) {
+                Ok(watchdog) => Some(watchdog),
+                Err(_) => return RunOutcome::Failed,
+            }
+        } else {
+            None
+        }
+    };
     let Ok(child) = cmd.spawn() else {
         return RunOutcome::Failed;
     };
     let mut guard = ChildGuard::new(child);
+    #[cfg(any(target_os = "macos", all(test, unix)))]
+    {
+        guard.watchdog = watchdog;
+    }
+    drop(shutdown);
+    // Drop pre-exec captures and their parent-side descriptors promptly.
+    drop(cmd);
     let pid = guard.pid;
 
     // Drain stdout in a background thread while we wait for exit.
@@ -1036,12 +1072,12 @@ fn run_hardened(mut cmd: Command, timeout: Duration, cap: usize, setup: ChildSet
     loop {
         if !cap_reported && output_cap_hit.load(Ordering::Acquire) {
             cap_reported = true;
+            guard.kill_group();
             tracing::warn!(
                 pid,
                 cap_bytes = cap,
                 "rizin output cap exceeded; killing process group"
             );
-            guard.kill_group();
         }
         match guard.has_exited() {
             Ok(true) => break,
@@ -1096,6 +1132,8 @@ struct ChildGuard {
     status: Option<ExitStatus>,
     /// [`Self::finish`] has run: the group is dead and out of the registry.
     finished: bool,
+    #[cfg(any(target_os = "macos", all(test, unix)))]
+    watchdog: Option<stng::subprocess::Watchdog>,
     /// Contains descendants on Windows the way `process_group(0)` does on
     /// Unix. Created immediately after spawn; a helper started in the window
     /// before the assignment lands would escape the job, which is what the
@@ -1118,6 +1156,8 @@ impl ChildGuard {
             pid,
             status: None,
             finished: false,
+            #[cfg(any(target_os = "macos", all(test, unix)))]
+            watchdog: None,
             #[cfg(windows)]
             job,
         }
@@ -1233,6 +1273,8 @@ fn exited_unreaped(pid: u32) -> io::Result<bool> {
 #[derive(Clone, Copy)]
 enum ChildSetup {
     Native,
+    #[cfg(all(test, unix))]
+    Watchdog,
     #[cfg(target_os = "linux")]
     ExternalLinux,
 }

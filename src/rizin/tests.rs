@@ -46,7 +46,11 @@ fn rizin_test_lock() -> std::sync::MutexGuard<'static, ()> {
     // `unwrap_or_else` so a poisoned mutex (from a panicking test
     // holding the guard) doesn't poison every subsequent test —
     // the registry state survives across test panics regardless.
-    LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    let lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // Shutdown is terminal in production. Each serialized shim test models
+    // a fresh scanner, including tests that deliberately close admission.
+    *registry(&RIZIN_SHUTDOWN) = false;
+    lock
 }
 
 fn make_recovery(json: &str) -> RizinRecovery {
@@ -782,6 +786,7 @@ fn stats_are_monotonic_named_counters() {
 
 #[test]
 fn temp_input_is_private_registered_and_removed_on_drop() {
+    let _lock = rizin_test_lock();
     let input = TempInput::write(b"sample bytes").expect("temp dir is writable");
     let path = input.path().to_path_buf();
     let name = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -806,6 +811,7 @@ fn temp_input_is_private_registered_and_removed_on_drop() {
 #[test]
 #[cfg(unix)]
 fn temp_input_refuses_a_planted_path() {
+    let _lock = rizin_test_lock();
     // The old name was `filefacts-rizin-{pid}-{seq}.bin`: plant a symlink at
     // every name it could have chosen next and check none is written through.
     let target = unique_shim_dir("filefacts-rizin-planted-target");
@@ -1574,7 +1580,7 @@ fn timed_out_shim_retries_and_recovers_but_crash_does_not_retry() {
 fn launch_probe_command(wait: bool, setup: ChildSetup) -> Command {
     let exe = std::env::current_exe().unwrap();
     let mut cmd = match setup {
-        ChildSetup::Native => Command::new(&exe),
+        ChildSetup::Native | ChildSetup::Watchdog => Command::new(&exe),
         ChildSetup::ExternalLinux => linux_launcher().unwrap().command(&exe).unwrap(),
     };
     cmd.args([
@@ -1670,7 +1676,7 @@ fn linux_launch_modes_keep_limits_and_parent_death_signal() {
         // Query the exec'd leader itself with setpriv instead.
         if let Some(setpriv) = crate::tools::resolve("setpriv") {
             let mut cmd = match setup {
-                ChildSetup::Native => Command::new(&setpriv),
+                ChildSetup::Native | ChildSetup::Watchdog => Command::new(&setpriv),
                 ChildSetup::ExternalLinux => linux_launcher().unwrap().command(&setpriv).unwrap(),
             };
             cmd.arg("--dump");
@@ -1830,4 +1836,71 @@ fn linux_launcher_keeps_arguments_literal() {
     };
     assert!(status.success());
     assert_eq!(stdout, value.as_bytes());
+}
+
+#[test]
+#[cfg(unix)]
+fn shutdown_refuses_later_launches() {
+    let _lock = rizin_test_lock();
+    kill_all_rizin_groups();
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "echo should-not-launch"]);
+    assert!(matches!(
+        run_hardened(command, Duration::from_secs(1), 1024, ChildSetup::Native),
+        RunOutcome::Failed
+    ));
+}
+
+#[test]
+#[cfg(unix)]
+fn independent_watchdog_launch_path_is_bounded() {
+    let _lock = rizin_test_lock();
+    let mut command = Command::new("/bin/sleep");
+    command.arg("30");
+    let started = std::time::Instant::now();
+    let out = run_hardened(
+        command,
+        Duration::from_millis(200),
+        1024,
+        ChildSetup::Watchdog,
+    );
+    assert!(matches!(
+        out,
+        RunOutcome::TimedOut | RunOutcome::Exited { .. }
+    ));
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+#[test]
+#[cfg(unix)]
+fn shutdown_cleans_up_concurrent_launches() {
+    let _lock = rizin_test_lock();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            handles.push(scope.spawn(|| {
+                let mut command = Command::new("/bin/sleep");
+                command.arg("30");
+                run_hardened(command, Duration::from_secs(2), 1024, ChildSetup::Native)
+            }));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while registry(&RIZIN_PGIDS).is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no launch was admitted"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        kill_all_rizin_groups();
+        for handle in handles {
+            match handle.join().unwrap() {
+                RunOutcome::Failed => {}
+                RunOutcome::Exited { status, .. } => assert!(!status.success()),
+                RunOutcome::TimedOut => panic!("shutdown missed a child"),
+            }
+        }
+    });
+    assert!(registry(&RIZIN_PGIDS).is_empty());
+    assert!(*registry(&RIZIN_SHUTDOWN));
 }
