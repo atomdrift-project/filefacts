@@ -83,6 +83,11 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
             .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
             .path();
         if path.is_dir() {
+            // Fixtures are test inputs, not extraction code, so they do not
+            // belong in the cache key, and a build must not depend on reading them.
+            if path.file_name().is_some_and(|name| name == "testdata") {
+                continue;
+            }
             collect_files(&path, out);
         } else {
             out.push(path);
