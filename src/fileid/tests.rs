@@ -664,8 +664,10 @@ fn txt_php_webshell_overrides_text_extension() {
     assert_detect("Php_Backdoor.txt", php, FileType::Php);
     // The saved webshell also embeds `document.write`, which used to tie
     // JavaScript inside the sniff window.
-    let saved = include_bytes!("testdata/php-backdoor.txt");
-    assert_detect("Php_Backdoor.txt", saved, FileType::Php);
+    // Stored compressed so endpoint protection leaves the checkout intact.
+    let saved = zstd::decode_all(&include_bytes!("testdata/php-backdoor.txt.zst")[..])
+        .expect("fixture decompresses");
+    assert_detect("Php_Backdoor.txt", &saved, FileType::Php);
 }
 
 #[test]
