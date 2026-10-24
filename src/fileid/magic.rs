@@ -1902,7 +1902,9 @@ fn classify_pk(path: &Path, data: &[u8]) -> (FileType, DetectionSource) {
     let odf =
         m.mimetype && memchr::memmem::find(data, b"application/vnd.oasis.opendocument.").is_some();
 
-    let ft = if m.android {
+    let ft = if super::go_module::recognized(data) {
+        FileType::GoModule
+    } else if m.android {
         FileType::ApkAndroid
     } else if m.vsix || loose(b"extension.vsixmanifest") {
         // VSIX and NuGet are OPC zips too; their manifests win.

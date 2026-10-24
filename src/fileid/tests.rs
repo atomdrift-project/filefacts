@@ -1439,6 +1439,7 @@ fn package_types_stay_in_archive_group() {
     // `archive` group that downstream consumers key on.
     for ft in [
         FileType::Gem,
+        FileType::GoModule,
         FileType::ApkAndroid,
         FileType::ApkAlpine,
         FileType::Npm,

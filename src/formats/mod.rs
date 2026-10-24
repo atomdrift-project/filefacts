@@ -306,7 +306,12 @@ pub(crate) fn extract(
             ctx.errors,
             apk_android::extract_from_archive,
         ),
-        FileType::Zip | FileType::Odf | FileType::Conda | FileType::Egg | FileType::Ipa => {
+        FileType::Zip
+        | FileType::GoModule
+        | FileType::Odf
+        | FileType::Conda
+        | FileType::Egg
+        | FileType::Ipa => {
             // Zip-based packages (Android apk, conda, egg, ipa): the generic
             // archive walk surfaces their member listing and the identity
             // manifests inside (PKG-INFO, Info.plist, …).

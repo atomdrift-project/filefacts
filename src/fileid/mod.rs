@@ -28,6 +28,7 @@
 
 pub mod container;
 mod ext;
+mod go_module;
 mod heuristics;
 mod magic;
 pub(crate) use magic::looks_like_obfuscated_rtf;
@@ -520,6 +521,9 @@ file_types! {
         GoSum => "go.sum", Config;
         /// ZIP archive (zip, apk, ipa, nupkg, etc.)
         Zip => "zip", Archive;
+        /// Go module distribution ZIP — all members share a `module@version/` prefix.
+        /// Distinct from Go source and the standalone `go.mod` manifest.
+        GoModule => "go_module", Archive;
         /// TAR archive (plain, no compression)
         Tar => "tar", Archive;
         /// ASCII CPIO archive (odc, newc, or newc checksum layout).
@@ -1384,6 +1388,7 @@ fn is_benign_extension_mismatch(path: &Path, data: &[u8], det: Detection) -> boo
     if matches!(
         content,
         FileType::Npm
+            | FileType::GoModule
             | FileType::PkgFreebsd
             | FileType::PkgArch
             | FileType::PythonSdist

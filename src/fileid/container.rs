@@ -205,6 +205,7 @@ impl FileType {
             | Self::PkgArch => Tar,
             // ZIP containers: bare zips and every zip-based package format.
             Self::Zip
+            | Self::GoModule
             | Self::ApkAndroid
             | Self::Conda
             | Self::Egg
@@ -329,6 +330,7 @@ mod tests {
         // The zip container itself is not compressed; its members are.
         for ft in [
             FileType::Whl,
+            FileType::GoModule,
             FileType::Jar,
             FileType::Nupkg,
             FileType::Conda,
