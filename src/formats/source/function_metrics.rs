@@ -22,6 +22,8 @@ use super::visit::{NodeIds, Visit};
 struct FunctionInfo {
     name: String,
     line_count: u32,
+    start_line: u32,
+    end_line: u32,
     param_count: u32,
     param_names: Vec<String>,
     is_anonymous: bool,
@@ -163,6 +165,8 @@ fn build_info(node: Node<'_>, source: &str, depth: u32) -> FunctionInfo {
     FunctionInfo {
         name,
         line_count,
+        start_line,
+        end_line,
         param_count,
         param_names,
         is_anonymous,
@@ -227,14 +231,20 @@ fn emit_metrics(functions: &[FunctionInfo], total_lines: u32, metrics: &mut Metr
     let mut param_counts: Vec<u32> = Vec::with_capacity(functions.len());
     let mut name_lengths: Vec<usize> = Vec::with_capacity(functions.len());
     let mut nesting_depths: Vec<u32> = Vec::with_capacity(functions.len());
-    let mut total_lines_in_functions: u32 = 0;
+    // Source-ordered spans can overlap through nesting or share a line.
+    // Count their union rather than repeatedly counting enclosing bodies.
+    let mut covered_lines = 0u64;
+    let mut covered_until = 0u64;
     let mut all_param_names: Vec<String> = Vec::new();
 
     for func in functions {
         lengths.push(func.line_count);
         param_counts.push(func.param_count);
         nesting_depths.push(func.nesting_depth);
-        total_lines_in_functions += func.line_count;
+        let start = u64::from(func.start_line).min(u64::from(total_lines));
+        let end = (u64::from(func.end_line) + 1).min(u64::from(total_lines));
+        covered_lines += end.saturating_sub(start.max(covered_until));
+        covered_until = covered_until.max(end);
         if !func.name.is_empty() {
             name_lengths.push(func.name.len());
         }
@@ -318,8 +328,8 @@ fn emit_metrics(functions: &[FunctionInfo], total_lines: u32, metrics: &mut Metr
     }
 
     if !lengths.is_empty() {
-        let sum: u32 = lengths.iter().sum();
-        let avg = f64::from(sum) / lengths.len() as f64;
+        let sum: u64 = lengths.iter().map(|&n| u64::from(n)).sum();
+        let avg = sum as f64 / lengths.len() as f64;
         metrics.insert(metric!("functions.avg_length_lines"), avg);
         metrics.insert(
             metric!("functions.max_length_lines"),
@@ -392,7 +402,7 @@ fn emit_metrics(functions: &[FunctionInfo], total_lines: u32, metrics: &mut Metr
         );
         metrics.insert(
             metric!("functions.code_ratio"),
-            f64::from(total_lines_in_functions) / f64::from(total_lines),
+            covered_lines as f64 / f64::from(total_lines),
         );
     }
 }
@@ -408,6 +418,40 @@ fn has_numeric_suffix(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn code_ratio_counts_nested_and_same_line_functions_once() {
+        for (source, expected) in [
+            (
+                "function outer() {\n  function inner() { return 1; }\n  return inner;\n}\nconst outside = 1;\n",
+                4.0 / 5.0,
+            ),
+            (
+                "const a = () => 1; const b = () => 2;\nconst outside = 1;\n",
+                0.5,
+            ),
+            ("function a() {}\n\nfunction b() {}\n", 2.0 / 3.0),
+        ] {
+            let parsed = crate::OpenOptions::new()
+                .path(std::path::Path::new("coverage.js"))
+                .open(source.as_bytes());
+            assert_eq!(
+                parsed.metrics().get("functions.code_ratio"),
+                Some(expected),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_ratio_counts_nested_python_functions_once() {
+        let source =
+            b"def outer():\n    def inner():\n        return 1\n    return inner\nvalue = 1\n";
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new("coverage.py"))
+            .open(source);
+        assert_eq!(parsed.metrics().get("functions.code_ratio"), Some(0.8));
+    }
+
     /// A shell function has no parameter list; the statements in its body
     /// must not be counted as parameters.
     #[test]
