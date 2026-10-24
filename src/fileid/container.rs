@@ -198,6 +198,11 @@ impl FileType {
             | Self::GentooBinpkg
             | Self::Npm
             | Self::Crate
+            | Self::Hex
+            | Self::Pub
+            | Self::Cran
+            | Self::Cpan
+            | Self::Hackage
             | Self::PythonSdist
             | Self::ApkAlpine
             | Self::Xbps
@@ -206,6 +211,7 @@ impl FileType {
             // ZIP containers: bare zips and every zip-based package format.
             Self::Zip
             | Self::GoModule
+            | Self::Composer
             | Self::ApkAndroid
             | Self::Conda
             | Self::Egg
@@ -255,7 +261,15 @@ impl FileType {
     const fn declared_compression(self) -> Compression {
         use Compression::{Bzip2, Gzip, None, Xz, Zstd};
         match self {
-            Self::TarGz | Self::Npm | Self::Crate | Self::PythonSdist | Self::ApkAlpine => Gzip,
+            Self::TarGz
+            | Self::Npm
+            | Self::Crate
+            | Self::PythonSdist
+            | Self::ApkAlpine
+            | Self::Pub
+            | Self::Cran
+            | Self::Cpan
+            | Self::Hackage => Gzip,
             Self::TarBz2 => Bzip2,
             Self::TarXz => Xz,
             // Arch packages vary across zst/xz/gz; zstd is the current default

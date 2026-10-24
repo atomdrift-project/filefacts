@@ -1,30 +1,4 @@
 //! Go proxy distribution ZIPs, identified without inflating member contents.
-use std::io::{self, Cursor, Read, Seek, SeekFrom};
-
-/// Bound failed end-of-directory searches as well as successful reads. The ZIP
-/// reader otherwise rescans its input for every false EOCD signature.
-struct Budgeted<'a> {
-    inner: Cursor<&'a [u8]>,
-    left: usize,
-}
-
-impl Read for Budgeted<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.left == 0 && !buf.is_empty() {
-            return Err(io::Error::other("ZIP probe read budget exhausted"));
-        }
-        let max = buf.len().min(self.left);
-        let n = self.inner.read(buf.get_mut(..max).unwrap_or_default())?;
-        self.left -= n;
-        Ok(n)
-    }
-}
-
-impl Seek for Budgeted<'_> {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.inner.seek(pos)
-    }
-}
 
 /// Recognize the distribution convention, not whether Go would accept every
 /// byte of this package. Older modules need not have a go.mod or a .go file.
@@ -45,11 +19,7 @@ pub(super) fn recognized(data: &[u8]) -> bool {
     let Some(prefix) = module_prefix(name) else {
         return false;
     };
-    let reader = Budgeted {
-        inner: Cursor::new(data),
-        left: data.len().saturating_mul(4).saturating_add(1 << 20),
-    };
-    let Ok(archive) = zip::ZipArchive::new(reader) else {
+    let Ok(archive) = super::zip_probe::open(data) else {
         return false;
     };
     let mut has_file = false;
@@ -127,7 +97,7 @@ fn number(part: &str) -> bool {
 mod tests {
     use super::*;
     use crate::{ArchiveFormat, FileId, FileType};
-    use std::io::Write;
+    use std::io::{Cursor, Write};
     use std::path::Path;
     use zip::write::SimpleFileOptions;
 

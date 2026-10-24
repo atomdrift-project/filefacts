@@ -1489,6 +1489,7 @@ fn tar_layout(mut reader: impl Read, deep: bool) -> Inside {
     // Some while every member so far shares one top-level directory.
     let mut root: Option<Option<String>> = Some(None);
     let mut members = 0usize;
+    let mut packages = super::package_layout::TarProbe::default();
     let (mut pkginfo, mut arch_meta) = (false, false);
     let (mut gem_metadata, mut gem_data) = (false, false);
     let (mut oci_layout, mut oci_index) = (false, false);
@@ -1510,7 +1511,7 @@ fn tar_layout(mut reader: impl Read, deep: bool) -> Inside {
             continue;
         }
         let Ok(path) = entry.path() else { continue };
-        let path = path.to_string_lossy();
+        let path = path.to_string_lossy().into_owned();
         let name = path.trim_start_matches("./").trim_end_matches('/');
         let (top, rest) = name.split_once('/').unwrap_or((name, ""));
         let base = name.rsplit('/').next().unwrap_or(name);
@@ -1571,11 +1572,18 @@ fn tar_layout(mut reader: impl Read, deep: bool) -> Inside {
                 _ => {}
             }
         }
+        if entry.header().entry_type().is_file() {
+            let size = entry.size();
+            packages.observe(name, entry, size);
+            if packages.hex() {
+                return Inside::Tar(FileType::Hex);
+            }
+        }
         // A single-root package may name itself last; the byte budget on
         // `reader` bounds that walk. Anything else is settled early.
         let cap = if deep {
             TAR_DEEP_MEMBERS
-        } else if root.is_some() {
+        } else if root.is_some() || packages.extended_walk() {
             usize::MAX
         } else {
             TAR_SHALLOW_MEMBERS
@@ -1585,7 +1593,11 @@ fn tar_layout(mut reader: impl Read, deep: bool) -> Inside {
         }
     }
     if members > 0 {
-        Inside::Tar(FileType::Tar)
+        Inside::Tar(
+            packages
+                .finish(root.as_ref().and_then(|r| r.as_deref()))
+                .unwrap_or(FileType::Tar),
+        )
     } else {
         Inside::NotTar
     }
@@ -1936,6 +1948,8 @@ fn classify_pk(path: &Path, data: &[u8]) -> (FileType, DetectionSource) {
         FileType::Xpi
     } else if m.jar {
         FileType::Jar
+    } else if super::package_layout::composer_zip(data) {
+        FileType::Composer
     } else {
         FileType::Zip
     };

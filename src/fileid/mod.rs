@@ -31,6 +31,8 @@ mod ext;
 mod go_module;
 mod heuristics;
 mod magic;
+mod package_layout;
+mod zip_probe;
 pub(crate) use magic::looks_like_obfuscated_rtf;
 mod markdown;
 mod perl_shell_shim;
@@ -613,6 +615,18 @@ file_types! {
         /// Rust crate (.crate) — gzip tar laid out as `<name>-<version>/` with a
         /// `Cargo.toml` at its root. The `.crate` extension is cargo-specific.
         Crate => "crate", Archive;
+        /// PHP Composer source distribution ZIP with a root composer.json.
+        Composer => "composer", Archive;
+        /// Hex release tar wrapping metadata.config and contents.tar.gz.
+        Hex => "hex", Archive;
+        /// Dart/pub.dev gzip source distribution with a root pubspec.yaml.
+        Pub => "pub", Archive;
+        /// CRAN R source package with a root DESCRIPTION identity.
+        Cran => "cran", Archive;
+        /// CPAN Perl gzip source distribution with META.json or META.yml.
+        Cpan => "cpan", Archive;
+        /// Hackage gzip source distribution with a matching .cabal manifest.
+        Hackage => "hackage", Archive;
         /// conda package (.conda) — ZIP holding `metadata.json` plus zstd-compressed
         /// `info-*`/`pkg-*` tars. Distinct from generic ZIP so conda identity
         /// (`info/index.json`) routes to its own model.
@@ -1389,6 +1403,13 @@ fn is_benign_extension_mismatch(path: &Path, data: &[u8], det: Detection) -> boo
         content,
         FileType::Npm
             | FileType::GoModule
+            | FileType::Composer
+            | FileType::Hex
+            | FileType::Pub
+            | FileType::Cran
+            | FileType::Cpan
+            | FileType::Hackage
+            | FileType::Crate
             | FileType::PkgFreebsd
             | FileType::PkgArch
             | FileType::PythonSdist
