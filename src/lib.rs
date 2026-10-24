@@ -1060,9 +1060,12 @@ fn stage_for(file_type: FileType) -> Stage {
         FileType::MachO => Stage::MachoParse,
         FileType::Ooxml => Stage::OoxmlParse,
         FileType::OleDoc | FileType::Msi => Stage::Ole2Parse,
-        FileType::Zip | FileType::GoModule | FileType::Crx | FileType::Odf | FileType::Jar => {
-            Stage::ZipParse
-        }
+        FileType::Zip
+        | FileType::GoModule
+        | FileType::Composer
+        | FileType::Crx
+        | FileType::Odf
+        | FileType::Jar => Stage::ZipParse,
         FileType::Tar | FileType::TarGz | FileType::TarBz2 | FileType::TarXz | FileType::TarZst => {
             Stage::TarParse
         }

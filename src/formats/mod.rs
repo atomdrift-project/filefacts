@@ -308,6 +308,7 @@ pub(crate) fn extract(
         ),
         FileType::Zip
         | FileType::GoModule
+        | FileType::Composer
         | FileType::Odf
         | FileType::Conda
         | FileType::Egg
@@ -444,7 +445,14 @@ pub(crate) fn extract(
             apk_alpine::extract(bytes, ctx.values, ctx.metrics);
             Ok(())
         }
-        FileType::PkgFreebsd | FileType::PkgArch | FileType::Xbps => tar::extract(
+        FileType::Hex
+        | FileType::Pub
+        | FileType::Cran
+        | FileType::Cpan
+        | FileType::Hackage
+        | FileType::PkgFreebsd
+        | FileType::PkgArch
+        | FileType::Xbps => tar::extract(
             bytes,
             file_type,
             ctx.values,
