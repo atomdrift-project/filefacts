@@ -1873,7 +1873,9 @@ fn detect_known(sniff: &Sniff<'_>) -> Option<Detection> {
         // reaching here means the filename claims HTML, and that claim is what
         // licenses looking past a short prefix. Otherwise front-padding the file
         // downgrades it to Unknown, which matches no trait at all.
-        if file_type == FileType::Html && !heuristics::looks_like_html(data) {
+        if file_type == FileType::Html
+            && !heuristics::looks_like_html(sniff.decoded().unwrap_or(data))
+        {
             return None;
         }
         // `.bin`/`.dat`/`.raw` say nothing about the content, and DOS samples

@@ -168,13 +168,31 @@ fn parse_atx_heading(line: &str) -> Option<String> {
 }
 
 /// Strip inline emphasis markers (`*`, `_`, backticks) from a heading.
-/// We don't reconstruct nested emphasis — we just remove the marker
-/// bytes so `**Foo**` and `` `bar` `` read as `Foo` and `bar`.
+/// We don't reconstruct nested emphasis. Remove formatting markers so
+/// `**Foo**` and `` `bar` `` read as `Foo` and `bar`, while preserving
+/// intraword underscore runs that cannot be emphasis delimiters.
 fn strip_inline_emphasis(s: &str) -> String {
-    let stripped: String = s
-        .chars()
-        .filter(|c| !matches!(c, '*' | '_' | '`'))
-        .collect();
+    let mut chars = s.chars().peekable();
+    let mut stripped = String::new();
+    let mut previous = None;
+    while let Some(ch) = chars.next() {
+        if ch == '_' {
+            let mut run_length = 1;
+            while chars.next_if_eq(&'_').is_some() {
+                run_length += 1;
+            }
+            // CommonMark forbids intraword underscore emphasis. Preserve the
+            // entire run in names such as `@scope/foo__bar` and `foo_bar`.
+            if previous.is_some_and(char::is_alphanumeric)
+                && chars.peek().is_some_and(|ch| ch.is_alphanumeric())
+            {
+                stripped.extend(std::iter::repeat_n('_', run_length));
+            }
+        } else if !matches!(ch, '*' | '`') {
+            stripped.push(ch);
+        }
+        previous = Some(ch);
+    }
     stripped.trim().to_owned()
 }
 

@@ -365,3 +365,27 @@ fn handles_invalid_utf8_gracefully() {
         Some("Heading")
     );
 }
+
+#[test]
+fn first_heading_preserves_intraword_underscores() {
+    for name in [
+        "@depup/aws-sdk__credential-provider-process",
+        "@scope/foo_bar",
+        "plain__package",
+        "módulo_nome",
+    ] {
+        for heading in [format!("# {name}\n"), format!("# **{name}**\n")] {
+            let v = run(&heading);
+            assert_eq!(get_str(&v, "markdown.first_heading").as_deref(), Some(name));
+        }
+    }
+}
+
+#[test]
+fn first_heading_still_strips_underscore_emphasis() {
+    let v = run("# __Bold__ _and_ **text**\n");
+    assert_eq!(
+        get_str(&v, "markdown.first_heading").as_deref(),
+        Some("Bold and text")
+    );
+}

@@ -114,6 +114,7 @@ fn walk_version_block(
     depth: u8,
     budget: &mut usize,
     values: &mut Values,
+    recover_strings: bool,
 ) {
     if depth >= MAX_VERSION_DEPTH || *budget == 0 || off + 6 > limit {
         return;
@@ -144,6 +145,29 @@ fn walk_version_block(
         && value_off < block_end
     {
         put_u64(values, offset_key, value_off as u64);
+        if recover_strings
+            && w_type == 1
+            && value_bytes >= 2
+            && value_off
+                .checked_add(value_bytes)
+                .is_some_and(|end| end <= block_end)
+            && let Some(data) = bytes.get(value_off..value_off + value_bytes)
+            && let Some(data) = data.strip_suffix(&[0, 0])
+        {
+            let text = bytes_at::utf16_lossy(data, bytes_at::Endian::Little);
+            let key = match key.as_str() {
+                "CompanyName" => Some(value_key!("pe.version.company")),
+                "FileDescription" => Some(value_key!("pe.version.description")),
+                "ProductName" => Some(value_key!("pe.version.product_name")),
+                "OriginalFilename" => Some(value_key!("pe.version.original_filename")),
+                "FileVersion" => Some(value_key!("pe.version.file_version")),
+                "ProductVersion" => Some(value_key!("pe.version.product_version")),
+                _ => None,
+            };
+            if let Some(key) = key {
+                put_str(values, key, &text);
+            }
+        }
     }
 
     // Children follow the value, DWORD-aligned, up to this block's end.
@@ -156,7 +180,15 @@ fn walk_version_block(
         if child_len < 6 {
             break;
         }
-        walk_version_block(bytes, child, block_end, depth + 1, budget, values);
+        walk_version_block(
+            bytes,
+            child,
+            block_end,
+            depth + 1,
+            budget,
+            values,
+            recover_strings,
+        );
         child = align4(child.saturating_add(child_len));
     }
 }
@@ -173,7 +205,7 @@ fn emit_value_offsets(bytes: &[u8], values: &mut Values) {
     };
     let root = key_pos.saturating_sub(6);
     let mut budget = MAX_VERSION_NODES;
-    walk_version_block(bytes, root, bytes.len(), 0, &mut budget, values);
+    walk_version_block(bytes, root, bytes.len(), 0, &mut budget, values, false);
 }
 
 /// Emit randomness/non-linguisticness metrics over the human-readable identity
@@ -479,6 +511,102 @@ fn file_flags(flags: u32) -> Vec<String> {
     out
 }
 
+/// Recover only RT_VERSION leaves when a full PE parse fails. In particular,
+/// large RCDATA resources must not hide an otherwise small version resource.
+/// This never relaxes goblin's resource-size guard or walks arbitrary payloads.
+pub(super) fn recover_partial(bytes: &[u8], values: &mut Values) {
+    use crate::formats::common::bytes_at::u32_le;
+    let recover = || -> Option<Vec<(usize, usize)>> {
+        if bytes.get(..2)? != b"MZ" {
+            return None;
+        }
+        let pe = u32_le(bytes, 0x3c)? as usize;
+        if bytes.get(pe..pe.checked_add(4)?)? != b"PE\0\0" {
+            return None;
+        }
+        let count = u16_le(bytes, pe + 6)? as usize;
+        if count == 0 || count > 96 {
+            return None;
+        }
+        let optional = pe.checked_add(24)?;
+        let optional_size = u16_le(bytes, pe + 20)? as usize;
+        let dirs = match u16_le(bytes, optional)? {
+            0x10b => 96,
+            0x20b => 112,
+            _ => return None,
+        };
+        if optional_size < dirs + 24 || u32_le(bytes, optional + dirs - 4)? < 3 {
+            return None;
+        }
+        let sections = optional.checked_add(optional_size)?;
+        bytes.get(sections..sections.checked_add(count * 40)?)?;
+        let offset = |rva: u32, len: usize| -> Option<usize> {
+            for i in 0..count {
+                let s = sections + i * 40;
+                let Some(delta) = rva.checked_sub(u32_le(bytes, s + 12)?) else {
+                    continue;
+                };
+                let delta = delta as usize;
+                if delta.checked_add(len)? <= u32_le(bytes, s + 16)? as usize {
+                    let off = (u32_le(bytes, s + 20)? as usize).checked_add(delta)?;
+                    bytes.get(off..off.checked_add(len)?)?;
+                    return Some(off);
+                }
+            }
+            None
+        };
+        let root = u32_le(bytes, optional + dirs + 16)?;
+        let declared = u32_le(bytes, optional + dirs + 20)? as usize;
+        let entry_offset = |relative: usize, len: usize| -> Option<usize> {
+            if relative.checked_add(len)? > declared.min(1024 * 1024) {
+                return None;
+            }
+            offset(root.checked_add(u32::try_from(relative).ok()?)?, len)
+        };
+        let mut todo = vec![(0usize, 0u8)];
+        let mut budget = 4096usize;
+        let mut leaves = Vec::new();
+        while let Some((relative, depth)) = todo.pop() {
+            let dir = entry_offset(relative, 16)?;
+            let n = (u16_le(bytes, dir + 12)? as usize)
+                .checked_add(u16_le(bytes, dir + 14)? as usize)?;
+            budget = budget.checked_sub(n)?;
+            for i in 0..n {
+                let e = entry_offset(relative.checked_add(16 + i * 8)?, 8)?;
+                if depth == 0 && u32_le(bytes, e)? != 16 {
+                    continue;
+                }
+                let target = u32_le(bytes, e + 4)?;
+                let next = (target & 0x7fff_ffff) as usize;
+                if depth < 2 && target & 0x8000_0000 != 0 {
+                    todo.push((next, depth + 1));
+                } else if depth == 2 && target & 0x8000_0000 == 0 {
+                    let data = entry_offset(next, 16)?;
+                    let len = u32_le(bytes, data + 4)? as usize;
+                    if len < 6 || len > 65536 || leaves.len() >= 16 {
+                        return None;
+                    }
+                    leaves.push((offset(u32_le(bytes, data)?, len)?, len));
+                } else {
+                    return None;
+                }
+            }
+        }
+        Some(leaves)
+    };
+    let Some(leaves) = recover() else {
+        return;
+    };
+    for (off, len) in leaves {
+        let (key, _) = read_utf16_key(bytes, off + 6, off + len);
+        if key != "VS_VERSION_INFO" {
+            continue;
+        }
+        let mut budget = MAX_VERSION_NODES;
+        walk_version_block(bytes, off, off + len, 0, &mut budget, values, true);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,6 +640,93 @@ mod tests {
         let len = b.len() as u16;
         b[0..2].copy_from_slice(&len.to_le_bytes());
         b
+    }
+
+    fn partial_version_pe() -> Vec<u8> {
+        let string = version_block("ProductName", Some("Disk Manager Tool"), &[]);
+        let table = version_block("040904b0", None, &string);
+        let root = version_block(
+            "VS_VERSION_INFO",
+            None,
+            &version_block("StringFileInfo", None, &table),
+        );
+        let mut pe = vec![0; 0x1000];
+        pe[..2].copy_from_slice(b"MZ");
+        let w = |b: &mut [u8], o, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+        let d = |b: &mut [u8], o, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        d(&mut pe, 0x3c, 0x80);
+        pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        w(&mut pe, 0x86, 1);
+        w(&mut pe, 0x94, 0xe0);
+        w(&mut pe, 0x98, 0x10b);
+        d(&mut pe, 0x98 + 92, 16);
+        d(&mut pe, 0x98 + 112, 0x1000);
+        d(&mut pe, 0x98 + 116, 22 * 1024 * 1024);
+        d(&mut pe, 0x178 + 12, 0x1000);
+        d(&mut pe, 0x178 + 16, 0xc00);
+        d(&mut pe, 0x178 + 20, 0x400);
+        for (dir, id, target) in [
+            (0usize, 16u32, 0x80000020u32),
+            (0x20, 1, 0x80000040),
+            (0x40, 1033, 0x60),
+        ] {
+            w(&mut pe, 0x400 + dir + 14, 1);
+            d(&mut pe, 0x400 + dir + 16, id);
+            d(&mut pe, 0x400 + dir + 20, target);
+        }
+        d(&mut pe, 0x460, 0x1100);
+        d(&mut pe, 0x464, root.len() as u32);
+        pe[0x500..0x500 + root.len()].copy_from_slice(&root);
+        pe
+    }
+    #[test]
+    fn partial_resource_recovery_is_bounded_and_structural() {
+        let pe = partial_version_pe();
+        let mut values = Values::new();
+        recover_partial(&pe, &mut values);
+        assert_eq!(
+            values
+                .get("pe.version.product_name")
+                .and_then(JsonValue::as_str),
+            Some("Disk Manager Tool")
+        );
+        assert!(
+            values
+                .get("pe.version.product_name_offset")
+                .and_then(JsonValue::as_u64)
+                .unwrap()
+                >= 0x500
+        );
+        for (off, data) in [
+            (0x410, 10u32),
+            (0x414, 0x80000000),
+            (0x460, 0xfffffff0),
+            (0x464, 0x10001),
+        ] {
+            let mut invalid = pe.clone();
+            invalid[off..off + 4].copy_from_slice(&data.to_le_bytes());
+            let mut values = Values::new();
+            recover_partial(&invalid, &mut values);
+            assert!(
+                values.get("pe.version.product_name").is_none(),
+                "offset {off:x}"
+            );
+        }
+        for length in [0, 64, 256, 1024, 1280] {
+            let mut values = Values::new();
+            recover_partial(&pe[..length], &mut values);
+            assert!(values.get("pe.version.product_name").is_none());
+        }
+        let mut invalid = pe.clone();
+        let key: Vec<u8> = "ProductName"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let at = memchr::memmem::find(&invalid, &key).unwrap();
+        invalid[at - 4..at - 2].copy_from_slice(&65535u16.to_le_bytes());
+        let mut values = Values::new();
+        recover_partial(&invalid, &mut values);
+        assert!(values.get("pe.version.product_name").is_none());
     }
 
     #[test]
@@ -561,7 +776,15 @@ mod tests {
     /// Blocks the walker visits for `blob`, rooted at offset 0.
     fn blocks_visited(blob: &[u8]) -> usize {
         let mut budget = MAX_VERSION_NODES;
-        walk_version_block(blob, 0, blob.len(), 0, &mut budget, &mut Values::new());
+        walk_version_block(
+            blob,
+            0,
+            blob.len(),
+            0,
+            &mut budget,
+            &mut Values::new(),
+            false,
+        );
         MAX_VERSION_NODES - budget
     }
 

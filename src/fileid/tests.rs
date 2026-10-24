@@ -2723,3 +2723,35 @@ fn dos_direct_vector_relocation_without_ah_selector() {
         detect(Path::new("opaque"), &unreachable).is_none_or(|d| d.file_type != FileType::DosCom)
     );
 }
+
+#[test]
+fn prefixed_utf16_html_extension_uses_decoded_content() {
+    let text = "%builder_placeholder%\r\n<html><head><hta:application id=\"x\"/></head><body></body></html>";
+    for little in [true, false] {
+        let mut data = if little {
+            vec![0xff, 0xfe]
+        } else {
+            vec![0xfe, 0xff]
+        };
+        for unit in text.encode_utf16() {
+            data.extend_from_slice(&if little {
+                unit.to_le_bytes()
+            } else {
+                unit.to_be_bytes()
+            });
+        }
+        for name in ["document.hta", "document.html", "document.htm"] {
+            assert_detect(name, &data, FileType::Html);
+        }
+    }
+    let mut prose = vec![0xff, 0xfe];
+    prose.extend(
+        "ordinary prose without markup"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes),
+    );
+    assert_ne!(
+        detect(Path::new("not-html.hta"), &prose).map(|d| d.file_type),
+        Some(FileType::Html)
+    );
+}

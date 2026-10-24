@@ -266,6 +266,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) -> Result<(), Er
         binary_flags(opt, metrics);
     }
     authenticode_from_header(&header, bytes, values, metrics);
+    super::pe_version_info::recover_partial(bytes, values);
     // Header-only fallback ran. Record that as a structured
     // fallback entry alongside the legacy `pe.partial_parse` bool
     // so trait authors can branch on either path. The bool is
