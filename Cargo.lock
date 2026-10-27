@@ -1529,9 +1529,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.5"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.2",
  "errno",
@@ -1790,7 +1790,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "2.1.1"
-source = "git+https://github.com/atomdrift-project/stng.git#12252770237ca3e5d0487b6c4b3a56e75e3e6435"
+source = "git+https://github.com/atomdrift-project/stng.git#7c3d704b971754d120e2f692cfb6f2a258dae88a"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -1815,7 +1815,7 @@ dependencies = [
 [[package]]
 name = "stng-process"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/stng.git#12252770237ca3e5d0487b6c4b3a56e75e3e6435"
+source = "git+https://github.com/atomdrift-project/stng.git#7c3d704b971754d120e2f692cfb6f2a258dae88a"
 dependencies = [
  "libc",
 ]
