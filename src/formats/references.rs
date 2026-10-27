@@ -68,6 +68,7 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Vec<
         FileType::PipfileLock => pipfile_lock(values, &mut out),
         FileType::GemfileLock => gemfile_lock(&mut out),
         FileType::Gem => gem_runtime_deps(values, &mut out),
+        FileType::Jar => maven_jar(values, &mut out),
         FileType::Vsix => vsix_deps(values, &mut out),
         FileType::ComposerLock => composer_lock(values, &mut out),
         FileType::YarnLock => yarn_lock(&mut out),
@@ -633,6 +634,49 @@ fn cargo_toml(values: &Values, out: &mut Refs<'_>) {
             repo,
             None,
         );
+    }
+}
+
+/// Embedded POM declarations retain scope without running an effective model.
+/// Unsupported declarations remain `jar.pom.dependency_gaps`, not latest pins.
+fn maven_jar(values: &Values, out: &mut Refs<'_>) {
+    let Some(rows) = values
+        .get_key(value_key!("jar.pom"))
+        .and_then(|pom| pom.get("dependencies"))
+        .and_then(JsonValue::as_array)
+    else {
+        return;
+    };
+    for row in rows {
+        let (Some(purl), Some(member), Some(evidence)) = (
+            row.get("purl").and_then(JsonValue::as_str),
+            row.get("member").and_then(JsonValue::as_str),
+            row.get("evidence").and_then(JsonValue::as_str),
+        ) else {
+            continue;
+        };
+        out.push(
+            RefLocator::Purl(purl.to_owned()),
+            RefKind::Dependency,
+            format!("jar.pom:{member}"),
+            evidence,
+            None,
+        );
+        if let Some(reference) = out.refs.last_mut() {
+            reference.context = Some(crate::DependencyContext {
+                scope: match row.get("scope").and_then(JsonValue::as_str) {
+                    Some("test") => crate::DependencyScope::Development,
+                    Some("provided") => crate::DependencyScope::Build,
+                    _ => crate::DependencyScope::Runtime,
+                },
+                optional: row
+                    .get("optional")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false),
+                has_install_script: false,
+                installed_path: None,
+            });
+        }
     }
 }
 

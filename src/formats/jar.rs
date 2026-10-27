@@ -20,6 +20,8 @@
 //!   describe the manifest's section structure.
 //! - `jar.pom.{group_id, artifact_id, version}` — first
 //!   `META-INF/maven/<g>/<a>/pom.properties` we find.
+//!   Embedded `pom.xml` files additionally supply direct dependency rows and
+//!   explicit effective-model coverage gaps. XML parsing is bounded and offline.
 //! - `jar.features[]` — Pike-style flag array (`signed`,
 //!   `multi_release`, `native_libs`, `embedded_jars`, `services`,
 //!   `java_agents`, `osgi_activator`).
@@ -42,7 +44,7 @@ use crate::output::{Errors, Metrics, Stage, Values};
 use crate::value_key;
 
 /// Cap on a single text entry we'll decompress for parsing
-/// (MANIFEST.MF / pom.properties). 1 MiB is generous; anything
+/// (MANIFEST.MF / pom.properties / pom.xml). 1 MiB is generous; anything
 /// larger is hostile zip-bomb input.
 const MAX_TEXT_BYTES: u64 = 1024 * 1024;
 
@@ -147,6 +149,9 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     let mut pom_artifact: Option<String> = None;
     let mut pom_version: Option<String> = None;
     let mut pom_reads = 0_usize;
+    let mut pom_xml_names = BTreeSet::new();
+    let mut pom_dependencies = Vec::new();
+    let mut pom_dependency_gaps = Vec::new();
     // Duplicate central-directory entries all name the one member a by-name
     // read finds, so the manifest is read once however often it is listed.
     let mut manifest_read = false;
@@ -249,6 +254,26 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
                 }
             }
         }
+        if name.starts_with("META-INF/maven/")
+            && name.ends_with("/pom.xml")
+            && pom_xml_names.insert(name.clone())
+        {
+            if pom_xml_names.len() <= MAX_POM_READS {
+                if let Some(text) = read_text(zip, name, errors) {
+                    super::maven_pom::dependencies(
+                        &text,
+                        name,
+                        &mut pom_dependencies,
+                        &mut pom_dependency_gaps,
+                    );
+                } else {
+                    pom_dependency_gaps.push(json!({"member": name, "reason": "POM XML could not be read within archive text limits"}));
+                }
+            } else if pom_xml_names.len() == MAX_POM_READS + 1 {
+                pom_dependency_gaps
+                    .push(json!({"member": name, "reason": "Embedded POM read limit reached"}));
+            }
+        }
     }
 
     if entry_count == 0 && manifest.as_ref().is_none_or(ManifestFacts::is_empty) {
@@ -306,7 +331,12 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         }
         values.insert_key(value_key!("jar.manifest"), JsonValue::Object(obj));
     }
-    if pom_group.is_some() || pom_artifact.is_some() || pom_version.is_some() {
+    if pom_group.is_some()
+        || pom_artifact.is_some()
+        || pom_version.is_some()
+        || !pom_dependencies.is_empty()
+        || !pom_dependency_gaps.is_empty()
+    {
         let mut pom = serde_json::Map::new();
         if let Some(g) = pom_group {
             pom.insert("group_id".into(), JsonValue::String(g));
@@ -316,6 +346,15 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         }
         if let Some(v) = pom_version {
             pom.insert("version".into(), JsonValue::String(v));
+        }
+        if !pom_dependencies.is_empty() {
+            pom.insert("dependencies".into(), JsonValue::Array(pom_dependencies));
+        }
+        if !pom_dependency_gaps.is_empty() {
+            pom.insert(
+                "dependency_gaps".into(),
+                JsonValue::Array(pom_dependency_gaps),
+            );
         }
         values.insert_key(value_key!("jar.pom"), JsonValue::Object(pom));
     }
@@ -601,6 +640,68 @@ mod tests {
         let (v, m, e) = run_with_errors(bytes);
         assert!(e.is_empty(), "{e:?}");
         (v, m)
+    }
+
+    #[test]
+    fn embedded_pom_dependencies_reach_the_typed_reference_view() {
+        let jar = build_jar(&[("META-INF/maven/g/app/pom.xml", br#"<project>
+          <dependencies>
+            <dependency><groupId>org.jetbrains.kotlin</groupId><artifactId>kotlin-stdlib</artifactId><version>2.0.20</version></dependency>
+            <dependency><groupId>g</groupId><artifactId>tests</artifactId><version>1</version><scope>test</scope><optional>true</optional></dependency>
+            <dependency><groupId>g</groupId><artifactId>inherited</artifactId></dependency>
+          </dependencies></project>"#)]);
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new("app.jar"))
+            .open(&jar);
+        let refs = parsed.references();
+        assert_eq!(refs.len(), 2, "{refs:?}");
+        assert_eq!(
+            refs[0].locator,
+            crate::RefLocator::Purl("pkg:maven/org.jetbrains.kotlin/kotlin-stdlib@2.0.20".into())
+        );
+        assert_eq!(
+            refs[0].context.as_ref().unwrap().scope,
+            crate::DependencyScope::Runtime
+        );
+        assert!(
+            refs[0].offset.is_none(),
+            "compressed member evidence has no outer-file offset"
+        );
+        assert_eq!(
+            refs[1].context.as_ref().unwrap().scope,
+            crate::DependencyScope::Development
+        );
+        assert!(refs[1].context.as_ref().unwrap().optional);
+        assert_eq!(
+            parsed
+                .values()
+                .get("jar.pom.dependency_gaps")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn embedded_pom_read_budget_preserves_a_gap() {
+        let names: Vec<_> = (0..MAX_POM_READS + 2)
+            .map(|i| format!("META-INF/maven/g/app{i}/pom.xml"))
+            .collect();
+        let entries: Vec<_> = names
+            .iter()
+            .map(|name| (name.as_str(), b"<project/>".as_slice()))
+            .collect();
+        let jar = build_jar(&entries);
+        let (values, _) = run(&jar);
+        let gaps = values
+            .get("jar.pom.dependency_gaps")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(gaps.len(), 1);
+        assert!(gaps[0]["reason"].as_str().unwrap().contains("read limit"));
     }
 
     fn run_with_errors(bytes: &[u8]) -> (Values, Metrics, Errors) {

@@ -145,6 +145,7 @@ mod macho;
 mod macho_code_signature;
 mod macho_hashes;
 mod markdown;
+mod maven_pom;
 mod nib;
 mod npm;
 mod nupkg;
