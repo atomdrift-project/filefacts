@@ -180,6 +180,7 @@ mod scpt;
 mod sevenz;
 mod shellcode;
 // Pending: lift once the in-flight source-walk refactor lands and fixes its hits.
+mod clr_il;
 pub(crate) mod source;
 mod source_meta;
 mod structured;

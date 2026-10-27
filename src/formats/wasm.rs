@@ -27,6 +27,9 @@ use crate::output::{DiagnosticKind, Stage, Symbols, Values};
 use crate::value_key;
 use serde_json::Value as JsonValue;
 
+#[path = "wasm_xor.rs"]
+mod xor;
+
 /// Defensive caps so a malformed module with inflated section/vector counts
 /// can't make us allocate unboundedly or spin. A real module stays far below.
 const MAX_ENTRIES: usize = 8192;
@@ -259,6 +262,7 @@ fn extract_producers(r: &mut Reader<'_>, values: &mut Values) {
 pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     let super::ExtractCtx {
         values,
+        strings,
         metrics,
         symbols: symbols_out,
         errors: errors_out,
@@ -268,6 +272,40 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     // anyway so a forced/misrouted file can't index out of range.
     if bytes.len() < 8 || !bytes.starts_with(b"\0asm") {
         return;
+    }
+
+    // Bytecode is executable code too: recover only instruction-bound XOR
+    // loops over active data. No guest module or imported API is executed.
+    super::common::extract_binary_strings(bytes, strings, super::common::XorScan::No);
+    let decoded = xor::recover(bytes);
+    if !decoded.is_empty() {
+        metrics.insert(
+            metric!("wasm.xor_decoded_range_count"),
+            decoded.len() as f64,
+        );
+        metrics.insert(
+            metric!("wasm.xor_decoded_bytes"),
+            decoded.iter().map(|r| r.bytes.len()).sum::<usize>() as f64,
+        );
+        values.insert_key(
+            value_key!("wasm.xor_decode"),
+            serde_json::json!({
+                "range_count": decoded.len(),
+                "decoded_bytes": decoded.iter().map(|r| r.bytes.len()).sum::<usize>(),
+            }),
+        );
+        let options = stng::ExtractOptions::new(4)
+            .with_garbage_filter(true)
+            .with_caller_provides_symbols(true);
+        let mut rows = Vec::new();
+        for range in decoded {
+            for mut row in stng::extract_strings_with_options(&range.bytes, &options) {
+                row.data_offset = row.data_offset.saturating_add(range.offset as u64);
+                row.method = stng::StringMethod::XorDecode;
+                rows.push(row);
+            }
+        }
+        strings.text.append_rows(&rows);
     }
 
     let mut r = Reader::new(bytes);

@@ -193,6 +193,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) -> Result<(), Er
         aliased_exports(&pe, bytes, metrics);
         clr_metadata(&pe, bytes, values, metrics);
         clr_resources(&pe, bytes, metrics);
+        clr_il_facts(&pe, bytes, values, metrics, symbols_out);
         data_directories(&pe, values);
         data_directory_anomalies(&pe, bytes, values, metrics);
         super::pe_image_hash::extract(&pe, bytes, values, metrics);
@@ -2366,6 +2367,80 @@ fn clr_metadata(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Me
                     put_str(values, value_key!("pe.clr.mvid"), format_guid(mvid));
                 }
             }
+        }
+    }
+}
+
+/// Managed references and IL are parsed as inert bytes, never through the CLR.
+fn clr_il_facts(
+    pe: &PE<'_>,
+    bytes: &[u8],
+    values: &mut Values,
+    metrics: &mut Metrics,
+    symbols: &mut crate::output::Symbols,
+) {
+    let Some(clr) = pe.clr_data.as_ref() else {
+        return;
+    };
+    let dir = clr.cor20_header.metadata;
+    let Some(base) = rva_to_file_offset(pe, dir.virtual_address) else {
+        return;
+    };
+    let Some(root) = base
+        .checked_add(dir.size as usize)
+        .and_then(|end| bytes.get(base..end))
+    else {
+        return;
+    };
+    let Some(result) = super::clr_il::analyze(root, base, bytes, |rva| rva_to_file_offset(pe, rva))
+    else {
+        return;
+    };
+    metrics.insert(metric!("pe.clr.method_count"), result.method_count as f64);
+    metrics.insert(
+        metric!("pe.clr.il_instruction_count"),
+        result.instruction_count as f64,
+    );
+    metrics.insert(metric!("pe.clr.calli_count"), result.calli_count as f64);
+    metrics.insert(
+        metric!("pe.clr.calli_method_count"),
+        result.calli_methods as f64,
+    );
+    metrics.insert(
+        metric!("pe.clr.resolver_pointer_method_count"),
+        result.resolver_pointer_methods as f64,
+    );
+    metrics.insert(
+        metric!("pe.clr.resource_xor_method_count"),
+        result.resource_xor_methods as f64,
+    );
+    values.insert_key(value_key!("pe.clr.il_scan"), serde_json::json!({"invalid_methods": result.invalid_methods, "truncated":result.truncated}));
+    for reference in result.references {
+        symbols.push(crate::Symbol::Import {
+            name: reference.name,
+            alias: None,
+            library: reference.library,
+            offset: Some(reference.offset as u64),
+            ordinal: None,
+        });
+    }
+    for method in result.methods {
+        symbols.push(crate::Symbol::Function {
+            name: method.name,
+            offset: Some(method.offset as u64),
+            complexity: None,
+            callees: method.callees,
+        });
+    }
+    for call in result.calls {
+        // An arity comes from the metadata signature. Actual argument values
+        // remain unknown: do not invent constants or value-flow relationships.
+        if let Some(arity) = call.arity {
+            symbols.push(crate::Symbol::Call {
+                target: Some(call.name),
+                args: vec![crate::Arg::Expression; arity],
+                offset: Some(call.offset as u64),
+            });
         }
     }
 }
