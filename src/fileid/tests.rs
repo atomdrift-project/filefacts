@@ -2303,6 +2303,46 @@ fn license_in_temp_dir_detected_as_text() {
     assert_eq!(det.source, DetectionSource::Filename);
 }
 
+#[test]
+fn extensionless_project_configuration_gets_text_fallback() {
+    for (name, data) in [
+        (".babelrc", b"{\"presets\": [\"example\"]}\n".as_slice()),
+        (".eslintrc", b"{\"extends\": \"example\"}\n".as_slice()),
+        (".eslintignore", b"build/\nnode_modules/\n".as_slice()),
+        (
+            ".editorconfig",
+            b"root = true\n[*]\nindent_size = 2\n".as_slice(),
+        ),
+    ] {
+        let detection = detect(Path::new(name), data).expect("config should be identified");
+        assert_ne!(detection.file_type, FileType::Unknown, "{name}");
+        assert!(
+            matches!(detection.file_type, FileType::Text | FileType::Json),
+            "{name}"
+        );
+    }
+    let elf = b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0";
+    assert!(detect(Path::new(".babelrc"), elf).is_none_or(|d| d.file_type != FileType::Text));
+}
+
+#[test]
+fn gcc_specs_section_identifies_extensionless_text() {
+    assert_detect(
+        "sysroot/lib/specs",
+        b"*self_spec:\n-wrapper /bin/sh,%R/wrap.sh\n",
+        FileType::Text,
+    );
+    assert_detect(
+        "specs",
+        b"*link:\n%{!static:--dynamic-linker /lib/ld.so}\n",
+        FileType::Text,
+    );
+    let prose = detect(Path::new("specs"), b"project specifications\n");
+    assert!(prose.is_none() || prose.unwrap().file_type != FileType::Text);
+    let binary = detect(Path::new("specs"), b"\x7fELF\x02\x01\x01\0*self_spec:\n");
+    assert!(binary.is_none() || binary.unwrap().file_type != FileType::Text);
+}
+
 // ── Content-first detection beats extension-only fallback ────────
 
 #[test]

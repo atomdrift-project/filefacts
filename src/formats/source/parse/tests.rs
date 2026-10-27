@@ -1,5 +1,26 @@
 use super::*;
 
+#[test]
+fn cpp_fallback_respects_cancellation_and_raw_delimiter_bounds() {
+    let cancelled = std::sync::atomic::AtomicBool::new(true);
+    let source = b"namespace example { template <typename T> void invoke(T x) { consume(x); } }";
+    let parsed = TreeCache::parse(source, FileType::C, Some(&cancelled));
+    assert!(parsed.cache().is_none());
+    // Exercise the C++ external scanner directly: an oversized, unfinished
+    // raw delimiter must recover or stop cleanly, rather than overflow its
+    // serialization buffer or make unbounded progress.
+    let malformed = format!(
+        "namespace example {{ auto value = R\"{}(unfinished",
+        "x".repeat(64 * 1024)
+    );
+    let started = Instant::now();
+    let parsed = TreeCache::parse_with_config(malformed.as_bytes(), FileType::C, None, &langs::CPP);
+    if let Some(cache) = parsed.cache() {
+        assert!(cache.tree().root_node().has_error());
+    }
+    assert!(started.elapsed() < SOURCE_PARSE_WALL_BACKSTOP + std::time::Duration::from_secs(1));
+}
+
 fn count_case_flip_nodes(node: tree_sitter::Node<'_>, source: &str) -> usize {
     let mut count = usize::from(
         node.kind() == "expansion"

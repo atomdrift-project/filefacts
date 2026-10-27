@@ -580,6 +580,12 @@ pub(super) fn detect_from_decoded(data: &[u8], decoded: Option<&[u8]>) -> Option
         return detect_from_content(text);
     }
 
+    // Sectioned key/value configs can quote source tokens in comments or
+    // values. Treat their document shape as text before language scoring.
+    if looks_like_ini_config(data) {
+        return Some(FileType::Text);
+    }
+
     // Detection rules, CI configuration, and package manifests quote the very
     // tokens this table scores: a rule pack hunting Python stagers contains
     // `import os`, one hunting macOS stealers contains `do shell script`. The
@@ -1178,11 +1184,58 @@ fn looks_like_prose(head: &[u8]) -> bool {
     punct * 100 < head.len() && code_lines * 100 < lines * 15
 }
 
-/// `true` when the bytes read as a structured-data document — a JSON object or
-/// array, or a YAML block mapping — rather than as code in any scored language.
-/// Kept deliberately shape-based: it asks how the lines are built, never which
-/// words they contain, so a rule file is data no matter which language's tokens
-/// it quotes.
+/// A conservative sectioned key/value document, such as an extensionless
+/// desktop configuration. Every significant line must fit the format.
+fn looks_like_ini_config(data: &[u8]) -> bool {
+    let head = data.get(..SCAN_LIMIT).unwrap_or(data);
+    if head.starts_with(b"#!") || looks_like_binary(head) {
+        return false;
+    }
+    let mut sections = 0usize;
+    let mut fields = 0usize;
+    let mut lines = head.split(|&b| b == b'\n').peekable();
+    while let Some(line) = lines.next() {
+        if lines.peek().is_none() && head.len() == SCAN_LIMIT {
+            break;
+        }
+        let line = line.trim_ascii();
+        if line.is_empty() || line.starts_with(b"#") || line.starts_with(b";") {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix(b"[").and_then(|s| s.strip_suffix(b"]")) {
+            if name.is_empty()
+                || !name
+                    .iter()
+                    .all(|c| c.is_ascii_alphanumeric() || b"_./: -".contains(c))
+            {
+                return false;
+            }
+            sections += 1;
+            continue;
+        }
+        let Some((key, _)) = line
+            .iter()
+            .position(|&b| b == b'=')
+            .map(|i| line.split_at(i))
+        else {
+            return false;
+        };
+        let key = key.trim_ascii();
+        if sections == 0
+            || key.is_empty()
+            || !key
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(c))
+        {
+            return false;
+        }
+        fields += 1;
+    }
+    sections >= 2 && fields >= 3
+}
+
+/// JSON containers, YAML mappings, and RFC822 stanzas are data even when
+/// their values quote programming-language tokens.
 fn looks_like_structured_data(data: &[u8]) -> bool {
     let head = data.get(..SCAN_LIMIT).unwrap_or(data);
     // A shebang names an interpreter: that is a script, whatever follows.

@@ -6,6 +6,64 @@ fn graph(path: &str, source: &str) -> Flow {
         .open(source.as_bytes());
     file.flow().unwrap().clone()
 }
+
+#[test]
+fn php_if_bodies_and_all_alternatives_preserve_values() {
+    let source = r#"<?php
+if (condition()) {
+    $data = acquire();
+    fwrite($peer, $data);
+} elseif (other()) {
+    $data = second();
+    fwrite($peer, $data);
+} elseif (third_condition()) {
+    $data = third();
+    fwrite($peer, $data);
+} else {
+    $data = last();
+    fwrite($peer, $data);
+}
+fwrite($peer, $data);
+if (condition()): $more = colon_read(); fwrite($peer, $more); endif;
+"#;
+    let flow = graph("relay.php", source);
+    assert!(!flow.limitations.contains("parse-error"), "{flow:?}");
+    assert!(!flow.limitations.contains("unmodeled-if-body"), "{flow:?}");
+    for name in ["acquire", "second", "third", "last", "colon_read"] {
+        assert!(
+            reaches(&flow, "fwrite", name),
+            "missing branch source {name}: {flow:?}"
+        );
+    }
+    assert_eq!(
+        flow.values
+            .iter()
+            .filter(|v| v.target.as_deref() == Some("fwrite"))
+            .count(),
+        6
+    );
+    let outside = source.find("}\nfwrite").unwrap() as u64 + 2;
+    let write = flow
+        .values
+        .iter()
+        .find(|v| v.offset == outside && v.target.as_deref() == Some("fwrite"))
+        .unwrap();
+    let origins = flow.origins(write.inputs[1], &[], 1000);
+    for name in ["acquire", "second", "third", "last"] {
+        assert!(
+            origins
+                .values
+                .iter()
+                .any(|o| flow.values[o.value].target.as_deref() == Some(name))
+        );
+    }
+    assert!(
+        flow.values
+            .iter()
+            .filter(|v| v.kind == FlowKind::Call)
+            .all(|v| v.module_level)
+    );
+}
 #[test]
 fn branch_merges_number_values_the_same_way_every_time() {
     // Branch bindings were merged in HashMap order, so value ids changed

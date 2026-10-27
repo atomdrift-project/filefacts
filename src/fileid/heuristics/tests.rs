@@ -1,5 +1,17 @@
 use super::*;
 
+#[test]
+fn sectioned_desktop_config_does_not_score_as_python() {
+    let config = b"; examples mention self. except def exec(\n[colors]\nbackground = #222222\nforeground = #ffffff\n[bar/example]\nmonitor = ${env:MONITOR:}\nwidth = 100%\n";
+    assert_eq!(detect_from_content(config), Some(FileType::Text));
+    for code in [
+        b"import os\nitems = [1, 2]\ndef run():\n    return os.getcwd()\n".as_slice(),
+        b"#!/usr/bin/python3\nimport os\n[one]\nx = 1\ny = 2\n[two]\nz = 3\n".as_slice(),
+    ] {
+        assert_eq!(detect_from_content(code), Some(FileType::Python));
+    }
+}
+
 fn fat12_boot_sector() -> [u8; 512] {
     let mut data = [0u8; 512];
     data[..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);

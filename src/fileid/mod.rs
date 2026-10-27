@@ -1602,6 +1602,27 @@ fn detect_known(sniff: &Sniff<'_>) -> Option<Detection> {
         });
     }
 
+    // GCC's extensionless specs files contain named `*spec:` sections. A
+    // name alone is ambiguous, so require both the filename and a section
+    // header, and let binary magic and executable shebangs win above.
+    if path.file_name().is_some_and(|name| name == "specs")
+        && magic::content_is_text(data)
+        && data.split(|b| *b == b'\n').any(|line| {
+            let line = line.trim_ascii();
+            line.strip_prefix(b"*")
+                .and_then(|s| s.strip_suffix(b":"))
+                .is_some_and(|name| {
+                    !name.is_empty() && name.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                })
+        })
+    {
+        return Some(Detection {
+            file_type: FileType::Text,
+            source: DetectionSource::Heuristic,
+            ext_match: ExtensionMatch::of(path, ext_ft, FileType::Text),
+        });
+    }
+
     // `.git/config` is normally extensionless. Its section/key structure is
     // a strong content signature, and may correct even a misleading filename
     // before source-language or exact-name fallbacks get a chance to win.

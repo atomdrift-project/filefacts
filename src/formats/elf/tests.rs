@@ -40,6 +40,32 @@ fn run(bytes: &[u8]) -> (Values, Strings, Metrics) {
 }
 
 #[test]
+fn truncated_section_table_does_not_claim_metadata_absence() {
+    let complete = elf_with_section(".comment", b"compiler\0");
+    let section_offset = u64::from_le_bytes(complete[40..48].try_into().unwrap());
+    let (_, _, complete_metrics) = run(&complete);
+    assert_eq!(complete_metrics.get("binary.is_stripped"), Some(1.0));
+
+    let mut truncated = complete;
+    truncated.truncate(truncated.len() - 1);
+    let (values, _, metrics) = run(&truncated);
+    assert_eq!(metrics.get("elf.section_headers_truncated"), Some(1.0));
+    assert_eq!(metrics.get("binary.is_pie"), Some(0.0));
+    assert_eq!(
+        values.get("elf.shoff").and_then(|v| v.as_u64()),
+        Some(section_offset)
+    );
+    assert_eq!(values.get("elf.shstrndx").and_then(|v| v.as_u64()), Some(2));
+    assert_eq!(metrics.get("binary.is_stripped"), None);
+    assert_eq!(
+        metrics.get("binary.full_symbol_table_absent_or_empty"),
+        None
+    );
+    assert_eq!(metrics.get("elf.absent_metadata_section_count"), None);
+    assert!(values.get("elf.absent_metadata_sections").is_none());
+}
+
+#[test]
 fn split_mdt_header_contract_requires_private_segments_and_absent_load_bytes() {
     let mut b = vec![0_u8; 148];
     b[..7].copy_from_slice(b"\x7fELF\x01\x01\x01");
@@ -1040,4 +1066,89 @@ fn distinct_long_section_names_are_cut() {
     assert!(names.iter().any(|n| n.chars().count() == MAX_SECTION_NAME));
     let (_, _, m) = run(&bytes);
     assert!(m.get("elf.duplicate_section_name_count").is_some());
+}
+
+#[test]
+fn static_function_fallback_recovers_only_defined_executable_functions() {
+    use crate::output::{Symbol, SymbolKind};
+    let text = [0x90_u8; 16];
+    let strtab = b"\0local_handler\0data_object\0undefined\0";
+    let mut payload = text.to_vec();
+    let str_off = PAYLOAD + payload.len() as u64;
+    payload.extend_from_slice(strtab);
+    payload.resize(payload.len().next_multiple_of(8), 0);
+    let sym_off = PAYLOAD + payload.len() as u64;
+    payload.extend_from_slice(&[0_u8; 24]);
+    for (name, kind, section, address, size) in [
+        (1_u32, 2_u8, 1_u16, PAYLOAD, 4_u64),
+        (15, 1, 1, PAYLOAD, 4),
+        (27, 2, 0, 0, 0),
+    ] {
+        let mut sym = [0_u8; 24];
+        sym[0..4].copy_from_slice(&name.to_le_bytes());
+        sym[4] = kind;
+        sym[6..8].copy_from_slice(&section.to_le_bytes());
+        sym[8..16].copy_from_slice(&address.to_le_bytes());
+        sym[16..24].copy_from_slice(&size.to_le_bytes());
+        payload.extend_from_slice(&sym);
+    }
+    let bytes = elf_over_payload(
+        &payload,
+        &[],
+        &[
+            Sec {
+                name: ".text",
+                ty: 1,
+                flags: 6,
+                off: PAYLOAD,
+                size: text.len() as u64,
+                ..Sec::default()
+            },
+            Sec {
+                name: ".strtab",
+                ty: 3,
+                off: str_off,
+                size: strtab.len() as u64,
+                ..Sec::default()
+            },
+            Sec {
+                name: ".symtab",
+                ty: 2,
+                off: sym_off,
+                size: 96,
+                link: 2,
+                entsize: 24,
+                ..Sec::default()
+            },
+        ],
+    );
+    let elf = Elf::parse(&bytes).unwrap();
+    let mut out = crate::Symbols::default();
+    static_function_fallback(&elf, bytes.len(), &mut out);
+    let functions: Vec<_> = out
+        .iter()
+        .filter(|s| s.kind() == SymbolKind::Function)
+        .collect();
+    assert_eq!(functions.len(), 1);
+    assert!(
+        matches!(functions[0], Symbol::Function { name, offset: Some(64), complexity: None, .. } if name == "local_handler")
+    );
+
+    let mut rich = crate::Symbols::default();
+    rich.push(Symbol::Function {
+        name: "analyzed".into(),
+        offset: Some(64),
+        complexity: Some(3),
+        callees: vec!["target".into()],
+    });
+    static_function_fallback(&elf, bytes.len(), &mut rich);
+    assert_eq!(
+        rich.iter()
+            .filter(|s| s.kind() == SymbolKind::Function)
+            .count(),
+        1
+    );
+    assert!(
+        matches!(rich.iter().next(), Some(Symbol::Function { name, complexity: Some(3), .. }) if name == "analyzed")
+    );
 }

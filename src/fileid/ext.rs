@@ -263,6 +263,15 @@ fn detect_from_filename(path: &Path) -> Option<FileType> {
     if name.eq_ignore_ascii_case(".npmrc") || name.eq_ignore_ascii_case(".yarnrc") {
         return Some(FileType::Text);
     }
+    // Common extensionless project configuration files may be JSON, YAML,
+    // INI-style text or ignore lists. Give them a text fallback so their
+    // contents are scanned; stronger content and binary signatures still win.
+    if [".babelrc", ".eslintrc", ".eslintignore", ".editorconfig"]
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+    {
+        return Some(FileType::Text);
+    }
     // Xcode project. The name is fixed by the format -- it is always
     // `<name>.xcodeproj/project.pbxproj` -- but the extension arm below still
     // covers the file copied out of its bundle for analysis.

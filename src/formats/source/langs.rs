@@ -56,12 +56,13 @@ pub(super) enum Lang {
     Elixir,
     Makefile,
     Clojure,
+    Cpp,
     Batch,
 }
 
 impl Lang {
     /// Number of variants, for tables indexed by `lang as usize`.
-    pub(super) const COUNT: usize = 24;
+    pub(super) const COUNT: usize = 25;
 
     /// Stable label exposed under `values.source.language` and as the flow
     /// view's `language`. Rule authors match on these strings, so they must
@@ -79,6 +80,7 @@ impl Lang {
             Self::Lua => "lua",
             Self::CSharp => "csharp",
             Self::C => "c",
+            Self::Cpp => "cpp",
             Self::Scala => "scala",
             Self::ObjC => "objc",
             Self::Kotlin => "kotlin",
@@ -109,7 +111,7 @@ impl Lang {
             Self::Ruby => FileType::Ruby,
             Self::Lua => FileType::Lua,
             Self::CSharp => FileType::CSharp,
-            Self::C => FileType::C,
+            Self::C | Self::Cpp => FileType::C,
             Self::Scala => FileType::Scala,
             Self::ObjC => FileType::ObjectiveC,
             Self::Kotlin => FileType::Kotlin,
@@ -352,6 +354,7 @@ static ALL: [&LangConfig; Lang::COUNT] = [
     &ELIXIR,
     &MAKEFILE,
     &CLOJURE,
+    &CPP,
     &BATCH,
 ];
 
@@ -361,7 +364,12 @@ pub(super) fn config_for(file_type: FileType) -> Option<&'static LangConfig> {
         .find(|config| config.lang.file_type() == file_type)
 }
 
+pub(super) fn config_named(name: &str) -> Option<&'static LangConfig> {
+    ALL.into_iter().find(|config| config.name() == name)
+}
+
 /// The file type whose language is labelled `name` ([`Lang::name`]).
+#[cfg(test)]
 pub(super) fn file_type_named(name: &str) -> Option<FileType> {
     ALL.into_iter()
         .find(|config| config.name() == name)
@@ -792,6 +800,33 @@ static C: LangConfig = LangConfig {
     function_kinds: &[],
     template_kinds: &[],
     binary_op_kinds: &["binary_expression"],
+};
+
+/// C++ shares the external C-family file type while publishing its actual
+/// parser dialect as source.language=cpp.
+pub(super) static CPP: LangConfig = LangConfig {
+    lang: Lang::Cpp,
+    language: || tree_sitter_cpp::LANGUAGE.into(),
+    string_kinds: &["string_literal", "raw_string_literal"],
+    function_query: r#"
+        (function_definition
+            declarator: (function_declarator declarator: (identifier) @fn))
+        (function_definition
+            declarator: (pointer_declarator
+                declarator: (function_declarator declarator: (identifier) @fn)))
+        (function_definition
+            declarator: (function_declarator
+                declarator: (qualified_identifier name: (identifier) @fn)))
+    "#,
+    class_query: r#"
+        (struct_specifier name: (type_identifier) @class)
+        (union_specifier name: (type_identifier) @class)
+        (enum_specifier name: (type_identifier) @class)
+        (class_specifier name: (type_identifier) @class)
+    "#,
+    compiled: CompiledQueries::new(),
+    function_kinds: &["lambda_expression"],
+    ..C
 };
 
 static SCALA: LangConfig = LangConfig {
@@ -1313,13 +1348,18 @@ mod tests {
         assert_eq!(names.len(), ALL.len());
     }
 
-    /// `config_for` and `file_type_named` both resolve through `Lang`, so each
-    /// language's file type and label must lead back to its own configuration.
+    /// Labels resolve to individual dialects. File types select a default;
+    /// C++ is the fallback dialect of the shared C-family file type.
     #[test]
     fn file_types_and_labels_resolve_to_their_config() {
         for config in ALL {
             let file_type = config.lang.file_type();
-            assert!(std::ptr::eq(config_for(file_type).unwrap(), config));
+            assert!(std::ptr::eq(config_named(config.name()).unwrap(), config));
+            if config.lang == Lang::Cpp {
+                assert_eq!(config_for(file_type).unwrap().lang, Lang::C);
+            } else {
+                assert!(std::ptr::eq(config_for(file_type).unwrap(), config));
+            }
             assert_eq!(file_type_named(config.name()), Some(file_type));
         }
         assert_eq!(file_type_named("cobol"), None);

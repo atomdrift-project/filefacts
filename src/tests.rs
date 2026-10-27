@@ -63,6 +63,7 @@ fn validate_source_query_accepts_every_parser_language() {
         "lua",
         "csharp",
         "c",
+        "cpp",
         "scala",
         "objc",
         "kotlin",

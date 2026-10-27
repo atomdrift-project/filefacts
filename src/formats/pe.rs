@@ -191,6 +191,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) -> Result<(), Er
         dos_stub_anomalies(&pe, bytes, metrics);
         checksum(&pe, bytes, metrics);
         aliased_exports(&pe, bytes, metrics);
+        shared_early_export_calls(&pe, bytes, metrics);
         clr_metadata(&pe, bytes, values, metrics);
         clr_resources(&pe, bytes, metrics);
         clr_il_facts(&pe, bytes, values, metrics, symbols_out);
@@ -279,6 +280,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) -> Result<(), Er
     );
     errors_out.record_fallback(crate::Stage::PeParse, "header-only fallback");
     metrics.insert(metric!("pe.partial_parse"), 1.0);
+    partial_section_overflows(bytes, &header, values, metrics);
     // goblin couldn't parse the section table / import directory at all
     // (the header-only path leaves `sections_out` and `symbols_out` empty).
     // This is exactly the case rizin recovery exists for — without it,
@@ -300,6 +302,55 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) -> Result<(), Er
         metrics,
     );
     Ok(())
+}
+
+/// A failed resource/import walk need not discard the raw section-table
+/// geometry. Only use a complete, bounded section table; never infer a clean
+/// count from a truncated table.
+fn partial_section_overflows(
+    bytes: &[u8],
+    header: &goblin::pe::header::Header<'_>,
+    values: &mut Values,
+    metrics: &mut Metrics,
+) {
+    let count = usize::from(header.coff_header.number_of_sections);
+    if count == 0 || count > 96 {
+        return;
+    }
+    let Some(start) = (header.dos_header.pe_pointer as usize)
+        .checked_add(4 + 20 + usize::from(header.coff_header.size_of_optional_header))
+    else {
+        return;
+    };
+    let Some(end) = count.checked_mul(40).and_then(|n| start.checked_add(n)) else {
+        return;
+    };
+    let Some(table) = bytes.get(start..end) else {
+        return;
+    };
+    let mut names = Vec::new();
+    for section in table.as_chunks::<40>().0 {
+        let Some(size) = crate::bytes::u32_le(section, 16) else {
+            return;
+        };
+        let Some(offset) = crate::bytes::u32_le(section, 20) else {
+            return;
+        };
+        if size != 0 && u64::from(offset) + u64::from(size) > bytes.len() as u64 {
+            let name = &section[..8];
+            let name = name.split(|&b| b == 0).next().unwrap_or_default();
+            names.push(JsonValue::String(
+                String::from_utf8_lossy(name).into_owned(),
+            ));
+        }
+    }
+    metrics.insert(metric!("pe.section_overflow_count"), names.len() as f64);
+    if !names.is_empty() {
+        values.insert_key(
+            value_key!("pe.overflowing_sections"),
+            JsonValue::Array(names),
+        );
+    }
 }
 
 /// Whether the optional header points at an export directory. Without one
@@ -2842,12 +2893,94 @@ fn section_anomalies(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &m
     }
 }
 
-/// Count exports whose first instruction shares a jump/call target
-/// with another export — the canonical stub-thunk aliasing pattern
-/// (malware aliasing N export names to a single payload via `JMP
-/// fcn_X`). Decodes one instruction per export RVA via `iced_x86`,
-/// groups by `near_branch_target`, and emits the population count of
-/// every group with ≥2 members.
+fn early_direct_calls(code: &[u8], rva: u64, bitness: u32) -> Vec<u64> {
+    use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind};
+    let mut targets = Vec::new();
+    let decoder = Decoder::with_ip(bitness, code, rva, DecoderOptions::NONE);
+    for ins in decoder.into_iter().take(12) {
+        if ins.is_invalid() {
+            break;
+        }
+        match ins.flow_control() {
+            FlowControl::Call => {
+                if matches!(
+                    ins.op0_kind(),
+                    OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+                ) {
+                    let target = ins.near_branch_target();
+                    if !targets.contains(&target) {
+                        targets.push(target);
+                    }
+                }
+            }
+            FlowControl::Next => {}
+            // A branch, return, exception or indirect call ends the straight
+            // line; do not claim calls beyond it are on this entry path.
+            _ => break,
+        }
+    }
+    targets
+}
+
+/// Largest number of named, non-forwarded export entries that have the same
+/// direct call in their first straight-line instructions. This reports a
+/// code shape; it does not establish invocation or the callee's behavior.
+fn shared_early_export_calls(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
+    use goblin::pe::optional_header::{MAGIC_32, MAGIC_64};
+    use std::collections::HashMap;
+    let Some(opt) = pe.header.optional_header.as_ref() else {
+        return;
+    };
+    let bitness = match opt.standard_fields.magic {
+        MAGIC_32 => 32,
+        MAGIC_64 => 64,
+        _ => return,
+    };
+    let mut counts: HashMap<u64, u32> = HashMap::new();
+    for export in &pe.exports {
+        if export.name.is_none() || export.reexport.is_some() {
+            continue;
+        }
+        let Ok(rva) = u32::try_from(export.rva) else {
+            continue;
+        };
+        // Use the same first-match rule as the RVA mapper, including its
+        // loader-aligned raw extent. Overlapping section headers must not
+        // let an executable section bless bytes mapped from another section.
+        let alignment = Some(opt.windows_fields.file_alignment);
+        let Some(section) = pe.sections.iter().find(|s| {
+            rva.checked_sub(s.virtual_address)
+                .is_some_and(|delta| u64::from(delta) < file_backed_size(s, alignment))
+        }) else {
+            continue;
+        };
+        if section.characteristics & 0x2000_0000 == 0 {
+            continue;
+        }
+        let Some(offset) = rva_to_file_offset(pe, rva) else {
+            continue;
+        };
+        let available =
+            file_backed_size(section, alignment) - u64::from(rva - section.virtual_address);
+        let end = offset
+            .saturating_add(usize::try_from(available.min(64)).unwrap_or(0))
+            .min(bytes.len());
+        let Some(code) = bytes.get(offset..end) else {
+            continue;
+        };
+        for target in early_direct_calls(code, u64::from(rva), bitness) {
+            *counts.entry(target).or_default() += 1;
+        }
+    }
+    if let Some(max) = counts.values().max().filter(|&&n| n >= 2) {
+        metrics.insert(
+            metric!("pe.exports_max_shared_early_call_count"),
+            f64::from(*max),
+        );
+    }
+}
+
+/// Count exports whose first direct jump/call target is shared.
 fn aliased_exports(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
     use iced_x86::{Decoder, DecoderOptions, Mnemonic};
     use std::collections::HashMap;

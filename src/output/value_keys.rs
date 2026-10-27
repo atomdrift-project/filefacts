@@ -846,6 +846,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "source.go.initialization_http",
     "source.go.package",
     "source.go.test_entry_candidates",
+    "source.js.runtime_imports",
     "source.language",
     "source.payload_flow.events",
     "source.payload_flow.truncated",

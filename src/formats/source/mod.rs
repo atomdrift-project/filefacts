@@ -381,6 +381,9 @@ pub(super) fn extract(
         value_key!("source.language"),
         JsonValue::String(config.name().to_string()),
     );
+    if matches!(config.lang, Lang::JavaScript | Lang::TypeScript) {
+        emit_static_runtime_imports(root, source, values);
+    }
     if config.lang == Lang::Python {
         python_module_calls::emit(root, source, values);
     }
@@ -473,6 +476,29 @@ fn decode_string_literal(
     config: &langs::LangConfig,
 ) -> Option<String> {
     let raw = node.utf8_text(source.as_bytes()).ok()?;
+    if config.lang == Lang::Cpp && node.kind() == "raw_string_literal" {
+        let raw = ["u8R\"", "uR\"", "UR\"", "LR\"", "R\""]
+            .into_iter()
+            .find_map(|prefix| raw.strip_prefix(prefix))?;
+        let (delimiter, body) = raw.split_once('(')?;
+        if delimiter.len() > 16 {
+            return None;
+        }
+        return body
+            .strip_suffix(&format!("){delimiter}\""))
+            .map(str::to_owned);
+    }
+    let raw = if config.lang == Lang::Cpp {
+        ["u8", "u", "U", "L"]
+            .into_iter()
+            .find_map(|prefix| {
+                raw.strip_prefix(prefix)
+                    .filter(|body| body.starts_with('"'))
+            })
+            .unwrap_or(raw)
+    } else {
+        raw
+    };
     if config.lang == Lang::Elixir && (raw.starts_with("\"\"\"") || raw.starts_with("'''")) {
         return escapes::decode_elixir_heredoc(raw);
     }
@@ -738,6 +764,72 @@ fn qualify_relative_member(node: Node<'_>, cleaned: String, source: &str) -> Str
     }
 }
 
+/// Static ES module edges that can execute at runtime. Type-only imports and
+/// exports are excluded; names and offsets are kept for dependency discovery.
+fn emit_static_runtime_imports(root: Node<'_>, source: &str, values: &mut Values) {
+    let mut rows = Vec::new();
+    for statement in named_children(root) {
+        if !matches!(statement.kind(), "import_statement" | "export_statement") {
+            continue;
+        }
+        let Some(module) = statement.child_by_field_name("source") else {
+            continue;
+        };
+        if module.kind() != "string" || statement_has_type_only_clause(statement) {
+            continue;
+        }
+        let Ok(raw) = module.utf8_text(source.as_bytes()) else {
+            continue;
+        };
+        let specifier = strip_quotes(raw);
+        if !specifier.is_empty() {
+            rows.push(serde_json::json!({"specifier": specifier, "offset": module.start_byte()}));
+        }
+        if rows.len() >= SOURCE_QUERY_OUTPUT_LIMIT {
+            break;
+        }
+    }
+    if !rows.is_empty() {
+        values.insert_key(
+            value_key!("source.js.runtime_imports"),
+            JsonValue::Array(rows),
+        );
+    }
+}
+
+/// TypeScript allows both `import type {X}` and per-specifier `type X`.
+/// A side-effect import, default binding, namespace binding, or any value
+/// specifier makes the edge runtime. Empty clauses retain the module edge.
+fn statement_has_type_only_clause(statement: Node<'_>) -> bool {
+    let mut cursor = statement.walk();
+    if statement.children(&mut cursor).any(|n| n.kind() == "type") {
+        return true;
+    }
+    let Some(clause) =
+        named_children(statement).find(|n| matches!(n.kind(), "import_clause" | "export_clause"))
+    else {
+        return false;
+    };
+    let list = if clause.kind() == "import_clause" {
+        let children: Vec<_> = named_children(clause).collect();
+        if children.iter().any(|n| n.kind() != "named_imports") {
+            return false;
+        }
+        children.into_iter().find(|n| n.kind() == "named_imports")
+    } else {
+        Some(clause)
+    };
+    let Some(list) = list else { return false };
+    let specs: Vec<_> = named_children(list)
+        .filter(|n| matches!(n.kind(), "import_specifier" | "export_specifier"))
+        .collect();
+    !specs.is_empty()
+        && specs.into_iter().all(|spec| {
+            let mut cursor = spec.walk();
+            spec.children(&mut cursor).any(|n| n.kind() == "type")
+        })
+}
+
 fn strip_quotes(s: &str) -> String {
     if let [first, inner @ .., last] = s.as_bytes()
         && first == last
@@ -753,15 +845,17 @@ pub(crate) fn supports(file_type: FileType) -> bool {
     langs::config_for(file_type).is_some()
 }
 
-/// Resolve `file_type` to its tree-sitter [`Language`](tree_sitter::Language). Used by callers
+/// Resolve a source dialect label to its tree-sitter [`Language`](tree_sitter::Language). Used by callers
 /// that want to compile a tree-sitter query against the same grammar
-/// filefacts uses internally — e.g. rule-engine load-time validation.
-pub(crate) fn tree_sitter_language(file_type: FileType) -> Option<tree_sitter::Language> {
-    langs::config_for(file_type).map(|config| (config.language)())
+/// filefacts uses internally — e.g. rule-engine load-time validation. C and
+/// C++ have distinct grammars despite sharing the external C-family type.
+pub(crate) fn tree_sitter_language_named(name: &str) -> Option<tree_sitter::Language> {
+    langs::config_named(name).map(|config| (config.language)())
 }
 
 /// The file type of the language labelled `name`, the value published under
 /// `values.source.language` (e.g. `"python"`, `"bash"`, `"objc"`).
+#[cfg(test)]
 pub(crate) fn file_type_for_language(name: &str) -> Option<FileType> {
     langs::file_type_named(name)
 }

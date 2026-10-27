@@ -125,6 +125,7 @@ pub(super) fn function_kinds_for(lang: Lang) -> &'static [&'static str] {
         | Lang::Lua
         | Lang::CSharp
         | Lang::C
+        | Lang::Cpp
         | Lang::Scala
         | Lang::ObjC
         | Lang::Kotlin

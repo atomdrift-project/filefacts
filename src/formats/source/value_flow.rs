@@ -103,6 +103,7 @@ fn definition(node: Node<'_>) -> bool {
             | "singleton_method"
             | "local_function"
             | "lambda"
+            | "lambda_expression"
     )
 }
 
@@ -223,6 +224,23 @@ impl Builder<'_> {
                 self.flow.limitations.insert("nested-function".into());
             }
             return 0;
+        }
+        if self.config.lang == Lang::Cpp {
+            // Member initializers depend on object construction; variable
+            // templates depend on instantiation. Neither is an unconditional
+            // namespace-level initializer. The separate definition walk still
+            // analyzes named methods and function-template bodies.
+            let limitation = match node.kind() {
+                "class_specifier" | "struct_specifier" | "union_specifier" => {
+                    Some("class-initializers-unmodeled")
+                }
+                "template_declaration" => Some("template-instantiation-unmodeled"),
+                _ => None,
+            };
+            if let Some(limitation) = limitation {
+                self.flow.limitations.insert(limitation.into());
+                return 0;
+            }
         }
         if node.kind().contains("comment")
             || node.kind().starts_with("import")
@@ -421,33 +439,40 @@ impl Builder<'_> {
             // What the branches change, over the bindings before the `if`.
             let mut merged: BTreeMap<String, usize> = BTreeMap::new();
             let mut values = Vec::new();
-            for field in ["consequence", "alternative"] {
-                if let Some(branch) = node.child_by_field_name(field) {
-                    let mut local = Bindings::under(bindings);
-                    values.push(self.eval(branch, &mut local, returns, depth + 1));
-                    // A name neither this branch nor an earlier one changed
-                    // resolves to the bindings before the `if` in `local` and
-                    // `merged` alike, so only changed names can need a merge.
-                    // Sorted, so value ids are stable.
-                    let names: BTreeSet<&String> =
-                        local.layered_names().chain(merged.keys()).collect();
-                    let mut changes = Vec::new();
-                    for name in names {
-                        let Some(id) = local.get(name) else {
-                            continue;
-                        };
-                        let previous = merged.get(name).copied().or_else(|| bindings.get(name));
-                        if let Some(previous) = previous {
-                            if previous != id {
-                                let merge = self.add(FlowKind::Merge, branch, vec![previous, id]);
-                                changes.push((name.clone(), merge));
-                            }
-                        } else {
-                            changes.push((name.clone(), id));
+            let consequence = node
+                .child_by_field_name("consequence")
+                .or_else(|| node.child_by_field_name("body"));
+            if consequence.is_none() {
+                self.flow.limitations.insert("unmodeled-if-body".into());
+            }
+            let mut cursor = node.walk();
+            let branches = consequence
+                .into_iter()
+                .chain(node.children_by_field_name("alternative", &mut cursor));
+            for branch in branches {
+                let mut local = Bindings::under(bindings);
+                values.push(self.eval(branch, &mut local, returns, depth + 1));
+                // A name neither this branch nor an earlier one changed
+                // resolves to the bindings before the `if` in `local` and
+                // `merged` alike, so only changed names can need a merge.
+                // Sorted, so value ids are stable.
+                let names: BTreeSet<&String> = local.layered_names().chain(merged.keys()).collect();
+                let mut changes = Vec::new();
+                for name in names {
+                    let Some(id) = local.get(name) else {
+                        continue;
+                    };
+                    let previous = merged.get(name).copied().or_else(|| bindings.get(name));
+                    if let Some(previous) = previous {
+                        if previous != id {
+                            let merge = self.add(FlowKind::Merge, branch, vec![previous, id]);
+                            changes.push((name.clone(), merge));
                         }
+                    } else {
+                        changes.push((name.clone(), id));
                     }
-                    merged.extend(changes);
                 }
+                merged.extend(changes);
             }
             for (name, id) in merged {
                 bindings.insert(name, id);
@@ -479,6 +504,7 @@ impl Builder<'_> {
                     | Lang::JavaScript
                     | Lang::TypeScript
                     | Lang::C
+                    | Lang::Cpp
                     | Lang::Java
                     | Lang::CSharp
             );
@@ -608,6 +634,7 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
                 let name = builder.text(name).to_string();
                 let mut function = FlowFunction::default();
                 let mut bindings = Bindings::over(&globals);
+                builder.in_function = true;
                 if let Some(params) = field_nested(node, "parameters") {
                     for param in named_children(params) {
                         let pattern = param
@@ -621,13 +648,12 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
                     }
                 }
                 if let Some(body) = node.child_by_field_name("body") {
-                    builder.in_function = true;
                     let tail = builder.eval(body, &mut bindings, &mut function.returns, 0);
-                    builder.in_function = false;
                     if config.lang == Lang::Rust {
                         function.returns.push(tail);
                     }
                 }
+                builder.in_function = false;
                 if builder
                     .flow
                     .functions

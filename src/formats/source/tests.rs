@@ -1,6 +1,270 @@
 use super::*;
 
 #[test]
+fn detached_numeric_sequence_calls_have_static_targets_without_receivers() {
+    let source = r#"
+(0, child_process.fork)("one");
+(0, node_child_process_1.fork)("two");
+((0, child_process["spawn"]))("three");
+(0 /* compiler comment */, child_process.exec)("four");
+(1, child_process.fork)("not-zero");
+(0x0, child_process["execFile"])("hex");
+(side_effect(), child_process.fork)("side-effect");
+(0, child_process[chosen])("computed");
+const text = "(0, child_process.fork)('quoted')";
+"#;
+    for path in ["calls.js", "calls.ts"] {
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new(path))
+            .open(source.as_bytes());
+        let flow = parsed.flow().unwrap();
+        assert!(!flow.limitations.contains("parse-error"));
+        for (marker, target) in [
+            ("one", Some("child_process.fork")),
+            ("two", Some("node_child_process_1.fork")),
+            ("three", Some("child_process.spawn")),
+            ("four", Some("child_process.exec")),
+            ("not-zero", Some("child_process.fork")),
+            ("hex", Some("child_process.execFile")),
+            ("side-effect", None),
+            ("computed", None),
+        ] {
+            let (offset, args) = parsed
+                .symbols()
+                .iter_kind(crate::SymbolKind::Call)
+                .find_map(|s| match s {
+                    crate::Symbol::Call {
+                        target: actual,
+                        args,
+                        offset,
+                        ..
+                    } if args
+                        .iter()
+                        .any(|a| matches!(a,crate::Arg::String {value} if value==marker)) =>
+                    {
+                        assert_eq!(actual.as_deref(), target, "{path}: {marker}");
+                        Some((offset.expect("source call offset"), args))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(args.len(), 1);
+            let value = flow
+                .values
+                .iter()
+                .find(|v| v.kind == crate::FlowKind::Call && v.offset == offset)
+                .unwrap();
+            assert_eq!(value.target.as_deref(), target, "flow {path}: {marker}");
+            assert!(
+                value.receiver.is_none(),
+                "detached call must not acquire a receiver"
+            );
+        }
+        assert!(!parsed.symbols().iter_kind(crate::SymbolKind::Call).any(
+            |s| matches!(s,crate::Symbol::Call {args,..} if args.iter().any(|a|
+                matches!(a,crate::Arg::String {value} if value=="quoted")))
+        ));
+    }
+}
+
+#[test]
+fn cpp_templates_preserve_callable_scope_and_buffer_flow() {
+    let source = r#"
+namespace functions {
+template <typename T> void invoke(void *process, T payload) {
+    auto buffer = VirtualAllocEx(process, 0, 4096, 0x3000, 0x40);
+    WriteProcessMemory(process, buffer, payload, 4096, 0);
+    CreateRemoteThread(process, 0, 0, buffer, 0, 0, 0);
+}
+}
+auto initialized = initialize();
+"#;
+    let parsed = crate::OpenOptions::new()
+        .path(std::path::Path::new("functions.h"))
+        .open(source.as_bytes());
+    assert_eq!(parsed.fileid().file_type(), crate::FileType::C);
+    assert_eq!(
+        parsed.values().get("source.language"),
+        Some(&serde_json::json!("cpp"))
+    );
+    let ast = parsed.source_ast().expect("C++ AST");
+    assert!(!ast.tree.root_node().has_error());
+    let query = Query::new(&ast.tree.language(), "(template_declaration) @template").unwrap();
+    assert_eq!(
+        collect_query(&query, source, ast.tree.root_node())
+            .items
+            .len(),
+        1
+    );
+    // C-family rule queries remain usable on the selected C++ grammar.
+    let query = Query::new(
+        &ast.tree.language(),
+        "(call_expression function: (identifier) @call)",
+    )
+    .unwrap();
+    assert_eq!(
+        collect_query(&query, source, ast.tree.root_node())
+            .items
+            .len(),
+        4
+    );
+    let flow = parsed.flow().expect("C++ flow");
+    assert_eq!(flow.language, "cpp");
+    assert!(!flow.limitations.contains("parse-error"));
+    let function = flow.functions.get("invoke").expect("template function");
+    assert_eq!(function.parameters.len(), 2);
+    assert!(
+        function
+            .parameters
+            .iter()
+            .all(|id| !flow.values[*id].module_level)
+    );
+    let call = |name: &str| {
+        flow.values
+            .iter()
+            .enumerate()
+            .find(|(_, value)| value.target.as_deref() == Some(name))
+            .unwrap()
+    };
+    let (allocated, alloc) = call("VirtualAllocEx");
+    let (_, write) = call("WriteProcessMemory");
+    let (_, thread) = call("CreateRemoteThread");
+    assert!(!alloc.module_level && !write.module_level && !thread.module_level);
+    assert_eq!(write.inputs[1], allocated);
+    assert_eq!(thread.inputs[3], allocated);
+    assert_eq!(write.inputs[0], function.parameters[0]);
+    assert_eq!(thread.inputs[0], function.parameters[0]);
+    assert_eq!(write.inputs[2], function.parameters[1]);
+    assert!(call("initialize").1.module_level);
+}
+
+#[test]
+fn cpp_raw_literals_and_qualified_calls_use_the_cpp_grammar() {
+    let source = r###"
+namespace example {
+void invoke() {
+    record(R"tag(CreateRemoteThread(fake)\n)tag");
+    record(u8R"delim(raw\ntext)delim");
+    record(L"wide");
+    example::send<int>("hello");
+    auto callback = [] { hidden(); };
+}
+}
+"###;
+    let parsed = crate::OpenOptions::new()
+        .path(std::path::Path::new("sample.cpp"))
+        .open(source.as_bytes());
+    let flow = parsed.flow().unwrap();
+    assert_eq!(flow.language, "cpp");
+    assert!(!flow.limitations.contains("parse-error"));
+    assert!(flow.limitations.contains("anonymous-function"));
+    assert!(
+        flow.values
+            .iter()
+            .filter(|v| v.kind == crate::FlowKind::Call)
+            .all(|v| !v.module_level)
+    );
+    let calls: Vec<_> = parsed
+        .symbols()
+        .iter_kind(crate::SymbolKind::Call)
+        .collect();
+    assert!(calls.iter().any(|s| matches!(s,
+        crate::Symbol::Call { target: Some(t), .. } if t == "example::send<int>")));
+    assert!(!calls.iter().any(|s| matches!(s,
+        crate::Symbol::Call { target: Some(t), .. } if t == "CreateRemoteThread")));
+    for value in [r"CreateRemoteThread(fake)\n", r"raw\ntext", "wide"] {
+        assert!(
+            calls.iter().any(|s| matches!(s,
+            crate::Symbol::Call { args, .. } if args.iter().any(|arg|
+                matches!(arg, crate::Arg::String { value: v } if v == value)
+            ))),
+            "missing literal: {value}"
+        );
+    }
+}
+
+#[test]
+fn valid_c_and_quoted_cpp_syntax_keep_the_c_grammar() {
+    let source = br#"// namespace fake { template <typename T> class Hidden {}; }
+void invoke(void) { record("namespace fake { class Hidden {}; }"); }
+"#;
+    let parsed = crate::OpenOptions::new()
+        .path(std::path::Path::new("sample.h"))
+        .open(source);
+    assert_eq!(
+        parsed.values().get("source.language"),
+        Some(&serde_json::json!("c"))
+    );
+    assert!(!parsed.source_ast().unwrap().tree.root_node().has_error());
+    let flow = parsed.flow().unwrap();
+    assert_eq!(flow.language, "c");
+    assert!(
+        flow.values
+            .iter()
+            .any(|v| v.target.as_deref() == Some("record") && !v.module_level)
+    );
+}
+
+#[test]
+fn cpp_query_validation_uses_dialect_instead_of_c_family() {
+    for language in ["cpp", "c++"] {
+        crate::validate_source_query(language, "(template_declaration) @template").unwrap();
+    }
+    assert!(crate::validate_source_query("c", "(template_declaration) @template").is_err());
+    crate::validate_source_query("c", "(call_expression) @call").unwrap();
+}
+
+#[test]
+fn cpp_member_and_template_initializers_do_not_imply_load_time_calls() {
+    let source = r#"
+namespace example {
+class Worker {
+    int value = on_construct();
+    inline static int shared = static_member();
+    void run() { on_run(); }
+};
+template <class T> auto cached = on_instantiate();
+auto initialized = on_load();
+}
+"#;
+    let parsed = crate::OpenOptions::new()
+        .path(std::path::Path::new("worker.cpp"))
+        .open(source.as_bytes());
+    let flow = parsed.flow().unwrap();
+    assert_eq!(flow.language, "cpp");
+    assert!(!flow.limitations.contains("parse-error"));
+    assert!(flow.limitations.contains("class-initializers-unmodeled"));
+    assert!(
+        flow.limitations
+            .contains("template-instantiation-unmodeled")
+    );
+    assert!(
+        flow.values
+            .iter()
+            .any(|v| v.target.as_deref() == Some("on_load") && v.module_level)
+    );
+    assert!(
+        flow.values
+            .iter()
+            .any(|v| v.target.as_deref() == Some("on_run") && !v.module_level)
+    );
+    for name in ["on_construct", "static_member", "on_instantiate"] {
+        assert!(
+            !flow
+                .values
+                .iter()
+                .any(|v| v.target.as_deref() == Some(name))
+        );
+        assert!(
+            parsed
+                .symbols()
+                .iter_kind(crate::SymbolKind::Call)
+                .any(|s| matches!(s, crate::Symbol::Call { target: Some(t), .. } if t == name))
+        );
+    }
+}
+
+#[test]
 fn function_ratios_use_the_extracted_counts() {
     // These ratios read `functions.total` / `imports.total`, keys nothing
     // emits, so they never fired.
@@ -512,6 +776,72 @@ fn ruby_imports_and_definitions() {
 }
 
 #[test]
+fn ruby_runtime_interpolation_is_a_template_for_arguments_and_bindings() {
+    let source = r##"
+system("curl -fsSL #{relay}")
+system(%Q{curl https://example.invalid/#{path}})
+system('curl #{literal}')
+system("curl \#{escaped}")
+endpoint = "https://example.invalid/#{path}"
+literal = 'https://example.invalid/#{path}'
+"##;
+    let parsed = crate::OpenOptions::new()
+        .path(std::path::Path::new("calls.rb"))
+        .open(source.as_bytes());
+    let symbols = parsed.symbols();
+    let args: Vec<_> = symbols
+        .iter_kind(crate::SymbolKind::Call)
+        .filter_map(|symbol| match symbol {
+            crate::Symbol::Call {
+                target: Some(target),
+                args,
+                ..
+            } if target == "system" => args.first(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(args.len(), 4);
+    assert!(matches!(args[0], crate::Arg::Template { value } if value.contains("#{relay}")));
+    assert!(matches!(args[1], crate::Arg::Template { value } if value.contains("#{path}")));
+    assert!(matches!(args[2], crate::Arg::String { value } if value == "curl #{literal}"));
+    assert!(matches!(args[3], crate::Arg::String { .. }));
+    assert!(symbols.iter().any(|symbol| matches!(symbol, crate::Symbol::Bind { target, shape: crate::ArgShape::Template, .. } if target == "endpoint")));
+    assert!(symbols.iter().any(|symbol| matches!(symbol, crate::Symbol::Bind { target, shape: crate::ArgShape::String, .. } if target == "literal")));
+}
+
+#[test]
+fn ruby_calls_preserve_receivers_and_do_not_invent_static_dynamic_receivers() {
+    let source = "system('bare')\nKernel.system('builtin')\nlogger.system('method')\nloggers[selector].system('dynamic')\nNet::HTTP.post('namespace')\n::Kernel.system('absolute')\n";
+    let parsed = crate::OpenOptions::new()
+        .path(std::path::Path::new("receivers.rb"))
+        .open(source.as_bytes());
+    let symbols = parsed.symbols();
+    for (marker, expected) in [
+        ("bare", Some("system")),
+        ("builtin", Some("Kernel.system")),
+        ("method", Some("logger.system")),
+        ("dynamic", None),
+        ("namespace", Some("Net::HTTP.post")),
+        ("absolute", Some("::Kernel.system")),
+    ] {
+        let target = symbols
+            .iter_kind(crate::SymbolKind::Call)
+            .find_map(|symbol| match symbol {
+                crate::Symbol::Call { target, args, .. }
+                    if args.iter().any(
+                        |arg| matches!(arg, crate::Arg::String { value } if value == marker),
+                    ) =>
+                {
+                    Some(target.as_deref())
+                }
+                _ => None,
+            })
+            .expect("observed call");
+        assert_eq!(target, expected, "{marker}");
+    }
+}
+
+#[test]
 fn lua_imports_and_definitions() {
     let src = b"local M = require(\"socket\")\nfunction greet(name)\n  return name\nend\nlocal function add(a, b) return a + b end\n";
     let (imports, functions) = parse_source("script.lua", src);
@@ -688,6 +1018,32 @@ fn powershell_functions_extracted() {
     let (_imports, functions) = parse_source("script.ps1", src);
     let names: Vec<&str> = functions.iter().map(String::as_str).collect();
     assert!(names.contains(&"Get-Greeting"), "got {names:?}");
+}
+
+#[test]
+fn shell_literal_word_concatenation_preserves_static_arguments() {
+    use crate::{Arg, Symbol};
+    let code = br##"#!/bin/sh
+curl --header='literal header' --url="https://stage.test/a" --header="$dynamic"
+"##;
+    let parsed = crate::OpenOptions::new()
+        .path(std::path::Path::new("test.sh"))
+        .open(code);
+    let args = parsed
+        .symbols()
+        .iter()
+        .find_map(|symbol| match symbol {
+            Symbol::Call {
+                target: Some(name),
+                args,
+                ..
+            } if name == "curl" => Some(args),
+            _ => None,
+        })
+        .unwrap();
+    assert!(matches!(&args[0], Arg::String { value } if value == "--header=literal header"));
+    assert!(matches!(&args[1], Arg::String { value } if value == "--url=https://stage.test/a"));
+    assert!(matches!(&args[2], Arg::Expression));
 }
 
 #[test]
@@ -940,4 +1296,45 @@ ffi.load("\097\109\115\105")
         matches!(s, crate::Symbol::Call { target: Some(t), args, .. }
             if t == "ffi.load" && args.iter().any(|a| matches!(a, crate::Arg::String { value } if value == "amsi")))
     }));
+}
+
+#[test]
+fn static_module_edges_exclude_type_only_imports_and_reexports() {
+    let code = br#"import type { A } from 'types-a';
+import { type A, type B } from 'types-b';
+import { type A, B } from 'mixed';
+import X, { type A } from 'default-and-type';
+import 'side-effect';
+export type { A } from 'types-c';
+export { type A } from 'types-d';
+export { type A, B } from 'export-mixed';
+export * from 'export-all';
+const text = "import fake from 'not-real'";
+"#;
+    let parsed = crate::OpenOptions::new()
+        .path(std::path::Path::new("module.ts"))
+        .open(code);
+    let values = parsed.values();
+    let rows = values
+        .get("source.js.runtime_imports")
+        .and_then(|v| v.as_array())
+        .unwrap();
+    let names: Vec<_> = rows
+        .iter()
+        .filter_map(|r| r.get("specifier").and_then(|s| s.as_str()))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "mixed",
+            "default-and-type",
+            "side-effect",
+            "export-mixed",
+            "export-all"
+        ]
+    );
+    for row in rows {
+        let offset = row["offset"].as_u64().unwrap() as usize;
+        assert_eq!(code[offset], b'\'');
+    }
 }

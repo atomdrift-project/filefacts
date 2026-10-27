@@ -521,6 +521,37 @@ impl TreeSitterDiagnostic {
     }
 }
 
+/// Error extent and evidence of dialect-specific syntax. Do not count nested
+/// errors twice or accept a C++ node found only inside error recovery.
+fn cpp_parse_quality(root: tree_sitter::Node<'_>) -> (usize, bool) {
+    let mut pending = vec![root];
+    let mut errors = 0usize;
+    let mut cpp = false;
+    while let Some(node) = pending.pop() {
+        if node.is_error() || node.is_missing() {
+            errors =
+                errors.saturating_add(node.end_byte().saturating_sub(node.start_byte()).max(1));
+            continue;
+        }
+        cpp |= matches!(
+            node.kind(),
+            "namespace_definition"
+                | "template_declaration"
+                | "class_specifier"
+                | "qualified_identifier"
+                | "reference_declarator"
+                | "raw_string_literal"
+                | "lambda_expression"
+                | "new_expression"
+                | "delete_expression"
+                | "requires_clause"
+        );
+        let mut cursor = node.walk();
+        pending.extend(node.children(&mut cursor));
+    }
+    (errors, cpp)
+}
+
 impl<'a> TreeCache<'a> {
     /// Parse `bytes` as `file_type` source. Returns [`TreeParse::Unavailable`]
     /// when filefacts deliberately refuses the parse or cannot build a
@@ -536,18 +567,54 @@ impl<'a> TreeCache<'a> {
                 "no tree-sitter grammar registered for source file type",
             ));
         };
+        let primary = Self::parse_with_config(bytes, file_type, cancel, config);
+        if file_type != FileType::C
+            || cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+            || primary
+                .cache()
+                .is_some_and(|cache| !cache.tree().root_node().has_error())
+        {
+            return primary;
+        }
+        // The external C file family also contains .cc/.cpp and ambiguous .h
+        // files. Try one bounded alternate parse, accepting it only when it
+        // recovers actual C++ syntax and improves the erroneous C parse.
+        let alternate = Self::parse_with_config(bytes, file_type, cancel, &langs::CPP);
+        if let Some(cache) = alternate.cache() {
+            let (errors, has_cpp) = cpp_parse_quality(cache.tree().root_node());
+            let old_errors = primary
+                .cache()
+                .map(|cache| cpp_parse_quality(cache.tree().root_node()).0)
+                .unwrap_or(usize::MAX);
+            if has_cpp && errors < old_errors {
+                return alternate;
+            }
+        }
+        primary
+    }
+
+    fn parse_with_config(
+        bytes: &'a [u8],
+        file_type: FileType,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        config: &'static LangConfig,
+    ) -> TreeParse<'a> {
         let (text, invalid_utf8_bytes) = utf8_source(bytes);
         let source: &str = &text;
-        if would_overflow_scanner_state(file_type, source) {
-            let diagnostic = TreeSitterDiagnostic::tree_sitter_guard(
-                config.name(),
-                source.len(),
-                scanner_audit(file_type),
-            );
+        let audit = if config.lang == langs::Lang::Cpp {
+            // tree-sitter-cpp 0.23.4: a fixed 16-wchar raw-string
+            // delimiter, with a compile-time serialization-buffer bound.
+            ScannerAudit::Bounded
+        } else {
+            scanner_audit(file_type)
+        };
+        if would_overflow_scanner_state_with_audit(file_type, source, audit) {
+            let diagnostic =
+                TreeSitterDiagnostic::tree_sitter_guard(config.name(), source.len(), audit);
             tracing::warn!(
                 language = config.name(),
                 bytes = source.len(),
-                audit = ?scanner_audit(file_type),
+                audit = ?audit,
                 "skipping tree-sitter parse due to source-size or scanner-state safety guard"
             );
             return TreeParse::Unavailable(diagnostic);
@@ -580,7 +647,11 @@ impl<'a> TreeCache<'a> {
             let deadline = Instant::now() + SOURCE_PARSE_WALL_BACKSTOP;
             let polls = Cell::new(0u64);
             let stop = Cell::new(None);
-            let mut recovery = RecoveryWatch::new(error_recovery_cap(file_type));
+            let mut recovery = RecoveryWatch::new(if config.lang == langs::Lang::Cpp {
+                Some(ERROR_RECOVERY_POLL_CAP)
+            } else {
+                error_recovery_cap(file_type)
+            });
             let fetched = Cell::new(0u64);
             let mut progress = |state: &tree_sitter::ParseState| -> ControlFlow<()> {
                 // The read callback below already gave up on the input.
@@ -878,8 +949,16 @@ fn bash_case_modification_operator(
 /// Pre-check input that could overflow a tree-sitter external scanner's
 /// 1024-byte serialization buffer. Returning `true` causes `parse` to
 /// skip the parse rather than risk the C-level abort.
+#[cfg(test)]
 fn would_overflow_scanner_state(file_type: FileType, source: &str) -> bool {
-    let audit = scanner_audit(file_type);
+    would_overflow_scanner_state_with_audit(file_type, source, scanner_audit(file_type))
+}
+
+fn would_overflow_scanner_state_with_audit(
+    file_type: FileType,
+    source: &str,
+    audit: ScannerAudit,
+) -> bool {
     if source.len() > parse_cap_bytes(audit) {
         return true;
     }

@@ -4,6 +4,88 @@ use super::{
     purl_encode as encode, push_local_ref, push_version_requirement, pypi_purl,
 };
 
+/// Read the installed package's own manifest. The container type has already
+/// identified this as Arch, avoiding the ambiguous Alpine `.PKGINFO` name.
+pub(super) fn arch_package(bytes: &[u8], out: &mut Refs<'_>) {
+    use std::io::{Cursor, Read};
+    let input = Cursor::new(bytes);
+    let reader: Box<dyn Read> = if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        let Ok(decoder) = zstd::stream::read::Decoder::new(input) else {
+            return;
+        };
+        Box::new(decoder)
+    } else if bytes.starts_with(&[0x1f, 0x8b]) {
+        Box::new(flate2::read::GzDecoder::new(input))
+    } else if bytes.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0]) {
+        Box::new(xz2::read::XzDecoder::new(input))
+    } else {
+        Box::new(input)
+    };
+    let mut archive = tar::Archive::new(reader.take(128 * 1024 * 1024));
+    let Ok(entries) = archive.entries() else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(path) = entry.path() else { continue };
+        if path.as_ref() != std::path::Path::new(".PKGINFO") {
+            continue;
+        }
+        if entry.size() > 1024 * 1024 {
+            return;
+        }
+        let mut text = String::new();
+        if entry
+            .take(1024 * 1024 + 1)
+            .read_to_string(&mut text)
+            .is_err()
+        {
+            return;
+        }
+        for line in text.lines() {
+            let Some((key, raw)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            let (scope, optional) = match key {
+                "depend" => (crate::DependencyScope::Runtime, false),
+                "optdepend" => (crate::DependencyScope::Runtime, true),
+                "makedepend" | "checkdepend" => (crate::DependencyScope::Build, false),
+                _ => continue,
+            };
+            let spec = raw.trim().split_once(": ").map_or(raw.trim(), |(s, _)| s);
+            let end = spec.find(['<', '>', '=']).unwrap_or(spec.len());
+            let name = spec[..end].trim();
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"@._+-".contains(&c))
+            {
+                continue;
+            }
+            let mut purl = format!("pkg:alpm/arch/{name}");
+            push_version_requirement(&mut purl, spec[end..].trim());
+            let before = out.refs.len();
+            out.push(
+                RefLocator::Purl(purl),
+                RefKind::Dependency,
+                format!("arch-pkginfo:{key}"),
+                line.trim(),
+                None,
+            );
+            if let Some(r) = out.refs.get_mut(before) {
+                r.offset = None; // the manifest is inside a compressed archive
+                r.context = Some(crate::DependencyContext {
+                    scope,
+                    optional,
+                    has_install_script: false,
+                    installed_path: None,
+                });
+            }
+        }
+        break;
+    }
+}
+
 pub(super) fn cargo(values: &Values, out: &mut Refs<'_>) {
     let root = values.as_json();
     let workspace = root.get("workspace").and_then(|v| v.get("dependencies"));
@@ -214,6 +296,33 @@ pub(super) fn pyproject(values: &Values, out: &mut Refs<'_>) {
     }
 }
 
+/// Repeated Requires-Dist headers from wheel or source distribution metadata.
+/// Keep marker expressions in the locator: they describe a candidate, not a
+/// guarantee that the requirement applies to the current environment.
+pub(super) fn pkginfo(values: &Values, out: &mut Refs<'_>) {
+    let Some(field) = values.as_json().get("requires-dist") else {
+        return;
+    };
+    let specs: Vec<&str> = match field {
+        JsonValue::String(s) => vec![s],
+        JsonValue::Array(a) => a.iter().filter_map(JsonValue::as_str).collect(),
+        _ => return,
+    };
+    for spec in specs {
+        let start = out.refs.len();
+        python_requirement(spec, "pkg-info:Requires-Dist", out);
+        if let Some(r) = out.refs.get_mut(start) {
+            let marker = spec.split_once(';').map(|(_, marker)| marker);
+            r.context = Some(crate::DependencyContext {
+                scope: crate::DependencyScope::Runtime,
+                optional: marker.is_some(),
+                has_install_script: false,
+                installed_path: None,
+            });
+        }
+    }
+}
+
 fn python_requirement(spec: &str, source: &str, out: &mut Refs<'_>) {
     let (requirement, marker) = spec
         .split_once(';')
@@ -273,6 +382,79 @@ mod tests {
     use super::*;
     use crate::FileType;
     use crate::formats::references::derive;
+
+    #[test]
+    fn arch_package_declares_runtime_optional_and_build_dependencies() {
+        use std::io::Write;
+        let mut tar = tar::Builder::new(Vec::new());
+        let data = b"pkgname = demo\ndepend = bash>=5\noptdepend = electron: graphical interface\nmakedepend = nodejs\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, ".PKGINFO", &data[..]).unwrap();
+        let plain = tar.into_inner().unwrap();
+        let zstd = zstd::stream::encode_all(&plain[..], 1).unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&plain).unwrap();
+        let gz = gz.finish().unwrap();
+        let mut xz = xz2::write::XzEncoder::new(Vec::new(), 1);
+        xz.write_all(&plain).unwrap();
+        let xz = xz.finish().unwrap();
+        for bytes in [&plain, &zstd, &gz, &xz] {
+            let mut out = super::super::Refs {
+                refs: Vec::new(),
+                text: None,
+                cursor: 0,
+                budget: 0,
+            };
+            arch_package(bytes, &mut out);
+            assert_eq!(out.refs.len(), 3);
+            assert!(
+                matches!(&out.refs[0].locator, RefLocator::Purl(p) if p.starts_with("pkg:alpm/arch/bash?") && p.contains("version_requirement="))
+            );
+            assert!(!out.refs[0].context.as_ref().unwrap().optional);
+            assert!(out.refs[1].context.as_ref().unwrap().optional);
+            assert_eq!(
+                out.refs[2].context.as_ref().unwrap().scope,
+                crate::DependencyScope::Build
+            );
+            assert!(out.refs.iter().all(|r| r.offset.is_none()));
+        }
+    }
+
+    #[test]
+    fn pkginfo_requires_dist_preserves_pins_ranges_and_markers() {
+        let bytes = b"Metadata-Version: 2.4\nName: demo\nRequires-Dist: Requests==2.32.3\nRequires-Dist: boto3<2,>=1.0\nRequires-Dist: pytest>=9; extra == \"dev\"\n\nRequires-Dist: body-example==1.0\n";
+        let facts = crate::OpenOptions::new()
+            .path(std::path::Path::new("METADATA"))
+            .open(bytes);
+        let refs = facts.references();
+        assert_eq!(refs.len(), 3);
+        let pinned = refs
+            .iter()
+            .find(|r| r.evidence.starts_with("Requests"))
+            .unwrap();
+        assert_eq!(
+            pinned.locator,
+            RefLocator::Purl("pkg:pypi/requests@2.32.3".into())
+        );
+        assert!(!pinned.context.as_ref().unwrap().optional);
+        let range = refs
+            .iter()
+            .find(|r| r.evidence.starts_with("boto3"))
+            .unwrap();
+        assert!(
+            matches!(&range.locator, RefLocator::Purl(p) if p.contains("version_requirement="))
+        );
+        let extra = refs
+            .iter()
+            .find(|r| r.evidence.starts_with("pytest"))
+            .unwrap();
+        assert!(extra.context.as_ref().unwrap().optional);
+        assert!(matches!(&extra.locator, RefLocator::Purl(p) if p.contains("environment_marker=")));
+        assert!(refs.iter().all(|r| r.offset.is_some()));
+    }
     #[test]
     fn cargo_roles_aliases_ranges_workspace_and_disabled_build() {
         let values = Values::from_json(

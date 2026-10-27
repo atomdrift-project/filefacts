@@ -1468,8 +1468,8 @@ pub fn read_input(path: &Path, max_bytes: u64) -> Result<Vec<u8>, Error> {
 /// `query` does not compile against it.
 pub fn validate_source_query(language: &str, query: &str) -> Result<(), Error> {
     let unsupported = || Error::UnsupportedLanguage(language.to_string());
-    let file_type = file_type_for_language(language).ok_or_else(unsupported)?;
-    let ts_lang = formats::source::tree_sitter_language(file_type).ok_or_else(unsupported)?;
+    let ts_lang = formats::source::tree_sitter_language_named(canonical_source_language(language))
+        .ok_or_else(unsupported)?;
     tree_sitter::Query::new(&ts_lang, query)
         .map(|_| ())
         .map_err(|source| Error::InvalidQuery {
@@ -1485,6 +1485,7 @@ const SOURCE_LANGUAGE_ALIASES: &[(&str, &str)] = &[
     ("ts", "typescript"),
     ("shell", "bash"),
     ("c#", "csharp"),
+    ("c++", "cpp"),
     ("ps1", "powershell"),
     ("objective-c", "objc"),
     ("clj", "clojure"),
@@ -1495,12 +1496,16 @@ const SOURCE_LANGUAGE_ALIASES: &[(&str, &str)] = &[
 
 /// The source file type named `name`: a `values.source.language` label or
 /// one of [`SOURCE_LANGUAGE_ALIASES`].
+#[cfg(test)]
 fn file_type_for_language(name: &str) -> Option<FileType> {
-    let label = SOURCE_LANGUAGE_ALIASES
+    formats::source::file_type_for_language(canonical_source_language(name))
+}
+
+fn canonical_source_language(name: &str) -> &str {
+    SOURCE_LANGUAGE_ALIASES
         .iter()
         .find_map(|&(alias, label)| (alias == name).then_some(label))
-        .unwrap_or(name);
-    formats::source::file_type_for_language(label)
+        .unwrap_or(name)
 }
 
 #[cfg(test)]

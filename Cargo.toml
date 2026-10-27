@@ -88,6 +88,7 @@ roxmltree = "0.21"
 # transitive tree via `zip`; surfacing it as a direct dep avoids
 # reaching through `zip`'s public re-exports.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+xz2 = "0.1"
 
 # Image decoders — used only to compute pixel-statistic metrics
 # (per-channel entropy, edge density, histogram flatness) that power
@@ -136,6 +137,7 @@ tree-sitter-ruby = "0.23"
 tree-sitter-lua = "0.5"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-c = "0.24"
+tree-sitter-cpp = "=0.23.4"
 tree-sitter-scala = "0.26"
 tree-sitter-objc = "3"
 tree-sitter-kotlin-ng = "1"

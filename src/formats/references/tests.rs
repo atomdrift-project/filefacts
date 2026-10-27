@@ -86,6 +86,26 @@ fn package_json_deps_pin_exact_and_unversion_ranges() {
 }
 
 #[test]
+fn npm_manifest_peer_dependencies_are_candidates_with_optional_metadata() {
+    let manifest = br#"{
+        "peerDependencies": {"react": "^18.0.0", "csstype": "^3.0.0"},
+        "peerDependenciesMeta": {"csstype": {"optional": true}},
+        "devDependencies": {"dev-only": "1.0.0"}
+    }"#;
+    let refs = derive(FileType::PackageJson, manifest, &Values::new());
+    let peer = |name: &str| {
+        refs.iter()
+            .find(|r| matches!(&r.locator, RefLocator::Purl(p) if p.starts_with(name)))
+            .expect("peer reference")
+    };
+    let react = peer("pkg:npm/react?");
+    assert_eq!(react.source, "package.json:peerDependencies");
+    assert!(!react.context.as_ref().unwrap().optional);
+    assert!(peer("pkg:npm/csstype?").context.as_ref().unwrap().optional);
+    assert!(!refs.iter().any(|r| r.evidence.starts_with("dev-only@")));
+}
+
+#[test]
 fn vscode_extension_manifest_deps_become_dependencies() {
     let manifest = br#"{
             "name": "krabt-extension-pack",

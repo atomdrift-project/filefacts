@@ -902,7 +902,15 @@ impl State {
         let callee = config.callee(node).or_else(|| first_named_child(node));
         let args_node = config.argument_list(node);
 
-        let target = callee.and_then(|c| self.static_path(c, source, config));
+        // Ruby stores the receiver beside the method name, rather than inside
+        // the callee field. Preserve it: logger.system is not Kernel.system,
+        // and a dynamically selected receiver must not become bare `system`.
+        let target = if config.lang == Lang::Ruby && node.child_by_field_name("receiver").is_some()
+        {
+            self.static_path(node, source, config)
+        } else {
+            callee.and_then(|c| self.static_path(c, source, config))
+        };
         // A Bash "command" whose name starts with `-` is an option word, not a
         // program, so it records no call.
         if config.lang == Lang::Bash && target.as_deref().is_some_and(|t| t.starts_with('-')) {
@@ -967,6 +975,18 @@ impl State {
 
 fn arg_shape(node: Node<'_>, config: &LangConfig) -> ArgShape {
     let k = node.kind();
+    // Ruby uses the same string node kind for literal and interpolated
+    // strings. A runtime interpolation must never become a fixed URL or
+    // command argument; escaped and single-quoted #{...} remain literals.
+    if config.lang == Lang::Ruby && config.string_kinds.contains(&k) {
+        let mut cursor = node.walk();
+        if node
+            .named_children(&mut cursor)
+            .any(|child| child.kind() == "interpolation")
+        {
+            return ArgShape::Template;
+        }
+    }
     if config.string_kinds.contains(&k) {
         ArgShape::String
     } else if config.number_kinds.contains(&k) {
@@ -1000,6 +1020,14 @@ fn arg_shape(node: Node<'_>, config: &LangConfig) -> ArgShape {
 /// / `Call` / `Expression` variants when the argument has no
 /// statically-recoverable value.
 pub(super) fn build_arg(node: Node<'_>, source: &str, config: &LangConfig) -> Arg {
+    // A shell word can concatenate unquoted and quoted literal pieces,
+    // e.g. --header='value' or --url="https://host/path". Preserve those
+    // static values; expansions and unsupported escapes stay expressions.
+    if config.lang == Lang::Bash && node.kind() == "concatenation" {
+        return static_shell_word(node, source, 0)
+            .map(|value| Arg::String { value })
+            .unwrap_or(Arg::Expression);
+    }
     // PHP (and a few other grammars) wrap each call argument in an `argument`
     // node whose child is the real expression, and PHP double-quoted strings
     // are `encapsed_string` wrapping a `string_content`. Without unwrapping,
@@ -1056,6 +1084,29 @@ pub(super) fn build_arg(node: Node<'_>, source: &str, config: &LangConfig) -> Ar
         ArgShape::Function => Arg::Function,
         ArgShape::Call => Arg::Call,
         ArgShape::Expression => Arg::Expression,
+    }
+}
+
+fn static_shell_word(node: Node<'_>, source: &str, depth: usize) -> Option<String> {
+    if depth > 32 {
+        return None;
+    }
+    let raw = node.utf8_text(source.as_bytes()).ok()?;
+    match node.kind() {
+        "word" if !raw.contains(['$', '`', '\\']) => Some(raw.to_owned()),
+        "raw_string" => Some(raw.strip_prefix('\'')?.strip_suffix('\'')?.to_owned()),
+        "string" if !raw.contains(['$', '`', '\\']) => {
+            Some(raw.strip_prefix('"')?.strip_suffix('"')?.to_owned())
+        }
+        "concatenation" => {
+            let mut value = String::new();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                value.push_str(&static_shell_word(child, source, depth + 1)?);
+            }
+            Some(value)
+        }
+        _ => None,
     }
 }
 
@@ -1137,6 +1188,8 @@ enum Part<'s> {
     /// Without the parens a symbol is one thing everywhere: a dotted path of
     /// identifiers, the same shape a stripped binary's symbol table yields.
     Call,
+    /// A syntactic wrapper that preserves the selected callee's name.
+    Transparent,
     /// Not static: a computed key, an empty or runtime-chosen name, an
     /// unknown node kind.
     Dynamic,
@@ -1153,7 +1206,56 @@ fn part<'t>(
     let root = |name: Option<&'t str>| (name.map_or(Part::Dynamic, Part::Root), None, 0);
     let text = || node.utf8_text(source.as_bytes()).ok();
     let kind = node.kind();
+    if matches!(config.lang, Lang::JavaScript | Lang::TypeScript)
+        && matches!(kind, "parenthesized_expression" | "sequence_expression")
+    {
+        let mut children = super::named_children(node).filter(|child| !child.is_extra());
+        if kind == "parenthesized_expression" {
+            if let Some(inner) = children.next()
+                && children.next().is_none()
+                && matches!(
+                    inner.kind(),
+                    "sequence_expression" | "parenthesized_expression"
+                )
+            {
+                return (Part::Transparent, Some(inner), 1);
+            }
+        } else if kind == "sequence_expression" {
+            // Compiler-emitted `(0, object.method)(...)` calls select the
+            // right-hand function without binding its receiver. A numeric
+            // prefix has no side effects; its spelling/value is irrelevant.
+            // Retain the outer call offset and argument list. Other comma
+            // expressions and computed names remain unresolved.
+            if let (Some(prefix), Some(callee), None) =
+                (children.next(), children.next(), children.next())
+                && prefix.kind() == "number"
+                && (config.identifier_kinds.contains(&callee.kind())
+                    || config.member_kinds.contains(&callee.kind())
+                    || is_subscript_kind(callee.kind()))
+            {
+                return (Part::Transparent, Some(callee), 1);
+            }
+        }
+    }
     if config.lang == Lang::Rust && kind == "scoped_identifier" {
+        return root(text());
+    }
+    if config.lang == Lang::Ruby && kind == "scope_resolution" {
+        // Ruby namespaces are constant paths, not a runtime receiver which
+        // happens to offer the same method. Keep Net::HTTP and ::Kernel;
+        // computed scopes remain unresolved.
+        return root(text().filter(|path| {
+            path.strip_prefix("::")
+                .unwrap_or(path)
+                .split("::")
+                .all(|part| {
+                    let mut chars = part.chars();
+                    chars.next().is_some_and(char::is_uppercase)
+                        && chars.all(|c| c.is_alphanumeric() || c == '_')
+                })
+        }));
+    }
+    if config.lang == Lang::Cpp && matches!(kind, "qualified_identifier" | "template_function") {
         return root(text());
     }
     // Perl aliases both bareword callees and builtin names to `function`.
@@ -1320,7 +1422,7 @@ impl Spine {
                         path.push_str(&name);
                         true
                     }
-                    Part::Call => true,
+                    Part::Call | Part::Transparent => true,
                     Part::Dynamic => false,
                 };
             let fate = if stopped {

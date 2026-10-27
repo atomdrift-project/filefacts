@@ -732,6 +732,7 @@ pub const CATALOG: &[&str] = &[
     "pe.entry_in_writable_section",
     "pe.entry_outside_sections",
     "pe.export_timestamp",
+    "pe.exports_max_shared_early_call_count",
     "pe.file_alignment",
     "pe.forwarded_export_count",
     "pe.has_cfg",

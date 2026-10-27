@@ -56,11 +56,13 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Vec<
         FileType::Npm | FileType::PackageJson => npm(values, &mut out),
         FileType::PackageLockJson => npm_lock(values, &mut out),
         FileType::SrcInfo => srcinfo(values, &mut out),
+        FileType::PkgArch => manifests::arch_package(bytes, &mut out),
         FileType::GoMod => go::manifest(&mut out, "go.mod"),
         FileType::GoSum => go::sums(&mut out),
         FileType::CargoToml => cargo_toml(values, &mut out),
         FileType::CargoLock => cargo_lock(values, &mut out),
         FileType::PyProjectToml => manifests::pyproject(values, &mut out),
+        FileType::PkgInfo => manifests::pkginfo(values, &mut out),
         FileType::RequirementsTxt => requirements_txt(&mut out),
         FileType::PoetryLock => poetry_lock(values, &mut out),
         FileType::PipfileLock => pipfile_lock(values, &mut out),
@@ -983,16 +985,17 @@ fn push_local_ref(out: &mut Refs<'_>, path: &str, source: &str) {
 /// fetchable npm reference: an exact pin (`1.2.3`) resolves straight to its
 /// tarball like a lockfile entry, while a range, dist-tag, or wildcard is
 /// emitted as an unversioned coordinate with its spec preserved for the
-/// fetcher to resolve against the registry. Only `dependencies` and
-/// `optionalDependencies` are followed — `devDependencies` and
-/// `peerDependencies` are not installed for a consumed package, so they are not
-/// part of the delivered supply chain. A no-op for a binary `.tgz` (no text).
+/// fetcher to resolve against the registry. Runtime, optional and peer
+/// requirements are followed. A peer may be supplied by the consumer or
+/// installed by its package manager; a resolved range is a candidate, not
+/// proof of the version in any particular installation. Dev dependencies are
+/// not installed when consuming a published package. A no-op for binary `.tgz`.
 fn npm_manifest_deps(out: &mut Refs<'_>) {
     let Some(text) = out.text else { return };
     let Ok(manifest) = serde_json::from_str::<JsonValue>(text) else {
         return;
     };
-    for field in ["dependencies", "optionalDependencies"] {
+    for field in ["dependencies", "optionalDependencies", "peerDependencies"] {
         let Some(deps) = manifest.get(field).and_then(JsonValue::as_object) else {
             continue;
         };
@@ -1004,14 +1007,25 @@ fn npm_manifest_deps(out: &mut Refs<'_>) {
             out.push(
                 locator,
                 RefKind::Dependency,
-                "package.json",
+                if field == "peerDependencies" {
+                    "package.json:peerDependencies"
+                } else {
+                    "package.json"
+                },
                 format!("{name}@{spec}"),
                 None,
             );
             if let Some(reference) = out.refs.last_mut() {
                 reference.context = Some(crate::DependencyContext {
                     scope: crate::DependencyScope::Runtime,
-                    optional: field == "optionalDependencies",
+                    optional: field == "optionalDependencies"
+                        || (field == "peerDependencies"
+                            && manifest
+                                .get("peerDependenciesMeta")
+                                .and_then(|m| m.get(name))
+                                .and_then(|m| m.get("optional"))
+                                .and_then(JsonValue::as_bool)
+                                == Some(true)),
                     has_install_script: false,
                     installed_path: None,
                 });

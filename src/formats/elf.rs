@@ -135,6 +135,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     // Owns the header-patched copy when the section header table was cut
     // off; declared here so the parse borrowing it outlives the match.
     let detached;
+    let mut section_headers_truncated = false;
     let elf = match goblin_safe::parse_elf(bytes) {
         goblin_safe::GoblinOutcome::Ok(elf) => elf,
         goblin_safe::GoblinOutcome::Failed(e) => {
@@ -147,6 +148,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
             {
                 errors_out.record_malformed(crate::Stage::ElfParse, e.to_string());
                 metrics.insert(metric!("elf.section_headers_truncated"), 1.0);
+                section_headers_truncated = true;
                 elf
             } else {
                 extract_binary_strings(bytes, strings, XorScan::Yes);
@@ -174,6 +176,31 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     let segment_notes = drain_notes(elf.iter_note_headers(bytes), &mut bytes.len(), errors_out);
 
     elf_header(&elf, values);
+    if section_headers_truncated {
+        // The recovery parse zeroes these fields in a temporary copy. Report
+        // the original header values rather than the synthetic parse values.
+        let (offset, width, index) = if elf.is_64 { (40, 8, 62) } else { (32, 4, 50) };
+        if let (Some(raw_offset), Some(raw_index)) = (
+            bytes.get(offset..offset + width),
+            bytes.get(index..index + 2),
+        ) {
+            let number = |raw: &[u8]| {
+                let mut result = 0_u64;
+                if elf.little_endian {
+                    for byte in raw.iter().rev() {
+                        result = (result << 8) | u64::from(*byte);
+                    }
+                } else {
+                    for byte in raw {
+                        result = (result << 8) | u64::from(*byte);
+                    }
+                }
+                result
+            };
+            put_u64(values, value_key!("elf.shoff"), number(raw_offset));
+            put_u64(values, value_key!("elf.shstrndx"), number(raw_index));
+        }
+    }
     dynamic(&elf, bytes.len(), values);
     sections(&elf, bytes, metrics, sections_out);
     *image_end = Some(image_end_of(&elf));
@@ -186,7 +213,9 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     super::elf_dynamic::init_arrays(&elf, bytes, values, metrics);
     super::elf_dynamic::dynsym_funcs(&elf, bytes.len(), values);
     super::elf_syscalls::emit(&elf, bytes, values, metrics);
-    stripped_metadata(&elf, values, metrics);
+    if !section_headers_truncated {
+        stripped_metadata(&elf, values, metrics);
+    }
     comment(&elf, bytes, values, metrics);
     gcc_command_line(&elf, bytes, values);
     super::elf_dwarf::emit(&elf, bytes, values, metrics);
@@ -194,7 +223,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     abi_tag(&segment_notes, values);
     package_note(&segment_notes, values);
     gnu_property(&elf, &segment_notes, values, metrics);
-    binary_flags(&elf, metrics);
+    binary_flags(&elf, section_headers_truncated, metrics);
     elf_numeric_metrics(&elf, &segment_notes, metrics, values);
     dynamic_metrics(&elf, bytes.len(), metrics);
     table_counts(&elf, metrics);
@@ -221,6 +250,10 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
             metrics,
         );
     }
+    // Preserve local function names when no disassembler supplied functions.
+    // Run after the fallback so symbol-table names never suppress richer Rizin
+    // function and call-graph facts.
+    static_function_fallback(&elf, bytes.len(), symbols_out);
     linker_family(&elf, values);
     comment_fingerprint(values);
     super::elf_hashes::emit(&elf, bytes.len(), values, symbols_out);
@@ -1698,11 +1731,17 @@ fn member_layout_metrics(elf: &Elf<'_>, file_len: usize, metrics: &mut Metrics) 
 }
 
 /// Cross-format `binary.*` metrics derivable from ELF header state.
-fn binary_flags(elf: &Elf<'_>, metrics: &mut Metrics) {
+fn binary_flags(elf: &Elf<'_>, section_headers_truncated: bool, metrics: &mut Metrics) {
     // PIE: dynamically-linked executable (`ET_DYN` + `PT_INTERP`).
     // A shared library is also `ET_DYN` but has no interpreter.
     let is_pie = elf.header.e_type == header::ET_DYN && elf.interpreter.is_some();
     metrics.insert(metric!("binary.is_pie"), f64::from(u8::from(is_pie)));
+
+    // The segment-only parse deliberately discards the declared section
+    // table. Its missing names and symbols are unknown, not absent.
+    if section_headers_truncated {
+        return;
+    }
 
     // Observe absence of the full .symtab. A header member may never have
     // contained one; this does not establish prior execution of strip.
@@ -2189,6 +2228,49 @@ fn load_segment_va_to_offset(elf: &Elf<'_>, va: u64) -> Option<u64> {
             let delta = va.checked_sub(p.p_vaddr)?;
             (delta < p.p_filesz).then(|| p.p_offset.saturating_add(delta))
         })
+}
+
+/// Recover locally defined ELF functions when disassembly yielded none.
+fn static_function_fallback(elf: &Elf<'_>, file_len: usize, out: &mut crate::Symbols) {
+    use crate::output::{Symbol, SymbolKind};
+    if out
+        .iter()
+        .any(|symbol| symbol.kind() == SymbolKind::Function)
+    {
+        return;
+    }
+    let mut names = NameBudget::new(file_len);
+    for sym in &elf.syms {
+        if sym.st_bind() != goblin::elf::sym::STB_LOCAL
+            || !sym.is_function()
+            || sym.st_value == 0
+            || sym.st_size == 0
+        {
+            continue;
+        }
+        let Some(section) = elf.section_headers.get(sym.st_shndx) else {
+            continue;
+        };
+        if section.sh_flags & u64::from(goblin::elf::section_header::SHF_EXECINSTR) == 0 {
+            continue;
+        }
+        let Some(name) = elf
+            .strtab
+            .get_at(sym.st_name)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        if !names.take(name.len()) {
+            break;
+        }
+        out.push(Symbol::Function {
+            name: name.to_string(),
+            offset: Some(sym.st_value),
+            complexity: None,
+            callees: Vec::new(),
+        });
+    }
 }
 
 fn symbols(
