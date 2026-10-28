@@ -250,9 +250,9 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
             metrics,
         );
     }
-    // Preserve local function names when no disassembler supplied functions.
-    // Run after the fallback so symbol-table names never suppress richer Rizin
-    // function and call-graph facts.
+    // Preserve symbol-table function names when no disassembler supplied
+    // functions. Run after the fallback so symbol-table names never suppress
+    // richer Rizin function and call-graph facts.
     static_function_fallback(&elf, bytes.len(), symbols_out);
     linker_family(&elf, values);
     comment_fingerprint(values);
@@ -2220,7 +2220,7 @@ fn image_end_of(elf: &Elf<'_>) -> u64 {
 /// the section table while keeping the loadable segments the dynamic linker
 /// needs. Returns `None` when no `PT_LOAD` segment covers `va` in the file image
 /// (e.g. a `.bss`-only address with no file backing).
-fn load_segment_va_to_offset(elf: &Elf<'_>, va: u64) -> Option<u64> {
+pub(super) fn load_segment_va_to_offset(elf: &Elf<'_>, va: u64) -> Option<u64> {
     elf.program_headers
         .iter()
         .filter(|p| p.p_type == goblin::elf::program_header::PT_LOAD)
@@ -2230,7 +2230,14 @@ fn load_segment_va_to_offset(elf: &Elf<'_>, va: u64) -> Option<u64> {
         })
 }
 
-/// Recover locally defined ELF functions when disassembly yielded none.
+/// Recover functions defined in this file from `.symtab` when disassembly
+/// yielded none.
+///
+/// Every binding counts: a static executable keeps its libc entry points
+/// (`execve`, `fexecve`, `syscall`) as `.symtab` globals and weaks with no
+/// `.dynsym` to export them, so a local-only walk hides exactly the calls a
+/// symbol rule looks for. Functions `.dynsym` already exports stay exports
+/// only, so a dynamic object reports each name once, in the same view it did.
 fn static_function_fallback(elf: &Elf<'_>, file_len: usize, out: &mut crate::Symbols) {
     use crate::output::{Symbol, SymbolKind};
     if out
@@ -2239,13 +2246,15 @@ fn static_function_fallback(elf: &Elf<'_>, file_len: usize, out: &mut crate::Sym
     {
         return;
     }
+    let exported: std::collections::HashSet<&str> = elf
+        .dynsyms
+        .iter()
+        .filter(|sym| sym.st_shndx != 0)
+        .filter_map(|sym| elf.dynstrtab.get_at(sym.st_name))
+        .collect();
     let mut names = NameBudget::new(file_len);
     for sym in &elf.syms {
-        if sym.st_bind() != goblin::elf::sym::STB_LOCAL
-            || !sym.is_function()
-            || sym.st_value == 0
-            || sym.st_size == 0
-        {
+        if !sym.is_function() || sym.st_value == 0 || sym.st_size == 0 {
             continue;
         }
         let Some(section) = elf.section_headers.get(sym.st_shndx) else {
@@ -2254,11 +2263,10 @@ fn static_function_fallback(elf: &Elf<'_>, file_len: usize, out: &mut crate::Sym
         if section.sh_flags & u64::from(goblin::elf::section_header::SHF_EXECINSTR) == 0 {
             continue;
         }
-        let Some(name) = elf
-            .strtab
-            .get_at(sym.st_name)
-            .filter(|name| !name.is_empty())
-        else {
+        let Some(name) = elf.strtab.get_at(sym.st_name).filter(|name| {
+            !name.is_empty()
+                && (sym.st_bind() == goblin::elf::sym::STB_LOCAL || !exported.contains(name))
+        }) else {
             continue;
         };
         if !names.take(name.len()) {

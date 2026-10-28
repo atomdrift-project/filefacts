@@ -1,9 +1,14 @@
-//! ELF **direct** syscall inventory — syscalls issued via a raw `syscall`/`svc`
-//! instruction rather than a libc wrapper.
+//! ELF syscall inventory — syscalls issued via a raw `syscall`/`svc`
+//! instruction, plus x86-64 calls to the libc `syscall(number, ...)` wrapper
+//! with a constant number.
 //!
 //! Direct syscalls are neutral capabilities, including those in static libc.
 //! Emit resolved numbers even when their ABI name is unknown. Each record has
 //! a file offset and constant arguments; trait rules supply behavioral meaning.
+//! A wrapper record carries `"via": "syscall"` and the call's offset, with
+//! `args` shifted to the syscall ABI (`rsi` is arg 0). The wrapper is found by
+//! its defined symbol (static binaries) or by the PLT stub or `-fno-plt` GOT
+//! slot of its import (dynamic binaries).
 //! x86-64 decoding follows instruction boundaries within executable regions.
 //! Work is bounded by the file size and records by MAX_CANDIDATES.
 
@@ -37,14 +42,16 @@ struct Site {
     name: &'static str,
     number: u32,
     args: [Option<u64>; N_ARGS],
+    /// The libc function the call went through; `None` for a raw instruction.
+    via: Option<&'static str>,
 }
 type Sites = BTreeMap<u64, Site>;
 
 pub(super) fn emit(elf: &Elf<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     let mut sites = Sites::new();
 
-    // The generic `syscall()` wrapper takes a runtime number we can't resolve;
-    // note its presence (an unresolved computed-number site) but nothing more.
+    // An imported `syscall()` wrapper may take runtime numbers; note its
+    // presence whether or not any of its call sites resolve.
     let indirect = elf
         .dynsyms
         .iter()
@@ -90,19 +97,28 @@ fn site_json((&offset, site): (&u64, &Site)) -> JsonValue {
         .take(end)
         .map(|a| a.map_or(JsonValue::Null, JsonValue::from))
         .collect();
-    serde_json::json!({
+    let mut record = serde_json::json!({
         "name": site.name,
         "number": site.number,
         "offset": offset,
         "args": vals,
-    })
+    });
+    if let (Some(via), Some(fields)) = (site.via, record.as_object_mut()) {
+        fields.insert("via".into(), via.into());
+    }
+    record
 }
 
 /// Executable file-backed sections, or executable PT_LOAD segments when section
 /// metadata is absent. Sort and clip overlaps so no file byte is scanned twice.
 /// Invalid ranges are ignored and emitted offsets always refer to file bytes.
-fn exec_regions<'a>(elf: &'a Elf<'_>, bytes: &'a [u8]) -> impl Iterator<Item = (usize, &'a [u8])> {
-    let mut ranges: Vec<(usize, usize, ())> = elf
+/// Each region carries its address bias (`vaddr - offset`, wrapping), which
+/// turns a file offset into the address its branch targets are relative to.
+fn exec_regions<'a>(
+    elf: &'a Elf<'_>,
+    bytes: &'a [u8],
+) -> impl Iterator<Item = (usize, u64, &'a [u8])> {
+    let mut ranges: Vec<(usize, usize, u64)> = elf
         .section_headers
         .iter()
         .filter(|sh| sh.sh_flags & u64::from(SHF_EXECINSTR) != 0 && sh.sh_type != SHT_NOBITS)
@@ -110,7 +126,7 @@ fn exec_regions<'a>(elf: &'a Elf<'_>, bytes: &'a [u8]) -> impl Iterator<Item = (
             Some((
                 usize::try_from(sh.sh_offset).ok()?,
                 usize::try_from(sh.sh_size).ok()?,
-                (),
+                sh.sh_addr.wrapping_sub(sh.sh_offset),
             ))
         })
         .collect();
@@ -123,45 +139,147 @@ fn exec_regions<'a>(elf: &'a Elf<'_>, bytes: &'a [u8]) -> impl Iterator<Item = (
                 Some((
                     usize::try_from(ph.p_offset).ok()?,
                     usize::try_from(ph.p_filesz).ok()?,
-                    (),
+                    ph.p_vaddr.wrapping_sub(ph.p_offset),
                 ))
             })
             .collect();
     }
     super::common::disjoint_file_ranges(ranges, bytes.len())
         .into_iter()
-        .filter_map(|(range, ())| Some((range.start, bytes.get(range)?)))
+        .filter_map(|(range, bias)| Some((range.start, bias, bytes.get(range)?)))
 }
 
 fn scan_x86_64(elf: &Elf<'_>, bytes: &[u8], sites: &mut Sites) -> u64 {
     use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic};
+    let wrapper = SyscallWrapper::new(elf, bytes);
     let mut direct = 0;
-    for (offset, region) in exec_regions(elf, bytes) {
-        let mut decoder = Decoder::with_ip(64, region, offset as u64, DecoderOptions::NONE);
+    for (offset, bias, region) in exec_regions(elf, bytes) {
+        let ip = (offset as u64).wrapping_add(bias);
+        let mut decoder = Decoder::with_ip(64, region, ip, DecoderOptions::NONE);
         let mut instruction = Instruction::default();
         let mut state = X86State::default();
         while decoder.can_decode() {
             decoder.decode_out(&mut instruction);
-            if instruction.mnemonic() == Mnemonic::Syscall {
-                direct += 1;
-                if direct <= MAX_CANDIDATES as u64 {
-                    let res = state.resolved();
-                    if let Some(number) = res.number {
-                        sites.insert(
-                            instruction.ip(),
-                            Site {
-                                name: x86_64_syscall_name(number).unwrap_or("unknown"),
-                                number,
-                                args: res.args,
-                            },
-                        );
-                    }
+            let site = match instruction.mnemonic() {
+                Mnemonic::Syscall => {
+                    direct += 1;
+                    Some((state.resolved(), None))
                 }
+                Mnemonic::Call if wrapper.is_called_by(&instruction) => {
+                    Some((state.resolved_wrapper_call(), Some("syscall")))
+                }
+                _ => None,
+            };
+            if let Some((res, via)) = site
+                && let Some(number) = res.number
+                && sites.len() < MAX_CANDIDATES
+            {
+                sites.insert(
+                    instruction.ip().wrapping_sub(bias),
+                    Site {
+                        name: x86_64_syscall_name(number).unwrap_or("unknown"),
+                        number,
+                        args: res.args,
+                        via,
+                    },
+                );
             }
             state.step(&instruction);
         }
     }
     direct
+}
+
+/// Where the libc `syscall(long number, ...)` wrapper can be called.
+///
+/// A static binary defines the function: calls land on its address. A dynamic
+/// binary imports it: calls land on a PLT stub that jumps through the import's
+/// GOT slot, or (`-fno-plt`) go through that slot directly. Relocatable objects
+/// have no addresses to compare, so they get neither.
+struct SyscallWrapper<'a> {
+    elf: &'a Elf<'a>,
+    bytes: &'a [u8],
+    /// Addresses of defined `syscall` functions.
+    entries: Vec<u64>,
+    /// GOT slots the dynamic linker fills with the imported `syscall`.
+    slots: Vec<u64>,
+}
+
+impl<'a> SyscallWrapper<'a> {
+    const NAME: &'static str = "syscall";
+
+    fn new(elf: &'a Elf<'a>, bytes: &'a [u8]) -> Self {
+        let mut wrapper = Self {
+            elf,
+            bytes,
+            entries: Vec::new(),
+            slots: Vec::new(),
+        };
+        if elf.header.e_type == goblin::elf::header::ET_REL {
+            return wrapper;
+        }
+        let defined =
+            |sym: &goblin::elf::Sym| sym.is_function() && sym.st_shndx != 0 && sym.st_value != 0;
+        wrapper.entries = elf
+            .syms
+            .iter()
+            .filter(|sym| defined(sym) && elf.strtab.get_at(sym.st_name) == Some(Self::NAME))
+            .chain(elf.dynsyms.iter().filter(|sym| {
+                defined(sym) && elf.dynstrtab.get_at(sym.st_name) == Some(Self::NAME)
+            }))
+            .map(|sym| sym.st_value)
+            .collect();
+        wrapper.slots = elf
+            .pltrelocs
+            .iter()
+            .chain(elf.dynrelas.iter())
+            .filter(|rel| {
+                elf.dynsyms.get(rel.r_sym).is_some_and(|sym| {
+                    sym.st_shndx == 0 && elf.dynstrtab.get_at(sym.st_name) == Some(Self::NAME)
+                })
+            })
+            .map(|rel| rel.r_offset)
+            .collect();
+        wrapper
+    }
+
+    /// Whether `call` (an x86-64 `call`) transfers to the wrapper.
+    fn is_called_by(&self, call: &iced_x86::Instruction) -> bool {
+        use iced_x86::OpKind;
+        match call.op0_kind() {
+            OpKind::NearBranch64 => {
+                let target = call.near_branch_target();
+                self.entries.contains(&target)
+                    || (!self.slots.is_empty()
+                        && self
+                            .plt_slot(target)
+                            .is_some_and(|slot| self.slots.contains(&slot)))
+            }
+            OpKind::Memory if call.is_ip_rel_memory_operand() => {
+                self.slots.contains(&call.ip_rel_memory_address())
+            }
+            _ => false,
+        }
+    }
+
+    /// The GOT slot a PLT stub at `address` jumps through: an optional
+    /// `endbr64`, then `jmp`/`bnd jmp qword [rip+disp]`.
+    fn plt_slot(&self, address: u64) -> Option<u64> {
+        use iced_x86::{Decoder, DecoderOptions, Mnemonic};
+        const STUB_PREFIX_LEN: usize = 16;
+        let start =
+            usize::try_from(super::elf::load_segment_va_to_offset(self.elf, address)?).ok()?;
+        let code = self
+            .bytes
+            .get(start..start.saturating_add(STUB_PREFIX_LEN).min(self.bytes.len()))?;
+        let mut decoder = Decoder::with_ip(64, code, address, DecoderOptions::NONE);
+        let mut jump = decoder.decode();
+        if jump.mnemonic() == Mnemonic::Endbr64 {
+            jump = decoder.decode();
+        }
+        (jump.mnemonic() == Mnemonic::Jmp && jump.is_ip_rel_memory_operand())
+            .then(|| jump.ip_rel_memory_address())
+    }
 }
 
 struct X86State {
@@ -203,6 +321,18 @@ impl X86State {
         Resolved {
             number: self.value(RAX).and_then(|n| u32::try_from(n).ok()),
             args: [RDI, RSI, RDX, R10, R8, R9].map(|r| self.value(r)),
+        }
+    }
+
+    /// Operands of `syscall(number, a0, a1, ...)` under the SysV C calling
+    /// convention: the number in `rdi`, then five arguments in `rsi`, `rdx`,
+    /// `rcx`, `r8`, `r9`. The sixth travels on the stack and stays unresolved.
+    fn resolved_wrapper_call(&self) -> Resolved {
+        use iced_x86::Register::{R8, R9, RCX, RDI, RDX, RSI};
+        let [a0, a1, a2, a3, a4] = [RSI, RDX, RCX, R8, R9].map(|r| self.value(r));
+        Resolved {
+            number: self.value(RDI).and_then(|n| u32::try_from(n).ok()),
+            args: [a0, a1, a2, a3, a4, None],
         }
     }
 
@@ -270,7 +400,7 @@ fn scan_aarch64(elf: &Elf<'_>, bytes: &[u8], sites: &mut Sites) -> u64 {
     const SVC0: u32 = 0xD400_0001;
     let mut direct = 0u64;
     let mut budget = MAX_CANDIDATES;
-    for (region_off, region) in exec_regions(elf, bytes) {
+    for (region_off, _, region) in exec_regions(elf, bytes) {
         for (word, insn) in region.as_chunks::<4>().0.iter().enumerate() {
             if u32::from_le_bytes([insn[0], insn[1], insn[2], insn[3]]) != SVC0 {
                 continue;
@@ -288,6 +418,7 @@ fn scan_aarch64(elf: &Elf<'_>, bytes: &[u8], sites: &mut Sites) -> u64 {
                         name: aarch64_syscall_name(number).unwrap_or("unknown"),
                         number,
                         args: res.args,
+                        via: None,
                     },
                 );
             }

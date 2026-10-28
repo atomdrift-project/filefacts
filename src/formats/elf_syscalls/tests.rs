@@ -126,6 +126,7 @@ fn site_json_carries_number_and_trims_trailing_unresolved_args() {
         name: "mprotect",
         number: 10,
         args,
+        via: None,
     };
     let j = site_json((&0x1234, &site));
     assert_eq!(j["name"], "mprotect");
@@ -274,7 +275,7 @@ fn overlapping_exec_sections_cannot_multiply_scan_work() {
     let bytes = elf_with_exec_sections(EM_X86_64, &code, 300);
     let elf = Elf::parse(&bytes).expect("synthetic ELF must parse");
 
-    let scanned: usize = exec_regions(&elf, &bytes).map(|(_, r)| r.len()).sum();
+    let scanned: usize = exec_regions(&elf, &bytes).map(|(_, _, r)| r.len()).sum();
     assert!(
         scanned <= bytes.len(),
         "300 MiB of claims must collapse to at most one {}-byte pass, got {scanned}",
@@ -284,7 +285,7 @@ fn overlapping_exec_sections_cannot_multiply_scan_work() {
     // An honest section is scanned in full — the cap costs no coverage.
     let one = elf_with_exec_sections(EM_X86_64, &code, 1);
     let elf = Elf::parse(&one).expect("synthetic ELF must parse");
-    let scanned: usize = exec_regions(&elf, &one).map(|(_, r)| r.len()).sum();
+    let scanned: usize = exec_regions(&elf, &one).map(|(_, _, r)| r.len()).sum();
     assert_eq!(scanned, SECTION_LEN);
 }
 
@@ -456,4 +457,159 @@ fn syscall_tables_resolve_by_index_and_leave_gaps_unnamed() {
     assert_eq!(aarch64_syscall_name(400), None);
     assert_eq!(x86_64_syscall_name(463), None);
     assert_eq!(x86_64_syscall_name(u32::MAX), None);
+}
+
+fn fixture_bytes(name: &str) -> Vec<u8> {
+    let path = format!("tests/fixtures/{name}");
+    std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"))
+}
+
+/// `emit` over a checked-in fixture; returns the published site records.
+fn fixture_sites(name: &str) -> Vec<JsonValue> {
+    elf_sites(&fixture_bytes(name))
+}
+
+fn elf_sites(bytes: &[u8]) -> Vec<JsonValue> {
+    let elf = Elf::parse(bytes).unwrap();
+    let mut values = Values::default();
+    let mut metrics = Metrics::default();
+    emit(&elf, bytes, &mut values, &mut metrics);
+    values
+        .get("elf.syscalls_direct")
+        .and_then(JsonValue::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The single `syscall(319, ...)` record, with the wrapper's argument shift.
+fn wrapper_site(sites: &[JsonValue]) -> &JsonValue {
+    let wrapped: Vec<_> = sites.iter().filter(|s| s["via"] == "syscall").collect();
+    assert_eq!(wrapped.len(), 1, "{sites:?}");
+    assert_eq!(wrapped[0]["name"], "memfd_create");
+    assert_eq!(wrapped[0]["number"], 319);
+    wrapped[0]
+}
+
+#[test]
+fn static_wrapper_call_resolves_through_symtab_function() {
+    let sites = fixture_sites("elf-syscall-wrapper-static.elf");
+    let site = wrapper_site(&sites);
+    // `call syscall` at file offset 0x600; the name pointer is an absolute
+    // address in this non-PIE image, then the 1, 2, 3, 4 constants.
+    assert_eq!(site["offset"], 0x600);
+    assert_eq!(site["args"], serde_json::json!([0x0100_019a, 1, 2, 3, 4]));
+    // musl's own wrapper body still yields raw instruction records.
+    assert!(sites.iter().any(|s| s.get("via").is_none()));
+}
+
+#[test]
+fn dynamic_wrapper_call_resolves_through_plt_stub() {
+    let sites = fixture_sites("elf-syscall-wrapper-plt.elf");
+    let site = wrapper_site(&sites);
+    // `.text` sits at a different address than its file offset: the record
+    // must name the file offset, not the virtual address 0x1001712.
+    assert_eq!(site["offset"], 0x712);
+    // `lea rsi, [rip+..]` is not a constant.
+    assert_eq!(site["args"], serde_json::json!([null, 1, 2, 3, 4]));
+}
+
+#[test]
+fn dynamic_wrapper_call_resolves_through_got_slot() {
+    let site = fixture_sites("elf-syscall-wrapper-noplt.elf")
+        .into_iter()
+        .find(|s| s["via"] == "syscall")
+        .unwrap();
+    assert_eq!(site["name"], "memfd_create");
+    assert_eq!(site["offset"], 0x542);
+}
+
+#[test]
+fn constant_rdi_call_to_another_function_is_not_a_syscall() {
+    // mov edi, 0x13f; call +0 — no `syscall` symbol or import exists.
+    let code = [0xBF, 0x3F, 0x01, 0x00, 0x00, 0xE8, 0x00, 0x00, 0x00, 0x00];
+    let bytes = elf_with_exec_sections(EM_X86_64, &code, 1);
+    let elf = Elf::parse(&bytes).unwrap();
+    let mut sites = Sites::new();
+    assert_eq!(scan_x86_64(&elf, &bytes, &mut sites), 0);
+    assert!(sites.is_empty());
+}
+
+#[test]
+fn wrapper_call_shifts_arguments_past_the_number() {
+    // mov edi,319; mov esi,7; mov edx,1; mov ecx,2; mov r8d,3; mov r9d,4
+    let code = [
+        0xBF, 0x3F, 0x01, 0x00, 0x00, 0xBE, 0x07, 0x00, 0x00, 0x00, 0xBA, 0x01, 0x00, 0x00, 0x00,
+        0xB9, 0x02, 0x00, 0x00, 0x00, 0x41, 0xB8, 0x03, 0x00, 0x00, 0x00, 0x41, 0xB9, 0x04, 0x00,
+        0x00, 0x00,
+    ];
+    let mut state = X86State::default();
+    let mut decoder = iced_x86::Decoder::new(64, &code, iced_x86::DecoderOptions::NONE);
+    while decoder.can_decode() {
+        state.step(&decoder.decode());
+    }
+    let res = state.resolved_wrapper_call();
+    assert_eq!(res.number, Some(319));
+    assert_eq!(
+        res.args,
+        [Some(7), Some(1), Some(2), Some(3), Some(4), None]
+    );
+}
+
+#[test]
+fn dynamic_wrapper_call_resolves_through_ibt_plt_stub() {
+    // The plt fixture with its `syscall` stub rewritten in the IBT `.plt.sec`
+    // shape, `endbr64; jmp [rip+disp]`, through the same GOT slot.
+    let sites = fixture_sites("elf-syscall-wrapper-ibt.elf");
+    assert_eq!(wrapper_site(&sites)["offset"], 0x712);
+}
+
+#[test]
+fn relocatable_objects_get_no_wrapper_records() {
+    // Symbol values in an object are section-relative, so a call target that
+    // happens to equal one says nothing. Relabel the static fixture ET_REL.
+    let mut bytes = fixture_bytes("elf-syscall-wrapper-static.elf");
+    bytes[16..18].copy_from_slice(&goblin::elf::header::ET_REL.to_le_bytes());
+    let sites = elf_sites(&bytes);
+    assert!(sites.iter().all(|s| s.get("via").is_none()), "{sites:?}");
+    // Raw instruction records do not depend on the file type.
+    assert!(!sites.is_empty());
+}
+
+#[test]
+fn wrapper_call_with_unknown_number_is_not_recorded() {
+    // Replace `mov edi, 319` (file offset 0x5de) with `mov edi, esi` and
+    // three nops: the call still reaches `syscall`, but with no known number.
+    let mut bytes = fixture_bytes("elf-syscall-wrapper-static.elf");
+    assert_eq!(bytes[0x5de..0x5e3], [0xBF, 0x3F, 0x01, 0x00, 0x00]);
+    bytes[0x5de..0x5e3].copy_from_slice(&[0x89, 0xF7, 0x90, 0x90, 0x90]);
+    let sites = elf_sites(&bytes);
+    assert!(sites.iter().all(|s| s.get("via").is_none()), "{sites:?}");
+}
+
+#[test]
+fn x86_record_budget_counts_kept_records_not_instructions() {
+    // Unresolved `syscall`s first: they are counted but must not spend the
+    // record budget, so the resolved sites after them are still kept.
+    let unresolved = MAX_CANDIDATES + 100;
+    let mut code = [0x0F, 0x05].repeat(unresolved);
+    for _ in 0..10 {
+        code.extend([0xB8, 0x0A, 0x00, 0x00, 0x00, 0x0F, 0x05]); // mov eax, 10; syscall
+    }
+    let bytes = elf_with_exec_sections(EM_X86_64, &code, 1);
+    let elf = Elf::parse(&bytes).unwrap();
+    let mut sites = Sites::new();
+    assert_eq!(
+        scan_x86_64(&elf, &bytes, &mut sites),
+        unresolved as u64 + 10
+    );
+    assert_eq!(sites.len(), 10);
+
+    // Past the budget the record set stays bounded; the count stays honest.
+    let resolved = MAX_CANDIDATES + 500;
+    let code = [0xB8, 0x0A, 0x00, 0x00, 0x00, 0x0F, 0x05].repeat(resolved);
+    let bytes = elf_with_exec_sections(EM_X86_64, &code, 1);
+    let elf = Elf::parse(&bytes).unwrap();
+    let mut sites = Sites::new();
+    assert_eq!(scan_x86_64(&elf, &bytes, &mut sites), resolved as u64);
+    assert_eq!(sites.len(), MAX_CANDIDATES);
 }

@@ -1152,3 +1152,133 @@ fn static_function_fallback_recovers_only_defined_executable_functions() {
         matches!(rich.iter().next(), Some(Symbol::Function { name, complexity: Some(3), .. }) if name == "analyzed")
     );
 }
+
+/// Function names the `.symtab` fallback recovers from a checked-in fixture.
+fn fallback_function_names(fixture: &str) -> Vec<String> {
+    use crate::output::Symbol;
+    let bytes = read_fixture(fixture);
+    let elf = Elf::parse(&bytes).unwrap();
+    let mut out = crate::Symbols::default();
+    static_function_fallback(&elf, bytes.len(), &mut out);
+    out.iter()
+        .filter_map(|s| match s {
+            Symbol::Function { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn static_function_fallback_keeps_static_executable_globals() {
+    // musl links `syscall`, `main` and the program's own entry points as
+    // `.symtab` globals; nothing exports them through `.dynsym`.
+    let names = fallback_function_names("elf-syscall-wrapper-static.elf");
+    for global in ["syscall", "main", "exported_entry", "__libc_start_main"] {
+        assert!(names.iter().any(|n| n == global), "{global} in {names:?}");
+    }
+}
+
+#[test]
+fn static_function_fallback_leaves_dynamic_exports_as_exports() {
+    use crate::output::Symbol;
+    // `-rdynamic` exports every global; `.dynsym` already reports them.
+    let names = fallback_function_names("elf-syscall-wrapper-plt.elf");
+    assert!(!names.iter().any(|n| n == "exported_entry" || n == "main"));
+    // Without `-rdynamic` the dynamic linker never sees them: functions.
+    let names = fallback_function_names("elf-syscall-wrapper-noplt.elf");
+    for global in ["exported_entry", "main"] {
+        assert!(names.iter().any(|n| n == global), "{global} in {names:?}");
+    }
+    // The `.dynsym` view is unchanged: an export, and `syscall` an import.
+    let bytes = read_fixture("elf-syscall-wrapper-plt.elf");
+    let elf = Elf::parse(&bytes).unwrap();
+    let mut out = crate::Symbols::default();
+    symbols(
+        &elf,
+        bytes.len(),
+        &mut Values::default(),
+        &mut Metrics::default(),
+        &mut out,
+    );
+    assert!(
+        out.iter()
+            .any(|s| matches!(s, Symbol::Export { name, .. } if name == "exported_entry"))
+    );
+    assert!(
+        out.iter()
+            .any(|s| matches!(s, Symbol::Import { name, .. } if name == "syscall"))
+    );
+}
+
+#[test]
+fn static_function_fallback_keeps_every_binding_of_defined_functions() {
+    use crate::output::Symbol;
+    let text = [0x90_u8; 16];
+    // Offsets: local_fn 1, global_fn 10, weak_fn 20, data_object 28, undefined 40.
+    let strtab = b"\0local_fn\0global_fn\0weak_fn\0data_object\0undefined\0";
+    let mut payload = text.to_vec();
+    let str_off = PAYLOAD + payload.len() as u64;
+    payload.extend_from_slice(strtab);
+    payload.resize(payload.len().next_multiple_of(8), 0);
+    let sym_off = PAYLOAD + payload.len() as u64;
+    payload.extend_from_slice(&[0_u8; 24]);
+    // st_info is (binding << 4) | type: STB_LOCAL 0, STB_GLOBAL 1, STB_WEAK 2;
+    // STT_OBJECT 1, STT_FUNC 2.
+    for (name, info, section, address, size) in [
+        (1_u32, 0x02_u8, 1_u16, PAYLOAD, 4_u64),
+        (10, 0x12, 1, PAYLOAD + 4, 4),
+        (20, 0x22, 1, PAYLOAD + 8, 4),
+        (28, 0x11, 1, PAYLOAD + 12, 4),
+        (40, 0x12, 0, 0, 0),
+    ] {
+        let mut sym = [0_u8; 24];
+        sym[0..4].copy_from_slice(&name.to_le_bytes());
+        sym[4] = info;
+        sym[6..8].copy_from_slice(&section.to_le_bytes());
+        sym[8..16].copy_from_slice(&address.to_le_bytes());
+        sym[16..24].copy_from_slice(&size.to_le_bytes());
+        payload.extend_from_slice(&sym);
+    }
+    let bytes = elf_over_payload(
+        &payload,
+        &[],
+        &[
+            Sec {
+                name: ".text",
+                ty: 1,
+                flags: 6,
+                off: PAYLOAD,
+                size: text.len() as u64,
+                ..Sec::default()
+            },
+            Sec {
+                name: ".strtab",
+                ty: 3,
+                off: str_off,
+                size: strtab.len() as u64,
+                ..Sec::default()
+            },
+            Sec {
+                name: ".symtab",
+                ty: 2,
+                off: sym_off,
+                size: 6 * 24,
+                link: 2,
+                entsize: 24,
+                ..Sec::default()
+            },
+        ],
+    );
+    let elf = Elf::parse(&bytes).unwrap();
+    let mut out = crate::Symbols::default();
+    static_function_fallback(&elf, bytes.len(), &mut out);
+    let mut names: Vec<_> = out
+        .iter()
+        .filter_map(|s| match s {
+            Symbol::Function { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["global_fn", "local_fn", "weak_fn"]);
+}
