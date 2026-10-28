@@ -17,6 +17,7 @@ mod escapes;
 mod go_syntax;
 mod payload_flow;
 mod python_module_calls;
+mod shell_fifo;
 mod value_flow;
 pub use payload_flow::go_package_payload_flow;
 mod rust_syntax;
@@ -390,6 +391,9 @@ pub(super) fn extract(
     }
     if config.lang == Lang::Batch {
         batch_commands::emit(root, source, values);
+    }
+    if config.lang == Lang::Bash {
+        shell_fifo::emit(root, source, values);
     }
     payload_flow::emit(
         root,

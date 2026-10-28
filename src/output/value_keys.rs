@@ -858,6 +858,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "source.rust.initializers",
     "source.rust.modules",
     "source.rust.proc_macro",
+    "source.shell.fifo_network_loops",
     "source.wordpress.plugin_name",
     "source.wordpress.slug",
     "source.wordpress.text_domain",
