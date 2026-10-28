@@ -1792,7 +1792,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "2.1.1"
-source = "git+https://github.com/atomdrift-project/stng.git#dafb7d17ffea1021e1f457e24e7c26eaef28d2f5"
+source = "git+https://github.com/atomdrift-project/stng.git#06ee8e4d17df7c9cde230485239fea2fda4238a5"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -1817,7 +1817,7 @@ dependencies = [
 [[package]]
 name = "stng-process"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/stng.git#dafb7d17ffea1021e1f457e24e7c26eaef28d2f5"
+source = "git+https://github.com/atomdrift-project/stng.git#06ee8e4d17df7c9cde230485239fea2fda4238a5"
 dependencies = [
  "libc",
 ]
@@ -2364,9 +2364,9 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "unicode-width"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
+checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
 
 [[package]]
 name = "utf8_iter"
