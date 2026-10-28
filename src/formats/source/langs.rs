@@ -300,7 +300,43 @@ impl LangConfig {
         if self.lang == Lang::Perl && call.kind() == "method_call_expression" {
             return Some(call);
         }
+        if self.lang == Lang::Kotlin {
+            return self.call_head(call).named_child(0);
+        }
         call.child_by_field_name(self.callee_field)
+    }
+
+    /// The Kotlin grammar wraps `f(x) { lambda }` in an outer call whose
+    /// first child is `f(x)`. It is one invocation, unlike `(f(x))(y)`.
+    pub(super) fn call_head<'tree>(
+        &self,
+        call: tree_sitter::Node<'tree>,
+    ) -> tree_sitter::Node<'tree> {
+        if self.lang != Lang::Kotlin {
+            return call;
+        }
+        let mut cursor = call.walk();
+        let lambda = call
+            .named_children(&mut cursor)
+            .any(|n| n.kind() == "annotated_lambda");
+        let mut cursor = call.walk();
+        let own_args = call
+            .named_children(&mut cursor)
+            .any(|n| n.kind() == "value_arguments");
+        if lambda
+            && !own_args
+            && let Some(inner) = call.named_child(0)
+            && inner.kind() == "call_expression"
+        {
+            let mut cursor = inner.walk();
+            if inner
+                .named_children(&mut cursor)
+                .any(|n| n.kind() == "value_arguments")
+            {
+                return inner;
+            }
+        }
+        call
     }
 
     /// Whether the argument list [`Self::argument_list`] found is itself the
@@ -312,19 +348,22 @@ impl LangConfig {
     }
 
     /// Locate a call's argument list for both symbol and value-flow extraction.
-    /// Elixir's `arguments` is an immediate named child, not a grammar field.
+    /// Elixir and Kotlin use immediate named argument-list children, not fields.
     /// Do not search descendants: a nested call or do-block owns its own args.
     pub(super) fn argument_list<'tree>(
         &self,
         node: tree_sitter::Node<'tree>,
     ) -> Option<tree_sitter::Node<'tree>> {
+        let node = self.call_head(node);
         node.child_by_field_name(self.arguments_field).or_else(|| {
-            if self.lang != Lang::Elixir {
-                return None;
-            }
+            let kind = match self.lang {
+                Lang::Elixir => "arguments",
+                Lang::Kotlin => "value_arguments",
+                _ => return None,
+            };
             let mut cursor = node.walk();
             node.named_children(&mut cursor)
-                .find(|child| child.kind() == "arguments")
+                .find(|child| child.kind() == kind)
         })
     }
 }
@@ -900,7 +939,11 @@ static OBJC: LangConfig = LangConfig {
 static KOTLIN: LangConfig = LangConfig {
     lang: Lang::Kotlin,
     language: || tree_sitter_kotlin_ng::LANGUAGE.into(),
-    string_kinds: &["string_literal", "character_literal"],
+    string_kinds: &[
+        "string_literal",
+        "multiline_string_literal",
+        "character_literal",
+    ],
     import_query: r#"
         (import (qualified_identifier) @import)
     "#,

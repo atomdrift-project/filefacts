@@ -476,6 +476,12 @@ fn decode_string_literal(
     config: &langs::LangConfig,
 ) -> Option<String> {
     let raw = node.utf8_text(source.as_bytes()).ok()?;
+    if config.lang == Lang::Kotlin && raw.starts_with("\"\"\"") {
+        return raw
+            .strip_prefix("\"\"\"")?
+            .strip_suffix("\"\"\"")
+            .map(str::to_owned);
+    }
     if config.lang == Lang::Cpp && node.kind() == "raw_string_literal" {
         let raw = ["u8R\"", "uR\"", "UR\"", "LR\"", "R\""]
             .into_iter()

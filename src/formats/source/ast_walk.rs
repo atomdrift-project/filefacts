@@ -899,6 +899,14 @@ impl State {
         config: &LangConfig,
         scratch: &mut TreeCursor<'t>,
     ) {
+        if config.lang == Lang::Kotlin
+            && let Some(parent) = node.parent()
+            && parent.kind() == "call_expression"
+            && config.call_head(parent).id() == node.id()
+        {
+            // The outer trailing-lambda call records these arguments once.
+            return;
+        }
         let callee = config.callee(node).or_else(|| first_named_child(node));
         let args_node = config.argument_list(node);
 
@@ -940,10 +948,19 @@ impl State {
                 args.push(build_arg(args_root, source, config));
             } else {
                 for arg in args_root.named_children(scratch) {
-                    if arg.kind() == "command_argument_sep" {
+                    if arg.kind() == "command_argument_sep" || arg.is_extra() {
                         continue;
                     }
                     args.push(build_arg(arg, source, config));
+                }
+            }
+        }
+        if config.lang == Lang::Kotlin {
+            // A trailing lambda is an additional argument owned by this call,
+            // not the value_arguments of a nested call in the lambda body.
+            for child in node.named_children(scratch) {
+                if child.kind() == "annotated_lambda" {
+                    args.push(Arg::Function);
                 }
             }
         }
@@ -975,10 +992,10 @@ impl State {
 
 fn arg_shape(node: Node<'_>, config: &LangConfig) -> ArgShape {
     let k = node.kind();
-    // Ruby uses the same string node kind for literal and interpolated
-    // strings. A runtime interpolation must never become a fixed URL or
-    // command argument; escaped and single-quoted #{...} remain literals.
-    if config.lang == Lang::Ruby && config.string_kinds.contains(&k) {
+    // Ruby and Kotlin share node kinds between literal and interpolated
+    // strings. Real grammar interpolation must not become a fixed command;
+    // escaped markers and Ruby single-quoted #{...} remain literals.
+    if matches!(config.lang, Lang::Ruby | Lang::Kotlin) && config.string_kinds.contains(&k) {
         let mut cursor = node.walk();
         if node
             .named_children(&mut cursor)
@@ -1020,11 +1037,41 @@ fn arg_shape(node: Node<'_>, config: &LangConfig) -> ArgShape {
 /// / `Call` / `Expression` variants when the argument has no
 /// statically-recoverable value.
 pub(super) fn build_arg(node: Node<'_>, source: &str, config: &LangConfig) -> Arg {
+    if config.lang == Lang::Kotlin && node.kind() == "value_argument" {
+        // Named and spread arguments do not establish positional parameter
+        // values. Keep their slot unresolved rather than borrowing a name or
+        // treating an expanded array as one literal command argument.
+        let mut cursor = node.walk();
+        if node
+            .children(&mut cursor)
+            .any(|child| matches!(child.kind(), "=" | "*"))
+        {
+            return Arg::Expression;
+        }
+        let mut cursor = node.walk();
+        return node
+            .named_children(&mut cursor)
+            .find(|child| !child.is_extra())
+            .map_or(Arg::Expression, |inner| build_arg(inner, source, config));
+    }
     // A shell word can concatenate unquoted and quoted literal pieces,
     // e.g. --header='value' or --url="https://host/path". Preserve those
     // static values; expansions and unsupported escapes stay expressions.
     if config.lang == Lang::Bash && node.kind() == "concatenation" {
         return static_shell_word(node, source, 0)
+            .map(|value| Arg::String { value })
+            .unwrap_or(Arg::Expression);
+    }
+    // Constant JS/TS string additions have an exact argument value too.
+    // Never coerce numbers, evaluate calls, resolve names or retain a prefix
+    // when any part is unknown. This is an iterative, bounded data transform.
+    if matches!(config.lang, Lang::JavaScript | Lang::TypeScript)
+        && matches!(
+            node.kind(),
+            "binary_expression" | "parenthesized_expression"
+        )
+    {
+        return static_js_string(node, source, config)
             .map(|value| Arg::String { value })
             .unwrap_or(Arg::Expression);
     }
@@ -1085,6 +1132,110 @@ pub(super) fn build_arg(node: Node<'_>, source: &str, config: &LangConfig) -> Ar
         ArgShape::Call => Arg::Call,
         ArgShape::Expression => Arg::Expression,
     }
+}
+
+/// Resolve only literal-string additions and grouping, with no JS execution.
+fn static_js_string(node: Node<'_>, source: &str, config: &LangConfig) -> Option<String> {
+    const MAX_BYTES: usize = 16_384;
+    const MAX_NODES: usize = 256;
+    let mut stack = vec![node];
+    let mut visited = 0;
+    let mut value = String::new();
+    while let Some(node) = stack.pop() {
+        visited += 1;
+        if visited > MAX_NODES {
+            return None;
+        }
+        match node.kind() {
+            "string" => {
+                // Bound the source allocation before decoding escape syntax.
+                if node.end_byte().checked_sub(node.start_byte())? > MAX_BYTES * 6 + 2 {
+                    return None;
+                }
+                if !supported_js_literal(node.utf8_text(source.as_bytes()).ok()?) {
+                    return None;
+                }
+                let part = decode_string_literal(node, source, config)?;
+                if value.len().checked_add(part.len())? > MAX_BYTES {
+                    return None;
+                }
+                value.push_str(&part);
+            }
+            "binary_expression" => {
+                let operator = node.child_by_field_name("operator")?;
+                if operator.utf8_text(source.as_bytes()).ok()? != "+" {
+                    return None;
+                }
+                stack.push(node.child_by_field_name("right")?);
+                stack.push(node.child_by_field_name("left")?);
+            }
+            "parenthesized_expression" => {
+                let mut cursor = node.walk();
+                let mut children = node
+                    .named_children(&mut cursor)
+                    .filter(|child| !child.is_extra());
+                let child = children.next()?;
+                if children.next().is_some() {
+                    return None;
+                }
+                stack.push(child);
+            }
+            _ => return None,
+        }
+    }
+    Some(value)
+}
+
+/// The shared escape decoder preserves unsupported forms and includes a few
+/// non-JS escapes. Such forms cannot establish an exact folded JS value.
+fn supported_js_literal(raw: &str) -> bool {
+    let Some(body) = raw.get(1..raw.len().saturating_sub(1)) else {
+        return false;
+    };
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if matches!(c, '\n' | '\r') {
+            return false;
+        }
+        if c != '\\' {
+            continue;
+        }
+        match chars.next() {
+            Some(
+                '\\' | '\'' | '"' | '`' | '/' | '$' | 'b' | 'f' | 'n' | 'r' | 't' | 'v' | '\n',
+            ) => {}
+            Some('0') if !chars.peek().is_some_and(char::is_ascii_digit) => {}
+            Some('x') => {
+                if !(0..2).all(|_| chars.next().is_some_and(|c| c.is_ascii_hexdigit())) {
+                    return false;
+                }
+            }
+            Some('u') => {
+                let braced = chars.peek() == Some(&'{');
+                if braced {
+                    chars.next();
+                }
+                let mut value = 0u32;
+                let mut count = 0;
+                while count < if braced { 6 } else { 4 } {
+                    let Some(digit) = chars.peek().and_then(|c| c.to_digit(16)) else {
+                        break;
+                    };
+                    chars.next();
+                    value = value * 16 + digit;
+                    count += 1;
+                }
+                if (braced && (count == 0 || chars.next() != Some('}')))
+                    || (!braced && count != 4)
+                    || char::from_u32(value).is_none()
+                {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn static_shell_word(node: Node<'_>, source: &str, depth: usize) -> Option<String> {

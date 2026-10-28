@@ -1,6 +1,102 @@
 use super::*;
 
 #[test]
+fn javascript_constant_string_arguments_keep_exact_values_without_coercion() {
+    let source = br#"
+capture('joined', "a" + (/* grouping */ 'b\n' + 'c'));
+capture('escapes', '\\' + '\u0061');
+capture('numeric', 'a' + 1);
+capture('other-operator', 'a' - 'b');
+capture('unknown', 'a' + missing);
+capture('call', ('a' + getValue()));
+capture('template', `a${missing}` + 'b');
+capture('static-template', `a` + 'b');
+capture('conditional', (false ? 'a' : 'b') + 'c');
+capture('other-language-escape', '\a' + 'b');
+capture('identity-escape', '\q' + 'b');
+capture('legacy-octal', '\07' + 'b');
+capture('invalid-hex', '\x4G' + 'b');
+capture('surrogate', '\uD800' + 'b');
+capture('last', ('complete'));
+const documentation = "capture('fake', 'a' + 'b')";
+"#;
+    for filename in ["arguments.js", "arguments.ts"] {
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new(filename))
+            .open(source);
+        let calls: Vec<_> = parsed
+            .symbols()
+            .iter_kind(crate::SymbolKind::Call)
+            .filter_map(|symbol| match symbol {
+                crate::Symbol::Call {
+                    target: Some(target),
+                    args,
+                    offset,
+                } if target == "capture" => Some((args, offset)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 15, "{filename}");
+        for (args, offset) in calls {
+            assert_eq!(args.len(), 2);
+            assert!(source[offset.unwrap() as usize..].starts_with(b"capture("));
+            let crate::Arg::String { value: tag } = &args[0] else {
+                panic!("literal tag");
+            };
+            let expected = match tag.as_str() {
+                "joined" => Some("ab\nc"),
+                "escapes" => Some("\\a"),
+                "last" => Some("complete"),
+                _ => None,
+            };
+            if let Some(expected) = expected {
+                assert!(
+                    matches!(&args[1],crate::Arg::String {value} if value==expected),
+                    "{filename} {tag}: {:?}",
+                    args[1]
+                );
+            } else {
+                assert!(
+                    matches!(args[1], crate::Arg::Expression),
+                    "{filename} {tag}: {:?}",
+                    args[1]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn javascript_constant_string_argument_budgets_do_not_return_partial_values() {
+    let at_limit = "a".repeat(16_384);
+    let over_limit = "a".repeat(16_385);
+    let many_parts = std::iter::repeat_n("''", 129).collect::<Vec<_>>().join("+");
+    let source = format!(
+        "capture('limit', '{at_limit}'+'');capture('oversize','{over_limit}'+'');capture('nodes',{many_parts});capture('after','still'+' complete');"
+    );
+    let parsed = crate::OpenOptions::new()
+        .path(std::path::Path::new("limits.js"))
+        .open(source.as_bytes());
+    let calls: Vec<_> = parsed
+        .symbols()
+        .iter_kind(crate::SymbolKind::Call)
+        .filter_map(|s| match s {
+            crate::Symbol::Call {
+                target: Some(target),
+                args,
+                ..
+            } if target == "capture" => Some(args),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 4);
+    assert!(matches!(&calls[0][1],crate::Arg::String{value} if value==&at_limit));
+    assert!(matches!(calls[1][1], crate::Arg::Expression));
+    assert!(matches!(calls[2][1], crate::Arg::Expression));
+    assert!(matches!(&calls[3][1],crate::Arg::String{value} if value=="still complete"));
+}
+
+#[test]
 fn detached_numeric_sequence_calls_have_static_targets_without_receivers() {
     let source = r#"
 (0, child_process.fork)("one");
@@ -901,6 +997,123 @@ fn kotlin_imports_and_definitions() {
     let names: Vec<&str> = functions.iter().map(String::as_str).collect();
     assert!(names.contains(&"hello"), "got {names:?}");
     assert!(names.contains(&"add"), "got {names:?}");
+}
+
+#[test]
+fn kotlin_call_arguments_preserve_values_without_borrowing_nested_or_named_arguments() {
+    use crate::{Arg, Symbol};
+    let source = r#"fun probe(argv: Array<String>) {
+      ProcessBuilder(/* context */ "security", "find-generic-password", "-w", "-s", "Chrome Safe Storage").start()
+      outer(inner("nested"), "tail")
+      named(mode = "security", option = "-w")
+      ProcessBuilder(*argv).start()
+      withLambda("value") { println("lambda body") }
+      lambdaOnly { println("another body") }
+      val printed = "ProcessBuilder('not a call')"
+    }"#;
+    let parsed = crate::OpenOptions::new()
+        .path(std::path::Path::new("calls.kt"))
+        .open(source.as_bytes());
+    let calls: Vec<_> = parsed
+        .symbols()
+        .iter()
+        .filter_map(|s| match s {
+            Symbol::Call {
+                target: Some(target),
+                args,
+                ..
+            } => Some((target.as_str(), args)),
+            _ => None,
+        })
+        .collect();
+    let builders: Vec<_> = calls
+        .iter()
+        .filter(|(target, _)| *target == "ProcessBuilder")
+        .collect();
+    assert_eq!(builders.len(), 2, "{calls:?}");
+    let expected = [
+        "security",
+        "find-generic-password",
+        "-w",
+        "-s",
+        "Chrome Safe Storage",
+    ];
+    assert_eq!(builders[0].1.len(), expected.len());
+    for (arg, value) in builders[0].1.iter().zip(expected) {
+        assert!(
+            matches!(arg, Arg::String { value: actual } if actual == value),
+            "{arg:?}"
+        );
+    }
+    assert!(matches!(builders[1].1.as_slice(), [Arg::Expression]));
+    let args = &calls
+        .iter()
+        .find(|(target, _)| *target == "outer")
+        .unwrap()
+        .1;
+    assert!(matches!(args.as_slice(), [Arg::Call, Arg::String { value }] if value == "tail"));
+    let args = &calls
+        .iter()
+        .find(|(target, _)| *target == "named")
+        .unwrap()
+        .1;
+    assert!(matches!(
+        args.as_slice(),
+        [Arg::Expression, Arg::Expression]
+    ));
+    let args = &calls
+        .iter()
+        .find(|(target, _)| *target == "withLambda")
+        .unwrap()
+        .1;
+    assert!(matches!(args.as_slice(), [Arg::String { value }, Arg::Function] if value == "value"));
+    let args = &calls
+        .iter()
+        .find(|(target, _)| *target == "lambdaOnly")
+        .unwrap()
+        .1;
+    assert!(matches!(args.as_slice(), [Arg::Function]));
+}
+
+#[test]
+fn kotlin_templates_do_not_become_fixed_arguments_and_raw_strings_keep_backslashes() {
+    use crate::{Arg, Symbol};
+    let source = r####"fun probe(value: String) {
+      sink("https://host/${value}")
+      sink("""$value""")
+      sink("literal \$value")
+      sink("""C:\temp\payload""")
+      sink("""\u0041""")
+      sink("\\\u0024value")
+    }"####;
+    let parsed = crate::OpenOptions::new()
+        .path(std::path::Path::new("strings.kt"))
+        .open(source.as_bytes());
+    let args: Vec<_> = parsed
+        .symbols()
+        .iter()
+        .filter_map(|s| match s {
+            Symbol::Call {
+                target: Some(target),
+                args,
+                ..
+            } if target == "sink" => args.first(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(args.len(), 6, "{args:?}");
+    assert!(matches!(args[0], Arg::Template { .. }));
+    assert!(matches!(args[1], Arg::Template { .. }));
+    for (arg, expected) in
+        args[2..]
+            .iter()
+            .zip(["literal $value", r"C:\temp\payload", r"\u0041", r"\$value"])
+    {
+        assert!(
+            matches!(arg, Arg::String { value } if value == expected),
+            "{arg:?}, expected {expected:?}"
+        );
+    }
 }
 
 #[test]
