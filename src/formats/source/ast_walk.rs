@@ -1103,7 +1103,7 @@ pub(super) fn build_arg(node: Node<'_>, source: &str, config: &LangConfig) -> Ar
             Some(value) => Arg::String { value },
             None => Arg::Expression,
         },
-        ArgShape::Number => match parse_numeric_literal_node(node, source) {
+        ArgShape::Number => match parse_numeric_literal_node(node, source, config) {
             Some((text, value, radix)) => Arg::Number { text, value, radix },
             None => Arg::Expression,
         },
@@ -1264,7 +1264,11 @@ fn static_shell_word(node: Node<'_>, source: &str, depth: usize) -> Option<Strin
 /// Parse a numeric-literal node into `(source_text, value, radix)`.
 /// Recognises `0x` / `0o` / `0b` prefixes; strips digit separators
 /// and integer suffixes. Returns `None` for floats / unparseable.
-fn parse_numeric_literal_node(node: Node<'_>, source: &str) -> Option<(String, i64, u32)> {
+fn parse_numeric_literal_node(
+    node: Node<'_>,
+    source: &str,
+    config: &LangConfig,
+) -> Option<(String, i64, u32)> {
     let text = node.utf8_text(source.as_bytes()).ok()?.to_string();
     if text.contains('.') {
         return None;
@@ -1276,9 +1280,19 @@ fn parse_numeric_literal_node(node: Node<'_>, source: &str) -> Option<(String, i
         (s, 8u32)
     } else if let Some(s) = text.strip_prefix("0b").or_else(|| text.strip_prefix("0B")) {
         (s, 2u32)
+    } else if config.lang == Lang::Go
+        && text.starts_with('0')
+        && text.as_bytes().get(1).is_some_and(u8::is_ascii_digit)
+    {
+        // Go retains the leading-zero octal spelling (0755), alongside 0o755.
+        // Other languages, including Rust, give leading zeroes different semantics.
+        (text.as_str(), 8u32)
     } else {
         (text.as_str(), 10u32)
     };
+    if config.lang == Lang::Go && !rest.chars().all(|c| c.is_digit(radix) || c == '_') {
+        return None;
+    }
     let cleaned: String = rest
         .chars()
         .take_while(|c| c.is_digit(radix) || *c == '_')

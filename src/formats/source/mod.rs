@@ -9,6 +9,7 @@
 //! [`ParsedFile`]: crate::ParsedFile
 
 mod ast_walk;
+mod batch_commands;
 mod batch_concat;
 mod call_target_metrics;
 mod comment_metrics;
@@ -386,6 +387,9 @@ pub(super) fn extract(
     }
     if config.lang == Lang::Python {
         python_module_calls::emit(root, source, values);
+    }
+    if config.lang == Lang::Batch {
+        batch_commands::emit(root, source, values);
     }
     payload_flow::emit(
         root,

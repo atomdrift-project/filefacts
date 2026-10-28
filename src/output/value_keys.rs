@@ -837,6 +837,8 @@ pub const VALUE_CATALOG: &[&str] = &[
     "shellcode.getpc",
     "source.autoconf.name",
     "source.autoconf.version",
+    "source.batch.command_sites",
+    "source.batch.command_sites_truncated",
     "source.execution.module_http",
     "source.go.generate",
     "source.go.generate_incomplete",

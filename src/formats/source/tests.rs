@@ -1551,3 +1551,44 @@ const text = "import fake from 'not-real'";
         assert_eq!(code[offset], b'\'');
     }
 }
+
+#[test]
+fn go_legacy_octal_call_arguments_keep_their_value_and_radix() {
+    let cases: &[(&str, &[u8], &[(i64, u32)])] = &[
+        (
+            "modes.go",
+            b"package p\nfunc f() { capture(0755, 0o755, 493, 0x1ed, 0b111101101, 0) }",
+            &[(493, 8), (493, 8), (493, 10), (493, 16), (493, 2), (0, 10)],
+        ),
+        (
+            "modes.rs",
+            b"fn f() { capture(0755, 0o755); }",
+            &[(755, 10), (493, 8)],
+        ),
+    ];
+    for &(filename, source, expected) in cases {
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new(filename))
+            .open(source);
+        let args = parsed
+            .symbols()
+            .iter_kind(crate::SymbolKind::Call)
+            .find_map(|symbol| match symbol {
+                crate::Symbol::Call {
+                    target: Some(target),
+                    args,
+                    ..
+                } if target == "capture" => Some(args),
+                _ => None,
+            })
+            .expect("capture call");
+        let actual: Vec<_> = args
+            .iter()
+            .map(|arg| match arg {
+                crate::Arg::Number { value, radix, .. } => (*value, *radix),
+                other => panic!("{filename}: expected numeric argument, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(actual.as_slice(), expected, "{filename}");
+    }
+}
