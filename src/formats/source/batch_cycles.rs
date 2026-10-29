@@ -1,6 +1,6 @@
 //! Bounded source-local process-spawn cycles, independent of label spelling.
 use crate::{Metrics, metric};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub(super) fn emit(source: &str, metrics: &mut Metrics) {
     let count = cycles(source);
@@ -41,6 +41,58 @@ fn cycles(source: &str) -> usize {
             }
         }
     }
+    // Follow only entry control flow that can be established statically.
+    // Ambiguous branches, command transfers and compound syntax stop proof.
+    let mut reachable = HashSet::new();
+    let mut pc = 0;
+    while let Some(line) = lines.get(pc).copied() {
+        if !reachable.insert(pc) {
+            break;
+        }
+        if line.is_empty() || comment(line) || line.starts_with(':') {
+            pc += 1;
+            continue;
+        }
+        if line.chars().any(|c| "&|()^<>".contains(c)) {
+            break;
+        }
+        let (head, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        if head.eq_ignore_ascii_case("goto") {
+            if rest.trim().eq_ignore_ascii_case(":eof") {
+                break;
+            }
+            let target = rest.trim().trim_start_matches(':').to_ascii_lowercase();
+            let Some(&target_pc) = labels.get(&target) else {
+                break;
+            };
+            pc = target_pc;
+            continue;
+        }
+        if [
+            "exit",
+            "if",
+            "for",
+            "call",
+            "cmd",
+            "cmd.exe",
+            "command",
+            "command.com",
+        ]
+        .iter()
+        .any(|name| head.eq_ignore_ascii_case(name))
+            || head
+                .trim_matches('"')
+                .to_ascii_lowercase()
+                .ends_with(".bat")
+            || head
+                .trim_matches('"')
+                .to_ascii_lowercase()
+                .ends_with(".cmd")
+        {
+            break;
+        }
+        pc += 1;
+    }
     let mut count = 0;
     let mut budget = 20_000usize;
     for (end, line) in lines.iter().enumerate() {
@@ -54,7 +106,7 @@ fn cycles(source: &str) -> usize {
         let Some(&start) = labels.get(&target) else {
             continue;
         };
-        if start >= end {
+        if start >= end || !reachable.contains(&start) || !reachable.contains(&end) {
             continue;
         }
         let Some(body) = lines.get(start + 1..end) else {
@@ -80,7 +132,7 @@ fn cycles(source: &str) -> usize {
             if line.chars().any(|c| "&|<>^()".contains(c)) {
                 return false;
             }
-            if words.any(|w| w.eq_ignore_ascii_case("/wait") || w.eq_ignore_ascii_case("/w")) {
+            if words.any(|w| w.starts_with('/') || (w.starts_with('%') && w.ends_with('%'))) {
                 return false;
             }
             launches += 1;
@@ -115,5 +167,13 @@ mod tests {
         );
         assert_eq!(cycles(":a\nstart tool.exe\ngoto b\n:b\n"), 0);
         assert_eq!(cycles(":a\nstart tool.exe & exit\ngoto a\n"), 0);
+        assert_eq!(cycles("exit /b\n:a\nstart tool.exe\ngoto a\n"), 0);
+        assert_eq!(cycles("goto done\n:a\nstart tool.exe\ngoto a\n:done\n"), 0);
+        assert_eq!(cycles(":a\nstart %OPTIONS% tool.exe\ngoto a\n"), 0);
+        assert_eq!(
+            cycles("if exist flag goto a\n:a\nstart tool.exe\ngoto a\n"),
+            0
+        );
+        assert_eq!(cycles("goto :eof\n:eof\nstart tool.exe\ngoto eof\n"), 0);
     }
 }
