@@ -515,10 +515,10 @@ fn ordinary_large_file_queries_within_a_tenth_of_the_budget() {
 }
 
 /// Without the start-depth cap, every step under 10k nested arrow
-/// functions revisits an open match per enclosing call: the imports query
-/// needs about 4k polls and its cost grows with the square of the depth.
-/// With the cap the cursor stops descending past it, so a tenth of that
-/// suffices.
+/// functions revisits an open match per enclosing call, so its cost grows
+/// with the square of the depth. With the cap the cursor stops descending
+/// past it and completes within a tenth of the query work budget. Polls
+/// include work on in-progress matches, not just cursor steps.
 #[test]
 fn deep_nesting_is_not_walked_past_the_start_depth_cap() {
     let src = format!(
@@ -532,8 +532,14 @@ fn deep_nesting_is_not_walked_past_the_start_depth_cap() {
         .spawn(move || {
             let tree = javascript_tree(&src);
             let imports = javascript_query(QueryKind::Imports);
-            collect_with_work_budget(imports, QueryKind::Imports, &src, tree.root_node(), 400)
-                .timed_out
+            collect_with_work_budget(
+                imports,
+                QueryKind::Imports,
+                &src,
+                tree.root_node(),
+                SOURCE_QUERY_WORK_BUDGET / 10,
+            )
+            .timed_out
         })
         .expect("spawn query thread")
         .join()

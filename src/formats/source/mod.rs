@@ -128,16 +128,17 @@ const SOURCE_QUERY_BYTE_LIMIT: usize = 2 * 1024 * 1024;
 const SOURCE_QUERY_OUTPUT_LIMIT: usize = 10_000;
 
 /// Work budget for one query, counted in progress polls. tree-sitter polls
-/// the query progress callback once per 100 cursor steps
-/// (`OP_COUNT_PER_QUERY_CALLBACK_CHECK` in `query.c`), so the same tree always
+/// the query progress callback after 1,000 work units, charging each cursor
+/// step for itself and its in-progress matches
+/// (`WORK_PER_QUERY_CALLBACK_CHECK` in `query.c`), so the same tree always
 /// stops at the same match, however loaded the machine is. A wall-clock
 /// budget would cut ordinary large files short under load, and the
 /// content-keyed disk cache would then keep the truncated symbols.
 ///
 /// Fixed rather than scaled: [`SOURCE_QUERY_BYTE_LIMIT`] already bounds how
-/// much tree a query walks. The heaviest query over about 68k real source
-/// files and generated 1–30 MiB sources took 40.6k polls (a minified bundle),
-/// an eighth of this budget.
+/// much tree a query walks. Ordinary large-file queries must fit in a tenth
+/// of this budget; the calibration test checks that against the current
+/// tree-sitter work accounting.
 const SOURCE_QUERY_WORK_BUDGET: u64 = 500_000;
 
 /// Deepest node at which a query pattern may start matching. Cursor steps
