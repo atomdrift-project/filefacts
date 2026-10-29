@@ -137,6 +137,8 @@ ecosystems! {
     Pub => "pub",
     /// PyPI.
     Pypi => "pypi",
+    /// RPM Fusion, the add-on repositories for Fedora.
+    Rpmfusion => "rpmfusion",
     /// The Snap Store.
     Snap => "snap",
     /// The Terraform registry.
@@ -145,6 +147,8 @@ ecosystems! {
     Ubuntu => "ubuntu",
     /// The Visual Studio Code marketplace.
     Vscode => "vscode",
+    /// Wolfi, Chainguard's container-first distribution.
+    Wolfi => "wolfi",
     /// WordPress.org plugins.
     Wordpress => "wordpress",
 }
