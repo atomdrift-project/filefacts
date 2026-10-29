@@ -195,3 +195,34 @@ fn dot_a_without_ar_magic_is_its_body() {
         Some(FileType::Text)
     );
 }
+
+#[test]
+fn gif_prefixed_repeating_xor_pe_retains_carrier_and_recovers_payload() {
+    let pe = include_bytes!("../../../tests/fixtures/test.exe");
+    for key in [
+        &[0x23][..],
+        &[0x13, 0x47, 0xa9, 0x82][..],
+        &[1, 20, 77, 217, 148, 64, 11, 176][..],
+    ] {
+        let mut encoded = b"GIF89a \0;seed".to_vec();
+        let offset = encoded.len();
+        assert_eq!(offset, 13);
+        encoded.extend(
+            pe.iter()
+                .enumerate()
+                .map(|(i, byte)| byte ^ key[(i + offset) % key.len()]),
+        );
+        let id = FileId::from_path_and_bytes(Path::new("asset.gif"), &encoded);
+        assert_eq!(id.file_type(), FileType::Gif);
+        let recovered = id
+            .xor_pe_key()
+            .expect("recover encoded PE behind GIF header");
+        assert_eq!(recovered.pe_offset(), offset);
+        assert_eq!(&recovered.decode(&encoded)[offset..], pe);
+    }
+    let mut clean = b"GIF89a\x01\0\x01\0\x80\0\0\0\0\0\xff\xff\xff\x2c\0\0\0\0\x01\0\x01\0\0\x02\x02\x44\x01\0\x3b".to_vec();
+    clean.extend_from_slice(&[0; 512]);
+    let id = FileId::from_path_and_bytes(Path::new("asset.gif"), &clean);
+    assert_eq!(id.file_type(), FileType::Gif);
+    assert!(id.xor_pe_key().is_none());
+}

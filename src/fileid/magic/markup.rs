@@ -31,6 +31,25 @@ pub(super) fn script_host_document(sniff: &Sniff<'_>) -> Option<FileType> {
     {
         return None;
     }
+    // Some WSF carriers put unquoted junk before the XML job. Honor the
+    // declared script language for that carrier, but never search past an
+    // earlier markup root or into a quoted source/documentation string.
+    let carrier = sniff.path.extension().is_some_and(|ext| {
+        ["wsf", "wsc", "sct"]
+            .iter()
+            .any(|name| ext.eq_ignore_ascii_case(name))
+    });
+    let data = if xml_head(data).is_none() && carrier {
+        let window = data.get(..WSH_SCRIPT_WINDOW).unwrap_or(data);
+        let at = memchr::memchr(b'<', window)?;
+        let prefix = data.get(..at)?;
+        if prefix.contains(&b'"') || prefix.contains(&b'\'') {
+            return None;
+        }
+        data.get(at..)?
+    } else {
+        data
+    };
     let head = xml_head(data)?;
     let root = head.root?;
     if !["job", "package", "component", "scriptlet"]

@@ -618,11 +618,15 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
 /// generic analyzer, and the key lets the consumer decode the image. It is
 /// recovered from known plaintext and checked against the PE header, so this
 /// cannot claim random bytes. Only opaque outcomes (Data, or nothing
-/// recognised) are tried: anything else was identified by its own bytes.
+/// recognised) and GIF-signature carriers are tried. A GIF header can front an
+/// encoded PE without changing its bytes; retain the carrier identity and
+/// expose the independently validated key.
 pub(crate) fn identify(path: &Path, data: &[u8]) -> (Option<Detection>, Option<RepeatingXorKey>) {
     let sniff = Sniff::new(path, data);
     let (detection, key) = match detect_known(&sniff) {
-        Some(d) if d.file_type == FileType::Data => (Some(d), recover_repeating_xor_pe(data)),
+        Some(d) if matches!(d.file_type, FileType::Data | FileType::Gif) => {
+            (Some(d), recover_repeating_xor_pe(data))
+        }
         Some(d) => (Some(d), None),
         None => match recover_repeating_xor_pe(data) {
             // An unrecognised extension (`.enc`) says nothing that opaque

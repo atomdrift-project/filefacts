@@ -134,6 +134,7 @@ impl Coverage {
 
 /// Fold a walker's coverage into the shared `media.*` facts.
 pub(crate) fn emit(bytes: &[u8], coverage: &Coverage, values: &mut Values, metrics: &mut Metrics) {
+    super::embedded_php::extract(bytes, values);
     let file_len = bytes.len() as u64;
     let mut stowaway: Vec<&'static str> = Vec::new();
     let mut stowaway_bytes: u64 = 0;
@@ -223,7 +224,9 @@ pub(crate) fn emit(bytes: &[u8], coverage: &Coverage, values: &mut Values, metri
         if let Some(region) = bytes.get(a..b.min(bytes.len())) {
             note(region, true, true, &mut stowaway);
         }
-        problems.push("data appended after end of container".to_string());
+        // `logical_end` is the extent accounted for by the parser. A
+        // failed walk does not establish that a real trailer was reached.
+        problems.push("data beyond parsed container regions".to_string());
     } else {
         trailing_bytes = 0;
     }

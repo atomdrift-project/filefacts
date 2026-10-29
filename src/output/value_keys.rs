@@ -496,6 +496,8 @@ pub const VALUE_CATALOG: &[&str] = &[
     "markdown.npm_packages",
     "media.container",
     "media.content_kind",
+    "media.php.analysis_limited",
+    "media.php.request_calls",
     "media.problems",
     "media.stowaway",
     "media.valid",

@@ -314,3 +314,27 @@ fn dos_binary_with_embedded_batch_text_keeps_binary_type() {
         assert_eq!(file_type(name, &bytes), Some(FileType::DosCom), "{name}");
     }
 }
+
+#[test]
+fn padded_wsf_declares_its_script_language() {
+    let mut data = b"word.junk? padding!\r\n".repeat(2000);
+    data.extend_from_slice(b"<job><script language=\"JScript\">WScript.Echo(1);</script></job>");
+    assert_eq!(file_type("changed.wsf", &data), Some(FileType::JavaScript));
+    let wide = utf16le(std::str::from_utf8(&data).unwrap(), true);
+    assert_eq!(file_type("changed.wsf", &wide), Some(FileType::JavaScript));
+    assert!(!FileId::from_path_and_bytes(Path::new("changed.wsf"), &data).extension_mismatch());
+}
+
+#[test]
+fn padded_wsf_does_not_override_markup_or_quoted_source() {
+    let page = b"<html><body><job><script language=\"JScript\">x=1;</script></job></body></html>";
+    assert_eq!(file_type("changed.wsf", page), Some(FileType::Html));
+    let quoted = b"x = \"<job><script language='JScript'>x=1;</script></job>\"\r\n";
+    assert_eq!(file_type("changed.wsf", quoted), Some(FileType::Vbs));
+    let mut too_far = vec![b'x'; 64 * 1024];
+    too_far.extend_from_slice(b"<job><script language=\"JScript\">x=1;</script></job>");
+    assert_ne!(
+        file_type("changed.wsf", &too_far),
+        Some(FileType::JavaScript)
+    );
+}

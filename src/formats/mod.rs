@@ -127,6 +127,7 @@ mod crx;
 mod deb;
 mod dmg;
 mod elf;
+mod embedded_php;
 mod font;
 mod gem;
 mod generic;

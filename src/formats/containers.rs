@@ -213,12 +213,19 @@ pub(crate) fn gif(bytes: &[u8]) -> Coverage {
                 break;
             }
             0x21 => {
-                // Extension: label byte, then sub-blocks.
+                // Comments, application metadata and plain-text extensions
+                // carry author-controlled bytes. Search their payloads for
+                // executable/archive headers, without treating metadata as
+                // unclaimed data or scanning compressed image pixels.
+                let label = bytes.get(at + 1).copied();
                 at += 2;
                 let Some(next) = skip_subblocks(bytes, at) else {
                     cov.problem("extension block truncated");
                     break;
                 };
+                if matches!(label, Some(0xFE | 0xFF | 0x01)) {
+                    cov.claim_freeform(at as u64, next as u64);
+                }
                 at = next;
             }
             0x2C => {

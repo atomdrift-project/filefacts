@@ -167,6 +167,58 @@ fn clean_gif_is_valid_and_trailing_payload_is_caught() {
     assert_eq!(stow(&v), vec!["pe"]);
 }
 
+#[test]
+fn gif_unparsed_tail_does_not_imply_a_trailer() {
+    let mut image = build_gif(&[]);
+    // Abort at the image introducer, before any actual trailer.
+    image[19] = 0x44;
+    image.extend_from_slice(&fake_pe(1024));
+    let (v, m) = facts(&gif(&image), &image);
+    assert_eq!(v.get("media.valid").and_then(|x| x.as_bool()), Some(false));
+    let problems = v.get("media.problems").unwrap().as_array().unwrap();
+    assert!(
+        problems
+            .iter()
+            .any(|x| x.as_str() == Some("unknown block marker"))
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|x| x.as_str() == Some("data beyond parsed container regions"))
+    );
+    assert!(
+        !problems
+            .iter()
+            .any(|x| x.as_str() == Some("data appended after end of container"))
+    );
+    assert!(m.get("media.trailing_bytes").unwrap() > 1000.0);
+    assert_eq!(stow(&v), vec!["pe"]);
+}
+
+#[test]
+fn gif_metadata_payloads_are_inspected_without_claiming_concealment() {
+    let clean = build_gif(&[]);
+    for payload in [fake_pe(512), Vec::from(&b"ordinary metadata MZ"[..])] {
+        let mut image = clean[..19].to_vec();
+        image.extend_from_slice(&[0x21, 0xFE]);
+        for chunk in payload.chunks(255) {
+            image.push(chunk.len() as u8);
+            image.extend_from_slice(chunk);
+        }
+        image.push(0);
+        image.extend_from_slice(&clean[19..]);
+        let (v, m) = facts(&gif(&image), &image);
+        assert_eq!(v.get("media.valid").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(m.get("media.trailing_bytes"), Some(0.0));
+        assert_eq!(m.get("media.stowaway_bytes"), Some(0.0));
+        if payload.starts_with(b"MZ") {
+            assert_eq!(stow(&v), vec!["pe"]);
+        } else {
+            assert!(stow(&v).is_empty());
+        }
+    }
+}
+
 fn build_aiff(extra: &[u8]) -> Vec<u8> {
     let comm = [
         0u8, 1, 0, 0, 2, 0, 0, 8, 0x40, 0x0b, 0xfa, 0, 0, 0, 0, 0, 0, 0,

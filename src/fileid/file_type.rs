@@ -113,7 +113,10 @@ impl Group {
 
     /// The types in this group, in declaration order.
     pub fn file_types(self) -> impl Iterator<Item = FileType> {
-        FileType::ALL.iter().copied().filter(move |t| t.group() == self)
+        FileType::ALL
+            .iter()
+            .copied()
+            .filter(move |t| t.group() == self)
     }
 }
 
