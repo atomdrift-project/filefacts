@@ -106,7 +106,7 @@ impl Supervisor {
             #[cfg(not(test))]
             let enabled = true;
             if enabled {
-                match stng::subprocess::Watchdog::arm(&mut cmd, timeout) {
+                match stng_process::Watchdog::arm(&mut cmd, timeout) {
                     Ok(watchdog) => Some(watchdog),
                     Err(error) => {
                         tracing::warn!(program, %error, "rizin run: cannot arm the watchdog; not starting");
@@ -303,7 +303,7 @@ struct ChildGuard<'s> {
     /// [`Self::finish`] has run: the group is dead and out of the registry.
     finished: bool,
     #[cfg(any(target_os = "macos", all(test, unix)))]
-    watchdog: Option<stng::subprocess::Watchdog>,
+    watchdog: Option<stng_process::Watchdog>,
     /// Contains descendants on Windows the way `process_group(0)` does on
     /// Unix. Created immediately after spawn; a helper started in the window
     /// before the assignment lands would escape the job, which is what the

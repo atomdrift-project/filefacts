@@ -49,7 +49,7 @@ fn string_opts_for(xor: XorScan, bytes: &[u8]) -> stng::ExtractOptions {
         .with_garbage_filter(true)
         .with_caller_provides_symbols(true);
     if xor.runs_on(bytes) {
-        opts.with_xor(None)
+        opts.with_xor(stng::XorMode::Auto)
     } else {
         opts
     }

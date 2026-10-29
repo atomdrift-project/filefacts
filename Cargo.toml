@@ -203,6 +203,9 @@ lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "x
 # `#[cfg(unix)]`.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# The rizin watchdog (process-group kill on parent death). Same source as stng
+# (a bare git URL) so both resolve to one copy.
+stng-process = { git = "https://github.com/atomdrift-project/stng.git" }
 # The CLI's SIGINT/SIGTERM cleanup thread (binary only, `cli`).
 signal-hook = { version = "0.3", optional = true }
 

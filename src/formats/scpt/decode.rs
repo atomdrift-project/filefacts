@@ -44,12 +44,10 @@ fn inputs(literals: &Literals, budget: usize) -> (Vec<stng::ExtractedString>, Ve
             end: cursor + len as u64,
             anchor: literal.offset,
         });
-        rows.push(stng::ExtractedString {
-            value: literal.value.clone(),
-            data_offset: cursor,
-            kind: stng::classify_string(&literal.value),
-            ..Default::default()
-        });
+        rows.push(
+            stng::ExtractedString::new(literal.value.clone(), cursor, stng::StringMethod::RawScan)
+                .with_kind(stng::classify_string(&literal.value)),
+        );
         cursor += len as u64 + 1;
     }
     (rows, origins, limited)

@@ -5,11 +5,8 @@ fn text_spans_locate_each_string_kind_correctly() {
     let text_rows: std::sync::Arc<[stng::ExtractedString]> = vec![
         // StackString: source is scattered across instructions, so the span
         // anchors at the first fragment — NOT the (non-contiguous) data_offset.
-        stng::ExtractedString {
-            value: "STACKSTR".into(),
-            data_offset: 9999,
-            method: stng::StringMethod::StackString,
-            fragments: Some(Box::new(vec![
+        stng::ExtractedString::new("STACKSTR", 9999, stng::StringMethod::StackString)
+            .with_fragments(vec![
                 stng::StringFragment {
                     offset: 0x100,
                     length: 4,
@@ -18,16 +15,9 @@ fn text_spans_locate_each_string_kind_correctly() {
                     offset: 0x200,
                     length: 4,
                 },
-            ])),
-            ..Default::default()
-        },
+            ]),
         // Plain byte-scan literal: span at its file offset.
-        stng::ExtractedString {
-            value: "plain".into(),
-            data_offset: 0x10,
-            method: stng::StringMethod::RawScan,
-            ..Default::default()
-        },
+        stng::ExtractedString::new("plain", 0x10, stng::StringMethod::RawScan),
     ]
     .into();
     let literals = Literals(vec![
@@ -54,18 +44,8 @@ fn text_spans_locate_each_string_kind_correctly() {
 #[test]
 fn text_iter_walks_both_encodings() {
     let rows: std::sync::Arc<[stng::ExtractedString]> = vec![
-        stng::ExtractedString {
-            value: "Mozilla/5.0".into(),
-            data_offset: 100,
-            method: stng::StringMethod::RawScan,
-            ..Default::default()
-        },
-        stng::ExtractedString {
-            value: "RegOpenKeyExW".into(),
-            data_offset: 200,
-            method: stng::StringMethod::WideString,
-            ..Default::default()
-        },
+        stng::ExtractedString::new("Mozilla/5.0", 100, stng::StringMethod::RawScan),
+        stng::ExtractedString::new("RegOpenKeyExW", 200, stng::StringMethod::WideString),
     ]
     .into();
     let t = Text::from_rows(rows);
