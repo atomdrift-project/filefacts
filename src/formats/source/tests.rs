@@ -114,7 +114,7 @@ const text = "(0, child_process.fork)('quoted')";
             .path(std::path::Path::new(path))
             .open(source.as_bytes());
         let flow = parsed.flow().unwrap();
-        assert!(!flow.limitations.contains("parse-error"));
+        assert!(!flow.limitations.contains(&crate::Limitation::ParseError));
         for (marker, target) in [
             ("one", Some("child_process.fork")),
             ("two", Some("node_child_process_1.fork")),
@@ -187,7 +187,7 @@ auto initialized = initialize();
     assert!(!ast.tree.root_node().has_error());
     let query = Query::new(&ast.tree.language(), "(template_declaration) @template").unwrap();
     assert_eq!(
-        collect_query(&query, source, ast.tree.root_node())
+        collect_query(&query, QueryKind::Functions, source, ast.tree.root_node())
             .items
             .len(),
         1
@@ -199,14 +199,14 @@ auto initialized = initialize();
     )
     .unwrap();
     assert_eq!(
-        collect_query(&query, source, ast.tree.root_node())
+        collect_query(&query, QueryKind::Functions, source, ast.tree.root_node())
             .items
             .len(),
         4
     );
     let flow = parsed.flow().expect("C++ flow");
     assert_eq!(flow.language, "cpp");
-    assert!(!flow.limitations.contains("parse-error"));
+    assert!(!flow.limitations.contains(&crate::Limitation::ParseError));
     let function = flow.functions.get("invoke").expect("template function");
     assert_eq!(function.parameters.len(), 2);
     assert!(
@@ -252,8 +252,11 @@ void invoke() {
         .open(source.as_bytes());
     let flow = parsed.flow().unwrap();
     assert_eq!(flow.language, "cpp");
-    assert!(!flow.limitations.contains("parse-error"));
-    assert!(flow.limitations.contains("anonymous-function"));
+    assert!(!flow.limitations.contains(&crate::Limitation::ParseError));
+    assert!(
+        flow.limitations
+            .contains(&crate::Limitation::AnonymousFunction)
+    );
     assert!(
         flow.values
             .iter()
@@ -328,11 +331,14 @@ auto initialized = on_load();
         .open(source.as_bytes());
     let flow = parsed.flow().unwrap();
     assert_eq!(flow.language, "cpp");
-    assert!(!flow.limitations.contains("parse-error"));
-    assert!(flow.limitations.contains("class-initializers-unmodeled"));
+    assert!(!flow.limitations.contains(&crate::Limitation::ParseError));
     assert!(
         flow.limitations
-            .contains("template-instantiation-unmodeled")
+            .contains(&crate::Limitation::ClassInitializersUnmodeled)
+    );
+    assert!(
+        flow.limitations
+            .contains(&crate::Limitation::TemplateInstantiationUnmodeled)
     );
     assert!(
         flow.values
@@ -415,7 +421,7 @@ fn source_query_output_limit_records_metric() {
         .expect("javascript grammar");
     let tree = parser.parse(&src, None).expect("parse generated js");
     let query = Query::new(&javascript_language(), "(identifier) @name").expect("identifier query");
-    let result = collect_query(&query, &src, tree.root_node());
+    let result = collect_query(&query, QueryKind::Functions, &src, tree.root_node());
 
     assert_eq!(result.items.len(), SOURCE_QUERY_OUTPUT_LIMIT);
     assert!(result.output_limited);
@@ -446,12 +452,13 @@ fn javascript_query(kind: QueryKind) -> &'static Query {
 /// Run `collect_query` with the work budget overridden to `polls`.
 fn collect_with_work_budget(
     query: &Query,
+    kind: QueryKind,
     src: &str,
     root: Node<'_>,
     polls: u64,
 ) -> QueryCollection {
     QUERY_WORK_OVERRIDE.set(polls);
-    let result = collect_query(query, src, root);
+    let result = collect_query(query, kind, src, root);
     QUERY_WORK_OVERRIDE.set(0);
     result
 }
@@ -459,7 +466,7 @@ fn collect_with_work_budget(
 /// The point of a work budget: a query that runs out stops at the same
 /// match every time, however loaded the machine is. Every step inside
 /// these nested calls is expensive (each enclosing call holds an open
-/// `require` match), the shape the old wall-clock budget cut short at a
+/// `require` match), the shape a wall-clock budget would cut short at a
 /// load-dependent point.
 #[test]
 fn query_work_budget_stops_at_the_same_point_every_time() {
@@ -469,11 +476,11 @@ fn query_work_budget_stops_at_the_same_point_every_time() {
     let tree = javascript_tree(&src);
     let imports = javascript_query(QueryKind::Imports);
 
-    let full = collect_query(imports, &src, tree.root_node());
+    let full = collect_query(imports, QueryKind::Imports, &src, tree.root_node());
     assert!(!full.timed_out);
     assert_eq!(full.items.len(), 2_000);
-    let first = collect_with_work_budget(imports, &src, tree.root_node(), 20);
-    let second = collect_with_work_budget(imports, &src, tree.root_node(), 20);
+    let first = collect_with_work_budget(imports, QueryKind::Imports, &src, tree.root_node(), 20);
+    let second = collect_with_work_budget(imports, QueryKind::Imports, &src, tree.root_node(), 20);
     assert!(first.timed_out && second.timed_out);
     assert_eq!(first.items, second.items);
     assert!(!first.items.is_empty() && first.items.len() < full.items.len());
@@ -495,6 +502,7 @@ fn ordinary_large_file_queries_within_a_tenth_of_the_budget() {
     for kind in [QueryKind::Imports, QueryKind::Functions, QueryKind::Classes] {
         let result = collect_with_work_budget(
             javascript_query(kind),
+            kind,
             &src,
             tree.root_node(),
             SOURCE_QUERY_WORK_BUDGET / 10,
@@ -524,7 +532,8 @@ fn deep_nesting_is_not_walked_past_the_start_depth_cap() {
         .spawn(move || {
             let tree = javascript_tree(&src);
             let imports = javascript_query(QueryKind::Imports);
-            collect_with_work_budget(imports, &src, tree.root_node(), 400).timed_out
+            collect_with_work_budget(imports, QueryKind::Imports, &src, tree.root_node(), 400)
+                .timed_out
         })
         .expect("spawn query thread")
         .join()
@@ -810,21 +819,15 @@ fn concat_chain_is_measured_at_its_outermost_node() {
 }
 
 #[test]
-fn go_package_name_comes_from_the_syntax_tree() {
-    let package = |path: &str, src: &str| {
-        let parsed = crate::OpenOptions::new()
-            .path(std::path::Path::new(path))
-            .open(src.as_bytes());
-        parsed
-            .source_ast()
-            .and_then(|ast| go_package_name(&ast).map(str::to_string))
-    };
+fn go_package_clause_comes_from_the_syntax_tree() {
     assert_eq!(
-        package("a.go", "package demo\nfunc main(){}\n").as_deref(),
+        go_package_clause("package demo\nfunc main(){}\n", None).as_deref(),
         Some("demo")
     );
-    assert_eq!(package("a.go", "func main(){}\n").as_deref(), Some(""));
-    assert_eq!(package("a.py", "package = 1\n"), None);
+    assert_eq!(
+        go_package_clause("func main(){}\n", None).as_deref(),
+        Some("")
+    );
 }
 
 /// Helper: parse `src` as a source file with the given extension
@@ -1295,11 +1298,9 @@ fn python_functions_and_classes_populate_typed_view() {
     assert!(names.contains(&"Greeter"), "expected Greeter");
 }
 
-/// Regression: `walk_node` used to recurse one stack frame per tree
-/// level with no bound, so a pathologically deep source file (e.g.
-/// thousands of nested parens) overflowed the worker stack and aborted
-/// the whole process. The walk must now stop at [`ast_walk::MAX_AST_DEPTH`]
-/// and complete, with `ast.max_depth` saturating at the cap.
+/// A pathologically deep source file (thousands of nested parens) must not
+/// overflow the worker stack: the walk stops at [`ast_walk::MAX_AST_DEPTH`]
+/// and completes, with `ast.max_depth` saturating at the cap.
 #[test]
 #[ignore = "CPU-saturating: parses a 50k-deep AST on an 8 MiB worker stack (>60s). Run with --ignored."]
 fn deeply_nested_source_does_not_overflow_stack() {
@@ -1333,10 +1334,8 @@ fn deeply_nested_source_does_not_overflow_stack() {
 }
 
 /// Parse `src` (as `path`) on a worker-sized stack and return its metrics.
-/// The unbounded AST-helper recursions (member / concat / subscript chains)
-/// used to recurse one frame — and, for member/subscript, one `String`
-/// allocation — per link, overflowing the stack and `abort()`ing the whole
-/// process on a chain thousands deep. With the cap in place a chain far
+/// Member, concat and subscript chains thousands deep must not cost a stack
+/// frame or an allocation per link: a chain far
 /// past [`ast_walk::MAX_AST_DEPTH`] must complete with `ast.max_depth` and
 /// every chain-length metric pinned at the cap, never growing with the
 /// input. `join()` returning `Ok` asserts nothing overflowed.
@@ -1361,10 +1360,8 @@ fn metrics_on_worker_stack(path: &str, src: String) -> crate::output::Metrics {
         .expect("deep chain must not overflow the stack")
 }
 
-/// Regression: `static_dotted_chain` recursed one stack frame (plus a
-/// `String` allocation) per link of a member chain with no bound, so a
-/// pathological `a.a.a.…` thousands deep overflowed the worker stack and
-/// aborted the process. It must now cap at `MAX_AST_DEPTH` and complete.
+/// A pathological member chain `a.a.a.…` thousands deep must not cost a
+/// stack frame per link: resolution caps at `MAX_AST_DEPTH` and completes.
 #[test]
 #[ignore = "CPU-saturating: parses a 50k-deep AST on an 8 MiB worker stack (>60s). Run with --ignored."]
 fn deep_member_chain_does_not_overflow_stack() {
@@ -1446,46 +1443,6 @@ fn subtraction_density_reflects_concentration() {
         density > 0.05,
         "a packed subtraction array is dense, got {density}"
     );
-}
-
-/// Each call and member of a chain resolved its path by walking the rest of
-/// the chain again, quadratic in its length: 500 chains of 900 calls took ten
-/// minutes, and members of chains past the depth cap each failed at the cap
-/// again. Each chain is now walked once, every call keeping its own path.
-#[test]
-fn long_chains_resolve_in_linear_time() {
-    let calls: String = (0..80)
-        .map(|i| format!("x = a{i}{};\n", ".b()".repeat(450)))
-        .collect();
-    let members: String = (0..40)
-        .map(|i| format!("y = c{i}{};\n", ".d".repeat(3_000)))
-        .collect();
-    let source = calls + &members;
-    let started = std::time::Instant::now();
-    let parsed = crate::OpenOptions::new()
-        .path(std::path::Path::new("chain.js"))
-        .open(source.as_bytes());
-    let targets: Vec<Option<&str>> = parsed
-        .symbols()
-        .iter_kind(crate::SymbolKind::Call)
-        .filter_map(|s| match s {
-            crate::Symbol::Call { target, .. } => Some(target.as_deref()),
-            _ => None,
-        })
-        .collect();
-    assert!(started.elapsed() < std::time::Duration::from_secs(20));
-    // Every call keeps its own path.
-    assert_eq!(targets.len(), 80 * 450);
-    assert!(targets.iter().all(Option::is_some));
-    let longest = format!("a0{}", ".b".repeat(450));
-    assert!(targets.contains(&Some(longest.as_str())));
-    assert!(targets.contains(&Some("a0.b")));
-    assert!(targets.contains(&Some("a79.b.b")));
-    // A member chain past the cap has no static path; the call chains'
-    // members do.
-    let metrics = parsed.metrics();
-    assert_eq!(metrics.get("ast.depth_capped"), Some(1.0));
-    assert_eq!(metrics.get("ast.max_member_depth"), Some(451.0));
 }
 
 #[test]

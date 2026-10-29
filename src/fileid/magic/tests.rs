@@ -1,3 +1,26 @@
+use super::archive::ZipNames;
+use super::markup::{attribute_value, decode_char_refs};
+use super::*;
+use crate::fileid::testutil::{gzip, tar, zstd};
+
+fn gzip_tar(members: &[(&str, &[u8])]) -> Vec<u8> {
+    gzip(&tar(members))
+}
+
+fn zstd_tar(members: &[(&str, &[u8])]) -> Vec<u8> {
+    zstd(&tar(members))
+}
+
+/// The signature stage alone, as [`super::detect_from_sniff`] runs it.
+fn detect_from_content(path: &Path, data: &[u8]) -> Option<Found> {
+    detect_from_sniff(&Sniff::new(path, data))
+}
+
+/// [`classify_pk`] of `data` under the name `path`.
+fn classify_named(path: &Path, data: &[u8]) -> FileType {
+    classify_pk(&Sniff::new(path, data))
+}
+
 fn is_svg(data: &[u8]) -> bool {
     detect_xml(data).map(|(ft, _)| ft) == Some(FileType::Svg)
 }
@@ -57,7 +80,6 @@ fn svg_root_ignores_a_document_with_no_svg_at_all() {
     assert!(!is_svg(b"<?xml version=\"1.0\"?>\n<rss version=\"2.0\">"));
     assert!(!is_svg(b"plain text"));
 }
-use super::*;
 
 #[test]
 fn elf_magic() {
@@ -358,7 +380,7 @@ fn gzip_plain() {
 }
 
 #[test]
-fn gzip_tar() {
+fn gzip_tar_by_name() {
     let data = [0x1f, 0x8b, 0x08, 0x00];
     let (ft, _) = detect_from_content(Path::new("data.tar.gz"), &data).unwrap();
     assert_eq!(ft, FileType::TarGz);
@@ -453,7 +475,7 @@ fn msix_by_manifest_without_extension() {
         ("AppxSignature.p7x", b""),
     ]);
     assert_eq!(
-        classify_pk(Path::new("FkSA3WUIlyfC"), &zip).0,
+        classify_named(Path::new("FkSA3WUIlyfC"), &zip),
         FileType::Zip
     );
     let bundle = zip_of(&[
@@ -461,7 +483,7 @@ fn msix_by_manifest_without_extension() {
         ("[Content_Types].xml", b"<Types/>"),
     ]);
     assert_eq!(
-        classify_pk(Path::new("bundle.bin"), &bundle).0,
+        classify_named(Path::new("bundle.bin"), &bundle),
         FileType::Zip
     );
 }
@@ -475,7 +497,7 @@ fn msix_bundle_manifest_past_the_entry_cap_is_still_a_zip() {
     entries.push(("[Content_Types].xml".into(), b"<Types/>"));
     let refs: Vec<(&str, &[u8])> = entries.iter().map(|(n, b)| (n.as_str(), *b)).collect();
     let zip = zip_of(&refs);
-    assert_eq!(classify_pk(Path::new("bundle"), &zip).0, FileType::Zip);
+    assert_eq!(classify_named(Path::new("bundle"), &zip), FileType::Zip);
 }
 
 /// The APPX marker must not pull a real Office document out of Ooxml.
@@ -485,7 +507,7 @@ fn office_document_without_appx_manifest_stays_ooxml() {
         ("[Content_Types].xml", b"<Types/>"),
         ("word/document.xml", b"<w:document/>"),
     ]);
-    assert_eq!(classify_pk(Path::new("report"), &docx).0, FileType::Ooxml);
+    assert_eq!(classify_named(Path::new("report"), &docx), FileType::Ooxml);
 }
 
 #[test]
@@ -498,7 +520,7 @@ fn msix_manifest_past_the_entry_cap_is_still_a_zip() {
     let refs: Vec<(&str, &[u8])> = entries.iter().map(|(n, b)| (n.as_str(), *b)).collect();
     let zip = zip_of(&refs);
     assert_eq!(
-        classify_pk(Path::new("FkSA3WUIlyfC"), &zip).0,
+        classify_named(Path::new("FkSA3WUIlyfC"), &zip),
         FileType::Zip
     );
 }
@@ -591,55 +613,45 @@ fn freebsd_pkg_zstd_archive() {
     assert_eq!(ft, FileType::PkgFreebsd);
 }
 
-/// Build a gzip-compressed tar from `(path, body)` members.
-fn build_gzip_tar(members: &[(&str, &[u8])]) -> Vec<u8> {
-    use std::io::Write;
-    let mut tar = Vec::new();
-    {
-        let mut b = tar::Builder::new(&mut tar);
-        for (path, body) in members {
-            let mut h = tar::Header::new_ustar();
-            h.set_path(path).unwrap();
-            h.set_size(body.len() as u64);
-            h.set_cksum();
-            b.append(&h, &body[..]).unwrap();
-        }
-        b.finish().unwrap();
-    }
-    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    e.write_all(&tar).unwrap();
-    e.finish().unwrap()
-}
-
-/// Build an uncompressed tar from `(path, body)` members.
-fn build_plain_tar(members: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut tar = Vec::new();
-    {
-        let mut b = tar::Builder::new(&mut tar);
-        for (path, body) in members {
-            let mut h = tar::Header::new_ustar();
-            h.set_path(path).unwrap();
-            h.set_size(body.len() as u64);
-            h.set_cksum();
-            b.append(&h, &body[..]).unwrap();
-        }
-        b.finish().unwrap();
-    }
-    tar
-}
-
 #[test]
 fn python_sdist_detected_by_pkg_info() {
-    let gz = build_gzip_tar(&[
+    let gz = gzip_tar(&[
         ("requests-2.31.0/setup.py", b"setup()"),
         ("requests-2.31.0/requests/__init__.py", b"# pkg"),
-        ("requests-2.31.0/PKG-INFO", b"Name: requests\n"),
+        (
+            "requests-2.31.0/PKG-INFO",
+            b"Metadata-Version: 2.1\nName: requests\nVersion: 2.31.0\n",
+        ),
     ]);
     let (ft, _) = detect_from_content(Path::new("requests-2.31.0.tar.gz"), &gz).unwrap();
     assert_eq!(ft, FileType::PythonSdist);
 
+    // The metadata has to name the root it sits under; the file name alone
+    // is no identity. The root spells a normalized name.
+    for (root, metadata) in [
+        ("requests-2.31.0", &b"Name: requests\n"[..]),
+        (
+            "requests-2.31.0",
+            b"Metadata-Version: 2.1\nName: other\nVersion: 2.31.0\n",
+        ),
+        (
+            "requests-2.31.0",
+            b"Metadata-Version: 2.1\nName: requests\nVersion: 2.31.1\n",
+        ),
+    ] {
+        let gz = gzip_tar(&[(&format!("{root}/PKG-INFO"), metadata)]);
+        let (ft, _) = detect_from_content(Path::new("blob"), &gz).unwrap();
+        assert_eq!(ft, FileType::TarGz, "{metadata:?}");
+    }
+    let gz = gzip_tar(&[(
+        "zope_interface-6.0/PKG-INFO",
+        b"Metadata-Version: 2.1\nName: zope.interface\nVersion: 6.0\n",
+    )]);
+    let (ft, _) = detect_from_content(Path::new("blob"), &gz).unwrap();
+    assert_eq!(ft, FileType::PythonSdist);
+
     // A single-rooted gzip tar without PKG-INFO stays a generic tar.gz.
-    let plain = build_gzip_tar(&[("proj-1.0/README", b"hi"), ("proj-1.0/main.c", b"int")]);
+    let plain = gzip_tar(&[("proj-1.0/README", b"hi"), ("proj-1.0/main.c", b"int")]);
     let (ft, _) = detect_from_content(Path::new("proj-1.0.tar.gz"), &plain).unwrap();
     assert_eq!(ft, FileType::TarGz);
 }
@@ -647,9 +659,12 @@ fn python_sdist_detected_by_pkg_info() {
 #[test]
 fn python_sdist_pkg_info_may_follow_large_source_tree() {
     let padding = vec![0u8; (8 << 20) + 1];
-    let gz = build_gzip_tar(&[
+    let gz = gzip_tar(&[
         ("generated-1.0/src/generated/client.py", &padding),
-        ("generated-1.0/PKG-INFO", b"Name: generated\n"),
+        (
+            "generated-1.0/PKG-INFO",
+            b"Metadata-Version: 2.1\nName: generated\nVersion: 1.0\n",
+        ),
     ]);
     let (ft, _) = detect_from_content(Path::new("content-addressed.sample"), &gz).unwrap();
     assert_eq!(ft, FileType::PythonSdist);
@@ -659,7 +674,7 @@ fn python_sdist_pkg_info_may_follow_large_source_tree() {
 fn arch_pkg_non_zstd_by_extension() {
     // The `.pkg.tar.{xz,gz}` extension is Arch-specific; content can't always
     // be read (no xz decompressor), so the extension is authoritative.
-    let gz = build_gzip_tar(&[
+    let gz = gzip_tar(&[
         (".PKGINFO", b"pkgname = foo\n"),
         ("usr/bin/foo", b"\x7fELF"),
     ]);
@@ -674,7 +689,7 @@ fn arch_pkg_non_zstd_by_extension() {
 #[test]
 fn oci_layout_and_docker_save_detected() {
     // OCI image layout: oci-layout + index.json.
-    let oci = build_plain_tar(&[
+    let oci = tar(&[
         ("oci-layout", br#"{"imageLayoutVersion":"1.0.0"}"#),
         ("index.json", br#"{"manifests":[]}"#),
         ("blobs/sha256/abc", b"blob"),
@@ -683,7 +698,7 @@ fn oci_layout_and_docker_save_detected() {
     assert_eq!(ft, FileType::OciImage);
 
     // docker save bundle: manifest.json + a layer tar.
-    let docker = build_plain_tar(&[
+    let docker = tar(&[
         ("deadbeef/layer.tar", b"layer"),
         ("config.json", b"{}"),
         ("manifest.json", br#"[{"RepoTags":["x:1"]}]"#),
@@ -691,13 +706,10 @@ fn oci_layout_and_docker_save_detected() {
     let (ft, _) = detect_from_content(Path::new("saved.tar"), &docker).unwrap();
     assert_eq!(ft, FileType::OciImage);
 
-    // A plain tar with neither marker pair is a generic tar. This used to
-    // assert `is_none()` -- the ustar branch bailed and Stage 4 recovered
-    // the type from the `.tar` extension. The resulting FileType was the
-    // same; only the DetectionSource differed. Asserting the type keeps
-    // the guarantee that actually matters (an OCI bundle is not a plain
-    // tar) without pinning the stage that supplies it.
-    let plain = build_plain_tar(&[("README", b"hi"), ("src/main.rs", b"fn main(){}")]);
+    // A plain tar with neither marker pair is a generic tar. The type is
+    // the guarantee that matters (an OCI bundle is not a plain tar), not
+    // the stage that supplies it.
+    let plain = tar(&[("README", b"hi"), ("src/main.rs", b"fn main(){}")]);
     let (ft, _) = detect_from_content(Path::new("plain.tar"), &plain).unwrap();
     assert_eq!(ft, FileType::Tar);
 }
@@ -705,11 +717,9 @@ fn oci_layout_and_docker_save_detected() {
 #[test]
 fn ustar_tar_detected_regardless_of_extension() {
     // The ustar signature at offset 257 identifies a tar on its own, so a
-    // tar is walked whatever it is named. Previously only `.tar` was
-    // recognized and the same bytes under any other extension were typed
-    // Data and never descended into -- an XMRig release tarball named
-    // `<sha256>.bin` produced one finding instead of six.
-    let plain = build_plain_tar(&[("README", b"hi"), ("src/main.rs", b"fn main(){}")]);
+    // tar is walked whatever it is named: a release tarball renamed
+    // `<sha256>.bin` still has its members read.
+    let plain = tar(&[("README", b"hi"), ("src/main.rs", b"fn main(){}")]);
     for name in ["payload.bin", "image.png", "noextension"] {
         let (ft, src) = detect_from_content(Path::new(name), &plain)
             .unwrap_or_else(|| panic!("{name} was not detected as a tar"));
@@ -782,7 +792,7 @@ fn npm_tgz_detected_by_package_prefix() {
     assert_eq!(ft, FileType::Npm);
 
     // A `.tgz` without the `package/` layout stays a generic gzip tar.
-    let plain = build_gzip_tar(&[("README", b"hi"), ("src/main.c", b"int")]);
+    let plain = gzip_tar(&[("README", b"hi"), ("src/main.c", b"int")]);
     let (ft, _) = detect_from_content(Path::new("blob.tgz"), &plain).unwrap();
     assert_eq!(ft, FileType::TarGz);
 
@@ -925,7 +935,7 @@ fn a_data_descriptor_chain_is_still_walkable() {
         Some(true)
     );
     assert_eq!(
-        classify_pk(Path::new("nameless"), &zip).0,
+        classify_named(Path::new("nameless"), &zip),
         FileType::ApkAndroid
     );
 }
@@ -937,7 +947,7 @@ fn an_extensionless_android_package_is_still_an_apk() {
         ("classes.dex", b"dex"),
     ]);
     assert_eq!(
-        classify_pk(Path::new("VirusShare_52b318f"), &apk).0,
+        classify_named(Path::new("VirusShare_52b318f"), &apk),
         FileType::ApkAndroid
     );
 }
@@ -956,12 +966,12 @@ fn a_stored_office_member_does_not_make_the_outer_zip_a_package() {
         Some(false)
     );
     assert_eq!(
-        classify_pk(Path::new("carrier.docx"), &outer).0,
+        classify_named(Path::new("carrier.docx"), &outer),
         FileType::Zip
     );
     // The inner document is still recognized on its own.
     assert_eq!(
-        classify_pk(Path::new("inner.xlsx"), &inner).0,
+        classify_named(Path::new("inner.xlsx"), &inner),
         FileType::Ooxml
     );
 }
@@ -986,7 +996,7 @@ fn a_large_archive_exceeding_max_entries_is_not_an_ooxml_package() {
         Some(false)
     );
     assert_eq!(
-        classify_pk(Path::new("release-6.4.124"), &zip).0,
+        classify_named(Path::new("release-6.4.124"), &zip),
         FileType::Zip
     );
 }
@@ -1001,7 +1011,10 @@ fn a_malformed_header_falls_back_rather_than_denying() {
     zip[18..22].copy_from_slice(&538_968_429u32.to_le_bytes());
     zip[26..28].copy_from_slice(&4096u16.to_le_bytes());
     assert_eq!(zip_has_top_level_entry(&zip, b"[Content_Types].xml"), None);
-    assert_eq!(classify_pk(Path::new("lure.docx"), &zip).0, FileType::Ooxml);
+    assert_eq!(
+        classify_named(Path::new("lure.docx"), &zip),
+        FileType::Ooxml
+    );
 }
 
 #[test]
@@ -1052,7 +1065,7 @@ fn an_office_extension_without_the_opc_marker_is_a_zip() {
     zip.extend_from_slice(b"\x14\x00\x00\x00\x08\x00");
     zip.extend_from_slice(b"documents.doc");
     zip.extend(std::iter::repeat_n(0u8, 64));
-    let (ft, _) = classify_pk(Path::new("invoice.xlsm"), &zip);
+    let ft = classify_named(Path::new("invoice.xlsm"), &zip);
     assert_eq!(ft, FileType::Zip);
 }
 
@@ -1063,7 +1076,7 @@ fn an_office_extension_with_the_opc_marker_is_still_ooxml() {
     zip.extend_from_slice(b"[Content_Types].xml");
     zip.extend(std::iter::repeat_n(0u8, 64));
     for name in ["a.docx", "a.xlsm", "a.pptm", "a.dotx"] {
-        let (ft, _) = classify_pk(Path::new(name), &zip);
+        let ft = classify_named(Path::new(name), &zip);
         assert_eq!(ft, FileType::Ooxml, "{name}");
     }
 }
@@ -1187,30 +1200,32 @@ fn pickles_by_frame_or_torch_magic_whatever_the_name() {
     assert_eq!(content_type("x.bin", proto2), None);
 }
 
-fn build_zstd_tar(members: &[(&str, &[u8])]) -> Vec<u8> {
-    zstd::encode_all(&build_plain_tar(members)[..], 3).unwrap()
-}
-
 #[test]
 fn tar_packages_by_layout_whatever_the_name() {
-    let gem = build_plain_tar(&[
+    let gem = tar(&[
         ("metadata.gz", b"x"),
         ("data.tar.gz", b"x"),
         ("checksums.yaml.gz", b"x"),
     ]);
     assert_eq!(content_type("blob", &gem), Some(FileType::Gem));
-    let gpkg = build_plain_tar(&[("foo-1.0/gpkg-1", b""), ("foo-1.0/image.tar", b"")]);
+    let gpkg = tar(&[("foo-1.0/gpkg-1", b""), ("foo-1.0/image.tar", b"")]);
     assert_eq!(content_type("blob", &gpkg), Some(FileType::GentooBinpkg));
-    let krate = build_gzip_tar(&[
-        ("foo-1.0/Cargo.toml", b"[package]"),
+    let krate = gzip_tar(&[
+        (
+            "foo-1.0/Cargo.toml",
+            b"[package]\nname = \"foo\"\nversion = \"1.0\"\n",
+        ),
         ("foo-1.0/Cargo.toml.orig", b""),
     ]);
     assert_eq!(content_type("blob", &krate), Some(FileType::Crate));
-    let alpine = build_gzip_tar(&[(".SIGN.RSA.builder.rsa.pub", b"sig")]);
+    // The manifest is the identity; cargo's backup of it is not.
+    let unnamed = gzip_tar(&[("foo-1.0/Cargo.toml.orig", b"")]);
+    assert_eq!(content_type("blob", &unnamed), Some(FileType::TarGz));
+    let alpine = gzip_tar(&[(".SIGN.RSA.builder.rsa.pub", b"sig")]);
     assert_eq!(content_type("blob", &alpine), Some(FileType::ApkAlpine));
-    let xbps = build_zstd_tar(&[("./props.plist", b"<plist/>"), ("./files.plist", b"")]);
+    let xbps = zstd_tar(&[("./props.plist", b"<plist/>"), ("./files.plist", b"")]);
     assert_eq!(content_type("blob", &xbps), Some(FileType::Xbps));
-    let arch = build_zstd_tar(&[
+    let arch = zstd_tar(&[
         (".BUILDINFO", b""),
         (".MTREE", b""),
         (".PKGINFO", b""),
@@ -1218,7 +1233,7 @@ fn tar_packages_by_layout_whatever_the_name() {
     ]);
     assert_eq!(content_type("blob", &arch), Some(FileType::PkgArch));
     // A layout that needs a different codec is only the generic tar.
-    let zstd_npm = build_zstd_tar(&[("package/package.json", b"{}")]);
+    let zstd_npm = zstd_tar(&[("package/package.json", b"{}")]);
     assert_eq!(content_type("blob", &zstd_npm), Some(FileType::TarZst));
 }
 
@@ -1261,14 +1276,14 @@ fn zip_packages_by_member_whatever_the_name() {
         ),
     ] {
         assert_eq!(
-            classify_pk(Path::new("blob"), &zip_of(entries)).0,
+            classify_named(Path::new("blob"), &zip_of(entries)),
             want,
             "{want:?}"
         );
     }
     // A manifest merely mentioned in a stored member is not a VSIX.
     let mention = zip_of(&[("notes.txt", b"see extension.vsixmanifest")]);
-    assert_eq!(classify_pk(Path::new("blob"), &mention).0, FileType::Zip);
+    assert_eq!(classify_named(Path::new("blob"), &mention), FileType::Zip);
 }
 
 #[test]
@@ -1300,4 +1315,395 @@ fn asar_lzma_and_msi_by_structure() {
     assert_eq!(content_type("setup.bin", &ole), Some(FileType::Msi));
     ole[512 + 0x50..512 + 0x60].fill(0);
     assert_eq!(content_type("setup.msi", &ole), Some(FileType::OleDoc));
+}
+
+/// Whether `name` is an entry of this zip; `None` when the walk could not
+/// finish without finding it.
+fn zip_has_top_level_entry(data: &[u8], name: &[u8]) -> Option<bool> {
+    let mut names = ZipNames::new(data);
+    if names.any(|n| n == name) {
+        return Some(true);
+    }
+    names.complete.then_some(false)
+}
+
+/// [`script_host_document`] of `data` alone.
+fn windows_script_host(data: &[u8]) -> Option<FileType> {
+    script_host_document(&Sniff::new(Path::new(""), data))
+}
+
+// ── odf confirmation ──
+/// A ZIP whose local-header walk cannot complete, carrying the
+/// OpenDocument namespace URI somewhere in its body -- the shape of the
+/// 88MB .xapk that was typed OpenDocument.
+fn unwalkable_zip_mentioning_odf() -> Vec<u8> {
+    let mut d = b"PK\x03\x04".to_vec();
+    // A local header with a nonsense name length, so the walk loses the
+    // thread and reports `None` rather than a confident "no".
+    d.extend_from_slice(&[0xFF; 26]);
+    d.extend_from_slice(b"application/vnd.oasis.opendocument.text");
+    d.resize(4096, 0x41);
+    d
+}
+
+#[test]
+fn indeterminate_walk_is_not_opendocument() {
+    let d = unwalkable_zip_mentioning_odf();
+    assert_ne!(classify_named(Path::new("x.xapk"), &d), FileType::Odf);
+}
+
+#[test]
+fn odf_extension_still_wins() {
+    let d = unwalkable_zip_mentioning_odf();
+    assert_eq!(classify_named(Path::new("x.odt"), &d), FileType::Odf);
+}
+
+// ── jet db sfnt collision ──
+#[test]
+fn nrbf_stream_header_is_nrbf_without_a_filename_gate() {
+    let data = [
+        0, 1, 0, 0, 0, 255, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0, 0, 11,
+    ];
+    for path in ["reference.cache", "renamed.ttf", "sample"] {
+        assert_eq!(
+            detect_from_content(Path::new(path), &data).map(|(ft, _)| ft),
+            Some(FileType::Nrbf)
+        );
+    }
+    for end in 0..17 {
+        assert_ne!(
+            detect_from_content(Path::new("sample"), &data[..end]).map(|(ft, _)| ft),
+            Some(FileType::Nrbf)
+        );
+    }
+    let mut wrong_version = data;
+    wrong_version[9] = 2;
+    assert_ne!(
+        detect_from_content(Path::new("sample"), &wrong_version).map(|(ft, _)| ft),
+        Some(FileType::Nrbf)
+    );
+}
+
+/// A real TrueType font still identifies as a font.
+#[test]
+fn sfnt_version_one_is_still_a_font() {
+    let mut data = vec![0x00, 0x01, 0x00, 0x00];
+    data.extend_from_slice(&[0x00, 0x0a, 0x00, 0x80, 0x00, 0x03, 0x00, 0x20]);
+    data.extend_from_slice(b"cmap");
+    assert_eq!(
+        detect_from_content(Path::new("x.ttf"), &data).map(|(ft, _)| ft),
+        Some(FileType::Font)
+    );
+}
+
+/// An Access database opens with the same four bytes and must not be
+/// handed to the font parser.
+#[test]
+fn jet_db_header_is_not_a_font() {
+    let mut data = vec![0x00, 0x01, 0x00, 0x00];
+    data.extend_from_slice(b"Standard Jet DB\x00");
+    data.extend_from_slice(&[0u8; 32]);
+    assert_ne!(
+        detect_from_content(Path::new("db.mdb"), &data).map(|(ft, _)| ft),
+        Some(FileType::Font)
+    );
+}
+
+/// The newer ACE engine names itself the same way.
+#[test]
+fn ace_db_header_is_not_a_font() {
+    let mut data = vec![0x00, 0x01, 0x00, 0x00];
+    data.extend_from_slice(b"Standard ACE DB\x00");
+    data.extend_from_slice(&[0u8; 32]);
+    assert_ne!(
+        detect_from_content(Path::new("db.accdb"), &data).map(|(ft, _)| ft),
+        Some(FileType::Font)
+    );
+}
+
+// ── html doctype magic ──
+use crate::FileId;
+
+#[test]
+fn utf8_bom_html_is_detected_under_misleading_names() {
+    for body in [
+        "<!DOCTYPE html><html><body>page</body></html>",
+        "  <HTML><body><script>document.write('x')</script></body></HTML>",
+        "<script src='https://example.invalid/a.js'></script>\n<!doctype html><html>",
+    ] {
+        let mut data = UTF8_BOM.to_vec();
+        data.extend_from_slice(body.as_bytes());
+        let file = FileId::from_path_and_bytes(Path::new("sample.vir"), &data);
+        assert_eq!(file.file_type(), FileType::Html, "{body}");
+    }
+}
+
+/// A page under a name that claims another language is still a page.
+#[test]
+fn doctype_html_is_detected_by_content() {
+    let data = b"<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\">\n<HTML></HTML>";
+    assert_eq!(
+        detect_from_content(Path::new("Trojan.JS.DeltreeY.c"), data).map(|(ft, _)| ft),
+        Some(FileType::Html)
+    );
+}
+
+/// The doctype keyword is case-insensitive in HTML and in the wild.
+#[test]
+fn lowercase_doctype_html_is_detected() {
+    let data = b"<!doctype html>\n<html><body>x</body></html>";
+    assert_eq!(
+        detect_from_content(Path::new("x"), data).map(|(ft, _)| ft),
+        Some(FileType::Html)
+    );
+}
+
+/// The SVG arm compares the root name, so it keeps its own doctype.
+#[test]
+fn doctype_svg_is_not_html() {
+    let data = b"<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"x\">\n<svg xmlns=\"x\"/>";
+    assert_ne!(
+        detect_from_content(Path::new("x.svg"), data).map(|(ft, _)| ft),
+        Some(FileType::Html)
+    );
+}
+
+/// Real pages are not flush left: an indented doctype is still a page, not
+/// the JavaScript inside it.
+#[test]
+fn indented_doctype_is_still_html() {
+    let data = b"    <!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\">\n<html>";
+    assert_eq!(
+        detect_from_content(Path::new("VirusShare_4bcf5cc475"), data).map(|(ft, _)| ft),
+        Some(FileType::Html)
+    );
+}
+
+/// A file whose first bytes are `<html` is a page, doctype or not.
+#[test]
+fn bare_html_root_is_html() {
+    let data = b"<html data-adblockkey=\"MFwwDQYJ\"><head><title>Redirecting</title>";
+    assert_eq!(
+        detect_from_content(Path::new("VirusShare_f54b1d8fed"), data).map(|(ft, _)| ft),
+        Some(FileType::Html)
+    );
+}
+
+/// The root-element check stops at a word boundary, so an XML document
+/// whose root merely begins with those letters is untouched.
+#[test]
+fn htmlspecialchars_root_is_not_html() {
+    let data = b"<htmlspecialchars>not a page</htmlspecialchars>";
+    assert_ne!(
+        detect_from_content(Path::new("x.xml"), data).map(|(ft, _)| ft),
+        Some(FileType::Html)
+    );
+}
+
+/// A short injected loader before a complete document must not hide the
+/// page from content-based type detection under an extensionless name.
+#[test]
+fn doctype_html_after_leading_script_is_detected_by_content() {
+    let data = b"<script src='https://example.invalid/stat.js'></script>\n<!DOCTYPE html>\n<html><head><title>x</title></head><body>x</body></html>";
+    let extensionless = FileId::from_path_and_bytes(Path::new("VirusShare_0123456789"), data);
+    assert_eq!(extensionless.file_type(), FileType::Html);
+    assert_eq!(extensionless.source(), DetectionSource::Magic);
+    assert!(!extensionless.extension_mismatch());
+
+    let misleading_name = FileId::from_path_and_bytes(Path::new("page.js"), data);
+    assert_eq!(misleading_name.file_type(), FileType::Html);
+    assert_eq!(misleading_name.source(), DetectionSource::Magic);
+    assert!(misleading_name.extension_mismatch());
+}
+
+/// A script with an HTML doctype in its source string but no HTML root is
+/// still a script, rather than an HTML document.
+#[test]
+fn doctype_string_without_html_root_is_not_a_document() {
+    let data = b"const x = '<!DOCTYPE html>'; eval(x);";
+    assert_ne!(
+        detect_from_content(Path::new("x"), data).map(|(ft, _)| ft),
+        Some(FileType::Html)
+    );
+}
+
+// ── registry script magic ──
+/// The Windows 9x/NT4 header, under a name that claims another type.
+#[test]
+fn regedit4_header_is_a_registry_script() {
+    let data = b"REGEDIT4\r\n\r\n[HKEY_LOCAL_MACHINE\\Software\\Foo]\r\n\"Bar\"=\"baz\"\r\n";
+    assert_eq!(
+        detect_from_content(Path::new("Trojan.WinREG.AntiFireWall.a"), data).map(|(ft, _)| ft),
+        Some(FileType::Reg)
+    );
+}
+
+/// The Windows 2000+ header.
+#[test]
+fn modern_registry_header_is_a_registry_script() {
+    let data = b"Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\X]\r\n";
+    assert_eq!(
+        detect_from_content(Path::new("x"), data).map(|(ft, _)| ft),
+        Some(FileType::Reg)
+    );
+}
+
+/// Prose that merely begins with the same word is not a registry script.
+#[test]
+fn unrelated_w_text_is_not_a_registry_script() {
+    let data = b"Windows compatibility notes\n\nThis document describes...\n";
+    assert_ne!(
+        detect_from_content(Path::new("notes.txt"), data).map(|(ft, _)| ft),
+        Some(FileType::Reg)
+    );
+    let mut utf16 = vec![0xFF, 0xFE];
+    utf16.extend(
+        "Windows compatibility notes\r\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes),
+    );
+    assert_ne!(
+        detect_from_content(Path::new("notes.txt"), &utf16).map(|(ft, _)| ft),
+        Some(FileType::Reg)
+    );
+}
+
+/// What regedit writes: UTF-16LE behind a byte-order mark. A copy
+/// re-saved as UTF-8 may keep a mark of its own.
+#[test]
+fn bom_prefixed_registry_exports_are_registry_scripts() {
+    let header = "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\X]\r\n";
+    let mut utf16 = vec![0xFF, 0xFE];
+    utf16.extend(header.encode_utf16().flat_map(u16::to_le_bytes));
+    let mut utf8 = UTF8_BOM.to_vec();
+    utf8.extend_from_slice(header.as_bytes());
+    for data in [utf16, utf8] {
+        assert_eq!(
+            detect_from_content(Path::new("export.reg"), &data),
+            Some((FileType::Reg, DetectionSource::Magic))
+        );
+        assert_eq!(
+            crate::fileid::detect(Path::new("export.reg"), &data).map(|d| d.file_type),
+            Some(FileType::Reg)
+        );
+    }
+}
+
+/// Every header spelling under its own `.reg` name is consistent with
+/// the extension. Before `.reg` was in the extension table, each one
+/// reported a mismatch against an unknown extension.
+#[test]
+fn reg_extension_agrees_with_every_header_spelling() {
+    let body = "\r\n\r\n[HKEY_CURRENT_USER\\X]\r\n\"A\"=dword:00000001\r\n";
+    let modern = format!("Windows Registry Editor Version 5.00{body}");
+    let mut utf16 = vec![0xFF, 0xFE];
+    utf16.extend(modern.encode_utf16().flat_map(u16::to_le_bytes));
+    let mut utf8_bom = UTF8_BOM.to_vec();
+    utf8_bom.extend_from_slice(modern.as_bytes());
+    let regedit4 = format!("REGEDIT4{body}").into_bytes();
+    for data in [utf16, utf8_bom, modern.into_bytes(), regedit4] {
+        let det = crate::fileid::detect(Path::new("Export.REG"), &data).unwrap();
+        assert_eq!(det.file_type, FileType::Reg);
+        assert_eq!(det.source, DetectionSource::Magic);
+        assert!(!det.extension_mismatch());
+        let id = crate::FileId::from_path_and_bytes(Path::new("export.reg"), &data);
+        assert_eq!(id.file_type().label(), "reg");
+        assert!(!id.extension_mismatch());
+    }
+}
+
+/// The header defines the format, so a `.reg` name on anything else is
+/// a mismatch, and the body is typed by its content.
+#[test]
+fn reg_extension_without_a_header_is_a_mismatch() {
+    let prose = b"These notes describe how the settings were changed last week.\n";
+    let det = crate::fileid::detect(Path::new("notes.reg"), prose).unwrap();
+    assert_eq!(det.file_type, FileType::Text);
+    assert!(det.extension_mismatch());
+    assert_eq!(det.extension_type(), Some(FileType::Reg));
+    // An empty file has nothing to contradict its name.
+    let empty = crate::fileid::detect(Path::new("empty.reg"), b"").unwrap();
+    assert_eq!(empty.file_type, FileType::Reg);
+    assert!(!empty.extension_mismatch());
+}
+
+/// Package-registry metadata keeps `registry`; it shares nothing with a
+/// registry export but the word.
+#[test]
+fn package_registry_metadata_is_not_a_registry_export() {
+    let doc = br#"{"ecosystem":"npm","name":"left-pad","version":"1.3.0"}"#;
+    let det = crate::fileid::detect(Path::new("left-pad@1.3.0.registry.json"), doc).unwrap();
+    assert_eq!(det.file_type, FileType::Registry);
+    assert_eq!(det.file_type.label(), "registry");
+    assert_eq!(FileType::from_label("reg"), Some(FileType::Reg));
+    assert!(FileType::Registry.is_structured_data());
+    assert!(!FileType::Reg.is_structured_data());
+}
+
+// ── windows script host ──
+#[test]
+fn character_references_resolve() {
+    assert_eq!(decode_char_refs(b"&#86;&#66;&#x53;cript"), "VBScript");
+    // A malformed reference is left as it is.
+    assert_eq!(decode_char_refs(b"&#zz;x"), "&#zz;x");
+}
+
+#[test]
+fn attribute_values() {
+    assert_eq!(
+        attribute_value(b" language='JScript' src=x", b"language"),
+        Some(&b"JScript"[..])
+    );
+    assert_eq!(
+        attribute_value(b"\r\nlanguage = \"VBScript\"", b"language"),
+        Some(&b"VBScript"[..])
+    );
+    assert_eq!(
+        attribute_value(b" language=VBS/", b"language"),
+        Some(&b"VBS"[..])
+    );
+    // `xlanguage` is a different attribute.
+    assert_eq!(
+        attribute_value(b" xlanguage=\"VBScript\"", b"language"),
+        None
+    );
+}
+
+#[test]
+fn script_host_roots_only() {
+    let job = b"<component>\n<script language=\"VBScript\">x = 1</script>\n</component>\n";
+    assert_eq!(windows_script_host(job), Some(FileType::Vbs));
+    // No language, or one the host does not run: not claimed.
+    assert_eq!(
+        windows_script_host(b"<job><script>x = 1</script></job>"),
+        None
+    );
+    assert_eq!(
+        windows_script_host(b"<job><script language=\"PerlScript\">1;</script></job>"),
+        None
+    );
+    // Other XML is left to the XML arm.
+    assert_eq!(
+        windows_script_host(b"<?xml version=\"1.0\"?><rss><script language=\"VBScript\"/></rss>"),
+        None
+    );
+}
+
+#[test]
+fn dib_header_versions() {
+    let header = |size: u32, planes: u16, bits: u16| {
+        let mut h = size.to_le_bytes().to_vec();
+        h.resize(40, 0);
+        let at = if size == 12 { 8 } else { 12 };
+        h[at..at + 2].copy_from_slice(&planes.to_le_bytes());
+        h[at + 2..at + 4].copy_from_slice(&bits.to_le_bytes());
+        h
+    };
+    for size in [12, 16, 40, 52, 56, 64, 108, 124] {
+        assert!(looks_like_dib_header(&header(size, 1, 8)), "size {size}");
+    }
+    assert!(!looks_like_dib_header(&header(41, 1, 8)));
+    assert!(!looks_like_dib_header(&header(40, 0, 8)));
+    assert!(!looks_like_dib_header(&header(40, 1, 3)));
+    assert!(!looks_like_dib_header(&[40, 0, 0]));
 }

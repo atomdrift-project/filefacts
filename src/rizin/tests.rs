@@ -1,15 +1,23 @@
+use super::recovery::*;
 use super::*;
-use crate::output::Metrics;
+use crate::output::{Metrics, SectionFlag, Symbol, SymbolKind, Symbols};
+
+/// Serializes the tests that run rizin through the process-wide
+/// [`SUPERVISOR`] (an open with rizin on), so their heavy real-rizin runs do
+/// not compete for the machine. Every test that launches a shim or reaps
+/// groups uses a private [`Supervisor`] instead and needs no lock: its
+/// registry and shutdown latch are its own.
+pub(crate) fn rizin_test_lock() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    lock(&LOCK)
+}
 
 #[test]
-fn rizin_gate_caps_live_children_and_releases_on_unwind() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+fn gate_caps_live_runs_and_releases_on_unwind() {
+    use std::sync::atomic::AtomicUsize;
 
-    let gate = RizinGate {
-        limit: 2,
-        active: Mutex::new(0),
-        changed: Condvar::new(),
-    };
+    let gate = Gate::new();
+    gate.set_limit(NonZeroUsize::new(2));
     let live = AtomicUsize::new(0);
     let peak = AtomicUsize::new(0);
     std::thread::scope(|scope| {
@@ -27,34 +35,33 @@ fn rizin_gate_caps_live_children_and_releases_on_unwind() {
         }
     });
     assert_eq!(peak.load(Ordering::SeqCst), 2);
-    assert_eq!(*gate.active.lock().unwrap(), 0);
+    assert_eq!(lock(&gate.state).active, 0);
     let _ = std::panic::catch_unwind(|| {
         let _permit = gate.acquire();
         panic!("release a permit on unwind");
     });
-    assert_eq!(*gate.active.lock().unwrap(), 0);
+    assert_eq!(lock(&gate.state).active, 0);
 }
 
-/// Tests that spawn rizin (or a shim) or reap process groups must hold
-/// this mutex for the duration of their run: `RIZIN_PGIDS` is
-/// process-wide, and without the lock the reaper test SIGKILLs shims
-/// registered by other in-flight tests, producing intermittent "shim
-/// recovery missing" failures. Settings are per call, so no test can
-/// mute or re-time another.
-fn rizin_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    // `unwrap_or_else` so a poisoned mutex (from a panicking test
-    // holding the guard) doesn't poison every subsequent test —
-    // the registry state survives across test panics regardless.
-    let lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    // Shutdown is terminal in production. Each serialized shim test models
-    // a fresh scanner, including tests that deliberately close admission.
-    *registry(&RIZIN_SHUTDOWN) = false;
-    lock
+/// Lifting the limit releases runs already waiting at the old one.
+#[test]
+fn gate_limit_change_wakes_waiting_runs() {
+    let gate = Gate::new();
+    gate.set_limit(NonZeroUsize::new(1));
+    let held = gate.acquire();
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| drop(gate.acquire()));
+        // Whether or not the waiter has blocked yet, lifting the limit lets
+        // it through while `held` is still out.
+        gate.set_limit(None);
+        waiter.join().unwrap();
+    });
+    drop(held);
+    assert_eq!(lock(&gate.state).active, 0);
 }
 
 fn make_recovery(json: &str) -> RizinRecovery {
-    #[derive(Deserialize)]
+    #[derive(serde::Deserialize)]
     struct Wire {
         #[serde(default)]
         imports: Vec<RawImport>,
@@ -108,6 +115,20 @@ fn metrics_command_skips_unused_work_but_keeps_full_cfg_analysis() {
     }
 }
 
+/// Every script's output splits into exactly the blocks the parser reads.
+#[test]
+fn every_script_emits_one_block_per_parsed_table() {
+    for script in [
+        RIZIN_METRICS_SCRIPT,
+        RIZIN_METRICS_SCRIPT_PE_X86,
+        RIZIN_METRICS_SCRIPT_PRELUDE,
+        RIZIN_METRICS_SCRIPT_GO,
+    ] {
+        let blocks = script.matches("echo ===SEP===").count() + 1;
+        assert_eq!(blocks, 5, "{script}");
+    }
+}
+
 #[test]
 fn analysis_script_picks_the_fast_path_only_for_pe_x86() {
     fn pe(machine: u16) -> Vec<u8> {
@@ -119,41 +140,39 @@ fn analysis_script_picks_the_fast_path_only_for_pe_x86() {
         b[0x64..0x66].copy_from_slice(&machine.to_le_bytes());
         b
     }
-    assert_eq!(analysis_script(&pe(0x8664), 5, false).1, "pe-x86");
-    assert_eq!(analysis_script(&pe(0x014c), 5, false).1, "pe-x86");
+    let label = |bytes: &[u8], symbols, go| analysis_script(bytes, symbols, go).label;
+    assert_eq!(label(&pe(0x8664), 5, false), "pe-x86");
+    assert_eq!(label(&pe(0x014c), 5, false), "pe-x86");
     assert_eq!(
-        analysis_script(&pe(0x8664), 0, false).1,
+        label(&pe(0x8664), 0, false),
         "pe-x86",
         "PE x86 is exact even without symbols"
     );
     assert_eq!(
-        analysis_script(&pe(0xaa64), 5, false).1,
+        label(&pe(0xaa64), 5, false),
         "prelude",
         "arm64 PE takes the prelude script"
     );
+    assert_eq!(label(b"\x7fELF\x02\x01\x01", 5, false), "prelude");
     assert_eq!(
-        analysis_script(b"\x7fELF\x02\x01\x01", 5, false).1,
-        "prelude"
-    );
-    assert_eq!(
-        analysis_script(b"\x7fELF\x02\x01\x01", 0, false).1,
+        label(b"\x7fELF\x02\x01\x01", 0, false),
         "full",
         "no symbol inventory keeps aaa"
     );
     assert_eq!(
-        analysis_script(b"MZ", 5, false).1,
+        label(b"MZ", 5, false),
         "prelude",
         "truncated header is not PE x86"
     );
     let mut bad = pe(0x8664);
     bad[0x3c..0x40].copy_from_slice(&0xffff_fff0u32.to_le_bytes());
     assert_eq!(
-        analysis_script(&bad, 5, false).1,
+        label(&bad, 5, false),
         "prelude",
         "e_lfanew out of range is not PE x86"
     );
     assert_eq!(
-        analysis_script(&pe(0x8664), 5, true).1,
+        label(&pe(0x8664), 5, true),
         "go-pclntab",
         "Go metadata needs the pclntab pass, and takes it directly"
     );
@@ -196,19 +215,14 @@ fn parse_json_array_empty_array_is_ok() {
     assert!(v.is_empty());
 }
 
-// ------------------------------------------------------------------
-// RawFunction accepts both rizin (`offset`) and old r2 (`addr`) keys
-// ------------------------------------------------------------------
-
 #[test]
-fn raw_function_accepts_offset_or_addr() {
+fn raw_function_reads_offset_and_size() {
     let v: Vec<RawFunction> =
         parse_json_array(r#"[{"name":"a","offset":4096,"size":32}]"#).unwrap();
     assert_eq!(v[0].offset, 4096);
     assert_eq!(v[0].size, 32);
-    let v: Vec<RawFunction> = parse_json_array(r#"[{"name":"b","addr":8192}]"#).unwrap();
-    assert_eq!(v[0].offset, 8192);
-    assert_eq!(v[0].size, 0);
+    let v: Vec<RawFunction> = parse_json_array(r#"[{"name":"b"}]"#).unwrap();
+    assert_eq!((v[0].offset, v[0].size), (0, 0));
 }
 
 #[test]
@@ -234,10 +248,8 @@ fn exposes_function_ranges_and_direct_call_edges() {
 }
 
 // ------------------------------------------------------------------
-// apply gate logic — "only fill what goblin left empty"
+// apply gate logic — "only fill what the format parser left empty"
 // ------------------------------------------------------------------
-
-use crate::output::{Symbol, SymbolKind, Symbols};
 
 fn first_function(symbols: &Symbols) -> Option<&Symbol> {
     symbols.iter_kind(SymbolKind::Function).next()
@@ -249,10 +261,9 @@ fn count_kind(symbols: &Symbols, kind: SymbolKind) -> usize {
 
 #[test]
 fn apply_populates_cfg_fields_from_aflj() {
-    // Full aflj payload — every CFG field exercised, including the
-    // is-lineal kebab key, the callrefs list (some named, some
-    // anonymous → only named ones land on `callees`), and the
-    // signed stackframe normalisation.
+    // A full aflj payload: named callrefs land on `callees` and as calls,
+    // the CODE ref does not, and fields filefacts does not import are
+    // ignored.
     let recovery = make_recovery(
         r#"{
                 "imports": [],
@@ -377,12 +388,12 @@ fn apply_populates_when_all_views_empty() {
 }
 
 #[test]
-fn apply_skips_imports_when_goblin_already_populated() {
+fn apply_skips_imports_when_the_parser_already_populated_them() {
     let recovery =
         make_recovery(r#"{"imports":[{"name":"rizin_only"}],"exports":[],"functions":[]}"#);
     let mut symbols = Symbols::new();
     symbols.push(Symbol::Import {
-        name: "from_goblin".into(),
+        name: "from_parser".into(),
         alias: None,
         library: None,
         offset: None,
@@ -390,7 +401,7 @@ fn apply_skips_imports_when_goblin_already_populated() {
     });
     let mut metrics = Metrics::new();
     recovery.apply(&mut symbols, &mut metrics);
-    // Rizin import dropped — goblin's entry survives untouched.
+    // Rizin import dropped — the parser's entry survives untouched.
     let names: Vec<String> = symbols
         .iter_kind(SymbolKind::Import)
         .filter_map(|s| match s {
@@ -398,13 +409,13 @@ fn apply_skips_imports_when_goblin_already_populated() {
             _ => None,
         })
         .collect();
-    assert_eq!(names, vec!["from_goblin"]);
+    assert_eq!(names, vec!["from_parser"]);
 }
 
 #[test]
 fn recovered_import_anchors_at_plt_address() {
     // rizin's iij carries the PLT/stub address; recovery records it as the
-    // import's offset (it only runs when goblin found zero imports). An
+    // import's offset (it only runs when the parser found zero imports). An
     // import without a plt stays unanchored rather than anchoring at 0.
     let recovery = make_recovery(
         r#"{"imports":[{"name":"dlopen","plt":4096},{"name":"getpid"}],"exports":[],"functions":[]}"#,
@@ -444,7 +455,7 @@ fn apply_skips_function_metrics_when_functions_already_populated() {
     recovery.apply(&mut symbols, &mut metrics);
     // The function-block was skipped → no aggregate metrics emitted.
     assert!(metrics.get("binary.avg_complexity").is_none());
-    // The preexisting goblin function survives.
+    // The preexisting function survives.
     assert_eq!(count_kind(&symbols, SymbolKind::Function), 1);
 }
 
@@ -481,6 +492,40 @@ fn without_exports_drops_only_the_export_view() {
     assert_eq!(count_kind(&symbols, SymbolKind::Export), 0);
     assert_eq!(count_kind(&symbols, SymbolKind::Import), 1);
     assert_eq!(count_kind(&symbols, SymbolKind::Function), 1);
+}
+
+#[test]
+fn apply_with_sections_fills_only_an_empty_table() {
+    let recovery = || {
+        make_recovery(
+            r#"{"sections":[
+                {"name":".text","size":16,"vaddr":4096,"paddr":512,"perm":"-r-x"},
+                {"name":"","size":1}
+            ]}"#,
+        )
+    };
+    let mut symbols = Symbols::new();
+    let mut metrics = Metrics::new();
+    let mut sections = Vec::new();
+    let counts = recovery().apply_with_sections(&mut symbols, &mut sections, &mut metrics);
+    assert_eq!(counts.sections, 1);
+    assert_eq!(sections.len(), 1);
+    assert_eq!(sections[0].name, ".text");
+    assert_eq!(
+        (
+            sections[0].vaddr,
+            sections[0].vsize,
+            sections[0].file_offset
+        ),
+        (4096, 16, 512)
+    );
+    assert_eq!(
+        sections[0].flags,
+        [SectionFlag::Readable, SectionFlag::Executable]
+    );
+    let counts = recovery().apply_with_sections(&mut symbols, &mut sections, &mut metrics);
+    assert_eq!(counts.sections, 0);
+    assert_eq!(sections.len(), 1);
 }
 
 #[test]
@@ -611,43 +656,46 @@ fn settings_admit_only_enabled_inputs_within_the_cap() {
 // ------------------------------------------------------------------
 
 /// `aalg` names only the functions it creates; one `aa`/`aac` already made
-/// stays `fcn.*`. The Go script ran `aa; aac; aalg` and left most of every
-/// Go binary unnamed. Host-independent guard on the order.
+/// stays `fcn.*`, so the Go script must run `aalg` first. Host-independent
+/// guard on the order.
 #[test]
 fn go_script_runs_aalg_before_discovery() {
-    let (script, label) = analysis_script(b"", 1, true);
-    assert_eq!(label, "go-pclntab");
-    let aalg = script.find("aalg").expect("Go script runs aalg");
-    let aa = script.find("aa;").expect("Go script runs aa");
-    assert!(aalg < aa, "aalg must precede aa: {script}");
-    assert!(!script.contains("aa; aac; aalg"), "{script}");
+    let script = analysis_script(b"", 1, true);
+    assert_eq!(script.label, "go-pclntab");
+    let aalg = script.commands.find("aalg").expect("Go script runs aalg");
+    let aa = script.commands.find("aa;").expect("Go script runs aa");
+    assert!(aalg < aa, "aalg must precede aa: {}", script.commands);
+    assert!(
+        !script.commands.contains("aa; aac; aalg"),
+        "{}",
+        script.commands
+    );
 }
 
 /// End to end on a stripped Go binary whose functions carry long
 /// module-qualified and generic names (see
-/// tests/fixtures/go-pclntab-names.md). In the old order none of its five
-/// `sealedpayload` functions came back named and 1,514 of 2,082 were
-/// `fcn.*`. Skips when rizin is not installed.
+/// tests/fixtures/go-pclntab-names.md). With discovery before `aalg`, none
+/// of its five `sealedpayload` functions came back named and 1,514 of 2,082
+/// were `fcn.*`. Skips when rizin is not installed.
 #[test]
 fn go_recovery_names_pclntab_functions() {
-    if !available() {
+    let Some(bin) = rizin_binary() else {
         return;
-    }
+    };
     let compressed = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/go-pclntab-names.zst"
     ))
     .expect("fixture present");
     let bytes = zstd::decode_all(compressed.as_slice()).expect("fixture decompresses");
-    // This spawns a real rizin, so it needs the same protection as the
-    // shim tests: the reaper test SIGKILLs every registered process group,
-    // which turns an in-flight recovery into `None`. `recover_with_bin`
-    // rather than `recover_with_symbols` so the in-run memo cannot answer
-    // in place of a real run.
-    let _lock = rizin_test_lock();
-    let bin = rizin_binary().expect("available() found rizin");
-    let rec =
-        recover_with_bin(bin, &bytes, 0, true, RIZIN_TIMEOUT).expect("rizin recovers the fixture");
+    // A private supervisor, so neither the process-wide memo nor another
+    // test's runs can answer in place of a real run.
+    let supervisor = Supervisor::new();
+    let script = analysis_script(&bytes, 0, true);
+    let rec = supervisor
+        .attempt(bin, &bytes, script, RIZIN_TIMEOUT)
+        .recovery
+        .expect("rizin recovers the fixture");
 
     let total = rec.functions.len();
     let unnamed = rec
@@ -690,7 +738,6 @@ fn concurrent_opens_keep_their_own_rizin_settings() {
     ))
     .expect("fixture present");
     let bytes = zstd::decode_all(compressed.as_slice()).expect("fixture decompresses");
-    // The reaper test would turn the rizin-on recovery into `None`.
     let _lock = rizin_test_lock();
     let on = crate::OpenOptions::new().cache(false);
     let off = crate::OpenOptions::new().cache(false).rizin(false);
@@ -729,10 +776,8 @@ fn go_pe_without_export_directory_recovers_no_exports() {
     ))
     .expect("fixture present");
     let bytes = zstd::decode_all(compressed.as_slice()).expect("fixture decompresses");
-    // Held for the whole parse: the reaper test would turn this recovery
-    // into `None`, and an empty recovery passes vacuously.
     let _lock = rizin_test_lock();
-    let parsed = crate::open(&bytes);
+    let parsed = crate::OpenOptions::new().cache(false).open(&bytes);
 
     let symbols = parsed.symbols();
     assert!(
@@ -750,28 +795,20 @@ fn go_pe_without_export_directory_recovers_no_exports() {
 
 #[test]
 #[cfg(unix)]
-fn kill_all_rizin_groups_drains_pgid_registry_idempotently() {
-    // Hold the rizin test lock — `kill_all_rizin_groups` SIGKILLs
-    // every entry in the registry, which would otherwise reap
-    // live shim subprocesses from sibling tests running in
-    // parallel under the default cargo-test thread pool.
-    let _lock = rizin_test_lock();
-    // No PGIDs registered: should be a clean no-op. Verifies the
-    // public reaper survives being called from a CLI signal
-    // handler after a clean shutdown.
-    let before = RIZIN_PGIDS.lock().map(|g| g.len()).unwrap_or(0);
-    kill_all_rizin_groups();
-    let after = RIZIN_PGIDS.lock().map(|g| g.len()).unwrap_or(0);
-    assert_eq!(before, after);
+fn kill_all_on_an_idle_supervisor_is_a_no_op() {
+    // No groups registered: a clean no-op, as when a CLI signal handler runs
+    // after a clean shutdown.
+    let supervisor = Supervisor::new();
+    supervisor.kill_all();
+    supervisor.kill_all();
+    assert!(lock(&supervisor.pgids).is_empty());
+    assert!(*lock(&supervisor.shutdown));
 }
 
 #[test]
 fn log_stats_is_no_op_when_total_zero() {
-    // Just confirm the call doesn't panic when nothing has been
-    // recorded yet. Real telemetry assertions would need a
-    // tracing subscriber; that's out of scope here.
-    // (We don't assert the counter — parallel tests may have
-    // bumped it.)
+    // Just confirm the call doesn't panic, whatever other tests have
+    // recorded in the process-wide counters.
     log_stats();
 }
 
@@ -792,8 +829,8 @@ fn stats_are_monotonic_named_counters() {
 
 #[test]
 fn temp_input_is_private_registered_and_removed_on_drop() {
-    let _lock = rizin_test_lock();
-    let input = TempInput::write(b"sample bytes").expect("temp dir is writable");
+    let supervisor = Supervisor::new();
+    let input = TempInput::write(&supervisor, b"sample bytes").expect("temp dir is writable");
     let path = input.path().to_path_buf();
     let name = path.file_name().unwrap().to_string_lossy().into_owned();
     assert!(name.starts_with(TEMP_INPUT_PREFIX), "{name}");
@@ -808,18 +845,17 @@ fn temp_input_is_private_registered_and_removed_on_drop() {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "other users must not read the sample");
     }
-    assert!(registry(&RIZIN_TEMP_INPUTS).contains(&path));
+    assert!(lock(&supervisor.temp_inputs).contains(&path));
     drop(input);
     assert!(!path.exists(), "temp input deleted on drop");
-    assert!(!registry(&RIZIN_TEMP_INPUTS).contains(&path));
+    assert!(!lock(&supervisor.temp_inputs).contains(&path));
 }
 
 #[test]
 #[cfg(unix)]
 fn temp_input_refuses_a_planted_path() {
-    let _lock = rizin_test_lock();
-    // The old name was `filefacts-rizin-{pid}-{seq}.bin`: plant a symlink at
-    // every name it could have chosen next and check none is written through.
+    // A name derived from the pid and a sequence number could be predicted:
+    // plant a symlink at every such name and check none is written through.
     let target = unique_shim_dir("filefacts-rizin-planted-target");
     let victim = target.with_extension("victim");
     std::fs::write(&victim, b"untouched").unwrap();
@@ -831,7 +867,8 @@ fn temp_input_refuses_a_planted_path() {
             planted.push(p);
         }
     }
-    let input = TempInput::write(b"sample").unwrap();
+    let supervisor = Supervisor::new();
+    let input = TempInput::write(&supervisor, b"sample").unwrap();
     assert!(!planted.contains(&input.path().to_path_buf()));
     drop(input);
     assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
@@ -842,38 +879,40 @@ fn temp_input_refuses_a_planted_path() {
 }
 
 #[test]
-fn kill_all_rizin_groups_removes_registered_temp_inputs() {
-    let _lock = rizin_test_lock();
-    let input = TempInput::write(b"in flight").unwrap();
+fn kill_all_removes_registered_temp_inputs() {
+    let supervisor = Supervisor::new();
+    let input = TempInput::write(&supervisor, b"in flight").unwrap();
     let path = input.path().to_path_buf();
-    kill_all_rizin_groups();
+    supervisor.kill_all();
     assert!(
         !path.exists(),
         "the reaper deletes inputs process::exit would leak"
     );
     // The run's own cleanup still tolerates the file being gone.
     drop(input);
-    assert!(!registry(&RIZIN_TEMP_INPUTS).contains(&path));
+    assert!(!lock(&supervisor.temp_inputs).contains(&path));
+    // And no new input is staged once shut down.
+    assert!(TempInput::write(&supervisor, b"late").is_err());
 }
 
 // ------------------------------------------------------------------
-// In-run memo: byte-bounded
+// In-run memo: byte-bounded, keyed by script
 // ------------------------------------------------------------------
 
 #[test]
 fn memo_is_bounded_by_bytes_as_well_as_entries() {
     let mut memo = Memo::new();
     let empty = || Some(make_recovery("{}"));
-    memo.insert([1; 32], empty(), RIZIN_MEMO_MAX_BYTES / 8);
+    memo.insert([1; 32], empty(), MEMO_MAX_BYTES / 8);
     assert!(memo.get(&[1; 32]).is_some());
     // Too large to share the budget: not remembered, and nothing evicted.
-    memo.insert([2; 32], empty(), RIZIN_MEMO_MAX_BYTES / 2);
+    memo.insert([2; 32], empty(), MEMO_MAX_BYTES / 2);
     assert!(memo.get(&[2; 32]).is_none());
     assert!(memo.get(&[1; 32]).is_some());
     // Filling past the byte budget resets the map instead of growing it.
     for k in 3..20u8 {
-        memo.insert([k; 32], empty(), RIZIN_MEMO_MAX_BYTES / 5);
-        assert!(memo.bytes <= RIZIN_MEMO_MAX_BYTES, "{} bytes", memo.bytes);
+        memo.insert([k; 32], empty(), MEMO_MAX_BYTES / 5);
+        assert!(memo.bytes <= MEMO_MAX_BYTES, "{} bytes", memo.bytes);
     }
     // A memoized failure is remembered as such.
     memo.insert([99; 32], None, 0);
@@ -881,33 +920,117 @@ fn memo_is_bounded_by_bytes_as_well_as_entries() {
 }
 
 #[test]
+fn memo_key_covers_bytes_script_and_budget() {
+    let settings = Settings::default();
+    let full = analysis_script(b"x", 0, false);
+    let prelude = analysis_script(b"x", 5, false);
+    assert_ne!(full, prelude);
+    let key = memo_key(b"x", full, &settings);
+    assert_eq!(key, memo_key(b"x", full, &settings));
+    assert_ne!(key, memo_key(b"y", full, &settings));
+    assert_ne!(key, memo_key(b"x", prelude, &settings));
+    let slower = Settings {
+        timeout: Duration::from_secs(1),
+        ..settings
+    };
+    assert_ne!(key, memo_key(b"x", full, &slower));
+    let retried = Settings {
+        retry_timeout: Some(RIZIN_TIMEOUT * 2),
+        ..settings
+    };
+    assert_ne!(key, memo_key(b"x", full, &retried));
+}
+
+/// The memo answers a repeat of the same bytes under the same script, and
+/// runs again for a different script over the same bytes.
+#[test]
+#[cfg(unix)]
+fn memo_replays_a_repeat_but_not_another_script() {
+    let dir = unique_shim_dir("filefacts-rizin-memoshim");
+    let runs = dir.join("runs");
+    let dir = stage_script(
+        dir,
+        &format!(
+            "echo run >> '{}'\nprintf '[]\\n===SEP===\\n[]\\n===SEP===\\n\\n===SEP===\\n[]\\n===SEP===\\n[]\\n'\n",
+            runs.display()
+        ),
+    );
+    let bin = dir.join("rizin");
+    let supervisor = Supervisor::new();
+    let settings = Settings::default();
+    let full = analysis_script(b"x", 0, false);
+    let prelude = analysis_script(b"x", 5, false);
+    let count = || std::fs::read_to_string(&runs).map_or(0, |s| s.lines().count());
+    assert!(supervisor.recover(&bin, b"x", full, &settings).is_some());
+    assert!(supervisor.recover(&bin, b"x", full, &settings).is_some());
+    assert_eq!(count(), 1, "the repeat was not answered from the memo");
+    assert!(supervisor.recover(&bin, b"x", prelude, &settings).is_some());
+    assert_eq!(count(), 2, "another script must not share the memo entry");
+    assert_eq!(supervisor.stats().total, 2);
+    assert_eq!(supervisor.stats().successes, 2);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// After too many abandoned readers rizin stays off: no run starts.
+#[test]
+#[cfg(unix)]
+fn disabled_supervisor_runs_nothing() {
+    let dir = stage_script(
+        unique_shim_dir("filefacts-rizin-disabledshim"),
+        "echo should-not-run\n",
+    );
+    let supervisor = Supervisor::new();
+    supervisor.disabled.store(true, Ordering::Release);
+    let script = analysis_script(b"x", 0, false);
+    let recovered = supervisor.recover(&dir.join("rizin"), b"x", script, &Settings::default());
+    assert!(recovered.is_none());
+    assert_eq!(supervisor.stats().total, 0);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 #[cfg(unix)]
 fn outside_sigkill_is_transient_but_a_crash_is_decided() {
-    let _lock = rizin_test_lock();
-    let killed = stage_script("filefacts-rizin-killedshim", "kill -9 $$\n");
-    let attempt = attempt_with_bin(&killed.join("rizin"), b"x", 0, false, RIZIN_TIMEOUT);
+    let supervisor = Supervisor::new();
+    let killed = stage_script(
+        unique_shim_dir("filefacts-rizin-killedshim"),
+        "kill -9 $$\n",
+    );
+    let attempt = shim_attempt(&supervisor, &killed, RIZIN_TIMEOUT);
     assert!(attempt.recovery.is_none());
     assert!(
         !attempt.deterministic,
         "a SIGKILL we did not send must not be memoized"
     );
-    let crashed = stage_script("filefacts-rizin-crashshim", "exit 3\n");
-    let attempt = attempt_with_bin(&crashed.join("rizin"), b"x", 0, false, RIZIN_TIMEOUT);
+    let crashed = stage_script(unique_shim_dir("filefacts-rizin-crashshim"), "exit 3\n");
+    let attempt = shim_attempt(&supervisor, &crashed, RIZIN_TIMEOUT);
     assert!(attempt.recovery.is_none());
     assert!(attempt.deterministic, "a crash on these bytes is theirs");
+    assert_eq!(supervisor.stats().failures, 2);
     let _ = std::fs::remove_dir_all(killed);
     let _ = std::fs::remove_dir_all(crashed);
 }
 
 // ------------------------------------------------------------------
-// Hardened runner: output cap, version probe
+// Shims, and the version probe
 // ------------------------------------------------------------------
 
-/// Stage `body` as an executable `rizin` shell script in a fresh directory.
+/// A fresh, process-unique scratch path for a shim.
+pub(super) fn unique_shim_dir(prefix: &str) -> std::path::PathBuf {
+    use std::sync::atomic::AtomicU64;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed),
+    ))
+}
+
+/// Stage `body` as an executable `rizin` shell script in `dir`, which it
+/// creates, and return `dir`.
 #[cfg(unix)]
-fn stage_script(prefix: &str, body: &str) -> std::path::PathBuf {
+pub(super) fn stage_script(dir: PathBuf, body: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
-    let dir = unique_shim_dir(prefix);
     std::fs::create_dir_all(&dir).unwrap();
     let shim = dir.join("rizin");
     std::fs::write(&shim, format!("#!/bin/sh\n{body}")).unwrap();
@@ -917,50 +1040,44 @@ fn stage_script(prefix: &str, body: &str) -> std::path::PathBuf {
     dir
 }
 
-#[test]
+/// One recovery run of the `rizin` shim in `dir` over a fixed input.
 #[cfg(unix)]
-fn output_cap_kills_the_group_from_the_supervisor_and_keeps_the_prefix() {
-    let _lock = rizin_test_lock();
-    // Writes forever; only the cap can end it before the deadline.
-    let dir = stage_script("filefacts-rizin-floodshim", "yes rizin-output\n");
-    let started = std::time::Instant::now();
-    let outcome = run_hardened(
-        Command::new(dir.join("rizin")),
-        Duration::from_secs(30),
-        64 * 1024,
-        ChildSetup::Native,
-    );
-    let RunOutcome::Exited {
-        status,
-        stdout,
-        cap_hit,
-    } = outcome
-    else {
-        panic!("a capped run still exits");
-    };
-    assert!(cap_hit);
-    assert!(!status.success());
-    assert_eq!(stdout.len(), 64 * 1024, "the prefix up to the cap is kept");
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "the cap, not the deadline, ended the run"
-    );
-    let _ = std::fs::remove_dir_all(dir);
+pub(super) fn shim_attempt(supervisor: &Supervisor, dir: &Path, timeout: Duration) -> Attempt {
+    let bytes = b"shim input";
+    let script = analysis_script(bytes, 0, false);
+    supervisor.attempt(&dir.join("rizin"), bytes, script, timeout)
+}
+
+/// [`shim_attempt`] under the default budget, keeping only the recovery.
+#[cfg(unix)]
+fn shim_recover(dir: &Path) -> Option<RizinRecovery> {
+    shim_attempt(&Supervisor::new(), dir, RIZIN_TIMEOUT).recovery
 }
 
 #[test]
 #[cfg(unix)]
 fn version_probe_is_bounded_by_its_deadline() {
-    let _lock = rizin_test_lock();
-    let dir = stage_script("filefacts-rizin-hangshim", "exec sleep 300\n");
-    let started = std::time::Instant::now();
-    assert_eq!(version_of(&dir.join("rizin"), Duration::from_secs(1)), None);
-    assert!(started.elapsed() < Duration::from_secs(5));
+    // Unbounded, the shim would print its banner after 300 s; bounded by a
+    // one-second deadline it is killed first and reads as unknown.
+    let dir = stage_script(
+        unique_shim_dir("filefacts-rizin-hangshim"),
+        "sleep 300\necho 'rizin 0.0.0 late'\n",
+    );
+    let supervisor = Supervisor::new();
+    assert_eq!(
+        supervisor.version_of(&dir.join("rizin"), Duration::from_secs(1)),
+        None
+    );
     let _ = std::fs::remove_dir_all(&dir);
 
-    let dir = stage_script("filefacts-rizin-versionshim", "echo 'rizin 9.9.9 @ test'\n");
+    let dir = stage_script(
+        unique_shim_dir("filefacts-rizin-versionshim"),
+        "echo 'rizin 9.9.9 @ test'\n",
+    );
     assert_eq!(
-        version_of(&dir.join("rizin"), Duration::from_secs(30)).as_deref(),
+        supervisor
+            .version_of(&dir.join("rizin"), Duration::from_secs(3600))
+            .as_deref(),
         Some("rizin 9.9.9 @ test")
     );
     let _ = std::fs::remove_dir_all(dir);
@@ -970,22 +1087,23 @@ fn version_probe_is_bounded_by_its_deadline() {
 // parse_recovery_output — block splitting + per-block error tolerance
 // ------------------------------------------------------------------
 
-/// Build a synthetic rizin stdout matching the
-/// `iij; echo ===SEP===; iEj; echo ===SEP===; aaa; echo ===SEP===; aflj`
-/// shape — four blocks with the canonical separator.
+/// A synthetic rizin stdout in the five-block shape every script produces.
 fn synthesize_stdout(imports: &str, exports: &str, chatter: &str, functions: &str) -> String {
-    format!("{imports}\n===SEP===\n{exports}\n===SEP===\n{chatter}\n===SEP===\n{functions}")
+    format!(
+        "{imports}\n===SEP===\n{exports}\n===SEP===\n{chatter}\n===SEP===\n{functions}\n===SEP===\n[]"
+    )
 }
 
 #[test]
-fn parse_recovery_output_splits_canonical_four_block_shape() {
+fn parse_recovery_output_splits_canonical_block_shape() {
     let stdout = synthesize_stdout(
         r#"[{"name":"open","libname":"libc.so"}]"#,
         r#"[{"name":"start","vaddr":4096}]"#,
         "[INFO] analysis ran",
         r#"[{"name":"main","offset":4096,"cc":3,"nbbs":5}]"#,
     );
-    let rec = parse_recovery_output(&stdout);
+    let (rec, complete) = parse_recovery_output(&stdout);
+    assert!(complete);
     assert_eq!(rec.imports.len(), 1);
     assert_eq!(rec.imports[0].name, "open");
     assert_eq!(rec.exports.len(), 1);
@@ -996,10 +1114,11 @@ fn parse_recovery_output_splits_canonical_four_block_shape() {
 
 #[test]
 fn parse_recovery_output_tolerates_truncated_blocks() {
-    // Only two separators present — third + fourth blocks missing.
-    // Should yield empty exports/functions rather than panic.
+    // Only one separator present — the later blocks are missing. Yields
+    // empty tables rather than panicking, and says it is incomplete.
     let stdout = "[]\n===SEP===\n[{\"name\":\"a\"}]";
-    let rec = parse_recovery_output(stdout);
+    let (rec, complete) = parse_recovery_output(stdout);
+    assert!(!complete);
     assert!(rec.imports.is_empty());
     assert_eq!(rec.exports.len(), 1);
     assert_eq!(rec.exports[0].name, "a");
@@ -1008,14 +1127,15 @@ fn parse_recovery_output_tolerates_truncated_blocks() {
 
 #[test]
 fn parse_recovery_output_recovers_from_malformed_block() {
-    // First block is unparseable JSON; we still get the rest.
+    // First block is unparseable JSON; we still get the rest, flagged.
     let stdout = synthesize_stdout(
         "this is not json",
         r#"[{"name":"x","vaddr":1}]"#,
         "",
         r#"[{"name":"y","offset":2}]"#,
     );
-    let rec = parse_recovery_output(&stdout);
+    let (rec, complete) = parse_recovery_output(&stdout);
+    assert!(!complete, "a malformed table is not a complete recovery");
     assert!(rec.imports.is_empty(), "bad JSON → empty, not panic");
     assert_eq!(rec.exports.len(), 1);
     assert_eq!(rec.functions.len(), 1);
@@ -1032,7 +1152,8 @@ fn parse_recovery_output_ignores_separator_inside_names() {
         "",
         r#"[{"name":"main","offset":4096}]"#,
     );
-    let rec = parse_recovery_output(&stdout);
+    let (rec, complete) = parse_recovery_output(&stdout);
+    assert!(complete);
     assert_eq!(rec.imports.len(), 2);
     assert_eq!(rec.imports[0].name, "===SEP===");
     assert_eq!(rec.exports.len(), 1);
@@ -1058,7 +1179,9 @@ fn resolved_call_names_are_bounded() {
     );
     let mut symbols = Symbols::new();
     let mut metrics = Metrics::new();
-    parse_recovery_output(&stdout).apply(&mut symbols, &mut metrics);
+    parse_recovery_output(&stdout)
+        .0
+        .apply(&mut symbols, &mut metrics);
     let mut copied = 0;
     let mut calls = 0;
     for symbol in symbols.iter() {
@@ -1080,7 +1203,8 @@ fn resolved_call_names_are_bounded() {
 
 #[test]
 fn parse_recovery_output_handles_empty_stdout() {
-    let rec = parse_recovery_output("");
+    let (rec, complete) = parse_recovery_output("");
+    assert!(!complete);
     assert!(rec.imports.is_empty());
     assert!(rec.exports.is_empty());
     assert!(rec.functions.is_empty());
@@ -1090,32 +1214,18 @@ fn parse_recovery_output_handles_empty_stdout() {
 // End-to-end spawn/drain via a fake-rizin shim script
 // ------------------------------------------------------------------
 
-/// Process-unique counter for shim scratch dirs. The previous
-/// `pid + subsec_nanos` scheme raced when three tests staged dirs
-/// inside the same nanosecond window under parallel execution.
-#[cfg(any(unix, windows))]
-fn unique_shim_dir(prefix: &str) -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    std::env::temp_dir().join(format!(
-        "{prefix}-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed),
-    ))
-}
-
-/// Execute a freshly staged shim once, untimed, so the timing assertions
-/// below measure the recovery path and not the host's first-exec cost.
+/// Execute a freshly staged shim once, unsupervised, so a timed run below
+/// measures the recovery path and not the host's first-exec cost.
 ///
 /// EndpointSecurity clients (macOS XProtect, and any third-party agent
 /// installed alongside it) hold the *first* `exec` of a newly written file
 /// while they scan it, then cache the verdict; the same shim runs in
-/// milliseconds afterwards. Measured at 11-36 s on one developer Mac, which
-/// is many times every bound asserted here. Every shim used by a timed test
-/// exits immediately when its first argument is `warmup`.
+/// milliseconds afterwards. That hold can be tens of seconds, longer than a
+/// short budget below. Every shim used by a budgeted test exits immediately
+/// when its first argument is `warmup`.
 #[cfg(unix)]
-fn warm_shim_exec(shim: &Path) {
-    let status = Command::new(shim)
+pub(super) fn warm_shim_exec(shim: &Path) {
+    let status = std::process::Command::new(shim)
         .arg("warmup")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1124,45 +1234,24 @@ fn warm_shim_exec(shim: &Path) {
     assert!(status.success(), "shim warm-up exited with {status}");
 }
 
-/// Stage a shell script that masquerades as `rizin`, prints a
-/// fixed stdout payload (escaping the canonical separators), and
-/// returns its directory so we can stitch it onto PATH. Returns
-/// `None` on non-Unix or when `/bin/sh` isn't available — those
-/// platforms exercise the same paths under cleave's real rizin.
+/// Stage a `rizin` shim that prints `stdout_payload` verbatim, whatever its
+/// arguments.
 #[cfg(unix)]
-fn stage_shim(stdout_payload: &str) -> Option<std::path::PathBuf> {
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    let dir = unique_shim_dir("filefacts-rizin-shim");
-    std::fs::create_dir_all(&dir).ok()?;
-    let shim = dir.join("rizin");
-    let mut f = std::fs::File::create(&shim).ok()?;
-    // The body interprets `$1` etc. as rizin's CLI args. We don't
-    // care about them — we just emit the canned stdout the
-    // production code expects to parse.
-    writeln!(f, "#!/bin/sh").ok()?;
-    // `cat <<'EOF'` preserves the body bytes-for-bytes; the
-    // single-quoted EOF disables shell expansion so payloads with
-    // backticks / dollars survive.
-    writeln!(f, "cat <<'EOF'").ok()?;
-    f.write_all(stdout_payload.as_bytes()).ok()?;
-    writeln!(f).ok()?;
-    writeln!(f, "EOF").ok()?;
-    let mut perms = std::fs::metadata(&shim).ok()?.permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&shim, perms).ok()?;
-    Some(dir)
+fn stage_shim(stdout_payload: &str) -> PathBuf {
+    // A quoted here-document delimiter disables expansion, so payloads with
+    // backticks and dollars survive byte for byte.
+    stage_script(
+        unique_shim_dir("filefacts-rizin-shim"),
+        &format!("cat <<'EOF'\n{stdout_payload}\nEOF\n"),
+    )
 }
 
-/// Spawn the shim through the same `recover()` codepath production
-/// uses, with PATH pointed at the shim dir. The cached PATH probe
-/// in `rizin_binary()` is bypassed via a private helper that takes
-/// the bin path directly — see `recover_with_bin_for_test`.
+/// Run the shim printing `stdout_payload` through the production recovery
+/// path: temp input, contained spawn, drain, parse.
 #[cfg(unix)]
-fn run_against_shim(stdout_payload: &str, input_bytes: &[u8]) -> Option<RizinRecovery> {
-    let dir = stage_shim(stdout_payload)?;
-    let shim_path = dir.join("rizin");
-    let result = recover_with_bin_for_test(&shim_path, input_bytes);
+fn run_against_shim(stdout_payload: &str) -> Option<RizinRecovery> {
+    let dir = stage_shim(stdout_payload);
+    let result = shim_recover(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     result
 }
@@ -1170,17 +1259,15 @@ fn run_against_shim(stdout_payload: &str, input_bytes: &[u8]) -> Option<RizinRec
 #[test]
 #[cfg(unix)]
 fn end_to_end_shim_returns_parsed_recovery() {
-    let _lock = rizin_test_lock();
-    // A canonical four-block payload — exercises spawn, drain,
-    // separator split, and per-block JSON parse together.
+    // A canonical payload — exercises spawn, drain, separator split, and
+    // per-block JSON parse together.
     let payload = synthesize_stdout(
         r#"[{"name":"malloc","libname":"libc.so.6"}]"#,
         r#"[{"name":"entry","vaddr":4096}]"#,
         "analysis-chatter-ignored",
         r#"[{"name":"f1","offset":4096,"cc":7,"nbbs":12}]"#,
     );
-    let rec = run_against_shim(&payload, b"unused bytes for temp file")
-        .expect("shim should return a recovery; if your /bin/sh is missing this test can't run");
+    let rec = run_against_shim(&payload).expect("shim should return a recovery");
     assert_eq!(rec.imports.len(), 1);
     assert_eq!(rec.imports[0].libname.as_deref(), Some("libc.so.6"));
     assert_eq!(rec.exports.len(), 1);
@@ -1188,10 +1275,43 @@ fn end_to_end_shim_returns_parsed_recovery() {
     assert_eq!(rec.functions[0].cc, Some(7));
 }
 
+/// Well-formed output counts as a success; output with a malformed table
+/// keeps what parsed but counts as a failure.
+#[test]
+#[cfg(unix)]
+fn malformed_output_is_kept_but_counted_as_a_failure() {
+    let supervisor = Supervisor::new();
+    let good = stage_shim(&synthesize_stdout("[]", "[]", "", "[]"));
+    assert!(
+        shim_attempt(&supervisor, &good, RIZIN_TIMEOUT)
+            .recovery
+            .is_some()
+    );
+    assert_eq!(
+        (supervisor.stats().successes, supervisor.stats().failures),
+        (1, 0)
+    );
+    let bad = stage_shim(&synthesize_stdout(
+        "not json",
+        r#"[{"name":"start","vaddr":4096}]"#,
+        "",
+        "[]",
+    ));
+    let rec = shim_attempt(&supervisor, &bad, RIZIN_TIMEOUT)
+        .recovery
+        .expect("partial recovery kept");
+    assert_eq!(rec.exports.len(), 1);
+    assert_eq!(
+        (supervisor.stats().successes, supervisor.stats().failures),
+        (1, 1)
+    );
+    let _ = std::fs::remove_dir_all(good);
+    let _ = std::fs::remove_dir_all(bad);
+}
+
 #[test]
 #[cfg(unix)]
 fn end_to_end_shim_handles_large_stdout_via_pipe_drain() {
-    let _lock = rizin_test_lock();
     // Build a function array large enough to exceed the typical
     // 64 KiB pipe buffer — without the background drain thread,
     // this would deadlock on shim's stdout write. With drain, it
@@ -1212,21 +1332,19 @@ fn end_to_end_shim_handles_large_stdout_via_pipe_drain() {
         "payload {} bytes — must exceed pipe buffer",
         payload.len()
     );
-    let rec = run_against_shim(&payload, b"x").expect("shim recovery");
+    let rec = run_against_shim(&payload).expect("shim recovery");
     assert_eq!(rec.functions.len(), 2000);
 }
 
 #[test]
 #[cfg(unix)]
 fn end_to_end_shim_returns_some_empty_recovery_on_separator_only_stdout() {
-    let _lock = rizin_test_lock();
-    // Three SEPs with empty blocks → valid but contentless rizin
-    // output. recover() returns Some(empty) here; `apply` is then
-    // a no-op (functions empty → no metrics emitted) and the
-    // caller's existing goblin data survives untouched. This is
+    // Empty tables are valid but contentless rizin output. The recovery is
+    // `Some(empty)`; `apply` is then a no-op (functions empty → no metrics
+    // emitted) and the parser's existing data survives untouched. This is
     // distinct from the "empty bytes → None" case below.
     let payload = synthesize_stdout("[]", "[]", "", "[]");
-    let rec = run_against_shim(&payload, b"x").expect("empty arrays still parse");
+    let rec = run_against_shim(&payload).expect("empty arrays still parse");
     assert!(rec.imports.is_empty());
     assert!(rec.exports.is_empty());
     assert!(rec.functions.is_empty());
@@ -1235,22 +1353,10 @@ fn end_to_end_shim_returns_some_empty_recovery_on_separator_only_stdout() {
 #[test]
 #[cfg(unix)]
 fn end_to_end_recover_returns_none_when_stdout_bytes_empty() {
-    let _lock = rizin_test_lock();
-    // Pure-stdlib shim that exits 0 with zero stdout bytes. Exercises
-    // the `stdout_bytes.is_empty() → None` guard against subprocesses
-    // that silently fail (rizin crashing before its first echo).
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    let dir = unique_shim_dir("filefacts-rizin-silentshim");
-    std::fs::create_dir_all(&dir).unwrap();
-    let shim = dir.join("rizin");
-    let mut f = std::fs::File::create(&shim).unwrap();
-    // `exit 0` produces zero stdout bytes — no trailing newline.
-    f.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
-    let mut perms = std::fs::metadata(&shim).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&shim, perms).unwrap();
-    let rec = recover_with_bin_for_test(&shim, b"unused");
+    // A shim that exits 0 with zero stdout bytes, like rizin crashing before
+    // its first echo.
+    let dir = stage_script(unique_shim_dir("filefacts-rizin-silentshim"), "exit 0\n");
+    let rec = shim_recover(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(rec.is_none(), "zero stdout bytes should yield None");
 }
@@ -1258,243 +1364,16 @@ fn end_to_end_recover_returns_none_when_stdout_bytes_empty() {
 #[test]
 #[cfg(unix)]
 fn end_to_end_recover_returns_none_on_nonzero_exit() {
-    let _lock = rizin_test_lock();
     // Shim exits non-zero (rizin crashed) — recover should not
     // return phantom data even if some partial stdout leaked.
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    let dir = unique_shim_dir("filefacts-rizin-failshim");
-    std::fs::create_dir_all(&dir).unwrap();
-    let shim = dir.join("rizin");
-    let mut f = std::fs::File::create(&shim).unwrap();
-    f.write_all(b"#!/bin/sh\necho 'partial output'\nexit 1\n")
-        .unwrap();
-    let mut perms = std::fs::metadata(&shim).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&shim, perms).unwrap();
-    let rec = recover_with_bin_for_test(&shim, b"unused");
+    let dir = stage_script(
+        unique_shim_dir("filefacts-rizin-failshim"),
+        "echo 'partial output'\nexit 1\n",
+    );
+    let rec = shim_recover(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(rec.is_none(), "non-zero exit should yield None");
 }
-
-#[test]
-#[cfg(unix)]
-fn exited_rizin_cannot_leave_descendant_holding_worker() {
-    let _lock = rizin_test_lock();
-
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    let dir = unique_shim_dir("filefacts-rizin-descendantshim");
-    std::fs::create_dir_all(&dir).unwrap();
-    let shim = dir.join("rizin");
-    let descendant_pid = dir.join("descendant.pid");
-    let mut f = std::fs::File::create(&shim).unwrap();
-    writeln!(f, "#!/bin/sh").unwrap();
-    // See `warm_shim_exec`: the untimed warm-up run must not fork a helper.
-    writeln!(f, "[ \"$1\" = warmup ] && exit 0").unwrap();
-    // The descendant inherits stdout, then the shim exits immediately. If
-    // the recovery path only reaps the group leader, `drain.join()` blocks
-    // until this sleep ends and retains its Rayon caller in the meantime.
-    writeln!(f, "sleep 5 &").unwrap();
-    writeln!(f, "descendant=$!").unwrap();
-    writeln!(
-        f,
-        "printf '%s\\n' \"$descendant\" > '{}'",
-        descendant_pid.display()
-    )
-    .unwrap();
-    writeln!(f, "exit 1").unwrap();
-    let mut perms = std::fs::metadata(&shim).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&shim, perms).unwrap();
-    drop(f);
-
-    warm_shim_exec(&shim);
-
-    let started = std::time::Instant::now();
-    let rec = recover_with_bin_for_test(&shim, b"descendant cleanup fixture");
-    let elapsed = started.elapsed();
-    assert!(rec.is_none(), "failed Rizin must not emit partial facts");
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "lingering descendant retained the worker for {elapsed:?}"
-    );
-
-    let descendant: i32 = std::fs::read_to_string(&descendant_pid)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    for _ in 0..100 {
-        // SAFETY: signal 0 performs existence/permission probing only.
-        #[allow(unsafe_code)]
-        let exists = unsafe { libc::kill(descendant, 0) } == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-        if !exists {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    // SAFETY: signal 0 performs existence/permission probing only.
-    #[allow(unsafe_code)]
-    let exists = unsafe { libc::kill(descendant, 0) } == 0
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-    assert!(!exists, "Rizin descendant survived its leader's exit");
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Windows counterpart of the `descendant_*` tests: a shim that
-/// backgrounds a helper which inherits stdout and then exits must not
-/// retain its Rayon caller.
-///
-/// This is the shape behind a whole-scan stall observed 2026-08-22 — every
-/// archive queued on the scan memory gate while the permit holder sat at
-/// 0% CPU. The leader is reaped, but `read_to_end` cannot return while a
-/// descendant holds the pipe's write end, and the drain join was unbounded.
-/// Unix contains this with a private process group; until the job object in
-/// `win_job`, Windows had neither the containment nor this coverage.
-#[test]
-#[cfg(windows)]
-fn windows_descendant_holding_stdout_does_not_retain_worker() {
-    let _lock = rizin_test_lock();
-
-    const HELPER_SECS: u64 = 20;
-    let dir = unique_shim_dir("filefacts-rizin-winshim");
-    std::fs::create_dir_all(&dir).unwrap();
-    let shim = dir.join("rizin.cmd");
-    let marker = dir.join("shim-ran.txt");
-
-    // `start /b` hands the helper an inherited copy of stdout and does not
-    // wait for it, so the leader exits while the pipe stays open.
-    let script = [
-        "@echo off".to_string(),
-        format!("echo ran > \"{}\"", marker.display()),
-        format!(
-            "start /b \"\" powershell -NoProfile -Command \"Start-Sleep -Seconds {HELPER_SECS}\""
-        ),
-        "exit 1".to_string(),
-    ]
-    .join("\r\n");
-    std::fs::write(&shim, script).unwrap();
-
-    let started = std::time::Instant::now();
-    let rec = recover_with_bin_for_test(&shim, b"windows descendant fixture");
-    let elapsed = started.elapsed();
-
-    assert!(
-        marker.exists(),
-        "shim never executed — the assertions below would be vacuous"
-    );
-    assert!(rec.is_none(), "failed Rizin must not emit partial facts");
-    assert!(
-        elapsed < Duration::from_secs(HELPER_SECS / 2),
-        "descendant holding stdout retained the worker for {elapsed:?}"
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-#[cfg(unix)]
-fn timeout_kills_process_group_joins_reader_and_returns_worker() {
-    let _lock = rizin_test_lock();
-
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    let dir = unique_shim_dir("filefacts-rizin-timeoutshim");
-    std::fs::create_dir_all(&dir).unwrap();
-    let shim = dir.join("rizin");
-    let leader_pid = dir.join("leader.pid");
-    let descendant_pid = dir.join("descendant.pid");
-    let mut f = std::fs::File::create(&shim).unwrap();
-    writeln!(f, "#!/bin/sh").unwrap();
-    // See `warm_shim_exec`: the untimed warm-up run must not block 300 s.
-    writeln!(f, "[ \"$1\" = warmup ] && exit 0").unwrap();
-    writeln!(f, "printf '%s\\n' \"$$\" > '{}'", leader_pid.display()).unwrap();
-    writeln!(f, "sleep 300 &").unwrap();
-    writeln!(f, "descendant=$!").unwrap();
-    writeln!(
-        f,
-        "printf '%s\\n' \"$descendant\" > '{}'",
-        descendant_pid.display()
-    )
-    .unwrap();
-    writeln!(f, "wait \"$descendant\"").unwrap();
-    let mut perms = std::fs::metadata(&shim).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&shim, perms).unwrap();
-    drop(f);
-
-    warm_shim_exec(&shim);
-
-    let started = std::time::Instant::now();
-    let rec = recover_with_bin(
-        &shim,
-        b"timeout cleanup fixture",
-        0,
-        false,
-        Duration::from_secs(1),
-    );
-    let elapsed = started.elapsed();
-    assert!(rec.is_none(), "timed-out Rizin must not emit partial facts");
-    assert!(
-        elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(5),
-        "one-second timeout returned after {elapsed:?}"
-    );
-
-    let leader: i32 = std::fs::read_to_string(&leader_pid)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    let descendant: i32 = std::fs::read_to_string(&descendant_pid)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-
-    fn process_exists(pid: i32) -> bool {
-        // SAFETY: signal 0 performs existence/permission probing only.
-        #[allow(unsafe_code)]
-        let rc = unsafe { libc::kill(pid, 0) };
-        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-
-    // The direct child is synchronously waited. Its background child is
-    // killed by the same process-group signal and may remain a zombie for a
-    // scheduler tick while init adopts it, so give reaping a short grace.
-    for _ in 0..100 {
-        if !process_exists(leader) && !process_exists(descendant) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(!process_exists(leader), "Rizin group leader was not reaped");
-    assert!(
-        !process_exists(descendant),
-        "Rizin descendant survived the process-group timeout"
-    );
-    assert!(
-        !RIZIN_PGIDS
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains(&leader),
-        "timed-out Rizin remained in the live-process registry"
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-// Temp-file cleanup is enforced by a `Drop` guard on `Cleanup<'_>`
-// inside `recover_with_bin`. Snapshotting `/tmp` before/after a
-// shim run would race against parallel shim tests (other threads
-// running `recover_with_bin_for_test` create files with the same
-// PID prefix); serialising every shim test to make the snapshot
-// deterministic defeats parallelism. The Drop pattern is idiomatic
-// Rust and was verified end-to-end on the malware sample run
-// (8,325 functions recovered, no `filefacts-rizin-*` files left in
-// `/tmp` across sessions).
 
 #[test]
 fn deadline_retry_targets_only_timeouts_and_runs_at_most_once() {
@@ -1542,37 +1421,35 @@ fn smaller_equal_or_disabled_retry_deadline_is_not_used() {
 #[test]
 #[cfg(unix)]
 fn timed_out_shim_retries_and_recovers_but_crash_does_not_retry() {
-    let _lock = rizin_test_lock();
-    // See `warm_shim_exec`: a held first exec would outlast the 100 ms budget.
+    // The first run sleeps for an hour, so its 100 ms budget always expires;
+    // the retry's budget is generous enough for any loaded machine.
     let dir = stage_script(
-        "filefacts-native-retry",
-        "[ \"$1\" = warmup ] && exit 0\nflag=\"${0}.first\"\nif [ ! -f \"$flag\" ]; then : > \"$flag\"; exec sleep 300; fi\nprintf '[]\\n===SEP===\\n[]\\n===SEP===\\n[]\\n===SEP===\\n[]\\n'\n",
+        unique_shim_dir("filefacts-native-retry"),
+        "[ \"$1\" = warmup ] && exit 0\nflag=\"${0}.first\"\nif [ ! -f \"$flag\" ]; then : > \"$flag\"; exec sleep 3600; fi\nprintf '[]\\n===SEP===\\n[]\\n===SEP===\\n\\n===SEP===\\n[]\\n===SEP===\\n[]\\n'\n",
     );
     warm_shim_exec(&dir.join("rizin"));
+    let supervisor = Supervisor::new();
     let mut runs = 0;
     let result = attempt_with_retry(
         Duration::from_millis(100),
-        Some(Duration::from_secs(2)),
+        Some(Duration::from_secs(600)),
         |timeout| {
             runs += 1;
-            attempt_with_bin(&dir.join("rizin"), b"fixture", 0, false, timeout)
+            shim_attempt(&supervisor, &dir, timeout)
         },
     );
     assert_eq!(runs, 2);
     assert!(result.recovery.is_some());
     assert!(!result.timed_out);
-    let crash = stage_script(
-        "filefacts-native-retry-crash",
-        "[ \"$1\" = warmup ] && exit 0\nexit 3\n",
-    );
-    warm_shim_exec(&crash.join("rizin"));
+    // A crash under a budget it cannot exceed is never retried.
+    let crash = stage_script(unique_shim_dir("filefacts-native-retry-crash"), "exit 3\n");
     let mut runs = 0;
     let result = attempt_with_retry(
-        Duration::from_millis(100),
-        Some(Duration::from_secs(2)),
+        Duration::from_secs(600),
+        Some(Duration::from_mins(20)),
         |timeout| {
             runs += 1;
-            attempt_with_bin(&crash.join("rizin"), b"fixture", 0, false, timeout)
+            shim_attempt(&supervisor, &crash, timeout)
         },
     );
     assert_eq!(runs, 1);
@@ -1580,333 +1457,4 @@ fn timed_out_shim_retries_and_recovers_but_crash_does_not_retry() {
     assert!(!result.timed_out);
     let _ = std::fs::remove_dir_all(dir);
     let _ = std::fs::remove_dir_all(crash);
-}
-
-#[cfg(target_os = "linux")]
-fn launch_probe_command(wait: bool, setup: ChildSetup) -> Command {
-    let exe = std::env::current_exe().unwrap();
-    let mut cmd = match setup {
-        ChildSetup::Native | ChildSetup::Watchdog => Command::new(&exe),
-        ChildSetup::ExternalLinux => linux_launcher().unwrap().command(&exe).unwrap(),
-    };
-    cmd.args([
-        "--exact",
-        if wait {
-            "rizin::tests::linux_waiting_child_probe"
-        } else {
-            "rizin::tests::linux_child_limits_probe"
-        },
-        "--ignored",
-        "--nocapture",
-        "--test-threads=1",
-    ]);
-    cmd
-}
-
-#[test]
-#[ignore = "subprocess fixture for Linux launch tests"]
-#[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
-fn linux_child_limits_probe() {
-    let mut a = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    let mut d = a;
-    let mut signal: libc::c_int = 0;
-    // SAFETY: live writable storage for these resource/signal queries.
-    let (pid, parent, group) = unsafe {
-        assert_eq!(libc::getrlimit(libc::RLIMIT_AS, &raw mut a), 0);
-        assert_eq!(libc::getrlimit(libc::RLIMIT_DATA, &raw mut d), 0);
-        assert_eq!(libc::prctl(libc::PR_GET_PDEATHSIG, &raw mut signal), 0);
-        (libc::getpid(), libc::getppid(), libc::getpgrp())
-    };
-    println!(
-        "FILEFACTS_LIMITS {pid} {parent} {group} {signal} {} {} {} {}",
-        a.rlim_cur, a.rlim_max, d.rlim_cur, d.rlim_max
-    );
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
-fn linux_launch_modes_keep_limits_and_parent_death_signal() {
-    let _lock = rizin_test_lock();
-    let mut setups = vec![ChildSetup::Native];
-    if linux_launcher().is_some() {
-        setups.push(ChildSetup::ExternalLinux);
-    }
-    let limited = |resource| {
-        let mut lim = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: live writable rlimit storage, for a supported resource.
-        assert_eq!(unsafe { libc::getrlimit(resource, &raw mut lim) }, 0);
-        [
-            lim.rlim_cur.min(RIZIN_MEMORY_LIMIT_BYTES),
-            lim.rlim_max.min(RIZIN_MEMORY_LIMIT_BYTES),
-        ]
-    };
-    let expected = [limited(libc::RLIMIT_AS), limited(libc::RLIMIT_DATA)].concat();
-    for setup in setups {
-        let result = run_hardened(
-            launch_probe_command(false, setup),
-            Duration::from_secs(10),
-            64 * 1024,
-            setup,
-        );
-        let RunOutcome::Exited {
-            status,
-            stdout,
-            cap_hit: false,
-        } = result
-        else {
-            panic!("probe did not exit");
-        };
-        assert!(status.success(), "{}", String::from_utf8_lossy(&stdout));
-        let output = String::from_utf8(stdout).unwrap();
-        let values: Vec<u64> = output
-            .lines()
-            .find_map(|line| line.split_once("FILEFACTS_LIMITS "))
-            .expect("probe limits")
-            .1
-            .split_whitespace()
-            .map(|v| v.parse().unwrap())
-            .collect();
-        assert_eq!(values.len(), 8);
-        assert_eq!(values[0], values[2]);
-        assert_eq!(values[1], u64::from(std::process::id()));
-        assert_eq!(values[4..], expected);
-        // libtest runs the probe on a new thread, where PDEATHSIG is reset.
-        // Query the exec'd leader itself with setpriv instead.
-        if let Some(setpriv) = crate::tools::resolve("setpriv") {
-            let mut cmd = match setup {
-                ChildSetup::Native | ChildSetup::Watchdog => Command::new(&setpriv),
-                ChildSetup::ExternalLinux => linux_launcher().unwrap().command(&setpriv).unwrap(),
-            };
-            cmd.arg("--dump");
-            let RunOutcome::Exited {
-                status,
-                stdout,
-                cap_hit: false,
-            } = run_hardened(cmd, Duration::from_secs(5), 64 * 1024, setup)
-            else {
-                panic!("leader signal probe failed");
-            };
-            assert!(status.success());
-            assert!(
-                String::from_utf8(stdout)
-                    .unwrap()
-                    .lines()
-                    .any(|line| line.split_whitespace().last() == Some("KILL"))
-            );
-        }
-    }
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-fn linux_launch_modes_keep_tighter_inherited_limits() {
-    let _lock = rizin_test_lock();
-    let Some(prlimit) = crate::tools::resolve("prlimit") else {
-        return;
-    };
-    let output = Command::new(prlimit)
-        .args([
-            "--as=1073741824:2147483648",
-            "--data=536870912:1073741824",
-            "--",
-        ])
-        .arg(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "rizin::tests::linux_launch_modes_keep_limits_and_parent_death_signal",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-}
-
-#[test]
-#[ignore = "subprocess fixture for parent-death test"]
-#[cfg(target_os = "linux")]
-fn linux_waiting_child_probe() {
-    use std::io::Write;
-    println!("FILEFACTS_CHILD {}", std::process::id());
-    std::io::stdout().flush().unwrap();
-    std::thread::sleep(Duration::from_secs(30));
-}
-
-#[test]
-#[ignore = "subprocess fixture that exits without cleanup"]
-#[cfg(target_os = "linux")]
-fn linux_parent_death_driver() {
-    use std::io::{BufRead, Write};
-    let mut cmd = launch_probe_command(true, ChildSetup::ExternalLinux);
-    crate::tools::scrub_env(&mut cmd);
-    apply_unix_hardening(&mut cmd, ChildSetup::ExternalLinux);
-    let mut child = cmd
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    for line in std::io::BufReader::new(child.stdout.take().unwrap()).lines() {
-        let line = line.unwrap();
-        if let Some((_, pid)) = line.split_once("FILEFACTS_CHILD ") {
-            println!("FILEFACTS_ORPHAN {pid}");
-            std::io::stdout().flush().unwrap();
-            std::process::exit(0);
-        }
-    }
-    let _ = child.wait();
-    panic!("child never became ready");
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
-fn linux_launcher_kills_child_after_parent_exit() {
-    let _lock = rizin_test_lock();
-    if linux_launcher().is_none() {
-        return;
-    }
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "rizin::tests::linux_parent_death_driver",
-            "--ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    let output = String::from_utf8(output.stdout).unwrap();
-    let pid: i32 = output
-        .lines()
-        .find_map(|line| line.split_once("FILEFACTS_ORPHAN "))
-        .expect("orphan pid")
-        .1
-        .trim()
-        .parse()
-        .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        let dead = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => stat.rsplit(')').next().unwrap().trim().starts_with('Z'),
-            Err(_) => true,
-        };
-        if dead {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            // SAFETY: private process group of this fixture.
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
-            panic!("child survived parent exit");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-fn linux_launcher_keeps_arguments_literal() {
-    let _lock = rizin_test_lock();
-    let Some(launcher) = linux_launcher() else {
-        return;
-    };
-    let value = "quotes '\" $() ; spaces";
-    let mut cmd = launcher.command(&launcher.shell).unwrap();
-    cmd.args(["-c", "printf '%s' \"$1\"", "fixture", value]);
-    let RunOutcome::Exited {
-        status,
-        stdout,
-        cap_hit: false,
-    } = run_hardened(cmd, Duration::from_secs(5), 1024, ChildSetup::ExternalLinux)
-    else {
-        panic!("literal-argument probe failed");
-    };
-    assert!(status.success());
-    assert_eq!(stdout, value.as_bytes());
-}
-
-#[test]
-#[cfg(unix)]
-fn shutdown_refuses_later_launches() {
-    let _lock = rizin_test_lock();
-    kill_all_rizin_groups();
-    let mut command = Command::new("/bin/sh");
-    command.args(["-c", "echo should-not-launch"]);
-    assert!(matches!(
-        run_hardened(command, Duration::from_secs(1), 1024, ChildSetup::Native),
-        RunOutcome::Failed
-    ));
-}
-
-#[test]
-#[cfg(unix)]
-fn independent_watchdog_launch_path_is_bounded() {
-    let _lock = rizin_test_lock();
-    let mut command = Command::new("/bin/sleep");
-    command.arg("30");
-    let started = std::time::Instant::now();
-    let out = run_hardened(
-        command,
-        Duration::from_millis(200),
-        1024,
-        ChildSetup::Watchdog,
-    );
-    assert!(matches!(
-        out,
-        RunOutcome::TimedOut | RunOutcome::Exited { .. }
-    ));
-    assert!(started.elapsed() < Duration::from_secs(3));
-}
-
-#[test]
-#[cfg(unix)]
-fn shutdown_cleans_up_concurrent_launches() {
-    let _lock = rizin_test_lock();
-    std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for _ in 0..8 {
-            handles.push(scope.spawn(|| {
-                let mut command = Command::new("/bin/sleep");
-                command.arg("30");
-                run_hardened(command, Duration::from_secs(2), 1024, ChildSetup::Native)
-            }));
-        }
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while registry(&RIZIN_PGIDS).is_empty() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "no launch was admitted"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        kill_all_rizin_groups();
-        for handle in handles {
-            match handle.join().unwrap() {
-                RunOutcome::Failed => {}
-                RunOutcome::Exited { status, .. } => assert!(!status.success()),
-                RunOutcome::TimedOut => panic!("shutdown missed a child"),
-            }
-        }
-    });
-    assert!(registry(&RIZIN_PGIDS).is_empty());
-    assert!(*registry(&RIZIN_SHUTDOWN));
 }

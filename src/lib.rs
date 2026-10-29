@@ -79,12 +79,14 @@
 //! binaries (see [`rizin`]). Turn that off with [`OpenOptions::rizin`].
 //!
 //! The disk cache in [`cache`] is off unless the host opts in with
-//! [`OpenOptions::cache`], or the `FILEFACTS_CACHE` environment variable
-//! turns it on for hosts that did not choose. When on, the first view access
-//! reads a matching entry from the user cache directory, or writes one after
-//! computing the views. The `filefacts` CLI opts in (`FILEFACTS_CACHE=0`
-//! still turns it off). Diagnostics are written to stderr only when
-//! `FILEFACTS_DEBUG` is set.
+//! [`OpenOptions::cache`]. When on, the first view access reads a matching
+//! entry from the cache directory, or writes one after computing the views.
+//! The library reads no environment variables: a host that wants
+//! `FILEFACTS_CACHE` to decide passes [`cache::env_override`] itself.
+//!
+//! filefacts reports what it decided, skipped and recovered from through
+//! [`tracing`], under `filefacts::<module>` targets. It never writes to stderr
+//! itself; what is shown, and where, is the host's choice of subscriber.
 //!
 //! ## Stability
 //!
@@ -108,7 +110,6 @@
 )]
 
 mod bytes;
-mod debug;
 mod derived_metrics;
 pub(crate) use derived_metrics::is_well_known_section_name;
 mod embedded_sources;
@@ -116,12 +117,15 @@ mod error;
 mod formats;
 mod go_dependency_context;
 mod go_package_context;
+mod identity;
 pub mod package_context;
 pub use go_dependency_context::{ReferenceMember, go_dependency_context};
 pub use go_package_context::{
     GoFileFlow, GoPackage, GoPackageFlow, GoSourceContext, go_source_context,
 };
+pub use output::{Resolution, UnresolvedReason};
 mod output;
+mod panic_guard;
 mod registry;
 mod scan;
 
@@ -136,19 +140,25 @@ pub use tree_sitter;
 pub(crate) use output::{metric, value_key};
 
 pub mod cache;
-pub mod cache_sweep;
 pub mod fileid;
-pub mod rpa;
-pub mod tools;
+mod tools;
 
-/// Optional rizin/radare2 integration with hardened subprocess
+/// Optional rizin integration with hardened subprocess
 /// discipline (RLIMIT, PR_SET_PDEATHSIG, process-group SIGKILL on
 /// timeout / output-cap overflow). Configured per file through
 /// [`OpenOptions`]; exposed as a public module only for what is genuinely
 /// process-wide: reaping in-flight workers (`kill_all_rizin_groups`) from a
-/// signal-handling thread (e.g. `ctrlc`), not an async signal handler, and
-/// `tracing` telemetry (`stats`, `log_stats`).
+/// signal-handling thread (e.g. `ctrlc`), not an async signal handler, the
+/// concurrency limit (`set_max_concurrent_runs`), and `tracing` telemetry
+/// (`stats`, `log_stats`).
+/// Ren'Py RPA archive members, for hosts that extract them.
+pub mod rpa {
+    pub use crate::formats::rpa::{Chunk, Member, members};
+}
 pub mod rizin;
+
+mod bundle;
+pub use bundle::{Bundle, View, ViewData};
 
 pub use formats::source::go_package_payload_flow;
 pub use formats::source::{decode_source_escapes, decode_source_escapes_for_type};
@@ -164,7 +174,9 @@ pub fn has_named_reference_metadata(path: &std::path::Path) -> bool {
     )
 }
 
-pub use output::{Flow, FlowFunction, FlowKind, FlowOrigin, FlowOrigins, FlowTransfer, FlowValue};
+pub use output::{
+    Flow, FlowFunction, FlowKind, FlowOrigin, FlowOrigins, FlowTransfer, FlowValue, Limitation,
+};
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -173,27 +185,30 @@ use std::time::Duration;
 
 pub use embedded_sources::EmbeddedSource;
 pub use error::Error;
-pub use fileid::{ArchiveFormat, Compression, Container, FileId, FileType, container_of};
+pub use fileid::{ArchiveFormat, Compression, Container, FileId, FileType, Group, container_of};
+pub use output::EntryType;
 pub use output::{
     ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Arg, ArgShape, CATALOG,
     Claim, Comments, DependencyContext, DependencyScope, Diagnostic, DiagnosticKind, Errors,
-    FAMILIES, Fact, HashAlgo, Identity, Literal, LiteralEncoding, LiteralMethod, Literals,
-    MetricKey, Metrics, Party, PinnedHash, QueryLimit, RefKind, RefLocator, Reference, Section,
-    SectionFlag, Sections, Signer, Span, Stage, Symbol, SymbolKind, Symbols, Text, Trust, Url,
-    UrlKind, VALUE_CATALOG, VALUE_FAMILIES, ValueKey, Values, archive_entry_type_count,
-    archive_method_count, ast_op, ast_op_density, dmg_codec_count, extension_content_mismatch,
-    source_query_limited,
+    FAMILIES, Fact, HashAlgo, Identity, Literal, LiteralEncoding, LiteralMethod, Literals, Metrics,
+    Party, PartyRole, PinnedHash, RefKind, RefLocator, Reference, Section, SectionFlag, Sections,
+    Signer, Span, Stage, Symbol, SymbolKind, Symbols, Text, Trust, Url, UrlKind, VALUE_CATALOG,
+    VALUE_FAMILIES, Values,
 };
-pub use registry::Registry;
+// Key types and the templated metric-key constructors: only filefacts emits
+// keys, so none of these is public.
+pub(crate) use output::{
+    MetricKey, QueryLimit, ValueKey, archive_entry_type_count, archive_method_count, ast_op,
+    ast_op_density, dmg_codec_count, extension_content_mismatch, source_query_limited,
+};
+pub use registry::{Ecosystem, Registry};
 
 /// Every metric key this build can emit, as fixed names plus the templates
 /// for the few keys with a data-derived segment.
 ///
-/// This is the enumeration downstream validators consume — cleave checks
-/// every `type: metrics` field in the trait corpus against it, so a rule
-/// naming a metric that no extractor emits is a build-time error there
-/// rather than a rule that silently never fires. Deriving the same list by
-/// scanning filefacts' source is the thing this exists to replace.
+/// A rule engine checks every metric a rule names against this list, so a
+/// rule naming a metric that no extractor emits fails when the rules load
+/// rather than silently never firing.
 #[must_use]
 pub fn known_metrics() -> (&'static [&'static str], &'static [&'static str]) {
     (CATALOG, FAMILIES)
@@ -230,55 +245,10 @@ pub fn known_values() -> (&'static [&'static str], &'static [&'static str]) {
 /// Schema version of the public output shape.
 ///
 /// Bumps on any field rename or semantic change. Field additions are
-/// non-breaking and do not bump this version. The on-disk cache carries a
-/// distinct [`cache::CACHE_SCHEMA_VERSION`], bumped only for breaking
-/// changes to its format; entries from older builds are never reused
-/// because every cache key includes a hash of filefacts' source.
-///
-/// **v5** — the `Imports`, `Exports`, `Functions`, and `Ast` peer
-/// types are collapsed into a single tagged [`Symbol`] enum. The
-/// `Function.kind` field is renamed to `decl` (to free the word `kind`
-/// for the discriminator) and `Function.calls` is renamed to `callees`
-/// (to disambiguate from the new [`Symbol::Call`] kind).
-///
-/// **v6** — the `Strings` collection is split into peer top-level
-/// [`Text`] (byte-scan: ascii + utf16le) and [`Literals`] (parser-
-/// extracted language string literals). The `StringCategory` enum and
-/// `ExtractedString.category` field are removed; the container
-/// identifies the tier.
-///
-/// **v7** — adds the [`Identity`] view: normalized, cross-format
-/// identity claims (name, identifier, project, signer, trust tier,
-/// authors, document title/producer, unique ids) folded out of the
-/// per-format structural values, each tagged claimed-vs-verified.
-///
-/// **v8** — metrics gain byte-span provenance. A *located* metric (one
-/// measured from a specific region — `binary.peak_region_entropy`,
-/// `text.invisible_chars`, `sections.entropy_max`, …) now serializes as
-/// `{"value": n, "spans": [{"offset", "len"}, …]}` instead of a bare
-/// number; unlocated metrics are unchanged. This is a value-shape change,
-/// so a consumer parsing every metric as a number must handle the object
-/// form. `stng::ExtractedString` also gains a `data_len` source extent.
-///
-/// **v9** — 75 value and metric keys are renamed to follow one naming
-/// convention (21 value keys, 54 metric keys); no key changes meaning or
-/// value except its name. Package links and identity fold onto the
-/// cross-format names (`whl.home_page`, `crx.homepage_url`, `rpm.url` →
-/// `<fmt>.homepage`; `deb.package`, `nupkg.id`, `apk.pkgname` →
-/// `<fmt>.name`), `pe.imphash` moves to `pe.hashes.imphash` beside the ELF
-/// and Mach-O fingerprints, counts take `_count` (`scpt.handlers` →
-/// `scpt.handler_count`), abbreviations are spelled out
-/// (`binary.huge_func_count` → `binary.huge_function_count`), and units
-/// that are not bytes become a suffix (`deb.installed_size` →
-/// `deb.installed_size_kib`). Identity claim sources name the new keys.
-/// `docs/NAMING.md` states the convention and `docs/schema-v9-renames.tsv`
-/// lists every old → new pair. Section flags share one vocabulary
-/// ([`SectionFlag`]), so ELF's `write` is now `writable` in both the sections
-/// view and `elf.sections[].flags`. A [`Reference`] with no locatable
-/// position omits `offset` rather than writing `0`, and a VBA import built at
-/// run time carries no `<non-literal>` placeholder: a non-literal `Lib`
-/// leaves `library` absent and a non-literal ProgID emits no import.
-pub const SCHEMA_VERSION: &str = "9";
+/// non-breaking and do not bump this version. The on-disk cache has its own
+/// format version, and never serves an entry written by another build of
+/// filefacts: every cache key includes a hash of filefacts' source.
+pub const SCHEMA_VERSION: &str = "10";
 
 /// A file with its bytes and lazily-computed metadata views.
 ///
@@ -318,6 +288,9 @@ pub struct ParsedFile<'a> {
     cancellation: Option<&'a AtomicBool>,
     // Whether `extracted` reads and writes the disk cache.
     cache: bool,
+    // The host's cache root (`OpenOptions::cache_dir`); `None` for the
+    // per-user default.
+    cache_dir: Option<Arc<Path>>,
     // The host's addition to every disk-cache key (`OpenOptions::cache_namespace`).
     cache_namespace: Option<Arc<str>>,
     // This file's rizin settings, carried into the extraction.
@@ -365,11 +338,16 @@ impl std::fmt::Debug for ParsedFile<'_> {
     }
 }
 
-/// The owned, serializable extraction snapshot. Round-trips through the
-/// disk cache ([`crate::cache`]) so the expensive recovery — chiefly the
-/// rizin disassembly pass folded into `symbols`/`sections`/`metrics` —
-/// is computed once per `(content, filefacts build, rizin config)` and
-/// reused across processes rather than re-run on every `open`.
+/// Everything one extraction produces. Round-trips through the disk cache
+/// ([`crate::cache`]) so the expensive recovery — chiefly the rizin
+/// disassembly pass folded into `symbols`/`sections`/`metrics` — is computed
+/// once per `(content, filefacts build, rizin config)` and reused across
+/// processes rather than re-run on every `open`.
+///
+/// The byte-scan `text` rows are cached in extraction order (see
+/// [`output::Strings`]), and under filefacts' key like everything else here.
+/// That key covers `Cargo.lock` (see `build.rs`), which pins stng to an exact
+/// commit: bumping stng retires every entry, with no version to maintain.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Extracted {
     values: Values,
@@ -381,89 +359,6 @@ struct Extracted {
     identity: Identity,
     references: Vec<Reference>,
     errors: Errors,
-}
-
-/// On-disk cache form of [`Extracted`]. The byte-scan `text` rows are stored
-/// as one list in extraction order: `Text`'s own serialized form groups them
-/// by encoding, which would hand a second `open` the rows in another order.
-///
-/// They are cached under filefacts' key like everything else here, and that
-/// key covers `Cargo.toml` (see `build.rs`), which pins stng to an exact
-/// commit: bumping stng retires every entry, with no version to maintain.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ExtractedSnapshot {
-    values: Values,
-    /// The rows `Text` shares, not a copy of them: snapshotting a fresh
-    /// extraction for the cache must not clone every string.
-    #[serde(with = "shared_rows")]
-    text: std::sync::Arc<[stng::ExtractedString]>,
-    literals: output::Literals,
-    comments: output::Comments,
-    metrics: Metrics,
-    archive_members: Vec<ArchiveMember>,
-    sections: Sections,
-    symbols: Symbols,
-    identity: Identity,
-    references: Vec<Reference>,
-    errors: Errors,
-}
-
-impl From<Extracted> for ExtractedSnapshot {
-    fn from(e: Extracted) -> Self {
-        Self {
-            values: e.values,
-            text: std::sync::Arc::clone(e.strings.text.rows()),
-            literals: e.strings.literals,
-            comments: e.strings.comments,
-            metrics: e.metrics,
-            archive_members: e.archive_members,
-            sections: e.sections,
-            symbols: e.symbols,
-            identity: e.identity,
-            references: e.references,
-            errors: e.errors,
-        }
-    }
-}
-
-impl From<ExtractedSnapshot> for Extracted {
-    fn from(s: ExtractedSnapshot) -> Self {
-        Self {
-            values: s.values,
-            strings: output::Strings {
-                text: output::Text::from_rows(s.text),
-                literals: s.literals,
-                comments: s.comments,
-            },
-            metrics: s.metrics,
-            archive_members: s.archive_members,
-            sections: s.sections,
-            symbols: s.symbols,
-            identity: s.identity,
-            references: s.references,
-            errors: s.errors,
-        }
-    }
-}
-
-/// Serde for a shared row slice: written as a sequence straight from the
-/// borrowed rows, read back into a fresh `Arc`.
-mod shared_rows {
-    use serde::{Deserialize, Deserializer, Serializer};
-    use std::sync::Arc;
-
-    pub(super) fn serialize<S: Serializer>(
-        rows: &Arc<[stng::ExtractedString]>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(rows.iter())
-    }
-
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Arc<[stng::ExtractedString]>, D::Error> {
-        Vec::<stng::ExtractedString>::deserialize(deserializer).map(Arc::from)
-    }
 }
 
 impl<'a> ParsedFile<'a> {
@@ -584,7 +479,10 @@ impl<'a> ParsedFile<'a> {
                 let cache = self.tree_cache()?;
                 // A panic leaves flow unavailable rather than taking the
                 // caller down; the other views are unaffected.
-                guarded(|| formats::source::build_value_flow(cache, self.symbols())).ok()
+                guarded("source-flow", || {
+                    formats::source::build_value_flow(cache, self.symbols())
+                })
+                .ok()
             })
             .as_ref()
     }
@@ -629,8 +527,8 @@ impl<'a> ParsedFile<'a> {
     /// unchanged, so a later run may succeed; a caller caching analysis
     /// output keyed by content **must not persist a payload while this is
     /// `true`**, or the degraded result would be served to every future
-    /// run. Pair with [`crate::cache::Computed::Transient`] and
-    /// [`OpenOptions::rizin_fingerprint`]. Always `false` when rizin is not
+    /// run. Key such a cache with [`OpenOptions::rizin_fingerprint`].
+    /// Always `false` when rizin is not
     /// installed, turned off with [`OpenOptions::rizin`], or skipped the
     /// input under [`OpenOptions::rizin_max_bytes`]: those results are
     /// correct for that environment and those settings, and keyed as such.
@@ -659,18 +557,6 @@ impl<'a> ParsedFile<'a> {
             .is_some_and(formats::source::TreeSitterDiagnostic::is_transient)
     }
 
-    /// Iterate every symbol name across the declaration kinds
-    /// (`Import`, `Export`, `Function`) for cross-cutting matchers
-    /// that ask "any declared name of this value regardless of role."
-    pub fn symbol_iter(&self) -> impl Iterator<Item = &str> {
-        self.symbols().iter().filter_map(|s| match s {
-            Symbol::Import { name, .. }
-            | Symbol::Export { name, .. }
-            | Symbol::Function { name, .. } => Some(name.as_str()),
-            _ => None,
-        })
-    }
-
     /// Borrow the shared tree-sitter parse, if this file is a source
     /// language and parsing succeeded.
     fn tree_cache(&self) -> Option<&formats::source::TreeCache<'a>> {
@@ -684,7 +570,7 @@ impl<'a> ParsedFile<'a> {
                 if !formats::source::supports(self.fileid.file_type()) {
                     return None;
                 }
-                let parsed = guarded(|| {
+                let parsed = guarded(Stage::SourceParse.as_str(), || {
                     formats::source::TreeCache::parse(
                         self.bytes,
                         self.fileid.file_type(),
@@ -721,7 +607,11 @@ impl<'a> ParsedFile<'a> {
             return None;
         }
         self.cfml_parse
-            .get_or_init(|| Some(guarded(|| formats::cfml::parse(self.bytes))))
+            .get_or_init(|| {
+                Some(guarded(Stage::SourceParse.as_str(), || {
+                    formats::cfml::parse(self.bytes)
+                }))
+            })
             .as_ref()
     }
 
@@ -749,23 +639,19 @@ impl<'a> ParsedFile<'a> {
                 self.fileid.extension_mismatch_transition(),
                 self.basename.as_deref(),
             );
-            let snapshot: Option<ExtractedSnapshot> =
-                cache::open_with_cache(self.bytes, &variant, |_| {
-                    let extracted = self.run_pipeline();
-                    let transient = rizin_incomplete(&extracted.metrics)
-                        || self
-                            .tree_parse()
-                            .and_then(formats::source::TreeParse::diagnostic)
-                            .is_some_and(formats::source::TreeSitterDiagnostic::is_transient);
-                    let snapshot = ExtractedSnapshot::from(extracted);
-                    if transient {
-                        Some(cache::Computed::Transient(snapshot))
-                    } else {
-                        Some(cache::Computed::Cacheable(snapshot))
-                    }
-                });
-            // `None` only when the closure declines, which it never does.
-            snapshot.map_or_else(|| self.run_pipeline(), Extracted::from)
+            cache::open_with_cache(self.cache_dir.as_deref(), self.bytes, &variant, || {
+                let extracted = self.run_pipeline();
+                let transient = rizin_incomplete(&extracted.metrics)
+                    || self
+                        .tree_parse()
+                        .and_then(formats::source::TreeParse::diagnostic)
+                        .is_some_and(formats::source::TreeSitterDiagnostic::is_transient);
+                if transient {
+                    cache::Computed::Transient(extracted)
+                } else {
+                    cache::Computed::Cacheable(extracted)
+                }
+            })
         })
     }
 
@@ -807,18 +693,20 @@ impl<'a> ParsedFile<'a> {
 #[derive(Debug)]
 struct PanicMessage(String);
 
-/// Run parse work that sits outside the extraction pipeline's own
-/// `catch_unwind` (the source parse, the CFML parse, the flow graph), turning
-/// a panic into its message. Without this, one malformed file takes down the
-/// whole host process.
-fn guarded<T>(work: impl FnOnce() -> T) -> Result<T, PanicMessage> {
-    match formats::goblin_safe::catch_infallible(work) {
-        formats::goblin_safe::GoblinOutcome::Ok(value) => Ok(value),
-        formats::goblin_safe::GoblinOutcome::Panicked(message) => Err(PanicMessage(message)),
-        // `catch_infallible` runs no goblin call, so it never reports one
-        // failing; carry the text rather than assert that.
-        formats::goblin_safe::GoblinOutcome::Failed(error) => Err(PanicMessage(error.to_string())),
-    }
+/// Run `work`, turning a panic into its message instead of unwinding into the
+/// host. Every stage of the pipeline runs under one of these, through
+/// [`panic_guard`], so the expected panic is not also printed by the panic
+/// hook. A caught panic is a filefacts bug worth seeing, so it is
+/// logged with the stage it cost: a [`Stage`] tag, or `source-flow` for the
+/// value-flow graph, which is built after the views and so has no entry in
+/// [`Errors`].
+fn guarded<T>(stage: &'static str, work: impl FnOnce() -> T) -> Result<T, PanicMessage> {
+    let message = match panic_guard::catch_infallible(work) {
+        Ok(value) => return Ok(value),
+        Err(message) => message,
+    };
+    tracing::warn!(stage, %message, "caught panic; stage facts lost");
+    Err(PanicMessage(message))
 }
 
 /// Whether a rizin run that should have recovered symbols did not complete.
@@ -831,8 +719,8 @@ fn rizin_incomplete(metrics: &Metrics) -> bool {
 }
 
 /// Everything besides the bytes and the build that a cached extraction
-/// depends on (see [`ParsedFile::extracted`]); [`cache::cache_key`] folds in
-/// the rest.
+/// depends on (see [`ParsedFile::extracted`]); the cache key folds in the
+/// rest.
 fn extraction_cache_variant(
     rizin: &rizin::Settings,
     namespace: Option<&str>,
@@ -845,10 +733,9 @@ fn extraction_cache_variant(
     // extraction output as `consistency.extension_content_mismatch.*`, so it
     // belongs in the key: identical bytes named `x.woff2` and `x.wav` detect
     // as the same type but produce different metrics, and must not share an
-    // entry. Without this, whichever name was scanned first won and every
-    // later identical-byte file inherited its verdict — a shell script named
-    // `.woff2` reported `script_as_unknown` (missing the masquerade) or a
-    // `.wav` reported `script_as_font` (inventing one), purely by scan order.
+    // entry, or whichever name was scanned first would decide the verdict
+    // for every later identical-byte file, missing a masquerade or inventing
+    // one purely by scan order.
     //
     // The *group* is folded in rather than the raw extension, so the key
     // space stays small: every unrecognised suffix collapses to one bucket,
@@ -929,10 +816,10 @@ fn run_extraction(
     // "this file is not in the format I expect" failure. Any
     // recoverable mid-extraction issues (goblin lazy-walker panics,
     // truncated sub-tables, permissive-mode fallbacks) are recorded
-    // through the typed `Errors` view instead — we want consumers to
-    // get everything we did manage to extract even when some sub-
-    // stage failed, since cleave depends on the partial data.
-    let extract_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    // through the typed `Errors` view instead: a consumer gets everything
+    // that was extracted even when some sub-stage failed.
+    let stage = stage_for(file_type);
+    let extract_result = guarded(stage.as_str(), || {
         formats::extract(
             file_type,
             bytes,
@@ -951,22 +838,26 @@ fn run_extraction(
                 rizin,
             },
         )
-    }));
+    });
     match extract_result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             // The format extractor bailed entirely. Surface that as a
-            // `malformed` entry so cleave can see *why* the
+            // `malformed` entry so a consumer can see *why* the
             // format-specific view is sparse.
-            errors.record_malformed(stage_for(file_type), error::display_chain(&e));
+            tracing::debug!(
+                stage = stage.as_str(),
+                error = %error::display_chain(&e),
+                "format extraction failed"
+            );
+            errors.record_malformed(stage, error::display_chain(&e));
         }
-        Err(payload) => {
-            let stage = stage_for(file_type);
+        Err(panic) => {
             if stage == Stage::SourceExtract {
                 metrics.insert(metric!("source.extract_panicked"), 1.0);
                 metrics.insert(metric!("source.ast_unavailable"), 1.0);
             }
-            errors.record_panic(stage, panic_payload_message(payload));
+            errors.record_panic(stage, panic.0);
         }
     }
     // Tree-sitter source extraction also pushes Call/Member/Bind/
@@ -974,20 +865,20 @@ fn run_extraction(
     // keeps `parse_count` at 1 regardless of which views the caller
     // reads.
     if let Some(cache) = tree_cache {
-        let walk_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let walk_result = guarded(Stage::SourceAstWalk.as_str(), || {
             formats::source::build_symbols(cache, &mut symbols, &mut metrics);
-        }));
-        if let Err(payload) = walk_result {
+        });
+        if let Err(panic) = walk_result {
             metrics.insert(metric!("source.ast_walk_panicked"), 1.0);
             metrics.insert(metric!("source.ast_unavailable"), 1.0);
-            errors.record_panic(Stage::SourceAstWalk, panic_payload_message(payload));
+            errors.record_panic(Stage::SourceAstWalk, panic.0);
         }
     }
     let sections = Sections::from_iter(sections);
     // The derivations below read the input bytes and every extractor's
     // output, so they get the same panic containment as the extractors: a
     // panic costs that derivation's facts, never the host process.
-    let derived_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let derived_result = guarded(Stage::FormatExtract.as_str(), || {
         // Aggregate metrics derived from sections — mirrors the
         // `sections.*` path convention.
         if !sections.is_empty() {
@@ -1001,9 +892,9 @@ fn run_extraction(
         // Per-kind counts for ergonomic rule filtering. Derived from the
         // unified `symbols` view.
         derived_metrics::emit_symbol_kind_counts(&symbols, &mut metrics);
-    }));
-    if let Err(payload) = derived_result {
-        errors.record_panic(Stage::FormatExtract, panic_payload_message(payload));
+    });
+    if let Err(panic) = derived_result {
+        errors.record_panic(Stage::FormatExtract, panic.0);
     }
 
     // Fold the per-format structural values into the normalized,
@@ -1011,22 +902,24 @@ fn run_extraction(
     // every extractor wrote (signature fields, manifest claims,
     // document properties). Never fails — absent inputs yield an empty
     // identity.
-    let identity =
-        std::panic::catch_unwind(|| formats::identity::derive(file_type, bytes, &values))
-            .unwrap_or_else(|payload| {
-                errors.record_panic(Stage::FormatExtract, panic_payload_message(payload));
-                Identity::default()
-            });
+    let identity = guarded(Stage::FormatExtract.as_str(), || {
+        identity::derive(file_type, bytes, &values)
+    })
+    .unwrap_or_else(|panic| {
+        errors.record_panic(Stage::FormatExtract, panic.0);
+        Identity::default()
+    });
 
     // External references this file points at (declared packages, install
     // hooks, staged URLs), normalized to PURL/URL. Reads the same `values`
     // the format extractors wrote; never fetches.
-    let references =
-        std::panic::catch_unwind(|| formats::references::derive(file_type, bytes, &values))
-            .unwrap_or_else(|payload| {
-                errors.record_panic(Stage::FormatExtract, panic_payload_message(payload));
-                Vec::new()
-            });
+    let references = guarded(Stage::FormatExtract.as_str(), || {
+        formats::references::derive(file_type, bytes, &values)
+    })
+    .unwrap_or_else(|panic| {
+        errors.record_panic(Stage::FormatExtract, panic.0);
+        Vec::new()
+    });
 
     if !errors.is_empty() {
         metrics.insert(metric!("parse.error_count"), errors.len() as f64);
@@ -1078,16 +971,6 @@ fn stage_for(file_type: FileType) -> Stage {
     }
 }
 
-fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    match payload.downcast::<String>() {
-        Ok(message) => *message,
-        Err(payload) => match payload.downcast::<&'static str>() {
-            Ok(message) => (*message).to_string(),
-            Err(_) => String::new(),
-        },
-    }
-}
-
 impl<'a> ParsedFile<'a> {
     fn new(bytes: &'a [u8], fileid: FileId, basename: Option<String>) -> Self {
         Self {
@@ -1099,6 +982,7 @@ impl<'a> ParsedFile<'a> {
             cfml_parse: OnceLock::new(),
             cancellation: None,
             cache: false,
+            cache_dir: None,
             cache_namespace: None,
             rizin: rizin::Settings::default(),
             extracted: OnceLock::new(),
@@ -1158,6 +1042,7 @@ pub struct OpenOptions<'a> {
     identification: Identification,
     cancellation: Option<&'a AtomicBool>,
     cache: bool,
+    cache_dir: Option<Arc<Path>>,
     cache_namespace: Option<Arc<str>>,
     rizin: rizin::Settings,
 }
@@ -1174,8 +1059,8 @@ impl<'a> OpenOptions<'a> {
     /// * identification from the bytes alone (until [`path`](Self::path)
     ///   is given);
     /// * no cancellation flag;
-    /// * the disk cache off, unless the `FILEFACTS_CACHE` environment
-    ///   variable turns it on (see [`cache::env_override`]);
+    /// * the disk cache off, and the per-user cache directory as its root
+    ///   once [`cache`](Self::cache) turns it on;
     /// * rizin on when it is installed, with a
     ///   [`rizin::DEFAULT_RIZIN_TIMEOUT_SECS`] budget per run, no size cap,
     ///   and every slice of a fat Mach-O analysed.
@@ -1184,7 +1069,8 @@ impl<'a> OpenOptions<'a> {
             path: None,
             identification: Identification::Detect,
             cancellation: None,
-            cache: cache::env_override().unwrap_or(false),
+            cache: false,
+            cache_dir: None,
             cache_namespace: None,
             rizin: rizin::Settings::default(),
         }
@@ -1256,15 +1142,24 @@ impl<'a> OpenOptions<'a> {
 
     /// Read and write the disk cache in [`cache`].
     ///
-    /// When on, the first view access reads a matching entry from the user
-    /// cache directory, or writes one after computing the views; a later open
-    /// of the same bytes, under the same settings, skips the extraction (and
-    /// its rizin run). The key covers the bytes, the filefacts build, the
+    /// When on, the first view access reads a matching entry from the cache
+    /// directory, or writes one after computing the views; a later open of
+    /// the same bytes, under the same settings, skips the extraction (and its
+    /// rizin run). The key covers the bytes, the filefacts build, the
     /// detected type, the basename and
-    /// [`rizin_fingerprint`](Self::rizin_fingerprint). Outranks
-    /// `FILEFACTS_CACHE`.
+    /// [`rizin_fingerprint`](Self::rizin_fingerprint). Off by default.
     pub fn cache(mut self, enabled: bool) -> Self {
         self.cache = enabled;
+        self
+    }
+
+    /// Keep the disk cache under `dir` instead of the per-user cache
+    /// directory. Created if missing; it must be an absolute path that no
+    /// other user can change, or the cache is skipped for these opens (its
+    /// entries are served as results and its sweep deletes by path). Does not
+    /// turn the cache on; see [`cache`](Self::cache).
+    pub fn cache_dir(mut self, dir: &Path) -> Self {
+        self.cache_dir = Some(Arc::from(dir));
         self
     }
 
@@ -1356,6 +1251,7 @@ impl<'a> OpenOptions<'a> {
         let mut parsed = ParsedFile::new(bytes, fileid, self.path.as_deref().and_then(basename_of));
         parsed.cancellation = self.cancellation;
         parsed.cache = self.cache;
+        parsed.cache_dir.clone_from(&self.cache_dir);
         parsed.cache_namespace.clone_from(&self.cache_namespace);
         parsed.rizin = self.rizin;
         parsed

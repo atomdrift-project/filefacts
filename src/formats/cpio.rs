@@ -6,12 +6,12 @@
 
 use serde_json::Value as JsonValue;
 
-use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_value};
+use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, member_value};
+use super::bounded::MAX_ARCHIVE_MEMBERS;
 use crate::error::Error;
-use crate::output::{ArchiveMember, ArchiveOffsets, ArchiveOwnership, Metrics, Values};
+use crate::output::{ArchiveMember, ArchiveOffsets, ArchiveOwnership, EntryType, Metrics, Values};
 use crate::value_key;
 
-const MAX_ENTRIES: usize = 65_536;
 const MAX_NAME_BYTES: usize = 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 16 * 1024 * 1024;
 
@@ -86,7 +86,13 @@ pub(super) fn extract(
 ) -> Result<(), Error> {
     values.insert_key(value_key!("cpio.complete"), serde_json::json!(false));
     let first = members.len();
-    let result = index(bytes, values, members, MAX_ENTRIES, MAX_METADATA_BYTES);
+    let result = index(
+        bytes,
+        values,
+        members,
+        MAX_ARCHIVE_MEMBERS,
+        MAX_METADATA_BYTES,
+    );
     if result.is_ok() {
         values.insert_key(value_key!("cpio.complete"), serde_json::json!(true));
     }
@@ -96,17 +102,16 @@ pub(super) fn extract(
     let mut stats = ArchiveStats::new(AGGS);
     for member in indexed {
         let mut reading = Reading::of(member);
-        reading.file = member.entry_type.as_deref() == Some("regular");
+        reading.file = member.entry_type == EntryType::Regular;
         reading.exec_mode = member
             .ownership
-            .as_ref()
-            .and_then(|o| o.mode_octal)
+            .mode_octal
             .is_some_and(|mode| mode & 0o111 != 0);
         stats.observe(member, &reading);
     }
     let list = indexed
         .iter()
-        .map(|m| JsonValue::Object(member_value(m, Shape::FULL)))
+        .map(|m| JsonValue::Object(member_value(m)))
         .collect();
     values.insert_key(value_key!("archive.members"), JsonValue::Array(list));
     stats.emit(values, metrics);
@@ -226,17 +231,17 @@ fn index(
             return Err(invalid("member count exceeds limit"));
         }
         let kind = match header.mode & 0o170000 {
-            0o100000 => "regular",
-            0o040000 => "directory",
-            0o120000 => "symlink",
-            0o020000 => "character",
-            0o060000 => "block",
-            0o010000 => "fifo",
-            0o140000 => "socket",
-            _ => "unknown",
+            0o100000 => EntryType::Regular,
+            0o040000 => EntryType::Directory,
+            0o120000 => EntryType::Symlink,
+            0o020000 => EntryType::CharDevice,
+            0o060000 => EntryType::BlockDevice,
+            0o010000 => EntryType::Fifo,
+            0o140000 => EntryType::Socket,
+            _ => EntryType::Other,
         };
         // Small link bodies are metadata; large ones stay bounded byte extents.
-        let linkname = if kind == "symlink" && size <= 4096 {
+        let linkname = if kind == EntryType::Symlink && size <= 4096 {
             metadata_bytes += size;
             if metadata_bytes > max_metadata {
                 return Err(invalid("metadata budget exceeded by link targets"));
@@ -246,27 +251,25 @@ fn index(
             None
         };
         members.push(ArchiveMember {
-            path: String::from_utf8_lossy(name).into_owned(),
-            size_bytes: header.file_size,
-            entry_type: Some(kind.into()),
             mtime_unix: i64::try_from(header.mtime).ok(),
             linkname,
-            host_os: None,
-            crc32: None,
-            encrypted: false,
-            compression: None,
-            ownership: Some(ArchiveOwnership {
+            ownership: ArchiveOwnership {
                 mode_octal: u32::try_from(header.mode).ok(),
                 uid: Some(header.uid),
                 gid: Some(header.gid),
                 uname: None,
                 gname: None,
-            }),
+            },
             offsets: ArchiveOffsets {
                 header: Some(offset as u64),
                 data: Some(data_offset as u64),
                 central_header: None,
             },
+            ..ArchiveMember::new(
+                String::from_utf8_lossy(name).into_owned(),
+                header.file_size,
+                kind,
+            )
         });
         // A missing alignment byte must not hide a fully present file body.
         // Retain its valid extent before reporting the incomplete stream.

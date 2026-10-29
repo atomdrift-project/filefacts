@@ -21,38 +21,37 @@
 //!    time safety is not enough by itself.
 //! 3. **Strict→permissive fallback** — `PE::parse_with_opts(...,
 //!    Permissive)` recovers more imports/exports on packed binaries
-//!    that strict mode rejects. Cleave learned this on vxug malware
-//!    samples.
+//!    that strict mode rejects.
 //!
 //! ## When to use what
 //!
 //! | Operation                                              | Helper                |
 //! |--------------------------------------------------------|------------------------|
-//! | `PE::parse(...)` / `parse_with_opts(...)`              | [`parse_pe`]           |
+//! | `PE::parse(...)` / `parse_with_opts(...)`              | [`prepare_pe`] then [`parse_pe`] |
 //! | `pe::header::Header::parse(...)`                       | [`parse_pe_header`]    |
 //! | `Elf::parse(...)`                                      | [`parse_elf`]          |
 //! | `Mach::parse(...)`                                     | [`parse_mach`]         |
 //! | `MachO::parse(...)` on one fat-binary slice            | [`parse_macho_slice`]  |
 //! | A `Result<T, goblin::error::Error>` you call later     | [`catch`]              |
-//! | A non-`Result` lazy access (e.g. `resource_data.count()`) | [`catch_infallible`] |
+//! | A non-`Result` lazy access (e.g. `resource_data.count()`) | [`crate::panic_guard::catch_infallible`] |
 //! | A lazy iterator (notes, debug entries, symbol versions) | [`drain`] / [`drain_or_record`] |
 //!
 //! `parse_pe` already does the strict→permissive fallback internally;
 //! callers should not reach for `PE::parse_with_opts` directly.
+
+use std::borrow::Cow;
 
 use goblin::elf::Elf;
 use goblin::error::Error as GoblinError;
 use goblin::mach::{Mach, MachO};
 use goblin::pe::PE;
 use goblin::pe::header::Header as PeHeader;
-use std::cell::Cell;
 use std::fmt;
-use std::panic;
-use std::sync::Once;
 
 use crate::Stage;
 use crate::formats::common::bytes_at::{u16_le, u32_le};
 use crate::formats::common::read_uleb128;
+use crate::formats::pe::layout::{self, EXPORT_DIRECTORY, IMPORT_DIRECTORY, RESOURCE_DIRECTORY};
 use crate::output::Errors;
 
 /// Outcome of a goblin operation, distinguishing a normal `Err` from
@@ -182,168 +181,198 @@ impl fmt::Display for Rejection {
     }
 }
 
-pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&'static str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "<non-string panic payload>".to_string()
-    }
-}
-
-// Every guard in this module, and the per-stage guards in `lib.rs`, turn a
-// parser panic into a recorded error by unwinding. Under `panic = "abort"`
-// `catch_unwind` catches nothing and one malformed file kills the host
-// process, so refuse to build that way rather than silently lose the
-// guarantee.
-#[cfg(panic = "abort")]
-compile_error!(
-    "filefacts requires `panic = \"unwind\"`: hostile inputs make its parsers panic, and \
-     those panics are caught with `catch_unwind` and reported as errors. With \
-     `panic = \"abort\"` a single malformed file would abort the whole process."
-);
-
-thread_local! {
-    static SUPPRESS_PANIC_OUTPUT: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Install a process-wide panic hook (once) that swallows panic
-/// messages from threads that opted into suppression. Replaces the
-/// older `take_hook` / `set_hook` swap pattern (which required a
-/// global Mutex to serialize swaps) with a single, race-free install.
-///
-/// This is deliberately process-global — a panic hook cannot be anything
-/// else — but it is installed at most once and only filters: it chains to
-/// whatever hook was installed before it (the host's, or std's default), and
-/// silences a panic only while the panicking thread is inside one of this
-/// module's guards. Panics anywhere else reach the previous hook untouched.
-/// A host that installs its own hook *after* filefacts' first parse replaces
-/// this one, which costs only the suppression of expected parser panics.
-fn install_suppression_hook() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let previous = panic::take_hook();
-        panic::set_hook(Box::new(move |info| {
-            if SUPPRESS_PANIC_OUTPUT.with(Cell::get) {
-                return;
-            }
-            previous(info);
-        }));
-    });
-}
-
-fn run_with_suppressed_panic_hook<T, F>(f: F) -> std::thread::Result<T>
-where
-    F: FnOnce() -> T,
-{
-    install_suppression_hook();
-
-    /// Puts back the flag as the guard found it, so a guard nested inside
-    /// another leaves the outer one still suppressing when it returns.
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            SUPPRESS_PANIC_OUTPUT.with(|flag| flag.set(self.0));
-        }
-    }
-
-    let _restore = Restore(SUPPRESS_PANIC_OUTPUT.with(|flag| flag.replace(true)));
-    panic::catch_unwind(panic::AssertUnwindSafe(f))
-}
-
 /// Catch panics around a fallible goblin call.
 pub(crate) fn catch<T, F>(f: F) -> GoblinOutcome<T>
 where
     F: FnOnce() -> Result<T, GoblinError>,
 {
-    match run_with_suppressed_panic_hook(f) {
+    match crate::panic_guard::catch_infallible(f) {
         Ok(Ok(value)) => GoblinOutcome::Ok(value),
         Ok(Err(e)) => GoblinOutcome::Failed(e),
-        Err(payload) => GoblinOutcome::Panicked(panic_message(&*payload)),
+        Err(message) => GoblinOutcome::Panicked(message),
     }
 }
 
-/// Catch panics around an infallible (lazy-walk) goblin call.
-pub(crate) fn catch_infallible<T, F>(f: F) -> GoblinOutcome<T>
-where
-    F: FnOnce() -> T,
-{
-    match run_with_suppressed_panic_hook(f) {
-        Ok(value) => GoblinOutcome::Ok(value),
-        Err(payload) => GoblinOutcome::Panicked(panic_message(&*payload)),
-    }
-}
-
-/// What [`parse_pe`] produced: the parse itself, plus whether its import
-/// table had to be abandoned to keep the parse bounded.
-pub(crate) struct PeParse<'a> {
-    pub(crate) outcome: GoblinOutcome<PE<'a>>,
+/// A PE's bytes made safe to hand to goblin, and what had to be given up for
+/// that. Built by [`prepare_pe`]; parse it with [`parse_pe`].
+pub(crate) struct PreparedPe<'a> {
+    /// The input, or one copy of it with the structures goblin cannot
+    /// survive cleared. File offsets are unchanged, so the copy reads
+    /// alongside the original bytes.
+    pub(crate) bytes: Cow<'a, [u8]>,
+    /// The header failed the pre-validation, so goblin must not see it.
+    rejected: Option<Rejection>,
     /// `Some(reason)` when the import directory could not be walked within
-    /// budget, so the returned PE was parsed with imports disabled. Callers
-    /// should surface it: an unwalkable import table is a fact about the
-    /// sample, not an internal detail.
+    /// budget, so the PE is parsed with imports disabled. Callers should
+    /// surface it: an unwalkable import table is a fact about the sample,
+    /// not an internal detail.
     pub(crate) imports_skipped: Option<Rejection>,
+    /// `Some(reason)` when the export directory's names exceed the budget,
+    /// so its slot is cleared in `bytes` and goblin parses no exports.
+    pub(crate) exports_skipped: Option<Rejection>,
 }
 
-impl<'a> PeParse<'a> {
-    /// The ordinary outcome: whatever goblin produced, imports included.
-    fn parsed(outcome: GoblinOutcome<PE<'a>>) -> Self {
-        Self {
-            outcome,
-            imports_skipped: None,
+/// Check a PE's headers before goblin sees them, and neutralize what goblin
+/// cannot survive, on at most one copy of `data`:
+///
+/// - a header [`validate_pe_header`] rejects is never parsed;
+/// - a Rich header that goblin would reject as fatal has its `Rich` magic
+///   cleared;
+/// - an export table whose names would cost goblin a quadratic walk has its
+///   data-directory slot cleared, since goblin cannot be told to skip
+///   exports;
+/// - an import table past budget is noted, and parsed with imports off.
+///
+/// The headers and section table are parsed once, for both budgets. Every
+/// copy-free path stays copy-free.
+pub(crate) fn prepare_pe(data: &[u8]) -> PreparedPe<'_> {
+    let mut prepared = PreparedPe {
+        bytes: Cow::Borrowed(data),
+        rejected: validate_pe_header(data).err(),
+        imports_skipped: None,
+        exports_skipped: None,
+    };
+    if let Some(reason) = prepared.rejected {
+        tracing::debug!(
+            target: "filefacts::goblin_safe",
+            format = "pe",
+            stage = "validate",
+            len = data.len(),
+            reason = %reason,
+            "PE header rejected before parsing"
+        );
+        return prepared;
+    }
+    // goblin 0.10 parses the Rich header inside both `PE::parse` and the
+    // header-only `Header::parse`, and a `Rich` marker with no XOR-decodable
+    // `DanS` table behind it aborts the *entire* parse, strict and permissive
+    // alike, leaving every section- and import-scoped fact blind. Packed and
+    // mangled binaries carry forged Rich stubs routinely. Zeroing the 4-byte
+    // magic makes goblin's marker scan find nothing and treat the header as
+    // absent; the Rich-header extractor still reads the untouched bytes, so a
+    // genuine Rich hash is unaffected.
+    if let Some(rich) = crate::formats::pe::rich::locate(data)
+        && rich.dans_pos.is_none()
+        && let Some(end) = rich
+            .rich_pos
+            .checked_add(4)
+            .filter(|&end| end <= data.len())
+    {
+        tracing::debug!(
+            target: "filefacts::goblin_safe",
+            format = "pe",
+            stage = "rich-header",
+            offset = rich.rich_pos,
+            "Rich marker with no decodable table cleared for goblin"
+        );
+        if let Some(magic) = prepared.bytes.to_mut().get_mut(rich.rich_pos..end) {
+            magic.fill(0);
         }
     }
+    let Some((header, sections)) = header_and_sections(&prepared.bytes) else {
+        return prepared;
+    };
+    prepared.imports_skipped =
+        import_walk_budget(&prepared.bytes, &sections, &header.optional).err();
+    if let Err(reason) = export_walk_budget(&prepared.bytes, &sections, &header.optional)
+        && let Some(slot) = layout::data_directory_offset(
+            header.pe_pointer,
+            header.optional.standard_fields.magic,
+            EXPORT_DIRECTORY,
+        )
+        && let Some(end) = slot.checked_add(8).filter(|&end| end <= data.len())
+        && let Some(entry) = prepared.bytes.to_mut().get_mut(slot..end)
+    {
+        entry.fill(0);
+        prepared.exports_skipped = Some(reason);
+    }
+    for (stage, reason) in [
+        ("imports", prepared.imports_skipped),
+        ("exports", prepared.exports_skipped),
+    ] {
+        if let Some(reason) = reason {
+            tracing::debug!(
+                target: "filefacts::goblin_safe",
+                format = "pe",
+                stage,
+                reason = %reason,
+                "directory past budget; kept from goblin"
+            );
+        }
+    }
+    prepared
 }
 
-/// Parse a PE file, panic-safe and with built-in permissive
-/// fallback.
-///
-/// The import directory is budgeted first (see [`import_walk_budget`]); an
-/// over-budget one is dropped and everything else parsed. Otherwise strict
-/// mode is tried; if it fails OR panics, the call is retried with
-/// `ParseMode::Permissive`. Returns the strict failure only when the
-/// permissive retry itself panicked (in which case the strict error is the
-/// more actionable signal).
-pub(crate) fn parse_pe(data: &[u8]) -> PeParse<'_> {
-    if let Err(e) = validate_pe_header(data) {
-        return PeParse::parsed(GoblinOutcome::Failed(GoblinError::Malformed(e.to_string())));
-    }
+/// The parts of a PE header the budgets need, owned so the bytes they were
+/// read from can still be patched.
+struct PeLayout {
+    pe_pointer: usize,
+    optional: goblin::pe::optional_header::OptionalHeader,
+}
 
+/// The headers and section table, read the way `PE::parse` reads them.
+/// `None` when they do not parse: the full parse then fails on the same bytes
+/// before it reaches imports or exports, so the budgets fail open.
+fn header_and_sections(
+    data: &[u8],
+) -> Option<(PeLayout, Vec<goblin::pe::section_table::SectionTable>)> {
+    let GoblinOutcome::Ok(header) = parse_pe_header(data) else {
+        return None;
+    };
+    let optional = header.optional_header?;
+    let pe_pointer = header.dos_header.pe_pointer as usize;
+    let mut offset = layout::optional_header_offset(pe_pointer)?
+        .saturating_add(usize::from(header.coff_header.size_of_optional_header));
+    let GoblinOutcome::Ok(sections) = catch(|| header.coff_header.sections(data, &mut offset))
+    else {
+        return None;
+    };
+    Some((
+        PeLayout {
+            pe_pointer,
+            optional,
+        },
+        sections,
+    ))
+}
+
+/// Parse a prepared PE, panic-safe and with built-in permissive fallback.
+///
+/// Strict mode is tried first; if it fails OR panics, the call is retried
+/// with `ParseMode::Permissive`. Returns the strict failure only when the
+/// permissive retry itself panicked (in which case the strict error is the
+/// more actionable signal). An import table past budget is parsed with
+/// imports off: a few hundred well-formed descriptors that all share one
+/// long table of ordinal entries make even strict goblin synthesize
+/// descriptors x entries imports, billions from a megabyte, so the budget
+/// runs before any full parse.
+pub(crate) fn parse_pe<'a>(prepared: &'a PreparedPe<'_>) -> GoblinOutcome<PE<'a>> {
+    if let Some(reason) = prepared.rejected {
+        return GoblinOutcome::Failed(GoblinError::Malformed(reason.to_string()));
+    }
+    let data: &'a [u8] = &prepared.bytes;
     let base_opts = goblin::pe::options::ParseOptions::default()
         .with_parse_mode(goblin::options::ParseMode::Permissive);
-
-    // Budget the import walk before any full parse. Strict mode is not safe
-    // from it either: a few hundred well-formed descriptors that all share one
-    // long table of ordinal entries make goblin synthesize descriptors x
-    // entries imports, each with its own `format!("ORDINAL n")`, which is
-    // billions from a megabyte. Only the headers and section table are needed
-    // to resolve the directory the way goblin will, and those are cheap.
-    if let Err(reason) = import_walk_budget_from_headers(data) {
+    if prepared.imports_skipped.is_some() {
         // A forged import directory. Keep every other fact (headers, sections,
         // exports, resources, Authenticode) rather than failing the whole PE:
-        // an unwalkable import table is itself a signal, not a reason to go
-        // blind on the sample. With imports off the parse is bounded.
+        // with imports off the parse is bounded.
         let importless_opts = base_opts.with_parse_imports(false);
-        return PeParse {
-            outcome: catch(|| PE::parse_with_opts(data, &importless_opts)),
-            imports_skipped: Some(reason),
-        };
+        return catch(|| PE::parse_with_opts(data, &importless_opts));
     }
 
     let strict = catch(|| PE::parse(data));
     if matches!(strict, GoblinOutcome::Ok(_)) {
-        return PeParse::parsed(strict);
+        return strict;
     }
 
     let permissive = catch(|| PE::parse_with_opts(data, &base_opts));
-
-    PeParse::parsed(match (&strict, &permissive) {
+    match (&strict, &permissive) {
         // Strict failed cleanly; permissive panicked — prefer the
         // clean failure message.
         (GoblinOutcome::Failed(_), GoblinOutcome::Panicked(_)) => strict,
         _ => permissive,
-    })
+    }
 }
 
 /// Import-directory descriptors a real PE ever declares. Linkers emit one per
@@ -385,12 +414,11 @@ fn name_len(data: &[u8], offset: usize, budget: usize) -> Option<usize> {
 /// malformed entry is *skipped* rather than fatal, so a forged directory
 /// pointing into dense non-zero bytes yields `file_len / 20` descriptors, each
 /// re-walking a lookup table of up to `file_len / entry_size` entries. That
-/// product is quadratic in the file size and, measured on a wedged production
-/// worker 2026-09-04, does not finish: one Rayon thread spent hours inside
-/// `ImportData::parse_with_opts` while every other worker in the shared pool
-/// parked on a join latch behind it, taking the whole process down. Strict
-/// mode is exposed too: well-formed descriptors may all share one long lookup
-/// table, and goblin materialises an `Import` per descriptor per entry.
+/// product is quadratic in the file size and does not finish in practice: a
+/// worker thread stuck inside `ImportData::parse_with_opts` parks every other
+/// worker in a shared pool behind it. Strict mode is exposed too: well-formed
+/// descriptors may all share one long lookup table, and goblin materialises
+/// an `Import` per descriptor per entry.
 ///
 /// goblin offers no cap of its own (`ParseOptions::parse_imports` is
 /// all-or-nothing), so this walks the same structure first, using goblin's own
@@ -401,7 +429,7 @@ fn name_len(data: &[u8], offset: usize, budget: usize) -> Option<usize> {
 /// hint/name strings they point at, before giving its answer.
 ///
 /// Fails open: anything it cannot resolve counts as within budget, so a PE
-/// shape this pre-walk does not model keeps exactly today's behaviour.
+/// shape this pre-walk does not model is parsed as goblin parses it.
 fn import_walk_budget(
     data: &[u8],
     sections: &[goblin::pe::section_table::SectionTable],
@@ -489,27 +517,6 @@ fn import_walk_budget(
     Ok(())
 }
 
-/// [`import_walk_budget`] over the headers and section table alone, read the
-/// way `PE::parse` reads them. Fails open when those do not parse: the full
-/// parse will then fail on the same bytes before it reaches the imports.
-fn import_walk_budget_from_headers(data: &[u8]) -> Result<(), Rejection> {
-    use goblin::pe::header::{SIZEOF_COFF_HEADER, SIZEOF_PE_MAGIC};
-    let GoblinOutcome::Ok(header) = parse_pe_header(data) else {
-        return Ok(());
-    };
-    let Some(optional_header) = header.optional_header else {
-        return Ok(());
-    };
-    let mut offset = (header.dos_header.pe_pointer as usize)
-        .saturating_add(SIZEOF_PE_MAGIC + SIZEOF_COFF_HEADER)
-        .saturating_add(usize::from(header.coff_header.size_of_optional_header));
-    let GoblinOutcome::Ok(sections) = catch(|| header.coff_header.sections(data, &mut offset))
-    else {
-        return Ok(());
-    };
-    import_walk_budget(data, &sections, &optional_header)
-}
-
 /// Decide whether goblin's export walk over `data` reads a bounded number of
 /// name bytes.
 ///
@@ -594,70 +601,6 @@ fn export_walk_budget(
     Ok(())
 }
 
-/// A copy of `data` with the export data directory cleared, when goblin's
-/// export walk would exceed [`export_walk_budget`]; `None` otherwise, so the
-/// common path never copies. Clearing the slot is the only way to keep goblin
-/// off the table while it parses everything else: the caller then reports the
-/// rejection, and keeps reading the untouched bytes for everything goblin
-/// does not parse.
-pub(crate) fn neutralize_oversized_export_directory(data: &[u8]) -> Option<(Vec<u8>, Rejection)> {
-    use goblin::pe::header::{SIZEOF_COFF_HEADER, SIZEOF_PE_MAGIC};
-    let GoblinOutcome::Ok(header) = parse_pe_header(data) else {
-        return None;
-    };
-    let optional_header = header.optional_header?;
-    let optional_offset = (header.dos_header.pe_pointer as usize)
-        .saturating_add(SIZEOF_PE_MAGIC + SIZEOF_COFF_HEADER);
-    let mut offset =
-        optional_offset.saturating_add(usize::from(header.coff_header.size_of_optional_header));
-    let GoblinOutcome::Ok(sections) = catch(|| header.coff_header.sections(data, &mut offset))
-    else {
-        return None;
-    };
-    let reason = export_walk_budget(data, &sections, &optional_header).err()?;
-    // The data-directory array opens the optional header's tail; the export
-    // directory is its first slot.
-    let slot = optional_offset.saturating_add(
-        if optional_header.standard_fields.magic == goblin::pe::optional_header::MAGIC_64 {
-            112
-        } else {
-            96
-        },
-    );
-    let mut patched = data.to_vec();
-    patched.get_mut(slot..slot.saturating_add(8))?.fill(0);
-    Some((patched, reason))
-}
-
-/// Detect a Rich header that goblin's parser would treat as a fatal
-/// `Malformed` error — the `Rich` marker is present in the DOS stub but
-/// no XOR-decodable `DanS` table precedes it — and return an owned copy
-/// of `data` with the marker neutralized so the rest of the PE still
-/// parses. Returns `None` when no Rich marker is present or the header is
-/// well-formed, so the common path never copies.
-///
-/// goblin 0.10 parses the Rich header inside both `PE::parse` and the
-/// header-only `Header::parse`, and a corrupt stub aborts the *entire*
-/// parse (strict and permissive alike) — leaving every section- and
-/// import-scoped fact blind. Packed and intentionally-mangled samples
-/// emit forged Rich stubs routinely. Zeroing the 4-byte `Rich` magic
-/// makes goblin's marker scan find nothing and treat the header as
-/// absent (`Ok(None)`); filefacts' own `pe_rich` extractor still reads
-/// the untouched bytes, so a genuine Rich hash is unaffected.
-pub(crate) fn neutralize_malformed_rich_header(data: &[u8]) -> Option<Vec<u8>> {
-    let rich = super::pe_rich::locate(data)?;
-    // A decodable DanS marker means the header is well-formed and goblin
-    // will parse it without complaint.
-    if rich.dans_pos.is_some() {
-        return None;
-    }
-    // No DanS table reachable — goblin would abort. Hand back a copy with
-    // the `Rich` magic cleared so its marker scan finds nothing.
-    let mut patched = data.to_vec();
-    patched.get_mut(rich.rich_pos..rich.rich_pos + 4)?.fill(0);
-    Some(patched)
-}
-
 /// Basic structural validation of PE headers, run *before* goblin
 /// sees the bytes. Defends against known panic / OOM triggers:
 ///
@@ -698,45 +641,30 @@ fn validate_pe_header(data: &[u8]) -> Result<(), Rejection> {
         return Err(Rejection::TooManySections(n_sections));
     }
 
-    let opt_offset = coff_offset + 20;
-    if opt_offset + 2 > data.len() {
-        return Ok(());
-    }
-
-    let Some(magic) = u16_le(data, opt_offset) else {
+    let Some(magic) = u16_le(data, coff_offset + 20) else {
         return Ok(());
     };
-    let (data_dir_count_offset, data_dir_offset) = match magic {
-        0x010b => (92, 96),   // PE32
-        0x020b => (108, 112), // PE32+
-        _ => return Ok(()),
-    };
-
-    let dir_count_ptr = opt_offset + data_dir_count_offset;
-    if dir_count_ptr + 4 > data.len() {
-        return Ok(());
-    }
-
-    let Some(n_dirs) = u32_le(data, dir_count_ptr) else {
+    let Some(n_dirs) =
+        layout::directory_count_offset(pe_offset, magic).and_then(|at| u32_le(data, at))
+    else {
         return Ok(());
     };
-
     if n_dirs > 16 {
         return Err(Rejection::TooManyDataDirectories(n_dirs));
     }
 
-    // Check the Imports (idx 1) and Resources (idx 2) data
-    // directories specifically — they're the two whose forged
-    // `size` field most reliably blows up goblin.
-    for i in 1..=2 {
-        if n_dirs as usize > i {
-            let dir_ptr = opt_offset + data_dir_offset + (i * 8);
-            if let Some(size) = u32_le(data, dir_ptr + 4)
-                && (size > 10 * 1024 * 1024 || size as usize > data.len())
-            {
-                let table = if i == 1 { "import" } else { "resource" };
-                return Err(Rejection::OversizedDirectory { table, size });
-            }
+    // The import and resource directories are the two whose forged `size`
+    // field most reliably blows up goblin.
+    for (index, table) in [
+        (IMPORT_DIRECTORY, "import"),
+        (RESOURCE_DIRECTORY, "resource"),
+    ] {
+        if n_dirs as usize > index
+            && let Some(size) = layout::data_directory_offset(pe_offset, magic, index)
+                .and_then(|at| u32_le(data, at.checked_add(4)?))
+            && (size > 10 * 1024 * 1024 || size as usize > data.len())
+        {
+            return Err(Rejection::OversizedDirectory { table, size });
         }
     }
 
@@ -759,8 +687,8 @@ pub(crate) fn parse_elf(data: &[u8]) -> GoblinOutcome<Elf<'_>> {
 /// arches) read file-controlled offsets only as they advance, long after the
 /// parse that produced them returned, so each walk needs its own guard.
 /// Callers get a finished `Vec`, never a live goblin iterator.
-pub(crate) fn drain<I: IntoIterator>(walk: I) -> GoblinOutcome<Vec<I::Item>> {
-    catch_infallible(|| walk.into_iter().collect())
+pub(crate) fn drain<I: IntoIterator>(walk: I) -> Result<Vec<I::Item>, String> {
+    crate::panic_guard::catch_infallible(|| walk.into_iter().collect())
 }
 
 /// [`drain`] for callers that surface failures: a walk that panics is
@@ -770,15 +698,29 @@ pub(crate) fn drain_or_record<I: IntoIterator>(
     errors: &mut Errors,
     stage: Stage,
 ) -> Vec<I::Item> {
-    match drain(walk) {
-        GoblinOutcome::Ok(items) => items,
-        GoblinOutcome::Panicked(msg) => {
-            errors.record_panic(stage, msg);
-            Vec::new()
-        }
-        // A drain cannot fail; goblin's per-item errors are items themselves.
-        GoblinOutcome::Failed(_) => Vec::new(),
-    }
+    drain(walk).unwrap_or_else(|msg| {
+        tracing::debug!(
+            target: "filefacts::goblin_safe",
+            stage = ?stage,
+            error = %msg,
+            "lazy goblin walk panicked; its items are dropped"
+        );
+        errors.record_panic(stage, msg);
+        Vec::new()
+    })
+}
+
+/// An ELF whose section header table runs past the end of the file, with
+/// that table detached so goblin can parse the segment view.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DetachedElf {
+    /// The file with `e_shoff`, `e_shnum` and `e_shstrndx` zeroed. Every
+    /// other byte, and so every file offset, is unchanged.
+    pub(crate) bytes: Vec<u8>,
+    /// The header's own `e_shoff`, before it was zeroed.
+    pub(crate) shoff: u64,
+    /// The header's own `e_shstrndx`, before it was zeroed.
+    pub(crate) shstrndx: u64,
 }
 
 /// A copy of `data` with the section header table detached, when that table
@@ -792,7 +734,7 @@ pub(crate) fn drain_or_record<I: IntoIterator>(
 /// parse the segment view; every file offset is unchanged, so the result can
 /// be read alongside the original bytes. `None` when the table is in bounds
 /// (the failure lies elsewhere) or the header itself is truncated.
-pub(crate) fn elf_without_truncated_section_headers(data: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn elf_without_truncated_section_headers(data: &[u8]) -> Option<DetachedElf> {
     let is64 = match data.get(4)? {
         1 => false,
         2 => true,
@@ -829,8 +771,13 @@ pub(crate) fn elf_without_truncated_section_headers(data: &[u8]) -> Option<Vec<u
     patched.get_mut(shnum_at..shnum_at + 2)?.fill(0);
     // `e_shstrndx` sits past every field read above, so a header cut off
     // inside it gets here; that is the "header itself is truncated" case.
+    let shstrndx = read(shstrndx_at, 2)?;
     patched.get_mut(shstrndx_at..shstrndx_at + 2)?.fill(0);
-    Some(patched)
+    Some(DetachedElf {
+        bytes: patched,
+        shoff,
+        shstrndx,
+    })
 }
 
 /// Parse a Mach-O (single arch or fat), panic-safe.
@@ -1037,18 +984,6 @@ fn goblin_ordinal(value: u64) -> u8 {
 struct BindTables {
     libs: usize,
     segments: usize,
-}
-
-/// Add the imports one bind-opcode stream at `start..end` would produce to
-/// `imports`, stopping as soon as the total passes the budget. Unbounded
-/// tables: only the count matters.
-#[cfg(test)]
-fn count_bind_imports(bytes: &[u8], start: usize, end: usize, imports: u64) -> u64 {
-    let unbounded = BindTables {
-        libs: usize::MAX,
-        segments: usize::MAX,
-    };
-    walk_bind_stream(bytes, start, end, imports, unbounded).unwrap_or(imports)
 }
 
 /// Replay one bind-opcode stream at `start..end` as goblin's interpreter

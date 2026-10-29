@@ -1,119 +1,43 @@
-//! Bounded source-local process-spawn cycles, independent of label spelling.
+//! Bounded source-local process-spawn cycles, independent of label
+//! spelling, read over the shared line model ([`super::batch_lines`]).
+use super::batch_lines::{BODY_BUDGET, Lines, Unmodelled, comment};
 use crate::{Metrics, metric};
-use std::collections::{HashMap, HashSet};
 
 pub(super) fn emit(source: &str, metrics: &mut Metrics) {
-    let count = cycles(source);
+    let (count, limited) = cycles(source);
     metrics.insert(
         metric!("source.batch.unconditional_start_cycles"),
         count as f64,
     );
+    if limited {
+        metrics.insert(metric!("source.batch.cycle_analysis_limited"), 1.0);
+    }
 }
 
-fn bare(s: &str) -> &str {
-    s.trim().trim_start_matches('@').trim_start()
-}
-fn comment(s: &str) -> bool {
-    s.starts_with("::")
-        || s.eq_ignore_ascii_case("rem")
-        || s.get(..4).is_some_and(|h| h.eq_ignore_ascii_case("rem "))
-}
-fn cycles(source: &str) -> usize {
-    if source.len() > 512 * 1024 {
-        return 0;
-    }
-    let lines: Vec<_> = source.lines().map(bare).collect();
-    if lines.len() > 10_000 {
-        return 0;
-    }
-    let mut labels = HashMap::new();
-    for (i, line) in lines.iter().enumerate() {
-        if comment(line) {
-            continue;
+/// The number of loops whose body only starts programs, without waiting,
+/// and whether a cap cut the count short.
+fn cycles(source: &str) -> (usize, bool) {
+    let lines = match Lines::new(source) {
+        Ok(lines) => lines,
+        Err(why) => {
+            tracing::debug!(
+                target: "filefacts::source",
+                format = "batch",
+                len = source.len(),
+                reason = ?why,
+                "batch cycles: file not modelled"
+            );
+            return (0, why == Unmodelled::TooLarge);
         }
-        if let Some(name) = line.strip_prefix(':') {
-            let name = name.trim().to_ascii_lowercase();
-            if name.is_empty() || name.contains(char::is_whitespace) {
-                continue;
-            }
-            if labels.insert(name, i).is_some() {
-                return 0;
-            }
-        }
-    }
-    // Follow only entry control flow that can be established statically.
-    // Ambiguous branches, command transfers and compound syntax stop proof.
-    let mut reachable = HashSet::new();
-    let mut pc = 0;
-    while let Some(line) = lines.get(pc).copied() {
-        if !reachable.insert(pc) {
-            break;
-        }
-        if line.is_empty() || comment(line) || line.starts_with(':') {
-            pc += 1;
-            continue;
-        }
-        if line.chars().any(|c| "&|()^<>".contains(c)) {
-            break;
-        }
-        let (head, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-        if head.eq_ignore_ascii_case("goto") {
-            if rest.trim().eq_ignore_ascii_case(":eof") {
-                break;
-            }
-            let target = rest.trim().trim_start_matches(':').to_ascii_lowercase();
-            let Some(&target_pc) = labels.get(&target) else {
-                break;
-            };
-            pc = target_pc;
-            continue;
-        }
-        if [
-            "exit",
-            "if",
-            "for",
-            "call",
-            "cmd",
-            "cmd.exe",
-            "command",
-            "command.com",
-        ]
-        .iter()
-        .any(|name| head.eq_ignore_ascii_case(name))
-            || head
-                .trim_matches('"')
-                .to_ascii_lowercase()
-                .ends_with(".bat")
-            || head
-                .trim_matches('"')
-                .to_ascii_lowercase()
-                .ends_with(".cmd")
-        {
-            break;
-        }
-        pc += 1;
-    }
+    };
     let mut count = 0;
-    let mut budget = 20_000usize;
-    for (end, line) in lines.iter().enumerate() {
-        let Some((head, target)) = line.split_once(char::is_whitespace) else {
-            continue;
-        };
-        if !head.eq_ignore_ascii_case("goto") {
-            continue;
-        }
-        let target = target.trim().trim_start_matches(':').to_ascii_lowercase();
-        let Some(&start) = labels.get(&target) else {
-            continue;
-        };
-        if start >= end || !reachable.contains(&start) || !reachable.contains(&end) {
-            continue;
-        }
-        let Some(body) = lines.get(start + 1..end) else {
+    let mut budget = BODY_BUDGET;
+    for (start, end) in lines.loops() {
+        let Some(body) = lines.lines.get(start + 1..end) else {
             continue;
         };
         if body.len() > budget {
-            break;
+            return (count, true);
         }
         budget -= body.len();
         let mut launches = 0;
@@ -142,38 +66,8 @@ fn cycles(source: &str) -> usize {
             count += 1;
         }
     }
-    count
+    (count, false)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn binds_arbitrary_labels_and_excludes_forward_and_wait() {
-        assert_eq!(
-            cycles(":unusual_42\nstart cmd.exe\nstart notepad.exe\ngoto unusual_42\n"),
-            1
-        );
-        assert_eq!(cycles(":again\nstart\ngoto :again\n"), 1);
-        assert_eq!(
-            cycles("goto start\n:start\nstart node.exe\ngoto done\n:done\n"),
-            0
-        );
-        assert_eq!(cycles(":a\nstart /wait tool.exe\ngoto a\n"), 0);
-        assert_eq!(cycles(":a\nstart tool.exe\ntimeout /t 5\ngoto a\n"), 0);
-        assert_eq!(
-            cycles(":a\nstart tool.exe\nif errorlevel 1 exit /b\ngoto a\n"),
-            0
-        );
-        assert_eq!(cycles(":a\nstart tool.exe\ngoto b\n:b\n"), 0);
-        assert_eq!(cycles(":a\nstart tool.exe & exit\ngoto a\n"), 0);
-        assert_eq!(cycles("exit /b\n:a\nstart tool.exe\ngoto a\n"), 0);
-        assert_eq!(cycles("goto done\n:a\nstart tool.exe\ngoto a\n:done\n"), 0);
-        assert_eq!(cycles(":a\nstart %OPTIONS% tool.exe\ngoto a\n"), 0);
-        assert_eq!(
-            cycles("if exist flag goto a\n:a\nstart tool.exe\ngoto a\n"),
-            0
-        );
-        assert_eq!(cycles("goto :eof\n:eof\nstart tool.exe\ngoto eof\n"), 0);
-    }
-}
+mod tests;

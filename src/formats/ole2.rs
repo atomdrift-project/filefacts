@@ -17,15 +17,19 @@
 //!   `VBA`-named storage), `"encryption"` (`EncryptionInfo` /
 //!   `EncryptedPackage` streams), `"ole_objects"`
 //!   (`\1Ole10Native` streams).
-//! - `office.macro_count`, `office.stream_count` — metrics.
-//! - `office.sheet_count`, `office.xlm_sheet_count`,
-//!   `office.hidden_sheet_count` — BIFF worksheet inventory.
-//!
-//! Metadata / property-set parsing is deferred to a follow-up slice;
-//! the SummaryInformation stream uses a documented but non-trivial
-//! property-set encoding (FMTID GUIDs + property IDs from MS-OSHARED).
-//! For Phase 2's first slice, we surface the structural inventory
-//! that supply-chain detection traits care about most.
+//! - `office.{title, creator, created, …}` — the SummaryInformation and
+//!   DocumentSummaryInformation property sets, under the same keys the
+//!   OOXML extractor uses.
+//! - `office.compobj.{user_type, clipboard_format, prog_id}` — the
+//!   `\1CompObj` class identity.
+//! - `office.dangerous_clsids[]`, `office.msg.attachments[]`,
+//!   `office.names[]`, `office.sheet_names[]` — storage CLSIDs with a
+//!   documented exploit history, Outlook attachments, and the BIFF
+//!   defined names and worksheet names.
+//! - `office.limits[]` — coverage the caps cut short: stream reads and the
+//!   entry listing.
+//! - `office.macro_count`, `office.stream_count`, `office.sheet_count`,
+//!   `office.xlm_sheet_count`, `office.hidden_sheet_count` — metrics.
 
 use crate::metric;
 use std::collections::BTreeMap;
@@ -35,6 +39,7 @@ use serde_json::Value as JsonValue;
 
 use crate::bytes::{self, Reader};
 use crate::error::Error;
+use crate::formats::bounded::{Limits, inflate_capped};
 use crate::formats::common::put_str;
 use crate::output::{Errors, Metrics, Stage, ValueKey, Values};
 use crate::value_key;
@@ -50,6 +55,16 @@ const MAX_STREAMS: usize = 4096;
 /// reads.
 const MAX_PROPERTIES_PER_SECTION: usize = 256;
 const MAX_NAMES: usize = 256;
+
+/// Read cap for the property-set and CompObj streams. Their fields sit in
+/// the first few kilobytes; a thumbnail property is the largest thing they
+/// carry.
+const MAX_PROPERTY_STREAM_BYTES: u64 = 1 << 20;
+
+/// Read cap for the BIFF workbook stream. The sheet table and defined names
+/// live in the globals substream at its start; the cap bounds what a forged
+/// stream length can make the walk hold.
+const MAX_WORKBOOK_BYTES: u64 = 32 << 20;
 
 pub(super) fn extract(
     bytes: &[u8],
@@ -74,9 +89,20 @@ pub(super) fn extract(
     let mut had_encrypted_summary = false;
     let mut had_object_pool = false;
     let mut dangerous_clsids: Vec<JsonValue> = Vec::new();
+    let mut limits = Limits::default();
 
     for entry in comp.walk() {
         if streams.len() >= MAX_STREAMS {
+            tracing::debug!(
+                target: "filefacts::ole2",
+                stage = "stream-list",
+                cap = MAX_STREAMS,
+                "entry walk stopped at the cap"
+            );
+            limits.push(
+                "stream-list-cap",
+                format!("entries past the first {MAX_STREAMS} not listed"),
+            );
             break;
         }
         let path = super::common::cfb_entry_path(&entry);
@@ -158,7 +184,13 @@ pub(super) fn extract(
         }
     }
 
-    let summary_data = read_stream_data(&mut comp, "\x05SummaryInformation", errors);
+    let summary_data = read_stream_data(
+        &mut comp,
+        "\x05SummaryInformation",
+        MAX_PROPERTY_STREAM_BYTES,
+        &mut limits,
+        errors,
+    );
     let summary_security_encrypted = summary_data
         .as_deref()
         .is_some_and(summary_document_security_encrypted);
@@ -174,9 +206,14 @@ pub(super) fn extract(
     // so a workbook still declaring one is worth reporting on its own.
     let workbook = ["Workbook", "Book"]
         .iter()
-        .find_map(|name| read_stream_data(&mut comp, name, errors))
+        .find_map(|name| read_stream_data(&mut comp, name, MAX_WORKBOOK_BYTES, &mut limits, errors))
         .unwrap_or_default();
     let workbook = if biff_encrypted(&workbook) {
+        tracing::debug!(
+            target: "filefacts::ole2",
+            stage = "workbook",
+            "FILEPASS present: record payloads are ciphertext, sheet table not read"
+        );
         Vec::new()
     } else {
         workbook
@@ -283,7 +320,13 @@ pub(super) fn extract(
     // DocumentSummaryInformation extends the summary set with
     // manager / company / security_flag / hyperlink_base — fields
     // OOXML carries in `docProps/app.xml`.
-    if let Some(data) = read_stream_data(&mut comp, "\x05DocumentSummaryInformation", errors) {
+    if let Some(data) = read_stream_data(
+        &mut comp,
+        "\x05DocumentSummaryInformation",
+        MAX_PROPERTY_STREAM_BYTES,
+        &mut limits,
+        errors,
+    ) {
         for (k, v) in parse_document_summary_information(&data) {
             props.entry(k).or_insert(v);
         }
@@ -297,8 +340,14 @@ pub(super) fn extract(
     // (`Excel.Sheet.8`, `Word.Document.8`, `PowerPoint.Show.8`, …) —
     // a `.doc` file whose CompObj declares Excel is the canonical
     // CVE-2017-0199 extension-mismatch shape.
-    if let Some(co) =
-        read_stream_data(&mut comp, "\x01CompObj", errors).and_then(|data| parse_compobj(&data))
+    if let Some(co) = read_stream_data(
+        &mut comp,
+        "\x01CompObj",
+        MAX_PROPERTY_STREAM_BYTES,
+        &mut limits,
+        errors,
+    )
+    .and_then(|data| parse_compobj(&data))
     {
         let mut obj = serde_json::Map::new();
         if !co.user_type.is_empty() {
@@ -311,19 +360,13 @@ pub(super) fn extract(
             );
         }
         if !co.prog_id.is_empty() {
-            // Naming note: cleave-side called this
-            // `app_version`, but MS-OLEDS calls it the
-            // ProgID. We surface both — `prog_id` is the
-            // forward-looking name (matches the spec);
-            // `app_version` stays for trait-rule continuity.
-            obj.insert("prog_id".into(), JsonValue::String(co.prog_id.clone()));
-            obj.insert("app_version".into(), JsonValue::String(co.prog_id));
+            obj.insert("prog_id".into(), JsonValue::String(co.prog_id));
         }
         if !obj.is_empty() {
             values.insert_key(value_key!("office.compobj"), JsonValue::Object(obj));
         }
     }
-
+    limits.emit(values, value_key!("office.limits"));
     Ok(())
 }
 
@@ -375,10 +418,8 @@ fn parse_summary_information(data: &[u8]) -> BTreeMap<ValueKey, JsonValue> {
 }
 
 /// Parse the `\x05DocumentSummaryInformation` property set into the
-/// subset of fields that overlap with the OOXML `office.*` shape.
-/// The full DSI also carries
-/// custom user-defined properties in a second section; we skip those
-/// for now — trait rules that care will get their own slice.
+/// subset of fields that overlap with the OOXML `office.*` shape. Its
+/// second section, the user-defined custom properties, is not read.
 fn parse_document_summary_information(data: &[u8]) -> BTreeMap<ValueKey, JsonValue> {
     let mut out = BTreeMap::new();
     let Some(section) = locate_first_section(data) else {
@@ -443,16 +484,8 @@ const BUILTIN_NAMES: [&str; 14] = [
     "filter_database",
 ];
 
-/// Read the `BOUNDSHEET` records from a BIFF workbook stream.
-///
-/// Excel 4.0 macro sheets are the payload surface of the XLM maldoc wave:
-/// they hold formulas, not VBA, so a workbook carrying one has no
-/// `_VBA_PROJECT` stream and looks macro-free to anything that only counts
-/// those. The sheet type lives here and nowhere else.
-///
-/// Walks the record stream properly rather than scanning for the record id —
-/// a `0x0085` byte pair occurs constantly inside cell data, and scanning
-/// finds sheets in files that have none.
+/// The `DEFINEDNAME` records of a BIFF workbook stream, lowercased.
+/// Built-in names come back by their spelled-out name (`auto_open`).
 fn defined_names(data: &[u8]) -> Vec<String> {
     const DEFINEDNAME: u16 = 0x0018;
     const BUILTIN: u16 = 0x0020;
@@ -556,6 +589,15 @@ fn biff_records(data: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
     })
 }
 
+/// Read the `BOUNDSHEET` records from a BIFF workbook stream.
+///
+/// Excel 4.0 macro sheets hold formulas, not VBA, so a workbook carrying one
+/// has no `_VBA_PROJECT` stream and looks macro-free to anything that only
+/// counts those. The sheet type lives here and nowhere else.
+///
+/// Walks the record stream properly rather than scanning for the record id —
+/// a `0x0085` byte pair occurs constantly inside cell data, and scanning
+/// finds sheets in files that have none.
 fn boundsheets(data: &[u8]) -> Vec<BoundSheet> {
     const BOUNDSHEET: u16 = 0x0085;
     let biff8 = biff_version(data) >= 0x0600;
@@ -771,21 +813,43 @@ fn attachment_extension(filename: &str) -> Option<String> {
     usable.then(|| ext.to_lowercase())
 }
 
-/// Read a whole stream. An absent stream is `None` and normal; one that is
-/// listed but cannot be read (a broken sector chain) is also recorded, since
-/// whatever is built from it would otherwise just be missing.
+/// Read a stream up to `cap` bytes. An absent stream is `None` and normal;
+/// one that is listed but cannot be read (a broken sector chain) is
+/// recorded, since whatever is built from it would otherwise just be
+/// missing. A stream past the cap yields its prefix and an `office.limits`
+/// entry.
 fn read_stream_data<T: Read + std::io::Seek>(
     comp: &mut cfb::CompoundFile<T>,
     path: &str,
+    cap: u64,
+    limits: &mut Limits,
     errors: &mut Errors,
 ) -> Option<Vec<u8>> {
-    let mut stream = comp.open_stream(path).ok()?;
-    let mut data = Vec::new();
-    if let Err(e) = stream.read_to_end(&mut data) {
-        record_unreadable_stream(errors, path, &e);
-        return None;
+    let stream = comp.open_stream(path).ok()?;
+    let len = stream.len();
+    let prefix = match inflate_capped(stream, cap) {
+        Ok(prefix) => prefix,
+        Err(e) => {
+            record_unreadable_stream(errors, path, &e);
+            return None;
+        }
+    };
+    if prefix.truncated {
+        let name = path.trim_start_matches(['\x01', '\x05']);
+        tracing::debug!(
+            target: "filefacts::ole2",
+            stage = "stream-read",
+            stream = name,
+            len,
+            cap,
+            "stream read stopped at the cap"
+        );
+        limits.push(
+            "stream-cap",
+            format!("stream {name:?} ({len} bytes) read only to its first {cap} bytes"),
+        );
     }
-    Some(data)
+    Some(prefix.bytes)
 }
 
 fn record_unreadable_stream(errors: &mut Errors, path: &str, e: &std::io::Error) {
@@ -798,22 +862,18 @@ fn record_unreadable_stream(errors: &mut Errors, path: &str, e: &std::io::Error)
     );
 }
 
+/// Whether PIDSI_DOC_SECURITY (0x13) has its password-protected bit set.
 fn summary_document_security_encrypted(data: &[u8]) -> bool {
     let Some(section) = locate_first_section(data) else {
         return false;
     };
-    let Some(value) = property_i32_by_pid(section, 0x13) else {
+    let Some((_, val_off)) = property_entries(section).find(|&(pid, _)| pid == 0x13) else {
         return false;
     };
-    value & 1 == 1
-}
-
-fn property_i32_by_pid(section: &[u8], wanted_pid: u32) -> Option<i32> {
-    let (_, val_off) = property_entries(section).find(|&(pid, _)| pid == wanted_pid)?;
     let Some(JsonValue::Number(value)) = read_property_i32(section, val_off) else {
-        return None;
+        return false;
     };
-    value.as_i64().and_then(|v| i32::try_from(v).ok())
+    value.as_i64().is_some_and(|v| v & 1 == 1)
 }
 
 /// The `(PID, value offset)` pairs of a property-set section, which follow
@@ -959,35 +1019,24 @@ fn read_filetime(body: &[u8]) -> Option<JsonValue> {
 }
 
 /// Format a Unix timestamp as ISO-8601 in UTC without pulling in a
-/// date crate. The math is the textbook proleptic-Gregorian
-/// algorithm — Howard Hinnant's `civil_from_days` formula.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    reason = "civil_from_days: every intermediate is bounded by the day count of a u64 second value"
-)]
+/// date crate: Howard Hinnant's `civil_from_days`, in its unsigned form
+/// since the input never precedes 1970.
 fn format_iso8601_utc(unix: u64) -> String {
-    let seconds_per_day: u64 = 86_400;
-    let days = (unix / seconds_per_day) as i64;
-    let secs = unix % seconds_per_day;
-    let hour = (secs / 3600) as u32;
-    let minute = ((secs % 3600) / 60) as u32;
-    let second = (secs % 60) as u32;
-    // Convert days-since-1970 to civil date.
+    let (days, secs) = (unix / 86_400, unix % 86_400);
     let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
+    let era = z / 146_097;
+    let doe = z % 146_097;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = (yoe as i64) + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let year = y + if month <= 2 { 1 } else { 0 };
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = era * 400 + yoe + u64::from(month <= 2);
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        year, month, day, hour, minute, second
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        secs / 3600,
+        secs % 3600 / 60,
+        secs % 60
     )
 }
 
@@ -996,7 +1045,6 @@ fn format_iso8601_utc(unix: u64) -> String {
 struct CompObjData {
     user_type: String,
     clipboard_format: String,
-    /// Emitted as both `prog_id` and the legacy `app_version` key.
     prog_id: String,
 }
 
@@ -1076,12 +1124,10 @@ fn sanitize_ansi(bytes: &[u8]) -> String {
         .to_string()
 }
 
-/// Curated allowlist of OLE CLSIDs that are documented exploitation
-/// vectors. Returns a short human-readable label when the CLSID is
-/// known, `None` otherwise. The list mirrors cleave's `office/ole2.rs`
-/// `lookup_dangerous_clsid` allowlist verbatim so traits that match
-/// on `office.dangerous_clsids[*].name` get the same string regardless
-/// of which side did the detection.
+/// Curated list of OLE CLSIDs that are documented exploitation vectors.
+/// Returns a short human-readable label when the CLSID is known, `None`
+/// otherwise. The labels are part of the output contract: rules match
+/// `office.dangerous_clsids[*].name` against them.
 fn lookup_dangerous_clsid(clsid: &str) -> Option<&'static str> {
     match clsid {
         "00021700-0000-0000-c000-000000000046"

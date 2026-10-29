@@ -1,21 +1,5 @@
 use super::*;
-use std::io::{Cursor, Write};
-use zip::CompressionMethod;
-use zip::write::SimpleFileOptions;
-
-fn build_whl(entries: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    {
-        let mut zip = ::zip::ZipWriter::new(Cursor::new(&mut buf));
-        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-        for (name, body) in entries {
-            zip.start_file(*name, opts).unwrap();
-            zip.write_all(body).unwrap();
-        }
-        zip.finish().unwrap();
-    }
-    buf
-}
+use crate::formats::testutil::stored_zip;
 
 fn run(bytes: &[u8]) -> (Values, Metrics) {
     let (v, m, e) = run_with_errors(bytes);
@@ -27,7 +11,7 @@ fn run_with_errors(bytes: &[u8]) -> (Values, Metrics, Errors) {
     let mut v = Values::new();
     let mut m = Metrics::new();
     let mut e = Errors::new();
-    if let Ok(mut zip) = crate::formats::zip::open_archive(bytes) {
+    if let Some(mut zip) = crate::formats::testutil::open_zip(bytes) {
         extract_from_archive(&mut zip, &mut v, &mut m, &mut e);
     }
     (v, m, e)
@@ -35,7 +19,7 @@ fn run_with_errors(bytes: &[u8]) -> (Values, Metrics, Errors) {
 
 #[test]
 fn metadata_that_is_not_utf8_records_one_error() {
-    let whl = build_whl(&[
+    let whl = stored_zip(&[
         ("mypkg/__init__.py", b""),
         (
             "mypkg-1.0.0.dist-info/METADATA",
@@ -55,7 +39,7 @@ fn metadata_that_is_not_utf8_records_one_error() {
         "{}",
         err.message
     );
-    assert!(v.get("whl.author").is_none());
+    assert!(v.get("whl.authors").is_none());
     // The central-directory facts are unaffected.
     assert_eq!(
         v.get("whl.has_metadata").and_then(|x| x.as_bool()),
@@ -67,7 +51,7 @@ fn metadata_that_is_not_utf8_records_one_error() {
 /// has none, which is an absence, not a read failure.
 #[test]
 fn metadata_absent_from_the_chosen_dist_info_records_nothing() {
-    let whl = build_whl(&[
+    let whl = stored_zip(&[
         ("a-1.0.dist-info/RECORD", b""),
         ("b-1.0.dist-info/METADATA", b"Name: b\n"),
     ]);
@@ -76,7 +60,7 @@ fn metadata_absent_from_the_chosen_dist_info_records_nothing() {
         v.get("whl.dist_info_dir").and_then(|x| x.as_str()),
         Some("a-1.0.dist-info")
     );
-    assert!(v.get("whl.author").is_none());
+    assert!(v.get("whl.authors").is_none());
 }
 
 /// Past the cap, the header block is still read, even when the cut lands
@@ -90,15 +74,18 @@ fn oversized_metadata_is_read_up_to_the_cap() {
         while meta.len() <= 256 * 1024 {
             meta.extend_from_slice("\u{e9}".as_bytes());
         }
-        let whl = build_whl(&[("mypkg-1.0.0.dist-info/METADATA", &meta)]);
+        let whl = stored_zip(&[("mypkg-1.0.0.dist-info/METADATA", &meta)]);
         let (v, _) = run(&whl);
-        assert_eq!(v.get("whl.author").and_then(|x| x.as_str()), Some("Jane"));
+        assert_eq!(
+            v.get("whl.authors[0].name").and_then(|x| x.as_str()),
+            Some("Jane")
+        );
     }
 }
 
 #[test]
 fn metadata_author_fields_are_extracted() {
-    let whl = build_whl(&[
+    let whl = stored_zip(&[
         ("mypkg/__init__.py", b""),
         (
             "mypkg-1.0.0.dist-info/METADATA",
@@ -108,26 +95,22 @@ fn metadata_author_fields_are_extracted() {
     ]);
     let (v, _) = run(&whl);
     assert_eq!(
-        v.get("whl.author").and_then(|x| x.as_str()),
-        Some("trtkajko")
-    );
-    assert_eq!(
-        v.get("whl.author_email").and_then(|x| x.as_str()),
-        Some("<mail@mail.com>")
+        v.get("whl.authors"),
+        Some(&serde_json::json!([{"name": "trtkajko", "email": "mail@mail.com"}]))
     );
     assert_eq!(
         v.get("whl.homepage").and_then(|x| x.as_str()),
         Some("https://example.test")
     );
     assert_eq!(
-        v.get("whl.summary").and_then(|x| x.as_str()),
+        v.get("whl.description").and_then(|x| x.as_str()),
         Some("A tiny package")
     );
 }
 
 #[test]
 fn pure_python_wheel_emits_purelib_shape() {
-    let whl = build_whl(&[
+    let whl = stored_zip(&[
         ("mypkg/__init__.py", b""),
         ("mypkg/core.py", b"x = 1\n"),
         ("mypkg-1.0.0.dist-info/METADATA", b"Name: mypkg\n"),
@@ -168,7 +151,7 @@ fn pure_python_wheel_emits_purelib_shape() {
 
 #[test]
 fn native_extensions_counted_across_platforms() {
-    let whl = build_whl(&[
+    let whl = stored_zip(&[
         ("mypkg/__init__.py", b""),
         ("mypkg/_native.pyd", b"MZ"),
         ("mypkg/_core.cpython-310.so", b"\x7fELF"),
@@ -200,7 +183,7 @@ fn ends_with_so_versioned_distinguishes_real_libs() {
 
 #[test]
 fn record_jws_signing_artifact_detected() {
-    let whl = build_whl(&[
+    let whl = stored_zip(&[
         ("mypkg/__init__.py", b""),
         ("mypkg-1.0.0.dist-info/METADATA", b"Name: mypkg\n"),
         ("mypkg-1.0.0.dist-info/WHEEL", b"Wheel-Version: 1.0\n"),
@@ -218,7 +201,7 @@ fn record_jws_signing_artifact_detected() {
 
 #[test]
 fn data_dir_detected() {
-    let whl = build_whl(&[
+    let whl = stored_zip(&[
         ("mypkg/__init__.py", b""),
         ("mypkg-1.0.0.data/scripts/hello", b"#!/bin/sh\necho hi\n"),
         ("mypkg-1.0.0.dist-info/METADATA", b"Name: mypkg\n"),
@@ -238,7 +221,7 @@ fn data_dir_detected() {
 
 #[test]
 fn multi_top_level_packages_listed() {
-    let whl = build_whl(&[
+    let whl = stored_zip(&[
         ("first_pkg/__init__.py", b""),
         ("second_pkg/__init__.py", b""),
         ("first_pkg/inner.py", b""),
@@ -259,7 +242,7 @@ fn multi_top_level_packages_listed() {
 fn no_dist_info_dir_short_circuits() {
     // ZIP that's structurally not a wheel — we emit nothing in the
     // `whl.*` namespace so consumers don't get phantom facts.
-    let whl = build_whl(&[("just/some/file.txt", b"hello")]);
+    let whl = stored_zip(&[("just/some/file.txt", b"hello")]);
     let (v, m) = run(&whl);
     assert!(v.get("whl.distribution").is_none());
     assert!(v.get("whl.dist_info_dir").is_none());
@@ -270,7 +253,7 @@ fn no_dist_info_dir_short_circuits() {
 fn dist_info_name_without_version_is_ignored_for_parse() {
     // Malformed dist-info dir name — no version field. We still
     // record the dir but skip the distribution/version split.
-    let whl = build_whl(&[
+    let whl = stored_zip(&[
         ("broken.dist-info/METADATA", b""),
         ("broken.dist-info/WHEEL", b""),
     ]);
@@ -289,7 +272,7 @@ fn missing_canonical_members_emits_no_has_flags() {
     // detection still triggers (dir present), but the has_* flags
     // stay off so the caller can tell a stripped wheel from a
     // valid one.
-    let whl = build_whl(&[("mypkg-1.0.dist-info/LICENSE", b"MIT\n")]);
+    let whl = stored_zip(&[("mypkg-1.0.dist-info/LICENSE", b"MIT\n")]);
     let (v, _) = run(&whl);
     assert_eq!(
         v.get("whl.dist_info_dir").and_then(|x| x.as_str()),
@@ -393,7 +376,7 @@ fn wheel_filename_rejects_empty_name_or_version() {
 /// and inner claim (`whl.distribution`) is visible to traits.
 #[test]
 fn outer_filename_facts_disagree_with_inner_dist_info() {
-    let whl = build_whl(&[
+    let whl = stored_zip(&[
         ("realpkg/__init__.py", b""),
         ("realpkg-1.0.0.dist-info/METADATA", b"Name: realpkg\n"),
         ("realpkg-1.0.0.dist-info/WHEEL", b""),

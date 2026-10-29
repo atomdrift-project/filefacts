@@ -1,8 +1,20 @@
 use super::*;
+use std::borrow::Cow;
 
 fn read_fixture(name: &str) -> Vec<u8> {
     let path = format!("tests/fixtures/{name}");
     std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"))
+}
+
+/// Add the imports one bind-opcode stream at `start..end` would produce to
+/// `imports`, stopping as soon as the total passes the budget. Unbounded
+/// tables: only the count matters.
+fn count_bind_imports(bytes: &[u8], start: usize, end: usize, imports: u64) -> u64 {
+    let unbounded = BindTables {
+        libs: usize::MAX,
+        segments: usize::MAX,
+    };
+    walk_bind_stream(bytes, start, end, imports, unbounded).unwrap_or(imports)
 }
 
 /// Offsets into `test.exe` (PE32+): the section table and the import
@@ -85,14 +97,21 @@ fn import_walk_budget_accepts_a_real_pe() {
     let bytes = read_fixture("test.exe");
     let pe = PE::parse(&bytes).expect("fixture PE");
     assert!(!pe.imports.is_empty());
-    assert!(
-        import_walk_budget_from_headers(&bytes).is_ok(),
+    let prepared = prepare_pe(&bytes);
+    assert_eq!(
+        prepared.imports_skipped, None,
         "a linker-produced import table must stay within budget"
     );
-    let parse = parse_pe(&bytes);
-    assert_eq!(parse.imports_skipped, None);
+    assert!(
+        matches!(prepared.bytes, Cow::Borrowed(_)),
+        "and costs no copy"
+    );
     assert_eq!(
-        parse.outcome.ok().expect("fixture parses").imports.len(),
+        parse_pe(&prepared)
+            .ok()
+            .expect("fixture parses")
+            .imports
+            .len(),
         pe.imports.len()
     );
 }
@@ -100,8 +119,11 @@ fn import_walk_budget_accepts_a_real_pe() {
 #[test]
 fn import_walk_budget_rejects_too_many_descriptors() {
     let bytes = pe_with_forged_import_directory(MAX_IMPORT_DESCRIPTORS + 1, false);
-    let err = import_walk_budget_from_headers(&bytes).expect_err("descriptor cap must trip");
-    assert_eq!(err, Rejection::UnterminatedImportDirectory);
+    assert_eq!(
+        prepare_pe(&bytes).imports_skipped,
+        Some(Rejection::UnterminatedImportDirectory),
+        "descriptor cap must trip"
+    );
 }
 
 /// The quadratic the bound exists for: a descriptor count a cap on
@@ -110,8 +132,11 @@ fn import_walk_budget_rejects_too_many_descriptors() {
 #[test]
 fn import_walk_budget_rejects_oversized_lookup_tables() {
     let bytes = pe_with_forged_import_directory(8, true);
-    let err = import_walk_budget_from_headers(&bytes).expect_err("entry budget must trip");
-    assert_eq!(err, Rejection::OversizedImportLookupTables);
+    assert_eq!(
+        prepare_pe(&bytes).imports_skipped,
+        Some(Rejection::OversizedImportLookupTables),
+        "entry budget must trip"
+    );
 }
 
 /// A PE whose import directory is well formed enough for *strict* mode:
@@ -154,41 +179,38 @@ fn pe_with_shared_ordinal_lookup_table(descriptors: usize, entries: usize) -> Ve
 fn parse_pe_budgets_imports_before_the_strict_parse() {
     // Within budget, the shared-table shape still reaches strict goblin.
     let small = pe_with_shared_ordinal_lookup_table(4, 8);
-    let parse = parse_pe(&small);
-    assert_eq!(parse.imports_skipped, None);
-    let pe = parse
-        .outcome
+    let prepared = prepare_pe(&small);
+    assert_eq!(prepared.imports_skipped, None);
+    let pe = parse_pe(&prepared)
         .ok()
         .expect("strict parse of the small fixture");
     assert_eq!(pe.imports.len(), 32, "4 descriptors x 8 entries");
 
     // 200 x 2000 = 400k imports from 16 KiB of table: refused up front.
     let big = pe_with_shared_ordinal_lookup_table(200, 2000);
-    let parse = parse_pe(&big);
+    let prepared = prepare_pe(&big);
     assert_eq!(
-        parse.imports_skipped,
+        prepared.imports_skipped,
         Some(Rejection::OversizedImportLookupTables)
     );
-    let pe = parse
-        .outcome
+    let pe = parse_pe(&prepared)
         .ok()
         .expect("headers and sections still parse");
     assert!(pe.imports.is_empty());
 }
 
-/// The bound has to be wired into `parse_pe`, not merely available: a
+/// The bound has to be wired into the parse, not merely available: a
 /// forged table must cost the imports and nothing else.
 #[test]
 fn parse_pe_drops_a_forged_import_table_and_keeps_the_rest() {
     let bytes = pe_with_forged_import_directory(8, true);
-    let parse = parse_pe(&bytes);
+    let prepared = prepare_pe(&bytes);
     assert_eq!(
-        parse.imports_skipped,
+        prepared.imports_skipped,
         Some(Rejection::OversizedImportLookupTables),
-        "parse_pe must report the abandoned import table"
+        "prepare_pe must report the abandoned import table"
     );
-    let pe = parse
-        .outcome
+    let pe = parse_pe(&prepared)
         .ok()
         .expect("headers and sections still parse");
     assert!(
@@ -357,20 +379,18 @@ fn pe_with_long_import_names(entries: usize, name_len: usize) -> Vec<u8> {
 #[test]
 fn import_walk_budget_rejects_oversized_names() {
     let small = pe_with_long_import_names(4, 1 << 20);
-    assert_eq!(import_walk_budget_from_headers(&small), Ok(()));
-    let parse = parse_pe(&small);
-    assert_eq!(parse.imports_skipped, None);
-    assert_eq!(parse.outcome.ok().expect("parses").imports.len(), 4);
+    let prepared = prepare_pe(&small);
+    assert_eq!(prepared.imports_skipped, None);
+    assert_eq!(parse_pe(&prepared).ok().expect("parses").imports.len(), 4);
 
     // 64 entries x 1 MiB of name: 64 MiB to scan and copy from a 1 MiB file.
     let big = pe_with_long_import_names(64, 1 << 20);
+    let prepared = prepare_pe(&big);
     assert_eq!(
-        import_walk_budget_from_headers(&big),
-        Err(Rejection::OversizedImportNames)
+        prepared.imports_skipped,
+        Some(Rejection::OversizedImportNames)
     );
-    let parse = parse_pe(&big);
-    assert_eq!(parse.imports_skipped, Some(Rejection::OversizedImportNames));
-    assert!(parse.outcome.ok().expect("parses").imports.is_empty());
+    assert!(parse_pe(&prepared).ok().expect("parses").imports.is_empty());
 }
 
 /// An export table of `pointers` name pointers. With `forwarded`, every
@@ -420,22 +440,30 @@ fn pe_with_export_table(pointers: usize, long: usize, forwarded: bool) -> Vec<u8
 fn oversized_export_names_are_kept_from_goblin() {
     for forwarded in [false, true] {
         let small = pe_with_export_table(4, 1 << 20, forwarded);
-        assert!(neutralize_oversized_export_directory(&small).is_none());
-        let pe = parse_pe(&small).outcome.ok().expect("parses");
+        let prepared = prepare_pe(&small);
+        assert!(prepared.exports_skipped.is_none());
+        let pe = parse_pe(&prepared).ok().expect("parses");
         assert_eq!(pe.exports.len(), 4);
 
         // 64 pointers x 1 MiB: 64 MiB of strings from a 1 MiB file.
         let big = pe_with_export_table(64, 1 << 20, forwarded);
-        let (patched, reason) =
-            neutralize_oversized_export_directory(&big).expect("export budget must trip");
-        assert_eq!(reason, Rejection::OversizedExportNames);
-        assert_eq!(patched.len(), big.len());
-        let pe = parse_pe(&patched).outcome.ok().expect("parses");
+        let prepared = prepare_pe(&big);
+        assert_eq!(
+            prepared.exports_skipped,
+            Some(Rejection::OversizedExportNames),
+            "export budget must trip"
+        );
+        assert_eq!(prepared.bytes.len(), big.len());
+        let pe = parse_pe(&prepared).ok().expect("parses");
         assert!(pe.exports.is_empty());
         assert!(!pe.sections.is_empty(), "everything else still parses");
     }
-    assert!(neutralize_oversized_export_directory(&read_fixture("test.exe")).is_none());
-    assert!(neutralize_oversized_export_directory(b"not a PE").is_none());
+    assert!(
+        prepare_pe(&read_fixture("test.exe"))
+            .exports_skipped
+            .is_none()
+    );
+    assert!(prepare_pe(b"not a PE").exports_skipped.is_none());
 }
 
 #[test]
@@ -470,7 +498,6 @@ fn drain_runs_a_lazy_walk_to_completion() {
             .flatten()
             .flatten(),
     )
-    .ok()
     .expect("note walk completes");
     // The fixture's single PT_NOTE carries its GNU build-id.
     assert_eq!(notes.len(), 1);
@@ -533,39 +560,9 @@ fn catch_converts_panic_to_outcome() {
 }
 
 #[test]
-fn catch_infallible_handles_clean_value() {
-    let result: GoblinOutcome<&str> = catch_infallible(|| "ok");
-    assert!(matches!(result, GoblinOutcome::Ok("ok")));
-}
-
-#[test]
-fn catch_infallible_catches_lazy_walker_panic() {
-    let result: GoblinOutcome<()> = catch_infallible(|| panic!("walker tripped"));
-    match result {
-        GoblinOutcome::Panicked(msg) => assert!(msg.contains("walker tripped")),
-        other => panic!("expected Panicked, got {other:?}"),
-    }
-}
-
-/// A guard nested inside another must hand suppression back to the outer
-/// one: resetting the flag to `false` used to let the outer closure's later
-/// panics reach the user's hook.
-#[test]
-fn nested_guards_restore_the_outer_suppression() {
-    let flag = || SUPPRESS_PANIC_OUTPUT.with(Cell::get);
-    assert!(!flag());
-    let outer = catch_infallible(|| {
-        let inner: GoblinOutcome<()> = catch_infallible(|| panic!("inner"));
-        assert!(matches!(inner, GoblinOutcome::Panicked(_)));
-        flag()
-    });
-    assert!(matches!(outer, GoblinOutcome::Ok(true)));
-    assert!(!flag(), "the outermost guard clears it again");
-}
-
-#[test]
 fn parse_pe_rejects_garbage() {
-    let result = parse_pe(b"not a PE file at all").outcome;
+    let prepared = prepare_pe(b"not a PE file at all");
+    let result = parse_pe(&prepared);
     match result {
         GoblinOutcome::Failed(_) | GoblinOutcome::Panicked(_) => {}
         other => panic!("expected failure, got {other:?}"),
@@ -576,7 +573,8 @@ fn parse_pe_rejects_garbage() {
 fn parse_pe_short_input_falls_through_to_goblin() {
     // Below the 64-byte gate, validate_pe_header returns Ok and
     // we hand the bytes straight to goblin, which fails cleanly.
-    let result = parse_pe(&[0u8; 16]).outcome;
+    let prepared = prepare_pe(&[0u8; 16]);
+    let result = parse_pe(&prepared);
     assert!(matches!(
         result,
         GoblinOutcome::Failed(_) | GoblinOutcome::Panicked(_)
@@ -917,7 +915,7 @@ pub(crate) fn macho_with_bind_tables(bind: &[u8]) -> Vec<u8> {
     file
 }
 
-/// A header cut off inside `e_shstrndx`, the last field zeroed, used to
+/// A header cut off inside `e_shstrndx`, the last field zeroed, must not
 /// panic slicing the patched copy: every field the helper reads is in
 /// bounds, but the one it then writes is not.
 #[test]
@@ -935,7 +933,9 @@ fn elf_detach_rejects_header_truncated_in_shstrndx() {
         header[shnum_at] = 5;
         header[shstrndx_at] = 3;
         // Section table at 0x10 + 5 * 0x40 ends past EOF: detach it.
-        let patched = elf_without_truncated_section_headers(&header).expect("detached");
+        let detached = elf_without_truncated_section_headers(&header).expect("detached");
+        assert_eq!((detached.shoff, detached.shstrndx), (0x10, 3));
+        let patched = detached.bytes;
         assert_eq!(
             [patched[shoff_at], patched[shnum_at], patched[shstrndx_at]],
             [0, 0, 0]

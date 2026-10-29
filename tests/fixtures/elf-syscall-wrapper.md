@@ -1,7 +1,17 @@
 # elf-syscall-wrapper-*.elf
 
 Inert x86-64 Linux executables that call `memfd_create` (319) through the libc
-`syscall()` wrapper with constant arguments. Never execute fixtures. Source:
+`syscall()` wrapper with constant arguments. Never execute fixtures. Written
+for this project (Apache-2.0); the `static` build also contains musl (MIT).
+
+| File | SHA-256 |
+|---|---|
+| `elf-syscall-wrapper-static.elf` | `d6d441565aa0b3f04129637c25e9e48f1efeee18f26c977d46de97bc8f4625de` |
+| `elf-syscall-wrapper-plt.elf` | `bce10d32904980b17300048adbd3f477f22628eaa9a63d3fb1876504931f46f7` |
+| `elf-syscall-wrapper-noplt.elf` | `97e01a86dae540ed34fd5059bfaf59de9c12bbde34f92fa479e231166708a18f` |
+| `elf-syscall-wrapper-ibt.elf` | `4dcd9e665c7528510b276bc910b09e8a5bc18b5faf42cd09a50b4b280e749653` |
+
+Source:
 
 ```c
 /* Inert fixture: issues memfd_create through the libc syscall() wrapper. */

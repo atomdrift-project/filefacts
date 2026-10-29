@@ -1,11 +1,10 @@
-//! Function metrics ported from cleave.
+//! Function metrics.
 //!
-//! Collects every function-definition node during the shared walk
-//! ([`super::visit`]) and emits `functions.*` keys describing count, size distribution, name
-//! shape, anonymous/async/generator counts, parameter shape, and
-//! nesting depth. Recursion counts stay zero — cleave's original
-//! analyzer left those for language-specific extractors that never
-//! materialised, so behaviour is preserved.
+//! Collects every node of the language's
+//! [`function_kinds`](super::langs::LangConfig::function_kinds) during the
+//! shared walk ([`super::visit`]) and emits `functions.*` keys describing
+//! count, size distribution, name shape, anonymous/async/generator counts,
+//! parameter shape, and nesting depth.
 
 use crate::metric;
 use tree_sitter::Node;
@@ -14,7 +13,6 @@ use crate::output::Metrics;
 
 use super::ast_walk::MAX_AST_DEPTH;
 use super::identifier_metrics::string_entropy;
-use super::langs::Lang;
 use super::visit::{NodeIds, Visit};
 
 /// Per-function info collected during the AST walk.
@@ -50,7 +48,9 @@ impl Collector {
         if visit.depth >= MAX_AST_DEPTH {
             self.capped = true;
         }
-        if !ids.metric_function.contains(visit.kind_id) {
+        // Named only: Python's `lambda` keyword token shares its kind name
+        // with the expression it starts.
+        if !visit.named || !ids.function.contains(visit.kind_id) {
             return;
         }
         // A function anywhere inside another, however deep, makes the
@@ -102,45 +102,6 @@ pub(super) fn emit(collector: Collector, total_lines: u32, metrics: &mut Metrics
     functions.len()
 }
 
-/// Function-defining node kinds per language. Mirrors the
-/// `function_node_types` used by cleave's UnifiedSourceAnalyzer; a language
-/// with no entry there has none here, so its files emit no `functions.*`
-/// metrics.
-pub(super) fn function_kinds_for(lang: Lang) -> &'static [&'static str] {
-    match lang {
-        Lang::Python => &["function_definition", "async_function_definition"],
-        Lang::JavaScript | Lang::TypeScript => &[
-            "function_declaration",
-            "function_expression",
-            "arrow_function",
-            "method_definition",
-            "generator_function_declaration",
-        ],
-        Lang::Go => &["function_declaration", "method_declaration"],
-        Lang::Rust => &["function_item"],
-        Lang::Java => &["method_declaration", "constructor_declaration"],
-        Lang::Bash => &["function_definition"],
-        Lang::Php => &["function_definition", "method_declaration"],
-        Lang::Ruby
-        | Lang::Lua
-        | Lang::CSharp
-        | Lang::C
-        | Lang::Cpp
-        | Lang::Scala
-        | Lang::ObjC
-        | Lang::Kotlin
-        | Lang::Swift
-        | Lang::PowerShell
-        | Lang::Perl
-        | Lang::Groovy
-        | Lang::Zig
-        | Lang::Elixir
-        | Lang::Makefile
-        | Lang::Clojure
-        | Lang::Batch => &[],
-    }
-}
-
 /// A function's info, without [`FunctionInfo::contains_nested_functions`],
 /// which the walk sets when it meets a nested function.
 fn build_info(node: Node<'_>, source: &str, depth: u32) -> FunctionInfo {
@@ -183,9 +144,9 @@ fn collect_param_names(params: Node<'_>, source: &str) -> (u32, Vec<String>) {
     let mut cursor = params.walk();
     for param in params.named_children(&mut cursor) {
         count += 1;
-        // Most grammars name the parameter via an `identifier` / `name`
-        // / `pattern` child. We fall back to the whole parameter text
-        // truncated; cleave's original behaviour was identical.
+        // Most grammars name the parameter via a `name` or `pattern`
+        // field or an identifier child; otherwise the whole parameter text
+        // stands in for the name.
         let name = param
             .child_by_field_name("name")
             .or_else(|| param.child_by_field_name("pattern"))
@@ -418,52 +379,4 @@ fn has_numeric_suffix(name: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn code_ratio_counts_nested_and_same_line_functions_once() {
-        for (source, expected) in [
-            (
-                "function outer() {\n  function inner() { return 1; }\n  return inner;\n}\nconst outside = 1;\n",
-                4.0 / 5.0,
-            ),
-            (
-                "const a = () => 1; const b = () => 2;\nconst outside = 1;\n",
-                0.5,
-            ),
-            ("function a() {}\n\nfunction b() {}\n", 2.0 / 3.0),
-        ] {
-            let parsed = crate::OpenOptions::new()
-                .path(std::path::Path::new("coverage.js"))
-                .open(source.as_bytes());
-            assert_eq!(
-                parsed.metrics().get("functions.code_ratio"),
-                Some(expected),
-                "{source}"
-            );
-        }
-    }
-
-    #[test]
-    fn code_ratio_counts_nested_python_functions_once() {
-        let source =
-            b"def outer():\n    def inner():\n        return 1\n    return inner\nvalue = 1\n";
-        let parsed = crate::OpenOptions::new()
-            .path(std::path::Path::new("coverage.py"))
-            .open(source);
-        assert_eq!(parsed.metrics().get("functions.code_ratio"), Some(0.8));
-    }
-
-    /// A shell function has no parameter list; the statements in its body
-    /// must not be counted as parameters.
-    #[test]
-    fn shell_function_statements_are_not_parameters() {
-        let src = b"greet() {\n  echo a\n  echo b\n  echo c\n}\n";
-        let parsed = crate::OpenOptions::new()
-            .path(std::path::Path::new("f.sh"))
-            .open(src);
-        let metrics = parsed.metrics();
-        assert_eq!(metrics.get("functions.no_params_count"), Some(1.0));
-        assert_eq!(metrics.get("functions.max_params"), None);
-        assert_eq!(metrics.get("functions.avg_params"), None);
-    }
-}
+mod tests;

@@ -105,12 +105,12 @@ fn typed_members_track_tar_headers() {
     let member = &archive_members[0];
     assert_eq!(member.path, "usr/bin/script.sh");
     assert_eq!(member.size_bytes, b"#!/bin/sh\n".len() as u64);
-    let ownership = member.ownership.as_ref().expect("tar entry has ownership");
+    let ownership = &member.ownership;
     assert_eq!(ownership.mode_octal, Some(0o755));
     assert_eq!(ownership.uid, Some(1000));
     assert_eq!(ownership.gid, Some(1000));
     assert_eq!(member.mtime_unix, Some(1_700_000_000));
-    assert_eq!(member.entry_type.as_deref(), Some("regular"));
+    assert_eq!(member.entry_type, crate::EntryType::Regular);
     assert_eq!(member.offsets.header, Some(0));
     assert_eq!(member.offsets.data, Some(512));
 }
@@ -193,9 +193,8 @@ fn compressed_variants_report_format_only() {
     assert!(values.get("archive.members").is_none());
 }
 
-/// A well-formed `.tar.gz` used to come back with a `malformed` error,
-/// because declining to walk the compressed stream was reported as a
-/// failed parse.
+/// A well-formed `.tar.gz` is not malformed: declining to walk the
+/// compressed stream is the designed outcome, not a failed parse.
 #[test]
 fn valid_tar_gz_opens_without_errors() {
     use std::io::Write;

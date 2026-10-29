@@ -76,6 +76,12 @@ pub(super) fn extract(
     // Header is exactly 76 bytes; first 4 bytes are its self-described
     // length.
     if bytes.len() < 76 || !bytes.starts_with(LNK_MAGIC) {
+        tracing::debug!(
+            target: "filefacts::lnk",
+            stage = "header",
+            len = bytes.len(),
+            "no 76-byte SHLLINK header; not parsed"
+        );
         return;
     }
 
@@ -147,8 +153,15 @@ pub(super) fn extract(
         if let Some(id_list_size) = bytes_at::u16_le(bytes, offset) {
             let id_list_end = offset.saturating_add(2 + id_list_size as usize);
             let body = offset + 2;
-            if let Some(list) = bytes.get(body..id_list_end) {
-                id_list_path = walk_id_list(list).map(|(p, at)| (p, body + at));
+            match bytes.get(body..id_list_end) {
+                Some(list) => id_list_path = walk_id_list(list).map(|(p, at)| (p, body + at)),
+                None => tracing::debug!(
+                    target: "filefacts::lnk",
+                    stage = "id-list",
+                    offset,
+                    len = id_list_size,
+                    "IDList runs past the end of the file"
+                ),
             }
             offset = id_list_end;
         }
@@ -227,7 +240,16 @@ pub(super) fn extract(
                 }
                 offset = next;
             }
-            None => break,
+            None => {
+                tracing::debug!(
+                    target: "filefacts::lnk",
+                    stage = "string-data",
+                    field = key.as_str(),
+                    offset,
+                    "StringData runs past the end of the file; later fields not read"
+                );
+                break;
+            }
         }
     }
 
@@ -237,10 +259,27 @@ pub(super) fn extract(
         let Some(block_size) = bytes_at::u32_le(bytes, offset).map(|n| n as usize) else {
             break;
         };
+        // A size under 4 is the TerminalBlock that ends the list.
         if block_size < 8 {
+            if block_size >= 4 {
+                tracing::debug!(
+                    target: "filefacts::lnk",
+                    stage = "extra-data",
+                    offset,
+                    len = block_size,
+                    "ExtraData block too short for its signature; walk stopped"
+                );
+            }
             break;
         }
         let Some(block) = bytes.get(offset..offset + block_size) else {
+            tracing::debug!(
+                target: "filefacts::lnk",
+                stage = "extra-data",
+                offset,
+                len = block_size,
+                "ExtraData block runs past the end of the file; walk stopped"
+            );
             break;
         };
         let Some(signature) = bytes_at::u32_le(block, 4) else {

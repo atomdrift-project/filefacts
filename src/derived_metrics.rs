@@ -230,13 +230,13 @@ pub(crate) fn is_well_known_section_name(name: &str) -> bool {
 const MAX_STRING_SPANS: usize = 64;
 
 /// Cross-format `binary.*` aggregates derived from sections + strings +
-/// raw bytes. Keeps the keys cleave's trait engine has used historically
-/// without each format extractor re-deriving the same logic.
+/// raw bytes, computed once here rather than by each format extractor.
 ///
-/// Emits (only the useful subset — fields cleave computed but no trait
-/// queried were dropped):
+/// Emits:
 /// - `binary.string_count`, `binary.max_string_length`,
-///   `binary.avg_string_length`, `binary.high_entropy_string_count`.
+///   `binary.avg_string_length`, `binary.string_length_stddev`,
+///   `binary.high_entropy_string_count`, `binary.sentence_string_count`,
+///   `binary.sentence_string_ratio`.
 /// - `binary.entropy_variance` — population variance across the
 ///   per-section entropies. Packers tend to flatten this; a normal
 ///   binary spreads across `.text` (~6), `.rodata` (~5), `.data` (~3).
@@ -255,20 +255,23 @@ pub(crate) fn emit_binary_aggregates(
     if total > 0 {
         let mut max_len = 0_usize;
         let mut max_string_span: Option<Span> = None;
-        let mut sum_len = 0_usize;
+        // Running sums of the lengths and their squares give the mean and
+        // the population variance in one pass, with no per-string buffer.
+        // `f64` keeps the squares exact well past any realistic input.
+        let mut sum_len = 0.0_f64;
+        let mut sum_sq = 0.0_f64;
         let mut high_entropy = 0_u64;
         let mut high_entropy_spans = SpanBuilder::with_cap(MAX_STRING_SPANS);
         let mut sentence = 0_u64;
-        // Collect lengths once; second pass below computes stddev.
-        let mut lengths: Vec<usize> = Vec::with_capacity(total);
         for (span, s) in strings.text_spans() {
             let len = s.len();
             if len > max_len {
                 max_len = len;
                 max_string_span = Some(span);
             }
-            sum_len = sum_len.saturating_add(len);
-            lengths.push(len);
+            let len = len as f64;
+            sum_len += len;
+            sum_sq += len * len;
             // Shannon-entropy floor of 6.0 bits/byte separates random-
             // looking strings (base64, keys, hex blobs) from English /
             // identifier-shaped text (~3–4.5).
@@ -280,15 +283,10 @@ pub(crate) fn emit_binary_aggregates(
                 sentence += 1;
             }
         }
-        let avg = sum_len as f64 / total as f64;
-        let variance = lengths
-            .iter()
-            .map(|&l| {
-                let d = l as f64 - avg;
-                d * d
-            })
-            .sum::<f64>()
-            / total as f64;
+        let avg = sum_len / total as f64;
+        // E[x²] − E[x]², clamped: rounding can leave a hair below zero when
+        // every length is equal.
+        let variance = (sum_sq / total as f64 - avg * avg).max(0.0);
         metrics.insert(metric!("binary.string_count"), total as f64);
         match max_string_span {
             Some(span) => {
@@ -436,61 +434,4 @@ pub(crate) fn emit_binary_overlay(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::output::Section;
-
-    #[test]
-    fn forged_section_sizes_do_not_overflow_the_code_data_ratio() {
-        // Two sections each claiming nearly `u64::MAX` bytes: the code and
-        // data sums used to be added unchecked.
-        let section = |name: &str, flag: SectionFlag| Section {
-            name: name.into(),
-            vaddr: 0,
-            vsize: 0,
-            file_offset: 0,
-            file_size: u64::MAX - 1,
-            flags: vec![flag],
-            flags_raw: None,
-            entropy: Some(1.0),
-        };
-        let sections = Sections::from_iter([
-            section("a", SectionFlag::Executable),
-            section("b", SectionFlag::Data),
-        ]);
-        let mut metrics = Metrics::new();
-        emit_binary_aggregates(&sections, &output::Strings::new(), b"x", &mut metrics);
-        assert_eq!(
-            metrics.get_key(&metric!("binary.code_to_data_ratio")),
-            Some(0.5)
-        );
-    }
-
-    /// Compiler and loader artifacts must not count as a public API.
-    ///
-    /// Any C++ binary built with exceptions exports Itanium-ABI RTTI, and every
-    /// Mach-O executable exports its image header. A stub with no real exports
-    /// reaches four on those alone, which is enough to satisfy an
-    /// `exports.api_count >= 4` suppression and silence the obfuscation rules
-    /// that would otherwise describe it.
-    #[test]
-    fn rtti_and_image_header_are_not_api_exports() {
-        for artifact in [
-            "__ZTISt9exception",
-            "_ZTSSt11logic_error",
-            "__ZTVN10__cxxabiv117__class_type_infoE",
-            "__ZTTSt13basic_fstream",
-            "_mh_execute_header",
-            "mh_execute_header",
-        ] {
-            assert!(!is_api_export(artifact), "{artifact} should not count");
-        }
-    }
-
-    #[test]
-    fn ordinary_symbols_are_api_exports() {
-        for real in ["_main", "curl_easy_init", "_SSL_connect", "ZLibDecompress"] {
-            assert!(is_api_export(real), "{real} should count");
-        }
-    }
-}
+mod tests;

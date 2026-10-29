@@ -7,13 +7,14 @@
 //! container layers, and works the same when filefacts is a git or
 //! crates.io dependency (both ship `src/`).
 //!
-//! The parsers filefacts calls (goblin, zip, tree-sitter, …) change its
-//! output as much as its own source does, and when filefacts is a dependency
-//! their versions come from the *consumer's* `Cargo.lock`, not ours. Cargo
-//! does not tell a build script where that lock is, so it is found the way
-//! cargo lays out a build (see [`consumer_lock`]). A host whose target
-//! directory lives elsewhere, or that wants its own invalidation, adds a
-//! namespace to every key with `OpenOptions::cache_namespace`.
+//! The hash covers only files inside this package: everything under `src/`
+//! (the Rust source and the data it embeds, such as trust anchors) except
+//! test fixtures and hidden files, plus `Cargo.toml` and `Cargo.lock`. The
+//! lock records which commit of the git `stng` dependency a standalone build
+//! uses. When filefacts is a dependency, its parsers' versions come from the
+//! consumer's lock, which this script deliberately does not read; a host that
+//! wants entries retired on its own dependency updates adds a namespace with
+//! `OpenOptions::cache_namespace`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,30 +24,19 @@ fn main() {
     let mut files = Vec::new();
     collect_files(&root.join("src"), &mut files);
     files.sort();
-    // The lock, not the manifest, records which commit of the bare git `stng`
-    // dependency is built, so both are hashed.
-    files.push(root.join("Cargo.toml"));
-    println!("cargo:rerun-if-changed=Cargo.toml");
-    let own_lock = root.join("Cargo.lock");
-    if own_lock.is_file() {
-        files.push(own_lock.clone());
-        println!("cargo:rerun-if-changed=Cargo.lock");
-    }
-    if let Some(lock) = consumer_lock(&own_lock) {
-        println!("cargo:rerun-if-changed={}", lock.display());
-        files.push(lock);
+    for name in ["Cargo.toml", "Cargo.lock"] {
+        let path = root.join(name);
+        if path.is_file() {
+            println!("cargo:rerun-if-changed={name}");
+            files.push(path);
+        }
     }
 
     let mut hash = Fnv1a::default();
     for path in &files {
         let contents = fs::read(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-        // The relative path too, so a rename or move changes the hash. The
-        // consumer's lock is the one file outside the package; name it by
-        // role, so where the consumer is checked out doesn't change the key.
-        let relative = path.strip_prefix(&root).map_or_else(
-            |_| "<consumer>/Cargo.lock".into(),
-            |relative| relative.to_string_lossy(),
-        );
+        // The relative path too, so a rename or move changes the hash.
+        let relative = path.strip_prefix(&root).unwrap_or(path).to_string_lossy();
         hash.write(relative.as_bytes());
         hash.write(&[0]);
         hash.write(&(contents.len() as u64).to_le_bytes());
@@ -57,38 +47,24 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 }
 
-/// The `Cargo.lock` of the workspace this build belongs to, when it is not
-/// filefacts' own. `OUT_DIR` is `<target>/<profile>/build/<pkg>-<hash>/out`,
-/// and a workspace keeps its lock beside `<target>` unless
-/// `CARGO_TARGET_DIR` moved it, so the nearest ancestor holding a
-/// `Cargo.lock` is that workspace. Finding none (a relocated target dir)
-/// leaves the key on filefacts' own source and lock.
-fn consumer_lock(own_lock: &Path) -> Option<PathBuf> {
-    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR")?);
-    let lock = out_dir
-        .ancestors()
-        .map(|dir| dir.join("Cargo.lock"))
-        .find(|lock| lock.is_file())?;
-    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    };
-    (!same(&lock, own_lock)).then_some(lock)
-}
-
+/// Appends every file under `dir` to `out`, skipping hidden entries (editor
+/// and Finder droppings would make the key depend on the checkout) and
+/// `testdata` directories (fixtures are test inputs, not extraction code, and
+/// a build must not depend on reading them).
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
     for entry in entries {
-        let path = entry
-            .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
-            .path();
+        let entry = entry.unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') {
+            continue;
+        }
         if path.is_dir() {
-            // Fixtures are test inputs, not extraction code, so they do not
-            // belong in the cache key, and a build must not depend on reading them.
-            if path.file_name().is_some_and(|name| name == "testdata") {
-                continue;
+            if name != "testdata" {
+                collect_files(&path, out);
             }
-            collect_files(&path, out);
         } else {
             out.push(path);
         }

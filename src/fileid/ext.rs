@@ -3,41 +3,149 @@
 use std::path::Path;
 
 use super::FileType;
+use super::file_type::Strength;
 
-/// Detect file type from path (filename match first, then extension).
-pub(crate) fn detect_from_path(path: &Path) -> Option<FileType> {
-    // Filename matches (manifests, well-known names)
-    if let Some(ft) = detect_from_filename(path) {
-        return Some(ft);
+/// What a path's name claims the file is, and how much that claim says.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct Claim {
+    /// The type the name implies.
+    pub(super) file_type: FileType,
+    /// What the claim says about the bytes: the type's own strength, except
+    /// where one spelling of a type says more or less than the others.
+    pub(super) strength: Strength,
+    /// The claim comes from a well-known filename rather than an extension.
+    pub(super) by_name: bool,
+}
+
+impl Claim {
+    /// The claim an extension naming `file_type` makes.
+    const fn of(file_type: FileType) -> Self {
+        Self {
+            file_type,
+            strength: file_type.strength(),
+            by_name: false,
+        }
     }
 
-    // GitHub Actions workflow files
+    /// An extension of a text language that has no analyzer of its own (a
+    /// stylesheet, SQL, a config syntax): typed as text, but a language claim
+    /// all the same. These syntaxes quote other languages' keywords (`let`,
+    /// `-`, braces) densely enough to fool the language scorer, so keyword
+    /// scoring does not replace the name; a binary or plainly foreign body
+    /// does.
+    const fn text_language() -> Self {
+        Self {
+            strength: Strength::Language,
+            ..Self::of(FileType::Text)
+        }
+    }
+
+    /// Whether the claim names a language: the extension's own strength, or
+    /// its type's when a variant suffix weakened the claim.
+    pub(super) const fn claims_language(self) -> bool {
+        matches!(self.strength, Strength::Language)
+            || matches!(self.file_type.strength(), Strength::Language)
+    }
+
+    /// Whether the language scorer replaces the claim.
+    pub(super) const fn yields_to_scorer(self) -> bool {
+        self.strength.yields_to_scorer()
+    }
+
+    /// Whether an unmistakable mark replaces the claim. A well-known
+    /// filename yields to a mark as far as its type does: a `LICENSE`
+    /// holding a manual page is text either way, while a `Makefile` or a
+    /// `package.json` stays what it is named.
+    pub(super) const fn yields_to_mark(self) -> bool {
+        if self.by_name {
+            self.file_type.strength().yields_to_mark()
+        } else {
+            self.strength.yields_to_mark()
+        }
+    }
+}
+
+/// What `path` claims: a well-known filename, then an extension.
+pub(super) fn claim(path: &Path) -> Option<Claim> {
+    if let Some(file_type) = detect_from_filename(path) {
+        return Some(Claim {
+            file_type,
+            strength: filename_strength(path),
+            by_name: true,
+        });
+    }
     let path_str = path.to_string_lossy();
     if is_github_workflow(&path_str) {
-        return Some(FileType::GithubActions);
+        return Some(Claim {
+            file_type: FileType::GithubActions,
+            strength: Strength::Named,
+            by_name: true,
+        });
     }
+    let claim = extension_claim(path, &path_str)?;
+    Some(if is_variant_suffix(path, claim) {
+        Claim {
+            strength: Strength::Weak,
+            ..claim
+        }
+    } else {
+        claim
+    })
+}
 
+/// How far a well-known filename is believed against its content: the
+/// language scorer may replace it unless its own extension is a claim the
+/// scorer may not replace (`package.json`, `Cargo.toml`).
+fn filename_strength(path: &Path) -> Strength {
+    match detect_from_extension(path) {
+        Some(ext) if !ext.yields_to_scorer() => Strength::Named,
+        _ => Strength::Weak,
+    }
+}
+
+/// An extension of one or two characters after a dotted family name
+/// (`Trojan.BAT.DelAll.a`, `Backdoor.PHP.Agent.bb`) is a variant letter in a
+/// naming scheme, not a type claim: the content decides, and the extension
+/// only stands when the content names nothing. A dotted family name has at
+/// least three components ahead of the suffix and opens with a capital, which
+/// leaves the dotted names source trees use (`jquery.min.js`,
+/// `app.component.ts`) alone.
+fn is_variant_suffix(path: &Path, claim: Claim) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some((stem, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    claim.strength == Strength::Language
+        && (1..=2).contains(&ext.len())
+        && stem.bytes().filter(|&b| b == b'.').count() >= 2
+        && stem.starts_with(|c: char| c.is_ascii_uppercase())
+}
+
+/// The claim a path's extension makes, multi-part suffixes included.
+fn extension_claim(path: &Path, path_str: &str) -> Option<Claim> {
     // systemd service drop-ins: *.service.d/*.conf
     if (path_str.contains(".service.d/") || path_str.contains(".service.d\\"))
         && ends_with_ci(path_str.as_bytes(), b".conf")
     {
-        return Some(FileType::SystemdService);
+        return Some(Claim::of(FileType::SystemdService));
     }
 
     // Archive multi-part extensions (check before single extension)
     let p = path_str.as_bytes();
     if let Some(ft) = suffix_type(p, ARCHIVE_SUFFIXES) {
-        return Some(ft);
+        return Some(Claim::of(ft));
     }
 
     // Versioned ELF shared libraries, e.g. libssl.so.3 or libc.so.6.
-    if has_versioned_so_suffix(&path_str) {
-        return Some(FileType::Elf);
+    if has_versioned_so_suffix(path_str) {
+        return Some(Claim::of(FileType::Elf));
     }
 
     // JAR/WAR/EAR by extension
     if let Some(ft) = suffix_type(p, JAVA_ARCHIVE_SUFFIXES) {
-        return Some(ft);
+        return Some(Claim::of(ft));
     }
 
     // mysqltest scripts (`t/*.test`, `include/*.inc`) and their recorded
@@ -48,21 +156,20 @@ pub(crate) fn detect_from_path(path: &Path) -> Option<FileType> {
     // language's rules then read test SQL as program code. Same reasoning as
     // `.sql` below. Bound to the directory, since `.test` and `.inc` are
     // generic extensions elsewhere (Tcl tests, PHP and Pascal includes).
-    if is_mysqltest_file(&path_str) {
-        return Some(FileType::Text);
+    if is_mysqltest_file(path_str) {
+        return Some(Claim::text_language());
     }
 
     // Single extension
-    if let Some(ft) = detect_from_extension(path) {
-        return Some(ft);
+    if let Some(claim) = detect_from_extension(path) {
+        return Some(claim);
     }
 
     // Wrapper suffix: `configure-backdoor.c.fragment`, `payload.php.sample`,
     // `index.js.bak`. Incident corpora, quarantine folders and editor backups
     // all append a suffix that says something about the file's provenance and
-    // nothing about its format. Without this the real extension is invisible,
-    // the file types as unknown, and no rule -- not even a `for: [text]` one --
-    // ever sees its bytes.
+    // nothing about its format. Without this the real extension is invisible
+    // and the file types as unknown.
     //
     // Only a fixed set of wrappers is stripped, and only one layer, so a
     // genuine two-part name (`libc.so.6`, `archive.tar.gz`) still resolves
@@ -72,8 +179,8 @@ pub(crate) fn detect_from_path(path: &Path) -> Option<FileType> {
     // text file has no magic, so the extension under the wrapper is the only
     // evidence there is.
     strip_wrapper_suffix(path)
-        .and_then(|inner| detect_from_extension(Path::new(&inner)))
-        .filter(|ft| is_wrapper_inner_type(*ft))
+        .and_then(|inner| detect_from_extension(Path::new(inner)))
+        .filter(|claim| is_wrapper_inner_type(claim.file_type))
 }
 
 /// Multi-part archive suffixes, tried in order: the first that ends the path
@@ -123,11 +230,8 @@ fn suffix_type(path: &[u8], table: &[(&[u8], FileType)]) -> Option<FileType> {
 ///
 /// The reason to read the extension out from under a wrapper is that these
 /// formats carry no signature of their own: once `.yaml` is hidden behind
-/// `.bak`, nothing in the bytes says what the file is, and it types as unknown —
-/// which means cleave skips it and not one rule ever sees it. That was the
-/// stated rationale for the carve-out, but the filter only admitted source
-/// code, so `deploy.yaml.quarantine` and `package.json.bak` still went
-/// untyped — exactly the incident-corpus names the wrapper list exists for.
+/// `.bak`, nothing in the bytes says what the file is, and it would type as
+/// unknown, which no rule reads.
 ///
 /// Binaries and archives stay excluded: their magic is authoritative and is
 /// consulted before any of this, so trusting a name like `note.so.old` would
@@ -159,7 +263,7 @@ const WRAPPER_SUFFIXES: &[&str] = &[
 ];
 
 /// `foo.c.fragment` -> `foo.c`, when the trailing extension is a wrapper.
-fn strip_wrapper_suffix(path: &Path) -> Option<String> {
+fn strip_wrapper_suffix(path: &Path) -> Option<&str> {
     let name = path.file_name()?.to_str()?;
     let (stem, ext) = name.rsplit_once('.')?;
     if !WRAPPER_SUFFIXES.iter().any(|w| ext.eq_ignore_ascii_case(w)) {
@@ -170,22 +274,21 @@ fn strip_wrapper_suffix(path: &Path) -> Option<String> {
     if !stem.contains('.') {
         return None;
     }
-    Some(stem.to_string())
-}
-
-/// Returns true if the path matched via filename (not extension).
-pub(crate) fn is_filename_match(path: &Path) -> bool {
-    detect_from_filename(path).is_some() || is_github_workflow(&path.to_string_lossy())
+    Some(stem)
 }
 
 /// `true` for a mysqltest script, include or result file under a
 /// `mysql-test/` directory (either path separator).
 fn is_mysqltest_file(path_str: &str) -> bool {
-    let p = path_str.replace('\\', "/");
-    (p.starts_with("mysql-test/") || p.contains("/mysql-test/"))
+    let in_dir = path_str
+        .split(['/', '\\'])
+        .rev()
+        .skip(1)
+        .any(|dir| dir == "mysql-test");
+    in_dir
         && [".test", ".result", ".inc"]
             .iter()
-            .any(|ext| ends_with_ci(p.as_bytes(), ext.as_bytes()))
+            .any(|ext| ends_with_ci(path_str.as_bytes(), ext.as_bytes()))
 }
 
 /// `true` for a GitHub Actions workflow file: a `.yml`/`.yaml` under a
@@ -194,44 +297,6 @@ fn is_github_workflow(path_str: &str) -> bool {
     (path_str.contains(".github/workflows/") || path_str.contains(".github\\workflows\\"))
         && (ends_with_ci(path_str.as_bytes(), b".yml")
             || ends_with_ci(path_str.as_bytes(), b".yaml"))
-}
-
-/// Returns true if the path has a data/config extension that should not be
-/// sent through content heuristics.
-pub(crate) fn is_data_format(path: &Path) -> bool {
-    let Some(ext) = lowercase_ext(path) else {
-        return false;
-    };
-
-    matches!(
-        &*ext,
-        "yaml"
-            | "yml"
-            | "json"
-            | "toml"
-            | "ini"
-            | "cfg"
-            | "conf"
-            | "properties"
-            | "txt"
-            | "text"
-            | "md"
-            | "markdown"
-            | "rst"
-            | "adoc"
-            | "csv"
-            | "tsv"
-            | "log"
-            | "svg"
-            | "xml"
-            | "service"
-            | "erl"
-            | "hrl"
-            | "elv"
-            | "nu"
-            | "fish"
-            | "map"
-    )
 }
 
 /// Detect from well-known filenames.
@@ -251,6 +316,30 @@ fn detect_from_filename(path: &Path) -> Option<FileType> {
     }
     if name.eq_ignore_ascii_case("composer.json") {
         return Some(FileType::ComposerJson);
+    }
+    // Lockfiles and dependency pins under their tools' fixed names. A Yarn
+    // lockfile kept for storage may carry a hash between name and suffix.
+    for (fixed, file_type) in [
+        ("go.mod", FileType::GoMod),
+        ("go.sum", FileType::GoSum),
+        ("requirements.txt", FileType::RequirementsTxt),
+        ("poetry.lock", FileType::PoetryLock),
+        ("pipfile.lock", FileType::PipfileLock),
+        ("gemfile.lock", FileType::GemfileLock),
+        ("composer.lock", FileType::ComposerLock),
+        ("yarn.lock", FileType::YarnLock),
+        ("pnpm-lock.yaml", FileType::PnpmLock),
+    ] {
+        if name.eq_ignore_ascii_case(fixed) {
+            return Some(file_type);
+        }
+    }
+    if name
+        .get(..5)
+        .is_some_and(|head| head.eq_ignore_ascii_case("yarn."))
+        && ends_with_ci(name.as_bytes(), b".lock")
+    {
+        return Some(FileType::YarnLock);
     }
     if name.eq_ignore_ascii_case("binding.gyp") {
         return Some(FileType::Gyp);
@@ -358,7 +447,7 @@ fn detect_from_filename(path: &Path) -> Option<FileType> {
         && (stem.eq_ignore_ascii_case("LICENSE")
             || stem.eq_ignore_ascii_case("LICENCE")
             || stem.eq_ignore_ascii_case("COPYING"))
-        && detect_from_extension(path).is_none_or(|ft| ft == FileType::Text)
+        && detect_from_extension(path).is_none_or(|claim| claim.file_type == FileType::Text)
     {
         return Some(FileType::Text);
     }
@@ -366,272 +455,288 @@ fn detect_from_filename(path: &Path) -> Option<FileType> {
     None
 }
 
-/// Detect from single file extension.
-fn detect_from_extension(path: &Path) -> Option<FileType> {
+/// The claim a single file extension makes.
+fn detect_from_extension(path: &Path) -> Option<Claim> {
     let ext = lowercase_ext(path)?;
 
-    match &*ext {
+    let file_type = match &*ext {
         "sh" | "bash" | "ksh" | "zsh" | "csh" | "tcsh" | "dash" | "fish" | "command" | "ebuild"
-        | "eclass" => Some(FileType::Shell),
-        "py" | "pyw" | "pyi" | "pth" => Some(FileType::Python),
-        "js" | "mjs" | "cjs" | "jsx" | "jse" => Some(FileType::JavaScript),
-        "ts" | "tsx" | "mts" | "cts" => Some(FileType::TypeScript),
+        | "eclass" => FileType::Shell,
+        "py" | "pyw" | "pyi" | "pth" => FileType::Python,
+        "js" | "mjs" | "cjs" | "jsx" | "jse" => FileType::JavaScript,
+        "ts" | "tsx" | "mts" | "cts" => FileType::TypeScript,
         // CSS and preprocessor stylesheets. There is no dedicated stylesheet
         // analyzer, and their C-like braces/`;`/`//` syntax otherwise scores as
         // JavaScript under content heuristics — which fires JS AST rules
         // (arithmetic-density obfuscation, string-concat) on benign layout math
         // like `margin: $a - $b`. Treat them as plain text: still scanned for
         // strings/URLs/secrets, but never parsed as a JS AST.
-        "css" | "scss" | "sass" | "less" | "styl" | "pcss" | "postcss" => Some(FileType::Text),
+        "css" | "scss" | "sass" | "less" | "styl" | "pcss" | "postcss" => {
+            return Some(Claim::text_language());
+        }
         // Vim script. No dedicated analyzer, and its ubiquitous `let ` bindings
         // otherwise score as JavaScript under content heuristics — which fires
         // JS rules on syntax databases like filetype.vim (a catalog of sensitive
         // path patterns: .aws/credentials, /etc/hosts, ...). Treat as plain text.
-        "vim" => Some(FileType::Text),
+        "vim" => return Some(Claim::text_language()),
         // Lisp family. No dedicated analyzer; parenthesized arithmetic like
         // `(- a b)` otherwise scores as JavaScript and fires JS obfuscation
         // rules on e.g. the GCL ANSI test suite. Treat as plain text.
-        "lsp" | "lisp" | "el" | "cl" | "scm" => Some(FileType::Text),
+        "lsp" | "lisp" | "el" | "cl" | "scm" => return Some(Claim::text_language()),
         // PatEL (`.ptl`) — Iosevka's Lisp-like glyph / OpenType-layout DSL,
         // compiled by the `patel` npm package. No dedicated analyzer; its
         // `$$include`, `$`-prefixed macros, and bare command-like statement
         // heads otherwise content-score as Shell and fire shell
         // command-execution / obfuscated-command traits on font-outline source.
         // Treat as plain text: still scanned for strings/URLs, never as shell.
-        "ptl" => Some(FileType::Text),
+        "ptl" => return Some(Claim::text_language()),
         // OCaml family. No dedicated analyzer; `let`-heavy implementations
         // otherwise score as JavaScript and `.mli` `val` declarations score
         // as Kotlin under weak content heuristics. Treat as plain text.
-        "ml" | "mli" | "mll" | "mly" | "mld" | "eliom" | "eliomi" => Some(FileType::Text),
+        "ml" | "mli" | "mll" | "mly" | "mld" | "eliom" | "eliomi" => {
+            return Some(Claim::text_language());
+        }
         // SQL dumps/scripts. No dedicated analyzer; large dumps of long INSERT
         // statements otherwise content-score as Batch and fire batch
         // line/token-bloat obfuscation rules. Treat as plain text.
-        "sql" | "ddl" | "dml" => Some(FileType::Text),
+        "sql" | "ddl" | "dml" => return Some(Claim::text_language()),
         // Neo4j Cypher graph dumps (e.g. an agent's autogenerated knowledge
         // graph). No dedicated analyzer; `MERGE (n:Label {k: 'v'})` syntax —
         // braces, colons, quoted props — otherwise content-scores as JavaScript
         // and runs every Node.js stealer/exfil rule against what is really a
         // data export. Treat as text so content traits still match by string.
-        "cypher" | "cql" => Some(FileType::Text),
+        "cypher" | "cql" => return Some(Claim::text_language()),
         // Smali (Android/Dalvik bytecode disassembly). No dedicated analyzer;
         // its dense arithmetic/array literals otherwise score as JavaScript and
         // fire JS arithmetic-obfuscation rules (e.g. jadx test .smali fixtures).
-        "smali" => Some(FileType::Text),
+        "smali" => return Some(Claim::text_language()),
         // Unified-diff patches. No dedicated analyzer; their `-`/`+` line
         // prefixes otherwise content-score as JavaScript, and the removed-line
         // `-` markers parse as subtraction operators — tripping
         // js-arithmetic-array-init on benign kernel/source patch sets. Text.
-        "patch" | "diff" => Some(FileType::Text),
-        // GNU M4 / Autoconf macro source. There is no dedicated parser yet,
-        // but treating it as text keeps build-system behavior visible to
-        // cleave instead of dropping every *.m4 file as Unknown.
-        "m4" => Some(FileType::Text),
+        "patch" | "diff" => return Some(Claim::text_language()),
+        // GNU M4 / Autoconf macro source. No dedicated parser; as text its
+        // build-system behavior is still scanned.
+        "m4" => return Some(Claim::text_language()),
         // TypeScript compiler test baselines (annotated code fixtures, not
         // executable JS): x.types / x.symbols / x.baseline.
-        "types" | "symbols" | "baseline" => Some(FileType::Text),
+        "types" | "symbols" | "baseline" => return Some(Claim::text_language()),
         // Protocol Buffer schemas. No dedicated analyzer; `.proto` syntax uses
         // `package` declarations and service/message identifiers that otherwise
         // content-score as Kotlin. Treat as text so C2/protocol traits can still
         // match without source-language misclassification.
-        "proto" => Some(FileType::Text),
+        "proto" => return Some(Claim::text_language()),
         // YARA rule sources. No dedicated analyzer; `rule X { strings: ... }`
         // with `$`-prefixed identifiers content-scores as PHP, Kotlin, Python or
-        // shell, so a shipped rule corpus runs those languages' traits over what
-        // is really a list of detection patterns -- and the patterns are quoted
-        // malware strings, so the rules fire on the rule. Keep a dedicated Yara
-        // type so no source-language traits are applied.
-        "yar" | "yara" => Some(FileType::Yara),
-        "go" => Some(FileType::Go),
-        "rs" => Some(FileType::Rust),
-        "java" => Some(FileType::Java),
-        "jsp" | "jspx" => Some(FileType::Jsp),
-        "asp" | "aspx" | "asa" | "asax" | "ascx" | "ashx" | "asmx" => Some(FileType::Asp),
-        "cfm" | "cfc" | "cfml" => Some(FileType::Cfml),
+        // shell, so a shipped rule set would be read as those languages when
+        // it is a list of detection patterns quoting malware strings. A
+        // dedicated Yara type keeps source-language analysis off it.
+        "yar" | "yara" => FileType::Yara,
+        "go" => FileType::Go,
+        "rs" => FileType::Rust,
+        "java" => FileType::Java,
+        "jsp" | "jspx" => FileType::Jsp,
+        "asp" | "aspx" | "asa" | "asax" | "ascx" | "ashx" | "asmx" => FileType::Asp,
+        "cfm" | "cfc" | "cfml" => FileType::Cfml,
         // `.cls` is also a Visual Basic class module, so it is not mapped here.
-        "tex" | "sty" | "ltx" | "dtx" => Some(FileType::Tex),
-        "ps" | "eps" | "epsf" => Some(FileType::PostScript),
-        "com" => Some(FileType::DosCom),
-        "mrc" => Some(FileType::Mirc),
-        "ircii" => Some(FileType::IrcII),
-        "class" => Some(FileType::JavaClass),
-        "pyc" | "pyo" => Some(FileType::PythonBytecode),
-        "beam" => Some(FileType::Beam),
-        "wasm" => Some(FileType::Wasm),
-        "dex" => Some(FileType::Dex),
-        "rb" | "rbs" | "gemspec" => Some(FileType::Ruby),
-        "php" | "php3" | "php4" | "php5" | "php7" | "phtml" => Some(FileType::Php),
-        "pl" | "pm" | "t" => Some(FileType::Perl),
-        "ps1" | "psm1" | "psd1" => Some(FileType::PowerShell),
-        "kt" | "kts" => Some(FileType::Kotlin),
-        "bat" | "cmd" => Some(FileType::Batch),
-        "jcl" => Some(FileType::Jcl),
+        "tex" | "sty" | "ltx" | "dtx" => FileType::Tex,
+        "ps" | "eps" | "epsf" => FileType::PostScript,
+        "com" => FileType::DosCom,
+        "mrc" => FileType::Mirc,
+        "ircii" => FileType::IrcII,
+        "class" => FileType::JavaClass,
+        "pyc" | "pyo" => FileType::PythonBytecode,
+        "beam" => FileType::Beam,
+        "wasm" => FileType::Wasm,
+        "dex" => FileType::Dex,
+        "rb" | "rbs" | "gemspec" => FileType::Ruby,
+        "php" | "php3" | "php4" | "php5" | "php7" | "phtml" => FileType::Php,
+        "pl" | "pm" | "t" => FileType::Perl,
+        "ps1" | "psm1" | "psd1" => FileType::PowerShell,
+        "kt" | "kts" => FileType::Kotlin,
+        "bat" | "cmd" => FileType::Batch,
+        "jcl" => FileType::Jcl,
         // A Windows registry export. Its header line is magic, so a `.reg`
         // without one is typed by its content and reported as a mismatch.
-        "reg" => Some(FileType::Reg),
-        "vbs" | "vbe" | "wsf" | "wsc" | "wsh" => Some(FileType::Vbs),
+        "reg" => FileType::Reg,
+        "vbs" | "vbe" | "wsf" | "wsc" | "wsh" => FileType::Vbs,
         "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" | "hxx" | "hh" | "pas" | "dpr" | "asm" | "s"
-        | "nasm" => Some(FileType::C),
+        | "nasm" => FileType::C,
         // Microsoft Interface Definition Language is C-like source; treating it as C
         // enables source facts even when content heuristics do not recognize MIDL syntax.
-        "idl" => Some(FileType::C),
-        "lua" => Some(FileType::Lua),
-        "cs" => Some(FileType::CSharp),
-        "swift" => Some(FileType::Swift),
-        "m" | "mm" => Some(FileType::ObjectiveC),
-        "groovy" | "gradle" => Some(FileType::Groovy),
-        "scala" | "sc" => Some(FileType::Scala),
-        "zig" => Some(FileType::Zig),
-        "ex" | "exs" => Some(FileType::Elixir),
-        "clj" | "cljs" | "cljc" | "cljr" | "edn" | "bb" => Some(FileType::Clojure),
-        "scpt" | "applescript" => Some(FileType::AppleScript),
-        "service" => Some(FileType::SystemdService),
-        "desktop" => Some(FileType::DesktopEntry),
-        "svg" => Some(FileType::Svg),
+        "idl" => FileType::C,
+        "lua" => FileType::Lua,
+        "cs" => FileType::CSharp,
+        "swift" => FileType::Swift,
+        "m" | "mm" => FileType::ObjectiveC,
+        "groovy" | "gradle" => FileType::Groovy,
+        "scala" | "sc" => FileType::Scala,
+        "zig" => FileType::Zig,
+        "ex" | "exs" => FileType::Elixir,
+        "clj" | "cljs" | "cljc" | "cljr" | "edn" | "bb" => FileType::Clojure,
+        "scpt" | "applescript" => FileType::AppleScript,
+        "service" => FileType::SystemdService,
+        "desktop" => FileType::DesktopEntry,
+        "svg" => FileType::Svg,
         // Interface Builder sources (.xib, .storyboard) are XML; their
         // compiled form is `Nib`.
         "xml" | "csproj" | "vbproj" | "fsproj" | "proj" | "props" | "targets" | "vcxproj"
         | "xaml" | "config" | "settings" | "nuspec" | "wsdl" | "xsd" | "xsl" | "xslt" | "xib"
-        | "storyboard" => Some(FileType::Xml),
+        | "storyboard" => FileType::Xml,
         // VS Code multi-root workspace files are JSONC (comments, trailing
         // commas) and can carry a `tasks` block with `runOn: folderOpen`, the
         // same autorun surface as `.vscode/tasks.json`. Typed as text, they
         // were invisible to every JSON rule; the generic JSON extractor's
         // JSONC fallback parses them.
-        "json" | "code-workspace" => Some(FileType::Json),
+        "json" | "code-workspace" => FileType::Json,
         // Generic YAML. The specific manifests that happen to be YAML
         // (pnpm-lock.yaml, action.yml, .github/workflows/*) are matched by
         // filename earlier in `detect_from_path`, so only the rest reach here.
-        "yaml" | "yml" => Some(FileType::Yaml),
-        "gyp" | "gypi" => Some(FileType::Gyp),
-        "plist" | "resx" => Some(FileType::Plist),
-        "nib" => Some(FileType::Nib),
-        "pbxproj" => Some(FileType::Pbxproj),
-        "cmake" => Some(FileType::Cmake),
-        "rtf" => Some(FileType::Rtf),
+        "yaml" | "yml" => FileType::Yaml,
+        "gyp" | "gypi" => FileType::Gyp,
+        "plist" | "resx" => FileType::Plist,
+        "nib" => FileType::Nib,
+        "pbxproj" => FileType::Pbxproj,
+        "cmake" => FileType::Cmake,
+        "rtf" => FileType::Rtf,
         "doc" | "msg" | "dot" | "ppt" | "pps" | "pot" | "ppa" | "xls" | "xlt" | "xla" => {
-            Some(FileType::OleDoc)
+            FileType::OleDoc
         }
-        "msi" | "msp" | "mst" | "msm" => Some(FileType::Msi),
+        "msi" | "msp" | "mst" | "msm" => FileType::Msi,
         // Ubuntu Snap: a SquashFS image. The magic confirms the filesystem but
         // not the package, so the extension is what separates the two.
-        "snap" => Some(FileType::Snap),
+        "snap" => FileType::Snap,
         // Flatpak bundles carry no magic at a fixed offset — extension only.
-        "flatpak" => Some(FileType::Flatpak),
-        "squashfs" | "sqsh" => Some(FileType::SquashFs),
+        "flatpak" => FileType::Flatpak,
+        "squashfs" | "sqsh" => FileType::SquashFs,
         // Detached OpenPGP signatures published beside release artifacts.
-        "sig" | "asc" | "sign" => Some(FileType::PgpSignature),
+        "sig" | "asc" | "sign" => FileType::PgpSignature,
         "docx" | "xlsx" | "pptx" | "docm" | "xlsm" | "pptm" | "dotx" | "dotm" | "xltx" | "xltm"
-        | "xlam" | "ppam" | "potx" | "potm" | "ppsx" | "ppsm" | "sldx" | "sldm" => {
-            Some(FileType::Ooxml)
-        }
-        ext if is_odf_extension(ext) => Some(FileType::Odf),
-        "exe" | "dll" | "sys" | "scr" | "cpl" | "ocx" | "drv" | "efi" | "pyd" => Some(FileType::Pe),
-        "so" | "elf" | "ko" => Some(FileType::Elf),
-        "dylib" | "bundle" | "macho" => Some(FileType::MachO),
-        "lnk" => Some(FileType::Lnk),
-        "pdf" => Some(FileType::Pdf),
-        "jpg" | "jpeg" | "jpe" | "jfif" => Some(FileType::Jpeg),
-        "png" => Some(FileType::Png),
-        "tif" | "tiff" => Some(FileType::Tiff),
-        "avif" | "avifs" => Some(FileType::Avif),
+        | "xlam" | "ppam" | "potx" | "potm" | "ppsx" | "ppsm" | "sldx" | "sldm" => FileType::Ooxml,
+        ext if is_odf_extension(ext) => FileType::Odf,
+        "exe" | "dll" | "sys" | "scr" | "cpl" | "ocx" | "drv" | "efi" | "pyd" => FileType::Pe,
+        "so" | "elf" | "ko" => FileType::Elf,
+        "dylib" | "bundle" | "macho" => FileType::MachO,
+        "lnk" => FileType::Lnk,
+        "pdf" => FileType::Pdf,
+        "jpg" | "jpeg" | "jpe" | "jfif" => FileType::Jpeg,
+        "png" => FileType::Png,
+        "tif" | "tiff" => FileType::Tiff,
+        "avif" | "avifs" => FileType::Avif,
         // Font containers. `.woff2`/`.woff`/`.eot` are web-delivery
         // wrappers, `.ttf`/`.otf` bare sfnt, `.ttc`/`.otc` collections.
         // Mapping them buys structural validation (see formats/font.rs)
         // for a family that is otherwise copied around unexamined.
-        "ttf" | "otf" | "ttc" | "otc" | "woff" | "woff2" | "eot" => Some(FileType::Font),
+        "ttf" | "otf" | "ttc" | "otc" | "woff" | "woff2" | "eot" => FileType::Font,
         // Media containers. Each has a structure walker (formats/containers.rs)
         // that reports which bytes the format accounts for, so a payload in
-        // the remainder is visible. Before these were mapped they had no file
-        // type at all and were skipped outright.
-        "wav" | "wave" => Some(FileType::Wav),
-        "aif" | "aiff" | "aifc" => Some(FileType::Aiff),
-        "mp3" => Some(FileType::Mp3),
-        "mp4" | "m4a" | "m4v" | "mov" => Some(FileType::Mp4),
-        "ico" | "cur" => Some(FileType::Ico),
-        "gif" => Some(FileType::Gif),
-        "bmp" | "dib" => Some(FileType::Bmp),
-        "webp" => Some(FileType::Webp),
+        // the remainder is visible.
+        "wav" | "wave" => FileType::Wav,
+        "aif" | "aiff" | "aifc" => FileType::Aiff,
+        "mp3" => FileType::Mp3,
+        "mp4" | "m4a" | "m4v" | "mov" => FileType::Mp4,
+        "ico" | "cur" => FileType::Ico,
+        "ani" => FileType::Ani,
+        "gif" => FileType::Gif,
+        "bmp" | "dib" => FileType::Bmp,
+        "webp" => FileType::Webp,
         // Sphinx caches parsed document trees as protocol pickle streams with
         // the canonical `.doctree` suffix under its build directory.
-        "pkl" | "pickle" | "joblib" | "debug_pkl" | "doctree" => Some(FileType::Pickle),
-        "trustcache" | "im4p" => Some(FileType::Data),
+        "pkl" | "pickle" | "joblib" | "debug_pkl" | "doctree" => FileType::Pickle,
+        // Image4 payloads and trust caches: content names the trust-cache
+        // table, and every other payload stays opaque data.
+        "trustcache" | "im4p" => FileType::Data,
         // Zip-based package ecosystems with unambiguous extensions get their
         // own type (the magic branch agrees when `PK` is present; this keeps
         // the extension fallback consistent so it isn't flagged a mismatch).
-        "ipa" => Some(FileType::Ipa),
-        "nupkg" => Some(FileType::Nupkg),
-        "vsix" => Some(FileType::Vsix),
-        "egg" => Some(FileType::Egg),
-        "conda" => Some(FileType::Conda),
+        "ipa" => FileType::Ipa,
+        "nupkg" => FileType::Nupkg,
+        "vsix" => FileType::Vsix,
+        "egg" => FileType::Egg,
+        "conda" => FileType::Conda,
         "zip" | "apk" | "epub" | "aar" | "pyz" | "msix" | "appx" | "msixbundle" | "appxbundle"
-        | "aab" | "apks" | "xapk" | "cbz" => Some(FileType::Zip),
-        "xpi" => Some(FileType::Xpi),
-        "whl" => Some(FileType::Whl),
-        "7z" | "cb7" => Some(FileType::SevenZ),
-        "rar" | "cbr" => Some(FileType::Rar),
-        "rpa" => Some(FileType::Rpa),
-        "rpyc" | "rpymc" => Some(FileType::Rpyc),
-        "deb" | "udeb" => Some(FileType::Deb),
+        | "aab" | "apks" | "xapk" | "cbz" => FileType::Zip,
+        "xpi" => FileType::Xpi,
+        "whl" => FileType::Whl,
+        "7z" | "cb7" => FileType::SevenZ,
+        "rar" | "cbr" => FileType::Rar,
+        "rpa" => FileType::Rpa,
+        "rpyc" | "rpymc" => FileType::Rpyc,
+        "deb" | "udeb" => FileType::Deb,
         // Static library: an `ar` archive of object files. Magic-based
         // detection also handles extensionless `.a`; this keeps the extension
         // fallback consistent (and off the `Deb` path).
         //
         // `.lib` is the Windows spelling -- both MSVC static libraries and
-        // import libraries are `ar` archives. Without it every Windows static
-        // library identified by magic was reported as an extension/content
-        // mismatch, which is the metric several `metadata/file/extension`
-        // traits read.
-        "a" | "lib" => Some(FileType::StaticLib),
-        "rpm" | "srpm" => Some(FileType::Rpm),
-        "crx" => Some(FileType::Crx),
-        "pkg" => Some(FileType::PkgMacos),
-        "dmg" => Some(FileType::Dmg),
-        "vhd" => Some(FileType::Vhd),
-        "iso" => Some(FileType::Iso),
-        "cab" | "msu" => Some(FileType::Cab),
-        "chm" => Some(FileType::Chm),
-        "asar" => Some(FileType::Asar),
-        "phar" => Some(FileType::Phar),
-        "cpio" => Some(FileType::Cpio),
-        "gz" => Some(FileType::Gz),
-        "bz2" => Some(FileType::Bz2),
-        "xz" => Some(FileType::Xz),
-        "lzma" => Some(FileType::Lzma),
-        "zst" => Some(FileType::Zst),
+        // import libraries are `ar` archives, so a Windows static library is
+        // consistent with its name.
+        "a" | "lib" => FileType::StaticLib,
+        "rpm" | "srpm" => FileType::Rpm,
+        "crx" => FileType::Crx,
+        "pkg" => FileType::PkgMacos,
+        "dmg" => FileType::Dmg,
+        "vhd" => FileType::Vhd,
+        "iso" => FileType::Iso,
+        "cab" | "msu" => FileType::Cab,
+        "chm" => FileType::Chm,
+        "asar" => FileType::Asar,
+        "phar" => FileType::Phar,
+        "cpio" => FileType::Cpio,
+        "gz" => FileType::Gz,
+        "bz2" => FileType::Bz2,
+        "xz" => FileType::Xz,
+        "lzma" => FileType::Lzma,
+        "zst" => FileType::Zst,
         // `.hta` is an HTML Application: mshta.exe runs it as a local-trust
-        // program, so it is markup on disk but a script in effect. It is a
-        // long-standing malware delivery format and was previously unmapped,
-        // which left every `.hta` as Unknown -- and an Unknown file matches no
-        // trait, since every trait declares the types it targets. Classified as
-        // Html so existing markup/script analysis applies; a first-class Hta
-        // type would be better still, but that needs a matching variant in the
-        // consumer's rule file-type enum.
-        "html" | "htm" | "hta" => Some(FileType::Html),
+        // program, so it is markup on disk but a script in effect. Classified
+        // as Html so markup and script analysis applies.
+        "html" | "htm" | "hta" => FileType::Html,
         // R Markdown / Quarto / Sweave are markdown documents with embedded
         // code chunks — classify as Markdown so they aren't analysed as source
         // code (their YAML frontmatter and code chunks otherwise trip
         // polyglot/obfuscation matchers).
-        "md" | "markdown" | "rmd" | "qmd" | "rnw" => Some(FileType::Markdown),
-        "mk" | "mak" => Some(FileType::Makefile),
-        "dockerfile" | "containerfile" => Some(FileType::Dockerfile),
+        "rmd" | "qmd" | "rnw" => FileType::Markdown,
+        // Plain Markdown is a prose name: a document keeps it by its
+        // structure, a script renamed `.md` does not.
+        "md" | "markdown" => {
+            return Some(Claim {
+                strength: Strength::Document,
+                ..Claim::of(FileType::Markdown)
+            });
+        }
+        "mk" | "mak" => FileType::Makefile,
+        "dockerfile" | "containerfile" => FileType::Dockerfile,
         // Checksum manifests shipped beside a release. Plain text listing
         // "<hex>  <filename>" pairs — no structure worth its own type, but
         // naming them keeps a release directory out of the unknown bucket.
         "sha256sum" | "sha512sum" | "sha1sum" | "md5sum" | "sha256" | "sha512" | "checksum"
-        | "checksums" => Some(FileType::Text),
-        "txt" | "text" | "b64" | "base64" | "rst" | "adoc" | "csv" | "tsv" | "log" => {
-            Some(FileType::Text)
+        | "checksums" | "b64" | "base64" => return Some(Claim::text_language()),
+        // Configuration syntaxes and the languages with no analyzer here
+        // (Erlang, Elvish, Nushell). Their values and comments quote other
+        // languages' tokens, which is not those languages.
+        "toml" | "ini" | "cfg" | "conf" | "properties" | "erl" | "hrl" | "elv" | "nu" => {
+            return Some(Claim::text_language());
         }
+        // Prose names. A body that is plainly a language is that language;
+        // the name is the fallback when the body says nothing.
+        "txt" | "text" | "rst" | "adoc" | "csv" | "tsv" | "log" => FileType::Text,
         // Source maps are structured data sidecars. Keeping them as Data lets the
         // archive analyzer inspect both ordinary JSON maps and raw embedded
         // Base64 payloads instead of dropping them as unknown members.
-        "map" => Some(FileType::Data),
+        // The name settles it: the sources a map embeds are not its language.
+        "map" => {
+            return Some(Claim {
+                strength: Strength::Named,
+                ..Claim::of(FileType::Data)
+            });
+        }
         // Generic data suffixes that do not imply a more specific format.
         // Includes opaque payload blobs and common database filenames; content
         // signatures still take precedence over this path-based fallback.
-        "dat" | "bin" | "db" | "payload" | "raw" => Some(FileType::Data),
-        _ => None,
-    }
+        "dat" | "bin" | "db" | "payload" | "raw" => FileType::Data,
+        _ => return None,
+    };
+    Some(Claim::of(file_type))
 }
 
 /// OpenDocument extensions: the document types, their templates, master
@@ -641,9 +746,8 @@ const ODF_EXTENSIONS: &[&str] = &[
     "odi",
 ];
 
-/// Whether lowercase `ext` is an OpenDocument extension. Shared with the zip
-/// classifier, which trusts the name when no member says otherwise.
-pub(super) fn is_odf_extension(ext: &str) -> bool {
+/// Whether lowercase `ext` is an OpenDocument extension.
+fn is_odf_extension(ext: &str) -> bool {
     ODF_EXTENSIONS.contains(&ext)
 }
 

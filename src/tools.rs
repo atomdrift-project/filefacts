@@ -1,5 +1,5 @@
-//! Cached external-tool resolution with platform fallbacks, and the
-//! environment such a tool may inherit.
+//! Resolving the external tools rizin integration runs, and the environment
+//! such a tool may inherit.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -32,7 +32,7 @@ const ENV_ALLOWLIST: &[&str] = &[
 /// A tool that parses sample bytes can be taken over by them, so it must not
 /// inherit secrets such as API tokens and service keys from its caller. Apply
 /// this to every such tool before spawning it.
-pub fn scrub_env(cmd: &mut Command) {
+pub(crate) fn scrub_env(cmd: &mut Command) {
     cmd.env_clear();
     for key in ENV_ALLOWLIST {
         if let Some(value) = std::env::var_os(key) {
@@ -49,7 +49,7 @@ pub fn scrub_env(cmd: &mut Command) {
 /// should pass the returned path to `Command::new` instead of relying on a
 /// child process to repeat resolution.
 #[must_use]
-pub fn resolve(name: &str) -> Option<PathBuf> {
+pub(crate) fn resolve(name: &str) -> Option<PathBuf> {
     let cache = RESOLUTIONS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(cache) = cache.lock()
         && let Some(resolution) = cache.get(name)
@@ -59,19 +59,13 @@ pub fn resolve(name: &str) -> Option<PathBuf> {
     // Probe without the lock, so one slow filesystem walk doesn't stall
     // every other lookup. Racing callers may both probe; the first answer
     // stored is the one everyone gets.
-    let resolution = resolve_uncached(name);
+    let resolution = std::env::var_os("PATH")
+        .and_then(|path| binary_in(&path, name))
+        .or_else(|| fallback_binary(name));
     match cache.lock() {
         Ok(mut cache) => cache.entry(name.to_string()).or_insert(resolution).clone(),
         Err(_) => resolution,
     }
-}
-
-fn resolve_uncached(name: &str) -> Option<PathBuf> {
-    binary_in_path(name).or_else(|| fallback_binary(name))
-}
-
-fn binary_in_path(name: &str) -> Option<PathBuf> {
-    binary_in(&std::env::var_os("PATH")?, name)
 }
 
 /// Search the directories of a `PATH`-style list for `name`.
@@ -104,25 +98,16 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
+/// The first executable `name` in the platform's conventional install
+/// locations, for a host whose `PATH` omits them.
 fn fallback_binary(name: &str) -> Option<PathBuf> {
     let names = candidate_names(name);
-    for root in fallback_roots() {
-        if let Some(binary) = names
+    fallback_roots().into_iter().find_map(|root| {
+        names
             .iter()
             .map(|candidate| root.join(candidate))
             .find(|candidate| is_executable(candidate))
-        {
-            return Some(binary);
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        let packages = windows_env_path("LOCALAPPDATA")?.join("Microsoft/WinGet/Packages");
-        return find_in_tree(&packages, &names, 5);
-    }
-
-    None
+    })
 }
 
 fn candidate_names(name: &str) -> Vec<String> {
@@ -164,28 +149,14 @@ fn fallback_roots() -> Vec<PathBuf> {
     {
         for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
             if let Some(base) = windows_env_path(variable) {
-                roots.extend([
-                    base.join("7-Zip"),
-                    base.join("Rizin"),
-                    base.join("Rizin/bin"),
-                    base.join("UPX"),
-                    base.join("upx"),
-                    base.join("innoextract"),
-                    base.join("InnoExtract"),
-                ]);
+                roots.extend([base.join("Rizin"), base.join("Rizin/bin")]);
             }
         }
         if let Some(local) = windows_env_path("LOCALAPPDATA") {
             roots.extend([
-                local.join("Programs/7-Zip"),
                 local.join("Programs/Rizin"),
                 local.join("Programs/Rizin/bin"),
-                local.join("Programs/UPX"),
-                local.join("Programs/upx"),
-                local.join("Programs/innoextract"),
-                local.join("Programs/InnoExtract"),
                 local.join("Microsoft/WinGet/Links"),
-                local.join("Microsoft/WinGet/Packages"),
             ]);
         }
     }
@@ -198,88 +169,5 @@ fn windows_env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
 }
 
-#[cfg(windows)]
-fn find_in_tree(root: &std::path::Path, names: &[String], depth: usize) -> Option<PathBuf> {
-    if depth == 0 {
-        return None;
-    }
-    let entries = std::fs::read_dir(root).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if is_executable(&path)
-            && path.file_name().is_some_and(|file_name| {
-                names
-                    .iter()
-                    .any(|name| file_name.eq_ignore_ascii_case(name))
-            })
-        {
-            return Some(path);
-        }
-        if entry.file_type().is_ok_and(|kind| kind.is_dir())
-            && let Some(binary) = find_in_tree(&path, names, depth - 1)
-        {
-            return Some(binary);
-        }
-    }
-    None
-}
-
 #[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::Component;
-
-    const TOOL: &str = "filefacts-test-tool";
-
-    fn tool_in(dir: &Path, mode: u32) -> PathBuf {
-        let tool = dir.join(TOOL);
-        std::fs::write(&tool, b"#!/bin/sh\n").expect("write tool");
-        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(mode)).expect("chmod");
-        tool
-    }
-
-    #[test]
-    fn relative_path_entries_are_skipped() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let tool = tool_in(tmp.path(), 0o755);
-        // The same directory, spelled relative to the working directory.
-        let cwd = std::env::current_dir().expect("cwd");
-        let relative: PathBuf = cwd
-            .components()
-            .skip(1)
-            .map(|_| Component::ParentDir)
-            .chain(tmp.path().components().skip(1))
-            .collect();
-        assert!(relative.join(TOOL).is_file(), "{}", relative.display());
-        assert_eq!(binary_in(relative.as_os_str(), TOOL), None);
-        assert_eq!(binary_in(OsStr::new(""), TOOL), None);
-        assert_eq!(binary_in(tmp.path().as_os_str(), TOOL), Some(tool));
-    }
-
-    #[test]
-    fn scrubbed_tool_sees_only_allowlisted_env() {
-        let mut cmd = Command::new("env");
-        cmd.env("FILEFACTS_TEST_SECRET", "hunter2");
-        scrub_env(&mut cmd);
-        let output = cmd.output().expect("run env");
-        let stdout = String::from_utf8(output.stdout).expect("utf-8 env");
-        assert!(!stdout.contains("FILEFACTS_TEST_SECRET"), "{stdout}");
-        for line in stdout.lines() {
-            let key = line.split('=').next().unwrap_or_default();
-            assert!(ENV_ALLOWLIST.contains(&key), "unexpected variable {key}");
-        }
-        if std::env::var_os("PATH").is_some() {
-            assert!(stdout.lines().any(|line| line.starts_with("PATH=")));
-        }
-    }
-
-    #[test]
-    fn non_executable_files_are_skipped() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let tool = tool_in(tmp.path(), 0o644);
-        assert_eq!(binary_in(tmp.path().as_os_str(), TOOL), None);
-        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        assert_eq!(binary_in(tmp.path().as_os_str(), TOOL), Some(tool));
-    }
-}
+mod tests;

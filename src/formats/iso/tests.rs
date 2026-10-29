@@ -173,6 +173,31 @@ fn file_in_one_namespace_is_still_tree_only() {
     assert!(anomalies.contains(&"tree-only-file"));
 }
 
+/// Hard links, several names for one extent within one tree, each stay a
+/// member, paired across trees in order; and a tree full of links to one
+/// extent keeps every name list at one entry, so the merge stays linear.
+#[test]
+fn hard_links_stay_distinct_members() {
+    let entries = vec![
+        entry(Namespace::Iso9660, "/A.EXE", 40, 512, 0),
+        entry(Namespace::Iso9660, "/B.EXE", 40, 512, 0),
+        entry(Namespace::Joliet, "/a.exe", 40, 512, 0),
+        entry(Namespace::Joliet, "/b.exe", 40, 512, 0),
+    ];
+    let files = merge_namespaces(entries, &mut Vec::new());
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0].names.len(), 2);
+    assert_eq!(files[1].names[1].1, "b.exe");
+
+    let links = 64 << 10;
+    let entries: Vec<Entry> = (0..links)
+        .map(|i| entry(Namespace::Iso9660, &format!("/L{i}"), 40, 512, 0))
+        .collect();
+    let files = merge_namespaces(entries, &mut Vec::new());
+    assert_eq!(files.len(), links);
+    assert!(files.iter().all(|f| f.names.len() == 1));
+}
+
 #[test]
 fn joliet_levels_recognised() {
     assert_eq!(joliet_level(b"%/@"), Some(1));

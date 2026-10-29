@@ -92,7 +92,7 @@ pub(super) fn extract(
     // Every distinct unknown type, for the dedup: a `Vec` scan per chunk
     // made a file of distinct types quadratic.
     let mut unknown_seen: HashSet<[u8; 4]> = HashSet::new();
-    let mut limits: Vec<JsonValue> = Vec::new();
+    let mut limits = super::bounded::Limits::default();
     let mut text_kv = serde_json::Map::new();
     let mut features: Vec<&'static str> = Vec::new();
     let mut dim_obj = serde_json::Map::new();
@@ -102,10 +102,10 @@ pub(super) fn extract(
     let mut i = 8usize;
     while let Some(head) = bytes.get(i..).and_then(<[u8]>::first_chunk::<8>) {
         if chunks_total >= MAX_CHUNKS {
-            limits.push(json!({
-                "stage": "chunk-cap",
-                "reason": format!("chunk walk stopped after {MAX_CHUNKS} chunks"),
-            }));
+            limits.push(
+                "chunk-cap",
+                format!("chunk walk stopped after {MAX_CHUNKS} chunks"),
+            );
             coverage.problem("chunk walk stopped at its cap");
             break;
         }
@@ -298,14 +298,12 @@ pub(super) fn extract(
     }
 
     if listed_chunks == MAX_LISTED_CHUNKS && chunks_total > listed_chunks {
-        limits.push(json!({
-            "stage": "chunk-list",
-            "reason": format!("png.chunks lists the first {MAX_LISTED_CHUNKS} of {chunks_total} chunks"),
-        }));
+        limits.push(
+            "chunk-list",
+            format!("png.chunks lists the first {MAX_LISTED_CHUNKS} of {chunks_total} chunks"),
+        );
     }
-    if !limits.is_empty() {
-        values.insert_key(value_key!("png.limits"), JsonValue::Array(limits));
-    }
+    limits.emit(values, value_key!("png.limits"));
 
     metrics.insert(metric!("png.chunk_count"), chunks_total as f64);
     metrics.insert(metric!("png.idat_chunk_count"), chunks_idat as f64);
@@ -418,9 +416,12 @@ fn claim_all_idat(extents: &[IdatExtent], coverage: &mut Coverage) {
 fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
     use png::Decoder;
 
-    let decoder = Decoder::new(bytes);
-    let Ok(mut reader) = decoder.read_info() else {
-        return;
+    let skipped = |reason: &str| {
+        tracing::debug!(target: "filefacts::png", stage = "pixel-stats", reason, "pixel statistics skipped");
+    };
+    let mut reader = match Decoder::new(std::io::Cursor::new(bytes)).read_info() {
+        Ok(reader) => reader,
+        Err(e) => return skipped(&format!("header did not decode: {e}")),
     };
     let info = reader.info();
     let width = info.width;
@@ -437,16 +438,19 @@ fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
     metrics.insert(metric!("image.height"), f64::from(height));
     metrics.insert(metric!("image.channels"), f64::from(channels));
 
-    let buf_size = reader.output_buffer_size();
-    if buf_size > image_stats::MAX_DECODE_BYTES {
-        return;
-    }
+    let Some(buf_size) = reader
+        .output_buffer_size()
+        .filter(|&size| size <= image_stats::MAX_DECODE_BYTES)
+    else {
+        return skipped("decoded image larger than the decode cap");
+    };
     let mut pixels = vec![0u8; buf_size];
-    let Ok(output_info) = reader.next_frame(&mut pixels) else {
-        return;
+    let output_info = match reader.next_frame(&mut pixels) {
+        Ok(info) => info,
+        Err(e) => return skipped(&format!("frame did not decode: {e}")),
     };
     let Some(pixels) = pixels.get(..output_info.buffer_size()) else {
-        return;
+        return skipped("frame larger than its buffer");
     };
 
     let raw_size = (width as usize)
@@ -473,9 +477,8 @@ fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
         metrics.insert(metric!("image.b_entropy"), f64::from(b));
         metrics.insert(metric!("png.a_entropy"), f64::from(a));
     } else {
-        // Mirror cleave's prior behavior: grayscale images put the
-        // overall pixel entropy into `r_entropy` so traits keyed on
-        // the red channel still fire for single-channel images.
+        // A single-channel image reports its pixel entropy as
+        // `r_entropy`, so a rule keyed on the red channel still applies.
         metrics.insert(metric!("image.r_entropy"), pixel_entropy);
         metrics.insert(metric!("image.g_entropy"), 0.0);
         metrics.insert(metric!("image.b_entropy"), 0.0);

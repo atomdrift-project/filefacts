@@ -2,25 +2,31 @@
 //!
 //! Reads macOS / iOS executables, dylibs, kernel extensions, and Mach-O
 //! FAT (universal) binaries. Surfaces header fields, the load-command
-//! list, LC_LOAD_DYLIB references, LC_RPATH entries, the LC_UUID, and
-//! code-signature presence.
+//! list, dylib references and versions, LC_RPATH entries, the LC_UUID,
+//! the embedded code signature, embedded plists, segment layout, typed
+//! imports and exports, Go build info and similarity hashes.
 //!
 //! For FAT binaries, exposes per-arch slices under `macho.slices[]`
-//! and surfaces the first slice's metadata at the top level so simple
-//! consumers don't have to enumerate the array.
+//! and surfaces the first parseable slice's metadata at the top level so
+//! simple consumers don't have to enumerate the array.
 
-use crate::bytes;
-use crate::metric;
-use crate::value_key;
+mod code_signature;
+mod fat;
+mod hashes;
+mod symbols;
+
 use goblin::mach::{self, Mach, MachO};
 use serde_json::Value as JsonValue;
 
+use crate::bytes;
 use crate::formats::common::{
     NativeFormat, RizinTarget, XorScan, extract_binary_strings, extract_binary_strings_from_object,
     plist_to_json, put_str, put_u64, rizin_fallback, section_entropy,
 };
 use crate::formats::goblin_safe;
+use crate::metric;
 use crate::output::{Errors, Metrics, Section, SectionFlag, ValueKey, Values};
+use crate::value_key;
 
 pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     let super::ExtractCtx {
@@ -34,10 +40,10 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
         ref rizin,
         ..
     } = ctx;
-    // Wrap goblin parse in catch_unwind. Fat-header arithmetic
-    // overflow on malformed Mach-O has historically panicked
-    // goblin; record the failure and return Ok so byte-level
-    // metrics from the generic pass aren't lost.
+    // goblin has panicked on fat-header arithmetic overflow in malformed
+    // Mach-O; `parse_mach` turns that into an outcome. A failed parse is
+    // recorded in `errors`, and the byte-level facts the generic pass already
+    // put in `metrics` and `strings` stand.
     let parsed = match goblin_safe::parse_mach(bytes) {
         goblin_safe::GoblinOutcome::Ok(m) => m,
         goblin_safe::GoblinOutcome::Failed(e) => {
@@ -60,7 +66,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     // count (rizin; stng's walk of a parsed object) visit every claimed entry,
     // up to `u32::MAX` of them.
     let fat_table_fits = match &parsed {
-        Mach::Fat(fat) => fat_table_fits(fat.narches, bytes.len()),
+        Mach::Fat(fat) => fat::table_fits(fat.narches, bytes.len()),
         Mach::Binary(_) => true,
     };
     // stng's ARM64 stack-XOR scan calls goblin's `imports()` itself, outside
@@ -82,17 +88,13 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     let goblin::Object::Mach(parsed) = object else {
         unreachable!("constructed as Object::Mach")
     };
-    // Resolve the Go attribution sections (pclntab + read-only data) from
-    // the thin-binary case while the parsed Mach-O is in scope; the bytes
-    // they reference outlive it. Fat binaries skip pclntab-based GoRoot
-    // recovery (rare for Go) but still get build-id via the marker scan.
-    // When the open asked for native-arch-only (e.g. `ascan ps`), hand rizin just the
-    // host-native slice of a fat binary instead of the whole universal file —
-    // the other slices will never run here and full `aaa` on each is the bulk
-    // of the per-binary cost. Falls back to the whole input for thin binaries
-    // or when no native slice is found.
+    // When the open asked for native-arch-only, hand rizin just the
+    // host-native slice of a fat binary instead of the whole universal file:
+    // the other slices never run here, and full analysis of each is the bulk
+    // of the per-binary cost. Thin binaries, and fat ones with no native
+    // slice, hand rizin the whole input.
     let mut native_rizin_range: Option<(usize, usize)> = None;
-    let (go_pclntab, go_rodata) = match parsed {
+    let has_go_pclntab = match parsed {
         Mach::Binary(macho) => {
             single_arch(
                 &macho,
@@ -104,17 +106,19 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
                 errors_out,
             );
             *image_end = Some(image_end_of(&macho));
-            macho_go_sections(&macho)
+            go_build_info(&macho, bytes, values)
         }
         Mach::Fat(fat) => {
             // goblin reads the arch table lazily; walk it once, guarded.
             // Entries are contiguous, so the first unreadable one ends it.
             let arches = goblin_safe::drain_or_record(
-                fat.iter_arches().take(MAX_FAT_ARCHES).map_while(Result::ok),
+                fat.iter_arches()
+                    .take(fat::MAX_ARCHES)
+                    .map_while(Result::ok),
                 errors_out,
                 crate::Stage::MachoParse,
             );
-            *image_end = fat_binary(
+            let analysed = fat::analyse(
                 bytes,
                 &arches,
                 values,
@@ -123,17 +127,17 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
                 symbols_out,
                 errors_out,
             );
+            *image_end = analysed.image_end;
             if rizin.native_arch_only {
-                native_rizin_range = native_slice_range(bytes, &arches);
+                native_rizin_range = fat::native_slice_range(bytes, &arches);
             }
-            (None, None)
+            analysed.has_go_pclntab
         }
     };
     let rizin_bytes = match native_rizin_range {
         Some((start, end)) => bytes.get(start..end).unwrap_or(bytes),
         None => bytes,
     };
-    let has_go_pclntab = go_pclntab.is_some_and(super::go_buildinfo::has_pclntab_magic);
     if fat_table_fits {
         rizin_fallback(
             RizinTarget {
@@ -149,12 +153,6 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
         );
     }
     super::upx::detect(bytes, values);
-    let go_sections = super::go_buildinfo::GoSections {
-        buildid_note: None,
-        pclntab: go_pclntab,
-        rodata: go_rodata,
-    };
-    super::go_buildinfo::detect(bytes, values, value_key!("macho.go"), None, &go_sections);
 }
 
 /// A segment's sections, which goblin reads lazily from the load command on
@@ -166,30 +164,66 @@ fn segment_sections<'a>(
     goblin_safe::catch(|| segment.sections()).ok()
 }
 
-/// Resolve the `__TEXT,__gopclntab` and read-only data (`__const`,
-/// falling back to `__rodata`) section bytes used for Go attribution.
-fn macho_go_sections<'a>(macho: &MachO<'a>) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
-    let (mut pclntab, mut const_data, mut rodata) = (None, None, None);
+/// Decode Go build info from the Mach-O image in `bytes` into `macho.go`,
+/// and report whether `__TEXT,__gopclntab` holds a real Go pclntab.
+///
+/// The build-info blob is looked for where Go's `debug/buildinfo` looks: the
+/// `__go_buildinfo` section, else the first non-empty segment mapped
+/// read-write (initial and maximum protection both). Pre-1.18 pointers
+/// resolve through the segments' file extents.
+fn go_build_info(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) -> bool {
+    const VM_PROT_RW: u32 = 0x3;
+    let (mut buildinfo, mut pclntab, mut const_data, mut rodata) = (None, None, None, None);
+    let mut writable_segment = None;
     for segment in &macho.segments {
-        if segment.name().unwrap_or("") != "__TEXT" {
-            continue;
+        let segment_name = segment.name().unwrap_or("");
+        if writable_segment.is_none()
+            && segment.vmaddr != 0
+            && segment.filesize != 0
+            && segment.initprot == VM_PROT_RW
+            && segment.maxprot == VM_PROT_RW
+        {
+            let start = bytes::sat_usize(segment.fileoff);
+            let end = start.saturating_add(bytes::sat_usize(segment.filesize));
+            writable_segment = bytes.get(start..end.min(bytes.len()));
         }
         let Some(secs) = segment_sections(segment) else {
             continue;
         };
         for (section, data) in secs {
-            match section.name().unwrap_or("") {
-                "__gopclntab" => pclntab = Some(data),
-                "__const" => const_data = Some(data),
-                "__rodata" => rodata = Some(data),
+            match (segment_name, section.name().unwrap_or("")) {
+                (_, "__go_buildinfo") if buildinfo.is_none() => buildinfo = Some(data),
+                ("__TEXT", "__gopclntab") => pclntab = Some(data),
+                ("__TEXT", "__const") => const_data = Some(data),
+                ("__TEXT", "__rodata") => rodata = Some(data),
                 _ => {}
             }
         }
     }
-    (pclntab, const_data.or(rodata))
+    let resolve = |va: u64| {
+        macho.segments.iter().find_map(|s| {
+            let delta = va.checked_sub(s.vmaddr)?;
+            (delta < s.filesize)
+                .then(|| s.fileoff.saturating_add(delta))
+                .and_then(|offset| usize::try_from(offset).ok())
+        })
+    };
+    let sections = super::go_buildinfo::GoSections {
+        buildinfo: buildinfo.or(writable_segment),
+        buildid_note: None,
+        pclntab,
+        rodata: const_data.or(rodata),
+    };
+    super::go_buildinfo::detect(
+        bytes,
+        values,
+        value_key!("macho.go"),
+        Some(&resolve),
+        &sections,
+    );
+    pclntab.is_some_and(super::go_buildinfo::has_pclntab_magic)
 }
 
-/// Whether a fat header's declared arch count fits in a file of `len` bytes.
 /// A copy of `bytes` in which every slice whose bind streams
 /// [`goblin_safe::validate_bind_opcodes`] rejects has its `LC_DYLD_INFO`
 /// bind and lazy-bind sizes zeroed, so goblin's `imports()` finds nothing to
@@ -213,9 +247,9 @@ fn bind_defused_copy(parsed: &Mach<'_>, bytes: &[u8]) -> Option<Vec<u8>> {
     match parsed {
         Mach::Binary(macho) => defuse(macho, bytes, 0),
         Mach::Fat(fat) => {
-            let arches = goblin_safe::catch_infallible(|| {
+            let arches = crate::panic_guard::catch_infallible(|| {
                 fat.iter_arches()
-                    .take(MAX_FAT_ARCHES)
+                    .take(fat::MAX_ARCHES)
                     .map_while(Result::ok)
                     .collect::<Vec<_>>()
             })
@@ -243,144 +277,6 @@ fn bind_defused_copy(parsed: &Mach<'_>, bytes: &[u8]) -> Option<Vec<u8>> {
         }
     }
     Some(copy)
-}
-
-fn fat_table_fits(narches: usize, len: usize) -> bool {
-    narches
-        <= len.saturating_sub(goblin::mach::fat::SIZEOF_FAT_HEADER)
-            / goblin::mach::fat::SIZEOF_FAT_ARCH
-}
-
-/// Most fat-header entries examined. `iter_arches` runs to the header's
-/// `nfat_arch` (up to `u32::MAX`) without checking it against the buffer, and
-/// each in-bounds entry costs a full slice analysis; real binaries carry a few.
-const MAX_FAT_ARCHES: usize = 64;
-
-/// Byte range of the host-native architecture slice within a fat Mach-O, used to
-/// hand rizin only the slice that can run on this host (see `extract`). Matches
-/// on `cputype` so `arm64` and `arm64e` (same cputype, different subtype) both
-/// resolve on Apple silicon. Returns `None` for an unknown host arch or when no
-/// slice matches — callers fall back to the whole input.
-fn native_slice_range(bytes: &[u8], arches: &[mach::fat::FatArch]) -> Option<(usize, usize)> {
-    // CPU_TYPE_* constants (mach/machine.h). The CPU_ARCH_ABI64 bit (0x0100_0000)
-    // is set on the 64-bit variants we target.
-    #[cfg(target_arch = "aarch64")]
-    const NATIVE_CPU_TYPE: u32 = 0x0100_000C; // CPU_TYPE_ARM64
-    #[cfg(target_arch = "x86_64")]
-    const NATIVE_CPU_TYPE: u32 = 0x0100_0007; // CPU_TYPE_X86_64
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    const NATIVE_CPU_TYPE: u32 = 0;
-
-    if NATIVE_CPU_TYPE == 0 {
-        return None;
-    }
-    for arch in arches {
-        if arch.cputype != NATIVE_CPU_TYPE {
-            continue;
-        }
-        let start = arch.offset as usize;
-        if start >= bytes.len() {
-            return None;
-        }
-        let end = start.saturating_add(arch.size as usize).min(bytes.len());
-        if end > start {
-            return Some((start, end));
-        }
-    }
-    None
-}
-
-/// Analyse every slice of a fat binary; returns the end of the last
-/// slice's image in whole-file offsets (see [`image_end_of`]), or `None`
-/// when no slice parsed.
-fn fat_binary(
-    bytes: &[u8],
-    arches: &[mach::fat::FatArch],
-    values: &mut Values,
-    metrics: &mut Metrics,
-    sections_out: &mut Vec<Section>,
-    symbols_out: &mut crate::Symbols,
-    errors_out: &mut Errors,
-) -> Option<u64> {
-    let mut slices: Vec<JsonValue> = Vec::new();
-    let mut image_end: Option<u64> = None;
-    // Slices of a real universal binary are disjoint. Each slice gets a full
-    // analysis (code-page hashing, plists, symbols), and nothing else stops
-    // every arch entry naming the same whole-file slice, multiplying that
-    // work by `MAX_FAT_ARCHES`; a slice overlapping one already analysed is
-    // skipped, so together they cost one pass over the file.
-    let mut analysed: Vec<std::ops::Range<usize>> = Vec::new();
-    for (idx, arch) in arches.iter().enumerate() {
-        // `arch.offset` and `arch.size` come from the fat header — on
-        // a misclassified CAFEBABE input (Java `.class` mistaken for
-        // Mach-O fat) they are random bytes and routinely overflow
-        // the file. Validate the start before slicing; `.min(end)`
-        // alone only clamps the upper bound and still panics on a
-        // huge start.
-        let start = arch.offset as usize;
-        if start >= bytes.len() {
-            continue;
-        }
-        let end = start.saturating_add(arch.size as usize).min(bytes.len());
-        let Some(slice_bytes) = bytes.get(start..end) else {
-            continue;
-        };
-        if analysed.iter().any(|r| r.start < end && start < r.end) {
-            errors_out.record_malformed(
-                crate::Stage::MachoParse,
-                format!("fat slice {idx} overlaps the slices before it"),
-            );
-            continue;
-        }
-        analysed.push(start..end);
-        // An unparseable slice is skipped; a panicking one is also recorded,
-        // as a panic on the container itself would be.
-        let macho = match goblin_safe::parse_macho_slice(slice_bytes) {
-            goblin_safe::GoblinOutcome::Ok(macho) => macho,
-            goblin_safe::GoblinOutcome::Failed(_) => continue,
-            goblin_safe::GoblinOutcome::Panicked(msg) => {
-                errors_out.record_panic(crate::Stage::MachoParse, msg);
-                continue;
-            }
-        };
-        let slice_end = u64::from(arch.offset).saturating_add(image_end_of(&macho));
-        image_end = image_end.max(Some(slice_end));
-        // Every slice gets the same forensic analysis as a single-arch
-        // binary: full header/load-command extraction, code signature,
-        // similarity hashes, segments. The result lands in this
-        // slice's entry of `macho.slices[]`. File-offset extent within
-        // the fat wrapper (`file_offset` + `file_size`) is added by
-        // the caller — consumers walking per-arch byte ranges read
-        // those rather than re-parsing the fat header.
-        let mut slice_entry = analyze_slice(&macho, slice_bytes);
-        if let JsonValue::Object(ref mut obj) = slice_entry {
-            obj.insert("file_offset".into(), JsonValue::Number(arch.offset.into()));
-            obj.insert("file_size".into(), JsonValue::Number(arch.size.into()));
-        }
-        slices.push(slice_entry);
-        if idx == 0 {
-            let first_section = sections_out.len();
-            single_arch(
-                &macho,
-                slice_bytes,
-                values,
-                metrics,
-                sections_out,
-                symbols_out,
-                errors_out,
-            );
-            // Unified sections address the whole input; load-command offsets
-            // address the slice. Entropy was already computed on slice bytes.
-            for section in sections_out.iter_mut().skip(first_section) {
-                if section.file_size > 0 {
-                    section.file_offset = section.file_offset.saturating_add(start as u64);
-                }
-            }
-        }
-    }
-    metrics.insert(metric!("macho.slice_count"), slices.len() as f64);
-    values.insert_key(value_key!("macho.slices"), JsonValue::Array(slices));
-    image_end
 }
 
 /// File offset one past the last byte the image itself accounts for:
@@ -451,73 +347,9 @@ fn image_end_of(macho: &MachO<'_>) -> u64 {
     end
 }
 
-/// Run the full single-arch extractor on a slice and return the
-/// resulting `macho.*` subtree as a JSON object. Used for FAT
-/// binaries so each architecture's view is recoverable independently
-/// of which slice happens to sit at index zero. Throws away the
-/// cross-format `Metrics`, `Symbols`, and `Section` outputs — those
-/// keep tracking the preferred slice via `single_arch`.
-fn analyze_slice(macho: &MachO<'_>, slice_bytes: &[u8]) -> JsonValue {
-    use crate::output::SymbolKind;
-    let mut slice_values = Values::new();
-    let mut throwaway_metrics = Metrics::new();
-    let mut throwaway_sections: Vec<Section> = Vec::new();
-    let mut throwaway_symbols = crate::Symbols::new();
-
-    extract_sections(
-        macho,
-        slice_bytes,
-        &mut throwaway_metrics,
-        &mut throwaway_sections,
-    );
-    extract_header_and_loads(
-        macho,
-        slice_bytes,
-        &mut slice_values,
-        &mut throwaway_metrics,
-    );
-    extract_symbols(
-        macho,
-        slice_bytes,
-        &mut throwaway_symbols,
-        &mut Errors::new(),
-    );
-    super::macho_hashes::emit(macho, slice_bytes, &mut slice_values, &throwaway_symbols);
-
-    let import_count = throwaway_symbols.iter_kind(SymbolKind::Import).count() as u64;
-    let export_count = throwaway_symbols.iter_kind(SymbolKind::Export).count() as u64;
-
-    // Pluck the `macho.*` subtree the extractors built and return it
-    // as the slice entry. Anything else (a flat key the future code
-    // path might add) is dropped — slices carry only Mach-O-shaped
-    // data.
-    let mut root = slice_values.into_json();
-    if let Some(obj) = root.as_object_mut() {
-        if let Some(macho_sub) = obj.remove("macho") {
-            // Counts the slice has at the unified-view level — exported
-            // as integers on the slice for symmetry with `imports.count`
-            // / `exports.count` on the top-level binary.
-            if let JsonValue::Object(mut m) = macho_sub {
-                m.insert(
-                    "import_count".into(),
-                    JsonValue::Number(import_count.into()),
-                );
-                m.insert(
-                    "export_count".into(),
-                    JsonValue::Number(export_count.into()),
-                );
-                m.insert(
-                    "section_count".into(),
-                    JsonValue::Number((throwaway_sections.len() as u64).into()),
-                );
-                return JsonValue::Object(m);
-            }
-            return macho_sub;
-        }
-    }
-    JsonValue::Object(serde_json::Map::new())
-}
-
+/// The full single-arch extraction of one Mach-O image into the top-level
+/// outputs: sections, header and load commands, symbols, similarity hashes
+/// and toolchain attribution.
 fn single_arch(
     macho: &MachO<'_>,
     bytes: &[u8],
@@ -527,287 +359,18 @@ fn single_arch(
     symbols_out: &mut crate::Symbols,
     errors_out: &mut Errors,
 ) {
-    extract_sections(macho, bytes, metrics, sections_out);
+    extract_sections(macho, bytes, sections_out);
     extract_header_and_loads(macho, bytes, values, metrics);
-    extract_symbols(macho, bytes, symbols_out, errors_out);
-    super::macho_hashes::emit(macho, bytes, values, symbols_out);
+    symbols::extract(macho, bytes, symbols_out, errors_out);
+    hashes::emit(macho, bytes, values, symbols_out);
     super::build_toolchain::from_macho(values, sections_out);
-}
-
-/// Walk Mach-O's dyld bind-info (imports) and export trie (exports)
-/// and surface them as typed `Imports`/`Exports` entries.
-///
-/// Two source tags distinguish how the entry was discovered:
-/// `macho-bind` for two-level-namespace bind imports (carrying the
-/// resolving dylib stem), `macho-trie` for exports recovered from
-/// the dyld export trie. A bind stream or export trie refused as hostile
-/// yields no entries and is recorded in `errors`.
-fn extract_symbols(
-    macho: &MachO<'_>,
-    bytes: &[u8],
-    symbols_out: &mut crate::Symbols,
-    errors: &mut Errors,
-) {
-    // Map each undefined external symbol to the file offset of its name in
-    // the `LC_SYMTAB` string table. goblin's `Import::offset` is the dyld
-    // *bind* slot (a pointer in `__got`/`__DATA`, binary data), but every
-    // other consumer anchors a symbol at its human-readable name — ELF
-    // imports point into `.dynstr`, and the hex/context view expects to
-    // render the name's ASCII. Anchoring imports at the name string keeps
-    // Mach-O consistent with ELF and makes the annotated bytes readable.
-    let name_offsets = import_name_offsets(macho, bytes);
-
-    // Imports — dylib stems are normalised to the bare library name
-    // (lowercased, basename only, `.dylib`/`.tbd` suffix stripped) so
-    // trait authors can match against `"libsystem.b"` rather than
-    // `"/usr/lib/libSystem.B.dylib"`.
-    let mut bind_imports = 0usize;
-    // `imports()` walks dyld bind opcodes lazily, after `parse_mach` has
-    // already returned, so the parse-time guard does not cover it. goblin
-    // 0.10.7 indexes the libs table with an unchecked ordinal
-    // (mach/imports.rs:103) and panics on a malformed one. LLVM's test corpus
-    // is full of deliberately malformed Mach-O, and a panic on a rayon worker
-    // took down the whole scan of llvm-toolchain-17 (142MB) with SIGSEGV.
-    // A panic here yields no imports and is recorded in `errors`.
-    // The opcodes are counted first: a forged repeat count makes goblin
-    // allocate billions of imports, and `catch` cannot stop an out-of-memory
-    // abort (see `validate_bind_opcodes`).
-    let imports = match goblin_safe::validate_bind_opcodes(macho, bytes) {
-        Ok(()) => goblin_safe::catch(|| macho.imports()),
-        Err(reason) => {
-            errors.record_malformed(crate::Stage::MachoParse, reason.to_string());
-            goblin_safe::GoblinOutcome::Failed(goblin::error::Error::Malformed(reason.to_string()))
-        }
-    };
-    if let goblin_safe::GoblinOutcome::Panicked(msg) = &imports {
-        errors.record_panic(crate::Stage::MachoParse, msg.clone());
-    }
-    if let goblin_safe::GoblinOutcome::Ok(imports) = imports {
-        for imp in &imports {
-            let library = normalize_dylib_path(imp.dylib);
-            // Prefer the name-string offset; fall back to the bind slot
-            // when the symbol has no `LC_SYMTAB` entry (rare, e.g.
-            // dyld-info-only binaries).
-            let offset = name_offsets.get(imp.name).copied().unwrap_or(imp.offset);
-            bind_imports += 1;
-            symbols_out.push(crate::Symbol::Import {
-                // Record the base symbol, not the Darwin `$VARIANT` spelling,
-                // so anchored trait matchers and imphash see `popen` rather
-                // than `popen$DARWIN_EXTSN`. The offset lookup above still uses
-                // the raw name — that is how it is keyed in `LC_SYMTAB`.
-                name: strip_darwin_symbol_variant(imp.name).to_string(),
-                alias: None,
-                library: Some(library),
-                offset: Some(offset),
-                ordinal: None,
-            });
-        }
-        // Import count flows through cross-format `imports.count`.
-    }
-
-    // Chained-fixups fallback.
-    //
-    // `macho.imports()` reads dyld *bind opcodes* (`LC_DYLD_INFO`). Binaries
-    // linked for macOS 12 and later carry `LC_DYLD_CHAINED_FIXUPS` instead and
-    // have no bind opcodes at all, so that call returns an empty list and the
-    // binary appeared to import nothing -- which is every current macOS build,
-    // malware included. A stealer whose only libc import is `system` looked
-    // identical to a binary with no imports whatsoever, and every `type:
-    // import` trait was blind to it.
-    //
-    // The undefined external symbols in `LC_SYMTAB` are those same imports,
-    // and `import_name_offsets` has already walked them to build the offset
-    // map above, so recovering them costs nothing extra. The dylib each one
-    // resolves to lives in the fixup chains rather than the symbol table, so
-    // `library` is left unset here instead of guessed at -- trait matchers key
-    // on the symbol name, and a wrong library is worse than none.
-    if bind_imports == 0 && !name_offsets.is_empty() {
-        let mut names: Vec<(&str, u64)> = name_offsets.iter().map(|(n, o)| (*n, *o)).collect();
-        names.sort_unstable();
-        for (name, offset) in names {
-            symbols_out.push(crate::Symbol::Import {
-                name: strip_darwin_symbol_variant(name).to_string(),
-                alias: None,
-                library: None,
-                offset: Some(offset),
-                ordinal: None,
-            });
-        }
-    }
-
-    // Exports — recovered from the dyld export trie. Re-exports
-    // (e.g. `libSystem` forwarding to `libdyld`) come through as
-    // regular `Export` entries; we surface only the name here, with
-    // forwarded-target handling left to a follow-up.
-    // Same exposure as `imports()` above: the export trie is walked lazily and
-    // goblin indexes it unchecked (mach/exports.rs:99). Worse than a panic, a
-    // trie with an edge back to an ancestor walks forever, and `catch` cannot
-    // interrupt a walk that never faults — so the trie is checked for loops
-    // first and a malformed one yields no exports (see `validate_export_trie`).
-    let exports = match goblin_safe::validate_export_trie(macho, bytes) {
-        Ok(()) => goblin_safe::catch(|| macho.exports()),
-        Err(reason) => {
-            errors.record_malformed(crate::Stage::MachoParse, reason.to_string());
-            goblin_safe::GoblinOutcome::Failed(goblin::error::Error::Malformed(reason.to_string()))
-        }
-    };
-    if let goblin_safe::GoblinOutcome::Panicked(msg) = &exports {
-        errors.record_panic(crate::Stage::MachoParse, msg.clone());
-    }
-    if let goblin_safe::GoblinOutcome::Ok(exports) = exports {
-        for exp in &exports {
-            symbols_out.push(crate::Symbol::Export {
-                // Normalize the same Darwin `$VARIANT` suffix as imports: these
-                // markers are *defined* in libSystem, so a library re-exporting
-                // libc carries them here. The allow-list leaves a binary's own
-                // `_OBJC_CLASS_$_…` exports intact.
-                name: strip_darwin_symbol_variant(&exp.name).to_string(),
-                offset: Some(exp.offset),
-                ordinal: None,
-                // dyld re-exports are surfaced via ExportInfo::Reexport
-                // in goblin; this extractor surfaces them as plain
-                // entries today and leaves forwarded-target decoding
-                // for a follow-up.
-                forward_to: None,
-            });
-        }
-        // Export count flows through cross-format `exports.count`.
-    }
-}
-
-/// Build a map from undefined-external symbol name to the file offset of
-/// that name in the `LC_SYMTAB` string table (`stroff + n_strx`).
-///
-/// These are the binary's imports as recorded in the static symbol table.
-/// goblin's `SymbolIterator` already resolves each `nlist` to its name, so
-/// we only need the absolute `stroff` from the symtab load command to turn
-/// the relative `n_strx` into a file offset. Returns an empty map when the
-/// binary is stripped (no `LC_SYMTAB`) — callers fall back to the bind slot.
-fn import_name_offsets<'a>(
-    macho: &MachO<'a>,
-    bytes: &[u8],
-) -> std::collections::HashMap<&'a str, u64> {
-    const N_EXT: u8 = 0x01;
-    const N_TYPE_MASK: u8 = 0x0e;
-    const N_UNDF: u8 = 0x00;
-
-    let mut offsets = std::collections::HashMap::new();
-    let Some(stroff) = macho.load_commands.iter().find_map(|lc| match lc.command {
-        mach::load_command::CommandVariant::Symtab(st) => Some(u64::from(st.stroff)),
-        _ => None,
-    }) else {
-        return offsets;
-    };
-
-    // goblin resolves each name through a file-controlled `n_strx` as the
-    // walk advances; an unwalkable table leaves only the bind-slot offsets.
-    let symbols = goblin_safe::drain(symtab_symbols(macho, bytes))
-        .ok()
-        .unwrap_or_default();
-    for sym in symbols {
-        let Ok((name, nlist)) = sym else { continue };
-        // External + undefined == imported symbol; `n_strx == 0` has no name.
-        if nlist.n_type & N_EXT == 0
-            || nlist.n_type & N_TYPE_MASK != N_UNDF
-            || nlist.n_strx == 0
-            || name.is_empty()
-        {
-            continue;
-        }
-        // First occurrence wins; duplicate undefined entries are degenerate.
-        offsets
-            .entry(name)
-            .or_insert_with(|| stroff + nlist.n_strx as u64);
-    }
-    offsets
-}
-
-/// The `LC_SYMTAB` entries whose `nlist` lies inside `bytes`, the buffer
-/// `macho` was parsed from.
-///
-/// goblin walks the header's `nsyms` (up to `u32::MAX`) without checking it
-/// against the file and yields an error for every entry past the end, so a
-/// forged count costs four billion steps, and collecting the walk aborts on
-/// the allocation. No entry past the end can parse, so stopping there loses
-/// nothing.
-pub(super) fn symtab_symbols<'a>(
-    macho: &MachO<'a>,
-    bytes: &[u8],
-) -> std::iter::Take<mach::symbols::SymbolIterator<'a>> {
-    let nlist_size = if macho.is_64 { 16 } else { 12 };
-    let fitting = macho
-        .load_commands
-        .iter()
-        .find_map(|lc| match lc.command {
-            mach::load_command::CommandVariant::Symtab(st) => {
-                Some(bytes.len().saturating_sub(bytes::sat_usize(st.symoff)) / nlist_size)
-            }
-            _ => None,
-        })
-        .unwrap_or(0);
-    macho.symbols().take(fitting)
-}
-
-/// Symbol-variant markers Darwin appends to a libc name after a `$`. Each
-/// selects a binary-compatible implementation of the *same* function, so it
-/// is an ABI/SDK detail rather than a distinct capability. This is the
-/// complete set libSystem uses; extend it here if Apple introduces another.
-const DARWIN_SYMBOL_VARIANTS: &[&str] =
-    &["UNIX2003", "DARWIN_EXTSN", "INODE64", "NOCANCEL", "1050"];
-
-/// Strip a macOS symbol-variant suffix, returning the base symbol.
-///
-/// Darwin records several libc calls under a `$`-variant spelling:
-/// `popen$DARWIN_EXTSN`, `open$NOCANCEL`, `stat$INODE64`, `write$UNIX2003`
-/// (variants can chain, e.g. `close$NOCANCEL$UNIX2003`). The analytically
-/// meaningful name is the base before the first `$` — the function the symbol
-/// actually refers to, whether the binary imports it or (as libSystem and its
-/// re-exporters do) defines it. Recording the raw spelling let anchored trait
-/// matchers (`^popen$`) and imphash/export-hash clustering miss it.
-///
-/// Only a suffix built entirely from known [`DARWIN_SYMBOL_VARIANTS`] tokens
-/// is stripped. `$` also carries unrelated conventions — Objective-C class
-/// references (`_OBJC_CLASS_$_NSURL`) and linker directives (`$ld$hide$…`) —
-/// and those must survive untouched, so a shape heuristic is not enough: an
-/// all-caps class name like `NSURL` would be mistaken for a variant. The
-/// allow-list keys on the actual ABI markers instead.
-fn strip_darwin_symbol_variant(name: &str) -> &str {
-    match name.split_once('$') {
-        Some((base, tail))
-            if !base.is_empty()
-                && tail
-                    .split('$')
-                    .all(|token| DARWIN_SYMBOL_VARIANTS.contains(&token)) =>
-        {
-            base
-        }
-        _ => name,
-    }
-}
-
-/// Reduce a recorded dylib path to its bare library stem, lowercased.
-/// `/usr/lib/libSystem.B.dylib` -> `"libsystem.b"`. Compatible with
-/// PE's `library` normalisation convention so trait matchers can
-/// share library names across formats.
-fn normalize_dylib_path(path: &str) -> String {
-    let basename = path.rsplit_once('/').map(|(_, name)| name).unwrap_or(path);
-    let stem = basename
-        .strip_suffix(".dylib")
-        .or_else(|| basename.strip_suffix(".tbd"))
-        .unwrap_or(basename);
-    stem.to_ascii_lowercase()
 }
 
 /// Walk `LC_SEGMENT` / `LC_SEGMENT_64` and surface each named
 /// section. Mach-O nests sections inside segments; we flatten the
 /// hierarchy with the canonical `__SEGMENT,__section` naming so
 /// `__TEXT,__text` etc. survives to the output.
-fn extract_sections(
-    macho: &MachO<'_>,
-    bytes: &[u8],
-    _metrics: &mut Metrics,
-    sections_out: &mut Vec<Section>,
-) {
+fn extract_sections(macho: &MachO<'_>, bytes: &[u8], sections_out: &mut Vec<Section>) {
     // Bytes left to measure entropy over. A real image's sections are
     // disjoint, so measuring each costs one pass over the file; section
     // headers are 80 bytes apiece and may all claim the whole file, which
@@ -903,10 +466,9 @@ fn extract_header_and_loads(
         value_key!("macho.cpu_type"),
         cpu_kind_string(macho.header.cputype(), macho.header.cpusubtype()),
     );
-    // Raw CPU type / file type / flags. The string-decoded fields above
-    // are for trait authors; consumers that need to round-trip the
-    // u32 (cleave's typed metrics keep the raw header values) read
-    // these `_raw` siblings.
+    // Raw CPU type / file type / flags. The string-decoded fields are for
+    // rule authors; consumers that need to round-trip the u32 read these
+    // `_raw` siblings.
     put_u64(
         values,
         value_key!("macho.cpu_type_raw"),
@@ -967,9 +529,8 @@ fn extract_header_and_loads(
     if macho.old_style_entry {
         metrics.insert(metric!("macho.old_style_entry"), 1.0);
     }
-    // Raw header counts: number of load commands and their cumulative
-    // byte size. `macho.load_command_count` already exists as a
-    // metric; `macho.load_commands_size` is new.
+    // Cumulative byte size of the load commands; their count is the
+    // `macho.load_command_count` metric.
     put_u64(
         values,
         value_key!("macho.load_commands_size"),
@@ -1016,11 +577,8 @@ fn extract_header_and_loads(
         _ => None,
     });
     if let Some(cs) = code_sig {
-        // Surface the LC_CODE_SIGNATURE blob size up front — cleave's
-        // typed `MachoMetrics::code_signature_size` reads this even
-        // when the deeper signature parse fails. The blob *offset*
-        // isn't useful to downstream consumers (they don't seek into
-        // it) so we skip it.
+        // The LC_CODE_SIGNATURE blob size stands even when the deeper
+        // signature parse fails.
         put_u64(
             values,
             value_key!("macho.code_signature_size"),
@@ -1034,12 +592,7 @@ fn extract_header_and_loads(
             value_key!("macho.code_signature_offset"),
             u64::from(cs.dataoff),
         );
-        super::macho_code_signature::parse(
-            bytes,
-            cs.dataoff as usize,
-            cs.datasize as usize,
-            values,
-        );
+        code_signature::parse(bytes, cs.dataoff as usize, cs.datasize as usize, values);
     }
 
     // LC_UUID — 128-bit build fingerprint. Stable per-build, used by
@@ -1111,7 +664,11 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
     const VM_PROT_WRITE: u32 = 0x2;
     const VM_PROT_EXECUTE: u32 = 0x4;
 
-    let entry = entry_point(macho);
+    // goblin maps `LC_MAIN`'s `entryoff`, a file offset, to its address in
+    // `__TEXT`, or takes `LC_UNIXTHREAD`'s PC; 0 when neither is present
+    // (typical for shared libraries). The raw `entryoff` would land in
+    // `__PAGEZERO` and miss the entry section.
+    let entry = macho.entry;
     let mut wx_count: u64 = 0;
     let mut exec_segment_count: u64 = 0;
     let mut wx_segments: Vec<JsonValue> = Vec::new();
@@ -1188,9 +745,7 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
             if executable { "x" } else { "-" },
         );
         entry_obj.insert("perms".into(), JsonValue::String(perms));
-        // Raw VM protection bitfields. Typed consumers display them as
-        // hex (e.g. cleave's `MachoSegmentEntry::initprot_hex`); we
-        // emit the u32 and let the consumer choose the formatting.
+        // Raw VM protection bitfields; consumers choose the formatting.
         entry_obj.insert(
             "initprot_raw".into(),
             JsonValue::Number(u64::from(segment.initprot).into()),
@@ -1238,18 +793,6 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
     if !segments_out.is_empty() {
         values.insert_key(value_key!("macho.segments"), JsonValue::Array(segments_out));
     }
-}
-
-/// Entry-point address from `LC_MAIN`'s `entryoff` (modern dylinker)
-/// or the legacy `LC_UNIXTHREAD`'s thread-state PC. Returns `0` when
-/// neither is present (typical for shared libraries).
-fn entry_point(macho: &MachO<'_>) -> u64 {
-    for lc in &macho.load_commands {
-        if let mach::load_command::CommandVariant::Main(main) = lc.command {
-            return main.entryoff;
-        }
-    }
-    macho.entry
 }
 
 /// Per-load-command shape metrics. Combines several presence checks
@@ -1626,8 +1169,7 @@ fn load_dylibs(macho: &MachO<'_>, values: &mut Values) {
             "current_version".into(),
             JsonValue::String(decode_version_nibbles(dylib.current_version)),
         );
-        // Raw packed u32 — typed consumers (cleave's `MachoDylibEntry`)
-        // keep the unencoded value alongside the human-readable form.
+        // The raw packed u32 rides alongside the human-readable form.
         entry.insert(
             "current_version_raw".into(),
             JsonValue::Number(u64::from(dylib.current_version).into()),
@@ -1808,10 +1350,9 @@ fn install_name(macho: &MachO<'_>, values: &mut Values) {
     }
 }
 
-/// Classify an install_name / dylib path by its leading dyld token.
-/// The 3CX backdoor toggled libffmpeg's `install_name` from `@rpath`
-/// to `@loader_path`; surfacing the kind lets trait authors compare
-/// the categorical form rather than regex-matching the raw string.
+/// Classify an install_name / dylib path by its leading dyld token, so a
+/// library swapped from `@rpath` to `@loader_path` resolution is a change
+/// of category rules can compare rather than a raw-string regex.
 fn install_name_kind(path: &str) -> &'static str {
     if let Some(rest) = path.strip_prefix('@') {
         if rest == "rpath" || rest.starts_with("rpath/") {
@@ -1953,23 +1494,30 @@ fn emit_embedded_plist(
                 continue;
             }
             let off = section.offset as usize;
+            let skip = |reason: &str| {
+                tracing::debug!(
+                    target: "filefacts::macho",
+                    stage = "embedded_plist",
+                    section = section_name,
+                    offset = off,
+                    len = section.size,
+                    reason,
+                    "embedded plist not parsed"
+                );
+            };
             // `size` is a u64 from the file: don't let a 32-bit host truncate
             // it into a plausible length.
-            let Ok(len) = usize::try_from(section.size) else {
-                return;
-            };
-            let end = off.saturating_add(len);
-            if off >= bytes.len() || end > bytes.len() || len == 0 {
-                return;
-            }
-            if len > MAX_EMBEDDED_PLIST_BYTES {
-                return;
-            }
-            let Some(plist_bytes) = bytes.get(off..end) else {
-                return;
-            };
-            if let Ok(parsed) = super::plist_guard::parse(plist_bytes) {
-                values.insert_key(key, plist_to_json(parsed, 0));
+            let plist_bytes = usize::try_from(section.size)
+                .ok()
+                .filter(|&len| len != 0)
+                .and_then(|len| bytes.get(off..off.checked_add(len)?));
+            match plist_bytes {
+                None => skip("empty or outside the file"),
+                Some(b) if b.len() > MAX_EMBEDDED_PLIST_BYTES => skip("over the size cap"),
+                Some(b) => match super::plist_guard::parse(b) {
+                    Ok(parsed) => values.insert_key(key, plist_to_json(parsed, 0)),
+                    Err(_) => skip("does not parse as a plist"),
+                },
             }
             return;
         }

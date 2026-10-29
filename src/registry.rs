@@ -4,10 +4,10 @@
 //! Where a manifest (`package.json`, `Cargo.toml`) is what a package *says about
 //! itself*, a [`Registry`] record is what the *registry says about the package*:
 //! when it was published, by whom, how widely it's installed, whether it's
-//! deprecated. fletch produces these from a registry round-trip; serialized as a
-//! `*.registry.json` document they are parsed back — by
-//! [`crate::formats`] — into the same `values`/`metrics` surface as any native
-//! manifest, so detection traits can reason over them uniformly.
+//! deprecated. A registry client builds one from a registry round-trip;
+//! serialized as a `*.registry.json` document it is parsed back into the same
+//! `values`/`metrics` surface as any native manifest, so detection rules can
+//! reason over both uniformly.
 //!
 //! The verbatim/derived split follows filefacts' convention: identity and text
 //! (ecosystem, author, license, …) land in [`Values`]; the counted and measured
@@ -18,10 +18,155 @@ mod lookalike;
 
 use crate::metric;
 use crate::value_key;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
 
 use crate::output::{Metrics, Values};
+
+/// Declares [`Ecosystem`] and its label table in one list, so a variant
+/// cannot be added without its label.
+macro_rules! ecosystems {
+    ($($(#[$doc:meta])* $variant:ident => $label:literal,)*) => {
+        /// The registry a [`Registry`] record came from.
+        ///
+        /// Serialized as its lowercase label (`"npm"`, `"pypi"`, `"crates"`,
+        /// …). A label without a variant here reads as [`Ecosystem::Other`]
+        /// and writes back as it was read, so a record naming a registry this
+        /// build does not know still parses.
+        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        #[non_exhaustive]
+        pub enum Ecosystem {
+            $($(#[$doc])* $variant,)*
+            /// A registry without a variant here, by its label as written.
+            Other(String),
+        }
+
+        impl Ecosystem {
+            /// The serialized label, e.g. `"npm"`.
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                match self {
+                    $(Self::$variant => $label,)*
+                    Self::Other(label) => label,
+                }
+            }
+
+            /// The ecosystem `label` names, matched without regard to case.
+            #[must_use]
+            pub fn from_label(label: &str) -> Self {
+                $(if label.eq_ignore_ascii_case($label) {
+                    return Self::$variant;
+                })*
+                Self::Other(label.to_string())
+            }
+        }
+
+        #[cfg(test)]
+        const NAMED: &[Ecosystem] = &[$(Ecosystem::$variant,)*];
+    };
+}
+
+ecosystems! {
+    /// Alpine Linux packages.
+    Alpine => "alpine",
+    /// Arch Linux official repositories.
+    Arch => "arch",
+    /// The Arch User Repository.
+    Aur => "aur",
+    /// The Chrome Web Store.
+    Chrome => "chrome",
+    /// ClawHub skills.
+    Clawhub => "clawhub",
+    /// Clojars.
+    Clojars => "clojars",
+    /// The ComfyUI node registry.
+    Comfyui => "comfyui",
+    /// Packagist (Composer).
+    Composer => "composer",
+    /// conda channels.
+    Conda => "conda",
+    /// CPAN.
+    Cpan => "cpan",
+    /// CRAN.
+    Cran => "cran",
+    /// crates.io.
+    Crates => "crates",
+    /// Debian.
+    Debian => "debian",
+    /// The Dify plugin marketplace.
+    Dify => "dify",
+    /// Fedora.
+    Fedora => "fedora",
+    /// Firefox add-ons (AMO).
+    Firefox => "firefox",
+    /// FreeBSD ports.
+    Freebsd => "freebsd",
+    /// RubyGems.
+    Gem => "gem",
+    /// GitHub releases and repositories.
+    Github => "github",
+    /// Go modules.
+    Golang => "golang",
+    /// Hex (Erlang/Elixir).
+    Hex => "hex",
+    /// Homebrew.
+    Homebrew => "homebrew",
+    /// The Hugging Face Hub.
+    Huggingface => "huggingface",
+    /// The JetBrains plugin marketplace.
+    Jetbrains => "jetbrains",
+    /// JSR.
+    Jsr => "jsr",
+    /// Maven Central.
+    Maven => "maven",
+    /// NetBSD pkgsrc.
+    Netbsd => "netbsd",
+    /// npm.
+    Npm => "npm",
+    /// NuGet.
+    Nuget => "nuget",
+    /// OCI container registries.
+    Oci => "oci",
+    /// OpenBSD packages.
+    Openbsd => "openbsd",
+    /// openSUSE.
+    Opensuse => "opensuse",
+    /// Open VSX.
+    Openvsx => "openvsx",
+    /// pub.dev (Dart).
+    Pub => "pub",
+    /// PyPI.
+    Pypi => "pypi",
+    /// The Snap Store.
+    Snap => "snap",
+    /// The Terraform registry.
+    Terraform => "terraform",
+    /// Ubuntu.
+    Ubuntu => "ubuntu",
+    /// The Visual Studio Code marketplace.
+    Vscode => "vscode",
+    /// WordPress.org plugins.
+    Wordpress => "wordpress",
+}
+
+impl std::fmt::Display for Ecosystem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for Ecosystem {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Ecosystem {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let label = std::borrow::Cow::<str>::deserialize(deserializer)?;
+        Ok(Self::from_label(&label))
+    }
+}
 
 /// A package release's registry metadata, normalized across ecosystems (npm,
 /// PyPI, crates.io, Packagist, the AUR, …). Every field beyond
@@ -30,10 +175,11 @@ use crate::output::{Metrics, Values};
 /// fabricated default. Marketplace concepts ([`rating`](Self::rating), download
 /// counts) sit beside library-registry ones so extension marketplaces map onto
 /// the same record as a library registry.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Registry {
-    /// The source registry: `npm`, `pypi`, `crates`, `composer`, `aur`, …
-    pub ecosystem: String,
+    /// The source registry.
+    pub ecosystem: Ecosystem,
     /// Package name as the registry knows it (scoped/`vendor/pkg` where so).
     pub name: String,
     /// The concrete version this record describes. Empty when the locator named
@@ -155,6 +301,49 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// A record of `name` in `ecosystem` with every other field unknown.
+    #[must_use]
+    pub fn new(ecosystem: Ecosystem, name: impl Into<String>) -> Self {
+        Self {
+            ecosystem,
+            name: name.into(),
+            version: String::new(),
+            published_at: None,
+            age_days: None,
+            latest_version: None,
+            author: None,
+            title: None,
+            description: None,
+            homepage: None,
+            repository: None,
+            repository_commit: None,
+            license: None,
+            downloads_total: None,
+            downloads_recent: None,
+            rating: None,
+            rating_count: None,
+            deprecated: None,
+            maintainers: None,
+            first_published_at: None,
+            previous_published_at: None,
+            package_age_days: None,
+            release_count: None,
+            releases_24h: None,
+            releases_48h: None,
+            publisher: None,
+            publisher_email_domain: None,
+            publisher_in_maintainers: None,
+            publisher_verified: None,
+            security_hold: None,
+            version_removed: None,
+            unpacked_size: None,
+            file_count: None,
+            has_install_script: None,
+            vulnerability_count: None,
+            release_times: Vec::new(),
+        }
+    }
+
     /// Seconds between [`published_at`](Self::published_at) and `now` (Unix
     /// seconds). `None` when the publish date is unknown. Saturates at zero so a
     /// clock skew that puts publication slightly ahead of `now` reads as "brand
@@ -199,23 +388,35 @@ impl Registry {
     ///
     /// Boolean facts become `0.0`/`1.0` metrics whenever the registry reported
     /// them: `0.0` is a known false, and an absent metric means the registry
-    /// did not say. Flags that other extractors emit only when they hold
-    /// (presence as `1.0`) cannot make that distinction; a `>= 1` threshold
-    /// reads the same under both encodings.
+    /// did not say. `registry.is_deprecated` is presence-only, `1.0` when a
+    /// deprecation notice was reported: a record without one cannot tell "not
+    /// deprecated" from "not reported". A `>= 1` threshold reads the same
+    /// under both encodings.
     pub fn write_facts(&self, values: &mut Values, metrics: &mut Metrics) {
+        // The author is a display string, often `"Name <email>"`; published
+        // in the shape every package format uses for its people.
+        crate::formats::people::put(
+            values,
+            value_key!("registry.authors"),
+            self.author
+                .as_deref()
+                .map(crate::formats::people::Person::parse),
+        );
         let mut put = |key: crate::ValueKey, v: Option<&str>| {
             if let Some(v) = v.filter(|s| !s.is_empty()) {
                 values.insert_key(key, JsonValue::String(v.to_string()));
             }
         };
-        put(value_key!("registry.ecosystem"), Some(&self.ecosystem));
+        put(
+            value_key!("registry.ecosystem"),
+            Some(self.ecosystem.as_str()),
+        );
         put(value_key!("registry.name"), Some(&self.name));
         put(value_key!("registry.version"), Some(&self.version));
         put(
             value_key!("registry.latest_version"),
             self.latest_version.as_deref(),
         );
-        put(value_key!("registry.author"), self.author.as_deref());
         put(value_key!("registry.title"), self.title.as_deref());
         put(
             value_key!("registry.description"),
@@ -271,12 +472,11 @@ impl Registry {
             metric!("registry.maintainer_count"),
             self.maintainers.map(f64::from),
         );
-        // A boolean deprecation flag as a 0/1 metric, so a trait can gate on
-        // `registry.is_deprecated >= 1` without parsing the reason text. Always
-        // written: a record without a deprecation notice is known not deprecated.
+        // A deprecation flag, so a rule can gate on `registry.is_deprecated
+        // >= 1` without parsing the reason text.
         num(
             metric!("registry.is_deprecated"),
-            Some(f64::from(u8::from(self.deprecated.is_some()))),
+            self.deprecated.is_some().then_some(1.0),
         );
 
         // Release history — every count/measure is a metric so traits can
@@ -362,89 +562,4 @@ impl Registry {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn with_age_derives_cadence_relative_to_now() {
-        let day = 86_400u64;
-        let now = 100 * day;
-        let reg = Registry {
-            ecosystem: "pypi".into(),
-            name: "widget".into(),
-            published_at: Some(now), // this release: right now
-            first_published_at: Some(now - 74 * day), // package born 74d ago
-            previous_published_at: Some(now - 2 * day),
-            // three releases inside 48h (one inside 24h), plus older ones
-            release_times: vec![now, now - 2 * day, now - 30 * day, now - 74 * day],
-            ..Default::default()
-        }
-        .with_age(now);
-
-        assert_eq!(reg.age_days, Some(0), "this version is brand new");
-        assert_eq!(reg.package_age_days, Some(74), "package is 74 days old");
-        assert_eq!(reg.releases_24h, Some(1), "only the current release in 24h");
-        assert_eq!(reg.releases_48h, Some(2), "current + the 2-days-ago one");
-    }
-
-    #[test]
-    fn write_facts_routes_counts_to_metrics_and_identity_to_values() {
-        let day = 86_400u64;
-        let now = 100 * day;
-        let reg = Registry {
-            ecosystem: "npm".into(),
-            name: "widget".into(),
-            published_at: Some(now),
-            previous_published_at: Some(now - 5 * day),
-            first_published_at: Some(now - 40 * day),
-            release_count: Some(12),
-            publisher: Some("attacker".into()),
-            publisher_email_domain: Some("gmail.com".into()),
-            publisher_in_maintainers: Some(false),
-            publisher_verified: Some(false),
-            security_hold: Some(false),
-            version_removed: Some(true),
-            unpacked_size: Some(4096),
-            file_count: Some(3),
-            has_install_script: Some(true),
-            vulnerability_count: Some(0),
-            ..Default::default()
-        }
-        .with_age(now);
-
-        let mut values = Values::new();
-        let mut metrics = Metrics::new();
-        reg.write_facts(&mut values, &mut metrics);
-
-        // Identity → values.
-        assert_eq!(
-            values.get("registry.publisher").and_then(|v| v.as_str()),
-            Some("attacker")
-        );
-        assert_eq!(
-            values
-                .get("registry.publisher_email_domain")
-                .and_then(|v| v.as_str()),
-            Some("gmail.com")
-        );
-        // Counts / measures / derived deltas / flags → metrics.
-        assert_eq!(metrics.get("registry.release_count"), Some(12.0));
-        assert_eq!(metrics.get("registry.package_age_days"), Some(40.0));
-        assert_eq!(
-            metrics.get("registry.days_since_previous_release"),
-            Some(5.0)
-        );
-        assert_eq!(metrics.get("registry.unpacked_size"), Some(4096.0));
-        assert_eq!(metrics.get("registry.file_count"), Some(3.0));
-        assert_eq!(metrics.get("registry.has_install_script"), Some(1.0));
-        assert_eq!(metrics.get("registry.publisher_in_maintainers"), Some(0.0));
-        assert_eq!(metrics.get("registry.publisher_verified"), Some(0.0));
-        assert_eq!(metrics.get("registry.security_hold"), Some(0.0));
-        assert_eq!(metrics.get("registry.version_removed"), Some(1.0));
-        // A present-but-zero count is still emitted (0 vulns is a real fact).
-        assert_eq!(metrics.get("registry.vulnerability_count"), Some(0.0));
-        // Publisher identity never leaks into metrics; counts never into values.
-        assert!(metrics.get("registry.publisher").is_none());
-        assert!(values.get("registry.release_count").is_none());
-    }
-}
+mod tests;

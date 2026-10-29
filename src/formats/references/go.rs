@@ -2,6 +2,23 @@
 use super::Refs;
 use crate::{HashAlgo, PinnedHash, RefKind, RefLocator};
 
+/// The `source` of each Go reference this module emits. The context pass
+/// (`go_dependency_context`) matches on them, so both sides name them here.
+pub(crate) mod source {
+    pub(crate) const MOD: &str = "go.mod";
+    pub(crate) const WORK: &str = "go.work";
+    pub(crate) const SUM: &str = "go.sum";
+    pub(crate) const SUM_GO_MOD: &str = "go.sum.go.mod";
+    pub(crate) const MOD_REPLACE: &str = "go.mod.replace";
+    pub(crate) const WORK_REPLACE: &str = "go.work.replace";
+    pub(crate) const MOD_EXCLUDE: &str = "go.mod.exclude";
+    pub(crate) const MOD_TOOL: &str = "go.mod.tool";
+    pub(crate) const WORK_USE: &str = "go.work.use";
+    pub(crate) const VENDOR_MODULE: &str = "go.vendor.module";
+    /// A limit marker: the named manifest did not parse completely.
+    pub(crate) const INCOMPLETE: &str = "go.manifest.incomplete";
+}
+
 // Tokenize directive lines without mistaking quoted // for comments. A
 // malformed quoted token is not guessed. No shell or environment expansion.
 pub(crate) fn words(line: &str) -> Option<Vec<String>> {
@@ -72,30 +89,38 @@ pub(crate) fn words(line: &str) -> Option<Vec<String>> {
     Some(words)
 }
 
-fn incomplete(out: &mut Refs<'_>, source: &str, evidence: &str) {
+fn incomplete(out: &mut Refs<'_>, manifest: &str, evidence: &str) {
+    tracing::debug!(
+        target: "filefacts::references::go",
+        format = manifest,
+        len = evidence.len(),
+        "Go manifest line not modelled; references from it are incomplete"
+    );
     out.push(
-        RefLocator::Path(source.into()),
+        RefLocator::Path(manifest.into()),
         RefKind::Undefined,
-        "go.manifest.incomplete",
+        source::INCOMPLETE,
         evidence,
         None,
     );
 }
 
-pub(super) fn manifest(out: &mut Refs<'_>, source: &str) {
+/// `go.mod` or `go.work` directives; `manifest` is [`source::MOD`] or
+/// [`source::WORK`].
+pub(super) fn manifest(out: &mut Refs<'_>, manifest: &str) {
     let Some(text) = out.text else { return };
     if text.len() > 2 * 1024 * 1024 {
-        incomplete(out, source, "source-byte-budget");
+        incomplete(out, manifest, "source-byte-budget");
         return;
     }
     let mut block = String::new();
     for (index, line) in text.lines().enumerate() {
         if index >= 20_000 {
-            incomplete(out, source, "directive-budget");
+            incomplete(out, manifest, "directive-budget");
             break;
         }
         let Some(mut tokens) = words(line) else {
-            incomplete(out, source, line);
+            incomplete(out, manifest, line);
             continue;
         };
         if tokens.is_empty() {
@@ -103,7 +128,7 @@ pub(super) fn manifest(out: &mut Refs<'_>, source: &str) {
         }
         if tokens == [")"] {
             if block.is_empty() {
-                incomplete(out, source, line);
+                incomplete(out, manifest, line);
             }
             block.clear();
             continue;
@@ -119,20 +144,20 @@ pub(super) fn manifest(out: &mut Refs<'_>, source: &str) {
         }
         let fields: Vec<_> = tokens.iter().map(String::as_str).collect();
         match (directive.as_str(), fields.as_slice()) {
-            ("require", [module, version]) if source == "go.mod" => out.push(
+            ("require", [module, version]) if manifest == source::MOD => out.push(
                 RefLocator::Purl(purl(module, version)),
                 RefKind::Dependency,
-                source,
+                manifest,
                 line.trim(),
                 None,
             ),
             ("replace", _) => {
                 let Some(split) = fields.iter().position(|v| *v == "=>") else {
-                    incomplete(out, source, line);
+                    incomplete(out, manifest, line);
                     continue;
                 };
                 if !(1..=2).contains(&split) {
-                    incomplete(out, source, line);
+                    incomplete(out, manifest, line);
                     continue;
                 }
                 let target = fields.get(split + 1..).unwrap_or_default();
@@ -140,7 +165,7 @@ pub(super) fn manifest(out: &mut Refs<'_>, source: &str) {
                     [path] => RefLocator::Path((*path).into()),
                     [module, version] => RefLocator::Purl(purl(module, version)),
                     _ => {
-                        incomplete(out, source, line);
+                        incomplete(out, manifest, line);
                         continue;
                     }
                 };
@@ -148,38 +173,42 @@ pub(super) fn manifest(out: &mut Refs<'_>, source: &str) {
                 out.push(
                     locator,
                     RefKind::Undefined,
-                    format!("{source}.replace"),
+                    if manifest == source::MOD {
+                        source::MOD_REPLACE
+                    } else {
+                        source::WORK_REPLACE
+                    },
                     line.trim().strip_prefix("replace").unwrap_or(line).trim(),
                     None,
                 );
             }
-            ("exclude", [module, version]) if source == "go.mod" => out.push(
+            ("exclude", [module, version]) if manifest == source::MOD => out.push(
                 RefLocator::Purl(purl(module, version)),
                 RefKind::Undefined,
-                "go.mod.exclude",
+                source::MOD_EXCLUDE,
                 line.trim(),
                 None,
             ),
-            ("use", [path]) if source == "go.work" => out.push(
+            ("use", [path]) if manifest == source::WORK => out.push(
                 RefLocator::Path((*path).into()),
                 RefKind::Local,
-                "go.work.use",
+                source::WORK_USE,
                 line.trim(),
                 None,
             ),
             ("tool", [path]) => out.push(
                 RefLocator::Path((*path).into()),
                 RefKind::Undefined,
-                "go.mod.tool",
+                source::MOD_TOOL,
                 line.trim(),
                 None,
             ),
             ("module" | "go" | "toolchain" | "godebug" | "retract", _) => {}
-            _ => incomplete(out, source, line),
+            _ => incomplete(out, manifest, line),
         }
     }
     if !block.is_empty() {
-        incomplete(out, source, "unterminated-directive-block");
+        incomplete(out, manifest, "unterminated-directive-block");
     }
 }
 
@@ -210,7 +239,11 @@ pub(super) fn sums(out: &mut Refs<'_>) {
         out.push(
             RefLocator::Purl(purl(module, version.trim_end_matches("/go.mod"))),
             RefKind::Undefined,
-            if metadata { "go.sum.go.mod" } else { "go.sum" },
+            if metadata {
+                source::SUM_GO_MOD
+            } else {
+                source::SUM
+            },
             line.trim(),
             Some(PinnedHash {
                 algo: HashAlgo::GoModH1,
@@ -240,7 +273,7 @@ pub(super) fn vendor(out: &mut Refs<'_>) {
                 out.push(
                     RefLocator::Purl(purl(module, version)),
                     RefKind::Undefined,
-                    "go.vendor.module",
+                    source::VENDOR_MODULE,
                     line,
                     None,
                 );
@@ -254,34 +287,4 @@ fn purl(module: &str, version: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn go_directives_handle_comments_quotes_and_adjacent_arrow() {
-        assert_eq!(
-            words("replace example.test/lib=>../fork// comment").unwrap(),
-            ["replace", "example.test/lib", "=>", "../fork"]
-        );
-        assert_eq!(
-            words("use \"./folder//name\" // comment").unwrap(),
-            ["use", "./folder//name"]
-        );
-        assert!(words("use \"unfinished").is_none());
-        assert!(words(&"token ".repeat(65)).is_none());
-    }
-
-    #[test]
-    fn go_vendor_truncation_is_explicit() {
-        let text = "# example.test/lib v1.0.0\n".repeat(20_001);
-        let parsed = crate::OpenOptions::new()
-            .path(std::path::Path::new("vendor/modules.txt"))
-            .open(text.as_bytes());
-        assert!(
-            parsed
-                .references()
-                .iter()
-                .any(|r| r.source == "go.manifest.incomplete")
-        );
-    }
-}
+mod tests;

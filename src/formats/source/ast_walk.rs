@@ -43,9 +43,9 @@ use super::visit::{self, NodeIds, Visit};
 ///
 /// tree-sitter trees can be arbitrarily deep on generated or adversarial
 /// source (thousands of nested brackets, binary expressions, etc.). The
-/// symbol walk once recursed one stack frame per level, so an unbounded walk
-/// would overflow the worker thread's stack and abort the whole process. The walk passes no
-/// node below this depth to [`State::visit`]. Real source is rarely more
+/// walk itself is iterative, but the shape detectors and chain resolution
+/// below are bounded by depth, so the walk passes no node below this depth
+/// to [`State::visit`]. Real source is rarely more
 /// than a few dozen levels deep; anything past this is machine-generated and
 /// yields no useful symbols. `ast.max_depth` saturates at this value, which is itself
 /// a usable "pathologically nested" signal.
@@ -63,10 +63,14 @@ pub(super) fn walk(
 ) {
     let mut collectors = visit::Collectors {
         ast: Some(State::default()),
+        identifiers: Some(visit::Identifiers::default()),
         ..visit::Collectors::default()
     };
     visit::walk(root, source, config, &mut collectors);
-    if let Some(state) = collectors.ast {
+    if let Some(mut state) = collectors.ast {
+        if let Some(identifiers) = collectors.identifiers {
+            state.add_identifiers(&identifiers.found);
+        }
         finish(state, config, symbols_out, metrics);
     }
 }
@@ -109,9 +113,8 @@ pub(super) fn finish(
     // Reaching the recursion cap means the tree (and any member/concat/subscript
     // chain inside it) was truncated — deeper nodes were not analysed. A
     // pathologically deep tree is itself a generated/obfuscated-source signal,
-    // so surface it as a metric *and* warn once: the same depth that trips this
-    // is what used to overflow the worker stack and abort the process, so an
-    // operator seeing a flood of these knows the inputs are hostile-shaped.
+    // so surface it as a metric *and* warn once: an operator seeing a flood of
+    // these knows the inputs are hostile-shaped.
     if state.max_depth >= MAX_AST_DEPTH {
         metrics.insert(metric!("ast.depth_capped"), 1.0);
         tracing::warn!(
@@ -314,27 +317,6 @@ fn subtree_has_mod(node: Node<'_>, source: &str, depth: u32) -> bool {
     false
 }
 
-/// Function definitions across the grammars: declarations, expressions,
-/// arrows, methods, lambdas and Rust `fn` items. The shape detectors below
-/// and their ratio denominator (`State::function_count`) share this one
-/// predicate, so no shape is counted for a kind the denominator leaves out.
-/// Named nodes only: Python's `lambda` keyword token shares its kind name
-/// with the expression it starts.
-fn is_function_definition(node: Node<'_>) -> bool {
-    node.is_named() && FUNCTION_DEFINITION_KINDS.contains(&node.kind())
-}
-
-/// The kinds [`is_function_definition`] accepts, when named.
-pub(super) const FUNCTION_DEFINITION_KINDS: &[&str] = &[
-    "function_declaration",
-    "function_expression",
-    "arrow_function",
-    "function_definition",
-    "lambda",
-    "method_definition",
-    "function_item",
-];
-
 /// The only kinds [`is_infinite_loop`] can accept.
 pub(super) const INFINITE_LOOP_KINDS: &[&str] = &[
     "for_statement",
@@ -349,9 +331,6 @@ pub(super) const INFINITE_LOOP_KINDS: &[&str] = &[
 /// obfuscation shape (`function(x){ return x }`, `lambda x: x`). The
 /// param↔return backreference is why a regex can't express this.
 fn is_identity_function(node: Node<'_>, source: &str) -> bool {
-    if !is_function_definition(node) {
-        return false;
-    }
     let bytes = source.as_bytes();
     // Collect parameter identifier names.
     let Some(params) = node.child_by_field_name("parameters") else {
@@ -425,9 +404,6 @@ fn returned_identifier<'a>(body: Node<'_>, bytes: &'a [u8]) -> Option<&'a str> {
 /// return a fixed string — replaces tree-sitter `(function_declaration body:
 /// (statement_block (return_statement (string))))` queries.
 fn is_string_return_function(node: Node<'_>) -> bool {
-    if !is_function_definition(node) {
-        return false;
-    }
     let Some(body) = node.child_by_field_name("body") else {
         return false;
     };
@@ -484,9 +460,6 @@ fn is_literal_or_identifier(node: Node<'_>) -> bool {
 /// dilute static and ML analysis. Parameterless distinguishes it from an
 /// identity proxy (`function(x){ return x }`).
 fn is_const_return_function(node: Node<'_>) -> bool {
-    if !is_function_definition(node) {
-        return false;
-    }
     // Parameterless: a `parameters`/`formal_parameters` node with no named
     // children. Python's `lambda: 0` has no parameter list at all, while a
     // JS `x => 0` keeps its lone parameter under `parameter` instead.
@@ -565,11 +538,11 @@ pub(super) struct State {
     /// Node id → its spine in `spines` and joint index, for every joint
     /// whose [`Fate`] is known.
     joints: HashMap<usize, (usize, usize)>,
-    /// Dedup'd bare-identifier names with first-seen byte offset.
-    /// Captures every identifier-kind token across the file — variable
-    /// references, parameter names, type names, function-call targets,
-    /// etc. — so naming-pattern rules (`c2_server`, `BackdoorListener`,
-    /// `xmrig`) can fire via `type: name, kind: identifier`.
+    /// Leaf identifier names, each with its first byte offset: variable
+    /// references, parameter names, type names, call targets and so on, so
+    /// naming-pattern rules (`c2_server`, `BackdoorListener`, `xmrig`) can
+    /// match `type: name, kind: identifier`. Filled from the shared walk's
+    /// [`visit::Identifiers`].
     identifiers: BTreeMap<String, u64>,
     /// Per-operator occurrence counts keyed by canonical name (`xor` → 12,
     /// `mod` → 3, …), tallied during the single existing walk. Emitted as
@@ -625,6 +598,15 @@ pub(super) struct State {
 }
 
 impl State {
+    /// Record the leaf identifiers a walk found, in source order.
+    pub(super) fn add_identifiers(&mut self, found: &[(&str, usize)]) {
+        for &(name, offset) in found {
+            self.identifiers
+                .entry(name.to_string())
+                .or_insert(offset as u64);
+        }
+    }
+
     /// Record `visit`'s node. The walk passes every node down to
     /// [`MAX_AST_DEPTH`] in pre-order, left to right; a node at the cap only
     /// counts, and nothing below it is passed.
@@ -684,23 +666,6 @@ impl State {
                     .all(|c| ids.number.contains(c.kind_id()));
                 if all_numeric && len > self.max_numeric_array_length {
                     self.max_numeric_array_length = len;
-                }
-            }
-        }
-
-        // Bare-identifier capture: every identifier-kind leaf node
-        // contributes its name to the dedup'd identifiers set, keyed
-        // by name with the first-seen byte offset. Filter to leaf
-        // identifiers (no named children) to skip e.g. qualified
-        // identifier wrappers — we want `os` and `path`, not the
-        // combined `os.path` node which member-chain extraction
-        // handles separately.
-        if ids.identifier.contains(kind) && node.named_child_count() == 0 {
-            if let Ok(text) = node.utf8_text(source.as_bytes()) {
-                if !text.is_empty() {
-                    self.identifiers
-                        .entry(text.to_string())
-                        .or_insert(node.start_byte() as u64);
                 }
             }
         }
@@ -766,7 +731,7 @@ impl State {
             }
         }
 
-        if visit.named && ids.function_definition.contains(kind) {
+        if visit.named && ids.function.contains(kind) {
             // Tally every function-definition node so the const/string-return
             // shapes can be reported as a fraction of all functions, not a raw
             // count that simply grows with the file.
@@ -1343,12 +1308,10 @@ enum Part<'s> {
     /// A call in receiver position contributes the name of what it called,
     /// and nothing else: `open(p).read()` is `open.read`.
     ///
-    /// This used to append `()`, which read as "a call happened here" but
-    /// was really positional — the outermost call is named by `record_call`
-    /// from its callee and never got parens, so `platform.system()` was
-    /// `platform.system` while `open(p).read()` was `open().read`. One call,
-    /// two spellings, depending on where it sat. Rule authors reasonably
-    /// wrote `.system()` and matched nothing.
+    /// No `()` is appended: the outermost call is named from its callee
+    /// without parens, so `platform.system()` is `platform.system`, and a
+    /// call in receiver position must read the same way for one call to
+    /// have one spelling wherever it sits.
     ///
     /// Without the parens a symbol is one thing everywhere: a dotted path of
     /// identifiers, the same shape a stripped binary's symbol table yields.
@@ -1484,8 +1447,8 @@ fn part<'t>(
                 && chars.all(|c| c.is_alphanumeric() || c == '_')
         });
         let part = key.map_or(Part::Dynamic, |key| Part::Field(Cow::Owned(key)));
-        // The recursive resolver this replaced spent a level on the fold
-        // itself; keep its depth accounting.
+        // The fold costs a depth level of its own, so a folded subscript
+        // chain reaches the depth cap where an unfolded one would.
         return (part, Some(object), 2);
     }
     if config.call_kinds.contains(&kind) {
@@ -1694,49 +1657,4 @@ fn string_concat_chain_length(node: Node<'_>, config: &LangConfig) -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn walk_state(path: &str, src: &str) -> State {
-        let parsed = crate::OpenOptions::new()
-            .path(std::path::Path::new(path))
-            .open(src.as_bytes());
-        let ast = parsed.source_ast().expect("parsed source");
-        let config = super::super::langs::config_for(ast.file_type).expect("language config");
-        let mut collectors = visit::Collectors {
-            ast: Some(State::default()),
-            ..visit::Collectors::default()
-        };
-        visit::walk(ast.tree.root_node(), ast.source, config, &mut collectors);
-        collectors.ast.expect("ast collector")
-    }
-
-    /// `function_count` is the denominator of the const/string-return ratios,
-    /// so every kind the shape detectors accept must be counted, Rust `fn`
-    /// items included.
-    #[test]
-    fn rust_fn_items_count_toward_the_function_total() {
-        let state = walk_state(
-            "lib.rs",
-            "fn a() {}\nfn b() -> u8 { 1 }\nimpl X { fn c(&self) {} }\n",
-        );
-        assert_eq!(state.function_count, 3);
-    }
-
-    /// Python lambdas are counted as functions (once each, not again for the
-    /// `lambda` keyword), so the shape detectors must see them too.
-    /// `lambda: 0` has no parameter list at all.
-    #[test]
-    fn python_lambdas_take_constant_and_string_return_shapes() {
-        let state = walk_state(
-            "shapes.py",
-            "a = lambda: 0\nb = lambda: None\nc = lambda x: 0\nd = lambda: 'x'\ne = lambda x: x\n",
-        );
-        assert_eq!(state.function_count, 5);
-        assert_eq!(state.const_return_fn_count, 3);
-        assert_eq!(state.string_return_fn_count, 1);
-        assert_eq!(state.identity_fn_count, 1);
-        // A JavaScript arrow's lone parameter sits outside `parameters`.
-        assert_eq!(walk_state("a.js", "f = x => 0;\n").const_return_fn_count, 0);
-    }
-}
+mod tests;

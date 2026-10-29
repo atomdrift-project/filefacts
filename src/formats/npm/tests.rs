@@ -103,7 +103,9 @@ fn emits_name_version_and_author_email() {
         Some("String left pad")
     );
     assert_eq!(
-        values.get("npm.author.email").and_then(JsonValue::as_str),
+        values
+            .get("npm.authors[0].email")
+            .and_then(JsonValue::as_str),
         Some("azer@example.com")
     );
     assert_eq!(
@@ -155,7 +157,7 @@ fn publisher_repo(publisher: &str, repository: &str) -> Option<f64> {
 
 #[test]
 fn name_repo_mismatch_spots_a_clone_and_rename() {
-    // Both gauntlet samples: the manifest names one package and claims
+    // The clone-and-rename shape: the manifest names one package and claims
     // another project's repository.
     assert_eq!(
         name_repo(

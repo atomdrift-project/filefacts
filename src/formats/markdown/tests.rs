@@ -1,10 +1,9 @@
 use super::*;
-use crate::output::{Metrics, Values};
+use crate::output::Values;
 
 fn run(input: &str) -> Values {
     let mut values = Values::default();
-    let mut metrics = Metrics::default();
-    extract(input.as_bytes(), &mut values, &mut metrics);
+    extract(input.as_bytes(), &mut values);
     values
 }
 
@@ -358,8 +357,7 @@ fn handles_invalid_utf8_gracefully() {
     let mut bytes = b"# Heading\n".to_vec();
     bytes.push(0xff);
     let mut values = Values::default();
-    let mut metrics = Metrics::default();
-    extract(&bytes, &mut values, &mut metrics);
+    extract(&bytes, &mut values);
     assert_eq!(
         get_str(&values, "markdown.first_heading").as_deref(),
         Some("Heading")
@@ -388,4 +386,12 @@ fn first_heading_still_strips_underscore_emphasis() {
         get_str(&v, "markdown.first_heading").as_deref(),
         Some("Bold and text")
     );
+}
+
+/// The `.vsix` check looks at the argument's last five bytes, which can fall
+/// inside a multi-byte character.
+#[test]
+fn non_ascii_extension_argument_is_rejected_without_panicking() {
+    let values = run("code --install-extension aéééé\ncode --install-extension pub.ext\n");
+    assert_eq!(get_arr(&values, "markdown.install_extensions"), ["ext"]);
 }

@@ -1,20 +1,10 @@
 use super::*;
-use crate::output::{ArchiveCompression, ArchiveOffsets, ArchiveOwnership};
+use crate::output::{ArchiveCompression, ArchiveOwnership};
 
+/// A member of the named entry type, spelled as `archive.members[]` does.
 fn member(path: &str, entry_type: &str, size: u64) -> ArchiveMember {
-    ArchiveMember {
-        path: path.into(),
-        size_bytes: size,
-        entry_type: Some(entry_type.into()),
-        mtime_unix: None,
-        linkname: None,
-        host_os: None,
-        crc32: None,
-        encrypted: false,
-        compression: None,
-        ownership: None,
-        offsets: ArchiveOffsets::default(),
-    }
+    let entry_type = serde_json::from_value(serde_json::json!(entry_type)).unwrap();
+    ArchiveMember::new(path.into(), size, entry_type)
 }
 
 fn stamped(path: &str, mtime: Option<i64>) -> ArchiveMember {
@@ -100,10 +90,7 @@ fn reading_overrides_name_based_defaults() {
 fn mode_bits_symlinks_and_escapes_come_from_the_typed_member() {
     let with_mode = |path: &str, kind: &str, mode: u32, link: Option<&str>| ArchiveMember {
         linkname: link.map(str::to_string),
-        ownership: Some(ArchiveOwnership {
-            mode_octal: Some(mode),
-            ..Default::default()
-        }),
+        ownership: ArchiveOwnership::mode(mode),
         ..member(path, kind, 0)
     };
     let members = [
@@ -137,10 +124,7 @@ fn methods_list_is_written_when_empty_only_if_asked() {
     assert!(if_any.get("archive.compression.methods").is_none());
 
     let packed = ArchiveMember {
-        compression: Some(ArchiveCompression {
-            compressed_size: Some(1),
-            method: Some("lzma".into()),
-        }),
+        compression: ArchiveCompression::new(Some(1), Some("lzma".into())),
         ..member("a", "regular", 10)
     };
     let (values, metrics) = run(
@@ -253,62 +237,24 @@ fn mtime_spread_survives_the_full_i64_range() {
     );
 }
 
+/// The published value is the typed member's serde form, plus whatever
+/// keys a format appends.
 #[test]
-fn member_value_maps_typed_fields_and_honours_the_shape() {
+fn member_value_is_the_serde_form() {
     let m = ArchiveMember {
-        mtime_unix: Some(5),
         crc32: Some(7),
-        compression: Some(ArchiveCompression {
-            compressed_size: Some(2),
-            method: Some("deflate".into()),
-        }),
-        ownership: Some(ArchiveOwnership {
-            mode_octal: Some(0o644),
-            uid: Some(1),
-            ..Default::default()
-        }),
-        offsets: ArchiveOffsets {
-            header: Some(0),
-            data: Some(30),
-            central_header: None,
-        },
+        encrypted: true,
         ..member("a.txt", "regular", 4)
     };
+    let mut value = member_value(&m);
     assert_eq!(
-        JsonValue::Object(member_value(&m, Shape::FULL)),
-        serde_json::json!({
-            "path": "a.txt",
-            "size_bytes": 4,
-            "entry_type": "regular",
-            "mtime_unix": 5,
-            "crc32": 7,
-            "compressed_size": 2,
-            "compression_method": "deflate",
-            "mode_octal": 0o644,
-            "uid": 1,
-            "header_offset": 0,
-            "data_offset": 30,
-        })
+        JsonValue::Object(value.clone()),
+        serde_json::to_value(&m).unwrap()
     );
-    let bare = member_value(
-        &ArchiveMember {
-            encrypted: true,
-            ..m
-        },
-        Shape {
-            offsets: false,
-            compression: false,
-        },
-    );
-    assert_eq!(bare.get("encrypted"), Some(&JsonValue::Bool(true)));
-    for absent in [
-        "compressed_size",
-        "compression_method",
-        "header_offset",
-        "data_offset",
-    ] {
-        assert!(!bare.contains_key(absent), "{absent}");
-    }
+    assert_eq!(value.get("encrypted"), Some(&JsonValue::Bool(true)));
+    assert!(!value.contains_key("compression_method"));
+    value.insert("extra".into(), JsonValue::Bool(true));
+    assert_eq!(value.len(), 6);
 }
 
 #[test]

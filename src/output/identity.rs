@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 /// One identity assertion and where it came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Claim {
     /// The asserted value (a name, identifier, version, …).
     pub value: String,
@@ -62,8 +63,54 @@ impl Claim {
     }
 }
 
+/// The part a [`Party`] plays in an artifact's making.
+///
+/// Serialized as the snake_case name (`"author"`, `"last_modified_by"`, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PartyRole {
+    /// Wrote the package or document (manifest `author`, document creator).
+    Author,
+    /// Maintains the package (`maintainer` fields, Debian `Maintainer`).
+    Maintainer,
+    /// Owns the package on its registry (NuGet `owners`).
+    Owner,
+    /// Built the distribution package (RPM `Packager`, Alpine `packager`).
+    Packager,
+    /// An account named by a build artifact as having produced it, such as
+    /// the owner recorded for an archive's members.
+    Builder,
+    /// Last saved the document (Office `LastModifiedBy`).
+    LastModifiedBy,
+    /// Named as the document's manager (Office `Manager`).
+    Manager,
+}
+
+impl PartyRole {
+    /// The serialized (snake_case) name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Author => "author",
+            Self::Maintainer => "maintainer",
+            Self::Owner => "owner",
+            Self::Packager => "packager",
+            Self::Builder => "builder",
+            Self::LastModifiedBy => "last_modified_by",
+            Self::Manager => "manager",
+        }
+    }
+}
+
+impl std::fmt::Display for PartyRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A named party — a person or organization the artifact references.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Party {
     /// Display name, when given.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -75,9 +122,8 @@ pub struct Party {
     /// Personal or project URL associated with the party.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// The role the party plays: `author`, `maintainer`, `publisher`,
-    /// `last_modified_by`, …
-    pub role: String,
+    /// The role the party plays.
+    pub role: PartyRole,
     /// The `values` key the party was read from.
     pub source: String,
 }
@@ -103,6 +149,7 @@ pub enum UrlKind {
 
 /// A URL the artifact advertises, tagged by what it points to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Url {
     /// What the URL points to.
     pub kind: UrlKind,
@@ -119,6 +166,7 @@ pub struct Url {
 /// certificate's distinguished names so a reader gets "Apple Inc."
 /// rather than a full `CN=…, O=…, C=…` string.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Signer {
     /// Certificate subject common name (`CN`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -139,6 +187,22 @@ pub struct Signer {
     pub signed_at: Option<String>,
     /// The `values` key the signer was resolved from.
     pub source: String,
+}
+
+impl Signer {
+    /// A signer resolved from `source` with no certificate fields yet; set
+    /// the ones the certificate carries.
+    #[must_use]
+    pub fn new(source: impl Into<String>) -> Self {
+        Self {
+            common_name: None,
+            organization: None,
+            subject: None,
+            issuer: None,
+            signed_at: None,
+            source: source.into(),
+        }
+    }
 }
 
 /// Normalized trust level of the artifact's signature, ordered from
@@ -290,3 +354,6 @@ impl Identity {
             && self.unique_ids.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests;

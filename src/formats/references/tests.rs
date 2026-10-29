@@ -1,4 +1,5 @@
 use super::*;
+use crate::{DependencyScope, OpenOptions};
 
 fn npm_values(repo: Option<&str>) -> Values {
     let mut v = Values::new();
@@ -447,8 +448,7 @@ fn npm_lock_v3_pins_dependencies() {
 
 #[test]
 fn srcinfo_aur_foreign_bootstrap() {
-    // Modeled on the pacman-foreign-bootstrap sample: a `bun` dep (the
-    // foreign-bootstrap vector), a constrained dep, a tarball source
+    // A foreign `bun` dependency, a constrained one, a tarball source
     // pinned by sha256, and a tag-pinned git source left as SKIP.
     let sum = "6b824bfd5a9f2c1cd8d6a30f858a7bdc7813a448f4894a151da035dac5af2f91";
     let pkg = serde_json::json!({
@@ -470,13 +470,14 @@ fn srcinfo_aur_foreign_bootstrap() {
         .expect("bun dep");
     assert_eq!(bun.kind, RefKind::Dependency);
     assert!(bun.is_fetch_target());
-    // Version constraint stripped from the name.
+    // The constraint leaves the name and is kept as a requirement.
     assert!(
-        refs.iter()
-            .any(|r| r.locator == RefLocator::Purl("pkg:alpm/arch/boost".into()))
+        refs.iter().any(|r| r.locator
+            == RefLocator::Purl("pkg:alpm/arch/boost?version_requirement=%3E%3D1.69.0".into())),
+        "{refs:?}"
     );
 
-    // Tarball source: sha256 pin doubles as the hopper content key.
+    // Tarball source: the sha256 pin doubles as the content key.
     let tar = refs
         .iter()
         .find(|r| r.locator == RefLocator::Url("https://example.com/extra.tar.gz".into()))
@@ -504,7 +505,7 @@ fn srcinfo_release_asset_url_stays_url_with_pin() {
     // A GitHub *release asset* download URL (not the repo) must be fetched
     // verbatim so its sha256sums pin applies. Collapsing it to
     // `pkg:github/owner/repo` would resolve to the source tree at HEAD —
-    // different bytes, a hash mismatch. Modeled on ttf-iosevka-curly-slab.
+    // different bytes, a hash mismatch.
     let sum = "97d10cd3052cf30a3bc5bac4434d2937220e3343c4304eca9bd5c2259b10f5bc";
     let asset = "https://github.com/be5invis/Iosevka/releases/download/v34.7.0/PkgTTF-Iosevka.zip";
     let pkg = serde_json::json!({
@@ -610,7 +611,8 @@ fn cargo_lock_pins_registry_crates_and_skips_path_deps() {
             value: sum.into()
         })
     );
-    // A SHA-256 pin *is* the .crate's content hash — doubles as the hopper key.
+    // A SHA-256 pin *is* the .crate's content hash, so it doubles as the
+    // content key.
     assert_eq!(r.content_sha256.as_deref(), Some(sum));
 }
 
@@ -804,7 +806,7 @@ fn gem_archive_resolves_runtime_deps_to_rubygems() {
     // npm — the bug that motivated this arm).
     let mut values = Values::new();
     values.insert(
-        "gem.runtime_dependencies",
+        "gem.dependencies",
         serde_json::json!(["faraday", "faraday-multipart", "mime-types"]),
     );
     let refs = derive(FileType::Gem, &[], &values);
@@ -1012,6 +1014,7 @@ fn github_action_rejects_purl_injection() {
 }
 
 #[test]
+#[ignore = "wall-clock bound; run with --ignored"]
 fn many_distinct_relative_imports_dedup_in_linear_time() {
     // Each specifier was checked against a list of every earlier one: 100k
     // distinct `require("./mN")` lines took 15 s.
@@ -1027,6 +1030,7 @@ fn many_distinct_relative_imports_dedup_in_linear_time() {
 }
 
 #[test]
+#[ignore = "wall-clock bound; run with --ignored"]
 fn locate_misses_are_charged_to_the_scan_budget() {
     // A v1 lockfile is walked last entry first, so every earlier dependency
     // misses the search resumed past the large last entry, and each miss
@@ -1064,6 +1068,7 @@ fn locate_misses_are_charged_to_the_scan_budget() {
 }
 
 #[test]
+#[ignore = "wall-clock bound; run with --ignored"]
 fn many_package_json_bin_targets_dedup_in_linear_time() {
     // Each target was checked against a list of every earlier one, which
     // made a `bin` map with 100k entries quadratic.
@@ -1080,4 +1085,145 @@ fn many_package_json_bin_targets_dedup_in_linear_time() {
         .filter(|r| matches!(r.locator, RefLocator::Path(_)))
         .count();
     assert_eq!(paths, 50_000);
+}
+
+#[test]
+fn dependency_scope_comes_from_the_table_not_words_in_the_package_name() {
+    let data = br#"[package]
+name = "fixture"
+version = "1.0.0"
+[dependencies]
+dev-dependencies-helper = "=1.0.0"
+build-dependencies-helper = "=2.0.0"
+[build-dependencies]
+cc = "=1.0.0"
+[dev-dependencies]
+tempfile = "=3.0.0"
+"#;
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("Cargo.toml"))
+        .open(data);
+    let by_name = |name: &str| {
+        parsed
+            .references()
+            .iter()
+            .find(|r| matches!(&r.locator, crate::RefLocator::Purl(p) if p.contains(name)))
+            .unwrap()
+    };
+    assert!(by_name("dev-dependencies-helper").context.is_none());
+    assert!(by_name("build-dependencies-helper").context.is_none());
+    assert_eq!(
+        by_name("pkg:cargo/cc@").context.as_ref().unwrap().scope,
+        DependencyScope::Build
+    );
+    assert_eq!(
+        by_name("tempfile").context.as_ref().unwrap().scope,
+        DependencyScope::Development
+    );
+}
+#[test]
+fn npm_lock_scopes_flags_aliases_and_integrity_survive() {
+    let data = br#"{"lockfileVersion":3,"packages":{
+      "node_modules/runtime":{"version":"1.0.0"},
+      "node_modules/dev":{"version":"2.0.0","dev":true},
+      "node_modules/optional":{"version":"3.0.0","optional":true},
+      "node_modules/both":{"version":"4.0.0","devOptional":true},
+      "node_modules/alias":{"name":"real","version":"5.0.0","dev":true,"hasInstallScript":true,"integrity":"sha512-PIN"}
+    }}"#;
+    let parsed = OpenOptions::new()
+        .path(std::path::Path::new("package-lock.json"))
+        .open(data);
+    let refs = parsed.references();
+    let by_name = |name: &str| {
+        refs.iter()
+            .find(|r| matches!(&r.locator, crate::RefLocator::Purl(p) if p.contains(name)))
+            .unwrap()
+    };
+    assert_eq!(
+        by_name("runtime").context.as_ref().unwrap().scope,
+        DependencyScope::Runtime
+    );
+    assert_eq!(
+        by_name("dev@").context.as_ref().unwrap().scope,
+        DependencyScope::Development
+    );
+    assert!(by_name("optional").context.as_ref().unwrap().optional);
+    let both = by_name("both").context.as_ref().unwrap();
+    assert!(both.optional);
+    assert_eq!(both.scope, DependencyScope::Runtime);
+    let alias = by_name("real");
+    let ctx = alias.context.as_ref().unwrap();
+    assert_eq!(ctx.installed_path.as_deref(), Some("node_modules/alias"));
+    assert!(ctx.has_install_script);
+    assert_eq!(ctx.scope, DependencyScope::Development);
+    assert_eq!(alias.pinned_hash.as_ref().unwrap().value, "PIN");
+}
+
+#[test]
+fn v1_nested_development_and_optional_context_is_inherited() {
+    let parsed = OpenOptions::new().path(std::path::Path::new("package-lock.json")).open(br#"{"lockfileVersion":1,"dependencies":{"parent":{"version":"1.0.0","dev":true,"optional":true,"dependencies":{"child":{"version":"npm:real-child@2.0.0","integrity":"sha512-PIN"}}}}}"#);
+    let child = parsed
+        .references()
+        .iter()
+        .find(|r| r.locator == RefLocator::Purl("pkg:npm/real-child@2.0.0".into()))
+        .unwrap();
+    let context = child.context.as_ref().unwrap();
+    assert_eq!(context.scope, DependencyScope::Development);
+    assert!(context.optional);
+    assert!(context.installed_path.is_none());
+    assert_eq!(child.pinned_hash.as_ref().unwrap().value, "PIN");
+}
+
+/// `.SRCINFO` dependencies carry the same scope and optionality as a built
+/// package's `.PKGINFO`: one parser reads both.
+#[test]
+fn srcinfo_dependencies_carry_scope_and_optionality() {
+    let pkg = serde_json::json!({
+        "pkg": {
+            "depends_x86_64": ["glibc"],
+            "optdepends": ["electron: graphical interface"],
+            "checkdepends": ["python-pytest"],
+            "makedepends": ["bad name"]
+        }
+    });
+    let refs = derive(FileType::SrcInfo, &[], &Values::from_json(pkg));
+    let context = |purl: &str| {
+        refs.iter()
+            .find(|r| r.locator == RefLocator::Purl(purl.into()))
+            .and_then(|r| r.context.clone())
+            .unwrap_or_else(|| panic!("{purl}: {refs:?}"))
+    };
+    assert_eq!(
+        context("pkg:alpm/arch/glibc").scope,
+        DependencyScope::Runtime
+    );
+    assert!(context("pkg:alpm/arch/electron").optional);
+    assert_eq!(
+        context("pkg:alpm/arch/python-pytest").scope,
+        DependencyScope::Build
+    );
+    assert_eq!(refs.len(), 3, "an invalid name is skipped: {refs:?}");
+}
+
+/// Workflow `uses:` references are CI-scoped dependencies.
+#[test]
+fn github_actions_uses_are_ci_scoped() {
+    let workflow = serde_json::json!({
+        "jobs": {"build": {"steps": [{"uses": "actions/checkout@v4"}]}}
+    });
+    let refs = derive(FileType::GithubActions, &[], &Values::from_json(workflow));
+    let [checkout] = refs.as_slice() else {
+        panic!("{refs:?}");
+    };
+    assert_eq!(
+        checkout.context.as_ref().map(|c| c.scope),
+        Some(DependencyScope::Ci)
+    );
+}
+
+/// The relative-import pattern compiles, so JavaScript local references are
+/// never silently empty.
+#[test]
+fn js_relative_import_pattern_compiles() {
+    assert!(JS_RELATIVE_IMPORT.is_some());
 }

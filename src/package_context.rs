@@ -1,24 +1,35 @@
 //! Bounded, filesystem-independent package relationships. The caller owns
 //! archive traversal; filefacts owns language and manifest semantics.
+//!
+//! # Paths
+//!
+//! Every function here takes the members of **one artifact** — one archive,
+//! package or source tree — per call. Member paths are logical, relative to
+//! that artifact's root and `/`-separated, and are never read from the host
+//! filesystem. Every path character other than `/` is ordinary, so a
+//! caller's own notation for nesting means nothing here. A reference that
+//! climbs above the root, or is absolute, resolves to nothing, so a result
+//! never reaches outside the members the caller grouped together: call once
+//! per nested archive to keep its members apart from its parent's.
+use crate::Values;
+use crate::formats::references::document;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// One analyzed member, with flattened parser values. Paths are logical archive
-/// paths, not paths that this module may read from the host filesystem.
+/// One analyzed member and the values filefacts extracted from it.
 #[derive(Debug, Clone, Copy)]
 pub struct SourceMember<'a> {
-    /// Logical member path, including its archive ownership boundary.
+    /// Logical member path; see [Paths](self#paths).
     pub path: &'a str,
-    /// Parsed, flattened facts from this member.
-    pub values: &'a BTreeMap<String, Value>,
+    /// The member's extracted values ([`crate::ParsedFile::values`]).
+    pub values: &'a Values,
 }
 
-/// One source member's text. Paths are logical archive paths, never read
-/// from the host filesystem.
+/// One source member's text.
 #[derive(Debug, Clone, Copy)]
 pub struct SourceFile<'a> {
-    /// Logical member path, including its archive ownership boundary.
+    /// Logical member path; see [Paths](self#paths).
     pub path: &'a str,
     /// The member's source text.
     pub source: &'a str,
@@ -49,8 +60,9 @@ pub enum Phase {
     Test,
 }
 
-/// Budgets for [`cargo_source_context`] and [`crate::go_source_context`].
-/// A result that hits one is marked `truncated`.
+/// Budgets for [`cargo_source_context`], [`crate::go_source_context`] and
+/// [`crate::go_dependency_context`]. A result that hits one is marked
+/// `truncated`, or its references unresolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ContextLimits {
@@ -71,6 +83,16 @@ pub struct ContextLimits {
     /// Most Go source bytes, summed, one package variant's payload flow
     /// analyses; more leaves that variant empty and truncated.
     pub max_flow_bytes: usize,
+    /// Most members a Go dependency context considers; more leaves every
+    /// module's references unresolved.
+    pub max_reference_members: usize,
+    /// Most references, summed over members, a Go dependency context
+    /// considers; more leaves every module's references unresolved.
+    pub max_references: usize,
+    /// Work units (member and reference comparisons) a Go dependency
+    /// context spends across all modules; a module it cannot afford keeps
+    /// its references unresolved.
+    pub max_reference_work: usize,
 }
 
 impl Default for ContextLimits {
@@ -83,6 +105,9 @@ impl Default for ContextLimits {
             max_cargo_visits: 20_000,
             max_flow_members: 128,
             max_flow_bytes: 2 * 1024 * 1024,
+            max_reference_members: 4096,
+            max_references: 50_000,
+            max_reference_work: 2_000_000,
         }
     }
 }
@@ -112,49 +137,23 @@ pub struct CargoTarget {
     pub members: BTreeSet<String>,
     /// Payload-flow event kinds found in those members.
     pub events: BTreeSet<String>,
-    /// `<phase>-<event>` labels, kept for existing rules; prefer `phase`
-    /// and `events`.
-    pub behaviors: Vec<String>,
     /// `<member>:mod <name>` declarations that matched no member, or more
     /// than one.
     pub unresolved_modules: BTreeSet<String>,
 }
 
-fn text<'a>(member: &'a SourceMember<'_>, key: &str) -> Option<&'a str> {
-    member.values.get(key).and_then(Value::as_str)
-}
-
-/// Whether the flattened path `path` is `<array>[<i>].<field>`: one field of
-/// an element of the array at `array`.
-fn element_field(path: &str, array: crate::ValueKey, field: &str) -> bool {
-    path.strip_prefix(array.as_str())
-        .and_then(|rest| rest.strip_suffix(field))
-        .and_then(|rest| rest.strip_suffix("]."))
-        .is_some_and(|rest| rest.starts_with('['))
-}
-
-/// Directory of a logical member path, separator included: through its last
-/// `/`, or through its last `!!` archive delimiter when that comes later, so
-/// members of sibling archives (`x/a.zip!!main.go`, `x/b.zip!!main.go`) never
-/// share a directory.
+/// Directory of a logical member path, through its last `/`; `""` at the
+/// artifact root.
 pub(crate) fn member_directory(path: &str) -> &str {
-    let slash = path.rfind('/').map_or(0, |i| i + 1);
-    let archive = path.rfind("!!").map_or(0, |i| i + 2);
-    &path[..slash.max(archive)]
-}
-
-/// The archive that owns a logical member path: everything through its last
-/// `!!` delimiter, or `""` outside any archive.
-pub(crate) fn archive_boundary(path: &str) -> &str {
-    &path[..path.rfind("!!").map_or(0, |i| i + 2)]
+    &path[..path.rfind('/').map_or(0, |i| i + 1)]
 }
 
 /// Apply the relative member reference `spec` to the `/`-separated directory
 /// `dir`, returning the normalized segments joined by `/`. `None` for a spec
-/// that is absolute, carries `\`, `:`, `!` or `#`, or climbs above `dir`'s
-/// root, so a reference can never leave the tree it was resolved in.
+/// that is absolute (`/x`, `C:/x`, `\\x`) or climbs above `dir`'s root, so a
+/// reference can never leave the artifact it was resolved in.
 pub(crate) fn join_relative(dir: &str, spec: &str) -> Option<String> {
-    if spec.starts_with('/') || spec.contains(['\\', ':', '!', '#']) {
+    if spec.starts_with('/') || spec.contains(['\\', ':']) {
         return None;
     }
     let mut parts: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
@@ -170,11 +169,10 @@ pub(crate) fn join_relative(dir: &str, spec: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
+/// `spec` resolved against the directory of `base_file`, kept within
+/// `boundary`, the directory of the manifest that owns both.
 fn resolve(base_file: &str, spec: &str, boundary: &str) -> Option<String> {
-    let base = base_file
-        .strip_prefix(boundary)?
-        .rsplit_once('/')
-        .map_or("", |(dir, _)| dir);
+    let base = member_directory(base_file.strip_prefix(boundary)?);
     Some(format!("{boundary}{}", join_relative(base, spec)?))
 }
 
@@ -192,27 +190,35 @@ pub fn cargo_source_context(
     let mut remaining = limits.max_cargo_visits;
     for manifest in members
         .iter()
-        .filter(|m| m.path.ends_with("/Cargo.toml") || m.path.ends_with("!!Cargo.toml"))
+        .filter(|m| m.path == "Cargo.toml" || m.path.ends_with("/Cargo.toml"))
     {
-        let boundary = &manifest.path[..manifest.path.len() - "Cargo.toml".len()];
+        let boundary = member_directory(manifest.path);
+        let field = |path| document(manifest.values, path);
         let mut entries = Vec::new();
-        if text(manifest, crate::value_key!("cargo.build_mode").as_str()) != Some("disabled") {
+        if manifest
+            .values
+            .get_key(crate::value_key!("cargo.build_mode"))
+            .and_then(Value::as_str)
+            != Some("disabled")
+        {
             entries.push((
-                text(manifest, "package.build").unwrap_or("build.rs"),
+                field("package.build")
+                    .and_then(Value::as_str)
+                    .unwrap_or("build.rs"),
                 Phase::Build,
             ));
         }
-        let phase = if manifest
-            .values
-            .get("lib.proc-macro")
-            .and_then(Value::as_bool)
-            == Some(true)
-        {
+        let phase = if field("lib.proc-macro").and_then(Value::as_bool) == Some(true) {
             Phase::ProcMacro
         } else {
             Phase::Runtime
         };
-        entries.push((text(manifest, "lib.path").unwrap_or("src/lib.rs"), phase));
+        entries.push((
+            field("lib.path")
+                .and_then(Value::as_str)
+                .unwrap_or("src/lib.rs"),
+            phase,
+        ));
         entries.push(("src/main.rs", Phase::Runtime));
         for (entry, phase) in entries {
             let Some(entry) =
@@ -222,10 +228,17 @@ pub fn cargo_source_context(
             };
             let mut pending = vec![entry.clone()];
             let mut visited = BTreeSet::new();
-            let mut kinds = BTreeSet::new();
+            let mut events = BTreeSet::new();
             let mut missing = BTreeSet::new();
             while let Some(path) = pending.pop() {
                 if remaining == 0 {
+                    tracing::debug!(
+                        target: "filefacts::package_context",
+                        stage = "cargo-modules",
+                        budget = limits.max_cargo_visits,
+                        manifest = manifest.path,
+                        "module visit budget spent; target coverage incomplete"
+                    );
                     truncated = true;
                     break;
                 }
@@ -236,29 +249,36 @@ pub fn cargo_source_context(
                 let Some(file) = files.get(path.as_str()) else {
                     continue;
                 };
-                for (key, value) in file.values {
-                    if element_field(key, crate::value_key!("source.payload_flow.events"), "kind") {
-                        if let Some(kind) = value.as_str() {
-                            kinds.insert(kind.to_string());
-                        }
-                    }
-                    if !element_field(key, crate::value_key!("source.rust.modules"), "name") {
+                let array = |key| {
+                    file.values
+                        .get_key(key)
+                        .and_then(Value::as_array)
+                        .map_or(&[][..], Vec::as_slice)
+                };
+                events.extend(
+                    array(crate::value_key!("source.payload_flow.events"))
+                        .iter()
+                        .filter_map(|event| event.get("kind")?.as_str())
+                        .map(str::to_string),
+                );
+                let stem = path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&path)
+                    .trim_end_matches(".rs");
+                // A non-root module file's children live in its own
+                // directory (`a.rs` declares `a/b.rs`).
+                let module_dir = if path == entry || matches!(stem, "lib" | "main" | "mod") {
+                    String::new()
+                } else {
+                    format!("{stem}/")
+                };
+                for module in array(crate::value_key!("source.rust.modules")) {
+                    let Some(name) = module.get("name").and_then(Value::as_str) else {
                         continue;
-                    }
-                    let Some(name) = value.as_str() else { continue };
-                    let prefix = key.trim_end_matches("name");
-                    let inline = text(file, &format!("{prefix}prefix")).unwrap_or("");
-                    let stem = path
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(&path)
-                        .trim_end_matches(".rs");
-                    let module_dir = if path == entry || matches!(stem, "lib" | "main" | "mod") {
-                        String::new()
-                    } else {
-                        format!("{stem}/")
                     };
-                    let candidates = match text(file, &format!("{prefix}path")) {
+                    let inline = module.get("prefix").and_then(Value::as_str).unwrap_or("");
+                    let candidates = match module.get("path").and_then(Value::as_str) {
                         Some(spec) => vec![format!("{inline}{spec}")],
                         None => vec![
                             format!("{module_dir}{inline}{name}.rs"),
@@ -277,20 +297,12 @@ pub fn cargo_source_context(
                     }
                 }
             }
-            // Compatibility projection for existing rules. New callers should
-            // consume phase/members/events rather than a policy-bearing label.
-            let label = phase.as_str();
-            let mut behaviors: Vec<_> = kinds.iter().map(|k| format!("{label}-{k}")).collect();
-            if kinds.contains("file-http-body") && kinds.contains("ssh-authorized-keys-write") {
-                behaviors.push("connected-file-upload-and-ssh-write".into());
-            }
             targets.push(CargoTarget {
                 manifest: manifest.path.to_string(),
                 entry,
                 phase,
                 members: visited,
-                events: kinds,
-                behaviors,
+                events,
                 unresolved_modules: missing,
             });
         }
@@ -312,124 +324,4 @@ impl Phase {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn cargo_context_respects_declared_graph_and_disabled_build() {
-        let mut manifest = BTreeMap::from([("package.build".into(), json!("bootstrap.rs"))]);
-        let root = BTreeMap::from([("source.rust.modules[0].name".into(), json!("helper"))]);
-        let helper = BTreeMap::from([(
-            "source.payload_flow.events[0].kind".into(),
-            json!("file-http-body"),
-        )]);
-        let unrelated = BTreeMap::from([(
-            "source.payload_flow.events[0].kind".into(),
-            json!("ssh-authorized-keys-write"),
-        )]);
-        let run = |manifest: &BTreeMap<String, Value>| {
-            cargo_source_context(
-                &[
-                    SourceMember {
-                        path: "p.zip!!pkg/Cargo.toml",
-                        values: manifest,
-                    },
-                    SourceMember {
-                        path: "p.zip!!pkg/bootstrap.rs",
-                        values: &root,
-                    },
-                    SourceMember {
-                        path: "p.zip!!pkg/helper.rs",
-                        values: &helper,
-                    },
-                    SourceMember {
-                        path: "p.zip!!pkg/unrelated.rs",
-                        values: &unrelated,
-                    },
-                ],
-                &ContextLimits::default(),
-            )
-        };
-        let facts = run(&manifest);
-        assert!(!facts.truncated);
-        let [target] = facts.targets.as_slice() else {
-            panic!("one target: {facts:?}");
-        };
-        assert_eq!(target.phase, Phase::Build);
-        assert_eq!(target.behaviors, ["build-file-http-body"]);
-        assert!(!target.events.contains("ssh-authorized-keys-write"));
-        let json = serde_json::to_value(&facts).unwrap();
-        assert_eq!(json["targets"][0]["phase"], "build");
-        assert_eq!(json["targets"][0]["entry"], "p.zip!!pkg/bootstrap.rs");
-        manifest.insert("cargo.build_mode".into(), json!("disabled"));
-        assert!(run(&manifest).targets.is_empty());
-    }
-
-    /// An exhausted visit budget is reported, not silently clean.
-    #[test]
-    fn cargo_context_reports_an_exhausted_budget() {
-        let manifest = BTreeMap::new();
-        let lib = BTreeMap::new();
-        let members = [
-            SourceMember {
-                path: "pkg/Cargo.toml",
-                values: &manifest,
-            },
-            SourceMember {
-                path: "pkg/src/lib.rs",
-                values: &lib,
-            },
-        ];
-        let mut limits = ContextLimits::default();
-        assert!(!cargo_source_context(&members, &limits).truncated);
-        limits.max_cargo_visits = 0;
-        assert!(cargo_source_context(&members, &limits).truncated);
-    }
-    #[test]
-    fn element_field_matches_only_array_element_fields() {
-        let events = crate::value_key!("source.payload_flow.events");
-        for (path, expected) in [
-            ("source.payload_flow.events[0].kind", true),
-            ("source.payload_flow.events[12].kind", true),
-            ("source.payload_flow.events[0].kinds", false),
-            ("source.payload_flow.events.kind", false),
-            ("source.payload_flow.events_extra[0].kind", false),
-            ("source.payload_flow.events[0]", false),
-            ("source.payload_flow.events].kind", false),
-        ] {
-            assert_eq!(element_field(path, events, "kind"), expected, "{path}");
-        }
-    }
-
-    #[test]
-    fn paths_do_not_escape_archive_or_package() {
-        for path in [
-            "../../outside.rs",
-            "/etc/passwd",
-            "x!!other.rs",
-            "C:/other.rs",
-        ] {
-            assert!(resolve("a.zip!!pkg/src/lib.rs", path, "a.zip!!pkg/").is_none());
-        }
-        assert_eq!(
-            resolve("a.zip!!pkg/src/lib.rs", "../helper.rs", "a.zip!!pkg/"),
-            Some("a.zip!!pkg/helper.rs".into())
-        );
-    }
-
-    #[test]
-    fn member_path_helpers_respect_archive_boundaries() {
-        assert_eq!(member_directory("pkg/a.go"), "pkg/");
-        assert_eq!(member_directory("main.go"), "");
-        assert_eq!(member_directory("x/a.zip!!main.go"), "x/a.zip!!");
-        assert_eq!(member_directory("x/a.zip!!sub/main.go"), "x/a.zip!!sub/");
-        assert_eq!(archive_boundary("x/a.zip!!sub/main.go"), "x/a.zip!!");
-        assert_eq!(archive_boundary("x/main.go"), "");
-        assert_eq!(join_relative("a/b", "../c/./d"), Some("a/c/d".into()));
-        assert_eq!(join_relative("", "c"), Some("c".into()));
-        for escaping in ["../../c", "/abs", "x!!y", "c:/d", "a\\b", "#frag"] {
-            assert_eq!(join_relative("a", escaping), None, "{escaping}");
-        }
-    }
-}
+mod tests;

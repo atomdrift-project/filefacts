@@ -119,6 +119,7 @@ mod carrier;
 pub(crate) mod cfml;
 mod chm;
 mod class;
+pub(crate) mod cms;
 pub(crate) mod common;
 mod containers;
 mod cpio;
@@ -126,24 +127,18 @@ mod crx;
 mod deb;
 mod dmg;
 mod elf;
-mod elf_dwarf;
-mod elf_dynamic;
-mod elf_hashes;
-mod elf_syscalls;
 mod font;
 mod gem;
 mod generic;
 mod go_buildinfo;
 pub(crate) mod goblin_safe;
-pub(crate) mod identity;
+mod image4;
 mod image_stats;
 pub(crate) mod iso;
 mod jar;
 mod jpeg;
 mod lnk;
 mod macho;
-mod macho_code_signature;
-mod macho_hashes;
 mod markdown;
 mod maven_pom;
 mod nib;
@@ -155,15 +150,10 @@ mod ooxml;
 mod pbxproj;
 mod pdf;
 mod pe;
-mod pe_authenticode;
-mod pe_debug;
-mod pe_image_hash;
-mod pe_manifest;
-mod pe_rich;
-mod pe_signature_trust;
-mod pe_version_info;
+pub(crate) mod people;
 pub(crate) mod phar;
 mod pickle;
+mod pkg_arch;
 mod pkgmeta;
 mod plist_guard;
 mod png;
@@ -172,7 +162,7 @@ mod python_sdist;
 mod rar;
 pub(crate) mod references;
 mod registry;
-mod rpa;
+pub(crate) mod rpa;
 mod rpm;
 mod rpyc;
 mod rtf;
@@ -180,13 +170,13 @@ mod rust_crate;
 mod scpt;
 mod sevenz;
 mod shellcode;
-// Pending: lift once the in-flight source-walk refactor lands and fixes its hits.
-mod clr_il;
 pub(crate) mod source;
 mod source_meta;
 mod structured;
 mod symbol_hashes;
 mod tar;
+#[cfg(test)]
+mod testutil;
 mod udf;
 mod upx;
 mod vba;
@@ -200,9 +190,8 @@ mod zip;
 /// Run one container walker and emit the shared `media.*` facts.
 ///
 /// Strings are extracted first: the masquerade case is exactly the one where
-/// the strings are the evidence, and cleave's recursive decode pipeline reads
-/// them to surface `metadata/encoded-payload/*` for base64 blobs and URLs
-/// hidden in the container.
+/// the strings are the evidence, and a caller decoding base64 blobs and URLs
+/// hidden in the container reads them there.
 fn media_container(
     bytes: &[u8],
     values: &mut Values,
@@ -247,7 +236,7 @@ pub(crate) fn extract(
     // Every file gets the generic byte-level metrics. Format-specific
     // extractors layer on top of (and may shadow with more accurate
     // values) what generic emits.
-    generic::extract(bytes, ctx.values, ctx.strings, ctx.metrics);
+    generic::extract(bytes, ctx.metrics);
     if file_type == FileType::Xml && axml::looks_like_axml(bytes) {
         axml::extract_values(bytes, ctx.values);
     }
@@ -308,8 +297,17 @@ pub(crate) fn extract(
             ctx.errors,
             apk_android::extract_from_archive,
         ),
-        FileType::Zip
-        | FileType::GoModule
+        // A plain zip may be a source release: the walk's archive is probed
+        // for a WordPress or autoconf identity.
+        FileType::Zip => zip_package(
+            bytes,
+            ctx.values,
+            ctx.metrics,
+            ctx.archive_members,
+            ctx.errors,
+            |archive, values, _, _| source_meta::probe_zip(archive, values),
+        ),
+        FileType::GoModule
         | FileType::Composer
         | FileType::Odf
         | FileType::Conda
@@ -433,27 +431,24 @@ pub(crate) fn extract(
         ),
         // 7z's header holds the member table even when its payload streams
         // are encrypted. Keep this metadata-only, matching the ZIP/TAR
-        // extractors: cleave owns any recursive extraction.
+        // extractors: any recursive extraction is the caller's.
         FileType::SevenZ => sevenz::extract(bytes, ctx.values, ctx.metrics, ctx.archive_members),
-        // Compressed-tar packages (Alpine apk, FreeBSD/Arch pkg, Void xbps):
-        // same handling as the other compressed-tar variants — format label
-        // only; cleave decompresses and re-submits the members. Void's
-        // `props.plist` identity needs a plist parse, deferred for now.
         // An Alpine package is concatenated gzip streams, not a plain
         // `.tar.gz`, so the generic tar walk declines it. Read the control
         // segment for the apk.* publisher identity the way npm/crate/gem read
-        // theirs; cleave still decompresses and re-submits the members.
+        // theirs; unpacking the members is the caller's.
         FileType::ApkAlpine => {
             apk_alpine::extract(bytes, ctx.values, ctx.metrics);
             Ok(())
         }
+        // Compressed-tar packages: format label only, like the other
+        // compressed-tar variants; unpacking the members is the caller's.
         FileType::Hex
         | FileType::Pub
         | FileType::Cran
         | FileType::Cpan
         | FileType::Hackage
         | FileType::PkgFreebsd
-        | FileType::PkgArch
         | FileType::Xbps => tar::extract(
             bytes,
             file_type,
@@ -461,6 +456,18 @@ pub(crate) fn extract(
             ctx.metrics,
             ctx.archive_members,
         ),
+        // An Arch package's `.PKGINFO` lands in `pkg.*`, as a PKGBUILD's
+        // fields do.
+        FileType::PkgArch => {
+            pkg_arch::extract(bytes, ctx.values);
+            tar::extract(
+                bytes,
+                file_type,
+                ctx.values,
+                ctx.metrics,
+                ctx.archive_members,
+            )
+        }
         // A Python sdist is a gzip tar: read `<root>/PKG-INFO` for the
         // python.* publisher identity, then list members (format label only).
         FileType::PythonSdist => python_sdist::extract(
@@ -524,31 +531,33 @@ pub(crate) fn extract(
         FileType::PackageLockJson
         | FileType::ChromeManifest
         | FileType::PipfileLock
-        | FileType::ComposerLock => structured::extract_json(bytes, ctx.values),
-        FileType::ComposerJson => structured::extract_composer_json(bytes, ctx.values),
+        | FileType::ComposerLock => structured::extract_json(bytes, ctx.values, ctx.errors),
+        FileType::ComposerJson => structured::extract_composer_json(bytes, ctx.values, ctx.errors),
         // A bare package.json: the verbatim JSON tree, plus the same
         // npm.* identity layer the tarball path emits.
         FileType::PackageJson => {
-            structured::extract_json(bytes, ctx.values)?;
+            structured::extract_json(bytes, ctx.values, ctx.errors)?;
             if let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(bytes) {
                 npm::emit(&manifest, ctx.values, ctx.metrics);
             }
             Ok(())
         }
-        FileType::Json => structured::extract_generic_json(bytes, ctx.values, ctx.metrics),
+        FileType::Json => {
+            structured::extract_generic_json(bytes, ctx.values, ctx.metrics, ctx.errors)
+        }
         // gyp is Python-literal syntax: JSON in the common case, but real (and
         // hostile) manifests use trailing commas, `#` comments, single quotes,
         // and byte escapes that strict JSON rejects. extract_gyp parses JSON
         // first, then falls back to a tolerant Python-literal parse so value
         // paths like targets[*].sources[*] and a byte-escaped target `type`
         // still resolve instead of vanishing into a text/raw scan.
-        FileType::Gyp => structured::extract_gyp(bytes, ctx.values, ctx.metrics),
+        FileType::Gyp => structured::extract_gyp(bytes, ctx.values, ctx.metrics, ctx.errors),
         FileType::VsixManifest => {
             vsix::extract(bytes, ctx.values, ctx.strings, ctx.metrics, ctx.errors);
             Ok(())
         }
         FileType::CargoToml => {
-            structured::extract_toml(bytes, ctx.values)?;
+            structured::extract_toml(bytes, ctx.values, ctx.errors)?;
             let mode = match ctx.values.get("package.build") {
                 Some(serde_json::Value::Bool(false)) => "disabled",
                 Some(serde_json::Value::String(_)) => "custom",
@@ -559,19 +568,21 @@ pub(crate) fn extract(
             Ok(())
         }
         FileType::CargoLock | FileType::PoetryLock | FileType::PyProjectToml => {
-            structured::extract_toml(bytes, ctx.values)
+            structured::extract_toml(bytes, ctx.values, ctx.errors)
         }
         FileType::GithubActions | FileType::PnpmLock | FileType::Yaml => {
-            structured::extract_yaml(bytes, ctx.values)
+            structured::extract_yaml(bytes, ctx.values, ctx.errors)
         }
         FileType::Plist => {
-            structured::extract_plist(bytes, ctx.values)?;
+            structured::extract_plist(bytes, ctx.values, ctx.errors)?;
             structured::plist_entitlement_metrics(ctx.values, ctx.metrics);
             Ok(())
         }
         FileType::Nib => nib::extract(bytes, ctx.values, ctx.strings, ctx.metrics),
-        FileType::Pbxproj => pbxproj::extract(bytes, ctx.values, ctx.strings, ctx.metrics),
-        FileType::PkgInfo => structured::extract_pkginfo(bytes, ctx.values),
+        FileType::Pbxproj => {
+            pbxproj::extract(bytes, ctx.values, ctx.strings, ctx.metrics, ctx.errors)
+        }
+        FileType::PkgInfo => structured::extract_pkginfo(bytes, ctx.values, ctx.errors),
         FileType::SrcInfo => pkgmeta::extract_srcinfo(bytes, ctx.values),
         FileType::Registry => registry::extract(bytes, ctx.values, ctx.metrics),
         // A Windows registry export is a text script, not package metadata:
@@ -615,8 +626,8 @@ pub(crate) fn extract(
         }
         // Media containers: walk the structure, then let carrier::emit turn
         // the coverage into the shared `media.*` facts. Strings are extracted
-        // for all of them, which is also what enrols them in cleave's
-        // encoded-payload decode pipeline.
+        // for all of them, which is what hands a caller the encoded payloads
+        // a carrier hides.
         FileType::Wav | FileType::Webp => {
             media_container(
                 bytes,
@@ -710,23 +721,24 @@ pub(crate) fn extract(
         | FileType::Elixir
         | FileType::Clojure
         | FileType::Batch
-        | FileType::Makefile => source::extract(
-            bytes,
-            file_type,
-            tree_cache,
-            ctx.values,
-            ctx.strings,
-            ctx.metrics,
-            ctx.symbols,
-        ),
+        | FileType::Makefile => {
+            source::extract(
+                bytes,
+                tree_cache,
+                ctx.values,
+                ctx.strings,
+                ctx.metrics,
+                ctx.symbols,
+            );
+            Ok(())
+        }
 
         // Shell gets the normal source/AST extraction; a PKGBUILD additionally
         // gets its package-metadata fields lifted into a pkg.* value tree so it
         // can be compared field-for-field against a sibling .SRCINFO.
         FileType::Shell => {
-            let r = source::extract(
+            source::extract(
                 bytes,
-                file_type,
                 tree_cache,
                 ctx.values,
                 ctx.strings,
@@ -736,7 +748,7 @@ pub(crate) fn extract(
             if ctx.basename == Some("PKGBUILD") {
                 pkgmeta::extract_pkgbuild(bytes, ctx.values, ctx.errors);
             }
-            r
+            Ok(())
         }
 
         // Text-like languages without a tree-sitter binding in filefacts.
@@ -752,43 +764,30 @@ pub(crate) fn extract(
         // metrics get layered on top.
         FileType::Markdown => {
             source::extract_text_only(bytes, ctx.metrics);
-            markdown::extract(bytes, ctx.values, ctx.metrics);
+            markdown::extract(bytes, ctx.values);
             Ok(())
         }
 
-        FileType::Data => {
+        FileType::Ani => {
             ani::extract(bytes, ctx.values, ctx.metrics);
-            if let Some(table) = crate::fileid::image4_trustcache::parse(bytes) {
-                let entries: Vec<_> = table
-                    .entries
-                    .as_chunks::<24>()
-                    .0
-                    .iter()
-                    .map(|entry| {
-                        serde_json::json!({
-                            "cdhash": common::hex_encode(&entry[..20]),
-                            "hash_type": entry[20], "flags": entry[21],
-                            "constraint_category": entry[22], "reserved": entry[23]
-                        })
-                    })
-                    .collect();
-                ctx.values.insert_key(
-                    value_key!("image4.trustcache"),
-                    serde_json::json!({
-                        "payload_type": "trca", "description": table.description,
-                        "version": 2, "uuid": common::hex_encode(table.uuid),
-                        "entry_count": entries.len(), "entries": entries
-                    }),
-                );
-            }
             Ok(())
         }
+        FileType::Image4TrustCache => {
+            image4::extract(bytes, ctx.values);
+            Ok(())
+        }
+        // Recognized, but nothing past the type to extract: the generic
+        // metrics and string scan below are the whole view.
+        FileType::Data
+        | FileType::Nrbf
+        | FileType::FatBootSector
+        | FileType::CertificateSignature => Ok(()),
         FileType::DesktopEntry => {
-            desktop_entry::extract(bytes, ctx.values);
+            desktop_entry::extract(bytes, ctx.values, ctx.errors);
             Ok(())
         }
         FileType::SystemdService => {
-            systemd::extract(bytes, ctx.values);
+            systemd::extract(bytes, ctx.values, ctx.errors);
             Ok(())
         }
         _ => Ok(()),
@@ -850,18 +849,26 @@ pub(crate) fn extract(
     /// header included. Refuse anything past a megabyte so a hostile length
     /// cannot expand without bound.
     fn inflate_cws(bytes: &[u8]) -> Option<Vec<u8>> {
-        use std::io::Read;
-        if !bytes.starts_with(b"CWS") {
-            return None;
-        }
-        let declared = crate::bytes::u32_le(bytes, 4)? as usize;
+        let body = bytes.strip_prefix(b"CWS")?.get(5..)?;
+        let skipped = |reason: &str| {
+            tracing::debug!(target: "filefacts::formats", format = "cws", reason, "movie not inflated");
+        };
+        let declared = crate::bytes::u32_le(bytes, 4)?;
         if !(8..=1 << 20).contains(&declared) {
+            skipped("declared movie size out of range");
             return None;
         }
-        let mut out = Vec::new();
-        let mut dec = flate2::read::ZlibDecoder::new(bytes.get(8..)?).take(declared as u64);
-        dec.read_to_end(&mut out).ok()?;
-        if out.is_empty() { None } else { Some(out) }
+        match bounded::inflate_capped(flate2::read::ZlibDecoder::new(body), u64::from(declared)) {
+            Ok(movie) if !movie.bytes.is_empty() => Some(movie.bytes),
+            Ok(_) => {
+                skipped("empty zlib stream");
+                None
+            }
+            Err(e) => {
+                skipped(&format!("zlib stream did not inflate: {e}"));
+                None
+            }
+        }
     }
 
     // Cross-format binary attribution derived from the merged symbol
@@ -882,51 +889,4 @@ pub(crate) fn extract(
 }
 
 #[cfg(test)]
-mod generic_yaml_routing_tests {
-    #[test]
-    fn yaml_type_populates_mapping_and_sequence_values() {
-        let mapping = crate::OpenOptions::new()
-            .file_type(crate::FileType::Yaml)
-            .open(b"tasks:\n  lint:\n    cmds: [go test]\n");
-        assert_eq!(
-            mapping.values().get("tasks.lint.cmds[0]"),
-            Some(&serde_json::json!("go test"))
-        );
-        let sequence = crate::OpenOptions::new()
-            .file_type(crate::FileType::Yaml)
-            .open(b"- title: Guide\n  url: guide\n");
-        assert_eq!(
-            sequence.values().get("root[0].title"),
-            Some(&serde_json::json!("Guide"))
-        );
-    }
-}
-
-#[cfg(test)]
-mod cws_string_tests {
-    use std::io::Write;
-
-    #[test]
-    fn inflated_cws_exposes_the_remote_movie_url() {
-        let movie = b"http://cdn.example/x\x00ff.swf\x00";
-        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-        enc.write_all(movie).unwrap();
-        let compressed = enc.finish().unwrap();
-        let mut file = b"CWS\x08".to_vec();
-        file.extend_from_slice(&((8 + movie.len()) as u32).to_le_bytes());
-        file.extend_from_slice(&compressed);
-        let opened = crate::open(&file);
-        let extracted = opened.extracted();
-        let text: Vec<&str> = extracted
-            .strings
-            .text
-            .iter()
-            .map(|s| s.value.as_str())
-            .collect();
-        assert!(
-            text.iter().any(|s| s.contains("http://cdn.example/x")),
-            "{text:?}"
-        );
-        assert!(text.iter().any(|s| s.contains("ff.swf")), "{text:?}");
-    }
-}
+mod tests;

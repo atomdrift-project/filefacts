@@ -1,4 +1,5 @@
 use super::*;
+use crate::formats::cfml::specimens;
 use crate::{Arg, FlowKind, Symbol};
 use std::collections::BTreeSet;
 
@@ -78,7 +79,11 @@ fn conditional_attribute_suffix_keeps_only_unconditional_fields() {
         .find(|v| v.target.as_deref() == Some("html:input"))
         .unwrap();
     assert!(!p.flow.values[call.inputs[0]].fields.contains_key("value"));
-    assert!(p.flow.limitations.contains("markup-syntax-unavailable"));
+    assert!(
+        p.flow
+            .limitations
+            .contains(&crate::Limitation::MarkupSyntaxUnavailable)
+    );
     assert_eq!(
         p.symbols
             .iter()
@@ -91,8 +96,8 @@ fn conditional_attribute_suffix_keeps_only_unconditional_fields() {
 }
 
 #[test]
-fn retained_datasource_shell_has_conditional_command_controls() {
-    let source = include_bytes!("../../../../testdata/cfml/datasource_shell.cfm");
+fn datasource_shell_has_conditional_command_controls() {
+    let source = specimens::datasource_shell();
     let names = controls(source);
     for name in ["cmd", "opts", "timeout"] {
         assert!(
@@ -143,8 +148,12 @@ fn entity_and_interpolation_allocations_share_the_constant_budget() {
     );
     let p = super::super::parse(source.as_bytes());
     assert!(
-        p.flow.limitations.contains("constant-string-budget")
-            || p.flow.limitations.contains("markup-entity-budget")
+        p.flow
+            .limitations
+            .contains(&crate::Limitation::ConstantStringBudget)
+            || p.flow
+                .limitations
+                .contains(&crate::Limitation::MarkupEntityBudget)
     );
     let computed: usize = p
         .flow
@@ -293,7 +302,7 @@ fn entity_decoding_does_not_change_bindings_or_literal_hashes() {
     assert!(
         p.flow
             .limitations
-            .contains("markup-named-entity-unavailable")
+            .contains(&crate::Limitation::MarkupNamedEntityUnavailable)
     );
     assert!(controls(b"<input name='c&unknown;md'>").is_empty());
 }
@@ -311,7 +320,11 @@ fn malformed_attributes_and_mixed_start_tags_are_conservative() {
     }
     let source = r#"<input name='cmd' value="<cfexecute name='fixed'>">"#;
     let p = super::super::parse(source.as_bytes());
-    assert!(p.flow.limitations.contains("markup-syntax-unavailable"));
+    assert!(
+        p.flow
+            .limitations
+            .contains(&crate::Limitation::MarkupSyntaxUnavailable)
+    );
     assert!(
         p.symbols.iter().any(
             |s| matches!(s, Symbol::Call {target, ..} if target.as_deref() == Some("cfexecute"))
@@ -341,9 +354,26 @@ fn markup_limits_and_every_prefix_are_bounded() {
 }
 
 #[test]
-fn retained_shell_has_real_command_control() {
-    let source = include_bytes!("../../../../testdata/cfml/encrypted_shell_decoded.cfm");
+fn decoded_shell_has_real_command_control() {
+    let source = specimens::encrypted_shell_decoded();
     assert!(controls(source).contains(&("html:input".into(), "command".into())));
+    let p = super::super::parse(source);
+    assert!(p.symbols.iter().any(|s| matches!(s, Symbol::Call {target, offset: Some(offset), ..} if target.as_deref() == Some("html:input") && source[*offset as usize..].starts_with(b"<input type=\"text\" name=\"command\""))));
+}
+
+/// Synthetic counterpart of the specimen control tests: inputs whose value
+/// attribute sits behind a `<cfif>` still declare their names.
+#[test]
+fn synthetic_conditional_command_controls() {
+    let source = br##"<cfoutput><input type=text name="cmd" size=50
+  <cfif isdefined("form.cmd")>value="#form.cmd#"</cfif>><input type="text" name="command" size="40"></cfoutput>"##;
+    let names = controls(source);
+    for name in ["cmd", "command"] {
+        assert!(
+            names.contains(&("html:input".into(), name.into())),
+            "{name}: {names:?}"
+        );
+    }
     let p = super::super::parse(source);
     assert!(p.symbols.iter().any(|s| matches!(s, Symbol::Call {target, offset: Some(offset), ..} if target.as_deref() == Some("html:input") && source[*offset as usize..].starts_with(b"<input type=\"text\" name=\"command\""))));
 }

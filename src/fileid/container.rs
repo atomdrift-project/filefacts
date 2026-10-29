@@ -3,9 +3,9 @@
 //! Many ecosystem package formats are, underneath their format-specific
 //! identity, just a well-known archive container wrapped in a compression
 //! codec: a `.gem` is an uncompressed `tar`, a `.crate` is a gzipped `tar`,
-//! a `.whl` is a `zip`. The mapping from each [`FileType`] to that pair lives
-//! here, so a consumer can ask "what archive and compression underlie this
-//! type?" without re-encoding the per-format knowledge.
+//! a `.whl` is a `zip`. Each [`FileType`] row declares that pair, so a
+//! consumer can ask "what archive and compression underlie this type?"
+//! without re-encoding the per-format knowledge.
 //!
 //! The decomposition has two levels:
 //!
@@ -62,8 +62,7 @@ pub enum ArchiveFormat {
 }
 
 impl ArchiveFormat {
-    /// Stable lowercase label, matching the container vocabulary cleave emits
-    /// in `archive.format.kind` (`tar`, `zip`, …).
+    /// Stable lowercase label (`tar`, `zip`, …).
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -168,118 +167,6 @@ pub struct Container {
     pub compression: Compression,
 }
 
-impl FileType {
-    /// The archive container format underlying this type, or `None` when the
-    /// type is not an archive-backed package.
-    ///
-    /// `None` covers source, binaries, and manifests, and also the pure
-    /// single-file compression wrappers (`.gz`, `.bz2`, `.xz`, `.zst`): those
-    /// carry no multi-file container of their own, so there is nothing to name
-    /// here — a consumer decompresses them and re-identifies the inner bytes.
-    ///
-    /// The returned format is the stable key for model selection: prefer a
-    /// specialist trained for the exact [`FileType`], and fall back to the
-    /// container format (ignoring compression) when none exists.
-    #[must_use]
-    pub const fn archive_format(self) -> Option<ArchiveFormat> {
-        use ArchiveFormat::{Ar, Asar, Cab, Iso9660, Rar, Rpa, SevenZip, Tar, Xar, Zip};
-        Some(match self {
-            // Tar containers: plain, the compressed `.tar.*` variants, and the
-            // ecosystem packages that are a tar at heart (uncompressed gem /
-            // OCI / Gentoo, gzipped npm / crate / sdist / Alpine apk, zstd
-            // FreeBSD / Void, and Arch's variably-compressed `.pkg.tar.*`).
-            Self::Tar
-            | Self::TarGz
-            | Self::TarBz2
-            | Self::TarXz
-            | Self::TarZst
-            | Self::Gem
-            | Self::OciImage
-            | Self::GentooBinpkg
-            | Self::Npm
-            | Self::Crate
-            | Self::Hex
-            | Self::Pub
-            | Self::Cran
-            | Self::Cpan
-            | Self::Hackage
-            | Self::PythonSdist
-            | Self::ApkAlpine
-            | Self::Xbps
-            | Self::PkgFreebsd
-            | Self::PkgArch => Tar,
-            // ZIP containers: bare zips and every zip-based package format.
-            Self::Zip
-            | Self::GoModule
-            | Self::Composer
-            | Self::ApkAndroid
-            | Self::Conda
-            | Self::Egg
-            | Self::Ipa
-            | Self::Nupkg
-            | Self::Vsix
-            | Self::Xpi
-            | Self::Whl
-            | Self::Jar
-            | Self::Odf
-            | Self::Crx => Zip,
-            Self::Deb => Ar,
-            Self::Cpio => ArchiveFormat::Cpio,
-            Self::PkgMacos => Xar,
-            Self::SevenZ => SevenZip,
-            Self::Rar => Rar,
-            Self::Rpa => Rpa,
-            Self::Cab => Cab,
-            Self::Asar => Asar,
-            Self::Iso => Iso9660,
-            _ => return None,
-        })
-    }
-
-    /// The full archive-plus-compression decomposition of this type, derived
-    /// from the type alone, or `None` for non-archive types (see
-    /// [`FileType::archive_format`]).
-    ///
-    /// Compression is exact for every type except Arch Linux packages
-    /// ([`FileType::PkgArch`]), whose `.pkg.tar.{zst,xz,gz}` codec the type
-    /// does not pin; this reports its modern default ([`Compression::Zstd`]).
-    /// Call [`container_of`] with the file bytes to resolve that case exactly.
-    #[must_use]
-    pub const fn container(self) -> Option<Container> {
-        let Some(archive) = self.archive_format() else {
-            return None;
-        };
-        Some(Container {
-            archive,
-            compression: self.declared_compression(),
-        })
-    }
-
-    /// The compression a type's [`FileType`] declares on its own, before any
-    /// byte inspection. For [`FileType::PkgArch`] this is the modern Arch
-    /// default; [`container_of`] refines it from the bytes.
-    const fn declared_compression(self) -> Compression {
-        use Compression::{Bzip2, Gzip, None, Xz, Zstd};
-        match self {
-            Self::TarGz
-            | Self::Npm
-            | Self::Crate
-            | Self::PythonSdist
-            | Self::ApkAlpine
-            | Self::Pub
-            | Self::Cran
-            | Self::Cpan
-            | Self::Hackage => Gzip,
-            Self::TarBz2 => Bzip2,
-            Self::TarXz => Xz,
-            // Arch packages vary across zst/xz/gz; zstd is the current default
-            // and `container_of` corrects it from the leading magic bytes.
-            Self::TarZst | Self::Xbps | Self::PkgFreebsd | Self::PkgArch => Zstd,
-            _ => None,
-        }
-    }
-}
-
 /// Resolve the [`Container`] for `file_type`, consulting `bytes` to pin the
 /// compression codec for types whose [`FileType`] does not determine it
 /// (Arch `.pkg.tar.{zst,xz,gz}`). For every other type — and whenever the
@@ -300,134 +187,4 @@ pub fn container_of(file_type: FileType, bytes: &[u8]) -> Option<Container> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn specialty_tar_packages_decompose_to_tar() {
-        // Uncompressed tar at heart.
-        assert_eq!(FileType::Gem.archive_format(), Some(ArchiveFormat::Tar));
-        assert_eq!(
-            FileType::Gem.container(),
-            Some(Container {
-                archive: ArchiveFormat::Tar,
-                compression: Compression::None,
-            })
-        );
-        // Gzipped tar.
-        assert_eq!(
-            FileType::Npm.container().map(|c| c.compression),
-            Some(Compression::Gzip)
-        );
-        assert_eq!(
-            FileType::PythonSdist.container().map(|c| c.compression),
-            Some(Compression::Gzip)
-        );
-        // Zstd tar.
-        assert_eq!(
-            FileType::Xbps.container().map(|c| c.compression),
-            Some(Compression::Zstd)
-        );
-    }
-
-    #[test]
-    fn the_users_example_tar_xz() {
-        let c = FileType::TarXz.container().expect("tar.xz decomposes");
-        assert_eq!(c.archive, ArchiveFormat::Tar);
-        assert_eq!(c.compression, Compression::Xz);
-        assert_eq!(c.archive.label(), "tar");
-        assert_eq!(c.compression.label(), "xz");
-    }
-
-    #[test]
-    fn zip_packages_report_uncompressed_zip_container() {
-        // The zip container itself is not compressed; its members are.
-        for ft in [
-            FileType::Whl,
-            FileType::GoModule,
-            FileType::Jar,
-            FileType::Nupkg,
-            FileType::Conda,
-        ] {
-            assert_eq!(
-                ft.container(),
-                Some(Container {
-                    archive: ArchiveFormat::Zip,
-                    compression: Compression::None,
-                }),
-                "{ft:?} should be an uncompressed zip container"
-            );
-        }
-    }
-
-    #[test]
-    fn non_archive_types_have_no_container() {
-        for ft in [
-            FileType::Elf,
-            FileType::Pe,
-            FileType::Python,
-            FileType::Json,
-        ] {
-            assert_eq!(ft.archive_format(), None);
-            assert_eq!(ft.container(), None);
-        }
-    }
-
-    #[test]
-    fn pure_compression_wrappers_have_no_container() {
-        // Single-file compression carries no multi-file container of its own.
-        for ft in [FileType::Gz, FileType::Bz2, FileType::Xz, FileType::Zst] {
-            assert_eq!(ft.archive_format(), None);
-        }
-    }
-
-    #[test]
-    fn non_tar_containers_map_correctly() {
-        assert_eq!(FileType::Deb.archive_format(), Some(ArchiveFormat::Ar));
-        assert_eq!(
-            FileType::PkgMacos.archive_format(),
-            Some(ArchiveFormat::Xar)
-        );
-        assert_eq!(
-            FileType::SevenZ.archive_format(),
-            Some(ArchiveFormat::SevenZip)
-        );
-        assert_eq!(FileType::Asar.archive_format(), Some(ArchiveFormat::Asar));
-    }
-
-    #[test]
-    fn pkg_arch_compression_resolved_from_bytes() {
-        // Declared default is zstd...
-        assert_eq!(
-            FileType::PkgArch.container().map(|c| c.compression),
-            Some(Compression::Zstd)
-        );
-        // ...but the bytes win: an xz-wrapped Arch package resolves to xz.
-        let xz_magic = [0xfd, b'7', b'z', b'X', b'Z', 0x00, 0x00, 0x00];
-        assert_eq!(
-            container_of(FileType::PkgArch, &xz_magic).map(|c| c.compression),
-            Some(Compression::Xz)
-        );
-        // A gzip-wrapped one resolves to gzip.
-        let gz_magic = [0x1f, 0x8b, 0x08, 0x00];
-        assert_eq!(
-            container_of(FileType::PkgArch, &gz_magic).map(|c| c.compression),
-            Some(Compression::Gzip)
-        );
-        // Unrecognizable leading bytes fall back to the declared default.
-        assert_eq!(
-            container_of(FileType::PkgArch, b"not magic").map(|c| c.compression),
-            Some(Compression::Zstd)
-        );
-    }
-
-    #[test]
-    fn container_of_matches_static_for_unambiguous_types() {
-        // For every type but PkgArch the bytes are irrelevant.
-        assert_eq!(
-            container_of(FileType::Npm, b"anything"),
-            FileType::Npm.container()
-        );
-        assert_eq!(container_of(FileType::Elf, b"anything"), None);
-    }
-}
+mod tests;

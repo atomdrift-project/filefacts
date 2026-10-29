@@ -122,7 +122,208 @@ pub struct Flow {
     /// Unambiguous local helper definitions.
     pub functions: BTreeMap<String, FlowFunction>,
     /// Known omissions/limits. Empty does not prove runtime reachability.
-    pub limitations: BTreeSet<String>,
+    pub limitations: BTreeSet<Limitation>,
+}
+
+/// Why a [`Flow`] is incomplete. Serialized as its kebab-case name
+/// (`"node-budget"`). New reasons may be added in a minor release, so a
+/// `match` outside this crate needs a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum Limitation {
+    // Scope of every graph: facts are source-local.
+    /// Relationships are may-flow within one file, not proven reachability.
+    SourceLocalMayFlowNotReachability,
+    /// CFML script blocks are analysed for local flow only.
+    ScriptBlockLocalFlowOnly,
+
+    // Budgets.
+    /// The value table reached its size cap.
+    NodeBudget,
+    /// The evaluation step budget or recursion depth ran out.
+    AnalysisBudget,
+    /// The source exceeded the analysed byte budget.
+    SourceByteBudget,
+    /// Too many variable bindings to track.
+    BindingBudget,
+    /// Too many constant strings to fold.
+    ConstantStringBudget,
+    /// Too many literal symbols to record.
+    SymbolLiteralBudget,
+    /// Too many markup entities to decode.
+    MarkupEntityBudget,
+    /// An expression nested past the depth cap.
+    ExpressionDepth,
+    /// An expression had more parts than the cap.
+    ExpressionParts,
+    /// Branches nested past the depth cap.
+    BranchDepth,
+    /// A branch had more alternatives than the cap.
+    BranchAlternatives,
+    /// HTTP parent tags nested past the depth cap.
+    HttpParentDepth,
+
+    // Syntax the producer could not read.
+    /// The parser reported errors; some relationships are missing.
+    ParseError,
+    /// An expression was not well formed.
+    MalformedExpression,
+    /// A string interpolation was not well formed.
+    MalformedInterpolation,
+    /// A tag's attribute list was not well formed.
+    MalformedAttributes,
+    /// A branch closed without opening, or the reverse.
+    UnbalancedBranch,
+    /// A branch was still open at end of input.
+    UnclosedBranch,
+    /// An HTTP child tag appeared outside its parent.
+    UnbalancedHttpParent,
+    /// An HTTP parent tag was still open at end of input.
+    UnclosedHttpParent,
+    /// The CFML markup scan stopped before the end of input.
+    MarkupSyntaxUnavailable,
+    /// A markup named entity is not decoded.
+    MarkupNamedEntityUnavailable,
+    /// A function body could not be located.
+    FunctionBodyUnavailable,
+    /// A script statement exceeded the syntax budget or did not parse.
+    ScriptStatementSyntaxOrBudget,
+    /// A script statement's flow could not be modelled.
+    ScriptStatementFlowUnavailable,
+    /// A script call exceeded the syntax budget or did not parse.
+    ScriptCallSyntaxOrBudget,
+    /// A condition call exceeded the syntax budget or did not parse.
+    ConditionCallSyntaxOrBudget,
+    /// The CFML scan stopped at its input byte cap.
+    SyntaxBytes,
+    /// The CFML scan stopped at its tag cap.
+    SyntaxTags,
+    /// The CFML scan stopped at its comment nesting cap.
+    SyntaxCommentDepth,
+    /// The CFML scan reached unterminated syntax.
+    SyntaxTruncated,
+    /// The CFML scan stopped at its script block cap.
+    SyntaxScript,
+    /// The CFML template is encrypted.
+    SyntaxEncrypted,
+
+    // Constructs that are not modelled.
+    /// An anonymous function's body is not analysed.
+    AnonymousFunction,
+    /// A nested named function's body is not analysed.
+    NestedFunction,
+    /// Two local helpers share a name, so neither is resolved.
+    AmbiguousHelper,
+    /// C++ class member initializers depend on object construction.
+    ClassInitializersUnmodeled,
+    /// C++ variable templates depend on instantiation.
+    TemplateInstantiationUnmodeled,
+    /// An assignment target was not a plain name.
+    CompoundAssignmentTarget,
+    /// An object field could not be resolved statically.
+    UnresolvedObjectField,
+    /// An `if` body is not modelled.
+    UnmodeledIfBody,
+    /// An expression form is not modelled.
+    UnsupportedExpression,
+    /// An assignment form is not modelled.
+    UnsupportedAssignment,
+    /// An assignment target form is not modelled.
+    UnsupportedAssignmentTarget,
+    /// A call target is not a static name.
+    UnsupportedCallTarget,
+    /// An indexed member read is not modelled.
+    UnsupportedIndexedMember,
+    /// A tag is not modelled.
+    UnsupportedTag,
+    /// An explicitly scoped variable was never bound.
+    UnresolvedExplicitVariable,
+    /// A scope lookup could not be resolved statically.
+    UnresolvedScopeLookup,
+    /// An unscoped variable's scope depends on runtime state.
+    ImplicitScopeRuntimeDependent,
+    /// A setting changes scope resolution at runtime.
+    DynamicScopeSetting,
+    /// A query's output scope could not be determined.
+    QueryOutputScopeUnavailable,
+    /// A file operation's result attributes are dynamic.
+    DynamicFileResultAttributes,
+    /// A file operation's result binding is dynamic.
+    DynamicFileResultBinding,
+    /// A file operation's action is dynamic.
+    DynamicFileResultAction,
+}
+
+impl Limitation {
+    /// The serialized (kebab-case) name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SourceLocalMayFlowNotReachability => "source-local-may-flow-not-reachability",
+            Self::ScriptBlockLocalFlowOnly => "script-block-local-flow-only",
+            Self::NodeBudget => "node-budget",
+            Self::AnalysisBudget => "analysis-budget",
+            Self::SourceByteBudget => "source-byte-budget",
+            Self::BindingBudget => "binding-budget",
+            Self::ConstantStringBudget => "constant-string-budget",
+            Self::SymbolLiteralBudget => "symbol-literal-budget",
+            Self::MarkupEntityBudget => "markup-entity-budget",
+            Self::ExpressionDepth => "expression-depth",
+            Self::ExpressionParts => "expression-parts",
+            Self::BranchDepth => "branch-depth",
+            Self::BranchAlternatives => "branch-alternatives",
+            Self::HttpParentDepth => "http-parent-depth",
+            Self::ParseError => "parse-error",
+            Self::MalformedExpression => "malformed-expression",
+            Self::MalformedInterpolation => "malformed-interpolation",
+            Self::MalformedAttributes => "malformed-attributes",
+            Self::UnbalancedBranch => "unbalanced-branch",
+            Self::UnclosedBranch => "unclosed-branch",
+            Self::UnbalancedHttpParent => "unbalanced-http-parent",
+            Self::UnclosedHttpParent => "unclosed-http-parent",
+            Self::MarkupSyntaxUnavailable => "markup-syntax-unavailable",
+            Self::MarkupNamedEntityUnavailable => "markup-named-entity-unavailable",
+            Self::FunctionBodyUnavailable => "function-body-unavailable",
+            Self::ScriptStatementSyntaxOrBudget => "script-statement-syntax-or-budget",
+            Self::ScriptStatementFlowUnavailable => "script-statement-flow-unavailable",
+            Self::ScriptCallSyntaxOrBudget => "script-call-syntax-or-budget",
+            Self::ConditionCallSyntaxOrBudget => "condition-call-syntax-or-budget",
+            Self::SyntaxBytes => "syntax-bytes",
+            Self::SyntaxTags => "syntax-tags",
+            Self::SyntaxCommentDepth => "syntax-comment-depth",
+            Self::SyntaxTruncated => "syntax-truncated",
+            Self::SyntaxScript => "syntax-script",
+            Self::SyntaxEncrypted => "syntax-encrypted",
+            Self::AnonymousFunction => "anonymous-function",
+            Self::NestedFunction => "nested-function",
+            Self::AmbiguousHelper => "ambiguous-helper",
+            Self::ClassInitializersUnmodeled => "class-initializers-unmodeled",
+            Self::TemplateInstantiationUnmodeled => "template-instantiation-unmodeled",
+            Self::CompoundAssignmentTarget => "compound-assignment-target",
+            Self::UnresolvedObjectField => "unresolved-object-field",
+            Self::UnmodeledIfBody => "unmodeled-if-body",
+            Self::UnsupportedExpression => "unsupported-expression",
+            Self::UnsupportedAssignment => "unsupported-assignment",
+            Self::UnsupportedAssignmentTarget => "unsupported-assignment-target",
+            Self::UnsupportedCallTarget => "unsupported-call-target",
+            Self::UnsupportedIndexedMember => "unsupported-indexed-member",
+            Self::UnsupportedTag => "unsupported-tag",
+            Self::UnresolvedExplicitVariable => "unresolved-explicit-variable",
+            Self::UnresolvedScopeLookup => "unresolved-scope-lookup",
+            Self::ImplicitScopeRuntimeDependent => "implicit-scope-runtime-dependent",
+            Self::DynamicScopeSetting => "dynamic-scope-setting",
+            Self::QueryOutputScopeUnavailable => "query-output-scope-unavailable",
+            Self::DynamicFileResultAttributes => "dynamic-file-result-attributes",
+            Self::DynamicFileResultBinding => "dynamic-file-result-binding",
+            Self::DynamicFileResultAction => "dynamic-file-result-action",
+        }
+    }
+}
+
+impl std::fmt::Display for Limitation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// A declarative library model: which inputs may contribute to a return value.
@@ -414,100 +615,4 @@ impl Flow {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Every kind with the JSON string it has always serialized as.
-    const KINDS: [(FlowKind, &str); 10] = [
-        (FlowKind::Literal, "literal"),
-        (FlowKind::Parameter, "parameter"),
-        (FlowKind::Call, "call"),
-        (FlowKind::Member, "member"),
-        (FlowKind::Merge, "merge"),
-        (FlowKind::Concat, "concat"),
-        (FlowKind::Alternative, "alternative"),
-        (FlowKind::Object, "object"),
-        (FlowKind::Keyword, "keyword"),
-        (FlowKind::Unknown, "unknown"),
-    ];
-
-    #[test]
-    fn kind_serializes_as_its_former_string() {
-        for (kind, name) in KINDS {
-            assert_eq!(serde_json::to_value(kind).unwrap(), name);
-            assert_eq!(kind.as_str(), name);
-            assert_eq!(kind.to_string(), name);
-            let back: FlowKind = serde_json::from_value(serde_json::json!(name)).unwrap();
-            assert_eq!(back, kind);
-        }
-        assert!(serde_json::from_str::<FlowKind>("\"Call\"").is_err());
-    }
-
-    #[test]
-    fn value_json_is_unchanged() {
-        let value = FlowValue {
-            kind: FlowKind::Call,
-            offset: 7,
-            literal: None,
-            target: Some("fetch".into()),
-            inputs: vec![1, 2],
-            receiver: None,
-            fields: BTreeMap::new(),
-            module_level: false,
-        };
-        assert_eq!(
-            serde_json::to_string(&value).unwrap(),
-            r#"{"kind":"call","offset":7,"target":"fetch","inputs":[1,2]}"#
-        );
-        let back: FlowValue =
-            serde_json::from_str(&serde_json::to_string(&value).unwrap()).unwrap();
-        assert_eq!(back.kind, FlowKind::Call);
-    }
-
-    /// Keyword entries are reached only by name, object entries also
-    /// positionally; alternatives are complete values, merges are not.
-    #[test]
-    fn traversal_reads_kinds() {
-        let literal = |offset| FlowValue {
-            kind: FlowKind::Literal,
-            offset,
-            literal: Some(Arg::String {
-                value: offset.to_string(),
-            }),
-            target: None,
-            inputs: Vec::new(),
-            receiver: None,
-            fields: BTreeMap::new(),
-            module_level: false,
-        };
-        let node = |kind, inputs: Vec<usize>, fields: &[(&str, usize)]| FlowValue {
-            kind,
-            offset: 0,
-            literal: None,
-            target: None,
-            inputs,
-            receiver: None,
-            fields: fields.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
-            module_level: false,
-        };
-        let flow = Flow {
-            values: vec![
-                literal(0),
-                literal(1),
-                node(FlowKind::Alternative, vec![0, 1], &[]),
-                node(FlowKind::Merge, vec![0, 1], &[]),
-                node(FlowKind::Keyword, Vec::new(), &[("a", 0)]),
-                node(FlowKind::Object, Vec::new(), &[("a", 1)]),
-            ],
-            ..Flow::default()
-        };
-        let complete = flow.complete_values(2, None, 100);
-        assert_eq!(complete.values.len(), 2);
-        assert!(!complete.incomplete);
-        assert!(flow.complete_values(3, None, 100).incomplete);
-        let ids = |o: FlowOrigins| o.values.into_iter().map(|v| v.value).collect::<Vec<_>>();
-        assert_eq!(ids(flow.complete_values(4, Some("a"), 100)), [0]);
-        assert_eq!(ids(flow.origins(4, &[], 100)), [4]);
-        assert_eq!(ids(flow.origins(5, &[], 100)), [1, 5]);
-    }
-}
+mod tests;

@@ -40,7 +40,7 @@ use super::value_keys::ValueKey;
 /// let script = parsed.values().get("scripts.postinstall");
 /// assert_eq!(script.and_then(|x| x.as_str()), Some("node setup.js"));
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Values(JsonValue);
 
@@ -108,7 +108,7 @@ impl Values {
     /// [`Self::get`] for a catalog-checked key:
     /// `values.get_key(value_key!("…"))` fails to build on a key that is not
     /// declared, where `get` would just return `None` forever.
-    pub fn get_key(&self, key: ValueKey) -> Option<&JsonValue> {
+    pub(crate) fn get_key(&self, key: ValueKey) -> Option<&JsonValue> {
         self.get(key.as_str())
     }
 
@@ -116,7 +116,7 @@ impl Values {
     /// data: an array index (`"[0]"`, `"[0].subject"`) or a field below an
     /// object (`"name"`). `get_key_at(k, "[0].x")` reads what `get` reads at
     /// `"<k>[0].x"`, and `get_key_at(k, "x")` what it reads at `"<k>.x"`.
-    pub fn get_key_at(&self, key: ValueKey, rest: &str) -> Option<&JsonValue> {
+    pub(crate) fn get_key_at(&self, key: ValueKey, rest: &str) -> Option<&JsonValue> {
         navigate(self.get_key(key)?, rest)
     }
 
@@ -160,13 +160,14 @@ fn insert_path(root: &mut Map<String, JsonValue>, path: &str, value: JsonValue) 
         if !entry.is_object() {
             *entry = JsonValue::Object(Map::new());
         }
-        cur = entry
-            .as_object_mut()
-            .expect("just ensured the entry is an object");
+        let JsonValue::Object(next) = entry else {
+            return;
+        };
+        cur = next;
     }
 }
 
-pub(super) fn navigate<'a>(value: &'a JsonValue, path: &str) -> Option<&'a JsonValue> {
+fn navigate<'a>(value: &'a JsonValue, path: &str) -> Option<&'a JsonValue> {
     let mut cur = value;
     for raw in path.split('.') {
         let (key, idx) = split_index(raw);
@@ -226,101 +227,4 @@ mod split_index_tests {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::Values;
-    use serde_json::json;
-
-    #[test]
-    fn insert_and_get_top_level() {
-        let mut v = Values::new();
-        v.insert("name", json!("filefacts"));
-        assert_eq!(v.get("name").and_then(|x| x.as_str()), Some("filefacts"));
-    }
-
-    #[test]
-    fn insert_creates_nested_objects() {
-        let mut v = Values::new();
-        v.insert("pe.coff.machine", json!("x86_64"));
-        assert_eq!(
-            v.get("pe.coff.machine").and_then(|x| x.as_str()),
-            Some("x86_64")
-        );
-        assert!(v.get("pe.coff").unwrap().is_object());
-    }
-
-    #[test]
-    fn insert_overwrites_non_object_intermediate() {
-        // Setting a leaf, then nesting under the same key, should not
-        // panic — the leaf is overwritten with an object.
-        let mut v = Values::new();
-        v.insert("pe", json!("leaf"));
-        v.insert("pe.coff.machine", json!("x86_64"));
-        assert_eq!(
-            v.get("pe.coff.machine").and_then(|x| x.as_str()),
-            Some("x86_64")
-        );
-    }
-
-    #[test]
-    fn get_missing_returns_none() {
-        let v = Values::new();
-        assert!(v.get("nope").is_none());
-        assert!(v.get("a.b.c").is_none());
-    }
-
-    #[test]
-    fn iter_yields_top_level() {
-        let mut v = Values::new();
-        v.insert("a", json!(1));
-        v.insert("b", json!(2));
-        let keys: Vec<&str> = v.iter().map(|(k, _)| k).collect();
-        assert!(keys.contains(&"a"));
-        assert!(keys.contains(&"b"));
-    }
-
-    #[test]
-    fn is_empty_works() {
-        let v = Values::new();
-        assert!(v.is_empty());
-        let mut v = Values::new();
-        v.insert("x", json!(1));
-        assert!(!v.is_empty());
-    }
-
-    /// The checked accessors read and write exactly what the string
-    /// accessors do at the joined path, so converting a call site cannot
-    /// change output.
-    #[test]
-    fn checked_accessors_match_string_paths() {
-        let mut v = Values::new();
-        v.insert_key(
-            crate::value_key!("pe.signatures"),
-            json!([{"subject": "CN=a", "thumbprint_sha256": "ab"}]),
-        );
-        v.insert_key_at(crate::value_key!("npm.author"), "email", json!("a@b"));
-        v.insert("npm.author.name", json!("A"));
-
-        let sigs = crate::value_key!("pe.signatures");
-        assert_eq!(v.get_key(sigs), v.get("pe.signatures"));
-        for rest in ["[0]", "[0].thumbprint_sha256", "[1]", "[0].missing", ""] {
-            let joined = if rest.is_empty() || rest.starts_with('[') {
-                format!("pe.signatures{rest}")
-            } else {
-                format!("pe.signatures.{rest}")
-            };
-            assert_eq!(v.get_key_at(sigs, rest), v.get(&joined), "{rest:?}");
-        }
-        let author = crate::value_key!("npm.author");
-        assert_eq!(v.get_key_at(author, "email"), Some(&json!("a@b")));
-        assert_eq!(v.get_key_at(author, "name"), v.get("npm.author.name"));
-        assert!(v.get_key(crate::value_key!("pe.go")).is_none());
-    }
-
-    #[test]
-    fn serializes_as_json_object() {
-        let mut v = Values::new();
-        v.insert("pe.coff.machine", json!("x86_64"));
-        let s = serde_json::to_string(&v).unwrap();
-        assert_eq!(s, r#"{"pe":{"coff":{"machine":"x86_64"}}}"#);
-    }
-}
+mod tests;

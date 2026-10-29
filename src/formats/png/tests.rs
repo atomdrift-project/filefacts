@@ -183,9 +183,8 @@ fn detects_unknown_chunks() {
     assert_eq!(unk[0].as_str(), Some("sTeG"));
 }
 
-/// A file of many distinct non-standard chunk types used to dedup each one
-/// against every earlier type: 100,000 of them took seven seconds. The
-/// types are still counted; the listings are capped and say so.
+/// A file of many distinct non-standard chunk types: every type is
+/// counted, and the listings are capped and say so.
 #[test]
 fn many_distinct_unknown_chunks_are_listed_up_to_caps() {
     let types: Vec<[u8; 4]> = (0..20_000_u32)
@@ -402,8 +401,8 @@ fn pixel_stats_natural_image_has_nonzero_entropy() {
 }
 
 /// `file.entropy` comes from the generic pass that runs ahead of every
-/// extractor, so the PNG extractor no longer computes it a second time;
-/// the full pipeline still reports it, decodable or not.
+/// extractor, not from the PNG extractor; the full pipeline reports it,
+/// decodable or not.
 #[test]
 fn file_entropy_comes_from_the_generic_pass() {
     // Valid PNG signature + IHDR claiming a width that overruns

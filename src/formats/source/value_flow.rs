@@ -1,83 +1,15 @@
 //! Source-language producer for the shared flow view.
 use super::langs::{Lang, LangConfig};
-use super::{MAX_FLOW_DEPTH, ast_walk, named_children};
-use crate::{Arg, Flow, FlowFunction, FlowKind, FlowValue, Symbol, Symbols};
+use super::scope::Scope;
+use super::{MAX_FLOW_DEPTH, ast_walk, named_children, text};
+use crate::{Arg, Flow, FlowFunction, FlowKind, FlowValue, Limitation, Symbol, Symbols};
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
 
 const NODE_LIMIT: usize = 20_000;
 const STEP_LIMIT: usize = 100_000;
 
-/// Name → value bindings, layered over an optional read-only base, itself
-/// either a flat map or an enclosing layer.
-///
-/// Every function body starts from the module-level bindings, and every `if`
-/// branch from the bindings before it. Copying those per function or per
-/// branch made the walk quadratic (functions × globals, or `if` statements ×
-/// names bound before them: 5k of each took 90 s); layering keeps the base
-/// borrowed and records only what the layer binds or unbinds. A `None` in
-/// `local` hides a base binding the layer removed.
-#[derive(Default)]
-struct Bindings<'g> {
-    base: Option<&'g BTreeMap<String, usize>>,
-    parent: Option<&'g Bindings<'g>>,
-    local: BTreeMap<String, Option<usize>>,
-}
-
-impl<'g> Bindings<'g> {
-    fn over(base: &'g BTreeMap<String, usize>) -> Self {
-        Self {
-            base: Some(base),
-            ..Self::default()
-        }
-    }
-    /// An empty layer over `parent`, which it reads through but never changes.
-    fn under(parent: &'g Bindings<'g>) -> Self {
-        Self {
-            parent: Some(parent),
-            ..Self::default()
-        }
-    }
-    /// The binding below this layer.
-    fn inherited(&self, name: &str) -> Option<usize> {
-        match self.parent {
-            Some(parent) => parent.get(name),
-            None => self.base.and_then(|base| base.get(name).copied()),
-        }
-    }
-    fn get(&self, name: &str) -> Option<usize> {
-        match self.local.get(name) {
-            Some(value) => *value,
-            None => self.inherited(name),
-        }
-    }
-    fn insert(&mut self, name: String, value: usize) {
-        self.local.insert(name, Some(value));
-    }
-    fn remove(&mut self, name: &str) {
-        if self.inherited(name).is_some() {
-            self.local.insert(name.to_string(), None);
-        } else {
-            self.local.remove(name);
-        }
-    }
-    /// Names this layer binds or unbinds, which are the only names whose
-    /// value can differ from the shared base.
-    fn layered_names(&self) -> impl Iterator<Item = &String> {
-        self.local.keys()
-    }
-    /// The flattened bindings, for a top-level layer with no parent.
-    fn into_map(self) -> BTreeMap<String, usize> {
-        let mut map = self.base.cloned().unwrap_or_default();
-        for (name, value) in self.local {
-            match value {
-                Some(value) => map.insert(name, value),
-                None => map.remove(&name),
-            };
-        }
-        map
-    }
-}
+type Bindings<'g> = Scope<'g, usize>;
 
 struct Builder<'a> {
     source: &'a str,
@@ -86,25 +18,6 @@ struct Builder<'a> {
     flow: Flow,
     steps: usize,
     in_function: bool,
-}
-
-fn definition(node: Node<'_>) -> bool {
-    matches!(
-        node.kind(),
-        "function_item"
-            | "function_definition"
-            | "function_declaration"
-            | "method_declaration"
-            | "method_definition"
-            | "function_expression"
-            | "arrow_function"
-            | "func_literal"
-            | "method"
-            | "singleton_method"
-            | "local_function"
-            | "lambda"
-            | "lambda_expression"
-    )
 }
 
 fn field_nested<'a>(mut node: Node<'a>, field: &str) -> Option<Node<'a>> {
@@ -132,7 +45,7 @@ fn function_name(mut node: Node<'_>) -> Option<Node<'_>> {
 
 impl Builder<'_> {
     fn text(&self, n: Node<'_>) -> &str {
-        &self.source[n.byte_range()]
+        text(n, self.source)
     }
     /// Interpolated strings carry expression values rather than being opaque
     /// constants. Escaped interpolation markers have no substitution node.
@@ -148,7 +61,7 @@ impl Builder<'_> {
     }
     fn add(&mut self, kind: FlowKind, node: Node<'_>, inputs: Vec<usize>) -> usize {
         if self.flow.values.len() >= NODE_LIMIT {
-            self.flow.limitations.insert("node-budget".into());
+            self.flow.limitations.insert(Limitation::NodeBudget);
             return 0;
         }
         let id = self.flow.values.len();
@@ -175,7 +88,7 @@ impl Builder<'_> {
         let mut stack = vec![(node, 0usize)];
         while let Some((node, depth)) = stack.pop() {
             if depth > MAX_FLOW_DEPTH {
-                self.flow.limitations.insert("analysis-budget".into());
+                self.flow.limitations.insert(Limitation::AnalysisBudget);
                 continue;
             }
             if self.config.identifier_kinds.contains(&node.kind()) {
@@ -209,19 +122,19 @@ impl Builder<'_> {
             || depth > MAX_FLOW_DEPTH
             || self.flow.values.len() >= NODE_LIMIT
         {
-            self.flow.limitations.insert("analysis-budget".into());
+            self.flow.limitations.insert(Limitation::AnalysisBudget);
             return 0;
         }
         self.steps += 1;
-        if definition(node) {
+        if self.config.is_function(node) {
             // The outer function walk deliberately stops at named functions.
             // Anonymous definitions encountered while evaluating their bodies
             // must report the same limitation as top-level callbacks, rather
             // than silently omitting all calls inside the callback.
             if function_name(node).is_none() {
-                self.flow.limitations.insert("anonymous-function".into());
+                self.flow.limitations.insert(Limitation::AnonymousFunction);
             } else if self.in_function {
-                self.flow.limitations.insert("nested-function".into());
+                self.flow.limitations.insert(Limitation::NestedFunction);
             }
             return 0;
         }
@@ -232,13 +145,13 @@ impl Builder<'_> {
             // analyzes named methods and function-template bodies.
             let limitation = match node.kind() {
                 "class_specifier" | "struct_specifier" | "union_specifier" => {
-                    Some("class-initializers-unmodeled")
+                    Some(Limitation::ClassInitializersUnmodeled)
                 }
-                "template_declaration" => Some("template-instantiation-unmodeled"),
+                "template_declaration" => Some(Limitation::TemplateInstantiationUnmodeled),
                 _ => None,
             };
             if let Some(limitation) = limitation {
-                self.flow.limitations.insert(limitation.into());
+                self.flow.limitations.insert(limitation);
                 return 0;
             }
         }
@@ -317,7 +230,7 @@ impl Builder<'_> {
                     } else {
                         self.flow
                             .limitations
-                            .insert("compound-assignment-target".into());
+                            .insert(Limitation::CompoundAssignmentTarget);
                         0
                     }
                 } else {
@@ -397,7 +310,7 @@ impl Builder<'_> {
                 } else {
                     self.flow
                         .limitations
-                        .insert("unresolved-object-field".into());
+                        .insert(Limitation::UnresolvedObjectField);
                 }
             }
             let kind = if node.kind() == "keyword_argument" {
@@ -424,7 +337,7 @@ impl Builder<'_> {
                         if let Some(pattern) = initializer.child_by_field_name("left") {
                             let mut declared = Bindings::default();
                             self.bind(pattern, 0, &mut declared);
-                            for name in declared.local.into_keys() {
+                            for name in declared.into_names() {
                                 let previous = bindings.get(&name);
                                 shadowed.insert(name, previous);
                             }
@@ -443,7 +356,7 @@ impl Builder<'_> {
                 .child_by_field_name("consequence")
                 .or_else(|| node.child_by_field_name("body"));
             if consequence.is_none() {
-                self.flow.limitations.insert("unmodeled-if-body".into());
+                self.flow.limitations.insert(Limitation::UnmodeledIfBody);
             }
             let mut cursor = node.walk();
             let branches = consequence
@@ -456,7 +369,7 @@ impl Builder<'_> {
                 // resolves to the bindings before the `if` in `local` and
                 // `merged` alike, so only changed names can need a merge.
                 // Sorted, so value ids are stable.
-                let names: BTreeSet<&String> = local.layered_names().chain(merged.keys()).collect();
+                let names: BTreeSet<&String> = local.names().chain(merged.keys()).collect();
                 let mut changes = Vec::new();
                 for name in names {
                     let Some(id) = local.get(name) else {
@@ -544,10 +457,9 @@ impl Builder<'_> {
             }
         }
         // Only the names the block declares are restored after it, so only
-        // theirs are saved: copying every binding per block was quadratic.
+        // theirs are saved: copying every binding per block is quadratic.
         let before: Vec<(String, Option<usize>)> = declared
-            .local
-            .into_keys()
+            .into_names()
             .map(|name| {
                 let previous = bindings.get(&name);
                 (name, previous)
@@ -595,25 +507,25 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
     builder
         .flow
         .limitations
-        .insert("source-local-may-flow-not-reachability".into());
-    if config.lang == Lang::Go {
-        builder.aliases = super::go_syntax::imports(root, source)
-            .into_iter()
-            .collect();
-    }
+        .insert(Limitation::SourceLocalMayFlowNotReachability);
     for symbol in symbols {
         if let Symbol::Import { name, alias, .. } = symbol {
-            let alias = alias.clone().or_else(|| {
-                (config.lang == Lang::Rust)
-                    .then(|| name.rsplit("::").next().unwrap_or(name).to_string())
+            // A path's last segment is its default local name.
+            let alias = alias.clone().or_else(|| match config.lang {
+                Lang::Rust => name.rsplit("::").next().map(str::to_string),
+                Lang::Go => name.rsplit('/').next().map(str::to_string),
+                _ => None,
             });
-            if let Some(alias) = alias.filter(|alias| alias != "*") {
+            if let Some(alias) = alias.filter(|alias| !matches!(alias.as_str(), "*" | "_" | ".")) {
                 builder.aliases.insert(alias, name.clone());
             }
         }
     }
     if source.len() > 2 * 1024 * 1024 {
-        builder.flow.limitations.insert("source-byte-budget".into());
+        builder
+            .flow
+            .limitations
+            .insert(Limitation::SourceByteBudget);
     } else {
         builder.add(FlowKind::Unknown, root, Vec::new());
         let mut module = Bindings::default();
@@ -623,12 +535,15 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
         let mut duplicate_names = BTreeSet::new();
         while let Some(node) = stack.pop() {
             if builder.steps >= STEP_LIMIT {
-                builder.flow.limitations.insert("analysis-budget".into());
+                builder.flow.limitations.insert(Limitation::AnalysisBudget);
                 break;
             }
-            if definition(node) {
+            if config.is_function(node) {
                 let Some(name) = function_name(node) else {
-                    builder.flow.limitations.insert("anonymous-function".into());
+                    builder
+                        .flow
+                        .limitations
+                        .insert(Limitation::AnonymousFunction);
                     continue;
                 };
                 let name = builder.text(name).to_string();
@@ -668,10 +583,10 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
         }
         for name in duplicate_names {
             builder.flow.functions.remove(&name);
-            builder.flow.limitations.insert("ambiguous-helper".into());
+            builder.flow.limitations.insert(Limitation::AmbiguousHelper);
         }
         if root.has_error() {
-            builder.flow.limitations.insert("parse-error".into());
+            builder.flow.limitations.insert(Limitation::ParseError);
         }
     }
     builder.flow

@@ -82,10 +82,7 @@ fn ascii_variants_index_exact_extents_and_identity() {
         extract(&bytes, &mut values, &mut Metrics::new(), &mut members).unwrap();
         assert_eq!(members.len(), 2);
         assert_eq!(members[1].path, "./postinstall");
-        assert_eq!(
-            members[1].ownership.as_ref().unwrap().mode_octal,
-            Some(0o100755)
-        );
+        assert_eq!(members[1].ownership.mode_octal, Some(0o100755));
         let start = members[1].offsets.data.unwrap() as usize;
         assert_eq!(
             &bytes[start..start + members[1].size_bytes as usize],
@@ -149,7 +146,16 @@ fn bounded_metadata_and_partial_results() {
         .is_err()
     );
     assert_eq!(members.len(), 1);
-    assert!(index(&bytes, &mut Values::new(), &mut Vec::new(), MAX_ENTRIES, 80).is_err());
+    assert!(
+        index(
+            &bytes,
+            &mut Values::new(),
+            &mut Vec::new(),
+            MAX_ARCHIVE_MEMBERS,
+            80
+        )
+        .is_err()
+    );
     let mut bytes = fixture("070701");
     bytes[94..102].copy_from_slice(b"ffffffff");
     assert!(
@@ -166,7 +172,16 @@ fn bounded_metadata_and_partial_results() {
     entry(&mut bytes, "070707", "link", &[b'x'; 4096], 0o120777);
     entry(&mut bytes, "070707", "TRAILER!!!", b"", 0);
     let mut members = Vec::new();
-    assert!(index(&bytes, &mut Values::new(), &mut members, MAX_ENTRIES, 500).is_err());
+    assert!(
+        index(
+            &bytes,
+            &mut Values::new(),
+            &mut members,
+            MAX_ARCHIVE_MEMBERS,
+            500
+        )
+        .is_err()
+    );
     assert!(
         members.is_empty(),
         "link allocation must obey metadata budget"

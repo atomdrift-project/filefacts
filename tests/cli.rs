@@ -20,25 +20,27 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// The binary, kept away from the user's caches: the extraction cache is
-/// off, and every directory a cache path is derived from — `HOME` (macOS
-/// puts caches in `~/Library/Caches`, ignoring `XDG_CACHE_HOME`) and
-/// `XDG_CACHE_HOME` — points into a private directory. Variables that steer
-/// stng's old caches or the debug output are cleared, whatever the
-/// developer's shell has set.
+/// The binary, independent of the host: the extraction cache and rizin are
+/// off by flag, and every directory a cache path is derived from — `HOME`
+/// (macOS puts caches in `~/Library/Caches`, ignoring `XDG_CACHE_HOME`) and
+/// `XDG_CACHE_HOME` — points into a private directory, which the background
+/// cache cleanup then sweeps instead of the user's. Every `FILEFACTS_*` and
+/// `STNG_*` variable is cleared, whatever the developer's shell has set.
 fn filefacts() -> Command {
     let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join("cli-home");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_filefacts"));
-    cmd.env("FILEFACTS_CACHE", "0")
+    cmd.args(["--no-cache", "--no-rizin"])
         .env("HOME", &home)
         .env("XDG_CACHE_HOME", home.join(".cache"))
         .env("NO_COLOR", "1");
     for (name, _) in std::env::vars_os() {
-        if name.to_str().is_some_and(|n| n.starts_with("STNG_")) {
+        if name
+            .to_str()
+            .is_some_and(|n| n.starts_with("STNG_") || n.starts_with("FILEFACTS_"))
+        {
             cmd.env_remove(&name);
         }
     }
-    cmd.env_remove("FILEFACTS_DEBUG");
     cmd
 }
 
@@ -346,5 +348,48 @@ fn call_arguments_render() {
     assert!(
         text.contains(r#"os.system  "curl x", 3, name, <call>, true"#),
         "{text}"
+    );
+}
+
+/// Every path named is analysed, in order; one that cannot be read is
+/// reported and fails the run without stopping the others.
+#[test]
+fn several_paths_are_each_analysed() {
+    let dir = scratch("several-paths");
+    fs::write(dir.join("a.py"), SOURCE).unwrap();
+    fs::write(dir.join("b.json"), b"{\"k\": 1}").unwrap();
+    let out = filefacts()
+        .current_dir(&dir)
+        .args(["--format", "json", "fileid", "a.py", "missing", "b.json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot read missing"), "{stderr}");
+    let types: Vec<String> = serde_json::Deserializer::from_slice(&out.stdout)
+        .into_iter::<Value>()
+        .map(|v| v.unwrap()["file_type"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(types, ["python", "json"]);
+}
+
+/// A malformed `FILEFACTS_RIZIN_CONCURRENCY` is reported and ignored, not
+/// fatal.
+#[test]
+fn malformed_rizin_concurrency_is_reported_and_ignored() {
+    let dir = scratch("rizin-concurrency");
+    let file = dir.join("a.py");
+    fs::write(&file, SOURCE).unwrap();
+    let out = filefacts()
+        .env("FILEFACTS_RIZIN_CONCURRENCY", "lots")
+        .args(["--format", "json", "fileid"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("FILEFACTS_RIZIN_CONCURRENCY=lots"),
+        "{stderr}"
     );
 }

@@ -200,10 +200,10 @@ pub(super) fn extract(
         Format::Eot => walk_eot(bytes, &mut report),
         Format::None => {
             report.problem("no font signature");
-            // Nothing here is a font, so say what it is instead. This is the
-            // reachable case where cleave still typed the file `font` — the
-            // bytes carry no magic of their own (a raw compressed blob, an
-            // encrypted stage, base64) so no other analyzer claimed them.
+            // Nothing here is a font, so say what it is instead. The file was
+            // typed `font` by its name alone: the bytes carry no magic of their
+            // own (a raw compressed blob, an encrypted stage, base64), so no
+            // other extractor claimed them.
             report.content_kind = classify_region(bytes).or(Some("unknown"));
         }
     }
@@ -316,7 +316,6 @@ pub(super) fn extract(
         metric!("font.largest_table_bytes"),
         report.largest_table_bytes as f64,
     );
-    #[allow(clippy::cast_precision_loss)]
     metrics.insert(
         metric!("font.declared_size_delta"),
         report.declared_size_delta as f64,

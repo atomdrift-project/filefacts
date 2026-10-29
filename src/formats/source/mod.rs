@@ -12,26 +12,27 @@ mod ast_walk;
 mod batch_commands;
 mod batch_concat;
 mod batch_cycles;
+mod batch_lines;
 mod call_target_metrics;
 mod comment_metrics;
 mod escapes;
 mod go_syntax;
 mod payload_flow;
 mod python_module_calls;
+mod runtime_imports;
 mod shell_fifo;
 mod value_flow;
 pub use payload_flow::go_package_payload_flow;
 mod rust_syntax;
+mod scope;
 
 /// Decode the escape sequences a parsed source string literal carries, so a
 /// consumer sees the text the program will actually use rather than the way the
 /// source spelled it.
 ///
-/// Re-exported from the crate root because cleave maintains its own AST
-/// string-literal corpus — the one `type: literal` rules match against — and has
-/// to land on the same value this crate reports from `cleave facts literals`.
-/// When those two disagree, a rule author who checks the facts (as the rule
-/// guide instructs) sees a string that no rule they write can match.
+/// Public so a consumer that builds its own literal corpus from the syntax
+/// tree lands on the same values this crate reports in the literal tier; if
+/// the two disagree, a rule written against the reported facts cannot match.
 pub fn decode_source_escapes(literal: &str) -> String {
     escapes::decode(literal)
 }
@@ -58,12 +59,12 @@ mod visit;
 use crate::metric;
 use crate::value_key;
 use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator};
 
-use crate::error::Error;
 use crate::fileid::FileType;
 use crate::output::{MetricKey, Metrics, Strings, Values};
 
@@ -75,6 +76,12 @@ pub(crate) use parse::{TreeCache, TreeParse, TreeSitterDiagnostic};
 /// Recursion bound shared by the payload- and value-flow evaluators, which
 /// recurse once per syntax level they descend.
 const MAX_FLOW_DEPTH: usize = 96;
+
+/// The source text `node` spans. Empty when the range does not fall on
+/// character boundaries of `source`, which a tree parsed from it never does.
+fn text<'s>(node: Node<'_>, source: &'s str) -> &'s str {
+    source.get(node.byte_range()).unwrap_or("")
+}
 
 /// The named children of `node`, in order, read through one cursor rather
 /// than collected.
@@ -123,9 +130,9 @@ const SOURCE_QUERY_OUTPUT_LIMIT: usize = 10_000;
 /// Work budget for one query, counted in progress polls. tree-sitter polls
 /// the query progress callback once per 100 cursor steps
 /// (`OP_COUNT_PER_QUERY_CALLBACK_CHECK` in `query.c`), so the same tree always
-/// stops at the same match, however loaded the machine is. The 250 ms
-/// wall-clock budget this replaced fired on ordinary large files under load,
-/// and the content-keyed disk cache then kept the truncated symbols.
+/// stops at the same match, however loaded the machine is. A wall-clock
+/// budget would cut ordinary large files short under load, and the
+/// content-keyed disk cache would then keep the truncated symbols.
 ///
 /// Fixed rather than scaled: [`SOURCE_QUERY_BYTE_LIMIT`] already bounds how
 /// much tree a query walks. The heaviest query over about 68k real source
@@ -214,47 +221,48 @@ impl QueryBudget {
     }
 }
 
-// The dispatcher in `formats::extract` requires every format
-// extractor to return `Result<(), Error>` even when the impl can't
-// fail; uniformity is more valuable than removing one always-Ok arm.
-#[allow(clippy::unnecessary_wraps)]
+/// Extract a source file's facts from its one parse: text, comment, string,
+/// identifier, import and function metrics, the literal and comment string
+/// tiers, symbols, and the per-language relation facts. Without a parse only
+/// the text metrics remain.
 pub(super) fn extract(
     bytes: &[u8],
-    _file_type: FileType,
     tree_cache: Option<&TreeCache<'_>>,
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
     symbols_out: &mut crate::Symbols,
-) -> Result<(), Error> {
+) {
     let Some(cache) = tree_cache else {
-        // Even without a parse, the byte stream still has language-agnostic
-        // text features worth surfacing — emit `text.*` metrics from the
-        // raw bytes when they decode as UTF-8.
-        if let Ok(content) = std::str::from_utf8(bytes) {
-            text_metrics::emit(content, metrics);
-        }
-        return Ok(());
+        extract_text_only(bytes, metrics);
+        return;
     };
     let config = cache.config();
     let source = cache.source();
     let root = cache.tree().root_node();
+    let lang = config.lang;
 
     // Byte-level / line-level / whitespace text metrics — language-agnostic.
     text_metrics::emit(source, metrics);
-    if config.lang == Lang::Batch {
+    if lang == Lang::Batch {
         batch_concat::emit(source, metrics);
         batch_cycles::emit(source, metrics);
     }
 
-    // One walk for every collector that only reads each node once.
     let mut walked = visit::Collectors {
         comments: Some(visit::Comments::default()),
         literals: Some(visit::Literals::default()),
         identifiers: Some(visit::Identifiers::default()),
         functions: Some(function_metrics::Collector::default()),
         ast: Some(ast_walk::State::default()),
-        payload: payload_flow::Collector::new(source, config.lang),
+        rust: (lang == Lang::Rust).then(rust_syntax::Items::default),
+        payload: payload_flow::Collector::new(source, lang),
+        batch_commands: (lang == Lang::Batch).then(batch_commands::Collector::default),
+        runtime_imports: lang
+            .is_ecmascript()
+            .then(runtime_imports::Collector::default),
+        python: (lang == Lang::Python).then(|| python_module_calls::Collector::new(source)),
+        shell: (lang == Lang::Bash).then(shell_fifo::Collector::default),
     };
     visit::walk(root, source, config, &mut walked);
     // Comment metrics over the comment nodes the walk found; also fills the
@@ -268,47 +276,61 @@ pub(super) fn extract(
     for literal in walked.literals.take().unwrap_or_default().found {
         strings.literals.push(literal);
     }
+    let identifiers = walked.identifiers.take().unwrap_or_default().found;
     // `build_symbols` emits the symbol walk's facts after extraction.
-    if let Some(ast) = walked.ast.take() {
+    if let Some(mut ast) = walked.ast.take() {
+        ast.add_identifiers(&identifiers);
         cache.stash_ast_walk(ast);
     }
-    let (mut imports, import_libraries) = config
-        .query(QueryKind::Imports)
-        .map(|query| collect_imports(query, source, root))
-        .unwrap_or_default();
-    if config.lang == Lang::Rust {
-        imports.items = rust_syntax::imports(root, source);
-    }
-    if config.lang == Lang::Lua {
+
+    // Imports, computed once: the symbols, metrics and payload flow below
+    // all read these.
+    let go_imports = (lang == Lang::Go).then(|| go_syntax::imports(root, source));
+    let mut rust = walked.rust.take();
+    let mut imports = if let Some(rust) = &mut rust {
+        QueryCollection {
+            items: std::mem::take(&mut rust.imports),
+            output_limited: rust.imports_limited,
+            ..QueryCollection::default()
+        }
+    } else if let Some(go_imports) = &go_imports {
+        let items = go_imports
+            .iter()
+            .map(|import| {
+                let name = match import.name {
+                    Some(local) => format!("{} as {local}", import.path),
+                    None => import.path.to_string(),
+                };
+                (name, import.offset as u64)
+            })
+            .collect();
+        QueryCollection {
+            items,
+            ..QueryCollection::default()
+        }
+    } else {
+        config
+            .query(QueryKind::Imports)
+            .map(|query| collect_query(query, QueryKind::Imports, source, root))
+            .unwrap_or_default()
+    };
+    if lang == Lang::Lua {
         for (name, _) in &mut imports.items {
             *name = escapes::decode_lua(name);
         }
     }
-    let functions = config
-        .query(QueryKind::Functions)
-        .map(|query| collect_query(query, source, root))
-        .unwrap_or_default();
-    let classes = config
-        .query(QueryKind::Classes)
-        .map(|query| collect_query(query, source, root))
-        .unwrap_or_default();
+    let [functions, classes] = [QueryKind::Functions, QueryKind::Classes].map(|kind| {
+        config
+            .query(kind)
+            .map(|query| collect_query(query, kind, source, root))
+            .unwrap_or_default()
+    });
     emit_query_limit_metrics(metrics, "imports", &imports);
     emit_query_limit_metrics(metrics, "functions", &functions);
     emit_query_limit_metrics(metrics, "classes", &classes);
 
-    // Identifier metrics — emit `identifiers.*`.
-    let identifiers = walked.identifiers.take().unwrap_or_default();
-    if identifiers.truncated {
-        tracing::warn!(
-            lang = config.name(),
-            kept = identifiers.found.len(),
-            source_bytes = source.len(),
-            "identifier text exceeded its budget; the longest nested names were \
-             left out of identifier metrics (generated or adversarial source)",
-        );
-    }
-    let identifiers = identifiers.found;
-    identifier_metrics::emit(&identifiers, metrics);
+    let identifier_names: Vec<&str> = identifiers.iter().map(|&(name, _)| name).collect();
+    identifier_metrics::emit(&identifier_names, metrics);
 
     // String-literal metrics — operate on the literals we already
     // extracted into the `strings` view.
@@ -318,7 +340,7 @@ pub(super) fn extract(
     // Import metrics — feed the canonical language name so stdlib
     // classification works.
     let import_refs: Vec<&str> = imports.items.iter().map(|(n, _)| n.as_str()).collect();
-    import_metrics::emit(&import_refs, config.lang, metrics);
+    import_metrics::emit(&import_refs, lang, metrics);
 
     // Function metrics over the function-definition nodes the walk found.
     let total_lines = crate::bytes::sat_u32(source.lines().count());
@@ -337,10 +359,9 @@ pub(super) fn extract(
     // module, including its relative prefix. Module imports remain standalone
     // facts, preserving module-level matching alongside the member bindings.
     for (name, offset) in &imports.items {
-        // Source-language aliased imports arrive as `module as local` (the raw
-        // `aliased_import` node text). Split so the symbol name is the bare
-        // module and the alias is a structured field — no whitespace in the
-        // symbol, and trait authors can match the alias directly.
+        // Aliased imports arrive as `module as local`. Split so the symbol
+        // name is the bare module and the alias is a structured field — no
+        // whitespace in the symbol, and rules can match the alias directly.
         let (bare, alias) = match name.split_once(" as ") {
             Some((module, local)) => (module.trim().to_string(), Some(local.trim().to_string())),
             None => (name.clone(), None),
@@ -348,7 +369,7 @@ pub(super) fn extract(
         symbols_out.push(crate::Symbol::Import {
             name: bare,
             alias,
-            library: import_libraries.get(offset).cloned(),
+            library: imports.libraries.get(offset).cloned(),
             offset: Some(*offset),
             ordinal: None,
         });
@@ -385,27 +406,44 @@ pub(super) fn extract(
         value_key!("source.language"),
         JsonValue::String(config.name().to_string()),
     );
-    if matches!(config.lang, Lang::JavaScript | Lang::TypeScript) {
-        emit_static_runtime_imports(root, source, values);
+    if let Some(imports) = walked.runtime_imports.take() {
+        imports.emit(values);
     }
-    if config.lang == Lang::Python {
-        python_module_calls::emit(root, source, values);
+    if let Some(python) = walked.python.take() {
+        python.emit(values);
     }
-    if config.lang == Lang::Batch {
-        batch_commands::emit(root, source, values);
+    if let Some(commands) = walked.batch_commands.take() {
+        commands.emit(values);
     }
-    if config.lang == Lang::Bash {
-        shell_fifo::emit(root, source, values);
+    if let Some(shell) = walked.shell.take() {
+        shell.emit(values);
     }
+    // Execution facts are read from syntax at any size; only the payload
+    // analysis has a source-size gate.
+    let mut test_only = HashSet::new();
+    if let Some(rust) = &mut rust {
+        rust.emit(values);
+        test_only = std::mem::take(&mut rust.test_only);
+    }
+    if lang == Lang::Go {
+        go_syntax::execution_facts(root, source, values);
+    }
+    let payload_imports = match (&rust, &go_imports) {
+        (Some(_), _) => payload_flow::Imports::Rust(&imports.items),
+        (_, Some(go)) => payload_flow::Imports::Go(go),
+        _ => payload_flow::Imports::None,
+    };
     payload_flow::emit(
         root,
         source,
-        config.lang,
+        config,
         values,
-        walked.payload.map(payload_flow::Collector::into_collected),
+        walked
+            .payload
+            .take()
+            .map(|payload| payload.into_collected(test_only)),
+        &payload_imports,
     );
-
-    Ok(())
 }
 
 /// Walk the tree-sitter parse and push every `Symbol::Call`,
@@ -438,11 +476,15 @@ pub(crate) fn build_value_flow(cache: &TreeCache<'_>, symbols: &crate::Symbols) 
     )
 }
 
-/// The package clause of a parsed Go file, `""` when it has none, read from
-/// the syntax tree alone. `None` for any other language.
-pub(crate) fn go_package_name<'a>(ast: &crate::SourceAst<'a>) -> Option<&'a str> {
-    (ast.file_type == FileType::Go)
-        .then(|| go_syntax::package_name(ast.tree.root_node(), ast.source))
+/// The package clause of Go `source`, `""` when it has none, read from the
+/// syntax tree alone; `None` when the source does not parse.
+pub(crate) fn go_package_clause(
+    source: &str,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<String> {
+    let parsed = TreeCache::parse(source.as_bytes(), FileType::Go, cancel);
+    let cache = parsed.cache()?;
+    Some(go_syntax::package_name(cache.tree().root_node(), cache.source()).to_string())
 }
 
 pub(super) fn looks_like_protocolless_url(value: &str) -> bool {
@@ -555,8 +597,10 @@ fn is_string_prefix(c: char) -> bool {
 #[derive(Default)]
 struct QueryCollection {
     items: Vec<(String, u64)>,
-    /// The work budget ran out, or the wall-clock backstop fired. Reported
-    /// under the historical `timeout` name ([`crate::QueryLimit::Timeout`]).
+    /// Python from-import member offset → owning module.
+    libraries: HashMap<u64, String>,
+    /// The work budget ran out, or the wall-clock backstop fired; reported as
+    /// [`crate::QueryLimit::Timeout`].
     timed_out: bool,
     match_limited: bool,
     output_limited: bool,
@@ -597,139 +641,102 @@ fn emit_query_limit_metrics(metrics: &mut Metrics, label: &str, result: &QueryCo
     }
 }
 
-fn collect_query(query: &Query, source: &str, root: Node<'_>) -> QueryCollection {
-    let capture_names = query.capture_names();
-    let mut cursor = source_query_cursor();
-    cursor.set_byte_range(0..source.len().min(SOURCE_QUERY_BYTE_LIMIT));
-    // De-duplicate by name, keeping the first (smallest) offset for
-    // each. A repeated `import os` shows up once; the offset points
-    // at its first occurrence, which is the most useful answer for
-    // proximity-style matchers.
-    let mut seen: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    let budget = QueryBudget::new();
-    let output_limited = Cell::new(false);
-    let mut progress_cb = |_: &tree_sitter::QueryCursorState| budget.poll();
-    let options = tree_sitter::QueryCursorOptions::default().progress_callback(&mut progress_cb);
-    {
-        let mut matches = cursor.matches_with_options(query, root, source.as_bytes(), options);
-        while let Some(m) = matches.next() {
-            for cap in m.captures() {
-                let name = capture_names.get(cap.index as usize).copied().unwrap_or("");
-                if name.starts_with('_') {
-                    continue;
-                }
-                if let Ok(text) = cap.node.utf8_text(source.as_bytes()) {
-                    let cleaned = strip_quotes(text);
-                    if cleaned.is_empty() {
-                        continue;
-                    }
-                    let offset = cap.node.start_byte() as u64;
-                    seen.entry(cleaned).or_insert(offset);
-                    if seen.len() >= SOURCE_QUERY_OUTPUT_LIMIT {
-                        output_limited.set(true);
-                        break;
-                    }
-                }
-            }
-            if output_limited.get() {
-                break;
-            }
-        }
-    }
-    QueryCollection {
-        items: seen.into_iter().collect(),
-        timed_out: budget.exhausted.get(),
-        match_limited: cursor.did_exceed_match_limit(),
-        output_limited: output_limited.get(),
-    }
-}
-
-/// Collect import symbols, qualifying Python relative-import members with
-/// their relative module prefix.
+/// Run a surface query, keeping each captured name once with its first
+/// offset: a repeated `import os` shows up once, at its first occurrence,
+/// the most useful answer for proximity-style matchers.
 ///
-/// Tree-sitter records `from .pkg import name` as two separate captures: the
-/// relative module (`.pkg`) and the imported member (`name`). The bare member
-/// is indistinguishable from a top-level `import name`, so `from . import
-/// requests` would otherwise masquerade as an import of the PyPI `requests`
-/// library. Rejoining the member to its relative module (`.requests`,
-/// `.pkg.requests`) keeps the symbol relative-prefixed: it counts as a
-/// relative import and no library matcher anchored on `^name` matches a local
-/// submodule. Non-relative imports and other languages pass through unchanged.
-fn collect_imports(
-    query: &Query,
-    source: &str,
-    root: Node<'_>,
-) -> (QueryCollection, std::collections::HashMap<u64, String>) {
+/// An import query's names are qualified as imports, and its
+/// [`QueryCollection::libraries`] map each Python from-import member's offset
+/// to its owning module. Tree-sitter
+/// records `from .pkg import name` as two captures, the relative module and
+/// the member; the bare member is indistinguishable from a top-level
+/// `import name`, so `from . import requests` would otherwise masquerade as
+/// an import of the PyPI `requests` library. Rejoining the member to its
+/// relative module (`.requests`, `.pkg.requests`) keeps it relative, so no
+/// library matcher anchored on `^name` matches a local submodule. Equal
+/// member names from distinct modules stay separate.
+fn collect_query(query: &Query, kind: QueryKind, source: &str, root: Node<'_>) -> QueryCollection {
+    let imports = kind == QueryKind::Imports;
     let capture_names = query.capture_names();
     let mut cursor = source_query_cursor();
     cursor.set_byte_range(0..source.len().min(SOURCE_QUERY_BYTE_LIMIT));
-    // Keep equal member names from distinct modules separate.
-    let mut seen = std::collections::BTreeMap::new();
-    let mut libraries = std::collections::HashMap::new();
+    let mut seen: BTreeMap<(String, Option<String>), u64> = BTreeMap::new();
+    let mut libraries = HashMap::new();
     let budget = QueryBudget::new();
-    let output_limited = Cell::new(false);
+    let mut output_limited = false;
     let mut progress_cb = |_: &tree_sitter::QueryCursorState| budget.poll();
     let options = tree_sitter::QueryCursorOptions::default().progress_callback(&mut progress_cb);
     {
         let mut matches = cursor.matches_with_options(query, root, source.as_bytes(), options);
-        while let Some(m) = matches.next() {
+        'matches: while let Some(m) = matches.next() {
             for cap in m.captures() {
                 let name = capture_names.get(cap.index as usize).copied().unwrap_or("");
                 if name.starts_with('_') {
                     continue;
                 }
-                if let Ok(text) = cap.node.utf8_text(source.as_bytes()) {
-                    let cleaned = strip_quotes(text);
-                    if cleaned.is_empty() {
-                        continue;
-                    }
-                    // Read alias fields structurally: Python permits tabs,
-                    // repeated spaces and line continuations around `as`.
-                    let cleaned = if cap.node.kind() == "aliased_import" {
-                        match (
-                            cap.node.child_by_field_name("name"),
-                            cap.node.child_by_field_name("alias"),
-                        ) {
-                            (Some(module), Some(alias)) => format!(
-                                "{} as {}",
-                                module.utf8_text(source.as_bytes()).unwrap_or("").trim(),
-                                alias.utf8_text(source.as_bytes()).unwrap_or("").trim()
-                            ),
-                            _ => cleaned,
-                        }
-                    } else {
-                        cleaned
-                    };
-                    let qualified = qualify_relative_member(cap.node, cleaned, source);
-                    let offset = cap.node.start_byte() as u64;
+                let cleaned = strip_quotes(text(cap.node, source));
+                if cleaned.is_empty() {
+                    continue;
+                }
+                let offset = cap.node.start_byte() as u64;
+                let key = if imports {
                     let library = python_import_library(cap.node, source);
                     if let Some(library) = &library {
                         libraries.insert(offset, library.clone());
                     }
-                    seen.entry((qualified, library)).or_insert(offset);
-                    if seen.len() >= SOURCE_QUERY_OUTPUT_LIMIT {
-                        output_limited.set(true);
-                        break;
-                    }
+                    (import_name(cap.node, cleaned, source), library)
+                } else {
+                    (cleaned, None)
+                };
+                seen.entry(key).or_insert(offset);
+                if seen.len() >= SOURCE_QUERY_OUTPUT_LIMIT {
+                    output_limited = true;
+                    break 'matches;
                 }
-            }
-            if output_limited.get() {
-                break;
             }
         }
     }
-    (
-        QueryCollection {
-            items: seen
-                .into_iter()
-                .map(|((name, _), offset)| (name, offset))
-                .collect(),
-            timed_out: budget.exhausted.get(),
-            match_limited: cursor.did_exceed_match_limit(),
-            output_limited: output_limited.get(),
-        },
+    let collection = QueryCollection {
+        items: seen
+            .into_iter()
+            .map(|((name, _), offset)| (name, offset))
+            .collect(),
         libraries,
-    )
+        timed_out: budget.exhausted.get(),
+        match_limited: cursor.did_exceed_match_limit(),
+        output_limited,
+    };
+    if collection.limited() {
+        tracing::debug!(
+            target: "filefacts::source",
+            query = kind.label(),
+            timed_out = collection.timed_out,
+            match_limited = collection.match_limited,
+            output_limited = collection.output_limited,
+            "surface query stopped early; its symbols are incomplete"
+        );
+    }
+    collection
+}
+
+/// An import capture's name: `module as alias` for a Python aliased import,
+/// read structurally since Python permits tabs, repeated spaces and line
+/// continuations around `as`, and a relative from-import member qualified
+/// with its module.
+fn import_name(node: Node<'_>, cleaned: String, source: &str) -> String {
+    let cleaned = match (
+        node.child_by_field_name("name")
+            .filter(|_| node.kind() == "aliased_import"),
+        node.child_by_field_name("alias"),
+    ) {
+        (Some(module), Some(alias)) => format!(
+            "{} as {}",
+            text(module, source).trim(),
+            text(alias, source).trim()
+        ),
+        _ => cleaned,
+    };
+    qualify_relative_member(node, cleaned, source)
 }
 
 /// The owner of a Python from-import member, never the module capture itself.
@@ -742,7 +749,7 @@ fn python_import_library(node: Node<'_>, source: &str) -> Option<String> {
     if module.id() == node.id() {
         return None;
     }
-    Some(module.utf8_text(source.as_bytes()).ok()?.trim().to_string())
+    Some(text(module, source).trim().to_string())
 }
 
 /// When `node` is the imported-member field of a Python relative
@@ -768,82 +775,13 @@ fn qualify_relative_member(node: Node<'_>, cleaned: String, source: &str) -> Str
     if module.kind() != "relative_import" {
         return cleaned;
     }
-    let Ok(prefix) = module.utf8_text(source.as_bytes()) else {
-        return cleaned;
-    };
-    let prefix = prefix.trim();
+    let prefix = text(module, source).trim();
     // `.`/`..` end in a dot already; `.pkg` needs a joining dot.
     if prefix.ends_with('.') {
         format!("{prefix}{cleaned}")
     } else {
         format!("{prefix}.{cleaned}")
     }
-}
-
-/// Static ES module edges that can execute at runtime. Type-only imports and
-/// exports are excluded; names and offsets are kept for dependency discovery.
-fn emit_static_runtime_imports(root: Node<'_>, source: &str, values: &mut Values) {
-    let mut rows = Vec::new();
-    for statement in named_children(root) {
-        if !matches!(statement.kind(), "import_statement" | "export_statement") {
-            continue;
-        }
-        let Some(module) = statement.child_by_field_name("source") else {
-            continue;
-        };
-        if module.kind() != "string" || statement_has_type_only_clause(statement) {
-            continue;
-        }
-        let Ok(raw) = module.utf8_text(source.as_bytes()) else {
-            continue;
-        };
-        let specifier = strip_quotes(raw);
-        if !specifier.is_empty() {
-            rows.push(serde_json::json!({"specifier": specifier, "offset": module.start_byte()}));
-        }
-        if rows.len() >= SOURCE_QUERY_OUTPUT_LIMIT {
-            break;
-        }
-    }
-    if !rows.is_empty() {
-        values.insert_key(
-            value_key!("source.js.runtime_imports"),
-            JsonValue::Array(rows),
-        );
-    }
-}
-
-/// TypeScript allows both `import type {X}` and per-specifier `type X`.
-/// A side-effect import, default binding, namespace binding, or any value
-/// specifier makes the edge runtime. Empty clauses retain the module edge.
-fn statement_has_type_only_clause(statement: Node<'_>) -> bool {
-    let mut cursor = statement.walk();
-    if statement.children(&mut cursor).any(|n| n.kind() == "type") {
-        return true;
-    }
-    let Some(clause) =
-        named_children(statement).find(|n| matches!(n.kind(), "import_clause" | "export_clause"))
-    else {
-        return false;
-    };
-    let list = if clause.kind() == "import_clause" {
-        let children: Vec<_> = named_children(clause).collect();
-        if children.iter().any(|n| n.kind() != "named_imports") {
-            return false;
-        }
-        children.into_iter().find(|n| n.kind() == "named_imports")
-    } else {
-        Some(clause)
-    };
-    let Some(list) = list else { return false };
-    let specs: Vec<_> = named_children(list)
-        .filter(|n| matches!(n.kind(), "import_specifier" | "export_specifier"))
-        .collect();
-    !specs.is_empty()
-        && specs.into_iter().all(|spec| {
-            let mut cursor = spec.walk();
-            spec.children(&mut cursor).any(|n| n.kind() == "type")
-        })
 }
 
 fn strip_quotes(s: &str) -> String {
@@ -897,17 +835,16 @@ fn emit_text_ratios(
     functions_total: usize,
     imports_total: usize,
 ) {
-    let m = metrics.clone();
-    let get = |key: MetricKey| m.get_key(&key).unwrap_or(0.0);
+    let get = |metrics: &Metrics, key: MetricKey| metrics.get_key(&key).unwrap_or(0.0);
 
     // Counted by the caller: `functions.count` / `imports.count` are only
     // emitted later, from the unified symbols view.
     let functions_total = functions_total as f64;
-    let strings_total = get(metric!("strings.count"));
-    let identifiers_total = get(metric!("identifiers.count"));
-    let identifiers_unique = get(metric!("identifiers.unique"));
+    let strings_total = get(metrics, metric!("strings.count"));
+    let identifiers_total = get(metrics, metric!("identifiers.count"));
+    let identifiers_unique = get(metrics, metric!("identifiers.unique"));
     let imports_total = imports_total as f64;
-    let functions_anonymous = get(metric!("functions.anonymous"));
+    let functions_anonymous = get(metrics, metric!("functions.anonymous"));
 
     if functions_total > 0.0 {
         metrics.insert(
@@ -981,11 +918,11 @@ fn emit_text_ratios(
 
     // Obfuscation indicator ratios.
     if identifiers_unique > 0.0 {
-        let suspicious = get(metric!("identifiers.hex_like_names"))
-            + get(metric!("identifiers.base64_like_names"))
-            + get(metric!("identifiers.sequential_names"))
-            + get(metric!("identifiers.keyboard_pattern_names"))
-            + get(metric!("identifiers.repeated_char_names"));
+        let suspicious = get(metrics, metric!("identifiers.hex_like_names"))
+            + get(metrics, metric!("identifiers.base64_like_names"))
+            + get(metrics, metric!("identifiers.sequential_names"))
+            + get(metrics, metric!("identifiers.keyboard_pattern_names"))
+            + get(metrics, metric!("identifiers.repeated_char_names"));
         if suspicious > 0.0 {
             metrics.insert(
                 metric!("text.suspicious_identifier_ratio"),
@@ -995,18 +932,18 @@ fn emit_text_ratios(
     }
 
     if strings_total > 0.0 {
-        let encoded = get(metric!("strings.base64_candidates"))
-            + get(metric!("strings.hex"))
-            + get(metric!("strings.url_encoded"));
+        let encoded = get(metrics, metric!("strings.base64_candidates"))
+            + get(metrics, metric!("strings.hex"))
+            + get(metrics, metric!("strings.url_encoded"));
         if encoded > 0.0 {
             metrics.insert(
                 metric!("text.encoded_string_ratio"),
                 encoded / strings_total,
             );
         }
-        let suspicious = get(metric!("strings.embedded_code_candidates"))
-            + get(metric!("strings.shell"))
-            + get(metric!("strings.sql"));
+        let suspicious = get(metrics, metric!("strings.embedded_code_candidates"))
+            + get(metrics, metric!("strings.shell"))
+            + get(metrics, metric!("strings.sql"));
         if suspicious > 0.0 {
             metrics.insert(
                 metric!("text.suspicious_string_ratio"),
@@ -1015,9 +952,10 @@ fn emit_text_ratios(
         }
     }
 
-    let comments_total = get(metric!("comments.count"));
+    let comments_total = get(metrics, metric!("comments.count"));
     if comments_total > 0.0 {
-        let suspicious = get(metric!("comments.high_entropy")) + get(metric!("comments.base64"));
+        let suspicious = get(metrics, metric!("comments.high_entropy"))
+            + get(metrics, metric!("comments.base64"));
         if suspicious > 0.0 {
             metrics.insert(
                 metric!("text.suspicious_comment_ratio"),
@@ -1027,7 +965,7 @@ fn emit_text_ratios(
     }
 
     if imports_total > 0.0 {
-        let dynamic = get(metric!("imports.dynamic"));
+        let dynamic = get(metrics, metric!("imports.dynamic"));
         if dynamic > 0.0 {
             metrics.insert(
                 metric!("text.dynamic_import_ratio"),

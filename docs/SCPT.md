@@ -1,7 +1,7 @@
 # Compiled AppleScript
 
 Filefacts reads `FasdUAS` scripts without running AppleScript or sending
-AppleEvents. Plaintext `.applescript` files keep their existing extraction.
+AppleEvents. Plaintext `.applescript` files are extracted as source text.
 
 ## Facts
 
@@ -35,24 +35,14 @@ string decoders. Results are additional literals, labeled `scpt-base64`,
 literals and call arguments are unchanged; decoding alone does not prove that
 the script uses the decoded value.
 
-## Traits
+## Matching
 
-Match a shell call and its argument together:
-
-```yaml
-if:
-  type: symbol
-  kind: call
-  exact: syso.exec
-  arg:
-    index: 0
-    kind: string
-    substr: "security find-generic-password"
-```
-
-Use `type: literal` for stored or recovered text. Combine sensitive targets,
-collection, and transport in objective traits. A shell call or a cookie path
-alone does not establish theft.
+Match a call together with its argument rather than either alone: a
+`symbols` row of kind `call` named `syso.exec` whose argument 0 is the string
+`security find-generic-password` is evidence of a keychain read, while the
+literal on its own is only text. Use `literals` for stored or recovered text.
+A shell call or a cookie path alone does not establish theft; combine the
+target, the collection and the transport.
 
 ## Bounds
 

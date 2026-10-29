@@ -1,7 +1,8 @@
 use super::*;
+use crate::formats::cfml::specimens;
 /// A call receiver ends at the `.` byte in the source. Lossy decoding
-/// widens each invalid byte to three, so the `.` offset in the decoded
-/// prefix used to address past the end of the input and panic.
+/// widens each invalid byte to three, so an offset taken from the decoded
+/// prefix would address past the end of the input.
 #[test]
 fn invalid_utf8_call_receiver_stays_within_the_source() {
     let invalid = [0xff; 100];
@@ -12,7 +13,9 @@ fn invalid_utf8_call_receiver_stays_within_the_source() {
         let source = [open, &invalid, close].concat();
         let p = parse(&source);
         assert!(
-            p.flow.limitations.contains("unsupported-call-target"),
+            p.flow
+                .limitations
+                .contains(&crate::Limitation::UnsupportedCallTarget),
             "{:?}",
             p.flow.limitations
         );
@@ -126,10 +129,8 @@ fn unquoted_attribute_offsets_and_all_prefixes_remain_valid() {
     assert_eq!(literal.offset, 15);
 }
 #[test]
-fn retained_shell_directory_creation_has_request_path_origins() {
-    let p = parse(include_bytes!(
-        "../../../../testdata/cfml/encrypted_shell_decoded.cfm"
-    ));
+fn decoded_shell_directory_creation_has_request_path_origins() {
+    let p = parse(specimens::encrypted_shell_decoded());
     let call = p.flow.values.iter().find(|v| v.target.as_deref() == Some("cfdirectory") && p.flow.complete_values(v.inputs[0], Some("action"), 1000).values.iter().any(|id| matches!(&p.flow.values[id.value].literal, Some(Arg::String {value}) if value == "create"))).unwrap();
     let origins = p.flow.field_origins(call.inputs[0], "directory", &[], 1000);
     for expected in ["form.dir", "form.cr_dir"] {
@@ -268,10 +269,8 @@ fn comparison_excludes_quoted_compound_and_malformed_conditions() {
     );
 }
 #[test]
-fn retained_devshell_has_password_binding_and_session_inequality() {
-    let p = parse(include_bytes!(
-        "../../../../testdata/cfml/encrypted_shell_decoded.cfm"
-    ));
+fn decoded_shell_has_password_binding_and_session_inequality() {
+    let p = parse(specimens::encrypted_shell_decoded());
     assert!(p.symbols.iter().any(
         |s| matches!(s, Symbol::Bind {target, shape: ArgShape::String, ..} if target == "mypwd")
     ));
@@ -315,8 +314,8 @@ fn elseif_calls_use_entry_bindings_not_sibling_assignments() {
     );
 }
 #[test]
-fn retained_devshell_has_condition_call_with_session_literal() {
-    let bytes = include_bytes!("../../../../testdata/cfml/encrypted_shell_decoded.cfm");
+fn decoded_shell_has_condition_call_with_session_literal() {
+    let bytes = specimens::encrypted_shell_decoded();
     let p = parse(bytes);
     assert!(p.flow.values.iter().any(|v| v.target.as_deref() == Some("isdefined")
             && v.inputs.first().is_some_and(|id| matches!(&p.flow.values[*id].literal, Some(Arg::String { value }) if value == "session.in"))));
@@ -325,15 +324,15 @@ fn retained_devshell_has_condition_call_with_session_literal() {
     assert!(
         p.flow
             .limitations
-            .contains("condition-call-syntax-or-budget")
+            .contains(&crate::Limitation::ConditionCallSyntaxOrBudget)
     );
     assert!(!p.symbols.iter().any(
         |s| matches!(s, Symbol::Call { target, .. } if target.as_deref() == Some("isdefined"))
     ));
 }
 #[test]
-fn retained_script_calls_and_password_origin_have_original_offsets() {
-    let bytes = include_bytes!("../../../../testdata/cfml/datasource_shell.cfm");
+fn datasource_shell_script_calls_and_password_origin_have_exact_offsets() {
+    let bytes = specimens::datasource_shell();
     let p = parse(bytes);
     for target in [
         "createobject",
@@ -444,7 +443,11 @@ fn indexed_members_are_canonical_bounded_and_respect_known_overwrites() {
         );
     }
     let p = parse(format!("<cfset x=data{}i{}>", "[".repeat(40), "]".repeat(40)).as_bytes());
-    assert!(p.flow.limitations.contains("expression-depth"));
+    assert!(
+        p.flow
+            .limitations
+            .contains(&crate::Limitation::ExpressionDepth)
+    );
 }
 #[test]
 fn skipped_tag_functions_do_not_shift_later_script_ranges() {
@@ -467,7 +470,11 @@ fn calls_after_script_are_visible_without_preserving_stale_bindings() {
             alias='fixed';
         </cfscript><cfexecute name="#alias#"><cffile action="read" file="#form.path#">"##;
     let p = parse(source);
-    assert!(p.flow.limitations.contains("script-block-local-flow-only"));
+    assert!(
+        p.flow
+            .limitations
+            .contains(&crate::Limitation::ScriptBlockLocalFlowOnly)
+    );
     assert_eq!(
         p.symbols
             .iter()
@@ -552,7 +559,7 @@ fn complete_values_keep_alternatives_but_not_unknown_compositions() {
     assert!(targets(br##"<cfexecute name="prefix#form.job#suffix">"##).contains("form.job"));
 }
 #[test]
-fn complete_values_bound_traversal_and_keep_legacy_merges_opaque() {
+fn complete_values_bound_traversal_and_keep_merges_opaque() {
     let mut p = parse(
         br##"<cfif x><cfset a='read'><cfelse><cfset a='write'></cfif><cffile action="#a#">"##,
     );
@@ -591,14 +598,18 @@ fn computed_and_copied_literals_have_cumulative_budgets() {
         parse(source.as_bytes())
             .flow
             .limitations
-            .contains("expression-parts")
+            .contains(&crate::Limitation::ExpressionParts)
     );
     let source = format!(
         "<cfset a='x'>{}<cffile action='#a#'>",
         "<cfset a=a&a>".repeat(25)
     );
     let p = parse(source.as_bytes());
-    assert!(p.flow.limitations.contains("constant-string-budget"));
+    assert!(
+        p.flow
+            .limitations
+            .contains(&crate::Limitation::ConstantStringBudget)
+    );
     let computed: usize = p
         .flow
         .values
@@ -616,7 +627,11 @@ fn computed_and_copied_literals_have_cumulative_budgets() {
         "<cfset b=opaque(a)>".repeat(80)
     );
     let p = parse(source.as_bytes());
-    assert!(p.flow.limitations.contains("symbol-literal-budget"));
+    assert!(
+        p.flow
+            .limitations
+            .contains(&crate::Limitation::SymbolLiteralBudget)
+    );
     let copied: usize = p
         .symbols
         .iter()
@@ -731,8 +746,8 @@ fn expression_symbols_agree_with_flow_and_ignore_quoted_code() {
 }
 
 #[test]
-fn retained_devshell_exposes_encrypt_argument_provenance() {
-    let bytes = include_bytes!("../../../../testdata/cfml/encrypted_shell_decoded.cfm");
+fn decoded_shell_exposes_encrypt_argument_provenance() {
+    let bytes = specimens::encrypted_shell_decoded();
     let parsed = crate::OpenOptions::new()
         .path(std::path::Path::new("decoded.cfm"))
         .file_type(crate::FileType::Cfml)
@@ -845,14 +860,18 @@ fn expressions_reject_malformed_and_bound_width_depth() {
         format!("f({})", vec!["form.path"; 70].join(",")),
     ] {
         let p = parse(format!("<cfset a={expression}>").as_bytes());
-        assert!(p.flow.limitations.contains("expression-parts"));
+        assert!(
+            p.flow
+                .limitations
+                .contains(&crate::Limitation::ExpressionParts)
+        );
     }
     let source = format!("<cfset a={}form.path{}>", "f(".repeat(40), ")".repeat(40));
     assert!(
         parse(source.as_bytes())
             .flow
             .limitations
-            .contains("expression-depth")
+            .contains(&crate::Limitation::ExpressionDepth)
     );
     let source = br#"<cfset a=getPageContext().getRequest().getParameter('file') & replace(form.x,'a','b')><cffile action='read' file='#a#'>"#;
     for end in 0..=source.len() {
@@ -865,10 +884,8 @@ fn expressions_reject_malformed_and_bound_width_depth() {
 }
 
 #[test]
-fn retained_devshell_has_request_chain_and_replace_write() {
-    let p = parse(include_bytes!(
-        "../../../../testdata/cfml/encrypted_shell_decoded.cfm"
-    ));
+fn decoded_shell_has_request_chain_and_replace_write() {
+    let p = parse(specimens::encrypted_shell_decoded());
     let mut request_reads = 0;
     let mut replace_writes = 0;
     for sink in p
@@ -969,13 +986,13 @@ fn malformed_tags_and_unknown_statements_do_not_keep_aliases() {
         parse(b"<cfif x>")
             .flow
             .limitations
-            .contains("unclosed-branch")
+            .contains(&crate::Limitation::UnclosedBranch)
     );
     assert!(
         parse(b"<cfelse>")
             .flow
             .limitations
-            .contains("unbalanced-branch")
+            .contains(&crate::Limitation::UnbalancedBranch)
     );
 }
 #[test]
@@ -998,10 +1015,10 @@ fn function_bodies_do_not_mutate_outer_bindings() {
 }
 
 #[test]
-fn public_views_share_parse_and_original_calls() {
+fn public_views_share_parse_and_specimen_calls() {
     for bytes in [
-        include_bytes!("../../../../testdata/cfml/datasource_shell.cfm").as_slice(),
-        include_bytes!("../../../../testdata/cfml/encrypted_shell_decoded.cfm").as_slice(),
+        specimens::datasource_shell(),
+        specimens::encrypted_shell_decoded(),
     ] {
         let parsed = crate::OpenOptions::new()
             .path(std::path::Path::new("a.cfm"))
@@ -1058,13 +1075,13 @@ fn flow_limits_and_all_prefixes() {
         parse(source.as_bytes())
             .flow
             .limitations
-            .contains("binding-budget")
+            .contains(&crate::Limitation::BindingBudget)
     );
     assert!(
         parse(&b"<cfif x>".repeat(MAX_BRANCHES + 1))
             .flow
             .limitations
-            .contains("branch-depth")
+            .contains(&crate::Limitation::BranchDepth)
     );
     let source = b"<cfset a=form.job><cfif session.pwd neq a><cfset a='fixed'><cfelseif a!=session.pwd><cfset b=a><cfelse><cfset a='it''s ##literal##'></cfif><cfexecute name='#a#'>";
     for end in 0..=source.len() {
@@ -1079,14 +1096,14 @@ fn flow_limits_and_all_prefixes() {
 #[test]
 fn node_expression_and_branch_union_budgets() {
     let p = parse(&b"<cfexecute name='#form.job#'>".repeat(8000));
-    assert!(p.flow.limitations.contains("node-budget"));
+    assert!(p.flow.limitations.contains(&crate::Limitation::NodeBudget));
     assert_eq!(p.flow.values.len(), MAX_VALUES);
     let source = format!("<cfset a={}form.job{}>", "#".repeat(40), "#".repeat(40));
     assert!(
         parse(source.as_bytes())
             .flow
             .limitations
-            .contains("expression-depth")
+            .contains(&crate::Limitation::ExpressionDepth)
     );
     let mut source = String::from("<cfif x>");
     for i in 0..MAX_BINDINGS {
@@ -1101,7 +1118,7 @@ fn node_expression_and_branch_union_budgets() {
         parse(source.as_bytes())
             .flow
             .limitations
-            .contains("binding-budget")
+            .contains(&crate::Limitation::BindingBudget)
     );
 }
 #[test]
@@ -1148,7 +1165,7 @@ fn implicit_lookup_setting_is_explicit_and_conservative() {
     assert!(
         p.flow
             .limitations
-            .contains("implicit-scope-runtime-dependent")
+            .contains(&crate::Limitation::ImplicitScopeRuntimeDependent)
     );
     let call = p
         .flow
@@ -1165,8 +1182,8 @@ fn implicit_lookup_setting_is_explicit_and_conservative() {
     );
 }
 #[test]
-fn retained_implicit_shell_has_guarded_argument_origin() {
-    let bytes = include_bytes!("../../../../testdata/cfml/implicit_command_shell.cmf");
+fn implicit_shell_has_guarded_argument_origin() {
+    let bytes = specimens::implicit_command_shell();
     let p = parse(bytes);
     let call = p
         .flow
@@ -1234,8 +1251,8 @@ fn file_result_flow_respects_source_order_and_branch_alternatives() {
     assert!(!values.contains("form.cmd") && values.contains("cffile:read-result"));
 }
 #[test]
-fn original_devshell_has_three_read_result_bindings() {
-    let source = include_bytes!("../../../../testdata/cfml/encrypted_shell_decoded.cfm");
+fn decoded_shell_has_three_read_result_bindings() {
+    let source = specimens::encrypted_shell_decoded();
     let p = parse(source);
     let binds: Vec<_> = p
         .symbols
@@ -1363,4 +1380,387 @@ fn self_closed_set_does_not_reinterpret_quoted_calls_or_division() {
             "{source}"
         );
     }
+}
+
+fn read_outputs(source: &[u8]) -> Vec<usize> {
+    let p = parse(source);
+    p.flow
+        .values
+        .iter()
+        .filter(|v| v.target.as_deref() == Some("cfoutput:expression"))
+        .filter(|v| {
+            p.flow
+                .origins(v.inputs[0], &[], 1000)
+                .values
+                .iter()
+                .any(|origin| {
+                    p.flow.values[origin.value].target.as_deref() == Some("cffile:read-result")
+                })
+        })
+        .map(|v| v.offset as usize)
+        .collect()
+}
+#[test]
+fn decoded_shell_read_responses_have_exact_offsets() {
+    let source = specimens::encrypted_shell_decoded();
+    let offsets = read_outputs(source);
+    assert_eq!(offsets.len(), 2);
+    for offset in offsets {
+        assert_eq!(&source[offset..offset + 11], b"FileContent");
+    }
+    let p = parse(source);
+    for name in ["cfheader", "cfcontent"] {
+        let call = p
+            .flow
+            .values
+            .iter()
+            .find(|v| v.target.as_deref() == Some(name))
+            .unwrap();
+        assert!(source[call.offset as usize..].starts_with(format!("<{name}").as_bytes()));
+        assert_eq!(p.flow.values[call.inputs[0]].kind, FlowKind::Keyword);
+    }
+}
+#[test]
+fn output_uses_current_value_through_aliases_and_response_tags() {
+    let source=br##"<cffile action="read" file="/fixed" variable="data"><cfset alias=data><cfheader name="Content-Disposition" value="inline"><cfcontent type="text/plain"><cfoutput>#alias#</cfoutput><cfset alias='fixed'><cfoutput>#alias#</cfoutput>"##;
+    let offsets = read_outputs(source);
+    assert_eq!(offsets.len(), 1);
+    assert_eq!(&source[offsets[0]..offsets[0] + 5], b"alias");
+    assert_eq!(read_outputs(b"<cfif flag><cffile action='read' file='/x' variable='data'><cfelse><cfset data='fixed'></cfif><cfoutput>#data#</cfoutput>").len(),1);
+    assert!(
+        read_outputs(
+            b"<cfoutput>#data#</cfoutput><cffile action='read' file='/x' variable='data'>"
+        )
+        .is_empty()
+    );
+}
+#[test]
+fn comments_strings_function_bodies_and_escaped_hashes_are_not_sinks() {
+    for source in [
+        b"<!--- <cfoutput>#data#</cfoutput> --->".as_slice(),
+        b"<cfset doc='<cfoutput>#data#</cfoutput>'>",
+        b"<cfscript>cfoutput(data);</cfscript>",
+        b"<cffunction name='f'><cfoutput>#data#</cfoutput></cffunction>",
+        b"<cfoutput>##data##</cfoutput>",
+        b"#data#",
+    ] {
+        assert!(!parse(source).symbols.iter().any(|s|matches!(s,Symbol::Call{target,..} if target.as_deref()==Some("cfoutput:expression"))),"{:?}",source);
+    }
+}
+#[test]
+fn response_call_attributes_are_parsed_and_comments_ignored() {
+    let p=parse(br##"<!--- <cfcontent file='/fake'> ---><cfheader name="Content-Disposition" value="inline;filename=#url.name#"><cfcontent file="#url.path#" type="application/octet-stream">"##);
+    let calls: Vec<_> = p
+        .flow
+        .values
+        .iter()
+        .filter(|v| matches!(v.target.as_deref(), Some("cfheader" | "cfcontent")))
+        .collect();
+    assert_eq!(calls.len(), 2);
+    let origins = p.flow.field_origins(calls[1].inputs[0], "file", &[], 1000);
+    assert!(
+        origins
+            .values
+            .iter()
+            .any(|v| p.flow.values[v.value].target.as_deref() == Some("url.path"))
+    );
+}
+
+#[test]
+fn query_columns_do_not_inherit_template_file_bindings() {
+    let source=b"<cffile action='read' file='/fixed' variable='data'><cfoutput query='rows'>#data#<cfoutput>#data#</cfoutput></cfoutput><cfoutput>#data#</cfoutput>";
+    let p = parse(source);
+    let outputs: Vec<_> = p
+        .flow
+        .values
+        .iter()
+        .filter(|v| v.target.as_deref() == Some("cfoutput:expression"))
+        .collect();
+    assert_eq!(outputs.len(), 3);
+    assert_eq!(outputs[0].inputs, vec![0]);
+    assert_eq!(outputs[1].inputs, vec![0]);
+    assert_ne!(outputs[2].inputs, vec![0]);
+    assert!(
+        p.flow
+            .limitations
+            .contains(&crate::Limitation::QueryOutputScopeUnavailable)
+    );
+}
+
+#[test]
+fn response_result_identity_and_truncations() {
+    for source in [
+        b"<cfset data=cffile('read')><cfoutput>#data#</cfoutput>".as_slice(),
+        b"<cfset data=cffile('read')><cfcontent variable='#data#'>",
+    ] {
+        let p = parse(source);
+        assert!(
+            !p.flow
+                .values
+                .iter()
+                .any(|v| v.target.as_deref() == Some("cffile:read-result"))
+        );
+    }
+    let source=b"<cffile action='read' file='/x' variable='data'><cfoutput query='q'><cfoutput>#data#</cfoutput></cfoutput><cfheader name='Content-Disposition' value='inline'><cfcontent variable='#data#'>";
+    for end in 0..=source.len() {
+        let p = parse(&source[..end]);
+        for value in &p.flow.values {
+            assert!(value.offset <= end as u64);
+            assert!(value.inputs.iter().all(|&v| v < p.flow.values.len()));
+        }
+    }
+}
+
+fn outputs(source: &[u8]) -> Vec<BTreeSet<String>> {
+    let p = parse(source);
+    p.flow
+        .values
+        .iter()
+        .filter(|v| v.target.as_deref() == Some("writeoutput"))
+        .map(|v| {
+            p.flow
+                .origins(v.inputs[0], &[], 1000)
+                .values
+                .iter()
+                .filter_map(|o| p.flow.values[o.value].target.clone())
+                .collect()
+        })
+        .collect()
+}
+#[test]
+fn datasource_shell_output_has_decrypt_origin() {
+    let source = specimens::datasource_shell();
+    let out = outputs(source);
+    assert_eq!(out.iter().filter(|s| s.contains("decrypt")).count(), 1);
+    let p = parse(source);
+    let binding = p
+        .symbols
+        .iter()
+        .find_map(|s| match s {
+            Symbol::Bind { target, offset, .. } if target == "decryptpassword" => {
+                Some(*offset as usize)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(source[binding..].starts_with(b"decryptPassword="));
+}
+#[test]
+fn assignment_aliases_reassignment_and_scope_boundaries() {
+    assert!(
+        outputs(
+            b"<cfscript>value=decrypt(secret,key); alias=value; writeOutput(alias);</cfscript>"
+        )[0]
+        .contains("decrypt")
+    );
+    assert!(
+        !outputs(
+            b"<cfscript>value=decrypt(secret,key); value='fixed'; writeOutput(value);</cfscript>"
+        )[0]
+        .contains("decrypt")
+    );
+    for source in [
+        b"<cfscript>if(flag){value=decrypt(secret,key);} writeOutput(value);</cfscript>".as_slice(),
+        b"<cfscript>if(flag){value=decrypt(secret,key);}else{writeOutput(value);}</cfscript>",
+        b"<cfscript>function a(){value=decrypt(secret,key);} function b(){writeOutput(value);}</cfscript>",
+        b"<cfscript>value=decrypt(secret,key);</cfscript><cfscript>writeOutput(value);</cfscript>",
+        b"<cfscript>value=decrypt(secret,key); value+=suffix; writeOutput(value);</cfscript>",
+        b"<cfscript>if(flag) value=decrypt(secret,key); writeOutput(value);</cfscript>",
+    ] { assert!(outputs(source).iter().all(|s|!s.contains("decrypt")),"{:?}",source); }
+}
+#[test]
+fn expression_objects_strings_comments_and_unknown_rhs_are_separate() {
+    for source in [
+        b"<cfscript>object={value=decrypt(secret,key)}; writeOutput(value);</cfscript>".as_slice(),
+        b"<cfscript>// value=decrypt(secret,key);\nwriteOutput(value);</cfscript>",
+        b"<cfscript>text=\"value=decrypt(secret,key);\";writeOutput(value);</cfscript>",
+    ] {
+        assert!(
+            outputs(source).iter().all(|s| !s.contains("decrypt")),
+            "{:?}",
+            source
+        );
+    }
+    let p = parse(b"<cfscript>data=[decrypt(secret,key)];</cfscript>");
+    assert!(
+        p.symbols
+            .iter()
+            .any(|s| matches!(s,Symbol::Call {target,..} if target.as_deref()==Some("decrypt")))
+    );
+    let p = parse(br#"<cfscript>text="<cfset pwd='x'>";</cfscript>"#);
+    let binds: Vec<_> = p
+        .symbols
+        .iter()
+        .filter_map(|s| match s {
+            Symbol::Bind { target, .. } => Some(target.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(binds, vec!["text"]);
+}
+
+// Synthetic counterparts of the specimen tests above: each reduces one
+// specimen construct to the smallest template that exercises it, so the
+// behaviour stays covered independently of the specimen bytes.
+
+fn origin_targets(p: &Parsed, value: usize, field: Option<&str>) -> BTreeSet<String> {
+    let origins = match field {
+        Some(field) => p.flow.field_origins(value, field, &[], 1000),
+        None => p.flow.origins(value, &[], 1000),
+    };
+    origins
+        .values
+        .iter()
+        .filter_map(|o| p.flow.values[o.value].target.clone())
+        .collect()
+}
+
+fn first_call<'p>(p: &'p Parsed, target: &str) -> &'p FlowValue {
+    p.flow
+        .values
+        .iter()
+        .find(|v| v.target.as_deref() == Some(target))
+        .unwrap_or_else(|| panic!("no {target} call"))
+}
+
+#[test]
+fn synthetic_directory_creation_has_request_path_origins() {
+    let p = parse(br##"<cfset Destination=Form.dir & "/" & Form.cr_dir><cfdirectory action="create" directory="#Destination#">"##);
+    let call = first_call(&p, "cfdirectory");
+    let origins = origin_targets(&p, call.inputs[0], Some("directory"));
+    assert!(origins.contains("form.dir"), "{origins:?}");
+    assert!(origins.contains("form.cr_dir"), "{origins:?}");
+}
+
+#[test]
+fn synthetic_password_binding_and_session_inequality() {
+    let p = parse(br##"<cfset mypwd="adobe123"><cfif session.pwd neq mypwd><cfset x=1></cfif>"##);
+    assert!(p.symbols.iter().any(
+        |s| matches!(s, Symbol::Bind {target, shape: ArgShape::String, ..} if target == "mypwd")
+    ));
+    assert!(p.symbols.iter().any(|s| matches!(s, Symbol::Call {target, args, ..} if target.as_deref() == Some("cfif") && matches!(&args[0], Arg::Identifier {name} if name == "session.pwd") && matches!(&args[2], Arg::Identifier {name} if name == "mypwd"))));
+}
+
+#[test]
+fn synthetic_condition_call_keeps_session_literal() {
+    let p = parse(br##"<cfif IsDefined("session.in") eq "No"><cfset x=1></cfif>"##);
+    let call = first_call(&p, "isdefined");
+    assert!(
+        matches!(&p.flow.values[call.inputs[0]].literal, Some(Arg::String { value }) if value == "session.in")
+    );
+}
+
+#[test]
+fn synthetic_script_datasource_calls_and_password_origin() {
+    let source = br##"<cfscript>
+dataSourceObb=createobject("java","coldfusion.server.ServiceFactory").getDatasourceService().getDatasources();
+for(i in dataSourceObb) {
+    decryptPassword=Decrypt(dataSourceObb[i]["password"], generate3DesKey("k"), "DESede", "Base64");
+    writeoutput("Password: " & decryptPassword);
+}
+</cfscript>"##;
+    let p = parse(source);
+    for target in [
+        "createobject",
+        "createobject.getdatasourceservice.getdatasources",
+        "decrypt",
+    ] {
+        assert!(
+            p.symbols.iter().any(
+                |s| matches!(s, Symbol::Call { target: t, .. } if t.as_deref() == Some(target))
+            ),
+            "{target}"
+        );
+    }
+    let decrypt = first_call(&p, "decrypt");
+    assert_eq!(
+        &source[decrypt.offset as usize..decrypt.offset as usize + 7],
+        b"Decrypt"
+    );
+    assert_eq!(decrypt.inputs.len(), 4);
+    assert!(origin_targets(&p, decrypt.inputs[0], None).contains("datasourceobb[*].password"));
+    let binding = p
+        .symbols
+        .iter()
+        .find_map(|s| match s {
+            Symbol::Bind { target, offset, .. } if target == "decryptpassword" => {
+                Some(*offset as usize)
+            }
+            _ => None,
+        })
+        .expect("decryptpassword binding");
+    assert!(source[binding..].starts_with(b"decryptPassword="));
+}
+
+#[test]
+fn synthetic_encrypt_argument_has_request_url_origin() {
+    let source = br##"<cfset data=encrypt(getPageContext().getRequest().getRequestURL().toString(), theKey, myAlgorithm, myEncoding)>"##;
+    let p = parse(source);
+    assert!(p.symbols.iter().any(|s| matches!(s,
+        Symbol::Call { target, args, .. } if target.as_deref() == Some("encrypt") && args.len() == 4)));
+    let call = first_call(&p, "encrypt");
+    assert!(
+        origin_targets(&p, call.inputs[0], None)
+            .contains("getpagecontext.getrequest.getrequesturl.tostring")
+    );
+}
+
+#[test]
+fn synthetic_request_parameter_read_and_replace_write() {
+    let p = parse(br##"<cfset pfile=getPageContext().getRequest().getParameter('file')><cffile action="read" file="#pfile#" variable="FileContent"><cfset Destination=Replace(Form.path,'a','b')><cffile action="write" file="#Destination#" output="#Form.text#">"##);
+    let sinks: Vec<_> = p
+        .flow
+        .values
+        .iter()
+        .filter(|v| v.target.as_deref() == Some("cffile"))
+        .map(|v| origin_targets(&p, v.inputs[0], Some("file")))
+        .collect();
+    assert_eq!(sinks.len(), 2);
+    assert!(sinks[0].contains("getpagecontext.getrequest.getparameter"));
+    assert!(sinks[1].contains("replace"));
+}
+
+#[test]
+fn synthetic_three_read_result_bindings() {
+    let source = br##"<cffile action="read" file="#a#" variable="FileContent"><cfif x><cffile action="read" file="#b#" variable="FileContent" ><cfelse><cffile action="read" file="#c#" variable="FileContent"></cfif>"##;
+    let p = parse(source);
+    let binds: Vec<_> = p
+        .symbols
+        .iter()
+        .filter_map(|s| match s {
+            Symbol::Bind {
+                target,
+                shape: ArgShape::Call,
+                offset,
+            } if target == "filecontent" => Some(*offset as usize),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(binds.len(), 3);
+    for at in binds {
+        assert!(source[at..].starts_with(b"<cffile"));
+    }
+}
+
+#[test]
+fn synthetic_read_responses_and_response_tags() {
+    let source = br##"<cffile action="read" file="/x" variable="FileContent"><cfheader name="Content-Disposition" value="attachment"><cfcontent type="application/octet-stream"><cfoutput>#FileContent#</cfoutput><cfoutput>#FileContent#</cfoutput>"##;
+    let offsets = read_outputs(source);
+    assert_eq!(offsets.len(), 2);
+    for offset in offsets {
+        assert_eq!(&source[offset..offset + 11], b"FileContent");
+    }
+    let p = parse(source);
+    for name in ["cfheader", "cfcontent"] {
+        let call = first_call(&p, name);
+        assert!(source[call.offset as usize..].starts_with(format!("<{name}").as_bytes()));
+        assert_eq!(p.flow.values[call.inputs[0]].kind, FlowKind::Keyword);
+    }
+}
+
+#[test]
+fn synthetic_guarded_unscoped_argument_has_form_origin() {
+    let p = parse(br##"<cfif IsDefined("FORM.cmd")><cfexecute name="C:\Winnt\System32\cmd.exe" arguments="/c #cmd#" timeout="1"></cfexecute></cfif>"##);
+    let call = first_call(&p, "cfexecute");
+    assert!(origin_targets(&p, call.inputs[0], Some("arguments")).contains("form.cmd"));
 }

@@ -1,19 +1,22 @@
 # go-pclntab-names.zst
 
 Inert synthetic Go program (linux/amd64, stripped) for Go function-name
-recovery tests. Its functions live in a package with a deliberately long module
+recovery. Its functions live in a package with a deliberately long module
 path, so their pclntab names run 105-267 bytes, and one generic helper is
 instantiated over `cipher.Block` and `cipher.AEAD`, so its names carry
 `{ } ;` type-shape characters. Never execute fixtures.
 
-It covers two regressions:
+SHA-256 (uncompressed): `1a15a5bbb36a652b631ceef1c3fd9fd4087b66a6412a94e0d82c4256547137cf`.
+Built for this project from the source below (Apache-2.0); the binary also
+contains the Go runtime (BSD-3-Clause).
 
-- rizin's Go script must run `aalg` before `aa; aac`. In the old order `aalg`
-  left every function `aa` had already created as `fcn.*` (1,514 of 2,082 here,
-  and none of the five `sealedpayload` functions named); `aalg` first leaves
-  ~40 unnamed and names all five.
-- stng's funcnametab splitter must keep names over 80 bytes and with generic
-  shapes (it dropped them, and their neighbours, before 2026-09-24).
+`go_recovery_names_pclntab_functions` (`src/rizin/tests.rs`, skipped without
+rizin) asserts that rizin recovers more than 1,000 functions, that fewer than
+10% stay unnamed `fcn.*`, and that `OpenSealedPayload`, `ReportLength` and
+`mustValue` come back by name. That holds only when the Go analysis script
+runs `aalg` (pclntab names) before `aa; aac`. The long and generic names
+also exercise stng's funcnametab splitter, which must keep names over 80
+bytes and names with generic shapes.
 
 Built with Go 1.27 from:
 

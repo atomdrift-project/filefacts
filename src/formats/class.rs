@@ -4,8 +4,9 @@
 //! version, decomposed access flags, constant-pool size, class
 //! hierarchy (`this_class`, `super_class`, `interfaces[]`), and
 //! the class-level attributes (`SourceFile`, `Signature`,
-//! `InnerClasses`). Member tables (fields[], methods[]) are
-//! skipped without parsing — class-level kv doesn't need them.
+//! `InnerClasses`). `fields[]` is skipped; `methods[]` is walked for the
+//! declared method names, which become function symbols. Constant-pool
+//! class and method references become imports.
 //!
 //! Schema:
 //!
@@ -87,31 +88,6 @@ impl ConstantPool {
         let name_idx = *self.class.get(&class_idx)?;
         self.utf8.get(&name_idx).map(String::as_str)
     }
-
-    /// File offset of a class entry's name string, for anchoring class imports.
-    fn class_name_offset(&self, class_idx: u16) -> Option<u64> {
-        self.utf8_offset.get(self.class.get(&class_idx)?).copied()
-    }
-
-    /// File offset of a methodref's method-name string, for anchoring
-    /// methodref-resolved imports.
-    fn methodref_name_offset(&self, idx: u16) -> Option<u64> {
-        let (_class_idx, nat_idx) = *self.methodref.get(&idx)?;
-        let (name_idx, _desc_idx) = *self.name_and_type.get(&nat_idx)?;
-        self.utf8_offset.get(&name_idx).copied()
-    }
-
-    /// Resolve a methodref-like CP entry to `(owning_class, name,
-    /// descriptor)` strings. Returns `None` when any link in the
-    /// chain is missing or malformed.
-    fn methodref_resolve(&self, idx: u16) -> Option<(&str, &str, &str)> {
-        let (class_idx, nat_idx) = *self.methodref.get(&idx)?;
-        let class = self.class_name(class_idx)?;
-        let (name_idx, desc_idx) = *self.name_and_type.get(&nat_idx)?;
-        let name = self.utf8.get(&name_idx).map(String::as_str)?;
-        let desc = self.utf8.get(&desc_idx).map(String::as_str)?;
-        Some((class, name, desc))
-    }
 }
 
 pub(super) fn extract(
@@ -123,10 +99,21 @@ pub(super) fn extract(
 ) {
     extract_binary_strings(bytes, strings, XorScan::No);
 
+    let abandon = |stage: &str, offset: usize| {
+        tracing::debug!(
+            target: "filefacts::class",
+            stage,
+            offset,
+            len = bytes.len(),
+            "class file truncated or malformed; no class facts"
+        );
+    };
     let Some(&[m0, m1, m2, m3, n0, n1, j0, j1, c0, c1]) = bytes.first_chunk::<10>() else {
+        abandon("magic", 0);
         return;
     };
     if u32::from_be_bytes([m0, m1, m2, m3]) != 0xCAFE_BABE {
+        abandon("magic", 0);
         return;
     }
     let minor_version = u16::from_be_bytes([n0, n1]);
@@ -135,29 +122,33 @@ pub(super) fn extract(
 
     let mut r = Reader::at(bytes, 10);
     let Some(cp) = parse_constant_pool(&mut r, cp_count) else {
+        abandon("constant_pool", r.pos());
         return;
     };
-    let Some(access_flags) = r.u16_be() else {
+    // access_flags, this_class, super_class, then the interface table.
+    let header = (|| {
+        let fields = [r.u16_be()?, r.u16_be()?, r.u16_be()?, r.u16_be()?];
+        let interfaces = (0..fields[3])
+            .map(|_| r.u16_be())
+            .collect::<Option<Vec<u16>>>()?;
+        Some((fields, interfaces))
+    })();
+    let Some(([access_flags, this_idx, super_idx, interfaces_count], interface_idx)) = header
+    else {
+        abandon("header", r.pos());
         return;
     };
-    let Some(this_idx) = r.u16_be() else {
-        return;
-    };
-    let Some(super_idx) = r.u16_be() else {
-        return;
-    };
-    let Some(interfaces_count) = r.u16_be() else {
-        return;
-    };
-    let mut interface_idx: Vec<u16> = Vec::with_capacity(interfaces_count as usize);
-    for _ in 0..interfaces_count {
-        let Some(idx) = r.u16_be() else {
-            return;
-        };
-        interface_idx.push(idx);
-    }
-    // Skip fields[]; parse methods[] for the typed Functions view.
-    if skip_member_table(&mut r).is_none() {
+    // Skip fields[] (`access_flags u2; name_index u2; descriptor_index u2;
+    // attributes` per entry); parse methods[] for the typed Functions view.
+    let fields = (|| {
+        for _ in 0..r.u16_be()? {
+            r.skip(6)?;
+            skip_attributes(&mut r)?;
+        }
+        Some(())
+    })();
+    if fields.is_none() {
+        abandon("fields", r.pos());
         return;
     }
     // The class attributes follow methods[], so a truncated method table
@@ -165,15 +156,16 @@ pub(super) fn extract(
     let mut name_budget = MAX_SYMBOL_NAME_BYTES;
     let attrs = match parse_methods(&mut r, &cp, symbols_out, &mut name_budget) {
         Some(()) => parse_attributes(&mut r, &cp),
-        None => ClassAttributes::default(),
+        None => {
+            abandon("methods", r.pos());
+            ClassAttributes::default()
+        }
     };
 
     // Surface external class references and methodref-resolved
     // imports. `this_class` is the class's own self-reference and
     // must not show up as an import.
     populate_imports(&cp, this_idx, symbols_out, metrics, &mut name_budget);
-    // (`class.method_count` was a byte-identical alias of `functions.count`,
-    // which carries 60 rule references. Dropped 2026-08-22.)
 
     // Complete CONSTANT_Class name set and CONSTANT_Utf8 string table.
     // Consumers run constant-pool class/string heuristics directly off
@@ -426,9 +418,10 @@ fn parse_methods(
 ) -> Option<()> {
     let count = r.u16_be()?;
     for _ in 0..count {
-        let access_flags = r.u16_be()?;
+        // access_flags u2, then name_index u2, then descriptor_index u2.
+        r.skip(2)?;
         let name_idx = r.u16_be()?;
-        let _descriptor_idx = r.u16_be()?;
+        r.skip(2)?;
         skip_attributes(r)?;
         let Some(name) = cp.utf8.get(&name_idx) else {
             continue;
@@ -436,11 +429,6 @@ fn parse_methods(
         if !charge(name_budget, name.len()) {
             continue;
         }
-        // Static methods are interesting for entry-point detection
-        // (`public static void main(String[])`). We don't yet emit
-        // the access-flag decomposition per function — that lives
-        // in the kv tree only.
-        let _ = access_flags;
         symbols_out.push(crate::Symbol::Function {
             name: name.clone(),
             // The method name is a constant-pool UTF-8 entry, so anchor the
@@ -495,7 +483,12 @@ fn populate_imports(
             name: name.to_string(),
             alias: None,
             library: None,
-            offset: cp.class_name_offset(idx),
+            // Anchored at the class name's string in the constant pool.
+            offset: cp
+                .class
+                .get(&idx)
+                .and_then(|n| cp.utf8_offset.get(n))
+                .copied(),
             ordinal: None,
         });
         class_count = class_count.saturating_add(1);
@@ -508,13 +501,17 @@ fn populate_imports(
     // Methodref / InterfaceMethodref / Fieldref — surface only the
     // ones we can fully resolve to (class, name, descriptor). The
     // owning-class name carries the library identity; the symbol
-    // name is the method name. Descriptor is not stored on Import
-    // today — `<non-literal>` style overloading collisions are
-    // rare enough that consumers can re-walk the kv tree if they
-    // need the signature.
+    // name is the method name, anchored at its constant-pool string. The
+    // descriptor must resolve but is not stored on the import.
     let mut method_ref_count: u32 = 0;
-    for (&idx, _) in &cp.methodref {
-        let Some((owner, name, _desc)) = cp.methodref_resolve(idx) else {
+    for &(class_idx, nat_idx) in cp.methodref.values() {
+        let Some(owner) = cp.class_name(class_idx) else {
+            continue;
+        };
+        let Some(&(name_idx, desc_idx)) = cp.name_and_type.get(&nat_idx) else {
+            continue;
+        };
+        let (Some(name), true) = (cp.utf8.get(&name_idx), cp.utf8.contains_key(&desc_idx)) else {
             continue;
         };
         method_ref_count = method_ref_count.saturating_add(1);
@@ -522,10 +519,10 @@ fn populate_imports(
             continue;
         }
         symbols_out.push(crate::Symbol::Import {
-            name: name.to_string(),
+            name: name.clone(),
             alias: None,
             library: Some(owner.to_string()),
-            offset: cp.methodref_name_offset(idx),
+            offset: cp.utf8_offset.get(&name_idx).copied(),
             ordinal: None,
         });
     }
@@ -533,17 +530,6 @@ fn populate_imports(
         metric!("class.method_ref_count"),
         f64::from(method_ref_count),
     );
-}
-
-/// Step over a `fields[]` table: `access_flags u2; name_index u2;
-/// descriptor_index u2; attributes_count u2; attributes[]` per entry.
-fn skip_member_table(r: &mut Reader<'_>) -> Option<()> {
-    let count = r.u16_be()?;
-    for _ in 0..count {
-        r.skip(6)?;
-        skip_attributes(r)?;
-    }
-    Some(())
 }
 
 /// Step over `attributes_count u2; attributes[]`, each attribute a

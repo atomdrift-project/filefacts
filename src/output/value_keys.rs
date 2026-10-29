@@ -37,8 +37,6 @@
 //!   root verbatim. The keys filefacts adds alongside it, such as
 //!   `pbxproj.scripts` or `cargo.build_mode`, are listed.
 
-use serde_json::Value as JsonValue;
-
 use super::metric_keys::str_eq;
 
 /// A [`Values`](super::Values) path that is known to be declared in
@@ -49,24 +47,13 @@ use super::metric_keys::str_eq;
 /// compile time. It wraps a `&'static str`, so it is `Copy` and
 /// APIs take it by value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ValueKey(&'static str);
+pub(crate) struct ValueKey(&'static str);
 
 impl ValueKey {
     /// The path as it appears in the values tree and in trait rules.
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         self.0
-    }
-
-    /// Look this key up in a JSON tree shaped like [`Values`](super::Values),
-    /// using the same dot-path rules as [`Values::get`](super::Values::get).
-    ///
-    /// This is for a values object that has already been serialized into
-    /// another fact, where there is no `Values` to call
-    /// [`get_key`](super::Values::get_key) on.
-    #[must_use]
-    pub fn get_in(self, root: &JsonValue) -> Option<&JsonValue> {
-        super::values::navigate(root, self.0)
     }
 }
 
@@ -160,10 +147,10 @@ pub const VALUE_CATALOG: &[&str] = &[
     "apk.description",
     "apk.homepage",
     "apk.license",
-    "apk.maintainer",
+    "apk.maintainers",
     "apk.name",
     "apk.origin",
-    "apk.packager",
+    "apk.packagers",
     "apk.provides",
     "apk.signing_keys",
     "apk.version",
@@ -233,23 +220,24 @@ pub const VALUE_CATALOG: &[&str] = &[
     "crate.name",
     "crate.repository",
     "crate.version",
-    "crx.author",
-    "crx.author_email",
+    "crx.authors",
     "crx.description",
     "crx.extension_id",
+    "crx.format_version",
     "crx.homepage",
     "crx.limits",
+    "crx.name",
     "crx.public_key_sha256",
     "crx.signature_verified",
     "crx.version",
     "deb.arch",
     "deb.dependencies",
+    "deb.description",
     "deb.limits",
-    "deb.maintainer",
+    "deb.maintainers",
     "deb.name",
     "deb.priority",
     "deb.section",
-    "deb.summary",
     "deb.version",
     "dmg.compression.codecs",
     "dmg.filesystem",
@@ -290,8 +278,8 @@ pub const VALUE_CATALOG: &[&str] = &[
     "elf.go",
     "elf.hashes.dyn_hash",
     "elf.hashes.export_hash",
-    "elf.hashes.imphash",
-    "elf.hashes.symhash",
+    "elf.hashes.import_hash",
+    "elf.hashes.symtab_import_hash",
     "elf.ident_pad",
     "elf.ident_version",
     "elf.ifuncs",
@@ -341,12 +329,12 @@ pub const VALUE_CATALOG: &[&str] = &[
     "font.unknown_tables",
     "font.valid",
     "gem.authors",
+    "gem.dependencies",
+    "gem.description",
     "gem.homepage",
-    "gem.licenses",
+    "gem.license",
     "gem.name",
     "gem.platform",
-    "gem.runtime_dependencies",
-    "gem.summary",
     "gem.version",
     "go_manifest.kind",
     "image4.trustcache",
@@ -481,7 +469,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "macho.hashes.dylib_hash",
     "macho.hashes.entitlement_hash",
     "macho.hashes.export_hash",
-    "macho.hashes.imphash",
+    "macho.hashes.import_hash",
     "macho.hashes.symhash",
     "macho.info_plist",
     "macho.install_name",
@@ -521,7 +509,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "nib.modules",
     "nib.outlets",
     "nib.resources",
-    "npm.author",
+    "npm.authors",
     "npm.description",
     "npm.homepage",
     "npm.limits",
@@ -624,6 +612,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "pe.debug.pdb.basename",
     "pe.debug.pdb.guid",
     "pe.debug.pdb.path",
+    "pe.debug.pdb.path_hex",
     "pe.debug.pdb.path_offset",
     "pe.debug.pdb.stem",
     "pe.debug.pdb.timestamp",
@@ -662,6 +651,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "pe.manifest.dpi_awareness_offset",
     "pe.manifest.long_path_aware",
     "pe.manifest.long_path_aware_offset",
+    "pe.manifest.parse_error",
     "pe.manifest.requested_execution_level",
     "pe.manifest.requested_execution_level_offset",
     "pe.manifest.supported_os",
@@ -671,7 +661,6 @@ pub const VALUE_CATALOG: &[&str] = &[
     "pe.os_version",
     "pe.overflowing_sections",
     "pe.overlapping_sections",
-    "pe.partial_parse",
     "pe.peb_access_sites",
     "pe.resource_timestamp",
     "pe.resource_types",
@@ -742,14 +731,14 @@ pub const VALUE_CATALOG: &[&str] = &[
     "pyc.source_files",
     "pyc.source_size",
     "pyc.timestamp",
-    "python.author",
+    "python.authors",
+    "python.description",
     "python.homepage",
     "python.license",
     "python.limits",
-    "python.maintainer",
+    "python.maintainers",
     "python.name",
     "python.requires_python",
-    "python.summary",
     "python.version",
     "rar.authenticity_info",
     "rar.comment",
@@ -779,7 +768,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "rar.version",
     "rar.volume",
     "rar.volume_number",
-    "registry.author",
+    "registry.authors",
     "registry.deprecated",
     "registry.description",
     "registry.ecosystem",
@@ -799,6 +788,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "rpm.buildhost",
     "rpm.buildtime",
     "rpm.cookie",
+    "rpm.description",
     "rpm.distribution",
     "rpm.epoch",
     "rpm.group",
@@ -807,7 +797,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "rpm.limits",
     "rpm.name",
     "rpm.os",
-    "rpm.packager",
+    "rpm.packagers",
     "rpm.payload_compressor",
     "rpm.payload_flags",
     "rpm.payload_format",
@@ -817,7 +807,6 @@ pub const VALUE_CATALOG: &[&str] = &[
     "rpm.scriptlets",
     "rpm.signature",
     "rpm.sourcerpm",
-    "rpm.summary",
     "rpm.vendor",
     "rpm.version",
     "rpyc",
@@ -852,13 +841,14 @@ pub const VALUE_CATALOG: &[&str] = &[
     "source.language",
     "source.payload_flow.events",
     "source.payload_flow.truncated",
-    "source.python.literal_stager_analysis",
-    "source.python.literal_tempfile_stager_flows",
     "source.python.module_alias_calls",
+    "source.python.module_calls_analysis",
+    "source.python.temporary_files",
     "source.rust.initializers",
     "source.rust.modules",
     "source.rust.proc_macro",
     "source.shell.fifo_network_loops",
+    "source.shell.fifos",
     "source.wordpress.plugin_name",
     "source.wordpress.slug",
     "source.wordpress.text_domain",
@@ -883,9 +873,9 @@ pub const VALUE_CATALOG: &[&str] = &[
     "wasm.memory.max",
     "wasm.producers",
     "wasm.xor_decode",
-    "whl.author",
-    "whl.author_email",
+    "whl.authors",
     "whl.data_dir",
+    "whl.description",
     "whl.dist_info_dir",
     "whl.distribution",
     "whl.filename.abi_tag",
@@ -899,16 +889,14 @@ pub const VALUE_CATALOG: &[&str] = &[
     "whl.has_record",
     "whl.has_wheel",
     "whl.homepage",
-    "whl.maintainer",
-    "whl.maintainer_email",
+    "whl.maintainers",
     "whl.purelib_shape",
     "whl.signing.has_record_jws",
     "whl.signing.has_record_p7s",
-    "whl.summary",
     "whl.top_level_packages",
     "whl.version",
     "xor.pe_key",
-    "xpi.author",
+    "xpi.authors",
     "xpi.description",
     "xpi.has_chrome_manifest",
     "xpi.has_install_rdf",

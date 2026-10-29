@@ -2,16 +2,24 @@
 //!
 //! Each case builds a known-bad input in memory, opens it, and touches every
 //! view. To pass, the case must finish on a 2 MiB worker thread (the stack a
-//! rayon worker gets) within a time budget and a peak-RSS cap.
+//! rayon worker gets) within a CPU-time budget and a peak-RSS cap.
 //!
 //! A stack overflow or an allocation failure aborts the process, which no
 //! `catch_unwind` can stop. So every case runs in a child copy of this test
 //! binary (re-invoked with [`CHILD_ENV`] set), while the parent enforces the
-//! deadline and the memory cap and reports how the child died. One abort
-//! then fails one test instead of taking the whole harness down with it.
+//! budget and the memory cap and reports how the child died. One abort then
+//! fails one test instead of taking the whole harness down with it.
+//!
+//! The budget is the CPU time the child used, not the wall-clock time it
+//! took: a loaded machine stretches the second but barely the first, and
+//! the regressions these cases guard against — quadratic walks, unbounded
+//! recursion — show up in both. Children run one at a time, so each one's
+//! CPU time can be read from the parent's `RUSAGE_CHILDREN`; a wall-clock
+//! limit several times the budget only stops a hang. Where the OS has no
+//! `getrusage` the wall-clock limit is all there is.
 //!
 //! Run with `cargo test --release --test hostile_inputs`. The heavier cases
-//! are ignored in debug builds, where unoptimised parsing makes their time
+//! are ignored in debug builds, where unoptimised parsing makes their
 //! budgets meaningless.
 #![allow(
     clippy::cast_possible_truncation,
@@ -22,13 +30,17 @@
     reason = "fixtures build binary layouts from literals and compare exact expected values"
 )]
 
+mod common;
+
 use std::hint::black_box;
 use std::io::{Cursor, Read, Write};
-use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use filefacts::{FileId, OpenOptions, ParsedFile};
+use common::iso::{SECTOR, both16, both32, dir_record, put};
+use common::{open_named, options, touch_all};
+use filefacts::FileId;
 
 /// Set in the child process: run the case body instead of supervising it.
 const CHILD_ENV: &str = "FILEFACTS_HOSTILE_CHILD";
@@ -39,15 +51,20 @@ const WORKER_STACK: usize = 2 << 20;
 /// Peak resident set allowed for one case, in KiB, unless the case sets its own.
 const DEFAULT_RSS_CAP_KIB: u64 = 1 << 20;
 
-/// Wall-clock budget for a case, given in release-build seconds. Debug builds
-/// get ten times as long.
+/// How many times its CPU budget a case may run for, in wall-clock time,
+/// before it is killed as hung.
+const HANG_FACTOR: u32 = 6;
+
+/// CPU budget for a case, given in release-build seconds. Debug builds get
+/// ten times as much.
 fn budget(release_secs: u64) -> Duration {
     let scale = if cfg!(debug_assertions) { 10 } else { 1 };
     Duration::from_secs(release_secs * scale)
 }
 
 /// Run `case` in a child copy of this test binary, on a [`WORKER_STACK`]
-/// thread, failing if it does not exit cleanly within `limit` and `rss_cap_kib`.
+/// thread, failing if it does not exit cleanly within `limit` of CPU time
+/// and `rss_cap_kib`.
 fn isolated(name: &str, limit: Duration, rss_cap_kib: u64, case: fn()) {
     if std::env::var_os(CHILD_ENV).is_some() {
         let worker = std::thread::Builder::new()
@@ -61,6 +78,14 @@ fn isolated(name: &str, limit: Duration, rss_cap_kib: u64, case: fn()) {
         return;
     }
 
+    // One child at a time: `children_cpu` then measures exactly this one,
+    // and the cases do not compete with each other for the machine.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    let _serial = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cpu_before = children_cpu();
+
     let exe = std::env::current_exe().expect("test binary path");
     let mut child = Command::new(exe)
         .args([
@@ -71,7 +96,6 @@ fn isolated(name: &str, limit: Duration, rss_cap_kib: u64, case: fn()) {
             "--test-threads=1",
         ])
         .env(CHILD_ENV, "1")
-        .env("FILEFACTS_CACHE", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -84,6 +108,7 @@ fn isolated(name: &str, limit: Duration, rss_cap_kib: u64, case: fn()) {
         out
     });
 
+    let hang = limit * HANG_FACTOR;
     let start = Instant::now();
     let mut peak_kib = 0;
     let verdict = loop {
@@ -98,8 +123,8 @@ fn isolated(name: &str, limit: Duration, rss_cap_kib: u64, case: fn()) {
                 ));
             }
         }
-        if start.elapsed() > limit {
-            break Err(format!("still running after {limit:?}"));
+        if start.elapsed() > hang {
+            break Err(format!("still running after {hang:?}; hung"));
         }
         std::thread::sleep(Duration::from_millis(20));
     };
@@ -108,17 +133,51 @@ fn isolated(name: &str, limit: Duration, rss_cap_kib: u64, case: fn()) {
         let _ = child.kill();
         let _ = child.wait();
     }
+    let cpu = children_cpu().map(|after| after.saturating_sub(cpu_before.unwrap_or_default()));
     let stderr = drain.join().unwrap_or_default();
     let stderr = tail(&stderr);
+    let cpu_shown = cpu.map_or_else(|| "unmeasured".to_owned(), |cpu| format!("{cpu:.2?}"));
     match verdict {
         Ok(status) if status.success() => {
-            eprintln!("{name}: ok in {elapsed:.2?}, peak RSS {peak_kib} KiB");
+            if let Some(cpu) = cpu {
+                assert!(
+                    cpu <= limit,
+                    "{name}: used {cpu:.2?} of CPU, over its {limit:?} budget \
+                     (wall {elapsed:.2?}, peak RSS {peak_kib} KiB)\n{stderr}"
+                );
+            }
+            eprintln!("{name}: ok, CPU {cpu_shown}, wall {elapsed:.2?}, peak RSS {peak_kib} KiB");
         }
         Ok(status) => panic!(
-            "{name}: child exited with {status} after {elapsed:.2?} (peak RSS {peak_kib} KiB)\n{stderr}"
+            "{name}: child exited with {status}, CPU {cpu_shown}, wall {elapsed:.2?} \
+             (peak RSS {peak_kib} KiB)\n{stderr}"
         ),
         Err(why) => panic!("{name}: {why}\n{stderr}"),
     }
+}
+
+/// CPU time, user plus system, used by this process's reaped children.
+#[cfg(unix)]
+fn children_cpu() -> Option<Duration> {
+    // SAFETY: `rusage` is plain old data, valid all-zero.
+    #[allow(unsafe_code)]
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `usage` is valid, writable storage for the result.
+    #[allow(unsafe_code)]
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &raw mut usage) };
+    if rc != 0 {
+        return None;
+    }
+    let time = |t: libc::timeval| {
+        Duration::from_secs(u64::try_from(t.tv_sec).unwrap_or(0))
+            + Duration::from_micros(u64::try_from(t.tv_usec).unwrap_or(0))
+    };
+    Some(time(usage.ru_utime) + time(usage.ru_stime))
+}
+
+#[cfg(not(unix))]
+fn children_cpu() -> Option<Duration> {
+    None
 }
 
 /// The child's peak resident set so far (`VmHWM`), where the OS exposes it.
@@ -157,36 +216,6 @@ macro_rules! hostile {
             isolated(stringify!($name), budget($secs), rss, case);
         }
     };
-}
-
-/// Options for a hermetic open: no disk cache and no rizin subprocess.
-fn options() -> OpenOptions<'static> {
-    OpenOptions::new().cache(false).rizin(false)
-}
-
-fn open_named<'a>(name: &str, bytes: &'a [u8]) -> ParsedFile<'a> {
-    options().path(Path::new(name)).open(bytes)
-}
-
-/// Touch every view so each lazy extraction stage runs, the flow graph and
-/// the source AST included.
-fn touch_all(parsed: &ParsedFile<'_>) {
-    black_box(parsed.fileid().file_type());
-    black_box(parsed.values());
-    black_box(parsed.text().len());
-    black_box(parsed.literals());
-    black_box(parsed.comments());
-    black_box(parsed.metrics().len());
-    black_box(parsed.archive_members().len());
-    black_box(parsed.source_ast().is_some());
-    black_box(parsed.sections());
-    black_box(parsed.symbols());
-    black_box(parsed.flow());
-    black_box(parsed.identity());
-    black_box(parsed.references().len());
-    black_box(parsed.errors());
-    black_box(parsed.embedded_sources().count());
-    black_box(parsed.symbol_iter().count());
 }
 
 // ---------------------------------------------------------------------------
@@ -380,40 +409,11 @@ hostile! {
 /// block 19, and block 19 holds `ce_per_area` `CE` records that each point
 /// back at block 19.
 fn iso_with_ce_loop(ce_per_area: usize) -> Vec<u8> {
-    const SECTOR: usize = 2048;
-    fn both32(v: u32) -> Vec<u8> {
-        [v.to_le_bytes(), v.to_be_bytes()].concat()
-    }
-    fn both16(v: u16) -> Vec<u8> {
-        [v.to_le_bytes(), v.to_be_bytes()].concat()
-    }
-    fn dirrec(name: &[u8], lba: u32, size: u32, flags: u8, su: &[u8]) -> Vec<u8> {
-        let mut body = vec![0];
-        body.extend(both32(lba));
-        body.extend(both32(size));
-        body.extend([0; 7]);
-        body.extend([flags, 0, 0]);
-        body.extend(both16(1));
-        body.push(name.len() as u8);
-        body.extend_from_slice(name);
-        if name.len().is_multiple_of(2) {
-            body.push(0);
-        }
-        body.extend_from_slice(su);
-        let mut rec = vec![(body.len() + 1) as u8];
-        rec.extend(body);
-        rec
-    }
     fn ce(block: u32, off: u32, len: u32) -> Vec<u8> {
         let data = [both32(block), both32(off), both32(len)].concat();
         let mut rec = vec![b'C', b'E', (4 + data.len()) as u8, 1];
         rec.extend(data);
         rec
-    }
-    fn put(img: &mut [u8], at: usize, data: &[u8]) {
-        img.get_mut(at..at + data.len())
-            .expect("write inside the image")
-            .copy_from_slice(data);
     }
 
     let mut img = vec![0u8; SECTOR * 24];
@@ -428,7 +428,7 @@ fn iso_with_ce_loop(ce_per_area: usize) -> Vec<u8> {
     put(
         &mut img,
         pvd + 156,
-        &dirrec(b"\0", 18, SECTOR as u32, 2, &[]),
+        &dir_record(b"\0", 18, SECTOR as u32, 2, [0; 7], &[]),
     );
     let term = 17 * SECTOR;
     put(&mut img, term, &[255]);
@@ -438,9 +438,9 @@ fn iso_with_ce_loop(ce_per_area: usize) -> Vec<u8> {
     let mut su = b"RR\x05\x01\x81".to_vec();
     su.extend(ce(19, 0, SECTOR as u32));
     let root = [
-        dirrec(b"\0", 18, SECTOR as u32, 2, &[]),
-        dirrec(b"\x01", 18, SECTOR as u32, 2, &[]),
-        dirrec(b"A;1", 20, 1, 0, &su),
+        dir_record(b"\0", 18, SECTOR as u32, 2, [0; 7], &[]),
+        dir_record(b"\x01", 18, SECTOR as u32, 2, [0; 7], &[]),
+        dir_record(b"A;1", 20, 1, 0, [0; 7], &su),
     ]
     .concat();
     put(&mut img, 18 * SECTOR, &root);

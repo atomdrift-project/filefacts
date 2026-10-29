@@ -1,7 +1,7 @@
-//! Import metrics ported from cleave.
+//! Import metrics.
 //!
-//! Takes the list of import names already extracted by the
-//! tree-sitter query in [`super::extract`] and emits `imports.*`
+//! Takes the import names [`super::extract`] collected once per file and
+//! emits `imports.*`
 //! keys: total, unique, stdlib/third-party split, relative imports,
 //! wildcard/dynamic/aliased imports, and their ratios.
 

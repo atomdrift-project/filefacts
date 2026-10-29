@@ -59,13 +59,21 @@ use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::collections::{HashSet, VecDeque};
 
 use crate::formats::common::bytes_at::{u16_le, u32_be, u32_le};
-use crate::output::{ArchiveMember, ArchiveOffsets, ArchiveOwnership, Metrics, Values};
+use crate::output::{ArchiveMember, ArchiveOffsets, ArchiveOwnership, EntryType, Metrics, Values};
 use crate::scan::days_from_civil;
 use crate::value_key;
 
-use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_value};
-use super::bounded::MAX_PATH_BYTES;
+use super::archive_stats::{
+    Agg, ArchiveStats, Reading, Scope, is_executable_extension, is_script_extension, member_value,
+};
+use super::bounded::{MAX_ARCHIVE_MEMBERS, MAX_PATH_BYTES};
 use super::udf;
+
+mod boot;
+mod unclaimed;
+
+use boot::emit_boot;
+use unclaimed::{emit_unclaimed, partition_claimed_ranges, unclaimed_regions};
 
 /// ISO 9660 logical sector. Fixed by the standard for optical media;
 /// the PVD's `logical_block_size` field may disagree, which is itself
@@ -77,8 +85,6 @@ const SYSTEM_AREA_SECTORS: usize = 16;
 /// set is 2–5 entries; the UDF bridge recognition sequence adds a few
 /// more. Anything past this is a malformed or padded set.
 const MAX_VOLUME_DESCRIPTORS: usize = 64;
-/// Cap on directory records walked across all trees.
-const MAX_ENTRIES: usize = super::bounded::MAX_ARCHIVE_MEMBERS;
 /// Cap on directory extents visited, bounding a cyclic tree.
 const MAX_DIRS: usize = 16_384;
 /// Cap on tree depth. ISO 9660 level 1 permits 8; Joliet and Rock Ridge
@@ -93,7 +99,7 @@ const MAX_DIR_EXTENT: usize = 32 << 20;
 /// extent on its start and declared length, so records naming one extent
 /// with ever-different lengths, or extents overlapping a sector apart, each
 /// re-read up to `MAX_DIR_EXTENT`: `MAX_DIRS` times the image. Real trees
-/// spend a few hundred bytes per record, far below this for `MAX_ENTRIES`.
+/// spend a few hundred bytes per record, far below this for `MAX_ARCHIVE_MEMBERS`.
 const MAX_DIR_BYTES_TOTAL: usize = 128 << 20;
 /// Cap on SUSP continuation-area hops per record.
 const MAX_CE_HOPS: usize = 8;
@@ -102,7 +108,7 @@ const MAX_CE_HOPS: usize = 8;
 const MAX_SUSP_BYTES_PER_ENTRY: usize = 64 << 10;
 /// Continuation-area bytes read across the whole walk. Every record can
 /// point its `CE` at the same areas, so the per-entry budget alone would
-/// still allow `MAX_ENTRIES` times it.
+/// still allow `MAX_ARCHIVE_MEMBERS` times it.
 const MAX_SUSP_BYTES_TOTAL: usize = 64 << 20;
 /// Bytes kept from a Rock Ridge `NM` name, across its continuation entries.
 const MAX_ALT_NAME_LEN: usize = 4096;
@@ -147,9 +153,9 @@ pub(super) fn extract(
     let members = archive_members.get(first..).unwrap_or_default();
     let mut stats = ArchiveStats::new(AGGS);
     for member in members {
-        let reading = match member.entry_type.as_deref() {
-            Some("regular") => Reading::of(member),
-            Some("directory" | "symlink") => Reading {
+        let reading = match member.entry_type {
+            EntryType::Regular => Reading::of(member),
+            EntryType::Directory | EntryType::Symlink => Reading {
                 file: false,
                 ..Reading::of(member)
             },
@@ -159,7 +165,7 @@ pub(super) fn extract(
     }
     let list = members
         .iter()
-        .map(|m| JsonValue::Object(member_value(m, Shape::FULL)))
+        .map(|m| JsonValue::Object(member_value(m)))
         .collect();
     values.insert_key(value_key!("archive.members"), JsonValue::Array(list));
     stats.emit(values, metrics);
@@ -326,7 +332,7 @@ fn walk_image(
     if udf_facts.present {
         let iso_files = archive_members
             .iter()
-            .filter(|m| m.entry_type.as_deref() != Some("directory"))
+            .filter(|m| m.entry_type != EntryType::Directory)
             .count() as u64;
         if udf_facts.file_count > iso_files {
             anomalies.push("udf-tree-has-extra-files");
@@ -964,198 +970,6 @@ fn emit_system_area(
 }
 
 // ---------------------------------------------------------------------------
-// El Torito boot catalog
-// ---------------------------------------------------------------------------
-
-/// What a boot record adds to the image-wide accounting.
-#[derive(Default)]
-struct BootTally {
-    /// A well-formed El Torito catalog was found.
-    el_torito: bool,
-    anomalies: Vec<&'static str>,
-    /// Byte ranges the catalog and its boot images occupy.
-    claimed: Vec<(u64, u64)>,
-}
-
-fn emit_boot(
-    bytes: &[u8],
-    body: &[u8],
-    pvd: &Pvd,
-    values: &mut Values,
-    metrics: &mut Metrics,
-    archive_members: &mut Vec<ArchiveMember>,
-) -> BootTally {
-    let mut tally = BootTally::default();
-    let boot_system = decode_field(&field(body, 7, 32), false);
-    values.insert_key(
-        value_key!("iso.boot.system_id"),
-        JsonValue::String(boot_system.clone()),
-    );
-    if !boot_system.to_ascii_uppercase().starts_with("EL TORITO") {
-        // A boot record that isn't El Torito still means "this image
-        // claims to boot"; record the claim without inventing a catalog.
-        values.insert_key(value_key!("iso.boot.bootable"), JsonValue::Bool(true));
-        return tally;
-    }
-
-    let catalog_lba = u32_le(body, 71).unwrap_or(0);
-    metrics.insert(metric!("iso.boot.catalog_lba"), f64::from(catalog_lba));
-    if catalog_lba >= pvd.volume_space_sectors {
-        tally.anomalies.push("boot-catalog-out-of-range");
-    }
-    let Some(catalog) = sector_at(bytes, catalog_lba as usize) else {
-        tally.anomalies.push("boot-catalog-unreadable");
-        return tally;
-    };
-    let catalog_start = u64::from(catalog_lba) * SECTOR as u64;
-    tally
-        .claimed
-        .push((catalog_start, catalog_start + SECTOR as u64));
-
-    // Validation entry: header 0x01, a platform id, and a 0x55AA key.
-    let valid = catalog.first() == Some(&0x01) && catalog.get(30..32) == Some(&[0x55, 0xAA]);
-    if !valid {
-        tally.anomalies.push("boot-catalog-invalid");
-    }
-    let manufacturer = decode_field(&field(catalog, 4, 24), false);
-    if !manufacturer.is_empty() {
-        values.insert_key(
-            value_key!("iso.boot.manufacturer"),
-            JsonValue::String(manufacturer),
-        );
-    }
-
-    let mut entries = Vec::new();
-    let mut platforms: Vec<&'static str> = Vec::new();
-    let mut current_platform = catalog.get(1).copied().unwrap_or(0);
-    let mut bootable_count = 0_u32;
-    let mut offset = 32;
-
-    while offset + 32 <= catalog.len() && entries.len() < MAX_BOOT_ENTRIES {
-        let Some(e) = catalog.get(offset..offset + 32) else {
-            break;
-        };
-        offset += 32;
-        let header = e.first().copied().unwrap_or(0);
-        match header {
-            // Section header: switches the platform for the entries after it.
-            0x90 | 0x91 => {
-                current_platform = e.get(1).copied().unwrap_or(0);
-                continue;
-            }
-            // Extension entry — continuation of the previous section entry.
-            0x44 => continue,
-            // Bootable (0x88) or non-bootable (0x00) section entry. A zero
-            // byte is also what padding looks like, so an all-zero record
-            // ends the catalog.
-            0x88 | 0x00 => {
-                if e.iter().all(|b| *b == 0) {
-                    break;
-                }
-            }
-            _ => break,
-        }
-        let bootable = header == 0x88;
-        if bootable {
-            bootable_count += 1;
-        }
-        let platform = platform_name(current_platform);
-        if !platforms.contains(&platform) {
-            platforms.push(platform);
-        }
-        let media = e.get(1).copied().unwrap_or(0);
-        let load_rba = u32_le(e, 8).unwrap_or(0);
-        let sectors = u16_le(e, 6).unwrap_or(0);
-        entries.push(json!({
-            "bootable": bootable,
-            "platform": platform,
-            "platform_id": current_platform,
-            "media_type": media_name(media),
-            "load_segment": u16_le(e, 2).unwrap_or(0),
-            "system_type": e.get(4).copied().unwrap_or(0),
-            "sector_count": sectors,
-            "load_rba": load_rba,
-            // Boot images are addressed in 512-byte virtual sectors but
-            // located by 2048-byte LBA; the byte offset is what a caller
-            // needs to carve the image out.
-            "offset": u64::from(load_rba) * SECTOR as u64,
-        }));
-        if load_rba >= pvd.volume_space_sectors {
-            tally.anomalies.push("boot-image-out-of-range");
-        }
-        // El Torito counts a boot image in 512-byte virtual sectors even
-        // though it is placed on a 2048-byte boundary.
-        let image_start = u64::from(load_rba) * SECTOR as u64;
-        let image_len = u64::from(sectors).saturating_mul(512).max(SECTOR as u64);
-        tally
-            .claimed
-            .push((image_start, image_start.saturating_add(image_len)));
-        // The boot image is executable content that no directory entry
-        // names — a bootkit lives here, not in the file tree — so it is
-        // surfaced as a member and analysed like any other payload.
-        archive_members.push(ArchiveMember {
-            path: format!(".iso-boot/{platform}-{}.img", entries.len()),
-            size_bytes: image_len,
-            entry_type: Some("boot-image".into()),
-            mtime_unix: None,
-            linkname: None,
-            host_os: None,
-            crc32: None,
-            encrypted: false,
-            compression: None,
-            ownership: None,
-            offsets: ArchiveOffsets {
-                header: None,
-                data: Some(image_start),
-                central_header: None,
-            },
-        });
-    }
-
-    metrics.insert(metric!("iso.boot.entry_count"), entries.len() as f64);
-    metrics.insert(
-        metric!("iso.boot.bootable_entry_count"),
-        f64::from(bootable_count),
-    );
-    values.insert_key(
-        value_key!("iso.boot.bootable"),
-        JsonValue::Bool(bootable_count > 0),
-    );
-    values.insert_key(
-        value_key!("iso.boot.platforms"),
-        JsonValue::Array(platforms.iter().map(|p| json!(p)).collect()),
-    );
-    values.insert_key(
-        value_key!("iso.boot.efi"),
-        JsonValue::Bool(platforms.contains(&"efi")),
-    );
-    values.insert_key(value_key!("iso.boot.entries"), JsonValue::Array(entries));
-    tally.el_torito = true;
-    tally
-}
-
-fn platform_name(id: u8) -> &'static str {
-    match id {
-        0x00 => "x86",
-        0x01 => "powerpc",
-        0x02 => "mac",
-        0xEF => "efi",
-        _ => "unknown",
-    }
-}
-
-fn media_name(id: u8) -> &'static str {
-    match id & 0x0F {
-        0 => "no-emulation",
-        1 => "floppy-1.2m",
-        2 => "floppy-1.44m",
-        3 => "floppy-2.88m",
-        4 => "hard-disk",
-        _ => "reserved",
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Directory tree walk
 // ---------------------------------------------------------------------------
 
@@ -1256,7 +1070,7 @@ impl Walk {
         let mut queue = VecDeque::from([(root_lba, root_len, String::new(), 0_u32)]);
         while let Some((lba, len, prefix, depth)) = queue.pop_front() {
             if self.dirs_walked >= MAX_DIRS
-                || self.entries.len() >= MAX_ENTRIES
+                || self.entries.len() >= MAX_ARCHIVE_MEMBERS
                 || self.path_budget == 0
             {
                 self.truncated = true;
@@ -1366,7 +1180,7 @@ impl Walk {
             };
             self.path_budget = left;
             out.push(entry);
-            if self.entries.len() + out.len() >= MAX_ENTRIES {
+            if self.entries.len() + out.len() >= MAX_ARCHIVE_MEMBERS {
                 self.truncated = true;
                 break;
             }
@@ -1578,9 +1392,18 @@ struct File {
 /// Keying on `(lba, size)` rather than on the path is what makes the
 /// evasion visible: the same bytes carry a different name in each tree,
 /// and a payload placed in only one tree still yields a member here.
+///
+/// Within one tree, several entries on one extent are hard links, each a
+/// name a reader sees, so each stays its own member: the `n`th entry a tree
+/// has on an extent merges with the `n`th of every other tree. That also
+/// bounds every file's name list by the number of trees.
 fn merge_namespaces(entries: Vec<Entry>, anomalies: &mut Vec<&'static str>) -> Vec<File> {
     let mut files: Vec<File> = Vec::new();
-    let mut index: std::collections::HashMap<(u32, u32), usize> = std::collections::HashMap::new();
+    let mut index: std::collections::HashMap<(u32, u32, usize), usize> =
+        std::collections::HashMap::new();
+    // How many entries each tree has had on each extent so far.
+    let mut links: std::collections::HashMap<(u32, u32, &'static str), usize> =
+        std::collections::HashMap::new();
     // Zero-length files by path. A linear search per file made a tree of
     // tens of thousands of empty files quadratic.
     let mut empty: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -1593,7 +1416,11 @@ fn merge_namespaces(entries: Vec<Entry>, anomalies: &mut Vec<&'static str>) -> V
             .to_string();
         // A zero-length file has no extent to key on; fall back to its path
         // so distinct empty files don't collapse into one member.
-        let key = (e.lba, e.size);
+        let link = links
+            .entry((e.lba, e.size, e.namespace.label()))
+            .or_default();
+        let key = (e.lba, e.size, *link);
+        *link += 1;
         let slot = if e.size == 0 {
             empty.get(&e.path)
         } else {
@@ -1684,13 +1511,6 @@ fn merge_namespaces(entries: Vec<Entry>, anomalies: &mut Vec<&'static str>) -> V
 // Tree facts
 // ---------------------------------------------------------------------------
 
-/// Extensions that execute (or launch something that does) on Windows —
-/// the platform an ISO delivery chain targets.
-const EXECUTABLE_EXTENSIONS: &[&str] = &[
-    "exe", "dll", "scr", "com", "pif", "cpl", "msi", "msix", "appx", "bat", "cmd", "ps1", "psm1",
-    "vbs", "vbe", "js", "jse", "wsf", "wsh", "hta", "jar", "msc", "cab", "sys", "ocx", "efi",
-];
-
 fn emit_tree(
     files: &[File],
     pvd: &Pvd,
@@ -1746,7 +1566,9 @@ fn emit_tree(
         largest = largest.max(size);
 
         let ext = extension_of(&f.path);
-        if EXECUTABLE_EXTENSIONS.contains(&ext.as_str()) {
+        // Anything the Windows shell runs on a double-click: the platform an
+        // ISO delivery chain targets.
+        if is_executable_extension(&ext) || is_script_extension(&ext) {
             executable_count += 1;
         }
         if ext == "lnk" {
@@ -1834,194 +1656,6 @@ fn emit_tree(
     values.insert_key(value_key!("iso.files"), JsonValue::Array(surfaced));
 }
 
-/// Cap on unclaimed regions reported. A fragmented image must not turn into
-/// thousands of pseudo-members.
-const MAX_UNCLAIMED_REGIONS: usize = 8;
-/// Smallest unclaimed run worth reporting. Below a couple of sectors a gap
-/// is ordinary alignment padding.
-const MIN_UNCLAIMED_BYTES: u64 = 4096;
-
-/// Byte ranges inside the image that nothing accounts for.
-///
-/// A walk of the directory tree only ever reads what the tree points at.
-/// The descriptors, the path tables, and every directory and file extent
-/// together cover the parts of an image that *mean* something; whatever is
-/// left is addressable storage that a mounted image ignores. That is where
-/// a payload goes when the goal is for a file listing to look clean, so the
-/// regions are surfaced as members in their own right and analysed like any
-/// other content.
-///
-/// All-zero runs are excluded: an image is padded to a sector, and empty
-/// padding is not evidence of anything.
-/// The byte ranges an MBR/GPT partition table in the system area claims.
-///
-/// A hybrid image (`xorriso -isohybrid-mbr`, and every Linux/BSD installer
-/// built that way) carries a partition table in LBA 0 alongside the ISO 9660
-/// descriptors. Its content lives in a partition, so the ISO volume can be
-/// tiny while the file is gigabytes: Redox's desktop livedisk declares 21
-/// sectors (43,008 bytes) of ISO 9660 and is 603,979,776 bytes long, with one
-/// 0xEE (GPT protective) entry spanning the whole image.
-///
-/// Those bytes are accounted for — by the partition table — so they are not
-/// "unclaimed". Without this, the entire filesystem is reported as one
-/// `trailing` member and every data-file rule runs across a whole operating
-/// system as an opaque blob.
-///
-/// Only entries that actually describe a range count. Bytes past the last
-/// partition are still unaccounted for and are still reported, so a payload
-/// appended after the partitioned area does not hide behind this.
-fn partition_claimed_ranges(bytes: &[u8]) -> Vec<(u64, u64)> {
-    let area = bytes
-        .get(..SYSTEM_AREA_SECTORS * SECTOR)
-        .unwrap_or_default();
-    if area.get(510..512) != Some(&[0x55, 0xAA]) {
-        return Vec::new();
-    }
-    // LBA size is fixed at 512 for the MBR entry format regardless of the
-    // ISO's own 2048-byte sectors.
-    const LBA: u64 = 512;
-    let total = bytes.len() as u64;
-    let mut out = Vec::new();
-    for i in 0..4 {
-        let off = 446 + i * 16;
-        let Some(e) = area.get(off..off + 16) else {
-            break;
-        };
-        let ptype = e.get(4).copied().unwrap_or(0);
-        let start = u64::from(u32_le(e, 8).unwrap_or(0));
-        let count = u64::from(u32_le(e, 12).unwrap_or(0));
-        if ptype == 0 || count == 0 {
-            continue;
-        }
-        let begin = start.saturating_mul(LBA).min(total);
-        let end = start.saturating_add(count).saturating_mul(LBA).min(total);
-        if end > begin {
-            out.push((begin, end));
-        }
-    }
-    out
-}
-
-fn unclaimed_regions(
-    files: &[File],
-    pvd: &Pvd,
-    bytes: &[u8],
-    mut claimed: Vec<(u64, u64)>,
-) -> Vec<(&'static str, u64, u64)> {
-    let sector = SECTOR as u64;
-    let round_up = |n: u64| n.div_ceil(sector).saturating_mul(sector);
-    claimed.reserve(files.len());
-    for f in files {
-        // Directories are metadata, and their extents are as much a claim on
-        // the image as a file's bytes are.
-        let len = round_up(u64::from(f.size));
-        claimed.push((f.offset, f.offset.saturating_add(len.max(sector))));
-    }
-    claimed.sort_unstable();
-
-    let declared = u64::from(pvd.volume_space_sectors).saturating_mul(sector);
-    let mut out = Vec::new();
-    let mut cursor = 0_u64;
-    for (start, end) in claimed {
-        if start > cursor && start - cursor >= MIN_UNCLAIMED_BYTES {
-            out.push(("slack", cursor, start - cursor));
-        }
-        cursor = cursor.max(end);
-    }
-    if declared > cursor && declared - cursor >= MIN_UNCLAIMED_BYTES {
-        out.push(("slack", cursor, declared - cursor));
-    }
-    // Bytes past the volume the descriptors declare. On a plain image no
-    // mastering tool writes here and an appended payload does, so any
-    // trailing byte is unaccounted for. On a hybrid image the partition
-    // table claims them, and only what lies past the last partition is
-    // genuinely unaccounted.
-    let actual = bytes.len() as u64;
-    if actual > declared {
-        let partition_end = partition_claimed_ranges(bytes)
-            .into_iter()
-            .map(|(_, end)| end)
-            .max()
-            .unwrap_or(0);
-        let trailing_from = declared.max(partition_end);
-        if actual > trailing_from {
-            out.push(("trailing", trailing_from, actual - trailing_from));
-        }
-    }
-
-    out.retain(|(kind, off, len)| {
-        // Trailing data is reported even when zeroed: nothing should be
-        // there at all. Interior padding is normally zeroed and says
-        // nothing, so only a populated run counts.
-        *kind == "trailing"
-            || usize::try_from(*off)
-                .ok()
-                .zip(usize::try_from(*len).ok())
-                .and_then(|(s, l)| bytes.get(s..s.saturating_add(l)))
-                .is_some_and(|region| region.iter().any(|b| *b != 0))
-    });
-    out.sort_by_key(|(_, _, len)| std::cmp::Reverse(*len));
-    out.truncate(MAX_UNCLAIMED_REGIONS);
-    out
-}
-
-fn emit_unclaimed(
-    regions: &[(&'static str, u64, u64)],
-    declared: u64,
-    values: &mut Values,
-    metrics: &mut Metrics,
-    archive_members: &mut Vec<ArchiveMember>,
-    anomalies: &mut Vec<&'static str>,
-) {
-    let total: u64 = regions
-        .iter()
-        .filter(|(kind, _, _)| *kind == "slack")
-        .map(|(_, _, len)| *len)
-        .sum();
-    metrics.insert(metric!("iso.unallocated_bytes"), total as f64);
-    metrics.insert(metric!("iso.unclaimed_region_count"), regions.len() as f64);
-    if declared > 0 {
-        metrics.insert(
-            metric!("iso.unallocated_ratio"),
-            total as f64 / declared as f64,
-        );
-    }
-    if total > 0 {
-        anomalies.push("populated-unallocated-space");
-    }
-
-    let mut list = Vec::with_capacity(regions.len());
-    for (kind, offset, len) in regions {
-        list.push(json!({ "kind": kind, "offset": offset, "size_bytes": len }));
-        archive_members.push(ArchiveMember {
-            path: match *kind {
-                "trailing" => ".iso-unclaimed/trailing.bin".to_string(),
-                _ => format!(".iso-unclaimed/slack-{offset:#x}.bin"),
-            },
-            size_bytes: *len,
-            // A distinct entry type, not `regular`: these are byte ranges the
-            // filesystem does not name, and a consumer must be able to tell
-            // them apart from files the image actually declares.
-            entry_type: Some((*kind).to_string()),
-            mtime_unix: None,
-            linkname: None,
-            host_os: None,
-            crc32: None,
-            encrypted: false,
-            compression: None,
-            ownership: None,
-            offsets: ArchiveOffsets {
-                header: None,
-                data: Some(*offset),
-                central_header: None,
-            },
-        });
-    }
-    if !list.is_empty() {
-        values.insert_key(value_key!("iso.unclaimed"), JsonValue::Array(list));
-    }
-}
-
 fn file_json(f: &File) -> JsonValue {
     let mut obj = JsonMap::new();
     obj.insert("path".into(), json!(f.path));
@@ -2097,32 +1731,24 @@ fn extension_of(path: &str) -> String {
 fn emit_members(files: &[File], archive_members: &mut Vec<ArchiveMember>) {
     for f in files {
         let entry_type = if f.is_dir {
-            "directory"
+            EntryType::Directory
         } else if f.symlink.is_some() {
-            "symlink"
+            EntryType::Symlink
         } else {
-            "regular"
+            EntryType::Regular
         };
-        let ownership = (f.mode.is_some() || f.uid.is_some()).then_some(ArchiveOwnership {
-            mode_octal: f.mode,
-            uid: f.uid,
-            gid: f.gid,
-            uname: None,
-            gname: None,
-        });
+        // ISO 9660 stores file data verbatim; there is no per-member codec to
+        // report, and the "compressed" size is the real size.
         archive_members.push(ArchiveMember {
-            path: f.path.trim_start_matches('/').to_string(),
-            size_bytes: u64::from(f.size),
-            entry_type: Some(entry_type.into()),
             mtime_unix: f.recorded,
             linkname: f.symlink.clone(),
-            host_os: None,
-            crc32: None,
-            encrypted: false,
-            // ISO 9660 stores file data verbatim; there is no per-member
-            // codec to report, and the "compressed" size is the real size.
-            compression: None,
-            ownership,
+            ownership: ArchiveOwnership {
+                mode_octal: f.mode,
+                uid: f.uid,
+                gid: f.gid,
+                uname: None,
+                gname: None,
+            },
             offsets: ArchiveOffsets {
                 header: None,
                 // Only hand out an offset a caller can slice. An interleaved
@@ -2131,6 +1757,11 @@ fn emit_members(files: &[File], archive_members: &mut Vec<ArchiveMember>) {
                 data: (!f.is_dir && f.contiguous && f.size > 0).then_some(f.offset),
                 central_header: None,
             },
+            ..ArchiveMember::new(
+                f.path.trim_start_matches('/').to_string(),
+                u64::from(f.size),
+                entry_type,
+            )
         });
     }
 }

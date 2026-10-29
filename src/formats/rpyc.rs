@@ -34,12 +34,7 @@ fn set_fact(fact: &mut Value, key: &str, value: Value) {
 }
 
 fn u32_at(bytes: &[u8], pos: usize) -> Result<u32, Error> {
-    let part = bytes
-        .get(pos..pos + 4)
-        .ok_or_else(|| Error::malformed("rpyc", "truncated slot table"))?;
-    Ok(u32::from_le_bytes(part.try_into().map_err(|_| {
-        Error::malformed("rpyc", "truncated slot table")
-    })?))
+    crate::bytes::u32_le(bytes, pos).ok_or_else(|| Error::malformed("rpyc", "truncated slot table"))
 }
 
 fn slots(bytes: &[u8]) -> Result<(u8, Vec<Slot>, usize), Error> {

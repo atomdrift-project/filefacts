@@ -26,11 +26,12 @@ use std::io::Cursor;
 
 use serde_json::Value as JsonValue;
 
-use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_value};
+use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, member_value};
+use super::bounded::Limits;
 use crate::bytes;
 use crate::error::Error;
 use crate::metric;
-use crate::output::{ArchiveCompression, ArchiveMember, ArchiveOffsets, Metrics, Values};
+use crate::output::{ArchiveCompression, ArchiveMember, EntryType, Metrics, Values};
 use crate::value_key;
 
 /// The shared aggregates a cabinet reports. Every CFFILE is a file (paths
@@ -166,27 +167,6 @@ fn parse_header(bytes: &[u8]) -> Result<Header, Error> {
     })
 }
 
-/// Total encoded length of a DER TLV at the start of `der`, header included.
-/// The CMS decoder rejects any bytes past the structure it is handed, and a
-/// signed cabinet is not obliged to end at its signature -- the samples here
-/// carry ~95KB more after it -- so the blob has to be cut to length first.
-fn der_total_len(der: &[u8]) -> Option<usize> {
-    let len_byte = *der.get(1)? as usize;
-    if len_byte < 0x80 {
-        return Some(2 + len_byte);
-    }
-    let count = len_byte & 0x7f;
-    if count == 0 || count > 4 {
-        return None;
-    }
-    let mut len = 0usize;
-    for i in 0..count {
-        len = (len << 8) | *der.get(2 + i)? as usize;
-    }
-    // Checked: four length bytes plus the header overflow a 32-bit usize.
-    len.checked_add(2 + count)
-}
-
 /// Whether a DER blob is a PKCS#7 ContentInfo wrapping SignedData -- the
 /// Authenticode shape. Checked before handing bytes to the CMS parser so an
 /// ordinary appended payload is not run through an ASN.1 decoder.
@@ -226,7 +206,7 @@ pub(super) fn extract(
     archive_members: &mut Vec<ArchiveMember>,
 ) -> Result<(), Error> {
     let header = parse_header(bytes)?;
-    let mut limits: Vec<JsonValue> = Vec::new();
+    let mut limits = Limits::default();
 
     values.insert_key(
         value_key!("archive.format.kind"),
@@ -333,22 +313,41 @@ pub(super) fn extract(
     //
     // The blob is the same structure PE and Mach-O carry, so it goes through
     // the same parser and is published under a `signatures[0]` key of the same
-    // shape, which lets the identity layer reuse the PE mapping unchanged.
+    // shape, which lets the identity layer reuse the PE mapping unchanged. The
+    // signature commits to a digest of the cabinet that nothing here
+    // recomputes, so a sound one reads `verified: null`, not true.
     if trailing > 0
         && let Some(tail) = bytes.get(trailing_at..)
         && is_pkcs7_signed_data(tail)
-        && let Some(der_len) = der_total_len(tail)
-        && let Some(blob) = tail.get(..der_len.min(tail.len()))
-        && let Some(sig) = super::pe_authenticode::parse_cms_blob(blob)
     {
-        values.insert_key(value_key!("cab.signatures"), JsonValue::Array(vec![sig]));
-        metrics.insert(metric!("cab.signature_bytes"), der_len as f64);
-        // Whatever sits past the signature is genuinely unaccounted for: the
-        // cabinet ended at `cbCabinet` and the signature ended here.
-        metrics.insert(
-            metric!("cab.post_signature_bytes"),
-            crate::bytes::sat_usize(trailing).saturating_sub(der_len) as f64,
-        );
+        // The DER element alone: a signed cabinet is not obliged to end at
+        // its signature, and the decoder rejects whatever follows.
+        let signature = super::cms::der_element(tail)
+            .and_then(|blob| Some((blob.len(), super::cms::parse_unbound_cms_blob(blob)?)));
+        match signature {
+            Some((der_len, sig)) => {
+                values.insert_key(
+                    value_key!("cab.signatures"),
+                    JsonValue::Array(vec![sig.to_json()]),
+                );
+                metrics.insert(metric!("cab.signature_bytes"), der_len as f64);
+                // Whatever sits past the signature is genuinely unaccounted
+                // for: the cabinet ended at `cbCabinet` and the signature
+                // ended here.
+                metrics.insert(
+                    metric!("cab.post_signature_bytes"),
+                    crate::bytes::sat_usize(trailing).saturating_sub(der_len) as f64,
+                );
+            }
+            None => tracing::debug!(
+                target: "filefacts::cab",
+                format = "cab",
+                stage = "signature",
+                offset = trailing_at,
+                len = tail.len(),
+                "appended SignedData did not parse"
+            ),
+        }
     }
 
     let mut members = Vec::new();
@@ -373,26 +372,19 @@ pub(super) fn extract(
 
                 for file in folder.file_entries() {
                     let member = ArchiveMember {
-                        // CFFILE stores a backslash-separated path; normalize
-                        // so member rules written against `a/b/c` match a
-                        // cabinet the same way they match a zip.
-                        path: file.name().replace('\\', "/"),
-                        size_bytes: u64::from(file.uncompressed_size()),
-                        entry_type: Some("regular".into()),
                         // The crate returns None for a DOS date/time that does
                         // not describe a real instant -- a builder artifact or
                         // a deliberate scrub.
                         mtime_unix: file.datetime().map(|dt| dt.assume_utc().unix_timestamp()),
-                        linkname: None,
-                        host_os: None,
-                        crc32: None,
-                        encrypted: false,
-                        compression: Some(ArchiveCompression {
-                            compressed_size: None,
-                            method: Some(method.clone()),
-                        }),
-                        ownership: None,
-                        offsets: ArchiveOffsets::default(),
+                        compression: ArchiveCompression::new(None, Some(method.clone())),
+                        // CFFILE stores a backslash-separated path; normalize
+                        // so member rules written against `a/b/c` match a
+                        // cabinet the same way they match a zip.
+                        ..ArchiveMember::new(
+                            file.name().replace('\\', "/"),
+                            u64::from(file.uncompressed_size()),
+                            EntryType::Regular,
+                        )
                     };
                     // The DOS attribute bits are the cabinet's own claim about
                     // the member, independent of its name -- a payload can be
@@ -406,7 +398,7 @@ pub(super) fn extract(
                     readonly_count += u64::from(file.is_read_only());
                     utf8_name_count += u64::from(file.is_name_utf());
 
-                    let mut obj = member_value(&member, Shape::FULL);
+                    let mut obj = member_value(&member);
                     for (key, set) in [
                         ("hidden", file.is_hidden()),
                         ("system", file.is_system()),
@@ -429,10 +421,14 @@ pub(super) fn extract(
             // most of the time: the reader rejects the continuation folder
             // indices the spec defines, so refusing to report anything would
             // lose a whole multi-part set.
-            limits.push(serde_json::json!({
-                "stage": "member-table",
-                "reason": err.to_string(),
-            }));
+            tracing::debug!(
+                target: "filefacts::cab",
+                format = "cab",
+                stage = "member-table",
+                error = %err,
+                "member table unreadable; header facts only"
+            );
+            limits.push("member-table", err.to_string());
         }
     }
 
@@ -446,9 +442,7 @@ pub(super) fn extract(
                 .collect::<Vec<_>>(),
         ),
     );
-    if !limits.is_empty() {
-        values.insert_key(value_key!("cab.limits"), JsonValue::Array(limits));
-    }
+    limits.emit(values, value_key!("cab.limits"));
 
     stats.emit(values, metrics);
     // Expansion against the cabinet's own declared size: the ratio a CAB bomb
@@ -487,136 +481,4 @@ pub(super) fn extract(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Build a one-file cabinet in memory and read it back through the same
-    /// path a scan takes.
-    fn cabinet_with(name: &str, body: &[u8]) -> Vec<u8> {
-        let mut builder = cab::CabinetBuilder::new();
-        builder
-            .add_folder(cab::CompressionType::None)
-            .add_file(name.to_string());
-        let mut writer = builder.build(Cursor::new(Vec::new())).unwrap();
-        while let Some(mut w) = writer.next_file().unwrap() {
-            std::io::Write::write_all(&mut w, body).unwrap();
-        }
-        writer.finish().unwrap().into_inner()
-    }
-
-    fn run(bytes: &[u8]) -> (Values, Metrics, Vec<ArchiveMember>) {
-        let mut values = Values::default();
-        let mut metrics = Metrics::default();
-        let mut typed = Vec::new();
-        extract(bytes, &mut values, &mut metrics, &mut typed).unwrap();
-        (values, metrics, typed)
-    }
-
-    #[test]
-    fn header_walk_emits_members_and_counts_executables() {
-        let bytes = cabinet_with("payload\\setup.exe", b"not an executable");
-        let (values, metrics, typed) = run(&bytes);
-
-        let members = values.get("archive.members").unwrap().as_array().unwrap();
-        assert_eq!(members.len(), 1);
-        // Backslashes are normalized so member rules match a cabinet the same
-        // way they match a zip.
-        assert_eq!(members[0]["path"].as_str(), Some("payload/setup.exe"));
-        assert_eq!(members[0]["size_bytes"].as_u64(), Some(17));
-        assert_eq!(metrics.get("archive.file_count"), Some(1.0));
-        assert_eq!(metrics.get("archive.executable_count"), Some(1.0));
-        assert_eq!(metrics.get("cab.folder_count"), Some(1.0));
-        assert_eq!(metrics.get("cab.file_count_mismatch"), Some(0.0));
-        assert_eq!(typed.len(), 1);
-        assert_eq!(
-            values
-                .get("archive.format.kind")
-                .and_then(serde_json::Value::as_str),
-            Some("cab")
-        );
-        assert_eq!(
-            values.get("cab.version").and_then(JsonValue::as_str),
-            Some("1.3")
-        );
-    }
-
-    #[test]
-    fn appended_bytes_are_reported_as_trailing() {
-        let mut bytes = cabinet_with("a.txt", b"hi");
-        let clean = run(&bytes).1.get("archive.trailing_bytes");
-        assert_eq!(clean, Some(0.0));
-
-        bytes.extend_from_slice(&[0x41; 512]);
-        let (_, metrics, _) = run(&bytes);
-        // The cabinet still parses; the appended block is what gets reported.
-        assert_eq!(metrics.get("archive.trailing_bytes"), Some(512.0));
-    }
-
-    #[test]
-    fn header_facts_survive_an_unreadable_member_table() {
-        // Truncate past the fixed header so the member table cannot be walked
-        // but the CFHEADER is intact.
-        let bytes = cabinet_with("a.txt", b"hi");
-        let cut = &bytes[..CFHEADER_FIXED_LEN + 2];
-        let (values, metrics, typed) = run(cut);
-
-        assert!(typed.is_empty());
-        assert!(values.get("cab.limits").is_some(), "limitation recorded");
-        // The identifying header fields are still reported.
-        assert_eq!(
-            values.get("cab.version").and_then(JsonValue::as_str),
-            Some("1.3")
-        );
-        assert!(metrics.get("cab.declared_total_size").unwrap() > 0.0);
-    }
-
-    #[test]
-    fn der_length_is_read_in_short_and_long_form() {
-        assert_eq!(der_total_len(&[0x30, 0x05, 0, 0, 0, 0, 0]), Some(7));
-        // 0x82 => two length bytes; 0x3d4b is the length seen on a real
-        // Microsoft-signed cabinet.
-        assert_eq!(der_total_len(&[0x30, 0x82, 0x3d, 0x4b]), Some(0x3d4b + 4));
-        assert_eq!(der_total_len(&[0x30, 0x85, 1, 1, 1, 1, 1]), None);
-        // The largest four-byte length overflows a 32-bit usize once the
-        // header is added; it reads as absent there, not as a wrapped length.
-        assert_eq!(
-            der_total_len(&[0x30, 0x84, 0xff, 0xff, 0xff, 0xff]),
-            0xffff_ffff_usize.checked_add(6)
-        );
-    }
-
-    #[test]
-    fn signature_guard_requires_the_signed_data_oid() {
-        let signed_data = [
-            0x30, 0x82, 0x3d, 0x4b, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07,
-            0x02, 0xa0, 0x00,
-        ];
-        assert!(is_pkcs7_signed_data(&signed_data));
-        // A DER sequence that is not SignedData, and plain appended bytes,
-        // must not be handed to the ASN.1 decoder.
-        let other = [
-            0x30, 0x82, 0x3d, 0x4b, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07,
-            0x01, 0xa0, 0x00,
-        ];
-        assert!(!is_pkcs7_signed_data(&other));
-        assert!(!is_pkcs7_signed_data(&[0x41; 64]));
-    }
-
-    #[test]
-    fn appended_payload_is_not_mistaken_for_a_signature() {
-        let mut bytes = cabinet_with("a.txt", b"hi");
-        bytes.extend_from_slice(&[0x41; 512]);
-        let (values, metrics, _) = run(&bytes);
-        assert_eq!(metrics.get("archive.trailing_bytes"), Some(512.0));
-        assert!(values.get("cab.signatures").is_none());
-        assert!(metrics.get("cab.signature_bytes").is_none());
-    }
-
-    #[test]
-    fn non_cabinet_bytes_are_rejected() {
-        let mut values = Values::default();
-        let mut metrics = Metrics::default();
-        let mut typed = Vec::new();
-        assert!(extract(b"not a cab at all", &mut values, &mut metrics, &mut typed).is_err());
-    }
-}
+mod tests;

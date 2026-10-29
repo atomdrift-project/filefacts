@@ -4,25 +4,15 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 
+# A member of the root workspace (see ../Cargo.toml): it shares the root's
+# Cargo.lock, [patch.crates-io] forks and profiles.
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-filefacts = { path = ".." }
-
-# Its own workspace, so the fuzz crate never joins the main build.
-[workspace]
-members = ["."]
-
-# Same fork as the root manifest: [patch] applies only in the root crate of a
-# build, and this crate is one. Keep it in step with ../Cargo.toml.
-[patch.crates-io]
-tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
-tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
-
-[profile.release]
-debug = 1
+# The library only: the CLI feature and jemalloc have nothing to fuzz.
+filefacts = { path = "..", default-features = false }
 
 [[bin]]
 name = "open_all_views"

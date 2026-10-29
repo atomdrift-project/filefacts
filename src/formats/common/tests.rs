@@ -176,8 +176,8 @@ fn xor_intent_detects_operator_and_keyword() {
 
 #[test]
 fn xor_intent_absent_in_benign_source() {
-    // A plain comment / coordinate string of the kind that previously
-    // mis-decoded into speculative "XOR payload" false positives.
+    // A plain comment / coordinate string, which an XOR scan would
+    // mis-decode into a speculative payload.
     assert!(!has_xor_intent(
         b"// Build data=\"Name:v1,v2;...\" from series"
     ));

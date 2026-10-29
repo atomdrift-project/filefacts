@@ -31,13 +31,17 @@ fn a_malformed_unicode_stream_name_is_rejected_rather_than_guessed() {
 
 #[test]
 fn decompress_empty_input_yields_empty_output() {
-    assert!(decompress_vba(&[]).unwrap().is_empty());
+    assert!(
+        decompress_vba(&[], MAX_DECOMPRESSED_SIZE)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
 fn decompress_rejects_wrong_signature() {
     // First byte must be 0x01.
-    let err = decompress_vba(&[0xFF, 0x00, 0x00]).unwrap_err();
+    let err = decompress_vba(&[0xFF, 0x00, 0x00], MAX_DECOMPRESSED_SIZE).unwrap_err();
     assert_eq!(err, DecompressError::BadSignature);
 }
 
@@ -49,15 +53,14 @@ fn decompress_uncompressed_chunk_roundtrip() {
     let mut input = vec![0x01u8];
     input.extend_from_slice(&0x0002_u16.to_le_bytes()); // chunk_size 2+3=5, uncompressed
     input.extend_from_slice(b"hello");
-    let out = decompress_vba(&input).unwrap();
+    let out = decompress_vba(&input, MAX_DECOMPRESSED_SIZE).unwrap();
     assert!(out.starts_with(b"hello"));
 }
 
 #[test]
 fn max_bit_count_matches_spec_steps() {
     // MAX(4, CeilingLog2(DecompressedCurrent - DecompressedChunkStart)),
-    // capped at 12 (MS-OVBA 2.4.1.3.19.1). It grows with the position;
-    // it used to shrink, which decoded every copy token wrongly.
+    // capped at 12 (MS-OVBA 2.4.1.3.19.1). It grows with the position.
     assert_eq!(max_bit_count(0), 4);
     assert_eq!(max_bit_count(4), 4);
     assert_eq!(max_bit_count(16), 4);
@@ -172,7 +175,7 @@ fn decompress_compressed_chunk_pure_literals() {
     input.extend_from_slice(&header.to_le_bytes());
     input.push(0x00); // flag byte — all literals
     input.extend_from_slice(b"abcdefgh");
-    let out = decompress_vba(&input).unwrap();
+    let out = decompress_vba(&input, MAX_DECOMPRESSED_SIZE).unwrap();
     assert_eq!(&out, b"abcdefgh");
 }
 
@@ -194,7 +197,7 @@ fn decompress_compressed_chunk_with_back_reference() {
     // offset=4 -> length_field=0, offset_field=3 -> (3 << 12) | 0.
     let token = 0x3000u16;
     input.extend_from_slice(&token.to_le_bytes());
-    let out = decompress_vba(&input).unwrap();
+    let out = decompress_vba(&input, MAX_DECOMPRESSED_SIZE).unwrap();
     assert_eq!(&out, b"ABCDABC");
 }
 
@@ -203,7 +206,7 @@ fn decompress_handles_truncated_chunk_header() {
     // Signature plus a single byte — chunk header needs 2 bytes,
     // so the loop should exit cleanly.
     let input = vec![0x01u8, 0xAB];
-    let out = decompress_vba(&input).unwrap();
+    let out = decompress_vba(&input, MAX_DECOMPRESSED_SIZE).unwrap();
     assert!(out.is_empty());
 }
 

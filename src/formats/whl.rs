@@ -31,7 +31,7 @@ use serde_json::Value as JsonValue;
 use std::io::{Read, Seek};
 
 use super::bounded::MemberFailure;
-use crate::output::{Errors, Metrics, Stage, ValueKey, Values};
+use crate::output::{Errors, Metrics, Stage, Values};
 
 pub(super) fn extract_from_archive<R: Read + Seek>(
     zip: &mut ::zip::ZipArchive<R>,
@@ -62,12 +62,13 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     let mut native_extension_count: u64 = 0;
     let mut top_level: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
-    for name in zip.file_names() {
+    for name in zip.file_names().filter_map(Result::ok) {
+        let name = name.as_ref();
         // Identify the dist-info / data directories from the first
-        // component of any path under them. Multiple matches are
-        // permitted in a malformed wheel; we keep the lexically first
-        // (BTreeSet ordering keeps that deterministic). Layout names
-        // match exactly, as installers match them.
+        // component of any path under them. A malformed wheel may carry
+        // several; the first in central-directory order is kept, which is
+        // deterministic for a given file. Layout names match exactly, as
+        // installers match them.
         if let Some(first) = name.split('/').next() {
             if first.ends_with(".dist-info") && dist_info_dir.as_deref() != Some(first) {
                 if dist_info_dir.is_none() {
@@ -298,32 +299,24 @@ fn read_text_member<R: Read + Seek>(
         .map_err(|e| MemberFailure::new(Stage::FormatExtract, format!("{name}: not UTF-8"), e))
 }
 
-/// Emit `whl.author` / `whl.maintainer` (+ `_email`), `whl.homepage` and
-/// the one-line `whl.summary` from an RFC 822 `METADATA` header block. Headers end at the first
-/// blank line (the long `Description` body follows); only the first
-/// occurrence of each field is taken, and `UNKNOWN` placeholders skipped.
+/// Emit `whl.authors` / `whl.maintainers`, `whl.homepage` and the one-line
+/// `whl.description` from a Core Metadata `METADATA` header block. Only the
+/// first occurrence of each field is taken, and `UNKNOWN` placeholders are
+/// skipped.
 fn emit_metadata_identity(meta: &str, values: &mut Values) {
-    let put_first = |values: &mut Values, key: ValueKey, val: &str| {
-        if !val.is_empty() && val != "UNKNOWN" && values.get_key(key).is_none() {
-            values.insert_key(key, JsonValue::String(val.to_string()));
-        }
-    };
-    for line in meta.lines() {
-        if line.is_empty() {
-            break;
-        }
-        let Some((field, value)) = line.split_once(':') else {
-            continue;
-        };
-        let value = value.trim();
-        match field.trim().to_ascii_lowercase().as_str() {
-            "author" => put_first(values, value_key!("whl.author"), value),
-            "author-email" => put_first(values, value_key!("whl.author_email"), value),
-            "maintainer" => put_first(values, value_key!("whl.maintainer"), value),
-            "maintainer-email" => put_first(values, value_key!("whl.maintainer_email"), value),
-            "home-page" => put_first(values, value_key!("whl.homepage"), value),
-            "summary" => put_first(values, value_key!("whl.summary"), value),
-            _ => {}
+    let headers = super::python_sdist::CoreMetadata::parse(meta);
+    super::python_sdist::emit_people(
+        &headers,
+        values,
+        value_key!("whl.authors"),
+        value_key!("whl.maintainers"),
+    );
+    for (field, key) in [
+        ("home-page", value_key!("whl.homepage")),
+        ("summary", value_key!("whl.description")),
+    ] {
+        if let Some(value) = headers.first(field).filter(|v| *v != "UNKNOWN") {
+            values.insert_key(key, JsonValue::String(value.to_string()));
         }
     }
 }

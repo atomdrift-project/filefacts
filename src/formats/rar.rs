@@ -23,21 +23,20 @@ use std::collections::BTreeSet;
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use super::archive_stats::{Agg, ArchiveStats, Dominance, Reading, Scope, Shape, member_value};
-use super::bounded::MAX_PATH_BYTES;
+use super::archive_stats::{Agg, ArchiveStats, Dominance, Reading, Scope, member_value};
+use super::bounded::{Limits, MAX_ARCHIVE_MEMBERS, MAX_PATH_BYTES};
 use crate::bytes::{Reader, sat_usize};
 use crate::error::Error;
 use crate::formats::common::hex_encode;
 use crate::metric;
 use crate::output::{
-    ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Metrics, Values,
+    ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, EntryType, Metrics, Values,
 };
 use crate::value_key;
 
 const MAX_SFX: usize = 1024 * 1024;
 const MAX_HEADER: usize = 2 * 1024 * 1024;
 const MAX_NAME: usize = 65_536;
-const MAX_MEMBERS: usize = 100_000;
 const MAX_BLOCKS: usize = 200_000;
 const FILETIME_UNIX_DIFF: u64 = 116_444_736_000_000_000;
 
@@ -157,7 +156,7 @@ struct Member {
     path: String,
     size_bytes: u64,
     packed: Option<u64>,
-    entry_type: &'static str,
+    entry_type: EntryType,
     mtime: Option<i64>,
     ctime: Option<i64>,
     atime: Option<i64>,
@@ -216,7 +215,9 @@ struct Archive {
     services: Vec<String>,
     streams: Vec<JsonValue>,
     extra_types: BTreeSet<u64>,
-    limits: Vec<JsonValue>,
+    limits: Limits,
+    /// The member list is full; later members are counted in a limit once.
+    members_capped: bool,
     end_present: bool,
     not_last_volume: bool,
     header_crc_mismatch: u64,
@@ -248,11 +249,8 @@ struct Archive {
     r4_encrypt_ver: Option<u8>,
 }
 
-fn limit(ar: &mut Archive, stage: &str, reason: impl Into<String>) {
-    ar.limits.push(serde_json::json!({
-        "stage": stage,
-        "reason": reason.into(),
-    }));
+fn limit(ar: &mut Archive, stage: &'static str, reason: impl Into<String>) {
+    ar.limits.push(stage, reason);
 }
 
 /// Step over a block's packed data. Data running past the end of the file is
@@ -553,7 +551,7 @@ fn apply_attrs(member: &mut Member, attrs: u32, unix: bool) {
         member.hidden = attrs & ATTR_HIDDEN != 0;
         member.system = attrs & ATTR_SYSTEM != 0;
         if attrs & ATTR_DIR != 0 {
-            member.entry_type = "directory";
+            member.entry_type = EntryType::Directory;
         }
     }
 }
@@ -590,9 +588,9 @@ fn finish_file(ar: &mut Archive, mut member: Member, extra: Extra, service: bool
             .is_some_and(|t| t.contains("symlink") || t == "hard-link")
         {
             member.entry_type = if extra.link_is_dir {
-                "directory"
+                EntryType::Directory
             } else {
-                "symlink"
+                EntryType::Symlink
             };
         }
     }
@@ -654,7 +652,7 @@ fn finish_file(ar: &mut Archive, mut member: Member, extra: Extra, service: bool
                     "encrypted": member.encrypted,
                 }));
                 member.path = path;
-                member.entry_type = "ntfs-stream";
+                member.entry_type = EntryType::NtfsStream;
                 push_member(ar, member);
             }
             _ => {}
@@ -670,12 +668,13 @@ fn finish_file(ar: &mut Archive, mut member: Member, extra: Extra, service: bool
 }
 
 fn push_member(ar: &mut Archive, member: Member) {
-    if ar.members.len() >= MAX_MEMBERS {
-        if ar.limits.is_empty() || ar.limits.last().is_some_and(|l| l["stage"] != "member-cap") {
+    if ar.members.len() >= MAX_ARCHIVE_MEMBERS {
+        if !ar.members_capped {
+            ar.members_capped = true;
             limit(
                 ar,
                 "member-cap",
-                format!("stopped at {MAX_MEMBERS} members"),
+                format!("stopped at {MAX_ARCHIVE_MEMBERS} members"),
             );
         }
         return;
@@ -815,9 +814,9 @@ fn walk_rar5(bytes: &[u8], start: usize, ar: &mut Archive) {
                     },
                     packed: data_size,
                     entry_type: if file_flags & LHFL_DIRECTORY != 0 {
-                        "directory"
+                        EntryType::Directory
                     } else {
-                        "regular"
+                        EntryType::Regular
                     },
                     mtime,
                     ctime: None,
@@ -1070,9 +1069,9 @@ fn walk_rar4(bytes: &[u8], start: usize, ar: &mut Archive) {
                     size_bytes: unp,
                     packed: Some(pack),
                     entry_type: if hflags & R4_LHD_WINDOWDIR == R4_LHD_WINDOWDIR {
-                        "directory"
+                        EntryType::Directory
                     } else {
-                        "regular"
+                        EntryType::Regular
                     },
                     mtime: ftime.and_then(dos_to_unix),
                     ctime: None,
@@ -1220,37 +1219,26 @@ fn split_member(m: Member) -> (ArchiveMember, JsonMap<String, JsonValue>) {
         insert_num(&mut rar_keys, "unpack_version", v);
     }
 
-    let ownership = (m.mode_octal.is_some()
-        || m.uid.is_some()
-        || m.gid.is_some()
-        || m.uname.is_some()
-        || m.gname.is_some())
-    .then_some(ArchiveOwnership {
-        mode_octal: m.mode_octal,
-        uid: m.uid,
-        gid: m.gid,
-        uname: m.uname,
-        gname: m.gname,
-    });
     let member = ArchiveMember {
-        path: m.path,
-        size_bytes: m.size_bytes,
-        entry_type: Some(m.entry_type.into()),
         mtime_unix: m.mtime,
         linkname: m.linkname,
         host_os: m.host_os,
         crc32: m.crc32,
         encrypted: m.encrypted,
-        compression: (m.packed.is_some() || m.method.is_some()).then_some(ArchiveCompression {
-            compressed_size: m.packed,
-            method: m.method,
-        }),
-        ownership,
+        compression: ArchiveCompression::new(m.packed, m.method),
+        ownership: ArchiveOwnership {
+            mode_octal: m.mode_octal,
+            uid: m.uid,
+            gid: m.gid,
+            uname: m.uname,
+            gname: m.gname,
+        },
         offsets: ArchiveOffsets {
             header: Some(m.header_off),
             data: m.data_off,
             central_header: None,
         },
+        ..ArchiveMember::new(m.path, m.size_bytes, m.entry_type)
     };
     (member, rar_keys)
 }
@@ -1401,12 +1389,7 @@ fn emit(
             ),
         );
     }
-    if !ar.limits.is_empty() {
-        values.insert_key(
-            value_key!("rar.limits"),
-            JsonValue::Array(ar.limits.clone()),
-        );
-    }
+    std::mem::take(&mut ar.limits).emit(values, value_key!("rar.limits"));
     if let (Some(min), Some(max)) = (ar.unpack_min, ar.unpack_max) {
         values.insert_key(
             value_key!("rar.unpack_version.min"),
@@ -1426,7 +1409,7 @@ fn emit(
         let mut reading = Reading::of(&member);
         reading.hidden = hidden;
         stats.observe(&member, &reading);
-        let mut obj = member_value(&member, Shape::FULL);
+        let mut obj = member_value(&member);
         obj.extend(rar_keys);
         members_json.push(JsonValue::Object(obj));
         archive_members.push(member);

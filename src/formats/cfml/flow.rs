@@ -1,6 +1,6 @@
 //! Policy-free relationships for the supported CFML tag subset.
-use super::{Tag, attributes, scan};
-use crate::{Arg, ArgShape, Flow, FlowKind, FlowValue, Symbol, Symbols};
+use super::{Dialect, Limit, Tag, attributes, scan};
+use crate::{Arg, ArgShape, Flow, FlowKind, FlowValue, Limitation, Symbol, Symbols};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
@@ -78,7 +78,7 @@ impl Builder<'_> {
     fn condition_calls(&mut self, range: Range<usize>) {
         let (calls, limited) = super::script::calls(self.bytes, range);
         if limited {
-            self.gap("condition-call-syntax-or-budget");
+            self.gap(Limitation::ConditionCallSyntaxOrBudget);
         }
         for call in calls {
             self.expr(call, 0);
@@ -180,7 +180,7 @@ impl Builder<'_> {
                         .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
             })
         {
-            self.gap("unsupported-indexed-member");
+            self.gap(Limitation::UnsupportedIndexedMember);
             return 0;
         }
         let mut parts = 0;
@@ -193,7 +193,7 @@ impl Builder<'_> {
             };
             parts += 1;
             if parts > MAX_EXPR_PARTS {
-                self.gap("expression-parts");
+                self.gap(Limitation::ExpressionParts);
                 return 0;
             }
             if byte == b'.' {
@@ -210,7 +210,7 @@ impl Builder<'_> {
                         .get(start)
                         .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
                 {
-                    self.gap("unsupported-indexed-member");
+                    self.gap(Limitation::UnsupportedIndexedMember);
                     return 0;
                 }
                 path.push('.');
@@ -221,7 +221,7 @@ impl Builder<'_> {
                 continue;
             }
             if byte != b'[' {
-                self.gap("unsupported-indexed-member");
+                self.gap(Limitation::UnsupportedIndexedMember);
                 return 0;
             }
             let start = at + 1;
@@ -233,7 +233,7 @@ impl Builder<'_> {
                 match byte {
                     b'\'' | b'"' => {
                         if !super::quoted(text, &mut at) {
-                            self.gap("malformed-expression");
+                            self.gap(Limitation::MalformedExpression);
                             return 0;
                         }
                         continue;
@@ -241,7 +241,7 @@ impl Builder<'_> {
                     b'[' => {
                         depth += 1;
                         if depth > MAX_EXPR_DEPTH {
-                            self.gap("expression-depth");
+                            self.gap(Limitation::ExpressionDepth);
                             return 0;
                         }
                     }
@@ -256,7 +256,7 @@ impl Builder<'_> {
                 at += 1;
             }
             if depth != 0 {
-                self.gap("malformed-expression");
+                self.gap(Limitation::MalformedExpression);
                 return 0;
             }
             let key = self.trim(start..at);
@@ -271,7 +271,7 @@ impl Builder<'_> {
                 path.push('.');
                 path.push_str(&String::from_utf8_lossy(inner).to_ascii_lowercase());
             } else if raw.is_empty() {
-                self.gap("malformed-expression");
+                self.gap(Limitation::MalformedExpression);
                 return 0;
             } else {
                 path.push_str("[*]");
@@ -301,14 +301,14 @@ impl Builder<'_> {
         while let Some(&byte) = text.get(at) {
             if matches!(byte, b'\'' | b'"') {
                 if !super::quoted(text, &mut at) {
-                    self.gap("malformed-expression");
+                    self.gap(Limitation::MalformedExpression);
                     return None;
                 }
                 continue;
             }
             if nesting == 0 && byte == delimiter {
                 if positions.len() == MAX_EXPR_PARTS {
-                    self.gap("expression-parts");
+                    self.gap(Limitation::ExpressionParts);
                     return None;
                 }
                 positions.push(at);
@@ -317,13 +317,13 @@ impl Builder<'_> {
                 b'(' => {
                     nesting += 1;
                     if nesting > MAX_EXPR_DEPTH {
-                        self.gap("expression-depth");
+                        self.gap(Limitation::ExpressionDepth);
                         return None;
                     }
                 }
                 b')' if nesting > 0 => nesting -= 1,
                 b')' => {
-                    self.gap("malformed-expression");
+                    self.gap(Limitation::MalformedExpression);
                     return None;
                 }
                 _ => {}
@@ -331,7 +331,7 @@ impl Builder<'_> {
             at += 1;
         }
         if nesting != 0 {
-            self.gap("malformed-expression");
+            self.gap(Limitation::MalformedExpression);
             None
         } else {
             Some(positions)
@@ -340,7 +340,7 @@ impl Builder<'_> {
 
     fn add(&mut self, kind: FlowKind, offset: usize, inputs: Vec<usize>) -> usize {
         if self.result.flow.values.len() >= MAX_VALUES {
-            self.result.flow.limitations.insert("node-budget".into());
+            self.gap(Limitation::NodeBudget);
             return 0;
         }
         let id = self.result.flow.values.len();
@@ -357,8 +357,18 @@ impl Builder<'_> {
         });
         id
     }
-    fn gap(&mut self, name: &str) {
-        self.result.flow.limitations.insert(name.into());
+    /// Record that the graph is incomplete, logging each reason once.
+    fn gap(&mut self, limitation: Limitation) {
+        if self.result.flow.limitations.insert(limitation) {
+            tracing::debug!(
+                target: "filefacts::cfml",
+                format = "cfml",
+                stage = "flow",
+                ?limitation,
+                values = self.result.flow.values.len(),
+                "CFML flow incomplete",
+            );
+        }
     }
     fn trim(&self, mut r: Range<usize>) -> Range<usize> {
         while r.start < r.end && self.bytes.get(r.start).is_some_and(u8::is_ascii_whitespace) {
@@ -396,7 +406,7 @@ impl Builder<'_> {
         }
         if let Some(total) = total {
             if total > super::MAX_BYTES - self.folded_bytes {
-                self.gap("constant-string-budget");
+                self.gap(Limitation::ConstantStringBudget);
                 return id;
             }
             let mut value = String::with_capacity(total);
@@ -451,7 +461,7 @@ impl Builder<'_> {
                 continue;
             }
             if inputs.len() >= MAX_EXPR_PARTS - 2 {
-                self.gap("expression-parts");
+                self.gap(Limitation::ExpressionParts);
                 return 0;
             }
             let begin = at + 1;
@@ -460,7 +470,7 @@ impl Builder<'_> {
             }
             at += 1;
             if !super::interpolation(text, &mut at) {
-                self.gap("malformed-interpolation");
+                self.gap(Limitation::MalformedInterpolation);
                 return 0;
             }
             inputs.push(self.expr(begin..at - 1, depth + 1));
@@ -477,7 +487,7 @@ impl Builder<'_> {
     }
     fn expr(&mut self, r: Range<usize>, depth: usize) -> usize {
         if depth > MAX_EXPR_DEPTH {
-            self.gap("expression-depth");
+            self.gap(Limitation::ExpressionDepth);
             return 0;
         }
         let r = self.trim(r);
@@ -497,7 +507,7 @@ impl Builder<'_> {
             let mut inputs = Vec::new();
             for end in parts.into_iter().chain(std::iter::once(r.end)) {
                 if self.trim(start..end).is_empty() {
-                    self.gap("malformed-expression");
+                    self.gap(Limitation::MalformedExpression);
                     return 0;
                 }
                 inputs.push(self.expr(start..end, depth + 1));
@@ -512,7 +522,7 @@ impl Builder<'_> {
                 .is_some_and(|text| super::quoted(text, &mut end))
                 || end != r.end
             {
-                self.gap("unsupported-expression");
+                self.gap(Limitation::UnsupportedExpression);
                 return 0;
             }
             return self.string(r.start + 1..r.end - 1, depth, Some(first));
@@ -558,7 +568,7 @@ impl Builder<'_> {
                 } else if let Some((_, method)) = prefix_text.rsplit_once('.') {
                     let method = method.trim();
                     if !valid_name(method) || method.contains('.') {
-                        self.gap("unsupported-call-target");
+                        self.gap(Limitation::UnsupportedCallTarget);
                         return 0;
                     }
                     let method = method.to_ascii_lowercase();
@@ -577,12 +587,12 @@ impl Builder<'_> {
                         .get(receiver)
                         .and_then(|v| v.target.clone())
                     else {
-                        self.gap("unsupported-call-target");
+                        self.gap(Limitation::UnsupportedCallTarget);
                         return 0;
                     };
                     (format!("{parent}.{method}"), Some(receiver))
                 } else {
-                    self.gap("unsupported-call-target");
+                    self.gap(Limitation::UnsupportedCallTarget);
                     return 0;
                 };
                 let args = open + 1..r.end - 1;
@@ -594,7 +604,7 @@ impl Builder<'_> {
                     let mut start = args.start;
                     for end in commas.into_iter().chain(std::iter::once(args.end)) {
                         if self.trim(start..end).is_empty() {
-                            self.gap("malformed-expression");
+                            self.gap(Limitation::MalformedExpression);
                             return 0;
                         }
                         inputs.push(self.expr(start..end, depth + 1));
@@ -629,7 +639,7 @@ impl Builder<'_> {
                         })
                         .collect();
                     if truncated {
-                        self.gap("symbol-literal-budget");
+                        self.gap(Limitation::SymbolLiteralBudget);
                     }
                     self.result.symbols.push(Symbol::Call {
                         target: Some(target.clone()),
@@ -645,7 +655,7 @@ impl Builder<'_> {
             }
         }
         if !first.is_ascii_alphabetic() && first != b'_' {
-            self.gap("unsupported-expression");
+            self.gap(Limitation::UnsupportedExpression);
             return 0;
         }
         if raw.contains(&b'[') {
@@ -655,7 +665,7 @@ impl Builder<'_> {
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.'))
         {
-            self.gap("unsupported-expression");
+            self.gap(Limitation::UnsupportedExpression);
             return 0;
         }
         let name = normalize_binding(&String::from_utf8_lossy(raw));
@@ -666,11 +676,11 @@ impl Builder<'_> {
             .get(..10)
             .is_some_and(|scope| scope.eq_ignore_ascii_case(b"variables."))
         {
-            self.gap("unresolved-explicit-variable");
+            self.gap(Limitation::UnresolvedExplicitVariable);
             return 0;
         }
         if name.split('.').any(str::is_empty) {
-            self.gap("unsupported-expression");
+            self.gap(Limitation::UnsupportedExpression);
             return 0;
         }
         if name.contains('.') {
@@ -691,7 +701,7 @@ impl Builder<'_> {
                     .find(|(short, _)| short == &name)
                     .map(|(_, path)| path.clone());
                 if let Some(path) = origin {
-                    self.gap("implicit-scope-runtime-dependent");
+                    self.gap(Limitation::ImplicitScopeRuntimeDependent);
                     // A known assignment to the explicit scope also shadows its
                     // original external value; an existence guard is not a write.
                     if let Some(id) = self.bindings.get(&path) {
@@ -706,7 +716,7 @@ impl Builder<'_> {
                     return id;
                 }
             }
-            self.gap("unresolved-scope-lookup");
+            self.gap(Limitation::UnresolvedScopeLookup);
             0
         }
     }
@@ -748,7 +758,7 @@ impl Builder<'_> {
                             .collect();
                         let (calls, limited) = super::script::calls(self.bytes, eq + 1..range.end);
                         if limited {
-                            self.gap("script-call-syntax-or-budget");
+                            self.gap(Limitation::ScriptCallSyntaxOrBudget);
                         }
                         for call in calls {
                             if !seen.contains(&(call.start as u64)) {
@@ -765,10 +775,10 @@ impl Builder<'_> {
         // Unsupported statements/control headers cannot preserve stale aliases.
         if !assignments || !matches!(calls.as_slice(), [only] if *only == range) {
             self.bindings.clear();
-            self.gap("script-statement-flow-unavailable");
+            self.gap(Limitation::ScriptStatementFlowUnavailable);
         }
         if limited {
-            self.gap("script-call-syntax-or-budget");
+            self.gap(Limitation::ScriptCallSyntaxOrBudget);
         }
         for call in calls {
             self.expr(call, 0);
@@ -786,7 +796,7 @@ impl Builder<'_> {
             .get(r.clone())
             .and_then(|body| body.iter().position(|b| *b == b'='))
         else {
-            self.gap("unsupported-assignment");
+            self.gap(Limitation::UnsupportedAssignment);
             self.bindings.clear();
             return;
         };
@@ -805,7 +815,7 @@ impl Builder<'_> {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.'))
         {
-            self.gap("unsupported-assignment-target");
+            self.gap(Limitation::UnsupportedAssignmentTarget);
             self.bindings.clear();
             return;
         }
@@ -869,7 +879,7 @@ impl Builder<'_> {
             offset: lhs.start as u64,
         });
         if !self.bindings.contains_key(&name) && self.bindings.len() == MAX_BINDINGS {
-            self.gap("binding-budget");
+            self.gap(Limitation::BindingBudget);
             self.bindings.clear();
             return;
         }
@@ -905,7 +915,7 @@ impl Builder<'_> {
             .is_some_and(|v| v.fields.contains_key("attributecollection"))
         {
             self.bindings.clear();
-            self.gap("dynamic-file-result-attributes");
+            self.gap(Limitation::DynamicFileResultAttributes);
             return;
         }
         let action = self
@@ -936,19 +946,19 @@ impl Builder<'_> {
                 && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
         }) else {
             self.bindings.clear();
-            self.gap("dynamic-file-result-binding");
+            self.gap(Limitation::DynamicFileResultBinding);
             return;
         };
         // Dynamic actions may overwrite this result name. Do not retain its
         // previous value, or claim a definite read-result value in that case.
         if action.is_none() {
             self.bindings.remove(&name);
-            self.gap("dynamic-file-result-action");
+            self.gap(Limitation::DynamicFileResultAction);
             return;
         }
         if !self.bindings.contains_key(&name) && self.bindings.len() == MAX_BINDINGS {
             self.bindings.clear();
-            self.gap("binding-budget");
+            self.gap(Limitation::BindingBudget);
             return;
         }
         let Some(offset) = self
@@ -997,20 +1007,17 @@ impl Builder<'_> {
             offset: Some(offset as u64),
         });
     }
-    fn call(&mut self, tag: &Tag, name: String) {
-        self.tag_call(tag, name, false, true);
-    }
     fn tag_call(&mut self, tag: &Tag, name: String, html: bool, interpolate: bool) -> usize {
-        let attrs = if html {
-            super::markup::attributes(self.bytes, tag, interpolate)
+        let dialect = if html {
+            Dialect::Html { interpolate }
         } else {
-            attributes(self.bytes, tag)
+            Dialect::Cfml
         };
-        let Some(attrs) = attrs else {
+        let Some(attrs) = attributes(self.bytes, tag, dialect) else {
             if name == "cffile" {
                 self.bindings.clear();
             }
-            self.gap("malformed-attributes");
+            self.gap(Limitation::MalformedAttributes);
             return 0;
         };
         let mut fields = BTreeMap::new();
@@ -1053,7 +1060,7 @@ impl Builder<'_> {
                     if text.contains('&')
                         && text.len().saturating_add(self.folded_bytes) > super::MAX_BYTES
                     {
-                        self.gap("markup-entity-budget");
+                        self.gap(Limitation::MarkupEntityBudget);
                         value = 0;
                     } else {
                         match super::markup::decode_references(text) {
@@ -1068,7 +1075,7 @@ impl Builder<'_> {
                                 value = id;
                             }
                             Err(()) => {
-                                self.gap("markup-named-entity-unavailable");
+                                self.gap(Limitation::MarkupNamedEntityUnavailable);
                                 value = 0;
                             }
                             Ok(None) => {}
@@ -1104,7 +1111,7 @@ impl Builder<'_> {
     }
     fn end_branch(&mut self, offset: usize) {
         let Some(mut branch) = self.branches.pop() else {
-            self.gap("unbalanced-branch");
+            self.gap(Limitation::UnbalancedBranch);
             self.bindings.clear();
             return;
         };
@@ -1118,7 +1125,7 @@ impl Builder<'_> {
             .flat_map(|b| b.keys().cloned())
             .collect();
         if keys.len() > MAX_BINDINGS {
-            self.gap("binding-budget");
+            self.gap(Limitation::BindingBudget);
             self.bindings.clear();
             return;
         }
@@ -1128,10 +1135,9 @@ impl Builder<'_> {
                 .iter()
                 .map(|b| b.get(&key).copied().unwrap_or(0))
                 .collect();
-            let id = if ids.len() == 1 {
-                *ids.first().unwrap()
-            } else {
-                self.add(FlowKind::Alternative, offset, ids.into_iter().collect())
+            let id = match ids.first() {
+                Some(&only) if ids.len() == 1 => only,
+                _ => self.add(FlowKind::Alternative, offset, ids.into_iter().collect()),
             };
             self.bindings.insert(key, id);
         }
@@ -1164,15 +1170,26 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
         },
     };
     b.add(FlowKind::Unknown, 0, Vec::new());
-    b.gap("source-local-may-flow-not-reachability");
+    // The scope of every graph rather than a gap in this one.
+    b.result
+        .flow
+        .limitations
+        .insert(Limitation::SourceLocalMayFlowNotReachability);
     if let Some(limit) = syntax.limitation {
-        b.gap(&format!("syntax-{limit:?}"));
+        b.gap(match limit {
+            Limit::Bytes => Limitation::SyntaxBytes,
+            Limit::Tags => Limitation::SyntaxTags,
+            Limit::CommentDepth => Limitation::SyntaxCommentDepth,
+            Limit::Truncated => Limitation::SyntaxTruncated,
+            Limit::Script => Limitation::SyntaxScript,
+            Limit::Encrypted => Limitation::SyntaxEncrypted,
+        });
     }
     if !syntax.scripts.is_empty() {
-        b.gap("script-block-local-flow-only");
+        b.gap(Limitation::ScriptBlockLocalFlowOnly);
     }
     if syntax.markup_limited {
-        b.gap("markup-syntax-unavailable");
+        b.gap(Limitation::MarkupSyntaxUnavailable);
     }
     let mut output_expressions = syntax.output_expressions.into_iter().peekable();
     let mut script_ranges = syntax.scripts.into_iter();
@@ -1183,11 +1200,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
     let mut output_scopes = Vec::new();
     let mut unknown_output_scopes = 0usize;
     for tag in syntax.tags {
-        while output_expressions
-            .peek()
-            .is_some_and(|r| r.start < tag.span.start)
-        {
-            let range = output_expressions.next().unwrap();
+        while let Some(range) = output_expressions.next_if(|r| r.start < tag.span.start) {
             if function_depth == 0 {
                 b.output(range, unknown_output_scopes == 0);
             }
@@ -1200,7 +1213,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
             None
         };
         if name == "cffunction" {
-            b.gap("function-body-unavailable");
+            b.gap(Limitation::FunctionBodyUnavailable);
             if tag.closing {
                 function_depth = function_depth.saturating_sub(1);
             } else {
@@ -1217,7 +1230,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
                 if let Some(range) = script_range {
                     let (events, limited) = super::script::statements(expression_bytes, range);
                     if limited {
-                        b.gap("script-statement-syntax-or-budget");
+                        b.gap(Limitation::ScriptStatementSyntaxOrBudget);
                     }
                     let implicit = b.implicit_scope;
                     b.implicit_scope = false;
@@ -1244,7 +1257,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
                 if !self_closed {
                     if http_parents.len() >= MAX_BRANCHES || opaque_http_depth > 0 {
                         opaque_http_depth = opaque_http_depth.saturating_add(1);
-                        b.gap("http-parent-depth");
+                        b.gap(Limitation::HttpParentDepth);
                     } else {
                         http_parents.push(((object != 0).then_some(object), Vec::new()));
                     }
@@ -1270,7 +1283,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
                         }
                     }
                 } else {
-                    b.gap("unbalanced-http-parent");
+                    b.gap(Limitation::UnbalancedHttpParent);
                 }
             }
             ("cfhttpparam", false) => {
@@ -1287,7 +1300,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
             ("cfset", false) => b.assignment(&tag),
             ("cfif", false) => {
                 if b.branches.len() == MAX_BRANCHES {
-                    b.gap("branch-depth");
+                    b.gap(Limitation::BranchDepth);
                     break;
                 }
                 b.condition_calls(tag.body.clone());
@@ -1301,11 +1314,11 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
             }
             ("cfelse" | "cfelseif", false) => {
                 let Some(branch) = b.branches.last_mut() else {
-                    b.gap("unbalanced-branch");
+                    b.gap(Limitation::UnbalancedBranch);
                     break;
                 };
                 if branch.has_else || branch.alternatives.len() >= 64 {
-                    b.gap("branch-alternatives");
+                    b.gap(Limitation::BranchAlternatives);
                     break;
                 }
                 branch.alternatives.push(std::mem::take(&mut b.bindings));
@@ -1326,12 +1339,14 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
                 "cfexecute" | "cffile" | "cfdirectory" | "cfinput" | "cftextarea" | "cfselect"
                 | "cfheader" | "cfcontent",
                 false,
-            ) => b.call(&tag, name),
+            ) => {
+                b.tag_call(&tag, name, false, true);
+            }
             ("input" | "textarea" | "select" | "button", false) => {
                 b.tag_call(&tag, format!("html:{name}"), true, output_depth > 0);
             }
             ("cfapplication", false) => {
-                if let Some(attrs) = attributes(bytes, &tag) {
+                if let Some(attrs) = attributes(bytes, &tag, Dialect::Cfml) {
                     for attr in attrs {
                         if bytes
                             .get(attr.name)
@@ -1346,18 +1361,18 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
                                 value.as_str(),
                                 "true" | "yes" | "1" | "false" | "no" | "0"
                             ) {
-                                b.gap("dynamic-scope-setting");
+                                b.gap(Limitation::DynamicScopeSetting);
                             }
                         }
                     }
                 } else {
                     b.implicit_scope = false;
-                    b.gap("malformed-attributes");
+                    b.gap(Limitation::MalformedAttributes);
                 }
             }
             ("cfoutput", false) => {
                 output_depth = output_depth.saturating_add(1);
-                let unknown = attributes(bytes, &tag).is_none_or(|attrs| {
+                let unknown = attributes(bytes, &tag, Dialect::Cfml).is_none_or(|attrs| {
                     attrs.iter().any(|a| {
                         [b"query".as_slice(), b"group", b"attributecollection"]
                             .iter()
@@ -1371,7 +1386,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
                 output_scopes.push(unknown);
                 if unknown {
                     unknown_output_scopes += 1;
-                    b.gap("query-output-scope-unavailable");
+                    b.gap(Limitation::QueryOutputScopeUnavailable);
                 }
             }
             ("cfoutput", true) => {
@@ -1388,7 +1403,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
             ) => {}
             // Do not let unknown control flow or calls preserve stale aliases.
             _ => {
-                b.gap("unsupported-tag");
+                b.gap(Limitation::UnsupportedTag);
                 b.bindings.clear();
             }
         }
@@ -1399,239 +1414,13 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
         }
     }
     if !http_parents.is_empty() || opaque_http_depth > 0 {
-        b.gap("unclosed-http-parent");
+        b.gap(Limitation::UnclosedHttpParent);
     }
     if !b.branches.is_empty() {
-        b.gap("unclosed-branch");
+        b.gap(Limitation::UnclosedBranch);
     }
     b.result
 }
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod response_tests {
-    use super::*;
-    fn read_outputs(source: &[u8]) -> Vec<usize> {
-        let p = parse(source);
-        p.flow
-            .values
-            .iter()
-            .filter(|v| v.target.as_deref() == Some("cfoutput:expression"))
-            .filter(|v| {
-                p.flow
-                    .origins(v.inputs[0], &[], 1000)
-                    .values
-                    .iter()
-                    .any(|origin| {
-                        p.flow.values[origin.value].target.as_deref() == Some("cffile:read-result")
-                    })
-            })
-            .map(|v| v.offset as usize)
-            .collect()
-    }
-    #[test]
-    fn original_read_response_expressions_have_exact_offsets() {
-        let source = include_bytes!("../../../testdata/cfml/encrypted_shell_decoded.cfm");
-        let offsets = read_outputs(source);
-        assert_eq!(offsets.len(), 2);
-        for offset in offsets {
-            assert_eq!(&source[offset..offset + 11], b"FileContent");
-        }
-        let p = parse(source);
-        for name in ["cfheader", "cfcontent"] {
-            let call = p
-                .flow
-                .values
-                .iter()
-                .find(|v| v.target.as_deref() == Some(name))
-                .unwrap();
-            assert!(source[call.offset as usize..].starts_with(format!("<{name}").as_bytes()));
-            assert_eq!(p.flow.values[call.inputs[0]].kind, FlowKind::Keyword);
-        }
-    }
-    #[test]
-    fn output_uses_current_value_through_aliases_and_response_tags() {
-        let source=br##"<cffile action="read" file="/fixed" variable="data"><cfset alias=data><cfheader name="Content-Disposition" value="inline"><cfcontent type="text/plain"><cfoutput>#alias#</cfoutput><cfset alias='fixed'><cfoutput>#alias#</cfoutput>"##;
-        let offsets = read_outputs(source);
-        assert_eq!(offsets.len(), 1);
-        assert_eq!(&source[offsets[0]..offsets[0] + 5], b"alias");
-        assert_eq!(read_outputs(b"<cfif flag><cffile action='read' file='/x' variable='data'><cfelse><cfset data='fixed'></cfif><cfoutput>#data#</cfoutput>").len(),1);
-        assert!(
-            read_outputs(
-                b"<cfoutput>#data#</cfoutput><cffile action='read' file='/x' variable='data'>"
-            )
-            .is_empty()
-        );
-    }
-    #[test]
-    fn comments_strings_function_bodies_and_escaped_hashes_are_not_sinks() {
-        for source in [
-            b"<!--- <cfoutput>#data#</cfoutput> --->".as_slice(),
-            b"<cfset doc='<cfoutput>#data#</cfoutput>'>",
-            b"<cfscript>cfoutput(data);</cfscript>",
-            b"<cffunction name='f'><cfoutput>#data#</cfoutput></cffunction>",
-            b"<cfoutput>##data##</cfoutput>",
-            b"#data#",
-        ] {
-            assert!(!parse(source).symbols.iter().any(|s|matches!(s,Symbol::Call{target,..} if target.as_deref()==Some("cfoutput:expression"))),"{:?}",source);
-        }
-    }
-    #[test]
-    fn response_call_attributes_are_parsed_and_comments_ignored() {
-        let p=parse(br##"<!--- <cfcontent file='/fake'> ---><cfheader name="Content-Disposition" value="inline;filename=#url.name#"><cfcontent file="#url.path#" type="application/octet-stream">"##);
-        let calls: Vec<_> = p
-            .flow
-            .values
-            .iter()
-            .filter(|v| matches!(v.target.as_deref(), Some("cfheader" | "cfcontent")))
-            .collect();
-        assert_eq!(calls.len(), 2);
-        let origins = p.flow.field_origins(calls[1].inputs[0], "file", &[], 1000);
-        assert!(
-            origins
-                .values
-                .iter()
-                .any(|v| p.flow.values[v.value].target.as_deref() == Some("url.path"))
-        );
-    }
-}
-
-#[cfg(test)]
-mod query_output_tests {
-    use super::*;
-    #[test]
-    fn query_columns_do_not_inherit_template_file_bindings() {
-        let source=b"<cffile action='read' file='/fixed' variable='data'><cfoutput query='rows'>#data#<cfoutput>#data#</cfoutput></cfoutput><cfoutput>#data#</cfoutput>";
-        let p = parse(source);
-        let outputs: Vec<_> = p
-            .flow
-            .values
-            .iter()
-            .filter(|v| v.target.as_deref() == Some("cfoutput:expression"))
-            .collect();
-        assert_eq!(outputs.len(), 3);
-        assert_eq!(outputs[0].inputs, vec![0]);
-        assert_eq!(outputs[1].inputs, vec![0]);
-        assert_ne!(outputs[2].inputs, vec![0]);
-        assert!(
-            p.flow
-                .limitations
-                .contains("query-output-scope-unavailable")
-        );
-    }
-}
-
-#[cfg(test)]
-#[test]
-fn response_result_identity_and_truncations() {
-    for source in [
-        b"<cfset data=cffile('read')><cfoutput>#data#</cfoutput>".as_slice(),
-        b"<cfset data=cffile('read')><cfcontent variable='#data#'>",
-    ] {
-        let p = parse(source);
-        assert!(
-            !p.flow
-                .values
-                .iter()
-                .any(|v| v.target.as_deref() == Some("cffile:read-result"))
-        );
-    }
-    let source=b"<cffile action='read' file='/x' variable='data'><cfoutput query='q'><cfoutput>#data#</cfoutput></cfoutput><cfheader name='Content-Disposition' value='inline'><cfcontent variable='#data#'>";
-    for end in 0..=source.len() {
-        let p = parse(&source[..end]);
-        for value in &p.flow.values {
-            assert!(value.offset <= end as u64);
-            assert!(value.inputs.iter().all(|&v| v < p.flow.values.len()));
-        }
-    }
-}
-
-#[cfg(test)]
-mod script_binding_tests {
-    use super::*;
-    fn outputs(source: &[u8]) -> Vec<BTreeSet<String>> {
-        let p = parse(source);
-        p.flow
-            .values
-            .iter()
-            .filter(|v| v.target.as_deref() == Some("writeoutput"))
-            .map(|v| {
-                p.flow
-                    .origins(v.inputs[0], &[], 1000)
-                    .values
-                    .iter()
-                    .filter_map(|o| p.flow.values[o.value].target.clone())
-                    .collect()
-            })
-            .collect()
-    }
-    #[test]
-    fn original_datasource_output_has_decrypt_origin() {
-        let source = include_bytes!("../../../testdata/cfml/datasource_shell.cfm");
-        let out = outputs(source);
-        assert_eq!(out.iter().filter(|s| s.contains("decrypt")).count(), 1);
-        let p = parse(source);
-        let binding = p
-            .symbols
-            .iter()
-            .find_map(|s| match s {
-                Symbol::Bind { target, offset, .. } if target == "decryptpassword" => {
-                    Some(*offset as usize)
-                }
-                _ => None,
-            })
-            .unwrap();
-        assert!(source[binding..].starts_with(b"decryptPassword="));
-    }
-    #[test]
-    fn assignment_aliases_reassignment_and_scope_boundaries() {
-        assert!(
-            outputs(
-                b"<cfscript>value=decrypt(secret,key); alias=value; writeOutput(alias);</cfscript>"
-            )[0]
-            .contains("decrypt")
-        );
-        assert!(!outputs(b"<cfscript>value=decrypt(secret,key); value='fixed'; writeOutput(value);</cfscript>")[0].contains("decrypt"));
-        for source in [
-            b"<cfscript>if(flag){value=decrypt(secret,key);} writeOutput(value);</cfscript>".as_slice(),
-            b"<cfscript>if(flag){value=decrypt(secret,key);}else{writeOutput(value);}</cfscript>",
-            b"<cfscript>function a(){value=decrypt(secret,key);} function b(){writeOutput(value);}</cfscript>",
-            b"<cfscript>value=decrypt(secret,key);</cfscript><cfscript>writeOutput(value);</cfscript>",
-            b"<cfscript>value=decrypt(secret,key); value+=suffix; writeOutput(value);</cfscript>",
-            b"<cfscript>if(flag) value=decrypt(secret,key); writeOutput(value);</cfscript>",
-        ] { assert!(outputs(source).iter().all(|s|!s.contains("decrypt")),"{:?}",source); }
-    }
-    #[test]
-    fn expression_objects_strings_comments_and_unknown_rhs_are_separate() {
-        for source in [
-            b"<cfscript>object={value=decrypt(secret,key)}; writeOutput(value);</cfscript>"
-                .as_slice(),
-            b"<cfscript>// value=decrypt(secret,key);\nwriteOutput(value);</cfscript>",
-            b"<cfscript>text=\"value=decrypt(secret,key);\";writeOutput(value);</cfscript>",
-        ] {
-            assert!(
-                outputs(source).iter().all(|s| !s.contains("decrypt")),
-                "{:?}",
-                source
-            );
-        }
-        let p = parse(b"<cfscript>data=[decrypt(secret,key)];</cfscript>");
-        assert!(
-            p.symbols.iter().any(
-                |s| matches!(s,Symbol::Call {target,..} if target.as_deref()==Some("decrypt"))
-            )
-        );
-        let p = parse(br#"<cfscript>text="<cfset pwd='x'>";</cfscript>"#);
-        let binds: Vec<_> = p
-            .symbols
-            .iter()
-            .filter_map(|s| match s {
-                Symbol::Bind { target, .. } => Some(target.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(binds, vec!["text"]);
-    }
-}

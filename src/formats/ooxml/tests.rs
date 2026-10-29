@@ -49,7 +49,7 @@ fn run_with_errors(bytes: &[u8]) -> (Values, Metrics, Errors) {
     let mut v = Values::new();
     let mut m = Metrics::new();
     let mut e = Errors::new();
-    if let Ok(mut zip) = crate::formats::zip::open_archive(bytes) {
+    if let Some(mut zip) = crate::formats::testutil::open_zip(bytes) {
         extract_from_archive(&mut zip, &mut v, &mut m, &mut e);
     }
     (v, m, e)
@@ -324,8 +324,8 @@ fn dde_field_and_custom_ui_onload_are_found() {
     assert_eq!(m.get("office.custom_ui_onload_count"), Some(1.0));
 }
 
-/// Thousands of parts used to be inflated and parsed twice each. The scan
-/// reads a bounded total; the parts past it are a recorded limit.
+/// Every `.xml` part is a scan candidate, so the scan reads a bounded total;
+/// the parts past it are a recorded limit.
 #[test]
 fn xml_part_scan_shares_one_byte_budget() {
     let ct = content_types_with_overrides(0);
@@ -768,6 +768,28 @@ fn relationship_parts_share_one_budget() {
 /// entry, found by key rather than by a scan of every entry.
 #[test]
 fn repeated_embedding_relationships_update_one_entry() {
+    // The index is what keeps this linear: every distinct part has exactly
+    // one key, pointing at its own entry, however often it is named.
+    let z = build_ooxml(&[("[Content_Types].xml", CONTENT_TYPES_DOCX.as_bytes())]);
+    let mut zip = crate::formats::testutil::open_zip(&z).unwrap();
+    let (mut seen, mut out) = (HashMap::new(), Vec::new());
+    for i in 0..20_000 {
+        let name = format!("word/embeddings/o{}.bin", i % 10_000);
+        push_embedded(
+            &mut zip,
+            &mut seen,
+            &mut out,
+            &name,
+            Some("oleObject"),
+            None,
+        );
+    }
+    assert_eq!(out.len(), 10_000);
+    assert_eq!(seen.len(), 10_000);
+    for (name, &at) in &seen {
+        assert_eq!(out[at]["filename"].as_str(), Some(name.as_str()));
+    }
+
     let mut rels = String::from("<Relationships>");
     for i in 0..20_000 {
         rels.push_str(&format!(
@@ -781,9 +803,7 @@ fn repeated_embedding_relationships_update_one_entry() {
         ("word/document.xml", b"<w:document/>"),
         ("word/_rels/document.xml.rels", rels.as_bytes()),
     ]);
-    let started = std::time::Instant::now();
     let (v, m) = run(&z);
-    assert!(started.elapsed() < std::time::Duration::from_secs(10));
     assert_eq!(m.get("office.embedded_count"), Some(10_000.0));
     let embedded = v.get("office.embedded").and_then(|x| x.as_array()).unwrap();
     assert_eq!(embedded[0]["filename"], "word/embeddings/o0.bin");

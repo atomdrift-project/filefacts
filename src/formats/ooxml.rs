@@ -27,12 +27,10 @@
 use crate::metric;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek};
-use std::sync::LazyLock;
-
-use aho_corasick::AhoCorasick;
 
 use serde_json::Value as JsonValue;
 
+use crate::formats::bounded::Limits;
 use crate::formats::common::{bytes_at, ends_with_ci, put_str};
 use crate::output::{DiagnosticKind, Errors, Metrics, Stage, ValueKey, Values};
 use crate::value_key;
@@ -63,10 +61,7 @@ const MAX_RELATIONSHIPS: usize = 65_536;
 
 /// Element names the DDE and customUI scans match on. A part naming none of
 /// them has nothing for either, and is not parsed.
-static SCAN_MARKERS: LazyLock<AhoCorasick> = LazyLock::new(|| {
-    AhoCorasick::new(["fldSimple", "instrText", "ddeLink", "customUI"])
-        .expect("fixed literal patterns build")
-});
+const SCAN_MARKERS: [&str; 4] = ["fldSimple", "instrText", "ddeLink", "customUI"];
 
 pub(super) fn extract_from_archive<R: Read + Seek>(
     zip: &mut ::zip::ZipArchive<R>,
@@ -74,7 +69,17 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     metrics: &mut Metrics,
     errors: &mut Errors,
 ) {
-    let names = zip_entry_names(zip);
+    // Part names straight from the central directory. Opening each entry
+    // would set up a decompressor per member just to read its name, and
+    // silently drop the names of entries it cannot open (an encrypted
+    // `vbaProject.bin`). Capped like the archive walk's member listing:
+    // every later pass is per name.
+    let names: Vec<String> = zip
+        .file_names()
+        .filter_map(Result::ok)
+        .take(super::bounded::MAX_ARCHIVE_MEMBERS)
+        .map(std::borrow::Cow::into_owned)
+        .collect();
     let Some(index) = build_ooxml_index(zip, &names, errors) else {
         return;
     };
@@ -142,7 +147,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         if declared_macro || name.ends_with("/vbaProject.bin") || name == "vbaProject.bin" {
             push_unique_string(&mut macros_seen, &mut macros, name);
         }
-        if is_control_content_type(content_type) {
+        if content_type.contains("vnd.ms-office.activeX") {
             push_control(&mut controls_seen, &mut controls, name, "active_x", None);
         }
         if name.contains("/embeddings/") {
@@ -296,47 +301,55 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         // Most parts carry neither: skip the parse unless an element either
         // scan looks for is named. Element names cannot be written as
         // character references, so a plain search finds every candidate.
-        if !SCAN_MARKERS.is_match(&text) {
+        if !SCAN_MARKERS.iter().any(|m| text.contains(m)) {
             continue;
         }
-        let Ok(doc) = roxmltree::Document::parse(&text) else {
-            continue;
+        let doc = match roxmltree::Document::parse(&text) {
+            Ok(doc) => doc,
+            Err(e) => {
+                tracing::debug!(
+                    target: "filefacts::ooxml",
+                    stage = "part-scan",
+                    part = name.as_str(),
+                    error = %e,
+                    "part names a DDE or customUI element but does not parse"
+                );
+                continue;
+            }
         };
         dde_links.extend(extract_dde_links(&doc, name));
         custom_ui_onload.extend(extract_custom_ui_onload(&doc, name));
     }
-    let mut limits = Vec::new();
+    let mut limits = Limits::default();
     if index.unread_rels > 0 {
-        limits.push(serde_json::json!({
-            "stage": "rels-budget",
-            "reason": format!(
+        limits.push(
+            "rels-budget",
+            format!(
                 "{} relationship part(s) not read in full: past the {MAX_RELS_TOTAL_BYTES}-byte \
                  or {MAX_RELATIONSHIPS}-relationship budget",
                 index.unread_rels
             ),
-        }));
+        );
     }
     if oversized_parts > 0 {
-        limits.push(serde_json::json!({
-            "stage": "part-scan",
-            "reason": format!(
+        limits.push(
+            "part-scan",
+            format!(
                 "{oversized_parts} XML part(s) over the {MAX_SCAN_PART_BYTES}-byte scan cap \
                  not searched for DDE links or customUI onLoad"
             ),
-        }));
+        );
     }
     if unscanned_parts > 0 {
-        limits.push(serde_json::json!({
-            "stage": "part-scan-budget",
-            "reason": format!(
+        limits.push(
+            "part-scan-budget",
+            format!(
                 "{unscanned_parts} XML part(s) past the {MAX_SCAN_TOTAL_BYTES}-byte scan budget \
                  not searched for DDE links or customUI onLoad"
             ),
-        }));
+        );
     }
-    if !limits.is_empty() {
-        values.insert_key(value_key!("office.limits"), JsonValue::Array(limits));
-    }
+    limits.emit(values, value_key!("office.limits"));
     if !dde_links.is_empty() {
         let count = dde_links.len() as f64;
         values.insert_key(value_key!("office.dde_links"), JsonValue::Array(dde_links));
@@ -402,18 +415,6 @@ impl OoxmlIndex {
         let ext = normalized.rsplit_once('.')?.1.to_ascii_lowercase();
         self.defaults.get(&ext).map(String::as_str)
     }
-}
-
-/// Part names straight from the central directory. Opening each entry would
-/// set up a decompressor per member just to read its name, and silently drop
-/// the names of entries it cannot open (an encrypted `vbaProject.bin`).
-/// Capped like the archive walk's member listing: every later pass is per
-/// name.
-fn zip_entry_names<R: Read + std::io::Seek>(zip: &::zip::ZipArchive<R>) -> Vec<String> {
-    zip.file_names()
-        .take(super::bounded::MAX_ARCHIVE_MEMBERS)
-        .map(str::to_string)
-        .collect()
 }
 
 /// Content types plus every relationship. `None` means no OOXML layer at all,
@@ -648,7 +649,16 @@ fn push_embedded<R: Read + std::io::Seek>(
     if let Ok(mut entry) = zip.by_name(filename) {
         obj.insert("size_bytes".into(), JsonValue::Number(entry.size().into()));
         let mut header = [0u8; 8];
-        let n = entry.read(&mut header).unwrap_or(0);
+        let n = entry.read(&mut header).unwrap_or_else(|e| {
+            tracing::debug!(
+                target: "filefacts::ooxml",
+                stage = "embedded",
+                part = filename,
+                error = %e,
+                "embedded part unreadable; kind not classified"
+            );
+            0
+        });
         if let Some(kind) = embedded_kind(header.get(..n).unwrap_or_default()) {
             obj.insert("kind".into(), JsonValue::String(kind.into()));
         }
@@ -662,10 +672,6 @@ fn is_macro_relationship(short_type: &str) -> bool {
 
 fn is_macro_content_type(content_type: &str) -> bool {
     content_type.contains("vbaProject") || content_type.contains("intlmacrosheet")
-}
-
-fn is_control_content_type(content_type: &str) -> bool {
-    content_type.contains("vnd.ms-office.activeX")
 }
 
 fn external_relationship_value(rel: &RelationshipInfo) -> JsonValue {
@@ -992,21 +998,14 @@ fn decode_xml_bytes(buf: &[u8]) -> Option<String> {
     if let Some(rest) = buf.strip_prefix(&[0xFE, 0xFF]) {
         return bytes_at::utf16_strict(rest, bytes_at::Endian::Big);
     }
-    if looks_utf16le(buf) {
+    // No BOM: an XML declaration spelled in UTF-16 still gives it away.
+    if buf.len() >= 8 && buf.starts_with(&[b'<', 0, b'?', 0]) {
         return bytes_at::utf16_strict(buf, bytes_at::Endian::Little);
     }
-    if looks_utf16be(buf) {
+    if buf.len() >= 8 && buf.starts_with(&[0, b'<', 0, b'?']) {
         return bytes_at::utf16_strict(buf, bytes_at::Endian::Big);
     }
     String::from_utf8(buf.to_vec()).ok()
-}
-
-fn looks_utf16le(buf: &[u8]) -> bool {
-    buf.len() >= 8 && buf.starts_with(&[b'<', 0, b'?', 0])
-}
-
-fn looks_utf16be(buf: &[u8]) -> bool {
-    buf.len() >= 8 && buf.starts_with(&[0, b'<', 0, b'?'])
 }
 
 #[cfg(test)]

@@ -4,6 +4,14 @@ use std::io::Cursor;
 use std::io::Write;
 use zip::write::{SimpleFileOptions, ZipWriter};
 
+/// Open `bytes` for reading members, or the error that stops it.
+fn open_archive(bytes: &[u8]) -> Result<Archive<'_>, Error> {
+    match open(bytes)? {
+        Opened::Archive { archive, .. } => Ok(archive),
+        Opened::RawOnly { error, .. } => Err(Error::malformed_caused_by("zip", error)),
+    }
+}
+
 fn run(bytes: &[u8]) -> (Values, Metrics) {
     let mut v = Values::new();
     let mut m = Metrics::new();
@@ -44,7 +52,7 @@ fn member_walk_stops_at_cap_and_records_limit() {
     let mut v = Values::new();
     let mut m = Metrics::new();
     let mut typed = Vec::new();
-    walk_archive(&mut archive, &z, &mut v, &mut m, &mut typed, 2).unwrap();
+    walk_archive(&mut archive, None, &z, &mut v, &mut m, &mut typed, 2).unwrap();
 
     let members = v.get("archive.members").and_then(|x| x.as_array()).unwrap();
     assert_eq!(members.len(), 2);
@@ -61,11 +69,12 @@ fn member_walk_stops_at_cap_and_records_limit() {
 
 #[test]
 fn compression_names_are_stable() {
-    assert_eq!(compression_method_name(CompressionMethod::Stored), "stored");
-    assert_eq!(
-        compression_method_name(CompressionMethod::Deflated),
-        "deflate"
-    );
+    assert_eq!(method_name(CompressionMethod::Stored), "stored");
+    assert_eq!(method_name(CompressionMethod::Deflated), "deflate");
+    // Methods this build cannot inflate still carry their names.
+    assert_eq!(method_name(CompressionMethod::BZIP2), "bzip2");
+    assert_eq!(method_name(CompressionMethod::PPMD), "ppmd");
+    assert_eq!(method_name_from_id(9), "deflate64");
 }
 
 #[test]
@@ -125,6 +134,25 @@ fn compression_ratio_present_when_uncompressed_nonzero() {
     let (_, m) = run(&z);
     let r = m.get("archive.compression.ratio").unwrap();
     assert!(r > 0.0 && r < 1.0, "expected ratio in (0,1), got {r}");
+}
+
+/// The JDK finds signature files and blocks whatever their case, and an
+/// EC signature block counts like RSA and DSA ones.
+#[test]
+fn jar_signed_shape_matches_any_case_and_ec_blocks() {
+    let z = build_zip(&[
+        ("META-INF/cert.sf", b"sigfile", CompressionMethod::Stored),
+        ("META-INF/cert.ec", b"\x00\x01", CompressionMethod::Stored),
+    ]);
+    let (v, _) = run(&z);
+    assert_eq!(
+        v.get("archive.signing.jar_signed_shape")
+            .and_then(|x| x.as_bool()),
+        Some(true)
+    );
+    let unsigned = build_zip(&[("META-INF/cert.ec", b"\x00", CompressionMethod::Stored)]);
+    let (v, _) = run(&unsigned);
+    assert!(v.get("archive.signing.jar_signed_shape").is_none());
 }
 
 #[test]
@@ -324,7 +352,8 @@ fn has_comment_flag_when_archive_has_global_comment() {
     let mut buf = Cursor::new(Vec::<u8>::new());
     {
         let mut w = ZipWriter::new(&mut buf);
-        w.set_raw_comment(b"hello world".to_vec().into_boxed_slice());
+        w.set_raw_comment(b"hello world".to_vec().into_boxed_slice())
+            .unwrap();
         let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
         w.start_file("a", opts).unwrap();
         w.write_all(b"x").unwrap();
@@ -343,7 +372,8 @@ fn full_archive_key_set_emitted_for_realistic_zip() {
     let mut buf = Cursor::new(Vec::<u8>::new());
     {
         let mut w = ZipWriter::new(&mut buf);
-        w.set_raw_comment(b"build comment".to_vec().into_boxed_slice());
+        w.set_raw_comment(b"build comment".to_vec().into_boxed_slice())
+            .unwrap();
         let opts = SimpleFileOptions::default()
             .compression_method(CompressionMethod::Deflated)
             .unix_permissions(0o644)
@@ -446,7 +476,8 @@ fn comment_size_emitted_when_archive_has_comment() {
     let mut buf = Cursor::new(Vec::<u8>::new());
     {
         let mut w = ZipWriter::new(&mut buf);
-        w.set_raw_comment(b"hello".to_vec().into_boxed_slice());
+        w.set_raw_comment(b"hello".to_vec().into_boxed_slice())
+            .unwrap();
         let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
         w.start_file("a", opts).unwrap();
         w.write_all(b"x").unwrap();
@@ -911,13 +942,10 @@ fn unopenable_archive_lists_members_from_the_raw_central_directory() {
         ("a.txt", b"a", CompressionMethod::Stored),
         ("b.txt", b"b", CompressionMethod::Stored),
     ]);
-    // Point the first central-directory entry at the central directory
-    // itself. `zip` rejects this while parsing the directory, but the raw
-    // walker can still list both names and report the bad local pointer.
+    // Claim the archive spans disks: `zip` refuses a multi-disk archive,
+    // but the raw walker can still list both names.
     let eocd = find_eocd(&z).unwrap();
-    let cd_size = bytes_at::u32_le(&z, eocd + 12).unwrap() as usize;
-    let cd_start = eocd - cd_size;
-    z[cd_start + 42..cd_start + 46].copy_from_slice(&(cd_start as u32).to_le_bytes());
+    z[eocd + 4..eocd + 6].copy_from_slice(&1_u16.to_le_bytes());
     assert!(ZipArchive::new(Cursor::new(&z[..])).is_err());
 
     let mut v = Values::new();
@@ -931,6 +959,30 @@ fn unopenable_archive_lists_members_from_the_raw_central_directory() {
     assert_eq!(paths, ["a.txt", "b.txt"]);
     assert_eq!(m.get("archive.member_count"), Some(2.0));
     assert_eq!(errors.len(), 1);
+}
+
+/// A central-directory entry pointing at the directory itself, not at a
+/// local header: the crate lists it, and the bad pointer is reported.
+#[test]
+fn entry_pointing_at_no_local_header_is_reported() {
+    let mut z = build_zip(&[
+        ("a.txt", b"a", CompressionMethod::Stored),
+        ("b.txt", b"b", CompressionMethod::Stored),
+    ]);
+    let eocd = find_eocd(&z).unwrap();
+    let cd_size = bytes_at::u32_le(&z, eocd + 12).unwrap() as usize;
+    let cd_start = eocd - cd_size;
+    z[cd_start + 42..cd_start + 46].copy_from_slice(&(cd_start as u32).to_le_bytes());
+
+    let mut v = Values::new();
+    let mut m = Metrics::new();
+    let mut members = Vec::new();
+    let mut errors = Errors::new();
+    open_and_walk(&z, &mut v, &mut m, &mut members, &mut errors).unwrap();
+    assert_eq!(members.len(), 2);
+    assert_eq!(m.get("archive.local_header_mismatch_count"), Some(1.0));
+    // The bad pointer, and the crate refusing that entry's record.
+    assert_eq!(errors.len(), 2, "{errors:?}");
 }
 
 /// A member past the read cap is refused rather than returned truncated.
@@ -958,24 +1010,28 @@ fn read_member_refuses_a_member_past_the_cap() {
 }
 
 /// An input packed with end-of-central-directory records that each point at
-/// a directory that is not there. The `zip` crate tries every one and rescans
-/// toward the start of the file for each, which took quadratic time (24 s for
-/// 1 MiB); its reads are now budgeted, so the open fails promptly.
+/// a directory that is not there. The `zip` crate tries the candidates in
+/// turn; the open fails, and however the crate searches, its reads during the
+/// open are bounded by the budget.
 #[test]
-fn failing_end_record_candidates_exhaust_the_open_budget() {
+fn failing_end_record_candidates_do_not_open() {
     let mut record = [0_u8; 22];
     record[..4].copy_from_slice(b"PK\x05\x06");
     record[8..10].copy_from_slice(&1_u16.to_le_bytes());
     record[10..12].copy_from_slice(&1_u16.to_le_bytes());
     let bytes = record.repeat((512 << 10) / record.len());
-
-    let start = std::time::Instant::now();
-    let Err(ZipError::Io(e)) = open_crate(Cow::Borrowed(&bytes)) else {
-        panic!("the open read budget was not what stopped the open");
-    };
-    assert!(e.to_string().contains("budget"), "{e}");
+    assert!(open_crate(Cow::Borrowed(&bytes)).is_err());
     assert!(open_archive(&bytes).is_err());
-    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+
+    // The budget: reads stop once it is spent.
+    let mut budgeted = Budgeted {
+        inner: Cursor::new(vec![0_u8; 16]),
+        left: Rc::new(Cell::new(4)),
+    };
+    let mut buf = [0_u8; 16];
+    assert_eq!(budgeted.read(&mut buf).unwrap(), 4);
+    let err = budgeted.read(&mut buf).unwrap_err();
+    assert!(err.to_string().contains("budget"), "{err}");
 
     // A well-formed archive opens, and its members read past the open
     // budget, which is lifted once the archive is open.

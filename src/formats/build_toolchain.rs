@@ -18,7 +18,7 @@
 //! sections) the *first* recognizable token wins, since that's the
 //! one a linker user would point at when asked "what built this?".
 
-use crate::formats::common::{put_str, read_uleb128};
+use crate::formats::common::put_str;
 use crate::output::Values;
 use crate::value_key;
 
@@ -51,33 +51,30 @@ impl Family {
 
 /// Derive `build.toolchain.*` from a finished ELF parse. Checks for
 /// a Go build-id section first (Go binaries usually ship without a
-/// `.comment` entry); the version comes from the `.go.buildinfo`
-/// blob when present. Otherwise walks `elf.comment[]` for the first
+/// `.comment` entry), taking the version from the `elf.go` build info the
+/// Go decoder already emitted. Otherwise walks `elf.comment[]` for the first
 /// recognized GCC / clang / rustc banner.
 pub(super) fn from_elf(values: &mut Values, sections: &[crate::output::Section], bytes: &[u8]) {
     if sections.iter().any(|s| s.name == ".note.go.buildid") {
-        let version = sections
-            .iter()
-            .find(|s| s.name == ".go.buildinfo")
-            .and_then(|s| read_go_buildinfo(bytes, s.file_offset, s.file_size))
+        let version = values
+            .get_key(value_key!("elf.go"))
+            .and_then(|go| go.get("version"))
+            .and_then(serde_json::Value::as_str)
+            .map(|v| v.trim_start_matches("go").to_string())
             .unwrap_or_default();
         emit(values, Family::Go, version);
         return;
     }
-    if let Some(entries) = values
+    let banner = values
         .get_key(value_key!("elf.comment"))
         .and_then(serde_json::Value::as_array)
-        .cloned()
-    {
-        for entry in entries {
-            let Some(text) = entry.as_str() else {
-                continue;
-            };
-            if let Some((family, version)) = recognize_comment(text) {
-                emit(values, family, version);
-                return;
-            }
-        }
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .find_map(recognize_comment);
+    if let Some((family, version)) = banner {
+        emit(values, family, version);
+        return;
     }
     // Stripped-binary fallback: Rust embeds its compiler version
     // string in `rodata` as `rustc X.Y.Z` followed by the build
@@ -139,47 +136,6 @@ fn scan_rust_rodata(sections: &[crate::output::Section], bytes: &[u8]) -> Option
         }
     }
     None
-}
-
-/// Parse `.go.buildinfo` and return the Go runtime version string
-/// (`"1.21.5"` style, with the `go` prefix stripped). Returns `None`
-/// on malformed input or the older pointer-style layout we don't
-/// follow.
-///
-/// Format reference (Go 1.18+ inline layout):
-/// - bytes 0..14: magic `\xff Go buildinf:`
-/// - byte 14: ptr_size
-/// - byte 15: flag (`0x2` = inline-string format)
-/// - bytes 16..32: filler padding (the header is 32 bytes total)
-/// - byte 32+: `varint` length then `len` bytes of `runtime.Version()`,
-///   then `varint` length then `len` bytes of `runtime/debug.BuildInfo`
-///   text (which we ignore for `build.toolchain.version`).
-fn read_go_buildinfo(bytes: &[u8], offset: u64, size: u64) -> Option<String> {
-    const MAGIC: &[u8] = b"\xff Go buildinf:";
-    let start = usize::try_from(offset).ok()?;
-    let len = usize::try_from(size).ok()?;
-    let end = start.checked_add(len)?;
-    if len < 32 {
-        return None;
-    }
-    let buf = bytes.get(start..end)?;
-    if !buf.starts_with(MAGIC) {
-        return None;
-    }
-    let flag = *buf.get(15)?;
-    if flag & 0x2 == 0 {
-        // Pointer format — would need to resolve a virtual address
-        // to a file offset via the segment table. Modern toolchains
-        // (Go 1.18+) write the inline format; skip the legacy
-        // pointer layout rather than reach back through goblin here.
-        return None;
-    }
-    // Inline data begins at byte 32 (the 32-byte header is fixed).
-    let mut version_start = 32;
-    let version_len = usize::try_from(read_uleb128(buf, &mut version_start)?).ok()?;
-    let version_end = version_start.checked_add(version_len)?;
-    let version = std::str::from_utf8(buf.get(version_start..version_end)?).ok()?;
-    Some(version.trim_start_matches("go").to_string())
 }
 
 /// Match a single `.comment` token against the known toolchain
@@ -300,84 +256,4 @@ fn emit(values: &mut Values, family: Family, version: String) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn recognizes_ubuntu_gcc_banner() {
-        let (fam, ver) = recognize_comment("GCC: (Ubuntu 14.2.0-1ubuntu1) 14.2.0").unwrap();
-        assert!(matches!(fam, Family::Gcc));
-        assert_eq!(ver, "14.2.0");
-    }
-
-    #[test]
-    fn recognizes_alpine_clang_banner() {
-        let (fam, ver) = recognize_comment("Alpine clang version 19.1.4").unwrap();
-        assert!(matches!(fam, Family::Clang));
-        assert_eq!(ver, "19.1.4");
-    }
-
-    #[test]
-    fn recognizes_apple_clang_banner() {
-        let (fam, ver) =
-            recognize_comment("Apple clang version 15.0.0 (clang-1500.0.40.1)").unwrap();
-        assert!(matches!(fam, Family::AppleClang));
-        assert_eq!(ver, "15.0.0");
-    }
-
-    #[test]
-    fn recognizes_rustc_banner() {
-        let (fam, ver) = recognize_comment("rustc version 1.78.0 (9b00956e5 2024-04-29)").unwrap();
-        assert!(matches!(fam, Family::Rustc));
-        assert_eq!(ver, "1.78.0");
-    }
-
-    /// Every `.rodata*` header may cover the same bytes; the scan stops once
-    /// the sections it read add up to the file, instead of re-reading them
-    /// per header. Disjoint sections are all read.
-    #[test]
-    fn rodata_scan_is_charged_against_the_file_length() {
-        let section = |off: u64, size: u64| crate::output::Section {
-            name: ".rodata".into(),
-            vaddr: 0,
-            vsize: size,
-            file_offset: off,
-            file_size: size,
-            flags: Vec::new(),
-            flags_raw: None,
-            entropy: None,
-        };
-        let mut bytes = vec![b'x'; 1000];
-        bytes[600..613].copy_from_slice(b"rustc 1.80.0 ");
-        let mut sections: Vec<_> = (0..5000).map(|_| section(0, 500)).collect();
-        sections.push(section(500, 500));
-        assert_eq!(scan_rust_rodata(&sections, &bytes), None);
-        let disjoint = [section(0, 500), section(500, 500)];
-        assert_eq!(
-            scan_rust_rodata(&disjoint, &bytes).as_deref(),
-            Some("1.80.0")
-        );
-    }
-
-    #[test]
-    fn ignores_unknown_banner() {
-        assert!(recognize_comment("some other text").is_none());
-    }
-
-    #[test]
-    fn go_buildinfo_inline_version_is_read() {
-        let mut blob = b"\xff Go buildinf:".to_vec();
-        blob.extend_from_slice(&[8, 0x2]); // ptr_size, inline-string flag
-        blob.resize(32, 0);
-        blob.push(8); // uvarint length
-        blob.extend_from_slice(b"go1.21.5");
-        let len = blob.len() as u64;
-        assert_eq!(read_go_buildinfo(&blob, 0, len).as_deref(), Some("1.21.5"));
-        // A length running past the section, or a truncated uvarint, is no
-        // version.
-        assert_eq!(read_go_buildinfo(&blob, 0, len - 1), None);
-        blob.truncate(32);
-        blob.push(0x88);
-        assert_eq!(read_go_buildinfo(&blob, 0, 33), None);
-    }
-}
+mod tests;

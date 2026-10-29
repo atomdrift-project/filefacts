@@ -1,3 +1,5 @@
+use super::notes::{gnu_property_name, pauth_platform_name};
+use super::symbols::static_function_fallback;
 use super::*;
 use crate::output::{Metrics, Strings, Values};
 
@@ -184,6 +186,11 @@ fn synthetic_elf_builder_parses_and_names_sections() {
     );
 }
 
+fn has_go_pclntab(elf: &Elf<'_>, bytes: &[u8]) -> bool {
+    read_section(elf, bytes, ".gopclntab")
+        .is_some_and(crate::formats::go_buildinfo::has_pclntab_magic)
+}
+
 #[test]
 fn go_pclntab_magic_is_detected() {
     // Go 1.18 pclntab magic (0xfffffff0, little-endian) + a plausible tail.
@@ -323,9 +330,8 @@ fn truncated_elf_header_doesnt_crash() {
     let (_, _, _) = run(&bytes);
 }
 
-/// Read a real binary fixture from the cleave repo. Lets tests
-/// exercise the full extractor against a non-trivial ELF without
-/// shipping our own corpus.
+/// Read a real binary fixture from `tests/fixtures`, to exercise the full
+/// extractor against a non-trivial ELF.
 fn read_fixture(name: &str) -> Vec<u8> {
     let path = format!("tests/fixtures/{name}");
     std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"))
@@ -350,9 +356,8 @@ fn strip_section_headers(bytes: &mut [u8]) {
 
 /// Section-header-stripped binaries must still anchor every import at its
 /// name's file offset. The `.dynstr` section is gone, but `DT_STRTAB` in the
-/// dynamic segment locates the same string table — without the fallback,
-/// downstream consumers see offset-less import matches and (in cleave) log
-/// them as "content match has no file offset".
+/// dynamic segment locates the same string table, so no import match is
+/// left without a file offset.
 #[test]
 fn stripped_section_headers_still_anchor_import_names() {
     use crate::output::{Symbol, SymbolKind};
@@ -409,12 +414,11 @@ fn end_to_end_parses_real_elf_fixture() {
     assert!(m.get("binary.is_stripped").is_some());
 }
 
-/// Pin every cleave-consumed emission added to support the
-/// ctx-only ELF analyzer migration. If filefacts stops emitting any
-/// of these, the analyzer's typed-metric path silently regresses
-/// to defaults — catch the loss here.
+/// Pin the header, segment and dependency facts consumers read as typed
+/// metrics: if one stops being emitted, a consumer silently falls back to a
+/// default.
 #[test]
-fn pinned_elf_metrics_for_cleave_consumers() {
+fn pinned_elf_metrics() {
     let bytes = read_fixture("test.elf");
     let (v, _, m) = run(&bytes);
     // Header / section / segment counts.
@@ -431,15 +435,13 @@ fn pinned_elf_metrics_for_cleave_consumers() {
     // dependency-loaded metrics are present.
     assert!(v.get("elf.machine").is_some());
     assert!(v.get("elf.type").is_some());
-    // segments[] entries now carry `flags_hex` for cleave's
-    // segment_entries carrier.
+    // segments[] entries carry `flags_hex` beside the `perms` string.
     let segs = v.get("elf.segments").and_then(|j| j.as_array()).unwrap();
     let first = segs.first().unwrap().as_object().unwrap();
     assert!(first.contains_key("flags_hex"));
     assert!(first.contains_key("perms"));
     assert!(first.contains_key("type"));
-    // Completeness: every program-header field is carried, including
-    // the previously-missing paddr/align.
+    // Completeness: every program-header field is carried.
     for key in [
         "vaddr",
         "paddr",
@@ -879,8 +881,8 @@ fn range_cover_matches_a_pairwise_scan() {
 }
 
 /// Every `DT_NEEDED` entry may name the same NUL-less run: 2048 entries over
-/// a 64 KiB run was 128 MiB of library names, and twice that again in
-/// `dyn_hash`. The copies now stop at twice the file length.
+/// a 64 KiB run would be 128 MiB of library names, and twice that again in
+/// `dyn_hash`. The copies stop at twice the file length.
 #[test]
 fn shared_long_library_name_is_not_copied_per_entry() {
     const RUN: usize = 64 * 1024;
@@ -917,11 +919,11 @@ fn shared_long_library_name_is_not_copied_per_entry() {
     );
 }
 
-/// `.symtab` entries may all name one NUL-less run: symhash lowercased a copy
-/// per entry (4096 × 64 KiB = 256 MiB). An overrun now yields no hash, while
-/// an ordinary table still hashes.
+/// `.symtab` entries may all name one NUL-less run, and lowercasing a copy
+/// per entry would be 4096 × 64 KiB = 256 MiB. An overrun yields no hash,
+/// while an ordinary table still hashes.
 #[test]
-fn shared_long_symbol_name_does_not_amplify_symhash() {
+fn shared_long_symbol_name_does_not_amplify_symtab_import_hash() {
     fn symtab_elf(strtab: &[u8], count: usize) -> Vec<u8> {
         let mut payload = strtab.to_vec();
         payload.resize(payload.len().next_multiple_of(8), 0);
@@ -959,15 +961,15 @@ fn shared_long_symbol_name_does_not_amplify_symhash() {
     run_strtab.extend(std::iter::repeat_n(b'A', 64 * 1024));
     let bytes = symtab_elf(&run_strtab, 4096);
     assert_eq!(Elf::parse(&bytes).unwrap().syms.len(), 4096);
-    assert!(run(&bytes).0.get("elf.hashes.symhash").is_none());
+    assert!(run(&bytes).0.get("elf.hashes.symtab_import_hash").is_none());
 
     let bytes = symtab_elf(b"\0printf\0", 2);
-    assert!(run(&bytes).0.get("elf.hashes.symhash").is_some());
+    assert!(run(&bytes).0.get("elf.hashes.symtab_import_hash").is_some());
 }
 
 /// Version-need walks follow file-controlled links with a 16-bit aux count
-/// per need, so 1024 needs sharing one 1024-entry aux chain was a million
-/// `lib@ver` strings from 32 KiB. The walk now stops at the record cap.
+/// per need, so 1024 needs sharing one 1024-entry aux chain would be a
+/// million `lib@ver` strings from 32 KiB. The walk stops at the record cap.
 #[test]
 fn shared_verneed_aux_chain_is_walked_once_per_cap() {
     const NEEDS: u32 = 1024;
@@ -1012,8 +1014,8 @@ fn shared_verneed_aux_chain_is_walked_once_per_cap() {
 }
 
 /// Note program headers may all cover one run of notes: 2000 `PT_NOTE`
-/// headers over 4096 empty notes was 8 million drained notes. The walk is now
-/// charged against the file length.
+/// headers over 4096 empty notes would be 8 million drained notes. The walk
+/// is charged against the file length.
 #[test]
 fn overlapping_note_segments_are_walked_within_the_file_budget() {
     let mut payload = Vec::new();
@@ -1032,8 +1034,8 @@ fn overlapping_note_segments_are_walked_within_the_file_budget() {
 }
 
 /// Section names are cut before they are hashed or copied: every header may
-/// name a distinct suffix of one NUL-less run, which `name_seen` used to copy
-/// whole (1000 headers over 64 KiB is 64 MiB of keys).
+/// name a distinct suffix of one NUL-less run, which copied whole would be
+/// 64 MiB of keys for 1000 headers over 64 KiB.
 #[test]
 fn distinct_long_section_names_are_cut() {
     let mut payload = vec![b'.'];
@@ -1193,7 +1195,7 @@ fn static_function_fallback_leaves_dynamic_exports_as_exports() {
     let bytes = read_fixture("elf-syscall-wrapper-plt.elf");
     let elf = Elf::parse(&bytes).unwrap();
     let mut out = crate::Symbols::default();
-    symbols(
+    symbols::emit(
         &elf,
         bytes.len(),
         &mut Values::default(),
@@ -1281,4 +1283,148 @@ fn static_function_fallback_keeps_every_binding_of_defined_functions() {
         .collect();
     names.sort_unstable();
     assert_eq!(names, ["global_fn", "local_fn", "weak_fn"]);
+}
+
+/// Overlap is any pair of ranges intersecting, not just sorted neighbours:
+/// `[0, 100)` holds `[30, 40)` though `[10, 20)` sorts between them.
+#[test]
+fn overlapping_matches_a_pairwise_scan() {
+    let pairwise = |ranges: &[(u64, u64)]| -> BTreeSet<usize> {
+        let mut out = BTreeSet::new();
+        for (i, &(a_start, a_end)) in ranges.iter().enumerate() {
+            for (j, &(b_start, b_end)) in ranges.iter().enumerate() {
+                let (first, second) = if (a_start, a_end, i) <= (b_start, b_end, j) {
+                    ((a_start, a_end), b_start)
+                } else {
+                    ((b_start, b_end), a_start)
+                };
+                if i != j && first.1 > second && second >= first.0 {
+                    out.insert(i);
+                }
+            }
+        }
+        out
+    };
+    let indexed = |ranges: &[(u64, u64)]| {
+        ranges
+            .iter()
+            .enumerate()
+            .map(|(i, &(s, e))| (s, e, i))
+            .collect()
+    };
+    for ranges in [
+        &[(0, 100), (10, 20), (30, 40)][..],
+        &[(0, 10), (10, 20), (20, 30)],
+        &[(30, 40), (0, 100), (200, 300), (250, 260), (10, 20)],
+        &[(5, 5), (0, 10), (10, 10)],
+        &[],
+    ] {
+        assert_eq!(overlapping(indexed(ranges)), pairwise(ranges), "{ranges:?}");
+    }
+    assert_eq!(
+        overlapping(indexed(&[(0, 100), (10, 20), (30, 40)])),
+        BTreeSet::from([0, 1, 2])
+    );
+}
+
+/// A section nested in another past an intervening one is counted; the
+/// sorted-neighbour comparison saw only the first pair.
+#[test]
+fn nested_section_past_a_neighbour_counts_as_overlap() {
+    let sec = |name, off, size| Sec {
+        name,
+        ty: 1,
+        off,
+        size,
+        ..Sec::default()
+    };
+    let bytes = elf_over_payload(
+        &[0u8; 100],
+        &[],
+        &[
+            sec(".a", PAYLOAD, 100),
+            sec(".b", PAYLOAD + 10, 10),
+            sec(".c", PAYLOAD + 30, 10),
+        ],
+    );
+    assert_eq!(run(&bytes).2.get("elf.section_overlap_count"), Some(3.0));
+}
+
+/// Go build info is read from `.go.buildinfo`, at an aligned offset, and a
+/// build-info magic in any other section (an embedded payload, a decoy) does
+/// not make the binary Go.
+#[test]
+fn go_build_info_is_read_only_from_its_section() {
+    let mut blob = b"\xff Go buildinf:".to_vec();
+    blob.extend_from_slice(&[8, 0x2]); // ptr_size, inline-string flag
+    blob.resize(32, 0);
+    blob.push(8);
+    blob.extend_from_slice(b"go1.22.4");
+    blob.push(0);
+    let go = |section: &str| {
+        run(&elf_with_section(section, &blob))
+            .0
+            .get("elf.go")
+            .cloned()
+    };
+    assert_eq!(go(".go.buildinfo").unwrap()["version"], "go1.22.4");
+    assert_eq!(go(".rodata"), None);
+}
+
+/// A `.debug_info` stored `SHF_COMPRESSED` (zlib or zstd) is inflated before
+/// the unit walk, rather than parsed as compressed bytes.
+#[test]
+fn compressed_debug_info_is_inflated() {
+    use std::io::Write;
+    // Abbreviation 1: DW_TAG_compile_unit, no children, DW_AT_name string.
+    let abbrev = [1u8, 0x11, 0, 0x03, 0x08, 0, 0, 0];
+    let mut info = Vec::new();
+    info.extend(15u32.to_le_bytes()); // unit_length
+    info.extend(4u16.to_le_bytes()); // DWARF 4
+    info.extend(0u32.to_le_bytes()); // debug_abbrev_offset
+    info.push(8); // address size
+    info.push(1); // root DIE, abbreviation 1
+    info.extend_from_slice(b"main.c\0");
+    let zlib = {
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(&info).unwrap();
+        z.finish().unwrap()
+    };
+    let zstd = zstd::encode_all(&info[..], 0).unwrap();
+    for (ch_type, stream) in [(1u32, zlib), (2, zstd)] {
+        // Elf64_Chdr: ch_type, ch_reserved, ch_size, ch_addralign.
+        let mut compressed = ch_type.to_le_bytes().to_vec();
+        compressed.extend(0u32.to_le_bytes());
+        compressed.extend((info.len() as u64).to_le_bytes());
+        compressed.extend(1u64.to_le_bytes());
+        compressed.extend_from_slice(&stream);
+        let mut payload = abbrev.to_vec();
+        payload.extend_from_slice(&compressed);
+        let bytes = elf_over_payload(
+            &payload,
+            &[],
+            &[
+                Sec {
+                    name: ".debug_abbrev",
+                    ty: 1,
+                    off: PAYLOAD,
+                    size: abbrev.len() as u64,
+                    ..Sec::default()
+                },
+                Sec {
+                    name: ".debug_info",
+                    ty: 1,
+                    flags: 0x800, // SHF_COMPRESSED
+                    off: PAYLOAD + abbrev.len() as u64,
+                    size: compressed.len() as u64,
+                    ..Sec::default()
+                },
+            ],
+        );
+        assert_eq!(
+            run(&bytes).0.get("elf.dwarf.source_files"),
+            Some(&serde_json::json!(["main.c"])),
+            "ch_type {ch_type}"
+        );
+    }
 }

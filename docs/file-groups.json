@@ -1,0 +1,211 @@
+{
+  "groups": {
+    "archives": [
+      "jar",
+      "zip",
+      "go_module",
+      "tar",
+      "cpio",
+      "tar.gz",
+      "tar.bz2",
+      "tar.xz",
+      "tar.zst",
+      "7z",
+      "rar",
+      "rpa",
+      "deb",
+      "rpm",
+      "pkg_macos",
+      "dmg",
+      "vhd",
+      "iso",
+      "squashfs",
+      "cab",
+      "chm",
+      "crx",
+      "xpi",
+      "whl",
+      "gem",
+      "apk_android",
+      "apk_alpine",
+      "npm",
+      "crate",
+      "composer",
+      "hex",
+      "pub",
+      "cran",
+      "cpan",
+      "hackage",
+      "conda",
+      "egg",
+      "nupkg",
+      "ipa",
+      "vsix",
+      "pkg_freebsd",
+      "pkg_arch",
+      "python_sdist",
+      "oci_image",
+      "xbps",
+      "snap",
+      "flatpak",
+      "gentoo_binpkg",
+      "asar",
+      "phar",
+      "msi"
+    ],
+    "audio": [
+      "wav",
+      "aiff",
+      "mp3"
+    ],
+    "build": [
+      "pbxproj",
+      "cmake",
+      "makefile",
+      "dockerfile"
+    ],
+    "bytecode": [
+      "java_class",
+      "python_bytecode",
+      "rpyc",
+      "beam",
+      "wasm",
+      "dex"
+    ],
+    "compressed": [
+      "gz",
+      "bz2",
+      "xz",
+      "lzma",
+      "zst"
+    ],
+    "config": [
+      "package.json",
+      "package-lock.json",
+      "vsix_manifest",
+      "chrome_manifest",
+      "cargo.toml",
+      "cargo.lock",
+      "requirements.txt",
+      "poetry.lock",
+      "pipfile.lock",
+      "gemfile.lock",
+      "composer.lock",
+      "yarn.lock",
+      "pnpm-lock.yaml",
+      "pyproject.toml",
+      "composer.json",
+      "json",
+      "gyp",
+      "github_actions",
+      "systemd_service",
+      "desktop_entry",
+      "xml",
+      "yaml",
+      "pkg_info",
+      "src_info",
+      "registry",
+      "reg",
+      "go.mod",
+      "go.sum",
+      "plist",
+      "nib",
+      "lnk",
+      "yara"
+    ],
+    "data": [
+      "data"
+    ],
+    "documents": [
+      "rtf",
+      "ole_doc",
+      "ooxml",
+      "pdf",
+      "html",
+      "postscript",
+      "odf"
+    ],
+    "fonts": [
+      "font"
+    ],
+    "images": [
+      "jpeg",
+      "png",
+      "tiff",
+      "avif",
+      "ico",
+      "ani",
+      "gif",
+      "bmp",
+      "webp",
+      "svg"
+    ],
+    "machine_code": [
+      "dos_com",
+      "shellcode",
+      "fat_boot_sector"
+    ],
+    "native": [
+      "macho",
+      "elf",
+      "pe",
+      "ne",
+      "static-lib"
+    ],
+    "scripts": [
+      "shell",
+      "batch",
+      "jcl",
+      "vbs",
+      "python",
+      "javascript",
+      "typescript",
+      "ruby",
+      "php",
+      "perl",
+      "lua",
+      "powershell",
+      "applescript",
+      "jsp",
+      "asp",
+      "cfml",
+      "mirc",
+      "ircii"
+    ],
+    "serialized": [
+      "pickle",
+      "nrbf"
+    ],
+    "signatures": [
+      "image4_trustcache",
+      "pgp_signature",
+      "certificate_signature"
+    ],
+    "source": [
+      "go",
+      "rust",
+      "java",
+      "csharp",
+      "swift",
+      "objective_c",
+      "groovy",
+      "scala",
+      "kotlin",
+      "zig",
+      "elixir",
+      "clojure",
+      "c"
+    ],
+    "text": [
+      "tex",
+      "markdown",
+      "text"
+    ],
+    "unknown": [
+      "unknown"
+    ],
+    "video": [
+      "mp4"
+    ]
+  }
+}

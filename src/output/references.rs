@@ -63,8 +63,59 @@ pub enum RefKind {
     /// a [`RefLocator::Path`] and is resolved against sibling files, not
     /// fetched.
     Local,
-    /// Recorded, but the kind could not be determined.
+    /// Recorded, but not a dependency selection of its own: a `replace` or
+    /// `exclude` directive, a checksum line, a parser limit marker.
     Undefined,
+}
+
+/// How a declared dependency settled against the rest of its artifact (the
+/// module's workspace, replacements, checksums and vendor directory). Set by
+/// [`crate::go_dependency_context`]; `None` on references nothing reconciled.
+/// Serialized as its kebab-case name; an unresolved one as
+/// `{"unresolved": "<reason>"}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum Resolution {
+    /// The declared minimum version stands. Minimal version selection may
+    /// still build a higher one, which this does not compute.
+    DeclaredMinimum,
+    /// A `replace` directive redirected the dependency; the locator and
+    /// source are the replacement's.
+    Replaced,
+    /// The artifact's vendor directory supplies the dependency.
+    Vendored,
+    /// The dependency could not be settled, so it is not a fetch target.
+    Unresolved(UnresolvedReason),
+}
+
+/// Why a dependency is [`Resolution::Unresolved`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum UnresolvedReason {
+    /// A manifest in the module's context did not parse completely.
+    Manifest,
+    /// An `exclude` directive names the declared minimum itself.
+    ExcludedMinimum,
+    /// A `replace` directive did not parse.
+    Replacement,
+    /// Replacements of equal priority disagree.
+    ReplacementConflict,
+    /// A local replacement path leaves the supplied artifact.
+    LocalBoundary,
+    /// A local replacement names a directory with no `go.mod`.
+    LocalMissing,
+    /// The checksum file pins the module to more than one hash.
+    ChecksumConflict,
+    /// The context work budget ran out before this module was reconciled.
+    ContextBudget,
+    /// `vendor/modules.txt` did not parse completely.
+    VendorMetadata,
+    /// `vendor/modules.txt` lists the module but its directory is absent.
+    VendorMissing,
+    /// A vendor directory exists but does not list the module.
+    VendorUnlisted,
 }
 
 /// A digest algorithm a manifest pins a reference to.
@@ -136,8 +187,11 @@ pub struct Reference {
     pub locator: RefLocator,
     /// The coarse kind / expression form this reference was found in.
     pub kind: RefKind,
-    /// Where the reference was found — a `values` key or parse site
-    /// (`npm.repository.url`, `npm.scripts.postinstall`).
+    /// Where the reference was found: the manifest field or parse site,
+    /// spelled as the format names it (`npm.repository.url`,
+    /// `Cargo.toml:target.cfg(unix).dependencies.libc`). Open-ended by
+    /// design, since manifest field paths are data; the reconciliation
+    /// outcome is [`Self::resolution`], never encoded here.
     pub source: String,
     /// The literal text the reference was extracted from — the `curl`/`wget`
     /// command, the manifest/lockfile entry, the `source=()` line — so the
@@ -156,8 +210,8 @@ pub struct Reference {
     /// the bytes it retrieves.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub pinned_hash: Option<PinnedHash>,
-    /// SHA-256 of the *referenced content*, lowercase hex — the key under
-    /// which the fetched bytes are catalogued in hopper. Unknown until the
+    /// SHA-256 of the *referenced content*, lowercase hex — the key a
+    /// fetcher catalogues the retrieved bytes under. Unknown until the
     /// content is fetched (or already in hand), so extraction usually
     /// leaves it `None`; a [`HashAlgo::Sha256`] pin is the one case it can
     /// be filled at extraction (the pin *is* the content hash).
@@ -166,6 +220,9 @@ pub struct Reference {
     /// Retained dependency scope and installation metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<DependencyContext>,
+    /// How the reference settled against the rest of its artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<Resolution>,
 }
 
 impl Reference {
@@ -186,31 +243,21 @@ impl Reference {
             pinned_hash: None,
             content_sha256: None,
             context: None,
+            resolution: None,
         }
     }
 
     /// Whether this reference is a fetch target. A source repository is
-    /// identity and an unclassified reference is not actioned, so neither
-    /// is fetched; dependencies, commands, and URL fetches are.
+    /// identity, an unclassified reference is not actioned, and an
+    /// unresolved dependency names no version to fetch, so none of them is
+    /// fetched; dependencies, commands, and URL fetches are.
     pub fn is_fetch_target(&self) -> bool {
         matches!(
             self.kind,
             RefKind::Dependency | RefKind::Command | RefKind::UrlFetch
-        )
+        ) && !matches!(self.resolution, Some(Resolution::Unresolved(_)))
     }
 }
 
 #[cfg(test)]
-mod context_tests {
-    use super::*;
-    #[test]
-    fn old_references_without_context_still_deserialize() {
-        let reference: Reference = serde_json::from_str(r#"{"locator":{"purl":"pkg:npm/a@1.0.0"},"kind":"dependency","source":"package.json","evidence":"a"}"#).unwrap();
-        assert!(reference.context.is_none());
-        assert!(
-            !serde_json::to_string(&reference)
-                .unwrap()
-                .contains("context")
-        );
-    }
-}
+mod tests;

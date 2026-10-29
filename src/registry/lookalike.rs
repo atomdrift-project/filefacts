@@ -1,18 +1,20 @@
 //! Lookalike names: a registry record whose name sits one keystroke from a
 //! popular package's, without being it.
 //!
-//! Only Terraform for now. A provider is `namespace/type`, and the type names
-//! what it manages, so a squat keeps the type and bends the namespace:
+//! Only Terraform has a list. A provider is `namespace/type`, and the type
+//! names what it manages, so a squat keeps the type and bends the namespace:
 //! `kreuzwenker/docker` for `kreuzwerker/docker`. Comparing namespaces within
-//! one type is what keeps this quiet. Measured 2026-09-24 over all 7,320
+//! one type is what keeps this quiet. Measured over all 7,320 registry
 //! providers against this list, it flagged exactly one — that squat — while two
 //! edits already caught a legitimate fork (`cnrancher/rancher2`), and a
 //! different namespace reusing a popular type is ordinary (1,498 providers).
 
 use std::cmp::Ordering;
 
-/// The 300 most-downloaded Terraform providers, lowercased and sorted, from
-/// 2026-09-24. Regenerate with:
+use super::Ecosystem;
+
+/// The 300 most-downloaded Terraform providers, lowercased and sorted.
+/// Regenerate with:
 ///
 /// ```sh
 /// for p in 1 2 3; do curl -s "https://registry.terraform.io/v2/providers?page%5Bsize%5D=100&page%5Bnumber%5D=$p&sort=-downloads"; done |
@@ -327,8 +329,8 @@ const TERRAFORM_POPULAR: &[&str] = &[
 /// `Some(1.0)` when `name` is one edit from a popular package's name in its
 /// ecosystem without being one, `Some(0.0)` when it was checked and is not,
 /// `None` when the ecosystem has no list.
-pub(super) fn name_lookalike(ecosystem: &str, name: &str) -> Option<f64> {
-    if !ecosystem.eq_ignore_ascii_case("terraform") {
+pub(super) fn name_lookalike(ecosystem: &Ecosystem, name: &str) -> Option<f64> {
+    if *ecosystem != Ecosystem::Terraform {
         return None;
     }
     let name = name.trim().to_ascii_lowercase();
@@ -369,59 +371,4 @@ fn one_edit(a: &str, b: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn popular_list_is_sorted_for_binary_search() {
-        assert!(TERRAFORM_POPULAR.windows(2).all(|w| w[0] < w[1]));
-    }
-
-    #[test]
-    fn flags_a_namespace_one_edit_from_a_popular_provider() {
-        assert_eq!(name_lookalike("terraform", "kreuzwenker/docker"), Some(1.0));
-        assert_eq!(name_lookalike("terraform", "Kreuzwenker/Docker"), Some(1.0));
-        // Swap, insertion, deletion.
-        assert_eq!(name_lookalike("terraform", "hashicrop/aws"), Some(1.0));
-        assert_eq!(name_lookalike("terraform", "hashicorpp/aws"), Some(1.0));
-        assert_eq!(name_lookalike("terraform", "hashcorp/aws"), Some(1.0));
-    }
-
-    #[test]
-    fn leaves_the_real_provider_forks_and_other_ecosystems_alone() {
-        assert_eq!(name_lookalike("terraform", "kreuzwerker/docker"), Some(0.0));
-        // Two edits: a legitimate fork, not a squat.
-        assert_eq!(name_lookalike("terraform", "cnrancher/rancher2"), Some(0.0));
-        // A popular type under an unrelated namespace is ordinary.
-        assert_eq!(
-            name_lookalike("terraform", "gocommunity-io/docker"),
-            Some(0.0)
-        );
-        // A lookalike namespace with a different type is not this shape.
-        assert_eq!(name_lookalike("terraform", "hashicrop/dockerd"), Some(0.0));
-        assert_eq!(name_lookalike("terraform", "docker"), None);
-        assert_eq!(name_lookalike("npm", "kreuzwenker/docker"), None);
-    }
-
-    #[test]
-    fn one_edit_is_exactly_one() {
-        for (a, b) in [
-            ("ab", "ba"),
-            ("abc", "abd"),
-            ("abc", "ab"),
-            ("ab", "abc"),
-            ("a", ""),
-        ] {
-            assert!(one_edit(a, b), "{a} vs {b}");
-        }
-        for (a, b) in [
-            ("abc", "abc"),
-            ("abc", "cba"),
-            ("abcd", "badc"),
-            ("abc", "a"),
-            ("", ""),
-        ] {
-            assert!(!one_edit(a, b), "{a} vs {b}");
-        }
-    }
-}
+mod tests;

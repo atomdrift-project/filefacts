@@ -12,8 +12,8 @@
 //!
 //! Adding a metric therefore means adding a line here, and renaming one means
 //! editing a line here — which is the point. The keys are a public contract:
-//! cleave's trait rules reference them by name, and a rename that does not
-//! show up in this file's diff is a rename that silently stops matching.
+//! downstream rules reference them by name, and a rename that does not show
+//! up in this file's diff is a rename that silently stops matching.
 //!
 //! Downstream consumers enumerate the surface through
 //! [`crate::known_metrics`] rather than re-deriving it by scanning source.
@@ -723,6 +723,7 @@ pub const CATALOG: &[&str] = &[
     "pe.data_directory_anomaly_count",
     "pe.data_directory_nonzero_rva_zero_size_count",
     "pe.data_directory_zero_rva_nonzero_size_count",
+    "pe.debug.pdb.path_non_utf8",
     "pe.declared_data_directory_count",
     "pe.delay_import_count",
     "pe.dos_stub_modified",
@@ -769,7 +770,6 @@ pub const CATALOG: &[&str] = &[
     "pe.section_overflow_count",
     "pe.section_overlap_count",
     "pe.security_directory_out_of_bounds",
-    "pe.signature_expired_days",
     "pe.timestamp",
     "pe.tls_callback_count",
     "pe.version.identity_entropy",
@@ -897,6 +897,7 @@ pub const CATALOG: &[&str] = &[
     "source.ast_unavailable.tree_sitter_guard",
     "source.ast_walk_panicked",
     "source.batch.concat_analysis_limited",
+    "source.batch.cycle_analysis_limited",
     "source.batch.seeded_snapshot_concat_loops",
     "source.batch.snapshot_concat_max_fanout",
     "source.batch.unbounded_snapshot_concat_loops",
@@ -1011,7 +1012,7 @@ pub const FAMILIES: &[&str] = &[
 
 /// `archive.compression.method_counts.<method>` — members per compression method.
 #[must_use]
-pub fn archive_method_count(method: &str) -> MetricKey {
+pub(crate) fn archive_method_count(method: &str) -> MetricKey {
     MetricKey(Cow::Owned(format!(
         "archive.compression.method_counts.{method}"
     )))
@@ -1019,26 +1020,26 @@ pub fn archive_method_count(method: &str) -> MetricKey {
 
 /// `archive.format.<entry_type>_count` — members per archive entry type.
 #[must_use]
-pub fn archive_entry_type_count(entry_type: &str) -> MetricKey {
+pub(crate) fn archive_entry_type_count(entry_type: &str) -> MetricKey {
     MetricKey(Cow::Owned(format!("archive.format.{entry_type}_count")))
 }
 
 /// `ast.op.<operator>` — occurrences of one AST operator.
 #[must_use]
-pub fn ast_op(operator: &str) -> MetricKey {
+pub(crate) fn ast_op(operator: &str) -> MetricKey {
     MetricKey(Cow::Owned(format!("ast.op.{operator}")))
 }
 
 /// `ast.op_density.<operator>` — occurrences per KB of one AST operator.
 #[must_use]
-pub fn ast_op_density(operator: &str) -> MetricKey {
+pub(crate) fn ast_op_density(operator: &str) -> MetricKey {
     MetricKey(Cow::Owned(format!("ast.op_density.{operator}")))
 }
 
 /// `consistency.extension_content_mismatch.<content>_as_<extension>` —
 /// a file whose detected content class disagrees with its extension class.
 #[must_use]
-pub fn extension_content_mismatch(content: &str, extension: &str) -> MetricKey {
+pub(crate) fn extension_content_mismatch(content: &str, extension: &str) -> MetricKey {
     MetricKey(Cow::Owned(format!(
         "consistency.extension_content_mismatch.{content}_as_{extension}"
     )))
@@ -1046,14 +1047,14 @@ pub fn extension_content_mismatch(content: &str, extension: &str) -> MetricKey {
 
 /// `dmg.compression.codec_counts.<codec>` — DMG blocks per compression codec.
 #[must_use]
-pub fn dmg_codec_count(codec: &str) -> MetricKey {
+pub(crate) fn dmg_codec_count(codec: &str) -> MetricKey {
     MetricKey(Cow::Owned(format!("dmg.compression.codec_counts.{codec}")))
 }
 
 /// Which tree-sitter query budget a `source.query_limited.<query>` hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum QueryLimit {
+pub(crate) enum QueryLimit {
     /// The query ran, but was cut off by one of the budgets below.
     Any,
     /// Hit the match-count ceiling.
@@ -1069,7 +1070,7 @@ pub enum QueryLimit {
 /// `source.query_limited.<query>[.<budget>]` — a tree-sitter query that hit
 /// a budget, so downstream consumers know the facts it feeds are partial.
 #[must_use]
-pub fn source_query_limited(query: &str, which: QueryLimit) -> MetricKey {
+pub(crate) fn source_query_limited(query: &str, which: QueryLimit) -> MetricKey {
     MetricKey(Cow::Owned(match which {
         QueryLimit::Any => format!("source.query_limited.{query}"),
         QueryLimit::Match => format!("source.query_limited.{query}.match_limit"),

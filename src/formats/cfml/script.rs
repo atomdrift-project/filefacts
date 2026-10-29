@@ -115,8 +115,17 @@ pub(super) fn calls(bytes: &[u8], range: Range<usize>) -> (Vec<Range<usize>>, bo
     let mut declaration = false;
     // End of the last dotted receiver chain scanned. Every name inside a
     // chain reaches that same end, so it is reused rather than rescanned:
-    // walking `a.b.c…` again from each of its n names was O(n²).
+    // walking `a.b.c…` again from each of its n names would be O(n²).
     let mut chain_end = range.start;
+    // Bytes the chain scans have walked. With the reuse above the scans are
+    // disjoint, so they cover each byte at most once; past twice the range
+    // the scan is not linear, and stops as limited rather than run on.
+    let mut chain_work = 0usize;
+    let chain_budget = range
+        .end
+        .saturating_sub(range.start)
+        .saturating_mul(2)
+        .saturating_add(1024);
     while let Some(&byte) = text.get(at) {
         if matches!(byte, b'\'' | b'"') {
             if !super::quoted(text, &mut at) {
@@ -154,6 +163,10 @@ pub(super) fn calls(bytes: &[u8], range: Range<usize>) -> (Vec<Range<usize>>, bo
                 end = whitespace(bytes, next_end, range.end);
             }
             chain_end = end;
+            chain_work = chain_work.saturating_add(end - at);
+            if chain_work > chain_budget {
+                return (out, true);
+            }
             end
         };
         if bytes.get(end) != Some(&b'(') {
@@ -191,64 +204,6 @@ pub(super) fn calls(bytes: &[u8], range: Range<usize>) -> (Vec<Range<usize>>, bo
         at = end;
     }
     (out, false)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn masking_preserves_offsets_strings_and_line_breaks() {
-        let source =
-            b"// fake()\nactual(/* comment */'http://x'); <!--- fake() <!--- inner ---> --->\n";
-        let masked = mask_comments(source, std::slice::from_ref(&(0..source.len())));
-        assert_eq!(masked.len(), source.len());
-        assert_eq!(masked.iter().filter(|b| **b == b'\n').count(), 2);
-        let (ranges, limited) = calls(&masked, 0..masked.len());
-        assert!(!limited);
-        assert_eq!(ranges.len(), 1);
-        assert_eq!(&source[ranges[0].start..ranges[0].start + 6], b"actual");
-        assert!(masked.windows(8).any(|s| s == b"http://x"));
-    }
-    #[test]
-    fn lexical_calls_are_bounded_and_do_not_include_function_signatures() {
-        let source = b"function demo(x) { actual(); } if (check()) { other().method(); }";
-        let (ranges, limited) = calls(source, 0..source.len());
-        assert!(!limited);
-        assert_eq!(
-            ranges
-                .iter()
-                .map(|r| &source[r.clone()])
-                .collect::<Vec<_>>(),
-            vec![b"actual()".as_slice(), b"check()", b"other().method()"]
-        );
-        for end in 0..=source.len() {
-            let (ranges, _) = calls(&source[..end], 0..end);
-            assert!(ranges.iter().all(|r| r.start < r.end && r.end <= end));
-        }
-        let source = b"f();".repeat(super::super::MAX_TAGS + 1);
-        let (ranges, limited) = calls(&source, 0..source.len());
-        assert!(limited);
-        assert_eq!(ranges.len(), super::super::MAX_TAGS);
-        let source = format!("f({}x{})", "(".repeat(40), ")".repeat(40));
-        assert!(calls(source.as_bytes(), 0..source.len()).1);
-    }
-    #[test]
-    fn long_member_chain_is_scanned_once() {
-        // Rescanning the chain from each of its names took minutes on a
-        // 600 KB `b.c.c…` assignment.
-        let source = format!("a = b{}; g(); x.y . z();", ".c".repeat(200_000));
-        let started = std::time::Instant::now();
-        let (ranges, limited) = calls(source.as_bytes(), 0..source.len());
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
-        assert!(!limited);
-        assert_eq!(
-            ranges
-                .iter()
-                .map(|r| &source.as_bytes()[r.clone()])
-                .collect::<Vec<_>>(),
-            vec![b"g()".as_slice(), b"x.y . z()"]
-        );
-    }
 }
 
 /// Source-ordered statement regions. Braces delimit independent local blocks;
@@ -329,7 +284,7 @@ pub(super) fn statements(bytes: &[u8], range: Range<usize>) -> (Vec<Event>, bool
                 }
             }
             b';' | b'{' | b'}' if delimiters.is_empty() => {
-                let allowed = *blocks.last().unwrap();
+                let allowed = blocks.last().copied().unwrap_or(false);
                 if start < at {
                     out.push(Event::Statement(start..at, allowed));
                 }
@@ -354,59 +309,13 @@ pub(super) fn statements(bytes: &[u8], range: Range<usize>) -> (Vec<Event>, bool
     }
     let limited = !delimiters.is_empty() || blocks.len() != 1;
     if start < range.end && !limited {
-        out.push(Event::Statement(start..range.end, *blocks.last().unwrap()));
+        out.push(Event::Statement(
+            start..range.end,
+            blocks.last().copied().unwrap_or(false),
+        ));
     }
     (out, limited)
 }
 
 #[cfg(test)]
-mod statement_tests {
-    use super::*;
-    #[test]
-    fn statement_regions_are_ordered_bounded_and_ignore_literal_delimiters() {
-        let source = b"if(check()) { value=f(';}'); out(value); } else { out(other); }";
-        let (events, limited) = statements(source, 0..source.len());
-        assert!(!limited);
-        let ranges: Vec<_> = events
-            .iter()
-            .filter_map(|e| match e {
-                Event::Statement(r, _) => Some(r.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(ranges.windows(2).all(|p| p[0].end <= p[1].start));
-        assert!(
-            ranges
-                .iter()
-                .any(|r| &source[r.clone()] == b" value=f(';}')")
-        );
-        for end in 0..=source.len() {
-            let (events, _) = statements(&source[..end], 0..end);
-            assert!(events.iter().all(|e| match e {
-                Event::Statement(r, _) => r.start < r.end && r.end <= end,
-                _ => true,
-            }));
-        }
-        for source in ["([)]", "][", ")"] {
-            assert!(statements(source.as_bytes(), 0..source.len()).1);
-        }
-        for (open, close) in [("(", ")"), ("[", "]"), ("{", "}")] {
-            let exact = format!("{}{}", open.repeat(32), close.repeat(32));
-            assert!(!statements(exact.as_bytes(), 0..exact.len()).1);
-        }
-        let exact = "f();".repeat(super::super::MAX_TAGS - 2);
-        let (events, limited) = statements(exact.as_bytes(), 0..exact.len());
-        assert!(!limited);
-        assert_eq!(events.len(), super::super::MAX_TAGS - 2);
-        for source in [
-            "{".repeat(33),
-            "(".repeat(33),
-            "[".repeat(33),
-            "f();".repeat(super::super::MAX_TAGS),
-        ] {
-            let (events, limited) = statements(source.as_bytes(), 0..source.len());
-            assert!(limited);
-            assert!(events.len() <= super::super::MAX_TAGS);
-        }
-    }
-}
+mod tests;

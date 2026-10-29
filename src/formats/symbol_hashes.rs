@@ -1,10 +1,14 @@
 //! The set-fingerprint construction behind the ELF and Mach-O similarity
-//! hashes ([`super::elf_hashes`], [`super::macho_hashes`]).
+//! hashes (`elf.hashes.*`, `macho.hashes.*`).
 //!
 //! Every hash is MD5 over a sorted, deduplicated list joined by commas — the
 //! construction VirusTotal, MalwareBazaar, machofile and YARA-X use — so a
 //! binary exposing the same import set under either format fingerprints
 //! identically. Keeping it in one place keeps the two formats from drifting.
+//!
+//! The import hash here is a *set*: order and duplicates are dropped. PE's
+//! `pe.hashes.imphash` is the Mandiant construction, which keeps import order
+//! and library names, so the two are named apart.
 
 use md5::{Digest, Md5};
 
@@ -20,12 +24,12 @@ pub(super) fn md5_of_set(mut names: Vec<String>) -> Option<String> {
     }
     names.sort_unstable();
     names.dedup();
-    Some(md5_of_csv(&names))
+    Some(hex_encode(&Md5::digest(names.join(",").as_bytes())))
 }
 
-/// The imphash: [`md5_of_set`] over the lowercased imported-symbol names in
-/// the unified symbols view.
-pub(super) fn imphash(symbols: &Symbols) -> Option<String> {
+/// The import hash: [`md5_of_set`] over the lowercased imported-symbol names
+/// in the unified symbols view.
+pub(super) fn import_hash(symbols: &Symbols) -> Option<String> {
     md5_of_set(
         symbols
             .iter_kind(SymbolKind::Import)
@@ -50,32 +54,5 @@ pub(super) fn export_hash(symbols: &Symbols) -> Option<String> {
     )
 }
 
-fn md5_of_csv(parts: &[String]) -> String {
-    hex_encode(&Md5::digest(parts.join(",").as_bytes()))
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn known_md5_vector() {
-        // MD5("a,b,c"): the comma-join + md5 step alone.
-        assert_eq!(
-            md5_of_csv(&["a".into(), "b".into(), "c".into()]),
-            "a44c56c8177e32d3613988f4dba7962e"
-        );
-        // MD5(""): the helper does not synthesise input.
-        assert_eq!(md5_of_csv(&[]), "d41d8cd98f00b204e9800998ecf8427e");
-    }
-
-    #[test]
-    fn set_hash_sorts_dedups_and_skips_the_empty_set() {
-        let set = |names: &[&str]| md5_of_set(names.iter().map(|s| (*s).to_string()).collect());
-        assert_eq!(
-            set(&["c", "a", "b", "a"]).as_deref(),
-            Some("a44c56c8177e32d3613988f4dba7962e")
-        );
-        assert_eq!(set(&[]), None);
-    }
-}
+mod tests;

@@ -1,13 +1,14 @@
-//! Desktop Entry fields migrated from cleave's structured-value parser.
-use crate::output::Values;
+//! Freedesktop Desktop Entry fields, and the shell flows their `Exec` lines
+//! carry.
+use crate::output::{Errors, Values};
 use serde_json::Value;
 
-pub(crate) fn extract(bytes: &[u8], values: &mut Values) {
+pub(crate) fn extract(bytes: &[u8], values: &mut Values, errors: &mut Errors) {
     if bytes.len() > 16 * 1024 * 1024 {
         return;
     }
     if let Some(root) = parse_desktop_entry(bytes) {
-        *values = Values::from_json(root);
+        super::structured::merge_document(root, values, errors);
         let command = values.get("desktop_entry.exec").cloned();
         let commands: Vec<&str> = match command.as_ref() {
             Some(Value::String(s)) => vec![s],

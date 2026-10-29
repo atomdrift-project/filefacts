@@ -41,6 +41,13 @@ const MAX_PROBED_MEMBERS: usize = 24;
 /// them past it falls back to the filename, as with any container we can't read.
 const MAX_INFLATE: u64 = 16 << 20;
 
+/// Largest zstd window accepted, as a power of two. The decoder allocates the
+/// window a frame declares before producing any output, so without this a
+/// few-byte frame claiming a 2 GiB window costs 2 GiB. 16 MiB covers every
+/// standard compression level and matches [`MAX_INFLATE`]: a larger window
+/// cannot reach anything the inflation cap would let us read.
+const ZSTD_WINDOW_LOG_MAX: u32 = 24;
+
 /// Longest archive directory accepted as a distribution slug. WordPress.org
 /// slugs are short and a filesystem path component stops at 255; a zip name
 /// field carries 64 KiB, so without this a crafted archive names the package.
@@ -123,8 +130,8 @@ fn autoconf_ac_init(text: &str, values: &mut Values) -> bool {
     // Autoconf 2.13 and earlier used `AC_INIT(unique-source-file)` — a single
     // filename to sanity-check the source dir, NOT a package name. The modern
     // `AC_INIT(package, version, …)` form always carries a version. So reject
-    // a lone arg that looks like a source file (dsniff/fragrouter/fragroute
-    // all do `AC_INIT(dsniff.c)`); require the modern form to trust the name.
+    // a lone arg that looks like a source file (`AC_INIT(main.c)`); require
+    // the modern form to trust the name.
     if name.is_empty()
         || name.contains('$')
         || name.starts_with("m4_")
@@ -156,8 +163,8 @@ fn looks_like_source_file(arg: &str) -> bool {
 /// Read `PACKAGE_TARNAME=`/`PACKAGE_VERSION=` from a generated `configure`'s
 /// header window — the assignments sit in the preamble, well inside the
 /// first [`HEADER_SCAN`] bytes. Only emits when non-empty: old autoconf
-/// (openssh 3.x) leaves them blank and keeps the version in `version.h`,
-/// which we don't guess at.
+/// leaves them blank and the project keeps its version elsewhere (often a
+/// `version.h`), which we don't guess at.
 fn configure_package_vars(text: &str, values: &mut Values) -> bool {
     let mut found = false;
     for line in text.lines() {
@@ -187,22 +194,42 @@ fn configure_var<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 /// Probe a file for interior source identity, dispatched by type. A source
 /// archive (`.zip`/`.tar.gz`/`.tar`) is walked for a WordPress plugin header
 /// or an autoconf `AC_INIT`; a bare `.php` may itself be a plugin's main
-/// file (the AccessPress backdoor samples are lone plugin PHPs). Every other
+/// file, since a plugin can be distributed or dropped as one PHP file. Every other
 /// type — already covered by an ecosystem manifest, or not source — no-ops.
 /// Best-effort throughout: a container we can't open yields nothing and the
 /// filename fallback still applies.
 pub(super) fn extract(bytes: &[u8], file_type: FileType, values: &mut Values) {
     match file_type {
-        FileType::Zip => probe_zip(bytes, values),
-        // Gzip and plain tar only: bz2/xz would need decompressors filefacts
-        // doesn't carry — cleave hands it the decompressed bytes instead. Plain
-        // tar needs no inflation cap; its own length is the bound.
+        // A zip is probed from the archive walk (see [`probe_zip`]). bzip2
+        // tarballs are not inflated, filefacts carrying no bzip2 decoder, so
+        // their identity falls back to the filename. Plain tar needs no
+        // inflation cap; its own length is the bound.
         FileType::TarGz => {
             probe_tar(
                 tar::Archive::new(GzDecoder::new(bytes).take(MAX_INFLATE)),
                 values,
             );
         }
+        FileType::TarZst => {
+            let decoder = zstd::stream::read::Decoder::with_buffer(bytes).and_then(|mut d| {
+                d.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
+                Ok(d)
+            });
+            match decoder {
+                Ok(decoder) => probe_tar(tar::Archive::new(decoder.take(MAX_INFLATE)), values),
+                Err(error) => tracing::debug!(
+                    target: "filefacts::source_meta",
+                    format = "tar.zst",
+                    stage = "open",
+                    %error,
+                    "zstd decoder setup failed; no interior identity",
+                ),
+            }
+        }
+        FileType::TarXz => probe_tar(
+            tar::Archive::new(super::bounded::xz_decoder(bytes).take(MAX_INFLATE)),
+            values,
+        ),
         FileType::Tar => probe_tar(tar::Archive::new(bytes), values),
         FileType::Php => {
             let head = bytes.get(..HEADER_SCAN).unwrap_or(bytes);
@@ -255,22 +282,50 @@ fn probe_members(members: &[(String, Vec<u8>)], values: &mut Values) {
     }
 }
 
-fn probe_zip(bytes: &[u8], values: &mut Values) {
-    let Ok(mut archive) = super::zip::open_archive(bytes) else {
-        return;
-    };
+/// Probe a source zip the archive walk already opened. Members are chosen by
+/// name before any is opened, so an archive of thousands of members costs one
+/// read per candidate, not a decompressor per member.
+pub(super) fn probe_zip(archive: &mut super::zip::Archive<'_>, values: &mut Values) {
+    let candidates: Vec<usize> = (0..archive.len())
+        .filter(|&i| {
+            archive
+                .name_for_index(i)
+                .and_then(Result::ok)
+                .is_some_and(|name| identity_candidate(&name))
+        })
+        .collect();
     let mut members = Vec::new();
-    for i in 0..archive.len() {
+    for i in candidates {
         if members.len() >= MAX_PROBED_MEMBERS {
+            tracing::debug!(
+                target: "filefacts::source_meta",
+                format = "zip",
+                stage = "members",
+                cap = MAX_PROBED_MEMBERS,
+                "probed-member cap reached; later candidates skipped",
+            );
             break;
         }
-        let Ok(entry) = archive.by_index(i) else {
-            continue;
+        let entry = match archive.by_index(i) {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::debug!(
+                    target: "filefacts::source_meta",
+                    format = "zip",
+                    stage = "member",
+                    index = i,
+                    %error,
+                    "member unreadable; skipped",
+                );
+                continue;
+            }
         };
-        let path = entry.name().to_string();
-        if !entry.is_file() || !identity_candidate(&path) {
+        if !entry.is_file() {
             continue;
         }
+        let Ok(path) = entry.name().map(std::borrow::Cow::into_owned) else {
+            continue;
+        };
         let mut buf = Vec::new();
         if entry.take(HEADER_SCAN as u64).read_to_end(&mut buf).is_ok() {
             members.push((path, buf));
@@ -280,15 +335,47 @@ fn probe_zip(bytes: &[u8], values: &mut Values) {
 }
 
 fn probe_tar<R: Read>(mut archive: tar::Archive<R>, values: &mut Values) {
-    let Ok(entries) = archive.entries() else {
-        return;
+    let entries = match archive.entries() {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::debug!(
+                target: "filefacts::source_meta",
+                format = "tar",
+                stage = "open",
+                %error,
+                "tar stream does not open; no interior identity",
+            );
+            return;
+        }
     };
     let mut members = Vec::new();
     for entry in entries {
         if members.len() >= MAX_PROBED_MEMBERS {
+            tracing::debug!(
+                target: "filefacts::source_meta",
+                format = "tar",
+                stage = "members",
+                cap = MAX_PROBED_MEMBERS,
+                "probed-member cap reached; later candidates skipped",
+            );
             break;
         }
-        let Ok(entry) = entry else { continue };
+        // A read error here is usually the inflation cap cutting the stream
+        // short; the walk cannot resynchronize after it.
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::debug!(
+                    target: "filefacts::source_meta",
+                    format = "tar",
+                    stage = "member",
+                    cap = MAX_INFLATE,
+                    %error,
+                    "tar walk stopped",
+                );
+                break;
+            }
+        };
         let Ok(path) = entry.path() else { continue };
         let path = path.to_string_lossy().into_owned();
         if !identity_candidate(&path) {
@@ -319,202 +406,4 @@ fn identity_candidate(path: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::output::Values;
-
-    fn vs(text: &str) -> Values {
-        let mut v = Values::default();
-        wordpress_header(text, &mut v);
-        v
-    }
-
-    #[test]
-    fn wordpress_plugin_header() {
-        let v = vs(
-            "<?php\n/**\n * Plugin Name: WP 1 Slider\n * Version:     1.2.9\n * Text Domain: wp-1-slider\n */",
-        );
-        assert_eq!(
-            v.get("source.wordpress.text_domain")
-                .and_then(|x| x.as_str()),
-            Some("wp-1-slider")
-        );
-        assert_eq!(
-            v.get("source.wordpress.version").and_then(|x| x.as_str()),
-            Some("1.2.9")
-        );
-        assert_eq!(
-            v.get("source.wordpress.plugin_name")
-                .and_then(|x| x.as_str()),
-            Some("WP 1 Slider")
-        );
-    }
-
-    #[test]
-    fn theme_header_via_css() {
-        let v = vs("/*\nTheme Name: Twenty Twenty\nVersion: 1.5\nText Domain: twentytwenty\n*/");
-        assert_eq!(
-            v.get("source.wordpress.theme_name")
-                .and_then(|x| x.as_str()),
-            Some("Twenty Twenty")
-        );
-        assert_eq!(
-            v.get("source.wordpress.version").and_then(|x| x.as_str()),
-            Some("1.5")
-        );
-    }
-
-    #[test]
-    fn version_without_wp_header_is_not_a_match() {
-        let mut v = Values::default();
-        assert!(!wordpress_header(
-            "<?php\n// Version: 9.9.9\n$x = 1;",
-            &mut v
-        ));
-        assert!(v.get("source.wordpress.version").is_none());
-    }
-
-    #[test]
-    fn ac_init_quoted_and_unquoted() {
-        for text in [
-            "AC_INIT([wget], [1.21.4], [bug@gnu.org])",
-            "AC_INIT(wget, 1.21.4)",
-            "AC_INIT([wget],\n        [1.21.4])",
-        ] {
-            let mut v = Values::default();
-            assert!(autoconf_ac_init(text, &mut v), "{text:?}");
-            assert_eq!(
-                v.get("source.autoconf.name").and_then(|x| x.as_str()),
-                Some("wget")
-            );
-            assert_eq!(
-                v.get("source.autoconf.version").and_then(|x| x.as_str()),
-                Some("1.21.4")
-            );
-        }
-    }
-
-    #[test]
-    fn ac_init_legacy_single_file_form_is_rejected() {
-        // autoconf 2.13: AC_INIT(unique-file) is a srcdir check, not a name.
-        for text in [
-            "AC_INIT(fragrouter.c)",
-            "AC_INIT([dsniff.c])",
-            "AC_INIT(src/main.c)",
-        ] {
-            let mut v = Values::default();
-            assert!(!autoconf_ac_init(text, &mut v), "{text:?}");
-            assert!(v.get("source.autoconf.name").is_none(), "{text:?}");
-        }
-    }
-
-    #[test]
-    fn ac_init_macro_version_is_rejected() {
-        let mut v = Values::default();
-        // A computed version (git describe) is not a usable claim.
-        assert!(autoconf_ac_init(
-            "AC_INIT([foo], m4_esyscmd([git describe]))",
-            &mut v
-        ));
-        assert_eq!(
-            v.get("source.autoconf.name").and_then(|x| x.as_str()),
-            Some("foo")
-        );
-        assert!(v.get("source.autoconf.version").is_none());
-    }
-
-    #[test]
-    fn configure_package_vars_only_when_populated() {
-        let mut v = Values::default();
-        assert!(configure_package_vars(
-            "PACKAGE_TARNAME='wget'\nPACKAGE_VERSION='1.21.4'\n",
-            &mut v
-        ));
-        assert_eq!(
-            v.get("source.autoconf.name").and_then(|x| x.as_str()),
-            Some("wget")
-        );
-
-        // openssh 3.x: empty PACKAGE_*; we must not emit a blank identity.
-        let mut v2 = Values::default();
-        assert!(!configure_package_vars(
-            "PACKAGE_NAME=\nPACKAGE_TARNAME=\nPACKAGE_VERSION=\n",
-            &mut v2
-        ));
-        assert!(v2.get("source.autoconf.name").is_none());
-    }
-
-    /// One-member `.tar.gz`, laid out as a source release: everything under a
-    /// single top-level directory.
-    fn source_targz(path: &str, body: &[u8]) -> Vec<u8> {
-        use std::io::Write;
-        let mut tar = tar::Builder::new(Vec::new());
-        let mut header = tar::Header::new_gnu();
-        header.set_size(body.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        tar.append_data(&mut header, path, body).unwrap();
-        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        gz.write_all(&tar.into_inner().unwrap()).unwrap();
-        gz.finish().unwrap()
-    }
-
-    #[test]
-    fn gzip_tar_yields_interior_autoconf_identity() {
-        let gz = source_targz("wget-1.21.4/configure.ac", b"AC_INIT([wget], [1.21.4])\n");
-        let mut v = Values::default();
-        extract(&gz, FileType::TarGz, &mut v);
-        assert_eq!(
-            v.get("source.autoconf.name").and_then(|x| x.as_str()),
-            Some("wget")
-        );
-        assert_eq!(
-            v.get("source.autoconf.version").and_then(|x| x.as_str()),
-            Some("1.21.4")
-        );
-    }
-
-    #[test]
-    fn gzip_tar_stops_at_the_inflation_cap() {
-        // A candidate parked past MAX_INFLATE must not be reached: the walker
-        // has to inflate everything before it, which is the whole hazard.
-        let mut body = vec![b'\n'; MAX_INFLATE as usize + (1 << 10)];
-        body.extend_from_slice(b"AC_INIT([wget], [1.21.4])\n");
-        let gz = source_targz("wget-1.21.4/configure.ac", &body);
-        let mut v = Values::default();
-        extract(&gz, FileType::TarGz, &mut v);
-        assert!(
-            v.get("source.autoconf.name").is_none(),
-            "must not inflate past the cap"
-        );
-    }
-
-    #[test]
-    fn zip_plugin_takes_slug_from_the_top_level_directory() {
-        use std::io::Write;
-        let mut buf = Vec::new();
-        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-        zw.start_file(
-            "apex-notification-bar-lite/apexnb.php",
-            zip::write::SimpleFileOptions::default(),
-        )
-        .unwrap();
-        zw.write_all(b"<?php\n/**\n * Plugin Name: Apex Bar\n * Text Domain: apexnb-lite\n */")
-            .unwrap();
-        zw.finish().unwrap();
-
-        let mut v = Values::default();
-        extract(&buf, FileType::Zip, &mut v);
-        // The WordPress.org distribution slug is the archive directory, which
-        // the interior text domain is free to disagree with — both are kept.
-        assert_eq!(
-            v.get("source.wordpress.slug").and_then(|x| x.as_str()),
-            Some("apex-notification-bar-lite")
-        );
-        assert_eq!(
-            v.get("source.wordpress.text_domain")
-                .and_then(|x| x.as_str()),
-            Some("apexnb-lite")
-        );
-    }
-}
+mod tests;

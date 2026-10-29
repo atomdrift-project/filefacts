@@ -3,8 +3,9 @@
 //! Every Go-compiled binary (Linux ELF, macOS Mach-O, Windows PE)
 //! embeds the metadata for `runtime/debug.BuildInfo` in a fixed
 //! magic-prefixed blob that lives in a section named
-//! `.go.buildinfo` (ELF) / `__DATA,__go_buildinfo` (Mach-O) /
-//! `.go.buildinfo` (PE). The blob layout has been stable since
+//! `.go.buildinfo` (ELF) / `__DATA,__go_buildinfo` (Mach-O), or near the
+//! start of the first writable data segment or section when there is no
+//! such section (stripped ELF, PE). The blob layout has been stable since
 //! Go 1.13, and is the cleanest way to recover:
 //!
 //! - the compiler version (`go1.21.5`),
@@ -24,15 +25,20 @@
 //! ```text
 //!     +0   14 bytes  "\xff Go buildinf:"                  (magic)
 //!     +14  1 byte    pointer-size              (4 or 8)
-//!     +15  1 byte    flags                     (bit 1 = strings inline)
-//!     +16  …         payload
+//!     +15  1 byte    flags     (bit 1 = strings inline; else non-zero = big-endian)
+//!     +16  …         two pointers (pre-1.18), or padding to +32
+//!     +32  …         inline payload (1.18+)
 //! ```
+//!
+//! The blob starts 16-byte aligned within its region, and only there is
+//! it looked for, as Go's own `debug/buildinfo` does: the first magic
+//! string anywhere in the file may belong to an embedded payload or a
+//! decoy, and must not make the host "Go".
 //!
 //! When `flags & 0x2` is set (Go 1.18+) the payload is two
 //! varint-length-prefixed strings: the version string, then the
-//! `modinfo` blob. Older binaries use pointers into the data
-//! segment instead — those are not parsed here; the version string
-//! still recovers because the modinfo plain-text is searchable.
+//! `modinfo` blob. Older binaries store two pointers to Go string
+//! headers instead, which the caller's VA→offset resolver follows.
 //!
 //! The `modinfo` blob itself is plain UTF-8: one record per line,
 //! tab-separated fields, prefixed with a 16-byte sentinel pair the
@@ -47,29 +53,26 @@ use crate::output::{ValueKey, Values};
 
 const MAGIC: &[u8] = b"\xff Go buildinf:";
 
+/// The blob's alignment within its region and its fixed header size, as Go's
+/// linker writes them and `debug/buildinfo` reads them.
+const ALIGN: usize = 16;
+const HEADER_LEN: usize = 32;
+
 /// `dep` / `=>` records kept from one modinfo blob. Real binaries list a
 /// few hundred (Kubernetes about a thousand); each six-byte `dep\tA` line
 /// becomes a JSON object of several hundred bytes, so an unbounded list
 /// turns a modinfo blob into a hundredfold allocation.
 const MAX_DEPS: usize = 16_384;
 
-/// Scan the file for Go's build-info magic and, when present,
-/// populate `<key_prefix>.go.*` with the decoded metadata. The
-/// key prefix is the format's namespace (`"elf"`, `"macho"`,
-/// `"pe"`) — keeps Go data attached to the format that hosted it.
-///
-/// `resolve_va` is an optional virtual-address resolver. The old
-/// (Go <1.18) format encodes the version + modinfo strings as
-/// pointers into the binary's load segments; resolving them needs
-/// the format's program-header table. Callers that can map a VA to
-/// a file offset (the ELF extractor walks `PT_LOAD`) pass a
-/// closure; those that can't pass `None` and we silently skip the
-/// old-format decode.
-/// Attribution sections the caller resolves (via its format parser) and
-/// hands to [`detect`] so the Go build-id / GoRoot / developer source
-/// root can be recovered. None of these live in the build-info blob.
+/// The byte ranges the caller's format parser resolves for [`detect`]: where
+/// the build-info blob may live, and the attribution sections the Go
+/// build-id / GoRoot / developer source root are recovered from, none of
+/// which live in the blob.
 #[derive(Default)]
 pub(super) struct GoSections<'a> {
+    /// Where Go's `debug/buildinfo` looks for the blob: the dedicated
+    /// section, else the format's first writable data segment or section.
+    pub buildinfo: Option<&'a [u8]>,
     /// ELF `.note.go.buildid` note bytes (None for Mach-O / PE).
     pub buildid_note: Option<&'a [u8]>,
     /// `.gopclntab` / `__gopclntab` section bytes.
@@ -106,8 +109,32 @@ pub(super) fn has_pclntab_magic(data: &[u8]) -> bool {
         .is_some_and(|magic| PCLNTAB_MAGICS.contains(&magic))
 }
 
-/// Emit the build info found in `bytes` as one object at `key` (`pe.go`,
-/// `elf.go` or `macho.go`).
+/// The PE section Go's `debug/buildinfo` searches: the first one with an
+/// address and a size whose characteristics, alignment aside, are exactly
+/// initialized, readable, writable data.
+pub(super) fn pe_region<'a>(pe: &goblin::pe::PE<'_>, bytes: &'a [u8]) -> Option<&'a [u8]> {
+    const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x40;
+    const IMAGE_SCN_ALIGN_32BYTES: u32 = 0x60_0000;
+    const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
+    const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+    const DATA: u32 = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+    let section = pe.sections.iter().find(|s| {
+        s.virtual_address != 0
+            && s.size_of_raw_data != 0
+            && s.characteristics & !IMAGE_SCN_ALIGN_32BYTES == DATA
+    })?;
+    let start = crate::bytes::sat_usize(section.pointer_to_raw_data);
+    let end = start.saturating_add(crate::bytes::sat_usize(section.size_of_raw_data));
+    bytes.get(start..end.min(bytes.len()))
+}
+
+/// Decode the build-info blob in `sections.buildinfo` into one object at
+/// `key` (`pe.go`, `elf.go` or `macho.go`), keeping Go data attached to the
+/// format that hosted it.
+///
+/// `resolve_va` maps a virtual address to an offset in `bytes`. The pre-1.18
+/// layout stores pointers to the version and modinfo strings rather than the
+/// strings, so without a resolver that layout yields nothing.
 pub(super) fn detect(
     bytes: &[u8],
     values: &mut Values,
@@ -115,21 +142,25 @@ pub(super) fn detect(
     resolve_va: Option<&dyn Fn(u64) -> Option<usize>>,
     sections: &GoSections<'_>,
 ) {
-    let Some(start) = memchr::memmem::find(bytes, MAGIC) else {
+    // The blob: from the first magic at a 16-byte offset into the region.
+    let Some((header, payload)) = sections.buildinfo.and_then(|region| {
+        let at = memchr::memmem::find_iter(region, MAGIC).find(|at| at % ALIGN == 0)?;
+        region.get(at..)?.split_first_chunk::<HEADER_LEN>()
+    }) else {
         return;
     };
-    let Some((header, payload)) = bytes.get(start..).and_then(<[u8]>::split_first_chunk::<32>)
-    else {
-        return;
-    };
-    let ptr_size = header[14] as usize;
+    let ptr_size = usize::from(header[14]);
     let flags = header[15];
-    let inline = flags & 0x2 != 0;
 
     let mut obj = Map::new();
-    if inline {
-        // Payload starts at a 32-byte alignment from the magic.
+    if flags & 0x2 != 0 {
         let Some((version, rest)) = read_uvarint_string(payload) else {
+            tracing::debug!(
+                target: "filefacts::go_buildinfo",
+                stage = "inline",
+                format = key.as_str(),
+                "Go build-info version string is truncated"
+            );
             return;
         };
         let modinfo_bytes = read_uvarint_string(rest).map_or(&[][..], |(s, _)| s);
@@ -138,13 +169,26 @@ pub(super) fn detect(
         }
         parse_modinfo(modinfo_bytes, &mut obj);
     } else if let Some(resolve) = resolve_va {
-        // Old (Go <1.18) format: two VA pointers follow the header
-        // at +16. Each one points to a Go string-header struct
-        // (`{ data ptr; int len }`) sitting in the data segment.
-        if !decode_old_format(bytes, start, ptr_size, resolve, &mut obj) {
+        // Pre-1.18: two pointers at +16, each to a Go string header
+        // (`{ data ptr; int len }`) in the data segment.
+        let big_endian = flags != 0;
+        if !decode_old_format(bytes, header, ptr_size, big_endian, resolve, &mut obj) {
+            tracing::debug!(
+                target: "filefacts::go_buildinfo",
+                stage = "pointers",
+                format = key.as_str(),
+                ptr_size,
+                "Go build-info pointers do not resolve to a version string"
+            );
             return;
         }
     } else {
+        tracing::debug!(
+            target: "filefacts::go_buildinfo",
+            stage = "pointers",
+            format = key.as_str(),
+            "pre-1.18 Go build info needs a VA resolver this format lacks"
+        );
         return;
     }
 
@@ -296,34 +340,33 @@ fn is_path_byte(b: u8) -> bool {
     matches!(b, b'/' | b'.' | b'-' | b'_' | b'+' | b':') || b.is_ascii_alphanumeric()
 }
 
-/// Decode the legacy pointer-based build-info layout. Returns
-/// `true` when at least the Go version string was recovered. The
-/// resolver maps a VA to a file offset; the rest is just two
-/// indirections (pointer → string header → string body).
+/// Decode the pre-1.18 pointer layout whose header is `header`. Returns
+/// `true` when at least the Go version string was recovered. The resolver
+/// maps a VA to an offset in `bytes`; the rest is two indirections (pointer →
+/// string header → string body).
 fn decode_old_format(
     bytes: &[u8],
-    start: usize,
+    header: &[u8; HEADER_LEN],
     ptr_size: usize,
+    big_endian: bool,
     resolve_va: &dyn Fn(u64) -> Option<usize>,
     out: &mut Map<String, JsonValue>,
 ) -> bool {
     if ptr_size != 4 && ptr_size != 8 {
         return false;
     }
-    if start + 16 + 2 * ptr_size > bytes.len() {
-        return false;
-    }
-    let v_ptr = read_uint_le(bytes, start + 16, ptr_size);
-    let m_ptr = read_uint_le(bytes, start + 16 + ptr_size, ptr_size);
+    // Both pointers fit the 32-byte header at the widest pointer size.
+    let v_ptr = read_uint(header, 16, ptr_size, big_endian);
+    let m_ptr = read_uint(header, 16 + ptr_size, ptr_size, big_endian);
 
     let mut got_version = false;
-    if let Some(version) = read_go_string(bytes, v_ptr, ptr_size, resolve_va) {
+    if let Some(version) = read_go_string(bytes, v_ptr, ptr_size, big_endian, resolve_va) {
         if let Ok(s) = std::str::from_utf8(&version) {
             out.insert("version".into(), JsonValue::String(s.to_string()));
             got_version = true;
         }
     }
-    if let Some(modinfo) = read_go_string(bytes, m_ptr, ptr_size, resolve_va) {
+    if let Some(modinfo) = read_go_string(bytes, m_ptr, ptr_size, big_endian, resolve_va) {
         parse_modinfo(&modinfo, out);
     }
     got_version
@@ -335,17 +378,17 @@ fn read_go_string(
     bytes: &[u8],
     header_va: u64,
     ptr_size: usize,
+    big_endian: bool,
     resolve_va: &dyn Fn(u64) -> Option<usize>,
 ) -> Option<Vec<u8>> {
     let hdr_off = resolve_va(header_va)?;
     if hdr_off.checked_add(2 * ptr_size)? > bytes.len() {
         return None;
     }
-    let data_va = read_uint_le(bytes, hdr_off, ptr_size);
-    let len = read_uint_le(bytes, hdr_off + ptr_size, ptr_size);
-    // Sanity-cap on length so a malformed pointer can't have us
-    // allocate gigabytes. 4 MiB is far above any real Go modinfo
-    // (kube-diag's was 1.3 KiB).
+    let data_va = read_uint(bytes, hdr_off, ptr_size, big_endian);
+    let len = read_uint(bytes, hdr_off + ptr_size, ptr_size, big_endian);
+    // A forged length must not allocate gigabytes; real modinfo blobs are a
+    // few KiB, far under 4 MiB.
     let len = usize::try_from(len).ok()?.min(4 * 1024 * 1024);
     if len == 0 {
         return Some(Vec::new());
@@ -355,20 +398,18 @@ fn read_go_string(
     Some(bytes.get(data_off..end)?.to_vec())
 }
 
-/// Little-endian unsigned read of `width` bytes (4 or 8). Go
-/// binaries are little-endian on every mainstream architecture
-/// (the loader hasn't shipped a big-endian build target in
-/// years), so we don't carry an endian parameter — the few
-/// `mips`/`s390x` BE binaries are rare enough to defer.
-fn read_uint_le(bytes: &[u8], off: usize, width: usize) -> u64 {
-    let mut v: u64 = 0;
-    for i in 0..width {
-        let Some(&b) = bytes.get(off + i) else {
-            return v;
-        };
-        v |= u64::from(b) << (8 * i);
+/// Unsigned read of a `width`-byte (4 or 8) target pointer or `int`; 0 past
+/// the end of `bytes`, which resolves to nothing.
+fn read_uint(bytes: &[u8], off: usize, width: usize, big_endian: bool) -> u64 {
+    let Some(field) = off.checked_add(width).and_then(|end| bytes.get(off..end)) else {
+        return 0;
+    };
+    let fold = |acc: u64, b: &u8| (acc << 8) | u64::from(*b);
+    if big_endian {
+        field.iter().fold(0, fold)
+    } else {
+        field.iter().rev().fold(0, fold)
     }
-    v
 }
 
 /// Parse the modinfo text and fold its records into `out`. Records
@@ -489,7 +530,13 @@ fn classify_deps(deps: &[JsonValue]) -> (u32, u32, u32, u32) {
             replaced += 1;
         } else if path.contains("/vendor/") {
             vendored += 1;
-        } else if is_stdlib_path(path) {
+        } else if path
+            .split('/')
+            .next()
+            .is_some_and(|first| !first.is_empty() && !first.contains('.'))
+        {
+            // A stdlib path has no dot in its first segment; third-party
+            // module paths are domain-rooted (`github.com/…`).
             std += 1;
         } else {
             thirdparty += 1;
@@ -498,170 +545,16 @@ fn classify_deps(deps: &[JsonValue]) -> (u32, u32, u32, u32) {
     (std, thirdparty, replaced, vendored)
 }
 
-/// A Go stdlib package path has no dot in its first segment (third-party
-/// module paths are domain-rooted: `github.com/…`, `golang.org/x/…`).
-fn is_stdlib_path(path: &str) -> bool {
-    let first = path.split('/').next().unwrap_or("");
-    !first.is_empty() && !first.contains('.')
-}
-
 /// Decode an unsigned varint (Go's `encoding/binary.Uvarint`) and
 /// return the trailing string of that length plus the rest of the
 /// payload after it. The string is *not* validated as UTF-8 — caller
 /// decides whether to lossy-decode or skip.
 fn read_uvarint_string(buf: &[u8]) -> Option<(&[u8], &[u8])> {
-    let (len, after_len) = decode_uvarint(buf)?;
-    let len = usize::try_from(len).ok()?;
-    if len > after_len.len() {
-        return None;
-    }
-    let (s, rest) = after_len.split_at(len);
-    Some((s, rest))
-}
-
-fn decode_uvarint(buf: &[u8]) -> Option<(u64, &[u8])> {
-    let mut end = 0;
-    let value = read_uleb128(buf, &mut end)?;
-    Some((value, buf.get(end..)?))
+    let mut start = 0;
+    let len = usize::try_from(read_uleb128(buf, &mut start)?).ok()?;
+    let end = start.checked_add(len)?;
+    Some((buf.get(start..end)?, buf.get(end..)?))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pclntab_magic_recognizes_known_versions() {
-        // Go 1.18 (LE) and Go 1.20 (BE) headers, with a plausible tail.
-        assert!(has_pclntab_magic(&[0xf0, 0xff, 0xff, 0xff, 0, 0, 1, 8]));
-        assert!(has_pclntab_magic(&[0xff, 0xff, 0xff, 0xf1, 0, 0, 1, 8]));
-        // Go 1.2 / 1.16 little-endian.
-        assert!(has_pclntab_magic(&[0xfb, 0xff, 0xff, 0xff]));
-        assert!(has_pclntab_magic(&[0xfa, 0xff, 0xff, 0xff]));
-    }
-
-    #[test]
-    fn pclntab_magic_rejects_decoys_and_short_input() {
-        // A section named like pclntab but without a real magic must NOT pass —
-        // otherwise a decoy could downgrade analysis and hide functions.
-        assert!(!has_pclntab_magic(b"not a pclntab"));
-        assert!(!has_pclntab_magic(&[0x00, 0x00, 0x00, 0x00]));
-        assert!(!has_pclntab_magic(&[0xf0, 0xff, 0xff])); // too short
-        assert!(!has_pclntab_magic(&[])); // empty
-    }
-
-    #[test]
-    fn uvarint_decodes_small_values() {
-        // 0x96 0x01 → 150. Standard Go uvarint test vector.
-        let (v, rest) = decode_uvarint(&[0x96, 0x01, 0xaa]).unwrap();
-        assert_eq!(v, 150);
-        assert_eq!(rest, &[0xaa]);
-    }
-
-    #[test]
-    fn modinfo_parses_minimal_record_set() {
-        let mut out = Map::new();
-        parse_modinfo(
-            b"path\texample.com/main\nmod\texample.com/main\tv1.0.0\t\ndep\texample.com/util\tv0.1.0\th1:xyz=\nbuild\t-tags=foo\nbuild\tvcs=git\nbuild\tvcs.modified=true\n",
-            &mut out,
-        );
-        assert_eq!(out["path"], JsonValue::String("example.com/main".into()));
-        let deps = out["deps"].as_array().unwrap();
-        assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0]["path"], "example.com/util");
-        assert_eq!(out["build_settings"]["-tags"], "foo");
-        assert_eq!(out["vcs"]["system"], "git");
-        assert_eq!(out["vcs"]["modified"], "true");
-    }
-
-    #[test]
-    fn classifies_dependency_provenance() {
-        let mut out = Map::new();
-        parse_modinfo(
-            b"path\texample.com/main\n\
-              dep\tfmt\t(devel)\t\n\
-              dep\tgithub.com/foo/bar\tv1.2.3\th1:aaa=\n\
-              dep\texample.com/old\tv1.0.0\th1:bbb=\n\
-              =>\texample.com/new\tv2.0.0\th1:ccc=\n",
-            &mut out,
-        );
-        // fmt = std, github.com/foo/bar = thirdparty, example.com/old is
-        // replaced (followed by a `=>` target), the `=>` itself not counted.
-        assert_eq!(out["deps_std"], JsonValue::from(1u32));
-        assert_eq!(out["deps_thirdparty"], JsonValue::from(1u32));
-        assert_eq!(out["deps_replaced"], JsonValue::from(1u32));
-        assert_eq!(out["deps_vendored"], JsonValue::from(0u32));
-    }
-
-    #[test]
-    fn build_id_from_rodata_marker() {
-        let rodata = b"....Go build ID: \"abc123/def456\"....";
-        let id = build_id(None, Some(rodata), b"");
-        assert_eq!(id.as_deref(), Some("abc123/def456"));
-    }
-
-    #[test]
-    fn build_id_from_elf_note() {
-        // namesz=4 ("Go\0\0"), descsz=7 ("id12345"), type=4.
-        let mut note = Vec::new();
-        note.extend_from_slice(&4u32.to_le_bytes());
-        note.extend_from_slice(&7u32.to_le_bytes());
-        note.extend_from_slice(&4u32.to_le_bytes());
-        note.extend_from_slice(b"Go\0\0");
-        note.extend_from_slice(b"id12345");
-        assert_eq!(parse_elf_buildid_note(&note).as_deref(), Some("id12345"));
-    }
-
-    #[test]
-    fn old_format_pointer_resolving_near_usize_max_is_ignored() {
-        // A PT_LOAD whose `p_offset` sits near `u64::MAX` resolves the
-        // version pointer to an offset where `hdr_off + 2 * ptr_size`
-        // used to overflow (a panic under overflow checks).
-        let mut blob = MAGIC.to_vec();
-        blob.extend_from_slice(&[8, 0]); // ptr_size, pointer-format flags
-        blob.resize(32, 0);
-        let resolve = |_: u64| Some(usize::MAX - 4);
-        let mut values = Values::new();
-        detect(
-            &blob,
-            &mut values,
-            crate::value_key!("elf.go"),
-            Some(&resolve),
-            &GoSections::default(),
-        );
-        assert!(values.get("elf.go").is_none());
-    }
-
-    #[test]
-    fn build_id_note_with_overflowing_name_size_is_ignored() {
-        let mut note = Vec::new();
-        note.extend_from_slice(&u32::MAX.to_le_bytes()); // namesz
-        note.extend_from_slice(&4u32.to_le_bytes());
-        note.extend_from_slice(&4u32.to_le_bytes());
-        note.extend_from_slice(b"Go\0\0abcd");
-        assert_eq!(parse_elf_buildid_note(&note), None);
-    }
-
-    /// Each `dep` line becomes a JSON object hundreds of times its size, so
-    /// the list stops at [`MAX_DEPS`].
-    #[test]
-    fn modinfo_dependency_list_is_capped() {
-        let blob = "dep\tA\n".repeat(MAX_DEPS + 10);
-        let mut out = Map::new();
-        parse_modinfo(blob.as_bytes(), &mut out);
-        assert_eq!(out["deps"].as_array().unwrap().len(), MAX_DEPS);
-    }
-
-    #[test]
-    fn go_root_from_pclntab_runtime_path() {
-        let pclntab = b"\x00\x00/usr/local/go/src/runtime/proc.go\x00";
-        assert_eq!(scan_go_root(pclntab).as_deref(), Some("/usr/local/go"));
-    }
-
-    #[test]
-    fn main_root_is_common_dir_of_developer_paths() {
-        let pclntab =
-            b"/home/dev/project/main.go\x00\x00/home/dev/project/pkg/util.go\x00\x00/usr/local/go/src/runtime/proc.go\x00";
-        let root = scan_go_main_root(pclntab, Some("/usr/local/go"));
-        assert_eq!(root.as_deref(), Some("/home/dev/project"));
-    }
-}
+mod tests;

@@ -4,8 +4,8 @@
 //! table: how many members of each kind, how big, how they are named, and
 //! when they were written. The counting lives here once. An extractor builds
 //! each [`ArchiveMember`] once, hands it to [`ArchiveStats::observe`] with its
-//! own [`Reading`] of what the typed member leaves open, derives the
-//! `archive.members[]` value with [`member_value`], and finally calls
+//! own [`Reading`] of what the typed member leaves open, serializes it into
+//! `archive.members[]` with [`member_value`], and finally calls
 //! [`ArchiveStats::emit`].
 //!
 //! Formats differ in which aggregates they can honestly report (a CAB has no
@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::metric;
-use crate::output::{ArchiveMember, Metrics, Values};
+use crate::output::{ArchiveMember, EntryType, Metrics, Values};
 use crate::value_key;
 
 /// Year-2100 ceiling for a believable member timestamp, as Unix seconds. A
@@ -142,7 +142,7 @@ impl Reading {
     pub(super) fn of(member: &ArchiveMember) -> Self {
         let class = classify_filename(&member.path);
         Self {
-            file: member.entry_type.as_deref() != Some("directory"),
+            file: member.entry_type != EntryType::Directory,
             hidden: class.is_hidden,
             exec_mode: false,
             class,
@@ -176,7 +176,7 @@ pub(super) struct ArchiveStats {
     size_files: u64,
     compressed: u64,
     methods: BTreeMap<String, u64>,
-    entry_types: BTreeMap<String, u64>,
+    entry_types: BTreeMap<EntryType, u64>,
     setuid: u64,
     setgid: u64,
     sticky: u64,
@@ -227,9 +227,9 @@ impl ArchiveStats {
     pub(super) fn observe(&mut self, member: &ArchiveMember, reading: &Reading) {
         let path = member.path.as_str();
         let class = &reading.class;
-        let entry_type = member.entry_type.as_deref();
+        let entry_type = member.entry_type;
         self.members += 1;
-        if entry_type == Some("directory") {
+        if entry_type == EntryType::Directory {
             self.directories += 1;
         }
         if reading.file {
@@ -238,7 +238,7 @@ impl ArchiveStats {
         }
         self.size_all = self.size_all.saturating_add(member.size_bytes);
 
-        let compressed = member.compression.as_ref().and_then(|c| c.compressed_size);
+        let compressed = member.compression.compressed_size;
         self.compressed = self.compressed.saturating_add(compressed.unwrap_or(0));
         if let Some(c) = compressed
             && c > 0
@@ -252,34 +252,27 @@ impl ArchiveStats {
                 self.bomb_files = ratio;
             }
         }
-        if let Some(method) = member
-            .compression
-            .as_ref()
-            .and_then(|c| c.method.as_deref())
-        {
+        if let Some(method) = member.compression.method.as_deref() {
             count_key(&mut self.methods, method);
         }
-        if let Some(t) = entry_type {
-            count_key(&mut self.entry_types, t);
-        }
+        *self.entry_types.entry(entry_type).or_default() += 1;
 
-        if let Some(ownership) = &member.ownership {
-            if let Some(mode) = ownership.mode_octal {
-                self.setuid += u64::from(mode & 0o4000 != 0);
-                self.setgid += u64::from(mode & 0o2000 != 0);
-                self.sticky += u64::from(mode & 0o1000 != 0);
-                self.world_writable += u64::from(mode & 0o002 != 0);
+        let ownership = &member.ownership;
+        if let Some(mode) = ownership.mode_octal {
+            self.setuid += u64::from(mode & 0o4000 != 0);
+            self.setgid += u64::from(mode & 0o2000 != 0);
+            self.sticky += u64::from(mode & 0o1000 != 0);
+            self.world_writable += u64::from(mode & 0o002 != 0);
+        }
+        if self.keep_owner_names {
+            if let Some(name) = &ownership.uname {
+                self.unames.insert(name.clone());
             }
-            if self.keep_owner_names {
-                if let Some(name) = &ownership.uname {
-                    self.unames.insert(name.clone());
-                }
-                if let Some(name) = &ownership.gname {
-                    self.gnames.insert(name.clone());
-                }
+            if let Some(name) = &ownership.gname {
+                self.gnames.insert(name.clone());
             }
         }
-        if entry_type == Some("symlink") {
+        if entry_type == EntryType::Symlink {
             self.symlinks += 1;
             self.symlink_escapes += u64::from(member.linkname.as_deref().is_some_and(|target| {
                 target.starts_with('/') || target.split('/').any(|c| c == "..")
@@ -379,13 +372,15 @@ impl ArchiveStats {
                 }
             }
             Agg::EntryTypes => {
+                // Sorted by name, not by declaration order.
+                let names: BTreeSet<&str> = self.entry_types.keys().map(|t| t.as_str()).collect();
                 values.insert_key(
                     value_key!("archive.format.entry_types"),
-                    key_list(&self.entry_types),
+                    JsonValue::Array(names.into_iter().map(JsonValue::from).collect()),
                 );
                 for (entry_type, count) in &self.entry_types {
                     metrics.insert(
-                        crate::archive_entry_type_count(&entry_type.replace('-', "_")),
+                        crate::archive_entry_type_count(&entry_type.as_str().replace('-', "_")),
                         *count as f64,
                     );
                 }
@@ -623,64 +618,15 @@ fn string_list(set: &BTreeSet<String>) -> JsonValue {
     JsonValue::Array(set.iter().map(|s| JsonValue::String(s.clone())).collect())
 }
 
-/// Which optional groups of a typed member its `archive.members[]` value
-/// carries. A format whose published value never had a group keeps it out,
-/// so the public shape does not change under it.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct Shape {
-    /// `header_offset`, `data_offset`, `central_header_offset`.
-    pub(super) offsets: bool,
-    /// `compressed_size`, `compression_method`.
-    pub(super) compression: bool,
-}
-
-impl Shape {
-    /// Every group the typed member has.
-    pub(super) const FULL: Self = Self {
-        offsets: true,
-        compression: true,
-    };
-}
-
-/// The `archive.members[]` value for one typed member: every populated
-/// field under its published key. `encrypted` appears only when set. Formats
-/// append their own extra keys to the returned object.
-pub(super) fn member_value(m: &ArchiveMember, shape: Shape) -> JsonMap<String, JsonValue> {
-    fn put(obj: &mut JsonMap<String, JsonValue>, key: &str, value: Option<impl Into<JsonValue>>) {
-        if let Some(v) = value {
-            obj.insert(key.into(), v.into());
-        }
+/// The `archive.members[]` value for one typed member: its serde form, to
+/// which a format may append keys of its own.
+pub(super) fn member_value(m: &ArchiveMember) -> JsonMap<String, JsonValue> {
+    // Every field serializes to a JSON string, number or bool, so this is
+    // always an object.
+    match serde_json::to_value(m) {
+        Ok(JsonValue::Object(obj)) => obj,
+        _ => JsonMap::new(),
     }
-    let mut obj = JsonMap::new();
-    obj.insert("path".into(), JsonValue::String(m.path.clone()));
-    obj.insert("size_bytes".into(), m.size_bytes.into());
-    put(&mut obj, "entry_type", m.entry_type.clone());
-    put(&mut obj, "mtime_unix", m.mtime_unix);
-    put(&mut obj, "linkname", m.linkname.clone());
-    put(&mut obj, "host_os", m.host_os.clone());
-    put(&mut obj, "crc32", m.crc32);
-    if m.encrypted {
-        obj.insert("encrypted".into(), JsonValue::Bool(true));
-    }
-    if shape.compression
-        && let Some(c) = &m.compression
-    {
-        put(&mut obj, "compressed_size", c.compressed_size);
-        put(&mut obj, "compression_method", c.method.clone());
-    }
-    if let Some(o) = &m.ownership {
-        put(&mut obj, "mode_octal", o.mode_octal);
-        put(&mut obj, "uid", o.uid);
-        put(&mut obj, "gid", o.gid);
-        put(&mut obj, "uname", o.uname.clone());
-        put(&mut obj, "gname", o.gname.clone());
-    }
-    if shape.offsets {
-        put(&mut obj, "header_offset", m.offsets.header);
-        put(&mut obj, "data_offset", m.offsets.data);
-        put(&mut obj, "central_header_offset", m.offsets.central_header);
-    }
-    obj
 }
 
 /// Classification flags for one member path, from the name alone.
@@ -779,7 +725,10 @@ pub(super) fn is_noise_filename(path: &str) -> bool {
     matches!(base, ".DS_Store" | "Thumbs.db" | "desktop.ini")
 }
 
-fn is_executable_extension(ext: &str) -> bool {
+/// Extensions of native executables and libraries, and of the Windows file
+/// kinds the shell launches as programs. The one table every archive and
+/// disk-image walker counts executables by; extensions are lowercase.
+pub(super) fn is_executable_extension(ext: &str) -> bool {
     matches!(
         ext,
         "exe"
@@ -787,8 +736,14 @@ fn is_executable_extension(ext: &str) -> bool {
             | "sys"
             | "scr"
             | "com"
+            | "pif"
             | "cpl"
+            | "ocx"
+            | "efi"
             | "msi"
+            | "msix"
+            | "appx"
+            | "msc"
             | "so"
             | "dylib"
             | "bin"
@@ -798,7 +753,9 @@ fn is_executable_extension(ext: &str) -> bool {
     )
 }
 
-fn is_script_extension(ext: &str) -> bool {
+/// Script extensions an interpreter runs directly, Windows Script Host and
+/// HTML applications included.
+pub(super) fn is_script_extension(ext: &str) -> bool {
     matches!(
         ext,
         "sh" | "bash"
@@ -813,6 +770,7 @@ fn is_script_extension(ext: &str) -> bool {
             | "pm"
             | "rb"
             | "js"
+            | "jse"
             | "mjs"
             | "cjs"
             | "ps1"
@@ -824,12 +782,15 @@ fn is_script_extension(ext: &str) -> bool {
             | "vbe"
             | "wsf"
             | "wsh"
+            | "hta"
             | "lua"
             | "php"
     )
 }
 
-fn is_archive_extension(ext: &str) -> bool {
+/// Archive and package extensions, whose members a consumer would unpack
+/// and walk in turn.
+pub(super) fn is_archive_extension(ext: &str) -> bool {
     matches!(
         ext,
         "zip"
@@ -841,6 +802,7 @@ fn is_archive_extension(ext: &str) -> bool {
             | "xpi"
             | "crx"
             | "nupkg"
+            | "asar"
             | "tar"
             | "gz"
             | "tgz"

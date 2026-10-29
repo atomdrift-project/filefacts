@@ -68,7 +68,8 @@ fn bash_53_normalizer_handles_special_indirect_and_array_parameters() {
 
 #[test]
 fn bash_53_normalizer_is_linear_on_unterminated_openers() {
-    // Each opener used to rescan the rest of the input for `]` or `}`.
+    // Rescanning the rest of the input for `]` or `}` at each opener would
+    // be quadratic.
     let unterminated = "${a[".repeat(64 * 1024) + "~}";
     assert!(normalize_bash_case_modification(&unterminated).is_none());
     let far_close = "${a~".repeat(64 * 1024) + "}";
@@ -82,7 +83,11 @@ fn bash_53_normalizer_is_linear_on_unterminated_openers() {
 
 #[test]
 fn bash_53_obfuscated_shell_regression_parses_without_losing_original_offsets() {
-    let source = include_bytes!("../../../../testdata/shell/bash53-case-inversion/4a5376aa6c33.sh");
+    let source = zstd::decode_all(
+        &include_bytes!("../../../../testdata/shell/bash53-case-inversion/4a5376aa6c33.sh.zst")[..],
+    )
+    .expect("specimen decompresses");
+    let source = source.as_slice();
     let parsed = TreeCache::parse(source, FileType::Shell, None);
     let cache = parsed
         .cache()

@@ -169,7 +169,7 @@ fn extracts_tracker_block() {
     // `machine_name` field that this extractor never writes, so the claim
     // was silently empty on every shortcut. It is reported once, as
     // `machine_id`; a `lnk_machine_name` duplicate was dropped.
-    let id = super::super::identity::derive(crate::FileType::Lnk, &lnk, &v);
+    let id = crate::identity::derive(crate::FileType::Lnk, &lnk, &v);
     assert_eq!(
         id.unique_ids.get("machine_id").map(String::as_str),
         Some("build-host-01")

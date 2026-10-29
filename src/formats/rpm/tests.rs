@@ -358,9 +358,7 @@ fn repeated_string_tag_is_read_once() {
     let mut tags = vec![(main_tag::NAME, 6, 1, Vec::new()); 20_000];
     // Not printable, so the binary string scan of the file stays cheap.
     tags.push((main_tag::NAME, 6, 1, vec![0x01; 1 << 20]));
-    let start = std::time::Instant::now();
     let (v, _, e) = run(&script_rpm(tags));
-    assert!(start.elapsed() < std::time::Duration::from_secs(5));
     assert!(v.get("rpm.name").is_none());
     assert!(e.is_empty(), "{e:?}");
 
@@ -371,4 +369,18 @@ fn repeated_string_tag_is_read_once() {
     ];
     let (v, _, _) = run(&script_rpm(tags));
     assert_eq!(v.get("rpm.name").and_then(|x| x.as_str()), Some("last"));
+}
+
+/// The work bound behind [`repeated_string_tag_is_read_once`], which only a
+/// clock shows: 20,000 copies of a 1 MiB run must not be read 20,000 times.
+/// A wall-clock bound flakes under a loaded test run, so it runs on request.
+#[test]
+#[ignore = "wall-clock bound; run with --ignored"]
+fn repeated_string_tag_read_is_linear() {
+    let mut tags = vec![(main_tag::NAME, 6, 1, Vec::new()); 20_000];
+    tags.push((main_tag::NAME, 6, 1, vec![0x01; 1 << 20]));
+    let bytes = script_rpm(tags);
+    let start = std::time::Instant::now();
+    run(&bytes);
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
 }

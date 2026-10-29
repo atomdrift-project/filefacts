@@ -1,3 +1,6 @@
+use super::symbols::{
+    import_name_offsets, normalize_dylib_path, strip_darwin_symbol_variant, symtab_symbols,
+};
 use super::*;
 use crate::output::Strings;
 
@@ -79,10 +82,9 @@ fn load_command_name_strips_required_bit() {
 
 /// End-to-end coverage of the variant-suffix normalization through the
 /// full `open()` pipeline, on a real Mach-O whose `LC_SYMTAB` records
-/// libc calls under Darwin's `$`-variant spelling. The fixture is a live
-/// (already-public) malware sample, so it is stored zstd-compressed — both
-/// to keep it small and to keep an executable backdoor from sitting
-/// unpacked in the tree where on-access scanners would quarantine it.
+/// libc calls under Darwin's `$`-variant spelling. The fixture is a real,
+/// already-public malicious dylib, stored zstd-compressed so it is small and
+/// not an executable on-access scanners quarantine.
 #[test]
 fn open_normalizes_darwin_variant_import_names() {
     let compressed = std::fs::read(concat!(
@@ -132,12 +134,10 @@ fn open_normalizes_darwin_variant_import_names() {
     );
 }
 
-/// Regression test for a panic seen in the field: a small file
-/// whose CAFEBABE prefix made goblin parse a fat header with
-/// implausible arch offsets. The old slicing path computed
-/// `&bytes[start..end]` where `start > bytes.len()` and panicked
-/// with `range start index N out of range`. We now bail before
-/// the slice and `extract` returns cleanly.
+/// A small file whose CAFEBABE prefix makes goblin parse a fat header with
+/// arch offsets past the end of the file: slicing `bytes[start..end]` with
+/// `start > bytes.len()` would panic, so the slice is skipped and `extract`
+/// returns cleanly.
 #[test]
 fn fat_header_with_out_of_range_arch_offset_does_not_panic() {
     // CAFEBABE + nfat_arch=2 + two arch entries each claiming a
@@ -165,10 +165,10 @@ fn fat_header_with_out_of_range_arch_offset_does_not_panic() {
 #[test]
 fn fat_table_must_fit_the_file() {
     // 50 entries of 20 bytes after the 8-byte header fill 1008 bytes.
-    assert!(fat_table_fits(50, 1008));
-    assert!(!fat_table_fits(51, 1008));
-    assert!(!fat_table_fits(u32::MAX as usize, 1024));
-    assert!(fat_table_fits(0, 0));
+    assert!(fat::table_fits(50, 1008));
+    assert!(!fat::table_fits(51, 1008));
+    assert!(!fat::table_fits(u32::MAX as usize, 1024));
+    assert!(fat::table_fits(0, 0));
 }
 
 #[test]
@@ -185,7 +185,7 @@ fn fat_header_arch_count_is_bounded_by_the_buffer() {
     assert!(
         metrics
             .get("macho.slice_count")
-            .is_none_or(|n| n <= MAX_FAT_ARCHES as f64)
+            .is_none_or(|n| n <= fat::MAX_ARCHES as f64)
     );
 }
 
@@ -312,8 +312,7 @@ fn end_to_end_parses_real_macho_fixture() {
 }
 
 /// Pin the `_raw` header fields and class_bits / entry / load
-/// command size values that downstream typed consumers
-/// (`cleave::MachoMetrics`) deserialise. test.macho is an x86_64
+/// command size values typed consumers deserialise. test.macho is an x86_64
 /// (cputype `0x01000007`) thin executable (`MH_EXECUTE = 0x2`).
 #[test]
 fn raw_header_fields_pinned() {
@@ -346,8 +345,7 @@ fn raw_header_fields_pinned() {
     );
 }
 
-/// Pin per-segment raw initprot/maxprot fields used by cleave's
-/// `MachoSegmentEntry::{initprot_hex, maxprot_hex}`.
+/// Pin per-segment raw initprot/maxprot fields.
 #[test]
 fn segment_raw_protections_emitted() {
     let bytes = read_fixture("test.macho");
@@ -367,8 +365,7 @@ fn segment_raw_protections_emitted() {
     assert_eq!(text.get("maxprot_raw").and_then(|x| x.as_u64()), Some(5));
 }
 
-/// Pin per-dylib raw current/compat versions used by cleave's
-/// typed `MachoDylibEntry`.
+/// Pin per-dylib raw current/compat versions.
 #[test]
 fn load_dylibs_raw_versions_emitted() {
     let bytes = read_fixture("test.macho");
@@ -597,7 +594,7 @@ fn forged_symbol_count_walks_only_the_entries_in_the_file() {
     assert_eq!(symtab_symbols(&macho, &file).count(), 2);
     assert!(import_name_offsets(&macho, &file).is_empty());
     let mut values = Values::new();
-    super::super::macho_hashes::emit(&macho, &file, &mut values, &crate::Symbols::new());
+    hashes::emit(&macho, &file, &mut values, &crate::Symbols::new());
     assert!(values.get("macho.hashes.symhash").is_none());
 }
 
@@ -686,7 +683,7 @@ fn overlapping_sections_share_one_entropy_pass() {
     let file = thin_macho(&[&command], &[0x90; 0x1000]);
     let macho = MachO::parse(&file, 0).expect("Mach-O with sections");
     let mut sections = Vec::new();
-    extract_sections(&macho, &file, &mut Metrics::new(), &mut sections);
+    extract_sections(&macho, &file, &mut sections);
     assert_eq!(sections.len(), nsects as usize);
     let measured = sections.iter().filter(|s| s.entropy.is_some()).count();
     assert!(
@@ -702,4 +699,51 @@ fn u32s(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
         .0
         .iter()
         .map(|c| u32::from_le_bytes(*c))
+}
+
+/// A fat binary whose first slice does not parse still gets a primary slice:
+/// the first one that does, analysed once, with the failure recorded.
+#[test]
+fn first_parseable_fat_slice_is_the_primary() {
+    // LC_UUID with a recognisable first word.
+    let slice = thin_macho(&[&[0x1b, 24, 0x0403_0201, 0, 0, 0]], &[]);
+    let mut file = vec![0u8; 0x3000];
+    let mut header = vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 2];
+    for (offset, size) in [(0x1000u32, 64u32), (0x2000, slice.len() as u32)] {
+        for word in [0x0100_0007u32, 3, offset, size, 12] {
+            header.extend_from_slice(&word.to_be_bytes());
+        }
+    }
+    file[..header.len()].copy_from_slice(&header);
+    file[0x2000..0x2000 + slice.len()].copy_from_slice(&slice);
+
+    let mut out = crate::formats::Sinks::default();
+    extract(&file, out.ctx());
+    let uuid = "01020304-0000-0000-0000-000000000000";
+    assert_eq!(out.values.get("macho.uuid"), Some(&serde_json::json!(uuid)));
+    let slices = out.values.get("macho.slices").unwrap().as_array().unwrap();
+    assert_eq!(slices.len(), 1);
+    assert_eq!(slices[0]["uuid"], uuid);
+    assert_eq!(slices[0]["file_offset"], 0x2000);
+    assert!(
+        out.errors
+            .iter()
+            .any(|e| e.message.contains("fat slice 0 does not parse")),
+        "{:?}",
+        out.errors
+    );
+}
+
+/// `LC_MAIN` stores the entry as a file offset; placed as an address it would
+/// fall in `__PAGEZERO` and name no section. Resolved through `__TEXT`, the
+/// entry lands in `__text`.
+#[test]
+fn lc_main_entry_resolves_to_its_section() {
+    let bytes = read_fixture("test.macho");
+    let (v, _, m) = run(&bytes);
+    assert_eq!(
+        v.get("macho.entry_section"),
+        Some(&serde_json::json!("__text"))
+    );
+    assert!(m.get("macho.entry_outside_segments").is_none());
 }

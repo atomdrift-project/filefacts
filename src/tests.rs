@@ -2,15 +2,15 @@ use super::*;
 
 #[test]
 fn guarded_turns_a_panic_into_its_message() {
-    assert_eq!(guarded(|| 7).ok(), Some(7));
-    let caught = guarded::<()>(|| panic!("boom"));
+    assert_eq!(guarded("test", || 7).ok(), Some(7));
+    let caught = guarded::<()>("test", || panic!("boom"));
     assert_eq!(caught.err().map(|panic| panic.0), Some("boom".to_string()));
 }
 
 #[test]
 fn invalid_utf8_cfml_does_not_take_down_the_caller() {
-    // Used to panic in the CFML flow parse, which sat outside every
-    // `catch_unwind` and so aborted the whole process.
+    // The CFML flow parse runs outside the extraction pipeline, so it needs
+    // its own guard: a panic there must not abort the whole process.
     let mut source = b"<cfset a = ".to_vec();
     source.extend(std::iter::repeat_n(0xFF, 100));
     source.extend_from_slice(b".foo()>");
@@ -147,11 +147,9 @@ fn validate_source_query_reports_invalid_query_with_its_cause() {
 
 /// The content/extension transition is path-derived but is written into
 /// the extraction output, so it has to be part of the disk-cache key.
-/// Identical bytes named `x.woff2` and `x.wav` detect as the same type,
-/// and before this was folded in they shared a cache entry: whichever was
-/// scanned first decided the mismatch metric for both, so a masquerade was
-/// reported on the wrong file or missed on the right one depending only on
-/// directory order.
+/// Identical bytes named `x.woff2` and `x.wav` detect as the same type; were
+/// the transition not in the key they would share a cache entry, and
+/// whichever was scanned first would decide the mismatch metric for both.
 #[test]
 fn cache_variant_separates_extension_transitions() {
     let as_font = extraction_cache_variant(
@@ -319,8 +317,10 @@ fn parse_count_is_one_after_any_view_access() {
 
 #[test]
 fn chm_overlay_uses_archive_data_and_directory_extents() {
-    let overlay = include_bytes!("../testdata/chm/overlay-persistence-sample.chm");
-    let parsed = open(overlay);
+    let overlay =
+        zstd::decode_all(&include_bytes!("../testdata/chm/overlay-persistence-sample.chm.zst")[..])
+            .expect("fixture decompresses");
+    let parsed = open(&overlay);
     let metrics = parsed.metrics();
     assert_eq!(metrics.get("binary.has_overlay"), Some(1.0));
     assert_eq!(metrics.get("binary.overlay_size"), Some(1546.0));
@@ -380,8 +380,8 @@ fn extracted_round_trips_through_cache_json() {
     // JSON, so a real, rich extraction (sections, symbols, the
     // stng-typed byte-scan `text` tier, metrics, identity) must
     // survive serialize -> deserialize -> serialize unchanged.
-    // Caching is off under cfg(test), so `extracted()` returns a
-    // freshly computed snapshot to round-trip.
+    // Caching is off by default, so `extracted()` returns a freshly
+    // computed extraction to round-trip.
     let bytes = std::fs::read("tests/fixtures/test.exe").expect("test.exe fixture should exist");
     let parsed = open(&bytes);
     let original = parsed.extracted();
@@ -401,7 +401,7 @@ fn extracted_round_trips_through_cache_json() {
 }
 
 #[test]
-fn pe_instruction_xor_strings_keep_provenance_across_snapshot() {
+fn pe_instruction_xor_strings_keep_provenance_across_the_cache() {
     // Synthetic PE containing only a decoder and inert API-name strings.
     // Names recovered from content must not be promoted into PE imports.
     let bytes = include_bytes!("../tests/fixtures/pe-xor-decoder.exe");
@@ -422,14 +422,13 @@ fn pe_instruction_xor_strings_keep_provenance_across_snapshot() {
         assert!(!e.symbols.iter().any(|s| s.kind() == SymbolKind::Import));
     };
     check(&extracted);
-    let snapshot = ExtractedSnapshot::from(extracted);
-    let json = serde_json::to_vec(&snapshot).unwrap();
-    let restored: ExtractedSnapshot = serde_json::from_slice(&json).unwrap();
-    check(&Extracted::from(restored));
+    let json = serde_json::to_vec(&extracted).unwrap();
+    let restored: Extracted = serde_json::from_slice(&json).unwrap();
+    check(&restored);
 }
 
 #[test]
-fn snapshot_keeps_strings_decoded_out_of_the_file() {
+fn cache_keeps_strings_decoded_out_of_the_file() {
     // An RTF's `\objdata` hex decodes to a command that appears nowhere
     // in the file's bytes. Those rows are appended to the text tier and
     // must survive the cache round-trip with the rest.
@@ -450,10 +449,8 @@ fn snapshot_keeps_strings_decoded_out_of_the_file() {
     let has_command = |e: &Extracted| e.strings.text.iter().any(|s| s.value.contains("certutil"));
     assert!(has_command(&extracted), "decoded command should be present");
 
-    let snapshot = ExtractedSnapshot::from(extracted);
-    let json = serde_json::to_vec(&snapshot).expect("serialize snapshot");
-    let restored: ExtractedSnapshot = serde_json::from_slice(&json).unwrap();
-    let rehydrated = Extracted::from(restored);
+    let json = serde_json::to_vec(&extracted).expect("serialize extraction");
+    let rehydrated: Extracted = serde_json::from_slice(&json).unwrap();
     assert!(
         has_command(&rehydrated),
         "decoded command must survive the cache round-trip"
@@ -461,7 +458,7 @@ fn snapshot_keeps_strings_decoded_out_of_the_file() {
 }
 
 #[test]
-fn snapshot_round_trips_text_rows_in_order() {
+fn cache_round_trips_text_rows_in_order() {
     // The disk cache stores the byte-scan rows itself, as one list in
     // extraction order, so a cached `open` returns exactly the rows (and
     // order) a fresh one does.
@@ -470,10 +467,8 @@ fn snapshot_round_trips_text_rows_in_order() {
     let want: Vec<stng::ExtractedString> = extracted.strings.text.rows().to_vec();
     assert!(!want.is_empty(), "fixture should yield byte-scan strings");
 
-    let snapshot = ExtractedSnapshot::from(extracted);
-    let json = serde_json::to_vec(&snapshot).expect("serialize snapshot");
-    let restored: ExtractedSnapshot = serde_json::from_slice(&json).expect("deserialize");
-    let got = Extracted::from(restored);
+    let json = serde_json::to_vec(&extracted).expect("serialize extraction");
+    let got: Extracted = serde_json::from_slice(&json).expect("deserialize");
     assert_eq!(
         got.strings.text.rows().to_vec(),
         want,
@@ -488,29 +483,6 @@ fn metrics_always_include_size_and_entropy() {
     let m = parsed.metrics();
     assert_eq!(m.get("file.size"), Some(256.0));
     assert!(m.get("file.entropy").unwrap() < 0.01);
-}
-
-/// `ParsedFile::symbol_iter` walks every Import / Export /
-/// Function row in one pass. Used by trait matchers that don't
-/// care which sub-kind a name appears in.
-#[test]
-fn symbol_iter_walks_all_three_collections() {
-    let bytes = std::fs::read("tests/fixtures/test.exe").expect("test.exe fixture should exist");
-    let parsed = open(&bytes);
-    // Realize the views before iterating — the lazy parse runs
-    // on first `.values()` access.
-    let _ = parsed.values();
-    let symbols = parsed.symbols();
-    let import_count = symbols.iter_kind(SymbolKind::Import).count();
-    assert!(import_count > 0, "PE fixture should have imports");
-    let total = parsed.symbol_iter().count();
-    let expected = symbols.iter_kind(SymbolKind::Import).count()
-        + symbols.iter_kind(SymbolKind::Export).count()
-        + symbols.iter_kind(SymbolKind::Function).count();
-    assert_eq!(
-        total, expected,
-        "symbol_iter must visit every Import/Export/Function row"
-    );
 }
 
 /// A healthy PE fixture should produce zero parse errors and
@@ -621,12 +593,15 @@ fn unique_script(tag: &str) -> Vec<u8> {
 }
 
 /// Each `ParsedFile` reads and writes the disk cache only as its own
-/// options say, whatever another file opened alongside asked for. (Unit
-/// tests get a private cache root; see `cache::root_location`.)
+/// options say, whatever another file opened alongside asked for.
 #[test]
 fn cache_setting_belongs_to_each_parsed_file() {
     let bytes = unique_script("cache-setting");
-    let cached = OpenOptions::new().cache(true).rizin(false);
+    let dir = tempfile::tempdir().unwrap();
+    let cached = OpenOptions::new()
+        .cache(true)
+        .cache_dir(dir.path())
+        .rizin(false);
 
     let first = cached.open(&bytes);
     let _ = first.metrics();
@@ -647,7 +622,10 @@ fn cache_setting_belongs_to_each_parsed_file() {
     // Rizin settings are part of the key: with rizin installed, a
     // rizin-on open must not be served the rizin-off entry. Without it
     // the two extractions are identical and rightly share one.
-    let rizin_on = OpenOptions::new().cache(true).open(&bytes);
+    let rizin_on = OpenOptions::new()
+        .cache(true)
+        .cache_dir(dir.path())
+        .open(&bytes);
     let _ = rizin_on.metrics();
     assert_eq!(rizin_on.parse_count(), u32::from(rizin::available()));
 }

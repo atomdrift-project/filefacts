@@ -88,7 +88,6 @@ fn touch_all(parsed: &ParsedFile<'_>) {
     black_box(parsed.references().len());
     black_box(parsed.errors());
     black_box(parsed.embedded_sources().count());
-    black_box(parsed.symbol_iter().count());
     fail_on_caught_panic(parsed);
 }
 

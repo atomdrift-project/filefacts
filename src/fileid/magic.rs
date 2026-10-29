@@ -10,13 +10,21 @@
 
 use std::{io::Read, path::Path};
 
-use super::ext::{ends_with_ci, is_odf_extension, lowercase_ext};
-use super::scripts::find_ci;
 use super::{
-    ArchiveFormat, Compression, DetectionSource, FileType, UTF8_BOM, container_of, sniff::Sniff,
-    strip_utf8_bom,
+    Compression, DetectionSource, FileType,
+    ext::{ends_with_ci, lowercase_ext},
+    sniff::Sniff,
+    text::{Controls, UTF8_BOM, control_bytes, strip_utf8_bom},
+    torch,
 };
 use crate::bytes;
+
+mod archive;
+mod markup;
+
+use archive::{Inside, TAR_HEAD_LIMIT, TAR_PEEK_LIMIT, classify_pk, classify_tar, tar_layout};
+pub(super) use markup::WSH_SCRIPT_WINDOW;
+use markup::{detect_xml, encoded_script, script_host_document};
 
 /// LNK shell link CLSID header (20 bytes).
 const LNK_MAGIC: &[u8] = &[
@@ -72,11 +80,6 @@ fn looks_like_axml(data: &[u8]) -> bool {
     u32::from_le_bytes([s0, s1, s2, s3]) as usize == data.len()
 }
 
-/// Detect file type from content. Returns the type and how it was detected.
-pub(crate) fn detect_from_content(path: &Path, data: &[u8]) -> Option<(FileType, DetectionSource)> {
-    detect_from_sniff(&Sniff::new(path, data))
-}
-
 /// A content check's verdict: the type and how it was detected.
 type Found = (FileType, DetectionSource);
 
@@ -129,10 +132,10 @@ const RULES: &[fn(&Probe<'_, '_>) -> Option<Found>] = &[
     asar,
     lzma_alone,
     github_actions_workflow,
-    manifest,
+    chrome_manifest,
 ];
 
-/// [`detect_from_content`], reusing what `sniff` has already derived.
+/// The signature stage: the first content rule that claims the bytes.
 pub(super) fn detect_from_sniff(sniff: &Sniff<'_>) -> Option<Found> {
     let data = sniff.data;
     let &[first, second, ..] = data else {
@@ -207,28 +210,22 @@ fn cold_fusion_template(p: &Probe<'_, '_>) -> Option<Found> {
     .then_some((FileType::Cfml, DetectionSource::Magic))
 }
 
-/// The detached signature sidecars shipped with several CDM clients use a
-/// single framed certificate, signature material, and a flags field. Require
-/// every boundary to agree; neither a `.sig` name nor an embedded DER prefix
-/// alone establishes this format. No authenticity or trust is inferred.
+/// DER tags (ITU-T X.690 §8.6, §8.9) an X.509 certificate is framed with.
+const DER_SEQUENCE: u8 = 0x30;
+const DER_BIT_STRING: u8 = 0x03;
+
+/// The detached signature sidecars shipped with several content-decryption
+/// clients: a single length-framed certificate, signature material, and a
+/// flags field. Every boundary has to agree; neither a `.sig` name nor an
+/// embedded DER prefix alone establishes this format. No authenticity or
+/// trust is inferred.
 fn certificate_signature(p: &Probe<'_, '_>) -> Option<Found> {
-    certificate_signature_data(p.data).then_some((FileType::Data, DetectionSource::Magic))
-}
-
-fn image4_trustcache(p: &Probe<'_, '_>) -> Option<Found> {
-    super::image4_trustcache::parse(p.data).map(|_| (FileType::Data, DetectionSource::Magic))
-}
-
-pub(super) fn certificate_signature_data(data: &[u8]) -> bool {
-    certificate_signature_body(data).is_some()
-}
-
-fn certificate_signature_body(data: &[u8]) -> Option<()> {
-    let mut rest = data.strip_prefix(&[0, 1])?;
+    let mut rest = p.data.strip_prefix(&[0, 1])?;
     let cert_len = signature_varint(&mut rest)?;
     let cert = rest.get(..cert_len)?;
     rest = rest.get(cert_len..)?;
-    let &[0x30, 0x82, hi, lo, ref body @ ..] = cert else {
+    // A SEQUENCE with a two-byte long-form length that spans the field.
+    let &[DER_SEQUENCE, 0x82, hi, lo, ref body @ ..] = cert else {
         return None;
     };
     if usize::from(u16::from_be_bytes([hi, lo])) + 4 != cert.len() {
@@ -237,7 +234,7 @@ fn certificate_signature_body(data: &[u8]) -> Option<()> {
     // An X.509 Certificate has a TBS sequence, an algorithm sequence,
     // and a BIT STRING signature, with no additional top-level fields.
     let mut der = body;
-    for tag in [0x30, 0x30, 0x03] {
+    for tag in [DER_SEQUENCE, DER_SEQUENCE, DER_BIT_STRING] {
         if *der.first()? != tag {
             return None;
         }
@@ -258,9 +255,17 @@ fn certificate_signature_body(data: &[u8]) -> Option<()> {
     }
     rest = rest.get(signature_len..)?.strip_prefix(&[3])?;
     let flags_len = signature_varint(&mut rest)?;
-    (flags_len == 1 && matches!(rest, [0 | 1])).then_some(())
+    (flags_len == 1 && matches!(rest, [0 | 1]))
+        .then_some((FileType::CertificateSignature, DetectionSource::Magic))
 }
 
+/// An Image4 payload carrying a trust-cache table.
+fn image4_trustcache(p: &Probe<'_, '_>) -> Option<Found> {
+    super::image4_trustcache::parse(p.data)
+        .map(|_| (FileType::Image4TrustCache, DetectionSource::Magic))
+}
+
+/// A little-endian base-128 length, as protobuf frames its fields.
 fn signature_varint(rest: &mut &[u8]) -> Option<usize> {
     let mut value = 0usize;
     for shift in (0..28).step_by(7) {
@@ -274,6 +279,7 @@ fn signature_varint(rest: &mut &[u8]) -> Option<usize> {
     None
 }
 
+/// A DER definite length (X.690 §8.1.3) of at most two octets.
 fn signature_der_length(rest: &mut &[u8]) -> Option<usize> {
     let (&byte, tail) = rest.split_first()?;
     *rest = tail;
@@ -344,10 +350,7 @@ fn iso_base_media(p: &Probe<'_, '_>) -> Option<Found> {
 
 /// A Windows URL shortcut: an INI whose first section is
 /// `[InternetShortcut]`. It carries no magic number and scores as no known
-/// language, so a copy named `invoice.pdf.url` came back `unknown` -- and an
-/// unidentified archive member is skipped whole. One in this corpus is the
-/// entire payload of a delivery zip: `URL=file:\\<ip>@80\...\scan.pdf.lnk`,
-/// a WebDAV fetch of a second shortcut, padded to 346 KB with NULs.
+/// language, so only this section names it, whatever the file is called.
 fn url_shortcut(p: &Probe<'_, '_>) -> Option<Found> {
     p.head
         .get(..URL_SHORTCUT_SECTION.len())
@@ -357,23 +360,20 @@ fn url_shortcut(p: &Probe<'_, '_>) -> Option<Found> {
 
 /// Windows Script Host documents: a `.wsf` job, a `.wsc` component or a
 /// `.sct` scriptlet is XML whose `<script language=...>` names what runs.
-/// The XML arm below would call the prolog'd ones plain XML, and markup
-/// sniffing called the rest HTML, so a VBScript dropper in a `<job>` was
-/// never scored as a script.
+/// Ahead of the XML arm, which would call it plain XML.
 fn script_host(p: &Probe<'_, '_>) -> Option<Found> {
     script_host_document(p.sniff).map(|ft| (ft, DetectionSource::Magic))
 }
 
 /// Script Encoder output (`.vbe`, `.jse`): `#@~^`, a six-character base64
-/// length, `==`. The body is ciphertext full of control bytes, so it was
-/// typed opaque data.
+/// length, `==`. The body is ciphertext full of control bytes, which no
+/// other rule would read as a script.
 fn script_encoder(p: &Probe<'_, '_>) -> Option<Found> {
     encoded_script(p.path, p.head).map(|ft| (ft, DetectionSource::Magic))
 }
 
-/// Lockfiles announce themselves in their opening lines. Hopper copies are
-/// often renamed `yarn.<sha>.lock`, so the header, not the name, has to
-/// carry them to the lockfile traits.
+/// Lockfiles announce themselves in their opening lines, so a lockfile
+/// renamed for storage (`yarn.<sha>.lock`) is still one.
 fn lockfile(p: &Probe<'_, '_>) -> Option<Found> {
     lockfile_header(p.data)
         .or_else(|| npm_json_lockfile(p.data))
@@ -422,18 +422,14 @@ fn postscript(p: &Probe<'_, '_>) -> Option<Found> {
 }
 
 /// Android binary XML: chunk type 0x0003, header size 8, a file-size field
-/// that covers this buffer, and a string-pool chunk next. A `.xml` name
-/// used to be the only signal, so a compiled layout was "XML" by extension
-/// while the text parser never saw a tag.
+/// that covers this buffer, and a string-pool chunk next.
 fn android_binary_xml(p: &Probe<'_, '_>) -> Option<Found> {
     looks_like_axml(p.data).then_some((FileType::Xml, DetectionSource::Magic))
 }
 
-/// An HTML document, whatever it is called and however it is indented.
-/// Keyed off `head` rather than `data` because real pages are not flush
-/// left: four VirusShare samples open with four spaces before the doctype,
-/// which a `starts_with` on byte 0 misses, and they were then scored as
-/// JavaScript on the strength of the jQuery inside them.
+/// An HTML document, whatever it is called and however it is indented:
+/// keyed off `head` rather than `data`, because real pages are not flush
+/// left.
 ///
 /// Both unambiguous openings are accepted. Nothing but a web page starts
 /// `<!DOCTYPE html`, and a file whose first bytes are `<html` is one too --
@@ -476,12 +472,33 @@ fn html_document(p: &Probe<'_, '_>) -> Option<Found> {
         .then_some((FileType::Html, DetectionSource::Magic))
 }
 
+/// Apple UDIF disk image: the 512-byte `koly` trailer, version 4 or later,
+/// that declares its own size.
 fn udif_dmg(p: &Probe<'_, '_>) -> Option<Found> {
-    looks_like_udif_dmg(p.data).then_some((FileType::Dmg, DetectionSource::Magic))
+    let trailer = p.data.last_chunk::<512>()?;
+    (trailer.starts_with(b"koly")
+        && bytes::u32_be(trailer, 4).is_some_and(|version| version >= 4)
+        && bytes::u32_be(trailer, 8) == Some(512))
+    .then_some((FileType::Dmg, DetectionSource::Magic))
 }
 
+/// Optical-disc image (`.iso`): ISO 9660 and/or UDF.
+///
+/// The Volume Descriptor set begins at sector 16 (offset `0x8000`); each
+/// 2048-byte descriptor is `[type:1][standard_identifier:5]`. ISO 9660 volume
+/// descriptors carry `"CD001"`; a UDF bridge Volume Recognition Sequence carries
+/// `"BEA01"`/`"NSR02"`/`"NSR03"`/`"TEA01"` (Windows install media are UDF). Either
+/// identifier in the first several sectors means 7-Zip can unpack the image.
 fn iso_image(p: &Probe<'_, '_>) -> Option<Found> {
-    looks_like_iso_or_udf(p.data).then_some((FileType::Iso, DetectionSource::Magic))
+    (16..=22usize)
+        .any(|sector| {
+            let off = sector * 2048 + 1;
+            matches!(
+                p.data.get(off..off + 5),
+                Some(b"CD001" | b"BEA01" | b"NSR02" | b"NSR03" | b"TEA01")
+            )
+        })
+        .then_some((FileType::Iso, DetectionSource::Magic))
 }
 
 /// TIFF's byte-order/version header identifies the container, not a valid IFD.
@@ -513,10 +530,8 @@ fn first_byte_signature(p: &Probe<'_, '_>) -> Option<Found> {
             // macOS routinely smuggles these into tarballs alongside real
             // files. Their bodies are binary metadata blobs (xattrs, finder
             // info, resource forks), not the file types their extension
-            // claims. Return Unknown so cleave's `is_program()` skip kicks
-            // in — otherwise `._foo.php` gets analyzed as PHP, the binary
-            // body trips entropy/obfuscation traits, and a benign Composer
-            // tarball lights up at suspicious.
+            // claims, so they are Unknown: `._foo.php` is not PHP, and a
+            // consumer that skips what `is_program` rejects skips it.
             if data.starts_with(&[0x00, 0x05, 0x16, 0x07]) {
                 Some((FileType::Unknown, DetectionSource::Magic))
             } else if let &[_, 0x00, 0x01 | 0x02, 0x00, lo, hi, ..] = data
@@ -530,11 +545,11 @@ fn first_byte_signature(p: &Probe<'_, '_>) -> Option<Found> {
             } else if let &[_, a, b, c, d, _, _, _, _, 1, 0, 0, 0, 0, 0, 0, 0, ..] = data
                 && [a, b, c, d] != [0; 4]
             {
-                // NRBF SerializedStreamHeader: record kind 0, nonzero root
-                // ID, ignored header ID, and little-endian version 1.0.
-                // Root ID 1 collides with the first four SFNT bytes. Route
-                // serialized records to opaque-byte analysis, not font parsing.
-                Some((FileType::Data, DetectionSource::Magic))
+                // NRBF SerializedStreamHeader (MS-NRBF 2.6.1): record kind 0,
+                // nonzero root ID, ignored header ID, and little-endian
+                // version 1.0. Root ID 1 collides with the first four SFNT
+                // bytes, so this is checked before the font arm.
+                Some((FileType::Nrbf, DetectionSource::Magic))
             } else if let Some(rest) = data.strip_prefix(&[0x00, 0x01, 0x00, 0x00])
                 && !rest.starts_with(b"Standard Jet DB")
                 && !rest.starts_with(b"Standard ACE DB")
@@ -543,8 +558,7 @@ fn first_byte_signature(p: &Probe<'_, '_>) -> Option<Found> {
                 // A Microsoft Access database opens with the same four bytes
                 // and then names its engine, so an .mdb/.accdb would otherwise
                 // be handed to the font parser and read as a corrupt font
-                // rather than as a database with macros in it. Seen on
-                // vxheaven's Virus.MSAccess.Detox.a.
+                // rather than as a database with macros in it.
                 // Four bytes is a weak signature, so this arm is reached only
                 // after the AppleDouble check above and is confirmed
                 // downstream by formats/font.rs walking the table directory.
@@ -591,7 +605,7 @@ fn first_byte_signature(p: &Probe<'_, '_>) -> Option<Found> {
                     matches!(signature, [3, 4] | [5, 6] | [7, 8] | [6, 6] | [6, 7])
                 })
             {
-                Some(classify_pk(path, data))
+                Some((classify_pk(p.sniff), DetectionSource::Magic))
             } else {
                 None
             }
@@ -746,25 +760,19 @@ fn first_byte_signature(p: &Probe<'_, '_>) -> Option<Found> {
             if data.starts_with(b"Rar!") {
                 Some((FileType::Rar, DetectionSource::Magic))
             } else if data.starts_with(b"REGEDIT4") {
-                // A .reg file's first line names the format. `FileType::Reg`
-                // was once reachable only from a `.reg` extension, so a registry
-                // script under any other name -- vxheaven's
-                // `Trojan.WinREG.AntiFireWall.a`, where the `.a` is a variant
-                // letter -- was typed by whatever the trailing component
-                // happened to mean. Nothing but a registry script opens with
+                // A .reg file's first line names the format, whatever the
+                // file is called: nothing but a registry script opens with
                 // this line. REGEDIT4 is the Windows 9x/NT4 spelling; the
                 // Windows 2000+ one is handled in the `W` arm below.
                 Some((FileType::Reg, DetectionSource::Magic))
             } else if (data.starts_with(b"RIFF") || data.starts_with(b"RIFX")) && data.len() >= 12 {
-                // RIFF container: `RIFF` + u32 length + form type. WAVE, WEBP
-                // and AVI share the wrapper, so the form type at offset 8
-                // decides. Animated cursors (`ACON`) are opaque binary data
-                // until there is a dedicated cursor analyzer. Recognize them
-                // so even a renamed cursor reaches generic static analysis.
+                // RIFF container: `RIFF` + u32 length + form type. WAVE, WEBP,
+                // AVI and animated cursors (`ACON`) share the wrapper, so the
+                // form type at offset 8 decides.
                 let kind = match data.get(8..12) {
                     Some(b"WEBP") => Some(FileType::Webp),
                     Some(b"WAVE") => Some(FileType::Wav),
-                    Some(b"ACON") => Some(FileType::Data),
+                    Some(b"ACON") => Some(FileType::Ani),
                     _ => None,
                 };
                 kind.map(|file_type| (file_type, DetectionSource::Magic))
@@ -832,9 +840,8 @@ fn first_byte_signature(p: &Probe<'_, '_>) -> Option<Found> {
         b'b' => {
             // Binary Plist: bplist. A `.nib` with this magic is a keyed-archive
             // nib (NSKeyedArchiver output inside an older nib bundle), but the
-            // bytes are a plain property list either way -- type it Plist so
-            // every plist-aware consumer (including rule engines that don't
-            // know a distinct Nib type) can address it.
+            // bytes are a plain property list either way, so it is typed
+            // Plist for every plist-aware consumer.
             if data.starts_with(b"bplist") {
                 Some((FileType::Plist, DetectionSource::Magic))
             } else {
@@ -919,9 +926,8 @@ fn first_byte_signature(p: &Probe<'_, '_>) -> Option<Found> {
         }
         0x1F => {
             // Gzip: 1F 8B, then CM 8 (deflate), the only method ever defined.
-            // What it wraps is read, not guessed from the name: npm packages,
-            // sdists and crates arrive as `<hash>.sample` in content-addressed
-            // stores.
+            // What it wraps is read, not guessed from the name: packages in
+            // content-addressed stores are named by their hash.
             if second == 0x8B && data.get(2) == Some(&8) {
                 let inside = tar_layout(
                     flate2::read::GzDecoder::new(data).take(TAR_PEEK_LIMIT),
@@ -1063,14 +1069,8 @@ fn first_byte_signature(p: &Probe<'_, '_>) -> Option<Found> {
 
 /// Uncompressed tar carries no leading magic — the `ustar` signature sits at
 /// offset 257. Its members say whether it is a gem, an OCI image, a Gentoo
-/// package or a plain tar.
-///
-/// This used to fall through to the extension fallback, which meant a tar
-/// was only recognized when it was *named* `.tar`: the same bytes under any
-/// other extension were typed `Data` and never walked, so every member went
-/// unanalyzed. That is a detection gap an attacker gets for free by renaming
-/// a file — an XMRig 6.24.0 release tarball named `<sha256>.bin` scored one
-/// finding as an opaque blob and six once renamed to `.tar`.
+/// package or a plain tar. A tar is a tar whatever it is named: renaming one
+/// must not hide its members from the archive walker.
 fn ustar(p: &Probe<'_, '_>) -> Option<Found> {
     if !(p.data.len() > 262 && p.data.get(257..262) == Some(b"ustar")) {
         return None;
@@ -1090,12 +1090,24 @@ fn python_bytecode(p: &Probe<'_, '_>) -> Option<Found> {
     .then_some((FileType::PythonBytecode, DetectionSource::Magic))
 }
 
-/// Tampered PE: only scan if there's an 'M' in the first 64 bytes.
+/// A PE whose `MZ` is not at offset 0: `MZ` within the first 64 bytes whose
+/// `e_lfanew` leads to a valid `PE\0\0` signature. Offset 0 was already
+/// checked by the MZ arm.
 fn tampered_pe(p: &Probe<'_, '_>) -> Option<Found> {
-    if !p.data.iter().take(64).skip(1).any(|&b| b == b'M') {
-        return None;
-    }
-    detect_tampered_pe(p.data).map(|ft| (ft, DetectionSource::Magic))
+    let window = p.data.get(..64).unwrap_or(p.data);
+    window
+        .windows(2)
+        .enumerate()
+        .skip(1)
+        .filter(|&(_, pair)| pair == b"MZ")
+        .any(|(i, _)| {
+            p.data.get(i..).is_some_and(|pe| {
+                bytes::u32_le(pe, 0x3C)
+                    .and_then(|e_lfanew| pe.get(e_lfanew as usize..))
+                    .is_some_and(|nt| nt.starts_with(b"PE\0\0"))
+            })
+        })
+        .then_some((FileType::Pe, DetectionSource::Magic))
 }
 
 /// Markup after a BOM or leading whitespace.
@@ -1108,26 +1120,92 @@ fn markup(p: &Probe<'_, '_>) -> Option<Found> {
 /// PHP, a shebang, or anything at all (a JPEG header makes a polyglot), and
 /// the archive is what `phar://` opens.
 fn phar(p: &Probe<'_, '_>) -> Option<Found> {
-    crate::formats::phar::is_phar(p.data).then_some((FileType::Phar, DetectionSource::Magic))
+    super::phar::is_phar(p.data).then_some((FileType::Phar, DetectionSource::Magic))
 }
 
+/// Electron ASAR: a Chromium pickle holding the header size (`04 00 00 00`,
+/// then the size), a second pickle whose payload is 4 bytes shorter, and the
+/// JSON file table as its string.
 fn asar(p: &Probe<'_, '_>) -> Option<Found> {
-    looks_like_asar(p.data).then_some((FileType::Asar, DetectionSource::Magic))
+    let u32_at = |off| bytes::u32_le(p.data, off);
+    (u32_at(0) == Some(4)
+        && u32_at(4).is_some_and(|size| u32_at(8) == size.checked_sub(4))
+        && p.data
+            .get(16..)
+            .is_some_and(|rest| rest.starts_with(b"{\"files\":")))
+    .then_some((FileType::Asar, DetectionSource::Magic))
 }
 
+/// LZMA-alone (`.lzma`): the properties byte every mainstream encoder writes
+/// (0x5D: lc=3, lp=0, pb=2), a dictionary size that `xz` and 7-Zip only ever
+/// write as 2^n or 2^n + 2^(n-1) between 4 KiB and 1.5 GiB, and an
+/// uncompressed size that is either unknown (all ones) or under 2^40. The
+/// header has no magic, so all three must hold; Chromium's `.pak` resources
+/// satisfy the last two.
 fn lzma_alone(p: &Probe<'_, '_>) -> Option<Found> {
-    looks_like_lzma_alone(p.data).then_some((FileType::Lzma, DetectionSource::Magic))
+    if p.data.len() < 14 || p.first != 0x5D {
+        return None;
+    }
+    let dict = bytes::u32_le(p.data, 1)?;
+    let size = bytes::u64_le(p.data, 5)?;
+    let n = dict.trailing_zeros();
+    let dict_ok = (12..=30).contains(&n) && (dict == 1 << n || dict == 3 << (n - 1));
+    (dict_ok && (size == u64::MAX || size < 1 << 40))
+        .then_some((FileType::Lzma, DetectionSource::Magic))
 }
 
+/// A GitHub Actions workflow outside `.github/workflows/`: a YAML name and
+/// top-level `on:` and `jobs:` keys.
 fn github_actions_workflow(p: &Probe<'_, '_>) -> Option<Found> {
-    looks_like_github_actions_workflow(p.path, p.data)
-        .then_some((FileType::GithubActions, DetectionSource::Heuristic))
+    if !(path_ends_with_ci(p.path, b".yml") || path_ends_with_ci(p.path, b".yaml")) {
+        return None;
+    }
+
+    let text = std::str::from_utf8(p.data.get(..16 * 1024).unwrap_or(p.data)).ok()?;
+
+    let mut has_on = false;
+    let mut has_jobs = false;
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with("---") || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue;
+        }
+
+        let Some((key, _)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim_matches(|c| c == '\'' || c == '"' || c == ' ');
+        match key {
+            "on" => has_on = true,
+            "jobs" => has_jobs = true,
+            _ => {}
+        }
+        if has_on && has_jobs {
+            return Some((FileType::GithubActions, DetectionSource::Heuristic));
+        }
+    }
+    None
 }
 
-/// Manifest files — only checked when there's a filename component.
-fn manifest(p: &Probe<'_, '_>) -> Option<Found> {
-    p.path.file_name()?;
-    detect_manifest(p.path, p.data).map(|ft| (ft, DetectionSource::Filename))
+/// A Chrome extension manifest: `manifest.json` carrying `manifest_version`
+/// and at least one Chrome-specific key. The name alone is shared with web
+/// app manifests and container image indexes.
+fn chrome_manifest(p: &Probe<'_, '_>) -> Option<Found> {
+    let named = p
+        .path
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("manifest.json"));
+    let has = |key: &[u8]| memchr::memmem::find(p.data, key).is_some();
+    (named
+        && has(b"\"manifest_version\"")
+        && (has(b"\"permissions\"")
+            || has(b"\"content_scripts\"")
+            || has(b"\"background\"")
+            || has(b"\"host_permissions\"")))
+    .then_some((FileType::ChromeManifest, DetectionSource::Filename))
 }
 
 /// Magic numbers for Python versions whose bytecode layout is handled by
@@ -1251,32 +1329,6 @@ fn vhd_image(p: &Probe<'_, '_>) -> Option<Found> {
     Some((FileType::Vhd, DetectionSource::Magic))
 }
 
-fn looks_like_udif_dmg(data: &[u8]) -> bool {
-    let Some(trailer) = data.last_chunk::<512>() else {
-        return false;
-    };
-    trailer.starts_with(b"koly")
-        && bytes::u32_be(trailer, 4).is_some_and(|version| version >= 4)
-        && bytes::u32_be(trailer, 8) == Some(512)
-}
-
-/// Optical-disc image (`.iso`): ISO 9660 and/or UDF.
-///
-/// The Volume Descriptor set begins at sector 16 (offset `0x8000`); each
-/// 2048-byte descriptor is `[type:1][standard_identifier:5]`. ISO 9660 volume
-/// descriptors carry `"CD001"`; a UDF bridge Volume Recognition Sequence carries
-/// `"BEA01"`/`"NSR02"`/`"NSR03"`/`"TEA01"` (Windows install media are UDF). Either
-/// identifier in the first several sectors means 7-Zip can unpack the image.
-fn looks_like_iso_or_udf(data: &[u8]) -> bool {
-    (16..=22usize).any(|sector| {
-        let off = sector * 2048 + 1;
-        matches!(
-            data.get(off..off + 5),
-            Some(b"CD001" | b"BEA01" | b"NSR02" | b"NSR03" | b"TEA01")
-        )
-    })
-}
-
 /// Case-insensitive suffix match on path bytes (no allocation).
 fn path_ends_with_ci(path: &Path, suffix: &[u8]) -> bool {
     ends_with_ci(path.to_string_lossy().as_bytes(), suffix)
@@ -1288,19 +1340,15 @@ fn path_ends_with_ci(path: &Path, suffix: &[u8]) -> bool {
 const TEXT_PROBE: usize = 64;
 
 /// Whether the head of `data` reads as plain text: UTF-8 with no control
-/// bytes other than whitespace. A character cut off by the end of the probe
-/// still counts.
+/// bytes beyond what any text carries. A character cut off by the end of the
+/// probe still counts.
 ///
-/// The strictest of the three binary/text tests in fileid, because it has the
-/// least to read: one control byte in the probe doubts a short signature, and
-/// form feed is the only control byte beyond tab and line breaks that plain
-/// text is allowed. `heuristics::looks_like_binary` and `scripts::is_binary`
-/// judge whole scoring windows by the share of control bytes instead, and the
-/// script grammars also allow the escapes that batch and IRC scripts print.
-pub(crate) fn content_is_text(data: &[u8]) -> bool {
+/// The probe is short, so where the classifier in `text` weighs the share
+/// of control bytes across a window, one control byte here is enough to
+/// doubt a short signature.
+pub(super) fn content_is_text(data: &[u8]) -> bool {
     let head = data.get(..TEXT_PROBE).unwrap_or(data);
-    let control = |b: &u8| (*b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r' | 0x0C)) || *b == 0x7F;
-    if head.iter().any(control) {
+    if control_bytes(head, Controls::Text) > 0 {
         return false;
     }
     match std::str::from_utf8(head) {
@@ -1377,10 +1425,6 @@ fn ole_root_clsid(data: &[u8]) -> Option<[u8; 16]> {
     data.get(at..at + 16)?.try_into().ok()
 }
 
-/// The pickle `torch.save` wrote before its zip format: protocol 2, then a
-/// ten-byte LONG1 holding the magic number 0x1950a86a20f9469cfc6c.
-const TORCH_LEGACY_MAGIC: &[u8] = b"\x80\x02\x8a\x0a\x6c\xfc\x9c\x46\xf9\x20\x6a\xa8\x50\x19";
-
 /// Python pickle. Protocol 4 and 5 open with a FRAME whose u64 length has
 /// no business near 2^40, and legacy `torch.save` with its own magic: either
 /// is the format itself. Protocols 2 and 3 open with two bytes that other
@@ -1388,572 +1432,13 @@ const TORCH_LEGACY_MAGIC: &[u8] = b"\x80\x02\x8a\x0a\x6c\xfc\x9c\x46\xf9\x20\x6a
 fn looks_like_pickle(path: &Path, data: &[u8]) -> bool {
     match data {
         [0x80, 4 | 5, 0x95, frame @ ..] => bytes::u64_le(frame, 0).is_some_and(|len| len < 1 << 40),
-        _ if data.starts_with(TORCH_LEGACY_MAGIC) => true,
+        _ if data.starts_with(torch::LEGACY_MAGIC) => true,
         [0x80, 2 | 3, ..] => matches!(
             lowercase_ext(path).as_deref(),
             Some("pkl" | "pickle" | "joblib" | "debug_pkl" | "pt" | "pth")
         ),
         _ => false,
     }
-}
-
-/// Electron ASAR: a Chromium pickle holding the header size (`04 00 00 00`,
-/// then the size), a second pickle whose payload is 4 bytes shorter, and the
-/// JSON file table as its string.
-fn looks_like_asar(data: &[u8]) -> bool {
-    let u32_at = |off| bytes::u32_le(data, off);
-    u32_at(0) == Some(4)
-        && u32_at(4).is_some_and(|size| u32_at(8) == size.checked_sub(4))
-        && data
-            .get(16..)
-            .is_some_and(|rest| rest.starts_with(b"{\"files\":"))
-}
-
-/// LZMA-alone (`.lzma`): the properties byte every mainstream encoder writes
-/// (0x5D: lc=3, lp=0, pb=2), a dictionary size that `xz` and 7-Zip only ever
-/// write as 2^n or 2^n + 2^(n-1) between 4 KiB and 1.5 GiB, and an
-/// uncompressed size that is either unknown (all ones) or under 2^40. The
-/// header has no magic, so all three must hold; Chromium's `.pak` resources
-/// satisfy the last two.
-fn looks_like_lzma_alone(data: &[u8]) -> bool {
-    if data.len() < 14 || data.first() != Some(&0x5D) {
-        return false;
-    }
-    let (Some(dict), Some(size)) = (bytes::u32_le(data, 1), bytes::u64_le(data, 5)) else {
-        return false;
-    };
-    let n = dict.trailing_zeros();
-    let dict_ok = (12..=30).contains(&n) && (dict == 1 << n || dict == 3 << (n - 1));
-    dict_ok && (size == u64::MAX || size < 1 << 40)
-}
-
-/// How far detection will inflate a gzip tar while reading its member names.
-/// npm packages, sdists and crates name themselves anywhere under their one
-/// root, and sdists often put `PKG-INFO` last, after generated clients, tests
-/// and documentation, so this is generous; it still bounds a decompression
-/// bomb.
-const TAR_PEEK_LIMIT: u64 = 64 << 20;
-
-/// How far detection will inflate a zstd tar. Its packages (FreeBSD, Arch,
-/// Void) name themselves in their leading members.
-const TAR_HEAD_LIMIT: u64 = 1 << 20;
-
-/// Members a plain tar is read through for an image's markers; a `docker
-/// save` bundle writes `manifest.json` after its layers.
-const TAR_DEEP_MEMBERS: usize = 512;
-
-/// Members read before a tar with several top-level entries is settled.
-/// Every first-member and metadata marker sits within them.
-const TAR_SHALLOW_MEMBERS: usize = 8;
-
-/// What a container's decoded bytes turned out to be.
-#[derive(Clone, Copy)]
-enum Inside {
-    /// The codec could not produce a first block: a truncated or corrupt
-    /// stream, or no decoder linked. The content has not spoken.
-    Unreadable,
-    /// The stream decoded and is not a tar.
-    NotTar,
-    /// A tar, typed by its layout: a package, or plain [`FileType::Tar`].
-    Tar(FileType),
-}
-
-/// What a tar's member names make it: a package with a fixed layout, or
-/// plain [`FileType::Tar`]. `deep` reads on for container-image markers,
-/// which only a plain tar can carry.
-///
-/// * First member: `<root>/gpkg-1` (Gentoo), `.SIGN.*` (Alpine),
-///   `+COMPACT_MANIFEST`/`+MANIFEST` (FreeBSD), `props.plist` (Void).
-/// * Anywhere: `.PKGINFO` with `.MTREE` or `.BUILDINFO` (Arch);
-///   `metadata.gz` with `data.tar.gz` (gem); `oci-layout` with `index.json`,
-///   or `manifest.json` with layers (OCI / `docker save`).
-/// * One top-level directory holding `package/package.json` (npm),
-///   `<root>/PKG-INFO` (Python sdist) or `<root>/Cargo.toml.orig` (crate).
-fn tar_layout(mut reader: impl Read, deep: bool) -> Inside {
-    // Read the first header block by hand, so a stream the codec cannot
-    // decode is told apart from one that decodes to something else.
-    let mut block = [0u8; 512];
-    let mut filled = 0;
-    while let Some(unfilled @ [_, ..]) = block.get_mut(filled..) {
-        match reader.read(unfilled) {
-            Ok(0) => return Inside::NotTar,
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return Inside::Unreadable,
-        }
-    }
-    let mut archive = tar::Archive::new(std::io::Cursor::new(block).chain(reader));
-    let Ok(mut entries) = archive.entries() else {
-        return Inside::NotTar;
-    };
-    // Some while every member so far shares one top-level directory.
-    let mut root: Option<Option<String>> = Some(None);
-    let mut members = 0usize;
-    let mut packages = super::package_layout::TarProbe::default();
-    let (mut pkginfo, mut arch_meta) = (false, false);
-    let (mut gem_metadata, mut gem_data) = (false, false);
-    let (mut oci_layout, mut oci_index) = (false, false);
-    let (mut docker_manifest, mut docker_layers) = (false, false);
-    loop {
-        let entry = match entries.next() {
-            Some(Ok(entry)) => entry,
-            // A stream whose first header does not parse is not a tar.
-            Some(Err(_)) if members == 0 => return Inside::NotTar,
-            Some(Err(_)) | None => break,
-        };
-        if matches!(
-            entry.header().entry_type(),
-            tar::EntryType::XGlobalHeader
-                | tar::EntryType::XHeader
-                | tar::EntryType::GNULongName
-                | tar::EntryType::GNULongLink
-        ) {
-            continue;
-        }
-        let Ok(path) = entry.path() else { continue };
-        let path = path.to_string_lossy().into_owned();
-        let name = path.trim_start_matches("./").trim_end_matches('/');
-        let (top, rest) = name.split_once('/').unwrap_or((name, ""));
-        let base = name.rsplit('/').next().unwrap_or(name);
-        // macOS AppleDouble sidecars that `tar` smuggles in are not members.
-        if base.starts_with("._") || name.is_empty() {
-            continue;
-        }
-        members += 1;
-
-        if members == 1 {
-            if base == "gpkg-1" && rest == "gpkg-1" {
-                return Inside::Tar(FileType::GentooBinpkg);
-            }
-            if name.starts_with(".SIGN.") {
-                return Inside::Tar(FileType::ApkAlpine);
-            }
-            if matches!(name, "+COMPACT_MANIFEST" | "+MANIFEST") {
-                return Inside::Tar(FileType::PkgFreebsd);
-            }
-            if name == "props.plist" {
-                return Inside::Tar(FileType::Xbps);
-            }
-        }
-        match name {
-            ".PKGINFO" => pkginfo = true,
-            ".MTREE" | ".BUILDINFO" => arch_meta = true,
-            "metadata.gz" => gem_metadata = true,
-            "data.tar.gz" => gem_data = true,
-            "oci-layout" => oci_layout = true,
-            "index.json" => oci_index = true,
-            "manifest.json" => docker_manifest = true,
-            "repositories" => docker_layers = true,
-            _ if name.ends_with("/layer.tar") || name.starts_with("blobs/") => {
-                docker_layers = true;
-            }
-            _ => {}
-        }
-        if pkginfo && arch_meta {
-            return Inside::Tar(FileType::PkgArch);
-        }
-        if gem_metadata && gem_data {
-            return Inside::Tar(FileType::Gem);
-        }
-        if (oci_layout && oci_index) || (docker_manifest && docker_layers) {
-            return Inside::Tar(FileType::OciImage);
-        }
-
-        match &mut root {
-            Some(r @ None) => *r = Some(top.to_owned()),
-            Some(Some(r)) if r != top => root = None,
-            _ => {}
-        }
-        if let Some(Some(r)) = &root {
-            match rest {
-                "package.json" if r == "package" => return Inside::Tar(FileType::Npm),
-                "PKG-INFO" => return Inside::Tar(FileType::PythonSdist),
-                "Cargo.toml.orig" => return Inside::Tar(FileType::Crate),
-                _ => {}
-            }
-        }
-        if entry.header().entry_type().is_file() {
-            let size = entry.size();
-            packages.observe(name, entry, size);
-            if packages.hex() {
-                return Inside::Tar(FileType::Hex);
-            }
-        }
-        // A single-root package may name itself last; the byte budget on
-        // `reader` bounds that walk. Anything else is settled early.
-        let cap = if deep {
-            TAR_DEEP_MEMBERS
-        } else if root.is_some() || packages.extended_walk() {
-            usize::MAX
-        } else {
-            TAR_SHALLOW_MEMBERS
-        };
-        if members >= cap {
-            break;
-        }
-    }
-    if members > 0 {
-        Inside::Tar(
-            packages
-                .finish(root.as_ref().and_then(|r| r.as_deref()))
-                .unwrap_or(FileType::Tar),
-        )
-    } else {
-        Inside::NotTar
-    }
-}
-
-/// Settle a file compressed with `compression`: the package its layout
-/// names, else the package its name names on the same container, else the
-/// generic tar. `None` when it is no tar at all. When the content could not be
-/// read, only a name can say a tar is inside.
-fn classify_tar(sniff: &Sniff<'_>, compression: Compression, inside: Inside) -> Option<FileType> {
-    let (path, data) = (sniff.path, sniff.data);
-    let layout = match inside {
-        Inside::NotTar => return None,
-        Inside::Unreadable => None,
-        Inside::Tar(ft) => Some(ft),
-    };
-    let fits = |ft: FileType| {
-        container_of(ft, data)
-            .is_some_and(|c| c.archive == ArchiveFormat::Tar && c.compression == compression)
-    };
-    if let Some(ft) = layout.filter(|&ft| ft != FileType::Tar && fits(ft)) {
-        return Some(ft);
-    }
-    // `.apk` names Android's zip or Alpine's gzip tar; the container decides.
-    let claim = if path_ends_with_ci(path, b".apk") {
-        Some(FileType::ApkAlpine)
-    } else {
-        sniff.ext_type()
-    };
-    if let Some(ft) = claim.filter(|&ft| fits(ft)) {
-        return Some(ft);
-    }
-    layout.map(|_| match compression {
-        Compression::Gzip => FileType::TarGz,
-        Compression::Bzip2 => FileType::TarBz2,
-        Compression::Xz => FileType::TarXz,
-        Compression::Zstd => FileType::TarZst,
-        _ => FileType::Tar,
-    })
-}
-
-fn looks_like_github_actions_workflow(path: &Path, data: &[u8]) -> bool {
-    if !(path_ends_with_ci(path, b".yml") || path_ends_with_ci(path, b".yaml")) {
-        return false;
-    }
-
-    let Ok(text) = std::str::from_utf8(data.get(..16 * 1024).unwrap_or(data)) else {
-        return false;
-    };
-
-    let mut has_on = false;
-    let mut has_jobs = false;
-    for line in text.lines() {
-        let line = line.trim_end();
-        if line.is_empty() || line.starts_with("---") || line.starts_with('#') {
-            continue;
-        }
-        if line.starts_with(' ') || line.starts_with('\t') {
-            continue;
-        }
-
-        let Some((key, _)) = line.split_once(':') else {
-            continue;
-        };
-        let key = key.trim_matches(|c| c == '\'' || c == '"' || c == ' ');
-        match key {
-            "on" => has_on = true,
-            "jobs" => has_jobs = true,
-            _ => {}
-        }
-        if has_on && has_jobs {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// The entry names along a zip's local-header chain, in order.
-///
-/// A plain `memmem` for a member name answers a different question: whether
-/// the bytes appear anywhere. They do whenever a zip stores an Office document
-/// uncompressed, because the inner package's own header is then present
-/// verbatim in the outer file -- which is how a zip holding one `.docx` came
-/// to be identified as a `.docx`, and its members never walked.
-///
-/// So step from header to header by each entry's declared compressed size.
-/// When the iterator ends, `complete` says whether it reached a real end of
-/// chain (or the entry cap). A walk that lost the thread -- a streaming entry
-/// with no size to step by, a header whose sizes are nonsense -- proves
-/// nothing absent, and callers fall back to a looser test rather than
-/// reporting a confident "no".
-struct ZipNames<'a> {
-    data: &'a [u8],
-    /// The next local header, or `None` once the walk has stopped.
-    off: Option<usize>,
-    left: usize,
-    complete: bool,
-}
-
-impl<'a> ZipNames<'a> {
-    /// Entries to walk. A package names its content types first, but a
-    /// marker such as an APK's `AndroidManifest.xml` sits wherever the
-    /// packager put it: entry 905 in one 21 MB sample here. Each step is a
-    /// bounds check and a few integer reads, so the ceiling is set by what a
-    /// real archive holds rather than by what the walk costs.
-    const MAX_ENTRIES: usize = 8192;
-
-    fn new(data: &'a [u8]) -> Self {
-        Self {
-            data,
-            off: Some(0),
-            left: Self::MAX_ENTRIES,
-            complete: false,
-        }
-    }
-}
-
-impl<'a> Iterator for ZipNames<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<&'a [u8]> {
-        let data = self.data;
-        let off = self.off.take()?;
-        if self.left == 0 {
-            self.complete = true;
-            return None;
-        }
-        self.left -= 1;
-        let u16_at = |at| bytes::u16_le(data, at).map(usize::from);
-        let u32_at = |at| bytes::u32_le(data, at).map(|v| v as usize);
-        let sig = data.get(off..off + 4)?;
-        if sig != b"PK\x03\x04" {
-            // Only a real end-of-chain marker completes the walk. Anything else
-            // means it lost the thread: the malformed packages this corpus is
-            // full of are still Office documents, and saying otherwise routes
-            // them to a reader that rejects them outright.
-            self.complete = matches!(
-                sig,
-                b"PK\x01\x02" | b"PK\x05\x06" | b"PK\x06\x06" | b"PK\x06\x07"
-            );
-            return None;
-        }
-        let flags = u16_at(off + 6)?;
-        let compressed = u32_at(off + 18)?;
-        let name_len = u16_at(off + 26)?;
-        let extra_len = u16_at(off + 28)?;
-        let name = data.get(off + 30..off + 30 + name_len)?;
-        // Bit 3: the sizes are repeated in a trailing data descriptor. When
-        // the local header carries them too they can still be stepped by;
-        // when it does not, there is nothing to step by and the walk stops.
-        self.off = (flags & 0x08 == 0 || compressed != 0)
-            .then(|| off.checked_add(30 + name_len + extra_len + compressed))
-            .flatten()
-            .filter(|&next| next <= data.len())
-            .and_then(|next| {
-                if flags & 0x08 == 0 || data.get(next..next + 4) != Some(b"PK\x07\x08") {
-                    return Some(next);
-                }
-                // Signature + crc + two sizes, four bytes each, or eight each
-                // in zip64. Which one is in use is not declared here, so take
-                // the length that lands on something a chain continues with.
-                [16usize, 24]
-                    .into_iter()
-                    .map(|skip| next + skip)
-                    .find(|&at| {
-                        matches!(
-                            data.get(at..at + 4),
-                            Some(b"PK\x03\x04" | b"PK\x01\x02" | b"PK\x05\x06")
-                        )
-                    })
-            });
-        Some(name)
-    }
-}
-
-/// Whether `name` is an entry of this zip; `None` when the walk could not
-/// finish without finding it.
-#[cfg(test)]
-fn zip_has_top_level_entry(data: &[u8], name: &[u8]) -> Option<bool> {
-    let mut names = ZipNames::new(data);
-    if names.any(|n| n == name) {
-        return Some(true);
-    }
-    names.complete.then_some(false)
-}
-
-/// The members that name a zip-based package, gathered in one walk.
-#[derive(Default)]
-struct ZipMarks {
-    android: bool,
-    content_types: bool,
-    mimetype: bool,
-    vsix: bool,
-    appx: bool,
-    nuspec: bool,
-    jar: bool,
-    wheel: bool,
-    egg: bool,
-    ipa: bool,
-    conda_metadata: bool,
-    conda_info: bool,
-    xpi: bool,
-    complete: bool,
-}
-
-impl ZipMarks {
-    fn scan(data: &[u8]) -> Self {
-        let mut m = Self::default();
-        let mut names = ZipNames::new(data);
-        for name in names.by_ref() {
-            let top_level = !name.contains(&b'/');
-            match name {
-                b"AndroidManifest.xml" => m.android = true,
-                b"[Content_Types].xml" => m.content_types = true,
-                b"mimetype" => m.mimetype = true,
-                b"extension.vsixmanifest" => m.vsix = true,
-                b"AppxManifest.xml" | b"AppxMetadata/AppxBundleManifest.xml" => m.appx = true,
-                b"META-INF/MANIFEST.MF" => m.jar = true,
-                b"EGG-INFO/PKG-INFO" => m.egg = true,
-                b"metadata.json" => m.conda_metadata = true,
-                b"install.rdf" | b"META-INF/mozilla.rsa" => m.xpi = true,
-                _ if top_level && name.ends_with(b".nuspec") => m.nuspec = true,
-                _ if top_level && name.starts_with(b"info-") && name.ends_with(b".tar.zst") => {
-                    m.conda_info = true;
-                }
-                _ if name
-                    .strip_suffix(b".dist-info/WHEEL")
-                    .is_some_and(|dir| !dir.is_empty() && !dir.contains(&b'/')) =>
-                {
-                    m.wheel = true;
-                }
-                _ if name.starts_with(b"Payload/")
-                    && memchr::memmem::find(name, b".app/").is_some() =>
-                {
-                    m.ipa = true;
-                }
-                _ => {}
-            }
-        }
-        m.complete = names.complete;
-        m
-    }
-}
-
-/// Names that claim an archive, not a document: a zip so named holding an
-/// OPC `[Content_Types].xml` stays the archive it says it is.
-const ARCHIVE_EXTS: &[&str] = &[
-    "zip",
-    "jar",
-    "war",
-    "ear",
-    "vsix",
-    "nupkg",
-    "xpi",
-    "whl",
-    "epub",
-    "apk",
-    "ipa",
-    "aar",
-    "egg",
-    "phar",
-    "pyz",
-    "conda",
-    "msix",
-    "appx",
-    "msixbundle",
-    "appxbundle",
-    "aab",
-    "apks",
-    "xapk",
-    "cbz",
-];
-
-/// The zip-based package a name claims, trusted when no member contradicts
-/// it. Office names are absent on purpose: an office extension is a claim,
-/// not the format, and without the OPC marker the file is a zip.
-fn zip_name_claim(ext: &str) -> Option<FileType> {
-    Some(match ext {
-        "jar" | "war" | "ear" => FileType::Jar,
-        "xpi" => FileType::Xpi,
-        "whl" => FileType::Whl,
-        "apk" => FileType::ApkAndroid,
-        "conda" => FileType::Conda,
-        "egg" => FileType::Egg,
-        "nupkg" => FileType::Nupkg,
-        "ipa" => FileType::Ipa,
-        "vsix" => FileType::Vsix,
-        ext if is_odf_extension(ext) => FileType::Odf,
-        _ => return None,
-    })
-}
-
-/// Classify a zip by the members only one kind of package carries; the name
-/// settles only what the members leave open.
-///
-/// That order decides whether anything looks inside. A file typed Ooxml goes
-/// to the office analyzer, which reads OPC parts; a file typed Zip goes to the
-/// archive analyzer, which walks the members. Three samples here are zips
-/// holding one payload apiece -- a `documents.doc` under an `.xlsm` name, a
-/// `.pdf.url` shortcut beside a decoy docx -- and none of those members were
-/// analyzed while the name was believed. And an APK, JAR or NuGet package
-/// delivered without its extension reached none of its own analysis.
-fn classify_pk(path: &Path, data: &[u8]) -> (FileType, DetectionSource) {
-    let ext = lowercase_ext(path);
-    let ext = ext.as_deref().unwrap_or("");
-    let m = ZipMarks::scan(data);
-    // Where the walk lost the thread, a marker's bytes anywhere are the best
-    // evidence left.
-    let loose = |marker: &[u8]| !m.complete && memchr::memmem::find(data, marker).is_some();
-    let opc = m.content_types || loose(b"[Content_Types].xml");
-    // An OpenDocument file stores `mimetype` first; an Android package can
-    // carry the namespace URI in any of its resources and is not one.
-    let odf =
-        m.mimetype && memchr::memmem::find(data, b"application/vnd.oasis.opendocument.").is_some();
-
-    let ft = if super::go_module::recognized(data) {
-        FileType::GoModule
-    } else if m.android {
-        FileType::ApkAndroid
-    } else if m.vsix || loose(b"extension.vsixmanifest") {
-        // VSIX and NuGet are OPC zips too; their manifests win.
-        FileType::Vsix
-    } else if m.appx || loose(b"AppxManifest.xml") || loose(b"AppxMetadata/AppxBundleManifest.xml")
-    {
-        // So are MSIX/APPX packages, which carry whole application trees
-        // (a bundled Python runtime, helper executables) that only the archive
-        // analyzer walks. The manifest is usually written last, past the
-        // entry cap on a large package, hence the loose fallback.
-        FileType::Zip
-    } else if opc && m.nuspec {
-        FileType::Nupkg
-    } else if opc && !ARCHIVE_EXTS.contains(&ext) {
-        FileType::Ooxml
-    } else if odf {
-        FileType::Odf
-    } else if let Some(claimed) = zip_name_claim(ext) {
-        claimed
-    } else if m.ipa {
-        FileType::Ipa
-    } else if m.wheel {
-        FileType::Whl
-    } else if m.egg {
-        FileType::Egg
-    } else if m.conda_metadata && m.conda_info {
-        FileType::Conda
-    } else if m.xpi {
-        FileType::Xpi
-    } else if m.jar {
-        FileType::Jar
-    } else if super::package_layout::composer_zip(data) {
-        FileType::Composer
-    } else {
-        FileType::Zip
-    };
-    (ft, DetectionSource::Magic)
 }
 
 /// A Windows bitmap: `BM`, then the info header that follows the 14-byte file
@@ -1980,237 +1465,6 @@ pub(crate) fn looks_like_dib_header(dib: &[u8]) -> bool {
         _ => return false,
     };
     planes == Some(1) && matches!(bits, Some(0 | 1 | 2 | 4 | 8 | 16 | 24 | 32 | 48 | 64))
-}
-
-/// [`script_host_document`] of `data` alone.
-#[cfg(test)]
-fn windows_script_host(data: &[u8]) -> Option<FileType> {
-    script_host_document(&Sniff::new(Path::new(""), data))
-}
-
-/// How far into a Windows Script Host document the `<script>` element is
-/// looked for. Droppers pad the opening tags with whitespace.
-const WSH_SCRIPT_WINDOW: usize = 64 * 1024;
-
-/// A `.wsf` / `.wsc` / `.sct` document, typed by the language of its first
-/// `<script>`: VBScript or JScript. The root element decides it is one --
-/// `<job>`, `<package>`, `<component>` or `<scriptlet>`; an HTML page with a
-/// VBScript block stays HTML.
-fn script_host_document(sniff: &Sniff<'_>) -> Option<FileType> {
-    // These are written by hand in Notepad as often as by tools, UTF-16 included.
-    let data = sniff.data;
-    let data = if data.starts_with(b"\xFF\xFE") || data.starts_with(b"\xFE\xFF") {
-        sniff.decoded()?
-    } else {
-        data
-    };
-    // `<!-- :` is cmd.exe's half of a batch/WSF hybrid: the batch lines hide
-    // in that comment, and cmd.exe runs them first. The batch grammar decides.
-    let opening = data.trim_ascii_start();
-    if opening
-        .get(..6)
-        .is_some_and(|open| open.eq_ignore_ascii_case(b"<!-- :"))
-    {
-        return None;
-    }
-    let head = xml_head(data)?;
-    let root = head.root?;
-    if !["job", "package", "component", "scriptlet"]
-        .iter()
-        .any(|r| root.eq_ignore_ascii_case(r.as_bytes()))
-    {
-        return None;
-    }
-    let mut rest = data.get(..WSH_SCRIPT_WINDOW).unwrap_or(data);
-    while let Some(at) = find_ci(rest, b"<script") {
-        let Some(after) = rest.get(at + b"<script".len()..) else {
-            break;
-        };
-        let tag = memchr::memchr(b'>', after)
-            .and_then(|end| after.get(..end))
-            .unwrap_or(after);
-        if let Some(language) = attribute_value(tag, b"language") {
-            let language = decode_char_refs(language).to_ascii_lowercase();
-            if language.starts_with("vbs") {
-                return Some(FileType::Vbs);
-            }
-            if language.starts_with("jscript") || language.starts_with("javascript") {
-                return Some(FileType::JavaScript);
-            }
-        }
-        rest = after;
-    }
-    None
-}
-
-/// The value of `name="..."` (or single-quoted) inside a tag, whitespace
-/// around the `=` allowed.
-fn attribute_value<'a>(tag: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
-    let mut from = 0;
-    while let Some(at) = find_ci(tag.get(from..)?, name) {
-        let start = from + at;
-        let (before, found) = tag.split_at_checked(start)?;
-        let rest = found.get(name.len()..)?.trim_ascii_start();
-        let boundary = before.last().is_none_or(u8::is_ascii_whitespace);
-        if let (true, Some(value)) = (boundary, rest.strip_prefix(b"=")) {
-            let value = value.trim_ascii_start();
-            let (&quote, inner) = value.split_first()?;
-            if quote == b'"' || quote == b'\'' {
-                return inner.split(|&b| b == quote).next();
-            }
-            return value
-                .split(|b| b.is_ascii_whitespace() || *b == b'/')
-                .next();
-        }
-        from = start + name.len();
-    }
-    None
-}
-
-/// Resolve `&#86;` / `&#x56;` character references, which obfuscated
-/// scriptlets use to spell `VBScript` without the letters.
-fn decode_char_refs(value: &[u8]) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut rest = value;
-    while let Some((&b, tail)) = rest.split_first() {
-        if b == b'&' && tail.first() == Some(&b'#') {
-            if let Some(end) = tail.iter().position(|&c| c == b';') {
-                let digits = tail
-                    .get(1..end)
-                    .and_then(|d| std::str::from_utf8(d).ok())
-                    .unwrap_or("");
-                let code = match digits.strip_prefix(['x', 'X']) {
-                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
-                    None => digits.parse().ok(),
-                };
-                if let Some(c) = code.and_then(char::from_u32) {
-                    out.push(c);
-                    rest = tail.get(end + 1..).unwrap_or_default();
-                    continue;
-                }
-            }
-        }
-        out.push(char::from(b));
-        rest = tail;
-    }
-    out
-}
-
-/// Script Encoder output: `#@~^` + base64 length + `==`. The cipher hides
-/// which language was encoded, so the one call the bytes cannot make falls to
-/// the name: `.jse` is JScript, anything else the far more common VBScript.
-fn encoded_script(path: &Path, head: &[u8]) -> Option<FileType> {
-    let rest = strip_utf8_bom(head).strip_prefix(b"#@~^")?;
-    let length = rest.get(..6)?;
-    if !length
-        .iter()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/'))
-        || rest.get(6..8) != Some(b"==")
-    {
-        return None;
-    }
-    let jse = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("jse"));
-    Some(if jse {
-        FileType::JavaScript
-    } else {
-        FileType::Vbs
-    })
-}
-
-/// Type a markup document by its root element: `plist`, `svg`, a known XML
-/// vocabulary, or any document with an `<?xml` prolog. HTML is claimed
-/// earlier and by the heuristics, not here.
-fn detect_xml(data: &[u8]) -> Option<(FileType, DetectionSource)> {
-    let head = xml_head(data)?;
-    let ft = match head.root {
-        Some(b"plist") => FileType::Plist,
-        Some(b"svg") => FileType::Svg,
-        // MSBuild projects often omit the prolog and open with `<Project`;
-        // the namespace keeps some other `<Project>` out.
-        Some(b"Project")
-            if memchr::memmem::find(head.text, b"schemas.microsoft.com/developer/msbuild")
-                .is_some() =>
-        {
-            FileType::Xml
-        }
-        Some(
-            b"rss" | b"feed" | b"RDF" | b"rdf:RDF" | b"configuration" | b"Configuration"
-            | b"manifest",
-        ) => FileType::Xml,
-        _ if head.prolog => FileType::Xml,
-        _ => return None,
-    };
-    Some((ft, DetectionSource::Magic))
-}
-
-/// How far into a document [`xml_head`] looks for the root element.
-const XML_HEAD: usize = 1024;
-
-/// The opening of a markup document, read the way a parser reads it.
-struct XmlHead<'a> {
-    /// The bytes read.
-    text: &'a [u8],
-    /// Whether an `<?xml` declaration came first.
-    prolog: bool,
-    /// The root element's name: the first element, or the doctype's name when
-    /// the head ends before any element. `None` when the two disagree -- a
-    /// document that contradicts itself is claimed by neither.
-    root: Option<&'a [u8]>,
-}
-
-/// Read past a BOM, whitespace, processing instructions, comments and the
-/// doctype to the root element. `None` unless the document opens with `<`.
-fn xml_head(data: &[u8]) -> Option<XmlHead<'_>> {
-    let text = data.get(..XML_HEAD).unwrap_or(data);
-    let mut rest = strip_utf8_bom(text).trim_ascii_start();
-    if !rest.starts_with(b"<") {
-        return None;
-    }
-    let prolog = rest.starts_with(b"<?xml");
-    let mut doctype = None;
-    let element = loop {
-        rest = rest.trim_ascii_start();
-        let close: &[u8] = if rest.starts_with(b"<?") {
-            b"?>"
-        } else if rest.starts_with(b"<!--") {
-            b"-->"
-        } else if let Some((open, after)) = rest.split_at_checked(9)
-            && open.eq_ignore_ascii_case(b"<!DOCTYPE")
-        {
-            doctype = Some(markup_name(after.trim_ascii_start()));
-            b">"
-        } else if rest.starts_with(b"<!") {
-            b">"
-        } else if let Some(name) = rest.strip_prefix(b"<") {
-            break Some(markup_name(name));
-        } else {
-            break None;
-        };
-        match memchr::memmem::find(rest, close).and_then(|end| rest.get(end + close.len()..)) {
-            Some(after) => rest = after,
-            None => break None,
-        }
-    };
-    let root = match (doctype, element) {
-        (Some(d), Some(e)) if d != e => None,
-        (d, e) => e.or(d),
-    };
-    Some(XmlHead {
-        text,
-        prolog,
-        root: root.filter(|r| !r.is_empty()),
-    })
-}
-
-/// The name that opens `bytes`, up to whitespace, `>`, `/` or `[`.
-fn markup_name(bytes: &[u8]) -> &[u8] {
-    bytes
-        .split(|&b| b.is_ascii_whitespace() || matches!(b, b'>' | b'/' | b'['))
-        .next()
-        .unwrap_or(bytes)
 }
 
 /// Detect shebang-based file types.
@@ -2289,25 +1543,6 @@ fn launched_interpreter<'a>(words: &mut impl Iterator<Item = &'a [u8]>) -> Optio
     None
 }
 
-/// Detect tampered PE: MZ within first 64 bytes with valid PE\0\0 signature.
-fn detect_tampered_pe(data: &[u8]) -> Option<FileType> {
-    let window = data.get(..64).unwrap_or(data);
-    window
-        .windows(2)
-        .enumerate()
-        // Offset 0 was already checked by the MZ arm.
-        .skip(1)
-        .filter(|&(_, pair)| pair == b"MZ")
-        .any(|(i, _)| {
-            data.get(i..).is_some_and(|pe| {
-                bytes::u32_le(pe, 0x3C)
-                    .and_then(|e_lfanew| pe.get(e_lfanew as usize..))
-                    .is_some_and(|nt| nt.starts_with(b"PE\0\0"))
-            })
-        })
-        .then_some(FileType::Pe)
-}
-
 /// Maximum prefix examined when identifying a Go module manifest by content.
 const GO_MOD_HEAD_LIMIT: usize = 4096;
 
@@ -2357,463 +1592,5 @@ fn looks_like_go_mod(data: &[u8]) -> bool {
             .all(|part| !part.is_empty() && part != "." && part != ".." && !part.starts_with('.'))
 }
 
-/// Detect manifest file types that require content inspection.
-#[expect(
-    clippy::case_sensitive_file_extension_comparisons,
-    reason = "`name` is lowercased before matching"
-)]
-fn detect_manifest(path: &Path, data: &[u8]) -> Option<FileType> {
-    let file_name = path.file_name()?.to_str()?;
-
-    // Stack-allocated lowercase (manifest names are short). A longer name is
-    // cut to the buffer.
-    let mut buf = [0u8; 32];
-    let file_name = file_name.as_bytes();
-    let file_name = file_name.get(..buf.len()).unwrap_or(file_name);
-    let lower = buf.get_mut(..file_name.len())?;
-    lower.copy_from_slice(file_name);
-    lower.make_ascii_lowercase();
-    let name = std::str::from_utf8(lower).unwrap_or("");
-
-    match name {
-        "package.json" => Some(FileType::PackageJson),
-        "package-lock.json" => Some(FileType::PackageLockJson),
-        "go.mod" => Some(FileType::GoMod),
-        "go.sum" => Some(FileType::GoSum),
-        "requirements.txt" => Some(FileType::RequirementsTxt),
-        "poetry.lock" => Some(FileType::PoetryLock),
-        "pipfile.lock" => Some(FileType::PipfileLock),
-        "gemfile.lock" => Some(FileType::GemfileLock),
-        "composer.lock" => Some(FileType::ComposerLock),
-        "yarn.lock" => Some(FileType::YarnLock),
-        "pnpm-lock.yaml" => Some(FileType::PnpmLock),
-        "manifest.json" => {
-            // Chrome extension: manifest_version + at least one Chrome-specific key
-            if memchr::memmem::find(data, b"\"manifest_version\"").is_some()
-                && (memchr::memmem::find(data, b"\"permissions\"").is_some()
-                    || memchr::memmem::find(data, b"\"content_scripts\"").is_some()
-                    || memchr::memmem::find(data, b"\"background\"").is_some()
-                    || memchr::memmem::find(data, b"\"host_permissions\"").is_some())
-            {
-                Some(FileType::ChromeManifest)
-            } else {
-                None
-            }
-        }
-        "extension.vsixmanifest" => Some(FileType::VsixManifest),
-        ".pkginfo" | ".buildinfo" | ".mtree" => Some(FileType::Text),
-        "pkg-info" | "metadata" => Some(FileType::PkgInfo),
-        "action.yml" | "action.yaml" => Some(FileType::GithubActions),
-        _ => {
-            if name.ends_with(".vsixmanifest") {
-                Some(FileType::VsixManifest)
-            } else if name.starts_with("yarn.") && name.ends_with(".lock") {
-                Some(FileType::YarnLock)
-            } else {
-                None
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod odf_confirmation_tests {
-    use super::*;
-
-    /// A ZIP whose local-header walk cannot complete, carrying the
-    /// OpenDocument namespace URI somewhere in its body -- the shape of the
-    /// 88MB .xapk that was typed OpenDocument.
-    fn unwalkable_zip_mentioning_odf() -> Vec<u8> {
-        let mut d = b"PK\x03\x04".to_vec();
-        // A local header with a nonsense name length, so the walk loses the
-        // thread and reports `None` rather than a confident "no".
-        d.extend_from_slice(&[0xFF; 26]);
-        d.extend_from_slice(b"application/vnd.oasis.opendocument.text");
-        d.resize(4096, 0x41);
-        d
-    }
-
-    #[test]
-    fn indeterminate_walk_is_not_opendocument() {
-        let d = unwalkable_zip_mentioning_odf();
-        assert_ne!(classify_pk(Path::new("x.xapk"), &d).0, FileType::Odf);
-    }
-
-    #[test]
-    fn odf_extension_still_wins() {
-        let d = unwalkable_zip_mentioning_odf();
-        assert_eq!(classify_pk(Path::new("x.odt"), &d).0, FileType::Odf);
-    }
-}
-
-#[cfg(test)]
-mod jet_db_sfnt_collision_tests {
-    use super::*;
-
-    #[test]
-    fn nrbf_stream_header_routes_to_data_without_a_filename_gate() {
-        let data = [
-            0, 1, 0, 0, 0, 255, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0, 0, 11,
-        ];
-        for path in ["reference.cache", "renamed.ttf", "sample"] {
-            assert_eq!(
-                detect_from_content(Path::new(path), &data).map(|(ft, _)| ft),
-                Some(FileType::Data)
-            );
-        }
-        for end in 0..17 {
-            assert_ne!(
-                detect_from_content(Path::new("sample"), &data[..end]).map(|(ft, _)| ft),
-                Some(FileType::Data)
-            );
-        }
-        let mut wrong_version = data;
-        wrong_version[9] = 2;
-        assert_ne!(
-            detect_from_content(Path::new("sample"), &wrong_version).map(|(ft, _)| ft),
-            Some(FileType::Data)
-        );
-    }
-
-    /// A real TrueType font still identifies as a font.
-    #[test]
-    fn sfnt_version_one_is_still_a_font() {
-        let mut data = vec![0x00, 0x01, 0x00, 0x00];
-        data.extend_from_slice(&[0x00, 0x0a, 0x00, 0x80, 0x00, 0x03, 0x00, 0x20]);
-        data.extend_from_slice(b"cmap");
-        assert_eq!(
-            detect_from_content(Path::new("x.ttf"), &data).map(|(ft, _)| ft),
-            Some(FileType::Font)
-        );
-    }
-
-    /// An Access database opens with the same four bytes and must not be
-    /// handed to the font parser.
-    #[test]
-    fn jet_db_header_is_not_a_font() {
-        let mut data = vec![0x00, 0x01, 0x00, 0x00];
-        data.extend_from_slice(b"Standard Jet DB\x00");
-        data.extend_from_slice(&[0u8; 32]);
-        assert_ne!(
-            detect_from_content(Path::new("db.mdb"), &data).map(|(ft, _)| ft),
-            Some(FileType::Font)
-        );
-    }
-
-    /// The newer ACE engine names itself the same way.
-    #[test]
-    fn ace_db_header_is_not_a_font() {
-        let mut data = vec![0x00, 0x01, 0x00, 0x00];
-        data.extend_from_slice(b"Standard ACE DB\x00");
-        data.extend_from_slice(&[0u8; 32]);
-        assert_ne!(
-            detect_from_content(Path::new("db.accdb"), &data).map(|(ft, _)| ft),
-            Some(FileType::Font)
-        );
-    }
-}
-
-#[cfg(test)]
-mod html_doctype_magic_tests {
-    use super::*;
-    use crate::FileId;
-
-    #[test]
-    fn utf8_bom_html_is_detected_under_misleading_names() {
-        for body in [
-            "<!DOCTYPE html><html><body>page</body></html>",
-            "  <HTML><body><script>document.write('x')</script></body></HTML>",
-            "<script src='https://example.invalid/a.js'></script>\n<!doctype html><html>",
-        ] {
-            let mut data = UTF8_BOM.to_vec();
-            data.extend_from_slice(body.as_bytes());
-            let file = FileId::from_path_and_bytes(Path::new("sample.vir"), &data);
-            assert_eq!(file.file_type(), FileType::Html, "{body}");
-        }
-    }
-
-    /// A page under a name that claims another language is still a page.
-    #[test]
-    fn doctype_html_is_detected_by_content() {
-        let data =
-            b"<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\">\n<HTML></HTML>";
-        assert_eq!(
-            detect_from_content(Path::new("Trojan.JS.DeltreeY.c"), data).map(|(ft, _)| ft),
-            Some(FileType::Html)
-        );
-    }
-
-    /// The doctype keyword is case-insensitive in HTML and in the wild.
-    #[test]
-    fn lowercase_doctype_html_is_detected() {
-        let data = b"<!doctype html>\n<html><body>x</body></html>";
-        assert_eq!(
-            detect_from_content(Path::new("x"), data).map(|(ft, _)| ft),
-            Some(FileType::Html)
-        );
-    }
-
-    /// The SVG arm compares the root name, so it keeps its own doctype.
-    #[test]
-    fn doctype_svg_is_not_html() {
-        let data = b"<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"x\">\n<svg xmlns=\"x\"/>";
-        assert_ne!(
-            detect_from_content(Path::new("x.svg"), data).map(|(ft, _)| ft),
-            Some(FileType::Html)
-        );
-    }
-
-    /// Real pages are not flush left. Four VirusShare samples open with four
-    /// spaces before the doctype and were scored as JavaScript for the jQuery
-    /// inside them.
-    #[test]
-    fn indented_doctype_is_still_html() {
-        let data = b"    <!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\">\n<html>";
-        assert_eq!(
-            detect_from_content(Path::new("VirusShare_4bcf5cc475"), data).map(|(ft, _)| ft),
-            Some(FileType::Html)
-        );
-    }
-
-    /// A file whose first bytes are `<html` is a page, doctype or not.
-    #[test]
-    fn bare_html_root_is_html() {
-        let data = b"<html data-adblockkey=\"MFwwDQYJ\"><head><title>Redirecting</title>";
-        assert_eq!(
-            detect_from_content(Path::new("VirusShare_f54b1d8fed"), data).map(|(ft, _)| ft),
-            Some(FileType::Html)
-        );
-    }
-
-    /// The root-element check stops at a word boundary, so an XML document
-    /// whose root merely begins with those letters is untouched.
-    #[test]
-    fn htmlspecialchars_root_is_not_html() {
-        let data = b"<htmlspecialchars>not a page</htmlspecialchars>";
-        assert_ne!(
-            detect_from_content(Path::new("x.xml"), data).map(|(ft, _)| ft),
-            Some(FileType::Html)
-        );
-    }
-
-    /// A short injected loader before a complete document must not hide the
-    /// page from content-based type detection under an extensionless name.
-    #[test]
-    fn doctype_html_after_leading_script_is_detected_by_content() {
-        let data = b"<script src='https://example.invalid/stat.js'></script>\n<!DOCTYPE html>\n<html><head><title>x</title></head><body>x</body></html>";
-        let extensionless = FileId::from_path_and_bytes(Path::new("VirusShare_0123456789"), data);
-        assert_eq!(extensionless.file_type(), FileType::Html);
-        assert_eq!(extensionless.source(), DetectionSource::Magic);
-        assert!(!extensionless.extension_mismatch());
-
-        let misleading_name = FileId::from_path_and_bytes(Path::new("page.js"), data);
-        assert_eq!(misleading_name.file_type(), FileType::Html);
-        assert_eq!(misleading_name.source(), DetectionSource::Magic);
-        assert!(misleading_name.extension_mismatch());
-    }
-
-    /// A script with an HTML doctype in its source string but no HTML root is
-    /// still a script, rather than an HTML document.
-    #[test]
-    fn doctype_string_without_html_root_is_not_a_document() {
-        let data = b"const x = '<!DOCTYPE html>'; eval(x);";
-        assert_ne!(
-            detect_from_content(Path::new("x"), data).map(|(ft, _)| ft),
-            Some(FileType::Html)
-        );
-    }
-}
-
-#[cfg(test)]
-mod registry_script_magic_tests {
-    use super::*;
-
-    /// The Windows 9x/NT4 header, under a name that claims another type.
-    #[test]
-    fn regedit4_header_is_a_registry_script() {
-        let data = b"REGEDIT4\r\n\r\n[HKEY_LOCAL_MACHINE\\Software\\Foo]\r\n\"Bar\"=\"baz\"\r\n";
-        assert_eq!(
-            detect_from_content(Path::new("Trojan.WinREG.AntiFireWall.a"), data).map(|(ft, _)| ft),
-            Some(FileType::Reg)
-        );
-    }
-
-    /// The Windows 2000+ header.
-    #[test]
-    fn modern_registry_header_is_a_registry_script() {
-        let data = b"Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\X]\r\n";
-        assert_eq!(
-            detect_from_content(Path::new("x"), data).map(|(ft, _)| ft),
-            Some(FileType::Reg)
-        );
-    }
-
-    /// Prose that merely begins with the same word is not a registry script.
-    #[test]
-    fn unrelated_w_text_is_not_a_registry_script() {
-        let data = b"Windows compatibility notes\n\nThis document describes...\n";
-        assert_ne!(
-            detect_from_content(Path::new("notes.txt"), data).map(|(ft, _)| ft),
-            Some(FileType::Reg)
-        );
-        let mut utf16 = vec![0xFF, 0xFE];
-        utf16.extend(
-            "Windows compatibility notes\r\n"
-                .encode_utf16()
-                .flat_map(u16::to_le_bytes),
-        );
-        assert_ne!(
-            detect_from_content(Path::new("notes.txt"), &utf16).map(|(ft, _)| ft),
-            Some(FileType::Reg)
-        );
-    }
-
-    /// What regedit writes: UTF-16LE behind a byte-order mark. A copy
-    /// re-saved as UTF-8 may keep a mark of its own.
-    #[test]
-    fn bom_prefixed_registry_exports_are_registry_scripts() {
-        let header = "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\X]\r\n";
-        let mut utf16 = vec![0xFF, 0xFE];
-        utf16.extend(header.encode_utf16().flat_map(u16::to_le_bytes));
-        let mut utf8 = UTF8_BOM.to_vec();
-        utf8.extend_from_slice(header.as_bytes());
-        for data in [utf16, utf8] {
-            assert_eq!(
-                detect_from_content(Path::new("export.reg"), &data),
-                Some((FileType::Reg, DetectionSource::Magic))
-            );
-            assert_eq!(
-                super::super::detect(Path::new("export.reg"), &data).map(|d| d.file_type),
-                Some(FileType::Reg)
-            );
-        }
-    }
-
-    /// Every header spelling under its own `.reg` name is consistent with
-    /// the extension. Before `.reg` was in the extension table, each one
-    /// reported a mismatch against an unknown extension.
-    #[test]
-    fn reg_extension_agrees_with_every_header_spelling() {
-        let body = "\r\n\r\n[HKEY_CURRENT_USER\\X]\r\n\"A\"=dword:00000001\r\n";
-        let modern = format!("Windows Registry Editor Version 5.00{body}");
-        let mut utf16 = vec![0xFF, 0xFE];
-        utf16.extend(modern.encode_utf16().flat_map(u16::to_le_bytes));
-        let mut utf8_bom = UTF8_BOM.to_vec();
-        utf8_bom.extend_from_slice(modern.as_bytes());
-        let regedit4 = format!("REGEDIT4{body}").into_bytes();
-        for data in [utf16, utf8_bom, modern.into_bytes(), regedit4] {
-            let det = super::super::detect(Path::new("Export.REG"), &data).unwrap();
-            assert_eq!(det.file_type, FileType::Reg);
-            assert_eq!(det.source, DetectionSource::Magic);
-            assert!(!det.extension_mismatch());
-            let id = crate::FileId::from_path_and_bytes(Path::new("export.reg"), &data);
-            assert_eq!(id.file_type().label(), "reg");
-            assert!(!id.extension_mismatch());
-        }
-    }
-
-    /// The header defines the format, so a `.reg` name on anything else is
-    /// a mismatch, and the body is typed by its content.
-    #[test]
-    fn reg_extension_without_a_header_is_a_mismatch() {
-        let prose = b"These notes describe how the settings were changed last week.\n";
-        let det = super::super::detect(Path::new("notes.reg"), prose).unwrap();
-        assert_eq!(det.file_type, FileType::Text);
-        assert!(det.extension_mismatch());
-        assert_eq!(det.extension_type(), Some(FileType::Reg));
-        // An empty file has nothing to contradict its name.
-        let empty = super::super::detect(Path::new("empty.reg"), b"").unwrap();
-        assert_eq!(empty.file_type, FileType::Reg);
-        assert!(!empty.extension_mismatch());
-    }
-
-    /// Package-registry metadata keeps `registry`; it shares nothing with a
-    /// registry export but the word.
-    #[test]
-    fn package_registry_metadata_is_not_a_registry_export() {
-        let doc = br#"{"ecosystem":"npm","name":"left-pad","version":"1.3.0"}"#;
-        let det = super::super::detect(Path::new("left-pad@1.3.0.registry.json"), doc).unwrap();
-        assert_eq!(det.file_type, FileType::Registry);
-        assert_eq!(det.file_type.label(), "registry");
-        assert_eq!(FileType::from_label("reg"), Some(FileType::Reg));
-        assert!(FileType::Registry.is_structured_data());
-        assert!(!FileType::Reg.is_structured_data());
-    }
-}
-
-#[cfg(test)]
-mod windows_script_host_tests {
-    use super::*;
-
-    #[test]
-    fn character_references_resolve() {
-        assert_eq!(decode_char_refs(b"&#86;&#66;&#x53;cript"), "VBScript");
-        // A malformed reference is left as it is.
-        assert_eq!(decode_char_refs(b"&#zz;x"), "&#zz;x");
-    }
-
-    #[test]
-    fn attribute_values() {
-        assert_eq!(
-            attribute_value(b" language='JScript' src=x", b"language"),
-            Some(&b"JScript"[..])
-        );
-        assert_eq!(
-            attribute_value(b"\r\nlanguage = \"VBScript\"", b"language"),
-            Some(&b"VBScript"[..])
-        );
-        assert_eq!(
-            attribute_value(b" language=VBS/", b"language"),
-            Some(&b"VBS"[..])
-        );
-        // `xlanguage` is a different attribute.
-        assert_eq!(
-            attribute_value(b" xlanguage=\"VBScript\"", b"language"),
-            None
-        );
-    }
-
-    #[test]
-    fn script_host_roots_only() {
-        let job = b"<component>\n<script language=\"VBScript\">x = 1</script>\n</component>\n";
-        assert_eq!(windows_script_host(job), Some(FileType::Vbs));
-        // No language, or one the host does not run: not claimed.
-        assert_eq!(
-            windows_script_host(b"<job><script>x = 1</script></job>"),
-            None
-        );
-        assert_eq!(
-            windows_script_host(b"<job><script language=\"PerlScript\">1;</script></job>"),
-            None
-        );
-        // Other XML is left to the XML arm.
-        assert_eq!(
-            windows_script_host(
-                b"<?xml version=\"1.0\"?><rss><script language=\"VBScript\"/></rss>"
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn dib_header_versions() {
-        let header = |size: u32, planes: u16, bits: u16| {
-            let mut h = size.to_le_bytes().to_vec();
-            h.resize(40, 0);
-            let at = if size == 12 { 8 } else { 12 };
-            h[at..at + 2].copy_from_slice(&planes.to_le_bytes());
-            h[at + 2..at + 4].copy_from_slice(&bits.to_le_bytes());
-            h
-        };
-        for size in [12, 16, 40, 52, 56, 64, 108, 124] {
-            assert!(looks_like_dib_header(&header(size, 1, 8)), "size {size}");
-        }
-        assert!(!looks_like_dib_header(&header(41, 1, 8)));
-        assert!(!looks_like_dib_header(&header(40, 0, 8)));
-        assert!(!looks_like_dib_header(&header(40, 1, 3)));
-        assert!(!looks_like_dib_header(&[40, 0, 0]));
-    }
-}

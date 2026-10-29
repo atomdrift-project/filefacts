@@ -74,7 +74,7 @@ fn code_blocks(p: &Parsed) -> Vec<usize> {
 
 #[test]
 fn portable_compiler_fixture_preserves_signedness_and_function_layout() {
-    let bytes = test_fixture();
+    let bytes = super::super::fixture::compiled();
     let p = parse(&bytes).unwrap();
     valid_offsets(&p, &bytes);
     assert_eq!(code_blocks(&p).len(), 2);
@@ -498,10 +498,11 @@ fn bytes_keep_tags_and_payload_offsets() {
 
 #[test]
 fn real_sample() {
-    let bytes = include_bytes!("../../../../tests/fixtures/stage4.scpt");
-    let p = parse(bytes).unwrap();
+    let bytes = zstd::decode_all(&include_bytes!("../../../../tests/fixtures/stage4.scpt.zst")[..])
+        .expect("fixture decompresses");
+    let p = parse(&bytes).unwrap();
     assert_eq!(p.version, "1.10");
-    valid_offsets(&p, bytes);
+    valid_offsets(&p, &bytes);
     let code = code_blocks(&p).len();
     let names = p
         .nodes

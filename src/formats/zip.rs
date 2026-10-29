@@ -1,10 +1,10 @@
 //! ZIP archive-index extractor.
 //!
-//! Reads the central directory only — never decompresses entries. The
-//! output is the full member listing, the archive comment, and a few
-//! per-entry forensic fields drawn from the central-directory header.
-//!
-//! Decompression and recursion are the caller's responsibility:
+//! The walk reads the central directory only. The output is the full member
+//! listing, the archive comment, and a few per-entry forensic fields drawn
+//! from the central-directory header. Package layers built on a ZIP read a
+//! few named members (manifests, signature blocks) through [`read_member`],
+//! which caps what it inflates; everything else is the caller's to unpack:
 //! `filefacts` describes what's *in* the archive, not what each member
 //! *contains*.
 //!
@@ -15,10 +15,6 @@
 //! the local-header signatures the central directory points at and tries
 //! again, and when even that fails, the member listing still comes from the
 //! raw central directory.
-
-// JAR signing manifests have format-defined uppercase names
-// (`META-INF/*.SF`, `*.RSA`). The case-sensitive comparison is required.
-#![allow(clippy::case_sensitive_file_extension_comparisons)]
 
 use crate::metric;
 use crate::value_key;
@@ -33,22 +29,14 @@ use serde_json::Value as JsonValue;
 use zip::result::ZipError;
 use zip::{CompressionMethod, ZipArchive};
 
-use super::archive_stats::{Agg, ArchiveStats, Dominance, Reading, Scope, Shape, member_value};
-use super::bounded::{MAX_ARCHIVE_MEMBERS, MemberPrefix, read_prefix};
-use super::common::bytes_at;
+use super::archive_stats::{Agg, ArchiveStats, Dominance, Reading, Scope, member_value};
+use super::bounded::{Limits, MAX_ARCHIVE_MEMBERS, MemberPrefix, inflate_capped};
+use super::common::{bytes_at, ends_with_ci};
 use crate::error::Error;
 use crate::output::{
-    ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Errors, Metrics, Stage,
-    Values,
+    ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, EntryType, Errors,
+    Metrics, Stage, Values,
 };
-
-/// Cap on how many central-directory entries are walked into
-/// `archive.members`. `ZipArchive::len()` counts the entries the `zip` crate
-/// actually parsed (each at least 46 bytes of central directory, de-duplicated
-/// by name), so it is bounded by the input size, not by the count the EOCD
-/// declares. A large input can still hold millions, though, and each walked
-/// entry costs a JSON member and an [`ArchiveMember`].
-pub(super) const MAX_ZIP_MEMBERS: usize = MAX_ARCHIVE_MEMBERS;
 
 /// The shared aggregates over the walked entries. The member count, the
 /// duplicate count and the sentinel-mtime count are ZIP's own: they also
@@ -146,10 +134,12 @@ fn open_crate(bytes: Cow<'_, [u8]>) -> Result<Archive<'_>, ZipError> {
 /// What [`open`] could make of a ZIP.
 enum Opened<'a> {
     /// The `zip` crate opened it, `repaired` local headers needing their
-    /// signature restored first.
+    /// signature restored first. `directory` is the raw central directory,
+    /// when the EOCD locates one, kept so the walk does not search again.
     Archive {
         archive: Archive<'a>,
         repaired: usize,
+        directory: Option<RawDirectory>,
     },
     /// Not even a repaired copy opens; only the raw central directory
     /// reads. `error` is why the crate refused the original.
@@ -162,52 +152,54 @@ enum Opened<'a> {
 /// Open `bytes` as a ZIP. `Err` only when there is no central directory to
 /// read at all — the input is not a ZIP.
 fn open(bytes: &[u8]) -> Result<Opened<'_>, Error> {
+    let directory = read_raw_directory(bytes);
     let error = match open_crate(Cow::Borrowed(bytes)) {
         Ok(archive) => {
-            // Recent `zip` releases defer local-header validation until a
-            // member is read. Older releases rejected the archive during
-            // `new`, which sent us through the repair path below. Check the
-            // central directory here too, so a successful open cannot hide
-            // a damaged local signature until a package layer reads it.
-            if let Some(directory) = read_raw_directory(bytes) {
-                let mismatches = directory
+            // The `zip` crate defers local-header validation until a member
+            // is read, so a damaged local signature would only surface when
+            // a package layer reads one. Check the central directory's
+            // targets here, and repair them up front.
+            if let Some(dir) = &directory
+                && dir
                     .entries
                     .iter()
-                    .filter(|entry| !local_header_intact(bytes, &directory, entry))
-                    .count();
-                if mismatches > 0
-                    && let Some((repaired_bytes, repaired)) =
-                        repair_local_headers(bytes, &directory)
-                    && let Ok(archive) = open_crate(Cow::Owned(repaired_bytes))
-                {
-                    return Ok(Opened::Archive { archive, repaired });
-                }
+                    .any(|entry| !local_header_intact(bytes, dir, entry))
+                && let Some((repaired_bytes, repaired)) = repair_local_headers(bytes, dir)
+                && let Ok(archive) = open_crate(Cow::Owned(repaired_bytes))
+            {
+                return Ok(Opened::Archive {
+                    archive,
+                    repaired,
+                    directory,
+                });
             }
             return Ok(Opened::Archive {
                 archive,
                 repaired: 0,
+                directory,
             });
         }
         Err(error) => error,
     };
-    let Some(directory) = read_raw_directory(bytes) else {
+    let Some(directory) = directory else {
         return Err(Error::malformed_caused_by("zip", error));
     };
     if let Some((repaired_bytes, repaired)) = repair_local_headers(bytes, &directory)
         && let Ok(archive) = open_crate(Cow::Owned(repaired_bytes))
     {
-        return Ok(Opened::Archive { archive, repaired });
+        tracing::debug!(
+            target: "filefacts::zip",
+            repaired,
+            error = %error,
+            "zip opened after restoring local-header signatures"
+        );
+        return Ok(Opened::Archive {
+            archive,
+            repaired,
+            directory: Some(directory),
+        });
     }
     Ok(Opened::RawOnly { error, directory })
-}
-
-/// Open `bytes` for reading members, restoring corrupted local-header
-/// signatures if that is what stops the `zip` crate.
-pub(super) fn open_archive(bytes: &[u8]) -> Result<Archive<'_>, Error> {
-    match open(bytes)? {
-        Opened::Archive { archive, .. } => Ok(archive),
-        Opened::RawOnly { error, .. } => Err(Error::malformed_caused_by("zip", error)),
-    }
 }
 
 /// Open `bytes` and emit the ZIP member listing and archive facts. Returns
@@ -225,6 +217,7 @@ pub(super) fn open_and_walk<'a>(
         Opened::Archive {
             mut archive,
             repaired,
+            directory,
         } => {
             if repaired > 0 {
                 metrics.insert(
@@ -238,8 +231,57 @@ pub(super) fn open_and_walk<'a>(
                          read through the central directory, as Android and Java do"
                     ),
                 );
+            } else if let Some(dir) = &directory {
+                // Pointers no signature repair could fix: the listing stands,
+                // but those members will not read.
+                let mismatched = dir
+                    .entries
+                    .iter()
+                    .filter(|e| !local_header_intact(bytes, dir, e))
+                    .count();
+                if mismatched > 0 {
+                    metrics.insert(
+                        metric!("archive.local_header_mismatch_count"),
+                        mismatched as f64,
+                    );
+                    errors.record_fallback(
+                        Stage::ZipParse,
+                        format!(
+                            "{mismatched} central-directory entries point at no local \
+                             file header; their members will not read"
+                        ),
+                    );
+                }
             }
-            extract_from_archive(&mut archive, bytes, values, metrics, archive_members)?;
+            let walked = walk_archive(
+                &mut archive,
+                directory.as_ref(),
+                bytes,
+                values,
+                metrics,
+                archive_members,
+                MAX_ARCHIVE_MEMBERS,
+            );
+            match (walked, &directory) {
+                (Ok(()), _) => {}
+                // An entry the crate parsed but cannot open its record for:
+                // the raw central directory still lists every member.
+                (Err(error), Some(dir)) => {
+                    errors.record_fallback(
+                        Stage::ZipParse,
+                        format!("{error}; members listed from the raw central directory"),
+                    );
+                    walk_raw(
+                        dir,
+                        bytes,
+                        values,
+                        metrics,
+                        archive_members,
+                        MAX_ARCHIVE_MEMBERS,
+                    );
+                }
+                (Err(error), None) => return Err(error),
+            }
             Ok(Some(archive))
         }
         Opened::RawOnly { error, directory } => {
@@ -264,7 +306,7 @@ pub(super) fn open_and_walk<'a>(
                 values,
                 metrics,
                 archive_members,
-                MAX_ZIP_MEMBERS,
+                MAX_ARCHIVE_MEMBERS,
             );
             Ok(None)
         }
@@ -280,23 +322,6 @@ pub(super) fn extract(
     errors: &mut Errors,
 ) -> Result<(), Error> {
     open_and_walk(bytes, values, metrics, archive_members, errors).map(drop)
-}
-
-pub(super) fn extract_from_archive<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
-    bytes: &[u8],
-    values: &mut Values,
-    metrics: &mut Metrics,
-    archive_members: &mut Vec<ArchiveMember>,
-) -> Result<(), Error> {
-    walk_archive(
-        archive,
-        bytes,
-        values,
-        metrics,
-        archive_members,
-        MAX_ZIP_MEMBERS,
-    )
 }
 
 /// One walked member, with the per-entry facts the walk aggregates.
@@ -329,20 +354,22 @@ fn is_symlink_mode(mode: u32) -> bool {
     mode & 0o170_000 == 0o120_000
 }
 
-fn entry_type(is_dir: bool, mode: Option<u32>) -> &'static str {
+fn entry_type(is_dir: bool, mode: Option<u32>) -> EntryType {
     if is_dir {
-        "directory"
+        EntryType::Directory
     } else if mode.is_some_and(is_symlink_mode) {
-        "symlink"
+        EntryType::Symlink
     } else {
-        "regular"
+        EntryType::Regular
     }
 }
 
-/// [`extract_from_archive`] with the member cap as a parameter, so the cap
-/// can be exercised without building a 65k-entry archive.
+/// Walk the members the `zip` crate parsed. `directory` is the raw central
+/// directory [`open`] already read, if any. The member cap is a parameter so
+/// it can be exercised without building a 65k-entry archive.
 fn walk_archive<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
+    directory: Option<&RawDirectory>,
     bytes: &[u8],
     values: &mut Values,
     metrics: &mut Metrics,
@@ -359,10 +386,13 @@ fn walk_archive<R: Read + Seek>(
             .by_index_raw(i)
             .map_err(|e| Error::malformed_with_source("zip", format!("entry {i}"), e))?;
         let mode = entry.unix_mode();
+        // Names that are not UTF-8 are decoded as CP437, which maps every
+        // byte, so this fallback never runs in practice.
+        let path = entry.name().map_or_else(
+            |_| String::from_utf8_lossy(entry.name_raw()).into_owned(),
+            Cow::into_owned,
+        );
         let member = ArchiveMember {
-            path: entry.name().to_string(),
-            size_bytes: entry.size(),
-            entry_type: Some(entry_type(entry.is_dir(), mode).into()),
             // None means the MS-DOS date didn't parse — Mozilla's (1980, 0, 0)
             // "no recorded timestamp" sentinel is the common case, and
             // deterministic-build tooling (web-ext, bazel) produces it on
@@ -370,46 +400,48 @@ fn walk_archive<R: Read + Seek>(
             mtime_unix: entry
                 .last_modified()
                 .and_then(crate::scan::zip_datetime_to_unix),
-            linkname: None,
-            host_os: None,
             crc32: Some(entry.crc32()),
             encrypted: entry.encrypted(),
-            compression: Some(ArchiveCompression {
-                compressed_size: Some(entry.compressed_size()),
-                method: Some(compression_method_name(entry.compression()).into()),
-            }),
-            ownership: mode.map(|mode| ArchiveOwnership {
-                mode_octal: Some(mode),
-                ..Default::default()
-            }),
+            compression: ArchiveCompression::new(
+                Some(entry.compressed_size()),
+                Some(method_name(entry.compression()).into()),
+            ),
+            ownership: mode.map(ArchiveOwnership::mode).unwrap_or_default(),
             offsets: ArchiveOffsets {
                 header: Some(entry.header_start()),
-                data: Some(entry.data_start()),
+                data: entry.data_start(),
                 central_header: Some(entry.central_header_start()),
             },
+            ..ArchiveMember::new(path, entry.size(), entry_type(entry.is_dir(), mode))
         };
-        facts.push(EntryFacts::new(
-            member,
-            mode,
-            entry.extra_data().unwrap_or_default(),
-            entry.comment().len(),
-        ));
+        let extra = entry.extra_data().unwrap_or_default();
+        facts.push(EntryFacts::new(member, mode, &extra, entry.comment().len()));
     }
 
     // The `zip` crate de-duplicates the central directory by name at parse
     // time, so the member loop above can't see shadowed entries. Walk the
-    // raw CDH bytes as well to catch the ZIP-confusion attack shape.
+    // raw CDH bytes as well to catch the ZIP-confusion attack shape: the
+    // directory `open` read, when it starts where the crate's does.
     let cd_start = usize::try_from(archive.central_directory_start()).unwrap_or(usize::MAX);
-    let raw_entries = scan_central_directory(bytes, cd_start);
-    let names: Vec<&str> = archive.file_names().collect();
+    let scanned;
+    let (raw_entries, eocd) = match directory {
+        Some(d) if d.start == cd_start => (d.entries.as_slice(), Some(d.eocd)),
+        _ => {
+            scanned = scan_central_directory(bytes, cd_start);
+            (scanned.as_slice(), find_eocd(bytes))
+        }
+    };
+    let names: Vec<Cow<'_, str>> = archive.file_names().filter_map(Result::ok).collect();
+    let names: Vec<&str> = names.iter().map(AsRef::as_ref).collect();
     emit_walk(
         WalkInput {
             bytes,
             comment: archive.comment(),
             member_count: archive.len(),
             facts,
-            raw_entries: &raw_entries,
+            raw_entries,
             names: &names,
+            eocd,
         },
         values,
         metrics,
@@ -437,27 +469,27 @@ fn walk_raw(
                 .header_offset
                 .saturating_add(directory.archive_offset as u64);
             let member = ArchiveMember {
-                path: e.name.clone(),
-                size_bytes: e.uncompressed_size,
-                entry_type: Some(entry_type(e.name.ends_with('/'), e.unix_mode()).into()),
                 mtime_unix: e.parsed_mtime,
-                linkname: None,
-                host_os: None,
                 crc32: Some(e.crc32),
                 encrypted: e.flags & 0x0001 != 0,
-                compression: Some(ArchiveCompression {
-                    compressed_size: Some(e.compressed_size),
-                    method: Some(method_name_from_id(e.method).into()),
-                }),
-                ownership: e.unix_mode().map(|mode| ArchiveOwnership {
-                    mode_octal: Some(mode),
-                    ..Default::default()
-                }),
+                compression: ArchiveCompression::new(
+                    Some(e.compressed_size),
+                    Some(method_name_from_id(e.method).into()),
+                ),
+                ownership: e
+                    .unix_mode()
+                    .map(ArchiveOwnership::mode)
+                    .unwrap_or_default(),
                 offsets: ArchiveOffsets {
                     header: Some(header),
                     data: None,
                     central_header: Some(e.central_header_offset as u64),
                 },
+                ..ArchiveMember::new(
+                    e.name.clone(),
+                    e.uncompressed_size,
+                    entry_type(e.name.ends_with('/'), e.unix_mode()),
+                )
             };
             EntryFacts::new(member, e.unix_mode(), e.extra(bytes), e.comment_len)
         })
@@ -471,6 +503,7 @@ fn walk_raw(
             facts,
             raw_entries: &directory.entries,
             names: &names,
+            eocd: Some(directory.eocd),
         },
         values,
         metrics,
@@ -491,6 +524,8 @@ struct WalkInput<'w> {
     raw_entries: &'w [RawCdhEntry],
     /// Every member name.
     names: &'w [&'w str],
+    /// Offset of the end-of-central-directory record, when found.
+    eocd: Option<usize>,
 }
 
 /// Emit the member listing and the archive-level facts, however the members
@@ -508,6 +543,7 @@ fn emit_walk(
         facts,
         raw_entries,
         names,
+        eocd,
     } = input;
     values.insert_key(
         value_key!("archive.format.kind"),
@@ -526,13 +562,12 @@ fn emit_walk(
 
     let walked = facts.len();
     if walked < member_count {
-        values.insert_key(
-            value_key!("zip.limits"),
-            serde_json::json!([{
-                "stage": "member-cap",
-                "reason": format!("walked {walked} of {member_count} members"),
-            }]),
+        let mut limits = Limits::default();
+        limits.push(
+            "member-cap",
+            format!("walked {walked} of {member_count} members"),
         );
+        limits.emit(values, value_key!("zip.limits"));
     }
     let mut members: Vec<JsonValue> = Vec::with_capacity(walked);
     let mut stats = ArchiveStats::new(AGGS);
@@ -555,16 +590,12 @@ fn emit_walk(
         reading.exec_mode = exec_mode;
         stats.observe(&member, &reading);
 
-        let mut obj = member_value(&member, Shape::FULL);
+        let mut obj = member_value(&member);
         extra_field_size += extra_len as u64;
         extra_field_tags.extend(&extra_tags);
         uses_zip64 |= extra_tags.contains(&0x0001);
         // Sentinel sizes in the central directory also indicate Zip64 usage.
-        let compressed = member
-            .compression
-            .as_ref()
-            .and_then(|c| c.compressed_size)
-            .unwrap_or(0);
+        let compressed = member.compression.compressed_size.unwrap_or(0);
         uses_zip64 |= compressed == 0xFFFF_FFFF || member.size_bytes == 0xFFFF_FFFF;
         if !extra_tags.is_empty() {
             let tags = extra_tags.iter().map(|t| JsonValue::from(*t)).collect();
@@ -678,14 +709,19 @@ fn emit_walk(
         );
     }
 
-    // Also report `archive.signing.jar_signed_shape` when META-INF/*.SF
-    // and META-INF/*.RSA both exist.
+    // Also report `archive.signing.jar_signed_shape` when a signature file
+    // (`META-INF/*.SF`) and a signature block (`*.RSA`, `*.DSA`, `*.EC`) both
+    // exist. The JDK matches both suffixes without regard to case.
+    let in_meta_inf = |n: &&&str| n.starts_with("META-INF/");
     let jar_signed_shape = names
         .iter()
-        .any(|n| n.starts_with("META-INF/") && n.ends_with(".SF"))
-        && names
-            .iter()
-            .any(|n| n.starts_with("META-INF/") && (n.ends_with(".RSA") || n.ends_with(".DSA")));
+        .filter(in_meta_inf)
+        .any(|n| ends_with_ci(n, ".SF"))
+        && names.iter().filter(in_meta_inf).any(|n| {
+            [".RSA", ".DSA", ".EC"]
+                .iter()
+                .any(|ext| ends_with_ci(n, ext))
+        });
     if jar_signed_shape {
         values.insert_key(
             value_key!("archive.signing.jar_signed_shape"),
@@ -711,7 +747,7 @@ fn emit_walk(
     if prefix > 0 {
         metrics.insert(metric!("archive.leading_bytes"), prefix as f64);
     }
-    let trailing = scan_trailing_bytes(bytes);
+    let trailing = eocd.map_or(0, |eocd| trailing_bytes(bytes, eocd));
     if trailing > 0 {
         metrics.insert(metric!("archive.trailing_bytes"), trailing as f64);
     }
@@ -761,6 +797,30 @@ pub(super) fn read_member<R: Read + Seek>(
     }
 }
 
+/// Read the manifest-like member `name` for a package layer. `None` when it
+/// is absent (silently), inflates past `cap` (a `stage` entry in `limits`),
+/// or will not read (a `ZipParse` error).
+pub(super) fn read_manifest_member<R: Read + Seek>(
+    zip: &mut ZipArchive<R>,
+    name: &str,
+    cap: u64,
+    limits: &mut Limits,
+    stage: &'static str,
+    errors: &mut Errors,
+) -> Option<Vec<u8>> {
+    match read_member(zip, name, cap) {
+        Ok(buf) => buf,
+        Err(MemberError::TooLarge { max }) => {
+            limits.push(stage, format!("{name} over the {max}-byte cap; not parsed"));
+            None
+        }
+        Err(e) => {
+            errors.record_malformed(Stage::ZipParse, format!("{name}: {e}"));
+            None
+        }
+    }
+}
+
 /// The first `max` bytes of member `name`, and whether more followed, for a
 /// caller that can use a prefix (a header block). `Ok(None)` when no member
 /// has that name.
@@ -774,8 +834,7 @@ pub(super) fn read_member_prefix<R: Read + Seek>(
         Err(ZipError::FileNotFound) => return Ok(None),
         Err(e) => return Err(MemberError::Zip(e)),
     };
-    let declared = entry.size();
-    read_prefix(entry, max, declared)
+    inflate_capped(entry, max)
         .map(Some)
         .map_err(|e| MemberError::Zip(ZipError::Io(e)))
 }
@@ -871,6 +930,8 @@ fn scan_central_directory(bytes: &[u8], cd_start: usize) -> Vec<RawCdhEntry> {
 /// The central directory located from the EOCD record alone.
 struct RawDirectory {
     entries: Vec<RawCdhEntry>,
+    /// Absolute offset of the first record.
+    start: usize,
     /// Bytes prepended to the archive (a self-extractor stub): every offset
     /// the directory records is relative to the archive, not the file.
     archive_offset: usize,
@@ -908,6 +969,7 @@ fn read_raw_directory(bytes: &[u8]) -> Option<RawDirectory> {
     let entries = scan_central_directory(bytes, cd_start);
     (!entries.is_empty()).then_some(RawDirectory {
         entries,
+        start: cd_start,
         archive_offset,
         eocd,
     })
@@ -981,19 +1043,16 @@ fn scan_prefix_bytes(bytes: &[u8]) -> usize {
     memchr::memmem::find(bytes, b"PK\x03\x04").unwrap_or(0)
 }
 
-/// Bytes appended after the End-of-Central-Directory record's stated
-/// end (EOCD offset + 22 + comment length). A non-zero value means an
-/// attacker (or an aggressive concatenator) stuck data on the end of
-/// the archive that the canonical EOCD doesn't account for.
-fn scan_trailing_bytes(bytes: &[u8]) -> usize {
-    let Some(eocd_offset) = find_eocd(bytes) else {
-        return 0;
-    };
+/// Bytes appended after the End-of-Central-Directory record at `eocd`
+/// (its offset + 22 + comment length). A non-zero value means an attacker
+/// (or an aggressive concatenator) stuck data on the end of the archive
+/// that the canonical EOCD doesn't account for.
+fn trailing_bytes(bytes: &[u8], eocd: usize) -> usize {
     // The comment length is the record's last fixed field, at +20.
-    let Some(comment_len) = bytes_at::u16_le(bytes, eocd_offset + 20) else {
+    let Some(comment_len) = bytes_at::u16_le(bytes, eocd + 20) else {
         return 0;
     };
-    let end = eocd_offset + 22 + usize::from(comment_len);
+    let end = eocd + 22 + usize::from(comment_len);
     bytes.len().saturating_sub(end)
 }
 
@@ -1013,33 +1072,60 @@ fn find_eocd(bytes: &[u8]) -> Option<usize> {
     memchr::memmem::rfind(window, b"PK\x05\x06").map(|i| scan_start + i)
 }
 
-fn compression_method_name(method: CompressionMethod) -> &'static str {
-    match method {
-        CompressionMethod::Stored => "stored",
-        CompressionMethod::Deflated => "deflate",
-        CompressionMethod::Bzip2 => "bzip2",
-        CompressionMethod::Zstd => "zstd",
-        CompressionMethod::Lzma => "lzma",
-        CompressionMethod::Xz => "xz",
-        CompressionMethod::Aes => "aes",
-        _ => "other",
-    }
+/// The method name for a member the `zip` crate parsed. The crate keeps
+/// the method's id private, so it is recovered from the crate's named
+/// methods.
+fn method_name(method: CompressionMethod) -> &'static str {
+    use CompressionMethod as M;
+    const IDS: [(CompressionMethod, u16); 20] = [
+        (M::STORE, 0),
+        (M::SHRINK, 1),
+        (M::REDUCE_1, 2),
+        (M::REDUCE_2, 3),
+        (M::REDUCE_3, 4),
+        (M::REDUCE_4, 5),
+        (M::IMPLODE, 6),
+        (M::DEFLATE, 8),
+        (M::DEFLATE64, 9),
+        (M::PKWARE_IMPLODE, 10),
+        (M::BZIP2, 12),
+        (M::LZMA, 14),
+        (M::ZSTD_DEPRECATED, 20),
+        (M::ZSTD, 93),
+        (M::MP3, 94),
+        (M::XZ, 95),
+        (M::JPEG, 96),
+        (M::WAVPACK, 97),
+        (M::PPMD, 98),
+        (M::AES, 99),
+    ];
+    IDS.iter()
+        .find(|(m, _)| *m == method)
+        .map_or("other", |&(_, id)| method_name_from_id(id))
 }
 
-/// [`compression_method_name`] for a raw central-directory method id.
+/// The method name for a central-directory method id (APPNOTE 4.4.5).
 fn method_name_from_id(id: u16) -> &'static str {
     match id {
         0 => "stored",
+        1 => "shrink",
+        2..=5 => "reduce",
+        6 => "implode",
         8 => "deflate",
+        9 => "deflate64",
+        10 => "pkware-implode",
         12 => "bzip2",
         14 => "lzma",
-        93 => "zstd",
+        20 | 93 => "zstd",
+        94 => "mp3",
         95 => "xz",
+        96 => "jpeg",
+        97 => "wavpack",
+        98 => "ppmd",
         99 => "aes",
         _ => "other",
     }
 }
 
 #[cfg(test)]
-#[allow(unused_imports)]
 mod tests;

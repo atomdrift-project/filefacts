@@ -25,6 +25,7 @@
 //!   that is malformed (bad magic, sizes running past the end of the file)
 //!   is recorded in `errors` instead.
 
+use super::people::{self, Person};
 use crate::metric;
 use serde_json::{Value as JsonValue, json};
 
@@ -293,7 +294,7 @@ fn apply_main_tag(entry: &IndexEntry, data: &[u8], values: &mut Values, metrics:
             entry,
             data,
         ),
-        main_tag::SUMMARY => set_string(values, value_key!("rpm.summary"), entry, data),
+        main_tag::SUMMARY => set_string(values, value_key!("rpm.description"), entry, data),
         main_tag::BUILDTIME => set_u32(
             values,
             metrics,
@@ -306,7 +307,11 @@ fn apply_main_tag(entry: &IndexEntry, data: &[u8], values: &mut Values, metrics:
         main_tag::DISTRIBUTION => set_string(values, value_key!("rpm.distribution"), entry, data),
         main_tag::VENDOR => set_string(values, value_key!("rpm.vendor"), entry, data),
         main_tag::LICENSE => set_string(values, value_key!("rpm.license"), entry, data),
-        main_tag::PACKAGER => set_string(values, value_key!("rpm.packager"), entry, data),
+        // `"Name <email>"`, as RPM's own `%packager` macro writes it.
+        main_tag::PACKAGER => {
+            let packager = decode_string(entry, data).map(|p| Person::parse(&p));
+            people::put(values, value_key!("rpm.packagers"), packager);
+        }
         main_tag::GROUP => set_string(values, value_key!("rpm.group"), entry, data),
         main_tag::URL => set_string(values, value_key!("rpm.homepage"), entry, data),
         main_tag::OS => set_string(values, value_key!("rpm.os"), entry, data),
@@ -391,15 +396,16 @@ impl HeaderError {
     /// Record a malformed header in `errors`, or a size-capped one in
     /// `rpm.limits`, attributed to `stage` (`signature-header` /
     /// `main-header`).
-    fn report(self, stage: &str, values: &mut Values, errors: &mut Errors) {
+    fn report(self, stage: &'static str, values: &mut Values, errors: &mut Errors) {
         match self {
             Self::Malformed(why) => {
                 errors.record_malformed(Stage::RpmParse, format!("{stage}: {why}"))
             }
-            Self::TooLarge(reason) => values.insert_key(
-                value_key!("rpm.limits"),
-                json!([{ "stage": stage, "reason": reason }]),
-            ),
+            Self::TooLarge(reason) => {
+                let mut limits = super::bounded::Limits::default();
+                limits.push(stage, reason);
+                limits.emit(values, value_key!("rpm.limits"));
+            }
         }
     }
 }

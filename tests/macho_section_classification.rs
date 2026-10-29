@@ -4,14 +4,20 @@
     clippy::cast_possible_truncation,
     reason = "helpers index and offset into a fixed, trusted fixture at known positions"
 )]
+mod common;
+
+// The section views under test come from the static parse alone: the
+// hermetic open turns rizin off, so an installed one cannot add to them.
+use common::open;
 use filefacts::SectionFlag;
 use sha2::{Digest, Sha256};
-const FAT: &[u8] = include_bytes!("../testdata/macho/lcg_xor_executable_constants.macho");
-/// The section views under test come from the static parse alone; rizin is
-/// off so an installed one cannot add to them.
-fn open(b: &[u8]) -> filefacts::ParsedFile<'_> {
-    filefacts::OpenOptions::new().rizin(false).open(b)
-}
+/// The specimen, stored zstd-compressed (see `testdata/README.md`).
+static FAT: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+    zstd::decode_all(
+        &include_bytes!("../testdata/macho/lcg_xor_executable_constants.macho.zst")[..],
+    )
+    .expect("fixture decompresses")
+});
 fn thin() -> &'static [u8] {
     &FAT[0x4000..0x4000 + 48560]
 }
@@ -50,10 +56,10 @@ fn entropy(b: &[u8]) -> f64 {
 #[test]
 fn code_entropy_excludes_executable_constants_and_uses_real_file_spans() {
     assert_eq!(
-        format!("{:x}", Sha256::digest(FAT)),
+        format!("{:x}", Sha256::digest(&*FAT)),
         "a4c3c55d1ca3e406fa8db67d6b8ec395ebb2d8ba76f835bae987733d71ee8fb1"
     );
-    for b in [FAT, thin(), &FAT[65536..65536 + 85776]] {
+    for b in [FAT.as_slice(), thin(), &FAT[65536..65536 + 85776]] {
         let p = open(b);
         let secs = p.sections();
         let constants = secs.iter().find(|s| s.name == "__TEXT,__const").unwrap();
@@ -105,7 +111,7 @@ fn code_entropy_excludes_executable_constants_and_uses_real_file_spans() {
 }
 #[test]
 fn fat_sections_are_rebased_once_without_changing_entropy() {
-    let fat = open(FAT);
+    let fat = open(&FAT);
     let t = open(thin());
     assert_eq!(fat.sections().len(), t.sections().len());
     for (f, s) in fat.sections().iter().zip(t.sections().iter()) {

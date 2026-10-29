@@ -19,7 +19,8 @@
 
 use serde_json::Value as JsonValue;
 
-use super::bounded::{MAX_TARGZ_SEARCH, TarGzSearch, find_targz_member, push_limit};
+use super::bounded::{Limits, MAX_TARGZ_SEARCH, TarGzSearch, find_targz_member};
+use super::people::{self, Person};
 use crate::error::Error;
 use crate::fileid::FileType;
 use crate::metric;
@@ -57,12 +58,12 @@ fn package_json(bytes: &[u8], values: &mut Values, errors: &mut Errors) -> Optio
         Ok(TarGzSearch::Found { prefix, .. }) => prefix,
         Ok(TarGzSearch::Absent) => return None,
         Ok(TarGzSearch::InflateCapped) => {
-            push_limit(
-                values,
-                value_key!("npm.limits"),
+            let mut limits = Limits::default();
+            limits.push(
                 "manifest-search",
                 format!("no {MANIFEST} in the first {MAX_TARGZ_SEARCH} inflated bytes"),
             );
+            limits.emit(values, value_key!("npm.limits"));
             return None;
         }
         Err(e) => {
@@ -71,12 +72,12 @@ fn package_json(bytes: &[u8], values: &mut Values, errors: &mut Errors) -> Optio
         }
     };
     if prefix.truncated {
-        push_limit(
-            values,
-            value_key!("npm.limits"),
+        let mut limits = Limits::default();
+        limits.push(
             "manifest",
             format!("{MANIFEST} over the {MAX_MANIFEST}-byte cap; not parsed"),
         );
+        limits.emit(values, value_key!("npm.limits"));
         return None;
     }
     serde_json::from_slice(&prefix.bytes)
@@ -115,15 +116,22 @@ pub(super) fn emit(manifest: &JsonValue, values: &mut Values, metrics: &mut Metr
     if let Some(url) = repository_url(obj.get("repository")) {
         values.insert_key(value_key!("npm.repository.url"), JsonValue::String(url));
     }
-    if let Some(author) = person(obj.get("author")) {
-        for (field, value) in author.named_fields() {
-            values.insert_key_at(value_key!("npm.author"), field, JsonValue::String(value));
-        }
-    }
-    let maintainers = people(obj.get("maintainers"));
-    if !maintainers.is_empty() {
-        values.insert_key(value_key!("npm.maintainers"), JsonValue::Array(maintainers));
-    }
+    // npm names one `author` and any number of `maintainers`, each a person
+    // object or a `"Name <email> (url)"` string.
+    people::put(
+        values,
+        value_key!("npm.authors"),
+        obj.get("author").map(Person::from_json),
+    );
+    people::put(
+        values,
+        value_key!("npm.maintainers"),
+        obj.get("maintainers")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+            .map(Person::from_json),
+    );
     // Install-time lifecycle hooks: the command string is the reference
     // source — a `postinstall` that fetches a remote stage is the classic
     // npm supply-chain vector.
@@ -344,85 +352,6 @@ fn repository_url(value: Option<&JsonValue>) -> Option<String> {
         JsonValue::Object(o) => o.get("url").and_then(JsonValue::as_str).map(str::to_string),
         _ => None,
     }
-}
-
-/// A parsed npm "person" — name, email, url — from either the object
-/// form or the `"Name <email> (url)"` string form.
-struct Person {
-    name: Option<String>,
-    email: Option<String>,
-    url: Option<String>,
-}
-
-impl Person {
-    fn named_fields(&self) -> impl Iterator<Item = (&'static str, String)> {
-        [
-            ("name", self.name.clone()),
-            ("email", self.email.clone()),
-            ("url", self.url.clone()),
-        ]
-        .into_iter()
-        .filter_map(|(k, v)| v.map(|v| (k, v)))
-    }
-
-    fn into_json(self) -> Option<JsonValue> {
-        let mut obj = serde_json::Map::new();
-        for (k, v) in self.named_fields() {
-            obj.insert(k.to_string(), JsonValue::String(v));
-        }
-        (!obj.is_empty()).then_some(JsonValue::Object(obj))
-    }
-}
-
-fn person(value: Option<&JsonValue>) -> Option<Person> {
-    match value? {
-        JsonValue::String(s) => Some(parse_person_string(s)),
-        JsonValue::Object(o) => {
-            let p = Person {
-                name: o
-                    .get("name")
-                    .and_then(JsonValue::as_str)
-                    .map(str::to_string),
-                email: o
-                    .get("email")
-                    .and_then(JsonValue::as_str)
-                    .map(str::to_string),
-                url: o.get("url").and_then(JsonValue::as_str).map(str::to_string),
-            };
-            (p.name.is_some() || p.email.is_some()).then_some(p)
-        }
-        _ => None,
-    }
-}
-
-fn people(value: Option<&JsonValue>) -> Vec<JsonValue> {
-    value
-        .and_then(JsonValue::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|v| person(Some(v)))
-        .filter_map(Person::into_json)
-        .collect()
-}
-
-/// Split `"Name <email> (url)"` into its parts.
-fn parse_person_string(s: &str) -> Person {
-    let email = between(s, '<', '>');
-    let url = between(s, '(', ')');
-    let name_end = s.find('<').or_else(|| s.find('(')).unwrap_or(s.len());
-    let name = s[..name_end].trim();
-    Person {
-        name: (!name.is_empty()).then(|| name.to_string()),
-        email,
-        url,
-    }
-}
-
-fn between(s: &str, open: char, close: char) -> Option<String> {
-    let start = s.find(open)?;
-    let end = s[start + 1..].find(close)? + start + 1;
-    let inner = s[start + 1..end].trim();
-    (!inner.is_empty()).then(|| inner.to_string())
 }
 
 #[cfg(test)]

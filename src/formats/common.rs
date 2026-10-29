@@ -4,7 +4,7 @@ use crate::metric;
 use serde_json::Value as JsonValue;
 
 use crate::output::{Section, Strings, Text, ValueKey, Values};
-use crate::scan::{ascii, entropy};
+use crate::scan::entropy;
 
 /// Whether stng's XOR seed search runs for a member.
 ///
@@ -37,15 +37,15 @@ impl XorScan {
     }
 }
 
-/// stng extraction options. filefacts is the
-/// single string-extraction authority for cleave, so these mirror the rich opts
-/// cleave used to pass to stng directly:
+/// stng extraction options. filefacts is the one string-extraction authority
+/// for its callers, so it asks stng for the full treatment:
 /// - `garbage_filter` drops high-noise runs,
 /// - `xor` recovers XOR-deobfuscated strings (key auto-detected),
 /// - `caller_provides_symbols` skips stng's symbol pass — filefacts walks the
 ///   symbol tables itself (`extract_symbols`), the single symbol codepath.
 fn string_opts_for(xor: XorScan, bytes: &[u8]) -> stng::ExtractOptions {
-    let opts = stng::ExtractOptions::new(ascii::DEFAULT_MIN_LEN)
+    // Four bytes is the minimum run `strings(1)` reports.
+    let opts = stng::ExtractOptions::new(4)
         .with_garbage_filter(true)
         .with_caller_provides_symbols(true);
     if xor.runs_on(bytes) {

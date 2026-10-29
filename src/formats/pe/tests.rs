@@ -1,62 +1,6 @@
 use super::*;
-
-#[test]
-fn partial_section_geometry_detects_overflow_only_with_complete_table() {
-    let mut bytes = vec![0u8; 512];
-    bytes[0..2].copy_from_slice(b"MZ");
-    bytes[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
-    bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
-    bytes[0x84..0x86].copy_from_slice(&0x14cu16.to_le_bytes());
-    bytes[0x86..0x88].copy_from_slice(&2u16.to_le_bytes());
-    let section = 0x98;
-    bytes[section..section + 5].copy_from_slice(b".text");
-    bytes[section + 16..section + 20].copy_from_slice(&64u32.to_le_bytes());
-    bytes[section + 20..section + 24].copy_from_slice(&256u32.to_le_bytes());
-    let second = section + 40;
-    bytes[second..second + 5].copy_from_slice(b".rsrc");
-    bytes[second + 16..second + 20].copy_from_slice(&500u32.to_le_bytes());
-    bytes[second + 20..second + 24].copy_from_slice(&400u32.to_le_bytes());
-    let header = match goblin_safe::parse_pe_header(&bytes) {
-        goblin_safe::GoblinOutcome::Ok(h) => h,
-        _ => panic!("valid minimal header"),
-    };
-    let mut values = Values::new();
-    let mut metrics = Metrics::new();
-    partial_section_overflows(&bytes, &header, &mut values, &mut metrics);
-    assert_eq!(metrics.get("pe.section_overflow_count"), Some(1.0));
-    assert_eq!(
-        values.get_key(value_key!("pe.overflowing_sections")),
-        Some(&serde_json::json!([".rsrc"]))
-    );
-    let mut absent = Metrics::new();
-    partial_section_overflows(
-        &bytes[..second + 20],
-        &header,
-        &mut Values::new(),
-        &mut absent,
-    );
-    assert!(absent.get("pe.section_overflow_count").is_none());
-}
-
-#[test]
-fn export_early_calls_stop_at_control_flow_and_deduplicate() {
-    // Two calls to 0x1010, then a jump; the call after the jump must not count.
-    let code = [
-        0xe8, 0x0b, 0, 0, 0, 0xe8, 0x06, 0, 0, 0, 0xeb, 0x05, 0xe8, 0x1f, 0, 0, 0, 0xc3,
-    ];
-    assert_eq!(early_direct_calls(&code, 0x1000, 64), vec![0x1010]);
-    // An indirect call is not a statically known shared target.
-    assert!(early_direct_calls(&[0xff, 0xd0, 0xc3], 0x1000, 64).is_empty());
-}
-use crate::output::Strings;
-
-#[test]
-fn rt_name_known() {
-    assert_eq!(rt_name(16), "RT_VERSION");
-    assert_eq!(rt_name(24), "RT_MANIFEST");
-    assert_eq!(rt_name(3), "RT_ICON");
-    assert_eq!(rt_name(99), "RT_UNKNOWN");
-}
+use crate::output::{Metrics, Strings, Values};
+use serde_json::Value as JsonValue;
 
 #[test]
 fn declares_export_directory_reads_the_export_slot() {
@@ -85,72 +29,6 @@ fn declares_export_directory_reads_the_export_slot() {
     ))))));
 }
 
-#[test]
-fn parse_clr_streams_reads_standard_heaps() {
-    // Minimal metadata root: BSJB, version "v4.0" (len 4), flags=0,
-    // streams=2, then #GUID (offset 0x20, size 16) and #Blob headers.
-    let mut md = Vec::new();
-    md.extend_from_slice(b"BSJB");
-    md.extend_from_slice(&1u16.to_le_bytes()); // major
-    md.extend_from_slice(&1u16.to_le_bytes()); // minor
-    md.extend_from_slice(&0u32.to_le_bytes()); // reserved
-    md.extend_from_slice(&4u32.to_le_bytes()); // version_len
-    md.extend_from_slice(b"v4.0"); // version (already 4-aligned)
-    md.extend_from_slice(&0u16.to_le_bytes()); // flags
-    md.extend_from_slice(&2u16.to_le_bytes()); // streams
-    md.extend_from_slice(&0x20u32.to_le_bytes()); // #GUID offset
-    md.extend_from_slice(&16u32.to_le_bytes()); // #GUID size
-    md.extend_from_slice(b"#GUID\0\0\0"); // name, padded to 8
-    md.extend_from_slice(&0x40u32.to_le_bytes()); // #Blob offset
-    md.extend_from_slice(&8u32.to_le_bytes()); // #Blob size
-    md.extend_from_slice(b"#Blob\0\0\0"); // name, padded to 8
-    let (names, guid) = parse_clr_streams(&md).unwrap();
-    assert_eq!(names, vec!["#GUID".to_string(), "#Blob".to_string()]);
-    assert_eq!(guid, Some((0x20, 16)));
-    assert!(parse_clr_streams(&b"NOPE"[..]).is_none());
-    // Truncation fails softly wherever it cuts; only the last name's
-    // two padding bytes are optional.
-    for cut in 0..md.len() - 2 {
-        assert!(parse_clr_streams(&md[..cut]).is_none(), "cut at {cut}");
-    }
-}
-
-#[test]
-fn delay_import_vas_resolve_against_the_full_image_base() {
-    // RvaBased descriptors pass through untouched.
-    assert_eq!(delay_import_rva(0x2000, true, 0x1_4000_0000), 0x2000);
-    // Legacy VA-based descriptor in a PE32 image.
-    assert_eq!(delay_import_rva(0x0040_2000, false, 0x0040_0000), 0x2000);
-    // A PE32+ base is above every 32-bit VA. Truncating it to its low
-    // half (0x4000_0000) would turn this forged VA into RVA 0x2000.
-    assert_eq!(delay_import_rva(0x4000_2000, false, 0x1_4000_0000), 0);
-}
-
-#[test]
-fn machine_string_known_values() {
-    assert_eq!(machine_string(0x8664), "x86_64");
-    assert_eq!(machine_string(0x014c), "i386");
-    assert_eq!(machine_string(0xaa64), "arm64");
-    assert_eq!(machine_string(0xffff), "unknown");
-}
-
-#[test]
-fn dll_characteristics_bit_decomposition() {
-    // dynamic_base | nx_compat | high_entropy_va
-    let flags = 0x0040 | 0x0100 | 0x0020;
-    let chars = dll_characteristics(flags);
-    assert!(chars.contains(&"dynamic_base"));
-    assert!(chars.contains(&"nx_compat"));
-    assert!(chars.contains(&"high_entropy_va"));
-}
-
-#[test]
-fn subsystem_string_known_values() {
-    assert_eq!(subsystem_string(2), "windows_gui");
-    assert_eq!(subsystem_string(3), "windows_cui");
-    assert_eq!(subsystem_string(1), "native");
-}
-
 fn run(bytes: &[u8]) -> (Values, Strings, Metrics) {
     let mut out = crate::formats::Sinks::default();
     let _ = extract(bytes, out.ctx());
@@ -163,7 +41,7 @@ fn run(bytes: &[u8]) -> (Values, Strings, Metrics) {
     (v, s, m)
 }
 
-fn read_fixture(name: &str) -> Vec<u8> {
+pub(super) fn read_fixture(name: &str) -> Vec<u8> {
     let path = format!("tests/fixtures/{name}");
     std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"))
 }
@@ -232,312 +110,6 @@ fn malformed_declared_directory_is_preserved_as_a_fact() {
 }
 
 #[test]
-fn manual_resolver_code_signals_require_the_complete_mechanics() {
-    // A bounds-checking export walker: MZ → e_lfanew → PE signature →
-    // PE32 export-directory offset and size. Keep this independent from a fixture
-    // so a future parser change cannot accidentally widen the detector.
-    let checked_walk = [
-        0x66, 0x81, 0x3f, 0x4d, 0x5a, 0x8b, 0x47, 0x3c, 0x81, 0x3c, 0x07, 0x50, 0x45, 0x00, 0x00,
-        0x8b, 0x4c, 0x07, 0x78, 0x8b, 0x54, 0x07, 0x7c,
-    ];
-    assert_eq!(count_checked_export_walks_x86(&checked_walk), 1);
-    assert_eq!(
-        find_checked_export_walks_x86(&checked_walk),
-        vec![CheckedExportWalk {
-            mz_check: 0,
-            e_lfanew: 5,
-            pe_check: 8,
-            export_rva: 15,
-            export_size: 19,
-        }]
-    );
-    assert_eq!(count_checked_export_walks_x86(&checked_walk[..8]), 0);
-
-    // A byte-wise custom hash: multiply, byte load, XOR with the
-    // accumulator and a constant, then rotate.
-    let hash_loop = [
-        0xb8, 0xdb, 0xf7, 0x26, 0xab, 0x80, 0xcd, 0x20, 0x80, 0xf9, 0x1a, 0x0f, 0x43, 0xcb, 0x69,
-        0xd8, 0x7f, 0x85, 0x3b, 0x80, 0x0f, 0xb6, 0xc1, 0x31, 0xd8, 0x35, 0x38, 0x9f, 0x93, 0x87,
-        0xc1, 0xc0, 0x09,
-    ];
-    assert_eq!(count_custom_byte_hash_loops_x86(&hash_loop), 1);
-    assert_eq!(
-        find_custom_byte_hash_profiles_x86(&hash_loop),
-        vec![ApiHashProfile {
-            loop_offset: 14,
-            kind: "multiply_xor_rotate",
-            seed: Some(0xab26f7db),
-            multiplier: 0x803b857f,
-            xor_constant: 0x87939f38,
-            rotate_bits: 9,
-            ascii_lowercase: true,
-        }]
-    );
-    assert_eq!(count_custom_byte_hash_loops_x86(&hash_loop[..29]), 0);
-}
-
-#[test]
-fn flattened_xor_rotate_multiply_hash_profile_recovers_seed_flow() {
-    let hash_loop = [
-        // seed -> stack slot 0x10
-        0xc7, 0x44, 0x24, 0x10, 0xb5, 0xcf, 0x88, 0x11,
-        // dispatcher copies slot 0x10 -> accumulator slot 0x1c
-        0x8b, 0x44, 0x24, 0x10, 0x89, 0x44, 0x24, 0x1c,
-        // lowercase normalization and accumulator update
-        0x8b, 0x44, 0x24, 0x18, 0x0f, 0xb6, 0x0c, 0x07, 0x89, 0xca, 0x80, 0xc2, 0xbf, 0x88, 0xce,
-        0x80, 0xce, 0x20, 0x80, 0xfa, 0x1a, 0x0f, 0xb6, 0xd6, 0x0f, 0x43, 0xd1, 0x8b, 0x4c, 0x24,
-        0x1c, 0xbd, 0xa7, 0x79, 0x02, 0x34, 0x31, 0xe9, 0xc1, 0xc1, 0x15, 0x69, 0xc9, 0x59, 0x94,
-        0x27, 0x85, 0x0f, 0xb6, 0xd2, 0x31, 0xca,
-    ];
-    let profiles = find_custom_byte_hash_profiles_x86(&hash_loop);
-    assert_eq!(profiles.len(), 1);
-    assert_eq!(profiles[0].kind, "xor_rotate_multiply_xor");
-    assert_eq!(profiles[0].seed, Some(0x1188cfb5));
-    assert_eq!(profiles[0].xor_constant, 0x340279a7);
-    assert_eq!(profiles[0].multiplier, 0x85279459);
-    assert_eq!(profiles[0].rotate_bits, 21);
-    assert!(profiles[0].ascii_lowercase);
-}
-
-#[test]
-fn recovered_profile_exactly_matches_native_api_name() {
-    let profile = LocatedHashProfile {
-        va: 0x40ed6d,
-        kind: "xor_rotate_multiply_xor".to_string(),
-        seed: 0x1188cfb5,
-        multiplier: 0x85279459,
-        xor_constant: 0x340279a7,
-        rotate_bits: 21,
-        ascii_lowercase: true,
-    };
-    assert_eq!(
-        hash_windows_name(&profile, "NtQueryInformationProcess"),
-        0x3b1471e8
-    );
-    assert_ne!(
-        hash_windows_name(&profile, "NtQuerySystemInformation"),
-        0x3b1471e8
-    );
-}
-
-#[test]
-fn recovers_immediate_and_constant_folded_hash_arguments() {
-    let mut bytes = read_fixture("test.exe");
-    let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
-    let optional_offset = pe_offset + 24;
-    assert_eq!(
-        u16::from_le_bytes(
-            bytes[optional_offset..optional_offset + 2]
-                .try_into()
-                .unwrap()
-        ),
-        0x20b
-    );
-    bytes[optional_offset + 24..optional_offset + 32]
-        .copy_from_slice(&0x0040_0000_u64.to_le_bytes());
-    let pe = PE::parse(&bytes).expect("fixture PE");
-    let section = pe
-        .sections
-        .iter()
-        .find(|section| section.size_of_raw_data >= 0x100)
-        .expect("fixture code section");
-    let section_file = section.pointer_to_raw_data as usize;
-    let section_va = pe.image_base + u64::from(section.virtual_address);
-    drop(pe);
-
-    let direct_offset = section_file + 0x20;
-    bytes[direct_offset..direct_offset + 11]
-        .copy_from_slice(&[0x68, 0xe8, 0x71, 0x14, 0x3b, 0x50, 0xe8, 0, 0, 0, 0]);
-
-    let memory_offset = section_file + 0x80;
-    bytes[memory_offset..memory_offset + 4].copy_from_slice(&0x0000bd87_u32.to_le_bytes());
-    let memory_va = u32::try_from(section_va + 0x80).expect("PE32 fixture VA");
-    let folded_offset = section_file + 0x40;
-    let mut folded = vec![0xa1];
-    folded.extend_from_slice(&memory_va.to_le_bytes());
-    folded.push(0xb9);
-    folded.extend_from_slice(&0x9bf7790b_u32.to_le_bytes());
-    folded.extend_from_slice(&[0x31, 0xc8, 0x05]);
-    folded.extend_from_slice(&0x9f1cad5c_u32.to_le_bytes());
-    folded.extend_from_slice(&[0x50, 0xff, 0x74, 0x24, 0x0c, 0xe8, 0, 0, 0, 0]);
-    bytes[folded_offset..folded_offset + folded.len()].copy_from_slice(&folded);
-    let pe = PE::parse(&bytes).expect("mutated fixture PE");
-    assert_eq!(
-        recover_x86_hash_argument(&pe, &bytes, section_va + 0x26),
-        Some((0x3b1471e8, "immediate"))
-    );
-    assert_eq!(
-        recover_x86_hash_argument(&pe, &bytes, section_va + 0x40 + 22),
-        Some((0x3b1471e8, "constant_folded_memory_xor_add"))
-    );
-}
-
-#[test]
-fn dll_characteristics_empty_when_zero() {
-    let chars = dll_characteristics(0);
-    assert!(chars.is_empty());
-}
-
-#[test]
-fn dll_characteristics_picks_up_force_integrity_and_aslr() {
-    // force_integrity (0x80) | dynamic_base (0x40) | guard_cf (0x4000)
-    let chars = dll_characteristics(0x80 | 0x40 | 0x4000);
-    assert!(chars.contains(&"force_integrity"));
-    assert!(chars.contains(&"dynamic_base"));
-    assert!(chars.contains(&"guard_cf"));
-}
-
-#[test]
-fn subsystem_string_unknown_fallback() {
-    assert_eq!(subsystem_string(99), "unknown");
-}
-
-#[test]
-fn rt_name_covers_canonical_resource_types() {
-    assert_eq!(rt_name(1), "RT_CURSOR");
-    assert_eq!(rt_name(2), "RT_BITMAP");
-    assert_eq!(rt_name(14), "RT_GROUP_ICON");
-}
-
-/// Every section header pointed at one executable run of `fs:[0x30]` loads:
-/// the bytes are scanned once (not once per header), the count is exact, and
-/// the per-site records stop at the cap with the cap reported.
-#[test]
-fn native_resolver_scan_clips_overlapping_sections_and_caps_sites() {
-    const NEEDLE: &[u8] = b"\x64\xa1\x30\x00\x00\x00";
-    const MATCHES: usize = MAX_NATIVE_SITES + 904;
-    let mut bytes = read_fixture("test.exe");
-    let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
-    let coff = pe_offset + 4;
-    let count = u16::from_le_bytes(bytes[coff + 2..coff + 4].try_into().unwrap()) as usize;
-    let size_of_optional = u16::from_le_bytes(bytes[coff + 16..coff + 18].try_into().unwrap());
-    let table = coff + 20 + size_of_optional as usize;
-    let region = bytes.len().next_multiple_of(0x200);
-    let len = NEEDLE.len() * MATCHES;
-    bytes.resize(region, 0);
-    bytes.extend(NEEDLE.iter().copied().cycle().take(len));
-    for i in 0..count {
-        let header = table + i * 40;
-        bytes[header + 16..header + 20].copy_from_slice(&(len as u32).to_le_bytes());
-        bytes[header + 20..header + 24].copy_from_slice(&(region as u32).to_le_bytes());
-        bytes[header + 36..header + 40].copy_from_slice(&0x6000_0020_u32.to_le_bytes());
-    }
-    assert!(
-        count > 1,
-        "the fixture must have overlapping headers to clip"
-    );
-
-    let pe = PE::parse_with_opts(
-        &bytes,
-        &goblin::pe::options::ParseOptions::default()
-            .with_parse_mode(goblin::options::ParseMode::Permissive)
-            .with_parse_imports(false),
-    )
-    .expect("forged fixture parses");
-    let mut values = Values::new();
-    let mut metrics = Metrics::new();
-    native_resolver_signals(&pe, &bytes, &mut values, &mut metrics);
-    assert_eq!(
-        metrics.get("pe.peb_access_x86_count"),
-        Some(MATCHES as f64),
-        "each byte scanned once despite {count} overlapping headers"
-    );
-    let sites = values
-        .get("pe.peb_access_sites")
-        .and_then(serde_json::Value::as_array)
-        .expect("sites");
-    assert_eq!(sites.len(), MAX_NATIVE_SITES);
-    assert_eq!(metrics.get("pe.native_resolver_sites_capped"), Some(1.0));
-    assert_eq!(
-        sites[1]["file_offset"],
-        serde_json::json!(region + NEEDLE.len())
-    );
-}
-
-/// The single RVA resolver follows the loader: a misaligned
-/// `PointerToRawData` is rounded down to 512, the file-backed extent is the
-/// raw size rounded to the file alignment, and the zero-filled virtual tail
-/// past it has no file offset.
-#[test]
-fn rva_resolution_follows_the_loader() {
-    use goblin::pe::section_table::SectionTable;
-    let text = SectionTable {
-        virtual_address: 0x1000,
-        virtual_size: 0x2000,
-        pointer_to_raw_data: 0x401,
-        size_of_raw_data: 0x100,
-        ..SectionTable::default()
-    };
-    let data = SectionTable {
-        virtual_address: 0x4000,
-        virtual_size: 0,
-        pointer_to_raw_data: 0x800,
-        size_of_raw_data: 0x200,
-        ..SectionTable::default()
-    };
-    let sections = [text, data];
-    let resolve = |rva| section_rva_to_file_offset(&sections, Some(0x200), rva);
-    assert_eq!(resolve(0x1000), Some(0x400), "pointer rounded down to 512");
-    // (0x401 + 0x100) rounded up to 0x200 is 0x600: 0x200 file-backed bytes.
-    assert_eq!(resolve(0x11ff), Some(0x5ff));
-    assert_eq!(resolve(0x1200), None, "virtual-only tail has no file bytes");
-    assert_eq!(resolve(0x2fff), None);
-    // Zero virtual size: the raw extent alone bounds it.
-    assert_eq!(resolve(0x41ff), Some(0x9ff));
-    assert_eq!(resolve(0x4200), None);
-    assert_eq!(resolve(0x0fff), None, "before every section");
-    // An invalid alignment keeps the unrounded raw extent.
-    assert_eq!(
-        section_rva_to_file_offset(&sections, Some(0x300), 0x1100),
-        Some(0x500)
-    );
-    assert_eq!(
-        section_rva_to_file_offset(&sections, Some(0x300), 0x1101),
-        None
-    );
-    // Header values at the top of the range must not overflow.
-    let edge = SectionTable {
-        virtual_address: u32::MAX - 0x10,
-        virtual_size: u32::MAX,
-        pointer_to_raw_data: u32::MAX,
-        size_of_raw_data: u32::MAX,
-        ..SectionTable::default()
-    };
-    assert!(section_rva_to_file_offset(&[edge], Some(0x200), u32::MAX).is_some());
-}
-
-/// The resource facts are derived from ids drained out of goblin's walker,
-/// outside its panic guard: counts, icons, and the deduplicated type list.
-#[test]
-fn resource_types_derive_from_drained_ids() {
-    let mut values = Values::new();
-    let mut metrics = Metrics::new();
-    resource_types(
-        &[Some(16), Some(3), None, Some(14), Some(3), Some(999)],
-        &mut values,
-        &mut metrics,
-    );
-    assert_eq!(metrics.get("pe.resource_count"), Some(6.0));
-    assert_eq!(metrics.get("pe.icon_count"), Some(3.0));
-    assert_eq!(
-        values.get("pe.resource_types"),
-        Some(&serde_json::json!([
-            "RT_ICON",
-            "RT_GROUP_ICON",
-            "RT_VERSION",
-            "RT_UNKNOWN"
-        ]))
-    );
-
-    let mut values = Values::new();
-    let mut metrics = Metrics::new();
-    resource_types(&[], &mut values, &mut metrics);
-    assert_eq!(metrics.get("pe.resource_count"), Some(0.0));
-    assert!(metrics.get("pe.icon_count").is_none());
-    assert!(values.get("pe.resource_types").is_none());
-}
-
-#[test]
 fn empty_input_doesnt_crash() {
     let (_, _, _) = run(&[]);
 }
@@ -560,7 +132,7 @@ fn truncated_pe_header_doesnt_crash() {
 fn end_to_end_parses_real_pe_fixture() {
     let bytes = read_fixture("test.exe");
     let (v, _, m) = run(&bytes);
-    // Pike-style flat schema for COFF + optional header.
+    // COFF and optional-header fields land flat under `pe.*`.
     assert!(v.get("pe.coff").is_some() || v.get("pe.machine").is_some());
     // PIE flag derived from DLL_CHARACTERISTICS_DYNAMIC_BASE.
     assert!(m.get("binary.is_pie").is_some());
@@ -735,48 +307,6 @@ fn rich_entries_populated_on_msvc_pe() {
     assert!(v.get("pe.rich.key").is_some());
 }
 
-/// Build a CLR resources blob from `[u32 len][bytes]` chunks.
-fn resource_blob(chunks: &[&[u8]]) -> Vec<u8> {
-    let mut b = Vec::new();
-    for c in chunks {
-        b.extend_from_slice(&(c.len() as u32).to_le_bytes());
-        b.extend_from_slice(c);
-        b.resize((b.len() + 7) & !7, 0);
-    }
-    b
-}
-
-#[test]
-fn scan_resource_blob_counts_and_measures() {
-    let low = vec![b'A'; 256]; // entropy 0
-    let high: Vec<u8> = (0..=255u8).cycle().take(4096).collect(); // entropy ~8
-    let blob = resource_blob(&[&low, &high]);
-    let (count, max_entropy, max_size, entropy_span, size_span) = scan_resource_blob(&blob);
-    assert_eq!(count, 2);
-    assert_eq!(max_size, 4096);
-    assert!(max_entropy > 7.0, "max_entropy {max_entropy}");
-    assert_eq!(entropy_span.map(|s| s.offset), Some(268));
-    assert_eq!(size_span.map(|s| s.offset), Some(268));
-}
-
-#[test]
-fn scan_resource_blob_stops_on_bad_length() {
-    // One good chunk, then a length that overruns the blob — the walk
-    // counts the good chunk and stops rather than over-reading.
-    let mut blob = resource_blob(&[b"hello there friend"]);
-    blob.extend_from_slice(&u32::MAX.to_le_bytes());
-    blob.extend_from_slice(b"trailing");
-    let (count, _, max_size, _, _) = scan_resource_blob(&blob);
-    assert_eq!(count, 1);
-    assert_eq!(max_size, 18);
-}
-
-#[test]
-fn scan_resource_blob_empty_and_truncated() {
-    assert_eq!(scan_resource_blob(&[]), (0, 0.0, 0, None, None));
-    assert_eq!(scan_resource_blob(&[0x10, 0x00]), (0, 0.0, 0, None, None)); // < 4 bytes
-}
-
 /// The PE entry-section parity fields (mirroring ELF/Mach-O) emit on a
 /// real binary and stay clean on a benign one: the entry resolves to a
 /// toolchain code section, so no nonstandard-entry-section anomaly.
@@ -788,202 +318,64 @@ fn pe_entry_parity_metrics_clean_on_fixture() {
     assert!(m.get("pe.entry_in_nonstandard_section").is_none());
 }
 
-/// `IMAGE_GUARD_*` bits as winnt.h defines them: the delay-load and
-/// export-suppression flags sit in the 0x1000..0x8000 nibble, below the
-/// longjmp and return-flow bits they once shadowed.
-#[test]
-fn guard_flag_names_follow_winnt() {
-    assert_eq!(
-        guard_flag_names(0x0000_F000),
-        [
-            "protect_delayload_iat",
-            "delayload_iat_in_its_own_section",
-            "export_suppression_info_present",
-            "enable_export_suppression",
-        ]
-    );
-    assert_eq!(
-        guard_flag_names(0x000F_0000),
-        [
-            "longjump_table_present",
-            "rf_instrumented",
-            "rf_enable",
-            "rf_strict"
-        ]
-    );
-}
-
-/// `test.exe` (PE32+) with `descriptors` delay-load descriptors that all
-/// share one name table of `entries` ordinal imports.
-fn pe_with_shared_delay_imports(descriptors: usize, entries: usize) -> Vec<u8> {
-    let put = |bytes: &mut Vec<u8>, at: usize, value: u32| {
-        bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
-    };
-    let mut bytes = read_fixture("test.exe");
-    let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
-    let coff = pe_offset + 4;
-    let sections = u16::from_le_bytes(bytes[coff + 2..coff + 4].try_into().unwrap()) as usize;
-    let size_of_optional = u16::from_le_bytes(bytes[coff + 16..coff + 18].try_into().unwrap());
-    let optional = coff + 20;
-    let last = optional + size_of_optional as usize + (sections - 1) * 40;
-    let va = u32::from_le_bytes(bytes[last + 12..last + 16].try_into().unwrap());
-    let pointer = u32::from_le_bytes(bytes[last + 20..last + 24].try_into().unwrap()) as usize;
-
-    let dll_at = (descriptors + 1) * 32;
-    let int_at = dll_at + 8;
-    let size = int_at + (entries + 1) * 8;
-    bytes.resize(pointer + size, 0);
-    bytes[pointer..pointer + size].fill(0);
-    put(&mut bytes, last + 8, size as u32); // virtual_size
-    put(&mut bytes, last + 16, size as u32); // size_of_raw_data
-    bytes[pointer + dll_at..pointer + dll_at + 6].copy_from_slice(b"a.dll\0");
-    for i in 0..entries {
-        let at = pointer + int_at + i * 8;
-        bytes[at..at + 8].copy_from_slice(&0x8000_0000_0000_0001_u64.to_le_bytes());
-    }
-    for i in 0..descriptors {
-        let at = pointer + i * 32;
-        put(&mut bytes, at, 1); // RvaBased
-        put(&mut bytes, at + 4, va + dll_at as u32);
-        put(&mut bytes, at + 16, va + int_at as u32);
-    }
-    // Data directory 13 is the delay-import table; PE32+ puts the array at +112.
-    let slot = optional + 112 + 13 * 8;
-    put(&mut bytes, slot, va);
-    put(&mut bytes, slot + 4, ((descriptors + 1) * 32) as u32);
-    bytes
-}
-
-/// Descriptors sharing one name table multiply into symbols; the total is
-/// capped, not just each table.
-#[test]
-fn delay_imports_are_capped_across_descriptors() {
-    let small = pe_with_shared_delay_imports(3, 5);
-    let pe = goblin_safe::parse_pe(&small).outcome.ok().expect("parses");
-    let (mut values, mut metrics, mut symbols) =
-        (Values::new(), Metrics::new(), crate::Symbols::new());
-    delay_imports(&pe, &small, &mut values, &mut metrics, &mut symbols);
-    assert_eq!(symbols.len(), 15);
-    assert_eq!(metrics.get("pe.delay_import_count"), Some(15.0));
-
-    // 128 descriptors x 4096 entries would be half a million symbols.
-    let big = pe_with_shared_delay_imports(128, 4096);
-    let pe = goblin_safe::parse_pe(&big).outcome.ok().expect("parses");
-    let (mut values, mut metrics, mut symbols) =
-        (Values::new(), Metrics::new(), crate::Symbols::new());
-    delay_imports(&pe, &big, &mut values, &mut metrics, &mut symbols);
-    assert_eq!(symbols.len(), 16 * 1024);
-    assert_eq!(metrics.get("pe.delay_import_count"), Some(16.0 * 1024.0));
-}
-
-fn located_profile(va: u64) -> LocatedHashProfile {
-    LocatedHashProfile {
-        va,
-        kind: "multiply_xor_rotate".to_string(),
-        seed: 0,
-        multiplier: 0,
-        xor_constant: 0,
-        rotate_bits: 0,
-        ascii_lowercase: false,
-    }
-}
-
-/// A call into a resolver takes the resolver's own hash profile, or that of
-/// the first helper it calls; calls into anything else are not requests.
-#[test]
-fn resolver_calls_pair_each_call_with_its_resolvers_profile() {
-    // 0x1000 resolves with its own loop; 0x2000 delegates to helper 0x3000;
-    // 0x4000 is an ordinary caller.
-    let ranges = [
-        (0x1000, 0x100),
-        (0x2000, 0x100),
-        (0x3000, 0x100),
-        (0x4000, 0x100),
-    ];
-    let profiles = [located_profile(0x3020), located_profile(0x1020)];
-    let edges = [
-        (0x4000, 0x4005, 0x1000),
-        (0x2000, 0x2030, 0x3000),
-        (0x4000, 0x400a, 0x2000),
-        (0x4000, 0x400f, 0x3000),
-    ];
-    let calls: Vec<_> = resolver_calls(&ranges, &edges, vec![0x2010, 0x1010], &profiles)
-        .into_iter()
-        .map(|(caller, callsite, resolver, profile)| (caller, callsite, resolver, profile.va))
-        .collect();
-    assert_eq!(
-        calls,
-        [
-            (0x4000, 0x4005, 0x1000, 0x1020),
-            (0x4000, 0x400a, 0x2000, 0x3020)
-        ]
-    );
-}
-
-/// Rizin can report a million call edges for a few megabytes of `call`
-/// instructions. Every edge into a resolver with no hash loop used to rescan
-/// all edges for a helper, so this many calls did not finish.
-#[test]
-fn resolver_calls_scale_with_the_edge_count() {
-    let calls = 200_000;
-    let ranges = [(0x1000, 0x100), (0x10_0000, 0x1000_0000)];
-    let edges: Vec<_> = (0..calls)
-        .map(|i| (0x10_0000, 0x10_0000 + 5 * i, 0x1000))
-        .collect();
-    assert!(resolver_calls(&ranges, &edges, vec![0x1010], &[]).is_empty());
-    let profiles = [located_profile(0x1020)];
-    assert_eq!(
-        resolver_calls(&ranges, &edges, vec![0x1010], &profiles).len(),
-        calls as usize
-    );
-}
-
-/// `test.exe` (PE32+) with a TLS directory registering `callbacks` callbacks.
-fn pe_with_tls_callbacks(callbacks: usize) -> Vec<u8> {
-    let put = |bytes: &mut Vec<u8>, at: usize, value: u64, width: usize| {
-        bytes[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
-    };
-    let mut bytes = read_fixture("test.exe");
-    let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
-    let coff = pe_offset + 4;
-    let sections = u16::from_le_bytes(bytes[coff + 2..coff + 4].try_into().unwrap()) as usize;
-    let size_of_optional = u16::from_le_bytes(bytes[coff + 16..coff + 18].try_into().unwrap());
-    let optional = coff + 20;
-    let image_base = u64::from_le_bytes(bytes[optional + 24..optional + 32].try_into().unwrap());
-    let last = optional + size_of_optional as usize + (sections - 1) * 40;
-    let va = u64::from(u32::from_le_bytes(
-        bytes[last + 12..last + 16].try_into().unwrap(),
+/// `test.exe` with a real Authenticode signature — Tencent's, so its image
+/// digest is not this file's — in its certificate table.
+fn with_foreign_signature() -> Vec<u8> {
+    const SIGNED_DATA: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/authenticode-digicert-tencent.p7b"
     ));
-    let pointer = u32::from_le_bytes(bytes[last + 20..last + 24].try_into().unwrap()) as usize;
-
-    let size = 40 + (callbacks + 1) * 8;
-    bytes.resize(pointer + size, 0);
-    bytes[pointer..pointer + size].fill(0);
-    put(&mut bytes, last + 8, size as u64, 4); // virtual_size
-    put(&mut bytes, last + 16, size as u64, 4); // size_of_raw_data
-    // IMAGE_TLS_DIRECTORY64.AddressOfCallBacks, then the array itself, every
-    // callback pointing back into this section.
-    put(&mut bytes, pointer + 24, image_base + va + 40, 8);
-    for i in 0..callbacks {
-        put(&mut bytes, pointer + 40 + i * 8, image_base + va, 8);
-    }
-    // Data directory 9 is the TLS table; PE32+ puts the array at +112.
-    put(&mut bytes, optional + 112 + 9 * 8, va, 4);
-    put(&mut bytes, optional + 112 + 9 * 8 + 4, 40, 4);
+    let blob = crate::formats::cms::der_element(SIGNED_DATA).unwrap();
+    let mut bytes = read_fixture("test.exe");
+    let table = bytes.len().next_multiple_of(8);
+    bytes.resize(table, 0);
+    bytes.extend(u32::try_from(blob.len() + 8).unwrap().to_le_bytes());
+    bytes.extend(0x0200_u16.to_le_bytes());
+    bytes.extend(0x0002_u16.to_le_bytes());
+    bytes.extend(blob);
+    bytes.resize(bytes.len().next_multiple_of(8), 0);
+    let size = u32::try_from(bytes.len() - table).unwrap();
+    let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    let magic = u16::from_le_bytes(bytes[pe_offset + 24..pe_offset + 26].try_into().unwrap());
+    let slot =
+        layout::data_directory_offset(pe_offset, magic, layout::CERTIFICATE_DIRECTORY).unwrap();
+    bytes[slot..slot + 4].copy_from_slice(&u32::try_from(table).unwrap().to_le_bytes());
+    bytes[slot + 4..slot + 8].copy_from_slice(&size.to_le_bytes());
     bytes
 }
 
-/// A callback array runs to its first null entry, so a forged one is as long
-/// as the file allows; the records are capped and the count stays exact.
+/// A fully parsed image is hashed, so a lifted signature is caught.
 #[test]
-fn tls_callback_records_are_capped() {
-    for (callbacks, records) in [(3, 3), (100_000, MAX_TLS_CALLBACK_RECORDS)] {
-        let bytes = pe_with_tls_callbacks(callbacks);
-        let pe = goblin_safe::parse_pe(&bytes).outcome.ok().expect("parses");
-        let (mut values, mut metrics) = (Values::new(), Metrics::new());
-        tls_callbacks(&pe, &mut values, &mut metrics);
-        assert_eq!(metrics.get("pe.tls_callback_count"), Some(callbacks as f64));
-        let recorded = values.get("pe.tls_callbacks").and_then(JsonValue::as_array);
-        assert_eq!(recorded.map(Vec::len), Some(records));
-    }
+fn foreign_signature_on_a_parsed_image_is_tampered() {
+    let (v, _, _) = run(&with_foreign_signature());
+    assert_eq!(v.get("pe.signatures[0].verified"), Some(&true.into()));
+    assert_eq!(
+        v.get("pe.signatures[0].digest_matches"),
+        Some(&false.into())
+    );
+    assert_eq!(
+        v.get("pe.signature_integrity").and_then(JsonValue::as_str),
+        Some("tampered")
+    );
+}
+
+/// The header-only fallback has no section table to hash the image with.
+/// The same lifted signature still verifies as CMS, but nothing binds it to
+/// this file, so it must read as unverifiable rather than intact.
+#[test]
+fn header_only_fallback_judges_signatures_unverifiable() {
+    let mut bytes = with_foreign_signature();
+    // A section count past what validation lets goblin walk forces the
+    // header-only path.
+    let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    bytes[pe_offset + 6..pe_offset + 8].copy_from_slice(&500_u16.to_le_bytes());
+    let (v, _, m) = run(&bytes);
+    assert_eq!(m.get("pe.partial_parse"), Some(1.0));
+    assert_eq!(v.get("pe.signatures[0].verified"), Some(&true.into()));
+    assert!(v.get("pe.signatures[0].digest_matches").is_none());
+    assert!(v.get("pe.image_hash").is_none());
+    assert_eq!(
+        v.get("pe.signature_integrity").and_then(JsonValue::as_str),
+        Some("unverifiable")
+    );
 }

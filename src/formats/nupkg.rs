@@ -5,10 +5,13 @@
 //! manifest for the publisher identity NuGet packages declare —
 //! `id`, `version`, `authors`, `owners`, and `projectUrl`.
 
+use super::people;
 use std::io::{Read, Seek};
 
 use serde_json::Value as JsonValue;
 
+use super::bounded::Limits;
+use super::common::ends_with_ci;
 use crate::output::{Errors, Metrics, Stage, ValueKey, Values};
 use crate::value_key;
 
@@ -21,35 +24,22 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     _metrics: &mut Metrics,
     errors: &mut Errors,
 ) {
-    // The manifest is a single root-level `{id}.nuspec`.
+    // The manifest is a single root-level `{id}.nuspec`; NuGet matches the
+    // extension without regard to case.
     let Some(name) = zip
         .file_names()
-        .find(|n| n.ends_with(".nuspec") && !n.contains('/'))
-        .map(str::to_string)
+        .filter_map(Result::ok)
+        .find(|n| ends_with_ci(n, ".nuspec") && !n.contains('/'))
+        .map(std::borrow::Cow::into_owned)
     else {
         return;
     };
-    // The name came from the listing, so an absent member is as much a
-    // failure as an unreadable one.
-    let buf = match super::zip::read_member(zip, &name, MAX_NUSPEC) {
-        Ok(Some(buf)) => buf,
-        Ok(None) => {
-            errors.record_malformed(Stage::ZipParse, format!("{name}: listed but not found"));
-            return;
-        }
-        Err(super::zip::MemberError::TooLarge { max }) => {
-            super::bounded::push_limit(
-                values,
-                value_key!("nupkg.limits"),
-                "nuspec",
-                format!("{name} over the {max}-byte cap; not parsed"),
-            );
-            return;
-        }
-        Err(e) => {
-            errors.record_malformed(Stage::ZipParse, format!("{name}: {e}"));
-            return;
-        }
+    let mut limits = Limits::default();
+    let manifest =
+        super::zip::read_manifest_member(zip, &name, MAX_NUSPEC, &mut limits, "nuspec", errors);
+    limits.emit(values, value_key!("nupkg.limits"));
+    let Some(buf) = manifest else {
+        return;
     };
     let parsed = String::from_utf8(buf)
         .map_err(|e| format!("not UTF-8: {e}"))
@@ -59,8 +49,8 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     }
 }
 
-/// Emit `nupkg.*` from a `.nuspec`. `authors` / `owners` are
-/// comma-separated lists the identity normalizer splits into people.
+/// Emit `nupkg.*` from a `.nuspec`. Its `authors` and `owners` are
+/// comma-separated name lists, published as people.
 fn parse_nuspec(text: &str, values: &mut Values) -> Result<(), roxmltree::Error> {
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let doc = roxmltree::Document::parse(text)?;
@@ -69,8 +59,6 @@ fn parse_nuspec(text: &str, values: &mut Values) -> Result<(), roxmltree::Error>
         ("version", value_key!("nupkg.version")),
         ("title", value_key!("nupkg.title")),
         ("description", value_key!("nupkg.description")),
-        ("authors", value_key!("nupkg.authors")),
-        ("owners", value_key!("nupkg.owners")),
         ("projectUrl", value_key!("nupkg.homepage")),
         ("repository", value_key!("nupkg.repository")),
     ];
@@ -87,95 +75,25 @@ fn parse_nuspec(text: &str, values: &mut Values) -> Result<(), roxmltree::Error>
             }
         }
     }
+    for (tag, key) in [
+        ("authors", value_key!("nupkg.authors")),
+        ("owners", value_key!("nupkg.owners")),
+    ] {
+        let names = doc
+            .descendants()
+            .find(|n| n.has_tag_name(tag))
+            .and_then(|n| n.text())
+            .unwrap_or_default();
+        people::put(
+            values,
+            key,
+            names
+                .split(',')
+                .map(|name| people::Person::from_fields(Some(name), None)),
+        );
+    }
     Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Cursor, Write};
-
-    fn nupkg_with(members: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut w = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
-        let opts = ::zip::write::SimpleFileOptions::default()
-            .compression_method(::zip::CompressionMethod::Stored);
-        for (name, body) in members {
-            w.start_file(*name, opts).unwrap();
-            w.write_all(body).unwrap();
-        }
-        w.finish().unwrap().into_inner()
-    }
-
-    fn run(bytes: &[u8]) -> (Values, Errors) {
-        let mut zip = ::zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
-        let mut v = Values::new();
-        let mut e = Errors::new();
-        extract_from_archive(&mut zip, &mut v, &mut Metrics::new(), &mut e);
-        (v, e)
-    }
-
-    #[test]
-    fn nuspec_that_is_not_xml_records_one_error() {
-        let (v, e) = run(&nupkg_with(&[("Acme.nuspec", b"<package><metadata>")]));
-        assert_eq!(e.len(), 1, "{e:?}");
-        let err = &e.as_slice()[0];
-        assert_eq!(
-            (err.stage, err.kind),
-            (Stage::FormatExtract, crate::DiagnosticKind::Malformed)
-        );
-        assert!(err.message.starts_with("Acme.nuspec:"), "{}", err.message);
-        assert!(v.get("nupkg.limits").is_none());
-    }
-
-    #[test]
-    fn well_formed_or_absent_nuspec_records_nothing() {
-        let (v, e) = run(&nupkg_with(&[(
-            "Acme.nuspec",
-            b"<package><metadata><id>Acme</id></metadata></package>",
-        )]));
-        assert!(e.is_empty(), "{e:?}");
-        assert_eq!(v.get("nupkg.name").and_then(|x| x.as_str()), Some("Acme"));
-        let (_, e) = run(&nupkg_with(&[("lib/a.dll", b"MZ")]));
-        assert!(e.is_empty(), "{e:?}");
-    }
-
-    #[test]
-    fn oversized_nuspec_is_a_limit_not_an_error() {
-        let big = vec![b' '; MAX_NUSPEC as usize + 1];
-        let (v, e) = run(&nupkg_with(&[("Acme.nuspec", &big)]));
-        assert!(e.is_empty(), "{e:?}");
-        let limits = v.get("nupkg.limits").and_then(|x| x.as_array()).unwrap();
-        assert_eq!(limits[0]["stage"], "nuspec");
-    }
-
-    #[test]
-    fn nuspec_identity_fields_extracted() {
-        let xml = r#"<?xml version="1.0"?>
-            <package><metadata>
-                <id>Acme.Widgets</id>
-                <version>1.2.3</version>
-                <authors>Acme Corp</authors>
-                <owners>Acme Corp</owners>
-                <projectUrl>https://acme.test</projectUrl>
-                <description>Widgets for .NET</description>
-            </metadata></package>"#;
-        let mut v = Values::new();
-        parse_nuspec(xml, &mut v).unwrap();
-        assert_eq!(
-            v.get("nupkg.description").and_then(|x| x.as_str()),
-            Some("Widgets for .NET")
-        );
-        assert_eq!(
-            v.get("nupkg.name").and_then(|x| x.as_str()),
-            Some("Acme.Widgets")
-        );
-        assert_eq!(
-            v.get("nupkg.authors").and_then(|x| x.as_str()),
-            Some("Acme Corp")
-        );
-        assert_eq!(
-            v.get("nupkg.homepage").and_then(|x| x.as_str()),
-            Some("https://acme.test")
-        );
-    }
-}
+mod tests;

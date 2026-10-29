@@ -12,115 +12,6 @@ fn sectioned_desktop_config_does_not_score_as_python() {
     }
 }
 
-fn fat12_boot_sector() -> [u8; 512] {
-    let mut data = [0u8; 512];
-    data[..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
-    data[3..11].copy_from_slice(b"MSDOS5.0");
-    data[11..13].copy_from_slice(&512u16.to_le_bytes());
-    data[13] = 1;
-    data[14..16].copy_from_slice(&1u16.to_le_bytes());
-    data[16] = 2;
-    data[17..19].copy_from_slice(&224u16.to_le_bytes());
-    data[19..21].copy_from_slice(&2880u16.to_le_bytes());
-    data[21] = 0xF0;
-    data[22..24].copy_from_slice(&9u16.to_le_bytes());
-    data[24..26].copy_from_slice(&18u16.to_le_bytes());
-    data[26..28].copy_from_slice(&2u16.to_le_bytes());
-    data[510..].copy_from_slice(&[0x55, 0xAA]);
-    data
-}
-
-fn fat32_boot_sector() -> [u8; 512] {
-    let mut data = [0u8; 512];
-    data[..3].copy_from_slice(&[0xEB, 0x58, 0x90]);
-    data[3..11].copy_from_slice(b"MSWIN4.1");
-    data[11..13].copy_from_slice(&512u16.to_le_bytes());
-    data[13] = 8;
-    data[14..16].copy_from_slice(&32u16.to_le_bytes());
-    data[16] = 2;
-    data[21] = 0xF8;
-    data[24..26].copy_from_slice(&63u16.to_le_bytes());
-    data[26..28].copy_from_slice(&255u16.to_le_bytes());
-    data[32..36].copy_from_slice(&1_000_000u32.to_le_bytes());
-    data[36..40].copy_from_slice(&976u32.to_le_bytes());
-    data[510..].copy_from_slice(&[0x55, 0xAA]);
-    data
-}
-
-#[test]
-fn padded_dos_com_overwriter_is_recognized_without_loose_interrupt_matches() {
-    const ANTON: &[u8] = include_bytes!("../../../testdata/dos-com/anton-97");
-    assert!(looks_like_dos_com_overwriter(ANTON));
-
-    let mut one_interrupt = vec![0u8; 5120];
-    one_interrupt[0..6].copy_from_slice(b"*.COM\0");
-    one_interrupt[16..18].copy_from_slice(&[0xCD, 0x21]);
-    one_interrupt[32..34].copy_from_slice(&[0xCD, 0x20]);
-    assert!(!looks_like_dos_com_overwriter(&one_interrupt));
-
-    let mut no_wildcard = one_interrupt.clone();
-    no_wildcard[24..26].copy_from_slice(&[0xCD, 0x21]);
-    no_wildcard[0..6].copy_from_slice(b"plain\0");
-    assert!(!looks_like_dos_com_overwriter(&no_wildcard));
-
-    let text = b"uses INT 21 and INT 20 while searching *.COM\n";
-    assert!(!looks_like_dos_com_overwriter(text));
-}
-
-#[test]
-fn fat_boot_sector_accepts_valid_fat12_and_fat32_bpbs() {
-    let sector = fat12_boot_sector();
-    assert!(looks_like_fat_boot_sector(&sector));
-    assert!(looks_like_fat_boot_sector(&fat32_boot_sector()));
-}
-
-#[test]
-fn fat_boot_sector_rejects_each_required_bpb_field_when_invalid() {
-    let sector = fat12_boot_sector();
-    let mut mutations: Vec<(&str, Box<dyn Fn(&mut [u8; 512])>)> = vec![
-        (
-            "bytes per sector",
-            Box::new(|b| b[11..13].copy_from_slice(&513u16.to_le_bytes())),
-        ),
-        ("cluster size", Box::new(|b| b[13] = 3)),
-        ("reserved sectors", Box::new(|b| b[14..16].fill(0))),
-        ("fat count", Box::new(|b| b[16] = 0)),
-        ("media descriptor", Box::new(|b| b[21] = 0)),
-        (
-            "fat size",
-            Box::new(|b| {
-                b[22..24].fill(0);
-                b[36..40].fill(0);
-            }),
-        ),
-        (
-            "volume size",
-            Box::new(|b| {
-                b[19..21].fill(0);
-                b[32..36].fill(0);
-            }),
-        ),
-        ("sectors per track", Box::new(|b| b[24..26].fill(0))),
-        ("head count", Box::new(|b| b[26..28].fill(0))),
-        ("jump opcode", Box::new(|b| b[0] = 0x90)),
-        ("short jump NOP", Box::new(|b| b[2] = 0x91)),
-        ("boot signature", Box::new(|b| b[511] = 0)),
-    ];
-    for (name, mutate) in mutations.drain(..) {
-        let mut invalid = sector;
-        mutate(&mut invalid);
-        assert!(
-            !looks_like_fat_boot_sector(&invalid),
-            "accepted invalid {name}"
-        );
-    }
-
-    let mut signature_only = [0x41u8; 512];
-    signature_only[510..].copy_from_slice(&[0x55, 0xAA]);
-    assert!(!looks_like_fat_boot_sector(&signature_only));
-    assert!(!looks_like_fat_boot_sector(&sector[..511]));
-}
-
 #[test]
 fn prose_with_keywords_is_not_source() {
     // Sentences that happen to contain JavaScript's scored tokens.
@@ -165,14 +56,14 @@ fn languages_round_trip_through_file_types() {
     assert_eq!(Lang::from_file_type(FileType::Go), None);
 }
 
-/// Two languages both past 655 points used to overflow `u16` when their
-/// ratio was taken, which panics in a debug build. They are simply too
-/// close to call.
+/// Two languages both past 655 points overflow `u16` if their ratio is
+/// taken unwidened, which panics in a debug build. They are simply too close
+/// to call.
 #[test]
 fn saturated_scores_are_compared_without_overflow() {
     let data = b"self.;cd /;".repeat(SCAN_LIMIT / 11);
     let scores = scan_scores(&data);
-    assert!(scores[Lang::Python.idx()] > 655 && scores[Lang::Shell.idx()] > 655);
+    assert!(Lang::Python.score(&scores) > 655 && Lang::Shell.score(&scores) > 655);
     assert_eq!(detect_from_content(&data), None);
 }
 
@@ -234,9 +125,9 @@ fn powershell_heuristic() {
     assert_eq!(detect_from_content(data), Some(FileType::PowerShell));
 }
 
-// A Discord clipboard stealer from the gauntlet, cut to its opening. It
-// carries no `$ErrorActionPreference`/`Write-Host`, only the advanced
-// function and `Add-Type` idioms.
+// A clipboard stealer cut to its opening. It carries no
+// `$ErrorActionPreference`/`Write-Host`, only the advanced function and
+// `Add-Type` idioms.
 #[test]
 fn powershell_advanced_function_and_add_type() {
     let data = b"Add-Type -AssemblyName WindowsBase\r\n\
@@ -776,8 +667,8 @@ suspend fun main() {\n\
 
 #[test]
 fn var_heavy_obfuscated_js_is_not_kotlin() {
-    // Trojanized WordPress JS (VirusShare sample): a jQuery script with an
-    // appended obfuscated injector whose renamed locals use `var` ~14×.
+    // Trojanized WordPress JS: a jQuery script with an appended obfuscated
+    // injector whose renamed locals use `var` ~14×.
     // `var ` is a JS keyword, not a Kotlin signal — the JS markers
     // (`(function(`, `===`, `window.`) must win, not lose to Kotlin's `var`.
     let data = b"jQuery(function( $ ){ $('.x').click(function(){}); });\n\
@@ -850,4 +741,123 @@ fn leading_encoded_literal_does_not_hide_following_source() {
     ] {
         assert_eq!(detect_from_content(source.as_bytes()), None);
     }
+}
+
+// ── binary guard ──
+
+#[test]
+fn dos_com_is_not_clojure() {
+    // A kilobyte of x86 with two chance `#'` pairs, which a byte scorer
+    // without the binary guard would type as Clojure.
+    let mut data = vec![0xBEu8, 0x10, 0x01, 0x8B, 0xFE, 0xB9, 0xD0, 0x01];
+    for i in 0..500u32 {
+        // Roughly the mix real code has: opcodes, operands and a steady
+        // dusting of control bytes.
+        data.push((i % 0x1F) as u8);
+        data.push(b'A' + (i % 26) as u8);
+    }
+    data.extend_from_slice(b"#'");
+    data.extend_from_slice(b"#'");
+    assert_eq!(detect_from_content(&data), None);
+}
+
+#[test]
+fn real_clojure_still_detected() {
+    let src = b"(ns app.core\n  (:require [clojure.string :as str]))\n\n(defn greet [n]\n  (str \"hi \" n))\n";
+    assert_eq!(detect_from_content(src), Some(FileType::Clojure));
+}
+
+#[test]
+fn python_comments_with_clojure_var_quote_tokens_stay_python() {
+    // An uploader script comments out lists of tags as `#'exe`, `#'elf`,
+    // etc. That Python comment prefix is not Clojure's var-quote reader
+    // macro, and must not outweigh strong Python imports and functions.
+    let src = b"import os\nimport json\nimport requests\n\ndef submit_samples(auth_key, folder_path):\n    tags = [\n        #'exe', #'elf', #'trojan', #'dropper',\n    ]\n    try:\n        response = requests.post(url, files=tags)\n    except Exception as e:\n        print(e)\n";
+    assert_eq!(detect_from_content(src), Some(FileType::Python));
+}
+
+#[test]
+fn batch_still_detected() {
+    let src = b"@echo off\r\nsetlocal\r\nset PATH=%PATH%;C:\\bin\r\necho done\r\n";
+    assert_eq!(detect_from_content(src), Some(FileType::Batch));
+}
+
+#[test]
+fn utf8_source_with_accents_is_not_binary() {
+    let src = "(ns café.core)\n(defn saluer [n] (str \"bonjour \" n))\n(defn adieu [n] (str \"au revoir \" n))\n".as_bytes();
+    assert_eq!(detect_from_content(src), Some(FileType::Clojure));
+}
+
+// ── lowercase batch heuristic ──
+
+/// Batch is case-insensitive and is usually written in lower case, and a
+/// script need not open with `@echo off`.
+#[test]
+fn lowercase_batch_body_is_recognised() {
+    let data = b"@ctty nul\nfor %%f in (*.com) do set K=%%f\nattrib +h Y%K%\ngoto end\n:end\n";
+    assert_eq!(detect_from_content(data), Some(FileType::Batch));
+}
+
+/// `errorlevel` is spelled that way in no other language.
+#[test]
+fn errorlevel_marks_a_batch_script() {
+    let data = b"find \"CW\" <%1 >nul\nif not errorlevel 1 goto c\nren %1 vir.tmp\n";
+    assert_eq!(detect_from_content(data), Some(FileType::Batch));
+}
+
+/// C's `goto` is deliberately not a batch token, so C source is untouched.
+#[test]
+fn c_goto_is_not_batch() {
+    let data = b"int f(int x){ if(!x) goto done; return 1; done: return 0; }\n";
+    assert_ne!(detect_from_content(data), Some(FileType::Batch));
+}
+
+// ── decoded text ──
+
+fn utf16(text: &str, little_endian: bool) -> Vec<u8> {
+    text.encode_utf16()
+        .flat_map(|u| {
+            if little_endian {
+                u.to_le_bytes()
+            } else {
+                u.to_be_bytes()
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn utf16_is_narrowed() {
+    let text = "Set x = CreateObject(\"WScript.Shell\") ' caf\u{e9}\r\n".repeat(4);
+    let mut le = vec![0xFF, 0xFE];
+    le.extend(utf16(&text, true));
+    assert_eq!(decoded_text(&le).unwrap().as_ref(), text.as_bytes());
+    let mut be = vec![0xFE, 0xFF];
+    be.extend(utf16(&text, false));
+    assert_eq!(decoded_text(&be).unwrap().as_ref(), text.as_bytes());
+    // No mark: the lane of NULs says which order.
+    assert_eq!(
+        decoded_text(&utf16(&text, true)).unwrap().as_ref(),
+        text.as_bytes()
+    );
+    assert_eq!(
+        decoded_text(&utf16(&text, false)).unwrap().as_ref(),
+        text.as_bytes()
+    );
+    // Short text with a mark still decodes.
+    let mut short = vec![0xFF, 0xFE];
+    short.extend(utf16("MsgBox 1", true));
+    assert_eq!(decoded_text(&short).unwrap().as_ref(), b"MsgBox 1");
+}
+
+#[test]
+fn mark_on_eight_bit_text_is_dropped() {
+    let data = b"\xff\xfe&cls\r\nstart \"\" x.exe\r\n\x00";
+    assert_eq!(decoded_text(data).unwrap().as_ref(), &data[2..]);
+}
+
+#[test]
+fn ordinary_bytes_are_left_alone() {
+    assert!(decoded_text(b"@echo off\r\n").is_none());
+    assert!(decoded_text(&[0u8; 256]).is_none());
 }

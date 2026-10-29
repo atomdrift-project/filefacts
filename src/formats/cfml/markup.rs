@@ -1,26 +1,22 @@
 //! Bounded source markup observations, not an HTML DOM or execution model.
 //! CFML scanning remains independent, including inside HTML attributes/raw text.
-use super::{Attribute, Tag, interpolation, starts};
+use super::{Tag, interpolation, starts};
 use std::ops::Range;
 
 #[derive(Default)]
 pub(super) struct Markup {
     until: usize,
-    control_until: usize,
+    /// End of the last form control's start tag; output expressions before
+    /// it belong to that tag's attributes.
+    pub control_until: usize,
     comment: bool,
     raw: Option<Range<usize>>,
-    output_depth: usize,
+    /// Open CFOUTPUT tags.
+    pub output_depth: usize,
     pub limited: bool,
 }
 
 impl Markup {
-    pub(super) fn in_output(&self) -> bool {
-        self.output_depth > 0
-    }
-    pub(super) fn inside_tag(&self, at: usize) -> bool {
-        at < self.control_until
-    }
-
     pub(super) fn cf_tag(&mut self, bytes: &[u8], tag: &Tag) {
         if bytes
             .get(tag.name.clone())
@@ -246,105 +242,6 @@ impl Markup {
             closing: false,
         })
     }
-}
-
-// HTML allows boolean attributes and does not double quote characters to escape
-// them. Hash expressions apply only while the containing CFOUTPUT is active.
-pub(super) fn attributes(bytes: &[u8], tag: &Tag, interpolate: bool) -> Option<Vec<Attribute>> {
-    let mut out: Vec<Attribute> = Vec::new();
-    let mut at = tag.body.start;
-    let end = tag.body.end;
-    // Everything through the body; indexing it past `end` yields `None`.
-    let body = bytes.get(..end)?;
-    while at < end {
-        while body.get(at).is_some_and(u8::is_ascii_whitespace) {
-            at += 1;
-        }
-        if at == end || (at + 1 == end && body.get(at) == Some(&b'/')) {
-            break;
-        }
-        if out.len() == 64 {
-            return None;
-        }
-        let start = at;
-        while body.get(at).is_some_and(|b| {
-            !b.is_ascii_whitespace()
-                && !matches!(b, b'=' | b'/' | b'>' | b'\'' | b'"' | b'<' | b'`')
-        }) {
-            at += 1;
-        }
-        if at == start {
-            return None;
-        }
-        let name = start..at;
-        let name_text = body.get(name.clone())?;
-        if out.iter().any(|a| {
-            body.get(a.name.clone())
-                .is_some_and(|n| n.eq_ignore_ascii_case(name_text))
-        }) {
-            return None;
-        }
-        while body.get(at).is_some_and(u8::is_ascii_whitespace) {
-            at += 1;
-        }
-        if body.get(at) != Some(&b'=') {
-            out.push(Attribute {
-                name,
-                value: at..at,
-                quoted: false,
-            });
-            continue;
-        }
-        at += 1;
-        while body.get(at).is_some_and(u8::is_ascii_whitespace) {
-            at += 1;
-        }
-        let &first = body.get(at)?;
-        let quote = matches!(first, b'\'' | b'"').then_some(first);
-        if quote.is_some() {
-            at += 1;
-        }
-        let start = at;
-        while let Some(&b) = body.get(at) {
-            if quote == Some(b) || (quote.is_none() && b.is_ascii_whitespace()) {
-                break;
-            }
-            if interpolate && b == b'#' {
-                if bytes.get(at + 1) == Some(&b'#') {
-                    at += 2;
-                    continue;
-                }
-                at += 1;
-                if !interpolation(body, &mut at) {
-                    return None;
-                }
-            } else {
-                if quote.is_none() && matches!(b, b'\'' | b'"' | b'<' | b'=' | b'`') {
-                    return None;
-                }
-                at += 1;
-            }
-        }
-        let value = start..at;
-        if let Some(q) = quote {
-            if body.get(at) != Some(&q) {
-                return None;
-            }
-            at += 1;
-            if body
-                .get(at)
-                .is_some_and(|b| !b.is_ascii_whitespace() && *b != b'/')
-            {
-                return None;
-            }
-        }
-        out.push(Attribute {
-            name,
-            value,
-            quoted: quote.is_some(),
-        });
-    }
-    Some(out)
 }
 
 // Numeric references cover ASCII name obfuscation without an HTML entity table.

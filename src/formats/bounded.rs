@@ -32,22 +32,72 @@ pub(super) const MAX_PATH_BYTES: usize = 64 << 20;
 /// bounds the walk past them: a small `.tgz` can inflate a thousandfold.
 pub(super) const MAX_TARGZ_SEARCH: u64 = 128 << 20;
 
-/// Append a `{stage, reason}` entry to the `key` limits list, keeping any
-/// entries already recorded there.
-pub(super) fn push_limit(
-    values: &mut Values,
-    key: ValueKey,
-    stage: &str,
-    reason: impl Into<String>,
-) {
-    let entry = json!({ "stage": stage, "reason": reason.into() });
-    let mut list = values
-        .get_key(key)
-        .and_then(JsonValue::as_array)
-        .cloned()
-        .unwrap_or_default();
-    list.push(entry);
-    values.insert_key(key, JsonValue::Array(list));
+/// Largest LZ dictionary (zstd window, xz/LZMA dictionary) a decoder may
+/// allocate, as a power of two. The stream header names its own size and
+/// the decoder allocates it before producing a byte, so without this a
+/// frame of a few bytes asks for gigabytes. 64 MiB is what `xz -9` and
+/// `zstd --ultra -22` on large inputs use; real package members need less.
+const MAX_DICTIONARY_LOG: u32 = 26;
+
+/// A zstd decoder over `input` that refuses frames whose window exceeds
+/// [`MAX_DICTIONARY_LOG`].
+pub(super) fn zstd_decoder<R: io::BufRead>(
+    input: R,
+) -> io::Result<zstd::stream::read::Decoder<'static, R>> {
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(input)?;
+    decoder.window_log_max(MAX_DICTIONARY_LOG)?;
+    Ok(decoder)
+}
+
+/// An xz decoder over `input` that refuses streams whose dictionary exceeds
+/// [`MAX_DICTIONARY_LOG`]. Concatenated streams are read as one, as `xz`
+/// itself does.
+pub(super) fn xz_decoder<R: Read>(input: R) -> lzma_rust2::XzReader<R> {
+    // The limit is the decoder's whole footprint in KiB: the dictionary
+    // plus the coder state, which a few MiB more covers.
+    const MEM_LIMIT_KIB: u32 = (1 << (MAX_DICTIONARY_LOG - 10)) + (4 << 10);
+    lzma_rust2::XzReader::new_mem_limit(input, true, MEM_LIMIT_KIB)
+}
+
+/// One bound a walk hit: the stage it was in, and what was cut short.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Limit {
+    pub(super) stage: &'static str,
+    pub(super) reason: String,
+}
+
+/// The bounds one extractor hit, written once to its `<format>.limits` key
+/// as `[{stage, reason}]`, so a capped walk is a reported limit rather than
+/// a silent short read.
+#[derive(Debug, Default)]
+pub(super) struct Limits(Vec<Limit>);
+
+impl Limits {
+    pub(super) fn push(&mut self, stage: &'static str, reason: impl Into<String>) {
+        let reason = reason.into();
+        tracing::debug!(target: "filefacts::bounded", stage, reason = %reason, "limit reached");
+        self.0.push(Limit { stage, reason });
+    }
+
+    /// Append the list to `key`; nothing is written when no limit was hit.
+    /// Appending, not replacing, lets two extractors of one file (an OLE2
+    /// container and the VBA project inside it) share `office.limits`.
+    pub(super) fn emit(self, values: &mut Values, key: ValueKey) {
+        if self.0.is_empty() {
+            return;
+        }
+        let mut list = values
+            .get_key(key)
+            .and_then(JsonValue::as_array)
+            .cloned()
+            .unwrap_or_default();
+        list.extend(
+            self.0
+                .into_iter()
+                .map(|l| json!({ "stage": l.stage, "reason": l.reason })),
+        );
+        values.insert_key(key, JsonValue::Array(list));
+    }
 }
 
 /// The first bytes of a member, read through a cap.
@@ -58,15 +108,16 @@ pub(super) struct MemberPrefix {
     pub(super) truncated: bool,
 }
 
-/// Read `reader` to at most `max` bytes, reading one more to tell a member
-/// exactly at the cap from one past it. `size_hint` is only a capacity
-/// hint: a declared size is the container's claim, not a bound.
-pub(super) fn read_prefix(reader: impl Read, max: u64, size_hint: u64) -> io::Result<MemberPrefix> {
-    let mut bytes = Vec::with_capacity(usize::try_from(size_hint.min(max)).unwrap_or(0));
-    reader.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
-    let truncated = bytes.len() as u64 > max;
+/// Read (and so, through a decoder, inflate) `reader` to at most `cap`
+/// bytes, reading one more to tell a member exactly at the cap from one
+/// past it. Whatever a decoder produced before an error is discarded with
+/// the error: a cut-off member would only fail to parse.
+pub(super) fn inflate_capped(reader: impl Read, cap: u64) -> io::Result<MemberPrefix> {
+    let mut bytes = Vec::new();
+    reader.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
+    let truncated = bytes.len() as u64 > cap;
     if truncated {
-        bytes.truncate(usize::try_from(max).unwrap_or(usize::MAX));
+        bytes.truncate(usize::try_from(cap).unwrap_or(usize::MAX));
     }
     Ok(MemberPrefix { bytes, truncated })
 }
@@ -212,8 +263,7 @@ fn find_targz_member_within(
         if !matches(&path) {
             continue;
         }
-        let size = entry.size();
-        return match read_prefix(entry, max_member, size) {
+        return match inflate_capped(entry, max_member) {
             Ok(prefix) => Ok(TarGzSearch::Found { path, prefix }),
             Err(source) => Err(TarGzError::Member { path, source }),
         };
@@ -231,108 +281,4 @@ fn find_targz_member_within(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write;
-
-    /// A gzipped tar holding the given members.
-    fn targz(members: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut builder = tar::Builder::new(Vec::new());
-        for (path, body) in members {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(body.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder.append_data(&mut header, path, *body).unwrap();
-        }
-        let tar = builder.into_inner().unwrap();
-        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        gz.write_all(&tar).unwrap();
-        gz.finish().unwrap()
-    }
-
-    #[test]
-    fn finds_the_member_and_caps_it() {
-        let bytes = targz(&[("pkg/a", b"skip"), ("pkg/manifest", b"0123456789")]);
-        let found = find_targz_member(&bytes, |p| p == "pkg/manifest", 4).unwrap();
-        let TarGzSearch::Found { path, prefix } = found else {
-            panic!("member not found");
-        };
-        assert_eq!(path, "pkg/manifest");
-        assert_eq!(prefix.bytes, b"0123");
-        assert!(prefix.truncated);
-    }
-
-    #[test]
-    fn absent_member_is_not_an_error() {
-        let bytes = targz(&[("pkg/a", b"x")]);
-        let found = find_targz_member(&bytes, |p| p == "pkg/manifest", 64).unwrap();
-        assert!(matches!(found, TarGzSearch::Absent));
-    }
-
-    /// A tarball whose manifest sits behind more inflated bytes than the
-    /// budget stops at the budget instead of inflating the whole stream.
-    #[test]
-    fn search_stops_at_the_inflate_budget() {
-        let padding = vec![0_u8; 1 << 20];
-        let bytes = targz(&[("pkg/pad", &padding), ("pkg/manifest", b"{}")]);
-        let found =
-            find_targz_member_within(&bytes, |p| p == "pkg/manifest", 64, 64 << 10).unwrap();
-        assert!(matches!(found, TarGzSearch::InflateCapped));
-        // With room, the same tarball yields the manifest.
-        let found = find_targz_member_within(&bytes, |p| p == "pkg/manifest", 64, 4 << 20).unwrap();
-        assert!(matches!(found, TarGzSearch::Found { .. }));
-    }
-
-    #[test]
-    fn utf8_prefix_drops_a_character_cut_by_the_cap() {
-        let cut = MemberPrefix {
-            bytes: "aé".as_bytes()[..2].to_vec(),
-            truncated: true,
-        };
-        assert_eq!(utf8_prefix(cut).unwrap(), "a");
-        let invalid = MemberPrefix {
-            bytes: vec![b'a', 0xff, b'b'],
-            truncated: true,
-        };
-        assert!(utf8_prefix(invalid).is_err());
-        let whole_but_cut = MemberPrefix {
-            bytes: "aé".as_bytes()[..2].to_vec(),
-            truncated: false,
-        };
-        assert!(utf8_prefix(whole_but_cut).is_err());
-    }
-
-    #[test]
-    fn push_limit_appends() {
-        let mut values = Values::new();
-        let key = crate::value_key!("pdf.limits");
-        push_limit(&mut values, key, "a", "first");
-        push_limit(&mut values, key, "b", "second");
-        let list = values.get_key(key).and_then(JsonValue::as_array).unwrap();
-        assert_eq!(list.len(), 2);
-        assert_eq!(list[1]["stage"].as_str(), Some("b"));
-    }
-
-    /// A tarball that is not gzip fails the walk; the recorded line names
-    /// the member sought, and the failure keeps the I/O error as its source.
-    #[test]
-    fn member_failures_keep_their_source_and_record_one_line() {
-        let Err(walk) = find_targz_member(b"not gzip", |_| true, 1024) else {
-            panic!("a tarball that is not gzip fails the walk");
-        };
-        let failure = walk.into_failure(Stage::TarParse, "<root>/PKG-INFO");
-        assert!(std::error::Error::source(&failure).is_some());
-        let mut errors = Errors::new();
-        failure.record(&mut errors);
-        let recorded = errors.iter().next().unwrap();
-        assert_eq!(recorded.stage, Stage::TarParse);
-        assert!(
-            recorded
-                .message
-                .starts_with("tarball unreadable before <root>/PKG-INFO: "),
-            "{}",
-            recorded.message
-        );
-    }
-}
+mod tests;

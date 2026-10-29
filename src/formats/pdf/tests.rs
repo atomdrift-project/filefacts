@@ -1,3 +1,10 @@
+use super::actions::MAX_JS_TOTAL;
+use super::filters::{DecodeError, decode_stream, inflate_capped};
+use super::lex::{
+    decode_hex, dict_names, find_token_between, has_name, read_hex_string, read_literal_string,
+};
+use super::objects::{collect_dict_regions, decode_object_streams};
+use super::tokens::Hits;
 use super::*;
 
 fn extract_pdf(bytes: &[u8]) -> (Values, Metrics) {
@@ -38,8 +45,6 @@ fn extracts_info_title() {
 fn detects_javascript_action_count() {
     let pdf = b"%PDF-1.5\n5 0 obj << /S /JavaScript /JS (app.alert('hi')) >> endobj\n%%EOF";
     let (_, m) = extract_pdf(pdf);
-    // The filefacts extractor reports the count via metrics —
-    // the action-detail array stays with cleave's PDF parser.
     assert_eq!(m.get("pdf.action_count"), Some(1.0));
 }
 
@@ -176,7 +181,7 @@ fn no_header_is_silent() {
 }
 
 // ------------------------------------------------------------------
-// Phase 1B derived-metric tests
+// Derived metrics
 // ------------------------------------------------------------------
 
 #[test]
@@ -191,7 +196,68 @@ fn leading_bytes_before_header_counted() {
 fn signature_object_counted() {
     let pdf = b"%PDF-1.7\n5 0 obj << /Type /Sig /Filter /Adobe.PPKLite >> endobj\n%%EOF";
     let (_, m) = extract_pdf(pdf);
-    assert!(m.get("pdf.signature_object_count").unwrap() >= 1.0);
+    assert_eq!(m.get("pdf.signature_object_count"), Some(1.0));
+}
+
+/// One signature written the joined way is one signature.
+#[test]
+fn joined_signature_type_counts_once() {
+    let pdf = b"%PDF-1.7\n5 0 obj <</Type/Sig/Filter/Adobe.PPKLite>> endobj\n%%EOF";
+    let (v, m) = extract_pdf(pdf);
+    assert_eq!(m.get("pdf.signature_object_count"), Some(1.0));
+    assert_eq!(v.get("pdf.shape.signature_object_count"), Some(&json!(1)));
+}
+
+/// A signature dictionary packed into an object stream is still counted,
+/// and still pairs with a second `%%EOF` as a signed incremental update.
+#[test]
+fn signature_inside_an_object_stream_is_counted() {
+    let mut pdf = pdf_with_object_stream(b"9 0 <</Type/Sig/Filter/Adobe.PPKLite>>");
+    pdf.extend_from_slice(b"%%EOF\n8 0 obj << >> endobj\n%%EOF\n");
+    let (_, m) = extract_pdf(&pdf);
+    assert_eq!(m.get("pdf.signature_object_count"), Some(1.0));
+    assert_eq!(m.get("pdf.signed_incremental_update_count"), Some(1.0));
+}
+
+/// `/Type` and its value may be separated by any whitespace or comment,
+/// and either may be spelled with `#xx` escapes; every such spelling is the
+/// same dictionary type.
+#[test]
+fn type_spellings_are_recognised() {
+    for spelling in [
+        &b"/Type\n/Sig"[..],
+        b"/Type  /Sig",
+        b"/Type\r\n\t/Sig",
+        b"/Type%note\n/Sig",
+        b"/Ty#70e/Sig",
+        b"/Type/S#69g",
+        b"/Type /#53#69#67",
+    ] {
+        let mut pdf = b"%PDF-1.7\n5 0 obj << ".to_vec();
+        pdf.extend_from_slice(spelling);
+        pdf.extend_from_slice(b" /Filter /Adobe.PPKLite >> endobj\n%%EOF");
+        let (_, m) = extract_pdf(&pdf);
+        assert_eq!(
+            m.get("pdf.signature_object_count"),
+            Some(1.0),
+            "{}",
+            String::from_utf8_lossy(spelling)
+        );
+    }
+    // A longer name, or a key that only starts like `/Type`, is not one.
+    for other in [&b"/Type /SigRef"[..], b"/Types /Sig", b"/Type#20 /Sig"] {
+        assert!(!has_name(other, b"Type", b"Sig"), "{other:?}");
+    }
+    // The other `/Type` sites read the same way.
+    let objstm = b"/Type\n/ObjStm";
+    assert!(has_name(objstm, b"Type", b"ObjStm"));
+    assert!(has_name(b"/Subtype  /Wid#67et", b"Subtype", b"Widget"));
+    assert_eq!(
+        dict_names(b"<</Type/Page/Kids[<</Type /Pages>>]>>", b"Type")
+            .map(|n| n.into_owned())
+            .collect::<Vec<_>>(),
+        [b"Page".to_vec(), b"Pages".to_vec()]
+    );
 }
 
 #[test]
@@ -339,11 +405,10 @@ fn direct_length_allows_adjacent_endstream_marker() {
     assert_eq!(m.get("pdf.stream_length_mismatch_count"), Some(0.0));
 }
 
-/// A tagged PDF ends with thousands of stream-less structure objects.
-/// Each one used to search for a `stream` token to end-of-file, which
-/// made region collection quadratic: 5 MB manuals took 80–400 s on the
-/// fleet (2026-09-06). The search is bounded by the object's own
-/// `endobj` now, and the walk is linear.
+/// A tagged PDF ends with thousands of stream-less structure objects. A
+/// `stream` search per object that ran to end-of-file would make region
+/// collection quadratic; bounded by the object's own `endobj`, the walk
+/// searches each byte a small constant number of times.
 #[test]
 fn dict_regions_are_linear_in_stream_less_objects() {
     let mut pdf =
@@ -356,17 +421,18 @@ fn dict_regions_are_linear_in_stream_less_objects() {
         );
     }
     pdf.extend_from_slice(b"trailer\n<< /Root 1 0 R >>\n%%EOF\n");
-    let started = std::time::Instant::now();
-    let regions = collect_dict_regions(&pdf);
-    let elapsed = started.elapsed();
+    let walk = collect_dict_regions(&pdf);
+    let regions = &walk.regions;
     assert_eq!(regions.len(), 1 + objects);
     assert_eq!(regions[0].obj_id, Some(1));
     assert_eq!(regions[0].stream_range, Some((40, 45)));
     assert_eq!(regions[1].obj_id, Some(2));
     assert!(regions[1..].iter().all(|r| r.stream_range.is_none()));
     assert!(
-        elapsed < std::time::Duration::from_secs(5),
-        "region walk is quadratic again: {elapsed:?}"
+        walk.searched <= 4 * pdf.len(),
+        "region walk searched {} bytes of a {}-byte file",
+        walk.searched,
+        pdf.len()
     );
 }
 
@@ -385,7 +451,10 @@ fn token_between_respects_the_bound() {
     );
     assert_eq!(find_token_between(bytes, 7, 20, b"stream"), None);
     assert_eq!(find_token_between(bytes, 7, 7, b"stream"), None);
-    assert_eq!(find_token_after(b"streams stream", 0, b"stream"), Some(8));
+    assert_eq!(
+        find_token_between(b"streams stream", 0, 14, b"stream"),
+        Some(8)
+    );
 }
 
 // ------------------------------------------------------------------
@@ -411,7 +480,7 @@ fn malformed_obj_block_doesnt_crash() {
 }
 
 // ------------------------------------------------------------------
-// Metrics ported from cleave's pdf_kv module
+// Action, type and object-stream counts
 // ------------------------------------------------------------------
 
 #[test]
@@ -449,11 +518,11 @@ fn object_streams_share_one_inflate_budget() {
     for _ in 0..4 {
         pdf.extend(pdf_with_object_stream(&[b' '; 100]));
     }
-    let regions = collect_dict_regions(&pdf);
+    let regions = collect_dict_regions(&pdf).regions;
     let streams = decode_object_streams(&pdf, &regions, 250);
     let sizes: Vec<usize> = streams.decoded.iter().map(|(_, t)| t.len()).collect();
     assert_eq!(sizes, [100, 100, 50]);
-    assert_eq!(streams.skipped, 1);
+    assert_eq!(streams.over_budget, 1);
 
     // Under the budget nothing is skipped or reported.
     let (values, _) = extract_pdf(&pdf);
@@ -476,8 +545,9 @@ fn token_and_type_searches_respect_boundaries() {
     let scan = TokenScan::run(b"obj objstm endobj 1 0 obj");
     assert_eq!(scan.get(Tok::Obj).accepted, 2);
     assert!(!TokenScan::run(b"objstm").has(Tok::Obj));
-    let pages = TokenScan::run(b"/Type /Page /Type/Pages /Type/Page>>");
-    assert_eq!(pages.type_count(TypeName::Page), 2);
+    let mut pages = TypeCounts::default();
+    pages.add(b"/Type /Page /Type/Pages /Type/Page>>");
+    assert_eq!(pages.page, 2);
     assert!(TokenScan::run(b"x/AA <</AA 3 0 R>>").has(Tok::AdditionalActions));
     assert!(!TokenScan::run(b"/AAA").has(Tok::AdditionalActions));
     assert_eq!(
@@ -495,10 +565,8 @@ fn token_ids_follow_declaration_order() {
     }
 }
 
-/// The single pass counts what the per-token `memmem` passes it replaced
-/// counted. The expected values were produced by those passes (and a
-/// differential run over 200k random token soups agreed with them)
-/// before they were deleted.
+/// The single pass counts what independent per-token `memmem` searches
+/// count, on input where the patterns overlap one another.
 #[test]
 fn one_pass_matches_the_per_token_passes_on_overlapping_tokens() {
     let bytes = OVERLAPPING_TOKENS;
@@ -513,7 +581,6 @@ fn one_pass_matches_the_per_token_passes_on_overlapping_tokens() {
         (Tok::ByteRange, 2),
         (Tok::Jbig2Decode, 2),
         (Tok::FlateDecode, 3),
-        (Tok::TypeSigSpaced, 2),
     ] {
         assert_eq!(s.get(tok).all, want, "{tok:?}");
     }
@@ -540,18 +607,21 @@ fn one_pass_matches_the_per_token_passes_on_overlapping_tokens() {
         assert_eq!(s.has(tok), want, "{tok:?}");
     }
     // `/Type /<Name>` in both spellings, never `/Pages` or `/SigRef`.
-    for (name, want) in [
-        (TypeName::Page, 3),
-        (TypeName::Annot, 2),
-        (TypeName::XObject, 1),
-        (TypeName::Font, 2),
-        (TypeName::Metadata, 1),
-        (TypeName::ObjStm, 2),
-        (TypeName::XRef, 1),
-        (TypeName::Sig, 2),
-    ] {
-        assert_eq!(s.type_count(name), want, "{name:?}");
-    }
+    let mut types = TypeCounts::default();
+    types.add(bytes);
+    assert_eq!(
+        types,
+        TypeCounts {
+            page: 3,
+            annot: 2,
+            xobject: 1,
+            font: 2,
+            metadata: 1,
+            objstm: 2,
+            xref: 1,
+            sig: 2,
+        }
+    );
     // The header that leads is `%PDF-%PDF-`, which carries no version.
     assert_eq!(s.get(Tok::Header).first, Some(13));
     assert_eq!(header_version(bytes, 13), None);
@@ -568,7 +638,7 @@ fn one_pass_matches_the_per_token_passes_on_overlapping_tokens() {
             let value = s
                 .get(tok)
                 .first_accepted
-                .and_then(|at| value_after_key(bytes, at + tok.pattern().0.len()));
+                .and_then(|at| value_after_key(bytes, at + tok.bytes().len()));
             (key, value)
         })
         .collect();
@@ -611,9 +681,9 @@ fn single_pattern_runs_and_input_edges() {
     let s = TokenScan::run(b"%%EOF%%EOF%%EOF");
     assert_eq!(s.get(Tok::Eof).all, 3);
     assert_eq!(s.get(Tok::Eof).last, Some(10));
-    let s = TokenScan::run(b"/Type/Sig/Type /Sig/Type /SigX/Type/Sig_");
-    assert_eq!(s.type_count(TypeName::Sig), 2);
-    assert_eq!(s.get(Tok::TypeSigSpaced).all, 2);
+    let mut types = TypeCounts::default();
+    types.add(b"/Type/Sig/Type /Sig/Type /SigX/Type/Sig_");
+    assert_eq!(types.sig, 2);
     let s = TokenScan::run(b"/Title");
     assert_eq!(s.get(Tok::InfoTitle).first_accepted, Some(0));
     assert_eq!(value_after_key(b"/Title", 6), None);
@@ -644,7 +714,7 @@ const OVERLAPPING_TOKENS: &[u8] = b"/Title(first)%PDF-%PDF-1.4%PDF-\n\
 #[test]
 fn type_counts_include_objects_inside_object_streams() {
     // A cross-reference-stream PDF keeps its annotations and pages in a
-    // compressed ObjStm. Counting only the bytes as written reported a
+    // compressed ObjStm. Counting only the bytes as written reports a
     // document with no annotations in it, which is what a full-page link
     // to an executable hides behind.
     let pdf = pdf_with_object_stream(
@@ -873,9 +943,9 @@ fn flate_stream_object(id: u32, content: &[u8]) -> Vec<u8> {
     out
 }
 
-/// A dict repeating `/JS 2 0 R` used to inflate the same 1 MiB stream once
-/// per repeat, so a few KB of input reached hundreds of MB. The target is
-/// decoded once; the repeats are listed without its content.
+/// A dict repeating `/JS 2 0 R` names one 1 MiB stream many times; decoding
+/// it per repeat would turn a few KB of input into hundreds of MB. The
+/// target is decoded once; the repeats are listed without its content.
 #[test]
 fn repeated_js_reference_is_decoded_once() {
     let mut pdf = b"%PDF-1.5\n1 0 obj << /S /JavaScript ".to_vec();
@@ -955,9 +1025,9 @@ fn truncated_flate_stream_keeps_its_prefix() {
 }
 
 /// Objects that open a `stream` but never close with `endobj` (or never
-/// write `endstream`) made every object search to end-of-file for the
-/// missing token: thousands of them ahead of a megabyte of padding took
-/// minutes. Each search now resumes where the last one left off.
+/// write `endstream`) would make a fresh search per object run to
+/// end-of-file for the missing token. Each search resumes where the last
+/// one left off, so the padding is searched once, not once per object.
 #[test]
 fn dict_regions_are_linear_without_closing_tokens() {
     for object in [
@@ -969,13 +1039,13 @@ fn dict_regions_are_linear_without_closing_tokens() {
             pdf.extend_from_slice(object.replace("{id}", &id.to_string()).as_bytes());
         }
         pdf.extend(vec![b' '; 4 << 20]);
-        let started = std::time::Instant::now();
-        let regions = collect_dict_regions(&pdf);
-        let elapsed = started.elapsed();
-        assert_eq!(regions.len(), 5_000);
+        let walk = collect_dict_regions(&pdf);
+        assert_eq!(walk.regions.len(), 5_000);
         assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "region walk is quadratic: {elapsed:?}"
+            walk.searched <= 4 * pdf.len(),
+            "region walk searched {} bytes of a {}-byte file",
+            walk.searched,
+            pdf.len()
         );
     }
 }
@@ -987,7 +1057,7 @@ fn closing_token_search_matches_a_fresh_search() {
     let pdf = b"%PDF-1.7\n1 0 obj << >> stream\nab\nendstream endobj\n\
                 2 0 obj << >> stream\ncd\nendstream\nendobj\n\
                 3 0 obj << /Length 2 >> stream\nef\nendstream endobj\n%%EOF\n";
-    let regions = collect_dict_regions(pdf);
+    let regions = collect_dict_regions(pdf).regions;
     let bodies: Vec<&[u8]> = regions
         .iter()
         .filter_map(|r| r.stream_range)
@@ -997,32 +1067,34 @@ fn closing_token_search_matches_a_fresh_search() {
 }
 
 /// A hex string is read only as far as its hex digits go. Reading to the
-/// next `>` regardless made every `/URI <` in a dictionary scan the rest
-/// of it: quadratic in the number of sites.
+/// next `>` regardless would make every `/URI <` in a dictionary scan the
+/// rest of it: quadratic in the number of sites.
 #[test]
 fn hex_value_scan_is_linear_in_sites() {
     let mut pdf = b"%PDF-1.7\n1 0 obj\n<< ".to_vec();
     pdf.extend(b"/URI <".repeat(50_000));
     pdf.extend_from_slice(b"/URI <68 74 74 70> >>\nendobj\n%%EOF\n");
-    let started = std::time::Instant::now();
     let (v, _) = extract_pdf(&pdf);
-    let elapsed = started.elapsed();
     let actions = v.get("pdf.actions").and_then(|a| a.as_array()).unwrap();
     assert_eq!(actions.len(), 1);
     assert_eq!(actions[0]["snippet"].as_str(), Some("http"));
-    assert!(
-        elapsed < std::time::Duration::from_secs(5),
-        "hex scan is quadratic: {elapsed:?}"
-    );
+    // Each site reads its first byte past `<` and stops there: the `/`
+    // that opens the next key.
+    let mut read = 0;
+    let site = b"/URI </URI <68 74 74 70>";
+    let (decoded, closed) =
+        decode_hex(site[6..].iter().copied().inspect(|_| read += 1), usize::MAX);
+    assert_eq!((decoded.as_slice(), closed, read), (&[][..], false, 1));
     assert_eq!(read_hex_string(b"<4 1 4>", 1).as_deref(), Some("A@"));
     assert_eq!(read_hex_string(b"<41", 1), None);
     assert_eq!(read_hex_string(b"<4x>", 1), None);
     assert_eq!(read_hex_string(b"<>", 1), None);
 }
 
-/// Every action site became a ~1 KB JSON entry from as little as six
-/// input bytes, so a dictionary packed with `/URI(` grew the values tree
-/// a hundredfold. Sites past the cap are not recorded, and that is said.
+/// Every action site becomes a ~1 KB JSON entry from as little as six
+/// input bytes, so a dictionary packed with `/URI(` would grow the values
+/// tree a hundredfold. Sites past the cap are not recorded, and that is
+/// said.
 #[test]
 fn action_sites_are_capped() {
     let mut pdf = b"%PDF-1.7\n1 0 obj\n<< ".to_vec();
@@ -1041,8 +1113,8 @@ fn action_sites_are_capped() {
 }
 
 /// A literal string reads a bounded span of input: line continuations
-/// produce no output, so the 1 KB output cap alone let one site walk the
-/// whole dictionary.
+/// produce no output, so the 1 KB output cap alone would let one site walk
+/// the whole dictionary.
 #[test]
 fn literal_string_span_is_bounded() {
     let mut text = b"(".to_vec();
@@ -1050,4 +1122,107 @@ fn literal_string_span_is_bounded() {
     text.extend_from_slice(b"tail)");
     assert_eq!(read_literal_string(&text, 1), None);
     assert_eq!(read_literal_string(b"(a\\\nb)", 1).as_deref(), Some("ab"));
+}
+
+/// A PDF with one object stream `7` holding `body`, as written, under the
+/// `/Filter` value `filter` (empty for none).
+fn pdf_with_raw_object_stream(filter: &str, body: &[u8]) -> Vec<u8> {
+    let mut pdf = format!("%PDF-1.5\n7 0 obj << /Type /ObjStm /N 1 /First 0 {filter} >> stream\n")
+        .into_bytes();
+    pdf.extend_from_slice(body);
+    pdf.extend_from_slice(b"\nendstream endobj\n%%EOF\n");
+    pdf
+}
+
+fn zlib(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    enc.write_all(data).unwrap();
+    enc.finish().unwrap()
+}
+
+const OBJSTM_BODY: &[u8] = b"31 0 <</Type/Annot/S/URI/URI(https://example.invalid/x)>>";
+
+/// An object stream with no `/Filter` is its own content; inflating it as
+/// zlib regardless finds nothing in it.
+#[test]
+fn unfiltered_object_stream_is_read() {
+    let (v, m) = extract_pdf(&pdf_with_raw_object_stream("", OBJSTM_BODY));
+    assert_eq!(m.get("pdf.annotation_count"), Some(1.0));
+    assert_eq!(m.get("pdf.uri_action_count"), Some(1.0));
+    assert!(v.get("pdf.limits").is_none());
+}
+
+/// A chain is decoded outermost first: ASCIIHex, then Flate.
+#[test]
+fn ascii_hex_then_flate_object_stream_is_read() {
+    let hex: String = zlib(OBJSTM_BODY)
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect();
+    for filter in [
+        "/Filter [/ASCIIHexDecode /FlateDecode]",
+        "/Filter [/AHx /Fl]",
+    ] {
+        let pdf = pdf_with_raw_object_stream(filter, format!("{hex}>").as_bytes());
+        let (v, m) = extract_pdf(&pdf);
+        assert_eq!(m.get("pdf.annotation_count"), Some(1.0), "{filter}");
+        let actions = v.get("pdf.actions").and_then(|a| a.as_array()).unwrap();
+        assert_eq!(actions[0]["source"], "objstm:7", "{filter}");
+    }
+}
+
+/// An object stream whose chain does not decode is a recorded limit, not a
+/// silent loss.
+#[test]
+fn undecodable_object_stream_is_recorded() {
+    for (filter, body) in [
+        ("/Filter /LZWDecode", &b"\x80\x0b\x60\x50"[..]),
+        ("/Filter /FlateDecode", b"not zlib at all"),
+    ] {
+        let (v, _) = extract_pdf(&pdf_with_raw_object_stream(filter, body));
+        let limits = v.get("pdf.limits").and_then(|l| l.as_array()).unwrap();
+        assert_eq!(
+            limits[0]["stage"].as_str(),
+            Some("object-stream-decode"),
+            "{filter}"
+        );
+        assert!(
+            limits[0]["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("1 object stream"),
+            "{limits:?}"
+        );
+    }
+}
+
+#[test]
+fn decode_stream_follows_the_chain() {
+    let chain = |names: &[&str]| names.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(decode_stream(b"plain", &[], 3).unwrap(), b"pla");
+    assert_eq!(
+        decode_stream(b"48 69>", &chain(&["ASCIIHexDecode"]), 16).unwrap(),
+        b"Hi"
+    );
+    assert_eq!(
+        decode_stream(b"87cURD]j7BEbo7~>", &chain(&["A85"]), 64).unwrap(),
+        b"Hello world"
+    );
+    assert_eq!(
+        decode_stream(b"<~z@:B~>", &chain(&["ASCII85Decode"]), 64).unwrap(),
+        b"\0\0\0\0ab"
+    );
+    assert_eq!(
+        decode_stream(&zlib(b"deflated"), &chain(&["Fl"]), 64).unwrap(),
+        b"deflated"
+    );
+    assert_eq!(
+        decode_stream(b"x", &chain(&["RunLengthDecode"]), 64),
+        Err(DecodeError::Unsupported("RunLengthDecode".into()))
+    );
+    assert_eq!(
+        decode_stream(b"x", &chain(&["FlateDecode"]), 64),
+        Err(DecodeError::Corrupt)
+    );
 }

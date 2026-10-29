@@ -1,33 +1,38 @@
 //! Disk cache for filefacts analysis output.
 //!
-//! The canonical store for an [`crate::ParsedFile`]'s extraction
-//! snapshot. Its reason to exist is the rizin disassembly pass: full
-//! `aaa` recovery on a stripped binary costs seconds to minutes, and the
-//! recovered imports/exports/functions/sections land in the cached
-//! payload, so a second `open` of the same bytes never re-runs rizin.
+//! The canonical store for an [`crate::ParsedFile`]'s extraction. Its reason
+//! to exist is the rizin disassembly pass: full `aaa` recovery on a stripped
+//! binary costs seconds to minutes, and the recovered imports, exports,
+//! functions and sections land in the cached payload, so a second `open` of
+//! the same bytes never re-runs rizin.
+//!
+//! The cache is off unless the host turns it on with
+//! [`crate::OpenOptions::cache`]. Nothing here reads the environment on its
+//! own: [`env_override`] is a helper for a host that chooses to let
+//! `FILEFACTS_CACHE` decide.
 //!
 //! # Layout
 //!
 //! ```text
-//! {cache_dir}/atomdrift/filefacts/v{CACHE_SCHEMA_VERSION}/{key[0..2]}/{key}.bin
+//! {root}/v{CACHE_SCHEMA_VERSION}/{key[0..2]}/{key}.bin
 //! ```
 //!
-//! On the host platforms this resolves (via [`dirs::cache_dir`]) to the
-//! idiomatic per-OS cache root: `~/Library/Caches/atomdrift/filefacts`
-//! (macOS), `~/.cache/atomdrift/filefacts` (Linux/XDG),
-//! `%LOCALAPPDATA%\atomdrift\filefacts` (Windows). The two-character
-//! shard keeps any single directory bounded. Lookups never create
-//! directories; a shard appears with the first entry stored in it.
+//! `root` is the directory the host named with
+//! [`crate::OpenOptions::cache_dir`], or by default `atomdrift/filefacts` under
+//! the per-user cache directory ([`dirs::cache_dir`]):
+//! `~/Library/Caches` (macOS), `~/.cache` (Linux/XDG), `%LOCALAPPDATA%`
+//! (Windows). The two-character shard keeps any single directory bounded.
+//! Lookups never create directories; a shard appears with the first entry
+//! stored in it.
 //!
 //! # Format
 //!
-//! `serde_json`-encoded payload, then zstd-compressed at level 3. JSON
-//! (not a positional format like bincode) is deliberate: the cached
-//! types carry `#[serde(skip_serializing_if)]` fields, which a
-//! self-describing format round-trips correctly and a positional one
-//! silently corrupts. Writes go through a uniquely named `.tmp*` file in
-//! the shard followed by an atomic rename, so two processes hashing the
-//! same input cannot corrupt the entry.
+//! `serde_json`-encoded payload, then zstd-compressed at level 3. JSON (not a
+//! positional format like bincode) is deliberate: the cached types carry
+//! `#[serde(skip_serializing_if)]` fields, which a self-describing format
+//! round-trips correctly and a positional one silently corrupts. Writes go
+//! through a uniquely named `.tmp*` file in the shard followed by an atomic
+//! rename, so two processes hashing the same input cannot corrupt the entry.
 //!
 //! # Invalidation
 //!
@@ -44,65 +49,52 @@
 //!   [`crate::OpenOptions::rizin_fingerprint`] (whether rizin runs, its
 //!   version, native-arch slicing, the size cap).
 //!
-//! [`CACHE_SCHEMA_VERSION`] is the manual lever on top, reserved for
-//! deliberate format breaks; [`prune_old_versions`] removes superseded
-//! version dirs.
+//! `CACHE_SCHEMA_VERSION` is the manual lever on top, reserved for deliberate
+//! format breaks; a sweep removes superseded version directories.
 //!
 //! # Retention
 //!
-//! Within the current version dir the cache is bounded by entry count:
-//! [`enforce_limits`] evicts the oldest entries once the total passes
-//! [`DEFAULT_MAX_ITEMS`], down to 90% of the cap. A cache *hit* bumps an
-//! entry's mtime, so eviction is least-recently-*used*, not
-//! merely oldest-written — the same count+LRU model cleave's analysis
-//! cache uses, so the two projects bound their caches consistently.
-//! [`cleanup`] runs the sweep on a background thread — the entry point a
-//! consumer calls at startup — and an on-write trigger kicks off the same
-//! sweep when a store pushes the cache over the ceiling mid-run. The
-//! sweep also removes temp files orphaned by a writer that died before its
-//! rename. Everything here is best-effort: the cache is a performance
-//! optimisation, never a source of truth.
+//! Each version directory is bounded by entry count, total size and age (see
+//! the `sweep` module). A cache hit bumps an entry's mtime, so eviction is
+//! least-recently-*used*, not merely oldest-written. [`cleanup`] runs a routine
+//! sweep of the default root on a background thread, the entry point a host
+//! calls at startup, and a store that finds its shard over its share of the
+//! budget starts the same sweep at once. Everything here is best-effort: the
+//! cache is a performance optimisation, never a source of truth.
+
+mod sweep;
 
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
+use sweep::{Budget, Gate, Sweep};
+
 /// The `FILEFACTS_CACHE` environment setting: `Some(false)` for `0` or
 /// `false` (any case), `Some(true)` for any other value, `None` when unset.
 ///
-/// The one place filefacts reads its environment for configuration. It feeds
-/// [`crate::OpenOptions::new`]'s cache default, so an operator can turn the
-/// cache on or off for a library host without a recompile; an explicit
-/// [`crate::OpenOptions::cache`] outranks it. A host that wants the cache on
-/// unless the operator says otherwise — the `filefacts` CLI — passes
-/// `env_override().unwrap_or(true)`. Read once per process: the environment
-/// is fixed at start, and this runs once per opened file.
+/// A helper for a host that lets its operator decide whether to pass
+/// [`crate::OpenOptions::cache`]: the `filefacts` CLI passes
+/// `env_override().unwrap_or(true)`. filefacts itself never calls it.
 #[must_use]
 pub fn env_override() -> Option<bool> {
-    static ENV: OnceLock<Option<bool>> = OnceLock::new();
-    *ENV.get_or_init(|| {
-        std::env::var("FILEFACTS_CACHE")
-            .ok()
-            .map(|v| parse_env_setting(&v))
-    })
+    std::env::var("FILEFACTS_CACHE")
+        .ok()
+        .map(|v| parse_env_setting(&v))
 }
 
 fn parse_env_setting(value: &str) -> bool {
     !(value == "0" || value.eq_ignore_ascii_case("false"))
 }
 
-/// On-disk cache schema version. Bump only on a deliberate, breaking
-/// change to the on-disk *format* (not ordinary payload-field additions —
-/// the build fingerprint in the cache key already retires stale entries
-/// when extraction logic changes). Version 6 moved the payload from
-/// positional bincode to self-describing JSON and folded the build
-/// fingerprint into the key.
-pub const CACHE_SCHEMA_VERSION: u32 = 6;
+/// On-disk cache schema version. Bump only on a deliberate, breaking change
+/// to the on-disk *format*, not for payload changes: the build fingerprint in
+/// the cache key already retires stale entries when extraction logic changes.
+const CACHE_SCHEMA_VERSION: u32 = 6;
 
 /// Build identity mixed into every cache key: `{crate version}+{source
 /// hash}`, where `build.rs` hashes the crate's `src/**` and `Cargo.lock`.
@@ -116,6 +108,43 @@ const BUILD_FINGERPRINT: &str = concat!(
     env!("FILEFACTS_SOURCE_HASH")
 );
 
+/// Default ceiling on retained cache entries. On reaching it, the least
+/// recently used entries are evicted down to 90% of it.
+///
+/// Public so a host bounding a cache of its own can quote the same ceiling.
+pub const DEFAULT_MAX_ITEMS: usize = 16_384;
+
+/// The ceilings every cache version directory is kept within: 30 days unused,
+/// [`DEFAULT_MAX_ITEMS`] entries, 2 GiB. The entry count usually binds first;
+/// the byte cap bounds the case of a few very large entries.
+const BUDGET: Budget = Budget {
+    max_age: Duration::from_hours(30 * 24),
+    max_bytes: 2 * 1024 * 1024 * 1024,
+    max_entries: DEFAULT_MAX_ITEMS,
+};
+
+/// Number of two-hex-character shard directories under a version dir. Cache
+/// keys are SHA-256 hex, so entries distribute uniformly across these; the
+/// count lets a single-shard sample estimate the whole.
+const SHARD_COUNT: usize = 256;
+
+/// Largest payload, in serialised bytes, the cache stores or decodes. An
+/// entry this large is cheaper to recompute than to hold, and the bound keeps
+/// a corrupt or planted entry — a few kilobytes of zstd can claim gigabytes —
+/// from becoming an allocation the size of its claim.
+const MAX_ENTRY_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Coarse granularity for the LRU mtime bump on a cache hit. A hit only
+/// rewrites the entry's mtime when it is already older than this, so an
+/// entry read repeatedly costs at most one metadata write per window rather
+/// than one per read. A day is fine enough to order eviction candidates
+/// while leaving the common hot-entry hit a pure read.
+const LRU_TOUCH_INTERVAL: Duration = Duration::from_hours(24);
+
+/// Name prefix of the temp files a store writes through. Spelled out (it is
+/// also `tempfile`'s default) because the sweep matches on it.
+const TEMP_PREFIX: &str = ".tmp";
+
 /// Lowercase hex-encode a byte slice.
 fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -126,31 +155,19 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/// SHA-256 a byte slice, returning the lowercase hex digest.
-#[cfg(test)]
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex(&Sha256::digest(bytes))
-}
-
 /// Disk-cache key for `bytes` analysed under `variant`.
 ///
 /// Content addressing is only sound when the cached payload is a pure
-/// function of the key. Two things break that for a bare content hash,
-/// and both are folded in here:
+/// function of the key. Two things break that for a bare content hash, and
+/// both are folded in here:
 ///
-/// * the filefacts build fingerprint — extraction logic changes
-///   between builds, so a stale entry from an older filefacts must not be
-///   reused;
+/// * the filefacts build fingerprint — extraction logic changes between
+///   builds, so a stale entry from an older filefacts must not be reused;
 /// * the caller's `variant` — the detected file type plus
-///   [`crate::OpenOptions::rizin_fingerprint`] (whether rizin runs, its
-///   version, native-arch slicing, the size cap), since the *same* bytes
-///   yield different extraction under different path-assisted types or
-///   rizin configurations.
-///
-/// `variant` may be empty for a computation that never involves rizin;
-/// the build fingerprint is always mixed in regardless.
-#[must_use]
-pub(crate) fn cache_key(bytes: &[u8], variant: &str) -> String {
+///   [`crate::OpenOptions::rizin_fingerprint`], since the *same* bytes yield
+///   different extraction under different path-assisted types or rizin
+///   configurations.
+fn cache_key(bytes: &[u8], variant: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     // Domain-separated so no concatenation of (content, build, variant)
@@ -162,55 +179,50 @@ pub(crate) fn cache_key(bytes: &[u8], variant: &str) -> String {
     hex(&hasher.finalize())
 }
 
-/// `{cache_dir}/atomdrift/filefacts`, resolved once per process. Creates
+/// `atomdrift/filefacts` under the per-user cache directory, resolved once per
+/// process; `None` when there is none or it fails [`root_in`]'s check. Creates
 /// nothing below the OS cache directory.
-///
-/// The cache directory must pass [`crate::cache_sweep::trusted_dir`]: an
-/// absolute path no other user can change. Entries read from the cache are
-/// served as analysis results and its sweep deletes by path, so a root
-/// another user could redirect or write into — a relative `HOME`, a cache
-/// under a shared directory — would let them plant verdicts or aim deletes
-/// at this user's files. Such a root leaves the cache off.
-fn root_location() -> Option<&'static Path> {
+fn default_root() -> Option<&'static Path> {
     static ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
     ROOT.get_or_init(|| {
-        // filefacts' own unit tests that open with `cache(true)` must not
-        // read or write the developer's real cache: give each test process
-        // a private root, removed by nothing but the OS's temp cleanup.
-        if cfg!(test) {
-            return Some(
-                crate::cache_sweep::trusted_dir(&std::env::temp_dir())?
-                    .join(format!("filefacts-unit-cache-{}", std::process::id())),
+        let Some(base) = dirs::cache_dir() else {
+            tracing::debug!("no per-user cache directory; disk cache off");
+            return None;
+        };
+        let root = root_in(&base);
+        if root.is_none() {
+            tracing::warn!(
+                dir = %base.display(),
+                "per-user cache directory is relative, missing or writable by another user; disk cache off"
             );
         }
-        // The OS cache directory itself (`~/.cache`) may not exist yet on a
-        // fresh account; it has to before its ownership can be checked.
-        let base = dirs::cache_dir()?;
-        if !base.is_absolute() {
-            return None;
-        }
-        let _ = fs::create_dir_all(&base);
-        let base = crate::cache_sweep::trusted_dir(&base)?;
-        Some(base.join("atomdrift").join("filefacts"))
+        Some(root?.join("atomdrift").join("filefacts"))
     })
     .as_deref()
 }
 
-/// Root cache directory for filefacts. Returns the writable OS/user cache dir,
-/// or `None` when no user cache directory is available. Created and probed
-/// for writability once per process; later calls return the first answer.
-pub fn cache_root() -> Option<PathBuf> {
-    static WRITABLE: OnceLock<Option<PathBuf>> = OnceLock::new();
-    WRITABLE
-        .get_or_init(|| {
-            let root = root_location()?;
-            fs::create_dir_all(root).ok()?;
-            // An anonymous temp file: nothing to clean up, and nothing left
-            // behind if the process dies mid-probe.
-            tempfile::tempfile_in(root).ok()?;
-            Some(root.to_path_buf())
-        })
-        .clone()
+/// `dir`, created if missing and resolved, when it is safe to cache in.
+///
+/// It must pass `sweep::trusted_dir`: an absolute path no other user can
+/// change. Entries read from the cache are served as analysis results and
+/// its sweep deletes by path, so a root another user could redirect or write
+/// into — a relative `HOME`, a cache under a shared directory — would let them
+/// plant verdicts or aim deletes at this user's files. Such a root leaves the
+/// cache off.
+fn root_in(dir: &Path) -> Option<PathBuf> {
+    // A fresh account may not have its cache directory yet; it has to exist
+    // before its ownership can be checked.
+    if dir.is_absolute() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let root = sweep::trusted_dir(dir);
+    if root.is_none() {
+        tracing::debug!(
+            dir = %dir.display(),
+            "cache directory is relative, missing or writable by another user; cache skipped"
+        );
+    }
+    root
 }
 
 /// `v{CACHE_SCHEMA_VERSION}` under `root`.
@@ -218,90 +230,67 @@ fn version_location(root: &Path) -> PathBuf {
     root.join(format!("v{CACHE_SCHEMA_VERSION}"))
 }
 
-/// Where the entry for `sha_hex` lives under `root`. Pure path computation,
-/// so a lookup that misses leaves no directories behind; [`store_at_path`]
+/// Where the entry for `key` lives under `root`. Pure path computation, so a
+/// lookup that misses leaves no directories behind; [`store_at_path`]
 /// creates the shard when it writes.
-fn entry_location(root: &Path, sha_hex: &str) -> Option<PathBuf> {
-    let shard = sha_hex.get(..2)?;
+fn entry_location(root: &Path, key: &str) -> Option<PathBuf> {
+    let shard = key.get(..2)?;
     Some(
         version_location(root)
             .join(shard)
-            .join(format!("{sha_hex}.bin")),
+            .join(format!("{key}.bin")),
     )
 }
 
-/// Directory holding cache entries for the current schema version, created
-/// if missing.
-pub fn version_dir() -> Option<PathBuf> {
-    let dir = version_location(&cache_root()?);
-    fs::create_dir_all(&dir).ok()?;
-    Some(dir)
-}
-
-/// Full on-disk path for a cache entry with the given SHA-256 hex
-/// digest. Creates the two-char shard directory if missing; lookups and
-/// [`is_cached`] resolve the same path without creating anything.
-pub fn entry_path(sha_hex: &str) -> Option<PathBuf> {
-    let path = entry_location(&cache_root()?, sha_hex)?;
-    fs::create_dir_all(path.parent()?).ok()?;
-    Some(path)
-}
-
-/// Largest payload, in serialised bytes, the cache stores or decodes. An
-/// entry this large is cheaper to recompute than to hold, and the bound
-/// keeps a corrupt or planted entry — a few kilobytes of zstd can claim
-/// gigabytes — from becoming an allocation the size of its claim.
-const MAX_ENTRY_BYTES: u64 = 1024 * 1024 * 1024;
-
-/// Read one cache entry: decompress and decode it, or `None` when it is
-/// missing, unreadable, over [`MAX_ENTRY_BYTES`], or fails to deserialise
-/// (treated as a cache miss rather than an error — a bad cache file gets
-/// overwritten on the next write).
-fn load_from_path<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
-    load_capped(path, MAX_ENTRY_BYTES)
-}
-
-/// [`load_from_path`] with the size cap as a parameter.
+/// Read one cache entry: decompress and decode it. `None` when it is
+/// missing, unreadable, over `max_bytes`, or fails to deserialise: each is
+/// a cache miss rather than an error, and a bad entry is overwritten by the
+/// next store.
 fn load_capped<T: serde::de::DeserializeOwned>(path: &Path, max_bytes: u64) -> Option<T> {
     // One open serves both the read and the mtime probe that drives LRU
-    // eviction; a missing/unreadable entry is a plain cache miss.
-    let file = fs::File::open(path).ok()?;
+    // eviction.
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            tracing::debug!(path = %path.display(), %error, "cache entry unreadable");
+            return None;
+        }
+    };
     let meta = file.metadata().ok()?;
     if meta.len() > max_bytes {
+        tracing::debug!(path = %path.display(), len = meta.len(), "cache entry oversize");
         return None;
     }
     let mtime = meta.modified().ok();
     // Decode straight from the file, stopping one byte past the cap so an
     // over-long payload is told apart from one exactly at it.
     let mut decoded = Vec::new();
-    zstd::Decoder::new(file)
-        .ok()?
-        .take(max_bytes + 1)
-        .read_to_end(&mut decoded)
-        .ok()?;
-    if decoded.len() as u64 > max_bytes {
+    let read = zstd::Decoder::new(file)
+        .and_then(|decoder| decoder.take(max_bytes + 1).read_to_end(&mut decoded));
+    if let Err(error) = read {
+        tracing::debug!(path = %path.display(), %error, "cache entry corrupt");
         return None;
     }
-    // LRU: bump the entry's mtime so `enforce_limits` evicts the
-    // least-recently-*used*, not merely the oldest-written. Best-effort
-    // and relatime-style — see [`touch_lru`].
+    if decoded.len() as u64 > max_bytes {
+        tracing::debug!(path = %path.display(), "cache entry decodes past the size cap");
+        return None;
+    }
+    let value = serde_json::from_slice::<T>(&decoded)
+        .inspect_err(|error| tracing::debug!(path = %path.display(), %error, "cache entry corrupt"))
+        .ok()?;
+    // LRU: bump the entry's mtime so the sweep evicts the
+    // least-recently-*used*, not merely the oldest-written.
     if let Some(mtime) = mtime {
         touch_lru(path, mtime);
     }
-    serde_json::from_slice::<T>(&decoded).ok()
+    Some(value)
 }
 
-/// Coarse granularity for the LRU mtime bump on a cache hit. A hit only
-/// rewrites the entry's mtime when it is already older than this, so an
-/// entry read repeatedly costs at most one metadata write per window
-/// rather than one per read. A day is fine enough to order eviction
-/// candidates while leaving the common hot-entry hit a pure read.
-const LRU_TOUCH_INTERVAL: Duration = Duration::from_hours(24);
-
-/// Best-effort relatime-style LRU touch: set `path`'s mtime to now, but
-/// only when its current mtime is already at least [`LRU_TOUCH_INTERVAL`]
-/// stale. Skips the metadata write for entries used within the window and
-/// silently tolerates a read-only cache (the touch simply doesn't happen).
+/// Best-effort relatime-style LRU touch: set `path`'s mtime to now, but only
+/// when its current mtime is already at least [`LRU_TOUCH_INTERVAL`] stale.
+/// Skips the metadata write for entries used within the window and tolerates
+/// a read-only cache (the touch simply doesn't happen).
 fn touch_lru(path: &Path, current_mtime: SystemTime) {
     let now = SystemTime::now();
     if now
@@ -316,10 +305,6 @@ fn touch_lru(path: &Path, current_mtime: SystemTime) {
     }
 }
 
-/// Name prefix of the temp files [`store_at_path`] writes through. Spelled
-/// out (it is also `tempfile`'s default) because the sweep matches on it.
-const TEMP_PREFIX: &str = ".tmp";
-
 /// Create the temp file a store writes through, in the entry's shard.
 fn temp_in(dir: &Path) -> std::io::Result<tempfile::NamedTempFile> {
     tempfile::Builder::new()
@@ -327,420 +312,208 @@ fn temp_in(dir: &Path) -> std::io::Result<tempfile::NamedTempFile> {
         .tempfile_in(dir)
 }
 
-/// Encode, compress and write one cache entry atomically to an
-/// already-resolved path, creating its shard directory if needed. Best-effort
-/// — disk failures are swallowed; the cache is a performance optimisation,
-/// not a source of truth. A payload over [`MAX_ENTRY_BYTES`] is not stored,
-/// since a load would refuse it.
-fn store_at_path<T: serde::Serialize>(path: &Path, value: &T) {
-    let Ok(serialized) = serde_json::to_vec(value) else {
-        return;
-    };
+/// Why a store did not happen.
+#[derive(Debug, thiserror::Error)]
+enum StoreError {
+    #[error("serialize: {0}")]
+    Serialize(#[from] serde_json::Error),
+    #[error("payload of {0} bytes is over the entry cap")]
+    Oversize(usize),
+    #[error("i/o: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("rename: {0}")]
+    Persist(#[from] tempfile::PersistError),
+}
+
+/// Encode, compress and write one cache entry atomically to `path`, creating
+/// its shard directory if needed. A payload over [`MAX_ENTRY_BYTES`] is not
+/// stored, since a load would refuse it.
+fn store_at_path<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {
+    let serialized = serde_json::to_vec(value)?;
     if serialized.len() as u64 > MAX_ENTRY_BYTES {
-        return;
+        return Err(StoreError::Oversize(serialized.len()));
     }
-    let Ok(compressed) = zstd::encode_all(&serialized[..], 3) else {
-        return;
-    };
-    // A uniquely named sibling, not `path.with_extension("tmp")`: two
-    // processes storing the same key would otherwise write through one temp
-    // file and could rename a mix of both into place. Dropped unpersisted,
-    // the temp file deletes itself.
-    let Some(dir) = path.parent() else {
-        return;
-    };
-    if fs::create_dir_all(dir).is_err() {
-        return;
-    }
-    let Ok(mut tmp) = temp_in(dir) else {
-        return;
-    };
-    if tmp.write_all(&compressed).is_ok() {
-        let _ = tmp.persist(path);
-    }
+    let compressed = zstd::encode_all(&serialized[..], 3)?;
+    // A uniquely named sibling: two processes storing the same key would
+    // otherwise write through one temp file and could rename a mix of both
+    // into place. Dropped unpersisted, the temp file deletes itself.
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    fs::create_dir_all(dir)?;
+    let mut tmp = temp_in(dir)?;
+    tmp.write_all(&compressed)?;
+    tmp.persist(path)?;
+    Ok(())
 }
 
-/// Remove cache directories from schema versions earlier than the
-/// current one. Best-effort; failures are ignored.
-pub fn prune_old_versions() {
-    let Some(root) = root_location() else {
-        return;
-    };
-    prune_old_versions_in(root);
-}
-
-fn prune_old_versions_in(root: &std::path::Path) {
+/// Remove version directories older than the current one under `root`.
+/// Best-effort; failures are ignored.
+fn prune_old_versions(root: &Path) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
         let name = entry.file_name();
-        let Some(name_str) = name.to_str() else {
-            continue;
-        };
-        let Some(ver_str) = name_str.strip_prefix('v') else {
-            continue;
-        };
-        let Ok(ver) = ver_str.parse::<u32>() else {
-            continue;
-        };
-        if ver < CACHE_SCHEMA_VERSION {
-            let _ = fs::remove_dir_all(entry.path());
+        let superseded = name
+            .to_str()
+            .and_then(|n| n.strip_prefix('v'))
+            .and_then(|v| v.parse::<u32>().ok())
+            .is_some_and(|v| v < CACHE_SCHEMA_VERSION);
+        if superseded {
+            match fs::remove_dir_all(entry.path()) {
+                Ok(()) => {
+                    tracing::debug!(dir = %entry.path().display(), "removed superseded cache version")
+                }
+                Err(error) => tracing::debug!(
+                    dir = %entry.path().display(),
+                    %error,
+                    "could not remove superseded cache version"
+                ),
+            }
         }
     }
 }
 
-/// Number of two-hex-character shard directories under a version dir.
-/// Cache keys are SHA-256 hex, so entries distribute uniformly across
-/// these; the count lets a single-shard sample estimate the whole.
-const SHARD_COUNT: usize = 256;
-
-/// Default ceiling on retained cache entries. On reaching it, the oldest
-/// (least-recently-used) entries are evicted; see [`enforce_limits`].
+/// Start a sweep of the default cache root on a background thread, returning
+/// immediately: superseded version directories are removed and the current
+/// one is brought within its budget. The entry point a host calls at startup.
 ///
-/// Shared with [`crate::cache_sweep`] and fletch's copy of it, so every atomdrift cache
-/// quotes one ceiling.
-pub const DEFAULT_MAX_ITEMS: usize = 16_384;
-
-/// Post-eviction target as a fraction of the cap (9/10). Evicting to 90%
-/// rather than exactly to the cap stops a cache sitting at the ceiling from
-/// re-triggering a sweep on the very next store. Mirrors cleave's analysis
-/// cache so the two projects bound their caches identically.
-const EVICTION_TARGET_NUM: usize = 9;
-const EVICTION_TARGET_DEN: usize = 10;
-
-/// Entries older than this are evicted regardless of the count/byte caps, so
-/// nothing lingers forever. Uses mtime, which a cache hit bumps, so a
-/// still-used entry is never dropped for age alone. 30 days.
-const MAX_AGE: Duration = Duration::from_hours(30 * 24);
-
-/// Disk ceiling for the cache; over it, the oldest entries are evicted to 90%.
-/// The item cap usually binds first — this bounds the pathological case of a
-/// few very large entries. 2 GiB.
-const MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
-// Process-wide item cap, read by both the startup sweep and the on-write
-// trigger so a single `set_max_items` reconfigures every cleanup path.
-static MAX_ITEMS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_ITEMS);
-
-/// Set the process-wide cache item cap. A consumer that wants a larger or
-/// smaller cache calls this once at startup, before the first [`cleanup`];
-/// [`DEFAULT_MAX_ITEMS`] applies otherwise.
+/// Best-effort: a short-lived process may exit before the sweep finishes (the
+/// thread dies with the process), and the next run resumes the work. A marker
+/// in the cache keeps this to one walk a day, so repeated calls are cheap.
 ///
-/// Process-wide on purpose, unlike the per-open settings in
-/// [`crate::OpenOptions`]: the cap bounds one shared directory, which every
-/// open in the process — and every other process using the same cache —
-/// writes into. Two opens asking for different caps would only take turns
-/// evicting each other's entries; there is no per-file answer to "how big
-/// may this directory get".
-pub fn set_max_items(max_items: usize) {
-    MAX_ITEMS.store(max_items, Ordering::Relaxed);
-}
-
-/// The currently configured item cap.
-#[must_use]
-pub fn max_items() -> usize {
-    MAX_ITEMS.load(Ordering::Relaxed)
-}
-
-/// Guards against overlapping sweeps: at most one enforcement pass runs at
-/// a time, whether kicked off at startup or by an on-write trigger.
-static SWEEP_RUNNING: AtomicBool = AtomicBool::new(false);
-
-/// Prune superseded schema versions and enforce the item cap on a
-/// background thread, returning immediately. This is the entry point a
-/// consumer calls at startup — one non-blocking call covers all cleanup.
-///
-/// Best-effort: a short-lived process may exit before the sweep finishes (a
-/// detached thread dies with the process), and the next run resumes the
-/// work; a long-lived consumer always sees it through. At most one sweep
-/// runs at a time, so repeated calls are cheap no-ops while one is in flight.
-///
-/// A no-op when the operator turned the cache off (`FILEFACTS_CACHE=0`, see
-/// [`env_override`]): a run told to leave the cache alone must not delete
-/// from it either.
+/// The host decides whether to call it: one told to leave the cache alone
+/// (`FILEFACTS_CACHE=0`, see [`env_override`]) should not delete from it
+/// either.
 pub fn cleanup() {
-    if env_override() == Some(false) {
-        return;
+    if let Some(root) = default_root() {
+        spawn_sweep(root, Gate::Interval);
     }
-    spawn_sweep(max_items());
-    // Age out stng's on-disk string cache. filefacts no longer writes it (the
-    // rows live in this cache's snapshots), but earlier builds filled it and
-    // nothing else prunes it in a filefacts- or cleave-only process. Drop this
-    // once the leftovers have aged out. Best-effort, self-gated to once a day,
-    // non-blocking.
-    crate::cache_sweep::spawn(vec![crate::cache_sweep::legacy_stng_budget()]);
 }
 
-/// Claim the sweep guard and run the cleanup passes on a detached thread.
-/// Silent no-op if a sweep is already running or the thread fails to spawn.
-fn spawn_sweep(max_items: usize) {
-    if SWEEP_RUNNING
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+/// Claim `root`'s current version directory and sweep it on a detached
+/// thread. A no-op when this process is already sweeping it.
+fn spawn_sweep(root: &Path, gate: Gate) {
+    let Some(sweep) = Sweep::claim(&version_location(root)) else {
         return;
-    }
+    };
+    let root = root.to_path_buf();
+    // A thread that fails to start drops the closure, and with it the claim.
     let spawned = std::thread::Builder::new()
         .name("filefacts-cache-sweep".into())
         .spawn(move || {
-            prune_old_versions();
-            enforce_limits(max_items);
-            SWEEP_RUNNING.store(false, Ordering::Release);
+            prune_old_versions(&root);
+            sweep.run(&BUDGET, gate);
         });
-    if spawned.is_err() {
-        SWEEP_RUNNING.store(false, Ordering::Release);
+    if let Err(error) = spawned {
+        tracing::debug!(%error, "could not start the cache sweep thread");
     }
 }
 
-/// Cheap on-write trigger: after storing a fresh entry, sample only its
-/// own shard directory. A store follows a cache *miss* — i.e. an expensive
-/// compute — so one `read_dir` here is negligible, and once a sweep is
-/// running the sample is skipped entirely. If this shard alone holds well
-/// more than its uniform share of the cap, the whole cache is over the
-/// ceiling; hand off to a background sweep, which counts for real before
-/// evicting.
-fn maybe_trigger_sweep(sha_hex: &str) {
-    // Keep filefacts' own test runs from sweeping the developer's real
-    // cache as a side effect of a direct `store`/`open_with_cache` call.
-    if cfg!(test) || SWEEP_RUNNING.load(Ordering::Relaxed) {
-        return;
-    }
-    let max_items = max_items();
+/// Cheap on-write trigger: after storing an entry, count only its own shard.
+/// A store follows a cache *miss*, an expensive compute, so one `read_dir`
+/// here is negligible. If this shard alone holds well more than its uniform
+/// share of the budget, the whole cache is over it; sweep now rather than
+/// wait for the next routine sweep.
+fn maybe_trigger_sweep(root: &Path, key: &str) {
     // 1.5× the per-shard mean: enough slack that a shard crossing it
     // reliably implies the whole cache is over, not just Poisson noise.
-    let per_shard_trigger = max_items / SHARD_COUNT * 3 / 2 + 1;
-    let (Some(root), Some(shard)) = (root_location(), sha_hex.get(..2)) else {
+    let per_shard_trigger = BUDGET.max_entries / SHARD_COUNT * 3 / 2 + 1;
+    let Some(shard) = key.get(..2) else {
         return;
     };
     let count =
         fs::read_dir(version_location(root).join(shard)).map_or(0, |it| it.flatten().count());
     if count > per_shard_trigger {
-        spawn_sweep(max_items);
+        tracing::debug!(shard, count, "cache shard over its share; sweeping");
+        spawn_sweep(root, Gate::Now);
     }
 }
 
-/// Enforce the cache's bounds synchronously, best-effort (failures ignored):
-///
-/// 1. Drop entries older than the 30-day TTL. mtime is
-///    least-recently-*used* — a cache hit bumps it — so a still-used
-///    entry is never dropped for age alone.
-/// 2. If the cache still exceeds `max_items` entries or the on-disk byte cap,
-///    evict the oldest until both are within 90% of their caps.
-///
-/// Temp files older than 15 minutes are removed along the way: they were
-/// left by a writer that died before its rename.
-///
-/// The cache key folds in the build fingerprint, so every change to
-/// filefacts' source orphans the previous build's entries; because those
-/// orphans are never read again their mtime never advances, so they age out
-/// and are evicted first. Prefer [`cleanup`], which runs this off the hot
-/// path.
-pub fn enforce_limits(max_items: usize) {
-    let Some(root) = root_location() else {
-        return;
-    };
-    enforce_limits_in(&version_location(root), max_items, MAX_BYTES);
-}
-
-/// A temp file this old was orphaned by a writer that died before its
-/// rename: a live store creates, writes and renames it within moments.
-const ORPHANED_TEMP_AGE: Duration = Duration::from_mins(15);
-
-/// Whether `name` is a store's temp file: [`TEMP_PREFIX`], or the
-/// `{key}.tmp` sibling that builds before the uniquely named temp files
-/// wrote into the same version dir.
-fn is_temp_name(name: &std::ffi::OsStr) -> bool {
-    name.to_str().is_some_and(|n| {
-        n.starts_with(TEMP_PREFIX) || n.rsplit_once('.').is_some_and(|(_, ext)| ext == "tmp")
-    })
-}
-
-fn enforce_limits_in(version_dir: &Path, max_items: usize, max_bytes: u64) {
-    let Ok(shards) = fs::read_dir(version_dir) else {
-        return;
-    };
-    let now = SystemTime::now();
-    // One transient (path, mtime, bytes) per live entry — a few MB at the
-    // default ceiling, freed as soon as the sweep returns.
-    let mut entries: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
-    for shard in shards.flatten() {
-        // `file_type` does not follow symlinks: a shard that is a link
-        // points outside the cache, and its `*.bin`/`*.tmp` files are not
-        // ours to evict.
-        if !shard.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
-        let Ok(files) = fs::read_dir(shard.path()) else {
-            continue;
-        };
-        for file in files.flatten() {
-            let path = file.path();
-            let is_entry = path.extension().is_some_and(|ext| ext == "bin");
-            let is_temp = !is_entry && is_temp_name(&file.file_name());
-            // Manage finished entries and temp files; leave any stray
-            // non-entry file alone.
-            if !is_entry && !is_temp {
-                continue;
-            }
-            let Ok(meta) = file.metadata() else {
-                continue;
-            };
-            let Ok(mtime) = meta.modified() else {
-                continue;
-            };
-            if is_entry {
-                entries.push((path, mtime, meta.len()));
-            } else if now.duration_since(mtime).unwrap_or_default() > ORPHANED_TEMP_AGE {
-                // A recent temp file may be an in-flight write; keep it.
-                let _ = fs::remove_file(&path);
-            }
-        }
-    }
-
-    // Age pass: drop anything past the TTL outright, whatever the counts.
-    entries.retain(|(path, mtime, _)| {
-        if now.duration_since(*mtime).unwrap_or_default() > MAX_AGE {
-            let _ = fs::remove_file(path);
-            false
-        } else {
-            true
-        }
-    });
-
-    // Count/byte pass: over either ceiling → evict oldest to 90% of both.
-    let mut total_bytes: u64 = entries.iter().map(|&(_, _, bytes)| bytes).sum();
-    if entries.len() > max_items || total_bytes > max_bytes {
-        // Oldest (least-recently-used) first.
-        entries.sort_unstable_by_key(|&(_, mtime, _)| mtime);
-        // Divide before multiplying so a huge `max_items` (e.g. `set_max_items`
-        // with `usize::MAX`) can't overflow; mirrors `byte_target` below.
-        let count_target = max_items / EVICTION_TARGET_DEN * EVICTION_TARGET_NUM;
-        let byte_target = max_bytes / 10 * 9;
-        let mut count = entries.len();
-        for (path, _, bytes) in &entries {
-            if count <= count_target && total_bytes <= byte_target {
-                break;
-            }
-            if fs::remove_file(path).is_ok() {
-                count -= 1;
-                total_bytes = total_bytes.saturating_sub(*bytes);
-            }
-        }
-    }
-}
-
-/// Whether a freshly computed payload may be persisted to disk.
+/// A freshly computed payload, tagged with whether it may be persisted.
 ///
 /// Content addressing is only sound when the computation is reproducible
-/// from the key. Most degradation in optional disassembly is *stable*
-/// for a given environment and settings (rizin absent or turned off, a
-/// specific version, native-arch slicing, the size cap) and is handled by
-/// the cache key's `variant`. What remains are *transient* conditions —
-/// rizin timed out, was killed on the output cap, or turned itself off
-/// after too many abandoned output readers. A payload produced under one of those is still usable for the
-/// current call but must not be written: persisting it would poison the
-/// entry, and every later run — whatever its own rizin setup — would
-/// reuse the degraded result.
-///
-/// `compute` returns [`Cacheable`](Self::Cacheable) for a result that is
-/// reproducible from the key, and [`Transient`](Self::Transient) for one
-/// that should be returned to the caller but never stored.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Computed<T> {
+/// from the key. Most degradation in optional disassembly is *stable* for a
+/// given environment and settings (rizin absent or turned off, a specific
+/// version, native-arch slicing, the size cap) and is handled by the cache
+/// key's `variant`. What remains are *transient* conditions — rizin timed
+/// out, was killed on the output cap, or turned itself off after too many
+/// abandoned output readers; a source parse stopped by its wall-clock
+/// backstop or cancelled. A payload produced under one of those is still
+/// usable for the current call but must not be written: persisting it would
+/// poison the entry for every later run.
+#[derive(Debug)]
+pub(crate) enum Computed<T> {
     /// Reproducible from the key — store it and return it.
     Cacheable(T),
     /// Produced under a transient condition — return it, don't store it.
     Transient(T),
 }
 
-impl<T> Computed<T> {
-    /// The wrapped value, discarding the persistability tag.
-    #[must_use]
-    pub fn into_inner(self) -> T {
-        match self {
-            Computed::Cacheable(v) | Computed::Transient(v) => v,
-        }
-    }
-}
-
-/// Open `bytes` through the disk cache: key → lookup → on miss, run
-/// `compute` and store the result *if it is [`Computed::Cacheable`]*.
-/// Returns the cached or freshly computed value, or `None` when
-/// `compute` itself returns `None`.
+/// Open `bytes` through the disk cache: key → lookup → on a miss, run
+/// `compute` and store the result if it is [`Computed::Cacheable`].
 ///
-/// `variant` discriminates inputs whose correct analysis depends on the
-/// environment — pass [`crate::OpenOptions::rizin_fingerprint`], or `""` when
-/// the computation never involves rizin. A [`Computed::Transient`]
-/// result is returned to the caller but never written, so a degraded
-/// rizin run (timeout, output-cap kill) cannot poison
-/// the entry for a later healthy run.
-///
-/// The cache key includes the schema version implicitly (it lives in
-/// a versioned subdirectory). Callers do not need to vary the key on
-/// schema bumps.
-pub fn open_with_cache<T, F>(bytes: &[u8], variant: &str, compute: F) -> Option<T>
-where
-    T: serde::Serialize + serde::de::DeserializeOwned,
-    F: FnOnce(&[u8]) -> Option<Computed<T>>,
-{
-    open_with_cache_in(
-        bytes,
-        variant,
-        |key| entry_location(root_location()?, key),
-        maybe_trigger_sweep,
-        compute,
-    )
-}
-
-fn open_with_cache_in<T, F, P, S>(
+/// `dir` is the host's cache root ([`crate::OpenOptions::cache_dir`]), or
+/// `None` for the per-user default. When the root is unusable the cache is
+/// skipped and `compute` runs. `variant` discriminates inputs whose correct
+/// analysis depends on more than the bytes (see [`cache_key`]).
+pub(crate) fn open_with_cache<T, F>(
+    dir: Option<&Path>,
     bytes: &[u8],
     variant: &str,
-    path_for: P,
-    after_store: S,
     compute: F,
-) -> Option<T>
+) -> T
 where
     T: serde::Serialize + serde::de::DeserializeOwned,
-    F: FnOnce(&[u8]) -> Option<Computed<T>>,
-    P: FnOnce(&str) -> Option<PathBuf>,
-    S: FnOnce(&str),
+    F: FnOnce() -> Computed<T>,
 {
-    let key = cache_key(bytes, variant);
-    let path = path_for(&key);
-    if let Some(cached) = path.as_deref().and_then(load_from_path::<T>) {
-        return Some(cached);
-    }
-    match compute(bytes)? {
-        Computed::Cacheable(value) => {
-            if let Some(path) = path {
-                store_at_path(&path, &value);
-            }
-            // A store means the cache just grew; cheaply check whether it
-            // has crossed the item ceiling and, if so, sweep in the
-            // background. Kept out of `store` so a direct `store` call
-            // (e.g. in tests) has no cleanup side effect.
-            after_store(&key);
-            Some(value)
-        }
-        Computed::Transient(value) => Some(value),
+    let root = match dir {
+        Some(dir) => root_in(dir),
+        None => default_root().map(Path::to_path_buf),
+    };
+    match root {
+        Some(root) => open_with_cache_in(&root, bytes, variant, compute),
+        None => match compute() {
+            Computed::Cacheable(value) | Computed::Transient(value) => value,
+        },
     }
 }
 
-/// Best-effort cache-entry path predicate. Returns `true` when a cached
-/// entry for the given bytes under `variant` already exists on disk.
-/// Creates no cache entry or shard.
-pub fn is_cached(bytes: &[u8], variant: &str) -> bool {
-    root_location()
-        .and_then(|root| entry_location(root, &cache_key(bytes, variant)))
-        .is_some_and(|p| p.exists())
+/// [`open_with_cache`] under an already-resolved `root`.
+fn open_with_cache_in<T, F>(root: &Path, bytes: &[u8], variant: &str, compute: F) -> T
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+    F: FnOnce() -> Computed<T>,
+{
+    let key = cache_key(bytes, variant);
+    let path = entry_location(root, &key);
+    if let Some(cached) = path
+        .as_deref()
+        .and_then(|path| load_capped::<T>(path, MAX_ENTRY_BYTES))
+    {
+        tracing::debug!(key, "cache hit");
+        return cached;
+    }
+    tracing::debug!(key, "cache miss");
+    match compute() {
+        Computed::Cacheable(value) => {
+            if let Some(path) = path {
+                match store_at_path(&path, &value) {
+                    Ok(()) => maybe_trigger_sweep(root, &key),
+                    Err(error) => tracing::debug!(key, %error, "cache store failed"),
+                }
+            }
+            value
+        }
+        Computed::Transient(value) => {
+            tracing::debug!(key, "transient result; not stored");
+            value
+        }
+    }
 }
 
 #[cfg(test)]

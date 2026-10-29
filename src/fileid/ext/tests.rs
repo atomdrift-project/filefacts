@@ -1,5 +1,9 @@
 use super::*;
 
+fn detect_from_path(path: &Path) -> Option<FileType> {
+    claim(path).map(|c| c.file_type)
+}
+
 #[test]
 fn autorun_config_carriers_are_typed() {
     // `.code-workspace` is JSONC with a possible folder-open `tasks` block.
@@ -345,16 +349,56 @@ fn unknown_extension() {
 }
 
 #[test]
-fn data_formats_blocked() {
-    assert!(is_data_format(Path::new("config.yaml")));
-    assert!(is_data_format(Path::new("data.json")));
-    assert!(is_data_format(Path::new("evil.service")));
-    assert!(is_data_format(Path::new("notes.txt")));
-    assert!(is_data_format(Path::new("package/parse.ts.map")));
-    assert!(!is_data_format(Path::new("script.py")));
-    assert!(!is_data_format(Path::new("binary")));
+fn claim_strengths_follow_the_type_table() {
+    let strength = |name: &str| claim(Path::new(name)).map(|c| c.strength);
+    for name in [
+        "config.yaml",
+        "data.json",
+        "evil.service",
+        "package/parse.ts.map",
+        "package.json",
+    ] {
+        assert_eq!(strength(name), Some(Strength::Named), "{name}");
+    }
+    assert_eq!(strength("README.md"), Some(Strength::Document));
+    assert_eq!(strength("index.html"), Some(Strength::Page));
+    for name in ["notes.txt", "payload.bin", "Makefile", "LICENSE.txt"] {
+        assert_eq!(strength(name), Some(Strength::Weak), "{name}");
+    }
+    for name in ["script.py", "style.css", "settings.toml"] {
+        assert_eq!(strength(name), Some(Strength::Language), "{name}");
+    }
+    assert_eq!(strength("font.woff2"), Some(Strength::Container));
+    assert_eq!(strength("tool.exe"), Some(Strength::MagicDefined));
+    assert_eq!(strength("binary"), None);
 }
 
+#[test]
+fn variant_letter_after_a_dotted_family_name_is_no_claim() {
+    let strength = |name: &str| claim(Path::new(name)).map(|c| (c.file_type, c.strength));
+    assert_eq!(
+        strength("Backdoor.PHP.Agent.bb"),
+        Some((FileType::Clojure, Strength::Weak))
+    );
+    assert_eq!(
+        strength("Trojan.BAT.Looper.t"),
+        Some((FileType::Perl, Strength::Weak))
+    );
+    // Dotted names from source trees keep their claims.
+    for name in [
+        "jquery.min.js",
+        "app.component.spec.ts",
+        "script.bb",
+        "Foo.m",
+        "Foo.Bar.java",
+    ] {
+        assert_eq!(
+            strength(name).map(|(_, s)| s),
+            Some(Strength::Language),
+            "{name}"
+        );
+    }
+}
 #[test]
 fn case_insensitive_extension() {
     assert_eq!(
@@ -401,9 +445,10 @@ fn source_alias_extensions() {
 
 #[test]
 fn filename_match_flag() {
-    assert!(is_filename_match(Path::new("package.json")));
-    assert!(!is_filename_match(Path::new("script.py")));
-    assert!(is_filename_match(Path::new(".github/workflows/ci.yml")));
+    let by_name = |name: &str| claim(Path::new(name)).is_some_and(|c| c.by_name);
+    assert!(by_name("package.json"));
+    assert!(!by_name("script.py"));
+    assert!(by_name(".github/workflows/ci.yml"));
 }
 
 #[test]
@@ -419,8 +464,21 @@ fn ooxml_extensions() {
 }
 
 #[test]
-fn erlang_returns_none() {
-    assert_eq!(detect_from_path(Path::new("app.erl")), None);
+fn analyzer_less_languages_and_configs_are_named_text() {
+    for name in [
+        "app.erl",
+        "app.hrl",
+        "rc.elv",
+        "config.nu",
+        "x.toml",
+        "x.conf",
+    ] {
+        assert_eq!(
+            claim(Path::new(name)),
+            Some(Claim::text_language()),
+            "{name}"
+        );
+    }
 }
 
 #[test]

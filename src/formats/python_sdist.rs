@@ -11,10 +11,11 @@
 //! Decompression stops as soon as `<root>/PKG-INFO` is reached, so a
 //! multi-megabyte sdist is rarely fully inflated just to read one manifest.
 
+use super::people::{self, Person};
 use serde_json::Value as JsonValue;
 
 use super::bounded::{
-    MAX_TARGZ_SEARCH, MemberFailure, TarGzSearch, find_targz_member, push_limit, utf8_prefix,
+    Limits, MAX_TARGZ_SEARCH, MemberFailure, TarGzSearch, find_targz_member, utf8_prefix,
 };
 use crate::error::Error;
 use crate::fileid::FileType;
@@ -58,12 +59,12 @@ fn pkg_info(bytes: &[u8], values: &mut Values) -> Result<Option<String>, MemberF
         Ok(TarGzSearch::Found { path, prefix }) => (path, prefix),
         Ok(TarGzSearch::Absent) => return Ok(None),
         Ok(TarGzSearch::InflateCapped) => {
-            push_limit(
-                values,
-                value_key!("python.limits"),
+            let mut limits = Limits::default();
+            limits.push(
                 "pkg-info-search",
                 format!("no {SOUGHT} in the first {MAX_TARGZ_SEARCH} inflated bytes"),
             );
+            limits.emit(values, value_key!("python.limits"));
             return Ok(None);
         }
         Err(e) => return Err(e.into_failure(Stage::TarParse, SOUGHT)),
@@ -75,7 +76,7 @@ fn pkg_info(bytes: &[u8], values: &mut Values) -> Result<Option<String>, MemberF
 
 /// Emit `python.*` identity values from a parsed `PKG-INFO` header block.
 fn emit(text: &str, values: &mut Values) {
-    let headers = Headers::parse(text);
+    let headers = CoreMetadata::parse(text);
     let set = |values: &mut Values, key: ValueKey, field: &str| {
         if let Some(v) = headers.first(field) {
             values.insert_key(key, JsonValue::String(v.to_string()));
@@ -83,7 +84,7 @@ fn emit(text: &str, values: &mut Values) {
     };
     set(values, value_key!("python.name"), "name");
     set(values, value_key!("python.version"), "version");
-    set(values, value_key!("python.summary"), "summary");
+    set(values, value_key!("python.description"), "summary");
     set(values, value_key!("python.license"), "license");
     set(values, value_key!("python.homepage"), "home-page");
     set(
@@ -92,72 +93,87 @@ fn emit(text: &str, values: &mut Values) {
         "requires-python",
     );
 
-    emit_person(&headers, "author", values, value_key!("python.author"));
-    emit_person(
+    emit_people(
         &headers,
-        "maintainer",
         values,
-        value_key!("python.maintainer"),
+        value_key!("python.authors"),
+        value_key!("python.maintainers"),
     );
 }
 
-/// Emit a `<key>.name` / `<key>.email` pair from the `<role>` /
-/// `<role>-email` headers. Modern `PKG-INFO` often carries the name only in
-/// the `*-email` header's `"Name <email>"` form, so the name falls back to
-/// that when the plain `<role>` header is absent.
-fn emit_person(headers: &Headers, role: &str, values: &mut Values, key: ValueKey) {
-    let email_field = format!("{role}-email");
-    let raw_email = headers.first(&email_field);
-    let email = raw_email.and_then(extract_email);
-    let name = headers
-        .first(role)
-        .map(str::to_string)
-        .or_else(|| raw_email.and_then(strip_email));
-    if let Some(name) = name.filter(|n| !n.is_empty()) {
-        values.insert_key_at(key, "name", JsonValue::String(name));
+/// The people a Core Metadata block names in its `<role>` and
+/// `<role>-email` headers. PEP 621 writes several as comma-separated lists,
+/// `"A <a@x>, B <b@x>"` in the email header, so the two lists pair up when
+/// they are the same length; otherwise each entry stands alone. `UNKNOWN`,
+/// setuptools' placeholder for a field the author left out, names nobody.
+fn core_metadata_people(headers: &CoreMetadata, role: &str) -> Vec<Person> {
+    let list = |field: &str| -> Vec<&str> {
+        headers
+            .first(field)
+            .into_iter()
+            .flat_map(|v| v.split(','))
+            .map(str::trim)
+            .filter(|v| !v.is_empty() && *v != "UNKNOWN")
+            .collect()
+    };
+    let names = list(role);
+    let emails = list(&format!("{role}-email"));
+    if names.len() == emails.len() {
+        return names
+            .iter()
+            .zip(&emails)
+            .map(|(name, email)| Person::from_fields(Some(name), Some(email)))
+            .collect();
     }
-    if let Some(email) = email {
-        values.insert_key_at(key, "email", JsonValue::String(email));
-    }
+    names
+        .iter()
+        .map(|name| Person::from_fields(Some(name), None))
+        .chain(
+            emails
+                .iter()
+                .map(|email| Person::from_fields(None, Some(email))),
+        )
+        .collect()
 }
 
-/// Pull the address out of an `"Name <email>"` string, or accept a bare
-/// address when it looks like one (`contains('@')`).
-fn extract_email(s: &str) -> Option<String> {
-    if let (Some(start), Some(end)) = (s.find('<'), s.find('>')) {
-        if start < end {
-            let inner = s[start + 1..end].trim();
-            return (!inner.is_empty()).then(|| inner.to_string());
-        }
-    }
-    let s = s.trim();
-    (s.contains('@') && !s.contains(' ')).then(|| s.to_string())
+/// Publish a Core Metadata block's authors and maintainers under `authors`
+/// and `maintainers`.
+pub(super) fn emit_people(
+    headers: &CoreMetadata,
+    values: &mut Values,
+    authors: ValueKey,
+    maintainers: ValueKey,
+) {
+    people::put(values, authors, core_metadata_people(headers, "author"));
+    people::put(
+        values,
+        maintainers,
+        core_metadata_people(headers, "maintainer"),
+    );
 }
 
-/// The display name from an `"Name <email>"` string (the part before `<`).
-fn strip_email(s: &str) -> Option<String> {
-    let name = s.split('<').next().unwrap_or("").trim();
-    (!name.is_empty()).then(|| name.to_string())
+/// A Python Core Metadata header block (`PKG-INFO`, a wheel's `METADATA`):
+/// RFC 822 fields in file order, names lowercased, a field repeated once per
+/// occurrence. A folded (continuation) line joins the field before it on a
+/// newline; the block ends at the first blank line, which begins the long
+/// description. The one parser for every Core Metadata reader.
+pub(super) struct CoreMetadata {
+    pub(super) fields: Vec<(String, String)>,
 }
 
-/// A parsed RFC 822 header block: lowercased field name → first value.
-/// Continuation (folded) lines are appended to the current field; parsing
-/// stops at the first blank line, which begins the long-description body.
-struct Headers {
-    fields: Vec<(String, String)>,
-}
-
-impl Headers {
-    fn parse(text: &str) -> Self {
+impl CoreMetadata {
+    pub(super) fn parse(text: &str) -> Self {
         let mut fields: Vec<(String, String)> = Vec::new();
         for line in text.lines() {
             if line.is_empty() {
                 break; // end of headers; body follows
             }
             if line.starts_with([' ', '\t']) {
-                if let Some(last) = fields.last_mut() {
-                    last.1.push(' ');
-                    last.1.push_str(line.trim());
+                if let Some((_, value)) = fields.last_mut() {
+                    if !value.is_empty() {
+                        value.push('\n');
+                    }
+                    value.push_str(line.trim());
                 }
                 continue;
             }
@@ -168,7 +184,8 @@ impl Headers {
         Self { fields }
     }
 
-    fn first(&self, field: &str) -> Option<&str> {
+    /// The first non-empty value of `field`, lowercase.
+    pub(super) fn first(&self, field: &str) -> Option<&str> {
         self.fields
             .iter()
             .find(|(k, _)| k == field)
@@ -178,155 +195,4 @@ impl Headers {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write;
-
-    /// A gzipped tar holding the given members.
-    fn tgz(members: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut tar = tar::Builder::new(Vec::new());
-        for (path, body) in members {
-            let mut h = tar::Header::new_ustar();
-            h.set_path(path).unwrap();
-            h.set_size(body.len() as u64);
-            h.set_mode(0o644);
-            h.set_cksum();
-            tar.append(&h, *body).unwrap();
-        }
-        let tar = tar.into_inner().unwrap();
-        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        gz.write_all(&tar).unwrap();
-        gz.finish().unwrap()
-    }
-
-    fn run(bytes: &[u8]) -> (Values, Errors) {
-        let mut v = Values::new();
-        let mut e = Errors::new();
-        extract(
-            bytes,
-            FileType::PythonSdist,
-            &mut v,
-            &mut Metrics::new(),
-            &mut Vec::new(),
-            &mut e,
-        )
-        .unwrap();
-        (v, e)
-    }
-
-    /// The one recorded error's stage and kind.
-    fn only_error(errors: &Errors) -> (Stage, crate::DiagnosticKind) {
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        (errors.as_slice()[0].stage, errors.as_slice()[0].kind)
-    }
-
-    #[test]
-    fn tarball_pkg_info_is_read_and_records_nothing() {
-        let (v, e) = run(&tgz(&[("demo-1.0/PKG-INFO", b"Name: demo\n")]));
-        assert!(e.is_empty(), "{e:?}");
-        assert_eq!(
-            v.get("python.name").and_then(JsonValue::as_str),
-            Some("demo")
-        );
-        // An sdist without a root PKG-INFO is not a failure.
-        let (_, e) = run(&tgz(&[("demo-1.0/setup.py", b"#")]));
-        assert!(e.is_empty(), "{e:?}");
-    }
-
-    #[test]
-    fn pkg_info_that_is_not_utf8_records_one_error() {
-        let (v, e) = run(&tgz(&[("demo-1.0/PKG-INFO", b"Name: d\xe9mo\n")]));
-        assert_eq!(
-            only_error(&e),
-            (Stage::FormatExtract, crate::DiagnosticKind::Malformed)
-        );
-        assert!(v.get("python.name").is_none());
-    }
-
-    #[test]
-    fn corrupt_gzip_stream_records_one_tar_parse_error() {
-        let mut bytes = tgz(&[("demo-1.0/PKG-INFO", b"Name: demo\n")]);
-        for b in &mut bytes[10..] {
-            *b ^= 0x5a;
-        }
-        let (_, e) = run(&bytes);
-        assert_eq!(
-            only_error(&e),
-            (Stage::TarParse, crate::DiagnosticKind::Malformed)
-        );
-    }
-
-    /// Past the cap, the header block is still read, even when the cut lands
-    /// inside a multi-byte character.
-    #[test]
-    fn oversized_pkg_info_is_read_up_to_the_cap() {
-        for body_start in ["", "x"] {
-            let mut meta = format!("Name: demo\nVersion: 1\n\n{body_start}").into_bytes();
-            while meta.len() as u64 <= MAX_MANIFEST {
-                meta.extend_from_slice("\u{e9}".as_bytes());
-            }
-            let (v, e) = run(&tgz(&[("demo-1.0/PKG-INFO", &meta)]));
-            assert!(e.is_empty(), "{e:?}");
-            assert_eq!(
-                v.get("python.name").and_then(JsonValue::as_str),
-                Some("demo")
-            );
-        }
-    }
-
-    #[test]
-    fn emits_name_version_and_author_email() {
-        let text = "Metadata-Version: 2.1\n\
-                    Name: requests\n\
-                    Version: 2.31.0\n\
-                    Summary: Python HTTP for Humans.\n\
-                    Home-page: https://requests.readthedocs.io\n\
-                    Author: Kenneth Reitz\n\
-                    Author-email: me@kennethreitz.org\n\
-                    License: Apache 2.0\n\
-                    \n\
-                    long description body: Name: not-a-header\n";
-        let mut values = Values::new();
-        emit(text, &mut values);
-        assert_eq!(
-            values.get("python.name").and_then(JsonValue::as_str),
-            Some("requests")
-        );
-        assert_eq!(
-            values.get("python.version").and_then(JsonValue::as_str),
-            Some("2.31.0")
-        );
-        assert_eq!(
-            values.get("python.author.name").and_then(JsonValue::as_str),
-            Some("Kenneth Reitz")
-        );
-        assert_eq!(
-            values
-                .get("python.author.email")
-                .and_then(JsonValue::as_str),
-            Some("me@kennethreitz.org")
-        );
-        // The body after the blank line must not leak in as a header.
-        assert_eq!(
-            values.get("python.name").and_then(JsonValue::as_str),
-            Some("requests")
-        );
-    }
-
-    #[test]
-    fn author_email_in_name_angle_form() {
-        let text = "Name: x\nAuthor-email: Jane Doe <jane@example.com>\n";
-        let mut values = Values::new();
-        emit(text, &mut values);
-        assert_eq!(
-            values.get("python.author.name").and_then(JsonValue::as_str),
-            Some("Jane Doe")
-        );
-        assert_eq!(
-            values
-                .get("python.author.email")
-                .and_then(JsonValue::as_str),
-            Some("jane@example.com")
-        );
-    }
-}
+mod tests;

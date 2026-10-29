@@ -197,13 +197,13 @@ pub(super) fn scan(bytes: &[u8]) -> Syntax {
             }
             continue;
         }
-        if markup.in_output() && byte == b'#' {
+        if markup.output_depth > 0 && byte == b'#' {
             if bytes.get(at + 1) == Some(&b'#') {
                 at += 2;
                 continue;
             }
             let begin = at + 1;
-            let inside_tag = markup.inside_tag(at);
+            let inside_tag = at < markup.control_until;
             at += 1;
             if !interpolation(bytes, &mut at) {
                 out.limitation = Some(Limit::Truncated);
@@ -277,13 +277,14 @@ pub(super) fn scan(bytes: &[u8]) -> Syntax {
             out.limitation = Some(Limit::Tags);
             return out;
         }
-        out.tags.push(Tag {
+        let tag = Tag {
             name: name_start..name_end,
             body: body_start..at,
             span: start..at + 1,
             closing,
-        });
-        markup.cf_tag(bytes, out.tags.last().unwrap());
+        };
+        markup.cf_tag(bytes, &tag);
+        out.tags.push(tag);
         at += 1;
         if !closing
             && bytes
@@ -313,9 +314,23 @@ pub(super) struct Attribute {
     pub quoted: bool,
 }
 
-// A malformed or duplicate attribute invalidates the whole tag. Consumers
-// must not make a call from a partially recognized argument list.
-pub(super) fn attributes(bytes: &[u8], tag: &Tag) -> Option<Vec<Attribute>> {
+/// The attribute syntax a tag is read with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Dialect {
+    /// CFML tags: every attribute has a value, quotes double to escape
+    /// themselves, and `#…#` always interpolates.
+    Cfml,
+    /// HTML tags: boolean attributes are allowed and quotes do not escape.
+    /// `#…#` interpolates only while an enclosing CFOUTPUT is active.
+    Html { interpolate: bool },
+}
+
+const MAX_ATTRIBUTES: usize = 64;
+
+/// The attributes of `tag`, in source order. A malformed or duplicate
+/// attribute invalidates the whole tag: a consumer must not make a call from a
+/// partially recognized argument list.
+pub(super) fn attributes(bytes: &[u8], tag: &Tag, dialect: Dialect) -> Option<Vec<Attribute>> {
     let mut out: Vec<Attribute> = Vec::new();
     let mut at = tag.body.start;
     let end = tag.body.end;
@@ -324,6 +339,13 @@ pub(super) fn attributes(bytes: &[u8], tag: &Tag) -> Option<Vec<Attribute>> {
     if at > end {
         return None;
     }
+    let name_byte = |b: &u8| match dialect {
+        Dialect::Cfml => b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'),
+        Dialect::Html { .. } => {
+            !b.is_ascii_whitespace()
+                && !matches!(b, b'=' | b'/' | b'>' | b'\'' | b'"' | b'<' | b'`')
+        }
+    };
     while at < end {
         while body.get(at).is_some_and(u8::is_ascii_whitespace) {
             at += 1;
@@ -331,14 +353,11 @@ pub(super) fn attributes(bytes: &[u8], tag: &Tag) -> Option<Vec<Attribute>> {
         if at == end || (at + 1 == end && body.get(at) == Some(&b'/')) {
             break;
         }
-        if out.len() == 64 {
+        if out.len() == MAX_ATTRIBUTES {
             return None;
         }
         let begin = at;
-        while body
-            .get(at)
-            .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
-        {
+        while body.get(at).is_some_and(name_byte) {
             at += 1;
         }
         if at == begin {
@@ -355,266 +374,103 @@ pub(super) fn attributes(bytes: &[u8], tag: &Tag) -> Option<Vec<Attribute>> {
         while body.get(at).is_some_and(u8::is_ascii_whitespace) {
             at += 1;
         }
-        if bytes.get(at) != Some(&b'=') {
-            return None;
+        if body.get(at) != Some(&b'=') {
+            if dialect == Dialect::Cfml {
+                return None;
+            }
+            out.push(Attribute {
+                name,
+                value: at..at,
+                quoted: false,
+            });
+            continue;
         }
         at += 1;
         while body.get(at).is_some_and(u8::is_ascii_whitespace) {
             at += 1;
         }
         let &first = body.get(at)?;
-        let is_quoted = matches!(first, b'\'' | b'"');
-
-        let value = if is_quoted {
-            let begin = at + 1;
-            if !quoted(body, &mut at) {
-                return None;
-            }
-            begin..at - 1
-        } else {
-            let begin = at;
-            while let Some(&b) = body.get(at)
-                && !b.is_ascii_whitespace()
-            {
-                if b == b'#' {
-                    at += 1;
-                    if !interpolation(body, &mut at) {
-                        return None;
-                    }
-                } else {
-                    at += 1;
-                }
-            }
-            begin..at
+        let quote = matches!(first, b'\'' | b'"').then_some(first);
+        let value = match dialect {
+            Dialect::Cfml => cfml_value(body, &mut at, quote.is_some())?,
+            Dialect::Html { interpolate } => html_value(body, &mut at, quote, interpolate)?,
         };
-        if body
-            .get(at)
-            .is_some_and(|b| !b.is_ascii_whitespace() && *b != b'/')
+        if quote.is_some()
+            && body
+                .get(at)
+                .is_some_and(|b| !b.is_ascii_whitespace() && *b != b'/')
         {
             return None;
         }
         out.push(Attribute {
             name,
             value,
-            quoted: is_quoted,
+            quoted: quote.is_some(),
         });
     }
     Some(out)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn exact_offsets_case_and_closing_tags() {
-        let b = b"abc<CFEXECUTE name='x'>body</CfExecute>";
-        let s = scan(b);
-        assert_eq!(s.limitation, None);
-        assert_eq!(s.tags.len(), 2);
-        assert_eq!(s.tags[0].span, 3..23);
-        assert_eq!(&b[s.tags[0].name.clone()], b"CFEXECUTE");
-        assert_eq!(&b[s.tags[0].body.clone()], b" name='x'");
-        assert!(s.tags[1].closing);
+/// A CFML attribute value starting at `*at`, without its quotes.
+fn cfml_value(body: &[u8], at: &mut usize, is_quoted: bool) -> Option<Range<usize>> {
+    if is_quoted {
+        let begin = *at + 1;
+        return quoted(body, at).then(|| begin..*at - 1);
     }
-
-    #[test]
-    fn nested_cfcomments_hide_tags() {
-        let s = scan(b"<!--- <cfset x=1> <!--- <cfexecute> ---> ---><cfoutput>");
-        assert_eq!(s.limitation, None);
-        assert_eq!(s.tags.len(), 1);
-    }
-
-    #[test]
-    fn quoted_tags_and_greater_than_are_opaque() {
-        let b = b"<cfset x='a > '' <cfexecute> b'><cfoutput>";
-        let s = scan(b);
-        assert_eq!(s.limitation, None);
-        assert_eq!(s.tags.len(), 2);
-        assert_eq!(&b[s.tags[0].body.clone()], b" x='a > '' <cfexecute> b'");
-    }
-
-    #[test]
-    fn interpolation_quotes_and_escaped_hashes() {
-        let b = br###"<cfexecute name="#form["a>b"]#" arguments="##literal##">"###;
-        let s = scan(b);
-        assert_eq!(s.limitation, None);
-        assert_eq!(s.tags.len(), 1);
-        assert_eq!(s.tags[0].span.end, b.len());
-    }
-
-    #[test]
-    fn partial_tokens_and_script_are_explicit() {
-        for b in [
-            b"<cfset x='no".as_slice(),
-            b"<!--- open",
-            b"<cfexecute name=",
-            b"<cfset x='#form.x'",
-        ] {
-            assert_eq!(scan(b).limitation, Some(Limit::Truncated));
-        }
-        let s = scan(b"<cfscript>x='<cfexecute>';</cfscript><cfexecute>");
-        assert_eq!(s.limitation, Some(Limit::Script));
-        assert_eq!(s.tags.len(), 3);
-        assert_eq!(s.scripts.len(), 1);
-    }
-
-    #[test]
-    fn script_boundaries_ignore_strings_and_comment_contents() {
-        let source = br##"<cfscript>
-        x="</cfscript><cfexecute name='fake'>";
-        y='double '' quote </cfscript>';
-        // </cfscript><cfexecute name='fake'>
-        /* </cfscript><cfexecute name='fake'> */
-        <!--- nested <!--- </cfscript> ---> --->
-        </CFSCRIPT ><cfexecute name='real'>"##;
-        let s = scan(source);
-        assert_eq!(s.limitation, Some(Limit::Script));
-        assert_eq!(s.tags.len(), 3);
-        assert_eq!(s.scripts.len(), 1);
-        assert_eq!(&source[s.tags[2].name.clone()], b"cfexecute");
-        assert_eq!(&source[s.tags[2].body.clone()], b" name='real'");
-        assert_eq!(s.scripts[0].end, s.tags[1].span.start);
-    }
-
-    #[test]
-    fn script_boundaries_are_bounded_and_truncation_is_explicit() {
-        for source in [
-            b"<cfscript>x='unterminated".as_slice(),
-            b"<cfscript>/* </cfscript>",
-            b"<cfscript>// </cfscript>",
-            b"<cfscript><!--- </cfscript>",
-            b"<cfscript></cfscriptExtra>",
-        ] {
-            assert_eq!(scan(source).limitation, Some(Limit::Truncated));
-        }
-        let source = format!("<cfscript>{}", "<!---".repeat(MAX_COMMENT_DEPTH + 1));
-        assert_eq!(
-            scan(source.as_bytes()).limitation,
-            Some(Limit::CommentDepth)
-        );
-        let source = b"<cfscript>/* x */ a='</cfscript>'; // x\n</cfscript><cfexecute name='real'>";
-        for end in 0..=source.len() {
-            let s = scan(&source[..end]);
-            assert!(s.tags.iter().all(|t| t.span.end <= end));
-            assert!(s.scripts.iter().all(|r| r.start <= r.end && r.end <= end));
-        }
-        let s = scan(b"<cfscript>x=1;</cfscript><cfscript>y=2;</cfscript><cfexecute>");
-        assert_eq!(s.scripts.len(), 2);
-        assert_eq!(s.tags.len(), 5);
-    }
-
-    #[test]
-    fn budgets_and_every_prefix_are_bounded() {
-        assert_eq!(
-            scan(&vec![b'x'; MAX_BYTES + 1]).limitation,
-            Some(Limit::Bytes)
-        );
-        assert_eq!(
-            scan(&b"<cfset>".repeat(MAX_TAGS + 1)).limitation,
-            Some(Limit::Tags)
-        );
-        assert_eq!(
-            scan(&b"<!---".repeat(MAX_COMMENT_DEPTH + 1)).limitation,
-            Some(Limit::CommentDepth)
-        );
-        let b = br###"<!--- nested <!--- x ---> ---><cfset x="#form["p"]#"><cfexecute>"###;
-        for end in 0..=b.len() {
-            let s = scan(&b[..end]);
-            for tag in s.tags {
-                assert!(tag.span.end <= end);
-            }
+    let begin = *at;
+    while let Some(&b) = body.get(*at)
+        && !b.is_ascii_whitespace()
+    {
+        *at += 1;
+        if b == b'#' && !interpolation(body, at) {
+            return None;
         }
     }
-    #[test]
-    fn retained_original_tag_offsets() {
-        use sha2::{Digest, Sha256};
-        let decoded = include_bytes!("../../../testdata/cfml/encrypted_shell_decoded.cfm");
-        assert_eq!(
-            format!("{:x}", Sha256::digest(decoded)),
-            "110db2340e0aecb5c59d73b15617b28999d941f974ae04acf4d53ddcf945e9dc"
-        );
-        let s = scan(decoded);
-        assert_eq!(s.limitation, None);
-        assert_eq!(
-            s.tags
-                .iter()
-                .filter(|t| starts(decoded, t.name.start, b"cf"))
-                .count(),
-            332
-        );
-        assert!(s.tags.iter().any(|t| &decoded[t.name.clone()] == b"input"));
-        let calls: Vec<_> = s
-            .tags
-            .iter()
-            .filter(|t| !t.closing && decoded[t.name.clone()].eq_ignore_ascii_case(b"cfexecute"))
-            .collect();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].span.start, 12558);
-        let direct = include_bytes!("../../../testdata/cfml/datasource_shell.cfm");
-        assert_eq!(
-            format!("{:x}", Sha256::digest(direct)),
-            "987de3c74aaa5371c98365b281fdc3c4b680558aae5b4c9895ec6b8c9fc083d2"
-        );
-        let s = scan(direct);
-        assert_eq!(s.limitation, Some(Limit::Script));
-        assert_eq!(s.scripts.len(), 1);
-        assert!(
-            direct[s.scripts[0].clone()]
-                .windows(b"getDatasources".len())
-                .any(|s| s == b"getDatasources")
-        );
-        assert!(
-            s.tags
-                .last()
-                .is_some_and(|t| t.closing && &direct[t.name.clone()] == b"cfoutput")
-        );
-        let calls: Vec<_> = s
-            .tags
-            .iter()
-            .filter(|t| !t.closing && direct[t.name.clone()].eq_ignore_ascii_case(b"cfexecute"))
-            .collect();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].span.start, 878);
-    }
-    #[test]
-    fn attributes_preserve_order_ranges_and_interpolation() {
-        let b = br###"<CFEXECUTE timeout=10 arguments="#form["opts"]#" NAME = '#selected#' />"###;
-        let tags = scan(b);
-        let attrs = attributes(b, &tags.tags[0]).unwrap();
-        assert_eq!(attrs.len(), 3);
-        assert_eq!(&b[attrs[0].name.clone()], b"timeout");
-        assert_eq!(&b[attrs[0].value.clone()], b"10");
-        assert!(!attrs[0].quoted);
-        assert_eq!(&b[attrs[1].value.clone()], br###"#form["opts"]#"###);
-        assert!(attrs[1].quoted);
-        assert_eq!(&b[attrs[2].value.clone()], b"#selected#");
-    }
-
-    #[test]
-    fn attributes_reject_duplicates_partial_and_excessive_lists() {
-        for b in [
-            b"<cfexecute name='a' NAME='b'>".as_slice(),
-            b"<cfexecute name>",
-            b"<cfexecute name=>",
-            b"<cfexecute name='a'arguments='b'>",
-        ] {
-            let s = scan(b);
-            assert!(attributes(b, &s.tags[0]).is_none());
-        }
-        let mut b = String::from("<cfexecute");
-        for i in 0..65 {
-            b.push_str(&format!(" a{i}='x'"));
-        }
-        b.push('>');
-        let s = scan(b.as_bytes());
-        assert!(attributes(b.as_bytes(), &s.tags[0]).is_none());
-    }
-    #[test]
-    fn encrypted_templates_need_decoding_before_syntax() {
-        let original = include_bytes!("../../../testdata/cfml/encrypted_shell_original.cfm");
-        let s = scan(original);
-        assert_eq!(s.limitation, Some(Limit::Encrypted));
-        assert!(s.tags.is_empty());
-    }
+    Some(begin..*at)
 }
+
+/// An HTML attribute value starting at `*at`, without its quotes.
+fn html_value(
+    body: &[u8],
+    at: &mut usize,
+    quote: Option<u8>,
+    interpolate: bool,
+) -> Option<Range<usize>> {
+    if quote.is_some() {
+        *at += 1;
+    }
+    let begin = *at;
+    while let Some(&b) = body.get(*at) {
+        if quote == Some(b) || (quote.is_none() && b.is_ascii_whitespace()) {
+            break;
+        }
+        if interpolate && b == b'#' {
+            if body.get(*at + 1) == Some(&b'#') {
+                *at += 2;
+                continue;
+            }
+            *at += 1;
+            if !interpolation(body, at) {
+                return None;
+            }
+        } else {
+            if quote.is_none() && matches!(b, b'\'' | b'"' | b'<' | b'=' | b'`') {
+                return None;
+            }
+            *at += 1;
+        }
+    }
+    let value = begin..*at;
+    if let Some(q) = quote {
+        if body.get(*at) != Some(&q) {
+            return None;
+        }
+        *at += 1;
+    }
+    Some(value)
+}
+
+#[cfg(test)]
+mod specimens;
+#[cfg(test)]
+mod tests;

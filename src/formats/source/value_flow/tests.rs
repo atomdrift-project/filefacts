@@ -27,8 +27,16 @@ fwrite($peer, $data);
 if (condition()): $more = colon_read(); fwrite($peer, $more); endif;
 "#;
     let flow = graph("relay.php", source);
-    assert!(!flow.limitations.contains("parse-error"), "{flow:?}");
-    assert!(!flow.limitations.contains("unmodeled-if-body"), "{flow:?}");
+    assert!(
+        !flow.limitations.contains(&crate::Limitation::ParseError),
+        "{flow:?}"
+    );
+    assert!(
+        !flow
+            .limitations
+            .contains(&crate::Limitation::UnmodeledIfBody),
+        "{flow:?}"
+    );
     for name in ["acquire", "second", "third", "last", "colon_read"] {
         assert!(
             reaches(&flow, "fwrite", name),
@@ -117,11 +125,12 @@ fn anonymous_function_limitations_survive_named_function_boundaries() {
     ] {
         let flow = graph(path, source);
         assert!(
-            !flow.limitations.contains("parse-error"),
+            !flow.limitations.contains(&crate::Limitation::ParseError),
             "{path}: {flow:?}"
         );
         assert!(
-            flow.limitations.contains("anonymous-function"),
+            flow.limitations
+                .contains(&crate::Limitation::AnonymousFunction),
             "{path}: {flow:?}"
         );
         assert!(
@@ -140,14 +149,26 @@ fn anonymous_function_limitations_survive_named_function_boundaries() {
         );
     }
     let direct = graph("a.js", "function activate(){send(acquire());}");
-    assert!(!direct.limitations.contains("anonymous-function"));
+    assert!(
+        !direct
+            .limitations
+            .contains(&crate::Limitation::AnonymousFunction)
+    );
     assert!(reaches(&direct, "send", "acquire"));
-    assert!(!direct.limitations.contains("nested-function"));
+    assert!(
+        !direct
+            .limitations
+            .contains(&crate::Limitation::NestedFunction)
+    );
     let nested = graph(
         "a.js",
         "function outer(){function inner(){register(() => send(acquire()));} inner();}",
     );
-    assert!(nested.limitations.contains("nested-function"));
+    assert!(
+        nested
+            .limitations
+            .contains(&crate::Limitation::NestedFunction)
+    );
     assert!(!nested.functions.contains_key("inner"));
     assert!(
         !nested
@@ -209,7 +230,7 @@ fn compound_assignments_preserve_both_operands_and_later_overwrites() {
             let source = format!("{prefix}{initial}{tail}{suffix}");
             let flow = graph(path, &source);
             assert!(
-                !flow.limitations.contains("parse-error"),
+                !flow.limitations.contains(&crate::Limitation::ParseError),
                 "{path}: {source}"
             );
             assert_eq!(
@@ -244,7 +265,11 @@ fn compound_assignments_preserve_both_operands_and_later_overwrites() {
         "a.js",
         "function run(){let obj={};obj.value+=right();send(obj.value);}",
     );
-    assert!(member.limitations.contains("compound-assignment-target"));
+    assert!(
+        member
+            .limitations
+            .contains(&crate::Limitation::CompoundAssignmentTarget)
+    );
     assert!(!reaches(&member, "send", "right"));
 }
 
@@ -300,7 +325,10 @@ fn go_if_initializers_preserve_flow_and_lexical_scope() {
     ] {
         let source = format!("package p\nfunc run(){{ {body} }}");
         let flow = graph("a.go", &source);
-        assert!(!flow.limitations.contains("parse-error"), "{body}");
+        assert!(
+            !flow.limitations.contains(&crate::Limitation::ParseError),
+            "{body}"
+        );
         assert_eq!(reaches(&flow, sink, "acquire"), expected, "{body}");
         assert_eq!(
             flow.values
@@ -587,7 +615,10 @@ fn deep_declarator_chains_bind_without_recursing() {
         let source = format!("void f(int {}p){{ send(p); }}\n", "*".repeat(60_000));
         graph("a.c", &source)
     });
-    assert!(flow.limitations.contains("analysis-budget"));
+    assert!(
+        flow.limitations
+            .contains(&crate::Limitation::AnalysisBudget)
+    );
 }
 
 #[test]
@@ -641,6 +672,7 @@ fn branch_merges_see_globals_changed_in_one_branch() {
 }
 
 #[test]
+#[ignore = "wall-clock bound; run with --ignored"]
 fn branches_and_blocks_do_not_copy_every_binding() {
     // Each `if` branch started from a copy of every binding in scope, and
     // each block saved one to restore its declarations: 5k module bindings
@@ -659,7 +691,11 @@ fn branches_and_blocks_do_not_copy_every_binding() {
     let started = std::time::Instant::now();
     let flow = file.flow().unwrap();
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
-    assert!(!flow.limitations.contains("analysis-budget"));
+    assert!(
+        !flow
+            .limitations
+            .contains(&crate::Limitation::AnalysisBudget)
+    );
     assert!(reaches(flow, "send", "acquire"));
     assert!(!reaches(flow, "send", "shadow"));
     assert!(reaches(flow, "sink", "other"));

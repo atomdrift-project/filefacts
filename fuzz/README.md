@@ -1,9 +1,10 @@
 # filefacts fuzz targets
 
 [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets for the
-extraction pipeline. This crate is its own workspace, so it never joins the
-main build. It repeats the root manifest's `[patch.crates-io]` block, because
-`[patch]` applies only in the root crate of a build. Keep the two in step.
+extraction pipeline. The crate is a member of the root workspace, so it
+builds against the same `Cargo.lock` and `[patch.crates-io]` forks as the
+library. It is not a default member: plain `cargo build` and `cargo test` at
+the root skip it. `cargo check -p filefacts-fuzz` type-checks it on stable.
 
 ## Targets
 
@@ -39,7 +40,7 @@ repository root:
 ```sh
 make fuzz FUZZ_TARGET=pdf
 # or directly:
-cd fuzz && cargo +nightly fuzz run pdf -- -rss_limit_mb=2048 -timeout=10
+cargo +nightly fuzz run pdf -- -rss_limit_mb=2048 -timeout=10 -max_len=1048576
 ```
 
 The limits matter: the failures this harness exists to find are aborts,
@@ -60,15 +61,19 @@ libFuzzer calls each target on the main thread, whose 8 MiB stack hides
 recursion that overflows a 2 MiB rayon worker in a real scan. The shared
 driver (`src/lib.rs`) therefore runs every input on a 2 MiB thread. A stack
 overflow aborts the process, and libFuzzer reports it as a deadly signal with
-the reproducing input saved under `artifacts/`.
+the reproducing input saved under `fuzz/artifacts/<target>/`.
 
 ### Seeds
 
 Seed a corpus with the repository's fixtures, for example:
 
 ```sh
-mkdir -p corpus/pe && cp ../tests/fixtures/*.exe ../tests/fixtures/*.dll corpus/pe/
+mkdir -p fuzz/corpus/pe && cp tests/fixtures/*.exe tests/fixtures/*.dll fuzz/corpus/pe/
 ```
+
+Some fixtures are real malware specimens stored zstd-compressed (see
+`testdata/README.md`); decompress them into the corpus only on a machine
+where that is acceptable.
 
 ## Regression tests
 

@@ -11,21 +11,26 @@
 //! Emitted keys:
 //!
 //! - `deb.name`, `deb.version`, `deb.arch` — core identity.
-//! - `deb.maintainer`, `deb.section`, `deb.priority` — provenance / category.
-//! - `deb.summary` — the `Description` synopsis (first line).
+//! - `deb.maintainers` (`Maintainer` and `Uploaders`), `deb.section`,
+//!   `deb.priority` — provenance / category.
+//! - `deb.description` — the `Description` synopsis (first line).
 //! - `deb.dependencies[]` — runtime dependency package names (bounded).
 //! - `deb.installed_size_kib` — declared installed size in KiB.
 //! - `deb.limits[]` — `{stage, reason}` when the control archive was left
-//!   unread by design: an `xz` (or other undecodable) `control.tar`, or one
-//!   that inflates past the size cap. A control archive that fails to
-//!   decompress, or an `ar` table that breaks off before reaching it, is a
-//!   parse failure and is recorded in `errors` instead.
+//!   unread or read short by design: a compression `dpkg` does not write for
+//!   `control.tar` (it writes none, gzip, xz or zstd), an archive that
+//!   inflates past the size cap, or a `control` file past its own cap. A
+//!   control archive that fails to decompress, or an `ar` table that breaks
+//!   off before reaching it, is a parse failure and is recorded in `errors`
+//!   instead.
 
+use super::people::{self, Person};
 use crate::metric;
-use std::io::{Cursor, Read};
+use std::io::Read;
 
 use serde_json::Value as JsonValue;
 
+use super::bounded::{Limits, MemberPrefix, inflate_capped, xz_decoder, zstd_decoder};
 use crate::error::Error;
 use crate::output::{Errors, Metrics, Stage, ValueKey, Values};
 use crate::value_key;
@@ -33,7 +38,7 @@ use crate::value_key;
 const AR_MAGIC: &[u8] = b"!<arch>\n";
 /// `ar` member headers are a fixed 60 bytes.
 const AR_HEADER_LEN: usize = 60;
-/// Cap on the compressed `control.tar` member we decompress.
+/// Cap on the inflated `control.tar` walked for its `control` file.
 const MAX_CONTROL_TAR: u64 = 4 << 20; // 4 MiB
 /// Cap on the decompressed `control` file (guards a decompression bomb).
 const MAX_CONTROL_FILE: u64 = 1 << 20; // 1 MiB
@@ -83,18 +88,25 @@ pub(super) fn extract(
         };
 
         if name.starts_with("control.tar") {
+            let mut limits = Limits::default();
             match read_control_file(&name, member) {
-                Ok(Some(control)) => parse_control(&control, values, metrics),
+                Ok(Some(control)) => {
+                    if control.truncated {
+                        limits.push(
+                            "control-file",
+                            format!("control over the {MAX_CONTROL_FILE}-byte cap; read short"),
+                        );
+                    }
+                    parse_control(&control.bytes, values, metrics);
+                }
                 // No `control` file inside: nothing to read, nothing failed.
                 Ok(None) => {}
-                Err(ControlError::Unread(reason)) => values.insert_key(
-                    value_key!("deb.limits"),
-                    serde_json::json!([{ "stage": "control-archive", "reason": reason }]),
-                ),
+                Err(ControlError::Unread(reason)) => limits.push("control-archive", reason),
                 Err(ControlError::Malformed(why)) => {
                     errors.record_malformed(Stage::TarParse, format!("{name}: {why}"));
                 }
             }
+            limits.emit(values, value_key!("deb.limits"));
             return Ok(());
         }
 
@@ -128,20 +140,19 @@ enum ControlError {
     Malformed(String),
 }
 
-/// Decompress `control.tar*` (by suffix) and return the `control` member's
-/// bytes, `Ok(None)` when the archive holds no `control` file.
-fn read_control_file(name: &str, member: &[u8]) -> Result<Option<Vec<u8>>, ControlError> {
-    let reader: Box<dyn Read> = if super::common::ends_with_ci(name, ".gz") {
+/// Decompress `control.tar*` (by suffix) and return the start of its
+/// `control` member, `Ok(None)` when the archive holds no `control` file.
+fn read_control_file(name: &str, member: &[u8]) -> Result<Option<MemberPrefix>, ControlError> {
+    let has = |suffix| super::common::ends_with_ci(name, suffix);
+    let reader: Box<dyn Read + '_> = if has(".gz") {
         Box::new(flate2::read::GzDecoder::new(member))
-    } else if super::common::ends_with_ci(name, ".zst") {
-        Box::new(
-            zstd::stream::read::Decoder::new(member)
-                .map_err(|e| ControlError::Malformed(e.to_string()))?,
-        )
-    } else if super::common::ends_with_ci(name, ".tar") {
-        Box::new(Cursor::new(member))
+    } else if has(".xz") {
+        Box::new(xz_decoder(member))
+    } else if has(".zst") {
+        Box::new(zstd_decoder(member).map_err(|e| ControlError::Malformed(e.to_string()))?)
+    } else if has(".tar") {
+        Box::new(member)
     } else {
-        // .xz / unknown compression: no decompressor available.
         return Err(ControlError::Unread(format!(
             "{name}: no decoder for this compression; control fields not read"
         )));
@@ -161,18 +172,16 @@ fn read_control_file(name: &str, member: &[u8]) -> Result<Option<Vec<u8>>, Contr
 }
 
 /// Walk a decompressed `control.tar` for its `./control` member.
-fn find_control<R: Read>(archive: &mut tar::Archive<R>) -> std::io::Result<Option<Vec<u8>>> {
+fn find_control<R: Read>(archive: &mut tar::Archive<R>) -> std::io::Result<Option<MemberPrefix>> {
     for entry in archive.entries()? {
         let entry = entry?;
         // `path()` borrows the entry immutably; resolve the match before the
-        // `read_to_end` consumes it.
+        // read consumes it.
         let is_control = entry
             .path()
             .is_ok_and(|p| matches!(p.to_string_lossy().as_ref(), "./control" | "control"));
         if is_control {
-            let mut buf = Vec::new();
-            entry.take(MAX_CONTROL_FILE).read_to_end(&mut buf)?;
-            return Ok(Some(buf));
+            return inflate_capped(entry, MAX_CONTROL_FILE).map(Some);
         }
     }
     Ok(None)
@@ -182,6 +191,9 @@ fn find_control<R: Read>(archive: &mut tar::Archive<R>) -> std::io::Result<Optio
 /// extend the previous field; we only need the single-line fields here.
 fn parse_control(control: &[u8], values: &mut Values, metrics: &mut Metrics) {
     let text = String::from_utf8_lossy(control);
+    // `Maintainer` and the co-maintainers in `Uploaders`, each a
+    // `"Name <email>"` person (Debian Policy §5.6.2, §5.6.3).
+    let mut maintainers = Vec::new();
     for line in text.lines() {
         // Field values are `Key: value`; skip continuation/blank lines.
         if line.starts_with(' ') || line.starts_with('\t') {
@@ -198,12 +210,13 @@ fn parse_control(control: &[u8], values: &mut Values, metrics: &mut Metrics) {
             "Package" => insert_str(values, value_key!("deb.name"), value),
             "Version" => insert_str(values, value_key!("deb.version"), value),
             "Architecture" => insert_str(values, value_key!("deb.arch"), value),
-            "Maintainer" => insert_str(values, value_key!("deb.maintainer"), value),
+            "Maintainer" => maintainers.push(Person::parse(value)),
+            "Uploaders" => maintainers.extend(value.split(',').map(Person::parse)),
             "Section" => insert_str(values, value_key!("deb.section"), value),
             "Priority" => insert_str(values, value_key!("deb.priority"), value),
             // `Description`'s first line is the synopsis; the indented
             // continuation lines (the long description) are skipped above.
-            "Description" => insert_str(values, value_key!("deb.summary"), value),
+            "Description" => insert_str(values, value_key!("deb.description"), value),
             "Installed-Size" => {
                 if let Ok(kib) = value.parse::<f64>() {
                     metrics.insert(metric!("deb.installed_size_kib"), kib);
@@ -222,6 +235,7 @@ fn parse_control(control: &[u8], values: &mut Values, metrics: &mut Metrics) {
             _ => {}
         }
     }
+    people::put(values, value_key!("deb.maintainers"), maintainers);
 }
 
 /// Extract the bare package names from a `Depends` field, dropping version
@@ -251,237 +265,4 @@ fn insert_str(values: &mut Values, key: ValueKey, value: &str) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write;
-
-    /// Build a minimal `.deb`: an `ar` archive with `debian-binary` and a
-    /// gzip `control.tar` containing `./control`.
-    fn build_deb(control: &str) -> Vec<u8> {
-        deb_with_control_member("control.tar.gz", &control_tar_gz(control))
-    }
-
-    /// A `.deb` whose control member has the given name and raw bytes.
-    fn deb_with_control_member(name: &str, member: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(AR_MAGIC);
-        append_ar_member(&mut out, "debian-binary", b"2.0\n");
-        append_ar_member(&mut out, name, member);
-        append_ar_member(&mut out, "data.tar.gz", b"");
-        out
-    }
-
-    fn control_tar_gz(control: &str) -> Vec<u8> {
-        // control.tar.gz holding ./control
-        let mut control_tar = Vec::new();
-        {
-            let mut b = tar::Builder::new(&mut control_tar);
-            let mut h = tar::Header::new_ustar();
-            h.set_path("./control").unwrap();
-            h.set_size(control.len() as u64);
-            h.set_mode(0o644);
-            h.set_entry_type(tar::EntryType::Regular);
-            h.set_cksum();
-            b.append(&h, control.as_bytes()).unwrap();
-            b.finish().unwrap();
-        }
-        let mut control_gz = Vec::new();
-        {
-            let mut enc =
-                flate2::write::GzEncoder::new(&mut control_gz, flate2::Compression::default());
-            enc.write_all(&control_tar).unwrap();
-            enc.finish().unwrap();
-        }
-        control_gz
-    }
-
-    fn run(deb: &[u8]) -> (Values, Metrics, Errors) {
-        let mut v = Values::new();
-        let mut m = Metrics::new();
-        let mut e = Errors::new();
-        extract(deb, &mut v, &mut m, &mut e).unwrap();
-        (v, m, e)
-    }
-
-    /// The one recorded error's stage and kind.
-    fn only_error(errors: &Errors) -> (Stage, crate::DiagnosticKind) {
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        (errors.as_slice()[0].stage, errors.as_slice()[0].kind)
-    }
-
-    fn append_ar_member(out: &mut Vec<u8>, name: &str, data: &[u8]) {
-        let mut header = [b' '; AR_HEADER_LEN];
-        header[..name.len()].copy_from_slice(name.as_bytes());
-        let size = data.len().to_string();
-        header[48..48 + size.len()].copy_from_slice(size.as_bytes());
-        header[58] = b'`';
-        header[59] = b'\n';
-        out.extend_from_slice(&header);
-        out.extend_from_slice(data);
-        if data.len() & 1 == 1 {
-            out.push(b'\n');
-        }
-    }
-
-    const CONTROL: &str = "Package: demo-pkg\n\
-Version: 1.2.3-1\n\
-Architecture: amd64\n\
-Maintainer: Jane Doe <jane@example.com>\n\
-Section: utils\n\
-Priority: optional\n\
-Installed-Size: 512\n\
-Depends: libc6 (>= 2.34), libssl3 (>= 3.0.0) | libssl1.1\n\
-Description: A demo package\n\
- Long description line that should be ignored.\n";
-
-    #[test]
-    fn extracts_core_identity() {
-        let deb = build_deb(CONTROL);
-        let (v, m, e) = run(&deb);
-        assert!(e.is_empty(), "{e:?}");
-        assert!(v.get("deb.limits").is_none());
-
-        assert_eq!(v.get("deb.name").and_then(|x| x.as_str()), Some("demo-pkg"));
-        assert_eq!(
-            v.get("deb.version").and_then(|x| x.as_str()),
-            Some("1.2.3-1")
-        );
-        assert_eq!(v.get("deb.arch").and_then(|x| x.as_str()), Some("amd64"));
-        assert_eq!(
-            v.get("deb.summary").and_then(|x| x.as_str()),
-            Some("A demo package")
-        );
-        assert_eq!(m.get("deb.installed_size_kib"), Some(512.0));
-    }
-
-    #[test]
-    fn parses_dependencies_without_constraints() {
-        let deb = build_deb(CONTROL);
-        let (v, _, _) = run(&deb);
-
-        let deps: Vec<&str> = v
-            .get("deb.dependencies")
-            .and_then(|x| x.as_array())
-            .unwrap()
-            .iter()
-            .filter_map(|x| x.as_str())
-            .collect();
-        assert_eq!(deps, vec!["libc6", "libssl3", "libssl1.1"]);
-    }
-
-    #[test]
-    fn non_deb_bytes_error() {
-        let mut v = Values::new();
-        let mut m = Metrics::new();
-        let mut e = Errors::new();
-        assert!(extract(b"not a deb", &mut v, &mut m, &mut e).is_err());
-    }
-
-    #[test]
-    fn corrupt_gzip_control_archive_records_one_tar_parse_error() {
-        let mut gz = control_tar_gz(CONTROL);
-        // Keep the gzip header, garble the deflate stream behind it.
-        for b in &mut gz[10..] {
-            *b ^= 0x5a;
-        }
-        let (v, _, e) = run(&deb_with_control_member("control.tar.gz", &gz));
-        assert_eq!(
-            only_error(&e),
-            (Stage::TarParse, crate::DiagnosticKind::Malformed)
-        );
-        assert!(e.as_slice()[0].message.starts_with("control.tar.gz:"));
-        assert!(v.get("deb.name").is_none());
-        assert!(v.get("deb.limits").is_none());
-    }
-
-    #[test]
-    fn corrupt_zstd_control_archive_records_one_tar_parse_error() {
-        let (v, _, e) = run(&deb_with_control_member(
-            "control.tar.zst",
-            b"\x28\xb5\x2f\xfd garbage",
-        ));
-        assert_eq!(
-            only_error(&e),
-            (Stage::TarParse, crate::DiagnosticKind::Malformed)
-        );
-        assert!(v.get("deb.limits").is_none());
-    }
-
-    /// An xz control archive is undecodable by design (no xz decoder): a
-    /// coverage limit, not a parse failure.
-    #[test]
-    fn xz_control_archive_is_a_limit_not_an_error() {
-        let (v, _, e) = run(&deb_with_control_member(
-            "control.tar.xz",
-            b"\xfd7zXZ\0 opaque",
-        ));
-        assert!(e.is_empty(), "{e:?}");
-        let limits = v.get("deb.limits").and_then(|x| x.as_array()).unwrap();
-        assert_eq!(limits.len(), 1);
-        assert_eq!(limits[0]["stage"], "control-archive");
-        assert!(
-            limits[0]["reason"]
-                .as_str()
-                .unwrap()
-                .starts_with("control.tar.xz:")
-        );
-    }
-
-    #[test]
-    fn control_archive_past_the_inflate_cap_is_a_limit_not_an_error() {
-        // A tar whose first member alone inflates past the cap, with the
-        // `control` file behind it.
-        let mut tar = Vec::new();
-        {
-            let mut b = tar::Builder::new(&mut tar);
-            let mut pad = tar::Header::new_ustar();
-            pad.set_path("./md5sums").unwrap();
-            pad.set_size(MAX_CONTROL_TAR + 1);
-            pad.set_cksum();
-            b.append(&pad, std::io::repeat(0).take(MAX_CONTROL_TAR + 1))
-                .unwrap();
-            let mut h = tar::Header::new_ustar();
-            h.set_path("./control").unwrap();
-            h.set_size(CONTROL.len() as u64);
-            h.set_cksum();
-            b.append(&h, CONTROL.as_bytes()).unwrap();
-            b.finish().unwrap();
-        }
-        let mut gz = Vec::new();
-        {
-            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::fast());
-            enc.write_all(&tar).unwrap();
-            enc.finish().unwrap();
-        }
-        let (v, _, e) = run(&deb_with_control_member("control.tar.gz", &gz));
-        assert!(e.is_empty(), "{e:?}");
-        let limits = v.get("deb.limits").and_then(|x| x.as_array()).unwrap();
-        assert_eq!(limits[0]["stage"], "control-archive");
-        assert!(limits[0]["reason"].as_str().unwrap().contains("cap"));
-    }
-
-    #[test]
-    fn control_member_cut_short_records_one_malformed_error() {
-        let deb = build_deb(CONTROL);
-        // Cut inside the control.tar.gz member's data.
-        let cut = AR_MAGIC.len() + 2 * AR_HEADER_LEN + 4 + 20;
-        let (v, _, e) = run(&deb[..cut]);
-        assert_eq!(
-            only_error(&e),
-            (Stage::FormatExtract, crate::DiagnosticKind::Malformed)
-        );
-        assert!(e.as_slice()[0].message.contains("past the end of the file"));
-        assert!(v.get("deb.name").is_none());
-    }
-
-    #[test]
-    fn deb_without_a_control_file_records_nothing() {
-        // A readable control.tar with no `control` in it: absent, not broken.
-        let mut tar = Vec::new();
-        tar::Builder::new(&mut tar).finish().unwrap();
-        let (v, _, e) = run(&deb_with_control_member("control.tar", &tar));
-        assert!(e.is_empty(), "{e:?}");
-        assert!(v.get("deb.limits").is_none());
-        assert!(v.get("deb.name").is_none());
-    }
-}
+mod tests;

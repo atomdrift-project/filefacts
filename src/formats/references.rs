@@ -8,7 +8,7 @@
 //! intra-artifact target is a [`RefLocator::Path`].
 
 use std::collections::HashSet;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use regex::Regex;
 use serde_json::Value as JsonValue;
@@ -35,7 +35,7 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Vec<
         .and_then(JsonValue::as_str)
     {
         Some("go.work") => {
-            go::manifest(&mut out, "go.work");
+            go::manifest(&mut out, go::source::WORK);
             return out.refs;
         }
         Some("go.work.sum") => {
@@ -48,16 +48,15 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Vec<
         }
         _ => {}
     }
-    // Only declared, structured dependencies live here. Imperative/undeclared
-    // recognition (install-hook commands, shell/Dockerfile `npm install`,
-    // `curl | sh`, URLs in variables) is fletch's `find`, which consumes these
-    // facts and adds the hunted refs.
+    // Only declared, structured dependencies live here. Imperative or
+    // undeclared references (install-hook commands, a Dockerfile's
+    // `npm install`, `curl | sh`, URLs in variables) are left to consumers
+    // that hunt for them in the other facts.
     match file_type {
         FileType::Npm | FileType::PackageJson => npm(values, &mut out),
         FileType::PackageLockJson => npm_lock(values, &mut out),
-        FileType::SrcInfo => srcinfo(values, &mut out),
-        FileType::PkgArch => manifests::arch_package(bytes, &mut out),
-        FileType::GoMod => go::manifest(&mut out, "go.mod"),
+        FileType::SrcInfo | FileType::PkgArch => alpm(values, &mut out),
+        FileType::GoMod => go::manifest(&mut out, go::source::MOD),
         FileType::GoSum => go::sums(&mut out),
         FileType::CargoToml => cargo_toml(values, &mut out),
         FileType::CargoLock => cargo_lock(values, &mut out),
@@ -84,9 +83,8 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Vec<
 /// `action.yml`) runs. Each `owner/repo@ref` is a GitHub repository action
 /// (`pkg:github`), each `docker://…` a container action (`pkg:oci`); local
 /// `./…` actions ship in the repo and are not external. Every match is a
-/// declared [`RefKind::Dependency`] — its CI-only *context* is the workflow
-/// file's, not the reference's, so a consumer gates fetching on the file type
-/// rather than a per-reference mark.
+/// declared [`RefKind::Dependency`] in the [`crate::DependencyScope::Ci`]
+/// scope.
 fn github_actions(values: &Values, out: &mut Refs<'_>) {
     let root = values.as_json();
     // Workflow steps: `jobs.<job>.steps[].uses`, plus a job-level `uses:` that
@@ -115,8 +113,16 @@ fn emit_uses(out: &mut Refs<'_>, uses: Option<&JsonValue>, source: &str) {
     let Some(raw) = uses.and_then(JsonValue::as_str) else {
         return;
     };
-    if let Some(locator) = github_action_locator(raw) {
-        out.push(locator, RefKind::Dependency, source, raw, None);
+    match github_action_locator(raw) {
+        Some(locator) => out.push(locator, RefKind::Dependency, source, raw, None),
+        None if !raw.trim().starts_with('.') => tracing::debug!(
+            target: "filefacts::references",
+            format = "github-actions",
+            stage = source,
+            len = raw.len(),
+            "`uses:` value is not a safe repository or container reference; skipped"
+        ),
+        None => {}
     }
 }
 
@@ -141,6 +147,17 @@ fn github_action_locator(uses: &str) -> Option<RefLocator> {
         // The registry keeps `/` for a namespace and `:` for a port; the image
         // leaf and the tag are bare names. Anything else must never reach a
         // fetchable locator.
+        // A registry must also be `host[:port]` plus namespace segments,
+        // each non-empty and alphanumeric-led: `purl_safe` alone admits
+        // `//evil.example`, which survives into `repository_url` and which a
+        // consumer resolving it as a URL reads as protocol-relative, pointing
+        // the fetch at an attacker's host.
+        let registry_safe = |registry: &str| {
+            purl_safe(registry, b"/:")
+                && registry
+                    .split('/')
+                    .all(|seg| seg.starts_with(|c: char| c.is_ascii_alphanumeric()))
+        };
         if !purl_safe(name, b"")
             || !registry.is_none_or(registry_safe)
             || !tag.is_none_or(|t| purl_safe(t, b""))
@@ -195,20 +212,6 @@ fn github_action_locator(uses: &str) -> Option<RefLocator> {
 /// registry port). Every PURL-syntax character (`?`, `#`, `&`, `@`, `%`),
 /// whitespace, and control byte is rejected, so a component can neither open a
 /// qualifier nor redirect the fetch.
-/// Whether a container registry is well-formed enough to hand to a fetcher:
-/// `host[:port]` plus optional namespace segments, each a real label.
-///
-/// Beyond [`purl_safe`] this requires every `/`-separated segment to be
-/// non-empty and alphanumeric-led. `purl_safe` alone admits `//evil.example`,
-/// which survives into `repository_url` and which a consumer resolving it as a
-/// URL reads as protocol-relative — pointing the fetch at an attacker's host.
-fn registry_safe(registry: &str) -> bool {
-    purl_safe(registry, b"/:")
-        && registry
-            .split('/')
-            .all(|seg| seg.starts_with(|c: char| c.is_ascii_alphanumeric()))
-}
-
 fn purl_safe(s: &str, extra: &[u8]) -> bool {
     !s.is_empty()
         && !s.contains("..")
@@ -229,7 +232,10 @@ fn js_local_refs(out: &mut Refs<'_>) {
     // A set: scanning a list for each specifier was quadratic, and 100k
     // distinct `require("./mN")` lines took 15 s.
     let mut seen: HashSet<&str> = HashSet::new();
-    for caps in js_relative_import_re().captures_iter(text) {
+    let Some(relative_import) = JS_RELATIVE_IMPORT.as_ref() else {
+        return;
+    };
+    for caps in relative_import.captures_iter(text) {
         let Some(spec) = caps.get(1).map(|m| m.as_str()) else {
             continue;
         };
@@ -245,13 +251,9 @@ fn js_local_refs(out: &mut Refs<'_>) {
 /// `import("./x")`. The keyword gate plus a specifier that must start with `.`
 /// keeps bare-package and non-import strings out; the closing quote keeps
 /// `import.meta` / `fromCharCode` out.
-fn js_relative_import_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| {
-        Regex::new(r#"\b(?:require|import|from)\b\s*\(?\s*["'](\.[^"'\n]*)["']"#)
-            .expect("js_relative_import_re compiles")
-    })
-}
+static JS_RELATIVE_IMPORT: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(r#"\b(?:require|import|from)\b\s*\(?\s*["'](\.[^"'\n]*)["']"#).ok()
+});
 
 /// `yarn.lock` (Yarn classic): one block per resolved package, headed by its
 /// `"name@range":` spec key, with `version "x"` and `integrity "sha…"` lines.
@@ -509,7 +511,7 @@ fn gemfile_lock(out: &mut Refs<'_>) {
 }
 
 /// A `.gem` archive's declared runtime dependencies, read from the
-/// `gem.runtime_dependencies` names the gem extractor lifts out of `metadata.gz`.
+/// `gem.dependencies` names the gem extractor lifts out of `metadata.gz`.
 /// A gemspec declares version *ranges* (`>= 0`, `~> 1.0`), not pins, so these are
 /// unversioned `pkg:gem/<name>` PURLs that resolve to the current release through
 /// rubygems.org at fetch time. Development dependencies are intentionally excluded
@@ -520,7 +522,7 @@ fn gemfile_lock(out: &mut Refs<'_>) {
 /// the `faraday-multipart` gem).
 fn gem_runtime_deps(values: &Values, out: &mut Refs<'_>) {
     let Some(deps) = values
-        .get_key(value_key!("gem.runtime_dependencies"))
+        .get_key(value_key!("gem.dependencies"))
         .and_then(JsonValue::as_array)
     else {
         return;
@@ -533,7 +535,7 @@ fn gem_runtime_deps(values: &Values, out: &mut Refs<'_>) {
         out.push(
             RefLocator::Purl(format!("pkg:gem/{name}")),
             RefKind::Dependency,
-            "gem.runtime_dependencies",
+            "gem.dependencies",
             name,
             None,
         );
@@ -626,7 +628,7 @@ fn pypi_purl(name: &str, version: &str) -> String {
 /// `Cargo.lock`, mirroring npm's manifest/lockfile split.
 fn cargo_toml(values: &Values, out: &mut Refs<'_>) {
     manifests::cargo(values, out);
-    if let Some(repo) = document_str(values, "package.repository") {
+    if let Some(repo) = document(values, "package.repository").and_then(JsonValue::as_str) {
         out.push(
             locator_from_repo(repo),
             RefKind::Repository,
@@ -681,7 +683,7 @@ fn maven_jar(values: &Values, out: &mut Refs<'_>) {
 }
 
 /// `Cargo.lock`: every `[[package]]` resolved to an exact version. Registry
-/// crates carry a `checksum` (raw-content SHA-256, so it doubles as the hopper
+/// crates carry a `checksum` (raw-content SHA-256, so it doubles as the
 /// content key); path/workspace/git entries have none and aren't fetchable from
 /// crates.io, so they're skipped.
 fn cargo_lock(values: &Values, out: &mut Refs<'_>) {
@@ -719,14 +721,12 @@ fn cargo_lock(values: &Values, out: &mut Refs<'_>) {
 /// [`Refs::locate`] resumes from the previous match, which is linear while a
 /// producer emits in document order. A producer that doesn't falls back to
 /// searching the whole file per reference — O(N × file), quadratic in a
-/// manifest that declares thousands. Measured before this budget existed: 40k
-/// `uses:` steps in 1.5 MB cost 10.5 s, rising 4× per doubling, so a crafted
-/// input scales to hours of CPU on one file. The resumed search counts too: a
-/// miss scans to end-of-file without moving the cursor, and a v1
-/// `package-lock.json` (walked last entry first) with 20k dependencies before
-/// a 4 MiB entry spent 35 s on those misses alone. Once the budget is spent
-/// the remaining offsets report 0, already the value for evidence we can't
-/// locate.
+/// manifest that declares thousands; unbounded, a crafted input scales to
+/// hours of CPU on one file. The resumed search counts too: a miss scans to
+/// end-of-file without moving the cursor, so a v1 `package-lock.json`
+/// (walked last entry first) would pay a whole-file scan per entry. Once the
+/// budget is spent the remaining offsets are `None`, as for evidence that
+/// cannot be located.
 const MAX_LOCATE_SCAN: usize = 64 << 20;
 
 /// Reference accumulator that also carries the raw file text for offsets.
@@ -754,6 +754,7 @@ impl Refs<'_> {
         if self.budget == 0 {
             return None;
         }
+        let before = self.budget;
         let tail = text.get(self.cursor..).unwrap_or_default();
         if let Some(at) = tail.find(evidence) {
             // The scan stopped at the match and the cursor moves there, so
@@ -762,6 +763,7 @@ impl Refs<'_> {
                 .budget
                 .saturating_sub(at.saturating_add(evidence.len()));
             self.cursor += at;
+            self.note_spent(before, text.len());
             return Some(self.cursor as u64);
         }
         // The miss scanned to end-of-file, and the fallback costs up to two
@@ -769,6 +771,7 @@ impl Refs<'_> {
         self.budget = self
             .budget
             .saturating_sub(tail.len().saturating_add(text.len().saturating_mul(2)));
+        self.note_spent(before, text.len());
         let found = text
             .find(evidence)
             .or_else(|| text.find(&anchor_from_locator(locator)));
@@ -778,9 +781,21 @@ impl Refs<'_> {
         found.map(|at| at as u64)
     }
 
+    /// Log the search that spent the last of the budget.
+    fn note_spent(&self, before: usize, len: usize) {
+        if self.budget == 0 && before > 0 {
+            tracing::debug!(
+                target: "filefacts::references",
+                stage = "locate",
+                len,
+                budget = MAX_LOCATE_SCAN,
+                "evidence search budget spent; later references carry no offset"
+            );
+        }
+    }
+
     /// Push one reference, deriving its `offset`, and `content_sha256` from a
-    /// SHA-256 pin (a sha256 pin *is* the content hash, so it doubles as the
-    /// hopper key). Every producer goes through here so these rules live in
+    /// SHA-256 pin (a sha256 pin *is* the content hash). Every producer goes through here so these rules live in
     /// one place.
     ///
     /// The offset is the start of `evidence`, else the start of the package
@@ -817,7 +832,7 @@ impl Refs<'_> {
             Some(crate::DependencyScope::Build)
         } else if cargo_table == Some("dev-dependencies") {
             Some(crate::DependencyScope::Development)
-        } else if source.starts_with("github.actions.") {
+        } else if source.starts_with("github-actions.") {
             Some(crate::DependencyScope::Ci)
         } else {
             None
@@ -837,6 +852,7 @@ impl Refs<'_> {
             pinned_hash,
             content_sha256,
             context,
+            resolution: None,
         });
     }
 }
@@ -857,8 +873,9 @@ fn anchor_from_locator(loc: &RefLocator) -> String {
     }
 }
 
-/// npm: the declared source repository (identity). Install-hook command/URL
-/// hunting lives in `fletch::find`.
+/// npm: the declared source repository (identity), declared dependencies,
+/// intra-package entry points and VS Code extension dependencies. Commands
+/// and URLs inside install hooks are not declarations and are not read here.
 fn npm(values: &Values, out: &mut Refs<'_>) {
     if let Some(repo) = values
         .get_key(value_key!("npm.repository.url"))
@@ -872,9 +889,27 @@ fn npm(values: &Values, out: &mut Refs<'_>) {
             None,
         );
     }
-    npm_manifest_deps(out);
-    npm_local_refs(out);
-    vscode_extension_deps(out);
+    // The manifest text is parsed here once, in file order, because each
+    // reader below needs keys `values` does not keep. A binary `.tgz` has no
+    // text and reaches none of them.
+    let Some(text) = out.text else { return };
+    let manifest = match serde_json::from_str::<JsonValue>(text) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            tracing::debug!(
+                target: "filefacts::references",
+                format = "package.json",
+                stage = "manifest",
+                len = text.len(),
+                %error,
+                "manifest text is not JSON; declared dependencies not read"
+            );
+            return;
+        }
+    };
+    npm_manifest_deps(&manifest, out);
+    npm_local_refs(&manifest, out);
+    vscode_extension_deps(&manifest, out);
 }
 
 /// `extensionDependencies` and `extensionPack` from a VS Code extension
@@ -895,22 +930,25 @@ fn npm(values: &Values, out: &mut Refs<'_>) {
 /// reasons.
 ///
 /// Unversioned: a manifest names the extension, never a version.
-fn vscode_extension_deps(out: &mut Refs<'_>) {
-    let Some(text) = out.text else { return };
-    let Ok(manifest) = serde_json::from_str::<JsonValue>(text) else {
-        return;
-    };
+fn vscode_extension_deps(manifest: &JsonValue, out: &mut Refs<'_>) {
     for field in ["extensionDependencies", "extensionPack"] {
         let Some(entries) = manifest.get(field).and_then(JsonValue::as_array) else {
             continue;
         };
         for id in entries.iter().filter_map(JsonValue::as_str) {
-            // A marketplace id is `publisher.name`; neither half may itself
-            // contain a dot, so anything else is not an extension coordinate.
+            // A marketplace id is `publisher.name`, each half ASCII
+            // alphanumerics with hyphens or underscores. Rejecting anything
+            // else keeps paths, versions and free text out of the list.
             let Some((publisher, name)) = id.split_once('.') else {
                 continue;
             };
-            if !is_marketplace_segment(publisher) || !is_marketplace_segment(name) {
+            if ![publisher, name].iter().all(|segment| {
+                !segment.is_empty()
+                    && segment.len() <= 64
+                    && segment
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            }) {
                 continue;
             }
             out.push(
@@ -924,27 +962,11 @@ fn vscode_extension_deps(out: &mut Refs<'_>) {
     }
 }
 
-/// Marketplace publisher and extension names are ASCII alphanumerics with
-/// hyphens or underscores. Rejecting anything else keeps paths, versions and
-/// free text out of the dependency list.
-fn is_marketplace_segment(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 64
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
 /// Intra-artifact file references a `package.json` names: the entry module
 /// (`main`/`module`), the `exports` map's targets, and the executables (`bin`).
 /// Each points at a sibling file in the same package, so a consumer resolves it
-/// against the bundle's other members rather than fetching it. A no-op for a
-/// binary `.tgz` (no text). The initial, deliberately small set of inter-file
-/// producers — relative `import`/`require` targets and HTML `src` can follow.
-fn npm_local_refs(out: &mut Refs<'_>) {
-    let Some(text) = out.text else { return };
-    let Ok(manifest) = serde_json::from_str::<JsonValue>(text) else {
-        return;
-    };
+/// against the bundle's other members rather than fetching it.
+fn npm_local_refs(manifest: &JsonValue, out: &mut Refs<'_>) {
     // Dedup identical targets — `exports` routinely repeats `main` and lists one
     // file under several conditions (`require`/`import`/`default`).
     let mut seen: HashSet<String> = HashSet::new();
@@ -1033,12 +1055,8 @@ fn push_local_ref(out: &mut Refs<'_>, path: &str, source: &str) {
 /// requirements are followed. A peer may be supplied by the consumer or
 /// installed by its package manager; a resolved range is a candidate, not
 /// proof of the version in any particular installation. Dev dependencies are
-/// not installed when consuming a published package. A no-op for binary `.tgz`.
-fn npm_manifest_deps(out: &mut Refs<'_>) {
-    let Some(text) = out.text else { return };
-    let Ok(manifest) = serde_json::from_str::<JsonValue>(text) else {
-        return;
-    };
+/// not installed when consuming a published package.
+fn npm_manifest_deps(manifest: &JsonValue, out: &mut Refs<'_>) {
     for field in ["dependencies", "optionalDependencies", "peerDependencies"] {
         let Some(deps) = manifest.get(field).and_then(JsonValue::as_object) else {
             continue;
@@ -1099,7 +1117,21 @@ fn npm_manifest_deps(out: &mut Refs<'_>) {
 /// - anything else: a range, dist-tag, or exact version of the key's own
 ///   package — the one case where the key *is* the coordinate.
 fn npm_dep_locator(name: &str, spec: &str) -> Option<RefLocator> {
-    if is_local_npm_spec(spec) {
+    // A workspace sibling, a pnpm catalog entry (itself declared in the
+    // workspace manifest) or a plain path is code already inside the
+    // artifact, scanned in place: none of them is fetchable.
+    const LOCAL: [&str; 9] = [
+        "workspace:",
+        "catalog:",
+        "file:",
+        "link:",
+        "portal:",
+        "./",
+        "../",
+        "/",
+        "~/",
+    ];
+    if LOCAL.iter().any(|prefix| spec.starts_with(prefix)) {
         return None;
     }
     if let Some(alias) = spec.strip_prefix("npm:") {
@@ -1112,27 +1144,23 @@ fn npm_dep_locator(name: &str, spec: &str) -> Option<RefLocator> {
     npm_registry_locator(name, spec)
 }
 
-/// A registry coordinate: versioned when the spec pins one exact version,
-/// versionless otherwise for the fetcher to resolve.
+/// A registry coordinate: versioned when the spec pins one exact version.
+/// Otherwise versionless, retaining the declared range or tag as a qualifier
+/// so the fetcher resolves exactly what the package manager would install; a
+/// rangeless or wildcard spec is the bare coordinate.
 fn npm_registry_locator(name: &str, spec: &str) -> Option<RefLocator> {
-    (!name.is_empty()).then(|| {
-        RefLocator::Purl(if is_exact_npm_version(spec) {
-            npm_purl(name, spec)
-        } else {
-            npm_purl_unversioned(name, spec)
-        })
-    })
-}
-
-/// Whether a spec resolves to code already on disk — a workspace sibling, a
-/// pnpm catalog entry (itself declared in the workspace manifest), or a plain
-/// path. None of these is fetchable, and all of them are inside the artifact
-/// already, where they are scanned in place.
-fn is_local_npm_spec(spec: &str) -> bool {
-    const LOCAL_PROTOCOLS: [&str; 5] = ["workspace:", "catalog:", "file:", "link:", "portal:"];
-    const LOCAL_PATHS: [&str; 4] = ["./", "../", "/", "~/"];
-    LOCAL_PROTOCOLS.iter().any(|p| spec.starts_with(p))
-        || LOCAL_PATHS.iter().any(|p| spec.starts_with(p))
+    if name.is_empty() {
+        return None;
+    }
+    if is_exact_npm_version(spec) {
+        return Some(RefLocator::Purl(npm_purl(name, spec)));
+    }
+    let mut purl = match name.strip_prefix('@').and_then(|s| s.split_once('/')) {
+        Some((scope, pkg)) => format!("pkg:npm/%40{scope}/{pkg}"),
+        None => format!("pkg:npm/{name}"),
+    };
+    push_version_requirement(&mut purl, spec);
+    Some(RefLocator::Purl(purl))
 }
 
 /// Split an `npm:` alias body into the aliased package and its range. The name
@@ -1188,18 +1216,6 @@ fn npm_forge_shorthand(spec: &str) -> Option<String> {
         .then(|| format!("https://{host}/{owner}/{repo}"))
 }
 
-/// An npm PURL with no pinned version, retaining the declared range or tag as
-/// a qualifier so the fetcher can resolve exactly what the package manager
-/// would install. A rangeless or wildcard spec is the bare coordinate.
-fn npm_purl_unversioned(name: &str, spec: &str) -> String {
-    let mut purl = match name.strip_prefix('@').and_then(|s| s.split_once('/')) {
-        Some((scope, pkg)) => format!("pkg:npm/%40{scope}/{pkg}"),
-        None => format!("pkg:npm/{name}"),
-    };
-    push_version_requirement(&mut purl, spec);
-    purl
-}
-
 /// Append a declared install constraint to an unversioned PURL as a
 /// `version_requirement` qualifier. PURL itself has no range syntax, so this
 /// is a house convention for the fetcher; an empty or `*` requirement carries
@@ -1247,10 +1263,13 @@ fn npm_lock(values: &Values, out: &mut Refs<'_>) {
     let root = values.as_json();
     if let Some(pkgs) = root.get("packages").and_then(JsonValue::as_object) {
         for (path, entry) in pkgs {
+            // The key is an install path (`node_modules/a/node_modules/@s/b`);
+            // the dependency is whatever follows the last `node_modules/`.
             // "" is the root project, not a dependency.
-            let Some(name) = dep_name_from_path(path) else {
+            let name = path.rsplit("node_modules/").next().unwrap_or_default();
+            if name.is_empty() || name == path {
                 continue;
-            };
+            }
             // `path` is the lockfile's own key — findable in the bytes, so
             // it doubles as the entry's evidence.
             push_locked_dep(out, name, entry, &format!("packages.{path}"), path);
@@ -1264,6 +1283,12 @@ fn npm_lock(values: &Values, out: &mut Refs<'_>) {
         let mut remaining = 100_000usize;
         while let Some((name, entry, source, parent_dev, parent_optional)) = stack.pop() {
             if remaining == 0 {
+                tracing::debug!(
+                    target: "filefacts::references",
+                    format = "package-lock",
+                    stage = "dependencies",
+                    "lockfile v1 dependency budget spent; deeper entries left out"
+                );
                 break;
             }
             remaining -= 1;
@@ -1293,14 +1318,6 @@ fn npm_lock(values: &Values, out: &mut Refs<'_>) {
             }
         }
     }
-}
-
-/// The package name from a v2/v3 `packages` key, which is an install path
-/// like `node_modules/foo` or `node_modules/a/node_modules/@scope/bar`.
-/// The dependency is whatever follows the last `node_modules/`.
-fn dep_name_from_path(path: &str) -> Option<&str> {
-    let name = path.rsplit("node_modules/").next()?;
-    (!name.is_empty() && name != path).then_some(name)
 }
 
 /// Push one locked dependency: `pkg:npm/...@version` with its `integrity`
@@ -1386,10 +1403,11 @@ fn parse_integrity(s: &str) -> Option<PinnedHash> {
     })
 }
 
-/// Arch / AUR `.SRCINFO`: declared package dependencies and build sources.
-/// This is the PKGBUILD's machine-readable metadata, already parsed under
-/// `pkg.*` by `pkgmeta::extract_srcinfo`, so no bash is parsed here.
-fn srcinfo(values: &Values, out: &mut Refs<'_>) {
+/// Arch package metadata under `pkg.*`: a `.SRCINFO` (parsed by `pkgmeta`)
+/// or a built package's `.PKGINFO` (parsed by `pkg_arch`), which share one
+/// field vocabulary. Declared pacman dependencies and build sources; no bash
+/// is parsed here.
+fn alpm(values: &Values, out: &mut Refs<'_>) {
     let Some(pkg) = values
         .get_key(value_key!("pkg"))
         .and_then(JsonValue::as_object)
@@ -1397,45 +1415,91 @@ fn srcinfo(values: &Values, out: &mut Refs<'_>) {
         return;
     };
 
-    // Declared pacman dependencies. A *foreign* one — not in the official
-    // repos — is the AUR bootstrap vector (`depends = bun` pulls an npm
-    // runtime); whether it is foreign is a downstream resolution question,
-    // so every declared dep is recorded.
-    for field in ["depends", "makedepends"] {
-        for dep in str_array(pkg.get(field)) {
-            let name = alpm_pkg_name(dep);
-            if name.is_empty() {
-                continue;
-            }
-            out.push(
-                RefLocator::Purl(format!("pkg:alpm/arch/{name}")),
-                RefKind::Dependency,
-                format!("pkg.{field}"),
-                dep,
-                None,
-            );
+    // Every declared dependency is recorded, architecture-suffixed arrays
+    // (`depends_x86_64`) included. A *foreign* one, not in the official
+    // repositories, can bootstrap another ecosystem (`depends = bun`);
+    // whether it is foreign is a resolution question for the consumer.
+    for (field, value) in pkg {
+        let (scope, optional) = match field.split_once('_').map_or(field.as_str(), |(b, _)| b) {
+            "depends" => (crate::DependencyScope::Runtime, false),
+            "optdepends" => (crate::DependencyScope::Runtime, true),
+            "makedepends" | "checkdepends" => (crate::DependencyScope::Build, false),
+            _ => continue,
+        };
+        for spec in str_array(Some(value)) {
+            push_alpm_dependency(out, &format!("pkg.{field}"), spec, scope, optional);
         }
     }
 
     // Build sources, each paired positionally with its `sha256sums` pin.
     // URL sources become refs; bare filenames are in-archive members, not
     // external, so they are skipped. A real `sha256sums` entry is the
-    // source's SHA-256 — `Refs::push` lifts it into `content_sha256`.
+    // source's SHA-256, which `Refs::push` lifts into `content_sha256`;
+    // `SKIP` and other non-hex entries are verification opt-outs.
     let sources = str_array(pkg.get("source"));
     let sums = str_array(pkg.get("sha256sums"));
     for (i, src) in sources.iter().enumerate() {
         let Some(locator) = source_locator(src) else {
             continue;
         };
-        let pin = sums.get(i).copied().and_then(sha256_pin);
+        let pin = sums.get(i).map(|sum| sum.trim()).and_then(|sum| {
+            (sum.len() == 64 && sum.bytes().all(|b| b.is_ascii_hexdigit())).then(|| PinnedHash {
+                algo: HashAlgo::Sha256,
+                value: sum.to_ascii_lowercase(),
+            })
+        });
         out.push(locator, RefKind::Dependency, "pkg.source", *src, pin);
     }
 }
 
-/// A pacman dependency name with its version constraint stripped:
-/// `boost>=1.69.0` → `boost`.
-fn alpm_pkg_name(dep: &str) -> &str {
-    dep.split(['>', '<', '=']).next().unwrap_or(dep).trim()
+/// One pacman dependency spec (`bash>=5`, `electron: graphical interface`)
+/// as a `pkg:alpm/arch/<name>` reference carrying its version requirement.
+/// An optional dependency's `: description` is dropped; a name pacman would
+/// reject is skipped.
+fn push_alpm_dependency(
+    out: &mut Refs<'_>,
+    source: &str,
+    spec: &str,
+    scope: crate::DependencyScope,
+    optional: bool,
+) {
+    let spec = spec.trim();
+    let requirement = spec.split_once(": ").map_or(spec, |(s, _)| s);
+    let end = requirement
+        .find(['<', '>', '='])
+        .unwrap_or(requirement.len());
+    let name = requirement[..end].trim();
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"@._+-".contains(&c))
+    {
+        tracing::debug!(
+            target: "filefacts::references",
+            format = "alpm",
+            stage = source,
+            len = spec.len(),
+            "dependency name pacman would reject; skipped"
+        );
+        return;
+    }
+    let mut purl = format!("pkg:alpm/arch/{name}");
+    push_version_requirement(&mut purl, requirement[end..].trim());
+    out.push(
+        RefLocator::Purl(purl),
+        RefKind::Dependency,
+        source,
+        spec,
+        None,
+    );
+    if let Some(reference) = out.refs.last_mut() {
+        reference.context = Some(crate::DependencyContext {
+            scope,
+            optional,
+            has_install_script: false,
+            installed_path: None,
+        });
+    }
 }
 
 /// A `source=()` entry's locator, or `None` if it is a bare local filename.
@@ -1458,31 +1522,18 @@ fn source_locator(src: &str) -> Option<RefLocator> {
         return None; // local filename
     }
     if let Some(purl) = purl_from_forge(base) {
-        let version = frag.and_then(frag_version);
+        // The pinned ref from a VCS fragment: `tag=V1.2` / `commit=abc`.
+        let version = frag.and_then(|frag| {
+            frag.split('&')
+                .find_map(|p| p.strip_prefix("tag=").or_else(|| p.strip_prefix("commit=")))
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        });
         return Some(RefLocator::Purl(
             version.map_or(purl.clone(), |v| format!("{purl}@{v}")),
         ));
     }
     Some(RefLocator::Url(scheme_part.to_string()))
-}
-
-/// The pinned ref from a VCS fragment: `tag=V1.2` / `commit=abc` → the value.
-fn frag_version(frag: &str) -> Option<String> {
-    frag.split('&')
-        .find_map(|p| p.strip_prefix("tag=").or_else(|| p.strip_prefix("commit=")))
-        .filter(|v| !v.is_empty())
-        .map(str::to_string)
-}
-
-/// A `sha256sums` entry as a pin, if it is a real 64-hex digest. `SKIP`
-/// and non-hex values are verification opt-outs, not digests.
-fn sha256_pin(s: &str) -> Option<PinnedHash> {
-    let s = s.trim();
-    let is_hex = s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
-    is_hex.then(|| PinnedHash {
-        algo: HashAlgo::Sha256,
-        value: s.to_ascii_lowercase(),
-    })
 }
 
 /// Collect a `values` field that is an array of strings (or a lone string).
@@ -1541,107 +1592,14 @@ fn purl_from_forge(repo: &str) -> Option<String> {
     ))
 }
 
-/// A string at `path` in a manifest's verbatim document tree, such as
+/// The value at `path` in a manifest's verbatim document tree, such as
 /// `package.repository` in a `Cargo.toml`. The path comes from the manifest
-/// format, not from an extractor, so it is not a cataloged value key.
-fn document_str<'a>(values: &'a Values, path: &str) -> Option<&'a str> {
-    values.get(path).and_then(JsonValue::as_str)
+/// format, not from an extractor, so it is not a cataloged value key. Every
+/// reader of a manifest document goes through here, so the tree's location
+/// in `values` is decided in one place.
+pub(crate) fn document<'a>(values: &'a Values, path: &str) -> Option<&'a JsonValue> {
+    values.get(path)
 }
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod dependency_context_tests {
-    use crate::{DependencyScope, OpenOptions};
-    #[test]
-    fn dependency_scope_comes_from_the_table_not_words_in_the_package_name() {
-        let data = br#"[package]
-name = "fixture"
-version = "1.0.0"
-[dependencies]
-dev-dependencies-helper = "=1.0.0"
-build-dependencies-helper = "=2.0.0"
-[build-dependencies]
-cc = "=1.0.0"
-[dev-dependencies]
-tempfile = "=3.0.0"
-"#;
-        let parsed = OpenOptions::new()
-            .path(std::path::Path::new("Cargo.toml"))
-            .open(data);
-        let by_name = |name: &str| {
-            parsed
-                .references()
-                .iter()
-                .find(|r| matches!(&r.locator, crate::RefLocator::Purl(p) if p.contains(name)))
-                .unwrap()
-        };
-        assert!(by_name("dev-dependencies-helper").context.is_none());
-        assert!(by_name("build-dependencies-helper").context.is_none());
-        assert_eq!(
-            by_name("pkg:cargo/cc@").context.as_ref().unwrap().scope,
-            DependencyScope::Build
-        );
-        assert_eq!(
-            by_name("tempfile").context.as_ref().unwrap().scope,
-            DependencyScope::Development
-        );
-    }
-    #[test]
-    fn npm_lock_scopes_flags_aliases_and_integrity_survive() {
-        let data = br#"{"lockfileVersion":3,"packages":{
-          "node_modules/runtime":{"version":"1.0.0"},
-          "node_modules/dev":{"version":"2.0.0","dev":true},
-          "node_modules/optional":{"version":"3.0.0","optional":true},
-          "node_modules/both":{"version":"4.0.0","devOptional":true},
-          "node_modules/alias":{"name":"real","version":"5.0.0","dev":true,"hasInstallScript":true,"integrity":"sha512-PIN"}
-        }}"#;
-        let parsed = OpenOptions::new()
-            .path(std::path::Path::new("package-lock.json"))
-            .open(data);
-        let refs = parsed.references();
-        let by_name = |name: &str| {
-            refs.iter()
-                .find(|r| matches!(&r.locator, crate::RefLocator::Purl(p) if p.contains(name)))
-                .unwrap()
-        };
-        assert_eq!(
-            by_name("runtime").context.as_ref().unwrap().scope,
-            DependencyScope::Runtime
-        );
-        assert_eq!(
-            by_name("dev@").context.as_ref().unwrap().scope,
-            DependencyScope::Development
-        );
-        assert!(by_name("optional").context.as_ref().unwrap().optional);
-        let both = by_name("both").context.as_ref().unwrap();
-        assert!(both.optional);
-        assert_eq!(both.scope, DependencyScope::Runtime);
-        let alias = by_name("real");
-        let ctx = alias.context.as_ref().unwrap();
-        assert_eq!(ctx.installed_path.as_deref(), Some("node_modules/alias"));
-        assert!(ctx.has_install_script);
-        assert_eq!(ctx.scope, DependencyScope::Development);
-        assert_eq!(alias.pinned_hash.as_ref().unwrap().value, "PIN");
-    }
-}
-
-#[cfg(test)]
-mod nested_lock_context_tests {
-    use crate::{DependencyScope, OpenOptions, RefLocator};
-    #[test]
-    fn v1_nested_development_and_optional_context_is_inherited() {
-        let parsed = OpenOptions::new().path(std::path::Path::new("package-lock.json")).open(br#"{"lockfileVersion":1,"dependencies":{"parent":{"version":"1.0.0","dev":true,"optional":true,"dependencies":{"child":{"version":"npm:real-child@2.0.0","integrity":"sha512-PIN"}}}}}"#);
-        let child = parsed
-            .references()
-            .iter()
-            .find(|r| r.locator == RefLocator::Purl("pkg:npm/real-child@2.0.0".into()))
-            .unwrap();
-        let context = child.context.as_ref().unwrap();
-        assert_eq!(context.scope, DependencyScope::Development);
-        assert!(context.optional);
-        assert!(context.installed_path.is_none());
-        assert_eq!(child.pinned_hash.as_ref().unwrap().value, "PIN");
-    }
-}

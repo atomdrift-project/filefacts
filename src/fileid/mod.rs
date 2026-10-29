@@ -1,20 +1,24 @@
 //! Fast file format identification by magic bytes, shebangs, and extensions.
 //!
-//! `fileid` identifies file formats with a content-first pipeline:
+//! `fileid` identifies file formats with a content-first pipeline, an
+//! ordered table of rules where the first that claims the file decides:
 //!
 //! 1. **Signatures** — magic bytes, shebangs and structural markers. Most sit
 //!    in the first few bytes; some are read further in (a tar header at 257, an
 //!    ISO volume descriptor at 32 KiB, a DMG trailer at the end), and archives
 //!    are walked far enough to see which package layout they carry
-//! 2. **Fast content heuristics** — lightweight patterns over a bounded window
-//!    (a few KiB, plus the tail of a padded file; no tree-sitter)
-//! 3. **Filename and extension fallback** — used only when content checks do not
+//! 2. **Content rules** — document shapes, unmistakable marks and the language
+//!    scorer, over a bounded window (a few KiB, plus the tail of a padded file;
+//!    no tree-sitter)
+//! 3. **Filename and extension fallback** — used only when content does not
 //!    identify a stronger type
 //!
-//! Strong content markers can override filename-only types, unknown extensions,
-//! weak extensions, and recognized polyglot/container disguises. Ordinary source
-//! extensions remain authoritative against ambiguous language-keyword matches.
-//! If no content rule or filename fallback yields a result, `detect` returns `None`.
+//! How far a name is believed against content is one column of the
+//! [`FileType`] table, its extension strength: weak names and container names
+//! whose signature is absent yield to content, a language name yields only to
+//! a binary or plainly foreign body, and a name for a format defined by its
+//! magic is wrong once the magic is absent. If no rule yields a result,
+//! `detect` returns `None`.
 //!
 //! # Example
 //!
@@ -27,27 +31,37 @@
 //! ```
 
 pub mod container;
+mod dos;
 mod ext;
+mod file_type;
 mod go_module;
 mod heuristics;
+pub(crate) mod image4_trustcache;
 mod magic;
-mod package_layout;
-mod zip_probe;
-pub(crate) use magic::looks_like_obfuscated_rtf;
 mod markdown;
+mod marks;
+mod package_layout;
 mod perl_shell_shim;
+pub(crate) mod phar;
 mod restructuredtext;
 mod scripts;
 pub(crate) mod shellcode;
 mod sniff;
+mod text;
+mod torch;
+mod zip_probe;
 
 pub use container::{ArchiveFormat, Compression, Container, container_of};
+pub use file_type::{FileType, Group};
+pub(crate) use magic::looks_like_obfuscated_rtf;
+pub(crate) use torch::legacy_header as torch_protocol2_legacy_header;
 
-use sniff::Sniff;
 use std::path::Path;
-use stng::{RepeatingXorKey, recover_repeating_xor_pe};
 
 use serde::Serialize;
+use sniff::Sniff;
+use stng::{RepeatingXorKey, recover_repeating_xor_pe};
+use text::strip_utf8_bom;
 
 /// Result of file-format identification.
 ///
@@ -108,9 +122,14 @@ impl FileId {
     pub fn from_path_and_bytes(path: &Path, bytes: &[u8]) -> Self {
         // Detection runs many hand-written heuristics over untrusted bytes; a
         // panic in one must not take the caller down with it.
-        let identified =
-            crate::formats::goblin_safe::catch_infallible(|| identify(path, bytes)).ok();
+        let identified = crate::panic_guard::catch_infallible(|| identify(path, bytes)).ok();
         let Some((detection, xor_pe_key)) = identified else {
+            tracing::debug!(
+                target: "filefacts::fileid",
+                path = %path.display(),
+                len = bytes.len(),
+                "identification panicked; reporting unknown"
+            );
             return Self {
                 source: DetectionSource::Failed,
                 ..Self::forced(FileType::Unknown)
@@ -211,674 +230,11 @@ impl FileId {
         if !self.extension_mismatch() {
             return None;
         }
-        let content = file_group(self.file_type);
-        let ext = self.mismatch_ext_type().map_or("unknown", file_group);
+        let content = self.file_type.group().label();
+        let ext = self
+            .mismatch_ext_type()
+            .map_or("unknown", |ft| ft.group().label());
         Some((content, ext))
-    }
-}
-
-/// Coarse content category for a [`FileType`], used to describe an
-/// extension/content mismatch as a `content_group → extension_group`
-/// transition. Every row of the [`FileType`] table names one, so a new
-/// variant forces a category choice.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Group {
-    Binary,
-    /// Interpreted scripting languages (cleave's `scripts` for-group).
-    Script,
-    /// Compiled / typed source languages (cleave's `source` for-group).
-    Source,
-    Config,
-    Archive,
-    Document,
-    Image,
-    /// Audio and video are their own classes: a payload renamed from
-    /// `.wav` to `.png` is a real transition, not a benign refinement.
-    Audio,
-    Video,
-    /// Fonts are their own class, not images: a font renamed to `.png`
-    /// is a format transition worth reporting, not a benign refinement.
-    Font,
-    Text,
-    Data,
-}
-
-impl Group {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Binary => "binary",
-            Self::Script => "script",
-            Self::Source => "source",
-            Self::Config => "config",
-            Self::Archive => "archive",
-            Self::Document => "document",
-            Self::Image => "image",
-            Self::Audio => "audio",
-            Self::Video => "video",
-            Self::Font => "font",
-            Self::Text => "text",
-            Self::Data => "data",
-        }
-    }
-}
-
-/// The name of `ft`'s [`Group`] in a mismatch transition.
-fn file_group(ft: FileType) -> &'static str {
-    ft.group().label()
-}
-
-/// The predicate flags a row of the [`FileType`] table can set; a row names
-/// the ones that hold for it.
-#[derive(Clone, Copy)]
-struct Flags(u8);
-
-impl Flags {
-    /// A compiled native binary or bytecode: [`FileType::is_binary`].
-    const BINARY: Self = Self(1);
-    /// Source code with AST support: [`FileType::is_source_code`].
-    const SOURCE_CODE: Self = Self(1 << 1);
-    /// A manifest parsed whole into the `values` tree:
-    /// [`FileType::is_structured_data`].
-    const STRUCTURED_DATA: Self = Self(1 << 2);
-    /// Not analyzed, so [`FileType::is_program`] is false.
-    const UNSUPPORTED: Self = Self(1 << 3);
-
-    const fn contains(self, flag: Self) -> bool {
-        self.0 & flag.0 != 0
-    }
-}
-
-/// Declares [`FileType`] from one table, so the enum, its labels, groups and
-/// predicate flags cannot drift apart. A row is a variant's documentation,
-/// then `Variant => "label", Group, FLAGS...;`.
-///
-/// The table generates the enum, [`FileType::label`], [`FileType::from_label`]
-/// (a repeated label is an unreachable-pattern warning), the `group` and
-/// `flags` lookups the predicates read, and, for tests, `FileType::ALL` in
-/// declaration order.
-macro_rules! file_types {
-    (
-        $(#[$meta:meta])*
-        pub enum FileType {
-            $(
-                $(#[doc = $doc:literal])*
-                $variant:ident => $label:literal, $group:ident $(, $flag:ident)*;
-            )+
-        }
-    ) => {
-        $(#[$meta])*
-        pub enum FileType {
-            $(
-                $(#[doc = $doc])*
-                $variant,
-            )+
-        }
-
-        impl FileType {
-            /// Every variant, in declaration order.
-            #[cfg(test)]
-            pub(crate) const ALL: &'static [Self] = &[$(Self::$variant),+];
-
-            /// The canonical, stable label for this type — the single nomenclature
-            /// shared by filefacts, cleave (its report `type` field), and scan (its
-            /// routing keys). It is also the serialized form (see the `serde` impls).
-            ///
-            /// The scheme: lowercase throughout; multi-word descriptive types use
-            /// `snake_case`; archive container+compression pairs use the real dotted
-            /// suffix (`tar.gz`); types that *are* a fixed filename use that filename
-            /// (`go.mod`, `package-lock.json`); and universally known short names stay
-            /// short (`elf`, `pe`, `macho`). [`FileType::from_label`] is the inverse.
-            #[must_use]
-            pub const fn label(self) -> &'static str {
-                match self {
-                    $(Self::$variant => $label,)+
-                }
-            }
-
-            /// Parse a [`FileType`] from its canonical [`label`](FileType::label).
-            /// Returns `None` for any string that is not a label — the exact inverse
-            /// of `label`, verified exhaustively by the `label_round_trips` test.
-            #[must_use]
-            pub fn from_label(label: &str) -> Option<Self> {
-                Some(match label {
-                    $($label => Self::$variant,)+
-                    _ => return None,
-                })
-            }
-
-            const fn group(self) -> Group {
-                match self {
-                    $(Self::$variant => Group::$group,)+
-                }
-            }
-
-            const fn flags(self) -> Flags {
-                match self {
-                    $(Self::$variant => Flags(0 $(| Flags::$flag.0)*),)+
-                }
-            }
-        }
-    };
-}
-
-file_types! {
-    /// File format identified by fileid.
-    ///
-    /// Variants cover binary formats, source languages, package manifests, archives,
-    /// and document types. Manifest types (e.g. `PackageJson`, `CargoToml`) are included
-    /// because they require format-specific analysis despite being syntactically JSON/TOML.
-    // Serialization goes through the canonical [`FileType::label`] /
-    // [`FileType::from_label`] pair (see the `impl serde::*` below), not a derived
-    // `rename_all`. That label is the single nomenclature filefacts, cleave, and
-    // scan all share — keeping the serialized form and the report/routing label
-    // the same string instead of two near-identical vocabularies.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    #[non_exhaustive]
-    pub enum FileType {
-        /// Mach-O binary (macOS/iOS executable or library)
-        MachO => "macho", Binary, BINARY;
-        /// ELF binary (Linux/Unix executable or shared library)
-        Elf => "elf", Binary, BINARY;
-        /// PE binary (Windows executable, DLL)
-        Pe => "pe", Binary, BINARY;
-        /// Windows New Executable (16-bit NE) binary
-        Ne => "ne", Binary, BINARY;
-        /// Unix shell script (bash, sh, zsh, etc.)
-        Shell => "shell", Script, SOURCE_CODE;
-        /// Windows batch file (.bat, .cmd)
-        Batch => "batch", Script;
-        /// IBM z/OS Job Control Language batch script (.jcl)
-        Jcl => "jcl", Script;
-        /// VBScript source file (.vbs, .vbe, .wsf, .wsc)
-        Vbs => "vbs", Script;
-        /// Python source file (.py)
-        Python => "python", Script, SOURCE_CODE;
-        /// JavaScript source file (.js, .mjs, .cjs)
-        JavaScript => "javascript", Script, SOURCE_CODE;
-        /// TypeScript source file (.ts, .tsx)
-        TypeScript => "typescript", Source, SOURCE_CODE;
-        /// Go source file (.go)
-        Go => "go", Source, SOURCE_CODE;
-        /// Rust source file (.rs)
-        Rust => "rust", Source, SOURCE_CODE;
-        /// Java source file (.java)
-        Java => "java", Source, SOURCE_CODE;
-        /// Compiled Java bytecode (.class)
-        JavaClass => "java_class", Binary, BINARY;
-        /// Python compiled bytecode (.pyc)
-        PythonBytecode => "python_bytecode", Binary, BINARY;
-        /// Ren'Py compiled script (RPC2 slots holding pickled AST data)
-        Rpyc => "rpyc", Script, BINARY;
-        /// Erlang/Elixir compiled BEAM bytecode (.beam; `FOR1`…`BEAM` IFF container)
-        Beam => "beam", Binary, BINARY;
-        /// WebAssembly binary module (.wasm; `\0asm` magic + version). A portable
-        /// bytecode payload — frequently a Go/TinyGo/Rust/Emscripten compile target
-        /// loaded by a JS host. Routed through the generic analyzer so string
-        /// extraction, entropy, and symbol-name traits fire on the embedded
-        /// `syscall/js` imports, struct tags, and rodata.
-        Wasm => "wasm", Binary, BINARY;
-        /// Dalvik/ART executable bytecode (`dex\n035\0` and later versions).
-        /// APKs carry this as `classes.dex`; a standalone `.dex` is the same
-        /// format, not an APK. There is no competing popular "DEX" file type —
-        /// the name is the format, not a platform qualifier.
-        Dex => "dex", Binary, BINARY;
-        /// Java archive (.jar, .war, .ear)
-        Jar => "jar", Archive;
-        /// Ruby source file (.rb)
-        Ruby => "ruby", Script, SOURCE_CODE;
-        /// PHP source file (.php)
-        Php => "php", Script, SOURCE_CODE;
-        /// Perl source file (.pl, .pm)
-        Perl => "perl", Script, SOURCE_CODE;
-        /// Lua source file (.lua)
-        Lua => "lua", Script, SOURCE_CODE;
-        /// C# source file (.cs)
-        CSharp => "csharp", Source, SOURCE_CODE;
-        /// PowerShell script (.ps1, .psm1)
-        PowerShell => "powershell", Script, SOURCE_CODE;
-        /// Swift source file (.swift)
-        Swift => "swift", Source, SOURCE_CODE;
-        /// Objective-C source file (.m, .mm)
-        ObjectiveC => "objective_c", Source, SOURCE_CODE;
-        /// Groovy source file (.groovy)
-        Groovy => "groovy", Source, SOURCE_CODE;
-        /// Scala source file (.scala)
-        Scala => "scala", Source, SOURCE_CODE;
-        /// Kotlin source file (.kt, .kts)
-        Kotlin => "kotlin", Source, SOURCE_CODE;
-        /// Zig source file (.zig)
-        Zig => "zig", Source, SOURCE_CODE;
-        /// Elixir source file (.ex, .exs)
-        Elixir => "elixir", Source, SOURCE_CODE;
-        /// Clojure / ClojureScript / EDN source (.clj, .cljs, .cljc, .cljr, .edn, .bb)
-        Clojure => "clojure", Source;
-        /// C source file (.c, .h)
-        C => "c", Source, SOURCE_CODE;
-        /// npm package.json manifest
-        PackageJson => "package.json", Config, STRUCTURED_DATA;
-        /// npm package-lock.json lockfile
-        PackageLockJson => "package-lock.json", Config, STRUCTURED_DATA;
-        /// VSCode extension manifest (.vsixmanifest)
-        VsixManifest => "vsix_manifest", Config;
-        /// Chrome extension manifest.json
-        ChromeManifest => "chrome_manifest", Config, STRUCTURED_DATA;
-        /// Rust Cargo.toml manifest
-        CargoToml => "cargo.toml", Config, STRUCTURED_DATA;
-        /// Rust Cargo.lock lockfile — pins every crate to an exact version + sha256.
-        CargoLock => "cargo.lock", Config, STRUCTURED_DATA;
-        /// Python pip requirements file (requirements.txt) — `name==version` pins.
-        RequirementsTxt => "requirements.txt", Config;
-        /// Python Poetry lockfile (poetry.lock) — resolved package set.
-        PoetryLock => "poetry.lock", Config, STRUCTURED_DATA;
-        /// Python Pipenv lockfile (Pipfile.lock) — resolved package set with hashes.
-        PipfileLock => "pipfile.lock", Config, STRUCTURED_DATA;
-        /// Ruby Bundler lockfile (Gemfile.lock) — resolved gem set with versions.
-        GemfileLock => "gemfile.lock", Config;
-        /// PHP Composer lockfile (composer.lock) — resolved package set with dists.
-        ComposerLock => "composer.lock", Config, STRUCTURED_DATA;
-        /// Yarn lockfile (yarn.lock) — resolved npm package set with integrity.
-        YarnLock => "yarn.lock", Config;
-        /// pnpm lockfile (pnpm-lock.yaml) — resolved npm package set with integrity.
-        PnpmLock => "pnpm-lock.yaml", Config, STRUCTURED_DATA;
-        /// Python pyproject.toml manifest
-        PyProjectToml => "pyproject.toml", Config, STRUCTURED_DATA;
-        /// PHP composer.json manifest
-        ComposerJson => "composer.json", Config, STRUCTURED_DATA;
-        /// Generic JSON document (.json)
-        Json => "json", Config;
-        /// node-gyp build manifest (binding.gyp, .gyp, .gypi). JSON-shaped build
-        /// config; its `<!(...)`/`<!@(...)` command-expansion runs arbitrary shell
-        /// during `node-gyp configure` (npm runs this automatically on install of a
-        /// package containing binding.gyp), a known supply-chain execution vector.
-        Gyp => "gyp", Config;
-        /// GitHub Actions workflow YAML
-        GithubActions => "github_actions", Config, STRUCTURED_DATA;
-        /// systemd service unit file (.service, .service.d/*.conf)
-        SystemdService => "systemd_service", Config;
-        /// freedesktop.org Desktop Entry (.desktop) - XDG application launcher / autostart
-        DesktopEntry => "desktop_entry", Config;
-        /// Generic XML document (.xml, MSBuild .csproj, SVG, XML config files, etc.)
-        Xml => "xml", Config;
-        /// Generic YAML document (.yaml, .yml) that is not one of the specific
-        /// manifests above (a GitHub Actions workflow, a pnpm lockfile). YAML is the
-        /// default configuration language for CI, Kubernetes and model cards, so an
-        /// unrecognized one is worth naming rather than leaving as `unknown`.
-        Yaml => "yaml", Config;
-        /// Python package metadata (PKG-INFO, METADATA)
-        PkgInfo => "pkg_info", Config, STRUCTURED_DATA;
-        /// Arch/AUR generated package metadata (.SRCINFO) — normalized mirror of PKGBUILD
-        SrcInfo => "src_info", Config, STRUCTURED_DATA;
-        /// Normalized package-registry metadata (`*.registry.json`) — an upstream
-        /// provider's account of a release (publish date, author, downloads,
-        /// rating, deprecation), the serialized form of [`crate::Registry`].
-        Registry => "registry", Config, STRUCTURED_DATA;
-        /// Windows registry export (`.reg`), the script `regedit` imports and
-        /// exports. Its first line names the format: `REGEDIT4`, or `Windows
-        /// Registry Editor Version 5.00` in UTF-8 or (as `regedit` writes it)
-        /// UTF-16LE behind a byte-order mark. Unrelated to [`Self::Registry`].
-        Reg => "reg", Config;
-        /// Go module manifest (go.mod) — `require` directives are declared dependencies.
-        GoMod => "go.mod", Config;
-        /// Go module checksum database (go.sum) — pins every module to an `h1:` hash.
-        GoSum => "go.sum", Config;
-        /// ZIP archive (zip, apk, ipa, nupkg, etc.)
-        Zip => "zip", Archive;
-        /// Go module distribution ZIP — all members share a `module@version/` prefix.
-        /// Distinct from Go source and the standalone `go.mod` manifest.
-        GoModule => "go_module", Archive;
-        /// TAR archive (plain, no compression)
-        Tar => "tar", Archive;
-        /// ASCII CPIO archive (odc, newc, or newc checksum layout).
-        Cpio => "cpio", Archive;
-        /// Gzip-compressed TAR (.tar.gz, .tgz, .crate)
-        TarGz => "tar.gz", Archive;
-        /// Bzip2-compressed TAR (.tar.bz2, .tbz2)
-        TarBz2 => "tar.bz2", Archive;
-        /// XZ-compressed TAR (.tar.xz, .txz)
-        TarXz => "tar.xz", Archive;
-        /// Zstandard-compressed TAR (.tar.zst, .xbps)
-        TarZst => "tar.zst", Archive;
-        /// Gzip-compressed single file (.gz, not a tar)
-        Gz => "gz", Archive;
-        /// Bzip2-compressed single file (.bz2, not a tar)
-        Bz2 => "bz2", Archive;
-        /// XZ-compressed single file (.xz, not a tar)
-        Xz => "xz", Archive;
-        /// LZMA-alone compressed single file (.lzma)
-        Lzma => "lzma", Archive;
-        /// Zstandard-compressed single file (.zst, not a tar)
-        Zst => "zst", Archive;
-        /// 7-Zip archive (.7z)
-        SevenZ => "7z", Archive;
-        /// RAR archive (.rar)
-        Rar => "rar", Archive;
-        /// Ren'Py archive (.rpa), with an RPA-2.0 or RPA-3.0 index header.
-        Rpa => "rpa", Archive;
-        /// Debian package (.deb)
-        Deb => "deb", Archive;
-        /// Unix static library (.a) — an `ar` archive of relocatable object files.
-        /// Shares the `!<arch>` magic with `.deb`; distinguished by the first `ar`
-        /// member (`.deb` leads with `debian-binary`, a static library does not).
-        StaticLib => "static-lib", Binary;
-        /// RPM package (.rpm)
-        Rpm => "rpm", Archive;
-        /// macOS installer package (.pkg, XAR format). Named `PkgMacos` (not bare
-        /// `Pkg`) because the `.pkg` extension is ambiguous: FreeBSD and Arch also
-        /// use it for compressed-tar packages, disambiguated by container magic.
-        PkgMacos => "pkg_macos", Archive;
-        /// Apple Disk Image (.dmg, UDIF container).
-        Dmg => "dmg", Archive;
-        /// Virtual Hard Disk, fixed or sparse, with a validated footer.
-        Vhd => "vhd", Archive;
-        /// Optical-disc image (.iso): ISO 9660 and/or UDF filesystem — full OS
-        /// install media. Identified by the volume-descriptor magic at sector 16;
-        /// unpacked downstream by 7-Zip (ISO 9660, Joliet, Rock Ridge, and UDF).
-        Iso => "iso", Archive;
-        /// SquashFS read-only filesystem image — `hsqs` (little-endian) or `sqsh`
-        /// (big-endian) superblock magic. Ships inside firmware images and appliance
-        /// builds, and is the wire format of a Snap package (see [`FileType::Snap`]).
-        SquashFs => "squashfs", Archive;
-        /// Cabinet archive (.cab)
-        Cab => "cab", Archive;
-        /// Compiled HTML Help (.chm) — Microsoft ITSF/ITOL container with
-        /// LZX-compressed HTML topics. Common malware delivery vector.
-        Chm => "chm", Archive;
-        /// Chrome extension (.crx)
-        Crx => "crx", Archive;
-        /// Mozilla Firefox extension (.xpi) — ZIP container with WebExtension or
-        /// legacy XUL layout. Disambiguated from generic ZIP so the XPI-specific
-        /// signing-scheme shape (`META-INF/mozilla.*`, `META-INF/cose.*`) can be
-        /// surfaced.
-        Xpi => "xpi", Archive;
-        /// Python wheel (.whl) — ZIP container with PEP 427 layout. Distinct
-        /// from generic ZIP so the wheel-specific surface (dist-info, RECORD,
-        /// native-extension count, top-level packages) can be extracted.
-        Whl => "whl", Archive;
-        /// RubyGems package (.gem) — uncompressed `ustar` tar holding
-        /// `metadata.gz` (gzipped `Gem::Specification` YAML), `data.tar.gz`, and
-        /// `checksums.yaml.gz`. Distinct from generic tar so the gem's external
-        /// identity metadata can be surfaced as `gem.*`.
-        Gem => "gem", Archive;
-        /// Android application package (.apk) — ZIP container (`AndroidManifest.xml`,
-        /// `classes.dex`). Disambiguated from the Alpine `.apk` by container magic
-        /// (`PK` zip vs gzip tar) so each ecosystem gets its own model.
-        ApkAndroid => "apk_android", Archive;
-        /// Alpine Linux package (.apk) — gzip-concatenated tar (signature ‖ control
-        /// ‖ data) carrying `.PKGINFO`. Disambiguated from the Android `.apk` by
-        /// container magic (gzip vs `PK` zip).
-        ApkAlpine => "apk_alpine", Archive;
-        /// npm package (.tgz) — gzip tar with everything under a `package/` prefix
-        /// (`package/package.json`). Disambiguated from a generic gzip tar by that
-        /// marker, so npm supply-chain signal (install scripts, bin shims) routes
-        /// to its own model.
-        Npm => "npm", Archive;
-        /// Rust crate (.crate) — gzip tar laid out as `<name>-<version>/` with a
-        /// `Cargo.toml` at its root. The `.crate` extension is cargo-specific.
-        Crate => "crate", Archive;
-        /// PHP Composer source distribution ZIP with a root composer.json.
-        Composer => "composer", Archive;
-        /// Hex release tar wrapping metadata.config and contents.tar.gz.
-        Hex => "hex", Archive;
-        /// Dart/pub.dev gzip source distribution with a root pubspec.yaml.
-        Pub => "pub", Archive;
-        /// CRAN R source package with a root DESCRIPTION identity.
-        Cran => "cran", Archive;
-        /// CPAN Perl gzip source distribution with META.json or META.yml.
-        Cpan => "cpan", Archive;
-        /// Hackage gzip source distribution with a matching .cabal manifest.
-        Hackage => "hackage", Archive;
-        /// conda package (.conda) — ZIP holding `metadata.json` plus zstd-compressed
-        /// `info-*`/`pkg-*` tars. Distinct from generic ZIP so conda identity
-        /// (`info/index.json`) routes to its own model.
-        Conda => "conda", Archive;
-        /// Python egg (.egg) — ZIP with an `EGG-INFO/` directory (`PKG-INFO`).
-        Egg => "egg", Archive;
-        /// NuGet package (.nupkg) — ZIP carrying a `*.nuspec` manifest.
-        Nupkg => "nupkg", Archive;
-        /// iOS application archive (.ipa) — ZIP with `Payload/*.app/Info.plist`.
-        Ipa => "ipa", Archive;
-        /// VS Code / Open VSX extension (.vsix) — ZIP carrying
-        /// `extension.vsixmanifest`. Distinct from the manifest file type
-        /// [`FileType::VsixManifest`], which is that inner XML alone.
-        Vsix => "vsix", Archive;
-        /// FreeBSD package (.pkg) — zstd-compressed tar whose first member is the
-        /// `+COMPACT_MANIFEST` / `+MANIFEST` metadata. Disambiguated from the macOS
-        /// `.pkg` by container magic (zstd-tar vs `xar!`) and from Arch by the
-        /// `+MANIFEST` marker.
-        PkgFreebsd => "pkg_freebsd", Archive;
-        /// Arch Linux package (.pkg.tar.{zst,xz,gz}) — compressed tar whose first
-        /// member is `.PKGINFO`. Disambiguated from FreeBSD by that marker; the
-        /// `.pkg.tar.*` extension is Arch-specific where the body can't be read.
-        PkgArch => "pkg_arch", Archive;
-        /// Python source distribution (sdist) — gzip tar laid out as
-        /// `<name>-<version>/` with a `PKG-INFO` metadata file at its root.
-        /// Disambiguated from a generic gzip tar by that marker, so the PyPI
-        /// publisher identity (`python.*`) routes to its own model.
-        PythonSdist => "python_sdist", Archive;
-        /// OCI / Docker container image archive — an (uncompressed) tar carrying
-        /// either an OCI `oci-layout` + `index.json` or a `docker save`
-        /// `manifest.json`. Distinct from a generic tar so image refs and content
-        /// digests can be surfaced as `oci.*`.
-        OciImage => "oci_image", Archive;
-        /// Void Linux package (.xbps) — zstd-compressed tar carrying `props.plist`
-        /// metadata. Distinguished from a generic `.tar.zst` by its extension.
-        Xbps => "xbps", Archive;
-        /// Ubuntu Snap package (.snap) — a SquashFS image carrying `meta/snap.yaml`.
-        /// Distinguished from a bare [`FileType::SquashFs`] image by its extension,
-        /// which is the only signal available without reading the filesystem.
-        Snap => "snap", Archive;
-        /// Flatpak single-file bundle (.flatpak) — an OSTree static delta in GVariant
-        /// framing. Unlike every other package format here it carries no magic at a
-        /// fixed offset and none is registered with `file(1)`, so the extension is
-        /// the identification.
-        Flatpak => "flatpak", Archive;
-        /// Gentoo binary package (GLEP 78 `.gpkg.tar`) — an uncompressed tar
-        /// bundling `metadata.tar.*`, `image.tar.*`, and a `Manifest`. Distinct
-        /// from a generic tar by its `.gpkg.tar` extension.
-        GentooBinpkg => "gentoo_binpkg", Archive;
-        /// Electron ASAR application archive (.asar)
-        Asar => "asar", Archive;
-        /// PHP archive in the native phar format: a PHP stub, a manifest, and
-        /// the packaged files. Tar- and zip-based phars are `tar` and `zip`.
-        Phar => "phar", Archive;
-        /// AppleScript source file (.applescript, .scpt)
-        AppleScript => "applescript", Script;
-        /// Apple Property List (.plist)
-        Plist => "plist", Config, STRUCTURED_DATA;
-        /// Compiled Interface Builder archive (.nib): the object graph AppKit or
-        /// UIKit instantiates for a window or view, in either the `NIBArchive`
-        /// layout or an `NSKeyedArchiver` binary plist. Distinct from `Plist`
-        /// because the graph names the app's own classes, action selectors,
-        /// and Swift modules, which is attribution a plain plist never carries.
-        Nib => "nib", Config, STRUCTURED_DATA;
-        /// Xcode project file (`project.pbxproj`) — an OpenStep-style property
-        /// list describing targets, build phases, and build settings. Kept
-        /// distinct from `Plist` because it is the only plist dialect that carries
-        /// executable build scripts, which is what makes it a supply-chain target.
-        Pbxproj => "pbxproj", Config, STRUCTURED_DATA;
-        /// CMake build script (`CMakeLists.txt`, `*.cmake`). Its own type rather
-        /// than generic text because it is executable build logic — `execute_process`
-        /// and `add_custom_command` run at configure and build time — so rules that
-        /// target build systems must be able to name it.
-        Cmake => "cmake", Config;
-        /// Rich Text Format document (.rtf)
-        Rtf => "rtf", Document;
-        /// Legacy Microsoft Office document (OLE2/CFBF: .doc, .xls, .ppt, .msg)
-        OleDoc => "ole_doc", Document;
-        /// Windows Installer package / patch (OLE2/CFBF: .msi, .msp). Same compound
-        /// container as [`OleDoc`](Self::OleDoc), but a distinct product surface (installer tables,
-        /// custom-action binaries, SummaryInformation) — not a document.
-        // Installer packages share the OLE2/CFBF wire format with OleDoc but
-        // are not documents — treat them as archive-class for mismatch
-        // transitions (e.g. an MSI renamed `.doc` is archive→document).
-        Msi => "msi", Archive;
-        /// Modern Microsoft Office document (OOXML: .docx, .xlsx, .pptx)
-        Ooxml => "ooxml", Document;
-        /// Windows Shell Link file (.lnk)
-        Lnk => "lnk", Binary;
-        /// JPEG image
-        Jpeg => "jpeg", Image;
-        /// PNG image
-        Png => "png", Image;
-        /// Tagged Image File Format (classic TIFF or BigTIFF).
-        Tiff => "tiff", Image;
-        /// AV1 Image File Format, identified by its ISO-BMFF brands.
-        Avif => "avif", Image;
-        /// RIFF audio (`.wav`). Chunked container; see formats/containers.rs.
-        Wav => "wav", Audio;
-        /// IFF audio (`.aiff`, `.aifc`).
-        Aiff => "aiff", Audio;
-        /// MPEG audio with optional ID3 tags (`.mp3`).
-        Mp3 => "mp3", Audio;
-        /// ISO base media (`.mp4`, `.m4a`, `.mov`) — a flat box sequence.
-        Mp4 => "mp4", Video;
-        /// Windows icon or cursor (`.ico`, `.cur`). The favicon every web package
-        /// ships and nobody opens, which is what makes it a carrier.
-        Ico => "ico", Image;
-        /// GIF image (`.gif`).
-        Gif => "gif", Image;
-        /// Windows bitmap (`.bmp`).
-        Bmp => "bmp", Image;
-        /// RIFF image (`.webp`).
-        Webp => "webp", Image;
-        /// Font container: sfnt (`.ttf`/`.otf`/`.ttc`), WOFF, WOFF2, or EOT.
-        /// One variant for the family because the abuse patterns are shared —
-        /// a payload wearing a font name, or a stowaway in the table gaps —
-        /// and the concrete container is reported as `font.format`.
-        Font => "font", Font;
-        /// SVG image (.svg) — XML-based vector graphic. Unlike raster images it
-        /// is text and can embed `<script>` / event handlers, making it a common
-        /// phishing/HTML-smuggling carrier; classified as media but scanned as XML.
-        Svg => "svg", Image;
-        /// Python pickle serialized data (.pkl, .pickle, .joblib)
-        Pickle => "pickle", Data;
-        /// PDF document
-        Pdf => "pdf", Document;
-        /// HTML document (.html, .htm)
-        Html => "html", Text;
-        /// JavaServer Pages (`.jsp`, `.jspx`). The page directive is unique to JSP.
-        Jsp => "jsp", Script;
-        /// Classic ASP and ASP.NET (`.asp`, `.aspx`, and the related suffixes).
-        Asp => "asp", Script;
-        /// ColdFusion Markup Language (`.cfm`, `.cfc`, `.cfml`).
-        Cfml => "cfml", Script;
-        /// TeX or LaTeX source (`.tex`, `.sty`, `.ltx`, `.dtx`). `.cls` is shared
-        /// with Visual Basic, so a class file is TeX only when its body says so.
-        Tex => "tex", Text;
-        /// YARA rule source (`.yar`, `.yara`).
-        // A detection ruleset, not prose. A `.yar` renamed `.txt` is
-        // config→text; it is not the same kind of file as a note.
-        Yara => "yara", Config;
-        /// PostScript or EPS (`.ps`, `.eps`).
-        PostScript => "postscript", Document;
-        /// DOS COM executable. No header of its own; `INT 21h` (`CD 21`) is the syscall.
-        DosCom => "dos_com", Binary, BINARY;
-        /// Headerless x86 / x86-64 position-independent code, recognised by the
-        /// GetPC idiom it opens with (see `fileid::shellcode`).
-        Shellcode => "shellcode", Binary, BINARY;
-        /// mIRC script (`.mrc`).
-        Mirc => "mirc", Script;
-        /// ircII or EPIC script. The `^on` / `^alias` hook syntax is the mark.
-        IrcII => "ircii", Script;
-        /// Markdown document (.md, .markdown)
-        Markdown => "markdown", Text, UNSUPPORTED;
-        /// Makefile / GNU Make build file
-        Makefile => "makefile", Config;
-        /// Dockerfile — container image build definition
-        Dockerfile => "dockerfile", Config;
-        /// OpenDocument Format (.odt, .ods, .odp, .odg) — ZIP-based office documents
-        Odf => "odf", Document, UNSUPPORTED;
-        /// OpenPGP signature (.sig, .asc) — the detached signature published beside
-        /// a release artifact. Both the ASCII-armored and binary packet forms.
-        /// Provenance evidence rather than payload, and named so a release directory
-        /// does not read as a pile of unknowns.
-        PgpSignature => "pgp_signature", Data;
-        /// Plain text data (.txt, .text, or printable text with no stronger type)
-        Text => "text", Text;
-        /// Opaque or sidecar data (.dat, .bin, .payload, .raw, and .map) — commonly carries
-        /// encrypted/XOR-d payloads or source-map embedded code. Routed through the generic analyzer
-        /// so string extraction, entropy, and encoded-payload detection still fire.
-        Data => "data", Data;
-        /// File type could not be determined
-        Unknown => "unknown", Data, UNSUPPORTED;
-    }
-}
-
-impl FileType {
-    /// Returns true for every type except `Unknown`, `Html`, `Markdown` and
-    /// `Odf`.
-    ///
-    /// Despite the name this is not limited to executable code: binaries,
-    /// scripts, manifests and archives count, and so do images, media, fonts,
-    /// plain text and opaque data.
-    #[must_use]
-    pub fn is_program(&self) -> bool {
-        !self.flags().contains(Flags::UNSUPPORTED)
-    }
-
-    /// Returns true if this file type is an archive or compressed container
-    /// whose members archive walkers can enumerate.
-    ///
-    /// This is narrower than the `"archive"` group: Flatpak bundles group as
-    /// archives for extension-mismatch purposes but stay opaque, because no
-    /// walker reads their OSTree delta framing yet. Windows Installer packages
-    /// group here too, and are read as OLE2 storage rather than walked.
-    #[must_use]
-    pub fn is_archive(&self) -> bool {
-        self.group() == Group::Archive && !matches!(self, Self::Flatpak | Self::Msi)
-    }
-
-    /// Returns true if this file type is a compiled native binary.
-    #[must_use]
-    pub fn is_binary(&self) -> bool {
-        self.flags().contains(Flags::BINARY)
-    }
-
-    /// Returns true if cleave supports analysis of this file type. Currently
-    /// the same as [`Self::is_program`], so `Unknown`, `Html`, `Markdown` and
-    /// `Odf` are not supported.
-    #[must_use]
-    pub fn is_supported(&self) -> bool {
-        self.is_program()
-    }
-
-    /// Returns true if this file type represents source code with AST support.
-    #[must_use]
-    pub fn is_source_code(&self) -> bool {
-        self.flags().contains(Flags::SOURCE_CODE)
-    }
-
-    /// Returns true for structured-manifest formats whose entire content is
-    /// parsed into the `values` tree (JSON/TOML/YAML manifests, plist, etc.).
-    ///
-    /// For these, the structured view *is* the content surface, so the
-    /// `strings(1)`-tier byte scan is suppressed — re-scanning the same bytes
-    /// would only duplicate the parsed tree as noise. This covers only the
-    /// named formats that are always fully parsed; generic `Json`/`Gyp` are
-    /// size-limited and intentionally fall back to a text scan when skipped.
-    #[must_use]
-    pub fn is_structured_data(&self) -> bool {
-        self.flags().contains(Flags::STRUCTURED_DATA)
-    }
-}
-
-impl std::fmt::Display for FileType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.label())
-    }
-}
-
-impl serde::Serialize for FileType {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.label())
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for FileType {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let label = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
-        Self::from_label(&label)
-            .ok_or_else(|| serde::de::Error::custom(format!("unknown FileType label: {label:?}")))
     }
 }
 
@@ -927,27 +283,19 @@ pub(crate) enum ExtensionMatch {
     /// extension's. Holds the type the shebang claimed.
     ShebangClaimed(FileType),
     /// The extension disagrees with the content by a known format convention
-    /// (see [`is_benign_extension_mismatch`]), so it is not reported as a
-    /// mismatch. Holds the type the extension implies, when it is known.
+    /// (see [`CONVENTIONS`]), so it is not reported as a mismatch. Holds the
+    /// type the extension implies, when it is known.
     Conventional(Option<FileType>),
 }
 
 impl ExtensionMatch {
-    /// How `ext`, the type the path's extension implies, relates to
-    /// `detected`, the type the content was identified as. An extension fileid
-    /// does not know is `Unknown` only when it names something; see
-    /// [`has_named_extension`].
-    fn of(path: &Path, ext: Option<FileType>, detected: FileType) -> Self {
-        match ext {
-            Some(FileType::Yaml) if is_yaml_dialect(detected) => Self::Consistent,
-            // A content-recognized npm lockfile remains a JSON document.
-            Some(FileType::Json) if detected == FileType::PackageLockJson => Self::Consistent,
-            // A phar is also written as a plain tar or zip archive.
-            Some(FileType::Phar) if matches!(detected, FileType::Tar | FileType::Zip) => {
-                Self::Consistent
-            }
+    /// How the type the name of `sniff` implies relates to `detected`, the
+    /// type the content was identified as. An extension fileid does not know
+    /// is `Unknown` only when it names something; see [`has_named_extension`].
+    fn of(sniff: &Sniff<'_>, detected: FileType) -> Self {
+        match sniff.ext_type() {
             Some(e) if e != detected => Self::Different(e),
-            None if has_named_extension(path) => Self::Unknown,
+            None if has_named_extension(sniff.path) => Self::Unknown,
             Some(_) | None => Self::Consistent,
         }
     }
@@ -991,6 +339,31 @@ pub struct Detection {
 }
 
 impl Detection {
+    /// `file_type`, found by `source`, set against what the name of `sniff`
+    /// implies.
+    fn found(sniff: &Sniff<'_>, file_type: FileType, source: DetectionSource) -> Self {
+        Self {
+            file_type,
+            source,
+            ext_match: ExtensionMatch::of(sniff, file_type),
+        }
+    }
+
+    /// `file_type`, found by content heuristics.
+    fn heuristic(sniff: &Sniff<'_>, file_type: FileType) -> Self {
+        Self::found(sniff, file_type, DetectionSource::Heuristic)
+    }
+
+    /// A type the name agrees with: the name's own claim, or one content
+    /// established with nothing in the name to contradict it.
+    fn named(file_type: FileType, source: DetectionSource) -> Self {
+        Self {
+            file_type,
+            source,
+            ext_match: ExtensionMatch::Consistent,
+        }
+    }
+
     /// True when content-based detection identified a different type than
     /// the file's extension implies.
     ///
@@ -1040,9 +413,25 @@ impl Detection {
 
     /// `self`, with a mismatch that is a known format convention no longer
     /// reported as one.
-    fn excuse_convention(mut self, path: &Path, data: &[u8]) -> Self {
-        if self.extension_mismatch() && is_benign_extension_mismatch(path, data, self) {
-            self.ext_match = ExtensionMatch::Conventional(self.extension_type());
+    fn excuse_convention(mut self, sniff: &Sniff<'_>) -> Self {
+        if !self.extension_mismatch() {
+            return self;
+        }
+        let ext = self.extension_type();
+        let case = Convention {
+            sniff,
+            ext,
+            content: self.file_type,
+        };
+        if let Some(&(name, _)) = CONVENTIONS.iter().find(|(_, holds)| holds(&case)) {
+            tracing::debug!(
+                target: "filefacts::fileid",
+                convention = name,
+                file_type = %self.file_type,
+                extension = ?ext,
+                "extension mismatch excused by format convention"
+            );
+            self.ext_match = ExtensionMatch::Conventional(ext);
         }
         self
     }
@@ -1068,195 +457,616 @@ fn is_shebang_juke(detected: FileType, ext_type: FileType) -> bool {
         )
 }
 
-fn allows_heuristic_extension_override(file_type: FileType) -> bool {
-    matches!(
-        file_type,
-        // A media extension is a container claim, not a language claim, and
-        // the whole point of naming a payload `fa-solid-500.woff2` or
-        // `favicon.ico` is that nothing looks inside. When the sniffer
-        // recognises real source in there, the source wins and
-        // `extension_mismatch` records the lie.
-        FileType::Data
-            | FileType::Font
-            // A signatureless image extension cannot establish that the
-            // bytes are an image. Let strong source-language heuristics win;
-            // real JPEG/PNG magic has already returned in stage 1.
-            | FileType::Jpeg
-            | FileType::Png
-            | FileType::Tiff
-            | FileType::Avif
-            | FileType::Wav
-            | FileType::Aiff
-            | FileType::Mp3
-            | FileType::Mp4
-            | FileType::Ico
-            | FileType::Gif
-            | FileType::Bmp
-            | FileType::Webp
-            | FileType::Zip
-            | FileType::Jar
-            | FileType::Xpi
-            | FileType::Whl
-            | FileType::Ooxml
-            | FileType::Odf
-            | FileType::Cab
-            | FileType::Chm
-            | FileType::Rar
-            | FileType::SevenZ
-            // `.a`/`.lib` claim an ar archive, and a real one starts with
-            // `!<arch>\n` -- magic that stage 1 always catches. So an `.a`
-            // that reaches this fallback is never a static library; the
-            // extension is the only thing saying otherwise. vxheaven names
-            // its samples `Virus.DOS.Jerusalem.1347.a`, `Exploit.HTML.
-            // HTHelp.a`, `Trojan.BAT.DelAll.a` -- a variant letter, not an
-            // extension -- and all twenty in the triage corpus were typed
-            // `static-lib` and analysed as opaque binaries. Letting the
-            // sniffer look inside recovers the HTML, batch and registry ones
-            // as what they are.
-            | FileType::StaticLib
-            // `.m` is Objective-C, and also where Perl, ASP, and mIRC samples
-            // get dumped. Real Objective-C that the scorer does not recognise
-            // stays Objective-C via the extension fallback. A body that is
-            // clearly another language should be that language.
-            | FileType::ObjectiveC
-            // `.bb` is Babashka, and also a vxheaven variant letter
-            // (`Backdoor.PHP.Agent.bb`). A body that is clearly another
-            // language should be that language; a Babashka script the scorer
-            // does not recognise stays Clojure via the extension.
-            | FileType::Clojure
-    )
+/// An extension/content disagreement weighed against the known conventions.
+struct Convention<'s, 'a> {
+    sniff: &'s Sniff<'a>,
+    /// The type the extension implies, when fileid knows it.
+    ext: Option<FileType>,
+    /// The type the content was identified as.
+    content: FileType,
 }
 
-/// Extensions that are a filename habit rather than a type claim. A mark may
-/// replace them. A real `.java` or `.py` may not.
-fn mark_replaces(file_type: FileType) -> bool {
-    matches!(
-        file_type,
-        FileType::Data
-            | FileType::Text
-            | FileType::Html
-            // An `.a` that reaches here has no `!<arch>` magic, so it claims
-            // nothing a mark could contradict.
-            | FileType::StaticLib
-            | FileType::ObjectiveC
-            | FileType::Lua
-            | FileType::Clojure
-            // An image suffix names a container, but without its signature it
-            // should not overrule unmistakable text/source content.
-            | FileType::Jpeg
-            | FileType::Png
-            | FileType::Tiff
-            | FileType::Avif
-            | FileType::JavaScript
-            | FileType::Python
-            | FileType::Vbs
-    )
+impl Convention<'_, '_> {
+    fn name_ends_ci(&self, suffix: &str) -> bool {
+        self.sniff
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| ext::ends_with_ci(n.as_bytes(), suffix.as_bytes()))
+    }
+
+    /// The legacy PyTorch and `torch.save` model suffixes.
+    fn torch_model_name(&self) -> bool {
+        [".pt", ".pth", ".ckpt"]
+            .iter()
+            .any(|suffix| self.name_ends_ci(suffix))
+    }
 }
 
-/// The UTF-8 byte-order mark. Windows editors write it ahead of scripts and
-/// markup alike, so content checks read past it.
-const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+/// Whether a convention holds for a disagreement.
+type Holds = fn(&Convention<'_, '_>) -> bool;
 
-/// `data` without a leading [`UTF8_BOM`].
-fn strip_utf8_bom(data: &[u8]) -> &[u8] {
-    data.strip_prefix(UTF8_BOM).unwrap_or(data)
+/// The format conventions under which an extension and the content disagree
+/// benignly, so the disagreement is not an evasion signal. The first that
+/// holds excuses the mismatch; the name is logged.
+const CONVENTIONS: &[(&str, Holds)] = &[
+    // macOS AppleDouble sidecars (`._name`) carry resource-fork bytes whose
+    // type intentionally differs from the extension.
+    ("appledouble_sidecar", |c| {
+        c.sniff
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("._"))
+    }),
+    // Apple localized `.strings` files use either binary or XML property
+    // lists. This says nothing about code disguised under that suffix.
+    ("apple_strings_plist", |c| {
+        c.content == FileType::Plist && c.name_ends_ci(".strings")
+    }),
+    // Legacy PyTorch uses pickle plus raw storage under its model suffixes.
+    // Its native magic and version framing are required; the suffix grants
+    // no trust.
+    ("torch_legacy_pickle", |c| {
+        c.content == FileType::Pickle && c.torch_model_name() && torch::legacy_header(c.sniff.data)
+    }),
+    // Modern torch.save and TorchScript keep those suffixes around a ZIP
+    // carrier. Central-directory and serialization-role framing is required;
+    // an arbitrary ZIP renamed `.pt` still disagrees with its suffix.
+    ("torch_zip_carrier", |c| {
+        c.content == FileType::Zip && c.torch_model_name() && torch::recognized(c.sniff)
+    }),
+    // Formats written in YAML or JSON: refining the generic document type to
+    // the specific one is agreement about the same file.
+    ("yaml_dialect", |c| {
+        c.ext == Some(FileType::Yaml)
+            && matches!(c.content, FileType::GithubActions | FileType::PnpmLock)
+    }),
+    ("npm_lockfile_json", |c| {
+        c.ext == Some(FileType::Json) && c.content == FileType::PackageLockJson
+    }),
+    // A phar is also written as a plain tar or zip archive.
+    ("phar_container", |c| {
+        c.ext == Some(FileType::Phar) && matches!(c.content, FileType::Tar | FileType::Zip)
+    }),
+    // An XML plist is an XML document. A binary plist named `.xml` still
+    // disagrees with that serialization and is not excused.
+    ("xml_plist", |c| {
+        let head = c.sniff.data.trim_ascii_start();
+        c.ext == Some(FileType::Xml)
+            && c.content == FileType::Plist
+            && (head.starts_with(b"<?xml") || head.starts_with(b"<plist"))
+    }),
+    // `.sig` is shared by OpenPGP and certificate-bearing signature
+    // containers; both are detached signatures.
+    ("signature_sidecar", |c| {
+        c.ext == Some(FileType::PgpSignature)
+            && c.content == FileType::CertificateSignature
+            && (c.name_ends_ci(".sig") || c.name_ends_ci(".sign"))
+    }),
+    // An Image4 payload name agrees with the trust cache it carries.
+    ("image4_payload", |c| {
+        c.content == FileType::Image4TrustCache
+            && (c.name_ends_ci(".im4p") || c.name_ends_ci(".trustcache"))
+    }),
+    // `.exe` is shared by the older 16-bit Windows NE format and PE.
+    ("ne_executable", |c| {
+        c.ext == Some(FileType::Pe) && c.content == FileType::Ne && c.name_ends_ci(".exe")
+    }),
+    // `.apk` names Android's zip and Alpine's gzip tar; the container
+    // decides which, and `.pkg` names macOS, FreeBSD and Arch packages.
+    ("shared_package_suffix", |c| {
+        (c.name_ends_ci(".apk") && matches!(c.content, FileType::ApkAndroid | FileType::ApkAlpine))
+            || (c.name_ends_ci(".pkg")
+                && matches!(c.content, FileType::PkgFreebsd | FileType::PkgArch))
+    }),
+    // The content refined a generic archive name to the package it holds
+    // (an npm `.tgz`, a Go module `.zip`, an OCI `.tar`): same container,
+    // same compression, so the name and the bytes agree on the archive.
+    ("package_in_generic_archive", |c| {
+        let data = c.sniff.data;
+        c.ext.is_some_and(|ext| {
+            let named = container_of(ext, data).or_else(|| {
+                // A bare codec name wraps whatever tar the content holds.
+                let codec = codec_of(ext)?;
+                container_of(c.content, data).filter(|inner| inner.compression == codec)
+            });
+            named.is_some() && named == container_of(c.content, data)
+        })
+    }),
+    // A Windows Script Host job or component declares its own language, and
+    // JScript is as much at home in a `.wsf` / `.wsc` as VBScript.
+    ("script_host_language", |c| {
+        c.ext == Some(FileType::Vbs)
+            && c.content == FileType::JavaScript
+            && (c.name_ends_ci(".wsf") || c.name_ends_ci(".wsc"))
+    }),
+    // XHTML served with a `.html` extension but parsed as XML.
+    ("xhtml", |c| {
+        let head = c.sniff.data.get(..4096).unwrap_or(c.sniff.data);
+        c.ext == Some(FileType::Html)
+            && c.content == FileType::Xml
+            && (text::contains_ci(head, b"<!doctype html") || text::contains_ci(head, b"<html"))
+    }),
+];
+
+/// The codec a single-file compression type names.
+const fn codec_of(ft: FileType) -> Option<Compression> {
+    match ft {
+        FileType::Gz => Some(Compression::Gzip),
+        FileType::Bz2 => Some(Compression::Bzip2),
+        FileType::Xz => Some(Compression::Xz),
+        FileType::Zst => Some(Compression::Zstd),
+        _ => None,
+    }
 }
 
-/// A leading tag. Used when the extension is a variant letter (`.sc`, `.ex`)
-/// rather than a claim that the body is that language.
-fn leading_markup(data: &[u8]) -> bool {
-    let rest = data.get(..32).unwrap_or(data).trim_ascii_start();
-    let starts = |prefix: &[u8]| {
-        rest.get(..prefix.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+/// Detect file type from content + path. Content is trusted first, extension as fallback.
+///
+/// Returns `None` if the file format cannot be identified. This is the same
+/// detection [`FileId::from_path_and_bytes`] makes, benign extension
+/// conventions included; only the XOR key of [`FileId::xor_pe_key`] is not
+/// carried.
+#[must_use]
+pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
+    identify(path, data).0
+}
+
+/// [`detect`], plus the key when the file is a PE under a repeating XOR key,
+/// as droppers ship their payload inside a jar or package (`hvnc.enc`,
+/// `payload.bin`). Magic cannot see such a file; as Data it reaches the
+/// generic analyzer, and the key lets the consumer decode the image. It is
+/// recovered from known plaintext and checked against the PE header, so this
+/// cannot claim random bytes. Only opaque outcomes (Data, or nothing
+/// recognised) are tried: anything else was identified by its own bytes.
+pub(crate) fn identify(path: &Path, data: &[u8]) -> (Option<Detection>, Option<RepeatingXorKey>) {
+    let sniff = Sniff::new(path, data);
+    let (detection, key) = match detect_known(&sniff) {
+        Some(d) if d.file_type == FileType::Data => (Some(d), recover_repeating_xor_pe(data)),
+        Some(d) => (Some(d), None),
+        None => match recover_repeating_xor_pe(data) {
+            // An unrecognised extension (`.enc`) says nothing that opaque
+            // data contradicts.
+            Some(key) => (
+                Some(Detection::named(FileType::Data, DetectionSource::Heuristic)),
+                Some(key),
+            ),
+            // Nothing recognised the file. A DOS COM in a store that names
+            // files by hash has no `.com` to go on, and carved shellcode has
+            // no name at all; Unknown is not analyzed, so the program shape
+            // is the last word.
+            None => (
+                headerless_program(data).map(|ft| Detection::heuristic(&sniff, ft)),
+                None,
+            ),
+        },
     };
-    starts(b"<script")
-        || starts(b"<html")
-        || starts(b"<!doctype")
-        || starts(b"<body")
-        || starts(b"<iframe")
+    if let Some(key) = key {
+        tracing::debug!(
+            target: "filefacts::fileid",
+            key_len = key.bytes().len(),
+            pe_offset = key.pe_offset(),
+            "repeating-XOR PE key recovered"
+        );
+    }
+    (detection.map(|d| d.excuse_convention(&sniff)), key)
 }
 
-/// `.sc` markup. Ammonite worksheets keep the extension; a leading tag does not.
-fn sc_name_is_markup(path: &Path, data: &[u8]) -> bool {
-    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-        return false;
-    };
-    ext.eq_ignore_ascii_case("sc") && leading_markup(data)
+/// One identification rule: the verdict it reaches on the sniffed input, or
+/// `None` to pass to the next.
+type Rule = fn(&Sniff<'_>) -> Option<Detection>;
+
+/// The rules [`identify`] tries, in priority order; the first verdict wins.
+/// Each is named for the decision log.
+const RULES: &[(&str, Rule)] = &[
+    ("signature", signature),
+    ("fat_boot_sector", fat_boot_sector),
+    ("jest_snapshot", jest_snapshot),
+    ("gcc_specs", gcc_specs),
+    ("git_config", git_config),
+    ("batch_polyglot", batch_polyglot),
+    ("restructuredtext_document", restructuredtext_document),
+    ("markdown_document", markdown_document),
+    ("unmistakable_mark", unmistakable_mark),
+    ("powershell_named_postscript", powershell_named_postscript),
+    ("cmake", cmake),
+    ("pyproject", pyproject),
+    ("language_score", language_score),
+    ("filename", filename),
+    ("named_text", named_text),
+    ("foreign_body", foreign_body),
+    ("binary_unit_file", binary_unit_file),
+    ("extension", extension),
+];
+
+/// Everything [`identify`] recognises without key recovery.
+fn detect_known(sniff: &Sniff<'_>) -> Option<Detection> {
+    let (rule, detection) = RULES
+        .iter()
+        .find_map(|&(name, rule)| rule(sniff).map(|d| (name, d)))?;
+    tracing::debug!(
+        target: "filefacts::fileid",
+        rule,
+        path = %sniff.path.display(),
+        len = sniff.data.len(),
+        file_type = %detection.file_type,
+        source = ?detection.source,
+        extension = ?sniff.ext_type(),
+        mismatch = detection.extension_mismatch(),
+        "identified"
+    );
+    Some(detection)
 }
 
-/// `.ex` is Elixir and a vxheaven variant letter. `.exs` stays Elixir.
-/// A leading mark of another format wins; `defmodule` does not.
-fn ex_variant_override(sniff: &Sniff<'_>) -> Option<FileType> {
-    let ext = sniff.path.extension().and_then(|e| e.to_str())?;
-    if !ext.eq_ignore_ascii_case("ex") {
+/// Magic bytes, shebangs and structural markers, settled against the name
+/// where the two are known to meet.
+fn signature(sniff: &Sniff<'_>) -> Option<Detection> {
+    let (file_type, source) = magic::detect_from_sniff(sniff)?;
+    let ext_ft = sniff.ext_type();
+    if file_type == FileType::Html {
+        if scripts::html_prefixed_batch(sniff.data) {
+            return Some(Detection::heuristic(sniff, FileType::Batch));
+        }
+        // A `.jsp` / `.asp` / `.cfm` page often opens with an HTML prologue.
+        // That prologue is magic for HTML, but the extension is what the
+        // server executes. Prefer it; the prologue is not a different type.
+        if let Some(ext_type) = ext_ft.filter(|ft| is_server_page(*ft)) {
+            return Some(Detection::named(ext_type, DetectionSource::Extension));
+        }
+        // A saved page can open with a doctype and still be the server
+        // page a few lines later. The mark replaces that HTML prologue
+        // the same way it replaces a `.txt` name.
+        if let Some(marked) = sniff.unmistakable().filter(|ft| is_server_page(*ft)) {
+            return Some(Detection::heuristic(sniff, marked));
+        }
+    }
+    if source == DetectionSource::Shebang {
+        // A Perl script that re-executes itself under Perl from a shell
+        // shebang is Perl, as its name says.
+        if file_type == FileType::Shell
+            && ext_ft == Some(FileType::Perl)
+            && perl_shell_shim::recognized(sniff.data)
+        {
+            return Some(Detection::named(FileType::Perl, DetectionSource::Heuristic));
+        }
+        // Shebang juke: the shebang is a 12-byte string an attacker can
+        // prepend to any file; the extension is what the user or loader
+        // treats the file as. JavaScript `.js` carrying `#!/bin/bash` is a
+        // textbook static-analysis evasion, so the extension is believed
+        // and the shebang's claim is kept beside it.
+        if let Some(ext_type) =
+            ext_ft.filter(|&ext| ext != file_type && is_shebang_juke(file_type, ext))
+        {
+            return Some(Detection {
+                file_type: ext_type,
+                source: DetectionSource::ExtensionOverridesShebang,
+                ext_match: ExtensionMatch::ShebangClaimed(file_type),
+            });
+        }
+        // Node, Deno and Bun all run TypeScript, so a JavaScript-runtime
+        // shebang on a `.ts` file names the runtime, not another language.
+        if file_type == FileType::JavaScript && ext_ft == Some(FileType::TypeScript) {
+            return Some(Detection::found(sniff, FileType::TypeScript, source));
+        }
+    }
+    Some(Detection::found(sniff, file_type, source))
+}
+
+/// The server-page types, whose sources open with HTML by design.
+const fn is_server_page(ft: FileType) -> bool {
+    matches!(ft, FileType::Jsp | FileType::Asp | FileType::Cfml)
+}
+
+/// A standalone FAT volume boot sector has no container magic, so its
+/// validated BPB identifies it before an opaque name can leave it unscanned.
+fn fat_boot_sector(sniff: &Sniff<'_>) -> Option<Detection> {
+    dos::looks_like_fat_boot_sector(sniff.data)
+        .then(|| Detection::heuristic(sniff, FileType::FatBootSector))
+}
+
+/// Jest's `.snap` files are CommonJS exports of template strings. The
+/// strings often contain HTML, which must not make the wrapper a page or
+/// send a text snapshot to the SquashFS extractor. Real filesystem
+/// signatures have already won.
+fn jest_snapshot(sniff: &Sniff<'_>) -> Option<Detection> {
+    let body = sniff.data.trim_ascii_start();
+    (matches!(sniff.ext_type(), Some(FileType::Snap | FileType::SquashFs))
+        && body.starts_with(b"// Jest Snapshot v")
+        && body
+            .split(|b| *b == b'\n')
+            .skip(1)
+            .find(|line| !line.trim_ascii().is_empty())
+            .is_some_and(|line| line.trim_ascii_start().starts_with(b"exports[")))
+    .then(|| Detection::heuristic(sniff, FileType::JavaScript))
+}
+
+/// GCC's extensionless specs files contain named `*spec:` sections. A name
+/// alone is ambiguous, so both the filename and a section header are
+/// required, and binary magic and executable shebangs have already won.
+fn gcc_specs(sniff: &Sniff<'_>) -> Option<Detection> {
+    let data = sniff.data;
+    (sniff.path.file_name().is_some_and(|name| name == "specs")
+        && magic::content_is_text(data)
+        && data.split(|b| *b == b'\n').any(|line| {
+            line.trim_ascii()
+                .strip_prefix(b"*")
+                .and_then(|s| s.strip_suffix(b":"))
+                .is_some_and(|name| {
+                    !name.is_empty() && name.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                })
+        }))
+    .then(|| Detection::heuristic(sniff, FileType::Text))
+}
+
+/// `.git/config` is normally extensionless. Its section/key structure is a
+/// strong content signature, and may correct even a misleading filename
+/// before source-language or exact-name fallbacks get a chance to win.
+fn git_config(sniff: &Sniff<'_>) -> Option<Detection> {
+    sniff
+        .looks_like_git_config()
+        .then(|| Detection::heuristic(sniff, FileType::Text))
+}
+
+/// A real batch prologue precedes the binary body in BAT/COM hybrids.
+/// Registered suffixes must not discard the same content evidence that
+/// identifies the hybrid under an unknown or prose suffix.
+fn batch_polyglot(sniff: &Sniff<'_>) -> Option<Detection> {
+    ((sniff.binary_not_source() || dos::looks_like_dos_com(sniff.data))
+        && scripts::binary_batch_prologue(sniff))
+    .then(|| Detection::heuristic(sniff, FileType::Batch))
+}
+
+/// ReStructuredText documents often contain executable-looking examples. A
+/// sectioned document with directives or literal blocks is a document by its
+/// content, even when those examples happen to score as a language or carry
+/// another format's mark.
+fn restructuredtext_document(sniff: &Sniff<'_>) -> Option<Detection> {
+    (sniff.ext_type() == Some(FileType::Text)
+        && sniff
+            .path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("rst"))
+        && restructuredtext::document_structure(sniff.data))
+    .then(|| Detection::named(FileType::Text, DetectionSource::Heuristic))
+}
+
+/// A document's fenced examples are not its execution language. Content
+/// stays first for scripts renamed `.md`; actual Markdown needs both a
+/// leading heading and a complete fenced block before this applies.
+fn markdown_document(sniff: &Sniff<'_>) -> Option<Detection> {
+    (sniff.ext_type() == Some(FileType::Markdown) && markdown::document_structure(sniff.data))
+        .then(|| Detection::named(FileType::Markdown, DetectionSource::Heuristic))
+}
+
+/// One unmistakable mark beats the language scorer. It replaces a name that
+/// yields to it (`.txt`, `.dat`, a container without its signature, a page),
+/// no name at all, and a language name whose body carries not one token of
+/// that language. A language the scorer cannot read cannot be shown absent,
+/// so its name stays what it says.
+fn unmistakable_mark(sniff: &Sniff<'_>) -> Option<Detection> {
+    let marked = sniff.unmistakable()?;
+    sniff
+        .claim()
+        .is_none_or(|c| {
+            c.file_type == marked
+                || c.yields_to_mark()
+                || (c.claims_language() && heuristics::lacks_language_evidence(c.file_type, sniff))
+        })
+        .then(|| Detection::heuristic(sniff, marked))
+}
+
+/// `.ps` is shared by PostScript and PowerShell. A strong PowerShell content
+/// score disambiguates script payloads, while the `%!PS` magic keeps real
+/// PostScript authoritative.
+fn powershell_named_postscript(sniff: &Sniff<'_>) -> Option<Detection> {
+    let data = sniff.data;
+    (sniff.ext_type() == Some(FileType::PostScript)
+        && !data.trim_ascii_start().starts_with(b"%!PS")
+        && (sniff.scored_type() == Some(FileType::PowerShell)
+            || heuristics::has_powershell_char_code_array(data)))
+    .then(|| Detection::heuristic(sniff, FileType::PowerShell))
+}
+
+/// CMake embeds compiler probes and arbitrary quoted strings, which can
+/// outscore its command syntax as Lua or C. When its mandated entry point or
+/// module extension carries recognizable CMake commands, the interpreter's
+/// type stands.
+fn cmake(sniff: &Sniff<'_>) -> Option<Detection> {
+    const COMMANDS: [&[u8]; 9] = [
+        b"cmake_minimum_required",
+        b"cmake_policy",
+        b"project",
+        b"add_library",
+        b"add_executable",
+        b"target_link_libraries",
+        b"find_package",
+        b"configure_file",
+        b"add_custom_command",
+    ];
+    if sniff.ext_type() != Some(FileType::Cmake) {
         return None;
     }
-    if let Some(marked) = sniff.unmistakable() {
-        return Some(marked);
-    }
     let data = sniff.data;
-    if leading_markup(data) || utf16le_markup(data) {
-        return Some(FileType::Html);
-    }
-    if leading_batch(data) {
-        return Some(FileType::Batch);
-    }
-    None
+    data.get(..16384)
+        .unwrap_or(data)
+        .split(|b| *b == b'\n')
+        .any(|line| {
+            let line = line.trim_ascii_start();
+            line.iter()
+                .position(|b| *b == b'(')
+                .and_then(|open| line.get(..open))
+                .is_some_and(|name| {
+                    let name = name.trim_ascii_end();
+                    COMMANDS
+                        .iter()
+                        .any(|command| name.eq_ignore_ascii_case(command))
+                })
+        })
+        .then(|| Detection::named(FileType::Cmake, DetectionSource::Heuristic))
 }
 
-fn leading_batch(data: &[u8]) -> bool {
-    let rest = data.get(..80).unwrap_or(data).trim_ascii_start();
-    if !rest
-        .get(..5)
-        .is_some_and(|head| head.eq_ignore_ascii_case(b"@echo"))
+/// Python project declarations re-collected without their mandated name.
+/// The document is parsed and PEP 621-specific fields are required; a
+/// generic `[project]` table or a quoted example is insufficient.
+fn pyproject(sniff: &Sniff<'_>) -> Option<Detection> {
+    let data = sniff.data;
+    if !sniff
+        .ext_type()
+        .is_none_or(|ft| matches!(ft, FileType::Text | FileType::PyProjectToml))
+        || data.len() > 1024 * 1024
+        || memchr::memmem::find(data, b"[project]").is_none()
     {
-        return false;
+        return None;
     }
-    let line = rest
-        .split(|b| *b == b'\n' || *b == b'\r')
-        .next()
-        .unwrap_or(rest);
-    line.windows(3).any(|w| w.eq_ignore_ascii_case(b"off"))
+    let table: toml::Table = std::str::from_utf8(data).ok()?.parse().ok()?;
+    let project = table.get("project")?.as_table()?;
+    (project.get("name").is_some_and(toml::Value::is_str)
+        && project
+            .get("requires-python")
+            .is_some_and(toml::Value::is_str)
+        && project
+            .get("dependencies")
+            .is_some_and(toml::Value::is_array))
+    .then(|| Detection::heuristic(sniff, FileType::PyProjectToml))
 }
 
-fn utf16le_markup(data: &[u8]) -> bool {
-    let Some(rest) = data.strip_prefix(b"\xff\xfe") else {
-        return false;
-    };
-    let (units, _) = rest.as_chunks::<2>();
-    let mut text = [0u8; 16];
-    let mut n = 0;
-    for (slot, &[lo, hi]) in text.iter_mut().zip(units) {
-        if hi != 0 {
-            return false;
-        }
-        *slot = lo;
-        n += 1;
+/// The language scorer replaces a name that yields to it, or none.
+/// Ordinary source extensions stay authoritative: keyword scoring is too
+/// weak to override `.go`, `.js`, `.swift`.
+fn language_score(sniff: &Sniff<'_>) -> Option<Detection> {
+    if !sniff.claim().is_none_or(|c| c.yields_to_scorer()) {
+        return None;
     }
-    leading_markup(text.get(..n).unwrap_or_default())
+    let file_type = sniff.scored_type()?;
+    Some(Detection::heuristic(sniff, file_type))
 }
 
-/// `.txt` / `.text` claim prose. They are listed as data formats so a note
-/// that mentions a keyword stays text, but a file whose body is clearly a
-/// language (`Php_Backdoor.txt`) should be that language. Other extensions
-/// that map to `Text` (OCaml `.ml`, CSS, SQL) stay on the extension.
-fn prose_extension_may_be_source(path: &Path) -> bool {
-    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-        return false;
+/// Content has had the first chance to identify the body. An exact filename
+/// is the fallback when its bytes carry no stronger evidence.
+fn filename(sniff: &Sniff<'_>) -> Option<Detection> {
+    let claim = sniff.claim().filter(|c| c.by_name)?;
+    Some(Detection::named(claim.file_type, DetectionSource::Filename))
+}
+
+/// Text under a named suffix fileid does not know (`.conf.local`). An
+/// extensionless file is left unclassified unless a stronger rule
+/// recognized it: plenty of opaque files are named without one.
+fn named_text(sniff: &Sniff<'_>) -> Option<Detection> {
+    (sniff.claim().is_none()
+        && has_named_extension(sniff.path)
+        && !sniff.data.is_empty()
+        && magic::content_is_text(sniff.data))
+    .then_some(Detection {
+        file_type: FileType::Text,
+        source: DetectionSource::Heuristic,
+        ext_match: ExtensionMatch::Unknown,
+    })
+}
+
+/// A language name on a body that is not that language: object code, a
+/// page, or another language the line grammars and the scorer are sure of
+/// while finding nothing of the claimed one. UTF-16 source is text here.
+fn foreign_body(sniff: &Sniff<'_>) -> Option<Detection> {
+    let ext = sniff.claim().filter(|c| c.claims_language())?.file_type;
+    let found = if sniff.binary_not_source() {
+        headerless_program(sniff.data).unwrap_or(FileType::Data)
+    } else {
+        heuristics::contradicts_extension(ext, sniff)?
     };
-    // `.txt` and `.md` name a document. The body is still scored first; the
-    // extension is only the fallback when that score finds no language.
-    // `.rmd` / `.qmd` stay markdown: those formats are prose with code chunks.
-    ext.eq_ignore_ascii_case("txt")
-        || ext.eq_ignore_ascii_case("text")
-        || ext.eq_ignore_ascii_case("md")
-        || ext.eq_ignore_ascii_case("markdown")
-        || ext.eq_ignore_ascii_case("rst")
-        || ext.eq_ignore_ascii_case("adoc")
-        || ext.eq_ignore_ascii_case("csv")
-        || ext.eq_ignore_ascii_case("tsv")
-        || ext.eq_ignore_ascii_case("log")
+    Some(Detection {
+        file_type: found,
+        source: DetectionSource::Heuristic,
+        ext_match: ExtensionMatch::Different(ext),
+    })
+}
+
+/// A unit file and a desktop entry are text; a binary body under either
+/// name is opaque data.
+fn binary_unit_file(sniff: &Sniff<'_>) -> Option<Detection> {
+    let ext = sniff
+        .ext_type()
+        .filter(|ft| matches!(ft, FileType::SystemdService | FileType::DesktopEntry))?;
+    sniff.binary_not_source().then_some(Detection {
+        file_type: FileType::Data,
+        source: DetectionSource::Heuristic,
+        ext_match: ExtensionMatch::Different(ext),
+    })
+}
+
+/// The extension fallback, once no content rule resolved and the name was
+/// not a well-known one.
+fn extension(sniff: &Sniff<'_>) -> Option<Detection> {
+    let file_type = sniff.ext_type()?;
+    let data = sniff.data;
+    let misnamed = || {
+        Some(Detection {
+            file_type: unclaimed_body_type(sniff),
+            source: DetectionSource::Heuristic,
+            ext_match: ExtensionMatch::Different(file_type),
+        })
+    };
+    // A format defined by its magic, whose magic the signature stage did not
+    // find. The name is the only thing claiming it, and the bytes have
+    // already said no.
+    if !data.is_empty() && file_type.strength() == file_type::Strength::MagicDefined {
+        return misnamed();
+    }
+    // `.m` is shared by Objective-C, MATLAB and Mercury. Objective-C carries
+    // directives the scorer knows (`#import`, `@interface`) or at least C
+    // statement structure; text with neither is not Objective-C because of
+    // its suffix.
+    if file_type == FileType::ObjectiveC
+        && !data.is_empty()
+        && !heuristics::has_language_evidence(file_type, sniff)
+        && !heuristics::looks_like_c_family(data)
+        && !heuristics::is_utf16_text(data)
+    {
+        return misnamed();
+    }
+    // A bitmap's header is decided by its signature. A `.dib` may leave out
+    // the 14-byte file header and start at the info header; anything else
+    // named `.bmp` is whatever its bytes are.
+    if file_type == FileType::Bmp && !data.is_empty() && !magic::looks_like_dib_header(data) {
+        return misnamed();
+    }
+    // Reaching this fallback means the body has no `<svg>` root, so the name
+    // is not a reason to call it an image: `logo.svg` holding a script is the
+    // script.
+    if file_type == FileType::Svg {
+        return misnamed();
+    }
+    // An HTML name requires markup in the body. The whole body is read: the
+    // name is what licenses looking past a short prefix, so front-padding
+    // cannot hide the page.
+    if file_type == FileType::Html && !heuristics::looks_like_html(sniff.text()) {
+        return None;
+    }
+    // A variant suffix after a dotted family name stands only when the
+    // content names nothing; markup names a page.
+    if sniff
+        .claim()
+        .is_some_and(|c| c.strength == file_type::Strength::Weak && c.claims_language())
+        && heuristics::looks_like_html(sniff.text())
+    {
+        return Some(Detection {
+            file_type: FileType::Html,
+            source: DetectionSource::Heuristic,
+            ext_match: ExtensionMatch::Different(file_type),
+        });
+    }
+    // `.bin`/`.dat`/`.raw` say nothing about the content, and carved
+    // programs routinely carry them. A program-shaped body under a generic
+    // data name is the program.
+    if file_type == FileType::Data
+        && let Some(program) = headerless_program(data)
+    {
+        return Some(Detection {
+            file_type: program,
+            source: DetectionSource::Heuristic,
+            ext_match: ExtensionMatch::Different(FileType::Data),
+        });
+    }
+    Some(Detection::named(file_type, DetectionSource::Extension))
 }
 
 /// True when a path's trailing dot-segment is a named extension rather than
@@ -1266,16 +1076,14 @@ fn prose_extension_may_be_source(path: &Path) -> bool {
 /// an extension of `"0"`, `react-redux@7.1.25` reports `"25"`, and `python3.11`
 /// reports `"11"`. Registry artifacts are routinely named this way — npm, crates
 /// and gem tarballs are stored as `<name>@<semver>` with no suffix at all.
+/// A run of digits claims nothing about a file's format, so it is not
+/// something content can disagree with. The `.so.1.1` case has its own
+/// handling in `ext::has_versioned_so_suffix`, which assigns the type.
 ///
 /// An unregistered UpperCamelCase tail after a dotted stem is often a module
 /// or executable name, such as `org.example.MyModule` or `us.zoom.ZoomDaemon`,
 /// rather than a claim that the file has an unknown suffix. Known extensions
 /// are resolved separately and still take precedence.
-///
-/// Treating version digits as unrecognized extensions made packages appear to
-/// mismatch their content. A run of digits claims nothing about a file's format,
-/// so it is not something content can disagree with. The `.so.1.1` case has its
-/// own handling in `ext::has_versioned_so_suffix`, which assigns the type.
 fn has_named_extension(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
@@ -1294,683 +1102,10 @@ fn has_named_extension(path: &Path) -> bool {
     !dotted_camel_case_tail
 }
 
-/// True for the specific formats that are *written in* YAML. Their `.yml` /
-/// `.yaml` extension resolves to the generic [`FileType::Yaml`], so content
-/// detection refining it to one of these is agreement about the same file, not
-/// a masquerade — the relationship `.json` already has with `package.json`.
-const fn is_yaml_dialect(ft: FileType) -> bool {
-    matches!(ft, FileType::GithubActions | FileType::PnpmLock)
-}
-
-/// Canonical protocol-2 legacy torch serialization magic and version framing.
-/// This identifies the bounded multi-pickle carrier convention, not trust or
-/// whole-file validity. Other torch serialization protocols are not covered.
-pub(crate) fn torch_protocol2_legacy_header(data: &[u8]) -> bool {
-    data.starts_with(&[
-        0x80, 2, 0x8a, 10, 0x6c, 0xfc, 0x9c, 0x46, 0xf9, 0x20, 0x6a, 0xa8, 0x50, 0x19, b'.', 0x80,
-        2, b'M', 0xe9, 3, b'.',
-    ])
-}
-
-/// True when an extension/content disagreement is a known benign format
-/// convention rather than an evasion signal. Mirrors the carve-outs cleave
-/// previously applied before emitting `metadata/file-extension-mismatch`.
-fn is_benign_extension_mismatch(path: &Path, data: &[u8], det: Detection) -> bool {
-    // macOS AppleDouble sidecars (`._name`) carry resource-fork bytes whose
-    // type intentionally differs from the extension — convention, not evasion.
-    if path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with("._"))
-    {
-        return true;
-    }
-    // Apple localized .strings files use either binary or XML property lists.
-    // This convention says nothing about code disguised under that suffix.
-    let strings_suffix = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .is_some_and(|s| s.eq_ignore_ascii_case("strings"));
-    if strings_suffix && det.file_type == FileType::Plist {
-        return true;
-    }
-    // Legacy PyTorch uses pickle plus raw storage under these model suffixes.
-    // Require its native magic/version framing; the suffix grants no trust.
-    let torch_model_suffix = path.extension().and_then(|s| s.to_str()).is_some_and(|s| {
-        ["pt", "pth", "ckpt"]
-            .iter()
-            .any(|ext| s.eq_ignore_ascii_case(ext))
-    });
-    if torch_model_suffix
-        && det.file_type == FileType::Pickle
-        && torch_protocol2_legacy_header(data)
-    {
-        return true;
-    }
-    // Modern torch.save and TorchScript keep their .pt/.pth/.ckpt suffixes
-    // around a ZIP carrier. Require central-directory and serialization-role
-    // framing; an arbitrary ZIP renamed .pt still disagrees with its suffix.
-    if torch_model_suffix && det.file_type == FileType::Zip && torch_zip::recognized(data) {
-        return true;
-    }
-    let Some(ext_type) = det.extension_type() else {
-        return false;
-    };
-    let content = det.file_type;
-    let name_ends_ci = |suffix: &str| {
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| ext::ends_with_ci(n.as_bytes(), suffix.as_bytes()))
-    };
-    // An XML plist is an XML document. A binary plist named .xml still
-    // disagrees with that serialization and is deliberately not exempted.
-    if ext_type == FileType::Xml
-        && content == FileType::Plist
-        && (data.trim_ascii_start().starts_with(b"<?xml")
-            || data.trim_ascii_start().starts_with(b"<plist"))
-    {
-        return true;
-    }
-    // `.sig` is shared by OpenPGP and certificate-bearing signature
-    // containers. Refining the latter from its complete framing is a format
-    // distinction, not a misleading extension.
-    if ext_type == FileType::PgpSignature
-        && content == FileType::Data
-        && (name_ends_ci(".sig") || name_ends_ci(".sign"))
-        && magic::certificate_signature_data(data)
-    {
-        return true;
-    }
-    // `.exe` is shared by the older 16-bit Windows NE format and PE. The
-    // extension database resolves it to PE, but NE content is a valid `.exe`.
-    if name_ends_ci(".exe") && ext_type == FileType::Pe && content == FileType::Ne {
-        return true;
-    }
-    // Android/Alpine APK: `.apk` (extension maps to Zip) resolved by container
-    // magic to the ecosystem-specific type. Both are legitimate `.apk`s — the
-    // disambiguation is the point, not an evasion signal.
-    if name_ends_ci(".apk")
-        && ext_type == FileType::Zip
-        && matches!(content, FileType::ApkAndroid | FileType::ApkAlpine)
-    {
-        return true;
-    }
-    // Content detection refined a generic-archive extension to a specific
-    // package ecosystem (npm `.tgz`, Arch/FreeBSD `.pkg*`). The extension's
-    // generic archive type and the content's specific archive type agree on
-    // being an archive — a benign refinement, not a masquerade.
-    if matches!(
-        content,
-        FileType::Npm
-            | FileType::GoModule
-            | FileType::Composer
-            | FileType::Hex
-            | FileType::Pub
-            | FileType::Cran
-            | FileType::Cpan
-            | FileType::Hackage
-            | FileType::Crate
-            | FileType::PkgFreebsd
-            | FileType::PkgArch
-            | FileType::PythonSdist
-            | FileType::OciImage
-            | FileType::Xbps
-            | FileType::GentooBinpkg
-    ) && ext_type.is_archive()
-    {
-        return true;
-    }
-    // A Windows Script Host job or component declares its own language, and
-    // JScript is as much at home in a `.wsf` / `.wsc` as VBScript.
-    if ext_type == FileType::Vbs
-        && content == FileType::JavaScript
-        && (name_ends_ci(".wsf") || name_ends_ci(".wsc"))
-    {
-        return true;
-    }
-    // XHTML served with a `.html` extension but parsed as XML.
-    if ext_type == FileType::Html && content == FileType::Xml {
-        let head = data.get(..4096).unwrap_or(data);
-        let prefix = String::from_utf8_lossy(head).to_ascii_lowercase();
-        return prefix.contains("<!doctype html") || prefix.contains("<html");
-    }
-    false
-}
-
-/// Detect file type from content + path. Content is trusted first, extension as fallback.
-///
-/// Returns `None` if the file format cannot be identified. This is the same
-/// detection [`FileId::from_path_and_bytes`] makes, benign extension
-/// conventions included; only the XOR key of [`FileId::xor_pe_key`] is not
-/// carried.
-#[must_use]
-pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
-    identify(path, data).0
-}
-
-/// [`detect`], plus the key when the file is a PE under a repeating XOR key,
-/// as droppers ship their payload inside a jar or package (`hvnc.enc`,
-/// `payload.bin`). Magic cannot see such a file, and as Unknown it was skipped
-/// outright; as Data it reaches the generic analyzer, and the key lets the
-/// consumer decode the image. It is recovered from known plaintext and checked
-/// against the PE header, so this cannot claim random bytes. Only opaque
-/// outcomes (Data, or nothing recognised) are tried: anything else was
-/// identified by its own bytes.
-pub(crate) fn identify(path: &Path, data: &[u8]) -> (Option<Detection>, Option<RepeatingXorKey>) {
-    let (detection, key) = match detect_known(&Sniff::new(path, data)) {
-        Some(d) if d.file_type == FileType::Data => (Some(d), recover_repeating_xor_pe(data)),
-        Some(d) => (Some(d), None),
-        None => match recover_repeating_xor_pe(data) {
-            // An unrecognised extension (`.enc`) says nothing that opaque
-            // data contradicts.
-            Some(key) => (
-                Some(Detection {
-                    file_type: FileType::Data,
-                    source: DetectionSource::Heuristic,
-                    ext_match: ExtensionMatch::Consistent,
-                }),
-                Some(key),
-            ),
-            None => (unnamed_program(path, data), None),
-        },
-    };
-    (detection.map(|d| d.excuse_convention(path, data)), key)
-}
-
-/// Everything [`identify`] recognises without key recovery.
-///
-/// The stages consult `sniff` for anything more than one of them derives, so
-/// each derivation runs once however many stages ask for it.
-fn detect_known(sniff: &Sniff<'_>) -> Option<Detection> {
-    let (path, data) = (sniff.path, sniff.data);
-    let ext_ft = sniff.ext_type();
-
-    // Stage 1: Content-based detection (magic bytes, shebangs)
-    if let Some((file_type, source)) = magic::detect_from_sniff(sniff) {
-        // A `.jsp` / `.asp` / `.cfm` page often opens with an HTML prologue.
-        // That prologue is magic for HTML, but the extension is what the
-        // server executes. Prefer it; the prologue is not a different type.
-        if file_type == FileType::Html {
-            if scripts::html_prefixed_batch(data) {
-                return Some(Detection {
-                    file_type: FileType::Batch,
-                    source: DetectionSource::Heuristic,
-                    ext_match: ExtensionMatch::of(path, ext_ft, FileType::Batch),
-                });
-            }
-            if let Some(ext_type) = ext_ft {
-                if matches!(ext_type, FileType::Jsp | FileType::Asp | FileType::Cfml) {
-                    return Some(Detection {
-                        file_type: ext_type,
-                        source: DetectionSource::Extension,
-                        ext_match: ExtensionMatch::Consistent,
-                    });
-                }
-            }
-            // A saved page can open with a doctype and still be the server
-            // page a few lines later. The mark replaces that HTML prologue
-            // the same way it replaces a `.txt` name.
-            if let Some(marked) = sniff.unmistakable() {
-                if matches!(marked, FileType::Jsp | FileType::Asp | FileType::Cfml) {
-                    return Some(Detection {
-                        file_type: marked,
-                        source: DetectionSource::Heuristic,
-                        ext_match: ExtensionMatch::of(path, ext_ft, marked),
-                    });
-                }
-            }
-        }
-
-        // Shebang-juke override: when the shebang claims a different scripting
-        // language than the file's extension implies, and both languages are
-        // plausible (script ↔ script), prefer the extension. The shebang is
-        // a 12-byte string an attacker can prepend to any file; the extension
-        // is what the user/loader treats the file as. JavaScript ".js" carrying
-        // a "#!/bin/bash" shebang is a textbook static-analysis evasion seen
-        // in the npm xmlrpc supply-chain compromise (2024) and similar.
-        if source == DetectionSource::Shebang
-            && file_type == FileType::Shell
-            && ext_ft == Some(FileType::Perl)
-            && perl_shell_shim::recognized(data)
-        {
-            return Some(Detection {
-                file_type: FileType::Perl,
-                source: DetectionSource::Heuristic,
-                ext_match: ExtensionMatch::Consistent,
-            });
-        }
-        if source == DetectionSource::Shebang {
-            if let Some(ext_type) = ext_ft {
-                if ext_type != file_type && is_shebang_juke(file_type, ext_type) {
-                    // Distinct source variant lets callers tell the juke case
-                    // apart from a normal shebang detection. ext_match stores
-                    // the type the shebang claimed.
-                    return Some(Detection {
-                        file_type: ext_type,
-                        source: DetectionSource::ExtensionOverridesShebang,
-                        ext_match: ExtensionMatch::ShebangClaimed(file_type),
-                    });
-                }
-            }
-        }
-
-        // Node, Deno and Bun all run TypeScript, so a JavaScript-runtime
-        // shebang on a `.ts` file names the runtime, not another language.
-        let file_type = if source == DetectionSource::Shebang
-            && file_type == FileType::JavaScript
-            && ext_ft == Some(FileType::TypeScript)
-        {
-            FileType::TypeScript
-        } else {
-            file_type
-        };
-
-        return Some(Detection {
-            file_type,
-            source,
-            ext_match: ExtensionMatch::of(path, ext_ft, file_type),
-        });
-    }
-
-    // A standalone FAT volume boot sector has no container magic. Identify its
-    // validated BPB before an opaque/unknown extension can leave it unscanned.
-    if heuristics::looks_like_fat_boot_sector(data) {
-        return Some(Detection {
-            file_type: FileType::Data,
-            source: DetectionSource::Heuristic,
-            ext_match: ExtensionMatch::of(path, ext_ft, FileType::Data),
-        });
-    }
-
-    // Jest's `.snap` files are CommonJS exports of template strings. The
-    // strings often contain HTML, which should not make the wrapper a page
-    // or send a text snapshot to the SquashFS extractor. Real filesystem
-    // signatures have already won in stage 1.
-    if matches!(ext_ft, Some(FileType::Snap | FileType::SquashFs))
-        && data.trim_ascii_start().starts_with(b"// Jest Snapshot v")
-        && data
-            .trim_ascii_start()
-            .split(|b| *b == b'\n')
-            .skip(1)
-            .find(|line| !line.trim_ascii().is_empty())
-            .is_some_and(|line| line.trim_ascii_start().starts_with(b"exports["))
-    {
-        return Some(Detection {
-            file_type: FileType::JavaScript,
-            source: DetectionSource::Heuristic,
-            ext_match: ExtensionMatch::of(path, ext_ft, FileType::JavaScript),
-        });
-    }
-
-    // GCC's extensionless specs files contain named `*spec:` sections. A
-    // name alone is ambiguous, so require both the filename and a section
-    // header, and let binary magic and executable shebangs win above.
-    if path.file_name().is_some_and(|name| name == "specs")
-        && magic::content_is_text(data)
-        && data.split(|b| *b == b'\n').any(|line| {
-            let line = line.trim_ascii();
-            line.strip_prefix(b"*")
-                .and_then(|s| s.strip_suffix(b":"))
-                .is_some_and(|name| {
-                    !name.is_empty() && name.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
-                })
-        })
-    {
-        return Some(Detection {
-            file_type: FileType::Text,
-            source: DetectionSource::Heuristic,
-            ext_match: ExtensionMatch::of(path, ext_ft, FileType::Text),
-        });
-    }
-
-    // `.git/config` is normally extensionless. Its section/key structure is
-    // a strong content signature, and may correct even a misleading filename
-    // before source-language or exact-name fallbacks get a chance to win.
-    if sniff.looks_like_git_config() {
-        return Some(Detection {
-            file_type: FileType::Text,
-            source: DetectionSource::Heuristic,
-            ext_match: ExtensionMatch::of(path, ext_ft, FileType::Text),
-        });
-    }
-    // A real batch prologue precedes the binary body in BAT/COM hybrids.
-    // Registered suffixes must not discard the same content evidence that
-    // identifies the hybrid under an unknown or prose suffix.
-    if (sniff.binary_not_source()
-        || (heuristics::looks_like_dos_com(data) && std::str::from_utf8(data).is_err()))
-        && scripts::binary_batch_prologue(data)
-    {
-        return Some(Detection {
-            file_type: FileType::Batch,
-            source: DetectionSource::Heuristic,
-            ext_match: ExtensionMatch::of(path, ext_ft, FileType::Batch),
-        });
-    }
-    let heuristic_may_override_ext = ext_ft.is_none_or(allows_heuristic_extension_override);
-
-    // `.sc` is an Ammonite worksheet and also a vxheaven variant letter.
-    // A worksheet starts with Scala. A file whose first token is markup is
-    // the page, and `.scala` is left alone.
-    if sc_name_is_markup(path, data) {
-        return Some(Detection {
-            file_type: FileType::Html,
-            source: DetectionSource::Heuristic,
-            ext_match: ExtensionMatch::Different(FileType::Scala),
-        });
-    }
-    if let Some(kind) = ex_variant_override(sniff) {
-        return Some(Detection {
-            file_type: kind,
-            source: DetectionSource::Heuristic,
-            ext_match: ExtensionMatch::Different(FileType::Elixir),
-        });
-    }
-
-    // One unmistakable mark beats the language scorer. It only replaces a
-    // weak or absent extension (`.txt`, `.m`, `.lua`, a page typed HTML
-    // because of a prologue). A `.java` or `.py` name stays what it says.
-    if let Some(marked) = sniff.unmistakable() {
-        if ext_ft.is_none_or(|ext| ext == marked || mark_replaces(ext)) {
-            return Some(Detection {
-                file_type: marked,
-                source: DetectionSource::Heuristic,
-                ext_match: ExtensionMatch::of(path, ext_ft, marked),
-            });
-        }
-    }
-
-    // `.ps` is shared by PostScript and PowerShell. A strong PowerShell content
-    // score disambiguates script payloads, while the `%!PS` magic above keeps
-    // real PostScript authoritative.
-    if ext_ft == Some(FileType::PostScript)
-        && !data.trim_ascii_start().starts_with(b"%!PS")
-        && (sniff.scored_type() == Some(FileType::PowerShell)
-            || heuristics::has_powershell_char_code_array(data))
-    {
-        return Some(Detection {
-            file_type: FileType::PowerShell,
-            source: DetectionSource::Heuristic,
-            ext_match: ExtensionMatch::Different(FileType::PostScript),
-        });
-    }
-
-    // ReStructuredText documents often contain executable-looking examples.
-    // A sectioned document with directives or literal blocks is a document by
-    // its content, even when those examples happen to score as a source language.
-    if ext_ft == Some(FileType::Text)
-        && path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("rst"))
-        && restructuredtext::document_structure(data)
-    {
-        return Some(Detection {
-            file_type: FileType::Text,
-            source: DetectionSource::Heuristic,
-            ext_match: ExtensionMatch::Consistent,
-        });
-    }
-
-    // A document's fenced examples are not its execution language. Keep
-    // content-first detection for scripts renamed .md; actual Markdown needs
-    // both a leading heading and a complete fenced block before this applies.
-    if ext_ft == Some(FileType::Markdown) && markdown::document_structure(data) {
-        return Some(Detection {
-            file_type: FileType::Markdown,
-            source: DetectionSource::Heuristic,
-            ext_match: ExtensionMatch::Consistent,
-        });
-    }
-
-    // CMake embeds compiler probes and arbitrary quoted strings, which can
-    // outscore its command syntax as Lua or C. When its mandated entry point
-    // or module extension carries recognizable CMake commands, retain the
-    // interpreter's type. Strong magic and content marks above still win.
-    if ext_ft == Some(FileType::Cmake) && has_cmake_commands(data) {
-        return Some(Detection {
-            file_type: FileType::Cmake,
-            source: DetectionSource::Heuristic,
-            ext_match: ExtensionMatch::Consistent,
-        });
-    }
-
-    // Re-collected Python project declarations may lose the mandated basename.
-    // Parse the document and require PEP 621-specific fields before claiming
-    // this type; a generic [project] table or quoted example is insufficient.
-    if ext_ft.is_none_or(|ft| matches!(ft, FileType::Text | FileType::PyProjectToml))
-        && data.len() <= 1024 * 1024
-        && data.windows(9).any(|w| w == b"[project]")
-        && std::str::from_utf8(data)
-            .ok()
-            .and_then(|s| s.parse::<toml::Table>().ok())
-            .and_then(|t| t.get("project").and_then(toml::Value::as_table).cloned())
-            .is_some_and(|p| {
-                p.get("name").is_some_and(toml::Value::is_str)
-                    && p.get("requires-python").is_some_and(toml::Value::is_str)
-                    && p.get("dependencies").is_some_and(toml::Value::is_array)
-            })
-    {
-        return Some(Detection {
-            file_type: FileType::PyProjectToml,
-            source: DetectionSource::Heuristic,
-            ext_match: ExtensionMatch::of(path, ext_ft, FileType::PyProjectToml),
-        });
-    }
-
-    // Stage 3: Content heuristics can override a filename-only type and weak
-    // extensions, and inspect extension-claimed containers/polyglots. Ordinary
-    // source extensions stay authoritative here: language keyword scoring is
-    // too weak to override `.go`, `.js`, `.swift`, etc. A non-magic `.zip` body
-    // may still be a script payload wearing an archive name.
-    if ((heuristic_may_override_ext || sniff.is_filename_match()) && !ext::is_data_format(path))
-        || prose_extension_may_be_source(path)
-    {
-        if let Some(file_type) = sniff.scored_type() {
-            return Some(Detection {
-                file_type,
-                source: DetectionSource::Heuristic,
-                ext_match: ExtensionMatch::of(path, ext_ft, file_type),
-            });
-        }
-    }
-
-    // Content signatures and language patterns have had the first chance to
-    // identify the body. An exact filename is only a fallback when its bytes
-    // carry no stronger evidence.
-    if sniff.is_filename_match() {
-        if let Some(file_type) = ext_ft {
-            return Some(Detection {
-                file_type,
-                source: DetectionSource::Filename,
-                ext_match: ExtensionMatch::Consistent,
-            });
-        }
-    }
-
-    // The fast text probe handles named but unregistered suffixes such as `.conf`.
-    // Leave extensionless files unclassified unless a stronger content rule
-    // recognizes them; many corpus files use opaque extensionless names.
-    if ext_ft.is_none()
-        && has_named_extension(path)
-        && !data.is_empty()
-        && magic::content_is_text(data)
-    {
-        return Some(Detection {
-            file_type: FileType::Text,
-            source: DetectionSource::Heuristic,
-            ext_match: ExtensionMatch::Unknown,
-        });
-    }
-
-    // Object code with a source extension is not that language. DOS COM samples
-    // named `Burger.m` or `Trivial.45.t` used to inherit Objective-C or Perl
-    // from the suffix. UTF-16 source is excluded inside `binary_not_source`.
-    if let Some(ext) = ext_ft.filter(|ft| claims_source(*ft)) {
-        if sniff.binary_not_source() {
-            return Some(Detection {
-                file_type: binary_body_type(data),
-                source: DetectionSource::Heuristic,
-                ext_match: ExtensionMatch::Different(ext),
-            });
-        }
-        // Text the extension misnames: a page, or another language the scorer
-        // is sure of while finding nothing of the claimed one.
-        if let Some(found) = heuristics::contradicts_extension(ext, sniff) {
-            return Some(Detection {
-                file_type: found,
-                source: DetectionSource::Heuristic,
-                ext_match: ExtensionMatch::Different(ext),
-            });
-        }
-    }
-
-    // A unit file and a desktop entry are text. The `.Service` on
-    // `Virus.Boot.Stoned.Service` is a variant letter on a boot sector,
-    // and a binary `.desktop` is the same kind of misname.
-    if let Some(ext) =
-        ext_ft.filter(|ft| matches!(ft, FileType::SystemdService | FileType::DesktopEntry))
-    {
-        if sniff.binary_not_source() {
-            return Some(Detection {
-                file_type: FileType::Data,
-                source: DetectionSource::Heuristic,
-                ext_match: ExtensionMatch::Different(ext),
-            });
-        }
-    }
-
-    // Stage 4: Extension fallback (used when no content-first detector resolved
-    // and the filename was not well-known).
-    if let Some(file_type) = ext_ft {
-        // A format defined by its magic, whose magic stage 1 did not find. The
-        // name is the only thing claiming it, and the bytes have already said
-        // no: vxheaven's `.a` variant letter made 200+ DOS programs, boot
-        // sectors and batch files "static libraries", and an HTML page named
-        // `.ko` became an ELF module.
-        if !data.is_empty() && is_magic_defined(file_type) {
-            return Some(Detection {
-                file_type: unclaimed_body_type(sniff),
-                source: DetectionSource::Heuristic,
-                ext_match: ExtensionMatch::Different(file_type),
-            });
-        }
-        // `.m` is where every misnamed sample lands. Objective-C carries
-        // directives the scorer knows (`#import`, `@interface`) or at least C
-        // statement structure; text with neither is not Objective-C because
-        // of its last letter.
-        if file_type == FileType::ObjectiveC
-            && !data.is_empty()
-            && !heuristics::has_language_evidence(file_type, data)
-            && !heuristics::looks_like_c_family(data)
-            && !heuristics::is_utf16_text(data)
-        {
-            return Some(Detection {
-                file_type: unclaimed_body_type(sniff),
-                source: DetectionSource::Heuristic,
-                ext_match: ExtensionMatch::Different(file_type),
-            });
-        }
-        // A bitmap's header is decided in stage 1. A `.dib` may leave out the
-        // 14-byte file header and start at the info header; anything else
-        // named `.bmp` is whatever its bytes are, not an image because of its
-        // name.
-        if file_type == FileType::Bmp && !data.is_empty() && !magic::looks_like_dib_header(data) {
-            return Some(Detection {
-                file_type: unclaimed_body_type(sniff),
-                source: DetectionSource::Heuristic,
-                ext_match: ExtensionMatch::Different(FileType::Bmp),
-            });
-        }
-        // SVG magic is decided in stage 1. Reaching this fallback means the
-        // body has no `<svg>` root, so the name is not a reason to call it an
-        // image. `logo.svg` containing a script is the script.
-        if file_type == FileType::Svg {
-            return Some(Detection {
-                file_type: unclaimed_body_type(sniff),
-                source: DetectionSource::Heuristic,
-                ext_match: ExtensionMatch::Different(FileType::Svg),
-            });
-        }
-        // HTML extension requires content validation. Use the extended window:
-        // reaching here means the filename claims HTML, and that claim is what
-        // licenses looking past a short prefix. Otherwise front-padding the file
-        // downgrades it to Unknown, which matches no trait at all.
-        if file_type == FileType::Html
-            && !heuristics::looks_like_html(sniff.decoded().unwrap_or(data))
-        {
-            return None;
-        }
-        // `.bin`/`.dat`/`.raw` say nothing about the content, and DOS samples
-        // and carved shellcode routinely carry them. A program-shaped body
-        // under a generic data name is the program, not opaque data.
-        if file_type == FileType::Data {
-            if let Some(program) = headerless_program(data) {
-                return Some(Detection {
-                    file_type: program,
-                    source: DetectionSource::Heuristic,
-                    ext_match: ExtensionMatch::Different(FileType::Data),
-                });
-            }
-        }
-        return Some(Detection {
-            file_type,
-            source: DetectionSource::Extension,
-            ext_match: ExtensionMatch::Consistent,
-        });
-    }
-
-    None
-}
-
-fn has_cmake_commands(data: &[u8]) -> bool {
-    let commands: [&[u8]; 9] = [
-        b"cmake_minimum_required",
-        b"cmake_policy",
-        b"project",
-        b"add_library",
-        b"add_executable",
-        b"target_link_libraries",
-        b"find_package",
-        b"configure_file",
-        b"add_custom_command",
-    ];
-    data.get(..16384)
-        .unwrap_or(data)
-        .split(|b| *b == b'\n')
-        .any(|line| {
-            let line = line.trim_ascii_start();
-            let Some(name) = line
-                .iter()
-                .position(|b| *b == b'(')
-                .and_then(|open| line.get(..open))
-            else {
-                return false;
-            };
-            let name = name.trim_ascii_end();
-            commands
-                .iter()
-                .any(|command| name.eq_ignore_ascii_case(command))
-        })
-}
-
-/// Nothing recognised the file. Corpora name samples by hash, so a DOS COM
-/// there has no `.com` to go on, and carved shellcode has no name at all;
-/// without this they were Unknown, which no trait walks.
-fn unnamed_program(path: &Path, data: &[u8]) -> Option<Detection> {
-    headerless_program(data).map(|file_type| Detection {
-        file_type,
-        source: DetectionSource::Heuristic,
-        ext_match: if has_named_extension(path) {
-            ExtensionMatch::Unknown
-        } else {
-            ExtensionMatch::Consistent
-        },
-    })
-}
-
 /// A program with no header of its own: a DOS COM, else x86 code that opens
-/// with a GetPC idiom. DOS COM is checked first; its test is the older one.
+/// with a GetPC idiom.
 fn headerless_program(data: &[u8]) -> Option<FileType> {
-    if heuristics::looks_like_unnamed_dos_com(data) {
+    if dos::looks_like_dos_com(data) {
         Some(FileType::DosCom)
     } else if shellcode::detect(data).is_some() {
         Some(FileType::Shellcode)
@@ -1979,65 +1114,15 @@ fn headerless_program(data: &[u8]) -> Option<FileType> {
     }
 }
 
-/// Types whose extension names a language or script, so a body that is not
-/// text, or is plainly another language, contradicts it.
-fn claims_source(ft: FileType) -> bool {
-    ft.is_source_code()
-        || matches!(
-            ft,
-            FileType::Clojure
-                | FileType::Batch
-                | FileType::Vbs
-                | FileType::AppleScript
-                | FileType::Mirc
-                | FileType::IrcII
-        )
-}
-
-/// Formats that start with magic stage 1 always recognises. Reaching the
-/// extension fallback means the magic is absent, so the name is wrong.
-fn is_magic_defined(ft: FileType) -> bool {
-    matches!(
-        ft,
-        // A registry export always opens with its header line.
-        FileType::Reg
-            | FileType::StaticLib
-            | FileType::Elf
-            | FileType::Pe
-            | FileType::MachO
-            | FileType::JavaClass
-            | FileType::Dex
-            | FileType::Wasm
-            | FileType::SquashFs
-            | FileType::Snap
-    )
-}
-
-/// Object code with no header: a DOS COM program when it calls DOS, x86
-/// shellcode when it opens with a GetPC idiom, otherwise opaque data.
-fn binary_body_type(data: &[u8]) -> FileType {
-    if heuristics::looks_like_dos_com(data) {
-        FileType::DosCom
-    } else if shellcode::detect(data).is_some() {
-        FileType::Shellcode
-    } else {
-        FileType::Data
-    }
-}
-
-/// What a body is once its extension has been ruled out: binary, a page, a
-/// language the scorer recognises, or plain text. A COM program shorter than
-/// the binary judgement's window still cannot pass as text: `CD 21` is never
-/// valid UTF-8.
+/// What a body is once its name has been ruled out: binary, a page, a
+/// language the scorer recognises, or plain text.
 fn unclaimed_body_type(sniff: &Sniff<'_>) -> FileType {
     let data = sniff.data;
-    if sniff.binary_not_source()
-        || (heuristics::looks_like_dos_com(data) && std::str::from_utf8(data).is_err())
-    {
-        binary_body_type(data)
+    if sniff.binary_not_source() || dos::looks_like_dos_com(data) {
+        headerless_program(data).unwrap_or(FileType::Data)
     } else if let Some(marked) = sniff.unmistakable() {
         marked
-    } else if heuristics::looks_like_html(data) {
+    } else if heuristics::looks_like_html(sniff.text()) {
         FileType::Html
     } else {
         sniff.scored_type().unwrap_or(FileType::Text)
@@ -2050,12 +1135,8 @@ fn unclaimed_body_type(sniff: &Sniff<'_>) -> FileType {
 /// Does not consider file extensions or the language heuristics.
 #[must_use]
 pub fn detect_content(data: &[u8]) -> Option<Detection> {
-    let path = Path::new("");
-    magic::detect_from_content(path, data).map(|(file_type, source)| Detection {
-        file_type,
-        source,
-        ext_match: ExtensionMatch::Consistent,
-    })
+    let sniff = Sniff::new(Path::new(""), data);
+    magic::detect_from_sniff(&sniff).map(|(file_type, source)| Detection::named(file_type, source))
 }
 
 /// Detect file type from path/extension alone.
@@ -2063,77 +1144,18 @@ pub fn detect_content(data: &[u8]) -> Option<Detection> {
 /// Does not examine file content.
 #[must_use]
 pub fn detect_path(path: &Path) -> Option<Detection> {
-    ext::detect_from_path(path).map(|file_type| Detection {
-        file_type,
-        source: if ext::is_filename_match(path) {
+    ext::claim(path).map(|claim| {
+        let source = if claim.by_name {
             DetectionSource::Filename
         } else {
             DetectionSource::Extension
-        },
-        ext_match: ExtensionMatch::Consistent,
+        };
+        Detection::named(claim.file_type, source)
     })
 }
 
 #[cfg(test)]
+mod testutil;
+
+#[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod static_lib_extension_override_tests {
-    use super::*;
-
-    /// A real ar archive is caught by magic in stage 1 and is unaffected.
-    #[test]
-    fn real_ar_archive_still_wins() {
-        let mut data = b"!<arch>\n".to_vec();
-        data.extend_from_slice(&[0x20; 64]);
-        assert_eq!(
-            detect(Path::new("libfoo.a"), &data).map(|d| d.file_type),
-            Some(FileType::StaticLib)
-        );
-    }
-
-    /// vxheaven appends a variant letter, so `Trojan.BAT.DelAll.a` looks like
-    /// an ar archive by extension while being a batch script. Since a genuine
-    /// `.a` always carries `!<arch>`, the sniffer is allowed to look inside.
-    #[test]
-    fn batch_body_named_dot_a_is_batch() {
-        let data = b"@echo off\r\nif not exist c:\\x.bat goto skip\r\nfor %%f in (*.bat) do call %%f\r\n:skip\r\n";
-        let d = detect(Path::new("Trojan.BAT.DelAll.a"), data).expect("detected");
-        assert_ne!(d.file_type, FileType::StaticLib);
-        assert!(d.extension_mismatch());
-    }
-
-    /// An `.a` without `!<arch>` is never a static library. An 8-byte COM
-    /// program is still a program: `CD 21` is never valid UTF-8.
-    #[test]
-    fn dot_a_without_ar_magic_is_its_body() {
-        let data = [0xe9u8, 0x12, 0x00, 0xb4, 0x09, 0xcd, 0x21, 0xc3];
-        assert_eq!(
-            detect(Path::new("Virus.DOS.Trivial.40.a"), &data).map(|d| d.file_type),
-            Some(FileType::DosCom)
-        );
-        assert_eq!(
-            detect(
-                Path::new("Backdoor.IRC.Notes.a"),
-                b"see you on the channel tonight\n"
-            )
-            .map(|d| d.file_type),
-            Some(FileType::Text)
-        );
-    }
-}
-
-/// Batch, VBScript, mIRC, ircII and bitmaps identified by their bytes: with no
-/// name, under a name that lies, and under a name that is right.
-#[cfg(test)]
-mod script_and_bitmap_content_tests;
-
-#[cfg(test)]
-mod tiff_avif_tests;
-
-#[cfg(test)]
-mod npm_lock_content_tests;
-
-mod torch_zip;
-
-pub(crate) mod image4_trustcache;

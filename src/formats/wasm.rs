@@ -27,7 +27,6 @@ use crate::output::{DiagnosticKind, Stage, Symbols, Values};
 use crate::value_key;
 use serde_json::Value as JsonValue;
 
-#[path = "wasm_xor.rs"]
 mod xor;
 
 /// Defensive caps so a malformed module with inflated section/vector counts
@@ -122,8 +121,9 @@ impl ImportModules {
     }
 }
 
-/// External-kind byte → (kind label, has_extra_index/limits descriptor).
-/// 0 func, 1 table, 2 memory, 3 global.
+/// Read the import section: every import's module joins `modules`, and each
+/// function import (external kind 0; 1 table, 2 memory and 3 global are
+/// skipped past) becomes an `Import` symbol anchored at its field name.
 fn extract_imports(
     body: &[u8],
     body_offset: u64,
@@ -142,10 +142,10 @@ fn extract_imports(
         let kind = r.byte().ok_or_else(truncated)?;
         // Skip the kind-specific descriptor so the next import aligns.
         let ok = match kind {
-            0x00 => r.uleb().map(|_| ()),    // func: typeidx
-            0x01 => skip_table_type(&mut r), // table: reftype + limits
-            0x02 => skip_limits(&mut r),     // memory: limits
-            0x03 => r.skip(2),               // global: valtype + mut
+            0x00 => r.uleb().map(|_| ()),                       // func: typeidx
+            0x01 => r.byte().and_then(|_| skip_limits(&mut r)), // table: reftype + limits
+            0x02 => skip_limits(&mut r),                        // memory: limits
+            0x03 => r.skip(2),                                  // global: valtype + mut
             _ => None,
         };
         modules.insert(&module);
@@ -178,11 +178,6 @@ fn skip_limits(r: &mut Reader<'_>) -> Option<()> {
         r.uleb()?; // max
     }
     Some(())
-}
-
-fn skip_table_type(r: &mut Reader<'_>) -> Option<()> {
-    r.byte()?; // element reftype
-    skip_limits(r)
 }
 
 fn extract_exports(
@@ -271,6 +266,12 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     // Header: `\0asm` + u32 version. Detection already vetted this, but guard
     // anyway so a forced/misrouted file can't index out of range.
     if bytes.len() < 8 || !bytes.starts_with(b"\0asm") {
+        tracing::debug!(
+            target: "filefacts::wasm",
+            stage = "header",
+            len = bytes.len(),
+            "no WebAssembly header; skipped"
+        );
         return;
     }
 
@@ -401,112 +402,18 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
             JsonValue::from(modules.order),
         );
     }
-    if !import_names.is_empty() {
-        import_names.truncate(MAX_ENTRIES);
-        values.insert_key(
-            value_key!("wasm.imports"),
-            JsonValue::from(import_names.clone()),
-        );
-    }
-    if !export_names.is_empty() {
-        export_names.truncate(MAX_ENTRIES);
-        values.insert_key(
-            value_key!("wasm.exports"),
-            JsonValue::from(export_names.clone()),
-        );
-    }
-
+    import_names.truncate(MAX_ENTRIES);
+    export_names.truncate(MAX_ENTRIES);
     metrics.insert(metric!("wasm.import_count"), import_names.len() as f64);
     metrics.insert(metric!("wasm.export_count"), export_names.len() as f64);
     metrics.insert(metric!("wasm.section_count"), section_count as f64);
+    if !import_names.is_empty() {
+        values.insert_key(value_key!("wasm.imports"), JsonValue::from(import_names));
+    }
+    if !export_names.is_empty() {
+        values.insert_key(value_key!("wasm.exports"), JsonValue::from(export_names));
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::output::Errors;
-
-    fn module(sections: &[(u8, &[u8])]) -> Vec<u8> {
-        let mut out = b"\0asm\x01\0\0\0".to_vec();
-        for (id, body) in sections {
-            out.push(*id);
-            out.push(body.len() as u8); // single-byte LEB128 for test sizes
-            out.extend_from_slice(body);
-        }
-        out
-    }
-
-    fn run(bytes: &[u8]) -> (Values, Errors) {
-        let mut out = crate::formats::Sinks::default();
-        extract(bytes, out.ctx());
-        (out.values, out.errors)
-    }
-
-    /// `env.f`, a function import of type 0.
-    const IMPORT_ENV_F: &[u8] = b"\x03env\x01f\x00\x00";
-
-    #[test]
-    fn well_formed_module_records_no_errors() {
-        let mut imports = vec![1];
-        imports.extend_from_slice(IMPORT_ENV_F);
-        let exports = b"\x01\x04main\x00\x00";
-        let (v, errors) = run(&module(&[(2, &imports), (7, exports)]));
-        assert_eq!(v.get("wasm.imports"), Some(&serde_json::json!(["f"])));
-        assert_eq!(v.get("wasm.exports"), Some(&serde_json::json!(["main"])));
-        assert!(errors.is_empty(), "{errors:?}");
-    }
-
-    /// The import vector stops at a broken entry. What was read is kept, and
-    /// the stop is recorded instead of passing as a complete import list.
-    #[test]
-    fn malformed_import_is_recorded_and_earlier_imports_kept() {
-        let mut imports = vec![2];
-        imports.extend_from_slice(IMPORT_ENV_F);
-        imports.extend_from_slice(b"\x03env");
-        let (v, errors) = run(&module(&[(2, &imports)]));
-        assert_eq!(v.get("wasm.imports"), Some(&serde_json::json!(["f"])));
-        let entry = errors.iter().next().expect("bail recorded");
-        assert_eq!(entry.kind, DiagnosticKind::Malformed);
-        assert_eq!(entry.stage, Stage::WasmParse);
-        assert!(entry.message.contains("import 1 truncated"), "{entry:?}");
-    }
-
-    #[test]
-    fn section_past_end_of_file_is_recorded() {
-        let mut bytes = module(&[(7, b"\x00")]);
-        bytes.extend_from_slice(&[2, 100, 1, 2, 3]);
-        let (v, errors) = run(&bytes);
-        assert_eq!(v.get("wasm.has_start"), Some(&serde_json::json!(false)));
-        let entry = errors.iter().next().expect("truncation recorded");
-        assert_eq!(entry.kind, DiagnosticKind::Truncated);
-        assert!(entry.message.contains("section 2"), "{entry:?}");
-    }
-
-    /// A repeated import section is reported and skipped, so `MAX_ENTRIES`
-    /// bounds the module's imports however many import sections it repeats;
-    /// module names stay deduplicated in first-seen order.
-    #[test]
-    fn repeated_import_section_is_recorded_and_not_reread() {
-        let mut imports = vec![3];
-        imports.extend_from_slice(IMPORT_ENV_F);
-        imports.extend_from_slice(b"\x04wasi\x01g\x00\x00");
-        imports.extend_from_slice(IMPORT_ENV_F);
-        let second = b"\x01\x05other\x01h\x00\x00";
-        let (v, errors) = run(&module(&[(2, &imports), (2, second), (2, second)]));
-        assert_eq!(
-            v.get("wasm.import_modules"),
-            Some(&serde_json::json!(["env", "wasi"]))
-        );
-        assert_eq!(
-            v.get("wasm.imports"),
-            Some(&serde_json::json!(["f", "g", "f"]))
-        );
-        assert_eq!(errors.len(), 2, "{errors:?}");
-        let entry = errors.iter().next().expect("repeat recorded");
-        assert_eq!(entry.kind, DiagnosticKind::Malformed);
-        assert!(entry.message.contains("section 2"), "{entry:?}");
-        assert!(entry.message.contains("repeats"), "{entry:?}");
-    }
-}
-
-// rebuild-marker
+mod tests;

@@ -1,9 +1,4 @@
 //! Per-language configuration for tree-sitter extractors.
-
-// Many of the queries in this file embed `"` inside their bodies, which
-// forces the `r#"..."#` raw form. Holding the others to a different
-// shape would split the file's visual rhythm without buying anything.
-#![allow(clippy::needless_raw_string_hashes)]
 //!
 //! Every supported source language declares one [`LangConfig`] entry
 //! covering three concerns:
@@ -17,9 +12,8 @@
 //!    `ast.calls`, `ast.members`, and `ast.call_strings`.
 //!
 //! Adding a language is an entry here, a [`Lang`] variant, and a Cargo
-//! dependency. Per-language tables that match on [`Lang`] exhaustively (such
-//! as the function-definition kinds in `function_metrics`) then fail to
-//! compile until they say what the new language does.
+//! dependency. Code that matches on [`Lang`] exhaustively then fails to
+//! compile until it says what the new language does.
 
 use std::sync::OnceLock;
 
@@ -186,16 +180,11 @@ pub(super) struct LangConfig {
     pub(super) object_kinds: &'static [&'static str],
     /// Node-kind names for array / list / slice literals.
     pub(super) array_kinds: &'static [&'static str],
-    /// Node-kind names for *anonymous* function / lambda / closure
-    /// **value** expressions — used by [`crate::formats::source::ast_walk`]
-    /// to classify a call argument's shape as
-    /// [`crate::ArgShape::Function`].
-    ///
-    /// Distinct from the named, top-level function-definition kinds
-    /// (`function_declaration`, `method_definition`, …) that
-    /// [`crate::formats::source::function_metrics`] looks for when
-    /// surfacing declared functions — those live in a separate table
-    /// inside that module.
+    /// Node-kind names for everything that defines a function body in this
+    /// language: declarations, methods, constructors, lambdas, closures and
+    /// blocks. The one table function metrics, the symbol walk's shape
+    /// detectors, call-argument shapes ([`crate::ArgShape::Function`]) and
+    /// both flow analyses read.
     pub(super) function_kinds: &'static [&'static str],
     /// Node-kind names for template / formatted / interpolated strings.
     pub(super) template_kinds: &'static [&'static str],
@@ -204,7 +193,7 @@ pub(super) struct LangConfig {
 }
 
 /// One of a language's surface-extraction queries.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum QueryKind {
     Imports,
     Functions,
@@ -215,7 +204,7 @@ impl QueryKind {
     #[cfg(test)]
     const ALL: [Self; 3] = [Self::Imports, Self::Functions, Self::Classes];
 
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             Self::Imports => "imports",
             Self::Functions => "functions",
@@ -264,6 +253,13 @@ impl LangConfig {
     /// a node) is also `None`, so that language's imports, functions or
     /// classes go missing. That is logged once here, and the
     /// `every_language_query_compiles` test turns it into a build failure.
+    /// Whether `node` is one of [`Self::function_kinds`]. Named only:
+    /// Python's `lambda` keyword token shares its kind name with the
+    /// expression it starts.
+    pub(super) fn is_function(&self, node: tree_sitter::Node<'_>) -> bool {
+        node.is_named() && self.function_kinds.contains(&node.kind())
+    }
+
     pub(super) fn query(&'static self, kind: QueryKind) -> Option<&'static Query> {
         let slot = match kind {
             QueryKind::Imports => &self.compiled.imports,
@@ -426,14 +422,14 @@ static JAVASCRIPT: LangConfig = LangConfig {
             arguments: (arguments (string) @import)
             (#eq? @_fn "require"))
     "#,
-    function_query: r#"
+    function_query: r"
         (function_declaration name: (identifier) @fn)
         (method_definition name: (property_identifier) @fn)
         (generator_function_declaration name: (identifier) @fn)
-    "#,
-    class_query: r#"
+    ",
+    class_query: r"
         (class_declaration name: (identifier) @class)
-    "#,
+    ",
     compiled: CompiledQueries::new(),
     call_kinds: &["call_expression", "new_expression"],
     callee_field: "function",
@@ -452,9 +448,12 @@ static JAVASCRIPT: LangConfig = LangConfig {
     object_kinds: &["object"],
     array_kinds: &["array"],
     function_kinds: &[
+        "function_declaration",
+        "generator_function_declaration",
         "function_expression",
-        "arrow_function",
         "generator_function",
+        "arrow_function",
+        "method_definition",
     ],
     template_kinds: &["template_string"],
     binary_op_kinds: &["binary_expression"],
@@ -471,14 +470,14 @@ static TYPESCRIPT: LangConfig = LangConfig {
             arguments: (arguments (string) @import)
             (#eq? @_fn "require"))
     "#,
-    function_query: r#"
+    function_query: r"
         (function_declaration name: (identifier) @fn)
         (method_definition name: (property_identifier) @fn)
-    "#,
-    class_query: r#"
+    ",
+    class_query: r"
         (class_declaration name: (type_identifier) @class)
         (interface_declaration name: (type_identifier) @class)
-    "#,
+    ",
     compiled: CompiledQueries::new(),
     call_kinds: &["call_expression", "new_expression"],
     callee_field: "function",
@@ -492,7 +491,14 @@ static TYPESCRIPT: LangConfig = LangConfig {
     null_kinds: &["null", "undefined"],
     object_kinds: &["object"],
     array_kinds: &["array"],
-    function_kinds: &["function_expression", "arrow_function"],
+    function_kinds: &[
+        "function_declaration",
+        "generator_function_declaration",
+        "function_expression",
+        "generator_function",
+        "arrow_function",
+        "method_definition",
+    ],
     template_kinds: &["template_string"],
     binary_op_kinds: &["binary_expression"],
 };
@@ -501,20 +507,20 @@ static PYTHON: LangConfig = LangConfig {
     lang: Lang::Python,
     language: || tree_sitter_python::LANGUAGE.into(),
     string_kinds: &["string"],
-    import_query: r#"
+    import_query: r"
         (import_statement name: (aliased_import) @import)
         (import_statement name: (dotted_name) @import)
         (import_from_statement module_name: (dotted_name) @import)
         (import_from_statement module_name: (relative_import) @import)
         (import_from_statement name: (aliased_import) @import)
         (import_from_statement name: (dotted_name) @import)
-    "#,
-    function_query: r#"
+    ",
+    function_query: r"
         (function_definition name: (identifier) @fn)
-    "#,
-    class_query: r#"
+    ",
+    class_query: r"
         (class_definition name: (identifier) @class)
-    "#,
+    ",
     compiled: CompiledQueries::new(),
     call_kinds: &["call"],
     callee_field: "function",
@@ -528,7 +534,7 @@ static PYTHON: LangConfig = LangConfig {
     null_kinds: &["none"],
     object_kinds: &["dictionary"],
     array_kinds: &["list", "tuple", "set"],
-    function_kinds: &["lambda"],
+    function_kinds: &["function_definition", "lambda"],
     template_kinds: &["string"],
     binary_op_kinds: &["binary_operator"],
 };
@@ -537,17 +543,17 @@ static GO: LangConfig = LangConfig {
     lang: Lang::Go,
     language: || tree_sitter_go::LANGUAGE.into(),
     string_kinds: &["interpreted_string_literal", "raw_string_literal"],
-    import_query: r#"
+    import_query: r"
         (import_spec path: (interpreted_string_literal) @import)
-    "#,
-    function_query: r#"
+    ",
+    function_query: r"
         (function_declaration name: (identifier) @fn)
         (method_declaration name: (field_identifier) @fn)
-    "#,
-    class_query: r#"
+    ",
+    class_query: r"
         (type_spec name: (type_identifier) @class type: (struct_type))
         (type_spec name: (type_identifier) @class type: (interface_type))
-    "#,
+    ",
     compiled: CompiledQueries::new(),
     call_kinds: &["call_expression"],
     callee_field: "function",
@@ -566,7 +572,7 @@ static GO: LangConfig = LangConfig {
     null_kinds: &["nil"],
     object_kinds: &["composite_literal"],
     array_kinds: &["composite_literal"],
-    function_kinds: &["func_literal"],
+    function_kinds: &["function_declaration", "method_declaration", "func_literal"],
     template_kinds: &[],
     binary_op_kinds: &["binary_expression"],
 };
@@ -575,18 +581,18 @@ static RUST: LangConfig = LangConfig {
     lang: Lang::Rust,
     language: || tree_sitter_rust::LANGUAGE.into(),
     string_kinds: &["string_literal", "raw_string_literal"],
-    import_query: r#"
+    import_query: r"
         (use_declaration argument: (scoped_identifier path: (identifier) @import))
         (use_declaration argument: (identifier) @import)
-    "#,
-    function_query: r#"
+    ",
+    function_query: r"
         (function_item name: (identifier) @fn)
-    "#,
-    class_query: r#"
+    ",
+    class_query: r"
         (struct_item name: (type_identifier) @class)
         (enum_item name: (type_identifier) @class)
         (trait_item name: (type_identifier) @class)
-    "#,
+    ",
     compiled: CompiledQueries::new(),
     call_kinds: &["call_expression"],
     callee_field: "function",
@@ -600,7 +606,7 @@ static RUST: LangConfig = LangConfig {
     null_kinds: &[],
     object_kinds: &["struct_expression"],
     array_kinds: &["array_expression"],
-    function_kinds: &["closure_expression"],
+    function_kinds: &["function_item", "closure_expression"],
     template_kinds: &[],
     binary_op_kinds: &["binary_expression"],
 };
@@ -609,20 +615,20 @@ static JAVA: LangConfig = LangConfig {
     lang: Lang::Java,
     language: || tree_sitter_java::LANGUAGE.into(),
     string_kinds: &["string_literal"],
-    import_query: r#"
+    import_query: r"
         (import_declaration (scoped_identifier) @import)
         (import_declaration (identifier) @import)
-    "#,
-    function_query: r#"
+    ",
+    function_query: r"
         (method_declaration name: (identifier) @fn)
         (constructor_declaration name: (identifier) @fn)
-    "#,
-    class_query: r#"
+    ",
+    class_query: r"
         (class_declaration name: (identifier) @class)
         (interface_declaration name: (identifier) @class)
         (enum_declaration name: (identifier) @class)
         (record_declaration name: (identifier) @class)
-    "#,
+    ",
     compiled: CompiledQueries::new(),
     call_kinds: &["method_invocation", "object_creation_expression"],
     callee_field: "name",
@@ -640,7 +646,12 @@ static JAVA: LangConfig = LangConfig {
     null_kinds: &["null_literal"],
     object_kinds: &[],
     array_kinds: &["array_initializer"],
-    function_kinds: &["lambda_expression"],
+    function_kinds: &[
+        "method_declaration",
+        "constructor_declaration",
+        "compact_constructor_declaration",
+        "lambda_expression",
+    ],
     template_kinds: &[],
     binary_op_kinds: &["binary_expression"],
 };
@@ -655,9 +666,9 @@ static BASH: LangConfig = LangConfig {
             argument: [(word) (string) (raw_string)] @import
             (#match? @_cmd "^(source|\\.)$"))
     "#,
-    function_query: r#"
+    function_query: r"
         (function_definition name: (word) @fn)
-    "#,
+    ",
     class_query: "",
     compiled: CompiledQueries::new(),
     call_kinds: &["command"],
@@ -672,7 +683,7 @@ static BASH: LangConfig = LangConfig {
     null_kinds: &[],
     object_kinds: &[],
     array_kinds: &["array"],
-    function_kinds: &[],
+    function_kinds: &["function_definition"],
     template_kinds: &[],
     binary_op_kinds: &[],
 };
@@ -687,14 +698,14 @@ static RUBY: LangConfig = LangConfig {
             arguments: (argument_list (string (string_content) @import))
             (#match? @_fn "^(require|require_relative|load|autoload)$"))
     "#,
-    function_query: r#"
+    function_query: r"
         (method name: (identifier) @fn)
         (singleton_method name: (identifier) @fn)
-    "#,
-    class_query: r#"
+    ",
+    class_query: r"
         (class name: (constant) @class)
         (module name: (constant) @class)
-    "#,
+    ",
     compiled: CompiledQueries::new(),
     call_kinds: &["call"],
     callee_field: "method",
@@ -713,7 +724,7 @@ static RUBY: LangConfig = LangConfig {
     null_kinds: &["nil"],
     object_kinds: &["hash"],
     array_kinds: &["array"],
-    function_kinds: &["lambda", "block", "do_block"],
+    function_kinds: &["method", "singleton_method", "lambda", "block", "do_block"],
     template_kinds: &["string"],
     binary_op_kinds: &["binary"],
 };
@@ -728,10 +739,10 @@ static LUA: LangConfig = LangConfig {
             arguments: (arguments (string (string_content) @import))
             (#eq? @_fn "require"))
     "#,
-    function_query: r#"
+    function_query: r"
         (function_declaration name: (identifier) @fn)
         (function_declaration name: (dot_index_expression field: (identifier) @fn))
-    "#,
+    ",
     class_query: "",
     compiled: CompiledQueries::new(),
     call_kinds: &["function_call"],
@@ -746,7 +757,7 @@ static LUA: LangConfig = LangConfig {
     null_kinds: &["nil"],
     object_kinds: &["table_constructor"],
     array_kinds: &["table_constructor"],
-    function_kinds: &["function_definition"],
+    function_kinds: &["function_declaration", "function_definition"],
     template_kinds: &[],
     binary_op_kinds: &["binary_expression"],
 };
@@ -760,22 +771,22 @@ static CSHARP: LangConfig = LangConfig {
         "raw_string_literal",
         "interpolated_string_expression",
     ],
-    import_query: r#"
+    import_query: r"
         (using_directive (identifier) @import)
         (using_directive (qualified_name) @import)
-    "#,
-    function_query: r#"
+    ",
+    function_query: r"
         (method_declaration name: (identifier) @fn)
         (constructor_declaration name: (identifier) @fn)
         (local_function_statement name: (identifier) @fn)
-    "#,
-    class_query: r#"
+    ",
+    class_query: r"
         (class_declaration name: (identifier) @class)
         (interface_declaration name: (identifier) @class)
         (struct_declaration name: (identifier) @class)
         (record_declaration name: (identifier) @class)
         (enum_declaration name: (identifier) @class)
-    "#,
+    ",
     compiled: CompiledQueries::new(),
     call_kinds: &["invocation_expression", "object_creation_expression"],
     callee_field: "function",
@@ -795,7 +806,13 @@ static CSHARP: LangConfig = LangConfig {
         "array_creation_expression",
         "implicit_array_creation_expression",
     ],
-    function_kinds: &["lambda_expression", "anonymous_method_expression"],
+    function_kinds: &[
+        "method_declaration",
+        "constructor_declaration",
+        "local_function_statement",
+        "lambda_expression",
+        "anonymous_method_expression",
+    ],
     template_kinds: &["interpolated_string_expression"],
     binary_op_kinds: &["binary_expression"],
 };
@@ -804,22 +821,22 @@ static C: LangConfig = LangConfig {
     lang: Lang::C,
     language: || tree_sitter_c::LANGUAGE.into(),
     string_kinds: &["string_literal"],
-    import_query: r#"
+    import_query: r"
         (preproc_include path: (system_lib_string) @import)
         (preproc_include path: (string_literal) @import)
-    "#,
-    function_query: r#"
+    ",
+    function_query: r"
         (function_definition
             declarator: (function_declarator declarator: (identifier) @fn))
         (function_definition
             declarator: (pointer_declarator
                 declarator: (function_declarator declarator: (identifier) @fn)))
-    "#,
-    class_query: r#"
+    ",
+    class_query: r"
         (struct_specifier name: (type_identifier) @class)
         (union_specifier name: (type_identifier) @class)
         (enum_specifier name: (type_identifier) @class)
-    "#,
+    ",
     compiled: CompiledQueries::new(),
     call_kinds: &["call_expression"],
     callee_field: "function",
@@ -836,7 +853,7 @@ static C: LangConfig = LangConfig {
     null_kinds: &["null"],
     object_kinds: &["initializer_list"],
     array_kinds: &["initializer_list"],
-    function_kinds: &[],
+    function_kinds: &["function_definition"],
     template_kinds: &[],
     binary_op_kinds: &["binary_expression"],
 };
@@ -847,7 +864,7 @@ pub(super) static CPP: LangConfig = LangConfig {
     lang: Lang::Cpp,
     language: || tree_sitter_cpp::LANGUAGE.into(),
     string_kinds: &["string_literal", "raw_string_literal"],
-    function_query: r#"
+    function_query: r"
         (function_definition
             declarator: (function_declarator declarator: (identifier) @fn))
         (function_definition
@@ -856,15 +873,15 @@ pub(super) static CPP: LangConfig = LangConfig {
         (function_definition
             declarator: (function_declarator
                 declarator: (qualified_identifier name: (identifier) @fn)))
-    "#,
-    class_query: r#"
+    ",
+    class_query: r"
         (struct_specifier name: (type_identifier) @class)
         (union_specifier name: (type_identifier) @class)
         (enum_specifier name: (type_identifier) @class)
         (class_specifier name: (type_identifier) @class)
-    "#,
+    ",
     compiled: CompiledQueries::new(),
-    function_kinds: &["lambda_expression"],
+    function_kinds: &["function_definition", "lambda_expression"],
     ..C
 };
 
@@ -872,17 +889,17 @@ static SCALA: LangConfig = LangConfig {
     lang: Lang::Scala,
     language: || tree_sitter_scala::LANGUAGE.into(),
     string_kinds: &["string", "interpolated_string_expression"],
-    import_query: r#"
+    import_query: r"
         (import_declaration (identifier) @import)
-    "#,
-    function_query: r#"
+    ",
+    function_query: r"
         (function_definition name: (identifier) @fn)
-    "#,
-    class_query: r#"
+    ",
+    class_query: r"
         (class_definition name: (identifier) @class)
         (object_definition name: (identifier) @class)
         (trait_definition name: (identifier) @class)
-    "#,
+    ",
     compiled: CompiledQueries::new(),
     call_kinds: &["call_expression"],
     callee_field: "function",
@@ -896,7 +913,7 @@ static SCALA: LangConfig = LangConfig {
     null_kinds: &["null_literal"],
     object_kinds: &[],
     array_kinds: &[],
-    function_kinds: &["lambda_expression"],
+    function_kinds: &["function_definition", "lambda_expression"],
     template_kinds: &["interpolated_string_expression"],
     binary_op_kinds: &["infix_expression"],
 };
@@ -905,19 +922,19 @@ static OBJC: LangConfig = LangConfig {
     lang: Lang::ObjC,
     language: || tree_sitter_objc::LANGUAGE.into(),
     string_kinds: &["string_literal"],
-    import_query: r#"
+    import_query: r"
         (preproc_include path: (system_lib_string) @import)
         (preproc_include path: (string_literal) @import)
-    "#,
-    function_query: r#"
+    ",
+    function_query: r"
         (function_definition
             declarator: (function_declarator declarator: (identifier) @fn))
         (method_definition (identifier) @fn)
-    "#,
-    class_query: r#"
+    ",
+    class_query: r"
         (class_interface (identifier) @class)
         (class_implementation (identifier) @class)
-    "#,
+    ",
     compiled: CompiledQueries::new(),
     call_kinds: &["call_expression", "message_expression"],
     callee_field: "function",
@@ -931,7 +948,7 @@ static OBJC: LangConfig = LangConfig {
     null_kinds: &["null", "nil"],
     object_kinds: &["dictionary_literal", "initializer_list"],
     array_kinds: &["array_literal", "initializer_list"],
-    function_kinds: &["block_expression"],
+    function_kinds: &["function_definition", "method_definition", "block_literal"],
     template_kinds: &[],
     binary_op_kinds: &["binary_expression"],
 };
@@ -944,16 +961,16 @@ static KOTLIN: LangConfig = LangConfig {
         "multiline_string_literal",
         "character_literal",
     ],
-    import_query: r#"
+    import_query: r"
         (import (qualified_identifier) @import)
-    "#,
-    function_query: r#"
+    ",
+    function_query: r"
         (function_declaration name: (identifier) @fn)
-    "#,
-    class_query: r#"
+    ",
+    class_query: r"
         (class_declaration name: (identifier) @class)
         (object_declaration name: (identifier) @class)
-    "#,
+    ",
     compiled: CompiledQueries::new(),
     call_kinds: &["call_expression"],
     callee_field: "",
@@ -967,7 +984,12 @@ static KOTLIN: LangConfig = LangConfig {
     null_kinds: &["null_literal"],
     object_kinds: &[],
     array_kinds: &[],
-    function_kinds: &["lambda_literal", "anonymous_function"],
+    function_kinds: &[
+        "function_declaration",
+        "secondary_constructor",
+        "anonymous_function",
+        "lambda_literal",
+    ],
     template_kinds: &["string_literal"],
     binary_op_kinds: &["binary_expression", "infix_expression"],
 };
@@ -980,17 +1002,17 @@ static SWIFT: LangConfig = LangConfig {
         "multi_line_string_literal",
         "raw_string_literal",
     ],
-    import_query: r#"
+    import_query: r"
         (import_declaration (identifier) @import)
-    "#,
+    ",
     function_query: r#"
         (function_declaration name: (simple_identifier) @fn)
         (init_declaration "init" @fn)
     "#,
-    class_query: r#"
+    class_query: r"
         (class_declaration name: (type_identifier) @class)
         (protocol_declaration name: (type_identifier) @class)
-    "#,
+    ",
     compiled: CompiledQueries::new(),
     call_kinds: &["call_expression"],
     callee_field: "",
@@ -1004,7 +1026,7 @@ static SWIFT: LangConfig = LangConfig {
     null_kinds: &["nil"],
     object_kinds: &["dictionary_literal"],
     array_kinds: &["array_literal"],
-    function_kinds: &["lambda_literal"],
+    function_kinds: &["function_declaration", "lambda_literal"],
     template_kinds: &["line_string_literal"],
     binary_op_kinds: &[
         "additive_expression",
@@ -1032,12 +1054,12 @@ static POWERSHELL: LangConfig = LangConfig {
             command_elements: (command_elements) @import
             (#match? @_cmd "^(Import-Module|Add-PSSnapin|Using)$"))
     "#,
-    function_query: r#"
+    function_query: r"
         (function_statement (function_name) @fn)
-    "#,
-    class_query: r#"
+    ",
+    class_query: r"
         (class_statement (simple_name) @class)
-    "#,
+    ",
     compiled: CompiledQueries::new(),
     call_kinds: &["command"],
     callee_field: "command_name",
@@ -1051,7 +1073,11 @@ static POWERSHELL: LangConfig = LangConfig {
     null_kinds: &[],
     object_kinds: &["hash_literal_expression"],
     array_kinds: &["array_expression", "array_literal_expression"],
-    function_kinds: &["script_block_expression"],
+    function_kinds: &[
+        "function_statement",
+        "class_method_definition",
+        "script_block_expression",
+    ],
     template_kinds: &["expandable_string_literal"],
     binary_op_kinds: &[
         "additive_expression",
@@ -1064,23 +1090,23 @@ static PHP: LangConfig = LangConfig {
     lang: Lang::Php,
     language: || tree_sitter_php::LANGUAGE_PHP.into(),
     string_kinds: &["string", "string_content", "heredoc_body"],
-    import_query: r#"
+    import_query: r"
         (namespace_use_clause (qualified_name) @import)
         (namespace_use_clause (name) @import)
         (require_expression (string) @import)
         (require_once_expression (string) @import)
         (include_expression (string) @import)
         (include_once_expression (string) @import)
-    "#,
-    function_query: r#"
+    ",
+    function_query: r"
         (function_definition name: (name) @fn)
         (method_declaration name: (name) @fn)
-    "#,
-    class_query: r#"
+    ",
+    class_query: r"
         (class_declaration name: (name) @class)
         (interface_declaration name: (name) @class)
         (trait_declaration name: (name) @class)
-    "#,
+    ",
     compiled: CompiledQueries::new(),
     call_kinds: &[
         "function_call_expression",
@@ -1098,7 +1124,12 @@ static PHP: LangConfig = LangConfig {
     null_kinds: &["null"],
     object_kinds: &["array_creation_expression"],
     array_kinds: &["array_creation_expression"],
-    function_kinds: &["anonymous_function_creation_expression", "arrow_function"],
+    function_kinds: &[
+        "function_definition",
+        "method_declaration",
+        "anonymous_function",
+        "arrow_function",
+    ],
     template_kinds: &[],
     binary_op_kinds: &["binary_expression"],
 };
@@ -1111,17 +1142,17 @@ static PERL: LangConfig = LangConfig {
         "interpolated_string_literal",
         "heredoc_content",
     ],
-    import_query: r#"
+    import_query: r"
         (use_statement (package) @import)
         (require_expression (bareword) @import)
-    "#,
-    function_query: r#"
+    ",
+    function_query: r"
         (subroutine_declaration_statement name: (bareword) @fn)
-    "#,
-    class_query: r#"
+    ",
+    class_query: r"
         (package_statement (package) @class)
         (class_statement (package) @class)
-    "#,
+    ",
     compiled: CompiledQueries::new(),
     call_kinds: &[
         "function_call_expression",
@@ -1146,7 +1177,12 @@ static PERL: LangConfig = LangConfig {
     null_kinds: &["undef_expression"],
     object_kinds: &["anonymous_hash_expression", "hash"],
     array_kinds: &["anonymous_array_expression", "array"],
-    function_kinds: &["anonymous_subroutine_expression"],
+    function_kinds: &[
+        "subroutine_declaration_statement",
+        "method_declaration_statement",
+        "anonymous_subroutine_expression",
+        "anonymous_method_expression",
+    ],
     template_kinds: &["interpolated_string_literal"],
     binary_op_kinds: &["binary_expression"],
 };
@@ -1157,17 +1193,17 @@ static GROOVY: LangConfig = LangConfig {
     // This grammar retains Java's node name for Groovy single-quoted
     // strings. Their contents are string values, including multi-byte text.
     string_kinds: &["string_literal", "character_literal"],
-    import_query: r#"
+    import_query: r"
         (import_declaration (scoped_identifier) @import)
         (import_declaration (identifier) @import)
-    "#,
-    function_query: r#"
+    ",
+    function_query: r"
         (method_declaration name: (identifier) @fn)
         (function_definition name: (identifier) @fn)
-    "#,
-    class_query: r#"
+    ",
+    class_query: r"
         (class_declaration name: (identifier) @class)
-    "#,
+    ",
     compiled: CompiledQueries::new(),
     call_kinds: &["method_invocation", "juxt_function_call"],
     callee_field: "name",
@@ -1185,7 +1221,13 @@ static GROOVY: LangConfig = LangConfig {
     null_kinds: &["null_literal"],
     object_kinds: &["map"],
     array_kinds: &["list", "array_literal"],
-    function_kinds: &["closure"],
+    function_kinds: &[
+        "function_definition",
+        "method_declaration",
+        "constructor_declaration",
+        "closure",
+        "lambda_expression",
+    ],
     template_kinds: &["string_interpolation"],
     binary_op_kinds: &["binary_expression"],
 };
@@ -1200,9 +1242,9 @@ static ZIG: LangConfig = LangConfig {
             (arguments (string (string_content) @import))
             (#any-of? @_fn "@import" "@cImport"))
     "#,
-    function_query: r#"
+    function_query: r"
         (function_declaration name: (identifier) @fn)
-    "#,
+    ",
     class_query: "",
     compiled: CompiledQueries::new(),
     call_kinds: &["call_expression"],
@@ -1222,7 +1264,7 @@ static ZIG: LangConfig = LangConfig {
     null_kinds: &["null"],
     object_kinds: &["struct_initializer", "anonymous_struct_initializer"],
     array_kinds: &[],
-    function_kinds: &[],
+    function_kinds: &["function_declaration"],
     template_kinds: &[],
     binary_op_kinds: &["binary_expression"],
 };
@@ -1271,14 +1313,14 @@ static MAKEFILE: LangConfig = LangConfig {
     lang: Lang::Makefile,
     language: || tree_sitter_make::LANGUAGE.into(),
     string_kinds: &["string"],
-    import_query: r#"
+    import_query: r"
         (include_directive (list (word) @import))
-    "#,
+    ",
     // Rules in Make are the closest analogue to "functions" — the
     // target name(s) of each rule.
-    function_query: r#"
+    function_query: r"
         (rule (targets (word) @fn))
-    "#,
+    ",
     class_query: "",
     compiled: CompiledQueries::new(),
     call_kinds: &["function_call", "shell_function"],
@@ -1357,66 +1399,4 @@ static BATCH: LangConfig = LangConfig {
 };
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A query that stops compiling after a grammar bump only logs at runtime
-    /// and drops that language's symbols, so compile every one here and name
-    /// each failure.
-    #[test]
-    fn every_language_query_compiles() {
-        let mut failures = Vec::new();
-        for config in &ALL {
-            for kind in QueryKind::ALL {
-                let source = config.query_source(kind);
-                if source.is_empty() {
-                    continue;
-                }
-                if let Err(error) = Query::new(&(config.language)(), source) {
-                    failures.push(format!("{} {} query: {error}", config.name(), kind.label()));
-                }
-            }
-        }
-        assert!(failures.is_empty(), "{}", failures.join("\n"));
-    }
-
-    /// Per-language behaviour is keyed on `Lang`, and its label is the
-    /// published `source.language` value, so each must belong to exactly one
-    /// configuration.
-    #[test]
-    fn every_config_has_its_own_language_and_label() {
-        let langs: std::collections::HashSet<Lang> = ALL.iter().map(|c| c.lang).collect();
-        let names: std::collections::HashSet<&str> = ALL.iter().map(|c| c.name()).collect();
-        assert_eq!(langs.len(), ALL.len());
-        assert_eq!(names.len(), ALL.len());
-    }
-
-    /// Labels resolve to individual dialects. File types select a default;
-    /// C++ is the fallback dialect of the shared C-family file type.
-    #[test]
-    fn file_types_and_labels_resolve_to_their_config() {
-        for config in ALL {
-            let file_type = config.lang.file_type();
-            assert!(std::ptr::eq(config_named(config.name()).unwrap(), config));
-            if config.lang == Lang::Cpp {
-                assert_eq!(config_for(file_type).unwrap().lang, Lang::C);
-            } else {
-                assert!(std::ptr::eq(config_for(file_type).unwrap(), config));
-            }
-            assert_eq!(file_type_named(config.name()), Some(file_type));
-        }
-        assert_eq!(file_type_named("cobol"), None);
-    }
-
-    #[test]
-    fn query_cache_compiles_once_and_skips_absent_queries() {
-        let first = PYTHON
-            .query(QueryKind::Imports)
-            .expect("python import query");
-        let again = PYTHON
-            .query(QueryKind::Imports)
-            .expect("python import query");
-        assert!(std::ptr::eq(first, again));
-        assert!(BASH.query(QueryKind::Classes).is_none());
-    }
-}
+mod tests;

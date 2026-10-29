@@ -1,9 +1,11 @@
-//! A bounded line grammar for straight-line batch snapshot/concatenation loops.
-//! Numeric and punctuation labels are read independently of tree-sitter's
-//! narrower label grammar. Facts describe source-local requests, not runtime
-//! success. Conditional/unknown loop bodies never establish these profiles.
+//! Straight-line batch snapshot/concatenation loops, read over the shared
+//! line model ([`super::batch_lines`]). Facts describe source-local requests,
+//! not runtime success. Conditional/unknown loop bodies never establish these
+//! profiles.
+use super::batch_lines::{BODY_BUDGET, Lines, Unmodelled, comment, words};
+use crate::formats::common::starts_with_ci;
 use crate::{Metrics, metric};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Default, Debug)]
 struct Stats {
@@ -32,129 +34,27 @@ pub(super) fn emit(source: &str, metrics: &mut Metrics) {
     }
 }
 
-fn bare(line: &str) -> &str {
-    let line = line.trim();
-    line.strip_prefix('@').unwrap_or(line).trim_start()
-}
-
-fn words(line: &str) -> (&str, &str) {
-    line.split_once(char::is_whitespace)
-        .map_or((line, ""), |(a, b)| (a, b.trim_start()))
-}
-
-fn label_name(name: &str) -> Option<String> {
-    let name = name.trim().strip_prefix(':').unwrap_or(name.trim());
-    (!name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_.$#!-".contains(c)))
-    .then(|| name.to_ascii_lowercase())
-}
-
-fn label(line: &str) -> Option<String> {
-    if line.starts_with("::") {
-        return None;
-    }
-    let name = line.strip_prefix(':')?;
-    label_name(name.split_whitespace().next()?)
-}
-
-fn jump(line: &str) -> Option<String> {
-    let (cmd, rest) = words(line);
-    cmd.eq_ignore_ascii_case("goto")
-        .then(|| label_name(rest))
-        .flatten()
-}
-
 fn analyze(source: &str) -> Stats {
-    if source.len() > 512 * 1024 {
-        return Stats {
-            limited: true,
-            ..Stats::default()
-        };
-    }
-    let lines: Vec<_> = source.lines().map(bare).collect();
-    if lines.len() > 10_000 {
-        return Stats {
-            limited: true,
-            ..Stats::default()
-        };
-    }
-    let mut labels = HashMap::new();
-    for (i, line) in lines.iter().enumerate() {
-        if let Some(name) = label(line) {
-            if labels.insert(name, i).is_some() {
-                return Stats::default();
-            }
-        }
-    }
-    let mut reachable = HashSet::new();
-    let mut pending = VecDeque::from([0]);
-    while let Some(i) = pending.pop_front() {
-        let Some(&line) = lines.get(i) else {
-            continue;
-        };
-        if !reachable.insert(i) {
-            continue;
-        }
-        let (cmd, rest) = words(line);
-        // Comments and labels cannot change entry flow. Other compound lines,
-        // nested interpreters and batch transfers require interprocedural flow
-        // analysis; stop rather than claiming their fallthrough reaches a loop.
-        if cmd.eq_ignore_ascii_case("rem")
-            || line.starts_with(':')
-            || line.to_ascii_lowercase().starts_with("<html>rem ")
-        {
-            pending.push_back(i + 1);
-            continue;
-        }
-        if line.chars().any(|c| "&|()^".contains(c))
-            || ["call", "for", "cmd", "cmd.exe", "command", "command.com"]
-                .iter()
-                .any(|name| cmd.eq_ignore_ascii_case(name))
-            || cmd.trim_matches('"').to_ascii_lowercase().ends_with(".bat")
-            || cmd.trim_matches('"').to_ascii_lowercase().ends_with(".cmd")
-        {
-            continue;
-        }
-        if cmd.eq_ignore_ascii_case("exit") {
-            continue;
-        }
-        if cmd.eq_ignore_ascii_case("goto") {
-            if let Some(target) = jump(line).and_then(|name| labels.get(&name)) {
-                pending.push_back(*target);
-            }
-            continue;
-        }
-        if cmd.eq_ignore_ascii_case("if") {
-            // Read both paths of this simple conditional; unsupported control
-            // syntax stops the proof instead of being treated as fallthrough.
-            let tokens: Vec<_> = rest.split_whitespace().collect();
-            let &[kind, level, goto, target] = tokens.as_slice() else {
-                continue;
+    let lines = match Lines::new(source) {
+        Ok(lines) => lines,
+        Err(why) => {
+            tracing::debug!(
+                target: "filefacts::source",
+                format = "batch",
+                len = source.len(),
+                reason = ?why,
+                "batch concat: file not modelled"
+            );
+            return Stats {
+                limited: why == Unmodelled::TooLarge,
+                ..Stats::default()
             };
-            if !kind.eq_ignore_ascii_case("errorlevel")
-                || level.parse::<u32>().is_err()
-                || !goto.eq_ignore_ascii_case("goto")
-            {
-                continue;
-            }
-            if let Some(target) = label_name(target).and_then(|name| labels.get(&name)) {
-                pending.push_back(*target);
-            }
         }
-        pending.push_back(i + 1);
-    }
+    };
     let mut stats = Stats::default();
-    let mut budget = 20_000usize;
-    for (end, line) in lines.iter().enumerate() {
-        let Some(start) = jump(line).and_then(|name| labels.get(&name).copied()) else {
-            continue;
-        };
-        if start >= end || !reachable.contains(&start) || !reachable.contains(&end) {
-            continue;
-        }
-        let Some(body) = lines.get(start + 1..end) else {
+    let mut budget = BODY_BUDGET;
+    for (start, end) in lines.loops() {
+        let Some(body) = lines.lines.get(start + 1..end) else {
             continue;
         };
         if body.len() > budget {
@@ -250,13 +150,10 @@ fn loop_body(body: &[&str]) -> Option<(bool, usize)> {
     let mut seeds = HashSet::new();
     let mut growth: HashMap<String, usize> = HashMap::new();
     for line in body {
-        if line.is_empty() || line.starts_with("::") {
+        if line.is_empty() || comment(line) {
             continue;
         }
         let (cmd, rest) = words(line);
-        if cmd.eq_ignore_ascii_case("rem") {
-            continue;
-        }
         // Inline control operators would invalidate the linear body proof.
         if line.chars().any(|c| "&|()^".contains(c)) {
             return None;
@@ -283,12 +180,12 @@ fn loop_body(body: &[&str]) -> Option<(bool, usize)> {
                 return None;
             }
             // Console operations without redirection do not mutate files.
-        } else if cmd.eq_ignore_ascii_case("echo") || cmd.to_ascii_lowercase().starts_with("echo.")
-        {
+        } else if cmd.eq_ignore_ascii_case("echo") || starts_with_ci(cmd, "echo.") {
             let text = if cmd.eq_ignore_ascii_case("echo") {
                 rest
             } else {
-                &line[5..]
+                // `cmd` is `line`'s first word, so this skips its `echo.`.
+                line.get(5..).unwrap_or_default()
             };
             let append = text.contains(">>");
             if let Some((data, target)) = text.split_once(if append { ">>" } else { ">" }) {
@@ -301,7 +198,7 @@ fn loop_body(body: &[&str]) -> Option<(bool, usize)> {
                     && !data.contains(['%', '!'])
                     && !data.trim().eq_ignore_ascii_case("off")
                     && !data.trim().eq_ignore_ascii_case("on")
-                    && (!data.trim().is_empty() || cmd.to_ascii_lowercase().starts_with("echo."))
+                    && (!data.trim().is_empty() || starts_with_ci(cmd, "echo."))
                 {
                     seeds.insert(file);
                 } else if !append {
@@ -383,120 +280,4 @@ fn loop_body(body: &[&str]) -> Option<(bool, usize)> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    const LOOP: &str = ":1\nset alias=cache\necho 0000>>data\ncopy /b data %alias%\ncopy /b data+%alias%+%alias%\ncopy /b data+data+data\ngoto 1\n";
-    #[test]
-    fn snapshot_source_and_backedge_are_bound() {
-        let s = analyze(LOOP);
-        assert_eq!((s.loops, s.seeded, s.fanout), (1, 1, 2));
-        let s = analyze(
-            &LOOP
-                .replace(":1", ":again!")
-                .replace("goto 1", "goto again!"),
-        );
-        assert_eq!((s.loops, s.seeded), (1, 1));
-        let s = analyze(
-            &LOOP
-                .replace("data", "different.bin")
-                .replace("cache", "snapshot.tmp"),
-        );
-        assert_eq!((s.loops, s.seeded), (1, 1));
-    }
-    #[test]
-    fn unrelated_or_reset_files_do_not_amplify() {
-        for s in [
-            LOOP.replace("copy /b data %alias%", "copy /b other %alias%"),
-            LOOP.replace("goto 1", "goto missing"),
-            LOOP.replace("goto 1", "if errorlevel 1 goto 1"),
-            LOOP.replace("echo 0000>>data", "echo 0000>data"),
-            LOOP.replace(
-                "copy /b data+%alias%",
-                "echo changed>>%alias%\ncopy /b data+%alias%",
-            ),
-            LOOP.replace("goto 1", "echo replaced>data\ngoto 1"),
-        ] {
-            assert_eq!(analyze(&s).loops, 0, "{s}");
-        }
-    }
-    #[test]
-    fn dead_or_quoted_loops_do_not_establish_execution() {
-        assert_eq!(analyze(&format!("exit /b\n{LOOP}")).loops, 0);
-        for prefix in [
-            "echo ignored & exit /b",
-            "call :stop",
-            "other.bat",
-            "cmd /c exit",
-        ] {
-            assert_eq!(
-                analyze(&format!("{prefix}\n{LOOP}\n:stop\nexit /b")).loops,
-                0
-            );
-        }
-        assert_eq!(
-            analyze(&format!("goto done\n{LOOP}\n:done\nexit /b")).loops,
-            0
-        );
-        assert_eq!(
-            analyze(
-                &LOOP
-                    .lines()
-                    .map(|s| format!("rem {s}\n"))
-                    .collect::<String>()
-            )
-            .loops,
-            0
-        );
-        assert_eq!(
-            analyze(
-                &LOOP
-                    .lines()
-                    .map(|s| format!("echo {s}\n"))
-                    .collect::<String>()
-            )
-            .loops,
-            0
-        );
-    }
-    #[test]
-    fn empty_or_bounded_profiles_are_distinct() {
-        let s = analyze(&LOOP.replace("echo 0000>>data\n", ""));
-        assert_eq!((s.loops, s.seeded), (1, 0));
-        assert_eq!(analyze(&LOOP.replace("goto 1", "exit /b")).loops, 0);
-        assert!(analyze(&"x".repeat(512 * 1024 + 1)).limited);
-    }
-    #[test]
-    fn seed_target_is_bound_to_amplified_source() {
-        let s = analyze(&LOOP.replace("echo 0000>>data", "echo 0000>>unrelated"));
-        assert_eq!((s.loops, s.seeded), (1, 0));
-        let s = analyze(&LOOP.replace(
-            "data+%alias%+%alias%",
-            "data+%alias%+%alias% separate-output",
-        ));
-        assert_eq!(s.loops, 0);
-    }
-
-    #[test]
-    fn redirects_prompts_and_unknown_seed_values_do_not_convict() {
-        assert_eq!(
-            analyze(&LOOP.replace("set alias=cache", "ctty nul>data\nset alias=cache")).loops,
-            0
-        );
-        assert_eq!(
-            analyze(&LOOP.replace("copy /b data %alias%", "copy /b /-y data %alias%")).loops,
-            0
-        );
-        assert_eq!(
-            analyze(&LOOP.replace("echo 0000>>data", "echo %unknown%>>data")).seeded,
-            0
-        );
-        assert_ne!(path(r"\\server\data"), path(r"\server\data"));
-    }
-
-    #[test]
-    fn simple_errorlevel_prelude_reaches_loop() {
-        let source =
-            format!("if errorlevel 1 goto start\necho alternate\ngoto start\n:start\n{LOOP}");
-        assert_eq!(analyze(&source).seeded, 1);
-    }
-}
+mod tests;

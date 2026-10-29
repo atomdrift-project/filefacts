@@ -97,8 +97,7 @@ pub enum LiteralEncoding {
 pub struct Literal {
     /// The value, decoded to UTF-8. Named as stng's
     /// [`ExtractedString::value`](stng::ExtractedString) is, so every string
-    /// view reads the same field; `text` is still accepted when reading.
-    #[serde(alias = "text")]
+    /// view reads the same field.
     pub value: String,
     /// Byte offset in the analysed file where the value's source starts: a
     /// literal's opening quote, or a comment body's first character.
@@ -170,17 +169,15 @@ impl From<ExtractedString> for Literal {
 /// source — earlier bytes first.
 ///
 /// Rows are the raw `stng::ExtractedString` (the single string-extraction
-/// engine), retained typed so the sole consumer (cleave) reads stng's
+/// engine), retained typed so a consumer reads stng's
 /// `StringKind`/`StringMethod` enums directly rather than re-parsing labels.
-/// Round-trips through the disk cache, so `stng::ExtractedString` carries
-/// `Deserialize` alongside `Serialize`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Text {
     /// All byte-scan rows, held as the shared `Arc` stng handed back so
-    /// downstream consumers (cleave) borrow this allocation instead of
-    /// cloning. ASCII and UTF-16LE are not separate buffers — the encoding
-    /// split is a view ([`Text::ascii`] / [`Text::utf16le`]) over `rows`,
-    /// which preserves the serialized `{ascii, utf16le}` shape.
+    /// consumers borrow this allocation instead of cloning. ASCII and
+    /// UTF-16LE are not separate buffers — the encoding split is a view
+    /// ([`Text::ascii`] / [`Text::utf16le`]) over `rows`, which is also the
+    /// serialized `{ascii, utf16le}` shape.
     rows: std::sync::Arc<[stng::ExtractedString]>,
 }
 
@@ -247,9 +244,8 @@ impl Text {
     }
 }
 
-// Serialize keeping the historical `{ascii, utf16le}` schema (a view over the
-// shared rows); deserialize concatenates the two arrays back into one `Arc`,
-// ascii first, matching `from_rows` order.
+// Serialize as the `{ascii, utf16le}` view over the shared rows; deserialize
+// concatenates the two arrays back into one `Arc`, ascii first.
 impl Serialize for Text {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
@@ -285,7 +281,7 @@ impl<'de> Deserialize<'de> for Text {
 /// parsers (JSON/YAML/TOML/etc.). Distinct from [`Text`] because
 /// these are language-defined literals, not byte-level printable
 /// runs — no comment or code false positives.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Literals(Vec<Literal>);
 
@@ -332,7 +328,7 @@ impl<'a> IntoIterator for &'a Literals {
 /// never fire on a keyword that appears in code or a string, only in a
 /// genuine comment — the lowest-false-positive home for "this keyword
 /// is mentioned in a comment" rules.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Comments(Vec<Literal>);
 
@@ -377,12 +373,17 @@ impl<'a> IntoIterator for &'a Comments {
 /// tier without juggling parameters. The bundle is *not* part of
 /// the public schema — consumers read [`ParsedFile::text`],
 /// [`ParsedFile::literals`], and [`ParsedFile::comments`] separately.
+/// Its serialized form is the disk cache's.
 ///
 /// [`ParsedFile::text`]: crate::ParsedFile::text
 /// [`ParsedFile::literals`]: crate::ParsedFile::literals
 /// [`ParsedFile::comments`]: crate::ParsedFile::comments
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Strings {
+    /// Cached as one list in extraction order: `Text`'s own serialized form
+    /// groups the rows by encoding, which would hand a cached `open` the
+    /// rows in another order than a fresh one.
+    #[serde(with = "rows")]
     pub(crate) text: Text,
     pub(crate) literals: Literals,
     pub(crate) comments: Comments,
@@ -430,150 +431,24 @@ impl Strings {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Serde for [`Strings::text`]: the shared rows written as a sequence straight
+/// from the borrowed slice, read back into a fresh `Arc`.
+mod rows {
+    use serde::{Deserialize, Deserializer, Serializer};
 
-    #[test]
-    fn text_spans_locate_each_string_kind_correctly() {
-        let text_rows: std::sync::Arc<[stng::ExtractedString]> = vec![
-            // StackString: source is scattered across instructions, so the span
-            // anchors at the first fragment — NOT the (non-contiguous) data_offset.
-            stng::ExtractedString {
-                value: "STACKSTR".into(),
-                data_offset: 9999,
-                method: stng::StringMethod::StackString,
-                fragments: Some(Box::new(vec![
-                    stng::StringFragment {
-                        offset: 0x100,
-                        length: 4,
-                    },
-                    stng::StringFragment {
-                        offset: 0x200,
-                        length: 4,
-                    },
-                ])),
-                ..Default::default()
-            },
-            // Plain byte-scan literal: span at its file offset.
-            stng::ExtractedString {
-                value: "plain".into(),
-                data_offset: 0x10,
-                method: stng::StringMethod::RawScan,
-                ..Default::default()
-            },
-        ]
-        .into();
-        let literals = Literals(vec![
-            Literal::new("decoded", 0x500).with_method(LiteralMethod::ScptBase64),
-            Literal::new("lit", 0x40),
-        ]);
-        let strings = Strings {
-            text: Text::from_rows(text_rows),
-            literals,
-            comments: Comments::new(),
-        };
-        let spans: Vec<(Span, &str)> = strings.text_spans().collect();
-        assert_eq!(
-            spans,
-            vec![
-                (Span::new(0x100, 4), "STACKSTR"), // first fragment, not (9999, 8)
-                (Span::new(0x10, 5), "plain"),
-                (Span::new(0x500, 7), "decoded"),
-                (Span::new(0x40, 3), "lit"),
-            ]
-        );
+    use super::Text;
+
+    pub(super) fn serialize<S: Serializer>(text: &Text, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(text.rows.iter())
     }
 
-    #[test]
-    fn text_iter_walks_both_encodings() {
-        let rows: std::sync::Arc<[stng::ExtractedString]> = vec![
-            stng::ExtractedString {
-                value: "Mozilla/5.0".into(),
-                data_offset: 100,
-                method: stng::StringMethod::RawScan,
-                ..Default::default()
-            },
-            stng::ExtractedString {
-                value: "RegOpenKeyExW".into(),
-                data_offset: 200,
-                method: stng::StringMethod::WideString,
-                ..Default::default()
-            },
-        ]
-        .into();
-        let t = Text::from_rows(rows);
-        let texts: Vec<&str> = t.iter().map(|s| s.value.as_str()).collect();
-        assert_eq!(texts, vec!["Mozilla/5.0", "RegOpenKeyExW"]);
-        assert_eq!(t.len(), 2);
-        assert_eq!(t.ascii().count(), 1);
-        assert_eq!(t.utf16le().count(), 1);
-    }
-
-    #[test]
-    fn literals_is_flat_serde_array() {
-        let mut lits = Literals::new();
-        lits.push(Literal::new("https://example/", 1024));
-        lits.push(
-            Literal::new("Hello", 7)
-                .with_method(LiteralMethod::ScptLiteral)
-                .with_encoding(LiteralEncoding::Utf16be),
-        );
-        let json = serde_json::to_string(&lits).unwrap();
-        assert!(json.starts_with('['), "literals serialises as bare array");
-        assert!(
-            json.contains(r#""method":"scpt-literal","encoding":"utf16be""#),
-            "{json}"
-        );
-        let back: Literals = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.as_slice(), lits.as_slice());
-    }
-
-    /// The serialized label and `as_str` agree for every method.
-    #[test]
-    fn literal_method_labels_match_serde() {
-        for method in [
-            LiteralMethod::ScptLiteral,
-            LiteralMethod::ScptConstant,
-            LiteralMethod::ScptBase64,
-            LiteralMethod::ScptBase64Obf,
-            LiteralMethod::ScptHex,
-            LiteralMethod::ScptUrl,
-            LiteralMethod::ScptUnicodeEscape,
-            LiteralMethod::ScptBase32,
-            LiteralMethod::ScptBase85,
-            LiteralMethod::ScptRot13Base64,
-            LiteralMethod::NibString,
-        ] {
-            assert_eq!(
-                serde_json::to_value(method).unwrap(),
-                serde_json::Value::from(method.as_str())
-            );
-        }
-    }
-
-    /// A source-extractor row keeps its text and offset through the push.
-    #[test]
-    fn producer_rows_convert_on_push() {
-        let mut lits = Literals::new();
-        lits.push(ExtractedString {
-            value: "x".into(),
-            offset: 9,
-            ..ExtractedString::default()
-        });
-        assert_eq!(lits.as_slice(), &[Literal::new("x", 9)]);
-    }
-
-    /// Rows serialize their string as `value`, like stng's text rows, and
-    /// still read the `text` they were written with before.
-    #[test]
-    fn literal_rows_name_their_string_value() {
-        let row = Literal::new("x", 9);
-        assert_eq!(
-            serde_json::to_value(&row).unwrap(),
-            serde_json::json!({"value": "x", "offset": 9})
-        );
-        let old: Literal = serde_json::from_str(r#"{"text":"x","offset":9}"#).unwrap();
-        assert_eq!(old, row);
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Text, D::Error> {
+        Vec::<stng::ExtractedString>::deserialize(deserializer)
+            .map(|rows| Text::from_rows(rows.into()))
     }
 }
+
+#[cfg(test)]
+mod tests;

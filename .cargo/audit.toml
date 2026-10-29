@@ -1,0 +1,20 @@
+# cargo-audit configuration, run in CI (.github/workflows/ci.yml).
+#
+# Every exception names the advisory, why filefacts is not exposed to it, and
+# what retires it. Anything else cargo-audit reports fails the build.
+
+[advisories]
+ignore = [
+    # rsa: Marvin attack, a timing side channel in RSA *decryption* and
+    # *signing* that can recover the private key. filefacts only verifies
+    # signatures, with public keys taken from the file being analysed; it
+    # holds no private key outside tests, so there is nothing to recover.
+    # No fixed rsa release exists yet; remove this once one does.
+    "RUSTSEC-2023-0071",
+    # crypto-bigint 0.5 (through p256/p384 0.13 and elliptic-curve): timing
+    # variability in operations meant to be constant-time. filefacts uses
+    # p256/p384 only for ECDSA verification with public keys and public
+    # inputs, so no secret flows through the affected code. Remove this when
+    # p256/p384 move to a fixed crypto-bigint and filefacts upgrades to them.
+    "RUSTSEC-2026-0387",
+]

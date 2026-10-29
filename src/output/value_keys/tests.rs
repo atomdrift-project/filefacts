@@ -38,22 +38,14 @@ fn declared_resolves_to_the_literal() {
     assert_eq!(value_key!("pkg").to_string(), "pkg");
 }
 
-#[test]
-fn get_in_navigates_like_values() {
-    let root = serde_json::json!({"pe": {"signatures": [{"subject": "CN=x"}]}});
-    let sigs = value_key!("pe.signatures").get_in(&root);
-    assert_eq!(sigs, root.pointer("/pe/signatures"));
-    assert!(value_key!("pe.go").get_in(&root).is_none());
-}
-
 /// Modules that only consume `values`. Every `value_key!` in them is a
 /// read, whatever it is passed to.
 const READER_MODULES: &[&str] = &[
     "src/embedded_sources.rs",
-    "src/formats/identity.rs",
     "src/formats/references.rs",
     "src/formats/references/",
     "src/go_package_context.rs",
+    "src/identity.rs",
     "src/package_context.rs",
 ];
 

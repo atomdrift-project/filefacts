@@ -32,11 +32,12 @@ use std::io::{Cursor, Read, Seek};
 
 use serde_json::Value as JsonValue;
 
+use crate::formats::bounded::Limits;
 use crate::formats::common::bytes_at;
 use crate::output::{Errors, Metrics, Stage, Values};
 
-/// Cap on the decompressed size of a single module — 10 MiB matches
-/// cleave's bound.
+/// Cap on the decompressed size of a single module. Real modules are tens
+/// of kilobytes; 10 MiB leaves room for generated or padded macros.
 const MAX_DECOMPRESSED_SIZE: usize = 10 * 1024 * 1024;
 /// Cap on the raw CFB stream length we'll read into memory.
 const MAX_STREAM_SIZE: u64 = 20 * 1024 * 1024;
@@ -83,7 +84,7 @@ struct Report<'a> {
     stage: Stage,
     /// The package part the project was read from, prefixed to messages.
     origin: Option<&'a str>,
-    limits: Vec<JsonValue>,
+    limits: Limits,
 }
 
 impl<'a> Report<'a> {
@@ -92,7 +93,7 @@ impl<'a> Report<'a> {
             errors,
             stage,
             origin,
-            limits: Vec::new(),
+            limits: Limits::default(),
         }
     }
 
@@ -108,25 +109,15 @@ impl<'a> Report<'a> {
         self.errors.record_malformed(self.stage, message);
     }
 
-    fn limit(&mut self, stage: &str, reason: String) {
+    fn limit(&mut self, stage: &'static str, reason: String) {
         let reason = self.located(reason);
-        self.limits
-            .push(serde_json::json!({ "stage": stage, "reason": reason }));
+        self.limits.push(stage, reason);
     }
 
     /// Append the caps hit to `office.limits`, after any the OOXML layer
     /// already put there.
     fn finish(self, values: &mut Values) {
-        if self.limits.is_empty() {
-            return;
-        }
-        let mut limits = values
-            .get_key(value_key!("office.limits"))
-            .and_then(JsonValue::as_array)
-            .cloned()
-            .unwrap_or_default();
-        limits.extend(self.limits);
-        values.insert_key(value_key!("office.limits"), JsonValue::Array(limits));
+        self.limits.emit(values, value_key!("office.limits"));
     }
 }
 
@@ -169,7 +160,7 @@ fn extract_project(
             return;
         }
     };
-    let dir_decompressed = match decompress_vba(&dir_bytes) {
+    let dir_decompressed = match decompress_vba(&dir_bytes, MAX_DECOMPRESSED_SIZE) {
         Ok(data) => data,
         Err(DecompressError::BadSignature) => {
             report.failure(format!(
@@ -264,7 +255,7 @@ fn extract_project(
             continue;
         };
         let cap = source_left.min(MAX_DECOMPRESSED_SIZE);
-        let source_bytes = match decompress_vba_within(container, cap) {
+        let source_bytes = match decompress_vba(container, cap) {
             Ok(source) => source,
             Err(DecompressError::BadSignature) => {
                 report.failure(format!(
@@ -426,7 +417,7 @@ fn extract_project(
 ///
 /// `vbaProject.bin` is itself a standalone CFBF compound file, so once
 /// its bytes are read out of the zip they flow through the same CFB walk
-/// as the legacy [`extract`] path and populate `office.vba.*`
+/// as the binary-document [`extract`] path and populate `office.vba.*`
 /// identically. This mirrors the `FileType::OleDoc` dispatch so macros in
 /// `.docm`/`.xlsm`/`.pptm` are decompressed, not merely flagged by stream
 /// path. A document carries a single VBA project; the first part the
@@ -445,11 +436,11 @@ pub(super) fn extract_from_zip<R: Read + Seek>(
     // Find the part by what the package says it is, not by what it is called.
     //
     // `office.macros` comes from `[Content_Types].xml`, which is where the
-    // package declares which part is the VBA project. Matching on the name
-    // `vbaProject.bin` instead meant a package that renamed it extracted no
-    // macros at all -- and renaming it is free: one sample here declares
-    // `Default Extension="bin" ContentType="application/vnd.ms-office.vbaProject"`
-    // and ships the project as `A@@@@.../Vasp7676CDT11.bin`, 273 KB of it.
+    // package declares which part is the VBA project. The part name is free
+    // to choose: a `Default Extension="bin"
+    // ContentType="application/vnd.ms-office.vbaProject"` declaration makes
+    // any `.bin` part the project, so a name match alone would miss renamed
+    // projects.
     let declared = values
         .get_key(value_key!("office.macros"))
         .and_then(JsonValue::as_array)
@@ -460,8 +451,9 @@ pub(super) fn extract_from_zip<R: Read + Seek>(
         .map(str::to_string);
     let Some(name) = declared.or_else(|| {
         zip.file_names()
+            .filter_map(Result::ok)
             .find(|n| n.to_ascii_lowercase().ends_with("vbaproject.bin"))
-            .map(str::to_string)
+            .map(std::borrow::Cow::into_owned)
     }) else {
         return;
     };
@@ -551,11 +543,16 @@ fn find_vba_prefix<R: Read + std::io::Seek>(comp: &mut cfb::CompoundFile<R>) -> 
         "Excel/VBA",
     ];
     for cand in CANDIDATES {
-        for entry in &entries {
-            let normalized = entry.trim_start_matches('/');
-            if normalized.eq_ignore_ascii_case(&format!("{cand}/dir")) {
-                return Some(format!("/{cand}"));
-            }
+        let found = entries.iter().any(|entry| {
+            let path = entry.trim_start_matches('/');
+            path.get(..cand.len())
+                .is_some_and(|storage| storage.eq_ignore_ascii_case(cand))
+                && path
+                    .get(cand.len()..)
+                    .is_some_and(|rest| rest.eq_ignore_ascii_case("/dir"))
+        });
+        if found {
+            return Some(format!("/{cand}"));
         }
     }
     // Fallback: any path ending in `/VBA/dir` (case-insensitive).
@@ -606,16 +603,11 @@ enum DecompressError {
     TooLarge,
 }
 
-/// [`decompress_vba_within`] the per-module cap, [`MAX_DECOMPRESSED_SIZE`].
-fn decompress_vba(data: &[u8]) -> Result<Vec<u8>, DecompressError> {
-    decompress_vba_within(data, MAX_DECOMPRESSED_SIZE)
-}
-
 /// Decompress an MS-OVBA RLE stream into at most `cap` bytes. The format
 /// starts with a `0x01` signature byte; each subsequent chunk has a 12-bit
 /// length plus an "is compressed" bit. Compressed chunks alternate 1-byte
 /// flag fields with eight tokens (literal byte or LZ-style back-reference).
-fn decompress_vba_within(data: &[u8], cap: usize) -> Result<Vec<u8>, DecompressError> {
+fn decompress_vba(data: &[u8], cap: usize) -> Result<Vec<u8>, DecompressError> {
     let Some(&signature) = data.first() else {
         return Ok(Vec::new());
     };
@@ -696,14 +688,9 @@ fn decompress_vba_within(data: &[u8], cap: usize) -> Result<Vec<u8>, DecompressE
 /// The spec is `max(4, ceil(log2(DecompressedCurrent - DecompressedChunkStart)))`,
 /// capped at 12: early in a chunk there is little to point back at, so the
 /// offset is cheap and the length gets the remaining bits; as the chunk fills,
-/// the offset claims more.
-///
-/// This ran the other way round -- 12 bits at the start of a chunk, shrinking
-/// toward 4 -- so every copy token decoded with the wrong split and produced
-/// plausible-looking but wrong bytes. The dir stream of a real `vbaProject.bin`
-/// came out with `04` bytes turned into `00`, which is enough to make its
-/// record sizes nonsense and yield zero modules: every OOXML document's macro
-/// source was silently unavailable, and so was the OLE2 path's.
+/// the offset claims more. Getting the split backwards still yields
+/// plausible-looking bytes, so a wrong decoder fails silently on dir-stream
+/// record sizes rather than loudly.
 fn max_bit_count(decompressed_pos: usize) -> u16 {
     let mut bits = 4u16;
     while bits < 12 && (1usize << bits) < decompressed_pos {
@@ -747,14 +734,12 @@ fn parse_dir_stream(data: &[u8]) -> DirStream {
     let mut out = Vec::new();
     // Start at PROJECTMODULES rather than at byte zero.
     //
-    // The records before it cannot be walked by `id`/`size` alone, and trying
-    // reached no module at all on real files. PROJECTVERSION (0x0009) declares
-    // Size 4 but carries 6 bytes, because the field is Reserved rather than a
-    // length; and the PROJECTREFERENCES that follow have per-kind layouts with
-    // their own embedded sizes. A project without references is rare enough --
-    // `stdole` is in nearly all of them -- that the walk fell over on
-    // essentially every document, which is why office.vba.modules[] was empty
-    // everywhere and no rule ever saw a line of macro source.
+    // The records before it cannot be walked by `id`/`size` alone.
+    // PROJECTVERSION (0x0009) declares Size 4 but carries 6 bytes, because the
+    // field is Reserved rather than a length; and the PROJECTREFERENCES that
+    // follow have per-kind layouts with their own embedded sizes. Nearly every
+    // project has references (`stdole` at least), so a naive walk from zero
+    // would desynchronize on almost every document.
     //
     // PROJECTMODULES is `Id=0x000F, Size=0x00000002`, and the MODULE records
     // after it are a clean id/size chain, which is the part this needs.
@@ -784,10 +769,8 @@ fn parse_dir_stream(data: &[u8]) -> DirStream {
                             // Prefer the Unicode one. The MBCS form is
                             // code-page bytes, and reading it as UTF-8 turns
                             // any non-ASCII letter into a replacement
-                            // character -- so a project with a module called
-                            // `Módulo1` looked for a stream named `M?dulo1`,
-                            // found nothing, and yielded no source at all.
-                            // Every non-English VBA project extracted empty.
+                            // character, so a module called `Módulo1` would
+                            // name a stream `M?dulo1` that does not exist.
                             pos += 6;
                             info.stream_name = read_ascii_string(data, pos, sub_size);
                             pos += sub_size;

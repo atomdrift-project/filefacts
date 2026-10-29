@@ -1,35 +1,37 @@
 //! Go dependency ownership over supplied members, without filesystem access.
 //! This reconciles declarations, replacements and exact checksums. It does not
 //! compute MVS or assert that a declared minimum is the version actually built.
-use crate::package_context::{archive_boundary, join_relative, member_directory};
-use crate::{RefKind, RefLocator, Reference};
+use crate::formats::references::go::{source, words};
+use crate::package_context::{ContextLimits, join_relative, member_directory};
+use crate::{RefKind, RefLocator, Reference, Resolution, UnresolvedReason};
 use std::collections::BTreeMap;
 
 /// An artifact member's already-extracted reference facts.
 #[derive(Debug, Clone, Copy)]
 pub struct ReferenceMember<'a> {
-    /// Logical path, including archive ownership delimiters.
+    /// Logical member path; see [the path contract](crate::package_context#paths).
     pub path: &'a str,
-    /// References produced by the member parser.
+    /// References produced by the member parser ([`crate::ParsedFile::references`]).
     pub references: &'a [Reference],
 }
 
-/// Whether `path`'s final component is `name`: the whole path, or `name`
-/// after a `/` or an `!!` archive delimiter.
+/// Whether `path`'s final component is `name`.
 fn named(path: &str, name: &str) -> bool {
     path.strip_suffix(name)
-        .is_some_and(|rest| rest.is_empty() || rest.ends_with('/') || rest.ends_with("!!"))
+        .is_some_and(|rest| rest.is_empty() || rest.ends_with('/'))
 }
 
+/// The module directory a local `replace`/`use` path names, relative to the
+/// member `base` that declares it; `None` when it leaves the artifact.
 fn local(base: &str, spec: &str) -> Option<String> {
-    let boundary = archive_boundary(base);
-    let relative = member_directory(base).strip_prefix(boundary)?;
-    let absolute = relative.starts_with('/');
-    Some(format!(
-        "{boundary}{}{}",
-        if absolute { "/" } else { "" },
-        join_relative(relative, spec)?
-    ))
+    join_relative(member_directory(base), spec)
+}
+
+/// Whether `path` is the `go.mod` of the module directory `module`.
+fn is_module_manifest(path: &str, module: &str) -> bool {
+    path.strip_suffix("go.mod")
+        .and_then(|dir| dir.strip_suffix('/'))
+        .map_or(path == "go.mod" && module.is_empty(), |dir| dir == module)
 }
 
 fn coordinate(reference: &Reference) -> Option<(&str, &str)> {
@@ -39,19 +41,19 @@ fn coordinate(reference: &Reference) -> Option<(&str, &str)> {
     purl.strip_prefix("pkg:golang/")?.rsplit_once('@')
 }
 
-fn unresolved(reference: &Reference, reason: &str) -> Reference {
+fn unresolved(reference: &Reference, reason: UnresolvedReason) -> Reference {
     let mut result = reference.clone();
-    result.kind = RefKind::Undefined;
-    result.source = format!("go.mod.unresolved-{reason}");
+    result.resolution = Some(Resolution::Unresolved(reason));
     result
 }
 
+/// Whether the workspace `work` lists the module whose manifest is `main`.
 fn owns(work: ReferenceMember<'_>, main: &str) -> bool {
-    archive_boundary(work.path) == archive_boundary(main)
-        && work.references.iter().any(|r| {
-            r.source == "go.work.use" && matches!(&r.locator,
-                RefLocator::Path(path) if local(work.path, path).is_some_and(|p| format!("{p}/go.mod") == main))
-        })
+    work.references.iter().any(|r| {
+        r.source == source::WORK_USE
+            && matches!(&r.locator, RefLocator::Path(path)
+                if local(work.path, path).is_some_and(|module| is_module_manifest(main, &module)))
+    })
 }
 
 fn reconcile(
@@ -60,38 +62,37 @@ fn reconcile(
     sums: &[&Reference],
     members: &[ReferenceMember<'_>],
 ) -> Reference {
-    if reference.source != "go.mod" || reference.kind != RefKind::Dependency {
+    if reference.source != source::MOD || reference.kind != RefKind::Dependency {
         return reference.clone();
     }
     let Some((module, version)) = coordinate(reference) else {
         return reference.clone();
     };
-    if context.iter().any(|(m, _)| {
-        m.references
-            .iter()
-            .any(|r| r.source == "go.manifest.incomplete")
-    }) {
-        return unresolved(reference, "manifest");
+    if context
+        .iter()
+        .any(|(m, _)| m.references.iter().any(|r| r.source == source::INCOMPLETE))
+    {
+        return unresolved(reference, UnresolvedReason::Manifest);
     }
     if context.iter().any(|(m, _)| {
         m.references
             .iter()
-            .any(|r| r.source == "go.mod.exclude" && r.locator == reference.locator)
+            .any(|r| r.source == source::MOD_EXCLUDE && r.locator == reference.locator)
     }) {
-        return unresolved(reference, "excluded-minimum");
+        return unresolved(reference, UnresolvedReason::ExcludedMinimum);
     }
     let mut matches = Vec::new();
     for (owner, workspace) in context {
         for r in owner
             .references
             .iter()
-            .filter(|r| r.source.ends_with(".replace"))
+            .filter(|r| r.source == source::MOD_REPLACE || r.source == source::WORK_REPLACE)
         {
-            let Some(words) = crate::formats::references::go::words(&r.evidence) else {
-                return unresolved(reference, "replacement");
+            let Some(words) = words(&r.evidence) else {
+                return unresolved(reference, UnresolvedReason::Replacement);
             };
             let Some(split) = words.iter().position(|w| w == "=>") else {
-                return unresolved(reference, "replacement");
+                return unresolved(reference, UnresolvedReason::Replacement);
             };
             if words.first().map(String::as_str) != Some(module)
                 || split == 2 && words.get(1).map(String::as_str) != Some(version)
@@ -103,15 +104,16 @@ fn reconcile(
     }
     matches.sort_by_key(|(priority, _, _)| *priority);
     let mut result = reference.clone();
-    result.source = "go.mod.declared-minimum".into();
+    result.resolution = Some(Resolution::DeclaredMinimum);
     if let Some((priority, owner, replacement)) = matches.last() {
         let peers: Vec<_> = matches.iter().filter(|(p, _, _)| p == priority).collect();
         if peers.iter().any(|(_, path, r)| {
             r.locator != replacement.locator
                 || matches!(r.locator, RefLocator::Path(_)) && path != owner
         }) {
-            return unresolved(reference, "replacement-conflict");
+            return unresolved(reference, UnresolvedReason::ReplacementConflict);
         }
+        result.resolution = Some(Resolution::Replaced);
         result.locator = replacement.locator.clone();
         result.pinned_hash = None;
         result.content_sha256 = None;
@@ -121,11 +123,11 @@ fn reconcile(
             reference.evidence, owner, replacement.evidence
         );
         if let RefLocator::Path(path) = &replacement.locator {
-            let Some(path) = local(owner, path) else {
-                return unresolved(reference, "local-boundary");
+            let Some(module) = local(owner, path) else {
+                return unresolved(reference, UnresolvedReason::LocalBoundary);
             };
-            if !members.iter().any(|m| m.path == format!("{path}/go.mod")) {
-                return unresolved(reference, "local-missing");
+            if !members.iter().any(|m| is_module_manifest(m.path, &module)) {
+                return unresolved(reference, UnresolvedReason::LocalMissing);
             }
             result.kind = RefKind::Local;
             return result;
@@ -133,11 +135,11 @@ fn reconcile(
     }
     let pins: Vec<_> = sums
         .iter()
-        .filter(|r| r.source == "go.sum" && r.locator == result.locator)
+        .filter(|r| r.source == source::SUM && r.locator == result.locator)
         .collect();
     if let Some(pin) = pins.first() {
         if pins.iter().any(|r| r.pinned_hash != pin.pinned_hash) {
-            return unresolved(reference, "checksum-conflict");
+            return unresolved(reference, UnresolvedReason::ChecksumConflict);
         }
         result.pinned_hash.clone_from(&pin.pinned_hash);
     }
@@ -146,25 +148,40 @@ fn reconcile(
 
 /// Reconcile each module with its own manifest and owning workspace only.
 /// Returned keys are logical member paths. Checksum-only/vendor records never
-/// become fetch candidates. The caller passes artifact members, not host paths.
+/// become fetch candidates. The caller passes one artifact's members, not
+/// host paths; see [the path contract](crate::package_context#paths).
+/// Budgets come from `limits`; a module they cannot cover keeps its
+/// references with [`UnresolvedReason::ContextBudget`].
 #[must_use]
-pub fn go_dependency_context(members: &[ReferenceMember<'_>]) -> BTreeMap<String, Vec<Reference>> {
+pub fn go_dependency_context(
+    members: &[ReferenceMember<'_>],
+    limits: &ContextLimits,
+) -> BTreeMap<String, Vec<Reference>> {
     let mut result = BTreeMap::new();
     let reference_count = members.iter().map(|m| m.references.len()).sum::<usize>();
-    let over_budget = members.len() > 4096 || reference_count > 50_000;
+    let over_budget =
+        members.len() > limits.max_reference_members || reference_count > limits.max_references;
     // Charge the conservative upper bound of nested reference/member scans,
     // not just the outer loop. A large workspace cannot hide quadratic work.
-    let mut remaining = 2_000_000usize;
+    let mut remaining = limits.max_reference_work;
+    let out_of_budget = |main: &ReferenceMember<'_>, stage: &str| {
+        tracing::debug!(
+            target: "filefacts::go_dependency_context",
+            stage,
+            manifest = main.path,
+            members = members.len(),
+            references = reference_count,
+            "context budget spent; module references left unresolved"
+        );
+        main.references
+            .iter()
+            .map(|r| unresolved(r, UnresolvedReason::ContextBudget))
+            .collect::<Vec<_>>()
+    };
     for main in members.iter().filter(|m| named(m.path, "go.mod")) {
         let lookup_cost = members.len().saturating_add(reference_count);
         if over_budget || remaining < lookup_cost {
-            result.insert(
-                main.path.into(),
-                main.references
-                    .iter()
-                    .map(|r| unresolved(r, "context-budget"))
-                    .collect(),
-            );
+            result.insert(main.path.into(), out_of_budget(main, "lookup"));
             continue;
         }
         remaining -= lookup_cost;
@@ -176,13 +193,7 @@ pub fn go_dependency_context(members: &[ReferenceMember<'_>]) -> BTreeMap<String
         if let Some(work) = workspace {
             let work_cost = members.len().saturating_mul(work.references.len());
             if remaining < work_cost {
-                result.insert(
-                    main.path.into(),
-                    main.references
-                        .iter()
-                        .map(|r| unresolved(r, "context-budget"))
-                        .collect(),
-                );
+                result.insert(main.path.into(), out_of_budget(main, "workspace"));
                 continue;
             }
             remaining -= work_cost;
@@ -198,17 +209,20 @@ pub fn go_dependency_context(members: &[ReferenceMember<'_>]) -> BTreeMap<String
         }
         let mut sums = Vec::new();
         for (owner, work) in &context {
-            let path = format!(
-                "{}{}",
-                member_directory(owner.path),
-                if *work { "go.work.sum" } else { "go.sum" }
-            );
-            if let Some(sum) = members.iter().find(|m| m.path == path) {
+            let directory = member_directory(owner.path);
+            let name = if *work { "go.work.sum" } else { "go.sum" };
+            if let Some(sum) = members.iter().find(|m| {
+                m.path
+                    .strip_prefix(directory)
+                    .is_some_and(|rest| rest == name)
+            }) {
                 sums.extend(sum.references);
             }
         }
-        let vendor_path = format!("{}vendor/modules.txt", member_directory(main.path));
-        let vendor = members.iter().find(|m| m.path == vendor_path);
+        let vendor_directory = format!("{}vendor/", member_directory(main.path));
+        let vendor = members
+            .iter()
+            .find(|m| m.path.strip_prefix(vendor_directory.as_str()) == Some("modules.txt"));
         let per_reference = context
             .iter()
             .map(|(m, _)| m.references.len())
@@ -218,13 +232,7 @@ pub fn go_dependency_context(members: &[ReferenceMember<'_>]) -> BTreeMap<String
             .saturating_add(members.len());
         let resolve_cost = main.references.len().saturating_mul(per_reference);
         if remaining < resolve_cost {
-            result.insert(
-                main.path.into(),
-                main.references
-                    .iter()
-                    .map(|r| unresolved(r, "context-budget"))
-                    .collect(),
-            );
+            result.insert(main.path.into(), out_of_budget(main, "resolve"));
             continue;
         }
         remaining -= resolve_cost;
@@ -233,37 +241,43 @@ pub fn go_dependency_context(members: &[ReferenceMember<'_>]) -> BTreeMap<String
             .iter()
             .map(|r| {
                 let mut value = reconcile(r, &context, &sums, members);
-                if value.kind == RefKind::Dependency {
-                    if let Some(vendor) = vendor {
-                        if vendor
-                            .references
-                            .iter()
-                            .any(|r| r.source == "go.manifest.incomplete")
-                        {
-                            return unresolved(r, "vendor-metadata");
-                        }
-                        let original_module = coordinate(r).map(|(m, _)| m);
-                        let selected = vendor.references.iter().find(|v| {
-                            v.source == "go.vendor.module"
-                                && coordinate(v).map(|(m, _)| m) == original_module
-                        });
-                        if let Some(selected) = selected {
-                            let Some((module, _)) = coordinate(selected) else {
-                                return unresolved(r, "vendor-metadata");
-                            };
-                            let path = format!("{}vendor/{module}/", member_directory(main.path));
-                            if !members.iter().any(|m| m.path.starts_with(&path)) {
-                                return unresolved(r, "vendor-missing");
-                            }
-                            value.kind = RefKind::Local;
-                            value.locator = RefLocator::Path(format!("vendor/{module}"));
-                            value.source = "go.vendor.bundled".into();
-                            value.evidence = format!("{}; {}", r.evidence, selected.evidence);
-                        } else {
-                            return unresolved(r, "vendor-unlisted");
-                        }
-                    }
+                if value.kind != RefKind::Dependency {
+                    return value;
                 }
+                let Some(vendor) = vendor else {
+                    return value;
+                };
+                if vendor
+                    .references
+                    .iter()
+                    .any(|r| r.source == source::INCOMPLETE)
+                {
+                    return unresolved(r, UnresolvedReason::VendorMetadata);
+                }
+                let original_module = coordinate(r).map(|(m, _)| m);
+                let Some(selected) = vendor.references.iter().find(|v| {
+                    v.source == source::VENDOR_MODULE
+                        && coordinate(v).map(|(m, _)| m) == original_module
+                }) else {
+                    return unresolved(r, UnresolvedReason::VendorUnlisted);
+                };
+                let Some((module, _)) = coordinate(selected) else {
+                    return unresolved(r, UnresolvedReason::VendorMetadata);
+                };
+                let vendored = members.iter().any(|m| {
+                    m.path
+                        .strip_prefix(vendor_directory.as_str())
+                        .and_then(|rest| rest.strip_prefix(module))
+                        .is_some_and(|rest| rest.starts_with('/'))
+                });
+                if !vendored {
+                    return unresolved(r, UnresolvedReason::VendorMissing);
+                }
+                value.kind = RefKind::Local;
+                value.locator = RefLocator::Path(format!("vendor/{module}"));
+                value.source.clone_from(&selected.source);
+                value.resolution = Some(Resolution::Vendored);
+                value.evidence = format!("{}; {}", r.evidence, selected.evidence);
                 value
             })
             .collect();
@@ -273,179 +287,4 @@ pub fn go_dependency_context(members: &[ReferenceMember<'_>]) -> BTreeMap<String
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    fn run(files: &[(&str, &str)]) -> BTreeMap<String, Vec<Reference>> {
-        let owned: Vec<_> = files
-            .iter()
-            .map(|(path, content)| {
-                let member_path = path.rsplit("!!").next().unwrap();
-                let parsed = crate::OpenOptions::new()
-                    .path(std::path::Path::new(member_path))
-                    .open(content.as_bytes());
-                ((*path).to_string(), parsed.references().to_vec())
-            })
-            .collect();
-        go_dependency_context(
-            &owned
-                .iter()
-                .map(|(path, refs)| ReferenceMember {
-                    path,
-                    references: refs,
-                })
-                .collect::<Vec<_>>(),
-        )
-    }
-
-    #[test]
-    fn named_matches_only_the_final_component() {
-        for (path, expected) in [
-            ("go.mod", true),
-            ("pkg/go.mod", true),
-            ("x/a.zip!!go.mod", true),
-            ("pkg/notgo.mod", false),
-            ("go.mod.bak", false),
-            ("x/a.zip!go.mod", false),
-        ] {
-            assert_eq!(named(path, "go.mod"), expected, "{path}");
-        }
-    }
-
-    #[test]
-    fn replacement_uses_exact_checksum_not_history_or_nested_directives() {
-        let facts = run(&[
-            (
-                "p.zip!!app/go.mod",
-                "module app\nrequire example.test/lib v1.0.0\nreplace example.test/lib => example.test/fork v2.0.0\n",
-            ),
-            (
-                "p.zip!!app/go.sum",
-                "example.test/fork v2.0.0 h1:EXACT\nexample.test/fork v2.0.0/go.mod h1:METADATA\nexample.test/lib v9.0.0 h1:HISTORY\n",
-            ),
-            (
-                "p.zip!!app/nested/go.mod",
-                "module nested\nreplace example.test/lib => example.test/unrelated v3.0.0\n",
-            ),
-        ]);
-        let dependency = facts["p.zip!!app/go.mod"]
-            .iter()
-            .find(|r| r.kind == RefKind::Dependency)
-            .unwrap();
-        assert_eq!(
-            dependency.locator,
-            RefLocator::Purl("pkg:golang/example.test/fork@v2.0.0".into())
-        );
-        assert_eq!(dependency.pinned_hash.as_ref().unwrap().value, "EXACT");
-        assert_eq!(
-            facts["p.zip!!app/go.mod"]
-                .iter()
-                .filter(|r| r.kind == RefKind::Dependency)
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn workspace_override_requires_explicit_ownership() {
-        let facts = run(&[
-            (
-                "p.zip!!go.work",
-                "go 1.25\nuse ./app\nreplace example.test/lib => example.test/work v3.0.0\n",
-            ),
-            (
-                "p.zip!!app/go.mod",
-                "module app\nrequire example.test/lib v1.0.0\nreplace example.test/lib => example.test/local v2.0.0\n",
-            ),
-            (
-                "p.zip!!other/go.mod",
-                "module other\nrequire example.test/lib v1.0.0\n",
-            ),
-            (
-                "unrelated.zip!!go.work",
-                "use ./app\nreplace example.test/lib => example.test/unrelated v4.0.0\n",
-            ),
-        ]);
-        assert_eq!(
-            facts["p.zip!!app/go.mod"][0].locator,
-            RefLocator::Purl("pkg:golang/example.test/work@v3.0.0".into())
-        );
-        assert_eq!(
-            facts["p.zip!!other/go.mod"][0].locator,
-            RefLocator::Purl("pkg:golang/example.test/lib@v1.0.0".into())
-        );
-    }
-
-    #[test]
-    fn quoted_local_replacement_stays_inside_supplied_artifact() {
-        let facts = run(&[
-            (
-                "p.zip!!app/go.mod",
-                "module app\nrequire example.test/lib v1.0.0\nreplace example.test/lib => \"../replacement folder\"\n",
-            ),
-            (
-                "p.zip!!replacement folder/go.mod",
-                "module example.test/lib\n",
-            ),
-        ]);
-        assert_eq!(facts["p.zip!!app/go.mod"][0].kind, RefKind::Local);
-        for path in ["../../escape", "/etc", "other.zip!!root"] {
-            let source = format!(
-                "module app\nrequire example.test/lib v1.0.0\nreplace example.test/lib => {path}\n"
-            );
-            let facts = run(&[("p.zip!!app/go.mod", &source)]);
-            assert!(
-                facts["p.zip!!app/go.mod"][0]
-                    .source
-                    .contains("unresolved-local")
-            );
-        }
-    }
-
-    #[test]
-    fn conflicts_exclusions_and_missing_local_modules_are_explicit() {
-        for extra in [
-            "exclude example.test/lib v1.0.0\n",
-            "replace example.test/lib => ../missing\n",
-            "replace example.test/lib => example.test/a v2.0.0\nreplace example.test/lib => example.test/b v3.0.0\n",
-        ] {
-            let source = format!("module app\nrequire example.test/lib v1.0.0\n{extra}");
-            let facts = run(&[("p.zip!!app/go.mod", &source)]);
-            assert_eq!(
-                facts["p.zip!!app/go.mod"][0].kind,
-                RefKind::Undefined,
-                "{extra}"
-            );
-        }
-        let facts = run(&[
-            (
-                "p.zip!!go.mod",
-                "module app\nrequire example.test/lib v1.0.0\n",
-            ),
-            (
-                "p.zip!!go.sum",
-                "example.test/lib v1.0.0 h1:ONE\nexample.test/lib v1.0.0 h1:TWO\n",
-            ),
-        ]);
-        assert_eq!(
-            facts["p.zip!!go.mod"][0].source,
-            "go.mod.unresolved-checksum-conflict"
-        );
-    }
-
-    #[test]
-    fn vendored_sources_are_not_refetched_from_the_registry() {
-        let facts = run(&[
-            (
-                "p.zip!!go.mod",
-                "module app\nrequire example.test/lib v1.0.0\n",
-            ),
-            (
-                "p.zip!!vendor/modules.txt",
-                "# example.test/lib v1.0.0\n## explicit\nexample.test/lib\n",
-            ),
-            ("p.zip!!vendor/example.test/lib/lib.go", "package lib\n"),
-        ]);
-        assert_eq!(facts["p.zip!!go.mod"][0].kind, RefKind::Local);
-        assert_eq!(facts["p.zip!!go.mod"][0].source, "go.vendor.bundled");
-    }
-}
+mod tests;

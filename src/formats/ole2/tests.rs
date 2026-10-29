@@ -8,8 +8,8 @@ fn run(bytes: &[u8]) -> (Values, Metrics) {
     (v, m)
 }
 
-/// A file with the OLE2 signature that `cfb` cannot open used to come
-/// back as an empty, error-free document.
+/// A file with the OLE2 signature that `cfb` cannot open is an error, not
+/// an empty, error-free document.
 #[test]
 fn unopenable_compound_file_is_reported() {
     let mut bytes = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1".to_vec();
@@ -602,10 +602,7 @@ fn surfaces_compobj_prog_id_for_extension_mismatch() {
     let cfb = build_cfb(&[("/WordDocument", b"x"), ("/\x01CompObj", &body)]);
     let (v, _) = run(&cfb);
     let co = v.get("office.compobj").and_then(|x| x.as_object()).unwrap();
-    assert_eq!(
-        co.get("app_version").and_then(|x| x.as_str()),
-        Some("Excel.Sheet.8")
-    );
+    assert!(co.get("app_version").is_none(), "{co:?}");
     assert_eq!(
         co.get("prog_id").and_then(|x| x.as_str()),
         Some("Excel.Sheet.8")
@@ -627,7 +624,7 @@ fn compobj_parser_handles_missing_prog_id() {
         co.get("user_type").and_then(|x| x.as_str()),
         Some("Microsoft Word Document")
     );
-    assert!(co.get("app_version").is_none());
+    assert!(co.get("prog_id").is_none());
 }
 
 #[test]
@@ -970,4 +967,30 @@ fn boundsheets_stops_at_a_truncated_record() {
     let mut d = vec![0x09, 0x08, 0x04, 0x00, 0, 0, 0, 0];
     d.extend_from_slice(&[0x85, 0x00, 0xFF, 0x00]); // claims 255 bytes, has none
     assert!(boundsheets(&d).is_empty());
+}
+
+/// A stream longer than its cap is read only to the cap, and the cut is a
+/// recorded limit rather than a silent loss.
+#[test]
+fn stream_reads_stop_at_the_cap() {
+    let body = vec![0x41; 8192];
+    let bytes = build_cfb(&[("/Workbook", &body)]);
+    let mut comp = cfb::CompoundFile::open(Cursor::new(&bytes[..])).unwrap();
+    let mut v = Values::new();
+    let mut limits = Limits::default();
+    let mut errors = Errors::new();
+    let data = read_stream_data(&mut comp, "Workbook", 1024, &mut limits, &mut errors).unwrap();
+    assert_eq!(data.len(), 1024);
+    assert!(errors.is_empty(), "{errors:?}");
+    limits.emit(&mut v, crate::value_key!("office.limits"));
+    let limits = v.get("office.limits").and_then(|x| x.as_array()).unwrap();
+    assert_eq!(limits[0]["stage"].as_str(), Some("stream-cap"));
+
+    // At or under the cap the whole stream comes back with nothing recorded.
+    let mut v = Values::new();
+    let mut limits = Limits::default();
+    let data = read_stream_data(&mut comp, "Workbook", 8192, &mut limits, &mut errors).unwrap();
+    assert_eq!(data, body);
+    limits.emit(&mut v, crate::value_key!("office.limits"));
+    assert!(v.get("office.limits").is_none());
 }

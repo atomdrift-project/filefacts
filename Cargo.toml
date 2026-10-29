@@ -11,13 +11,22 @@ keywords = ["forensics", "binary-analysis", "metadata", "pe", "elf"]
 categories = ["parsing", "command-line-utilities"]
 readme = "README.md"
 
+# The fuzz crate shares this lock file and the [patch.crates-io] forks below;
+# plain `cargo build`/`test`/`clippy` touch only the library and CLI. The
+# vendored grammar is third-party code, built as a dependency but not held to
+# this workspace's fmt and lint gates.
+[workspace]
+members = [".", "fuzz"]
+default-members = ["."]
+exclude = ["vendor"]
+
 [lib]
 name = "filefacts"
 path = "src/lib.rs"
 
 [[bin]]
 name = "filefacts"
-path = "src/bin/filefacts.rs"
+path = "src/bin/filefacts/main.rs"
 required-features = ["cli"]
 
 [[test]]
@@ -60,27 +69,24 @@ goblin = { version = "0.10", default-features = false, features = ["std", "pe32"
 # binaries.
 gimli = { version = "0.32", default-features = false, features = ["read", "std"] }
 
-# Language-aware string extractor — Go/Rust fat-pointer aware, dedupes
+# Language-aware string extractor: Go/Rust fat-pointer aware, dedupes
 # packed runs, decodes XOR-obfuscated and base64-wrapped payloads.
-# Cleave used to call this directly; centralising in filefacts lets every
-# consumer get the same high-quality string set.
 # stng types (`ExtractedString`, `StringMethod`, ...) are part of filefacts'
-# public API, so consumers (cleave) must name this exact source: a bare git
-# URL with no rev/branch/tag. Cargo treats `git = URL` and `git = URL, rev = R`
-# as different sources, which yields two copies of stng whose types don't unify.
-# No default features: those build the `stng` command, not the library.
+# public API, so a consumer that also depends on stng must name this exact
+# source: a bare git URL with no rev, branch or tag. Cargo treats `git = URL`
+# and `git = URL, rev = R` as different sources, which yields two copies of
+# stng whose types don't unify. The commit actually built is recorded in
+# Cargo.lock. No default features: those build the `stng` command, not the
+# library.
 stng = { git = "https://github.com/atomdrift-project/stng.git", default-features = false }
 
-
-# Archive index readers. We use these for header/central-directory enumeration
-# only — never for decompression or extraction.
-zip = "2"
+# Archive index readers. Members are only ever read through a size cap, and
+# only for manifests and signature blocks: stored and deflated are the only
+# methods ZIP-family packages use for those, so no other codec is compiled in.
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 # MS-CAB header reader: CFHEADER/CFFOLDER/CFFILE only, no block decompression.
 cab = "0.6"
 tar = "0.4"
-# 7z header reader. Like zip and tar, filefacts uses it only to enumerate
-# archive metadata; member payloads are never decompressed here.
-sevenz-rust = { version = "=0.6.1", features = ["aes256"] }
 # XML parser for VSIX / WiX-style manifests. Pure Rust, no external
 # binary calls.
 roxmltree = "0.21"
@@ -88,27 +94,30 @@ roxmltree = "0.21"
 # transitive tree via `zip`; surfacing it as a direct dep avoids
 # reaching through `zip`'s public re-exports.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-xz2 = "0.1"
+# Pure-Rust LZMA and xz decoders: 7z encoded headers and `.tar.xz` package
+# members (dpkg's default control compression). Its `xz` feature verifies
+# SHA-256 stream checksums with `sha2` 0.11, so the tree carries `sha2` 0.11
+# beside the 0.10 below until `rsa`, `p256`/`p384` and `cms` ship releases on
+# `digest` 0.11; the alternatives (`lzma-rs`, `xz2`) lack either a `Read`
+# decoder with a memory limit or a pure-Rust build.
+lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "xz"] }
 
 # Image decoders — used only to compute pixel-statistic metrics
 # (per-channel entropy, edge density, histogram flatness) that power
 # steganography detection. Decode is best-effort: structural marker /
-# chunk metadata is always emitted, pixel stats are skipped silently
+# chunk metadata is always emitted, pixel stats are skipped (and logged)
 # on decode failure or oversize inputs.
-jpeg-decoder = "0.3"
-png = "0.17"
+jpeg-decoder = { version = "0.3", default-features = false }
+png = "0.18"
 
 # Structured-format parsers.
 serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }
-toml = "0.8"
+toml = "1"
 plist = "1"
 
 # Microsoft Compound File Binary Format (OLE2 / CFBF) — the storage
 # layout for legacy Office documents (.doc / .xls / .ppt) and MSI / MSG.
-cfb = "0.10"
-# UUID handling — `cfb`'s storage-CLSID API takes a `uuid::Uuid` and we
-# need to construct them in test fixtures.
-uuid = "1"
+cfb = "0.14"
 
 # Regex engine for the VBA symbol extractor. No PCRE features used —
 # the standard `regex` crate is enough.
@@ -116,14 +125,9 @@ regex = "1"
 
 # Source-code extraction. Each language is its own crate; the base
 # `tree-sitter` engine is shared. Adding a language is one dependency
-# line plus one entry in `src/formats/source/langs.rs`.
-# Forked to carry an illumos fix: lib/src/portable/endian.h has no branch for
-# compilers that don't predefine __illumos__ (stock toolchains generally
-# don't), so an illumos build hits "#error platform not supported". The fork
-# adds a __sun branch over <sys/byteorder.h>. Upstream PR pending; drop this
-# back to a crates.io version once it lands. The vendored tree-sitter-clojure
-# grammar points at the same source — `links = "tree-sitter"` permits exactly
-# one copy in the graph, so the two must not diverge.
+# line plus one entry in `src/formats/source/langs.rs`. `tree-sitter`,
+# `tree-sitter-language` and `tree-sitter-bash` are replaced by forks in
+# [patch.crates-io] below.
 tree-sitter = "0.28"
 tree-sitter-javascript = "0.25"
 tree-sitter-typescript = "0.23"
@@ -149,12 +153,13 @@ tree-sitter-zig = "1.1"
 tree-sitter-elixir = "0.3"
 tree-sitter-make = "1.1.1"
 tree-sitter-batch = "0.11.1"
-# Vendored: the published 0.1.0 pins tree-sitter ^0.25.6, conflicting with this
-# crate's 0.28 (links = "tree-sitter" permits only one). The vendored copy bumps
-# that to 0.28 (the grammar binds via tree-sitter-language's decoupled
-# LanguageFn ABI, so the parser.c is forward-compatible). A path dependency
-# (not crates.io + [patch]) so it resolves transitively when filefacts is itself
-# consumed as a git dependency — [patch] only applies in the root crate.
+# Vendored (see vendor/tree-sitter-clojure/VENDORED.md): the published 0.1.0
+# requires tree-sitter ^0.25.6, conflicting with this crate's 0.28
+# (`links = "tree-sitter"` permits only one copy). The vendored copy requires
+# 0.28 instead; the grammar binds through tree-sitter-language's LanguageFn
+# ABI, so its parser.c is forward-compatible. A path dependency rather than
+# crates.io + [patch] so it also resolves when filefacts is itself a git
+# dependency: [patch] applies only in the root of a build.
 tree-sitter-clojure = { path = "vendor/tree-sitter-clojure" }
 
 # Authenticode signature parsing. `cms` parses the PKCS#7 SignedData
@@ -167,7 +172,8 @@ sha2 = { version = "0.10", features = ["oid"] }
 sha1 = { version = "0.10", features = ["oid"] }
 md-5 = "0.10"
 
-# Structured logging — used by rizin subprocess statistics emission.
+# Structured logging for extractor, cache and rizin subprocess events. The
+# library only emits; the host installs a subscriber.
 tracing = "0.1"
 # The CLI's stderr subscriber for `FILEFACTS_DEBUG` (binary only, `cli`).
 tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = ["fmt", "std", "ansi"] }
@@ -175,7 +181,7 @@ tracing-subscriber = { version = "0.3", optional = true, default-features = fals
 # Disk cache — zstd-compressed JSON blobs keyed by sha256. JSON (not a
 # positional format) round-trips the `skip_serializing_if` fields the
 # cached payload carries; zstd keeps the on-disk size competitive.
-zstd = "0.13"
+zstd = "0.14.3"
 
 # OS cache directory lookup — `~/.cache/atomdrift/filefacts` (Linux) /
 # `Library/Caches/atomdrift/filefacts` (macOS) / `%LOCALAPPDATA%\atomdrift\filefacts`
@@ -185,6 +191,12 @@ dirs = "6"
 # Temp file handling for rizin input materialisation and atomic disk-cache
 # writes. `tempfile` cleans up properly on Drop and avoids races.
 tempfile = "3"
+
+[dev-dependencies]
+# `cfb`'s storage-CLSID API takes a `uuid::Uuid`; test fixtures build them.
+uuid = "1"
+# Test fixtures for the LZMA/xz readers are compressed on the fly.
+lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "xz", "encoder"] }
 
 # Process group / RLIMIT / PR_SET_PDEATHSIG hooks for the hardened
 # rizin subprocess. Unix only — the gates in `rizin.rs` are
@@ -319,21 +331,27 @@ inherits = "release"
 strip = "none"
 debug = 2
 
-# Forked tree-sitter, for the illumos fix described above. Both crates have to
-# come from the fork together: the fork's tree-sitter depends on its in-tree
-# tree-sitter-language, and `links = "tree-sitter-language"` permits only one
-# copy in the graph — leaving the grammars on the crates.io copy is a hard
-# resolver conflict, not a preference.
-#
-# Unlike the tree-sitter-clojure path dep above, [patch] does NOT resolve
-# transitively: it applies only in the root crate. Consumers that build scan
-# or cleave as the root need this same block in their own manifest. Delete it
-# everywhere once the upstream PR lands and a release carries the fix.
+# Forks carrying fixes not yet in a crates.io release. [patch] applies only in
+# the root of a build, so a consumer that depends on filefacts must copy this
+# block into its own manifest; without it, the build uses the unfixed crates.io
+# releases. Delete each entry once a release carries its fix.
 [patch.crates-io]
-# Unicode-safe brace-range scanner; shared across consumers by update-deps.
-tree-sitter-bash = { git = "https://github.com/tstromberg/tree-sitter-bash" }
+# tree-sitter: lib/src/portable/endian.h has no branch for compilers that do
+# not predefine __illumos__ (stock toolchains generally don't), so an illumos
+# build stops at "#error platform not supported". The fork adds a __sun branch
+# over <sys/byteorder.h>. tree-sitter and tree-sitter-language must come from
+# the fork together: the fork's tree-sitter depends on its in-tree
+# tree-sitter-language, and `links = "tree-sitter-language"` permits only one
+# copy in the graph, so leaving the grammars on the crates.io copy is a
+# resolver conflict.
 tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
 tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
+# tree-sitter-bash: the external scanner passes the lexer's lookahead, a
+# Unicode code point, to ctype's isdigit() while scanning `{1..9}` brace
+# ranges. isdigit() is undefined for values outside unsigned char, so a
+# non-ASCII character there can read out of bounds or abort. The fork tests
+# for ASCII digits directly.
+tree-sitter-bash = { git = "https://github.com/tstromberg/tree-sitter-bash" }
 
 [profile.dev]
 debug = "line-tables-only"

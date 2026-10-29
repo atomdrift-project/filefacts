@@ -39,9 +39,9 @@ const MAX_MODELED_AST_FILE_BYTES: usize = 4 * 1024 * 1024;
 /// progress callback once per 100 parser operations
 /// (`OP_COUNT_PER_PARSER_CALLBACK_CHECK` in `parser.c`), so counting polls
 /// measures work, not time: the same bytes stop at the same point however
-/// loaded the machine is. The wall-clock budget this replaced fired on
-/// ordinary files under load, and the content-keyed disk cache then kept the
-/// shallower facts.
+/// loaded the machine is. A wall-clock budget would cut ordinary files short
+/// under load, and the content-keyed disk cache would then keep the shallower
+/// facts.
 ///
 /// The budget is [`PARSE_WORK_BASE`] polls plus one per
 /// [`PARSE_BYTES_PER_POLL`] bytes of input. Since the tree-sitter fork counts
@@ -58,7 +58,7 @@ const MAX_MODELED_AST_FILE_BYTES: usize = 4 * 1024 * 1024;
 /// per byte, counting stack work raised poll counts by at most 1.35× at the
 /// 99th percentile, and no file used more than an eighth of its budget (a
 /// 4 MiB minified bundle, about 0.02 polls per byte, uses 84k of 1.07M).
-/// Input that keeps the parser ambiguous, like that C header, now stops after
+/// Input that keeps the parser ambiguous, like that C header, stops after
 /// about 82k polls, in about 5 s.
 const PARSE_WORK_BASE: u64 = 20_000;
 const PARSE_BYTES_PER_POLL: u64 = 4;
@@ -439,8 +439,8 @@ impl TreeSitterDiagnostic {
 
     /// `source.ast_unavailable.parse_timeout` means the parse exhausted its
     /// work budget or, for input that makes single operations expensive, hit
-    /// the wall-clock backstop. The metric keeps its historical name because
-    /// rules key on it; the message names the limit. This message is
+    /// the wall-clock backstop. The metric is named for the backstop; the
+    /// message names the limit that fired. This message is
     /// deterministic, so it carries the offset where the budget ran out.
     fn parse_work_exhausted(language: &'static str, bytes: usize, budget: u64, at: usize) -> Self {
         Self {

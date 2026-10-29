@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly: the slow tests, and fresh advisories against an unchanged tree.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# bash everywhere, Windows included, so every step stops at its first failure.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: lint and test (${{ matrix.os }})
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: make lint and make test
+        if: runner.os != 'Windows'
+        run: make lint && make test
+      # Windows runners do not reliably ship make; run the same commands directly.
+      - name: lint and test (cargo)
+        if: runner.os == 'Windows'
+        run: |
+          cargo fmt --all --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test
+
+  msrv:
+    name: MSRV
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the rust-version from Cargo.toml
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          test -n "$msrv"
+          rustup toolchain install "$msrv" --profile minimal
+          rustup default "$msrv"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --all-features --locked
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Accepted advisories, each with its justification: .cargo/audit.toml.
+      - run: cargo audit
+
+  fuzz:
+    name: fuzz targets build
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install nightly --profile minimal && rustup default nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fuzz build
+
+  slow:
+    name: slow and release-only tests
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      # Release mode enables the release-only budgets in tests/hostile_inputs.rs.
+      - run: cargo test --release
+      # The ignored tests, minus the Linux subprocess probes that only make
+      # sense when spawned by their parent test.
+      - run: >-
+          cargo test --release -- --ignored
+          --skip linux_child_limits_probe
+          --skip linux_waiting_child_probe
+          --skip linux_parent_death_driver

@@ -1,5 +1,6 @@
 use super::*;
 use crate::FileType;
+use crate::fileid::phar::{FLAG_SIGNATURE, MAX_DETECT_STUB, SIGNATURE_MAGIC, is_phar};
 
 /// One packaged file for [`build`].
 struct Member<'a> {
@@ -179,10 +180,7 @@ fn compressed_members_carry_their_method() {
     let data = build(STUB, &[deflated], b"", None);
     let (_, metrics, members) = run(&data);
     let m = &members[1];
-    assert_eq!(
-        m.compression.as_ref().and_then(|c| c.method.as_deref()),
-        Some("deflate")
-    );
+    assert_eq!(m.compression.method.as_deref(), Some("deflate"));
     assert_eq!(
         metrics.get("archive.compression.method_counts.deflate"),
         Some(1.0)
@@ -204,26 +202,6 @@ fn members_past_the_end_are_not_sliceable() {
     assert_eq!(limits[0]["stage"], "truncated");
 }
 
-/// The stub ends where PHP's reader says: a ` ?>` after the token is part of
-/// it, as is one newline after that, and nothing else is.
-#[test]
-fn the_stub_ends_where_php_says() {
-    for (tail, extra) in [
-        (&b""[..], 0),
-        (b" ?>", 3),
-        (b" ?>\n", 4),
-        (b" ?>\r\n", 5),
-        (b"\n?>\n", 4),
-        (b"\n", 0),
-    ] {
-        let mut data = b"<?php __HALT_COMPILER();".to_vec();
-        let token_end = data.len();
-        data.extend_from_slice(tail);
-        data.extend_from_slice(b"rest");
-        assert_eq!(stub_end(&data, token_end), token_end + extra, "{tail:?}");
-    }
-}
-
 /// A PHP file that merely contains the token is not a phar.
 #[test]
 fn the_token_alone_is_not_a_phar() {
@@ -232,6 +210,25 @@ fn the_token_alone_is_not_a_phar() {
     ));
     assert!(!is_phar(b"<?php echo 'no token here';"));
     assert!(!is_phar(b"plain text that ends in GBMB"));
+}
+
+/// Detection searches only the head of a file for the stub's end, so a large
+/// PHP file costs no full pass; the same phar with its stub in the window is
+/// one.
+#[test]
+fn detection_searches_a_bounded_stub_window() {
+    let mut padded = b"<?php ".to_vec();
+    padded.resize(MAX_DETECT_STUB + 1, b' ');
+    padded.extend_from_slice(b"__HALT_COMPILER(); ?>\r\n");
+    let far = build(&padded, &[member("a.php", b"<?php")], b"", None);
+    assert!(!is_phar(&far));
+    assert!(parse(&far, MAX_ARCHIVE_MEMBERS).is_ok());
+    assert!(is_phar(&build(
+        STUB,
+        &[member("a.php", b"<?php")],
+        b"",
+        None
+    )));
 }
 
 /// Detection: a native phar is a phar whatever its stub, and a `.phar` name on

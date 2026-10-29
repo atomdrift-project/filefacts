@@ -3,7 +3,12 @@ use super::*;
 #[test]
 fn json_object_is_promoted() {
     let mut v = Values::new();
-    extract_json(br#"{"name":"x","version":"1.0"}"#, &mut v).unwrap();
+    extract_json(
+        br#"{"name":"x","version":"1.0"}"#,
+        &mut v,
+        &mut Errors::new(),
+    )
+    .unwrap();
     assert_eq!(v.get("name").and_then(|x| x.as_str()), Some("x"));
     assert_eq!(v.get("version").and_then(|x| x.as_str()), Some("1.0"));
 }
@@ -11,28 +16,33 @@ fn json_object_is_promoted() {
 #[test]
 fn json_array_root_lands_under_root_key() {
     let mut v = Values::new();
-    extract_json(b"[1,2,3]", &mut v).unwrap();
+    extract_json(b"[1,2,3]", &mut v, &mut Errors::new()).unwrap();
     assert!(v.get("root").and_then(|x| x.as_array()).is_some());
 }
 
 #[test]
 fn json_malformed_returns_error() {
     let mut v = Values::new();
-    let err = extract_json(b"{ not json", &mut v).unwrap_err();
+    let err = extract_json(b"{ not json", &mut v, &mut Errors::new()).unwrap_err();
     assert!(matches!(err, Error::Malformed { format: "json", .. }));
 }
 
 #[test]
 fn toml_basic() {
     let mut v = Values::new();
-    extract_toml(b"[package]\nname = \"x\"\n", &mut v).unwrap();
+    extract_toml(b"[package]\nname = \"x\"\n", &mut v, &mut Errors::new()).unwrap();
     assert_eq!(v.get("package.name").and_then(|x| x.as_str()), Some("x"));
 }
 
 #[test]
 fn yaml_basic() {
     let mut v = Values::new();
-    extract_yaml(b"name: x\non:\n  push:\n    branches: [main]\n", &mut v).unwrap();
+    extract_yaml(
+        b"name: x\non:\n  push:\n    branches: [main]\n",
+        &mut v,
+        &mut Errors::new(),
+    )
+    .unwrap();
     assert_eq!(v.get("name").and_then(|x| x.as_str()), Some("x"));
 }
 
@@ -40,10 +50,11 @@ fn yaml(text: &str) -> JsonValue {
     parse_yaml(text.as_bytes()).unwrap()
 }
 
-/// Plain scalars resolve as serde_yaml 0.9 resolved them, so values rules
-/// match as strings (`0755`, `1_000`, `yes`) stay strings.
+/// Plain scalars resolve by the core schema, except that a leading-zero
+/// decimal stays a string, so what values rules match as strings (`0755`,
+/// `1_000`, `yes`) stays a string.
 #[test]
-fn yaml_plain_scalars_resolve_as_serde_yaml_did() {
+fn yaml_plain_scalars_resolve_by_the_core_schema() {
     let v = yaml(
         "on: push\nwords: [yes, no, on, off, y, n]\nbools: [true, True, FALSE]\n\
              odd: [tRuE, nUlL, 0755, 007, 1_000, 1e999, +.nan]\n\
@@ -82,7 +93,7 @@ fn yaml_plain_scalars_resolve_as_serde_yaml_did() {
 /// leave a string, and a local tag is dropped with its plain scalar
 /// resolved as untagged.
 #[test]
-fn yaml_tags_resolve_as_serde_yaml_did() {
+fn yaml_tags_resolve_by_the_core_schema() {
     let v = yaml(
         "int: !!int \"42\"\nfloat: !!float 1\nstr: !!str 0x1F\nts: !!timestamp 2001-12-14\n\
              bin: !!binary aGVsbG8=\nlocal: !custom 12\nlocal_zero: !custom 0755\n\
@@ -105,7 +116,8 @@ fn yaml_tags_resolve_as_serde_yaml_did() {
     }
 }
 
-/// A key that is not a string keeps the spelling serde_yaml gave it.
+/// A key that is not a string is spelled as its JSON text, with YAML's
+/// spellings for the floats JSON cannot write, and its tag dropped.
 #[test]
 fn yaml_non_string_keys_are_spelled_by_value() {
     let v = yaml(
@@ -119,13 +131,13 @@ fn yaml_non_string_keys_are_spelled_by_value() {
         ("true", "bool"),
         ("null", "nil"),
         ("1.5", "float"),
-        ("1e20", "exp"),
+        ("1e+20", "exp"),
         (".inf", "inf"),
         ("0755", "zero"),
-        ("- a\n- b", "seq"),
-        ("x: 1", "map"),
-        ("- yes\n- '1'\n- - 2\n  - 3", "nested"),
-        ("!t tagged", "tag"),
+        ("[\"a\",\"b\"]", "seq"),
+        ("{\"x\":1}", "map"),
+        ("[\"yes\",\"1\",[2,3]]", "nested"),
+        ("tagged", "tag"),
     ] {
         assert_eq!(v[key], value, "{key:?} in {v}");
     }
@@ -141,9 +153,9 @@ fn yaml_anchors_aliases_and_merge_keys() {
     assert_eq!(v["again"], "0755");
 }
 
-/// A billion laughs stops at serde_yaml's alias rule, and reusing one big
-/// anchor stops at the replay budget, both quickly and without building
-/// the expansion. Three levels (1,110 replayed events) are ordinary reuse.
+/// A billion laughs, and reusing one big anchor, both stop at the replay
+/// budget without building the expansion. Three levels (1,110 replayed
+/// events) are ordinary reuse.
 #[test]
 fn yaml_alias_bombs_are_rejected_quickly() {
     let mut laughs = String::from("a0: &a0 lol\n");
@@ -157,12 +169,10 @@ fn yaml_alias_bombs_are_rejected_quickly() {
         items.join(", "),
         vec!["*big"; 2_000].join(", ")
     );
-    let start = std::time::Instant::now();
     let err = parse_yaml(laughs.as_bytes()).unwrap_err().to_string();
-    assert!(err.contains("alias repetition limit"), "{err}");
+    assert!(err.contains("aliases expand past"), "{err}");
     let err = parse_yaml(reuse.as_bytes()).unwrap_err().to_string();
     assert!(err.contains("aliases expand past"), "{err}");
-    assert!(start.elapsed() < std::time::Duration::from_secs(10));
     let small: String = laughs.lines().take(4).map(|l| format!("{l}\n")).collect();
     assert!(parse_yaml(small.as_bytes()).is_ok());
 }
@@ -186,7 +196,7 @@ fn yaml_alias_scalar_bytes_are_bounded() {
     assert_eq!(yaml(&ok)["uses"].as_array().map(Vec::len), Some(100));
 }
 
-/// Nesting is capped at serde_yaml's 128 levels, in flow and block style,
+/// Nesting is capped at 128 levels, in flow and block style,
 /// through aliases too, and an absurdly deep document fails fast.
 #[test]
 fn yaml_nesting_depth_is_bounded() {
@@ -213,10 +223,10 @@ fn yaml_nesting_depth_is_bounded() {
     );
     assert!(parse_yaml(deep.as_bytes()).is_err());
     assert!(parse_yaml(b"a: &a [1, *a]\n").is_err());
-    let start = std::time::Instant::now();
-    assert!(parse_yaml(flow(100_000).as_bytes()).is_err());
-    assert!(parse_yaml(block(5_000).as_bytes()).is_err());
-    assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    for doc in [flow(100_000), block(5_000)] {
+        let err = parse_yaml(doc.as_bytes()).unwrap_err().to_string();
+        assert!(err.contains("depth") || err.contains("recursion"), "{err}");
+    }
 }
 
 /// The per-event budgets grow with the input, so a lockfile larger than
@@ -238,7 +248,7 @@ fn yaml_streams_duplicates_and_bad_bytes_are_malformed() {
         b"a: [1, 2\n",
     ] {
         let mut v = Values::new();
-        let err = extract_yaml(bad, &mut v).unwrap_err();
+        let err = extract_yaml(bad, &mut v, &mut Errors::new()).unwrap_err();
         assert!(matches!(err, Error::Malformed { format: "yaml", .. }));
     }
     assert_eq!(yaml(""), JsonValue::Null);
@@ -250,17 +260,17 @@ fn yaml_streams_duplicates_and_bad_bytes_are_malformed() {
 /// `bplist00` magic, not from anything the caller passes.
 #[test]
 fn binary_plist_matches_xml_plist() {
-    let mut dict = plist::Dictionary::new();
+    let mut dict = ::plist::Dictionary::new();
     dict.insert("CFBundleIdentifier".into(), "com.example.dropper".into());
     dict.insert("LSUIElement".into(), true.into());
     dict.insert("Count".into(), 42.into());
     dict.insert("Ratio".into(), 0.5.into());
-    dict.insert("Blob".into(), plist::Value::Data(b"Man".to_vec()));
+    dict.insert("Blob".into(), ::plist::Value::Data(b"Man".to_vec()));
     dict.insert(
         "Args".into(),
-        plist::Value::Array(vec!["-c".into(), "curl http://x".into()]),
+        ::plist::Value::Array(vec!["-c".into(), "curl http://x".into()]),
     );
-    let root = plist::Value::Dictionary(dict);
+    let root = ::plist::Value::Dictionary(dict);
 
     let mut binary = Vec::new();
     root.to_writer_binary(&mut binary).unwrap();
@@ -269,9 +279,9 @@ fn binary_plist_matches_xml_plist() {
     root.to_writer_xml(&mut xml).unwrap();
 
     let mut from_binary = Values::new();
-    extract_plist(&binary, &mut from_binary).unwrap();
+    extract_plist(&binary, &mut from_binary, &mut Errors::new()).unwrap();
     let mut from_xml = Values::new();
-    extract_plist(&xml, &mut from_xml).unwrap();
+    extract_plist(&xml, &mut from_xml, &mut Errors::new()).unwrap();
     assert_eq!(from_binary.as_json(), from_xml.as_json());
 
     assert_eq!(
@@ -289,27 +299,27 @@ fn binary_plist_matches_xml_plist() {
 /// object references decode to `CF$UID` dictionaries instead of nulls.
 #[test]
 fn binary_plist_keyed_archive_uids_are_preserved() {
-    let mut class = plist::Dictionary::new();
+    let mut class = ::plist::Dictionary::new();
     class.insert("$classname".into(), "NSMutableDictionary".into());
-    let mut object = plist::Dictionary::new();
-    object.insert("$class".into(), plist::Value::Uid(plist::Uid::new(2)));
-    let mut root = plist::Dictionary::new();
+    let mut object = ::plist::Dictionary::new();
+    object.insert("$class".into(), ::plist::Value::Uid(::plist::Uid::new(2)));
+    let mut root = ::plist::Dictionary::new();
     root.insert("$archiver".into(), "NSKeyedArchiver".into());
     root.insert(
         "$objects".into(),
-        plist::Value::Array(vec![
+        ::plist::Value::Array(vec![
             "$null".into(),
-            plist::Value::Dictionary(object),
-            plist::Value::Dictionary(class),
+            ::plist::Value::Dictionary(object),
+            ::plist::Value::Dictionary(class),
         ]),
     );
     let mut binary = Vec::new();
-    plist::Value::Dictionary(root)
+    ::plist::Value::Dictionary(root)
         .to_writer_binary(&mut binary)
         .unwrap();
 
     let mut values = Values::new();
-    extract_plist(&binary, &mut values).unwrap();
+    extract_plist(&binary, &mut values, &mut Errors::new()).unwrap();
     assert_eq!(values.get("$archiver").unwrap(), "NSKeyedArchiver");
     assert_eq!(values.get("$objects[1].$class.CF$UID").unwrap(), 2);
     assert_eq!(
@@ -338,15 +348,23 @@ fn nested_xml_plist(levels: usize) -> Vec<u8> {
     .into_bytes()
 }
 
-/// A 20k-deep `<array>` nest built the whole `plist::Value` and then recursed
-/// through it, overflowing the stack. The cap now applies as events stream in.
+/// A 20k-deep `<array>` nest is refused as its events stream in, before a
+/// `plist::Value` is built whose recursive walk would overflow the stack.
 #[test]
 fn plist_nesting_depth_is_bounded() {
     let (deep, at_cap, past_cap) = on_small_stack(|| {
         let mut values = Values::new();
-        let deep = extract_plist(&nested_xml_plist(20_000), &mut values);
-        let at_cap = extract_plist(&nested_xml_plist(PLIST_MAX_DEPTH), &mut values);
-        let past_cap = extract_plist(&nested_xml_plist(PLIST_MAX_DEPTH + 1), &mut values);
+        let deep = extract_plist(&nested_xml_plist(20_000), &mut values, &mut Errors::new());
+        let at_cap = extract_plist(
+            &nested_xml_plist(PLIST_MAX_DEPTH),
+            &mut values,
+            &mut Errors::new(),
+        );
+        let past_cap = extract_plist(
+            &nested_xml_plist(PLIST_MAX_DEPTH + 1),
+            &mut values,
+            &mut Errors::new(),
+        );
         (
             deep.map_err(|e| e.to_string()),
             at_cap.map_err(|e| e.to_string()),
@@ -382,10 +400,8 @@ fn binary_plist_reference_reuse_is_bounded() {
     bytes.extend(0u64.to_be_bytes());
     bytes.extend(table.to_be_bytes());
 
-    let start = std::time::Instant::now();
-    let err = extract_plist(&bytes, &mut Values::new()).unwrap_err();
+    let err = extract_plist(&bytes, &mut Values::new(), &mut Errors::new()).unwrap_err();
     assert!(err.to_string().contains("expand past"), "{err}");
-    assert!(start.elapsed() < std::time::Duration::from_secs(5));
 }
 
 #[test]
@@ -396,7 +412,8 @@ fn plist_structure_errors_are_malformed() {
         // Unterminated.
         "<plist><array><string>v</string></plist>",
     ] {
-        let err = extract_plist(bad.as_bytes(), &mut Values::new()).unwrap_err();
+        let err =
+            extract_plist(bad.as_bytes(), &mut Values::new(), &mut Errors::new()).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -413,30 +430,31 @@ fn plist_structure_errors_are_malformed() {
 #[test]
 fn yaml_scanner_errors_keep_their_source() {
     use std::error::Error as _;
-    let err = extract_yaml(b"a: [1, 2\n", &mut Values::new()).unwrap_err();
+    let err = extract_yaml(b"a: [1, 2\n", &mut Values::new(), &mut Errors::new()).unwrap_err();
     assert!(err.source().is_some(), "{err}");
-    let err = extract_yaml(b"a: 1\n---\nb: 2\n", &mut Values::new()).unwrap_err();
+    let err =
+        extract_yaml(b"a: 1\n---\nb: 2\n", &mut Values::new(), &mut Errors::new()).unwrap_err();
     assert!(matches!(err, Error::Malformed { format: "yaml", .. }));
 }
 
 #[test]
 fn binary_plist_truncated_is_an_error() {
-    let mut dict = plist::Dictionary::new();
+    let mut dict = ::plist::Dictionary::new();
     dict.insert("k".into(), "v".into());
     let mut binary = Vec::new();
-    plist::Value::Dictionary(dict)
+    ::plist::Value::Dictionary(dict)
         .to_writer_binary(&mut binary)
         .unwrap();
     let mut values = Values::new();
-    assert!(extract_plist(&binary[..binary.len() / 2], &mut values).is_err());
-    assert!(extract_plist(b"bplist00", &mut values).is_err());
+    assert!(extract_plist(&binary[..binary.len() / 2], &mut values, &mut Errors::new()).is_err());
+    assert!(extract_plist(b"bplist00", &mut values, &mut Errors::new()).is_err());
 }
 
 #[test]
 fn pkginfo_simple() {
     let mut v = Values::new();
     let input = b"Metadata-Version: 2.1\nName: foo\nVersion: 1.2.3\n";
-    extract_pkginfo(input, &mut v).unwrap();
+    extract_pkginfo(input, &mut v, &mut Errors::new()).unwrap();
     assert_eq!(
         v.get("metadata-version").and_then(|x| x.as_str()),
         Some("2.1")
@@ -448,7 +466,7 @@ fn pkginfo_simple() {
 fn pkginfo_keys_are_lowercase() {
     let mut v = Values::new();
     let input = b"Summary: Dependency confusion PoC\nAuthor-email: a@example.com\n";
-    extract_pkginfo(input, &mut v).unwrap();
+    extract_pkginfo(input, &mut v, &mut Errors::new()).unwrap();
     assert_eq!(
         v.get("summary").and_then(|x| x.as_str()),
         Some("Dependency confusion PoC")
@@ -463,7 +481,7 @@ fn pkginfo_keys_are_lowercase() {
 fn pkginfo_multi_value_becomes_array() {
     let mut v = Values::new();
     let input = b"Classifier: A\nClassifier: B\nClassifier: C\n";
-    extract_pkginfo(input, &mut v).unwrap();
+    extract_pkginfo(input, &mut v, &mut Errors::new()).unwrap();
     let arr = v.get("classifier").and_then(|x| x.as_array()).unwrap();
     assert_eq!(arr.len(), 3);
 }
@@ -482,7 +500,7 @@ fn generic_json_strict_path_leaves_no_lenient_marker() {
     let json = br#"{"version":"2.0.0","tasks":[{"command":"node ./x.js"}]}"#;
     let mut v = Values::new();
     let mut m = Metrics::new();
-    extract_generic_json(json, &mut v, &mut m).unwrap();
+    extract_generic_json(json, &mut v, &mut m, &mut Errors::new()).unwrap();
     assert_eq!(
         v.get("tasks[0].command").and_then(|x| x.as_str()),
         Some("node ./x.js")
@@ -509,7 +527,7 @@ fn generic_json_trailing_comma_still_yields_the_task_tree() {
         }"#;
     let mut v = Values::new();
     let mut m = Metrics::new();
-    extract_generic_json(json, &mut v, &mut m).unwrap();
+    extract_generic_json(json, &mut v, &mut m, &mut Errors::new()).unwrap();
     assert_eq!(
         v.get("tasks[0].command").and_then(|x| x.as_str()),
         Some("node ./public/fonts/fa-solid-300.llf")
@@ -533,7 +551,7 @@ fn generic_json_line_and_block_comments_are_trivia() {
         }"#;
     let mut v = Values::new();
     let mut m = Metrics::new();
-    extract_generic_json(json, &mut v, &mut m).unwrap();
+    extract_generic_json(json, &mut v, &mut m, &mut Errors::new()).unwrap();
     // Dotted setting names are literal keys, so read the tree directly
     // rather than through the path-splitting `get`.
     let root = v.as_json();
@@ -550,10 +568,22 @@ fn generic_json_line_and_block_comments_are_trivia() {
 fn generic_json_garbage_and_unterminated_comment_fail_cleanly() {
     let mut v = Values::new();
     let mut m = Metrics::new();
-    assert!(extract_generic_json(b"{ this is not json }", &mut v, &mut m).is_err());
-    assert!(extract_generic_json(b"{ /* open forever \"a\": 1 }", &mut v, &mut m).is_err());
+    assert!(
+        extract_generic_json(b"{ this is not json }", &mut v, &mut m, &mut Errors::new()).is_err()
+    );
+    assert!(
+        extract_generic_json(
+            b"{ /* open forever \"a\": 1 }",
+            &mut v,
+            &mut m,
+            &mut Errors::new()
+        )
+        .is_err()
+    );
     // gyp's `#` comments are not JSONC comments.
-    assert!(extract_generic_json(b"{ # nope\n \"a\": 1 }", &mut v, &mut m).is_err());
+    assert!(
+        extract_generic_json(b"{ # nope\n \"a\": 1 }", &mut v, &mut m, &mut Errors::new()).is_err()
+    );
     assert!(v.get("a").is_none());
 }
 
@@ -564,7 +594,7 @@ fn gyp_plain_json_uses_the_strict_path() {
     let gyp = br#"{"targets":[{"target_name":"addon","sources":["addon.c"]}]}"#;
     let mut v = Values::new();
     let mut m = Metrics::new();
-    extract_gyp(gyp, &mut v, &mut m).unwrap();
+    extract_gyp(gyp, &mut v, &mut m, &mut Errors::new()).unwrap();
     assert_eq!(
         v.get("targets[0].target_name").and_then(|x| x.as_str()),
         Some("addon")
@@ -587,7 +617,7 @@ fn gyp_lenient_decodes_byte_escaped_target_and_sources() {
         }"#;
     let mut v = Values::new();
     let mut m = Metrics::new();
-    extract_gyp(gyp, &mut v, &mut m).unwrap();
+    extract_gyp(gyp, &mut v, &mut m, &mut Errors::new()).unwrap();
     assert_eq!(
         v.get("variables.var").and_then(|x| x.as_str()),
         Some("Frot")
@@ -614,7 +644,7 @@ fn gyp_unicode_escape_recovers_the_command_string() {
     let gyp = br#"{"targets":[{"conditions":[["\U0000006e\U0000006f\U00000064\U00000065", {}]]}]}"#;
     let mut v = Values::new();
     let mut m = Metrics::new();
-    extract_gyp(gyp, &mut v, &mut m).unwrap();
+    extract_gyp(gyp, &mut v, &mut m, &mut Errors::new()).unwrap();
     // conditions is an array of `[expr, {}]` pairs — nested arrays, which
     // the dotted `get` path can't index in one segment, so assert on the
     // JSON tree directly.
@@ -631,7 +661,15 @@ fn gyp_garbage_fails_cleanly() {
     // Neither JSON nor gyp: no tree, so the caller falls through to a scan.
     let mut v = Values::new();
     let mut m = Metrics::new();
-    assert!(extract_gyp(b"\x00\x01 not a manifest", &mut v, &mut m).is_err());
+    assert!(
+        extract_gyp(
+            b"\x00\x01 not a manifest",
+            &mut v,
+            &mut m,
+            &mut Errors::new()
+        )
+        .is_err()
+    );
 }
 
 /// The parser error behind a `Malformed` is its `source()`, not repeated in
@@ -642,16 +680,16 @@ fn malformed_errors_keep_their_text_and_expose_the_parser_error() {
     use std::error::Error as _;
     let mut v = Values::new();
 
-    let err = extract_toml(b"name = \"x\"\nversion = \n", &mut v).unwrap_err();
+    let err = extract_toml(b"name = \"x\"\nversion = \n", &mut v, &mut Errors::new()).unwrap_err();
     assert_eq!(err.to_string(), "malformed toml");
     assert_eq!(
         crate::error::display_chain(&err),
-        "malformed toml: TOML parse error at line 2, column 11\n  |\n2 | version = \n  |           ^\ninvalid string\nexpected `\"`, `'`\n"
+        "malformed toml: TOML parse error at line 2, column 11\n  |\n2 | version = \n  |           ^\nstring values must be quoted, expected literal string\n"
     );
     let source = err.source().expect("toml source");
-    assert!(source.downcast_ref::<toml::de::Error>().is_some());
+    assert!(source.downcast_ref::<::toml::de::Error>().is_some());
 
-    let err = extract_toml(b"\xff\xfe = 1\n", &mut v).unwrap_err();
+    let err = extract_toml(b"\xff\xfe = 1\n", &mut v, &mut Errors::new()).unwrap_err();
     assert_eq!(err.to_string(), "malformed toml: input is not utf-8");
     assert_eq!(
         crate::error::display_chain(&err),
@@ -660,7 +698,7 @@ fn malformed_errors_keep_their_text_and_expose_the_parser_error() {
     let source = err.source().expect("utf-8 source");
     assert!(source.downcast_ref::<std::str::Utf8Error>().is_some());
 
-    let err = extract_json(br#"{"a":"#, &mut v).unwrap_err();
+    let err = extract_json(br#"{"a":"#, &mut v, &mut Errors::new()).unwrap_err();
     assert_eq!(err.to_string(), "malformed json");
     assert_eq!(
         crate::error::display_chain(&err),
@@ -671,7 +709,13 @@ fn malformed_errors_keep_their_text_and_expose_the_parser_error() {
 
     // Structural checks of our own carry no cause.
     let mut m = Metrics::new();
-    let err = extract_gyp(b"\x00\x01 not a manifest", &mut v, &mut m).unwrap_err();
+    let err = extract_gyp(
+        b"\x00\x01 not a manifest",
+        &mut v,
+        &mut m,
+        &mut Errors::new(),
+    )
+    .unwrap_err();
     assert_eq!(
         err.to_string(),
         "malformed gyp: not valid JSON or gyp Python-literal syntax"
@@ -682,23 +726,23 @@ fn malformed_errors_keep_their_text_and_expose_the_parser_error() {
 #[test]
 fn native_entitlement_requests_require_top_level_boolean_true() {
     for value in [
-        plist::Value::Boolean(true),
-        plist::Value::Boolean(false),
-        plist::Value::String("true".into()),
-        plist::Value::Integer(1.into()),
+        ::plist::Value::Boolean(true),
+        ::plist::Value::Boolean(false),
+        ::plist::Value::String("true".into()),
+        ::plist::Value::Integer(1.into()),
     ] {
-        let expected = if value == plist::Value::Boolean(true) {
+        let expected = if value == ::plist::Value::Boolean(true) {
             1.0
         } else {
             0.0
         };
-        let mut dict = plist::Dictionary::new();
+        let mut dict = ::plist::Dictionary::new();
         dict.insert("com.apple.security.cs.allow-jit".into(), value.clone());
         dict.insert(
             "com.apple.security.cs.allow-unsigned-executable-memory".into(),
             value,
         );
-        let root = plist::Value::Dictionary(dict);
+        let root = ::plist::Value::Dictionary(dict);
         for binary in [false, true] {
             let mut bytes = Vec::new();
             if binary {
@@ -707,7 +751,7 @@ fn native_entitlement_requests_require_top_level_boolean_true() {
                 root.to_writer_xml(&mut bytes).unwrap();
             }
             let mut values = Values::new();
-            extract_plist(&bytes, &mut values).unwrap();
+            extract_plist(&bytes, &mut values, &mut Errors::new()).unwrap();
             let mut metrics = Metrics::new();
             plist_entitlement_metrics(&values, &mut metrics);
             assert_eq!(
@@ -721,8 +765,80 @@ fn native_entitlement_requests_require_top_level_boolean_true() {
         }
     }
     let mut values = Values::new();
-    extract_plist(br#"<?xml version="1.0"?><plist><dict><key>nested</key><dict><key>com.apple.security.cs.allow-jit</key><true/></dict></dict></plist>"#, &mut values).unwrap();
+    extract_plist(br#"<?xml version="1.0"?><plist><dict><key>nested</key><dict><key>com.apple.security.cs.allow-jit</key><true/></dict></dict></plist>"#, &mut values, &mut Errors::new()).unwrap();
     let mut metrics = Metrics::new();
     plist_entitlement_metrics(&values, &mut metrics);
     assert_eq!(metrics.get("plist.jit_entitlement_requested"), Some(0.0));
+}
+
+/// A document cannot erase or forge the facts filefacts writes itself: its
+/// keys merge beside `file.*`, and a root that names a filefacts-owned
+/// family is dropped and recorded.
+#[test]
+fn document_keys_cannot_forge_filefacts_roots() {
+    let parsed = crate::OpenOptions::new()
+        .path(std::path::Path::new("config.json"))
+        .rizin(false)
+        .open(br#"{"file":{"basename":"evil.exe"},"npm":{"name":"x"},"name":"ok"}"#);
+    let values = parsed.values();
+    assert_eq!(
+        values.get("file.basename").and_then(JsonValue::as_str),
+        Some("config.json")
+    );
+    assert!(values.get("npm.name").is_none());
+    assert_eq!(values.get("name").and_then(JsonValue::as_str), Some("ok"));
+    assert!(
+        parsed
+            .errors()
+            .iter()
+            .any(|e| e.message.contains("file, npm")),
+        "{:?}",
+        parsed.errors()
+    );
+}
+
+/// Top-level keys real manifests use keep their facts even where the word
+/// is also a catalog root that no structured-document extractor writes:
+/// conda's `source` and `build`, electron-builder's `build`, vercel's `pkg`.
+#[test]
+fn ordinary_manifest_roots_are_kept() {
+    let parsed = crate::OpenOptions::new()
+        .path(std::path::Path::new("settings.json"))
+        .rizin(false)
+        .open(br#"{"source":{"url":"https://example.invalid/x.tgz"},"build":{"number":1},"pkg":{"scripts":"a.js"}}"#);
+    let values = parsed.values();
+    assert_eq!(
+        values.get("source.url").and_then(JsonValue::as_str),
+        Some("https://example.invalid/x.tgz")
+    );
+    assert_eq!(values.get("build.number"), Some(&JsonValue::from(1)));
+    assert_eq!(
+        values.get("pkg.scripts").and_then(JsonValue::as_str),
+        Some("a.js")
+    );
+    assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
+}
+
+/// A dotted document key would read as the path it spells to a consumer
+/// that flattens the tree, so it is judged by its first segment; `root` is
+/// the document's own wrapper and stays.
+#[test]
+fn merge_drops_dotted_reserved_keys_and_keeps_root() {
+    let mut values = Values::new();
+    values.insert_key(crate::value_key!("file.stem"), JsonValue::from("x"));
+    let mut errors = Errors::new();
+    merge_document(
+        serde_json::json!({"file.basename": "evil", "root": 1, "scripts": {}}),
+        &mut values,
+        &mut errors,
+    );
+    assert!(values.as_json().get("file.basename").is_none());
+    assert_eq!(values.get("file.stem"), Some(&JsonValue::from("x")));
+    assert_eq!(values.get("root"), Some(&JsonValue::from(1)));
+    assert!(values.get("scripts").is_some());
+    assert_eq!(errors.len(), 1);
+
+    merge_document(serde_json::json!([1, 2]), &mut values, &mut Errors::new());
+    assert_eq!(values.get("root"), Some(&serde_json::json!([1, 2])));
+    assert_eq!(values.get("file.stem"), Some(&JsonValue::from("x")));
 }

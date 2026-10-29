@@ -13,13 +13,16 @@
 //!    `github.com/owner/repo` references extracted from the document.
 //!    Sub-paths (`.../blob/main/foo`, `.../issues/1`) collapse to the
 //!    `owner/repo` form.
+//! - `markdown.npm_packages[]` — deduped, ordered list of npm package names
+//!    the document links to (`npmjs.com/package/<name>`) or badges
+//!    (shields.io `/npm/v/<name>`), scopes kept whole.
 //! - `markdown.install_packages[]` — deduped, ordered list of the package
 //!    names a README tells the reader to install (`npm install foo`,
 //!    `yarn add foo`, `pip install foo`, ...). This is the most load-bearing
 //!    identity claim a README makes: "type this to get me". A clone-and-rename
 //!    republication routinely forgets to update it, leaving the upstream name
-//!    in the instructions while the manifest carries the new one, so cleave
-//!    compares the two (`consistency.manifest_readme_name_mismatch`).
+//!    in the instructions while the manifest carries the new one, so a rule
+//!    can compare the two.
 //!    Unlike `markdown.npm_packages`, which reads registry *links* (badges
 //!    frequently point at an unrelated project), this reads *imperatives*.
 //! - `markdown.install_extensions[]` — the same imperative for editor
@@ -37,18 +40,17 @@
 //! Setext-style headings (underline form) are intentionally not
 //! supported — every real-world README this signal targets uses ATX.
 //!
-//! No values are emitted when the document has no heading and no
-//! GitHub references; the file simply contributes nothing to the
-//! `markdown.*` namespace.
+//! Each key is emitted only when the document yields a value for it; a
+//! document with none contributes nothing to the `markdown.*` namespace.
 use std::collections::BTreeSet;
 
 use serde_json::Value as JsonValue;
 
 use crate::formats::common::put_str;
-use crate::output::{Metrics, Values};
+use crate::output::Values;
 use crate::value_key;
 
-pub(super) fn extract(bytes: &[u8], values: &mut Values, _metrics: &mut Metrics) {
+pub(super) fn extract(bytes: &[u8], values: &mut Values) {
     // Markdown is UTF-8 by spec; fall back to lossy decode for safety.
     let text = match std::str::from_utf8(bytes) {
         Ok(s) => std::borrow::Cow::Borrowed(s),
@@ -106,7 +108,8 @@ fn first_atx_heading(text: &str) -> Option<String> {
         // example is still "inside a fence" for our purposes.
         let trimmed = line.trim_start();
         if let Some(fence_char) = in_fence {
-            if is_fence_line(trimmed, fence_char) {
+            // A closing fence is at least three of the opening character.
+            if trimmed.chars().take_while(|c| *c == fence_char).count() >= 3 {
                 in_fence = None;
             }
             continue;
@@ -125,13 +128,6 @@ fn first_atx_heading(text: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// True if a trimmed line is a closing fence for `fence_char`
-/// (at least 3 consecutive fence characters).
-fn is_fence_line(trimmed: &str, fence_char: char) -> bool {
-    let count = trimmed.chars().take_while(|c| *c == fence_char).count();
-    count >= 3
 }
 
 /// Parse a single ATX heading line. Returns `Some(text)` if the line
@@ -223,8 +219,7 @@ fn github_repos(text: &str) -> Vec<String> {
         // `github.com/foo/bar` collapse to the same value.
         let repo_clean = repo.strip_suffix(".git").unwrap_or(repo);
         let joined = format!("github.com/{}/{}", owner, repo_clean);
-        if !seen.contains(joined.as_str()) {
-            seen.insert(joined.clone());
+        if seen.insert(joined.clone()) {
             out.push(joined);
         }
     }
@@ -256,19 +251,6 @@ fn is_path_segment_char(ch: char) -> bool {
 /// the upstream README names the *upstream* package instead, so a supply-chain
 /// trait can compare this against the manifest's declared `name`.
 fn npm_packages(text: &str) -> Vec<String> {
-    // `/npm/v/<pkg>` is a shields.io version badge, and its URL commonly carries
-    // the image format as an extension: `/npm/v/etag.svg`. Keeping the suffix
-    // made every badge name a package that does not exist, so a rule comparing
-    // the manifest name against this list saw a mismatch for `etag`, `js-yaml`,
-    // `commander` and every other project that badges itself this way.
-    fn strip_badge_extension(name: &str) -> &str {
-        for ext in [".svg", ".png", ".json"] {
-            if let Some(base) = name.strip_suffix(ext) {
-                return base;
-            }
-        }
-        name
-    }
     const NEEDLES: [&str; 2] = ["npmjs.com/package/", "/npm/v/"];
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
@@ -278,12 +260,20 @@ fn npm_packages(text: &str) -> Vec<String> {
             let start = cursor + rel + needle.len();
             cursor = start;
             if let Some(name) = take_npm_name(&text[start..]) {
-                let name = strip_badge_extension(&name).to_string();
+                // `/npm/v/<pkg>` is a shields.io version badge, and its URL
+                // commonly carries the image format as an extension:
+                // `/npm/v/etag.svg`. Keeping the suffix would name a package
+                // that does not exist, and every self-badging project would
+                // appear to disagree with its own manifest.
+                let name = [".svg", ".png", ".json"]
+                    .into_iter()
+                    .find_map(|ext| name.strip_suffix(ext))
+                    .unwrap_or(&name)
+                    .to_string();
                 if name.is_empty() {
                     continue;
                 }
-                if !seen.contains(name.as_str()) {
-                    seen.insert(name.clone());
+                if seen.insert(name.clone()) {
                     out.push(name);
                 }
             }
@@ -292,9 +282,6 @@ fn npm_packages(text: &str) -> Vec<String> {
     out
 }
 
-/// Take one npm package name from the start of `s`. Handles a `@scope/name`
-/// pair as a single value; otherwise a bare unscoped segment. Returns `None`
-/// for an empty or malformed name.
 /// Package names a README instructs the reader to install.
 ///
 /// Scans every line (inside fenced blocks too — install commands almost always
@@ -422,9 +409,17 @@ fn extension_argument_name(arg: &str) -> Option<String> {
     }
     // A packaged file may be given by path; only the basename carries identity.
     let base = arg.rsplit(['/', '\\']).next()?;
-    let vsix = base.len() > 5 && base[base.len() - 5..].eq_ignore_ascii_case(".vsix");
-    let name = if vsix {
-        strip_version_suffix(&base[..base.len() - 5])
+    // Byte offsets, not character ones: `get` refuses a cut inside a
+    // multi-byte character, which can never be a `.vsix` suffix anyway.
+    let stem = base
+        .len()
+        .checked_sub(".vsix".len())
+        .filter(|&at| at > 0)
+        .and_then(|at| Some((base.get(..at)?, base.get(at..)?)))
+        .filter(|(_, suffix)| suffix.eq_ignore_ascii_case(".vsix"))
+        .map(|(stem, _)| stem);
+    let name = if let Some(stem) = stem {
+        strip_version_suffix(stem)
     } else {
         // Marketplace id: publisher.extension. A bare token with no publisher
         // half is taken as-is.
@@ -497,6 +492,9 @@ fn install_argument_name(arg: &str) -> Option<String> {
     Some(name)
 }
 
+/// Take one npm package name from the start of `s`. Handles a `@scope/name`
+/// pair as a single value; otherwise a bare unscoped segment. Returns `None`
+/// for an empty or malformed name.
 fn take_npm_name(s: &str) -> Option<String> {
     if let Some(rest) = s.strip_prefix('@') {
         let scope = take_path_segment(rest)?;
@@ -507,19 +505,11 @@ fn take_npm_name(s: &str) -> Option<String> {
         let name = take_path_segment(&s[after_scope + 1..])?;
         Some(format!("@{}/{}", scope, name))
     } else {
-        take_npm_segment(s).map(str::to_owned)
+        // An unscoped name ends where a path segment does; `?` and `#` are
+        // not segment characters, so a shields badge such as
+        // `/npm/v/foo?style=flat` yields `foo`.
+        take_path_segment(s).map(str::to_owned)
     }
-}
-
-/// Like `take_path_segment`, but stops at a URL fragment/query as well so a
-/// shields badge such as `/npm/v/foo?style=flat` yields `foo`.
-fn take_npm_segment(s: &str) -> Option<&str> {
-    let end = s
-        .find(|ch: char| {
-            ch == '/' || ch == '?' || ch == '#' || ch.is_whitespace() || !is_path_segment_char(ch)
-        })
-        .unwrap_or(s.len());
-    s.get(..end).filter(|seg| !seg.is_empty())
 }
 
 #[cfg(test)]

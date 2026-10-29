@@ -9,18 +9,18 @@
 //! one (gem, OCI image, Gentoo binpkg). The gzip/bzip2/xz/zstd-wrapped
 //! variants and the packages built on them (npm, crate, sdist, Alpine apk,
 //! FreeBSD/Arch pkg, xbps) get the `archive.format.kind` label and nothing
-//! else: cleave decompresses them and re-submits the inner tar, which is
+//! else: the caller decompresses them and submits the inner tar, which is
 //! walked then. Package identity for the gzipped ones is read by their own
 //! modules, not here.
 
 use serde_json::Value as JsonValue;
 
-use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, Shape, member_value};
-use super::bounded::{MAX_ARCHIVE_MEMBERS, push_limit};
+use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, member_value};
+use super::bounded::{Limits, MAX_ARCHIVE_MEMBERS};
 use crate::error::Error;
 use crate::fileid::FileType;
 use crate::metric;
-use crate::output::{ArchiveMember, ArchiveOffsets, ArchiveOwnership, Metrics, Values};
+use crate::output::{ArchiveMember, ArchiveOffsets, ArchiveOwnership, EntryType, Metrics, Values};
 use crate::value_key;
 
 /// The shared aggregates a tar reports. Only regular entries are files, and
@@ -46,13 +46,6 @@ const AGGS: &[Agg] = &[
     Agg::MisplacedExecutables,
     Agg::MtimeRange,
 ];
-
-/// A tar member's published value has never carried its byte offsets; they
-/// are on the typed member only.
-const SHAPE: Shape = Shape {
-    offsets: false,
-    ..Shape::FULL
-};
 
 pub(super) fn extract(
     bytes: &[u8],
@@ -97,22 +90,13 @@ pub(super) fn extract(
 
         let named = |name: Option<&str>| name.filter(|n| !n.is_empty()).map(str::to_string);
         let mode_octal = header.mode().ok();
-        let uid = header.uid().ok();
-        let gid = header.gid().ok();
-        let uname = named(header.username().ok().flatten());
-        let gname = named(header.groupname().ok().flatten());
-        let ownership = (mode_octal.is_some()
-            || uid.is_some()
-            || gid.is_some()
-            || uname.is_some()
-            || gname.is_some())
-        .then_some(ArchiveOwnership {
+        let ownership = ArchiveOwnership {
             mode_octal,
-            uid,
-            gid,
-            uname,
-            gname,
-        });
+            uid: header.uid().ok(),
+            gid: header.gid().ok(),
+            uname: named(header.username().ok().flatten()),
+            gname: named(header.groupname().ok().flatten()),
+        };
         let linkname = if kind.is_symlink() || kind.is_hard_link() {
             header
                 .link_name()
@@ -132,32 +116,27 @@ pub(super) fn extract(
         } else {
             (None, None)
         };
+        let path = entry
+            .path()
+            .ok()
+            .map_or_else(String::new, |p| p.to_string_lossy().into_owned());
         let member = ArchiveMember {
-            path: entry
-                .path()
-                .ok()
-                .map_or_else(String::new, |p| p.to_string_lossy().into_owned()),
-            size_bytes: header.size().unwrap_or(0),
-            entry_type: Some(tar_entry_type(kind).into()),
             mtime_unix: header.mtime().ok().map(u64::cast_signed),
             linkname,
-            host_os: None,
-            crc32: None,
-            encrypted: false,
-            compression: None,
             ownership,
             offsets: ArchiveOffsets {
                 header: header_offset,
                 data: data_offset,
                 central_header: None,
             },
+            ..ArchiveMember::new(path, header.size().unwrap_or(0), tar_entry_type(kind))
         };
 
         let mut reading = Reading::of(&member);
         reading.file = kind == tar::EntryType::Regular;
         reading.exec_mode = mode_octal.is_some_and(|m| m & 0o111 != 0);
         stats.observe(&member, &reading);
-        members.push(JsonValue::Object(member_value(&member, SHAPE)));
+        members.push(JsonValue::Object(member_value(&member)));
         archive_members.push(member);
     }
 
@@ -167,12 +146,9 @@ pub(super) fn extract(
     if unlisted > 0 {
         let total = listed as u64 + unlisted;
         metrics.insert(metric!("archive.member_count"), total as f64);
-        push_limit(
-            values,
-            value_key!("tar.limits"),
-            "member-cap",
-            format!("listed {listed} of {total} members"),
-        );
+        let mut limits = Limits::default();
+        limits.push("member-cap", format!("listed {listed} of {total} members"));
+        limits.emit(values, value_key!("tar.limits"));
     }
     Ok(())
 }
@@ -202,23 +178,23 @@ fn format_label(file_type: FileType) -> &'static str {
     }
 }
 
-fn tar_entry_type(t: tar::EntryType) -> &'static str {
-    use tar::EntryType;
+fn tar_entry_type(t: tar::EntryType) -> EntryType {
+    use tar::EntryType as T;
     match t {
-        EntryType::Regular => "regular",
-        EntryType::Link => "hardlink",
-        EntryType::Symlink => "symlink",
-        EntryType::Char => "char-device",
-        EntryType::Block => "block-device",
-        EntryType::Directory => "directory",
-        EntryType::Fifo => "fifo",
-        EntryType::Continuous => "continuous",
-        EntryType::GNULongName => "gnu-longname",
-        EntryType::GNULongLink => "gnu-longlink",
-        EntryType::GNUSparse => "gnu-sparse",
-        EntryType::XGlobalHeader => "pax-global",
-        EntryType::XHeader => "pax-header",
-        _ => "other",
+        T::Regular => EntryType::Regular,
+        T::Link => EntryType::Hardlink,
+        T::Symlink => EntryType::Symlink,
+        T::Char => EntryType::CharDevice,
+        T::Block => EntryType::BlockDevice,
+        T::Directory => EntryType::Directory,
+        T::Fifo => EntryType::Fifo,
+        T::Continuous => EntryType::Continuous,
+        T::GNULongName => EntryType::GnuLongname,
+        T::GNULongLink => EntryType::GnuLonglink,
+        T::GNUSparse => EntryType::GnuSparse,
+        T::XGlobalHeader => EntryType::PaxGlobal,
+        T::XHeader => EntryType::PaxHeader,
+        _ => EntryType::Other,
     }
 }
 

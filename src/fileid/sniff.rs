@@ -1,16 +1,24 @@
 //! One identification's input, and what has been derived from it so far.
 //!
-//! The stages of [`super::identify`] ask the same questions of the same bytes:
-//! what the name implies, whether a format's mark is present, what the
-//! language scorer makes of the body, and the UTF-16 decode behind the last
-//! two. A [`Sniff`] answers each the first time it is asked and keeps the
-//! answer, so every derivation runs at most once per call however many stages
-//! consult it. Nothing here decides a type; the stages still run in their own
-//! order and the first match still wins.
+//! The rules of [`super::identify`] ask the same questions of the same bytes:
+//! what the name claims, whether a format's mark is present, what the line
+//! grammars and the language scorer make of the body, whether the bytes open
+//! as a zip, and the UTF-16 decode behind several of those. A [`Sniff`]
+//! answers each the first time it is asked and keeps the answer, so every
+//! derivation runs at most once per call however many rules consult it.
+//! Nothing here decides a type; the rules still run in their own order and
+//! the first match still wins.
 
 use std::{borrow::Cow, cell::OnceCell, path::Path};
 
-use super::{FileType, ext, heuristics, strip_utf8_bom};
+use super::{
+    FileType,
+    ext::{self, Claim},
+    heuristics::{self, Scores},
+    marks,
+    scripts::{self, Evidence},
+    strip_utf8_bom, zip_probe,
+};
 
 /// The path and bytes being identified, with lazily computed derivations.
 pub(super) struct Sniff<'a> {
@@ -20,20 +28,24 @@ pub(super) struct Sniff<'a> {
     pub(super) data: &'a [u8],
     /// `data` without a leading UTF-8 byte-order mark.
     pub(super) body: &'a [u8],
-    /// [`ext::detect_from_path`].
-    ext_type: OnceCell<Option<FileType>>,
-    /// [`ext::is_filename_match`].
-    filename_match: OnceCell<bool>,
+    /// [`ext::claim`].
+    claim: OnceCell<Option<Claim>>,
     /// [`heuristics::decoded_text`]: UTF-16 narrowed for the byte scorers.
     decoded: OnceCell<Option<Cow<'a, [u8]>>>,
-    /// [`heuristics::detect_from_content`].
+    /// [`scripts::evidence`] of [`Self::text`] past its leading whitespace.
+    evidence: OnceCell<Evidence>,
+    /// [`heuristics::head_scores`] of [`Self::text`].
+    scores: OnceCell<Scores>,
+    /// [`heuristics::scored_type`].
     scored: OnceCell<Option<FileType>>,
-    /// [`heuristics::unmistakable`].
+    /// [`marks::unmistakable`].
     marked: OnceCell<Option<FileType>>,
-    /// [`heuristics::looks_like_git_config`].
+    /// [`marks::looks_like_git_config`].
     git_config: OnceCell<bool>,
     /// [`heuristics::binary_not_source`].
     binary_not_source: OnceCell<bool>,
+    /// The bytes opened as a zip, when they are one.
+    zip: OnceCell<Option<zip_probe::Archive<'a>>>,
 }
 
 impl<'a> Sniff<'a> {
@@ -42,57 +54,69 @@ impl<'a> Sniff<'a> {
             path,
             data,
             body: strip_utf8_bom(data),
-            ext_type: OnceCell::new(),
-            filename_match: OnceCell::new(),
+            claim: OnceCell::new(),
             decoded: OnceCell::new(),
+            evidence: OnceCell::new(),
+            scores: OnceCell::new(),
             scored: OnceCell::new(),
             marked: OnceCell::new(),
             git_config: OnceCell::new(),
             binary_not_source: OnceCell::new(),
+            zip: OnceCell::new(),
         }
+    }
+
+    /// What the path's name or extension claims.
+    pub(super) fn claim(&self) -> Option<Claim> {
+        *self.claim.get_or_init(|| ext::claim(self.path))
     }
 
     /// The type the path's name or extension implies.
     pub(super) fn ext_type(&self) -> Option<FileType> {
-        *self
-            .ext_type
-            .get_or_init(|| ext::detect_from_path(self.path))
+        self.claim().map(|c| c.file_type)
     }
 
-    /// Whether [`Self::ext_type`] came from a well-known filename rather
-    /// than an extension.
-    pub(super) fn is_filename_match(&self) -> bool {
-        *self
-            .filename_match
-            .get_or_init(|| ext::is_filename_match(self.path))
-    }
-
-    /// The text the byte scorers read instead of `data`, when that differs.
+    /// The UTF-16 text behind the bytes, narrowed to 8 bits, when they are
+    /// UTF-16 or carry a UTF-16 byte-order mark.
     pub(super) fn decoded(&self) -> Option<&[u8]> {
         self.decoded
             .get_or_init(|| heuristics::decoded_text(self.data))
             .as_deref()
     }
 
+    /// The text the scorers and line grammars read: [`Self::decoded`], or
+    /// the bytes themselves, without a UTF-8 byte-order mark.
+    pub(super) fn text(&self) -> &[u8] {
+        self.decoded().map_or(self.body, strip_utf8_bom)
+    }
+
+    /// What the line grammars make of [`Self::text`].
+    pub(super) fn evidence(&self) -> &Evidence {
+        self.evidence
+            .get_or_init(|| scripts::evidence(self.text().trim_ascii_start()))
+    }
+
+    /// The language scorer's table for the head of [`Self::text`].
+    pub(super) fn head_scores(&self) -> &Scores {
+        self.scores
+            .get_or_init(|| heuristics::head_scores(self.text().trim_ascii_start()))
+    }
+
     /// The language the content scorer finds in the body.
     pub(super) fn scored_type(&self) -> Option<FileType> {
-        *self
-            .scored
-            .get_or_init(|| heuristics::detect_from_decoded(self.data, self.decoded()))
+        *self.scored.get_or_init(|| heuristics::scored_type(self))
     }
 
     /// A mark that belongs to one format and almost nothing else.
     pub(super) fn unmistakable(&self) -> Option<FileType> {
-        *self
-            .marked
-            .get_or_init(|| heuristics::unmistakable(self.body, || self.looks_like_git_config()))
+        *self.marked.get_or_init(|| marks::unmistakable(self))
     }
 
     /// Git's config syntax in the head.
     pub(super) fn looks_like_git_config(&self) -> bool {
         *self
             .git_config
-            .get_or_init(|| heuristics::looks_like_git_config(self.data))
+            .get_or_init(|| marks::looks_like_git_config(self.data))
     }
 
     /// Object code, not text in any encoding.
@@ -100,5 +124,11 @@ impl<'a> Sniff<'a> {
         *self
             .binary_not_source
             .get_or_init(|| heuristics::binary_not_source(self.data))
+    }
+
+    /// The bytes opened as a zip archive, each caller with its own read
+    /// budget over the one parsed central directory.
+    pub(super) fn zip(&self) -> Option<zip_probe::Archive<'a>> {
+        self.zip.get_or_init(|| zip_probe::open(self.data)).clone()
     }
 }

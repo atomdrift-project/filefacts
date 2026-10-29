@@ -1,10 +1,19 @@
-//! Bounded manifest probes for source-package archives. A nested dependency's
-//! manifest cannot name its enclosing archive: only a root or one wrapper counts.
-// Published member names are case-sensitive format markers.
-#![allow(clippy::case_sensitive_file_extension_comparisons)]
+//! What a package archive's member names and manifests make it.
+//!
+//! One standard decides every tar layout. Member names a format defines
+//! settle it where the format puts them: the first member (`gpkg-1`,
+//! `.SIGN.*`, `+MANIFEST`, `props.plist`) or the archive root (`.PKGINFO`
+//! with `.MTREE`, `metadata.gz` with `data.tar.gz`, an OCI layout). An
+//! ecosystem manifest settles it only when its own identity names the one
+//! directory every member sits under (`<name>-<version>/` for a crate or an
+//! sdist), or the archive has no root directory at all; npm fixes its root
+//! as `package/`, so its manifest settles the layout when it checks out there:
+//! a nested dependency's manifest cannot name its enclosing archive, and a
+//! manifest's fixed name alone is no identity, since empty templates and
+//! documentation carry it too.
 use std::io::Read;
 
-use super::FileType;
+use super::{FileType, Sniff, zip_probe};
 
 pub(super) const MANIFEST_LIMIT: u64 = 128 * 1024;
 
@@ -56,13 +65,38 @@ fn crate_manifest(root: &str, body: &str) -> Option<FileType> {
         .then_some(FileType::Crate)
 }
 
-/// The manifest's own identity must fit its archive root. Fixed manifest names
-/// alone are insufficient: empty templates and documentation are common.
+/// A Python sdist's Core Metadata: `Name` and `Version`, and a root named
+/// for them. The root spells the name as the build tool normalized it, so the
+/// two are compared with PEP 503 normalization.
+fn sdist_manifest(root: &str, text: &str) -> Option<FileType> {
+    field(text, "Metadata-Version")?;
+    let name = field(text, "Name")?;
+    let release = field(text, "Version")?;
+    let stem = root.strip_suffix(release)?.strip_suffix('-')?;
+    let normalized = |s: &str| {
+        s.split(['-', '_', '.'])
+            .filter(|part| !part.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>()
+    };
+    (!name.is_empty() && version(release) && normalized(stem) == normalized(name))
+        .then_some(FileType::PythonSdist)
+}
+
+/// The manifest's own identity must fit its archive root.
 fn manifest(path: &str, body: &[u8]) -> Option<FileType> {
     let (root, name) = manifest_name(path)?;
     let text = std::str::from_utf8(body).ok()?;
     match name {
         "Cargo.toml" if !root.is_empty() => crate_manifest(root, text),
+        // npm packs every package under `package/`.
+        "package.json" if root == "package" => {
+            let doc: serde_json::Value = serde_json::from_slice(body).ok()?;
+            let named = |key| doc.get(key).and_then(serde_json::Value::as_str);
+            (named("name").is_some_and(|n| !n.is_empty()) && named("version").is_some())
+                .then_some(FileType::Npm)
+        }
+        "PKG-INFO" if !root.is_empty() => sdist_manifest(root, text),
         "composer.json" => {
             let doc: serde_json::Value = serde_json::from_slice(body).ok()?;
             let (vendor, package) = doc.get("name")?.as_str()?.split_once('/')?;
@@ -106,7 +140,7 @@ fn manifest(path: &str, body: &[u8]) -> Option<FileType> {
             && version(field(text, "version")?)
             && field(text, "meta-spec").is_some())
         .then_some(FileType::Cpan),
-        name if name.ends_with(".cabal") && !root.is_empty() => {
+        name if !root.is_empty() && name.strip_suffix(".cabal").is_some() => {
             let package = field(text, "name")?;
             let release = field(text, "version")?;
             (name.strip_suffix(".cabal")? == package
@@ -118,18 +152,61 @@ fn manifest(path: &str, body: &[u8]) -> Option<FileType> {
     }
 }
 
-pub(super) fn is_manifest(path: &str) -> bool {
+fn is_manifest(path: &str) -> bool {
     manifest_name(path).is_some_and(|(_, name)| {
         matches!(
             name,
-            "Cargo.toml" | "pubspec.yaml" | "DESCRIPTION" | "META.json" | "META.yml"
-        ) || name.ends_with(".cabal")
+            "Cargo.toml"
+                | "package.json"
+                | "PKG-INFO"
+                | "pubspec.yaml"
+                | "DESCRIPTION"
+                | "META.json"
+                | "META.yml"
+        ) || name
+            .rsplit_once('.')
+            .is_some_and(|(stem, ext)| !stem.is_empty() && ext == "cabal")
     })
 }
 
-#[derive(Default)]
+/// Members a tar is read through for a container image's markers; a `docker
+/// save` bundle writes `manifest.json` after its layers.
+const DEEP_MEMBERS: usize = 512;
+
+/// Members read before a tar with several top-level entries is settled.
+/// Every first-member and root marker sits within them.
+const SHALLOW_MEMBERS: usize = 8;
+
+/// The top-level directory a tar's members share.
+enum Root {
+    /// No member observed yet.
+    Unseen,
+    /// Every member so far sits under this one.
+    One(String),
+    /// Members sit under more than one.
+    Many,
+}
+
+/// A tar's members, observed one at a time, and the package layout they
+/// name. See the module documentation for the standard every marker meets.
 pub(super) struct TarProbe {
+    /// Members observed, not counting metadata headers and AppleDouble
+    /// sidecars.
+    members: usize,
+    /// The top-level directory the members so far share.
+    root: Root,
+    /// The first ecosystem manifest whose identity checked out, with the
+    /// root it names (empty for a rootless archive).
     candidate: Option<(String, FileType)>,
+    pkginfo: bool,
+    arch_meta: bool,
+    gem_metadata: bool,
+    gem_data: bool,
+    oci_layout: bool,
+    oci_index: bool,
+    docker_manifest: bool,
+    docker_layers: bool,
+    /// Dart sources, so a rootless pub package may name itself late.
     pub_hint: bool,
     hex_version: bool,
     hex_checksum: bool,
@@ -138,10 +215,116 @@ pub(super) struct TarProbe {
 }
 
 impl TarProbe {
-    /// Inspect only small manifests or short format signatures. `tar` skips the
-    /// rest under its caller's existing total decompression budget.
-    pub(super) fn observe(&mut self, path: &str, entry: impl Read, size: u64) {
-        self.pub_hint |= path.ends_with(".dart") || path == "lib";
+    pub(super) fn new() -> Self {
+        Self {
+            members: 0,
+            root: Root::Unseen,
+            candidate: None,
+            pkginfo: false,
+            arch_meta: false,
+            gem_metadata: false,
+            gem_data: false,
+            oci_layout: false,
+            oci_index: false,
+            docker_manifest: false,
+            docker_layers: false,
+            pub_hint: false,
+            hex_version: false,
+            hex_checksum: false,
+            hex_metadata: false,
+            hex_contents: false,
+        }
+    }
+
+    /// Members observed so far.
+    pub(super) fn members(&self) -> usize {
+        self.members
+    }
+
+    /// Observe the member at `path` (`./` and a trailing `/` already
+    /// trimmed). Returns the layout once a format-defined marker settles it.
+    /// Only small manifests and short signatures are read from `entry`; `tar`
+    /// skips the rest under its caller's decompression budget.
+    pub(super) fn observe(
+        &mut self,
+        path: &str,
+        is_file: bool,
+        entry: impl Read,
+        size: u64,
+    ) -> Option<FileType> {
+        let (top, rest) = path.split_once('/').unwrap_or((path, ""));
+        let base = path.rsplit('/').next().unwrap_or(path);
+        // macOS AppleDouble sidecars that `tar` smuggles in are not members.
+        if base.starts_with("._") || path.is_empty() {
+            return None;
+        }
+        self.members += 1;
+        if self.members == 1 {
+            let first = if base == "gpkg-1" && rest == "gpkg-1" {
+                Some(FileType::GentooBinpkg)
+            } else if path.starts_with(".SIGN.") {
+                Some(FileType::ApkAlpine)
+            } else if matches!(path, "+COMPACT_MANIFEST" | "+MANIFEST") {
+                Some(FileType::PkgFreebsd)
+            } else if path == "props.plist" {
+                Some(FileType::Xbps)
+            } else {
+                None
+            };
+            if first.is_some() {
+                return first;
+            }
+        }
+        match path {
+            ".PKGINFO" => self.pkginfo = true,
+            ".MTREE" | ".BUILDINFO" => self.arch_meta = true,
+            "metadata.gz" => self.gem_metadata = true,
+            "data.tar.gz" => self.gem_data = true,
+            "oci-layout" => self.oci_layout = true,
+            "index.json" => self.oci_index = true,
+            "manifest.json" => self.docker_manifest = true,
+            "repositories" => self.docker_layers = true,
+            _ if path.ends_with("/layer.tar") || path.starts_with("blobs/") => {
+                self.docker_layers = true;
+            }
+            _ => {}
+        }
+        if self.pkginfo && self.arch_meta {
+            return Some(FileType::PkgArch);
+        }
+        if self.gem_metadata && self.gem_data {
+            return Some(FileType::Gem);
+        }
+        if (self.oci_layout && self.oci_index) || (self.docker_manifest && self.docker_layers) {
+            return Some(FileType::OciImage);
+        }
+        match &self.root {
+            Root::Unseen => self.root = Root::One(top.to_owned()),
+            Root::One(r) if r != top => self.root = Root::Many,
+            _ => {}
+        }
+        if is_file {
+            self.read_manifest(path, entry, size);
+            // npm's root is fixed by the format, so its manifest settles the
+            // layout as soon as it checks out under that one root.
+            if matches!(&self.root, Root::One(r) if r == "package")
+                && self
+                    .candidate
+                    .as_ref()
+                    .is_some_and(|(_, kind)| *kind == FileType::Npm)
+            {
+                return Some(FileType::Npm);
+            }
+            if self.hex_version && self.hex_checksum && self.hex_metadata && self.hex_contents {
+                return Some(FileType::Hex);
+            }
+        }
+        None
+    }
+
+    fn read_manifest(&mut self, path: &str, entry: impl Read, size: u64) {
+        self.pub_hint |=
+            path == "lib" || path.rsplit_once('.').is_some_and(|(_, ext)| ext == "dart");
         let hex_limit = match path {
             "VERSION" => Some(8),
             "CHECKSUM" => Some(128),
@@ -167,11 +350,11 @@ impl TarProbe {
             "VERSION" => self.hex_version = body.trim_ascii() == b"3",
             "CHECKSUM" => {
                 self.hex_checksum = body.trim_ascii().len() == 64
-                    && body.trim_ascii().iter().all(u8::is_ascii_hexdigit)
+                    && body.trim_ascii().iter().all(u8::is_ascii_hexdigit);
             }
             "metadata.config" => {
                 self.hex_metadata = memchr::memmem::find(&body, b"<<\"name\">>").is_some()
-                    && memchr::memmem::find(&body, b"<<\"version\">>").is_some()
+                    && memchr::memmem::find(&body, b"<<\"version\">>").is_some();
             }
             "contents.tar.gz" => self.hex_contents = body.starts_with(b"\x1f\x8b"),
             _ => {
@@ -188,51 +371,56 @@ impl TarProbe {
         }
     }
 
-    pub(super) fn hex(&self) -> bool {
-        self.hex_version && self.hex_checksum && self.hex_metadata && self.hex_contents
+    /// How many members to read before settling. A single-root package may
+    /// name itself last, so it is read to the end of the caller's byte
+    /// budget; `deep` reads on for container-image markers, which only a
+    /// plain tar carries.
+    pub(super) fn cap(&self, deep: bool) -> usize {
+        if deep {
+            DEEP_MEMBERS
+        } else if !matches!(self.root, Root::Many) || self.pub_hint {
+            usize::MAX
+        } else {
+            SHALLOW_MEMBERS
+        }
     }
 
-    pub(super) fn extended_walk(&self) -> bool {
-        self.pub_hint
-    }
-
-    pub(super) fn finish(self, root: Option<&str>) -> Option<FileType> {
-        self.candidate.and_then(|(prefix, kind)| {
-            (prefix.is_empty() || root == Some(prefix.as_str())).then_some(kind)
-        })
+    /// The layout once every member read has been observed: the manifest
+    /// candidate when its root is the archive's one root (or it has none),
+    /// else a plain tar.
+    pub(super) fn finish(self) -> FileType {
+        self.candidate
+            .and_then(|(prefix, kind)| {
+                (prefix.is_empty() || matches!(&self.root, Root::One(r) if *r == prefix))
+                    .then_some(kind)
+            })
+            .unwrap_or(FileType::Tar)
     }
 }
 
 /// Composer distributions are commonly GitHub ZIPs, including streaming ZIPs.
-/// Use the central directory and inflate only the root manifest, with a hard cap.
-pub(super) fn composer_zip(data: &[u8]) -> bool {
-    // Avoid opening every arbitrary ZIP unless a local name at least mentions
-    // composer.json. This is a hint only; the central directory is authoritative.
-    if memchr::memmem::find(data, b"composer.json").is_none() {
-        return false;
-    }
-    let Ok(mut archive) = super::zip_probe::open(data) else {
+/// Use the central directory and inflate only the root manifest, with a hard
+/// cap. Callers ask only when a local name mentions `composer.json`.
+pub(super) fn composer_zip(sniff: &Sniff<'_>) -> bool {
+    let Some(mut archive) = sniff.zip() else {
         return false;
     };
-    let candidate = archive
-        .file_names()
+    let candidate = zip_probe::names(&archive)
         .find(|name| manifest_name(name).is_some_and(|(_, base)| base == "composer.json"))
-        .map(str::to_owned);
+        .map(std::borrow::Cow::into_owned);
     let Some(name) = candidate else {
         return false;
     };
     let Some((root, _)) = manifest_name(&name) else {
         return false;
     };
-    let prefix = if root.is_empty() {
-        String::new()
-    } else {
-        format!("{root}/")
-    };
-    if !prefix.is_empty()
-        && !archive
-            .file_names()
-            .all(|name| name == root || name.starts_with(&prefix))
+    if !root.is_empty()
+        && !zip_probe::names(&archive).all(|name| {
+            name == root
+                || name
+                    .strip_prefix(root)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
     {
         return false;
     }
@@ -252,170 +440,4 @@ pub(super) fn composer_zip(data: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::{ArchiveFormat, FileId, FileType};
-    use std::io::{Cursor, Write};
-    use std::path::Path;
-
-    fn tar(members: &[(&str, &[u8])], gzip: bool) -> Vec<u8> {
-        let mut builder = tar::Builder::new(Vec::new());
-        for (path, body) in members {
-            let mut header = tar::Header::new_ustar();
-            header.set_size(body.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder.append_data(&mut header, path, *body).unwrap();
-        }
-        let data = builder.into_inner().unwrap();
-        if !gzip {
-            return data;
-        }
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        encoder.write_all(&data).unwrap();
-        encoder.finish().unwrap()
-    }
-
-    fn zip(members: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        for (name, body) in members {
-            writer
-                .start_file(*name, zip::write::SimpleFileOptions::default())
-                .unwrap();
-            writer.write_all(body).unwrap();
-        }
-        writer.finish().unwrap().into_inner()
-    }
-
-    fn identifies(bytes: &[u8], kind: FileType) {
-        for path in ["download", "deadbeef", "artifact.tar.gz", "archive.zip"] {
-            let id = FileId::from_path_and_bytes(Path::new(path), bytes);
-            assert_eq!(id.file_type(), kind, "{path}");
-        }
-        let parsed = crate::OpenOptions::new().cache(false).open(bytes);
-        assert_eq!(parsed.fileid().file_type(), kind);
-        assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
-        // These fields feed container fallback models independently of the
-        // ecosystem-specific label.
-        let container = kind.archive_format().unwrap();
-        assert_eq!(
-            parsed
-                .values()
-                .get("archive.container.archive")
-                .and_then(serde_json::Value::as_str),
-            Some(container.label())
-        );
-        let label = serde_json::to_string(&kind).unwrap();
-        assert_eq!(serde_json::from_str::<FileType>(&label).unwrap(), kind);
-    }
-
-    #[test]
-    fn source_package_types_survive_renamed_downloads() {
-        let cases: Vec<(FileType, Vec<u8>)> = vec![
-            (FileType::Crate, tar(&[("demo-1.2.3/Cargo.toml", b"[package]\nname='demo'\nversion='1.2.3'\n")], true)),
-            (FileType::Pub, tar(&[("lib/demo.dart", b"library demo;"), ("pubspec.yaml", b"name: demo\nversion: '1.2.3'\nenvironment:\n  sdk: ^3.4.0\n")], true)),
-            (FileType::Cran, tar(&[("demo/DESCRIPTION", b"Package: demo\nVersion: 1.2.3\nTitle: Example\nDescription: Example package.\n")], true)),
-            (FileType::Cpan, tar(&[("Demo-1.23/META.json", br#"{"name":"Demo","version":"1.23","meta-spec":{"version":2}}"#)], true)),
-            (FileType::Cpan, tar(&[("Demo-1.23/META.yml", b"---\nname: Demo\nversion: '1.23'\nmeta-spec:\n  version: '1.4'\n")], true)),
-            (FileType::Hackage, tar(&[("demo-0.1.2.3/demo.cabal", b"Name: demo\nVersion: 0.1.2.3\nCabal-Version: >=1.10\n")], true)),
-            (FileType::Hex, tar(&[("VERSION", b"3"), ("CHECKSUM", &[b'A';64]), ("metadata.config", b"{<<\"name\">>,<<\"demo\">>}.\n{<<\"version\">>,<<\"1.2.3\">>}."), ("contents.tar.gz", b"\x1f\x8b\x08\0")], false)),
-            (FileType::Composer, zip(&[("demo-main/composer.json", br#"{"name":"vendor/demo","require":{"php":">=8.0"}}"#), ("demo-main/src/Demo.php", b"<?php echo 1;")])),
-            (FileType::Composer, zip(&[("composer.json", br#"{"name":"vendor/demo"}"#), ("src/Demo.php", b"<?php echo 1;")])),
-        ];
-        for (kind, bytes) in cases {
-            identifies(&bytes, kind);
-        }
-    }
-
-    #[test]
-    fn incidental_manifests_do_not_name_the_outer_archive() {
-        for members in [
-            vec![(
-                "repo/docs/demo/Cargo.toml",
-                &b"[package]\nname='demo'\nversion='1.2.3'\n"[..],
-            )],
-            vec![(
-                "repo/Cargo.toml",
-                &b"[package]\nname='demo'\nversion='1.2.3'\n"[..],
-            )],
-            vec![(
-                "repo/sub/pubspec.yaml",
-                &b"name: demo\nversion: 1.2.3\n"[..],
-            )],
-            vec![(
-                "demo/DESCRIPTION",
-                &b"Package: other\nVersion: 1.0\nTitle: x\nDescription: y\n"[..],
-            )],
-            vec![(
-                "Demo-1.0/META.json",
-                &br#"{"name":"Demo","version":"1.0"}"#[..],
-            )],
-            vec![("demo-1.0/demo.cabal", &b"name: other\nversion: 1.0\n"[..])],
-            vec![
-                ("VERSION", &b"3"[..]),
-                ("CHECKSUM", &b"bad"[..]),
-                ("metadata.config", &b"x"[..]),
-                ("contents.tar.gz", &b"x"[..]),
-            ],
-            vec![
-                (
-                    "demo-1.2.3/Cargo.toml",
-                    &b"[package]\nname='demo'\nversion='1.2.3'\n"[..],
-                ),
-                ("unrelated/payload", &b"x"[..]),
-            ],
-        ] {
-            assert_eq!(
-                FileId::from_bytes(&tar(&members, true)).file_type(),
-                FileType::TarGz,
-                "{members:?}"
-            );
-        }
-        for members in [
-            vec![(
-                "repo/vendor/lib/composer.json",
-                &br#"{"name":"vendor/lib"}"#[..],
-            )],
-            vec![("repo/composer.json", &b"{}"[..])],
-            vec![
-                ("repo/composer.json", &br#"{"name":"vendor/lib"}"#[..]),
-                ("other/file", &b"x"[..]),
-            ],
-            vec![("repo/composer.json", &b"{broken"[..])],
-        ] {
-            assert_eq!(
-                FileId::from_bytes(&zip(&members)).file_type(),
-                FileType::Zip
-            );
-        }
-        assert_eq!(
-            FileType::Composer.archive_format(),
-            Some(ArchiveFormat::Zip)
-        );
-    }
-
-    #[test]
-    fn rootless_pub_manifest_may_follow_many_source_files() {
-        let names: Vec<String> = (0..100).map(|i| format!("lib/source{i}.dart")).collect();
-        let mut members: Vec<_> = names
-            .iter()
-            .map(|s| (s.as_str(), &b"library demo;"[..]))
-            .collect();
-        members.push(("README.md", b"documentation"));
-        members.push(("pubspec.yaml", b"name: demo\nversion: 1.2.3\n"));
-        identifies(&tar(&members, true), FileType::Pub);
-    }
-
-    #[test]
-    fn oversized_manifests_remain_generic() {
-        let mut oversized = b"name: demo\nversion: 1.2.3\n# ".to_vec();
-        oversized.resize(super::MANIFEST_LIMIT as usize + 1, b'a');
-        assert_eq!(
-            FileId::from_bytes(&tar(&[("pubspec.yaml", &oversized)], true)).file_type(),
-            FileType::TarGz
-        );
-        assert_eq!(
-            FileId::from_bytes(&zip(&[("composer.json", &oversized)])).file_type(),
-            FileType::Zip
-        );
-    }
-}
+mod tests;

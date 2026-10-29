@@ -12,8 +12,8 @@
 //!
 //! - `pyc.magic` — hex of the 4-byte file signature.
 //! - `pyc.python_version` — derived from the magic table.
-//! - `pyc.is_hash_based` — PEP 552 bit 0; replaces timestamp with
-//!   a hash when set.
+//! - `pyc.hash` — the 8-byte source hash of a PEP 552 hash-based pyc
+//!   (flags bit 0), in hex; its presence marks the variant.
 //! - `pyc.timestamp`, `pyc.source_size` — populated only on the
 //!   timestamp-based variant (older / non-PEP-552 default).
 //! - `pyc.source_files[]` — recovered source paths from
@@ -23,7 +23,7 @@ use crate::metric;
 use crate::value_key;
 use serde_json::Value as JsonValue;
 
-use crate::formats::common::{XorScan, extract_binary_strings, put_str};
+use crate::formats::common::{XorScan, extract_binary_strings, hex_encode, put_str};
 use crate::output::{Metrics, Strings, Values};
 
 /// Cap on body bytes scanned for source-filename strings. Real
@@ -41,13 +41,19 @@ pub(super) fn extract(
 ) {
     extract_binary_strings(bytes, strings, XorScan::No);
 
-    let Some((header, rest)) = bytes.split_first_chunk::<16>() else {
+    // PEP 3147+ magic ends in `0x0d 0x0a`.
+    let Some((header, rest)) = bytes
+        .split_first_chunk::<16>()
+        .filter(|(header, _)| header[2..4] == [0x0D, 0x0A])
+    else {
+        tracing::debug!(
+            target: "filefacts::pyc",
+            stage = "header",
+            len = bytes.len(),
+            "no 16-byte pyc header with a CRLF magic; no pyc facts"
+        );
         return;
     };
-    // PEP 3147+ magic ends in `0x0d 0x0a`.
-    if header[2] != 0x0D || header[3] != 0x0A {
-        return;
-    }
 
     let magic_word = u16::from_le_bytes([header[0], header[1]]);
     let flags = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
@@ -65,11 +71,9 @@ pub(super) fn extract(
         put_str(values, value_key!("pyc.python_version"), ver);
     }
     if is_hash_based {
-        // Per the convention, omit the `is_hash_based: true` bool
-        // and use a presence-only key instead — `exists:
-        // pyc.hash` flags the variant for traits without a bool.
-        let hash_hex: String = header[8..16].iter().map(|b| format!("{b:02x}")).collect();
-        put_str(values, value_key!("pyc.hash"), hash_hex);
+        // A presence-only key rather than an `is_hash_based` bool:
+        // `exists: pyc.hash` flags the variant.
+        put_str(values, value_key!("pyc.hash"), hex_encode(&header[8..16]));
     } else {
         let ts = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
         let sz = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
@@ -165,149 +169,4 @@ fn is_path_byte(b: u8) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn build_pyc(magic_word: u16, flags: u32, ts: u32, sz: u32, body: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(16 + body.len());
-        out.extend_from_slice(&magic_word.to_le_bytes());
-        out.extend_from_slice(&[0x0D, 0x0A]);
-        out.extend_from_slice(&flags.to_le_bytes());
-        out.extend_from_slice(&ts.to_le_bytes());
-        out.extend_from_slice(&sz.to_le_bytes());
-        out.extend_from_slice(body);
-        out
-    }
-
-    fn run(bytes: &[u8]) -> (Values, Metrics) {
-        let mut v = Values::new();
-        let mut s = Strings::default();
-        let mut m = Metrics::new();
-        extract(bytes, &mut v, &mut s, &mut m);
-        (v, m)
-    }
-
-    #[test]
-    fn surfaces_header_and_filenames() {
-        let mut body = vec![0x10];
-        body.extend_from_slice(b"/build/foo/bar.py");
-        body.push(0);
-        let pyc = build_pyc(3413, 0, 1_700_000_000, 1234, &body);
-        let (v, m) = run(&pyc);
-        assert_eq!(
-            v.get("pyc.python_version").and_then(|x| x.as_str()),
-            Some("3.8")
-        );
-        assert_eq!(m.get("pyc.timestamp"), Some(1_700_000_000.0));
-        assert_eq!(m.get("pyc.source_size"), Some(1234.0));
-        let files = v
-            .get("pyc.source_files")
-            .and_then(|x| x.as_array())
-            .unwrap();
-        assert_eq!(files[0].as_str(), Some("/build/foo/bar.py"));
-    }
-
-    #[test]
-    fn hash_based_emits_hash_key_not_timestamp() {
-        let body = b"\x10/build/foo.py\x00".to_vec();
-        let pyc = build_pyc(3439, 0x01, 0, 0, &body);
-        let (v, m) = run(&pyc);
-        assert!(v.get("pyc.hash").is_some());
-        assert!(m.get("pyc.timestamp").is_none());
-    }
-
-    #[test]
-    fn rejects_too_short() {
-        let (v, _) = run(b"short");
-        assert!(v.get("pyc.magic").is_none());
-    }
-
-    #[test]
-    fn rejects_bad_signature() {
-        let (v, _) = run(&[0u8; 32]);
-        assert!(v.get("pyc.magic").is_none());
-    }
-
-    #[test]
-    fn dedupes_filenames() {
-        let mut body = Vec::new();
-        for _ in 0..40 {
-            body.push(0x10);
-            body.extend_from_slice(b"/tmp/file.py");
-            body.push(0);
-        }
-        let pyc = build_pyc(3413, 0, 1, 1, &body);
-        let (v, _) = run(&pyc);
-        let files = v
-            .get("pyc.source_files")
-            .and_then(|x| x.as_array())
-            .unwrap();
-        assert_eq!(files.len(), 1);
-    }
-
-    #[test]
-    fn unknown_magic_omits_version() {
-        // Magic word not in the version table — header still parses,
-        // but `pyc.python_version` is omitted rather than mis-labelled.
-        let pyc = build_pyc(9999, 0, 0, 0, b"");
-        let (v, _) = run(&pyc);
-        assert!(v.get("pyc.magic").is_some());
-        assert!(v.get("pyc.python_version").is_none());
-    }
-
-    #[test]
-    fn recognizes_pyx_pyw_pyi_extensions() {
-        let mut body = Vec::new();
-        for path in [b"a/b.pyx" as &[u8], b"c/d.pyw", b"e/f.pyi", b"g.py"] {
-            body.push(0x10);
-            body.extend_from_slice(path);
-            body.push(0);
-        }
-        let pyc = build_pyc(3413, 0, 1, 1, &body);
-        let (v, m) = run(&pyc);
-        let files = v
-            .get("pyc.source_files")
-            .and_then(|x| x.as_array())
-            .unwrap();
-        let paths: Vec<&str> = files.iter().filter_map(|x| x.as_str()).collect();
-        assert!(paths.contains(&"a/b.pyx"));
-        assert!(paths.contains(&"c/d.pyw"));
-        assert!(paths.contains(&"e/f.pyi"));
-        assert!(paths.contains(&"g.py"));
-        assert_eq!(m.get("pyc.source_file_count"), Some(4.0));
-    }
-
-    #[test]
-    fn rejects_signature_with_wrong_second_pair() {
-        // First two bytes look like a magic word but the next two are
-        // not `\r\n` — must reject.
-        let mut bytes = vec![0x55, 0x0D, 0x00, 0x00];
-        bytes.extend_from_slice(&[0u8; 12]);
-        let (v, _) = run(&bytes);
-        assert!(v.get("pyc.magic").is_none());
-    }
-
-    #[test]
-    fn body_scan_caps_filename_count() {
-        // Build 40 distinct filenames; should cap at MAX_SOURCE_FILES (32).
-        let mut body = Vec::new();
-        for i in 0..40 {
-            body.push(0x10);
-            body.extend_from_slice(format!("/tmp/file{i}.py").as_bytes());
-            body.push(0);
-        }
-        let pyc = build_pyc(3413, 0, 1, 1, &body);
-        let (v, _) = run(&pyc);
-        let files = v
-            .get("pyc.source_files")
-            .and_then(|x| x.as_array())
-            .unwrap();
-        assert_eq!(files.len(), MAX_SOURCE_FILES);
-    }
-
-    #[test]
-    fn empty_input_is_silent() {
-        let (v, _) = run(&[]);
-        assert!(v.get("pyc.magic").is_none());
-    }
-}
+mod tests;
