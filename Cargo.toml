@@ -344,8 +344,8 @@ debug = 2
 # tree-sitter-language, and `links = "tree-sitter-language"` permits only one
 # copy in the graph, so leaving the grammars on the crates.io copy is a
 # resolver conflict.
-tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
-tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
+tree-sitter = { git = "https://github.com/tstromberg/tree-sitter" }
+tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter" }
 # tree-sitter-bash: the external scanner passes the lexer's lookahead, a
 # Unicode code point, to ctype's isdigit() while scanning `{1..9}` brace
 # ranges. isdigit() is undefined for values outside unsigned char, so a
