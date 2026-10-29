@@ -900,6 +900,7 @@ pub const CATALOG: &[&str] = &[
     "source.batch.seeded_snapshot_concat_loops",
     "source.batch.snapshot_concat_max_fanout",
     "source.batch.unbounded_snapshot_concat_loops",
+    "source.batch.unconditional_start_cycles",
     "source.class_count",
     "source.extract_panicked",
     "source.function_count",

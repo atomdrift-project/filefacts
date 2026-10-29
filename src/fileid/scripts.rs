@@ -347,7 +347,10 @@ impl Evidence {
                 .iter()
                 .take_while(|b| matches!(b, b';' | b',' | b'='))
                 .count();
-            if batch == Grade::Weak && raw.get(margin) == Some(&b'@') {
+            if batch == Grade::Weak
+                && (raw.get(margin) == Some(&b'@')
+                    || (self.batch_opener && line.starts_with(b"\x1b[")))
+            {
                 batch = Grade::Strong;
             }
             // `:::On Error Resume Next:::` -- VBScript's statement separator,
@@ -681,6 +684,11 @@ enum BatchStep<'a> {
 /// of times (`((((`, `junk&junk&...`), so the continuations are followed in a
 /// loop: a padded line must not grow the stack, which no `catch_unwind` saves.
 fn batch_line(line: &[u8]) -> Grade {
+    // Raw ANSI.SYS keyboard assignments are commonly emitted by DOS batch
+    // scripts. The surrounding batch opener supplies the language evidence.
+    if line.starts_with(b"\x1b[") && line.ends_with(b"p") && line.contains(&b';') {
+        return Grade::Weak;
+    }
     let mut carry = Continuation::SAME;
     let mut expanded: Vec<u8>;
     let mut line = line;

@@ -348,3 +348,17 @@ sh.Run \"powershell -nop\", 0\r\nWScript.Sleep 1000\r\n",
     );
     assert_eq!(verdict(&data), Some(FileType::Vbs));
 }
+
+#[test]
+fn dos_ansi_keyboard_assignment_batch() {
+    let data = b"@ECHO ON\r\n\x1b[78;89;13p\r\n\x1b[110;121;13p\r\n\x1b[102;\"format c:\";13p\r\n\x1b[70;\"format c:\";13p";
+    assert_eq!(verdict(data), Some(FileType::Batch));
+    assert_eq!(
+        crate::fileid::detect(std::path::Path::new("sample.i"), data).map(|d| d.file_type),
+        Some(FileType::Batch)
+    );
+    assert_eq!(
+        verdict(b"A document about terminal colors\n\x1b[31mRed\x1b[0m\n"),
+        None
+    );
+}

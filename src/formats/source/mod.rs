@@ -11,6 +11,7 @@
 mod ast_walk;
 mod batch_commands;
 mod batch_concat;
+mod batch_cycles;
 mod call_target_metrics;
 mod comment_metrics;
 mod escapes;
@@ -243,6 +244,7 @@ pub(super) fn extract(
     text_metrics::emit(source, metrics);
     if config.lang == Lang::Batch {
         batch_concat::emit(source, metrics);
+        batch_cycles::emit(source, metrics);
     }
 
     // One walk for every collector that only reads each node once.
