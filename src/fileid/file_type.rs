@@ -30,9 +30,10 @@ pub enum Group {
     /// Single-stream compression (gzip, bzip2, xz, lzma, zstd): one
     /// compressed payload, not a container of members.
     Compressed,
-    /// Office documents, PDF, RTF, PostScript and HTML.
+    /// Authored documents: office formats, PDF, RTF, PostScript, HTML, TeX
+    /// and Markdown.
     Documents,
-    /// Prose and markup that is read as text.
+    /// Plain text with no recognized markup.
     Text,
     /// Raster and vector images.
     Images,
@@ -722,7 +723,7 @@ file_types! {
         Cfml => "cfml", Scripts, Named;
         /// TeX or LaTeX source (`.tex`, `.sty`, `.ltx`, `.dtx`). `.cls` is shared
         /// with Visual Basic, so a class file is TeX only when its body says so.
-        Tex => "tex", Text, Named;
+        Tex => "tex", Documents, Named;
         /// YARA rule source (`.yar`, `.yara`).
         // A detection ruleset, not prose. A `.yar` renamed `.txt` is
         // config→text; it is not the same kind of file as a note.
@@ -743,7 +744,7 @@ file_types! {
         /// ircII or EPIC script. The `^on` / `^alias` hook syntax is the mark.
         IrcII => "ircii", Scripts, Language;
         /// Markdown document (.md, .markdown)
-        Markdown => "markdown", Text, Named, UNSUPPORTED;
+        Markdown => "markdown", Documents, Named, UNSUPPORTED;
         /// Makefile / GNU Make build file
         Makefile => "makefile", Build, Named;
         /// Dockerfile — container image build definition

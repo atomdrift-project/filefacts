@@ -20,6 +20,10 @@ is listed under **Changed** with the new value.
   `usage()` documents environment variables and exit codes.
 - File types `ani`, `nrbf`, `image4_trustcache`, `fat_boot_sector` and
   `certificate_signature` (each was `data`).
+- `filefacts::Group`: every `FileType` belongs to exactly one of 19 groups
+  (`Group::ALL`, `label`, `from_label`, `file_types`); `FileType::ALL` and
+  `const FileType::group()` are public. `docs/file-groups.json` publishes
+  the table for consumers that route or train per group.
 - Signatures report `signer_count`, `key_bits`, `weak_key`,
   `weak_algorithms[]` and `extended_key_usage[]`.
 - PDF object streams with no filter, ASCIIHex, ASCII85 or chained filters are
@@ -71,6 +75,14 @@ is listed under **Changed** with the new value.
   - CFML `Flow.limitations` `syntax-*` values are kebab-case.
   - `source.shell.fifo_network_loops` and the Python temporary-file facts
     (`source.python.temporary_files`) are reshaped as general relations.
+  - `consistency.extension_content_mismatch.<content>_as_<ext>` names
+    `Group` labels: `binary` → `native`, `bytecode` or `machine_code`;
+    `script` → `scripts`; `archive` → `archives` or `compressed`;
+    `document` → `documents`; `image` → `images`; `font` → `fonts`. New
+    labels `build`, `signatures`, `serialized` and `unknown` take types
+    that were `config` or `data`; HTML, TeX and Markdown move from `text`
+    to `documents`, `lnk` from `binary` to `config`, and TypeScript from
+    `source` to `scripts`.
 - Semantic changes:
   - `pe.hashes.imphash` matches pefile and VirusTotal for ordinal imports.
   - PDF `/Type` counts (`pdf.*_count`, `pdf.shape.*`) count dictionaries in

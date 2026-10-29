@@ -122,7 +122,9 @@
       "ooxml",
       "pdf",
       "html",
+      "tex",
       "postscript",
+      "markdown",
       "odf"
     ],
     "fonts": [
@@ -197,8 +199,6 @@
       "c"
     ],
     "text": [
-      "tex",
-      "markdown",
       "text"
     ],
     "unknown": [

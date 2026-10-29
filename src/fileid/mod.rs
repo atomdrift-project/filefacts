@@ -215,15 +215,15 @@ impl FileId {
         }
     }
 
-    /// When [`Self::extension_mismatch`] holds, the coarse
-    /// `(content_group, extension_group)` transition — e.g. `("binary",
-    /// "image")` for a PE named `.png`. The extension group is `"unknown"`
-    /// when the extension is unrecognized (e.g. `.woff2` carrying a PE).
+    /// When [`Self::extension_mismatch`] holds, the [`Group`] labels of the
+    /// `(content, extension)` transition — e.g. `("native", "images")` for a
+    /// PE named `.png`. The extension group is `"unknown"` when the extension
+    /// is unrecognized (e.g. `.woff2` carrying a PE).
     ///
     /// This deliberately reports *what kind* of mismatch occurred and leaves
     /// the severity call to the consumer: a `.docx` named `.doc`
-    /// (`document`→`document`) is mundane, while a PE named `.jpeg`
-    /// (`binary`→`image`) is a masquerade. Returns `None` when there is no
+    /// (`documents`→`documents`) is mundane, while a PE named `.jpeg`
+    /// (`native`→`images`) is a masquerade. Returns `None` when there is no
     /// genuine mismatch.
     #[must_use]
     pub fn extension_mismatch_transition(&self) -> Option<(&'static str, &'static str)> {
