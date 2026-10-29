@@ -18,10 +18,10 @@ path = "src/lib.rs"
 # Upstream requires 0.25.6; filefacts needs 0.28, and `links = "tree-sitter"`
 # permits only one copy in the graph.
 tree-sitter = "0.28"
-tree-sitter-language = "0.1.5"
+tree-sitter-language = "0.1"
 
 [build-dependencies]
-cc = "1.0"
+cc = "1.10"
 
 # build.rs uses `cc`; cargo-machete does not see build-script usage.
 [package.metadata.cargo-machete]
