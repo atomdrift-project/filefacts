@@ -245,6 +245,39 @@ pub(super) fn extract(
     if trailing_bytes > 0 {
         features.push("trailing_data");
     }
+    // An IEND byte record in an unframed trailer is consistent with an old
+    // image suffix left by a nontruncating save. It is also trivial to forge:
+    // keep it as structural context, never as coverage or a safety verdict.
+    let trailer = bytes.get(last_chunk_end..).unwrap_or_default();
+    let mut trailing_iend_count = 0usize;
+    let mut trailing_iend_offsets = Vec::new();
+    if iend_seen {
+        for offset in memchr::memmem::find_iter(trailer, b"\0\0\0\0IEND\xae\x42\x60\x82") {
+            trailing_iend_count += 1;
+            if trailing_iend_offsets.len() < 64 {
+                trailing_iend_offsets.push(JsonValue::from(last_chunk_end + offset));
+            }
+        }
+        if trailing_iend_count > trailing_iend_offsets.len() {
+            limits.push(
+                "trailer-iend-list",
+                "png.trailing_iend_offsets lists the first 64 matches",
+            );
+        }
+        if !trailing_iend_offsets.is_empty() {
+            values.insert_key(
+                value_key!("png.trailing_iend_offsets"),
+                JsonValue::Array(trailing_iend_offsets),
+            );
+            if trailer.ends_with(b"\0\0\0\0IEND\xae\x42\x60\x82") {
+                features.push("trailer_ends_with_iend");
+            }
+        }
+    }
+    metrics.insert(
+        metric!("png.trailing_iend_count"),
+        trailing_iend_count as f64,
+    );
     if chunks_after_iend > 0 {
         features.push("post_iend_chunks");
     }

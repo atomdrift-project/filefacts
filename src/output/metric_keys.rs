@@ -796,6 +796,7 @@ pub const CATALOG: &[&str] = &[
     "png.text_chunk_bytes",
     "png.trailing_bytes",
     "png.trailing_chunk_count",
+    "png.trailing_iend_count",
     "png.unknown_chunk_count",
     "pyc.source_file_count",
     "pyc.source_size",

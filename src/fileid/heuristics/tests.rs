@@ -861,3 +861,30 @@ fn ordinary_bytes_are_left_alone() {
     assert!(decoded_text(b"@echo off\r\n").is_none());
     assert!(decoded_text(&[0u8; 256]).is_none());
 }
+
+#[test]
+fn java_wildcard_signatures_are_not_php_tags() {
+    for signature in [
+        b"java.util.List<? extends java.lang.Number>".as_slice(),
+        b"java.util.Comparator<? super java.lang.String>",
+        b"java.lang.Class<?>",
+    ] {
+        assert!(!super::has_php_tag(signature));
+        assert_ne!(detect_from_content(signature), Some(FileType::Php));
+    }
+    // The actual API tables repeat these signatures thousands of times.
+    let table = b"java.util.List<? extends java.lang.Number>#get(int;)\n".repeat(2000);
+    assert_ne!(detect_from_content(&table), Some(FileType::Php));
+}
+
+#[test]
+fn java_wildcards_do_not_hide_real_php_tags() {
+    for mixed in [
+        b"List<? extends Number>\n<?php system($_GET['cmd']); ?>".as_slice(),
+        b"Class<?>\n<? $cmd=$_POST['cmd']; system($cmd); ?>",
+        b"<? $x=1; ?>\nList<? super Number>",
+    ] {
+        assert!(super::has_php_tag(mixed));
+        assert_eq!(detect_from_content(mixed), Some(FileType::Php));
+    }
+}

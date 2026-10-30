@@ -10,6 +10,11 @@ is listed under **Changed** with the new value.
 
 ### Added
 
+- PNG trailer context: `png.trailing_iend_count`, bounded absolute byte offsets
+  in `png.trailing_iend_offsets`, and `trailer_ends_with_iend` in features. These
+  CRC-correct byte records can support investigating image overwrite residue;
+  they never claim trailer coverage or establish that its contents are safe.
+
 - `Registry::favorites` and the `registry.favorites` metric: stars, likes,
   or favers, a popularity count with no score behind it (unlike
   `rating_count`, the votes behind `rating`).

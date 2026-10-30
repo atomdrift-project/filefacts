@@ -728,6 +728,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "png.limits",
     "png.pixel_payloads",
     "png.text",
+    "png.trailing_iend_offsets",
     "png.unknown_chunks",
     "pyc.hash",
     "pyc.magic",

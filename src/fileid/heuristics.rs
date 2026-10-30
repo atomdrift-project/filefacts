@@ -1363,23 +1363,37 @@ fn starts_with_dockerfile_instruction(data: &[u8]) -> bool {
 /// or `<?=`, or the `?>` that closes a fragment whose opening tag was cut off.
 /// `<?xml …?>` is an XML processing instruction and never counts on its own.
 fn has_php_tag(data: &[u8]) -> bool {
-    let mut saw_xml_pi = false;
+    let mut saw_non_php_open = false;
     let mut rest = data;
     while let Some(pos) = memchr::memmem::find(rest, b"<?") {
         let Some(after) = rest.get(pos + 2..) else {
             break;
         };
+        let bound = after.trim_ascii_start();
+        // Java wildcard bounds in API signature catalogs are not PHP short
+        // tags. Nor is Class<?>: its question mark is generic type syntax.
+        // These cannot begin valid PHP statements. Continue searching so a
+        // genuine tag later in a mixed file still establishes PHP content.
+        let java_wildcard = after.starts_with(b">")
+            || (after.first().is_some_and(u8::is_ascii_whitespace)
+                && [b"extends".as_slice(), b"super".as_slice()]
+                    .iter()
+                    .any(|keyword| {
+                        bound.starts_with(keyword)
+                            && bound.get(keyword.len()).is_some_and(u8::is_ascii_whitespace)
+                    }));
         if after
             .get(..3)
             .is_some_and(|pi| pi.eq_ignore_ascii_case(b"xml"))
+            || java_wildcard
         {
-            saw_xml_pi = true;
+            saw_non_php_open = true;
         } else {
             return true;
         }
         rest = after;
     }
-    !saw_xml_pi && memchr::memmem::find(data, b"?>").is_some()
+    !saw_non_php_open && memchr::memmem::find(data, b"?>").is_some()
 }
 
 /// Tags that only markup carries. Static like [`SCANNER`]'s patterns, so a

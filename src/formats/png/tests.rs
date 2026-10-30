@@ -427,3 +427,107 @@ fn file_entropy_comes_from_the_generic_pass() {
         assert!((h - entropy::shannon(&bytes)).abs() < 1e-9);
     }
 }
+
+#[test]
+fn counts_only_crc_correct_iend_records_in_unframed_trailer() {
+    let end = b"\0\0\0\0IEND\xae\x42\x60\x82";
+    let mut bytes = build_png(&[
+        (b"tEXt", &[b"Comment\0".as_slice(), end].concat()),
+        (b"IEND", &[]),
+    ]);
+    let first_end = bytes.len();
+    bytes.extend_from_slice(b"unframed compressed residue");
+    let first_marker = bytes.len();
+    bytes.extend_from_slice(end);
+    bytes.extend_from_slice(b"more old image bytes");
+    let second_marker = bytes.len();
+    bytes.extend_from_slice(end);
+    let (values, metrics) = run(&bytes);
+    assert_eq!(metrics.get("png.trailing_iend_count"), Some(2.0));
+    assert_eq!(
+        values.get("png.trailing_iend_offsets"),
+        Some(&json!([first_marker, second_marker]))
+    );
+    assert_eq!(
+        metrics.get("png.trailing_bytes"),
+        Some((bytes.len() - first_end) as f64)
+    );
+    assert!(
+        values
+            .get("png.features")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .contains(&json!("trailer_ends_with_iend"))
+    );
+    let mut corrupt = bytes.clone();
+    corrupt[first_marker + 11] ^= 1;
+    *corrupt.last_mut().unwrap() ^= 1;
+    let (values, metrics) = run(&corrupt);
+    assert_eq!(metrics.get("png.trailing_iend_count"), Some(0.0));
+    assert!(values.get("png.trailing_iend_offsets").is_none());
+}
+
+#[test]
+fn contiguous_post_iend_chunks_are_not_unframed_residue() {
+    let bytes = build_png(&[(b"IEND", &[]), (b"IEND", &[])]);
+    let (values, metrics) = run(&bytes);
+    assert_eq!(metrics.get("png.trailing_iend_count"), Some(0.0));
+    assert_eq!(metrics.get("png.trailing_chunk_count"), Some(1.0));
+    assert!(values.get("png.trailing_iend_offsets").is_none());
+}
+
+#[test]
+fn iend_suffix_never_hides_an_appended_executable() {
+    let mut bytes = build_png(&[(b"IEND", &[])]);
+    let first_end = bytes.len();
+    let mut pe = vec![0u8; 2048];
+    pe[..2].copy_from_slice(b"MZ");
+    pe[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+    pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+    bytes.extend_from_slice(&pe);
+    bytes.extend_from_slice(b"\0\0\0\0IEND\xae\x42\x60\x82");
+    let (values, metrics) = run(&bytes);
+    assert_eq!(metrics.get("png.trailing_iend_count"), Some(1.0));
+    assert_eq!(
+        metrics.get("png.trailing_bytes"),
+        Some((bytes.len() - first_end) as f64)
+    );
+    assert!(
+        values
+            .get("media.stowaway")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .contains(&json!("pe"))
+    );
+}
+
+#[test]
+fn iend_trailer_offsets_are_bounded_but_all_records_count() {
+    let mut bytes = build_png(&[(b"IEND", &[])]);
+    bytes.extend_from_slice(b"unframed");
+    for _ in 0..70 {
+        bytes.extend_from_slice(b"\0\0\0\0IEND\xae\x42\x60\x82");
+    }
+    let (values, metrics) = run(&bytes);
+    assert_eq!(metrics.get("png.trailing_iend_count"), Some(70.0));
+    assert_eq!(
+        values
+            .get("png.trailing_iend_offsets")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert!(
+        values
+            .get("png.limits")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r.get("stage").and_then(JsonValue::as_str) == Some("trailer-iend-list"))
+    );
+}
