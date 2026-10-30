@@ -682,7 +682,14 @@ pub(crate) fn extract(
             Ok(())
         }
         FileType::PythonBytecode => {
-            pyc::extract(bytes, ctx.values, ctx.strings, ctx.metrics);
+            pyc::extract(
+                bytes,
+                ctx.values,
+                ctx.strings,
+                ctx.metrics,
+                ctx.symbols,
+                ctx.errors,
+            );
             Ok(())
         }
         FileType::Rpm => rpm::extract(bytes, ctx.values, ctx.strings, ctx.metrics, ctx.errors),

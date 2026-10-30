@@ -1,12 +1,11 @@
 //! Python compiled bytecode (`.pyc`) extractor.
 //!
-//! Marshal-format-agnostic: surfaces the fixed 16-byte header
+//! Surfaces the fixed 16-byte header
 //! (magic + flags + timestamp/hash + source-size) and recovers
 //! source-filename strings by scanning the body for ASCII byte
 //! runs ending in `.py` / `.pyx` / `.pyw` / `.pyi`. The marshal
-//! stream itself isn't decoded — `co_filename` paths land in the
-//! body contiguously regardless of marshal opcode, so a substring
-//! pass catches them without a version-specific decoder.
+//! stream also supplies bounded code-object identifier tables for supported
+//! versions. Constant/documentation strings never become identifier facts.
 //!
 //! Schema:
 //!
@@ -24,7 +23,9 @@ use crate::value_key;
 use serde_json::Value as JsonValue;
 
 use crate::formats::common::{XorScan, extract_binary_strings, hex_encode, put_str};
-use crate::output::{Metrics, Strings, Values};
+use crate::output::{Errors, Metrics, Stage, Strings, Symbols, Values};
+
+mod names;
 
 /// Cap on body bytes scanned for source-filename strings. Real
 /// `co_filename` paths sit very early in the marshal stream; the
@@ -38,6 +39,8 @@ pub(super) fn extract(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
+    symbols: &mut Symbols,
+    errors: &mut Errors,
 ) {
     extract_binary_strings(bytes, strings, XorScan::No);
 
@@ -69,6 +72,12 @@ pub(super) fn extract(
     );
     if let Some(ver) = python_version_for_magic(magic_word) {
         put_str(values, value_key!("pyc.python_version"), ver);
+        if let Some(minor) = ver.strip_prefix("3.").and_then(|s| s.parse::<u8>().ok())
+            && (8..=14).contains(&minor)
+            && let Err(message) = names::extract(rest, minor, symbols)
+        {
+            errors.record_malformed(Stage::FormatExtract, format!("Python marshal: {message}"));
+        }
     }
     if is_hash_based {
         // A presence-only key rather than an `is_hash_based` bool:
@@ -112,6 +121,7 @@ fn python_version_for_magic(magic: u16) -> Option<&'static str> {
         3450..=3495 => Some("3.11"),
         3500..=3531 => Some("3.12"),
         3550..=3571 => Some("3.13"),
+        3627 => Some("3.14"),
         _ => None,
     }
 }

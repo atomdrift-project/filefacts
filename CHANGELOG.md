@@ -22,9 +22,9 @@ is listed under **Changed** with the new value.
 - Bounded PNG pixel-payload probes for channel/bit-plane packing, traversal
   swaps, prime pixels and transparent RGB; Base64, hex, UTF-16, single-byte
   XOR, and checksum-validated zlib/gzip transforms. Script, configuration and
-  binary-format recognition emit recovered layouts and
-  bounded previews are in `png.pixel_payloads`; probe budgets and limits are
-  observable without treating random pixels alone as a recovered payload.
+  binary-format recognition emit recovered layouts and bounded previews in
+  `png.pixel_payloads`; probe budgets and limits are observable without
+  treating random pixels alone as a recovered payload.
 - `filefacts::{Bundle, View, ViewData}` with `ParsedFile::bundle()` and
   `ParsedFile::view()`: the CLI's versioned JSON document, now part of the
   library. The JSON is byte-identical to what the CLI wrote before.

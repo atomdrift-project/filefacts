@@ -1,4 +1,5 @@
 use super::*;
+use crate::output::Symbol;
 
 fn build_pyc(magic_word: u16, flags: u32, ts: u32, sz: u32, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 + body.len());
@@ -15,8 +16,108 @@ fn run(bytes: &[u8]) -> (Values, Metrics) {
     let mut v = Values::new();
     let mut s = Strings::default();
     let mut m = Metrics::new();
-    extract(bytes, &mut v, &mut s, &mut m);
+    extract(
+        bytes,
+        &mut v,
+        &mut s,
+        &mut m,
+        &mut Symbols::new(),
+        &mut Errors::new(),
+    );
     (v, m)
+}
+
+fn identifiers(bytes: &[u8]) -> (Symbols, Errors) {
+    let mut symbols = Symbols::new();
+    let mut errors = Errors::new();
+    extract(
+        bytes,
+        &mut Values::new(),
+        &mut Strings::default(),
+        &mut Metrics::new(),
+        &mut symbols,
+        &mut errors,
+    );
+    (symbols, errors)
+}
+
+#[test]
+fn python_314_names_are_identifiers_but_catalog_constants_are_not() {
+    let code = include_bytes!("../../../testdata/pyc/names-314.pyc");
+    let (symbols, errors) = identifiers(code);
+    assert!(errors.is_empty(), "{errors:?}");
+    for name in ["keyboard", "on_press", "slice", "frozenset"] {
+        assert!(symbols.iter().any(|s| s.name() == Some(name)), "{name}");
+    }
+    let (symbols, errors) = identifiers(include_bytes!("../../../testdata/pyc/strings-314.pyc"));
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(
+        symbols.iter().next().and_then(Symbol::name),
+        Some("CATALOG")
+    );
+    let (values, _) = run(code);
+    assert_eq!(
+        values.get("pyc.python_version").and_then(|v| v.as_str()),
+        Some("3.14")
+    );
+}
+
+#[test]
+fn python_311_code_layout_keeps_offsets_into_original_bytes() {
+    let code = include_bytes!("../../../testdata/pyc/names-311.pyc");
+    let (symbols, errors) = identifiers(code);
+    assert!(errors.is_empty(), "{errors:?}");
+    for name in ["strip", "replace", "startswith", "lstrip"] {
+        let symbol = symbols.iter().find(|s| s.name() == Some(name)).unwrap();
+        let Symbol::Identifier {
+            offset: Some(offset),
+            ..
+        } = symbol
+        else {
+            panic!("identifier offset missing")
+        };
+        assert_eq!(
+            &code[*offset as usize..*offset as usize + name.len()],
+            name.as_bytes()
+        );
+    }
+}
+
+#[test]
+fn truncated_nested_code_never_leaks_partial_identifier_facts() {
+    let code = include_bytes!("../../../testdata/pyc/names-314.pyc");
+    for end in 16..code.len() {
+        let (symbols, errors) = identifiers(&code[..end]);
+        assert!(
+            symbols.is_empty(),
+            "partial identifiers at truncation {end}"
+        );
+        assert!(!errors.is_empty(), "missing diagnostic at {end}");
+    }
+}
+
+#[test]
+fn malformed_or_excessive_marshal_inputs_are_recoverable() {
+    for body in [
+        b"c\0\0".as_slice(),
+        b"r\xff\xff\xff\x7f".as_slice(),
+        b"c\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0(\xff\xff\xff\x7f".as_slice(),
+    ] {
+        let bytes = build_pyc(3627, 0, 0, 0, body);
+        let (symbols, errors) = identifiers(&bytes);
+        assert!(symbols.is_empty());
+        assert!(!errors.is_empty());
+    }
+    let mut body = b"c".to_vec();
+    body.extend_from_slice(&[0; 20]);
+    for _ in 0..100 {
+        body.extend_from_slice(b")\x01");
+    }
+    body.push(b'N');
+    let (symbols, errors) = identifiers(&build_pyc(3627, 0, 0, 0, &body));
+    assert!(symbols.is_empty());
+    assert!(!errors.is_empty());
 }
 
 #[test]
