@@ -888,3 +888,12 @@ fn java_wildcards_do_not_hide_real_php_tags() {
         assert_eq!(detect_from_content(mixed), Some(FileType::Php));
     }
 }
+
+#[test]
+fn java_wildcard_does_not_hide_short_php_function_call() {
+    // PHP may call a user-defined function named super with whitespace before
+    // its parenthesis. A Java wildcard bound must start with a type name.
+    let php = b"<? super ($_POST['code']); ?>";
+    assert!(super::has_php_tag(php));
+    assert_eq!(detect_from_content(php), Some(FileType::Php));
+}

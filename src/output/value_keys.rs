@@ -501,6 +501,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "media.php.request_calls",
     "media.problems",
     "media.stowaway",
+    "media.trailing_content_kind",
     "media.valid",
     "nib.actions",
     "nib.archiver",

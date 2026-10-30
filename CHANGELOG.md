@@ -10,6 +10,10 @@ is listed under **Changed** with the new value.
 
 ### Added
 
+- `media.trailing_content_kind` identifies the actual trailing region separately
+  from executable/archive signatures in metadata or interior gaps. This prevents
+  assigning an unrelated embedded header to an ordinary image trailer.
+
 - PNG trailer context: `png.trailing_iend_count`, bounded absolute byte offsets
   in `png.trailing_iend_offsets`, and `trailer_ends_with_iend` in features. These
   CRC-correct byte records can support investigating image overwrite residue;

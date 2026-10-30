@@ -223,3 +223,72 @@ fn cabinet_candidate_requires_bounded_header_and_searches_past_false_magic() {
     assert!(!find_cab(&cab));
     assert!(!find_cab(b"MSCF"));
 }
+
+#[test]
+fn trailer_kind_is_distinct_from_claimed_metadata_and_interior_holes() {
+    let pe = fake_pe(1024);
+    let mut bytes = vec![0; 64];
+    bytes.extend_from_slice(&pe);
+    let end = bytes.len();
+    bytes.extend_from_slice(b"ordinary unframed trailing text without an executable");
+    bytes.extend_from_slice(b" and sufficient length to exceed the coverage floor");
+    let mut coverage = Coverage::new("test", 8);
+    coverage.claim(8, 64);
+    coverage.claim_freeform(64, end as u64);
+    let (values, _) = run(&coverage, &bytes);
+    assert!(stow(&values).contains(&"pe".to_string()));
+    assert_eq!(
+        values.get("media.trailing_content_kind"),
+        Some(&serde_json::json!("text"))
+    );
+
+    // A program in an interior hole is likewise not a program in the tail.
+    coverage.claims.clear();
+    coverage.claim(end as u64 - 16, end as u64);
+    let (values, _) = run(&coverage, &bytes);
+    assert!(stow(&values).contains(&"pe".to_string()));
+    assert_eq!(
+        values.get("media.trailing_content_kind"),
+        Some(&serde_json::json!("text"))
+    );
+}
+
+#[test]
+fn executable_trailer_retains_location_when_metadata_is_ordinary() {
+    let mut bytes = vec![0; 64];
+    bytes.extend_from_slice(&fake_pe(1024));
+    let mut coverage = Coverage::new("test", 8);
+    coverage.claim(8, 64);
+    let (values, _) = run(&coverage, &bytes);
+    assert_eq!(
+        values.get("media.trailing_content_kind"),
+        Some(&serde_json::json!("pe"))
+    );
+}
+
+#[test]
+fn no_trailer_kind_is_invented_for_covered_or_opaque_unrecognized_data() {
+    let bytes = vec![0; 512];
+    let mut coverage = Coverage::new("test", 8);
+    coverage.claim(8, bytes.len() as u64);
+    assert!(
+        run(&coverage, &bytes)
+            .0
+            .get("media.trailing_content_kind")
+            .is_none()
+    );
+    assert!(
+        run(&Coverage::unrecognized(), &bytes)
+            .0
+            .get("media.trailing_content_kind")
+            .is_none()
+    );
+    let mut high = vec![0; 64];
+    high.extend((0..=255u8).cycle().take(2048));
+    coverage.claims.clear();
+    coverage.claim(8, 64);
+    assert_eq!(
+        run(&coverage, &high).0.get("media.trailing_content_kind"),
+        Some(&serde_json::json!("high_entropy"))
+    );
+}

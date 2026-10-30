@@ -140,22 +140,25 @@ pub(crate) fn emit(bytes: &[u8], coverage: &Coverage, values: &mut Values, metri
     let mut stowaway: Vec<&'static str> = Vec::new();
     let mut stowaway_bytes: u64 = 0;
     let mut stowaway_entropy: f64 = 0.0;
+    let mut trailing_content_kind = None;
     let mut problems = coverage.problems.clone();
 
     let mut note = |region: &[u8], counted: bool, allow_text: bool, out: &mut Vec<&'static str>| {
         if region.is_empty() {
-            return;
+            return None;
         }
         if counted {
             stowaway_bytes = stowaway_bytes.saturating_add(region.len() as u64);
             stowaway_entropy = stowaway_entropy.max(entropy::shannon(region));
         }
-        if let Some(kind) = classify_region(region) {
+        let kind = classify_region(region);
+        if let Some(kind) = kind {
             let expected_text = !allow_text && matches!(kind, "text" | "base64" | "high_entropy");
             if !expected_text && !out.contains(&kind) {
                 out.push(kind);
             }
         }
+        kind
     };
 
     // Freeform regions are legitimately claimed content, so they are searched
@@ -223,7 +226,7 @@ pub(crate) fn emit(bytes: &[u8], coverage: &Coverage, values: &mut Values, metri
             return;
         };
         if let Some(region) = bytes.get(a..b.min(bytes.len())) {
-            note(region, true, true, &mut stowaway);
+            trailing_content_kind = note(region, true, true, &mut stowaway);
         }
         // `logical_end` is the extent accounted for by the parser. A
         // failed walk does not establish that a real trailer was reached.
@@ -252,6 +255,12 @@ pub(crate) fn emit(bytes: &[u8], coverage: &Coverage, values: &mut Values, metri
         let kind = classify_region(bytes).unwrap_or("unknown");
         values.insert_key(
             value_key!("media.content_kind"),
+            JsonValue::String(kind.to_string()),
+        );
+    }
+    if let Some(kind) = trailing_content_kind {
+        values.insert_key(
+            value_key!("media.trailing_content_kind"),
             JsonValue::String(kind.to_string()),
         );
     }

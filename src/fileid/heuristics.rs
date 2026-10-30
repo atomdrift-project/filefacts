@@ -1380,7 +1380,17 @@ fn has_php_tag(data: &[u8]) -> bool {
                     .iter()
                     .any(|keyword| {
                         bound.starts_with(keyword)
-                            && bound.get(keyword.len()).is_some_and(u8::is_ascii_whitespace)
+                            && bound
+                                .get(keyword.len())
+                                .is_some_and(u8::is_ascii_whitespace)
+                            && bound[keyword.len()..]
+                                .trim_ascii_start()
+                                .first()
+                                .is_some_and(|b| {
+                                    b.is_ascii_alphabetic()
+                                        || matches!(*b, b'_' | b'$')
+                                        || *b >= 0x80
+                                })
                     }));
         if after
             .get(..3)
