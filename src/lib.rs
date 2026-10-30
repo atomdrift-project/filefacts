@@ -139,6 +139,14 @@ pub use tree_sitter;
 // re-exported here so every module imports them as `crate::metric`.
 pub(crate) use output::{metric, value_key};
 
+/// Bounded static recovery of supported PyArmor layouts using a companion runtime.
+/// Recovery never executes Python objects or the native runtime.
+pub mod pyarmor {
+    pub use crate::formats::pyarmor::{
+        RecoveredPyc, Recovery, is_container, python_containers, recover,
+    };
+}
+
 pub mod cache;
 pub mod fileid;
 mod tools;

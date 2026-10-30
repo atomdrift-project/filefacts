@@ -145,6 +145,8 @@ is listed under **Changed** with the new value.
 - `font.layout_format` retains a structurally coherent WOFF whose signature
   bytes were reordered, while `font.format` stays `none` and `font.valid`
   stays false; corrupt decoder fixtures no longer become opaque payloads.
+- Media-carrier CAB candidates require a bounded, versioned fixed header;
+  ASCII `MSCF` in diagram/Base64 metadata is not an embedded cabinet.
 - Media-carrier gzip findings validate reserved header flags and a bounded
   deflate stream, avoiding three-byte magic coincidences inside compressed
   PNG metadata while retaining real compressed stowaways.

@@ -197,3 +197,29 @@ fn large_gzip_is_probed_with_bounded_output() {
     let gzip = compressed_gzip(&vec![b'A'; 1024 * 1024]);
     assert_eq!(classify_region(&gzip), Some("gzip"));
 }
+
+#[test]
+fn cab_ascii_inside_diagram_metadata_is_not_an_archive() {
+    let region = b"diagram=MSCF%2BsrsQL1eNarNwQrSK3R%2B7j3Vch%2BMhE";
+    assert!(!find_cab(region));
+    assert_ne!(classify_region(region), Some("cab"));
+}
+
+#[test]
+fn cabinet_candidate_requires_bounded_header_and_searches_past_false_magic() {
+    let mut cab = vec![0u8; 36];
+    cab[..4].copy_from_slice(b"MSCF");
+    cab[8..12].copy_from_slice(&36u32.to_le_bytes());
+    cab[16..20].copy_from_slice(&36u32.to_le_bytes());
+    cab[24..26].copy_from_slice(&[3, 1]);
+    assert_eq!(classify_region(&cab), Some("cab"));
+    let mut padded = b"MSCF not a cabinet; padding ".to_vec();
+    padded.extend_from_slice(&cab);
+    assert_eq!(classify_region(&padded), Some("cab"));
+    cab[8..12].copy_from_slice(&37u32.to_le_bytes());
+    assert!(!find_cab(&cab));
+    cab[8..12].copy_from_slice(&36u32.to_le_bytes());
+    cab[16..20].copy_from_slice(&37u32.to_le_bytes());
+    assert!(!find_cab(&cab));
+    assert!(!find_cab(b"MSCF"));
+}

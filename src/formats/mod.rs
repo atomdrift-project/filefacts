@@ -159,6 +159,7 @@ mod pkgmeta;
 mod plist_guard;
 mod png;
 mod png_stego;
+pub(crate) mod pyarmor;
 mod pyc;
 mod python_sdist;
 mod rar;

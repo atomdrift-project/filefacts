@@ -173,6 +173,8 @@ der = { version = "0.7", features = ["std"] }
 sha2 = { version = "0.10", features = ["oid"] }
 sha1 = { version = "0.10", features = ["oid"] }
 md-5 = "0.10"
+# Static PyArmor container and nested instruction recovery.
+aes = "0.9"
 
 # Structured logging for extractor, cache and rizin subprocess events. The
 # library only emits; the host installs a subscriber.

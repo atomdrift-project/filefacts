@@ -305,6 +305,9 @@ pub(crate) fn classify_region(region: &[u8]) -> Option<&'static str> {
     if find_gzip(region) {
         return Some("gzip");
     }
+    if find_cab(region) {
+        return Some("cab");
+    }
     // `#!/` is likewise short. A shebang only means anything at the start of a
     // line, which is also the only place an interpreter honours it.
     if starts_line_with(region, b"#!/") {
@@ -319,7 +322,6 @@ pub(crate) fn classify_region(region: &[u8]) -> Option<&'static str> {
         (&b"\xfd7zXZ\x00"[..], "xz"),
         (&b"7z\xbc\xaf\x27\x1c"[..], "sevenz"),
         (&b"Rar!\x1a\x07"[..], "rar"),
-        (&b"MSCF"[..], "cab"),
         (&b"\x28\xb5\x2f\xfd"[..], "zstd"),
     ] {
         if memchr::memmem::find(region, magic).is_some() {
@@ -339,6 +341,33 @@ pub(crate) fn classify_region(region: &[u8]) -> Option<&'static str> {
         return Some("high_entropy");
     }
     None
+}
+
+/// Cabinet magic is ASCII and can occur inside Base64 or diagram metadata.
+/// Require a fixed header with supported version and bounded container/file
+/// offsets; this identifies a candidate, without claiming full CAB validity.
+fn find_cab(region: &[u8]) -> bool {
+    let mut from = 0usize;
+    while let Some(rel) = region
+        .get(from..)
+        .and_then(|rest| memchr::memmem::find(rest, b"MSCF"))
+    {
+        let at = from + rel;
+        if let Some(rest) = region.get(at..)
+            && let Some(header) = rest.first_chunk::<36>()
+            && header[24..26] == [3, 1]
+            && let Some(size) = u32_le(header, 8)
+            && let Some(files) = u32_le(header, 16)
+            && size >= 36
+            && size as usize <= rest.len()
+            && files >= 36
+            && files <= size
+        {
+            return true;
+        }
+        from = at + 4;
+    }
+    false
 }
 
 /// A DOS header whose `e_lfanew` resolves to the `PE\0\0` signature. This is
