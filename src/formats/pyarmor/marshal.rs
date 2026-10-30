@@ -212,9 +212,9 @@ impl<'a> Reader<'a> {
                 .push("instruction nonce-XOR protection remains encrypted");
             return Ok(false);
         }
-        let decrypted =
-            ctr(&code[begin..end], self.key, &nonce).ok_or("instruction cipher failed")?;
-        code[begin..end].copy_from_slice(&decrypted);
+        let region = code.get_mut(begin..end).ok_or("invalid encrypted region")?;
+        let decrypted = ctr(region, self.key, &nonce).ok_or("instruction cipher failed")?;
+        region.copy_from_slice(&decrypted);
         if flags & 8 != 0 {
             let tail = length.checked_add(begin).ok_or("prologue overflow")?;
             if tail > code.len() {
