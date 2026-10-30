@@ -11,6 +11,7 @@ fn document_splits_into_values_and_metrics() {
         "author": "azer",
         "license": "WTFPL",
         "downloads_recent": 5_441_645u64,
+        "favorites": 88_739u64,
         "deprecated": "use String.prototype.padStart()",
         "maintainers": 2
     })
@@ -35,6 +36,7 @@ fn document_splits_into_values_and_metrics() {
     // Counted/measured → metrics, thresholdable by trait `min`/`max`.
     assert_eq!(metrics.get("registry.age_days"), Some(100.0));
     assert_eq!(metrics.get("registry.downloads_recent"), Some(5_441_645.0));
+    assert_eq!(metrics.get("registry.favorites"), Some(88_739.0));
     assert_eq!(metrics.get("registry.maintainer_count"), Some(2.0));
     assert_eq!(metrics.get("registry.is_deprecated"), Some(1.0));
     // Absent optionals are skipped, not zero-filled.

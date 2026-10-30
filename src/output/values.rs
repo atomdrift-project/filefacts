@@ -28,6 +28,8 @@ use super::value_keys::ValueKey;
 /// [`VALUE_CATALOG`](crate::VALUE_CATALOG) and written through a key checked
 /// against it at compile time, so a rename fails filefacts' build instead of
 /// silently emptying a reader. The view is read-only outside filefacts.
+/// [`crate::values`] reads the facts consumers act on as typed structs; a
+/// tree retained as JSON becomes a `Values` again with [`Values::from`].
 ///
 /// # Example
 ///
@@ -143,6 +145,15 @@ impl Values {
     /// `true` when the values object has no top-level keys.
     pub fn is_empty(&self) -> bool {
         self.0.as_object().is_none_or(Map::is_empty)
+    }
+}
+
+/// Rebuild the view of a tree retained from an earlier analysis, such as
+/// the JSON `Values` serializes to. Nothing is copied or checked: a root that
+/// is not an object reads as empty.
+impl From<JsonValue> for Values {
+    fn from(value: JsonValue) -> Self {
+        Self(value)
     }
 }
 

@@ -136,11 +136,7 @@ pub(super) fn emit(manifest: &JsonValue, values: &mut Values, metrics: &mut Metr
     // source — a `postinstall` that fetches a remote stage is the classic
     // npm supply-chain vector.
     if let Some(scripts) = obj.get("scripts").and_then(JsonValue::as_object) {
-        for (hook, key) in [
-            ("preinstall", value_key!("npm.scripts.preinstall")),
-            ("install", value_key!("npm.scripts.install")),
-            ("postinstall", value_key!("npm.scripts.postinstall")),
-        ] {
+        for (hook, key) in crate::values::NPM_INSTALL_HOOKS {
             if let Some(cmd) = scripts.get(hook).and_then(JsonValue::as_str) {
                 values.insert_key(key, JsonValue::String(cmd.to_string()));
             }

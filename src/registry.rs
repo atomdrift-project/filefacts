@@ -222,6 +222,10 @@ pub struct Registry {
     pub rating: Option<f32>,
     /// Number of ratings/votes behind [`rating`](Self::rating).
     pub rating_count: Option<u64>,
+    /// Users who starred, liked, or favorited the package (GitHub stars,
+    /// Hugging Face likes, Docker Hub stars, Packagist favers). A popularity
+    /// count with no score behind it, unlike [`rating_count`](Self::rating_count).
+    pub favorites: Option<u64>,
     /// Deprecation notice when the registry flags the release or package.
     pub deprecated: Option<String>,
     /// Count of maintainers/owners, a thin custody signal.
@@ -326,6 +330,7 @@ impl Registry {
             downloads_recent: None,
             rating: None,
             rating_count: None,
+            favorites: None,
             deprecated: None,
             maintainers: None,
             first_published_at: None,
@@ -471,6 +476,10 @@ impl Registry {
         num(
             metric!("registry.rating_count"),
             self.rating_count.map(|v| v as f64),
+        );
+        num(
+            metric!("registry.favorites"),
+            self.favorites.map(|v| v as f64),
         );
         num(
             metric!("registry.maintainer_count"),

@@ -142,6 +142,7 @@ pub(crate) use output::{metric, value_key};
 pub mod cache;
 pub mod fileid;
 mod tools;
+pub mod values;
 
 /// Optional rizin integration with hardened subprocess
 /// discipline (RLIMIT, PR_SET_PDEATHSIG, process-group SIGKILL on

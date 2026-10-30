@@ -10,6 +10,15 @@ is listed under **Changed** with the new value.
 
 ### Added
 
+- `Registry::favorites` and the `registry.favorites` metric: stars, likes,
+  or favers, a popularity count with no score behind it (unlike
+  `rating_count`, the votes behind `rating`).
+- `filefacts::values`: typed, borrowing reads of the value facts consumers act
+  on, from any `&Values`, live or retained: `basename`, `npm_install_hooks`,
+  `batch_command_sites` (as `BatchCommandSite`) and
+  `batch_command_sites_truncated`. Their producers write through the same
+  declarations, so the JSON output is unchanged.
+- `impl From<serde_json::Value> for Values`, to read a tree retained as JSON.
 - `filefacts::{Bundle, View, ViewData}` with `ParsedFile::bundle()` and
   `ParsedFile::view()`: the CLI's versioned JSON document, now part of the
   library. The JSON is byte-identical to what the CLI wrote before.

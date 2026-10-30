@@ -2,6 +2,7 @@
 //! expanded argv: CMD quoting, percent expansion and program-specific parsing
 //! must not be guessed by the producer. Consumers can recognize fixed recipes.
 use super::visit::{NodeIds, Visit};
+use crate::values::BatchCommandSite;
 use crate::{Values, value_key};
 
 const MAX_SITES: usize = 128;
@@ -48,8 +49,13 @@ impl Collector {
             return;
         }
         self.bytes += text.len();
-        self.sites.push(serde_json::json!({"name": name_text, "text": text,
-            "offset": node.start_byte(), "name_offset": name.start_byte(), "name_end": name.end_byte()}));
+        self.sites.push(serde_json::json!(BatchCommandSite {
+            name: name_text,
+            text,
+            offset: node.start_byte() as u64,
+            name_offset: name.start_byte() as u64,
+            name_end: name.end_byte() as u64,
+        }));
     }
 
     /// Write `source.batch.command_sites*`.

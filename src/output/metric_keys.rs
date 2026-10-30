@@ -822,6 +822,7 @@ pub const CATALOG: &[&str] = &[
     "registry.days_since_previous_release",
     "registry.downloads_recent",
     "registry.downloads_total",
+    "registry.favorites",
     "registry.file_count",
     "registry.first_published_unix",
     "registry.has_install_script",
