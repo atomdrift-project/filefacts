@@ -143,3 +143,57 @@ fn alignment_padding_is_not_a_hole() {
     let (_, m) = run(&c, &bytes);
     assert_eq!(m.get("media.gap_bytes"), Some(0.0));
 }
+
+fn compressed_gzip(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::GzBuilder::new()
+        .filename("payload.txt")
+        .comment("carrier regression")
+        .write(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
+
+#[test]
+fn invalid_gzip_header_in_claimed_metadata_is_not_an_archive() {
+    // Bytes observed inside the valid zTXt stream of ws-about-codecs.png.
+    // 0x8e sets reserved gzip flags, so this is not a gzip header.
+    let mut bytes = vec![0u8; 64];
+    bytes.extend_from_slice(b"\x1f\x8b\x08\x8e\x9f\xd4\x9b\x17\x23\x39\x83\xa4");
+    bytes.resize(512, 0);
+    let mut coverage = Coverage::new("test", 8);
+    coverage.claim(8, 64);
+    coverage.claim_freeform(64, 512);
+    let (values, metrics) = run(&coverage, &bytes);
+    assert!(!stow(&values).contains(&"gzip".to_string()));
+    assert_eq!(metrics.get("media.stowaway_bytes"), Some(0.0));
+}
+
+#[test]
+fn gzip_stowaway_survives_padding_optional_headers_and_bad_magic() {
+    let gzip = compressed_gzip(b"printf 'carrier regression\\n'; id; uname -s\n");
+    let mut region = b"padding\x1f\x8b\x08\x8e invalid candidate; ".to_vec();
+    region.extend_from_slice(&gzip);
+    assert_eq!(classify_region(&region), Some("gzip"));
+    let mut bytes = vec![0u8; 64];
+    bytes.extend_from_slice(&region);
+    let mut coverage = Coverage::new("test", 8);
+    coverage.claim_freeform(8, bytes.len() as u64);
+    assert!(stow(&run(&coverage, &bytes).0).contains(&"gzip".to_string()));
+}
+
+#[test]
+fn gzip_magic_requires_a_valid_stream_and_small_member_checksum() {
+    assert_ne!(classify_region(b"prefix\x1f\x8b\x08"), Some("gzip"));
+    let mut gzip = compressed_gzip(b"ordinary compressed data");
+    assert_eq!(classify_region(&gzip), Some("gzip"));
+    let checksum = gzip.len() - 8;
+    *gzip.get_mut(checksum).unwrap() ^= 1;
+    assert_ne!(classify_region(&gzip), Some("gzip"));
+}
+
+#[test]
+fn large_gzip_is_probed_with_bounded_output() {
+    let gzip = compressed_gzip(&vec![b'A'; 1024 * 1024]);
+    assert_eq!(classify_region(&gzip), Some("gzip"));
+}

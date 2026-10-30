@@ -322,6 +322,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "font.content_kind",
     "font.features",
     "font.format",
+    "font.layout_format",
     "font.problems",
     "font.sfnt_version",
     "font.stowaway",

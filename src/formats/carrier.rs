@@ -29,6 +29,7 @@
 //! duplicating it here would fork that capability for no gain.
 
 use serde_json::Value as JsonValue;
+use std::io::{Read, sink};
 
 use crate::formats::common::bytes_at::u32_le;
 use crate::metric;
@@ -301,6 +302,9 @@ pub(crate) fn classify_region(region: &[u8]) -> Option<&'static str> {
     if find_bzip2(region) {
         return Some("bzip2");
     }
+    if find_gzip(region) {
+        return Some("gzip");
+    }
     // `#!/` is likewise short. A shebang only means anything at the start of a
     // line, which is also the only place an interpreter honours it.
     if starts_line_with(region, b"#!/") {
@@ -312,7 +316,6 @@ pub(crate) fn classify_region(region: &[u8]) -> Option<&'static str> {
         (&b"\xce\xfa\xed\xfe"[..], "macho"),
         (&b"\xca\xfe\xba\xbe"[..], "macho"),
         (&b"PK\x03\x04"[..], "zip"),
-        (&b"\x1f\x8b\x08"[..], "gzip"),
         (&b"\xfd7zXZ\x00"[..], "xz"),
         (&b"7z\xbc\xaf\x27\x1c"[..], "sevenz"),
         (&b"Rar!\x1a\x07"[..], "rar"),
@@ -376,6 +379,34 @@ fn find_bzip2(region: &[u8]) -> bool {
             && magic == b"\x31\x41\x59\x26\x53\x59"
         {
             return true;
+        }
+        from = at + 3;
+    }
+    false
+}
+
+/// Validate a gzip member rather than treating its three magic bytes as an
+/// archive. Compressed PNG metadata can contain that triplet by chance. Both
+/// compressed input and produced output are bounded; reaching the output cap
+/// proves a coherent deflate prefix, not a complete member/checksum.
+fn find_gzip(region: &[u8]) -> bool {
+    const INPUT_CAP: usize = 256 * 1024;
+    const OUTPUT_CAP: u64 = 64 * 1024;
+    let mut from = 0usize;
+    while let Some(rel) = region
+        .get(from..)
+        .and_then(|rest| memchr::memmem::find(rest, b"\x1f\x8b\x08"))
+    {
+        let at = from + rel;
+        if let Some(rest) = region.get(at..)
+            && let Some([_, _, _, flags, ..]) = rest.first_chunk::<10>()
+            && flags & 0xe0 == 0
+            && let Some(probe) = rest.get(..rest.len().min(INPUT_CAP))
+        {
+            let mut decoded = flate2::read::GzDecoder::new(probe).take(OUTPUT_CAP);
+            if std::io::copy(&mut decoded, &mut sink()).is_ok() {
+                return true;
+            }
         }
         from = at + 3;
     }

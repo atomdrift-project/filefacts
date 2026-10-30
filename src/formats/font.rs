@@ -199,12 +199,29 @@ pub(super) fn extract(
         Format::Woff2 => walk_woff2(bytes, &mut report),
         Format::Eot => walk_eot(bytes, &mut report),
         Format::None => {
-            report.problem("no font signature");
-            // Nothing here is a font, so say what it is instead. The file was
-            // typed `font` by its name alone: the bytes carry no magic of their
-            // own (a raw compressed blob, an encrypted stage, base64), so no
-            // other extractor claimed them.
-            report.content_kind = classify_region(bytes).or(Some("unknown"));
+            // A transposed signature does not erase a coherent WOFF header
+            // and table directory. Keep the signature failure, but do not
+            // call the otherwise fully framed font an opaque encrypted blob.
+            let recovered = reordered_woff_header(bytes).then(|| {
+                let mut candidate = Report {
+                    structure_ok: true,
+                    scan_budget: (bytes.len() as u64).saturating_mul(SCAN_PASSES),
+                    ..Report::default()
+                };
+                walk_woff(bytes, &mut candidate);
+                candidate
+            });
+            if let Some(candidate) = recovered.filter(|r| r.structure_ok) {
+                report = candidate;
+                report.problem("font signature bytes are reordered");
+                values.insert_key(
+                    value_key!("font.layout_format"),
+                    JsonValue::String("woff".to_string()),
+                );
+            } else {
+                report.problem("no font signature");
+                report.content_kind = classify_region(bytes).or(Some("unknown"));
+            }
         }
     }
 
@@ -349,6 +366,28 @@ fn classify(bytes: &[u8]) -> Format {
         return Format::Eot;
     }
     Format::None
+}
+
+/// A reordered WOFF signature is a corruption candidate only when the
+/// flavor, declared length, reserved field and nonempty table count also fit.
+/// The full WOFF walk must then validate its directory and byte coverage.
+fn reordered_woff_header(bytes: &[u8]) -> bool {
+    let Some(mut magic) = bytes.first_chunk::<4>().copied() else {
+        return false;
+    };
+    magic.sort_unstable();
+    magic == *b"FFOw"
+        && bytes.get(4..8).is_some_and(|flavor| {
+            matches!(flavor, b"OTTO" | b"true" | b"typ1" | b"\x00\x01\x00\x00")
+        })
+        && u32_be(bytes, 8).is_some_and(|len| u64::from(len) == bytes.len() as u64)
+        && bytes.get(14..16) == Some(&[0, 0])
+        && bytes
+            .get(12..14)
+            .and_then(<[u8]>::first_chunk::<2>)
+            .is_some_and(|count| {
+                (1..=MAX_TABLES).contains(&usize::from(u16::from_be_bytes(*count)))
+            })
 }
 
 /// Walk an sfnt table directory starting at `base`, returning its entries and

