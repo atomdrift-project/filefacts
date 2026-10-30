@@ -220,7 +220,13 @@ fn repeated_unknown_chunk_type_is_listed_once() {
         .unwrap();
     assert_eq!(unknown.len(), 1);
     assert_eq!(m.get("png.unknown_chunk_count"), Some(1000.0));
-    assert!(v.get("png.limits").is_none());
+    assert!(
+        !v.get("png.limits")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+            .any(|limit| limit.get("stage").and_then(JsonValue::as_str) == Some("chunk-list"))
+    );
 }
 
 #[test]

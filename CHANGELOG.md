@@ -19,6 +19,12 @@ is listed under **Changed** with the new value.
   `batch_command_sites_truncated`. Their producers write through the same
   declarations, so the JSON output is unchanged.
 - `impl From<serde_json::Value> for Values`, to read a tree retained as JSON.
+- Bounded PNG pixel-payload probes for channel/bit-plane packing, traversal
+  swaps, prime pixels and transparent RGB; Base64, hex, UTF-16, single-byte
+  XOR, and checksum-validated zlib/gzip transforms. Script, configuration and
+  binary-format recognition emit recovered layouts and
+  bounded previews are in `png.pixel_payloads`; probe budgets and limits are
+  observable without treating random pixels alone as a recovered payload.
 - `filefacts::{Bundle, View, ViewData}` with `ParsedFile::bundle()` and
   `ParsedFile::view()`: the CLI's versioned JSON document, now part of the
   library. The JSON is byte-identical to what the CLI wrote before.
@@ -51,7 +57,9 @@ is listed under **Changed** with the new value.
 
 ### Changed
 
-- **`SCHEMA_VERSION` is now `10`.** Renamed or reshaped keys:
+- **`SCHEMA_VERSION` is now `11`.** Renamed or reshaped keys:
+  - PNG `image.*` statistics normalize palette and 16-bit samples rather than
+    counting palette indices or alternating bytes as color samples.
   - `cert_chain_depth` → `cert_bag_size` in every signature object;
     timestamp times are RFC 3339.
   - `elf.hashes.imphash` → `elf.hashes.import_hash`,

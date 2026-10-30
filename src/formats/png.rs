@@ -326,7 +326,7 @@ pub(super) fn extract(
     // Best-effort pixel-statistic pass. Decoder errors are swallowed —
     // a PNG with a corrupted IDAT chunk or unsupported color depth
     // still gets the structural metrics above.
-    extract_pixel_stats(bytes, metrics);
+    extract_pixel_stats(bytes, values, metrics);
 }
 
 /// Claim the portion of concatenated IDAT data consumed by the first zlib
@@ -413,13 +413,18 @@ fn claim_all_idat(extents: &[IdatExtent], coverage: &mut Coverage) {
 /// compression ratio, and PNG-specific alpha entropy.
 /// Whole-file `file.entropy` is not repeated here: the generic pass emits it
 /// for every file before this extractor runs.
-fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
+fn extract_pixel_stats(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     use png::Decoder;
 
-    let skipped = |reason: &str| {
+    let mut skipped = |reason: &str| {
         tracing::debug!(target: "filefacts::png", stage = "pixel-stats", reason, "pixel statistics skipped");
+        let mut limits = super::bounded::Limits::default();
+        limits.push("pixel-decode", reason);
+        limits.emit(values, value_key!("png.limits"));
     };
-    let mut reader = match Decoder::new(std::io::Cursor::new(bytes)).read_info() {
+    let mut decoder = Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND);
+    let mut reader = match decoder.read_info() {
         Ok(reader) => reader,
         Err(e) => return skipped(&format!("header did not decode: {e}")),
     };
@@ -427,7 +432,7 @@ fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
     let width = info.width;
     let height = info.height;
     let bit_depth = info.bit_depth as u32;
-    let channels: u32 = match info.color_type {
+    let channels: u32 = match reader.output_color_type().0 {
         png::ColorType::Grayscale | png::ColorType::Indexed => 1,
         png::ColorType::GrayscaleAlpha => 2,
         png::ColorType::Rgb => 3,
@@ -463,6 +468,54 @@ fn extract_pixel_stats(bytes: &[u8], metrics: &mut Metrics) {
         1.0
     };
 
+    // PNG stores 16-bit samples big endian. Probe both byte lanes; image
+    // statistics describe normalized 8-bit samples rather than alternating
+    // high/low bytes or palette indices.
+    let normalized;
+    let pixels = if bit_depth == 16 {
+        let low: Vec<u8> = pixels
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[_, low]| *low)
+            .collect();
+        normalized = pixels
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[high, _]| *high)
+            .collect::<Vec<_>>();
+        super::png_stego::extract(
+            &low,
+            width as usize,
+            height as usize,
+            channels as usize,
+            "u16-low",
+            values,
+            metrics,
+        );
+        super::png_stego::extract(
+            &normalized,
+            width as usize,
+            height as usize,
+            channels as usize,
+            "u16-high",
+            values,
+            metrics,
+        );
+        normalized.as_slice()
+    } else {
+        super::png_stego::extract(
+            pixels,
+            width as usize,
+            height as usize,
+            channels as usize,
+            "u8",
+            values,
+            metrics,
+        );
+        pixels
+    };
     let pixel_entropy = entropy::shannon(pixels);
     metrics.insert(metric!("image.pixel_entropy"), pixel_entropy);
     metrics.insert(metric!("image.histogram_flatness"), pixel_entropy / 8.0);

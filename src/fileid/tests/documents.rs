@@ -569,3 +569,22 @@ fn scripts_under_image_extensions_keep_their_content_type() {
         assert!(id.extension_mismatch());
     }
 }
+
+#[test]
+fn tab_indented_python_bare_except_is_not_a_make_target() {
+    let source = b"import socket\nfor attempt in range(3):\n\ttry:\n\t\tstream = socket.socket()\n\t\tstream.connect(('localhost', 8080))\n\t\tbreak\n\texcept:\n\t\tpass\n";
+    assert_detect("stage.py", source, FileType::Python);
+    let valid = b"import socket\ntry:\n\tstream = socket.socket()\nexcept:\n\tpass\n";
+    assert_detect("stage.py", valid, FileType::Python);
+    assert_detect("stage.pyw", valid, FileType::Python);
+    let make = b"except:\n\techo retry\n";
+    assert_detect("Makefile", make, FileType::Makefile);
+}
+
+#[test]
+fn python_namespace_dict_colon_is_not_a_make_target() {
+    let source = b"import socket\nfor attempt in range(3):\n\ttry:\n\t\tstream = socket.socket()\n\texcept:\n\t\tpass\nexec(code,{'stream':stream})\n";
+    assert_detect("stage.py", source, FileType::Python);
+    let source = b"import socket\ntry:\n\tpass\nexcept:\n\tpass\nexec(code,{\"stream\":stream})\n";
+    assert_detect("stage.py", source, FileType::Python);
+}

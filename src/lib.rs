@@ -249,7 +249,7 @@ pub fn known_values() -> (&'static [&'static str], &'static [&'static str]) {
 /// non-breaking and do not bump this version. The on-disk cache has its own
 /// format version, and never serves an entry written by another build of
 /// filefacts: every cache key includes a hash of filefacts' source.
-pub const SCHEMA_VERSION: &str = "10";
+pub const SCHEMA_VERSION: &str = "11";
 
 /// A file with its bytes and lazily-computed metadata views.
 ///
@@ -1407,3 +1407,6 @@ fn canonical_source_language(name: &str) -> &str {
 
 #[cfg(test)]
 mod tests;
+
+/// Structurally framed JVM classes embedded in a JPHP compiled module.
+pub use formats::jphp::class_frames as jphp_class_frames;

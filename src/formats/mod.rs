@@ -158,6 +158,7 @@ mod pkg_arch;
 mod pkgmeta;
 mod plist_guard;
 mod png;
+mod png_stego;
 mod pyc;
 mod python_sdist;
 mod rar;
@@ -891,3 +892,5 @@ pub(crate) fn extract(
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) mod jphp;

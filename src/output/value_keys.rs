@@ -725,6 +725,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "png.icc_profile_name",
     "png.last_modified",
     "png.limits",
+    "png.pixel_payloads",
     "png.text",
     "png.unknown_chunks",
     "pyc.hash",

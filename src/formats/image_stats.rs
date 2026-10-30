@@ -68,9 +68,10 @@ fn tally(histogram: &mut [u32; 256], value: u8) {
 }
 
 /// Fraction of adjacent-pixel pairs (horizontal + vertical) whose
-/// first-channel value differs by more than the edge threshold. Real
-/// imagery shows structured edges; random/encrypted payloads stuffed
-/// into image bytes have very low edge density.
+/// first-channel value differs by more than the edge threshold. This is a
+/// measurement of local contrast, not a steganography verdict: independent
+/// random samples tend to have high edge density, while flat graphics and
+/// smooth gradients tend to have low edge density.
 #[must_use]
 pub(super) fn edge_density(pixels: &[u8], width: usize, height: usize, channels: usize) -> f32 {
     const EDGE_THRESHOLD: i32 = 30;
