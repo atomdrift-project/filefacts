@@ -45,6 +45,26 @@ fn go_mod_content_signature_is_bounded_and_specific() {
 }
 
 #[test]
+fn go_mod_content_signature_needs_the_whole_manifest_grammar() {
+    // A real manifest: directives, a require block, comments.
+    assert!(looks_like_go_mod(
+        b"module example.org/tool\n\ngo 1.23\ntoolchain go1.23.4\n\nrequire (\n\tgolang.org/x/net v0.30.0 // indirect\n\texample.org/lib v1.2.3\n)\n\nreplace example.org/lib => ../lib\n"
+    ));
+    // strong_password 0.0.7: a Ruby module declaration is followed by Ruby.
+    assert!(!looks_like_go_mod(
+        b"module StrongPassword\n  class StrengthChecker\n    BASE_ENTROPY = 18\n  end\nend\n"
+    ));
+    // Fortran and other `module NAME` languages likewise.
+    assert!(!looks_like_go_mod(
+        b"module constants\n  implicit none\ncontains\nend module\n"
+    ));
+    // An unclosed block holds entries, not directives.
+    assert!(looks_like_go_mod(
+        b"module example.org/tool\nrequire (\n\texample.org/lib v1.2.3\n"
+    ));
+}
+
+#[test]
 fn go_mod_content_signature_only_needs_the_prefix() {
     let mut data = b"module example.org/tool\ngo 1.23\n".to_vec();
     data.resize(GO_MOD_HEAD_LIMIT + 256, b' ');

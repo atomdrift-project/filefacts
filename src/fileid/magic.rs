@@ -1546,21 +1546,49 @@ fn launched_interpreter<'a>(words: &mut impl Iterator<Item = &'a [u8]>) -> Optio
 /// Maximum prefix examined when identifying a Go module manifest by content.
 const GO_MOD_HEAD_LIMIT: usize = 4096;
 
-/// Go's module directive is the first non-comment directive in a `go.mod`.
-/// Checking that narrow grammar is constant-space and avoids assigning module
-/// semantics to ordinary prose or Go source declarations such as `export module`.
+/// Directives a `go.mod` may hold after its `module` line.
+const GO_MOD_DIRECTIVES: &[&str] = &[
+    "go",
+    "toolchain",
+    "godebug",
+    "require",
+    "replace",
+    "exclude",
+    "retract",
+    "tool",
+    "ignore",
+];
+
+/// Go's module directive is the first non-comment directive in a `go.mod`, and
+/// every line after it is another directive, a comment, or an entry of a
+/// parenthesized directive block. Checking that narrow grammar is
+/// constant-space and avoids assigning module semantics to ordinary prose,
+/// Go source declarations such as `export module`, or another language's
+/// module declaration — Ruby's `module Name` is followed by Ruby, not by
+/// `require` lines.
 fn looks_like_go_mod(data: &[u8]) -> bool {
+    let truncated = data.len() > GO_MOD_HEAD_LIMIT;
     let head = data.get(..GO_MOD_HEAD_LIMIT).unwrap_or(data);
     let Ok(text) = std::str::from_utf8(head) else {
         return false;
     };
-    let Some(line) = text
+    let mut lines: Vec<&str> = text
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with("//"))
-    else {
+        .filter(|line| !line.is_empty() && !line.starts_with("//"))
+        .collect();
+    // A cut-off final line is not evidence either way.
+    if truncated {
+        lines.pop();
+    }
+    let Some((first, directives)) = lines.split_first() else {
         return false;
     };
+    go_module_directive(first) && go_mod_directives(directives)
+}
+
+/// `module <path>`, with a well-formed module path.
+fn go_module_directive(line: &str) -> bool {
     let Some(rest) = line.strip_prefix("module") else {
         return false;
     };
@@ -1590,6 +1618,27 @@ fn looks_like_go_mod(data: &[u8]) -> bool {
         && path
             .split('/')
             .all(|part| !part.is_empty() && part != "." && part != ".." && !part.starts_with('.'))
+}
+
+/// Whether every line is a `go.mod` directive, or an entry of a `( … )` block.
+fn go_mod_directives(lines: &[&str]) -> bool {
+    let mut in_block = false;
+    lines.iter().all(|line| {
+        if in_block {
+            in_block = !line.starts_with(')');
+            return true;
+        }
+        let keyword = line
+            .split(|c: char| c.is_ascii_whitespace() || c == '(')
+            .next()
+            .unwrap_or_default();
+        if !GO_MOD_DIRECTIVES.contains(&keyword) {
+            return false;
+        }
+        let code = line.split("//").next().unwrap_or(line).trim_end();
+        in_block = code.ends_with('(');
+        true
+    })
 }
 
 #[cfg(test)]

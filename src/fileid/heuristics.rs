@@ -792,7 +792,7 @@ pub(super) fn scored_type(sniff: &Sniff<'_>) -> Option<FileType> {
     // the closing one.
     if lang == Lang::Php {
         let tail = data.get(data.len().saturating_sub(TAIL_SIZE)..);
-        let tagged = has_php_tag(data.get(..SCAN_LIMIT * 2).unwrap_or(data))
+        let tagged = has_php_tag(data)
             || (is_mostly_whitespace(data, SCAN_LIMIT)
                 && data.len() > SCAN_LIMIT
                 && tail.is_some_and(has_php_tag));
@@ -1365,11 +1365,19 @@ fn starts_with_dockerfile_instruction(data: &[u8]) -> bool {
 fn has_php_tag(data: &[u8]) -> bool {
     let mut saw_non_php_open = false;
     let mut rest = data;
-    while let Some(pos) = memchr::memmem::find(rest, b"<?") {
+    let limit = data.len().min(SCAN_LIMIT * 2);
+    let mut examined = 0;
+    // Bound the tag search, but inspect the original suffix. Cutting the
+    // sample through a Java type name must not turn its wildcard into PHP.
+    while examined < limit {
+        let search_len = rest.len().min(limit - examined + 1);
+        let Some(pos) = memchr::memmem::find(&rest[..search_len], b"<?") else {
+            break;
+        };
         let Some(after) = rest.get(pos + 2..) else {
             break;
         };
-        let bound = after.trim_ascii_start();
+        let bound = after.get(..512).unwrap_or(after).trim_ascii_start();
         // Java wildcard bounds in API signature catalogs are not PHP short
         // tags. Nor is Class<?>: its question mark is generic type syntax.
         // These cannot begin valid PHP statements. Continue searching so a
@@ -1379,18 +1387,42 @@ fn has_php_tag(data: &[u8]) -> bool {
                 && [b"extends".as_slice(), b"super".as_slice()]
                     .iter()
                     .any(|keyword| {
-                        bound.starts_with(keyword)
-                            && bound
+                        if !bound.starts_with(keyword)
+                            || !bound
                                 .get(keyword.len())
                                 .is_some_and(u8::is_ascii_whitespace)
-                            && bound[keyword.len()..]
+                        {
+                            return false;
+                        }
+                        let name = bound[keyword.len()..].trim_ascii_start();
+                        let valid_start = name.first().is_some_and(|b| {
+                            b.is_ascii_alphabetic() || matches!(*b, b'_' | b'$') || *b >= 0x80
+                        });
+                        let length = name
+                            .iter()
+                            .take(512)
+                            .take_while(|b| {
+                                b.is_ascii_alphanumeric()
+                                    || matches!(**b, b'_' | b'$' | b'.')
+                                    || **b >= 0x80
+                            })
+                            .count();
+                        // PHP word operators followed by arrays or variables
+                        // can resemble Java type suffixes. Keep PHP for those
+                        // ambiguous names rather than hiding executable input.
+                        let first = name[..length]
+                            .split(|b| matches!(*b, b'.' | b'$'))
+                            .next()
+                            .unwrap_or_default();
+                        let php_operator = [b"and".as_slice(), b"or", b"xor", b"instanceof"]
+                            .iter()
+                            .any(|op| first.eq_ignore_ascii_case(op));
+                        valid_start
+                            && !php_operator
+                            && name[length..]
                                 .trim_ascii_start()
                                 .first()
-                                .is_some_and(|b| {
-                                    b.is_ascii_alphabetic()
-                                        || matches!(*b, b'_' | b'$')
-                                        || *b >= 0x80
-                                })
+                                .is_some_and(|b| matches!(*b, b'>' | b'<' | b'['))
                     }));
         if after
             .get(..3)
@@ -1401,9 +1433,10 @@ fn has_php_tag(data: &[u8]) -> bool {
         } else {
             return true;
         }
+        examined += pos + 2;
         rest = after;
     }
-    !saw_non_php_open && memchr::memmem::find(data, b"?>").is_some()
+    !saw_non_php_open && memchr::memmem::find(&data[..limit], b"?>").is_some()
 }
 
 /// Tags that only markup carries. Static like [`SCANNER`]'s patterns, so a

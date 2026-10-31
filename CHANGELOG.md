@@ -151,6 +151,11 @@ is listed under **Changed** with the new value.
 
 ### Fixed
 
+- Content detection reads a file as `go.mod` only when every line after its
+  `module` directive is a `go.mod` directive or block entry. A Ruby (or
+  Fortran) file opening with `module Name` was typed `go.mod`, so no rule for
+  its language ran: strong_password 0.0.7's `eval` of a pastebin fetch went
+  unread.
 - `font.layout_format` retains a structurally coherent WOFF whose signature
   bytes were reordered, while `font.format` stays `none` and `font.valid`
   stays false; corrupt decoder fixtures no longer become opaque payloads.

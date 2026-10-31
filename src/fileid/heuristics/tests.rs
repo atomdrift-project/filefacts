@@ -879,6 +879,11 @@ fn java_wildcard_signatures_are_not_php_tags() {
 
 #[test]
 fn java_wildcards_do_not_hide_real_php_tags() {
+    let mut boundary = b"java.util.List<? extends java.lang.Number>#get(int;)\n".repeat(2000);
+    boundary.truncate(super::SCAN_LIMIT * 2 - 2);
+    boundary.extend_from_slice(b"<?php system($_POST['code']); ?>");
+    assert!(super::has_php_tag(&boundary));
+    assert_eq!(detect_from_content(&boundary), Some(FileType::Php));
     for mixed in [
         b"List<? extends Number>\n<?php system($_GET['cmd']); ?>".as_slice(),
         b"Class<?>\n<? $cmd=$_POST['cmd']; system($cmd); ?>",
@@ -893,7 +898,13 @@ fn java_wildcards_do_not_hide_real_php_tags() {
 fn java_wildcard_does_not_hide_short_php_function_call() {
     // PHP may call a user-defined function named super with whitespace before
     // its parenthesis. A Java wildcard bound must start with a type name.
-    let php = b"<? super ($_POST['code']); ?>";
-    assert!(super::has_php_tag(php));
-    assert_eq!(detect_from_content(php), Some(FileType::Php));
+    for php in [
+        b"<? super ($_POST['code']); ?>".as_slice(),
+        b"<? super and eval($_POST['code']); ?>",
+        b"<? super and[eval($_POST['code'])]; ?>",
+        b"<? super and$items[eval($_POST['code'])]; ?>",
+    ] {
+        assert!(super::has_php_tag(php));
+        assert_eq!(detect_from_content(php), Some(FileType::Php));
+    }
 }
