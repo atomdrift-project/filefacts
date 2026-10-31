@@ -361,4 +361,6 @@ tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter" }
 tree-sitter-bash = { git = "https://github.com/tstromberg/tree-sitter-bash" }
 
 [profile.dev]
+# `false` still permits local Thin LTO in optimized crates.
+lto = "off"
 debug = "line-tables-only"
