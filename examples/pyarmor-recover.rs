@@ -3,12 +3,12 @@
 use std::{env, fs, path::PathBuf};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = env::args_os().skip(1).collect();
-    if args.len() != 3 {
+    let [runtime, input, directory] = args.as_slice() else {
         return Err("expected RUNTIME INPUT OUTPUT_DIRECTORY".into());
-    }
-    let runtime = fs::read(&args[0])?;
-    let input = fs::read(&args[1])?;
-    let directory = PathBuf::from(&args[2]);
+    };
+    let runtime = fs::read(runtime)?;
+    let input = fs::read(input)?;
+    let directory = PathBuf::from(directory);
     let mut containers = filefacts::pyarmor::python_containers(&input);
     if containers.is_empty() {
         containers.push(input);
