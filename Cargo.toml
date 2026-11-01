@@ -52,7 +52,7 @@ aho-corasick = "1"
 crc32fast = "1"
 # x86/x86-64 instruction decoder — first-instruction decode at each PE
 # export RVA powers stub/thunk alias detection.
-iced-x86 = { version = "1.21", default-features = false, features = ["decoder", "std", "instr_info"] }
+iced-x86 = { version = "1.22", default-features = false, features = ["decoder", "std", "instr_info"] }
 
 # Authenticode signature verification — RSA-PKCS1v15 + ECDSA over
 # the SignerInfo signed-attrs digest. Pure-Rust crypto.

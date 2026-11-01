@@ -779,9 +779,9 @@ dependencies = [
 
 [[package]]
 name = "iced-x86"
-version = "1.21.0"
+version = "1.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c447cff8c7f384a7d4f741cfcff32f75f3ad02b406432e8d6c878d56b1edf6b"
+checksum = "c23ad4d19dca41180e835ef6fbd2c1ee655777eca086ad80dd517e0513322879"
 dependencies = [
  "lazy_static",
 ]
@@ -1708,7 +1708,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/stng.git#8b7cbebf8819e845a23c4efdf6098e0208d0a8ea"
+source = "git+https://github.com/atomdrift-project/stng.git#7685892060ef1da0d973c6fbe0e6a7e4345751b8"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -1733,7 +1733,7 @@ dependencies = [
 [[package]]
 name = "stng-process"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/stng.git#8b7cbebf8819e845a23c4efdf6098e0208d0a8ea"
+source = "git+https://github.com/atomdrift-project/stng.git#7685892060ef1da0d973c6fbe0e6a7e4345751b8"
 dependencies = [
  "libc",
 ]

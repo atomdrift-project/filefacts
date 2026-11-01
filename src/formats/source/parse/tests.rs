@@ -721,15 +721,23 @@ fn a_latin1_byte_no_longer_hides_the_tree() {
 /// A long run of `(a)*` -- cast or multiplication? -- keeps the parser's
 /// stack ambiguous all the way through. Tree-sitter freed such a stack
 /// recursively and overflowed the C stack, aborting the process; the fork it
-/// is pinned to frees it iteratively. If this regresses, the whole test binary
-/// aborts.
+/// is pinned to frees it iteratively. A small thread stack makes a shorter,
+/// faster chain sufficient to exercise that failure. If this regresses, the
+/// whole test binary aborts.
 #[test]
 fn a_long_ambiguous_cast_chain_does_not_overflow_the_stack() {
-    let source = format!("int x = {}a;\n", "(a)*".repeat(100_000));
-    let parsed = TreeCache::parse(source.as_bytes(), FileType::C, None);
-    assert!(
-        parsed.cache().is_some(),
-        "{:?}",
-        parsed.diagnostic().map(|d| &d.message)
-    );
+    std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let source = format!("int x = {}a;\n", "(a)*".repeat(10_000));
+            let parsed = TreeCache::parse(source.as_bytes(), FileType::C, None);
+            assert!(
+                parsed.cache().is_some(),
+                "{:?}",
+                parsed.diagnostic().map(|d| &d.message)
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
