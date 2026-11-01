@@ -162,7 +162,7 @@ pub(super) fn analyse(
                 symbols_out.iter_kind(SymbolKind::Export).count() - exports,
                 sections_out.len() - first_section,
             );
-            out.has_go_pclntab = go_build_info(&macho, slice_bytes, values);
+            out.has_go_pclntab = go_build_info(&macho, slice_bytes, values, symbols_out);
             // Unified sections address the whole input; load-command offsets
             // address the slice. Entropy was already computed on slice bytes.
             for section in sections_out.iter_mut().skip(first_section) {

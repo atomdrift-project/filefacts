@@ -10,6 +10,7 @@ Never execute a fixture.
 |---|---|---|
 | `dropper.xib`, `dropper.nib`, `dropper-keyed.nib` | synthetic | [`dropper-nib.md`](dropper-nib.md) |
 | `elf-syscall-wrapper-*.elf` | synthetic | [`elf-syscall-wrapper.md`](elf-syscall-wrapper.md) |
+| `go-macho-arm64.zst` | synthetic | [`go-macho-arm64.md`](go-macho-arm64.md) |
 | `go-pclntab-names.zst` | synthetic | [`go-pclntab-names.md`](go-pclntab-names.md) |
 | `go-pe-no-exports.exe.zst` | synthetic | [`go-pe-no-exports.md`](go-pe-no-exports.md) |
 | `pe-xor-decoder.exe` | synthetic | [`pe-xor-decoder.md`](pe-xor-decoder.md) |

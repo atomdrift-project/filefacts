@@ -164,6 +164,9 @@ fn parsed(pe: PE<'_>, bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     // evidence, and in that layout the native parser supplies no typed
     // function inventory for the Rizin fallback to skip over.
     let has_go_function_metadata = has_go_pclntab || values.get_key(value_key!("pe.go")).is_some();
+    if has_go_function_metadata {
+        go_functions(pe, &go_sections, has_go_pclntab, symbols_out);
+    }
     super::build_toolchain::from_pe_rich(values);
     let target = RizinTarget {
         format: NativeFormat::Pe,
@@ -188,6 +191,49 @@ fn parsed(pe: PE<'_>, bytes: &[u8], ctx: super::ExtractCtx<'_>) {
         sections_out,
         metrics,
     );
+}
+
+/// Add the functions a Go PE's pclntab names (see [`super::go_pclntab`]),
+/// which then spare it the rizin fallback. The table is the `.gopclntab`
+/// section when there is one; Go's linker otherwise folds it into `.rdata`,
+/// where a candidate must pass the same validation to count.
+fn go_functions(
+    pe: &goblin::pe::PE<'_>,
+    go_sections: &super::go_buildinfo::GoSections<'_>,
+    has_go_pclntab: bool,
+    symbols_out: &mut crate::Symbols,
+) {
+    use goblin::pe::section_table::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE};
+    let va = |rva: u32| pe.image_base.saturating_add(u64::from(rva));
+    let Some(text) = pe
+        .sections
+        .iter()
+        .find(|s| s.name().is_ok_and(|name| name == ".text"))
+        .map(|s| va(s.virtual_address))
+    else {
+        return;
+    };
+    let Some(code) = super::go_pclntab::Code::of(
+        pe.sections
+            .iter()
+            .filter(|s| s.characteristics & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE) != 0)
+            .map(|s| {
+                (
+                    va(s.virtual_address),
+                    u64::from(s.virtual_size.max(s.size_of_raw_data)),
+                )
+            }),
+    ) else {
+        return;
+    };
+    let functions = match (has_go_pclntab, go_sections.pclntab, go_sections.rodata) {
+        (true, Some(table), _) => super::go_pclntab::functions(table, code, text),
+        (_, _, Some(rdata)) => super::go_pclntab::find(rdata, code, text),
+        _ => None,
+    };
+    for function in functions.into_iter().flatten() {
+        symbols_out.push(function);
+    }
 }
 
 /// The facts the headers alone support, for a PE goblin could not parse in

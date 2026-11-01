@@ -86,7 +86,7 @@ pub(super) struct GoSections<'a> {
 /// Go 1.2/1.16/1.18/1.20 use `0xfffffffb/fa/f0/f1`; the table is laid out in
 /// target byte order, so both orientations are accepted (LE covers
 /// amd64/arm64/386/arm; BE covers s390x/mips/ppc64).
-const PCLNTAB_MAGICS: [[u8; 4]; 8] = [
+pub(super) const PCLNTAB_MAGICS: [[u8; 4]; 8] = [
     [0xfb, 0xff, 0xff, 0xff],
     [0xfa, 0xff, 0xff, 0xff],
     [0xf0, 0xff, 0xff, 0xff],

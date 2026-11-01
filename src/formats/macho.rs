@@ -106,7 +106,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
                 errors_out,
             );
             *image_end = Some(image_end_of(&macho));
-            go_build_info(&macho, bytes, values)
+            go_build_info(&macho, bytes, values, symbols_out)
         }
         Mach::Fat(fat) => {
             // goblin reads the arch table lazily; walk it once, guarded.
@@ -165,16 +165,24 @@ fn segment_sections<'a>(
 }
 
 /// Decode Go build info from the Mach-O image in `bytes` into `macho.go`,
-/// and report whether `__TEXT,__gopclntab` holds a real Go pclntab.
+/// add the functions `__TEXT,__gopclntab` names to `symbols_out` (see
+/// [`super::go_pclntab`]), and report whether it holds a real Go pclntab.
 ///
 /// The build-info blob is looked for where Go's `debug/buildinfo` looks: the
 /// `__go_buildinfo` section, else the first non-empty segment mapped
 /// read-write (initial and maximum protection both). Pre-1.18 pointers
 /// resolve through the segments' file extents.
-fn go_build_info(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) -> bool {
+fn go_build_info(
+    macho: &MachO<'_>,
+    bytes: &[u8],
+    values: &mut Values,
+    symbols_out: &mut crate::Symbols,
+) -> bool {
     const VM_PROT_RW: u32 = 0x3;
     let (mut buildinfo, mut pclntab, mut const_data, mut rodata) = (None, None, None, None);
     let mut writable_segment = None;
+    let mut code = Vec::new();
+    let mut text = None;
     for segment in &macho.segments {
         let segment_name = segment.name().unwrap_or("");
         if writable_segment.is_none()
@@ -191,9 +199,17 @@ fn go_build_info(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) -> bool {
             continue;
         };
         for (section, data) in secs {
+            if section.flags
+                & (mach::constants::S_ATTR_PURE_INSTRUCTIONS
+                    | mach::constants::S_ATTR_SOME_INSTRUCTIONS)
+                != 0
+            {
+                code.push((section.addr, section.size));
+            }
             match (segment_name, section.name().unwrap_or("")) {
                 (_, "__go_buildinfo") if buildinfo.is_none() => buildinfo = Some(data),
                 ("__TEXT", "__gopclntab") => pclntab = Some(data),
+                ("__TEXT", "__text") => text = Some(section.addr),
                 ("__TEXT", "__const") => const_data = Some(data),
                 ("__TEXT", "__rodata") => rodata = Some(data),
                 _ => {}
@@ -221,7 +237,19 @@ fn go_build_info(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) -> bool {
         Some(&resolve),
         &sections,
     );
-    pclntab.is_some_and(super::go_buildinfo::has_pclntab_magic)
+    let Some(pclntab) = pclntab.filter(|table| super::go_buildinfo::has_pclntab_magic(table))
+    else {
+        return false;
+    };
+    if let Some(functions) = super::go_pclntab::Code::of(code)
+        .zip(text)
+        .and_then(|(code, text)| super::go_pclntab::functions(pclntab, code, text))
+    {
+        for function in functions {
+            symbols_out.push(function);
+        }
+    }
+    true
 }
 
 /// A copy of `bytes` in which every slice whose bind streams

@@ -132,6 +132,7 @@ mod font;
 mod gem;
 mod generic;
 mod go_buildinfo;
+mod go_pclntab;
 pub(crate) mod goblin_safe;
 mod image4;
 mod image_stats;

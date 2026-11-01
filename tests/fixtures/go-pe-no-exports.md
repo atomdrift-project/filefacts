@@ -9,11 +9,13 @@ SHA-256 (uncompressed): `c11b4ceec83415c966fc31bd3a891d3e1d1395761ab551e8eabd7f7
 Built for this project from the source below (Apache-2.0); the binary also
 contains the Go runtime (BSD-3-Clause).
 
+Go's PE linker folds the pclntab into `.rdata`, with no section of its own.
+`a_stripped_go_pe_finds_its_pclntab_in_rdata`
+(`src/formats/go_pclntab/tests.rs`) asserts that all 1,415 functions are found
+there, that the export view stays empty, and that rizin never starts.
 `go_pe_without_export_directory_recovers_no_exports` (`src/rizin/tests.rs`,
-skipped without rizin) asserts that rizin's functions are recovered but no
-export reaches the export view, since Go PEs always take the rizin path.
-`concurrent_opens_keep_their_own_rizin_settings` uses it as a small binary
-rizin can analyse quickly.
+skipped without rizin) runs rizin on it directly and asserts that the phantom
+export is dropped when the image declares no export directory.
 
 Built with Go 1.27 from:
 

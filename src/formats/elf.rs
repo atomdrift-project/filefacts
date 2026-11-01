@@ -262,17 +262,40 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     // Split firmware header members declare segments stored in sibling files.
     // Disassembling such a member invents an entry function in an unmapped
     // range. Keep its header facts, but recover code only from present bytes.
+    // A function inventory that covers the code is all rizin's recovery would
+    // add, so it goes in before the admission decision, which then skips the
+    // disassembler: Go's pclntab first (exact names, present even when
+    // stripped), else a `.symtab` that covers the code.
+    let code = super::go_pclntab::Code::of(
+        elf.section_headers
+            .iter()
+            .filter(|sh| sh.sh_flags & u64::from(goblin::elf::section_header::SHF_EXECINSTR) != 0)
+            .map(|sh| (sh.sh_addr, sh.sh_size)),
+    );
+    // A real pclntab magic, not just the section name: no non-Go toolchain
+    // writes one, so a decoy `.gopclntab` cannot pass for Go.
+    let pclntab = read_section(&elf, bytes, ".gopclntab")
+        .filter(|table| super::go_buildinfo::has_pclntab_magic(table));
+    let text = section_header(&elf, ".text").map(|sh| sh.sh_addr);
+    if let Some(go) = pclntab
+        .zip(code)
+        .zip(text)
+        .and_then(|((table, code), text)| super::go_pclntab::functions(table, code, text))
+    {
+        for function in go {
+            symbols_out.push(function);
+        }
+    }
+    if code.is_some() {
+        symbols::static_function_fallback(&elf, bytes.len(), code, symbols_out);
+    }
     if has_present_load_or_code_bytes(&elf, bytes.len()) {
         rizin_fallback(
             RizinTarget {
                 format: NativeFormat::Elf,
                 bytes,
                 strings,
-                // A real pclntab magic, not just the section name: no non-Go
-                // toolchain writes one, so a decoy `.gopclntab` cannot skip
-                // deep recovery for a stripped payload.
-                go_function_metadata: read_section(&elf, bytes, ".gopclntab")
-                    .is_some_and(super::go_buildinfo::has_pclntab_magic),
+                go_function_metadata: pclntab.is_some(),
                 settings: rizin,
             },
             sections_out,
@@ -280,10 +303,9 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
             metrics,
         );
     }
-    // Preserve symbol-table function names when no disassembler supplied
-    // functions. Run after the fallback so symbol-table names never suppress
-    // richer Rizin function and call-graph facts.
-    symbols::static_function_fallback(&elf, bytes.len(), symbols_out);
+    // Symbol-table names for a binary whose `.symtab` covers too little to
+    // stand in for disassembly, kept when rizin supplied no functions.
+    symbols::static_function_fallback(&elf, bytes.len(), None, symbols_out);
     linker_family(&elf, values);
     comment_fingerprint(values);
     hashes::emit(&elf, bytes.len(), values, symbols_out);

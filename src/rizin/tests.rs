@@ -732,12 +732,13 @@ fn concurrent_opens_keep_their_own_rizin_settings() {
     if !available() {
         return;
     }
-    let compressed = std::fs::read(concat!(
+    // A stripped C binary: the admission policy sends it to rizin. (A Go
+    // binary would not do: its functions come from the pclntab either way.)
+    let bytes = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/go-pe-no-exports.exe.zst"
+        "/tests/fixtures/test.elf"
     ))
     .expect("fixture present");
-    let bytes = zstd::decode_all(compressed.as_slice()).expect("fixture decompresses");
     let _lock = rizin_test_lock();
     let on = crate::OpenOptions::new().cache(false);
     let off = crate::OpenOptions::new().cache(false).rizin(false);
@@ -761,32 +762,41 @@ fn concurrent_opens_keep_their_own_rizin_settings() {
     assert!(!off_incomplete);
 }
 
-/// End to end on a Go PE with no export directory (see
-/// tests/fixtures/go-pe-no-exports.md). Rizin recovers its functions but
-/// also lists the `gopclntab` symbol under `iEj`; that must not reach the
-/// export view. Skips when rizin is not installed.
+/// On a Go PE with no export directory (see
+/// tests/fixtures/go-pe-no-exports.md), rizin lists the `gopclntab` symbol
+/// under `iEj`. The PE path drops a recovery's exports when the image
+/// declares no export directory; this holds rizin to that. The opened PE
+/// itself no longer reaches rizin (its pclntab supplies the functions), so
+/// the recovery is taken directly. Skips when rizin is not installed.
 #[test]
 fn go_pe_without_export_directory_recovers_no_exports() {
-    if !available() {
+    let Some(bin) = rizin_binary() else {
         return;
-    }
+    };
     let compressed = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/go-pe-no-exports.exe.zst"
     ))
     .expect("fixture present");
     let bytes = zstd::decode_all(compressed.as_slice()).expect("fixture decompresses");
-    let _lock = rizin_test_lock();
-    let parsed = crate::OpenOptions::new().cache(false).open(&bytes);
-
-    let symbols = parsed.symbols();
+    let rec = Supervisor::new()
+        .attempt(bin, &bytes, analysis_script(&bytes, 0, true), RIZIN_TIMEOUT)
+        .recovery
+        .expect("rizin recovers the fixture");
     assert!(
-        count_kind(symbols, SymbolKind::Function) > 0,
-        "rizin did not run, so the export check below proves nothing"
+        !rec.exports.is_empty(),
+        "rizin lists no phantom export, so the filter below proves nothing"
     );
+
+    let (mut symbols, mut sections, mut metrics) =
+        (Symbols::default(), Vec::new(), Metrics::default());
+    let counts =
+        rec.without_exports()
+            .apply_with_sections(&mut symbols, &mut sections, &mut metrics);
+    assert!(count_kind(&symbols, SymbolKind::Function) > 0);
     let exports: Vec<&Symbol> = symbols.iter_kind(SymbolKind::Export).collect();
     assert!(exports.is_empty(), "phantom exports: {exports:?}");
-    assert!(parsed.metrics().get("pe.recovered_export_count").is_none());
+    assert_eq!(counts.exports, 0);
 }
 
 // ------------------------------------------------------------------

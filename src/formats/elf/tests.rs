@@ -1,7 +1,7 @@
 use super::notes::{gnu_property_name, pauth_platform_name};
 use super::symbols::static_function_fallback;
 use super::*;
-use crate::output::{Metrics, Strings, Values};
+use crate::output::{Metrics, Strings, SymbolKind, Values};
 
 #[test]
 fn header_only_and_memory_only_segments_do_not_admit_code_recovery() {
@@ -1126,7 +1126,7 @@ fn static_function_fallback_recovers_only_defined_executable_functions() {
     );
     let elf = Elf::parse(&bytes).unwrap();
     let mut out = crate::Symbols::default();
-    static_function_fallback(&elf, bytes.len(), &mut out);
+    static_function_fallback(&elf, bytes.len(), None, &mut out);
     let functions: Vec<_> = out
         .iter()
         .filter(|s| s.kind() == SymbolKind::Function)
@@ -1143,7 +1143,7 @@ fn static_function_fallback_recovers_only_defined_executable_functions() {
         complexity: Some(3),
         callees: vec!["target".into()],
     });
-    static_function_fallback(&elf, bytes.len(), &mut rich);
+    static_function_fallback(&elf, bytes.len(), None, &mut rich);
     assert_eq!(
         rich.iter()
             .filter(|s| s.kind() == SymbolKind::Function)
@@ -1161,7 +1161,7 @@ fn fallback_function_names(fixture: &str) -> Vec<String> {
     let bytes = read_fixture(fixture);
     let elf = Elf::parse(&bytes).unwrap();
     let mut out = crate::Symbols::default();
-    static_function_fallback(&elf, bytes.len(), &mut out);
+    static_function_fallback(&elf, bytes.len(), None, &mut out);
     out.iter()
         .filter_map(|s| match s {
             Symbol::Function { name, .. } => Some(name.clone()),
@@ -1178,6 +1178,62 @@ fn static_function_fallback_keeps_static_executable_globals() {
     for global in ["syscall", "main", "exported_entry", "__libc_start_main"] {
         assert!(names.iter().any(|n| n == global), "{global} in {names:?}");
     }
+}
+
+/// The executable code of `elf`, as the extractor measures it.
+fn executable_code(elf: &Elf<'_>) -> crate::formats::go_pclntab::Code {
+    crate::formats::go_pclntab::Code::of(
+        elf.section_headers
+            .iter()
+            .filter(|sh| sh.sh_flags & u64::from(goblin::elf::section_header::SHF_EXECINSTR) != 0)
+            .map(|sh| (sh.sh_addr, sh.sh_size)),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_symtab_covering_the_code_stands_in_for_disassembly() {
+    // The static musl binary's `.symtab` sizes cover its code, so its
+    // functions go in ahead of the rizin decision.
+    let bytes = read_fixture("elf-syscall-wrapper-static.elf");
+    let elf = Elf::parse(&bytes).unwrap();
+    let code = executable_code(&elf);
+    let mut out = crate::Symbols::default();
+    static_function_fallback(&elf, bytes.len(), Some(code), &mut out);
+    assert_eq!(out.iter_kind(SymbolKind::Function).count(), 32);
+}
+
+#[test]
+fn a_symtab_covering_little_of_the_code_waits_for_disassembly() {
+    // The same `.symtab` against ten times the code: a token symbol table
+    // (a lone `main`, or one grafted on to dodge rizin) must not stand in.
+    let bytes = read_fixture("elf-syscall-wrapper-static.elf");
+    let elf = Elf::parse(&bytes).unwrap();
+    let code = executable_code(&elf);
+    let larger = crate::formats::go_pclntab::Code {
+        bytes: code.bytes * 10,
+        ..code
+    };
+    let mut out = crate::Symbols::default();
+    static_function_fallback(&elf, bytes.len(), Some(larger), &mut out);
+    assert_eq!(out.iter_kind(SymbolKind::Function).count(), 0);
+    // Without the requirement, as after rizin found nothing, they are kept.
+    static_function_fallback(&elf, bytes.len(), None, &mut out);
+    assert_eq!(out.iter_kind(SymbolKind::Function).count(), 32);
+}
+
+#[test]
+fn an_unstripped_elf_skips_rizin() {
+    // End to end: with its `.symtab` in before the admission decision, a
+    // one-millisecond rizin budget never trips (where rizin is installed).
+    let bytes = read_fixture("elf-syscall-wrapper-static.elf");
+    let _lock = crate::rizin::tests::rizin_test_lock();
+    let parsed = crate::OpenOptions::new()
+        .cache(false)
+        .rizin_timeout(std::time::Duration::from_millis(1))
+        .open(&bytes);
+    assert!(!parsed.rizin_recovery_incomplete(), "rizin ran");
+    assert_eq!(parsed.symbols().iter_kind(SymbolKind::Function).count(), 32);
 }
 
 #[test]
@@ -1273,7 +1329,7 @@ fn static_function_fallback_keeps_every_binding_of_defined_functions() {
     );
     let elf = Elf::parse(&bytes).unwrap();
     let mut out = crate::Symbols::default();
-    static_function_fallback(&elf, bytes.len(), &mut out);
+    static_function_fallback(&elf, bytes.len(), None, &mut out);
     let mut names: Vec<_> = out
         .iter()
         .filter_map(|s| match s {
