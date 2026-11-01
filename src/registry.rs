@@ -274,11 +274,13 @@ pub struct Registry {
     /// namespace (Open VSX). `Some(false)` means anyone could have published
     /// under this name; `None` when the registry has no such concept.
     pub publisher_verified: Option<bool>,
-    /// Whether the registry has replaced this package with a takedown
-    /// placeholder — npm's `security holding package` stub, published by the
-    /// registry's own security team after malicious code was removed. `Some(true)`
-    /// is as authoritative a bad signal as a registry gives; `None` when the
-    /// registry has no such tombstone concept.
+    /// Whether the registry has withdrawn this package or version for
+    /// security — replaced the package with a takedown placeholder (npm's
+    /// `security holding package` stub, published by the registry's own
+    /// security team after malicious code was removed), or deleted this
+    /// version under a malware advisory. `Some(true)` is as authoritative a
+    /// bad signal as a registry gives; `None` when the registry has no such
+    /// takedown concept.
     pub security_hold: Option<bool>,
     /// Whether *this version* has been removed from the registry — unpublished
     /// (npm `time.unpublished`) or yanked — while its metadata still resolves.
