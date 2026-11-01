@@ -484,18 +484,54 @@ fn bitstream(view: PixelView<'_>, packing: Packing<'_>, probe: &mut Probe) -> Ve
     let total = width.saturating_mul(height);
     let mut out = Vec::with_capacity(cap);
     let (mut byte, mut used) = (0u8, 0u8);
+    // The mask's bit positions, high to low, resolved once instead of
+    // re-filtering `0..8` on every sample: this walk runs for every
+    // (layout x mask x order) probe over up to `MAX_STEPS` samples per image,
+    // and the per-sample bookkeeping dominated PNG extraction on image-heavy
+    // archives.
+    let mut bits = [0u8; 8];
+    let mut bit_count = 0usize;
+    for bit in (0..8).rev() {
+        if mask & (1 << bit) != 0 {
+            bits[bit_count] = bit;
+            bit_count += 1;
+        }
+    }
+    let bits = &bits[..bit_count];
+    // A full mask in stream order copies the sample byte as-is.
+    let whole_bytes = mask == 0xff && !reverse;
     let ordinary = 0..if prime.is_none() {
         total.min(MAX_PIXELS)
     } else {
         0
     };
+    // Sequential indices step their coordinates instead of dividing; prime
+    // indices (sparse) still divide.
+    let (mut next_ordinary, mut cx, mut cy) = (0usize, 0usize, 0usize);
     for index in ordinary.chain(prime.unwrap_or_default().iter().copied()) {
         probe.steps += 1;
         if probe.steps > MAX_STEPS {
             probe.limited = true;
             break;
         }
-        let (x, y) = if column {
+        let (x, y) = if index == next_ordinary {
+            let at = (cx, cy);
+            next_ordinary += 1;
+            if column {
+                cy += 1;
+                if cy == height {
+                    cy = 0;
+                    cx += 1;
+                }
+            } else {
+                cx += 1;
+                if cx == width {
+                    cx = 0;
+                    cy += 1;
+                }
+            }
+            at
+        } else if column {
             (index / height, index % height)
         } else {
             (index % width, index / width)
@@ -508,7 +544,15 @@ fn bitstream(view: PixelView<'_>, packing: Packing<'_>, probe: &mut Probe) -> Ve
             else {
                 return out;
             };
-            for bit in (0..8).rev().filter(|&b| mask & (1 << b) != 0) {
+            if whole_bytes {
+                out.push(value);
+                if out.len() == cap {
+                    probe.limited |= index + 1 < total;
+                    return out;
+                }
+                continue;
+            }
+            for &bit in bits {
                 let value = (value >> bit) & 1;
                 if reverse {
                     byte |= value << used;
