@@ -1555,3 +1555,45 @@ fn go_legacy_octal_call_arguments_keep_their_value_and_radix() {
         assert_eq!(actual.as_slice(), expected, "{filename}");
     }
 }
+
+#[test]
+fn javascript_commonjs_exports_follow_the_export_object_and_its_aliases() {
+    let exports = |source: &str| -> Vec<String> {
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new("index.js"))
+            .open(source.as_bytes());
+        parsed
+            .symbols()
+            .iter_kind(crate::SymbolKind::Export)
+            .filter_map(|symbol| symbol.name().map(str::to_owned))
+            .collect()
+    };
+    // event-stream 3.3.6: the alias is bound first, then the new API member.
+    assert_eq!(
+        exports(
+            "var es = exports\n  , flatmap = require('flatmap-stream')\n\
+             es.through = require('through')\nes.flatmap = flatmap\n"
+        ),
+        ["flatmap", "through"]
+    );
+    // Direct members, a chained alias, and object-literal keys.
+    assert_eq!(
+        exports("exports.a = 1;\nmodule.exports.b = function () {};\n"),
+        ["a", "b"]
+    );
+    assert_eq!(
+        exports("var api = module.exports = {};\napi.run = function () {};\n"),
+        ["run"]
+    );
+    assert_eq!(
+        exports("module.exports = { parse, 'stringify': s, load() {}, ...rest };\n"),
+        ["load", "parse", "stringify"]
+    );
+    // An alias bound after its members still names the export object.
+    assert_eq!(
+        exports("var api = {};\napi.fetch = f;\nmodule.exports = api;\n"),
+        ["fetch"]
+    );
+    // Ordinary locals and nested members are not exports.
+    assert!(exports("var cfg = {};\ncfg.port = 1;\nexports.a.b = 2;\n").is_empty());
+}

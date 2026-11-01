@@ -5,6 +5,7 @@
 //!
 //! - one [`Symbol::Call`] per call site,
 //! - one [`Symbol::Bind`] per static assignment,
+//! - one [`Symbol::Export`] per CommonJS export name (JavaScript/TypeScript),
 //! - one [`Symbol::Member`] per unique dotted member-access chain.
 //!
 //! Numeric tally features are written into the caller's [`Metrics`]
@@ -92,8 +93,38 @@ pub(super) fn finish(
     for c in state.calls {
         symbols_out.push(c);
     }
+    // CommonJS members: set on `exports`/`module.exports` directly, or
+    // through a local alias of either.
+    let mut exports = state.exports;
+    let commonjs = matches!(config.lang, Lang::JavaScript | Lang::TypeScript);
+    for bind in state.binds.iter().filter(|_| commonjs) {
+        let Symbol::Bind { target, offset, .. } = bind else {
+            continue;
+        };
+        let member = ["module.exports.", "exports."]
+            .iter()
+            .find_map(|root| target.strip_prefix(root))
+            .or_else(|| {
+                let (root, member) = target.split_once('.')?;
+                state.export_aliases.contains(root).then_some(member)
+            });
+        if let Some(member) = member
+            && !member.is_empty()
+            && !member.contains('.')
+        {
+            exports.entry(member.to_owned()).or_insert(*offset);
+        }
+    }
     for b in state.binds {
         symbols_out.push(b);
+    }
+    for (name, offset) in exports {
+        symbols_out.push(Symbol::Export {
+            name,
+            offset: Some(offset),
+            ordinal: None,
+            forward_to: None,
+        });
     }
     for (path, offset) in state.members {
         symbols_out.push(Symbol::Member {
@@ -528,6 +559,13 @@ fn is_infinite_loop(node: Node<'_>, source: &str) -> bool {
 pub(super) struct State {
     calls: Vec<Symbol>,
     binds: Vec<Symbol>,
+    /// CommonJS export names, each with the offset of its first assignment:
+    /// members set on `exports`, `module.exports`, or a local alias of either,
+    /// and the keys of an object literal assigned to `module.exports`.
+    exports: BTreeMap<String, u64>,
+    /// Locals bound to the CommonJS export object (`var es = exports`,
+    /// `module.exports = api`), so `es.flatmap = …` reads as the export it is.
+    export_aliases: HashSet<String>,
     members: BTreeMap<String, u64>,
     /// Ids of member/subscript nodes inside a chain whose outermost node
     /// already recorded their paths; the walk skips each as it passes.
@@ -947,12 +985,96 @@ impl State {
         let Some(target) = self.static_path(target_node, source, config) else {
             return;
         };
+        let offset = target_node.start_byte() as u64;
+        if matches!(config.lang, Lang::JavaScript | Lang::TypeScript) {
+            self.record_commonjs_export(&target, value_node, source, offset);
+        }
         self.binds.push(Symbol::Bind {
             target,
             shape: arg_shape(value_node, config),
-            offset: target_node.start_byte() as u64,
+            offset,
         });
     }
+
+    /// Record what a JS/TS assignment says about the CommonJS export object:
+    /// a local that aliases it (`var es = exports`, `module.exports = api`),
+    /// or the keys of an object literal assigned to it. Members set on it
+    /// (`es.flatmap = …`) are read from the binds once the whole file is
+    /// seen, so an alias bound after its members (`api.x = …; module.exports
+    /// = api`) still counts.
+    fn record_commonjs_export(&mut self, target: &str, value: Node<'_>, source: &str, offset: u64) {
+        if !target.contains('.') && binds_export_object(value, source) {
+            self.export_aliases.insert(target.to_owned());
+        } else if is_export_object(target) {
+            match value.kind() {
+                "identifier" => {
+                    if let Some(local) = source.get(value.byte_range()) {
+                        self.export_aliases.insert(local.to_owned());
+                    }
+                }
+                "object" => {
+                    for name in object_keys(value, source) {
+                        self.exports.entry(name).or_insert(offset);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Whether `path` names the CommonJS export object itself.
+fn is_export_object(path: &str) -> bool {
+    matches!(path, "exports" | "module.exports")
+}
+
+/// Whether an assigned value is the CommonJS export object: `exports`,
+/// `module.exports`, or a chained assignment that sets one of them
+/// (`module.exports = {…}` in `var es = module.exports = {…}`).
+fn binds_export_object(mut value: Node<'_>, source: &str) -> bool {
+    let text = |node: Node<'_>| source.get(node.byte_range()).unwrap_or_default();
+    loop {
+        if is_export_object(text(value)) {
+            return true;
+        }
+        if value.kind() != "assignment_expression" {
+            return false;
+        }
+        let (Some(left), Some(right)) = (assignment_target(value), assignment_value(value)) else {
+            return false;
+        };
+        if is_export_object(text(left)) {
+            return true;
+        }
+        value = right;
+    }
+}
+
+/// The static keys of a JS object literal: `a` and `b` of `{ a, b: c,
+/// 'd': e }`, and named methods. Computed keys and spreads have no static
+/// name.
+fn object_keys(object: Node<'_>, source: &str) -> Vec<String> {
+    let mut cursor = object.walk();
+    object
+        .named_children(&mut cursor)
+        .filter_map(|entry| match entry.kind() {
+            "shorthand_property_identifier" => Some(entry),
+            "pair" => entry.child_by_field_name("key"),
+            "method_definition" => entry.child_by_field_name("name"),
+            _ => None,
+        })
+        .filter_map(|key| {
+            let text = source.get(key.byte_range())?;
+            match key.kind() {
+                "property_identifier" | "shorthand_property_identifier" | "identifier" => {
+                    Some(text.to_owned())
+                }
+                "string" => Some(text.trim_matches(['"', '\'']).to_owned()),
+                _ => None,
+            }
+        })
+        .filter(|name| !name.is_empty())
+        .collect()
 }
 
 fn arg_shape(node: Node<'_>, config: &LangConfig) -> ArgShape {
