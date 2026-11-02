@@ -1045,3 +1045,29 @@ fn failing_end_record_candidates_do_not_open() {
         body
     );
 }
+
+/// A false encryption bit must not hide APK identity, but neither a wrong
+/// CRC nor an oversized plaintext stream may be accepted as a manifest.
+#[test]
+fn read_false_encryption_flags_requires_complete_crc_checked_plaintext() {
+    for method in [CompressionMethod::Stored, CompressionMethod::Deflated] {
+        let mut bytes = build_zip(&[("AndroidManifest.xml", b"plain manifest", method)]);
+        for (signature, delta) in [(b"PK\x03\x04", 6usize), (b"PK\x01\x02", 8usize)] {
+            let offset = bytes.windows(4).position(|w| w == signature).unwrap();
+            bytes[offset + delta] |= 1;
+        }
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        assert_eq!(
+            read_member(&mut archive, "AndroidManifest.xml", 100).unwrap(),
+            Some(b"plain manifest".to_vec())
+        );
+        assert!(matches!(
+            read_member(&mut archive, "AndroidManifest.xml", 3),
+            Err(MemberError::TooLarge { .. })
+        ));
+        let cd = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        bytes[cd + 16] ^= 1;
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        assert!(read_member(&mut archive, "AndroidManifest.xml", 100).is_err());
+    }
+}

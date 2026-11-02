@@ -829,6 +829,39 @@ pub(super) fn read_member_prefix<R: Read + Seek>(
     name: &str,
     max: u64,
 ) -> Result<Option<MemberPrefix>, MemberError> {
+    // Some APK protectors set the ZIP encryption bit on plaintext. Read raw
+    // bytes only when complete bounded decompression, size and CRC agree.
+    // Keep the declaration in archive facts; never treat ciphertext as text.
+    if let Some(index) = zip.index_for_name(name) {
+        let raw = zip.by_index_raw(index).map_err(MemberError::Zip)?;
+        if raw.encrypted() {
+            let size = raw.size();
+            let crc = raw.crc32();
+            let method = raw.compression();
+            let prefix = match method {
+                CompressionMethod::Stored => inflate_capped(raw, max),
+                CompressionMethod::Deflated => {
+                    inflate_capped(flate2::read::DeflateDecoder::new(raw), max)
+                }
+                _ => {
+                    return Err(MemberError::Zip(ZipError::UnsupportedArchive(
+                        "encrypted member cannot be read as bounded plaintext",
+                    )));
+                }
+            }
+            .map_err(|e| MemberError::Zip(ZipError::Io(e)))?;
+            if prefix.truncated {
+                return Err(MemberError::TooLarge { max });
+            }
+            if prefix.bytes.len() as u64 != size || crc32fast::hash(&prefix.bytes) != crc {
+                return Err(MemberError::Zip(ZipError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "encrypted member is not verified plaintext",
+                ))));
+            }
+            return Ok(Some(prefix));
+        }
+    }
     let entry = match zip.by_name(name) {
         Ok(entry) => entry,
         Err(ZipError::FileNotFound) => return Ok(None),

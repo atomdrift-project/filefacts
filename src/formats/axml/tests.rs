@@ -155,3 +155,23 @@ fn truncated_input_yields_what_was_read() {
         let _ = parse(&full[..cut.min(full.len())]);
     }
 }
+
+#[test]
+fn extended_attribute_stride_keeps_known_prefix() {
+    let mut bytes = doc();
+    let pool_size = u32_le(&bytes, 12).unwrap() as usize;
+    let element = 8 + pool_size;
+    bytes[element + 26..element + 28].copy_from_slice(&24u16.to_le_bytes());
+    bytes.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+    let element_size = (bytes.len() - element) as u32;
+    bytes[element + 4..element + 8].copy_from_slice(&element_size.to_le_bytes());
+    let file_size = bytes.len() as u32;
+    bytes[4..8].copy_from_slice(&file_size.to_le_bytes());
+    let elements = parse(&bytes);
+    assert_eq!(
+        elements[0].attrs,
+        vec![("package".into(), "com.example.app".into())]
+    );
+    bytes[element + 26..element + 28].copy_from_slice(&19u16.to_le_bytes());
+    assert!(parse(&bytes)[0].attrs.is_empty());
+}

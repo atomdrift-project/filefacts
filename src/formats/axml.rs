@@ -238,11 +238,10 @@ fn parse_start_element(chunk: &[u8], pool: &[String], budget: &mut usize) -> Opt
     let attr_size = u16_le(chunk, 26)? as usize;
     let attr_count = u16_le(chunk, 28)? as usize;
     let mut attrs = Vec::new();
-    // 20 bytes is the documented per-attribute record: ns(4) name(4)
-    // rawValue(4) size(2) res0(1) dataType(1) data(4). Any other stride means
-    // a layout this reader does not understand, so the attributes are left out
-    // rather than misread into plausible-looking nonsense.
-    if attr_size != 20 {
+    // The first 20 bytes are ns/name/rawValue plus the typed value. Android
+    // uses the declared stride, so future or protected manifests can append
+    // extension bytes. Keep that stride while reading only the known prefix.
+    if attr_size < 20 {
         return Some(Element { name, attrs });
     }
     for i in 0..attr_count.min(512) {
