@@ -21,7 +21,7 @@ tree-sitter = "0.28"
 tree-sitter-language = "0.1"
 
 [build-dependencies]
-cc = "1.10"
+cc = "1.11"
 
 # build.rs uses `cc`; cargo-machete does not see build-script usage.
 [package.metadata.cargo-machete]
