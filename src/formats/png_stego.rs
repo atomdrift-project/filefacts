@@ -491,13 +491,13 @@ fn bitstream(view: PixelView<'_>, packing: Packing<'_>, probe: &mut Probe) -> Ve
     // archives.
     let mut bits = [0u8; 8];
     let mut bit_count = 0usize;
-    for bit in (0..8).rev() {
-        if mask & (1 << bit) != 0 {
-            bits[bit_count] = bit;
-            bit_count += 1;
-        }
+    for (slot, bit) in bits
+        .iter_mut()
+        .zip((0..8).rev().filter(|bit| mask & (1 << bit) != 0))
+    {
+        *slot = bit;
+        bit_count += 1;
     }
-    let bits = &bits[..bit_count];
     // A full mask in stream order copies the sample byte as-is.
     let whole_bytes = mask == 0xff && !reverse;
     let ordinary = 0..if prime.is_none() {
@@ -552,7 +552,7 @@ fn bitstream(view: PixelView<'_>, packing: Packing<'_>, probe: &mut Probe) -> Ve
                 }
                 continue;
             }
-            for &bit in bits {
+            for &bit in bits.iter().take(bit_count) {
                 let value = (value >> bit) & 1;
                 if reverse {
                     byte |= value << used;
