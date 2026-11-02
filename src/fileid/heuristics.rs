@@ -486,6 +486,21 @@ fn scan_scores(data: &[u8]) -> Scores {
                 continue;
             }
         }
+        // PHP and Lua both spell `elseif`. Lua requires `then`, while PHP
+        // follows the condition with a brace or colon. Repeated PHP browser/OS
+        // branches must not outscore the file's own PHP opening tag as Lua.
+        if m == b"elseif " {
+            let line = rest
+                .split(|&b| b == b'\n' || b == b'\r')
+                .next()
+                .unwrap_or(rest);
+            if !line
+                .split(u8::is_ascii_whitespace)
+                .any(|word| word == b"then")
+            {
+                continue;
+            }
+        }
         let Some(entry) = s.entries.get(mat.pattern().as_usize()) else {
             continue;
         };

@@ -302,6 +302,21 @@ impl LangConfig {
         call.child_by_field_name(self.callee_field)
     }
 
+    /// Lua distinguishes `object:method` from `object.field` in its grammar.
+    /// Both retain an explicit receiver and a static member name; argument
+    /// indexes continue to describe source-written arguments (not implicit self).
+    pub(super) fn member_property<'tree>(
+        &self,
+        node: tree_sitter::Node<'tree>,
+    ) -> Option<tree_sitter::Node<'tree>> {
+        let field = if self.lang == Lang::Lua && node.kind() == "method_index_expression" {
+            "method"
+        } else {
+            self.member_property_field
+        };
+        node.child_by_field_name(field)
+    }
+
     /// The Kotlin grammar wraps `f(x) { lambda }` in an outer call whose
     /// first child is `f(x)`. It is one invocation, unlike `(f(x))(y)`.
     pub(super) fn call_head<'tree>(
@@ -748,7 +763,7 @@ static LUA: LangConfig = LangConfig {
     call_kinds: &["function_call"],
     callee_field: "name",
     arguments_field: "arguments",
-    member_kinds: &["dot_index_expression"],
+    member_kinds: &["dot_index_expression", "method_index_expression"],
     member_object_field: "table",
     member_property_field: "field",
     identifier_kinds: &["identifier"],

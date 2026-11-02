@@ -1535,7 +1535,7 @@ fn part<'t>(
     if config.member_kinds.contains(&kind) {
         let (Some(object), Some(prop)) = (
             node.child_by_field_name(config.member_object_field),
-            node.child_by_field_name(config.member_property_field),
+            config.member_property(node),
         ) else {
             return DYNAMIC;
         };

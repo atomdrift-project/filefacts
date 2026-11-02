@@ -95,7 +95,7 @@ impl Builder<'_> {
                 bindings.insert(self.text(node).to_string(), value);
             } else if matches!(
                 node.kind(),
-                "expression_list" | "pattern_list" | "tuple_pattern"
+                "expression_list" | "variable_list" | "pattern_list" | "tuple_pattern"
             ) {
                 // Reversed so names bind left to right, as the recursive
                 // walk did: a repeated name keeps its last binding.
@@ -181,6 +181,31 @@ impl Builder<'_> {
                 value.literal = Some(literal);
             }
             return id;
+        }
+        // Lua's assignments expose sibling lists rather than left/right
+        // fields. Evaluate all RHS expressions before updating bindings so
+        // parallel assignments (a, b = b, a) preserve their old inputs.
+        if self.config.lang == Lang::Lua && node.kind() == "assignment_statement" {
+            let target = named_children(node).find(|child| child.kind() == "variable_list");
+            let value = named_children(node).find(|child| child.kind() == "expression_list");
+            if let (Some(target), Some(value)) = (target, value) {
+                let inputs: Vec<usize> = named_children(value)
+                    .map(|child| self.eval(child, bindings, returns, depth + 1))
+                    .collect();
+                for (index, name) in named_children(target).enumerate() {
+                    // A final call may yield additional values. Their individual
+                    // return positions are unmodeled, so keep them unknown.
+                    self.bind(name, inputs.get(index).copied().unwrap_or(0), bindings);
+                }
+                return self.add(FlowKind::Merge, node, inputs);
+            }
+        }
+        if self.config.lang == Lang::Lua && node.kind() == "variable_declaration" {
+            if let Some(names) = named_children(node).find(|child| child.kind() == "variable_list")
+            {
+                self.bind(names, 0, bindings);
+                return 0;
+            }
         }
         // Some grammars name the `+=` form directly; others reuse the plain
         // assignment kind and hang the operator off it. Each kind is named
@@ -280,7 +305,7 @@ impl Builder<'_> {
                     if !self.config.member_kinds.contains(&n.kind()) {
                         return None;
                     }
-                    let property = n.child_by_field_name(self.config.member_property_field)?;
+                    let property = self.config.member_property(n)?;
                     property
                         .kind()
                         .ends_with("identifier")

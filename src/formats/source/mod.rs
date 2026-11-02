@@ -521,14 +521,34 @@ pub(super) fn looks_like_protocolless_url(value: &str) -> bool {
 /// of them agree on what `f"…"` or `b'…'` holds.
 ///
 /// `None` when the node is not a complete quoted literal: an unterminated
-/// one, or an unquoted form such as a heredoc body, Perl `q{…}` or Lua
-/// `[[…]]`, whose text callers treat as they see fit.
+/// one, or an unquoted form such as a heredoc body or Perl `q{…}`,
+/// whose text callers treat as they see fit. Lua long strings are decoded.
 fn decode_string_literal(
     node: Node<'_>,
     source: &str,
     config: &langs::LangConfig,
 ) -> Option<String> {
     let raw = node.utf8_text(source.as_bytes()).ok()?;
+    if config.lang == Lang::Lua && raw.starts_with('[') {
+        let after_open = raw.strip_prefix('[')?;
+        let level = after_open.bytes().take_while(|&byte| byte == b'=').count();
+        let body = after_open.get(level..)?.strip_prefix('[')?;
+        let close = format!("]{}]", "=".repeat(level));
+        let body = body.strip_suffix(&close)?;
+        // Lua long strings are raw, ignore an initial line break, and
+        // normalize every line-ending form to a single newline.
+        let body = body
+            .strip_prefix("\r\n")
+            .or_else(|| body.strip_prefix("\n\r"))
+            .or_else(|| body.strip_prefix('\n'))
+            .or_else(|| body.strip_prefix('\r'))
+            .unwrap_or(body);
+        return Some(
+            body.replace("\r\n", "\n")
+                .replace("\n\r", "\n")
+                .replace('\r', "\n"),
+        );
+    }
     if config.lang == Lang::Kotlin && raw.starts_with("\"\"\"") {
         return raw
             .strip_prefix("\"\"\"")?

@@ -1597,3 +1597,36 @@ fn javascript_commonjs_exports_follow_the_export_object_and_its_aliases() {
     // Ordinary locals and nested members are not exports.
     assert!(exports("var cfg = {};\ncfg.port = 1;\nexports.a.b = 2;\n").is_empty());
 }
+
+#[test]
+fn lua_long_bracket_literals_and_call_arguments_agree() {
+    for (literal, expected) in [
+        ("[[plain]]", "plain"),
+        ("[=[\nraw \\123 and ]] text]=]", "raw \\123 and ]] text"),
+        (
+            "[==[\r\nfirst\r\nsecond\rthird\n\rfourth]==]",
+            "first\nsecond\nthird\nfourth",
+        ),
+    ] {
+        let source = format!("consume({literal})\n");
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new("template.lua"))
+            .open(source.as_bytes());
+        assert!(
+            parsed
+                .literals()
+                .iter()
+                .any(|value| value.value == expected)
+        );
+        assert!(
+            parsed
+                .symbols()
+                .iter_kind(crate::SymbolKind::Call)
+                .any(|symbol| {
+                    matches!(symbol, crate::Symbol::Call { target: Some(target), args, .. }
+                if target == "consume" && args.iter().any(|arg|
+                    matches!(arg, crate::Arg::String { value } if value == expected)))
+                })
+        );
+    }
+}

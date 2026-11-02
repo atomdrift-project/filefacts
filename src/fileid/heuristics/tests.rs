@@ -908,3 +908,23 @@ fn java_wildcard_does_not_hide_short_php_function_call() {
         assert_eq!(detect_from_content(php), Some(FileType::Php));
     }
 }
+
+#[test]
+fn php_elseif_router_is_not_lua() {
+    for newline in ["\n", "\r\n"] {
+        let mut source = format!("<?{newline}function detect_browser($ua) {{{newline}");
+        source.push_str("if ($ua == 'first') { return 'first'; }\n");
+        for _ in 0..12 {
+            source.push_str("elseif (eregi('browser', $ua)) { return 'other'; }\n");
+        }
+        source.push_str("}\n?>\n");
+        assert_eq!(detect_from_content(source.as_bytes()), Some(FileType::Php));
+    }
+}
+
+#[test]
+fn lua_elseif_requires_its_then_keyword() {
+    let source =
+        b"if first then return 1\nelseif second then return 2\nelseif third then return 3\nend\n";
+    assert_eq!(detect_from_content(source), Some(FileType::Lua));
+}

