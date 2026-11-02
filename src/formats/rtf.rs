@@ -406,15 +406,53 @@ fn objdata_objects(bytes: &[u8], strings: &mut Strings, metrics: &mut Metrics) -
     out
 }
 
-/// Decode the run of hex digits that follows `\objdata`, skipping the
-/// whitespace and group braces writers wrap it with. Stops at the first
-/// byte that is neither, which is where the object group ends.
+/// Decode hex object data while ignoring RTF formatting controls and nested
+/// groups. A closing brace at the entry depth terminates this destination;
+/// bytes in later document groups must never become part of the object.
+/// Both input scanning and output allocation remain independently bounded.
 fn decode_hex_run(bytes: &[u8], max_hex: usize, max_out: usize) -> Vec<u8> {
     let mut out = Vec::new();
     let mut high: Option<u8> = None;
-    for &b in bytes.iter().take(max_hex) {
-        if b.is_ascii_whitespace() || b == b'{' {
-            continue;
+    let mut depth = 0usize;
+    let mut rest = bytes.get(..max_hex).unwrap_or(bytes);
+    while let Some((&b, tail)) = rest.split_first() {
+        rest = tail;
+        match b {
+            b'{' => {
+                depth += 1;
+                if depth > MAX_GROUP_DEPTH as usize {
+                    break;
+                }
+                continue;
+            }
+            b'}' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                continue;
+            }
+            b'\\' => {
+                if rest.first().is_some_and(u8::is_ascii_alphabetic) {
+                    let (word, tail) = split_control_word(rest);
+                    // Binary destinations need a separate byte-oriented reader.
+                    // Do not interpret their bytes as hex or formatting.
+                    if word == b"bin" {
+                        break;
+                    }
+                    rest = tail.strip_prefix(b" ").unwrap_or(tail);
+                    continue;
+                }
+                if let Some(tail) = rest.strip_prefix(b"*") {
+                    rest = tail;
+                    continue;
+                }
+                // Escaped braces or character escapes are literal data, not
+                // formatting controls that can safely be discarded.
+                break;
+            }
+            _ if b.is_ascii_whitespace() => continue,
+            _ => {}
         }
         let Some(nib) = hex_nibble(b) else {
             break;
@@ -422,10 +460,10 @@ fn decode_hex_run(bytes: &[u8], max_hex: usize, max_out: usize) -> Vec<u8> {
         match high.take() {
             None => high = Some(nib),
             Some(h) => {
-                out.push((h << 4) | nib);
                 if out.len() >= max_out {
                     break;
                 }
+                out.push((h << 4) | nib);
             }
         }
     }

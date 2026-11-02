@@ -29,6 +29,14 @@ pub(super) fn to_der(ber: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Normalize a complete standalone CMS object. Unlike an embedded signature
+/// blob, a standalone profile must not silently discard trailing bytes.
+pub(super) fn to_der_exact(ber: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(ber.len());
+    let rest = element(ber, &mut out, 0)?;
+    rest.is_empty().then_some(out)
+}
+
 /// Read one element from `input`, append its DER form to `out`, and return
 /// the bytes after it.
 fn element<'a>(input: &'a [u8], out: &mut Vec<u8>, depth: usize) -> Option<&'a [u8]> {

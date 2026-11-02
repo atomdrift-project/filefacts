@@ -1212,12 +1212,19 @@ impl<'s> Analysis<'s> {
         depth: usize,
     ) -> Bits {
         let condition = node.child_by_field_name("condition");
-        // Reachability is enforced only for the module-execution fact.
-        if self.language.is_ecmascript()
-            && condition.is_some_and(|n| self.text(n).trim_matches(['(', ')', ' ']) == "false")
-        {
-            return 0;
-        }
+        // A literal boolean determines which branch can produce a payload.
+        // Keep the alternative of `if false`; dropping both branches loses
+        // real sends. Other conditions remain conservative branch unions.
+        let constant =
+            condition.and_then(
+                |n| match self.text(n).trim_matches(['(', ')', ' ', '\n', '\t']) {
+                    "false" if self.language != Lang::Python => Some(false),
+                    "true" if self.language != Lang::Python => Some(true),
+                    "False" if self.language == Lang::Python => Some(false),
+                    "True" if self.language == Lang::Python => Some(true),
+                    _ => None,
+                },
+            );
         if let Some(condition) = condition {
             self.eval(condition, bindings, out, depth + 1);
         }
@@ -1227,6 +1234,9 @@ impl<'s> Analysis<'s> {
         let mut merged: BTreeMap<String, Bits> = BTreeMap::new();
         let mut result = 0;
         for field in ["consequence", "alternative"] {
+            if constant.is_some_and(|value| value != (field == "consequence")) {
+                continue;
+            }
             if let Some(branch) = node.child_by_field_name(field) {
                 let mut branch_bindings = Bindings::under(bindings);
                 result |= self.eval(branch, &mut branch_bindings, out, depth + 1);

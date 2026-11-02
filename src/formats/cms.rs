@@ -326,6 +326,32 @@ pub(crate) fn parse_cms_blob(der_bytes: &[u8]) -> Option<JsonValue> {
     parse_pkcs7(der_bytes, Signs::Encapsulated).map(|sig| sig.to_json())
 }
 
+/// Recover a property list carried as CMS SignedData's encapsulated data.
+/// Apple provisioning profiles use this envelope. Follow the ASN.1 fields,
+/// never an XML substring elsewhere in the certificate or signature material.
+/// This validates framing and plist structure, not a signature or trust chain;
+/// forged signatures must still expose their content to normal analysis.
+pub(crate) fn encapsulated_plist(bytes: &[u8]) -> Option<::plist::Value> {
+    // Profiles are normally tens of KiB. Bound allocations before DER/BER
+    // decoding; plist_guard independently bounds nesting and DAG expansion.
+    if bytes.first() != Some(&0x30) || bytes.len() > 16 * 1024 * 1024 {
+        return None;
+    }
+    let ci = ContentInfo::from_der(bytes)
+        .ok()
+        .or_else(|| ContentInfo::from_der(&ber::to_der_exact(bytes)?).ok())?;
+    if ci.content_type != ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2") {
+        return None;
+    }
+    let signed_data: SignedData = ci.content.decode_as().ok()?;
+    let encap = signed_data.encap_content_info;
+    if encap.econtent_type != ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1") {
+        return None;
+    }
+    let content: OctetString = encap.econtent?.decode_as().ok()?;
+    super::plist_guard::parse(content.as_bytes()).ok()
+}
+
 /// [`parse_cms_blob`] for a detached signature over `content`. The Mach-O
 /// code-signature module hands over the CMS blob found inside
 /// `CSMAGIC_BLOBWRAPPER` with the CodeDirectory it signs, which lives beside

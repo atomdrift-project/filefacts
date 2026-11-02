@@ -57,7 +57,8 @@ fn label_name(name: &str) -> Option<String> {
 /// not follow: compound syntax, nested interpreters and batch transfers.
 fn opaque(line: &str) -> bool {
     let cmd = words(line).0;
-    line.chars().any(|c| "&|()^".contains(c))
+    line.chars().any(|c| "&|(^".contains(c))
+        || line.split_whitespace().any(|token| token.starts_with(')'))
         || ["call", "for", "cmd", "cmd.exe", "command", "command.com"]
             .iter()
             .any(|name| cmd.eq_ignore_ascii_case(name))

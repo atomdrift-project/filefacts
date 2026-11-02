@@ -246,13 +246,28 @@ pub(super) fn extract_plist(
     values: &mut Values,
     errors: &mut Errors,
 ) -> Result<(), Error> {
-    merge_document(plist::parse_plist(bytes)?, values, errors);
+    let document = plist::parse_plist(bytes)?;
+    // Set the envelope observation before merging untrusted document fields.
+    // It is a framing fact, not verification of any signature or permissions.
+    values.insert_key(
+        value_key!("plist.cms_wrapped"),
+        JsonValue::Bool(bytes.first() == Some(&0x30)),
+    );
+    merge_document(document, values, errors);
     Ok(())
 }
 
 /// Typed native entitlement requests. A declaration is not proof of a valid
 /// signature, permission grant, bundle identity or an executed memory action.
 pub(super) fn plist_entitlement_metrics(values: &Values, metrics: &mut Metrics) {
+    // Preserve the extractor-owned envelope observation in the typed metric
+    // view as well. Consumers that reparse raw document keys must not treat a
+    // document-supplied plist.cms_wrapped field as evidence of CMS framing.
+    let cms_wrapped = values.get("plist.cms_wrapped").and_then(JsonValue::as_bool) == Some(true);
+    metrics.insert(
+        metric!("plist.cms_wrapped"),
+        f64::from(u8::from(cms_wrapped)),
+    );
     for (key, field) in [
         (
             "com.apple.security.cs.allow-jit",

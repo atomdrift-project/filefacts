@@ -4,6 +4,136 @@ use super::{
 };
 use der::oid::ObjectIdentifier;
 
+mod plist_envelopes {
+    use cms::content_info::{CmsVersion, ContentInfo};
+    use cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerInfos};
+    use der::asn1::{Any, OctetString, SetOfVec};
+    use der::{Decode, Encode};
+    use std::path::Path;
+
+    const XML: &[u8] = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+<key>ProvisionsAllDevices</key><true/>
+<key>Entitlements</key><dict><key>com.apple.security.get-task-allow</key><true/></dict>
+</dict></plist>"#;
+
+    fn envelope(content: Option<&[u8]>, outer: &str, inner: &str) -> Vec<u8> {
+        let sd = SignedData {
+            version: CmsVersion::V1,
+            digest_algorithms: SetOfVec::default(),
+            encap_content_info: EncapsulatedContentInfo {
+                econtent_type: inner.parse().unwrap(),
+                econtent: content.map(|bytes| {
+                    Any::from_der(&OctetString::new(bytes).unwrap().to_der().unwrap()).unwrap()
+                }),
+            },
+            certificates: None,
+            crls: None,
+            signer_infos: SignerInfos(SetOfVec::default()),
+        };
+        ContentInfo {
+            content_type: outer.parse().unwrap(),
+            content: Any::from_der(&sd.to_der().unwrap()).unwrap(),
+        }
+        .to_der()
+        .unwrap()
+    }
+
+    fn wrap(content: &[u8]) -> Vec<u8> {
+        envelope(
+            Some(content),
+            "1.2.840.113549.1.7.2",
+            "1.2.840.113549.1.7.1",
+        )
+    }
+
+    #[test]
+    fn cms_plist_is_identified_and_extracted_without_trusting_a_signature() {
+        // No signer exists: framing must not grant trust or hide the contents.
+        let bytes = wrap(XML);
+        for name in [
+            "embedded.provisionprofile",
+            "profile.mobileprovision",
+            "renamed.bin",
+        ] {
+            let parsed = crate::OpenOptions::new()
+                .path(Path::new(name))
+                .rizin(false)
+                .open(&bytes);
+            assert_eq!(parsed.fileid().file_type(), crate::FileType::Plist);
+            if name != "renamed.bin" {
+                assert!(!parsed.fileid().extension_mismatch());
+            }
+            assert_eq!(
+                parsed.values().get("plist.cms_wrapped"),
+                Some(&serde_json::json!(true))
+            );
+            assert_eq!(
+                parsed.values().get("ProvisionsAllDevices"),
+                Some(&serde_json::json!(true))
+            );
+            assert_eq!(
+                parsed.values().as_json()["Entitlements"]["com.apple.security.get-task-allow"],
+                true
+            );
+        }
+    }
+
+    #[test]
+    fn cms_plist_accepts_binary_plists_and_ber_framing() {
+        let value = plist::Value::from_reader(std::io::Cursor::new(XML)).unwrap();
+        let mut binary = Vec::new();
+        value.to_writer_binary(&mut binary).unwrap();
+        assert!(super::super::encapsulated_plist(&wrap(&binary)).is_some());
+        let der = wrap(XML);
+        let (tag, body, _) = super::super::read_tlv(&der).unwrap();
+        assert_eq!(tag, 0x30);
+        let mut ber = vec![0x30, 0x80];
+        ber.extend_from_slice(body);
+        ber.extend_from_slice(&[0, 0]);
+        assert!(super::super::encapsulated_plist(&ber).is_some());
+    }
+
+    #[test]
+    fn cms_plist_rejects_wrong_roles_truncation_trailing_data_and_non_plists() {
+        for (outer, inner, content) in [
+            ("1.2.840.113549.1.7.1", "1.2.840.113549.1.7.1", Some(XML)),
+            ("1.2.840.113549.1.7.2", "1.2.840.113549.1.7.2", Some(XML)),
+            ("1.2.840.113549.1.7.2", "1.2.840.113549.1.7.1", None),
+            (
+                "1.2.840.113549.1.7.2",
+                "1.2.840.113549.1.7.1",
+                Some(&b"not a plist"[..]),
+            ),
+        ] {
+            assert!(super::super::encapsulated_plist(&envelope(content, outer, inner)).is_none());
+        }
+        let mut bytes = wrap(XML);
+        for end in 0..bytes.len() {
+            assert!(super::super::encapsulated_plist(&bytes[..end]).is_none());
+        }
+        bytes.extend_from_slice(b"trailing");
+        assert!(super::super::encapsulated_plist(&bytes).is_none());
+        let raw = [b"junk".as_slice(), XML].concat();
+        assert!(super::super::encapsulated_plist(&raw).is_none());
+    }
+
+    #[test]
+    fn plain_plist_cannot_forge_the_cms_envelope_observation() {
+        let bytes = br#"<plist version="1.0"><dict><key>plist</key><dict>
+<key>cms_wrapped</key><true/></dict></dict></plist>"#;
+        let parsed = crate::OpenOptions::new()
+            .path(Path::new("forged.plist"))
+            .rizin(false)
+            .open(bytes);
+        assert_eq!(
+            parsed.values().get("plist.cms_wrapped"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(parsed.metrics().get("plist.cms_wrapped"), Some(0.0));
+        assert!(!parsed.errors().is_empty());
+    }
+}
+
 /// A real Authenticode blob: Tencent's leaf, issued by DigiCert's SHA2
 /// Assured ID Code Signing CA (the root is not in the bag).
 const DIGICERT_TENCENT: &[u8] = include_bytes!(concat!(

@@ -294,3 +294,50 @@ fn escaped_braces_dont_unbalance_depth() {
         Some("A{B}C")
     );
 }
+
+#[test]
+fn objdata_formatting_controls_and_sibling_groups_preserve_nibble_pairs() {
+    let rtf = objdata_rtf("Package", b"cmd /c harmless-test-marker");
+    let text = String::from_utf8(rtf).unwrap();
+    let start = text.find("objdata ").unwrap() + 8;
+    let end = text[start..].find('}').unwrap() + start;
+    let mut interleaved = text[..start].to_string();
+    for (i, nibble) in text[start..end]
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .enumerate()
+    {
+        if i % 11 == 0 {
+            interleaved.push_str("{\\f27 ");
+        }
+        interleaved.push(nibble);
+        interleaved.push_str(" \\c731 ");
+        if i % 11 == 10 {
+            interleaved.push('}');
+        }
+    }
+    let nibbles = text[start..end]
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .count();
+    if nibbles % 11 != 0 {
+        interleaved.push('}');
+    }
+    interleaved.push_str(&text[end..]);
+    let (v, _) = extract_rtf(interleaved.as_bytes());
+    let objects = v.get("rtf.objects").and_then(|x| x.as_array()).unwrap();
+    assert_eq!(objects[0]["class"], "Package");
+    assert_eq!(objects[0]["native_len"], 27);
+}
+
+#[test]
+fn objdata_stops_at_destination_boundary_and_obeys_both_limits() {
+    assert_eq!(
+        decode_hex_run(b"{\\f2 4\\c7 1} {\\f3 4\\c7 2}}4344", 100, 100),
+        b"AB"
+    );
+    assert_eq!(decode_hex_run(b"41424344", 100, 2), b"AB");
+    assert_eq!(decode_hex_run(b"41424344", 4, 100), b"AB");
+    assert!(decode_hex_run(b"\\bin4 4142", 100, 100).is_empty());
+    assert!(decode_hex_run(b"\\{4142", 100, 100).is_empty());
+}

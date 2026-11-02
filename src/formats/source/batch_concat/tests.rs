@@ -112,3 +112,13 @@ fn simple_errorlevel_prelude_reaches_loop() {
     let source = format!("if errorlevel 1 goto start\necho alternate\ngoto start\n:start\n{LOOP}");
     assert_eq!(analyze(&source).seeded, 1);
 }
+
+#[test]
+fn closing_parenthesis_inside_argument_does_not_stop_fallthrough() {
+    // At top level a closing parenthesis inside an argument is literal; it
+    // does not establish a compound command or terminate this batch file.
+    let source = format!("unknown missing-command:)\n{LOOP}");
+    assert_eq!(analyze(&source).seeded, 1);
+    assert_eq!(analyze(&format!("echo )\n{LOOP}")).loops, 0);
+    assert_eq!(analyze(&format!("( exit /b )\n{LOOP}")).loops, 0);
+}

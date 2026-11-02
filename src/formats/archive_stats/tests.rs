@@ -284,3 +284,31 @@ fn is_noise_filename_helper() {
     // Case-sensitive — exact Windows / macOS conventions only.
     assert!(!is_noise_filename("THUMBS.DB"));
 }
+
+#[test]
+fn managed_package_executables_have_expected_locations() {
+    for path in [
+        "lib/net8.0/Library.dll",
+        "Lib/net48/Plugins/Plugin.dll",
+        "ref/net8.0/Reference.dll",
+        "runtimes/win-x64/native/Native.dll",
+        "tools/net8.0/any/Tool.dll",
+        "tasks/Build.Tasks.dll",
+        "weaver/Weaver.dll",
+        "project/bin/Release/App.exe",
+    ] {
+        let class = classify_filename(path);
+        assert!(class.is_executable, "{path}");
+        assert!(!class.is_misplaced_executable, "{path}");
+    }
+    for path in [
+        "docs/invoice.pdf.exe",
+        "tools/invoice.pdf.exe",
+        "lib/../../payload.dll",
+        "photos/PhotoViewer.dll",
+        "adlib/Library.dll",
+        "ribbon/Tool.exe",
+    ] {
+        assert!(classify_filename(path).is_misplaced_executable, "{path}");
+    }
+}

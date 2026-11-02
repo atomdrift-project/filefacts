@@ -721,6 +721,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "pkg.checksums",
     "pkg.source_github_owners",
     "pkg.url_github_owner",
+    "plist.cms_wrapped",
     "png.chunks",
     "png.dimensions",
     "png.features",

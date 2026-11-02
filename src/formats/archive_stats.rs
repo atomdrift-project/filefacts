@@ -694,8 +694,9 @@ pub(super) fn classify_filename(path: &str) -> FilenameClass {
     c.is_nested_archive = is_archive_extension(extension);
 
     if c.is_executable {
-        // PE executables belong under a `bin/`-like prefix and `.so`/`.dylib`
-        // under `lib*/`; anything else is "misplaced", the canonical lure.
+        // Executable placement is a packaging observation, not a malware
+        // verdict. Managed/NuGet libraries and build tools also have normal
+        // lib/, ref/, runtimes/, tools/, tasks/ and weaver/ locations.
         let is_unix_lib = matches!(extension, "so" | "dylib");
         let is_pe = matches!(extension, "exe" | "dll" | "sys" | "scr");
         let in_bin = ["bin/", "usr/bin/", "sbin/", "usr/sbin/", "usr/local/bin/"]
@@ -707,7 +708,14 @@ pub(super) fn classify_filename(path: &str) -> FilenameClass {
         c.is_misplaced_executable = if is_unix_lib {
             !in_lib
         } else if is_pe {
-            !path.to_ascii_lowercase().contains("bin/")
+            let lower_path = path.to_ascii_lowercase();
+            let in_pe_package_dir = ["lib/", "ref/", "runtimes/", "tools/", "tasks/", "weaver/"]
+                .iter()
+                .any(|prefix| lower_path.starts_with(prefix));
+            let in_bin_component = lower_path.split('/').any(|part| part == "bin");
+            c.has_path_traversal
+                || c.has_double_extension
+                || !(in_bin_component || in_pe_package_dir)
         } else {
             matches!(extension, "bin" | "elf") && !in_bin
         };

@@ -270,8 +270,23 @@ impl Builder<'_> {
             // Nested calls can have the same start offset (f().g()). Resolve
             // this callee with the symbol extractor's shared syntax helper;
             // an offset-to-single-target map would conflate the calls.
-            let mut target =
-                callee.and_then(|n| ast_walk::static_dotted_chain(n, self.source, self.config));
+            let mut target = callee.and_then(|n| {
+                ast_walk::static_dotted_chain(n, self.source, self.config).or_else(|| {
+                    // A computed receiver can still have a statically named
+                    // method: `frame[2:].decode()`. Preserve only the suffix,
+                    // with a leading dot so it cannot impersonate a free or
+                    // module-qualified function. The receiver graph remains
+                    // separate; library transfers still require an explicit model.
+                    if !self.config.member_kinds.contains(&n.kind()) {
+                        return None;
+                    }
+                    let property = n.child_by_field_name(self.config.member_property_field)?;
+                    property
+                        .kind()
+                        .ends_with("identifier")
+                        .then(|| format!(".{}", self.text(property)))
+                })
+            });
             if let Some(raw) = target.as_ref() {
                 let end = raw.find(['.', ':', '(']).unwrap_or(raw.len());
                 if bindings.get(&raw[..end]).is_none() {

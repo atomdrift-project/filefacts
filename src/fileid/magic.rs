@@ -120,6 +120,7 @@ const RULES: &[fn(&Probe<'_, '_>) -> Option<Found>] = &[
     vhd_image,
     iso_image,
     certificate_signature,
+    cms_property_list,
     image4_trustcache,
     tiff_header,
     renpy_compiled_script,
@@ -208,6 +209,12 @@ fn cold_fusion_template(p: &Probe<'_, '_>) -> Option<Found> {
         || p.data
             .starts_with(b"Allaire Cold Fusion Template\r\nHeader Size: "))
     .then_some((FileType::Cfml, DetectionSource::Magic))
+}
+
+/// CMS framing around a parsed property list, independent of its filename.
+fn cms_property_list(p: &Probe<'_, '_>) -> Option<Found> {
+    crate::formats::cms::encapsulated_plist(p.data)
+        .map(|_| (FileType::Plist, DetectionSource::Magic))
 }
 
 /// DER tags (ITU-T X.690 §8.6, §8.9) an X.509 certificate is framed with.

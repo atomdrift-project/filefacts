@@ -13,7 +13,12 @@ pub(super) const PLIST_MAX_DEPTH: usize = super::super::plist_guard::MAX_DEPTH;
 /// through [`plist_guard::parse`](super::super::plist_guard::parse), which refuses
 /// reference expansion and nesting the conversion below could not survive.
 pub(super) fn parse_plist(bytes: &[u8]) -> Result<JsonValue, Error> {
-    let parsed = super::super::plist_guard::parse(bytes).map_err(|e| e.into_error("plist"))?;
+    let parsed = if bytes.first() == Some(&0x30) {
+        super::super::cms::encapsulated_plist(bytes)
+            .ok_or_else(|| Error::malformed("plist", "invalid CMS-wrapped property list"))?
+    } else {
+        super::super::plist_guard::parse(bytes).map_err(|e| e.into_error("plist"))?
+    };
     Ok(plist_to_json(parsed))
 }
 

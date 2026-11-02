@@ -720,3 +720,39 @@ fn calls_record_whether_they_run_at_load_time() {
     assert_eq!(module_level("cp.execSync"), Some(true));
     assert_eq!(module_level("cp.spawnSync"), Some(false));
 }
+
+#[test]
+fn computed_receiver_retains_method_suffix_and_requires_a_transfer_model() {
+    for (method, expected) in [("decode", true), ("transform", false)] {
+        let source = format!(
+            "import subprocess\nframe=sock.recv(4096)\nsubprocess.check_output(frame[2:].{method}(), shell=True)\n"
+        );
+        let flow = graph("relay.py", &source);
+        let sink = flow
+            .values
+            .iter()
+            .find(|v| v.target.as_deref() == Some("subprocess.check_output"))
+            .unwrap();
+        let models = [FlowTransfer {
+            call: ".decode".into(),
+            arguments: vec![],
+            receiver: true,
+        }];
+        let origins = flow.origins(sink.inputs[0], &models, 1000);
+        // Calls at the requested source and unmodeled transforms remain
+        // opaque; the test concerns whether the explicit transfer reaches recv.
+        assert_eq!(
+            origins
+                .values
+                .iter()
+                .any(|origin| flow.values[origin.value].target.as_deref() == Some("sock.recv")),
+            expected,
+            "{source}: {flow:?}"
+        );
+        assert!(
+            flow.values
+                .iter()
+                .any(|value| value.target.as_deref() == Some(&format!(".{method}")))
+        );
+    }
+}

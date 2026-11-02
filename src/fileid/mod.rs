@@ -504,6 +504,13 @@ const CONVENTIONS: &[(&str, Holds)] = &[
     ("apple_strings_plist", |c| {
         c.content == FileType::Plist && c.name_ends_ci(".strings")
     }),
+    // Provisioning profiles carry their plist inside CMS SignedData. That
+    // envelope is validated by content detection; the suffix grants no trust.
+    ("apple_provisioning_plist", |c| {
+        c.content == FileType::Plist
+            && c.sniff.data.first() == Some(&0x30)
+            && (c.name_ends_ci(".provisionprofile") || c.name_ends_ci(".mobileprovision"))
+    }),
     // Legacy PyTorch uses pickle plus raw storage under its model suffixes.
     // Its native magic and version framing are required; the suffix grants
     // no trust.
