@@ -115,6 +115,39 @@ fn surfaces_comment() {
 }
 
 #[test]
+fn short_comment_lengths_are_reported_only_as_segment_headers() {
+    for len in [0, 1] {
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xFE, 0, len, 0xFF, 0xD9];
+        let (values, _) = run(&jpeg);
+        let features = values
+            .get("jpeg.features")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert!(
+            features
+                .iter()
+                .any(|v| v.as_str() == Some("short_comment_length"))
+        );
+        assert_eq!(
+            values.get("media.valid").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+    for jpeg in [
+        build_jpeg(&[(0xFE, vec![])]),
+        build_jpeg(&[(0xE1, vec![0xFF, 0xFE, 0, 1])]),
+    ] {
+        let (values, _) = run(&jpeg);
+        assert!(
+            !values
+                .get("jpeg.features")
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("short_comment_length")))
+        );
+    }
+}
+
+#[test]
 fn detects_concatenated_jpegs() {
     let data = vec![0xFF, 0xD8, 0xFF, 0xD8, 0xFF, 0xD9];
     let (v, m) = run(&data);

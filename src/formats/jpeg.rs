@@ -14,7 +14,7 @@
 //! - `jpeg.adobe_color_transform` — APP14 Adobe color-transform byte.
 //! - `jpeg.features[]` — Pike-style flag array: `exif`, `gps`, `icc`,
 //!   `iptc`, `photoshop_irb`, `xmp`, `jfif_thumbnail`,
-//!   `concatenated_jpegs`.
+//!   `concatenated_jpegs`, `short_comment_length`.
 //! - `jpeg.{segment_count, app_segment_count, com_count, dqt_count,
 //!   dht_count, soi_count, maker_note_bytes}` — flat metrics.
 
@@ -103,6 +103,10 @@ pub(super) fn extract(
                 };
                 let seg_len = usize::from(u16::from_be_bytes(len));
                 if seg_len < 2 {
+                    coverage.problem("JPEG segment length shorter than length field");
+                    if marker == 0xFE {
+                        state.features.push("short_comment_length");
+                    }
                     break;
                 }
                 let body_start = pos + 2;

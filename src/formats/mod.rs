@@ -140,6 +140,7 @@ mod macho;
 mod markdown;
 mod maven_pom;
 mod msbuild;
+mod ne;
 mod nib;
 mod npm;
 mod nupkg;
@@ -282,6 +283,7 @@ pub(crate) fn extract(
             scpt::extract(bytes, ctx.values, ctx.strings, ctx.metrics, ctx.symbols)
         }
         FileType::Pe => pe::extract(bytes, ctx.reborrow()),
+        FileType::Ne => ne::extract(bytes, ctx.symbols, ctx.metrics),
         FileType::Elf => {
             elf::extract(bytes, ctx.reborrow());
             Ok(())

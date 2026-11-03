@@ -30,6 +30,7 @@
 //! assert_eq!(id.file_type(), FileType::Elf);
 //! ```
 
+mod commodore;
 pub mod container;
 mod dos;
 mod ext;
@@ -43,12 +44,17 @@ mod marks;
 mod package_layout;
 mod perl_shell_shim;
 pub(crate) mod phar;
+mod prodos;
 mod restructuredtext;
+mod rexx_cms;
+mod sap_abap;
 mod scripts;
 pub(crate) mod shellcode;
+mod sign_of_misery;
 mod sniff;
 mod text;
 mod torch;
+mod unix_aout16;
 mod zip_probe;
 
 pub use container::{ArchiveFormat, Compression, Container, container_of};
@@ -676,6 +682,9 @@ const RULES: &[(&str, Rule)] = &[
     ("gcc_specs", gcc_specs),
     ("git_config", git_config),
     ("batch_polyglot", batch_polyglot),
+    ("ftp_command_script", ftp_command_script),
+    ("rexx_cms_script", rexx_cms_script),
+    ("sap_abap_report", sap_abap_report),
     ("restructuredtext_document", restructuredtext_document),
     ("markdown_document", markdown_document),
     ("unmistakable_mark", unmistakable_mark),
@@ -818,6 +827,21 @@ fn git_config(sniff: &Sniff<'_>) -> Option<Detection> {
         .then(|| Detection::heuristic(sniff, FileType::Text))
 }
 
+/// CMS REXX EXECs may be extensionless and otherwise look like comment-led
+/// prose. Recognize a bounded combination of REXX statements and CMS I/O.
+fn rexx_cms_script(sniff: &Sniff<'_>) -> Option<Detection> {
+    (sniff.ext_type().is_none_or(|ft| ft == FileType::Text)
+        && rexx_cms::looks_like_cms_exec(sniff.text()))
+    .then(|| Detection::heuristic(sniff, FileType::Text))
+}
+
+/// Extensionless ABAP report source with SAP repository I/O.
+fn sap_abap_report(sniff: &Sniff<'_>) -> Option<Detection> {
+    (sniff.ext_type().is_none_or(|ft| ft == FileType::Text)
+        && sap_abap::looks_like_report(sniff.text()))
+    .then(|| Detection::heuristic(sniff, FileType::Text))
+}
+
 /// A real batch prologue precedes the binary body in BAT/COM hybrids.
 /// Registered suffixes must not discard the same content evidence that
 /// identifies the hybrid under an unknown or prose suffix.
@@ -825,6 +849,76 @@ fn batch_polyglot(sniff: &Sniff<'_>) -> Option<Detection> {
     ((sniff.binary_not_source() || dos::looks_like_dos_com(sniff.data))
         && scripts::binary_batch_prologue(sniff))
     .then(|| Detection::heuristic(sniff, FileType::Batch))
+}
+
+/// A line-oriented FTP client command file is data for the FTP client, not
+/// source code merely because its name ends in a language extension. Require
+/// the full connect / binary / download / exit sequence in order, so a single
+/// quoted or documented FTP command cannot override a source-file claim.
+fn ftp_command_script(sniff: &Sniff<'_>) -> Option<Detection> {
+    let data = sniff.data;
+    if data.len() > 4096 || !data.is_ascii() {
+        return None;
+    }
+    let mut lines = data
+        .split(|b| *b == b'\n')
+        .map(|line| line.trim_ascii())
+        .filter(|line| !line.is_empty());
+    let mut first = lines
+        .next()?
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|s| !s.is_empty());
+    if !first.next()?.eq_ignore_ascii_case(b"open") {
+        return None;
+    }
+    let host = first.next()?;
+    if host.is_empty()
+        || !host
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':'))
+    {
+        return None;
+    }
+    if let Some(port) = first.next() {
+        let valid_port = std::str::from_utf8(port)
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .is_some_and(|n| n > 0);
+        if !valid_port || first.next().is_some() {
+            return None;
+        }
+    }
+    let mut binary = false;
+    let mut get = false;
+    let mut ended = false;
+    for line in lines {
+        if ended {
+            return None;
+        }
+        if line
+            .iter()
+            .any(|b| !b.is_ascii_graphic() && !b.is_ascii_whitespace())
+        {
+            return None;
+        }
+        if line.eq_ignore_ascii_case(b"binary") || line.eq_ignore_ascii_case(b"bin") {
+            binary = true;
+        } else if get && (line.eq_ignore_ascii_case(b"bye") || line.eq_ignore_ascii_case(b"quit")) {
+            ended = true;
+        } else if binary {
+            let mut words = line
+                .split(|b| b.is_ascii_whitespace())
+                .filter(|s| !s.is_empty());
+            if words
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case(b"get"))
+                && words.next().is_some()
+            {
+                get = true;
+            }
+        }
+    }
+    ended.then(|| Detection::heuristic(sniff, FileType::Text))
 }
 
 /// ReStructuredText documents often contain executable-looking examples. A
@@ -1113,11 +1207,19 @@ fn has_named_extension(path: &Path) -> bool {
     !dotted_camel_case_tail
 }
 
-/// A program with no header of its own: a DOS COM, else x86 code that opens
-/// with a GetPC idiom.
+/// Recognize selected headerless or lightly structured programs when no
+/// stronger format or filename rule has claimed the bytes.
 fn headerless_program(data: &[u8]) -> Option<FileType> {
     if dos::looks_like_dos_com(data) {
         Some(FileType::DosCom)
+    } else if commodore::has_basic_sys_loader(data)
+        || prodos::has_prodos_system_code(data)
+        || prodos::has_prodos_boot_code(data)
+        || sign_of_misery::looks_like_script(data)
+        || unix_aout16::looks_like_image(data)
+    {
+        // These formats have no dedicated type yet, so use generic analysis.
+        Some(FileType::Data)
     } else if shellcode::detect(data).is_some() {
         Some(FileType::Shellcode)
     } else {

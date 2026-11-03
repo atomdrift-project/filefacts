@@ -594,6 +594,10 @@ fn first_byte_signature(p: &Probe<'_, '_>) -> Option<Found> {
             if second == b'Z' {
                 let file_type = if looks_like_ne_executable(data) {
                     FileType::Ne
+                } else if super::dos::looks_like_dos_mz(data) && !has_extended_mz_header(data) {
+                    // Preserve a validated 16-bit DOS image for generic byte
+                    // analysis rather than routing it to the PE parser.
+                    FileType::Data
                 } else {
                     FileType::Pe
                 };
@@ -1232,6 +1236,22 @@ fn is_supported_python_bytecode_magic(magic: u16) -> bool {
             | 3627
             | 62211
     )
+}
+
+/// Preserve newer executable formats that share the MZ prefix; their DOS stub
+/// can itself have a coherent page count and entry point.
+fn has_extended_mz_header(data: &[u8]) -> bool {
+    let Some(&[a, b, c, d]) = data.get(0x3c..0x40) else {
+        return false;
+    };
+    let offset = u32::from_le_bytes([a, b, c, d]) as usize;
+    if offset < 0x40 {
+        return false;
+    }
+    let Some(signature) = data.get(offset..offset.saturating_add(2)) else {
+        return false;
+    };
+    matches!(signature, b"PE" | b"NE" | b"LE" | b"LX" | b"W3" | b"W4")
 }
 
 /// Check the DOS MZ header's `e_lfanew` pointer for a Windows NE signature.
