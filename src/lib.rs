@@ -147,6 +147,9 @@ pub mod pyarmor {
     };
 }
 
+/// Bounded integrity-checked recovery of RC4-encrypted code containers.
+pub mod rc4_container;
+
 pub mod cache;
 pub mod fileid;
 mod tools;
