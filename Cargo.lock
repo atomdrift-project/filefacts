@@ -90,6 +90,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "binform"
 version = "0.1.0"
+source = "git+https://github.com/atomdrift-project/binform.git#3542ed751dd073cb1a97cd34b0bd17aa2934b26c"
 dependencies = [
  "gimli",
  "iced-x86",

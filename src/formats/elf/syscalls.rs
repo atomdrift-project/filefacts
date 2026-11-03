@@ -62,7 +62,10 @@ pub(super) fn emit(
         let endpoints = endpoints(&unique);
         if !endpoints.is_empty() {
             let count = endpoints.len();
-            values.insert_key(value_key!("elf.network_endpoints"), JsonValue::Array(endpoints));
+            values.insert_key(
+                value_key!("elf.network_endpoints"),
+                JsonValue::Array(endpoints),
+            );
             metrics.insert(metric!("elf.network_endpoint_count"), count as f64);
         }
     }
@@ -167,7 +170,12 @@ fn decode_sockaddr(index: usize, value: &binform::Value) -> Option<JsonValue> {
     let port = u16::from_be_bytes([byte(bytes, 2)?, byte(bytes, 3)?]);
     let (kind, ip) = match family {
         AF_INET => {
-            let octets = [byte(bytes, 4)?, byte(bytes, 5)?, byte(bytes, 6)?, byte(bytes, 7)?];
+            let octets = [
+                byte(bytes, 4)?,
+                byte(bytes, 5)?,
+                byte(bytes, 6)?,
+                byte(bytes, 7)?,
+            ];
             ("sockaddr_in", Ipv4Addr::from(octets).to_string())
         }
         AF_INET6 => {

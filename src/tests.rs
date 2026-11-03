@@ -152,13 +152,8 @@ fn validate_source_query_reports_invalid_query_with_its_cause() {
 /// whichever was scanned first would decide the mismatch metric for both.
 #[test]
 fn cache_variant_separates_extension_transitions() {
-    let as_font = extraction_cache_variant(
-        None,
-        FileType::Shell,
-        true,
-        Some(("script", "font")),
-        None,
-    );
+    let as_font =
+        extraction_cache_variant(None, FileType::Shell, true, Some(("script", "font")), None);
     let as_unknown = extraction_cache_variant(
         None,
         FileType::Shell,
@@ -166,13 +161,7 @@ fn cache_variant_separates_extension_transitions() {
         Some(("script", "unknown")),
         None,
     );
-    let consistent = extraction_cache_variant(
-        None,
-        FileType::Shell,
-        false,
-        None,
-        None,
-    );
+    let consistent = extraction_cache_variant(None, FileType::Shell, false, None, None);
     assert_ne!(as_font, as_unknown);
     assert_ne!(as_font, consistent);
     assert_ne!(as_unknown, consistent);
@@ -180,13 +169,7 @@ fn cache_variant_separates_extension_transitions() {
     // a tree full of `.woff2` files does not lose cache sharing.
     assert_eq!(
         as_font,
-        extraction_cache_variant(
-            None,
-            FileType::Shell,
-            true,
-            Some(("script", "font")),
-            None
-        )
+        extraction_cache_variant(None, FileType::Shell, true, Some(("script", "font")), None)
     );
 }
 
@@ -195,20 +178,8 @@ fn cache_variant_separates_extension_transitions() {
 #[test]
 fn cache_variant_separates_unnamed_mismatch() {
     assert_ne!(
-        extraction_cache_variant(
-            None,
-            FileType::Shell,
-            true,
-            None,
-            None
-        ),
-        extraction_cache_variant(
-            None,
-            FileType::Shell,
-            false,
-            None,
-            None
-        )
+        extraction_cache_variant(None, FileType::Shell, true, None, None),
+        extraction_cache_variant(None, FileType::Shell, false, None, None)
     );
 }
 
@@ -216,15 +187,7 @@ fn cache_variant_separates_unnamed_mismatch() {
 /// and from hosts that set none.
 #[test]
 fn cache_variant_separates_host_namespaces() {
-    let key = |namespace| {
-        extraction_cache_variant(
-            namespace,
-            FileType::Elf,
-            false,
-            None,
-            None,
-        )
-    };
+    let key = |namespace| extraction_cache_variant(namespace, FileType::Elf, false, None, None);
     assert_ne!(key(Some("a")), key(Some("b")));
     assert_ne!(key(Some("a")), key(None));
     assert_eq!(key(Some("a")), key(Some("a")));
@@ -235,15 +198,7 @@ fn cache_variant_separates_basename_facts() {
     // Identical Rust bytes can be a build hook or an ordinary module.
     // Archive extraction and standalone scans must not inherit whichever
     // basename happened to populate the content cache first.
-    let key = |name| {
-        extraction_cache_variant(
-            None,
-            FileType::Rust,
-            false,
-            None,
-            name,
-        )
-    };
+    let key = |name| extraction_cache_variant(None, FileType::Rust, false, None, name);
     assert_ne!(key(Some("build.rs")), key(Some("lib.rs")));
     assert_ne!(key(Some("build.rs")), key(None));
     assert_ne!(key(Some("")), key(None));
@@ -329,36 +284,12 @@ fn chm_overlay_uses_archive_data_and_directory_extents() {
 #[test]
 fn extraction_cache_separates_path_dependent_file_types() {
     assert_ne!(
-        extraction_cache_variant(
-            None,
-            FileType::Gz,
-            false,
-            None,
-            None
-        ),
-        extraction_cache_variant(
-            None,
-            FileType::Npm,
-            false,
-            None,
-            None
-        ),
+        extraction_cache_variant(None, FileType::Gz, false, None, None),
+        extraction_cache_variant(None, FileType::Npm, false, None, None),
     );
     assert_eq!(
-        extraction_cache_variant(
-            None,
-            FileType::Npm,
-            false,
-            None,
-            None
-        ),
-        extraction_cache_variant(
-            None,
-            FileType::Npm,
-            false,
-            None,
-            None
-        ),
+        extraction_cache_variant(None, FileType::Npm, false, None, None),
+        extraction_cache_variant(None, FileType::Npm, false, None, None),
     );
 }
 
@@ -625,7 +556,11 @@ fn cache_key_tracks_every_output_affecting_input() {
     ]
     .into_iter()
     .collect();
-    assert_eq!(distinct.len(), 5, "every keyed input is distinct: {distinct:?}");
+    assert_eq!(
+        distinct.len(),
+        5,
+        "every keyed input is distinct: {distinct:?}"
+    );
 }
 
 /// A raised cancellation flag abandons the source parse of the file it

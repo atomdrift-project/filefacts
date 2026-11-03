@@ -55,9 +55,7 @@ mod plist_envelopes {
             "profile.mobileprovision",
             "renamed.bin",
         ] {
-            let parsed = crate::OpenOptions::new()
-                .path(Path::new(name))
-                .open(&bytes);
+            let parsed = crate::OpenOptions::new().path(Path::new(name)).open(&bytes);
             assert_eq!(parsed.fileid().file_type(), crate::FileType::Plist);
             if name != "renamed.bin" {
                 assert!(!parsed.fileid().extension_mismatch());
